@@ -37,7 +37,7 @@ func TestWriteIPListFile_doesNotGCMidRender(t *testing.T) {
 
 	// Then：A 的文件必须存活——GC 不得在渲染中途按陈旧引用集删在役文件
 	if _, err := os.Stat(pathA); err != nil {
-		t.Fatalf("在役名单文件被渲染中途 GC 删除: %v（P2-1：allow 方向 403 风暴/deny 方向 fail-open 根因）", err)
+		t.Fatalf("在役名单文件被渲染中途 GC 删除: %v（allow 方向 403 风暴/deny 方向 fail-open 根因）", err)
 	}
 }
 

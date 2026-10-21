@@ -40,7 +40,7 @@ import (
 //     统一收尾）；
 //   - services/downloadintegrity.go recordDownloadIntegrityAudits 的动作/对象变量由调用方
 //     传入字面量（动作 校验阻断/下载校验、对象 CRS规则库/IP数据库/完整性记录，
-//     均纳入扫描；S历史问题 锁外落库改造后审计写点收敛到该 flush 函数）；
+//     均纳入扫描；历史问题 锁外落库改造后审计写点收敛到该 flush 函数）；
 var auditVocabDynamicAllowlist = map[string]map[int][]string{
 	"handlers/audit.go":                {1: {"recordAudit"}, 2: {"recordAudit"}},
 	"middleware/middleware.go":         {1: {"auditMiddleware"}, 2: {"auditMiddleware"}},
@@ -71,7 +71,7 @@ var auditVocabDynamicAllowlist = map[string]map[int][]string{
 
 // auditVocabCallSpecs 给出各审计写入口的 动作/对象 参数下标。
 // recordAuthenticationSecurityAudit 是 middleware.go:38 对 services.RecordAuditLog
-// 的函数变量别名（历史问题 D-01：不登记则该调用点整点不被扫描，「认证拒绝」不进
+// 的函数变量别名（历史问题：不登记则该调用点整点不被扫描，「认证拒绝」不进
 // 后端动作集，danger 契约条目虚设）。
 var auditVocabCallSpecs = map[string][2]int{
 	"RecordAuditLog":                    {1, 2},
@@ -107,7 +107,7 @@ func TestAuditVocabulary_wordLimits(t *testing.T) {
 			violations = append(violations, file+":"+strconv.Itoa(line)+" "+kind+" "+strconv.Quote(value)+" 超上限（"+strconv.Itoa(n)+" 词 > "+strconv.Itoa(limit)+"）")
 		}
 	}
-	// SEC-C-U1 ④（历史）：字面量 (action, resource) 对命中归一表旧侧的
+	// 历史修复 ④（历史）：字面量 (action, resource) 对命中归一表旧侧的
 	// 成对判定已随 历史问题 移入 internal/db（谓词不再导出）：
 	// audit_vocabulary_migration_test.go 的 TestAuditWritePointsUseCanonicalVocabulary。
 	err = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {

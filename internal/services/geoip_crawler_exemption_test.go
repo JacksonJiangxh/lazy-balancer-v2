@@ -77,7 +77,7 @@ func TestBuildIPPrecheckDirectives_crawlerExemptionEmptyEnginesAllEngines(t *tes
 	}
 }
 
-// TestEngineGate_crawlerExemptionDirectives（R-10）：爬虫豁免/伪装规则的
+// TestEngineGate_crawlerExemptionDirectives（历史修复）：爬虫豁免/伪装规则的
 // 真实渲染产物必须被同版 coraza 引擎编译接受（字符串断言不构成验证终点）。
 func TestEngineGate_crawlerExemptionDirectives(t *testing.T) {
 	p := &models.SecurityPolicy{
@@ -113,7 +113,7 @@ func TestEngineGate_crawlerPassLogDetectedAction(t *testing.T) {
 	compileForEngineGate(t, directives)
 }
 
-// 历史 历史问题：伪装规则条件收敛到「本策略已勾选引擎」——头值携带引擎 ID
+// 历史问题：伪装规则条件收敛到「本策略已勾选引擎」——头值携带引擎 ID
 // （与 Verified 对称），未勾选引擎的验证失败不得被本策略 deny。
 func TestGeoIPCrawlerSpoof_scopedToSelectedEngines(t *testing.T) {
 	policy := &models.SecurityPolicy{
@@ -153,7 +153,7 @@ func TestGeoIPCrawlerSpoof_scopedToSelectedEngines(t *testing.T) {
 	}
 }
 
-// 历史 历史问题：渲染侧输出 crawler_exempt 门控字段（与绑定策略同源）。
+// 历史问题：渲染侧输出 crawler_exempt 门控字段（与绑定策略同源）。
 func TestBuildGeoipHandler_emitsCrawlerGate(t *testing.T) {
 	if h := buildGeoipHandler(true); h["crawler_exempt"] != true {
 		t.Fatalf("crawler_exempt=true must be emitted, got %#v", h)

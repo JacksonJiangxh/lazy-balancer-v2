@@ -1,6 +1,6 @@
 package acme
 
-// 历史修复3：权威 NS 发现的加固——EDNS0（避免 512B UDP 截断把 NODATA
+// 历史修复：权威 NS 发现的加固——EDNS0（避免 512B UDP 截断把 NODATA
 // 当答案）、TC=1 走 TCP 重查、NS 查询有限重试、SOA 停止条件（不误走父域）、
 // 发现的区必须是 fqdn 后缀、失败原因留痕。测试通过 dnsExchange 接缝注入固定
 // 应答，不依赖网络与时序。

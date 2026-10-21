@@ -10,7 +10,7 @@ import (
 )
 
 // lb_rules/path_rules 两表——cluster_apply.go 内 certificate_configs/cert_jobs/
-// users/api_keys 的时间列（含同族 ca_providers，R-12 兄弟位点）仍直写 time.Time，
+// users/api_keys 的时间列（含同族 ca_providers，历史修复 兄弟位点）仍直写 time.Time，
 // 驱动序列化为带时区后缀形态（'+00:00'/RFC3339），与主端 datetime('now') 平面
 // 格式三态并存。修复=全部写点统一平面格式（nullableTimeFlat / UTC().Format；
 // 空值路径保持 NULL）。

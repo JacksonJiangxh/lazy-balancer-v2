@@ -21,7 +21,7 @@ type PathRuleInput = {
   readonly redirect_to?: string
 }
 // isValidHostName 与后端 isValidHost（internal/handlers/helpers.go）逐条对齐的
-// 主机名校验（FE-U3，历史）：标签字符 [A-Za-z0-9_-]、标签首尾须字母或数字、
+// 主机名校验（历史修复，历史）：标签字符 [A-Za-z0-9_-]、标签首尾须字母或数字、
 // 单标签 ≤63、总长 ≤253。前端方向不放宽到 IP 字面量（SNI 语义不需要）。
 export const isValidHostName = (value: string): boolean => {
   if (value === '' || value.length > 253) return false
@@ -95,7 +95,7 @@ const STATIC_RESPONSE_STATUSES: Readonly<Record<number, true>> = {
 }
 export const validatePathRules = (rules: readonly PathRuleInput[]): string | null => {
   const seen = new Map<string, number>()
-  // C-F3 同后端：prefix 与 exact 在同一路径上并存时，路由按 SortOrder 首条终结
+  // 历史修复 同后端：prefix 与 exact 在同一路径上并存时，路由按 SortOrder 首条终结
   // 匹配，靠后的一条必被遮蔽成死规则——保存前整组拒绝（跨类型互查）。
   const seenPrefixRoots = new Map<string, number>()
   const seenExactNorms = new Map<string, number>()
@@ -139,12 +139,12 @@ export const validatePathRules = (rules: readonly PathRuleInput[]): string | nul
     if (responseMode === 'redirect') {
       const target = rule.redirect_to ?? ''
       if (!target.trim()) return `第 ${rowNumber} 条路径：301 跳转需要填写跳转地址`
-      // FE-U4（历史）：形状校验查原串（与后端 rule_features.go 同位）——
+      // 历史修复（历史）：形状校验查原串（与后端 rule_features.go 同位）——
       // 此前 trim 后判定，" http://x" 前端放行、后端按原串 400，口径分叉。
       // eslint-disable-next-line no-control-regex
       if (/[\x00-\x1f\x7f]/.test(target)) return `第 ${rowNumber} 条路径：跳转地址含非法字符`
       if (!target.startsWith('/') && !target.startsWith('http://') && !target.startsWith('https://')) return `第 ${rowNumber} 条路径：跳转地址须为 http(s):// 绝对地址或 / 开头路径`
-      // FE71-6：与后端 rule_features.go:464 同句——301 跳转与响应内容互斥
+      // 历史修复：与后端 rule_features.go:464 同句——301 跳转与响应内容互斥
       //（UI 正常切换模式会清空内容，此处防回读载荷/残留表单态双携，后端恒 400）。
       if (rule.response_body || rule.response_content_type) return `第 ${rowNumber} 条路径：301 跳转与响应内容互斥（请清空内容/格式）`
       if (rule.upstreams !== null || rule.upstream_path) return `第 ${rowNumber} 条路径：301 跳转模式与上游配置互斥`

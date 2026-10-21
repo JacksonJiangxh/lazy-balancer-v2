@@ -45,7 +45,7 @@ export function useLibUpdateDialog<TInfo>(options: UseLibUpdateDialogOptions<TIn
 
   const updating = computed(() => options.isRunning(status.value))
 
-  // S历史问题④:手写 setInterval → usePollingTask(后台标签页暂停/自动清理)。
+  // 历史问题④:手写 setInterval → usePollingTask(后台标签页暂停/自动清理)。
   // 历史问题:弹框会话级暂停(非终态)——stop 会永久 disposed,重开弹框即失效;
   // 组件卸载的终态清理由 usePollingTask 内置 onUnmounted 兜底。
   const polling = usePollingTask(async () => { await refreshStatus() }, { interval: 2000 })

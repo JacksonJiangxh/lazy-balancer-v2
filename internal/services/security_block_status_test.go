@@ -8,7 +8,7 @@ package services
 // 策略合成状态码。SecRuleUpdateActionById 949110 "deny,status:<syn>" 必须在
 // 引擎层真实抬码(interruption.Status==<syn>)——若引擎不支持(coraza 与
 // ModSecurity 行为差),fallback=CRS 中断走 403 兜底路由(计划 Assumptions 节)。
-// 这是引擎行为实证,非字符串断言(R-10)。
+// 这是引擎行为实证,非字符串断言(历史修复)。
 
 import (
 	"encoding/json"

@@ -13,7 +13,7 @@ import (
 
 // 注册三分支已成功——清理失败（如账户目录被外部移除）此前连坐注册结果返回
 // 错误，须降级为 warn 日志并返回 nil。
-func TestCERT44_3_RegisterAccount_toleratesStaleCleanupFailure(t *testing.T) {
+func TestRegisterAccount_toleratesStaleCleanupFailure(t *testing.T) {
 	// Given：可用的 CA directory（注册本身成功）
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {

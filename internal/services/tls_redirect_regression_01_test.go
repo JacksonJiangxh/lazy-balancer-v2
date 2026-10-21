@@ -2,7 +2,7 @@ package services
 
 // （旧代码只对 acme_dns 判证书就绪）——域名被 301 到无服务的 TLS 端口。
 // 修复：跳转与 server 同判据（availableCerts 命中才发射），不分 tls_source。
-// 可达性：保存/启用/导入侧均已拦截空证书（直改 DB/残留脏行才可达），P2 下限。
+// 可达性：保存/启用/导入侧均已拦截空证书（直改 DB/残留脏行才可达），历史修复 下限。
 
 import (
 	"testing"

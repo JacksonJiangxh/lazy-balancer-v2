@@ -18,7 +18,7 @@ func (s stubListProvider) BuildCredentialsJSON(map[string]string) (map[string]in
 	return nil, nil
 }
 
-// B431-3(历史):List 原实现直出注册表 map 遍历序,/dns-providers 响应
+// 历史修复(历史):List 原实现直出注册表 map 遍历序,/dns-providers 响应
 // 顺序随进程随机——改为按 Code 排序的稳定切片。
 func TestList_returnsProvidersSortedByCode(t *testing.T) {
 	// Given:乱序注册一批 stub provider(测试结束清出,恢复真实注册表)

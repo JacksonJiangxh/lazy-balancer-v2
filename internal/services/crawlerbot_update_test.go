@@ -95,7 +95,7 @@ func TestPrimeCrawlerIPLists_builtinFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("snapshot file missing: %v", err)
 	}
-	// PD-04（历史）：内置首版=官方快照（googlebot 官方段以 /27 粒度发布，
+	// 历史修复（历史）：内置首版=官方快照（googlebot 官方段以 /27 粒度发布，
 	// 旧断言 66.249.66.0/24 钉的是已删除的手写表形态）。
 	if !strings.Contains(string(data), "192.178.4.0/27") {
 		t.Errorf("内置首版未包含 Google CIDR: %s", string(data))
@@ -174,7 +174,7 @@ func TestMarkCrawlerSourceFailed_usesScheduleNotBackoff(t *testing.T) {
 	}
 }
 
-// 历史问题-2（R-12 同族收敛）：crawlerbot 源族排程槽写入必须继承威胁源族门禁
+// 历史问题-2（历史修复 同族收敛）：crawlerbot 源族排程槽写入必须继承威胁源族门禁
 // ——仅 auto 触发且现存槽空/过期才推进；手动触发（成功/失败）不动预约、
 // 未来槽不回拨。旧实现无条件改写 next_update：手动轮可静默吞掉当天自动轮，
 // 一次瞬时手动失败可抑制自动重试。
@@ -325,11 +325,11 @@ func TestPrimeCrawlerIPLists_usesBundledSeedFile(t *testing.T) {
 	}
 }
 
-// —— 回退 /load 无系统重载审计（SSA-87-03，历史） ——
+// —— 回退 /load 无系统重载审计（历史修复，历史） ——
 
 // 爬虫名单变化且投影热路径未证实收敛 → 真实 /load 必须与 threat_update/autoban
 // 同口径留系统重载审计（成功/失败两态）。
-func TestSSA8703_crawlerFallbackReloadRecordsSystemAudit(t *testing.T) {
+func TestCrawlerFallbackReload_recordsSystemAudit(t *testing.T) {
 	newClusterTestService(t)
 	oldRefresher, oldReloader := threatProjectionRefresher, threatReloader
 	t.Cleanup(func() { threatProjectionRefresher, threatReloader = oldRefresher, oldReloader })
@@ -356,11 +356,11 @@ func TestSSA8703_crawlerFallbackReloadRecordsSystemAudit(t *testing.T) {
 	}
 }
 
-// —— 快照变化判定顺序敏感（SSA-87-07，历史） ——
+// —— 快照变化判定顺序敏感（历史修复，历史） ——
 
 // 同集合换序不得判为变化（源站重排不产生写放大/「更新成功」噪声），且未变化
 // 不重写 DB entries（展示顺序保持）；真实内容变化仍须探测到。
-func TestSSA8707_upsertChangeDetectionIgnoresOrder(t *testing.T) {
+func TestCrawlerUpsert_changeDetectionIgnoresOrder(t *testing.T) {
 	_, database := newClusterTestService(t)
 	oldFile := crawlerIPListFile
 	crawlerIPListFile = filepath.Join(t.TempDir(), "crawler-ip-lists.json")
@@ -377,7 +377,7 @@ func TestSSA8707_upsertChangeDetectionIgnoresOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	if changed {
-		t.Fatal("同集合换序必须判为未变化（顺序敏感的字节比较=SSA-87-07）")
+		t.Fatal("同集合换序必须判为未变化（顺序敏感的字节比较=历史修复）")
 	}
 	// DB 展示顺序保持原状（未变化不重写）。
 	var raw string

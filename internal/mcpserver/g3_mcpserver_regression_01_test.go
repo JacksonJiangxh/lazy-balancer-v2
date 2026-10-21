@@ -12,7 +12,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
-// APIMCP44-1(P3):filterReadOnlyTools 对错误形态(含 error 成员)或缺
+// 历史修复:filterReadOnlyTools 对错误形态(含 error 成员)或缺
 // result/result.tools 的响应必须原样透传输入字节——固定结构体重建会把
 // error 形态改写为「result.tools:null」假成功,吞掉上游错误信号。
 func TestAPIMCP_filterReadOnlyTools_passthrough_non_tools_list_shapes(t *testing.T) {
@@ -41,7 +41,7 @@ func TestAPIMCP_filterReadOnlyTools_passthrough_non_tools_list_shapes(t *testing
 	}
 }
 
-// APIMCP44-1 回归形状:正常 tools/list 响应仍按只读白名单过滤——GET 工具
+// 历史修复 回归形状:正常 tools/list 响应仍按只读白名单过滤——GET 工具
 // (list_rules)保留,写工具(create_rule)剔除,jsonrpc/id 原样保留。
 func TestAPIMCP_filterReadOnlyTools_still_filters_tools_list(t *testing.T) { // Given 正常 tools/list 响应(一只读一写工具)
 	input := `{"jsonrpc":"2.0","id":7,"result":{"tools":[{"name":"list_rules","description":"列出"},{"name":"create_rule","description":"创建"}]}}`
@@ -65,7 +65,7 @@ func TestAPIMCP_filterReadOnlyTools_still_filters_tools_list(t *testing.T) { // 
 	}
 }
 
-// APIMCP44-3(P5,文案):MCP 回环客户端超时错误提示必须补「操作可能已在服务端
+// 历史修复(历史修复,文案):MCP 回环客户端超时错误提示必须补「操作可能已在服务端
 // 生效,请先用查询类工具核对状态再重试」——纯传输层失败文案会让 Agent 直接
 // 重试非幂等操作(备份/导入/重启等),造成重复执行。
 func TestAPIMCP_forward_timeout_error_carries_state_check_hint(t *testing.T) { // Given 上游响应慢于客户端超时
@@ -96,7 +96,7 @@ func TestAPIMCP_forward_timeout_error_carries_state_check_hint(t *testing.T) { /
 	}
 }
 
-// APIMCP44-3 回归形状:非超时失败(连接拒绝)保持原「内部 API 请求失败」
+// 历史修复 回归形状:非超时失败(连接拒绝)保持原「内部 API 请求失败」
 // 文案,不带超时提示。
 func TestAPIMCP_forward_non_timeout_error_keeps_original_message(t *testing.T) { // Given 不可达地址(连接拒绝,非超时)
 	client := &http.Client{Timeout: time.Second}
@@ -121,7 +121,7 @@ func TestAPIMCP_forward_non_timeout_error_keeps_original_message(t *testing.T) {
 }
 
 // 4 字节 "null")不得误判为错误形态而跳过过滤——正常 result.tools 仍须过滤。
-func TestW3R44_4_filterReadOnlyTools_error_null_still_filters(t *testing.T) {
+func TestFilterReadOnlyTools_errorNullStillFilters(t *testing.T) {
 	// Given error:null + 正常 result.tools(一写工具)
 	input := `{"jsonrpc":"2.0","id":9,"error":null,"result":{"tools":[{"name":"create_rule","description":"创建"}]}}`
 

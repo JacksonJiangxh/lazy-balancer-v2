@@ -181,7 +181,7 @@ func assertSingleSecurityAudit(t *testing.T, recorded []string, reason, credenti
 	}
 }
 
-// SYSMW-U1（历史 历史问题）：认证审计限流器容量硬上限——PER历史问题 的 1024 清扫阈值
+// 历史修复（历史）：认证审计限流器容量硬上限——历史问题 的 1024 清扫阈值
 // 只清 >=2min 陈旧键，洪水期（唯一 reason+path+ip 键高速涌入）全部键新鲜、清扫
 // 零效果，map 曾无界增长（对照 loginRateBuckets 1024 硬拒建桶的真上限）。修复=
 // 清扫后仍达硬上限（4096）则丢弃新键：不进 map 也不记审计（审计丢失可接受，
@@ -227,7 +227,7 @@ func TestAuthenticationAuditLimiter_floodHardCap(t *testing.T) {
 	}
 }
 
-// 历史 历史问题：认证态每请求回读 DB——禁用立即 401、角色取自 DB 而非
+// 历史问题：认证态每请求回读 DB——禁用立即 401、角色取自 DB 而非
 // token claim（旧令牌提升权限必须失效）。
 func TestJWTAuth_disabledUserRejectedImmediately(t *testing.T) {
 	cfg, token := newJWTContractFixture(t, jwt.SigningMethodHS256, true)

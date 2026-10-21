@@ -1,9 +1,9 @@
 package services
 
-// 日志大小缓存失效（U10-F04）、taskRun helper nil 库守卫（U10-F11）、
-// 威胁任务 manager nil 响亮失败（L01-01）、角色读失败 fail-closed（L01-04）、
-// 版本表闭包单源（U10-F03）、证书任务文案（L04-05）、从节点镜像行过滤
-// （L04-07）、异步触发错误分类（L01-02）。
+// 日志大小缓存失效（历史修复）、taskRun helper nil 库守卫（历史修复）、
+// 威胁任务 manager nil 响亮失败（历史修复）、角色读失败 fail-closed（历史修复）、
+// 版本表闭包单源（历史修复）、证书任务文案（历史修复）、从节点镜像行过滤
+// （历史修复）、异步触发错误分类（历史修复）。
 
 import (
 	"errors"
@@ -26,7 +26,7 @@ func auditCount(t *testing.T, action string) int {
 	return n
 }
 
-// U10-F01：配置导入提交后重装四族首槽——「enabled 但 next_update 空」的
+// 历史修复：配置导入提交后重装四族首槽——「enabled 但 next_update 空」的
 // 导入行必须武装出非空槽（不依赖重启引擎）。
 func TestRearmSecurityLibrarySlots_fillsImportedEmptySlots(t *testing.T) {
 	te := newWireTestEngine(t)
@@ -70,7 +70,7 @@ func TestRearmSecurityLibrarySlots_fillsImportedEmptySlots(t *testing.T) {
 	}
 }
 
-// U10-F04：日志大小缓存必须可失效——改库后下一行写入即用新阈值（曾仅
+// 历史修复：日志大小缓存必须可失效——改库后下一行写入即用新阈值（曾仅
 // 5 分钟 TTL 自然过期，设置保存后仍按旧阈值滚动）。
 func TestInvalidateTaskLogSizeCache_usesNewValueImmediately(t *testing.T) {
 	initServicesDB(t)
@@ -90,7 +90,7 @@ func TestInvalidateTaskLogSizeCache_usesNewValueImmediately(t *testing.T) {
 	}
 }
 
-// U10-F11：taskRun 两 helper 的 nil 库守卫——不得 panic（同族 B1-8 口径：
+// 历史修复：taskRun 两 helper 的 nil 库守卫——不得 panic（同族 历史修复 口径：
 // false / 当前 UTC）。
 func TestTaskRunHelpers_nilDBNeitherPanics(t *testing.T) {
 	old := db.DB
@@ -106,7 +106,7 @@ func TestTaskRunHelpers_nilDBNeitherPanics(t *testing.T) {
 	}
 }
 
-// L01-01：威胁任务在 manager 未初始化时必须响亮失败（曾 return nil→success，
+// 历史修复：威胁任务在 manager 未初始化时必须响亮失败（曾 return nil→success，
 // 装配顺序错误被静默吞掉）。
 func TestThreatTask_nilManagerFailsLoudly(t *testing.T) {
 	te := newWireTestEngine(t)
@@ -124,7 +124,7 @@ func TestThreatTask_nilManagerFailsLoudly(t *testing.T) {
 	}
 }
 
-// L01-04：角色种子读失败必须 warn + 重试一次，仍失败按从节点启动
+// 历史修复：角色种子读失败必须 warn + 重试一次，仍失败按从节点启动
 // （fail-closed：不得因读错误默认主节点而启动 master-only daemon）。
 func TestInitTaskEngine_roleReadFailureFailsClosed(t *testing.T) {
 	initServicesDB(t)
@@ -140,7 +140,7 @@ func TestInitTaskEngine_roleReadFailureFailsClosed(t *testing.T) {
 	}
 }
 
-// U10-F03：crs/ip2region 的开关/槽闭包统一读单源 helper——关闭即零槽、
+// 历史修复：crs/ip2region 的开关/槽闭包统一读单源 helper——关闭即零槽、
 // 开启且槽存在即展示。
 func TestVersionTaskClosures_singleSourceSemantics(t *testing.T) {
 	te := newWireTestEngine(t)
@@ -169,7 +169,7 @@ func TestVersionTaskClosures_singleSourceSemantics(t *testing.T) {
 	}
 }
 
-// L04-05：cert-manual-poll 文案必须与执行体（CertManualCheckOnce=手动上传
+// 历史修复：cert-manual-poll 文案必须与执行体（CertManualCheckOnce=手动上传
 // 证书到期巡检）一致。
 func TestCertManualPoll_copyMatchesExecution(t *testing.T) {
 	te := newWireTestEngine(t)
@@ -185,7 +185,7 @@ func TestCertManualPoll_copyMatchesExecution(t *testing.T) {
 	}
 }
 
-// L04-07：从主节点同步的镜像行仅在「本节点当前为从节点」时隐藏——promote 后
+// 历史修复：从主节点同步的镜像行仅在「本节点当前为从节点」时隐藏——promote 后
 // 这些行属于本节点自己的签发工作项，必须可见。
 func TestCollectCertJobRows_mirrorFilterOnlyOnSlave(t *testing.T) {
 	initServicesDB(t)
@@ -223,7 +223,7 @@ func TestCollectCertJobRows_mirrorFilterOnlyOnSlave(t *testing.T) {
 	}
 }
 
-// L01-02：TriggerTaskAsync 统一错误分类——成功记「触发」；ErrAlreadyRunning/
+// 历史修复：TriggerTaskAsync 统一错误分类——成功记「触发」；ErrAlreadyRunning/
 // ErrTaskSkipped 静默（非故障）；其它错误记「触发失败」。
 func TestTriggerTaskAsync_errorClassification(t *testing.T) {
 	te := newWireTestEngine(t)
@@ -261,7 +261,7 @@ func TestTriggerTaskAsync_errorClassification(t *testing.T) {
 	}
 }
 
-// U10-F12：并发触发同一任务时，只有 CAS 胜者成功——「触发」审计必须只在
+// 历史修复：并发触发同一任务时，只有 CAS 胜者成功——「触发」审计必须只在
 // Trigger 成功后记录（败者不得留孤儿审计行）。
 func TestTriggerTaskAsync_concurrentOnlyWinnerAudits(t *testing.T) {
 	te := newWireTestEngine(t)

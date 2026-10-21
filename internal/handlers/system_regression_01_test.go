@@ -1,15 +1,15 @@
 package handlers
 
-//   - U04d-05：审计下拉单行 Scan 失败必须与查询/迭代失败同按故障轮处理
+//   - 历史修复：审计下拉单行 Scan 失败必须与查询/迭代失败同按故障轮处理
 //     （partial=true 且不写 60s 缓存）；
-//   - U04d-06：/logs/stats 的阈值读取收窄到一次并按 want 门控（结构门——
+//   - 历史修复：/logs/stats 的阈值读取收窄到一次并按 want 门控（结构门——
 //     任务循环曾逐任务重复读同一 task_log_size_mb 列）；
-//   - U04d-07：证书有 SAN 时不得回退 CN（现代客户端以 SAN 为准）；
-//   - U04d-08：DNS 服务器多冒号畸形地址不得回落「含点即 FQDN」；
-//   - U04d-09：/metrics/history 空结果必须是 []（不是 null）；
-//   - U04d-11：admin-only 写端点的 403 权限分支必须进 OpenAPI；
-//   - U04d-15：dirBytes 与 aggregateDirStats 两套轮转分类器同输入必须等价；
-//   - U04d-17：queryRowsAsMaps 的迭代错误必须携带表/快照 label。
+//   - 历史修复：证书有 SAN 时不得回退 CN（现代客户端以 SAN 为准）；
+//   - 历史修复：DNS 服务器多冒号畸形地址不得回落「含点即 FQDN」；
+//   - 历史修复：/metrics/history 空结果必须是 []（不是 null）；
+//   - 历史修复：admin-only 写端点的 403 权限分支必须进 OpenAPI；
+//   - 历史修复：dirBytes 与 aggregateDirStats 两套轮转分类器同输入必须等价；
+//   - 历史修复：queryRowsAsMaps 的迭代错误必须携带表/快照 label。
 
 import (
 	"context"
@@ -38,7 +38,7 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// ---- U04d-05：审计下拉单行 Scan 失败 ----
+// ---- 历史修复：审计下拉单行 Scan 失败 ----
 
 type auditScanFailConnector struct{ match func(string) bool }
 
@@ -149,7 +149,7 @@ func TestAuditLogOptions_scanErrorRoundDoesNotPoisonCache(t *testing.T) {
 	}
 }
 
-// ---- U04d-07：SAN 优先于 CN ----
+// ---- 历史修复：SAN 优先于 CN ----
 
 func TestTLSCertCoversDomain_sanTakesPrecedenceOverCN(t *testing.T) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -189,7 +189,7 @@ func TestTLSCertCoversDomain_sanTakesPrecedenceOverCN(t *testing.T) {
 	}
 }
 
-// ---- U04d-08：DNS 服务器畸形冒号地址 ----
+// ---- 历史修复：DNS 服务器畸形冒号地址 ----
 
 func TestValidateDnsServerShape_rejectsMalformedColonAddresses(t *testing.T) {
 	valid := []string{
@@ -212,7 +212,7 @@ func TestValidateDnsServerShape_rejectsMalformedColonAddresses(t *testing.T) {
 	}
 }
 
-// ---- U04d-09：/metrics/history 空结果数组形状 ----
+// ---- 历史修复：/metrics/history 空结果数组形状 ----
 
 func TestGetMetricsHistory_emptyResultIsEmptyArray(t *testing.T) {
 	newMetricsTestDatabase(t)
@@ -237,7 +237,7 @@ func TestGetMetricsHistory_emptyResultIsEmptyArray(t *testing.T) {
 	}
 }
 
-// ---- U04d-11：OpenAPI 403 权限分支 ----
+// ---- 历史修复：OpenAPI 403 权限分支 ----
 
 func TestAPIDocRoutes_documentAdminWriteForbidden(t *testing.T) {
 	routes := make(map[string]apiDocRoute, len(apiDocRoutes))
@@ -255,7 +255,7 @@ func TestAPIDocRoutes_documentAdminWriteForbidden(t *testing.T) {
 	}
 }
 
-// ---- U04d-15：两套轮转分类器同输入等价 ----
+// ---- 历史修复：两套轮转分类器同输入等价 ----
 
 func TestDirBytes_MatchesAggregateDirStatsForRotationFamilies(t *testing.T) {
 	dir := t.TempDir()
@@ -285,7 +285,7 @@ func TestDirBytes_MatchesAggregateDirStatsForRotationFamilies(t *testing.T) {
 	}
 }
 
-// ---- U04d-06：/logs/stats 阈值读取收窄（结构门） ----
+// ---- 历史修复：/logs/stats 阈值读取收窄（结构门） ----
 
 func TestGetLogStats_thresholdReadsHoistedAndGated(t *testing.T) {
 	raw, err := os.ReadFile("logstats.go")
@@ -308,7 +308,7 @@ func TestGetLogStats_thresholdReadsHoistedAndGated(t *testing.T) {
 	}
 }
 
-// ---- U04d-17：queryRowsAsMaps 错误 label ----
+// ---- 历史修复：queryRowsAsMaps 错误 label ----
 
 type rowIterErrConnector struct{}
 
@@ -357,7 +357,7 @@ func TestQueryRowsAsMaps_wrapsIterationErrorWithLabel(t *testing.T) {
 	}
 }
 
-// ---- U04d-03：finishTxApply 两条 commit 失败分支的已提交视图恢复 ----
+// ---- 历史修复：finishTxApply 两条 commit 失败分支的已提交视图恢复 ----
 
 func TestFinishTxApplyCommitFailureBranchesRestoreCommittedView(t *testing.T) {
 	raw, err := os.ReadFile("handlers.go")
@@ -395,7 +395,7 @@ func TestFinishTxApplyCommitFailureBranchesRestoreCommittedView(t *testing.T) {
 	if branches != 2 {
 		t.Fatalf("finishTxApply commit 失败分支=%d, want 2（apply 成功与退化提交两形态）", branches)
 	}
-	// U04d-13：成功链只经 reloadNote 清除一次 caddy_apply_error。
+	// 历史修复：成功链只经 reloadNote 清除一次 caddy_apply_error。
 	if got := strings.Count(body, "recordCaddyApplyResult(nil)"); got != 0 {
 		t.Errorf("finishTxApply 内重复清除 caddy_apply_error %d 处（reloadNote 已覆盖成功/同字节两形态）", got)
 	}
@@ -404,7 +404,7 @@ func TestFinishTxApplyCommitFailureBranchesRestoreCommittedView(t *testing.T) {
 	}
 }
 
-// U04d-03 行为：提交失败的统一恢复必须回滚事务、把运行配置 /load 回已提交
+// 历史修复 行为：提交失败的统一恢复必须回滚事务、把运行配置 /load 回已提交
 // 视图、并把 last-known-good 从「未提交内容」写回已提交视图字节。
 func TestRecoverCommittedViewAfterCommitFailureRestoresRuntimeAndLKG(t *testing.T) {
 	h := newBackupTestHandlers(t)

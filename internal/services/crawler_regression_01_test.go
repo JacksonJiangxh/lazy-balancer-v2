@@ -38,7 +38,7 @@ func TestParseCrawlerCIDRsForFormat_360OfficialWildcardPage(t *testing.T) {
 	}
 }
 
-// C1-83-02：URL/版本前缀的四段数字（Chrome/…、Edg/…、v…）不得作为网段；
+// 历史修复：URL/版本前缀的四段数字（Chrome/…、Edg/…、v…）不得作为网段；
 // 合法 URL 路径中的 IP 仍可提取（不过度拒绝）。
 func TestParseCrawlerCIDRsForFormat_versionPrefixesRejected(t *testing.T) {
 	body := "Chrome/140.0.0.0 v1.2.3.4 Edg/141.0.0.1 deny http://203.0.113.9/path\n"
@@ -56,7 +56,7 @@ func TestParseCrawlerCIDRsForFormat_versionPrefixesRejected(t *testing.T) {
 	}
 }
 
-// C1-83-02：非结构化源的合理性门——解析结果须落在引擎声明的官方段内，
+// 历史修复：非结构化源的合理性门——解析结果须落在引擎声明的官方段内，
 // 「子集 + 覆盖」（见 crawler_audit86_test.go 的超网/截断/JSON 形状）。
 func TestValidateCrawlerEntriesSanity(t *testing.T) {
 	if _, err := validateCrawlerEntriesSanity("so360spider", []string{"140.0.0.0/32"}); err == nil {
@@ -75,7 +75,7 @@ func TestValidateCrawlerEntriesSanity(t *testing.T) {
 	}
 }
 
-// ---- C1-83-05：内置源 canonical URL/format 刷新到存量部署 ----
+// ---- 历史修复：内置源 canonical URL/format 刷新到存量部署 ----
 
 func TestRefreshCrawlerSources_preservesTimestampWhenCanonicalValueUnchanged(t *testing.T) {
 	// Given one already-canonical row and one stale row, both with a stable

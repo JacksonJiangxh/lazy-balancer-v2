@@ -11,7 +11,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 历史修复 B42-1: 备份携带 id=1 的非默认拦截页时，重播种 INSERT OR IGNORE 因 PK
+// 历史修复: 备份携带 id=1 的非默认拦截页时，重播种 INSERT OR IGNORE 因 PK
 // 冲突静默 no-op——导入后仍零默认页，必须记「导入警告」审计而非无声放过。
 func TestImportConfigBackup_warnsWhenReseedConflictsWithExistingNonDefaultID1(t *testing.T) {
 	// Given
@@ -51,7 +51,7 @@ func TestImportConfigBackup_warnsWhenReseedConflictsWithExistingNonDefaultID1(t 
 	}
 }
 
-// 历史修复 B42-2: 多默认页导入且保留行（MIN id）内容为种子库存时，被降级行中内容
+// 历史修复: 多默认页导入且保留行（MIN id）内容为种子库存时，被降级行中内容
 // 非空且非库存、id 最大者的 content 提升到保留行——用户定制内容不因降级丢失。
 func TestImportConfigBackup_promotesDemotedBlockPageContentWhenKeptIsStock(t *testing.T) {
 	// Given
@@ -94,7 +94,7 @@ func TestImportConfigBackup_promotesDemotedBlockPageContentWhenKeptIsStock(t *te
 	}
 }
 
-// 历史修复 B42-2（反例）: 保留行内容已被用户定制（非库存）时不得被被降级行覆盖。
+// 历史修复（反例）: 保留行内容已被用户定制（非库存）时不得被被降级行覆盖。
 func TestImportConfigBackup_keepsCustomizedDefaultBlockPageContentOnDemote(t *testing.T) {
 	// Given
 	h := newBackupTestHandlers(t)

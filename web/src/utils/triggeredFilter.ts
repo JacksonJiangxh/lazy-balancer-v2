@@ -1,6 +1,6 @@
 // 事件「触发规则」筛选的类别 → 后端 token 段映射（单源）。
 //
-// 审计 87 W87-15：该映射原先内联在 SecurityEvents.vue 的 fetchEvents 里，仅靠
+// 历史修复：该映射原先内联在 SecurityEvents.vue 的 fetchEvents 里，仅靠
 // 源码文本钉，任何语义漂移（少一类、段序变化、自定义 tag 被误当类别）都无测试可拦。
 // 序列化抽为纯函数后由 triggeredFilter.spec.ts 行为钉住；视图只负责选择与渲染。
 //
@@ -9,7 +9,7 @@
 // 含逗号的消息关键词会整串回退为消息搜索（前端只管连接，不判断语义）。
 
 // 触发阶段筛选为固定预置八类（历史用户裁定：固定预置值，不接受任意值）。
-// 历史 历史问题：限流（429）无 sec_events 数据源，不再作为筛选项/分类。
+// 历史问题：限流（429）无 sec_events 数据源，不再作为筛选项/分类。
 export const TRIGGERED_CATEGORIES = ['爬虫Bot', '地域拦截', 'IP 访问控制', '信任名单', '威胁情报库', '请求体异常', 'WAF·CRS', 'WAF·自定义'] as const
 export type TriggeredCategory = typeof TRIGGERED_CATEGORIES[number]
 

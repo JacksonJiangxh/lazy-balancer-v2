@@ -7,7 +7,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 历史修复0：7 天趋势日桶必须按配置时区的**逐日边界**分桶，不得把单一当前
+// 历史修复：7 天趋势日桶必须按配置时区的**逐日边界**分桶，不得把单一当前
 // 偏移套到整周 SQL date() 上——DST 周界会让切换前一日的边界错 1h，事件跨到
 // 相邻日桶（默认 Asia/Shanghai 无 DST，故长期未暴露）。
 //
@@ -49,7 +49,7 @@ func TestLoadSecurityOverviewAggregates_trendUsesPerDayDSTBoundaries(t *testing.
 	}
 }
 
-// 历史修复7：requestedHours 需求必须有界衰减——一次 30d 请求不得永久把后台
+// 历史修复：requestedHours 需求必须有界衰减——一次 30d 请求不得永久把后台
 // 回填窗口顶到上限；同时窗口只升不降、上限钳制、≤24h 不产生宽窗需求。
 func TestThreatRollupRequestedHours_boundedDecay(t *testing.T) {
 	reset := func() {
@@ -95,7 +95,7 @@ func TestThreatRollupRequestedHours_boundedDecay(t *testing.T) {
 	}
 }
 
-// 历史修复7：回退窗口钳制同样只看有效需求——过期需求不得继续扩大回退范围。
+// 历史修复：回退窗口钳制同样只看有效需求——过期需求不得继续扩大回退范围。
 func TestThreatRollupRewindMinute_staleDemandFallsBackToSevenDays(t *testing.T) {
 	reset := func() {
 		threatRollupRequestedHours.Store(0)

@@ -12,7 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// newCustomRuleRouter 构造仅挂自定义规则更新端点的路由（历史修复 B-N1 测试用）。
+// newCustomRuleRouter 构造仅挂自定义规则更新端点的路由（历史修复 测试用）。
 func newCustomRuleRouter(t *testing.T) *gin.Engine {
 	t.Helper()
 	fakeCaddy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -26,7 +26,7 @@ func newCustomRuleRouter(t *testing.T) *gin.Engine {
 	return router
 }
 
-// 历史修复 B-N1：PUT /security/custom-rules/:id 省略 enabled 不得静默禁用规则——
+// 历史修复：PUT /security/custom-rules/:id 省略 enabled 不得静默禁用规则——
 // 指针部分更新语义（nil=保持现值），MCP 无约束 body 的部分更新不再把零值
 // false 直写落库；显式 false 仍可正常禁用。
 func TestUpdateSecurityCustomRule_partialUpdateKeepsEnabled(t *testing.T) {
@@ -87,7 +87,7 @@ func TestUpdateSecurityCustomRule_partialUpdateKeepsEnabled(t *testing.T) {
 	}
 }
 
-// 历史修复 B-N1 契约补充：合并后的有效形态仍须过统一校验——省略字段不得成为
+// 历史修复 契约补充：合并后的有效形态仍须过统一校验——省略字段不得成为
 // 绕过 name/action/score/conditions 校验的通道（校验输入=现值+覆盖）。
 func TestUpdateSecurityCustomRule_mergedShapeStillValidated(t *testing.T) {
 	setupSecurityPolicyTestDB(t)

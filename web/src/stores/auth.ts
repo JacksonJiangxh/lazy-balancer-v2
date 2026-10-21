@@ -36,7 +36,7 @@ const initialCurrentPage: PageId =
   queryPageValid ??
   (hashPage && isPageId(hashPage) ? hashPage :
    storedCurrentPage && isPageId(storedCurrentPage) ? storedCurrentPage : 'dashboard')
-// 审计 B4-I1：深链 ?page= 仅作首屏入口——消费后立即剥离并同步 localStorage，
+// 审计 历史修复：深链 ?page= 仅作首屏入口——消费后立即剥离并同步 localStorage，
 // 否则参数永久留在 URL 上遮蔽 hash 导航（深链标签页导航后刷新被拉回原页）。
 if (storedCurrentPage !== initialCurrentPage) localStorage.setItem('currentPage', initialCurrentPage)
 if (queryPageValid) {
@@ -58,7 +58,7 @@ export const useAuthStore = defineStore('auth', () => {
   // 不再默认 'master'：从节点刷新+瞬时失败窗口曾按主节点 fail-open 渲染写控件。
   const nodeMode = ref<ClusterNodeMode | null>(null)
   const timezone = ref<string>('Asia/Shanghai')
-  // FE-70-8：cert_renewal_days 并入 /config 消费面（CertJobs 曾挂载整取单键）；
+  // 历史修复：cert_renewal_days 并入 /config 消费面（CertJobs 曾挂载整取单键）；
   // ≤0（含 0）时按 30 展示，与后端口径对齐
   const certRenewalDays = ref(30)
   // 与 cert_renewal_days 同源：mfa_write_guard 随 /config 投影（Users 页曾为此
@@ -89,7 +89,7 @@ export const useAuthStore = defineStore('auth', () => {
     if (readOnlyReason.value === 'unknown') return '信息加载中，暂以只读模式呈现'
     return ''
   })
-  // FE-4（历史）：从节点判定单一事实源——Keys/Users/SecurityRules 曾各自
+  // 历史修复（历史）：从节点判定单一事实源——Keys/Users/SecurityRules 曾各自
   // 复写 `nodeMode==='slave'`/`readOnlyReason==='slave'` 派生，收敛到本 getter。
   const isSlaveNode = computed(() => nodeMode.value === 'slave')
 
@@ -200,7 +200,7 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
-// FI-18：重入护栏显式化——loading 期间的重复调用不再伪装成「登录成功」
+// 历史修复：重入护栏显式化——loading 期间的重复调用不再伪装成「登录成功」
 //（原 login 重入返回 { mfaRequired:false } 与成功形态无法区分），
 // skipped:true 表示本次请求未发出，调用方应提示并中止。
 interface LoginResult {
@@ -262,7 +262,7 @@ interface LoginResult {
         is_enabled: res.user.is_enabled,
         display_name: res.user.display_name,
         mfa_enabled: res.user.mfa_enabled ?? false,
-        // OIDC-4:票据登录响应携带的来源标记——缺失按本地,避免从节点 UI 误判
+        // 历史修复:票据登录响应携带的来源标记——缺失按本地,避免从节点 UI 误判
         auth_provider: res.user.auth_provider ?? 'local',
       }
     }
@@ -306,7 +306,7 @@ interface LoginResult {
     }
   }
 
-  // FI-07：token 已在客户端判定过期（或本就不存在）时，服务端吊销毫无意义——
+  // 历史修复：token 已在客户端判定过期（或本就不存在）时，服务端吊销毫无意义——
   // 撤销表只对仍有效的 jti 有价值，过期令牌必吃 401 并在后端认证拒绝审计记
   // 一条 jwt_expired 噪音。此路径仅做本地清理；手动登出（logout）仍走服务端吊销。
   // intentionalLogout 语义与 logout() 一致：抑制后续在途请求 401 的全局弹窗。

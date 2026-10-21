@@ -1,6 +1,6 @@
 package services
 
-// 历史修复 D-4（历史，用户裁定）：删除规则后的 metrics_history 清理失败
+// 历史修复（历史，用户裁定）：删除规则后的 metrics_history 清理失败
 // 此前仅 Logf（无审计、无重试）。裁定=失败落操作审计 + taskengine 有界重试
 // ——本轮由周期任务 metrics-orphan-cleanup 承担：按「已删除规则」谓词收敛
 // 清理残留历史指标（每轮限量分批，天然有界；收敛后每轮零工作）。

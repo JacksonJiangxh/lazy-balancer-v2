@@ -1,4 +1,4 @@
-// 懒加载状态机验收（历史 历史问题）：并发单飞、失败可重试、成功永久命中。
+// 懒加载状态机验收（历史问题）：并发单飞、失败可重试、成功永久命中。
 //
 // 运行：cd web && npm test
 
@@ -27,7 +27,7 @@ test('暂停轮询：中止在途任务信号、作废旧结果，恢复后用�
   const signals: AbortSignal[] = []
   let staleCurrent: boolean | null = null
   let calls = 0
-  // A85WT-历史问题：usePollingTask 内部 onUnmounted 需要活跃组件实例——经 SSR 渲染
+  // 历史修复：usePollingTask 内部 onUnmounted 需要活跃组件实例——经 SSR 渲染
   // 提供真实实例上下文，不再以「无实例」状态触碰 Vue 生命周期（no-op 警告）。
   let polling!: PollingTask
   await renderToString(createSSRApp({
@@ -206,7 +206,7 @@ test('reset 丢弃值，下一次 ensure 重新加载', async () => {
   assert.equal(calls, 2)
 })
 
-// ---- 审计 87 WEBT-08④：usePollingTask 的 stop/invalidate/可见性/timer + FI-14 覆盖 ----
+// ---- 历史修复④：usePollingTask 的 stop/invalidate/可见性/timer + 历史修复 覆盖 ----
 
 test('usePollingTask.stop 释放：abort 在途、永久终止后续轮次', async () => {
   const gate = Promise.withResolvers<void>()
@@ -308,7 +308,7 @@ test('usePollingTask：document.hidden 停摆定时轮询，恢复可见立即�
   }
 })
 
-// ---- 审计 87 WEBT-08④：sessionSingleFlight 的 onError/requestedSession/isInflight ----
+// ---- 历史修复④：sessionSingleFlight 的 onError/requestedSession/isInflight ----
 
 test('sessionSingleFlight：失败走 onError（带会话）且不落 loadedSession，在途状态可观测', async () => {
   const gate = Promise.withResolvers<string>()

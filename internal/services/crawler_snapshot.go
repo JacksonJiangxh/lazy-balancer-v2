@@ -13,8 +13,14 @@ import (
 )
 
 // crawlerIPListFile 快照交换文件（root 服务与插件的唯一交换面）。
-// 包级变量以便测试覆盖到临时目录；生产默认容器内 /app/data 不变。
-var crawlerIPListFile = "/app/data/crawler-ip-lists.json"
+// 包级变量以便测试覆盖到临时目录；生产默认容器内 /app/data 不变；
+// ConfigureWafDirs 按 data_dir 派生。
+// defaultCrawlerIPListFile 与 caddygeoip 插件 Provision 的兜底默认同值——
+// 渲染侧仅在派生值不同于此默认时发射 crawler_ip_list_file（字节稳定裁定，
+// 见 buildGeoipHandler）。
+const defaultCrawlerIPListFile = "/app/data/crawler-ip-lists.json"
+
+var crawlerIPListFile = defaultCrawlerIPListFile
 
 // SetCrawlerIPListFileForTest 重定向快照交换文件路径，仅供测试隔离使用（返回还原函数）。
 func SetCrawlerIPListFileForTest(path string) func() {

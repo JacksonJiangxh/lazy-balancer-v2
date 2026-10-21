@@ -60,7 +60,7 @@ func TestSecurityEventsRetentionCleanup_deletesEventsOlderThanConfiguredDays(t *
 }
 
 func TestSecurityEventsRetentionCleanup_keepsAllBelowSafetyMax(t *testing.T) {
-	// SEC-B-GAP-U2（历史）：原名 trimsOldestRowsWhenCountExceedsMax 与断言
+	// 历史修复（历史）：原名 trimsOldestRowsWhenCountExceedsMax 与断言
 	// 语义相反（行为变更后复用旧名）——本用例实际钉「宽年龄窗+远低于安全上限
 	// 时全存活」。count-trim 分支的独立钉测见
 	// TestSecurityEventsRetentionCleanup_trimsOldestWhenRowCapExceeded（历史
@@ -108,7 +108,7 @@ func TestSecurityEventsRetentionSettings_appliesDefaultsWhenZero(t *testing.T) {
 
 func TestSecurityEventsRetentionCleanup_usesDefaultDaysWhenConfigZero(t *testing.T) {
 	// Given: zeroed retention config and events straddling the default 90-day window
-	// (GEO25-2: 默认从 30 天提升到与操作日志同口径的 90 天/3 个月)
+	// (历史修复: 默认从 30 天提升到与操作日志同口径的 90 天/3 个月)
 	setupSecurityEventsRetentionTestDB(t)
 	if _, err := db.DB.Exec(`UPDATE global_config SET security_events_retention_days=0 WHERE id=1`); err != nil {
 		t.Fatal(err)
@@ -206,7 +206,7 @@ func TestSecurityEventsRetentionCleanup_stopsPromptlyWhenContextCanceled(t *test
 	if got := countSecurityEventsByType(t, "expired"); got != seedTotal-securityEventsRetentionDeleteBatch {
 		t.Fatalf("expired events after canceled cleanup = %d, want %d (exactly one batch deleted)", got, seedTotal-securityEventsRetentionDeleteBatch)
 	}
-	// SEC-L1（历史）：取消路径的返回契约与其余早退同口径——已提交删
+	// 历史修复（历史）：取消路径的返回契约与其余早退同口径——已提交删
 	// 除的批次数必须如实上报（§6.5 摘要行数据源），不得归 0 丢弃。
 	if deleted != securityEventsRetentionDeleteBatch {
 		t.Fatalf("canceled cleanup returned %d, want %d（恰好一批已删计数）", deleted, securityEventsRetentionDeleteBatch)
@@ -256,7 +256,7 @@ func TestSecurityEventsRetentionCleanup_batchesAgeDelete(t *testing.T) {
 	}
 }
 
-// ---- 历史 A 域：RG-TS-ROLLUP-RETENTION（历史问题）----
+// ---- 历史 A 域：历史修复（历史问题）----
 
 func countRollupRowsBefore(t *testing.T, cutoff string) int {
 	t.Helper()
@@ -307,7 +307,7 @@ func TestSecurityEventRollupRetention_batches(t *testing.T) {
 }
 
 // 历史问题（历史）：security_events_row_cap 可配置后，count 超限批删分支可
-// 经济构造——钉住「按最旧优先裁剪到上限 + 返回已删计数」（SEC-L1 口径）。
+// 经济构造——钉住「按最旧优先裁剪到上限 + 返回已删计数」（历史修复 口径）。
 func TestSecurityEventsRetentionCleanup_trimsOldestWhenRowCapExceeded(t *testing.T) {
 	// Given cap=3、宽年龄窗、5 条近期事件（id 升序=时间序）
 	setupSecurityEventsRetentionTestDB(t)
@@ -364,7 +364,7 @@ func TestSecurityEventsRetentionCleanup_trimsOldestWhenRowCapExceeded(t *testing
 	}
 }
 
-// A83A-历史问题（历史）：分钟事件高水位键与 rollup 同生命周期清理——
+// 历史问题（历史）：分钟事件高水位键与 rollup 同生命周期清理——
 // 写入侧每分钟一行 metrics_state，旧实现无任何删除点（1440 键/天常驻）。
 func TestSecurityEventsRetentionCleanup_prunesRollupHighwaterKeys(t *testing.T) {
 	setupSecurityEventsRetentionTestDB(t)
@@ -431,11 +431,11 @@ func TestSecurityEventsRetentionCleanup_rowCapTrimsByEventTime(t *testing.T) {
 	}
 }
 
-// —— 保留摘要漏行帽（SSA-87-05，历史） ——
+// —— 保留摘要漏行帽（历史修复，历史） ——
 
 // 摘要必须同时表达天数与行帽：cleanup 按 count-max 裁剪，只写「保留 N 天」
 // 会让行帽提前裁剪时的用户可见文案与实际行为漂移。
-func TestSSA8705_retentionSummaryIncludesRowCap(t *testing.T) {
+func TestSecurityEventsRetention_summaryIncludesRowCap(t *testing.T) {
 	setupSecurityEventsRetentionTestDB(t)
 	if _, err := db.DB.Exec(`UPDATE global_config SET security_events_retention_days=30, security_events_row_cap=5000 WHERE id=1`); err != nil {
 		t.Fatal(err)

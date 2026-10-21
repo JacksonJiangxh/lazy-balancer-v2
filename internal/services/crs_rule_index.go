@@ -2,7 +2,7 @@ package services
 
 // 结构化 CRS 规则索引：解析 /app/waf/crs/rules/*.conf 中每条 SecRule 的
 // id + msg，供三处消费——
-//   1. GET /security/crs/历史修复（handlers.GetCRSRuleIndex）；
+//   1. GET /security/crs/rule-index（handlers.GetCRSRuleIndex）；
 //   2. BuildCorazaDirectives 的 crs_rule_groups 混合展开（6 位 ID → 父文件
 //      Include + 补删）与 crs_excluded_rules 作用域展开（组号 → 逐 ID
 //      ctl:ruleRemoveById）及陈旧过滤（ruleId 不在本地索引 → 跳过发射）；
@@ -57,7 +57,7 @@ func (idx *CRSRuleIndex) Has(ruleID string) bool {
 }
 
 // Find 返回 ruleID 的索引条目（id 升序线性扫描）；不存在返回 nil。
-// Find 线性扫描返回首个同 id 条目（切片升序即最低 id）。历史 历史修复
+// Find 线性扫描返回首个同 id 条目（切片升序即最低 id）。历史修复
 // 评估过集合化：需把 ids 集合值改为切片下标，收益在每条目 µs 级——裁定保留
 // 现实现（调用点为配置构建/预览路径，非请求热路径），注释声明为有意取舍。
 func (idx *CRSRuleIndex) Find(ruleID string) *CRSRuleIndexEntry {
@@ -362,7 +362,7 @@ var (
 	crsRuleIndexKey   string
 )
 
-// crsRuleIndexVersion 读取 security_crs_version 行值（SS87-历史问题：收敛到
+// crsRuleIndexVersion 读取 security_crs_version 行值（历史问题：收敛到
 // readCurrentCRSVersion 单一真源——此前这里与更新判定各有一套「空串 vs
 // bundled」口径）。索引读取的容错口径保留：库不可用/读失败回落空串（索引
 // 仍可用，仅版本展示为空）；行缺失/空值按首装口径回落 bundled，与更新判定
@@ -440,7 +440,7 @@ func buildCRSRuleIndex() *CRSRuleIndex {
 // GetCRSRuleIndex 返回规则索引（命中缓存或重建）。永不返回 nil，Rules
 // 恒为非 nil 空切片起步。
 //
-// SS87-历史问题（verify 结论：确认为有界瞬态窗口，不修锁）：本函数与
+// （verify 结论：确认为有界瞬态窗口，不修锁）：本函数与
 // BuildCorazaDirectives 的读侧不持 wafFileMu，而 CRS 树交换
 // （swapCRSTreeFromStaging）持 wafFileMu 执行 RemoveAll(rules)→moveTree。
 // 两者互不阻塞，交换窗口内并发生成可能读到缺失/部分 rules 树（索引为空 →
@@ -449,7 +449,7 @@ func buildCRSRuleIndex() *CRSRuleIndex {
 // 并发生成若选中已被移除的文件，coraza 加载失败→/load 被拒，运行配置保持
 // 上一代（不发布半代）；③交换完成后引用键（目录条目数/尺寸/最大 mtime）必然
 // 变化，窗口内缓存的空索引不会被后续渲染复用。禁止让渲染持 wafFileMu：导入
-// 路径持锁序为 CaddyOpLock→wafFileMu，反向嵌套即 历史修复 死锁。
+// 路径持锁序为 CaddyOpLock→wafFileMu，反向嵌套即 AB-BA 死锁。
 func GetCRSRuleIndex() *CRSRuleIndex {
 	key := crsRuleIndexCacheKey(crsRuleIndexVersion())
 	crsRuleIndexMu.Lock()
@@ -462,7 +462,7 @@ func GetCRSRuleIndex() *CRSRuleIndex {
 	return index
 }
 
-// lazyCRSRuleIndex（审计 M4）返回链级惰性索引取值闭包：单次配置生成内
+// lazyCRSRuleIndex（历史修复）返回链级惰性索引取值闭包：单次配置生成内
 // BuildCorazaDirectives 的三个消费点（crsCoveredInfraGroupCodes /
 // emitCRSRuleGroupSelection / emitScopedCRSExclusions）各自直调 GetCRSRuleIndex
 // 会各付一次缓存键计算（ReadDir + 全量 stat + DB 查询），200 规则全量生成时

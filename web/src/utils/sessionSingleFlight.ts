@@ -1,4 +1,4 @@
-// 会话式单飞加载器（历史问题-F11 行为单源）：原 useCrsRuleIndex 内的模块级
+// 会话式单飞加载器（历史问题 行为单源）：原 useCrsRuleIndex 内的模块级
 // requestedSeq/loadedSeq/inflight 状态机抽出为无依赖工厂——消费方注入 load/apply，
 // 测试可直接验证「并发单飞、旧会话后到丢弃、新会话链式补取、失败可重试」的
 // 运行时语义，无需源码文本断言。

@@ -2,7 +2,7 @@ package services
 
 import "testing"
 
-// LBS-B-R4（历史）：原 TestExplicitAuditRoutesAreHandledByHandlers（手抄
+// 历史修复（历史）：原 TestExplicitAuditRoutesAreHandledByHandlers（手抄
 // 43 条 Explicit 路由子集断言 HasExplicitAuditEvent）已删除——历史问题-4 后
 // HasExplicitAuditEvent 从 auditRoutePolicies 派生，子集断言退化为恒真同义
 // 反复（对新增路由静默失效）。覆盖由更强钉吸收：audit_action_mapping_test.go
@@ -64,7 +64,7 @@ func TestClassifyAuditRouteMatrix(t *testing.T) {
 		// 任务触发（历史问题-1，历史）：升 Explicit——handler 按
 		// TaskTriggerSelfRecordsAudit 分流补记（非自记族）/跳过（自记族）。
 		{"POST", "/api/v1/system/tasks/:id/trigger", AuditPolicyExplicit},
-		// 三库手动更新：审计由任务体 defer 单记（2026-09-29 裁定+历史问题 历史问题-2）。
+		// 三库手动更新：审计由任务体 defer 单记（2026-09-29 裁定+历史问题-2）。
 		{"POST", "/api/v1/security/crs/update", AuditPolicySkip},
 		{"POST", "/api/v1/security/custom-rules", AuditPolicyExplicit},
 		{"PUT", "/api/v1/security/custom-rules/:id", AuditPolicyExplicit},
@@ -86,7 +86,7 @@ func TestClassifyAuditRouteMatrix(t *testing.T) {
 	}
 }
 
-// 历史问题(C3):POST /settings/oidc/test 是读探测语义(发现+JWKS 可达性,不落库
+// 历史问题(历史修复):POST /settings/oidc/test 是读探测语义(发现+JWKS 可达性,不落库
 // 配置)——只读 API Key 应可调用,须经 readOnlyWriteRoutes 放行。
 func TestIsReadOnlyWriteRoute_allowsOIDCDiscoveryProbe(t *testing.T) {
 	if !IsReadOnlyWriteRoute("POST", "/api/v1/settings/oidc/test") {
@@ -96,7 +96,7 @@ func TestIsReadOnlyWriteRoute_allowsOIDCDiscoveryProbe(t *testing.T) {
 
 // 历史问题（历史，主审上调 历史问题）：证书配置两条 test 路由移出只读白名单
 // ——dnsproviders.Validate 会真实 Present+CleanUp DNS TXT（非只读探测）。
-// U04a2-历史问题（历史）：CA 提供商 test 同步移出——provider == ZeroSSL 且
+// 历史问题（历史）：CA 提供商 test 同步移出——provider == ZeroSSL 且
 // 缺 EAB 时 TestCAProviderWithContext → AutoProvisionZeroSSLEAB 会申请 EAB 并
 // UPDATE ca_providers.credentials（caproviders.go:342-344），不是纯探测；
 // 只读 API Key/从节点/MFA step-up 三守卫必须恢复完整写权限校验。

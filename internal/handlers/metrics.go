@@ -19,7 +19,7 @@ import (
 
 var caddyMetricsHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
-// metricsDashboardCache:PER历史问题(历史)监控面板聚合结果缓存,5s TTL
+// metricsDashboardCache:历史问题(历史)监控面板聚合结果缓存,5s TTL
 // (复用 helpers.go systemSampleTTL 同模式)——面板自动刷新/多开页签在同一
 // 抓取周期内复用聚合;抓取/解析/查询失败不写缓存(错误直出,下次重试)。
 var metricsDashboardCache struct {
@@ -41,7 +41,7 @@ func fetchCaddyMetrics(ctx context.Context, url string) ([]byte, error) {
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return nil, fmt.Errorf("Caddy 指标接口返回状态码 %d", resp.StatusCode)
 	}
-	// M21（2026-09-05 审计）：与 services.go collect 的 历史问题 W3-2 同型——limit+1
+	// 历史修复（2026-09-05 审计）：与 services.go collect 的 历史问题 同型——limit+1
 	// 探测读取，超 16MB 显式报错（共用本函数的指标端点回 502），防止指标基数
 	// 膨胀时的无界内存分配。
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20+1))
@@ -64,7 +64,7 @@ func (h *Handlers) GetMetricsOverview(c *gin.Context) {
 }
 
 func (h *Handlers) GetMetricsDashboard(c *gin.Context) {
-	// PER历史问题:TTL 内命中直接复用聚合结果(见 metricsDashboardCache 注释);
+	// 历史问题:TTL 内命中直接复用聚合结果(见 metricsDashboardCache 注释);
 	// 锁随整个聚合持有,与 helpers.go getCachedDiskUsage 同模式——并发请求
 	// 串行复用同一抓取,不会击穿到 Caddy。
 	metricsDashboardCache.Lock()
@@ -143,7 +143,7 @@ func (h *Handlers) GetMetricsDashboard(c *gin.Context) {
 	for _, rule := range rules {
 		metrics := emptyRuleMetrics()
 		if rule.enabled && rule.protocol == "tcp" {
-			// 历史修复 历史问题：TCP 口径=上游地址归集（caddy-l4 指标仅 upstream 标签，
+			// 历史问题：TCP 口径=上游地址归集（caddy-l4 指标仅 upstream 标签，
 			// 见 tcpRuleMetrics 注释）——多规则共享上游地址时为跨规则合计值，
 			// Dashboard 请求数/处理中列 tooltip 已明示。
 			metrics = metricsIndex.tcpRuleMetrics(upstreamsByRule[rule.id])
@@ -153,7 +153,7 @@ func (h *Handlers) GetMetricsDashboard(c *gin.Context) {
 		metrics["enabled"] = rule.enabled
 		blocked := blockedByRule[rule.id]
 		metrics["blocked"] = blocked
-		// 4xx 扣除安全拦截(共享 deductBlockedFrom4xx,F6)
+		// 4xx 扣除安全拦截(共享 deductBlockedFrom4xx,历史修复)
 		deductBlockedFrom4xx(metrics, blocked)
 		ruleMetrics[rule.id] = metrics
 	}
@@ -199,9 +199,9 @@ func (h *Handlers) GetRuleMetrics(c *gin.Context) {
 		}
 		metrics, parseErr = parseTCPRuleMetricsFromPrometheus(string(body), upstreams)
 		if parseErr == nil {
-			// F6(第 28.6 轮审计):TCP 规则无 lazybalancer 计数(L4 无插件)——
+			// 历史修复(历史审计):TCP 规则无 lazybalancer 计数(L4 无插件)——
 			// blocked 恒 0,与 Dashboard 对该形态恒写 blocked 键对齐。
-			// 历史修复 历史问题：本端点 TCP 指标同为上游地址口径（L4 指标仅 upstream
+			// 历史问题：本端点 TCP 指标同为上游地址口径（L4 指标仅 upstream
 			// 标签）——共享上游地址的多规则返回相同合计值，非规则独占计数。
 			metrics["blocked"] = int64(0)
 		}
@@ -217,10 +217,10 @@ func (h *Handlers) GetRuleMetrics(c *gin.Context) {
 }
 
 // parseMetricsInterval 解析 interval 参数（"<n>h"/"<n>d"/"<n>m"，空/非法回退
-// 1h；上限 168h/7d/10080m——F9(历史):保留期固定 7 天）为 SQLite
-// datetime modifier 与窗口秒数。SYS-R1（历史）：单一解析源——此前
+// 1h；上限 168h/7d/10080m——历史修复(历史):保留期固定 7 天）为 SQLite
+// datetime modifier 与窗口秒数。历史修复（历史）：单一解析源——此前
 // metricsIntervalModifier 与 metricsIntervalSeconds 两份手写解析靠注释维持
-// 一致（U8a-历史问题 分桶粒度=窗口秒数/720 必须对应 SQL modifier），收敛后编译期
+// 一致（历史问题 分桶粒度=窗口秒数/720 必须对应 SQL modifier），收敛后编译期
 // 保证。SQLite 没有 "1h" 语法，算术拼接得 NULL。
 func parseMetricsInterval(interval string) (modifier string, seconds int64) {
 	interval = strings.TrimSpace(strings.ToLower(interval))
@@ -287,7 +287,7 @@ func (h *Handlers) GetRuleMetricsHistory(c *gin.Context) {
 	}
 	modifier, bucketSeconds, bucketCount := metricsHistoryRange(c.DefaultQuery("range", "24h"))
 	if db.MetricsDB == nil {
-		// B2-历史问题（历史）：MetricsDB 未装配（单测/嵌入形态）不得
+		// 历史问题（历史）：MetricsDB 未装配（单测/嵌入形态）不得
 		// nil-deref panic——对齐 历史问题 家族（GetIPEventCount/GetRuleStageStats）
 		// 返回空数据 200。
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"protocol": protocol, "supported": true, "bucket_interval_seconds": bucketSeconds, "rows": []any{}}})
@@ -355,10 +355,10 @@ func (h *Handlers) GetRuleMetricsHistory(c *gin.Context) {
 func (h *Handlers) GetMetricsHistory(c *gin.Context) {
 	ruleID := c.Query("rule_id")
 	rawInterval := c.DefaultQuery("interval", "1h")
-	// SYS-R1（历史）：modifier 与窗口秒数取自同一解析（parseMetricsInterval），
-	// 杜绝双解析器漂移（U8a-历史问题 分桶粒度推导的正确性前提）。
+	// 历史修复（历史）：modifier 与窗口秒数取自同一解析（parseMetricsInterval），
+	// 杜绝双解析器漂移（历史问题 分桶粒度推导的正确性前提）。
 	interval, intervalSeconds := parseMetricsInterval(rawInterval)
-	// U8a-历史问题（历史）：分桶上限——镜像 get_rule_metrics_history 的窗口
+	// 历史问题（历史）：分桶上限——镜像 get_rule_metrics_history 的窗口
 	// 函数范式（每桶取末行样本，桶数 ≤720）。此前无上限无分桶：默认配置
 	// 7 天窗 30s 间隔可达 ~2 万行 ≈2.5MB 一次性返回（5s 间隔可达 12 万行）。
 	metricsHistoryMaxBuckets := int64(720)
@@ -371,7 +371,7 @@ func (h *Handlers) GetMetricsHistory(c *gin.Context) {
 	var err error
 
 	if db.MetricsDB == nil {
-		// B2-历史问题（历史）：未装配形态返回空列表 `[]`（同 U04d-09
+		// 历史问题（历史）：未装配形态返回空列表 `[]`（同 历史修复
 		// 空结果形态），不得 nil-deref panic。
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: []any{}})
 		return
@@ -436,7 +436,7 @@ func (h *Handlers) GetMetricsHistory(c *gin.Context) {
 		BytesOut      int64     `json:"bytes_out"`
 	}
 
-	// U04d-09：空结果必须是 []（同族列表端点与 OpenAPI 契约）——nil slice
+	// 历史修复：空结果必须是 []（同族列表端点与 OpenAPI 契约）——nil slice
 	// 序列化为 null 会让客户端额外处理 null 形状。
 	metrics := make([]MetricRow, 0)
 	for rows.Next() {

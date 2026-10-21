@@ -332,7 +332,7 @@ func TestDownloadProgressReader_callbacksViaWriteRuleSetDownload(t *testing.T) {
 }
 
 func TestCRSDownloadTarballLogged_startProgressCompletionLines(t *testing.T) {
-	// Given 内存下载服务：显式 Content-Length + 分 10 块 flush 模拟流式到达
+	// Given 内存下载服务：显式 历史修复 + 分 10 块 flush 模拟流式到达
 	body := bytes.Repeat([]byte("c"), 64*1024)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
@@ -399,7 +399,7 @@ func TestCRSDownloadTarballLogged_startProgressCompletionLines(t *testing.T) {
 	}
 }
 
-// SEC-历史问题（历史）：gitHubAPIToken 读库失败（非 ErrNoRows）此前静默
+// 历史问题（历史）：gitHubAPIToken 读库失败（非 ErrNoRows）此前静默
 // 降级无令牌——与同文件 getGitHubProxyURL「读库故障记日志留痕」口径分裂。
 // 补 warn 后降级可见；行缺失（ErrNoRows）属正常「未配置」不告警。
 func TestGitHubAPIToken_readFailureLogsWarn(t *testing.T) {

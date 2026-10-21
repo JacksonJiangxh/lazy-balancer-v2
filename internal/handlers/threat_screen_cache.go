@@ -33,7 +33,7 @@ const topTargetsCacheTTL = time.Minute
 
 // topTargetsCacheKey 缓存键含 *sql.DB 指针与窗口锚点 sinceMinute——
 // 测试换库/换窗口即失效，不串库不串窗口；窗口每分钟前移即新键，不会返回
-// 含窗口外事件的过期聚合。窗口粒度只由 sinceMinute 编码（HC-04 历史：
+// 含窗口外事件的过期聚合。窗口粒度只由 sinceMinute 编码（历史修复：
 // 此前键上还带无消费方的 hours，形成第二事实源——查询只按 sinceMinute 过滤，
 // 键上的 hours 会让后续改动窗口语义时误判已有隔离）。
 type topTargetsCacheKey struct {
@@ -54,7 +54,7 @@ var (
 
 // threatTopTargets 窗口内目标维度 rollup（security_event_target_rollup，
 // rule_caddy_id 分组）计数前 3 → 主库 lb_rules 取 name/domain。
-//   - 历史 历史问题：读分钟 rollup 而非原始事件表——原始表受保留期/行帽
+//   - 历史问题：读分钟 rollup 而非原始事件表——原始表受保留期/行帽
 //     裁剪，旁路会让「TOP 被攻击站点」与同屏其余卡片窗口分裂；
 //   - 历史问题：保留/私网地址在固化期已排除（与其余维度同口径）；
 //   - 历史问题：先批量解析现存规则，再按计数顺序取前 3 条**现存**目标——已

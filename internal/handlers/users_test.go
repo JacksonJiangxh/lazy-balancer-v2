@@ -56,7 +56,7 @@ func TestDeleteUser_rejectsLastEnabledAdministrator(t *testing.T) {
 func TestToggleUserStatus_rejectsDisablingLastEnabledAdministrator(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	seedUserAuditTest(t, 5, "admin-5", "admin", true)
-	// SYSRENDE历史问题-3(历史):自禁用守卫(400)先于最后管理员守卫(409)——
+	// 历史问题(历史):自禁用守卫(400)先于最后管理员守卫(409)——
 	// 本测试意图是最后管理员守卫,actorID 改 99(非自身)避开自禁用前置拦截。
 	// 目标用 id=5:id=1 已被初始管理员保护(2026-09-18)先行 400 拦截。
 	response := serveUserMutation(h, http.MethodPut, "/users/5", `{"is_enabled":false}`, 99, h.ToggleUserStatus)
@@ -75,7 +75,7 @@ func TestUpdateUser_rejectsDemotingLastEnabledAdministrator(t *testing.T) {
 	}
 }
 
-// SYS-F4（历史 历史问题）：UpdateUser 的 UPDATE 命中 0 行此前一律误报
+// 历史修复（历史）：UpdateUser 的 UPDATE 命中 0 行此前一律误报
 // 409「不能移除最后一个已启用管理员」——并发删除形态（读旧行后、UPDATE 前
 // 行消失）应镜像 ToggleUserStatus 先例按 COUNT 分判：行已不在 → 404；
 // 行仍在（末管理员 EXISTS 门拦截）→ 409。
@@ -141,7 +141,7 @@ func TestLastAdministratorGuard_allowsChangeWhenAnotherEnabledAdministratorExist
 	h := newBackupTestHandlers(t)
 	seedUserAuditTest(t, 4, "admin-4", "admin", true)
 	seedUserAuditTest(t, 2, "admin-2", "admin", true)
-	// SYSRENDE历史问题-3(历史):actorID 改 2(admin-2 操作 admin-4)——
+	// 历史问题(历史):actorID 改 2(admin-2 操作 admin-4)——
 	// 自禁用守卫(400)前置,本测试意图是「另一管理员存在时允许」;目标非
 	// id=1(初始管理员保护会先行 400)。
 	response := serveUserMutation(h, http.MethodPut, "/users/4", `{"is_enabled":false}`, 2, h.ToggleUserStatus)
@@ -222,7 +222,7 @@ func serveUserMutation(h *Handlers, method, path, body string, actorID int, hand
 	return response
 }
 
-// SYSRENDE历史问题-3(历史):自禁用守卫目标形状——操作者禁用自己被 400 拒绝。
+// 历史问题(历史):自禁用守卫目标形状——操作者禁用自己被 400 拒绝。
 func TestToggleUserStatus_rejectsDisablingSelf(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	seedUserAuditTest(t, 1, "admin-1", "admin", true)
@@ -374,7 +374,7 @@ func TestResetUserPassword_clearsLoginLockout(t *testing.T) {
 	}
 }
 
-// APIMCP41-2(历史,2026-09-19 用户裁定「统一遵循请求体大小配置项限制」)
+// 历史修复(历史,2026-09-19 用户裁定「统一遵循请求体大小配置项限制」)
 // 端点级实证:CreateUser 在 bind 前经 guardConfiguredJSONBody——配置 1MB 上限时
 // ≈2MB body 预检 413(未接 guard 则落入 username max=50 校验 400),小 body 正常 201。
 func TestCreateUser_configuredBodyLimit413(t *testing.T) {
@@ -391,7 +391,7 @@ func TestCreateUser_configuredBodyLimit413(t *testing.T) {
 	}
 }
 
-// F-SYSR-1（历史）：ListUsers 空表出口归一——data 须为 [] 而非 null
+// 历史修复（历史）：ListUsers 空表出口归一——data 须为 [] 而非 null
 // （与 apikeys scanAPIKeys 出口同形，两形状并存会让前端判空逻辑分裂）。
 func TestListUsers_emptyTableReturnsEmptyArray(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -412,7 +412,7 @@ func TestListUsers_emptyTableReturnsEmptyArray(t *testing.T) {
 	}
 }
 
-// B1-04（历史）：OIDC 门对 password 字段的拦截粒度——空密码串在策略层
+// 历史修复（历史）：OIDC 门对 password 字段的拦截粒度——空密码串在策略层
 // 语义为「不修改」（validatePasswordPolicy 空值放行、passwordHash 仅在非空时
 // 生成），管理员更新 OIDC 用户角色/启停时载荷携带空 password 键不应被拒。
 func TestUpdateUser_oidcEmptyPasswordTreatedAsUnchanged(t *testing.T) {
@@ -442,7 +442,7 @@ func TestUpdateUser_oidcEmptyPasswordTreatedAsUnchanged(t *testing.T) {
 	}
 }
 
-// B1-05（历史）：审计富化的 username 回填查询此前静默吞错（_ = Scan）——
+// 历史修复（历史）：审计富化的 username 回填查询此前静默吞错（_ = Scan）——
 // DB 故障下操作照常 200 且审计详情缺失用户名。改为与其余 DB 错误同口径 500
 // （RENAME COLUMN 注入读失败，同 TestUserMutations_rejectWhenIdentityUnreadable 形状）。
 func TestUserMutations_failWhenUsernameUnreadable(t *testing.T) {
@@ -472,7 +472,7 @@ func TestUserMutations_failWhenUsernameUnreadable(t *testing.T) {
 	})
 }
 
-// B1-历史问题（历史）：OIDC 写保护门按「值实际变化」判定——携带与库中
+// 历史问题（历史）：OIDC 写保护门按「值实际变化」判定——携带与库中
 // 同值的 display_name、空 username 或同值 username 属无实际变更的局部更新，
 // 不得整单 400（角色/启停是本地管理语义）；真实字段变更仍 400。
 func TestUpdateUser_oidcGateComparesValuesNotFieldPresence(t *testing.T) {

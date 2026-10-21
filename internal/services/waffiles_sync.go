@@ -29,10 +29,10 @@ import (
 // （ip2regionupdate 安装段 / ApplyWafFileBundle 直写）四方写相位与
 // BuildWafFileBundle 读相位（lbbak 导出 / 集群按需端点共用）在此串行——此前
 // 无共享锁，lbbak 导入与三库更新器交错会产生混合/残缺 rules 树（部分防护静默
-// 失效 历史修复）、撕裂 .iplist（缺条目名单静默残缺）与 xdb 元数据瞬时错位；
+// 失效 fail-open）、撕裂 .iplist（缺条目名单静默残缺）与 xdb 元数据瞬时错位；
 // 读侧不入锁则打出半新半旧 bundle（manifest sha256 自洽不可检）。
 // 锁只包文件相位（staging 先行、网络下载与 Caddy 重载在锁外——锁内取
-// CaddyOpLock 会与导入路径 CaddyOpLock→wafFileMu 的持锁序构成 历史修复）。
+// CaddyOpLock 会与导入路径 CaddyOpLock→wafFileMu 的持锁序构成 AB-BA）。
 var wafFileMu sync.Mutex
 
 // WafFileLock 返回 WAF 数据文件读写互斥锁（跨包消费：handlers 侧 lbbak 导入
@@ -50,7 +50,7 @@ type WafFileBundle struct {
 	IP2RegionTag string `json:"ip2region_version"`
 	IP2RegionSha string `json:"ip2region_sha256"`
 	// 原始字节载荷（JSON 序列化时由 encoding/json 转 base64；lbbak 通道直接
-	// 以原始字节入 tar 条目）——字段名已去 B64 后缀（历史补充轮 历史修复）。
+	// 以原始字节入 tar 条目）——字段名已去 B64 后缀（历史修复）。
 	CRSTarGz []byte `json:"crs_tar_gz,omitempty"`
 	Xdb      []byte `json:"xdb,omitempty"`
 	// RDB 文件化：威胁库 .fast 文件（主节点编译产物，从节点直接使用零编译）
@@ -183,7 +183,7 @@ func wafFileBundleComplete(ref *models.ClusterWafFilesRef, bundle *WafFileBundle
 
 // buildWafFileBundleLocked 返回 bundle、引用键与本次引用（调用方必须已持
 // wafFileMu）。命中缓存时不重读任何文件；ref 始终是当前时刻的引用（用于
-// 响应体缓存的完整性门，SS87-历史问题）。
+// 响应体缓存的完整性门）。
 func buildWafFileBundleLocked() (*WafFileBundle, string, *models.ClusterWafFilesRef) {
 	ref := buildWafFileRefLocked()
 	if ref == nil {
@@ -221,12 +221,12 @@ func BuildWafFileBundleResponse() []byte {
 	}
 	body, err := json.Marshal(models.APIResponse{Code: 0, Data: bundle})
 	if err != nil {
-		// 该结构只含字符串/字节切片/数字，Marshal 实际不可失败；保持 历史修复
+		// 该结构只含字符串/字节切片/数字，Marshal 实际不可失败；保持 fail-visible
 		// 而非缓存半成品。
 		Logf("error", "序列化 WAF 数据包失败: %v", err)
 		return nil
 	}
-	// SS87-历史问题：响应体缓存也以完整性与引用键为门——主端瞬时读失败产出
+	// 历史问题：响应体缓存也以完整性与引用键为门——主端瞬时读失败产出
 	// 「声明哈希非空但缺内容」的 bundle 时，不得把异常形态缓存并在合并窗口内
 	// 放大传播（从端每次都拒绝，仅浪费重试周期）。不完整时照常返回本次字节。
 	if wafFileBundleCache.key == key && wafFileBundleComplete(ref, bundle) {
@@ -236,7 +236,7 @@ func BuildWafFileBundleResponse() []byte {
 	return body
 }
 
-// BuildWafFileRef computes the live 历史修复 hashes without file content;
+// BuildWafFileRef computes the live rule-file hashes without file content;
 // the snapshot embeds this reference so unchanged files never ride along.
 func BuildWafFileRef() *models.ClusterWafFilesRef {
 	// 历史问题：读相位统一持 wafFileMu——导出侧（本函数）与写相位（CRS 树交换/
@@ -248,7 +248,7 @@ func BuildWafFileRef() *models.ClusterWafFilesRef {
 
 // buildWafFileRefLocked 是 BuildWafFileRef 的无锁核心（调用方必须已持
 // wafFileMu；BuildWafFileBundle 与导出一侧共用，杜绝锁内自取）。
-// 历史修复 历史问题（历史）：与 checked 变体单源——组件存在但读取/哈希
+// 历史问题（历史）：与 checked 变体单源——组件存在但读取/哈希
 // 失败不再静默省略分量（旧行为让快照 ref 少一项：从端不拉取、主端无告警，
 // 主从静默分叉），而是错误日志显式化 + 整体返回 nil。消费侧语义：
 // 主端快照缺 waf_files 引用（从端跳过比对、保留现状）与从端本地漂移检测
@@ -465,7 +465,7 @@ func validThreatFileName(name string) bool {
 }
 
 // scanThreatFastFiles 是 scanThreatFastFilesChecked 的静默容错形态
-// （SS87-历史问题 单源——此前两份 glob+白名单+哈希实现，后续修补易漏一侧）：
+// （ 单源——此前两份 glob+白名单+哈希实现，后续修补易漏一侧）：
 // 仅 wafFilesRefDiffers 消费，任一枚举/哈希失败按「不可判定」返回空映射，
 // 使漂移判定成立（全量重拉，方向安全），不向比对路径上抛错误。
 func scanThreatFastFiles() map[string]string {
@@ -477,13 +477,13 @@ func scanThreatFastFiles() map[string]string {
 }
 
 // BuildWafFileBundle collects the live rule files with content; served by the
-// 历史修复 endpoint, and never embedded in snapshots.
+// on-demand endpoint, and never embedded in snapshots.
 // 历史问题-01（历史）：本函数是 WAF 数据文件读者——两个调用方（lbbak 导出
 // buildLbbakExport / 集群按需端点 GetWafFiles）都曾在无锁下读 CRS 树/xdb/
 // 威胁 .fast，与写者（CRS 树交换/威胁 .iplist 写编译/xdb 安装/lbbak 导入
 // 直写）交错会打出半新半旧 bundle：lbbak manifest 的 sha256 按内存字节计算
 // 自洽仍通过，还原后 WAF 静默降级。读取全程在 wafFileMu 互斥段内（与写侧
-// 文件相位串行）；锁内不取 CaddyOpLock（写侧同口径，防 历史修复）。
+// 文件相位串行）；锁内不取 CaddyOpLock（写侧同口径，防 AB-BA）。
 // 历史问题-01：引用指纹不变时直接复用已物化 bundle（见 wafFileBundleCache）。
 func BuildWafFileBundle() *WafFileBundle {
 	wafFileMu.Lock()
@@ -493,7 +493,7 @@ func BuildWafFileBundle() *WafFileBundle {
 }
 
 // BuildWafFileBundleInLockChecked 是锁内 bundle 物化的完整性显式变体
-// （历史问题 历史）：返回物化是否覆盖引用声明的全部组件。lbbak 导出必须消费
+// （历史问题）：返回物化是否覆盖引用声明的全部组件。lbbak 导出必须消费
 // 本变体——瞬时读失败（tar 打包/xdb 读取/威胁 .fast 读取）会产出「manifest
 // 自洽但缺 CRS/xdb/威胁文件」的包，恢复时静默缺安全数据；集群按需端点因从端
 // 有 wafFilesRefMatchesBundle 校验而安全，lbbak 侧没有同等校验。
@@ -513,7 +513,7 @@ func BuildWafFileBundleInLockChecked() (*WafFileBundle, bool) {
 
 // wafFilesRefDiffers reports whether the slave's live files fail to match
 // any artifact referenced by the snapshot.
-// rewriteVersionIfMissingOrStale 保证 .version 与主节点声明的 tag 一致（历史问题 A-#4）：
+// rewriteVersionIfMissingOrStale 保证 .version 与主节点声明的 tag 一致（历史问题）：
 // tag 非空且磁盘缺失或内容不符时原子补写（tmp+rename）；tag 为空是合法收敛信号
 // （主端 .version 缺失/损坏/形状校验置空），本地陈旧 tag 必须一并清除，否则
 // waf_files 节哈希（含标签）两端永不对齐，从端永久假漂移全量重拉；写失败必须
@@ -528,7 +528,7 @@ func rewriteVersionIfMissingOrStale(path, tag string) error {
 	if current, err := os.ReadFile(path); err == nil && strings.TrimSpace(string(current)) == strings.TrimSpace(tag) {
 		return nil
 	}
-	// D1-历史问题：单源原子落盘（tmp+fsync+父目录 fsync）。
+	// 历史问题：单源原子落盘（tmp+fsync+父目录 fsync）。
 	return writeFileAtomicSynced(path, []byte(tag), 0644)
 }
 
@@ -556,7 +556,7 @@ func wafFilesRefDiffers(r *models.ClusterWafFilesRef) bool {
 		}
 	}
 	// 威胁库 .fast 也属于引用面：同步开关关闭时仅威胁库更新也必须产生
-	// “同步警告”审计（历史 历史问题-3）。
+	// “同步警告”审计（历史问题-3）。
 	if len(r.ThreatSha256s) > 0 {
 		local := scanThreatFastFiles()
 		if len(local) != len(r.ThreatSha256s) {
@@ -572,7 +572,7 @@ func wafFilesRefDiffers(r *models.ClusterWafFilesRef) bool {
 }
 
 // wafFilesRefMatchesBundle verifies fetched content against the reference
-// so a master 历史修复 file update cannot silently install unverified bytes.
+// so a master mid-sync file update cannot silently install unverified bytes.
 func wafFilesRefMatchesBundle(r *models.ClusterWafFilesRef, b *WafFileBundle) bool {
 	if r == nil || b == nil {
 		return false
@@ -605,8 +605,8 @@ func wafFilesRefMatchesBundle(r *models.ClusterWafFilesRef, b *WafFileBundle) bo
 }
 
 // ApplyWafFileBundle writes the bundle's files to disk when they differ from
-// what is already live. It is idempotent: matching content is a 历史修复, so a
-// 历史修复 without rule changes costs only a hash comparison. 历史修复
+// what is already live. It is idempotent: matching content is a no-op, so a
+// re-sync without rule changes costs only a hash comparison. 历史修复
 // changed flags let callers report exactly which dataset was updated.
 func ApplyWafFileBundle(bundle *WafFileBundle) (crsChanged, xdbChanged, threatChanged bool, err error) {
 	if bundle == nil {
@@ -616,7 +616,7 @@ func ApplyWafFileBundle(bundle *WafFileBundle) (crsChanged, xdbChanged, threatCh
 	// 时 BuildWafFileBundle 会产出该形状):从端应用「无操作」后漂移判定
 	// 永不收敛,必须拒绝(主端恢复后下轮同步自愈)。
 	//
-	// SS87-历史问题 边界披露（有意设计，不修）：本函数只对「bundle 携带的组件」
+	//  边界披露（有意设计，不修）：本函数只对「bundle 携带的组件」
 	// 动作——主端引用缺席某组件（ref 无 CRS 哈希 / 无 xdb / 无威胁条目）时
 	// 从端既有树/库**原样保留**，不以缺席表达删除。安全语义边界：主端组件
 	// 缺失时其安全链因库缺失不渲染，而从端仍按旧树全量拦截——主从拦截面
@@ -669,18 +669,18 @@ func ApplyWafFileBundle(bundle *WafFileBundle) (crsChanged, xdbChanged, threatCh
 			if got := hex.EncodeToString(sum[:]); got != bundle.IP2RegionSha {
 				return crsChanged, xdbChanged, threatChanged, newWafFileApplyError("xdb", fmt.Errorf("同步 IP2Region数据库哈希不匹配（声明 %s，实际 %s），已拒绝落盘", bundle.IP2RegionSha, got))
 			}
-			// D1-历史问题：单源原子落盘（tmp+fsync+父目录 fsync；临时文件点前缀，
+			// 历史问题：单源原子落盘（tmp+fsync+父目录 fsync；临时文件点前缀，
 			// 不会被 waf bundle 打包）。
 			if err := writeFileAtomicSynced(ip2regionLivePath, bundle.Xdb, 0644); err != nil {
 				return crsChanged, xdbChanged, threatChanged, newWafFileApplyError("xdb", fmt.Errorf("落盘同步 IP2Region数据库: %w", err))
 			}
 			xdbChanged = true
 		}
-		// 历史问题 A-#4：xdb 未变化也要校验/补写 .version——.version 丢失或写失败
+		// 历史问题：xdb 未变化也要校验/补写 .version——.version 丢失或写失败
 		// 会让本地 ref 的 tag 为空，wafFilesDrifted 每轮误判漂移且全量重拉
 		// 走不到本分支的自愈（重拉时 sha 相同），从节点永久假警报。
-		// SS87-历史问题：补写必须晚于内容哈希校验——先写 sidecar 再验哈希会在
-		// 拒绝路径留下「新标签 + 旧库」跨代偏斜（F-历史问题-02 的收敛目标）。
+		// 历史问题：补写必须晚于内容哈希校验——先写 sidecar 再验哈希会在
+		// 拒绝路径留下「新标签 + 旧库」跨代偏斜（历史问题-02 的收敛目标）。
 		if tagErr := rewriteVersionIfMissingOrStale(ip2regionLivePath+".version", bundle.IP2RegionTag); tagErr != nil {
 			return crsChanged, xdbChanged, threatChanged, newWafFileApplyError("xdb", fmt.Errorf("写入同步 IP2Region数据库版本标记: %w", tagErr))
 		}
@@ -694,7 +694,7 @@ func ApplyWafFileBundle(bundle *WafFileBundle) (crsChanged, xdbChanged, threatCh
 			return crsChanged, xdbChanged, threatChanged, fmt.Errorf("同步威胁库文件名非法 %q，已拒绝整包", tf.Name)
 		}
 		if len(tf.Content) == 0 {
-			// SS87-历史问题：声明哈希非空 = 主端引用声称存在该文件（0 字节文件
+			// 历史问题：声明哈希非空 = 主端引用声称存在该文件（0 字节文件
 			// 的 sha256 也非空），但包内无内容——从端若静默 continue 则永不
 			// 落盘、ref 哈希永不等，每轮误判漂移全量重拉永不收敛。与缺哈希
 			// 同纵深：拒绝整包（主端恢复后下轮自愈）。
@@ -732,7 +732,7 @@ func ApplyWafFileBundle(bundle *WafFileBundle) (crsChanged, xdbChanged, threatCh
 		// 两个调用方（cluster_apply 的 aerr 分支 / lbbak 导入）err 路径均不
 		// 消费 changed 标志，无需逐 err 路径置回。
 		threatChanged = true
-		// D1-历史问题：单源原子落盘（tmp+fsync+父目录 fsync；临时文件点前缀，
+		// 历史问题：单源原子落盘（tmp+fsync+父目录 fsync；临时文件点前缀，
 		// 不会被 waf bundle 打包）。
 		if err := writeFileAtomicSynced(fastPath, tf.Content, 0644); err != nil {
 			return crsChanged, xdbChanged, threatChanged, fmt.Errorf("写威胁库 .fast %s: %w", tf.Name, err)
@@ -742,7 +742,7 @@ func ApplyWafFileBundle(bundle *WafFileBundle) (crsChanged, xdbChanged, threatCh
 }
 
 // skipWafSyncTransient 判断相对路径是否为不得进入 waf 同步打包的瞬态文件
-// （M24 防御兜底）：任意层级的点前缀路径（.staging/.历史修复/隐藏标记）与
+// （历史修复 防御兜底）：任意层级的点前缀路径（.staging/.sync-in/隐藏标记）与
 // *.bak/*.old 后缀（CRS 更新器备份残树，正常已迁往 crs.transient 兄弟目录，
 // 此处兜底旧版本残留/异常路径）。混入会让主从 tar 指纹按瞬态内容计算，
 // 两端永不对齐 → 全量重拉死循环。
@@ -857,11 +857,11 @@ func writeTarEntries(dir string, tw *tar.Writer) error {
 const maxWafSyncExtractFiles = 2000 // 2000 文件数上限
 
 // maxWafSyncExtractBytes 256MB 解包字节上限。var 以便测试缩小预算构造
-// 恰好用尽的边界包（历史问题 历史问题），生产路径不修改。
+// 恰好用尽的边界包（历史问题），生产路径不修改。
 var maxWafSyncExtractBytes int64 = 256 << 20
 
 // untarGzTo extracts data into destDir atomically. When expectSum is
-// 历史修复, the 历史修复 staging tree must hash to it, or the sync is
+// non-empty, the re-archived staging tree must hash to it, or the sync is
 // rejected before anything touches the live tree.
 func untarGzTo(data []byte, destDir string, expectSum string) error {
 	gz, err := gzip.NewReader(bytes.NewReader(data))
@@ -910,8 +910,8 @@ func untarGzTo(data []byte, destDir string, expectSum string) error {
 				return fmt.Errorf("同步规则集文件数超过上限（%d 个），已拒绝落盘", maxWafSyncExtractFiles)
 			}
 			// 先减后比：writtenBytes 恒 ≤ maxWafSyncExtractBytes（每个被接受条目维持
-			// 该不变量），减法不下溢；加法在 hdr.Size 接近 2^63-1（GNU 历史修复）
-			// 时溢出为负会绕过上限（历史问题 A-#2）。
+			// 该不变量），减法不下溢；加法在 hdr.Size 接近 2^63-1（GNU base-256）
+			// 时溢出为负会绕过上限（历史问题）。
 			if hdr.Size < 0 || hdr.Size > maxWafSyncExtractBytes-writtenBytes {
 				return fmt.Errorf("同步规则集解包体积超过上限（%d 字节），已拒绝落盘", maxWafSyncExtractBytes)
 			}
@@ -948,7 +948,7 @@ func untarGzTo(data []byte, destDir string, expectSum string) error {
 			return fmt.Errorf("同步规则集哈希不匹配（声明 %s，实际 %s），已拒绝落盘", expectSum, sum)
 		}
 	}
-	// Replace live tree: backup then swap (历史修复, 历史修复 like
+	// Replace live tree: backup then swap (copy-based, overlayfs-safe like
 	// the CRS updater itself).
 	backup := destDir + ".sync-bak"
 	os.RemoveAll(backup)
@@ -965,7 +965,7 @@ func untarGzTo(data []byte, destDir string, expectSum string) error {
 		// 情形。copyDir 只覆盖同名文件、不删除旧树中新包缺失的文件，必须先清空
 		// destDir 再复制（对齐 crsinstall.go 安装前的显式 RemoveAll 语义），否则
 		// CRS 更新删除/改名规则文件后从端树为旧+新合并、tarGzDirSum 永不等于
-		// 声明哈希，漂移检测永不收敛（历史问题 A-#2）。
+		// 声明哈希，漂移检测永不收敛（历史问题）。
 		if err := os.RemoveAll(destDir); err != nil {
 			// 历史问题 backup 已就绪，清空失败同样尽力恢复，与下方 copyDir
 			// 失败分支恢复面对称；恢复错误并入返回，不吞掉。
@@ -973,7 +973,7 @@ func untarGzTo(data []byte, destDir string, expectSum string) error {
 		}
 		if err := copyDir(staging, destDir); err != nil {
 			// 复制中途失败时 destDir 已被清空但可能残留部分新树文件——恢复自身的
-			// 错误并入返回错误，不吞掉（历史问题 历史修复）。首装（destDir 原本不存在）
+			// 错误并入返回错误，不吞掉（历史修复）。首装（destDir 原本不存在）
 			// 无备份可恢复，必须把部分新树整树删除回到「不存在」终态。
 			restoreErr := restoreWafTreeFromBackup(backup, destDir)
 			if !destExisted {
@@ -987,7 +987,7 @@ func untarGzTo(data []byte, destDir string, expectSum string) error {
 }
 
 // restoreWafTreeFromBackup 尽力从 backup 恢复 destDir：先整树清空再从备份复制，
-// 保证恢复结果为纯旧树而非旧+新混合树（历史问题 历史修复，对齐 untarGzTo 的清空语义）。
+// 保证恢复结果为纯旧树而非旧+新混合树（历史修复，对齐 untarGzTo 的清空语义）。
 // backup 不存在（备份时刻 destDir 不存在）时无可恢复对象，按空操作收尾。
 func restoreWafTreeFromBackup(backup, destDir string) error {
 	if _, statErr := os.Stat(backup); statErr != nil {
@@ -1002,7 +1002,7 @@ func restoreWafTreeFromBackup(backup, destDir string) error {
 	return nil
 }
 
-// fetchWafFiles pulls the full file bundle from the master's 历史修复
+// fetchWafFiles pulls the full file bundle from the master's on-demand
 // endpoint and verifies it against the snapshot reference before use.
 func (s *SyncService) fetchWafFiles(ctx context.Context, ref *models.ClusterWafFilesRef) (*WafFileBundle, error) {
 	var masterURL, token string
@@ -1020,7 +1020,7 @@ func (s *SyncService) fetchWafFiles(ctx context.Context, ref *models.ClusterWafF
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		// body 截断至 200B 并回退到合法 历史修复 边界：错误消息经审计详情落库
+		// body 截断至 200B 并回退到合法 UTF-8 边界：错误消息经审计详情落库
 		// （无界写入），超长/非法字节 body 会膨胀审计库并产生乱码（历史问题）。
 		// 复用 cluster_sync.go 的既有截断模式（:586-587）。
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
@@ -1084,7 +1084,7 @@ func sanitizeBundleVersion(v string) string {
 	return v
 }
 
-// SanitizeBundleVersion 是 sanitizeBundleVersion 的导出包装(历史问题-F6):
+// SanitizeBundleVersion 是 sanitizeBundleVersion 的导出包装(历史问题):
 // 备份导入(lbbak)路径与集群同步路径共用同一版本串形状校验——备份文件
 // 同样是外部输入,超长/控制字符版本串不得直写 .version 伴生文件与审计详情。
 func SanitizeBundleVersion(v string) string {

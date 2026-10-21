@@ -1,7 +1,7 @@
 package services
 
 // 历史 修复钉（引擎接线元数据）：NextSlotFn SQL（历史问题-③）/更新族单飞与
-// 调度开关（历史问题/历史问题-2）/证书族角色门（历史问题-2）。
+// 调度开关（历史问题-2）/证书族角色门（历史问题-2）。
 
 import (
 	"bytes"
@@ -24,14 +24,14 @@ func newWireTestEngine(t *testing.T) *taskengine.Engine {
 }
 
 // newWireTestEngineWithRuntimeLog 同 newWireTestEngine，但显式指定
-// runtimeLogFile（V87-TO-05③：注入空串模拟「旋转写入器打开失败」形态）。
+// runtimeLogFile（历史修复③：注入空串模拟「旋转写入器打开失败」形态）。
 func newWireTestEngineWithRuntimeLog(t *testing.T, runtimeLogFile string) *taskengine.Engine {
 	t.Helper()
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatalf("initialize test database: %v", err)
 	}
-	// TASK-3（历史·测试卫生）：注入空载 configLoadRerun——否则
+	// 历史修复（历史·测试卫生）：注入空载 configLoadRerun——否则
 	// InitTaskEngine 尾部 BootSync（startup:config-load）因钩子 nil 恒落
 	// failed 启动行（「配置重载未接线」），每个夹具用例都携带一行假失败
 	// 残留。与 certJobsActiveFn 注入缝同模式：Cleanup 还原 nil。
@@ -45,7 +45,7 @@ func newWireTestEngineWithRuntimeLog(t *testing.T, runtimeLogFile string) *taske
 	return InitTaskEngine("", runtimeLogFile)
 }
 
-// S-A-历史问题：任务日志目录创建失败必须显式留痕，不能在只读/异常挂载下
+// 历史问题：任务日志目录创建失败必须显式留痕，不能在只读/异常挂载下
 // 静默退化为零任务日志。
 func TestInitTaskEngine_logsTaskLogDirMkdirFailure(t *testing.T) {
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
@@ -75,7 +75,7 @@ func TestInitTaskEngine_logsTaskLogDirMkdirFailure(t *testing.T) {
 	}
 }
 
-// S-A-历史问题：reconciler 必须绑定启动它的引擎代际；StopTaskEngine 后快速
+// 历史问题：reconciler 必须绑定启动它的引擎代际；StopTaskEngine 后快速
 // 再 Init 时，上一代不得因读到新全局引擎而永久存活。
 func TestStartRoleReconciler_stopsPreviousGeneration(t *testing.T) {
 	oldInterval := roleReconcilerInterval
@@ -128,7 +128,7 @@ func TestMustRegisterTask_panicsOnInvalidDescriptor(t *testing.T) {
 	})
 }
 
-// TASK-3（历史·测试卫生）：夹具注入空载 configLoadRerun 后，
+// 历史修复（历史·测试卫生）：夹具注入空载 configLoadRerun 后，
 // BootSync 启动行必须落 success——failed 残留形态（钩子 nil「配置重载未
 // 接线」）回归即红。
 func TestTaskEngineWire_bootConfigLoadRowSucceeds(t *testing.T) {
@@ -142,7 +142,7 @@ func TestTaskEngineWire_bootConfigLoadRowSucceeds(t *testing.T) {
 	}
 }
 
-// TASK-L1（历史 历史问题）：全新安装三安全库自动更新永不排程——引擎化后零槽
+// 历史修复（历史）：全新安装三安全库自动更新永不排程——引擎化后零槽
 // 恒不到期，首槽武装须由引擎注册路径承担。钉：全新库+默认配置（auto_update
 // 默认开）→ DescribeAll 中 threat/crs/ip2region 三族 NextSlot 全非空。
 func TestTaskEngineWire_SecurityLibrariesFirstSlotArmed(t *testing.T) {
@@ -209,7 +209,7 @@ func TestTaskEngineWire_DaemonsFullyControllable(t *testing.T) {
 	// cluster-sync RoleAny：主节点角色下真实运行（主分支=服务面巡检）
 	te.SetRole(true)
 	te.StartLoop("cluster-sync")
-	// D2-历史问题：固定 150ms sleep 在 CI 负载下会产生假红——与同域既有模式
+	// 历史问题：固定 150ms sleep 在 CI 负载下会产生假红——与同域既有模式
 	// （waitForCond）对齐。
 	waitForCond(t, 2*time.Second, func() bool { return te.IsRunning("cluster-sync") })
 	if !te.IsRunning("cluster-sync") {
@@ -304,7 +304,7 @@ func TestTaskEngineWire_PeriodicIntervalAndScheduledSlotPresent(t *testing.T) {
 	}
 }
 
-// TASK-1（历史）：引擎 Trigger/RunSync 角色门曾只认 Descriptor.MasterOnly
+// 历史修复（历史）：引擎 Trigger/RunSync 角色门曾只认 Descriptor.MasterOnly
 // bool（三安全库专用），cert 族×5 与 auto-backup 仅声明 RunsOn=RoleMasterOnly
 // ——从节点手动 Trigger 可绕过角色门直跑主节点任务体。收敛为
 // roleAllows(RunsOn) 单机制后钉死拒绝形状。
@@ -340,10 +340,10 @@ func TestTaskEngineWire_canTriggerDerivedFromKind(t *testing.T) {
 	}
 }
 
-// V87-TO-02：StopTaskEngine 先 engine.Stop()（drain 超时即放弃等待）再置全局
+// 历史修复：StopTaskEngine 先 engine.Stop()（drain 超时即放弃等待）再置全局
 // taskEngine=nil；daemon goroutine 若在超时后首次进入 Run，裸读 taskEngine
 // 会 nil 解引用 panic。同族 cert-renewal-scan / cert-waiting-ca 已固定句柄
-// （历史 历史问题-06），本处为第三处。
+// （历史问题-06），本处为第三处。
 func TestClusterSyncDaemonRun_nilEngineReturnsWithoutPanic(t *testing.T) {
 	old := taskEngine
 	taskEngine = nil

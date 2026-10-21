@@ -59,7 +59,7 @@ func TestTrafficRecord_attackNormalBuckets(t *testing.T) {
 	}
 }
 
-// E83-历史问题：统计桶键与发射侧/校验侧同口径 TrimSpace——空白异形国名不得
+// 历史问题：统计桶键与发射侧/校验侧同口径 TrimSpace——空白异形国名不得
 // 建出与正式国名并存的脏桶（前端会显示两个「中国」）。
 func TestTrafficRecord_trimsCountryKey(t *testing.T) {
 	resetTrafficState(t)
@@ -80,7 +80,7 @@ func TestTrafficRecord_trimsCountryKey(t *testing.T) {
 	}
 }
 
-// E81-历史问题：xdb 私网/保留段行的国家列为 "0"/"Reserved"，不是国家值——计数桶
+// 历史问题：xdb 私网/保留段行的国家列为 "0"/"Reserved"，不是国家值——计数桶
 // 与事件流都不得为其建键（聚合端点已过滤 ""/"0"/"Reserved"，两端口径统一）。
 func TestTrafficRecord_rejectsNonCountryKeys(t *testing.T) {
 	resetTrafficState(t)
@@ -112,7 +112,7 @@ func TestTrafficRecord_rejectsNonCountryKeys(t *testing.T) {
 	}
 }
 
-// A85PLG 历史问题：xdb 中文异体国名（「美国」）与英文规范名必须归一到同一桶——
+// 历史问题：xdb 中文异体国名（「美国」）与英文规范名必须归一到同一桶——
 // 分键各自计数时，app 聚合端点按翻译后中文名重建 map（后写覆盖先写）会丢掉
 // 其中一桶的 attack/normal 计数。归一经 geoipnames.NormalizeCountry，与发射
 // 侧 geoipLocFor 同表同函数；「中国」保留不折叠。

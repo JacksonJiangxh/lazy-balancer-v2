@@ -63,7 +63,7 @@ func (m *MetricsService) Start() {
 	defer ticker.Stop()
 	defer cleanupTicker.Stop()
 	m.cleanupHistory()
-	// 历史修复-历史问题（历史）：启动即采集一轮——曾首 collect 等首个 interval
+	// 历史修复（历史）：启动即采集一轮——曾首 collect 等首个 interval
 	// （默认 30s），重启后面板首屏 30s 全零；与 cleanupHistory 同点对称。
 	m.collect()
 
@@ -83,13 +83,13 @@ func (m *MetricsService) Stop() {
 	m.stopOnce.Do(func() { close(m.stopCh) })
 }
 
-// N+9 历史问题：metrics 采集失败族状态转换日志。30s 采集周期下，持久性失败
+// 历史问题：metrics 采集失败族状态转换日志。30s 采集周期下，持久性失败
 // （端点不可达、非 200、body 中段读取失败、body 超限、解析/入库失败）逐
 // tick 裸记日志约 2880 行/天同一消息。改为状态转换口径：ok→fail 记一次
 // （warn）、fail→ok 恢复记一次（info）、持续同一状态静默。状态按失败类别
 // （key）独立跟踪：前置类别失败（如 Get 失败）不评估后续类别，其恢复标记
 // 只在后续 tick 实际通过该检查时才落，避免「仍失败却记恢复」。map 有界：
-// 生产类别集固定 7 个（N+11 历史修复 增补 body 中段读取失败类别——原枚举漏掉的
+// 生产类别集固定 7 个（历史修复 增补 body 中段读取失败类别——原枚举漏掉的
 // 唯一零信号成员），清扫上限（历史问题 同模式）仅为防御动态键场景——超上限整体
 // 重置，各类别至多重复放行一条，无数据影响。
 var (
@@ -104,7 +104,7 @@ const metricsStateEvictCap = 64
 // ok→fail 返回 "warn"；fail→ok 返回 "info"；状态不变返回 ""。
 // 初始状态视为 ok：首次失败记一次 warn，首次成功静默（无恢复可记）。
 //
-// D1-历史问题：状态机本体已是通用实现（logStateTransition），metrics 采集族与
+// 历史问题：状态机本体已是通用实现（logStateTransition），metrics 采集族与
 // 低频巡检循环（时区刷新/运行日志尺寸刷新）共用——持久失败的下行 SQL 在
 // 30s tick 下不再各打 2880 行/天同一消息。键空间按调用方前缀隔离。
 func logMetricsStateTransition(key string, failed bool) string {
@@ -151,7 +151,7 @@ const geoipPassSeriesMarker = `handler="http.handlers.geoip2region"`
 // filterGeoipPassSeries 剔除 geoip 透传路由注入的序列行（历史修复 单源纯函数）。
 // geoip 规则的请求先过独立透传路由再过主/路径路由，两条路由各自注入 metrics
 // ——同一请求的请求数/状态码/字节量在全局与 历史修复 全部翻倍。
-// 历史修复-历史问题（历史）：Builder 逐行条件写入单副本（曾 Split+Join——行切片
+// 历史修复（历史）：Builder 逐行条件写入单副本（曾 Split+Join——行切片
 // ~24B/行 + 16MB 拼接副本，与「拷贝只做一次」口径矛盾）。分隔符仅在保留行
 // 之间落盘：输出与「按 \n 切分后丢弃命中行、再用 \n 连接」逐字节等价，
 // 含尾部空行（"a\n" → 保留行的切分为 ["a",""]）与被删末行两形态。
@@ -204,12 +204,12 @@ func (m *MetricsService) collect() {
 		Logf("info", "metrics endpoint recovered")
 	}
 
-	// 历史问题 二十六次 读取上限对齐 overviewmetrics 的 16MB 探测模式
-	//（历史问题 H 同类）——规则数×状态码×host 序列的基数爆炸在 30s 采集周期里
+	// 历史问题 读取上限对齐 overviewmetrics 的 16MB 探测模式
+	//（历史问题同类）——规则数×状态码×host 序列的基数爆炸在 30s 采集周期里
 	// 可分配大块内存，超限按解析失败跳过本样本。
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20+1))
 	if err != nil {
-		// N+11 body 中段读取错误此前裸 return——失败族中唯一零信号成员
+		// body 中段读取错误此前裸 return——失败族中唯一零信号成员
 		// （52fdb0f7 枚举未覆盖）。现与其他类别同口径走状态转换日志。
 		if logMetricsStateTransition(metricsFailureRead, true) != "" {
 			Logf("warn", "Failed to read metrics body: %v", err)
@@ -229,12 +229,12 @@ func (m *MetricsService) collect() {
 		Logf("info", "metrics endpoint body back under 16MB cap")
 	}
 
-	// N+11 string 拷贝只做一次——parse 与 历史修复 store 共用同一
+	// string 拷贝只做一次——parse 与 历史修复 store 共用同一
 	// text，此前两次 string(body) 最坏双拷贝 32MB（16MB body ×2）。
 	text := string(body)
 	// geoip 规则的请求先过独立透传路由（首处理器 http.handlers.geoip2region，
 	// buildGeoipPassRoute）再过主/路径路由，两条路由各自注入 metrics——同一
-	// 请求的请求数/状态码/字节量在全局与 历史修复 全部翻倍。透传路由无
+	// 请求的请求数/状态码/字节量在全局与 per-host 全部翻倍。透传路由无
 	// reverse_proxy，其序列不含任何上游语义，整条剔除即恢复真实计数。
 	if strings.Contains(text, geoipPassSeriesMarker) {
 		text = filterGeoipPassSeries(text)
@@ -534,7 +534,7 @@ func parseRuleLabelMetrics(text string) (map[string]*ruleLabelAggregate, error) 
 // storePerHostMetrics 按 rule label(lazybalancer_*)写规则级历史行——
 // 2026-09-15 用户裁定:caddy_id 直接匹配替代域名/host 匹配(通配符/大小写/
 // IDNA/多域名/空域名全部天然正确,且不再有静默 continue 失配)。
-// TCP 规则无行(历史修复 无规则级流量计数器)。
+// TCP 规则无行(caddy-l4 无规则级流量计数器)。
 func (m *MetricsService) storePerHostMetrics(text string) error {
 	byRule, err := parseRuleLabelMetrics(text)
 	if err != nil {
@@ -597,7 +597,7 @@ func (m *MetricsService) refreshDBOverviewMetrics() {
 	activeRules, totalRules, onlineNodes := m.overview.ActiveRules, m.overview.TotalRules, m.overview.OnlineNodes
 	m.mu.RUnlock()
 
-	// 历史 B3: 错误必须显式处理，否则 DB 故障时 overview 三项指标静默归零。
+	// 历史 历史修复: 错误必须显式处理，否则 DB 故障时 overview 三项指标静默归零。
 	// 查询失败时保留既有 overview 行中的前值（与 onlineNodes 分支同口径）。
 	if err := database.QueryRow("SELECT COUNT(*) FROM lb_rules WHERE enabled = 1").Scan(&activeRules); err != nil {
 		Logf("error", "updateOverview: query active rules failed: %v (keeping previous value=%d)", err, activeRules)

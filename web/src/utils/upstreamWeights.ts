@@ -68,10 +68,10 @@ export const redistributeWeight = <Item extends WeightedItem>(items: Item[], cha
   distributeWeight(otherItems, 100 - changed.weight)
 }
 
-// ⚠ 变异契约(历史 历史问题 文档化):participatingItems 及依赖它的函数会
+// ⚠ 变异契约(历史问题 文档化):participatingItems 及依赖它的函数会
 // **就地改写** items[].weight——禁用行与超出 MAX_UPSTREAM_ROWS 的行被写 0。
 // 当前调用方(编辑器草稿态)依赖此行为;未来在只读场景复用时须先剥离副作用。
-// weightPercent 权重百分比展示(历史 历史问题 收敛——原 RuleFlowDialog/Rules 两份
+// weightPercent 权重百分比展示(历史问题 收敛——原 RuleFlowDialog/Rules 两份
 // 同口径复刻)。签名:(upstreams, row)→0-100 整数;禁用行 0;总和≤0 时 0。
 export const weightPercent = (
   upstreams: ReadonlyArray<{ weight?: number; enabled?: boolean }> | undefined,
@@ -84,7 +84,7 @@ export const weightPercent = (
   return Math.round(((row.weight || 0) / sum) * 100)
 }
 
-// payloadWeight（A86 D-3）：后端已废除 0→1 静默归一（weight<1 保存/导入均
+// payloadWeight（历史修复）：后端已废除 0→1 静默归一（weight<1 保存/导入均
 // 响亮 400）。草稿态禁用行权重被 participatingItems 写 0（上方变异契约），
 // 保存载荷边界为禁用行送 1——禁用行权重无业务意义（输入框禁用、百分比列
 // 恒显「禁用」），与既有库形态（禁用行历史落库均为 1）一致；启用行原样送出

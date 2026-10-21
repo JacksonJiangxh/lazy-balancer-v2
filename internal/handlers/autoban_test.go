@@ -340,7 +340,7 @@ func TestAutobanStatus_banEffectiveTruthTable(t *testing.T) {
 }
 
 // 历史问题（历史）：autobanListReferenced / autobanBanEffective 的查询失败
-// 历史修复 分支此前无测试——预置名单查询失败时必须按「已引用/已生效」处理
+// fail-closed 分支此前无测试——预置名单查询失败时必须按「已引用/已生效」处理
 // （不弹误导性黄条）。status 端点在名单表缺失时更早的 AutobanListEntries 已
 // 500，故直接钉两个判据 helper 的失败分支。
 func TestAutobanStatus_listReferencedFailClosed(t *testing.T) {
@@ -530,7 +530,7 @@ func TestCreatePolicy_builtinAutobanListRefMessageNamesAutoban(t *testing.T) {
 	}
 }
 
-// ---- 历史修复/D5（历史）：PUT 禁用路径收尾接线 ----
+// ---- 历史修复（历史）：PUT 禁用路径收尾接线 ----
 
 // Given 名单含已到期自动条目+未到期自动条目；重载回调间谍；名单无任何发射面引用。
 // When PUT enabled=false（禁用保存）。
@@ -594,12 +594,12 @@ func TestAutobanPreset_categoryDescriptionLocked(t *testing.T) {
 	}
 }
 
-// ---- A83A-历史问题（历史）：过期自动封禁条目的手动封禁 ----
+// ---- 历史问题（历史）：过期自动封禁条目的手动封禁 ----
 
 // Given 预置名单含一条已到期未清理的自动封禁条目（自动封禁关闭时不会清理）。
 // When 从事件页对该 IP 手动封禁（AddIPToList）。
 // Then 条目必须被覆盖为生效中的手动条目（清空 expires_at），而不是命中即
-// added:false 的静默 历史修复（渲染生效集仍为空）。
+// added:false 的静默 no-op（渲染生效集仍为空）。
 func TestAddIPToList_replacesExpiredAutobanEntry(t *testing.T) {
 	router := newAutobanTestEnv(t)
 	id := autobanPresetID(t)
@@ -630,7 +630,7 @@ func TestAddIPToList_replacesExpiredAutobanEntry(t *testing.T) {
 	}
 }
 
-// A83A-历史问题（历史）：威胁名单导出时文件读取/解析故障必须显式 500——
+// 历史问题（历史）：威胁名单导出时文件读取/解析故障必须显式 500——
 // 旧实现吞掉非 NotExist 错误返回 200 空 TXT，调用方无法区分「名单为空」。
 func TestExportIPList_threatFileReadErrorReturns500(t *testing.T) {
 	router := newAutobanTestEnv(t)

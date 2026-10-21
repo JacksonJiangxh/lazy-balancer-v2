@@ -57,3 +57,101 @@ func TestControlThreatScreenCollector_proxiesLease(t *testing.T) {
 		t.Fatalf("attack flow sample_n=%d after release, want 0", got)
 	}
 }
+
+// 历史修复：代理层把 lease_id 传入本地攻击光流租约表——单租约释放不误杀
+// 其他租约（旧码 DELETE 全局置 0）；有效档位=存活租约 min（最密）。
+func TestControlThreatScreenCollector_releaseKeepsSurvivingLeases(t *testing.T) {
+	services.ResetThreatScreenAttackFlowForTest()
+	t.Cleanup(services.ResetThreatScreenAttackFlowForTest)
+	admin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"enabled":true}`))
+	}))
+	defer admin.Close()
+
+	h := &Handlers{cfg: &config.Config{CaddyAdminURL: admin.URL}}
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.POST("/security/overview/threat-screen/collector", h.ControlThreatScreenCollector)
+	r.DELETE("/security/overview/threat-screen/collector", h.ControlThreatScreenCollector)
+	call := func(method, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(method, "/security/overview/threat-screen/collector", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// Given 两个标签页租约 A(8)/B(1) 并存
+	if rec := call(http.MethodPost, `{"lease_id":"tab-a","ttl_ms":30000,"sample_n":8}`); rec.Code != http.StatusOK {
+		t.Fatalf("POST tab-a status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := call(http.MethodPost, `{"lease_id":"tab-b","ttl_ms":30000,"sample_n":1}`); rec.Code != http.StatusOK {
+		t.Fatalf("POST tab-b status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := services.ThreatScreenAttackFlowSampleN(); got != 1 {
+		t.Fatalf("sample_n=%d, want 1（存活租约最密档）", got)
+	}
+	// When B 关闭释放 Then A(8) 仍生效（旧码全局置 0 误杀 A）
+	if rec := call(http.MethodDelete, `{"lease_id":"tab-b"}`); rec.Code != http.StatusOK {
+		t.Fatalf("DELETE tab-b status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := services.ThreatScreenAttackFlowSampleN(); got != 8 {
+		t.Fatalf("after DELETE tab-b sample_n=%d, want 8（A 存活）", got)
+	}
+	// When A 也释放 Then 归 0
+	if rec := call(http.MethodDelete, `{"lease_id":"tab-a"}`); rec.Code != http.StatusOK {
+		t.Fatalf("DELETE tab-a status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := services.ThreatScreenAttackFlowSampleN(); got != 0 {
+		t.Fatalf("after DELETE tab-a sample_n=%d, want 0", got)
+	}
+}
+
+// 历史修复：admin 请求失败（503）时本地租约不得已变更——先转发成功再落本地。
+func TestControlThreatScreenCollector_adminFailureKeepsLocalLeases(t *testing.T) {
+	services.ResetThreatScreenAttackFlowForTest()
+	t.Cleanup(services.ResetThreatScreenAttackFlowForTest)
+	status := http.StatusOK
+	admin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(`{"enabled":true}`))
+	}))
+	defer admin.Close()
+
+	h := &Handlers{cfg: &config.Config{CaddyAdminURL: admin.URL}}
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.POST("/security/overview/threat-screen/collector", h.ControlThreatScreenCollector)
+	r.DELETE("/security/overview/threat-screen/collector", h.ControlThreatScreenCollector)
+	call := func(method, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(method, "/security/overview/threat-screen/collector", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// Given 租约 A(1) 已生效
+	if rec := call(http.MethodPost, `{"lease_id":"tab-a","ttl_ms":30000,"sample_n":1}`); rec.Code != http.StatusOK {
+		t.Fatalf("POST tab-a status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := services.ThreatScreenAttackFlowSampleN(); got != 1 {
+		t.Fatalf("sample_n=%d, want 1", got)
+	}
+	// When admin 故障（503）时申请/释放 Then 本地租约保持不变
+	status = http.StatusServiceUnavailable
+	if rec := call(http.MethodPost, `{"lease_id":"tab-b","ttl_ms":30000,"sample_n":8}`); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("POST tab-b status=%d, want 503 透传", rec.Code)
+	}
+	if got := services.ThreatScreenAttackFlowSampleN(); got != 1 {
+		t.Fatalf("after failed POST sample_n=%d, want 1（失败不落本地）", got)
+	}
+	if rec := call(http.MethodDelete, `{"lease_id":"tab-a"}`); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("DELETE tab-a status=%d, want 503 透传", rec.Code)
+	}
+	if got := services.ThreatScreenAttackFlowSampleN(); got != 1 {
+		t.Fatalf("after failed DELETE sample_n=%d, want 1（失败不释放本地）", got)
+	}
+}

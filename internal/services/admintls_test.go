@@ -16,7 +16,7 @@ func TestRuntimeAdminTLSChanged_detects_uploaded_certificate_rotation(t *testing
 	}
 }
 
-// LBH-B-N1（历史）：存在但损坏的自签证书对必须自愈——读侧仅验「双文件
+// 历史修复（历史）：存在但损坏的自签证书对必须自愈——读侧仅验「双文件
 // 可读」不够，X509KeyPair 解析失败（截断/换位/垃圾内容）原样上抛会让启动
 // 进入崩溃循环且面板无清除入口。先读后验：损坏对记 warn 并落既有重生成路径。
 func TestSelfSignedCert_corrupt_pair_regenerates(t *testing.T) {
@@ -60,7 +60,7 @@ func TestSelfSignedCert_corrupt_pair_regenerates(t *testing.T) {
 	}
 }
 
-// LBH-B-N2（历史）：指纹对 cert/key 无分隔拼接存在理论双解——
+// 历史修复（历史）：指纹对 cert/key 无分隔拼接存在理论双解——
 // cert="A",key="BC" 与 cert="AB",key="C" 同串同哈希，真实轮换会被误判为
 // 未变化。钉住「边界组合必须产生不同指纹」。
 func TestFingerprintAdminTLS_separates_cert_key_boundary(t *testing.T) {

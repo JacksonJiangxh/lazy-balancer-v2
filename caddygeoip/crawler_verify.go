@@ -94,7 +94,7 @@ func VerifyCrawler(ip, engineID string) bool {
 		// 官方声明不支持 nslookup 的厂商（360）：官方 IP 段验证（名单表=
 		// 定时更新任务的快照，更新即生效，无需重载）。O(log n) 查找本身很便宜，
 		// 不缓存正向结论——否则 CIDR 被官方移除后仍可豁免至多 1h
-		// （历史 E-历史问题）。
+		// （历史）。
 		ok = verifyCrawlerIPRangeFromList(ip, engineID)
 		cacheable = false
 	} else {
@@ -138,7 +138,7 @@ func VerifyCrawler(ip, engineID string) bool {
 // verifyCrawlerDNS 双跳验证本体（无缓存、需已持信号量）。第二个返回值表示
 // 结论是否可缓存：PTR/正向回验的确定性否定为 true，任何解析错误/超时为 false。
 func verifyCrawlerDNS(ip, engineID string) (bool, bool) {
-	// U80 E-CM-05：地址归一化比较——netip 解析 + Unmap。客户端 IP 可能是
+	// 历史修复：地址归一化比较——netip 解析 + Unmap。客户端 IP 可能是
 	// 4in6 映射形态（::ffff:a.b.c.d），而 DNS 正向应答恒为 v4 规范串，
 	// 字符串比较会恒不命中把真爬虫误杀；带 zone/不可解析输入 fail-closed
 	// （确定性否定，可缓存）。
@@ -216,11 +216,49 @@ func ResetCrawlerVerifyCacheForTest(r crawlerDNSResolver) {
 
 // crawlerIPListFile 厂商 IP 段名单快照文件（root 服务写、插件读——模块边界：
 // caddygeoip 独立模块不 import 根模块，快照经共享文件交换）。
-var crawlerIPListFile = "/app/data/crawler-ip-lists.json"
+// defaultCrawlerIPListFile 与根服务容器默认逐字节一致（插件侧
+// 兜底；根服务自定义 data_dir 时渲染侧经 crawler_ip_list_file 配置键下发
+// 派生路径，由 GeoIPHandler.Provision 应用）。
+const defaultCrawlerIPListFile = "/app/data/crawler-ip-lists.json"
+
+var (
+	// crawlerIPListFileMu 保护 crawlerIPListFile：Provision（配置重载）写、
+	// 判定热路径经 crawlerIPListFilePath 读，重载窗口内可并发。
+	crawlerIPListFileMu sync.Mutex
+	crawlerIPListFile   = defaultCrawlerIPListFile
+)
+
+// crawlerIPListFilePath 返回当前快照交换文件路径。
+func crawlerIPListFilePath() string {
+	crawlerIPListFileMu.Lock()
+	defer crawlerIPListFileMu.Unlock()
+	return crawlerIPListFile
+}
+
+// setCrawlerIPListFilePath 应用配置路径（GeoIPHandler.Provision；空值忽略）。
+// 路径变化时重置快照缓存——否则旧路径的成功快照在其 TTL（≤10min）内继续
+// 服役，把上一部署形态的名单带进新形态。fail-closed 语义与失败重试间隔
+// （crawlerIPListRetryInterval，默认 10s）不变。
+func setCrawlerIPListFilePath(path string) {
+	if path == "" {
+		return
+	}
+	crawlerIPListFileMu.Lock()
+	changed := crawlerIPListFile != path
+	if changed {
+		crawlerIPListFile = path
+	}
+	crawlerIPListFileMu.Unlock()
+	if changed {
+		crawlerFileCacheMu.Lock()
+		crawlerFileCacheSnap = nil
+		crawlerFileCacheMu.Unlock()
+	}
+}
 
 // crawlerIPRangeSnapshot 预编译快照：引擎 ID → 已解析前缀列表。加载时一次性
 // ParsePrefix（历史问题），判定热路径零解析/零分配。ok=false 表示读取/解析失败
-// 的空快照——只按短重试间隔节流（E81-历史问题），成功快照按完整重载间隔缓存。
+// 的空快照——只按短重试间隔节流（历史问题），成功快照按完整重载间隔缓存。
 type crawlerIPRangeSnapshot struct {
 	prefixes map[string][]netip.Prefix
 	// loadedAt 是本快照开始读取的时刻（TTL 基准）。
@@ -228,7 +266,7 @@ type crawlerIPRangeSnapshot struct {
 	ok       bool
 	// modTime/size 是读取时打开 inode 的 stat 形态（内容代际）：写侧经
 	// rename 换文件，慢读者可能读到 rename 前的旧 inode 并在新快照落定后
-	// 才提交——以代际较旧者判定丢弃（E83-历史问题，与 wafiplist 历史问题 同型）。
+	// 才提交——以代际较旧者判定丢弃（历史问题，与 wafiplist 历史问题 同型）。
 	modTime time.Time
 	size    int64
 	// committedAt 是落定时刻：失败读取与并发成功快照的先后判定依据。
@@ -251,7 +289,7 @@ var crawlerIPListRetryInterval = 10 * time.Second
 // loadCrawlerIPRangeSnapshot 返回当前快照（成功快照超过 10min、失败快照超过
 // 重试间隔时重读）。读盘与解析在锁外完成（双检 + 原子快照替换 + 内容代际
 // 守卫）：文件大/磁盘慢时不再阻塞并发判定，慢读者也不会把 rename 前的旧
-// 内容写回新快照（E83-历史问题，见 commitCrawlerIPRangeSnapshot）。读取/JSON/
+// 内容写回新快照（历史问题，见 commitCrawlerIPRangeSnapshot）。读取/JSON/
 // 解析失败同样写入节流时间戳并返回空快照（fail-closed + 失败也节流，旧实现
 // 失败路径不写时间戳，缺失文件时每次判定都尝试读盘）。
 func loadCrawlerIPRangeSnapshot() *crawlerIPRangeSnapshot {
@@ -271,7 +309,7 @@ func loadCrawlerIPRangeSnapshot() *crawlerIPRangeSnapshot {
 	crawlerFileCacheMu.Unlock()
 
 	next := &crawlerIPRangeSnapshot{prefixes: map[string][]netip.Prefix{}, loadedAt: now}
-	if file, err := os.Open(crawlerIPListFile); err == nil {
+	if file, err := os.Open(crawlerIPListFilePath()); err == nil {
 		// stat 与读取针对同一已打开 inode：rename 换文件后旧 fd 读到的仍是
 		// 旧代际内容，st 因此如实标识所读内容（不能读后按路径再 stat）。
 		if st, statErr := file.Stat(); statErr == nil {
@@ -334,7 +372,7 @@ func verifyCrawlerIPRangeFromList(ipStr, engineID string) bool {
 	}
 	// 历史问题：畸形地址不得 panic（MustParseAddr 旧实现可直接崩进程）——
 	// 解析失败即 fail-closed。
-	// U80 E-CM-05：带 zone 拒绝 + 4in6 映射形态 Unmap 归一——netip 的 v4
+	// 历史修复：带 zone 拒绝 + 4in6 映射形态 Unmap 归一——netip 的 v4
 	// 前缀不含 4in6 地址，不归一则映射形态的真爬虫恒不命中（误判为伪装）。
 	ip, err := netip.ParseAddr(ipStr)
 	if err != nil || ip.Zone() != "" {

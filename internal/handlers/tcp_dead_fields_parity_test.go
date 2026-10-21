@@ -1,6 +1,6 @@
 package handlers
 
-// CORE-F2（历史 历史问题）：TCP 死值清零 SQL 双实现 parity 钉——启动迁移
+// 历史修复（历史问题）：TCP 死值清零 SQL 双实现 parity 钉——启动迁移
 // db.migrateTCPRuleDeadFields（db.go）与导入归一
 // handlers.normalizeRuleRowsForTransport（config_backup.go:tcpRuleDeadFieldsResetSQL）
 // 持有两份逐字相同的 UPDATE 字面量（11 列 SET + TCP 谓词），跨包无法共享常量，

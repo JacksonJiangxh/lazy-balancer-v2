@@ -147,8 +147,8 @@ func TestSyncService_applySnapshot_preservesLocalLoginLockoutState(t *testing.T)
 	}
 }
 
-// 2026-09-06 二轮 历史问题（W10 复核结论）：IsMaster 对历史 NULL 行的口径必须与
-// readonly 写闸（COALESCE(is_master,1) 历史修复）一致——NULL 视为主节点。
+// 2026-09-06 历史问题（历史修复 复核结论）：IsMaster 对历史 NULL 行的口径必须与
+// readonly 写闸（COALESCE(is_master,1) fail-open）一致——NULL 视为主节点。
 // 历史问题 迁移（db.go）已回填存量 NULL 使稳态不可达，此处为纵深防御一致性。
 func TestClusterService_IsMaster_nullIsMasterFailsOpenAsMaster(t *testing.T) {
 	// Given：历史脏数据 is_master=NULL
@@ -170,7 +170,7 @@ func TestClusterService_IsMaster_nullIsMasterFailsOpenAsMaster(t *testing.T) {
 	}
 }
 
-// 2026-09-06 二轮 历史问题：主节点侧按节点的 TOFU 指纹钉重置——按
+// 2026-09-06 历史问题：主节点侧按节点的 TOFU 指纹钉重置——按
 // IssueServiceControlTicket 同一口径（access_url 优先，回退 protocol://ip:port）
 // 定位 pin 文件，只删除目标节点的钉，不影响其他节点与无关主机。
 func TestClusterService_ForgetNodePin_removesOnlyTargetNodePin(t *testing.T) {
@@ -387,7 +387,7 @@ func TestSyncService_applySnapshot_lockedUsersExtendButNeverShorten(t *testing.T
 	assertLock("a", laterLock, 1)
 }
 
-// 历史修复 修订：旧主端形态（载荷缺失/nil）必须 历史修复——不得清从节点本地锁与计数。
+// 历史修复 修订：旧主端形态（载荷缺失/nil）必须 no-op——不得清从节点本地锁与计数。
 func TestSyncService_applySnapshot_nilLockedUsersPayloadIsNoOp(t *testing.T) {
 	// Given：本地用户带活跃锁与失败计数；快照不带 locked_users（模拟旧主端）
 	cluster, database := newClusterTestService(t)

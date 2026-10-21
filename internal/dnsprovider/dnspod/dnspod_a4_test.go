@@ -1,6 +1,6 @@
 package dnspod
 
-// A-4（历史证书域双实现同步）：cleanUp/deleteOne 在 provider 返回非 ctx
+// 历史修复（历史证书域双实现同步）：cleanUp/deleteOne 在 provider 返回非 ctx
 // 错误而 ctx 已取消/超时时，须与 tencent deleteOne 同口径把 ctx.Err() 并入
 // 错误链（保留原始 provider 错误）——否则取消归因丢失，诊断只剩 API 文案。
 // 钉法：传输层无视 req.Context() 恒回 API 错误体（模拟「取消与 API 失败并发」

@@ -47,7 +47,7 @@ test('A3 计数器回退：标记 reset 并重建基线，不静默丢负数', (
   assert.deepEqual(after.normalDeltas, [])
 })
 
-test('A3b attack 桶回退同样 reset（审计 87 WEBT-08③：此前只覆盖 normal 回退）', () => {
+test('A3b attack 桶回退同样 reset（历史修复③：此前只覆盖 normal 回退）', () => {
   // normal 继续增长、attack 计数器回退（Caddy 重载/租约重建）——必须断开曲线
   // 重建基线，不得把负增量当 0 静默吞掉（否则攻击速率会持续偏负/失真）。
   const prev = baseline({ 中国: { normal: 100, attack: 50 } }, 0)
@@ -60,7 +60,7 @@ test('A3b attack 桶回退同样 reset（审计 87 WEBT-08③：此前只覆盖 
 })
 
 test('A3c 抽样比非法（0/负数/NaN）按 1 处理且不误触发基线重建', () => {
-  // 审计 87 WEBT-08③：safeSample 分支此前无覆盖——sampleN=0 若参与比较会让
+  // 历史修复③：safeSample 分支此前无覆盖——sampleN=0 若参与比较会让
   // 每轮都「抽样比变化」→ 恒重置基线（大屏流量曲线永久空白）。
   for (const sampleN of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
     const prev = baseline({ 中国: { normal: 100 } }, 0, 1)
@@ -120,7 +120,7 @@ test('A9 脏值按 0 处理（缺失/非数值不产生 NaN）', () => {
   assert.equal(Number.isNaN(dirty.attackQps), false)
 })
 
-test('A10 归一 counts 单源：调用方用返回 counts 建基线，脏值下一轮仍正常差分（WT87-07）', () => {
+test('归一 counts 单源：调用方用返回 counts 建基线，脏值下一轮仍正常差分（历史修复）', () => {
   type Raw = { normal?: number; attack?: number }
   const first = trafficDelta(null, { 中国: {} as Raw, 美国: { normal: 7 } }, 0)
   assert.equal(first.baseline, true)

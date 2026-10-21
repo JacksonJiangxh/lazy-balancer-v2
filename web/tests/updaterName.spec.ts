@@ -1,4 +1,4 @@
-// 更新者展示名单源验收（A85WA-历史问题）：Rules/SecurityRules/SecurityBlockPages/
+// 更新者展示名单源验收（历史修复）：Rules/SecurityRules/SecurityBlockPages/
 // SecurityPolicies 四份同构实现收敛为 utils/updaterName。
 //
 // 运行：cd web && npm test

@@ -13,7 +13,7 @@ import { COUNTRY_CENTROIDS, FALLBACK_CENTROID } from '@/utils/countryCentroids'
 import { THREAT_COUNTRIES } from '@/utils/worldBorders'
 import { CHINA_PROVINCES } from '@/utils/chinaProvinces'
 import { loadAdmin1Tables, loadedAdmin1Tables } from '@/utils/admin1Loader'
-import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, arcEndpoints, adminShortName, normalizeCountryName, aggregateCountryCounts, drillCountryAllowed, DOT_LAND, arcOriginForLocation, hasProvinceStats, drillCommitAllowed, drillClickIntent } from '@/utils/threatShared'
+import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, arcEndpoints, normalizeCountryName, aggregateCountryCounts, drillCountryAllowed, DOT_LAND, arcOriginForLocation, hasProvinceStats, drillCommitAllowed, drillClickIntent, provinceDotGrid } from '@/utils/threatShared'
 import type { ThreatScene, ThreatSceneOptions, CountryHeat } from '@/utils/threatScene'
 import { FLOW_ATTACK_COLOR, FLOW_NORMAL_COLOR, FLOW_FLIGHT_MS, flowArcLabel, flowArcTierWidth, type FlowArcTier } from '@/utils/threatTheme'
 import { planFlowArcs } from '@/utils/threatFlowRules'
@@ -85,7 +85,7 @@ function flyAltitudeFor(name: string): number {
 }
 
 export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOptions): ThreatScene {
-  // 历史 历史问题：本站坐标是可变状态——构造期常量会让 setServer 只改
+  // 历史问题：本站坐标是可变状态——构造期常量会让 setServer 只改
   // 环/点，弧线终点与返回视角仍指向旧坐标（本变量由 setServer/返回视角消费）。
   let server: Centroid = opts?.serverCentroid ?? COUNTRY_CENTROIDS['中国'] ?? [104, 35]
   let siteConfigured = opts?.siteConfigured ?? !!opts?.serverCentroid
@@ -197,7 +197,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   const nativeRAF = originalRAF.bind(window)
   // 本实例补丁状态：重叠实例后装者覆盖前装者时，dispose 只在自己仍是栈顶
   // 时恢复；否则标记 inactive，由后续栈顶恢复后经本补丁转发到 prev
-  //（历史 历史问题-6，原实现会让补丁永久残留）。
+  //（历史问题-6，原实现会让补丁永久残留）。
   const rafPatch = { active: true, prev: originalRAF }
   const globeCycle = (globe as unknown as { _animationCycle?: FrameRequestCallback })._animationCycle
   // 60fps 节流：globe.gl 自循环没有 FPS 选项，这里按累计时间预算把它的
@@ -285,7 +285,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     const right = new THREE.Vector3().crossVectors(dir, cam.up).normalize()
     const up = new THREE.Vector3().crossVectors(right, dir).normalize()
     const origin = new THREE.Vector3().setFromMatrixPosition(cam.matrixWorld)
-    // 逆投影纯数学单源（threatProjection.sphereSurfacePoint，WT87-09）：
+    // 逆投影纯数学单源（threatProjection.sphereSurfacePoint，历史修复）：
     // 与点阵同一壳层求交（不是球面），消除高纬/球缘的视差。
     return sphereSurfacePoint(
       {
@@ -304,7 +304,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
 
   
   /**
-   * 单帧补绘（WT87-04）：暂停态 `globe.pauseAnimation()` 停掉库自循环后，
+   * 单帧补绘（历史修复）：暂停态 `globe.pauseAnimation()` 停掉库自循环后，
    * 同步的相机/图层变更无人渲染。globe.gl 无 manual-render API，这里直接用
    * 已捕获的 renderer 画一帧（与地图引擎 renderOnce 同语义）。
    */
@@ -330,7 +330,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
 
   let drillSeq = 0
 
-  /** 下钻某国（历史 历史问题：下钻态点击他国与地图版一致=切换下钻）。
+  /** 下钻某国（历史问题：下钻态点击他国与地图版一致=切换下钻）。
    *  无省层数据（含 admin1 chunk 加载失败）时不进入下钻——原实现直接
    *  drilledName+flyTo，省板为空（被选国家成空洞）。 */
   async function drillCountry(name: string): Promise<void> {
@@ -339,9 +339,9 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     const seq = ++drillSeq
     if (name !== '中国') {
       const tables = await loadAdmin1Tables()
-      // 历史问题-F5：chunk 加载期间用户退出大屏/复位/返回 → 丢弃结果（判定单源，
+      // 历史问题：chunk 加载期间用户退出大屏/复位/返回 → 丢弃结果（判定单源，
       // 与地图引擎共用）。原地球 zoomOut/resetView 不递增 drillSeq，迟到续体
-      // 会把用户刚做的复位覆盖成下钻（WT87-03）。
+      // 会把用户刚做的复位覆盖成下钻（历史修复）。
       if (!drillCommitAllowed(seq, drillSeq, disposed)) return
       if (!tables) {
         if (!disposed) opts?.onProvinceLoadError?.()
@@ -392,7 +392,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
 
   // ---- hover：国家/省 hex 标记重着色 + 悬浮名（与地图版同构：pointermove 只
   // 记坐标，帧内拾取一次——原实现每个 pointermove 事件全量扫描 177 国多边形，
-  // 快速移动时同帧多次射线拾取，hover 明显滞后（历史 历史问题）。 ----
+  // 快速移动时同帧多次射线拾取，hover 明显滞后（历史问题）。 ----
   const hoverTipEl = document.createElement('div')
   hoverTipEl.style.cssText = 'position:absolute;z-index:6;pointer-events:none;display:none;padding:5px 10px;background:rgba(4,12,32,.92);border:1px solid rgba(80,170,255,.45);color:#e2ecff;font:12px "Noto Sans SC","PingFang SC",sans-serif;white-space:nowrap;border-radius:2px'
   container.appendChild(hoverTipEl)
@@ -474,7 +474,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       const cv = container.querySelector('canvas')
       const r = (cv ?? container).getBoundingClientRect()
       hoverTipEl.style.display = 'block'
-      // WT87-11：省级统计只覆盖中国，海外下钻不得显示「该省 0 次攻击」。
+      // 历史修复：省级统计只覆盖中国，海外下钻不得显示「该省 0 次攻击」。
       hoverTipEl.textContent = provinceHover && drilledName && !hasProvinceStats(drilledName)
         ? `${name} 无省级统计`
         : `${name} ${count}`
@@ -701,27 +701,8 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       return cached
     }
     const source = provinceSource(country)
-    let minLon = 180, maxLon = -180, minLat = 90, maxLat = -90
-    for (const pv of source) {
-      for (const poly of pv.polys) for (const ring of poly) for (let k = 0; k + 1 < ring.length; k += 2) {
-        if (ring[k] < minLon) minLon = ring[k]
-        if (ring[k] > maxLon) maxLon = ring[k]
-        if (ring[k + 1] < minLat) minLat = ring[k + 1]
-        if (ring[k + 1] > maxLat) maxLat = ring[k + 1]
-      }
-    }
-    const dots: WorldDot[] = []
-    let row = 0
-    for (let lat = minLat; lat <= maxLat; lat += DOT_STEP, row++) {
-      const offset = row % 2 === 1 ? DOT_STEP / 2 : 0
-      for (let lon = minLon + offset; lon <= maxLon; lon += DOT_STEP) {
-        for (const pv of source) {
-          if (!sharedPointInPolys(lon, lat, pv.polys)) continue
-          dots.push({ lat, lng: lon, key: adminShortName(pv.name) })
-          break
-        }
-      }
-    }
+    // 省点阵走共享实现（含省级 bbox 预筛，历史修复；与地图引擎同口径）。
+    const dots: WorldDot[] = provinceDotGrid(source, DOT_STEP)
     const result = { dots, positions: dotPositions(dots) }
     provinceDotCache.set(country, result)
     while (provinceDotCache.size > PROVINCE_DOT_CACHE_MAX) {
@@ -1047,7 +1028,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     const now = performance.now()
     const dt = now - last
     last = now
-    // hover 拾取每帧最多一次（pointermove 只记坐标——历史 历史问题）
+    // hover 拾取每帧最多一次（pointermove 只记坐标——历史问题）
     processHover()
     drawFlowOverlay(now, dt / 1000)
     if (!paused) {
@@ -1068,7 +1049,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     applyHotspots()
     // 无条件应用：两帧内已下钻（中国路径同步完成，drillCountry 不 await）时
     // applyLayer 此前因 !layerReady 早退，而 setCountries/setProvinces 只走
-    // 「activeDots 已存在」重着色分支 → 省点阵永不应用（WT87-10）。
+    // 「activeDots 已存在」重着色分支 → 省点阵永不应用（历史修复）。
     applyLayer()
   }))
   let rafId = requestAnimationFrame(frame)
@@ -1119,7 +1100,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       applyHotspots()
       if (!drilledName) {
         // 计数变化不改点集/位置：已建层只重算颜色，避免 30s 轮询重建
-        // 1.3 万点 geometry（历史 历史问题-2）。首帧仍需建层。
+        // 1.3 万点 geometry（历史问题-2）。首帧仍需建层。
         if (!activeDots) {
           applyLayer()
         } else {
@@ -1149,7 +1130,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     },
     setServer(centroid: Centroid | null): void {
       if (!centroid) return
-      // 历史 历史问题：状态化本站坐标——热光点、弧线终点（spawnArc 每次
+      // 历史问题：状态化本站坐标——热光点、弧线终点（spawnArc 每次
       // 读 server）、返回世界视角（zoomOut/resetView）随之更新；原实现只改
       // 环/点数据，server 常量让后续弧线仍飞向旧坐标。
       server = [centroid[0], centroid[1]]
@@ -1164,7 +1145,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       if (paused) renderOnce()
     },
     zoomOut(): void {
-      // WT87-03：与地图版同源——复位/返回必须作废在途省界加载，否则迟到的
+      // 历史修复：与地图版同源——复位/返回必须作废在途省界加载，否则迟到的
       // chunk 续体会把用户刚做的复位覆盖成下钻。
       drillSeq += 1
       enterWorldView(600)
@@ -1195,7 +1176,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     },
     dispose(): void {
       disposed = true
-      // 历史问题-F5：作废在途省界加载（下钻续体在 await 后检查 disposed，双保险）
+      // 历史问题：作废在途省界加载（下钻续体在 await 后检查 disposed，双保险）
       drillSeq += 1
       rafPatch.active = false
       if (window.requestAnimationFrame === throttledRAF) window.requestAnimationFrame = rafPatch.prev
@@ -1219,7 +1200,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
         if (!points) continue
         points.geometry.dispose()
         const pointsMaterial = points.material as THREE.PointsMaterial
-        // 历史问题-F6：Material.dispose() 不释放贴图——dotTexture 的 CanvasTexture
+        // 历史问题：Material.dispose() 不释放贴图——dotTexture 的 CanvasTexture
         // 必须显式释放，否则反复进出大屏累积 Canvas/GPU 资源。
         pointsMaterial.map?.dispose()
         pointsMaterial.dispose()
@@ -1228,7 +1209,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       backdropDotsPoints = null
       hoverDotsPoints = null
       dotLayerGroup.clear()
-      // 历史问题-F6：海面材质（globe.globeMaterial）随实例销毁释放
+      // 历史问题：海面材质（globe.globeMaterial）随实例销毁释放
       oceanMat.dispose()
       if (scanMat) {
         scanMat.dispose()
@@ -1238,7 +1219,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
         scanGeo.dispose()
         scanGeo = null
       }
-      // WebGL/three 资源释放（历史 历史问题）：原仅清数据 + innerHTML，
+      // WebGL/three 资源释放（历史问题）：原仅清数据 + innerHTML，
       // renderer/几何/纹理驻留 → 反复进出大屏堆内存与 WebGL 上下文持续增长。
       const destructible = globe as unknown as { _destructor?: () => void; renderer?: () => THREE.WebGLRenderer }
       try {

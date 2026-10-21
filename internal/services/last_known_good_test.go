@@ -53,7 +53,7 @@ func TestCaddyService_ApplyLastKnownGood_sendsFileContentToLoad(t *testing.T) {
 	var bodies []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost && r.URL.Path == "/load" {
-			// LBS-B-L2（历史）：单次 Read 不保证读满——短读会截断断言
+			// 历史修复（历史）：单次 Read 不保证读满——短读会截断断言
 			// 内容致偶发红，改 io.ReadFull。
 			buf := make([]byte, r.ContentLength)
 			_, _ = io.ReadFull(r.Body, buf)
@@ -85,12 +85,12 @@ func TestCaddyService_ApplyLastKnownGood_sendsFileContentToLoad(t *testing.T) {
 	}
 }
 
-// F-历史问题-03（历史 历史问题）：ApplyLastKnownGood 的 /load 此前仅持 s.mu——
+// 历史问题-03（历史）：ApplyLastKnownGood 的 /load 此前仅持 s.mu——
 // 与持 CaddyOpLock 的并发「渲染+/load」写者（handler 写路径/后台 Force 重载）
 // 无互斥，last-good 的旧配置可后到覆盖新配置。修复=入 CaddyOpLock（与
 // GenerateAndApplyConfigForce 同型：CaddyOpLock→s.mu 持锁序，叶操作无 AB-BA）。
 // 唯一生产调用方 ApplyConfigOnStartup（handlers.go 启动兜底）在 applyCaddyConfigE
-// 返回后调用、不持锁（R-2.5 反向枚举：无 InLock 变体需求）。
+// 返回后调用、不持锁（历史修复.5 反向枚举：无 InLock 变体需求）。
 func TestCaddyService_ApplyLastKnownGood_blocks_while_caddy_op_lock_held(t *testing.T) {
 	// Given：落盘文件 + 就绪的假 admin；CaddyOpLock 被预持（模拟并发写临界区）
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -129,7 +129,7 @@ func TestCaddyService_ApplyLastKnownGood_blocks_while_caddy_op_lock_held(t *test
 	}
 }
 
-// 裁定 2026-09-07 K1：从节点启动 last-good 回退后写 apply_ok_reload_failed
+// 裁定 2026-09-07 历史修复：从节点启动 last-good 回退后写 apply_ok_reload_failed
 // 补偿标记——Pull 的 304 分支识别后全量重拉，消除「同步正常+运行旧配置」的
 // 静默窗口（主节点长期静态时从节点不再卡旧配置直到人工干预）。
 func TestMarkStartupFallbackPending_writesCompensationMarker(t *testing.T) {
@@ -147,12 +147,12 @@ func TestMarkStartupFallbackPending_writesCompensationMarker(t *testing.T) {
 	}
 }
 
-// F-历史问题-02（历史 历史问题）：启动渲染被拒且 last-known-good 回退也失败的
+// 历史问题-02（历史）：启动渲染被拒且 last-known-good 回退也失败的
 // 双失败路径此前不写任何补偿标记——运行配置与数据库处于未知分叉态，而 Pull 的
 // 304 分支只认 apply_ok_reload_failed 标记，自愈失明（「同步正常+运行未知旧
 // 配置」静默到下次真实变更或重启）。修复=双失败同样落标记，下轮 Pull 打破 304
 // 强制全量重放。本测试钉：标记写入 + 304 触发器（syncReloadFailureMarkerPresent）
-// 识别（全量重拉机制本身由 cluster_r31/历史修复 既有测试覆盖）。
+// 识别（全量重拉机制本身由既有集群重拉测试覆盖）。
 func TestMarkStartupFallbackFailed_writesCompensationMarker(t *testing.T) {
 	_, database := newClusterTestService(t)
 	cause := errors.New("apply last-known-good config failed: connection refused")

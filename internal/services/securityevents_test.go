@@ -42,7 +42,7 @@ func (s *syncBuffer) String() string {
 	return s.buf.String()
 }
 
-// Real Coraza audit transaction (历史修复 JSON, 历史修复). Message
+// Real Coraza audit transaction (pretty-printed JSON, multi-line). Message
 // shape mirrors coraza v3's JSON formatter: data.id 是规则 ID，data.raw 是规则
 // 原文，msg 携带宏展开后的文本；阻断评估规则（949110）的 msg 报告累计总分。
 const securityEventsFixtureBlocked = `{
@@ -149,7 +149,7 @@ func TestSecurityEventsParseTransaction_BlockedMapsAllFields(t *testing.T) {
 }
 
 func TestSecurityEventsParseTransaction_SumsSetvarScoresAcrossMessages(t *testing.T) {
-	// Given: a 历史修复 历史修复 interruption with two matched rules (+5/+3 setvar)
+	// Given: a phase-1 custom-rule interruption with two matched rules (+5/+3 setvar)
 	// When: parsing
 	rec, err := securityEventsParseTransaction(json.RawMessage(securityEventsFixtureBlockedMulti))
 	if err != nil {
@@ -217,7 +217,7 @@ func TestSecurityEventsParseTransaction_RealCustomRuleAuditShape(t *testing.T) {
 }
 
 func TestSecurityEventsParseTransaction_CleanPassThroughLogsWithoutRuleFields(t *testing.T) {
-	// Given: a 历史修复 transaction with no messages and only a host header
+	// Given: a non-interrupted transaction with no messages and only a host header
 	// When: parsing
 	rec, err := securityEventsParseTransaction(json.RawMessage(securityEventsFixtureClean))
 	if err != nil {
@@ -260,7 +260,7 @@ func TestSecurityEventsMapHost_MatchesCanonicalAndReportsUnknown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load mappings: %v", err)
 	}
-	// When/Then: canonical comparison is 历史修复 and carries the resolved names
+	// When/Then: canonical comparison is case-insensitive and carries the resolved names
 	rule := securityEventsMapHost("GO029.COM", rules)
 	if rule.caddyID != "lb_rule1" || rule.name != "test rule" {
 		t.Errorf("mapHost(GO029.COM)=(%q,%q), want (lb_rule1,test rule)", rule.caddyID, rule.name)
@@ -270,7 +270,7 @@ func TestSecurityEventsMapHost_MatchesCanonicalAndReportsUnknown(t *testing.T) {
 	if pid != 7 || pname != "policy-seven" {
 		t.Errorf("attributePolicy=(%d,%q), want (7,policy-seven)", pid, pname)
 	}
-	// When/Then: unknown hosts map to 历史修复 rule, attribution returns zero
+	// When/Then: unknown hosts map to zero-value rule, attribution returns zero
 	if rule := securityEventsMapHost("unknown.example.com", rules); rule.caddyID != "" {
 		t.Errorf("mapHost(unknown)=%q, want \"\"", rule.caddyID)
 	}
@@ -392,7 +392,7 @@ func TestSecurityEventsOffsetRoundTrip(t *testing.T) {
 	if err := securityEventsWriteOffset(path, 4096); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	// Then: the plain integer 历史修复
+	// Then: the plain integer round-trips
 	if got, err := securityEventsReadOffset(path); err != nil || got != 4096 {
 		t.Fatalf("round-trip: offset=%d err=%v, want 4096,nil", got, err)
 	}
@@ -447,7 +447,7 @@ func TestSecurityEventsShouldReset_ShrinkAndInodeChange(t *testing.T) {
 }
 
 func TestSecurityEventsFindNextDocument_boundedBufferOnSmallTail(t *testing.T) {
-	// N+11 扫描缓冲按 min(4MB, 历史修复) 定界（f.Stat）——硬杀残片
+	// 扫描缓冲按 min(4MB, 历史修复) 定界（f.Stat）——硬杀残片
 	// 留下 <4KB 小文件时，每次 2s tick 的解码失败不再分配整块 4MB 窗口。
 	// 定位行为保持不变；from 到/超 EOF 时零读取直接未找到。
 	dir := t.TempDir()
@@ -611,7 +611,7 @@ func TestSecurityEventsTickIngestsFixtureLog(t *testing.T) {
 }
 
 func TestSecurityEventsTick_idleTickSkipsMappingLoad(t *testing.T) {
-	// N+11 空闲 tick（上次干净 pass 后无新增字节）不得重载映射
+	// 空闲 tick（上次干净 pass 后无新增字节）不得重载映射
 	// （3 条主库查询 + 逐行 IDNA）。seam：首次干净 tick 后把主库置 nil——
 	// 若空闲 tick 仍调 loadMappings 会返回 "database not initialized"；
 	// 追加新事务后应照常恢复摄取。
@@ -736,7 +736,7 @@ func TestSecurityEventsIngestRotatedDelta_recoversRotationWindowEvents(t *testin
 	}
 	rotateAuditLogIfNeeded()
 
-	// Then: the 历史修复 ingest recovered B from the archive window
+	// Then: the rotated-delta ingest recovered B from the archive window
 	if err := db.MetricsDB.QueryRow(`SELECT COUNT(*) FROM security_events`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
@@ -814,7 +814,7 @@ func TestSecurityEventsTickDedupesDuplicateTransactionID(t *testing.T) {
 }
 
 func TestSecurityEventsTickSkipsMalformedAndContinues(t *testing.T) {
-	// Given: an audit log with garbage bytes and a 历史修复 JSON between valid docs
+	// Given: an audit log with garbage bytes and a non-transaction JSON between valid docs
 	dataDir := t.TempDir()
 	if err := db.Initialize(dataDir); err != nil {
 		t.Fatal(err)
@@ -1027,7 +1027,7 @@ func TestRotateAuditLog_retriesPendingDeltaBeforeShifting(t *testing.T) {
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatalf("pending marker must exist after failed delta ingest: %v", err)
 	}
-	// Then：F5 崩溃窗口（truncate 已执行、补采未完成）——活文件已清空但标记
+	// Then：历史修复 崩溃窗口（truncate 已执行、补采未完成）——活文件已清空但标记
 	// 因先于 truncate 落盘而幸存，.1 仍保存 B，下次轮转可恢复
 	liveInfo, err := os.Stat(logPath)
 	if err != nil {
@@ -1443,7 +1443,7 @@ func TestSecurityEventsWriteOffset_renameFailureCleansTmp(t *testing.T) {
 }
 
 func TestSecurityEventsTick_warnRateLimitedPerOffset(t *testing.T) {
-	// Given：日志含正常事务 + ≥4MB 无文档头畸形区 + 后续事务（F1 停摆场景，
+	// Given：日志含正常事务 + ≥4MB 无文档头畸形区 + 后续事务（历史修复 停摆场景，
 	// 偏移永久卡在畸形区前）
 	dataDir := t.TempDir()
 	if err := db.Initialize(dataDir); err != nil {
@@ -1468,7 +1468,7 @@ func TestSecurityEventsTick_warnRateLimitedPerOffset(t *testing.T) {
 	log.SetOutput(&buf)
 	t.Cleanup(func() { log.SetOutput(oldWriter) })
 
-	// When：单轮摄取连续执行 10 次（同一 pollState 尾读器——同偏移反复 F1，旧行为每轮一条 warn）
+	// When：单轮摄取连续执行 10 次（同一 pollState 尾读器——同偏移反复 历史修复，旧行为每轮一条 warn）
 	resetSecurityEventsPollState(t)
 	for i := 0; i < 10; i++ { // ≥ 10 轮——同一 pollState 尾读器跨轮复用
 		SecurityEventsPollOnce()
@@ -1514,7 +1514,7 @@ func TestRotateAuditLog_skipsMalformedRegionInArchive(t *testing.T) {
 		t.Fatalf("tick err=%v, want beyond-scan-window error (precondition)", err)
 	}
 
-	// When：轮转——归档含畸形区 + B，补采走归档 历史修复 恢复
+	// When：轮转——归档含畸形区 + B，补采走归档 scan-to-EOF 恢复
 	rotateAuditLogIfNeeded()
 
 	// Then：畸形区之后的 B 入库、轮转正常推进（标记清除、活文件已截断）
@@ -1548,7 +1548,7 @@ func TestRotateAuditLog_skipsMalformedRegionInArchive(t *testing.T) {
 }
 
 func TestRotateAuditLog_endsPassWhenArchiveGarbageUnrecoverable(t *testing.T) {
-	// Given：日志含 A + ≥4MB 畸形区在尾部（无后续事件，历史修复 找不到文档头）
+	// Given：日志含 A + ≥4MB 畸形区在尾部（无后续事件，scan-to-EOF 找不到文档头）
 	dataDir := t.TempDir()
 	if err := db.Initialize(dataDir); err != nil {
 		t.Fatal(err)
@@ -1579,7 +1579,7 @@ func TestRotateAuditLog_endsPassWhenArchiveGarbageUnrecoverable(t *testing.T) {
 		t.Fatalf("tick err=%v, want beyond-scan-window error (precondition)", err)
 	}
 
-	// When：轮转——归档补采 历史修复 找不到下一个文档头
+	// When：轮转——归档补采 scan-to-EOF 找不到下一个文档头
 	rotateAuditLogIfNeeded()
 
 	// Then：记一条 error 日志并结束该 pass（区域不可恢复），轮转照常推进：
@@ -1759,8 +1759,8 @@ func TestRotateAuditLog_abortsRotationWhenMarkerWriteFails(t *testing.T) {
 func TestRotateAuditLog_liveTailGarbageDoesNotBlockRotation(t *testing.T) {
 	// Given：日志含 A（tick 已摄取）+ ≥4MB 畸形区 + B（tick 被畸形区卡住停采）；
 	// copy 完成后 Coraza 再写入 ≥4MB 畸形区 C——活文件补采区间 [archSize, EOF)
-	// 整体为畸形区，旧行为（archive=false）F1 报错中止轮转：每 2s 周期反复复制
-	// 更大文件、永不截断（历史问题 F1 死锁）
+	// 整体为畸形区，旧行为（archive=false）历史修复 报错中止轮转：每 2s 周期反复复制
+	// 更大文件、永不截断（历史问题 死锁）
 	dataDir := t.TempDir()
 	if err := db.Initialize(dataDir); err != nil {
 		t.Fatal(err)
@@ -1829,7 +1829,7 @@ func TestRotateAuditLog_liveTailGarbageDoesNotBlockRotation(t *testing.T) {
 
 func TestSecurityEventsBackscanDocumentStart_crossChunkBoundary(t *testing.T) {
 	// Given：唯一 "\n{" 跨 1MB 分块边界——'\n' 恰为 [0, 1MB) 块末字节、
-	// '{' 恰为 [1MB, ...) 块首字节（分块回扫必须识别跨块文档头，历史问题 F3）
+	// '{' 恰为 [1MB, ...) 块首字节（分块回扫必须识别跨块文档头，历史问题）
 	dir := t.TempDir()
 	path := filepath.Join(dir, "audit.log")
 	content := strings.Repeat("a", 1<<20-1) + "\n{" + strings.Repeat("b", 1<<20-2)
@@ -1967,11 +1967,11 @@ func TestSecurityEventsAttribution_OverlappingCustomRulePicksLowestPolicyID(t *t
 }
 
 // 历史修复 单属自定义规则 → 归因到拥有该规则的策略（而非首绑定回退值）。
-// Given：自定义规则 DB id 3 仅被 历史修复（customJSON [3]，emit id 10003）包含；
-// 历史修复 是绑定顺序第一条但不含该规则。
+// Given：自定义规则 DB id 3 仅被 policy-B（customJSON [3]，emit id 10003）包含；
+// policy-A 是绑定顺序第一条但不含该规则。
 // When：摄取 audit rule_triggered="10003"。
-// Then：归因到 历史修复 —— 若 contains 判定用 DB id 与 emit id 直接比较（ID 空间
-// 错位），contains 对两个策略均失败，会错误回退到首绑定 历史修复。
+// Then：归因到 policy-B —— 若 contains 判定用 DB id 与 emit id 直接比较（ID 空间
+// 错位），contains 对两个策略均失败，会错误回退到首绑定 policy-A。
 func TestSecurityEventsAttribution_SingleOwnerCustomRulePicksOwnerPolicy(t *testing.T) {
 	pid, pname := securityEventsSeedAttrPolicy(t, "10003", []struct {
 		id         int
@@ -1990,11 +1990,11 @@ func TestSecurityEventsAttribution_SingleOwnerCustomRulePicksOwnerPolicy(t *test
 }
 
 // 历史修复 归因回退：首绑定为禁用策略 → 跳过到第一个启用绑定。
-// Given：历史修复（id 1）禁用且绑定顺序第一，历史修复（id 3）启用；
+// Given：policy-off（id 1）禁用且绑定顺序第一，policy-B（id 3）启用；
 // rule_triggered="2"（IP ACL 拒绝 id，不属于自定义/CRS 任一 ID 带）不被任何策略
 // 显式包含 → 触发回退路径。
 // When：摄取 audit rule_triggered="2"。
-// Then：回退到第一个 ENABLED 绑定 历史修复；禁止返回 (1,"")（禁用首绑定 + 空名）。
+// Then：回退到第一个 ENABLED 绑定 policy-B；禁止返回 (1,"")（禁用首绑定 + 空名）。
 func TestSecurityEventsAttribution_FallbackSkipsDisabledFirstBinding(t *testing.T) {
 	pid, pname := securityEventsSeedAttrPolicy(t, "2", []struct {
 		id         int
@@ -2123,12 +2123,12 @@ func TestSecurityEventsAttribution_UnboundReturnsZeroValue(t *testing.T) {
 	}
 }
 
-// A3 历史问题 遗留 ip_blacklist 拒绝（rule_triggered="4"）必须归因到拥有黑名单的策略。
-// Given：lb_rule1 绑定 [历史修复(id1, 无任何 IP 控制), 历史修复(id3, ip_blacklist
+// 历史修复问题 遗留 ip_blacklist 拒绝（rule_triggered="4"）必须归因到拥有黑名单的策略。
+// Given：lb_rule1 绑定 [policy-A(id1, 无任何 IP 控制), policy-B(id3, ip_blacklist
 // '["10.0.0.1"]')]，绑定顺序 policy_id ASC。
 // When：归因 audit rule_triggered="4"（BuildCorazaDirectives 对非空 ip_blacklist
 // 发射 id:4 的遗留黑名单拒绝）。
-// Then：归因到 历史修复(id3) —— 而非首绑定回退值 历史修复。
+// Then：归因到 policy-B(id3) —— 而非首绑定回退值 policy-A。
 func TestSecurityEventsAttribution_LegacyBlacklistDenyPicksOwnerPolicy(t *testing.T) {
 	dataDir := t.TempDir()
 	if err := db.Initialize(dataDir); err != nil {
@@ -2156,11 +2156,11 @@ func TestSecurityEventsAttribution_LegacyBlacklistDenyPicksOwnerPolicy(t *testin
 	}
 }
 
-// A3 历史问题 IP ACL 黑名单模式拒绝（rule_triggered="2"）必须归因到拥有该 ACL 的策略。
-// Given：lb_rule1 绑定 [历史修复(id1, 无任何 IP 控制), 历史修复(id4,
+// 历史修复问题 IP ACL 黑名单模式拒绝（rule_triggered="2"）必须归因到拥有该 ACL 的策略。
+// Given：lb_rule1 绑定 [policy-A(id1, 无任何 IP 控制), policy-C(id4,
 // ip_acl_enabled=1, ip_acl_mode='deny', ip_acl_list '["1.2.3.4"]')]。
 // When：归因 audit rule_triggered="2"（enabled+deny+名单非空时发射 id:2）。
-// Then：归因到 历史修复(id4) —— 而非首绑定回退值 历史修复。
+// Then：归因到 policy-C(id4) —— 而非首绑定回退值 policy-A。
 func TestSecurityEventsAttribution_IPACLDenyPicksOwnerPolicy(t *testing.T) {
 	dataDir := t.TempDir()
 	if err := db.Initialize(dataDir); err != nil {
@@ -2188,7 +2188,7 @@ func TestSecurityEventsAttribution_IPACLDenyPicksOwnerPolicy(t *testing.T) {
 	}
 }
 
-// A3 历史问题 回退守恒：rule_triggered="4" 但没有任何绑定策略配置黑名单时，
+// 历史修复问题 回退守恒：rule_triggered="4" 但没有任何绑定策略配置黑名单时，
 // 仍回退到第一个 ENABLED 绑定策略（发射现实：必有策略发出了该 id，只是当前
 // 配置已变更），禁止回归为零值或报错。
 func TestSecurityEventsAttribution_BlacklistDenyFallsBackToFirstEnabledWhenNoOwner(t *testing.T) {
@@ -2215,7 +2215,7 @@ func TestSecurityEventsAttribution_BlacklistDenyFallsBackToFirstEnabledWhenNoOwn
 	}
 }
 
-// A3 历史问题 边界：allow（白名单）模式的 IP ACL 不拥有 rule_triggered="2" 的归属
+// 历史修复问题 边界：allow（白名单）模式的 IP ACL 不拥有 rule_triggered="2" 的归属
 // （归属口径仅认 deny 黑名单模式，与审计规格一致）；事件回退到第一个启用绑定。
 func TestSecurityEventsAttribution_IPACLAllowModeDoesNotOwnDenyEvent(t *testing.T) {
 	dataDir := t.TempDir()
@@ -2426,7 +2426,7 @@ func TestAuditFailureThrottleKey_replacesDigitRuns(t *testing.T) {
 	}
 }
 
-// N+9 历史问题：pending 归档缺失分支的 warn 必须走 60s 限流——标记删除失败
+// 历史问题：pending 归档缺失分支的 warn 必须走 60s 限流——标记删除失败
 // （只读目录等）时标记留在盘上，2s tick 反复进入该分支，裸 warn 每 tick
 // 一条（~43k 行/天）。只读目录模拟在 root 下退化为「删除成功」，但断言的
 // 窗口内至多一条上限两种情况都成立。
@@ -2482,7 +2482,7 @@ func TestRotateAuditLogIfNeeded_pendingArchiveMissing_unremovableMarkerWarnsAtMo
 	}
 }
 
-// N+9 历史问题（正向）：标记可删除时 warn 仍保持一次性——删除成功后标记消失，
+// 历史问题（正向）：标记可删除时 warn 仍保持一次性——删除成功后标记消失，
 // 后续 tick 不再进入该分支。
 func TestRotateAuditLogIfNeeded_pendingArchiveMissing_removableMarkerWarnsOnceAndDrops(t *testing.T) {
 	// Given：重置限流状态；可写目录 + 指向缺失归档的 pending 标记
@@ -2542,9 +2542,9 @@ func TestRotateAuditLogIfNeeded_pendingArchiveMissing_removableMarkerWarnsOnceAn
 // 审计 历史问题：GeoIP（id:8）归因走真实 loader 路径——securityEventsLoadMappings
 // 此前不加载 geoip_countries，case 8 所有权判定对空 GeoIPCountries 必败，
 // 多策略绑定时错归首启用策略（单测曾用合成 map 绕过 loader 掩盖该缺陷）。
-// Given：历史修复（id 1，无 geoip）绑定顺序第一，历史修复（id 3，geoip ["CN"]）。
+// Given：policy-A（id 1，无 geoip）绑定顺序第一，policy-B（id 3，geoip ["CN"]）。
 // When：摄取 audit rule_triggered="8"（GeoIP 区域拦截）。
-// Then：归因到 历史修复（携带 geoip 条目者），而非首绑定 历史修复。
+// Then：归因到 policy-B（携带 geoip 条目者），而非首绑定 policy-A。
 func TestSecurityEventsAttribution_GeoIPOwnerPicksGeoIPCarryingPolicy(t *testing.T) {
 	dataDir := t.TempDir()
 	if err := db.Initialize(dataDir); err != nil {
@@ -2774,7 +2774,7 @@ func TestSecurityEventsParseTransaction_requestContext(t *testing.T) {
 	}
 }
 
-// S2(2026-09-10 审计):自定义规则事件归因分支缺模式门——off=全关(四态化)后
+// 历史修复(2026-09-10 审计):自定义规则事件归因分支缺模式门——off=全关(四态化)后
 // 零发射,不得认领自定义规则事件(与 CRS 分支 blocking/detection 门同口径)。
 func TestSecurityEventsAttribution_ModeOffPolicyDoesNotClaimCustomRuleEvents(t *testing.T) {
 	pid, pname := securityEventsSeedAttrPolicy(t, "10001", []struct {
@@ -2793,7 +2793,7 @@ func TestSecurityEventsAttribution_ModeOffPolicyDoesNotClaimCustomRuleEvents(t *
 	}
 }
 
-// SYSRENDE历史问题(历史):迁移/首启动形态——文件缺失分支创建空文件时
+// 历史问题(历史):迁移/首启动形态——文件缺失分支创建空文件时
 // 残留 offset>0 必须归零。否则新文件快速增长超过旧 offset 后,前缀事件被
 // 永久跳过(inode 分支 lastInfo=nil 首启动永不生效)。
 func TestSecurityEventsTick_missingFileResetsStaleOffset(t *testing.T) {
@@ -2823,7 +2823,7 @@ func TestSecurityEventsTick_missingFileResetsStaleOffset(t *testing.T) {
 }
 
 // 同域名双规则归因(2026-09-15 用户实证):rules[host] 覆盖致 https 规则 ref
-// 蒸发,rulesByID 缺 https id → header=历史修复 回退 MapHost 命中 http 规则。
+// 蒸发,rulesByID 缺 https id → header=https-id 回退 MapHost 命中 http 规则。
 // host:port 双写后两 ref 共存,归因精确。
 func TestSecurityEventsAttribution_sameDomainTwoRules(t *testing.T) {
 	_, database := newClusterTestService(t)
@@ -2848,11 +2848,11 @@ func TestSecurityEventsAttribution_sameDomainTwoRules(t *testing.T) {
 	if rulesByID["lb_http"].caddyID == "" {
 		t.Fatal("http rule ref missing from rulesByID")
 	}
-	// header=历史修复 归因命中 https 规则
+	// header=https-id 归因命中 https 规则
 	if got := rulesByID["lb_https"]; got.name != "https-rule" {
 		t.Fatalf("attribution for https-id=%q, want https-rule", got.name)
 	}
-	// header=历史修复 归因命中 http 规则
+	// header=http-id 归因命中 http 规则
 	if got := rulesByID["lb_http"]; got.name != "http-rule" {
 		t.Fatalf("attribution for http-id=%q, want http-rule", got.name)
 	}
@@ -2903,7 +2903,7 @@ func TestSecurityEventsAttribution_singleRuleForms(t *testing.T) {
 	}
 }
 
-// 历史问题-F1/F2(历史,历史问题)+ 历史问题-1/2/3(历史,历史问题 误拒修正):
+// 历史问题(历史,历史问题)+ 历史问题-1/2/3(历史,历史问题 误拒修正):
 // fallback 归因模式/动作可行性门。门禁语义按「模式 × 动作 × 规则 id 族」交叉积,
 // 逐格对照发射侧(security.go:179-184 IP 控制/GeoIP 与模式无关独立发射、
 // :220-222 off 引擎 On、:347→:351 自定义先于 id:6 DetectionOnly 切换、:668
@@ -2952,10 +2952,10 @@ func TestSecurityEventsAttribution_FallbackModeFeasibilityGate(t *testing.T) {
 		action    string
 		wantPID   int
 	}{
-		// ── F1/F2 原始标靶(正确拒绝,保持) ──
-		// F1:custom_only 首绑不得认领 blocked id:11(无 949 评分链,id:11 恒 pass)
+		// ── 历史修复 原始标靶(正确拒绝,保持) ──
+		// 历史修复:custom_only 首绑不得认领 blocked id:11(无 949 评分链,id:11 恒 pass)
 		{"F1 custom_only id:11 blocked rejected", "lb_r1", "11", "blocked", 2},
-		// F2:custom_only 不得认领 CRS(零 Include)
+		// 历史修复:custom_only 不得认领 CRS(零 Include)
 		{"F2 custom_only CRS blocked rejected", "lb_r2", "913100", "blocked", 0},
 		// detection 不得认领 CRS blocked(id:6 切换先于 CRS 评估,DetectionOnly 零中断)
 		{"detection CRS blocked rejected", "lb_r3", "913100", "blocked", 0},
@@ -3188,9 +3188,9 @@ func TestSecurityEventsAttribution_IncapableOnlyStillAttributed(t *testing.T) {
 }
 
 // 历史修复 真值表扩格（mode × IP 能力 × 动作）：能力首选层不得误拒既有合法形状——
-// off+历史修复 blocked 照旧首选（历史问题-1 形状且真有能力）；历史修复 deny
+// off+deny-ACL blocked 照旧首选（历史问题-1 形状且真有能力）；refs-only deny
 // 计能力（与发射端 refs 合并口径同源）；信任名单仅 logged 语义计能力，blocked
-// 下不得抢过门禁可行但无能力的 detection 绑定；allow 模式不认领 id:2（A3 历史问题
+// 下不得抢过门禁可行但无能力的 detection 绑定；allow 模式不认领 id:2（历史修复问题
 // 钉住的既有口径在能力层保持）；黑名单属主走 contains 不受影响。
 func TestSecurityEventsAttribution_IPFamilyCapabilityTruthTable(t *testing.T) {
 	dataDir := t.TempDir()
@@ -3232,12 +3232,12 @@ func TestSecurityEventsAttribution_IPFamilyCapabilityTruthTable(t *testing.T) {
 		clientIP string
 		wantPID  int
 	}{
-		// off+历史修复 blocked：clientIP 不在名单（漂移形状）排空 contains 后，
+		// off+deny-ACL blocked：clientIP 不在名单（漂移形状）排空 contains 后，
 		// 能力首选层照旧首选（历史问题-1 不得回归误拒、不归零）
 		{"off deny-ACL blocked tier1", "lb_off", "2", "blocked", "198.51.100.7", 2},
-		// off+历史修复 blocked + 事件源在名单：contains 成员命中直达属主（合同形状）
+		// off+deny-ACL blocked + 事件源在名单：contains 成员命中直达属主（合同形状）
 		{"off deny-ACL member contains hit", "lb_off", "2", "blocked", "::1", 2},
-		// 历史修复 deny（inline 空仅引用）计能力：logged 语义下优先于无能力 detection
+		// refs-only deny（inline 空仅引用）计能力：logged 语义下优先于无能力 detection
 		{"refs-only deny logged tier1", "lb_refs", "2", "logged", "198.51.100.7", 3},
 		// 信任名单仅 logged 计能力：logged 下信任策略优先于无能力 detection
 		{"trust wl logged tier1", "lb_trust", "2", "logged", "", 4},
@@ -3346,7 +3346,7 @@ func TestSecurityEventsAttribution_CustomFamilyCapabilityPreference(t *testing.T
 //   - off：CRS/自定义/body 守卫全关（仅 IP 族独立发射，非本表维度）；
 //   - custom_only：CRS 全拒（零 Include）；id:11 blocked 拒（pass 动作恒不中断，
 //     无 949 评分链）；logged 可产——emitBodyProcessorRules 在 custom_only 存在
-//     启用自定义规则时发射（SEC-历史问题 收紧，模式粒度门不变）；
+//     启用自定义规则时发射（历史问题 收紧，模式粒度门不变）；
 //   - detection：blocked 拒 CRS（id:6 切换先于 CRS）；自定义/含 id:11 logged 可产；
 //   - blocking：门全域；id:11 blocked 保持可行格（发射面恒在；物理上 pass 恒不
 //     中断、该形状事件不存在，恒真格无害）。
@@ -3461,7 +3461,7 @@ func TestSecurityEventsFallbackGate_CustomFamilyTruthTable(t *testing.T) {
 // BuildCorazaDirectives 对 stage0 产空串不出自有 handler）——对非 IP 族的任何
 // 动作事件均不可产（mode=off 门恒拒，含信任 wl：wl 在能力面也仅 logged 语义）。
 // 真值表锁格 + 与有能力兄弟绑定的合成形状；IP 族 blocked 的无属主漂移形状按
-// S3 既有语义走必归属层归首绑（禁归零），一并锚定。
+// 历史修复 既有语义走必归属层归首绑（禁归零），一并锚定。
 func TestSecurityEventsAttribution_Stage0ZeroEmissionSurfaceLock(t *testing.T) {
 	dataDir := t.TempDir()
 	if err := db.Initialize(dataDir); err != nil {
@@ -3507,14 +3507,14 @@ func TestSecurityEventsAttribution_Stage0ZeroEmissionSurfaceLock(t *testing.T) {
 	if pid, _ := securityEventsAttributePolicy("lb_mix", "10005", "blocked", "", policyByID, bindings); pid != 11 {
 		t.Fatalf("lb_mix (10005,blocked)=(%d), want 11 — stage0 不得凭候选顺序认领自定义事件", pid)
 	}
-	// IP 族 blocked 无属主（两个绑定均无 ACL 发射面）：按 S3 既有必归属语义归
+	// IP 族 blocked 无属主（两个绑定均无 ACL 发射面）：按 历史修复 既有必归属语义归
 	// 首绑 stage0，禁归零（能力首选层已拒绝两者,漂移形状归首启用绑定）
 	if pid, _ := securityEventsAttributePolicy("lb_mix", "2", "blocked", "", policyByID, bindings); pid != 9 {
-		t.Fatalf("lb_mix (2,blocked)=(%d), want 9 — 必归属层锚（S3 既有语义,禁归零）", pid)
+		t.Fatalf("lb_mix (2,blocked)=(%d), want 9 — 必归属层锚（既有语义,禁归零）", pid)
 	}
 }
 
-// 历史 历史问题-5：IP 族能力首选层的信任分支必须镜像引擎/预检的信任发射门——
+// 历史问题-5：IP 族能力首选层的信任分支必须镜像引擎/预检的信任发射门——
 // stage0 + trust_detection=0（直通）策略的信任 IP 走路由层 subroute 短路（零 coraza
 // 事务）、非信任 IP 全链评估且无 DetectionOnly 降级 ⇒ 该策略物理上不产任何 logged
 // IP 族事件；但能力层此前只核「whitelist 启用且非空」，会在漂移窗口（属主名单事后
@@ -3676,7 +3676,7 @@ func TestSecurityEventsCRSExclusionMatcher_shapes(t *testing.T) {
 	}
 }
 
-// TestSecurityEventsPolicyContainsRule_leadingZeroRuleIDGroupDecode（SEC-历史问题，
+// TestSecurityEventsPolicyContainsRule_leadingZeroRuleIDGroupDecode（历史问题，
 // 历史）：ruleTriggered 前导零等畸形串（Atoi 可解析入 900000-999999
 // 区间但长度≠6）的组号解码防御——7 位串 "0942100" 的 [1:3] 切片错位切出
 // "94"（数值 942100 真实组号是 21），存量/带外数据若携带 "94" 组号会被
@@ -3702,7 +3702,7 @@ func TestSecurityEventsPolicyContainsRule_leadingZeroRuleIDGroupDecode(t *testin
 	_ = securityEventsPolicyContainsRule(g21Policy, "0942100", "198.51.100.9") // 断言不 panic
 }
 
-// ---- 历史 A 域：历史修复（历史问题 / 历史问题）----
+// ---- 历史 A 域：历史修复（历史问题）----
 
 // securityEvents历史Fixture 生成一条可摄取事务（rule 942100 非中断形态，
 // 足以通过自动封禁喂入门：rule_triggered 非空 + action=blocked）。
@@ -3753,7 +3753,7 @@ func autobanCountForTest(ip string) int {
 }
 
 // securityEventsLoggedRuleFixture 生成一条非中断（logged）事务，并用
-// 历史修复 固定归属规则；时间取当前时钟以通过自动封禁窗口。
+// X-LB-Rule-ID 固定归属规则；时间取当前时钟以通过自动封禁窗口。
 func securityEventsLoggedRuleFixture(txID, ip, ruleCaddyID string) string {
 	now := time.Now().UTC()
 	fixture := securityEvents历史Fixture(txID, ip, "/trust")
@@ -4036,7 +4036,7 @@ func TestSecurityEventsSerializeHeaders_manyHeadersDroppedConsistently(t *testin
 // 每 2s tick 重建全部映射」的成本上界：20 万条威胁名单文本（单源上限量级）
 // + N 条引用它的 deny 策略，并单列文件读取与聚合两个分项。
 //
-// 实测（Apple M4 Max，10x）：readList=200k ≈ 4.6ms/次，aggregate=200k ≈
+// 实测（Apple 历史修复 Max，10x）：readList=200k ≈ 4.6ms/次，aggregate=200k ≈
 // 19ms/次；mappings 在策略数 1→10（同一名单、来源列相同）时保持 ≈23ms/次
 // ——按来源列去重展开（resolvePolicyIPListRefs 的 expandMemo）之前为
 // 183ms/次（每策略各聚合一次）。剩余成本 = 每 tick 一次读文件+聚合，占 2s

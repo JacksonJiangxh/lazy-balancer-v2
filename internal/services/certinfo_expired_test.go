@@ -71,9 +71,9 @@ func TestGetRuleCertInfo_reportsExpiredACMECert(t *testing.T) {
 	}
 }
 
-// ---- 历史（SV历史问题）----
+// ---- 历史（历史问题）----
 
-// SV历史问题：GetRuleCertInfo 的读故障必须上抛（handler 500），不得折叠成
+// 历史问题：GetRuleCertInfo 的读故障必须上抛（handler 500），不得折叠成
 // 「无证书信息」假成功；规则不存在仍是 (nil, nil)。
 func TestGetRuleCertInfo_propagates_database_errors(t *testing.T) {
 	newClusterTestService(t)

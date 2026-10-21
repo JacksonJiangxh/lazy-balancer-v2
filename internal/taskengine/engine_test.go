@@ -56,7 +56,7 @@ func TestEngine_SingletonTriggerRejectedWhileRunning(t *testing.T) {
 	release := make(chan struct{})
 	started := make(chan struct{})
 	e.Register(Descriptor{ID: "t-single", Family: "t", Name: "单飞", Kind: KindPeriodic,
-		// TASK-L2（历史）配套：Periodic 注册必须带 IntervalFn（本测试经
+		// 历史修复（历史）配套：Periodic 注册必须带 IntervalFn（本测试经
 		// Trigger 驱动，间隔值不参与断言）。
 		IntervalFn: func() time.Duration { return time.Hour },
 		Run: func(rc RunContext) error {
@@ -318,7 +318,7 @@ func TestEngine_DaemonLifecycle(t *testing.T) {
 // Given Periodic 任务（30ms 间隔）。
 // When 调度运行至 ≥5 轮落行。
 // Then ≥5 行且全部终态 success（无 RFO 静默）。
-// CI87-15（历史）：编排同步点用 Run 内部信号，不再以 10ms 墙钟轮询推断
+// 历史修复：编排同步点用 Run 内部信号，不再以 10ms 墙钟轮询推断
 // 执行进度——契约是「每轮独立执行且每轮落行」，不是固定窗口内的绝对轮数；
 // 3s 截止只在真回归时触发。
 func TestEngine_PeriodicRecordsEveryCycle(t *testing.T) {
@@ -725,7 +725,7 @@ func TestEngine_CancelHookPathLandsCancelled(t *testing.T) {
 
 // Given BootSync Oneshot 任务注册后。
 // When RunBootSyncTasks（InitTaskEngine 尾部同型调用）。
-// Then Run 同步执行恰一次、task_runs 记 startup 触发行（B1：启动执行单轨化
+// Then Run 同步执行恰一次、task_runs 记 startup 触发行（历史修复：启动执行单轨化
 // ——曾 main.go 直调+legacy startupPhase 记录旁路）。
 func TestEngine_BootSyncTasksRunOnceWithStartupRow(t *testing.T) {
 	e := newTestEngine(t)
@@ -821,7 +821,7 @@ func TestEngine_StatusMirrorRoleGated(t *testing.T) {
 
 // Given Oneshot 任务与独立任务日志目录。
 // When 以 trigger=caddy-restart 同步执行（Caddy 崩溃自愈 watcher 通道）。
-// Then 任务日志必须含 [start] 行（F-历史问题-04：[start] 打印条件仅放行
+// Then 任务日志必须含 [start] 行（历史问题-04：[start] 打印条件仅放行
 // manual/startup——caddy-restart 轮只有 [done]，排障看不到执行起点）。
 func TestEngine_CaddyRestartTriggerWritesStartLine(t *testing.T) {
 	e := newTestEngine(t)
@@ -845,7 +845,7 @@ func TestEngine_CaddyRestartTriggerWritesStartLine(t *testing.T) {
 
 // Given Scheduled 任务的 NextSlotFn 阻塞中（模拟三库排程槽 DB 查询耗时）。
 // When tick 求值 NextSlotFn 期间并发调用 IsRunning（需同一把 r.mu）。
-// Then IsRunning 不得被阻塞（F-历史问题-05：NextSlotFn 持 r.mu 调用会把 DB 延迟
+// Then IsRunning 不得被阻塞（历史问题-05：NextSlotFn 持 r.mu 调用会把 DB 延迟
 // 传导到同任务的 Cancel/IsRunning/StopLoop——须快照后锁外求值再回锁落缓存）。
 func TestEngine_TickEvaluatesNextSlotOutsideRegistrationLock(t *testing.T) {
 	e := newTestEngine(t)
@@ -880,7 +880,7 @@ func TestEngine_TickEvaluatesNextSlotOutsideRegistrationLock(t *testing.T) {
 	}
 }
 
-// TASK-L3（历史 历史问题）：RecoverOrphans 补上与同文件其余导出 DB 函数
+// 历史修复（历史）：RecoverOrphans 补上与同文件其余导出 DB 函数
 // （History/Stats24h/PurgeTaskRuns 等 7 处）同形的 db.DB nil 防护——曾裸用
 // db.DB.Exec，nil 时进程级 panic。
 func TestEngine_RecoverOrphansNilDBReturnsZero(t *testing.T) {
@@ -897,8 +897,8 @@ func TestEngine_RecoverOrphansNilDBReturnsZero(t *testing.T) {
 	}
 }
 
-// TASK-L4（历史 历史问题）：Periodic 的 IntervalFn 与 Scheduled 的 NextSlotFn
-// 同形锁外求值（F-历史问题-05 同族收敛补全——IntervalFn 未来改 DB 读取形态时，
+// 历史修复（历史）：Periodic 的 IntervalFn 与 Scheduled 的 NextSlotFn
+// 同形锁外求值（历史问题-05 同族收敛补全——IntervalFn 未来改 DB 读取形态时，
 // 持 r.mu 求值会把延迟传导到同任务的 Cancel/IsRunning/StopLoop）。
 //
 // Given Periodic 任务的 IntervalFn 阻塞中（模拟可配置间隔的 DB 读取耗时）。
@@ -937,7 +937,7 @@ func TestEngine_TickEvaluatesIntervalOutsideRegistrationLock(t *testing.T) {
 	}
 }
 
-// TASK-L9（历史 历史问题）：生命周期行时间戳与业务行（TeeTaskLog）统一为
+// 历史修复（历史）：生命周期行时间戳与业务行（TeeTaskLog）统一为
 // 斜杠形态——曾 [start]/[done] 用横杠、业务行用斜杠，同一 tasks/{id}.log
 // 两种时间戳并存。engineNowStr 是 DB datetime 比较口径（SQLite 只认横杠）
 // 不改，日志行单独走斜杠。

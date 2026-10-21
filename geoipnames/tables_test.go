@@ -2,10 +2,10 @@ package geoipnames
 
 import "testing"
 
-// 共享表内容钉（PLUG-N3，历史）：四张表从 internal/services 与
+// 共享表内容钉（历史修复，历史）：四张表从 internal/services 与
 // caddygeoip 的镜像双份收敛为单源——钉条目数（防意外截断/漏行）与关键
 // 映射（防键值漂移）。条目数基线取自收敛前镜像测试的核验值
-// （22/13/45/31，两侧逐条人工比对一致）；U80 E-CM-04 起 ProvinceAliases
+// （22/13/45/31，两侧逐条人工比对一致）；历史修复 起 ProvinceAliases
 // 剔除 11 条恒等别名（key==value 死条目，未命中即原样返回不影响输出），
 // 基线 22→11，并加零恒等钉防回潮。历史修复 补 Taichung County→台中县，
 // CityPinyinFixes 基线 45→46，服务层以仓库 xdb 全段扫描同步验收。
@@ -27,7 +27,7 @@ func TestGeoipNamesTables_pinnedCountsAndSpotMappings(t *testing.T) {
 		}
 	}
 
-	// And：零恒等映射钉（E-CM-04——恒等别名是死条目，canonical* 未命中
+	// And：零恒等映射钉（历史修复——恒等别名是死条目，canonical* 未命中
 	// 本就原样返回）
 	for name, table := range map[string]map[string]string{
 		"ProvinceAliases":       ProvinceAliases,
@@ -144,7 +144,7 @@ func TestGeoipNames_overseasCountriesTableAndNormalize(t *testing.T) {
 		{"Reserved", ""},                   // 非国家 → 兜底
 		{"United States", "United States"}, // 规范名原样通过
 		{"Japan", "Japan"},                 // 未列入表的规范名原样通过（纯白名单过滤）
-		// X4（历史）：「中国」走国内分支非海外国——显式归一空串（不入树、
+		// 历史修复（历史）：「中国」走国内分支非海外国——显式归一空串（不入树、
 		// 不发国名，发射侧回落海外哨兵判定由国内分支接管）；含空白形态一并
 		// 归一（TrimSpace 对称——树侧判定本就 Trim，发射侧此前裸比较）。
 		{"中国", ""},

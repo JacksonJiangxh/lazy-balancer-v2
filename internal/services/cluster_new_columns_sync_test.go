@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// CL-U1（历史）：逐上游回源域名（origin_domain）集群同步面钉测试——
+// 历史修复（历史）：逐上游回源域名（origin_domain）集群同步面钉测试——
 // snapshotAllUpstreams SELECT 与 insertSnapshotRules 的 upstreams INSERT 必须
 // 同构携带该列，缺一即从节点静默丢回源域名（同步面分叉）。钉住「快照导出 →
 // 清空 → 重放」全链路 origin_domain 逐值守恒（含空值零值守恒）。
@@ -82,7 +82,7 @@ func TestClusterSnapshot_originDomainRoundTrip(t *testing.T) {
 	}
 }
 
-// CL-U1（历史）：健康检查域名（health_check_host）集群同步面钉测试——
+// 历史修复（历史）：健康检查域名（health_check_host）集群同步面钉测试——
 // snapshotRules SELECT 与 insertSnapshotRules 的 lb_rules INSERT 必须同构携带
 // 该列，缺一即从节点静默丢健康检查域名。钉住「导出 → 清空 → 重放」逐值守恒。
 func TestClusterSnapshot_healthCheckHostRoundTrip(t *testing.T) {
@@ -138,7 +138,7 @@ func TestClusterSnapshot_healthCheckHostRoundTrip(t *testing.T) {
 	}
 }
 
-// CL-U1（历史）：path_rules 静态响应/301 跳转五列（response_mode/
+// 历史修复（历史）：path_rules 静态响应/301 跳转五列（response_mode/
 // response_status/response_body/response_content_type/redirect_to）集群同步面
 // 钉测试——snapshotAllPathRules SELECT 与 insertSnapshotPathRules INSERT 必须
 // 同构携带，缺一即从节点静默丢静态响应配置。钉住「导出 → 清空 → 重放」

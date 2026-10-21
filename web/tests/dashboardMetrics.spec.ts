@@ -26,7 +26,7 @@ test('历史问题-6：成功响应缺失某规则才标失败，已有指标保
   })
 })
 
-test('A86 历史问题：TCP 行指标 title 明示上游地址口径，HTTP 行/禁用/采集失败不受影响', () => {
+test('TCP 行指标 title 明示上游地址口径，HTTP 行/禁用/采集失败不受影响', () => {
   // TCP 行：口径明示 + 值括注
   const tcpTitle = ruleMetricCellTitle({ disabled: false, unavailable: false, tcp: true, value: '1,234' })
   assert.ok(tcpTitle.includes(TCP_UPSTREAM_GRANULARITY_NOTE))

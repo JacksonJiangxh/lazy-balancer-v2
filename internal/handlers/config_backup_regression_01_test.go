@@ -1,11 +1,11 @@
 package handlers
 
-//   - RC-2/F75C-3：受信代理导入门按「备份是否携带 security_ip_lists 表」分流
-//     ——携带时 refs 存在性仅按备份行集合解析（W2 全量替换先例：备份行才是
+//   - 历史修复：受信代理导入门按「备份是否携带 security_ip_lists 表」分流
+//     ——携带时 refs 存在性仅按备份行集合解析（历史修复 全量替换先例：备份行才是
 //     导入后的真实数据），指向库内但不在备份内的 id 导入后必然悬空 → 400；
 //     未携带时照旧走库（迟到表 era 备份/「缺席=保留本地」语义不变）。
-//   - F75C-2：/security/autoban/status 响应补 is_master/role（从端卡片角色门
-//     数据源）；AB-4：list_entries 与渲染生效面同口径（剔除已到期未清理）。
+//   - 历史修复：/security/autoban/status 响应补 is_master/role（从端卡片角色门
+//     数据源）；历史修复：list_entries 与渲染生效面同口径（剔除已到期未清理）。
 
 import (
 	"encoding/json"
@@ -37,7 +37,7 @@ func r75bBackupJSONWithoutIPListsTable(t *testing.T, cfg map[string]any) string 
 	return string(data)
 }
 
-// TestImportConfigBackup_trustedProxyRefsResolvedAgainstBackupRowsOnly（RC-2）：
+// TestImportConfigBackup_trustedProxyRefsResolvedAgainstBackupRowsOnly（历史修复）：
 // 备份携带名单表时，refs 存在性仅按备份行集合解析——指向库内存量（导入后被
 // 全量替换掉）的 id 必须 400 拒绝，不得借「备份∪库」通道放行为导入后悬空引用。
 func TestImportConfigBackup_trustedProxyRefsResolvedAgainstBackupRowsOnly(t *testing.T) {
@@ -99,7 +99,7 @@ func TestImportConfigBackup_trustedProxyRefsResolvedAgainstBackupRowsOnly(t *tes
 	})
 }
 
-// TestGetAutobanStatus_roleFieldsAndActiveCaliber（F75C-2+AB-4）：status 响应
+// TestGetAutobanStatus_roleFieldsAndActiveCaliber（历史修复）：status 响应
 // 补 is_master/role（引擎未装配时保守判从——不提供会在从端 403 的写入口）；
 // list_entries 剔除已到期未清理条目（与渲染生效面同口径）。
 func TestGetAutobanStatus_roleFieldsAndActiveCaliber(t *testing.T) {
@@ -126,11 +126,11 @@ func TestGetAutobanStatus_roleFieldsAndActiveCaliber(t *testing.T) {
 		t.Fatalf("decode: %v body=%s", err, w.Body.String())
 	}
 	data := payload.Data
-	// F75C-2：角色位在场且自洽（绝对值由 services 层缝钉测锁定——handlers
+	// 历史修复：角色位在场且自洽（绝对值由 services 层缝钉测锁定——handlers
 	// 全量跑位时其它用例会装配全局引擎，环境角色不可在此断言）。
 	rawMaster, ok := data["is_master"]
 	if !ok {
-		t.Fatal("is_master 字段缺失（F75C-2 从端角色门数据源）")
+		t.Fatal("is_master 字段缺失（历史修复 从端角色门数据源）")
 	}
 	isMaster, ok := rawMaster.(bool)
 	if !ok {
@@ -143,7 +143,7 @@ func TestGetAutobanStatus_roleFieldsAndActiveCaliber(t *testing.T) {
 	if role, _ := data["role"].(string); role != wantRole {
 		t.Fatalf("role=%v 与 is_master=%v 不自洽, want %q", data["role"], isMaster, wantRole)
 	}
-	// AB-4：list_entries=2（生效条目；已到期未清理的 203.0.113.2 不计入）。
+	// 历史修复：list_entries=2（生效条目；已到期未清理的 203.0.113.2 不计入）。
 	if n, _ := data["list_entries"].(float64); n != 2 {
 		t.Fatalf("list_entries=%v, want 2（已到期未清理条目不计入——与渲染生效面同口径）", data["list_entries"])
 	}

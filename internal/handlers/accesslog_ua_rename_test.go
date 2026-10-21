@@ -1,7 +1,7 @@
 package handlers
 
-// LBH-B-L1（历史 历史问题）：UA 改名保护门只认精确路径——祖先改名
-//（request>headers->hdrs 整树带走 User-Agent，filterencoder.go:466-471 引擎实证）
+// 历史修复（历史问题）：UA 改名保护门只认精确路径——祖先改名
+//（request>headers->hdrs 整树带走 历史修复，filterencoder.go:466-471 引擎实证）
 // 绕过校验，UA 统计静默失效。钉三形状：祖先改名/根改名/精确改名全拒。
 // 回归：合法改名（remote_ip→src）与无关改名放行。
 

@@ -13,10 +13,10 @@ import (
 	jwt "github.com/golang-jwt/jwt/v5"
 )
 
-// S-1（2026-09-05 裁定）：管理员经 PUT /users/:id 与 POST /users/:id/reset-password
+// 历史修复（2026-09-05 裁定）：管理员经 PUT /users/:id 与 POST /users/:id/reset-password
 // 重置任意用户（含本人）密码属重置操作、不验当前密码；唯一要求是 MFA 写保护
 // （mfa_write_guard）开启且操作者已启用 MFA 时须 MFA 验证码。两端点均为写方法、
-// 不在 readOnlyWriteRoutes/守卫豁免清单内，由 admin 组级 mfaStepUpGuard 覆盖（U7c-68-01
+// 不在 readOnlyWriteRoutes/守卫豁免清单内，由 admin 组级 mfaStepUpGuard 覆盖（历史修复
 // 自 v1 级下沉）——本测试以真实 JWT 穿完整认证链钉住该契约：无 mfa_ts → 428；验码后的新 JWT → 200。
 func TestMFAStepUpGuard_protectsAdminUserPasswordEndpoints(t *testing.T) {
 	router := newMiddlewareTestRouter(t)
@@ -76,10 +76,10 @@ func TestMFAStepUpGuard_protectsAdminUserPasswordEndpoints(t *testing.T) {
 	}
 }
 
-// U7c-68-01（历史）：admin 组端点的拒绝次序——非管理员（含 MFA 启用
+// 历史修复（历史）：admin 组端点的拒绝次序——非管理员（含 MFA 启用
 // 且 mfa_ts 过期者）打 admin 组端点必须先见 adminOnly 的 403 真因，而非
 // mfaStepUpGuard 的 428（此前守卫挂在 v1 级、先于组级 adminOnly 执行，用户
-// 输码重试后才见「需要管理员权限」——与 U7c-3 从节点 403 先于 428 同型）。
+// 输码重试后才见「需要管理员权限」——与 历史修复 从节点 403 先于 428 同型）。
 // 修复=链序：mfaStepUpGuard 从 v1 级下沉至 admin/business 两组级，admin 组内
 // adminOnly 先于 step-up。
 func TestMFAStepUpGuard_adminOnly403BeforeStepUp428(t *testing.T) {
@@ -118,7 +118,7 @@ func TestMFAStepUpGuard_adminOnly403BeforeStepUp428(t *testing.T) {
 	}
 }
 
-// SYSMW-U2（历史 历史问题）：business 组守卫次序对称 U7c-68-01——非管理员打
+// 历史修复（历史问题）：business 组守卫次序对称 历史修复——非管理员打
 // business 组管理写端点须先见 readOnlyGuard 的 403 角色真因，而非
 // mfaStepUpGuard 的 428（旧次序 step-up 在前：用户验码重试后才见
 // 「非管理员用户只读」，与 admin 组已修的误导链同型）。

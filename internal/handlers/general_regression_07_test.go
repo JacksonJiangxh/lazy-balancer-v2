@@ -13,8 +13,8 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 历史修复 发现1：EnableRule 不得把 acme_config_id 悬挂（配置行已删除）的存量
-// acme_dns 规则投入运行——历史修复 F-3 存在性门此前只组合进 Create/Update，
+// 历史修复：EnableRule 不得把 acme_config_id 悬挂（配置行已删除）的存量
+// acme_dns 规则投入运行——历史修复 存在性门此前只组合进 Create/Update，
 // EnableRule 的唯一预校验 validateStoredRuleConfig 只有 0 值门，悬挂 id
 // 放行后 TLS 端口明文服务且签发期单任务失败，无自愈。
 func TestEnableRule_rejects_dangling_acme_config_id(t *testing.T) {
@@ -45,7 +45,7 @@ func TestEnableRule_rejects_dangling_acme_config_id(t *testing.T) {
 	}
 }
 
-// 历史修复 发现1+发现4：EnableRule 不得把引用已禁用（enabled=0）DNS 提供商配置的
+// 历史修复+发现4：EnableRule 不得把引用已禁用（enabled=0）DNS 提供商配置的
 // 规则投入运行——签发侧 certissuer.go 按 AND enabled=1 查空即单任务失败。
 func TestEnableRule_rejects_disabled_certificate_config(t *testing.T) {
 	// Given
@@ -83,8 +83,8 @@ func TestEnableRule_rejects_disabled_certificate_config(t *testing.T) {
 	}
 }
 
-// 历史修复 发现1：EnableRule 不得把 ca_provider_id 悬挂（提供商已删除）的存量
-// acme_dns 规则投入运行——与 历史修复 F-1 写侧 400 口径对齐。
+// 历史修复：EnableRule 不得把 ca_provider_id 悬挂（提供商已删除）的存量
+// acme_dns 规则投入运行——与 历史修复 写侧 400 口径对齐。
 func TestEnableRule_rejects_dangling_ca_provider_id(t *testing.T) {
 	// Given
 	handler, _, _ := newAuditRuleHandlers(t, 0)
@@ -114,7 +114,7 @@ func TestEnableRule_rejects_dangling_ca_provider_id(t *testing.T) {
 	}
 }
 
-// 历史修复 发现4：CreateRule 引用已禁用（enabled=0）的 certificate_configs 行必须
+// 历史修复：CreateRule 引用已禁用（enabled=0）的 certificate_configs 行必须
 // 400——同函数 ca_provider 检查与签发侧均按 AND enabled=1 口径，存在性检查
 // 不得只查 id。
 func TestCreateRule_rejects_disabled_certificate_config(t *testing.T) {
@@ -151,7 +151,7 @@ func TestCreateRule_rejects_disabled_certificate_config(t *testing.T) {
 	}
 }
 
-// 历史修复 发现5+发现6：DuplicateRule 复制源规则的 acme_config_id/ca_provider_id
+// 历史修复+发现6：DuplicateRule 复制源规则的 acme_config_id/ca_provider_id
 // 原值且不跑存在性校验——源规则携带悬挂 id 时必须 400 并点名源规则，副本不得落库。
 func TestDuplicateRule_rejects_dangling_acme_config_id(t *testing.T) {
 	// Given
@@ -181,7 +181,7 @@ func TestDuplicateRule_rejects_dangling_acme_config_id(t *testing.T) {
 	}
 }
 
-// 历史修复 发现6：validateEnabledStoredRuleConfigs（启动 + UpdateConfig 聚合校验）
+// 历史修复：validateEnabledStoredRuleConfigs（启动 + UpdateConfig 聚合校验）
 // 必须点名 acme_config_id 悬挂的启用规则——存量/导入坏规则不得静默通过。
 func TestValidateEnabledStoredRuleConfigs_flags_dangling_acme_config(t *testing.T) {
 	// Given
@@ -206,7 +206,7 @@ func TestValidateEnabledStoredRuleConfigs_flags_dangling_acme_config(t *testing.
 	}
 }
 
-// 历史修复 发现6 对照组：引用存在且启用的配置时聚合校验不得误伤合法启用规则。
+// 历史修复 对照组：引用存在且启用的配置时聚合校验不得误伤合法启用规则。
 func TestValidateEnabledStoredRuleConfigs_accepts_valid_acme_config(t *testing.T) {
 	// Given
 	newBackupTestHandlers(t)
@@ -225,7 +225,7 @@ func TestValidateEnabledStoredRuleConfigs_accepts_valid_acme_config(t *testing.T
 	}
 }
 
-// 历史修复 发现2 公共夹具：备份内一条启用的 acme_dns 规则行。
+// 历史修复 公共夹具：备份内一条启用的 acme_dns 规则行。
 func r53BackupACMERule(acmeConfigID int) map[string]any {
 	return map[string]any{
 		"caddy_id": "lb_bak_acme", "name": "bak-acme", "protocol": "http",
@@ -235,11 +235,11 @@ func r53BackupACMERule(acmeConfigID int) map[string]any {
 	}
 }
 
-// 历史修复 发现2：v2 备份携带 enabled + acme_dns + acme_config_id=0（或悬挂）的
-// 规则行时校验必须整包拒绝——导入为全量替换，坏行会绕过 历史修复 F-2 门直接
+// 历史修复：v2 备份携带 enabled + acme_dns + acme_config_id=0（或悬挂）的
+// 规则行时校验必须整包拒绝——导入为全量替换，坏行会绕过 历史修复 门直接
 // 投入运行（TLS 端口明文服务，无自愈）。引用优先在备份自带表解析
 // （deleteOrder 会清光 live 表），与 validateBackupRuleReferences 同哲学。
-// 历史修复 C-1：TLS 形态校验迁至 validateV2BackupTLSShape（冲突置禁用之后执行）。
+// 历史修复：TLS 形态校验迁至 validateV2BackupTLSShape（冲突置禁用之后执行）。
 func TestValidateV2BackupTLSShape_rejects_bad_acme_rows(t *testing.T) {
 	tests := []struct {
 		name        string

@@ -2,8 +2,8 @@ package handlers
 
 //         cluster_sync.go/cluster_status.go 节点写端点）
 //         cluster_status.go 加导出薄包装 ClearNodeSectionReports）
-//   D-1   无令牌哈希节点恢复成 pending（不保留 approved 死行）
-//   D-3   导入侧 upstream weight<1 响亮拒绝（不静默归一）
+//   历史修复   无令牌哈希节点恢复成 pending（不保留 approved 死行）
+//   历史修复   导入侧 upstream weight<1 响亮拒绝（不静默归一）
 
 import (
 	"context"
@@ -129,7 +129,7 @@ func TestNodesImportRowGate_absentNodesKeepsLocal(t *testing.T) {
 	}
 }
 
-// ── D-1：无哈希节点恢复成 pending ──
+// ── 历史修复：无哈希节点恢复成 pending ──
 
 func TestNodeWithoutTokenHashRestoredAsPending(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -168,7 +168,7 @@ func TestNodeWithoutTokenHashRestoredAsPending(t *testing.T) {
 
 func TestAutoBackupSectionsVersionProtected(t *testing.T) {
 	h := newBackupTestHandlers(t)
-	// 三个节点本地迁移标记同族（R-12 收敛）：备份携带非法形态导入跳过、
+	// 三个节点本地迁移标记同族（历史修复 收敛）：备份携带非法形态导入跳过、
 	// 本地标记不被覆盖、整型重扫不炸（启动迁移 Scan int 同形态）。
 	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_sections_version=1, threat_traffic_sample_unified_migrated=1, security_events_retention_migrated=1 WHERE id=1`); err != nil {
 		t.Fatal(err)
@@ -233,7 +233,7 @@ func TestImportCountsIncludeNodes(t *testing.T) {
 	}
 }
 
-// 结构性守卫（A86H_A 建议）：configBackupTables 每张表必须在汇总标签清单
+// 结构性守卫（历史修复 建议）：configBackupTables 每张表必须在汇总标签清单
 // 或显式豁免清单中，防新增表再次漏计数。
 func TestImportCountsDetailCoversAllBackupTables(t *testing.T) {
 	exempt := map[string]bool{
@@ -324,7 +324,7 @@ func TestImportAccessLogFormatGate(t *testing.T) {
 	})
 }
 
-// ── D-3：导入侧 weight<1 拒绝 ──
+// ── 历史修复：导入侧 weight<1 拒绝 ──
 
 func TestImportRejectsUpstreamWeightBelowOne(t *testing.T) {
 	rule := map[string]any{"caddy_id": "lb_w", "name": "w", "protocol": "http", "domain": "w.example.test", "listen_port": 18080, "enabled": 1}
@@ -549,7 +549,7 @@ func TestV1ImportQueueFailureStillConverges(t *testing.T) {
 	t.Cleanup(services.ResetCAQueueManagerForTest)
 	// 注入队列恢复失败（与 v2 钉测同一测试缝）。
 	oldRequeue := requeueNonTerminalCertJobs
-	requeueNonTerminalCertJobs = func() error { return errA86Requeue }
+	requeueNonTerminalCertJobs = func() error { return errRequeueInjected }
 	t.Cleanup(func() { requeueNonTerminalCertJobs = oldRequeue })
 	// 陈旧应用失败横幅：导入成功后必须清除（v2 同口径）。
 	if _, err := db.DB.Exec(`UPDATE global_config SET caddy_apply_error='stale-import-failure' WHERE id=1`); err != nil {
@@ -591,4 +591,4 @@ func TestV1ImportQueueFailureStillConverges(t *testing.T) {
 	}
 }
 
-var errA86Requeue = errors.New("a86 requeue failed")
+var errRequeueInjected = errors.New("requeue injected failure")

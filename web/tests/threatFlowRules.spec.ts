@@ -85,7 +85,7 @@ test('自适应切换：档位与目标一致时清空确认计数但保留上�
   assert.deepEqual(third, { active: 4, stable: 0, pendingTarget: 0, lastSwitch: 34_000, changed: true })
 })
 
-test('自适应切换：方向反转不累计（突发+骤停不得直接跳档，WT87-06）', () => {
+test('自适应切换：方向反转不累计（突发+骤停不得直接跳档，历史修复）', () => {
   // 高流量一次 → 目标 8；随后骤停一次 → 目标 1。旧实现只按次数累加，
   // 在 4s 门已过时会把这两次相反采样当作「连续 2 次同向」直接切到 1/1。
   let outcome = stepAdaptiveSample({ active: 4, stable: 0, lastSwitch: 0 }, 900, 10_000)

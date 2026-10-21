@@ -35,7 +35,7 @@ func TestRunningRuleRouteIDs_configAbove4MBStillDecoded(t *testing.T) {
 	}
 }
 
-// S历史问题（历史）：看门狗读取与 readAdminConfigBody 同源——>32MB 必须
+// 历史问题（历史）：看门狗读取与 readAdminConfigBody 同源——>32MB 必须
 // 返回超限哨兵（而非裸 LimitReader 的解码失败），调用方据此把「超限」与瞬时
 // 读失败分开留痕。
 func TestRunningRuleRouteIDs_oversizeClassified(t *testing.T) {
@@ -67,7 +67,7 @@ func TestRunningRuleRouteIDs_nonOKStatusFails(t *testing.T) {
 	}
 }
 
-// 解析容忍度回归（S历史问题 修复的伴随约束）：读取统一到 readAdminConfigBody 后，
+// 解析容忍度回归（历史问题 修复的伴随约束）：读取统一到 readAdminConfigBody 后，
 // 解析必须保持旧实现的容忍面——Decoder 只消费第一个顶层值，尾部多余字节不得把
 // 「运行配置可读」降级为「读取失败」（否则启动守卫/看门狗探针按无正向证据放行，
 // 外来路由告警与 历史问题 守卫静默失效）。

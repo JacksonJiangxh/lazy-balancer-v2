@@ -247,7 +247,7 @@ func TestCreateRule_commitFailureRestoresLKGToCommittedView(t *testing.T) {
 	}
 }
 
-// 源码钉测（R-12 同族收敛）：规则×5 / UpdateConfig / PutCaddyConfig 的 commit
+// 源码钉测（历史修复 同族收敛）：规则×5 / UpdateConfig / PutCaddyConfig 的 commit
 // 失败分支必须统一走 recoverCommittedViewAfterCommitFailure(tx)，禁止再回退
 // 到 restoreImportRuntime / ApplyConfig(oldRuntimeConfig)（恢复 /load 失败时
 // LKG 滞留未提交字节）。

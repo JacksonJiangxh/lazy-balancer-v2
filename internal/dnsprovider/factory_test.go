@@ -65,7 +65,7 @@ func TestNewProviderFromCredentials_explicit_mode_still_wins(t *testing.T) {
 	}
 }
 
-// A-1（历史）：空 mode 无法推断时的错误文案必须可诊断分流——两类凭证
+// 历史修复（历史）：空 mode 无法推断时的错误文案必须可诊断分流——两类凭证
 // 并存=歧义（需显式 mode 消歧），全缺/不完整=缺失（需补齐凭证）。原实现两者
 // 同落 default 的「unsupported dns provider mode: 」（mode 为空），排障无法区分。
 func TestNewProviderFromCredentials_emptyModeErrorDistinguishesAmbiguityFromMissing(t *testing.T) {

@@ -10,7 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// 历史修复 C1: v2.1.1（已发版）导出为「tables-only 校验和 + exported_at 非空」形态，
+// 历史修复: v2.1.1（已发版）导出为「tables-only 校验和 + exported_at 非空」形态，
 // 历史修复 门控将其误判「篡改」整包拒绝。修复后报兼容性提示（仍拒绝导入——Config 区
 // 不受旧校验和保护）；而真正篡改的新格式文件（两种校验和均不匹配）仍按篡改拒绝。
 func TestValidateV2Backup_v211Shape_reportsCompatibilityNotTamper(t *testing.T) {

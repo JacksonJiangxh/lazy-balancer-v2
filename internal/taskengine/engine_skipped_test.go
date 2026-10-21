@@ -1,6 +1,6 @@
 package taskengine
 
-// TASK-L5（历史 历史问题）：ErrTaskSkipped 哨兵 → task_runs skipped 终态。
+// 历史修复（历史问题）：ErrTaskSkipped 哨兵 → task_runs skipped 终态。
 
 import (
 	"context"
@@ -24,7 +24,7 @@ func TestTerminalStatus_mapsSkippedSentinel(t *testing.T) {
 	}
 }
 
-// A85历史问题-3：demote 同时取消 ctx 并返回 ErrTaskSkipped；非故障放弃必须
+// 历史问题：demote 同时取消 ctx 并返回 ErrTaskSkipped；非故障放弃必须
 // 优先于通用 cancelled，才能与用户主动取消区分。
 func TestTerminalStatus_demoteSkipPrecedesCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -41,7 +41,7 @@ func TestTerminalStatus_demoteSkipPrecedesCancellation(t *testing.T) {
 	}
 }
 
-// TASK-5（历史 历史问题）：skipped 终态同样落 message——跳过原因此前只进
+// 历史修复（历史问题）：skipped 终态同样落 message——跳过原因此前只进
 // 任务日志 [done] 行，task_runs.message 恒空，任务历史页丢失「为何跳过」。
 func TestRunNow_skippedRunCarriesSkipReason(t *testing.T) {
 	e := newTestEngine(t)

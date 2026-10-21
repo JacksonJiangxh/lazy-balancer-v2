@@ -73,7 +73,7 @@ func (m *httpRedirectMux) dispatch() {
 	for {
 		connection, err := m.Listener.Accept()
 		if err != nil {
-			// INFRA-2（历史登记）：net.Error.Temporary() 自 Go 1.18 起弃用，
+			// 历史修复（历史登记）：net.Error.Temporary() 自 Go 1.18 起弃用，
 			// 但本判据行为已由 http_redirect_mux_test.go 钉死（Temporary()=true 且
 			// Timeout()=false 类 accept 瞬时失败的退避实证）——保留弃用 API 换取
 			// 行为稳定，不经判据改写发散；未来 accept 语义有明确替代再迁移。
@@ -174,8 +174,8 @@ func redirectHTTP(reader *bufio.Reader, connection net.Conn) {
 		}
 		if strings.HasPrefix(strings.ToLower(line), "host:") {
 			host = strings.TrimSpace(line[len("host:"):])
-			// Host 行内裸 CR 等控制字符不得反射进 Location（历史 历史问题：
-			// TrimSpace 只去首尾，中置 CR 曾原样进响应头）；INFRA-71-2（第
+			// Host 行内裸 CR 等控制字符不得反射进 Location（历史问题：
+			// TrimSpace 只去首尾，中置 CR 曾原样进响应头）；历史修复（第
 			// 71 轮）：中置空格（0x20）同族——TrimSpace 同样剔不掉，畸形 Host
 			// 不得反射。含控制字符/空格（<=0x20 或 0x7f）即视为无效 Host，
 			// 回退本地地址。

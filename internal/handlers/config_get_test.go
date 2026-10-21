@@ -64,7 +64,7 @@ func TestGetConfig_omits_legacy_global_dns_credentials(t *testing.T) {
 	}
 }
 
-// G4（历史）：设置页读路径 SQL 默认值字面量是治理默认值的第三次复制
+// 历史修复（历史）：设置页读路径 SQL 默认值字面量是治理默认值的第三次复制
 // （DDL DEFAULT+启动回填+此处）——改参数绑定 db.Default* 常量后，本扫描钉
 // 防字面量回流：GetConfig 函数体内治理列名旁不得再出现写死默认值字面量。
 func TestGetConfig_noGovernedDefaultLiterals(t *testing.T) {
@@ -96,7 +96,7 @@ func TestGetConfig_noGovernedDefaultLiterals(t *testing.T) {
 	}
 }
 
-// G4 行为钉：cert_expiry_days（fresh DDL 可空列）NULL 形态读路径回退
+// 历史修复 行为钉：cert_expiry_days（fresh DDL 可空列）NULL 形态读路径回退
 // db.DefaultCertExpiryDays 常量，不 500 不零值。批 1+2 值型列（request_body/
 // http_*/caddy_log_size_mb）fresh DDL NOT NULL+启动回填报证 NULL 不可达，
 // 其 COALESCE(? 常量) 仅为防御形态——由 TestGetConfig_noGovernedDefaultLiterals
@@ -127,7 +127,7 @@ func TestGetConfig_nullCertExpiryDaysFallsBackToConstant(t *testing.T) {
 	}
 }
 
-// R2（历史）：cert_expiry_days 消费点族「默认值 30 字面量」回流钉——G4
+// 历史修复（历史）：cert_expiry_days 消费点族「默认值 30 字面量」回流钉——历史修复
 // 同型扫描从 GetConfig 单函数扩展到六消费点族：SQL COALESCE 字面量一律参数
 // 绑定 db.DefaultCertExpiryDays（caddy.go 形态），Go 降级分支一律取治理常量
 // （services/certinfo.go GetCertExpiryThreshold 基准）。库值唯一真相（批 3）
@@ -170,7 +170,7 @@ func TestCertExpiryDays_noDefaultLiteralsAcrossConsumers(t *testing.T) {
 	}
 }
 
-// D2-历史问题 handler 侧：GET /config 的展示钳位必须与运行时/状态阈值同界，
+// 历史问题 handler 侧：GET /config 的展示钳位必须与运行时/状态阈值同界，
 // 低值 <10→60、高值 >86400→86400。
 func TestGetConfig_syncIntervalClampMatchesRuntime(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -209,7 +209,7 @@ func TestGetConfig_syncIntervalClampMatchesRuntime(t *testing.T) {
 	}
 }
 
-// B1-历史问题：自定义 Caddy 配置可包含私钥或敏感 header，非管理员及只读
+// 历史问题：自定义 Caddy 配置可包含私钥或敏感 header，非管理员及只读
 // API Key 不得通过 GET /config 读取原文；管理员 JWT/读写 Key 保持回归。
 func TestGetConfig_caddyConfigVisibilityByIdentity(t *testing.T) {
 	const secret = `private-key-and-sensitive-header`

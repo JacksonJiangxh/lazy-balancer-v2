@@ -68,7 +68,7 @@
                 <el-tag v-if="laggingSectionCount(row) > 0" type="warning" size="small" effect="plain">分区滞后 {{ laggingSectionCount(row) }}</el-tag>
                 <el-tag v-else-if="row.reported_version < row.current_version" type="warning" size="small" effect="plain">待同步</el-tag>
                 <el-tag v-else-if="row.reported_version === row.current_version" type="success" size="small" effect="plain">已同步</el-tag>
-                <!-- F8:reported>current 罕见形态(主版本回退)——不误显已同步 -->
+                <!-- 历史修复:reported>current 罕见形态(主版本回退)——不误显已同步 -->
                 <el-tag v-else type="info" size="small" effect="plain">版本异常</el-tag>
               </div>
             </template>
@@ -91,7 +91,7 @@
             <span class="version-nums">{{ row.reported_version }}<template v-if="row.reported_version < row.current_version"> → {{ row.current_version }}</template></span>
             <el-tag v-if="row.reported_version < row.current_version" type="warning" size="small" effect="plain">待同步</el-tag>
             <el-tag v-else-if="row.reported_version === row.current_version" type="success" size="small" effect="plain">已同步</el-tag>
-            <!-- F8:reported>current 罕见形态(主版本回退)——不误显已同步 -->
+            <!-- 历史修复:reported>current 罕见形态(主版本回退)——不误显已同步 -->
             <el-tag v-else type="info" size="small" effect="plain">版本异常</el-tag>
             <span v-if="row.is_approved" class="section-sync-stale">暂无分区上报</span>
           </div>
@@ -171,9 +171,9 @@ const showLastSeenColumn = computed(() => viewportWidth.value >= 1580)
 const syncSwitchItems = [
   // (三分类合并:全局配置并入系统数据节)确保系统基本运行的数据不可禁用同步。
   // 2026-09-19 文案整理:「证书文件随负载规则开关同步」属 rules 开关管辖
-  // (历史问题 A-N5),不在本行尾注。
+  // (历史问题),不在本行尾注。
   { key: 'sync_users', label: '系统数据', tip: '用户账号、API 密钥、ACME 配置与全局设置（恒同步，不可禁用）' },
-  // 证书任务行与证书文件随本开关(历史问题 A-N5):关闭时从节点保留本地规则,
+  // 证书任务行与证书文件随本开关(历史问题):关闭时从节点保留本地规则,
   // 其证书行/文件不按主节点快照删改。
   { key: 'sync_rules', label: '负载均衡规则', tip: '规则、上游、路径规则与证书任务（证书文件随本开关同步）' },
   // 三分类合并:规则库文件差量通道并入安全防护开关(单开关统策略行与文件)。
@@ -243,7 +243,7 @@ const versionIncompatibilityError = (node: ClusterNodeWithSyncError): string => 
 </script>
 
 <style scoped>
-/* SYSRENDE历史问题(历史,历史问题)+ 2026-09-17 用户实证修正:原豁免覆盖
+/* 历史问题(历史,历史问题)+ 2026-09-17 用户实证修正:原豁免覆盖
    全表所有含标签列(配置版本/健康同被压成块级,单行标签失去垂直居中)。
    精确化为「仅状态列且离线时长存在时」才块级叠行——在线(单标签)与
    配置版本/健康列回全局 inline-flex 居中规则。 */
@@ -259,7 +259,7 @@ const versionIncompatibilityError = (node: ClusterNodeWithSyncError): string => 
 .mono-value { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
 .version-cell { display: flex; align-items: center; gap: 6px; flex-wrap: nowrap; min-width: 0; }
 .version-cell-wrap { flex-wrap: wrap; }
-/* F3(第 20.5 轮):stale 分支三元素可超 170px——该分支恢复 wrap,主分支
+/* 历史修复(历史审计):stale 分支三元素可超 170px——该分支恢复 wrap,主分支
    (两元素版本号+标签)保持 nowrap 消除换行。 */
 .version-nums { font-variant-numeric: tabular-nums; white-space: nowrap; }
 .offline-duration { font-size: 12px; color: #9ca3af; margin-top: 2px; }

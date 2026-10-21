@@ -162,7 +162,7 @@ func newBackupTestHandlers(t *testing.T) *Handlers {
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
-		// B1-07（历史）：直换包级句柄必须同步复位 currentDB（SetDB
+		// 历史修复（历史）：直换包级句柄必须同步复位 currentDB（SetDB
 		// 契约见其注释）——否则后台循环/GetDB 继续持有已关闭的测试库句柄。
 		db.SetDB(oldDB)
 	})
@@ -203,7 +203,7 @@ func TestImportConfigBackup_rejects_backup_without_enabled_admin_and_preserves_c
 		{name: "empty users", users: []map[string]any{}},
 		{name: "users only", users: []map[string]any{{"id": 2, "username": "reader", "password_hash": "hash", "role": "user", "is_enabled": 1}}},
 		{name: "all admins disabled", users: []map[string]any{{"id": 2, "username": "disabled-admin", "password_hash": "hash", "role": "admin", "is_enabled": false}}},
-		// 历史问题 历史问题: is_enabled 为 null 的管理员在归一（NULL→1，对齐 migrateUsersIsEnabledNotNull）
+		// 历史问题: is_enabled 为 null 的管理员在归一（NULL→1，对齐 migrateUsersIsEnabledNotNull）
 		// 后视为启用，不再属于「无启用管理员」拒绝场景——见
 		// TestImportConfigBackup_normalizes_null_boolean_rows。
 	}
@@ -265,7 +265,7 @@ func TestImportConfigBackup_accepts_enabled_admin_and_increments_password_versio
 }
 
 func TestImportConfigBackup_normalizes_null_boolean_rows(t *testing.T) {
-	// 历史问题 历史问题: pre-历史修复/历史问题 库导出的全 null 管理员备份此前被
+	// 历史问题: 历史问题 库导出的全 null 管理员备份此前被
 	// backupBooleanEnabled(nil)=false 先行 400 拦截，归一不可达；归一须在
 	// checksum 之后、管理员校验之前执行：用户 is_enabled null→1、规则/上游
 	// enabled null→0，导入成功且落库值正确。
@@ -305,13 +305,13 @@ func TestImportConfigBackup_normalizes_null_boolean_rows(t *testing.T) {
 	}
 }
 
-// C5 KNOWN-GAP-1：v2 备份导入通道对三张安全表的可空列零归一——带校验和的备份
+// 历史修复：v2 备份导入通道对三张安全表的可空列零归一——带校验和的备份
 // 携带 content/action/score/description/custom_rules 等 NULL 时，restoreTable 原样
 // 落库（下游 raw 消费方：caddy.go 拦截页 content 扫描、自定义规则生成扫描），而
 // 集群快照 dump 侧（cluster_snapshot.go:420/428/449）已全量 COALESCE 硬化——两条
 // 「全量替换」通道容忍度背离。导入必须成功（无 400/500），且落库值为 dump 侧对齐
 // 默认值而非 NULL；NULL 布尔列（enabled/is_default）落 schema/dump 默认而非布尔强转。
-// N+13 H2-F3 起 content NULL/空行被 skipEmptyBlockPages 软跳过（不再落库），
+// 历史修复 起 content NULL/空行被 skipEmptyBlockPages 软跳过（不再落库），
 // content 归一断言相应改为非空内容原样落库。
 func TestImportConfigBackup_normalizes_null_security_rows(t *testing.T) {
 	// Given：三张安全表各携带一行 NULL 毒化可空列（content 给非空值以越过
@@ -365,7 +365,7 @@ func TestImportConfigBackup_normalizes_null_security_rows(t *testing.T) {
 	}
 }
 
-// N+13 H2-F3：空内容拦截页行软跳过——手造备份 content:""/纯空白 落库后，
+// 历史修复：空内容拦截页行软跳过——手造备份 content:""/纯空白 落库后，
 // 引用该页的 WAF/GeoIP/限流拦截渲染空响应体，静默退化为 Caddy 原生 403。
 // 校验期按 skipEmptyDomainHTTPRules 同款口径跳过该行并告警，其余行正常导入。
 func TestImportConfigBackup_skips_empty_content_block_pages(t *testing.T) {
@@ -449,7 +449,7 @@ func TestSkipEmptyBlockPages_clearsDanglingReferences(t *testing.T) {
 	}
 }
 
-// N+13 H2-F3：预览端与导入端同序软跳过——空内容拦截页在预览即告警，
+// 历史修复：预览端与导入端同序软跳过——空内容拦截页在预览即告警，
 // summary 计数反映跳后行集，不得预览静默、导入才跳。
 func TestValidateConfigImport_reports_empty_content_block_page_skips(t *testing.T) {
 	// Given
@@ -490,7 +490,7 @@ func TestValidateConfigImport_reports_empty_content_block_page_skips(t *testing.
 }
 
 func TestValidateConfigImport_rejects_dangling_rule_references(t *testing.T) {
-	// 历史问题 历史问题: 预览接口须与实际导入同序校验 upstreams/path_rules 引用存在性，
+	// 历史问题: 预览接口须与实际导入同序校验 upstreams/path_rules 引用存在性，
 	// 否则悬挂引用备份在预览显示可导入、实际导入才 400。
 	// Given
 	h := newBackupTestHandlers(t)
@@ -556,7 +556,7 @@ func TestImportConfigBackup_rejects_invalid_certificate_job_status(t *testing.T)
 			if response.Code != http.StatusBadRequest {
 				t.Fatalf("status=%d body=%s, want 400", response.Code, response.Body.String())
 			}
-			// 历史问题-历史问题（历史）：仅断言 400 会被前置门（管理员门等）
+			// 历史问题（历史）：仅断言 400 会被前置门（管理员门等）
 			// 的 400 假通过——必须点名证书任务状态门。
 			if !strings.Contains(response.Body.String(), test.want) {
 				t.Fatalf("body=%s, want contains %q（不得被其他前置门假通过）", response.Body.String(), test.want)
@@ -849,7 +849,7 @@ func TestImportConfigBackup_clamps_excessive_jwt_expiration(t *testing.T) {
 	}
 }
 
-// S-7 裁定：指标保留随日志保留，该键已迁移删除，旧备份含该键被忽略。
+// 历史修复 裁定：指标保留随日志保留，该键已迁移删除，旧备份含该键被忽略。
 func TestImportConfigBackup_ignoresDeadMetricsRetentionDaysKey(t *testing.T) {
 	for _, item := range []struct {
 		name  string
@@ -992,7 +992,7 @@ func TestImportConfigBackup_missingOperatorAccount_respectsChoice(t *testing.T) 
 }
 
 func TestImportConfigBackup_preserves_backup_rule_attribution_without_operator_context(t *testing.T) {
-	// 审计 B3：归属重映射仅在操作者存在时执行——无操作者上下文时，备份行自带的
+	// 历史修复：归属重映射仅在操作者存在时执行——无操作者上下文时，备份行自带的
 	// updated_by 必须原样保留，不得写 NULL 抹掉全部规则归属（操作者非空但缺席
 	// 备份的场景已被自锁前置门 400 拦截，见上一用例）。
 	// Given
@@ -1061,7 +1061,7 @@ func TestImportConfigBackup_requeues_imported_non_terminal_certificate_jobs(t *t
 		INSERT INTO cert_jobs (rule_id,domain,status,ca_provider_id) VALUES ('lb_requeue_v2','requeue.example.test','creating_order',999999)`); err != nil {
 		t.Fatalf("seed non-terminal job: %v", err)
 	}
-	// 历史问题 发现2/A-2 起启用 acme_dns 规则须引用有效证书配置（备份内可解析），
+	// 历史问题 发现2/历史修复 起启用 acme_dns 规则须引用有效证书配置（备份内可解析），
 	// 夹具补种子行并绑定，保持本用例的 requeue 语义不变。
 	dnsResult, err := db.DB.Exec(`INSERT INTO certificate_configs (name,dns_provider,dns_credentials,enabled) VALUES ('requeue-dns','dnspod','{"token":"x"}',1)`)
 	if err != nil {
@@ -1414,7 +1414,7 @@ func TestValidateV2Backup_credentials_must_be_json_object(t *testing.T) {
 	}
 }
 
-// B3-82-历史问题/04：备份行必须与保存侧同门——CA 并发/间隔上界及 DNS
+// 历史修复：备份行必须与保存侧同门——CA 并发/间隔上界及 DNS
 // provider/专属凭证均不得绕过；合法上界与有效凭证保持回归。
 func TestValidateV2Backup_caProviderLimitsAndDNSProviderContracts(t *testing.T) {
 	validCA := func() map[string]any {
@@ -1465,7 +1465,7 @@ func TestValidateV2Backup_caProviderLimitsAndDNSProviderContracts(t *testing.T) 
 	}
 }
 
-// B3-82-历史问题/04 收窄：legacy 空 provider/空凭证行保持放行；只有非空且
+// 历史修复 收窄：legacy 空 provider/空凭证行保持放行；只有非空且
 // 未知或必填缺失的形态才拒绝。
 func TestValidateV2Backup_legacyEmptyProviderRowsAllowed(t *testing.T) {
 	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
@@ -1494,7 +1494,7 @@ func TestValidateV2Backup_rejects_self_loop_80_tls_redirect_rule(t *testing.T) {
 			wantErrText: "80 端口开启 TLS 跳转无意义",
 		},
 		{
-			// 历史 历史问题: 禁用规则不参与渲染（caddy.go WHERE enabled=1），
+			// 历史问题: 禁用规则不参与渲染（caddy.go WHERE enabled=1），
 			// 自环组合无运行时影响；导出→导入往返不应因存量禁用行失败。
 			name: "禁用状态的 80 端口 + TLS 跳转自环规则可导入",
 			rule: map[string]any{"caddy_id": "lb_backup_loop_disabled", "name": "备份禁用自环", "protocol": "http", "domain": "loop.test", "listen_port": 80, "enable_tls": 1, "tls_http_redirect": 1, "enabled": 0},
@@ -1515,9 +1515,9 @@ func TestValidateV2Backup_rejects_self_loop_80_tls_redirect_rule(t *testing.T) {
 			if err := json.Unmarshal([]byte(backup), &b); err != nil {
 				t.Fatalf("unmarshal backup: %v", err)
 			}
-			// 历史问题 历史问题 拆分后：逐行校验在 validateV2BackupRules（handler 在
+			// 历史问题 拆分后：逐行校验在 validateV2BackupRules（handler 在
 			// skipEmptyDomainHTTPRules 之后调用）；直测时组合两者保持原语义。
-			// 历史问题 历史问题：TLS 形态校验在 validateV2BackupTLSShape，一并串联。
+			// 历史问题：TLS 形态校验在 validateV2BackupTLSShape，一并串联。
 			_, err := validateV2Backup(b)
 			if err == nil {
 				err = validateV2BackupRules(b.Tables)
@@ -1538,7 +1538,7 @@ func TestValidateV2Backup_rejects_self_loop_80_tls_redirect_rule(t *testing.T) {
 	}
 }
 
-// 历史问题 B-NEW-1：v2 导入域名规范化门——通配/非法域名整包 400（用户裁决：系统
+// 历史问题：v2 导入域名规范化门——通配/非法域名整包 400（用户裁决：系统
 // 不支持通配符域名），合法域名钳回规范形式。
 func TestValidateV2Backup_rejects_wildcard_domain(t *testing.T) {
 	tests := []struct {
@@ -1558,7 +1558,7 @@ func TestValidateV2Backup_rejects_wildcard_domain(t *testing.T) {
 			wantErrText: "系统不支持通配符域名",
 		},
 		{
-			name:        "空 protocol 的通配域名同被拒（历史 历史问题 同口径）",
+			name:        "空 protocol 的通配域名同被拒（历史问题 同口径）",
 			rule:        map[string]any{"caddy_id": "lb_backup_noproto", "name": "空协议", "protocol": "", "domain": "*.c.test", "listen_port": 80},
 			wantErrText: "系统不支持通配符域名",
 		},
@@ -1584,7 +1584,7 @@ func TestValidateV2Backup_rejects_wildcard_domain(t *testing.T) {
 			if err := json.Unmarshal([]byte(backup), &b); err != nil {
 				t.Fatalf("unmarshal backup: %v", err)
 			}
-			// 历史问题 历史问题 同款链序：空域名 http 行先软跳过（返回跳过警告，非 error）。
+			// 历史问题 同款链序：空域名 http 行先软跳过（返回跳过警告，非 error）。
 			_ = skipEmptyDomainHTTPRules(b.Tables)
 			err := validateV2BackupRules(b.Tables)
 			if tt.wantErrText != "" {
@@ -1643,7 +1643,7 @@ func TestValidateV2Backup_rejects_tcp_rule_with_dns_server(t *testing.T) {
 			if err := json.Unmarshal([]byte(backup), &b); err != nil {
 				t.Fatalf("unmarshal backup: %v", err)
 			}
-			// 与 TestValidateV2Backup_rejects_wildcard_domain 同链序（历史问题 历史问题）。
+			// 与 TestValidateV2Backup_rejects_wildcard_domain 同链序（历史问题）。
 			_ = skipEmptyDomainHTTPRules(b.Tables)
 			err := validateV2BackupRules(b.Tables)
 			if tt.wantErrText != "" {
@@ -1659,7 +1659,7 @@ func TestValidateV2Backup_rejects_tcp_rule_with_dns_server(t *testing.T) {
 	}
 }
 
-// 历史问题 历史问题：v2 导入 upstreams.protocol 白名单——与保存侧 validateUpstreams 同口径，
+// 历史问题：v2 导入 upstreams.protocol 白名单——与保存侧 validateUpstreams 同口径，
 // 防手造备份带入 http 规则 + 上游 "tls"（渲染侧明文 HTTP 打 TLS 端口，静默 502）。
 func TestValidateBackupRuleReferences_rejects_bad_upstream_protocol(t *testing.T) {
 	base := func(ruleProtocol string) map[string][]map[string]any {
@@ -1773,7 +1773,7 @@ func TestValidateBackupRuleReferences_rejects_bad_origin_domain_and_health_check
 	}
 }
 
-// 历史问题 历史问题（传播通道钳制）: v2 备份中 TCP + enable_tls=1 + 空证书的行被静默钳制
+// 历史问题（传播通道钳制）: v2 备份中 TCP + enable_tls=1 + 空证书的行被静默钳制
 // 为关闭 TLS（不因存量形态拒绝整包导入）。
 func TestValidateV2BackupTLSShape_clamps_tcp_stale_tls(t *testing.T) {
 	rule := map[string]any{
@@ -2042,7 +2042,7 @@ func selfSignedTestPair(t *testing.T) (certPEM, keyPEM string) {
 }
 
 func TestImportConfigBackup_normalizesNullEnabled(t *testing.T) {
-	// Given：pre-历史问题 库导出的备份含 "enabled":null 的行（历史问题 起两表 NOT NULL，
+	// Given：历史问题 库导出的备份含 "enabled":null 的行（历史问题 起两表 NOT NULL，
 	// 原值插入会触发约束失败整包回滚）
 	h := newBackupTestHandlers(t)
 	if _, err := db.DB.Exec("INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (1,'current-admin','hash','admin',1)"); err != nil {
@@ -2083,11 +2083,11 @@ func TestImportConfigBackup_normalizesNullEnabled(t *testing.T) {
 	}
 }
 
-// 历史问题 历史问题: pre-历史修复 库的 users.is_enabled 为可空列（历史修复 起 NOT NULL），旧实例导出的
+// 历史问题: 历史修复 库的 users.is_enabled 为可空列（历史修复 起 NOT NULL），旧实例导出的
 // "is_enabled":null 行导入 历史修复+ 库会触发约束失败整包回滚；归一为 1（与
 // lb_rules/upstreams 的 NULL→0 不同，对齐 migrateUsersIsEnabledNotNull 口径）。
 func TestImportConfigBackup_normalizesNullUserIsEnabled(t *testing.T) {
-	// Given：备份含一个 is_enabled:null 用户行（pre-历史修复 遗留）+ 一个启用 admin
+	// Given：备份含一个 is_enabled:null 用户行（历史修复 遗留）+ 一个启用 admin
 	h := newBackupTestHandlers(t)
 	router := gin.New()
 	router.POST("/config/import", h.ImportConfigBackup)
@@ -2116,7 +2116,7 @@ func TestImportConfigBackup_normalizesNullUserIsEnabled(t *testing.T) {
 	}
 }
 
-// 历史问题 历史问题: skipEmptyDomainHTTPRules 必须先于逐行校验——空域名行无论端口是否非法
+// 历史问题: skipEmptyDomainHTTPRules 必须先于逐行校验——空域名行无论端口是否非法
 // 都一律软跳过并告警；非空域名+非法端口行仍整包 400。
 func TestImportConfigBackup_skips_empty_domain_rule_before_row_validation(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -2175,7 +2175,7 @@ func TestImportConfigBackup_skips_empty_domain_rule_before_row_validation(t *tes
 	})
 }
 
-// B3-82-历史问题：空域名 HTTP 规则的关联 cert_jobs 必须先随规则软跳过，
+// 历史修复：空域名 HTTP 规则的关联 cert_jobs 必须先随规则软跳过，
 // 再执行状态门；非跳过规则的非法状态仍必须拒绝。
 func TestConfigBackup_emptyDomainRuleSkipsCertJobBeforeStatusGate(t *testing.T) {
 	backupWithJob := func(ruleDomain, status string) string {
@@ -2220,8 +2220,8 @@ func TestConfigBackup_emptyDomainRuleSkipsCertJobBeforeStatusGate(t *testing.T) 
 	})
 }
 
-// SC-BAK-01: Config backup export → import round-trip preserves multi-row
-// security_policy_bindings (one rule → multiple policies). Post-import
+// 历史修复: Config backup export → import round-trip preserves multi-row
+// security_policy_bindings (one rule → multiple policies). 历史修复
 // validation passes and policy_id ordering is queryable via the same SELECT
 // the runtime uses (ORDER BY policy_id ASC).
 func TestConfigBackup_multiRowBindingsRoundTrip(t *testing.T) {
@@ -2309,8 +2309,8 @@ func TestConfigBackup_multiRowBindingsRoundTrip(t *testing.T) {
 	}
 }
 
-// SC-BAK-01 (dangling): Backup import validates binding references and rejects
-// rows pointing to non-existent policies (历史问题 C-#2). Pin this behavior.
+// 历史修复 (dangling): Backup import validates binding references and rejects
+// rows pointing to non-existent policies (历史问题). Pin this behavior.
 func TestConfigBackup_danglingBindingRejected(t *testing.T) {
 	// Given: a backup where lb_dangle binds to policy 1 (valid) and policy 99
 	// (no such row in security_policies).
@@ -2350,7 +2350,7 @@ func TestConfigBackup_danglingBindingRejected(t *testing.T) {
 	}
 }
 
-// audit I-A：restoreTable 的 NULL→默认值归一此前三张安全表专属（C5 KNOWN-GAP-1），
+// audit 历史修复：restoreTable 的 NULL→默认值归一此前三张安全表专属（历史修复），
 // 其余 11 张备份表的可空列携带 JSON null 时原样落库，直接命中各 raw-scan 消费点：
 // users.created_at NULL → auth.go Login 的 time.Time 扫描 500 → 永久锁死；
 // api_keys.created_at/布尔列 NULL → scanAPIKeys 500；ca_providers 数值列 NULL →
@@ -2526,7 +2526,7 @@ func TestImportConfigBackup_normalizes_null_rows_for_all_backup_tables(t *testin
 	if scanned != 1 {
 		t.Fatalf("cert_jobs scanned=%d, want 1", scanned)
 	}
-	// X-1（历史 历史问题）：非 ACME 态规则（lb_nulldump: enable_tls=0）的 cert_jobs
+	// 历史修复（历史）：非 ACME 态规则（lb_nulldump: enable_tls=0）的 cert_jobs
 	// 行随导入失效任务清理删除——此前只清孤儿行（rule_id 不在 lb_rules），此类
 	// 「规则仍在但已非 ACME」的残留会被续签扫描/任务列表当作活任务。
 	var orphanJobs int
@@ -2661,7 +2661,7 @@ func TestImportConfigBackup_normalizes_null_rows_for_all_backup_tables(t *testin
 	}
 }
 
-// audit I-A 同构回归：dump→restore→dump 往返必须逐字节稳定（fresh backup 的
+// audit 历史修复 同构回归：dump→restore→dump 往返必须逐字节稳定（fresh backup 的
 // 表区语义相等）——归一只替换显式 NULL，不得改变任何非 NULL 值。种子库先经
 // 一次导入「愈合并」（对齐集群通道/恢复后库的规范形态），随后 A=export →
 // import(A) → B=export 必须语义相等（唯一豁免：导入固定递增 users.password_version
@@ -2953,7 +2953,7 @@ func TestValidateV2Backup_rejectsNonObjectIPListEntries(t *testing.T) {
 	}
 }
 
-// U6B-1（历史）：备份布尔门枚举漏 trust_detection——security_policies
+// 历史修复（历史）：备份布尔门枚举漏 trust_detection——security_policies
 // 的阶段 0 信任检测开关（BOOLEAN NOT NULL DEFAULT 0）不在 backupBooleanTableColumns，
 // 字符串 "true" 形态经导入落库后由布尔门漏过：校验期读 false、存储期 SQLite 亲和性
 // 保留文本，同一值两期含义相反。畸形形态整包 400；布尔/0-1 数值放行且落库正确。
@@ -3027,7 +3027,7 @@ func TestValidateV2BackupBooleanTypes_rejectsMalformedTrustDetection(t *testing.
 	}
 }
 
-// U6B-2（历史）：备份校验缺 policy_type 值域门——显式未知类型
+// 历史修复（历史）：备份校验缺 policy_type 值域门——显式未知类型
 // （手编辑/带外改库导出）原样落库后策略页分组与阶段外字段归一判定漂移；
 // 非字符串形态与三枚举门同口径拒绝（历史问题 同型，backupString 不得静默
 // 归一）。空串/null/缺省放行——导入侧 restoreTable 对空行按内容重推断。
@@ -3205,7 +3205,7 @@ func TestImportAutoBackupResetNeeded(t *testing.T) {
 	}
 }
 
-// ── v2 备份 JSON 夹具（历史问题-历史问题，历史） ──
+// ── v2 备份 JSON 夹具（历史问题，历史） ──
 //
 // 这是全包唯一的 v2 备份 JSON 构造器。此前并存 9 个 *BackupJSON 构造器
 // （completeBackupJSON / completeBackupJSONOmit / r41BackupJSON /

@@ -12,7 +12,7 @@ import (
 )
 
 // 密码策略 8-24 可打印 ASCII（2026-09-28 用户裁定），超限密码以 400 拒绝：
-// >24 由 validatePasswordPolicy 给出友好中文文案（F-SYSR-3 收口 UpdateUser），
+// >24 由 validatePasswordPolicy 给出友好中文文案（历史修复 收口 UpdateUser），
 // >72（bcrypt 物理上限，v0.55 起 ErrPasswordTooLong）仍由绑定层兜底——
 // 不能先落库再让用户以被截断的密码登录失败。
 func TestUserPasswordEndpoints_reject_passwords_over_policy_max(t *testing.T) {
@@ -69,7 +69,7 @@ func TestUserPasswordEndpoints_reject_passwords_over_policy_max(t *testing.T) {
 	}
 }
 
-// F-SYSR-3（历史）：UpdateUser 密码长度边界交 validatePasswordPolicy
+// 历史修复（历史）：UpdateUser 密码长度边界交 validatePasswordPolicy
 // （历史问题-5 只收敛了 CreateUser）——修复前 25-32 位密码走绑定层 max=24
 // 泛化 400「请求格式错误」，拿不到「密码长度不能超过 24 位」友好文案。
 func TestUpdateUser_passwordLengthRejectedByPolicyWithFriendlyMessage(t *testing.T) {

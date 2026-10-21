@@ -16,7 +16,7 @@ import (
 // last_error 指向轮转失败；恢复后健康位复位；「补采失败不截断」语义不变。
 func TestSecurityEventsPollOnce_rotationFailureEntersHealthSnapshot(t *testing.T) {
 	// Given：一条已摄取事件 + 超阈活文件（每 tick 触发轮转）。
-	// SSA-87-10（历史）：库夹具必须保存/还原全局指针并 Close（同包
+	// 历史修复（历史）：库夹具必须保存/还原全局指针并 Close（同包
 	// stallSetup/setupSecurityEventsRetentionTestDB 口径）——裸 Initialize 会让
 	// 包级 DB 指向已删除的临时目录。
 	logPath, offsetPath := stallSetup(t)

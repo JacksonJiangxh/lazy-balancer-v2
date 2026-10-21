@@ -108,7 +108,7 @@ func TestIPListFast_4in6EntriesHitV4Queries(t *testing.T) {
 }
 
 // EvictIPListCache（历史问题 缓存 GC）：淘汰后同路径下次加载重新读盘解析——
-// services 侧删除孤儿文件后，历史修复 不得把旧集合无限期留在内存。
+// services 侧删除孤儿文件后，fail-stale 不得把旧集合无限期留在内存。
 func TestIPListFast_evictCacheForcesReparse(t *testing.T) {
 	dir := useAllowedDir(t)
 	path := writeListFile(t, dir, "evict.txt", []string{"203.0.113.0/24"})

@@ -352,7 +352,7 @@ func TestAuditWritePointsUseCanonicalVocabulary(t *testing.T) {
 }
 
 func TestMigrateAuditVocabulary_convergesChainedRenameInOnePass(t *testing.T) {
-	// Given 链式组合行（CORE-U1，历史）：("重载","Caddy 配置") 须先经对象改名
+	// Given 链式组合行（历史修复，历史）：("重载","Caddy 配置") 须先经对象改名
 	// 条目变 ("重载","Caddy配置")、再经联动条目变 ("重载","Caddy服务")——单趟循环
 	// 下联动条目已越过，需两次启动才收敛；不动点循环要求单次调用即归一终态。
 	auditDB := openVocabularyTestAuditDB(t)

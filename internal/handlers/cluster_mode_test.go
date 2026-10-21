@@ -72,7 +72,7 @@ func TestSetClusterMode_returns_registration_id_when_local_transition_fails(t *t
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
 		db.SetDB(oldDB)
 	})
-	// CLUSTER-1（历史）：本地转换失败的注入不再关闭包级 db.DB——
+	// 历史修复（历史）：本地转换失败的注入不再关闭包级 db.DB——
 	// 假 handler 关包级句柄会污染全局状态（Cleanup 前的审计与断言全踩
 	// closed 连接）。改为给 clusterService 单独注入已关闭句柄，BecomeSlave
 	// 的 DB 失败语义不变且不外溢。
@@ -251,7 +251,7 @@ func TestUpdateClusterSettings_sync_interval_range_validation(t *testing.T) {
 	}
 }
 
-// S历史问题(历史):恒同步拒绝属客户端错误 → 400(与间隔校验同型),
+// 历史问题(历史):恒同步拒绝属客户端错误 → 400(与间隔校验同型),
 // 此前普通 error 落 403 与 apidocs 声称相悖。
 func TestUpdateClusterSettings_rejectsDisablingSyncUsersAs400(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -293,7 +293,7 @@ func TestUpdateClusterSettings_auditUsesUnifiedRulesLabel(t *testing.T) {
 	}
 }
 
-// 历史问题（历史 历史问题）：空 body 的幂等空保存曾落「更新/集群设置」零详情审计
+// 历史问题（历史）：空 body 的幂等空保存曾落「更新/集群设置」零详情审计
 // （parts 为空 → Join 空串），无法区分「无修改」与记录缺陷——复用同域既有
 // 「无修改」文案（caproviders/certificates 同口径）。
 func TestUpdateClusterSettings_emptyChangeAuditsNoModification(t *testing.T) {
@@ -316,7 +316,7 @@ func TestUpdateClusterSettings_emptyChangeAuditsNoModification(t *testing.T) {
 	}
 }
 
-// 历史问题（历史 历史问题，R-12 家族收敛）：历史修复 历史问题 的导入窗口节点写门覆盖了
+// 历史问题（历史问题，历史修复 家族收敛）：历史问题 的导入窗口节点写门覆盖了
 // 注册/审批/改址/清 pin/上报，但漏掉角色切换端点——SetClusterMode 在远端
 // 注册后写 global_config、Promote 写 global_config，导入事务全量替换
 // global_config 时会被覆盖（含远端孤儿注册）。本测试钉住三端点在导入窗口内

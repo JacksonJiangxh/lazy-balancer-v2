@@ -83,7 +83,7 @@ func TestCRSUpdateRun_snapshotPersistFailureIsAudited(t *testing.T) {
 	if got := countCRSAudits(t, "写入失败"); got != 1 {
 		t.Fatalf("persist-failure audits=%d, want 1 (degraded snapshot state must be operator-visible)", got)
 	}
-	// And 组件日志行级别/阶段一致（历史修复 发现2）：ERROR 行必须标 failed 阶段——
+	// And 组件日志行级别/阶段一致（历史修复）：ERROR 行必须标 failed 阶段——
 	// 与同 run 末尾的 INFO/success 行并列时，success 阶段的 ERROR 行会误导阶段列。
 	logBytes, err := os.ReadFile(taskengine.TaskLogPath("crs"))
 	if err != nil {

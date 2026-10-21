@@ -98,7 +98,7 @@ func captureCertJobLogWarns(t *testing.T) func() []string {
 	}
 }
 
-// D2-历史问题：删除规则时必须同时清掉当前日志、.N 轮转副本与 .log.gz
+// 历史问题：删除规则时必须同时清掉当前日志、.N 轮转副本与 .log.gz
 // 压缩归档；同目录其他规则文件不受影响。
 func TestRemoveCertJobLogFiles_removesCompressedAndRotatedGenerations(t *testing.T) {
 	useCertJobLogTestEnv(t, 1<<20)
@@ -166,7 +166,7 @@ func TestCertJobFileLogger_rotation_failure_is_surfaced(t *testing.T) {
 
 // 历史问题 并发守护：每次写日志都新建实例（Issue 的 jobLogger / WriteCertJobLog* 是
 // 真实调用形态），8 实例并发写同 ruleID、阈值 1 字节使每次写都触发轮转。锁定后
-// 历史修复 原子化；断言全部落盘行完整无撕裂、代际集合不越界。
+// check-rotate-append 原子化；断言全部落盘行完整无撕裂、代际集合不越界。
 // 注：并发交错本身概率性，本测试为回归守护（配合 -race），确定性红由
 // rotation_failure_is_surfaced 承担。
 func TestCertJobFileLogger_concurrent_writers_keep_lines_intact(t *testing.T) {
@@ -243,7 +243,7 @@ func TestCertJobFileLogger_housekeepingDeletesOnlyExpiredFiles(t *testing.T) {
 		t.Fatalf("touch active log: %v", err)
 	}
 
-	// When：历史修复 housekeeping 节拍
+	// When：log-cleanup housekeeping 节拍
 	logFile := filepath.Join(filepath.Dir(taskengine.LogDir()), "lazy-balancer.log")
 	result := taskLogsHousekeeping(logFile)
 
@@ -291,7 +291,7 @@ func TestCertJobFileLogger_singleTrackRotationKeepsFiveGenerations(t *testing.T)
 		}
 		return string(data)
 	}
-	// 活动文件=历史修复，.1-.5=历史修复..历史修复，历史修复 已退役。
+	// 活动文件=最新代际，.1-.5=依次更老代际；旧剔除式命名已退役。
 	want := map[int]string{0: "GEN-7-", 1: "GEN-6-", 2: "GEN-5-", 3: "GEN-4-", 4: "GEN-3-", 5: "GEN-2-"}
 	for i, tag := range want {
 		if got := readGen(i); !strings.Contains(got, tag) {
@@ -356,7 +356,7 @@ func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
 
 // 证书任务日志文件名主体必须与规则访问日志同构
 // （可逆编码）。旧实现 sanitizePathComponent 剔除非法字符：`lb.dot` 与 `lbdot`
-// 落到同一 历史修复.log 与同一写锁——签发日志跨规则混写、保留期清理互相
+// 落到同一 certjob-lbdot.log 与同一写锁——签发日志跨规则混写、保留期清理互相
 // 删除（housekeeping 从文件名反推 ID 的前提在字母表外不成立）。
 func TestCertJobLogFileName_reversibleForDottedIDs(t *testing.T) {
 	useCertJobLogTestEnv(t, 1<<20)

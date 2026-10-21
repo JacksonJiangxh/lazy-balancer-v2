@@ -1,8 +1,8 @@
 package services
 
-// C1-1 同步包声明哈希非空但未携带内容 → 拒绝应用(主端瞬态 IO 下轮自愈);
-// C1-2 ReportNode 落库前 last_sync_error 与从端写侧同口径截断(≤512B);
-// C1-3 ApproveNode 重复审批(非 pending)→ 409 语义错误而非 404。
+// 历史修复 同步包声明哈希非空但未携带内容 → 拒绝应用(主端瞬态 IO 下轮自愈);
+// 历史修复 ReportNode 落库前 last_sync_error 与从端写侧同口径截断(≤512B);
+// 历史修复 ApproveNode 重复审批(非 pending)→ 409 语义错误而非 404。
 
 import (
 	"context"

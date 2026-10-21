@@ -17,7 +17,7 @@ import (
 
 // certJobRereadFailingConnector 返回一个按语句路由的假 db.DB：任务行 SELECT 正常
 // 返回在途态行，CAS UPDATE 命中 0 行（模拟 worker 并发推进状态），重读 SELECT
-// 注入瞬时 DB 故障（同 历史修复/历史修复 的假连接器模式）。
+// 注入瞬时 DB 故障（同 历史修复 的假连接器模式）。
 type certJobRereadFailingConnector struct{}
 
 func (certJobRereadFailingConnector) Connect(context.Context) (driver.Conn, error) {
@@ -45,7 +45,7 @@ func (certJobRereadFailingConn) Begin() (driver.Tx, error) { return nil, errors.
 func (certJobRereadFailingConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
 	switch {
 	case strings.Contains(query, "rule_id, domain, status"):
-		// F49-8 起 DeleteCertJob 的首个 SELECT 同时扫 cert_pem/key_pem（6 列）。
+		// 历史修复 起 DeleteCertJob 的首个 SELECT 同时扫 cert_pem/key_pem（6 列）。
 		return &fakeQueryRows{values: [][]driver.Value{{"lb_reread_500", "reread.example.test", "validating", int64(1), "", ""}}}, nil
 	case strings.Contains(query, "SELECT status FROM cert_jobs"):
 		return nil, errors.New("注入的重读故障")
@@ -70,7 +70,7 @@ func (certJobZeroRowsResult) LastInsertId() (int64, error) { return 0, nil }
 func (certJobZeroRowsResult) RowsAffected() (int64, error) { return 0, nil }
 
 func TestDeleteCertJob_reread_failure_returns_500(t *testing.T) {
-	// 历史修复 N-4：CAS 命中 0 行后的归因重读本身失败（瞬时 DB 故障）是 历史修复 A-#3
+	// 历史修复：CAS 命中 0 行后的归因重读本身失败（瞬时 DB 故障）是 历史修复
 	// 新增的第三分支——必须显式 500（读取任务状态失败），不得误报 409/404。
 	// Given
 	h := newBackupTestHandlers(t)
@@ -96,7 +96,7 @@ func TestDeleteCertJob_reread_failure_returns_500(t *testing.T) {
 }
 
 func TestDeleteCertJob_concurrent_status_change_returns_409(t *testing.T) {
-	// 历史修复 A-#3：在途态任务（S-2 放行的 escape-hatch 对象）删除时，worker 在
+	// 历史修复：在途态任务（历史修复 放行的 escape-hatch 对象）删除时，worker 在
 	// SELECT 与 disabled 翻转之间推进状态（如 validating→validated），CAS
 	// 命中 0 行属并发竞争而非服务器故障——必须重读区分归因并返回 409
 	// 刷新重试文案（对齐 RetryCertJob 模式），不得返回误导性 500。
@@ -136,7 +136,7 @@ func TestDeleteCertJob_concurrent_status_change_returns_409(t *testing.T) {
 }
 
 func TestDeleteCertJob_row_disappearing_before_disable_returns_404(t *testing.T) {
-	// 历史修复 A-#3：CAS 命中 0 行且重读发现行已不存在（并发删除），按 handler 对
+	// 历史修复：CAS 命中 0 行且重读发现行已不存在（并发删除），按 handler 对
 	// 缺失任务的既有语义返回 404，而非 500「Failed to verify disabled job」。
 	// Given
 	h := newBackupTestHandlers(t)
@@ -206,7 +206,7 @@ func TestDeleteCertJob_restore_skips_when_row_left_disabled(t *testing.T) {
 	}
 }
 
-// 函数 rows.Err() 500 口径及 F-CORE-2「warn 留痕+continue」口径不对称。
+// 函数 rows.Err() 500 口径及 历史修复「warn 留痕+continue」口径不对称。
 // 修复：warn+continue。钉：单行 scan 失败 → warn 留痕 + 不 500 + 其余行照常返回。
 func TestListCertificates_scanFailureWarnsAndKeepsRemainingRows(t *testing.T) {
 	// Given：假驱动首行 id 列类型错误（Scan 必然失败），次行正常

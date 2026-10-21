@@ -1,4 +1,4 @@
-// 安全策略保存载荷行为验收（审计 87 W87-15）：
+// 安全策略保存载荷行为验收（历史修复）：
 // 载荷原先内联在 SecurityPolicies.handleSave，字段语义（阶段外裁剪、引用释放、
 // stage0 信任恒启用、geoip 三态归一、mixed 不显式提交）无求值测试。
 //
@@ -109,7 +109,7 @@ test('几何开关与限流参数原样透传（不做裁剪）', () => {
   )
 })
 
-test('W87-03：豁免开启 + 空引擎 = 不可保存（后端空集=全部引擎）', () => {
+test('豁免开启 + 空引擎 = 不可保存（后端空集=全部引擎）', () => {
   assert.equal(crawlerExemptionNeedsEngines({ geoipEnabled: true, crawlerExempt: true, engines: [] }), true)
   // 勾选任一引擎即合法
   assert.equal(crawlerExemptionNeedsEngines({ geoipEnabled: true, crawlerExempt: true, engines: ['googlebot'] }), false)

@@ -25,7 +25,7 @@ func l7RuleFeatureInput(protocol string, duration, interval int) ruleFeatureInpu
 	}
 }
 
-func TestP2_4_tryWindowRequiresPositiveIntervalAtFieldGate(t *testing.T) {
+func TestTryWindow_requiresPositiveIntervalAtFieldGate(t *testing.T) {
 	cases := []struct {
 		name     string
 		protocol string
@@ -60,7 +60,7 @@ func TestP2_4_tryWindowRequiresPositiveIntervalAtFieldGate(t *testing.T) {
 	}
 }
 
-func TestP2_4_createRuleReturnsFieldLevelError(t *testing.T) {
+func TestCreateRule_returnsFieldLevelError(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
 	gin.SetMode(gin.TestMode)
 	router := gin.New()

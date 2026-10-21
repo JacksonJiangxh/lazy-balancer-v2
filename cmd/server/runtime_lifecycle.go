@@ -71,7 +71,7 @@ func (l *runtimeLifecycle) stopACMEWithin(timeout time.Duration) {
 	l.certService = nil
 	l.certDone = nil
 	// 历史问题-9/历史问题-1：与 StartACME 注入对称——停机必须清除任务引擎证书
-	// 单轮体消费的 active 指针，否则 demote/停机后 历史修复 等循环
+	// 单轮体消费的 active 指针，否则 demote/停机后 cert-manual-poll 等循环
 	// 继续驱动已停服务（重复到期日志/无角色门补扫）。
 	services.SetActiveCertificateService(nil)
 	if worker != nil {
@@ -97,10 +97,10 @@ func (l *runtimeLifecycle) stopACMEWithin(timeout time.Duration) {
 	}
 }
 
-// StartSync/StopSync 与 StartACME 共用 l.mu（历史问题-2）：历史修复 的
+// StartSync/StopSync 与 StartACME 共用 l.mu（历史问题-2）：cluster-sync 的
 // 启停来自 taskengine daemon 换代，Shutdown 与换代并发时原实现无锁——旧代
 // Stop 可能在 Shutdown 已 teardown 之后执行，或新代 Start 越过 Shutdown
-// 重新拉起同步循环。stopped 门使退出后的 Start 成为 历史修复。
+// 重新拉起同步循环。stopped 门使退出后的 Start 成为 no-op。
 func (l *runtimeLifecycle) StartSync() {
 	l.mu.Lock()
 	defer l.mu.Unlock()

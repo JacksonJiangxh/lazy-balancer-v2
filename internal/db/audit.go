@@ -59,7 +59,7 @@ func InitializeAuditDB(dataDir string) error {
 	}
 	AuditDB = auditDB
 	if err := migrateLegacyAuditLogs(DB, path); err != nil {
-		// 历史问题 历史问题: 初始化中途失败时缓冲的系统事件原样保留（下次启动重放），
+		// 历史问题: 初始化中途失败时缓冲的系统事件原样保留（下次启动重放），
 		// 此处仅留痕条数，不静默丢弃。
 		log.Printf("audit log migration failed (%v); %d buffered system audit entries retained for next startup", err, systemAuditBufferLen())
 		return err
@@ -159,7 +159,7 @@ func auditVocabularyMigrated(fingerprint string) bool {
 	return stored == fingerprint
 }
 
-// CORE-U1（历史）：归一表存在链式条目（如 ("重载","Caddy 配置") 单趟只能
+// 历史修复（历史）：归一表存在链式条目（如 ("重载","Caddy 配置") 单趟只能
 // 命中对象改名条目变 ("重载","Caddy配置")——联动条目在表序上已越过），单趟
 // 循环需两次启动才收敛——循环至不动点（整趟零改动）使单次启动归一终态。
 // 趟数上限=条目数+1：无环表每趟严格推进，超限即未来编辑引入环，WARN 防御
@@ -225,7 +225,7 @@ func migrateAuditVocabulary() {
 	log.Printf("audit vocabulary migration did not converge after %d passes (rename table cycle?)", maxPasses)
 }
 
-// 历史问题 历史问题: 启动迁移跑在 InitializeAuditDB 之前，且 db 不能反向依赖
+// 历史问题: 启动迁移跑在 InitializeAuditDB 之前，且 db 不能反向依赖
 // services.RecordAuditLog（import 环）——迁移期的系统事件先入内存缓冲，审计库
 // 就绪后统一落 audit_log 表，与 UI 操作日志同源。
 type systemAuditEntry struct {
@@ -239,7 +239,7 @@ var systemAuditBuffer struct {
 	entries []systemAuditEntry
 }
 
-// 历史问题 历史问题: 缓冲设上限，审计库长期不可用（或 flush 反复失败）时丢弃最旧条目并
+// 历史问题: 缓冲设上限，审计库长期不可用（或 flush 反复失败）时丢弃最旧条目并
 // 告警，避免内存无界增长。
 const systemAuditBufferCap = 10000
 
@@ -266,7 +266,7 @@ func trimSystemAuditBufferLocked() {
 }
 
 // flushSystemAuditLogs 将缓冲的系统事件写入审计库并清空缓冲；审计库未就绪或单条
-// 写失败时条目按原顺序留回缓冲（历史问题 历史问题：等待下次 flush 重试，不再静默丢事件），
+// 写失败时条目按原顺序留回缓冲（历史问题：等待下次 flush 重试，不再静默丢事件），
 // 与 services.RecordAuditLog 的 best-effort 语义一致。
 func flushSystemAuditLogs() {
 	systemAuditBuffer.mu.Lock()
@@ -321,8 +321,8 @@ func migrateLegacyAuditLogs(mainDB *sql.DB, auditPath string) error {
 		return fmt.Errorf("failed to attach audit database: %w", err)
 	}
 	defer func() {
-		// CORE-F4（历史）：DETACH 失败曾静默忽略——连接归还池仍挂
-		// audit_migration schema，本次迁移虽已提交（A-2 核实当前不可达），
+		// 历史修复（历史）：DETACH 失败曾静默忽略——连接归还池仍挂
+		// audit_migration schema，本次迁移虽已提交（历史修复 核实当前不可达），
 		// 但失败须留痕便于排查连接池污染。
 		if _, err := conn.ExecContext(ctx, "DETACH DATABASE audit_migration"); err != nil {
 			log.Printf("migrateLegacyAuditLogs: DETACH audit_migration 失败（连接归还池仍挂 schema）: %v", err)

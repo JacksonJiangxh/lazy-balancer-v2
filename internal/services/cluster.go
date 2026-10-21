@@ -28,12 +28,12 @@ var (
 	// (重复审批/已处理)——handler 侧映射 409。
 	ErrNodeNotPending = errors.New("节点不在待审批状态")
 	ErrAlreadyMaster  = errors.New("当前节点已是主节点")
-	// ErrNotMasterNode（历史问题-历史问题）：请求已通过 handler 角色门，但在节点簿记
+	// ErrNotMasterNode（历史问题）：请求已通过 handler 角色门，但在节点簿记
 	// 写语句执行前角色已降级（TOCTOU）。handler 应映射 403，与 requireMaster
 	// 同文案。
 	ErrNotMasterNode       = errors.New("该操作仅允许在主节点执行")
 	ErrInvalidSyncInterval = errors.New("同步间隔需在 10-86400 秒之间")
-	// ErrSyncUsersLocked 系统数据恒同步不可禁用(S历史问题:handler 映射 400)。
+	// ErrSyncUsersLocked 系统数据恒同步不可禁用(历史问题:handler 映射 400)。
 	ErrSyncUsersLocked = errors.New("系统数据为恒同步项（含用户/密钥/ACME），不允许禁用；证书随负载规则开关")
 )
 
@@ -80,7 +80,7 @@ func registerClusterService(service *ClusterService) {
 	clusterServicesMu.Unlock()
 }
 
-// unregisterClusterService 移除单个实例（S历史问题-06）：全局表以 *sql.DB 为键
+// unregisterClusterService 移除单个实例（历史问题-06）：全局表以 *sql.DB 为键
 // 且此前永不移除条目——测试/运行期重建 DB 时全局表强引用已 Close 的句柄，
 // 内存与其关联的 service 无法回收。测试 teardown 与显式释放路径调用本函数。
 func unregisterClusterService(service *ClusterService) {
@@ -102,7 +102,7 @@ func unregisterClusterService(service *ClusterService) {
 	clusterServicesMu.Unlock()
 }
 
-// clusterDBHandleAlive 报告句柄是否仍可 Ping（S历史问题-06 的兜底回收：库已
+// clusterDBHandleAlive 报告句柄是否仍可 Ping（历史问题-06 的兜底回收：库已
 // Close 而未见显式 unregister 时，查询路径顺手剔除死条目，防止全局表在
 // 测试/重建场景无限累积）。查询路径仅在主节点巡检与 Promote/BecomeSlave
 // 触发，Ping 成本可忽略。
@@ -149,7 +149,7 @@ func tokenHash(token string) string {
 	return hex.EncodeToString(hash[:])
 }
 
-// masterRoleConditionSQL 是节点簿记写语句的 SQL 级角色条件（历史问题-历史问题）：
+// masterRoleConditionSQL 是节点簿记写语句的 SQL 级角色条件（历史问题）：
 // handler 的 requireMaster 与本次写之间没有共享锁，BecomeSlave 可在窗口内
 // 提交 is_master=0——带该条件的写语句在降级后恒 0 行，消除「降级后仍审批/
 // 上报/改访问地址」的 TOCTOU 类别。
@@ -237,7 +237,7 @@ func (s *ClusterService) RegisterNode(ctx context.Context, req models.ClusterReg
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// 历史问题-历史问题：事务内角色复核（SQL 级）。降级已提交则拒绝注册/覆盖，避免
+	// 历史问题：事务内角色复核（SQL 级）。降级已提交则拒绝注册/覆盖，避免
 	// 旧主节点在降级窗口继续写入节点簿记。
 	var masterNow bool
 	if err := tx.QueryRowContext(ctx, "SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&masterNow); err != nil {
@@ -300,7 +300,7 @@ func (s *ClusterService) RegisterNode(ctx context.Context, req models.ClusterReg
 	if err != nil {
 		return models.ClusterRegistration{}, fmt.Errorf("更新待审批节点: %w", err)
 	}
-	// 历史修复 历史问题：nodes 不在 cluster_version 触发器清单（middleware/cluster_version.go
+	// 历史问题：nodes 不在 cluster_version 触发器清单（middleware/cluster_version.go
 	// 依赖显式 bump）——注册/覆盖改变节点拓扑后必须同事务 bump，否则快照缓存键
 	// 不变，新节点的 node_sites 缺项，继承坐标静默不生效直至下一次无关 bump。
 	if err := BumpClusterVersion(ctx, tx); err != nil {
@@ -320,7 +320,7 @@ func (s *ClusterService) UpdateNodeSiteCoordinates(ctx context.Context, nodeID i
 		return fmt.Errorf("开启节点站点坐标事务: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	// 历史修复 历史问题：无变更保存=历史修复——现值相同则不写库不 bump（「打开弹框原样
+	// 历史问题：无变更保存=no-op——现值相同则不写库不 bump（「打开弹框原样
 	// 保存」不得放大为全集群快照重放；继承节点 0,0 原样保存保持继承不固化）。
 	var currentLat, currentLon float64
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(server_map_lat,0), COALESCE(server_map_lon,0) FROM nodes WHERE id=? AND `+masterRoleConditionSQL, nodeID).Scan(&currentLat, &currentLon); err != nil {
@@ -343,7 +343,7 @@ func (s *ClusterService) UpdateNodeSiteCoordinates(ctx context.Context, nodeID i
 	if updated != 1 {
 		return s.nodeWriteMissError(ctx)
 	}
-	// 坐标是 历史修复 下发数据，必须 bump 版本触发从节点拉取；与节点行同事务。
+	// 坐标是 node-local 下发数据，必须 bump 版本触发从节点拉取；与节点行同事务。
 	if err := BumpClusterVersion(ctx, tx); err != nil {
 		return err
 	}
@@ -381,7 +381,7 @@ func (s *ClusterService) ApproveNode(ctx context.Context, nodeID int) error {
 		return fmt.Errorf("读取审批结果: %w", err)
 	}
 	if updated != 1 {
-		// 历史问题-历史问题：先区分「已降级」（403 语义）与节点状态/存在性问题。
+		// 历史问题：先区分「已降级」（403 语义）与节点状态/存在性问题。
 		isMaster, roleErr := RoleOf(ctx, s.db)
 		if roleErr != nil {
 			return fmt.Errorf("复核节点角色: %w", roleErr)
@@ -465,8 +465,8 @@ func BumpClusterVersion(ctx context.Context, executor clusterVersionExecutor) er
 	if err != nil {
 		return fmt.Errorf("递增集群版本: %w", err)
 	}
-	// D1-历史问题：global_config 行缺失/异常时 Exec 返回 0 行且 nil error，集群
-	// 版本不递增，从节点可能继续 304 不拉新内容——按 历史修复 报错。
+	// 历史问题：global_config 行缺失/异常时 Exec 返回 0 行且 nil error，集群
+	// 版本不递增，从节点可能继续 304 不拉新内容——按 fail-visible 报错。
 	updated, err := result.RowsAffected()
 	if err != nil {
 		return fmt.Errorf("读取集群版本递增结果: %w", err)
@@ -488,7 +488,7 @@ func (s *ClusterService) Promote(ctx context.Context) error {
 		return ErrAlreadyMaster
 	}
 	// 历史问题-06：角色翻转显式失效快照缓存（幂等零成本）。缓存键只有
-	// version/ownership/开关，降级期间在途的 历史修复 Run 可写过库且
+	// version/ownership/开关，降级期间在途的 master-only Run 可写过库且
 	// is_master=0 不 bump 版本——若从降级到再升主之间没有发生 apply，旧缓存
 	// 内容会被当作权威重新对外提供。放在角色检查之后，成功/失败路径都覆盖。
 	clusterSnapshotCaches.Delete(s.db)
@@ -516,12 +516,12 @@ func (s *ClusterService) Promote(ctx context.Context) error {
 	// daemon 的 Stop 在另一 goroutine 异步执行——不显式排干则在途拉取（含已
 	// 通过 admission 的 apply）可能在升主提交后继续把从节点数据写回库。
 	// 排干失败（ctx 到期）即中止提升，不做半程角色翻转。
-	// S历史问题-06：同库可能登记多个同步服务实例（测试/重建），逐个排干——
+	// 历史问题-06：同库可能登记多个同步服务实例（测试/重建），逐个排干——
 	// 只排干最后注册的一个会让其余实例的在途 apply 越过升主提交点。
 	if drainers := syncDrainersFor(s.db); len(drainers) > 0 {
-		// 历史问题-历史问题：排干失败的返回路径同样必须重开准入（defer 必须先于
+		// 历史问题：排干失败的返回路径同样必须重开准入（defer 必须先于
 		// DrainPulls 注册）。DrainPulls 自身已置 pullsStopped=true，原实现只在
-		// 成功后注册 defer：失败路径若 历史修复 已停（用户关闭）或
+		// 成功后注册 defer：失败路径若 cluster-sync 已停（用户关闭）或
 		// TaskEngine()==nil，准入永久关闭——从节点「立即同步」被 beginPull 拒绝
 		// 且哨兵不落库，静默脱同步直到再次 Promote/BecomeSlave/重启。
 		for _, drainer := range drainers {
@@ -555,7 +555,7 @@ func (s *ClusterService) Promote(ctx context.Context) error {
 	// 历史问题（历史裁定·设计声明）：nodes 表（含各从节点
 	// cluster_token_hash）跨角色切换刻意保留——Promote/BecomeSlave 均只重置
 	// global_config，从不清空 nodes。拓扑连续性语义：脱离通知
-	// （notifyMasterDetach）只是 历史修复，旧主节点令牌撤销依赖其成功；
+	// （notifyMasterDetach）只是 best-effort，旧主节点令牌撤销依赖其成功；
 	// 本节点降级后再提升时，旧 nodes 行即刻恢复权威，旧从节点持有的令牌
 	// 仍然有效，经手工 Resume/重新注册即可复活上报与同步——这是有意设计
 	// （主库清零后可凭从库副本恢复集群拓扑），不是令牌泄漏缺口。
@@ -597,7 +597,7 @@ func (s *ClusterService) Promote(ctx context.Context) error {
 	}
 	// 自动备份：v2.0 引擎 Scheduled 驱动（RunsOn=MasterOnly 角色门）——
 	// promote 后由引擎 SetRole 使能，无需单独拉起。
-	// 角色翻转由引擎 SetRole 唯一驱动：历史修复/历史修复 经 daemon
+	// 角色翻转由引擎 SetRole 唯一驱动：cert-issuance/cluster-sync 经 daemon
 	// 生命周期挂钩启停，不再存在管理器直调或旧调度器旁路。
 	if te != nil {
 		te.SetRole(true)
@@ -622,8 +622,8 @@ func (s *ClusterService) detachFromMaster(ctx context.Context, masterURL, oldTok
 		Logf("info", "parse old cluster master URL after promotion: %v", err)
 		RecordAuditLog("system", "清理失败", "证书指纹", FormatAuditDetail("旧主节点地址无效", err.Error()), "")
 		// 地址损坏时无法定位旧主节点 pin 文件——磁盘残留为已知边界
-		// （历史 历史修复 如实化）：残留仅在该 host:port 将来重新注册
-		// 为从节点时引发一次 PinMismatch，历史修复 可恢复。
+		// （历史修复 如实化）：残留仅在该 host:port 将来重新注册
+		// 为从节点时引发一次 PinMismatch，forget-pins 可恢复。
 		return
 	}
 	pinPath, err := clusterPinPathForDatabase(s.db, parsedMasterURL.Host)
@@ -706,7 +706,7 @@ func normalizeSyncInterval(interval int) int {
 // 避免阈值在两处各自硬编码导致口径漂移。
 const nodeOfflineMultiplier = 2
 
-// nodeOfflineThreshold 节点离线阈值的统一口径（F-历史问题-02，历史）：
+// nodeOfflineThreshold 节点离线阈值的统一口径（历史问题-02，历史）：
 // max(nodeOfflineMultiplier×sync_interval, masterSyncOfflineThreshold 下限)。
 // 存量脏值（历史问题 前残留的 0/负数或 1-9s）按 60s 计，与从节点 run loop
 // （cluster_sync.go）的 clamp 值一致：从节点实际以 60s 周期上报，若按原始脏值
@@ -749,7 +749,7 @@ func ComputeNodeStatus(approved bool, lastSeen time.Time, syncInterval int, now 
 	if !approved {
 		return "pending"
 	}
-	// 阈值口径集中在 nodeOfflineThreshold（F-历史问题-02）：脏值 clamp 与 120s 下限
+	// 阈值口径集中在 nodeOfflineThreshold（历史问题-02）：脏值 clamp 与 120s 下限
 	// 与巡检/总览同函数，UI 不再各自维护一套。
 	if lastSeen.IsZero() || now.Sub(lastSeen) > nodeOfflineThreshold(syncInterval) {
 		return "offline"
@@ -768,7 +768,7 @@ func DecodeClusterHealth(value string) (*models.ClusterHealth, error) {
 	return &health, nil
 }
 
-// notifyMasterDetach 历史修复 通知旧主节点本从节点已提升脱离。提升后本节点仍持有
+// notifyMasterDetach best-effort 通知旧主节点本从节点已提升脱离。提升后本节点仍持有
 // 旧集群令牌，且旧主节点仍保留本节点行与该令牌哈希，旧令牌在主节点上仍能验签通过，
 // 因此携带 detached=true 的上报会令主节点删除本节点行（令牌随之撤销），节点列表即时收敛；
 // 客户端仅用已知指纹比对（不落盘），避免清理后的 pin 文件被 TOFU 重新写回；超时 3 秒

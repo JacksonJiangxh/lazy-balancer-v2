@@ -1,6 +1,6 @@
 package services
 
-// LBH-A-U1 同族（历史，主审裁定并入）：从端应用快照时 TCP 规则的 HTTP
+// 历史修复 同族（历史，主审裁定并入）：从端应用快照时 TCP 规则的 HTTP
 // 专属死配置字段族（host_header/health_check_path/enable_compress/compress_types/
 // request_body_max_size_mb/upstream_keepalive_timeout/server_tokens_hidden）须
 // 随 TLS 归一一并归零——否则死值在从端持久化，「提升为主」（DB 事务不重跑
@@ -38,7 +38,7 @@ func TestInsertSnapshotRules_tcpZeroesHTTPOnlyFieldFamily(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Then：全族字段落库前归零（历史问题 A-N1 TLS 归一的同族扩展）
+	// Then：全族字段落库前归零（历史问题 TLS 归一的同族扩展）
 	var (
 		enableTLS                     bool
 		tlsCert, tlsKey               string

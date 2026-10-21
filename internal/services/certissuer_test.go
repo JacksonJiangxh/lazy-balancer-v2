@@ -68,7 +68,7 @@ func TestCertIssuer_deployIssuedCertificate_keeps_nonterminal_state_when_reload_
 	jobID, ruleID := seedCertificateJob(t, "downloaded")
 	useTemporaryCertDir(t)
 	issuer := NewCertIssuer(func() error { return errors.New("reload failed") })
-	// 历史问题 A-#1 起再调度为异步（go deploymentRetry）——断言必须经 channel 等待
+	// 历史问题 起再调度为异步（go deploymentRetry）——断言必须经 channel 等待
 	// 回调到达，裸读计数器既是顺序竞态也是数据竞态（全量并发下偶发 flake）。
 	retried := make(chan struct{}, 1)
 	issuer.deploymentRetry = func(gotJobID int, got issuedCertificate, _ time.Duration) {
@@ -213,7 +213,7 @@ func TestCertIssuer_deployIssuedCertificate_restores_files_when_job_disabled_bef
 }
 
 func TestCertIssuer_deployIssuedCertificate_skips_rollback_when_cas_loser_files_match_winner(t *testing.T) {
-	// 历史问题 历史问题(b)：并发部署回调（在途回调 × Resume/Unblock 补扫重试）部署同
+	// 历史问题(b)：并发部署回调（在途回调 × Resume/Unblock 补扫重试）部署同
 	// jobID 同一份证书时，双方 WriteCertFiles 内容相同，终态 CAS 先到者提交
 	// issued、后到者进冲突分支——其部署前快照可能早于胜者写入（旧证书），无
 	// 条件恢复会把磁盘回退到旧证书，而 DB='issued'+新 PEM、Caddy 服务新证书，
@@ -265,7 +265,7 @@ func TestCertIssuer_deployIssuedCertificate_skips_rollback_when_cas_loser_files_
 }
 
 func TestCertIssuer_deployIssuedCertificate_restores_when_disk_differs_from_own_material(t *testing.T) {
-	// 历史问题 历史问题(b) 对照：终态 CAS 冲突但磁盘内容与本回调部署的证书不同（并发
+	// 历史问题(b) 对照：终态 CAS 冲突但磁盘内容与本回调部署的证书不同（并发
 	// 新化身写入了另一份证书）时，快照恢复语义必须保持不变——回滚到本回调
 	// 部署前快照并重新重载。
 	// Given
@@ -372,7 +372,7 @@ func TestCertIssuer_Issue_fast_path_returns_reload_error_and_keeps_downloaded(t 
 		t.Fatalf("seed rule CA provider: %v", err)
 	}
 	issuer := NewCertIssuer(func() error { return errors.New("reload failed") })
-	// 历史问题 A-#1 起再调度异步——channel 等待替代裸计数器（消顺序/数据竞态）。
+	// 历史问题 起再调度异步——channel 等待替代裸计数器（消顺序/数据竞态）。
 	retried := make(chan struct{}, 1)
 	issuer.deploymentRetry = func(int, issuedCertificate, time.Duration) { retried <- struct{}{} }
 
@@ -720,7 +720,7 @@ func TestCertIssuer_deploymentFailed_backs_off_then_slowRetriesAtMaxAttempts(t *
 	// Given
 	jobID, ruleID := seedCertificateJob(t, "downloaded")
 	issuer := NewCertIssuer(nil)
-	// 历史问题 A-1：deploymentFailed 的再调度是异步 go deploymentRetry（历史问题 A-#1），
+	// 历史问题：deploymentFailed 的再调度是异步 go deploymentRetry（历史问题），
 	// 回调内裸写切片与 历史问题 已修的两处同型竞态——channel 收集 + 有界等待。
 	type retryCall struct {
 		material issuedCertificate
@@ -1006,7 +1006,7 @@ func TestCertIssuer_deployIssuedCertificate_serializes_rollback_by_rule(t *testi
 	}
 }
 
-// N+11 D1-S1：字符串回退不得把裸 "429" 子串当限流证据——acme/issuer.go:105
+// 历史修复：字符串回退不得把裸 "429" 子串当限流证据——acme/issuer.go:105
 // 把域名嵌进错误文本（"present dns for %s: ..."），429.example.com 这类域名
 // 会被误分类为 CA 限流（waiting_ca 冷却 1-3h 而非 failJob 30min 重试）。
 // 真实 CA 429 由结构化 *acme.Error StatusCode==429 分支覆盖。
@@ -1039,7 +1039,7 @@ func TestDetectRateLimit_string_fallback_ignores_bare_429_substring(t *testing.T
 	}
 }
 
-// CLC历史问题(历史):CA 429 Retry-After 提示分支封顶 3h。
+// 历史问题(历史):CA 429 历史修复 提示分支封顶 3h。
 func TestComputeBackoff_retryAfterClampedTo3h(t *testing.T) {
 	if got := computeBackoff(1, 24*time.Hour); got != 3*time.Hour {
 		t.Fatalf("computeBackoff(1, 24h)=%v, want 3h (clamped)", got)
@@ -1055,7 +1055,7 @@ func TestComputeBackoff_retryAfterClampedTo3h(t *testing.T) {
 	}
 }
 
-// F-SYSR-4（历史）：注释承诺剥「句点或逗号」而 TrimRight 只剥句点
+// 历史修复（历史）：注释承诺剥「句点或逗号」而 TrimRight 只剥句点
 // ——逗号结尾的 "retry after 3600s," 此前落入解析失败被整段丢弃。
 func TestExtractRetryAfterFromError_stripsTrailingCommaAndPeriod(t *testing.T) {
 	if d := extractRetryAfterFromError("rate limited, retry after 3600s,"); d != 3600*time.Second {
@@ -1096,7 +1096,7 @@ func TestDeploymentFailed_writesCertJobLogWithAttemptAndReason(t *testing.T) {
 	}
 }
 
-// 历史问题/历史问题-02 封顶形态：第 10 次部署失败保留可部署态（慢速重试），日志行
+// 历史问题-02 封顶形态：第 10 次部署失败保留可部署态（慢速重试），日志行
 // 同样带 attempt=10/10 与慢速重试说明。
 func TestDeploymentFailed_entersSlowRetryAtMaxAttempts(t *testing.T) {
 	useCertJobLogTestEnv(t, 1<<20)
@@ -1291,7 +1291,7 @@ func TestHandleQueueExecutionError_roleInterruptionDoesNotConsumeRenewalAttempts
 	}
 }
 
-// ---- 历史（SV历史问题）----
+// ---- 历史（历史问题）----
 
 func TestParseRetryAfter_non_positive_seconds_zeroes(t *testing.T) {
 	for _, header := range []string{"-5", "0"} {

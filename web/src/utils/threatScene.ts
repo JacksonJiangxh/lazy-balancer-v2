@@ -18,7 +18,7 @@ import {
 } from '@/utils/threatProjection'
 import { THREAT_COUNTRIES } from '@/utils/worldBorders'
 import { CHINA_PROVINCES } from '@/utils/chinaProvinces'
-import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, adminShortName as sharedShortName, DOT_LAND as SHARED_DOT_LAND, normalizeCountryName, aggregateCountryCounts, POINTY_TOP_HEX_VERTICES, drillCountryAllowed, arcOriginForLocation, hasProvinceStats, drillCommitAllowed, drillClickIntent } from '@/utils/threatShared'
+import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, adminShortName as sharedShortName, DOT_LAND as SHARED_DOT_LAND, normalizeCountryName, aggregateCountryCounts, POINTY_TOP_HEX_VERTICES, drillCountryAllowed, arcOriginForLocation, hasProvinceStats, drillCommitAllowed, drillClickIntent, polysBounds } from '@/utils/threatShared'
 import { COUNTRY_CENTROIDS, FALLBACK_CENTROID, type Centroid } from '@/utils/countryCentroids'
 import { loadAdmin1Tables } from '@/utils/admin1Loader'
 import { FLOW_ATTACK_COLOR as ATTACK_COLOR, FLOW_NORMAL_COLOR as NORMAL_COLOR, FLOW_FLIGHT_MS, flowArcLabel, flowArcTierWidth, type FlowArcTier } from '@/utils/threatTheme'
@@ -47,7 +47,7 @@ const ZOOM_SECONDS = 0.6
 const RIPPLE_POOL = 12
 // 静态层离屏位图宽度上限（物理像素）。总览 zoom 随视口宽度增长（width×2/360），
 // 4K 屏可达 ~14，叠加 DPR 2 后宽度 >1 万物理像素（≈160MB）——超过上限时
-// 按上限分配、由 blit 放大（极端屏轻微软化，换取内存有界；历史 历史问题
+// 按上限分配、由 blit 放大（极端屏轻微软化，换取内存有界；历史问题
 // 明确要求把 dpr 计入本判定）。
 const MAX_STATIC_WIDTH = 4096
 // 绝对热力标尺（log10(命中)/3 → 0..1），砖红三档，首段向底色插值
@@ -117,27 +117,6 @@ function easeOutCubic(t: number): number {
   return 1 - Math.pow(1 - t, 3)
 }
 
-function polysBounds(polys: number[][][]): { minLon: number; maxLon: number; minLat: number; maxLat: number } {
-  let minLon = 180
-  let maxLon = -180
-  let minLat = 90
-  let maxLat = -90
-  for (const poly of polys) {
-    for (const ring of poly) {
-      for (let i = 0; i + 1 < ring.length; i += 2) {
-        const lon = ring[i]
-        const lat = ring[i + 1]
-        if (lon < minLon) minLon = lon
-        if (lon > maxLon) maxLon = lon
-        if (lat < minLat) minLat = lat
-        if (lat > maxLat) maxLat = lat
-      }
-    }
-  }
-  return { minLon, maxLon, minLat, maxLat }
-}
-
-
 function pointInPolys(lon: number, lat: number, polys: number[][][]): boolean {
   return sharedPointInPolys(lon, lat, polys)
 }
@@ -203,7 +182,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
   let hoverScreen: Centroid2D | null = null
   let pendingHover: Centroid2D | null = null
 
-  // A85WB-历史问题：悬停高亮 Path2D 缓存——悬停大国（数千点）每帧重建路径是主线程
+  // 历史修复：悬停高亮 Path2D 缓存——悬停大国（数千点）每帧重建路径是主线程
   // 热点；几何只随 hover 目标/相机/视口尺寸/下钻层变化，同键逐帧复用。
   let worldHoverCache: { key: string; path: Path2D; count: number } | null = null
   let drillHoverCache: { key: string; path: Path2D; count: number } | null = null
@@ -414,7 +393,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
   }
 
   function rebuildStaticLayer(): void {
-    // DPR 计入离屏分配（历史 历史问题）：原按 CSS 像素分配、blit 时放回 CSS
+    // DPR 计入离屏分配（历史问题）：原按 CSS 像素分配、blit 时放回 CSS
     // 尺寸 → Retina 下静态层被 2× 下采样（点阵发虚/边缘糊）。现按
     // zoom×dpr 分配并以同倍率变换绘制，blit 目标仍是 CSS 尺寸（1:1 物理像素）。
     const scale = Math.min(cam.zoom * dpr, MAX_STATIC_WIDTH / WORLD_W)
@@ -477,7 +456,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
     if (staticDirty) rebuildStaticLayer()
   }
 
-  /** 下钻悬浮点高亮（只画命中省的点，数量小；路径按 hover+相机键缓存，A85WB-历史问题）。 */
+  /** 下钻悬浮点高亮（只画命中省的点，数量小；路径按 hover+相机键缓存，历史修复）。 */
   function drawDrillHover(): void {
     if (!hoverName || !provinceDots) return
     const key = hoverCacheKey(hoverName)
@@ -646,7 +625,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
     event.preventDefault()
   }
 
-  // A85WB-历史问题：指针移出画布即清悬停态+浮签（对齐地球引擎 pointerleave 清理）——
+  // 历史修复：指针移出画布即清悬停态+浮签（对齐地球引擎 pointerleave 清理）——
   // 原实现移入右侧 HUD/底部图区后最后国家的提示框与提亮长期残留。
   function onPointerLeave(): void {
     hoverName = null
@@ -677,7 +656,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
     drillDirty = true
   }
 
-  // ---- 省界数据按需加载（历史 历史问题） ----
+  // ---- 省界数据按需加载（历史问题） ----
   // admin1Provinces 是 1.9MB 静态表——顶栏首屏不需要它（仅下钻时消费）。
   // 共享加载器动态 import：Vite 切出独立 chunk，总览首屏零下载；加载失败按
   // 「无省层」降级（不白屏、不进下钻），并经 onProvinceLoadError 让视图 toast。
@@ -710,7 +689,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
   }
 
   let drillSeq = 0
-  // 历史问题-F5：销毁标记——省界 chunk 在途时退出大屏，续体不得再操作已卸载视图
+  // 历史问题：销毁标记——省界 chunk 在途时退出大屏，续体不得再操作已卸载视图
   let disposed = false
 
   async function drillToCountry(country: string): Promise<void> {
@@ -768,7 +747,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
     const fromX = cam.camX
     const toX = fromX + wrapDeg(camX - fromX)
     // 暂停态无动画帧驱动（rafId=0）：直接落点并补绘一帧，否则「复位视角/返回
-    // 世界/下钻」在暂停中静默无反应（历史 历史问题）。
+    // 世界/下钻」在暂停中静默无反应（历史问题）。
     if (paused) {
       applyCamTarget(toX, camY, zoom)
       renderOnce()
@@ -1003,7 +982,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
     if (!hoverName) return
     // 与地球模式统一：不铺半透明多边形，直接把命中该国的点阵提亮（地球是
     // 直接改 hex 颜色）。worldDotsByKey 预索引，悬停国通常数百点。
-    // A85WB-历史问题：路径按 hover+相机键缓存——原每帧全量重建 Path2D，悬停大国时
+    // 历史修复：路径按 hover+相机键缓存——原每帧全量重建 Path2D，悬停大国时
     // CPU 成本随点数线性放大。
     buildWorldDots()
     const dots = worldDotsByKey?.get(hoverName)
@@ -1044,7 +1023,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
     }
   }
 
-  /** 单帧合成（tick 与暂停补绘共用，历史 历史问题）：静态层 + hover +
+  /** 单帧合成（tick 与暂停补绘共用，历史问题）：静态层 + hover +
    *  下钻省层 + 全部动态层（弧线/涟漪/信标/扫掠/浮签）。暂停帧传 delta=0：
    *  画面元素在位但动画不推进——原 renderOnce 只画静态层+浮签，暂停后弧线/
    *  信标/扫掠整层消失。 */
@@ -1119,7 +1098,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
           if (pointInPolys(geo.lon, geo.lat, pv.polys)) {
             hoverName = pv.name
             const short = shortName(pv.name)
-            // WT87-11：省级统计只覆盖中国（后端 threatLocationParts 仅对中国
+            // 历史修复：省级统计只覆盖中国（后端 threatLocationParts 仅对中国
             // 取省）；海外下钻不得把「无数据源」渲染成「该省 0 次攻击」。
             hoverTip.textContent = hasProvinceStats(drillLayerCountry)
               ? `${short} ${provinceCounts.get(short) ?? provinceCounts.get(pv.name) ?? 0}`
@@ -1205,7 +1184,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
     // 否则每次回调都全量重绘静态层（用户实测地图刚打开卡顿）。
     if (sizeChanged || cam.zoom !== prevZoom) staticDirty = true
     // 暂停态无 tick 驱动：尺寸变化后必须补绘一帧，否则画布是新尺寸的空白
-    // （历史 历史问题）。
+    // （历史问题）。
     if (paused) renderOnce()
   }
   const resizeObserver = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(applySize) : null
@@ -1232,7 +1211,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
       startLoop()
     },
     setCountries(entries: CountryHeat[]): void {
-      // 30s 轮询同数据不得触发整幅静态层重建（历史 历史问题）：长度+逐键
+      // 30s 轮询同数据不得触发整幅静态层重建（历史问题）：长度+逐键
       // 浅比较，无变化直接返回（原恒 staticDirty=true → 每轮全量栅格化）。
       const nextCounts = aggregateCountryCounts(entries)
       if (heatEntriesEqual(countryCounts, [...nextCounts].map(([name, count]) => ({ name, count })))) return
@@ -1302,7 +1281,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
       }
     },
     dispose(): void {
-      // 历史问题-F5：作废在途下钻（drillToCountry 的 await 后继体检查 disposed）
+      // 历史问题：作废在途下钻（drillToCountry 的 await 后继体检查 disposed）
       disposed = true
       drillSeq += 1
       cancelAnimationFrame(rafId)

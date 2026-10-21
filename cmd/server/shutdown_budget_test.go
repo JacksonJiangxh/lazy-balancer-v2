@@ -1,10 +1,10 @@
 package main
 
-// 历史修复 历史修复 / 历史修复 钉测试：
-//   - P2-1：关停总预算超出 compose stop_grace_period（HTTP≤10s + drainCaddy≤2s
+// 关停预算与信号注册窗口钉测试：
+//   - 关停总预算超出 compose stop_grace_period（HTTP≤10s + drainCaddy≤2s
 //     + engine.Stop 30s + StopACME 无界 <-done）。Go 侧单一预算 + 各段派生，
 //     最坏路径必须 ≤ grace；StopACME 的 <-done 必须有界。
-//   - P3-4：signal.Notify 注册晚于 BootSync——启动窗口内 SIGTERM 走默认动作
+//   - signal.Notify 注册晚于 BootSync——启动窗口内 SIGTERM 走默认动作
 //     立即退出。注册前置后，窗口内到达的信号必须在监听前被识别并走正常关停。
 
 import (
@@ -25,7 +25,8 @@ import (
 const composeStopGracePeriod = 30 * time.Second
 
 // Given 关停预算（fake clock）。
-// When 按真实顺序消耗各段（HTTP → Caddy 排水 → 引擎排空 → ACME 收尾）。
+// When 按真实顺序消耗各段（HTTP → Caddy 排水 → 引擎排空 → metrics/时区/
+// 日志轮转等待 → ACME 收尾）。
 // Then 各段钳制正确、总和 ≤ processShutdownBudget（且 < compose grace）。
 func TestShutdownBudgetWorstCaseFitsComposeGrace(t *testing.T) {
 	if processShutdownBudget >= composeStopGracePeriod {
@@ -40,6 +41,12 @@ func TestShutdownBudgetWorstCaseFitsComposeGrace(t *testing.T) {
 	now = now.Add(caddySeg)
 	engineSeg := b.engineDrain()
 	now = now.Add(engineSeg)
+	metricsSeg := b.segment(metricsStopSegmentMax)
+	now = now.Add(metricsSeg)
+	tzSeg := b.segment(tzStopSegmentMax)
+	now = now.Add(tzSeg)
+	logRotateSeg := b.segment(logRotateStopSegmentMax)
+	now = now.Add(logRotateSeg)
 	acmeSeg := b.segment(acmeStopSegmentMax)
 	now = now.Add(acmeSeg)
 
@@ -49,14 +56,24 @@ func TestShutdownBudgetWorstCaseFitsComposeGrace(t *testing.T) {
 	if caddySeg != caddyDrainSegmentMax {
 		t.Fatalf("Caddy 排水段=%s, want %s", caddySeg, caddyDrainSegmentMax)
 	}
-	wantEngine := processShutdownBudget - httpShutdownSegmentMax - caddyDrainSegmentMax - acmeStopSegmentMax
+	trailingReserve := metricsStopSegmentMax + tzStopSegmentMax + logRotateStopSegmentMax + acmeStopSegmentMax
+	wantEngine := processShutdownBudget - httpShutdownSegmentMax - caddyDrainSegmentMax - trailingReserve
 	if engineSeg != wantEngine {
-		t.Fatalf("引擎排空=剩余−ACME 预留=%s, got %s", wantEngine, engineSeg)
+		t.Fatalf("引擎排空=剩余−收尾段预留=%s, got %s", wantEngine, engineSeg)
+	}
+	if metricsSeg != metricsStopSegmentMax {
+		t.Fatalf("metrics 等待段=%s, want %s", metricsSeg, metricsStopSegmentMax)
+	}
+	if tzSeg != tzStopSegmentMax {
+		t.Fatalf("时区刷新等待段=%s, want %s", tzSeg, tzStopSegmentMax)
+	}
+	if logRotateSeg != logRotateStopSegmentMax {
+		t.Fatalf("日志轮转等待段=%s, want %s", logRotateSeg, logRotateStopSegmentMax)
 	}
 	if acmeSeg != acmeStopSegmentMax {
 		t.Fatalf("ACME 段=%s, want %s", acmeSeg, acmeStopSegmentMax)
 	}
-	total := httpSeg + caddySeg + engineSeg + acmeSeg
+	total := httpSeg + caddySeg + engineSeg + metricsSeg + tzSeg + logRotateSeg + acmeSeg
 	if total > processShutdownBudget {
 		t.Fatalf("最坏路径总和 %s 超出总预算 %s", total, processShutdownBudget)
 	}
@@ -167,6 +184,39 @@ func TestRuntimeLifecycle_ShutdownWithTimeoutBoundsStuckWorker(t *testing.T) {
 	lifecycle.ShutdownWithTimeout(50 * time.Millisecond)
 	if buf.Len() != before {
 		t.Fatal("第二次 Shutdown 不得重复记录超时日志")
+	}
+}
+
+// Given 一个永不关闭的通道（可控挂起的 metrics 采集循环形态——collect 阻塞
+// 在 http.Client 10s / DB busy_timeout 30s 时 <-metricsDone 的旧形态）。
+// When awaitChannelWithin 以 50ms 上限等待。
+// Then 按预算放弃等待返回 false；预算耗尽（d<=0）立即放弃不阻塞。
+func TestAwaitChannelWithin_givesUpWhenNeverClosed(t *testing.T) {
+	never := make(chan struct{})
+	begin := time.Now()
+	if awaitChannelWithin("测试 worker", never, 50*time.Millisecond) {
+		t.Fatal("通道未关闭必须返回 false（放弃等待）")
+	}
+	if elapsed := time.Since(begin); elapsed > 2*time.Second {
+		t.Fatalf("等待未受预算约束：耗时 %s（预算 50ms）", elapsed)
+	}
+	if awaitChannelWithin("测试 worker", never, 0) {
+		t.Fatal("预算耗尽必须立即放弃等待")
+	}
+}
+
+// Given 已关闭的通道（worker 正常退出形态）。
+// When awaitChannelWithin 以充裕预算等待。
+// Then 立即返回 true——正常路径不等满预算。
+func TestAwaitChannelWithin_fastPathWhenClosed(t *testing.T) {
+	closed := make(chan struct{})
+	close(closed)
+	begin := time.Now()
+	if !awaitChannelWithin("测试 worker", closed, time.Hour) {
+		t.Fatal("通道已关闭必须返回 true")
+	}
+	if elapsed := time.Since(begin); elapsed > time.Second {
+		t.Fatalf("正常路径耗时 %s，不得空等预算", elapsed)
 	}
 }
 

@@ -29,7 +29,7 @@ func nextQuarantinePath(path string) string {
 	for i := 1; ; i++ {
 		candidate := base
 		if i > 1 {
-			// CORE-F1（历史）：后缀从 -1 起（i-1）——旧式 i 使序号
+			// 历史修复（历史）：后缀从 -1 起（i-1）——旧式 i 使序号
 			// 跳号（base→base-2，base-1 永不生成）。
 			candidate = fmt.Sprintf("%s-%d", base, i-1)
 		}
@@ -37,7 +37,7 @@ func nextQuarantinePath(path string) string {
 			return candidate
 		} else if err != nil {
 			// 持久 Stat 错误（父路径 ENOTDIR/EACCES 等）——记日志返回现值，
-			// 不得无界自旋（历史问题 CORE-F1）。后续 Rename 失败由调用方处理。
+			// 不得无界自旋（历史问题）。后续 Rename 失败由调用方处理。
 			log.Printf("nextQuarantinePath: stat %s: %v（返回现值候选路径）", candidate, err)
 			return candidate
 		}
@@ -302,7 +302,7 @@ func openAndPingMetricsDB(dbPath string) (*sql.DB, error) {
 
 func initMetricsSchema(db *sql.DB) error {
 
-	// idx_metrics_rule 与 idx_metrics_rule_timestamp 左前缀重叠（审计 C 组清理），
+	// idx_metrics_rule 与 idx_metrics_rule_timestamp 左前缀重叠（历史清理），
 	// schema 内以 DROP INDEX IF EXISTS 一次性回收存量库上的冗余索引。
 	schema := `
 	CREATE TABLE IF NOT EXISTS metrics_history (
@@ -368,7 +368,7 @@ func initMetricsSchema(db *sql.DB) error {
 		PRIMARY KEY (minute, country, province, family, rule, action)
 	) WITHOUT ROWID;
 
-	-- 历史 历史问题：被攻击目标（rule_caddy_id）分钟 rollup——与主 rollup
+	-- 历史问题：被攻击目标（rule_caddy_id）分钟 rollup——与主 rollup
 	-- 同批写入，使「TOP 被攻击站点」与总量/国家等卡片同窗口，不再依赖原始表
 	-- （原始表受保留期/行帽裁剪；主 rollup 主键无法承载该维度）。
 	CREATE TABLE IF NOT EXISTS security_event_target_rollup (
@@ -383,7 +383,7 @@ func initMetricsSchema(db *sql.DB) error {
 	-- 由本语句在每次初始化时幂等回收。
 	DROP INDEX IF EXISTS idx_security_event_target_rollup_minute;
 
-	-- 指标库通用状态表（历史 历史问题）：rollup 固化水位等持久元数据。
+	-- 指标库通用状态表（历史问题）：rollup 固化水位等持久元数据。
 	-- 键值单行形态，水位与分钟数据同事务提交——不再以数据行 MAX(minute)
 	-- 反推水位（空分钟不产行，MAX 水位会让空分钟永不推进）。
 	CREATE TABLE IF NOT EXISTS metrics_state (
@@ -396,7 +396,7 @@ func initMetricsSchema(db *sql.DB) error {
 		return fmt.Errorf("failed to initialize metrics database schema: %w", err)
 	}
 	// 幂等迁移：为既有指标库补齐 security_events 缺列（全新库由上面的建表语句
-	// 直接带出全部列）。CORE-R2（历史）：原四个逐字相同的「pragma 查列→缺则
+	// 直接带出全部列）。历史修复（历史）：原四个逐字相同的「pragma 查列→缺则
 	// ADD COLUMN」函数（migrateSecurityEventsTransactionID/RequestContext/
 	// Duration/PrecheckUs）收敛为单一登记点 migrateSecurityEventsColumns。
 	if err := migrateSecurityEventsColumns(db); err != nil {
@@ -404,7 +404,7 @@ func initMetricsSchema(db *sql.DB) error {
 	}
 	// transaction_id 的幂等唯一部分索引（WHERE != ''）让重复事务写入被
 	// OR IGNORE 静默去重，同时保留历史遗留空 transaction_id 行不受唯一约束影响。
-	// 存量重复行：启动期去重（保留每事务最早行）后照常建索引（历史修复 历史问题，
+	// 存量重复行：启动期去重（保留每事务最早行）后照常建索引（历史问题，
 	// 台账裁定：去重后再建索引，不靠跳过——跳过会让 offset 重建/轮转补采把
 	// 重复事件重新入库并重复喂 autoban/rollup）。
 	if err := ensureSecurityEventsTransactionIndex(db); err != nil {
@@ -417,7 +417,7 @@ func initMetricsSchema(db *sql.DB) error {
 }
 
 // ensureSecurityEventsTransactionIndex 在建立唯一部分索引前检查存量重复事务。
-// 历史修复 历史问题：发现重复时不再 WARN+跳过（跳过期间 INSERT OR IGNORE 失去
+// 历史问题：发现重复时不再 WARN+跳过（跳过期间 INSERT OR IGNORE 失去
 // 唯一约束兜底，offset 重建/轮转补采会把重复事件重新入库并重复喂
 // autoban/rollup）——改为启动期一次性去重：每个非空 transaction_id 保留
 // 最早行（MIN(id)，即首次摄取的事件），删除其余重复行后照常建索引，摄取
@@ -531,7 +531,7 @@ func migrateMetricsHistoryBlocked(db *sql.DB) error {
 	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON metrics_history(timestamp)"); err != nil {
 		return fmt.Errorf("failed to recreate metrics_history index: %w", err)
 	}
-	// 历史问题/SysRender29-F2(历史):DROP 重建丢失
+	// 历史问题(历史):DROP 重建丢失
 	// idx_metrics_rule_timestamp(原 schema 块在旧表建,重建后消失)——
 	// 重建后至重启前历史查询全表扫描。同步重建。
 	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS idx_metrics_rule_timestamp ON metrics_history(rule_id, timestamp)"); err != nil {
@@ -542,8 +542,8 @@ func migrateMetricsHistoryBlocked(db *sql.DB) error {
 
 // cleanupMetricsHistoryBatch 是历史清理的单批删除行数：镜像姊妹实现
 // securityEventsRetentionDeleteBatch（internal/services/securityevents_retention.go）
-// 的 历史问题 F9 教训——大批量单语句 DELETE 长时间持指标库写锁，阻塞摄取 tick。
-// 同库同故障形态，同口径分批（D3-F1）。做成 var 以便测试收缩批次观察多批行为。
+// 的 历史问题 教训——大批量单语句 DELETE 长时间持指标库写锁，阻塞摄取 tick。
+// 同库同故障形态，同口径分批（历史修复）。做成 var 以便测试收缩批次观察多批行为。
 var cleanupMetricsHistoryBatch = 5000
 
 // CleanupMetricsHistory 按 retentionDays 分批删除过期的 metrics_history 行。
@@ -566,7 +566,7 @@ func CleanupMetricsHistory(retentionDays int) error {
 		if affected == 0 {
 			return nil
 		}
-		// 批间短暂让出写锁，避免长时间阻塞摄取 INSERT（历史问题 F9，与
+		// 批间短暂让出写锁，避免长时间阻塞摄取 INSERT（历史问题，与
 		// securityEventsRetentionCleanup 同口径）。
 		time.Sleep(10 * time.Millisecond)
 	}

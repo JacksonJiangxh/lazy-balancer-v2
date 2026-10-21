@@ -94,7 +94,7 @@ func TestStore_MatchingValue_includes_legacy_entries_best_effort(t *testing.T) {
 		t.Fatalf("matching value: %v", err)
 	}
 
-	// Then: the legacy entry (empty value) is included 历史修复; the live
+	// Then: the legacy entry (empty value) is included best-effort; the live
 	// beta record is not
 	if len(matching) != 1 {
 		t.Fatalf("matching=%v, want legacy entry only", matching)
@@ -164,7 +164,7 @@ func TestStore_MatchingValue_empty_value_falls_back_to_name_match(t *testing.T) 
 		t.Fatalf("matching value: %v", err)
 	}
 
-	// Then: legacy 历史修复 semantics return both
+	// Then: legacy name-based semantics return both
 	if len(matching) != 2 {
 		t.Fatalf("matching=%v, want both records", matching)
 	}
@@ -296,7 +296,7 @@ func TestStore_quarantines_unsupported_version_state_file(t *testing.T) {
 		t.Fatalf("add after version mismatch: %v", err)
 	}
 
-	// Then: the 历史修复 file was quarantined, not silently reset
+	// Then: the future-version file was quarantined, not silently reset
 	quarantined, err := filepath.Glob(store.path + ".corrupt-*")
 	if err != nil {
 		t.Fatalf("glob quarantined files: %v", err)
@@ -350,7 +350,7 @@ func TestStore_quarantineKeepsDistinctSamplesOnClockCollision(t *testing.T) {
 func TestStore_concurrent_stores_mixed_operations(t *testing.T) {
 	// Given: two Store instances over the same file (writer plus a
 	// restarted reader) and concurrent goroutines mixing Add / Remove /
-	// MatchingValue; the 历史修复 fileMu must serialize every access
+	// MatchingValue; the package-level fileMu must serialize every access
 	dir := t.TempDir()
 	storeA, err := New(dir)
 	if err != nil {
@@ -387,7 +387,7 @@ func TestStore_concurrent_stores_mixed_operations(t *testing.T) {
 					return
 				}
 				if i%2 == 0 {
-					// Remove must receive the 历史修复 record (as
+					// Remove must receive the disk-round-tripped record (as
 					// the providers do via MatchingValue): the local struct's
 					// CreatedAt keeps nanosecond precision and would not
 					// compare equal after the JSON round trip
@@ -416,7 +416,7 @@ func TestStore_concurrent_stores_mixed_operations(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Then: the final file decodes and holds exactly the 历史修复
+	// Then: the final file decodes and holds exactly the never-removed
 	// records — odd iterations of every goroutine, each exactly once
 	records := readStoreRecords(t, storeA)
 	got := make(map[string]int, len(records))
@@ -441,7 +441,7 @@ func TestStore_concurrent_stores_mixed_operations(t *testing.T) {
 
 // 历史问题（历史）：Remove 的相等判定必须按语义（CreatedAt.Equal）——
 // Record 内联 == 比较含 time.Time 的表示细节（monotonic 位、loc 指针），
-// 语义相同的记录被判不等 → Remove 静默 历史修复，记录永久残留两种真实形态：
+// 语义相同的记录被判不等 → Remove 静默 no-op，记录永久残留两种真实形态：
 //  1. 调用方持有写入时的原值（time.Now() 带 monotonic）与文件读回值比较；
 //  2. 文件记录时区与当前进程 Local 不同（时区设置变更后重启）——两侧各
 //     解析出独立 FixedZone 指针。
@@ -465,7 +465,7 @@ func TestStore_Remove_semantic_match_after_reload(t *testing.T) {
 			if err := store.Remove(record); err != nil {
 				t.Fatalf("remove: %v", err)
 			}
-			// Then：语义相等的记录必须被删除（旧内联 == 比较 历史修复 残留）。
+			// Then：语义相等的记录必须被删除（旧内联 == 比较 no-op 残留）。
 			if records := readStoreRecords(t, store); len(records) != 0 {
 				t.Fatalf("语义相等的记录未被删除（Remove no-op）：%+v", records)
 			}

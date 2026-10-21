@@ -46,7 +46,7 @@ type issuedCertificate struct {
 var deploymentLifecycleJobStatuses = []string{"downloaded", "cleanup_dns", "cleanup_warning"}
 
 // deploymentLifecycleJobStatusSQL 供 SQL IN (...) 复用，避免状态集新增时
-// 多处字面量分叉（历史 D2-历史问题）。
+// 多处字面量分叉（历史）。
 const deploymentLifecycleJobStatusSQL = "'downloaded','cleanup_dns','cleanup_warning'"
 
 type certificateDeploymentError struct {
@@ -87,7 +87,7 @@ func (e *CAProviderRateLimitError) Error() string {
 	return fmt.Sprintf("CA rate limited (429), retry after %v: %s", e.RetryAfter, e.Reason)
 }
 
-// parseRetryAfter parses an HTTP Retry-After header value into a duration.
+// parseRetryAfter parses an HTTP 历史修复 header value into a duration.
 //
 // 历史问题（历史）：本函数与 internal/dnsprovider/internal/retry.After 是
 // 同语义双实现（包边界所致：dnsprovider/internal 不可被 services 导入）。
@@ -98,7 +98,7 @@ func parseRetryAfter(header string) time.Duration {
 		return 0
 	}
 	if seconds, err := strconv.Atoi(header); err == nil {
-		// SV历史问题：非正值显式归零（此前 "-5" 返回 -5s，仅靠下游 >0 判断
+		// 历史问题：非正值显式归零（此前 "-5" 返回 -5s，仅靠下游 >0 判断
 		// 才无害）——与 dnsprovider/retry.After 及本条契约注释同口径。
 		if seconds <= 0 {
 			return 0
@@ -113,8 +113,8 @@ func parseRetryAfter(header string) time.Duration {
 	return 0
 }
 
-// computeBackoff returns the cooling duration based on attempt count and CA Retry-After.
-// CLC历史问题(历史):CA 提示分支与自有阶梯同封顶 3h——超大 Retry-After
+// computeBackoff returns the cooling duration based on attempt count and CA 历史修复.
+// 历史问题(历史):CA 提示分支与自有阶梯同封顶 3h——超大 历史修复
 // 提示值不再令冷却期越过证书过期点(attempts 停 1,maxAttempts 升级兜底
 // 永不触发的形态闭合)。
 func computeBackoff(attempts int, retryAfter time.Duration) time.Duration {
@@ -134,6 +134,10 @@ func computeBackoff(attempts int, retryAfter time.Duration) time.Duration {
 
 // NewCertIssuer creates a new CertIssuer. The reloader is called after a
 // certificate is successfully issued so Caddy picks up the new cert.
+// reloader 契约：全部调用点都在部署临界区内、已持
+// CaddyOpLock（锁序 CaddyOpLock → DeployLock）——必须注入 InLock 变体
+// （生产=GenerateAndApplyConfigForceInLock，cmd/server/main.go）；注入自取
+// CaddyOpLock 的 Force 变体即重入死锁（非可重入锁）。nil=跳过重载。
 func NewCertIssuer(reloader func() error, dataDir ...string) *CertIssuer {
 	issuer := &CertIssuer{caddyReloader: reloader, deploymentRetry: scheduleCertificateDeploymentRetry}
 	if len(dataDir) > 0 {
@@ -211,7 +215,7 @@ func rescanDroppedCertificateDeploymentRetries() {
 // is running and reporting it as "stopped" would misdiagnose the condition.
 var ErrCertificateDeploymentRetryBusy = errors.New("证书部署重试回调仍在退出中")
 
-// RetryCertificateDeploymentNow 手动重试入口（历史问题 历史）：把 downloaded
+// RetryCertificateDeploymentNow 手动重试入口（历史问题）：把 downloaded
 // 任务的部署重试立即重排（取消挂起的退避 timer 并在当前时刻执行一次部署）。
 // 返回 nil 表示 timer 已登记；服务停止返回 ErrCertificateQueueInactive，旧回调
 // 未退出返回 ErrCertificateDeploymentRetryBusy。deployment_available_after
@@ -260,7 +264,7 @@ func retryCertificateDeployment(ctx context.Context, jobID int, reloader func() 
 
 func (s *CertIssuer) deploymentFailed(jobID int, material issuedCertificate, message string, err error) error {
 	var previousAttempt int
-	// 历史 历史问题: 使用 QueryRowContext 以响应 worker 取消信号（此处函数无 ctx，用 Background 兜底）。
+	// 历史问题: 使用 QueryRowContext 以响应 worker 取消信号（此处函数无 ctx，用 Background 兜底）。
 	if queryErr := db.DB.QueryRowContext(context.Background(), "SELECT COALESCE(deployment_attempts,0) FROM cert_jobs WHERE id=? AND status IN ('issued','downloaded','cleanup_dns','cleanup_warning')", jobID).Scan(&previousAttempt); queryErr != nil {
 		return &certificateDeploymentError{err: errors.Join(err, queryErr)}
 	}
@@ -312,8 +316,8 @@ func (s *CertIssuer) deploymentFailed(jobID int, material issuedCertificate, mes
 	}
 	if updateErr == nil && s.deploymentRetry != nil {
 		material.deploymentAttempt = attempt
-		// 历史问题 A-#1：异步再调度。此处常在部署回调 goroutine 内被同步调用——
-		// 若同步进入 scheduleDeploymentRetry，会命中 历史问题 历史问题(a) 的在途回调
+		// 历史问题：异步再调度。此处常在部署回调 goroutine 内被同步调用——
+		// 若同步进入 scheduleDeploymentRetry，会命中 历史问题(a) 的在途回调
 		// 等待分支，等待对象恰是自己（done 只在本回调的 defer 关闭）→ 同
 		// goroutine 自锁，重试链永久断裂并毒化 Resume/导入/启动恢复。起独立
 		// goroutine 后等待变为跨 goroutine（回调返回即 done 关闭），「同
@@ -378,15 +382,15 @@ func (s *CertIssuer) Issue(ctx context.Context, jobID int, ruleID, domains strin
 	var deploymentAttempt int
 	var ruleEnabled bool
 	var ruleProviderID int
-	// 历史 历史问题: 使用 QueryRowContext 以响应 worker 取消信号。
+	// 历史问题: 使用 QueryRowContext 以响应 worker 取消信号。
 	if err := db.DB.QueryRowContext(ctx, `SELECT j.status, COALESCE(j.ca_provider_id,0), COALESCE(j.deployment_attempts,0), COALESCE(r.enabled,0), COALESCE(r.ca_provider_id,0)
 		FROM cert_jobs j LEFT JOIN lb_rules r ON r.caddy_id = j.rule_id WHERE j.id = ?`, jobID).
 		Scan(&jobStatus, &jobProviderID, &deploymentAttempt, &ruleEnabled, &ruleProviderID); err == nil &&
 		(jobStatus == "issued" || jobStatus == "downloaded") && ruleEnabled {
 		var existingCert, existingKey string
-		// 历史 历史问题: 历史 误用 context.Background()，Issue 函数本身有 ctx 参数。
+		// 历史问题: 历史 误用 context.Background()，Issue 函数本身有 ctx 参数。
 		if err := db.DB.QueryRowContext(ctx, "SELECT COALESCE(cert_pem,''), COALESCE(key_pem,'') FROM cert_jobs WHERE id=?", jobID).Scan(&existingCert, &existingKey); err == nil && existingCert != "" && existingKey != "" {
-			// CERT42-5 告警 + C2 非正回退语义收敛于 GetCertRenewalDays（历史问题-2）。
+			// 历史修复 告警 + 历史修复 非正回退语义收敛于 GetCertRenewalDays（历史问题-2）。
 			renewalDays := GetCertRenewalDays()
 			if notAfter, perr := parseCertNotAfter(existingCert); perr == nil && time.Until(notAfter) > time.Duration(renewalDays)*24*time.Hour {
 				// 规则 ca_provider_id=0（跟随默认）时不能拿 0 与任务中已解析的具体
@@ -395,8 +399,20 @@ func (s *CertIssuer) Issue(ctx context.Context, jobID int, ruleID, domains strin
 				resolvedRuleProvider, resolveErr := ResolveCAProviderID(ruleProviderID)
 				if resolveErr == nil && resolvedRuleProvider == jobProviderID {
 					material := issuedCertificate{ruleID: ruleID, certPEM: existingCert, keyPEM: existingKey, notAfter: notAfter, providerID: jobProviderID, deploymentAttempt: deploymentAttempt}
+					// 锁序：CaddyOpLock → DeployLock。恢复链
+					//（UpdateRule/EnableRule 补偿全程持 caddyOpMu=CaddyOpLock →
+					// RestoreCertJobsForRule 取 DeployLock）按此序持锁；旧序
+					// DeployLock→（reloader 内）CaddyOpLock 与其双向互等成 AB-BA。
+					// 本临界区内的重载回调以 InLock 语义调用——生产注入
+					// GenerateAndApplyConfigForceInLock（cmd/server/main.go），自取
+					// CaddyOpLock 的 Force 变体会重入死锁（非可重入锁）；持锁期间
+					// 禁止再新增 CaddyOpLock 获取点。
+					CaddyOpLock.Lock()
 					unlock := DeployLock(ruleID)
-					defer unlock()
+					defer func() {
+						unlock()
+						CaddyOpLock.Unlock()
+					}()
 					if err := confirmCertificateDeployment(ctx, jobID, material, true); err != nil {
 						return err
 					}
@@ -438,7 +454,7 @@ func (s *CertIssuer) Issue(ctx context.Context, jobID int, ruleID, domains strin
 					}
 					if s.caddyReloader != nil {
 						err := s.caddyReloader()
-						// 2026-09-07 裁定 C1：fast-path 重载与主路径（:536/:539）统一留痕。
+						// 2026-09-07 裁定 历史修复：fast-path 重载与主路径（:536/:539）统一留痕。
 						s.auditFastPathReload(jobID, material, err)
 						if err != nil {
 							return s.deploymentFailed(jobID, material, "重新部署后重载 Caddy 失败: "+err.Error(), fmt.Errorf("reload Caddy after certificate redeploy: %w", err))
@@ -447,8 +463,8 @@ func (s *CertIssuer) Issue(ctx context.Context, jobID int, ruleID, domains strin
 					if err := ctx.Err(); err != nil {
 						return errors.Join(err, restoreCertificateDeployment(snapshot, s.caddyReloader))
 					}
-					// 历史问题 三十次 F5（cluster 审计 F-N1，窄场景：运维手改证书文件或
-					// 历史问题 历史问题(b) 并发新化身分叉残留）：job 状态 "issued" + 磁盘不匹配
+					// 历史问题（cluster 审计 历史修复，窄场景：运维手改证书文件或
+					// 历史问题(b) 并发新化身分叉残留）：job 状态 "issued" + 磁盘不匹配
 					// 的快速路径走到这里时，finalize 的 from-set 必须含 "issued"——
 					// 否则 transitionJob CAS 失败 → errors.Join 恢复 → 磁盘回滚到
 					// 不匹配状态 → 自愈路径断裂（job 保持 issued、磁盘永远错）。
@@ -467,7 +483,7 @@ func (s *CertIssuer) Issue(ctx context.Context, jobID int, ruleID, domains strin
 		}
 	}
 
-	// Pre-flight check: verify the CA provider is reachable before starting the
+	// 历史修复 check: verify the CA provider is reachable before starting the
 	// real issuance flow. If the CA is down (e.g. ZeroSSL 504), fail fast and
 	// let the retry scheduler handle the next attempt.
 	// AutoProvisionZeroSSLEAB updates provider.Credentials in-memory so the
@@ -510,7 +526,7 @@ func (s *CertIssuer) Issue(ctx context.Context, jobID int, ruleID, domains strin
 
 	// Resolve ACME config for the rule.
 	var acmeConfigID int
-	// 历史 历史问题: 使用 QueryRowContext 以响应 worker 取消信号。
+	// 历史问题: 使用 QueryRowContext 以响应 worker 取消信号。
 	err := db.DB.QueryRowContext(ctx, "SELECT COALESCE(acme_config_id,0) FROM lb_rules WHERE caddy_id=?", ruleID).Scan(&acmeConfigID)
 	if err != nil {
 		failJob(jobID, "读取规则 ACME 配置失败")
@@ -584,7 +600,7 @@ func (s *CertIssuer) Issue(ctx context.Context, jobID int, ruleID, domains strin
 		failJob(jobID, err.Error())
 		return err
 	}
-	// 历史 历史问题: 区分 DB 错误与角色变化，避免误报"节点切换为从节点"。
+	// 历史问题: 区分 DB 错误与角色变化，避免误报"节点切换为从节点"。
 	if err := checkCertificateIssuanceRole(ctx); err != nil {
 		return err
 	}
@@ -601,8 +617,16 @@ func (s *CertIssuer) Issue(ctx context.Context, jobID int, ruleID, domains strin
 }
 
 func (s *CertIssuer) deployIssuedCertificate(ctx context.Context, jobID int, material issuedCertificate) error {
+	// 锁序：CaddyOpLock → DeployLock，与恢复链（持
+	// caddyOpMu 的补偿路径 → RestoreCertJobsForRule）同序，消除
+	// DeployLock→CaddyOpLock 旧序的 AB-BA 互等。s.caddyReloader 为 InLock
+	// 语义（本临界区已持 CaddyOpLock），见 NewCertIssuer 契约。
+	CaddyOpLock.Lock()
 	unlock := DeployLock(material.ruleID)
-	defer unlock()
+	defer func() {
+		unlock()
+		CaddyOpLock.Unlock()
+	}()
 	if err := confirmCertificateDeployment(ctx, jobID, material, false); err != nil {
 		// 历史问题(历史):ErrNoRows(规则删除/禁用/角色翻转)保持 raw
 		// ——材料已无意义,重试无益;其余(瞬时 DB)走 deploymentFailed 重试链,
@@ -659,7 +683,7 @@ func (s *CertIssuer) deployIssuedCertificate(ctx context.Context, jobID int, mat
 
 	tx, err := db.DB.BeginTx(ctx, nil)
 	if err != nil {
-		// 审计 M10：终段 DB 失败（如 SQLITE_BUSY）与文件写入失败同走
+		// 历史修复：终段 DB 失败（如 SQLITE_BUSY）与文件写入失败同走
 		// deploymentFailed 重试链（任务回 'downloaded'+退避，兼容 30s 部署
 		// 补扫）。已写入的证书文件就是本次部署目标，重试会重新快照并收敛，
 		// 回滚旧快照只会让首签发场景在重试成功前无证书可用。
@@ -679,7 +703,7 @@ func (s *CertIssuer) deployIssuedCertificate(ctx context.Context, jobID int, mat
 	}
 	if err != nil {
 		rollbackErr := tx.Rollback()
-		// 历史问题 历史问题(b)：并发部署回调（在途回调 × 补扫重试）部署同 jobID 同一份
+		// 历史问题(b)：并发部署回调（在途回调 × 补扫重试）部署同 jobID 同一份
 		// 证书时，CAS 败者的部署前快照可能早于胜者写入——无条件恢复会把磁盘
 		// 回退到旧证书，与 DB('issued'+新 PEM)/Caddy 三方静默分叉，且
 		// reconcileMissingCertFiles 不比对内容，分叉持续到下次续签。终态 CAS
@@ -696,7 +720,7 @@ func (s *CertIssuer) deployIssuedCertificate(ctx context.Context, jobID int, mat
 			failJob(jobID, "证书部署确认失败: "+err.Error())
 			return errors.Join(fmt.Errorf("finalize issued certificate: %w", err), rollbackErr, cleanupErr)
 		}
-		// 审计 M10：真实 DB 失败（transition/提交出错，如 SQLITE_BUSY）不得走
+		// 历史修复：真实 DB 失败（transition/提交出错，如 SQLITE_BUSY）不得走
 		// 上面的 failJob——会把已签发落库证书搁浅为 failed，rescan 只扫
 		// downloaded、续期只扫临期，自动恢复通道全部错过（首签发无证书最长
 		// ~60 天，手动重试整轮重签烧配额）。改走与文件写入失败相同的
@@ -708,7 +732,7 @@ func (s *CertIssuer) deployIssuedCertificate(ctx context.Context, jobID int, mat
 
 // deploymentCommittedByConcurrentWinner 报告终态 CAS 冲突是否源于并发部署回调
 // 已提交同一份证书：任务状态已推进到终态 issued 且磁盘证书内容与本次部署材料
-// 一致。仅用于冲突分支的恢复快照跳过判定（历史问题 历史问题(b) 纵深防御）。
+// 一致。仅用于冲突分支的恢复快照跳过判定（历史问题(b) 纵深防御）。
 func deploymentCommittedByConcurrentWinner(jobID int, material issuedCertificate) bool {
 	var status string
 	if err := db.DB.QueryRow("SELECT status FROM cert_jobs WHERE id=?", jobID).Scan(&status); err != nil || status != "issued" {
@@ -763,7 +787,7 @@ func restoreCertificateDeployment(snapshot CertFilesSnapshot, reloader func() er
 	}
 	if reloader != nil {
 		err := reloader()
-		// 2026-09-07 裁定 C1：回滚重载同口径留痕（成功回滚=DB 态重渲染；失败=旧配置保留）。
+		// 2026-09-07 裁定 历史修复：回滚重载同口径留痕（成功回滚=DB 态重渲染；失败=旧配置保留）。
 		recordSystemReloadAudit("certificate_issued", err)
 		if err != nil {
 			return fmt.Errorf("reload Caddy after certificate rollback: %w", err)
@@ -798,7 +822,7 @@ func detectRateLimit(err error) *CAProviderRateLimitError {
 		return nil
 	}
 
-	// Try to extract a Retry-After hint from the error text. The ACME library
+	// Try to extract a 历史修复 hint from the error text. The ACME library
 	// sometimes includes it as "retry after 2026-01-02 03:04:05 +0000 UTC"
 	// (Go time.Time.String()) or "retry after 3600s".
 	retryAfter := time.Duration(0)
@@ -808,7 +832,7 @@ func detectRateLimit(err error) *CAProviderRateLimitError {
 	return &CAProviderRateLimitError{RetryAfter: retryAfter, Reason: err.Error()}
 }
 
-// extractRetryAfterFromError attempts to pull a Retry-After duration out of a
+// extractRetryAfterFromError attempts to pull a 历史修复 duration out of a
 // CA error message. It is a best-effort fallback because golang.org/x/crypto/acme
 // does not expose the HTTP response directly.
 func extractRetryAfterFromError(errText string) time.Duration {
@@ -816,7 +840,7 @@ func extractRetryAfterFromError(errText string) time.Duration {
 	if idx := strings.Index(lower, "retry after"); idx != -1 {
 		suffix := errText[idx+len("retry after"):]
 		suffix = strings.TrimSpace(suffix)
-		// Strip a trailing period or comma (F-SYSR-4：此前只剥句点，注释与
+		// Strip a trailing period or comma (历史修复：此前只剥句点，注释与
 		// 行为不符——逗号结尾的 "3600s," 会整段落入解析失败)。
 		suffix = strings.TrimRight(suffix, ".,")
 		// Try parsing as seconds if it looks like "3600s".
@@ -838,7 +862,7 @@ func extractRetryAfterFromError(errText string) time.Duration {
 			}
 		}
 		// Try parsing as Go time.Time.String()（"2006-01-02 15:04:05 -0700 MST"，
-		// 即上方注释文档化的形态）。SV历史问题：此前只试 RFC3339/HTTP-date，该
+		// 即上方注释文档化的形态）。历史问题：此前只试 RFC3339/HTTP-date，该
 		// 文档化分支永不命中，退化为自有阶梯（1–3h，偏长）；Go 解析布局虽无
 		// 小数秒字段，但解析器接受任意长度的小数秒（标准库特例）。
 		if t, err := time.Parse("2006-01-02 15:04:05 -0700 MST", suffix); err == nil {
@@ -871,7 +895,7 @@ func CanonicalACMEDomains(domains string) (string, error) {
 // "www.a.com,a.com"）；非双元素集（单域名/多段/空）原样返回。cert_jobs.domain
 // 存排序规范形式，而 lb_rules.domain 保留用户输入顺序，任务匹配需同时覆盖两种
 // 排列（lower+replace 归一后按 IN (canonical, reversed) 命中）。
-// LBH-6（历史 历史问题）：handlers.rules.reversedACMEDomainForm 与
+// 历史修复（历史）：handlers.rules.reversedACMEDomainForm 与
 // handlers.certjobs.reversedCertJobDomain 双份同实现收敛至此唯一源，两侧委托。
 func ReversedCertJobDomain(domain string) string {
 	if parts := strings.Split(domain, ","); len(parts) == 2 {
@@ -959,7 +983,7 @@ func parseCertNotAfter(certPEM string) (time.Time, error) {
 	return cert.NotAfter, nil
 }
 
-// auditFastPathReload D1 修正：fast-path 重载审计带 job/rule 归因（对齐主路径粒度）。
+// auditFastPathReload 历史修复 修正：fast-path 重载审计带 job/rule 归因（对齐主路径粒度）。
 func (s *CertIssuer) auditFastPathReload(jobID int, material issuedCertificate, err error) {
 	if err != nil {
 		RecordAuditLog("system", "重载失败", "Caddy服务", FormatAuditDetail(AuditSourcePart("certificate_issued"), AuditJobPart(jobID), AuditRulePart(material.ruleID)), "")

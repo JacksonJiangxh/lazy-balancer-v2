@@ -63,12 +63,12 @@ func resetSnapshotRowIsolationThrottle() {
 // 快照是主→从的整包下发通道，一行 JSON 畸形不得让全部规则/策略/节点数据
 // 500。告警必须点名表与行 ID。
 //
-// D2-历史问题 语义如实化：隔离**不是**「从节点保留本地既有行」——快照节是全量
+// 历史问题 语义如实化：隔离**不是**「从节点保留本地既有行」——快照节是全量
 // 替换语义（users 节先 clearSyncTables(api_keys, users)、security 节先
 // DELETE security_custom_rules 再插入 payload），且节哈希按剔除坏行后的
 // payload 计算，从节点不会因哈希不一致跳过。因此主节点某行损坏时，从节点
 // 下一次 apply 后该行**消失**（api_keys 表现为认证消失、custom_rules 表现为
-// 拦截规则消失），主节点修复该行后下一次同步自然自愈。该 历史修复 隔离是
+// 拦截规则消失），主节点修复该行后下一次同步自然自愈。该 fail-open 隔离是
 // 有意取舍（防单行坏数据瘫痪全量同步），调用方 skip 后必须继续。
 func warnCorruptedSnapshotRow(table string, rowID any, err error) {
 	key := fmt.Sprintf("%s:%v", table, rowID)
@@ -107,13 +107,13 @@ type snapshotStore interface {
 // Snapshot builds the full cluster snapshot. tokenKey signs the payload with
 // the requesting node's cluster token  so slaves can verify;
 // tokenKey 为空跳过签名——仅测试接缝(生产 GetClusterSnapshot 恒经
-// clusterTokenAuth 携带非空令牌,历史问题/历史问题)。
+// clusterTokenAuth 携带非空令牌,历史问题)。
 func (s *ClusterService) Snapshot(ctx context.Context, sinceVersion int, clientFingerprint string, tokenKey string) (models.ClusterSnapshot, bool, error) {
 	s.retryPendingPinCleanup()
 	// 品牌镜像刷新(2026-09-11):每次同步轮询先对账 branding.json→
 	// global_config.branding_json——文件变化即 bump 版本,304 门自然失效,
 	// 变更流向从节点;内容不变零扰动。快照缓存随版本失效自然重建。
-	// S历史问题-05：显式传本服务 s.db（不再依赖全局 db.DB），内容未变时
+	// 历史问题-05：显式传本服务 s.db（不再依赖全局 db.DB），内容未变时
 	// 函数内先读短路，纯 304 轮不再向主库写。
 	if s.dataDir != "" {
 		if changed, err := RefreshBrandingMirrorDB(s.db, s.dataDir); err != nil {
@@ -152,7 +152,7 @@ func (s *ClusterService) Snapshot(ctx context.Context, sinceVersion int, clientF
 func (s *ClusterService) ConfirmRegistration(ctx context.Context, token string) error {
 	// 历史问题（历史）：清列与上方旧协议交付确认（:84）对齐——过期时间戳
 	// 一并置 NULL，不与已清空的 secret 残留分叉。
-	// 历史问题-历史问题：SQL 级角色条件——降级窗口内的确认不得再写节点簿记。
+	// 历史问题：SQL 级角色条件——降级窗口内的确认不得再写节点簿记。
 	result, err := s.db.ExecContext(ctx, "UPDATE nodes SET registration_secret=NULL, registration_secret_expires_at=NULL WHERE cluster_token_hash=? AND "+masterRoleConditionSQL, tokenHash(token))
 	if err != nil {
 		return fmt.Errorf("确认集群令牌交付: %w", err)
@@ -198,7 +198,7 @@ func (s *ClusterService) cachedSnapshot(ctx context.Context) (models.ClusterSnap
 	// 开关读取失败必须报错——空缓存键 + nil 开关会把主节点 sync_users=0
 	// 等关闭保护在该份快照内绕过（从节点 computeSectionSkips 回退全开默认值），
 	// 且无自愈路径。无法确认权威开关状态时不得发布快照。
-	// D2-历史问题：开关读取与快照内容共用同一事务视图（此前走 s.db，事务外读取
+	// 历史问题：开关读取与快照内容共用同一事务视图（此前走 s.db，事务外读取
 	// 可能拿到不同时点数据；单连接池下更会对自身连接永久等待）。
 	switches, err := readSyncSwitches(ctx, tx)
 	if err != nil {
@@ -250,7 +250,7 @@ func (s *ClusterService) buildFullSnapshot(ctx context.Context, store snapshotSt
 	}
 	snapshot.WafFiles = BuildWafFileRef()
 	// 与缓存键侧同口径——读不到权威开关时不得发布 nil 开关快照。
-	// D2-历史问题：走调用方 store（cachedSnapshot 的 tx），与快照内容同事务视图。
+	// 历史问题：走调用方 store（cachedSnapshot 的 tx），与快照内容同事务视图。
 	switches, err := readSyncSwitches(ctx, store)
 	if err != nil {
 		return models.ClusterSnapshot{}, fmt.Errorf("读取主节点同步开关: %w", err)
@@ -264,7 +264,7 @@ func (s *ClusterService) buildFullSnapshot(ctx context.Context, store snapshotSt
 	// 主节点与从节点共用同一 ACME 状态校验：结构性不一致（缺区段/字段不全）
 	// 会被从节点拒绝，此处提前校验并记录错误以提升主节点可见性，但仍照常
 	// 发布。单规则/单证书损坏（acme_config_id=0、悬挂配置、悬挂 CA 提供商
-	// 引用）两侧均为 warn 跳过（历史问题 发现3、历史问题 N3），不阻断同步。
+	// 引用）两侧均为 warn 跳过（历史问题 发现3、历史问题），不阻断同步。
 	if err := validateSnapshotACMEState(snapshot); err != nil {
 		Logf("error", "cluster snapshot self-validation failed (still publishing): %v", err)
 	}
@@ -283,7 +283,7 @@ func (s *ClusterService) clusterSnapshotForApply(ctx context.Context) (models.Cl
 	}
 	defer tx.Rollback()
 	var previous models.ClusterSnapshot
-	// S历史问题-02（历史）：apply 的 previous 只消费三节哈希、证书轴与
+	// 历史问题-02（历史）：apply 的 previous 只消费三节哈希、证书轴与
 	// ACME ownership（computeSectionSkips/recordAppliedSectionHashes 的
 	// localHashes、snapshotCertsDiffer/removeMissingSnapshotCerts、
 	// restoreSnapshotArtifacts）。此前复用 clusterSnapshotBypassingCache 全量
@@ -312,7 +312,7 @@ func (s *ClusterService) clusterSnapshotForApply(ctx context.Context) (models.Cl
 // loadSectionHashInputs 装载 users/rules/security 三节哈希所需的全部输入
 // （全局配置区 + 三节表域），与 buildSnapshot 共用同一装载函数族（哈希奇偶
 // 不变式）。漂移守卫与 apply 基线共用本函数，避免两套「哪些列进哈希」的
-// 平行清单——S历史问题-02/S历史问题-03 家族收敛点。
+// 平行清单——历史问题-02/历史问题-03 家族收敛点。
 func (s *ClusterService) loadSectionHashInputs(ctx context.Context, store snapshotStore, snapshot *models.ClusterSnapshot) error {
 	// 三分类合并:users 节 payload 含 basic_settings/caddy_config——必须装载
 	// 全局配置区,且与 BuildSnapshot 复用同一装载函数(哈希奇偶不变式)。
@@ -404,7 +404,7 @@ var emptyDNSOwnershipCanonical = []byte(`{"version":1,"records":[]}`)
 // 与 ACME 区段（snapshotACME）共用。文件缺失按空规范字节继续（原语义）。文件损坏
 // （JSON 解码失败或结构校验失败）同样回退空态，对齐 ownership.Store.load 的隔离语义
 // （internal/dnsprovider/ownership/store.go：坏文件重命名 .corrupt-<unixts> 后按空态
-// 继续——所有权文件是尽力而为的缓存，空分发可经幂等 历史修复 删除与 75min stale
+// 继续——所有权文件是尽力而为的缓存，空分发可经幂等 not-found 删除与 75min stale
 // 窗口自愈）。快照侧不执行重命名（避免与 store 的 fileMu 读改写竞态），仅告警一行；
 // store 下一次 Add/Matching/Remove 触碰坏文件时会完成实际隔离，随后本函数自然走
 // ErrNotExist 分支。其余读取错误（真实 I/O 故障）保持报错，不被空态掩盖。
@@ -458,7 +458,7 @@ func nearestSnapshotCertificateExpiry(certificates []models.ClusterCertificate, 
 			continue
 		}
 		expiresAt, err := parseSnapshotExpiry(certificate.ExpiresAt)
-		// 历史问题 三十次 F11（两路审计独立确认，提交信息曾声称已修但从未落盘——
+		// 历史问题（两路审计独立确认，提交信息曾声称已修但从未落盘——
 		// 第 3 次同类失误）：解析失败视同缺失——唯一 ACME 证书 expires_at 非空
 		// 不可解析时 nearest 保持零 → 缓存快照永不按时间过期 → ACME 续期不传播
 		// 到副本。给最小重建窗口（ACME 域才计，避免非 ACME 误触发）。
@@ -516,7 +516,7 @@ func parseSnapshotExpiry(value string) (time.Time, error) {
 // 三分类合并(2026-09-19):全局配置并入系统数据节(恒同步)——装载不再受
 // sync_global_config 开关裁剪(列已删除,快照恒携带)。
 func (s *ClusterService) loadSnapshotGlobalSettings(ctx context.Context, store snapshotStore, snapshot *models.ClusterSnapshot) error {
-	// R2（历史）：cert_expiry_days 兜底经 db.DefaultCertExpiryDays 参数绑定
+	// 历史修复（历史）：cert_expiry_days 兜底经 db.DefaultCertExpiryDays 参数绑定
 	// （消费点族单源，读侧禁字面量回流——其余 COALESCE 字面量属 cert_renewal_*
 	// 列族/既有批 1+2 口径，不在本轮收敛范围）。
 	var caddyConfig string
@@ -618,7 +618,7 @@ func (s *ClusterService) loadSnapshotGlobalSettings(ctx context.Context, store s
 	snapshot.BasicSettings.SecurityEventsRowCap = &seCap
 	snapshot.BasicSettings.ThreatTrafficSampleN = &trafficSample
 
-	// D1（历史）：自动封禁六项配置随 users 节同步（镜像 历史问题/历史问题-01
+	// 历史修复（历史）：自动封禁六项配置随 users 节同步（镜像 历史问题-01
 	// 指针装载+COALESCE 兜底恒携带，升主即按主端配置生效）。局部名 abn* 与上方
 	// 自动备份组 ab* 区分（同一函数作用域）。
 	var abnEnabled, abnDryRun bool
@@ -740,12 +740,12 @@ func (s *ClusterService) snapshotSecurityPolicies(ctx context.Context, store sna
 // 的目标表，NULL 归一口径与 security_policies 一致（entries '[]'、审计列
 // 0/”），保证主从落库行为一致。
 func (s *ClusterService) snapshotSecurityIPLists(ctx context.Context, store snapshotStore) (json.RawMessage, error) {
-	// C6（历史落地；历史定性修正）：entries 空值归一 COALESCE('') →
+	// 历史修复（历史落地；历史定性修正）：entries 空值归一 COALESCE('') →
 	// '[]' 是**纠正方向**，不是等价改写——快照出口载荷字节由此改变（从端
 	// restoreTable/快照版本哈希拿到的是 '[]' 而非 ''），「行为等价」仅在下游
 	// 读路径再做一次 COALESCE 归一的前提下才成立（handlers 读路径
 	// COALESCE(entries,'[]')/备份 restoreTableNullDefaults/自动封禁 merge 同
-	// 归一），并非无差异 历史修复。本点修正的是快照出口单点与全链 '[]' 单源
+	// 归一），并非无差异 no-op。本点修正的是快照出口单点与全链 '[]' 单源
 	// 口径的分叉。
 	return s.dumpTableAsJSON(ctx, store, "security_ip_lists", "id,name,COALESCE(description,'') AS description,COALESCE(category,'') AS category,COALESCE(entries,'[]') AS entries,COALESCE(created_by,0) AS created_by,COALESCE(created_at,'') AS created_at,COALESCE(updated_by,0) AS updated_by,COALESCE(updated_at,'') AS updated_at,COALESCE(system,0) AS system", "id")
 }
@@ -810,7 +810,7 @@ func (s *ClusterService) snapshotSecurityBlockPages(ctx context.Context, store s
 }
 
 // clusterRuleLibVersionColumns 是 CRS/IP2Region 版本行的列清单单源
-// （S历史问题-15，历史）：快照导出、差分本地读取、从端写侧三处此前
+// （历史问题-15，历史）：快照导出、差分本地读取、从端写侧三处此前
 // 各抄一份（列增减需同时改 6 处，历史问题-01 已出现「快照列与差分行不同步」
 // 教训）。两张表列清单/扫描顺序完全一致，共享本常量与下方中性行扫描。
 const clusterRuleLibVersionColumns = `id,version,COALESCE(updated_at,''),COALESCE(auto_update,1),COALESCE(update_status,'idle'),COALESCE(message,''),COALESCE(last_checked,''),COALESCE(next_update,''),COALESCE(trigger,''),COALESCE(started_at,''),COALESCE(finished_at,''),COALESCE(schedule_days,'1,2,3,4,5,6,7'),COALESCE(schedule_time,'04:00')`
@@ -906,7 +906,7 @@ func (s *ClusterService) snapshotSecurityIP2RegionVersion(ctx context.Context, s
 
 // snapshotTime 把快照时间统一到秒：从端落库使用 crsTimeLayout（秒），
 // 若主端哈希输入保留亚秒，主从节哈希永久不等并触发多余全量重拉
-// （历史 D2-历史问题）。
+// （历史）。
 func snapshotTime(t time.Time) time.Time {
 	if t.IsZero() {
 		return t
@@ -1063,7 +1063,7 @@ func (s *ClusterService) snapshotRules(ctx context.Context, store snapshotStore)
 			&rule.BlockPageStage1ID, &rule.BlockPageStage1Status, &rule.BlockPageStage3ID, &rule.BlockPageStage3Status); err != nil {
 			return nil, fmt.Errorf("扫描快照规则: %w", err)
 		}
-		// S历史问题-03（历史）：与 path_rules/users/api_keys/ACME 逐行
+		// 历史问题-03（历史）：与 path_rules/users/api_keys/ACME 逐行
 		// 对称，规则时间戳截到秒（写侧 crsTimeLayout=秒/UTC）。仅启动迁移处理
 		// 存量行，运行期导入/备份恢复/带外写入的亚秒或 +08:00 形态会让主端
 		// 导出 JSON 与从端落库重建形态分叉 → rules 节哈希永久不等，每次主端
@@ -1242,7 +1242,7 @@ func (s *ClusterService) snapshotCertificates(ctx context.Context, store snapsho
 		return nil, fmt.Errorf("关闭手工证书结果: %w", err)
 	}
 
-	// S历史问题-10（历史·契约声明）：证书轴仅镜像**启用**规则
+	// 历史问题-10（历史·契约声明）：证书轴仅镜像**启用**规则
 	// （r.enabled=1）的 ACME 证书。主从「规则-证书」页面对禁用规则不一致是
 	// 有意取舍而非缺陷：从端 cert_jobs 全量替换 + removeMissingSnapshotCerts
 	// 会移除禁用规则的历史证书行与文件（disabled 规则不参与流量，无可用性
@@ -1275,7 +1275,7 @@ func (s *ClusterService) snapshotCertificates(ctx context.Context, store snapsho
 		}
 		canonicalRuleDomain, err := CanonicalACMEDomains(ruleDomain)
 		if err != nil {
-			// 历史问题/历史问题/历史问题 历史修复 裁定家族：单条规则的域名串损坏（导入残留/
+			// 历史问题 fail-open 裁定家族：单条规则的域名串损坏（导入残留/
 			// 直改库）只跳过该规则候选并限频告警——整包报错会让主节点对所有
 			// 从节点 Pull 持续 500 且无自愈路径。
 			warnSnapshotCertificateCandidate(cert.RuleID, int(candidate.ID), fmt.Errorf("规则域名规范化失败: %w", err), now)
@@ -1298,7 +1298,7 @@ func (s *ClusterService) snapshotCertificates(ctx context.Context, store snapsho
 	}
 	sort.Strings(ruleIDs)
 	for _, ruleID := range ruleIDs {
-		// 组选阶段统一解析候选证书（历史问题 M6：行扫描阶段不再逐候选做 X509KeyPair
+		// 组选阶段统一解析候选证书（历史问题：行扫描阶段不再逐候选做 X509KeyPair
 		// 全量解析，消除每候选双解析）。解析/有效期/域名覆盖失败的候选按 rule/job
 		// 限频告警后跳过；解析结果存入 Leaf 供 SelectCertificate 复用。
 		canonicalDomains, err := CanonicalACMEDomains(ruleDomains[ruleID])
@@ -1366,7 +1366,7 @@ func warnSnapshotCertificateCandidate(ruleID string, jobID int, cause error, now
 		return
 	}
 	snapshotCertificateWarnings.last[key] = now
-	// 历史 历史问题: 顺手清理过期条目，防止长期运行 master 节点的 map 无限增长。
+	// 历史问题: 顺手清理过期条目，防止长期运行 master 节点的 map 无限增长。
 	for k, t := range snapshotCertificateWarnings.last {
 		if now.Sub(t) > snapshotCertificateWarningsGCTtl {
 			delete(snapshotCertificateWarnings.last, k)

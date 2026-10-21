@@ -14,7 +14,7 @@ import (
 // legacySecurityEnumBackfills 既有模式归一(security_block_pages 无
 // status_code 列,429 仅可能存于 security_policies,见 db.go:492-502 与
 // db.go:1234-1236 注释)。
-func TestSEC441_normalizeBackfillsBlockStatus429To403(t *testing.T) {
+func TestNormalizeBackfillsBlockStatus429To403(t *testing.T) {
 	// Given 主节点(fresh 库 is_master 默认 TRUE),一条 429 遗留行 + 一条合法 404 行
 	setupSecurityEnumTestDB(t)
 	if _, err := db.DB.Exec(

@@ -10,7 +10,7 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// 历史 历史问题-4：请求日志格式串曾传入两次 param.Method——每行输出
+// 历史问题-4：请求日志格式串曾传入两次 param.Method——每行输出
 // 形如「| GET | GET "/path"」，method 重复且占用了其他字段的列。钉死：
 // method 与 path 各出现一次，列结构为 [time] status | latency | ip | METHOD "path"。
 func TestRequestLogFormatterPrintsMethodAndPathOnce(t *testing.T) {

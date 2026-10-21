@@ -47,7 +47,7 @@ func selfSignedPEM(t *testing.T, cn string) (string, string) {
 	return certPEM, keyPEM
 }
 
-// 历史修复 F-A1：禁用→重启用（Resume 分支）后必须重渲染重应用——此前 Resume 在
+// 历史修复：禁用→重启用（Resume 分支）后必须重渲染重应用——此前 Resume 在
 // ApplyConfigFromTx 之后翻 'issued'，已应用配置缺 TLS/301 且无 re-apply，
 // 看门狗只查路由存在，静默失配无上界。
 func TestEnableRule_resumeTriggersReapplyWithTLS(t *testing.T) {
@@ -90,7 +90,7 @@ func TestEnableRule_resumeTriggersReapplyWithTLS(t *testing.T) {
 
 	// Then：Resume 之后必须有 re-apply——最终一次 /load 载荷含该规则的 TLS 材料
 	//（tls.load_files 非空）且不含 'disabled' 过滤态下的裸路由。
-	// U04d-12①：原断言只查 lb_resume 字符串——无 TLS 裸路由也可通过；改为
+	// 历史修复①：原断言只查 lb_resume 字符串——无 TLS 裸路由也可通过；改为
 	// 直接钉 TLS 材料（load_files + 证书路径）出现。
 	if len(rec.loads) < 2 {
 		t.Fatalf("/load calls=%d, want ≥2（启用应用 + Resume 重应用）", len(rec.loads))

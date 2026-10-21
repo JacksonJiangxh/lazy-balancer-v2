@@ -51,7 +51,7 @@ func validCustomRulePayload(name string) map[string]any {
 }
 
 // 历史问题（历史）/历史问题（历史常量化）：全局 200 条上限的目标形状钉测试
-// ——上限行为历史已存在（基线钉，R-1 豁免 RED，见修复报告），历史
+// ——上限行为历史已存在（基线钉，历史修复 豁免 RED，见修复报告），历史
 // 常量化 securityCustomRuleMaxGlobalCount 不改变阈值与文案语义。
 func TestCreateSecurityCustomRule_rejectsAtGlobalCountLimit(t *testing.T) {
 	setupSecurityPolicyTestDB(t)

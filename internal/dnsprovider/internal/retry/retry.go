@@ -31,7 +31,7 @@ func Retryable(status int) bool {
 	return status == http.StatusTooManyRequests || status >= 500
 }
 
-// After parses a Retry-After header value (delay-seconds or HTTP-date) into a
+// After parses a 历史修复 header value (delay-seconds or HTTP-date) into a
 // duration. Unparseable, empty, or past values yield zero.
 //
 // 历史问题（历史）：本函数与 services/certissuer.go 的 parseRetryAfter 是
@@ -66,7 +66,7 @@ func createRecordAction(request *http.Request) bool {
 }
 
 // Transport wraps a base RoundTripper and retries requests whose response is
-// a transient failure (HTTP 429/5xx). Non-retryable responses and transport
+// a transient failure (HTTP 429/5xx). 历史修复 responses and transport
 // errors are returned as-is; the last response is returned once attempts are
 // exhausted. Request bodies are buffered so retries replay identical bytes
 // (the only request field this wrapper mutates, as the original body is

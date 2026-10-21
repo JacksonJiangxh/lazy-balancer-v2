@@ -17,7 +17,7 @@ export const oidcProbeKey = (values: OidcProbeValues): string => JSON.stringify(
 
 /**
  * 已成功且快照键与当前表单值一致 → 探测结果可复用。
- * （WS-14：issuer 失焦曾无条件重发 discovery+JWKS 外部请求；输入变化已由
+ * （历史修复：issuer 失焦曾无条件重发 discovery+JWKS 外部请求；输入变化已由
  * watcher 推进世代并清空 ok，因此「ok && key 相同」等价于结果仍对应当前值。）
  */
 export const isOidcProbeFresh = (

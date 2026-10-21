@@ -32,7 +32,7 @@ func TestTrustedProxyDegradation_bannerRecordsOnApply(t *testing.T) {
 			return
 		}
 		// 拒未知顶层字段返 400。旧桩恒 200 掩盖了内部键 __lazy_balancer_*
-		// 漏进载荷导致降级配置被硬拒的缺陷（D3 可用性优先被反转）。
+		// 漏进载荷导致降级配置被硬拒的缺陷（历史修复 可用性优先被反转）。
 		body, err := io.ReadAll(io.LimitReader(r.Body, 32<<20))
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)

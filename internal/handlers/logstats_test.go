@@ -18,7 +18,7 @@ import (
 )
 
 func TestLogRotatedBackups_matchServiceWriters(t *testing.T) {
-	// H-B1-08（历史）：契约以服务端导出的数值钉住（此前读取 services 源码
+	// 历史修复（历史）：契约以服务端导出的数值钉住（此前读取 services 源码
 	// 文本——常量改类型/加注释/第三个 writer 出现时会误红或漏验）。写侧与
 	// 展示层的保留份数必须同源同值。
 	if logRotatedBackups != services.CertJobLogMaxRotatedFiles() {
@@ -100,7 +100,7 @@ func TestGetLogStats_securityEventsRow(t *testing.T) {
 }
 
 // 历史问题-02 读侧同源：certjob 统计跟随 {任务日志目录}/certjobs（与写入端
-// CertJobLogPath 同源）。曾读写死 /app/logs 根——B3 惰性化后写入端已迁
+// CertJobLogPath 同源）。曾读写死 /app/logs 根——历史修复 惰性化后写入端已迁
 // tasks/certjobs/，读侧不同源则统计恒 0B。
 func TestGetLogStats_certJobRowFollowsTaskLogDir(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -455,7 +455,7 @@ func TestResolvedWafAuditLogFile_tracksDerivedPath(t *testing.T) {
 	}
 }
 
-// H-B1-04：单行轮询（?key=certjob）不得读取与所选行无关的配置列。
+// 历史修复：单行轮询（?key=certjob）不得读取与所选行无关的配置列。
 func TestGetLogStats_singleRowRequestSkipsUnrelatedConfigReads(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	probe := &prepareProbe{}

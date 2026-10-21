@@ -20,7 +20,7 @@ func (h *Handlers) GenerateClusterLoginTicket(c *gin.Context) {
 	// v2.1.8 决策4：集群「登录从节点」需当前 admin 已启用 MFA——未启用直接引导
 	// 先去安全设置绑定；写验证开关开启时还要求 10 分钟内验证过（428 → 前端
 	// 全局 step-up 弹窗验码后自动重试），票据本身即含 MFA 事实。
-	// 历史问题 C-历史问题：DB 读错误必须 fail-closed（无法证明已启用=拒绝），此前
+	// 历史问题：DB 读错误必须 fail-closed（无法证明已启用=拒绝），此前
 	// err != nil 时条件不成立直接放行发票。
 	// v2.3.0 用户裁定:OIDC 用户与本地 MFA 体系完全解耦(IdP 侧已验证二因子),
 	// 两道 MFA 门仅对本地用户生效——OIDC 会话直接放行发票。
@@ -116,7 +116,7 @@ func (h *Handlers) TicketLogin(c *gin.Context) {
 		recordTicketLoginFailure(c, claims.Username, reason)
 		message := "登录票据无效或已过期"
 		if status == http.StatusInternalServerError {
-			// 历史问题（历史 历史问题）：DB/内部故障（审计侧已归因 database_error）
+			// 历史问题（历史）：DB/内部故障（审计侧已归因 database_error）
 			// 不得复用凭证文案——否则运维误判为票据问题并反复重取票据。
 			message = "登录票据校验失败，请稍后重试"
 		}

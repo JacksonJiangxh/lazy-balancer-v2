@@ -22,7 +22,7 @@ func TestTrafficEventRing_recordsAndSnapshots(t *testing.T) {
 		t.Fatalf("event0=%+v", events[0])
 	}
 	more, _ := trafficEventSnapshot(events[0].Seq, 10)
-	// 「美国」入口归一为英文规范名（A85PLG 历史问题，与计数桶/app 聚合同口径）。
+	// 「美国」入口归一为英文规范名（历史问题，与计数桶/app 聚合同口径）。
 	if len(more) != 1 || more[0].Country != "United States" {
 		t.Fatalf("incremental=%+v", more)
 	}
@@ -32,7 +32,7 @@ func TestTrafficEventRing_recordsAndSnapshots(t *testing.T) {
 	}
 }
 
-// PL历史问题：trafficEventSeq 是进程内计数器，Caddy 重启后归零；前端则保留
+// 历史问题：trafficEventSeq 是进程内计数器，Caddy 重启后归零；前端则保留
 // 上一代际的高水位 since。服务端若不判别代际而把入参 since 原样回吐，前端
 // 「next_seq < previous 才复位」的判据永不成立 → 正常流量光流永久停更。
 func TestTrafficEventSnapshot_cursorAheadOfGenerationResets(t *testing.T) {

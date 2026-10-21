@@ -1,7 +1,7 @@
 package handlers
 
 // 历史修复——历史问题-01（users 空表拒绝）、历史问题-03（预览单侧缺失
-// 建模）、历史问题-04（CRS 日志时序）、F-B1（未登记威胁条目告警）、历史问题-02
+// 建模）、历史问题-04（CRS 日志时序）、历史修复（未登记威胁条目告警）、历史问题-02
 // handlers 侧探针（applyLbbakWafFiles 文件相位入 wafFileMu）。
 
 import (
@@ -29,7 +29,7 @@ import (
 )
 
 // buildLbbakWithExtraThreatEntry 手工组包：manifest 只登记 config.json，
-// tar 内额外携带 manifest 未登记的 threat/ustc.iplist 条目（F-B1 形态——
+// tar 内额外携带 manifest 未登记的 threat/ustc.iplist 条目（历史修复 形态——
 // 旧备份/损坏包可能产出，导入不拒绝但必须告警）。
 func buildLbbakWithExtraThreatEntry(t *testing.T, backupJSON string, threatData []byte) []byte {
 	t.Helper()
@@ -291,7 +291,7 @@ func TestLbbakImport_waitsForWafLockBeforeDBTransaction(t *testing.T) {
 	}
 }
 
-// B3-82-历史问题：导入必须先暂停/排空任务再取 WAF 文件锁；若先取锁，
+// 历史修复：导入必须先暂停/排空任务再取 WAF 文件锁；若先取锁，
 // 等待该锁的更新任务无法被取消，排空必然超时并可能在提交后旧写覆盖。
 func TestLbbakImport_pausesSchedulingBeforeWafLock(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -457,7 +457,7 @@ func TestLbbakImport_commit_success_uses_audit_not_crs_task_log(t *testing.T) {
 	}
 }
 
-// ── F-B1：manifest 未登记的 threat/*.iplist 条目必须告警（不拒绝） ──
+// ── 历史修复：manifest 未登记的 threat/*.iplist 条目必须告警（不拒绝） ──
 
 // Given lbbak 包内含 manifest 未登记的 threat/ustc.iplist 条目。
 // When 导入执行。
@@ -482,7 +482,7 @@ func TestLbbakImport_unregistered_threat_entry_warns(t *testing.T) {
 	}
 }
 
-// B3-82-历史问题：未选择安全防护分类时条目并未落盘，警告不得宣称「已按原样落盘」。
+// 历史修复：未选择安全防护分类时条目并未落盘，警告不得宣称「已按原样落盘」。
 func TestLbbakImport_unregisteredThreatSkippedBySectionsWarnsNotImported(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	g := newBackupSectionRouter(h)

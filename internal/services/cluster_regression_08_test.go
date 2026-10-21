@@ -21,7 +21,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// U05-F01 / RG-CLUSTER-SNAPSHOT-ROW-ISOLATION
+// 历史修复
 // ---------------------------------------------------------------------------
 
 func TestSnapshot_buildIsolatesCorruptedJSONRows(t *testing.T) {
@@ -136,7 +136,7 @@ func TestSnapshotRowIsolationThrottle_evictsExpiredEntriesAndKeepsThrottle(t *te
 }
 
 // ---------------------------------------------------------------------------
-// U05-F02 / RG-CLUSTER-WAF-REPULL-RESET
+// 历史修复
 // ---------------------------------------------------------------------------
 
 func TestSyncService_Pull_304_clears_waf_repull_state_after_manual_convergence(t *testing.T) {
@@ -176,7 +176,7 @@ func TestSyncService_Pull_304_clears_waf_repull_state_after_manual_convergence(t
 }
 
 // ---------------------------------------------------------------------------
-// U05-F03 / RG-CLUSTER-POSTCOMMIT-SIDEEFFECT
+// 历史修复
 // ---------------------------------------------------------------------------
 
 func TestSyncService_applySnapshot_brandingFailureMarksRetryAndClearsOnSuccess(t *testing.T) {
@@ -432,7 +432,7 @@ func TestClusterService_BecomeSlave_detachesOnlyPreviousDifferentMaster(t *testi
 }
 
 // ---------------------------------------------------------------------------
-// L02-01 / RG-CLUSTER-PROMOTE-DRAIN
+// 历史修复
 // ---------------------------------------------------------------------------
 
 func TestClusterService_Promote_drainsPostAdmissionApply(t *testing.T) {
@@ -535,7 +535,7 @@ func TestSyncService_applySnapshot_rechecksRoleInsideTransaction(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// L02-02 / RG-CLUSTER-SLAVE-SYNC-START
+// 历史修复
 // ---------------------------------------------------------------------------
 
 func TestClusterService_BecomeSlave_startsStoppedClusterSyncLoop(t *testing.T) {
@@ -570,7 +570,7 @@ func TestClusterService_BecomeSlave_startsStoppedClusterSyncLoop(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// L02-03 / RG-CLUSTER-NODE-IDENTITY
+// 历史修复
 // ---------------------------------------------------------------------------
 
 func TestClusterService_RegisterNode_reportsOverwrittenApprovedNode(t *testing.T) {
@@ -615,7 +615,7 @@ func TestClusterService_RegisterNode_reportsOverwrittenApprovedNode(t *testing.T
 }
 
 // ---------------------------------------------------------------------------
-// L02-04 / RG-CLUSTER-TICKET-ERROR
+// 历史修复
 // ---------------------------------------------------------------------------
 
 func TestClusterService_GenerateLoginTicket_distinguishesOfflineFromMissing(t *testing.T) {
@@ -651,7 +651,7 @@ func TestClusterService_GenerateLoginTicket_distinguishesOfflineFromMissing(t *t
 }
 
 // ---------------------------------------------------------------------------
-// L02-05 / RG-CLUSTER-STATUS-RESET
+// 历史修复
 // ---------------------------------------------------------------------------
 
 func TestClusterService_BecomeSlave_resetsLastSync(t *testing.T) {

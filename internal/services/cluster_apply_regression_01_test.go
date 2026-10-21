@@ -7,7 +7,7 @@ import (
 	"lazy-balancer-v2/internal/models"
 )
 
-// 历史修复 A-N5：rules 开关关闭时证书轴联动跳过——本地 cert_jobs 保留、快照证书
+// 历史修复：rules 开关关闭时证书轴联动跳过——本地 cert_jobs 保留、快照证书
 // 不回插（证书行/文件是规则轴的派生数据；开关关闭时从节点本地 enabled=1 的
 // acme_dns 规则保留，若仍清空证书轴，其 TLS 会静默永久丢失且无自愈路径）。
 func TestReplaceSnapshotTx_RulesDisabledKeepsLocalCertJobs(t *testing.T) {
@@ -49,7 +49,7 @@ func TestReplaceSnapshotTx_RulesDisabledKeepsLocalCertJobs(t *testing.T) {
 	}
 }
 
-// 历史修复 A-N5 反向锁定：rules 哈希一致（unchanged，非开关关闭）时证书轴仍全量
+// 历史修复 反向锁定：rules 哈希一致（unchanged，非开关关闭）时证书轴仍全量
 // 不得被本修复误伤。
 func TestReplaceSnapshotTx_RulesUnchangedStillReplaysCertJobs(t *testing.T) {
 	_, database := newClusterTestService(t)

@@ -207,7 +207,7 @@ func TestToolsListHidesWriteTools_forReadOnlyAPIKey(t *testing.T) {
 			dashboardVisible = true
 		}
 		// ApiMcp-新1:读探测 POST 工具对只读 Key 合法可见(单一事实源
-		// ReadOnlyProbeTools，历史 历史问题 收敛；历史问题 与 U04a2-历史问题 后 3 项)
+		// ReadOnlyProbeTools，历史问题 收敛；历史问题 与 历史问题 后 3 项)
 		for _, spec := range tools {
 			if spec.name == tool.Name && spec.method != http.MethodGet {
 				if _, probe := ReadOnlyProbeTools[tool.Name]; !probe {
@@ -309,7 +309,7 @@ func TestResolveAPIKeyReadOnly_treatsDisabledOwnerAsNotReadOnly(t *testing.T) {
 	// When
 	readOnly, err := resolveAPIKeyReadOnly(apiKey)
 
-	// Then：所有者被禁用时按 历史修复 处理，不视为只读
+	// Then：所有者被禁用时按 key-not-found 处理，不视为只读
 	if err == nil {
 		t.Fatalf("want key-not-found err for disabled owner, got nil")
 	}
@@ -340,7 +340,7 @@ func TestResolveAPIKeyReadOnly_rejectsExpiredKey(t *testing.T) {
 	// When
 	readOnly, err := resolveAPIKeyReadOnly(apiKey)
 
-	// Then：key 已过期时按 历史修复 处理，不视为只读
+	// Then：key 已过期时按 key-not-found 处理，不视为只读
 	if err == nil {
 		t.Fatalf("want key-not-found err for expired key, got nil")
 	}
@@ -432,7 +432,7 @@ func TestRedirectedPOSTPreservesMethodAndBody(t *testing.T) {
 	}
 }
 
-// 历史 历史问题-1：面板 TLS 嗅探层对明文请求实际返回 302（cmd/server
+// 历史问题-1：面板 TLS 嗅探层对明文请求实际返回 302（cmd/server
 // http_redirect_mux.go），转发重放集合必须含 302——否则面板启用 HTTPS 后
 // 全部 tools/call 收到 302 空 body 走 {} 错误。本测试钉「302 同样按原方法/
 // 原请求体重放一次」。
@@ -777,7 +777,7 @@ func TestAddIPToListToolForwardsValue(t *testing.T) {
 
 func TestGetIPListToolForwardsID(t *testing.T) {
 	// Given：v2.3.2 名单瘦身后 list_ip_lists 仅含 entry_count，读条目唯一通道
-	// 是 GET /security/历史修复/:id——历史问题（历史）补 get_ip_list 工具
+	// 是 GET /security/ip-lists/:id——历史问题（历史）补 get_ip_list 工具
 	// 覆盖该端点（GET 只读，id 进路径）。
 	var receivedMethod, receivedPath string
 	rest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -804,7 +804,7 @@ func TestGetIPListToolForwardsID(t *testing.T) {
 	// When
 	result := callTool(t, New(rest.URL+"/api/v1", rest.Client()), "get_ip_list", `{"id":9}`)
 
-	// Then：转发到 GET /api/v1/security/历史修复/9，响应原文含 entries
+	// Then：转发到 GET /api/v1/security/ip-lists/9，响应原文含 entries
 	if receivedMethod != http.MethodGet || receivedPath != "/api/v1/security/ip-lists/9" {
 		t.Fatalf("request=%s %s", receivedMethod, receivedPath)
 	}
@@ -914,7 +914,7 @@ func TestGetCRSRuleIndexToolForwardsReadOnly(t *testing.T) {
 	}
 }
 
-// 历史问题(C5):v2.3.0 起 /config/export 恒返回 lbbak 二进制(tar.gz,
+// 历史问题(历史修复):v2.3.0 起 /config/export 恒返回 lbbak 二进制(tar.gz,
 // application/gzip)——forward 把响应体喂 NewToolResultText 会把 gzip 字节
 // 静默损坏成不可读文本。非 JSON 历史修复 必须以 IsError 文本指引改走
 // 面板/REST,不得让二进制字节进文本结果。

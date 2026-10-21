@@ -8,7 +8,7 @@
         </h2>
         <p class="page-desc">查看安全拦截与检测事件记录</p>
       </div>
-      <!-- A85WB-历史问题：刷新联动自动封禁状态卡——建议列表/今日封禁/名单数不再
+      <!-- 历史修复：刷新联动自动封禁状态卡——建议列表/今日封禁/名单数不再
            停留在进入页面时的快照 -->
       <el-button :icon="Refresh" @click="refreshPage">刷新</el-button>
     </div>
@@ -39,7 +39,7 @@
               <el-tag :type="autobanStatus.enabled ? (autobanStatus.dry_run ? 'warning' : 'success') : 'info'" size="small" effect="plain">
                 {{ autobanStatus.enabled ? (autobanStatus.dry_run ? '观察模式' : '运行中') : '未启用' }}
               </el-tag>
-              <!-- F75C-2（历史）：调度仅主节点执行——从端徽章标示+写按钮禁用 -->
+              <!-- 历史修复：调度仅主节点执行——从端徽章标示+写按钮禁用 -->
               <el-tag v-if="!autobanStatus.is_master" type="info" size="small" effect="plain">仅主节点调度</el-tag>
             </div>
             <div class="autoban-stats">
@@ -218,7 +218,7 @@
         <!-- OPTIONS 为最长方法名(7 字符),90 定宽 -->
         <el-table-column prop="method" label="方法" width="90" align="center" />
         <el-table-column prop="uri" label="URI" min-width="140" show-overflow-tooltip />
-        <!-- 历史问题 二十二次（用户需求）：异常评分列——CRS 评分制下每事件携带的累计
+        <!-- 历史问题（用户需求）：异常评分列——CRS 评分制下每事件携带的累计
              anomaly_score（后端已返回，此前未展示）；按分数着色便于快速识别高威胁。 -->
         <el-table-column label="评分" width="80" align="center">
           <template #default="{ row }">
@@ -256,7 +256,7 @@
     <!-- 自动封禁配置弹框（历史问题）：六项配置+口径/窗口变更重置提示 -->
     <el-dialog v-model="autobanDialogVisible" width="min(600px, 94vw)" top="8vh" append-to-body class="dialog-body-inset">
       <template #header>
-        <!-- W87-06：喂入门只排除「已验证爬虫豁免」事件，ACL/GeoIP/威胁情报事件
+        <!-- 历史修复：喂入门只排除「已验证爬虫豁免」事件，ACL/GeoIP/威胁情报事件
              同样计数——文案不得自缩为「WAF 事件」，否则用户按「只有 WAF 命中才
              计数」校准阈值会过早封禁 -->
         <DialogHeader :icon="Lock" title="自动封禁配置" subtitle="安全事件（IP 访问控制/地域/WAF/威胁情报，已验证爬虫豁免除外）固定窗口计数达到阈值即写入「自动封禁名单」（调度开启时到期自动解封）" />
@@ -400,7 +400,7 @@ interface AutobanStatus {
   // 历史问题-02：黄条判据 = 封禁是否真正生效（名单非空 ∧ 被启用+IP ACL 启用+deny 的
   // 策略在 ip_acl_list_refs 引用）。后端 list_referenced 为热路径资格门的四面
   // 引用集（含白名单/受信代理/CRS 排除），不能区分「引用」与「拦截生效」——
-  // 纯后端内部字段，本卡不声明不消费（A85WB-历史问题 死字段移除）。
+  // 纯后端内部字段，本卡不声明不消费（历史修复 死字段移除）。
   ban_effective: boolean
   suggestions: AutobanSuggestion[]
   // 后端另有 running/last_run/last_status/role/tracked_ips（API 契约保留）——
@@ -425,7 +425,7 @@ const autobanStatus = ref<AutobanStatus>({
 })
 const autobanStatusLoading = ref(false)
 const autobanToggling = ref(false)
-// 状态读取失败（历史问题/F17）：错误态不得按「确定状态」展示——写入口一律禁用
+// 状态读取失败（历史问题）：错误态不得按「确定状态」展示——写入口一律禁用
 const autobanStatusError = ref(false)
 // 黄条判据单源（utils/autobanStatus，行为钉测）：仅 enabled ∧ ban_effective===false
 const autobanIneffective = computed(() => isAutobanIneffective(autobanStatus.value))
@@ -593,11 +593,11 @@ const toggleAutobanEnabled = async (): Promise<void> => {
 
 // 触发阶段分类（历史追加需求，用户裁定）：IP ACL 族=黑白名单/信任/地域/
 // 威胁库预检，统一展示「IP 访问控制」；WAF 含 CRS 与自定义两源；请求体异常独立。
-// FE-7（历史）：原 isIpAclFamily 谓词与 stageCategory 口径重叠（且被其包含
+// 历史修复（历史）：原 isIpAclFamily 谓词与 stageCategory 口径重叠（且被其包含
 // ——链接门 `isIpAclFamily || stageCategory==='trust'` 等价于 stageCategory ∈
 // {acl,trust}），删除谓词，统一走 stageCategory 单一事实源。
 
-// Review66-Head ②：ctx 弹框耗时展示按族判定——仅 WAF 族（wafCrs/wafCustom/
+// 历史修复 ②：ctx 弹框耗时展示按族判定——仅 WAF 族（wafCrs/wafCustom/
 // body）经 WAF 段独立测量用加和式（duration_us=WAF 段，拦截/记录两形态同为
 // 纯段口径）；预检族 duration_us≡precheck_us 单值展示（预检决策耗时，拦截与
 // 放行同口径——历史起预检拦在决策后、403 写出前记录，不再混入链首全程）。
@@ -606,11 +606,11 @@ const ctxWafFamily = computed(() => {
   return ['wafCrs', 'wafCustom', 'body'].includes(triggerStageFamily(t))
 })
 
-// FE65-2：stageCategory 改由共享 triggerStageFamily 投影（securityStages 唯一
+// 历史修复：stageCategory 改由共享 triggerStageFamily 投影（securityStages 唯一
 // 实现，原 历史问题 双实现并存欠账）——本视图五桶 = 细粒度族的合并投影：
 // ipAcl/geoip/threat 同归「IP 访问控制」（阶段 1 合并口径），wafCrs/wafCustom
 // 同归「WAF」；trust/body/other 同名直通。
-// 历史问题-F1：crawler 独立成类（后端 v2.3.8 将已验证爬虫/伪装从地域段拆出）——
+// 历史问题：crawler 独立成类（后端 v2.3.8 将已验证爬虫/伪装从地域段拆出）——
 // 阶段列显示「爬虫校验」而非笼统归入 IP 访问控制；仍是阶段 1 预检事件，
 // 点击进入同一触发详情弹框。
 const stageCategory = (row: SecurityEvent): 'trust' | 'acl' | 'crawler' | 'waf' | 'body' | 'other' => {
@@ -765,7 +765,7 @@ const total = ref(0)
 const logStorageRefreshKey = ref(0)
 
 // 触发阶段筛选为固定预置八类（历史用户裁定：固定预置值，不接受任意值）。
-// 令牌 → 后端族段映射与序列化单源在 utils/triggeredFilter（审计 87 W87-15：
+// 令牌 → 后端族段映射与序列化单源在 utils/triggeredFilter（历史修复：
 // 原实现内联在本文件、无行为测试）。
 const filters = ref({ action: '', ip: '', uri: '', rule_name: '', rule_triggered: [...TRIGGERED_CATEGORIES] as string[], policy_name: '', timeRange: null as [string, string] | null })
 
@@ -786,7 +786,7 @@ const applyFilters = () => {
   const range = filters.value.timeRange
   if (range?.[0] && range?.[1] && range[0] > range[1]) {
     ElMessage.warning('开始时间不能晚于结束时间')
-    // 历史 历史问题：只清 end 保留已填的 start（原清空整个区间丢两侧输入）
+    // 历史问题：只清 end 保留已填的 start（原清空整个区间丢两侧输入）
     filters.value.timeRange = [range[0], '']
   }
   page.value = 1
@@ -803,7 +803,7 @@ const handleSizeChange = () => { page.value = 1; fetchEvents() }
 
 const goToRule = (row: SecurityEvent) => { window.open(`/?page=rules&rs=${encodeURIComponent(row.rule_caddy_id)}`, '_blank') }
 const goToPolicy = (row: SecurityEvent) => {
-  // FE42-1：交接改走 URL query（sp / sp-search 参数，同 goToRule 的 rs 形态），
+  // 历史修复：交接改走 URL query（sp / sp-search 参数，同 goToRule 的 rs 形态），
   // SecurityPolicies.vue onMounted 消费后 replaceState 清除。
   if (row.policy_id > 0) {
     window.open(`/?page=security-policies&sp=${row.policy_id}`, '_blank')
@@ -837,7 +837,7 @@ const fetchEvents = async () => {
     if (res.data?.ingestion) ingestionStatus.value = res.data.ingestion
     logStorageRefreshKey.value++
   } catch {
-    // 历史问题 D-N5：瞬态失败保留末次成功数据（对齐 AuditLog 口径）——此前清空列表
+    // 历史问题：瞬态失败保留末次成功数据（对齐 AuditLog 口径）——此前清空列表
     // 却保留陈旧 total，空态文案「暂无安全事件」在排障窗口内误导为「无攻击」。
     // 全局拦截器已弹失败 toast。
   } finally {
@@ -849,7 +849,7 @@ onMounted(() => {
   fetchAutobanStatus()
 })
 
-// A85WB-历史问题：页面刷新同时拉自动封禁状态（调度在后台持续运行，dry-run 建议
+// 历史修复：页面刷新同时拉自动封禁状态（调度在后台持续运行，dry-run 建议
 // 列表/banned_today/list_entries 不作长期快照）。
 const refreshPage = (): void => {
   void fetchEvents()

@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/caddyserver/caddy/v2"
 )
 
 // fakeResolver 可编程 DNS 替身：PTR 与正向结果按表返回。
@@ -282,7 +284,7 @@ func TestVerifyCrawler_dnsFailureFailClosed(t *testing.T) {
 	}
 }
 
-// ---- 历史 历史问题 / 历史问题 ----
+// ---- 历史问题 ----
 
 func resetCrawlerIPRangeCacheForTest() {
 	crawlerFileCacheMu.Lock()
@@ -312,7 +314,7 @@ func TestCrawlerIPRangeList_precompiledAndFailureThrottled(t *testing.T) {
 	if verifyCrawlerIPRangeFromList("66.249.66.1", "googlebot") {
 		t.Fatal("failure must be throttled for the retry interval")
 	}
-	// E81-历史问题：失败只按短重试间隔节流（旧实现缓存满 10min，冷装窗口 360
+	// 历史问题：失败只按短重试间隔节流（旧实现缓存满 10min，冷装窗口 360
 	// 豁免 fail-closed 最长 10 分钟）；重试间隔过后重读 → 命中。
 	crawlerFileCacheMu.Lock()
 	crawlerFileCacheSnap.loadedAt = time.Now().Add(-2 * time.Minute)
@@ -357,7 +359,7 @@ func TestVerifyCrawlerIPRange_invalidAddrNoPanic(t *testing.T) {
 	}
 }
 
-// ---- 历史 E-CM-05：地址归一化（Unmap/zone），方向 fail-closed ----
+// ---- 历史修复：地址归一化（Unmap/zone），方向 fail-closed ----
 
 // Given: 客户端 IP 为 4in6 映射形态，PTR 属引擎官方域，正向回验返回 v4 规范串
 // When: 双跳验证
@@ -419,7 +421,7 @@ func TestVerifyCrawlerIPRange_v4MappedAndZoneNormalized(t *testing.T) {
 	}
 }
 
-// E83-历史问题：并发加载代际守卫——慢读者读到 rename 前的旧 inode，不得在新
+// 历史问题：并发加载代际守卫——慢读者读到 rename 前的旧 inode，不得在新
 // 快照落定后把旧内容写回（否则官方段更新后旧段最多沿用 10 分钟）。
 func TestCrawlerIPRangeSnapshot_staleGenerationDoesNotOverwrite(t *testing.T) {
 	resetCrawlerIPRangeCacheForTest()
@@ -449,7 +451,7 @@ func TestCrawlerIPRangeSnapshot_staleGenerationDoesNotOverwrite(t *testing.T) {
 	}
 }
 
-// E83-历史问题 反向形状：并发成功快照落定后，较早开始的失败读取不得把它降级成
+// 历史问题 反向形状：并发成功快照落定后，较早开始的失败读取不得把它降级成
 // 空集（fail-closed 空窗）。TTL 到期后的失败读取（晚于成功落定）照常覆盖。
 func TestCrawlerIPRangeSnapshot_freshSuccessNotDowngradedByOldFailure(t *testing.T) {
 	resetCrawlerIPRangeCacheForTest()
@@ -475,5 +477,72 @@ func TestCrawlerIPRangeSnapshot_freshSuccessNotDowngradedByOldFailure(t *testing
 	}
 	if got := commitCrawlerIPRangeSnapshot(laterFailure); got != laterFailure {
 		t.Fatal("成功快照过期后的失败读取应覆盖为空快照（fail-closed）")
+	}
+}
+
+// 渲染侧经 crawler_ip_list_file 配置键下发根服务派生路径——
+// 自定义 data_dir 部署下根服务把运行快照写到 <data_dir>/crawler-ip-lists.json，
+// 插件若不消费配置键会恒读 /app/data/crawler-ip-lists.json（读侧分叉，360 类
+// IP 段豁免静默失效）。Provision 必须应用配置路径；路径变化时重置快照缓存，
+// 否则旧路径成功快照在其 TTL（≤10min）内继续服役，把上一部署形态的名单带进
+// 新形态。fail-closed 语义与失败重试间隔不变。
+func TestProvision_appliesCrawlerIPListFileAndResetsSnapshot(t *testing.T) {
+	// Given：旧路径有一份成功快照已缓存（模拟上一部署形态）
+	oldFile := crawlerIPListFile
+	t.Cleanup(func() {
+		setCrawlerIPListFilePath(oldFile)
+		resetCrawlerIPRangeCacheForTest()
+	})
+	oldPath := filepath.Join(t.TempDir(), "old-crawler.json")
+	if err := os.WriteFile(oldPath, []byte(`{"so360spider":["140.0.0.0/24"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setCrawlerIPListFilePath(oldPath)
+	resetCrawlerIPRangeCacheForTest()
+	if !verifyCrawlerIPRangeFromList("140.0.0.1", "so360spider") {
+		t.Fatal("旧路径快照应命中（前置条件）")
+	}
+
+	// When：Provision 携带渲染侧发射的派生路径（新部署形态，名单不同）
+	newPath := filepath.Join(t.TempDir(), "crawler-ip-lists.json")
+	if err := os.WriteFile(newPath, []byte(`{"so360spider":["42.236.8.0/21"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := &GeoIPHandler{CrawlerIPListFile: newPath}
+	if err := h.Provision(caddy.Context{Context: context.Background()}); err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+
+	// Then：读取路径已切换到配置值，旧路径缓存快照不再服役（命中新名单而非旧名单）
+	if got := crawlerIPListFilePath(); got != newPath {
+		t.Fatalf("crawlerIPListFile=%q, want %q", got, newPath)
+	}
+	if !verifyCrawlerIPRangeFromList("42.236.8.1", "so360spider") {
+		t.Fatal("Provision 后应按新路径快照判定（新名单命中）")
+	}
+	if verifyCrawlerIPRangeFromList("140.0.0.1", "so360spider") {
+		t.Fatal("路径切换必须重置快照缓存——旧路径名单不得继续服役")
+	}
+}
+
+// 兜底裁定：插件 Provision 默认不动——未配置时路径保持
+// /app/data/crawler-ip-lists.json（容器默认形态渲染侧省略该键，见根服务
+// TestBuildGeoipHandler_defaultPathsOmitted 的字节稳定裁定）。
+func TestProvision_crawlerIPListFileDefaultsToAppData(t *testing.T) {
+	oldFile := crawlerIPListFile
+	t.Cleanup(func() {
+		setCrawlerIPListFilePath(oldFile)
+		resetCrawlerIPRangeCacheForTest()
+	})
+	setCrawlerIPListFilePath(filepath.Join(t.TempDir(), "other.json"))
+	h := &GeoIPHandler{}
+	if err := h.Provision(caddy.Context{Context: context.Background()}); err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+	if got := crawlerIPListFilePath(); got != "/app/data/crawler-ip-lists.json" {
+		t.Fatalf("默认 crawlerIPListFile=%q, want /app/data/crawler-ip-lists.json", got)
+	}
+	if h.CrawlerIPListFile != "/app/data/crawler-ip-lists.json" {
+		t.Fatalf("Provision 未回填默认: %q", h.CrawlerIPListFile)
 	}
 }

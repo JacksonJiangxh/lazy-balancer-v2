@@ -1,8 +1,8 @@
 package taskengine
 
-// 并发锁（U10-F08）、DescribeAll 稳定序（L01-03）、TaskMeta 诊断字段
-// 序列化口径（U10-F06）、tick 槽回写并发校验（L01-08）、RearmLoop 用户停止
-// 语义（L01-09）。
+// 并发锁（历史修复）、DescribeAll 稳定序（历史修复）、TaskMeta 诊断字段
+// 序列化口径（历史修复）、tick 槽回写并发校验（历史修复）、RearmLoop 用户停止
+// 语义（历史修复）。
 
 import (
 	"encoding/json"
@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-// U10-F05：注册式调度函数的 panic 不得杀死调度循环——NextSlotFn panic 的
+// 历史修复：注册式调度函数的 panic 不得杀死调度循环——NextSlotFn panic 的
 // 任务本 tick 跳过（fail-closed 零值槽），其它任务照常按节拍执行。
 func TestEngine_ScheduleFnPanicDoesNotKillLoop(t *testing.T) {
 	e := newTestEngine(t)
@@ -53,7 +53,7 @@ func TestEngine_ScheduleFnPanicDoesNotKillLoop(t *testing.T) {
 	}
 }
 
-// U10-F08：多写入方并发跨阈值时，stat→rotate→append 必须整体互斥——.1 存在
+// 历史修复：多写入方并发跨阈值时，stat→rotate→append 必须整体互斥——.1 存在
 // 且活动文件+归档的总行数守恒（并发交错会丢一代）。
 func TestAppendTaskLogLine_concurrentRotationKeepsAllLines(t *testing.T) {
 	dir := t.TempDir()
@@ -99,7 +99,7 @@ func countFileLines(t *testing.T, path string) int {
 	return strings.Count(string(data), "\n")
 }
 
-// L01-03：DescribeAll 必须按「分类固定序 + 类内 ID 字典序」稳定输出——
+// 历史修复：DescribeAll 必须按「分类固定序 + 类内 ID 字典序」稳定输出——
 // 曾直接 range map，连续请求行序随机。
 func TestEngine_DescribeAllStableCategoryAndIDOrder(t *testing.T) {
 	e := newTestEngine(t)
@@ -150,7 +150,7 @@ func TestTaskMeta_JSONOmitsEnabled(t *testing.T) {
 	}
 }
 
-// L01-08：tick 锁外求值槽期间并发 Run 已完成并回写新槽——陈旧求值不得覆盖
+// 历史修复：tick 锁外求值槽期间并发 Run 已完成并回写新槽——陈旧求值不得覆盖
 // 新槽（否则会把未来槽打回过去，形成重复投递）。
 func TestEngine_TickDoesNotClobberConcurrentlyWrittenSlot(t *testing.T) {
 	e := newTestEngine(t)
@@ -195,7 +195,7 @@ func TestEngine_TickDoesNotClobberConcurrentlyWrittenSlot(t *testing.T) {
 	}
 }
 
-// L01-09：RearmLoop 不得越过用户停止；仅在明确告知「有活」时越过并立即补跑。
+// 历史修复：RearmLoop 不得越过用户停止；仅在明确告知「有活」时越过并立即补跑。
 func TestEngine_RearmLoopRespectsUserStopUnlessWork(t *testing.T) {
 	e := newTestEngine(t)
 	var runs atomic.Int32

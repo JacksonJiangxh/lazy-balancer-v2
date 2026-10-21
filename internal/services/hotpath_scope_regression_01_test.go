@@ -1,18 +1,18 @@
 package services
 
 //
-// HP-1：u-* 并集投影稳定命名冲突——预检逐规则渲染（policiesForRule）但
+// 历史修复：u-* 并集投影稳定命名冲突——预检逐规则渲染（policiesForRule）但
 // u-deny/u-trust/u-bl/u-allow/u-allow-exempt/u-trust12 是全局单文件名，
 // 异策略集多规则时后渲染覆盖前者=漏拦+误拦。修复方向：scope 编入规则身份
 // （ruleCaddyID），GC regex 收新形态。
 //
-// CERT-1：refreshIPListProjectionsInLock 丢弃证书快照——热路径渲染经
+// 历史修复：refreshIPListProjectionsInLock 丢弃证书快照——热路径渲染经
 // MaterializeCertPairs 物化了新证书文件（快照非空）而 JSON 字节一致时返回
-// 「收敛」，磁盘新证书+Caddy 内存旧证书静默分叉（历史修复 W1-1「物化即有变⇒强制
+// 「收敛」，磁盘新证书+Caddy 内存旧证书静默分叉（历史修复「物化即有变⇒强制
 // 重载」在热路径失守）。修复方向：三态（收敛/需强制/回退），调用方据态走
 // 强制重载。
 //
-// SEC-2：资格门（ipListsReferencedByEnabledPolicyLabeled）只查
+// 历史修复：资格门（ipListsReferencedByEnabledPolicyLabeled）只查
 // ip_acl_list_refs/ip_whitelist_refs，不覆盖仅被 trusted_proxy_range_refs
 // 或 CRS 排除 scope=ip/list 条目 ListRefs 引用的名单——保守回退口径缺口。
 // 本文件 RED 阶段全部使用既有 API（签名不变更即可编译运行），实现后追加
@@ -39,7 +39,7 @@ import (
 )
 
 // r76TestCertPEM 生成自签证书+私钥 PEM（ECDSA P-256，serial 取纳秒保证多次
-// 调用内容互异——CERT-1 场景 v1/v2 材料必须字节不同）。
+// 调用内容互异——历史修复 场景 v1/v2 材料必须字节不同）。
 func r76TestCertPEM(t *testing.T, cn string) (string, string) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -69,7 +69,7 @@ func r76TestCertPEM(t *testing.T, cn string) (string, string) {
 		string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}))
 }
 
-// HP-1 钉测（RED 先行）：两条规则各绑一个异条目 deny ACL 策略，经生产渲染
+// 历史修复 钉测（RED 先行）：两条规则各绑一个异条目 deny ACL 策略，经生产渲染
 // 通道逐规则出预检段。修复前两次渲染先后覆写同一个 u-deny.txt——后渲染的
 // 并集顶掉前者，先渲染规则的预检算子读到的文件不再是自己的并集（漏拦+误拦）。
 // 修复后各规则投影进 u-deny-<ruleCaddyID>.txt，内容各自正确且互不覆盖。
@@ -107,7 +107,7 @@ func TestPrecheckProjectionFilesScopedPerRule(t *testing.T) {
 	}
 }
 
-// CERT-1 钉测（RED 先行）：证书材料变化（等价证书续期已提交：仅 DB 内容变、
+// 历史修复 钉测（RED 先行）：证书材料变化（等价证书续期已提交：仅 DB 内容变、
 // 规则 JSON 形态不变）后发生名单写路径收敛（autoban merge 资格门命中）——
 // 热路径渲染会经 MaterializeCertPairs 把新证书物化落盘，JSON 字节一致，
 // 旧实现返回「收敛」（零 /load）→ Caddy 内存停留旧证书静默分叉。修复后必须
@@ -172,14 +172,14 @@ func TestCertMaterialChangeForcesReloadOnListConverge(t *testing.T) {
 	if spy.refreshes != 1 {
 		t.Fatalf("资格门命中必须走投影热路径刷新：refreshes=%d", spy.refreshes)
 	}
-	// 历史修复 W1-1：热路径渲染物化了新证书（快照非空）⇒ 不得宣称收敛，必须强制
+	// 历史修复：热路径渲染物化了新证书（快照非空）⇒ 不得宣称收敛，必须强制
 	// 重载收敛（回退全量重载回调）。
 	if spy.reloads == 0 {
 		t.Fatalf("证书材料被热路径渲染物化后仍宣称收敛（零重载）——磁盘新证书与 Caddy 内存旧证书静默分叉：refreshes=%d reloads=%d", spy.refreshes, spy.reloads)
 	}
 }
 
-// SEC-2 钉测（RED 先行）其一：仅被 CRS 排除 scope=list 条目 ListRefs 引用的
+// 历史修复 钉测（RED 先行）其一：仅被 CRS 排除 scope=list 条目 ListRefs 引用的
 // 名单，资格门必须判为「被引用」（否则热路径资格误判未引用→回退全量链，
 // 保守口径与契约不符）。
 func TestRefGateCoversCRSScopedExclusionListRefs(t *testing.T) {
@@ -194,7 +194,7 @@ func TestRefGateCoversCRSScopedExclusionListRefs(t *testing.T) {
 	}
 }
 
-// SEC-2 钉测（RED 先行）其二：仅被 trusted_proxy_range_refs 引用（受信代理
+// 历史修复 钉测（RED 先行）其二：仅被 trusted_proxy_range_refs 引用（受信代理
 // 已启用）的名单，资格门必须判为「被引用」（tp.txt 投影消费该名单条目）。
 func TestRefGateCoversTrustedProxyRangeRefs(t *testing.T) {
 	newClusterTestService(t)
@@ -208,9 +208,9 @@ func TestRefGateCoversTrustedProxyRangeRefs(t *testing.T) {
 	}
 }
 
-// ---- 全形状补钉（R-5：目标+回归+畸形） ----
+// ---- 全形状补钉（历史修复：目标+回归+畸形） ----
 
-// HP-1 引擎层钉测：id:12 的 u-trust12 投影同样按规则身份隔离——同一策略
+// 历史修复 引擎层钉测：id:12 的 u-trust12 投影同样按规则身份隔离——同一策略
 // 形态、两条规则身份、两份不同 stage0 保留检测并集，各自投影文件内容正确
 // 且互不覆盖（旧全局单文件名下后渲染覆盖前者=信任集串染）。
 func TestEngineTrust12ProjectionScopedPerRule(t *testing.T) {
@@ -229,7 +229,7 @@ func TestEngineTrust12ProjectionScopedPerRule(t *testing.T) {
 	}
 }
 
-// HP-1 畸形形状：空规则身份必须显性报错（fail-loud——静默退回全局名会原样
+// 历史修复 畸形形状：空规则身份必须显性报错（fail-loud——静默退回全局名会原样
 // 重建覆盖冲突）。
 func TestEmptyRuleIdentityFailsLoud(t *testing.T) {
 	policy := &models.SecurityPolicy{AnomalyThreshold: 5, Mode: "blocking"}
@@ -241,7 +241,7 @@ func TestEmptyRuleIdentityFailsLoud(t *testing.T) {
 	}
 }
 
-// CERT-1 直接钉测：证书材料变化 + 名单写（已提交视图）→ RefreshIPListProjections
+// 历史修复 直接钉测：证书材料变化 + 名单写（已提交视图）→ RefreshIPListProjections
 // 返回 NeedForce；强制重载收敛后名单再写 → 回到 Converged（三态收敛闭环）。
 func TestRefreshTriStateCertMaterialization(t *testing.T) {
 	stubSecurityLibsAvailable(t)
@@ -305,7 +305,7 @@ func TestRefreshTriStateCertMaterialization(t *testing.T) {
 	}
 }
 
-// SEC-1 钉测（R-10 引擎级收口）：大名单（内联展开将撞 48KiB 单行护栏）经
+// 历史修复 钉测（历史修复 引擎级收口）：大名单（内联展开将撞 48KiB 单行护栏）经
 // CRS 作用域限定排除引用时——BuildCorazaDirectives 必须成功（旧 @ipMatch
 // 内联形态此形状直接渲染失败=整份配置无法保存），排除规则改投影
 // @ipListFast（配置行短、名单内容在投影文件里），且渲染产物必须被 coraza
@@ -350,11 +350,11 @@ func TestScopedExclusionBigListProjectedAndEngineAccepted(t *testing.T) {
 	if !strings.Contains(proj, "203.0.113.5/32") || !strings.Contains(proj, "10.0.0.0/20") {
 		t.Fatalf("投影文件须含 ips 与聚合后的名单条目: %q…", proj[:min(200, len(proj))])
 	}
-	// R-10：ctl:ruleRemoveById + @ipListFast 新形状必须被 coraza 编译接受。
+	// 历史修复：ctl:ruleRemoveById + @ipListFast 新形状必须被 coraza 编译接受。
 	compileForEngineGate(t, directives)
 }
 
-// SEC-2 回归形状：scope=all 条目的 ListRefs 不构成投影引用面（发射侧不消费
+// 历史修复 回归形状：scope=all 条目的 ListRefs 不构成投影引用面（发射侧不消费
 // ——emitScopedCRSExclusions 仅收 scope=ip/list），资格门不得误判。
 func TestRefGateIgnoresScopeAllListRefs(t *testing.T) {
 	newClusterTestService(t)
@@ -368,7 +368,7 @@ func TestRefGateIgnoresScopeAllListRefs(t *testing.T) {
 	}
 }
 
-// SEC-2 回归形状：受信代理未启用时 trusted_proxy_range_refs 不构成引用面
+// 历史修复 回归形状：受信代理未启用时 trusted_proxy_range_refs 不构成引用面
 // （渲染侧 trustedProxyServerFields 按未启用返回，tp.txt 不消费名单）。
 func TestRefGateIgnoresDisabledTrustedProxyRefs(t *testing.T) {
 	newClusterTestService(t)

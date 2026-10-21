@@ -16,7 +16,7 @@ import (
 	"golang.org/x/crypto/acme"
 )
 
-// Issuer orchestrates the full ACME 历史修复 issuance flow.
+// Issuer orchestrates the full ACME DNS-01 issuance flow.
 type Issuer struct {
 	Client              *Client
 	Provider            dnsprovider.Provider
@@ -24,7 +24,7 @@ type Issuer struct {
 	RequireRecursiveDNS bool
 }
 
-// Issue obtains a certificate for the given domains via 历史修复 challenge.
+// Issue obtains a certificate for the given domains via DNS-01 challenge.
 // It logs each stage through the Logger and cleans up DNS records afterwards.
 func (i *Issuer) Issue(ctx context.Context, domains []string) (certPEM, keyPEM string, err error) {
 	if len(domains) == 0 {
@@ -69,7 +69,7 @@ func (i *Issuer) Issue(ctx context.Context, domains []string) (certPEM, keyPEM s
 		return "", "", fmt.Errorf("订单 %s 状态 invalid%s", order.URI, errMsg)
 	}
 
-	// Step 3: Clean up any stale 历史修复 TXT records first, then present new challenges.
+	// Step 3: Clean up any stale DNS-01 TXT records first, then present new challenges.
 	type challengeInfo struct {
 		domain    string
 		tokenFQDN string
@@ -313,7 +313,7 @@ func dnsCleanupBudget(challengeCount int) time.Duration {
 type ChallengeInfo struct {
 	Domain    string
 	TokenFQDN string
-	// Value is the 历史修复 TXT value (key authorization digest) this record
+	// Value is the DNS-01 TXT value (key authorization digest) this record
 	// was presented with; cleanup removes only records of that value so
 	// concurrent issuances for the same domain cannot delete each other.
 	Value string
@@ -348,7 +348,7 @@ func (i *Issuer) waitForValidation(ctx context.Context, authURL, chalURL string)
 	}
 
 	// ZeroSSL validation can legitimately take several minutes, so allow a
-	// generous budget instead of failing fast into an 历史修复 retry.
+	// generous budget instead of failing fast into an order-recreating retry.
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 
@@ -433,7 +433,7 @@ func isACMERRateLimit(err error) bool {
 	return errors.As(err, &acmeErr) && acmeErr.StatusCode == http.StatusTooManyRequests
 }
 
-// dns01Challenge 返回授权中的 历史修复 挑战（无则 nil）。历史修复（历史）
+// dns01Challenge 返回授权中的 dns-01 挑战（无则 nil）。历史修复（历史）
 // 抽出供授权状态分流与常规路径共用，避免两处各写一遍遍历。
 func dns01Challenge(auth *acme.Authorization) *acme.Challenge {
 	if auth == nil {
@@ -519,7 +519,7 @@ func (i *Issuer) waitForDNS(ctx context.Context, fqdn, expected string, timeout 
 	for {
 		// Authoritative name servers first: every reachable server must have
 		// the record before we let the CA validate. Servers that fail to
-		// respond are dropped from the list so a 历史修复 server does
+		// respond are dropped from the list so a network-blocked server does
 		// not consume the propagation budget on every tick.
 		var authLastFound []string
 		var authLastResolver string
@@ -533,11 +533,11 @@ func (i *Issuer) waitForDNS(ctx context.Context, fqdn, expected string, timeout 
 			return nil
 		}
 
-		// W1（历史，用户裁定）：每轮并行于权威探测公共递归做共识统计。
+		// 历史修复（历史，用户裁定）：每轮并行于权威探测公共递归做共识统计。
 		// 放行判据二选一：①authReady（上）；②≥MinHits 台递归命中当前期望值
 		// ×连续 MinRounds 轮。权威全 miss 而递归命中的三形态（CNAME 委托/
 		// NS 变更/权威集群分裂）LE 验证均能跟随实际 DNS 状态成功，客户端
-		// 死等权威即恒超时；单台缓存超前（M9）由「多台共识×连续两轮」对冲。
+		// 死等权威即恒超时；单台缓存超前（历史修复）由「多台共识×连续两轮」对冲。
 		//
 		// 历史问题（历史）：各台并行探测（每台独立 ctx 超时）——串行时黑洞
 		// 解析器（8.8.8.8/1.1.1.1 各 UDP+TCP 两次 8s 超时）把单轮膨胀到
@@ -584,14 +584,14 @@ func (i *Issuer) waitForDNS(ctx context.Context, fqdn, expected string, timeout 
 		// （initialAuthServers 为空——域名没有可用 NS/解析失败）时，单台递归
 		// 命中即放行，此时递归确实是无权威可问时的唯一信号。
 		// 曾经有权威、而本轮全部探针瞬时失败的情形**不**适用该兜底：那是网络
-		// 抖动窗口，放行单台×单轮会绕过 M9 的 3 台×2 轮共识（缓存污染/超前
+		// 抖动窗口，放行单台×单轮会绕过 历史修复 的 3 台×2 轮共识（缓存污染/超前
 		// 会被当成真传播），CA 验证失败即消耗 Let's Encrypt 5 次/时配额。
 		if len(authServers) == 0 && len(initialAuthServers) == 0 && len(recursiveHits) > 0 {
 			log("DNS 已命中 %s @ %s, 值: %s（域名无可用权威，按递归单台放行）", fqdn, recursiveHits[0], expected)
 			return nil
 		}
 
-		// W2（历史）：权威存活台全 miss 持续超阈值且递归未达共识——显式
+		// 历史修复（历史）：权威存活台全 miss 持续超阈值且递归未达共识——显式
 		// 诊断一次（生产排障 30 秒自明根因，不再盲猜）。
 		if !divergenceDiagnosed && len(authServers) > 0 &&
 			time.Since(firstProbeAt) > propagationDivergenceDiagAfter {
@@ -620,7 +620,7 @@ func (i *Issuer) waitForDNS(ctx context.Context, fqdn, expected string, timeout 
 	}
 }
 
-// orNone 空切片显示占位（W2 诊断/超时清单用）。
+// orNone 空切片显示占位（历史修复 诊断/超时清单用）。
 func orNone(list []string) string {
 	if len(list) == 0 {
 		return "(无)"
@@ -628,13 +628,13 @@ func orNone(list []string) string {
 	return strings.Join(list, ",")
 }
 
-// W1/W2（历史，用户裁定）：waitForDNS 测试接缝（镜像 recursiveDNS* 先例：
+// 历史修复（历史，用户裁定）：waitForDNS 测试接缝（镜像 recursiveDNS* 先例：
 // var 而非 const，测试按比例缩放预算保持墙钟快速，生产代码不得改写）。
 var (
 	// resolveAuthoritativeNSFn 权威 NS 解析入口（测试替换为固定假权威清单）。
 	resolveAuthoritativeNSFn = resolveAuthoritativeNS
 	// propagationRecursiveResolvers 公共递归清单（中国友好解析器在前）——
-	// 单源：waitForDNS 共识统计与 checkRecursiveDNS 共用（历史问题 历史）。
+	// 单源：waitForDNS 共识统计与 checkRecursiveDNS 共用（历史问题）。
 	propagationRecursiveResolvers = []string{
 		"223.5.5.5:53",    // Alibaba AliDNS
 		"119.29.29.29:53", // Tencent DNSPod
@@ -650,7 +650,7 @@ var (
 	propagationDivergenceDiagAfter = 30 * time.Second
 	// 递归共识放行阈值：≥MinHits 台递归命中当前值 × 连续 MinRounds 轮。
 	// MinHits 下限=3、MinRounds 下限=2 由 TestPropagationConsensusDefaults
-	// 钉死（M9：单台/双台缓存超前不得放行，2026-10-13 用户裁定 2→3）。
+	// 钉死（历史修复：单台/双台缓存超前不得放行，2026-10-13 用户裁定 2→3）。
 	propagationConsensusMinHits   = 3
 	propagationConsensusMinRounds = 2
 )
@@ -774,7 +774,7 @@ func (i *Issuer) probeAuthServersLogged(ctx context.Context, servers []string, f
 }
 
 // dnsLogState 记录每个探针目标上一次打印的状态，使逐台命中/失败/未命中行
-// 仅在状态变化时输出（历史问题 历史，镜像 waitForValidation 的 lastChalStatus
+// 仅在状态变化时输出（历史问题，镜像 waitForValidation 的 lastChalStatus
 // 先例）。零值可用；nil 视为「总是变化」（首次必打）。
 type dnsLogState struct {
 	last map[string]string

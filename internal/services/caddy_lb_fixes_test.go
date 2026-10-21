@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// LB-04 曾钉 health_check_timeout NULL/0 行渲染兜底 2s；库值唯一真相批 1+2
+// 历史修复 曾钉 health_check_timeout NULL/0 行渲染兜底 2s；库值唯一真相批 1+2
 // （2026-10-14 用户裁定）废除写死兜底——health_check_timeout 为类型①值型列
 // （NOT NULL DEFAULT 2+启动回填+写侧 400+导入归一门）：fresh DDL 的 NOT NULL
 // 使 NULL 行结构上不可达（存量库可空列 NULL 由每启动回填报 2）；0 行=带外

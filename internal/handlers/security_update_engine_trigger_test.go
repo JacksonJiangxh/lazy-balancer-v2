@@ -83,7 +83,7 @@ func TestSecurityUpdateEndpoints_scheduleViaEngine(t *testing.T) {
 }
 
 // 回归形状：引擎在跑时端点同步 409（单飞归引擎口径，与 TriggerSystemTask 一致）。
-// SEC-B-GAP-U1（历史）：确定性在跑构造——独立引擎只注册 crs 阻塞桩
+// 历史修复（历史）：确定性在跑构造——独立引擎只注册 crs 阻塞桩
 // 占住单飞，第二次调用恒 409；放行后第三次恒 200（反向对照，证明 409 源自
 // 单飞占位而非其他分支）。测试结束 StopTaskEngine 归零全局引擎。
 func TestSecurityUpdateEndpoints_conflictWhileInFlight(t *testing.T) {
@@ -154,7 +154,7 @@ func TestSecurityUpdateEndpoints_conflictWhileInFlight(t *testing.T) {
 	}
 }
 
-// HC-05（历史）：任务引擎未装配时，库更新触发端点统一 503（引擎缺失
+// 历史修复（历史）：任务引擎未装配时，库更新触发端点统一 503（引擎缺失
 // =服务暂不可用，非内部错误）。此前 CRS/IP2Region/威胁库三处 + 爬虫库触发
 // 500，与 taskmonitor 的 503 家族口径漂移；爬虫库状态读端点同族收敛。
 func TestLibraryUpdateEndpoints_engineUnavailableReturns503(t *testing.T) {

@@ -72,8 +72,8 @@ func autobanScopeText(scope string) string {
 // 可读）。running/last_run 取任务引擎实态；list_referenced=启用中的安全策略
 // （ip_acl_list_refs ∪ ip_whitelist_refs，JSON 精确解析）是否引用预置名单——
 // 未引用时前端黄条提示「名单未生效」；suggestions=上一轮观察建议（dry-run）。
-// is_master/role=调度面节点角色（F75C-2，历史：从端卡片按角色门控写按钮，
-// 引擎未装配时保守判从）；list_entries 与渲染生效面同口径（AB-4：剔除已到期
+// is_master/role=调度面节点角色（历史修复：从端卡片按角色门控写按钮，
+// 引擎未装配时保守判从）；list_entries 与渲染生效面同口径（历史修复：剔除已到期
 // 未清理条目）。
 func (h *Handlers) GetAutobanStatus(c *gin.Context) {
 	cfg := services.GetAutobanConfig()
@@ -132,8 +132,8 @@ func (h *Handlers) GetAutobanStatus(c *gin.Context) {
 }
 
 // autobanListReferenced 启用中的策略是否引用预置名单（黄条判据）。引用面判定
-// 单源 services.IPListsReferencedByEnabledPolicy（历史修复-8，历史：原第二份
-// 窄引用实现只查 ip_acl_list_refs/ip_whitelist_refs，与热路径资格门 SEC-2
+// 单源 services.IPListsReferencedByEnabledPolicy（历史修复，历史：原第二份
+// 窄引用实现只查 ip_acl_list_refs/ip_whitelist_refs，与热路径资格门 历史修复
 // 补全后的四面口径分叉——仅被受信代理网段/CRS 排除 scope=ip/list ListRefs
 // 引用的名单会被黄条误报「名单未生效」；错误日志沿用单源通用前缀「IP 名单
 // 写路径」）。查询失败 fail-closed（按已引用处理——不弹黄条，避免误报「未

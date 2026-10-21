@@ -1,8 +1,8 @@
-// FE40-D1-2：负载策略→文案映射（Rules/Dashboard 共用）。
+// 历史修复：负载策略→文案映射（Rules/Dashboard 共用）。
 // 键集与后端 httpStrategies 全集对齐（weighted_round_robin/least_conn/
 // ip_hash/random/first/cookie）；Dashboard 原死键 round_robin 与 Rules 原
 // 死键 header 已删除（后端不接受该两形态）。
-// FE65-6：映射对象收窄为模块内私有（外泄面只剩 getStrategyLabel 一个函数，
+// 历史修复：映射对象收窄为模块内私有（外泄面只剩 getStrategyLabel 一个函数，
 // 消费方禁止绕过函数直读映射，防第二份映射/直改键值）
 const strategyLabels: Record<string, string> = {
   weighted_round_robin: '轮询',

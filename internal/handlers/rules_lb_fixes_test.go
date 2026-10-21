@@ -15,7 +15,7 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// ---- LB-01：CreateRule 支持显式 enabled（缺省=启用，显式 false=禁用）----
+// ---- 历史修复：CreateRule 支持显式 enabled（缺省=启用，显式 false=禁用）----
 
 func TestCreateRule_persists_explicit_enabled_false(t *testing.T) {
 	// Given：UI 复制向导以 enabled:false 创建副本（预览展示「禁用」）
@@ -75,7 +75,7 @@ func TestCreateRule_defaults_to_enabled_when_field_absent(t *testing.T) {
 	}
 }
 
-// ---- LB-02：UpdateRule 的 TCP 三字段指针化（nil=沿用存量，显式 0=真实零值）----
+// ---- 历史修复：UpdateRule 的 TCP 三字段指针化（nil=沿用存量，显式 0=真实零值）----
 
 func seedTCPRuleForZeroMerge(t *testing.T, caddyID string, listenPort int) {
 	t.Helper()
@@ -160,7 +160,7 @@ func TestUpdateRule_keeps_tcp_fields_when_absent(t *testing.T) {
 	}
 }
 
-// ---- LB-03：监听端口不得与本进程管理端口（面板口/Caddy admin 口）冲突 ----
+// ---- 历史修复：监听端口不得与本进程管理端口（面板口/Caddy admin 口）冲突 ----
 
 func TestCreateRule_rejects_configured_admin_panel_port(t *testing.T) {
 	// Given：部署把管理面板端口配置为 8800（非硬编码默认 8000）
@@ -206,7 +206,7 @@ func TestUpdateRule_rejects_configured_admin_panel_port(t *testing.T) {
 	}
 }
 
-// ---- LB-04 曾钉「读取口径 health_check_timeout NULL 默认 2」；库值唯一真相
+// ---- 历史修复 曾钉「读取口径 health_check_timeout NULL 默认 2」；库值唯一真相
 // 批 1+2：health_check_timeout 为 NOT NULL 值型列（fresh DDL），NULL 行结构上
 // 不可达——存量库可空列 NULL 由启动回填报 2 后直读，读侧 COALESCE 归一退役。
 // 展示层直读库值，无缺省替换。
@@ -256,7 +256,7 @@ func TestListRules_displaysStoredHealthCheckTimeoutVerbatim(t *testing.T) {
 	t.Fatalf("seeded rule lb_hcnull missing from list response: %s", response.Body.String())
 }
 
-// ---- LB-13：caddy-config 响应并列返回规则全部路由（主路由+路径路由等兄弟路由）----
+// ---- 历史修复：caddy-config 响应并列返回规则全部路由（主路由+路径路由等兄弟路由）----
 
 func TestGetRuleCaddyConfig_returns_sibling_path_routes(t *testing.T) {
 	// Given：启用自定义路由的规则；运行配置含其主路由与两条路径路由（及其他规则路由）
@@ -327,8 +327,8 @@ func TestGetRuleCaddyConfig_returns_sibling_path_routes(t *testing.T) {
 	}
 }
 
-// ---- 历史问题（历史 历史问题）：UpdateRule 健康检查双阈值指针化 ----
-// （nil=沿用存量，显式值落库；显式 0=落库 0=渲染默认 3/2，与 LB-02 M16 同口径）
+// ---- 历史问题（历史）：UpdateRule 健康检查双阈值指针化 ----
+// （nil=沿用存量，显式值落库；显式 0=落库 0=渲染默认 3/2，与 历史修复 同口径）
 
 func seedHCThresholdRule(t *testing.T, caddyID string, listenPort int) {
 	t.Helper()
@@ -419,7 +419,7 @@ func TestUpdateRule_persists_explicit_health_check_thresholds(t *testing.T) {
 	}
 }
 
-// ---- 历史问题（历史 历史问题）：健康检查双阈值负值 400（>=0 放行，0=默认语义）----
+// ---- 历史问题（历史）：健康检查双阈值负值 400（>=0 放行，0=默认语义）----
 
 func TestCreateRule_rejects_negative_health_check_thresholds(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
@@ -472,7 +472,7 @@ func TestUpdateRule_rejects_negative_health_check_thresholds(t *testing.T) {
 	}
 }
 
-// D1-历史问题：定向预览与全量渲染同为 fail-visible；存量非法 protocol 不得
+// 历史问题：定向预览与全量渲染同为 fail-visible；存量非法 protocol 不得
 // 被吞成 200 + 空 server_context。
 func TestGetRuleCaddyConfig_unsupportedProtocolReturnsError(t *testing.T) {
 	initializeRuleFeatureTestDB(t)

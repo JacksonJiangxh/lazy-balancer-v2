@@ -1,6 +1,6 @@
 package handlers
 
-// 历史 历史问题-13：BatchRuleBlockPages 的逐规则 UPDATE 必须带同值守卫——
+// 历史问题-13：BatchRuleBlockPages 的逐规则 UPDATE 必须带同值守卫——
 // 修复前同值批量（拦截页/状态码未变）同样 UPDATE 命中全部行，触发 lb_rules
 // 行级同步触发器（阶段页四列在 OF 清单内）→ 同值操作引发全集群快照重放。
 // 历史问题（历史）：bound 改按 RowsAffected>0 计（真实变更），同值命中计入

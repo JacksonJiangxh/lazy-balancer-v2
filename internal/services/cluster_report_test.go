@@ -15,7 +15,7 @@ import (
 	"lazy-balancer-v2/internal/models"
 )
 
-// 历史问题-1(D1):主节点启用管理 HTTPS 后,跨主机/未跟随的 3xx 会以空 body
+// 历史问题-1(历史修复):主节点启用管理 HTTPS 后,跨主机/未跟随的 3xx 会以空 body
 // 落到既有分支——Report 此前把 3xx 当成功静默吞掉,RegisterWithMaster 则报
 // 「解析注册响应: unexpected end of JSON input」让运维无从下手。两处都须
 // 在读 body 前给可行动错误(仿 Pull 的 3xx 分支文案)。
@@ -132,7 +132,7 @@ func TestSyncService_RegisterWithMaster_returnsActionableErrorOnUnfollowedRedire
 
 // 历史问题：临期统计覆盖仍可能代表当前证书材料的 downloaded/failed 行，
 // 不只 issued；waiting_ca 不属于部署完成/待部署证书材料口径。
-// D2-历史问题（历史）：部署生命周期 cleanup_dns/cleanup_warning（材料已落库、
+// 历史问题（历史）：部署生命周期 cleanup_dns/cleanup_warning（材料已落库、
 // 待部署）同样必须计入——此前与规则页/任务页到期口径分叉。
 func TestSyncService_Report_countsExpiringCertificatesAcrossDeployableStates(t *testing.T) {
 	_, database := newClusterTestService(t)
@@ -192,7 +192,7 @@ func TestSyncService_Report_countsExpiringCertificatesAcrossDeployableStates(t *
 	}
 }
 
-// S历史问题-09：cert_expiry_days 非法时按状态转换只记一次 warn，恢复记一次 info。
+// 历史问题-09：cert_expiry_days 非法时按状态转换只记一次 warn，恢复记一次 info。
 func TestReport_certExpiryWarnOnlyOnStateTransition(t *testing.T) {
 	// 隔离共享状态转换 map 的该 key（同 metrics_test.go isolateMetricsState 范式）：
 	// 同文件其它 Report 用例可能已把该 key 置为 failed，状态机对「已失败→再失败」

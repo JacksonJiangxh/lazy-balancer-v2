@@ -105,7 +105,7 @@ func (transport *flakyTransport) RoundTrip(request *http.Request) (*http.Respons
 
 // 记录日志继续轮询——限流错误被吞成 10 分钟超时，丢失限流语义（外层
 // detectRateLimit 接不到 *acme.Error，任务无法进入 waiting_ca 按
-// Retry-After 退避），且轮询持续给已被限流的 CA 加压。429 必须立即上抛。
+// 历史修复 退避），且轮询持续给已被限流的 CA 加压。429 必须立即上抛。
 func TestIssuer_waitForValidation_returnsRateLimitErrorImmediately(t *testing.T) {
 	// Given: CA 对 challenge 轮询恒返 429
 	fake := newValidationPollServer(t)
@@ -129,7 +129,7 @@ func TestIssuer_waitForValidation_returnsRateLimitErrorImmediately(t *testing.T)
 	}
 }
 
-// F49-9 回归形状：非 429 的瞬时错误（transport 级网络失败）维持「日志+重试」
+// 历史修复 回归形状：非 429 的瞬时错误（transport 级网络失败）维持「日志+重试」
 // 口径——轮询恢复后照常完成验证。
 func TestIssuer_waitForValidation_retriesTransientErrors(t *testing.T) {
 	// Given: 前两次 challenge 轮询 transport 级失败，授权在 challenge

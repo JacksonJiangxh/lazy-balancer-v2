@@ -1,4 +1,4 @@
-// 威胁大屏共享纯函数验收（历史 历史问题 / 历史问题 / 历史问题）：
+// 威胁大屏共享纯函数验收（历史问题 / 历史问题）：
 //   A. 热力数据指纹：相同→true；计数/长度/重复键变化→false
 //   B. 弧线端点：终点恒为当前本站坐标（setServer 后新弧线随新坐标）
 //   C. 危险等级化简：检测模式 12 分边界（原恒等三元 >=6 与 <6 同值）
@@ -54,7 +54,7 @@ test('B 弧线端点：终点跟随当前本站坐标（构造期常量即失效
   assert.notEqual(first.endLat, second.endLat)
 })
 
-// WT87-09：台湾归一/短名/计数合并此前零断言——热力、命中、下钻三处都靠它们。
+// 历史修复：台湾归一/短名/计数合并此前零断言——热力、命中、下钻三处都靠它们。
 // 失效时台湾点阵不与大陆同色、下钻/命中回退 FALLBACK_CENTROID（中太平洋），
 // 且没有任何测试会拦住。
 test('台湾归一：Taiwan/台湾 → 中国，其他国名原样（用户裁定 2026-10-18）', () => {
@@ -91,14 +91,75 @@ test('省短名：34 省后缀逐条剥离，非行政后缀不动（与后端 i
   assert.equal(adminShortName('省'), '省')
 })
 
-test('省级统计边界：仅中国有省级数据源，海外下钻必须显示「无省级统计」（WT87-11）', () => {
+test('省级统计边界：仅中国有省级数据源，海外下钻必须显示「无省级统计」（历史修复）', () => {
   assert.equal(hasProvinceStats('中国'), true)
   assert.equal(hasProvinceStats('美国'), false)
   assert.equal(hasProvinceStats(''), false)
 })
 
-test('下钻续体作废：seq 过期或已销毁一律丢弃（双引擎共用判定，WT87-03）', () => {
+test('下钻续体作废：seq 过期或已销毁一律丢弃（双引擎共用判定，历史修复）', () => {
   assert.equal(drillCommitAllowed(3, 3, false), true)
   assert.equal(drillCommitAllowed(2, 3, false), false, '复位/返回递增 seq 后迟到续体必须丢弃')
   assert.equal(drillCommitAllowed(3, 3, true), false, '退出大屏后不得再操作已销毁引擎')
+})
+
+// 历史修复：省点阵 bbox 预筛钉测——预筛只是跳点优化，产出必须与无预筛
+// 形态逐点一致（宽幅国家下 34 省 × 全网格直接 pointInPolys 是首次下钻长任务，
+// 与 threatScene.ts 省级 bbox 预筛同构）。
+import { provinceDotGrid } from '../src/utils/threatShared.ts'
+import { pointInPolys } from '../src/utils/threatShared.ts'
+
+function rectPoly(minLon: number, minLat: number, maxLon: number, maxLat: number): number[][][] {
+  return [[[minLon, minLat, maxLon, minLat, maxLon, maxLat, minLon, maxLat, minLon, minLat]]]
+}
+
+/** 无预筛参照实现：与 provinceDotGrid 同网格语义，但逐格点对全部省份做射线判定。 */
+function provinceDotGridNoPrefilter(
+  source: readonly { name: string; polys: number[][][] }[],
+  step: number,
+): { lat: number; lng: number; key: string }[] {
+  let minLon = 180, maxLon = -180, minLat = 90, maxLat = -90
+  for (const pv of source) {
+    for (const poly of pv.polys) for (const ring of poly) for (let k = 0; k + 1 < ring.length; k += 2) {
+      if (ring[k] < minLon) minLon = ring[k]
+      if (ring[k] > maxLon) maxLon = ring[k]
+      if (ring[k + 1] < minLat) minLat = ring[k + 1]
+      if (ring[k + 1] > maxLat) maxLat = ring[k + 1]
+    }
+  }
+  const dots: { lat: number; lng: number; key: string }[] = []
+  let row = 0
+  for (let lat = minLat; lat <= maxLat; lat += step, row++) {
+    const offset = row % 2 === 1 ? step / 2 : 0
+    for (let lon = minLon + offset; lon <= maxLon; lon += step) {
+      for (const pv of source) {
+        if (!pointInPolys(lon, lat, pv.polys)) continue
+        dots.push({ lat, lng: lon, key: adminShortName(pv.name) })
+        break
+      }
+    }
+  }
+  return dots
+}
+
+test('省点阵 bbox 预筛与无预筛形态产出逐点一致（宽幅/远距/多边形组）', () => {
+  const source = [
+    // 宽幅省：横跨大部分经度域（预筛几乎不跳点，回归形状）
+    { name: '宽幅省', polys: rectPoly(-170, 40, 170, 60) },
+    // 远距小省：绝大部分格点被 bbox 预筛跳过（目标形状）
+    { name: '小岛省', polys: rectPoly(10, -20, 12.5, -17.5) },
+    // 多边形组省：两段分离多边形（畸形形状：bbox 大于实际覆盖）
+    { name: '双片省', polys: [...rectPoly(-60, -40, -55, -35), ...rectPoly(60, 0, 65, 5)] },
+  ]
+  for (const step of [2.5, 5]) {
+    assert.deepEqual(
+      provinceDotGrid(source, step),
+      provinceDotGridNoPrefilter(source, step),
+      `step=${step} 预筛产出必须与无预筛一致`,
+    )
+  }
+  // 键名走共享短名口径
+  const dots = provinceDotGrid([{ name: '广东省', polys: rectPoly(110, 20, 112, 22) }], 1)
+  assert.ok(dots.length > 0)
+  assert.equal(dots[0].key, '广东')
 })

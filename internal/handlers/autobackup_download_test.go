@@ -14,7 +14,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// U7b-F1（历史）：备份下载 Stat→FileAttachment 的 TOCTOU（备份完成
+// 历史修复（历史）：备份下载 Stat→FileAttachment 的 TOCTOU（备份完成
 // prune 掉在下载文件→Stat 过打开失败 panic/500+审计先于交付虚记）。
 // 修复=句柄先行（os.Open 成功后才审计+流式交付）。竞态形态不可确定性
 // 注入——以下为交付形状基线钉+缺失文件回归钉（结构修复见实现）。

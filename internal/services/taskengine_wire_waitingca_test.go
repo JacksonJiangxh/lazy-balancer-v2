@@ -1,7 +1,7 @@
 package services
 
-// F-历史问题-01（历史，历史问题）：cert-waiting-ca Run 体「!certJobsActive() →
-// StopLoop」存在 T0 读后 T1 入队竞态窗口——续期扫描入队侧 StartLoop 先落地、
+// 历史问题-01（历史）：cert-waiting-ca Run 体「!certJobsActive() →
+// StopLoop」存在 T0 读后 历史修复 入队竞态窗口——续期扫描入队侧 StartLoop 先落地、
 // Run 侧 StopLoop 后落地时，最终态=任务活跃但调度已停（无人再唤醒，滞留到
 // 下次入队/重启）。修复：StopLoop 后复检 certJobsActiveFn——活跃则重新
 // StartLoop 拉回（复检之后的新入队由入队侧 StartLoop 承担，窗口闭合）。

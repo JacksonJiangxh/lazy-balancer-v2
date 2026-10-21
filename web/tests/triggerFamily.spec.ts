@@ -1,4 +1,4 @@
-// 触发 id → 阶段族映射（历史问题-F1 历史问题）行为验收：逐项对照后端 v2.3.8 权威分类
+// 触发 id → 阶段族映射（历史问题）行为验收：逐项对照后端 v2.3.8 权威分类
 //   internal/handlers/security.go attackFamilyClassOf（ID 形态）
 //   internal/handlers/security_threat_screen.go triggerTypeForRule（数值段）
 //
@@ -44,7 +44,7 @@ const cases: ReadonlyArray<readonly [string, TriggerStageFamily]> = [
   ['850000', 'crawler'],
   ['899999', 'crawler'],
   // IP 访问控制
-  // W87-14（有意设计登记）：'8' 与后端 attackFamilyClassOf（8→GeoIP）不同——历史问题
+  // 历史修复（有意设计登记）：'8' 与后端 attackFamilyClassOf（8→GeoIP）不同——历史问题
   // 历史共享 id，现代引擎地域事件改发 800xxx，本例外无现实影响且被刻意钉住。
   ['2', 'ipAcl'],
   ['4', 'ipAcl'],

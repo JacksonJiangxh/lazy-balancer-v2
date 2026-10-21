@@ -12,7 +12,7 @@ import (
 // 镜像内 /app/waf.dist/crawler-ip-lists.seed.json 由 Dockerfile 从**同一路径**
 // COPY——同一份字节同时服务「镜像资产」与「离线回退」两个消费面。
 //
-// PD-04（历史）：此前该数据在 config/ 下作为镜像资产，而 internal/services
+// 历史修复（历史）：此前该数据在 config/ 下作为镜像资产，而 internal/services
 // 另存一份手写 Go 表；两份逐渐分叉（手写表 gptbot 仅 3 条且含官方已不发布的
 // 20.191.0.0/16 超网——若 gptbot 改 iprange 验证即为 fail-open）。手写表已删除，
 // services 的回退直接取 BuiltinCrawlerIPLists，结构上不可能再分叉。

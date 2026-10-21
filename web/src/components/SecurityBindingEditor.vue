@@ -18,8 +18,8 @@
           <span class="bind-stage-title">{{ section.title }}</span>
           <span class="bind-stage-head-meta">
             <span class="bind-stage-count">已选 {{ section.selection.value.length }} 条</span>
-            <!-- 存量多限流绑定（历史 历史问题 裁定：运行兼容 + 保存即引导清理）：单选控件
-                 仅展示首条，徽标使显示与 ruleModeTotal 计数口径一致（历史 历史问题-37） -->
+            <!-- 存量多限流绑定（历史问题 裁定：运行兼容 + 保存即引导清理）：单选控件
+                 仅展示首条，徽标使显示与 ruleModeTotal 计数口径一致（历史问题-37） -->
             <el-tag
               v-if="section.single && section.selection.value.length > 1"
               type="warning"
@@ -268,7 +268,7 @@ const pickerPagedRules = computed(() => {
   return pickerFilteredRules.value.slice(start, start + PICKER_PAGE_SIZE)
 })
 
-// FE71-2（R-12 同族，对照 SecurityPolicies 同名选择器先例）：搜索收窄后高页码
+// 历史修复（历史修复 同族，对照 SecurityPolicies 同名选择器先例）：搜索收窄后高页码
 // 会落在空页，回到第 1 页
 watch(pickerSearch, () => {
   pickerPage.value = 1
@@ -375,7 +375,7 @@ const submit = async (): Promise<void> => {
     try {
       // mixed 不携带提交：后端按提交集全量替换绑定（携带 mixed 会被拒绝，不含
       // mixed 的提交会静默剥离）；存在已绑 mixed 时保存按钮已禁用，不会走到这里。
-      // 响应经 showSaveResult 统一呈现（历史 历史问题）：退化 200（DB 已提交
+      // 响应经 showSaveResult 统一呈现（历史问题）：退化 200（DB 已提交
       // 但 Caddy 应用失败）带 message 后缀时必须常驻警告，原实现丢弃返回值。
       const res = await request.put<APIResponse>(`/security/rules/${encodeURIComponent(rule.caddy_id)}/policies`, {
         policy_ids: [...bindStage0.value, ...bindStage1.value, ...bindStage2.value, ...bindStage3.value],
@@ -430,7 +430,7 @@ const submit = async (): Promise<void> => {
     emit('update:modelValue', false)
     emit('saved')
   } catch (error: unknown) {
-    // 与规则侧对齐（历史 历史问题）：原无 catch → 请求失败产生 unhandled
+    // 与规则侧对齐（历史问题）：原无 catch → 请求失败产生 unhandled
     // rejection（全局拦截器已 toast，这里仅记录并保持弹框可重试）
     console.error('save policy bindings failed', error)
   } finally {

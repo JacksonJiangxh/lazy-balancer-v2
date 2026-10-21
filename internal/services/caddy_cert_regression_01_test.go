@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-// 历史修复 A-N1 回归锁定：tx 渲染路径的 ACME 证书候选可见性。
+// 历史修复 回归锁定：tx 渲染路径的 ACME 证书候选可见性。
 
 // 谓词 miss 补查：事务引入/翻转的 acme 规则（已提交视图的 lb_rules 子查询将其
 // 排除——UpdateRule manual→acme、EnableRule、v2 导入新 caddy_id 三形态同根）

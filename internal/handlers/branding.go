@@ -97,10 +97,10 @@ var brandingStore = struct {
 // brandingFailureProbeWindow 失败探测/日志的限流窗口（历史问题）。
 const brandingFailureProbeWindow = time.Minute
 
-// loadBrandingConfig returns the 历史修复 branding snapshot, transparently
+// loadBrandingConfig returns the in-memory branding snapshot, transparently
 // reloading when the file's mtime/size changed (or dataDir switched).
 // Absent file or empty fields mean "use the default for that field";
-// 历史修复 fields are rendered verbatim (never merged with defaults).
+// non-empty fields are rendered verbatim (never merged with defaults).
 func loadBrandingConfig(dataDir string) brandingConfig {
 	path := filepath.Join(dataDir, "branding.json")
 	st, stErr := os.Stat(path)
@@ -115,7 +115,7 @@ func loadBrandingConfig(dataDir string) brandingConfig {
 		return cfg
 	}
 	// 历史问题：stat 失败（文件缺失/不可读）且近期已探测过失败 → 直接返回
-	// 历史修复，不再每请求重读+记日志；文件恢复（stat 成功）即走
+	// last-known-good，不再每请求重读+记日志；文件恢复（stat 成功）即走
 	// 慢路径立即收敛。
 	if stErr != nil && brandingStore.loaded && brandingStore.dataDir == dataDir &&
 		!brandingStore.failedProbeAt.IsZero() && time.Since(brandingStore.failedProbeAt) < brandingFailureProbeWindow {
@@ -210,7 +210,7 @@ func brandingReloadDetail(prev, next brandingConfig) string {
 	return services.FormatAuditDetail(filtered...)
 }
 
-// readBrandingFile reads and parses branding.json with 历史修复 fallback
+// readBrandingFile reads and parses branding.json with field-level fallback
 // (2026-09-11 裁定):整体 JSON 非法 → 全字段默认;单字段类型错(如数字)
 // → 仅该字段回退默认,其余字段正常生效。字段空值/null 由消费方按
 // 「该字段用默认」语义处理。
@@ -311,7 +311,7 @@ type brandingResponse struct {
 	LandingUsesDefault bool   `json:"landing_uses_default"`
 }
 
-// brandingSyncGate 60s 采样门（历史 历史问题，用户裁定）：GetBranding 是公开
+// brandingSyncGate 60s 采样门（历史问题，用户裁定）：GetBranding 是公开
 // 无鉴权端点，幂等同步/种子/镜像每请求 ~7 条 SQL 是残余放大面——boot+首请求
 // 已完成播种，门内跳过仅推迟带外变更 ≤60s 可见。branding.json 为手工编辑/
 // 集群同步文件，无管理面写路径（因此无需写侧主动失效）；内容热重载由 stat
@@ -398,7 +398,7 @@ func (h *Handlers) GetBranding(c *gin.Context) {
 // renderDefaultBlockPage renders the branded default block page; consumed by
 // SeedDefaultBlockPage(种子默认拦截页)与预览路径。
 func renderDefaultBlockPage(cfg brandingConfig) string {
-	// 页脚由 renderBlockPageShell 内部按同一 cfg 构建（历史补充轮 历史问题：
+	// 页脚由 renderBlockPageShell 内部按同一 cfg 构建（历史 历史问题：
 	// 此处曾有逐字重复的死计算，已删）。
 	return renderBlockPageShell(cfg, blockPageSpecs["default"])
 }
@@ -474,7 +474,7 @@ func renderBlockPageShell(cfg brandingConfig, spec blockPageSpec) string {
 <html lang="zh-CN">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>%s — %s</title>
 <style>
-* { margin: 0; padding: 0; 历史修复; }
+* { margin: 0; padding: 0; box-sizing: border-box; }
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; min-height: 100vh; display: flex; align-items: center; justify-content: center; background: linear-gradient(165deg, #f8fafc 0%%, #f1f5f9 45%%, #eef2f7 100%%); position: relative; overflow: hidden; }
 .blob { position: absolute; border-radius: 50%%; filter: blur(70px); }
 .blob-a { width: 380px; height: 380px; background: rgba(59,130,246,.10); top: -120px; right: -80px; }
@@ -520,7 +520,7 @@ p strong { color: #334155; font-weight: 600; }
 }
 
 // blockPageFooterHTML escapes the footer text and linkifies bare http(s) URLs,
-// keeping 历史修复 branding content inert in the block page.
+// keeping user-controlled branding content inert in the block page.
 func blockPageFooterHTML(text string) string {
 	esc := strings.ReplaceAll(text, "&", "&amp;")
 	esc = strings.ReplaceAll(esc, "<", "&lt;")
@@ -543,7 +543,7 @@ var builtinBlockPageIdentities = []builtinBlockPageIdentity{
 	{9002, "系统维护页面", "系统内置维护页面（备选，手动选用后生效）", "maintenance"},
 }
 
-// SeedDefaultBlockPage 历史修复 the default block page row (is_default=1) from
+// SeedDefaultBlockPage re-renders the default block page row (is_default=1) from
 // branding.json，并对内置备选页（id 9001 限流/9002 维护，2026-09-25 用户裁定）
 // 播种+自愈——内容漂移或 is_builtin 标志丢失（备份导入/带外改库形态）均归位
 // 库存。Idempotent: an unchanged render writes nothing (updated_at is
@@ -562,7 +562,7 @@ func SeedDefaultBlockPage(dataDir string) (bool, error) {
 	}
 	if !isMaster {
 		// The default block page content is owned by the master and arrives on
-		// slaves via cluster sync; branding.json is 历史修复, so 历史修复
+		// slaves via cluster sync; branding.json is node-local, so re-rendering
 		// here would overwrite the synced content with local defaults.
 		return false, nil
 	}
@@ -570,7 +570,7 @@ func SeedDefaultBlockPage(dataDir string) (bool, error) {
 	content := renderDefaultBlockPage(cfg)
 	// 默认页 历史修复 恒 html（带外改库漂移自愈；白名单类型不影响——
 	// 渲染处空值回退与写侧白名单把守，此处仅归位默认页）。
-	result, err := db.DB.Exec(`UPDATE security_block_pages SET content=?, content_type=?, updated_at=datetime('now') WHERE is_default=1 AND (COALESCE(content,'') != ? OR COALESCE(content_type,'') != ?) /* 历史 历史问题：content=NULL 行 != ? 为 NULL 不命中——COALESCE 同 content_type 侧 */`, content, models.DefaultBlockPageContentType, content, models.DefaultBlockPageContentType)
+	result, err := db.DB.Exec(`UPDATE security_block_pages SET content=?, content_type=?, updated_at=datetime('now') WHERE is_default=1 AND (COALESCE(content,'') != ? OR COALESCE(content_type,'') != ?) /* 历史问题：content=NULL 行 != ? 为 NULL 不命中——COALESCE 同 content_type 侧 */`, content, models.DefaultBlockPageContentType, content, models.DefaultBlockPageContentType)
 	if err != nil {
 		return false, fmt.Errorf("更新默认拦截页面内容: %w", err)
 	}
@@ -584,7 +584,7 @@ func SeedDefaultBlockPage(dataDir string) (bool, error) {
 			return changed, fmt.Errorf("播种内置拦截页面 %d: %w", bp.id, err)
 		}
 		// 历史修复（历史）：name/description/content 裸 != 对 NULL 不命中（带外改库
-		// 置 NULL 正是本函数自称要自愈的形态）——COALESCE 同 :510 默认页历史 历史问题
+		// 置 NULL 正是本函数自称要自愈的形态）——COALESCE 同 :510 默认页历史问题
 		// 修复口径（name 列 NOT NULL，一并包仅为统一口径）。
 		// 历史问题：UPDATE 增身份守卫——INSERT OR IGNORE 因 id 冲突未插入时，无守卫的
 		// UPDATE 会按 id 改写「占用了内置 id 的自定义页」。身份判据=is_builtin=1

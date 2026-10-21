@@ -26,7 +26,7 @@ caddy_http_requests_total{handler="headers",host="go029.com",server="http_443"} 
 
 func TestRateLimitBlocksParse_aggregatesPerHostByCode429(t *testing.T) {
 	// Given metrics text mixing codes, handlers, methods, servers, and sibling histogram series
-	// When the counters are parsed——仅按 code="429" 过滤（handler 标签自 F3 起恒为
+	// When the counters are parsed——仅按 code="429" 过滤（handler 标签自 历史修复 起恒为
 	// 主路由链首 headers，不可作区分维度；上游自返 429 如实纳入计数，卡片已标注口径）
 	counts := parseRateLimit429Counts(rateLimit429MetricsFixture)
 
@@ -248,7 +248,7 @@ func TestScrapeRateLimitBlocks_emptyMetricsReturnsNonNilSlice(t *testing.T) {
 	}
 }
 
-// V87-TO-09：按 Prometheus exposition 规范解码标签值转义（\\ \" \n）——
+// 历史修复：按 Prometheus exposition 规范解码标签值转义（\\ \" \n）——
 // 此前反斜杠被吞掉后原样写下一字节，\n 被解析成字面 n。规范未定义的转义
 // （\t 等）原样保留（含反斜杠），不静默丢字节。
 func TestParsePromLabelPairs_prometheusEscapes(t *testing.T) {

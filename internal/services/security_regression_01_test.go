@@ -40,7 +40,7 @@ func clusterVersion(t *testing.T) int64 {
 }
 
 // TestNormalizeLegacySecurityPolicyEnums_normalizesAndBumps_whenLegacyRowsExist
-// 验证 历史修复 发现1：遗留枚举空串行在启动时被归一到 Create 侧默认值
+// 验证 历史修复：遗留枚举空串行在启动时被归一到 Create 侧默认值
 // （ip_acl_mode→deny、mode→off、geoip_mode→deny），合法行不受影响；实际变更
 // >0 且为主节点时集群版本 +1，让从节点随下次同步收敛。
 func TestNormalizeLegacySecurityPolicyEnums_normalizesAndBumps_whenLegacyRowsExist(t *testing.T) {
@@ -177,7 +177,7 @@ func TestNormalizeLegacySecurityPolicyEnums_slaveSkipsNormalize(t *testing.T) {
 }
 
 // TestNormalizeLegacySecurityPolicyEnums_backfillsZeroAnomalyThreshold 验证
-// 历史修复 B-N5：历史修复 F3 之前落库的 anomaly_threshold=0 行随启动归一为 5（UI 显示 0
+// 历史修复：历史修复 之前落库的 anomaly_threshold=0 行随启动归一为 5（UI 显示 0
 // 而发射端 >0 判断跳过阈值 SecAction、CRS 回落默认 5 的展示/行为漂移闭合）。
 func TestNormalizeLegacySecurityPolicyEnums_backfillsZeroAnomalyThreshold(t *testing.T) {
 	setupSecurityEnumTestDB(t)
@@ -204,7 +204,7 @@ func TestNormalizeLegacySecurityPolicyEnums_backfillsZeroAnomalyThreshold(t *tes
 	}
 }
 
-// 批 3 扩展（历史修复 B-N5 同族）：负值行同归一——回填口径从 `=0` 扩为 `<=0`
+// 批 3 扩展（历史修复 同族）：负值行同归一——回填口径从 `=0` 扩为 `<=0`
 // （写侧 max1(x,5)/枚举白名单恒产生正值，负值只能是带外直写）。
 func TestNormalizeLegacySecurityPolicyEnums_backfillsNegativeAnomalyThreshold(t *testing.T) {
 	setupSecurityEnumTestDB(t)
@@ -257,7 +257,7 @@ func TestNormalizeLegacySecurityPolicyEnums_backfillsInvalidBlockStatusCode(t *t
 		t.Fatalf("off-enum-451 block_status_code=%d, want 403（451 非写侧白名单值，SQL 直写形态归一）", got)
 	}
 	if got := readStatus("legacy-429"); got != 403 {
-		t.Fatalf("legacy-429 block_status_code=%d, want 403（SEC44-1 既有归一保持）", got)
+		t.Fatalf("legacy-429 block_status_code=%d, want 403（历史修复 既有归一保持）", got)
 	}
 	if got := readStatus("valid-503"); got != 503 {
 		t.Fatalf("valid-503 block_status_code=%d, want 503（合法值不受影响）", got)

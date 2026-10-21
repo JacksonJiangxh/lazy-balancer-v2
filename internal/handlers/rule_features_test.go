@@ -497,7 +497,7 @@ func TestCreateRule_persists_requested_DNS_family(t *testing.T) {
 			handler, _ := newRuleFeatureTestHandlersWithCapture(t)
 			router := gin.New()
 			router.POST("/rules", handler.CreateRule)
-			// N+12 历史问题：TCP+dynamic_dns 保存侧已拒绝，dns_family 持久化改用 HTTP 载体。
+			// 历史问题：TCP+dynamic_dns 保存侧已拒绝，dns_family 持久化改用 HTTP 载体。
 			body := strings.NewReader(fmt.Sprintf(`{"name":"dns-%s","protocol":"http","domain":"dns-%s.example.test","listen_port":%d,"dynamic_dns":true,"dns_family":"%s","health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"example.test","port":9000,"enabled":true}]}`, test.family, test.family, test.port, test.family))
 			request := httptest.NewRequest(http.MethodPost, "/rules", body)
 			request.Header.Set("Content-Type", "application/json")
@@ -681,7 +681,7 @@ func TestReplacePathRulesTx_replaces_all_rows_and_preserves_nullable_upstreams(t
 	}
 }
 
-// 历史 历史问题: loader 与渲染侧同口径（NULL 视禁用）——此前 COALESCE(enabled,1)
+// 历史问题: loader 与渲染侧同口径（NULL 视禁用）——此前 COALESCE(enabled,1)
 // 把遗留 NULL 行视为启用，UI 显示与生成配置分裂。
 func TestLoadUpstreamsBatch_defaults_NULL_enabled_to_false(t *testing.T) {
 	// Given
@@ -706,7 +706,7 @@ func TestLoadUpstreamsBatch_defaults_NULL_enabled_to_false(t *testing.T) {
 	}
 }
 
-// 历史 历史问题: 存量库的 NULL enabled 上游在初始化迁移后归一化为 0（NULL 视禁用），
+// 历史问题: 存量库的 NULL enabled 上游在初始化迁移后归一化为 0（NULL 视禁用），
 // 不再存在 NULL 行；迁移幂等，重跑无副作用。
 func TestMigration_upstreamsEnabledNullNormalizedToDisabled(t *testing.T) {
 	// Given 模拟迁移前的存量库：先初始化建表，再回退为可空 enabled 并写入 NULL 行
@@ -749,7 +749,7 @@ func TestMigration_upstreamsEnabledNullNormalizedToDisabled(t *testing.T) {
 	}
 }
 
-// 历史 F-A: 存量库的 NULL enabled 规则在初始化迁移后归一化为 0（NULL 视禁用，
+// 历史修复: 存量库的 NULL enabled 规则在初始化迁移后归一化为 0（NULL 视禁用，
 // 与渲染侧 WHERE enabled=1 口径一致），不再存在 NULL 行；迁移幂等，重跑无副作用。
 func TestMigration_lbRulesEnabledNullNormalizedToDisabled(t *testing.T) {
 	// Given 模拟迁移前的存量库：先初始化建表，再回退为可空 enabled 并写入 NULL 行
@@ -790,7 +790,7 @@ func TestMigration_lbRulesEnabledNullNormalizedToDisabled(t *testing.T) {
 	}
 }
 
-// 历史 F-A: 列表/详情读取点（lbRuleListColumns + scanLbRules，即 ListRules/GetRule
+// 历史修复: 列表/详情读取点（lbRuleListColumns + scanLbRules，即 ListRules/GetRule
 // 路径）与渲染侧同口径（NULL 视禁用）——此前 COALESCE(enabled,1) 把遗留 NULL 行视为
 // 启用，UI 显示与生成配置分裂。
 func TestListRules_defaults_NULL_enabled_to_false(t *testing.T) {
@@ -934,7 +934,7 @@ func initializeRuleFeatureTestDB(t *testing.T) *sql.DB {
 	return database
 }
 
-// LBH-A-历史问题（历史 历史问题）：预校验渲染输入必须回填本日新特性列——
+// 历史问题（历史）：预校验渲染输入必须回填本日新特性列——
 // toPathRuleConfigs 此前丢 response_mode/response_status/response_body/
 // response_content_type/redirect_to 五列，EnableRule/启动聚合预检把直返/301
 // 路径规则当转发链渲染，与真实渲染（static_response 单 handler 路由）分叉。
@@ -963,7 +963,7 @@ func TestToPathRuleConfigs_carriesResponseFields(t *testing.T) {
 	}
 }
 
-// LBH-A-历史问题 同族：预检 SingleRuleConfig 回填 origin_domain（逐上游回源域名，
+// 历史问题 同族：预检 SingleRuleConfig 回填 origin_domain（逐上游回源域名，
 // 真实渲染经 map 处理器消费）与 host_header/health_check_host/enable_compress
 // 族；TLS 材料/开关为有意保留的空口子集（GenerateSingleRuleCaddyConfig 单规则
 // 形态约定，钉零防误回填）。
@@ -982,7 +982,7 @@ func TestPrecheckRuleConfig_carriesNewFeatureColumns(t *testing.T) {
 	}
 
 	// When
-	// B2-08：全局请求体上限由调用方传入（聚合校验一次读取）。
+	// 历史修复：全局请求体上限由调用方传入（聚合校验一次读取）。
 	config := precheckRuleConfig(rule, 128)
 
 	// Then：新特性列全保真
@@ -1004,7 +1004,7 @@ func TestPrecheckRuleConfig_carriesNewFeatureColumns(t *testing.T) {
 	}
 }
 
-// B2-08：聚合校验一次读取全局 request_body_max_size_mb，不随规则数线性加点查。
+// 历史修复：聚合校验一次读取全局 request_body_max_size_mb，不随规则数线性加点查。
 func TestValidateEnabledStoredRuleConfigs_readsGlobalBodyLimitOnce(t *testing.T) {
 	newBackupTestHandlers(t)
 	for i := range 3 {
@@ -1030,7 +1030,7 @@ func TestValidateEnabledStoredRuleConfigs_readsGlobalBodyLimitOnce(t *testing.T)
 	}
 }
 
-// B2-09：关系批量查询按 500 分块——IN (...) 占位符不再随规则数无限增长。
+// 历史修复：关系批量查询按 500 分块——IN (...) 占位符不再随规则数无限增长。
 func TestRuleRelationBatchQueriesChunkLargeRuleSets(t *testing.T) {
 	newBackupTestHandlers(t)
 	ids := make([]string, 1200)

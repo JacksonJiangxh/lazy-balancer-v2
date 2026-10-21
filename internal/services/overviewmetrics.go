@@ -116,7 +116,7 @@ type RateLimitHostBlocks struct {
 }
 
 // overviewMetricsReadLimit 是 Caddy /metrics 响应体的读取上限：指标基数异常膨胀
-// 时防止大块内存分配拖垮仪表盘请求（历史问题 H）。
+// 时防止大块内存分配拖垮仪表盘请求（历史问题）。
 const overviewMetricsReadLimit = int64(16 << 20)
 
 // scrapeRateLimitBlocksUncached 抓取 Caddy admin /metrics 并按站点聚合 429 限流
@@ -185,7 +185,7 @@ func parseRateLimit429Counts(body string) map[string]float64 {
 		}
 		labels := parsePromLabelPairs(line[len(rateLimit429CountMetric):braceEnd])
 		// 仅按 code=429 过滤：Caddy metrics 的 handler 标签取主路由链首处理器
-		//（routes.go:174），F3 注入后恒为 headers、错误路由响应亦继承主路由
+		//（routes.go:174），历史修复 注入后恒为 headers、错误路由响应亦继承主路由
 		// 标签——handler="rate_limit" 永不命中。本栈限流拦截自 v2.2.3 起恒 429
 		//（buildRateLimitErrorRoute），上游自返 429 无法区分、如实纳入计数
 		//（卡片文案已标注口径）。
@@ -211,7 +211,7 @@ func parseRateLimit429Counts(body string) map[string]float64 {
 
 // parsePromLabelPairs 解析 Prometheus 标签列表（key="value",...），容忍值内的
 // 逗号；残缺片段直接丢弃。
-// 转义按 exposition format 规范解码（V87-TO-09）：`\\`→`\`、`\"`→`"`、
+// 转义按 exposition format 规范解码（历史修复）：`\\`→`\`、`\"`→`"`、
 // `\n`→换行。规范未定义的转义（如 `\t`）原样保留（反斜杠+字符）——此前
 // 实现直接吞掉反斜杠写下一字节，`\n` 被解析成字面 n（值失真），且静默丢字节。
 func parsePromLabelPairs(s string) map[string]string {

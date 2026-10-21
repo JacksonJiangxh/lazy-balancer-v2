@@ -103,7 +103,7 @@ func TestMCPEndpointAuthenticationGatesAndProtocol(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
 	}
-	// CI87-11：不钉工具总数——硬编码 136 在每次增删工具时都红，且不表达任何
+	// 历史修复：不钉工具总数——硬编码 136 在每次增删工具时都红，且不表达任何
 	// 可观察契约。改为断言 tools/list 与 ListToolSpecs 全量一致（无遗漏/无重复/
 	// 无多余），新增工具无需改测试。
 	specs := mcpserver.ListToolSpecs()
@@ -132,7 +132,7 @@ func TestMCPEndpointAuthenticationGatesAndProtocol(t *testing.T) {
 	}
 }
 
-// CI87-06 装配钉：SetupRouter 把 admin 组路由集合注入 MCP 可见性后，非管理员
+// 历史修复 装配钉：SetupRouter 把 admin 组路由集合注入 MCP 可见性后，非管理员
 // 属主的 MCP Key 的 tools/list 不再暴露恒 403 的管理工具（真实守卫链 + 真实
 // 注入），business 组工具照常可见。
 func TestMCPToolsListForNonAdminKeyHidesAdminGroupTools(t *testing.T) {
@@ -227,7 +227,7 @@ func TestMCPEndpointToolCallAllowsOriginalClientIPWhitelist(t *testing.T) {
 	}
 }
 
-// 历史 K-1：MCP 工具调用经回环转发后，操作审计的源 IP 必须是发起
+// 历史修复：MCP 工具调用经回环转发后，操作审计的源 IP 必须是发起
 // MCP 请求的真实客户端 IP，而非回环地址 127.0.0.1（此前 RemoteAddr 恒为
 // 回环，MCP 操作在审计日志里无法定位真实来源）。stop_caddy 走 Generic
 // 中间件审计（Caddy 测试环境不可达 → 500，中间件仍记录）。
@@ -331,7 +331,7 @@ func TestMCPEndpointRejectsRequestBodyLargerThanOneMiB(t *testing.T) {
 	}
 }
 
-// APIMCP45-6：mcpAccessGuard 两拒绝分支此前不留任何审计——无凭证探测 /mcp 与
+// 历史修复：mcpAccessGuard 两拒绝分支此前不留任何审计——无凭证探测 /mcp 与
 // 未开启 MCP 的 Key 使用在认证拒绝台账零痕迹（同链 adminOnly/apiKeyReadOnly/
 // readOnly 守卫均已留痕）。镜像既有形态：recordAuthenticationRejection +
 // securityAuditLimiter 去重（同 reason+path+ip 一分钟窗记 1 条）。

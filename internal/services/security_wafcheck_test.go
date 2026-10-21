@@ -7,7 +7,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 回归锁定（历史问题；SEC-B-GAP-R1 历史头注改写为现行链路口径）：DB
+// 回归锁定（历史问题；历史修复头注改写为现行链路口径）：DB
 // waf_check_response 列必须经 scanSecurityPolicyByID（生产等价路径
 // GetSecurityPoliciesForRule 同用的 SQL 扫描）加载并传导至
 // BuildCorazaDirectives——否则「检查响应体」开关在 Caddy 渲染层被静默关闭。

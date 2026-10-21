@@ -15,7 +15,7 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// 历史修复 发现1（回归）：drain 超时 abort 路径下补偿已成功启动并接管租约，
+// 历史修复（回归）：drain 超时 abort 路径下补偿已成功启动并接管租约，
 // 处理程序返回后 defer 不得释放该租约——提前释放会让补偿 goroutine 的
 // enqueueCompensation 见租约缺失而永久退避（每轮重新 drain+restore，
 // 反复打断该规则合法签发）。租约必须由补偿 goroutine 自身在完成时释放。
@@ -71,7 +71,7 @@ func TestDeleteRule_keeps_block_lease_when_compensation_started_after_drain_time
 	}
 }
 
-// 历史修复 发现1（panic 窗口）：drain 前/中 panic 时 gin Recovery 只恢复 HTTP 栈、
+// 历史修复（panic 窗口）：drain 前/中 panic 时 gin Recovery 只恢复 HTTP 栈、
 // 不清理 blockedRules——租约 defer 必须登记在 drain 之前，否则屏障滞留到下一次
 // Stop，该规则证书任务被静默永久拦截。
 func TestDeleteRule_releases_block_lease_when_drain_panics(t *testing.T) {
@@ -105,7 +105,7 @@ func TestDeleteRule_releases_block_lease_when_drain_panics(t *testing.T) {
 	}
 }
 
-// 历史修复 发现3(a)：CreateRule 不得落库 enable_tls+acme_dns 而未选证书配置的规则——
+// 历史修复(a)：CreateRule 不得落库 enable_tls+acme_dns 而未选证书配置的规则——
 // 该状态在主节点单规则损坏（签发按单任务失败），却会让从节点快照校验整包拒绝、
 // 瘫痪整个集群同步。必须在写入侧 400 拒绝。
 func TestCreateRule_rejects_acme_dns_without_certificate_config(t *testing.T) {
@@ -133,7 +133,7 @@ func TestCreateRule_rejects_acme_dns_without_certificate_config(t *testing.T) {
 	}
 }
 
-// 历史修复 发现3(a)：UpdateRule 的 0=保留现值语义下，合并后生效状态为
+// 历史修复(a)：UpdateRule 的 0=保留现值语义下，合并后生效状态为
 // enable_tls+acme_dns 且 acme_config_id=0 时同样必须 400——覆盖
 // 「切换到 acme_dns 但未选配置」与「存量坏规则（导入残留）被编辑」两种路径。
 func TestUpdateRule_rejects_acme_dns_without_certificate_config(t *testing.T) {
@@ -179,14 +179,14 @@ func TestUpdateRule_rejects_acme_dns_without_certificate_config(t *testing.T) {
 	})
 }
 
-// 历史修复 发现3(a) 对照组：保留现值合并出非零配置时必须放行（0=保留现值语义不被误伤）。
+// 历史修复(a) 对照组：保留现值合并出非零配置时必须放行（0=保留现值语义不被误伤）。
 func TestUpdateRule_allows_acme_dns_edit_when_config_preserved(t *testing.T) {
 	// Given
 	harness := newUpdateAuditRuleHandlers(t, "lb_preserved_config", 0, false)
 	seedAuditRule(t, "lb_preserved_config", "before", "preserved.example.test", 8080, false, "acme_dns", true)
 	seedAuditUpstream(t, "lb_preserved_config")
-	// 历史修复 F-4：acme_config_id 必须引用真实存在的 certificate_configs 行，
-	// 否则 历史修复 F-3 的悬挂存在性校验会把本测试变成 400（而非保留语义验证）。
+	// 历史修复：acme_config_id 必须引用真实存在的 certificate_configs 行，
+	// 否则 历史修复 的悬挂存在性校验会把本测试变成 400（而非保留语义验证）。
 	dnsResult, err := db.DB.Exec(`INSERT INTO certificate_configs (name,dns_provider,dns_credentials,enabled) VALUES ('dns','dnspod','{"token":"x"}',1)`)
 	if err != nil {
 		t.Fatalf("seed certificate config: %v", err)

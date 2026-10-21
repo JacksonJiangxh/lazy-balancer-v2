@@ -322,9 +322,9 @@ const fetchOIDCStatus = async () => {
 const authStore = useAuthStore()
 const isReadOnly = computed(() => authStore.readOnlyReason !== null)
 const users = ref<UserListItem[]>([])
-// 历史问题-F5：列表加载失败与真实空列表不可区分 → 显性错误态 + 重试
+// 历史问题：列表加载失败与真实空列表不可区分 → 显性错误态 + 重试
 const loadError = ref(false)
-// FE-70-8 同口径：mfa_write_guard 读 authStore.fetchConfig 消费面（曾挂载单取
+// 历史修复 同口径：mfa_write_guard 读 authStore.fetchConfig 消费面（曾挂载单取
 // GET /config 只为一个键，与 /config 的 15s 刷新重复；store ref 响应式，
 // 挂载早于 fetchConfig 完成也会随后收敛）。首值 false = 守卫关闭的保守形态。
 const mfaWriteGuard = computed(() => authStore.mfaWriteGuard)
@@ -337,7 +337,7 @@ const submittingUserId = ref<number | null>(null)
 const operatingUserIds = ref(new Set<number>())
 const currentPage = ref(1)
 const pageSize = ref(10)
-// W87-16（复用优先）：分页切片 + 页越界夹紧收敛到 useClampedPagination 单源——
+// 历史修复（复用优先）：分页切片 + 页越界夹紧收敛到 useClampedPagination 单源——
 // 原实现手写 slice 并在 fetchUsers 内手工夹紧 maxPage（与 Rules/BlockPages/
 // Policies 的共享范式并存两份）。
 const { pagedItems: paginatedUsers } = useClampedPagination(users, currentPage, pageSize)
@@ -372,7 +372,7 @@ const fetchUsers = async () => {
     if (requestSeq === usersRequestSeq) {
       users.value = res.data || []
       loadError.value = false
-      // 页越界夹紧归 useClampedPagination（W87-16）——不再手工重算 maxPage。
+      // 页越界夹紧归 useClampedPagination（历史修复）——不再手工重算 maxPage。
     }
   } catch (error: unknown) {
     // Error toast is already shown by the global axios interceptor; swallow here
@@ -416,7 +416,7 @@ const handleSubmit = async () => {
         display_name: oidcTarget ? undefined : form.value.display_name,
         password: oidcTarget ? undefined : (form.value.password || undefined),
       })
-      // admin 编辑本人行且提交了密码：同 B4-I2，干净登出替代死 token 误报。
+      // admin 编辑本人行且提交了密码：同 历史修复，干净登出替代死 token 误报。
       if (editingSelf && form.value.password) {
         authStore.showToast('success', '密码已修改，请重新登录')
         await authStore.logout()
@@ -424,7 +424,7 @@ const handleSubmit = async () => {
       }
       mfaAwareSuccess('更新成功')
     } else {
-      // FE43-5(历史):创建用户显式白名单字段上行——form 含 password_confirm
+      // 历史修复(历史):创建用户显式白名单字段上行——form 含 password_confirm
       // 仅前端二次确认用,不随请求提交。
       await request.post('/users', {
         username: form.value.username,
@@ -495,7 +495,7 @@ const handleToggleStatus = async (id: number, isEnabled: boolean) => {
     try {
       await ElMessageBox.confirm('确定要禁用这个用户吗？禁用后该用户将无法登录。', '警告', { type: 'warning' })
     } catch {
-      // 历史问题 D-2：取消确认时回滚乐观开关——el-switch 已先行翻转 row.is_enabled，
+      // 历史问题：取消确认时回滚乐观开关——el-switch 已先行翻转 row.is_enabled，
       // 不回滚则 UI 显示「已禁用」而服务端仍启用，直到下次 fetchUsers 才自愈。
       const row = users.value.find(u => u.id === id)
       if (row) row.is_enabled = !isEnabled
@@ -585,7 +585,7 @@ const resetPassword = async (id: number) => {
       await request.post(`/users/${id}/reset-password`, { new_password: newPassword })
       if (isSelf) {
         // 管理员重置本人密码:重置端点递增 pwd_ver 吊销自身会话——干净登出
-        // (对齐 AppLayout.saveProfile / B4-I2),避免死 token 误报会话失效
+        // (对齐 AppLayout.saveProfile / 历史修复),避免死 token 误报会话失效
         authStore.showToast('success', '密码已重置，请重新登录')
         await authStore.logout()
         return
@@ -593,7 +593,7 @@ const resetPassword = async (id: number) => {
       mfaAwareSuccess('密码重置成功')
     }
   } catch (e) {
-    // W87-12：lbOpen 取消/关闭以 {ok:false} **resolve**（不走 reject），上面已
+    // 历史修复：lbOpen 取消/关闭以 {ok:false} **resolve**（不走 reject），上面已
     // `if (!r.ok) return` 处理——此处不存在 'cancel'/'close' 字符串拒绝（那些是
     // ElMessageBox 时代残留）。请求本身不带 silent，失败已由全局拦截器 toast，
     // 此处仅记录；仅对无法归因到拦截器的意外拒绝（非 Error 值）兜底提示。
@@ -653,7 +653,7 @@ const resetMfa = async (row: UserListItem): Promise<void> => {
     await fetchUsers()
   } catch (error: unknown) {
     if (error === 'cancel' || error === 'close') return
-    // D5 IMP-1：api.ts 全局 428 重试流已 toast 并打标——此处跳过二次弹窗；
+    // 历史修复：api.ts 全局 428 重试流已 toast 并打标——此处跳过二次弹窗；
     // 未打标的（如锁定开关关闭时端点自身的 401「验证码错误」）仍在此展示。
     if ((error as { mfaSurfaced?: boolean }).mfaSurfaced) {
       console.error('MFA reset failed:', error)
@@ -686,7 +686,7 @@ const mfaBindingClosed = () => {
 }
 
 const openMfaBinding = async (row: UserListItem): Promise<void> => {
-  // W87-10：与 resetMfa/resetPassword 同款函数级纵深守卫（按钮已禁用；此处防
+  // 历史修复：与 resetMfa/resetPassword 同款函数级纵深守卫（按钮已禁用；此处防
   // 后续调用方绕过）。是否向非管理员放行自助绑定属产品裁定（见 fix 报告）。
   if (isReadOnly.value || mfaBinding.value.loading) return
   try {
@@ -708,7 +708,7 @@ const openMfaBinding = async (row: UserListItem): Promise<void> => {
 }
 
 const activateMfa = async (): Promise<void> => {
-  // W87-11：按钮已按 6 位禁用（原实现在不足 6 位时静默 no-op，用户以为页面卡住）；
+  // 历史修复：按钮已按 6 位禁用（原实现在不足 6 位时静默 no-op，用户以为页面卡住）；
   // 函数内保留短路作为纵深兜底（脚本/键盘直触路径）。
   if (isReadOnly.value || mfaBinding.value.code.length !== 6 || mfaBinding.value.loading) return
   mfaBinding.value.loading = true
@@ -727,7 +727,7 @@ const activateMfa = async (): Promise<void> => {
 }
 
 const copyMfaRecovery = async (): Promise<void> => {
-  // 历史问题-F7：走统一 copyText（clipboard API + textarea 降级）——面板默认
+  // 历史问题：走统一 copyText（clipboard API + textarea 降级）——面板默认
   // HTTP 部署属非安全上下文，navigator.clipboard 不可用，原实现在该场景恒失败。
   const ok = await copyText(mfaBinding.value.recoveryCodes.join('\n'))
   if (ok) ElMessage.success('恢复代码已复制')

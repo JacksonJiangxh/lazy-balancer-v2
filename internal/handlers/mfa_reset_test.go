@@ -60,7 +60,7 @@ func mfaResetRouter(h *Handlers, authType string) *gin.Engine {
 }
 
 // mfaResetRouterWithGuard 模拟守卫态:guardMarker=true 时前置注入
-// mfa_stepup_verified(S历史问题:生产由 mfaStepUpGuard 开启态放行路径置)。
+// mfa_stepup_verified(历史问题:生产由 mfaStepUpGuard 开启态放行路径置)。
 func mfaResetRouterWithGuard(h *Handlers, authType string, guardMarker bool) *gin.Engine {
 	router := gin.New()
 	router.POST("/users/:id/mfa/reset", func(c *gin.Context) {

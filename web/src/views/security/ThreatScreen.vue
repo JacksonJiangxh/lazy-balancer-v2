@@ -535,7 +535,7 @@ const attackToasts = ref<AttackToast[]>([])
 const TOAST_MAX = 3
 const TOAST_TTL = 4500
 const toastTimers = new Map<number, number>()
-/** 事件行触发类型单源=后端 trigger_type（历史 历史问题）：前端原按
+/** 事件行触发类型单源=后端 trigger_type（历史问题）：前端原按
  *  rule_triggered 二次猜解阶段（只识别 429/2/8/48x，其余一律 WAF），与后端
  *  trigger_type 映射（800xxx→地域拦截/12→信任/14→威胁情报/11→请求体…）
  *  左右自相矛盾。旧后端缺字段时回退 attack_type。 */
@@ -660,7 +660,7 @@ const filteredFeed = computed(() =>
 )
 
 // ============ 正常流量 sparkline（计数器差分 → QPS 采样窗口） ============
-// 历史 历史问题/历史问题：available=false（Caddy admin 不可达）时保留上一帧
+// 历史问题：available=false（Caddy admin 不可达）时保留上一帧
 // 并显性提示，不再把采集失败渲染为 0 流量；首轮只建基线；QPS 按真实间隔
 // （trafficScreenMetrics.trafficDelta）；计数器回退=曲线断开重建。
 let trafficBaseline: TrafficBaseline | null = null
@@ -684,7 +684,7 @@ const trafficTask = usePollingTask(async ({ signal, isCurrent }) => {
   const countries = res.data?.countries ?? {}
   const now = Date.now()
   const sample = trafficDelta(trafficBaseline, countries, now, sampleN)
-  // WT87-07：基线必须取 trafficDelta **归一后**的计数（缺失/非数值→0），
+  // 历史修复：基线必须取 trafficDelta **归一后**的计数（缺失/非数值→0），
   // 不得从原始响应重建——否则缺字段时基线存 undefined，差分恒 NaN 且静默丢国。
   trafficBaseline = {
     counts: sample.counts,
@@ -717,7 +717,7 @@ function setWindow(hours: number): void {
 }
 
 // 本站坐标 + 大屏模式（threat_screen_mode：map/globe）——/config 读一次。
-// 历史 历史问题：不阻塞引擎/轮询启动（见 onMounted）。
+// 历史问题：不阻塞引擎/轮询启动（见 onMounted）。
 const screenMode = ref('map')
 // 采样配置单源：-1=自适应、0=关闭（全量/固定 2-64 已退役，存量值归一为 -1）。
 const flowSampleN = ref(-1)
@@ -846,7 +846,7 @@ let flowCursorEpoch = 0
 let adaptiveStable = 0
 let adaptiveLastSwitch = 0
 // 正在累计确认的目标档位：必须跨轮持久化，否则「连续同向」永远只有 1 次
-//（WT87-06：方向反转要靠它识别，丢失后自适应档位将永不切换）。
+//（历史修复：方向反转要靠它识别，丢失后自适应档位将永不切换）。
 let adaptivePendingTarget = 0
 const flowTask = usePollingTask(async ({ signal, isCurrent }) => {
   const cursorEpoch = flowCursorEpoch
@@ -925,7 +925,7 @@ async function mountEngine(): Promise<void> {
     const engine = create(mapHost.value, {
       serverCentroid: siteConfigured.value ? [serverLatLon[1], serverLatLon[0]] : null,
       siteConfigured: siteConfigured.value,
-      // 历史问题-F4：原硬编码 ['中国'] 使非中国下钻全部被 drillCountryAllowed 拦截
+      // 历史问题：原硬编码 ['中国'] 使非中国下钻全部被 drillCountryAllowed 拦截
       // （静默无动作），与 admin1Provinces「全球省级行政界」/ admin1Loader「首次
       // 下钻才拉取」及全量国家省层钉测冲突。省略 = 不限国家（threatShared 缺省语义）。
       onDrillChange: (name: string | null) => { zoomedName.value = name },
@@ -945,7 +945,7 @@ async function mountEngine(): Promise<void> {
     if (siteConfigured.value) engine.setServer([serverLatLon[1], serverLatLon[0]])
   } catch (error: unknown) {
     // 动态 chunk 404（发布中途旧页面）/网络失败：显性错误态 + 重试入口，
-    // 数据轮询不受影响（历史 历史问题）。
+    // 数据轮询不受影响（历史问题）。
     console.error('threat screen engine load failed', error)
     engineError.value = true
     mountedMode = null
@@ -958,7 +958,7 @@ async function mountEngine(): Promise<void> {
   }
 }
 
-// 页面隐藏也按暂停渲染（A86 历史问题）：与手动暂停取或，恢复可见后回到手动态。
+// 页面隐藏也按暂停渲染（历史修复问题）：与手动暂停取或，恢复可见后回到手动态。
 let screenHidden = false
 function applyMapPause(): void {
   threatMap?.setPaused(paused.value || screenHidden)
@@ -1036,7 +1036,7 @@ function releaseCollector(): void {
   }).catch(() => { /* TTL 兜底 */ })
 }
 
-// hidden 停摆/visible 恢复纳管单源（A86 历史问题）：时钟、弧光冲刷、采集租约
+// hidden 停摆/visible 恢复纳管单源（历史修复问题）：时钟、弧光冲刷、采集租约
 // 心跳三类间隔随页面可见性启停；hidden 时同步释放采集租约——此前仅暂停渲
 // 染，心跳在后台持续续租让 Caddy 空计数。
 const screenLoop = createVisibilityIntervals({
@@ -1107,7 +1107,7 @@ onBeforeUnmount(() => {
   threatMap?.dispose()
   threatMap = null
   mountedMode = null
-  // 调试句柄不钉住引擎对象图（历史 历史问题）
+  // 调试句柄不钉住引擎对象图（历史问题）
   delete (window as unknown as Record<string, unknown>).__threatScene
 })
 

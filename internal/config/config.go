@@ -112,14 +112,14 @@ func Load(path string) *Config {
 	if path != "" {
 		data, err := os.ReadFile(path)
 		if err != nil {
-			// S-3：配置文件读取失败必须可见（与下方解析失败分支对称）——静默回落
+			// 历史修复：配置文件读取失败必须可见（与下方解析失败分支对称）——静默回落
 			// 默认值会让「指定了 -config 却没生效」排查无门。
 			log.Printf("config: failed to read config file %s (%v); using defaults", path, err)
 		} else {
 			// Try to parse as JSON (simple approach)
 			var fileCfg map[string]interface{}
 			if jerr := json.Unmarshal(data, &fileCfg); jerr != nil {
-				// 历史问题 二十六次 W3-3：文件存在但解析失败必须可见——静默回落
+				// 历史问题：文件存在但解析失败必须可见——静默回落
 				// 默认值会让「改了配置没生效」排查无门。
 				log.Printf("config: file %s exists but failed to parse (%v); using defaults", path, jerr)
 			} else {
@@ -165,7 +165,7 @@ func Load(path string) *Config {
 				}
 				if v, ok := fileCfg["port"].(float64); ok {
 					// 历史问题-7（历史）：浮点截断不得静默——8000.9→8000 会让
-					// 「配置未生效」无从排查。CI87-10（历史）：与
+					// 「配置未生效」无从排查。历史修复：与
 					// metrics_interval 同口径先判界再转换——1e300 之类巨值直接
 					// float→int 是实现相关结果（实测回绕成 MaxInt64），先转换
 					// 再回退会产生诡异日志与一次无意义的越界整数。
@@ -186,7 +186,7 @@ func Load(path string) *Config {
 					cfg.CaddyMetricsURL = v
 				}
 				if v, ok := fileCfg["metrics_interval"].(float64); ok {
-					// E81/历史问题-4：≤0 与超范围都必须可见（旧实现 0/负值静默回落
+					// 历史问题-4：≤0 与超范围都必须可见（旧实现 0/负值静默回落
 					// 默认 30s；巨值 float→int 转换是未定义语义，可能回绕成负数
 					// 再被静默抬到 5s 高频采集）。先判界再转换。
 					switch {
@@ -230,14 +230,14 @@ func Load(path string) *Config {
 	} else if reason := jwtSecretWeakness(cfg.JWTSecret); reason != "" {
 		// 历史问题-2：环境变量通道此前完全不校验长度（文件通道强制 ≥32 并再生）。
 		// env 是运维显式输入，不自动替换（替换会让所有令牌静默失效），只告警
-		// 可见。CI87-09：判据增加熵下限——纯长度达标但形态可预测（空格/重复
+		// 可见。历史修复：判据增加熵下限——纯长度达标但形态可预测（空格/重复
 		// 字节）的密钥同样告警。
 		log.Printf("config: JWT_SECRET 环境变量强度不足——%s；JWT HS256 与 OIDC state 可被离线伪造，请改用 ≥%d 字节的高熵随机密钥", reason, minJWTSecretBytes)
 	}
 
-	// 历史问题 二十六次 W3-3：端口范围校验——port=0 会绑随机端口、>65535 只在
+	// 历史问题：端口范围校验——port=0 会绑随机端口、>65535 只在
 	// 监听时才报错，均早失败为佳。
-	// U8b-历史问题（历史）：校验对称补齐（metrics_interval 有钳位而 port 无）
+	// 历史问题（历史）：校验对称补齐（metrics_interval 有钳位而 port 无）
 	if cfg.Port < 1 || cfg.Port > 65535 {
 		log.Printf("config: invalid port %d (config file port field); falling back to 8000", cfg.Port)
 		cfg.Port = 8000
@@ -260,10 +260,10 @@ func loadOrCreateJWTSecret(dataDir string) string {
 			return string(data)
 		}
 		if len(data) > 0 {
-			// ADNS-N1（历史）：非空弱密钥的覆写必须可见——此前静默
+			// 历史修复（历史）：非空弱密钥的覆写必须可见——此前静默
 			// 重生成，旧令牌全部失效且零日志信号；与下方目录/写失败分支
 			// 及端口回退的可见性准则对齐。空文件等同未初始化，不告警。
-			// CI87-09：原因含长度或熵两类（"长度过短"/"熵不足"）。
+			// 历史修复：原因含长度或熵两类（"长度过短"/"熵不足"）。
 			log.Printf("JWT 密钥文件 %s 内容%s，已重新生成（旧令牌将失效）", secretPath, jwtSecretWeakness(string(data)))
 		}
 	} else if !os.IsNotExist(err) {

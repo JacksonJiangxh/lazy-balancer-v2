@@ -371,7 +371,7 @@ func TestBindWritePaths_rejectMixedPolicies(t *testing.T) {
 		t.Fatalf("batch-bind with mixed status=%d body=%s, want 400", response.Code, response.Body.String())
 	}
 
-	// BulkUpdatePolicyBindings（历史 F1）：mixed 策略 id → 400
+	// BulkUpdatePolicyBindings（历史修复）：mixed 策略 id → 400
 	response = postJSON(t, router, "/security/policies/1/bindings/bulk", map[string]any{"bind": []string{"lb_mb"}, "unbind": []string{}})
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("bulk with mixed status=%d body=%s, want 400", response.Code, response.Body.String())
@@ -424,14 +424,14 @@ func TestCreateSecurityPolicy_stage1ClearsTrustFields(t *testing.T) {
 	if whitelist != "[]" || wlRefs != "[]" {
 		t.Fatalf("stage1 trust fields=(wl %s, refs %s), want cleared (trust belongs to stage 0)", whitelist, wlRefs)
 	}
-	// SEC-B-F2（历史）：显式 stage1/2/3 的 ip_whitelist_enabled 归 0
+	// 历史修复（历史）：显式 stage1/2/3 的 ip_whitelist_enabled 归 0
 	// 落库（与 Update 路径 &falseVal 同形），不再走 policyWhitelistDefault(nil)=1。
 	if wlEnabled {
 		t.Fatal("stage1 ip_whitelist_enabled=true, want 0（阶段外信任开关归零）")
 	}
 }
 
-// SEC-B-F2（历史）：显式 stage2/stage3 创建同样把 ip_whitelist_enabled
+// 历史修复（历史）：显式 stage2/stage3 创建同样把 ip_whitelist_enabled
 // 归 0 落库——此前 normalizeOutOfStageFields 置 nil 使 INSERT 落默认 1，
 // 与 Update 路径（&falseVal → 0）形状漂移。
 func TestCreateSecurityPolicy_stage23ZeroWhitelistEnabled(t *testing.T) {

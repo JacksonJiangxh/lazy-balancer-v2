@@ -73,7 +73,7 @@ func TestCaddyService_GetUpstreamHealthDetailed_usesDedicatedMetricsURL(t *testi
 	}
 }
 
-// PERF42-1 回归形状：16MB 以内的正常响应照常解析。
+// 历史修复 回归形状：16MB 以内的正常响应照常解析。
 func TestCaddyService_getUpstreamHealthFromMetrics_parsesSmallBody(t *testing.T) {
 	// Given a small /metrics body with healthy and unhealthy upstreams
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

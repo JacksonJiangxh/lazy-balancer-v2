@@ -73,7 +73,7 @@ func TestRecordAuditLogWritesToIndependentDatabase(t *testing.T) {
 }
 
 func TestFormatAuditActionAuthAndNodeRegistration(t *testing.T) {
-	// 历史问题 D-N3：原断言 /nodes/register 映射——该路由实际注册为 /cluster/register，
+	// 历史问题：原断言 /nodes/register 映射——该路由实际注册为 /cluster/register，
 	// 映射从未可达（死映射）；/auth/login 为 Explicit（handler 记录 登录成功/失败）。
 	// 两者现均须为空。
 	action, resource, _ := FormatAuditAction("POST", "/api/v1/auth/login")
@@ -87,7 +87,7 @@ func TestFormatAuditActionAuthAndNodeRegistration(t *testing.T) {
 }
 
 func TestGetAuditLogSizeBytes_cachesThresholdWithinTTL(t *testing.T) {
-	// N+11 D3-F5b：2s 轮转 tick 此前在日志非空时每轮都查主库取阈值。
+	// 历史修复：2s 轮转 tick 此前在日志非空时每轮都查主库取阈值。
 	// getAuditLogSizeBytes 现带 60s TTL 缓存：窗口内配置变更不观察（有界
 	// 陈旧），过期后重查；读失败不入缓存（回退值不钉死整个窗口）。
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
@@ -136,7 +136,7 @@ func TestAuditUserPart(t *testing.T) {
 	}
 }
 
-// LBS-B-U2（历史 历史问题）：「审计保留月数」读取失败三态分裂统一——
+// 历史修复（历史问题）：「审计保留月数」读取失败三态分裂统一——
 // CleanupAuditLogs 读取失败（含 global_config 行缺失 ErrNoRows）回退默认
 // 3 月继续清理 + warn 留痕（曾静默 return 0：audit-retention 任务每 24h
 // 报「清理 0 条」而 audit_log 永久不清，三消费点中最坏分支）。

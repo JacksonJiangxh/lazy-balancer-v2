@@ -20,7 +20,7 @@ func queryRowsAsMaps(ctx context.Context, queryer tableQuerier, request rowQuery
 	defer rows.Close()
 	columns, err := rows.Columns()
 	if err != nil {
-		// U04d-17：与 Query/Scan 分支同口径——列读取失败也必须带表/快照
+		// 历史修复：与 Query/Scan 分支同口径——列读取失败也必须带表/快照
 		// label，否则备份导出/规则快照日志无法定位失败源。
 		return nil, fmt.Errorf("读取%s列: %w", request.label, err)
 	}

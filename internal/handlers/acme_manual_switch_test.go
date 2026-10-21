@@ -63,7 +63,7 @@ func putUpdateRule(t *testing.T, h interface{}, caddyID, body string) *httptest.
 }
 
 // 主形状：acme→manual 切换携带 queued 任务——必须 200，任务行**直接删除**
-// （历史修复 历史用户裁定：脱离 ACME 即删任务，取代 历史问题-01 的「翻终态
+// （历史修复用户裁定：脱离 ACME 即删任务，取代 历史问题-01 的「翻终态
 // disabled」——30s 补扫对象已不存在），acme_config_id 清零。
 func TestUpdateRule_acmeToManual_convergesNonTerminalCertJobs(t *testing.T) {
 	// Given

@@ -84,10 +84,10 @@ func TestRegionTree_countriesCacheJSON(t *testing.T) {
 	}
 }
 
-// TestStaleRegionTreeCache_r27_invalidatesR26Cache：修订号 bump（历史修复→历史修复）是
+// TestStaleRegionTreeCache_invalidatesEarlierCache：修订号 bump（历史修复→历史修复）是
 // 旧缓存失效的唯一机制——历史修复 旧形态（无 countries）缓存必须判过期重建，否则
 // 升级部署后选项树静默缺国家集。
-func TestStaleRegionTreeCache_r27_invalidatesR26Cache(t *testing.T) {
+func TestStaleRegionTreeCache_invalidatesEarlierCache(t *testing.T) {
 	dir := t.TempDir()
 	live := filepath.Join(dir, "ip2region.xdb")
 	cachePath := live + ".regions.json"
@@ -208,7 +208,7 @@ func TestGeoipLocOperator_countryEntriesExact(t *testing.T) {
 	}
 }
 
-// TestBuildIPPrecheckDirectives_geoipCountryEntries（R-10）：真实渲染产物含
+// TestBuildIPPrecheckDirectives_geoipCountryEntries（历史修复）：真实渲染产物含
 // 国名条目策略形状——国名精确/省份后缀/海外哨兵三形态并存，送 coraza
 // NewWAF 编译（引擎约束只在编译可见）。
 func TestBuildIPPrecheckDirectives_geoipCountryEntries(t *testing.T) {

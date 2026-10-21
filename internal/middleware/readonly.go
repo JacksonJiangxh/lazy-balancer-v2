@@ -18,7 +18,7 @@ func readOnlyGuard(database *sql.DB) gin.HandlerFunc {
 		if routePath == "" {
 			routePath = path
 		}
-		// SYSMW-R2（历史 历史问题）：写方法判定收敛至包级 writeMethods
+		// 历史修复（历史）：写方法判定收敛至包级 writeMethods
 		// （middleware.go）——与原 switch 四形态同义集合。
 		if !writeMethods[c.Request.Method] {
 			c.Next()
@@ -65,14 +65,14 @@ func isReadOnlyGuardWhitelisted(path string) bool {
 	// promote/forget-pins 补救通道不可达;verify-step 仅写非同步簿记列
 	// (users 触发器 OF 列表不含 mfa_last_timestep),从节点本地执行无
 	// 同步副作用,与 /auth/logout 同理放行。
-	// SYSMW-A2（历史）：login 公开路由、logout 挂 v1 级，当前均不经
+	// 历史修复（历史）：login 公开路由、logout 挂 v1 级，当前均不经
 	// 本守卫（仅 admin/business 组级）——两条目为挪组防御（若日后路由
 	// 挪入组级，白名单仍须放行，对齐 middleware.go mfaStepUpGuard 同款
 	// 防御性豁免）。
 	return path == "/api/v1/auth/login" ||
 		path == "/api/v1/auth/logout" ||
 		path == "/api/v1/auth/mfa/verify-step" ||
-		// U7c-4（历史）：原「path == /api/v1/cluster 精确匹配」已删——
+		// 历史修复（历史）：原「path == /api/v1/cluster 精确匹配」已删——
 		// 生产路由面无精确注册（全部经 /cluster/ 前缀分支覆盖），永假死分支。
 		strings.HasPrefix(path, "/api/v1/cluster/")
 }
@@ -82,7 +82,7 @@ func isSelfServicePath(path string) bool {
 	return path == "/api/v1/users/me" ||
 		path == "/api/v1/users/me/api-keys" ||
 		strings.HasPrefix(path, "/api/v1/users/me/api-keys/") ||
-		// 历史问题 B-历史问题：MFA 自助端点（setup/activate/disable/recovery-codes/
+		// 历史问题：MFA 自助端点（setup/activate/disable/recovery-codes/
 		// verify-step）——仅操作调用者本人第二因子，与 /users/me 同属自助维护，
 		// 此前漏白名单致非 admin 用户 403（UI 却对全体展示卡片）。
 		strings.HasPrefix(path, "/api/v1/auth/mfa/") ||

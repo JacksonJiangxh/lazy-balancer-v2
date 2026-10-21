@@ -13,7 +13,7 @@ import (
 
 // 非法动作原文（含换行/控制字符、超长）此前直接落审计详情——必须经
 // registerAuditField 清洗（去控制字符、截断 128B）后再拼接。
-func TestCL44_3_ClusterServiceControl_sanitizesAuditActionField(t *testing.T) {
+func TestClusterServiceControl_sanitizesAuditActionField(t *testing.T) {
 	setupClusterServiceControlDB(t)
 	_, router := newSlaveTestHandler(&config.Config{})
 	// Given：含换行/控制字符且超长的非法动作（动作校验先于票据校验，直接落审计）
@@ -43,7 +43,7 @@ func TestCL44_3_ClusterServiceControl_sanitizesAuditActionField(t *testing.T) {
 
 // 空 body 此前落进 JSON 解析报「unexpected end of JSON input」——须在读 body
 // 前给可行动指引（访问地址改 https:// 或修正反代），与集群同步 3xx 分支同契约。
-func TestCL44_4_callClusterServiceControl_returnsActionableErrorOnRedirect(t *testing.T) {
+func TestCallClusterServiceControl_returnsActionableErrorOnRedirect(t *testing.T) {
 	setupClusterServiceControlDB(t)
 	// Given：从端 301 跨主机重定向，空 body
 	slave := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

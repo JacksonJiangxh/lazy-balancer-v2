@@ -60,7 +60,7 @@ func NormalizeClusterNodeName(name string) string {
 	name = strings.TrimSpace(name)
 	name = strings.Map(func(r rune) rune {
 		// C0、DEL 与 C1（0x80-0x9F）均为控制字符；旧实现漏 C1，注释口径
-		// 与行为不一致（历史 历史问题-2）。
+		// 与行为不一致（历史问题-2）。
 		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
 			return -1
 		}
@@ -260,7 +260,7 @@ type ClusterHealth struct {
 
 type ClusterReport struct {
 	AppliedVersion int `json:"applied_version" binding:"min=0"`
-	// ServiceStatus 保留（历史 历史问题 裁定：有意设计-保留）：主节点
+	// ServiceStatus 保留（历史问题 裁定：有意设计-保留）：主节点
 	// 当前不消费该字段（cluster_status.go 的节点视图不读它，前端亦无渲染点），
 	// 但 binding 强校验仍要求从节点上报 ok/degraded。删除会破坏旧主/旧从
 	// 滚动升级期的上报契约（旧主节点对缺字段的绑定校验直接 400），故保留到
@@ -376,7 +376,7 @@ type ClusterBasicSettings struct {
 	CrawlerAutoUpdate   *bool   `json:"crawler_auto_update,omitempty"`
 	CrawlerScheduleDays *string `json:"crawler_schedule_days,omitempty"`
 	CrawlerScheduleTime *string `json:"crawler_schedule_time,omitempty"`
-	// D1（历史）：自动封禁六项配置随 users 节同步——从节点提升为主节点
+	// 历史修复（历史）：自动封禁六项配置随 users 节同步——从节点提升为主节点
 	// 后调度按主端配置直接生效（镜像 历史问题 自动备份组/历史问题-01 威胁排程组）。
 	// 指针+omitempty 缺席语义：旧主端快照缺该组时从端 apply 跳过写入、保留本地
 	// 设置，不清零；新主端装载恒非 nil（COALESCE 兜底），快照恒携带。此前六列
@@ -414,7 +414,7 @@ type ClusterUser struct {
 	// pending 密钥不跨节点（绑定向导是节点本地交互；半途切换面板属可重做流程）。
 }
 
-// ClusterLockedUser 是主节点活跃登录锁的同步载荷（SC-4 修订）：主节点账号被锁
+// ClusterLockedUser 是主节点活跃登录锁的同步载荷（历史修复 修订）：主节点账号被锁
 // 状态必须传播到从节点（从节点本地锁定独立生效）。走快照独立顶层载荷
 // locked_users 而非 users 节列——login_* 不在 users 触发器快照列/节哈希/漂移
 // 守卫内，避免每次登录失败触发 users/api_keys 全量重放与漂移循环。只携带
@@ -478,7 +478,8 @@ type ClusterSnapshot struct {
 	SecurityBlockPages  []SecurityBlockPage  `json:"security_block_pages,omitempty"`
 	// SecurityIPLists（v2.3.0）：可复用 IP 地址列表全量 dump（行结构与
 	// security_policies 同款 map 形态）；策略 ip_acl_list_refs/
-	// ip_whitelist_refs 以 id 引用本表，随 security 节一起全量替换。
+	// ip_whitelist_refs 以 id 引用本表。缺席=旧主端（v2.3.0-）未携带，
+	// 从端保留本地；携带空数组 [] = 显式清空；携带即全量替换。
 	SecurityIPLists          json.RawMessage                   `json:"security_ip_lists,omitempty"`
 	SecurityCRSVersion       []ClusterSecurityCRSVersion       `json:"security_crs_version,omitempty"`
 	SecurityIP2RegionVersion []ClusterSecurityIP2RegionVersion `json:"security_ip2region_version,omitempty"`
@@ -490,10 +491,10 @@ type ClusterSnapshot struct {
 	SecurityCrawlerSources json.RawMessage   `json:"security_crawler_sources,omitempty"`
 	SectionHashes          map[string]string `json:"section_hashes,omitempty"`
 	// MasterSyncSwitches 为主节点三类同步开关（users/rules/security，2026-09-19
-	// 三分类归一；CL-R1 历史修正「五类」陈旧注释），随快照下发；从节点跳过判定
+	// 三分类归一；历史修复修正「五类」陈旧注释），随快照下发；从节点跳过判定
 	// 以此为准（从节点本地开关列不参与，避免永远默认全开导致开关失效）。
 	MasterSyncSwitches *ClusterSyncSwitchesPayload `json:"master_sync_switches,omitempty"`
-	// LockedUsers（SC-4 修订）：主节点活跃登录锁，独立顶层载荷——不参与任何
+	// LockedUsers（历史修复 修订）：主节点活跃登录锁，独立顶层载荷——不参与任何
 	// 节哈希/漂移守卫（避免登录失败触发 users 全量重放）；从端只延长不清除。
 	// 加性可选字段、omitempty：旧主端缺省 → 从端 no-op；旧从端忽略未知字段
 	// （先例：MasterSyncSwitches/WafFiles），故不 bump CurrentSnapshotSchema。

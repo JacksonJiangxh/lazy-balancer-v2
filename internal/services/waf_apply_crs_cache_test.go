@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// 历史修复6：集群同步与 lbbak 导入共用 ApplyWafFileBundle 落盘 live CRS 树，
+// 历史修复：集群同步与 lbbak 导入共用 ApplyWafFileBundle 落盘 live CRS 树，
 // CRS 落盘成功后必须让 /security/crs 的规则数缓存失效（此前仅进程重启或
 // 下一次成功更新才收敛）。
 func TestApplyWafFileBundle_invalidatesCRSRuleCount(t *testing.T) {

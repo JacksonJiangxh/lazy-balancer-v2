@@ -68,7 +68,7 @@ func TestACMEAccountKeyPath_changes_when_EAB_HMAC_changes(t *testing.T) {
 }
 
 // 历史问题（历史）：名称按现断言更名——轮换前代密钥是不同账户身份，必须保留
-// （历史问题 F-A2：删除前代密钥会让被删方以再生密钥撞既有账户，签发持续失败）。
+// （历史问题：删除前代密钥会让被删方以再生密钥撞既有账户，签发持续失败）。
 func TestClient_RegisterAccount_keeps_rotated_predecessor_key(t *testing.T) {
 	// Given
 	var server *httptest.Server
@@ -115,8 +115,8 @@ func TestClient_RegisterAccount_keeps_rotated_predecessor_key(t *testing.T) {
 	if err != nil {
 		t.Fatalf("register rotated EAB account: %v", err)
 	}
-	// 历史问题 F-A2 契约更新：同 (directory,email,KID) 不同 HMAC 的密钥是不同账户身份，
-	// 不再被互删——旧断言（删除轮换前代密钥）正是 F-A2 定性的有害行为：被删方
+	// 历史问题 契约更新：同 (directory,email,KID) 不同 HMAC 的密钥是不同账户身份，
+	// 不再被互删——旧断言（删除轮换前代密钥）正是 历史修复 定性的有害行为：被删方
 	// 下次以再生密钥撞既有账户，签发持续失败直至人工恢复。轮换遗留密钥保留仅是
 	// 字节级残留，无功能影响。
 	if _, err := os.Stat(oldKeyPath); err != nil {
@@ -175,7 +175,7 @@ func TestClient_RegisterAccount_keeps_recently_used_predecessor_key(t *testing.T
 	}
 }
 
-// F-A1：账户密钥文件存在但无法解析时必须 fail-closed——静默再生新密钥会覆盖
+// 历史修复：账户密钥文件存在但无法解析时必须 fail-closed——静默再生新密钥会覆盖
 // 既有密钥文件，且新密钥对 CA 而言是陌生账户（或撞既有 email/EAB 账户被拒），
 // 造成难以诊断的持续签发失败。
 func TestLoadOrCreateAccountKey_fails_closed_on_unparseable_key(t *testing.T) {
@@ -245,7 +245,7 @@ func decodeACMERequestPayload(t *testing.T, request *http.Request) string {
 	return jws.Payload
 }
 
-// F-B1：CA 以 400 "already registered"（而非 200 sentinel）拒绝注册时，新密钥撞
+// 历史修复：CA 以 400 "already registered"（而非 200 sentinel）拒绝注册时，新密钥撞
 // 既有 email/EAB 账户与真正的密钥复用不可区分——必须用 onlyReturnExisting 探测
 // 验证本密钥确实持有账户，探测失败则显式报错，不得静默当成功。
 func TestClient_RegisterAccount_rejects_mask_hit_when_key_holds_no_account(t *testing.T) {
@@ -299,7 +299,7 @@ func TestClient_RegisterAccount_rejects_mask_hit_when_key_holds_no_account(t *te
 	}
 }
 
-// F-B1 伴随契约：400 already registered 但 onlyReturnExisting 探测确认本密钥持有
+// 历史修复 伴随契约：400 already registered 但 onlyReturnExisting 探测确认本密钥持有
 // 账户 → 真复用，注册成功。
 func TestClient_RegisterAccount_reuses_when_mask_hit_and_key_holds_account(t *testing.T) {
 	// Given
@@ -343,7 +343,7 @@ func TestClient_RegisterAccount_reuses_when_mask_hit_and_key_holds_account(t *te
 	}
 }
 
-// F-B1 伴随契约：200 sentinel（JWK 匹配，x/crypto 已缓存 KID）为真复用路径，
+// 历史修复 伴随契约：200 sentinel（JWK 匹配，x/crypto 已缓存 KID）为真复用路径，
 // 直接成功且无需额外探测。
 func TestClient_RegisterAccount_reuses_on_already_exists_sentinel(t *testing.T) {
 	// Given
@@ -411,11 +411,11 @@ func TestClient_FetchCert_uses_certificate_downloaded_during_finalize(t *testing
 	}
 }
 
-// N+11 D1-S3：非 429 重试走截断指数退避 1,2,4,8s、封顶 10s（对齐 x/crypto
+// 历史修复：非 429 重试走截断指数退避 1,2,4,8s、封顶 10s（对齐 x/crypto
 // defaultBackoff 曲线）——固定 2s 会在 CA 5xx 过载时维持约 5 倍请求压力。
 // x/crypto v0.55.0 语义：RetryBackoff 返回值即重试延迟本身（不与默认曲线或
-// Retry-After 叠加），≤0 立即放弃重试。429→0 保持不变：库内立即放弃，交由
-// 上层 waiting_ca 记账按 CA 的 Retry-After 统一退避。
+// 历史修复 叠加），≤0 立即放弃重试。429→0 保持不变：库内立即放弃，交由
+// 上层 waiting_ca 记账按 CA 的 历史修复 统一退避。
 func TestNewClientRetryBackoff_curve(t *testing.T) {
 	// Given
 	client, err := newClient("https://acme.example/directory", "admin@example.com", t.TempDir(), nil)
@@ -429,7 +429,7 @@ func TestNewClientRetryBackoff_curve(t *testing.T) {
 
 	// When/Then：n 从 1 起跳（x/crypto 文档：首次失败 n=1）— 基线
 	// 1,2,4,8,10,10,10 秒 + 0~1s 抖动（历史问题：多规则并发签发不得在同一 CA
-	// 5xx 窗口以相同延迟同步重试）。DNS-87-F2（历史）：原测试从 n=0 起跳
+	// 5xx 窗口以相同延迟同步重试）。历史修复（历史）：原测试从 n=0 起跳
 	// 断言 1,2,4,8,10…，而生产首召即 n=1 → 曲线整体右移一档（2,4,8,10…）却
 	// 恰好被 n=0 这一永不出现的档位掩蔽。
 	assertCurve := func(n int, base time.Duration) {
@@ -468,10 +468,10 @@ func TestNewClientRetryBackoff_curve(t *testing.T) {
 	}
 }
 
-// 历史（DNS-ACME 域）：既有账户密钥可用时，元数据（卫生清理输入）
-// 写失败不得阻断签发（DNS-87-F9）。
+// 历史（历史修复 域）：既有账户密钥可用时，元数据（卫生清理输入）
+// 写失败不得阻断签发（历史修复）。
 
-// DNS-87-F9：既有账户密钥可用时，元数据（卫生清理输入）写失败不得阻断签发。
+// 历史修复：既有账户密钥可用时，元数据（卫生清理输入）写失败不得阻断签发。
 func TestLoadOrCreateAccountKey_metadataWriteFailureDoesNotBlockIssuance(t *testing.T) {
 	dir := t.TempDir()
 	const directoryURL = "https://acme.example/directory"

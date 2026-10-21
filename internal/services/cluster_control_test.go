@@ -193,7 +193,7 @@ func TestIssueServiceControlTicketPrefersAccessURL(t *testing.T) {
 	}
 }
 
-// S历史问题-12：无 GetBody 的带体请求在同主机 https 升级重定向下返回合成 301
+// 历史问题-12：无 GetBody 的带体请求在同主机 https 升级重定向下返回合成 301
 // 空体，且目标端不再收到请求。
 func TestDoWithSameHostTLSUpgradeRedirect_unreplayableBodySynthetic301(t *testing.T) {
 	var hits atomic.Int32

@@ -460,7 +460,7 @@ func TestProvider_CleanUp_removes_ownership_of_independently_deleted_records(t *
 	}
 }
 
-// 历史修复 历史问题：不可解析的持久化 RecordID 只告警一次并移除，正常兄弟条目不受影响。
+// 历史问题：不可解析的持久化 RecordID 只告警一次并移除，正常兄弟条目不受影响。
 func TestProvider_CleanUp_malformedPersistedRecordIDRemovedAfterWarning(t *testing.T) {
 	// Given 同一 challenge 下一条不可解析的持久化 ID 与一条正常 ID（真实 ownership 文件）。
 	dataDir := t.TempDir()
@@ -554,7 +554,7 @@ func TestProvider_CleanUp_memoryModeReappendsFailedRecord(t *testing.T) {
 
 // ctxCanceledApiErrorTransport 模拟「请求在途时 ctx 取消、服务端仍返回
 // API 错误包」：阻塞至 request ctx 结束后回 500 + TencentCloudSDKError
-// 错误体（AD-5）。ctx 已取消时 RoundTrip 立即返回，无需额外同步。
+// 错误体（历史修复）。ctx 已取消时 RoundTrip 立即返回，无需额外同步。
 type ctxCanceledApiErrorTransport struct{}
 
 func (transport *ctxCanceledApiErrorTransport) RoundTrip(request *http.Request) (*http.Response, error) {
@@ -567,8 +567,8 @@ func (transport *ctxCanceledApiErrorTransport) RoundTrip(request *http.Request) 
 	}, nil
 }
 
-// AD-5（历史）：createRecord 失败时 ctx 已取消不得以 ctx.Err()
-// 整体覆写 provider 错误（对齐 deleteOne :142-146 历史 历史问题 口径）——
+// 历史修复（历史）：createRecord 失败时 ctx 已取消不得以 ctx.Err()
+// 整体覆写 provider 错误（对齐 deleteOne :142-146 历史问题 口径）——
 // errors.Join 保留两者：具体 API 失败原因可诊断，取消事实不丢。
 func TestProvider_createRecord_keeps_provider_error_when_context_canceled(t *testing.T) {
 	// Given

@@ -303,7 +303,7 @@ func TestApplyWafFileBundle_rejectsCRSWithoutDeclaredHash(t *testing.T) {
 }
 
 func TestBuildWafFileRef_sanitizesMalformedIP2RegionTag(t *testing.T) {
-	// E5 IMP-1：主端 BuildWafFileRef 把 .version 原文写进 ref.IP2RegionTag（参与
+	// 历史修复：主端 BuildWafFileRef 把 .version 原文写进 ref.IP2RegionTag（参与
 	// waf_files 节哈希），而从端落盘前经 sanitizeBundleVersion 置空——同一畸形
 	// 版本串两端推导结果不同，节哈希永不对齐，从端永久节流重拉。主端必须用同一
 	// 规则推导 tag。
@@ -411,7 +411,7 @@ func TestApplyWafFileBundle_preservesVersionFileRawBytes(t *testing.T) {
 }
 
 func TestUntarGzTo_midCopyFailure_restoresPureOldTree(t *testing.T) {
-	// 历史问题 A-F3：staging→destDir 复制中途失败时，恢复必须产出纯旧树。旧实现只
+	// 历史问题：staging→destDir 复制中途失败时，恢复必须产出纯旧树。旧实现只
 	// 用 backup 覆盖同名文件，已复制成功的新树文件残留为混合树。staging 预置
 	// 的只读子目录（含文件使函数起始的 RemoveAll(staging) 静默失败而存活）
 	// 让 copyDir 在复制完 a-new.conf 后失败。
@@ -510,7 +510,7 @@ func TestUntarGzTo_firstInstall_midCopyFailure_leavesNoPartialTree(t *testing.T)
 }
 
 func TestUntarGzTo_removeAllFailure_attemptsBackupRestore(t *testing.T) {
-	// 历史问题 A-N2：rename 失败后 os.RemoveAll(destDir) 失败时 backup 已就绪，
+	// 历史问题：rename 失败后 os.RemoveAll(destDir) 失败时 backup 已就绪，
 	// 必须与 copyDir 失败分支对称地尝试从 backup 恢复（先清空再复制），恢复
 	// 错误 errors.Join 并入返回；而非直接 return 留下部分删除的旧树。
 	// Given：非空旧树（locked/ 0555 使 RemoveAll 失败但 backup 复制可读）+ 合法同步包
@@ -571,7 +571,7 @@ func TestUntarGzTo_removeAllFailure_attemptsBackupRestore(t *testing.T) {
 }
 
 func TestUntarGzTo_restoreFailure_joinedIntoReturnedError(t *testing.T) {
-	// 历史问题 A-F3：恢复（清空+从 backup 复制）自身的错误不得被 `_ =` 吞掉，必须
+	// 历史问题：恢复（清空+从 backup 复制）自身的错误不得被 `_ =` 吞掉，必须
 	// 并入返回错误。destDir 写入 32MB 新文件的窗口内注入只读子目录，使恢复路径
 	// 的 RemoveAll(destDir) 失败。
 	// Given：非空旧树 + 含大文件的同步包 + staging 内预置只读子目录
@@ -602,7 +602,7 @@ func TestUntarGzTo_restoreFailure_joinedIntoReturnedError(t *testing.T) {
 		_ = os.RemoveAll(staging)
 		_ = os.RemoveAll(destDir)
 	})
-	// D1-历史问题：copyFile 改用单源原子落盘，临时文件为同目录唯一名
+	// 历史问题：copyFile 改用单源原子落盘，临时文件为同目录唯一名
 	// （.<base>-<rand>.tmp）——按 glob 观测写入窗口，不再依赖固定
 	// 的 a-new.conf.tmp。
 	tmpPattern := filepath.Join(destDir, ".a-new.conf-*.tmp")
@@ -626,7 +626,7 @@ func TestUntarGzTo_restoreFailure_joinedIntoReturnedError(t *testing.T) {
 				_ = os.Chmod(blocker, 0000)
 				return
 			}
-			// SS87-历史问题：轮询退避——无 sleep 的忙转会在整段 32MB 解包期间
+			// 历史问题：轮询退避——无 sleep 的忙转会在整段 32MB 解包期间
 			// 空转一个核（CI 资源浪费）；写入窗口由 glob 观测，1ms 粒度足够。
 			time.Sleep(time.Millisecond)
 		}
@@ -652,7 +652,7 @@ func TestUntarGzTo_restoreFailure_joinedIntoReturnedError(t *testing.T) {
 }
 
 func TestUntarGzTo_nonEmptyDest_removesStaleFiles(t *testing.T) {
-	// 历史问题 A-#2：rename 到非空目录恒失败，兜底分支即主路径；合并复制不删除旧树中
+	// 历史问题：rename 到非空目录恒失败，兜底分支即主路径；合并复制不删除旧树中
 	// 新包缺失的文件，CRS 更新删除/改名规则文件后从端树为旧+新合并、永不收敛。
 	// 兜底分支必须先清空 destDir 再复制。
 	// Given：非空目标树，含新包中不存在的陈旧文件与子目录
@@ -702,7 +702,7 @@ func TestUntarGzTo_nonEmptyDest_removesStaleFiles(t *testing.T) {
 
 // 历史问题 单元：主节点 bundle tag 为空是合法收敛信号（主端 .version 缺失、损坏
 // 或形状校验置空），本地陈旧 tag 必须同步清空——否则 waf_files 节哈希（含
-// 标签）两端永不对齐，从端永久假漂移全量重拉（历史问题 A-#4 不变量的空值半边）。
+// 标签）两端永不对齐，从端永久假漂移全量重拉（历史问题 不变量的空值半边）。
 func TestRewriteVersionIfMissingOrStale_emptyTagClearsStaleSidecar(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "ip2region.xdb.version")
@@ -950,7 +950,7 @@ func TestWafFilesRefMatchesBundle_verifiesThreatSha256s(t *testing.T) {
 	})
 }
 
-// 历史修复 历史问题（历史）：集群同步路径的 WAF ref 构建不得静默省略分量——
+// 历史问题（历史）：集群同步路径的 WAF ref 构建不得静默省略分量——
 // 组件存在但读取/哈希失败时，旧实现少一项分量，从端不拉取、主端无告警，
 // 主从静默分叉（从端继续用旧 WAF 规则/旧库）。修复后读失败显式化：
 // 整个 ref 视为不可用（nil）+ 错误日志，从端漂移检测把 nil 当分叉处理
@@ -985,7 +985,7 @@ func TestBuildWafFileRef_readFailureIsExplicit(t *testing.T) {
 	}
 }
 
-// SS87-历史问题：xdb sidecar 只在内容哈希校验通过后才改写（拒绝路径不得留下
+// 历史问题：xdb sidecar 只在内容哈希校验通过后才改写（拒绝路径不得留下
 // 「新标签 + 旧库」跨代偏斜）。
 func TestApplyWafFileBundle_xdbHashMismatchLeavesVersionSidecarUntouched(t *testing.T) {
 	dir := t.TempDir()
@@ -1019,7 +1019,7 @@ func TestApplyWafFileBundle_xdbHashMismatchLeavesVersionSidecarUntouched(t *test
 	}
 }
 
-// SS87-历史问题：空内容 + 非空声明哈希的威胁条目拒绝整包（否则从端永不落盘、
+// 历史问题：空内容 + 非空声明哈希的威胁条目拒绝整包（否则从端永不落盘、
 // ref 哈希永不等，每轮误判漂移全量重拉永不收敛）。
 func TestApplyWafFileBundle_emptyThreatContentWithDeclaredHashRejected(t *testing.T) {
 	dir := t.TempDir()
@@ -1047,7 +1047,7 @@ func TestApplyWafFileBundle_emptyThreatContentWithDeclaredHashRejected(t *testin
 	}
 }
 
-// SS87-历史问题：不完整 bundle 的响应体不得进入合并缓存（异常形态不得在 2s
+// 历史问题：不完整 bundle 的响应体不得进入合并缓存（异常形态不得在 2s
 // 窗口内放大传播）；完整 bundle 仍必须缓存。
 func TestBuildWafFileBundleResponse_incompleteBundleNotCached(t *testing.T) {
 	dir := t.TempDir()

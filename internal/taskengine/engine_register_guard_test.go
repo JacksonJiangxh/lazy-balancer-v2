@@ -1,6 +1,6 @@
 package taskengine
 
-// TASK-L2（历史 历史问题）：Register 对 Kind 与 Fn 配套的校验——Periodic 缺
+// 历史修复（历史问题）：Register 对 Kind 与 Fn 配套的校验——Periodic 缺
 // IntervalFn 会在 tick 处 nil 调用 panic 崩进程；Scheduled 缺 NextSlotFn 静默
 // 停摆。注册期响亮拒绝。
 
@@ -28,7 +28,7 @@ func TestRegister_rejectsScheduledWithoutNextSlotFn(t *testing.T) {
 	}
 }
 
-// B1-6（历史）：Daemon 不进 tick——EnabledFn 在调度面静默忽略且文档
+// 历史修复（历史）：Daemon 不进 tick——EnabledFn 在调度面静默忽略且文档
 // 未声明。注册期响亮拒绝，防注册方误以为业务门生效（常驻业务门归 Run 体
 // 首行，autoban 形态）。
 func TestRegister_rejectsDaemonWithEnabledFn(t *testing.T) {

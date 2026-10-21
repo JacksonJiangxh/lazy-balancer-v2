@@ -15,7 +15,7 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// 历史修复 A-N1（drain 失败分支）：降级竞态下 Stop 已清空 blockedRules 后 block 才创建，
+// 历史修复（drain 失败分支）：降级竞态下 Stop 已清空 blockedRules 后 block 才创建，
 // drain 失败且补偿无法启动（manager 已停止）时租约必须当场释放——否则节点重新
 // 提升后该规则的证书任务被屏障永久拦截，静默停发直到下一次 Stop。
 func TestDeleteRule_releases_block_lease_when_compensation_start_fails_on_drain_failure(t *testing.T) {
@@ -51,7 +51,7 @@ func TestDeleteRule_releases_block_lease_when_compensation_start_fails_on_drain_
 	}
 }
 
-// 历史修复 A-N1（deferred 分支）：drain 成功（stopped manager 上 CancelJobsForRule 为
+// 历史修复（deferred 分支）：drain 成功（stopped manager 上 CancelJobsForRule 为
 // 无操作返回 nil）后 Caddy 应用失败，deferred 补偿同样无法启动，租约必须释放，
 // 规则与证书任务保持回滚后的原状。
 func TestDeleteRule_releases_block_lease_when_compensation_start_fails_after_apply_failure(t *testing.T) {
@@ -88,7 +88,7 @@ func TestDeleteRule_releases_block_lease_when_compensation_start_fails_after_app
 	}
 }
 
-// 历史修复 C-#2：security_policy_bindings 无外键，手造备份可绑定不存在的策略——导入后
+// 历史修复：security_policy_bindings 无外键，手造备份可绑定不存在的策略——导入后
 // 该规则 WAF/限流/GeoIP 静默失效（loadSecurityPolicyContext 查不到策略即无策略渲染）。
 // 导入前校验须 400 点名行号与悬挂 id，与保存侧「策略必须存在」同严。
 func TestImportConfigBackup_rejects_security_policy_binding_with_dangling_policy(t *testing.T) {
@@ -132,7 +132,7 @@ func TestImportConfigBackup_rejects_security_policy_binding_with_dangling_policy
 	}
 }
 
-// 历史修复 C-#2：悬挂 rule_caddy_id 同样拒绝；经预览端点验证 ValidateConfigImport
+// 历史修复：悬挂 rule_caddy_id 同样拒绝；经预览端点验证 ValidateConfigImport
 // 与导入路径同序继承该校验（Valid=false 而非预览放行、导入才 400）。
 func TestValidateConfigImport_rejects_security_policy_binding_with_dangling_rule(t *testing.T) {
 	// Given：绑定指向备份中不存在的规则 lb_ghost
@@ -169,7 +169,7 @@ func TestValidateConfigImport_rejects_security_policy_binding_with_dangling_rule
 	}
 }
 
-// 历史修复 C-#2 对照组：引用完整的绑定导入成功并落库。
+// 历史修复 对照组：引用完整的绑定导入成功并落库。
 func TestImportConfigBackup_accepts_valid_security_policy_bindings(t *testing.T) {
 	// Given
 	h := newBackupTestHandlers(t)
@@ -202,7 +202,7 @@ func TestImportConfigBackup_accepts_valid_security_policy_bindings(t *testing.T)
 
 // rule_caddy_id，与 upstreams/path_rules/cert_jobs 的 rule_id 不同）必须一并
 // 跳过——skip 先于 validateBackupRuleReferences 执行，绑定若不随规则移除会命中
-// 「引用了不存在的规则」整包 400，与 历史修复 C-3「软跳过+警告」语义冲突。
+// 「引用了不存在的规则」整包 400，与 历史修复「软跳过+警告」语义冲突。
 func TestImportConfigBackup_skips_bindings_of_empty_domain_rules(t *testing.T) {
 	// Given：一条空域名 HTTP 规则带绑定，一条正常规则带绑定
 	h := newBackupTestHandlers(t)

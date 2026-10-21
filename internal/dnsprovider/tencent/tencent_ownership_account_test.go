@@ -1,6 +1,6 @@
 package tencent
 
-// 历史修复2：所有权条目带账户身份（与 dnspod 侧同口径，判定单源在
+// 历史修复：所有权条目带账户身份（与 dnspod 侧同口径，判定单源在
 // ownership.DecideRemoval）。换凭据后旧条目 MUST NOT 被按 record_id 删除。
 
 import (

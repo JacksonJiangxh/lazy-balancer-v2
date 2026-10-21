@@ -13,7 +13,7 @@ import (
 
 // registration_secret 为空）时，RegisterWithMaster 此前静默成功，残缺注册信息
 // 会被调用方落库——必须在返回前显式拒绝。
-func TestCL44_2_RegisterWithMaster_rejectsMalformedRegistrationPayload(t *testing.T) {
+func TestRegisterWithMaster_rejectsMalformedRegistrationPayload(t *testing.T) {
 	// Given：主节点 200 但 data 缺注册编号与注册密钥
 	master := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -31,7 +31,7 @@ func TestCL44_2_RegisterWithMaster_rejectsMalformedRegistrationPayload(t *testin
 	}
 }
 
-func TestCL44_2_RegisterWithMaster_acceptsValidRegistrationPayload(t *testing.T) {
+func TestRegisterWithMaster_acceptsValidRegistrationPayload(t *testing.T) {
 	// Given
 	master := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

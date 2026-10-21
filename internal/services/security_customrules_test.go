@@ -63,7 +63,7 @@ func TestResolvePolicyCustomRules_chunkedIDsAcrossBatches(t *testing.T) {
 	}
 }
 
-// 历史 历史问题: 分块查询失败时其 id 不得计入悬空引用日志——此前
+// 历史问题: 分块查询失败时其 id 不得计入悬空引用日志——此前
 // dropped=len(ids)-len(rules) 把「查询失败」误报为「规则已删除」；
 // 失败块单独留痕，悬空口径只统计查询成功分块。
 func TestResolvePolicyCustomRules_chunkFailureDoesNotInflateDanglingLog(t *testing.T) {
@@ -161,7 +161,7 @@ func TestBuildCorazaDirectives_userAgentTargetUsesColonNotation(t *testing.T) {
 	}
 }
 
-// TestBuildCorazaDirectives_equalsOperatorEmitsStreq（审计 H1）：equals 语义
+// TestBuildCorazaDirectives_equalsOperatorEmitsStreq（历史修复）：equals 语义
 // 收紧为大小写敏感精确匹配 @streq——此前误用 @pm（短语匹配：大小写不敏感 +
 // 空格分词，「等于 /admin」实际是「包含单词 admin」），与 UI「等于」承诺不符。
 func TestBuildCorazaDirectives_equalsOperatorEmitsStreq(t *testing.T) {
@@ -289,7 +289,7 @@ func TestEmitCustomRules_invalidRuleLogsSkipAndSparesCleanRules(t *testing.T) {
 	}
 }
 
-// N15-F1：多条件链式规则的 setvar 必须绑定到链条末条。coraza v3 在起始条
+// 历史修复：多条件链式规则的 setvar 必须绑定到链条末条。coraza v3 在起始条
 // 算子命中时立即执行其非破坏性动作（internal/corazawaf/rule.go matchVariable
 // 注释「We run non-disruptive actions even if there is no chain match」）——
 // 起始条命中而后续条件未命中时链条整体不匹配，但起始条上的 setvar 已累加
@@ -355,7 +355,7 @@ func TestEmitCustomRules_multiConditionSetvarOnLastChainElement(t *testing.T) {
 	}
 }
 
-// N15-F1 对照组：单条件规则的发射形状不变（setvar 仍在唯一条目上）。
+// 历史修复 对照组：单条件规则的发射形状不变（setvar 仍在唯一条目上）。
 func TestEmitCustomRules_singleConditionSetvarStaysOnRule(t *testing.T) {
 	var sb strings.Builder
 	rules := []models.CustomRule{
@@ -425,7 +425,7 @@ func TestEmitCustomRules_bodyTargetScansParsedBodyCollections(t *testing.T) {
 	}
 }
 
-// 历史 历史问题：发射守卫复用保存侧 validateCustomRulePattern——空/纯空白
+// 历史问题：发射守卫复用保存侧 validateCustomRulePattern——空/纯空白
 // pattern 的规则必须整条跳过（@contains "" 等于匹配一切，绝不能落成无条件
 // deny），合法规则不受影响。
 func TestEmitCustomRules_emptyPatternSkipped(t *testing.T) {

@@ -60,7 +60,7 @@ func TestCertJobRetryBlocked_rejects_disabled_job_without_timestamp(t *testing.T
 	}
 }
 
-// CERT-N3（历史）：downloaded 态（证书已签发下载、停在部署退避窗口）
+// 历史修复（历史）：downloaded 态（证书已签发下载、停在部署退避窗口）
 // 的重试拦截文案不得复用在途签发口径「任务正在执行中」——签发已结束，
 // 用户被误导为签发流程卡住。单列部署窗口口径。
 func TestCertJobRetryBlocked_downloaded_job_uses_deployment_message(t *testing.T) {
@@ -274,7 +274,7 @@ func TestRetryCertJob_accepts_www_first_rule_domain(t *testing.T) {
 }
 
 func TestDeleteCertJob_blocks_pending_chain_job_when_rule_still_auto_issuing(t *testing.T) {
-	// S-2：failed/waiting_ca/queued 是「等待签发或等待重试」的被动状态——规则
+	// 历史修复：failed/waiting_ca/queued 是「等待签发或等待重试」的被动状态——规则
 	// 保持 active acme_dns 时删除会让该域名自动签发链永久断链且 UI 零信号
 	// （周期路径只重排已存在行，CreateOrRequeueCertJob 仅规则写路径调用），
 	// 与 issued/downloaded 守卫同型，必须 409 显式拒绝。
@@ -336,7 +336,7 @@ func TestDeleteCertJob_blocks_inflight_job_when_rule_still_auto_issuing(t *testi
 }
 
 func TestDeleteCertJob_allows_pending_chain_job_when_rule_disabled(t *testing.T) {
-	// S-2 放行形态（与既有 disabled-flow 语义一致）：规则已禁用时签发链本就
+	// 历史修复 放行形态（与既有 disabled-flow 语义一致）：规则已禁用时签发链本就
 	// 停摆，删除 failed/waiting_ca/queued 任务不影响任何链，照常放行。
 	h := newBackupTestHandlers(t)
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled,enable_tls,tls_source)
@@ -365,7 +365,7 @@ func TestDeleteCertJob_allows_pending_chain_job_when_rule_disabled(t *testing.T)
 }
 
 func TestDeleteCertJob_blocks_issued_job_when_rule_still_auto_renewing(t *testing.T) {
-	// 历史问题 N4：删除 issued 任务行后纯周期路径永不重建（CreateOrRequeueCertJob
+	// 历史问题：删除 issued 任务行后纯周期路径永不重建（CreateOrRequeueCertJob
 	// 仅由规则写路径调用），规则自动续签永久断链且 UI 无信号——规则仍在
 	// enabled+acme_dns+域名一致时必须 409 显式拒绝，先禁用规则方可删除。
 	h := newBackupTestHandlers(t)
@@ -394,7 +394,7 @@ func TestDeleteCertJob_blocks_issued_job_when_rule_still_auto_renewing(t *testin
 }
 
 func TestDeleteCertJob_blocks_downloaded_job_with_reversed_rule_domain(t *testing.T) {
-	// 历史问题 N4：downloaded 任务持有已下载证书，删除同样断续签链；规则域名
+	// 历史问题：downloaded 任务持有已下载证书，删除同样断续签链；规则域名
 	// 顺序与任务规范形式相反时仍须命中拦截（与续签扫描的域名判读一致）。
 	h := newBackupTestHandlers(t)
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled,enable_tls,tls_source)
@@ -419,7 +419,7 @@ func TestDeleteCertJob_blocks_downloaded_job_with_reversed_rule_domain(t *testin
 }
 
 func TestDeleteCertJob_allows_issued_job_when_rule_not_auto_renewing(t *testing.T) {
-	// 历史问题 N4 放行形态：规则已禁用或已切回 manual 证书时，删除 issued 任务
+	// 历史问题 放行形态：规则已禁用或已切回 manual 证书时，删除 issued 任务
 	// 不影响任何续签链（续签扫描本就跳过这些规则），按原语义放行。
 	h := newBackupTestHandlers(t)
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled,enable_tls,tls_source)
@@ -448,7 +448,7 @@ func TestDeleteCertJob_allows_issued_job_when_rule_not_auto_renewing(t *testing.
 }
 
 func TestDeleteCertJob_aborts_when_rule_reenabled_during_delete(t *testing.T) {
-	// 历史问题 C-发现3 TOCTOU：N4 守卫读到 enabled=0 放行后 EnableRule（持
+	// 历史问题 C-发现3 TOCTOU：历史修复 守卫读到 enabled=0 放行后 EnableRule（持
 	// caddyOpMu）完成启用，删除照常执行 → 规则无任务行、续签永久断链。
 	// 修复：守卫检查与状态翻转/删除全程持 caddyOpMu 与 EnableRule 互斥——
 	// EnableRule 先完成时守卫必须复核到 enabled=1 并 409。
@@ -551,7 +551,7 @@ func TestDeleteCertJob_deleteFailureLeavesDisabledRuleJobFailed(t *testing.T) {
 func TestDeleteCertJob_restores_downloaded_job_with_material_when_delete_fails(t *testing.T) {
 	// 历史问题（历史）：删除持有证书材料的 downloaded 任务失败时，恢复
 	// 路径必须原地保持 'downloaded' 并把部署窗口推到 now（对齐 caqueue
-	// requeueCanceledJob 的 历史问题 A-#5 口径）——转 'queued' 会丢弃已签发证书
+	// requeueCanceledJob 的 历史问题 口径）——转 'queued' 会丢弃已签发证书
 	// 触发整轮重签（Issue 快速路径只认 issued/downloaded）。
 	h := newBackupTestHandlers(t)
 	services.ResetCAQueueManagerForTest()
@@ -616,7 +616,7 @@ func TestCertJobOperationLock_serializes_retry_and_delete(t *testing.T) {
 }
 
 func TestRetryCertJob_does_not_acquire_caddyOpMu(t *testing.T) {
-	// S-6 锁序回归网：DeleteCertJob 以 caddyOpMu→certJobOperationLock 顺序持锁，
+	// 历史修复 锁序回归网：DeleteCertJob 以 caddyOpMu→certJobOperationLock 顺序持锁，
 	// RetryCertJob 只持 certJobOperationLock。若未来 RetryCertJob 在 operationLock
 	// 临界区内再获取 caddyOpMu，即与 DeleteCertJob 构成 AB-BA 死锁——现有测试
 	// 对此全部绿灯，此处用临界区内 TryLock 探针断言该不变量。
@@ -655,10 +655,10 @@ func TestRetryCertJob_does_not_acquire_caddyOpMu(t *testing.T) {
 }
 
 func TestRetryCertJob_reread_row_deleted_returns_404(t *testing.T) {
-	// 历史问题 A-3：UPDATE 0 行后重读若返回 scanErr（SQLITE_BUSY 等瞬时错误），
+	// 历史问题：UPDATE 0 行后重读若返回 scanErr（SQLITE_BUSY 等瞬时错误），
 	// 不能落入通用 409 把 DB 错误归因为规则禁用——必须显式 500。
-	// 历史问题 A-N3：行被并发删除（ErrNoRows）从 500 细分为 404（对齐 DeleteCertJob
-	// 历史问题 A-#3 的三分归因）；本测试以删行模拟，断言新 404 契约。
+	// 历史问题：行被并发删除（ErrNoRows）从 500 细分为 404（对齐 DeleteCertJob
+	// 历史问题 的三分归因）；本测试以删行模拟，断言新 404 契约。
 	h := newBackupTestHandlers(t)
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
@@ -693,7 +693,7 @@ func TestRetryCertJob_reread_row_deleted_returns_404(t *testing.T) {
 }
 
 func TestRetryCertJob_blocked_by_rule_deletion_returns_409(t *testing.T) {
-	// 历史问题 A-4：规则删除屏障期（BlockJobsForRule 生效）用户点重试，EnqueueIfActive
+	// 历史问题：规则删除屏障期（BlockJobsForRule 生效）用户点重试，EnqueueIfActive
 	// 应走 changed=false 的冲突语义（409），而不是返回 error 落 500。
 	h := newBackupTestHandlers(t)
 	services.ResetCAQueueManagerForTest()
@@ -728,7 +728,7 @@ func TestRetryCertJob_blocked_by_rule_deletion_returns_409(t *testing.T) {
 }
 
 func TestRetryCertJob_active_job_returns_queue_busy_message(t *testing.T) {
-	// 历史问题 A-F3：EnqueueIfActive 在途命中（历史问题 发现2）走 !changed 且重读状态未变时，
+	// 历史问题：EnqueueIfActive 在途命中（历史问题 发现2）走 !changed 且重读状态未变时，
 	// 409 文案必须归因"任务正在队列中"，不得误导为规则禁用/配置变更。
 	h := newBackupTestHandlers(t)
 	services.ResetCAQueueManagerForTest()
@@ -848,7 +848,7 @@ func TestGetCertJobLogs_concatenates_all_rotated_backups_oldest_first(t *testing
 	}
 }
 
-// B3-历史问题：证书日志尾窗与系统/Caddy 日志共用 tailLogWindow 的残段口径。
+// 历史问题：证书日志尾窗与系统/Caddy 日志共用 tailLogWindow 的残段口径。
 func TestReadCertJobLogFile_tailWindowDropsPartialFirstLine(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "cert.log")
 	for _, tc := range []struct {
@@ -872,7 +872,7 @@ func TestReadCertJobLogFile_tailWindowDropsPartialFirstLine(t *testing.T) {
 }
 
 // 历史问题（2026-09-05 证书域审计裁定）：cert_expiry_days 读取失败不得放大为整个
-// 任务列表 500——降级默认 30 并告警，对齐 历史 历史问题 的 checkManualCertExpiration
+// 任务列表 500——降级默认 30 并告警，对齐 历史问题 的 checkManualCertExpiration
 // 口径。种子任务 20 天后过期：默认阈值 30 下应判 expiring，证明降级取值真实生效。
 func TestListCertJobs_degrades_to_default_expiry_days_when_config_missing(t *testing.T) {
 	// Given：一条 issued 任务 20 天后过期；基线（配置在）请求 200
@@ -905,7 +905,7 @@ func TestListCertJobs_degrades_to_default_expiry_days_when_config_missing(t *tes
 	}
 }
 
-// （SYS-R5，历史：自 apikeys_current_test.go 迁回——本族为 cert_jobs 序列化
+// （历史修复，历史：自 apikeys_current_test.go 迁回——本族为 cert_jobs 序列化
 // 主题，此前仅因共用 newBackupTestHandlers 夹具寄居于 API Key 文件。）
 func TestCertJobEndpointsSerializeNullableTimes(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -997,14 +997,14 @@ func TestListCertJobs_returnsStatusCountsForQueueBanner(t *testing.T) {
 	}
 }
 
-// 历史问题（历史 历史问题，锁序并发回归）：DeleteCertJob 删除失败的恢复分支曾在
+// 历史问题（历史问题，锁序并发回归）：DeleteCertJob 删除失败的恢复分支曾在
 // 持有 per-job operationLock 时反向获取 caddyOpMu——与入口锁序
 // （caddyOpMu→operationLock）构成 AB-BA：同 id 连点/同桶（id%64）并发删除
 // 先取到 caddyOpMu 后在桶锁排队，双向互等且 caddyOpMu 被永久占用（规则/配置
 // 写与 Caddy 启停全部挂起）。本测试用 cancelCertJob 阻塞窗确定性复现：
 //
 //	T1（删除失败，恢复前）此时只持 operationLock；
-//	T2 按入口锁序先持 caddyOpMu，再请求同一把 operationLock。
+//	历史修复 按入口锁序先持 caddyOpMu，再请求同一把 operationLock。
 //
 // 修复前 T1 继续反向取 caddyOpMu → 死锁（5s 超时失败）；修复后 T1 先释放
 // per-job 锁再按规范顺序重取，两者依次完成且行按恢复语义落库。
@@ -1038,7 +1038,7 @@ func TestDeleteCertJob_recoveryKeepsCanonicalLockOrder(t *testing.T) {
 		t.Fatal("DeleteCertJob 未到达取消点（夹具前置失败）")
 	}
 
-	// T2：与入口同锁序（caddyOpMu → operationLock）的同桶并发操作。
+	// 历史修复：与入口同锁序（caddyOpMu → operationLock）的同桶并发操作。
 	secondEntered := make(chan struct{})
 	secondReleased := make(chan struct{})
 	go func() {
@@ -1082,7 +1082,7 @@ func TestDeleteCertJob_recoveryKeepsCanonicalLockOrder(t *testing.T) {
 	}
 }
 
-// 历史问题（历史 历史问题，verify→fixed）：cert_jobs.updated_at 在 DDL 中可空
+// 历史问题（历史问题，verify→fixed）：cert_jobs.updated_at 在 DDL 中可空
 // （internal/db/db.go 建表语句），NULL 时重试冷却门曾直接放行（fail-open）：
 // 历史行/带外插入的 queued/failed 任务可连点绕过 15/5 分钟冷却、连续消耗
 // CA 配额。修复：updated_at 无效时回退 created_at 计算；两列都缺失时

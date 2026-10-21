@@ -513,7 +513,7 @@ func queryBindingRows(t *testing.T, database *sql.DB, ruleCaddyID string) []int 
 	return ids
 }
 
-// SC-CLU-01: A primary node with MULTIPLE binding rows for one rule
+// 历史修复: A primary node with MULTIPLE binding rows for one rule
 // (e.g. rule R bound to policies 1, 3, 5) snapshots to a slave; after apply,
 // the slave's security_policy_bindings contains exactly those rows (no dedup
 // to one row, no loss, order-preserving by policy_id).
@@ -579,7 +579,7 @@ func TestClusterSnapshot_multiRowBindingsPreserved(t *testing.T) {
 	}
 }
 
-// SC-CLU-01 (dangling): A binding whose policy was deleted on primary is
+// 历史修复 (dangling): A binding whose policy was deleted on primary is
 // carried verbatim through snapshot→apply. The runtime (GetSecurityPoliciesForRule)
 // silently skips it via scanSecurityPolicyByID. Pin this pre-v2.2.0 behavior.
 func TestClusterSnapshot_danglingBindingPreserved(t *testing.T) {
@@ -621,7 +621,7 @@ func TestClusterSnapshot_danglingBindingPreserved(t *testing.T) {
 }
 
 // queryRecordingSnapshotStore 记录最近一次 QueryContext 的 SQL 后委托真实 DB
-// 执行（同时验证 SQL 可执行）——仅用于 SS87-历史问题 的宽松 ORDER BY 成员断言。
+// 执行（同时验证 SQL 可执行）——仅用于  的宽松 ORDER BY 成员断言。
 type queryRecordingSnapshotStore struct {
 	database *sql.DB
 	query    string
@@ -671,11 +671,11 @@ func orderByNameSet(query string, names ...string) bool {
 }
 
 func TestClusterSnapshot_securityBindingsFullyOrdered(t *testing.T) {
-	// E-F2 回归：v2.2.0 多策略后同一 rule_caddy_id 最多 8 行绑定（SEC-B-GAP-U3：
+	// 历史修复 回归：v2.2.0 多策略后同一 rule_caddy_id 最多 8 行绑定（历史修复：
 	// 上限 2026-09-21 已 5→8，注释滞同步）。ORDER BY 只给 rule_caddy_id 时行间
 	// 顺序在 SQL 层无定义（靠复合主键覆盖索引碰巧稳定，属查询计划偶然），而
 	// 快照指纹/缓存键要求字节级确定性。
-	// SS87-历史问题：旧断言钉 SQL 文本后缀（ORDER BY rule_caddy_id, policy_id），
+	// 历史问题：旧断言钉 SQL 文本后缀（ORDER BY rule_caddy_id, policy_id），
 	// 对等价改写（ORDER BY 1,2 / 子查询 / CTE）过敏且不证明行为——改为行为钉：
 	// 同一绑定集合按两种相反的物理插入顺序落库，快照字节必须一致。
 	cluster, database := newClusterTestService(t)
@@ -711,7 +711,7 @@ func TestClusterSnapshot_securityBindingsFullyOrdered(t *testing.T) {
 		t.Fatalf("bindings snapshot=%s\nwant %s", forward, want)
 	}
 
-	// 契约钉（SS87-历史问题 取舍说明）：字节确定性用例在 SQLite 上无法区分
+	// 契约钉（ 取舍说明）：字节确定性用例在 SQLite 上无法区分
 	// 「ORDER BY 只给 rule_caddy_id」——复合主键覆盖索引恰可满足该排序，行间
 	// 次序仍稳定（正是找出项所说的「查询计划偶然」）。因此补一条宽松的
 	// ORDER BY 成员断言：只要求子句里出现两列（去空白后按词元比较），容忍
@@ -749,4 +749,109 @@ func TestApplySnapshot_normalizesPolicyValueColumns(t *testing.T) {
 	if anomaly != 5 {
 		t.Fatalf("nil anomaly_threshold applied as %d, want 5", anomaly)
 	}
+}
+
+// 历史修复：旧主端（v2.3.0-）快照不携带 security_ip_lists 键时，
+// 从端不得清空本地名单——与威胁源/爬虫源「缺席=保留本地」nil 门同口径。
+// 携带空数组 [] = 显式清空；携带正常载荷 = 全量替换。
+func TestClusterApplySnapshot_securityIPListsAbsentPreservesLocal(t *testing.T) {
+	seedLists := func(t *testing.T, database *sql.DB) {
+		t.Helper()
+		if _, err := database.Exec(`INSERT INTO security_ip_lists (name,description,category,entries,created_by,created_at,updated_by,updated_at,system) VALUES
+			('p205-list-a','','','["1.1.1.1"]',0,'2026-01-01 00:00:00',0,'2026-01-01 00:00:00',1),
+			('p205-list-b','','','["2.2.2.2"]',0,'2026-01-01 00:00:00',0,'2026-01-01 00:00:00',1),
+			('p205-list-c','','','["3.3.3.3"]',0,'2026-01-01 00:00:00',0,'2026-01-01 00:00:00',1)`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	countLists := func(t *testing.T, database *sql.DB) int {
+		t.Helper()
+		var n int
+		if err := database.QueryRow(`SELECT COUNT(*) FROM security_ip_lists`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	baseSnapshot := func() models.ClusterSnapshot {
+		return models.ClusterSnapshot{
+			Version:             9,
+			SecurityPolicies:    json.RawMessage("[]"),
+			SecurityBindings:    json.RawMessage("[]"),
+			SecurityCustomRules: []models.SecurityCustomRule{},
+			SecurityBlockPages:  []models.SecurityBlockPage{},
+			SecurityCRSVersion:  []models.ClusterSecurityCRSVersion{},
+		}
+	}
+
+	t.Run("absent key preserves local lists", func(t *testing.T) {
+		// Given：本地三条名单 + 无 security_ip_lists 键的快照（nil RawMessage，
+		// 模拟 v2.3.0- 主端）。
+		_, database := newClusterTestService(t)
+		seedLists(t, database)
+		before := countLists(t, database)
+		snapshot := baseSnapshot()
+
+		// When
+		if err := replaceSnapshotDB(context.Background(), database, snapshot); err != nil {
+			t.Fatalf("apply snapshot: %v", err)
+		}
+
+		// Then：本地名单全部保留。
+		if got := countLists(t, database); got != before {
+			t.Fatalf("security_ip_lists rows=%d after absent-key apply, want %d (preserved)", got, before)
+		}
+	})
+
+	t.Run("empty array explicitly clears", func(t *testing.T) {
+		// Given：本地三条名单 + 显式空数组载荷（主端已清空名单）。
+		_, database := newClusterTestService(t)
+		seedLists(t, database)
+		snapshot := baseSnapshot()
+		snapshot.SecurityIPLists = json.RawMessage("[]")
+
+		// When
+		if err := replaceSnapshotDB(context.Background(), database, snapshot); err != nil {
+			t.Fatalf("apply snapshot: %v", err)
+		}
+
+		// Then：显式清空语义不破坏。
+		if got := countLists(t, database); got != 0 {
+			t.Fatalf("security_ip_lists rows=%d after empty-array apply, want 0", got)
+		}
+	})
+
+	t.Run("payload replaces all", func(t *testing.T) {
+		// Given：本地三条名单 + 携带一行的正常载荷。
+		_, database := newClusterTestService(t)
+		seedLists(t, database)
+		row := map[string]interface{}{
+			"id": 41, "name": "p205-master-list", "description": "from master",
+			"category": "deny", "entries": `["9.9.9.9"]`,
+			"created_by": 1, "created_at": "2026-02-02 00:00:00",
+			"updated_by": 1, "updated_at": "2026-02-02 00:00:00", "system": 0,
+		}
+		raw, err := json.Marshal([]map[string]interface{}{row})
+		if err != nil {
+			t.Fatal(err)
+		}
+		snapshot := baseSnapshot()
+		snapshot.SecurityIPLists = raw
+
+		// When
+		if err := replaceSnapshotDB(context.Background(), database, snapshot); err != nil {
+			t.Fatalf("apply snapshot: %v", err)
+		}
+
+		// Then：全量替换——仅剩载荷行。
+		if got := countLists(t, database); got != 1 {
+			t.Fatalf("security_ip_lists rows=%d after payload apply, want 1", got)
+		}
+		var name string
+		if err := database.QueryRow(`SELECT name FROM security_ip_lists`).Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		if name != "p205-master-list" {
+			t.Fatalf("remaining list name=%q, want p205-master-list", name)
+		}
+	})
 }

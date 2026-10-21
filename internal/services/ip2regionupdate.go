@@ -16,7 +16,7 @@ import (
 
 var ErrIP2RegionUpdateRunning = errors.New("IP2Region 更新任务正在进行中")
 
-// errIP2RegionReload 标记「安装后内存热换失败」（历史问题 历史修复）：此时磁盘已是新库
+// errIP2RegionReload 标记「安装后内存热换失败」（历史修复）：此时磁盘已是新库
 // 而内存 searcher 仍是旧库，run() 须走与 reloader 失败相同的回滚路径，不得按
 // 普通安装失败直接落库（磁盘/内存/DB 会三方分叉）。
 var errIP2RegionReload = errors.New("重载 ip2region 内存索引失败")
@@ -38,7 +38,7 @@ const (
 	IP2RegionStatusCancelled IP2RegionUpdateStatus = "cancelled"
 )
 
-// IP2RegionUpdateManager runs ip2region xdb updates 历史修复 and persists
+// IP2RegionUpdateManager runs ip2region xdb updates single-flight and persists
 // terminal state in security_ip2region_version.
 type IP2RegionUpdateManager struct {
 	mu      sync.Mutex
@@ -46,7 +46,7 @@ type IP2RegionUpdateManager struct {
 	state   ip2RegionTaskState
 	runDone chan struct{}
 
-	// bakCreated 标记本次运行已创建 ip2region.xdb.bak（历史问题 F1，镜像 CRS 的
+	// bakCreated 标记本次运行已创建 ip2region.xdb.bak（历史问题，镜像 CRS 的
 	// CRSUpdateManager.overridesBakCreated/rulesBakCreated，crsinstall.go 的
 	// downloadAndInstall/restoreBackupInLock）：rollbackXDB 只消费本
 	// 运行创建的 bak——跨运行崩溃窗口（rename 成功后、reloader 前崩溃）残留的
@@ -54,12 +54,12 @@ type IP2RegionUpdateManager struct {
 	// 每次 run() 开始时重置，downloadAndInstall 备份成功后置位。
 	bakCreated bool
 
-	// prevVersion 记录安装锁段读出的事件前版本行值（F-历史问题-02）：版本行与
+	// prevVersion 记录安装锁段读出的事件前版本行值（历史问题-02）：版本行与
 	// sidecar 随安装段（wafFileMu 互斥区）写入新 tag，重载失败且磁盘已还原
 	// 旧 xdb 时（run() restored 分支）行与 sidecar 必须回滚到本值——否则
 	// 「磁盘旧/行新」三方分叉。每次成功安装锁段内刷新。
 	prevVersion string
-	// newXdbSha 本次安装新工件的 sha256（历史问题）：rollback 全败时 历史修复
+	// newXdbSha 本次安装新工件的 sha256（历史问题）：rollback 全败时 fail-open
 	// 必须验证 live 仍是该工件（普通文件 + 摘要一致 + validate 通过）方可认 success。
 	newXdbSha string
 
@@ -101,7 +101,7 @@ func ResetIP2RegionUpdateManagerForTest() {
 	ip2RegionUpdateManagerOnce = sync.Once{}
 }
 
-// SetIP2RegionAutoUpdate toggles the 历史修复 flag without touching the
+// SetIP2RegionAutoUpdate toggles the auto-update flag without touching the
 // stored version; a missing row is seeded with the fallback version.
 func SetIP2RegionAutoUpdate(enabled bool) error {
 	if _, err := db.DB.Exec(
@@ -125,7 +125,7 @@ func SetIP2RegionAutoUpdate(enabled bool) error {
 
 func ensureIP2RegionVersionRow() {
 	if _, err := db.DB.Exec(
-		// 历史问题 二十六次 D2（裁决）：IP 库自动更新默认 ON——与 CRS 种子及 schema
+		// 历史问题（裁决）：IP 库自动更新默认 ON——与 CRS 种子及 schema
 		// DEFAULT TRUE 对齐（此前种子 FALSE 与 schema 默认矛盾；过期 xdb 同样
 		// 引发地域策略误拦/漏拦）。
 		"INSERT OR IGNORE INTO security_ip2region_version (id, version, auto_update) VALUES (1, 'unknown', TRUE)",
@@ -146,7 +146,7 @@ func currentIP2RegionVersion() string {
 var ip2RegionCurrentVersionForRun = currentIP2RegionVersion
 
 // StartUpdate begins an async update; only one may run at a time. 返回本次 run
-// 的完成通道（历史问题 历史修复，与 CRS 侧同形）：调度器 rearm 须等待该捕获通道而非
+// 的完成通道（历史修复，与 CRS 侧同形）：调度器 rearm 须等待该捕获通道而非
 // 回读现行 m.runDone，防手动更新插队覆盖后的错等与误判。手动调用方可忽略。
 // rc 语义同 CRS（RunID>0=引擎已记跳自记；Operator 审计归人）。
 // currentTrigger 当前在途运行触发源（StartUpdate 落 m.state.trigger）——
@@ -166,7 +166,7 @@ func (m *IP2RegionUpdateManager) StartUpdate(trigger string, rc *taskengine.RunC
 	m.running = true
 	m.runDone = make(chan struct{})
 	m.state = ip2RegionTaskState{status: IP2RegionStatusChecking, trigger: trigger, startedAt: time.Now().UTC()}
-	// SS87-历史问题：可取消 ctx 与 running 同临界区登记（镜像 CRS）——StartUpdate
+	// 历史问题：可取消 ctx 与 running 同临界区登记（镜像 CRS）——StartUpdate
 	// 返回后立刻 CancelRunning 必须命中，不得读到未登记的 runCancel 静默放行。
 	runCtx, runCancel := context.WithCancel(updateRunBaseContext(rc))
 	m.runCancel = runCancel
@@ -204,7 +204,7 @@ func (m *IP2RegionUpdateManager) setStage(status IP2RegionUpdateStatus, message 
 }
 
 // run 同步执行一次更新（测试/内部直调路径）：自建可取消 ctx 并登记
-// runCancel（镜像 CRS 的 SS87-历史问题 形态）。
+// runCancel（镜像 CRS 的  形态）。
 func (m *IP2RegionUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 	runCtx, runCancel := context.WithCancel(updateRunBaseContext(rc))
 	defer runCancel()
@@ -250,9 +250,9 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 	}()
 
 	// 历史问题 单写方：task_runs 由引擎统一记录。
-	// F-历史问题-01（历史）：runCtx 派生自 rc.Ctx（镜像 CRS 侧）——引擎 demote
+	// 历史问题-01（历史）：runCtx 派生自 rc.Ctx（镜像 CRS 侧）——引擎 demote
 	// 中止（SetRole 取消在途 Scheduled）随 rc.Ctx 传播；nil rc 回退 Background。
-	// SS87-历史问题：ctx 由调用方（StartUpdate/run）预建。
+	// 历史问题：ctx 由调用方（StartUpdate/run）预建。
 	defer func() {
 		m.mu.Lock()
 		m.running = false
@@ -260,7 +260,7 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 	}()
 
 	// 起点角色复查（历史问题）：与 CRS 更新同一 demote 竞态窗口——tick 越过
-	// is_master 守卫后节点被降级时，从节点上的 历史修复 更新必须立即终止。
+	// is_master 守卫后节点被降级时，从节点上的 in-flight 更新必须立即终止。
 	// 历史问题（历史）：NULL 兜底归一为 1，与 IsMaster/readonly 写闸/
 	// 调度器 tick 的 COALESCE(is_master,1) 同口径（历史 NULL 视为主节点）。
 	if isMaster, err := RoleOf(context.Background(), db.DB); err != nil || !isMaster {
@@ -271,7 +271,7 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 		return
 	}
 
-	// 每次运行重置：rollbackXDB 仅消费本运行创建的 .bak（历史问题 F1）。
+	// 每次运行重置：rollbackXDB 仅消费本运行创建的 .bak（历史问题）。
 	m.bakCreated = false
 
 	ensureIP2RegionVersionRow()
@@ -297,7 +297,7 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 		WriteIP2RegionUpdateLog("WARN", "retry", fmt.Sprintf("查询 ip2region 最新版本失败: %v；等待 %s 重试，第 %d 次，共 %d 次", rerr, wait, nextAttempt, updateMaxAttempts))
 	})
 	if err != nil {
-		// F-历史问题-01：runCtx 取消且已非主节点=demote 在途中止——落 skipped
+		// 历史问题-01：runCtx 取消且已非主节点=demote 在途中止——落 skipped
 		// （与起点角色复查同语义），不走 fail（从节点中止非故障）。
 		if master, known := updateRunRoleAtCancel(); runCtx.Err() != nil && known && !master {
 			m.syncInstalledVersionToState()
@@ -329,7 +329,7 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 		return
 	}
 	if tag == currentVersion || (cmpErr == nil && cmp <= 0) {
-		// 历史问题 二十七次 N6（补正重写——首版实施脚本缺失落盘调用丢失）：已是最新也
+		// 历史问题（补正重写——首版实施脚本缺失落盘调用丢失）：已是最新也
 		// 补写 .version sidecar——此前该分支提前 return 不写，崩溃遗留的 stale tag
 		// 将无限期不愈（愈于下次「安装」而非下次「检查」）；幂等，写失败仅记日志。
 		if err := rewriteVersionIfMissingOrStale(ip2regionLivePath+".version", tag); err != nil {
@@ -347,7 +347,7 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 		m.state.status = IP2RegionStatusSuccess
 		m.state.message = "已是最新版本"
 		m.state.finishedAt = time.Now().UTC()
-		// S历史问题-11 同型补 version（历史 历史问题）：内存态优先后 version
+		// 历史问题-11 同型补 version（历史）：内存态优先后 version
 		// 此前在「已是最新」时退化为空串（CRS 侧已修，本侧漏同步）。
 		m.state.version = currentIP2RegionVersion()
 		m.mu.Unlock()
@@ -362,7 +362,7 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 	var installErr error
 	installRetErr := runWithInTaskRetry(runCtx, func() error {
 		installErr = m.downloadAndInstall(runCtx, tag)
-		// errIP2RegionReload=内存热换失败（历史修复 回滚路径），非瞬断——不重试。
+		// errIP2RegionReload=内存热换失败（fail-open 回滚路径），非瞬断——不重试。
 		if errors.Is(installErr, errIP2RegionReload) {
 			return nil
 		}
@@ -378,7 +378,7 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 		installErr = runCtx.Err()
 	}
 	if installErr != nil && !errors.Is(installErr, errIP2RegionReload) {
-		// F-历史问题-01：同上方 fetch 分支——demote 在途中止落 skipped（不回滚
+		// 历史问题-01：同上方 fetch 分支——demote 在途中止落 skipped（不回滚
 		// 不重载：从节点保持只读不变量）。
 		if master, known := updateRunRoleAtCancel(); runCtx.Err() != nil && known && !master {
 			m.syncInstalledVersionToState()
@@ -398,7 +398,7 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 	// 历史问题 安装后内存热换失败视同 reloader 失败进入同一回滚路径（磁盘已是
 	// 新库、内存仍是旧库，直接按 failed 落库会重演三方分叉）；此时不再调用
 	// reloader，直接回滚。memSwitched 记录内存 searcher 是否已切到新库，供
-	// 历史修复 的 message 注明「内存未切换、重启后生效」。
+	// fail-open 的 message 注明「内存未切换、重启后生效」。
 	reloadErr := installErr
 	memSwitched := installErr == nil
 	// 历史问题-3（历史）：nil reloader 守卫——镜像 CRS 侧（crsinstall.go 的
@@ -415,14 +415,14 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 		// 回滚旧 xdb 并再次重载（镜像 CRS fail() 路径，历史问题 1.2）：reloader 失败
 		// 时磁盘还原到更新前状态，避免「磁盘已是新库、DB 记录旧版本+failed」的
 		// 长期不一致；还原后内存热换失败时旧 searcher 保持服役、磁盘已是基线
-		//（历史问题 历史问题）——若安装阶段热换曾成功，内存 searcher 以新数据滞后，在下
+		//（历史问题）——若安装阶段热换曾成功，内存 searcher 以新数据滞后，在下
 		// 次更新安装或重启后收敛（无周期性 reload；Caddy 侧 geoip 强制随
 		// reloader 重试收敛），不影响磁盘/DB 一致性。回滚或重试失败仅记录，
 		// 不改变失败落库。
 		restored, distRestore, rbErr := m.rollbackXDB()
 		switch {
 		case rbErr != nil:
-			// 历史问题：回滚升级链全败时 历史修复 **必须**验证 live 仍是本次
+			// 历史问题：回滚升级链全败时 fail-open **必须**验证 live 仍是本次
 			// 新工件（普通文件 + sha 等于新工件 + validate 通过）；否则按失败
 			// 落库并回写旧版本（不得把未验证的字节认成「已生效」）。
 			Logf("error", "ip2region update: rollback xdb failed: %v", rbErr)
@@ -451,7 +451,7 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 			m.advanceSlotIfAuto(trigger)
 			return
 		case restored:
-			// F-历史问题-02：磁盘已还原旧 xdb——安装段（锁内）写入的新版本行与
+			// 历史问题-02：磁盘已还原旧 xdb——安装段（锁内）写入的新版本行与
 			// sidecar 必须同步回滚到 prevVersion，否则「磁盘旧/行新」三方分叉
 			// （导出侧读新 tag 配旧 xdb）。回滚失败仅记日志：fail() 落 failed
 			// 状态行，下次成功更新/启动对账自愈。
@@ -482,7 +482,7 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 			m.advanceSlotIfAuto(trigger)
 			return
 		default:
-			// 历史问题 F1 bakCreated==false（全新部署首次更新，无旧 live
+			// 历史问题 bakCreated==false（全新部署首次更新，无旧 live
 			// 可备份）且 dist 也缺失，无任何「更新前基线」可回退。但 live 必须
 			// 仍是本次已验证的新工件才可按成功落库（与 rbErr 分支同门）。
 			if m.failOpenPreconditionHolds() {
@@ -496,8 +496,8 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 			return
 		}
 	}
-	// SS87-历史问题：只清理本运行创建的备份（与 rollbackXDB 的 bakCreated 口径、
-	// 历史问题/历史问题/历史修复 历史问题「本运行创建才可消费/清理」统一）——历史修复（live
+	// 历史问题：只清理本运行创建的备份（与 rollbackXDB 的 bakCreated 口径、
+	// 历史问题「本运行创建才可消费/清理」统一）——fresh-install（live
 	// 不存在→本轮未建备份）时磁盘上的陈旧 .bak 是崩溃现场唯一恢复副本，
 	// 成功路径删除会无谓销毁它。
 	if m.bakCreated {
@@ -511,9 +511,9 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 		Logf("error", "ip2region update: failed to record success: %v", err)
 	}
 	SetIP2RegionVersion(tag)
-	// 历史问题 二十六次 主节点补写 .version sidecar——waffiles_sync 的
+	// 历史问题 主节点补写 .version sidecar——waffiles_sync 的
 	// BuildWafFileRef（ref.IP2RegionTag）与从节点 rewriteVersionIfMissingOrStale
-	// 都假设它存在。F-历史问题-02 后首写已随安装段（wafFileMu 互斥区）完成，此处
+	// 都假设它存在。历史问题-02 后首写已随安装段（wafFileMu 互斥区）完成，此处
 	// 为幂等补写（安装段写失败时的自愈网，同 tag 命中即跳过重写）。
 	if err := rewriteVersionIfMissingOrStale(ip2regionLivePath+".version", tag); err != nil {
 		Logf("error", "ip2region update: failed to write .version sidecar: %v", err)
@@ -612,15 +612,15 @@ func (m *IP2RegionUpdateManager) downloadAndInstall(parent context.Context, tag 
 	if err := validateIP2RegionXDB(staged); err != nil {
 		return err
 	}
-	// 历史问题：记录新工件摘要，供回滚全败时 历史修复 前置校验。
+	// 历史问题：记录新工件摘要，供回滚全败时 fail-open 前置校验。
 	if sum, sumErr := sha256File(staged); sumErr == nil {
 		m.newXdbSha = sum
 	} else {
 		m.newXdbSha = ""
 	}
-	// TOFU 完整性基线在格式验证成功之后记录（历史问题 F6）：验证前的坏工件留下基线
+	// TOFU 完整性基线在格式验证成功之后记录（历史问题）：验证前的坏工件留下基线
 	// 会让下次同 tag 好下载误报。I/O 类记录失败不阻断安装；mismatch 必须中止
-	// 安装并保留旧基线（审计 M11，契约#4，镜像代理投毒无拦截力）。
+	// 安装并保留旧基线（历史修复，镜像代理投毒无拦截力）。
 	if ierr := recordDownloadIntegrity(ip2RegionXDBBaselineKey(tag), staged, "IP数据库"); ierr != nil {
 		if errors.Is(ierr, errDownloadIntegrityMismatch) {
 			return ierr
@@ -642,8 +642,8 @@ func (m *IP2RegionUpdateManager) downloadAndInstall(parent context.Context, tag 
 		m.bakCreated = true
 	}
 	if err := osRename(staged, ip2regionLivePath); err != nil {
-		// 安装未发生：仅清理本运行创建的备份（SS87-历史问题——无 bakCreated 守
-		// 卫时 历史修复 会删除跨运行的陈旧 .bak，而该备份是崩溃现场唯一
+		// 安装未发生：仅清理本运行创建的备份（——无 bakCreated 守
+		// 卫时 fresh-install 会删除跨运行的陈旧 .bak，而该备份是崩溃现场唯一
 		// 恢复副本；陈旧 bak 本就不会被 rollback 消费）。
 		if m.bakCreated {
 			os.Remove(liveBak)
@@ -651,7 +651,7 @@ func (m *IP2RegionUpdateManager) downloadAndInstall(parent context.Context, tag 
 		wafFileMu.Unlock()
 		return fmt.Errorf("安装 ip2region xdb: %w", err)
 	}
-	// F-历史问题-02（历史）：版本行与 .version sidecar 收进安装段同一互斥
+	// 历史问题-02（历史）：版本行与 .version sidecar 收进安装段同一互斥
 	// 区——此前在锁外 run() 成功路径，写相位中段（xdb 已换、行/sidecar 未写）
 	// 导出侧（BuildWafFileBundle/BuildWafFileRef 读相位持同一锁）可打出「文件
 	// 新/行旧」偏斜并沿 waf_files 通道扩散。单行 UPDATE+小文件原子写毫秒级，
@@ -696,40 +696,40 @@ func (m *IP2RegionUpdateManager) downloadXDBLogged(ctx context.Context, tag, des
 // rollbackXDB 将本次更新前备份的旧 xdb 还原到 live 路径并热换内存 searcher
 // （历史问题 1.2，镜像 CRS 的 restoreBackup）。返回 restored=true 表示磁盘已
 // 回到「更新前基线」，调用方按 failed+旧版本落库即磁盘/DB 一致；restored=false
-// 且 err=nil 表示无任何基线可用，由调用方按 历史修复 处理（历史问题 F1）。
+// 且 err=nil 表示无任何基线可用，由调用方按 fail-open 处理（历史问题）。
 //
 // 基线优先级：本运行创建的 .bak > dist 发行版副本。陈旧 .bak（跨运行崩溃窗口
-// 的保全副本）永不消费（历史问题 F1）；bakCreated==false 时回退到 ip2regionDistPath
+// 的保全副本）永不消费（历史问题）；bakCreated==false 时回退到 ip2regionDistPath
 // ——全新部署首次更新无旧 live 可备份，dist 即「更新前状态」的权威副本。dist
 // 也缺失时不做任何改动，返回 restored=false。
 //
-// .bak 还原升级链（历史问题 历史问题）：rename 失败（非权限类的瞬时故障，如偶发 IO
+// .bak 还原升级链（历史问题）：rename 失败（非权限类的瞬时故障，如偶发 IO
 // 错误）不等于基线丢失——.bak 仍在磁盘，升级为 copyFile 还原；权限类失败
 // （目录不可写）下 copyFile 需要同一目录的写权限、必然同败，会直接落到 dist
-// 回退；全部失败才返回 error，由调用方走 历史修复（DB 必须跟随实际状态，
+// 回退；全部失败才返回 error，由调用方走 fail-open（DB 必须跟随实际状态，
 // 不得记 failed+旧版本重演三方分叉）。
 //
-// 任一级的磁盘还原一旦成功即「该级成功」，内存热换失败不再升级（历史问题 历史问题）：
+// 任一级的磁盘还原一旦成功即「该级成功」，内存热换失败不再升级（历史问题）：
 // rename 会消费 .bak，升级后 copy 级必然失败、dist 必然执行，而 dist 是镜像
 // 捆绑的旧版本，会覆盖已正确还原的更新前基线——磁盘(dist 旧版)≠DB(failed+
 // 旧版本)分叉且基线不可恢复。热换失败只记 warn 并返回 restored=true：Reload
 // 失败时旧 searcher 保持服役、磁盘已还原为基线；若安装阶段热换曾成功，内存
 // searcher 以新数据滞后，在下次更新安装或重启后收敛（无周期性 reload；
-// Caddy 侧 geoip 强制随 reloader 重试收敛）。dist 级同口径（历史问题 历史修复）：
-// dist copy 成功后磁盘=dist 基线，历史修复 前提「磁盘已是新库」不成立，
+// Caddy 侧 geoip 强制随 reloader 重试收敛）。dist 级同口径（历史修复）：
+// dist copy 成功后磁盘=dist 基线，fail-open 前提「磁盘已是新库」不成立，
 // 热换失败同样 warn + restored=true；仅 dist copy 本身失败（磁盘未动、仍
-// 是新库）才返回 error，由调用方走 历史修复。
+// 是新库）才返回 error，由调用方走 fail-open。
 func (m *IP2RegionUpdateManager) rollbackXDB() (restored bool, distRestore bool, err error) {
 	if m.bakCreated {
 		bak := ip2regionLivePath + ".bak"
 		if _, err := os.Stat(bak); err == nil {
 			if renameErr := osRename(bak, ip2regionLivePath); renameErr == nil {
 				if rErr := reloadIP2RegionSearcher(); rErr != nil {
-					// 历史问题 历史问题：磁盘已还原为更新前基线，热换失败不得升级——
+					// 历史问题：磁盘已还原为更新前基线，热换失败不得升级——
 					// .bak 已被 rename 消费，升级后 copy 必然失败、dist 必然
 					// 执行，镜像捆绑的旧版会覆盖正确基线（磁盘≠DB 分叉+基线
 					// 丢失）。磁盘已是基线；若安装阶段热换曾成功，内存
-					// searcher 滞后至下次更新安装或重启收敛（历史问题 历史修复）。
+					// searcher 滞后至下次更新安装或重启收敛（历史修复）。
 					Logf("error", "ip2region update: reload after rename restore failed (%v); disk baseline restored; if the install-time hot-swap succeeded, the in-memory searcher lags until the next update install or restart (Caddy-side geoip converges with the reloader)", rErr)
 				}
 				return true, false, nil
@@ -743,7 +743,7 @@ func (m *IP2RegionUpdateManager) rollbackXDB() (restored bool, distRestore bool,
 					Logf("error", "ip2region update: failed to remove bak after copy restore: %v", rErr)
 				}
 				if rErr := reloadIP2RegionSearcher(); rErr != nil {
-					// 历史问题 历史问题：同 rename 级——磁盘已是正确基线，热换失败仅
+					// 历史问题：同 rename 级——磁盘已是正确基线，热换失败仅
 					// 记 warn，不得升级到 dist 覆盖基线（滞后收敛口径同上）。
 					Logf("error", "ip2region update: reload after copy restore failed (%v); disk baseline restored; if the install-time hot-swap succeeded, the in-memory searcher lags until the next update install or restart (Caddy-side geoip converges with the reloader)", rErr)
 				}
@@ -767,15 +767,15 @@ func (m *IP2RegionUpdateManager) rollbackXDB() (restored bool, distRestore bool,
 	}
 	if err := reloadIP2RegionSearcher(); err != nil {
 		// 历史问题 dist copy 已成功、磁盘=dist 基线，历史修复 前提「磁盘已
-		// 是新库」不成立——与 rename/copy 级同口径（历史问题 历史问题）记 warn 并返回
+		// 是新库」不成立——与 rename/copy 级同口径（历史问题）记 warn 并返回
 		// restored=true，由 run() 记 failed+旧版本（磁盘/DB 一致）；仅 dist
-		// copy 本身失败（上方，磁盘未动、仍是新库）才返回 error 走 历史修复。
+		// copy 本身失败（上方，磁盘未动、仍是新库）才返回 error 走 fail-open。
 		Logf("error", "ip2region update: reload after dist restore failed (%v); disk restored to dist baseline; if the install-time hot-swap succeeded, the in-memory searcher lags until the next update install or restart (Caddy-side geoip converges with the reloader)", err)
 	}
 	return true, true, nil
 }
 
-// failOpenPreconditionHolds 校验 历史修复 前置（历史问题）：live 为普通文件、
+// failOpenPreconditionHolds 校验 fail-open 前置（历史问题）：live 为普通文件、
 // 摘要等于本次新工件、且 validateIP2RegionXDB 通过。
 func (m *IP2RegionUpdateManager) failOpenPreconditionHolds() bool {
 	info, err := os.Lstat(ip2regionLivePath)
@@ -817,13 +817,13 @@ func (m *IP2RegionUpdateManager) writeDistRollbackMarkers() {
 }
 
 // successAfterReloadFailOpen 在「reloader 失败但无任何回退基线」时按成功落库
-// （历史问题 F1 历史修复）：磁盘已是新库，DB 记录 success+新 tag 让三方一致；
+// （历史问题 fail-open）：磁盘已是新库，DB 记录 success+新 tag 让三方一致；
 // message 保留 reloader 错误以便排查 Caddy 侧问题，审计同样记成功但附带上该
-// 警告。落库前与 restored 分支对称补一次 reloader 重试（历史问题 历史问题）：重试成功
+// 警告。落库前与 restored 分支对称补一次 reloader 重试（历史问题）：重试成功
 // 则 Caddy 即刻追上新库、按无警告成功落库；仍失败则在 message 中注明 Caddy
 // 侧 GeoIP 停留在旧库、待下次任意成功重载后生效。rbErr 非 nil（回滚升级链全
-// 部失败）时 message 还须携带回滚失败根因（历史问题 B-#6）——仅进组件日志会让运维
-// 误判为纯重载问题。memSwitched=false（安装热换失败，历史问题 历史修复）时 message 还
+// 部失败）时 message 还须携带回滚失败根因（历史问题）——仅进组件日志会让运维
+// 误判为纯重载问题。memSwitched=false（安装热换失败，历史修复）时 message 还
 // 须注明内存 searcher 未切换、重启后生效——否则 DB 记 success 而内存仍是旧库，
 // 重启前无任何可见痕迹。
 func (m *IP2RegionUpdateManager) successAfterReloadFailOpen(tag string, reloadErr, rbErr error, memSwitched bool) {
@@ -859,7 +859,7 @@ func (m *IP2RegionUpdateManager) successAfterReloadFailOpen(tag string, reloadEr
 		Logf("error", "ip2region update: failed to record fail-open success: %v", err)
 	}
 	SetIP2RegionVersion(tag)
-	// 历史问题 二十六次 历史修复 成功同样补写 sidecar（与 success() 同因）。
+	// 历史修复：fail-open 成功同样补写 sidecar（与 success() 同因）。
 	if err := rewriteVersionIfMissingOrStale(ip2regionLivePath+".version", tag); err != nil {
 		Logf("error", "ip2region update: failed to write .version sidecar: %v", err)
 	}

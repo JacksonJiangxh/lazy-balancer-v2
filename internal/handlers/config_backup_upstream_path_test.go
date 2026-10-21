@@ -115,7 +115,7 @@ func TestImportConfigBackup_legacyBackupWithoutUpstreamPath_restoresEmptyDefault
 	}
 }
 
-// ── 历史问题-历史问题（历史）：携带 lb_rules 但 upstreams/path_rules 缺席的
+// ── 历史问题（历史）：携带 lb_rules 但 upstreams/path_rules 缺席的
 // 截断备份会让 live upstream/path 行指向已被整体替换的规则（渲染不可见、集群
 // 快照原样 dump、极小概率 id 复用误挂）——导入事务内按导入后视图幂等剪枝。 ──
 

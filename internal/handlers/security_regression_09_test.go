@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-// TestUpdateSecurityPolicy_crsFieldsRejectWhitespaceEntries 验证 历史修复 B-#1 校验侧：
+// TestUpdateSecurityPolicy_crsFieldsRejectWhitespaceEntries 验证 历史修复 校验侧：
 // crs_rule_groups / crs_excluded_rules 条目不允许首尾空白。旧校验先 TrimSpace 再
 // 检查，" 42"/"42 "/"\t42" 全部通过并按原样落库，而发射端用原始值拼接 Include
 // glob（REQUEST-9 42-*.conf）→ 零匹配 → coraza 静默跳过，blocking 模式该组

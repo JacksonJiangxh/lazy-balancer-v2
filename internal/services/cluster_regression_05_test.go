@@ -139,7 +139,7 @@ func TestSyncService_run_clampsExcessiveSyncInterval(t *testing.T) {
 
 // err != nil 路径，显式调用已删除，run 循环在 pullErr 非空时不再重复写。
 func TestSyncService_run_integrityFailure_writesLastSyncErrorOnce(t *testing.T) {
-	// Given：重载失败标记已存在（签名无效属自愈类，审计 S-1 起标记必须保留）；
+	// Given：重载失败标记已存在（签名无效属自愈类，审计 历史修复 起标记必须保留）；
 	// 主节点返回伪造签名的快照
 	_, database := newClusterTestService(t)
 	if _, err := database.Exec("UPDATE global_config SET last_sync_error=? WHERE id=1",

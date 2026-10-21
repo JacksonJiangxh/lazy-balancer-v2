@@ -12,7 +12,7 @@ import (
 	"testing"
 )
 
-// TestAuditResultText_literalArgsCovered（SVC-F1，历史）：审计结果码渲染
+// TestAuditResultText_literalArgsCovered（历史修复，历史）：审计结果码渲染
 // 硬卡控。扫描 internal/ 全部非测试源码中 AuditResultPart 调用的**字面量**实参，
 // 断言每个结果码都在 auditResultTextMap 有中文映射——否则失败详情渲染
 // 「结果：<英文码>」，与中文口径分裂（"failure"/"storage_corrupted" 曾如此）。
@@ -165,7 +165,7 @@ func TestAuditResultText_dynamicClosureCodes(t *testing.T) {
 	}
 }
 
-// —— 审计来源码渲染（V87-TO-01，历史）——
+// —— 审计来源码渲染（历史修复，历史）——
 
 // scanAuditSourceLiterals 扫描 internal/ 非测试源码中给定函数的**字面量**首参，
 // 返回 字面量 → 首处位置。
@@ -234,7 +234,7 @@ func hasASCIILetter(s string) bool {
 	return false
 }
 
-// V87-TO-01：来源码字面量覆盖钉（与 TestAuditResultText_literalArgsCovered 对称）。
+// 历史修复：来源码字面量覆盖钉（与 TestAuditResultText_literalArgsCovered 对称）。
 // 扫描 AuditSourcePart 的字面量实参以及两条把首参直接转发给它的链
 // （recordSystemReloadAudit / txReloadDetail）——每个含 ASCII 字母的字面量必须
 // 在 auditSourceTextMap 有中文映射，否则落 default 渲染英文内部标识
@@ -260,7 +260,7 @@ func TestAuditSourcePart_literalArgsCovered(t *testing.T) {
 	}
 }
 
-// V87-TO-01：动态实参（变量/表达式）不在字面量扫描范围——新增动态入口必须
+// 历史修复：动态实参（变量/表达式）不在字面量扫描范围——新增动态入口必须
 // 同步审查取值域。这里钉住当前动态调用点数量：新增即红。
 func TestAuditSourcePart_dynamicCallSitesTripwire(t *testing.T) {
 	root, err := filepath.Abs(filepath.Join("..", "..", "internal"))
@@ -311,7 +311,7 @@ func TestAuditSourcePart_dynamicCallSitesTripwire(t *testing.T) {
 	}
 }
 
-// V87-TO-01：内部来源码必须渲染中文（映射值不得回显内部码）。
+// 历史修复：内部来源码必须渲染中文（映射值不得回显内部码）。
 func TestAuditSourcePart_internalCodesRenderChinese(t *testing.T) {
 	want := map[string]string{
 		"runtime_reconcile":  "来源：运行时对账",

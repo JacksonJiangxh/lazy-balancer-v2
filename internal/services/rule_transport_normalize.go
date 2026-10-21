@@ -21,11 +21,11 @@ import (
 )
 
 // normalizeRuleForTransport 规则传输归一（单一事实源）：
-// ① body 上限钳 [0,4096]（历史问题 C-F1）；
-// ② TCP+TLS 死形态清除（历史问题 A-N1）；
-// ③ TCP 行 HTTP 专属字段归零（LBH-A-U1 同族，2026-10-11 裁定并入导出侧；
+// ① body 上限钳 [0,4096]（历史问题）；
+// ② TCP+TLS 死形态清除（历史问题）；
+// ③ TCP 行 HTTP 专属字段归零（历史修复 同族，2026-10-11 裁定并入导出侧；
 //
-//	LBH79-历史问题.1 补 health_check_host）。
+//	补 health_check_host）。
 //
 // ④ 健康检查族/tcp_try_interval 值型列回填（库值唯一真相批 1+2，2026-10-14
 //
@@ -36,7 +36,7 @@ import (
 // 调用方：snapshotRules（主端导出）、insertSnapshotRules（从端落库）、
 // 备份导入后置归一——三面同构是 rules 节哈希主从相等的不变量基础。
 //
-// CORE-2（历史裁定，采用头注声明防重报）：传输族刻意窄于保存族
+// 历史修复（历史裁定，采用头注声明防重报）：传输族刻意窄于保存族
 // （rules.go 保存/更新路径的 TCP 零值化清单还含 tls_source/acme_config_id/
 // ca_provider_id/tls_http_redirect 与 stage 拦截页 4 列）——传输/导入/迁移产生
 // 的 TCP 行残留这些列已推演为惰性无害：全部 ACME 消费方（签发/续签/证书
@@ -76,7 +76,7 @@ func normalizeRuleForTransport(rule *models.LbRule) {
 		// 「没有就都应该没有」：主端存储、导出、从端落库三面全零。
 		rule.HostHeader = ""
 		rule.HealthCheckPath = ""
-		// LBH79-历史问题.1：健康检查域名同为 HTTP-only（TCP 探针走端口）——
+		// 历史问题：健康检查域名同为 HTTP-only（TCP 探针走端口）——
 		// 保存族（tcpDeadFieldReset）已清，传输族补齐，避免主从/导入面分叉。
 		rule.HealthCheckHost = ""
 		rule.EnableCompress = false

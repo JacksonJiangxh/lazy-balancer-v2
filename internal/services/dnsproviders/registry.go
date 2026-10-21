@@ -9,7 +9,7 @@ type CredentialField struct {
 	Required    bool   `json:"required"`
 	Placeholder string `json:"placeholder,omitempty"`
 	// VisibleWhen 声明字段可见性：{其它字段名: 允许取值}，全部条件命中才显示。
-	// 前端据此渲染表单（WS-13，历史）——原前端按 dnspod 的两种认证模式
+	// 前端据此渲染表单（历史修复，历史）——原前端按 dnspod 的两种认证模式
 	// 硬编码可见字段，后端新增 provider 时其 credential_fields 会被整体隐藏。
 	// 为空 = 恒显示。
 	VisibleWhen map[string][]string `json:"visible_when,omitempty"`
@@ -52,7 +52,7 @@ func List() []Provider {
 	for _, p := range registry {
 		list = append(list, p)
 	}
-	// B431-3(历史):map 遍历序不确定,/dns-providers 响应顺序随进程
+	// 历史修复(历史):map 遍历序不确定,/dns-providers 响应顺序随进程
 	// 随机——按 Code(注册表键,唯一)排序输出稳定切片。
 	sort.Slice(list, func(i, j int) bool { return list[i].Code() < list[j].Code() })
 	return list

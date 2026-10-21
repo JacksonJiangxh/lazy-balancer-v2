@@ -38,7 +38,7 @@ var (
 	configDriftQueryWarned      bool // 规则数据读取失败首报留痕
 	configDriftReadWarned       bool // 运行配置读取失败首报留痕
 	// 历史修复（历史）：configWatchdogMu/Cancel/Done 三个引擎化前残留
-	// 死变量已删（StartConfigWatchdog/StopConfigWatchdog 随 M2 退役，零消费方）。
+	// 死变量已删（StartConfigWatchdog/StopConfigWatchdog 随 历史修复 退役，零消费方）。
 )
 
 // ResetConfigDrift 角色切换时重置看门狗状态——曾漂移的主节点降级为从节点后，
@@ -69,7 +69,7 @@ func CurrentConfigDrift() ConfigDriftStatus {
 // 经系统日志 + 操作日志 + GetCaddyStatus（前端全局横幅）三通道告知，连续两轮不一致
 // 才置状态（防配置应用窗口的瞬时误报）。从节点不运行——同步链路已有 drift 检测与
 // 重载失败标记自愈覆盖。恢复由用户手动重启完成（横幅入口），不做自动重应用。
-// 历史修复（历史）引擎化口径：60s 节拍由任务引擎 历史修复 族驱动
+// 历史修复（历史）引擎化口径：60s 节拍由任务引擎 config-watchdog 族驱动
 // （taskengine_wire.go 注册），停止随 StopTaskEngine 统一收尾；admin 地址由
 // InitTaskEngine 装配时注入下方包级变量。
 var watchdogAdminURLValue string
@@ -91,7 +91,7 @@ func WatchdogCheckOnce() (runErr error) {
 	}
 	if isMaster, err := RoleOf(context.Background(), db.DB); err != nil || !isMaster {
 		if err != nil {
-			// 查询失败与「非主节点」同为跳过，失败留痕（历史 历史问题 标准——
+			// 查询失败与「非主节点」同为跳过，失败留痕（历史问题 标准——
 			// 静默吞错会掩盖 DB 异常）。
 			Logf("warn", "配置看门狗: 读取集群角色失败，本轮跳过: %v", err)
 		}
@@ -191,7 +191,7 @@ func checkConfigConsistency(adminURL string) (checked bool, err error) {
 	if err != nil {
 		// Caddy 不可达由 GetCaddyStatus 的 status 通道报告；但「配置超解析上限/
 		// 解析失败」会让看门狗永久静默——须留痕（首次失败告警，恢复后复位）。
-		// S历史问题：超限（与瞬时读失败不同——不会自愈）单独留痕文案。
+		// 历史问题：超限（与瞬时读失败不同——不会自愈）单独留痕文案。
 		configDriftMu.Lock()
 		if !configDriftReadWarned {
 			configDriftReadWarned = true
@@ -214,9 +214,9 @@ func checkConfigConsistency(adminURL string) (checked bool, err error) {
 
 // expectedRenderedRules 计算应出现在运行配置中的规则：启用中且至少有一个启用上游，
 // 并排除渲染侧有意跳过的三类，否则会被误报为「缺失」：
-//   - TCP+动态 DNS 逐规则跳过、同端口多 TCP 整组拒绝（历史问题 历史问题，与 caddy.go 同口径）；
-//   - A85历史问题-2：HTTP+TLS 规则在 caddy.go 渲染门因「无可用证书（manual 材料缺失 /
-//     ACME 无域匹配且未过期证书）」整条 历史修复 跳过。看门狗必须消费同一判据，
+//   - TCP+动态 DNS 逐规则跳过、同端口多 TCP 整组拒绝（历史问题，与 caddy.go 同口径）；
+//   - 历史问题：HTTP+TLS 规则在 caddy.go 渲染门因「无可用证书（manual 材料缺失 /
+//     ACME 无域匹配且未过期证书）」整条 fail-closed 跳过。看门狗必须消费同一判据，
 //     否则 ACME 首签窗口（或证书过期窗口）连续两轮即误报配置漂移、全局横幅常亮。
 //
 // 返回 caddy_id → 规则名称。
@@ -273,7 +273,7 @@ func expectedRenderedRules() (map[string]string, error) {
 				closeErr := certRows.Close()
 				return nil, fmt.Errorf("解析 ACME 证书候选失败: %w", errors.Join(scanErr, closeErr))
 			}
-			// SV历史问题：与渲染装载同口径预解析（certReady 对每条规则只做选择，
+			// 历史问题：与渲染装载同口径预解析（certReady 对每条规则只做选择，
 			// 但同一候选集会在多次巡检比较中重复使用）。
 			if candidate.Status != "disabled" {
 				candidate.Leaf = ParseCertificateLeaf(candidate.CertPEM, candidate.KeyPEM)
@@ -333,7 +333,7 @@ const configWatchdogHeartbeatRounds = 60
 
 // runningRuleRouteIDs 从 Caddy 运行配置收集规则路由 @id（lb_ 前缀），
 // 覆盖 http 与 layer4 两类服务器。
-// S历史问题：读取/上限/状态分类统一委托 readAdminConfigBody（caddy.go）——
+// 历史问题：读取/上限/状态分类统一委托 readAdminConfigBody（caddy.go）——
 // 32MB+1 超限探测、非 2xx 显式错误、超限返回 errCaddyAdminConfigTooLarge，
 // 与 GetConfig/getRunningConfigBytes 同源；裸 LimitReader 会让「超限」与
 // 「瞬时读失败」不可区分，超大部署漂移检测长期静默。
@@ -352,7 +352,7 @@ func runningRuleRouteIDs(adminURL string) (map[string]bool, error) {
 	// 解析保持与旧实现同容忍度：json.Decoder 只消费第一个顶层值（尾随字节/
 	// 多余闭合符被忽略），json.Unmarshal 则要求整份字节恰为一个值。Caddy admin
 	// 契约外尾随内容不应把「运行配置可读」降级为「读取失败」——看门狗与启动
-	// 守卫的探针宁可沿用既有容忍面（S历史问题 只统一读取上限/状态分类，未收紧
+	// 守卫的探针宁可沿用既有容忍面（历史问题 只统一读取上限/状态分类，未收紧
 	// 解析语义）。
 	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&config); err != nil {
 		return nil, err
@@ -364,7 +364,7 @@ func runningRuleRouteIDs(adminURL string) (map[string]bool, error) {
 		servers, _ := app["servers"].(map[string]interface{})
 		for _, srv := range servers {
 			// 历史问题：形状异常（带外 /load 或版本漂移）不得 panic——一律
-			// 历史修复 断言跳过。
+			// comma-ok 断言跳过。
 			srvObj, ok := srv.(map[string]interface{})
 			if !ok {
 				continue
@@ -542,7 +542,7 @@ func updateConfigDrift(missing, extra []string) {
 	}
 }
 
-// LBH79-历史问题：漂移文案单源（横幅 GetCaddyStatus 与看门狗审计共用）——
+// 历史问题：漂移文案单源（横幅 GetCaddyStatus 与看门狗审计共用）——
 // 此前两处各自拼接「缺失规则路由/多余规则路由」，跨包维护两份。展示上限
 // 防止规则数很大时 60s 轮询响应与 audit_log.detail 无界增长。
 const (

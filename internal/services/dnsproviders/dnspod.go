@@ -14,7 +14,7 @@ import (
 
 var newDNSProviderFromCredentials = dnsprovider.NewProviderFromCredentials
 
-// warnLog 是本包的告警输出接缝（SV历史问题）：包边界不允许导入 services 的分级
+// warnLog 是本包的告警输出接缝（历史问题）：包边界不允许导入 services 的分级
 // Logf，默认写标准库 log 并保留原有 "warn: " 前缀形态；services 侧在 init
 // 注入 Logf("warn", ...)，使告警与全局日志级别过滤/JSON 输出同形态（此前
 // 直接 log.Printf 的残留在 warn 以上级别过滤或 JSON 输出场景会丢失/形态分叉）。
@@ -38,7 +38,7 @@ func (d *DNSPod) Name() string       { return "DNSPod (腾讯云)" }
 func (d *DNSPod) ModuleName() string { return "dns.providers.dnspod" }
 
 func (d *DNSPod) CredentialFields() []CredentialField {
-	// visible_when/option_labels（WS-13，历史）：字段可见性与选项文案
+	// visible_when/option_labels（历史修复，历史）：字段可见性与选项文案
 	// 由后端元数据下发，前端不再硬编码两种认证模式的字段名。
 	visibleOnly := func(mode string) map[string][]string {
 		return map[string][]string{"auth_mode": {mode}}
@@ -62,7 +62,7 @@ func (d *DNSPod) CredentialFieldOptions(field string) []string {
 	return nil
 }
 
-// buildCredentials 校验并产出规范凭据 map（LBS-B-R3，历史：内核直返
+// buildCredentials 校验并产出规范凭据 map（历史修复，历史：内核直返
 // map——曾先 Marshal 成 JSON 串、BuildCredentialsJSON 再 Unmarshal 回 map
 // 的序列化往返，仅为类型转换）。
 //
@@ -91,7 +91,7 @@ func (d *DNSPod) buildCredentials(creds map[string]string) (map[string]string, e
 		if creds["secret_id"] == "" || creds["secret_key"] == "" {
 			return nil, fmt.Errorf("腾讯云认证方式需要提供 SecretId 和 SecretKey")
 		}
-		// CERT40-3:canonical 不再携带 api_token 拼接值——tencent 模式消费端
+		// 历史修复:canonical 不再携带 api_token 拼接值——tencent 模式消费端
 		// (factory.go)只读 secret_id/secret_key,拼接串是零消费死字段。
 		return map[string]string{
 			"mode":       "tencent",
@@ -101,7 +101,7 @@ func (d *DNSPod) buildCredentials(creds map[string]string) (map[string]string, e
 	case "dnspod":
 		apiToken := ""
 		if creds["app_id"] != "" && creds["app_token"] != "" {
-			// AD-2（历史）：app_id+app_token→api_token 拼接为双实现——本处
+			// 历史修复（历史）：app_id+app_token→api_token 拼接为双实现——本处
 			// （UI 面 canonical 产出）与 internal/dnsprovider/factory.go 的 legacy
 			// 归一化（协议面消费）互为镜像；任一侧改字段名/拼接格式须双侧同步。
 			apiToken = creds["app_id"] + "," + creds["app_token"]
@@ -180,7 +180,7 @@ func (d *DNSPod) Validate(creds map[string]string, testDomain string) error {
 	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), dnsProviderValidateTimeout)
 	defer cleanupCancel()
 	if err := provider.CleanUp(cleanupCtx, zone, challengeName); err != nil {
-		// CERT42-6（历史）：清理失败时测试 TXT 记录可能已残留——记告警
+		// 历史修复（历史）：清理失败时测试 TXT 记录可能已残留——记告警
 		// 并在错误文案点名手动清理路径；返回错误语义不变（验证仍判失败）。
 		warnLog("dnspod 验证清理失败，测试记录 %s 可能残留，请手动清理: %v", challengeName, err)
 		return fmt.Errorf("DNS 清理测试失败: %w（测试记录可能已残留，请登录 DNS 控制台手动清理 %s TXT 记录）", err, strings.TrimSuffix(challengeName, "."))

@@ -99,7 +99,7 @@ func TestMFAVerifyFailures_NeverCountOrLock(t *testing.T) {
 			t.Fatalf("attempt %d: status=%d, want 401（验码失败只提示，不计数不锁定）", i, code)
 		}
 	}
-	// K2-历史问题(历史):断言迁移到 login_* 列(生产 schema 已删
+	// 历史问题(历史):断言迁移到 login_* 列(生产 schema 已删
 	// mfa_failed_attempts/mfa_locked_until 死列)——MFA 验码失败不计数。
 	var loginAttempts int
 	var loginLocked sql.NullString

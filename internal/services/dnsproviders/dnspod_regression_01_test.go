@@ -9,16 +9,16 @@ import (
 	"lazy-balancer-v2/internal/dnsprovider"
 )
 
-type stubRound42Provider struct {
+type stubFailingAPIProvider struct {
 	presentErr error
 	cleanupErr error
 }
 
-func (s *stubRound42Provider) Present(context.Context, string, string, string, int) error {
+func (s *stubFailingAPIProvider) Present(context.Context, string, string, string, int) error {
 	return s.presentErr
 }
 
-func (s *stubRound42Provider) CleanUp(context.Context, string, string) error {
+func (s *stubFailingAPIProvider) CleanUp(context.Context, string, string) error {
 	return s.cleanupErr
 }
 
@@ -28,7 +28,7 @@ func TestDNSPod_Validate_cleanupFailureAdvisesManualCleanup(t *testing.T) {
 	// Given a provider whose present succeeds but cleanup fails
 	old := newDNSProviderFromCredentials
 	newDNSProviderFromCredentials = func(string) (dnsprovider.Provider, error) {
-		return &stubRound42Provider{cleanupErr: errors.New("Record.Remove failed: timeout")}, nil
+		return &stubFailingAPIProvider{cleanupErr: errors.New("Record.Remove failed: timeout")}, nil
 	}
 	t.Cleanup(func() { newDNSProviderFromCredentials = old })
 	provider := &DNSPod{}
@@ -49,12 +49,12 @@ func TestDNSPod_Validate_cleanupFailureAdvisesManualCleanup(t *testing.T) {
 	}
 }
 
-// CERT42-6 回归形状：Present 失败不属于清理残留场景，文案不得出现手动清理提示。
+// 历史修复 回归形状：Present 失败不属于清理残留场景，文案不得出现手动清理提示。
 func TestDNSPod_Validate_presentFailureKeepsOriginalMessage(t *testing.T) {
 	// Given a provider whose present fails
 	old := newDNSProviderFromCredentials
 	newDNSProviderFromCredentials = func(string) (dnsprovider.Provider, error) {
-		return &stubRound42Provider{presentErr: errors.New("Domain.List failed: no auth")}, nil
+		return &stubFailingAPIProvider{presentErr: errors.New("Domain.List failed: no auth")}, nil
 	}
 	t.Cleanup(func() { newDNSProviderFromCredentials = old })
 	provider := &DNSPod{}

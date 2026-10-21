@@ -125,7 +125,7 @@ export interface CrsRuleOptionView {
  */
 // 模块级共享状态（单例）：所有 useCrsRuleIndex() 消费方共享同一份索引与加载态
 const rules = ref<CrsRuleIndexEntry[]>([])
-// F-历史问题（历史）：rules/version/load 三个返回位全仓零消费（两个消费方仅
+// 历史问题（历史）：rules/version/load 三个返回位全仓零消费（两个消费方仅
 // 解构 loading/loaded/byId/options/ensureForDialog）——version ref 随死返回一并
 // 删除（移除后写-only）；rules/loading 等模块级状态保留（byId/options 内部消费）
 const loading = ref(false)
@@ -141,7 +141,7 @@ const byId = computed(() => {
 const options = computed<CrsRuleOptionView[]>(() =>
   rules.value.map((r) => ({ id: r.id, ...crsRuleLabelView(r), file: r.file, category: r.category })))
 
-// 历史问题-F11：会话守卫/单飞状态机抽到 utils/sessionSingleFlight（无依赖工厂，
+// 历史问题：会话守卫/单飞状态机抽到 utils/sessionSingleFlight（无依赖工厂，
 // 行为测试直测「旧请求后到丢弃 + 新会话链式补取 + 失败可重试」，不再源码正则断言）。
 // 消费方语义与原实现一致：同一 openSeq 复用缓存；跨实例在途去重；失败不落
 // loadedSession 允许同会话重试；旧会话响应丢弃。

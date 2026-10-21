@@ -20,7 +20,7 @@ import (
 //   （非终态减去 queued/pending 未起动行）；queued/pending 维持 历史修复
 //   「删除+提交后取消+200」语义。
 //   谓词统一为 NOT IN ('failed','disabled')——失败终态行保留失败史实。
-// - D-3：weight<1 保存侧响亮拒绝（Create/Update 同门，含禁用上游行），
+// - 历史修复：weight<1 保存侧响亮拒绝（Create/Update 同门，含禁用上游行），
 
 // seedCertJobWithStatus 在给定规则下补一条指定状态/域名的 cert_jobs 行
 // （cert_jobs UNIQUE(rule_id,domain)，同行多条任务须用不同域名）。
@@ -108,7 +108,7 @@ func TestUpdateRule_orphanACME_pendingJobStillConverges200(t *testing.T) {
 		`{"name":"after","enable_tls":true,"tls_source":"manual","tls_cert":%q,"tls_key":%q}`, certPEM, keyPEM))
 
 	if response.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s, want 200（pending 未起动行维持 R10 删除语义）", response.Code, response.Body.String())
+		t.Fatalf("status=%d body=%s, want 200（pending 未起动行维持历史删除语义）", response.Code, response.Body.String())
 	}
 	if n := countRuleCertJobs(t, "lb_a86_pend"); n != 0 {
 		t.Fatalf("cert jobs remaining=%d, want 0（pending 行随脱离 ACME 删除）", n)
@@ -140,7 +140,7 @@ func TestUpdateRule_disableViaUpdate_preservesFailedCertJob(t *testing.T) {
 		t.Fatalf("queued job status=%q, want disabled（非终态任务须暂停）", status)
 	}
 	if status := certJobStatusByDomain(t, "lb_a86_disupd", "issued.example.test"); status != "disabled" {
-		t.Fatalf("issued job status=%q, want disabled（禁用后任务视图不得仍显示 issued，L7-P2-01）", status)
+		t.Fatalf("issued job status=%q, want disabled（禁用后任务视图不得仍显示 issued）", status)
 	}
 }
 
@@ -175,7 +175,7 @@ func TestDisableRule_certJobPredicateKeepsFailed(t *testing.T) {
 	}
 }
 
-// ── D-3：weight<1 保存侧响亮拒绝 ───────────────────────────────────────────
+// ── 历史修复：weight<1 保存侧响亮拒绝 ───────────────────────────────────────────
 
 func postCreateRule(t *testing.T, handler *Handlers, body map[string]any) *httptest.ResponseRecorder {
 	t.Helper()

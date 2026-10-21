@@ -81,7 +81,7 @@ func CrawlerIPListName(engineID string) string {
 func crawlerDisplayName(engineID string) string { return CrawlerIPListName(engineID) }
 
 // CrawlerSystemListNames 内置爬虫名单名全集（security_ip_lists system=1 的
-// 合法来源之一）。历史问题-历史问题（历史）：备份导入的 system 名单白名单
+// 合法来源之一）。历史问题（历史）：备份导入的 system 名单白名单
 // 与配额口径共用本注册表——新增内置源只改 crawlerBotSources 一处。
 func CrawlerSystemListNames() []string {
 	names := make([]string, 0, len(crawlerBotSources))

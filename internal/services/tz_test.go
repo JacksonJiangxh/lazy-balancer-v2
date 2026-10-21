@@ -53,10 +53,65 @@ func TestTimezoneRefresh_stops_and_waits_when_context_is_canceled(t *testing.T) 
 	cancel()
 
 	// Then: <-done 返回即证明循环已停止且等待闭合（阻塞则测试超时失败；
-	// 历史修复 历史：原 <-done 之后的 历史修复 分支恒不可达，已删）。
+	// 历史修复：原 <-done 之后的 select-default 分支恒不可达，已删）。
 	<-done
 
 	t.Cleanup(func() { StartTimezoneRefresh(context.Background()) })
+}
+
+// Given 一个永不退出的时区刷新 worker（可控挂起：done 永不关闭——等价于
+// refresh 阻塞在 DB busy_timeout 的生产形态）。
+// When StopTimezoneRefreshWithin 以 50ms 上限调用。
+// Then 按 deadline 放弃等待并返回 false（不再无界 <-done）；字段保留，
+// worker 最终退出后可再次 Stop 完成清零（可重启语义不变）。
+func TestStopTimezoneRefreshWithin_givesUpWhenWorkerStuck(t *testing.T) {
+	StopTimezoneRefresh() // 停掉 init 启动的真实 worker
+	t.Cleanup(func() { StartTimezoneRefresh(context.Background()) })
+
+	stuck := make(chan struct{}) // 永不关闭
+	timezoneRefresh.Lock()
+	timezoneRefresh.cancel = func() {}
+	timezoneRefresh.done = stuck
+	timezoneRefresh.Unlock()
+
+	begin := time.Now()
+	if StopTimezoneRefreshWithin(50 * time.Millisecond) {
+		t.Fatal("卡住的 worker 必须返回 false（放弃等待）")
+	}
+	if elapsed := time.Since(begin); elapsed > 2*time.Second {
+		t.Fatalf("等待未受预算约束：耗时 %s（预算 50ms）", elapsed)
+	}
+
+	close(stuck)
+	if !StopTimezoneRefreshWithin(2 * time.Second) {
+		t.Fatal("worker 退出后 Stop 必须返回 true")
+	}
+	timezoneRefresh.Lock()
+	cleared := timezoneRefresh.cancel == nil && timezoneRefresh.done == nil
+	timezoneRefresh.Unlock()
+	if !cleared {
+		t.Fatal("worker 退出后字段必须清零（可重启语义不变）")
+	}
+}
+
+// Given 正常运行的时区刷新 worker（init 形态，空闲 select 循环）。
+// When StopTimezoneRefreshWithin 以充裕预算调用。
+// Then 快速返回 true——正常路径不等满预算。
+func TestStopTimezoneRefreshWithin_fastPathDoesNotConsumeBudget(t *testing.T) {
+	StopTimezoneRefresh()
+	StartTimezoneRefresh(context.Background())
+	t.Cleanup(func() {
+		StopTimezoneRefresh()
+		StartTimezoneRefresh(context.Background())
+	})
+
+	begin := time.Now()
+	if !StopTimezoneRefreshWithin(5 * time.Second) {
+		t.Fatal("正常 worker 必须在预算内退出")
+	}
+	if elapsed := time.Since(begin); elapsed > 2*time.Second {
+		t.Fatalf("正常路径耗时 %s，不得在预算内空等", elapsed)
+	}
 }
 
 func TestApplicationLogWriterFiltersRawStandardLogsAtConfiguredThreshold(t *testing.T) {
@@ -193,7 +248,7 @@ func (s *shortWriteSink) Write(p []byte) (int, error) {
 	return s.n, nil
 }
 
-// S历史问题（历史）：多行 payload（Logf 消息内嵌换行）必须逐行按级别过滤
+// 历史问题（历史）：多行 payload（Logf 消息内嵌换行）必须逐行按级别过滤
 // 后重组——只看首行会让 warn/error 档整体放行后续低级别行（级别过滤被绕过）。
 func TestApplicationLogWriter_filtersEachLineOfMultilinePayload(t *testing.T) {
 	oldLevel := CurrentLogLevel()

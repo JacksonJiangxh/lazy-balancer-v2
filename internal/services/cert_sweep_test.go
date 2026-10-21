@@ -153,7 +153,7 @@ func TestCertTicks_skipAndRecoveryLinesTransitionOnce(t *testing.T) {
 	}
 }
 
-// 历史问题-11（历史修复 形态）+ 历史问题 收敛：门控放行（有非终态任务）但服务
+// 历史问题-11（cert-waiting-ca 形态）+ 历史问题 收敛：门控放行（有非终态任务）但服务
 // 未运行时记一次跳过行（状态门新文案）；门控拦截（全部终态）时保持静默
 // （2026-09-29 裁定的零扫描门控不得被空转日志破坏）。
 func TestCertWaitingCATickOnce_skipLineGatedOnActiveJobs(t *testing.T) {
@@ -281,5 +281,52 @@ func TestTaskEngineWire_certTasksPropagateRunFailures(t *testing.T) {
 	}
 	if err := te.Trigger("cert-renewal-scan", "manual", ""); err == nil {
 		t.Fatal("cert-renewal-scan Run 未上抛扫描失败（任务监控会显示 success）")
+	}
+}
+
+// 历史问题-15：手动证书到期巡检读失败必须上抛（此前仅应用日志 Logf+return，
+// Run 恒 nil，task_runs 落 success——任务监控呈现假健康）。对齐
+// cert-renewal-scan/cert-reconcile 同族口径。
+func TestCertManualCheckOnce_propagates_query_failure(t *testing.T) {
+	useCertSweepTickTestEnv(t)
+	resetCertificateServiceForTest(t)
+	SetActiveCertificateService(NewCertificateService())
+	// Given：lb_rules 读故障（巡检候选查询必然失败）
+	if _, err := db.DB.Exec(`DROP TABLE lb_rules`); err != nil {
+		t.Fatalf("drop lb_rules: %v", err)
+	}
+
+	// When
+	err := CertManualCheckOnce()
+
+	// Then 1：读失败上抛（Run 随之返回 error → task_runs 失败终态）
+	if err == nil {
+		t.Fatal("CertManualCheckOnce err=nil, want 巡检读故障上抛（fail-visible）")
+	}
+	// Then 2：失败轮任务日志必须有失败行
+	data, readErr := os.ReadFile(taskengine.TaskLogPath("cert-manual-poll"))
+	if readErr != nil {
+		t.Fatalf("read task log: %v", readErr)
+	}
+	if !strings.Contains(string(data), "巡检失败") {
+		t.Fatalf("失败轮任务日志缺失失败行: %q", string(data))
+	}
+}
+
+// 历史问题-15 接线钉：cert-manual-poll 的 Run 必须上抛 Once 的失败——
+// task_runs 终态与任务监控依赖该返回值（此前 Run 恒 return nil）。
+func TestTaskEngineWire_certManualPollPropagatesRunFailure(t *testing.T) {
+	te := newWireTestEngine(t)
+	resetCertificateServiceForTest(t)
+	SetActiveCertificateService(NewCertificateService())
+	t.Cleanup(func() { SetActiveCertificateService(nil) })
+	// Given：lb_rules 读故障（巡检查询必然失败；task_runs 写入不受影响）
+	if _, err := db.DB.Exec(`DROP TABLE lb_rules`); err != nil {
+		t.Fatalf("drop lb_rules: %v", err)
+	}
+
+	// Then
+	if err := te.Trigger("cert-manual-poll", "manual", ""); err == nil {
+		t.Fatal("cert-manual-poll Run 未上抛巡检读失败（任务监控会显示 success）")
 	}
 }

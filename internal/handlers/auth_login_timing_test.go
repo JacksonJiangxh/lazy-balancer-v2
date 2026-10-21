@@ -16,7 +16,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// D5-S5（N+11 轮）：Login 的 ErrNoRows 分支不跑 bcrypt 即返 401，与「用户存在
+// 历史修复：Login 的 ErrNoRows 分支不跑 bcrypt 即返 401，与「用户存在
 // 但密码错」路径存在 ~bcrypt 量级（数十毫秒）的时序差 → 用户名枚举侧信道。
 // 修复：不存在用户也对包级固定 dummy 哈希（init 生成一次，DefaultCost 与真实
 // 哈希同档）跑一次注定失败的比较后再返回同形 401。
@@ -60,7 +60,7 @@ func TestLogin_unknownUserAndWrongPassword_returnIdentical401(t *testing.T) {
 	}
 }
 
-// M7（用户已批准契约）：登录账户级锁定——5 次密码失败锁 10 分钟（429），锁定
+// 历史修复（用户已批准契约）：登录账户级锁定——5 次密码失败锁 10 分钟（429），锁定
 // 期间即使密码正确同样 429（且先跑一次真实 bcrypt 等时占位，不泄露锁定账户的
 // 密码正误）；置锁同语句清零计数（锁满不再累计）。
 func TestLogin_locksAccountAfterFiveFailures(t *testing.T) {
@@ -113,7 +113,7 @@ func TestLogin_locksAccountAfterFiveFailures(t *testing.T) {
 	}
 }
 
-// M7：成功登录清零失败计数——4 次失败后正确登录不触发锁定，计数归零。
+// 历史修复：成功登录清零失败计数——4 次失败后正确登录不触发锁定，计数归零。
 func TestLogin_successClearsLockoutCounter(t *testing.T) {
 	// Given 4 次失败（再错一次即锁定）
 	database := setupAuthTestDB(t)

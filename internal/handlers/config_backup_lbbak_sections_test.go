@@ -2,9 +2,9 @@ package handlers
 
 // 历史修复(簇 A·备份导入管线)行为规格:
 // 历史问题 lbbak 导入分类选择(query sections)、历史问题 password_version 吊销收窄、
-// BE-历史问题 解压炸弹上限、历史问题 .version 伴生文件保留、历史问题 落盘失败警告、
-// BE-历史问题 仅全局配置导出拒绝、BE-历史问题 单侧文件-版本表绑定、历史问题 ACME 引用
-// 预检警告、LB-历史问题 NULL 归一 5→2。
+// 历史问题 解压炸弹上限、历史问题 .version 伴生文件保留、历史问题 落盘失败警告、
+// 历史问题 仅全局配置导出拒绝、历史问题 单侧文件-版本表绑定、历史问题 ACME 引用
+// 预检警告、历史问题 NULL 归一 5→2。
 
 import (
 	"archive/tar"
@@ -179,7 +179,7 @@ func craftLbbakRaw(t *testing.T, entries map[string][]byte) []byte {
 	return buf.Bytes()
 }
 
-// BE-历史问题:parseLbbak 条目数与总解压字节上限。
+// 历史问题:parseLbbak 条目数与总解压字节上限。
 func TestParseLbbak_entryAndTotalCaps(t *testing.T) {
 	// 条目数上限(>64 拒绝)
 	entries := map[string][]byte{}
@@ -260,7 +260,7 @@ func TestLbbakImport_wafFileFailureWarns(t *testing.T) {
 
 // 三分类合并(2026-09-19 用户裁定):legacy 分类键 global_config 是「系统数据」
 // (users)的别名、waf_files 是「安全防护」(security)的别名——旧书签/脚本的
-// ?sections= 导出必须成功且携带对应表族,不再 400(BE-历史问题 死备份哨兵随
+// ?sections= 导出必须成功且携带对应表族,不再 400(历史问题 死备份哨兵随
 // 分类合并撤销:users 恒有表,「仅全局配置」形态不可达)。
 func TestExportConfigBackup_legacySectionAliases(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -325,7 +325,7 @@ func TestExportConfigBackup_legacySectionAliases(t *testing.T) {
 
 // 三分类合并勘误(2026-09-19):users 分类备份(系统数据表族+全局配置区)
 // 必须可导入。旧「全量形态」探测器以「含 users 表」判定全量,把分类备份
-// 误判为全量并以「缺少 lb_rules」拒绝——恰好制造 BE-历史问题 要消灭的死备份
+// 误判为全量并以「缺少 lb_rules」拒绝——恰好制造 历史问题 要消灭的死备份
 // 形态(旧五分类模型下 users-only 导出同样中招,新增 users=系统数据含全局
 // 配置后触发面扩大到 global_config 别名导出)。
 func TestImportConfigBackup_usersCategoryBackupImports(t *testing.T) {
@@ -359,7 +359,7 @@ func TestImportConfigBackup_usersCategoryBackupImports(t *testing.T) {
 	}
 }
 
-// BE-历史问题:单侧 waf 文件缺失时对应版本表跳过并警告(xdb 在、CRS 缺 →
+// 历史问题:单侧 waf 文件缺失时对应版本表跳过并警告(xdb 在、CRS 缺 →
 // security_crs_version 不被空表覆盖)。
 func TestLbbakImport_singleSideWafBinding(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -425,7 +425,7 @@ func TestImportConfigBackup_warnsDanglingACMEReferences(t *testing.T) {
 	}
 }
 
-// LB-历史问题:NULL health_check_timeout 归一为 2(与写侧/渲染/快照通道同口径)。
+// 历史问题:NULL health_check_timeout 归一为 2(与写侧/渲染/快照通道同口径)。
 func TestImportConfigBackup_normalizesNullHealthCheckTimeout(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	g := newBackupSectionRouter(h)

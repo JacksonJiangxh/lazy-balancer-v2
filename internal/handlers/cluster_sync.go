@@ -55,7 +55,7 @@ func authenticatedClusterToken(c *gin.Context) string {
 func (h *Handlers) PullClusterSnapshot(c *gin.Context) {
 	// 主节点无同步对象：入口直接拒绝，不调 Pull——否则「主节点不能从其他
 	// 节点同步」会经 recordSyncError 写入 last_sync_error 且无自动清除路径，
-	// 节点页面持续显示假错误（历史问题 历史修复）。前端按钮只对从节点渲染，此为后端防御。
+	// 节点页面持续显示假错误（历史修复）。前端按钮只对从节点渲染，此为后端防御。
 	// 门控查询失败时按主节点语义拒绝（历史问题 发现2）：放行会让主节点走 Pull
 	// 命中 errSyncMasterNoPull 返回 500 + 误导审计「同步失败」，实际
 	// 只是瞬时 DB 读错。400 文案与真主节点一致，前端无歧义。
@@ -63,7 +63,7 @@ func (h *Handlers) PullClusterSnapshot(c *gin.Context) {
 		clusterError(c, http.StatusBadRequest, "主节点无需手动同步", err)
 		return
 	}
-	// 历史问题（历史 历史问题，历史修复 同族收敛）：与 SetClusterMode/Promote/
+	// 历史问题（历史问题，历史修复 同族收敛）：与 SetClusterMode/Promote/
 	// ForgetClusterPins 同口径——装配缺失时 503，不得 nil 指针 panic 落成
 	// Gin recovery 的 500 空体。
 	if h.syncService == nil {
@@ -93,7 +93,7 @@ func (h *Handlers) PullClusterSnapshot(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "手动同步完成", Data: result})
 }
 
-// ForgetClusterPins 是从节点管理员的 PinMismatch 补救端点（M13②）：主节点更换
+// ForgetClusterPins 是从节点管理员的 PinMismatch 补救端点（历史修复②）：主节点更换
 // 管理面板证书后从节点同步持续指纹不匹配，运维确认新证书合法后清空全部 TOFU
 // 指纹钉（内存缓存+磁盘 pin 文件），下一同步 tick 按新证书重新钉扎。仅 admin
 // 路由组可达（readOnlyGuard 的 /cluster/* 白名单保证从节点可用），操作留审计。
@@ -163,7 +163,7 @@ func (h *Handlers) ForgetClusterNodePin(c *gin.Context) {
 		status := http.StatusInternalServerError
 		switch {
 		case errors.Is(err, services.ErrNotMasterNode):
-			// 历史修复 历史问题：降级竞态 403 与 requireMaster 门同源带头（保留失败审计）。
+			// 历史问题：降级竞态 403 与 requireMaster 门同源带头（保留失败审计）。
 			c.Header("X-LB-Error-Code", masterRequiredErrorCode)
 			status = http.StatusForbidden
 		case errors.Is(err, services.ErrNodeNotFound):
@@ -189,7 +189,7 @@ func (h *Handlers) ForgetClusterNodePin(c *gin.Context) {
 }
 
 // GetClusterWafFiles serves the full CRS/IP2Region file bundle on demand to
-// slaves whose 历史修复 hash reference differs from their local files.
+// slaves whose snapshot-carried hash reference differs from their local files.
 // 历史问题-01：响应体按引用指纹缓存（一次 base64/JSON 编码），不再每请求
 // 全树打包 + 重新序列化；限流由 clusterMachineRateLimit 在路由层预占。
 func (h *Handlers) GetClusterWafFiles(c *gin.Context) {

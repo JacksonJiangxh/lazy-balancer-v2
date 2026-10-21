@@ -1,5 +1,5 @@
 // 中国省界数据（威胁大屏国家级下钻，v3）：geo.datav.aliyun.com areas_v3 100000_full
-// 构建期一次性转换静态入库（Douglas-Peucker 容差 0.02° + 3 位小数，约 0.1km；
+// 构建期一次性转换静态入库（历史修复 容差 0.02° + 3 位小数，约 0.1km；
 // 连续重复点去重 + 闭合首点剥离后简化再重闭合），运行时零外部请求（零 CDN）。
 // 九段线等无名要素不纳入（平铺地图不渲染）。name=原始全名；short=剥后缀短名
 // （与后端 formatIP2RegionLocation → ip2RegionShortenName 及 china_provinces

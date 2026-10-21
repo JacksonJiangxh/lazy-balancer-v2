@@ -17,7 +17,7 @@ const (
 
 // PolicyFeatureSet 策略内容的阶段特征组：G0=信任名单（启用且内联/引用非空），
 // G1=IP ACL（启用且内联/引用非空）/黑名单非空/GeoIP 生效，G2=限流（启用且
-// rps>0），G3=WAF（mode∈blocking/detection/custom_only 或自定义规则引用非空）。
+// rps>0），历史修复=WAF（mode∈blocking/detection/custom_only 或自定义规则引用非空）。
 // 推断（InferPolicyType）与拆分迁移（split 按组生成子策略）共用同一份分组
 // 判定，禁止第二份实现。阶段 0（2026-09-20 用户裁定）：信任名单独立成策略
 // 类型——默认直通上游（trust_detection=0，不过后续任何流程），保留检测记录
@@ -49,7 +49,7 @@ func PolicyTypeFeatures(p *SecurityPolicy) PolicyFeatureSet {
 }
 
 // InferPolicyType 按内容特征推断策略类型——backfill、写侧缺省提交、旧快照/
-// 旧备份导入的共同单一事实源。恰好一组→对应类型（G0→stage0），多组→mixed，
+// 旧备份导入的共同单一事实源。恰好一组→对应类型（历史修复→stage0），多组→mixed，
 // 零组→stage3（WAF 是安全策略默认心智，空策略归此）。
 func InferPolicyType(p *SecurityPolicy) string {
 	fs := PolicyTypeFeatures(p)
@@ -150,10 +150,10 @@ type SecurityPolicySummary struct {
 	RateLimitRPS       int    `json:"rate_limit_rps"`
 	RateLimitBurst     int    `json:"rate_limit_burst"`
 	CRSExcludedCount   int    `json:"crs_excluded_count"`
-	// D-K1：摘要携带 CRS 规则组原始 JSON——前端向导跨策略重复告警直接消费摘要，
+	// 历史修复：摘要携带 CRS 规则组原始 JSON——前端向导跨策略重复告警直接消费摘要，
 	// 不再对每条启用策略 N+1 拉取详情。
 	CRSRuleGroups json.RawMessage `json:"crs_rule_groups"`
-	// 历史问题 三十次追加（多策略绑定 Q2 根因 1）：ruleProtections 的 GeoIP/自定义
+	// 历史问题追加（多策略绑定 历史修复 根因 1）：ruleProtections 的 GeoIP/自定义
 	// 规则行此前永远没有数据（接口只给 has_ip_control/has_rate_limit）。
 	HasGeoIP            bool   `json:"has_geoip"`
 	HasCustomRules      bool   `json:"has_custom_rules"`
@@ -291,7 +291,7 @@ type SecurityEvent struct {
 	// 「预检+WAF」完整分解;预检事件与 DurationUs 同值。
 	PrecheckUs int64 `json:"precheck_us"`
 	// RequestHeaders：事件请求的完整头（JSON 文本，64KB 截断——2026-09-28 用户
-	// 裁定由 8KB 上调，见 securityEventsHeadersCap；本注释历史 L3 项纠偏）——
+	// 裁定由 8KB 上调，见 securityEventsHeadersCap；本注释历史 历史修复 项纠偏）——
 	// 摄入恒落库；
 	// RequestBody：仅策略开 log_request_body 后有值（64KB 截断，非 UTF-8 转
 	// base64 并带标记前缀）。敏感头掩码是前端展示层姿态，库内为原文。
@@ -351,7 +351,7 @@ type CRSInfo struct {
 	UpdatedAt     string `json:"updated_at"`
 	NextUpdate    string `json:"next_update"`
 	RuleCount     int    `json:"rule_count"`
-	// IsLatest 三态(N2,历史):nil=未知(冷启动未取到 latest/解析失败),
+	// IsLatest 三态(历史修复,历史):nil=未知(冷启动未取到 latest/解析失败),
 	// false=有更新, true=已是最新——此前未知态默认 true 属新鲜度信任 fail-open。
 	IsLatest     *bool  `json:"is_latest,omitempty"`
 	UpdateStatus string `json:"update_status"`
@@ -413,7 +413,7 @@ type SecurityCustomRule struct {
 	UpdatedAt   string                `json:"updated_at"`
 }
 
-// CreateCustomRuleRequest 自定义规则创建请求（历史 HC-06）：enabled 用
+// CreateCustomRuleRequest 自定义规则创建请求（历史修复）：enabled 用
 // 指针——JSON 省略即按「启用」落库（与 CreateSecurityPolicy 的 enabled 默认
 // true 同口径）。此前直接绑定 SecurityCustomRule 的 bool，MCP 无约束 body
 // （server.go create_custom_rule）省略 enabled 会创建一条静默禁用的 WAF 规则，
@@ -427,7 +427,7 @@ type CreateCustomRuleRequest struct {
 	Enabled     *bool                 `json:"enabled"`
 }
 
-// UpdateCustomRuleRequest 自定义规则更新请求（历史问题 B-N1）：全字段指针——省略即
+// UpdateCustomRuleRequest 自定义规则更新请求（历史问题）：全字段指针——省略即
 // 保持现值。此前直接绑定 SecurityCustomRule（bool/值类型），省略 enabled 的
 // 部分更新（MCP 无约束 body 的现实路径）会把零值 false 直写落库，静默禁用
 // 规则且审计无痕迹；与 UpdateSecurityPolicyRequest 同口径。
@@ -445,7 +445,7 @@ type SecurityBlockPage struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
 	Content     string `json:"content"`
-	// ContentType 拦截响应的 Content-Type（2026-09-25 用户裁定可配置）；
+	// ContentType 拦截响应的 历史修复（2026-09-25 用户裁定可配置）；
 	// 白名单见 BlockPageContentTypes，空值按 DefaultBlockPageContentType 归一。
 	ContentType string `json:"content_type"`
 	IsDefault   bool   `json:"is_default"`
@@ -459,10 +459,10 @@ type SecurityBlockPage struct {
 	RuleRefCount int `json:"rule_ref_count"`
 }
 
-// DefaultBlockPageContentType 拦截页默认 Content-Type（内置三页同此）。
+// DefaultBlockPageContentType 拦截页默认 历史修复（内置三页同此）。
 const DefaultBlockPageContentType = "text/html; charset=utf-8"
 
-// BlockPageContentTypes 可选 Content-Type 白名单（含编码；创建/更新写侧校验）。
+// BlockPageContentTypes 可选 历史修复 白名单（含编码；创建/更新写侧校验）。
 var BlockPageContentTypes = []string{
 	DefaultBlockPageContentType,
 	"application/json; charset=utf-8",

@@ -460,7 +460,7 @@ func TestGetRuleStageStats_nilMetricsDBReturnsFullZeroShape(t *testing.T) {
 	}
 }
 
-// APIMCP45-3：stage-stats 对不存在规则此前误归 500（message 借「规则不存在」
+// 历史修复：stage-stats 对不存在规则此前误归 500（message 借「规则不存在」
 // 文案但 code 500）——ErrNoRows 分判 404 not_found；其余 DB 故障保持 500 且
 // message 归位「阶段统计查询失败」。前端 RuleFlowDialog 对非 200 一律
 // stats=null（catch 分支），404 化不改变前端表现。
@@ -522,7 +522,7 @@ func TestGetRuleStageStats_unknownRuleReturns404(t *testing.T) {
 	})
 }
 
-// HC-01（历史 历史问题）：批量绑定端点的 rule_ids 数量上限。同族端点均有
+// 历史修复（历史问题）：批量绑定端点的 rule_ids 数量上限。同族端点均有
 // 上限（bindings/bulk=100、batch-block-pages=500），本端点此前无界——超大
 // rule_ids 会在 BEGIN IMMEDIATE + caddyOpMu 内逐规则查询/写入，阻塞全部主库
 // 配置写。判据按 normalizeRuleIDs 归一后集合计数（空白/重复 id 不占额度）。

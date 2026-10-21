@@ -14,7 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// 历史修复1：部分载荷省略 listen_port 时不得把存量端口改写成 443。
+// 历史修复：部分载荷省略 listen_port 时不得把存量端口改写成 443。
 // API/MCP 的 update_rule 明确允许只提交部分字段；此前 UpdateRule 在读到存量
 // 之前就把省略的端口填成 443，导致 8443/8080 规则被静默迁移。
 func TestUpdateRule_partialPayloadKeepsExistingListenPort(t *testing.T) {
@@ -81,7 +81,7 @@ func TestUpdateRule_explicitListenPortStillApplied(t *testing.T) {
 	}
 }
 
-// 历史修复2：UpdateRule 主动放锁窗口后必须复核规则行仍存在——
+// 历史修复：UpdateRule 主动放锁窗口后必须复核规则行仍存在——
 // 已删除规则不得被更新失败补偿按快照复活。
 func TestAbortIfRuleDeleted_rejectsDeletedRule(t *testing.T) {
 	newUpdateAuditRuleHandlers(t, "lb_gone", 0, false)

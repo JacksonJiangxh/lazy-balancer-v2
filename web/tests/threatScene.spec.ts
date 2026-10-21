@@ -89,7 +89,7 @@ test('②360° 环绕：panBy 横向平移后中心拾取正确；纵向钳制�
   const center = screenToLonLat(W / 2, H / 2, { ...CAM, camX: panned.camX, camY: panned.camY })
   const expected = -91.1 // 向左拖 480px=指针位移 -480 → camX +160 → wrap 至 -91.1
   assert.ok(Math.abs(center.lon - expected) < 1e-6, `平移后中心 lon=${center.lon}, want ${expected}`)
-  // 纵向越界拖动被钳在世界内（A85WT-历史问题：钉精确钳制值，替代恒真区间断言与
+  // 纵向越界拖动被钳在世界内（历史修复：钉精确钳制值，替代恒真区间断言与
   // 死代码 centerY——总览 zoom=3 下 visH=300 ≥ WORLD_D，相机恒居中）
   const clamped = panBy(CAM, 0, -100000)
   assert.ok(Math.abs(clamped.camY - WORLD_D / 2) < 1e-9, `总览纵向应钉在 WORLD_D/2: ${clamped.camY}`)
@@ -192,7 +192,7 @@ function cameraAt(lat: number, lng: number, altitudeRatio: number, radius: numbe
   return { cam, project }
 }
 
-test('⑥地球球面逆投影往返：正投影的 NDC → 经纬度误差 < 1e-6°（WT87-09）', () => {
+test('⑥地球球面逆投影往返：正投影的 NDC → 经纬度误差 < 1e-6°（历史修复）', () => {
   const R = 100 * 1.005
   let checked = 0
   // 覆盖东半球/西半球（美加 lng<-90 曾整片 miss）与高纬（俄/加）
@@ -223,7 +223,7 @@ test('⑥地球球面逆投影往返：正投影的 NDC → 经纬度误差 < 1e
   assert.ok(Math.abs(pickedWest.lng + 120) < 1e-6)
 })
 
-test('⑥b地球拾取：射线背向球面/未命中返回 null（WT87-09）', () => {
+test('⑥b地球拾取：射线背向球面/未命中返回 null（历史修复）', () => {
   const R = 100
   const away = {
     origin: [0, 0, 3 * R] as Vec3,
@@ -241,7 +241,7 @@ test('⑥b地球拾取：射线背向球面/未命中返回 null（WT87-09）', 
   assert.ok(Math.abs(hit.lat - 90) < 1e-6, `北极拾取纬度 ${hit.lat}`)
 })
 
-test('⑦地图/地球引擎修复契约（历史问题/历史问题/历史问题/历史问题 + WT87-11）', () => {
+test('⑦地图/地球引擎修复契约', () => {
   const mapSrc = readFileSync(join(ROOT, 'src/utils/threatScene.ts'), 'utf8')
   const globeSrc = readFileSync(join(ROOT, 'src/utils/threatGlobe.ts'), 'utf8')
   assert.match(mapSrc, /POINTY_TOP_HEX_VERTICES/, '地图点阵必须消费六边形顶点，而非圆弧')
@@ -252,7 +252,7 @@ test('⑦地图/地球引擎修复契约（历史问题/历史问题/历史问�
   }
   assert.doesNotMatch(mapSrc, /sawServerConfig/, 'setServer 不得只接受首次配置')
   assert.match(mapSrc, /server = \[centroid\[0\], centroid\[1\]\]/)
-  // WT87-11：两引擎的省级 hover 都必须按数据能力边界标注，不得把「无省级
+  // 历史修复：两引擎的省级 hover 都必须按数据能力边界标注，不得把「无省级
   // 数据源」渲染成「该省 0 次攻击」。
   for (const src of [mapSrc, globeSrc]) {
     assert.match(src, /hasProvinceStats\(/, '省级统计边界必须走共享判定')
@@ -261,7 +261,7 @@ test('⑦地图/地球引擎修复契约（历史问题/历史问题/历史问�
 })
 
 // ---- 数据级：省板包含断言（消费运行时导出的真实数据） ----
-// 审计 87 WEBT-09③：原实现按「一实体一行 + 两空格缩进」逐行正则解析三个数据
+// 历史修复③：原实现按「一实体一行 + 两空格缩进」逐行正则解析三个数据
 // 模块源码——纯格式化（换行/缩进）即假红，结构重排则可能命中错误行（假绿）。
 // 三个模块本身已 import 为本测试的运行时导出，直接对数据结构求 bbox 即可；
 // 源码文本只保留「静态字面量、零运行时抓取」的构建期契约交叉校验。

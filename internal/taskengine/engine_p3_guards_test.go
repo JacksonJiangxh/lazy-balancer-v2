@@ -1,14 +1,14 @@
 package taskengine
 
-// 历史修复 P3 族（历史修复/3/5）钉测试：
-//   - P3-1 Scheduled 分支缺「投递前业务门复核」——NextSlotFn（DB 读）窗口内
+// 调度守卫族钉测试：
+//   - Scheduled 分支缺「投递前业务门复核」——NextSlotFn（DB 读）窗口内
 //     用户关掉业务开关仍派发一轮，违反「EnabledFn=false=零执行零落行」契约。
-//   - P3-2 RearmLoop 对常驻族恒传 restartIntent=true——运行中 daemon 被栽
+//   - RearmLoop 对常驻族恒传 restartIntent=true——运行中 daemon 被栽
 //     pendingRestart，在随后一次正常退出时被换取新代（RearmLoop 契约是
 //     「仅重置节拍，不改变调度」）。
-//   - P3-3 RunAsync/RunAsyncResult 缺 KindDaemon 拒绝——与 Trigger/RunSync
+//   - RunAsync/RunAsyncResult 缺 KindDaemon 拒绝——与 Trigger/RunSync
 //     的纵深不对称（绕过 startDaemon 生命周期双跑）。
-//   - P3-5 任务日志行不截断——单行可超 task_log_size_mb 并放大日志体积；
+//   - 任务日志行不截断——单行可超 task_log_size_mb 并放大日志体积；
 //     DB message 已有 truncMsg(500)，日志行须有统一上限。
 
 import (

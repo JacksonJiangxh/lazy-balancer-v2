@@ -20,7 +20,7 @@ func storedStatusSnapshot() CRSUpdateStatusSnapshot {
 		FROM security_crs_version WHERE id=1`).
 		Scan(&stored.status, &stored.trigger, &stored.startedAt, &stored.finishedAt, &stored.message, &stored.version)
 	if err != nil {
-		// DB 读失败静默回退 idle 会丢可回溯性（历史 历史问题）：留 warn 后回退。
+		// DB 读失败静默回退 idle 会丢可回溯性（历史问题）：留 warn 后回退。
 		Logf("warn", "CRS 状态: 读取存储快照失败，回退 idle: %v", err)
 		return CRSUpdateStatusSnapshot{Status: string(CRSStatusIdle)}
 	}
@@ -50,7 +50,7 @@ func snapshotFromState(state crsTaskState) CRSUpdateStatusSnapshot {
 	return snap
 }
 
-// IsActiveCRSStatus reports whether the status describes an 历史修复 update.
+// IsActiveCRSStatus reports whether the status describes an in-flight update.
 func IsActiveCRSStatus(status string) bool {
 	switch CRSUpdateStatus(status) {
 	case CRSStatusChecking, CRSStatusDownloading, CRSStatusInstalling, CRSStatusReloading:
@@ -109,7 +109,7 @@ func (m *CRSUpdateManager) InvalidateRuleCount() {
 }
 
 // InvalidateCRSRuleCount 供带外替换 live CRS 树的通道丢弃规则数缓存
-// ：集群同步/备份导入的文件相位统一收敛在
+// 历史问题：集群同步/备份导入的文件相位统一收敛在
 // ApplyWafFileBundle，由该函数在 CRS 落盘成功后调用；manager 未初始化
 // （测试/半初始化装配）时为空操作，不 panic。
 func InvalidateCRSRuleCount() {

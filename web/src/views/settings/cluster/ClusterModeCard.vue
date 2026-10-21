@@ -23,7 +23,7 @@
       <el-form-item label="同步间隔">
         <div class="interval-row">
           <el-input-number v-model="syncInterval" :min="10" :max="86400" :disabled="intervalDisabled" />
-          <!-- 历史问题-历史问题：单位后缀归一全局 form-tip-inline（原自管 .interval-unit
+          <!-- 历史问题：单位后缀归一全局 form-tip-inline（原自管 .interval-unit
                与全局类仅色差/字号差）；行内 gap 已提供间距，左侧外边距置零 -->
           <span class="form-tip-inline" style="margin-left: 0">秒</span>
           <el-button v-if="!isSlave" :loading="intervalSaving" :disabled="intervalDisabled || syncInterval === status?.sync_interval" @click="saveSyncInterval">保存</el-button>
@@ -91,7 +91,7 @@ const props = defineProps<{
   readonly status: ClusterStatus | null
   readonly loading: boolean
   readonly registrationRequest: number
-  /** 父级注册请求成功计数（WS-17：成功后清空一次性令牌；取消/失败保留）。 */
+  /** 父级注册请求成功计数（历史修复：成功后清空一次性令牌；取消/失败保留）。 */
   readonly registrationSucceeded: number
   readonly readOnly: boolean
   readonly intervalSaving: boolean
@@ -110,7 +110,7 @@ let registrationOriginMode: ClusterNodeMode | null = null
 const syncInterval = ref(60)
 const form = reactive<RegistrationForm>({ master_url: '', register_token: '', node_name: '' })
 
-// WS-18：与节点访问地址共用 utils/clusterUrl——原实现只校验 scheme，带凭证/
+// 历史修复：与节点访问地址共用 utils/clusterUrl——原实现只校验 scheme，带凭证/
 // query/fragment 的地址会通过前端校验、提交时被后端同一规则拒绝（晚失败）。
 const validateMasterUrl = (_rule: unknown, value: string, callback: (error?: Error) => void): void => {
   const error = validateClusterUrl(value, { label: '主节点地址', emptyMessage: '请输入主节点地址' })
@@ -162,7 +162,7 @@ watch(
 )
 
 // 注册请求被主节点受理（父级二次确认后的 POST 成功）→ 令牌已消耗，清空；
-// 取消确认/入口守卫早退/请求失败都保留输入（WS-17）。
+// 取消确认/入口守卫早退/请求失败都保留输入（历史修复）。
 watch(() => props.registrationSucceeded, () => { form.register_token = '' })
 
 // 注册令牌为一次性凭据：注册流程结束（提交/取消/成功关闭）后不回填，避免下次打开残留旧令牌
@@ -170,7 +170,7 @@ watch(registrationOpen, (open) => {
   if (!open) {
     registrationOriginMode = null
     form.register_token = ''
-    // FE-70-7：X/ESC 直闭不走 closeRegistration——复位对齐实际节点模式，否则
+    // 历史修复：X/ESC 直闭不走 closeRegistration——复位对齐实际节点模式，否则
     // 主节点表单错显「从节点」（曾等 status 轮询 ≤15s 才自愈）
     selectedMode.value = props.status?.node_mode ?? 'master'
   }
@@ -190,7 +190,7 @@ const handleModeChange = (value: string | number | boolean): void => {
 }
 
 const closeRegistration = (): void => {
-  // 关闭路径统一收口 watch(registrationOpen)：令牌清空 + selectedMode 复位（FE-70-7）
+  // 关闭路径统一收口 watch(registrationOpen)：令牌清空 + selectedMode 复位（历史修复）
   registrationOpen.value = false
 }
 
@@ -210,7 +210,7 @@ const submitRegistration = async (): Promise<void> => {
     register_token: form.register_token.trim(),
     ...(nodeName ? { node_name: nodeName } : {}),
   })
-  // WS-17：不在此清空令牌——emit 之后父级的二次确认/入口守卫才可能发生，
+  // 历史修复：不在此清空令牌——emit 之后父级的二次确认/入口守卫才可能发生，
   // 取消确认或守卫早退都会让已粘贴的一次性令牌白白丢失。弹框关闭
   //（成功/取消/X）统一由 watch(registrationOpen) 清空。
 }

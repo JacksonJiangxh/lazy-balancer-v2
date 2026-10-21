@@ -392,10 +392,10 @@ func TestAutoBackupScheduled_nilExecutorReturnsError(t *testing.T) {
 	}
 }
 
-// V87-TO-03：monthly day 带外写入 29-31（集群快照直写不校验）时，短月
+// 历史修复：monthly day 带外写入 29-31（集群快照直写不校验）时，短月
 // 「已执行→步进」会回退到已执行的过去槽：nextAutoBackupSlot 返回不晚于 now
 // 且不晚于水位线的时刻，引擎每 tick 重跑备份并刷 task_runs。
-// 读侧须把 day 收敛到写侧允许区间（越界回退默认 1——与 handlers 读侧 SYS-F1
+// 读侧须把 day 收敛到写侧允许区间（越界回退默认 1——与 handlers 读侧 历史修复
 // 同口径，保证「UI 显示的即生效值」）。
 func TestAutoBackupNextSlot_outOfRangeMonthlyDayDoesNotRepeatExecutedSlot(t *testing.T) {
 	setupAutoBackupTestDB(t)
@@ -417,7 +417,7 @@ func TestAutoBackupNextSlot_outOfRangeMonthlyDayDoesNotRepeatExecutedSlot(t *tes
 	}
 }
 
-// V87-TO-03（回归形状）：weekly day 越界（0 或 >7）此前让 autoBackupDueSlot
+// 历史修复（回归形状）：weekly day 越界（0 或 >7）此前让 autoBackupDueSlot
 // ok=false → 调度面零槽（任务静默停摆）。读侧收敛到可调度区间后必须有槽。
 func TestAutoBackupNextSlot_outOfRangeWeeklyDayStillSchedules(t *testing.T) {
 	setupAutoBackupTestDB(t)

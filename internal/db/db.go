@@ -36,7 +36,7 @@ var (
 // （defaultUpdates，幂等 UPDATE WHERE IS NULL OR <=0）、导入/快照/传输归一
 // 门。语义约定：这些列 0 无效（库恒有效），渲染直读，无效即显性报错。
 // 反向钉测：db_truth_defaults_test.go 断言 DDL DEFAULT 与本组常量逐项一致；
-// 渲染侧 历史修复 见 render_db_truth_test.go。
+// 渲染侧 fail-visible 见 render_db_truth_test.go。
 const (
 	DefaultRequestBodyMaxSizeMB          = 128
 	DefaultHTTPReadTimeout               = 60
@@ -53,12 +53,12 @@ const (
 	// cert_expiry_days 同族——DDL DEFAULT + 启动回填 + 读侧直读零兜底三件套。
 	DefaultCertRenewalDays     = 30
 	DefaultCertRenewalAttempts = 5
-	// DefaultAnomalyThreshold（G6，历史）：security_policies.anomaly_threshold
+	// DefaultAnomalyThreshold（历史修复，历史）：security_policies.anomaly_threshold
 	// 类型①值列默认值——fresh CREATE 的 security_policies.anomaly_threshold
 	// DDL DEFAULT + 启动归一（security_normalize.go legacySecurityEnumBackfills）
 	// + DB 侧钉测三处单源。
 	DefaultAnomalyThreshold = 5
-	// 安全事件保留 / 威胁大屏口径默认值（历史问题 历史单源化）：
+	// 安全事件保留 / 威胁大屏口径默认值（历史问题单源化）：
 	// 此前 90 天 / 100 万行 / 采样 -1 / 模式 'map' 在 DDL（newColumns）、启动
 	// 迁移、读侧 COALESCE、导入归一四处各写一份字面量，改默认值需同步 4+ 处
 	// （request_body 多年漏检同族）。现以本组常量为唯一事实源：DDL/回填/
@@ -293,7 +293,7 @@ func createTables() error {
 	);
 
 	-- users/api_keys/lb_rules 等表的存量库补列统一由 runMigrations 的
-	-- newColumns 通道承担（CORE-R1 收敛后唯一登记点，见该处注释）。
+	-- newColumns 通道承担（历史修复 收敛后唯一登记点，见该处注释）。
 
 	-- API Keys table
 	CREATE TABLE IF NOT EXISTS api_keys (
@@ -331,10 +331,10 @@ func createTables() error {
 		-- 无兜底（0 无效→启动回填/写侧 400 拦截）。存量库 ALTER 无法补 NOT NULL
 		--（SQLite 限制），由每启动回填 defaultUpdates 收敛 NULL/<=0。
 		health_check_interval INTEGER NOT NULL DEFAULT 10,
-		-- 历史问题 历史问题: schema 默认仅新库/重建生效（SQLite 不支持 ALTER COLUMN DEFAULT）；
+		-- 历史问题: schema 默认仅新库/重建生效（SQLite 不支持 ALTER COLUMN DEFAULT）；
 		-- 存量行 health_check_timeout 值不变；全部生产 INSERT 显式带值，DEFAULT 惰性。
 		-- 批 1+2：DEFAULT 5→2——与写侧（CreateRule 校验边界）/读取/渲染三方统一
-		-- （历史问题-1/LB-04），5 为从未生效的陈旧默认。
+		-- （历史问题-1/历史修复），5 为从未生效的陈旧默认。
 		health_check_timeout INTEGER NOT NULL DEFAULT 2,
 		health_check_unhealthy_threshold INTEGER NOT NULL DEFAULT 3,
 		health_check_healthy_threshold INTEGER NOT NULL DEFAULT 2,
@@ -373,7 +373,7 @@ func createTables() error {
 		compress_types VARCHAR(100) DEFAULT 'gzip',
 		enabled BOOLEAN NOT NULL DEFAULT 1,
 		log_enabled BOOLEAN DEFAULT 0,
-		-- U6B-3（历史）：阶段拦截页四列——此前仅靠 newColumns 启动补列，
+		-- 历史修复（历史）：阶段拦截页四列——此前仅靠 newColumns 启动补列，
 		-- fresh DDL 滞后于存量库 ALTER 通道。
 		block_page_stage1_id INTEGER NOT NULL DEFAULT 0,
 		block_page_stage1_status INTEGER NOT NULL DEFAULT 0,
@@ -482,7 +482,7 @@ func createTables() error {
 		sync_interval INTEGER DEFAULT 60,
 		caddy_log_level VARCHAR(10) DEFAULT 'info',
 		caddy_log_size_mb INTEGER NOT NULL DEFAULT 100,
-		-- D40-2-1:默认 128(与 coraza 默认 RequestBodyLimit 统一)。批 1+2:
+		-- 历史修复:默认 128(与 coraza 默认 RequestBodyLimit 统一)。批 1+2:
 		-- NOT NULL+渲染直读,存量库 0 行由启动回填报 128,渲染层写死 128 兜底废除。
 		request_body_max_size_mb INTEGER NOT NULL DEFAULT 128,
 		http_read_timeout INTEGER NOT NULL DEFAULT 60,
@@ -603,7 +603,7 @@ func createTables() error {
 	-- MFA 登录二步挑战（v2.1.8）：节点本地临时态，不参与集群同步/配置备份
 	--（同 used_login_tickets 先例）；过期行（含未消费）由每次签发挑战时的
 	-- 惰性 DELETE 清除（历史问题 修正：原注释所述 loginRateLimit 桶扫描不存在）。
-	-- password_version（历史 U04c-02）：绑定签发时的密码版本——改密/重置
+	-- password_version（历史修复）：绑定签发时的密码版本——改密/重置
 	-- 后旧挑战校验必败（验证端要求与 users.password_version 相等），
 	-- 杜绝「旧密码取得挑战→重置后仍能完成 MFA」。
 	CREATE TABLE IF NOT EXISTS mfa_challenges (
@@ -646,7 +646,7 @@ func createTables() error {
 		name TEXT NOT NULL,
 		description TEXT DEFAULT '',
 		content TEXT DEFAULT '',
-		-- 拦截响应 Content-Type（2026-09-25 用户裁定可配置，白名单见 models）；
+		-- 拦截响应 历史修复（2026-09-25 用户裁定可配置，白名单见 models）；
 		-- 存量行由 ensureNewColumns 补列，默认即内置三页的形态。
 		content_type TEXT DEFAULT 'text/html; charset=utf-8',
 		is_default BOOLEAN DEFAULT FALSE,
@@ -714,7 +714,7 @@ func createTables() error {
 	log_request_body INTEGER DEFAULT 0,
 	ip_acl_list_refs TEXT DEFAULT '[]',
 	ip_whitelist_refs TEXT DEFAULT '[]',
-	-- U6B-3（历史）：实体单职化/阶段 0 两列与 newColumns 对齐
+	-- 历史修复（历史）：实体单职化/阶段 0 两列与 newColumns 对齐
 	-- （TEXT NOT NULL DEFAULT '' / BOOLEAN NOT NULL DEFAULT 0），fresh 建库
 	-- 不再依赖启动补列。
 	policy_type TEXT NOT NULL DEFAULT '',
@@ -765,7 +765,7 @@ func createTables() error {
 	CREATE INDEX IF NOT EXISTS idx_auto_backups_created_at ON auto_backups(created_at);
 	-- 统一任务引擎（v2.3.4 lazy-task-engine）：全部任务族的运行历史。
 	-- 304 空轮/纯镜像不落库；仅真实执行与终态。保留随安全事件保留清理族。
-	-- TASK-L7（历史）：stage/entry_count 零写入方死列已删（存量库经
+	-- 历史修复（历史）：stage/entry_count 零写入方死列已删（存量库经
 	-- deadColumnDrops 幂等移除）。
 	CREATE TABLE IF NOT EXISTS task_runs (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -883,7 +883,7 @@ func runMigrations() error {
 	if _, err := dropColumnIfExists("global_config", "access_log_enabled"); err != nil {
 		return err
 	}
-	// 历史修复/历史修复（2026-09-05/06 审计裁定）：metrics_public/metrics_origins 为零
+	// 历史修复（2026-09-05/06 审计裁定）：metrics_public/metrics_origins 为零
 	// 消费死列（历史上预留给「指标公开访问/CORS」设想，从未接线）；
 	// metrics_retention_days 的指标保留期已改用 audit_retention_months
 	//（2026-09-06 裁定，历史修复）——三列存量库逐列删除（逐列判定使单列残留
@@ -904,7 +904,7 @@ func runMigrations() error {
 	//（mfa_*/oidc_*/password_* 等）。fresh 库与存量库恒经本通道补列收敛；
 	// 例外：整表重建迁移（users/security_policies/nodes/lb_rules+upstreams/
 	// cert_jobs 重建 DDL）必须同步携列——重建位于二次 ensureNewColumns 安全网
-	// 之后，丢列无同启动自愈（历史修复/D403-历史问题 先例）。
+	// 之后，丢列无同启动自愈（历史问题 先例）。
 	newColumns := map[string]string{
 		// 历史修复（历史）迁入登记：原 runMigrations 头部的逐列硬编码检查与
 		// apiKeyColumns/newLbColumns 局部 map 循环——DDL 与默认值逐字沿用原登记。
@@ -969,7 +969,7 @@ func runMigrations() error {
 		"lb_rules.health_check_host":       "TEXT NOT NULL DEFAULT ''",
 		"global_config.threat_auto_update": "INTEGER NOT NULL DEFAULT 1",
 		"security_ip_lists.system":         "INTEGER NOT NULL DEFAULT 0",
-		// MFA 登录挑战绑定签发时密码版本（历史 历史修复）。
+		// MFA 登录挑战绑定签发时密码版本（历史修复）。
 		"mfa_challenges.password_version":      "INTEGER NOT NULL DEFAULT 0",
 		"path_rules.upstream_path":             "TEXT NOT NULL DEFAULT ''",
 		"security_threat_sources.content_hash": "TEXT DEFAULT ''",
@@ -1012,7 +1012,7 @@ func runMigrations() error {
 		"users.mfa_recovery_codes":             "TEXT DEFAULT '[]'",
 		"users.mfa_last_timestep":              "INTEGER DEFAULT 0",
 		"users.mfa_pending_fails":              "INTEGER DEFAULT 0",
-		// M7（契约）：账户级登录锁定列（auth.go Login 写读；与 MFA 写保护的
+		// 历史修复（契约）：账户级登录锁定列（auth.go Login 写读；与 MFA 写保护的
 		// mfa_* 计数列独立，登录锁定与 MFA 冷却互不牵连）。计数列 NOT NULL——
 		// 存量行取默认 0，不存在 NULL 语义。
 		"users.login_failed_attempts": "INTEGER NOT NULL DEFAULT 0",
@@ -1137,7 +1137,7 @@ func runMigrations() error {
 		"security_block_pages.content_type": "TEXT DEFAULT 'text/html; charset=utf-8'",
 		"security_policies.updated_by":      "INTEGER DEFAULT 0",
 		// 四列刻意可空（不加 NOT NULL）：restoreTable/快照/带外脏数据可携带 NULL，
-		// 读路径 loadSecurityPolicyContext 以 COALESCE 归一化；加 NOT NULL 会拒绝 null 恢复（历史修复/F3 回归测试）。
+		// 读路径 loadSecurityPolicyContext 以 COALESCE 归一化；加 NOT NULL 会拒绝 null 恢复（历史修复 回归测试）。
 		"security_policies.ip_whitelist_enabled":  "INTEGER DEFAULT 1",
 		"security_policies.geoip_countries":       "TEXT DEFAULT '[]'",
 		"security_policies.geoip_mode":            "TEXT DEFAULT 'deny'",
@@ -1163,12 +1163,12 @@ func runMigrations() error {
 		"global_config.auto_backup_sections_version": "INTEGER NOT NULL DEFAULT 0",
 		"global_config.auto_backup_last_run":         "DATETIME",
 		// 三分类合并·方案A(2026-09-19):文件态记账专用列(wafFilesDrifted
-		// 的 304 兜底与 历史问题 A-#4 标签自愈依赖;哈希域=纯 ref 含版本标签)。
+		// 的 304 兜底与 历史问题 标签自愈依赖;哈希域=纯 ref 含版本标签)。
 		"global_config.applied_waf_ref_hash":    "TEXT DEFAULT ''",
 		"global_config.applied_waf_ref_version": "INTEGER DEFAULT 0",
 		// 自动封禁（历史问题）六项配置列：启用/阈值/窗口分钟/封禁时长（枚举
 		// '10m','30m','1h','6h','12h','24h','permanent'）/统计口径（'blocked',
-		// 'logged','all'）/观察模式（1=默认 历史修复，仅记录建议不落名单）。
+		// 'logged','all'）/观察模式（1=默认 dry-run，仅记录建议不落名单）。
 		// 全部 NOT NULL——语义零值即合法值（关/100/5/'1h'/'all'/观察），无 NULL 分支。
 		"global_config.autoban_enabled":        "INTEGER NOT NULL DEFAULT 0",
 		"global_config.autoban_threshold":      "INTEGER NOT NULL DEFAULT 100",
@@ -1179,7 +1179,7 @@ func runMigrations() error {
 		"nodes.server_map_lat":                 "REAL NOT NULL DEFAULT 0",
 		"nodes.server_map_lon":                 "REAL NOT NULL DEFAULT 0",
 	}
-	// 历史问题 F1: 四个全局超时列的 0→推荐默认回填原为「仅新增列时执行一次」——
+	// 历史问题: 四个全局超时列的 0→推荐默认回填原为「仅新增列时执行一次」——
 	// 当时渲染层把 0 当作「省略=用 Caddy 默认」的有效值，每启动无条件回填会
 	// 静默改写用户显式设置的 0。批 1+2（库值唯一真相，2026-10-14 用户裁定）
 	// 推翻该口径：http_read/write/idle_timeout 三列转为类型①值型（0 无效），
@@ -1187,7 +1187,7 @@ func runMigrations() error {
 	// 合法用户选择，归一不是改写）；此处三列一次性回填随之退役。
 	// upstream_keepalive_timeout 保持类型②省略型（0=省略=历史问题 用户裁定，继承
 	// Caddy/Go Transport 默认 2 分钟）——「新增列时代存量行为 0」的一次性形状
-	// 防御保留，显式 60 是写侧合法值，任何迁移不得改写（审计 历史问题）。
+	// 防御保留，显式 60 是写侧合法值，任何迁移不得改写（历史问题）。
 	newColumnBackfills := map[string]string{
 		// 审计 历史问题/本列自引入起 DEFAULT 0，新增当刻存量行恒为 0——
 		// 此回填仅覆盖理论上的「列带 DEFAULT 60 时代新增」路径，实际库零命中
@@ -1221,7 +1221,7 @@ func runMigrations() error {
 	if _, err := DB.Exec("DROP INDEX IF EXISTS idx_nodes_status"); err != nil {
 		return fmt.Errorf("failed to drop dead nodes status index: %w", err)
 	}
-	// D403-历史问题 结构性兜底：上方整表重建迁移若以陈旧 DDL 重建而丢列，这里幂等
+	// 历史问题 结构性兜底：上方整表重建迁移若以陈旧 DDL 重建而丢列，这里幂等
 	// 补齐收敛——重建迁移自身漏列不再造成列永久丢失（数据按列默认值回填）。
 	if err := ensureNewColumns(newColumns, newColumnBackfills); err != nil {
 		return err
@@ -1231,6 +1231,9 @@ func runMigrations() error {
 	}
 	if err := normalizeUpstreamWeightsMigration(); err != nil {
 		return fmt.Errorf("failed to normalize upstream weights: %w", err)
+	}
+	if err := normalizeNtlmTakeoverConsistencyMigration(); err != nil {
+		return fmt.Errorf("failed to normalize ntlm takeover consistency: %w", err)
 	}
 	if err := migrateSecurityEventRetentionDefaults(); err != nil {
 		return err
@@ -1286,7 +1289,7 @@ func runMigrations() error {
 	}
 
 	// Normalize legacy/global default values that are invalid regardless of version
-	// 历史问题 历史问题: 移除原第 3 条「追加 UA rename 行」的 UPDATE——该行每次启动都被下方
+	// 历史问题: 移除原第 3 条「追加 UA rename 行」的 UPDATE——该行每次启动都被下方
 	// 清理循环无条件剔除（死代码），且引发每启动一次无谓写放大。
 	defaultUpdates := []string{
 		"UPDATE global_config SET jwt_expire_minutes=20 WHERE jwt_expire_minutes IS NULL OR jwt_expire_minutes<=0 OR jwt_expire_minutes>1440",
@@ -1313,7 +1316,7 @@ func runMigrations() error {
 		fmt.Sprintf("UPDATE lb_rules SET health_check_healthy_threshold=%d WHERE health_check_healthy_threshold IS NULL OR health_check_healthy_threshold<=0", DefaultHealthCheckHealthyThreshold),
 		fmt.Sprintf("UPDATE lb_rules SET tcp_try_interval=%d WHERE tcp_try_interval IS NULL OR tcp_try_interval<=0", DefaultTCPTryInterval),
 		// 库值唯一真相（批 3）：cert_expiry_days 类型①值型列（写侧 1-365 校验
-		// 历史问题 历史修复 + 导入钳制 历史问题 历史问题 之外的最后防线）：NULL/<=0 归 30；用户已设
+		// 历史修复 + 导入钳制 历史问题 之外的最后防线）：NULL/<=0 归 30；用户已设
 		// 有效值（>0）恒不触碰。消费侧 GetCertExpiryThreshold 直读零兜底。
 		fmt.Sprintf("UPDATE global_config SET cert_expiry_days=%d WHERE cert_expiry_days IS NULL OR cert_expiry_days<=0", DefaultCertExpiryDays),
 		// 历史问题（历史）：cert_renewal_days/cert_renewal_attempts 纳入同一
@@ -1321,7 +1324,7 @@ func runMigrations() error {
 		// 静默吞掉，无任何留痕）。读侧 GetCertRenewalDays/Attempts 直读零兜底。
 		fmt.Sprintf("UPDATE global_config SET cert_renewal_days=%d WHERE cert_renewal_days IS NULL OR cert_renewal_days<=0", DefaultCertRenewalDays),
 		fmt.Sprintf("UPDATE global_config SET cert_renewal_attempts=%d WHERE cert_renewal_attempts IS NULL OR cert_renewal_attempts<=0", DefaultCertRenewalAttempts),
-		// D2（历史）：自动封禁六列每启动幂等回填（同上铁律的最后防线
+		// 历史修复（历史）：自动封禁六列每启动幂等回填（同上铁律的最后防线
 		// 形态）——带外直写/畸形备份导入的脏行（0-1 外布尔、枚举外文本、写侧
 		// 边界外数值）在下次启动收敛到治理默认；运行期窗口内的无效值由消费侧
 		// 护栏（RunAutobanCycle 执行前校验，拒绝执行+显性报错）承担，不静默兜底。
@@ -1356,7 +1359,7 @@ func runMigrations() error {
 			}
 			out = append(out, l)
 		}
-		// 历史问题 历史问题: 内容未变化时跳过写回（避免每启动一次无谓 UPDATE）。
+		// 历史问题: 内容未变化时跳过写回（避免每启动一次无谓 UPDATE）。
 		if cleaned := strings.Join(out, "\n"); cleaned != lf {
 			if _, err := DB.Exec("UPDATE global_config SET access_log_format=? WHERE id=1", cleaned); err != nil {
 				return fmt.Errorf("failed to clean global config access log format: %w", err)
@@ -1365,8 +1368,8 @@ func runMigrations() error {
 	}
 
 	// Sensitive credential headers are dropped from access logs (Cookie and
-	// Authorization are redacted by Caddy itself; API keys are not). A85历史问题-A：
-	// 归一为唯一规范行——既有的 历史修复 rename 行会被移除（渲染层虽强制
+	// Authorization are redacted by Caddy itself; API keys are not). 历史问题：
+	// 归一为唯一规范行——既有的 X-API-Key rename 行会被移除（渲染层虽强制
 	// delete 覆盖，落库值仍应与所见一致）；空格式不写回（「不裁剪原生字段」
 	// 的默认形态，渲染层恒注入脱敏行）。
 	var lf2 string
@@ -1439,7 +1442,7 @@ func runMigrations() error {
 		return fmt.Errorf("failed to migrate cert_jobs status constraint: %w", err)
 	}
 	// idx_cert_jobs_rule_domain 与 idx_cert_jobs_rule_domain_unique 左前缀重叠
-	//（审计 C 组清理），删除冗余索引；IF EXISTS 幂等，存量库一次性回收。
+	//（历史清理），删除冗余索引；IF EXISTS 幂等，存量库一次性回收。
 	if _, err := DB.Exec("DROP INDEX IF EXISTS idx_cert_jobs_rule_domain"); err != nil {
 		return fmt.Errorf("failed to drop redundant cert_jobs rule-domain index: %w", err)
 	}
@@ -1464,7 +1467,7 @@ func runMigrations() error {
 	// Normalize ca_available_after to SQLite canonical UTC datetime format.
 	// Older rows may contain Go time.Time strings like
 	// "2026-07-02 11:56:03.432055881+00:00" which don't compare correctly
-	// against datetime('now'). datetime() of an 历史修复 string
+	// against datetime('now'). datetime() of an already-canonical string
 	// returns the same value, so this is safe to run repeatedly.
 	// datetime() 对无法解析的值返回 NULL：若无条件覆盖，存量垃圾值会被静默清成
 	// NULL，丢失「该行数据异常」的信号。仅规范化可解析的值。
@@ -1494,12 +1497,12 @@ func runMigrations() error {
 		return fmt.Errorf("failed to migrate lb_rules primary key: %w", err)
 	}
 
-	// 历史修复（审计 N+8）：lb_rules/upstreams 三张高频索引必须在 PK 重建之后创建——
+	// 历史修复（历史）：lb_rules/upstreams 三张高频索引必须在 PK 重建之后创建——
 	// 重建会 DROP 两张旧表，随表级联删除的索引若在重建前创建，则本次启动内一直
 	// 缺失（端口冲突检查/配置生成/指标采集退化为全表扫描），要到下次启动才被
 	// IF NOT EXISTS 自愈。fresh 库路径 PK 已是 caddy_id，此处 IF NOT EXISTS 为幂等
-	// 历史修复（schema 侧已建的同名索引不冲突）。
-	// 历史 历史问题/历史问题：listen_port 用于创建/更新规则的端口冲突检查；
+	// no-op（schema 侧已建的同名索引不冲突）。
+	// 历史问题：listen_port 用于创建/更新规则的端口冲突检查；
 	// enabled 用于 Caddy 配置生成与每 5s 指标采集。
 	if _, err := DB.Exec("CREATE INDEX IF NOT EXISTS idx_upstreams_rule_enabled_id ON upstreams(rule_id,enabled,id)"); err != nil {
 		return fmt.Errorf("failed to index upstream rule loading: %w", err)
@@ -1511,13 +1514,13 @@ func runMigrations() error {
 		return fmt.Errorf("failed to index lb_rules enabled: %w", err)
 	}
 
-	// 历史问题 B1: 须在 lb_rules 重建之后——重建前的遗留表可能没有 enable_tls 列。
+	// 历史问题: 须在 lb_rules 重建之后——重建前的遗留表可能没有 enable_tls 列。
 	if err := migrateLegacyHTTPSProtocol(); err != nil {
 		return fmt.Errorf("failed to migrate legacy https protocol: %w", err)
 	}
 
 	// 历史问题-1（历史）：TCP DNS 死配置清理由 deadFields 同族收口；
-	// 历史修复 旧形态由 runMigrations 尾部的 migrateTCPRuleDeadFields 覆盖并负责版本 bump。
+	// TLS-only 旧形态由 runMigrations 尾部的 migrateTCPRuleDeadFields 覆盖并负责版本 bump。
 	if err := migrateTCPRuleStaleDNSServer(); err != nil {
 		return fmt.Errorf("failed to migrate tcp rule stale dns server: %w", err)
 	}
@@ -1549,7 +1552,7 @@ func runMigrations() error {
 		return fmt.Errorf("failed to normalize NULL lb_rules.enabled: %w", err)
 	}
 
-	// 历史修复（审计 N+8）：备份恢复通道的 epoch 归一（config_backup.go
+	// 历史修复（历史）：备份恢复通道的 epoch 归一（config_backup.go
 	// backupTableNullDefaults）只守住「新恢复」的行——修复前已恢复的存量行仍带
 	// NULL 时间戳，集群 dump 侧 snapshotRules/snapshotACME 裸列直扫 time.Time
 	// 对 NULL 失败会中断整集群同步。启动幂等回填 epoch（与恢复通道、dump 侧
@@ -1610,7 +1613,7 @@ func runMigrations() error {
 		}
 	}
 
-	// 历史问题（审计 N+9）：同一恢复通道对 users/api_keys/path_rules/cert_jobs 的
+	// 历史问题（历史）：同一恢复通道对 users/api_keys/path_rules/cert_jobs 的
 	// created_at 也做 epoch 归一，历史修复 回填未跟上——修复前已恢复的存量 NULL
 	// 行持续毒化裸 time.Time 消费端（users→登录 Scan 失败 500 永久锁死/用户
 	// 列表/集群快照、api_keys 列表与快照、path_rules 快照、cert_jobs 列表/
@@ -1677,8 +1680,8 @@ func runMigrations() error {
 	// - lb_rules.ip_acl_mode / ip_acl_list 为规则级 IP 访问控制的遗留列，规则级 IP ACL 早已
 	//   迁入 security_policies（策略级 ip_acl_* 仍在使用），这两列不再被读取或写入。
 	deadColumnDrops := []struct{ table, column string }{
-		{"task_runs", "stage"},              // TASK-历史修复（历史）：零写入方死列
-		{"task_runs", "entry_count"},        // TASK-历史修复（历史）：零写入方死列
+		{"task_runs", "stage"},              // 历史修复（历史）：零写入方死列
+		{"task_runs", "entry_count"},        // 历史修复（历史）：零写入方死列
 		{"global_config", "caddy_log_path"}, // 读取但从未使用，日志文件名由渲染层硬编码
 		{"security_block_pages", "status_code"},
 		{"security_custom_rules", "status_code"},
@@ -1727,7 +1730,7 @@ func runMigrations() error {
 			`); err != nil {
 				return fmt.Errorf("failed to seed CA providers: %w", err)
 			}
-			// LastInsertId returns the last row of the 历史修复 insert (Let's Encrypt),
+			// LastInsertId returns the last row of the multi-row insert (Let's Encrypt),
 			// so look up Let's Encrypt's actual ID directly and set it as the default.
 			var leid int64
 			if err := DB.QueryRow("SELECT id FROM ca_providers WHERE provider = 'letsencrypt' ORDER BY id LIMIT 1").Scan(&leid); err != nil {
@@ -1781,7 +1784,7 @@ func runMigrations() error {
 	// 威胁情报库/自动封禁内置只读名单种子（单源：SeedSystemIPLists，
 	// 导入提交后由 handlers 以同一函数重播）。name 稳定（更新任务定位键），
 	// 条目空，由更新任务独占写；system=1 行面板/API 拒改拒删。
-	// 历史问题/历史问题-1：存在性判定按 name+system=1——同名用户列表（旧备份
+	// 历史问题-1：存在性判定按 name+system=1——同名用户列表（旧备份
 	// 可携带 system=0 行）不阻止内置行创建，也不被合并/删除，仅留痕。
 	if err := SeedSystemIPLists(DB); err != nil {
 		return err
@@ -1796,7 +1799,7 @@ func runMigrations() error {
 	if err := migrateTCPRuleDeadFields(); err != nil {
 		return err
 	}
-	// A85历史问题-3-RESIDUAL：旧版本 HTTP→TCP 切换前遗留的惰性策略绑定。
+	// 历史问题：旧版本 HTTP→TCP 切换前遗留的惰性策略绑定。
 	if err := migrateTCPRuleSecurityPolicyBindings(); err != nil {
 		return err
 	}
@@ -1807,7 +1810,7 @@ func runMigrations() error {
 }
 
 // migrateDropDeadMFAColumns(2026-09-10 审计 历史修复):users.mfa_failed_attempts/
-// mfa_locked_until 是 M7 残留死列——现行锁定走 login_failed_attempts/
+// mfa_locked_until 是 历史修复 残留死列——现行锁定走 login_failed_attempts/
 // login_locked_until(auth.go),该二列零消费(仅残留清零写与快照搬运)。删除
 // 列+全部搬运/清零写点;集群同步不做向下兼容(2026-09-09 裁定),新旧快照
 // 字段集不一致由同版本升级前提保证。幂等:列存在才 DROP。
@@ -1933,19 +1936,19 @@ const legacyHTTPSHasCertPredicate = `(
 
 // migrateLegacyHTTPSProtocol 一次性迁移：a1ecbe3a 期写入路径曾接受 protocol='https'
 // （语义即 http+TLS），b6e2b624 起写侧白名单收敛为 http/tcp，存量 https 行编辑/复制
-// 全部 400、启用后按「非 http 即 TCP」渲染（域名匹配静默丢失）。归一规则（历史问题 历史问题）：
+// 全部 400、启用后按「非 http 即 TCP」渲染（域名匹配静默丢失）。归一规则（历史问题）：
 //   - 有证行 → protocol='http' + enable_tls=1，保持原意图（含 enable_tls 已为 0 的
 //     行——https 协议本身隐含 TLS）；
 //   - 无证行 → protocol='http' + enable_tls=0 且清 tls_http_redirect：渲染为普通
 //     HTTP，保持可编辑，避免 TLS 端口明文与指向非 TLS 端口的幻影跳转（历史修复 形态的
 //     迁移再制造）。
 //
-// 「有证」判定（历史问题 历史问题）：内联 tls_cert/tls_key 均非空，或 tls_source='acme_dns'
+// 「有证」判定（历史问题）：内联 tls_cert/tls_key 均非空，或 tls_source='acme_dns'
 // 且 cert_jobs 中存有该规则已签发的证书（cert_pem/key_pem 非空、任务未禁用）——
 // 签发门控（caqueue）不筛 protocol，历史 https 行可能经 ACME 签出证书，仅查内联
 // 列会把此类行当无证处理，导致已签发证书静默不再加载且永不续期。
 //
-// 幂等，重跑零命中。受影响规则记入操作日志（历史问题 历史问题：迁移跑在审计库初始化之前，
+// 幂等，重跑零命中。受影响规则记入操作日志（历史问题：迁移跑在审计库初始化之前，
 // 先缓冲、InitializeAuditDB 就绪后落库）。
 func migrateLegacyHTTPSProtocol() error {
 	rows, err := DB.Query(`SELECT caddy_id, name,
@@ -2234,7 +2237,7 @@ var canonicalDomainMigrationSources = []struct {
 // canonicalDomainMigrationNeeded 以与迁移本体相同的口径判定是否有事可做：任一存量
 // 值与规范形不同，或 cert_jobs 仍存在 (rule_id, domain) 重复组。无事可做时调用方
 // 整段跳过——否则每次启动都白跑一次 DROP/CREATE 唯一索引（立即写事务）加三次全表
-// 扫描（C5 历史修复）。迁移在服务器接受流量前单线程执行，判定与迁移间无并发写入。
+// 扫描（历史修复）。迁移在服务器接受流量前单线程执行，判定与迁移间无并发写入。
 func canonicalDomainMigrationNeeded() (bool, error) {
 	for _, source := range canonicalDomainMigrationSources {
 		rows, err := DB.Query(source.query)
@@ -2345,7 +2348,7 @@ func migrateCanonicalDomains() error {
 		}
 		renamedDomains++
 	}
-	// 历史问题 历史问题：去重保留判据改为「优先有证书材料的行，同列再比 id」——原 MAX(id)
+	// 历史问题：去重保留判据改为「优先有证书材料的行，同列再比 id」——原 MAX(id)
 	// 在规范域碰撞时（legacy 大小写/IDN 变体行）可能删掉带已签发证书的旧行、
 	// 保留其后创建的无证书行，规则丢失现网证书需重签。一次性迁移窗口内生效。
 	dedupeResult, err := tx.Exec(`DELETE FROM cert_jobs WHERE id NOT IN (
@@ -2450,7 +2453,7 @@ func migrateAutoBackupNodeTopologySection() error {
 	sections := []string{}
 	if raw.Valid && strings.TrimSpace(raw.String) != "" {
 		if err := json.Unmarshal([]byte(raw.String), &sections); err != nil {
-			// 畸形存量值不在迁移中猜测修复；交由设置读侧 历史修复。
+			// 畸形存量值不在迁移中猜测修复；交由设置读侧 fail-visible。
 			_, err = DB.Exec(`UPDATE global_config SET auto_backup_sections_version=1 WHERE id=1`)
 			return err
 		}
@@ -2478,6 +2481,31 @@ func normalizeUpstreamWeightsMigration() error {
 	if n, _ := res.RowsAffected(); n > 0 {
 		// 历史问题（历史）：上游权重被改写须留痕。
 		detail := fmt.Sprintf("启动迁移：存量上游权重无效值（NULL/<1）归 1：%d 条", n)
+		log.Print(detail)
+		recordSystemAudit("启动迁移", "负载规则", detail)
+	}
+	return nil
+}
+
+// normalizeNtlmTakeoverConsistencyMigration：ntlm_compatible
+// 是展示/声明列——渲染对其零感知，真实 NTLM 行为由四列接管形态决定
+// （tcp_try_duration=-1/upstream_force_http1=1/proxy_flush_interval=-1/
+// upstream_keepalive_timeout=300，UI 修改器落下的唯一合法形态）。写侧/导入/
+// 启用三族门收紧前，API 直构/旧备份/集群快照可落「ntlm=1 但四列不齐」的
+// 不一致行——面板宣称 NTLM、运行行为非 NTLM。启动期归一 ntlm_compatible=0：
+// 纯展示修正（该列渲染零消费），四列运行值原样保留、渲染行为零漂移；用户
+// 经向导重新开启开关即恢复完整接管形态。幂等：一致行与 ntlm=0 行零命中。
+// 集群同步侧不需单独处理——主端归一后经快照收敛从端。
+func normalizeNtlmTakeoverConsistencyMigration() error {
+	res, err := DB.Exec(`UPDATE lb_rules SET ntlm_compatible=0 WHERE ntlm_compatible=1 AND (
+		COALESCE(tcp_try_duration,0)<>-1 OR COALESCE(upstream_force_http1,0)<>1
+		OR COALESCE(proxy_flush_interval,0)<>-1 OR COALESCE(upstream_keepalive_timeout,0)<>300)`)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		// 与孤儿 path_rules/上游权重归一同口径：归一用户数据须留痕。
+		detail := fmt.Sprintf("启动迁移：已将 %d 条「ntlm_compatible=1 但接管四列不齐」的规则归一为 ntlm_compatible=0（渲染对该列零感知，运行行为不变）", n)
 		log.Print(detail)
 		recordSystemAudit("启动迁移", "负载规则", detail)
 	}
@@ -2516,7 +2544,7 @@ func migrateSecurityEventRetentionDefaults() error {
 
 // migrateSystemIPListUniqueIndex 为 security_ip_lists 的 system=1 行建立
 // (name) 部分唯一索引。存量重复行先按 MIN(id) 去重——同名
-// system=1 行只可能来自历史 历史修复 竞态，保留最早一行（与其它
+// system=1 行只可能来自历史修复 竞态，保留最早一行（与其它
 // 迁移的去重优先级一致）；删除行数留运行日志，便于事后核对引用。
 // 同名 system=0 用户列表不受索引约束（部分索引仅覆盖 system=1）。
 func migrateSystemIPListUniqueIndex() error {
@@ -2585,7 +2613,7 @@ func SeedSystemIPLists(database *sql.DB) error {
 	return err
 }
 
-// ensureNewColumns 按清单逐列补齐（幂等：列已存在零命中）。D403-历史问题 提取自
+// ensureNewColumns 按清单逐列补齐（幂等：列已存在零命中）。历史问题 提取自
 // runMigrations 内联循环：三个整表重建迁移之后需再次调用，收敛重建以陈旧 DDL
 // 重建时丢失的列（数据按列默认值回填，不再永久丢失）。
 func ensureNewColumns(columns, backfills map[string]string) error {
@@ -2828,7 +2856,7 @@ func migrateUsersIsEnabledNotNull() error {
 	})
 }
 
-// migrateSecurityPoliciesNullable（历史问题）：历史 历史修复 窗口期建库的
+// migrateSecurityPoliciesNullable（历史问题）：历史 NOT-NULL 窗口期建库的
 // security_policies 四列（geoip_countries/geoip_mode/waf_check_response/
 // block_status_code）永久停留 NOT NULL——fresh CREATE 与 newColumns 迁移
 // 现均为可空，但二者对「列已存在」的窗口期库都不生效，无收敛路径；NOT NULL
@@ -2847,7 +2875,7 @@ func migrateSecurityPoliciesNullable() error {
 	if err := withTableRebuild(context.Background(), "security_policies", func(tx *sql.Tx) error {
 		// rebuild 必须与 fresh CREATE（含 refs 两列）同形状并搬运其数据——
 		// 陈旧 DDL 会把同一 runMigrations 早前 newColumns 刚加的列丢掉
-		//（审计 历史问题：窗口期库首启安全策略子系统整体 no such column）。
+		//（历史问题：窗口期库首启安全策略子系统整体 no such column）。
 		if _, err := tx.Exec(`CREATE TABLE security_policies_new (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			name TEXT NOT NULL,
@@ -2948,7 +2976,7 @@ func migrateNodesDeadColumns() error {
 		// 历史问题:重建目标对齐新 schema(无 master_id/自引用 FK,idx_nodes_master；
 		// 补 UNIQUE(ip,port))——master_id 死列经本路径与 migrateNodesDropMasterID
 		// 双路径收敛为同一形态。
-		// 历史修复 历史问题:重建 DDL 必须携 server_map_lat/lon 并 COALESCE 保值——
+		// 历史问题:重建 DDL 必须携 server_map_lat/lon 并 COALESCE 保值——
 		// 此前漏列，升级重建丢坐标（第二次 ensureNewColumns 仅以默认 0 补回 schema，
 		// 值已丢失）。
 		// 历史问题（历史）：DDL 与拷贝 SELECT 抽到 nodesRebuildDDL/
@@ -2971,7 +2999,7 @@ func migrateNodesDeadColumns() error {
 // nodesRebuildDDL 与 nodesRebuildCopySQL 是 nodes 整表重建的唯一 DDL 单源
 // （历史问题，历史）：两条历史升级路径——migrateNodesDeadColumns
 // （legacy sync 列）与 migrateNodesDropMasterID（master_id 死列）——共用本形态，
-// 杜绝「加列只改一处、另一条升级路径静默丢值」（历史修复 历史问题 丢过
+// 杜绝「加列只改一处、另一条升级路径静默丢值」（历史问题 丢过
 // server_map_lat/lon）。target 为迁移期临时表名。
 //
 // fresh CREATE（createTables）的列集合是本函数的超集前提：新增列须同时登记
@@ -3014,8 +3042,8 @@ func nodesRebuildCopySQL(target string) string {
 		SELECT id,name,COALESCE(mode,'slave'),ip_address,port,COALESCE(protocol,'http'),COALESCE(access_url,''),is_approved,sync_interval,status,cluster_token_hash,registration_secret,registration_secret_expires_at,cluster_token_delivered,reported_version,health_json,last_sync_at,last_sync_error,last_seen,created_at,COALESCE(server_map_lat,0),COALESCE(server_map_lon,0) FROM nodes;`
 }
 
-// migrateOidcIdentityUniqueIndex（历史修复，历史）：OIDC 身份三元组唯一
-// 索引——JIT 开户在并发回调窗口（双请求同走 历史修复 分支）下可产生重复
+// migrateOidcIdentityUniqueIndex（历史修复）：OIDC 身份三元组唯一
+// 索引——JIT 开户在并发回调窗口（双请求同走 no-rows 分支）下可产生重复
 // (oidc_issuer, oidc_subject) 行，命中 SELECT 无 ORDER BY 时取行不确定，会话
 // 随机落到重复行之一。partial 索引只约束 auth_provider='oidc' 且 subject 非空
 // 的行，本地用户与历史空串行不受影响。安全阀：建索引前先查重，存量库存在
@@ -3057,7 +3085,7 @@ func migrateLegacyDNSCredentials() error {
 		return fmt.Errorf("failed to begin legacy certificate credential migration: %w", err)
 	}
 	// 逐列探测：历史中断可能只留下 dns_id 或 dns_key 单列；旧实现要求
-	// 两列同时存在，残形会被永久跳过（历史 历史问题-4）。
+	// 两列同时存在，残形会被永久跳过（历史问题-4）。
 	var hasID, hasKey bool
 	if err := tx.QueryRow(`SELECT
 		EXISTS(SELECT 1 FROM pragma_table_info('certificate_configs') WHERE name='dns_id'),
@@ -3136,7 +3164,7 @@ func rollbackMigration(tx *sql.Tx, migrationErr error) error {
 	return migrationErr
 }
 
-// readForeignKeysSetting 读取连接当前 foreign_keys 设置（0/1）。M25：表重建
+// readForeignKeysSetting 读取连接当前 foreign_keys 设置（0/1）。历史修复：表重建
 // 迁移临时关闭 foreign_keys 前先记原值，结束后还原原值而非无条件 =ON——
 // 调用方若刻意保持关闭，迁移不得悄悄改写会话设置。
 func readForeignKeysSetting(ctx context.Context, conn *sql.Conn) (int, error) {
@@ -3210,7 +3238,7 @@ func migrateLbRulesPrimaryKey() error {
 			upstream_keepalive_timeout INTEGER DEFAULT 0,
 			server_tokens_hidden INTEGER DEFAULT 0,
 			-- 与 fresh CREATE 同步携带（ensureNewColumns 已加列，陈旧 DDL 会把列
-			-- 连同值一并丢弃——U6B-3 先例）。
+			-- 连同值一并丢弃——历史修复 先例）。
 			ntlm_compatible INTEGER NOT NULL DEFAULT 0,
 			upstream_force_http1 INTEGER NOT NULL DEFAULT 0,
 			custom_routes_enabled BOOLEAN NOT NULL DEFAULT 0,
@@ -3223,7 +3251,7 @@ func migrateLbRulesPrimaryKey() error {
 			proxy_stream_close_delay INTEGER NOT NULL DEFAULT 0,
 			host_header VARCHAR(255),
 			-- 与 fresh CREATE 同步携带（ensureNewColumns 在本重建之前已加列，
-			-- 陈旧 DDL 会把列连同值一并丢弃——U6B-3 先例）。
+			-- 陈旧 DDL 会把列连同值一并丢弃——历史修复 先例）。
 			health_check_host TEXT NOT NULL DEFAULT '',
 			enable_tls BOOLEAN DEFAULT FALSE,
 			tls_cert TEXT,
@@ -3236,7 +3264,7 @@ func migrateLbRulesPrimaryKey() error {
 			compress_types VARCHAR(100) DEFAULT 'gzip',
 			enabled BOOLEAN NOT NULL DEFAULT 1,
 			log_enabled BOOLEAN DEFAULT 0,
-			-- U6B-3（历史）：与 fresh CREATE 同步携带阶段拦截页四列——
+			-- 历史修复（历史）：与 fresh CREATE 同步携带阶段拦截页四列——
 			-- ensureNewColumns 在本重建之前已加列，陈旧 DDL 会把列连同值一并
 			-- 丢弃，且本重建位于二次 ensureNewColumns 安全网之后（无同启动自愈）。
 			block_page_stage1_id INTEGER NOT NULL DEFAULT 0,
@@ -3312,7 +3340,7 @@ func migrateLbRulesPrimaryKey() error {
 
 		// Create new upstreams table with VARCHAR rule_id
 		// enabled 与 fresh CREATE 对齐为 NOT NULL DEFAULT 1（历史问题 消除双通道
-		// schema 漂移）；本迁移先于 历史修复 NULL 归一化执行，拷贝侧以
+		// schema 漂移）；本迁移先于导入侧 NULL 归一化执行，拷贝侧以
 		// COALESCE(enabled,0) 兜底（与 lb_rules_new 拷贝同口径，NULL 视禁用）。
 		_, err = tx.Exec(`
 		CREATE TABLE upstreams_new (
@@ -3445,7 +3473,7 @@ func migrateCertJobsStatusConstraint() error {
 
 	log.Println("Migrating cert_jobs status constraint...")
 
-	// 历史问题/04（历史）：枚举外状态（已废弃/拼写错误）是用户可见数据
+	// 历史问题（历史）：枚举外状态（已废弃/拼写错误）是用户可见数据
 	// 改写——归一到终态 failed（保守：failed 不会被签发队列拾取，且
 	// certificates.go 的「无 expires_at 的 failed」重签路径可手动恢复），
 	// 不再回 'queued'（活跃起始态，会被队列立刻拾取并触发一次无审计的签发/
@@ -3590,7 +3618,7 @@ func migrateSyncSwitches() error {
 	return err
 }
 
-// migrateNodesDropMasterID 存量库 nodes 表重建(历史问题/历史问题,2026-09-12):
+// migrateNodesDropMasterID 存量库 nodes 表重建(历史问题,2026-09-12):
 // master_id 为死列(无业务读写),连同自引用 FK 与 idx_nodes_master 一并移除;
 // 补 UNIQUE(ip_address, port) 防深度(应用层单未用令牌不变式已防竞态,此处
 // 为改库/代码回归兜底)。重建前按 (ip,port) 去重保 MIN(id)。幂等:新形态

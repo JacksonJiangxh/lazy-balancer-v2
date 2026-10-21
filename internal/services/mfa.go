@@ -68,7 +68,7 @@ func mfaValidateTOTP(secret, code string, now time.Time) (int64, bool) {
 
 // —— 恢复代码 ——
 
-// mfaGenerateRecoveryCodes 生成 n 个恢复码，返回 (明文列表, 历史修复 哈希 JSON)。
+// mfaGenerateRecoveryCodes 生成 n 个恢复码，返回 (明文列表, SHA-256 哈希 JSON)。
 func mfaGenerateRecoveryCodes(n int) ([]string, string, error) {
 	codes := make([]string, 0, n)
 	hashes := make([]string, 0, n)
@@ -96,7 +96,7 @@ func mfaGenerateRecoveryCodes(n int) ([]string, string, error) {
 // 旧实现把存储错误吞成未命中，handler 侧会当作验证码错误累加失败计数并
 // 可能触发账户锁定。
 // 历史问题 消费语句改条件 UPDATE（... AND mfa_recovery_codes=? 旧值 CAS）——
-// 历史修复 在毫秒级并发下可双消费同码；CAS 保证只有一个写入者生效。
+// read-then-write 在毫秒级并发下可双消费同码；CAS 保证只有一个写入者生效。
 func mfaConsumeRecoveryCode(userID int, code string) (bool, error) {
 	var raw string
 	if err := db.DB.QueryRow("SELECT COALESCE(mfa_recovery_codes,'[]') FROM users WHERE id=?", userID).Scan(&raw); err != nil {
@@ -170,7 +170,7 @@ func MFAIssueChallenge(userID int) (string, error) {
 	return token, nil
 }
 
-// MFARecordChallengeFailure 挑战级失败计数（历史问题 B-历史问题 硬闸）：单挑战失败 10 次
+// MFARecordChallengeFailure 挑战级失败计数（历史问题 硬闸）：单挑战失败 10 次
 // 即作废（consumed=1）——与全局锁定开关无关的爆破收敛（分布式 IP 池对单个
 // 5 分钟挑战的尝试上限从「10/min/IP × N」收敛为固定 10 次）。
 const mfaChallengeFailThreshold = 10
@@ -225,8 +225,8 @@ func MFARestoreChallenge(token string, userID int) {
 // 历史收敛；调用方须持 mfaMu）：读取 secret 与重放状态——secret 为空报
 // 「用户未启用 MFA」（两入口同口径）；code 为 6 位时校验 TOTP，成功推进
 // mfa_last_timestep（重放防护：同窗或更早的已用片拒绝，±1 容差窗内；
-// S历史问题 状态写失败必须传播——吞错时同片码可在容差窗内重放换取新
-// 历史修复 窗）。返回 (true,nil)=通过；(false,nil)=码错误/重放/非 6 位；
+// 历史问题 状态写失败必须传播——吞错时同片码可在容差窗内重放换取新
+// step-up 窗）。返回 (true,nil)=通过；(false,nil)=码错误/重放/非 6 位；
 // (false,err)=查询/写库故障。
 func mfaVerifyTOTPLocked(userID int, code string, now time.Time) (bool, error) {
 	var secret string
@@ -288,7 +288,7 @@ func MFAVerifyCode(userID int, code string, now time.Time) (bool, error) {
 }
 
 // MFAVerifyTOTPCode 仅校验 6 位动态验证码（用户裁决 N+10：除登录与重置 MFA
-// 外的全部 MFA 入口——历史修复 写守卫链（含配置导入）、重新绑定确认段、
+// 外的全部 MFA 入口——verify-step 写守卫链（含配置导入）、重新绑定确认段、
 // 禁用确认——不接受恢复码。恢复码是一次性应急登录凭证，其「提交即消费」
 // 语义与高敏操作的二次校验/审计链不兼容，且不应作为操作授权凭证）。
 // 非 6 位输入与错误 TOTP 同按失败计（硬门冷却同样生效）；不触碰恢复码存储。
@@ -299,7 +299,7 @@ func MFAVerifyTOTPCode(userID int, code string, now time.Time) (bool, error) {
 }
 
 // MFAVerifyPending 绑定向导 activate 步：验证 pending secret 的当前码（无重放状态）。
-// U7a-历史问题（历史）：与 MFAVerifyCode/MFAVerifyTOTPCode 同容错——入口
+// 历史问题（历史）：与 MFAVerifyCode/MFAVerifyTOTPCode 同容错——入口
 // TrimSpace（粘贴带空格验证码此前恒败）。
 func MFAVerifyPending(userID int, code string, now time.Time) (bool, error) {
 	var pending string
@@ -331,7 +331,7 @@ func MFAActivate(userID int) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	// S历史问题:CAS 绑定已验 pending——验证(MFAVerifyPending)与激活两请求间
+	// 历史问题:CAS 绑定已验 pending——验证(MFAVerifyPending)与激活两请求间
 	// 并发 MFASetup 会覆盖 pending,无条件提升会把未经验码的新 secret 转正
 	// (用户 authenticator 持旧值 → MFA 永久不可用,自伤 DoS)。
 	result, err := db.DB.Exec(
@@ -349,8 +349,8 @@ func MFAActivate(userID int) ([]string, error) {
 
 // MFARegenerateRecoveryCodes 原地重生成恢复码（旧码全部作废），返回明文。
 func MFARegenerateRecoveryCodes(userID int) ([]string, error) {
-	// 历史问题 历史问题：与 MFAVerifyCode 同持 mfaMu——无锁时与恢复码消费的
-	// 历史修复 交错会把刚生成的 10 个新码静默作废。
+	// 历史问题：与 MFAVerifyCode 同持 mfaMu——无锁时与恢复码消费的
+	// read-then-write 交错会把刚生成的 10 个新码静默作废。
 	mfaMu.Lock()
 	defer mfaMu.Unlock()
 	codes, hashesJSON, err := mfaGenerateRecoveryCodes(mfaRecoveryCodeCount)
@@ -363,12 +363,12 @@ func MFARegenerateRecoveryCodes(userID int) ([]string, error) {
 	return codes, nil
 }
 
-// mfaPendingFailThreshold pending 验证失败作废阈值（历史问题 A-历史问题：与全局锁定
+// mfaPendingFailThreshold pending 验证失败作废阈值（历史问题：与全局锁定
 // 开关无关的硬闸——10^6 码空间在无限流端点上的暴力面由此收敛为 5 次机会）。
 const mfaPendingFailThreshold = 5
 
 // MFARecordPendingFailure 记一次 pending 验证失败；达阈值作废 pending 并返回 true。
-// S历史问题:单条原子条件 UPDATE(读-改-写双语句在并发爆破下丢更新,硬闸
+// 历史问题:单条原子条件 UPDATE(读-改-写双语句在并发爆破下丢更新,硬闸
 // 退化约 2 倍预算)——达阈值同语句清空 pending 并回写 0,以影响行数判定。
 func MFARecordPendingFailure(userID int) bool {
 	var reset int64
@@ -390,7 +390,7 @@ func MFAClearPendingFailures(userID int) {
 // MFAResetForUser 管理员重置：清全部 MFA 状态（secret/pending/恢复码/重放片，
 // pending 含失败计数）；登录锁定归重置密码路径。
 func MFAResetForUser(userID int) error {
-	// 历史问题 历史问题：同上——重置与消费交错时 '[]' 写回可复活已消费项（虽被 secret
+	// 历史问题：同上——重置与消费交错时 '[]' 写回可复活已消费项（虽被 secret
 	// 为空挡住，仍按串行化口径统一）。
 	mfaMu.Lock()
 	defer mfaMu.Unlock()
@@ -417,7 +417,7 @@ type MFAStatus struct {
 }
 
 // MFAGetStatus 读用户状态。
-// D2-历史问题（历史）：恢复码列解析失败是存储损坏，必须显性报错——
+// 历史问题（历史）：恢复码列解析失败是存储损坏，必须显性报错——
 // 此前吞掉 JSON 错误会展示「剩余 0 个」，掩盖损坏且与
 // mfaConsumeRecoveryCode 的三态口径分裂。
 func MFAGetStatus(userID int) (MFAStatus, error) {
@@ -434,12 +434,12 @@ func MFAGetStatus(userID int) (MFAStatus, error) {
 }
 
 // MFAWriteGuardEnabled 读全局写操作验证开关。
-// S历史问题（历史）：读取失败必须显式报错——旧实现返回 false 把「读不到」
+// 历史问题（历史）：读取失败必须显式报错——旧实现返回 false 把「读不到」
 // 降级为「开关关闭」且无任何留痕，与 MFALockoutEnabled 的 历史修复 裁定（读失败
 // 显式报错、调用方决定口径）分裂。调用方各自决定 历史修复/路由级
-// 历史修复 守卫按 SA1 裁定维持 历史修复（第二因子便利层，jwtAuth 已在前序
-// 历史修复 把关）但必须留痕；API Key 创建路径与相邻的 MFA 状态读取同口径
-// 历史修复（历史问题 C-历史问题）。
+// step-up 守卫按 SA1 裁定维持 fail-open（第二因子便利层，jwtAuth 已在前序
+// fail-closed 把关）但必须留痕；API Key 创建路径与相邻的 MFA 状态读取同口径
+// fail-closed（历史问题）。
 func MFAWriteGuardEnabled() (bool, error) {
 	var v int
 	if err := db.DB.QueryRow("SELECT COALESCE(mfa_write_guard,0) FROM global_config WHERE id=1").Scan(&v); err != nil {

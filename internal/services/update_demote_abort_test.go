@@ -1,6 +1,6 @@
 package services
 
-// F-历史问题-01（历史，历史问题）：demote 在途 Scheduled 中止——三库 Run 体的
+// 历史问题-01（历史）：demote 在途 Scheduled 中止——三库 Run 体的
 // runCtx 曾是独立 context.Background（crsupdate/ip2regionupdate/threatupdate），
 // 引擎 SetRole 对 Scheduled 在途的取消（rc.Ctx）传不进去，demote 后任务跑完、
 // 从节点写版本行/名单/规则树，打破只读不变量。修复：runCtx 派生自 rc.Ctx
@@ -213,7 +213,7 @@ func TestThreatRunUpdate_demoteOnLastSourceAbortsAsSkipped(t *testing.T) {
 	}
 }
 
-// A85历史问题-2：手动取消必须立即打断任务内重试，且 manager/DB/审计与
+// 历史问题：手动取消必须立即打断任务内重试，且 manager/DB/审计与
 // task_runs 同为 cancelled；不得重试后落 failed + 「更新失败」。
 func TestWireLibraryUpdates_manualCancelAlignsTerminalAndAudit(t *testing.T) {
 	tests := []struct {
@@ -490,7 +490,7 @@ func TestUpdateInstallEntryCancellationDoesNotWriteSuccess(t *testing.T) {
 	})
 }
 
-// 历史修复 历史问题（历史）：取消发生在树交换之后（重载阶段）时，交换段已把
+// 历史问题（历史）：取消发生在树交换之后（重载阶段）时，交换段已把
 // security_crs_version.version 与 live VERSION 落为新 tag——旧 cancel 路径只
 // 还原文件树（restoreBackup）不回滚版本行/标记，留下「旧树+新版本号」并被
 // 下轮 tag==current「已是最新」短路永久固化（ReconcileCRSState 因 liveV==dbV
@@ -546,6 +546,81 @@ func TestCRSUpdateRun_cancelDuringReloadRollsBackVersionRowAndMarker(t *testing.
 	}
 	if version != "v4.14.0" {
 		t.Fatalf("DB 版本行=%q, want v4.14.0（否则下轮被「已是最新」短路永久固化）", version)
+	}
+	if status != "cancelled" {
+		t.Fatalf("update_status=%q, want cancelled", status)
+	}
+}
+
+// 取消观察点用 updateRunStillMaster 做角色复核——DB 读
+// 失败被并入「非主节点」而跳过同代回滚；随后 run() 的 cancel(..., true) 走
+// restoreBackup 只还文件树、不还 VERSION 标记与 DB 版本行 → 「旧树+新版本行」
+// 被下轮 tag==current「已是最新」短路永久固化（ReconcileCRSState 因
+// liveV==dbV 也不修复——版本行没回滚，liveV 反而是旧的，对账会把 live 标
+// 记成新版本的假象固化）。修复=三态门 updateRunRoleAtCancel：!known（角色
+// 不可判定）按主节点口径执行同代回滚（主节点避免固化；真从节点多回滚一次
+// 由集群同步自愈）；known && !master（真降级）保持 历史问题-01 不回滚语义。
+//
+// 角色读失败形态：is_master 写入非布尔文本使 RoleOf 的 Scan 失败（DB 连接
+// 本身健康——回滚与 cancel 的版本行写入仍可用）。
+func TestCRSUpdateRun_cancelWithRoleReadFailureStillRollsBack(t *testing.T) {
+	m := newTestCRSManager(t)
+	seedCRSVersionRow(t, "v4.14.0", true)
+	writeTestFile(t, filepath.Join(m.crsDir, "rules", crsRulesProbeFile), "SecRule init")
+	writeTestFile(t, filepath.Join(m.crsDir, "rules", "REQUEST-OLD.conf"), "SecRule old")
+	writeTestFile(t, filepath.Join(m.crsDir, crsVersionFile), "v4.14.0\n")
+
+	m.fetchLatestTag = func(context.Context) (string, error) { return "v4.15.0", nil }
+	m.downloadTarball = fakeCRSDownload(t, map[string]string{
+		"coreruleset-4.15.0/crs-setup.conf.example":     "# new setup",
+		"coreruleset-4.15.0/rules/" + crsRulesProbeFile: "# init probe\n",
+		"coreruleset-4.15.0/rules/REQUEST-NEW.conf":     "SecRule new\n",
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m.reloader = func() error {
+		// 重载期间用户取消 + 角色读取故障（is_master 非布尔 → RoleOf Scan 失败）。
+		// 二次调用（cancel 路径的恢复重载）幂等。
+		if _, err := db.DB.Exec(`UPDATE global_config SET is_master='corrupt' WHERE id=1`); err != nil {
+			t.Errorf("corrupt role row: %v", err)
+		}
+		cancel()
+		return nil
+	}
+
+	done, err := m.StartUpdate("manual", &taskengine.RunContext{Ctx: ctx, Trigger: "manual"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("重载阶段取消后未退出")
+	}
+
+	if got := m.StatusSnapshot().Status; got != "cancelled" {
+		t.Fatalf("manager 终态=%q, want cancelled", got)
+	}
+	// 树必须回到更新前。
+	data, err := os.ReadFile(filepath.Join(m.crsDir, "rules", "REQUEST-OLD.conf"))
+	if err != nil || string(data) != "SecRule old" {
+		t.Fatalf("rules 树未回滚: %q,%v", data, err)
+	}
+	if _, err := os.Stat(filepath.Join(m.crsDir, "rules", "REQUEST-NEW.conf")); !os.IsNotExist(err) {
+		t.Fatal("新树残影 REQUEST-NEW.conf 不得留在 live")
+	}
+	// 角色不可判定时必须按主节点口径同代回滚：VERSION 标记与 DB 版本行
+	// 与树同代——旧形态跳回滚留下 v4.15.0，被下轮「已是最新」短路永久固化。
+	if got := readCRSVersionMarker(m.crsDir); got != "v4.14.0" {
+		t.Fatalf("VERSION 标记=%q, want v4.14.0（角色读失败跳回滚 → 旧树+新标记固化）", got)
+	}
+	var version, status string
+	if err := db.DB.QueryRow(`SELECT version, COALESCE(update_status,'') FROM security_crs_version WHERE id=1`).Scan(&version, &status); err != nil {
+		t.Fatal(err)
+	}
+	if version != "v4.14.0" {
+		t.Fatalf("DB 版本行=%q, want v4.14.0（角色读失败跳回滚 → 旧树+新版本行被「已是最新」短路永久固化）", version)
 	}
 	if status != "cancelled" {
 		t.Fatalf("update_status=%q, want cancelled", status)

@@ -10,7 +10,7 @@
       </div>
     </div>
 
-    <!-- W87-04：历史问题-F5 家族口径——列表失败必须显性化（「暂无操作日志」不得
+    <!-- 历史修复：历史问题家族口径——列表失败必须显性化（「暂无操作日志」不得
          同时代表空库与故障），并给重试入口。 -->
     <el-alert v-if="loadError" type="error" :closable="false" show-icon class="polling-error-alert error-banner">
       <template #title>
@@ -50,7 +50,7 @@
           <el-button type="primary" @click="applyFilters">筛选</el-button>
           <el-button @click="resetFilters">重置</el-button>
         </div>
-        <!-- W87-13：消费后端 partial=true（部分下拉）与整体失败——下拉缺项必须可见，
+        <!-- 历史修复：消费后端 partial=true（部分下拉）与整体失败——下拉缺项必须可见，
              且不得与「真空库」混淆。 -->
         <el-text v-if="optionsIncomplete" type="warning" size="small">
           筛选选项未完整加载，下拉列表可能缺项
@@ -135,9 +135,9 @@ const filters = ref({
 const usernameOptions = ref<string[]>([])
 const actionOptions = ref<string[]>([])
 const resourceOptions = ref<string[]>([])
-// W87-04：列表请求失败与「确实没有日志」必须可区分（历史问题-F5 家族漏点）。
+// 历史修复：列表请求失败与「确实没有日志」必须可区分（历史问题家族漏点）。
 const loadError = ref(false)
-// W87-13：后端在任一 option 查询失败时下发 partial=true（auditlog.go）——原实现
+// 历史修复：后端在任一 option 查询失败时下发 partial=true（auditlog.go）——原实现
 // 只映射三列、把「部分下拉」渲染成「下拉为空」。optionsError 覆盖请求整体失败。
 const optionsPartial = ref(false)
 const optionsError = ref(false)
@@ -171,7 +171,7 @@ const resetFilters = () => {
   fetchLogs()
 }
 
-// 历史 历史问题:表驱动(原 60+ 字面量 if 链——后端新增动作词时手改链易漏)
+// 历史问题:表驱动(原 60+ 字面量 if 链——后端新增动作词时手改链易漏)
 const ACTION_TAG_TABLE: Record<string, string> = {
   '删除': 'danger',
   '检测失败': 'danger',

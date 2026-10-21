@@ -16,7 +16,7 @@ import (
 // 校验——TCP+cookie 等 HTTP 专属策略、TCP+dynamic_dns(渲染整跳过)、同端口
 // 双启用 TCP 规则均可经存量/直改 DB 进入启用态。
 
-// LB42-2:存量 tcp+cookie 规则 EnableRule 期望 400(与保存门 rule_features.go
+// 历史修复:存量 tcp+cookie 规则 EnableRule 期望 400(与保存门 rule_features.go
 // 策略白名单同口径;现行 200 把 cookie 透传到 L4 渲染被静默忽略)。
 func TestEnableRule_rejectsTCPRuleWithHTTPOnlyStrategy(t *testing.T) {
 	// Given
@@ -42,7 +42,7 @@ func TestEnableRule_rejectsTCPRuleWithHTTPOnlyStrategy(t *testing.T) {
 	}
 }
 
-// LB42-3①:存量 tcp+dynamic_dns 规则(渲染整跳过形态)EnableRule 期望 400;
+// 历史修复①:存量 tcp+dynamic_dns 规则(渲染整跳过形态)EnableRule 期望 400;
 // 聚合校验同样点名。
 func TestEnableRule_rejectsTCPRuleWithDynamicDNS(t *testing.T) {
 	// Given
@@ -61,7 +61,7 @@ func TestEnableRule_rejectsTCPRuleWithDynamicDNS(t *testing.T) {
 	}
 }
 
-// LB42-3②:存量两条同端口 TCP 均启用(兜 validatePortFromDB 之前的存量双
+// 历史修复②:存量两条同端口 TCP 均启用(兜 validatePortFromDB 之前的存量双
 // 启用),聚合校验必须报错并点名全部冲突规则。
 func TestValidateEnabledStoredRuleConfigs_namesDuplicateTCPPortRules(t *testing.T) {
 	// Given
@@ -81,7 +81,7 @@ func TestValidateEnabledStoredRuleConfigs_namesDuplicateTCPPortRules(t *testing.
 	}
 }
 
-// LB42-3① 聚合形态:tcp+dynamic_dns 启用存量在聚合校验点名。
+// 历史修复① 聚合形态:tcp+dynamic_dns 启用存量在聚合校验点名。
 func TestValidateEnabledStoredRuleConfigs_namesTCPDynamicDNS(t *testing.T) {
 	// Given
 	initializeRuleFeatureTestDB(t)

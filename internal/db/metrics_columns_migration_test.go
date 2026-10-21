@@ -4,7 +4,7 @@ import (
 	"testing"
 )
 
-// S-6/S-7（2026-09-05/06 审计裁定）：global_config 的 metrics_public /
+// 历史修复（2026-09-05/06 审计裁定）：global_config 的 metrics_public /
 // metrics_origins（零消费死列）与 metrics_retention_days（指标保留期已改用
 // audit_retention_months，2026-09-06 裁定）三列迁移删除。契约：①存量库迁移
 // 删除且幂等、行数据存活；②新库经 createTables+runMigrations 全流程后不再

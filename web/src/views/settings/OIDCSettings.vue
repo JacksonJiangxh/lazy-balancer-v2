@@ -6,7 +6,7 @@
       <DialogHeader :icon="Connection" title="登录认证（OIDC）"
         :subtitle="loadFailed ? '配置读取失败' : configured ? (enabled ? '已启用——登录页展示认证服务入口' : '已配置未启用') : '配置企业认证服务,本地账号登录始终保留'" />
     </template>
-    <!-- WS-15：读取失败显性化（此前静默呈现上一轮残留状态或空白表单） -->
+    <!-- 历史修复：读取失败显性化（此前静默呈现上一轮残留状态或空白表单） -->
     <el-alert v-if="loadFailed" type="error" :closable="false" show-icon class="mb12"
       title="OIDC 配置读取失败——当前按「未配置」展示，读取成功前无法保存；请关闭弹框后重试" />
     <div v-else-if="!configured" class="info-note-bar"><span class="info-note-desc">通过企业认证服务（OIDC）登录——配置仅 3 项，端点自动发现；本地账号登录始终保留。</span></div>
@@ -161,7 +161,7 @@ const loadSlaves = async () => {
       })
   } catch { /* 单机部署或非主节点——只显示本节点 */ }
 }
-// 历史问题/历史问题:弹框打开时才拉取(懒加载),且每次重开刷新——挂载即拉会令
+// 历史问题:弹框打开时才拉取(懒加载),且每次重开刷新——挂载即拉会令
 // Users 页每次访问多发 2 请求(从节点 /cluster/nodes 必 403 白跑),重开
 // 不刷新会让陈旧 probe.ok 绕过重测直接保存(多人管理脏写)。
 watch(() => props.modelValue, (open) => {
@@ -171,7 +171,7 @@ watch(() => props.modelValue, (open) => {
 
 const notify = () => emit('status', { enabled: enabled.value, configured: configured.value })
 
-// WS-15：读取失败不得沿用上一轮残留状态（二次打开弹框 GET 失败时仍显示
+// 历史修复：读取失败不得沿用上一轮残留状态（二次打开弹框 GET 失败时仍显示
 // 「已启用/删除配置/暂停使用」，父级标签也被回填旧值）。catch 清空为未配置态
 // 并显性提示；保存门同时拦截，避免用户以「空表单」覆盖现有配置。
 const loadFailed = ref(false)
@@ -253,7 +253,7 @@ const doRunProbe = async (values: OidcProbeValues, token: OidcProbeToken): Promi
   }
 }
 
-// WS-14：已通过且表单值未变时直接复用结果——原每次失焦都触发一次 discovery+
+// 历史修复：已通过且表单值未变时直接复用结果——原每次失焦都触发一次 discovery+
 // JWKS（+ 可选凭证校验）外部请求，字段间来回切换会重复打 IdP。
 const probeOnBlur = () => {
   if (!form.issuer.trim() && !probe.checked) return
@@ -276,7 +276,7 @@ const test = async () => {
 }
 
 const save = async () => {
-  // WS-11/WS-15：函数级守卫 + 读取未成功时禁止保存（空表单会覆盖现有配置）
+  // 历史修复：函数级守卫 + 读取未成功时禁止保存（空表单会覆盖现有配置）
   if (isReadOnly.value || saving.value) return
   if (loadFailed.value) { ElMessage.warning('OIDC 配置读取失败，请关闭弹框后重试'); return }
   if (!form.issuer.trim()) { ElMessage.warning('请填写服务地址'); return }
@@ -343,7 +343,7 @@ const remove = async () => {
 }
 
 const copy = async (text: string) => {
-  // FE42-7：复用 utils/copy 的 copyText（clipboard API + textarea 降级双通道，与全站一致）。
+  // 历史修复：复用 utils/copy 的 copyText（clipboard API + textarea 降级双通道，与全站一致）。
   if (await copyText(text)) {
     ElMessage.success('已复制')
     return

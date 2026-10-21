@@ -1,8 +1,8 @@
 package taskengine
 
 // 历史域 A（rows.Err 家族收敛，taskengine 侧）：
-//   - TASK-A3：History 迭代错误/Scan 失败须 warn 留痕（此前静默 continue）
-//   - LNK71-2：Stats24hHourlySeries 同族（与 services/certificates.go 的
+//   - 历史修复：History 迭代错误/Scan 失败须 warn 留痕（此前静默 continue）
+//   - 历史修复：Stats24hHourlySeries 同族（与 services/certificates.go 的
 //     reconcileMissingCertFiles 正面对照——本文件两处为此前唯二漏网点）
 
 import (
@@ -97,7 +97,7 @@ func captureEngineLog(t *testing.T) *strings.Builder {
 	return &buf
 }
 
-// TASK-A3（历史 历史问题）：History 循环 rows.Err() 未检查——迭代错误表现为
+// 历史修复（历史问题）：History 循环 rows.Err() 未检查——迭代错误表现为
 // 「部分历史 + 静默」；Scan 失败同样静默 continue。修复：两者均 warn 留痕
 // （返回形状不变——历史页降级展示已读行，与 taskmonitor 读取侧容错一致）。
 func TestEngine_History_iterationErrorWarns(t *testing.T) {
@@ -119,8 +119,8 @@ func TestEngine_History_iterationErrorWarns(t *testing.T) {
 	}
 }
 
-// LNK71-2（历史 历史问题）：Stats24hHourlySeries 聚合循环 rows.Err() 未检查+
-// Scan 静默——TASK-1（历史）同批触碰未同步收敛。修复：warn 留痕，24 桶
+// 历史修复（历史问题）：Stats24hHourlySeries 聚合循环 rows.Err() 未检查+
+// Scan 静默——历史修复（历史）同批触碰未同步收敛。修复：warn 留痕，24 桶
 // 零填形状不变（图表降级为空序列，不崩不缺桶）。
 func TestEngine_Stats24hHourlySeries_iterationErrorWarns(t *testing.T) {
 	e := newTestEngine(t)

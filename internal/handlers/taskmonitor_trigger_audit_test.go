@@ -1,6 +1,6 @@
 package handlers
 
-// 历史问题-1（历史，历史问题）：7/12 可手动触发族手动触发在 audit_log 无痕——
+// 历史问题-1（历史）：7/12 可手动触发族手动触发在 audit_log 无痕——
 // AuditPolicySkip 的前提「任务体 defer 单记审计」（历史问题 时仅 3 自记族）随 v2.0
 // 可触发族扩容失效：现 12 族中 5 族自记（threat/crs/ip2region 任务体 defer +
 // auto-backup 执行器 + startup:config-load 载入审计），7 族任务体零审计
@@ -86,7 +86,7 @@ func countTriggerFailAudit(t *testing.T) int {
 	return n
 }
 
-// F-历史问题+F-历史问题（历史）：四处 go 闭包 te.Trigger 错误被吞——非自记族已
+// 历史问题+历史问题（历史）：四处 go 闭包 te.Trigger 错误被吞——非自记族已
 // 补记「触发」但 Trigger 失败时任务未执行，审计只剩孤儿行；自记族零痕迹。
 // 修复：go 内 err 非 nil 时补记「触发失败」审计+日志（operator 闭包外预取——
 // gin.Context 在 handler 返回后被复用，闭包内读是竞态）。
@@ -114,7 +114,7 @@ func TestTriggerSystemTask_triggerFailureLeavesCompensationAudit(t *testing.T) {
 	t.Fatal("Trigger 失败路径零补偿审计——任务未执行/失败无痕（孤儿审计）")
 }
 
-// TASK-2（历史 历史问题）：手动触发 409 预检（IsTaskInFlight）与异步 goroutine
+// 历史修复（历史）：手动触发 409 预检（IsTaskInFlight）与异步 goroutine
 // Trigger 之间无原子性——并发双击两请求均可过预检，后到者在引擎 CAS 落败拿
 // ErrAlreadyRunning：任务实际已由先到请求启动，落「触发失败」审计是语义
 // 失真（用户看到失败而任务在跑）。修复：该错误在 goroutine 内静默。
@@ -188,14 +188,14 @@ func TestTriggerSystemTask_doubleClickRaceNoMisleadingFailAudit(t *testing.T) {
 	}
 	if !materialized {
 		// 回归必须触达 ErrAlreadyRunning 补偿分支；跳过会让该断言在
-		// 慢速/单核 CI 上永久假绿（历史 B3-历史问题）。
+		// 慢速/单核 CI 上永久假绿（历史）。
 		t.Fatal("50 次尝试内双击竞态未成形（预检均拦截）——未验证到目标分支")
 	}
 }
 
-// LNK71-1（历史 历史问题）：手动触发落在 skipped 终态时仍落「触发失败」审计
-// ——threat/crs/ip2region Run 体 demote 中止返回 ErrTaskSkipped（TASK-L5
-// 哨兵，task_runs 已落 skipped 行），TASK-2 修 ErrAlreadyRunning 时同族扫描
+// 历史修复（历史）：手动触发落在 skipped 终态时仍落「触发失败」审计
+// ——threat/crs/ip2region Run 体 demote 中止返回 ErrTaskSkipped（历史修复
+// 哨兵，task_runs 已落 skipped 行），历史修复 修 ErrAlreadyRunning 时同族扫描
 // 未延伸到该哨兵。skipped=「非故障放弃」，复记「触发失败」是语义失真
 // （用户看到失败而任务体明确声明放弃）。修复：goroutine 内静默
 // （镜像 ErrAlreadyRunning 分支）。

@@ -257,7 +257,7 @@ func TestServeHTTP_setsCorazaHeaders_forKnownIP(t *testing.T) {
 
 // TestServeHTTP_overseasSentinels_forUnresolvableClient：fail-closed 哨兵——
 // 不可解析客户端（IPv6 对 v4-only xdb 查询失败）全头发空串、X-LB-GeoIP-Loc 恒
-// 「海外」（deny 模式海外策略对其拦截，与 D1 裁决一致）。
+// 「海外」（deny 模式海外策略对其拦截，与 历史修复 裁决一致）。
 func TestServeHTTP_overseasSentinels_forUnresolvableClient(t *testing.T) {
 	xdb := findTestXdb()
 	if xdb == "" {
@@ -339,7 +339,7 @@ func TestServeHTTP_overseasEmitsCountryName(t *testing.T) {
 	}
 }
 
-// TestGeoipLocFor_trimsChinaCountryColumn（X4，历史）：国家列「中国」判定
+// TestGeoipLocFor_trimsChinaCountryColumn（历史修复，历史）：国家列「中国」判定
 // TrimSpace 对称——树侧收集判定本就 Trim（ip2region.go），发射侧此前裸比较
 // （" 中国" 异形行走海外分支后 NormalizeCountry 折叠出「中国」串发射，匹配
 // 键恒不命中）。国内 → 省/省-市；海外 → 归一化国名；不可解析 → 哨兵。
@@ -361,7 +361,7 @@ func TestGeoipLocFor_trimsChinaCountryColumn(t *testing.T) {
 	}
 }
 
-// E83-历史问题：发射侧国家列 TrimSpace——变量/头/统计桶与 geoipLocFor 同口径。
+// 历史问题：发射侧国家列 TrimSpace——变量/头/统计桶与 geoipLocFor 同口径。
 // 空白异形行（" 中国"）修复前出现 Loc=广东省 但 country_name=" 中国" 的
 // 自相矛盾取值。
 func TestParseGeoIPRegion_trimsCountryForEmission(t *testing.T) {
@@ -393,7 +393,7 @@ func TestParseGeoIPRegion_trimsCountryForEmission(t *testing.T) {
 	}
 }
 
-// TestParseGeoIPRegion_noCityWithoutProvince（PL历史问题 核实结论）：随包三份
+// TestParseGeoIPRegion_noCityWithoutProvince（历史问题 核实结论）：随包三份
 // xdb（caddygeoip/testdata、data/、data-slave/，各 553,954+ 段全量扫描）中
 // 「国家=中国 + 省列无效 + 城市列有效」的行数为 0——省列无效的 13 种 region
 // 串（如「中国|0|0|阿里|CN」）城市列同为 0/空。因此不会发射树侧不可表达的
@@ -430,7 +430,7 @@ func TestParseGeoIPRegion_noCityWithoutProvince(t *testing.T) {
 	}
 }
 
-// TestProvision_sharedSearcherSingletonPerXdbPath（审计 M2）：同 XdbPath 的
+// TestProvision_sharedSearcherSingletonPerXdbPath（历史修复）：同 XdbPath 的
 // 多个 handler 必须共享同一 Ip2Region 实例——每 handler 各建一份会各开 20 个
 // searcher fd（50 条 GeoIP 规则≈1000 fd 逼近 soft limit，重载期翻倍），fd 耗尽
 // → Provision 降级 pass-through → 全客户端判「海外」误拦。指针同一即证明
@@ -595,7 +595,7 @@ func TestRealClientIP_ignoresUntrustedProxyHeadersAndStripsPort(t *testing.T) {
 }
 
 func TestNormalizeCity_pinyinMappedAndPassthrough(t *testing.T) {
-	// 历史问题 二十五次：发射侧城市列规范化——拼音段映射为规范中文（策略树侧同款
+	// 历史问题：发射侧城市列规范化——拼音段映射为规范中文（策略树侧同款
 	// 表，城市级 CEL 规则对拼音段可命中）；中文原样通过；无效值置空。
 	cases := map[string]string{
 		"Guangzhou Shi": "广州市",
@@ -627,7 +627,7 @@ func TestNormalizeProvince_taiwanCityPromotion(t *testing.T) {
 }
 
 func TestNormalizeCity_autonomousPrefecture(t *testing.T) {
-	// 历史问题 二十八次（用户反馈）：少数民族自治州简称 → 全称（与树侧同款表
+	// 历史问题（用户反馈）：少数民族自治州简称 → 全称（与树侧同款表
 	// 同步）；「大理市」是另一个县级市，全称必须是「大理白族自治州」。
 	cases := map[string]string{
 		"大理":   "大理白族自治州",
@@ -646,13 +646,13 @@ func TestNormalizeCity_autonomousPrefecture(t *testing.T) {
 	}
 }
 
-// TestSharedGeoIPSearcher_statFailureEvictsCachedEntry（PLUG-N2，历史）：
+// TestSharedGeoIPSearcher_statFailureEvictsCachedEntry（历史修复，历史）：
 // stat 失败（xdb 更新 rename 窗口/文件被删）且缓存持有该路径条目时，条目
 // 必须驱逐——旧实例走既有 AfterFunc 延迟关闭（在途查询保护与换库路径一致）。
 // 不驱逐时旧 inode 实例永久占据缓存槽：stat 失败路径原样 return err 不碰
 // 缓存，文件以「同 modtime+size」形态恢复（rsync -a/touch -r 保时间戳重铺）
 // 时缓存命中判定通过，被删 inode 的旧库被无限期当有效数据服务（更新静默
-// 失效——恰是 M2 缓存条目要防的形态）。
+// 失效——恰是 历史修复 缓存条目要防的形态）。
 func TestSharedGeoIPSearcher_statFailureEvictsCachedEntry(t *testing.T) {
 	src := findTestXdb()
 	if src == "" {
@@ -724,7 +724,7 @@ func TestSharedGeoIPSearcher_statFailureEvictsCachedEntry(t *testing.T) {
 	}
 }
 
-// E81-历史问题：xdb 带外损坏（文件形态变化但重建失败）时不得让 Provision 收到
+// 历史问题：xdb 带外损坏（文件形态变化但重建失败）时不得让 Provision 收到
 // error 而降级 pass-through（全部客户端判「海外」→ deny 海外全量误拦）；
 // 必须 fail-stale 继续服务缓存旧实例（与 wafiplist 的 fail-stale 对称）。
 func TestSharedGeoIPSearcher_rebuildFailureServesStale(t *testing.T) {
@@ -784,7 +784,7 @@ func TestSharedGeoIPSearcher_rebuildFailureServesStale(t *testing.T) {
 	}
 }
 
-// ---- 历史 历史问题 / 历史问题 ----
+// ---- 历史问题 ----
 
 const googlebotUA = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
 

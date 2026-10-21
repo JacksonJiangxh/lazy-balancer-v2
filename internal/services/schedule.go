@@ -26,7 +26,7 @@ const (
 	defaultScheduleTime = "04:00"
 )
 
-// 排程槽推进门共享 SQL 片段（SEC-历史问题，历史）：仅 auto 触发且现存
+// 排程槽推进门共享 SQL 片段（历史问题，历史）：仅 auto 触发且现存
 // 槽空/过期才推进——手动触发不动预约、未来槽不回拨。此前同一谓词在
 // CRS/IP2Region/威胁情报三族 8 处内联重复（历史同型漏同步两起），此处收敛
 // 为单一事实源；参数序恒为「触发来源（?='auto'）、下一槽值（?）」。
@@ -199,7 +199,7 @@ func logScheduleReadRecovered(key string) {
 // versionTableNextUpdate 读版本表当前排程槽（空串=未排程）——历史修复 同批，
 // 引擎 NextSlotFn 的 DB 直读数据源（不经管理器实例）。
 func versionTableNextUpdate(table string) string {
-	// 历史修复（历史）：nil 库守卫——NextSlotFn 历史修复（零值槽）。
+	// 历史修复（历史）：nil 库守卫——NextSlotFn fail-closed（零值槽）。
 	if db.DB == nil {
 		return ""
 	}
@@ -220,7 +220,7 @@ func versionTableNextSlot(table string, now time.Time) string {
 	return NextScheduledSlot(now, days, hhmm, CurrentLocation()).UTC().Format(crsTimeLayout)
 }
 
-// versionTableAutoUpdateEnabled 读版本表自动更新开关（读错 历史修复）。
+// versionTableAutoUpdateEnabled 读版本表自动更新开关（读错 fail-closed）。
 func versionTableAutoUpdateEnabled(table string) bool {
 	if db.DB == nil {
 		return false

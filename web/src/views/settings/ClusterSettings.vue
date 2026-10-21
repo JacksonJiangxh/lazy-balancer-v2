@@ -231,7 +231,7 @@ const nodeConfigDialogVisible = ref(false)
 const editingNodeConfig = ref<ClusterNode | null>(null)
 const nodeConfigSaving = ref(false)
 const registrationRequest = ref(0)
-// WS-17：注册请求被主节点受理后递增——子组件据此清空已消耗的一次性令牌
+// 历史修复：注册请求被主节点受理后递增——子组件据此清空已消耗的一次性令牌
 //（取消确认或请求失败时令牌仍可能有效，必须保留）。
 const registrationSucceeded = ref(0)
 const tokenDialogVisible = ref(false)
@@ -274,7 +274,7 @@ const openServiceControlDialog = (node: ClusterNode): void => {
 const executeServiceControl = async (): Promise<void> => {
   if (isReadOnlyProp.value) return
   if (!serviceControlNode.value || !serviceControlAction.value) return
-  // WS-04：占位先于确认——双击「执行操作」不再叠加两个确认框/重复下发。
+  // 历史修复：占位先于确认——双击「执行操作」不再叠加两个确认框/重复下发。
   if (serviceControlLoading.value) {
     ElMessage.warning('服务控制请求正在执行，请稍候')
     return
@@ -311,7 +311,7 @@ const executeServiceControl = async (): Promise<void> => {
 const forgetNodePin = async (): Promise<void> => {
   const node = serviceControlNodeLive.value
   if (isReadOnlyProp.value || !node || nodePinForgetting.value) return
-  // WS-04：占位先于确认（原确认后才置位——双击叠加确认框/重复请求）
+  // 历史修复：占位先于确认（原确认后才置位——双击叠加确认框/重复请求）
   nodePinForgetting.value = true
   try {
     const confirmed = await confirmAction(
@@ -343,7 +343,7 @@ const fetchStatus = async (roundSignal?: AbortSignal): Promise<ClusterStatus> =>
   const requestSeq = ++requestSequence
   const response = await request.get<APIResponse<ClusterStatus>>('/cluster/status', { signal: roundSignal ?? clusterPolling.signal, silent: true })
   const data = response.data
-  // FE40-D1-4：协议违例用 TypeError（Error 保留给业务失败）。
+  // 历史修复：协议违例用 TypeError（Error 保留给业务失败）。
   if (!data) throw new TypeError('集群状态响应缺少数据')
   if (!disposed && requestSeq === requestSequence) {
     status.value = data
@@ -432,7 +432,7 @@ const promoteToMaster = async (): Promise<void> => {
 
 const syncNow = async (): Promise<void> => {
   if (isReadOnlyProp.value) return
-  // WS-04：占位先于确认——双击「立即同步」不再叠加确认框或重复拉取。
+  // 历史修复：占位先于确认——双击「立即同步」不再叠加确认框或重复拉取。
   if (syncing.value) {
     ElMessage.warning('同步请求正在执行，请稍候')
     return
@@ -464,7 +464,7 @@ const syncNow = async (): Promise<void> => {
 const forgettingPins = ref(false)
 const forgetPins = async (): Promise<void> => {
   if (isReadOnlyProp.value) return
-  // WS-04：占位先于确认（原确认后才置位——双击叠加确认框/重复请求）
+  // 历史修复：占位先于确认（原确认后才置位——双击叠加确认框/重复请求）
   if (forgettingPins.value) {
     ElMessage.warning('清除指纹请求正在执行，请稍候')
     return
@@ -507,7 +507,7 @@ const generateRegisterToken = async (): Promise<void> => {
 const copyRegisterToken = async (): Promise<void> => {
   const token = registerToken.value?.token
   if (!token) return
-  // FE40-D1-3：复用 utils/copy 的 copyText（降级路径/类型收口与全站一致）。
+  // 历史修复：复用 utils/copy 的 copyText（降级路径/类型收口与全站一致）。
   const ok = await copyText(token)
   if (ok) {
     mfaAwareSuccess('注册令牌已复制')
@@ -524,7 +524,7 @@ const syncSwitchLabels: Record<string, string> = {
 
 const updateSyncField = async (field: string, value: boolean): Promise<void> => {
   if (isReadOnlyProp.value) return
-  // WS-04：占位先于确认（双击开关不再叠加确认框/重复 PUT）；取消路径回读状态
+  // 历史修复：占位先于确认（双击开关不再叠加确认框/重复 PUT）；取消路径回读状态
   // 复位开关显示。
   if (settingsLoading.value) {
     ElMessage.warning('同步设置正在保存，请稍候')
@@ -569,7 +569,7 @@ const updateSyncInterval = async (value: number): Promise<void> => {
   }
 }
 
-// WS-04：「入口取占位 → 确认 → 请求 → finally 释放」。占位（pendingNodeId）必须
+// 历史修复：「入口取占位 → 确认 → 请求 → finally 释放」。占位（pendingNodeId）必须
 // 先于确认弹框取得——原实现在确认之后才占位，双击审批/拒绝/删除会叠加两个确认框，
 // 确认第二个时动作被静默丢弃（用户以为已处理）。与 TaskMonitor.runTaskAction
 // （历史问题）同范式。
@@ -615,7 +615,7 @@ const confirmAndRunNodeAction = async (
   }
 }
 
-// 历史问题 D-N1：审批是三个节点操作中安全面最大的「信任授予」动作（确认后外部节点
+// 历史问题：审批是三个节点操作中安全面最大的「信任授予」动作（确认后外部节点
 // 入集群并开始同步），与拒绝/删除对称补二次确认，防 pending 列表误点。
 const approveNode = (node: ClusterNode): Promise<void> =>
   confirmAndRunNodeAction(node, 'approve', `确定确认节点“${node.name}”加入集群吗？确认后该节点将开始同步。`, '审批确认')
@@ -769,7 +769,7 @@ onUnmounted(() => {
 .equal-height-row :deep(.el-card__body) { height: 100%; box-sizing: border-box; }
 .cluster-settings { display: flex; flex-direction: column; gap: 20px; }
 .polling-error-alert { align-self: stretch; }
-/* .polling-error-title/.polling-error-meta 已收敛 main.css（FE-R2） */
+/* .polling-error-title/.polling-error-meta 已收敛 main.css（历史修复） */
 .token-box { display: flex; align-items: center; gap: 12px; margin-top: 4px; padding: 14px; border-radius: var(--radius-md); background: var(--bg-secondary); border: 1px dashed var(--border-color, #dcdfe6); }
 .token-expiry { margin-top: 10px; }
 

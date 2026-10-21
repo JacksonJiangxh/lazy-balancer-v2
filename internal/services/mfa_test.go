@@ -184,7 +184,7 @@ func TestMFAChallengeLifecycle(t *testing.T) {
 	}
 }
 
-// B3-82-历史问题：执行错误必须与「行未更新」分判，调用方才能区分 DB 故障 500
+// 历史修复：执行错误必须与「行未更新」分判，调用方才能区分 DB 故障 500
 // 与正常挑战失效 401。
 func TestMFAConsumeChallenge_returnsExecutionError(t *testing.T) {
 	mfaTestEnv(t)
@@ -217,7 +217,7 @@ func TestMFAResetForUser(t *testing.T) {
 	if st.Enabled {
 		t.Fatal("reset must disable mfa")
 	}
-	// U6a-2：pending 失败计数随重置一并清零（原死断言 if locked := false 的
+	// 历史修复：pending 失败计数随重置一并清零（原死断言 if locked := false 的
 	// 替换——锁定本就归重置密码路径，此处钉住 reset 对 MFA 自有状态的覆盖）。
 	var enabled, pendingFails int
 	if err := db.DB.QueryRow("SELECT mfa_enabled, COALESCE(mfa_pending_fails,0) FROM users WHERE id=6").Scan(&enabled, &pendingFails); err != nil {
@@ -246,7 +246,7 @@ func TestMFAWriteGuardEnabled(t *testing.T) {
 	if enabled, err = MFAWriteGuardEnabled(); err != nil || !enabled {
 		t.Fatalf("toggle read: enabled=%v err=%v", enabled, err)
 	}
-	// S历史问题：读取失败必须显式报错，不得静默降级为「开关关闭」（fail-open）。
+	// 历史问题：读取失败必须显式报错，不得静默降级为「开关关闭」（fail-open）。
 	if _, err := db.DB.Exec("DELETE FROM global_config WHERE id=1"); err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +255,7 @@ func TestMFAWriteGuardEnabled(t *testing.T) {
 	}
 }
 
-// U7a-历史问题（历史）：三个 TOTP 验证器输入容错须一致——MFAVerifyCode/
+// 历史问题（历史）：三个 TOTP 验证器输入容错须一致——MFAVerifyCode/
 // MFAVerifyTOTPCode 均先 TrimSpace，MFAVerifyPending 缺失，绑定向导 activate
 // 步粘贴带空格验证码恒失败。
 func TestMFAVerifyPending_trimsWhitespace(t *testing.T) {
@@ -383,7 +383,7 @@ func TestMFARestoreChallenge_invalidatedChallengeStaysDead(t *testing.T) {
 	}
 }
 
-// D2-历史问题（历史）：MFAGetStatus 对恢复码存储损坏必须显性报错，
+// 历史问题（历史）：MFAGetStatus 对恢复码存储损坏必须显性报错，
 // 不得以「剩余 0 个」掩盖（与 mfaConsumeRecoveryCode 的三态口径一致）。
 func TestMFAGetStatus_reportsCorruptedRecoveryCodes(t *testing.T) {
 	mfaTestEnv(t)

@@ -104,7 +104,7 @@ func TestFastFile_Truncated(t *testing.T) {
 	}
 }
 
-// PLUG-L1（历史 历史问题）：腐化 bits/乱序条目静默破坏二分判定——ReadFastFile
+// 历史修复（历史问题）：腐化 bits/乱序条目静默破坏二分判定——ReadFastFile
 // 必须校验 bits 范围（v4≤32/v6≤128）与地址非降序不变量，响亮拒绝腐化文件。
 func TestFastFile_CorruptedBitsRejected(t *testing.T) {
 	dir := t.TempDir()
@@ -139,7 +139,7 @@ func TestFastFile_UnorderedRejected(t *testing.T) {
 	}
 }
 
-// PL-1（历史 历史问题）：升序校验不验「嵌套/同址不同 bits」形态——
+// 历史修复（历史问题）：升序校验不验「嵌套/同址不同 bits」形态——
 // 10.0.0.0/16 与其子段 10.0.1.0/24 地址升序却互相包含，二分可被窄段遮蔽
 // 返回假阴性（「可加载但查询错误」正是 WriteFastFile 注释定义的最坏静默
 // 腐化形态）。须响亮拒绝。
@@ -198,7 +198,7 @@ func TestFastFile_NestedPrefixesRejected(t *testing.T) {
 	}
 }
 
-// E83-历史问题：读侧必须校验主机位已掩码——.fast 是跨进程输入（节点回传），
+// 历史问题：读侧必须校验主机位已掩码——.fast 是跨进程输入（节点回传），
 // 单条未掩码条目可通过 bits/升序/嵌套全部校验，却让二分查询用未掩码地址
 // 比较而假阴性（威胁名单静默漏拦）。
 func TestFastFile_UnmaskedEntriesRejected(t *testing.T) {
@@ -248,7 +248,7 @@ func TestFastFile_UnmaskedEntriesRejected(t *testing.T) {
 	}
 }
 
-// 历史修复 历史问题（历史）：ReadFastFile 对跨进程 .fast 输入必须先过 Stat
+// 历史问题（历史）：ReadFastFile 对跨进程 .fast 输入必须先过 Stat
 // 体积门再读字节——异常/恶意超大文件不得在读取阶段就拖垮内存（文本名单
 // 路径已有 MaxFileBytes 同型硬上限，iplistfast.go:249-250）。
 func TestFastFile_ReadSizeCap(t *testing.T) {

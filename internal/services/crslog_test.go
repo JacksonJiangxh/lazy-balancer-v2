@@ -10,7 +10,7 @@ import (
 )
 
 // 历史问题-2/历史问题：旧 crs-update.log 已退役——WriteCRSUpdateLog 唯一落点=
-// tasks/crs.log（tee 单点；SEC-历史问题 历史收敛后写口导出、无 Append* 别名）。
+// tasks/crs.log（tee 单点；历史问题收敛后写口导出、无 Append* 别名）。
 // 本钉测双守卫：①单点写入口径（曾双写）恰 1 行/次；②旧文件不再产生。
 func TestWriteCRSUpdateLog_singleSinkNoDoubleTee(t *testing.T) {
 	dir := t.TempDir()
@@ -58,7 +58,7 @@ func TestTaskLogsHousekeeping_retentionOnlyDoesNotRotate(t *testing.T) {
 	}
 }
 
-// 历史问题-1 收尾（历史 C2 残余收口）：certjobs/ 尺寸轮转归写入侧预写入轮转
+// 历史问题-1 收尾（历史修复 残余收口）：certjobs/ 尺寸轮转归写入侧预写入轮转
 // 单一负责（5 代移位），housekeeping 对 certjobs/ 只做保留期清理、不做尺寸轮转——
 // 否则孤儿超阈活动文件会被 rename 覆盖 .1 代际（双轨覆盖丢史窗口的残留面）。
 func TestTaskLogsHousekeeping_certjobsExemptFromSizeRotation(t *testing.T) {

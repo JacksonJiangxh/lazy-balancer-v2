@@ -4,7 +4,7 @@
 // 机制：security_crawler_sources 源表（Google/OpenAI/Bing/360 官方 JSON/表）
 // 独立排程（默认每天 04:00）+ 手动触发下载 → 通用 CIDR 提取（JSON/HTML 通用解析）→
 // security_ip_lists 系统名单（name=CrawlerIPListName(engine)，system=1）原子快照
-// 写入；失败保留上次快照（历史修复，绝不以更新失败破坏既有豁免）。
+// 写入；失败保留上次快照（fail-safe，绝不以更新失败破坏既有豁免）。
 // 验证器（caddygeoip.VerifyCrawler）按 IP 段命中即豁免（方法 C 与方法 B
 // PTR 双跳并行），名单投影与既有安全_ip_lists 同表复用。
 package services
@@ -27,12 +27,12 @@ import (
 // 当前无运行态字段，单例仅统一生命周期与调用契约）。
 type CrawlerUpdateManager struct{}
 
-// validateCrawlerEntriesSanity 爬虫名单合理性门（历史问题-02 + 历史修复 历史问题 收紧）。
+// validateCrawlerEntriesSanity 爬虫名单合理性门（历史问题-02 + 历史问题 收紧）。
 // 引擎声明了官方段（geoipnames 单一事实源）时，一切格式（含 JSON——结构化
 // 字段白名单由 parseCrawlerCIDRsForFormat 承担，本门承担段集一致性）：
 //  1. 子集门：每条解析结果必须 ⊆ 某官方段（off.Bits()<=prefix.Bits() 且
-//     包含首地址）——历史修复 历史问题 前为「交集」判定，0.0.0.0/0、10.0.0.0/8 等
-//     覆盖官方段的超网会被放行，写入即对启用爬虫豁免的策略整体 历史修复；
+//     包含首地址）——历史问题 前为「交集」判定，0.0.0.0/0、10.0.0.0/8 等
+//     覆盖官方段的超网会被放行，写入即对启用爬虫豁免的策略整体 fail-open；
 //  2. 覆盖门：每个官方段至少被保留条目覆盖 1/8 地址空间（历史修复 起为
 //     地址空间覆盖率口径，不再是「任一更具体条目命中」；阈值依据见函数内
 //     360 官方页实测）——截断页/仅一条官方段内 IP 的错误页、以及「每段一个
@@ -162,7 +162,7 @@ func crawlerSnapshotBaseline(engineID string) (count int, known bool, err error)
 	return count, known, nil
 }
 
-// crawlerSnapshotShrinkGuard 条数收缩门（历史修复 历史问题）：新名单条数较当前快照
+// crawlerSnapshotShrinkGuard 条数收缩门（历史问题）：新名单条数较当前快照
 // 收缩超过一半时拒绝写入、保留上次快照——子集/覆盖门之外的兜底（引擎未
 // 声明官方段时它是唯一闸门）。基线=DB 名单行当前条数，无行回退内置首版
 // （首轮更新也受门），两者皆无则放行（无可对照口径）。基线读取失败按
@@ -189,7 +189,7 @@ const CrawlerIPListEntryCap = 2000
 
 // crawlerSnapshotGrowthGuard 条数扩张门（历史修复，与收缩门对称）：源响应上限
 // 16MB，通用 CIDR 提取后可产出数十万条，此前只有收缩门（防塌缩），膨胀会直接
-// 放大 DB 行、历史修复.json、插件每 10min 重载的前缀表与渲染期内存，
+// 放大 DB 行、crawler-ip-lists.json、插件每 10min 重载的前缀表与渲染期内存，
 // 并绕过产品 2000 条口径。两道门：
 //  1. 绝对上限 CrawlerIPListEntryCap（无对照基线的引擎同样受约束）；
 //  2. 相对上限：较当前快照膨胀一倍以上（官方名单规模稳定，翻倍即视为劫持/
@@ -330,13 +330,13 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 		// 保留上次快照；词法边界已排除版本号/日期等 IP 同形 token）。
 		entries, perr := parseCrawlerCIDRsForFormat(body, src.Format)
 		if perr == nil {
-			// 历史问题-02（历史）+ 历史修复 历史问题（历史收紧）：合理性门——
+			// 历史问题-02（历史）+ 历史问题（历史收紧）：合理性门——
 			// 子集（每条 ⊆ 官方段，取代旧交集判定）+ 覆盖（官方段全覆盖），
 			// 一切格式同口径；错误页/超网/截断名单保留上次快照。
 			entries, perr = validateCrawlerEntriesSanity(src.Name, entries)
 		}
 		if perr == nil {
-			// 历史修复 历史问题：条数收缩门——较当前快照（DB/内置首版）收缩过半拒绝写入。
+			// 历史问题：条数收缩门——较当前快照（DB/内置首版）收缩过半拒绝写入。
 			perr = crawlerSnapshotShrinkGuard(src.Name, len(entries))
 		}
 		if perr == nil {

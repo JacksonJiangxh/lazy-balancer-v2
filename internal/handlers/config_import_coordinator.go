@@ -88,7 +88,7 @@ type configImportSession struct {
 	// begin 函数的 defer（该函数在导入体执行前就返回）。
 	resumeEngine func()
 	// releaseBeforeLock 释放排空之后、caddyOpMu/事务之前取得的资源锁
-	// （配置导入的 WAF 文件锁，历史修复-历史问题）。close 在 caddyOpMu 之后释放，
+	// （配置导入的 WAF 文件锁，历史修复）。close 在 caddyOpMu 之后释放，
 	// 保持与获取顺序相反的锁序。
 	releaseBeforeLock func()
 }
@@ -100,12 +100,12 @@ var errCertQueueDrainIncomplete = errors.New("证书任务执行中，请稍后�
 var errImportTaskDrainIncomplete = errors.New("在途任务未排空，请稍后重试")
 
 // importInFlightDrainTimeout 导入前排空在途任务的有界等待（历史问题-1，历史
-// 审计）：与证书队列 PauseAndDrain 的 30s 屏障同量级。A85历史问题-4 起超时
-// 历史修复 拒绝导入（部分 Run 体不消费取消信号），恢复调度并留失败审计，
+// 审计）：与证书队列 PauseAndDrain 的 30s 屏障同量级。历史问题 起超时
+// fail-closed 拒绝导入（部分 Run 体不消费取消信号），恢复调度并留失败审计，
 // 不再让旧任务与全量替换并发。
 var importInFlightDrainTimeout = 30 * time.Second
 
-// configImportBeginMu 串行化整个导入会话（历史修复-历史问题/历史问题-历史问题）：
+// configImportBeginMu 串行化整个导入会话（历史修复）：
 // Pause/Resume 是单布尔位，若两个导入都先 Pause 再抢 caddyOpMu，先结束者
 // Resume 会让后者在调度已恢复的状态下执行。此锁覆盖 Pause→事务→close，
 // 后到导入在暂停开始前排队。
@@ -117,7 +117,7 @@ var configImportBeginAttemptHook func()
 var configImportBeforePrelockHook func()
 
 // configImportBusy 探测导入会话是否持有全局导入锁（不阻塞）：启停/控制
-// 常驻任务在导入期间必须 409，避免绕过 PauseAndDrain（历史 历史问题-03）。
+// 常驻任务在导入期间必须 409，避免绕过 PauseAndDrain（历史问题-03）。
 func configImportBusy() bool {
 	if configImportBeginMu.TryLock() {
 		configImportBeginMu.Unlock()
@@ -126,9 +126,9 @@ func configImportBusy() bool {
 	return true
 }
 
-// rejectNodeWriteDuringImport（历史修复 历史问题，历史）：配置导入窗口内
+// rejectNodeWriteDuringImport（历史问题，历史）：配置导入窗口内
 // 节点写端点（注册/审批/拒绝/删除/改访问地址/改站点坐标/清 pin/节点上报等）
-// 一律 409 历史修复。导入事务全量替换 nodes 表：窗口内的节点写入要么被
+// 一律 409 fast-fail。导入事务全量替换 nodes 表：窗口内的节点写入要么被
 // 导入覆盖（静默丢失），要么阻塞在 SQLite 写锁上至 busy_timeout（30s）后
 // 500——两种形态都比干净 409 差。与 taskmonitor 的调度开关门共用
 // configImportBusy 探测，文案同族。
@@ -162,9 +162,9 @@ func (h *Handlers) beginConfigImportWithPrelock(ctx context.Context, prelock fun
 	}
 	configImportBeginMu.Lock()
 	releaseSession := func() { configImportBeginMu.Unlock() }
-	// 历史问题 / 历史问题-1（历史）：导入将全量替换业务数据——先暂停 tick
+	// 历史问题-1（历史）：导入将全量替换业务数据——先暂停 tick
 	// 派发并取消在途 Scheduled/Periodic/Oneshot Run（Daemon 不在范围），再有界
-	// 等待其在途落定，避免其提交落在导入事务之后形成 历史修复。
+	// 等待其在途落定，避免其提交落在导入事务之后形成 last-writer-wins。
 	// 此前只发取消信号不等待：不消费 rc.Ctx 的 Run 体会在导入期间继续跑完。
 	//
 	// 顺序铁律（历史 Fix81Inf 复核）：Pause/Cancel/Wait 必须在取 caddyOpMu
@@ -193,10 +193,10 @@ func (h *Handlers) beginConfigImportWithPrelock(ctx context.Context, prelock fun
 		}
 	}
 	// 历史问题-02（历史）：CA 队列 PauseAndDrain 必须先于 caddyOpMu——在途
-	// 证书部署会经 caddyReloader 取 caddyOpMu（services/caddy.go 203-208）；
-	// 旧顺序「先持锁再排空」形成自锁：部署 worker 等锁、导入等排空，30s 后
-	// 必然 409。与上方任务引擎「先排空再取锁」铁律同序。排空在 WAF 预锁之前，
-	// 避免持 WAF 锁阻塞更新任务。
+	// 证书部署需要 CaddyOpLock（部署临界区入口即取锁，
+	// certissuer.go deployIssuedCertificate/快速路径）；旧顺序「先持锁再排空」
+	// 形成自锁：部署 worker 等锁、导入等排空，30s 后必然 409。与上方任务引擎
+	// 「先排空再取锁」铁律同序。排空在 WAF 预锁之前，避免持 WAF 锁阻塞更新任务。
 	recovery := importQueueRecovery{manager: services.GetCAQueueManager()}
 	if recovery.manager != nil {
 		recovery.wasActive = recovery.manager.IsActive()
@@ -265,7 +265,7 @@ func (session *configImportSession) close() {
 		_ = session.abort(errors.New("导入流程未完成"))
 	}
 	session.h.caddyOpMu.Unlock()
-	// 历史问题-1/A85历史问题-1：导入全程（含失败 abort 的恢复动作）结束后
+	// 历史问题-1/历史问题：导入全程（含失败 abort 的恢复动作）结束后
 	// 先恢复 tick，再释放串行会话锁。反向释放会让下一代导入的 Pause 被
 	// 本代 Resume 覆盖，破坏 Pause→事务→close 的串行排空不变量。
 	if session.resumeEngine != nil {
@@ -280,9 +280,9 @@ func (session *configImportSession) abort(importErr error) error {
 	if session.finished {
 		return importErr
 	}
-	// 历史修复-1（历史）：会话内 CLI 预检/强制应用等渲染已按未提交导入内容
+	// 历史修复（历史）：会话内 CLI 预检/强制应用等渲染已按未提交导入内容
 	// 重写投影文件——abort 必回滚 tx，磁盘同步回退到已提交态（零 /load；
-	// 快照阶段失败等未渲染形态为同字节 历史修复）。已持 caddyOpMu（begin 起）。
+	// 快照阶段失败等未渲染形态为同字节 no-op）。已持 caddyOpMu（begin 起）。
 	session.h.caddyService.RollbackIPListProjectionsToCommittedInLock()
 	if session.runtime != nil {
 		if session.runtimeApplyAttempted {
@@ -315,7 +315,7 @@ func (session *configImportSession) commit(affectedRuleIDs []string, certificate
 	// 历史问题 v2 导入事务全量重插 cert_jobs（restoreTable 保留原 id），证书
 	// 候选必须读事务自身——经已提交视图会拿到将被替换的旧行，旧 PEM 覆写导入
 	// 刚落盘的新证书文件。导入期 CA 队列已 PauseAndDrain，无并发证书提交。
-	// 历史问题 二十六次 导入强制重载——证书已在上方落盘，生成期比对相等，
+	// 历史问题 导入强制重载——证书已在上方落盘，生成期比对相等，
 	// 非强制会被 errSameConfig 短路（旧证书继续服务）。
 
 	// 2026-09-06 裁定 ④' 边界补齐：导入同样过 Caddy CLI 校验层（校验输入=
@@ -335,7 +335,7 @@ func (session *configImportSession) commit(affectedRuleIDs []string, certificate
 		return &importCoordinatorError{phase: importPhaseCommit, err: session.abort(err)}
 	}
 	session.runtime = nil
-	// 历史问题 历史修复/全量替换导入对消失规则的产物清理。v2/v1 导入均清光
+	// 历史修复/全量替换导入对消失规则的产物清理。v2/v1 导入均清光
 	// lb_rules 后重插（v1 还换新 caddy_id），但产物轴此前只写不删：消失规则的
 	// 证书文件（含 ACME 私钥）在 /app/certs 无限残留——与 DeleteRule「规则消失
 	// → 密钥删除」的约定矛盾，卷读权限者可恢复管理员以为已删除的密钥；v1 路径
@@ -365,7 +365,7 @@ func importFailureCaddyRejected(err error) bool {
 	return errors.As(err, &coordinatorErr) && coordinatorErr.phase == importPhaseCaddy && coordinatorErr.caddyRejected
 }
 
-// cleanupDisappearedRuleArtifacts 清理本次导入中消失规则的产物（历史问题 历史修复/F2）：
+// cleanupDisappearedRuleArtifacts 清理本次导入中消失规则的产物（历史修复）：
 // 证书文件、孤儿 cert_jobs 行、指标与规则/证书日志。提交成功后调用；失败仅
 // 审计留痕，不否决导入。
 func (session *configImportSession) cleanupDisappearedRuleArtifacts() {
@@ -411,7 +411,7 @@ func (session *configImportSession) cleanupDisappearedRuleArtifacts() {
 		services.RecordAuditLog("system", "清理失败", "证书任务", fmt.Sprintf("导入后清理孤儿证书任务失败：%v", err), "")
 		return
 	}
-	// 历史修复（历史 历史问题）：规则存在但已非 ACME 自动签发态的失效任务行——与
+	// 历史修复（历史问题）：规则存在但已非 ACME 自动签发态的失效任务行——与
 	// v2 导入事务内同谓词清理；覆盖 v1 路径与理论绕过路径。
 	if _, err := db.DB.ExecContext(session.ctx,
 		`DELETE FROM cert_jobs WHERE rule_id IN (SELECT caddy_id FROM lb_rules WHERE NOT (enable_tls=1 AND tls_source='acme_dns'))`); err != nil {

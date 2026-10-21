@@ -1,4 +1,4 @@
-// IP 名单弹框守卫与 CSV 往返验收（历史 历史问题 / 历史问题）：
+// IP 名单弹框守卫与 CSV 往返验收（历史问题）：
 //   A. 详情在途/失败时保存必须禁用（否则空 entries 全量 PUT 清空名单）
 //   B. 已有名单 + 空条目需二次确认；新建空名单不弹
 //   C. 导出→导入逐字相等，二次往返不累积漂移（备注含逗号/引号/换行）
@@ -11,7 +11,7 @@ import { readFileSync } from 'node:fs'
 
 import { canSaveIpList, needsEmptyListConfirm } from '../src/utils/ipListSaveGuard.ts'
 import { formatIpListEntryLine, parseIpListEntryLine } from '../src/utils/ipListCsv.ts'
-// 审计 87 WEBT-02：注入本测试自己的 IPv4-only 正则会让「IPv6 CIDR」被文档化成
+// 历史修复：注入本测试自己的 历史修复 正则会让「IPv6 CIDR」被文档化成
 // 非法值，与生产注入的 isValidCidr（SecurityRules.vue CSV 导入）语义相反。
 import { isValidCidr } from '../src/utils/ruleValidation.ts'
 import {
@@ -22,7 +22,7 @@ import {
   writeSharedEntries,
 } from '../src/utils/securityStages.ts'
 
-test('IP 快捷处置：信任命中只全扫一次，GeoIP 区域只解析一次（历史问题/历史问题）', () => {
+test('IP 快捷处置：信任命中只全扫一次，GeoIP 区域只解析一次（历史问题）', () => {
   const src = readFileSync(new URL('../src/views/security/IPLocationAction.vue', import.meta.url), 'utf8')
   assert.match(src, /const trustHitSummary = computed/, '信任命中与豁免策略应共享一次计算')
   assert.doesNotMatch(src, /const td[01]Owner = policies\.value\.find/, '逐行不得再全策略扫描')
@@ -72,12 +72,12 @@ test('C3 旧格式（无引号、逗号/空白分隔）保持兼容', () => {
   assert.deepEqual(parseIpListEntryLine('10.0.0.1,普通备注', isValidCidr), { value: '10.0.0.1', remark: '普通备注' })
   assert.deepEqual(parseIpListEntryLine('10.0.0.1 普通备注', isValidCidr), { value: '10.0.0.1', remark: '普通备注' })
   assert.deepEqual(parseIpListEntryLine('10.0.0.1', isValidCidr), { value: '10.0.0.1', remark: '' })
-  // 审计 87 WEBT-02：IPv6 CIDR 是生产校验器的合法输入（isValidCidr 走 isValidIpv6，
-  // prefix≤128）——原测试用 IPv4-only 替身把它断言成非法值（假前提）。
+  // 历史修复：IPv6 CIDR 是生产校验器的合法输入（isValidCidr 走 isValidIpv6，
+  // prefix≤128）——原测试用 历史修复 替身把它断言成非法值（假前提）。
   assert.deepEqual(parseIpListEntryLine('2001:db8::/32', isValidCidr), { value: '2001:db8::/32', remark: '' })
 })
 
-test('C9 IPv6 导入往返与非法形态（审计 87 WEBT-02）', () => {
+test('C9 IPv6 导入往返与非法形态（历史修复）', () => {
   // 生产注入的真实校验器语义：合法 IPv6 CIDR/单地址可导入并逐字往返
   for (const value of ['2001:db8::/32', '2001:db8::1', 'fe80::/10', '::1']) {
     assert.equal(isValidCidr(value), true, `${value} 应为合法值`)

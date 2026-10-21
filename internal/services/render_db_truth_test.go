@@ -446,7 +446,7 @@ func TestRenderDBTruth_BlockStatusCodeZeroFollowsDefault403(t *testing.T) {
 
 func TestRenderDBTruth_CertExpiryDaysInvalidLogsExplicitError(t *testing.T) {
 	// 类型①值型列：库值无效（带外直写，正常已被启动回填收敛）不得静默降级——
-	// 显性 error 留痕后按 CERT42-5 读故障族口径取默认 30。
+	// 显性 error 留痕后按 历史修复 读故障族口径取默认 30。
 	_, database := newClusterTestService(t)
 	if _, err := database.Exec("UPDATE global_config SET cert_expiry_days=-5 WHERE id=1"); err != nil {
 		t.Fatalf("dirty cert_expiry_days: %v", err)
@@ -464,7 +464,7 @@ func TestRenderDBTruth_CertExpiryDaysInvalidLogsExplicitError(t *testing.T) {
 	}
 }
 
-// G5（历史）：caddy_log_size_mb 哨兵贯通钉——批 1+2 只钉了 <=0 fail-visible
+// 历史修复（历史）：caddy_log_size_mb 哨兵贯通钉——批 1+2 只钉了 <=0 fail-visible
 // （ZeroGlobalColumnsFailVisible），未钉「库值直发」方向。137 哨兵贯通到
 // logging.logs.*.writer.roll_size_mb（任何写死 100 回流即被识破）。
 func TestRenderDBTruth_LogSizeMB137SentinelPassThrough(t *testing.T) {

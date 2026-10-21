@@ -71,8 +71,8 @@ func (h *Handlers) GetThreatLib(c *gin.Context) {
 		sources = append(sources, s)
 		totalEntries += s.EntryCount
 	}
-	// 历史修复（历史 历史问题·家族漏收敛）：迭代错误（rows.Err）不得以
-	// 「部分/空列表 + 200」返回——与 历史问题/历史问题 在总览/事件列表建立的
+	// 历史修复（历史问题·家族漏收敛）：迭代错误（rows.Err）不得以
+	// 「部分/空列表 + 200」返回——与 历史问题 在总览/事件列表建立的
 	// 「残缺列表不得以 200」口径对齐（Scan 失败分支同响应形）。
 	if err := rows.Err(); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取威胁情报库失败: " + err.Error()})
@@ -129,7 +129,7 @@ func (h *Handlers) UpdateThreatAutoUpdate(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求无效"})
 		return
 	}
-	// 历史问题-7：与 UpdateCRSAutoUpdate 同口径主节点门（历史问题 B-#4）——从节点
+	// 历史问题-7：与 UpdateCRSAutoUpdate 同口径主节点门（历史问题）——从节点
 	// 状态行在集群同步段内，本地写会被下次快照覆盖。
 	if !requireMasterNode(c) {
 		return
@@ -177,7 +177,7 @@ func (h *Handlers) UpdateThreatSourceFlags(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无可更新字段"})
 		return
 	}
-	// 历史问题-7：与 UpdateCRSAutoUpdate 同口径主节点门（历史问题 B-#4）。
+	// 历史问题-7：与 UpdateCRSAutoUpdate 同口径主节点门（历史问题）。
 	if !requireMasterNode(c) {
 		return
 	}
@@ -238,7 +238,7 @@ func (h *Handlers) StartThreatLibUpdate(c *gin.Context) {
 		return
 	}
 	op := auditOperator(c)
-	// 历史问题/A85历史问题-2：响应前同步预占位，拒绝时不得伪报 running。
+	// 历史问题：响应前同步预占位，拒绝时不得伪报 running。
 	if err := services.TriggerTaskAsync(te, "threat", services.TriggerAuditContext{
 		Operator: op, Family: "威胁情报库", Name: "威胁情报库更新",
 	}); err != nil {

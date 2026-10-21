@@ -136,7 +136,7 @@
             <el-switch v-model="adminTls.enabled" :disabled="isReadOnly || !adminTlsLoaded" @change="onAdminTlsToggle" />
             <el-button v-if="adminTls.enabled" size="small" style="margin-left: 8px;" :disabled="isReadOnly" @click="openAdminTlsDialog">配置证书</el-button>
             <el-text v-if="adminTlsDirty" type="warning" size="small" style="margin-left: 8px">已暂存，点击下方保存后生效</el-text>
-            <!-- WS-07：读取失败显性化 + 重试（与 githubProxyLoaded 的提示同口径） -->
+            <!-- 历史修复：读取失败显性化 + 重试（与 githubProxyLoaded 的提示同口径） -->
             <template v-else-if="adminTlsLoadFailed">
               <el-text type="danger" size="small" style="margin-left: 8px">TLS 配置读取失败，开关暂不可用</el-text>
               <el-link type="primary" underline="never" size="small" style="margin-left: 6px" @click="retryLoadAdminTls">重试</el-link>
@@ -281,7 +281,7 @@
 
       <template v-if="importValidation && !importValidating">
         <div v-if="!importValidation.valid" class="info-note-bar import-alert"><span class="info-note-desc">{{ importValidation.error || '备份文件校验失败' }}</span></div>
-        <!-- 历史问题-历史问题：预览无效时分类 chip 保持可见可用——取消勾选坏行分类后
+        <!-- 历史问题：预览无效时分类 chip 保持可见可用——取消勾选坏行分类后
              revalidateImport 自动重校验恢复 valid 即解锁确认（历史问题-02「未选分类
              坏行不误拒」契约的 UI 可达面）；空分类选择仍由确认时 FE44-6 拦截 -->
         <div class="import-result">
@@ -298,7 +298,7 @@
             <el-text v-if="importValidation.type === 'v1'" type="info" size="small" class="import-v1-hint">V1 备份仅支持负载均衡规则导入</el-text>
             <el-text v-else-if="!importValidation.valid" type="warning" size="small" class="import-v1-hint">校验未通过——取消勾选包含异常数据的分类后将自动重新校验</el-text>
           </div>
-          <!-- WS-10：0 选择时摘要/冲突/覆盖范围必须一并隐藏（否则与「本次不会
+          <!-- 历史修复：0 选择时摘要/冲突/覆盖范围必须一并隐藏（否则与「本次不会
                覆盖任何数据」并存，展示的是上次选择的陈旧预览）。 -->
           <template v-if="importValidation.valid && importPreviewSelected">
             <el-tag :type="importValidation.type === 'v1' ? 'warning' : 'success'" size="small">
@@ -311,7 +311,7 @@
             </div>
             <!-- 历史问题-2:勾选「安全防护」但备份无规则库文件时预览提示(后端兜底
                  跳过规则库版本记录表并在导入结果 warnings 中说明)
-                 历史问题-历史问题（历史）：has_waf_files 已纳入威胁库名单条目，
+                 历史问题（历史）：has_waf_files 已纳入威胁库名单条目，
                  本提示仅剩「CRS/IP2Region/威胁名单条目全无」形态——文案按真实能力
                  点明缺失的是规则库版本文件，避免与「导入将落盘名单文件」矛盾 -->
             <el-text
@@ -326,7 +326,7 @@
                 {{ formatImportConflict(conflict) }}
               </li>
             </ul>
-            <!-- 历史问题-历史问题：空分类选择不再拼出「将仅覆盖所选分类：，」残句
+            <!-- 历史问题：空分类选择不再拼出「将仅覆盖所选分类：，」残句
                  （0 选择的文案已由下方 v-else 分支承担，本块恒有 ≥1 分类） -->
             <div v-if="importValidation.type !== 'v1'" class="info-note-bar import-alert"><span class="info-note-desc">{{ importSections.length === BACKUP_SECTIONS.length ? '导入将覆盖当前全部配置（规则、用户、密钥、证书任务、节点拓扑）' : `将仅覆盖所选分类：${importSections.map((k) => BACKUP_SECTIONS.find((s) => s.key === k)?.label || k).join('、')}，未选分类保持现状` }}</span></div>
             <div v-else class="info-note-bar" style="margin-top: 4px"><span class="info-note-desc">仅导入负载均衡规则，其他数据不受影响</span></div>
@@ -337,7 +337,7 @@
 
       <template #footer>
         <el-button @click="importDialogVisible = false">取消</el-button>
-        <!-- WS-10/WS-11：0 选择与只读态一律置灰（函数级守卫见 confirmImport） -->
+        <!-- 历史修复：0 选择与只读态一律置灰（函数级守卫见 confirmImport） -->
         <el-button type="primary" :disabled="!importValidation?.valid || !importPreviewSelected || isReadOnly" :loading="importing" @click="confirmImport">确认导入</el-button>
       </template>
     </el-dialog>
@@ -477,7 +477,7 @@
     <template #header>
       <DialogHeader :icon="Lock" title="写操作验证支持的操作" subtitle="覆盖全部管理写操作（只读语义 POST 与 MFA 自助端点除外）" />
     </template>
-    <!-- WS-05：与 middleware.go 的 mfaStepUpGuard 挂载面（admin/business 两组级）
+    <!-- 历史修复：与 middleware.go 的 mfaStepUpGuard 挂载面（admin/business 两组级）
          及 readOnlyWriteRoutes 豁免清单同源。注意：证书配置/DNS 凭证/CA 提供商
          的「测试」会真实写入 DNS TXT 或自动申请 EAB——属写操作，需验证；仅
          OIDC 连接测试、配置预览/备份校验、证书解析、批量查询为读语义豁免。 -->
@@ -530,7 +530,7 @@ const appLogContainer = ref<HTMLElement | null>(null)
 
 // （历史问题 过度修复审查 REMOVE：appLogRequestSeq 已删——入口 loading 门 +
 // appLogVisible 析取使其作为裁决条件永不为真。）
-// A85WA-历史问题：日志尾轮询收敛 useLogTailPolling 单源（hidden 暂停/单飞/滚底统一）。
+// 历史修复：日志尾轮询收敛 useLogTailPolling 单源（hidden 暂停/单飞/滚底统一）。
 const appLogTail = useLogTailPolling({
   interval: 3000,
   content: appLogContent,
@@ -567,7 +567,7 @@ watch(appLogAutoRefresh, (enabled) => {
   else appLogTail.stop()
 })
 
-// FE-6（历史）：onUnmounted 生命周期收尾移至 disposed/tlsProtocolFallbackTimer
+// 历史修复（历史）：onUnmounted 生命周期收尾移至 disposed/tlsProtocolFallbackTimer
 // 声明之后（见下方 TLS 段尾），消除「引用其后声明的 let」的脆弱形态。
 
 // 备份分类(2026-09-19 三分类合并；本轮新增节点拓扑):与集群同步节同构
@@ -597,7 +597,7 @@ const exportSections = ref<string[]>(BACKUP_SECTIONS.map((s) => s.key))
 const exportDialogVisible = ref(false)
 const toggleImportSection = (key: string): void => {
   const validation = importValidation.value
-  // 历史问题-02（CERT41-1）：预览无效时分类开关保持可用——剔除坏行分类后重校验
+  // 历史问题-02（历史修复）：预览无效时分类开关保持可用——剔除坏行分类后重校验
   // 即恢复可导入，「未选分类坏行不误拒」契约方才 UI 可达
   if (!validation) return
   if (validation.type === 'v1' && key !== 'rules') return
@@ -673,9 +673,9 @@ interface AutoBackupSettingsResponse {
 const autoBackupVisible = ref(false)
 const autoBackupLoading = ref(false)
 // 读取失败/未完成时表单仍是默认值（enabled=false、daily/03:00/keep 7），
-// 此时允许保存会用默认值覆盖服务端配置（历史 历史问题-2）。
+// 此时允许保存会用默认值覆盖服务端配置（历史问题-2）。
 const autoBackupLoaded = ref(false)
-// A85WA-历史问题：quiet 轮询失败 toast 节流水位（30s，对齐 usePollingErrorState 语义）
+// 历史修复：quiet 轮询失败 toast 节流水位（30s，对齐 usePollingErrorState 语义）
 let lastAutoBackupErrorToastAt = 0
 const autoBackupSaving = ref(false)
 const autoBackupRunning = ref(false)
@@ -715,7 +715,7 @@ const fetchAutoBackup = async (quiet = false): Promise<void> => {
     const res = await request.get<{ data: AutoBackupSettingsResponse }>('/settings/auto-backup', { silent: true })
     const d = res.data
     // quiet=true 来自「立即备份」轮询：只刷新列表与上次成功时间，不得用服务端
-    // 值覆盖用户未保存的频率/时间/保留份数/范围（历史问题-F4）。
+    // 值覆盖用户未保存的频率/时间/保留份数/范围（历史问题）。
     if (!quiet) {
       autoBackupForm.value = {
         enabled: d.enabled,
@@ -737,7 +737,7 @@ const fetchAutoBackup = async (quiet = false): Promise<void> => {
     autoBackupLoaded.value = true
   } catch {
     if (quiet) {
-      // A85WA-历史问题：「立即备份」2s 静默轮询失败不得逐轮弹 toast（60s 窗口最多
+      // 历史修复：「立即备份」2s 静默轮询失败不得逐轮弹 toast（60s 窗口最多
       // ~30 条相同错误）。quiet 轮不重置 autoBackupLoaded——此前已加载成功时保存
       // 仍可用；仅「从未加载成功」时令节流提示一次。
       console.error('Failed to poll auto-backup status')
@@ -766,7 +766,7 @@ const toggleAutoBackupSection = (key: string): void => {
 }
 
 const saveAutoBackupSettings = async (): Promise<boolean> => {
-  // WS-11：函数级纵深防御——角色/节点模式在弹框打开期间变化时不得仍发请求
+  // 历史修复：函数级纵深防御——角色/节点模式在弹框打开期间变化时不得仍发请求
   // （按钮禁用只是入口层，不能覆盖全部触发路径）。
   if (isReadOnly.value || !autoBackupSectionsValid.value || autoBackupSaving.value) return false
   if (!autoBackupLoaded.value || autoBackupLoading.value) {
@@ -807,7 +807,7 @@ const runAutoBackupNow = async (): Promise<void> => {
     mfaAwareSuccess('备份已开始，完成后将自动刷新列表')
     const deadline = Date.now() + 60000
     let completed: AutoBackupRow | undefined
-    // WS-08：组件卸载（切到其它设置页/离开系统设置）后必须终止轮询——原只以
+    // 历史修复：组件卸载（切到其它设置页/离开系统设置）后必须终止轮询——原只以
     // 弹框可见为门，卸载后仍会每 2s 拉取最多 30 次并在其它页面弹结果 toast。
     while (!disposed && autoBackupVisible.value && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 2000))
@@ -831,7 +831,7 @@ const runAutoBackupNow = async (): Promise<void> => {
   }
 }
 
-// 备份大小：零值占位 '-'，格式化走 formatBytes 单一事实源（历史 历史问题）
+// 备份大小：零值占位 '-'，格式化走 formatBytes 单一事实源（历史）
 const formatBackupSize = (bytes: number): string => (!bytes || bytes <= 0 ? '-' : formatBytes(bytes))
 
 // 内容列只显备份范围；hover 明细=各表行数摘要+触发方式（2026-09-21 用户裁定）
@@ -861,7 +861,7 @@ const downloadAutoBackup = async (row: AutoBackupRow): Promise<void> => {
 }
 
 const restoreAutoBackup = async (row: AutoBackupRow): Promise<void> => {
-  // WS-11：写动作函数级守卫（还原会覆盖配置，仅主节点管理员可执行）
+  // 历史修复：写动作函数级守卫（还原会覆盖配置，仅主节点管理员可执行）
   if (backupDisabled.value) return
   const scope = autoBackupScopeText(row)
   try {
@@ -898,7 +898,7 @@ const restoreAutoBackup = async (row: AutoBackupRow): Promise<void> => {
 }
 
 const deleteAutoBackup = async (row: AutoBackupRow): Promise<void> => {
-  // WS-11：写动作函数级守卫
+  // 历史修复：写动作函数级守卫
   if (backupDisabled.value) return
   try {
     await ElMessageBox.confirm(`确认删除备份「${row.filename}」？删除后不可恢复。`, '删除备份', {
@@ -961,7 +961,7 @@ const IMPORT_MAX_BYTES = 128 * 1024 * 1024
 const importFileContent = ref<string | Blob>('')
 const importValidation = ref<ImportValidation | null>(null)
 const importValidating = ref(false)
-// WS-10：0 个分类 = 无可导内容。原实现 revalidateImport 早退，弹框却继续显示
+// 历史修复：0 个分类 = 无可导内容。原实现 revalidateImport 早退，弹框却继续显示
 // 上一次选择的校验摘要/冲突，按钮也可点（点了才提示）——预览与按钮必须同门。
 const importPreviewSelected = computed<boolean>(() => importSections.value.length > 0)
 const importInput = ref<HTMLInputElement | null>(null)
@@ -1039,7 +1039,7 @@ const handleImportFile = async (event: Event): Promise<void> => {
   importValidating.value = true
   try {
     // v2.3.0 lbbak 为二进制 tar.gz——按魔数选择读取与提交方式。
-    // F-历史问题-01：先剥 UTF-8 BOM 再做魔数检测（与后端 config_backup.go 历史问题
+    // 历史问题-01：先剥 UTF-8 BOM 再做魔数检测（与后端 config_backup.go 历史问题
     // 同口径——BOM \xef\xbb\xbf 与 gzip 魔数不冲突，剥 BOM 必须在魔数检测之前），
     // 否则带 BOM 的 lbbak 前端误判为 JSON、带 BOM 的 JSON 提交体解析失败
     const bomProbe = new Uint8Array(await file.slice(0, 3).arrayBuffer())
@@ -1053,11 +1053,11 @@ const handleImportFile = async (event: Event): Promise<void> => {
       importFileContent.value = await file.slice(bomLen).text()
     }
     // 历史问题-02：预览请求携带分类选择（初始=全选，与下方 V2 默认选择一致；
-    // V1 备份不消费该参数）——预览与导入同参，预览结果按所选分类过滤
+    // 历史修复 备份不消费该参数）——预览与导入同参，预览结果按所选分类过滤
     const data = await postImportValidation(BACKUP_SECTIONS.map((sec) => sec.key))
     if (validationSeq !== importValidationSeq) return
     importValidation.value = data ?? null
-    // V1 仅负载规则(锁定);V2 默认全选。无 WAF 规则库文件的备份不整类剔除
+    // 历史修复 仅负载规则(锁定);V2 默认全选。无 WAF 规则库文件的备份不整类剔除
     // 「安全防护」(该分类同时含策略表)——后端兜底:跳过规则库版本记录表,
     // 并在响应 warnings 中说明(下方结果弹框展示)
     if (data?.type === 'v1') {
@@ -1076,10 +1076,10 @@ const handleImportFile = async (event: Event): Promise<void> => {
   }
 }
 
-// 历史问题-02：预览校验请求统一构造——携带当前分类选择（CERT41-1：后端
+// 历史问题-02：预览校验请求统一构造——携带当前分类选择（历史修复：后端
 // ValidateConfigImport 在校验前按 sections 过滤未选分类的表，坏行不误拒，
 // summary/warnings 亦只含所选分类）。参数形态与导入端点对齐：lbbak 二进制
-// 经 ?sections= query（历史问题），JSON 备份体内顶层注入 sections（V1 备份
+// 经 ?sections= query（历史问题），JSON 备份体内顶层注入 sections（历史修复 备份
 // 不消费该键，解析时忽略）。
 const postImportValidation = async (sections: string[]): Promise<ImportValidation | undefined> => {
   const isLbbak = importFileIsLbbak.value
@@ -1105,7 +1105,7 @@ const postImportValidation = async (sections: string[]): Promise<ImportValidatio
 // 面板保持显示（不闪 loading），并发切换经 importValidationSeq 只取最新响应。
 const revalidateImport = async (): Promise<void> => {
   const sections = importSections.value
-  // V1 校验不消费分类（仅负载规则）；空选择无可导内容（确认时 FE44-6 拦截）——不重发
+  // 历史修复 校验不消费分类（仅负载规则）；空选择无可导内容（确认时 历史修复 拦截）——不重发
   if (importValidation.value?.type === 'v1' || sections.length === 0) return
   if (!importFileContent.value) return
   const validationSeq = ++importValidationSeq
@@ -1121,14 +1121,14 @@ const revalidateImport = async (): Promise<void> => {
 }
 
 const confirmImport = async (): Promise<void> => {
-  // WS-11：确认按钮的 isReadOnly 门之外，函数级再守一道（角色/节点模式在弹框
+  // 历史修复：确认按钮的 isReadOnly 门之外，函数级再守一道（角色/节点模式在弹框
   // 打开期间变化时仍可能触发点击）。
   if (isReadOnly.value) return
   const validation = importValidation.value
   if (!validation?.valid || importing.value) return
-  // FE44-6：未选分类先于最终确认弹框拦截（V1 路径强制 ['rules']，不可达此分支）
+  // 历史修复：未选分类先于最终确认弹框拦截（历史修复 路径强制 ['rules']，不可达此分支）
   if (importSections.value.length === 0) { ElMessage.warning('请至少选择一个导入分类'); return }
-  // 历史问题 D-3：全量导入是全仓破坏性最强的操作（覆盖规则、用户、密钥、证书任务与全部凭证），
+  // 历史问题：全量导入是全仓破坏性最强的操作（覆盖规则、用户、密钥、证书任务与全部凭证），
   // 此前是唯一缺二次确认弹框的破坏性操作——「确认导入」按钮与警示文案不足以兜底误点。
   try {
     const isFullImport = validation.type === 'v1' || importSections.value.length === BACKUP_SECTIONS.length
@@ -1171,7 +1171,7 @@ const confirmImport = async (): Promise<void> => {
     const resultLines = [
       res.message || '配置导入成功',
       ...warnings,
-      // 历史问题-历史问题：无冲突时不占位——「冲突置为禁用：0 条」恒显属噪音行
+      // 历史问题：无冲突时不占位——「冲突置为禁用：0 条」恒显属噪音行
       ...(disabledConflicts.length > 0 ? [`冲突置为禁用：${disabledConflicts.length} 条`] : []),
       ...disabledConflicts.map(formatImportConflict),
     ]
@@ -1255,7 +1255,7 @@ interface AdminTlsForm {
 }
 
 const mfaScopeVisible = ref(false)
-// WS-05：与 middleware.go 的 admin/business 组写路由逐族对齐——本清单是 MFA
+// 历史修复：与 middleware.go 的 admin/business 组写路由逐族对齐——本清单是 MFA
 // 弹框「受保护操作范围」的唯一事实源：新增写端点族必须同步入列（否则弹框会
 // 低估受保护范围），测试按清单反查缺失项。
 const mfaScopeGroups = [
@@ -1268,13 +1268,13 @@ const mfaScopeGroups = [
 ]
 
 const settings = defineModel<BasicSettingsConfig>('settings', { required: true })
-// 父级 /config 加载完成前禁止保存：表单此刻仍是默认值（历史 历史问题-1）。
+// 父级 /config 加载完成前禁止保存：表单此刻仍是默认值（历史问题-1）。
 const props = defineProps<{ configLoaded: boolean }>()
 const emit = defineEmits<{
   (e: 'save'): void
 }>()
 
-// 读取失败不得把默认值当可写值（历史 历史问题）：原 getter 未加载时回退
+// 读取失败不得把默认值当可写值（历史）：原 getter 未加载时回退
 // 默认代理、保存 payload 恒带该键——一次 /config 抖动 + 任一保存 = 把用户已选
 // 的 AxisNow 静默改回默认。现以 githubProxyLoaded 门控编辑与提交。
 const githubProxyLoaded = ref(false)
@@ -1309,9 +1309,9 @@ const loadGithubRemoteState = async (): Promise<void> => {
   }
 }
 loadGithubRemoteState()
-// GitHub 令牌三态（历史 历史问题）：省略=保持、显式空串（清除钮）=撤销、非空=覆盖；has_github_token 仅显隐占位
+// GitHub 令牌三态（历史）：省略=保持、显式空串（清除钮）=撤销、非空=覆盖；has_github_token 仅显隐占位
 const githubTokenInput = ref('')
-// 清除标记（历史 历史问题，用户裁定三态语义：nil=保持/空串=清除/非空=覆盖）：
+// 清除标记（历史问题，用户裁定三态语义：nil=保持/空串=清除/非空=覆盖）：
 // 点「清除」置位，保存时显式提交空串撤销令牌；用户重新输入自动撤销标记。
 const githubTokenClearPending = ref(false)
 const clearGithubToken = () => {
@@ -1389,10 +1389,10 @@ const adminTlsDirty = computed(() => {
   return adminTls.value.mode !== adminTlsSaved.value.mode || stagedAdminTlsCert.value !== null
 })
 
-// A85WA-历史问题：/admin-tls 读取失败不再静默吞错——开关禁用直到加载成功，
+// 历史修复：/admin-tls 读取失败不再静默吞错——开关禁用直到加载成功，
 // 避免长期以默认关闭态误导「HTTPS 已关闭」。
 const adminTlsLoaded = ref(false)
-// WS-07（A85WA-历史问题 未完成项）：读取失败必须显性化——原仅 console.warn，
+// 历史修复：读取失败必须显性化——原仅 console.warn，
 // 开关永久灰置且页面不解释（用户只能整页刷新碰运气）。内联错误 + 重试入口。
 const adminTlsLoadFailed = ref(false)
 const loadAdminTls = async () => {
@@ -1415,7 +1415,7 @@ const loadAdminTls = async () => {
 const retryLoadAdminTls = (): void => { void loadAdminTls() }
 
 const openAdminTlsDialog = () => {
-  // WS-11：上传/校验走 admin-tls/inspect（后端写语义端点，非只读豁免）
+  // 历史修复：上传/校验走 admin-tls/inspect（后端写语义端点，非只读豁免）
   if (isReadOnly.value) return
   adminTlsForm.value = {
     mode: adminTls.value.mode === 'upload' ? 'upload' : 'selfsigned',
@@ -1456,7 +1456,7 @@ let tlsInspectSeq = 0
 let tlsProtocolFallbackTimer: ReturnType<typeof setTimeout> | null = null
 let disposed = false
 
-// FE-6（历史）：组件卸载收尾引用上述 tls 态与 disposed，故置于声明之后
+// 历史修复（历史）：组件卸载收尾引用上述 tls 态与 disposed，故置于声明之后
 // （原位于 appLogTimer watch 附近、引用其后声明的 let——当前安全但形态脆弱）。
 onUnmounted(() => {
   disposed = true
@@ -1468,7 +1468,7 @@ onUnmounted(() => {
 const onTlsFile = async (e: Event, kind: 'cert' | 'key') => {
   const input = e.target as HTMLInputElement
   const file = input.files?.[0]
-  // WS-06：读完即复位（与导入选择器同口径）——否则再次选择同一路径/同名文件
+  // 历史修复：读完即复位（与导入选择器同口径）——否则再次选择同一路径/同名文件
   // 不触发 change，换盘内容或重试同一证书时弹框停在旧状态。
   input.value = ''
   if (!file) return
@@ -1501,7 +1501,7 @@ const onTlsFile = async (e: Event, kind: 'cert' | 'key') => {
 const notifyTlsRestarting = (toHttps: boolean) => {
   const target = `${toHttps ? 'https' : 'http'}://${location.host}/`
   // 不盲跳：新进程 HTTPS listener 在完整启动序列后才 bind，固定延时跳转必中连接拒绝窗口
-  // （历史问题 D-1）。停留当前页，弹窗给出可点击的目标链接，由用户就绪后自行访问。
+  // （历史问题）。停留当前页，弹窗给出可点击的目标链接，由用户就绪后自行访问。
   ElMessageBox.alert(
     `已保存，服务正在自动重启（从节点同步后将自动重启生效），就绪后请访问：<a href="${target}" target="_blank" rel="noopener noreferrer" style="word-break: break-all;">${target}</a>`,
     '正在重启',
@@ -1518,7 +1518,7 @@ const notifyTlsRestarting = (toHttps: boolean) => {
   if (tlsProtocolFallbackTimer) clearTimeout(tlsProtocolFallbackTimer)
   // 兜底提醒（不导航）：无论是否已关闭弹窗，15s 后提示一次手动访问新地址
   tlsProtocolFallbackTimer = setTimeout(() => {
-    // WS-09：实现明确「不盲跳」（见上），文案不得再承诺自动跳转
+    // 历史修复：实现明确「不盲跳」（见上），文案不得再承诺自动跳转
     if (!disposed) ElMessage.warning(`请手动访问新地址：${target}`)
   }, 15000)
 }
@@ -1541,7 +1541,7 @@ const restarting = ref(false)
 const handleRestart = async () => {
   if (isReadOnly.value || restarting.value) return
   restarting.value = true
-  // 历史问题-F10：确认/重启/就绪轮询流程单源（utils/restart），与漂移恢复横幅同一实现
+  // 历史问题：确认/重启/就绪轮询流程单源（utils/restart），与漂移恢复横幅同一实现
   const result = await restartServiceWithFeedback({
     confirmMessage: '重启期间服务短暂不可用，容器将自动拉起，就绪后自动刷新页面。确认重启？',
     confirmTitle: '重启服务',
@@ -1591,7 +1591,7 @@ const handleSave = async () => {
       ...(githubProxyLoaded.value ? { github_proxy_url: githubProxyUrl.value } : {}),
       source: 'basic',
     }
-    // 令牌三态（历史 历史问题，用户裁定）：清除标记→显式空串撤销；有输入→覆盖；
+    // 令牌三态（历史问题，用户裁定）：清除标记→显式空串撤销；有输入→覆盖；
     // 两者皆无→省略字段保持现值
     if (githubTokenClearPending.value) {
       ;(payload as Record<string, unknown>).github_token = ''
@@ -1704,7 +1704,7 @@ const handleSave = async () => {
 }
 .settings-form { padding: 4px 0; }
 .compact-select { width: 240px; max-width: 100%; }
-/* 历史问题-历史问题：旧式 el-text tip-inline/tip-block 已全量归一全局 form-tip-inline/
+/* 历史问题：旧式 el-text tip-inline/tip-block 已全量归一全局 form-tip-inline/
    form-tip-line（main.css 唯一事实源），scoped 重复定义删除 */
 .info-list { padding: 4px 0; }
 .info-item {
@@ -1788,7 +1788,7 @@ const handleSave = async () => {
 .auto-backup-scope-text { white-space: nowrap; }
 .auto-backup-list { border-top: 1px solid var(--el-border-color-lighter); padding-top: 10px; }
 
-/* 自管标签行(ClusterModeCard 范式,FE41-1):复刻 EP .el-form-item__label 计算
+/* 自管标签行(ClusterModeCard 范式,历史修复):复刻 EP .el-form-item__label 计算
  * 样式(右对齐/32px 行高/12px 右内边距),110px 与两弹框 label-width 一致;
  * role=group+aria-label 替代 el-form-item label,规避 el-radio-group 组容器
  * DIV 被 label for 指向的 Firefox a11y 告警 */

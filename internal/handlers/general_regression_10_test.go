@@ -39,7 +39,7 @@ func r56BuildBackup(t *testing.T, tables map[string][]map[string]any, cfg map[st
 
 // 历史修复 新发现#1：布尔列类型门——备份中布尔列的 JSON 值只能是布尔或 0/1 数值。
 // 字符串 "1" 在校验期被 backupBooleanEnabled 读为 false，而 SQLite 亲和性在
-// 恢复期把同一文本转存为 INTEGER 1（同一值两期含义相反），C-4/C-1/C-2 全部门
+// 恢复期把同一文本转存为 INTEGER 1（同一值两期含义相反），历史修复 全部门
 // 被击穿（admin_tls 崩溃循环、TLSShape 白名单绕过、冲突矩阵漏判）。校验必须
 func TestValidateV2Backup_rejects_non_boolean_typed_boolean_columns(t *testing.T) {
 	tests := []struct {
@@ -149,7 +149,7 @@ func TestValidateV2Backup_accepts_canonical_boolean_values(t *testing.T) {
 	}
 }
 
-// 历史修复 新发现#1（C-4 崩溃循环原样复现的封堵）：admin_tls_enabled:"1"（字符串）
+// 历史修复 新发现#1（历史修复 崩溃循环原样复现的封堵）：admin_tls_enabled:"1"（字符串）
 // + upload + 空证书——校验期被读为 disabled 放行、恢复期落库为 INTEGER 1，
 // 下次启动 ResolveCertificate 失败即进程退出。类型门必须 400 点名字段且零写入。
 func TestImportConfigBackup_rejects_string_typed_admin_tls_enabled(t *testing.T) {

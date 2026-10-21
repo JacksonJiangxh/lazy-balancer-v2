@@ -1,6 +1,6 @@
 package services
 
-// V1（历史用户裁定）：Caddy 重启 watcher 直调 ApplyConfigOnStartup 绕过
+// 历史修复（历史用户裁定）：Caddy 重启 watcher 直调 ApplyConfigOnStartup 绕过
 // 引擎（无 task_runs/[start]/[done]/单飞，审计+任务日志双行）——一切任务统一
 // 引擎调度。修复：watcher 改 RunSync("startup:config-load","caddy-restart")，
 // Run 体触发门放行 caddy-restart（现门仅 manual/startup，直放会 no-op）。

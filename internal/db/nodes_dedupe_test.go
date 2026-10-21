@@ -1,6 +1,6 @@
 package db
 
-// 历史修复1：nodes 整表重建前的去重不得只保 MIN(id)。
+// 历史修复：nodes 整表重建前的去重不得只保 MIN(id)。
 // 重复 (ip_address, port) 行里低 id 可能是旧的未批准行，被删的高 id 才是
 // 已批准/持 cluster_token_hash 的当前节点——按 MIN(id) 删会让该节点从注册表
 // 消失（令牌与 last_seen 一并丢失，需重新注册/审批）。

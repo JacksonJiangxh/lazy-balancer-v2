@@ -9,7 +9,7 @@ import (
 	"github.com/miekg/dns"
 )
 
-// W1/W2（历史，用户裁定）：waitForDNS 放行判据锚定「准确公共 DNS 已命中」——
+// 历史修复（历史，用户裁定）：waitForDNS 放行判据锚定「准确公共 DNS 已命中」——
 // 权威全 miss 而公共递归共识命中（≥2 台 × 连续 2 轮）即放行。生产实证形态：
 // 权威全部「无 TXT 记录」而 nslookup 公共递归已命中（CNAME 委托/NS 变更/集群
 // 分裂三形态），LE 验证均能跟随实际 DNS 状态成功，客户端死等权威即恒超时。
@@ -66,7 +66,7 @@ func setupPropagationSeams(t *testing.T, authServers []string) *captureLogger {
 	return logger
 }
 
-// W1 主形态：权威全部 NODATA（生产「全 miss」实证形态）+ 3 台递归恒命中 →
+// 历史修复 主形态：权威全部 NODATA（生产「全 miss」实证形态）+ 3 台递归恒命中 →
 // 连续 2 轮共识即放行。未实现共识放行时 waitForDNS 烧满预算超时（RED）。
 func TestIssuer_waitForDNS_recursiveConsensusReleasesWhenAuthoritativeBlind(t *testing.T) {
 	const expected = "consensus-value"
@@ -98,7 +98,7 @@ func TestIssuer_waitForDNS_recursiveConsensusReleasesWhenAuthoritativeBlind(t *t
 	}
 }
 
-// W1 混合形态：权威部分命中部分 miss（authReady 恒假=滞后+分歧混合），
+// 历史修复 混合形态：权威部分命中部分 miss（authReady 恒假=滞后+分歧混合），
 // 递归共识命中同样放行（用户裁定确认②）。
 func TestIssuer_waitForDNS_partialAuthoritativeHits_stillReleaseOnConsensus(t *testing.T) {
 	const expected = "partial-auth-value"
@@ -126,7 +126,7 @@ func TestIssuer_waitForDNS_partialAuthoritativeHits_stillReleaseOnConsensus(t *t
 	}
 }
 
-// M9 回归钉：单台递归命中（即便恒定多轮）不构成共识，不得放行——
+// 历史修复 回归钉：单台递归命中（即便恒定多轮）不构成共识，不得放行——
 // 公共递归缓存可取自已刷新单台，CA 问滞后权威时挑战仍会失败。
 func TestIssuer_waitForDNS_singleResolverHit_does_not_release(t *testing.T) {
 	const expected = "single-hit-value"
@@ -139,7 +139,7 @@ func TestIssuer_waitForDNS_singleResolverHit_does_not_release(t *testing.T) {
 
 	issuer := &Issuer{Logger: &captureLogger{}}
 	if err := issuer.waitForDNS(context.Background(), fqdn, expected, 500*time.Millisecond); err == nil {
-		t.Fatalf("single-resolver hit must NOT release (M9 anti-quota-burn guard)")
+		t.Fatalf("single-resolver hit must NOT release (历史修复 anti-quota-burn guard)")
 	}
 }
 
@@ -164,7 +164,7 @@ func TestIssuer_waitForDNS_authoritativeFullHit_releases(t *testing.T) {
 	}
 }
 
-// W2：权威存活台全 miss 持续超过诊断阈值 → 显式诊断日志（两方清单）；
+// 历史修复：权威存活台全 miss 持续超过诊断阈值 → 显式诊断日志（两方清单）；
 // 预算耗尽的错误信息同样携带权威/递归清单——生产排障 30 秒自明根因。
 func TestIssuer_waitForDNS_divergenceDiagnosedAndTimeoutListsBothSides(t *testing.T) {
 	const expected = "divergence-value"
@@ -193,7 +193,7 @@ func TestIssuer_waitForDNS_divergenceDiagnosedAndTimeoutListsBothSides(t *testin
 	}
 }
 
-// 防御：共识阈值接缝不得被生产代码改写为 1（M9 底线的机器可验证形态）。
+// 防御：共识阈值接缝不得被生产代码改写为 1（历史修复 底线的机器可验证形态）。
 func TestPropagationConsensusDefaults(t *testing.T) {
 	if propagationConsensusMinHits < 3 {
 		t.Fatalf("propagationConsensusMinHits=%d < 3 would weaken the anti-cache-premature-release guard (2026-10-13 user ruling: 2→3)", propagationConsensusMinHits)
@@ -235,12 +235,12 @@ func TestIssuer_waitForDNS_allAuthoritativeTransientlyFailed_doesNotBypassConsen
 
 	issuer := &Issuer{Logger: logger}
 	if err := issuer.waitForDNS(context.Background(), fqdn, expected, 500*time.Millisecond); err == nil {
-		t.Fatalf("曾有权威后全失败时单台递归命中不得放行（会绕过 M9 3×2 共识）")
+		t.Fatalf("曾有权威后全失败时单台递归命中不得放行（会绕过 3×2 共识）")
 	}
 }
 
 // 回归形状：曾有权威、全失败，但递归多台共识达标 → 仍按共识放行
-// （M9 裁定口径不变，只是不再接受单台证据）。
+// （历史修复 裁定口径不变，只是不再接受单台证据）。
 func TestIssuer_waitForDNS_allAuthoritativeTransientlyFailed_consensusStillReleases(t *testing.T) {
 	const expected = "transient-consensus-value"
 	const fqdn = "_acme-challenge.transientconsensus.example.com."

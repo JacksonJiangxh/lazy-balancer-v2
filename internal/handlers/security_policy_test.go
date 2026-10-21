@@ -117,7 +117,7 @@ func TestSecurityPolicy_seededLegacyMixedRoundTripsAllColumns(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Then every column 历史修复
+	// Then every column round-trips
 	var (
 		description, mode, aclMode, aclList, whitelist, blacklist, excluded string
 		threshold, rateRPS, rateBurst, blockPageID                          int
@@ -349,7 +349,7 @@ func TestUpdateSecurityPolicy_rejectsBlankEnumString(t *testing.T) {
 	router := newSecurityRouter(t)
 	id := createTestPolicy(t, router, map[string]any{"name": "空串策略", "mode": "blocking"})
 
-	// When the update sends an explicit 历史修复 mode
+	// When the update sends an explicit empty-string mode
 	// Then it must be rejected：空串会把 mode 列清空，汇总口径（mode!="off" 即计入
 	// WAF）与发射口径（仅 blocking/detection 生效）随即漂移
 	recorder := putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{"mode": ""})
@@ -360,7 +360,7 @@ func TestUpdateSecurityPolicy_rejectsBlankEnumString(t *testing.T) {
 		t.Fatalf("blank mode rejection must name the field, got %s", body)
 	}
 
-	// And an explicit 历史修复 geoip_mode is rejected too（创建时已归一为 allow/deny，空串属于域外值）
+	// And an explicit empty-string geoip_mode is rejected too（创建时已归一为 allow/deny，空串属于域外值）
 	recorder = putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{"geoip_mode": ""})
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("blank geoip_mode must be rejected with 400, got %d body=%s", recorder.Code, recorder.Body.String())
@@ -382,7 +382,7 @@ func TestUpdateSecurityPolicy_rejectsBlankName(t *testing.T) {
 	router := newSecurityRouter(t)
 	id := createTestPolicy(t, router, map[string]any{"name": "原名策略"})
 
-	// When the update sends an explicit 历史修复 name
+	// When the update sends an explicit empty-string name
 	recorder := putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{"name": ""})
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("blank name must be rejected with 400, got %d body=%s", recorder.Code, recorder.Body.String())
@@ -391,7 +391,7 @@ func TestUpdateSecurityPolicy_rejectsBlankName(t *testing.T) {
 		t.Fatalf("blank name rejection message mismatch, got %s", body)
 	}
 
-	// And a 历史修复 name is rejected too
+	// And a whitespace-only name is rejected too
 	recorder = putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{"name": "   "})
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("whitespace name must be rejected with 400, got %d body=%s", recorder.Code, recorder.Body.String())
@@ -607,7 +607,7 @@ func TestUpdateSecurityPolicy_rejectsInvalidIPCIDR(t *testing.T) {
 		router := newSecurityRouter(t)
 		id := createTestPolicy(t, router, map[string]any{"name": "upd-bad-json"})
 
-		// When the field is updated to a 历史修复 string
+		// When the field is updated to a non-JSON-array string
 		recorder := putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{
 			"ip_whitelist": "not-json",
 		})
@@ -620,7 +620,7 @@ func TestUpdateSecurityPolicy_rejectsInvalidIPCIDR(t *testing.T) {
 }
 
 func TestGetSecurityPolicy_detailCarriesWAFCheckResponse(t *testing.T) {
-	// Given a policy created with the 历史修复 check enabled
+	// Given a policy created with the response-body check enabled
 	setupSecurityPolicyTestDB(t)
 	router := newSecurityRouter(t)
 	id := createTestPolicy(t, router, map[string]any{
@@ -632,7 +632,7 @@ func TestGetSecurityPolicy_detailCarriesWAFCheckResponse(t *testing.T) {
 	// When the policy detail is requested
 	recorder := getRequest(t, router, fmt.Sprintf("/security/policies/%d", id))
 
-	// Then the detail 历史修复 waf_check_response so the frontend edit form
+	// Then the detail round-trips waf_check_response so the frontend edit form
 	// does not silently reset it to false
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("detail status=%d body=%s", recorder.Code, recorder.Body.String())
@@ -653,7 +653,7 @@ func TestGetSecurityPolicy_detailCarriesWAFCheckResponse(t *testing.T) {
 }
 
 func TestListSecurityPolicies_summaryCarriesWAFCheckResponse(t *testing.T) {
-	// Given a policy created with the 历史修复 check enabled
+	// Given a policy created with the response-body check enabled
 	setupSecurityPolicyTestDB(t)
 	router := newSecurityRouter(t)
 	createTestPolicy(t, router, map[string]any{
@@ -714,7 +714,7 @@ func TestUpdateSecurityPolicy_crsFieldsNormalizeAndValidate(t *testing.T) {
 		t.Fatalf("normalized columns = (%q,%q), want ([],[])", groups, excluded)
 	}
 
-	// And a 历史修复 payload is rejected with 400
+	// And a non-JSON-array payload is rejected with 400
 	recorder = putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{"crs_rule_groups": "not-json"})
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("invalid crs_rule_groups must 400, got %d body=%s", recorder.Code, recorder.Body.String())
@@ -728,7 +728,7 @@ func TestUpdateSecurityPolicy_crsFieldsNormalizeAndValidate(t *testing.T) {
 		t.Fatalf("numeric-array crs_excluded_rules must 400, got %d body=%s", recorder.Code, recorder.Body.String())
 	}
 
-	// And a valid array persists 历史修复
+	// And a valid array persists as-is
 	recorder = putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{"crs_rule_groups": `["20","42"]`})
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("valid update status=%d body=%s", recorder.Code, recorder.Body.String())
@@ -792,7 +792,7 @@ func TestListSecurityPolicies_ipACLDisabledHidesControlCapability(t *testing.T) 
 	// When the list is requested
 	recorder := getRequest(t, router, "/security/policies")
 
-	// Then the summary reports the ACL as disabled and no 历史修复 capability
+	// Then the summary reports the ACL as disabled and no IP-control capability
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("list status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
@@ -899,7 +899,7 @@ func TestUpdateSecurityPolicy_anomalyThresholdZeroNormalizesToFive(t *testing.T)
 	router := newSecurityRouter(t)
 	id := createTestPolicy(t, router, map[string]any{"name": "阈值归一策略", "mode": "blocking"})
 
-	// When 更新请求显式传 anomaly_threshold=0（历史问题 F3：0 非合法枚举值，直接
+	// When 更新请求显式传 anomaly_threshold=0（历史问题：0 非合法枚举值，直接
 	// 落库会让发射端 services/security.go:157 的 `AnomalyThreshold > 0` 判断
 	// 跳过 SecAction id:900，CRS 回落默认阈值 5，UI 显示 0 与实际行为不符）
 	recorder := putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{
@@ -930,7 +930,7 @@ func TestUpdateSecurityPolicy_rejectsBlankIPACLMode(t *testing.T) {
 		"ip_acl_list":    `["203.0.113.0/24"]`,
 	})
 
-	// When 更新请求显式传空串 ip_acl_mode（历史问题 B-#1：空串落库后发射端
+	// When 更新请求显式传空串 ip_acl_mode（历史问题：空串落库后发射端
 	// services/security.go 仅 allow/deny 分支产出规则，零 ACL 规则生效；而
 	// SecurityPolicyHasIPControl 只看 enabled && list 非空，UI 仍宣称已启用）
 	recorder := putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{"ip_acl_mode": ""})
@@ -964,7 +964,7 @@ func TestCreateSecurityPolicy_defaultsIPACLMode(t *testing.T) {
 	})
 
 	// Then ip_acl_mode 按 geoip_mode 同口径归一为 "deny"：启用态 ACL 绝不携带
-	// 空模式落库（空模式在发射端产出零规则，历史问题 B-#1）
+	// 空模式落库（空模式在发射端产出零规则，历史问题）
 	var mode string
 	if err := db.DB.QueryRow("SELECT ip_acl_mode FROM security_policies WHERE id=?", id).Scan(&mode); err != nil {
 		t.Fatalf("read back ip_acl_mode: %v", err)
@@ -975,7 +975,7 @@ func TestCreateSecurityPolicy_defaultsIPACLMode(t *testing.T) {
 }
 
 // seedNullColumnPolicy 写入一条多个可空列显式为 NULL 的策略（模拟带外编辑/
-// 备份恢复/集群继承产生的 NULL 行），返回策略 ID。历史问题/历史问题 测试共用。
+// 备份恢复/集群继承产生的 NULL 行），返回策略 ID。历史问题 测试共用。
 func seedNullColumnPolicy(t *testing.T, name string) int64 {
 	t.Helper()
 	result, err := db.DB.Exec(`INSERT INTO security_policies
@@ -1133,9 +1133,9 @@ func TestCreateSecurityPolicy_rejectsUnknownMode(t *testing.T) {
 	}
 }
 
-// S1(2026-09-10 审计):IP ACL allow 模式+空生效名单——发射端 len>0 门静默跳过
-// (「其余一律拒绝」实际全放行 历史修复)。UI 有守卫,API/MCP 直写可绕;按
-// 历史问题/历史问题 同型先例在写入侧 400(与 UI 文案同口径)。
+// 历史修复(2026-09-10 审计):IP ACL allow 模式+空生效名单——发射端 len>0 门静默跳过
+// (「其余一律拒绝」实际全放行 fail-open)。UI 有守卫,API/MCP 直写可绕;按
+// 历史问题 同型先例在写入侧 400(与 UI 文案同口径)。
 func TestCreateSecurityPolicy_rejectsAllowModeWithEmptyACLList(t *testing.T) {
 	// Given
 	setupSecurityPolicyTestDB(t)
@@ -1152,7 +1152,7 @@ func TestCreateSecurityPolicy_rejectsAllowModeWithEmptyACLList(t *testing.T) {
 	}
 }
 
-// S7(2026-09-10 审计):HasCustomRules 需带模式门——off=全关(2026-09-09 四态化)
+// 历史修复(2026-09-10 审计):HasCustomRules 需带模式门——off=全关(2026-09-09 四态化)
 // 后,off 策略的自定义规则不发射,能力列不得宣称「按规则内动作执行」。
 func TestSecurityPolicySummary_offModeHasCustomRulesFalse(t *testing.T) {
 	// Given
@@ -1208,7 +1208,7 @@ func TestUpdateSecurityPolicy_rateLimitGateUsesEffectiveValues(t *testing.T) {
 	}
 }
 
-// A81A-历史问题：详情/列表 DTO 必须携带爬虫豁免两列。修复前两处均缺席 → 前端
+// 历史问题：详情/列表 DTO 必须携带爬虫豁免两列。修复前两处均缺席 → 前端
 // 编辑策略时读不到（按 false/默认三引擎渲染），保存时恒回写 false，任何
 // 「重命名/改描述」都会静默关闭爬虫豁免（安全行为变更）。
 func TestSecurityPolicyDTO_crawlerExemptionRoundTrip(t *testing.T) {
@@ -1221,7 +1221,7 @@ func TestSecurityPolicyDTO_crawlerExemptionRoundTrip(t *testing.T) {
 	id := createTestPolicy(t, router, map[string]any{
 		"name":       "爬虫豁免策略",
 		"geoip_mode": "deny",
-		// P1 启用态空名单 400 → 给一条真实地域条目
+		// 历史修复 启用态空名单 400 → 给一条真实地域条目
 		"geoip_countries":       `["海外"]`,
 		"geoip_crawler_exempt":  true,
 		"geoip_crawler_engines": `["googlebot"]`,
@@ -1283,7 +1283,7 @@ func TestSecurityPolicyDTO_crawlerExemptionRoundTrip(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("update status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
 	}
-	// Then 豁免仍在（历史修复 不丢配置）
+	// Then 豁免仍在（round-trip 不丢配置）
 	var exempt bool
 	var enginesRaw string
 	if err := db.DB.QueryRow(`SELECT COALESCE(geoip_crawler_exempt,0), COALESCE(geoip_crawler_engines,'') FROM security_policies WHERE id=?`, id).Scan(&exempt, &enginesRaw); err != nil {

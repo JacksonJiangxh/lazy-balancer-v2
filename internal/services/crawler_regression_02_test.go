@@ -14,7 +14,7 @@ import (
 )
 
 // 旧实现把任何覆盖官方段的超网（0.0.0.0/0、10.0.0.0/8）或仅含一条官方段内 IP
-// 的错误页判为合法，可整体替换豁免名单（GeoIP/伪装检测 历史修复 或合法爬虫
+// 的错误页判为合法，可整体替换豁免名单（GeoIP/伪装检测 fail-open 或合法爬虫
 // 失去豁免）。
 
 // so360spider 官方五段全覆盖的最小合法集合（每段至少 1/8 地址空间，
@@ -165,7 +165,7 @@ func TestValidateCrawlerEntriesSanity_singleIPCannotCoverPrefix(t *testing.T) {
 
 // 系统名单写入必须有扩张上限。源响应上限 16MB，
 // 解析后可达数十万条；此前只有收缩门（防塌缩），无任何增长限制，
-// 会直接放大 DB 行、历史修复.json、插件每 10min 重载的前缀表
+// 会直接放大 DB 行、crawler-ip-lists.json、插件每 10min 重载的前缀表
 // 与渲染期内存，并绕过产品 2000 条口径。
 func TestCrawlerSnapshotGrowthGuard(t *testing.T) {
 	_, database := newClusterTestService(t)

@@ -13,7 +13,7 @@ import (
 	"lazy-balancer-v2/internal/models"
 )
 
-// 历史修复 历史问题：新节点注册必须 bump cluster_version——nodes 不在版本触发器清单
+// 历史问题：新节点注册必须 bump cluster_version——nodes 不在版本触发器清单
 // （middleware/cluster_version.go），不 bump 则快照缓存键不变，新节点的
 // node_sites 缺项，继承坐标静默不生效直至下一次无关 bump。
 func TestClusterService_RegisterNode_bumpsVersionAndPublishesNodeSite(t *testing.T) {
@@ -85,7 +85,7 @@ func TestClusterService_RegisterNode_bumpsVersionAndPublishesNodeSite(t *testing
 	}
 }
 
-// 历史修复 历史问题：ForgetNodePin 读址 SQL 必须带 SQL 级角色条件（同族 TOCTOU 唯一
+// 历史问题：ForgetNodePin 读址 SQL 必须带 SQL 级角色条件（同族 TOCTOU 唯一
 // 漏点）——降级窗口命中 0 行时按 masterScopeMissError 复核语义返回
 // ErrNotMasterNode，而不是继续删除主节点目录下的 pin 文件。
 func TestClusterService_ForgetNodePin_requiresMasterRole(t *testing.T) {
@@ -141,7 +141,7 @@ func TestClusterService_ForgetNodePin_requiresMasterRole(t *testing.T) {
 	}
 }
 
-// 历史修复 历史问题（后端 no-op 门）：坐标无变化的保存不写库、不 bump cluster_version
+// 历史问题（后端 no-op 门）：坐标无变化的保存不写库、不 bump cluster_version
 // ——「打开弹框原样保存」不得放大为全集群快照重放。
 func TestClusterService_UpdateNodeSiteCoordinates_noopDoesNotBump(t *testing.T) {
 	service, database := newClusterTestService(t)
@@ -215,7 +215,7 @@ func TestClusterService_UpdateNodeSiteCoordinates_noopDoesNotBump(t *testing.T) 
 
 // 静态锚点：clusterPinPathForDatabase 命名核对（sha256(host) hex 文件名），
 // 防止测试与生产路径推导漂移。
-func TestClusterA86_pinPathDerivationMatchesTOFUNaming(t *testing.T) {
+func TestClusterService_pinPathDerivationMatchesTOFUNaming(t *testing.T) {
 	_, database := newClusterTestService(t)
 	pinPath, host, err := nodePinPathFromAccessURL(database, "http://10.0.0.21:8000")
 	if err != nil {

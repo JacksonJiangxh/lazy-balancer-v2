@@ -132,7 +132,7 @@ func BenchmarkIPListFast_200000_throttled(b *testing.B) {
 }
 
 // BenchmarkParseIPListFile_200000 20 万条全量解析+聚合（重载一次性成本）——
-// 名单重建阻塞面的上限锚点（历史修复 窗口内旧集合在役，不影响判定）。
+// 名单重建阻塞面的上限锚点（fail-stale 窗口内旧集合在役，不影响判定）。
 func BenchmarkParseIPListFile_200000(b *testing.B) {
 	dir := b.TempDir()
 	entries := make([]string, 0, 200000)

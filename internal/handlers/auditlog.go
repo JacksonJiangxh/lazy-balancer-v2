@@ -47,7 +47,7 @@ func (h *Handlers) GetAuditLogOptions(c *gin.Context) {
 		Value string `json:"value"`
 		Count int64  `json:"count"`
 	}
-	// 历史问题（历史）：锁只保护缓存读写（历史修复，与 brandingStore 慢
+	// 历史问题（历史）：锁只保护缓存读写（double-check，与 brandingStore 慢
 	// 路径同型）——此前持锁执行三条全表 GROUP BY，深审计库/IO 抖动时全部
 	// 筛选面板请求（含命中缓存路径）被串行阻塞。缓存 miss 时释放锁再查询，
 	// 并发 miss 各自查询后写回（同内容，最后写入者胜，无撕裂读）。
@@ -168,7 +168,7 @@ func buildAuditLogFilters(c *gin.Context, loc *time.Location) (string, []interfa
 		conds = append(conds, c1)
 		args = append(args, a1)
 	}
-	// 畸形时间筛选改 400（历史 F8，用户裁定）：此前解析失败静默丢弃条件
+	// 畸形时间筛选改 400（历史 历史修复，用户裁定）：此前解析失败静默丢弃条件
 	// 返回全量数据——用户以为在按时间过滤而实际没有。解析统一在此处做，
 	// 失败即 400（aborted=true 让调用方短路）。
 	parseBoundary := func(raw, endOfDay string) (time.Time, bool, bool) {
@@ -220,7 +220,7 @@ func (h *Handlers) GetAuditLogs(c *gin.Context) {
 		page = 1
 	}
 	// clamp 上限防 *pageSize 整数溢出为负 → SQLite OFFSET 报错 500
-	// （与 ListSecurityEvents security.go:815 同口径，历史问题 C）。
+	// （与 ListSecurityEvents security.go:815 同口径，历史问题）。
 	// 历史问题:上限收紧 100000→10000——审计库全量在百万行量级内,10 万页
 	// (200 万行偏移)无命中语义只浪费深翻页扫描。
 	if page > 10000 {

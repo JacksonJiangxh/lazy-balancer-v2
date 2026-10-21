@@ -98,7 +98,7 @@ export interface SpherePickCamera {
 }
 
 /**
- * 地球引擎自研拾取的逆投影单源（WT87-09）：NDC 坐标 + 相机基向量 → 射线 ∩
+ * 地球引擎自研拾取的逆投影单源（历史修复）：NDC 坐标 + 相机基向量 → 射线 ∩
  * 半径 radius 的球面 → three-globe 球面约定经纬度（经度 wrap 到 [-180,180)）。
  * 原实现内嵌在 threatGlobe 闭包里（依赖 three/globe 实例），无法确定性断言；
  * 抽成纯数学后可经「正投影→逆投影」往返验证西半球 wrap 与高纬极区。

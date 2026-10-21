@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-// W6 行为锚定测试：cleanupLegacyCRSTransient 的可观察契约是「删除具名瞬态
+// 历史修复 行为锚定测试：cleanupLegacyCRSTransient 的可观察契约是「删除具名瞬态
 // 目标与 *.bak/*.old 后缀条目、保留其余全部内容，且清理动作留审计日志行、
 // 目录缺失时静默无操作」。先于重构编写并在旧实现上验证通过（锁定现行为），
 // 重构（单次 ReadDir + 集合判断）后必须保绿。

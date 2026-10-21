@@ -64,7 +64,7 @@ func setupAPIKeyTestDB(t *testing.T) *sql.DB {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// APIMCP42-3(历史测试卫生):M6 密码确认门已于 2026-09 裁定删除——
+	// 历史修复(历史测试卫生):历史修复 密码确认门已于 2026-09 裁定删除——
 	// 特权 Key(非只读或 MCP)创建不验密码,可选防线为 mfa_write_guard 的
 	// MFA step-up(428,见 apikeys.go createAPIKeyForUser);本文件用例未开
 	// guard,不再种子真实密码哈希、不再携带 password 载荷。
@@ -275,7 +275,7 @@ func TestCreateCurrentUserAPIKeyReturnsPlaintextOnce(t *testing.T) {
 	}
 }
 
-// B43-3-3(历史):API Key 名称 TrimSpace 后非空且 ≤100 字符——空白名/超长名
+// 历史修复(历史):API Key 名称 TrimSpace 后非空且 ≤100 字符——空白名/超长名
 // 此前直接落库(api_keys.name VARCHAR(100) 在 SQLite 不强制长度),列表与审计
 // 出现不可读名。重名不拒绝(既有产品决策保持)。
 func TestCreateCurrentUserAPIKey_validatesName(t *testing.T) {
@@ -360,7 +360,7 @@ func TestUpdateCurrentUserAPIKeyForcesLegacyKeyReadOnly(t *testing.T) {
 
 func TestAdminAPIKeyReadOnlySettingIsUnchanged(t *testing.T) {
 	database := setupAPIKeyTestDB(t)
-	// APIMCP42-3:特权 Key(可写)创建现行语义=mfa_write_guard 的 MFA step-up
+	// 历史修复:特权 Key(可写)创建现行语义=mfa_write_guard 的 MFA step-up
 	//(428),无密码确认门;本用例未开 guard,直接创建。
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
@@ -414,8 +414,8 @@ func TestCreateCurrentUserAPIKeyNormalizesMCPWhitelist(t *testing.T) {
 	database := setupAPIKeyTestDB(t)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
-	// APIMCP42-3:mcp_enabled Key 属特权 Key——现行确认门为 mfa_write_guard
-	// 的 MFA step-up(428),密码载荷已随 M6 裁定删除。
+	// 历史修复:mcp_enabled Key 属特权 Key——现行确认门为 mfa_write_guard
+	// 的 MFA step-up(428),密码载荷已随 历史修复 裁定删除。
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/v1/users/me/api-keys", strings.NewReader(`{"name":"mcp","mcp_enabled":true,"read_only":true,"mcp_ip_whitelist":["192.168.1.5","2001:db8::1"]}`))
 	ctx.Request.Header.Set("Content-Type", "application/json")
 	ctx.Set("user_id", 1)
@@ -450,13 +450,13 @@ func TestUpdateAPIKeyRejectsInvalidMCPWhitelist(t *testing.T) {
 	}
 }
 
-// U7a-历史问题（历史）：每用户 50 配额的判定与插入必须原子——并发创建
+// 历史问题（历史）：每用户 50 配额的判定与插入必须原子——并发创建
 // 此前 count-then-insert TOCTOU 可越过上限。本测试用生产 DSN（db.Initialize：
 // WAL+busy_timeout+_txlock=immediate）并发轰 55 个创建，总数不得超 50。
 // 注：setupAPIKeyTestDB 的裸 sql.Open 无 busy_timeout，并发下会以 SQLITE_BUSY
 // 500 污染断言，故此处独立搭生产形态环境。
 func TestCreateAPIKey_quotaAtomicUnderConcurrency(t *testing.T) {
-	// B1-历史问题（历史）：db.Initialize 会替换三个全局句柄，恢复必须
+	// 历史问题（历史）：db.Initialize 会替换三个全局句柄，恢复必须
 	// 三者齐全——此前漏 MetricsDB，后续用例会踩已关闭的临时指标库。
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	if err := db.Initialize(t.TempDir()); err != nil {

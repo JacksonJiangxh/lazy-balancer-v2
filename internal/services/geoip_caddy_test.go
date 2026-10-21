@@ -72,7 +72,7 @@ func handlerNamesAsString(t *testing.T, routeValue interface{}) string {
 }
 
 // wafHandlers 按链序收集 route 的全部 waf（coraza）处理器——链首可能含
-// X-LB-Rule-ID 注入等原生 headers 处理器（F3），定长索引访问须以 waf 维度
+// X-LB-Rule-ID 注入等原生 headers 处理器（历史修复），定长索引访问须以 waf 维度
 // 定位而非链维度，避免注入/移除前置处理器时测试集体漂移。
 func wafHandlers(t *testing.T, routeValue interface{}) []map[string]interface{} {
 	t.Helper()
@@ -479,7 +479,7 @@ func TestGeoipLocOperator_regexEquivalence(t *testing.T) {
 }
 
 // TestGeoipPrivateRanges_excludesPublicMappedIPv4 verifies the fail-open fix:
-// a public IPv4-mapped address (::ffff:8.8.8.8) must NOT match any private
+// a public 历史修复 address (::ffff:8.8.8.8) must NOT match any private
 // range, while mapped private (::ffff:192.168.1.1) and plain private
 // (192.168.1.1) addresses must. The prior ::ffff:0:0/96 entry matched the whole
 // mapped space and would have let public mapped clients 绕过 GeoIP blocking.
@@ -642,13 +642,13 @@ func TestLoadSecurityPolicyContext_carriesTriStateGateFields(t *testing.T) {
 		t.Fatalf("GeoIPMode=%q, want off", p.GeoIPMode)
 	}
 	// refs-only 信任合并集仍应装载（数据在，仅被开关门压制）
-	// 历史 历史问题：合并集规范化为 CIDR 形（裸 IP → /32），匹配语义等价
+	// 历史问题：合并集规范化为 CIDR 形（裸 IP → /32），匹配语义等价
 	if len(p.MergedWhitelist) != 1 || p.MergedWhitelist[0] != "198.51.100.7/32" {
 		t.Fatalf("MergedWhitelist=%v, want [198.51.100.7]", p.MergedWhitelist)
 	}
 }
 
-// 历史 历史问题：爬虫验证控制头（X-LB-Crawler-Verified/Spoof）由 caddygeoip
+// 历史问题：爬虫验证控制头（X-LB-Crawler-Verified/Spoof）由 caddygeoip
 // 在 coraza phase:1 之前注入并已消费，必须与 X-LB-GeoIP-* 同口径无条件剥离——
 // 无 GeoIP 策略绑定的规则（handler 不在场）下客户端伪造值绝不能直达上游。
 func TestRenderUpstreamStrip_crawlerHeaders(t *testing.T) {

@@ -12,7 +12,7 @@ import (
 )
 
 func TestExtractCRSTarball_rejectsEntryWhenDeclaredSizeOverflowsInt64(t *testing.T) {
-	// 历史修复 发现1：与 历史修复 A-#2（untarGzTo）同形的「先加后比」int64 溢出——
+	// 历史修复：与 历史修复（untarGzTo）同形的「先加后比」int64 溢出——
 	// totalBytes(≥1) + MaxInt64 回绕为负，> 500MB 判假，解压上限被绕过，
 	// 构造 tarball 可按声明体积写爆数据卷（新 tag 首次下载无 TOFU 基线可比，
 	// 该上限是最后一道防线）。修复后必须先减后比，按声明体积在写盘前拒绝。

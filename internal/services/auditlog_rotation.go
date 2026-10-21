@@ -28,7 +28,7 @@ var (
 	auditFailureLogClock = time.Now
 )
 
-// auditFailureLogWindow 是同一消息的放行窗口（60s，历史 历史修复 确立口径）。
+// auditFailureLogWindow 是同一消息的放行窗口（60s，历史修复 确立口径）。
 const auditFailureLogWindow = 60 * time.Second
 
 // auditFailureLogEvictCap 是限流 map 的键数上限：清扫后仍超此值即整体重置
@@ -84,13 +84,13 @@ func throttledAuditFailureLogf(format string, args ...any) {
 }
 
 // auditLogPath 是 Coraza 审计日志的路径；定义为变量以便测试注入临时目录
-// （生产环境为 /app/logs/历史修复/audit.log,2026-09-14 从 /app/waf/audit 迁入）。轮转检查由事件摄取的 2s tick 驱动
-// （securityevents.go StartSecurityEventsIngestion，历史问题 历史修复 移除从未被引用的
+// （生产环境为 /app/logs/waf-audit/audit.log,2026-09-14 从 /app/waf/audit 迁入）。轮转检查由事件摄取的 2s tick 驱动
+// （securityevents.go StartSecurityEventsIngestion，历史修复 移除从未被引用的
 // auditLogCheckInterval 死常量）。
 var auditLogPath = "/app/logs/waf-audit/audit.log"
 
 // AuditLogPath 返回审计日志文件路径(导出 getter——渲染/摄取/统计/目录创建
-// 四处单一源,SYSRENDE历史问题:字面量重复收敛)。
+// 四处单一源,历史问题:字面量重复收敛)。
 func AuditLogPath() string {
 	return auditLogPath
 }
@@ -130,12 +130,12 @@ func rotateAuditLogIfNeeded() (total int, rotErr error) {
 	pending, pendingErr := securityEventsReadPendingDelta()
 	if pendingErr != nil {
 		// 标记是否存在及其补采责任未知时不得 shift/覆盖任何归档；保留现场，
-		// 下轮读恢复后先重试补采。与其他轮转 I/O 错误同走 历史修复。
+		// 下轮读恢复后先重试补采。与其他轮转 I/O 错误同走 fail-closed。
 		return total, fmt.Errorf("read pending delta marker: %w", pendingErr)
 	}
 	if pending != nil {
 		if _, err := os.Stat(pending.Path); os.IsNotExist(err) {
-			// N+9 历史问题：warn 走 60s 限流（throttledAuditFailureLogf）——标记删除
+			// 历史问题：warn 走 60s 限流（throttledAuditFailureLogf）——标记删除
 			// 失败（只读目录等）时标记留在盘上，2s tick 反复进入本分支，裸 warn
 			// 每 tick 一条（~43k 行/天）；同归一化消息共享窗口，路径中数字已由
 			// digit key 归一为 #。消息内容保持原样。
@@ -161,7 +161,7 @@ func rotateAuditLogIfNeeded() (total int, rotErr error) {
 	// 轮转前记录已持久化的摄取偏移：tick 读到 EOF 后、复制完成前 Coraza 新写入
 	// 的事件只存在于 .1，活文件截断后 tailer 重置偏移也不会再读 .1，需在归档后
 	// 从 [persistedOffset, .1 size) 区间补采。
-	// 读取失败不得静默按 0 补采（历史 历史问题，用户裁定）：0 起点会把整个 .1
+	// 读取失败不得静默按 0 补采（历史问题，用户裁定）：0 起点会把整个 .1
 	// 重灌 security_events（transaction_id 唯一索引去重兜底，量级=全文件重复
 	// 解析）——留 warn 供诊断，行为保持 0 兜底（轮转不能因读取失败而阻塞）。
 	persistedOffset, offErr := securityEventsReadOffset(securityEventsOffsetPath)
@@ -217,7 +217,7 @@ func rotateAuditLogIfNeeded() (total int, rotErr error) {
 		}
 		// 活文件补采以归档语义进行（archive=true）：补采区间有界且完整内容已在
 		// 刚拷贝的 .1 中以归档语义摄取，活文件畸形区（≥4MB 无文档头）可安全跳过；
-		// 若按活文件语义 F1 报错，轮转每 2s 周期反复中止，文件永不截断（历史问题 F1）。
+		// 若按活文件语义 历史修复 报错，轮转每 2s 周期反复中止，文件永不截断（历史问题）。
 		if n, ierr := securityEventsIngestDeltaFrom(auditLogPath, ingestFrom, true); ierr != nil {
 			throttledAuditFailureLogf("audit log rotation: ingest live tail [%d, %d) failed (not truncating): %v", ingestFrom, tailInfo.Size(), ierr)
 			return total, fmt.Errorf("ingest live tail failed (not truncating): %w", ierr)
@@ -233,7 +233,7 @@ func rotateAuditLogIfNeeded() (total int, rotErr error) {
 	if finalInfo, ferr := os.Stat(auditLogPath); ferr == nil && finalInfo.Size() > archSize {
 		return total, rotErr
 	}
-	// F5: truncate 前先落 pending 标记。标记写失败绝不在无标记状态下截断——
+	// 历史修复: truncate 前先落 pending 标记。标记写失败绝不在无标记状态下截断——
 	// 活文件仍完好、内容无损失，本轮中止下周期重试。truncate 成功与补采完成之间
 	// 的任何崩溃点，标记都已在盘上（补采成功即删除、失败保留），下次轮转 shift 前
 	// 先重试，双向崩溃安全；truncate 失败则移除标记——活文件未截断、内容完整，
@@ -248,7 +248,7 @@ func rotateAuditLogIfNeeded() (total int, rotErr error) {
 		throttledAuditFailureLogf("audit log rotation: truncate failed (will retry next cycle): %v", err)
 		return total, fmt.Errorf("truncate failed (will retry next cycle): %w", err)
 	}
-	// M20（2026-09-05 审计）：truncate 成功后立即把持久化 offset 归零——此前
+	// 历史修复（2026-09-05 审计）：truncate 成功后立即把持久化 offset 归零——此前
 	// 依赖下次读取时的 size 比较（新 size < 旧 offset）才回退，窗口期内 offset
 	// 悬挂在旧文件大小上；写入失败仅告警不中断轮转（size 比对仍兜底）。
 	if err := securityEventsWriteOffset(securityEventsOffsetPath, 0); err != nil {
@@ -271,7 +271,7 @@ func rotateAuditLogIfNeeded() (total int, rotErr error) {
 }
 
 // securityEventsBackscanDocumentStart 后向扫描 [0, from) 内最近一个文档头 "\n{"
-// （历史修复 格式中下一个顶层文档的起始 `{`），返回该 `{` 的字节位置；
+// （pretty-print 格式中下一个顶层文档的起始 `{`），返回该 `{` 的字节位置；
 // 未找到（超大事务/畸形区）或打开失败时回退 from 本身。用于确定活文件补采起点：
 // copy 末次读可能截断在事务中部，从截断点直接解码会跳过该事务。回扫取全量区间
 // 而非固定窗口——回扫时活文件仍完好，from（归档大小）有界于轮转阈值（默认
@@ -279,7 +279,7 @@ func rotateAuditLogIfNeeded() (total int, rotErr error) {
 // 两半皆失。
 //
 // 实现为 1MB 分块从尾部向前读（而非一次 ReadAt 分配 from 字节）：阈值来自
-// audit_log_size_mb 且无上限校验，配置大值时整块分配会 OOM 崩溃循环（历史问题 F3）。
+// audit_log_size_mb 且无上限校验，配置大值时整块分配会 OOM 崩溃循环（历史问题）。
 // 文档头可跨块边界（前块末字节 '\n' + 后块首字节 '{'），跨块时返回后块起点。
 func securityEventsBackscanDocumentStart(path string, from int64) (int64, error) {
 	const chunkSize = 1 << 20
@@ -344,7 +344,7 @@ func copyAuditLogTo(src, dst string) error {
 		return err
 	}
 	// 归档必须在 truncate 活文件前真正落盘：否则掉电后 .1 可能为空/半截，
-	// pending 标记无从补采（历史 历史问题-1）。
+	// pending 标记无从补采（历史问题-1）。
 	if err := out.Sync(); err != nil {
 		_ = out.Close()
 		_ = os.Remove(tmp)
@@ -366,7 +366,7 @@ func auditLogBaseName() string {
 }
 
 // securityEventsPendingDelta 记录一次失败的归档补采：内容为待补采的归档路径 +
-// 起始偏移 + 归档大小，持久化为 <auditlog>.历史修复 标记文件。下次轮转
+// 起始偏移 + 归档大小，持久化为 <auditlog>.delta-pending 标记文件。下次轮转
 // shift 前先重试补采（成功才删除标记），防止 .1 被 shift 覆盖后事件永久丢失。
 type securityEventsPendingDelta struct {
 	Path   string `json:"path"`
@@ -387,7 +387,7 @@ func securityEventsWritePendingDelta(p securityEventsPendingDelta) error {
 	if err != nil {
 		return err
 	}
-	// D1-历史问题：单源原子落盘（tmp+fsync+父目录 fsync）——半写/掉电丢失标记
+	// 历史问题：单源原子落盘（tmp+fsync+父目录 fsync）——半写/掉电丢失标记
 	// 会让轮转窗口事件永久丢失。
 	return writeFileAtomicSynced(securityEventsPendingDeltaPath(), data, 0o644)
 }
@@ -416,7 +416,7 @@ func securityEventsReadPendingDelta() (*securityEventsPendingDelta, error) {
 	return &p, nil
 }
 
-// auditLogSizeCacheTTL 是轮转阈值的缓存窗口（N+11 历史修复）：2s 轮转 tick 在
+// auditLogSizeCacheTTL 是轮转阈值的缓存窗口（历史修复）：2s 轮转 tick 在
 // 日志非空时此前每轮都查主库取阈值，稳态每 2s 一条主库查询。阈值是管理端偶尔
 // 修改的常量，60s 生效延迟对按大小轮转无实际影响；缓存后稳态每 tick 仅一次
 // stat、零 DB 查询。主库读失败不缓存：回退 10MB 当轮生效、下一 tick 重试，

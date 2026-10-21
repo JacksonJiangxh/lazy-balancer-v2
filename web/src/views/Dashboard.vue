@@ -278,13 +278,13 @@
             stripe
             :header-cell-style="{ background: '#f9fafb' }"
           >
-            <!-- 历史问题 二十八次宽度二调（用户实测 458/230 失调）：min-width 弹性列按
+            <!-- 历史问题宽度二调（用户实测 458/230 失调）：min-width 弹性列按
                  值比例分配剩余空间（260:130 把 2/3 剩余给了状态码列）——改固定 width
                  才能精确控制比例；名称列取 280（内容列），右端空白由表格自然留白。 -->
             <el-table-column prop="name" label="规则名称" min-width="300" show-overflow-tooltip>
               <template #default="{ row }">
-                <!-- 历史问题 二十八次：长规则名省略号 + 悬浮全文（列宽 100→130 用户反馈调整）。 -->
-                <!-- 历史问题 二十八次审计 F1：省略号样式必须放在 slot 内层 span——el-link 根是
+                <!-- 历史问题：长规则名省略号 + 悬浮全文（列宽 100→130 用户反馈调整）。 -->
+                <!-- 历史问题审计 历史修复：省略号样式必须放在 slot 内层 span——el-link 根是
                      inline-flex，text 直接内容在 .el-link__inner flex item 里，根上的
                      text-overflow 不会渲染 …（flex 容器无自有行盒），只硬裁切。 -->
                 <el-link type="primary" underline="never" role="button" tabindex="0" :title="row.name" @click.prevent="openRuleHistory(row)" @keydown.enter.prevent="openRuleHistory(row)" @keydown.space.prevent="openRuleHistory(row)"><span style="display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{{ row.name }}</span></el-link>
@@ -315,7 +315,7 @@
                 <span class="text-primary" :title="ruleMetricCellTitle({ disabled: isRuleDisabled(row), unavailable: !!ruleMetricsUnavailable[row.caddy_id], tcp: row.protocol === 'tcp', value: ruleMetrics[row.caddy_id]?.requests_total?.toLocaleString() ?? '-' })">{{ isRuleDisabled(row) ? '已禁用' : ruleMetricsUnavailable[row.caddy_id] ? '采集失败' : ruleMetrics[row.caddy_id]?.requests_total?.toLocaleString() ?? '-' }}</span>
               </template>
             </el-table-column>
-            <!-- 历史问题 二十八次初版 310 过宽（用户反馈）→ 260：常见量级（万级以内）
+            <!-- 历史问题初版 310 过宽（用户反馈）→ 260：常见量级（万级以内）
                  四 badge 单行 ~230px 舒适；极端大数字（百万级）由 flex-wrap 换行
                  兜底（badge 自身 nowrap，不出现数字内折）。
                  历史（用户反馈）：入站/出站流量列 90→100（字节量级数字易被截），
@@ -391,8 +391,8 @@
       </div>
       <el-empty v-if="ruleHistoryUnsupported" description="TCP 规则暂无历史流量统计（四层代理无流量计数指标）" :image-size="60" />
       <template v-else>
-        <!-- W87-06：加载失败 ≠ 该时间范围无数据——失败态与空态分文案（同页
-             A85WB-历史问题「采集失败 ≠ 无数据」固化口径），并提供重试。 -->
+        <!-- 历史修复：加载失败 ≠ 该时间范围无数据——失败态与空态分文案（同页
+             历史修复「采集失败 ≠ 无数据」固化口径），并提供重试。 -->
         <el-alert v-if="ruleHistoryError" type="error" :closable="false" show-icon class="polling-error-alert error-banner history-error-alert">
           <template #title>
             <div class="polling-error-title">
@@ -500,7 +500,7 @@ const connEstablishedHistory = ref<number[]>([])
 const connTimeWaitHistory = ref<number[]>([])
 const connTimestamps = ref<number[]>([])
 
-// W87-07：节点角色三态（fail-closed 展示）——nodeMode 为 null（/config 首拉失败
+// 历史修复：节点角色三态（fail-closed 展示）——nodeMode 为 null（/config 首拉失败
 // 或 15s 重试窗口内）时不显示「主节点」：同页写控件按 readOnlyReason（含
 // 'unknown'）隐藏，展示层不能反向宣告「主节点」误导运维。
 const nodeModeRole = computed<'master' | 'slave' | 'unknown'>(() => {
@@ -511,7 +511,7 @@ const nodeModeRole = computed<'master' | 'slave' | 'unknown'>(() => {
 const nodeModeLabel = computed(() => nodeModeRole.value === 'master' ? '主节点' : nodeModeRole.value === 'slave' ? '从节点' : '节点角色未知')
 const nodeModeTagType = computed(() => nodeModeRole.value === 'master' ? 'success' : nodeModeRole.value === 'slave' ? 'warning' : 'info')
 
-// W87-08：caddyStatus 取值 running/stopped/unknown，样式类须映射——原先直接拼
+// 历史修复：caddyStatus 取值 running/stopped/unknown，样式类须映射——原先直接拼
 // caddyStatus 使 `.status-tag.info`（未知态灰底）零命中。
 const caddyStatusClass = computed(() => caddyStatus.value === 'running' ? 'running' : caddyStatus.value === 'stopped' ? 'stopped' : 'info')
 
@@ -566,7 +566,7 @@ const ruleHistoryRows = ref<RuleHistoryRow[]>([])
 const ruleHistoryBucketSeconds = ref(0)
 const ruleHistoryLoading = ref(false)
 const ruleHistoryUnsupported = ref(false)
-// W87-06：请求失败必须与「该时间范围内暂无数据」区分（否则取证/排障会被误导）。
+// 历史修复：请求失败必须与「该时间范围内暂无数据」区分（否则取证/排障会被误导）。
 const ruleHistoryError = ref('')
 
 const openRuleHistory = (rule: Rule) => {
@@ -626,7 +626,7 @@ const diffCounters = (previous: RuleHistoryRow, current: RuleHistoryRow): RuleHi
     requests: current.requests_total - previous.requests_total,
     status2xx: current.requests_2xx - previous.requests_2xx,
     status3xx: current.requests_3xx - previous.requests_3xx,
-    // F4(历史):历史图 4xx 与实时表同口径扣除 Block(钳制 ≥0)——
+    // 历史修复(历史):历史图 4xx 与实时表同口径扣除 Block(钳制 ≥0)——
     // 存储双列(当次裁定),展示面不再双计。
     status4xx: Math.max(0, (current.requests_4xx - previous.requests_4xx) - (current.requests_blocked - previous.requests_blocked)),
     status5xx: current.requests_5xx - previous.requests_5xx,
@@ -643,7 +643,7 @@ const ruleHistoryDeltas = computed(() => {
     const previous = ruleHistoryRows.value[index - 1]
     const current = ruleHistoryRows.value[index]
     if (!previous || !current) continue
-    // 缺 timestamp 的行给空标签而非抛 TypeError（S-02）：formatDate 恒返回 string，
+    // 缺 timestamp 的行给空标签而非抛 TypeError（历史修复）：formatDate 恒返回 string，
     // 原 `?.slice(5,16) || current.timestamp.slice(5,16)` 在行缺 timestamp 时触发 undefined.slice。
     labels.push(current.timestamp ? (formatDate(current.timestamp).slice(5, 16) || '') : '')
     deltas.push(diffCounters(previous, current))
@@ -684,8 +684,8 @@ const ruleRankValue = (caddyId: string): number => {
 }
 
 const rankableRules = computed(() => {
-  // W87-05：单条规则指标缺失时 ruleRankValue=0 会被「>0」过滤掉，外观等同
-  // 「无流量」且逐列「采集失败」分支永不渲染（A85WB-历史问题 只覆盖了全表失败）。
+  // 历史修复：单条规则指标缺失时 ruleRankValue=0 会被「>0」过滤掉，外观等同
+  // 「无流量」且逐列「采集失败」分支永不渲染（历史修复 只覆盖了全表失败）。
   // 采集失败的行必须可见——排在正常行之后，保持「故障 ≠ 无数据」口径。
   const ranked = rules.value.filter((rule) =>
     ruleRankValue(rule.caddy_id) > 0 || ruleMetricsUnavailable.value[rule.caddy_id] === true,
@@ -699,7 +699,7 @@ const rankableRules = computed(() => {
 })
 
 const sortedRules = computed(() => {
-  // W87-05：失败行不占排行榜的 10 个名额——前 10 按指标排，失败行全部追加在
+  // 历史修复：失败行不占排行榜的 10 个名额——前 10 按指标排，失败行全部追加在
   // 末尾。否则 10 条有流量规则会把失败行挤出 slice，故障再次静默消失。
   const ranked = rankableRules.value.filter((rule) => ruleMetricsUnavailable.value[rule.caddy_id] !== true)
   const failed = rankableRules.value.filter((rule) => ruleMetricsUnavailable.value[rule.caddy_id] === true)
@@ -709,7 +709,7 @@ const sortedRules = computed(() => {
 const rulesEmptyText = computed(() => {
   if (rulesUnavailable.value) return '采集失败'
   if (rules.value.length === 0) return '暂无负载均衡规则'
-  // A85WB-历史问题：指标采集失败 ≠ 无流量——失败口径与页面其它「采集失败」一致，
+  // 历史修复：指标采集失败 ≠ 无流量——失败口径与页面其它「采集失败」一致，
   // 不再把采集故障误报为「暂无请求/流量数据」。
   if (caddyMetricsUnavailable.value) return '采集失败'
   return rankBy.value === 'bytes' ? '暂无流量数据' : '暂无请求数据'
@@ -728,7 +728,7 @@ const ipList = computed(() => {
   return Object.entries(ips).map(([iface, ip]) => ({ iface, ip }))
 })
 
-// FE40-D1-2：策略文案映射提取至 utils/strategyLabels（死键 round_robin 已删）。
+// 历史修复：策略文案映射提取至 utils/strategyLabels（死键 round_robin 已删）。
 
 const getRuleProtocolLabel = (rule: Rule): 'HTTP' | 'HTTPS' | 'TCP' => {
   if (rule.protocol === 'tcp') return 'TCP'
@@ -809,7 +809,7 @@ const fetchAllData = (roundSignal?: AbortSignal): Promise<void> => {
   if (disposed) return Promise.resolve()
   if (fetchAllDataPromise) return fetchAllDataPromise
 
-  // FE43-7(历史):删除手造 Authorization 头——api.ts 请求拦截器对全部
+  // 历史修复(历史):删除手造 Authorization 头——api.ts 请求拦截器对全部
   // 同域相对路径请求统一从 localStorage 注入同一 token(api.ts:186-196)。
   // 轮询轮次传入本轮 signal（pause/stop 可取消在途请求）；手动刷新（Caddy
   // 操作后的补偿刷新）无轮次可用，回落页级永久 signal（随卸载终止）。
@@ -869,7 +869,7 @@ const fetchAllData = (roundSignal?: AbortSignal): Promise<void> => {
       caddyMetricsUnavailable.value = true
       hostMetricsUnavailable.value = true
       overviewUnavailable.value = true
-      // 历史 历史问题: 移除 rulesUnavailable.value = true（与 /rules then 竞态）。
+      // 历史问题: 移除 rulesUnavailable.value = true（与 /rules then 竞态）。
       // rulesUnavailable 由 /rules 自己的 then/catch 管理，避免双 setter 竞态。
       ruleMetricsUnavailable.value = buildRuleMetricsUnavailable(rules.value, undefined, false)
     }),
@@ -974,7 +974,7 @@ const fetchRuleHealth = async (currentRules: Rule[], version: number, roundSigna
       ruleHealthUnavailable.value = false
     }
   } catch (e) {
-    // 历史问题 D-N6：与成功分支同款版本守卫——跨版本在途失败不污染新版本规则集的
+    // 历史问题：与成功分支同款版本守卫——跨版本在途失败不污染新版本规则集的
     // 健康列（短暂全「-」误判）。
     if (!disposed && version === rulesVersion) {
       ruleHealthUnavailable.value = true

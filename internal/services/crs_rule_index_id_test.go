@@ -2,7 +2,7 @@ package services
 
 import "testing"
 
-// 历史修复8：CRS 规则索引的 id: 匹配必须限定在动作串（最后一个引号字面量）内，
+// 历史修复：CRS 规则索引的 id: 匹配必须限定在动作串（最后一个引号字面量）内，
 // 并剥离其内部 msg/tag 单引号内容——否则数据操作数或 msg/tag 文本里的
 // "id:9xxxxx" 会生成幻影规则 ID（放行不存在规则的保存 / 混合选组补删真实 ID）。
 func TestParseCRSRuleFileContent_noPhantomIDFromOperandOrMsg(t *testing.T) {

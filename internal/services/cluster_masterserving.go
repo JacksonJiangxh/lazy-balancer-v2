@@ -152,7 +152,7 @@ func masterSyncServingRound(ctx context.Context, now time.Time, w *masterServing
 
 	seen := make(map[int64]bool, len(nodes))
 	online, offlineCount, lagging := 0, 0, 0
-	// 每节点阈值与 ComputeNodeStatus/updateOverview 同口径（F-历史问题-02）——
+	// 每节点阈值与 ComputeNodeStatus/updateOverview 同口径（历史问题-02）——
 	// max(2×全局 sync_interval, 下限 120s)+脏值 clamp 归一到 nodeOfflineThreshold，
 	// 同一轮全节点同值（全局列）。
 	threshold := nodeOfflineThreshold(syncInterval)
@@ -204,7 +204,7 @@ func masterSyncServingRound(ctx context.Context, now time.Time, w *masterServing
 	}
 
 	// 小时级心跳：全绿才记（异常在挂→静默，异常已 WARN 留痕）。
-	// D1-历史问题：异常轮必须清零窗口——原实现只按轮数自增/满 60 清零，窗口内
+	// 历史问题：异常轮必须清零窗口——原实现只按轮数自增/满 60 清零，窗口内
 	// 出现离线/滞后后，恢复仅数轮就可能在「仅数轮全绿」时输出「服务面正常」
 	// 心跳（与 configwatchdog 的漂移清零窗口口径分叉）。
 	if offlineCount > 0 || lagging > 0 {
@@ -216,7 +216,7 @@ func masterSyncServingRound(ctx context.Context, now time.Time, w *masterServing
 		return
 	}
 	w.quietRounds = 0
-	// D1-历史问题：异常轮已在上方提前返回，此处 offlineCount/lagging 恒为 0——
+	// 历史问题：异常轮已在上方提前返回，此处 offlineCount/lagging 恒为 0——
 	// 原 switch 的第二个 case 是恒真死分支，按无条件输出收敛。
 	if len(nodes) == 0 {
 		TaskLogf("cluster-sync", "serving", "服务面正常：无从节点注册")

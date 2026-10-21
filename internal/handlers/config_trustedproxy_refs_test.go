@@ -124,7 +124,7 @@ func TestUpdateConfig_trustedProxyRefs_rejectsInvalidListEntry(t *testing.T) {
 	}
 }
 
-// SYS-F3（历史 历史问题）：总量门此前只挂在 refs 载荷分支——inline-only 更新
+// 历史修复（历史问题）：总量门此前只挂在 refs 载荷分支——inline-only 更新
 // 时库中既有引用展开不参与合计，「内联 ≤64 + 存量 refs 展开 1999」可破
 // 2000 上限（非对称）。钉：inline 载荷 + 库中存量 refs 超总量组合 → 400；
 // 未超总量 → 200（回归形状）。
@@ -185,13 +185,13 @@ func TestConfigBackup_trustedProxyRangeRefsRoundTrip(t *testing.T) {
 	if _, err := db.DB.Exec(`INSERT INTO users (id, username, password_hash, role, display_name, is_enabled) VALUES (2, 'backup-admin', 'hash', 'admin', 'Backup Admin', 1) ON CONFLICT(id) DO NOTHING`); err != nil {
 		t.Fatal(err)
 	}
-	// U04d-02：id 3 是内置威胁名单（db 种子）——内置名单引用自本轮起 400
+	// 历史修复：id 3 是内置威胁名单（db 种子）——内置名单引用自本轮起 400
 	// 拒绝（威胁名单条目在 .iplist 文件，DB entries 恒空会让格式/总量门失效），
 	// 本往返用例改用不冲突的自定义 id。
 	if _, err := db.DB.Exec(`UPDATE global_config SET trusted_proxy_range_refs='[903,907]' WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
-	// D3（历史）导入门后语义：refs 存在性按「备份内优先 ∪ 库内」解析
+	// 历史修复（历史）导入门后语义：refs 存在性按「备份内优先 ∪ 库内」解析
 	//——真实备份的被引用名单随 security_ip_lists 表导出，此处种两行使备份
 	// 自洽（带外直写悬空 refs 的旧形态现在导入 400，见 r74c 门钉测）。
 	for _, id := range []int64{903, 907} {
@@ -241,7 +241,7 @@ func TestConfigBackup_trustedProxyRangeRefsRoundTrip(t *testing.T) {
 	}
 }
 
-// 历史问题（历史 历史问题）：引用展开计数曾按原始 len(entries) 累加，而逐条校验
+// 历史问题（历史）：引用展开计数曾按原始 len(entries) 累加，而逐条校验
 // 与渲染层都跳过空 value 条目——名单含空条目（带外改库/旧数据）时，实际
 // 展开 ≤2000 的合法载荷会被总量门 400 拒绝。钉：两侧（refs 载荷分支与
 // inline-only 存量分支）都只计通过校验的非空条目。

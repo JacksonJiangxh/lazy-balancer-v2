@@ -15,11 +15,11 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// D5-S1 / D5-S4（N+11 轮）：MFASetup 的 otpauth 账号位与 pending 密钥落库。
-// - D5-S1：账号位此前用数字 ID（getContextUserID），所有用户的 Authenticator
+// 历史修复：MFASetup 的 otpauth 账号位与 pending 密钥落库。
+// - 历史修复：账号位此前用数字 ID（getContextUserID），所有用户的 Authenticator
 //   条目都显示「LazyBalancer:1」不可区分；services/mfa.go 约定 accountName
 //   即用户名，jwtAuth/apiKeyAuth 均已注入 c username。
-// - D5-S4：pending 密钥此前两段写（先清后设、第二段错误经 err==nil 门吞掉），
+// - 历史修复：pending 密钥此前两段写（先清后设、第二段错误经 err==nil 门吞掉），
 //   首成次败时已向客户端返回 200+secret 而 pending 为空——用户扫码后 activate
 //   必报「没有待激活的 MFA 密钥」；且两语句间存在瞬时空窗。修复为单条
 //   UPDATE 原子落库，失败显式 500。
@@ -34,7 +34,7 @@ func seedMfaSetupUser(t *testing.T) {
 }
 
 // TestMFASetup_otpauthAccountNameUsesUsername：首绑 setup 返回的 otpauth URI
-// 账号位应为用户名（D5-S1）。修复前：LazyBalancer:1（数字 ID，全员同名）。
+// 账号位应为用户名（历史修复）。修复前：LazyBalancer:1（数字 ID，全员同名）。
 func TestMFASetup_otpauthAccountNameUsesUsername(t *testing.T) {
 	// Given 未启用 MFA 的用户 operator（id=1）
 	h := newBackupTestHandlers(t)
@@ -58,7 +58,7 @@ func TestMFASetup_otpauthAccountNameUsesUsername(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 	if !strings.Contains(body.Data.URI, "LazyBalancer:operator") {
-		t.Fatalf("uri=%s, want 账号位含用户名 operator（D5-S1：不应再用数字 ID）", body.Data.URI)
+		t.Fatalf("uri=%s, want 账号位含用户名 operator（历史修复：不应再用数字 ID）", body.Data.URI)
 	}
 	if strings.Contains(body.Data.URI, "LazyBalancer:1?") || strings.HasSuffix(body.Data.URI, "LazyBalancer:1") {
 		t.Fatalf("uri=%s, want 不含数字 ID 账号位 LazyBalancer:1", body.Data.URI)
@@ -66,7 +66,7 @@ func TestMFASetup_otpauthAccountNameUsesUsername(t *testing.T) {
 }
 
 // TestMFASetup_persistsPendingSecretAndResetsFailCounter：成功路径单响应窗口
-// 内 secret 落库且失败计数清零（D5-S4 原子形状的可观测面）。
+// 内 secret 落库且失败计数清零（历史修复 原子形状的可观测面）。
 func TestMFASetup_persistsPendingSecretAndResetsFailCounter(t *testing.T) {
 	// Given 未启用 MFA、pending 失败计数=3 的用户
 	h := newBackupTestHandlers(t)
@@ -102,7 +102,7 @@ func TestMFASetup_persistsPendingSecretAndResetsFailCounter(t *testing.T) {
 }
 
 // mfaPendingWriteFailingConnector 按 SQL 路由的假 db.DB：mfa_enabled 读返回
-// 未启用行，pending 写注入故障（同 历史问题/历史问题 假连接器模式）。
+// 未启用行，pending 写注入故障（同 历史问题 假连接器模式）。
 type mfaPendingWriteFailingConnector struct{}
 
 func (mfaPendingWriteFailingConnector) Connect(context.Context) (driver.Conn, error) {
@@ -146,7 +146,7 @@ func (mfaPendingWriteFailingConn) ExecContext(_ context.Context, query string, _
 }
 
 // TestMFASetup_pendingWriteFailure_returns500：pending 写入失败必须显式 500
-// 「保存 MFA 密钥失败」，不得 200 返回 secret 而 pending 为空（D5-S4）。
+// 「保存 MFA 密钥失败」，不得 200 返回 secret 而 pending 为空（历史修复）。
 // 修复前：两段写的清空语句失败即整体跳过，200 + 空 pending + 用户扫码白扫。
 func TestMFASetup_pendingWriteFailure_returns500(t *testing.T) {
 	// Given 真库种子用户 + 写入路径注入故障的假 DB
@@ -171,7 +171,7 @@ func TestMFASetup_pendingWriteFailure_returns500(t *testing.T) {
 	}
 }
 
-// B3-82-历史问题：activate 的 pending 读取故障必须 500 且不得计入验证码失败；
+// 历史修复：activate 的 pending 读取故障必须 500 且不得计入验证码失败；
 // 普通错误验证码仍保持 400 + 计数的回归契约。
 func TestMFAActivate_pendingFailureClassification(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -214,7 +214,7 @@ func TestMFAActivate_pendingFailureClassification(t *testing.T) {
 	}
 }
 
-// B3-82-历史问题：已启用 MFA 的用户重绑时验码失败属于高敏失败尝试，必须留审计。
+// 历史修复：已启用 MFA 的用户重绑时验码失败属于高敏失败尝试，必须留审计。
 func TestMFASetup_rebindVerificationFailureWritesAudit(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	seedMfaResetUsers(t, true)

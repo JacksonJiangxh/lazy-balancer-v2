@@ -21,7 +21,7 @@ func forceRenameFailure(t *testing.T) {
 }
 
 func TestCopyFile_atomicWriteNoTmpResidue(t *testing.T) {
-	// Given 历史问题 历史问题：copyFile 原子落盘（D1-历史问题 起为同目录唯一临时名
+	// Given 历史问题：copyFile 原子落盘（历史问题 起为同目录唯一临时名
 	// .<base>-<rand>.tmp + fsync；成功后只留目标文件）
 	root := t.TempDir()
 	src := filepath.Join(root, "src.xdb")
@@ -144,7 +144,7 @@ func TestCRSUpdateRun_successWhenRenameUnavailable(t *testing.T) {
 	}
 }
 
-// TestCRSUpdateRun_backupCopyFailureLeavesNoPartialRulesBak 验证 历史问题 B-N2(a)：
+// TestCRSUpdateRun_backupCopyFailureLeavesNoPartialRulesBak 验证 历史问题(a)：
 // rules→rules.bak 的备份拷贝中途失败（ENOSPC/EIO 类故障）时不得残留部分
 // rules.bak——旧实现直接 copyDir 到 rules.bak，失败留下残树，restoreBackup
 // 无完整性校验即消费它，会把残树搬入 live、WAF 静默削弱。事务化备份
@@ -180,7 +180,7 @@ func TestCRSUpdateRun_backupCopyFailureLeavesNoPartialRulesBak(t *testing.T) {
 		t.Fatalf("message=%q, want the backup failure cause", message)
 	}
 	if _, err := os.Stat(crsTransientPath(m.crsDir, "rules.bak")); !os.IsNotExist(err) {
-		t.Fatal("partial rules.bak must not exist after a failed backup copy (历史问题 B-N2)")
+		t.Fatal("partial rules.bak must not exist after a failed backup copy (历史问题)")
 	}
 	if _, err := os.Stat(crsTransientPath(m.crsDir, "rules.bak.tmp")); !os.IsNotExist(err) {
 		t.Fatal("rules.bak.tmp staging must be cleaned up after a failed backup copy")
@@ -189,14 +189,14 @@ func TestCRSUpdateRun_backupCopyFailureLeavesNoPartialRulesBak(t *testing.T) {
 		t.Fatal("live rules tree must be untouched")
 	}
 	if _, err := os.Lstat(filepath.Join(m.crsDir, "rules", "REQUEST-901.conf")); err != nil {
-		t.Fatal("live rules tree must stay complete: a partial bak must not replace it (历史问题 B-N2)")
+		t.Fatal("live rules tree must stay complete: a partial bak must not replace it (历史问题)")
 	}
 }
 
 // TestCRSUpdateRun_installFailureRemovesFreshlyCreatedOverrides 验证审计场景：
 // 手动改过 crs-setup.conf（迁移 diff 非空）且 overrides 由本次迁移新建，重载
 // 失败后 overrides 被删除、旧 setup 恢复——恢复后的重载不再重复应用同一批
-// 自定义行（历史问题 S3）。
+// 自定义行（历史问题）。
 func TestCRSUpdateRun_installFailureRemovesFreshlyCreatedOverrides(t *testing.T) {
 	// Given a live setup with user customizations and no pre-existing overrides
 	m := newTestCRSManager(t)
@@ -251,7 +251,7 @@ func TestCRSUpdateRun_installFailureRemovesFreshlyCreatedOverrides(t *testing.T)
 }
 
 // TestCRSUpdateRun_installFailureRestoresPreexistingOverrides 验证 overrides 在
-// 更新前已存在（前次迁移产物）时，安装失败后其内容被还原而非保留本次覆写（历史问题 S3）。
+// 更新前已存在（前次迁移产物）时，安装失败后其内容被还原而非保留本次覆写（历史问题）。
 func TestCRSUpdateRun_installFailureRestoresPreexistingOverrides(t *testing.T) {
 	// Given a live setup with user customizations and a pre-existing overrides file
 	m := newTestCRSManager(t)
@@ -289,7 +289,7 @@ func TestCRSUpdateRun_installFailureRestoresPreexistingOverrides(t *testing.T) {
 
 // TestCRSUpdateRun_preservedOverridesBakSurvivesNextRunFailure 验证 历史问题 1.1：
 // 运行 N 因还原失败保全的 zz-user-overrides.conf.bak（三-1 唯一恢复副本），在
-// 运行 N+1 创建新备份前失败时不得被先行清除——旧实现 L91 无条件 os.Remove 会在
+// 运行 N+1 创建新备份前失败时不得被先行清除——旧实现 历史修复 无条件 os.Remove 会在
 // 新备份尚未创建时毁掉该副本，恢复路径全失。
 func TestCRSUpdateRun_preservedOverridesBakSurvivesNextRunFailure(t *testing.T) {
 	// Given 运行 N 保全的 overrides 备份 + N+1 备份 crs-setup.conf 时失败
@@ -381,7 +381,7 @@ func TestCRSRollbackAfterReloadFailure_blocksWhileWafFileLockHeld(t *testing.T) 
 	writeTestFile(t, filepath.Join(m.crsDir, "rules", "REQUEST-901-INITIALIZATION.conf"), "SecRule live")
 	writeTestFile(t, filepath.Join(crsTransientPath(m.crsDir, "rules.bak"), "REQUEST-901-INITIALIZATION.conf"), "SecRule old")
 	writeTestFile(t, filepath.Join(m.crsDir, crsVersionFile), "v4.15.0\n")
-	m.rulesBakCreated = true // 本运行已创建 rules.bak（历史修复 历史问题 守卫）
+	m.rulesBakCreated = true // 本运行已创建 rules.bak（历史问题 守卫）
 
 	probeBlocksUnderWafFileLock(t, "CRS 重载失败回滚（树+VERSION+版本行）", func() {
 		m.rollbackAfterReloadFailure("v4.14.0")
@@ -403,7 +403,7 @@ func TestCRSRollbackAfterReloadFailure_blocksWhileWafFileLockHeld(t *testing.T) 
 	}
 }
 
-// 历史修复 历史问题（历史）：rules/setup/stock .bak 无「本运行创建」守卫——上一
+// 历史问题（历史）：rules/setup/stock .bak 无「本运行创建」守卫——上一
 // 运行在「备份已建→清理前」崩溃残留的完整备份，会在本运行到达备份点前失败
 // （如下载失败走 fail(..., true)）时被 restoreBackup 无条件消费：live 树/setup
 // 被回滚到崩溃前状态（若崩溃发生在 swap 后则与 DB 版本行分叉，同 历史问题 形态；
@@ -454,7 +454,7 @@ func TestCRSUpdateRun_staleBaksNotConsumedOnEarlyFailure(t *testing.T) {
 	}
 }
 
-// 历史修复 历史问题 回归形状（正向）：陈旧备份在场时，本运行到达备份点会用新备份覆盖
+// 历史问题 回归形状（正向）：陈旧备份在场时，本运行到达备份点会用新备份覆盖
 // 之（复制覆写语义不变），失败路径消费的是本运行备份——live 回到「本次更新前」
 // 状态而非崩溃前的陈旧状态。
 func TestCRSUpdateRun_thisRunBaksConsumedOnSwapFailure(t *testing.T) {

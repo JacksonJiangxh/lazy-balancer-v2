@@ -121,7 +121,7 @@ func (h *Handlers) MFAVerifyLogin(c *gin.Context) {
 			return
 		}
 		services.RecordAuditLog(user.Username, "认证拒绝", "用户认证", services.FormatAuditDetail("MFA", "验证码错误"), c.ClientIP())
-		// 历史问题 B-历史问题：挑战级失败计数——分布式 IP 限流绕过下对单挑战的爆破收敛
+		// 历史问题：挑战级失败计数——分布式 IP 限流绕过下对单挑战的爆破收敛
 		//（10 次作废，需重新走密码步取新挑战）。
 		_ = services.MFARecordChallengeFailure(req.MFAToken)
 		// 统一登录失败计数（开关语义见 recordLoginFailure）。
@@ -151,7 +151,7 @@ func (h *Handlers) MFAStatus(c *gin.Context) {
 }
 
 // MFASetup POST /auth/mfa/setup — 生成 pending secret + otpauth URI（未启用）。
-// 历史问题 历史问题：已启用 MFA 的用户重新 setup 需当前有效验证码确认（守卫验码放行
+// 历史问题：已启用 MFA 的用户重新 setup 需当前有效验证码确认（守卫验码放行
 // 或本层验码，见下）——此前无任何门：持被劫持会话即可静默轮换第二因子
 // （setup 响应明文返回新 secret + URI，攻击者配好自己的 authenticator 后
 // activate 即夺取 MFA；受害者未启用场景则被强开攻击者控制的 MFA = 永久
@@ -187,7 +187,7 @@ func rejectOIDCUserMFAOperation(c *gin.Context, targetUserID int) bool {
 // mfaVerifyFailureResponse 收敛「登录后验码失败」的响应与审计口径（历史修复，
 // 历史）：verr != nil = 查询/写库故障 → 500（不把底层 SQL 错误文本透给
 // 客户端、也不写「验证码错误」误导排障）；verr == nil = 真验证码错误 → 调用方
-// 既有审计文案 + 401。四处入口（重绑/禁用/历史修复/管理员重置）共用，与 Login
+// 既有审计文案 + 401。四处入口（重绑/禁用/step-up/管理员重置）共用，与 Login
 // 的 历史修复 及 MFAActivate 已确立的三态口径一致。
 func mfaVerifyFailureResponse(c *gin.Context, verr error, failureDetail string) {
 	if verr != nil {
@@ -223,7 +223,7 @@ func (h *Handlers) MFASetup(c *gin.Context) {
 	}
 	if mfaEnabled {
 		// 2026-09 用户裁定：登录后不再有密码输入要求——重绑仅验当前有效验证码
-		//（历史问题 历史问题 的验码确认保留；验码失败只提示不计数，全系统唯一锁定为
+		//（历史问题 的验码确认保留；验码失败只提示不计数，全系统唯一锁定为
 		// 登录阶段 5 次/10 分钟、受「登录失败锁定」开关控制）。
 		var req struct {
 			Code string `json:"code"`
@@ -283,7 +283,7 @@ func (h *Handlers) MFAActivate(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "MFA 验证服务暂时不可用，请稍后重试"})
 			return
 		}
-		// 历史问题 A-历史问题：pending 码失败计数——VerifyPending 无锁定无限流（loginRateLimit
+		// 历史问题：pending 码失败计数——VerifyPending 无锁定无限流（loginRateLimit
 		// 只挂公开路由），持会话者可对 10^6 码空间暴力；5 次失败作废 pending（重新
 		// setup 才能再试），与挑战级计数同为与全局开关无关的硬闸。
 		if invalidated := services.MFARecordPendingFailure(userID); invalidated {
@@ -325,11 +325,11 @@ func (h *Handlers) MFADisable(c *gin.Context) {
 		return
 	}
 	// 历史问题(历史,历史问题,历史问题 同形对齐):守卫验码放行路径(标记在)跳过
-	// 本层验码——守卫/历史修复 已消费 TOTP 时间片,前端 428 重试带同码时
+	// 本层验码——守卫/verify-step 已消费 TOTP 时间片,前端 428 重试带同码时
 	// 同片重放拒绝使禁用流程结构性必 401;机器身份/守卫关(无标记)本层验码保持。
 	if !mfaStepUpVerifiedInContext(c) {
 		if ok, verr := services.MFAVerifyTOTPCode(userID, req.Code, time.Now()); !ok {
-			// B5 高敏动作的失败尝试与成功同等可审计（对齐 MFAResetByAdmin 前置验码失败留痕）。
+			// 历史修复 高敏动作的失败尝试与成功同等可审计（对齐 MFAResetByAdmin 前置验码失败留痕）。
 			mfaVerifyFailureResponse(c, verr, services.FormatAuditDetail("禁用 MFA 前验证失败", services.AuditResultPart("failure")))
 			return
 		}
@@ -342,9 +342,9 @@ func (h *Handlers) MFADisable(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "MFA 已禁用"})
 }
 
-// MFARecoveryCodes POST /auth/mfa/历史修复 — 重生成恢复码（2026-09 用户
+// MFARecoveryCodes POST /auth/mfa/recovery-codes — 重生成恢复码（2026-09 用户
 // 裁定：登录后不再有密码输入要求，JWT 会话即确认；会话安全为信任边界）。
-// U7a-历史问题（历史）：补 OIDC 门——五个 MFA 写入口仅此一处缺席，与
+// 历史问题（历史）：补 OIDC 门——五个 MFA 写入口仅此一处缺席，与
 // setup/activate/disable 同为自助端点，targetUserID=0（操作自己，从 JWT 取）。
 func (h *Handlers) MFARecoveryCodes(c *gin.Context) {
 	if rejectOIDCUserMFAOperation(c, 0) {
@@ -355,7 +355,7 @@ func (h *Handlers) MFARecoveryCodes(c *gin.Context) {
 	}
 	userID := int(contextUserID(c))
 	var enabled bool
-	// B3-历史问题（历史）：DB 读失败不得并入「MFA 未启用」400——
+	// 历史问题（历史）：DB 读失败不得并入「MFA 未启用」400——
 	// 基础设施故障 500，业务态未启用保持 400。
 	if err := db.DB.QueryRow("SELECT COALESCE(mfa_enabled,0) FROM users WHERE id=?", userID).Scan(&enabled); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取 MFA 状态失败"})
@@ -397,11 +397,11 @@ func (h *Handlers) MFAVerifyStep(c *gin.Context) {
 	// 重签 JWT：保留原身份声明，仅刷新 mfa_ts（与 respondLogin 同构；node_mode 重读）
 	var user models.User
 	var passwordVersion int64
-	// B3-历史问题（历史）：重读用户的 DB 错误不得并入 401「用户不可用」
+	// 历史问题（历史）：重读用户的 DB 错误不得并入 401「用户不可用」
 	// ——基础设施故障 500；行缺失/禁用保持 401（JWT 仍有效但账号已不可用）。
 	// 历史修复（历史）：重读列必须含 auth_provider（COALESCE 与登录路径同
-	// 口径）——漏列会让所有 历史修复 响应的 auth_provider 变成 ""，且存量
-	// OIDC 行（mfa_enabled=1）在 历史修复 成功后丢掉 auth_method=oidc 声明
+	// 口径）——漏列会让所有 step-up 响应的 auth_provider 变成 ""，且存量
+	// OIDC 行（mfa_enabled=1）在 verify-step 成功后丢掉 auth_method=oidc 声明
 	// （middleware 的 MFA 门短路与集群票据直通依赖该声明）。
 	if err := db.DB.QueryRow(`SELECT id, username, role, display_name, is_enabled, created_at, last_login, password_version, COALESCE(auth_provider,'local') FROM users WHERE id=?`, userID).
 		Scan(&user.ID, &user.Username, &user.Role, &user.DisplayName, &user.IsEnabled, &user.CreatedAt, &user.LastLogin, &passwordVersion, &user.AuthProvider); err != nil {
@@ -418,7 +418,7 @@ func (h *Handlers) MFAVerifyStep(c *gin.Context) {
 // —— Admin 端点 ——
 
 // mfaStepUpVerifiedInContext:守卫(开启态)验码放行路径的标记优先;开关
-// 关闭或机器身份时守卫未运行,无标记,本层验码保持(S历史问题:消除
+// 关闭或机器身份时守卫未运行,无标记,本层验码保持(历史问题:消除
 // handler 重读开关的毫秒窗 TOCTOU——开关在中间件后翻转不再产生
 // 「守卫未验码+本层跳过」的免验窗口)。历史问题(MFAResetByAdmin)起用,
 // 历史问题(历史)提升为包级供 MFA 自助写端点(禁用/重绑确认)复用。
@@ -455,11 +455,11 @@ func (h *Handlers) MFAResetByAdmin(c *gin.Context) {
 	// MFADisable 的双重确认同语义；无密码项：admin 路由已过 JWT + 用户管理
 	// 确认弹框承担意图确认）。
 	// 历史问题（用户裁决）：写操作守卫（mfaStepUpGuard）开启时第一层豁免——守卫已对
-	// 本写操作完成验码（60 秒窗内静默放行或 428→历史修复 刷新 mfa_ts），再验
-	// 一次会在 TOTP 重放保护下同片互斥：历史修复 消费时间片后第一层无码可用，
+	// 本写操作完成验码（60 秒窗内静默放行或 428→verify-step 刷新 mfa_ts），再验
+	// 一次会在 TOTP 重放保护下同片互斥：verify-step 消费时间片后第一层无码可用，
 	// 必 401（验证码错误→踢出登录→连续失败触发 10 分钟锁定）。
 	// mfaStepUpVerifiedInContext:守卫(开启态)验码放行路径的标记优先;开关
-	// 关闭或机器身份时守卫未运行,无标记,本层验码保持(S历史问题:消除
+	// 关闭或机器身份时守卫未运行,无标记,本层验码保持(历史问题:消除
 	// handler 重读开关的毫秒窗 TOCTOU——开关在中间件后翻转不再产生
 	// 「守卫未验码+本层跳过」的免验窗口)。
 	// 历史问题 补正（审计 问题-3）：守卫真正验过码的只有 JWT 路径——mfaStepUpGuard

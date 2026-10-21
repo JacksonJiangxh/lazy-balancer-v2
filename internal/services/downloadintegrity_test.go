@@ -1,6 +1,6 @@
 package services
 
-// allow: SIZE_OK — TOFU download-integrity regression tests (历史问题 F4/F5).
+// allow: SIZE_OK — TOFU download-integrity regression tests (历史问题).
 
 import (
 	"database/sql"
@@ -18,7 +18,7 @@ import (
 
 // TestRecordDownloadIntegrity_concurrentSourcesNoLostUpdate 验证两个更新调度器
 // （CRS / ip2region）同小时并发下载时，共享记录文件的 load-modify-persist 不丢
-// 更新、不撕裂文件（历史问题 F4）。
+// 更新、不撕裂文件（历史问题）。
 func TestRecordDownloadIntegrity_concurrentSourcesNoLostUpdate(t *testing.T) {
 	dir := t.TempDir()
 	oldPath := downloadIntegrityPath
@@ -70,7 +70,7 @@ func TestRecordDownloadIntegrity_concurrentSourcesNoLostUpdate(t *testing.T) {
 }
 
 // TestRecordDownloadIntegrity_quarantinesCorruptRecordsFile 验证损坏的记录文件
-// 被隔离（.corrupt-* 保留现场）、基线从头重建，而非静默禁用 TOFU 检查（历史问题 F5）。
+// 被隔离（.corrupt-* 保留现场）、基线从头重建，而非静默禁用 TOFU 检查（历史问题）。
 func TestRecordDownloadIntegrity_quarantinesCorruptRecordsFile(t *testing.T) {
 	dir := t.TempDir()
 	oldPath := downloadIntegrityPath
@@ -99,7 +99,7 @@ func TestRecordDownloadIntegrity_quarantinesCorruptRecordsFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// S历史问题：隔离告警的审计载荷在 recordDownloadIntegrity 内以 pending 形式
+	// 历史问题：隔离告警的审计载荷在 recordDownloadIntegrity 内以 pending 形式
 	// 锁外落库；此处再次装载的是已修复的记录文件，不得再生待落审计。
 	if len(audits) != 0 {
 		t.Fatalf("已修复记录文件不得再产生待落审计, got %#v", audits)
@@ -120,7 +120,7 @@ func TestRecordDownloadIntegrity_quarantinesCorruptRecordsFile(t *testing.T) {
 	}
 }
 
-// S历史问题（历史）：审计库被外部写锁占住（RecordAuditLog 阻塞）时，
+// 历史问题（历史）：审计库被外部写锁占住（RecordAuditLog 阻塞）时，
 // 完整性记录不得持 downloadIntegrityMu 等审计 I/O——另一族更新调度器的
 // load-modify-persist 必须立即可进入（历史问题 的同族约定）。
 func TestRecordDownloadIntegrity_releasesLockBeforeAuditIO(t *testing.T) {

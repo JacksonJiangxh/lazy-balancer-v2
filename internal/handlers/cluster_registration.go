@@ -19,7 +19,7 @@ import (
 // （无 JWT/API Key 认证），超大体可撑爆审计库（历史问题）。
 const registerRequestMaxBytes = 16 << 10
 
-// registerAuditField 限制写入审计详情的节点字段：截断至 128B（回退合法 历史修复
+// registerAuditField 限制写入审计详情的节点字段：截断至 128B（回退合法 UTF-8
 // 边界）并去除控制字符，防未认证请求注入超长内容或伪造日志换行（历史问题）。
 func registerAuditField(s string) string {
 	s = strings.Map(func(r rune) rune {
@@ -56,7 +56,7 @@ func (h *Handlers) GenerateClusterRegisterToken(c *gin.Context) {
 }
 
 func (h *Handlers) RegisterClusterNode(c *gin.Context) {
-	// 历史修复 历史问题：导入窗口 历史修复（全量替换 nodes，窗口写入会被覆盖或阻塞）。
+	// 历史问题：导入窗口 fast-fail（全量替换 nodes，窗口写入会被覆盖或阻塞）。
 	if rejectNodeWriteDuringImport(c) {
 		return
 	}
@@ -72,13 +72,13 @@ func (h *Handlers) RegisterClusterNode(c *gin.Context) {
 	registration, err := h.clusterService.RegisterNode(c.Request.Context(), req, time.Now())
 	if err != nil {
 		if errors.Is(err, services.ErrInvalidRegisterToken) {
-			// 无效令牌路径不携带攻击者输入，详情与响应均用通用文案（历史问题/8）
+			// 无效令牌路径不携带攻击者输入，详情与响应均用通用文案（历史问题）
 			services.RecordAuditLog("system", "注册失败", "集群节点", "注册令牌无效", c.ClientIP())
 			clusterError(c, http.StatusUnauthorized, "注册令牌无效或已过期", err)
 			return
 		}
 		if errors.Is(err, services.ErrNotMasterNode) {
-			// 历史问题-历史问题：SQL 级角色条件命中 0 行（降级竞态）→ 403，与
+			// 历史问题：SQL 级角色条件命中 0 行（降级竞态）→ 403，与
 			// requireMaster 同文案同头形状，不折叠成 500。
 			clusterMasterForbidden(c, err)
 			return
@@ -119,7 +119,7 @@ func (h *Handlers) GetClusterRegistrationStatus(c *gin.Context) {
 		clusterError(c, http.StatusBadRequest, "注册编号无效", err)
 		return
 	}
-	// 历史问题-04：同族机器端点（register/confirm/snapshot/历史修复/report）均有
+	// 历史问题-04：同族机器端点（register/confirm/snapshot/waf-files/report）均有
 	// 主节点门，仅本端点缺失——降级后的主节点按 历史问题 保留 nodes 行，残留
 	// 注册行仍可被应答 approved 并重发集群令牌。权限面不扩大（令牌由 secret
 	// 确定性派生），但角色门必须一致收敛。
@@ -206,7 +206,7 @@ func (h *Handlers) UpdateClusterNodeSiteCoordinates(c *gin.Context) {
 		return
 	}
 	if err := h.clusterService.UpdateNodeSiteCoordinates(c.Request.Context(), id, *req.ServerMapLat, *req.ServerMapLon); err != nil {
-		// 历史修复 历史问题：服务层降级竞态 403 与 requireMaster 门同源带头。
+		// 历史问题：服务层降级竞态 403 与 requireMaster 门同源带头。
 		if errors.Is(err, services.ErrNotMasterNode) {
 			clusterMasterForbidden(c, err)
 			return
@@ -241,7 +241,7 @@ func (h *Handlers) UpdateClusterNodeAccessURL(c *gin.Context) {
 }
 
 func (h *Handlers) clusterNodeAction(c *gin.Context, action string, operation func(int) error) {
-	// 历史修复 历史问题：审批/拒绝/删除共用的写端点收口——导入窗口 409 历史修复。
+	// 历史问题：审批/拒绝/删除共用的写端点收口——导入窗口 409 fast-fail。
 	if rejectNodeWriteDuringImport(c) {
 		return
 	}
@@ -254,7 +254,7 @@ func (h *Handlers) clusterNodeAction(c *gin.Context, action string, operation fu
 		return
 	}
 	if err := operation(id); err != nil {
-		// 历史修复 历史问题：服务层降级竞态 403 与 requireMaster 门同源带头。
+		// 历史问题：服务层降级竞态 403 与 requireMaster 门同源带头。
 		if errors.Is(err, services.ErrNotMasterNode) {
 			clusterMasterForbidden(c, err)
 			return

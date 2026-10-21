@@ -1,4 +1,4 @@
-// 拦截页归因行为验收（审计 87 W87-01）：逐条对照后端渲染事实
+// 拦截页归因行为验收（历史修复）：逐条对照后端渲染事实
 //   internal/services/caddy.go —— buildBlockPageErrorRoute（阶段 1 预检合并 403 兜底）、
 //   buildRateLimitErrorRoute（阶段 2 恒 429）、blockStatusForPolicy（阶段 3 逐策略
 //   合成码 483+，规则级 stage3 覆盖 → 恒 482）、阶段 1/3 规则级覆盖路由（481/482）。
@@ -121,7 +121,7 @@ test('全链无有效页 → none（回落 Caddy 默认 403）', () => {
   assert.equal(resolveBlockPageAttribution(3, chain).effective, 'none')
 })
 
-test('W87-05：拦截页列表未落地时不得判定缺失（不出假警告）', () => {
+test('拦截页列表未落地时不得判定缺失（不出假警告）', () => {
   const pages = [{ id: 7, content: '<p>blocked</p>' }]
   // 未落地：任何判定都返回 false（「未知」而非「已删除」）
   assert.equal(blockPageMissing(7, pages, false), false)
@@ -137,7 +137,7 @@ test('W87-05：拦截页列表未落地时不得判定缺失（不出假警告�
 
 // ---- 接线钉：视图是否真的消费上面的单源实现（纯函数测试全绿但视图回退不会红）----
 
-test('W87-01 接线：SecurityPolicies 逐阶段归因消费 resolveBlockPageAttribution', () => {
+test('接线：SecurityPolicies 逐阶段归因消费 resolveBlockPageAttribution', () => {
   const text = source('src/views/security/SecurityPolicies.vue')
   assert.match(text, /import \{[^}]*resolveBlockPageAttribution[^}]*\} from '@\/utils\/securityStages'/)
   assert.match(text, /const results = stages\.map\(\(stage\) =>\s*resolveBlockPageAttribution\(/)
@@ -148,7 +148,7 @@ test('W87-01 接线：SecurityPolicies 逐阶段归因消费 resolveBlockPageAtt
   assert.match(text, /v-for="\(note, i\) in row\.blockPageNotes"/)
 })
 
-test('W87-05 接线：拦截页缺失判定消费单源谓词且受加载门约束', () => {
+test('接线：拦截页缺失判定消费单源谓词且受加载门约束', () => {
   const text = source('src/views/security/SecurityPolicies.vue')
   assert.match(text, /blockPageMissing\(e\.blockPageId \?\? 0, blockPages\.value, blockPagesLoaded\.value\)/)
   assert.match(text, /if \(bpRes\.status === 'fulfilled'\) \{ blockPages\.value = bpRes\.value\.data \|\| \[\]; blockPagesLoaded\.value = true \}/)

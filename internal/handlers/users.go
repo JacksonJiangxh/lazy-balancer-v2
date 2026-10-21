@@ -34,7 +34,7 @@ func (h *Handlers) ListUsers(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "数据库错误"})
 			return
 		}
-		// CI87-08：mfa_enabled 由构造器单源填充，删除手工补字段。
+		// 历史修复：mfa_enabled 由构造器单源填充，删除手工补字段。
 		response := models.NewUserResponse(u, mfaEnabled == 1)
 		response.AuthProvider = authProvider
 		users = append(users, response)
@@ -48,6 +48,11 @@ func (h *Handlers) ListUsers(c *gin.Context) {
 }
 
 func (h *Handlers) CreateUser(c *gin.Context) {
+	// users 在导入全量替代表清单内：窗口内写入会被静默覆盖或阻塞至
+	// busy_timeout——与节点写族同口径 409 fast-fail（历史修复），先于解析 body。
+	if rejectWriteDuringImport(c, "执行用户写操作") {
+		return
+	}
 	var req models.CreateUserRequest
 	if !guardConfiguredJSONBody(c) {
 		return
@@ -104,7 +109,7 @@ func passwordResetColumns() []string {
 	}
 }
 
-// revokeMFAChallenges 改密时吊销在册 MFA 登录挑战（历史 U04c-02）：
+// revokeMFAChallenges 改密时吊销在册 MFA 登录挑战（历史修复）：
 // 三条改密路径（管理员更新/重置、自助改密）都必须在同一事务内调用——
 // 版本绑定是主防线，删除保证旧挑战不以任何路径残留。
 func revokeMFAChallenges(tx *sql.Tx, userID int) error {
@@ -113,6 +118,10 @@ func revokeMFAChallenges(tx *sql.Tx, userID int) error {
 }
 
 func (h *Handlers) UpdateUser(c *gin.Context) {
+	// 导入窗口 409（历史修复，同 CreateUser）。
+	if rejectWriteDuringImport(c, "执行用户写操作") {
+		return
+	}
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil || id <= 0 {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "用户 ID 无效"})
@@ -146,10 +155,10 @@ func (h *Handlers) UpdateUser(c *gin.Context) {
 	// 2026-09-18 用户裁定:OIDC 用户显示名/密码源自 IdP,管理员亦不可改
 	// (角色/启停是本地管理语义,不受限)。历史问题:username 同为 IdP 源属性
 	// (JIT 取 preferred_username),与显示名/密码同一裁定口径一并拦截。
-	// B1-04（历史）：空 password 键在策略层语义为「不修改」
+	// 历史修复（历史）：空 password 键在策略层语义为「不修改」
 	// （validatePasswordPolicy 空值放行、passwordHash 仅非空生成）——携带
 	// 空串不算改密尝试，不得触发 OIDC 门；非空仍拦截。
-	// B1-历史问题（历史）：门控按「值实际变化」而非「字段出现」判定——
+	// 历史问题（历史）：门控按「值实际变化」而非「字段出现」判定——
 	// 携带与库中同值的 display_name、空 username 属无变更的局部更新（写侧
 	// 同样跳过，见下方 UPDATE 分支），不得整单 400。故门控前移到事务内读到
 	// 旧值之后再判。
@@ -186,7 +195,7 @@ func (h *Handlers) UpdateUser(c *gin.Context) {
 		return
 	}
 
-	// OIDC 门（值变化判定，见上方 B1-历史问题）：username 空串/同值、display_name
+	// OIDC 门（值变化判定，见上方 历史问题）：username 空串/同值、display_name
 	// 同值均为「不修改」（与下方 UPDATE 分支同一谓词），非空密码恒视为改密尝试。
 	usernameChanged := req.Username != nil && *req.Username != "" && *req.Username != oldUsername
 	displayNameChanged := req.DisplayName != nil && *req.DisplayName != oldDisplayName
@@ -215,13 +224,13 @@ func (h *Handlers) UpdateUser(c *gin.Context) {
 	sets := make([]string, 0, 5)
 	args := make([]any, 0, 5)
 	if usernameChanged {
-		if err := validateUsernamePolicy(*req.Username); err != nil { // 历史问题-历史问题：改名须过策略（创建/注册已查、更新曾漏）
+		if err := validateUsernamePolicy(*req.Username); err != nil { // 历史问题：改名须过策略（创建/注册已查、更新曾漏）
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 			return
 		}
 		sets = append(sets, "username = ?")
 		args = append(args, *req.Username)
-		// S历史问题:审计记旧→新(角色降权等高敏变更可取证重建;密码只记名)。
+		// 历史问题:审计记旧→新(角色降权等高敏变更可取证重建;密码只记名)。
 		changed = append(changed, "用户名："+oldUsername+"→"+*req.Username)
 	}
 	if req.Role != nil && *req.Role != "" && *req.Role != oldRole {
@@ -263,7 +272,7 @@ func (h *Handlers) UpdateUser(c *gin.Context) {
 			return
 		}
 		if rowsAffected == 0 {
-			// SYS-F4（历史 历史问题）：0 行按 COUNT 分判（镜像 ToggleUserStatus
+			// 历史修复（历史）：0 行按 COUNT 分判（镜像 ToggleUserStatus
 			// 先例）——行已消失（并发删除）→ 404；行仍在=末管理员 EXISTS 门
 			// 拦截 → 409。此前一律 409 会把并发删除误报成管理员锁。
 			var exists int
@@ -279,14 +288,14 @@ func (h *Handlers) UpdateUser(c *gin.Context) {
 	}
 	var user models.User
 	var authProvider string
-	// U04c-02：改密成功后在提交前吊销在册 MFA 挑战。
+	// 历史修复：改密成功后在提交前吊销在册 MFA 挑战。
 	if passwordHash != "" {
 		if err := revokeMFAChallenges(tx, id); err != nil {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新用户失败"})
 			return
 		}
 	}
-	// B1-历史问题：响应必须回填 mfa_enabled（与 GET /users 同口径）——此前
+	// 历史问题：响应必须回填 mfa_enabled（与 GET /users 同口径）——此前
 	// NewUserResponse 无该字段，PUT 响应恒为 false，API 消费者/脚本误判。
 	var mfaEnabled int
 	if err := tx.QueryRowContext(c.Request.Context(), `SELECT id,username,role,display_name,is_enabled,created_at,last_login,COALESCE(auth_provider,'local'),COALESCE(mfa_enabled,0) FROM users WHERE id=?`, id).
@@ -332,6 +341,10 @@ func isOIDCUser(ctx context.Context, userID int) (bool, error) {
 const setupAdminUserID = 1
 
 func (h *Handlers) DeleteUser(c *gin.Context) {
+	// 导入窗口 409（历史修复，同 CreateUser）。
+	if rejectWriteDuringImport(c, "执行用户写操作") {
+		return
+	}
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil || id <= 0 {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "用户 ID 无效"})
@@ -402,7 +415,7 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 		}
 		cascadeKeyIDs = append(cascadeKeyIDs, keyID)
 	}
-	// F-SYSR-2（历史）：级联 Key 清单迭代失败须留痕——cascadeKeyIDs 缺项
+	// 历史修复（历史）：级联 Key 清单迭代失败须留痕——cascadeKeyIDs 缺项
 	// 意味着对应 Key 的白名单解析缓存不被清扫（孤儿缓存驻留，无越权面；
 	// 删除照常——warn-only 口径）。
 	if err := keyRows.Err(); err != nil {
@@ -441,13 +454,17 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 }
 
 func (h *Handlers) ToggleUserStatus(c *gin.Context) {
+	// 导入窗口 409（历史修复，同 CreateUser）。
+	if rejectWriteDuringImport(c, "执行用户写操作") {
+		return
+	}
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil || id <= 0 {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "用户 ID 无效"})
 		return
 	}
 
-	// B1-历史问题：*bool——缺省/拼错字段不得被零值当成「禁用」。{
+	// 历史问题：*bool——缺省/拼错字段不得被零值当成「禁用」。{
 	// 请求体 {} 此前绑定成功且 IsEnabled=false，直接把用户静默停用。
 	var req struct {
 		IsEnabled *bool `json:"is_enabled"`
@@ -465,7 +482,7 @@ func (h *Handlers) ToggleUserStatus(c *gin.Context) {
 	}
 	enable := *req.IsEnabled
 
-	// SYSRENDE历史问题-3(历史):自禁用防护——禁用自己=当前会话立即
+	// 历史问题(历史):自禁用防护——禁用自己=当前会话立即
 	// 失效,与 DeleteUser 自保护(历史问题-2)不对称。UI 已挡/API 未挡。
 	if !enable {
 		if userIDInt := int(contextUserID(c)); userIDInt == id {
@@ -518,7 +535,7 @@ func (h *Handlers) ToggleUserStatus(c *gin.Context) {
 		return
 	}
 	var statusUsername string
-	// B1-05（历史）：审计富化回填不再静默吞错——读失败与其余 DB
+	// 历史修复（历史）：审计富化回填不再静默吞错——读失败与其余 DB
 	// 错误同口径 500（tx 未提交，操作随回滚不生效）。
 	if err := tx.QueryRowContext(c.Request.Context(), "SELECT username FROM users WHERE id = ?", id).Scan(&statusUsername); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新用户状态失败"})
@@ -538,6 +555,10 @@ func (h *Handlers) ToggleUserStatus(c *gin.Context) {
 }
 
 func (h *Handlers) ResetUserPassword(c *gin.Context) {
+	// 导入窗口 409（历史修复，同 CreateUser）。
+	if rejectWriteDuringImport(c, "执行用户写操作") {
+		return
+	}
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil || id <= 0 {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "用户 ID 无效"})
@@ -576,7 +597,7 @@ func (h *Handlers) ResetUserPassword(c *gin.Context) {
 		return
 	}
 
-	// 单条 UPDATE 事务（保持 G2 事务化改造的回滚完整性，M6 吊销已按用户裁定移除）。
+	// 单条 UPDATE 事务（保持 历史修复 事务化改造的回滚完整性，历史修复 吊销已按用户裁定移除）。
 	tx, err := db.DB.BeginTx(c.Request.Context(), nil)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "重置密码失败"})
@@ -605,13 +626,13 @@ func (h *Handlers) ResetUserPassword(c *gin.Context) {
 		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "用户不存在"})
 		return
 	}
-	// U04c-02：密码重置吊销在册 MFA 挑战（与更新/自助改密同语义）。
+	// 历史修复：密码重置吊销在册 MFA 挑战（与更新/自助改密同语义）。
 	if err := revokeMFAChallenges(tx, id); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "重置密码失败"})
 		return
 	}
 	var resetUsername string
-	// B1-05（历史）：同 ToggleUserStatus——审计富化回填读失败 500。
+	// 历史修复（历史）：同 ToggleUserStatus——审计富化回填读失败 500。
 	if err := tx.QueryRowContext(c.Request.Context(), "SELECT username FROM users WHERE id = ?", id).Scan(&resetUsername); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "重置密码失败"})
 		return

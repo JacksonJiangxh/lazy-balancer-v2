@@ -1,6 +1,6 @@
 package handlers
 
-// SYS-F1（历史 历史问题）：AutoBackupSettings 读侧钳制不对称——keep 有越界回退
+// 历史修复（历史问题）：AutoBackupSettings 读侧钳制不对称——keep 有越界回退
 // （1-30 外回退 7），day 却原样返回。越界存量 day（如 weekly=15 / monthly=40）
 // 会直接渲染到 UI 的日期下拉，展示层与调度消费端（weekly 1-7、monthly 1-28、
 // daily 忽略）判据分叉。修复=读侧按 frequency 钳制，越界回退 1（DB 默认），

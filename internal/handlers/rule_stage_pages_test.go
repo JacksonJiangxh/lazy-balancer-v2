@@ -106,7 +106,7 @@ func TestRule_stageBlockPages_validation(t *testing.T) {
 		{"dangling stage3 page", `{"name":"stage","protocol":"http","domain":"stage.example.test","listen_port":8080,"block_page_stage3_id":999}`},
 		{"stage1 status out of set", `{"name":"stage","protocol":"http","domain":"stage.example.test","listen_port":8080,"block_page_stage1_id":7,"block_page_stage1_status":418}`},
 		{"stage3 status out of set", `{"name":"stage","protocol":"http","domain":"stage.example.test","listen_port":8080,"block_page_stage3_id":8,"block_page_stage3_status":500}`},
-		// LBH79-历史问题：有状态码、无页 id → 渲染永不消费的死配置，必须 400。
+		// 历史问题：有状态码、无页 id → 渲染永不消费的死配置，必须 400。
 		{"stage1 status without page", `{"name":"stage","protocol":"http","domain":"stage.example.test","listen_port":8080,"block_page_stage1_status":503}`},
 		{"stage3 status without page", `{"name":"stage","protocol":"http","domain":"stage.example.test","listen_port":8080,"block_page_stage3_status":403}`},
 	}

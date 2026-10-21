@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-// TestCopyDirTransactional_renameFailureCleansTmp 验证 历史修复 B-#2：最终
+// TestCopyDirTransactional_renameFailureCleansTmp 验证 历史修复：最终
 // rename(tmp→dst) 失败时完整暂存树 rules.bak.tmp 必须清理（与 copyFile 的
 // rename 失败清理对称），不得残留完整拷贝供未来任何 *.tmp 扫描路径误消费。
 func TestCopyDirTransactional_renameFailureCleansTmp(t *testing.T) {
@@ -31,12 +31,12 @@ func TestCopyDirTransactional_renameFailureCleansTmp(t *testing.T) {
 		t.Fatal("copyDirTransactional should fail when the final rename is blocked")
 	}
 	if _, sErr := os.Stat(dst + ".tmp"); !os.IsNotExist(sErr) {
-		t.Fatal("tmp staging tree must be removed when the final rename fails (R50 B-#2)")
+		t.Fatal("tmp staging tree must be removed when the final rename fails (历史修复)")
 	}
 }
 
-// TestRestoreBackup_partialRulesBakWithoutProbeSkipped 验证 历史修复 B-#3：rules.bak
-// 含若干 .conf 但缺探针文件（pre-历史修复 裸 copyDir 留下的部分残树）时
+// TestRestoreBackup_partialRulesBakWithoutProbeSkipped 验证 历史修复：rules.bak
+// 含若干 .conf 但缺探针文件（历史修复 裸 copyDir 留下的部分残树）时
 // restoreBackup 拒绝消费——「≥1 个 .conf」的旧门会放行它，用部分树替换完整
 // live 树，WAF 规则数量静默减少。
 func TestRestoreBackup_partialRulesBakWithoutProbeSkipped(t *testing.T) {
@@ -48,7 +48,7 @@ func TestRestoreBackup_partialRulesBakWithoutProbeSkipped(t *testing.T) {
 	writeTestFile(t, filepath.Join(m.crsDir, "crs-setup.conf"), "# live")
 
 	// When 尝试还原备份
-	m.rulesBakCreated = true // 本运行已创建 rules.bak（历史修复 P2-1 守卫——守卫之后仍由探针门拦截）
+	m.rulesBakCreated = true // 本运行已创建 rules.bak（历史修复 守卫——守卫之后仍由探针门拦截）
 	m.restoreBackup()
 
 	// Then live 规则树未被部分 bak 替换，bak 留在原地供排查（未消费）
@@ -64,7 +64,7 @@ func TestRestoreBackup_partialRulesBakWithoutProbeSkipped(t *testing.T) {
 	}
 }
 
-// TestCRSUpdateRun_successCleansRulesOldResidue 验证 历史修复 B-#4：成功路径清理
+// TestCRSUpdateRun_successCleansRulesOldResidue 验证 历史修复：成功路径清理
 // 上一次失败更新崩溃窗口留下的 rules.old 残留——否则它只能等下一次失败的
 // 更新才被 restoreRulesBackup 开头清理，可长期占用一整棵规则树的磁盘。
 func TestCRSUpdateRun_successCleansRulesOldResidue(t *testing.T) {
@@ -90,11 +90,11 @@ func TestCRSUpdateRun_successCleansRulesOldResidue(t *testing.T) {
 		t.Fatalf("update_status=%q (%s), want success", status, message)
 	}
 	if _, err := os.Stat(crsTransientPath(m.crsDir, "rules.old")); !os.IsNotExist(err) {
-		t.Fatal("rules.old residue should be cleaned on the success path (R50 B-#4)")
+		t.Fatal("rules.old residue should be cleaned on the success path (历史修复)")
 	}
 }
 
-// TestSeedCRSRules_partialLiveTreeIsReseeded 验证 历史修复 B-#5：崩溃窗口
+// TestSeedCRSRules_partialLiveTreeIsReseeded 验证 历史修复：崩溃窗口
 // （moveTree copyDir 回退直写 live 中途崩溃）留下的部分规则树——目录存在、
 // 有 .conf 但缺探针文件——不得让 SeedCRSRules 早退，应清除后重新播种。
 func TestSeedCRSRules_partialLiveTreeIsReseeded(t *testing.T) {
@@ -123,8 +123,8 @@ func TestSeedCRSRules_partialLiveTreeIsReseeded(t *testing.T) {
 	}
 }
 
-// TestIP2RegionUpdateRun_failOpenMessageCarriesRollbackCause 验证 历史修复 B-#6：
-// 回滚升级链全部失败走 历史修复 时，DB message 必须携带回滚失败根因——
+// TestIP2RegionUpdateRun_failOpenMessageCarriesRollbackCause 验证 历史修复：
+// 回滚升级链全部失败走 fail-open 时，DB message 必须携带回滚失败根因——
 // 仅进组件日志会让运维把磁盘/DB 状态误判为纯重载问题。
 func TestIP2RegionUpdateRun_failOpenMessageCarriesRollbackCause(t *testing.T) {
 	// Given 全部回滚基线失败：reloader 首次失败时将 live 换成目录，此后

@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-// nodeHealthWarn 是节点列表 health_json 解析失败的限频状态（S历史问题-08）：
+// nodeHealthWarn 是节点列表 health_json 解析失败的限频状态（历史问题-08）：
 // Nodes() 每次节点列表请求都会碰到同一坏行，前端轮询（秒级/十秒级）下同一条
 // warn 会持续刷屏。与同包 snapshotRowIsolation / throttled*Logf 家族同口径：
 // 同一 nodeID 在窗口内只告警一次，插入时顺带回收过期键（节点 ID 有界）。
@@ -47,11 +47,11 @@ func warnNodeHealthParseThrottled(nodeID int, cause error, now time.Time) {
 // RoleOf 读取节点角色（主节点=true）的单源实现（历史问题-07）。COALESCE(is_master,1)
 // 与 readonly 写闸（readonly.go）及 cluster_version 触发器口径一致：历史库 NULL
 // 视为主节点。历史问题 迁移（db.go）已回填存量 NULL，稳态不可达，
-// 此处为纵深防御一致性（2026-09-06 集群审计 历史问题 / W10 复核结论）——此前裸
+// 此处为纵深防御一致性（2026-09-06 集群审计 历史问题 / 历史修复 复核结论）——此前裸
 // SELECT 对 NULL Scan 失败会使 requireMaster/Promote 走 500，
 // 同一脏数据在两守卫处语义相反。
 //
-// 读失败语义由调用方决定（历史修复 主节点 / 500 / 跳过本轮）：本函数只做
+// 读失败语义由调用方决定（fail-open 主节点 / 500 / 跳过本轮）：本函数只做
 // 单源读取，不做策略；新调用点禁止再内联 SQL（历史：25 处重复实现已
 // 出现失败语义分叉，本批先收敛 cluster 相关点，residual 见修复报告）。
 func RoleOf(ctx context.Context, database *sql.DB) (bool, error) {
@@ -79,7 +79,7 @@ func (s *ClusterService) BecomeSlave(ctx context.Context, masterURL string, regi
 	}
 	// 换主与升主同样需要排干旧拓扑已准入的拉取：否则旧主快照的提交后
 	// 阶段可能越过新凭据落库点，继续物化旧配置/触发旧 Caddy 重载。
-	// S历史问题-06：同库全部实例逐个排干（只处理最后注册的一个会漏掉在途 apply）。
+	// 历史问题-06：同库全部实例逐个排干（只处理最后注册的一个会漏掉在途 apply）。
 	drainers := syncDrainersFor(s.db)
 	if len(drainers) > 0 {
 		for _, drainer := range drainers {
@@ -133,12 +133,12 @@ func (s *ClusterService) BecomeSlave(ctx context.Context, masterURL string, regi
 		}
 	}
 	// 历史问题-06：角色翻转显式失效快照缓存。缓存键只有 version/ownership/开关，
-	// 降级瞬间在途的 历史修复 Run 可越过角色检查写库且 is_master=0 不 bump
+	// 降级瞬间在途的 master-only Run 可越过角色检查写库且 is_master=0 不 bump
 	// 版本——若此后未发生任何 apply 就再次升主，旧缓存会被当作权威下发。
 	clusterSnapshotCaches.Delete(s.db)
 	// 历史问题-05：角色翻转后主节点期间的分区上报缓存不再有权威来源。
 	s.clearAllSectionReports()
-	// 角色翻转由引擎 SetRole 唯一驱动：历史修复 任务统一停调，历史修复
+	// 角色翻转由引擎 SetRole 唯一驱动：master-only 任务统一停调，cluster-sync
 	// 经 RestartOnRoleFlip 换代为从节点分支；无管理器/旧调度器旁路。
 	if te := TaskEngine(); te != nil {
 		te.SetRole(false)
@@ -146,7 +146,7 @@ func (s *ClusterService) BecomeSlave(ctx context.Context, masterURL string, regi
 		// 不会覆盖主节点期间被用户停止的 loopEnabled——切从是本机拓扑变更
 		// （等价基线的 StartSync 直调），不同步即为静默脱管，必须显式恢复调度。
 		te.StartLoop("cluster-sync")
-		// 历史问题：偏好表若仍保留主节点期间的 历史修复=0，下次重启会再次
+		// 历史问题：偏好表若仍保留主节点期间的 cluster-sync=0，下次重启会再次
 		// 停同步。切从是显式拓扑变更——持久偏好同步恢复（写失败仅告警，
 		// 当前进程已启动）。
 		if err := RecordTaskLoopPref("cluster-sync", true); err != nil {
@@ -207,8 +207,8 @@ func (s *ClusterService) UpdateSettings(ctx context.Context, req models.ClusterS
 		}
 	}
 	// 系统数据恒同步(2026-09-11 裁定):users/api_keys/ACME 等确保系统基本
-	// 运行的数据不可禁用同步(证书任务行与文件随负载规则开关,历史问题 历史修复)。
-	// S历史问题:哨兵错误使 handler 映射 400(客户端错误,与间隔校验同型)。
+	// 运行的数据不可禁用同步(证书任务行与文件随负载规则开关,历史修复)。
+	// 历史问题:哨兵错误使 handler 映射 400(客户端错误,与间隔校验同型)。
 	if req.SyncUsers != nil && !*req.SyncUsers {
 		return ErrSyncUsersLocked
 	}
@@ -256,7 +256,7 @@ func (s *ClusterService) Status(ctx context.Context) (models.ClusterStatus, erro
 	// 历史问题-1(历史)/历史问题-1(历史幻影修复修正——clamp 曾被误插
 	// 在上方 return 之后不可达,go vet unreachable 实证):展示口径与运行时 clamp
 	// 对齐(cluster_sync.go 的 run 循环 interval clamp,<10 → 60)——存量脏值
-	// (0/负/1-9s)不再原样展示与运行时分叉。(D2-历史问题:原注释的固定行号已漂移,
+	// (0/负/1-9s)不再原样展示与运行时分叉。(历史问题:原注释的固定行号已漂移,
 	// 改为符号化定位。)
 	status.SyncInterval = normalizeSyncInterval(status.SyncInterval)
 	status.LastSyncError, status.SyncErrorCode = decodeSyncError(storedSyncError)
@@ -316,7 +316,7 @@ func (s *ClusterService) Nodes(ctx context.Context, now time.Time) ([]models.Clu
 		// 单节点 health_json 损坏只降级该节点（Health=nil），不拖垮整个节点列表
 		health, decodeErr := DecodeClusterHealth(healthJSON)
 		if decodeErr != nil {
-			// S历史问题-08：同一坏行按 nodeID 限频告警（节点页轮询不再刷屏）。
+			// 历史问题-08：同一坏行按 nodeID 限频告警（节点页轮询不再刷屏）。
 			warnNodeHealthParseThrottled(node.ID, decodeErr, now)
 		} else {
 			node.Health = health
@@ -336,7 +336,7 @@ func (s *ClusterService) Nodes(ctx context.Context, now time.Time) ([]models.Clu
 	return nodes, nil
 }
 
-// attachSectionSync 为已上报分区哈希的节点聚合 历史修复 同步状态：主节点
+// attachSectionSync 为已上报分区哈希的节点聚合 per-section 同步状态：主节点
 // 自身节哈希与同步开关过滤每次请求只计算一次；任一依赖读取失败时整体降级
 // （所有节点 SectionSync 保持 nil，等同旧版本从节点占位），绝不把错误上抛
 // 拖垮节点列表，也绝不展示可能失真的「全部滞后」。
@@ -448,7 +448,7 @@ func (s *ClusterService) clearAllSectionReports() {
 	clear(s.sectionReports)
 }
 
-// ClearNodeSectionReports（历史修复 历史问题/历史修复，历史修复主审授权扩展）：
+// ClearNodeSectionReports（历史问题/历史修复，历史修复主审授权扩展）：
 // 拓扑整体恢复（备份导入）删除节点时，按库遍历登记的全部 ClusterService
 // 实例清除该节点的分区上报缓存（与 clusterServicesFor 同模式——缓存是实例
 // 本地状态，需逐实例清理）。仅用于「节点已被删除」的清理；仍存在的节点
@@ -463,7 +463,7 @@ func ClearNodeSectionReports(database *sql.DB, nodeID int) {
 
 func (s *ClusterService) ReportNode(ctx context.Context, nodeID int, report models.ClusterReport, now time.Time) error {
 	health := report.Health
-	// 历史问题-2:last_sync_error 落库前与从端写侧同口径截断(512B + 历史修复
+	// 历史问题-2:last_sync_error 落库前与从端写侧同口径截断(512B + UTF-8
 	// 边界回退)——64KB 错误串不再撑大 nodes 行与 health_json。
 	if len(report.LastSyncError) > 512 {
 		report.LastSyncError = string(truncateValidUTF8Tail([]byte(report.LastSyncError[:512])))
@@ -484,14 +484,14 @@ func (s *ClusterService) ReportNode(ctx context.Context, nodeID int, report mode
 		return fmt.Errorf("读取节点上报结果: %w", err)
 	}
 	if rows != 1 {
-		// 历史问题-历史问题：降级窗口内的上报按 403 语义拒绝，而不是误报 404。
+		// 历史问题：降级窗口内的上报按 403 语义拒绝，而不是误报 404。
 		return s.nodeWriteMissError(ctx)
 	}
 	s.storeSectionReport(nodeID, report.SectionHashes)
 	return nil
 }
 
-// resolveNodeAccessURL 推导节点访问地址的单源实现（D2-历史问题）：显式
+// resolveNodeAccessURL 推导节点访问地址的单源实现（历史问题）：显式
 // access_url 优先，否则 protocol://ip:port；protocol 非 https 一律归一为 http
 // （原四处逐字重复，口径漂移风险）。
 func resolveNodeAccessURL(ipAddress string, port int, protocol, accessURL string) string {
@@ -530,7 +530,7 @@ func (s *ClusterService) DeleteNode(ctx context.Context, nodeID int) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 	// 历史问题(历史):删行前取访问地址——删行后 pin 成孤儿且无 API
-	// 清除通道,同 host:port 复用时服务控制 历史修复 PinMismatch 只能手工
+	// 清除通道,同 host:port 复用时服务控制 fail-closed PinMismatch 只能手工
 	// 删盘。地址解析与 ForgetNodePin 同口径(access_url 优先)。
 	var ipAddress, protocol, accessURL string
 	var port int
@@ -542,7 +542,7 @@ func (s *ClusterService) DeleteNode(ctx context.Context, nodeID int) error {
 	}
 	rows, err := result.RowsAffected()
 	if err != nil || rows != 1 {
-		// 历史问题-历史问题：降级窗口内的删除按 403 语义拒绝（节点仍在），而非 404。
+		// 历史问题：降级窗口内的删除按 403 语义拒绝（节点仍在），而非 404。
 		// 复核角色用独立连接（nodeWriteMissError），必须先退出写事务。
 		_ = tx.Rollback()
 		return s.nodeWriteMissError(ctx)

@@ -115,7 +115,7 @@ func TestCreateAPIKey_rejectsPastExpiry(t *testing.T) {
 func TestCreateAPIKey_acceptsFutureExpiry(t *testing.T) {
 	// Given
 	handler := newBackupTestHandlers(t)
-	// M6（契约）：admin 创建可写 Key 属特权 Key，须种子真实密码并携带 password
+	// 历史修复（契约）：admin 创建可写 Key 属特权 Key，须种子真实密码并携带 password
 	// 过共享确认门。
 	hash, err := bcrypt.GenerateFromPassword([]byte("admin-secret"), bcrypt.MinCost)
 	if err != nil {

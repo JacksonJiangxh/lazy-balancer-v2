@@ -59,7 +59,7 @@ func runWithInTaskRetry(ctx context.Context, op func() error, onWait func(nextAt
 // 与三库起点角色复查同一 SQL 口径（COALESCE(is_master,1)；查询失败按非主
 // 节点→跳过语义，宁停勿写）。
 func updateRunStillMaster() bool {
-	// 历史问题：与同族 历史修复 口径一致——nil 库 历史修复（按非主节点）。
+	// 历史问题：与同族 历史修复 口径一致——nil 库 fail-closed（按非主节点）。
 	if db.DB == nil {
 		return false
 	}

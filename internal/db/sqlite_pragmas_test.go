@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// R-sqlite-pragmas：DSN 中的 _journal_mode/_busy_timeout/_synchronous 会被 glebarez
+// 历史修复：DSN 中的 _journal_mode/_busy_timeout/_synchronous 会被 glebarez
 // 驱动静默忽略（仅 _pragma/_txlock/_time_format 生效，且驱动无条件 busy_timeout=5000），
 // 三个库必须在 open 后显式落 PRAGMA——否则主库常年跑 delete+5s，任何长写事务都会
 // 把 BEGIN IMMEDIATE 的读写全线拖垮（v2.2.0 生产 SQLITE_BUSY 级联的根因之一）。
@@ -40,7 +40,7 @@ func TestInitialize_appliesSQLiteRuntimePragmas(t *testing.T) {
 	}
 }
 
-// R-sqlite-pragmas-mask：busy_timeout/synchronous 的连接级生效通道是 DSN _pragma（驱动
+// 历史修复：busy_timeout/synchronous 的连接级生效通道是 DSN _pragma（驱动
 // 对每条新连接执行）。若驱动 _pragma 处理回退（274f3028 修复的静默忽略同类回归），
 // 守卫必须在专用连接上只读回读并报错——不能先在采样连接上 Exec 修复再自证通过，
 // 否则其余连接仍跑驱动默认值（busy_timeout=5000 / synchronous=FULL）而守卫放行。
@@ -68,7 +68,7 @@ func TestApplySQLiteRuntimePragmas_rejectsWeakenedDSN(t *testing.T) {
 	}
 }
 
-// R-sqlite-pragmas-migrate：journal_mode=WAL 的显式 apply 必须保留——它是旧 delete 模式
+// 历史修复：journal_mode=WAL 的显式 apply 必须保留——它是旧 delete 模式
 // 库文件的迁移路径（文件级、幂等、不受连接遮蔽影响），删掉它旧库永远停在 delete。
 func TestApplySQLiteRuntimePragmas_migratesDeleteModeFile(t *testing.T) {
 	// Given 一个以 delete 模式创建的库文件（DSN 不带任何 _pragma）

@@ -16,9 +16,9 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// T2（v2.2.0 多策略绑定）：一规则绑多策略的 RED 测试。
-// 覆盖：POST additive（SC-BIND-02）、PUT 原子替换（SC-BIND-01，max8/单 ID/审计/
-// 排序）、DELETE 精确 unbind（SC-BIND-03）、GET 数组有序（SC-GET-01/02）。
+// 历史修复（v2.2.0 多策略绑定）：一规则绑多策略的 RED 测试。
+// 覆盖：POST additive（历史修复）、PUT 原子替换（历史修复，max8/单 ID/审计/
+// 排序）、DELETE 精确 unbind（历史修复）、GET 数组有序（历史修复/02）。
 // 上限 2026-09-21 用户裁定 5→8（maxBindingsPerRule）。
 
 func newMultiPolicyRouter(t *testing.T) *gin.Engine {
@@ -115,7 +115,7 @@ func assertIDSlice(t *testing.T, got []int, want []int) {
 	}
 }
 
-// SC-BIND-02：POST bind 改为 additive——绑定 A 后再绑 B，A 必须保留。
+// 历史修复：POST bind 改为 additive——绑定 A 后再绑 B，A 必须保留。
 func TestBindRuleToPolicy_additivePreservesSiblingBindings(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newMultiPolicyRouter(t)
@@ -138,7 +138,7 @@ func TestBindRuleToPolicy_additivePreservesSiblingBindings(t *testing.T) {
 	assertIDSlice(t, got, want)
 }
 
-// SC-BIND-01：PUT 原子替换 + 按序返回（写入 [3,1,2]，DB 按 policy_id ASC 读出 [1,2,3]）。
+// 历史修复：PUT 原子替换 + 按序返回（写入 [3,1,2]，DB 按 policy_id ASC 读出 [1,2,3]）。
 func TestSetRuleSecurityPolicies_replacesAtomicallyOrderedASC(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newMultiPolicyRouter(t)
@@ -164,7 +164,7 @@ func TestSetRuleSecurityPolicies_replacesAtomicallyOrderedASC(t *testing.T) {
 	assertIDSlice(t, queryBoundPolicyIDs(t, "lb_mp_put"), []int{p2})
 }
 
-// SC-BIND-01：超过 8 条策略 → 400「最多绑定 8 条策略」（2026-09-21 上限 5→8）。
+// 历史修复：超过 8 条策略 → 400「最多绑定 8 条策略」（2026-09-21 上限 5→8）。
 func TestSetRuleSecurityPolicies_rejectsMoreThanEight(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newMultiPolicyRouter(t)
@@ -185,7 +185,7 @@ func TestSetRuleSecurityPolicies_rejectsMoreThanEight(t *testing.T) {
 	}
 }
 
-// SC-BIND-01 上限边界：恰好 8 条唯一策略 → 200（2026-09-21 上限 5→8）。
+// 历史修复 上限边界：恰好 8 条唯一策略 → 200（2026-09-21 上限 5→8）。
 func TestSetRuleSecurityPolicies_acceptsExactlyEight(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newMultiPolicyRouter(t)
@@ -201,7 +201,7 @@ func TestSetRuleSecurityPolicies_acceptsExactlyEight(t *testing.T) {
 	assertIDSlice(t, queryBoundPolicyIDs(t, "lb_mp_cap8"), ids)
 }
 
-// SC-BIND-01 边界（B-I2）：上限判定须先去重——8 条唯一策略携带一个重复 id
+// 历史修复 边界（历史修复）：上限判定须先去重——8 条唯一策略携带一个重复 id
 // （9 元素数组）不得因原始数组长度 9 误判超限；写入结果为去重后的 8 行。
 func TestSetRuleSecurityPolicies_dedupsBeforeMaxCheck(t *testing.T) {
 	// Given 8 条策略与一条 HTTP 规则
@@ -254,7 +254,7 @@ func TestSetRuleSecurityPolicies_eightTypedPoliciesAccepted(t *testing.T) {
 	assertIDSlice(t, queryBoundPolicyIDs(t, "lb_mp_typed"), ids)
 }
 
-// SC-BIND-01：单元素 policy_ids 向后兼容（PUT [1] 与 POST bind 等价行为）。
+// 历史修复：单元素 policy_ids 向后兼容（PUT [1] 与 POST bind 等价行为）。
 func TestSetRuleSecurityPolicies_singleIDBackwardsCompatible(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newMultiPolicyRouter(t)
@@ -305,7 +305,7 @@ func TestSetRuleSecurityPolicies_rejectsNonHTTPRule(t *testing.T) {
 	}
 }
 
-// SC-BIND-03：DELETE unbind 精确删一行——[A,B] 解绑 A 后只剩 B。
+// 历史修复：DELETE unbind 精确删一行——[A,B] 解绑 A 后只剩 B。
 func TestUnbindRuleFromPolicy_removesOnlyTargetRow(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newMultiPolicyRouter(t)
@@ -323,7 +323,7 @@ func TestUnbindRuleFromPolicy_removesOnlyTargetRow(t *testing.T) {
 	assertIDSlice(t, queryBoundPolicyIDs(t, "lb_mp_unbind"), []int{policyB})
 }
 
-// SC-GET-01：GET /security/rules/:caddy_id/policy 返回 []policy 按 id ASC。
+// 历史修复：GET /security/rules/:caddy_id/policy 返回 []policy 按 id ASC。
 func TestGetSecurityPolicyBindings_returnsOrderedArray(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newMultiPolicyRouter(t)
@@ -358,7 +358,7 @@ func TestGetSecurityPolicyBindings_returnsOrderedArray(t *testing.T) {
 	assertIDSlice(t, got, []int{p1, p2, p3})
 }
 
-// SC-GET-01 边界：规则无绑定时返回空数组（不是 null 单对象）。
+// 历史修复 边界：规则无绑定时返回空数组（不是 null 单对象）。
 func TestGetSecurityPolicyBindings_emptyArrayWhenNoBindings(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newMultiPolicyRouter(t)
@@ -385,7 +385,7 @@ func TestGetSecurityPolicyBindings_emptyArrayWhenNoBindings(t *testing.T) {
 	}
 }
 
-// SC-GET-02：GET /security/bindings 返回 map[string][]BindingInfo 按 policy_id ASC。
+// 历史修复：GET /security/bindings 返回 map[string][]BindingInfo 按 policy_id ASC。
 func TestGetAllSecurityBindings_returnsArrayPerRule(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newMultiPolicyRouter(t)
@@ -429,7 +429,7 @@ func TestGetAllSecurityBindings_returnsArrayPerRule(t *testing.T) {
 	}
 }
 
-// SC-BIND-01：PUT 替换写审计日志（action=更新 / resource=安全策略 / detail 含规则与策略列表）。
+// 历史修复：PUT 替换写审计日志（action=更新 / resource=安全策略 / detail 含规则与策略列表）。
 func TestSetRuleSecurityPolicies_writesAuditLog(t *testing.T) {
 	// Given 一条 HTTP 规则与两条策略
 	setupSecurityPolicyTestDB(t)
@@ -458,7 +458,7 @@ func TestSetRuleSecurityPolicies_writesAuditLog(t *testing.T) {
 	}
 }
 
-// SC-BIND-01 契约补全：PUT 空数组 policy_ids=[] = 解除该规则全部绑定——
+// 历史修复 契约补全：PUT 空数组 policy_ids=[] = 解除该规则全部绑定——
 // 200 + GET 空数组 + DB 0 行 + 审计日志（与 apidocs/MCP schema 的空数组语义对齐）。
 func TestSetRuleSecurityPolicies_emptyArrayUnbindsAll(t *testing.T) {
 	// Given 规则已绑定两条策略
@@ -586,7 +586,7 @@ func TestBindRuleToPolicy_outOfOrderBindStillReadsASC(t *testing.T) {
 	}
 }
 
-// SC-GET-01 实现口径：GET /security/rules/:caddy_id/policy 仅返回 enabled=1 的策略
+// 历史修复 实现口径：GET /security/rules/:caddy_id/policy 仅返回 enabled=1 的策略
 // （handler 逐条 SELECT ... WHERE id=? AND enabled=1，禁用的绑定项被跳过）。
 func TestGetSecurityPolicyBindings_skipsDisabledPolicies(t *testing.T) {
 	// Given 规则绑定两条策略，其中一条随后被禁用
@@ -625,7 +625,7 @@ func TestGetSecurityPolicyBindings_skipsDisabledPolicies(t *testing.T) {
 	}
 }
 
-// SC-CAS-01：删除策略仅清该策略的绑定行——同规则上兄弟策略的绑定保留。
+// 历史修复：删除策略仅清该策略的绑定行——同规则上兄弟策略的绑定保留。
 func TestDeleteSecurityPolicy_preservesSiblingPolicyBindingsOnSameRules(t *testing.T) {
 	// Given 两条规则各自绑定策略 X 与 Y
 	setupSecurityPolicyTestDB(t)
@@ -651,7 +651,7 @@ func TestDeleteSecurityPolicy_preservesSiblingPolicyBindingsOnSameRules(t *testi
 	assertIDSlice(t, queryBoundPolicyIDs(t, "lb_mp_cas_b"), []int{policyY})
 }
 
-// SC-CAS-02：删除 LB 规则仅清该规则的绑定行——同策略上兄弟规则的绑定保留。
+// 历史修复：删除 LB 规则仅清该规则的绑定行——同策略上兄弟规则的绑定保留。
 func TestDeleteRule_preservesOtherRulesBindingsOnSamePolicy(t *testing.T) {
 	// Given 两条规则绑定同一策略
 	handler, _, _ := newAuditRuleHandlers(t, 0)
@@ -687,7 +687,7 @@ func TestDeleteRule_preservesOtherRulesBindingsOnSamePolicy(t *testing.T) {
 	assertIDSlice(t, queryBoundPolicyIDs(t, "lb_mp_del_b"), []int{int(policyID)})
 }
 
-// 绑定上限（B-I1，2026-09-21 上限 5→8）：POST additive 与 PUT 同上限——第 8 条
+// 绑定上限（历史修复，2026-09-21 上限 5→8）：POST additive 与 PUT 同上限——第 8 条
 // （新策略对）照常 200；规则绑满 8 条后 POST 第 9 条 → 400「最多绑定 8 条策略」；
 // 重绑已存在的 (rule,policy) 对保持幂等 200（INSERT OR IGNORE 不产生新行）。
 func TestBindRuleToPolicy_postAdditiveCapAtEight(t *testing.T) {
@@ -737,7 +737,7 @@ func TestBindRuleToPolicy_postAdditiveCapAtEight(t *testing.T) {
 	assertIDSlice(t, queryBoundPolicyIDs(t, "lb_mp_cap"), all)
 }
 
-// SC-GET-02 扩展（D-I1）：GET /security/bindings 每绑定携带 block_page_id——前端
+// 历史修复 扩展（历史修复）：GET /security/bindings 每绑定携带 block_page_id——前端
 // 据此计算「首个启用且配置了拦截页面的策略」，与后端生成口径（首个 enabled 且
 // block_page_id>0）一致，前导策略 block_page_id=0 时不得误判。
 func TestGetAllSecurityBindings_includesBlockPageID(t *testing.T) {
@@ -785,7 +785,7 @@ func TestGetAllSecurityBindings_includesBlockPageID(t *testing.T) {
 	}
 }
 
-// SC-GET-02 扩展（拦截页归因）：GET /security/bindings 每绑定携带
+// 历史修复 扩展（拦截页归因）：GET /security/bindings 每绑定携带
 // block_status_code（NULL/0 归一为 403）——前端冲突提示与 Rules 页锁形弹框
 // 据此展示「<页名>(状态码 XXX)」，与后端生成口径（BlockStatusCode 0→403）一致。
 func TestGetAllSecurityBindings_includesBlockStatusCode(t *testing.T) {
@@ -836,7 +836,7 @@ func TestGetAllSecurityBindings_includesBlockStatusCode(t *testing.T) {
 	}
 }
 
-// A-I2 硬化（GetAllSecurityBindings）：绑定 JOIN 的 p.block_page_id 可空——
+// 历史修复 硬化（GetAllSecurityBindings）：绑定 JOIN 的 p.block_page_id 可空——
 // 带外编辑/备份恢复/集群继承产生 NULL 时，修复前行 Scan 报错被 continue 静默
 // 跳过，绑定从 UI 地图中消失；修复后 COALESCE 归一化为 0，绑定照常返回。
 func TestGetAllSecurityBindings_toleratesNullBlockPageID(t *testing.T) {
@@ -1014,7 +1014,7 @@ func TestGetAllSecurityBindings_nullEnabledReadsDisabled(t *testing.T) {
 	}
 }
 
-// D-K1：策略列表摘要携带 crs_rule_groups——前端向导的跨策略重复告警直接消费摘要，
+// 历史修复：策略列表摘要携带 crs_rule_groups——前端向导的跨策略重复告警直接消费摘要，
 // 不再对每条启用策略 N+1 拉取详情。
 func TestListSecurityPolicies_summaryIncludesCRSRuleGroups(t *testing.T) {
 	// Given 一条配置 CRS 规则组 ["42","43"] 的策略
@@ -1053,7 +1053,7 @@ func TestListSecurityPolicies_summaryIncludesCRSRuleGroups(t *testing.T) {
 	}
 }
 
-// HC-07（历史）：审计详情必须记录**去重后**的绑定集合。提交
+// 历史修复（历史）：审计详情必须记录**去重后**的绑定集合。提交
 // [1,1,2] 时库内终态为 [1,2]，此前审计串用原始 req.PolicyIDs 生成
 // 「[1,1,2]」——取证时无法从审计还原最终绑定集。修复=归一次、写入与审计共用。
 func TestSetRuleSecurityPolicies_auditUsesDeduplicatedSet(t *testing.T) {

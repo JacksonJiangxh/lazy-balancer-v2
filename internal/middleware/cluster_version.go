@@ -16,7 +16,7 @@ func clusterVersionMiddleware(database *sql.DB) gin.HandlerFunc {
 	installErr := installClusterVersionTriggers(database)
 	// 装配期 DDL 失败后所有同步写与主端登录恒 500，此前只把错误塞进
 	// gin 上下文（无日志落点）——系统日志看不到根因。此处一次性留痕，响应与
-	// 历史修复 语义不变。
+	// fail-closed 语义不变。
 	if installErr != nil {
 		services.Logf("error", "集群版本触发器安装失败（同步写与主端登录将 fail-closed 返回 500）: %v", installErr)
 	}
@@ -26,11 +26,11 @@ func clusterVersionMiddleware(database *sql.DB) gin.HandlerFunc {
 			return
 		}
 		if installErr != nil {
-			// 历史问题-13（历史）：登录/MFA 验证步的 历史修复 仅主节点
+			// 历史问题-13（历史）：登录/MFA 验证步的 fail-closed 仅主节点
 			// 语义——users 触发器 WHEN COALESCE(is_master,1)=1，从节点锁写入
-			// 本就不会 bump，历史修复 在从端零保护收益、只截断登录可用性
-			// （与票据登录被排除出 历史修复 面的口径一致）。角色读失败按
-			// 写闸同语义 历史修复 落入 500（不猜测放行）。
+			// 本就不会 bump，fail-closed 在从端零保护收益、只截断登录可用性
+			// （与票据登录被排除出 fail-closed 面的口径一致）。角色读失败按
+			// 写闸同语义 fail-closed 落入 500（不猜测放行）。
 			if isLoginLockWritePath(c.Request.Method, c.FullPath()) {
 				if isMaster, err := services.RoleOf(c.Request.Context(), database); err == nil && !isMaster {
 					c.Next()
@@ -48,7 +48,7 @@ func clusterVersionMiddleware(database *sql.DB) gin.HandlerFunc {
 // globalConfigSyncedColumns 是 global_config UPDATE 触发器的 OF 列清单单源
 // （历史问题-3）。凡随集群快照同步的 global_config 列都必须在此——漏列时
 // 「仅写该列」的 UPDATE 不 bump cluster_version，从节点经 304 门永久滞留
-// 旧值（D1 autoban 六列、历史问题 自动备份组均曾因同类遗漏修过）。
+// 旧值（历史修复 autoban 六列、历史问题 自动备份组均曾因同类遗漏修过）。
 // 漂移防护：ClusterBasicSettings（internal/models/cluster.go）的全部字段
 // （JSON tag = 列名）必须命中本清单，钉测见 cluster_version_of_drift_test.go。
 // auto_backup_last_run 刻意排除：调度器每轮备份推进，入列会让每轮备份引发
@@ -94,16 +94,16 @@ func installClusterVersionTriggers(database *sql.DB) error {
 		{name: "lb_rules", snapshotColumns: "caddy_id,name,description,protocol,domain,listen_port,strategy,dynamic_dns,enable_dns_server,dns_server,dns_family,health_check_path,health_check_interval,health_check_timeout,health_check_unhealthy_threshold,health_check_healthy_threshold,enable_active_health_check,tcp_health_check_port,tcp_proxy_protocol,tcp_try_duration,tcp_try_interval,request_body_max_size_mb,upstream_keepalive_timeout,server_tokens_hidden,ntlm_compatible,upstream_force_http1,host_header,health_check_host,custom_routes_enabled,proxy_dial_timeout,proxy_response_header_timeout,proxy_read_timeout,proxy_write_timeout,proxy_stream_timeout,proxy_flush_interval,proxy_stream_close_delay,enable_tls,tls_source,acme_config_id,ca_provider_id,tls_cert,tls_key,tls_http_redirect,enable_compress,compress_types,enabled,log_enabled,created_by,created_at,updated_at,updated_by,block_page_stage1_id,block_page_stage1_status,block_page_stage3_id,block_page_stage3_status"},
 		{name: "upstreams", snapshotColumns: "id,rule_id,host,port,weight,dynamic_dns,enabled,protocol,max_connections,origin_domain"},
 		{name: "path_rules", snapshotColumns: "id,rule_id,sort_order,match_type,path,upstream_path,upstreams_json,response_mode,response_status,response_body,response_content_type,redirect_to"},
-		// 历史问题 历史问题：users 触发器 OF 列表补 v2.1.8 的 MFA 权威列——此前不在列表内，
+		// 历史问题：users 触发器 OF 列表补 v2.1.8 的 MFA 权威列——此前不在列表内，
 		// MFA 状态写（含管理员重置）不 bump cluster_version → 快照缓存持续命中
 		// 旧指纹 → 从节点 304 循环，主节点 MFA 变更稳态永不传播（泄露 secret 经
 		// 重置后在从节点仍可用）。记账两列（last_timestep/failed_attempts）不补
-		// ——它们经 历史问题 历史问题 的哈希清零已不参与漂移判定，入列只会让登录热路径的
+		// ——它们经 历史问题 的哈希清零已不参与漂移判定，入列只会让登录热路径的
 		// 计数推进引发无谓重放。pending 不跨节点不补。
 		// 历史修复 修订：locked_until（login_locked_until）从 历史问题 初版「不补」枚举划出
 		// 入 OF 列表——主端置锁/解锁 UPDATE 即 bump cluster_version，快照缓存重建、
 		// locked_users 当周期下发（否则锁只在下次无关变更时才传播）；历史问题「补了
-		// 引发无谓重放」的前提已被 S历史问题-1 值变化守卫消除（登录热路径对
+		// 引发无谓重放」的前提已被 历史问题-1 值变化守卫消除（登录热路径对
 		// login_locked_until 的保值写不 bump，见下方守卫段）。仅失败计数
 		// （login_failed_attempts）不入列：普通失败不产生版本抖动；从端本地写由
 		// WHEN is_master=1 守卫排除。
@@ -164,7 +164,7 @@ func installClusterVersionTriggers(database *sql.DB) error {
 				}
 				operationClause += " OF " + ofColumns
 			}
-			// S历史问题-1(历史):users 表值变化守卫——登录热路径同值写
+			// 历史问题-1(历史):users 表值变化守卫——登录热路径同值写
 			// (成功登录 NULL→NULL、失败计数 CASE 保值)同样触发 OF 触发器,每次
 			// 登录引发全集群快照重放+从节点强制 Caddy 重载。改为「任一同步列
 			// 值真实变化」(IS NOT NULL 安全比较全链 OR):登录热路径写
@@ -214,7 +214,7 @@ func installClusterVersionTriggers(database *sql.DB) error {
 					// 历史问题(历史):簿记抖动守卫——签发/续期的阶段写
 					// (message/attempts/updated_at 等簿记列,每次签发 ~15 次)同样
 					// 触发 OF 触发器,导致全集群快照 304 门失效+从端强制重载。
-					// 与 users 表 S历史问题-1 同口径:仅语义列(影响渲染/从端行为)
+					// 与 users 表 历史问题-1 同口径:仅语义列(影响渲染/从端行为)
 					// 值真实变化才 bump;簿记列同值/变化均不 bump。
 					// 历史问题(历史):status 移出语义列——续期形态老证保留使成员
 					// 条件恒真,11 次阶段迁移逐 bump(每次全集群强制重载);材料变化
@@ -237,7 +237,7 @@ func installClusterVersionTriggers(database *sql.DB) error {
 					valueChange = append(valueChange, "(OLD.status='disabled' AND NEW.status<>'disabled')")
 					whenClause += " AND (" + strings.Join(valueChange, " OR ") + ")"
 				case "DELETE":
-					// DELETE 侧成员守卫与 UPDATE 同款——注意其不对称性（历史 历史修复
+					// DELETE 侧成员守卫与 UPDATE 同款——注意其不对称性（历史修复
 					// 如实化）：删除非成员行（disabled/过期/无材料）时 WHEN 恒假不 bump，
 					// 从节点该行残留至下次任意语义 bump 自愈（展示面-only，快照证书选择
 					// 同样只认成员行，签发不受影响）。
@@ -271,7 +271,7 @@ func installClusterVersionTriggers(database *sql.DB) error {
 	// 历史问题-01(历史):threat_auto_update/threat_schedule_days/
 	// threat_schedule_time 三列入 OF(同 历史问题 先例)——主端保存威胁库排程/
 	// 总开关即下发,从端升主后按主端排程运行。
-	// D1(历史):autoban_enabled/threshold/window_minutes/duration/scope/
+	// 历史修复(历史):autoban_enabled/threshold/window_minutes/duration/scope/
 	// dry_run 六列入 OF(同 历史问题 先例)——主端 PUT /security/autoban 保存即下发;
 	// 不在 OF 内则稳态变更经 304 门滞留主节点,从端恒默认值、升主后按陈旧配置
 	// 静默运行(名单传播而配置不传播)。
@@ -297,19 +297,19 @@ func isLoginLockWritePath(method, path string) bool {
 func isSynchronizedWrite(method, path string) bool {
 	// 历史问题:auth/setup(初始化管理员)与 OIDC 回调(JIT 开户)写 users 表,
 	// 但回调是 GET 形态——精确匹配置于方法门之外,触发器不可用时同样
-	// 历史修复(否则首次开户静默绕过版本 bump,从节点用户集漂移)。
+	// fail-closed(否则首次开户静默绕过版本 bump,从节点用户集漂移)。
 	if method == http.MethodPost && path == "/api/v1/auth/setup" {
 		return true
 	}
 	if method == http.MethodGet && path == "/api/v1/auth/oidc/callback" {
 		return true
 	}
-	// 历史修复 登录锁传播（历史 历史问题-3）：密码登录与 MFA 验证步都会写
+	// 历史修复 登录锁传播（历史问题-3）：密码登录与 MFA 验证步都会写
 	// users 同步列——失败置锁 login_locked_until（auth.go recordLoginFailure /
 	// mfa.go 验证步同计一个账户级计数）、成功清零解锁。触发器不可用时若放行，
 	// 降级态真实置锁不 bump cluster_version，主节点锁状态无法随快照传播到
-	// 从节点（与 历史修复 语义冲突）——与 setup/OIDC 开户同口径 历史修复。
-	// 历史问题-13（历史）：该 历史修复 仅主节点语义——触发器降级态下
+	// 从节点（与 历史修复 语义冲突）——与 setup/OIDC 开户同口径 fail-closed。
+	// 历史问题-13（历史）：该 fail-closed 仅主节点语义——触发器降级态下
 	// 从节点由 clusterVersionMiddleware 经 RoleOf 分流放行（users 触发器
 	// WHEN is_master=1，从端锁写入本就不 bump，拦截只损登录可用性）。
 	// 票据登录不写 users 同步列，不在此列（保全从节点登录
@@ -321,7 +321,7 @@ func isSynchronizedWrite(method, path string) bool {
 		return false
 	}
 	// Writes to synced global_config columns.
-	// 历史问题:历史修复 六设置列与 oidc_config 均在 global_config 触发器 OF
+	// 历史问题:auto-backup 六设置列与 oidc_config 均在 global_config 触发器 OF
 	// 列表(见上),主端保存必须 bump 供从端收敛。
 	if method == http.MethodPut && (path == "/api/v1/config" || path == "/api/v1/caddy/config" || path == "/api/v1/cluster/settings" || path == "/api/v1/admin-tls" || path == "/api/v1/settings/auto-backup" || path == "/api/v1/settings/oidc") {
 		return true
@@ -340,21 +340,21 @@ func isSynchronizedWrite(method, path string) bool {
 		return true
 	}
 	// 历史问题(历史评审):自动备份还原经 importConfigBackupCore 重写
-	// lb_rules/upstreams 等全部同步表,与 /config/import 同口径 历史修复;
+	// lb_rules/upstreams 等全部同步表,与 /config/import 同口径 fail-closed;
 	// run(手动备份)与 delete 仅写 auto_backups 本地簿记表,不在此列。
 	if method == http.MethodPost && strings.HasPrefix(path, "/api/v1/auto-backup/") && strings.HasSuffix(path, "/restore") {
 		return true
 	}
-	// Certificate issuance and job retry/delete write cert_jobs; parse and 历史修复 queries are 历史修复.
+	// Certificate issuance and job retry/delete write cert_jobs; parse and current-jobs queries are read-only.
 	if path == "/api/v1/certificates/issue" ||
 		(strings.HasPrefix(path, "/api/v1/certificates/jobs/") && (method == http.MethodDelete || (method == http.MethodPost && strings.HasSuffix(path, "/retry")))) {
 		return true
 	}
-	// CA provider updates write ca_providers. U04a2-历史问题（历史）：POST
-	// /历史修复/:id/test 亦然——ZeroSSL 缺 EAB 时 AutoProvisionZeroSSLEAB
+	// CA provider updates write ca_providers. 历史问题（历史）：POST
+	// /ca-providers/:id/test 亦然——ZeroSSL 缺 EAB 时 AutoProvisionZeroSSLEAB
 	// 会 UPDATE ca_providers.credentials（触发器 OF 列内含 credentials）。
 	// 原注释「test 仅探测凭据」的前提不成立：触发器安装失败的降级态须同样
-	// 历史修复，不得静默写同步表却不 bump cluster_version。
+	// fail-closed，不得静默写同步表却不 bump cluster_version。
 	if method == http.MethodPut && strings.HasPrefix(path, "/api/v1/ca-providers") {
 		return true
 	}
@@ -370,8 +370,8 @@ func isSynchronizedWrite(method, path string) bool {
 	}
 	// 审计 历史问题//api/v1/auth/mfa 下仅 activate/disable/历史修复
 	// 三路由写 users 触发器 OF 列（mfa_enabled/mfa_secret/mfa_recovery_codes）；
-	// verify/历史修复/setup 只写刻意排除的记账/pending 列（永不 bump）——
-	// 不得按前缀捕获，否则触发器安装失败的降级态下 MFA 登录/历史修复 被误伤
+	// verify/verify-step/setup 只写刻意排除的记账/pending 列（永不 bump）——
+	// 不得按前缀捕获，否则触发器安装失败的降级态下 MFA 登录/step-up 被误伤
 	// 500，UI 恢复路径对 MFA 用户截断。
 	for _, exact := range []string{"/api/v1/auth/mfa/activate", "/api/v1/auth/mfa/disable", "/api/v1/auth/mfa/recovery-codes"} {
 		if path == exact {

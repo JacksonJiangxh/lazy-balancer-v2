@@ -6,7 +6,7 @@ import (
 )
 
 // 「不可安全重试」族——PUT 全量/部分更新与幂等追加(added=false)重复调用
-// 保持相同目标状态,与 OIDC C7 同格「可安全重试」文案。
+// 保持相同目标状态,与 OIDC 历史修复 同格「可安全重试」文案。
 func TestAPIDocs_idempotentWriteRetryContracts(t *testing.T) {
 	for _, key := range []string{
 		"PUT /settings/auto-backup",
@@ -26,7 +26,7 @@ func TestAPIDocs_idempotentWriteRetryContracts(t *testing.T) {
 		"PUT /security/crawler-lib/schedule",
 		"PUT /security/crawler-lib/:id/flags",
 		"PUT /security/autoban",
-		// U11-2：unbind 无条件 DELETE 绑定行（未绑定时同样返回成功），
+		// 历史修复：unbind 无条件 DELETE 绑定行（未绑定时同样返回成功），
 		// 重复调用保持已解绑状态——不得落入 DELETE 默认「重复调用返回 404」。
 		"DELETE /security/policies/:id/bind/:caddy_id",
 		"POST /security/ip-lists/:id/ips",

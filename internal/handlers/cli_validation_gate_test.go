@@ -51,7 +51,7 @@ func TestRuleWrite_cliRejectionBlocksCommit(t *testing.T) {
 	if count != 0 {
 		t.Fatalf("cli-rejected rule committed rows=%d, want 0", count)
 	}
-	// A85历史问题-A：规则路由均为 Explicit（中间件不兜底），apply 失败必须留痕。
+	// 历史问题：规则路由均为 Explicit（中间件不兜底），apply 失败必须留痕。
 	var auditCount int
 	if err := db.AuditDB.QueryRow("SELECT COUNT(*) FROM audit_log WHERE action='创建失败' AND resource='负载规则' AND detail LIKE '%coraza: invalid directive%'").Scan(&auditCount); err != nil {
 		t.Fatalf("count rule failure audit: %v", err)
@@ -180,7 +180,7 @@ func TestImportConfigBackup_cliRejectionAbortsImport(t *testing.T) {
 
 // 乱填保障闭环（2026-09-06 补充裁定）：CLI 校验器不可用 + admin 传输失败 =
 // 配置未经任何 Caddy 级校验且无法应用——此情形下不得退化提交（无法排除
-// 坏配置），必须回滚并明确报错。A85历史问题-B：传输错误可能发生在 Caddy 已
+// 坏配置），必须回滚并明确报错。历史问题：传输错误可能发生在 Caddy 已
 // 应用候选之后，分支必须回滚到已提交视图运行配置并持久化失败横幅。
 func TestSecurityWrite_unvalidatedApplyFailsClosed(t *testing.T) {
 	// Given：CLI 校验器不可用 + Caddy 管理接口不可达
@@ -189,7 +189,7 @@ func TestSecurityWrite_unvalidatedApplyFailsClosed(t *testing.T) {
 	url := closed.URL
 	closed.Close()
 	handler, _, _ := newAuditRuleHandlers(t, 0)
-	handler.caddyService = services.NewCaddyService(url) // LBH-B-R3（历史）：零增值包装内联（不可达由死 URL 提供）
+	handler.caddyService = services.NewCaddyService(url) // 历史修复（历史）：零增值包装内联（不可达由死 URL 提供）
 	handler.caddyService.SetCLIValidatorForTest(func(rendered []byte) error {
 		return services.ErrCLIValidatorUnavailable
 	})
@@ -216,7 +216,7 @@ func TestSecurityWrite_unvalidatedApplyFailsClosed(t *testing.T) {
 	}
 }
 
-// 裁定 2026-09-07 D2：规则×5 apply 错误统一映射——配置拒绝→400（中文），
+// 裁定 2026-09-07 历史修复：规则×5 apply 错误统一映射——配置拒绝→400（中文），
 // ErrUnvalidatedApply/传输失败→500；DisableRule 文案中文化。
 func TestRuleWrites_applyErrorStatusMapping(t *testing.T) {
 	tests := []struct {

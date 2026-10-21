@@ -314,7 +314,7 @@ func writeOpenAPIOperation(b *strings.Builder, route apiDocRoute) {
 	seenStatuses := make(map[string]bool, len(route.Errors))
 	for _, routeError := range route.Errors {
 		parts := strings.SplitN(routeError, " ", 2)
-		// SYSRENDE历史问题 关联(历史):同码多形态(如 400 invalid_request+
+		// 历史问题 关联(历史):同码多形态(如 400 invalid_request+
 		// 400 cannot_disable_self)去重取首——OpenAPI YAML 不允许重复键。
 		if seenStatuses[parts[0]] {
 			continue
@@ -374,7 +374,7 @@ var apiDocContracts = map[string]apiDocContract{
 	"POST /auth/mfa/verify":   {rawResponse: true, security: "public"},
 	"GET /auth/setup":         {security: "public"},
 	"POST /auth/setup":        {security: "public"},
-	// 历史问题(C1):OIDC 公开路由契约——status 为登录页按钮显隐探测、login 为
+	// 历史问题(历史修复):OIDC 公开路由契约——status 为登录页按钮显隐探测、login 为
 	// 浏览器 302 跳转、callback 为 IdP 回调重定向,三者均不携带 JWT/API Key;
 	// 漏登记会让 OpenAPI 把它们误标 bearerAuth。
 	"GET /auth/oidc/status":              {security: "public"},
@@ -394,9 +394,9 @@ var apiDocContracts = map[string]apiDocContract{
 	"POST /rules":                        {successStatus: http.StatusCreated},
 	"POST /rules/:caddy_id/duplicate":    {successStatus: http.StatusCreated},
 	"POST /certificate-configs":          {successStatus: http.StatusCreated},
-	// 历史问题(C2):v2.3.0 起导出恒为 lbbak tar.gz(writeLbbakResponse 以
+	// 历史问题(历史修复):v2.3.0 起导出恒为 lbbak tar.gz(writeLbbakResponse 以
 	// application/gzip 下发);sections query 与导入侧对称（分类键清单由
-	// configBackupSections 单一事实源派生——历史修复 历史问题，防文档与实现再分叉）。
+	// configBackupSections 单一事实源派生——历史问题，防文档与实现再分叉）。
 	"GET /config/export": {rawResponse: true, responseContentType: "application/gzip", queryParameters: []apiDocParameter{{"sections", "string", "可选配置分类（逗号分隔）：" + configBackupSectionKeysText() + "，默认全选；旧版 global_config/waf_files 键自动归一（分别视为 users/security）；未知分类返回 400"}}},
 	// 历史问题（历史）：两个非 JSON 下载端点显式登记 media type——漏登记
 	// 会回落到 application/json 并被包成 {"code":0,...,"data":非 JSON}。
@@ -445,7 +445,7 @@ func writeOpenAPIParameters(b *strings.Builder, route apiDocRoute, queryParamete
 	for part := range strings.SplitSeq(route.Path, "/") {
 		if name, found := strings.CutPrefix(part, ":"); found {
 			valueType := "string"
-			// APIMCP-A2（历史）：任务 ID 是 "threat"/"cert-job:5" 等字符串
+			// 历史修复（历史）：任务 ID 是 "threat"/"cert-job:5" 等字符串
 			// ——/system/tasks/ 前缀路由的 :id 保留 string，与其余数字 :id 路由
 			// 的 integer 判定分流（MCP 侧同参数始终 string，两侧此前自相矛盾）。
 			if name == "id" && !strings.HasPrefix(route.Path, "/system/tasks/") {
@@ -527,13 +527,13 @@ func operationDescription(route apiDocRoute) string {
 		"PUT /security/crawler-lib/auto-update", "PUT /security/crawler-lib/schedule", "PUT /security/crawler-lib/:id/flags", "PUT /security/autoban":
 		retry = "可安全重试：相同请求重复调用保持相同目标状态。"
 	case "PATCH /users/me", "PATCH /users/me/api-keys/:id", "PATCH /api-keys/:id/status":
-		// APIMCP50-历史问题:PATCH 语义化部分更新与 PUT 同格幂等。
+		// 历史问题:PATCH 语义化部分更新与 PUT 同格幂等。
 		retry = "可安全重试：相同请求重复调用保持相同目标状态。"
 	case "POST /security/ip-lists/:id/ips":
-		// APIMCP42-1:幂等追加——条目已存在时返回 added=false,不重复落行。
+		// 历史修复:幂等追加——条目已存在时返回 added=false,不重复落行。
 		retry = "可安全重试：重复追加同一条目返回 added=false，不产生重复数据。"
 	case "DELETE /settings/oidc":
-		// API历史修复(C7):OIDC 删除为幂等清空——重复调用保持配置为已删除状态
+		// 历史修复(历史修复):OIDC 删除为幂等清空——重复调用保持配置为已删除状态
 		// 并返回成功(与资源型 DELETE 的 404 语义不同)。
 		retry = "可安全重试：重复调用保持 OIDC 配置为已删除状态并返回成功。"
 	case "DELETE /security/policies/:id/bind/:caddy_id":
@@ -551,7 +551,7 @@ func operationDescription(route apiDocRoute) string {
 	return description + " " + retry
 }
 
-// APIMCP-历史问题（历史）：内容完全静态（apiDocRoutes 进程内不变，路由数随
+// 历史问题（历史）：内容完全静态（apiDocRoutes 进程内不变，路由数随
 // 扩表增长），YAML 拼接缓存一次——此前每请求全量重建。
 var openAPIYAMLOnce = sync.OnceValue(buildOpenAPIYAML)
 

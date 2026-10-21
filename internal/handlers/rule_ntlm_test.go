@@ -100,6 +100,7 @@ func TestUpdateRule_rejects_strategy_change_while_ntlm_on(t *testing.T) {
 	caddyID := ntlmCreateAndWait(t, router, `{
 		"name":"ntlm-edit","protocol":"http","domain":"ntlm-edit.example.test","listen_port":18003,
 		"strategy":"cookie","ntlm_compatible":1,
+		"tcp_try_duration":-1,"upstream_force_http1":1,"proxy_flush_interval":-1,"upstream_keepalive_timeout":300,
 		"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,
 		"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]
 	}`)
@@ -132,6 +133,7 @@ func TestCreateRule_persists_ntlm_and_getrule_returns_it(t *testing.T) {
 	created := serveJSON(t, router, http.MethodPost, "/rules", `{
 		"name":"ntlm-ok","protocol":"http","domain":"ntlm-ok.example.test","listen_port":18005,
 		"strategy":"cookie","ntlm_compatible":1,
+		"tcp_try_duration":-1,"upstream_force_http1":1,"proxy_flush_interval":-1,"upstream_keepalive_timeout":300,
 		"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,
 		"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]
 	}`)
@@ -174,6 +176,7 @@ func TestUpdateRule_ntlm_off_restores_zero_and_omitted_keeps_value(t *testing.T)
 	caddyID := ntlmCreateAndWait(t, router, `{
 		"name":"ntlm-off","protocol":"http","domain":"ntlm-off.example.test","listen_port":18006,
 		"strategy":"cookie","ntlm_compatible":1,
+		"tcp_try_duration":-1,"upstream_force_http1":1,"proxy_flush_interval":-1,"upstream_keepalive_timeout":300,
 		"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,
 		"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]
 	}`)
@@ -210,8 +213,9 @@ func TestUpdateRule_ntlm_off_restores_zero_and_omitted_keeps_value(t *testing.T)
 func TestConfigBackup_export_import_roundtrip_preserves_ntlm(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	gin.SetMode(gin.TestMode)
-	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id, name, protocol, domain, listen_port, strategy, ntlm_compatible, enabled)
-		VALUES ('lb_ntlmbak', 'ntlm-backup', 'http', 'ntlm-backup.example.test', 8080, 'cookie', 1, 1)`); err != nil {
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id, name, protocol, domain, listen_port, strategy, ntlm_compatible, enabled,
+		tcp_try_duration, upstream_force_http1, proxy_flush_interval, upstream_keepalive_timeout)
+		VALUES ('lb_ntlmbak', 'ntlm-backup', 'http', 'ntlm-backup.example.test', 8080, 'cookie', 1, 1, -1, 1, -1, 300)`); err != nil {
 		t.Fatalf("seed rule: %v", err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id, host, port, weight, enabled) VALUES ('lb_ntlmbak', '127.0.0.1', 9000, 1, 1)`); err != nil {

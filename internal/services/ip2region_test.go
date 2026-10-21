@@ -15,7 +15,7 @@ import (
 )
 
 // testSegments mirror a production xdb whose fifth region field carries the
-// 历史修复 country code; the last segment exercises the malformed path.
+// alpha-2 country code; the last segment exercises the malformed path.
 var testSegments = []xdbSegment{
 	{startIP: 0x01020300, endIP: 0x010203FF, region: "美国|0|0|0|US"},
 	{startIP: 0x01020400, endIP: 0x010204FF, region: "中国|0|0|0|CN"},
@@ -58,7 +58,7 @@ func writeTestXDB(t *testing.T, path string, segments []xdbSegment) {
 	for _, seg := range segments {
 		appendRegion(seg.region)
 	}
-	// Pass 2: contiguous segment index blocks (the searcher 历史修复
+	// Pass 2: contiguous segment index blocks (the searcher binary-searches
 	// fixed 14-byte blocks between the vector entry's start/end pointers).
 	blockPtrs := make([]uint32, len(segments))
 	for i, seg := range segments {
@@ -72,7 +72,7 @@ func writeTestXDB(t *testing.T, path string, segments []xdbSegment) {
 		next = uint32(len(buf))
 	}
 
-	// Vector index entry for the shared 历史修复 prefix.
+	// Vector index entry for the shared first-two-byte prefix.
 	b0, b1 := byte(segments[0].startIP>>24), byte(segments[0].startIP>>16)
 	idx := headerSize + (int(b0)*256+int(b1))*8
 	binary.LittleEndian.PutUint32(buf[idx:], blockPtrs[0])
@@ -92,7 +92,7 @@ func writeTestXDB(t *testing.T, path string, segments []xdbSegment) {
 }
 
 // withIP2RegionPaths points the singleton at the given files and resets the
-// loaded searcher afterwards so tests stay isolated under -shuffle. 历史问题 B-#1
+// loaded searcher afterwards so tests stay isolated under -shuffle. 历史问题
 // 起 ValidateGeoIPCountries 以 live searcher 为判据——进入时也必须清空遗留
 // searcher，否则前序测试加载的真实 xdb 会让本测试的 live 判定意外为 loaded。
 func withIP2RegionPaths(t *testing.T, live, dist string) {
@@ -172,7 +172,7 @@ func Test_InitIP2Region_loads_live_xdb_then_Lookup_and_Reload(t *testing.T) {
 		t.Fatalf("Lookup(8.8.8.8)=%q, want empty for unknown IP", got)
 	}
 
-	// When reloaded, the searcher stays 历史修复
+	// When reloaded, the searcher stays hot-swappable
 	Reload()
 	if got := Lookup("1.2.3.100"); got != "US" {
 		t.Fatalf("Lookup after Reload=%q, want US", got)
@@ -190,7 +190,7 @@ func Test_LookupRegion_returns_raw_region_or_empty(t *testing.T) {
 	withIP2RegionPaths(t, live, filepath.Join(dir, "missing-dist.xdb"))
 	InitIP2Region()
 
-	// When / Then: the raw 历史修复 region comes back verbatim
+	// When / Then: the raw pipe-separated region comes back verbatim
 	if got := LookupRegion("1.2.6.9"); got != "中国|广东省|深圳市|电信|CN" {
 		t.Fatalf("LookupRegion(1.2.6.9)=%q, want raw China region string", got)
 	}
@@ -281,7 +281,7 @@ func Test_GetSetIP2RegionVersion_roundtrip(t *testing.T) {
 	}
 }
 
-// N+13 GetIP2RegionRegionTree 按 xdb stat 键记忆化——稳态调用返回
+// GetIP2RegionRegionTree 按 xdb stat 键记忆化——稳态调用返回
 // 同一树（免 ~220ms 全量扫描），stat 键变化（带外替换/触摸）触发重扫。
 func Test_GetIP2RegionRegionTree_memoizes_until_xdb_stat_changes(t *testing.T) {
 	// Given：双段 fixture xdb（单段会使 header Start/End 指针相等、树扫描
@@ -343,7 +343,7 @@ func resetRegionTreeMemoForTest(t *testing.T) {
 // 历史修复(历史):条目数应从 header StartIndexPtr/EndIndexPtr 直读
 // (xdb v2 官方边界,2 次 ReadAt),不再扫 65536 格 vector 推导(每次调用
 // 65536 次 8B ReadAt,BufferCache 已全内存纯浪费;且 vector 端点语义含
-// 末条结尾,推导 历史修复)。
+// 末条结尾,推导 off-by-one)。
 func TestGetIP2RegionEntryCount_readsHeaderBounds(t *testing.T) {
 	// Given: 构造最小 xdb——header(start=1000,end=1000+14*(历史问题))+vector 全零
 	const n = 100
@@ -371,7 +371,7 @@ func TestGetIP2RegionEntryCount_readsHeaderBounds(t *testing.T) {
 	}
 }
 
-// SEC-历史问题（历史）：writeRegionTreeCache 落盘失败此前静默吞错且仍写
+// 历史问题（历史）：writeRegionTreeCache 落盘失败此前静默吞错且仍写
 // INFO「已重建」成功行（日志谎报）。修复后失败写 WARN「重建落盘失败」且
 // 无 INFO 成功行；writeProvincesCache 错误沿返回值上抛给调用点留痕。
 func TestWriteRegionTreeCache_writeFailureLogsWarn(t *testing.T) {

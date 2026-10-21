@@ -170,7 +170,7 @@ func TestThreatUpdate_sourceFailureKeepsOldListAndContinues(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// F-历史问题-01（历史）：任一源失败即整体失败——RunUpdate 回传
+	// 历史问题-01（历史）：任一源失败即整体失败——RunUpdate 回传
 	// ErrThreatUpdateFailed（引擎 task_runs 记 failed）；单源失败仍不中断其余源。
 	if err := GetThreatUpdateManager().RunUpdate("manual", nil); !errors.Is(err, ErrThreatUpdateFailed) {
 		t.Fatalf("second run err=%v, want ErrThreatUpdateFailed", err)
@@ -215,7 +215,7 @@ func TestThreatUpdate_parseGuards(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// F-历史问题-01（历史）：两源失败（解析守卫拒绝）→ 整体失败回传。
+	// 历史问题-01（历史）：两源失败（解析守卫拒绝）→ 整体失败回传。
 	if err := GetThreatUpdateManager().RunUpdate("manual", nil); !errors.Is(err, ErrThreatUpdateFailed) {
 		t.Fatalf("run err=%v, want ErrThreatUpdateFailed（两源被守卫拒绝）", err)
 	}
@@ -514,7 +514,7 @@ func TestThreatDueSources_emptyListIsDue(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wafDir, "threat-ustc.iplist"), []byte("203.0.113.1/32\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	// 历史问题：fast 同样必须在场，否则仍视为未装载。历史修复 历史问题：判据含可读性
+	// 历史问题：fast 同样必须在场，否则仍视为未装载。历史问题：判据含可读性
 	// 校验——夹具用真实编译产物（伪「LBF1」头在可读性口径下即损坏文件）。
 	if err := CompileFromIplistFile(filepath.Join(wafDir, "threat-ustc.iplist")); err != nil {
 		t.Fatalf("编译 .fast 夹具: %v", err)
@@ -664,10 +664,10 @@ func TestThreatUpdate_listExistenceQueryErrorNotFastPathSuccess(t *testing.T) {
 	}
 
 	// When：同内容 run2 —— 原始哈希一致进入快速路径，COUNT 失败。
-	// F-历史问题-01（历史）后失败回传引擎：源失败必须返回错误（旧契约
+	// 历史问题-01（历史）后失败回传引擎：源失败必须返回错误（旧契约
 	// 断言返回 nil 已随迁）；行级 failed 落库仍是本测试真契约。
 	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err == nil {
-		t.Fatal("run2: 源写库失败必须返回错误（F-历史问题-01 失败回传契约）")
+		t.Fatal("run2: 源写库失败必须返回错误（历史问题-01 失败回传契约）")
 	}
 
 	// Then：不得标 success 快速返回——完整路径写库失败落 failed
@@ -765,7 +765,7 @@ func TestThreatUpdate_reloadPendingMarkerRetired(t *testing.T) {
 	}
 }
 
-// 历史 历史问题（历史问题）：run() 起点 is_master 复查（历史问题 家族收敛——
+// 历史问题（历史）：run() 起点 is_master 复查（历史问题 家族收敛——
 // crsupdate/ip2regionupdate 均有，威胁库为漏点）：tick 守卫与任务发出之间的
 // demote 竞态窗口内，从节点继续执行会写 security_ip_lists 并触发重载，
 // 打破从节点只读不变量。
@@ -803,7 +803,7 @@ func TestThreatUpdate_runRejectedOnSlave(t *testing.T) {
 	}
 }
 
-// F-历史问题-01（历史，历史问题）：RunUpdate 恒返 nil——源失败仅内部落行，引擎
+// 历史问题-01（历史）：RunUpdate 恒返 nil——源失败仅内部落行，引擎
 // task_runs 把失败轮记成 success（终态失真）。修复：失败终态回传
 // ErrThreatUpdateFailed（「任一源失败即失败」，与 run 内 anyFailed/
 // failSourceRow 口径对齐）；skipped/cancelled 各有终态通道，不算失败。
@@ -828,7 +828,7 @@ func TestThreatRunUpdate_returnsErrorOnSourceFailure(t *testing.T) {
 	}
 }
 
-// F-历史问题-01 引擎侧契约钉：经 wire Run 体透传——源失败轮 task_runs 必须落
+// 历史问题-01 引擎侧契约钉：经 wire Run 体透传——源失败轮 task_runs 必须落
 // failed（曾恒 success）。Given 一源必败；When 引擎手动触发 threat；
 // Then Trigger 回传 ErrThreatUpdateFailed 且 task_runs 终态 failed。
 func TestWireThreatRun_failureLandsTaskRunsFailed(t *testing.T) {
@@ -848,7 +848,7 @@ func TestWireThreatRun_failureLandsTaskRunsFailed(t *testing.T) {
 	}
 }
 
-// SEC-C-N3（历史 历史问题）：CancelRunning 补 running 门——runCancel 一次运行后
+// 历史修复（历史）：CancelRunning 补 running 门——runCancel 一次运行后
 // 不清空，无运行中任务时（running=false）仍返回 true、与注释「无运行中任务
 // 返回 false」不符；对齐 CRS/IP2Region 同形（cancel!=nil && running）。
 func TestThreatCancelRunning_falseWhenIdleAfterRun(t *testing.T) {
@@ -918,9 +918,9 @@ func TestThreatListsReferenced_iterationErrorTreatedAsReferenced(t *testing.T) {
 	}
 }
 
-// T2（历史盲区补钉）：threat 通道 NeedForce→回退 /load 钉测——刷新返回
-// NeedForce（本轮渲染物化了证书文件，历史 CERT-1）时必须回退强制重载
-// 收敛（宁可一次重载，不欠引用方渲染收敛，历史问题 W1-1）；重载失败仅留痕，
+// 历史修复（历史盲区补钉）：threat 通道 NeedForce→回退 /load 钉测——刷新返回
+// NeedForce（本轮渲染物化了证书文件，历史修复）时必须回退强制重载
+// 收敛（宁可一次重载，不欠引用方渲染收敛，历史问题）；重载失败仅留痕，
 // 不中断任务、不计任务失败。
 func TestThreatUpdate_needForceFallsBackToReload(t *testing.T) {
 	overrideWafDirForTest(t)
@@ -1127,11 +1127,11 @@ func TestUpdateOneSource_healPreservesRawHash(t *testing.T) {
 	}
 }
 
-// —— 变化面判定不再依赖名单 id 查询（SSA-87-11，历史） ——
+// —— 变化面判定不再依赖名单 id 查询（历史修复，历史） ——
 
 // 内容变化 → 收敛；内容未变 → 零收敛。钉住 changedIDs→changed bool 重构后的
 // 判定面无行为漂移（旧的逐源 id 查询只被 len() 消费，已删除）。
-func TestSSA8711_changeDetectionDrivesConvergence(t *testing.T) {
+func TestThreatUpdate_changeDetectionDrivesConvergence(t *testing.T) {
 	overrideWafDirForTest(t)
 	newClusterTestService(t)
 	setupThreatTest(t, nil, nil, nil)
@@ -1172,12 +1172,12 @@ func TestSSA8711_changeDetectionDrivesConvergence(t *testing.T) {
 	}
 }
 
-// —— StartUpdate 返回即 CancelRunning 必真（SSA-87-06 同族，SS87-历史问题） ——
+// —— StartUpdate 返回即 CancelRunning 必真（历史修复同族） ——
 
 // 旧实现把 runCancel 登记放在 run goroutine 内：StartUpdate 返回后立刻取消
 // （任务引擎 CancelHook／前端连点）会读到 nil（首次）或上一轮陈旧 cancel，
 // 取消静默失效/取消错轮。单 P 调度使该窗口确定可复现。
-func TestSSA87_threatStartUpdateRegistersCancelBeforeReturn(t *testing.T) {
+func TestThreatStartUpdate_registersCancelBeforeReturn(t *testing.T) {
 	oldProcs := runtime.GOMAXPROCS(1)
 	t.Cleanup(func() { runtime.GOMAXPROCS(oldProcs) })
 	overrideWafDirForTest(t)

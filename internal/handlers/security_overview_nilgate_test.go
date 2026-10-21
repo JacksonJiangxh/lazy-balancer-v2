@@ -9,8 +9,8 @@ import (
 	"lazy-balancer-v2/internal/models"
 )
 
-// 历史 历史问题（历史问题）：GetSecurityOverview 在 MetricsDB==nil 时必须返回
-// 空面板 200 而非 nil 解引用 panic——对齐历史 历史问题 家族口径
+// 历史问题（历史）：GetSecurityOverview 在 MetricsDB==nil 时必须返回
+// 空面板 200 而非 nil 解引用 panic——对齐历史问题 家族口径
 // （ListSecurityEvents:3088 / GetIPEventCount:2977 / GetRuleStageStats）。
 func TestGetSecurityOverview_metricsDBNilReturnsEmptyPanel(t *testing.T) {
 	setupSecurityPolicyTestDB(t)

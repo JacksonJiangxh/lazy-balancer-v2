@@ -1,6 +1,6 @@
 package handlers
 
-// 历史修复(历史问题/3/4、OIDC-5、历史问题、历史问题、历史问题)的行为规格:
+// 历史修复(历史问题/4、历史问题、历史问题、历史问题、历史问题)的行为规格:
 // OIDC 令牌 pwd_ver、state 容量上限、discovery 负缓存、JIT 空白用户名兜底、
 // OIDC 用户 username 不可改、初始管理员不可降级、回调失败 302 回前端。
 
@@ -146,7 +146,7 @@ func TestOIDCProvider_failure_negative_cache(t *testing.T) {
 	}
 }
 
-// OIDC-5:preferred_username 纯空白经 TrimSpace 后必须走兜底链,不得产出空用户名行。
+// 历史问题:preferred_username 纯空白经 TrimSpace 后必须走兜底链,不得产出空用户名行。
 func TestOIDCCallback_jit_blank_username_falls_back(t *testing.T) {
 	idp := newMockIdP(t)
 	idp.usePref = true
@@ -439,7 +439,7 @@ func TestOIDCLogin_failureMessageDoesNotLeakProviderDetail(t *testing.T) {
 	}
 }
 
-// 历史问题 同族（R-12）：回调侧 provider 构建/令牌交换/id_token 校验失败同样
+// 历史问题 同族（历史修复）：回调侧 provider 构建/令牌交换/id_token 校验失败同样
 // 不得把原始错误回显给未认证浏览器。
 func TestOIDCCallback_failureMessageDoesNotLeakProviderDetail(t *testing.T) {
 	idp := newMockIdP(t)

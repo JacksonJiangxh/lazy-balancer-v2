@@ -193,8 +193,8 @@ func TestJWTLogout_revocation_usesUTCTextAcrossNegativeTimezoneQueryAndCleanup(t
 	if err := db.DB.QueryRow("SELECT COUNT(*) FROM revoked_jti WHERE expires_at > ?", time.Now().UTC().Format("2006-01-02T15:04:05Z")).Scan(&active); err != nil {
 		t.Fatal(err)
 	}
-	// CI87-13：驱动生产清理实现（db.CleanupExpiredRevokedJTI）而非在测试里复刻
-	// DELETE——真实 SQL 与时间格式（历史问题 B-F4 的 T/空格分隔陷阱）由此被覆盖。
+	// 历史修复：驱动生产清理实现（db.CleanupExpiredRevokedJTI）而非在测试里复刻
+	// DELETE——真实 SQL 与时间格式（历史问题 的 T/空格分隔陷阱）由此被覆盖。
 	if _, err := db.DB.Exec("INSERT INTO revoked_jti (jti_hash, expires_at) VALUES ('stale-jti','2000-01-01T00:00:00Z')"); err != nil {
 		t.Fatal(err)
 	}
@@ -214,9 +214,9 @@ func TestJWTLogout_revocation_usesUTCTextAcrossNegativeTimezoneQueryAndCleanup(t
 	}
 }
 
-// 历史 S-2：401 消息按失败类别分语义——过期（自然态，重登可解）与
+// 历史修复：401 消息按失败类别分语义——过期（自然态，重登可解）与
 // 签名无效/格式损坏（凭证问题）不得同发「登录状态已过期」；状态码均保持 401。
-// 历史 S-4：API Key 认证无会话令牌概念——登出应返回 404（无会话令牌
+// 历史修复：API Key 认证无会话令牌概念——登出应返回 404（无会话令牌
 // 可吊销，对齐 DELETE 重复调用 404 的幂等契约），而非旧代码的恒 500（context
 // 缺少 JWT 吊销哈希落穿错误分支）。
 func TestAPIKeyLogout_returnsNotFoundInsteadOf500(t *testing.T) {
@@ -341,7 +341,7 @@ func TestJWTAuth_rejects_first_token_after_two_same_second_password_changes(t *t
 	h := handlers.NewHandlers(handlers.Dependencies{})
 	update := func(current, next string) int64 {
 		response := httptest.NewRecorder()
-		// M5（契约）：本人改密须携带 current_password 过共享确认门。
+		// 历史修复（契约）：本人改密须携带 current_password 过共享确认门。
 		request := httptest.NewRequest(http.MethodPatch, "/users/me", strings.NewReader(`{"password":"`+next+`","current_password":"`+current+`"}`))
 		request.Header.Set("Content-Type", "application/json")
 		context, _ := gin.CreateTestContext(response)
@@ -480,7 +480,7 @@ func TestJWTAuth_allows_legacy_token_only_for_password_version_zero(t *testing.T
 }
 
 // ensurePasswordVersionColumn 钉夹具契约：users.password_version 在场。
-// SYSMW-72-C（历史）：现行架构 db.Initialize 建库即含该列
+// 历史修复（历史）：现行架构 db.Initialize 建库即含该列
 // （v2.1.8 迁移内联），原 ALTER 补列分支不可达已删——列缺席即夹具错误，
 // 直接失败暴露而非静默修补。
 func ensurePasswordVersionColumn(t *testing.T) {
@@ -807,7 +807,7 @@ func TestReadOnlyGuard_SlaveMcpWriteRouteRejected(t *testing.T) {
 
 // 历史问题（历史，主审上调 历史问题）：证书配置「测试」两条路由已移出只读白名单
 // ——它们会经 dnsproviders.Validate 真实 Present+CleanUp DNS TXT 记录（非纯读
-// 探测），从节点与只读 API Key 不得触发。U04a2-历史问题（历史）：CA 提供商
+// 探测），从节点与只读 API Key 不得触发。历史问题（历史）：CA 提供商
 // 测试同步移出——ZeroSSL 缺 EAB 时会真实写 ca_providers.credentials。
 func TestReadOnlyGuard_slaveCannotRunCertificateConfigTests(t *testing.T) {
 	router := newReadOnlyGuardTestRouter(t, false, "admin")
@@ -837,7 +837,7 @@ func TestReadOnlyGuard_adminCanRunCertificateConfigTests(t *testing.T) {
 }
 
 // 只读 API Key（同一 readOnlyWriteRoutes 事实源）同样不得触发证书配置测试，
-// 也不得触发 ZeroSSL 缺 EAB 时会写库的 CA 提供商测试（U04a2-历史问题）。
+// 也不得触发 ZeroSSL 缺 EAB 时会写库的 CA 提供商测试（历史问题）。
 func TestAPIKeyReadOnlyGuard_blocksCertificateConfigTests(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()

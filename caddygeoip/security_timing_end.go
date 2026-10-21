@@ -38,7 +38,7 @@ func (SecurityTimingEnd) CaddyModule() caddy.ModuleInfo {
 
 // ServeHTTP 计算 logged 事件耗时（注册表分段键 end，自预检完成锚点起算=
 // WAF 段值）写入进程内计时注册表，原样透传下游（reverse_proxy）。计时读头
-// 逻辑收敛于 recordSecurityTiming（PLUG-R1，security_timing.go）。
+// 逻辑收敛于 recordSecurityTiming（历史修复，security_timing.go）。
 //
 // 终态标记不在此处：blocked_counter 是链最外层收点，其 post-next 统一置
 // 注册表终态（auditTimingClose，auditwriter.go）——本收点之后已无安全链段。

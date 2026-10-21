@@ -1,6 +1,6 @@
 // 安全策略保存载荷组装（单源纯函数）。
 //
-// 审计 87 W87-15：载荷组装原先内联在 SecurityPolicies.handleSave，只能靠源码文本钉；
+// 历史修复：载荷组装原先内联在 SecurityPolicies.handleSave，只能靠源码文本钉；
 // 字段语义（阶段外字段裁剪、引用列表随开关释放、stage0 信任恒启用、空名单保留）
 // 都是后端契约，抽成纯函数后由 policyPayload.spec.ts 行为钉住。
 //
@@ -121,7 +121,7 @@ export const buildPolicyPayload = (input: PolicyPayloadInput): PolicyPayload => 
 }
 
 /**
- * 爬虫豁免「空引擎」守卫（审计 87 W87-03）。
+ * 爬虫豁免「空引擎」守卫（历史修复）。
  *
  * 后端渲染器 `crawlerEngineSelected` 对空集返回 true（空集 = 全部引擎，为兼容
  * 存量不允许改语义：internal/services/caddy.go）；而 UI 复选框「全不选」的直觉

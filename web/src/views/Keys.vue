@@ -377,7 +377,7 @@ interface CreateAPIKeyResponse {
 }
 
 const authStore = useAuthStore()
-// 历史问题-F9：只读门按「非 master 即禁用」判定——nodeMode 未知（/config 未返回/
+// 历史问题：只读门按「非 master 即禁用」判定——nodeMode 未知（/config 未返回/
 // 失败）时 fail-closed（与 历史问题/全站 readOnlyReason 口径一致）。主节点非 admin
 // 仍可管理本人密钥（后端强制只读 Key，白名单放行自助密钥端点）。
 const nodeWriteBlocked = computed(() => authStore.nodeMode !== 'master')
@@ -385,7 +385,7 @@ const isAdmin = computed(() => authStore.user?.role === 'admin')
 
 const keys = ref<readonly APIKey[]>([])
 const loading = ref(false)
-// 历史问题-F5：加载失败不得呈现为「暂无 API 密钥」——显性错误态 + 重试
+// 历史问题：加载失败不得呈现为「暂无 API 密钥」——显性错误态 + 重试
 const loadError = ref(false)
 const creating = ref(false)
 const createDialogVisible = ref(false)
@@ -466,7 +466,7 @@ const fetchKeys = async () => {
   }
 }
 
-// W87-16：白名单归一/序列化/逐行 CIDR 校验收敛到 utils/apiKeyWhitelist 单源（可 node 行为测试）。
+// 历史修复：白名单归一/序列化/逐行 CIDR 校验收敛到 utils/apiKeyWhitelist 单源（可 node 行为测试）。
 
 // 后端契约恒为 string[]（internal/models/models.go APIKey/APIKeyResponse），无需 string 兼容分支
 const parseWhitelist = (value: readonly string[]): string => value.join('\n')
@@ -662,7 +662,7 @@ const fetchMCPTools = async (): Promise<void> => {
       mcpToolsError.value = `工具清单加载失败：${error.message}`
       return
     }
-    // FE43-6(历史):非 Error 异常同样置错误态——否则落入「暂无工具」误态。
+    // 历史修复(历史):非 Error 异常同样置错误态——否则落入「暂无工具」误态。
     mcpToolsError.value = `工具清单加载失败：${String(error) || '未知错误'}`
     console.error('Failed to fetch MCP tools:', error)
   } finally {

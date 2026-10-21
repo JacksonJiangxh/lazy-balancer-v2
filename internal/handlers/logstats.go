@@ -39,13 +39,13 @@ type LogStorageInfo struct {
 }
 
 // dirBytes 返回 path 的活跃文件大小与轮转副本合计。两类轮转家族都统计
-// (SYS-1,2026-09-10 审计):自研 .1..9 shift 后缀;时间戳后缀家族——运行日志
-// <path>.YYYYMMDD-HHMMSS(logrotate.go)与 Caddy/timberjack 的 <name>-<ts>-size.log
+// (历史修复,2026-09-10 审计):自研 .1..9 shift 后缀;时间戳后缀家族——运行日志
+// <path>.历史修复(logrotate.go)与 Caddy/timberjack 的 <name>-<ts>-size.log
 // isTimberjackRotationCopy 判定文件名是否为 timberjack 轮转副本
 // (<stem>-<ts>-size.log / .gz,ts 首字符为数字)。与 timestampedRotationStatsWithEntries
 // 的 timberjack 分支同口径(历史问题 数字边界校验),聚合枚举时跳过这些副本
 // ——它们已由 base 文件的 timestampedRotationStatsWithEntries 计入 rotated,
-// 再计入 active 即双计(F-A,历史)。
+// 再计入 active 即双计(历史修复,历史)。
 func isTimberjackRotationCopy(name string) bool {
 	suffix := ""
 	if strings.HasSuffix(name, "-size.log.gz") {
@@ -89,10 +89,10 @@ func dirBytesWithEntries(path string, entries []os.DirEntry) (int64, int64, int)
 
 func timestampedRotationStatsWithEntries(path string, entries []os.DirEntry) (int64, int) {
 	dir := filepath.Dir(path)
-	// Sys-N1 根因(历史):运行日志 path=/app/logs/lazy-balancer.log,
+	// 历史修复 根因(历史):运行日志 path=/app/logs/lazy-balancer.log,
 	// TrimSuffix 去 .log 后 base=lazy-balancer,而轮转副本实际是
-	// lazy-balancer.log.YYYYMMDD-HHMMSS → rest=.log.2026... 不匹配 16 字符判定。
-	// 修复:不去扩展名,base 含 .log → rest=.YYYYMMDD-HHMMSS 恰 16 字符。
+	// lazy-balancer.log.历史修复 → rest=.log.2026... 不匹配 16 字符判定。
+	// 修复:不去扩展名,base 含 .log → rest=.历史修复 恰 16 字符。
 	// timberjack 族(caddy/rules)的副本 <base去ext>-<ts>-size.log 需去 ext,
 	// 故两种 base 各算一次:扩展 base 匹配运行日志族,去 ext base 匹配 timberjack。
 	base := filepath.Base(path)
@@ -111,7 +111,7 @@ func timestampedRotationStatsWithEntries(path string, entries []os.DirEntry) (in
 			continue
 		}
 		name := e.Name()
-		// B2-历史问题（历史）：整文件 gzip 归档 <base>.gz（如
+		// 历史问题（历史）：整文件 gzip 归档 <base>.gz（如
 		// certjob-lb_x.log.gz）同属该文件的轮转副本——按规则/证书收窄路径
 		// (dirBytes) 此前漏计，与聚合路径展示分叉。
 		if name == base+".gz" {
@@ -121,8 +121,8 @@ func timestampedRotationStatsWithEntries(path string, entries []os.DirEntry) (in
 			}
 			continue
 		}
-		// 运行日志族(base 含 .log):rest = .YYYYMMDD-HHMMSS(16 字符)；
-		// B2-07（历史）：gzip 压缩副本 .YYYYMMDD-HHMMSS.gz 同族计入
+		// 运行日志族(base 含 .log):rest = .历史修复(16 字符)；
+		// 历史修复（历史）：gzip 压缩副本 .历史修复.gz 同族计入
 		// （此前漏计，与聚合路径分叉）。
 		if strings.HasPrefix(name, base) {
 			rest := name[len(base):]
@@ -183,7 +183,7 @@ type dirStats struct {
 // 历史问题：聚合累加 RotatedCount，且 .gz 归档不再冒充活跃）。
 // 返回 基名 → 归并结果。分类口径与 dirBytes 一致：
 //   - base（匹配、非轮转副本、非 .gz）计入 Active；
-//   - .1..9 移位副本、运行日志族 base.YYYYMMDD-HHMMSS、timberjack
+//   - .1..9 移位副本、运行日志族 base.历史修复、timberjack
 //     <stem>-<ts>-size.log[.gz] 副本计入所属 base 的 Rotated/RotCount；
 //   - 不归属任何匹配 base 的 .gz 按归档计入 Rotated（压缩归档不是活跃文件）。
 func aggregateDirStats(dir string, match func(name string) bool) map[string]dirStats {
@@ -252,7 +252,7 @@ func isRotationCopyShape(name string) bool {
 			return true
 		}
 	}
-	// 运行日志族 base.YYYYMMDD-HHMMSS（rest 恰 16 字符）
+	// 运行日志族 base.历史修复（rest 恰 16 字符）
 	if len(name) > 17 {
 		rest := name[len(name)-16:]
 		if rest[0] == '.' && isDigits(rest[1:9]) && rest[9] == '-' && isDigits(rest[10:]) {
@@ -265,8 +265,8 @@ func isRotationCopyShape(name string) bool {
 // rotationCopyBaseOf 把轮转副本归到所属 base（与 dirBytes/timestampedRotationStatsWithEntries
 // 同口径：移位后缀、运行日志时间戳后缀、timberjack 时间戳后缀三族）。
 func rotationCopyBaseOf(name string, bases map[string]struct{}, stemToBase map[string]string) (string, bool) {
-	// H-B1-05（历史）：整文件 gzip 归档 <base>.gz 归到 base——与
-	// dirBytes/timestampedRotationStatsWithEntries 的 B2-历史问题 分支同口径。
+	// 历史修复（历史）：整文件 gzip 归档 <base>.gz 归到 base——与
+	// dirBytes/timestampedRotationStatsWithEntries 的 历史问题 分支同口径。
 	// 此前只对齐了运行日志族与 timberjack 族，整文件归档落入下方通用 .gz
 	// 独立键（消费侧按固定基名取值 → 该文件字节从聚合行消失）。
 	if base := strings.TrimSuffix(name, ".gz"); base != name {
@@ -283,7 +283,7 @@ func rotationCopyBaseOf(name string, bases map[string]struct{}, stemToBase map[s
 			}
 		}
 	}
-	// 运行日志族 base.YYYYMMDD-HHMMSS[.gz]（rest 恰 16 字符；B2-07 历史
+	// 运行日志族 base.历史修复[.gz]（rest 恰 16 字符；历史修复
 	// 审计：gzip 压缩副本同族归并，此前落入通用 .gz 独立键与 dirBytes 分叉）
 	core := strings.TrimSuffix(name, ".gz")
 	if len(core) > 17 {
@@ -317,7 +317,7 @@ func rotationCopyBaseOf(name string, bases map[string]struct{}, stemToBase map[s
 }
 
 func globalConfigInt(column string, fallback int64) int64 {
-	// nil 守卫(历史 APIMCP41-2 集成事故):guardConfiguredJSONBody 经本函数
+	// nil 守卫(历史修复 集成事故):guardConfiguredJSONBody 经本函数
 	// 读配置,无 DB 脚手架的测试/调用形态下 db.DB 为 nil,QueryRow 直接 panic
 	// ——nil 与读失败同口径回退默认值。
 	if db.DB == nil {
@@ -447,17 +447,17 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		return false
 	}
 
-	// S-7（2026-09-06 裁定）已被 2026-09-15 裁定部分覆盖:指标历史固定保留
+	// 历史修复（2026-09-06 裁定）已被 2026-09-15 裁定部分覆盖:指标历史固定保留
 	// 最近 7 天(services/services.go cleanupHistory),不再复用「日志保留」
 	// ——ConfigSource 类目清单不得再含指标历史(历史问题,历史)。
 	// 历史(用户裁定文案精简):可见文案短化——类目清单移 ConfigSource
 	// (tooltip 展示),行内只留「每日清理 · 保留 N 个月」。
 	//
-	// H-B1-04（历史）：保留口径/事件上限同样按 want 门控——此前三处无条件
+	// 历史修复（历史）：保留口径/事件上限同样按 want 门控——此前三处无条件
 	// 求值（audit_retention_months 点查 + 安全事件策略两次点查），单行轮询也付
-	// 3 次多余 SQLite 往返，与下方 U04d-06 声明的门控不成立；安全事件两项
+	// 3 次多余 SQLite 往返，与下方 历史修复 声明的门控不成立；安全事件两项
 	// （摘要+行帽）收敛为一次策略读取（services.SecurityEventsRetentionSnapshot）。
-	// U04d-06：阈值按 want 门控——日志弹框只请求单行时不得读其它配置列。
+	// 历史修复：阈值按 want 门控——日志弹框只请求单行时不得读其它配置列。
 	// 每列只读一次（此前任务循环逐任务重复读 task_log_size_mb）。
 	var (
 		auditLogLimit   *int64
@@ -502,7 +502,7 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		{Key: "caddy_server", Name: "Caddy HTTP 服务器日志", LimitBytes: caddyLimit, KeepCount: logRotatedBackups, ConfigSource: "Caddy 全局配置 · 日志大小"},
 		{Key: "caddy_proxy", Name: "Caddy 反向代理日志", LimitBytes: caddyLimit, KeepCount: logRotatedBackups, ConfigSource: "Caddy 全局配置 · 日志大小"},
 		{Key: "rule_access", Name: "规则访问日志", LimitBytes: caddyLimit, KeepCount: logRotatedBackups, ConfigSource: "Caddy 全局配置 · 日志大小"},
-		// F-历史问题-03（历史）：原 coraza_audit 行删除——前端零消费方
+		// 历史问题-03（历史）：原 coraza_audit 行删除——前端零消费方
 		// （LogStorageBar 仅 security_events/rule_access 两键），且与
 		// security_events 行同文件同统计，纯重复死面；audit_log_size_mb 配置
 		// 链仍由 auditlog_rotation.go 完整消费。
@@ -515,7 +515,7 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		}
 		return nil
 	}
-	// H-B1-04：保留口径与事件上限只在所请求行内读取（各一次点查）。
+	// 历史修复：保留口径与事件上限只在所请求行内读取（各一次点查）。
 	if info := byKey("audit"); info != nil && want("audit") {
 		info.RetentionNote = "每日清理 · 保留 " + strconv.FormatInt(globalConfigInt("audit_retention_months", 3), 10) + " 个月"
 	}
@@ -660,7 +660,7 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 	}
 	ruleID := strings.TrimSpace(c.Query("caddy_id"))
 	if ruleID != "" && (strings.ContainsAny(ruleID, "/\\") || ruleID == "." || ruleID == "..") {
-		// D1-历史问题（历史）：读侧不再要求「净化结果==原值」——写入端规则日志
+		// 历史问题（历史）：读侧不再要求「净化结果==原值」——写入端规则日志
 		// 文件名改为可逆编码（合法字母表原样、其余字符 %hex），含点等 v2 导入
 		// ID 的日志因此可读。这里只保留路径穿越形状的拒绝；文件名一律经
 		// services.RuleLogFileComponent 生成，输出恒为安全字符集。
@@ -669,14 +669,14 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 	}
 	if info := byKey("certjob"); info != nil && want("certjob") {
 		// 历史问题-02 读侧同源：与写入端 CertJobLogPath 同取 {任务日志目录}/certjobs
-		// （曾读写死 /app/logs 根——B3 惰性化后写入端已迁，不同源恒 0B）。
+		// （曾读写死 /app/logs 根——历史修复 惰性化后写入端已迁，不同源恒 0B）。
 		certJobDir := services.CertJobLogDir()
 		if ruleID != "" {
 			cjA, cjR, cjC := dirBytes(services.CertJobLogPath(ruleID))
 			info.SizeBytes, info.RotatedBytes, info.RotatedCount = cjA, cjR, cjC
 			info.Name = "证书任务日志 #" + ruleID
 		} else {
-			// 历史问题/F12：一次目录枚举归并（原逐文件 dirBytes = O(N²)）；
+			// 历史问题：一次目录枚举归并（原逐文件 dirBytes = O(N²)）；
 			// 归档份数与 .gz 归档同时计入（原丢弃 rotCount、.gz 冒充活跃）。
 			var active, rotated int64
 			var rotCount int

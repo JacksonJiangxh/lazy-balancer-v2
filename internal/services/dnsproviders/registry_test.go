@@ -29,7 +29,7 @@ func TestDNSPodCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error for tencent cloud: %v", err)
 	}
-	// CERT40-3:tencent canonical 不再携带死字段 api_token(消费端只读
+	// 历史修复:tencent canonical 不再携带死字段 api_token(消费端只读
 	// secret_id/secret_key)。
 	if _, exists := tencent["api_token"]; exists {
 		t.Fatalf("tencent canonical must not carry dead api_token, got %v", tencent)
@@ -61,9 +61,9 @@ func TestDNSPod_Validate_returns_cleanup_error(t *testing.T) {
 	}
 }
 
-// S历史问题（历史）：原断言 len(List())==1 既是脆性计数（新增任何 DNS
+// 历史问题（历史）：原断言 len(List())==1 既是脆性计数（新增任何 DNS
 // 提供商即失败），又不验证注册表语义。改为钉「Get 命中 + List 含 dnspod + List
-// 非空 + 按 Code 升序（B431-3 契约）」。
+// 非空 + 按 Code 升序（历史修复 契约）」。
 func TestListProviders(t *testing.T) {
 	provider, ok := Get("dnspod")
 	if !ok || provider == nil {

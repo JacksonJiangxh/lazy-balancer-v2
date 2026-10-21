@@ -8,7 +8,7 @@ package handlers
 //   · 写保护矩阵:绑本地 MFA→TOTP 弹码;OIDC 会话(auth_method=oidc)与本地
 //     MFA 体系完全解耦,经 mfaStepUpGuard 显式直通(v2.3.0 用户裁定);
 //     锁定仅密码路径(OIDC 失败不计入,防「伪造回调锁死账号」DoS)
-//   · 配置随 global_config 集群快照自动同步;从节点回调独立闭环（注：主端 users 节变更触发重放时会抹除本节点 JIT 行——该行存续期内签发的 JWT 将 401「用户不存在」，经 IdP 重新登录即自愈重建。历史问题-02 历史补证：抹除由漂移守卫自触发（本地 users 节哈希分叉→强制重放），首次仅在从节点登录的 OIDC 用户每个同步周期需重认证，直至在主端登录。U6a-4-1 历史裁定：最小动作=声明，不采用 SC-4 保留模式）→只读 JWT
+//   · 配置随 global_config 集群快照自动同步;从节点回调独立闭环（注：主端 users 节变更触发重放时会抹除本节点 JIT 行——该行存续期内签发的 JWT 将 401「用户不存在」，经 IdP 重新登录即自愈重建。历史问题-02 历史补证：抹除由漂移守卫自触发（本地 users 节哈希分叉→强制重放），首次仅在从节点登录的 OIDC 用户每个同步周期需重认证，直至在主端登录。历史修复裁定：最小动作=声明，不采用 历史修复 保留模式）→只读 JWT
 
 import (
 	"context"
@@ -64,7 +64,7 @@ var (
 	oidcProvMu   sync.Mutex
 	oidcProvCach = map[string]oidcProvEntry{} // issuer -> discovery 产物(含短 TTL 负缓存)
 	// oidcProvCacheMax 硬上限：管理员探测接口接受任意 issuer，无上限会导致
-	// 每个唯一 issuer 永久占位（历史 B2-历史问题）。满员淘汰任一条目，
+	// 每个唯一 issuer 永久占位（历史）。满员淘汰任一条目，
 	// 下个请求按需重新 discovery。
 	oidcProvCacheMax = 64
 	// oidcStateCount 在册 state 条目计数(历史问题:未认证泛洪封顶,计数与
@@ -83,7 +83,7 @@ type oidcProvEntry struct {
 const (
 	oidcStateTTL    = 10 * time.Minute
 	oidcNegCacheTTL = 5 * time.Second // discovery 失败负缓存 TTL
-	// oidcReturnToMaxBytes 登录 return_to 的字节上限（历史 B1-历史问题）：
+	// oidcReturnToMaxBytes 登录 return_to 的字节上限（历史）：
 	// state 条目按条数封顶但此前单条 return_to 无界——未认证攻击者可用
 	// 4096 条 ~1MB 的 return_to 近似保留数 GB 内存。站内前端页面键远短于此，
 	// 超限一律按非法值丢弃（fail-safe，跳回默认首页）。
@@ -94,7 +94,7 @@ const (
 // var 供测试收窄)。
 var oidcStateMaxEntries = 4096
 
-// reserveOIDCStateSlot 原子预留一个在册 state 槽位（历史 U04c-07）。
+// reserveOIDCStateSlot 原子预留一个在册 state 槽位（历史修复）。
 // 旧实现「先 Load 判定上限、discovery/随机数之后再 Store + Add(1)」是
 // TOCTOU：并发未认证登录可在检查与入册之间同时通过上限判定，越过 4096
 // 硬上限。CAS 循环不持锁、不阻塞昂贵的 discovery；上限 <=0 表示一律拒绝
@@ -118,7 +118,7 @@ func reserveOIDCStateSlot() bool {
 // ── 配置读写 ──
 
 // loadOIDCConfig 读取 OIDC 配置。
-// B1-历史问题（历史）：读失败/JSON 损坏必须与「未配置」区分——旧实现把
+// 历史问题（历史）：读失败/JSON 损坏必须与「未配置」区分——旧实现把
 // 两者折叠为 false，更新端点据此以零值整体回写，会把 issuer/client_id/secret
 // 清空（fail-open 破坏性写）。现在：未配置=(零值, nil)，读取失败=(零值, err)。
 func loadOIDCConfig() (OIDCConfig, error) {
@@ -148,7 +148,7 @@ func saveOIDCConfig(cfg OIDCConfig) error {
 	if err != nil {
 		return err
 	}
-	// B1-历史问题：与 UpdateConfig 同口径——影响行数非 1 即失败，不得报成功。
+	// 历史问题：与 UpdateConfig 同口径——影响行数非 1 即失败，不得报成功。
 	affected, err := res.RowsAffected()
 	if err != nil {
 		return err
@@ -271,7 +271,7 @@ func (h *Handlers) OIDCStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"enabled": true, "display_name": name}})
 }
 
-// trustedProxyRemoteAddr(APIMCP41-5,历史,2026-09-19 用户裁定按建议收窄):
+// trustedProxyRemoteAddr(历史修复,历史,2026-09-19 用户裁定按建议收窄):
 // 仅当直连对端为回环/私网(RFC1918+ULA+链路本地,即可信反代)时才采信
 // X-Forwarded-Proto/Host。解析失败(畸形/空)一律 false——宁可回退请求自身
 // 基址也不采信可疑来源。
@@ -288,7 +288,7 @@ func trustedProxyRemoteAddr(remoteAddr string) bool {
 }
 
 // requestOrigin 推导回调基址(反向代理场景尊重 X-Forwarded-Proto/Host)。
-// APIMCP41-5:转发头仅当直连对端可信时采信——路由器 SetTrustedProxies(nil)
+// 历史修复:转发头仅当直连对端可信时采信——路由器 SetTrustedProxies(nil)
 // 意味着任何公网客户端都能伪造 X-Forwarded-Host,无来源校验会把回调
 // redirect_uri 与成功回跳基址(令牌走 fragment)指向攻击者域。
 func requestOrigin(c *gin.Context) string {
@@ -423,12 +423,12 @@ func (h *Handlers) OIDCLogin(c *gin.Context) {
 		fail("OIDC 未启用")
 		return
 	}
-	// 过期清理先行(历史问题 历史问题 复审修正):封顶判定必须在自愈清理之后——
+	// 过期清理先行(历史问题 复审修正):封顶判定必须在自愈清理之后——
 	// 否则死条目(未被回调消费的过期 state)永无清理机会,4096 次未完成
 	// 登录即可把 OIDC 登录永久 429 直至重启(防护自身被武器化)。
 	oidcStates.Range(func(k, v any) bool {
 		if e, ok := v.(oidcStateEntry); ok && time.Since(e.created) > oidcStateTTL {
-			// SEC-1:LoadAndDelete 原子扣减——与回调消费方竞争同键时恰好一个
+			// 历史修复:LoadAndDelete 原子扣减——与回调消费方竞争同键时恰好一个
 			// 赢家,计数不向负漂移(封顶判定因此不被侵蚀)。
 			if _, loaded := oidcStates.LoadAndDelete(k); loaded {
 				oidcStateCount.Add(-1)
@@ -438,7 +438,7 @@ func (h *Handlers) OIDCLogin(c *gin.Context) {
 	})
 	// 历史问题:在册 state 条目封顶——未认证泛洪不得无限放大内存(上限远高于
 	// 正常未完成登录量级;到达即拒绝,不影响「回调失败不计锁定」裁定)。
-	// U04c-07：改为原子预留（CAS 递增），后续失败路径经 defer 释放——
+	// 历史修复：改为原子预留（CAS 递增），后续失败路径经 defer 释放——
 	// 检查与入册不再有 TOCTOU 窗口。
 	if !reserveOIDCStateSlot() {
 		fail("登录请求过于频繁，请稍后再试")
@@ -469,7 +469,7 @@ func (h *Handlers) OIDCLogin(c *gin.Context) {
 		fail("生成 nonce 失败")
 		return
 	}
-	// PKCE verifier 由 oauth2.GenerateVerifier() 内部自行取随机（历史补充轮
+	// PKCE verifier 由 oauth2.GenerateVerifier() 内部自行取随机（历史
 	// 历史问题：原 verifierRaw 随机读取从未消费，死代码已删）。
 	state := hex.EncodeToString(stateRaw)
 	nonce := hex.EncodeToString(nonceRaw)
@@ -490,7 +490,7 @@ func (h *Handlers) OIDCLogin(c *gin.Context) {
 }
 
 // isUniqueConstraintError 判定 SQLite 唯一约束冲突——modernc 驱动错误文本口径
-// 「UNIQUE constraint failed」+ 历史驱动兼容段「already exists」（SYS-R2，第 69
+// 「UNIQUE constraint failed」+ 历史驱动兼容段「already exists」（历史修复，第 69
 // 轮：users.go 用户名 409 两处双段判定并入本 helper 单一源）。
 func isUniqueConstraintError(err error) bool {
 	return err != nil && (strings.Contains(err.Error(), "UNIQUE constraint failed") || strings.Contains(err.Error(), "already exists"))
@@ -519,7 +519,7 @@ type oidcIdentity struct {
 }
 
 // lookupOIDCIdentity 按 (issuer,subject) 查身份行（命中分支、JIT 并发回退
-// 共用同一查询口径——U04c-08 收敛）。
+// 共用同一查询口径——历史修复 收敛）。
 func lookupOIDCIdentity(issuer, subject string) (oidcIdentity, error) {
 	var ident oidcIdentity
 	err := db.DB.QueryRow(`SELECT id, username, role, COALESCE(is_enabled,1), COALESCE(password_version,0)
@@ -592,11 +592,11 @@ const oidcJITInsertAttempts = 3
 // 前并发者抢占候选名」的竞态），不执行真实 INSERT。
 var oidcJITInsertAttemptHook func(attempt int) error
 
-// createOIDCUserWithRetry JIT 开户（U04c-08）：候选检查与 INSERT 之间
+// createOIDCUserWithRetry JIT 开户（历史修复）：候选检查与 INSERT 之间
 // 在「不同 subject、相同 preferred_username 并发首登」下仍会撞 username
 // 唯一约束——旧实现只按 (issuer,subject) 回查，身份行不存在即令本次登录
 // 失败。新语义：唯一冲突且身份行不存在时重算候选名并有限重试；同一 subject
-// 的并发回调（U6a-1）仍按命中分支收口，不补「创建」审计。
+// 的并发回调（历史修复）仍按命中分支收口，不补「创建」审计。
 // 返回 (身份行, 是否本次创建, 错误)。
 func createOIDCUserWithRetry(issuer, subject, base, displayName string) (oidcIdentity, bool, error) {
 	for attempt := 1; attempt <= oidcJITInsertAttempts; attempt++ {
@@ -687,7 +687,7 @@ func (h *Handlers) OIDCCallback(c *gin.Context) {
 		return
 	}
 	if errParam := c.Query("error"); errParam != "" {
-		// SEC-3+历史问题-4:仅回显 OAuth2/OIDC 标准错误码——description 与自造
+		// 历史修复+历史问题-4:仅回显 OAuth2/OIDC 标准错误码——description 与自造
 		// error 值均为外部可控文本,回显会被登录页当系统提示渲染(社工文案
 		// 注入面);非白名单短码一律吞掉,只保留「提供商拒绝授权」事实。
 		msg := "提供商拒绝授权"
@@ -709,7 +709,7 @@ func (h *Handlers) OIDCCallback(c *gin.Context) {
 	oauth2Token, err := oauthCfg.Exchange(ctx, c.Query("code"),
 		oauth2.SetAuthURLParam("code_verifier", entry.verifier))
 	if err != nil {
-		// 历史问题 同族（R-12）：交换错误含 token_endpoint 地址/HTTP 细节，不得
+		// 历史问题 同族（历史修复）：交换错误含 token_endpoint 地址/HTTP 细节，不得
 		// 回显给未认证浏览器——固定短句 + 原始错误仅日志。
 		services.Logf("warn", "OIDC 令牌交换失败: %v", err)
 		fail("OIDC 令牌交换失败，请稍后重试", "OIDC 令牌交换失败")
@@ -760,7 +760,7 @@ func (h *Handlers) OIDCCallback(c *gin.Context) {
 			fail("账号已被禁用", "")
 			return
 		}
-		// U04c-06：显示名是 IdP 源属性——重复登录按最新 claims 刷新（否则
+		// 历史修复：显示名是 IdP 源属性——重复登录按最新 claims 刷新（否则
 		// 永久停留在首次开户快照，而 UI 明示「由认证服务管理」）。role/
 		// is_enabled/username 仍由本地管理；username 刷新涉及唯一冲突与历史
 		// 链接，本轮保留本地值（报告裁定：单独策略）。
@@ -773,8 +773,8 @@ func (h *Handlers) OIDCCallback(c *gin.Context) {
 	case errors.Is(err, sql.ErrNoRows):
 		// JIT 开户:默认普通角色;用户名取 preferred_username→email 本地部分→sub,
 		// 冲突时后缀去重(不绑定本地账号,同名共存)。TrimSpace 先于空值兜底
-		// (OIDC-5:纯空白 preferred_username 不得穿过兜底产出空用户名)。
-		// SYS-1（历史裁定·不修+声明）：用户名策略（auth.go usernamePolicyRe
+		// (历史问题:纯空白 preferred_username 不得穿过兜底产出空用户名)。
+		// 历史修复（历史裁定·不修+声明）：用户名策略（auth.go usernamePolicyRe
 		// `^[a-z][a-z0-9]*$`）仅约束本地创建/改名，OIDC JIT 有意豁免——
 		// preferred_username 是 IdP 源属性，强行归一会破坏身份链（JIT 命中键是
 		// (issuer,subject)，撞 username 走后缀去重，无身份混同）。
@@ -792,8 +792,8 @@ func (h *Handlers) OIDCCallback(c *gin.Context) {
 		if displayName == "" {
 			displayName = base
 		}
-		// U04c-08：不同 subject 同名并发首登仍会撞 username 唯一约束——
-		// 唯一冲突后重算候选名有限重试（含 U6a-1 的同 subject 并发回退）。
+		// 历史修复：不同 subject 同名并发首登仍会撞 username 唯一约束——
+		// 唯一冲突后重算候选名有限重试（含 历史修复 的同 subject 并发回退）。
 		var created bool
 		var cerr error
 		ident, created, cerr = createOIDCUserWithRetry(cfg.Issuer, claims.Sub, base, displayName)
@@ -838,7 +838,7 @@ func (h *Handlers) OIDCCallback(c *gin.Context) {
 // 附加 auth_method=oidc 与 pwd_ver(历史问题:jwtAuth 对缺 pwd_ver 且 DB 版本
 // ≠0 的令牌恒拒——无该声明的 OIDC 会话在导入 bump 后永久 401)。
 // 唯一语义差异:node_mode 的判定错误路径——本函数单测分支查询失败按零值判
-// slave,respondLoginWithMFA 查询失败保持 master(U7a-历史问题,见下方分支注释)。
+// slave,respondLoginWithMFA 查询失败保持 master(历史问题,见下方分支注释)。
 func (h *Handlers) issueOIDCJWT(userID int, username, role string, passwordVersion int64) (string, time.Time, error) {
 	expireMinutes := loginExpireMinutes() // SYS-3：与密码登录共用单源钳制（auth.go）
 	now := time.Now()
@@ -873,7 +873,7 @@ func (h *Handlers) issueOIDCJWT(userID int, username, role string, passwordVersi
 // ── 管理端点(显示/测试/修改/删除) ──
 
 // OIDCSettings GET /settings/oidc(admin)——secret 掩码返回。
-// client_secret_masked 为文档性字段（apidocs 登记；历史问题 历史核实
+// client_secret_masked 为文档性字段（apidocs 登记；历史问题核实
 // 前端不消费——前端仅用 has_secret 显隐），保留供 API 消费者辨别 secret 已配置。
 func (h *Handlers) OIDCSettings(c *gin.Context) {
 	cfg, err := loadOIDCConfig()
@@ -916,13 +916,13 @@ func (h *Handlers) OIDCSettingsUpdate(c *gin.Context) {
 	}
 	cfg, cfgErr := loadOIDCConfig()
 	if cfgErr != nil {
-		// B1-历史问题：读失败/损坏时不得以零值继续合并——否则会清空 issuer/
+		// 历史问题：读失败/损坏时不得以零值继续合并——否则会清空 issuer/
 		// client_id/secret（破坏性写）。整体拒绝，保留库中现值。
 		services.Logf("error", "OIDC 配置更新前读取失败（已拒绝写入）: %v", cfgErr)
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取 OIDC 配置失败"})
 		return
 	}
-	before := cfg // B1-历史问题：字段级变更留痕基线
+	before := cfg // 历史问题：字段级变更留痕基线
 	if req.Enabled != nil {
 		cfg.Enabled = *req.Enabled
 	}
@@ -931,7 +931,7 @@ func (h *Handlers) OIDCSettingsUpdate(c *gin.Context) {
 		// 历史问题:url.Parse + scheme 白名单——HasPrefix("http") 放行
 		// 「httpxy://…」类伪 scheme。空 issuer 保留清除语义。
 		if *req.Issuer != "" {
-			// 历史问题/历史问题/B1-历史问题：url.Parse + scheme 白名单单源——
+			// 历史问题：url.Parse + scheme 白名单单源——
 			// HasPrefix("http") 放行「httpxy://…」类伪 scheme；空 issuer 保留清除语义。
 			if err := validateOIDCIssuerURL(issuer); err != nil {
 				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
@@ -965,7 +965,7 @@ func (h *Handlers) OIDCSettingsUpdate(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "OIDC 配置已保存"})
 }
 
-// oidcConfigUpdateAuditDetail 生成字段级 delta（B1-历史问题，历史）。
+// oidcConfigUpdateAuditDetail 生成字段级 delta（历史问题，历史）。
 // 该端点为 AuditPolicyExplicit，中间件不补字段——此前详情仅有「认证集成 成功」，
 // 启用/禁用、issuer、client_id 的任何变更在审计中不可区分。secret 只记
 // 「已更换/已清除」，绝不落值（对齐 config_changes.go GitHub token 口径）。
@@ -1018,7 +1018,7 @@ func (h *Handlers) OIDCSettingsTest(c *gin.Context) {
 	if !guardConfiguredJSONBody(c) {
 		return
 	}
-	// U04c-09：只有真正的空 body 才回退「测试已保存配置」；语法畸形/字段
+	// 历史修复：只有真正的空 body 才回退「测试已保存配置」；语法畸形/字段
 	// 类型错误必须 400（旧实现吞掉绑定错误，客户端格式错误会收到 200）。
 	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求参数无效"})
@@ -1037,13 +1037,13 @@ func (h *Handlers) OIDCSettingsTest(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请提供服务地址"})
 		return
 	}
-	// B1-历史问题：探测路径与保存路径同一 scheme 策略——任何出站
+	// 历史问题：探测路径与保存路径同一 scheme 策略——任何出站
 	// (discovery/token/jwks) 前先拒绝非 https（回环除外）。
 	if err := validateOIDCIssuerURL(issuer); err != nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
-	// SEC-2:机器身份(API Key/MCP)不开放「任指 URL」探测——issuer 须与已
+	// 历史修复:机器身份(API Key/MCP)不开放「任指 URL」探测——issuer 须与已
 	// 保存配置一致(先例端点探测的都是已存实体);管理员 JWT 面板编辑流不受限。
 	if c.GetString("auth_type") == "api_key" {
 		stored, cfgErr := loadOIDCConfig()
@@ -1063,7 +1063,7 @@ func (h *Handlers) OIDCSettingsTest(c *gin.Context) {
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"ok": false, "error": err.Error()}})
 		return
 	}
-	// B1-历史问题：JWKS 可达性——此前注释声称「一次签验失败即证可达性」，实际
+	// 历史问题：JWKS 可达性——此前注释声称「一次签验失败即证可达性」，实际
 	// 只反序列化 discovery 文档，jwks_uri 不可达/格式错误直到首次登录验签才炸。
 	// 测试阶段必须显式 GET jwks_uri（有界客户端 + 响应上限 + keys 非空）。
 	var providerClaims struct {
@@ -1173,7 +1173,7 @@ func probeClientCredentials(tokenURL, clientID, clientSecret string) (bool, erro
 	if clientID == "" || clientSecret == "" {
 		return false, nil // 无凭证可验(仅探测发现可达性)
 	}
-	// B1-历史问题：discovery 的 token_endpoint 同样受 scheme 策略约束——
+	// 历史问题：discovery 的 token_endpoint 同样受 scheme 策略约束——
 	// 不得把 client_secret 明文 POST 到非 https 的非回环地址。
 	if err := validateOIDCIssuerURL(tokenURL); err != nil {
 		return false, fmt.Errorf("令牌端点地址不合规: %w", err)
@@ -1228,7 +1228,7 @@ func (h *Handlers) OIDCSettingsDelete(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "删除 OIDC 配置失败"})
 		return
 	}
-	// B1-历史问题：删除留痕「删除前的字段值」（secret 只记是否配置），供取证
+	// 历史问题：删除留痕「删除前的字段值」（secret 只记是否配置），供取证
 	// 重建被抹除的接入参数。
 	detail := "认证集成"
 	if cfgErr == nil {
@@ -1261,7 +1261,7 @@ func (h *Handlers) OIDCSettingsDelete(c *gin.Context) {
 // 退化为第二道防线（纵深防御）。
 func sanitizeOIDCReturnTo(raw string) string {
 	if raw == "" || len(raw) > oidcReturnToMaxBytes {
-		// B1-历史问题：超长值直接丢弃——未认证入口不得承载任意大小的内存驻留。
+		// 历史问题：超长值直接丢弃——未认证入口不得承载任意大小的内存驻留。
 		return ""
 	}
 	if !strings.HasPrefix(raw, "/") || strings.HasPrefix(raw, "//") || strings.HasPrefix(raw, "/\\") {
@@ -1271,7 +1271,7 @@ func sanitizeOIDCReturnTo(raw string) string {
 }
 
 // validateOIDCIssuerURL 校验 OIDC 出站 URL 的 scheme/host 策略（历史问题；
-// B1-历史问题 收敛为单源）：仅允许 https；http 仅允许回环地址（127.0.0.0/8、::1）
+// 历史问题 收敛为单源）：仅允许 https；http 仅允许回环地址（127.0.0.0/8、::1）
 // 供本机 mock/测试。保存路径与「测试」探测路径（discovery/token/jwks）必须在
 // 任何出站请求前执行同一校验——此前测试端点绕过保存校验，管理员会话被借用时
 // 可探测内网或把 client_secret 明文 POST 到任指地址。

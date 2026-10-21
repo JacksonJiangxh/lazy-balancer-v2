@@ -12,10 +12,10 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// Review66-Head 发现 ①（2026-10-03 用户裁定核实后全修）：m 单位漏乘 60——30m
+// 历史修复 发现 ①（2026-10-03 用户裁定核实后全修）：m 单位漏乘 60——30m
 // 窗口被算成 30s，桶宽钳位 1s，升序 LIMIT 720 保留最旧桶，静默丢弃最近数据。
-// SYS-R1（历史）：双手写解析收敛为 parseMetricsInterval 单源，本测试改靶
-// 并扩为 modifier/seconds 双输出一致性钉（U8a-历史问题 分桶粒度=窗口秒数/720 必须
+// 历史修复（历史）：双手写解析收敛为 parseMetricsInterval 单源，本测试改靶
+// 并扩为 modifier/seconds 双输出一致性钉（历史问题 分桶粒度=窗口秒数/720 必须
 // 对应 SQL modifier，单源后编译期保证）。
 
 func TestParseMetricsInterval_modifierSecondsAgreement(t *testing.T) {

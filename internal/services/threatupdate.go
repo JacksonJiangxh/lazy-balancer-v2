@@ -24,7 +24,7 @@ import (
 var wafDir = "/app/waf"
 
 // wafDistDir 镜像内 WAF 发行版目录（CRS 树/xdb/爬虫种子的兜底来源）。
-// ConfigureWafDirs 随 data_dir 派生（SS87-历史问题）。
+// ConfigureWafDirs 随 data_dir 派生。
 var wafDistDir = "/app/waf.dist"
 
 // OverrideThreatWafDirForTest 测试注入临时 waf 目录（macOS 无 /app）。
@@ -44,7 +44,7 @@ func OverrideThreatWafDirForTest(dir string) (restore func()) {
 
 var ErrThreatUpdateRunning = errors.New("威胁情报库更新任务正在进行中")
 
-// ErrThreatUpdateFailed 任一源失败即整体失败（F-历史问题-01，历史）：失败终态
+// ErrThreatUpdateFailed 任一源失败即整体失败（历史问题-01，历史）：失败终态
 // 回传引擎——RunUpdate 曾恒返 nil，引擎 task_runs 把失败轮记成 success。口径与
 // run 内 anyFailed/failSourceRow 对齐；skipped（角色复查）/cancelled（手动取消）
 // 各有终态通道，不算失败。
@@ -68,7 +68,7 @@ type ThreatUpdateManager struct {
 	lastTaskOutcome string // success / failed / ""（未跑过）
 }
 
-// 历史修复（镜像 CRS/IP2Region 管理器）：仅 main.go 初始化。角色传播
+// nil-until-init（镜像 CRS/IP2Region 管理器）：仅 main.go 初始化。角色传播
 // 统一由任务引擎 SetRole 驱动（BecomeSlave/Promote 仅调用 SetRole，不再有
 // SetMasterRole 旁路）；未初始化时相关调度钩子经 nil 守卫跳过，不会把
 // 调度器（首轮即下载）带进无关测试。
@@ -140,7 +140,7 @@ func (m *ThreatUpdateManager) StatusSnapshot() ThreatTaskStatus {
 }
 
 // threatReloader 残留 /load 收敛回调（main.go 注入 caddyReloader）：仅热路径
-// 未证实收敛（发射面变化/运行配置不可读/刷新被拒）时的 历史修复 回退使用
+// 未证实收敛（发射面变化/运行配置不可读/刷新被拒）时的 fail-safe 回退使用
 // ——受信代理引用面 2026-10-15 随 tp.txt/lb_file 热路径化退役，不再有
 // 「按引用面定向重载」形态。
 var threatReloader func() error
@@ -149,10 +149,10 @@ var threatReloader func() error
 // CaddyService.RefreshIPListProjections，2026-10-15 用户裁定 threatReloader
 // 重载门退役）：被启用策略引用的名单内容变化后重写投影文件收敛（零 /load，
 // @ipListFast 匹配器 ≤1s stat 热感知）。返回 ProjectionConverged=已证实收敛
-// ——ProjectionNeedForce（本轮渲染物化了证书文件，历史 历史修复）与
+// ——ProjectionNeedForce（本轮渲染物化了证书文件，历史修复）与
 // ProjectionFallback（发射面变化/运行配置不可读）均未证实收敛，调用方回退
 // threatReloader 强制 /load 收敛（宁可一次重载，不欠引用方渲染收敛；强制
-// 形态同时满足 历史问题 历史修复）。历史问题 失败自愈标记（threatReloadPending）随之
+// 形态同时满足 历史修复）。历史问题 失败自愈标记（threatReloadPending）随之
 // 退役：热路径无失败态（回退即当轮 /load）；残留受信代理分支的失败由配置
 // 一致性看门狗漂移横幅 + 下次任意配置变更收敛兜底。
 var threatProjectionRefresher func() (IPListProjectionOutcome, error)
@@ -175,7 +175,7 @@ func (m *ThreatUpdateManager) StartUpdate(trigger string, rc *taskengine.RunCont
 		return nil, ErrThreatUpdateRunning
 	}
 	m.running = true
-	// 历史修复 同族（SS87-历史问题 家族收敛，历史）：可取消 ctx 与 running
+	// 历史修复同族（家族收敛）：可取消 ctx 与 running
 	// 在同一临界区登记——StartUpdate 返回后立刻 CancelRunning（任务引擎
 	// CancelHook／前端连点／自动化脚本）必须命中，不得因 run goroutine 尚未
 	// 执行而读到 runCancel==nil（首次）或上一轮的陈旧 cancel（非首次）静默
@@ -212,7 +212,7 @@ func (m *ThreatUpdateManager) RunUpdate(trigger string, rc *taskengine.RunContex
 		m.mu.Unlock()
 	}()
 	m.run(trigger, rc)
-	// F-历史问题-01（历史）：失败终态回传引擎（镜像 crs/ip2region wire Run
+	// 历史问题-01（历史）：失败终态回传引擎（镜像 crs/ip2region wire Run
 	// 体读 StatusSnapshot 判 failed 的口径）——恒返 nil 时引擎 task_runs 把
 	// 失败轮记成 success。
 	if m.StatusSnapshot().Outcome == "failed" {
@@ -261,7 +261,7 @@ func threatDueSources(trigger string) ([]threatSourceRow, error) {
 		}
 		// 名单为空视为到期（v2.3.2 名单化升级窗口：旧版写文件新版写名单，
 		// 不补这条则升级后最长 24h 名单为空、引用策略零拦截）——但仅限
-		// 「从未失败」形态（consecutive_failures=0，历史 历史问题，用户裁
+		// 「从未失败」形态（consecutive_failures=0，历史问题，用户裁
 		// 定）：持续产不出条目的失败源按排程门控，不再每分钟整任务重跑。
 		// v2.3.4 RDB 文件化：.iplist 文件缺失同此语义（哈希命中会跳过写
 		// 文件，不补这条则升级后文件永不落地、严格渲染持续跳过策略）。
@@ -287,12 +287,12 @@ func threatDueSources(trigger string) ([]threatSourceRow, error) {
 func threatListEmpty(source string) bool {
 	// 历史问题：.iplist 或 .fast 任一缺失都视为未装载——fast 是运行消费面，
 	// 只补文本不补 fast 会让新从节点/崩溃窗口永远缺加速文件。
-	// 历史修复 历史问题：.fast 存在但损坏同样视为未装载（可读性校验，stat 不算数）。
+	// 历史问题：.fast 存在但损坏同样视为未装载（可读性校验，stat 不算数）。
 	return threatIplistMissing(source) || threatFastUnusable(source)
 }
 
 // run 同步执行（测试/内部直调路径）：自建可取消 ctx 并登记 runCancel；
-// 生产入口经 StartUpdate 预建 ctx（历史修复 同族 SS87-历史问题——取消能力不得
+// 生产入口经 StartUpdate 预建 ctx（历史修复同族——取消能力不得
 // 晚于 StartUpdate 返回才就绪）。
 func (m *ThreatUpdateManager) run(trigger string, rc *taskengine.RunContext) {
 	runCtx, runCancel := context.WithCancel(updateRunBaseContext(rc))
@@ -337,7 +337,7 @@ func (m *ThreatUpdateManager) runWithContext(runCtx context.Context, trigger str
 	m.lastTrigger = trigger
 	m.lastStartedAt = time.Now().UTC().Format(crsTimeLayout)
 	m.mu.Unlock()
-	// 起点角色复查（历史 历史问题，历史问题 家族收敛）：调度器 tick 的 is_master
+	// 起点角色复查（历史问题，历史问题 家族收敛）：调度器 tick 的 is_master
 	// 守卫与更新启动之间存在 demote 竞态窗口——从节点继续执行会写
 	// security_ip_lists 并触发重载，打破只读不变量。NULL 兜底归一为 1（同
 	// crsupdate/ip2regionupdate 口径）。
@@ -359,7 +359,7 @@ func (m *ThreatUpdateManager) runWithContext(runCtx context.Context, trigger str
 	}
 	if err != nil {
 		Logf("error", "威胁情报库: 读取源列表失败: %v", err)
-		finishWith("failed") // 历史 历史问题：早退路径同样落终态，状态端点不失真
+		finishWith("failed") // 历史问题：早退路径同样落终态，状态端点不失真
 		return
 	}
 	if len(sources) == 0 {
@@ -370,11 +370,11 @@ func (m *ThreatUpdateManager) runWithContext(runCtx context.Context, trigger str
 	anyChanged := false // 内容真实变化的源存在（收敛分支的判定面）
 	anyFailed := false
 	cancelled := false
-	demoted := false // F-历史问题-01：demote 在途中止标记（outcome=skipped，优先于 cancelled/failed）
+	demoted := false // 历史问题-01：demote 在途中止标记（outcome=skipped，优先于 cancelled/failed）
 	runStartedAt := taskRunStartedAt(rc)
 	for _, source := range sources {
 		if runCtx.Err() != nil {
-			// F-历史问题-01：取消源分流——demote（角色已翻转）落 skipped（与起点
+			// 历史问题-01：取消源分流——demote（角色已翻转）落 skipped（与起点
 			// 角色复查同语义：从节点中止非故障）；主节点=手动取消 cancelled。
 			if master, known := updateRunRoleAtCancel(); known && !master {
 				demoted = true
@@ -392,7 +392,7 @@ func (m *ThreatUpdateManager) runWithContext(runCtx context.Context, trigger str
 		anyChanged = anyChanged || changed
 		anyFailed = anyFailed || failed
 	}
-	// 中止点归一（F-历史问题-01）：末源在途取消时循环自然结束（无下一轮顶部
+	// 中止点归一（历史问题-01）：末源在途取消时循环自然结束（无下一轮顶部
 	// 检查）——补判一次取消源；demote 优先于源失败（中止非故障）。
 	if !demoted && !cancelled && runCtx.Err() != nil {
 		if master, known := updateRunRoleAtCancel(); known && !master {
@@ -431,7 +431,7 @@ func (m *ThreatUpdateManager) runWithContext(runCtx context.Context, trigger str
 		AppendThreatUpdateLog("WARN", "unchanged", "投影刷新器未注册，跳过热路径（引用方渲染由下次配置变更收敛）")
 	} else if hot, rerr := threatProjectionRefresher(); rerr != nil || hot != ProjectionConverged {
 		// 投影刷新被拒（生成失败）/发射面变化/运行配置不可读/
-		// 证书材料被物化（NeedForce，历史 历史修复——重载回调为强制形态，
+		// 证书材料被物化（NeedForce，历史修复——重载回调为强制形态，
 		// 击穿 errSameConfig 让新证书进 Caddy 内存）→ 回退 /load 收敛——宁可
 		// 一次重载，不欠引用方渲染收敛。
 		AppendThreatUpdateLog("INFO", "reloading", "投影热路径未证实收敛（发射面变化/证书物化或刷新失败），回退重载 Caddy 配置")
@@ -549,7 +549,7 @@ func (m *ThreatUpdateManager) updateOneSource(ctx context.Context, source threat
 	}
 	AppendThreatUpdateLog("INFO", "downloading", fmt.Sprintf("下载 %s（%s）", source.name, source.url))
 
-	// 历史问题：fast 不可用（缺失/损坏，历史修复 历史问题）而文本仍在时优先从现有
+	// 历史问题：fast 不可用（缺失/损坏，历史问题）而文本仍在时优先从现有
 	// 文本重建，不依赖重新下载。
 	var entries []string
 	var rawHash string
@@ -609,7 +609,7 @@ func (m *ThreatUpdateManager) updateOneSource(ctx context.Context, source threat
 			// 跳过快照=拦截面静默为空）——记错并继续完整聚合/写库路径。
 			Logf("error", "威胁情报库: 检查源 %s 内置名单存在性失败: %v", source.name, err)
 		case listExists > 0 && threatFilesUnusable(source.name):
-			// RDB 文件化升级引导 + 历史修复 历史问题：名单行在但 .iplist 缺失或 .fast
+			// RDB 文件化升级引导 + 历史问题：名单行在但 .iplist 缺失或 .fast
 			// 缺失/损坏（v2.3.3 升级、带外损坏形态）——穿透快速路径照常写盘/
 			// 重编译，否则文件永不落地/损坏永不修复。
 			Logf("info", "威胁情报库: 源 %s 原始哈希一致但名单文件不可用（缺失/损坏），执行落盘修复", source.name)
@@ -653,7 +653,7 @@ func (m *ThreatUpdateManager) updateOneSource(ctx context.Context, source threat
 
 // markSourceSuccess 源成功状态落库（版本/条数/退避清零/下一窗口 + 原始字节哈希）。
 // 排程槽生命周期（2026-10-11 用户裁定）：仅 auto 且现存槽空/过期才推进——手动不动预约。
-// rawHash 缺省=兼容旧调用形态【不写】raw_hash 列（历史 历史问题：无条件覆写
+// rawHash 缺省=兼容旧调用形态【不写】raw_hash 列（历史问题：无条件覆写
 // 空串曾使快路径自我失效——缺省时动态剔除该列，保留上次慢路径哈希）。
 // 返回成功状态落库错误（吞错会让任务终态 success 掩盖状态机不闭环）。
 func markSourceSuccess(id int, entryCount int, finished string, trigger string, rawHash ...string) error {
@@ -675,7 +675,7 @@ func markSourceSuccess(id int, entryCount int, finished string, trigger string, 
 			return err
 		}
 	} else {
-		// raw_hash 缺省（快路径内容未变）不覆写该列（历史 历史问题 修法）。
+		// raw_hash 缺省（快路径内容未变）不覆写该列（历史问题 修法）。
 		args := append(append([]any{}, entryArgs...), version, finished, trigger, next, id)
 		if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_status='success', message='', `+entrySet+`version=?, finished_at=?, `+threatSlotAdvanceSQL+`, consecutive_failures=0, updated_at=datetime('now') WHERE id=?`,
 			args...); err != nil {
@@ -683,7 +683,7 @@ func markSourceSuccess(id int, entryCount int, finished string, trigger string, 
 			return err
 		}
 	}
-	// 成功留痕（尾部共享，两分支同达，历史 历史问题 修法）：rawHash 分支=内容
+	// 成功留痕（尾部共享，两分支同达，历史问题 修法）：rawHash 分支=内容
 	// 更新；无参分支=哈希一致跳过写入。原 历史问题 修复在 rawHash 分支加的 return
 	// 切断了本段日志（真实更新零留痕），已撤除。
 	// 源名仅用于日志，按 id 反查一次
@@ -733,7 +733,7 @@ func writeThreatSystemList(source string, entries []string) (bool, error) {
 		return false, fmt.Errorf("读源哈希失败: %w", err)
 	}
 	// RDB 文件化：文件缺失时哈希命中不得跳过（升级引导——v2.3.3 升上来
-	// 内容未变，但 .iplist/.fast 尚未落地，须照常写盘）。历史修复 历史问题：.fast
+	// 内容未变，但 .iplist/.fast 尚未落地，须照常写盘）。历史问题：.fast
 	// 存在但损坏同样不得跳过——照常写盘完成重编译修复。
 	if listExists > 0 && storedHash == hash && storedHash != "" && !threatFilesUnusable(source) {
 		return false, nil
@@ -832,7 +832,7 @@ func downloadAndParseThreatSourceCtx(parent context.Context, source threatSource
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, source.url, nil)
 	if err == nil {
-		req.Header.Set("User-Agent", "lazy-balancer-v2") // 历史 历史问题：空 UA 可能被源拒绝/插页（对齐 crshttp 同口径）
+		req.Header.Set("User-Agent", "lazy-balancer-v2") // 历史问题：空 UA 可能被源拒绝/插页（对齐 crshttp 同口径）
 	}
 	if err != nil {
 		return nil, "", fmt.Errorf("构造请求失败: %w", err)
@@ -885,7 +885,7 @@ func threatIplistMissing(source string) bool {
 }
 
 // threatFastUnusable 报告源的 .fast 加速文件是否不可用：缺失（stat 失败）
-// 或存在但损坏/不可读（历史修复 历史问题，历史——旧口径只 stat，损坏文件
+// 或存在但损坏/不可读（历史问题，历史——旧口径只 stat，损坏文件
 // 会让哈希快路径永久跳过修复、引用策略在渲染层被整体跳过）。可读性校验
 // 用 ReadFastFile 全量判定（magic/flags/尺寸/bits/掩码/序/不相交）。
 func threatFastUnusable(source string) bool {
@@ -972,7 +972,7 @@ func WriteThreatIplistCompiled(iplistPath string, data []byte) error {
 		return err
 	}
 	// 数据落盘后再编译/rename；掉电窗口内空 .iplist/.fast 会让拦截静默
-	// 历史修复（历史 历史问题-3）。
+	// fail-open（历史问题-3）。
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
 		return err

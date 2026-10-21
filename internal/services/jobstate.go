@@ -100,7 +100,7 @@ func JobIsTerminal(status string) bool {
 
 // maxJobMessageBytes 限制写入 cert_jobs.message 的任务消息大小。CA 错误详情等外部
 // 文本可能无界嵌入错误链，而 message 列会同步到从节点并展示在 UI（历史
-// F-历史问题），各写入点（failJob/jobLogger.Log/deploymentFailed）统一截断。
+// 历史问题），各写入点（failJob/jobLogger.Log/deploymentFailed）统一截断。
 const maxJobMessageBytes = 1024
 
 // truncateJobMessage 将任务消息截断到 maxJobMessageBytes 字节内，并回退到合法

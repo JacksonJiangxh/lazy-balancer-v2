@@ -18,7 +18,7 @@ import (
 // 与 PutCaddyConfig/导入路径(config_backup.go)口径不一。
 // 历史问题 UpdateRule 显式空 upstreams 数组曾被 len==0 归并进「保留存量」;改为
 // nil 判定区分「省略」与「显式 []」——显式 [] 经 validateRulePayloadBeforeSave
-// 「至少需要一个上游服务器」400 拒绝（历史问题 历史纠正：零上游非合法形态，
+// 「至少需要一个上游服务器」400 拒绝（历史问题纠正：零上游非合法形态，
 // 本文件早期头注释「显式 []=清空（零上游为合法形态）」与现行语义相反，已更正；
 // 引用一律用函数名，不写行号——行号漂移曾致三处误导）。
 // 历史问题 DuplicateRule 的 TCP 死形态归一漏清 CAProviderID,与 CreateRule/UpdateRule
@@ -166,7 +166,7 @@ func TestDuplicateRule_copiesSecurityPolicyBindings(t *testing.T) {
 	}
 }
 
-// B2-04 / B2-05：跨模式残留清理——生效来源非 manual 不保留证书材料；
+// 历史修复：跨模式残留清理——生效来源非 manual 不保留证书材料；
 // 非 acme_dns 的 ca_provider_id 归零（manual→manual 编辑同样自愈）。
 func TestUpdateRule_clearsCrossSourceTLSResidue(t *testing.T) {
 	t.Run("manual-to-acme-drops-certificate-material", func(t *testing.T) {

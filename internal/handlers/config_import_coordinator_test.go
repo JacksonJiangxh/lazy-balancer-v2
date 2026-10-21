@@ -46,7 +46,7 @@ func TestImportFailureAuditDescriptionReflectsFailurePhase(t *testing.T) {
 	}
 }
 
-// B3-82-历史问题 / 历史问题-历史问题：并发导入必须串行；第二个会话在第一个
+// 历史修复 / 历史问题：并发导入必须串行；第二个会话在第一个
 // close 前不得已执行 Pause，否则第一个 Resume 会让它失去排空保护。
 func TestBeginConfigImport_serializesConcurrentSessions(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -103,7 +103,7 @@ func TestBeginConfigImport_serializesConcurrentSessions(t *testing.T) {
 	second.session.close()
 }
 
-// A85历史问题-1：Resume 必须先于串行会话锁释放；否则后到导入可先 Pause，
+// 历史问题：Resume 必须先于串行会话锁释放；否则后到导入可先 Pause，
 // 再被前一代 Resume 覆盖，在调度恢复状态下执行事务。
 func TestConfigImportSessionClose_resumesBeforeReleasingSerialization(t *testing.T) {
 	h := &Handlers{}
@@ -127,7 +127,7 @@ func TestConfigImportSessionClose_resumesBeforeReleasingSerialization(t *testing
 	}
 }
 
-// A85历史问题-4：ctx-blind 在途任务超过排空预算后不得继续全量导入；
+// 历史问题：ctx-blind 在途任务超过排空预算后不得继续全量导入；
 // 必须恢复调度、释放会话锁并返回可重试 409，而非留下 last-writer-wins 窗口。
 func TestBeginConfigImport_taskDrainTimeoutAbortsBeforeTransaction(t *testing.T) {
 	h := newBackupTestHandlers(t)

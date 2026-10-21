@@ -1,8 +1,8 @@
 package handlers
 
 // 历史问题-4:安全域文本字段长度封顶——策略名 ≤100 rune、描述 ≤500 rune、
-// 自定义规则名 ≤100 rune、自定义规则描述 ≤500 rune（SEC-U1 历史补齐）、
-// 拦截页名 ≤100 rune、拦截页描述 ≤500 rune（SEC-A-2 历史补齐）、
+// 自定义规则名 ≤100 rune、自定义规则描述 ≤500 rune（历史修复补齐）、
+// 拦截页名 ≤100 rune、拦截页描述 ≤500 rune（历史修复补齐）、
 // 拦截页 content ≤64KB;DB 列无长度约束,超长串随审计详情/列表响应/发射文本放大。
 
 import (
@@ -71,7 +71,7 @@ func TestSecurityInputs_lengthLimits(t *testing.T) {
 		}
 	})
 
-	// SEC-U1（历史）：自定义规则 description 补封顶（历史问题-4 家族漏收敛
+	// 历史修复（历史）：自定义规则 description 补封顶（历史问题-4 家族漏收敛
 	// ——策略描述同口径 500 rune；DB 列无约束，超长串随列表响应/审计详情放大）。
 	t.Run("custom rule description over 500 runes rejected", func(t *testing.T) {
 		rec := postJSON(t, router, "/security/custom-rules", map[string]any{
@@ -105,7 +105,7 @@ func TestSecurityInputs_lengthLimits(t *testing.T) {
 			t.Fatalf("exactly 64KB content must pass, got %d %s", rec.Code, rec.Body.String())
 		}
 	})
-	// SEC-A-2（历史）：拦截页 name/description 补封顶（历史问题-4 家族漏收敛
+	// 历史修复（历史）：拦截页 name/description 补封顶（历史问题-4 家族漏收敛
 	// 点——策略/自定义规则同口径 100/500 rune；创建与更新同门）。
 	t.Run("block page name over 100 runes rejected", func(t *testing.T) {
 		rec := postJSON(t, router, "/security/block-pages", map[string]any{

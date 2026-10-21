@@ -11,7 +11,7 @@ import (
 	"lazy-balancer-v2/geoipnames"
 )
 
-// PD-04（历史）：爬虫地址库内置首版的单一事实源。
+// 历史修复（历史）：爬虫地址库内置首版的单一事实源。
 //
 // 历史形态：镜像资产 config/crawler-ip-lists.seed.json + services 内另存一份
 // 手写 Go 表。两份分叉——手写表 gptbot 仅 3 条（含官方已不发布的
@@ -46,7 +46,7 @@ func summary(lists map[string][]string) map[string]int {
 	return out
 }
 
-// TestCrawlerSeedIPRanges_alignWithGeoIPNames 段集不变量（历史问题 历史 + PD-04 历史）：
+// TestCrawlerSeedIPRanges_alignWithGeoIPNames 段集不变量（历史问题 + 历史修复）：
 // geoipnames.CrawlerEngine.IPRanges 是「官方 IP 段」的唯一权威声明，
 //  1. 声明了官方段的引擎（iprange 验证）：每个内置 CIDR 必须落在某个官方段内
 //     （⊆），且每个官方段至少被一个内置 CIDR 覆盖（不得漏段）；

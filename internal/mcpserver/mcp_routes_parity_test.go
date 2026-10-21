@@ -7,7 +7,7 @@ import (
 	"lazy-balancer-v2/internal/mcpserver"
 )
 
-// TestMCPToolSpecs_cover_registeredGinRoutes MCP 工具↔路由对照绊线（历史问题 B-F7）：
+// TestMCPToolSpecs_cover_registeredGinRoutes MCP 工具↔路由对照绊线（历史问题）：
 // 每个工具的 (method, path) 必须命中 SetupRouter 注册的真实路由——工具指向已
 // 改名/删除的路由只会在 Agent 调用时 404，编译期与既有测试均不可见（OpenAPI
 // 侧有同款绊线，MCP 侧此前为空白）。{param} 形态经 ginPathToOpenAPI 反向

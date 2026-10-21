@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// 历史 历史问题-01/02/04 + 历史问题-01 修复钉测试。
+// 历史问题-01/02/04 + 历史问题-01 修复钉测试。
 // 形状来源：生产调用形态=启动/翻转期三连 SetMasterRole→SetRole（每次转发），
 // 既有测试每轮只翻一次与生产不符——本文件按真实形态钉。
 
@@ -115,7 +115,7 @@ func TestEngine_DemoteTripleSetRoleDoesNotReviveOnSlave(t *testing.T) {
 }
 
 // Given 常驻运行中且已被 SetRole 重申（bug 形态下会栽标）。
-// When Engine.Stop()（进程退出——U10 补充的第四触发面）。
+// When Engine.Stop()（进程退出——历史修复 补充的第四触发面）。
 // Then 不在 teardown 中拉起新代。
 func TestEngine_StopPreventsRestart(t *testing.T) {
 	e := newTestEngine(t)
@@ -333,7 +333,7 @@ func TestEngine_RoleFlipWithoutFlagNoRestart(t *testing.T) {
 
 // Given master-only Scheduled 任务在途（Run 阻塞于 rc.Ctx.Done）。
 // When demote（SetRole(false)，生产形态）。
-// Then 在途 Run 被中止且终态落 cancelled（F-历史问题-01：SetRole targets 曾仅
+// Then 在途 Run 被中止且终态落 cancelled（历史问题-01：SetRole targets 曾仅
 // Daemon/Periodic——定时族在途 Run 继续跑完，demote 后从节点写面（三库
 // 版本行/名单/规则树）打破只读不变量；取消经 rc.Ctx 传播，Run 体据此落
 // skipped 与起点角色复查对齐）。
@@ -343,7 +343,7 @@ func TestEngine_DemoteCancelsInFlightScheduled(t *testing.T) {
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
 	e.Register(Descriptor{ID: "t-sched", Family: "t", Name: "定时", Kind: KindScheduled, RunsOn: RoleMasterOnly,
-		// TASK-L2（历史）配套：Scheduled 注册必须带 NextSlotFn（远期槽——
+		// 历史修复（历史）配套：Scheduled 注册必须带 NextSlotFn（远期槽——
 		// tick 不触发，本测试经 Trigger 驱动在途形态）。
 		NextSlotFn: func() time.Time { return time.Now().Add(time.Hour) },
 		Run: func(rc RunContext) error {
@@ -428,7 +428,7 @@ func TestEngine_RapidRoleFlipRestartsMasterOnlyDaemon(t *testing.T) {
 
 // Given master-only Periodic 任务在途（Run 阻塞于 rc.Ctx.Done）。
 // When demote（SetRole(false)，生产形态）。
-// Then 在途 Run 被中止且终态落 cancelled（X-3 历史：Periodic 分支曾仅在
+// Then 在途 Run 被中止且终态落 cancelled（历史修复：Periodic 分支曾仅在
 // 角色获得时置零节拍，demote 不取消在途 Run——与 Scheduled 分支同型的只读
 // 不变量破坏：从节点写面继续跑完。本测试钉「镜像 Scheduled 取消」）。
 func TestEngine_DemoteCancelsInFlightPeriodic(t *testing.T) {
@@ -437,7 +437,7 @@ func TestEngine_DemoteCancelsInFlightPeriodic(t *testing.T) {
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
 	e.Register(Descriptor{ID: "t-periodic", Family: "t", Name: "周期", Kind: KindPeriodic, RunsOn: RoleMasterOnly,
-		// TASK-L2（历史）配套：Periodic 注册必须带 IntervalFn（长间隔——
+		// 历史修复（历史）配套：Periodic 注册必须带 IntervalFn（长间隔——
 		// tick 不触发，本测试经 Trigger 驱动在途形态）。
 		IntervalFn: func() time.Duration { return time.Hour },
 		Run: func(rc RunContext) error {

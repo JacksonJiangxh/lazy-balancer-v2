@@ -17,7 +17,7 @@ test('历史问题-3：未打开、未知来源与其它状态不触发跃迁关
   assert.equal(shouldCloseRegistrationDialog(true, 'master', 'master'), false)
 })
 
-// WS-17：一次性注册令牌不得在 emit 后立即清空——父级二次确认/入口守卫才可能
+// 历史修复：一次性注册令牌不得在 emit 后立即清空——父级二次确认/入口守卫才可能
 // 取消，取消后须能直接重试而不必重新粘贴。仅父级 POST 成功或弹框关闭时清空。
 test('WS-17：提交后不即时清空令牌，确认成功/关闭弹框统一清理', () => {
   const page = source('src/views/settings/cluster/ClusterModeCard.vue')

@@ -10,7 +10,7 @@
       </div>
     </div>
 
-    <!-- W87-03：/caddy/config 仅 admin 组（middleware.go admin.GET("/caddy/config")），
+    <!-- 历史修复：/caddy/config 仅 admin 组（middleware.go admin.GET("/caddy/config")），
          页面此前对全体登录用户可见、非管理员每次进入必得 403（横幅 + toast 双通道，
          无权限语义）。按角色渲染空态且不发请求——深链 #/caddy 同样被覆盖。从节点
          admin 的 GET 仍放行（readonly.go 只拦写），故不按 slave 收口。 -->
@@ -66,7 +66,7 @@ type JsonValue = JsonPrimitive | { readonly [key: string]: JsonValue } | JsonVal
 type CaddyConfigResponse = { readonly data?: JsonValue }
 
 const authStore = useAuthStore()
-// W87-03：权限态收口——只有 admin 能读 /caddy/config（服务端另有纵深 403）。
+// 历史修复：权限态收口——只有 admin 能读 /caddy/config（服务端另有纵深 403）。
 // user 尚未拉到（null）时给「读取权限中」而非「无权限」，避免 admin 首屏误判。
 const canViewConfig = computed(() => authStore.user?.role === 'admin')
 const permissionEmptyText = computed(() => authStore.user === null ? '正在读取账户权限…' : '仅管理员可查看 Caddy 配置预览')
@@ -105,7 +105,7 @@ watch(canViewConfig, (allowed) => {
 .card-header { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
 .card-title { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; color: var(--text-primary); }
 /* 滚动唯一归 SyntaxHighlight 内层（70vh 自滚）——外层不得叠加 max-height+
-   overflow（历史 历史问题-1：双垂直滚动条根因，本页是唯一未传 height 的
+   overflow（历史问题-1：双垂直滚动条根因，本页是唯一未传 height 的
    消费方）；外层只保留深色底框与最小高度。 */
 .config-preview { min-height: 160px; overflow: visible; padding: 14px; border-radius: var(--radius-md); background: #1e293b; }
 

@@ -1,4 +1,4 @@
-// 路径规则校验与后端 rule_features.go 同口径验收（审计 87 WEB-UTILS）：
+// 路径规则校验与后端 rule_features.go 同口径验收（历史修复）：
 //   历史问题-06 自定义上游池：主机形态 / host:port 去重 / http-https 混布
 //   历史问题-07 同类型查重按后端键（exact 不剥尾 /），跨类型遮蔽仍归一键
 //

@@ -616,10 +616,139 @@ func TestAutobanMerge_evictsEarliestExpiringAutobanEntries(t *testing.T) {
 	})
 }
 
-// ---- 重载节流（AU-1 持锁契约 + D4 三态） ----
+// ---- 容量挤出清桶（历史修复：挤出=解封同语义，否则挤出→下轮重封轮转） ----
+
+// Given 满容量名单（自动条目）+ 新达标候选触发挤出。
+// When autobanMergeEntries 完成容量收敛。
+// Then merge 结果必须携带被挤出条目的 IP 身份（EvictedIPs），供调用方
+// 同步清计数桶与落容量收敛留痕。
+func TestAutobanMerge_reportsEvictedIPs(t *testing.T) {
+	installAutobanFixture(t, "2026-10-14 10:00:00")
+	oldCap := AutobanListEntryCap
+	AutobanListEntryCap = 2
+	t.Cleanup(func() { AutobanListEntryCap = oldCap })
+	seedPresetEntries(t, []models.IPListEntry{
+		{Value: "198.51.100.3", Remark: AutobanEntryRemark, ExpiresAt: "2026-10-14 12:00:00"}, // 晚到期
+		{Value: "198.51.100.4", Remark: AutobanEntryRemark, ExpiresAt: "2026-10-14 11:00:00"}, // 最早到期→被挤
+	})
+	out, err := autobanMergeEntries(AutobanConfig{Enabled: true, Threshold: 1, WindowMinutes: 5, Duration: "1h", Scope: "all", DryRun: false},
+		[]AutobanSuggestion{{IP: "203.0.113.10", Count: 120}})
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if out.Evicted != 1 {
+		t.Fatalf("given: evicted=%d, want 1", out.Evicted)
+	}
+	if len(out.EvictedIPs) != 1 || out.EvictedIPs[0] != "198.51.100.4" {
+		t.Fatalf("EvictedIPs=%v, want [198.51.100.4]（被挤出条目身份）", out.EvictedIPs)
+	}
+}
+
+// Given 容量=1 的名单：受害者 IP 计数达标被封入名单。
+// When 新 IP 达标触发容量收敛挤出受害者，随后零新事件再跑一轮。
+// Then 受害者的计数桶必须随挤出同步清空——零新事件下不得再进候选重封
+// （旧行为：挤出只计数不清桶 → 下轮旧计数仍 ≥ 阈值立即重封 →
+// 「挤出→重封→再挤出」轮转，本钉测必红）。
+func TestAutobanRunCycle_evictedIPBucketClearedNoRotation(t *testing.T) {
+	f := installAutobanFixture(t, "2026-10-14 10:00:00")
+	setAutobanConfigRaw(t, true, 3, 60, "1h", "all", false)
+	oldCap := AutobanListEntryCap
+	AutobanListEntryCap = 1
+	t.Cleanup(func() { AutobanListEntryCap = oldCap })
+
+	// 第一轮：受害者 3 次达标 → 封入名单（容量 1，恰好满）。
+	for range 3 {
+		autobanObserveEvent("198.51.100.4", "blocked", "942100")
+	}
+	if err := RunAutobanCycle(taskengine.RunContext{Trigger: "auto"}); err != nil {
+		t.Fatalf("round1: %v", err)
+	}
+	if _, ok := entryValues(presetEntries(t))["198.51.100.4"]; !ok {
+		t.Fatal("given: 受害者第一轮应被封入名单")
+	}
+
+	// 第二轮：新 IP 3 次达标 → 名单已满 → 挤出受害者、封入新 IP。
+	for range 3 {
+		autobanObserveEvent("203.0.113.10", "blocked", "942100")
+	}
+	if err := RunAutobanCycle(taskengine.RunContext{Trigger: "auto"}); err != nil {
+		t.Fatalf("round2: %v", err)
+	}
+	entries := entryValues(presetEntries(t))
+	if _, ok := entries["198.51.100.4"]; ok {
+		t.Fatal("given: 受害者应被容量收敛挤出")
+	}
+	if _, ok := entries["203.0.113.10"]; !ok {
+		t.Fatal("given: 新 IP 应在挤出后封入")
+	}
+
+	// 第三轮：零新事件。受害者桶已随挤出清空 → 不得重封（不重封则
+	// 名单保持不变——无挤出无新封）。
+	f.Advance(time.Minute)
+	if err := RunAutobanCycle(taskengine.RunContext{Trigger: "auto"}); err != nil {
+		t.Fatalf("round3: %v", err)
+	}
+	if _, ok := entryValues(presetEntries(t))["198.51.100.4"]; ok {
+		t.Fatal("挤出未清桶：受害者零新事件被立即重封（挤出→重封轮转）")
+	}
+	if _, ok := entryValues(presetEntries(t))["203.0.113.10"]; !ok {
+		t.Fatal("在封的新 IP 不得在零变化轮丢失")
+	}
+}
+
+// ---- 容量收敛留痕携带挤出条目身份 ----
+
+// Given 名单满 12 条自动条目、候选触发整批挤出（12 个）。
+// When 正式模式跑一轮 RunAutobanCycle。
+// Then 容量收敛 WARN 行与审计详情携带挤出条目身份，截断到前 10 个
+// +「等 N 个」（N=总数），第 11/12 个不逐一点名。
+func TestAutobanRunCycle_capacityConvergenceListsEvictedIdentities(t *testing.T) {
+	installAutobanFixture(t, "2026-10-14 10:00:00")
+	setAutobanConfigRaw(t, true, 1, 5, "1h", "all", false)
+	oldCap := AutobanListEntryCap
+	AutobanListEntryCap = 1
+	t.Cleanup(func() { AutobanListEntryCap = oldCap })
+	var seeded []models.IPListEntry
+	for i := 1; i <= 12; i++ {
+		// 到期时间递增 → 挤出序即编号升序（确定性身份断言）。
+		seeded = append(seeded, models.IPListEntry{
+			Value:     fmt.Sprintf("198.51.100.%d", i),
+			Remark:    AutobanEntryRemark,
+			ExpiresAt: fmt.Sprintf("2026-10-14 11:%02d:00", i),
+		})
+	}
+	seedPresetEntries(t, seeded)
+	autobanObserveEvent("203.0.113.10", "blocked", "942100")
+
+	if err := RunAutobanCycle(taskengine.RunContext{Trigger: "auto"}); err != nil {
+		t.Fatalf("RunAutobanCycle: %v", err)
+	}
+	log := readTaskLog(t, AutobanTaskID)
+	if !strings.Contains(log, "容量收敛：挤出 12、丢弃 0") {
+		t.Fatalf("WARN 行应有挤出计数:\n%s", log)
+	}
+	// 前 10 个逐一点名，第 11/12 个并入「等 12 个」。
+	for _, want := range []string{"198.51.100.1", "198.51.100.10", "等 12 个"} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("WARN 行缺挤出身份 %q:\n%s", want, log)
+		}
+	}
+	if strings.Contains(log, "198.51.100.11") || strings.Contains(log, "198.51.100.12") {
+		t.Fatalf("WARN 行挤出身份应截断到前 10 个（第 11/12 个不得点名）:\n%s", log)
+	}
+	var detail string
+	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='容量收敛'`).Scan(&detail); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(detail, "198.51.100.4") || !strings.Contains(detail, "等 12 个") {
+		t.Fatalf("容量收敛审计详情应携带挤出条目身份（截断形态）: %q", detail)
+	}
+}
+
+// ---- 重载节流（历史修复 持锁契约 + 历史修复 三态） ----
 
 // Given 重载回调与节流时钟；生产调用方在 CaddyOpLock 临界区内请求重载
-// （AU-1：merge+重载同一临界区，注入回调为 InLock 变体）。
+// （历史修复：merge+重载同一临界区，注入回调为 InLock 变体）。
 // When 首次请求/节流窗口内再请求/窗口过后 flush。
 // Then 立即重载→暂存→合并执行；三态返回与暂存标记一致。
 func TestAutobanReloadThrottle(t *testing.T) {
@@ -660,7 +789,7 @@ func TestAutobanReloadThrottle(t *testing.T) {
 	}
 }
 
-// D4（历史）：重载失败必须留系统审计（来源=自动封禁名单，system 归因）
+// 历史修复（历史）：重载失败必须留系统审计（来源=自动封禁名单，system 归因）
 // +置暂存再武装——下一轮 flush 强制重试；重试成功后补落成功审计。
 func TestAutobanReload_failureAuditsAndRearms(t *testing.T) {
 	f := installAutobanFixture(t, "2026-10-14 10:00:00")
@@ -706,7 +835,7 @@ func TestAutobanReload_failureAuditsAndRearms(t *testing.T) {
 	}
 }
 
-// D4：摘要尾注三态——已重载/暂存/失败；无名单变化为空（不得恒称「已触发」）。
+// 历史修复：摘要尾注三态——已重载/暂存/失败；无名单变化为空（不得恒称「已触发」）。
 func TestAutobanReloadNote_triState(t *testing.T) {
 	if got := reloadNote(false, autobanReloadApplied); got != "" {
 		t.Fatalf("无变化尾注=%q, want 空", got)
@@ -823,7 +952,7 @@ func TestAutobanObserveBatch_commitPointFeed(t *testing.T) {
 
 // ---- 计数器修剪：未跨阈值的过期桶不产生候选 ----
 
-// AB-1（历史）回归形状：过期且未跨阈值的桶照常修剪、不产生候选；已跨阈值
+// 历史修复（历史）回归形状：过期且未跨阈值的桶照常修剪、不产生候选；已跨阈值
 // 的过期桶必须产生候选（正向钉在 TestAutobanRunCycle_expiredBucketStillBans）。
 func TestAutobanCandidates_pruneStaleBuckets(t *testing.T) {
 	f := installAutobanFixture(t, "2026-10-14 10:00:00")
@@ -842,7 +971,7 @@ func TestAutobanCandidates_pruneStaleBuckets(t *testing.T) {
 	}
 }
 
-// ---- 解封清桶（历史 F2/AB-1 同族收敛） ----
+// ---- 解封清桶（历史修复 同族收敛） ----
 
 // Given 删除 IP 与对照 IP 均达阈值并入名单（真实计数路径）；随后删除 IP 经
 // handlers remove-ip/预置名单差集保存两路径共用的清桶入口解封，对照 IP 仅从
@@ -1180,6 +1309,9 @@ func TestAutobanRunCycle_capacityConvergenceObservable(t *testing.T) {
 	if !strings.Contains(log, "[WARN]") || !strings.Contains(log, "容量收敛：挤出 1、丢弃 0") {
 		t.Fatalf("任务日志应有 WARN 级容量收敛行（挤出 1、丢弃 0）:\n%s", log)
 	}
+	if !strings.Contains(log, "挤出 IP 198.51.100.4") {
+		t.Fatalf("WARN 行应点名被挤出条目身份（198.51.100.4）:\n%s", log)
+	}
 	var n int
 	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='容量收敛' AND resource='IP 地址列表' AND username='system'`).Scan(&n); err != nil {
 		t.Fatalf("count audit: %v", err)
@@ -1294,7 +1426,7 @@ func TestAutobanCandidates_aggregateExpiryLog(t *testing.T) {
 	}
 }
 
-// ---- AU-1（历史）：merge 读改写+重载与名单写路径同一 CaddyOpLock 临界区 ----
+// ---- 历史修复（历史）：merge 读改写+重载与名单写路径同一 CaddyOpLock 临界区 ----
 
 // Given 正式模式、候选达标；CaddyOpLock 被并发「名单写路径」临界区预持
 // （handlers AddIPToList/UpdateIPList 同型：持 CaddyOpLock → 读条目 → 追加 →
@@ -1356,13 +1488,13 @@ func TestAutobanRunCycle_mergeSerializesWithListWriterUnderCaddyOpLock(t *testin
 	}
 }
 
-// ---- AU-2（历史）：批入口一次读配置，scope+window 下传单事件路径 ----
+// ---- 历史修复（历史）：批入口一次读配置，scope+window 下传单事件路径 ----
 
 // Given 库配置窗口=1 分钟。
 // When autobanObserveEventScoped 显式接收下传的 scope/window。
 // Then 窗口内累计、越过下传窗口重置（若回退内层逐事件读库或写死兜底，
 // 2 分钟处仍是同窗口累计，断言即失败）；窗口无效（<=0）跳过计数、无写死
-// 5 分钟兜底（D2-③ 同函数落地）。
+// 5 分钟兜底（历史修复-③ 同函数落地）。
 func TestAutobanObserveBatch_scopeAndWindowPassedDown(t *testing.T) {
 	f := installAutobanFixture(t, "2026-10-14 10:00:00")
 	setAutobanConfigRaw(t, true, 100, 1, "1h", "all", true)
@@ -1395,10 +1527,10 @@ func TestAutobanObserveBatch_scopeAndWindowPassedDown(t *testing.T) {
 	}
 }
 
-// ---- AU-8/D5（历史）：禁用路径收尾——到期清理一次+暂存重载强制收敛 ----
+// ---- 历史修复（历史）：禁用路径收尾——到期清理一次+暂存重载强制收敛 ----
 
 // Given 名单含已到期自动条目/未到期自动条目/手动条目，且存在节流暂存的重载
-// （禁用后无循环 flush 点——AU-8 核心）。
+// （禁用后无循环 flush 点——历史修复 核心）。
 // When AutobanDisableFlush()（PUT 禁用路径在 StopLoop 前调用）。
 // Then 已到期自动条目立即清除+落「自动解封」审计；暂存重载绕过节流强制执行；
 // 未到期/手动条目保留；暂存标记清除。
@@ -1429,7 +1561,7 @@ func TestAutobanDisableFlush_expiresOnceAndForceFlushes(t *testing.T) {
 
 	got := entryValues(presetEntries(t))
 	if _, exists := got["198.51.100.1"]; exists {
-		t.Fatal("已到期自动条目必须在禁用收尾时清除（D5 到期解封收尾）")
+		t.Fatal("已到期自动条目必须在禁用收尾时清除（到期解封收尾）")
 	}
 	if _, exists := got["198.51.100.2"]; !exists {
 		t.Fatal("未到期条目必须保留")
@@ -1480,7 +1612,7 @@ func TestAutobanDisableFlush_mergeFailureIsVisible(t *testing.T) {
 	}
 }
 
-// ---- 历史 A 域：RG-SEC-AUTOBAN-CANDIDATE-CAP（历史问题）----
+// ---- 历史 A 域：历史修复（历史问题）----
 
 func TestAutobanFormalMerge_beyondSuggestionCap(t *testing.T) {
 	installAutobanFixture(t, "2026-10-14 10:00:00")
@@ -1708,12 +1840,12 @@ func TestRunAutobanCycle_surfacesFeedDegraded(t *testing.T) {
 	}
 }
 
-// —— 禁用收尾不清到期计数桶（SSA-87-02，历史） ——
+// —— 禁用收尾不清到期计数桶（历史修复，历史） ——
 
 // 禁用收尾的到期解封必须同步清计数桶（与 Run 轮 历史问题 同语义）：否则窗口内
 // 重新启用且零新流量时旧计数仍 ≥ 阈值，下一轮立即重封刚解封的 IP。
 // 未到期条目的桶不得清（仅到期解封同步清桶）。
-func TestSSA8702_disableFlushForgetsExpiredCounters(t *testing.T) {
+func TestAutobanDisableFlush_forgetsExpiredCounters(t *testing.T) {
 	clock := installAutobanFixture(t, "2026-10-14 10:00:00")
 	setAutobanConfigRaw(t, true, 1, 5, "1h", "all", false)
 	seedPresetEntries(t, []models.IPListEntry{

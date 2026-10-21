@@ -13,7 +13,7 @@ interface BrandingResponse {
 
 export const appName = ref('Lazy Balancer')
 const footerText = ref('Lazy Balancer V2 · Copyright © 2026 XiaoBao')
-// 历史问题 二十九次：发版检查单——发版时需同步 bump 此回退版本。
+// 历史问题：发版检查单——发版时需同步 bump 此回退版本。
 export const appVersion = ref('v2.3.8')
 const footerUsesDefault = ref(true)
 
@@ -29,7 +29,7 @@ export const footerHtml = computed(() => {
 
 export async function loadBranding(): Promise<void> {
   try {
-    const res = await request.get<BrandingResponse>('/branding', { silent: true }) // 历史 历史问题：装饰性预取失败不弹全局错误 toast
+    const res = await request.get<BrandingResponse>('/branding', { silent: true }) // 历史问题：装饰性预取失败不弹全局错误 toast
     if (res.data?.app_name) appName.value = res.data.app_name
     if (res.data?.version) appVersion.value = res.data.version
     footerUsesDefault.value = res.data?.footer_uses_default !== false

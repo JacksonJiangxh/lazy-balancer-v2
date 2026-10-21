@@ -5,9 +5,9 @@ package caddygeoip
 // coraza 以 `SecAuditLogType lbfile` 选用本插件（security.go 渲染层发射）。
 // 与退役的 serial 直写相比的两个职责：
 //
-//  1. timing 注入：进程内 历史修复 计时注册表（auditTiming*，写点=
+//  1. timing 注入：进程内 per-request 计时注册表（auditTiming*，写点=
 //     blocked_counter / SecurityTimingPre / SecurityTimingEnd，键=blocked_counter
-//     注入的 历史修复 头值——审计 JSON 的 request.headers 天然
+//     注入的 X-Lb-Security-Timing-Id 头值——审计 JSON 的 request.headers 天然
 //     收录该头，Write 无需解析正文即可取得关联键）在刷盘前注入审计 JSON 顶层
 //     lb_timing 字段：{"pre_us":N,"end_us":M}（缺席分段省略）。读侧
 //     （internal/services/securityevents.go）直接从审计行取值，
@@ -23,14 +23,14 @@ package caddygeoip
 //     acquireAuditPipeline）；写路径因此恒有活 drain 消费，不存在「管线已关」
 //     的同步回退分支——上游从不调 AuditLogWriter.Close（见 FlushAuditPipelines）。
 //
-// 时序契约（为什么注入在 drain 侧而非 Write 侧）：历史修复 v2.6.2 在 WAF
+// 时序契约（为什么注入在 drain 侧而非 Write 侧）：coraza-caddy v2.6.2 在 WAF
 // 处理函数入口即 defer tx.ProcessLogging()+tx.Close()，这两个调用在处理函数
 // 返回时才执行——即审计 Write 发生在 coraza 中间件返回前的一刻：请求要么已
 // 跑完下游链，要么已被中断（下游链未执行）。据此两类事件的到场状态不同：
 //   - logged/放行事件：SecurityTimingPre 与 SecurityTimingEnd 都在链内、先于
 //     ProcessLogging 执行，Write 时 pre/end 两段已经写好；
 //   - 拦截事件（WAF/GeoIP/IP ACL/限流）：链在下游收点之前中断，拦截分段
-//     （pre 或 end）与终态标记由链最外层 blocked_counter 的 历史修复 写入
+//     （pre 或 end）与终态标记由链最外层 blocked_counter 的计时收尾写入
 //     注册表——严格晚于该 Write（coraza 的 defer 先于外层包装恢复执行）。
 //
 // 因此注入必须留在 drain 侧：drain goroutine 对每条审计行限时等待注册表终态
@@ -66,7 +66,7 @@ import (
 const auditWriterName = "lbfile"
 
 // auditBodyMaxBytes 限制审计 part C（请求体）与 part E（响应体）在快照/队列/
-// 格式化链中保留的原始体字节数（A85PLG 历史问题：两侧同一硬上限——coraza 默认
+// 格式化链中保留的原始体字节数（历史问题：两侧同一硬上限——coraza 默认
 // SecResponseBodyLimit=512KiB，响应侧不设限会让 2048 深队列放大到 ~1GiB）。
 // 截断只影响审计展示，不影响 WAF 已完成的规则评估。
 const auditBodyMaxBytes = 64 * 1024
@@ -100,23 +100,23 @@ var (
 	// （消费不删——同一请求可产多条审计行[预检+策略引擎]，共享同一注册表条目）。
 	// 以 atomic.Int64 纳秒存储而非普通 time.Duration：常驻 sweeper goroutine
 	// 读、测试收窄参数写，普通变量在 `go test -race` 下构成数据竞争
-	// （PL历史问题）。零值为 0（立即全部过期），默认值在 init 中置入。
+	// （历史问题）。零值为 0（立即全部过期），默认值在 init 中置入。
 	auditTimingEntryTTLNs atomic.Int64
-	// auditTimingMaxEntries 注册表条目硬上限（历史修复 历史问题，历史）：计时 ID
+	// auditTimingMaxEntries 注册表条目硬上限（历史问题，历史）：计时 ID
 	// 形态校验之外的第二道内存 DoS 防线——任何新键生产路径（含未来写点）都不
 	// 得让注册表无界增长。100k 条目 ≈ 30s TTL × ~3.3k RPS 的合法上限，内存
 	// 约 15MB；满时拒绝新键（该请求不计耗时，静默降级），既有键照常写入。
 	auditTimingMaxEntries = 100_000
-	// auditTimingSweepIntervalNs 周期清扫间隔（纳秒，历史修复 历史问题）：旧实现清扫仅
+	// auditTimingSweepIntervalNs 周期清扫间隔（纳秒，历史问题）：旧实现清扫仅
 	// 由建条驱动（每 64 次建条一次），停流后过期条目永久驻留；后台 sweeper 按
 	// 本周期兜底回收，零流量下注册表同样收敛。atomic 存储原因同上。
 	auditTimingSweepIntervalNs atomic.Int64
 )
 
-// —— 历史修复 计时注册表 ——
+// —— per-request 计时注册表 ——
 // 写点：SecurityTimingPre(:pre)/SecurityTimingEnd(:end)/blocked_counter(:pre 或
 // :end + 终态 close)。读点：audit drain goroutine（限时等待终态后注入）。
-// 键=历史修复 头值（16 字符随机 hex，进程内唯一；coraza tx ID
+// 键=X-Lb-Security-Timing-Id 头值（16 字符随机 hex，进程内唯一；coraza tx ID
 // 每引擎独立生成，一个请求多个引擎多个 tx ID，不能作请求级键）。
 
 type auditTimingEntry struct {
@@ -125,7 +125,7 @@ type auditTimingEntry struct {
 	endUs  int64
 	preSet bool
 	endSet bool
-	// closed 终态标记：链最外层收点（blocked_counter 历史修复）在全部分段
+	// closed 终态标记：链最外层收点（blocked_counter post-next）在全部分段
 	// 写点完成后的空值写法（guard）下置位——drain 见 closed 即注入并停止等待。
 	closed  bool
 	created time.Time
@@ -154,7 +154,7 @@ var (
 	auditTimingMu      sync.Mutex
 	auditTimingEntries = map[string]*auditTimingEntry{}
 	// auditTimingOrder 是建条顺序的 FIFO：清扫只从队首弹出 TTL 已过期条目，
-	// 摊销 O(过期数)。E81-历史问题：旧实现每 64 次建条全表扫描（O(n)，n≈TTL×RPS），
+	// 摊销 O(过期数)。历史问题：旧实现每 64 次建条全表扫描（O(n)，n≈TTL×RPS），
 	// 每次请求摊销 O(n/64) 次 map 迭代且持全局锁 ⇒ CPU 随 RPS² 增长。
 	// 不变量：队列内 created 单调不减（time.Now 的单调读数），且每条目只
 	// 入队一次（id 为进程内唯一随机值，不会重建）。
@@ -168,13 +168,13 @@ var (
 	// 条目/无计时头行必须零轮询立即返回——替代挂钟阈值断言，消除 CI 负载
 	// 抖动假红）。仅 auditTimingWait 轮询步 incr，成本可忽略。
 	auditTimingPollCountForTest atomic.Int64
-	// auditTimingSweepVisitsForTest 清扫检查的队列元素数（E81-历史问题 钉：清扫
+	// auditTimingSweepVisitsForTest 清扫检查的队列元素数（历史问题 钉：清扫
 	// 成本必须随「过期条目数」而非注册表规模增长）。
 	auditTimingSweepVisitsForTest atomic.Int64
 )
 
 // auditTimingRecord 写入一个分段计时（µs）。id 为空（计时 ID 生成失败的降级
-// 形态）或形态非法（历史修复 历史问题 纵深：非 16-hex 不得建条——头值客户端可控）
+// 形态）或形态非法（历史问题 纵深：非 16-hex 不得建条——头值客户端可控）
 // 静默忽略——耗时是增强信息，不产生请求路径错误。
 // 条目硬上限：注册表满时拒绝新键（该请求不计耗时），既有键照常更新。
 func auditTimingRecord(id, segment string, us int64) {
@@ -195,7 +195,7 @@ func auditTimingRecord(id, segment string, us int64) {
 		auditTimingSweepIfDueLocked(now)
 	}
 	auditTimingMu.Unlock()
-	// 历史修复 历史问题：首个条目创建时启动周期 sweeper（进程级单例，注册表本身即
+	// 历史问题：首个条目创建时启动周期 sweeper（进程级单例，注册表本身即
 	// 包级生命周期）——停流后过期条目也由周期清扫回收，不再仅依赖建条驱动。
 	startAuditTimingSweeperForTest()
 	e.mu.Lock()
@@ -237,8 +237,8 @@ func startAuditTimingSweeperForTest() {
 }
 
 // auditTimingClose 标记该请求的全部分段已写完（终态）。由链最外层收点
-// （blocked_counter 历史修复）调用——此刻整个安全链已返回，不会再有分段写点。
-// 条目不存在时直接返回（E81-历史问题）：drain 对未知 tid 首轮即返，
+// （blocked_counter post-next）调用——此刻整个安全链已返回，不会再有分段写点。
+// 条目不存在时直接返回（历史问题）：drain 对未知 tid 首轮即返，
 // close 建条没有收益——它只会给「零分段写点」的请求额外占一个 TTL 条目。
 func auditTimingClose(id string) {
 	if id == "" {
@@ -305,7 +305,7 @@ func auditTimingSweepLocked(now time.Time) {
 // TTL，条目已被清扫）或写点缺失的异常行，分段数据永不到场。旧行为对未知 tid
 // 轮询满超时：单 drain goroutine × 逐行满等 2s × 入队阻塞式零丢弃（无背压阀）
 // = 积压行批量到场时 drain 沉陷、请求路径被拖住。代价：预检拦行的终态由
-// blocked_counter 历史修复 在 Write 后微秒级补写，首轮恰落在该间隙内的行
+// blocked_counter post-next 在 Write 后微秒级补写，首轮恰落在该间隙内的行
 // （drain 抢先完成格式化的极小竞态窗）不注入 lb_timing——耗时是增强信息，
 // 展示层报「—」，可接受。
 func auditTimingWait(id string, timeout time.Duration) auditTimingSnapshot {
@@ -484,7 +484,7 @@ func (t *auditSnapshotTransaction) HasRequest() bool {
 	return t != nil && t.Request_ != nil
 }
 
-// Request 缺席时返回 nil 接口（比 coraza 的 历史修复 更保守：formatter 侧的
+// Request 缺席时返回 nil 接口（比 coraza 的 typed-nil 更保守：formatter 侧的
 // != nil 哨兵在此语义下成立）。
 func (t *auditSnapshotTransaction) Request() plugintypes.AuditLogTransactionRequest {
 	if t == nil || t.Request_ == nil {
@@ -528,8 +528,8 @@ func (t *auditSnapshotTransaction) IsInterrupted() bool {
 // OCSF/自定义格式化器消费（本项目固定 JSON 渲染，JSON 输出经下方标签字段与内置
 // 格式化器一致：args 恒 {} 空对象）。
 //
-// E81-历史问题：嵌入值不是事务活对象，而是 frozenArgsRequest(req) 返回的同动态类型
-// 历史修复 指针——只保留 Args() 的接口契约，不引用事务变量集合。旧实现嵌入 live
+// 历史问题：嵌入值不是事务活对象，而是 frozenArgsRequest(req) 返回的同动态类型
+// typed-nil 指针——只保留 Args() 的接口契约，不引用事务变量集合。旧实现嵌入 live
 // 请求，注释声称「tx.Close 后为空读」与 coraza 实现不符（ConcatKeyed 持有事务
 // argsGet/argsPost 的长期引用，tx 回池复用后 Args() 会读到下一请求的参数，而
 // drain 侧格式化恒晚于 tx.Close）。
@@ -618,7 +618,7 @@ func (f auditSnapshotFile) Size() int64 { return f.Size_ }
 func (f auditSnapshotFile) Mime() string { return f.Mime_ }
 
 // auditSnapshotResponse 实现 plugintypes.AuditLogTransactionResponse。
-// BodyTruncated_ 与请求侧同标记位（A85PLG 历史问题，JSON 契约对称 omitempty）。
+// BodyTruncated_ 与请求侧同标记位（历史问题，JSON 契约对称 omitempty）。
 type auditSnapshotResponse struct {
 	Protocol_      string              `json:"protocol"`
 	Status_        int                 `json:"status"`
@@ -717,7 +717,7 @@ var (
 	_ plugintypes.AuditLogTransactionProducer     = (*auditSnapshotProducer)(nil)
 )
 
-// snapshotAuditBody 对审计体（part C 请求体 / part E 响应体，A85PLG 历史问题 同
+// snapshotAuditBody 对审计体（part C 请求体 / part E 响应体，历史问题 同
 // 上限同语义）做字节级硬截断。超长前缀必须 Clone：直接切片会让快照继续持有
 // 原始大 string 的整个 backing array，失去内存上限意义。
 func snapshotAuditBody(body string) (string, bool) {
@@ -726,7 +726,7 @@ func snapshotAuditBody(body string) (string, bool) {
 	}
 	cut := auditBodyMaxBytes
 	// 写侧与读侧上限相等，读侧无法凭长度判断截断；文本在写侧显式追加
-	// 标记，避免 UI 把半截 body 当完整内容（历史 E-历史问题）。二进制不
+	// 标记，避免 UI 把半截 body 当完整内容（历史）。二进制不
 	// 追加（会破坏 base64 判定）。
 	for cut > 0 && !utf8.RuneStart(body[cut]) {
 		cut--
@@ -738,8 +738,8 @@ func snapshotAuditBody(body string) (string, bool) {
 	return prefix, true
 }
 
-// snapshotAuditLog 把 live AuditLog 拷贝为自持快照。接口 nil 检查穿透 历史修复
-// （coraza 的 Response()/Producer() 返回 历史修复 指针——接口非 nil 但底层为
+// snapshotAuditLog 把 live AuditLog 拷贝为自持快照。接口 nil 检查穿透 typed-nil
+// （coraza 的 Response()/Producer() 返回 typed-nil 指针——接口非 nil 但底层为
 // nil，按缺失处理保持 JSON 信封一致：response/producer omitempty）。
 func snapshotAuditLog(al plugintypes.AuditLog) *auditSnapshot {
 	s := &auditSnapshot{Parts_: append(types.AuditLogParts(nil), al.Parts()...)}
@@ -788,7 +788,7 @@ func snapshotTransaction(tx plugintypes.AuditLogTransaction) *auditSnapshotTrans
 		t.Request_ = r
 	}
 	if resp := tx.Response(); !isNilInterface(resp) {
-		// A85PLG 历史问题：响应体与请求体同硬上限（coraza 默认
+		// 历史问题：响应体与请求体同硬上限（coraza 默认
 		// SecResponseBodyLimit=512KiB——不截断则快照/队列/落盘全链放大）。
 		respBody, respTruncated := snapshotAuditBody(resp.Body())
 		q := &auditSnapshotResponse{
@@ -823,7 +823,7 @@ func snapshotTransaction(tx plugintypes.AuditLogTransaction) *auditSnapshotTrans
 
 // frozenArgsRequest 返回不再引用 coraza 事务活对象的请求接口值，仅用于满足
 // AuditLogTransactionRequest 的 Args() 方法（返回类型不可命名，外部包只能经
-// 接口提升实现）。做法：取该请求动态类型的零值（历史修复 指针）——coraza 的
+// 接口提升实现）。做法：取该请求动态类型的零值（typed-nil 指针）——coraza 的
 // *auditlog.TransactionRequest.Args() 在 nil 接收者上返回全新的空 ConcatKeyed
 // （internal/auditlog/auditlog.go，nil 分支），因此任何迟到的 Args() 读取得到
 // 「空」而不是复用事务里下一请求的参数。
@@ -868,7 +868,7 @@ func argsNilSafe(t reflect.Type, req plugintypes.AuditLogTransactionRequest) boo
 	return safe
 }
 
-// isNilInterface 判定接口值为 nil 或持 历史修复 指针。
+// isNilInterface 判定接口值为 nil 或持 typed-nil 指针。
 func isNilInterface(v any) bool {
 	if v == nil {
 		return true
@@ -1003,10 +1003,10 @@ var (
 
 // acquireAuditPipeline 取目标路径的进程级共享管线（不存在则创建：打开 fd +
 // 启动 drain）。fd 打开失败返回错误——coraza NewWAF 会把 Init 错误上抛为配置
-// 拒绝（/load 历史修复，与退役前 serial writer 同语义）。
+// 拒绝（/load fail-fast，与退役前 serial writer 同语义）。
 //
 // 为什么是进程级单例（不回收、不随 reload 换血）：上游从不调
-// AuditLogWriter.Close（coraza v3.8.1 的 WAF.Close 与 历史修复 的 Destruct
+// AuditLogWriter.Close（coraza v3.8.1 的 WAF.Close 与插件的 Destruct
 // 都不触碰审计写插件，见 FlushAuditPipelines），因此引用计数与「最后一个引用
 // 释放即关队列」的 teardown 在进程内不可能被触发——保留它们只会让写路径依赖
 // 一条永不发生的生命周期事件。这里改为：同一 target 恒返回同一管线，fd 与
@@ -1048,7 +1048,7 @@ func (p *auditPipeline) openFile(mode os.FileMode) error {
 
 // enqueue 阻塞式入队（零丢弃）：队列满时等待 drain 消化——退化价=退役前
 // serial 同步写。queue 创建后只读且永不关闭（进程级单例，见
-// acquireAuditPipeline），因此发送无需锁、也不存在 历史修复。
+// acquireAuditPipeline），因此发送无需锁、也不存在竞态。
 func (p *auditPipeline) enqueue(item lbAuditItem) error {
 	p.queue <- item
 	return nil
@@ -1122,7 +1122,7 @@ func (p *auditPipeline) flush() {
 }
 
 // FlushAuditPipelines 冲刷全部存活管线；Caddy 模块 Cleanup（reload/优雅停机）
-// 调用，弥补上游从不调用 AuditLogWriter.Close 导致的尾部丢失（历史 E-历史问题）。
+// 调用，弥补上游从不调用 AuditLogWriter.Close 导致的尾部丢失（历史）。
 // 只刷盘不关闭：管线是进程级单例，fd/drain 的生命周期与进程一致。
 func FlushAuditPipelines() {
 	auditPipelinesMu.Lock()
@@ -1158,7 +1158,7 @@ func (p *auditPipeline) closeFile() {
 type lbAuditWriter struct {
 	formatter plugintypes.AuditLogFormatter
 	pipeline  *auditPipeline
-	// failed 标记 Init 失败（fd 打不开）：后续 Write 静默 历史修复——与 coraza
+	// failed 标记 Init 失败（fd 打不开）：后续 Write 静默 no-op——与 coraza
 	// serial writer Init 失败后 Write 短路同形态（coraza 已在 Init 错误点
 	// 上抛/记日志，配置加载被拒）。
 	failed bool

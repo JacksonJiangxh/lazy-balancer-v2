@@ -14,13 +14,13 @@ var legacySecurityEnumBackfills = []string{
 	"UPDATE security_policies SET ip_acl_mode='deny' WHERE COALESCE(TRIM(ip_acl_mode),'')=''",
 	"UPDATE security_policies SET mode='off' WHERE COALESCE(TRIM(mode),'')=''",
 	"UPDATE security_policies SET geoip_mode='deny' WHERE COALESCE(TRIM(geoip_mode),'')=''",
-	// 历史问题 B-N5：历史问题 F3 之前落库的 threshold=0 行——UI 显示 0、发射端 >0 判断
+	// 历史问题：历史问题 之前落库的 threshold=0 行——UI 显示 0、发射端 >0 判断
 	// 跳过阈值 SecAction 而 CRS 回落默认 5（「UI 宣称 0、实际 5」的展示/行为
 	// 漂移，与空串枚举行同型）。归一到 Create 侧 max1(x,5) 的默认值 5。
 	// 库值唯一真相（批 3）：口径从 `=0` 扩为 `<=0`——写侧 max1/枚举白名单恒
 	// 产生正值，负值只能是带外直写；NULL 由 COALESCE(...,0) 归并同分支。
 	// 渲染侧对回填后仍无效的值 fail-visible（BuildCorazaDirectives）。
-	// G6（历史）：字面量 5 改绑定 db.DefaultAnomalyThreshold 单源。
+	// 历史修复（历史）：字面量 5 改绑定 db.DefaultAnomalyThreshold 单源。
 	fmt.Sprintf("UPDATE security_policies SET anomaly_threshold=%d WHERE COALESCE(anomaly_threshold,0)<=0", db.DefaultAnomalyThreshold),
 	// 历史问题（历史）：429 已剔除出拦截状态码白名单（限流专用语义，
 	// overviewmetrics.go 限流卡片按 code=429 计数，WAF 拦截页 429 会混入
@@ -31,7 +31,7 @@ var legacySecurityEnumBackfills = []string{
 	// 403/404/503，0=未设置跟随默认 403 为类型②省略型合法值）——旧备份/带外
 	// 脏值（如 418）随启动归一，渲染层不再消费枚举外状态码。
 	"UPDATE security_policies SET block_status_code=403 WHERE block_status_code IS NOT NULL AND block_status_code NOT IN (0,400,401,403,404,503)",
-	// G2（历史，用户裁定方案①）：rate_limit_rps 历史脏行（enabled=1 &
+	// 历史修复（历史，用户裁定方案①）：rate_limit_rps 历史脏行（enabled=1 &
 	// rps<1，修复前 Update 缺陷可落库）绑定启用规则时整份配置生成失败
 	// （渲染层 fail-visible）。启动归一关停业务开关——rps 库值保持原样
 	//（不造假默认值），INFO 摘要行披露归一计数；写侧 validateRateLimitShape
@@ -104,7 +104,7 @@ func NormalizeLegacySecurityPolicyEnums(ctx context.Context) {
 	}
 	if isMaster {
 		// 二次启动起行级版本触发器已持久化于库，上方每条 UPDATE 已按命中行数
-		// bump 过；显式递增会叠加成多次（历史问题-F1）。落「启动前值+1」的确定性
+		// bump 过；显式递增会叠加成多次（历史问题）。落「启动前值+1」的确定性
 		// 值：无论触发器是否已安装/触发，一次启动归一只净增 1，测试（无触发
 		// 器）与生产口径一致。版本语义只需单调递增，多次 bump 折叠为一次不
 		// 影响从节点收敛。

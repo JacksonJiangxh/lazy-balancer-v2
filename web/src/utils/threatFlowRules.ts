@@ -56,7 +56,7 @@ export function nextFlowCursor(previous: number, data: { enabled?: boolean; next
   return typeof data.next_seq === 'number' ? data.next_seq : previous
 }
 
-/** 自适应档位取值集合（1/4/8）曾是零消费导出常量，A85WA-历史问题 移除；
+/** 自适应档位取值集合（1/4/8）曾是零消费导出常量，历史修复 移除；
  *  档位语义由 nextAdaptiveSampleN/stepAdaptiveSample 承载。 */
 
 /**
@@ -112,7 +112,7 @@ export interface AdaptiveSampleOutcome extends AdaptiveSampleState {
  * 自适应采样单步状态机：连续 2 次采样**同向**且距上次换档 ≥4s 才换档。
  * 同向=两次采样算出的目标档位一致（`pendingTarget`）；目标改变（含高→低反转）
  * 时确认计数从 1 重新累计——只按次数累加会把「突发一次+骤停一次」误判为
- * 连续确认（WT87-06）。目标与当前一致时清空确认计数（但保留上次换档时刻——
+ * 连续确认（历史修复）。目标与当前一致时清空确认计数（但保留上次换档时刻——
  * 回摆同样受 4s 门约束）。
  */
 export function stepAdaptiveSample(state: AdaptiveSampleState, observedRate: number, now: number): AdaptiveSampleOutcome {

@@ -2,7 +2,7 @@ package services
 
 import "testing"
 
-// SVC-C1（历史）：routeClaimedByAny/claimedRoutePrefixes 行为等价钉——
+// 历史修复（历史）：routeClaimedByAny/claimedRoutePrefixes 行为等价钉——
 // 预建前缀集合判定必须与旧式 `routeID == caddyID || strings.HasPrefix(routeID,
 // caddyID+"_")` 逐形状同结果（精确匹配 / 子路由归属主规则 / 前缀兄弟不得误认 /
 // 无下划线边界不得认领 / 空集恒 false）。

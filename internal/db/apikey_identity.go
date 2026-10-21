@@ -12,7 +12,7 @@ import (
 var ErrAPIKeyNotFound = errors.New("API key not found or inactive")
 
 // APIKeyIdentity 是 API Key 认证与 MCP 可见性判定的统一解析结果。
-// CI87-07（历史）：middleware 认证查询与 mcpserver 只读可见性查询此前是
+// 历史修复：middleware 认证查询与 mcpserver 只读可见性查询此前是
 // 两份手写 SQL + 哈希逻辑（prefix 取 12 字节 + sha256 + 同一套有效性条件）；
 // 认证条件一旦变更（新增撤销/作用域），可见性会静默漂移。收敛到本函数单源。
 type APIKeyIdentity struct {

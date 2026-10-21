@@ -68,7 +68,7 @@ func TestReadRuleLogTail_multilineTailSemanticsUnchanged(t *testing.T) {
 	}
 }
 
-// 历史问题-U7b2-01（历史）：removeTimberjackRotations 数字边界守卫——
+// 历史问题（历史）：removeTimberjackRotations 数字边界守卫——
 // 兄弟规则（caddy_id 以本 stem 为前缀，lb_abc 与 lb_abc-extra）的轮转副本
 // 此前被本规则的清扫按前缀+后缀整体误删（logstats.go 历史问题 同族先例：
 // stem 后 '-<ts>' 段首字符必须为数字）。
@@ -104,7 +104,7 @@ func TestRemoveRuleLogFiles_siblingRuleRotationsUntouched(t *testing.T) {
 	}
 }
 
-// LBS-A-1（历史 历史问题）：ReadRuleLogTail 两段式倒扫改写的窗口等价钉——
+// 历史修复（历史问题）：ReadRuleLogTail 两段式倒扫改写的窗口等价钉——
 // 多块窗口/块边界跨行/cap 边界/未终结尾行/少于 maxLines 五形状的 content 与
 // offset 期望按旧实现语义手算钉死（改写前后同输入同输出，逐字节等价）。
 func TestReadRuleLogTail_windowEquivalenceShapes(t *testing.T) {
@@ -176,7 +176,7 @@ func TestReadRuleLogTail_windowEquivalenceShapes(t *testing.T) {
 	})
 }
 
-// LBS/LBH-3（历史）：ReadRuleLogFrom 遇整窗无换行（>8MB 单行/二进制/
+// LBS/历史修复（历史）：ReadRuleLogFrom 遇整窗无换行（>8MB 单行/二进制/
 // 损坏日志）时旧式把 data 置 nil 使 next==offset 原地不动——调用方按返回
 // offset 轮询会永久卡死。钉两形状：无换行大文件每个「读满的窗口」必须前进
 // 一个窗口（未满窗残段仍扣留，等待写侧补全换行）；有换行文件交付完整行且

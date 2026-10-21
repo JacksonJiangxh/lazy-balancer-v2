@@ -12,7 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// S-6（2026-09-05 审计裁定）：global_config.metrics_public/metrics_origins 死列
+// 历史修复（2026-09-05 审计裁定）：global_config.metrics_public/metrics_origins 死列
 // 删除后的备份兼容契约——①携带这两键的历史备份导入无错（恢复侧按现存列过滤，
 // 未知键静默跳过，其余配置正常落库）；②新导出的备份不再携带两键。
 func TestImportConfigBackup_toleratesDeadMetricsConfigKeys(t *testing.T) {

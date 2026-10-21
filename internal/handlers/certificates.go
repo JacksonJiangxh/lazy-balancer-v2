@@ -19,7 +19,7 @@ import (
 	"lazy-balancer-v2/internal/services/dnsproviders"
 )
 
-// maskedDNSCredentialsSentinel（历史问题 二十六次 D4）：非 admin 响应中 DNS 凭证值的
+// maskedDNSCredentialsSentinel（历史问题）：非 admin 响应中 DNS 凭证值的
 // 掩码占位。更新路径识别到全掩码形态按「未提交」处理（保持原值）——前端
 // FreeCertificates 的编辑表单会原样回传 GET 到的值。
 const maskedDNSCredentialsSentinel = "***"
@@ -50,7 +50,7 @@ func maskDNSCredentialsJSON(raw string) string {
 }
 
 // isMaskedDNSCredentials 判断提交的凭证是否为「GET 掩码原样回传」（未改动）。
-// 历史问题（历史 历史问题）：只有**全部值均为掩码哨兵**（且至少一个键）才算未改动。
+// 历史问题（历史）：只有**全部值均为掩码哨兵**（且至少一个键）才算未改动。
 // 旧口径把空串视为「可以共存」，`{"app_id":"","app_token":"***"}` 被整体吞成未修改
 // ——用户显式清空 app_id 的意图静默丢失。含空串/真实值的回传一律走
 // mergeMaskedDNSCredentials（空串保留为空 = 显式清空，哨兵逐字段取库值）。
@@ -97,7 +97,7 @@ func (h *Handlers) ListCertificateConfigs(c *gin.Context) {
 	if role, ok := c.Get("role"); ok && role == "admin" {
 		isAdmin = true
 	}
-	// 历史问题 二十六次 D4：凭证最小可见性——非 admin 只见掩码形态。
+	// 历史问题：凭证最小可见性——非 admin 只见掩码形态。
 	// 历史问题：admin 属主的只读 API Key 同样只见掩码——apiKeyAuth 注入的
 	// api_key_read_only 标志(机器身份,密钥泄露面大于会话)独立于属主角色
 	// 生效;admin JWT 会话路径不受影响。
@@ -227,7 +227,7 @@ func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 	h.caddyOpMu.Lock()
 	defer h.caddyOpMu.Unlock()
 
-	// LBS/历史修复（历史 历史问题）：旧行读取与动态 UPDATE 收敛到同一事务
+	// 历史修复（历史）：旧行读取与动态 UPDATE 收敛到同一事务
 	//（_txlock=immediate → BEGIN IMMEDIATE 先取写锁）——审计 changed 清单的
 	//比对基线即写入前那一刻的真实行，消除「事务外预读 → 写入」窗口内并发
 	//提交导致的清单失真（镜像 历史修复 的事务内旧行模式）。
@@ -357,7 +357,7 @@ func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 	}
 
 	if req.DNSCredentials != nil {
-		// 历史问题 二十六次 D4：全掩码回传（非 admin GET 后未改动即保存）按未提交
+		// 历史问题：全掩码回传（非 admin GET 后未改动即保存）按未提交
 		// 处理——否则掩码串会覆盖真实凭证。部分掩码已在上方合并进
 		// req.DNSCredentials。
 		if isMaskedDNSCredentials(req.DNSCredentials) {
@@ -411,7 +411,7 @@ func (h *Handlers) DeleteCertificateConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Invalid id parameter"})
 		return
 	}
-	// 历史问题（历史 历史问题）：引用查询与 DELETE 必须同一临界区——lb_rules.
+	// 历史问题（历史）：引用查询与 DELETE 必须同一临界区——lb_rules.
 	// acme_config_id 上没有外键约束（certificate_configs 的引用无 FK 兜底，SQLite
 	// DDL 亦未声明），并发的 UpdateRule（持 caddyOpMu、锁内 validateRuleACMEReferences
 	// 查询本表）会在「查到零引用 → DELETE」窗口提交绑定，留下悬空引用（续签/首签
@@ -595,7 +595,7 @@ func (h *Handlers) ListCertificates(c *gin.Context) {
 		var ruleID, domain, status, message, expiresAt, updatedAt string
 		var expiresNull, updatedNull sql.NullString
 		if err := rows.Scan(&id, &ruleID, &domain, &status, &message, &expiresNull, &updatedNull); err != nil {
-			// 历史修复（历史 历史问题）：单行 Scan 失败 warn 留痕+跳过（对齐
+			// 历史修复（历史）：单行 Scan 失败 warn 留痕+跳过（对齐
 			// 历史修复 口径）——静默丢行会让该域名在证书清单中无故缺席；
 			// 迭代级失败仍由下方 rows.Err() 500 兜底。
 			services.Logf("warn", "证书任务列表：跳过扫描失败行（该域名聚合行本轮缺失）: %v", err)
@@ -666,7 +666,7 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "CA 队列未初始化"})
 		return
 	}
-	// 历史问题（历史 历史问题）：队列暂停必须 409 点名原因——EnqueueIfActive 的
+	// 历史问题（历史）：队列暂停必须 409 点名原因——EnqueueIfActive 的
 	// !active 出口返回 changed=false（jobID=0 时上游再折成 "CA queue is paused"
 	// 错误），原实现走「200 已创建 0 个任务」的假成功或 500。规则屏障与在途
 	// 两条 changed=false 出口在下方定向/批量分支分别归因。
@@ -675,12 +675,12 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "证书签发队列已暂停，无法创建签发任务"})
 		return
 	}
-	// 历史修复 历史问题（历史问题-01）：手工签发的 规则当前态读取→冷却门→upsert/入队
+	// 历史问题（历史问题-01）：手工签发的 规则当前态读取→冷却门→upsert/入队
 	// 全程与规则写/删除/改域共用 caddyOpMu 临界区——此前无锁读取后与
 	// UpdateRule 改域迁移（任务行已改到新域）交错，本次仍按旧域 INSERT
 	// 新行并入队，对旧域实际发起 CA 签发（部署期域不匹配拒绝，job 滞留
 	// downloaded 至 6h sweep）；与 DeleteRule 交错可留孤儿任务行。
-	// 请求体已在锁外绑定（历史修复 序）；EnqueueIfActive 只取队列
+	// 请求体已在锁外绑定（bind-before-lock 序）；EnqueueIfActive 只取队列
 	// 叶锁（m.mu/q.mu），execute 在锁外 goroutine 运行，无反向锁序。
 	h.caddyOpMu.Lock()
 	defer h.caddyOpMu.Unlock()
@@ -750,7 +750,7 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 		jobID, changed, err := services.CreateOrRequeueCertJobWithChange(req.CaddyID, canonicalRuleDomain, 0, qm)
 		if err != nil {
 			if errors.Is(err, services.ErrCertRuleStateConflict) {
-				// 历史修复 历史问题：upsert 落库闸的规则当前态复核拒绝（防御纵深——
+				// 历史问题：upsert 落库闸的规则当前态复核拒绝（防御纵深——
 				// 持锁临界区内正常不可达）——409 冲突语义，不得折成 500。
 				auditFailure("conflict", "规则状态已变更（规则已删除、禁用或域名已修改）")
 				c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "规则状态已变更（规则已删除、禁用或域名已修改），请刷新后重试"})
@@ -882,7 +882,7 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 		}
 		if pausedMidBatch && queued > 0 {
 			// 已入队 N>0 后队列被并发暂停：按部分成功返回，不能 409 谎报全失败
-			// （历史 B3-历史问题）。剩余目标留给下次触发。
+			// （历史）。剩余目标留给下次触发。
 			skipNote := formulaSkippedNote(skippedCooldown, skippedInFlight, skippedBlocked, skippedUnsupported)
 			message := fmt.Sprintf("已创建 %d 个签发任务；证书签发队列被暂停，剩余目标未处理", queued)
 			if skipNote != "" {
@@ -958,12 +958,12 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 		cooldownNote = fmt.Sprintf("，%d 个任务处于冷却期已跳过", skippedCooldown)
 	}
 	recordAudit(c, "触发签发", "证书", services.FormatAuditDetail(scope, fmt.Sprintf("入队 %d 个任务%s", queued, cooldownNote), services.AuditResultPart("requested")))
-	// 历史 历史问题：入队后渲染输入零变化——签发完成由 worker 链路自行应用，去掉强制重载
+	// 历史问题：入队后渲染输入零变化——签发完成由 worker 链路自行应用，去掉强制重载
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: fmt.Sprintf("已创建 %d 个签发任务", queued), Data: gin.H{"queued": queued, "skipped_cooldown": skippedCooldown}})
 }
 
 func (h *Handlers) ParseCertificate(c *gin.Context) {
-	// 历史问题 二十八次审计 F3：证书解析入参 PEM 上限 2MB（对齐 历史修复 inspect 的
+	// 历史问题审计 历史修复：证书解析入参 PEM 上限 2MB（对齐 admin-tls inspect 的
 	// maxAdminTLSJSONBytes 量级）——此前无上限，任何持凭证者（含只读 API key，
 	// 本端点在 readOnlyWriteRoutes）可投递任意大 body 造成内存压力。
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 2<<20)

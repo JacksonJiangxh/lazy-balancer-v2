@@ -19,8 +19,8 @@ import (
 //   - ranges：裸 IP 补 /32（v4）//128（v6）；条数 ≤64；前缀长度 <8（v4）
 //     或 <29（v6）一律拒绝——过宽网段会让伪造的头在任意来源被采信。
 //   - range_refs（2026-10-12）：引用的 IP 地址列表 id（JSON 整数数组）；
-//     每个 id 必须存在且为自定义名单（system=1 内置名单拒绝——U04d-02）；
-//     引用名单条目须为合法 IP/CIDR 且与内联通道同宽度判据（U04d-01）；总
+//     每个 id 必须存在且为自定义名单（system=1 内置名单拒绝——历史修复）；
+//     引用名单条目须为合法 IP/CIDR 且与内联通道同宽度判据（历史修复）；总
 //     CIDR 数（内联 + 引用展开）≤ trustedProxyMaxTotalCIDRs。
 //   - headers：条数 ≤8；字符集 ^[A-Za-z0-9-]{1,64}$；去重保序；
 //     空数组 = 仅 X-Forwarded-For（渲染层省略 client_ip_headers）。
@@ -33,7 +33,7 @@ const trustedProxyMaxTotalCIDRs = 2000
 
 // trustedProxyListSource 名单解析源行（id → 名单行）。builtin 标记
 // system=1 的内置名单（威胁情报/爬虫/自动封禁）——受信代理不允许引用
-// （U04d-02：威胁名单真实条目在 .iplist 文件，DB entries 恒空，按 DB 列
+// （历史修复：威胁名单真实条目在 .iplist 文件，DB entries 恒空，按 DB 列
 // 校验会同时失去条格式门与 2000 条总量门；前端本已只列自定义名单）。
 type trustedProxyListSource struct {
 	name    string
@@ -41,9 +41,9 @@ type trustedProxyListSource struct {
 	builtin bool
 }
 
-// trustedProxyBackupSource 导入通道的名单解析源（RC-2/F75C-3，历史）。
+// trustedProxyBackupSource 导入通道的名单解析源（历史修复）。
 // 按「备份是否携带 security_ip_lists 表」分流：
-//   - carried=true：名单表随备份**全量替换**（W2 先例——备份行才是导入后的
+//   - carried=true：名单表随备份**全量替换**（历史修复 先例——备份行才是导入后的
 //     真实数据），refs 存在性仅按备份行集合解析；指向库内但不在备份内的 id
 //     导入后必然悬空，校验期 400 拒绝（旧「备份内优先 ∪ 库内」口径会借库内
 //     命中放行为导入后悬空引用）。
@@ -69,7 +69,7 @@ func validateTrustedProxyFieldsWithSource(req *models.UpdateConfigRequest, sourc
 			return err
 		}
 		*req.TrustedProxyRanges = normalized
-		// 总量门对称面（SYS-F3，历史 历史问题）：refs 未随载荷时按库中存量
+		// 总量门对称面（历史修复，历史问题）：refs 未随载荷时按库中存量
 		// 引用展开合计——内联面与引用面合并才是真实展开规模（refs 载荷
 		// 分支在下方做同口径判定，此处不重复）。
 		if req.TrustedProxyRangeRefs == nil {
@@ -136,7 +136,7 @@ func trustedProxyInlineCount(req *models.UpdateConfigRequest) (int, error) {
 	return len(entries), nil
 }
 
-// idChunk 是一个 id 分片及其预构造的 IN 子句占位符与参数（SYS-REST-F2 第 73
+// idChunk 是一个 id 分片及其预构造的 IN 子句占位符与参数（历史修复 第 73
 // 轮：受信代理两处 500 分片样板单源——仅共享分片构造，不合并查询/校验语义）。
 type idChunk struct {
 	placeholders string
@@ -166,9 +166,9 @@ func chunkIDs(ids []int64, chunkSize int) []idChunk {
 	return chunks
 }
 
-// resolveTrustedProxyRefLists 解析 refs 引用的名单行（RC-2 分流的单点）：
+// resolveTrustedProxyRefLists 解析 refs 引用的名单行（历史修复 分流的单点）：
 // 备份行命中直取；未命中且备份未携带名单表（carried=false）时分片查库。
-// 两通道都带 system 列映射 builtin（U04d-02 写侧拒绝内置名单）。
+// 两通道都带 system 列映射 builtin（历史修复 写侧拒绝内置名单）。
 // carried=true 不回落库内——名单表随备份全量替换，库内命中不代表导入后存在。
 func resolveTrustedProxyRefLists(ids []int64, source trustedProxyBackupSource) (map[int64]trustedProxyListSource, error) {
 	resolved := make(map[int64]trustedProxyListSource, len(ids))
@@ -214,7 +214,7 @@ func resolveTrustedProxyRefLists(ids []int64, source trustedProxyBackupSource) (
 // 可达——真实导出恒携带全列）不在本门范围内，由渲染层 fail-closed 与名单删除
 // 守卫兜底。存量 refs JSON 畸形/条目不可解析（仅见于带外改库）按 0 计。
 //
-// 内置名单（system=1）引用自 U04d-02 起在写侧拒绝；升级前存量引用仍按 DB
+// 内置名单（system=1）引用自 历史修复 起在写侧拒绝；升级前存量引用仍按 DB
 // entries 计数（威胁名单恒 0 条——其真实条目不参与本门，属既有配置的遗留
 // 边界：下次保存 refs 载荷时被 400 拒绝并要求改用自定义名单）。
 func trustedProxyStoredRefEntriesWithSource(source trustedProxyBackupSource) (int, error) {
@@ -236,7 +236,7 @@ func trustedProxyStoredRefEntriesWithSource(source trustedProxyBackupSource) (in
 		if row.entries == "" || json.Unmarshal([]byte(row.entries), &entries) != nil {
 			continue
 		}
-		// 历史问题（历史 历史问题）：与写入侧逐条校验/渲染层同口径——空 value 条目
+		// 历史问题（历史）：与写入侧逐条校验/渲染层同口径——空 value 条目
 		// 展开时被跳过，计数不得按原始 len 累加（否则实际展开 ≤2000 的合法
 		// 载荷会被总量门 400 拒绝）。
 		for _, entry := range entries {
@@ -250,10 +250,10 @@ func trustedProxyStoredRefEntriesWithSource(source trustedProxyBackupSource) (in
 
 // normalizeTrustedProxyRangeRefsWithSource 校验并归一引用载荷：空白归一 "[]"；
 // 非空须为整数数组 JSON（字符串/对象条目拒绝）；逐 id 校验存在性（内置名单
-// 拒绝，U04d-02）与条目格式/宽度（parseTrustedProxyPrefix + services 宽度
-// 判据，与内联通道同口径，U04d-01）；去重保序。
+// 拒绝，历史修复）与条目格式/宽度（parseTrustedProxyPrefix + services 宽度
+// 判据，与内联通道同口径，历史修复）；去重保序。
 // source 按备份是否携带名单表分流（trustedProxyBackupSource）：carried=true
-// 时存在性仅按备份行集合解析（RC-2——全量替换后库内行不复存在，悬空 400）；
+// 时存在性仅按备份行集合解析（历史修复——全量替换后库内行不复存在，悬空 400）；
 // carried=false 时未命中备份行的 id 按库内存量解析（保存通道同口径）。
 // 返回归一 JSON 与引用名单条目总数（总量门的判定面）。
 func normalizeTrustedProxyRangeRefsWithSource(raw string, source trustedProxyBackupSource) (string, int, error) {
@@ -280,7 +280,7 @@ func normalizeTrustedProxyRangeRefsWithSource(raw string, source trustedProxyBac
 	if len(unique) == 0 {
 		return "[]", 0, nil
 	}
-	// RC-2 分流单点：备份行命中直取；未命中仅当备份未携名单表才回落库内
+	// 历史修复 分流单点：备份行命中直取；未命中仅当备份未携名单表才回落库内
 	// （resolveTrustedProxyRefLists——chunkIDs 保留 SQLite 变量数上限的批量
 	// 口径，手造备份可携带任意长的 refs 数组）。
 	resolved, err := resolveTrustedProxyRefLists(unique, source)
@@ -293,7 +293,7 @@ func normalizeTrustedProxyRangeRefsWithSource(raw string, source trustedProxyBac
 		if !ok {
 			return "", 0, fmt.Errorf("受信代理引用的地址列表不存在：#%d", id)
 		}
-		// U04d-02：内置名单（威胁情报/爬虫/自动封禁）不得作为受信代理来源——
+		// 历史修复：内置名单（威胁情报/爬虫/自动封禁）不得作为受信代理来源——
 		// 真实条目在 .iplist 文件、DB entries 恒空，按 DB 列校验会同时失去条
 		// 格式门与总量门；且威胁名单与「可信回源」语义相反。与 UI 一致拒绝。
 		if row.builtin {
@@ -314,7 +314,7 @@ func normalizeTrustedProxyRangeRefsWithSource(raw string, source trustedProxyBac
 			if err != nil {
 				return "", 0, fmt.Errorf("引用的地址列表「%s」含无效 IP/CIDR 条目：%s（受信网段仅接受 IP/CIDR）", row.name, value)
 			}
-			// U04d-01：与内联通道同一宽度判据——名单通道不得成为过宽网段的
+			// 历史修复：与内联通道同一宽度判据——名单通道不得成为过宽网段的
 			// 等价绕过入口（否则伪造头可在任意来源被采信）。
 			if services.TrustedProxyPrefixAllSpace(prefix) {
 				return "", 0, fmt.Errorf("引用的地址列表「%s」含过宽网段 %s：该网段覆盖全部地址空间，等同信任任意来源", row.name, prefix.String())
@@ -322,7 +322,7 @@ func normalizeTrustedProxyRangeRefsWithSource(raw string, source trustedProxyBac
 			if prefix.Bits() < services.TrustedProxyMinPrefixBits(prefix.Addr()) {
 				return "", 0, fmt.Errorf("引用的地址列表「%s」含过宽网段 %s：最小允许 /8（IPv4）与 /29（IPv6），请收窄到该 CDN 的回源网段", row.name, prefix.String())
 			}
-			// 历史问题（历史 历史问题）：计数口径=通过校验的条数（空 value 在上方
+			// 历史问题（历史）：计数口径=通过校验的条数（空 value 在上方
 			// continue 已跳过）——与渲染层实际注入的集合一致。
 			total++
 		}
@@ -364,7 +364,7 @@ func normalizeTrustedProxyRanges(raw string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("无效的受信代理网段: %s", entry)
 		}
-		// 历史 历史问题（历史问题）+ U04d-01：全空间形态与最小前缀长度判据
+		// 历史问题（历史）+ 历史修复：全空间形态与最小前缀长度判据
 		// 单源在 services（内联/引用/渲染三处同口径）——全空间（0.0.0.0/8、
 		// 0.0.0.0/0、::/0、v4-mapped 全零 /96）等同「信任任意来源的伪造头」。
 		if services.TrustedProxyPrefixAllSpace(prefix) {
@@ -373,7 +373,7 @@ func normalizeTrustedProxyRanges(raw string) (string, error) {
 		if prefix.Bits() < services.TrustedProxyMinPrefixBits(prefix.Addr()) {
 			return "", fmt.Errorf("受信代理网段过宽（%s）：最小允许 /8（IPv4）与 /29（IPv6），请收窄到该 CDN 的回源网段", prefix.String())
 		}
-		// 去重保序（与 headers 侧同口径，历史补充轮 U6B-7）
+		// 去重保序（与 headers 侧同口径，历史修复）
 		if _, dup := seen[prefix.String()]; dup {
 			continue
 		}

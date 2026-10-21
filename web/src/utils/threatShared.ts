@@ -74,8 +74,80 @@ export function adminShortName(name: string): string {
   return name
 }
 
+export interface PolysBounds {
+  minLon: number
+  maxLon: number
+  minLat: number
+  maxLat: number
+}
+
+/** 扁平多边形组外包框（点阵 bbox 预筛共用）。 */
+export function polysBounds(polys: number[][][]): PolysBounds {
+  let minLon = 180
+  let maxLon = -180
+  let minLat = 90
+  let maxLat = -90
+  for (const poly of polys) {
+    for (const ring of poly) {
+      for (let k = 0; k + 1 < ring.length; k += 2) {
+        if (ring[k] < minLon) minLon = ring[k]
+        if (ring[k] > maxLon) maxLon = ring[k]
+        if (ring[k + 1] < minLat) minLat = ring[k + 1]
+        if (ring[k + 1] > maxLat) maxLat = ring[k + 1]
+      }
+    }
+  }
+  return { minLon, maxLon, minLat, maxLat }
+}
+
+export interface ProvinceGridDot {
+  lat: number
+  lng: number
+  key: string
+}
+
 /**
- * 热力数据指纹比较（历史 历史问题 纯函数层）：引擎 setCountries/setProvinces
+ * 下钻省点阵：错列经纬网格 × 省多边形命中（首个命中省取色键=行政短名）。
+ * 省级 bbox 预筛（历史修复，与 threatScene 省级预筛同构）：34 省 × 全网格
+ * 直接 pointInPolys 在宽幅国家首次下钻产生明显长任务；先按省 bbox 排除绝
+ * 大多数省份，再对候选做射线判定。bbox 是命中判定的保守超集，预筛不改变
+ * 产出点集。
+ */
+export function provinceDotGrid(
+  source: readonly { name: string; polys: number[][][] }[],
+  step: number,
+): ProvinceGridDot[] {
+  let minLon = 180
+  let maxLon = -180
+  let minLat = 90
+  let maxLat = -90
+  const bounds = source.map((pv) => {
+    const b = polysBounds(pv.polys)
+    if (b.minLon < minLon) minLon = b.minLon
+    if (b.maxLon > maxLon) maxLon = b.maxLon
+    if (b.minLat < minLat) minLat = b.minLat
+    if (b.maxLat > maxLat) maxLat = b.maxLat
+    return b
+  })
+  const dots: ProvinceGridDot[] = []
+  let row = 0
+  for (let lat = minLat; lat <= maxLat; lat += step, row++) {
+    const offset = row % 2 === 1 ? step / 2 : 0
+    for (let lon = minLon + offset; lon <= maxLon; lon += step) {
+      for (let pi = 0; pi < source.length; pi++) {
+        const b = bounds[pi]
+        if (lon < b.minLon || lon > b.maxLon || lat < b.minLat || lat > b.maxLat) continue
+        if (!pointInPolys(lon, lat, source[pi].polys)) continue
+        dots.push({ lat, lng: lon, key: adminShortName(source[pi].name) })
+        break
+      }
+    }
+  }
+  return dots
+}
+
+/**
+ * 热力数据指纹比较（历史问题 纯函数层）：引擎 setCountries/setProvinces
  * 每 30s 轮询重放同一份计数——长度 + 逐键计数浅比较，无变化时调用方跳过
  * 静态层重建（原恒置脏位 → 每轮全量栅格化整幅离屏画布）。
  * 重复键视为变化（Map 语义下后者覆盖，指纹不可当相等）。
@@ -92,7 +164,7 @@ export function heatEntriesEqual(prev: ReadonlyMap<string, number>, next: readon
 }
 
 /**
- * 地球弧线端点（历史 历史问题 纯函数接缝）：起点=归属地质心，终点=本站。
+ * 地球弧线端点（历史问题 纯函数接缝）：起点=归属地质心，终点=本站。
  * 本站坐标是可变状态（配置到达后 setServer），弧线对象必须按当前值快照——
  * 抽成纯函数后可由 node:test 断言「终点随 server 更新」，防止退回构造期常量。
  */
@@ -105,7 +177,7 @@ export function arcEndpoints(
 
 /** 归属地文本 → 光流起点（中国精确到省质心，其余国家质心，未知走兜底点）。
  *  地图/地球两引擎共用，避免省/国家查找与回退规则双实现漂移
- *  （历史 历史问题-5）。 */
+ *  （历史问题-5）。 */
 export function arcOriginForLocation(ipLocation: string): Centroid {
   const [country, province] = ipLocation.split('·')
   if (!country) return FALLBACK_CENTROID
@@ -124,7 +196,7 @@ export function normalizeCountryName(name: string): string {
 }
 
 /**
- * 该下钻国家是否有省级统计源（WT87-11）：后端 `threatLocationParts` 只对中国
+ * 该下钻国家是否有省级统计源（历史修复）：后端 `threatLocationParts` 只对中国
  * 从归属地串取省，`china_provinces` 也只聚合中国省——海外下钻的省板是纯几何，
  * UI 必须显示「无省级统计」而不是 0，避免把缺失当成「该省 0 次攻击」。
  */
@@ -133,7 +205,7 @@ export function hasProvinceStats(country: string): boolean {
 }
 
 /**
- * 异步下钻续体的提交判定（WT87-03）：`seq` 已被返回/复位/销毁递增，或引擎已
+ * 异步下钻续体的提交判定（历史修复）：`seq` 已被返回/复位/销毁递增，或引擎已
  * 销毁 → 丢弃加载结果。地图/地球共用，防止一侧补了作废逻辑另一侧漏（原地球
  * 的 zoomOut/resetView 不递增 drillSeq，迟到的 chunk 会把用户刚做的复位覆盖）。
  */

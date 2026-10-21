@@ -46,7 +46,7 @@ func TestRegionTreeFromXDB_ptrOverflowTerminates(t *testing.T) {
 	}
 }
 
-// 历史修复 二十三次：xdb 段索引全量扫描的省→城市树契约（使用仓库内固定
+// 历史修复：xdb 段索引全量扫描的省→城市树契约（使用仓库内固定
 // caddygeoip/testdata/ip2region_v4.xdb，CI 不得因 live 库不存在而恒跳过）。
 func TestIP2RegionRegionTree_scan(t *testing.T) {
 	// 测试夹具直取仓库源文件，避免开发机 live 库或 /tmp 副本造成版本分叉。
@@ -82,13 +82,13 @@ func TestIP2RegionRegionTree_scan(t *testing.T) {
 	if tree.Provinces[len(tree.Provinces)-1] != "海外" {
 		t.Fatalf("海外 must be last, got %q", tree.Provinces[len(tree.Provinces)-1])
 	}
-	// 历史修复 二十五次：未映射 ASCII 段清零断言——当前 v3.17.0 全部拼音/英文段已
+	// 历史修复：未映射 ASCII 段清零断言——当前 v3.17.0 全部拼音/英文段已
 	// 映射；未来 xdb 版本新增未映射段时计数 >0，此断言失败提醒补映射表
 	//（丢失可见而非静默过滤）。
 	if tree.DroppedASCIIProvinces != 0 || tree.DroppedASCIICities != 0 {
 		t.Fatalf("unmapped ASCII segments dropped: prov=%d city=%d — 映射表需为新版 xdb 补条目", tree.DroppedASCIIProvinces, tree.DroppedASCIICities)
 	}
-	// 历史修复（历史修复 二十八次，用户反馈）：少数民族自治州简称必须映射为全称——
+	// 历史修复（历史修复，用户反馈）：少数民族自治州简称必须映射为全称——
 	// 云南大理/怒江、四川凉山等 30 个自治州；「大理」这类简称不得残留。
 	assertCity := func(prov, want string) {
 		for _, c := range tree.Cities[prov] {

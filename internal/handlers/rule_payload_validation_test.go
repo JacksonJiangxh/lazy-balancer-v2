@@ -1,6 +1,6 @@
 package handlers
 
-// 历史问题/历史问题(历史):host_header 字符校验(CRLF/控制字符注入
+// 历史问题(历史):host_header 字符校验(CRLF/控制字符注入
 // reverse_proxy 头部)、dns_server 形状校验(空 host/非数字端口)、
 // services.ExtractMetricLabel 精确键匹配(x_host 不得误归集 host)。
 
@@ -69,7 +69,7 @@ func TestExtractLabel_exactKeyMatch(t *testing.T) {
 	}
 }
 
-// H-B1-06：共享保存门收录 tls_source 白名单与 request_body_max_size_mb 值域
+// 历史修复：共享保存门收录 tls_source 白名单与 request_body_max_size_mb 值域
 // ——新增写路径只调共享门也不得落库跨模式 TLS 形态/越界值。
 func TestRulePayloadSaveGateRejectsTLSSourceAndBodyLimit(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -101,7 +101,7 @@ func TestRulePayloadSaveGateRejectsTLSSourceAndBodyLimit(t *testing.T) {
 	}
 }
 
-// H-B1-07：DNS 服务器 host 不得「含点即 FQDN」——非法字符保存即拒。
+// 历史修复：DNS 服务器 host 不得「含点即 FQDN」——非法字符保存即拒。
 func TestValidateSingleDnsAddress_rejectsIllegalHostCharacters(t *testing.T) {
 	for _, bad := range []string{"a!b.example.com", "x/y.example.com", "dns example.com", `dns"bad.example.com`, "a:b:c"} {
 		if err := validateSingleDnsAddress(bad); err == nil {

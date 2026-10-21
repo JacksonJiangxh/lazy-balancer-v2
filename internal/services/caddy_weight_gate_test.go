@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// 上游权重非正值的渲染不变量（历史 历史问题-7 复核后转为永久回归钉）：
+// 上游权重非正值的渲染不变量（历史问题-7 复核后转为永久回归钉）：
 // Caddy v2.11.4 WeightedRoundRobinSelection.Provision 仅累加 Weights，
 // Select 首行 `currentWeight := int(r.index.Add(1)) % r.totalWeight`——全 0 权重
 // 使 totalWeight=0 → 每请求 integer divide by zero panic（net/http 按连接

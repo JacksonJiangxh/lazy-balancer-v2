@@ -21,7 +21,7 @@ func SetCrawlerAutoUpdate(enabled bool) error {
 // CrawlerAutoUpdateEnabled 读爬虫地址库独立总闸。
 func CrawlerAutoUpdateEnabled() bool { return globalTaskAutoUpdateEnabled("crawler") }
 
-// ArmCrawlerFirstSlots 爬虫地址库首槽武装（导出入口，A81A-历史问题）：单源启用
+// ArmCrawlerFirstSlots 爬虫地址库首槽武装（导出入口，历史问题）：单源启用
 // 与总闸开启走同一实现——总闸已开但无非空 next_update 时，启用单个源必须
 // 立即武装其排程槽，否则 NextSlotFn 恒空、任务永不触发（直到重启/重存排程）。
 func ArmCrawlerFirstSlots() { armCrawlerFirstSlots() }

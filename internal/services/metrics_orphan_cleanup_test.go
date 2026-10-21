@@ -1,6 +1,6 @@
 package services
 
-// 历史修复 D-4：metrics_history 孤儿行收敛清理（taskengine metrics-orphan-cleanup
+// 历史修复：metrics_history 孤儿行收敛清理（taskengine metrics-orphan-cleanup
 // 任务体）钉测试。
 
 import (

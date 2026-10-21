@@ -102,7 +102,7 @@ func TestDriftGuardSectionHashes_detectsMutation(t *testing.T) {
 	}
 }
 
-// TestSnapshotSecurityPolicies_nullEnabledDumpsAsDisabled 锁定 R-I1：主节点读路径
+// TestSnapshotSecurityPolicies_nullEnabledDumpsAsDisabled 锁定 历史修复：主节点读路径
 // 一律把 NULL enabled 当禁用（WHERE ... AND enabled=1），dump 却 COALESCE(enabled,1)
 // 落成启用——主节点不执行的策略经快照在从节点变成启用，且提升后永久分叉。
 // dump 必须与读路径同构：NULL → 禁用（0）。
@@ -137,7 +137,7 @@ func TestSnapshotSecurityPolicies_nullEnabledDumpsAsDisabled(t *testing.T) {
 	}
 }
 
-// TestSnapshotSecurityCustomRules_toleratesNullTimestamps 锁定 R-I7：
+// TestSnapshotSecurityCustomRules_toleratesNullTimestamps 锁定 历史修复：
 // security_custom_rules.created_at/updated_at 可空（DEFAULT datetime('now')，
 // 无 NOT NULL），一行 NULL 即让快照 scan 失败——主节点快照端点与每个从节点
 // 拉取全挂，漂移守卫哈希每 304 周期丢失漂移检测。必须 COALESCE 归一化为空串。
@@ -166,7 +166,7 @@ func TestSnapshotSecurityCustomRules_toleratesNullTimestamps(t *testing.T) {
 	}
 }
 
-// TestSnapshotSecurityBlockPages_toleratesNullTimestamps 锁定 R-I7：
+// TestSnapshotSecurityBlockPages_toleratesNullTimestamps 锁定 历史修复：
 // security_block_pages.created_at/updated_at 同样可空，与 custom_rules 同缺陷。
 func TestSnapshotSecurityBlockPages_toleratesNullTimestamps(t *testing.T) {
 	// Given：一条 created_at/updated_at 为 NULL 的拦截页面
@@ -220,7 +220,7 @@ func TestNearestSnapshotCertificateExpiry_missingExpiryDoesNotMaskNearerRealExpi
 	}
 }
 
-// D2-F1：expires_at 列落在过去的 ACME 证书（status<>'disabled' 且 pem 非空、
+// 历史修复：expires_at 列落在过去的 ACME 证书（status<>'disabled' 且 pem 非空、
 // 叶证书仍有效，但列值是续期回写失败/带外导入的过期残留）不得把缓存失效点
 // 钉在过去——否则 now.Before(expiresAt) 恒 false，每次快照都全量重建。
 func TestNearestSnapshotCertificateExpiry_pastExpiryClampedToRebuildWindow(t *testing.T) {
@@ -239,7 +239,7 @@ func TestNearestSnapshotCertificateExpiry_pastExpiryClampedToRebuildWindow(t *te
 	}
 }
 
-// D2-F1 集成：叶证书有效但 expires_at 列过期的种子 → 首次快照后缓存失效点
+// 历史修复 集成：叶证书有效但 expires_at 列过期的种子 → 首次快照后缓存失效点
 // 必须在未来（缺失窗口），保证下一次同版本同指纹 Pull 命中缓存而非全量重建。
 func TestClusterService_Snapshot_stalePastExpiryColumnKeepsCacheHitWindow(t *testing.T) {
 	// Given
@@ -266,7 +266,7 @@ func TestClusterService_Snapshot_stalePastExpiryColumnKeepsCacheHitWindow(t *tes
 	}
 }
 
-// D2-F2：结果集迭代错误（driver Rows.Next 返回非 io.EOF 错误）只能经
+// 历史修复：结果集迭代错误（driver Rows.Next 返回非 io.EOF 错误）只能经
 // rows.Err() 观测——Close() 只回报关闭错误。以下假驱动注入首迭代即失败
 // 的结果集，SQL 按 needle 路由，其余查询返回正常空集。
 type fakeIterErrRows struct {
@@ -365,7 +365,7 @@ func TestSnapshotCertificates_propagatesManualCertRowsIterationError(t *testing.
 	}
 }
 
-// D2-S1：304 路径不得执行交付前置——canonical 拷贝、HMAC 签名与「确认旧协议
+// 历史修复：304 路径不得执行交付前置——canonical 拷贝、HMAC 签名与「确认旧协议
 // 集群令牌交付」的 nodes UPDATE 只属于真正下发的快照（304 响应体为空，全部
 // 是纯浪费；清 registration_secret 语义见 cluster_sync.go 注册轮询侧注释）。
 func TestClusterService_Snapshot_304PathSkipsSigningPrework(t *testing.T) {
@@ -414,7 +414,7 @@ func TestClusterService_Snapshot_304PathSkipsSigningPrework(t *testing.T) {
 	}
 }
 
-// D2-S2：同步开关读取失败必须让快照构建报错——吞错会发布 nil 开关快照，
+// 历史修复：同步开关读取失败必须让快照构建报错——吞错会发布 nil 开关快照，
 // 从节点 computeSectionSkips 回退全开默认值，主节点 sync_users=0 等关闭
 // 保护在该份快照内被绕过且无自愈。 BOOLEAN 列驻留不可扫描文本（SQLite
 // 动态类型）即可只打断 readSyncSwitches 而不打断其余快照读取。
@@ -438,10 +438,10 @@ func TestClusterService_Snapshot_syncSwitchesReadFailureErrors(t *testing.T) {
 	}
 }
 
-// N+12 历史问题：单条 acme_dns 规则的域名串损坏（>2 域名，导入残留/直改库形态）
+// 历史问题：单条 acme_dns 规则的域名串损坏（>2 域名，导入残留/直改库形态）
 // 只能跳过该规则的证书候选并限频告警——整包报错会让主节点对所有从节点
 // Pull 持续 500 且无自愈路径（同循环坏证书候选 :881/:887/:899 的
-// 历史问题/历史问题/历史问题 fail-open 裁定家族）。
+// 历史问题 fail-open 裁定家族）。
 func TestClusterService_Snapshot_badRuleDomainSkipsCandidateInsteadOfFailing(t *testing.T) {
 	// Given：域名串 'a.com,b.com,c.com'（3 域名 → CanonicalACMEDomains 报错）
 	// 挂在一条已签发有效证书的 acme_dns 规则上——证书本身有效，唯一坏点
@@ -479,7 +479,7 @@ func TestClusterService_Snapshot_badRuleDomainSkipsCandidateInsteadOfFailing(t *
 	}
 }
 
-// S历史问题-02：apply 基线只装载消费面——无 WafFiles（不再全树 tar.gz+sha256），
+// 历史问题-02：apply 基线只装载消费面——无 WafFiles（不再全树 tar.gz+sha256），
 // 三节哈希与漂移守卫同口径，证书轴/ACME ownership 齐全。
 func TestClusterSnapshotForApply_skipsWafFileTreeHash(t *testing.T) {
 	service, _ := newClusterTestService(t)
@@ -512,7 +512,7 @@ func TestClusterSnapshotForApply_skipsWafFileTreeHash(t *testing.T) {
 	}
 }
 
-// S历史问题-10（verify，契约钉死）：证书轴只镜像启用规则的 ACME 证书。
+// 历史问题-10（verify，契约钉死）：证书轴只镜像启用规则的 ACME 证书。
 func TestSnapshotCertificates_mirrorsOnlyEnabledRules(t *testing.T) {
 	service, database := newClusterTestService(t)
 	ctx := context.Background()
@@ -537,7 +537,7 @@ func TestSnapshotCertificates_mirrorsOnlyEnabledRules(t *testing.T) {
 		t.Fatalf("enabled rule certificate missing: %#v", seen)
 	}
 	if seen["lb_disabled"] {
-		t.Fatal("disabled rule certificate must not be mirrored (S历史问题-10 contract)")
+		t.Fatal("disabled rule certificate must not be mirrored (历史问题-10 contract)")
 	}
 }
 

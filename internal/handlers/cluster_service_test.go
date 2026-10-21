@@ -243,7 +243,7 @@ func TestClusterServiceControl_rejects_invalid_action(t *testing.T) {
 	}
 }
 
-// CLUSTER-3（历史）：解析失败分支的审计动作不得留空段——
+// 历史修复（历史）：解析失败分支的审计动作不得留空段——
 // ShouldBindJSON 失败时 Action 多为零值，此前审计详情落「操作：」空值，
 // 无法区分「动作未知的畸形请求」与记录缺陷。空串以占位符显式留痕。
 func TestClusterServiceControl_parseFailureAuditsPlaceholderAction(t *testing.T) {
@@ -455,7 +455,7 @@ func TestControlClusterNodeService_rejects_bad_requests(t *testing.T) {
 		t.Fatalf("bad node id status=%d body=%s, want 400", recorder.Code, recorder.Body.String())
 	}
 
-	// B2-历史问题（历史）：三条失败早退各留一条「失败」审计（此前零审计）。
+	// 历史问题（历史）：三条失败早退各留一条「失败」审计（此前零审计）。
 	details := auditDetailsServiceControlRows(t)
 	if len(details) != 3 {
 		t.Fatalf("audit details=%v, want one failure row per rejected request", details)
@@ -510,7 +510,7 @@ func TestControlClusterNodeService_ignores_APIKey_readonly_annotation(t *testing
 // 经 ClusterServiceControlRequest.Operator → 从端 recordClusterServiceControlAuditBy
 // 落 audit_log.username,防旧主节点降级为「主节点」匿名的回归无护栏。
 func TestClusterServiceControlOperatorTransfer(t *testing.T) {
-	// F64 升级为端到端钉(原弱钉仅测字段零/非零——同义反复):
+	// 历史修复 升级为端到端钉(原弱钉仅测字段零/非零——同义反复):
 	// ①验证 recordClusterServiceControlAuditBy 在 operator 非空时
 	//   将 operator 作为 audit username 落库
 	// ②operator 空串时回退「主节点」

@@ -15,7 +15,7 @@ import (
 	"lazy-balancer-v2/internal/models"
 )
 
-// 历史修复 A-M2：快照提交成功但 Caddy 重载失败时，必须留下可识别、可重试的
+// 历史修复：快照提交成功但 Caddy 重载失败时，必须留下可识别、可重试的
 // 状态（apply_ok_reload_failed 标记写入 last_sync_error），否则主节点
 // 版本未变 → 后续同步一律 304 → 陈旧运行配置被永久掩盖且状态页仍显示 ok。
 func TestSyncService_applySnapshot_reloadFailure_marks_apply_ok_reload_failed(t *testing.T) {
@@ -141,7 +141,7 @@ func TestSyncService_Pull_repulls_full_snapshot_after_reload_failure_marker(t *t
 	}
 }
 
-// 历史修复 HIGH-1：apply 成功但 Caddy 重载失败时，标记必须在同一 Pull 周期内
+// 历史修复：apply 成功但 Caddy 重载失败时，标记必须在同一 Pull 周期内
 // 存活（defer 清空不得吞掉本周期写入的标记）；下一周期 304 时必须以
 // since_version=0 全量重拉补偿重试。
 func TestSyncService_Pull_reload_failure_marker_survives_defer_and_triggers_repull(t *testing.T) {
@@ -219,7 +219,7 @@ func TestSyncService_Pull_reload_failure_marker_survives_defer_and_triggers_repu
 	}
 }
 
-// 历史修复 A-LOW-2：上报被拒时 200 字节截断可能落在多字节 UTF-8 字符中间，
+// 历史修复：上报被拒时 200 字节截断可能落在多字节 UTF-8 字符中间，
 // 错误信息尾部不得残留半个字符的乱码字节。
 func TestSyncService_Report_rejection_body_trims_partial_utf8_tail(t *testing.T) {
 	// Given：主节点 403 正文为 300 字节的纯中文
@@ -252,7 +252,7 @@ func TestSyncService_Report_rejection_body_trims_partial_utf8_tail(t *testing.T)
 	}
 }
 
-// 历史修复 F1：run 循环周期末的 recordSyncError(nil,nil) 不得清掉本周期 Pull
+// 历史修复：run 循环周期末的 recordSyncError(nil,nil) 不得清掉本周期 Pull
 // 落库的 apply_ok_reload_failed 标记——历史修复 只修了 Pull defer，run 层第二处
 // 清空点让 304 分支的自愈补偿在生产中从未触发。测试必须走真实 run() 循环。
 func TestSyncService_run_reloadFailureMarker_survivesCycleEndAndTriggersRepull(t *testing.T) {
@@ -330,7 +330,7 @@ func TestSyncService_run_reloadFailureMarker_survivesCycleEndAndTriggersRepull(t
 	}
 }
 
-// 历史修复 F2：传输层错误不得覆盖 apply_ok_reload_failed 标记（标记是全量重拉补偿的
+// 历史修复：传输层错误不得覆盖 apply_ok_reload_failed 标记（标记是全量重拉补偿的
 // 唯一触发器）；组合消息保留前缀保证 304 分支 HasPrefix 检测仍命中。终止类错误
 // 允许覆盖。recordSyncError(nil,nil) 对标记同样保留（与 run 循环跳过同口径兜底）。
 func TestSyncService_recordSyncError_preservesReloadFailureMarkerOnTransportError(t *testing.T) {

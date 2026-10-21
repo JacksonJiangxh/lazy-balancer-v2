@@ -77,7 +77,7 @@ export interface NodeSiteFormValue {
 }
 
 /**
- * A86 历史问题：节点站点弹框的表单初值单源。site_inherited 节点的
+ * 历史修复问题：节点站点弹框的表单初值单源。site_inherited 节点的
  * server_map_lat/lon 是服务端替换后的主节点坐标副本，必须还原为
  * 0,0 + 空选择（继承语义），不得把继承值预填为可保存值——否则
  * 「打开即保存」会把继承静默固化为显式坐标，此后主节点坐标变更不再传播。
@@ -96,7 +96,7 @@ export function initialNodeSiteForm(node: {
 }
 
 /**
- * A86 历史问题：表单坐标相对打开时初值是否有变化。无变化保存=no-op——
+ * 历史修复问题：表单坐标相对打开时初值是否有变化。无变化保存=no-op——
  * 弹框直接关闭，不发 PUT、不触发集群版本 bump 与全集群同步。
  */
 export function nodeSiteCoordsChanged(

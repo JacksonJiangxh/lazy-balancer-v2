@@ -1,6 +1,6 @@
 package services
 
-// TASK-2（历史）：wire EnabledFn 读库失败方向统一 fail-closed——
+// 历史修复（历史）：wire EnabledFn 读库失败方向统一 fail-closed——
 // crs/ip2region 曾 err→true（读库失败显示「启用」，实际调度面读不到开关
 // 状态）；auto-backup 曾 err!=nil||enabled（同向 fail-open）。读错时应
 // 显示「已停止」（LoopOn=false），与 threat 既有 fail-closed 口径一致。
@@ -62,7 +62,7 @@ func enabledOf(t *testing.T, te *taskengine.Engine, id string) bool {
 	return m.LoopOn
 }
 
-// B1-8（历史）：wire Fn 闭包族 db.DB 直读无 nil 守卫（生产不可达——引擎
+// 历史修复（历史）：wire Fn 闭包族 db.DB 直读无 nil 守卫（生产不可达——引擎
 // wire 晚于 db.Initialize；测试/降级形态可触达）。EnabledFn/NextSlotFn/StatusFn
 // 读 nil 库必须 fail-closed（LoopOn=false/零值槽/空状态），不得 panic——
 // SyncBusinessTaskDrivers 对齐四族业务门，Lookup 同时驱动槽/状态闭包（含

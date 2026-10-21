@@ -41,8 +41,8 @@ func resetTrafficEvents() {
 }
 
 // trafficEventRecord 记录一条正常请求（抽样在写入前完成）。国名键非国家值
-// （空/0/Reserved）不记录——与计数桶及聚合端点同口径（E81-历史问题）；异体
-// 归一与计数桶同 helper（A85PLG 历史问题，事件流与计数桶键口径一致）。
+// （空/0/Reserved）不记录——与计数桶及聚合端点同口径（历史问题）；异体
+// 归一与计数桶同 helper（历史问题，事件流与计数桶键口径一致）。
 func trafficEventRecord(country, province string) {
 	country = normalizeTrafficCountryKey(country)
 	if !trafficCountryKeyValid(country) || !trafficCollectorActive() {
@@ -96,7 +96,7 @@ func trafficEventSnapshot(since uint64, limit int) ([]trafficEvent, uint64) {
 	}
 	// next 必须是本批最后一条的 seq，而不是全局最新 seq；否则一批被 limit
 	// 截断时前端会把未返回的事件永久跳过（全量 1000/s 下必现）。
-	// PL历史问题：入参游标超过本进程已分配的最大 seq，只可能来自上一进程代际
+	// 历史问题：入参游标超过本进程已分配的最大 seq，只可能来自上一进程代际
 	// （trafficEventSeq 是进程内计数器，Caddy 重启后归零）——此时必须显式回吐
 	// 0 要求前端从最新窗口重新追赶。原样回吐 since 会让前端「next_seq <
 	// previous 才复位」的判据永不成立，光流在该标签页内永久停更。

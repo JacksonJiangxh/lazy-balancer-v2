@@ -140,7 +140,7 @@ func TestListSecurityEvents_excludeKeepsNullRuleTriggered(t *testing.T) {
 }
 
 func TestListSecurityEvents_legacyRowsFallBackToJoinedNames(t *testing.T) {
-	// Given a rule and policy, plus a 历史修复 event with empty snapshot columns
+	// Given a rule and policy, plus a pre-migration event with empty snapshot columns
 	setupSecurityPolicyTestDB(t)
 	router := newSecurityEventsRouter(t)
 
@@ -360,7 +360,7 @@ func TestCategorizeAttack_familyMapping(t *testing.T) {
 		{"protocol attack", "921110", "HTTP Request Smuggling", "协议攻击"},
 		{"scanner", "913100", "Scanner Detected", "扫描探测"},
 		{"blocking evaluation", "949110", "Inbound Anomaly Score Exceeded", "请求阻断评估"},
-		// F-历史问题-02（历史）：已装 CRS v4 组的具体分类（waf/crs/rules/
+		// 历史问题-02（历史）：已装 CRS v4 组的具体分类（waf/crs/rules/
 		// 目录实证规则 ID）——此前落兜底「其他」。
 		{"multipart attack", "922110", "Multipart Attack", "Multipart 攻击"},
 		{"response java leak", "952011", "Java Exception", "响应 Java 泄露"},
@@ -373,7 +373,7 @@ func TestCategorizeAttack_familyMapping(t *testing.T) {
 		{"ip whitelist via msg", "", "命中 IP 白名单", "IP 访问控制"},
 		{"ip acl via msg", "", "触发 IP 访问控制", "IP 访问控制"},
 		{"ip acl via id 2", "2", "", "IP 访问控制"},
-		// 历史 历史问题：id:3/12 对齐 family 表/stage 桶归「信任名单」（发射
+		// 历史问题：id:3/12 对齐 family 表/stage 桶归「信任名单」（发射
 		// 为 pass,nolog 永不产事件——防御性归族，三侧同口径）
 		{"trust precheck id 3", "3", "", "信任名单"},
 		{"trust precheck id 12", "12", "", "信任名单"},
@@ -388,7 +388,7 @@ func TestCategorizeAttack_familyMapping(t *testing.T) {
 		{"empty input", "", "", "其他"},
 		{"custom rule six-digit id", "123456", "something else", "自定义规则"},
 		// 历史修复（历史）收敛前语义钉：未列名 3 位前缀的 9xxxxx（CRS 保留段
-		// 余数）在概览视图走 历史修复——msg 命中 IP 黑白名单门仍归 IP 访问
+		// 余数）在概览视图走 fall-through——msg 命中 IP 黑白名单门仍归 IP 访问
 		// 控制，裸形态归「其他」（阶段视图则整段归 WAF，两视图有意分叉）。
 		{"unlisted crs id with acl msg", "960100", "命中 IP 黑名单", "IP 访问控制"},
 		{"unlisted crs id bare", "960100", "something else", "其他"},
@@ -484,7 +484,7 @@ func TestGetSecurityOverview_fallsBackToBundledCRSVersion(t *testing.T) {
 // 故障时 ActivePolicies 会同挂触发 500，本测试钉住仅该表异常的静默窗口）。
 // When：请求 /security/overview。
 // Then：500「安全总览查询失败」——此前 err 被静默吞掉（err == nil 才应用），
-// 违反本函数 历史问题 D2 自述标准，面板静默回落捆绑版本 +「idle」与真实态不可区分。
+// 违反本函数 历史问题 自述标准，面板静默回落捆绑版本 +「idle」与真实态不可区分。
 // 无行（ErrNoRows）是全新安装的合法状态，200 回落契约由 fallsBackToBundled
 // CRSVersion 钉住，不属故障。
 func TestGetSecurityOverview_crsVersionQueryFailureReturns500(t *testing.T) {
@@ -502,7 +502,7 @@ func TestGetSecurityOverview_crsVersionQueryFailureReturns500(t *testing.T) {
 }
 
 func TestGetSecurityOverview_trendBucketsLocalDateForNegativeOffset(t *testing.T) {
-	// Given a western timezone (America/New_York, 历史修复 in summer) so the offset is negative
+	// Given a western timezone (America/New_York, UTC-4 in summer) so the offset is negative
 	setupSecurityPolicyTestDB(t)
 	router := newSecurityEventsRouter(t)
 	if _, err := time.LoadLocation("America/New_York"); err != nil {
@@ -518,7 +518,7 @@ func TestGetSecurityOverview_trendBucketsLocalDateForNegativeOffset(t *testing.T
 	// When the overview is requested
 	recorder := getRequest(t, router, "/security/overview")
 
-	// Then the event lands in the correct 历史修复 bucket (no 历史修复 trend from "+-240")
+	// Then the event lands in the correct local-date bucket (no all-zero trend from "+-240")
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("overview status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
@@ -563,7 +563,7 @@ func TestGetSecurityOverview_trendZeroFillsSevenDays(t *testing.T) {
 	// When the overview is requested
 	recorder := getRequest(t, router, "/security/overview")
 
-	// Then the trend always covers 历史修复 … today ascending with 历史修复 gaps
+	// Then the trend always covers today-6 … today ascending with zero-filled gaps
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("overview status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
@@ -661,7 +661,7 @@ func TestGetSecurityOverview_topIPsEmptyMessageYieldsOtherFamily(t *testing.T) {
 }
 
 func TestGetSecurityOverview_topIPsSharesLocalSixDayWindowWithTrend(t *testing.T) {
-	// Given a 历史修复 timezone so local midnight precedes UTC midnight
+	// Given a positive-offset timezone so local midnight precedes UTC midnight
 	setupSecurityPolicyTestDB(t)
 	router := newSecurityEventsRouter(t)
 	services.ConfigureLocation("Asia/Shanghai")
@@ -803,7 +803,7 @@ func TestLoadSecurityOverviewAggregates_cacheHitAndExpiry(t *testing.T) {
 	}
 
 	// Then 缓存过期后同一键必须重算并看到新事件（直接调整测试缓存项的
-	// 过期时刻，避免 30s 历史修复 sleep）。
+	// 过期时刻，避免 30s wall-clock sleep）。
 	securityOverviewAggCacheMu.Lock()
 	for key, entry := range securityOverviewAggCache {
 		if key.metrics == db.MetricsDB {
@@ -893,7 +893,7 @@ func TestLoadSecurityOverviewAggregates_doesNotCacheFailures(t *testing.T) {
 	}
 }
 
-// S4/S5(2026-09-10 审计):①family 筛选单数字前缀无长度约束,自定义 5 位 ID
+// 历史修复(2026-09-10 审计):①family 筛选单数字前缀无长度约束,自定义 5 位 ID
 // (24567 等)交叉命中 IP/地域族;②id:11(请求体解析失败守卫)三侧分类缺标签。
 func TestRuleTriggeredFilterSQL_singleDigitFamiliesUseExactMatch(t *testing.T) {
 	var args []any
@@ -907,7 +907,7 @@ func TestRuleTriggeredFilterSQL_singleDigitFamiliesUseExactMatch(t *testing.T) {
 		}
 	}
 	// 自定义规则族不得命中 IP 族条件：其条件由长度约束的 GLOB 承载（非 LIKE
-	// 前缀），且不追加查询参数（历史 F12：原 _ = customSQL 为假断言）。
+	// 前缀），且不追加查询参数（历史修复：原 _ = customSQL 为假断言）。
 	var customArgs []any
 	customSQL := ruleTriggeredFilterSQL("自定义规则", &customArgs)
 	if strings.Contains(customSQL, "LIKE") {
@@ -935,7 +935,7 @@ func TestCategorizeAttack_bodyProcessorErrorAndNoCrossFamily(t *testing.T) {
 }
 
 // 历史问题-05（历史）：MetricsDB 未装配的兜底返回必须与成功路径同形状——
-// 键为 events（历史 历史问题 引入防 panic 时误用 list 键，前端按 events 解析
+// 键为 events（历史问题 引入防 panic 时误用 list 键，前端按 events 解析
 // 拿到 undefined 空列表）。
 func TestListSecurityEvents_nilMetricsDBFallbackUsesEventsKey(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
@@ -963,7 +963,7 @@ func TestListSecurityEvents_nilMetricsDBFallbackUsesEventsKey(t *testing.T) {
 	}
 }
 
-// ---- 历史 历史问题 / 历史问题 ----
+// ---- 历史问题 ----
 
 func TestListSecurityEvents_triggerTypePopulated(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
@@ -1170,7 +1170,7 @@ func TestListSecurityEvents_disclosesIngestionHealth(t *testing.T) {
 
 // 历史修复（历史）：列表投影在 SQL 侧只取「截断上限 +1 字符」探针，Go 侧
 // 仍追加同一截断标记——响应形态不变，但 DB→进程传输不再是大字段全量
-// （100 行 × 64KB/字段）。SUBSTR 按字符计，多字节值不得被切断成非法 历史修复。
+// （100 行 × 64KB/字段）。SUBSTR 按字符计，多字节值不得被切断成非法 UTF-8。
 func TestListSecurityEvents_largeFieldsCappedWithMarker(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	gin.SetMode(gin.TestMode)

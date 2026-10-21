@@ -1,4 +1,4 @@
-// 威胁大屏国家键集单源验收（历史 历史问题/历史问题）：
+// 威胁大屏国家键集单源验收（历史问题）：
 //   A. THREAT_COUNTRIES 排除南极洲（地图/地球两引擎同表）
 //   B. 每个威胁国家（中国走 chinaProvinces 高精度表）在 ADMIN1_PROVINCES 命中
 //      ——全量键集断言，非抽查（原 11 个英文/旧名分组只能靠人工发现）
@@ -16,7 +16,7 @@ import { CHINA_PROVINCES } from '../src/utils/chinaProvinces.ts'
 test('A 威胁国家表：排除南极洲且其余国家与 worldBorders 一致', () => {
   assert.equal(WORLD_COUNTRIES.length - THREAT_COUNTRIES.length, 1)
   assert.ok(!THREAT_COUNTRIES.some((c) => c.name === 'Antarctica'), '南极洲必须从威胁国家表剔除')
-  // 审计 87 WEBT-03：原 `assert.notEqual(THREAT_COUNTRIES, WORLD_COUNTRIES)` 是
+  // 历史修复：原 `assert.notEqual(THREAT_COUNTRIES, WORLD_COUNTRIES)` 是
   // 同义反复（两个数组对象恒不相等）——若过滤谓词改成别的国家、或顺序/集合漂移
   // 也通过。改为与「唯一预期谓词」逐项同集同序比对（元素对象按设计共享）。
   assert.deepEqual(
@@ -66,7 +66,7 @@ test('C 别名表：10 个历史英文/旧名分组 + 巴勒斯坦双源/南极�
     Brunei: '文莱',
     Swaziland: '斯威士兰',
   }
-  // 标题口径与实际校验面一致（审计 87 WEBT-04：标题曾写 11 个而表只有 10 个）
+  // 标题口径与实际校验面一致（历史修复：标题曾写 11 个而表只有 10 个）
   assert.equal(Object.keys(expected).length, 10)
   for (const [alias, target] of Object.entries(expected)) {
     assert.equal(COUNTRY_ALIAS[alias], target, `别名 ${alias} 目标漂移`)
@@ -77,7 +77,7 @@ test('C 别名表：10 个历史英文/旧名分组 + 巴勒斯坦双源/南极�
   assert.equal(COUNTRY_ALIAS['Gaza Strip'], '巴勒斯坦')
   assert.equal(COUNTRY_ALIAS['West Bank'], '巴勒斯坦')
   assert.ok(hasRows('巴勒斯坦'))
-  // WT87-01：两源必须**逐省合并**——只断言目标键非空会让「后到别名被静默
+  // 历史修复：两源必须**逐省合并**——只断言目标键非空会让「后到别名被静默
   // 丢弃」（原实现仅 Gaza 条带）也通过，下钻西岸整片成空洞。
   const palestine = ADMIN1_PROVINCES['巴勒斯坦']
   const palestineNames = palestine.map((row) => row.name)

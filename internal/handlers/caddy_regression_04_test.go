@@ -11,7 +11,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 历史修复 C-B-1（v1 备份）: 禁用的 SSL 规则无内联证书时，导入归一为 enable_tls=0
+// 历史修复（v1 备份）: 禁用的 SSL 规则无内联证书时，导入归一为 enable_tls=0
 // 并逐条告警——此前会原样落库 enable_tls=1 + tls_source='manual' + 空证书的非法
 // 状态，且该状态随 v2 导出回流。
 func TestImportV1Config_normalizes_disabled_ssl_rule_without_cert(t *testing.T) {
@@ -53,7 +53,7 @@ func TestImportV1Config_normalizes_disabled_ssl_rule_without_cert(t *testing.T) 
 	}
 }
 
-// 历史修复 C2-N1（v1 备份）: TCP 规则带 SSL 开关但无证书时，导入归一为 enable_tls=0
+// 历史修复（v1 备份）: TCP 规则带 SSL 开关但无证书时，导入归一为 enable_tls=0
 // 并告警——保留 enable_tls=1+空 manual 证书会让该规则任何编辑恒 400 且 UI 无自救。
 func TestImportV1Config_normalizes_tcp_ssl_rule_without_cert(t *testing.T) {
 	// Given v1 备份中一条 TCP（protocol=false）+ ssl=true 的规则不带证书
@@ -93,7 +93,7 @@ func TestImportV1Config_normalizes_tcp_ssl_rule_without_cert(t *testing.T) {
 	}
 }
 
-// 历史修复 C3-F3（v1 备份）: fail_timeout ≤ 5 且开启 http_check 的规则，导入时健康检查
+// 历史修复（v1 备份）: fail_timeout ≤ 5 且开启 http_check 的规则，导入时健康检查
 func TestImportV1Config_clamps_short_active_health_interval(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	gin.SetMode(gin.TestMode)
@@ -129,9 +129,9 @@ func TestImportV1Config_clamps_short_active_health_interval(t *testing.T) {
 	}
 }
 
-// 历史修复 C-B-1（v2 备份）: 启用手动 TLS 空证书行被拒绝时须点名违规规则，便于在
+// 历史修复（v2 备份）: 启用手动 TLS 空证书行被拒绝时须点名违规规则，便于在
 // 整包备份中定位（镜像保存/启用侧 validateStoredRuleConfig 口径）。
-// 历史修复 C-1：TLS 形态校验迁至 validateV2BackupTLSShape（冲突置禁用之后执行）。
+// 历史修复：TLS 形态校验迁至 validateV2BackupTLSShape（冲突置禁用之后执行）。
 func TestValidateV2BackupTLSShape_names_offending_rule(t *testing.T) {
 	// Given 一条启用、手动 TLS、无证书的备份规则行
 	rule := map[string]any{

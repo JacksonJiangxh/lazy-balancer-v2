@@ -1,7 +1,7 @@
 package handlers
 
-// allow: SIZE_OK — 历史修复 security-domain handler regression tests (F7 page clamp,
-// F10 binding rule existence).
+// allow: SIZE_OK — 历史修复 security-domain handler regression tests (历史修复 page clamp,
+// 历史修复 binding rule existence).
 
 import (
 	"encoding/json"
@@ -19,7 +19,7 @@ import (
 )
 
 // TestListSecurityEvents_hugePageDoesNot500 验证超大 page 参数被 clamp，
-// (page-1)*pageSize 不再整数溢出为负 OFFSET（历史修复 F7）。
+// (page-1)*pageSize 不再整数溢出为负 OFFSET（历史修复）。
 func TestListSecurityEvents_hugePageDoesNot500(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newSecurityR26Router(t)
@@ -53,7 +53,7 @@ func TestListSecurityEvents_hugePageDoesNot500(t *testing.T) {
 }
 
 // TestListCRSRules_hugePageDoesNot500 验证超大 page 参数被 clamp，
-// allRules[start:end] 不再越界 panic（历史修复 F7）。
+// allRules[start:end] 不再越界 panic（历史修复）。
 func TestListCRSRules_hugePageDoesNot500(t *testing.T) {
 	oldDir := crsRulesDir
 	dir := t.TempDir()
@@ -90,7 +90,7 @@ func TestListCRSRules_hugePageDoesNot500(t *testing.T) {
 	}
 }
 
-// TestBindRuleToPolicy_rejectsMissingRule 验证绑定前校验规则真实存在（历史修复 F10）。
+// TestBindRuleToPolicy_rejectsMissingRule 验证绑定前校验规则真实存在（历史修复）。
 func TestBindRuleToPolicy_rejectsMissingRule(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newSecurityRouter(t)

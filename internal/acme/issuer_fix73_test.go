@@ -71,7 +71,7 @@ func TestIssuer_waitForDNS_probesResolversInParallel(t *testing.T) {
 	}
 }
 
-// 历史修复 历史问题：权威服务器与递归服务器一样必须同轮并行。四台服务器只有在
+// 历史问题：权威服务器与递归服务器一样必须同轮并行。四台服务器只有在
 // 全部同时在途时才返回命中；串行实现会逐台等待兜底并全部返回 NODATA。
 func TestIssuer_probeAuthServersLogged_probesAuthoritativeInParallel(t *testing.T) {
 	const expected = "parallel-auth-value"
@@ -124,7 +124,7 @@ func TestIssuer_probeAuthServersLogged_probesAuthoritativeInParallel(t *testing.
 	}
 }
 
-// 历史修复 历史问题 超时边界：每台权威使用独立短超时。应答慢于该超时时须按
+// 历史问题 超时边界：每台权威使用独立短超时。应答慢于该超时时须按
 // 查询失败处理（不进入 alive），而不是串行等到服务端 NODATA 后当作存活未命中。
 func TestIssuer_probeAuthServersLogged_appliesPerServerTimeout(t *testing.T) {
 	oldTimeout := propagationResolverProbeTimeout
@@ -203,7 +203,7 @@ func TestIssuer_waitForDNS_convergesRepeatedProbeLogs(t *testing.T) {
 	issuer := &Issuer{Logger: logger}
 	// 1 台命中不足共识 → 必然超时；500ms/20ms≈25 轮，旧形态每轮各刷一行。
 	if err := issuer.waitForDNS(context.Background(), fqdn, expected, 500*time.Millisecond); err == nil {
-		t.Fatal("单台命中不得放行（M9 底线）")
+		t.Fatal("单台命中不得放行（共识底线）")
 	}
 
 	countContaining := func(substr string) int {

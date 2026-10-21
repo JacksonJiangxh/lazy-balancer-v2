@@ -8,8 +8,8 @@ import (
 )
 
 // 历史问题（历史）：通用绊线——pathArgs/queryArgs 是转发器实际取值依据，
-// 必须全部出现在该工具的 input_schema.properties 中。历史问题 B-F2/APIMCP45-1/
-// 历史问题 F2 三次同类缺陷此前只靠单工具测试兜底。CI87-05（历史）：删除
+// 必须全部出现在该工具的 input_schema.properties 中。
+// 历史问题 三次同类缺陷此前只靠单工具测试兜底。历史修复：删除
 // bodySchema 豁免——宽松 body 形态同样必须声明路径参数（此前 8 个「按 id
 // 更新」工具声明 pathArgs 却让 schema 只留 additionalProperties，Agent 只能
 // 凭描述猜 id）。工具统一用 bodySchemaWithID 声明。

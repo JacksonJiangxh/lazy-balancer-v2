@@ -307,7 +307,7 @@ const topIpAttackLabel = (row: TopIP): string => {
 const overview = ref<Overview>({ today_blocked: 0, today_detected: 0, active_policies: 0, crs_version: '', trend: [], top_ips: [], attack_types: [], attack_types_stage: [], raw_coverage_from: '', backfill_incomplete: false })
 // 分布图展示模式：勾选=按阶段五桶（默认，与触发阶段口径一致）；取消=具体分类
 // 总览加载失败（如 metrics 库故障导致后端 500）时置位：避免把全零面板
-// 误当「无攻击」，用户目标与 历史问题 D2 的后端显式报错对齐（历史问题 F1）。
+// 误当「无攻击」，用户目标与 历史问题 的后端显式报错对齐（历史问题）。
 const overviewError = ref(false)
 const trendChartOption = computed(() => {
   const dates = overview.value.trend.map(t => t.date)
@@ -346,14 +346,14 @@ const fetchData = async () => {
     }
   } catch {
     // 后端 500（如 metrics 库故障）不再静默吞掉：置错误状态展示提示条，
-    // 全零面板不再冒充「无攻击」（历史问题 F1）。
+    // 全零面板不再冒充「无攻击」（历史问题）。
     overviewError.value = true
   }
 }
 
 const blockedEvents = ref<SecurityEvent[]>([])
 // 面板级错误态：请求失败时面板内显示「加载失败」，不再静默降级为「暂无」，
-// 与 overviewError 的 历史问题 F1 口径一致（历史问题 S4）。
+// 与 overviewError 的 历史问题 口径一致（历史问题）。
 const blockedEventsError = ref(false)
 
 const fetchBlockedEvents = async () => {

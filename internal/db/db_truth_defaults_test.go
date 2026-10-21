@@ -32,7 +32,7 @@ func TestFreshSchemaDefaults_MatchGovernedConstants(t *testing.T) {
 		{"lb_rules", "health_check_unhealthy_threshold", fmt.Sprint(DefaultHealthCheckUnhealthyThreshold), 1},
 		{"lb_rules", "health_check_healthy_threshold", fmt.Sprint(DefaultHealthCheckHealthyThreshold), 1},
 		{"lb_rules", "tcp_try_interval", fmt.Sprint(DefaultTCPTryInterval), 1},
-		// G6（历史）：双向钉补齐——批 3 治理列此前只有消费侧 fail-visible 钉
+		// 历史修复（历史）：双向钉补齐——批 3 治理列此前只有消费侧 fail-visible 钉
 		//（render_db_truth_test.go），DDL DEFAULT 与治理常量未双向钉。
 		{"global_config", "cert_expiry_days", fmt.Sprint(DefaultCertExpiryDays), 0},
 		// 历史问题（历史）：续期天数/次数与 cert_expiry_days 同族，DDL DEFAULT
@@ -246,7 +246,7 @@ func TestRunMigrationsBackfillsInvalidValueColumns(t *testing.T) {
 	if _, err := database.Exec(`INSERT INTO global_config (id,caddy_config) VALUES (1,'{}')`); err != nil {
 		t.Fatalf("seed global config: %v", err)
 	}
-	// G6（历史）：cert_expiry_days 回填钉（defaultUpdates 已含该列——
+	// 历史修复（历史）：cert_expiry_days 回填钉（defaultUpdates 已含该列——
 	// NULL/<=0 归 DefaultCertExpiryDays；用户已设有效值保留）。
 	if _, err := database.Exec("UPDATE global_config SET cert_expiry_days=0, cert_renewal_days=0, cert_renewal_attempts=0"); err != nil {
 		t.Fatalf("zero cert expiry/renewal columns: %v", err)
@@ -298,7 +298,7 @@ func TestRunMigrationsBackfillsInvalidValueColumns(t *testing.T) {
 	assertScalar("SELECT http_write_timeout FROM global_config WHERE id=1", DefaultHTTPWriteTimeout)
 	assertScalar("SELECT http_idle_timeout FROM global_config WHERE id=1", DefaultHTTPIdleTimeout)
 	assertScalar("SELECT caddy_log_size_mb FROM global_config WHERE id=1", DefaultCaddyLogSizeMB)
-	// G6（历史）：cert_expiry_days 回填归 DefaultCertExpiryDays。
+	// 历史修复（历史）：cert_expiry_days 回填归 DefaultCertExpiryDays。
 	assertScalar("SELECT cert_expiry_days FROM global_config WHERE id=1", DefaultCertExpiryDays)
 	// 历史问题（历史）：续期天数/次数同批回填（此前只有 DDL DEFAULT）。
 	assertScalar("SELECT cert_renewal_days FROM global_config WHERE id=1", DefaultCertRenewalDays)
@@ -320,7 +320,7 @@ func TestRunMigrationsBackfillsInvalidValueColumns(t *testing.T) {
 // 「重建 DDL ≡ fresh DDL 全列 name/type/notnull/default/pk」钉测；users /
 // security_policies / nodes（nodes 见 db_nodes_rebuild_parity_test.go）缺回归
 // 形状——新增列只改 fresh 不改正重建时，二次 ensureNewColumns 会以默认值补回
-// 列，用户值静默丢失（OIDC / U6B-3 / 历史修复 历史问题 三次先例）。
+// 列，用户值静默丢失（OIDC / 历史修复 / 历史问题 三次先例）。
 func assertShapeMatchesFresh(t *testing.T, table string, fresh []pragmaColumn, rebuilt []pragmaColumn) {
 	t.Helper()
 	freshColumns := make(map[string]pragmaColumn, len(fresh))

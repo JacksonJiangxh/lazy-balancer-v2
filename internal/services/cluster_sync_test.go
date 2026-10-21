@@ -99,7 +99,7 @@ func TestSyncService_RegisterWithMaster_acceptsHTTP(t *testing.T) {
 }
 
 func TestSyncService_RegisterWithMaster_rejectsOversizedResponseBody(t *testing.T) {
-	// 历史问题 N2：注册响应与快照拉取同威胁模型（主节点是该链路唯一对端），
+	// 历史问题：注册响应与快照拉取同威胁模型（主节点是该链路唯一对端），
 	// 超大响应体不得全量解码入内存，超限按既有解析失败路径处理。
 	// Given：上限被调低，响应为超限但整体合法的 JSON
 	old := maxRegistrationResponseBytes
@@ -143,7 +143,7 @@ func TestSyncService_RegisterWithMaster_decodesResponseWithinLimit(t *testing.T)
 }
 
 func TestSyncService_pollRegistration_ignoresOversizedStatusResponse(t *testing.T) {
-	// 历史问题 N2：注册状态轮询响应同样必须有上限——无 LimitReader 时超限但合法
+	// 历史问题：注册状态轮询响应同样必须有上限——无 LimitReader 时超限但合法
 	// 的 approved 响应会解码成功并推进 confirm 流程。
 	// Given
 	old := maxRegistrationResponseBytes
@@ -790,7 +790,7 @@ func TestSyncService_run_stopsAfterReportingHigherMasterSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	cluster := NewClusterService(database, "")
-	// 历史问题-历史问题：ReportNode 现在带 SQL 级主节点角色条件（降级竞态不可写）。
+	// 历史问题：ReportNode 现在带 SQL 级主节点角色条件（降级竞态不可写）。
 	// 本用例在同一库上模拟「主节点接收从节点上报」，必须先把角色落成主节点，
 	// 否则会被角色守卫按降级拒绝（从端上报本身由 HTTP requireMaster 先行门禁）。
 	if _, err := database.Exec("UPDATE global_config SET is_master=1 WHERE id=1"); err != nil {
@@ -1005,7 +1005,7 @@ func TestSyncService_Pull_rejectsSchemaV1SnapshotWithoutWritingDatabase(t *testi
 	}
 
 	// Then
-	// 历史 S-11: 移除 v1/v2 legacy 回退后，v1 快照因缺少 canonical_payload
+	// 历史修复: 移除 v1/v2 legacy 回退后，v1 快照因缺少 canonical_payload
 	// 在签名校验阶段被拒绝。验证关键不变量：拒绝发生 + 本地数据未被覆盖。
 	if pullErr == nil || username != "local-user" {
 		t.Fatalf("pull error=%v local username=%q", pullErr, username)
@@ -1099,7 +1099,7 @@ func TestSyncService_Stop_returns_when_run_is_waiting_before_pull_admission(t *t
 }
 
 func TestSyncService_StartStop_resetsWafRepullFailures(t *testing.T) {
-	// 历史问题 历史问题 回归：角色切换/Stop-Start 复用同一 SyncService 实例时，
+	// 历史问题 回归：角色切换/历史修复 复用同一 SyncService 实例时，
 	// wafRepullFailures 必须清零，否则陈旧计数会让新会话首次漂移重拉被降频延迟。
 	service := &SyncService{}
 	service.runFn = func(ctx context.Context) { <-ctx.Done() }
@@ -1118,7 +1118,7 @@ func TestSyncService_StartStop_resetsWafRepullFailures(t *testing.T) {
 }
 
 func TestSyncService_Halted_concurrentPullAndResume_noCounterRace(t *testing.T) {
-	// 历史问题 历史问题 回归：Halted 态下手动 Pull 与 Resume 并发时，wafRepullFailures
+	// 历史问题 回归：Halted 态下手动 Pull 与 Resume 并发时，wafRepullFailures
 	// 的复位（startLocked，持 s.mu）与读取（Pull defer → recordSyncError，
 	// 持 pullMu）无共同互斥锁——计数器必须原子访问；旧实现（裸 int）在本
 	// 测试下 go test -race 必然报数据竞争。
@@ -1163,7 +1163,7 @@ func TestSyncService_Halted_concurrentPullAndResume_noCounterRace(t *testing.T) 
 }
 
 func TestSyncService_Pull_onMaster_skipsSyncErrorPersistence(t *testing.T) {
-	// 历史问题 S-1 回归：主节点经 API/MCP 调到 Pull 时错误只返回调用方，不得经
+	// 历史问题 回归：主节点经 API/MCP 调到 Pull 时错误只返回调用方，不得经
 	// recordSyncError 写入 last_sync_error（该错误无自动清除路径）。
 	_, database := newClusterTestService(t)
 	if _, err := database.Exec("UPDATE global_config SET is_master=1, last_sync_error='' WHERE id=1"); err != nil {
@@ -1386,7 +1386,7 @@ func TestSyncService_Pull_convergesVersionTagOnlyWafDrift(t *testing.T) {
 	// 主 v3.17.0audit / 从 v3.16.0audit，xdb 字节相同），漂移判定
 	// wafFilesDrifted（节哈希含标签）为 true，而应用侧门控
 	// wafFilesRefDiffers（仅内容 sha）为 false —— fetchWafFiles 分支
-	// 被短路，历史问题 A-#4 的 rewriteVersionIfMissingOrStale 永不执行，
+	// 被短路，历史问题 的 rewriteVersionIfMissingOrStale 永不执行，
 	// 304 分支兜底重拉 → 应用跳过 → 死循环（每周期全量重拉 + 主节点
 	// 「同步下发」审计刷屏）。修复后应用侧门控以漂移态开路，标签收敛。
 	clusterSvc, database := newClusterTestService(t)
@@ -1483,7 +1483,7 @@ func TestSyncService_Pull_convergesVersionTagOnlyWafDrift(t *testing.T) {
 	}
 
 	// 收敛后：不得再次拉取安全数据包（标签已收敛，门控关闭）。
-	// 第二轮可能因夹具合成节哈希与本地重建口径的固有分叉做一次性 E3
+	// 第二轮可能因夹具合成节哈希与本地重建口径的固有分叉做一次性 历史修复
 	// 漂移重放（生产真实快照节收敛后无此轮）；关键是重放也不再拉包、
 	// 标签保持收敛，且随后一轮必须是净 304——循环终止。
 	fetchesAfterConvergence := len(wafFetches)
@@ -1782,7 +1782,7 @@ func TestSyncService_run_clampsInvalidSyncInterval(t *testing.T) {
 }
 
 func TestSyncService_run_clampsSubMinimumSyncInterval(t *testing.T) {
-	// 历史问题 A-1：历史问题 前存量库可残留 sync_interval ∈ [1,9]（低于校验下限 10 但 >=1），
+	// 历史问题：历史问题 前存量库可残留 sync_interval ∈ [1,9]（低于校验下限 10 但 >=1），
 	// 经 buildSnapshot→updateSnapshotSettings 逐字下发后从节点 run 循环若不 clamp
 	// 会以秒级频率 Pull master（Pull 风暴）。clamp 下限必须与校验下限一致。
 	_, database := newClusterTestService(t)
@@ -1843,7 +1843,7 @@ func TestDecodeSnapshotEnvelope_rejectsBodyOverSizeLimit(t *testing.T) {
 }
 
 func TestDecodeSnapshotEnvelope_overflowNamesByteLimit(t *testing.T) {
-	// 历史问题 N1：超限必须与网络截断/损坏区分——LimitReader 静默截断会让两者
+	// 历史问题：超限必须与网络截断/损坏区分——LimitReader 静默截断会让两者
 	// 共用「unexpected EOF」，节点页面无法分辨主节点异常膨胀与链路故障。
 	// Given
 	old := maxSnapshotResponseBytes
@@ -1915,7 +1915,7 @@ func startRunLoopTestMaster(t *testing.T, snapshot any) (master *httptest.Server
 }
 
 func TestSyncService_Run_schemaTooOldDoesNotHalt_retriesNextCycle(t *testing.T) {
-	// E-F1 回归：v3 从节点拉到签名合法的 v2 主节点快照（SchemaTooOld）是可自愈
+	// 历史修复 回归：v3 从节点拉到签名合法的 v2 主节点快照（SchemaTooOld）是可自愈
 	// 的降级错误——主节点升级后自动恢复（与同类的 v2 无 canonical 形态一致，
 	// cluster_sync.go:1116-1118 刻意非终止）。滚动升级先升从节点时若进 Halted
 	// 终态，主节点升级后从节点不会自动恢复，只能人工 Resume/改模式/重启。
@@ -1967,7 +1967,7 @@ func TestSyncService_Run_schemaTooOldDoesNotHalt_retriesNextCycle(t *testing.T) 
 }
 
 func TestSyncService_Run_schemaTooNewStillHalts(t *testing.T) {
-	// E-F1 回归护栏：min_reader_version 超出本节点支持范围的签名合法快照仍是
+	// 历史修复 回归护栏：min_reader_version 超出本节点支持范围的签名合法快照仍是
 	// 终止错误——无法安全解析 canonical_payload，必须 Halted 等待本节点升级，
 	// 不得降级重试（cluster_sync.go:1122-1127 的语义不变）。
 	// Given：从节点 + 主节点下发签名合法、min_reader_version 超前的快照
@@ -2019,7 +2019,7 @@ func TestSyncService_Run_schemaTooNewStillHalts(t *testing.T) {
 	}
 }
 
-// S历史问题(历史 历史问题):主节点无 WAF 文件(applied 节哈希=nullRef 基准)+
+// 历史问题(历史问题):主节点无 WAF 文件(applied 节哈希=nullRef 基准)+
 // 从节点残留文件 → 漂移检测必须豁免(false),否则 404 重拉死循环。
 func TestWafFilesDrifted_nullRefAppliedHashExempt(t *testing.T) {
 	_, database := newClusterTestService(t)
@@ -2100,7 +2100,7 @@ func countAuditRows(t *testing.T, database *sql.DB, action, resource string) int
 	return count
 }
 
-// S历史问题-01：同一失败内容只写一条操作审计；内容变化重记；恢复后清空状态。
+// 历史问题-01：同一失败内容只写一条操作审计；内容变化重记；恢复后清空状态。
 func TestSyncFailureAudit_throttlesIdenticalFailuresAndRerecords(t *testing.T) {
 	newClusterTestService(t)
 	sync := NewSyncService(nil, nil, nil)
@@ -2149,7 +2149,7 @@ func TestSyncFailureAudit_throttlesIdenticalFailuresAndRerecords(t *testing.T) {
 	}
 }
 
-// S历史问题-01 集成面：主节点持续返回签名无效快照时，两轮 Pull 只写一条审计。
+// 历史问题-01 集成面：主节点持续返回签名无效快照时，两轮 Pull 只写一条审计。
 func TestSyncService_Pull_throttlesRepeatedIntegrityFailureAudit(t *testing.T) {
 	_, database := newClusterTestService(t)
 	const token = "cluster-token"
@@ -2181,7 +2181,7 @@ func TestSyncService_Pull_throttlesRepeatedIntegrityFailureAudit(t *testing.T) {
 	}
 }
 
-// S历史问题-06：按库登记全部同步服务实例，支持显式注销；注销后 Promote/BecomeSlave
+// 历史问题-06：按库登记全部同步服务实例，支持显式注销；注销后 Promote/BecomeSlave
 // 的排干面随之收缩（不再只排干最后注册的一个）。
 func TestSyncDrainers_registersAllInstancesAndUnregisters(t *testing.T) {
 	_, database := newClusterTestService(t)

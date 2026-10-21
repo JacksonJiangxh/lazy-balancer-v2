@@ -72,8 +72,8 @@ func loadConfigSnapshot() (configSnapshot, error) {
 	//（NOT NULL DEFAULT+每启动回填报证不可达；upstream_keepalive_timeout 为
 	// 类型②省略型保留 COALESCE 0）。
 	var old configSnapshot
-	// R2（历史）：cert_expiry_days 字面量 30 → db.DefaultCertExpiryDays 绑定
-	// 参数（caddy.go G4 形态）；同句 cert_renewal_days/attempts 属 cert_renewal_*
+	// 历史修复（历史）：cert_expiry_days 字面量 30 → db.DefaultCertExpiryDays 绑定
+	// 参数（caddy.go 历史修复 形态）；同句 cert_renewal_days/attempts 属 cert_renewal_*
 	// 列族，不在本轮 cert_expiry_days 收敛范围。缺行仍整体报错（预览面拒绝
 	// 「以零值快照误报全字段变更」）。
 	err := db.DB.QueryRow(`SELECT COALESCE(acme_email,''), COALESCE(dns_provider,'dnspod'), COALESCE(dns_credentials,''),
@@ -147,7 +147,7 @@ func planConfigChanges(req models.UpdateConfigRequest, old configSnapshot) confi
 	add("timezone", "时区", req.Timezone != nil && *req.Timezone != old.Timezone)
 	add("github_proxy_url", "GitHub加速代理", req.GitHubProxyURL != nil && *req.GitHubProxyURL != old.GitHubProxyURL)
 	// 令牌变更只记字段名（不落值）——config_changes 预览面无敏感信息；
-	// nil=保持、空串=清除（历史 历史问题，用户裁定：显式空串须计入变更，
+	// nil=保持、空串=清除（历史问题，用户裁定：显式空串须计入变更，
 	// 否则「空串清除」请求整包落入「配置无变化」短路，撤销永不到达 UPDATE）。
 	add("github_token", "GitHub 令牌", req.GitHubToken != nil && *req.GitHubToken != old.GitHubToken)
 	add("audit_retention_months", "日志保留", req.AuditRetentionMonths != nil && *req.AuditRetentionMonths != old.AuditRetentionMonths)

@@ -59,7 +59,7 @@ func daemonLifecycleRun(rc taskengine.RunContext, start, stop func()) error {
 	return nil
 }
 
-// certJobsActiveFn 测试缝（F-历史问题-01 竞态序列注入用）；生产=certJobsActive。
+// certJobsActiveFn 测试缝（历史问题-01 竞态序列注入用）；生产=certJobsActive。
 var certJobsActiveFn = certJobsActive
 
 // TaskEngine 返回全局引擎实例（未初始化返回 nil——测试环境）。
@@ -72,14 +72,14 @@ func SetTaskEngineForTest(te *taskengine.Engine) { taskEngine = te }
 // reconcileTaskEngineRole 把引擎角色对齐到 DB 单源角色（历史问题-1）。
 //
 // 引擎角色此前只在 InitTaskEngine 播种一次：播种连续失败即 SetRole(false)，
-// 若 DB 实为主节点则形成「DB=主/引擎=从」的进程内半主半从——历史修复
+// 若 DB 实为主节点则形成「DB=主/引擎=从」的进程内半主半从——master-only
 // 任务全部静默停摆，且再次 Promote 返回 ErrAlreadyMaster 无法自愈。本函数
-// 由独立 startRoleReconciler 每 60s 调用（A85历史问题-7；不是 历史修复
+// 由独立 startRoleReconciler 每 60s 调用（历史问题；不是 config-watchdog
 // 任务体），使角色成为可收敛的 DB 投影，且不受用户停止看门狗影响。
 //
 // 并发安全：与 ClusterService.Promote/BecomeSlave 的 roleMu 串行——两处
 // 翻转都在持 roleMu 时完成「DB 更新 + SetRole」。不串行则对账可能读到翻转
-// 前的旧角色，并在降级落定后把引擎重新升主（从节点启动 历史修复 daemon
+// 前的旧角色，并在降级落定后把引擎重新升主（从节点启动 master-only daemon
 // 写库）。锁序 roleMu → 引擎内部锁，与翻转路径同序，无反向获取。
 func reconcileTaskEngineRole() {
 	reconcileTaskEngineRoleFor(TaskEngine())
@@ -141,15 +141,15 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	}
 	taskengine.SetLogDir(tasksLogDir)
 	taskengine.SetTaskLogSizeBytesFn(getTaskLogSizeBytes)
-	// 历史问题（历史）：以暂停 tick 形态建引擎——BootSync（startup:历史修复）
+	// 历史问题（历史）：以暂停 tick 形态建引擎——BootSync（startup:config-load）
 	// 完成前面板装配期的周期/定时任务不得抢跑（配置未加载即执行首轮）；下方
 	// RunBootSyncTasks 之后 ResumeScheduling 恢复调度。
 	taskEngine = taskengine.NewEngine(taskengine.Options{StartPaused: true})
 	// 角色种子（v2.0 角色门前置）：按 DB 角色初始化——从节点不瞬启
-	// 历史修复 daemon（否则 boot 行噪音：启动→SetRole 停止）。
+	// master-only daemon（否则 boot 行噪音：启动→SetRole 停止）。
 	// 历史问题-1 修复：曾在此前多建一个引擎（种子落在被弃实例上失效+泄漏）。
-	// 历史问题：读失败 warn+重试一次；仍失败按 历史修复 从节点启动——
-	// 不得因读错误保持 NewEngine 默认主节点（会拉起 历史修复 daemon 并
+	// 历史问题：读失败 warn+重试一次；仍失败按 fail-closed 从节点启动——
+	// 不得因读错误保持 NewEngine 默认主节点（会拉起 master-only daemon 并
 	// 放开写面）。并发角色翻转由后续 SetRole 正常收敛。
 	var roleMaster bool
 	roleErr := errors.New("数据库未初始化")
@@ -289,7 +289,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		IntervalFn: func() time.Duration { return 6 * time.Hour },
 		Run: func(rc taskengine.RunContext) error {
 			// 长跑期间 StopTaskEngine 可能把全局置 nil；闭包内固定句柄，
-			// 收尾调用不会 nil 解引用（历史 历史问题-06）。
+			// 收尾调用不会 nil 解引用（历史问题-06）。
 			te := taskEngine
 			result := CertRenewalScanOnce()
 			// 入队即唤醒 CA 等待补扫（默认调度关闭）。历史问题：走 RearmLoop
@@ -315,7 +315,8 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Description: "每 10 分钟检查手动上传证书的过期/临期并按日去重告警",
 		Category:    "证书", Kind: taskengine.KindPeriodic, RunsOn: taskengine.RoleMasterOnly,
 		IntervalFn: func() time.Duration { return 10 * time.Minute },
-		Run:        func(rc taskengine.RunContext) error { CertManualCheckOnce(); return nil },
+		// 历史问题-15：巡检读失败上抛（task_runs 失败终态），不再恒 return nil。
+		Run: func(rc taskengine.RunContext) error { return CertManualCheckOnce() },
 	})
 
 	mustRegisterTask(taskEngine, taskengine.Descriptor{
@@ -327,8 +328,8 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			te := taskEngine
 			if !certJobsActiveFn() {
 				// 全部终态——自动关闭调度（回到默认关闭态）。
-				// F-历史问题-01（历史）：StopLoop 后复检——首查（T0）到停调度
-				// 之间的入队（T1）若经入队侧 StartLoop 先落地，会被本次 StopLoop
+				// 历史问题-01（历史）：StopLoop 后复检——首查（T0）到停调度
+				// 之间的入队（历史修复）若经入队侧 StartLoop 先落地，会被本次 StopLoop
 				// 覆盖成「任务活跃但调度已停」死态；复检捕获则重新拉回（复检
 				// 之后的新入队由入队侧 StartLoop 承担，窗口闭合）。
 				if te != nil {
@@ -389,7 +390,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	//   噪音口径见 cluster_masterserving.go）。
 	// RunsOn=RoleAny + RestartOnRoleFlip：两角色同启停语义（调度开关/引擎
 	// 生命周期一致）；角色翻转换代重启使 Run 分支与角色同步切换；boot/
-	// 停止/成功/失败行与 tasks/历史修复.log 两角色共写（各节点本地文件）。
+	// 停止/成功/失败行与 tasks/cluster-sync.log 两角色共写（各节点本地文件）。
 	mustRegisterTask(taskEngine, taskengine.Descriptor{
 		ID:                "cluster-sync",
 		Family:            "cluster",
@@ -451,7 +452,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			// 测试环境不建管理器，生产管理器初始化晚于引擎注册，管理器门会让
 			// 首槽武装在窗口期读不到。历史问题：开关/槽统一读单源 helper
 			// （versionTableAutoUpdateEnabled/versionTableNextUpdate，nil 库与
-			// 读错均 历史修复 零值槽）。
+			// 读错均 fail-closed 零值槽）。
 			if !versionTableAutoUpdateEnabled("security_crs_version") {
 				return time.Time{}
 			}
@@ -468,7 +469,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			if m == nil {
 				return ""
 			}
-			// F-历史问题-02（历史）：仅在途阶段映射 running——failed/skipped
+			// 历史问题-02（历史）：仅在途阶段映射 running——failed/skipped
 			// 持久终态曾落入 running，任务监控恒显「运行中」。
 			if IsActiveCRSStatus(m.StatusSnapshot().Status) {
 				return "running"
@@ -503,23 +504,23 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Category:    "安全防护", Kind: taskengine.KindScheduled, RunsOn: taskengine.RoleMasterOnly, Cancelable: true,
 		NextSlotFn: func() time.Time {
 			// 历史修复 同批：DB 直读不依赖管理器实例（与 crs 同形）。
-			// 历史问题：开关/槽统一读单源 helper（nil 库/读错 历史修复 零值槽）。
+			// 历史问题：开关/槽统一读单源 helper（nil 库/读错 fail-closed 零值槽）。
 			if !versionTableAutoUpdateEnabled("security_ip2region_version") {
 				return time.Time{}
 			}
 			return parseUTCSlot(versionTableNextUpdate("security_ip2region_version"))
 		},
 		// 业务开关门（关=已停止——展示+调度面跳过，历史问题；DB 直读）。
-		// 历史问题：读库失败 历史修复（helper 同源，与 crs/threat 同口径）。
+		// 历史问题：读库失败 fail-closed（helper 同源，与 crs/threat 同口径）。
 		EnabledFn: func() bool { return versionTableAutoUpdateEnabled("security_ip2region_version") },
 		StatusFn: func() string {
-			// 历史修复（历史）：nil 库守卫——空状态 历史修复。
+			// 历史修复（历史）：nil 库守卫——空状态 fail-closed。
 			if db.DB == nil {
 				return ""
 			}
 			var status string
 			_ = db.DB.QueryRow("SELECT COALESCE(update_status,'') FROM security_ip2region_version WHERE id=1").Scan(&status)
-			// F-历史问题-02（历史）：同 CRS——仅在途阶段映射 running，
+			// 历史问题-02（历史）：同 CRS——仅在途阶段映射 running，
 			// failed/skipped 持久终态不再失真为「运行中」。
 			if IsActiveIP2RegionStatus(status) {
 				return "running"
@@ -573,7 +574,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			return time.Time{}
 		},
 		EnabledFn: func() bool { // 业务开关门（备份未启用=已停止——展示+调度面跳过，历史问题）
-			// 历史修复（历史）：读库失败 历史修复——曾 err!=nil||enabled
+			// 历史修复（历史）：读库失败 fail-closed——曾 err!=nil||enabled
 			// 把读错误报为启用。
 			row, err := loadAutoBackupSettings()
 			return err == nil && row.enabled
@@ -602,7 +603,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		RunsOn:      taskengine.RoleAny, // R3（历史）：BootSync 仅 RoleAny（注册期强制；启动执行面无角色语义）
 		BootSync:    true,               // B1（历史后裁定）：启动执行=引擎同步触发（面板监听前完成）
 		Run: func(rc taskengine.RunContext) error {
-			// V1（历史）：历史修复=Caddy 崩溃自愈 watcher 经引擎调度
+			// 历史修复（历史）：caddy-restart=Caddy 崩溃自愈 watcher 经引擎调度
 			// （曾 watcher 直调执行体绕过引擎——task_runs/单飞/日志双行）。
 			if rc.Trigger != "manual" && rc.Trigger != "startup" && rc.Trigger != "caddy-restart" {
 				return nil
@@ -617,17 +618,17 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	// ============ 手动触发语义 + 默认调度启动 ============
 
 	// 手动触发=类型派生（2026-10-11 用户裁定，取代 SetManualRun 白名单——
-	// 历史修复 曾被白名单遗漏致循环任务无「运行」操作）：
+	// config-watchdog 曾被白名单遗漏致循环任务无「运行」操作）：
 	// 定时/循环/触发均可手动调度；常驻族恒不可（启停即可，启停由调度开关+重启承担）。
 
 	// 默认调度启动：
-	// - 循环 8 个全启动（历史修复 除外——默认关闭，续期扫描唤醒；
+	// - 循环 8 个全启动（cert-waiting-ca 除外——默认关闭，续期扫描唤醒；
 	//   autoban 除外——调度唯一前提=业务启用，见下）
 	// - 常驻 3 个全启动（系统启动即运行；关闭调度=启动也不运行）
-	// - 定时 4 个启动排程（threat/crs/ip2region/历史修复——EnabledFn/
-	//   NextSlotFn 内含开关判断；历史修复 不在本清单，调度由
+	// - 定时 4 个启动排程（threat/crs/ip2region/auto-backup——EnabledFn/
+	//   NextSlotFn 内含开关判断；crawlerbot-update 不在本清单，调度由
 	//   SyncBusinessTaskDrivers 按业务开关对齐）
-	// 历史问题/历史问题：默认启动前先读偏好——显式停止的 daemon 必须在任何
+	// 历史问题：默认启动前先读偏好——显式停止的 daemon 必须在任何
 	// StartLoop 副作用（启动记录/首轮执行）之前跳过；否则先启动再 StopLoop
 	// 会留下假启动记录并可能实际跑一轮。
 	taskLoopPrefs := loadTaskLoopPrefs()
@@ -644,15 +645,15 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		taskEngine.StartLoop(id)
 	}
 	// 首槽武装先落默认源/版本行，随后的业务开关同步才能读到全新库的
-	// 默认启用态（否则 ErrNoRows 被 历史修复 误译为关闭并 StopLoop）。
+	// 默认启用态（否则 ErrNoRows 被 fail-closed 误译为关闭并 StopLoop）。
 	armSecurityLibraryFirstSlots()
 	// 历史问题：套用用户显式启停偏好——覆盖默认启动清单（停止态不复活；
 	// 用户主动开启的默认关闭任务恢复调度）；业务驱动任务跳过。
-	// D2-历史问题（历史）：复用上方已读取的偏好快照，不再二次查表。
+	// 历史问题（历史）：复用上方已读取的偏好快照，不再二次查表。
 	applyTaskLoopPrefs(taskEngine, taskLoopPrefs)
 	// 业务驱动任务启动均按业务实态对齐（唯一清单见 businessTaskDrivers）。
 	SyncBusinessTaskDrivers()
-	// B1：BootSync 任务同步执行（startup:历史修复——面板监听前完成，
+	// 历史修复：BootSync 任务同步执行（startup:config-load——面板监听前完成，
 	// 替代 main.go 直调+legacy startupPhase 记录旁路）
 	taskEngine.RunBootSyncTasks()
 	// 历史问题（历史）：BootSync 完成后解除 tick 暂停——此前 ticker 在
@@ -662,8 +663,8 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	return taskEngine
 }
 
-// startRoleReconciler 把引擎角色对账从用户可停止的 历史修复 中解耦
-// （历史 历史问题-2）：看门狗被停后，播种失败/角色漂移仍能每 60s 自愈。
+// startRoleReconciler 把引擎角色对账从用户可停止的 config-watchdog 中解耦
+// （历史问题-2）：看门狗被停后，播种失败/角色漂移仍能每 60s 自愈。
 // 每次 InitTaskEngine 启动一个并绑定该代引擎；全局换代或本代停止后退出。
 var roleReconcilerInterval = 60 * time.Second
 
@@ -674,7 +675,7 @@ func startRoleReconciler(te *taskengine.Engine) <-chan struct{} {
 		ticker := time.NewTicker(roleReconcilerInterval)
 		defer ticker.Stop()
 		for range ticker.C {
-			// 历史修复-历史问题：不能每 tick 重读全局后继续运行——StopTaskEngine
+			// 历史修复：不能每 tick 重读全局后继续运行——StopTaskEngine
 			// 置 nil 后快速 Init 会让旧 goroutine 误认新引擎而永久泄漏。
 			if TaskEngine() != te || te.IsStopped() {
 				return
@@ -746,8 +747,8 @@ func WakeCertWaitingCAForEnqueuedJob() {
 // 闭包抽出，便于对「引擎句柄固定」契约直接钉测）。
 // 历史修复（历史）：先固定引擎句柄再读角色——StopTaskEngine 在
 // engine.Stop() 的 drain 超时后置全局 taskEngine=nil，daemon goroutine 若在
-// 超时后首次进入 Run，裸读全局会 nil 解引用 panic（同族 历史修复 /
-// 历史修复 已按历史 历史问题-06 固定句柄）。句柄为空=引擎已停机/换代：
+// 超时后首次进入 Run，裸读全局会 nil 解引用 panic（同族 cert-renewal-scan /
+// cert-waiting-ca 已按历史问题-06 固定句柄）。句柄为空=引擎已停机/换代：
 // 直接退出，不得把「无引擎」误判成从节点去拉起同步生命周期。
 func clusterSyncDaemonRun(rc taskengine.RunContext) error {
 	te := TaskEngine()
@@ -776,7 +777,7 @@ func RearmSecurityLibrarySlots() {
 	armSecurityLibraryFirstSlots()
 }
 
-// armSecurityLibraryFirstSlots 四个规则库首槽武装（历史修复，历史 历史问题）：
+// armSecurityLibraryFirstSlots 四个规则库首槽武装（历史修复，历史问题）：
 // auto_update 开且 next_update 空的行写入下一排程槽（versionTableNextSlot/
 // threatNextSlot 与既有排程写侧同函数同口径）。已有槽的行、开关关闭的行
 // 一律不动；武装失败仅告警不阻断启动（下一排程保存路径会自愈）。

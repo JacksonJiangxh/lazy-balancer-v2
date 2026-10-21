@@ -7,7 +7,7 @@ import (
 	"lazy-balancer-v2/internal/models"
 )
 
-// 历史修复 M4：Resume 直接调用时不得把正在执行的 'creating_%' 任务置回 'queued'——
+// 历史修复：Resume 直接调用时不得把正在执行的 'creating_%' 任务置回 'queued'——
 // 否则执行结束后的状态转换失败会把合法签发误标 failed。
 func TestCAQueueManager_Resume_skips_jobs_active_in_queue(t *testing.T) {
 	// Given：任务正在队列中执行（q.active 含该任务，DB 状态 creating_order）
@@ -39,7 +39,7 @@ func TestCAQueueManager_Resume_skips_jobs_active_in_queue(t *testing.T) {
 	queue.stop()
 }
 
-// 历史修复 M5：规则阻塞期间被丢弃的 'downloaded' 部署重试（窗口已过），在解锁
+// 历史修复：规则阻塞期间被丢弃的 'downloaded' 部署重试（窗口已过），在解锁
 // 最后一个阻塞令牌后必须补扫重新调度，否则滞停到下次 Resume/Start。
 func TestCAQueueManager_UnblockJobsForRule_rescansDroppedDeploymentRetries(t *testing.T) {
 	// Given：'downloaded' 任务部署窗口已过；规则被阻塞；证书服务已注册

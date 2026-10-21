@@ -12,9 +12,9 @@ import (
 	"time"
 )
 
-// generateR41CAChain 生成「测试 CA → 叶子」证书对,返回叶子 PEM/私钥与含
+// generateTestCAChain 生成「测试 CA → 叶子」证书对,返回叶子 PEM/私钥与含
 // 测试 CA 的根池(经 tlsCertSystemRoots 注入,模拟系统根信任)。
-func generateR41CAChain(t *testing.T, dnsNames []string) (certPEM, keyPEM string, roots *x509.CertPool) {
+func generateTestCAChain(t *testing.T, dnsNames []string) (certPEM, keyPEM string, roots *x509.CertPool) {
 	t.Helper()
 	now := time.Now()
 	caKey, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -67,15 +67,15 @@ func generateR41CAChain(t *testing.T, dnsNames []string) (certPEM, keyPEM string
 	return certPEM, keyPEM, roots
 }
 
-// injectR41Roots 用测试根池替换系统根源(验证链完整性判定),返回还原函数。
-func injectR41Roots(t *testing.T, roots *x509.CertPool) {
+// injectTestRoots 用测试根池替换系统根源(验证链完整性判定),返回还原函数。
+func injectTestRoots(t *testing.T, roots *x509.CertPool) {
 	t.Helper()
 	old := tlsCertSystemRoots
 	tlsCertSystemRoots = func() (*x509.CertPool, error) { return roots, nil }
 	t.Cleanup(func() { tlsCertSystemRoots = old })
 }
 
-// CERT41-4:自签单张——系统根不认可(unknown authority)→链不完整警告。
+// 历史修复:自签单张——系统根不认可(unknown authority)→链不完整警告。
 func TestTlsCertificateWarnings_selfSignedSingleWarnsIncompleteChain(t *testing.T) {
 	// Given
 	certPEM, keyPEM, err := generateTestCert("self.example.test", time.Now().Add(-time.Hour), time.Now().Add(365*24*time.Hour))
@@ -93,11 +93,11 @@ func TestTlsCertificateWarnings_selfSignedSingleWarnsIncompleteChain(t *testing.
 	}
 }
 
-// CERT41-4:链可信但证书不覆盖规则域名→域名不匹配警告(不阻断)。
+// 历史修复:链可信但证书不覆盖规则域名→域名不匹配警告(不阻断)。
 func TestTlsCertificateWarnings_domainMismatchWarns(t *testing.T) {
 	// Given
-	certPEM, keyPEM, roots := generateR41CAChain(t, []string{"cert.example.test"})
-	injectR41Roots(t, roots)
+	certPEM, keyPEM, roots := generateTestCAChain(t, []string{"cert.example.test"})
+	injectTestRoots(t, roots)
 
 	// When
 	warnings := tlsCertificateWarnings(certPEM, keyPEM, "rule.example.test")
@@ -112,7 +112,7 @@ func TestTlsCertificateWarnings_domainMismatchWarns(t *testing.T) {
 	}
 }
 
-// CERT41-4:链可信且域名覆盖(精确与通配)→无警告返回 nil。
+// 历史修复:链可信且域名覆盖(精确与通配)→无警告返回 nil。
 func TestTlsCertificateWarnings_validChainAndCoveredDomainReturnsNil(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -128,8 +128,8 @@ func TestTlsCertificateWarnings_validChainAndCoveredDomainReturnsNil(t *testing.
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Given
-			certPEM, keyPEM, roots := generateR41CAChain(t, tt.dnsNames)
-			injectR41Roots(t, roots)
+			certPEM, keyPEM, roots := generateTestCAChain(t, tt.dnsNames)
+			injectTestRoots(t, roots)
 
 			// When
 			warnings := tlsCertificateWarnings(certPEM, keyPEM, tt.domain)
@@ -142,7 +142,7 @@ func TestTlsCertificateWarnings_validChainAndCoveredDomainReturnsNil(t *testing.
 	}
 }
 
-// CERT41-4:通配符语义边界——*.example.test 不覆盖裸域与二级以上子域。
+// 历史修复:通配符语义边界——*.example.test 不覆盖裸域与二级以上子域。
 func TestTlsCertificateWarnings_wildcardBoundary(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -155,8 +155,8 @@ func TestTlsCertificateWarnings_wildcardBoundary(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Given
-			certPEM, keyPEM, roots := generateR41CAChain(t, []string{"*.example.test"})
-			injectR41Roots(t, roots)
+			certPEM, keyPEM, roots := generateTestCAChain(t, []string{"*.example.test"})
+			injectTestRoots(t, roots)
 
 			// When
 			warnings := tlsCertificateWarnings(certPEM, keyPEM, tt.domain)
@@ -170,7 +170,7 @@ func TestTlsCertificateWarnings_wildcardBoundary(t *testing.T) {
 	}
 }
 
-// CERT41-4:无法解析的证书材料由 validateTLSCertificate 硬校验负责,
+// 历史修复:无法解析的证书材料由 validateTLSCertificate 硬校验负责,
 // 警告侧防御性返回 nil(不重复报错)。
 func TestTlsCertificateWarnings_invalidMaterialReturnsNil(t *testing.T) {
 	// When

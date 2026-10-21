@@ -14,7 +14,7 @@ import (
 )
 
 func (h *Handlers) SetClusterMode(c *gin.Context) {
-	// 历史问题（历史 历史问题，R-12 守卫族收敛）：导入事务全量替换 global_config，
+	// 历史问题（历史问题，历史修复 守卫族收敛）：导入事务全量替换 global_config，
 	// 窗口内切换角色会在远端留下无法本地回滚的注册（BecomeSlave 之后被导入
 	// 覆盖 → 远端孤儿注册 + 本地仍为主节点）。必须先于任何网络副作用 fast-fail。
 	if rejectNodeWriteDuringImport(c) {
@@ -87,7 +87,7 @@ func (h *Handlers) SetClusterMode(c *gin.Context) {
 		})
 		return
 	}
-	// 历史问题 A-N4：令牌撤销/schema 不匹配会把同步循环置为 Halted 终态，而角色翻转
+	// 历史问题：令牌撤销/schema 不匹配会把同步循环置为 Halted 终态，而角色翻转
 	// 由引擎 SetRole 唯一驱动（cluster-sync daemon 换代重启；BecomeSlave 侧仅
 	// SetRole + 恢复调度开关，不再有旧 StartSync 生命周期旁路）——Start() 对
 	// Halted 态是 no-op（cluster_sync.go startLocked 门控），重新注册后循环永不
@@ -107,7 +107,7 @@ func (h *Handlers) SetClusterMode(c *gin.Context) {
 // requestProtocol 返回本节点自述访问协议，注册时上报主节点（用于拼接该
 // 节点的访问地址与面板展示）。X-Forwarded-Proto 无条件采信——自述协议，
 // 可信度以部署边界为界：伪造该头的可达前提是已通过认证的 admin 管理面，
-// 污染面仅限自家节点的注册地址。CLUSTER-4（历史）：保守维持
+// 污染面仅限自家节点的注册地址。历史修复（历史）：保守维持
 // 现状，不加受信门。
 func requestProtocol(c *gin.Context) string {
 	if c.Request.TLS != nil || strings.EqualFold(c.GetHeader("X-Forwarded-Proto"), "https") {
@@ -117,7 +117,7 @@ func requestProtocol(c *gin.Context) string {
 }
 
 func (h *Handlers) PromoteClusterNode(c *gin.Context) {
-	// 历史问题（历史 历史问题）：导入窗口写 global_config 会被全量替换覆盖——
+	// 历史问题（历史）：导入窗口写 global_config 会被全量替换覆盖——
 	// 与节点写端点同族 fast-fail（先于任何状态读取/生效）。
 	if rejectNodeWriteDuringImport(c) {
 		return
@@ -137,10 +137,10 @@ func (h *Handlers) PromoteClusterNode(c *gin.Context) {
 		clusterError(c, status, "提升为主节点失败: "+err.Error(), err)
 		return
 	}
-	// 历史问题 A-N2：提升成功后清空内存 TOFU pin 缓存——Promote 的 cleanupClusterPin
+	// 历史问题：提升成功后清空内存 TOFU pin 缓存——Promote 的 cleanupClusterPin
 	// 只删 pin 文件，内存 verifiedPins 残留旧主节点指纹会让记录与钉扎状态错位
-	//（M13① 后 do() 不再以内存指纹回写，此处清空保持内存/磁盘 TOFU 生命周期
-	// 对齐）。与 历史问题 A-N4 的 Resume() 同点位：角色切换的完整收尾。
+	//（历史修复① 后 do() 不再以内存指纹回写，此处清空保持内存/磁盘 TOFU 生命周期
+	// 对齐）。与 历史问题 的 Resume() 同点位：角色切换的完整收尾。
 	h.syncService.ForgetClusterPins()
 	// 生命周期由任务引擎统一驱动（Promote → SetRole → daemon hook/角色门），
 	// handler 不再直调管理器或旧调度器。
@@ -149,7 +149,7 @@ func (h *Handlers) PromoteClusterNode(c *gin.Context) {
 }
 
 func (h *Handlers) UpdateClusterSettings(c *gin.Context) {
-	// 历史问题（历史 历史问题）：同步开关与间隔写 global_config，导入窗口内的写入
+	// 历史问题（历史）：同步开关与间隔写 global_config，导入窗口内的写入
 	// 会被全量替换覆盖（静默丢失）——与节点写端点同族 fast-fail。
 	if rejectNodeWriteDuringImport(c) {
 		return
@@ -180,7 +180,7 @@ func (h *Handlers) UpdateClusterSettings(c *gin.Context) {
 		clusterError(c, status, msg, err)
 		return
 	}
-	// 历史问题（历史 历史问题）：空 body = 幂等空保存，parts 为空时审计详情曾落空串
+	// 历史问题（历史）：空 body = 幂等空保存，parts 为空时审计详情曾落空串
 	// （无法区分「无修改」与记录缺陷）——复用同域既有「无修改」文案
 	// （caproviders/certificates 同口径）。
 	detail := clusterSettingsChangeDetail(req)

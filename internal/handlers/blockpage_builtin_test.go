@@ -80,9 +80,9 @@ func TestSeedDefaultBlockPage_seedsAndRepairsBuiltinPages(t *testing.T) {
 }
 
 func TestSeedDefaultBlockPage_repairsBuiltinPagesWithNullColumns(t *testing.T) {
-	// Given 带外改库把内置备选页 content/description 置 NULL——SYS-U2（历史）：
+	// Given 带外改库把内置备选页 content/description 置 NULL——历史修复（历史）：
 	// 自愈 UPDATE 的裸 != 比较对 NULL 不命中（NULL != ? 为 NULL），漂移行永不归位；
-	// 与 :510 默认页历史 历史问题 修复同口径，须 COALESCE 同防。
+	// 与 :510 默认页历史问题 修复同口径，须 COALESCE 同防。
 	initBrandingTestDB(t)
 	dataDir := t.TempDir()
 	if _, err := db.DB.Exec(`UPDATE security_block_pages SET content=NULL, description=NULL WHERE id=9001`); err != nil {

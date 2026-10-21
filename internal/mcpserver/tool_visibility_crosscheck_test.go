@@ -11,7 +11,7 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// ginPath 生产实现在 tool_visibility.go（历史 CI87-06 起可见性按
+// ginPath 生产实现在 tool_visibility.go（历史修复 起可见性按
 // "METHOD /api/v1"+ginPath(spec.path) 匹配 admin 路由集合）；外部测试包经
 // export_test.go 的 GinPathForTest 共享。
 

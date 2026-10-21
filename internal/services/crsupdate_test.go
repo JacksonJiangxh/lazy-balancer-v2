@@ -337,8 +337,8 @@ func countCRSUpdateFailedAudits(t *testing.T) int {
 	return n
 }
 
-// 历史问题 历史问题-2（2026-09-29 裁定口径）：操作审计由 run() 的 defer 每轮单记——
-// fail() 本体零审计（曾内联「仅首败审计」历史问题 I1，与 defer 双记已撤）。
+// 历史问题-2（2026-09-29 裁定口径）：操作审计由 run() 的 defer 每轮单记——
+// fail() 本体零审计（曾内联「仅首败审计」历史问题，与 defer 双记已撤）。
 func TestCRSUpdateFail_auditRecordedByRunDeferPerRun(t *testing.T) {
 	m := newTestCRSManager(t)
 	seedCRSVersionRow(t, "v4.14.0", true)
@@ -362,7 +362,7 @@ func TestCRSUpdateFail_counterUpdateFailureDoesNotReaudit(t *testing.T) {
 	seedCRSVersionRow(t, "v4.14.0", true)
 	// 模拟第 1 次失败已落库（计数=1、已审计）；随后计数 UPDATE 持续失败（RAISE
 	// ABORT 触发器）：审计判定必须用「预读计数+1」=2，不得回退到旧计数 1 导致
-	// 第 2 次失败重复写审计（历史问题 F3）。
+	// 第 2 次失败重复写审计（历史问题）。
 	if _, err := db.DB.Exec("UPDATE security_crs_version SET consecutive_failures=1 WHERE id=1"); err != nil {
 		t.Fatal(err)
 	}
@@ -531,7 +531,7 @@ func TestCRSUpdateRun_usesTaskRunStartedAt(t *testing.T) {
 	}
 }
 
-// SS87-历史问题：StartUpdate 返回前必须已登记取消函数——返回后立刻 CancelRunning
+// 历史问题：StartUpdate 返回前必须已登记取消函数——返回后立刻 CancelRunning
 // （任务引擎 CancelHook／前端连点／自动化脚本）必须命中，不得静默返回 false。
 func TestStartUpdate_registersCancelBeforeReturn(t *testing.T) {
 	// Given 单 P 调度：调用方在 StartUpdate 返回后立刻取消时，旧实现因 runCancel
@@ -575,7 +575,7 @@ func TestStartUpdate_registersCancelBeforeReturn(t *testing.T) {
 	}
 }
 
-// SS87-历史问题 / 历史问题：版本读取区分「行缺失→bundled」与「读失败→错误」。
+// / 历史问题：版本读取区分「行缺失→bundled」与「读失败→错误」。
 func TestReadCurrentCRSVersion_rowMissingFallsBackToBundled(t *testing.T) {
 	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatal(err)
@@ -604,7 +604,7 @@ func TestReadCurrentCRSVersion_readErrorSurfaces(t *testing.T) {
 	}
 }
 
-// SS87-历史问题：读版本行失败时更新必须 fail-visible——旧实现以 bundled 参与
+// 历史问题：读版本行失败时更新必须 fail-visible——旧实现以 bundled 参与
 // 「已是最新」短路，远端 tag 恰等于 bundled 时更新被静默跳过。
 func TestCRSUpdateRun_versionReadFailureIsVisible(t *testing.T) {
 	// Given 版本行不可读（表缺失）+ 远端 tag 恰等于镜像捆绑版本

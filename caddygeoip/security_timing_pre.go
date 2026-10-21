@@ -35,7 +35,7 @@ func (SecurityTimingPre) CaddyModule() caddy.ModuleInfo {
 }
 
 // ServeHTTP 记录预检段耗时（注册表分段键 pre）并交接分段锚点，原样透传下游。
-// 计时读头逻辑收敛于 recordSecurityTiming（PLUG-R1，security_timing.go）。
+// 计时读头逻辑收敛于 recordSecurityTiming（历史修复，security_timing.go）。
 //
 // 分段锚点交接（历史，预检拦耗时口径）：记录 pre 后把起始纳秒头重写为
 // 当前时刻——下游 SecurityTimingEnd 的 end 自此从预检完成后起算（=WAF 段值，

@@ -17,7 +17,7 @@ const securityBlockedMetricName = "security_blocked_total"
 // newSecurityBlockedCounterVec 每次 Provision 新建 CounterVec 并注册——
 // caddy-l4 newProxyMetrics 同模式(l4proxy/metrics.go:54):同 registry 时
 // registerOrExisting 复用已注册实例(不丢数据),跨 reload 新 registry 时
-// 全新注册(归零,与 caddy_http_* 同纪元)——历史问题(第 28.5 轮审计):包级
+// 全新注册(归零,与 caddy_http_* 同纪元)——历史问题(历史审计):包级
 // singleton 跨 reload 不归零,与 caddy_http_* 纪元错位,扣除常态钳 4xx 到 0。
 func newSecurityBlockedCounterVec(reg *prometheus.Registry) *prometheus.CounterVec {
 	return registerOrExisting(reg, prometheus.NewCounterVec(
@@ -61,7 +61,7 @@ func init() {
 //   - 无锁/无共享态——prometheus counter 线程安全,reload 幂等;
 //   - API 兼容面:caddy.Module/caddyhttp.HandlerError 稳定(v2.0 起);
 //     ctx.GetMetricsRegistry() 是 EXPERIMENTAL(Caddy 标注 subject to change)
-//     ——已 nil 守卫(移除则降级为不计数而非崩溃),历史问题(第 28.5 轮审计)。
+//     ——已 nil 守卫(移除则降级为不计数而非崩溃),历史问题(历史审计)。
 type SecurityBlockedCounter struct {
 	// Rule 是所属负载均衡规则的 caddy_id(渲染期静态注入)。
 	Rule string `json:"rule,omitempty"`
@@ -142,13 +142,13 @@ func (h *SecurityBlockedCounter) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	err := next.ServeHTTP(w, r)
 
 	var herr caddyhttp.HandlerError
-	// 历史问题(第 28.5 轮审计):「ID 非空+4xx」误纳非安全 4xx——caddyhttp.Error
+	// 历史问题(历史审计):「ID 非空+4xx」误纳非安全 4xx——caddyhttp.Error
 	// 恒生成 ID(randString 9 字符),proxy 499/request_body 413 也被计入。
 	// 精确判定:len(ID)==16(coraza tx.ID,randomString(16))或 status==429
 	// (限流,caddyhttp.Error 生成 9 字符 ID)——覆盖安全拦截全部,排除
 	// proxy 499/request_body 413/其他 caddyhttp.Error 4xx(全 9 字符)。
 	// 脆弱点:coraza 若改 tx.ID 长度→断;但 v2.x 一直 16,且 coraza 版本由
-	// go.mod pin(v3.8.1)+Dockerfile 构建断言(区间 [v3.8.1,v3.9),PL历史问题)
+	// go.mod pin(v3.8.1)+Dockerfile 构建断言(区间 [v3.8.1,v3.9),历史问题)
 	// 双重控制——可控。
 	isSecurityBlock = err != nil && errors.As(err, &herr) &&
 		herr.StatusCode >= 400 && herr.StatusCode < 500 &&
@@ -171,7 +171,7 @@ func (h *SecurityBlockedCounter) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		}
 	}
 	if isSecurityBlock {
-		// F1(第 28.6 轮审计):历史问题 判定丢失 4xx 约束——coraza 引擎 500
+		// 历史修复(历史审计):历史问题 判定丢失 4xx 约束——coraza 引擎 500
 		// (16 字符 tx.ID)被误计为安全拦截且吃掉一个合法 4xx。恢复 4xx 约束。
 		if h.metrics != nil {
 			h.metrics.WithLabelValues(h.Rule).Inc()

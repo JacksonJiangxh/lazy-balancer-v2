@@ -111,7 +111,7 @@ onMounted(async () => {
       const hadValidSession = authStore.isLoggedIn
       try {
         const result = await authStore.loginWithTicket(loginTicket)
-        // FI-18：重入护栏命中（挂载期为单次调用，防御性判断）——未建立会话时不导航。
+        // 历史修复：重入护栏命中（挂载期为单次调用，防御性判断）——未建立会话时不导航。
         if (!result.skipped) authStore.setCurrentPage('dashboard')
       } catch (error: unknown) {
         if (hadValidSession) await authStore.init()

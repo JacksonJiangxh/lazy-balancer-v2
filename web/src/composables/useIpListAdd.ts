@@ -13,7 +13,7 @@ export interface IpListOption {
   system?: boolean
 }
 
-// F-历史问题（历史）：全仓零外部消费（仅本模块参数类型）——去掉 export
+// 历史问题（历史）：全仓零外部消费（仅本模块参数类型）——去掉 export
 interface AddIpToListOptions {
   /** 动作词（默认「加入」）：确认框标题/文案与成功反馈共用 */
   verb?: string

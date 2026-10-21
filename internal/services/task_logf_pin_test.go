@@ -151,6 +151,36 @@ func TestTaskLogf_CertManualPoll_exceptionRoundsOnly(t *testing.T) {
 	}
 }
 
+// 历史问题-15③：PEM 损坏/解析失败行此前仅应用日志 warn 不计数，巡检摘要零
+// 痕迹。摘要须补「另 N 行解析失败已跳过」（对照续期扫描 skippedNote 口径）；
+// 纯解析失败轮（过期/临期计数为零）同属异常轮，必须留一行而非静默。
+func TestTaskLogf_CertManualPoll_parseFailureCountedInSummary(t *testing.T) {
+	_, database := newClusterTestService(t)
+	newTaskLogDir(t)
+	lastCertServiceMissing.Store(false)
+	SetActiveCertificateService(NewCertificateService())
+	t.Cleanup(func() { SetActiveCertificateService(nil) })
+
+	// Given：一张 PEM 损坏的手动证书（解析必失败）
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source,tls_cert) VALUES ('lb_manual_bad_pem','manual-bad','manual-bad.test','http',8080,1,1,'manual','not-a-valid-pem')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// When：解析失败是行级跳过（非读故障），轮次本身不算失败
+	if err := CertManualCheckOnce(); err != nil {
+		t.Fatalf("解析失败轮 err=%v, want nil", err)
+	}
+
+	// Then：恰一行结论，含解析失败计数
+	logStr := readTaskLog(t, "cert-manual-poll")
+	if got := strings.Count(logStr, "手动证书到期检查"); got != 1 {
+		t.Fatalf("解析失败轮结论行=%d, want 1: %q", got, logStr)
+	}
+	if !strings.Contains(logStr, "另 1 行解析失败已跳过") {
+		t.Fatalf("结论行缺失解析失败计数: %q", logStr)
+	}
+}
+
 // Given v2.0 四类型标准全量注册。
 // When DescribeAll。
 // Then Kind 映射：定时 5（threat/crs/ip2region/crawlerbot-update/auto-backup）、循环 9、
@@ -191,7 +221,7 @@ func TestTaskEngineWire_KindMapping(t *testing.T) {
 	}
 }
 
-// V87-TO-05③：runtimeLogFile 未打开（旋转写入器打开失败）时 log-cleanup
+// 历史修复③：runtimeLogFile 未打开（旋转写入器打开失败）时 log-cleanup
 // 整个 Run 体此前为空——任务监控恒绿却零动作、任务日志零行。必须留「未启用」行。
 func TestTaskLogf_LogCleanupDisabledWhenRuntimeLogFileMissing(t *testing.T) {
 	// runtimeLogFile 为空=旋转写入器打开失败的真实形态；InitTaskEngine 会按
@@ -208,7 +238,7 @@ func TestTaskLogf_LogCleanupDisabledWhenRuntimeLogFileMissing(t *testing.T) {
 	}
 }
 
-// V87-TO-10：失败轮任务日志不得写「清理完成」——task_runs 已落 failed，
+// 历史修复：失败轮任务日志不得写「清理完成」——task_runs 已落 failed，
 // 日志称完成会把排障方向带偏（metrics 库不可用/ctx 取消）。
 func TestTaskLogf_SecurityEventsRetentionFailureSaysFailed(t *testing.T) {
 	newTaskLogDir(t)
@@ -230,7 +260,7 @@ func TestTaskLogf_SecurityEventsRetentionFailureSaysFailed(t *testing.T) {
 	}
 }
 
-// V87-TO-10：孤儿规则指标清理同族。
+// 历史修复：孤儿规则指标清理同族。
 func TestTaskLogf_MetricsOrphanCleanupFailureSaysFailed(t *testing.T) {
 	newTaskLogDir(t)
 	te := newWireTestEngine(t)

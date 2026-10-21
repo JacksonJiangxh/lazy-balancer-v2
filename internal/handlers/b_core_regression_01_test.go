@@ -27,7 +27,7 @@ import (
 
 // 配置时区渲染，但过期/未生效两条 warning 仍用 UTC 原值 Format——配置时区与
 // UTC 跨日时，warning 文案日期与 not_after/not_before 日期相差一天。
-func TestU13_02_parseTLSCertificateWarningsFollowConfiguredTimezone(t *testing.T) {
+func TestParseTLSCertificateWarnings_followConfiguredTimezone(t *testing.T) {
 	previous := services.CurrentLocation()
 	if _, err := services.ConfigureLocation("Asia/Shanghai"); err != nil {
 		t.Fatal(err)
@@ -40,7 +40,7 @@ func TestU13_02_parseTLSCertificateWarningsFollowConfiguredTimezone(t *testing.T
 
 	t.Run("expired", func(t *testing.T) {
 		// NotAfter = Asia/Shanghai 2026-01-01 00:30（UTC 2025-12-31 16:30）
-		certPEM, keyPEM := selfSignedCertForCERT44(t, "u13-02-expired.test",
+		certPEM, keyPEM := selfSignedCertWithExpiry(t, "u13-02-expired.test",
 			time.Date(2025, 12, 30, 0, 0, 0, 0, time.UTC),
 			time.Date(2026, 1, 1, 0, 30, 0, 0, shanghai))
 
@@ -61,7 +61,7 @@ func TestU13_02_parseTLSCertificateWarningsFollowConfiguredTimezone(t *testing.T
 
 	t.Run("not yet valid", func(t *testing.T) {
 		// NotBefore = Asia/Shanghai 2026-12-31 00:30（UTC 2026-12-30 16:30）
-		certPEM, keyPEM := selfSignedCertForCERT44(t, "u13-02-future.test",
+		certPEM, keyPEM := selfSignedCertWithExpiry(t, "u13-02-future.test",
 			time.Date(2026, 12, 31, 0, 30, 0, 0, shanghai),
 			time.Date(2027, 1, 2, 0, 0, 0, 0, time.UTC))
 
@@ -83,7 +83,7 @@ func TestU13_02_parseTLSCertificateWarningsFollowConfiguredTimezone(t *testing.T
 
 // InProgress——续签扫描两查询（expires_at 非空）均不可见，任务永不推进。该
 // 形态无到期日可判，必须按 Retry 重排队。
-func TestU13_03_ResolveEnableCertJobAction_issuedWithoutExpiryRetries(t *testing.T) {
+func TestResolveEnableCertJobAction_issuedWithoutExpiryRetries(t *testing.T) {
 	now := time.Now()
 	if action := ResolveEnableCertJobAction(true, "issued", nil, now, 30); action != EnableCertJobRetry {
 		t.Fatalf("action=%v, want EnableCertJobRetry（issued 且无到期日不可判定，须重排队）", action)
@@ -96,7 +96,7 @@ func TestU13_03_ResolveEnableCertJobAction_issuedWithoutExpiryRetries(t *testing
 }
 
 // 契约噪音。删除字段后，/certificates/parse 响应不含 error 键，类型也无该字段。
-func TestU13_08_CertificateInfoHasNoDeadErrorField(t *testing.T) {
+func TestCertificateInfo_hasNoDeadErrorField(t *testing.T) {
 	if field, ok := reflect.TypeOf(CertificateInfo{}).FieldByName("Error"); ok {
 		t.Fatalf("CertificateInfo.Error 死字段仍在（JSON 键 %q 在包内零赋值点）", field.Tag.Get("json"))
 	}
@@ -130,7 +130,7 @@ func TestU13_08_CertificateInfoHasNoDeadErrorField(t *testing.T) {
 // rulePayloadInput（本校验门消费），要么显式列在 notMirrored（由其他单源校验/
 // 无值域规则承担）；新增字段漏登记即红。归一视图字段也必须真实存在于
 // 两个请求模型中（防改名/拼写漂移）。
-func TestU13_07_rulePayloadInputParityWithModels(t *testing.T) {
+func TestRulePayload_inputParityWithModels(t *testing.T) {
 	notMirrored := map[string]string{
 		"Name":                       "仅 binding:required 非空（持久化字段，无格式规则）",
 		"Description":                "自由文本（持久化字段，无格式规则）",
@@ -191,7 +191,7 @@ func TestU13_07_rulePayloadInputParityWithModels(t *testing.T) {
 }
 
 // 只有 Logf+审计，任务日志无业务结论行——同函数成功/回退分支都有 TaskLogf。
-func TestU13_11_startupGuardWritesTaskLogSummary(t *testing.T) {
+func TestStartupGuard_writesTaskLogSummary(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	fake, loadCount := foreignRoutesFakeAdmin(t, []string{"lb_foreign777"})
 	h.cfg = &config.Config{CaddyAdminURL: fake.URL}
@@ -220,7 +220,7 @@ func TestU13_11_startupGuardWritesTaskLogSummary(t *testing.T) {
 // 完全绕过校验。本门用 AST 扫描 validateRulePayloadBeforeSave 的两个 switch
 // 分支，要求每个 rulePayloadInput 字段在 Create/Update 两分支都被真实赋值
 // （声明→赋值→消费完整链）。
-func TestU04d_validateRulePayloadSwitchesAssignEveryInputField(t *testing.T) {
+func TestValidateRulePayload_switchesAssignEveryInputField(t *testing.T) {
 	source, err := os.ReadFile("handlers.go")
 	if err != nil {
 		t.Fatalf("read handlers.go: %v", err)

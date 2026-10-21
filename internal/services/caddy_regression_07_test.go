@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// 历史修复 F-5: GenerateSingleRuleCaddyConfig 入口协议白名单与 GenerateRouteObject
+// 历史修复: GenerateSingleRuleCaddyConfig 入口协议白名单与 GenerateRouteObject
 // 对齐——非法协议（如混合版本运行时写入的 https 行）硬错误而非静默按 TCP 渲染。
 func TestGenerateSingleRuleCaddyConfig_unsupportedProtocol_returnsError(t *testing.T) {
 	// Given 一条 protocol=https 的规则（正常 http/tcp 行不在此列）

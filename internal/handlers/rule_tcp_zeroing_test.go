@@ -49,7 +49,7 @@ func TestUpdateRule_protocolSwitchToTCPZeroesDNSFields(t *testing.T) {
 	}
 }
 
-// LBH-A-L1（历史 历史问题）：http→tcp 协议切换不清上游 origin_domain——后端
+// 历史修复（历史问题）：http→tcp 协议切换不清上游 origin_domain——后端
 // validateRulePayloadBeforeSave 对 TCP+origin_domain 硬 400，前端 TCP 下该列
 // 不渲染（隐藏字段卡保存）。切换即弃置（与 host_header 同格归零）。
 func TestUpdateRule_protocolSwitchToTCPZeroesOriginDomain(t *testing.T) {
@@ -105,7 +105,7 @@ func TestPathRuleUpstreams_duplicateRejected(t *testing.T) {
 	}
 }
 
-// LBH-A-U2（历史 历史问题）：CreateRule 的 TCP 归一顺位必须先于 TLS 来源/手动
+// 历史修复（历史问题）：CreateRule 的 TCP 归一顺位必须先于 TLS 来源/手动
 // 证书材料校验（与 UpdateRule 同格）——此前 TCP+enable_tls:true+空/bogus
 // tls_source 创建恒 400「启用 TLS 时必须选择证书来源」，同形态更新却归一放行
 // 200，两入口对同一输入响应分叉。
@@ -154,7 +154,7 @@ func TestCreateRule_tcpNormalizationPrecedesTLSValidation(t *testing.T) {
 	}
 }
 
-// LBH-A-U1（历史 历史问题）：TCP 规则创建不得落库 HTTP 专属死配置字段族
+// 历史修复（历史问题）：TCP 规则创建不得落库 HTTP 专属死配置字段族
 // （host_header/health_check_path/enable_compress/compress_types/
 // request_body_max_size_mb/upstream_keepalive_timeout/server_tokens_hidden）——
 // TCP 渲染零消费（buildTCPServer/buildTCPProxyRoute 实证），携带即归一弃置
@@ -186,8 +186,8 @@ func TestCreateRule_tcpDropsHTTPOnlyFieldFamily(t *testing.T) {
 	assertTCPRuleFamilyZeroed(t, "lb_rules 创建行", "name='tcp-family'")
 }
 
-// LBH-A-U1 同族：协议未变的 TCP 编辑同样归一（存量/导入残留的编辑自愈，
-// 与 历史问题 历史问题 的 TLS 归一/历史问题 阶段页归一同格）。
+// 历史修复 同族：协议未变的 TCP 编辑同样归一（存量/导入残留的编辑自愈，
+// 与 历史问题 的 TLS 归一/历史问题 阶段页归一同格）。
 func TestUpdateRule_tcpEditHealsHTTPOnlyFieldFamily(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
 	gin.SetMode(gin.TestMode)
@@ -218,7 +218,7 @@ func TestUpdateRule_tcpEditHealsHTTPOnlyFieldFamily(t *testing.T) {
 	assertTCPRuleFamilyZeroed(t, "lb_rules 编辑自愈", "caddy_id='lb_tcpfam'")
 }
 
-// LBH-A-N1（历史 历史问题）：NTLM 接管态（td=-1，方案 C 库级表达）随
+// 历史修复（历史问题）：NTLM 接管态（td=-1，方案 C 库级表达）随
 // http→tcp 切换命中校验死端——指针合并（rules.go nil=沿用存量）把 -1 带进
 // TCP 值域门（rule_features.go TCP 分支拒负值），400 指向用户从未提交的字段，
 // UI 无自救路径。切换路径负值自愈归零（TCP 语义：0/-1 均为不重试；5s
@@ -264,9 +264,9 @@ func TestUpdateRule_switchToTCPHealsNegativeTryDurationFromNTLMState(t *testing.
 	}
 }
 
-// LBH-A-N1 同族第二面：直改 DB/导入残留的 TCP 行携带负值重试窗口——任意
+// 历史修复 同族第二面：直改 DB/导入残留的 TCP 行携带负值重试窗口——任意
 // 同协议编辑（如改名）同样命中负值门 400。同协议编辑路径负值一并自愈归零
-// （与 LBH-A-U1 死配置自愈同格）；非负值尊重 LB-02 指针合并契约
+// （与 历史修复 死配置自愈同格）；非负值尊重 历史修复 指针合并契约
 // （nil=沿用存量/显式值=尊重输入，rules_lb_fixes_test 钉测）。
 func TestUpdateRule_tcpEditHealsNegativeTryWindowResidue(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
@@ -303,7 +303,7 @@ func TestUpdateRule_tcpEditHealsNegativeTryWindowResidue(t *testing.T) {
 	}
 }
 
-// LBH-A-N1 同族（R-12 收敛）：DuplicateRule 把源行 td/ti 原样喂进
+// 历史修复 同族（历史修复 收敛）：DuplicateRule 把源行 td/ti 原样喂进
 // validateRuleFeatures（rules.go 复制校验）——直改 DB 残留的负值 TCP 源行
 // 复制即 400 死端（与编辑路径同形）；负值不放大到副本，非负窗口原样复制。
 func TestDuplicateRule_tcpCopyHealsNegativeTryWindowResidue(t *testing.T) {
@@ -340,7 +340,7 @@ func TestDuplicateRule_tcpCopyHealsNegativeTryWindowResidue(t *testing.T) {
 	}
 }
 
-// LBH-A-U1 同族：DuplicateRule 不把源 TCP 行的死配置放大到副本（与
+// 历史修复 同族：DuplicateRule 不把源 TCP 行的死配置放大到副本（与
 // CreateRule/UpdateRule 归一同口径，历史问题 归一块的家族补齐）。
 func TestDuplicateRule_tcpCopyDropsHTTPOnlyFieldFamily(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
@@ -371,7 +371,7 @@ func TestDuplicateRule_tcpCopyDropsHTTPOnlyFieldFamily(t *testing.T) {
 	assertTCPRuleFamilyZeroed(t, "副本行", "name='tcpdup（副本）'")
 }
 
-// 历史问题（历史 历史问题）：TCP 归一的 HTTP 专属字段清单补齐 TLSHTTPRedirect/
+// 历史问题（历史）：TCP 归一的 HTTP 专属字段清单补齐 TLSHTTPRedirect/
 // Domain/UpstreamForceHTTP1——单一 tcpDeadFieldReset 清单由 Create/Update/
 // Duplicate 共用（此前 Create 显式携带落库、Update/Duplicate 仅零散归零，
 // 死配置随快照/导出/复制放大）。
@@ -512,7 +512,7 @@ func TestUpdateRule_httpEditDropsTCPOnlyFields(t *testing.T) {
 	}
 }
 
-// LBH79-历史问题.4：HTTP 源行的 TCP-only 残留（tcp_health_check_port/
+// 历史问题：HTTP 源行的 TCP-only 残留（tcp_health_check_port/
 // tcp_proxy_protocol）不得随复制放大——Create/Update 已反向清零，复制
 // 路径此前只处理 TCP 源行。
 func TestDuplicateRule_httpCopyClearsTCPOnlyFields(t *testing.T) {
@@ -548,7 +548,7 @@ func TestDuplicateRule_httpCopyClearsTCPOnlyFields(t *testing.T) {
 	}
 }
 
-// LBH79-历史问题.1/04.2/04.3：同协议 TCP 编辑必须自愈健康检查域名、上游回源
+// 历史问题：同协议 TCP 编辑必须自愈健康检查域名、上游回源
 // 域名与死证书/私钥材料（此前只在协议切换分支清理，或 SQL 写入条件不命中）。
 func TestUpdateRule_tcpEditClearsHTTPOnlyAndTLSResidue(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)

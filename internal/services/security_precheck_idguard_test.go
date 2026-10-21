@@ -4,7 +4,7 @@ package services
 // 800000+policyID 落入 CRS 保留段（900000+）时必须跳过该策略链并告警——
 // 危害是事件归因/分桶错位（securityEventsPolicyContainsRule 的 800xxx case
 // 与 stage-stats 分桶都不再命中），而非编译失败（预检是独立 coraza 配置，
-// 段内 id 彼此唯一，无同 id 冲突）。测试仍以引擎编译作回归面（R-10）。
+// 段内 id 彼此唯一，无同 id 冲突）。测试仍以引擎编译作回归面（历史修复）。
 
 import (
 	"encoding/json"
@@ -34,7 +34,7 @@ func TestEngineGate_precheckGeoipPolicyIDGuard(t *testing.T) {
 	compileForEngineGate(t, dOK)
 }
 
-// ---- 历史 A 域：RG-SEC-PRECHECK-ID-ENCODE / RG-SEC-PRECHECK-SCORE ----
+// ---- 历史 A 域：历史修复 ----
 
 func precheckRuleIDList(directives string) []int {
 	var out []int

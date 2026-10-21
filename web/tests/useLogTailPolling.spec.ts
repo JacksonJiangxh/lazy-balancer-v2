@@ -1,4 +1,4 @@
-// 日志尾部轮询 composable 行为验收（A85WA-历史问题 收敛 Rules/CertJobs/TaskMonitor/
+// 日志尾部轮询 composable 行为验收（历史修复 收敛 Rules/CertJobs/TaskMonitor/
 // BasicSettings/CaddyGlobalSettings 五份同构实现）：写回+滚底、null 跳过、
 // 会话序号作废、单飞 loading 门、错误分流、后台标签页暂停、定时器生命周期。
 //
@@ -128,7 +128,7 @@ test('后台标签页暂停：document.hidden 时轮次跳过（node 无 documen
 })
 
 test('start 装定时器并立即刷新；stop 冻结后续轮次', async () => {
-  // 审计 87 WEBT-08①：原实现用真实时钟 sleep(75)/sleep(60) 断言 20ms 定时器——
+  // 历史修复①：原实现用真实时钟 sleep(75)/sleep(60) 断言 20ms 定时器——
   // 慢机/CI 负载下可假红。改为 node:test mock timers（只替换 setInterval，
   // setTimeout 仍真实，用于等待异步 refresh 落地），时间推进即断言。
   let calls = 0

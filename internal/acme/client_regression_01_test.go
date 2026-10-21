@@ -29,7 +29,7 @@ func TestRemoveStaleAccountKeyPair_toleratesAlreadyRemovedMetadata(t *testing.T)
 	}
 }
 
-// CERT42-4 回归形状：key 缺失元数据在（既有容忍口径保持）与双文件齐全
+// 历史修复 回归形状：key 缺失元数据在（既有容忍口径保持）与双文件齐全
 // （正常清理）两形态都不报错且全部删除。
 func TestRemoveStaleAccountKeyPair_removesPresentFiles(t *testing.T) {
 	t.Run("metadata present, key already gone", func(t *testing.T) {

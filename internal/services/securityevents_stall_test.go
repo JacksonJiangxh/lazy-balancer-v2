@@ -38,7 +38,7 @@ func stallFixtureBytes(doc2, doc3 string) []byte {
 
 func stallSetup(t *testing.T) (logPath, offsetPath string) {
 	t.Helper()
-	// SSA-87-10（历史）：保存/还原全局库指针并 Close——裸 Initialize
+	// 历史修复（历史）：保存/还原全局库指针并 Close——裸 Initialize
 	// 会覆盖包级 DB/MetricsDB/AuditDB 且不关旧句柄，后续用例可能静默跑到已删除
 	// 临时目录并用陈旧库（顺序依赖/假绿）。
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB

@@ -11,7 +11,7 @@ import (
 )
 
 // TestPolicyWriteTx_serializableIsolationBlocksConcurrentRuleDelete 串行模拟
-// 历史修复 三-3 交错（历史修复 I1 的镜像方向）：策略写入事务的引用校验 SELECT 之后、
+// 历史修复 三-3 交错（历史修复 的镜像方向）：策略写入事务的引用校验 SELECT 之后、
 // INSERT 之前，并发的规则删除不得提交。BEGIN IMMEDIATE 下校验即持写锁，删除
 // 只能等写入事务提交后执行——校验与写入之间不存在插队窗口，写入的策略绝不会
 // 引用「校验与写入之间」被删的规则（悬空引用）。

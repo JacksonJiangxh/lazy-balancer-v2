@@ -21,7 +21,7 @@ func initBrandingTestDB(t *testing.T) {
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
-		// B1-07（历史）：同步复位 currentDB，后台循环不得持有已关闭测试库
+		// 历史修复（历史）：同步复位 currentDB，后台循环不得持有已关闭测试库
 		db.SetDB(oldDB)
 	})
 }
@@ -54,7 +54,7 @@ func TestRenderDefaultBlockPage_substitutes_app_name_and_footer_text(t *testing.
 	}
 }
 
-// 2026-09-25 用户裁定（推翻 D5 KNOWN-GAP-1 全宽裁定）：默认拦截页改浅色精美
+// 2026-09-25 用户裁定（推翻既往历史修复的全宽裁定）：默认拦截页改浅色精美
 // 风，内容卡片限宽居中、不占满页面宽度。锁定限宽 token 与精美化形状
 // （SVG 徽章 + 403 胶囊），防止回退到全宽或纯文字布局。
 func TestRenderDefaultBlockPage_card_width_capped_and_centered(t *testing.T) {
@@ -310,7 +310,7 @@ func TestLoadBrandingConfig_memorySnapshotDetectsFileChange(t *testing.T) {
 	}
 
 	// 删除(运行期瞬态窗口):保旧值(2026-09-11 裁定——重启重建负责重置,
-	// S历史问题;半截写/删除同属「文件暂不可用」,不闪回默认)。
+	// 历史问题;半截写/删除同属「文件暂不可用」,不闪回默认)。
 	os.Remove(path)
 	if cfg := loadBrandingConfig(dir); cfg.AppName != "Beta" {
 		t.Fatalf("after remove: app_name=%q, want keep-last-good Beta", cfg.AppName)

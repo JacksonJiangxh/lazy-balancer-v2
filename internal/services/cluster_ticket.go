@@ -29,7 +29,7 @@ var (
 	ErrLoginTicketUserUnavailable = errors.New("登录票据用户不存在或已禁用")
 )
 
-// clusterTicketVerify 是集群一次性票据的验签结果分类（S历史问题-04）：登录票据
+// clusterTicketVerify 是集群一次性票据的验签结果分类（历史问题-04）：登录票据
 // 与服务控制票据共用同一 HMAC/base64 实现，调用方只按分类映射各自哨兵
 // （两者错误文案不同，不能合并成同一 error）。
 type clusterTicketVerify uint8
@@ -77,7 +77,7 @@ func verifyClusterTicket(ticket string, key []byte) ([]byte, clusterTicketVerify
 
 // consumeClusterTicketJTI 在调用方事务内一次性消费票据（清理过期记录 +
 // jti 去重插入）；返回 false 表示重放。事务提交由调用方负责，DB 错误不消耗
-// 票据——登录票据与服务控制票据的唯一消费实现（S历史问题-04）。
+// 票据——登录票据与服务控制票据的唯一消费实现（历史问题-04）。
 func consumeClusterTicketJTI(ctx context.Context, tx *sql.Tx, jti string, now, expiresAt time.Time) (bool, error) {
 	if _, err := tx.ExecContext(ctx, "DELETE FROM used_login_tickets WHERE expires_at<=?", now); err != nil {
 		return false, err
@@ -107,7 +107,7 @@ func (s *ClusterService) GenerateLoginTicket(ctx context.Context, claims models.
 		}
 		return models.ClusterLoginTicketResponse{}, fmt.Errorf("读取登录目标节点: %w", err)
 	}
-	// M12：在线判定改动态口径（与 Nodes()/ComputeNodeStatus 一致）——nodes.status
+	// 历史修复：在线判定改动态口径（与 Nodes()/ComputeNodeStatus 一致）——nodes.status
 	// 只在注册/上报时写入、从不回写 'offline'，按陈旧 status 列判定会把已停止
 	// 上报的从节点仍当作在线放行签发登录票据。sync_interval 同款读取（含脏值
 	// clamp，由 ComputeNodeStatus 内部归一）。
@@ -118,7 +118,7 @@ func (s *ClusterService) GenerateLoginTicket(ctx context.Context, claims models.
 	if !approved || keyHash == "" {
 		return models.ClusterLoginTicketResponse{}, ErrNodeNotFound
 	}
-	// 历史问题（RG-CLUSTER-TICKET-ERROR）：已批准但从未上报/已离线与「节点不存在
+	// 历史问题（历史修复）：已批准但从未上报/已离线与「节点不存在
 	// 或未审批」是两类问题——前者 handler 映射 409 + 「确认从节点在线后重试」，
 	// 后者维持 404。keyHash 为空（从未取得集群令牌）仍按不存在处理。
 	if ComputeNodeStatus(approved, lastSeen.Time, syncInterval, now) != "online" {
@@ -145,7 +145,7 @@ func (s *ClusterService) GenerateLoginTicket(ctx context.Context, claims models.
 }
 
 // 历史问题（历史裁定·设计声明）：票据登录刻意不检查从节点本地
-// login_locked_until——该列是从节点自身密码登录端点的暴破防护记账（SC-4，
+// login_locked_until——该列是从节点自身密码登录端点的暴破防护记账（历史修复，
 // 本地写入、不随快照同步），而本路径不含任何口令猜测面：票据由主节点在
 // 完整认证（本地用户强制 MFA 步进验证/OIDC 会话经 IdP 二因子）后签发，
 // 票据本身即主端 MFA 事实；一次性消费（jti 入 used_login_tickets）+90s

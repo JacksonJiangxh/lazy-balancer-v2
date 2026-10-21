@@ -22,7 +22,7 @@ var crsHTTPClient = &http.Client{Timeout: 30 * time.Second}
 var crsDownloadClient = &http.Client{}
 
 // ruleSetDownloadSizeCap 是 CRS/ip2region 下载的最大字节数（2GB）：代理在超时
-// 窗口内可无限流式灌入，无界 io.Copy 会写爆数据卷 staging 目录（历史问题 A）。
+// 窗口内可无限流式灌入，无界 io.Copy 会写爆数据卷 staging 目录（历史问题）。
 const ruleSetDownloadSizeCap = int64(2 << 30)
 
 // downloadProgressFunc 是下载进度回调：written 为已落盘字节数，total 为预期总
@@ -30,8 +30,8 @@ const ruleSetDownloadSizeCap = int64(2 << 30)
 // 信号，随后由计数 reader 在流式拷贝中持续回调（历史问题）。
 type downloadProgressFunc func(written, total int64)
 
-// writeRuleSetDownload 将响应体限界写入目标文件：Content-Length 超上限先拒绝
-// 落盘，流式拷贝超上限即报错中止（历史问题 A）。progress 非 nil 时先发出 (0, total)
+// writeRuleSetDownload 将响应体限界写入目标文件：历史修复 超上限先拒绝
+// 落盘，流式拷贝超上限即报错中止（历史问题）。progress 非 nil 时先发出 (0, total)
 // 开始信号，再经计数 reader 持续上报进度（历史问题）。
 func writeRuleSetDownload(out *os.File, resp *http.Response, cap int64, progress downloadProgressFunc) error {
 	if resp.ContentLength > cap {
@@ -74,7 +74,7 @@ func (r *downloadProgressReader) Read(p []byte) (int, error) {
 }
 
 // newDownloadProgressLogger 返回节流进度闭包（历史问题）：首次回调（下载函数的
-// (0, total) 开始信号）写「开始下载」行，携带完整来源 URL，Content-Length
+// (0, total) 开始信号）写「开始下载」行，携带完整来源 URL，历史修复
 // 已知时附预计大小；此后 total 已知按每 10% 阈值、未知按每 5MB 写一条「下载
 // 进度」行。logLine 由调用方接到各自的更新日志 writer。
 func newDownloadProgressLogger(sourceURL string, logLine func(message string)) downloadProgressFunc {
@@ -202,7 +202,7 @@ func crsTarballSourceURL(tag string) string {
 	return ghProxied(crsTarballBaselineKey(tag))
 }
 
-// crsTarballBaselineKey 是完整性基线的键(GEO25-3,历史):裸 GitHub
+// crsTarballBaselineKey 是完整性基线的键(历史修复,历史):裸 GitHub
 // URL 不含代理前缀——代理是传输层(白名单可切换),内容校验应钉源站;切换
 // 代理不应另立基线(同一上游内容经不同代理下载,SHA256 不变)。
 func crsTarballBaselineKey(tag string) string {
@@ -319,7 +319,7 @@ func fetchGitHubLatestTagViaProxy(ctx context.Context, repoSlug string) (string,
 	}
 	if m := ghLatestTagInBodyRegexp.FindSubmatch(body); m != nil {
 		// 与 Location/API 两条漏斗同口径校验形状；正则可捕获换行等控制字符，
-		// 不校验会污染任务日志/版本 message/审计详情（历史 历史问题-1）。
+		// 不校验会污染任务日志/版本 message/审计详情（历史问题-1）。
 		tag := string(m[1])
 		if err := validateReleaseTag(tag); err != nil {
 			return "", err
@@ -373,7 +373,7 @@ func parseGitHubTagFromLocation(location string) (string, error) {
 
 // gitHubAPIToken 读取可选 GITHUB_TOKEN（global_config.github_token，
 // 2026-09-25 用户裁定）：未认证 GitHub API 限流 60/h/IP（共享出口 IP 常被打满
-// 致自动更新连日 403，历史 历史问题），令牌提升至 5000/h。仅用于
+// 致自动更新连日 403，历史问题），令牌提升至 5000/h。仅用于
 // api.github.com 直连——绝不随请求发往第三方加速代理（防泄漏）。
 func gitHubAPIToken() string {
 	if db.DB == nil {
@@ -381,7 +381,7 @@ func gitHubAPIToken() string {
 	}
 	var token string
 	if err := db.DB.QueryRow(`SELECT COALESCE(github_token,'') FROM global_config WHERE id=1`).Scan(&token); err != nil {
-		// SEC-历史问题（历史）：非 ErrNoRows 读库失败记 warn 留痕（对齐
+		// 历史问题（历史）：非 ErrNoRows 读库失败记 warn 留痕（对齐
 		// getGitHubProxyURL 口径）——静默降级会让连日 403 限流排障不可见。
 		if !errors.Is(err, sql.ErrNoRows) {
 			Logf("warn", "读取 GitHub API 令牌失败，按无令牌降级（未认证限流 60/h）: %v", err)
@@ -409,7 +409,7 @@ func fetchGitHubLatestTagFromAPI(ctx context.Context, client *http.Client, apiUR
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		// 403 = GitHub API 未认证限流（60 次/小时/IP），401 = 令牌失效/作废——
-		// 同属认证面失败（历史 历史问题，用户裁定），与 5xx 传输类故障一并经
+		// 同属认证面失败（历史问题，用户裁定），与 5xx 传输类故障一并经
 		// 代理 releases/latest 页面回退；其余 4xx 不重试。
 		return "", fmt.Errorf("GitHub 返回 %d", resp.StatusCode),
 			resp.StatusCode >= http.StatusInternalServerError || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized

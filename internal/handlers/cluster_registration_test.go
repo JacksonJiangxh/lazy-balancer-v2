@@ -75,7 +75,7 @@ func TestRegisterClusterNode_invalid_token_audit_detail_is_generic(t *testing.T)
 	// When
 	h.RegisterClusterNode(ctx)
 
-	// Then：401 且审计详情不含攻击者输入（历史问题/8）
+	// Then：401 且审计详情不含攻击者输入（历史问题）
 	if recorder.Code != http.StatusUnauthorized {
 		t.Fatalf("status=%d body=%s, want 401", recorder.Code, recorder.Body.String())
 	}
@@ -94,7 +94,7 @@ func TestRegisterClusterNode_invalid_token_audit_detail_is_generic(t *testing.T)
 	}
 }
 
-// （SYS-R5，历史：自 apikeys_current_test.go 迁回——本族为集群注册校验
+// （历史修复，历史：自 apikeys_current_test.go 迁回——本族为集群注册校验
 // 主题，此前仅因共用 newBackupTestHandlers 夹具寄居于 API Key 文件。）
 func TestRegisterClusterNodeRejectsInvalidAddressAndPort(t *testing.T) {
 	h := newBackupTestHandlers(t)

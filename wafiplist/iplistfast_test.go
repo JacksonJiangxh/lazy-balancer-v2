@@ -278,7 +278,7 @@ func TestLoadAndResolvePrefixes_contract(t *testing.T) {
 		t.Fatalf("fresh=%v, want 2 条", fresh)
 	}
 
-	// 运行期形态 = 归一（白名单）+ 热路径入口（U80 E-CM-01：原 ResolvePrefixes
+	// 运行期形态 = 归一（白名单）+ 热路径入口（历史修复：原 ResolvePrefixes
 	// 包装无生产调用方已删除，测试直用生产同款两步组合）。
 	cleaned, err := NormalizeAllowedPath(path)
 	if err != nil {

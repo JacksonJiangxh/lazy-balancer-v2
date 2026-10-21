@@ -3,7 +3,7 @@ package services
 // 始终发射收敛钉测（2026-10-15 用户裁定）：ipListRuleOperand 空名单投影空
 // 文件恒发射 @ipListFast（空集=匹配器永不命中=与无规则语义等价），上层
 // 「全空则不发该 SecRule」的内容门控对发射面 flag 为真实 opt-in 的热路径
-// 可变名单随之一并收敛（R-12 同族扫描清单）——空↔非空降为纯内容变化全走
+// 可变名单随之一并收敛（历史修复 同族扫描清单）——空↔非空降为纯内容变化全走
 // 投影热路径。收敛范围实证边界：
 //   · deny·绕过 ACL：ip_acl_enabled 表默认 0，flag 为刻意 opt-in → 收敛；
 //   · stage0 保留检测：trust_detection 为刻意 opt-in → 收敛（id:12）；
@@ -25,7 +25,7 @@ import (
 	"lazy-balancer-v2/internal/models"
 )
 
-// R-10 引擎编译门禁（RED 先行）：始终发射收敛引入的新形状=「@ipListFast 指
+// 历史修复 引擎编译门禁（RED 先行）：始终发射收敛引入的新形状=「@ipListFast 指
 // 向空投影文件」的 SecRule。coraza 算子构建期新鲜加载该文件——当前实现拒绝
 // 空文件（名单为空 error）→ 本测试 RED；wafiplist 收敛后引擎必须接受。
 // 字符串形状断言（上方各钉测）不构成行为验证，本门禁为验证终点。
@@ -38,7 +38,7 @@ func TestEngineGate_ipListFastEmptyFileOperatorAccepted(t *testing.T) {
 	compileForEngineGate(t, directives)
 }
 
-// R-10 引擎编译门禁（真实渲染产物）：空名单恒发射的全部新形状逐字送 coraza
+// 历史修复 引擎编译门禁（真实渲染产物）：空名单恒发射的全部新形状逐字送 coraza
 // 编译——策略引擎（空 deny ACL/空信任/stage0 空 id:12）与预检合并段（空并集）。
 func TestEngineGate_alwaysEmitRenderedShapes(t *testing.T) {
 	t.Run("engine-empty-deny-acl", func(t *testing.T) {

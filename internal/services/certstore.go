@@ -435,8 +435,8 @@ func MaterializeAllCertsFromDB() {
 				continue
 			}
 			// 同 rule_id 多行只取首个**适用**行（ORDER BY updated_at DESC, id DESC）。
-			// SV历史问题（R-12 同族收敛，对齐 certificates.go reconcile 历史
-			// D2-历史问题）：必须先判适用性再标记 seen——先 seen 后适用性会让最新
+			// 历史问题（历史修复 同族收敛，对齐 certificates.go reconcile 历史
+			// 历史问题）：必须先判适用性再标记 seen——先 seen 后适用性会让最新
 			// 旧域行短路较旧的适用行，整条规则被跳过、证书文件不物化。
 			if seenRules[ruleID] {
 				continue
@@ -467,7 +467,7 @@ func MaterializeAllCertsFromDB() {
 }
 
 // materializeCertPair 把库内证书对物化到磁盘，返回是否真正发生了写入。
-// SV历史问题：内容与权限已一致时零写（返回 changed=false）——调用方的恢复计数
+// 历史问题：内容与权限已一致时零写（返回 changed=false）——调用方的恢复计数
 // 与审计/任务日志必须只统计 changed，否则每次启动都报「恢复 N 个」，稀释真正
 // 的恢复事件（运维无法区分「真恢复」与「本来就在」）。
 func materializeCertPair(ruleID, certPEM, keyPEM string) (bool, error) {
@@ -485,7 +485,7 @@ func materializeCertPair(ruleID, certPEM, keyPEM string) (bool, error) {
 		// 契约)——私钥被 chmod 0644 后启动路径此前不修复,直到下次 apply。
 		if certInfo, serr := os.Stat(certPath); serr == nil && certInfo.Mode().Perm() == 0644 {
 			if keyInfo, kerr := os.Stat(keyPath); kerr == nil && keyInfo.Mode().Perm() == 0600 {
-				// CERT-历史问题（历史）：删除对磁盘字节的重复 X509KeyPair 解析——
+				// 历史问题（历史）：删除对磁盘字节的重复 X509KeyPair 解析——
 				// :467 的 bytes.Equal 已证明磁盘字节与 :458 刚验证通过的库内
 				// 字节完全相同，二次解析不可能产生不同结果。
 				return false, nil

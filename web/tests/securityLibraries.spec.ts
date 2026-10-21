@@ -1,6 +1,6 @@
-// 规则库展示单源验收（历史问题-F1/F2）：
-//   F1 IP 地理库「未安装」不得再显示「已最新/正常」——状态/健康标签显式表达
-//   F2 SecurityRules 与 SecurityOverview 的聚合/状态映射单源，空源列表两端同结论
+// 规则库展示单源验收（历史问题）：
+//   历史修复 IP 地理库「未安装」不得再显示「已最新/正常」——状态/健康标签显式表达
+//   历史修复 SecurityRules 与 SecurityOverview 的聚合/状态映射单源，空源列表两端同结论
 //
 // 运行：cd web && npm test
 
@@ -49,7 +49,7 @@ test('多源聚合：状态优先级 更新中>失败>成功>未更新', () => {
 })
 
 test('多源聚合：关闭源（update_enabled=false）→ disabled，不沿用历史失败/排程', () => {
-  // 审计 87 WEBT-08②：disabled 分支与 libraryStatusTagType('disabled') 此前无覆盖。
+  // 历史修复②：disabled 分支与 libraryStatusTagType('disabled') 此前无覆盖。
   const base = { version: '2026.10.01', update_status: 'failed', entry_count: 3, last_checked: '2026-10-01', next_update: '2026-11-01' }
   const summary = summarizeLibrarySources([{ ...base, update_enabled: false }])
   assert.equal(summary.status, 'disabled', '全部源已关闭时不得沿用关闭前的 failed')
@@ -115,7 +115,7 @@ test('多源库健康标签：未配置源不再显示正常', () => {
   )
 })
 
-test('健康标签加载三态：首次响应落地前显示「加载中」，不得冒充「正常」（A85WA-历史问题）', () => {
+test('健康标签加载三态：首次响应落地前显示「加载中」，不得冒充「正常」（历史修复）', () => {
   // 首屏窗口：初值 available:true/status:'' 不代表已确认正常
   assert.deepEqual(
     libraryHealthTag('CRS 规则库', { loadError: false, available: true, status: '', loaded: false }),
@@ -138,7 +138,7 @@ test('健康标签加载三态：首次响应落地前显示「加载中」，�
 
 test('单库健康标签：持久 update_status 的失败/进行中/关闭态不得伪装为正常（历史问题-01）', () => {
   // 后端 update_status 可为 failed（更新失败落库）；同卡状态列已据此显示「更新失败」，
-  // 卡头此前一律绿「正常」——自相矛盾（历史问题-F1 同族）。
+  // 卡头此前一律绿「正常」——自相矛盾（历史问题 同族）。
   assert.deepEqual(
     libraryHealthTag('CRS 规则库', { loadError: false, available: true, status: 'failed' }),
     { label: 'CRS 规则库 · 更新失败', type: 'danger' },
@@ -174,7 +174,7 @@ test('单库健康标签：持久 update_status 的失败/进行中/关闭态不
   assert.equal(unknown.type, 'danger')
 })
 
-test('W87-02：CRS 数量列是规则条数，不是文件数', () => {
+test('CRS 数量列是规则条数，不是文件数', () => {
   assert.equal(crsRuleCountLabel(832), '832 条规则')
   assert.equal(crsRuleCountLabel(1234), '1,234 条规则')
   // 缺失/0 不冒充「0 条规则已就绪」

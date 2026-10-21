@@ -74,7 +74,7 @@ var threatRollupRewindPending atomic.Int64
 
 var errThreatRollupRestart = errors.New("threat rollup restart after concurrent rewind")
 
-// threatScreenNow 时钟缝（历史 历史问题：可控时间轴验证「上一分钟在完整后
+// threatScreenNow 时钟缝（历史问题：可控时间轴验证「上一分钟在完整后
 // 至少终固一次」——迟到写入必须被下一次固化覆盖）。
 var threatScreenNow = func() time.Time { return time.Now().UTC() }
 
@@ -92,7 +92,7 @@ const (
 	threatRollupMaxBatchesPerCall = 25
 	// threatRollupRepairMinutes 迟到事件回填窗口（≥摄取停顿 + 一轮 warmer）。
 	threatRollupRepairMinutes = 10
-	// threatRollupTargetReadyKey 目标维度 rollup 就绪标记（历史 历史问题）：
+	// threatRollupTargetReadyKey 目标维度 rollup 就绪标记（历史）：
 	// 升级后缺失 → 强制重置覆盖区间重固——否则既有 coverage 宣称已覆盖，
 	// 历史窗口的目标计数永久缺失（top_targets 与其余卡片窗口分裂）。
 	threatRollupTargetReadyKey = "threat_rollup_target_ready"
@@ -107,13 +107,13 @@ const (
 	// 递增 threatRollupClassifierVersion，代际不一致按空覆盖重固。
 	threatRollupClassifierVersionKey = "threat_rollup_classifier_version"
 	threatRollupClassifierVersion    = "2"
-	// threatRollupRebuildFromKey 未完成的全量重建意图起点（A83A-历史问题-01）：
+	// threatRollupRebuildFromKey 未完成的全量重建意图起点（历史问题-01）：
 	// 目标维度就绪标记缺失 / GeoIP 代际变化的触发窗口起点。意图存在期间每次
 	// 固化都按 fullRebuild 处理并把回填下界扩到该起点，覆盖底端推进到起点后
-	// 删除——修复「单次调用最多 23h，其余分钟的增量路径无新事件即 历史修复，
+	// 删除——修复「单次调用最多 23h，其余分钟的增量路径无新事件即 no-op，
 	// 目标维度/归属地永不补算、就绪标记却已写入」的自愈中断。
 	threatRollupRebuildFromKey = "threat_rollup_rebuild_from"
-	// threatRollupStaleAfter 固化陈旧阈值（历史 历史问题）：warmer 每 60s
+	// threatRollupStaleAfter 固化陈旧阈值（历史）：warmer 每 60s
 	// 一轮，超过 3 分钟无成功固化视为陈旧——请求路径改为同步固化，持续失败
 	// 以 500 显式暴露，不得把旧值伪装成最新 200。
 	threatRollupStaleAfter = 3 * time.Minute
@@ -191,9 +191,9 @@ func applyPendingThreatRollupRewindInLock() {
 
 // ThreatRollupRewindTo 摄取提交后回退 rollup 覆盖水位（历史问题-1，历史）。
 // minute=本批实际插入的最旧事件分钟（UTC）。若该分钟落在已覆盖区间内（停机/
-// 升级积压、轮转补采），把 last_fixed 回退到 历史修复——下一次 ensureThreatRollup
+// 升级积压、轮转补采），把 last_fixed 回退到 minute-1——下一次 ensureThreatRollup
 // 从该分钟起重固到窗口末端（幂等）。
-// 历史问题-历史问题：不得阻塞摄取提交——warmer 批次期间 TryLock 失败时仅排队，
+// 历史问题：不得阻塞摄取提交——warmer 批次期间 TryLock 失败时仅排队，
 // 由 ensure 的批次间隙/下一次 warmer 合并执行；窗口外目标钳制到展示下界。
 func ThreatRollupRewindTo(minute time.Time) {
 	if minute.IsZero() || db.MetricsDB == nil {
@@ -360,9 +360,9 @@ func ensureThreatRollupWithYields(hours int) error {
 		coveredFrom = dTo.Add(time.Minute)
 		lastFixed = dTo
 	}
-	// A83A-历史问题-01（历史）：重建意图跨调用持久化。旧实现只在触发
+	// 历史问题-01（历史）：重建意图跨调用持久化。旧实现只在触发
 	// 那一轮把 rebuildAll 置真——单次最多回填 23h（批数上限），宽窗口其余
-	// 分钟的增量路径在「无新事件」时直接 历史修复，目标维度/归属地永不补算，
+	// 分钟的增量路径在「无新事件」时直接 no-op，目标维度/归属地永不补算，
 	// 而目标就绪标记已在首轮写入（后续调用 rebuildAll=false），自愈中断且
 	// backfill_incomplete 不再披露。持久化起点并据此扩展回填下界，使后续
 	// 任意窗口的调用都继续全量重建，直到覆盖底端到达意图起点。
@@ -532,7 +532,7 @@ func ensureThreatRollupWithYields(hours int) error {
 			return err
 		}
 	}
-	// A83A-历史问题-01：覆盖底端已推进到持久化重建起点——意图窗口内的旧侧分钟
+	// 历史问题-01：覆盖底端已推进到持久化重建起点——意图窗口内的旧侧分钟
 	// （以及本轮新侧/最新段）均已按全量重建固化，清除意图标记，恢复正常增量
 	// 语义。批数用尽未到达时保留标记，后续调用继续全量重建。
 	if rebuildAll && !coveredFrom.After(rebuildFrom) {
@@ -563,7 +563,7 @@ var (
 )
 
 // threatRollupRequestedHours 最近请求过的最大窗口（小时）：宽窗口请求把
-// 需求告知 warmer，后台每轮按 max(7d, 需求) 扩窗回填（历史 历史问题）。
+// 需求告知 warmer，后台每轮按 max(7d, 需求) 扩窗回填（历史）。
 // 需求带**有界有效期**——大屏固定 24h 消费，hours 参数仅为后续扩展
 // 保留；一次 30d 请求若永久生效，warmer 每分钟都按 30d 回填，后台成本被
 // 单次请求永久抬升。超过 threatRollupRequestedHoursTTL 未再请求即复位。
@@ -670,7 +670,7 @@ func StartThreatRollupWarmer(ctx context.Context) {
 		run := func() {
 			// 启动即预固化 7 天（UI 最大窗口），赶在保留期/行帽裁剪之前；
 			// 只预热 24h 会让升级后 24h–7d 区间在裁剪后永久少计
-			// （历史 历史问题-01）。单次调用按 25 批有界推进，后续轮次续做。
+			// （历史问题-01）。单次调用按 25 批有界推进，后续轮次续做。
 			hours := threatRollupRewindWindowHours
 			if req := threatRollupRequestedHoursLimit(); req > hours {
 				hours = req
@@ -719,7 +719,7 @@ var queryThreatRecentBlocked = func(sinceMinute string) (int, error) {
 }
 
 // threatRollupEventHighwaterPrefix 分钟高水位键前缀——与保留清理共用单一
-// 事实源（A83A-历史问题：写入/删除两份硬编码曾漂移为「只写不删」）。
+// 事实源（历史问题：写入/删除两份硬编码曾漂移为「只写不删」）。
 const threatRollupEventHighwaterPrefix = services.ThreatRollupEventHighwaterPrefix
 
 func loadThreatRollupEventHighwater(tx *sql.Tx, minute string) (int64, error) {
@@ -830,7 +830,7 @@ func threatFixMinuteWithMode(tx *sql.Tx, m time.Time, fullRebuild bool) error {
 		country, province := threatLocationParts(enrichIPLocation(ip))
 		// top_rules 维度优先 rule_triggered（真正的 WAF/CRS/自定义规则 ID），
 		// 无归属时才回退负载规则名；混用两者会让「TOP 命中规则」名不副实
-		// （历史 历史问题-03）。
+		// （历史问题-03）。
 		ruleKey := ruleTriggered
 		if ruleKey == "" {
 			ruleKey = ruleName
@@ -876,7 +876,7 @@ func threatFixMinuteWithMode(tx *sql.Tx, m time.Time, fullRebuild bool) error {
 	if _, err := tx.Exec(`DELETE FROM security_event_rollup WHERE minute = ?`, minuteStr); err != nil {
 		return err
 	}
-	// 历史 历史问题：目标维度同批重固（rollup 主键无法承载 rule_caddy_id）。
+	// 历史问题：目标维度同批重固（rollup 主键无法承载 rule_caddy_id）。
 	if _, err := tx.Exec(`DELETE FROM security_event_target_rollup WHERE minute = ?`, minuteStr); err != nil {
 		return err
 	}
@@ -926,8 +926,8 @@ func threatLocationParts(location string) (string, string) {
 	return country, province
 }
 
-// trafficCountry/trafficSnapshot Caddy admin /lb/历史修复 响应形状
-// （caddygeoip 历史修复 原子计数器，attack/normal 双桶累计）。
+// trafficCountry/trafficSnapshot Caddy admin /lb/traffic-stats 响应形状
+// （caddygeoip per-country 原子计数器，attack/normal 双桶累计）。
 type trafficCountry struct {
 	Attack uint64 `json:"attack"`
 	Normal uint64 `json:"normal"`
@@ -944,7 +944,7 @@ func threatTrafficEmptyDegrade() gin.H {
 	return gin.H{"countries": map[string]trafficCountry{}, "available": false, "sample_n": 1}
 }
 
-// ControlThreatScreenCollector POST/DELETE /security/overview/历史修复/collector
+// ControlThreatScreenCollector POST/DELETE /security/overview/threat-screen/collector
 // 代理 Caddy admin 的流量采集租约：大屏打开时申请/续租，关闭时释放；
 // 插件在无租约时跳过所有流量采集热路径（安全日志不受影响）。
 func (h *Handlers) ControlThreatScreenCollector(c *gin.Context) {
@@ -954,17 +954,18 @@ func (h *Handlers) ControlThreatScreenCollector(c *gin.Context) {
 		return
 	}
 	target := strings.TrimRight(h.cfg.CaddyAdminURL, "/") + "/lb/traffic-collector"
-	// 威胁大屏的攻击光流使用独立采样源；本次 collector 请求同时同步其
-	// sample_n（0=关闭，1/4/8=对应采样档）。安全事件日志不受影响。
-	if c.Request.Method == http.MethodDelete {
-		services.SetThreatScreenAttackFlowSampleN(0)
-	} else {
-		var collectorReq struct {
-			SampleN *int `json:"sample_n"`
-		}
-		if json.Unmarshal(body, &collectorReq) == nil && collectorReq.SampleN != nil {
-			services.SetThreatScreenAttackFlowSampleN(*collectorReq.SampleN)
-		}
+	// 威胁大屏的攻击光流使用独立采样源；本次 collector 请求同时按 lease_id
+	// 同步其本地采样租约（历史修复 租约化，与 Caddy 侧 traffic_lease.go
+	// 同模型：有效档位=存活租约 min，单租约释放不误杀其他租约）。
+	// 安全事件日志不受影响。
+	var collectorReq struct {
+		LeaseID string `json:"lease_id"`
+		TTLMs   *int64 `json:"ttl_ms"`
+		SampleN *int   `json:"sample_n"`
+	}
+	_ = json.Unmarshal(body, &collectorReq)
+	if collectorReq.LeaseID == "" && c.Request.Method == http.MethodDelete {
+		collectorReq.LeaseID = c.Query("lease_id")
 	}
 	req, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, target, bytes.NewReader(body))
 	if err != nil {
@@ -981,10 +982,31 @@ func (h *Handlers) ControlThreatScreenCollector(c *gin.Context) {
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	// 先转发成功再落本地：admin 失败（503/400）时本地租约保持原状，
+	// 避免 app/Caddy 两侧采样状态分叉。
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if c.Request.Method == http.MethodDelete {
+			services.ReleaseThreatScreenAttackFlowLease(collectorReq.LeaseID)
+		} else if collectorReq.LeaseID != "" {
+			var ttl time.Duration
+			if collectorReq.TTLMs != nil {
+				ttl = time.Duration(*collectorReq.TTLMs) * time.Millisecond
+			}
+			sampleN := 1
+			if collectorReq.SampleN != nil {
+				sampleN = *collectorReq.SampleN
+			}
+			if err := services.AcquireThreatScreenAttackFlowLease(collectorReq.LeaseID, ttl, sampleN); err != nil {
+				// 本地登记失败（租约超限等）不回滚 admin 侧已生效租约；
+				// 响应原样透传，本地光流档位保持旧值。
+				services.Logf("warn", "threat-screen collector: local attack-flow lease acquire failed: %v", err)
+			}
+		}
+	}
 	c.Data(resp.StatusCode, "application/json", respBody)
 }
 
-// GetThreatScreenFlowEvents GET /security/overview/历史修复/events
+// GetThreatScreenFlowEvents GET /security/overview/threat-screen/events
 // 代理 Caddy admin 逐请求正常流量环形缓冲；since_seq 增量拉取，仅大屏打开时
 // 前端轮询。响应透传 enabled/sample_n/events/next_seq。
 func (h *Handlers) GetThreatScreenFlowEvents(c *gin.Context) {
@@ -1005,7 +1027,7 @@ func (h *Handlers) GetThreatScreenFlowEvents(c *gin.Context) {
 		return
 	}
 	defer resp.Body.Close()
-	// A81A-历史问题：对齐同族读端点（GetCRSRuleContent/GetCRSSetupConfig 的 413 口径）
+	// 历史问题：对齐同族读端点（GetCRSRuleContent/GetCRSSetupConfig 的 413 口径）
 	// ——超限显式拒绝而非把截断的 JSON 以 200 透传（调用方会把残缺事件流当
 	// 完整增量消费）。
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20+1))
@@ -1020,7 +1042,7 @@ func (h *Handlers) GetThreatScreenFlowEvents(c *gin.Context) {
 	}
 	// 应用统一信封：Caddy admin 返回裸 JSON，前端 request 封装按 data 字段
 	// 消费（res.data）——裸透传会让 flowTask 每轮判定 enabled=false 并把游标
-	// 重置为 0，正常请求蓝色光流永不绘制（历史 历史问题 实测）。
+	// 重置为 0，正常请求蓝色光流永不绘制（历史问题 实测）。
 	var payload struct {
 		Enabled bool `json:"enabled"`
 		Events  []struct {
@@ -1047,8 +1069,8 @@ func (h *Handlers) GetThreatScreenFlowEvents(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: payload})
 }
 
-// GetThreatScreenTraffic GET /security/overview/历史修复/traffic
-// 大屏实时流量代理（Plan B）：读 Caddy admin 自定义端点 /lb/历史修复，
+// GetThreatScreenTraffic GET /security/overview/threat-screen/traffic
+// 大屏实时流量代理（Plan B）：读 Caddy admin 自定义端点 /lb/traffic-stats，
 // 国名翻译中文（geoipnames 单源）+ Reserved/空/0 键过滤。1s TTL + singleflight
 // 进程内缓存（key=admin URL，大屏 1-2s 轮询不对 admin 放大请求；失败不缓存）。
 func (h *Handlers) GetThreatScreenTraffic(c *gin.Context) {
@@ -1137,12 +1159,12 @@ func threatHourlyBuckets(hours int, now time.Time, offset int) ([]time.Time, []m
 	return bucketStarts, hourly
 }
 
-// GetSecurityThreatScreen GET /security/overview/历史修复?hours=24
+// GetSecurityThreatScreen GET /security/overview/threat-screen?hours=24
 // 返回大屏聚合：窗口总量/拦截率/logged 数/限流拦截数（Caddy metrics 429，
 // 重载口径）/活跃攻击源（近 10min 去重）/国家计数 map（ip_location 首段，
 // 空归属跳过）/Top3 攻击国家、攻击类型与被攻击目标（top_targets，
 // rule_caddy_id 分组 + lb_rules 名域）。任一安全库查询失败显式 500
-// （历史问题 D2：全零大屏与「无攻击」不可区分）；Caddy metrics 抓取失败降级
+// （历史问题：全零大屏与「无攻击」不可区分）；Caddy metrics 抓取失败降级
 // 200——ratelimit_blocks=0 + ratelimit_available=false，其余维度照常
 // （大屏 30s 轮询容忍指标瞬时不可达，可用性位披露）。
 func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
@@ -1193,7 +1215,7 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 	since := now.UTC().Add(-time.Duration(hours) * time.Hour).Truncate(time.Second).Format("2006-01-02 15:04:05")
 	activeSince := now.UTC().Add(-threatActiveSourceWindow).Truncate(time.Second).Format("2006-01-02 15:04:05")
 
-	// 任一查询失败显式报错（历史问题 D2 单错误收敛，trackErr 同 GetSecurityOverview）
+	// 任一查询失败显式报错（历史问题 单错误收敛，trackErr 同 GetSecurityOverview）
 	var firstErr error
 	trackErr := func(err error) {
 		if err != nil && firstErr == nil {
@@ -1205,7 +1227,7 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 	// 国家/省/攻击族/规则/小时——原 5 条原始表窗口扫描合并为 1 条 rollup 扫
 	// 描，与原始表规模解耦）。保留/私网已在固化时排除（口径不变）。
 	// warmer 已启动时由后台协程承担固化（每 60s 一轮），请求路径不再常规懒
-	// 固化（避免与用户请求抢写锁/重复回填）。历史 历史问题/F02 修正：
+	// 固化（避免与用户请求抢写锁/重复回填）。历史问题 修正：
 	//   - 首轮未完成或最近成功固化已陈旧（warmer 持续失败）→ 请求路径同步
 	//     固化，不得把「已启动」当作「已有可用覆盖」；
 	//   - 宽窗口（>24h）尚未覆盖到窗口起点 → 按持久 coverage 在请求路径补做
@@ -1237,7 +1259,7 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 	}
 	// 原始事件已被保留期/行帽裁剪时，缺失分钟的固化只能写 0；此刻
 	// coveredFrom 可能已推进到窗口起点，单看覆盖无法发现「不可重建」。
-	// 披露原始表最早事件，并把窗口前段标为不完整（历史 历史问题-01）。
+	// 披露原始表最早事件，并把窗口前段标为不完整（历史问题-01）。
 	rawCoverageFrom := ""
 	if raw, err := threatRawCoverageStart(db.MetricsDB); err != nil {
 		trackErr(err)
@@ -1314,7 +1336,7 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 		trackErr(activeRows.Err())
 		activeRows.Close()
 	}
-	// top_targets：前 3 被攻击目标（历史 历史问题：读分钟 rollup 的目标
+	// top_targets：前 3 被攻击目标（历史问题：读分钟 rollup 的目标
 	// 维度，与 total/国家同窗口；原始表受保留期/行帽裁剪，不能作为旁路）
 	topTargets, terr := threatTopTargets(sinceMinute)
 	trackErr(terr)
@@ -1653,7 +1675,7 @@ func (h *Handlers) GetSecurityEventFeed(c *gin.Context) {
 			scanned++
 			var e models.SecurityEventFeedItem
 			var ruleTriggered, ruleMsg string
-			// Scan 失败必须中止（历史问题 D3：部分零值行不得当真实事件返回）
+			// Scan 失败必须中止（历史问题：部分零值行不得当真实事件返回）
 			if err := rows.Scan(&e.ID, &e.EventTime, &e.ClientIP, &e.Action, &e.RuleName, &ruleTriggered, &ruleMsg, &e.EventType, &e.DurationUs, &e.AnomalyScore); err != nil {
 				services.Logf("error", "security event feed: scan failed: %v", err)
 				scanFailed = true

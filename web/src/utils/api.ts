@@ -37,17 +37,17 @@ interface RequestClient {
   get<T = APIResponse<unknown>>(url: string, config?: AxiosRequestConfig): Promise<T>
   post<T = APIResponse<unknown>>(url: string, data?: unknown, config?: AxiosRequestConfig): Promise<T>
   put<T = APIResponse<unknown>>(url: string, data?: unknown, config?: AxiosRequestConfig): Promise<T>
-  // M5：本人资料自助更新——提交新密码必须带 current_password（后端密码确认门）。
+  // 历史修复：本人资料自助更新——提交新密码必须带 current_password（后端密码确认门）。
   patch(url: '/users/me', data: UpdateCurrentUserInput, config?: AxiosRequestConfig): Promise<APIResponse>
   patch<T = APIResponse<unknown>>(url: string, data?: unknown, config?: AxiosRequestConfig): Promise<T>
   delete<T = APIResponse<unknown>>(url: string, config?: AxiosRequestConfig): Promise<T>
 }
 
 // v2.1.8 MFA step-up 弹码：返回验证码或 null（取消）。
-// M27：并发 428 共享在途弹码 Promise（同码同结果），finally 清空供下一轮
+// 历史修复：并发 428 共享在途弹码 Promise（同码同结果），finally 清空供下一轮
 // step-up 重新弹窗；下方 verify-step 刷新同样只发一次。
 let mfaPending: Promise<string | null> | null = null
-// M27：在途 verify-step 刷新——同码重放会被后端 MFAVerifyTOTPCode 的
+// 历史修复：在途 verify-step 刷新——同码重放会被后端 MFAVerifyTOTPCode 的
 // mfa_last_timestep 记录拒绝并计失败，并发等待者必须共享同一次刷新。
 let mfaStepUpRefresh: Promise<void> | null = null
 // 历史问题 八次：MFA 宽限窗提示节流（60 秒一次）
@@ -93,7 +93,7 @@ export const validateMfaCodeInput = (raw: string): boolean => {
 const validateTotpCodeInput = (raw: string): boolean => /^\d{6}$/.test(normalizeMfaCodeInput(raw))
 
 const promptMfaCode = (): Promise<string | null> => {
-  // M27：弹窗已在途时直接共享同一 Promise——并发 428 不再连环弹窗/被误判取消。
+  // 历史修复：弹窗已在途时直接共享同一 Promise——并发 428 不再连环弹窗/被误判取消。
   if (mfaPending) return mfaPending
   // 新一轮弹码意味着新验证码：作废旧刷新句柄，确认后的等待者各自重试原请求。
   mfaStepUpRefresh = null
@@ -261,7 +261,7 @@ service.interceptors.response.use(
       // 不是会话失效——直接传播后端文案，不得弹「会话失效」并强制登出。
       // 历史问题 补正：管理员重置端点 /users/:id/mfa/reset 同样以 401 返回「验证码错误」，
       // 需同口径放行（Users.vue 的 catch 展示后端文案供重试），否则误杀会话。
-      // 历史问题-历史问题：只有后端明确的「当前密码错误」才豁免会话失效；同端点的
+      // 历史问题：只有后端明确的「当前密码错误」才豁免会话失效；同端点的
       // token 过期/未登录 401 仍必须进入下方重新登录流程。
       // 历史问题-04：MFA 端点同样收窄到后端文案白名单（验证码/挑战错误）——
       // 428→verify-step 窗口内的会话过期 401 必须弹「会话失效」并重登。
@@ -304,7 +304,7 @@ service.interceptors.response.use(
         const authStore = useAuthStore()
         const code = await promptMfaCode()
         if (code) {
-          // M27：并发 428 共享同一次 verify-step（同码重放会被后端 mfa_last_timestep
+          // 历史修复：并发 428 共享同一次 verify-step（同码重放会被后端 mfa_last_timestep
           // 拒绝并计失败锁定），所有等待者用刷新后的 token 各自重试原请求。
           if (!mfaStepUpRefresh) {
             mfaStepUpRefresh = authStore.refreshMfaStep(code).finally(() => {
@@ -323,13 +323,13 @@ service.interceptors.response.use(
         if (!error.config?.silent) {
           ElMessage.warning('已取消 MFA 验证，操作未执行')
         }
-        // D5 IMP-2：静默取消同样以中文文案 reject，避免下方透出 428 英文常量。
+        // 历史修复：静默取消同样以中文文案 reject，避免下方透出 428 英文常量。
         return Promise.reject(new ApiRequestError('已取消 MFA 验证，操作未执行', status))
       } catch (stepError: unknown) {
         // 历史问题 D-新2/D-新4：verify-step 失败（如输错码，401 文案已由 /auth/mfa/
         // 豁免分支携带）——给出可见反馈，不再静默吞掉。
         ElMessage.error(stepError instanceof Error ? stepError.message : 'MFA 验证未完成')
-        // D5 IMP-1：已 toast 的错误打标，下游 catch（Users.vue resetMfa）跳过二次弹窗。
+        // 历史修复：已 toast 的错误打标，下游 catch（Users.vue resetMfa）跳过二次弹窗。
         if (stepError instanceof Error) {
           ;(stepError as Error & { mfaSurfaced?: boolean }).mfaSurfaced = true
         }

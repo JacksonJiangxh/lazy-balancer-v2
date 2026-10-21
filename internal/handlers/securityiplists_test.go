@@ -579,7 +579,7 @@ func TestListSecurityPolicies_summaryCarriesRefs(t *testing.T) {
 
 // 历史问题（历史）：DeleteIPList 引用门与 DeleteSecurityCustomRule/
 // DeleteSecurityBlockPage 同口径——仅 enabled=1 策略的引用阻止删除；禁用策略
-// 的悬空引用由 历史问题 B-N1 重启用门兜底（UpdateSecurityPolicy 重启用时按
+// 的悬空引用由 历史问题 重启用门兜底（UpdateSecurityPolicy 重启用时按
 // 「显式值 ?? 存量值」有效形态过 validateIPListRefsExistence，见
 // handlers/security.go 重启用门段）。
 func TestDeleteIPList_referenceGuardEnabledPoliciesOnly(t *testing.T) {
@@ -623,7 +623,7 @@ func TestDeleteIPList_referenceGuardEnabledPoliciesOnly(t *testing.T) {
 
 // 历史问题 配套钉住（有意不对称，非遗漏）：UpdateIPList 清空门保持偏严——
 // 禁用 allow 策略引用的列表同样禁止清空（不按 enabled 过滤）。重启用门
-// （历史问题 B-N1）只校验引用存在性、不校验引用列表条目非空，S1 门只数 ref ID
+// （历史问题）只校验引用存在性、不校验引用列表条目非空，历史修复 门只数 ref ID
 // 个数；若清空门放过禁用策略，重启用后 allow+空生效名单 fail-open 无兜底。
 func TestUpdateIPList_clearGateCountsDisabledAllowPolicy(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
@@ -638,7 +638,7 @@ func TestUpdateIPList_clearGateCountsDisabledAllowPolicy(t *testing.T) {
 	}
 }
 
-// APIMCP41-2 安全域端点级实证：写端点在 bind 前经 guardConfiguredJSONBody——
+// 历史修复 安全域端点级实证：写端点在 bind 前经 guardConfiguredJSONBody——
 // 配置 1MB 上限时 ≈2MB body 预检 413（未接 guard 的端点会落入正常校验 400）。
 func TestCreateIPList_configuredBodyLimit413(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
@@ -657,7 +657,7 @@ func TestCreateIPList_configuredBodyLimit413(t *testing.T) {
 	}
 }
 
-// ---- 历史 A 域：RG-SEC-ALLOW-EFFECTIVE-NONEMPTY（历史问题 / 历史问题）----
+// ---- 历史 A 域：历史修复（历史问题）----
 
 func policyPayloadAllow(name string, inline string, refIDs ...int64) map[string]any {
 	refs := "[]"
@@ -817,7 +817,7 @@ func TestRemoveIPFromList_rejectsEmptyingAllowReferencedList(t *testing.T) {
 	}
 }
 
-// 历史 历史问题：引用视图纳入受信代理面——列表接口须显式标注
+// 历史问题：引用视图纳入受信代理面——列表接口须显式标注
 // trusted_proxy_referenced（ref_policies 不伪造策略项，ref_count 合并展示）。
 func TestIPListRefView_includesTrustedProxy(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
@@ -871,7 +871,7 @@ func TestAllowEffectiveListNonEmpty_ignoresExpiredEntries(t *testing.T) {
 	}
 }
 
-// HC-02（历史）：保存一组「全部已到期」的条目等价于生效集合为空——
+// 历史修复（历史）：保存一组「全部已到期」的条目等价于生效集合为空——
 // allow 引用名单的清空门不得被原始 len>0 绕过（与 remove-ip 的 历史问题 同源：
 // 判据用 AutobanActiveEntries 过滤后的有效集合，渲染侧同口径）。此前仅
 // remove-ip 修了口径，UpdateIPList 仍按原始条目数判定 ⇒ allow 策略 fail-open。

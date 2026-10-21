@@ -11,7 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// APIMCP41-2（历史，2026-09-19 用户裁定「统一遵循请求体大小配置项限制」）：
+// 历史修复（历史，2026-09-19 用户裁定「统一遵循请求体大小配置项限制」）：
 // 写/读探测端点的请求体上限统一取全局配置 request_body_max_size_mb
 // （0=默认 128，写侧 0-4096），不再逐端点裸奔或各定各的常量。
 func TestGuardConfiguredJSONBody(t *testing.T) {

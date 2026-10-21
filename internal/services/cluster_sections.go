@@ -25,13 +25,13 @@ type syncSection struct {
 
 var syncSections = []syncSection{
 	// 系统数据排第一(2026-09-11 裁定):恒同步不可禁用,含用户/密钥/ACME
-	// 与全局配置(证书任务行与文件随 rules 开关,历史问题 历史修复)。
+	// 与全局配置(证书任务行与文件随 rules 开关,历史修复)。
 	{Key: "users", NewLabel: "系统数据"},
 	{Key: "rules", NewLabel: "负载均衡规则"},
 	{Key: "security", NewLabel: "安全防护"},
 }
 
-// ComputeSnapshotSectionHashes derives a stable 历史修复 per section from the
+// ComputeSnapshotSectionHashes derives a stable SHA-256 per section from the
 // snapshot payload itself, so master and slave agree without extra DB reads.
 func ComputeSnapshotSectionHashes(s *models.ClusterSnapshot) map[string]string {
 	if s == nil {
@@ -49,8 +49,8 @@ func ComputeSnapshotSectionHashes(s *models.ClusterSnapshot) map[string]string {
 	return hashes
 }
 
-// sectionPayloadFor returns the 历史修复 payload a section hash is derived
-// from. Extracted so the 历史修复 hashing (ComputeSnapshotSectionHashes) and
+// sectionPayloadFor returns the JSON-marshaled payload a section hash is derived
+// from. Extracted so the full-snapshot hashing (ComputeSnapshotSectionHashes) and
 // the lightweight drift guard (driftGuardSectionHashes) share ONE canonical payload
 // definition — the hash parity invariant between the two depends on it.
 func sectionPayloadFor(key string, s *models.ClusterSnapshot) interface{} {
@@ -111,7 +111,7 @@ func sectionPayloadFor(key string, s *models.ClusterSnapshot) interface{} {
 // 端点写入，不进快照与节哈希）：users 节重放时由 replaceSnapshotTx 读出并在
 // 回插后回写保留，重放不会解锁从节点被锁账户。
 // 注意：mfa_enabled/mfa_secret/mfa_recovery_codes 是主节点权威字段，不清零
-// （其漂移检测配合 历史问题 历史问题 的触发器补列，保证管理员重置等安全操作正常传播）。
+// （其漂移检测配合 历史问题 的触发器补列，保证管理员重置等安全操作正常传播）。
 func sanitizeUsersForHash(users []models.ClusterUser) []models.ClusterUser {
 	if len(users) == 0 {
 		return users
@@ -160,9 +160,9 @@ func (sw SyncSwitches) sectionEnabled(key string) bool {
 	return true
 }
 
-// readSyncSwitches reads the 历史修复 sync switches (defaults 历史修复 for
-// missing columns/rows, e.g. 历史修复 databases). ctx 由调用方直传
-// （LBS/历史修复 历史：不再内部 context.Background()，保持本包 ctx 透传约定
+// readSyncSwitches reads the node-local sync switches (defaults all-on for
+// missing columns/rows, e.g. pre-migration databases). ctx 由调用方直传
+// （历史修复：不再内部 context.Background()，保持本包 ctx 透传约定
 // ——快照构建可随调用方取消）。
 func readSyncSwitches(ctx context.Context, dbh interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
@@ -351,7 +351,7 @@ func recordAppliedSectionHashes(dbh *sql.DB, snapshot models.ClusterSnapshot, sk
 		// 稳定参照（见 applySnapshot 调用点注释）；本地哈希缺失回退快照侧。
 		// 代价如实化（历史问题）：同构建常态下每次漂移会多 1 轮全量重拉才收敛
 		//（本轮强制重放+落本地口径，下轮起哈希一致走跳过）——这是有意取舍，
-		// E3 历史问题 的跨构建漂移防护优先于省一轮重拉。
+		// 历史修复问题 的跨构建漂移防护优先于省一轮重拉。
 		if sk.wasDrifted(sec.Key) {
 			if lh, lok := localHashes[sec.Key]; lok && lh != "" {
 				h = lh
@@ -366,7 +366,7 @@ func recordAppliedSectionHashes(dbh *sql.DB, snapshot models.ClusterSnapshot, sk
 	// 三分类合并·方案A(2026-09-19 裁定):文件态记账落 global_config 专用列
 	// (applied_waf_ref_hash=纯 ref 哈希含版本标签,applied_waf_ref_version=
 	// 告警去重版本)——cluster_applied_sections 严格 3 行与 syncSections
-	// 同构;wafFilesDrifted 的 304 兜底重拉与 历史问题 A-#4 标签自愈依赖该记录。
+	// 同构;wafFilesDrifted 的 304 兜底重拉与 历史问题 标签自愈依赖该记录。
 	// 随安全防护开关写入/冻结(节哈希、上报与 hover 均不包含文件态)。
 	if switches.Security {
 		refHash := wafFilesNullRefHash
@@ -381,11 +381,11 @@ func recordAppliedSectionHashes(dbh *sql.DB, snapshot models.ClusterSnapshot, sk
 	}
 }
 
-// logSyncSwitchGuards surfaces 历史修复 drift: 历史修复 nodes
+// logSyncSwitchGuards surfaces cross-section drift: security-switch-off nodes
 // whose master references newer CRS/IP2Region files (file state follows the
 // security switch after the 3-category merge).
 func logSyncSwitchGuards(dbh *sql.DB, snapshot models.ClusterSnapshot, sk *sectionSkips, switches SyncSwitches) {
-	// 历史问题 A-#3：告警对象是「开关关闭导致 WAF 文件滞后」的从节点——开关开启时
+	// 历史问题：告警对象是「开关关闭导致 WAF 文件滞后」的从节点——开关开启时
 	// applySnapshot 随即拉取文件，无滞后可告。三分类合并后判定挂 security
 	// 开关(waf_files 不再是同步节,sk.disabled 只含 3 节键);dedup 记账走
 	// global_config.applied_waf_ref_version(方案A 列;security 关闭时

@@ -9,7 +9,7 @@ import (
 
 // 为 0/负值时必须回退 30 天（与 certinfo.go GetCertExpiryThreshold 同形态），
 // 否则阈值退化后「即将过期」告警静默失效。
-func TestCERT44_5_checkManualCertExpiration_floorsNonPositiveWarnDays(t *testing.T) {
+func TestCheckManualCertExpiration_floorsNonPositiveWarnDays(t *testing.T) {
 	_, database := newClusterTestService(t)
 	// Given：一张 20 天后过期的手动证书（0 < 20 <= 30，阈值是否回退决定其是否计入）
 	certPEM, _ := expiredShapeCertAndKey(t, "manual44.test", time.Now().Add(20*24*time.Hour))

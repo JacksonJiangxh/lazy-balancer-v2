@@ -119,7 +119,7 @@ func TestSecurityBlockedCounter_panicFinalizesTimingAndTraffic(t *testing.T) {
 		_ = h.ServeHTTP(httptest.NewRecorder(), req, next)
 	}()
 
-	// panic 向外传播的同时，审计计时不得留下「等待中」的条目（E81-历史问题：无
+	// panic 向外传播的同时，审计计时不得留下「等待中」的条目（历史问题：无
 	// 分段写点时 close 不建条；drain 首轮查表即返，不为该行等满超时），流量
 	// 也不能静默丢失。
 	id := req.Header.Get(securityTimingHeader)
@@ -208,8 +208,8 @@ func TestSecurityBlockedCounter_timingSegmentSelection(t *testing.T) {
 	}
 
 	// 非拦截形态（logged 放行）：本 handler 之外无任何分段写点（无 timing_pre/
-	// timing_end）——E81-历史问题 起 close 不再建条，因此不产生注册表条目；
-	// 审计 drain 对未知 tid 首轮即返（AUD-1），同样不等待。
+	// timing_end）——历史问题 起 close 不再建条，因此不产生注册表条目；
+	// 审计 drain 对未知 tid 首轮即返（历史修复），同样不等待。
 	t.Run("logged passthrough without segment writes leaves no entry", func(t *testing.T) {
 		useTestTimingRegistry(t)
 		h := &SecurityBlockedCounter{Rule: "lb_seg_rule"}
@@ -227,7 +227,7 @@ func TestSecurityBlockedCounter_timingSegmentSelection(t *testing.T) {
 		count := len(auditTimingEntries)
 		auditTimingMu.Unlock()
 		if exists || count != 0 {
-			t.Fatalf("close must not create entries (E81-历史问题), got %d entries", count)
+			t.Fatalf("close must not create entries (历史问题), got %d entries", count)
 		}
 		// AND：drain 侧零轮询立即返回（不注入 lb_timing）。
 		snap := auditTimingWait(id, 50*time.Millisecond)
@@ -240,7 +240,7 @@ func TestSecurityBlockedCounter_timingSegmentSelection(t *testing.T) {
 	})
 }
 
-// 历史问题(第 28.5 轮审计):Provision/registerOrExisting 护栏——7723d76d registry
+// 历史问题(历史审计):Provision/registerOrExisting 护栏——7723d76d registry
 // 事故(指标恒 0)的回归测试。
 func TestRegisterOrExisting(t *testing.T) {
 	reg := prometheus.NewRegistry()

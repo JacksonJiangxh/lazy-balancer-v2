@@ -192,7 +192,7 @@ func TestGenerateCaddyConfig_fail_closed_errors_do_not_call_load(t *testing.T) {
 				t.Fatal(err)
 			}
 		}, want: "decode path upstreams"},
-		// 历史 历史问题: 原用例以 path_rules 空数组 upstreams_json='[]' 触发
+		// 历史问题: 原用例以 path_rules 空数组 upstreams_json='[]' 触发
 		// "generate HTTP routes" 失败——该场景现按修复语义回退主上游（与 nil 同口径，
 		// 见 TestGenerateSingleRuleCaddyConfig_pathRuleEmptyUpstreamArray_...），
 		// 改用 dynamic-DNS 双上游维持 fail-closed 校验覆盖。
@@ -1133,7 +1133,7 @@ func TestGenerateRouteObject_placesWafHandlerFirst_whenBlockingPolicyBound(t *te
 		t.Fatalf("generate routes: %v", err)
 	}
 	names := handlerChainNames(t, routes[0])
-	// F3：链首是 X-LB-Rule-ID 注入（headers），waf 紧随其后
+	// 历史修复：链首是 X-LB-Rule-ID 注入（headers），waf 紧随其后
 	if names[0] != "headers" {
 		t.Fatalf("chain head=%q, want headers (X-LB-Rule-ID inject) in %v", names[0], names)
 	}
@@ -1332,7 +1332,7 @@ func TestBuildWafHandler_nilMatrix(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			// When（历史 历史问题: buildWafHandler 已删，协议门控在生产调用点，
+			// When（历史问题: buildWafHandler 已删，协议门控在生产调用点，
 			// 测试复刻调用点语义：仅 http 规则经 WithPolicy 变体构建）
 			var protocol string
 			if err := database.QueryRow(`SELECT protocol FROM lb_rules WHERE caddy_id=?`, tc.caddyID).Scan(&protocol); err != nil || protocol != "http" {
@@ -1958,10 +1958,10 @@ func TestBuildCorazaDirectives_chainedCustomRuleCarriesActionsOnlyOnStarter(t *t
 	if !strings.Contains(chainLines[0], "id:10007") || !strings.Contains(chainLines[0], "deny") || !strings.Contains(chainLines[0], ",chain") {
 		t.Fatalf("starter must carry id+disruptive+chain: %s", chainLines[0])
 	}
-	// N15-F1：多条件链的 setvar 挪到末条——起始条命中而后续条件未命中时
+	// 历史修复：多条件链的 setvar 挪到末条——起始条命中而后续条件未命中时
 	// coraza 已执行起始条非破坏性动作，起始条携带 setvar 会泄漏幽灵异常分。
 	if strings.Contains(chainLines[0], "setvar:") {
-		t.Fatalf("starter must not carry setvar (leaks on failed chain, N15-F1): %s", chainLines[0])
+		t.Fatalf("starter must not carry setvar (leaks on failed chain, 历史修复): %s", chainLines[0])
 	}
 	for i, line := range chainLines[1:] {
 		if strings.Contains(line, "deny") || strings.Contains(line, "msg:") || strings.Contains(line, "id:") {
@@ -1975,7 +1975,7 @@ func TestBuildCorazaDirectives_chainedCustomRuleCarriesActionsOnlyOnStarter(t *t
 		t.Fatalf("final rule must not carry chain: %s", chainLines[2])
 	}
 	if !strings.Contains(chainLines[2], "setvar:tx.inbound_anomaly_score_pl1=+0") {
-		t.Fatalf("final rule must carry the setvar tail (N15-F1): %s", chainLines[2])
+		t.Fatalf("final rule must carry the setvar tail (历史修复): %s", chainLines[2])
 	}
 }
 
@@ -2035,7 +2035,7 @@ func TestGenerateCaddyConfig_skips_redirect_route_when_same_domain_port80_rule_e
 	})
 }
 
-// 历史问题 C-N2：DynamicDNS + weighted_round_robin 不再发射 weights=[1]——Caddy 的
+// 历史问题：DynamicDNS + weighted_round_robin 不再发射 weights=[1]——Caddy 的
 // WeightedRoundRobinSelection 对 len(Weights)<2 早退恒选 pool[0]（不做可用性
 // 检查），流量被钉死在解析列表首个 IP、其余 A 记录零流量，首 IP 宕机时
 // try_duration 内重试全撞同一 IP 后 502。改发内建 random（按 Available() 过滤
@@ -2071,9 +2071,9 @@ func TestGenerateSingleRuleCaddyConfig_dynamicDNS_selectionPolicy(t *testing.T) 
 }
 
 func TestApplyConfig_forceReloadHeader(t *testing.T) {
-	// 历史问题 二十五次：数据类更新（xdb/CRS/证书文件）不改变配置 JSON，Caddy 对字节
+	// 历史问题：数据类更新（xdb/CRS/证书文件）不改变配置 JSON，Caddy 对字节
 	// 相同的 /load 短路跳过 provision（errSameConfig）——force 变体必须带
-	// Cache-Control: must-revalidate 绕过短路；常规 apply 不得带（避免无谓的
+	// 历史修复: must-revalidate 绕过短路；常规 apply 不得带（避免无谓的
 	// 全量重载开销）。
 	var loads int
 	var lastCacheControl string
@@ -2110,8 +2110,8 @@ func TestApplyConfig_forceReloadHeader(t *testing.T) {
 }
 
 func TestApplyConfig_autoForceOnCertSnapshot(t *testing.T) {
-	// 历史问题 二十六次 W1-1：生成期 MaterializeCertPairs 写盘了证书文件（快照非空）
-	// 时即使调用方走常规 ApplyConfig 也必须自动带 Cache-Control: must-revalidate
+	// 历史问题：生成期 MaterializeCertPairs 写盘了证书文件（快照非空）
+	// 时即使调用方走常规 ApplyConfig 也必须自动带 历史修复: must-revalidate
 	// ——证书路径确定性意味着重传证书不改变 JSON，不强制会被 errSameConfig
 	// 短路（旧证书继续服务）。快照为空时不得强制（避免冗余全量重载）。
 	var lastCacheControl string
@@ -2145,7 +2145,7 @@ func TestApplyConfig_autoForceOnCertSnapshot(t *testing.T) {
 }
 
 func TestHttpsRedirectLocationPreservesURI(t *testing.T) {
-	// 历史问题 二十七次补正：301 Location 必须携带 {http.request.uri}（path+query）——
+	// 历史问题补正：301 Location 必须携带 {http.request.uri}（path+query）——
 	// v2.1.11 首发时该修复因实施脚本断言中止丢失且无测试兜底，发布信息与代码
 	// 不一致。本断言锁定占位符在位，防止再次静默丢失。
 	for _, port := range []int{443, 8443} {
@@ -2159,7 +2159,7 @@ func TestHttpsRedirectLocationPreservesURI(t *testing.T) {
 	}
 }
 
-// S历史问题(历史):80/443 同样整体禁用 autoHTTPS——disable_certificates
+// 历史问题(历史):80/443 同样整体禁用 autoHTTPS——disable_certificates
 // 下引擎仍恒向 http_80 追加被项目落地页遮蔽的 catch-all 308(死路由+
 // superfluous WriteHeader 日志噪音+未来 terminal 化后盲导 443 的地雷);
 // 跳转完全由项目自有 redirectRoutes 管理(TLSHTTPRedirect,任意端口)。
@@ -2186,7 +2186,7 @@ func TestGenerateCaddyConfig_autoHTTPSFullyDisabled(t *testing.T) {
 			continue
 		}
 		if ah["disable"] != true {
-			t.Errorf("server %s automatic_https=%v, want disable:true (S历史问题: 死路由消除)", name, ah)
+			t.Errorf("server %s automatic_https=%v, want disable:true (历史问题: 死路由消除)", name, ah)
 		}
 	}
 }
@@ -2260,7 +2260,7 @@ func TestCaddyOpLockSharedBetweenForceAndHandlers(t *testing.T) {
 	}
 }
 
-// LBS-A-2（历史 历史问题；LBS/LBH-7 历史跨包单源）：ExtractMetricLabel
+// 历史修复（历史问题；LBS/历史修复跨包单源）：ExtractMetricLabel
 // 边界感知收敛（历史问题 精确键匹配）——裸子串匹配会把 peer_upstream 等
 // 前缀兄弟标签的值误归到 upstream（现实标签集暂无前缀兄弟，防御性收敛）。
 func TestExtractMetricLabel_boundaryAware(t *testing.T) {
@@ -2285,9 +2285,9 @@ func TestExtractMetricLabel_boundaryAware(t *testing.T) {
 	}
 }
 
-// ---- 历史（SV历史问题）----
+// ---- 历史（历史问题）----
 
-// SV历史问题：候选装载阶段必须预解析 Leaf（disabled 候选除外），供
+// 历史问题：候选装载阶段必须预解析 Leaf（disabled 候选除外），供
 // SelectCertificate 走快路径并供过期回退复用。
 func TestACMECertCandidatesForRule_preparses_leaf(t *testing.T) {
 	_, database := newClusterTestService(t)

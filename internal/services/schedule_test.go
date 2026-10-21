@@ -508,7 +508,7 @@ func TestMarkSourceSuccess_usesConfiguredSchedule(t *testing.T) {
 	}
 }
 
-// LBS-B-U1（历史 历史问题）：SetThreatSchedule 两步写事务化——第二写点（重排
+// 历史修复（历史问题）：SetThreatSchedule 两步写事务化——第二写点（重排
 // 各源 next_update）失败时，第一写点（global_config 排程列）须整体回滚，
 // 不留「排程已改、槽位照旧」中间态（曾两独立 Exec 先后提交）。
 func TestSetThreatSchedule_rollsBackWhenRearmFails(t *testing.T) {

@@ -83,7 +83,7 @@ func respondTaskTriggerAdmissionError(c *gin.Context, err error) {
 
 // respondTaskEngineUnavailable 任务引擎未装配的统一响应。引擎缺失属「服务
 // 暂不可用」而非内部错误——与触发/启停/取消路径的 503 同口径（历史问题 裁定），
-// 全仓单一出口（历史 HC-05：库更新触发端点此前 500，与任务监控 503
+// 全仓单一出口（历史修复：库更新触发端点此前 500，与任务监控 503
 // 形成家族状态码漂移）。
 func respondTaskEngineUnavailable(c *gin.Context) {
 	c.JSON(http.StatusServiceUnavailable, models.APIResponse{Code: 503, Message: "任务引擎未初始化"})
@@ -120,12 +120,12 @@ func (h *Handlers) TriggerSystemTask(c *gin.Context) {
 				c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "任务运行中，请稍后重试"})
 				return
 			}
-			// 历史问题/历史问题：触发与审计统一走 services.TriggerTaskAsync——
+			// 历史问题：触发与审计统一走 services.TriggerTaskAsync——
 			// 「触发」审计只在 Trigger 成功后记录（非自记族），并发双击败者
 			// 拿 ErrAlreadyRunning 静默、skipped 终态静默、真失败记补偿审计。
 			// gin.Context 在 handler 返回后池化复用：审计上下文必须在此预取。
 			// 同步预占位：暂停/停止/角色拒绝必须在写响应前返回 409/503，
-			// 不能先 200 再在 goroutine 里吞错（历史 历史问题-01）。
+			// 不能先 200 再在 goroutine 里吞错（历史问题-01）。
 			actx := triggerAuditContext(c, "任务监控", m.Name)
 			if err := te.RunAsyncResult(id, "manual", actx.Operator, func(runErr error) {
 				services.RecordTaskTriggerResult(id, actx, runErr)
@@ -230,7 +230,7 @@ func (h *Handlers) CancelSystemTask(c *gin.Context) {
 }
 
 // ControlSystemTask 常驻循环启停（admin；body {"action":"start|stop|restart"}）。
-// TASK-L11（历史）：现形态——Controllable = Kind==Daemon（引擎元数据驱动），
+// 历史修复（历史）：现形态——Controllable = Kind==Daemon（引擎元数据驱动），
 // 仅常驻族（security-events-ingestion/cert-issuance/cluster-sync）可控；Periodic
 // 族（cert-waiting-ca 等）启停走 toggle 端点，本端点对其恒 400。v2.0 前
 // 「Continuous 族可控」注释已随四类型标准作废。
@@ -369,7 +369,7 @@ func (h *Handlers) GetSystemTaskLogs(c *gin.Context) {
 		keep = certJobLogMaxRotatedBackups
 	}
 	content := prependTaskLogRotations(path, string(data), keep)
-	// A85历史问题-1：256KB 是活动文件与轮转副本拼接后的合计预算。必须直接取
+	// 历史问题：256KB 是活动文件与轮转副本拼接后的合计预算。必须直接取
 	// 拼接串最后 tail 字节，再丢弃首行残段；tailLogWindow 只负责行边界，
 	// 不能把全串当成已定位的尾窗（否则仅丢首行，响应仍可数倍超限）。
 	if len(content) > tail {

@@ -41,7 +41,7 @@ func audit79RuleTables() map[string][]map[string]any {
 	}
 }
 
-// U04B-01: bindings must be checked against the post-import rule/policy view;
+// 历史修复: bindings must be checked against the post-import rule/policy view;
 // rules-only replacement must not leave bindings attached to deleted rules.
 func TestImportConfigBackup_postImportRuleBindingView(t *testing.T) {
 	t.Run("security-only uses live rules", func(t *testing.T) {
@@ -112,7 +112,7 @@ func TestImportConfigBackup_postImportRuleBindingView(t *testing.T) {
 	})
 }
 
-// U04B-02: an allowed source name must not make a forged download URL or parser
+// 历史修复: an allowed source name must not make a forged download URL or parser
 // format acceptable. Imported rows converge to the built-in source definition.
 func TestValidateImportedSources_restoreCanonicalEndpoints(t *testing.T) {
 	// Given allowed names carrying attacker-controlled endpoint metadata.
@@ -138,7 +138,7 @@ func TestValidateImportedSources_restoreCanonicalEndpoints(t *testing.T) {
 	}
 }
 
-// U04B-03: users-only import must not run security/rule/block-page
+// 历史修复: users-only import must not run security/rule/block-page
 // post-processing against tables that were not selected.
 func TestImportConfigBackup_unselectedSectionsHaveNoPostProcessing(t *testing.T) {
 	// Given live state that each currently unguarded post-processor would rewrite.
@@ -198,7 +198,7 @@ func TestImportConfigBackup_unselectedSectionsHaveNoPostProcessing(t *testing.T)
 	}
 }
 
-// U04B-05: v2 rule rows must pass the same health/retry/header/path/domain
+// 历史修复: v2 rule rows must pass the same health/retry/header/path/domain
 // constraints as the save path after import normalization.
 func TestValidateV2BackupRules_saveSideValueDomain(t *testing.T) {
 	tests := []struct {
@@ -297,7 +297,7 @@ func TestValidateConvertedV1Rules_saveSideValueDomain(t *testing.T) {
 	}
 }
 
-// U04B-06: auto-backup PATCH rows must be validated after merging omitted
+// 历史修复: auto-backup PATCH rows must be validated after merging omitted
 // frequency/day fields from the live configuration.
 func TestImportAutoBackupSettings_validatesMergedLiveSchedule(t *testing.T) {
 	tests := []struct {
@@ -336,7 +336,7 @@ func TestImportAutoBackupSettings_validatesMergedLiveSchedule(t *testing.T) {
 	}
 }
 
-// U04B-07: branding_json is a mirror, not the source of truth. Import must
+// 历史修复: branding_json is a mirror, not the source of truth. Import must
 // materialize the file and re-render dependent branding output.
 func TestImportConfigBackup_materializesBranding(t *testing.T) {
 	tests := []struct {
@@ -436,13 +436,13 @@ func TestImportConfigBackup_malformedBrandingWarnsAndKeepsFile(t *testing.T) {
 	}
 }
 
-// U04B-08: replacing crawler configuration must immediately rebuild the file
+// 历史修复: replacing crawler configuration must immediately rebuild the file
 // consumed by caddygeoip, rather than waiting for restart or a later download.
 func TestImportConfigBackup_rebuildsCrawlerSnapshot(t *testing.T) {
 	// Given a stale runtime snapshot and a backup carrying a different crawler list.
 	h := newBackupTestHandlers(t)
 	audit79SeedAdmin(t)
-	// B3-历史问题（历史）：go:linkname 改写 services 未导出变量 →
+	// 历史问题（历史）：go:linkname 改写 services 未导出变量 →
 	// 正式测试缝 services.SetCrawlerIPListFileForTest（返回还原闭包）。
 	snapshotPath := filepath.Join(t.TempDir(), "crawler-ip-lists.json")
 	t.Cleanup(services.SetCrawlerIPListFileForTest(snapshotPath))
@@ -474,7 +474,7 @@ func TestImportConfigBackup_rebuildsCrawlerSnapshot(t *testing.T) {
 	}
 }
 
-// U04B-09: runtime retention fields follow the save-side bounds.
+// 历史修复: runtime retention fields follow the save-side bounds.
 func TestValidateV2BackupRuntimeSettings_securityEventRetentionBounds(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -564,7 +564,7 @@ func TestImportConfigBackup_normalizesRequestBodyIntegerShapes(t *testing.T) {
 	}
 }
 
-// U04B-12: all listed NOT NULL DEFAULT columns normalize explicit JSON null.
+// 历史修复: all listed NOT NULL DEFAULT columns normalize explicit JSON null.
 // path_rules also proves defaults are applied before match-type validation.
 func TestImportConfigBackup_normalizesRemainingNullDefaults(t *testing.T) {
 	t.Run("restore table defaults", func(t *testing.T) {
@@ -635,7 +635,7 @@ func TestImportConfigBackup_normalizesRemainingNullDefaults(t *testing.T) {
 	})
 }
 
-// U04B-13: JSON null is not a JSON object, while empty/object shapes retain
+// 历史修复: JSON null is not a JSON object, while empty/object shapes retain
 // their existing behavior.
 func TestValidateCredentialsJSONObject_rejectsNull(t *testing.T) {
 	// Given / When / Then all object/non-object shapes follow the credential contract.
@@ -651,7 +651,7 @@ func TestValidateCredentialsJSONObject_rejectsNull(t *testing.T) {
 	}
 }
 
-// ── 历史问题-历史问题（历史）：仅导入「安全防护」分类时，备份携带的
+// ── 历史问题（历史）：仅导入「安全防护」分类时，备份携带的
 // security_policy_bindings 指向 live TCP 规则——TCP 渲染链不消费策略，绑定为
 // 死绑定，必须在插入后清理（策略页不得宣称生效而运行态零防护）。 ──
 

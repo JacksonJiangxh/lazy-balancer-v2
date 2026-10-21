@@ -83,12 +83,12 @@ func TestSeedCRSRules_seedsFromSnapshotWhenVersionDiffers(t *testing.T) {
 	if string(setup) != "# snapshot setup" {
 		t.Fatalf("crs-setup.conf=%q, want snapshot setup", setup)
 	}
-	// W4 裁定后骨架仅重建 audit；custom 死目录不再创建（防回归）。
+	// 历史修复 裁定后骨架仅重建 audit；custom 死目录不再创建（防回归）。
 	if info, err := os.Stat(filepath.Join(root, "waf", "audit")); err != nil || !info.IsDir() {
 		t.Fatalf("waf/audit missing after seed: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(root, "waf", "custom")); !os.IsNotExist(err) {
-		t.Fatalf("waf/custom must not be recreated after seed (W4), stat err=%v", err)
+		t.Fatalf("waf/custom must not be recreated after seed, stat err=%v", err)
 	}
 }
 

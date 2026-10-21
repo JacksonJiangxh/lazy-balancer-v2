@@ -132,7 +132,7 @@ interface PolicyRow {
   ip_whitelist: string
   ip_whitelist_refs?: string
   ip_blacklist: string
-  // 审计 W-S2（第六轮）：信任三态开关——加入名单前须提示「当前关闭=零生效」
+  // 审计 历史修复（第六轮）：信任三态开关——加入名单前须提示「当前关闭=零生效」
   ip_whitelist_enabled?: boolean
   // 分组路由字段（历史问题）：policy_type 由列表/详情接口携带；'' 为存量待推断态。
   // 摘要标志仅列表摘要携带（详情接口无）——refreshRow 以合并方式保留
@@ -168,7 +168,7 @@ interface PolicyDetail {
 
 const props = defineProps<{ ip: string; location: string; ruleCaddyId?: string }>()
 
-// W87-07：client_ip 可能带首尾空白（导入/带外数据）。parseIPList 内部已 trim，
+// 历史修复：client_ip 可能带首尾空白（导入/带外数据）。parseIPList 内部已 trim，
 // 而移除/legacy 判定曾用未 trim 的原始 props.ip——状态显示「已信任/已拦截」却在
 // 移除时提示「已不在名单」或过滤不生效。全流程统一读本 computed。
 const trimmedIp = computed(() => props.ip.trim())
@@ -207,9 +207,9 @@ const loadEventCount = async (): Promise<void> => {
 
 const onPopoverShow = (): void => { void loadPolicies(); void loadEventCount() }
 
-// 键盘激活（历史 历史问题）：Enter/Space 不仅要预取数据，还须真正打开弹层——
+// 键盘激活（历史）：Enter/Space 不仅要预取数据，还须真正打开弹层——
 // trigger=click 的 el-popover 在非原生 button 上不合成 click，须持 ref 调 open。
-// FE-P5a（历史）：中置二次导入并入文件头 :79 的 `import { computed, ref }`。
+// 历史修复（历史）：中置二次导入并入文件头 :79 的 `import { computed, ref }`。
 const popoverRef = ref<{ open: () => void } | null>(null)
 const openPopover = (): void => {
   // 预取由 el-popover 的 before-enter 统一触发（onPopoverShow）——此处再显式
@@ -222,7 +222,7 @@ const openPopover = (): void => {
 // 没有→自动创建「{策略名}-信任」并关联+加入。
 const trustApi = useTrustAssociation({
   getList: () => ipLists.value,
-  // 历史验收：写入后必须清条目缓存——loadIpLists 只拉缓存缺失 ID（B3-历史问题
+  // 历史验收：写入后必须清条目缓存——loadIpLists 只拉缓存缺失 ID（历史问题
   // 优化），已缓存列表的新增条目不可见导致「拦截此 IP」按钮在加入后仍显示
   onChanged: () => {
     // 写入后失效共享缓存（含 TriggerDetailDialog 订阅方），再按需重拉
@@ -252,7 +252,7 @@ const ipLists = ref<IpListOption[]>([])
 interface IpListWithEntries extends IpListOption {
   entries?: Array<{ value: string; remark?: string }>
 }
-// 与 TriggerDetailDialog 共用模块级缓存（历史 历史问题）：原为组件内 ref，
+// 与 TriggerDetailDialog 共用模块级缓存（历史）：原为组件内 ref，
 // 每事件行一个实例 → 同一 IP 弹层多次打开/多行弹层各自整批下载条目。
 const ipListEntries = ref<Record<number, string[]>>({ ...sharedEntriesCache })
 let unregisterEntriesCache: (() => void) | null = null
@@ -276,7 +276,7 @@ const loadIpLists = async (): Promise<void> => {
       for (const id of parseRefIds(p.ip_acl_list_refs)) refIds.add(id)
       for (const id of parseRefIds(p.ip_whitelist_refs)) refIds.add(id)
     }
-    // 仅拉取共享缓存缺失的名单 id（历史 历史问题）：跨组件/跨实例共享，
+    // 仅拉取共享缓存缺失的名单 id（历史）：跨组件/跨实例共享，
     // 写入动作经 invalidate 清空后自动重拉；成员判定保持即时正确
     await ensureSharedEntries(refIds, async (id) => {
       const res = await request.get<APIResponse<{ id: number; entries?: Array<{ value: string }> }>>(`/security/ip-lists/${id}`)
@@ -302,7 +302,7 @@ const loadIpLists = async (): Promise<void> => {
 
 // 生效名单 = 内联 ∪ 引用列表条目（精确字符串去重，与向导同口径）；缓存中缺失的
 // 引用列表跳过（防御性回退为仅内联）。内核统一在 utils/securityStages
-// mergeIpEntryValues（历史问题 FE-3 收敛），本处仅适配 ipListEntries 数据源成形。
+// mergeIpEntryValues（历史问题 收敛），本处仅适配 ipListEntries 数据源成形。
 const mergeIpEntries = (inline: string[], refs: number[]): string[] =>
   mergeIpEntryValues(inline, refs.map((id) => ipListEntries.value[id] ?? []))
 
@@ -353,7 +353,7 @@ const loadPolicies = async (): Promise<void> => {
   // 加入黑名单后，打开规则 B 弹窗需要看到最新 ACL 状态（无陈旧缓存）。
   // 地址列表选项同节奏刷新（含引用条目缓存）；等两者就绪后再渲染行，
   // 避免「内联 ∪ 引用」口径在条目到达前短暂退化为仅内联
-  // FE18-3(历史):seq 守卫——弹层快速关开产生并发 GET 时,
+  // 历史修复(历史):seq 守卫——弹层快速关开产生并发 GET 时,
   // 先发晚到不再覆盖新状态(与 wizardOpenSeq 同仓模式)。
   // 注:loadIpLists 内部写 ipLists ref 未纳入本 seq(独立加载面,
   // 亚秒级关开竞态的展示瞬态;若需彻底,可在该函数加同款守卫)。
@@ -418,11 +418,11 @@ interface RowView {
   geoRegions: string
 }
 
-// X1（历史）：海外国家中文映射（模块级缓存，regions API 单源；setup 期
+// 历史修复（历史）：海外国家中文映射（模块级缓存，regions API 单源；setup 期
 // 触发一次拉取，rows computed 内读 .value 注册响应依赖）。
 const countryZh = useCountryNamesCn()
 
-// 历史 F4 收敛（A76Misc）：rowView 原三处「全策略×全条目」扫描在 rows
+// 历史修复收敛（历史）：rowView 原三处「全策略×全条目」扫描在 rows
 // computed 内逐行重算（O(策略²×条目)，每次开弹层全量重跑）——提升为共享
 // computed：本 IP 是否被任一策略信任 + 命中本 IP 的非系统引用名单集合，
 // rowView 内退化为布尔读取/Set 查询（O(策略×条目) 一次）。
@@ -462,7 +462,7 @@ const ipExactListIds = computed(() => {
 
 const rowView = (policy: PolicyRow): RowView => {
   // 信任口径（内联 ∪ 引用）先行计算——阶段 0 行整行语义即信任，ACL 行也要渲染信任动作。
-  // 历史问题-历史问题：信任成员判定与 ACL 侧同为 CIDR 感知（entryMatchesIp）——内联/引用
+  // 历史问题：信任成员判定与 ACL 侧同为 CIDR 感知（entryMatchesIp）——内联/引用
   // 信任名单的 CIDR 条目在引擎侧本就豁免该 IP，精确串匹配会漏报「已信任」状态；
   // 移除动作仍收窄为精确条目（inTrustInlineExact，与 历史问题 ACL 侧同口径——CIDR
   // 覆盖的 IP 无法由 PUT 精确剔除）
@@ -509,7 +509,7 @@ const rowView = (policy: PolicyRow): RowView => {
   view.canClearDeadTrust = view.trustDead && view.inTrustInlineExact
   // 信任引用命中（全类型行）：信任 refs 中包含此 IP 的非系统列表 → 可移除。
   // 条目来源 = ipListEntries 缓存（loadPolicies 拉取 acl+whitelist 全部 refs）；
-  // 命中判定走共享 ipHitListIds（历史 F4 收敛）。
+  // 命中判定走共享 ipHitListIds（历史修复 收敛）。
   const trustRefIds = parseRefIds(policy.ip_whitelist_refs)
   view.removableTrustRefLists = ipLists.value
     .filter((l) => trustRefIds.includes(l.id) && ipExactListIds.value.has(l.id))
@@ -552,7 +552,7 @@ const rowView = (policy: PolicyRow): RowView => {
   // geoip_mode !== 'off'（后端实际下发）
   const geoActive = (policy.geoip_mode ?? 'off') !== 'off' && regionCount > 0
   view.geoActive = geoActive
-  // X1（历史）：区域清单展示层翻译——country_names_cn 单源映射（useCountryNamesCn
+  // 历史修复（历史）：区域清单展示层翻译——country_names_cn 单源映射（useCountryNamesCn
   // 模块级缓存），未命中（省份/省市联值/海外哨兵/新国名）回退原文；geoip_countries
   // 值本身零改动。
   const zh = countryZh.value
@@ -580,7 +580,7 @@ const rowView = (policy: PolicyRow): RowView => {
   }
 
   // 生效名单 = 内联 ∪ 引用列表条目；引用命中的条目无法在本弹窗移除
-  // （PUT 仅写内联 ip_acl_list）。展示口径 CIDR 感知（历史 历史问题：内联
+  // （PUT 仅写内联 ip_acl_list）。展示口径 CIDR 感知（历史问题：内联
   // CIDR 条目命中实际 IP）；历史问题：移除动作收窄为精确条目（inInlineExact）——
   // 内联 CIDR 覆盖的 IP 无法由 PUT 精确剔除（剔除整条 CIDR 会波及其他 IP），
   // 不再亮「移除」，状态行改标「来自内联 CIDR」引导到策略编辑。
@@ -648,7 +648,7 @@ const cancelTrustAll = async (row: RowView): Promise<void> => {
   // 历史问题 对齐：信任生效仅由本弹窗不可移除的条目（内联 CIDR 覆盖 / 系统名单精确
   // 条目）提供时，「取消信任」是空操作——不再弹确认框走流程后谎报成功，直接
   // 指引到对应编辑面。
-  // 历史问题-F2：处置计划单源（utils/trustRemoval）——可移除条目（内联精确 +
+  // 历史问题：处置计划单源（utils/trustRemoval）——可移除条目（内联精确 +
   // 命中引用列表精确条目）与不可移除的残余 CIDR 信任一次算清。原实现仅在
   // 「无内联精确条目」时守卫；IP 同时由内联精确条目与引用 CIDR 信任时跳过
   // 守卫，移除后仍持续信任却弹「已取消信任 / 恢复拦截」的谎报。
@@ -702,7 +702,7 @@ const cancelTrustAll = async (row: RowView): Promise<void> => {
     invalidateSharedEntriesCache()
     await loadPolicies()
   } catch {
-    // 失败提示由全局拦截器弹出；部分移除也刷新到实际状态（历史 历史问题）
+    // 失败提示由全局拦截器弹出；部分移除也刷新到实际状态（历史）
     invalidateSharedEntriesCache()
     await loadPolicies()
   } finally {
@@ -718,7 +718,7 @@ const cancelTrustAll = async (row: RowView): Promise<void> => {
 const aclRefsAllSystem = (p: PolicyRow): boolean => {
   const refs = parseRefIds(p.ip_acl_list_refs)
   if (refs.length === 0) return false
-  // 内联 ACL 非空时保留卡片（历史 历史问题）：原谓词只看 refs 全 system，
+  // 内联 ACL 非空时保留卡片（历史）：原谓词只看 refs 全 system，
   // 「内联 2 IP + 引用威胁库」的策略被整卡隐藏——用户无法移除内联条目。
   if (parseIPList(p.ip_acl_list ?? '').length > 0) return false
   return refs.every((id) => Boolean(ipLists.value.find((l) => l.id === id)?.system))
@@ -942,7 +942,7 @@ const refreshRow = async (id: number): Promise<void> => {
   try {
     const fresh = await fetchDetail(id)
     if (fresh) {
-      // 历史 历史问题：详情接口不携带摘要标志——直接 spread 会用 undefined 覆写
+      // 历史问题：详情接口不携带摘要标志——直接 spread 会用 undefined 覆写
       // 列表摘要值使分组路由退化；逐字段只合并非 undefined
       policies.value = policies.value.map((x) => {
         if (x.id !== fresh.id) return x

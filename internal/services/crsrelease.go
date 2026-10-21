@@ -14,7 +14,7 @@ import (
 )
 
 // validateCRSStaging ensures an extracted CRS release tree is complete enough
-// to swap into place: the setup template plus an intact rules tree. 历史问题 F3：
+// to swap into place: the setup template plus an intact rules tree. 历史问题：
 // 探针文件（crsRulesProbeFile）是 backup restore / seed / snapshot 消费门共用
 // 的完整性契约，安装期必须同步把关——否则未来 CRS 重组 rules/ 的发布会装出
 // 退化树，之后每次启动都触发清空重播循环。
@@ -130,7 +130,7 @@ func parseGitHubLatestTag(body []byte) (string, error) {
 	return payload.TagName, nil
 }
 
-// crsExtractMaxBytes 是解压总字节上限（防 gzip 炸弹耗尽数据卷，历史问题 F8）：
+// crsExtractMaxBytes 是解压总字节上限（防 gzip 炸弹耗尽数据卷，历史问题）：
 // tar 头声明的 hdr.Size 即解压后写入的确切字节数，跨条目累计超限即中止。
 const crsExtractMaxBytes = 500 << 20
 

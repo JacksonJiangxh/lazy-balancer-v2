@@ -80,7 +80,7 @@ func snapshotLbbakThreatIplists(bundle *services.WafFileBundle) (map[string][]by
 		data, err := services.ReadThreatIplistBySource(tf.Name)
 		if err != nil {
 			// 可 stat 但不可读/解析失败：静默缺件会让还原删除本地旧文件
-			// （历史 历史问题-3），导出必须显式失败。
+			// （历史问题-3），导出必须显式失败。
 			return nil, fmt.Errorf("读取威胁名单 %s: %w", tf.Name, err)
 		}
 		threatIplists[tf.Name] = data
@@ -88,7 +88,7 @@ func snapshotLbbakThreatIplists(bundle *services.WafFileBundle) (map[string][]by
 	return threatIplists, nil
 }
 
-// 历史问题-历史问题（历史）：原 buildLbbakPayload（threatSnapshot 缺省的
+// 历史问题（历史）：原 buildLbbakPayload（threatSnapshot 缺省的
 // 组包快捷入口）生产零调用——生产导出一律 buildLbbakPayloadWithThreatIplists
 // 传入 WafFileLock 内的内存快照。测试专用入口已移入 _test.go，避免生产文件
 // 承载第二调用链。
@@ -193,16 +193,16 @@ type lbbakPayload struct {
 	XdbSha256  string
 	// RDB 文件化：威胁库 .iplist 源文件（源名→内容）
 	ThreatIplists map[string][]byte
-	// F-B1（历史）：tar 内存在但 manifest 未登记 checksum 的
+	// 历史修复（历史）：tar 内存在但 manifest 未登记 checksum 的
 	// threat/*.iplist 条目——内容未经完整性校验。老备份兼容照常落盘，
 	// 调用方在响应/审计侧告警。
 	UnregisteredThreatEntries []string
 }
 
-// 解压放大防护(BE-历史问题):请求体上限只约束压缩字节(128MB,gzip 最高 ~1032:1
+// 解压放大防护(历史问题):请求体上限只约束压缩字节(128MB,gzip 最高 ~1032:1
 // 膨胀),条目数与总解压字节必须在读入内存前拦截——对齐仓内 untarGzTo 的
 // maxWafSyncExtract* 同款标准。var 供测试收窄构造边界。
-// 历史问题-历史问题（历史）：单条目上限提为 maxLbbakEntryBytes 单源——导出
+// 历史问题（历史）：单条目上限提为 maxLbbakEntryBytes 单源——导出
 // 预检（validateLbbakExportEntries）与解包（parseLbbak）共用同一上限，避免
 // 两处字面量漂移让面板导出「自身无法还原」的包。
 var (
@@ -274,10 +274,10 @@ func parseLbbak(raw []byte) (*lbbakPayload, error) {
 	if payload.ConfigJSON == nil {
 		return nil, errors.New("lbbak 缺少 config.json")
 	}
-	// B2-历史问题（历史）：manifest 逐条目 sha256 是 lbbak 的完整性承诺——
+	// 历史问题（历史）：manifest 逐条目 sha256 是 lbbak 的完整性承诺——
 	// config.json / CRS / xdb 必须在 manifest 中登记后才可使用；此前只校验
 	// 「已登记的条目」，手造 {"checksum":{}} 可让这三类核心载荷未经任何摘要
-	// 校验即落库。威胁 .iplist 的未登记形态保留既有兼容告警（F-B1 裁定）。
+	// 校验即落库。威胁 .iplist 的未登记形态保留既有兼容告警（历史修复 裁定）。
 	for _, required := range []string{lbbakEntryConfig, lbbakEntryCRS, lbbakEntryXdb} {
 		if _, exists := entries[required]; !exists {
 			continue
@@ -307,7 +307,7 @@ func parseLbbak(raw []byte) (*lbbakPayload, error) {
 		if _, ok := db.CanonicalThreatSource(source); !ok {
 			return nil, fmt.Errorf("lbbak 威胁库条目名非法: %s", name)
 		}
-		// F-B1：manifest 未登记的条目未经 sha256 校验（合法导出恒登记全部
+		// 历史修复：manifest 未登记的条目未经 sha256 校验（合法导出恒登记全部
 		// 条目）——老备份兼容照常携带，登记进告警面由调用方在响应/审计提示。
 		if !manifestRegistered(name) {
 			payload.UnregisteredThreatEntries = append(payload.UnregisteredThreatEntries, name)
@@ -361,7 +361,7 @@ func reconcileImportedThreatFiles(tables map[string][]map[string]any, payload *l
 		if _, hasFile := payload.ThreatIplists[name]; hasFile || failed[name] {
 			continue // 随包文件已落盘（失败源保留本地文件与记录）
 		}
-		// 历史问题-历史问题（历史，verify 裁定）：导出侧只为已存在文件写条目，
+		// 历史问题（历史，verify 裁定）：导出侧只为已存在文件写条目，
 		// 因此「备份未携带该源文件」有两种含义——上次下载成功但名单为空（备份
 		// 记录 version 非空/update_status=success），或导出节点从未成功下载过该
 		// 源（version 为空/idle）。两种形态都必须删除本地旧文件：DB 行已按备份
@@ -403,7 +403,7 @@ func reconcileImportedThreatFiles(tables map[string][]map[string]any, payload *l
 	return warnings, changed
 }
 
-// lbbakWafApplyResult 逐文件落盘结果（历史问题/03/08）：此前失败仅返回单条
+// lbbakWafApplyResult 逐文件落盘结果（历史问题）：此前失败仅返回单条
 // warning 且仍 commit，版本记录与文件分裂；现按文件/威胁源逐个记账，调用方
 // 据此在事务内丢弃未落盘文件的版本记录并把逐源失败并入 responseWarnings。
 type lbbakWafApplyResult struct {
@@ -441,7 +441,7 @@ func validateLbbakXdbPayload(data []byte) error {
 // applyLbbakWafFilesInLock 落盘 waf 文件(sha 比对幂等);与集群同步落盘同构。
 // 历史问题:ip2regionTag 从备份表区传入——空 tag 会让 ApplyWafFileBundle 删除
 // .version 伴生文件,破坏「文件与版本记录同批」不变量。
-// 历史问题/历史问题/03/08:逐文件结果返回（不再是单一 warning）——落盘失败的
+// 历史问题:逐文件结果返回（不再是单一 warning）——落盘失败的
 // CRS/xdb 由调用方在事务内丢弃对应版本表、威胁库逐源失败并入响应告警；
 // xdb 落盘前必须通过装载验证（坏文件拒绝并保留本地文件）。
 // applyLbbakWafFilesInLock 在有 WAF 文件时要求调用方已持
@@ -556,5 +556,5 @@ func currentTimeFilename() string {
 	return time.Now().Format("20060102-150405")
 }
 
-// 历史问题-F2:原 validateLbbakForImport 死包装(全仓零调用点)已删除——validate
+// 历史问题:原 validateLbbakForImport 死包装(全仓零调用点)已删除——validate
 // 端点直接使用 parseLbbak。

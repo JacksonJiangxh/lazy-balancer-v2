@@ -50,7 +50,7 @@ func r41ACMEJobRow() map[string]any {
 	return map[string]any{"rule_id": "lb_bak_acme", "domain": "bak-acme.example.test", "status": "issued", "cert_pem": "CERT", "key_pem": "KEY"}
 }
 
-// CERT41-1 形状①:坏行在未选分类——sections 过滤前置后,未选「负载规则」
+// 历史修复 形状①:坏行在未选分类——sections 过滤前置后,未选「负载规则」
 // 分类的端口坏行不得误拒整包,且不得落库。
 func TestImportConfigBackup_sectionsUnselectedBadRowsDoNotReject(t *testing.T) {
 	// Given
@@ -77,7 +77,7 @@ func TestImportConfigBackup_sectionsUnselectedBadRowsDoNotReject(t *testing.T) {
 	}
 }
 
-// CERT41-1 形状②:坏行在已选分类——勾选「负载规则」后同一坏行仍整包 400。
+// 历史修复 形状②:坏行在已选分类——勾选「负载规则」后同一坏行仍整包 400。
 func TestImportConfigBackup_sectionsSelectedBadRowsStillReject(t *testing.T) {
 	// Given
 	h := newBackupTestHandlers(t)
@@ -110,7 +110,7 @@ func r41FullBackupWithACMEPair(t *testing.T, sections []string) string {
 	}, nil)
 }
 
-// CERT41-1 形状③:备份带 cert 配置但用户未勾系统数据——过滤后引用按 live
+// 历史修复 形状③:备份带 cert 配置但用户未勾系统数据——过滤后引用按 live
 // 解析(live 缺引用)必须 400,不得按将被丢弃的备份行误放行。
 func TestImportConfigBackup_sectionsUnselectedUsersDanglingACMERejected(t *testing.T) {
 	// Given:live 无 certificate_configs id 7
@@ -129,7 +129,7 @@ func TestImportConfigBackup_sectionsUnselectedUsersDanglingACMERejected(t *testi
 	}
 }
 
-// CERT41-1 形状④:备份带 cert 配置且已选系统数据——按备份行解析(原语义),
+// 历史修复 形状④:备份带 cert 配置且已选系统数据——按备份行解析(原语义),
 // 与 live 无关,导入成功且配置落库。
 func TestImportConfigBackup_sectionsSelectedUsersResolvesAgainstBackupRows(t *testing.T) {
 	// Given:live 无 certificate_configs id 7(解析必须命中备份行)
@@ -149,7 +149,7 @@ func TestImportConfigBackup_sectionsSelectedUsersResolvesAgainstBackupRows(t *te
 	}
 }
 
-// CERT41-1 形状⑤:规则库单独备份(从未携带 cert 表)+选 rules 未选 users——
+// 历史修复 形状⑤:规则库单独备份(从未携带 cert 表)+选 rules 未选 users——
 // 对称),导入成功且警告进响应。
 func TestImportConfigBackup_rulesOnlyBackupLiveDanglingACMEWarns(t *testing.T) {
 	// Given:live 有本地管理员(rules 分类不触碰 users),无 certificate_configs id 7
@@ -182,7 +182,7 @@ func TestImportConfigBackup_rulesOnlyBackupLiveDanglingACMEWarns(t *testing.T) {
 	}
 }
 
-// CERT41-1 回归钉:规则库单独备份 + 未显式分类(默认全选) + live 缺引用——
+// 历史修复 回归钉:规则库单独备份 + 未显式分类(默认全选) + live 缺引用——
 // 默认全选语义下 cert 表「被选但缺席备份」,维持 live 硬解析 400(不降级)。
 func TestImportConfigBackup_rulesOnlyBackupDefaultSectionsLiveDanglingRejected(t *testing.T) {
 	// Given
@@ -204,7 +204,7 @@ func TestImportConfigBackup_rulesOnlyBackupDefaultSectionsLiveDanglingRejected(t
 	}
 }
 
-// CERT41-1 形状⑥a:预览与导入同序——未选分类的坏行不得误报不可导入。
+// 历史修复 形状⑥a:预览与导入同序——未选分类的坏行不得误报不可导入。
 func TestValidateConfigImport_sectionsUnselectedBadRowsStayValid(t *testing.T) {
 	// Given
 	h := newBackupTestHandlers(t)
@@ -222,7 +222,7 @@ func TestValidateConfigImport_sectionsUnselectedBadRowsStayValid(t *testing.T) {
 	}
 }
 
-// CERT41-1 形状⑥b:预览与导入同序——已选分类的坏行预览即报不可导入。
+// 历史修复 形状⑥b:预览与导入同序——已选分类的坏行预览即报不可导入。
 func TestValidateConfigImport_sectionsSelectedBadRowsInvalid(t *testing.T) {
 	// Given
 	h := newBackupTestHandlers(t)
@@ -243,7 +243,7 @@ func TestValidateConfigImport_sectionsSelectedBadRowsInvalid(t *testing.T) {
 	}
 }
 
-// CERT41-1 形状⑥c:预览与导入同序——备份带 cert 配置但未勾系统数据,引用
+// 历史修复 形状⑥c:预览与导入同序——备份带 cert 配置但未勾系统数据,引用
 // 按 live 解析失败,预览即报不可导入(误放行关闭)。
 func TestValidateConfigImport_sectionsUnselectedUsersDanglingACMEInvalid(t *testing.T) {
 	// Given:live 无 certificate_configs id 7
@@ -262,7 +262,7 @@ func TestValidateConfigImport_sectionsUnselectedUsersDanglingACMEInvalid(t *test
 	}
 }
 
-// CERT41-1 形状⑥d:预览与导入同序——规则库单独备份+选 rules 未选 users,
+// 历史修复 形状⑥d:预览与导入同序——规则库单独备份+选 rules 未选 users,
 // live 缺引用→预览可导入并携带悬挂警告(降级对称)。
 func TestValidateConfigImport_rulesOnlyBackupLiveDanglingACMEWarns(t *testing.T) {
 	// Given
@@ -310,7 +310,7 @@ func TestImportCountsDetail_includesSecurityUserContentTables(t *testing.T) {
 	}
 }
 
-// CERT41-4 导入侧接线:手动证书规则的链不完整/域名不匹配警告并入导入
+// 历史修复 导入侧接线:手动证书规则的链不完整/域名不匹配警告并入导入
 // responseWarnings(不阻断);配对合法性仍由 materializeImportCertificates 硬校验。
 func TestImportConfigBackup_warnsManualCertChainAndDomainMismatch(t *testing.T) {
 	// Given
@@ -348,7 +348,7 @@ func TestImportConfigBackup_warnsManualCertChainAndDomainMismatch(t *testing.T) 
 	}
 }
 
-// CERT41-4 接线对照:证书域名覆盖规则域名时不得产生域名不匹配警告
+// 历史修复 接线对照:证书域名覆盖规则域名时不得产生域名不匹配警告
 // (自签单张的链警告仍出现)。
 func TestImportConfigBackup_certWarningsSkipCoveredDomain(t *testing.T) {
 	// Given

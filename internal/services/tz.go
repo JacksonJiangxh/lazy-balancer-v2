@@ -51,7 +51,7 @@ func StartTimezoneRefresh(ctx context.Context) <-chan struct{} {
 	timezoneRefresh.done = done
 	go func() {
 		defer close(done)
-		// D1-历史问题：30s tick 下持久失败逐轮同消息（最坏 2880 行/天）——改状态
+		// 历史问题：30s tick 下持久失败逐轮同消息（最坏 2880 行/天）——改状态
 		// 转换口径（ok→fail 一次 warn、持续静默、fail→ok 一次 info），与
 		// metrics 采集族共用 logStateTransition。
 		refresh := func() {
@@ -81,15 +81,34 @@ func StartTimezoneRefresh(ctx context.Context) <-chan struct{} {
 }
 
 func StopTimezoneRefresh() {
+	StopTimezoneRefreshWithin(0)
+}
+
+// StopTimezoneRefreshWithin 有界停止时区刷新 worker：cancel 后最多等待 within
+// （within<=0=无界，与 StopTimezoneRefresh 同语义）。超时放弃等待并 warn——
+// 进程退出路径用：残留 goroutine 随进程消亡，cancel/done 字段保留，worker
+// 最终退出后可再次调用完成清零（可重启语义不变）。返回 true=worker 已退出
+// 且状态清零。
+func StopTimezoneRefreshWithin(within time.Duration) bool {
 	timezoneRefresh.Lock()
 	defer timezoneRefresh.Unlock()
 	if timezoneRefresh.cancel == nil {
-		return
+		return true
 	}
 	timezoneRefresh.cancel()
-	<-timezoneRefresh.done
+	if within <= 0 {
+		<-timezoneRefresh.done
+	} else {
+		select {
+		case <-timezoneRefresh.done:
+		case <-time.After(within):
+			Logf("warn", "timezone refresh worker 未在关停预算 %s 内退出，放弃等待（进程继续退出）", within)
+			return false
+		}
+	}
 	timezoneRefresh.cancel = nil
 	timezoneRefresh.done = nil
+	return true
 }
 
 func refreshLocation() error {
@@ -194,7 +213,7 @@ func Logf(level, format string, args ...any) {
 // applicationLogWriter 按 "WARNING:"/"ERROR:" 行首前缀做级别过滤（历史修复，
 // 历史·声明）——隐式依赖 main.go log.SetFlags(0)：标准 log 的时间戳/
 // 文件名前缀会顶掉级别前缀使过滤全数落空。两侧契约互指（见 main.go 同名注释）。
-// S历史问题：多行 payload（Logf 消息内嵌换行）逐行判定后重组——只看首行会把
+// 历史问题：多行 payload（Logf 消息内嵌换行）逐行判定后重组——只看首行会把
 // 后续低级别行一并放行（warn/error 档过滤被绕过）。
 type applicationLogWriter struct {
 	w io.Writer
@@ -221,7 +240,7 @@ func (writer *applicationLogWriter) Write(p []byte) (int, error) {
 		}
 		return writer.w.Write(p)
 	}
-	// S历史问题（历史）：多行 payload（Logf 消息内嵌换行）必须逐行判定并
+	// 历史问题（历史）：多行 payload（Logf 消息内嵌换行）必须逐行判定并
 	// 重组——只看首行会让 warn/error 档把后续 info 级行整体放行（级别过滤失效）。
 	lines := bytes.Split(body, []byte("\n"))
 	kept := make([][]byte, 0, len(lines))
@@ -253,7 +272,7 @@ func (writer *applicationLogWriter) Write(p []byte) (int, error) {
 }
 
 // lineAllowedAtThreshold 报告单行日志是否达到配置阈值（行首级别前缀判定）。
-// 调用方不得把多行 payload 直接交给本函数——只看首行会让整体放行（S历史问题）。
+// 调用方不得把多行 payload 直接交给本函数——只看首行会让整体放行（历史问题）。
 func lineAllowedAtThreshold(line []byte, threshold int32) bool {
 	line = trimLeadingASCIIWhitespace(line)
 	if threshold >= logLevelError {

@@ -76,7 +76,7 @@ var threatSystemListLegacyNames = map[string]string{
 
 // migrateThreatSystemListNames 存量 system=1 内置名单按旧名改名为新名（保 id——
 // 策略 refs 按 id 引用）。幂等；种子 INSERT 按新名查重，旧名行不改名会双重存在。
-// CORE-U3（历史）识别同名冲突；历史起新名被占用（如用户手工建的
+// 历史修复（历史）识别同名冲突；历史起新名被占用（如用户手工建的
 // 同名 system=0 名单）时，把冲突用户行改名为「规范名（用户 <id>）」（保 id/
 // 数据），再让 system 行接管规范名。避免同名双行导致选择器歧义，且旧 system
 // 名单不会因跳过改名而永久失更。
@@ -101,7 +101,7 @@ func migrateThreatSystemListNames() error {
 		if conflicts > 0 {
 			// 新名被用户名单占用时不能跳过：旧 system 名单会永久失更。
 			// 把占用的用户行改名为带 id 的唯一名称（保 id/数据），再让
-			// system 行接管规范名（历史 历史问题-1）。
+			// system 行接管规范名（历史问题-1）。
 			rows, rerr := DB.Query(`SELECT id FROM security_ip_lists WHERE name=? AND system=0`, sl.Name)
 			if rerr != nil {
 				return fmt.Errorf("query conflicting threat system list rows: %w", rerr)

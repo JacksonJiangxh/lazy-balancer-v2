@@ -10,13 +10,13 @@ export interface CurrentUser {
 
 export interface UserListItem extends CurrentUser {
   // 历史问题-5:原 Omit<CurrentUser,'is_enabled'> + 立即重加 is_enabled 是
-  // 无操作变换——直接 extends 消除冗余（FE-70-11：is_enabled/mfa_enabled
+  // 无操作变换——直接 extends 消除冗余（历史修复：is_enabled/mfa_enabled
   // 两条 extends 已继承的无操作重声明一并删除）
   created_at?: string | null
   last_login?: string | null
 }
 
-// M5：PATCH /users/me 请求体——提交新密码（password 非空）必须携带
+// 历史修复：PATCH /users/me 请求体——提交新密码（password 非空）必须携带
 // current_password 过后端密码确认门，仅改显示名时不需要。
 export interface UpdateCurrentUserInput {
   readonly display_name?: string
@@ -207,7 +207,7 @@ type ClusterSyncErrorCode = 'schema_too_new' | 'schema_too_old' | 'signature_inv
 
 type ClusterHealthWithSyncError = ClusterHealth & { readonly sync_error_code?: ClusterSyncErrorCode }
 
-/** 节点视图模型（历史问题-历史问题 收敛：ClusterSettings/ClusterMasterPanel 原两处重复
+/** 节点视图模型（历史问题 收敛：ClusterSettings/ClusterMasterPanel 原两处重复
  *  声明）——health.sync_error_code 收窄为已知错误码联合 */
 export type ClusterNodeWithSyncError = Omit<ClusterNode, 'health'> & { readonly health: ClusterHealthWithSyncError | null }
 
@@ -252,7 +252,7 @@ export interface ClusterSyncResult {
 }
 
 /**
- * GET /config 响应（前端消费字段子集，FI-05 单一事实源）：
+ * GET /config 响应（前端消费字段子集，历史修复 单一事实源）：
  * 与后端 models.GlobalConfig 的 json 契约逐字段对齐；集群专属字段
  * （is_master/master_url/sync_interval 等）与敏感字段（dns_credentials）不在此面。
  */

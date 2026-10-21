@@ -2,7 +2,7 @@ package handlers
 
 // 历史问题(历史,历史问题):v2 备份导入钳制缺口——caddy_log_size_mb
 // (写侧 ≥100,caddy.go:305-308)与 audit_log_size_mb(写侧 ≤512,:380-387)
-// 无导入侧钳制(历史问题#3/历史问题 历史问题/历史问题 C-N2 同族漏网):越界值原样落库后,
+// 无导入侧钳制(历史问题 同族漏网):越界值原样落库后,
 // 基础设置保存被写侧校验锁死(400),直至人工修库或重启钳位(若有)。
 
 import (
@@ -81,7 +81,7 @@ func TestImportConfigBackup_clamps_audit_log_size_mb(t *testing.T) {
 	}
 }
 
-// SYS-U1（历史，历史问题——历史问题/历史问题#3 同族漏点）：task_log_size_mb 与
+// 历史修复（历史，历史问题——历史问题 同族漏点）：task_log_size_mb 与
 // runtime_log_size_mb 无导入侧钳制——越界值原样落库后基础设置保存被写侧
 // 1-1024 校验锁死（400）。钳到写侧同边界；非整数形态回退 schema 缺省
 //（10/100，db.go newColumns 登记）。

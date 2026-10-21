@@ -24,7 +24,7 @@ func SelectRuleCertificate(candidates []CertificateCandidate, ruleDomains string
 // CertDaysRemaining 证书剩余天数单源（历史 CERT 域冗余收敛：原
 // certjobs/certinfo/certificates/admintls/helpers 五份同表达式——历史问题 的
 // -int(Ceil(-x)) 与 历史问题 真截断逐值恒等，表达式已统一，本函数固化单一出口）。
-// 口径=向零截断（历史修复/历史问题 未过期 23h→0、过期 1 天 3 小时→-1）；
+// 口径=向零截断（历史问题 未过期 23h→0、过期 1 天 3 小时→-1）；
 // 过期判定勿以返回值 ≤0 兼判（-1h 过期返回 0），另用 !now.Before(notAfter)。
 func CertDaysRemaining(notAfter, now time.Time) int {
 	return int(notAfter.Sub(now).Hours() / 24)
@@ -49,9 +49,9 @@ func CertificateExpiryStatus(notAfter, now time.Time, thresholdDays int) string 
 // 库值唯一真相（批 3）：cert_expiry_days 类型①值型列直读（COALESCE 兜底
 // 删除）——NULL/<=0 由启动回填（db.go defaultUpdates）收敛；此处的降级分支
 // 仅覆盖带外直写/读故障，两分支均 error 级显性留痕后按 历史修复 读故障族
-// 口径取治理默认 db.DefaultCertExpiryDays（R2，历史：降级取值/日志文本
+// 口径取治理默认 db.DefaultCertExpiryDays（历史修复，历史：降级取值/日志文本
 // 全部单源到常量，禁字面量回流——见 handlers/config_get_test.go 消费点族扫描）。
-// 对任务/展示类消费方 历史修复=日志留痕，不静默。
+// 对任务/展示类消费方 fail-visible=日志留痕，不静默。
 func GetCertExpiryThreshold() int {
 	// 历史修复（历史）：同包多数配置读取 helper 有 db.DB==nil 守卫——
 	// 未初始化库回退默认值，不得 nil deref（当前不可达，防御性一致）。
@@ -141,7 +141,7 @@ func GetCertRenewalAttempts() int {
 }
 
 // FormatRuleCertInfo 从 PEM 证书内容生成展示用 RuleCertInfo——批量
-// (handlers.GetRulesCertInfo)与单规则(ParseCertInfo)两路径同用（历史问题 历史修复
+// (handlers.GetRulesCertInfo)与单规则(ParseCertInfo)两路径同用（历史修复
 // 收敛：原 handlers.parseBatchRuleCertInfo 与本文件 ParseCertInfo 两份实现历史
 // 三度分叉）。参数显式化：expiryDays=expiring 阈值天数、now=判定基准（批量取
 // 统一快照，避免逐规则 time.Now 漂移）；caddyID 非空时回填。source=acme_dns 且
@@ -152,7 +152,7 @@ func FormatRuleCertInfo(certPEM, source, ruleDomains, caddyID string, expiryDays
 
 // formatRuleCertInfo 与 FormatRuleCertInfo 同源：cert 非空时复用已解析证书
 // （候选装载阶段预解析的 Leaf），不再 pem.Decode + x509.ParseCertificate
-// （SV历史问题：过期回退逐个候选择优后再解析一次的重复成本）。
+// （历史问题：过期回退逐个候选择优后再解析一次的重复成本）。
 func formatRuleCertInfo(certPEM string, cert *x509.Certificate, source, ruleDomains, caddyID string, expiryDays int, now time.Time) *models.RuleCertInfo {
 	info := &models.RuleCertInfo{
 		CaddyID: caddyID,
@@ -232,7 +232,7 @@ func ParseCertInfo(certPEM, source, ruleDomains string) *models.RuleCertInfo {
 }
 
 // GetRuleCertInfo returns parsed certificate info for a single rule.
-// SV历史问题：返回 error 仅表示读取失败（DB 故障必须 历史修复，不得折叠成
+// 历史问题：返回 error 仅表示读取失败（DB 故障必须 fail-visible，不得折叠成
 // 「无证书信息」假成功）；「规则不存在」与「未启用 TLS」仍以 (nil, nil) 表达
 // ——handler 保持 200 + data:null 的既有契约。批量端点 GetRulesCertInfo 走
 // 另一入口（整批失败已 500），不受本签名影响。
@@ -269,13 +269,13 @@ func GetRuleCertInfo(caddyID string) (*models.RuleCertInfo, error) {
 	}
 }
 
-// getACMECertInfo returns parsed certificate info for an 历史修复 rule.
+// getACMECertInfo returns parsed certificate info for an ACME-issued rule.
 // It reads the issued certificate from cert_jobs.cert_pem.
-// SV历史问题：与规则行读取同契约——cert_jobs 的查询/Scan/迭代失败必须上抛
+// 历史问题：与规则行读取同契约——cert_jobs 的查询/Scan/迭代失败必须上抛
 // （handler 500），不得折叠成 missingACMECertInfo「尚未签发或不存在」假成功：
 // DB 故障与「确实还没有证书」对操作者必须可区分。仅「无候选行」返回 missing。
 func getACMECertInfo(caddyID, ruleDomain string) (*models.RuleCertInfo, error) {
-	// SV历史问题：阈值/基准取一次，供候选选择与过期回退共用——此前
+	// 历史问题：阈值/基准取一次，供候选选择与过期回退共用——此前
 	// ExpiredACMECertInfoFallback 对每个候选调用 ParseCertInfo，每候选一次
 	// global_config 读 + 重复 X509 解析。
 	now := time.Now()
@@ -298,7 +298,7 @@ func getACMECertInfo(caddyID, ruleDomain string) (*models.RuleCertInfo, error) {
 			Logf("error", "GetRuleCertInfo: failed to scan ACME certificate for %s: %v", caddyID, err)
 			return nil, fmt.Errorf("解析规则 %s 的 ACME 证书行: %w", caddyID, err)
 		}
-		// SV历史问题/09：预解析一次，供 SelectRuleCertificate 与过期回退共用。
+		// 历史问题：预解析一次，供 SelectRuleCertificate 与过期回退共用。
 		if candidate.Status != "disabled" {
 			candidate.Leaf = ParseCertificateLeaf(candidate.CertPEM, candidate.KeyPEM)
 		}
@@ -319,12 +319,12 @@ func getACMECertInfo(caddyID, ruleDomain string) (*models.RuleCertInfo, error) {
 	return missingACMECertInfo(caddyID, ruleDomain), nil
 }
 
-// ExpiredACMECertInfoFallback(历史修复/历史修复 共享):候选集 PEM 非空但
+// ExpiredACMECertInfoFallback(历史修复 共享):候选集 PEM 非空但
 // SelectRuleCertificate 无一可选中时,逐个解析——首个非 disabled 且 PEM 非空
 // 的已过期候选按 expired 呈现(Error=「ACME 证书已过期」),不再误报「尚未
 // 签发或不存在」;无已过期候选(解析失败/未过期)返回 nil,调用方维持原口径。
 // 单规则(GetRuleCertInfo)与批量(handlers GetRulesCertInfo)两路径同用。
-// SV历史问题：expiryDays/now 由调用方一次性提供（批量端点已有阈值与 now），
+// 历史问题：expiryDays/now 由调用方一次性提供（批量端点已有阈值与 now），
 // 避免每个候选一次 global_config 查询；解析结果直接复用 FormatRuleCertInfo。
 func ExpiredACMECertInfoFallback(candidates []CertificateCandidate, caddyID, ruleDomain string, expiryDays int, now time.Time) *models.RuleCertInfo {
 	for _, candidate := range candidates {

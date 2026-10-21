@@ -12,7 +12,7 @@ import (
 	"lazy-balancer-v2/internal/models"
 )
 
-// 裁定 2026-09-07 S1/S2：多策略 IP 预检——① 信任名单并入 allow 放行集（信任
+// 裁定 2026-09-07 历史修复：多策略 IP 预检——① 信任名单并入 allow 放行集（信任
 // 优先，与单策略语义一致）；② 交集改为 CIDR 感知（网络包含关系取更具体方）。
 func TestIntersectIPLists_cidrAware(t *testing.T) {
 	tests := []struct {
@@ -90,7 +90,7 @@ func TestBuildIPPrecheck_trustListInclusion(t *testing.T) {
 	}
 }
 
-// 2026-09-08 审计 SF3：D3 门控关闭路径——IPWhitelistEnabled=false 的信任
+// 2026-09-08 审计 SF3：历史修复 门控关闭路径——IPWhitelistEnabled=false 的信任
 // 名单不得并入多策略预检（与 BuildCorazaDirectives 信任三态口径一致）。
 func TestBuildIPPrecheck_trustDisabledNotIncluded(t *testing.T) {
 	// Given：历史问题 allow=[1.2.3.4] trust=[5.6.7.8] 但信任开关关闭；历史问题 deny=[9.9.9.9]
@@ -109,7 +109,7 @@ func TestBuildIPPrecheck_trustDisabledNotIncluded(t *testing.T) {
 }
 
 // 2026-09-08 审计 SF1：同基址不同掩码的方向独立性。
-// SEC-D1（历史）：语义钉迁移到生产唯一实现 cidrIntersectParsed（经
+// 历史修复（历史）：语义钉迁移到生产唯一实现 cidrIntersectParsed（经
 // parseEntryCached 构造条目，镜像 intersectIPLists 调用形态）——旧
 // cidrIntersectEntry 自 历史问题 预解析缓存改造后生产零调用，已删除。
 func TestCidrIntersectParsed_directionIndependent(t *testing.T) {
@@ -122,7 +122,7 @@ func TestCidrIntersectParsed_directionIndependent(t *testing.T) {
 	}
 }
 
-// TestBuildCorazaDirectives_BodyAccessTruthTable(R-6 首例,S历史问题):
+// TestBuildCorazaDirectives_BodyAccessTruthTable(历史修复 首例,历史问题):
 // 机械枚举 body 门控读取的全部变量交叉积——mode(4)×自定义规则态(3:
 // 无规则/停放启用/发射启用)×IP 控制(2)。期望:On ⟺ crsActive ‖
 // (customActive && hasCustomRules)。历史:历史修复 引擎不可消费条件→历史修复 停放
@@ -144,7 +144,7 @@ func TestBuildCorazaDirectives_BodyAccessTruthTable(t *testing.T) {
 		// crsActive(blocking/detection):恒 On(CRS phase:2 消费)
 		{"blocking", "none", false, true},
 		// parked 格仅对 off 有实义(非 off 模式 parked/emitted 同输入等价类,
-		// S历史问题 去重)。
+		// 历史问题 去重)。
 		{"blocking", "emitted-enabled", false, true},
 		{"blocking", "none", true, true},
 		{"detection", "none", false, true},
@@ -154,7 +154,7 @@ func TestBuildCorazaDirectives_BodyAccessTruthTable(t *testing.T) {
 		{"custom_only", "emitted-enabled", true, true},
 		{"custom_only", "none", false, false}, // 空策略→default return ""
 		{"custom_only", "none", true, false},  // 仅 IP 控制:phase:1,无 body 消费者
-		// off:IP/GeoIP 仅 phase:1,停放规则不发射→Off(S历史问题 回归格)
+		// off:IP/GeoIP 仅 phase:1,停放规则不发射→Off(历史问题 回归格)
 		{"off", "none", true, false},
 		{"off", "parked-enabled", true, false}, // ← 历史修复 反向回归格:此前误 On
 		{"off", "parked-enabled", false, false},
@@ -193,12 +193,12 @@ func TestBuildCorazaDirectives_BodyAccessTruthTable(t *testing.T) {
 	}
 }
 
-// TestBuildCorazaDirectives_customOnlyIPControlSkipsBodyProcessors（SEC-历史问题，
+// TestBuildCorazaDirectives_customOnlyIPControlSkipsBodyProcessors（历史问题，
 // 历史）：custom_only+仅 IP 控制（零启用自定义规则）形状下
 // SecRequestBodyAccess 恒 Off（BodyAccessTruthTable 该格已钉），body
 // processor 激活规则 id:9/10/11 无任何消费者——不得发射（死指令）。
 // 对照格：custom_only+启用自定义规则时 id:9/10/11 必须在场（body 条件规则
-// 依赖解析，SEC-REVIEW-03）。
+// 依赖解析，历史修复）。
 func TestBuildCorazaDirectives_customOnlyIPControlSkipsBodyProcessors(t *testing.T) {
 	// Given：custom_only + 仅 IP 控制（无自定义规则）
 	ipOnly := &models.SecurityPolicy{Mode: "custom_only", Enabled: true,
@@ -312,7 +312,7 @@ func TestBuildCorazaDirectives_multiPolicyAllowSelfTrustExclusion(t *testing.T) 
 	}
 }
 
-// 历史 历史问题（历史问题）：a==b 字面捷径不得免检——两条 allow 名单含同一坏
+// 历史问题（历史）：a==b 字面捷径不得免检——两条 allow 名单含同一坏
 // 条目（集群同步/带外改库可注入，保存面校验不覆盖存量行）时，交集被坏条目
 // 顶成非空，恒拒规则（id:7 @rx .*）不发射、改发含坏行投影 → @ipListFast
 // 构建期 fail-closed 整份渲染失败。与聚合面「不可解析不参与匹配」同口径：
@@ -373,12 +373,12 @@ func TestCountEnabledCustomRulesBatch_matchesSingles(t *testing.T) {
 	}
 }
 
-// —— 畸形爬虫引擎列静默等价「全部引擎」（SSA-87-08，历史） ——
+// —— 畸形爬虫引擎列静默等价「全部引擎」（历史修复，历史） ——
 
 // 畸形非空 engines 保留「全部引擎」向后兼容语义但必须 WARN 留痕（否则豁免面
 // 被静默放大且零告警）；空集（""/空白/"[]"）不是畸形、不告警；合法形态只命中
 // 勾选引擎。
-func TestSSA8708_malformedCrawlerEnginesWarnsAndKeepsCompat(t *testing.T) {
+func TestCrawlerEngines_malformedWarnsAndKeepsCompat(t *testing.T) {
 	var logs bytes.Buffer
 	oldWriter := log.Writer()
 	log.SetOutput(&logs)

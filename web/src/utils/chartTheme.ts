@@ -11,7 +11,7 @@ const chartPalette = {
 } as const
 
 /** 状态 → 色（任务监控/安全总览共用语义色）——键=TaskStatus 实际产出值
- * （running/idle/queued/failed/disabled；B1-3 历史清理：cancelled/stopped
+ * （running/idle/queued/failed/disabled；历史修复清理：cancelled/stopped
  * 为零产出死键——方案 A 后 stopped 已退役、cancelled 仅存在于 task_runs
  * result 字段非状态列；passive/no_runs 曾为零产出死条目，历史问题-08 清理） */
 export const statusColor: Record<string, string> = {

@@ -27,7 +27,7 @@ func r54BackupTLSRule(tlsSource any) map[string]any {
 // （manual/acme_dns）——空串/垃圾值（如 'https'）此前两个分支都不命中、整包放行，
 // 导入后渲染侧 availableCerts 仅认 manual/acme_dns，该规则无证书 → TLS 端口明文服务。
 // 保存侧（rules.go）与启用侧（rule_features.go:697-699）均 400 此形态，导入不得更宽。
-// 历史修复 C-1：TLS 形态校验迁至 validateV2BackupTLSShape（冲突置禁用之后执行）。
+// 历史修复：TLS 形态校验迁至 validateV2BackupTLSShape（冲突置禁用之后执行）。
 func TestValidateV2BackupTLSShape_rejects_unknown_tls_source(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -68,7 +68,7 @@ func TestValidateV2BackupTLSShape_rejects_unknown_tls_source(t *testing.T) {
 
 // 历史修复 新发现1 对照组：禁用行 tls_source 为垃圾值不阻断导入（不参与渲染），
 // 与 历史修复 矩阵「禁用的 acme_dns 坏行不阻断导入」同口径。
-// 历史修复 C-1：TLS 形态校验迁至 validateV2BackupTLSShape（冲突置禁用之后执行）。
+// 历史修复：TLS 形态校验迁至 validateV2BackupTLSShape（冲突置禁用之后执行）。
 func TestValidateV2BackupTLSShape_allows_disabled_rule_with_unknown_tls_source(t *testing.T) {
 	newBackupTestHandlers(t)
 	rule := r54BackupTLSRule("")
@@ -79,7 +79,7 @@ func TestValidateV2BackupTLSShape_allows_disabled_rule_with_unknown_tls_source(t
 }
 
 // 历史修复 新发现1（acme_dns 合法值仍走原有校验）：合法 acme_dns 行不因白名单误伤。
-// 历史修复 C-1：TLS 形态校验迁至 validateV2BackupTLSShape（冲突置禁用之后执行）。
+// 历史修复：TLS 形态校验迁至 validateV2BackupTLSShape（冲突置禁用之后执行）。
 func TestValidateV2BackupTLSShape_allows_valid_acme_dns_row(t *testing.T) {
 	newBackupTestHandlers(t)
 	tables := map[string][]map[string]any{
@@ -118,12 +118,12 @@ func TestValidateV2BackupCertJobs_domain_matching(t *testing.T) {
 		wantErrText string
 	}{
 		{
-			name:        "缺少任务行被拒绝（R53-A-2 迁入）",
+			name:        "缺少任务行被拒绝（历史修复 迁入）",
 			tables:      r54ACMEJobTables("", ""),
 			wantErrText: "缺少证书签发任务",
 		},
 		{
-			name:        "任务行全部 disabled 被拒绝（R53-A-2 迁入）",
+			name:        "任务行全部 disabled 被拒绝（历史修复 迁入）",
 			tables:      r54ACMEJobTables("bak-acme.example.test", "disabled"),
 			wantErrText: "缺少证书签发任务",
 		},

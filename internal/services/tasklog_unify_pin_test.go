@@ -22,7 +22,7 @@ func TestCollectCertJobRows_TerminalCounts(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close(); db.DB, db.MetricsDB, db.AuditDB = oldDB, oldM, oldA })
 	now := time.Now().UTC().Format("2006-01-02 15:04:05")
-	// D2-历史问题（历史）：种子写入错误不得丢弃——静默失败会让整条断言链
+	// 历史问题（历史）：种子写入错误不得丢弃——静默失败会让整条断言链
 	// 在空表上「通过」。
 	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, updated_at) VALUES ('r1','a.test','issued',?)`, now); err != nil {
 		t.Fatalf("seed issued row: %v", err)
@@ -182,7 +182,7 @@ func TestCollectCertJobRows_oldTerminalStillShown(t *testing.T) {
 	}
 }
 
-// V87-TO-06：读库失败的回退值不得写入缓存——DB 瞬时不可用时任务日志此前按
+// 历史修复：读库失败的回退值不得写入缓存——DB 瞬时不可用时任务日志此前按
 // 10MB 滚动并钉死整个 5 分钟窗口（审计侧同职责缓存已按「失败不缓存」实现）。
 func TestGetTaskLogSizeBytes_readFailureNotCached(t *testing.T) {
 	initServicesDB(t)

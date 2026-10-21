@@ -170,7 +170,7 @@ func TestListSecurityEvents_carriesIPLocationField(t *testing.T) {
 }
 
 func TestGetSecurityOverview_topIPsCarryIPLocationField(t *testing.T) {
-	// Given: one recent event feeding the Top-10 table
+	// Given: one recent event feeding the 历史修复 table
 	setupSecurityPolicyTestDB(t)
 	router := newSecurityEventsRouter(t)
 	seedSecurityEvent(t, time.Now().UTC().Format("2006-01-02 15:04:05"), "lb_loc2", 1, "942100", "SQL Injection")
@@ -202,7 +202,7 @@ func TestGetSecurityOverview_topIPsCarryIPLocationField(t *testing.T) {
 	}
 }
 
-// N15-F2：ListSecurityPolicies 的 rule_caddy_id 过滤按绑定表筛出该规则绑定的
+// 历史修复：ListSecurityPolicies 的 rule_caddy_id 过滤按绑定表筛出该规则绑定的
 // 策略（IP 归属地弹窗按当前规则收敛可选策略列表所依赖的口径）。
 func TestListSecurityPolicies_ruleCaddyIDFilter(t *testing.T) {
 	// Given：两条启用策略，仅甲绑定到规则 lb_filter1

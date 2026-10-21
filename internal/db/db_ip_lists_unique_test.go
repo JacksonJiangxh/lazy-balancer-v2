@@ -2,7 +2,7 @@ package db
 
 import "testing"
 
-// 历史修复2：system=1 名单必须有 name 唯一性兜底；同名 system=0 用户列表
+// 历史修复：system=1 名单必须有 name 唯一性兜底；同名 system=0 用户列表
 // 仍允许存在（部分索引只覆盖 system=1）。
 func TestMigrateSystemIPListUniqueIndex_dedupesAndEnforces(t *testing.T) {
 	database := openMigrationTestDB(t)
@@ -50,7 +50,7 @@ func TestMigrateSystemIPListUniqueIndex_dedupesAndEnforces(t *testing.T) {
 	}
 }
 
-// 历史修复2：EnsureSystemIPList 在唯一索引下重复调用仍幂等（OR IGNORE 路径）。
+// 历史修复：EnsureSystemIPList 在唯一索引下重复调用仍幂等（OR IGNORE 路径）。
 func TestEnsureSystemIPList_idempotentWithUniqueIndex(t *testing.T) {
 	database := openMigrationTestDB(t)
 	if err := createTables(); err != nil {

@@ -12,7 +12,7 @@ package caddygeoip
 //     误差——大屏光流为密度示意，可接受。
 //   - 国名口径：计数/事件桶键经 geoipnames.NormalizeCountry 归一（xdb 中文
 //     异体如「美国」折叠为英文规范名；「中国」保留）——app 聚合端点按翻译
-//     后中文名重建 map（覆盖语义），异体分键会被丢计数（A85PLG 历史问题）；
+//     后中文名重建 map（覆盖语义），异体分键会被丢计数（历史问题）；
 //     客户端请求头不参与计数，本模块不加依赖。
 //   - 统计边界：计数由链尾 lb_security_blocked_counter 执行；国名只来自
 //     geoip2region 的服务端变量。未启用地域能力的规则没有该变量，因此不产生
@@ -93,7 +93,7 @@ const (
 // trafficCountryKeyValid 判定国名键是否为可展示的国家值：xdb 对私网/保留
 // 网段行的国家列常为 "0"/"Reserved"，不可解析行为空串。与事件聚合端点
 // （internal/handlers/security_threat_screen.go 的 ""/"0"/"Reserved" 过滤）
-// 同口径——E81-历史问题：大屏只为真实国家画弧/建桶。
+// 同口径——历史问题：大屏只为真实国家画弧/建桶。
 func trafficCountryKeyValid(country string) bool {
 	switch strings.TrimSpace(country) {
 	case "", "0", "Reserved":
@@ -123,7 +123,7 @@ func trafficEntryFor(country string) *trafficEntry {
 	return e
 }
 
-// normalizeTrafficCountryKey 归一统计/事件桶的国名键（A85PLG 历史问题）：
+// normalizeTrafficCountryKey 归一统计/事件桶的国名键（历史问题）：
 // TrimSpace 后海外异体（xdb 中文「美国」等）经 geoipnames.NormalizeCountry
 // 折叠为规范名——与发射侧 geoipLocFor（handler.go）同表同函数；「中国」
 // 保留（NormalizeCountry 对其返回空串，须前置保留）；无效值（空/0/Reserved）
@@ -140,7 +140,7 @@ func normalizeTrafficCountryKey(country string) string {
 // trafficRecord 记一次请求（country 非国家值=未解析/私网保留段——跳过；
 // 抽样期按 1/N 计数并 ×N 还原）。
 func trafficRecord(country string, attack bool) {
-	// E83-历史问题 + A85PLG 历史问题：国名键 TrimSpace + 异体归一——否则空白异形
+	// 历史问题：国名键 TrimSpace + 异体归一——否则空白异形
 	// （" 中国"）与中文异体（"美国"）各建脏桶，大屏出现重复国桶且 app 侧
 	// 覆盖式聚合丢计数。发射侧已归一，此处为纵深防御。
 	country = normalizeTrafficCountryKey(country)

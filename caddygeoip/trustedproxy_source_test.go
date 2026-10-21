@@ -1,7 +1,7 @@
 package caddygeoip
 
 // http.ip_sources.lb_file（2026-10-15 受信代理网段热路径化）的模块单测：
-// 加载/热重载/fail-stale/坏行 fail-fast/白名单/引擎级（R-10：真实 Caddy
+// 加载/热重载/fail-stale/坏行 fail-fast/白名单/引擎级（历史修复：真实 Caddy
 // 加载含 lb_file 的配置）。文件缓存与解析语义单源在 wafiplist（@ipListFast
 // 同一缓存），本文件只测模块装配与 IPRangeSource 契约形态。
 
@@ -229,7 +229,7 @@ func TestFileIPRangeSource_instances_resolve_independently(t *testing.T) {
 	}
 }
 
-// TestFileIPRangeSource_engine_gate_real_caddy_load（R-10）：真实 Caddy 引擎
+// TestFileIPRangeSource_engine_gate_real_caddy_load（历史修复）：真实 Caddy 引擎
 // 加载含 trusted_proxies lb_file 的配置——模块装配/命名空间/JSON 形态的
 // 验证终点是引擎接受，字符串断言不构成行为验证。
 func TestFileIPRangeSource_engine_gate_real_caddy_load(t *testing.T) {

@@ -14,7 +14,7 @@
       </el-button>
     </div>
 
-    <!-- W87-04：主数据失败与「确实没有策略」必须可区分——保留旧表 + 重试入口
+    <!-- 历史修复：主数据失败与「确实没有策略」必须可区分——保留旧表 + 重试入口
          （同族页 SecurityRules/SecurityBlockPages 同款 error-banner 范式） -->
     <el-alert v-if="policiesLoadError" type="error" :closable="false" show-icon class="polling-error-alert error-banner mb-5">
       <template #title>
@@ -570,7 +570,7 @@
               <el-switch v-model="form.geoip_enabled" @change="onGeoipEnabledChange" />
             </el-form-item>
             <template v-if="form.geoip_enabled">
-              <!-- 历史问题 二十七次 N3（裁决）：披露 IPv6/不可解析客户端语义——
+              <!-- 历史问题（裁决）：披露 IPv6/不可解析客户端语义——
                    fail-closed 设计下它们按「海外」处理。 -->
               <el-form-item><div class="info-note-bar"><span class="info-note-desc">地域规则仅对 IPv4 生效：IPv6 与不可解析客户端按「海外」处理（拦截模式勾选海外时将被拦截；仅允许模式只勾选省份时将被拦截）。IP 库未安装时地域规则不可启用。</span></div>
               </el-form-item>
@@ -581,7 +581,7 @@
                 </el-radio-group>
               </el-form-item>
               <el-form-item label="区域选择">
-                <!-- 历史问题 二十三次（用户裁决）：区域精确到市——省级联选择；只选省 =
+                <!-- 历史问题（用户裁决）：区域精确到市——省级联选择；只选省 =
                      整省生效（存量语义），展开选市 = 省+市联合匹配（省/市 形态）。
                      v2.3.7 修正：独立「海外」一级叶子取消——「海外国家」父节点
                      可勾选，勾选 = 全部海外（解析失败/IPv6 兜底哨兵 ∪ 全部
@@ -596,7 +596,7 @@
                   style="width: 100%"
                 />
                 <div class="form-tip-line">基于 IP2Region 离线库判断访客所在区域，与 CIDR 规则同时生效；只选省份 = 整省生效</div>
-                <!-- A85WB-历史问题：加载失败显性化+重试；已保存的地域值保留不清空 -->
+                <!-- 历史修复：加载失败显性化+重试；已保存的地域值保留不清空 -->
                 <div v-if="regionsError" class="form-tip-line">
                   <el-text type="danger" size="small">地域数据加载失败，已保存的地域配置仍保留。</el-text>
                   <el-link type="primary" size="small" @click="fetchRegions">重试</el-link>
@@ -611,7 +611,7 @@
                     <el-checkbox v-for="e in crawlerEngineOptions" :key="e.id" :value="e.id">{{ e.name }}</el-checkbox>
                   </el-checkbox-group>
                   <div class="form-tip-line">勾选的引擎经反向 DNS/官方 IP 段验证为真实爬虫后豁免地域拦截（IP 名单/WAF/限流仍全量生效）；伪装爬虫 UA 的请求会被拒绝并记录攻击事件。360 无反查支持按官方 IP 段验证；标注「观察级」的引擎按厂商域名验证</div>
-                  <!-- W87-03：空选=全部引擎（后端空集语义），必须显性说明——否则
+                  <!-- 历史修复：空选=全部引擎（后端空集语义），必须显性说明——否则
                        用户以为「全不选=不豁免」，实际是全豁免 -->
                   <div v-if="form.geoip_crawler_engines.length === 0" class="form-tip-line">
                     <el-text type="warning" size="small">未勾选任何引擎：等于豁免全部引擎（此形态不可保存，请至少勾选一个或关闭爬虫豁免）</el-text>
@@ -749,7 +749,7 @@
               <div v-if="form.block_page_id === 0" class="form-tip-line">{{ editorPolicyType === 'stage2' ? '不配置拦截页：429 返回空响应体（可选内置「限流拦截页面」）' : '不配置拦截页；规则无阶段页覆盖且同规则无其他策略页时，拦截返回 Caddy 默认 403' }}</div>
               <div v-else class="form-tip-line">拦截时返回给客户端的自定义页面，在"拦截页面"页面管理，<el-link type="primary" @click="goToBlockPagesPage">去创建/编辑</el-link></div>
               <!-- 拦截页归因分层口径：规则可配阶段页覆盖；未覆盖时按触发策略显示。
-                   W87-01：逐阶段按后端渲染事实判定（阶段 1/2 取绑定链首个有页策略，
+                   历史修复：逐阶段按后端渲染事实判定（阶段 1/2 取绑定链首个有页策略，
                    阶段 3 逐策略合成码；规则级覆盖压过策略页），不再恒渲染绿色「生效中」。 -->
               <div v-if="boundRuleRows.length > 0" class="block-page-rule-annotations">
                 <div v-for="row in boundRuleRows" :key="row.caddyId" class="block-page-rule-annotation">
@@ -1020,7 +1020,7 @@ const authStore = useAuthStore()
 const isReadOnly = computed(() => authStore.readOnlyReason !== null)
 
 const users = ref<UserListItem[]>([])
-// 更新者显示名走 utils/updaterName 单源（A85WA-历史问题 四份同构收敛）
+// 更新者显示名走 utils/updaterName 单源（历史修复 四份同构收敛）
 const getUpdaterName = (userId?: number) => updaterName(users.value, userId)
 
 const crsRuleOptions = ref<CRSRuleOption[]>([])
@@ -1034,10 +1034,10 @@ const crsExcludedRows = ref<CrsExcludedRow[]>([])
 const loading = ref(false)
 const saving = ref(false)
 const policies = ref<PolicySummary[]>([])
-// W87-04：主列表拉取失败必须可辨识（否则「加载失败」与「确实没有策略」同形，
+// 历史修复：主列表拉取失败必须可辨识（否则「加载失败」与「确实没有策略」同形，
 // 用户会误以为策略被清空）。失败保留旧数据，仅置错误态供横幅+重试。
 const policiesLoadError = ref(false)
-// W87-05：拦截页列表是否至少成功落地过一次——未落地时不得做「页面已删除/
+// 历史修复：拦截页列表是否至少成功落地过一次——未落地时不得做「页面已删除/
 // 内容为空」的空页预告（bpRes 部分失败会让所有启用策略显示假警告）。
 const blockPagesLoaded = ref(false)
 const policySearch = ref('')
@@ -1084,13 +1084,13 @@ const filteredPolicies = computed(() => {
 const policyPage = ref(1)
 const policyPageSize = ref(10)
 watch([activeTypeTab, policySearch], () => { policyPage.value = 1 })
-// 分页夹紧+切片：useClampedPagination 单一范式（历史 历史问题，取代 computed
+// 分页夹紧+切片：useClampedPagination 单一范式（历史问题，取代 computed
 // 内副作用赋值反模式）
 const { pagedItems: pagedPolicies } = useClampedPagination(filteredPolicies, policyPage, policyPageSize)
 
 // 三阶段启用 chips 谓词：阶段 1=IP 访问控制||地域拦截、阶段 2=限流、
-// 阶段 3=后端 G3 口径（has_waf=CRS 生效 ∪ custom_only ∪ 自定义规则数>0；
-// has_custom_rules 带 S7 off 门且不含 custom_only 空规则形，不再直接消费）
+// 阶段 3=后端 历史修复 口径（has_waf=CRS 生效 ∪ custom_only ∪ 自定义规则数>0；
+// has_custom_rules 带 历史修复 off 门且不含 custom_only 空规则形，不再直接消费）
 const stage3ChipOn = (row: PolicySummary): boolean => row.has_waf || row.mode === 'custom_only' || row.custom_rules_count > 0
 
 
@@ -1139,7 +1139,7 @@ const policySummaryLine = (row: PolicySummary): string => {
     // 与锁摘要/详情弹框共用共享投影器口径（历史问题-05）：
     // ① ACL 关闭但遗留独立黑名单仍在拦截时不得显示「未启用 ACL」；
     // ② 地域关闭但保留区域时如实标注「已关闭（保留 N 区域）」。
-    // WU-09（审计 87 口径分层）：内容门 hasIPACLControl 只决定「是否有渲染产物」，
+    // 历史修复（历史修复口径分层）：内容门 hasIPACLControl 只决定「是否有渲染产物」，
     // 列表摘要展示必须与后端 SecurityPolicyHasIPControl（ip_acl_enabled 开启即
     // true）对齐——显式开启 ACL 但名单为空时显示模式与 0 条，而不是「未启用」。
     const aclPart = row.ip_acl_enabled === true || hasIPACLControl(row) ? formatAclModeDetail(ipLists.value, row) : '未启用 ACL'
@@ -1159,7 +1159,7 @@ const stageOverrideSaving = ref<Record<string, boolean>>({})
 // 上次保存失败待重试（历史问题）：失败不得回写 seed（待提交项消失=与「重新
 // 点击保存可重试」承诺矛盾），改记失败标记并在行内显示「待重试」。
 const stageOverrideFailed = ref<Record<string, boolean>>({})
-// W87-09：批量端点会跳过 TCP/不存在的规则（200 + skipped 列表）——被跳过的规则
+// 历史修复：批量端点会跳过 TCP/不存在的规则（200 + skipped 列表）——被跳过的规则
 // 不得回写「已覆盖」，需逐条记住原因并保持待提交（下次保存重试）。
 const stageOverrideSkipped = ref<Record<string, string>>({})
 
@@ -1198,7 +1198,7 @@ const onStageOverrideChange = (caddyId: string, stage: 1 | 3, field: 'id' | 'sta
   } else if (stage === 1) edit.stage1_status = value
   else edit.stage3_status = value
   stageOverrideEdits.value = { ...stageOverrideEdits.value, [caddyId]: edit }
-  // W87-09：用户重新选择即清除「未写入」标记（原因来自上一次写入，已不适用）
+  // 历史修复：用户重新选择即清除「未写入」标记（原因来自上一次写入，已不适用）
   if (stageOverrideSkipped.value[caddyId]) {
     const nextSkipped = { ...stageOverrideSkipped.value }
     delete nextSkipped[caddyId]
@@ -1226,7 +1226,7 @@ const migrateChildTypes = computed<SecurityPolicyType[]>(() => {
   const types: SecurityPolicyType[] = []
   // 含信任名单 → 产出「原名（阶段 0）」子策略（后端 trust_detection 恒 1=保留检测，行为保持）
   if (hasTrustEntries(p)) types.push('stage0')
-  // 历史 历史问题：改用 securityStages 单一事实源（ACL 启用 ∧ 内联∪引用
+  // 历史问题：改用 securityStages 单一事实源（ACL 启用 ∧ 内联∪引用
   // 非空，或遗留黑名单非空——与后端 PolicyTypeFeatures 同口径）——旧本地谓词
   // 要求内联条目非空且 migrate 路径不拉条目值，仅靠引用列表的混合策略预演
   // 会漏报阶段 1。
@@ -1354,7 +1354,7 @@ const viewPolicySections = computed<ViewPolicySection[]>(() => {
     {
       title: '阶段 1 · IP 访问控制',
       rows: [
-        // WU-09：与列表摘要同口径——ip_acl_enabled 开启即展示模式（即使名单为空），
+        // 历史修复：与列表摘要同口径——ip_acl_enabled 开启即展示模式（即使名单为空），
         // 内容门只用于阶段能力/类型推断
         { label: '访问控制', value: d.ip_acl_enabled === true || hasIPACLControl(d) ? formatAclModeDetail(ipLists.value, d) : '未启用' },
         // 信任名单只归阶段 0 段（2026-09-21 用户裁定：独立阶段 0，阶段 1 不再重复展示）
@@ -1468,13 +1468,13 @@ const fetchIpLists = async (seq?: number): Promise<void> => {
 }
 // 合并内联 + 引用列表条目（按精确字符串去重，与 v1 匹配口径一致）；缓存中缺失的
 // 引用列表跳过（防御性回退为仅内联）。内核统一在 utils/securityStages
-// mergeIpEntryValues（历史问题 FE-3 收敛），本处仅适配 ipListDetails 数据源成形。
+// mergeIpEntryValues（历史问题 收敛），本处仅适配 ipListDetails 数据源成形。
 const mergeIpEntries = (inline: string[], refs: number[]): string[] =>
   mergeIpEntryValues(inline, refs.map((id) => (ipListDetails.value[id] ?? []).map((e) => e.value)))
 // 条数-only 合并口径（列表页摘要用，不拉条目值）：内联去重数 + Σ引用名单
 // entry_count。与 mergeIpEntries 的去重合计可能略有出入（内联与引用重叠时），
 // 仅作列表页一行摘要展示；精确合计以向导内（条目已加载）为准。
-// FE-R1（历史）：本地 mergedIpEntryCount 与 utils/securityStages 共享
+// 历史修复（历史）：本地 mergedIpEntryCount 与 utils/securityStages 共享
 // mergeIpEntryCount 逐字重复——删除本地实现，调用点直连共享函数。
 // 引用侧合计条数（各列表条目数之和，不去重——去重后的合计在 hint 的「合计」中给出）
 const selectedRefEntryCount = (refs: number[]): number => refs.reduce((sum, id) => sum + (ipLists.value.find((l) => l.id === id)?.entry_count ?? 0), 0)
@@ -1518,7 +1518,7 @@ const pendingOverrideRules = computed<Array<{ caddyId: string; edit: StageOverri
       || edit.stage3_id !== seed.stage3_id || edit.stage3_status !== seed.stage3_status)
     .map(({ caddyId, edit }) => ({ caddyId, edit })))
 const originalBoundRules = ref<string[]>([])
-// 历史问题 D60-F1：策略对话框打开序列号——丢弃在途详情 GET 的过期返回。
+// 历史问题：策略对话框打开序列号——丢弃在途详情 GET 的过期返回。
 let policyDialogOpenSeq = 0
 
 // 步骤条按阶段序重排（实体单职化）：基础信息 → 阶段 1 → 阶段 2 → 阶段 3 → 拦截页 → 关联规则 → 预览；
@@ -1545,7 +1545,7 @@ const WIZARD_STEP_META: Record<WizardStep, { title: string; icon: typeof InfoFil
   [WIZARD_STEP.PREVIEW]: { title: '配置预览', icon: Check },
 }
 const currentStep = ref<WizardStep>(WIZARD_STEP.BASIC)
-// 条目值惰性拉取（历史 F55 追加问题修复，方案 A）：进入 IP/信任编辑、关联
+// 条目值惰性拉取（历史修复 追加问题修复，方案 A）：进入 IP/信任编辑、关联
 // 规则或配置预览时补齐缺失条目——后两步的冲突链与预览同样消费引用条目。
 watch([currentStep, ipACLList, ipWhitelist, ipACLListRefs, ipWhitelistRefs], ([step]) => {
   if (step !== WIZARD_STEP.IP_ACL && step !== WIZARD_STEP.TRUST
@@ -1638,12 +1638,12 @@ const selectedCustomRules = ref<number[]>([])
 // action 用于多策略冲突检测（放行型 pass / 拦截型 block）；enabled 预留
 const allCustomRules = ref<Array<{ id: number; name: string; action?: string; enabled?: boolean }>>([])
 
-// 返回是否加载成功——历史问题 D-4：聚焦流程（FE42-1 起为 ?sp= 策略 ID）需区分
+// 返回是否加载成功——历史问题：聚焦流程（历史修复 起为 ?sp= 策略 ID）需区分
 // 「列表加载失败」与「策略确已删除」，否则瞬时失败会被误报为「已被删除」。
 const fetchData = async (): Promise<boolean> => {
   loading.value = true
   try {
-    // 历史问题 二十六次 W3-1：allSettled 替代 all——策略主数据失败才整体报错，
+    // 历史问题：allSettled 替代 all——策略主数据失败才整体报错，
     // 辅助数据（规则/CRS 选项/拦截页/绑定/用户）部分失败保留已有数据，
     // 避免「保存策略后任一辅助端点失败 → 整个列表不刷新」的 stale 状态。
     const [polRes, ruleRes, crsRes, bpRes, crRes, bindRes, userRes, ipListRes] = await Promise.allSettled([
@@ -1659,7 +1659,7 @@ const fetchData = async (): Promise<boolean> => {
     ])
     if (polRes.status === 'rejected') {
       console.error('Failed to load policies data:', polRes.reason)
-      // W87-04：错误态显性化——保留旧数据（若有），横幅+重试由模板渲染
+      // 历史修复：错误态显性化——保留旧数据（若有），横幅+重试由模板渲染
       policiesLoadError.value = true
       return false
     }
@@ -1683,7 +1683,7 @@ const fetchData = async (): Promise<boolean> => {
 }
 
 // JSON 数组文本解析走 utils/securityStages（单源）：文本 JSON.parse 后委托
-// parseUnknownIds 的对象/数字双形态守卫（A85WB-历史问题 收敛——原与本模块
+// parseUnknownIds 的对象/数字双形态守卫（历史修复 收敛——原与本模块
 // parseUnknownIds 同构两份，存在漂移风险）。
 const parseCustomRuleIds = (raw: string | undefined): number[] => {
   if (!raw) return []
@@ -1781,7 +1781,7 @@ const removeCrsGroupValue = (value: string): void => {
   crsRuleGroups.value = crsRuleGroups.value.filter((v) => v !== value)
 }
 
-// crsResponsePhaseGroupCodes（历史问题 二十九次 L9）：响应阶段 CRS 类别两位代码
+// crsResponsePhaseGroupCodes（历史问题）：响应阶段 CRS 类别两位代码
 //（950-956/980）——这些组仅在「检查响应体」开启时才被后端 Include
 //（security.go:169-177），否则静默 no-op。用于给选中响应组但开关关闭的用户
 // 一个针对性提示。959 响应评估为系统基础组（随响应检查开启由后端强制加载，
@@ -1793,7 +1793,7 @@ const hasResponsePhaseGroupWithoutCheck = computed(
 
 // 拦截评估规则（949 请求阻断评估 / 959 响应评估）排除判定：拦截模式下这两组负责
 // 按异常阈值执行阻断，排除后阈值拦截失效。目标形态覆盖两位组号 49/59、949xxx/959xxx
-// 六位规则 ID、REQUEST-949-*/RESPONSE-959-* 文件名，以及与 949000-949999 /
+// 六位规则 ID、REQUEST-949-*/历史修复-* 文件名，以及与 949000-949999 /
 // 959000-959999 相交的区间遗留形态。
 const isEvalGroupExclusionTarget = (target: string): boolean => {
   const t = target.trim()
@@ -1810,7 +1810,7 @@ const isEvalGroupExclusionTarget = (target: string): boolean => {
   return false
 }
 // 仅 scope=all 的 949/959 排除使阈值拦截全局失效；scoped 排除只影响命中来源
-// IP，不配「全局失效」的无条件告警（审计 F-S2 口径）。
+// IP，不配「全局失效」的无条件告警（审计 历史修复 口径）。
 const blockingEvalExclusionAlert = computed(
   () => form.value.mode === 'blocking' && crsExcludedRows.value.some((row) => row.scope === 'all' && isEvalGroupExclusionTarget(row.target)),
 )
@@ -2000,7 +2000,7 @@ const serializedExcludedRules = computed<CrsExcludedRow[]>(() => {
     const key = `${target}\u0000${row.scope}\u0000${row.ips.join(',')}\u0000${row.listRefs.join(',')}`
     if (seen.has(key)) continue
     seen.add(key)
-    // 审计 V2-S3（第五轮）：序列化按 scope 剥离非当前作用域的残留——
+    // 审计 历史修复（第五轮）：序列化按 scope 剥离非当前作用域的残留——
       // 带外数据（scope=all 但 ips 非空）会 400 卡保存。
       out.push({ target, scope: row.scope,
         ips: row.scope === 'ip' ? [...row.ips] : [],
@@ -2262,7 +2262,7 @@ const parseUnknownStringList = (raw: unknown): string[] => {
   return []
 }
 
-// IP 名单归一化（去空白、去重）统一走 mergeIpEntryValues(values, [])（历史问题 FE-3 单源）。
+// IP 名单归一化（去空白、去重）统一走 mergeIpEntryValues(values, [])（历史问题 单源）。
 // v1 仅做精确字符串匹配——10.0.0.0/8 与 10.0.0.1 之类的 CIDR 包含关系不在本期范围
 //（跨策略冲突检测用）。
 
@@ -2652,12 +2652,12 @@ const whitelistSectionAlert = computed<string>(() => {
 // 拦截页归因（哪条策略触发的拦截就显示哪条策略的拦截页）的两类可静态检测提示：
 // ② 空页预告（warn）——策略配置了拦截页但页已删除/内容为空（后端等同无页，
 // 该策略 deny 不抬码，中断落首绑定有页策略的 403 兜底路由）。
-// W87-05：拦截页列表未成功落地过一次时不得判定「已删除/内容为空」——bpRes
+// 历史修复：拦截页列表未成功落地过一次时不得判定「已删除/内容为空」——bpRes
 // 部分失败会让所有启用策略挂上假警告；加载门在单源谓词内（blockPageMissing）。
 const blockPageBroken = (e: ChainEntry): boolean =>
   blockPageMissing(e.blockPageId ?? 0, blockPages.value, blockPagesLoaded.value)
 
-// W87-01：本策略拦截页「按阶段实际生效」判定——单源走 resolveBlockPageAttribution
+// 历史修复：本策略拦截页「按阶段实际生效」判定——单源走 resolveBlockPageAttribution
 // （与 caddy.go 的阶段 1 首绑定有页/阶段 2 429 首绑定有页/阶段 3 逐策略合成码
 // 逐条对齐）。旧实现 `enabled && block_page_id>0` 恒渲染绿色「生效中」，多策略
 // 绑定或规则级覆盖在场时是假绿。
@@ -2750,7 +2750,7 @@ const boundRuleRows = computed<BoundRuleRow[]>(() => boundRules.value.map((caddy
     listenPort: rule?.listen_port ?? 0,
     chain,
     blockPageNotes: blockPageNotes(caddyId, chain),
-    // 审计 W-S5（第六轮）：性能提示应按实际生效的处理链计——禁用策略不产生处理链，
+    // 审计 历史修复（第六轮）：性能提示应按实际生效的处理链计——禁用策略不产生处理链，
     // 计入会虚高（提示"超过 3 条可能影响性能"在不达 3 条时误报）。
     mergedCount: enabledEntries.length,
     showPerfTip: enabledEntries.length > PERF_POLICY_THRESHOLD,
@@ -2859,7 +2859,7 @@ const confirmExtract = async (): Promise<void> => {
   try {
     await ElMessageBox.confirm(`确定创建列表「${name}」（${sourceEntries.length} 条）并转为引用？内联条目将清空，拦截语义不变。`, '确认', { type: 'warning' })
   } catch { return }
-  // 审计 B4-S1：捕获对话框会话——在途 POST 落地时若用户已关窗并打开另一策略，
+  // 审计 历史修复：捕获对话框会话——在途 POST 落地时若用户已关窗并打开另一策略，
   // 续体不得把 A 的列表 id 写进 B 的表单（持久化损坏）。
   const openSeq = policyDialogOpenSeq
   extracting.value = true
@@ -2873,7 +2873,7 @@ const confirmExtract = async (): Promise<void> => {
     })
     const newId = res.data?.id
     if (!newId) throw new Error('创建列表响应缺少 id')
-    // 审计 B4-S1：会话已切换（关窗重开另一策略）时丢弃续体——refs/内联写入
+    // 审计 历史修复：会话已切换（关窗重开另一策略）时丢弃续体——refs/内联写入
     // 属于表单会话状态，落到新会话即持久化损坏。
     if (openSeq !== policyDialogOpenSeq) return
     // 交换语义：新建列表 → 追加到该侧 refs → 清空内联（合并生效集不变）；
@@ -2896,7 +2896,7 @@ const confirmExtract = async (): Promise<void> => {
 }
 
 async function openDialog(row?: PolicySummary) {
-  // 历史问题 D60-F1：对话框打开序列号（同 Rules.vue wizardOpenSeq 模式）——
+  // 历史问题：对话框打开序列号（同 Rules.vue wizardOpenSeq 模式）——
   // 详情 GET 在途期间用户再点"新建策略"或另一行"编辑"，首个返回会覆盖
   // editingId/表单，把保存语义错位成 PUT 到错误策略。
   const openSeq = ++policyDialogOpenSeq
@@ -2960,7 +2960,7 @@ async function openDialog(row?: PolicySummary) {
         ElMessage.warning('原拦截页面已删除，已回退默认页面')
       }
     } catch (error: unknown) {
-      // 历史问题 D-N1：catch 路径也要先比对序列号——GET 失败的过期请求会清空
+      // 历史问题：catch 路径也要先比对序列号——GET 失败的过期请求会清空
       // 在途新编辑的 editingId（try 前同步赋值的旧值），保存误走 POST 创建
       // 重复策略。
       if (openSeq !== policyDialogOpenSeq) return
@@ -3007,7 +3007,7 @@ const resetWizard = () => {
   ruleBoundPolicies.value = {}
   // 历史问题-02：引用名单条目缓存随会话复位清空（与 openDialog 同口径）。
   ipListDetails.value = {}
-  // FE-2（历史）：阶段页覆盖编辑暂存须随向导复位清空——否则编辑策略 A
+  // 历史修复（历史）：阶段页覆盖编辑暂存须随向导复位清空——否则编辑策略 A
   // 暂存的覆盖会跨会话泄漏到绑定同规则的策略 B（保存写入 A 的暂存值）。
   stageOverrideEdits.value = {}
   stageOverrideSaving.value = {}
@@ -3033,7 +3033,7 @@ const handleSave = async () => {
     currentStep.value = WIZARD_STEP.TRUST
     return
   }
-  // 历史 历史问题：stage0 信任内联条目此前绕过 CIDR 前置校验（开关门恒
+  // 历史问题：stage0 信任内联条目此前绕过 CIDR 前置校验（开关门恒
   // false、typeAllowsStage(1) 恒 false）——逐条前置，报错带定位（后端 400 兜底）。
   if (typeAllowsStage(0)) {
     const bad = ipWhitelist.value.find((v) => !isValidCidr(v))
@@ -3051,7 +3051,7 @@ const handleSave = async () => {
     currentStep.value = WIZARD_STEP.WAF_RULES
     return
   }
-  // W87-03：爬虫豁免开启但未勾选任何引擎 = 后端渲染器空集语义「全部引擎」
+  // 历史修复：爬虫豁免开启但未勾选任何引擎 = 后端渲染器空集语义「全部引擎」
   // （crawlerEngineSelected: len==0 → true，为兼容存量不允许改），而 UI 复选框
   // 「全不选」的直觉语义是「不豁免任何引擎」——两者相反，必须阻止静默放宽。
   if (crawlerExemptionNeedsEngines({ geoipEnabled: form.value.geoip_enabled, crawlerExempt: form.value.geoip_crawler_exempt, engines: form.value.geoip_crawler_engines })) {
@@ -3065,7 +3065,7 @@ const handleSave = async () => {
   } catch { return }
   saving.value = true
   try {
-    // v2.2.0 上限守卫（SC-BIND-02 配套）：POST bind 为 additive 且服务端不强制上限
+    // v2.2.0 上限守卫（历史修复 配套）：POST bind 为 additive 且服务端不强制上限
     //（上限由 PUT /security/rules/:caddy_id/policies 强制），本流程的绑定上限闸门在客户端。
     // 保存前刷新绑定快照，避免并发会话下用过期数据放行超限绑定。
     try {
@@ -3093,7 +3093,7 @@ const handleSave = async () => {
     // 数组文本下发（ip_acl_list_refs / ip_whitelist_refs）；后端将引用列表条目与
     // 内联条目合并生效，允许/拒绝侧归属与对应内联字段一致。
     // 显式白名单：仅提交 UpdateSecurityPolicyRequest 实际字段；组装单源见
-    // utils/policyPayload（审计 87 W87-15——字段语义有行为测试）。
+    // utils/policyPayload（历史修复——字段语义有行为测试）。
     const payload = buildPolicyPayload({
       name: form.value.name,
       description: form.value.description,
@@ -3139,10 +3139,10 @@ const handleSave = async () => {
       // 保持打开重试时用户停留在此错乱视图）。
       editingPolicyType.value = createPolicyType.value
     }
-    // v2.2.0 多策略绑定保存组合（SC-BIND-02）：新增/取消走策略侧批量端点
+    // v2.2.0 多策略绑定保存组合（历史修复）：新增/取消走策略侧批量端点
     // （历史：单事务批量增删本策略绑定行，不触碰兄弟绑定——与原逐规则
     // additive POST/DELETE 语义一致，但从 N 次全链请求收敛为 1 次单渲染请求）。
-    // 历史问题（R-12 同族）：逐片响应汇总后再呈现——只保留末片会让早先分片的
+    // 历史问题（历史修复 同族）：逐片响应汇总后再呈现——只保留末片会让早先分片的
     // 退化 200（Caddy 应用失败但 DB 已提交）被覆盖丢失。
     const bindResponses: Array<{ message?: string } | undefined> = []
     try {
@@ -3176,7 +3176,7 @@ const handleSave = async () => {
     // 成功提示只弹一条（见下方 showSaveResult 合并调用）——先记下真正写入的条数
     let syncedCount = 0
     if (pendingOverrides.length > 0) {
-      // 历史 历史问题：按 4 字段覆盖值分组，改调已发布
+      // 历史问题：按 4 字段覆盖值分组，改调已发布
       // POST /rules/batch-block-pages（单事务一次渲染）。原实现逐规则整对象
       // PUT /rules/:id：N 条规则=N 次全链渲染，且携带 name/protocol/domain/
       // listen_port 快照会把另一标签页的改名回退。
@@ -3204,7 +3204,7 @@ const handleSave = async () => {
               block_page_stage3_status: edit.stage3_id > 0 ? edit.stage3_status : 0,
             })
             const skippedItems = res.data?.skipped ?? []
-            // W87-09：先归集 skipped 再回写——被跳过的规则（TCP/规则不存在等）库中
+            // 历史修复：先归集 skipped 再回写——被跳过的规则（TCP/规则不存在等）库中
             // 未写入，回写会让 UI 谎报「已覆盖」且下次保存不再重试。
             const skippedIds = new Set(skippedItems.map((item) => item.rule_id))
             for (const caddyId of chunk) {
@@ -3238,7 +3238,7 @@ const handleSave = async () => {
         return
       }
       if (skippedNotes.length > 0) {
-        // W87-09：被跳过的规则行内已标「未写入（原因）」，此处给汇总口径；
+        // 历史修复：被跳过的规则行内已标「未写入（原因）」，此处给汇总口径；
         // 成功计数只数真正写入的规则（不得把 skipped 计入「已同步」）。
         ElMessage.warning(`部分规则未写入阶段拦截页覆盖：${skippedNotes.join('；')}；这些规则保持待保存，可重试`)
       }
@@ -3257,7 +3257,7 @@ const handleSave = async () => {
     const mergedBind = mergeBulkResults(bindResponses)
     if (mergedBind?.message?.includes(CADDY_APPLY_FAILED_MARKER)) showSaveResult(mergedBind, '')
     dialogVisible.value = false; fetchData()
-    // FE18-1(历史):本地契约 throw(如「响应缺少 id」)不经 axios 拦截器,
+    // 历史修复(历史):本地契约 throw(如「响应缺少 id」)不经 axios 拦截器,
     // 空 catch 会静默吞掉——点保存无反应且已落库可致重试重复创建;按错误
     // 来源分流:ApiRequestError=HTTP 层(拦截器已 toast,不二次弹),其余
     // (本地 throw)在此提示。
@@ -3270,7 +3270,7 @@ const handleSave = async () => {
 
 const deletingPolicyId = ref<number | null>(null)
 function handleDelete(row: PolicySummary) {
-  // FE18-2(历史):重入守卫(快速双击叠加双确认框→双 DELETE 误报)+
+  // 历史修复(历史):重入守卫(快速双击叠加双确认框→双 DELETE 误报)+
   // 取消与失败分离(原空 catch 同时吞掉网络失败,行滞留至下轮)。
   if (deletingPolicyId.value !== null) return
   deletingPolicyId.value = row.id
@@ -3287,11 +3287,11 @@ function handleDelete(row: PolicySummary) {
 const goToCustomRulesPage = () => { window.open('/?page=security-rules&tab=custom', '_blank') }
 const goToBlockPagesPage = () => { window.open('/?page=security-block-pages', '_blank') }
 const openRuleInNewTab = (caddyId: string): void => {
-  // FE40-D1-6：交接改走 URL query（rs 参数），Rules.vue onMounted 消费后清除。
+  // 历史修复：交接改走 URL query（rs 参数），Rules.vue onMounted 消费后清除。
   window.open(`/?page=rules&rs=${encodeURIComponent(caddyId)}`, '_blank')
 }
 
-// A85WB-历史问题：地域树加载失败显性化——不再静默清空（保留已加载/已选值可见可
+// 历史修复：地域树加载失败显性化——不再静默清空（保留已加载/已选值可见可
 // 编辑），给 toast 与弹框内重试入口；「加载失败」不伪装成「无区域」。
 const regionsError = ref(false)
 const fetchRegions = async () => {
@@ -3311,7 +3311,7 @@ const fetchRegions = async () => {
 }
 
 onMounted(async () => {
-  // FE42-1：安全事件页「查看策略」交接改走 URL query（sp=策略 ID / sp-search=名称
+  // 历史修复：安全事件页「查看策略」交接改走 URL query（sp=策略 ID / sp-search=名称
   // 关键词），消费后 replaceState 清除——localStorage 通道在多标签/隐私模式下错乱。
   const query = new URLSearchParams(window.location.search)
   const search = query.get('sp-search')
@@ -3326,7 +3326,7 @@ onMounted(async () => {
     if (matched) activeTypeTab.value = policyTypeOf(matched)
   }
   if (focusId && loaded) {
-    // 历史问题 D-4：仅列表加载成功时才判定「已被删除」；加载失败时全局拦截器已弹错误
+    // 历史问题：仅列表加载成功时才判定「已被删除」；加载失败时全局拦截器已弹错误
     // toast，这里不再叠加误导性的「已被删除」提示。
     const row = policies.value.find((p) => p.id === focusId)
     if (row) openDialog(row)
@@ -3592,7 +3592,7 @@ onMounted(async () => {
 <!-- el-tooltip popper 挂载到 body， scoped 样式无法命中，单独非 scoped 块 -->
 <style>
 
-/* U9 兜底：关联规则多时 popper 可超视口——flip 回退之外由内部滚动承接 */
+/* 历史修复 兜底：关联规则多时 popper 可超视口——flip 回退之外由内部滚动承接 */
 .policy-rules-popper { max-height: 60vh; overflow-y: auto; }
 .policy-rules-popper .policy-rule-row {
   padding: 4px 8px;

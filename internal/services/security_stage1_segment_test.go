@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// 历史问题 LBH-F8 一致性钉：Stage1PrecheckSegmentSQL / Stage1PrecheckIDSQLList 与
+// 历史问题 一致性钉：Stage1PrecheckSegmentSQL / Stage1PrecheckIDSQLList 与
 // Go 谓词 IsStage1PrecheckID 三处同源——固定族、GeoIP 段任一处漏改即在此失败。
 func TestStage1PrecheckSegmentSQL_matchesGoPredicate(t *testing.T) {
 	// 1) Go 谓词固定族 {2,4,7,8,14} 必须逐项在 SQL 清单中（带引号形态），

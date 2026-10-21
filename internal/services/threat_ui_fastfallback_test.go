@@ -1,6 +1,6 @@
 package services
 
-// SEC-U2（历史 历史问题）：从节点 .iplist 文本缺失（waf_files 只同步 .fast）时
+// 历史修复（历史问题）：从节点 .iplist 文本缺失（waf_files 只同步 .fast）时
 // UI 详情读面 ReadThreatIplistForUI 返回空集，与引擎按 .fast 全量拦截分裂。
 // 修复：UI 读面补 .fast 回退（与渲染侧 readThreatIplistEntries 同口径）。
 
@@ -39,7 +39,7 @@ func TestReadThreatIplistForUI_fallsBackToFastOnSlave(t *testing.T) {
 	}
 }
 
-// SEC-A-F2（历史 历史问题）：ReadThreatIplistForUI 的 .iplist 文本行过滤补
+// 历史修复（历史问题）：ReadThreatIplistForUI 的 .iplist 文本行过滤补
 // #/; 注释行跳过——与渲染侧 readThreatIplistEntries/编译侧 ipcompile 同口径
 // （潜伏分叉：机器生成文件无注释不触发，人工修补/未来头部注释即分裂）。
 func TestReadThreatIplistForUI_skipsCommentLines(t *testing.T) {

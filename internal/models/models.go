@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// RevokedTokenTimeFormat 吊销 JWT 的 expires_at 统一格式（U6a-5-4 收敛：
+// RevokedTokenTimeFormat 吊销 JWT 的 expires_at 统一格式（历史修复 收敛：
 // handlers 写侧与 middleware 读侧曾跨包双份定义——单侧改动会静默失配）。
 const RevokedTokenTimeFormat = "2006-01-02T15:04:05Z"
 
@@ -37,8 +37,8 @@ type UserResponse struct {
 }
 
 // NewUserResponse 构造用户响应。mfaEnabled 必须由调用方从 users.mfa_enabled
-// 读取后传入：CI87-08（历史）将原本「构造后手工 response.MFAEnabled=…」
-// 的口径收敛为签名参数——历史 历史问题 十次/B1-历史问题 两次都因新增返回路径忘记
+// 读取后传入：历史修复将原本「构造后手工 response.MFAEnabled=…」
+// 的口径收敛为签名参数——历史问题/两次历史问题 两次都因新增返回路径忘记
 // 补字段导致 mfa_enabled 恒 false（前端登录预检误报）。签名强制让遗漏在
 // 编译期失败，而不是静默返回错误值。
 func NewUserResponse(user User, mfaEnabled bool) UserResponse {
@@ -509,14 +509,14 @@ type CreateRuleRequest struct {
 	BlockPageStage1Status int `json:"block_page_stage1_status"`
 	BlockPageStage3ID     int `json:"block_page_stage3_id"`
 	BlockPageStage3Status int `json:"block_page_stage3_status"`
-	// LB-01：缺省（nil）=创建即启用（向后兼容历史调用方）；显式 false=创建为
+	// 历史修复：缺省（nil）=创建即启用（向后兼容历史调用方）；显式 false=创建为
 	// 禁用（UI 复制向导按预览「禁用」态落库）。
 	Enabled *bool `json:"enabled,omitempty"`
 }
 
 type UpdateRuleRequest struct {
 	Name string `json:"name"`
-	// 审计 M16：HostHeader/Description/DnsServer/HealthCheckPath 指针化——
+	// 历史修复：HostHeader/Description/DnsServer/HealthCheckPath 指针化——
 	// 省略（nil）=保留原值，显式空串=清空；旧行为空串与省略无法区分。
 	Description         *string `json:"description"`
 	Protocol            string  `json:"protocol"`
@@ -530,13 +530,13 @@ type UpdateRuleRequest struct {
 	HealthCheckPath     *string `json:"health_check_path"`
 	HealthCheckInterval int     `json:"health_check_interval"`
 	HealthCheckTimeout  int     `json:"health_check_timeout"`
-	// 历史问题（M16 口径续）：健康检查双阈值指针化——省略（nil）=保留原值。
+	// 历史问题（历史修复 口径续）：健康检查双阈值指针化——省略（nil）=保留原值。
 	// 显式 0 不再落库：写侧校验 400、启动迁移回填默认 3/2，渲染层直读库值
 	// 且无效值显性失败（无写死兜底）。
 	HealthCheckUnhealthyThreshold *int  `json:"health_check_unhealthy_threshold"`
 	HealthCheckHealthyThreshold   *int  `json:"health_check_healthy_threshold"`
 	EnableActiveHealthCheck       *bool `json:"enable_active_health_check"`
-	// LB-02（M16 口径续）：TCP 字段指针化——省略（nil）=保留原值。
+	// 历史修复（历史修复 口径续）：TCP 字段指针化——省略（nil）=保留原值。
 	// tcp_try_duration 0=不重试；tcp_try_interval 由启动回填默认 2（写侧
 	// <=0 拒绝），tcp_health_check_port 0=跟随上游端口。
 	TCPHealthCheckPort       *int  `json:"tcp_health_check_port"`
@@ -614,7 +614,7 @@ type UpdateConfigRequest struct {
 	JWTExpireMinutes           *int    `json:"jwt_expire_minutes"`
 	Timezone                   *string `json:"timezone"`
 	GitHubProxyURL             *string `json:"github_proxy_url"`
-	// GitHubToken 可选令牌三态（历史 历史问题 起）：nil=保持现值、空串=清除
+	// GitHubToken 可选令牌三态（历史问题 起）：nil=保持现值、空串=清除
 	// （唯一撤销路径）、非空=覆盖。响应面永不回显（GlobalConfig.GitHubToken json:"-"）。
 	GitHubToken         *string `json:"github_token"`
 	DefaultCAProviderID *int    `json:"default_ca_provider_id"`
@@ -687,7 +687,7 @@ type SystemInfo struct {
 	RunningStatus string            `json:"running_status"`
 	Uptime        int64             `json:"uptime"`
 	// NodeMode 三态：master / slave / unknown（unknown=角色查询失败或库未装配，
-	// 历史 HC-11——不得把查询失败静默呈现为 master 误导排障）。
+	// 历史修复——不得把查询失败静默呈现为 master 误导排障）。
 	NodeMode string `json:"node_mode"`
 	Version  string `json:"version"`
 }

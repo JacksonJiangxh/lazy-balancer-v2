@@ -74,7 +74,7 @@ func (s *ClusterService) IssueServiceControlTicket(ctx context.Context, nodeID i
 }
 
 // signServiceControlTicket 保留包装（服务控制票据的调用面命名），实现与
-// 登录票据共用 signClusterTicket（S历史问题-04：签发单源）。
+// 登录票据共用 signClusterTicket（历史问题-04：签发单源）。
 func signServiceControlTicket(claims models.ClusterServiceControlClaims, key []byte) (string, error) {
 	ticket, err := signClusterTicket(claims, key)
 	if err != nil {
@@ -98,7 +98,7 @@ func (s *ClusterService) ForgetNodePin(ctx context.Context, nodeID int) (string,
 	if err := s.db.QueryRowContext(ctx, `SELECT ip_address,port,COALESCE(protocol,'http'),COALESCE(access_url,'') FROM nodes WHERE id=? AND `+masterRoleConditionSQL, nodeID).
 		Scan(&ipAddress, &port, &protocol, &accessURL); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			// 历史修复 历史问题：SQL 级角色条件（同族 TOCTOU 唯一漏点）——0 行时复核
+			// 历史问题：SQL 级角色条件（同族 TOCTOU 唯一漏点）——0 行时复核
 			// 角色：降级窗口返回 403 哨兵，而不是继续删除主节点目录下的 pin。
 			return "", s.nodeWriteMissError(ctx)
 		}
@@ -223,7 +223,7 @@ func DoWithSameHostTLSUpgradeRedirect(client *http.Client, req *http.Request) (*
 		}
 		retry.Body = body
 	} else if req.Body != nil {
-		// 历史问题-历史问题:无 GetBody 的带体请求不可重放(body 已被首次请求消费,
+		// 历史问题:无 GetBody 的带体请求不可重放(body 已被首次请求消费,
 		// 重放会发送空/残缺载荷)——原实现返回已 Close 的 resp(调用方读 body
 		// 报错),合并后取 cluster_sync 方法版语义:返回合成空壳 301 响应。
 		return &http.Response{

@@ -111,7 +111,7 @@ func (h *Handlers) StartCrawlerLibUpdate(c *gin.Context) {
 		return
 	}
 	op := auditOperator(c)
-	// 历史问题/A85历史问题-2：响应前同步预占位；自记族成功零 handler 审计，
+	// 历史问题：响应前同步预占位；自记族成功零 handler 审计，
 	// ErrAlreadyRunning/ErrTaskSkipped 静默，真失败留补偿审计。
 	if err := services.TriggerTaskAsync(te, "crawlerbot-update", services.TriggerAuditContext{
 		Operator: op, Family: "爬虫地址库", Name: "爬虫地址更新",
@@ -206,7 +206,7 @@ func (h *Handlers) UpdateCrawlerLibFlags(c *gin.Context) {
 	}
 	var name string
 	if err := db.DB.QueryRow(`SELECT name FROM security_crawler_sources WHERE id=?`, id).Scan(&name); err != nil {
-		// A81A-历史问题：与威胁库同款三分支——缺行=404，其余 DB 故障=500
+		// 历史问题：与威胁库同款三分支——缺行=404，其余 DB 故障=500
 		// （此前一律 404，可重试故障被误报「爬虫源不存在」）。
 		if errors.Is(err, sql.ErrNoRows) {
 			c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "爬虫源不存在"})
@@ -228,7 +228,7 @@ func (h *Handlers) UpdateCrawlerLibFlags(c *gin.Context) {
 			return
 		}
 	}
-	// A81A-历史问题：单源启用即武装首槽（威胁库 UpdateThreatSourceFlags 同构）——
+	// 历史问题：单源启用即武装首槽（威胁库 UpdateThreatSourceFlags 同构）——
 	// 总闸已开且无任何启用源持 next_update 时，仅改开关会让排程槽恒空。
 	if *body.UpdateEnabled {
 		services.ArmCrawlerFirstSlots()

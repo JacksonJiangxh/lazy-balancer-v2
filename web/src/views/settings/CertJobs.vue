@@ -60,7 +60,7 @@
     </el-table-column>
     <el-table-column label="剩余天数" width="90">
       <template #default="{ row }">
-        <!-- 历史问题 D-N4：过期证书不渲染裸负数——色弱/黑白场景下「-1 天」无文字语义 -->
+        <!-- 历史问题：过期证书不渲染裸负数——色弱/黑白场景下「-1 天」无文字语义 -->
         <span v-if="row.status === 'issued' && row.expires_at" :class="['cert-days', certificateStatus(row)]">
           {{ certificateStatus(row) === 'expired' ? `已过期 ${Math.abs(row.days_remaining)} 天` : `${row.days_remaining} 天` }}
         </span>
@@ -163,7 +163,7 @@ let disposed = false
 
 const jobs = ref<CertJob[]>([])
 const loading = ref(false)
-// FE-70-8：cert_renewal_days 改读 authStore.fetchConfig 消费面（曾挂载整取
+// 历史修复：cert_renewal_days 改读 authStore.fetchConfig 消费面（曾挂载整取
 // GET /config 单键）——store ref 响应式，挂载早于 fetchConfig 完成也能随后收敛。
 const certRenewalDays = computed(() => authStore.certRenewalDays)
 const currentPage = ref(1)
@@ -186,8 +186,8 @@ const logHtml = computed(() => {
     .replace(/\[DEBUG\]/g, '<span style="color:#a855f7">$&</span>')
 })
 
-// A85WA-历史问题：日志尾轮询收敛 useLogTailPolling 单源（后台标签页暂停/单飞/会话
-// 序号作废/滚底统一）；30s 节流错误 toast（历史问题 D-N5）保留在 onError。
+// 历史修复：日志尾轮询收敛 useLogTailPolling 单源（后台标签页暂停/单飞/会话
+// 序号作废/滚底统一）；30s 节流错误 toast（历史问题）保留在 onError。
 const logTail = useLogTailPolling({
   interval: 3000,
   content: logContent,
@@ -203,7 +203,7 @@ const logTail = useLogTailPolling({
   onError: (error) => {
     if (disposed) return
     console.error('Failed to fetch cert job logs:', error)
-    // 历史问题 D-N5：toast 节流（对齐 usePollingErrorState 的 30s 语义）——弹窗内
+    // 历史问题：toast 节流（对齐 usePollingErrorState 的 30s 语义）——弹窗内
     // 3s 轮询持续失败时不再每 tick 叠加一条「获取日志失败」刷屏。
     const now = Date.now()
     if (now - lastLogErrorToastAt > 30_000) {
@@ -291,7 +291,7 @@ const retryJob = async (row: CertJob) => {
     await request.post(`/certificates/jobs/${row.id}/retry`, undefined, { signal: jobsPolling.signal })
     if (disposed) return
     mfaAwareSuccess('重新签发已触发')
-    // FE42-9：run() 恰逢在途轮询时只把 pending 合并进当前 drain——若撞上 drain 已退出
+    // 历史修复：run() 恰逢在途轮询时只把 pending 合并进当前 drain——若撞上 drain 已退出
     // 而 inFlight 未清的微任务窗口，pending 会搁浅到下一个 5s 定时 tick，「已触发」toast
     // 后列表迟迟不更新。第一次 await 等在途排空（drainPromise 的 finally 先于本 continuation
     // 清掉 inFlight），第二次 run 必然新起 drain，强制一次 POST 之后的新鲜抓取。
@@ -315,7 +315,7 @@ const viewLogs = async (row: CertJob) => {
   logDialogVisible.value = true
 }
 
-// 历史问题-F3：先同步装定时器再触发首拉（logTail.start 内部即此序）——原 await 后才
+// 历史问题：先同步装定时器再触发首拉（logTail.start 内部即此序）——原 await 后才
 // startLogPolling，首拉慢于关闭时 @closed 已清 timer，随后续体又装上 3s 轮询
 // （关闭后持续请求日志端点）。
 const onLogDialogOpened = (): void => {
@@ -409,7 +409,7 @@ onUnmounted(() => {
 }
 .cert-jobs-pagination { display: flex; justify-content: flex-end; margin-top: 16px; }
 .polling-error-alert { margin-bottom: 16px; }
-/* .polling-error-title/.polling-error-meta 已收敛 main.css（FE-R2） */
+/* .polling-error-title/.polling-error-meta 已收敛 main.css（历史修复） */
 .cert-jobs-table :deep(.el-table__cell) {
   vertical-align: middle;
 }

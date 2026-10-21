@@ -107,7 +107,7 @@ func TestGetClusterSnapshot_auditFallsBackToNodeID(t *testing.T) {
 }
 
 func TestPullClusterSnapshot_master_rejected_without_sync_error(t *testing.T) {
-	// 历史问题 历史修复 回归：主节点调手动同步端点必须入口直接 400（不调 Pull），
+	// 历史修复 回归：主节点调手动同步端点必须入口直接 400（不调 Pull），
 	// 且 last_sync_error 保持为空——不得让节点页面显示无自愈路径的假错误。
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	if err := db.Initialize(t.TempDir()); err != nil {
@@ -191,7 +191,7 @@ func TestGetClusterWafFiles_demotedMasterForbidden(t *testing.T) {
 	}
 }
 
-// 历史问题（历史 历史问题，历史修复 同族收敛）：PullClusterSnapshot 曾直接调用
+// 历史问题（历史问题，历史修复 同族收敛）：PullClusterSnapshot 曾直接调用
 // h.syncService.Pull/Resume 而无 nil 判定——同族（SetClusterMode/Promote/
 // ForgetClusterPins）均以 503「同步服务未初始化」前置。装配缺失或测试注入
 // nil 时，从节点手动同步会 nil 指针 panic（Gin recovery → 500 空体），

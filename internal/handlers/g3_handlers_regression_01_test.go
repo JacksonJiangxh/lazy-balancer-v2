@@ -54,12 +54,12 @@ func round44FullBackupTablesMinus(omit ...string) map[string][]map[string]any {
 	return tables
 }
 
-// SEM44-1(P1):v2.1.2-v2.2.13 时代的合法全量备份(Version=2+新格式校验和)
+// 历史修复(历史修复):v2.1.2-v2.2.13 时代的合法全量备份(Version=2+新格式校验和)
 // 缺迟到表(security_crs_version/security_ip2region_version 于 v2.1.10
 // (76f616a) 起入导出清单、security_ip_lists 于 v2.2.1(6bf0bf5) 起入导出
 // 清单)不得被必需表门 400 硬拒;缺席表由导入链「缺席=保留本地」语义承接
 // (备份未携带的表不得清空本地数据)。
-func TestSEM44_1_ImportConfigBackup_accepts_pre_late_table_era_full_backups(t *testing.T) {
+func TestImportConfigBackup_acceptsPreLateTableEraFullBackups(t *testing.T) {
 	eras := []struct {
 		name string
 		omit []string
@@ -103,10 +103,10 @@ func TestSEM44_1_ImportConfigBackup_accepts_pre_late_table_era_full_backups(t *t
 	}
 }
 
-// SEM44-1(P1) 预览路径确认:ValidateConfigImport(config_import_v1.go:577)
+// 历史修复(历史修复) 预览路径确认:ValidateConfigImport(config_import_v1.go:577)
 // 与导入同走 validateV2Backup 必需表门——一处修复双路径生效,预览不得再误报
 // 「备份缺少必需的数据表」。
-func TestSEM44_1_ValidateConfigImport_accepts_v220_era_full_backup(t *testing.T) {
+func TestValidateConfigImport_acceptsV220EraFullBackup(t *testing.T) {
 	// Given v2.2.0 十四表形态备份(缺 security_ip_lists)
 	h := newBackupTestHandlers(t)
 	r55SeedCurrentAdmin(t)
@@ -133,9 +133,9 @@ func TestSEM44_1_ValidateConfigImport_accepts_v220_era_full_backup(t *testing.T)
 	}
 }
 
-// SEM44-1 回归形状:全量形态(三族标记齐备)缺非迟到核心表仍必须 400——
+// 历史修复 回归形状:全量形态(三族标记齐备)缺非迟到核心表仍必须 400——
 // 迟到表容缺不得放宽为「任意表缺席放行」。
-func TestSEM44_1_ImportConfigBackup_still_rejects_full_backup_missing_core_table(t *testing.T) {
+func TestImportConfigBackup_stillRejectsFullBackupMissingCoreTable(t *testing.T) {
 	// Given 全量形态备份缺 upstreams(非迟到核心表)
 	h := newBackupTestHandlers(t)
 	r55SeedCurrentAdmin(t)
@@ -154,9 +154,9 @@ func TestSEM44_1_ImportConfigBackup_still_rejects_full_backup_missing_core_table
 	r55AssertZeroWrite(t)
 }
 
-// SEM44-1 回归形状:v2.0.10-v2.1.0 八表时代导出(Version=2,无 security_policies)
+// 历史修复 回归形状:v2.0.10-v2.1.0 八表时代导出(Version=2,无 security_policies)
 // 走 hasSecurity=false 分类分支(已知表>0 即放行),修复不得破坏该既有可导入路径。
-func TestSEM44_1_ImportConfigBackup_eight_table_era_uses_classification_branch(t *testing.T) {
+func TestImportConfigBackup_eightTableEraUsesClassificationBranch(t *testing.T) {
 	// Given Version=2 八表形态备份(无安全族表),新格式校验和覆盖实际内容
 	h := newBackupTestHandlers(t)
 	r55SeedCurrentAdmin(t)
@@ -181,10 +181,10 @@ func TestSEM44_1_ImportConfigBackup_eight_table_era_uses_classification_branch(t
 	}
 }
 
-// CERT44-1(P2):导入校验对 ca_providers 行补 provider 白名单门——保存/更新侧
+// 历史修复(历史修复):导入校验对 ca_providers 行补 provider 白名单门——保存/更新侧
 // (services/caproviders.go:194)恒拒 letsencrypt/zerossl 之外的 provider,导入
 // 侧不得更宽;违例整包 400 且零写入。
-func TestCERT44_1_ImportConfigBackup_rejects_unknown_ca_provider(t *testing.T) {
+func TestImportConfigBackup_rejectsUnknownCAProvider(t *testing.T) {
 	// Given 备份携带 provider=evil-ca 的 ca_providers 行
 	h := newBackupTestHandlers(t)
 	r55SeedCurrentAdmin(t)
@@ -205,10 +205,10 @@ func TestCERT44_1_ImportConfigBackup_rejects_unknown_ca_provider(t *testing.T) {
 	r55AssertZeroWrite(t)
 }
 
-// CERT44-1(P2):directory_url 无条件覆写为官方常量(与服务层 :197-201 同
+// 历史修复(历史修复):directory_url 无条件覆写为官方常量(与服务层 :197-201 同
 // 语义)——合法 provider + 恶意目录 URL 的备份导入后,落库 directory_url 必须
 // 是官方常量而非备份原值。
-func TestCERT44_1_ImportConfigBackup_overwrites_directory_url_with_official_constant(t *testing.T) {
+func TestImportConfigBackup_overwritesDirectoryURLWithOfficialConstant(t *testing.T) {
 	cases := []struct {
 		provider string
 		wantURL  string
@@ -243,7 +243,7 @@ func TestCERT44_1_ImportConfigBackup_overwrites_directory_url_with_official_cons
 	}
 }
 
-// SYSB44-1：OIDC 空哈希必须用 loginDummyBcryptHash 做等时比较，真实本地哈希
+// 历史修复：OIDC 空哈希必须用 loginDummyBcryptHash 做等时比较，真实本地哈希
 // 则原样保留。直接钉 loginCompareHash 的输入输出，避免以 30ms wall-clock 地板
 // 在重负载 CI 上误报；空哈希端到端恒拒由下方 never_authenticates 用例覆盖。
 func TestLoginCompareHash_emptyUsesDummyAndPreservesRealHash(t *testing.T) {
@@ -256,12 +256,12 @@ func TestLoginCompareHash_emptyUsesDummyAndPreservesRealHash(t *testing.T) {
 	}
 }
 
-// SYSB44-3(P5):GetAppLogs 128KB 尾读窗口起点可能切在多字节 UTF-8 rune 中段
+// 历史修复(历史修复):GetAppLogs 128KB 尾读窗口起点可能切在多字节 UTF-8 rune 中段
 // ——首行残段带无效字节,JSON 编码后以 U+FFFD 污染输出。修复:起点非零时
 // 前进到下一 '\n' 再开始读(丢弃被截断的首行残段)。
 // 构造:总长度使 startOffset=size-128KB 恰落在「中」(3 字节)的第 2 字节;
 // 窗口内行数 <500(排除 maxLines 裁剪把残段首行裁掉的干扰)。
-func TestSYSB44_3_GetAppLogs_tail_window_never_splits_multibyte_rune(t *testing.T) {
+func TestGetAppLogs_tailWindowNeverSplitsMultibyteRune(t *testing.T) {
 	// Given
 	const maxBytes = 128 * 1024
 	pad := strings.Repeat("a", 100) + "\n"               // 101 字节
@@ -317,7 +317,7 @@ func TestSYSB44_3_GetAppLogs_tail_window_never_splits_multibyte_rune(t *testing.
 // 对象换成 loginDummyBcryptHash——其明文是源码内公开常量(随二进制分发),
 // OIDC JIT 用户(password_hash=”)可用该公开串通过主比较登录。安全不变量:
 // 空哈希账户任何密码不得认证(等时比较只取耗时副作用,结果必须恒败)。
-func TestSYSB44_1_Login_oidc_empty_password_hash_never_authenticates(t *testing.T) {
+func TestLogin_oidcEmptyPasswordHashNeverAuthenticates(t *testing.T) {
 	// Given OIDC JIT 用户(空 password_hash)
 	h := newBackupTestHandlers(t)
 	if _, err := db.DB.Exec("INSERT INTO users (id,username,password_hash,role,is_enabled,auth_provider) VALUES (2,'oidc-dummy','','user',1,'oidc')"); err != nil {
@@ -334,9 +334,9 @@ func TestSYSB44_1_Login_oidc_empty_password_hash_never_authenticates(t *testing.
 }
 
 // 备份导入路径可再引入 block_status_code=429 行(混入限流指标口径)。修复:
-// validateV2BackupSecurityPolicies 对 429 归一为 403(与 CERT44-1 导入侧
+// validateV2BackupSecurityPolicies 对 429 归一为 403(与 历史修复 导入侧
 // 覆写同格;旧备份不因新白名单硬拒)。
-func TestW3R44_3_validateV2Backup_normalizes_block_status_429(t *testing.T) {
+func TestValidateV2Backup_normalizesBlockStatus429(t *testing.T) {
 	// Given 修复前时代备份携带 block_status_code=429 的策略行
 	backup := completeBackupJSON(t, map[string][]map[string]any{
 		"security_policies": {{"id": 1, "name": "p1", "block_status_code": 429}},

@@ -100,7 +100,7 @@ func TestBuildPort80DomainOwners_indexesNormalizedCandidates(t *testing.T) {
 	}
 }
 
-// 回归形状：80 端口规则零启用上游时不得作为遮蔽方（M1 语义），且同一条跳转
+// 回归形状：80 端口规则零启用上游时不得作为遮蔽方（历史修复 语义），且同一条跳转
 func TestGenerateCaddyConfig_httpsRedirect_disabledUpstreamPort80RuleDoesNotShadow(t *testing.T) {
 	// Given 一条 TLS 跳转规则与一条同域名但全部上游禁用的 80 端口规则
 	useTemporaryCertDir(t)

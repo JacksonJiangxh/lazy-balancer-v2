@@ -1,4 +1,4 @@
-// 更新者/创建者显示名单源（A85WA-历史问题 收敛）：Rules/SecurityRules/
+// 更新者/创建者显示名单源（历史修复 收敛）：Rules/SecurityRules/
 // SecurityBlockPages/SecurityPolicies 原各持一份同构 getUpdaterName——
 // display_name 优先、空串回落 username、缺省/零/未命中一律 '-'。
 export interface UpdaterUserLike {

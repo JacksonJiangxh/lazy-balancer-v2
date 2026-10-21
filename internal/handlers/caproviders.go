@@ -86,14 +86,14 @@ func (h *Handlers) UpdateCAProvider(c *gin.Context) {
 		return
 	}
 
-	// 历史问题 历史问题：与 CreateRule/历史问题 问题 同款 1MB 请求体上限——credentials 为
+	// 历史问题：与 CreateRule/历史问题 问题 同款 1MB 请求体上限——credentials 为
 	// 自由 JSON 字符串，无上限时超大合法 JSON 经 ShouldBindJSON 等量内存驻留并
 	// 原样落库（域内其余写端点均已设限，本端点为漏网）。
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20)
 	var req models.UpdateCAProviderRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		// 历史修复（历史）：MaxBytesReader 超限映射 413，与导入/
-		// PutCaddyConfig/历史修复 同口径（此前并入 400）。
+		// PutCaddyConfig/admin-tls 同口径（此前并入 400）。
 		if isRequestBodyTooLarge(err) {
 			c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: "请求体过大"})
 			return
@@ -128,7 +128,7 @@ func (h *Handlers) UpdateCAProvider(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "名称不能为空"})
 		case errors.Is(err, services.ErrCAProviderNameTooLong):
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "名称不能超过 100 个字符"})
-		// 历史问题 历史问题：directory_url 两个 400 分支已删——服务层按 provider 无条件覆写
+		// 历史问题：directory_url 两个 400 分支已删——服务层按 provider 无条件覆写
 		// 常量（services/caproviders.go:195-199），用户输入实际无效，两错误永不触发。
 		case errors.Is(err, services.ErrCAProviderInvalidCredentials):
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "凭证必须是有效的 JSON"})
@@ -162,7 +162,7 @@ func (h *Handlers) UpdateCAProvider(c *gin.Context) {
 	case credentialChanged:
 		changed = append(changed, "凭证")
 	case credentialCleared:
-		// 历史问题（历史 历史问题）：空串会真实清空 credentials 列，不得记「无修改」。
+		// 历史问题（历史）：空串会真实清空 credentials 列，不得记「无修改」。
 		changed = append(changed, "凭证（清空）")
 	}
 	if req.MaxConcurrent != nil && *req.MaxConcurrent != old.MaxConcurrent {

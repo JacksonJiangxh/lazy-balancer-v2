@@ -90,7 +90,7 @@ func New(secretID, secretKey string) (*Provider, error) {
 	}, nil
 }
 
-// Present creates a distinct _历史修复 TXT record (no upsert): a repeated
+// Present creates a distinct _acme-challenge TXT record (no upsert): a repeated
 // Present for the same name adds another record, and cleanup removes records by
 // ownership record ID / value (历史修复，历史).
 func (p *Provider) Present(ctx context.Context, zone, tokenFQDN, value string, ttl int) error {
@@ -125,7 +125,7 @@ func (p *Provider) Present(ctx context.Context, zone, tokenFQDN, value string, t
 	return nil
 }
 
-// CleanUp removes the _历史修复 TXT record.
+// CleanUp removes the _acme-challenge TXT record.
 func (p *Provider) CleanUp(ctx context.Context, zone, tokenFQDN string) error {
 	return p.cleanUp(ctx, zone, tokenFQDN, "", false)
 }
@@ -180,7 +180,7 @@ func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, b
 	deleteOne := func(recordID uint64, value string) error {
 		if err := p.deleteRecord(ctx, zone, recordID); err != nil {
 			if ctx.Err() != nil {
-				// 保留原始 provider 错误（历史 历史问题：整体覆写会丢失具体
+				// 保留原始 provider 错误（历史问题：整体覆写会丢失具体
 				// API 失败原因，诊断信息归零）；与 dnspod 侧口径对齐。
 				err = errors.Join(err, ctx.Err())
 			}
@@ -220,7 +220,7 @@ func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, b
 			// 历史修复 independence: a record whose deletion failed keeps
 			// its ownership entry (the DNS record may still exist), but an
 			// earlier miss must not skip Remove for records that WERE
-			// deleted — that orphans them until 历史修复.
+			// deleted — that orphans them until self-heal.
 			if deleteOne(recordID, record.Value) != nil {
 				continue
 			}
@@ -295,7 +295,7 @@ func (p *Provider) createRecord(ctx context.Context, zone, subDomain, value stri
 	resp, err := p.client.CreateRecordWithContext(ctx, req)
 	if err != nil {
 		if ctx.Err() != nil {
-			// 历史修复（历史）：对齐 deleteOne 口径（历史 历史问题）——以
+			// 历史修复（历史）：对齐 deleteOne 口径（历史问题）——以
 			// ctx.Err() 整体覆写会丢失具体 API 失败原因（诊断信息归零），
 			// errors.Join 保留两者。
 			err = errors.Join(err, ctx.Err())

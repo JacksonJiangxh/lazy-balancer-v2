@@ -193,7 +193,7 @@ func TestEngine_PeriodicEnabledFnRecheckHonorsStopLoop(t *testing.T) {
 	}
 }
 
-// A85历史问题-1：Pause/SetRole 与投递竞态时，未通过 admission 的轮次不得
+// 历史问题：Pause/SetRole 与投递竞态时，未通过 admission 的轮次不得
 // 推进 lastCheck；恢复后必须立即补跑，而不是白等一个完整 interval。
 func TestEngine_PeriodicAdmissionRaceDoesNotAdvanceBeat(t *testing.T) {
 	tests := []struct {

@@ -22,7 +22,7 @@ import (
 // MFA 验证失败（verify-step 及全部登录后验码入口）只提示 401、不计数不锁定
 // ——全系统唯一锁定在登录阶段（密码+验证码同计 5 次/10 分钟，受「登录失败
 // 锁定」开关控制）。仍生效的硬闸仅剩登录阶段两处：单挑战连续失败 10 次作废
-// 挑战（B-历史问题）、pending 绑定连续失败 5 次作废待激活密钥（A-历史问题）。
+// 挑战（历史问题）、pending 绑定连续失败 5 次作废待激活密钥（历史问题）。
 
 // seedMfaVerifyStepUser 种 id=1 且已启用 MFA 的操作者，返回其 TOTP secret。
 func seedMfaVerifyStepUser(t *testing.T) string {
@@ -80,7 +80,7 @@ func wrongMfaCode(t *testing.T, secret string, now time.Time) string {
 	return ""
 }
 
-// N+10 用户裁决：除登录与重置 MFA 外，全部 MFA 入口（含 verify-step）仅接受
+// 用户裁决：除登录与重置 MFA 外，全部 MFA 入口（含 verify-step）仅接受
 // 6 位动态验证码——恢复码属一次性应急登录凭证，不得作为操作授权凭证（导入
 // 配置等写守卫链经此端点）。RED：当前实现接受恢复码，本测试断言拒绝。
 func TestMFAVerifyStep_rejectsRecoveryCode(t *testing.T) {
@@ -104,7 +104,7 @@ func TestMFAVerifyStep_rejectsRecoveryCode(t *testing.T) {
 	}
 }
 
-// B3-历史问题（历史）：step-up 验码通过后的用户重读，DB 错误此前与
+// 历史问题（历史）：step-up 验码通过后的用户重读，DB 错误此前与
 // 「用户不存在/禁用」同报 401 用户不可用——DB 故障被降级成认证拒绝。
 // 拆分：读失败 500；行缺失/禁用保持 401。
 func TestMFAVerifyStep_userReloadFailureReturns500(t *testing.T) {
@@ -124,7 +124,7 @@ func TestMFAVerifyStep_userReloadFailureReturns500(t *testing.T) {
 	}
 }
 
-// H-B1-03：verify-step 重读用户必须带 auth_provider（此前 SELECT 漏列 →
+// 历史修复：verify-step 重读用户必须带 auth_provider（此前 SELECT 漏列 →
 // 所有 step-up 响应 auth_provider=""，存量 OIDC 行丢 auth_method 声明）。
 func TestMFAVerifyStep_preservesAuthProvider(t *testing.T) {
 	h := newBackupTestHandlers(t)

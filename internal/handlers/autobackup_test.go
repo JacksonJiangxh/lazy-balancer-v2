@@ -34,7 +34,7 @@ func newAutoBackupTestHandlers(t *testing.T) *Handlers {
 	return h
 }
 
-// wireAutoBackupEngineForTest B2（历史后裁定）：/auto-backup/run 经引擎
+// wireAutoBackupEngineForTest 历史修复（历史后裁定）：/auto-backup/run 经引擎
 // RunSync——测试环境装配引擎+执行器（镜像 main.go 注入形态）。
 func wireAutoBackupEngineForTest(t *testing.T, h *Handlers) {
 	t.Helper()
@@ -524,7 +524,7 @@ func TestAutoBackupSettings_returnsSettingsAndRowsDesc(t *testing.T) {
 	}
 }
 
-// SYS-F1（历史 历史问题）：GET /settings/auto-backup 的 last_run 此前恒 null——
+// 历史修复（历史）：GET /settings/auto-backup 的 last_run 此前恒 null——
 // auto_backup_last_run 扫描进 sql.NullString 后零消费（lastRunValue 零赋值）。
 // 钉：库中有水位线时响应面回传同值；库中 NULL 时保持 null 形态（不写空串）。
 func TestAutoBackupSettings_returnsLastRun(t *testing.T) {
@@ -626,7 +626,7 @@ func TestDeleteAutoBackup_removesFileAndRow(t *testing.T) {
 }
 
 func TestDeleteAutoBackup_dbFailureReturns500(t *testing.T) {
-	// Given 主节点 + auto_backups 表不可用（DB 故障形态）——SYS-U3（历史）：
+	// Given 主节点 + auto_backups 表不可用（DB 故障形态）——历史修复（历史）：
 	// DB 故障与「备份不存在」不得混同为 404（排障方向误导）；ErrNoRows 404、
 	// 其余响亮 500（dbQueryNotFound 分判，与 GetCurrentUser/requireAutoBackupMaster
 	// 已立先例同口径）。
@@ -855,7 +855,7 @@ func TestRunAutoBackupOnce_prunesToKeepSetting(t *testing.T) {
 	}
 }
 
-// SYSB43-1(历史):裁剪时文件删除失败(非 ErrNotExist)必须保留 DB 行
+// 历史修复(历史):裁剪时文件删除失败(非 ErrNotExist)必须保留 DB 行
 // 下轮重试——此前行随 warn 一并删除,残留文件成孤儿永不再裁剪。
 func TestPruneAutoBackups_fileRemovalOutcomes(t *testing.T) {
 	// Given:三个 success 行——同名非空目录(Remove 返回 ENOTEMPTY)/文件缺失/
@@ -933,7 +933,7 @@ func TestRunAutoBackupNow_auditOperatorIsCurrentUser(t *testing.T) {
 	}
 }
 
-// U7b-F3（历史）：备份目录含私钥/凭证明文文件，目录权限必须 0700
+// 历史修复（历史）：备份目录含私钥/凭证明文文件，目录权限必须 0700
 // （MkdirAll 建目录时生效；指向已存在目录时为 no-op，故指向不存在的子目录）。
 func TestRunAutoBackupOnce_backupDirPerm0700(t *testing.T) {
 	h := newAutoBackupTestHandlers(t)
@@ -953,7 +953,7 @@ func TestRunAutoBackupOnce_backupDirPerm0700(t *testing.T) {
 
 // backupListFailingConnector：global_config 设置行查询成功返回缺省值，
 // auto_backups 列表查询「语句成功、迭代即失败」——注入 AutoBackupSettings
-// 备份列表循环的 rows.Err() 故障（历史问题-⑫，历史问题/历史问题 口径）。
+// 备份列表循环的 rows.Err() 故障（历史问题-⑫，历史问题 口径）。
 type backupListFailingConnector struct{}
 
 func (backupListFailingConnector) Connect(context.Context) (driver.Conn, error) {
@@ -1105,7 +1105,7 @@ func TestNextAutoBackupFilename_statFailureIsNotAvailable(t *testing.T) {
 	}
 }
 
-// B2-历史问题（历史）：文件名分配器在 200 个变体全冲突时必须报错，
+// 历史问题（历史）：文件名分配器在 200 个变体全冲突时必须报错，
 // 不得回退到基础名（可能已存在）——否则写盘会覆盖既有备份。
 func TestNextAutoBackupFilename_errorsWhenAllVariantsTaken(t *testing.T) {
 	h := newAutoBackupTestHandlers(t)

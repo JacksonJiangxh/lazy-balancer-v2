@@ -12,7 +12,7 @@ type ToolSpec struct {
 	Method      string `json:"method"`
 	Path        string `json:"path"`
 	// ReadOnly 表示该工具对只读 API Key「只读可用」——GET 且非隐藏工具，或读
-	// 探测 POST 白名单（见 isReadOnlyTool）。历史问题 MISC-F1 修正：此前恒为
+	// 探测 POST 白名单（见 isReadOnlyTool）。历史问题 修正：此前恒为
 	// method==HTTP GET，与真实只读能力集漂移（读语义探测 POST 误标 false、
 	// export_config 误标 true——外部契约变更，发布时向 MCP 使用者披露）。
 	// 历史问题（历史）：test_certificate_config 移出探测集（写 DNS TXT），

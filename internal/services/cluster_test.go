@@ -37,7 +37,7 @@ func (f *clusterLifecycleFake) StopSync()  { f.syncStopped.Store(true) }
 
 // v3SnapshotWithACMESection 将直调 applySnapshot 的夹具补齐为生产可达形态：
 // 生产快照经 verifiedSnapshotIntegrity 闸门后必为当前 schema 且携带 ACME
-// 区段；validateSnapshotACMEState 对缺区段统一硬拒（历史问题 S-4 移除 v2 放行
+// 区段；validateSnapshotACMEState 对缺区段统一硬拒（历史问题 移除 v2 放行
 // 死分支后，未设 SchemaVersion/ACME 的旧夹具会被拒）。
 func v3SnapshotWithACMESection(snapshot models.ClusterSnapshot) models.ClusterSnapshot {
 	snapshot.SchemaVersion = CurrentSnapshotSchema
@@ -58,7 +58,7 @@ func newClusterTestService(t *testing.T) (*ClusterService, *sql.DB) {
 	database := db.DB
 	service := NewClusterService(database, "")
 	t.Cleanup(func() {
-		// S历史问题-06：显式注销全局注册表条目（LIFO：先注销，再 Close/恢复）。
+		// 历史问题-06：显式注销全局注册表条目（LIFO：先注销，再 Close/恢复）。
 		unregisterClusterService(service)
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
@@ -533,7 +533,7 @@ func TestComputeNodeStatus_marks_stale_approved_node_offline(t *testing.T) {
 	}
 }
 
-// F-历史问题-02（历史 历史问题）：巡检离线阈值 max(2×sync_interval,120s)
+// 历史问题-02（历史）：巡检离线阈值 max(2×sync_interval,120s)
 // （cluster_masterserving.go）与 UI 阈值 2×clamp(sync_interval)（ComputeNodeStatus/
 // updateOverview）在 sync_interval∈[10,59] 分叉——interval=30 时巡检以 120s 判
 // 在线、UI 以 60s 判离线，同一节点在告警与节点列表两口径打架。归一为同一函数
@@ -1233,7 +1233,7 @@ func TestClusterSnapshot_alwaysCarriesGlobalSettings(t *testing.T) {
 	}
 }
 
-// S历史问题-14（历史）：测试名/注释原以「Caddy 同步开关关闭」描述行为，
+// 历史问题-14（历史）：测试名/注释原以「Caddy 同步开关关闭」描述行为，
 // 但三分类合并后已无 sync_caddy_config 开关（列已删，见下方
 // TestClusterService_Status_removesLegacySyncCaddyConfig）。真实契约是：
 // 快照未携带 caddy_config（=旧主端缺席）时跳过 Caddy 全局列，保留从端本地值。

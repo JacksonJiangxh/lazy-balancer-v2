@@ -14,7 +14,7 @@ import (
 	jwt "github.com/golang-jwt/jwt/v5"
 )
 
-// 历史修复 B-1 回归绊线：mfaStepUpGuard 的 428 行为——此前 auth_type 从未被 jwtAuth
+// 历史修复 回归绊线：mfaStepUpGuard 的 428 行为——此前 auth_type 从未被 jwtAuth
 // 设置 + GetString 读 float64 user_id 双缺陷使守卫整体死代码（单测全绿掩盖）。
 // 本测试让真实 JWT 穿过完整认证链。
 func TestMFAStepUpGuard_endToEnd(t *testing.T) {

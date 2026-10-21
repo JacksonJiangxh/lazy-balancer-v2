@@ -1,4 +1,4 @@
-// 配置时区格式化的无依赖单源（历史问题-F11）：date.ts 的 tzFormat/formatInConfigTz
+// 配置时区格式化的无依赖单源（历史问题）：date.ts 的 tzFormat/formatInConfigTz
 // 内联实现抽出，供页面渲染与 node --test 行为断言共用——date.ts 依赖 auth store
 // （走 @ 别名），测试无法加载；本模块零依赖，测试可直接构造格式化器验证 h23 口径。
 export const DEFAULT_TZ = 'Asia/Shanghai'

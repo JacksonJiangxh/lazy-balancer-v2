@@ -1,4 +1,4 @@
-// A86 历史问题 行为测试：页面隐藏时间隔任务（时钟/弧光冲刷/采集租约心跳）必须
+// 历史修复问题 行为测试：页面隐藏时间隔任务（时钟/弧光冲刷/采集租约心跳）必须
 // 停摆，恢复可见时立即补 tick 并重启——纯行为断言（假 document/window 驱动
 // 真实生产代码 createVisibilityIntervals），非源码文本钉。
 //
@@ -60,7 +60,7 @@ const makeHarness = (options?: { hidden?: boolean }): Harness => {
   return { doc, win, counts, get hiddenCalls() { return state.hiddenCalls }, get visibleCalls() { return state.visibleCalls }, loop }
 }
 
-test('A86 历史问题：start 立即补 immediate tick 并挂起全部间隔', () => {
+test('start 立即补 immediate tick 并挂起全部间隔', () => {
   const h = makeHarness()
   h.loop.start()
   assert.equal(h.counts.clock, 1, '时钟首刷立即执行')
@@ -72,7 +72,7 @@ test('A86 历史问题：start 立即补 immediate tick 并挂起全部间隔', 
   h.loop.stop()
 })
 
-test('A86 历史问题：hidden 停止全部间隔并回调 onHidden（释放租约）', () => {
+test('hidden 停止全部间隔并回调 onHidden（释放租约）', () => {
   const h = makeHarness()
   h.loop.start()
   h.doc.hidden = true
@@ -85,7 +85,7 @@ test('A86 历史问题：hidden 停止全部间隔并回调 onHidden（释放租
   h.loop.stop()
 })
 
-test('A86 历史问题：visible 恢复间隔、立即补 tick 并回调 onVisible', () => {
+test('visible 恢复间隔、立即补 tick 并回调 onVisible', () => {
   const h = makeHarness()
   h.loop.start()
   h.doc.hidden = true
@@ -101,7 +101,7 @@ test('A86 历史问题：visible 恢复间隔、立即补 tick 并回调 onVisib
   h.loop.stop()
 })
 
-test('A86 历史问题：重复 hidden/visible 不产生叠加间隔', () => {
+test('重复 hidden/visible 不产生叠加间隔', () => {
   const h = makeHarness()
   h.loop.start()
   h.doc.hidden = true
@@ -115,7 +115,7 @@ test('A86 历史问题：重复 hidden/visible 不产生叠加间隔', () => {
   h.loop.stop()
 })
 
-test('A86 历史问题：stop 摘除监听并清空间隔，幂等', () => {
+test('stop 摘除监听并清空间隔，幂等', () => {
   const h = makeHarness()
   h.loop.start()
   h.loop.stop()
@@ -128,7 +128,7 @@ test('A86 历史问题：stop 摘除监听并清空间隔，幂等', () => {
   assert.equal(h.win.size, 0, '幂等 stop 后仍无间隔')
 })
 
-test('A86 历史问题：挂载即 hidden 不起间隔不取租约，恢复可见后正常启动', () => {
+test('挂载即 hidden 不起间隔不取租约，恢复可见后正常启动', () => {
   const h = makeHarness({ hidden: true })
   h.loop.start()
   assert.equal(h.win.size, 0, 'hidden 挂载不得启动任何间隔')

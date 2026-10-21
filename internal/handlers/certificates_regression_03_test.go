@@ -1,6 +1,6 @@
 package handlers
 
-// L04-01（签发未入队不得伪装成功）。
+// 历史修复（签发未入队不得伪装成功）。
 
 import (
 	"encoding/json"
@@ -132,7 +132,7 @@ func TestDeleteCertificateConfig_holds_caddyOpMuAcrossReferenceCheckAndDelete(t 
 	}
 }
 
-// L4-82-06：证书清单按 (rule_id,domain) 聚合；同域不同规则不得折叠，
+// 历史修复：证书清单按 (rule_id,domain) 聚合；同域不同规则不得折叠，
 // 较新的 disabled 行不得遮蔽另一规则已签发证书。
 func TestListCertificates_groupsByRuleAndDomain(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -343,7 +343,7 @@ func TestUpdateCertificateConfig_emptyFieldWithMaskNotSwallowed(t *testing.T) {
 	}
 }
 
-// —— L04-01：签发未入队不得回 200「已创建 0 个任务」 ——
+// —— 历史修复：签发未入队不得回 200「已创建 0 个任务」 ——
 
 func seedIssueRule(t *testing.T, caddyID, domain string) {
 	t.Helper()

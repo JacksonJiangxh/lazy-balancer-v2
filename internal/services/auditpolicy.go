@@ -13,10 +13,10 @@ var auditRoutePolicies = map[string]AuditPolicy{
 	"POST /api/v1/auth/ticket-login": AuditPolicyExplicit,
 	// v2.1.8 MFA：公开 verify 与登录同语义（挑战令牌即凭据，handler 已细分记录
 	// 认证拒绝/登录成功）；自助端点 handler 显式记录启用/禁用（用户认证对象）；
-	// recovery-codes 重生成成功由 handler 显式记录「生成/恢复码」（S-8，2026-09-05
+	// recovery-codes 重生成成功由 handler 显式记录「生成/恢复码」（历史修复，2026-09-05
 	// 审计裁定——纯会话门下旧码全作废+明文下发登录可用凭证，须留痕）；setup/
 	// status/verify-step 为读或内部动作不产生审计（Generic 中间件映射为空 →
-	// 不记录——历史问题 D-N3 后的收敛形态）；admin reset handler 记录「重置/用户认证」。
+	// 不记录——历史问题 后的收敛形态）；admin reset handler 记录「重置/用户认证」。
 	"POST /api/v1/auth/mfa/verify":         AuditPolicyExplicit,
 	"POST /api/v1/auth/mfa/setup":          AuditPolicySkip,
 	"GET /api/v1/auth/mfa/status":          AuditPolicySkip,
@@ -27,7 +27,7 @@ var auditRoutePolicies = map[string]AuditPolicy{
 	"POST /api/v1/users/:id/mfa/reset":     AuditPolicyExplicit,
 	"POST /api/v1/auth/logout":             AuditPolicyExplicit,
 	"POST /api/v1/auth/setup":              AuditPolicyExplicit,
-	// 历史问题 CORE-F2：/mcp 条目运行时冗余——auditMiddleware 为根级中间件（先于
+	// 历史问题：/mcp 条目运行时冗余——auditMiddleware 为根级中间件（先于
 	// v1 组注册）会对 /mcp 分类，但缺省返回同为 AuditPolicySkip；保留本条目作
 	// 「有意跳过」显式登记——契约测试 TestSetupRouter_writeRoutesHaveExplicit-
 	// AuditClassification 要求每条写路由显式分类（intentionalSkip 断言
@@ -101,7 +101,7 @@ var auditRoutePolicies = map[string]AuditPolicy{
 	"POST /api/v1/system/tasks/:id/cancel":  AuditPolicyExplicit,
 	"POST /api/v1/system/tasks/:id/control": AuditPolicyExplicit,
 	"POST /api/v1/config/reload":            AuditPolicyGeneric,
-	// 历史问题 C-N3-c：validate 经 /load 真实加载候选配置（handler 成功后回弹权威
+	// 历史问题-c：validate 经 /load 真实加载候选配置（handler 成功后回弹权威
 	// 配置）——不再豁免审计，handler 显式记录校验三态。
 	"POST /api/v1/config/validate":                        AuditPolicyExplicit,
 	"POST /api/v1/rules/cert-info":                        AuditPolicySkip,
@@ -181,7 +181,7 @@ var readOnlyWriteRoutes = map[string]struct{}{
 	// 只读白名单——providers.Validate 会真实 Present+CleanUp DNS TXT 记录（非读
 	// 探测语义），从节点/只读 API Key 不得触发；三守卫（apiKeyReadOnlyGuard/
 	// mfaStepUpGuard/readOnlyGuard）对两条恢复完整写权限校验。
-	// U04a2-历史问题（历史）：ca-providers/:id/test 同步移出——ZeroSSL 提供商
+	// 历史问题（历史）：ca-providers/:id/test 同步移出——ZeroSSL 提供商
 	// 缺 EAB 时 TestCAProviderWithContext 会调 AutoProvisionZeroSSLEAB 申请 EAB
 	// 并 UPDATE ca_providers.credentials（caproviders.go:342-344），原「仅探测
 	// ACME 目录/账户可达性」的豁免前提不成立；三守卫同样恢复完整写权限校验。
@@ -190,10 +190,10 @@ var readOnlyWriteRoutes = map[string]struct{}{
 	// 调用方配置成为运行配置），只读 API key/从节点/MFA 豁免均可触发真实
 	// 配置加载；移除后三守卫（apiKeyReadOnlyGuard/mfaStepUpGuard/readOnlyGuard）
 	// 同步恢复完整写权限校验。
-	// 历史问题 B-F3：移除 "POST /api/v1/mcp"——/mcp 挂载早于本组 Use(apiKeyReadOnlyGuard)
+	// 历史问题：移除 "POST /api/v1/mcp"——/mcp 挂载早于本组 Use(apiKeyReadOnlyGuard)
 	// 等中间件（Gin 对 group 中间件链做注册期快照），该条目无任何运行时消费者；
 	// MCP 写控制实际由内部转发重入跳完整重跑只读/从节点/管理员守卫承担。
-	// 历史问题(C3):OIDC 发现探测为读语义(完整 discovery+JWKS 可达性探测,失败
+	// 历史问题(历史修复):OIDC 发现探测为读语义(完整 discovery+JWKS 可达性探测,失败
 	// 仅记审计不落库配置),只读 API Key 放行。
 	"POST /api/v1/settings/oidc/test": {},
 	"POST /api/v1/rules/cert-info":    {},
@@ -214,7 +214,7 @@ func ClassifyAuditRoute(method, path string) AuditPolicy {
 
 // taskTriggerSelfAuditIDs 手动触发审计自记族（历史问题-1，历史）：
 //   - threat/crs/ip2region：manager run 的 defer 每轮单记（2026-09-29 用户裁定
-//   - 历史问题 历史问题-2 收敛），operator 经 RunContext 归人；
+//   - 历史问题-2 收敛），operator 经 RunContext 归人；
 //   - crawlerbot-update：源更新入口 defer 自记（crawler_update.go）；
 //   - auto-backup：备份执行器（handlers/autobackup.go）按结果记「备份/备份失败」；
 //   - startup:config-load：runConfigLoad 载入审计（启动与手动同体）。

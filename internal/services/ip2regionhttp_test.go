@@ -91,7 +91,7 @@ func TestFetchIP2RegionLatestTag_bothFailErrorNamesBothURLs(t *testing.T) {
 }
 
 func TestIP2RegionDownloadXDBLogged_startAndCompletionLines(t *testing.T) {
-	// Given 内存下载服务：显式 Content-Length + 分块 flush 模拟流式到达
+	// Given 内存下载服务：显式 历史修复 + 分块 flush 模拟流式到达
 	body := bytes.Repeat([]byte("i"), 8*1024)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Length", strconv.Itoa(len(body)))

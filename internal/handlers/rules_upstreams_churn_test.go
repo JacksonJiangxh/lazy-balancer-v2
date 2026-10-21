@@ -1,6 +1,6 @@
 package handlers
 
-// 历史 历史问题：UpdateRule 的 upstreams 写入必须增量收敛（replaceUpstreamsTx，
+// 历史问题：UpdateRule 的 upstreams 写入必须增量收敛（replaceUpstreamsTx，
 // 镜像 replacePathRulesTx 三入口语义）——修复前恒 DELETE 全删 + INSERT：任何
 // 规则编辑（含纯改名）都重建全部上游行（id 递增），且恒触发行级同步触发器
 // （upstreams 在集群版本矩阵内）→ 每次 UpdateRule 多一轮从端同步。
@@ -167,7 +167,7 @@ func TestUpdateRule_upstreams_incrementalConvergence(t *testing.T) {
 	}
 }
 
-// LBH-A-U3（历史 历史问题）：churn 钉补新列——origin_domain 必须参与内容比较。
+// 历史修复（历史问题）：churn 钉补新列——origin_domain 必须参与内容比较。
 // 仅改 origin_domain → 原地 UPDATE 一次（保 id）；同值回传 → 零写入。
 // 若内容比较回归剔除 origin_domain，本测试两形状同时失守（变更不落库/
 // 同值误写）。

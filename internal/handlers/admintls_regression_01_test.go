@@ -8,7 +8,7 @@ import (
 // (services/certinfo.go int(hours/24) 截断)不一致——此前未过期 Ceil
 // (23h→1)、已过期 Floor(过期 1天3h→-2)。统一为向零截断:23h→0、
 // 过期 1天3h→-1。
-func TestParseAdminTLSCertInfo_daysLeftTruncatesLikeR67(t *testing.T) {
+func TestParseAdminTLSCertInfo_daysLeftTruncates(t *testing.T) {
 	now := time.Now()
 	tests := []struct {
 		name     string
@@ -35,7 +35,7 @@ func TestParseAdminTLSCertInfo_daysLeftTruncatesLikeR67(t *testing.T) {
 				t.Fatalf("parse: %v", err)
 			}
 			if info.DaysLeft != tt.wantDays {
-				t.Fatalf("days_left=%d, want %d(R67 截断口径)", info.DaysLeft, tt.wantDays)
+				t.Fatalf("days_left=%d, want %d(历史截断口径)", info.DaysLeft, tt.wantDays)
 			}
 			if info.Expired != tt.expired {
 				t.Fatalf("expired=%v, want %v", info.Expired, tt.expired)

@@ -53,7 +53,7 @@ func (h *Handlers) GetSecurityRateLimitBlocks(c *gin.Context) {
 // 暂无限流拦截必须可区分，前端 chip 显示「暂无计数」）。
 func (h *Handlers) GetRuleStageStats(c *gin.Context) {
 	if db.MetricsDB == nil {
-		// MetricsDB 未装配：与成功路径同键的零统计而非 panic（历史 历史问题）。
+		// MetricsDB 未装配：与成功路径同键的零统计而非 panic（历史）。
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{
 			"stage1_blocked_24h":      0,
 			"stage3_blocked_24h":      0,
@@ -85,7 +85,7 @@ func (h *Handlers) GetRuleStageStats(c *gin.Context) {
 		n, convErr := strconv.Atoi(triggered)
 		switch {
 		case triggered == "429":
-			// A81A-历史问题：限流拦截（429）由 ratelimit_blocks_reload（/metrics
+			// 历史问题：限流拦截（429）由 ratelimit_blocks_reload（/metrics
 			// 429 计数）单独供给阶段 2 chip；此前落入 else 分支被计入
 			// stage3_blocked_24h，导致同一拦截同时出现在阶段 2 与阶段 3。
 			continue
@@ -361,7 +361,7 @@ func loadSecurityOverviewAggregates(metricsDB *sql.DB, today time.Time, todaySta
 	for name, value := range stageCounts {
 		attackTypesStage = append(attackTypesStage, models.SecurityAttackType{Name: name, Value: value})
 	}
-	// A81A-历史问题：值相等时按名称升序 tiebreak（map 迭代序随机，防轮询抖动）。
+	// 历史问题：值相等时按名称升序 tiebreak（map 迭代序随机，防轮询抖动）。
 	sort.Slice(attackTypesStage, func(i, j int) bool {
 		if attackTypesStage[i].Value != attackTypesStage[j].Value {
 			return attackTypesStage[i].Value > attackTypesStage[j].Value

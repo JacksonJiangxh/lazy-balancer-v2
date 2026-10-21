@@ -28,13 +28,13 @@ import (
 func TestListRules_uses_schema_defaults_when_nullable_columns_are_NULL(t *testing.T) {
 	// Given
 	handler := newRuleFeatureTestHandlers(t)
-	// 历史 F-A: lb_rules.enabled 已 NOT NULL，回退迁移前结构以写入 NULL 行
+	// 历史修复: lb_rules.enabled 已 NOT NULL，回退迁移前结构以写入 NULL 行
 	simulateLegacyNullableLbRules(t, db.DB)
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,listen_port,health_check_path,health_check_interval,health_check_timeout,health_check_unhealthy_threshold,health_check_healthy_threshold,enabled)
 		VALUES ('lb_nulls','nullable','http',8080,NULL,NULL,NULL,NULL,NULL,NULL)`); err != nil {
 		t.Fatalf("seed nullable rule: %v", err)
 	}
-	// 历史 历史问题: upstreams.enabled 已 NOT NULL，回退迁移前结构以写入 NULL 行
+	// 历史问题: upstreams.enabled 已 NOT NULL，回退迁移前结构以写入 NULL 行
 	simulateLegacyNullableUpstreams(t, db.DB)
 	if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb_nulls','127.0.0.1',9000,1,NULL,'http')`); err != nil {
 		t.Fatalf("seed nullable upstream: %v", err)
@@ -47,7 +47,7 @@ func TestListRules_uses_schema_defaults_when_nullable_columns_are_NULL(t *testin
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/rules", nil))
 
 	// Then
-	// 注：health_check_timeout 的 NULL 回退原钉 5（schema 旧默认口径），LB-04
+	// 注：health_check_timeout 的 NULL 回退原钉 5（schema 旧默认口径），历史修复
 	//（用户裁定）已将读取/生成/渲染默认统一为 2（与写侧 CreateRule/校验副本
 	// 一致，见 rule_features.go lbRuleListColumns 与 services/caddy.go 渲染兜底）；
 	// 本期望随新契约更新，与 TestListRules_defaults_NULL_health_check_timeout_to_2 同口径。
@@ -805,7 +805,7 @@ func TestRuleToggle_restores_original_state_when_Caddy_apply_fails(t *testing.T)
 			// When
 			router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, test.path, nil))
 
-			// Then：配置被 Caddy 拒绝 → 400（裁定 2026-09-07 D2 统一映射）
+			// Then：配置被 Caddy 拒绝 → 400（裁定 2026-09-07 历史修复 统一映射）
 			if response.Code != http.StatusBadRequest {
 				t.Fatalf("toggle status=%d body=%s", response.Code, response.Body.String())
 			}
@@ -832,7 +832,7 @@ func TestRuleWriteEndpoints_roll_back_database_when_Caddy_apply_fails(t *testing
 	}{
 		{
 			name: "create", method: http.MethodPost, path: "/rules", body: `{"name":"candidate","protocol":"tcp","listen_port":19001,"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`,
-			// LBH79-历史问题：此处原有补偿阻断触发器——apply 失败走 defer tx.Rollback
+			// 历史问题：此处原有补偿阻断触发器——apply 失败走 defer tx.Rollback
 			// （删除由回滚完成，不执行 removeCreatedRule），触发器永不触达。删除
 			// 死夹具；回滚终态断言不变。
 			seed:  func(*testing.T) {},
@@ -874,7 +874,7 @@ func TestRuleWriteEndpoints_roll_back_database_when_Caddy_apply_fails(t *testing
 			seed: func(t *testing.T) {
 				seedAuditRule(t, "lb_tx_enable", "enable", "enable-tx.example.test", 8080, false, "manual", false)
 				seedAuditUpstream(t, "lb_tx_enable")
-				// LBH79-历史问题：补偿发生在 commit 之后的失败分支，apply 失败在
+				// 历史问题：补偿发生在 commit 之后的失败分支，apply 失败在
 				// commit 前回滚——此触发器永不触达，删除死夹具。
 			},
 			mount: func(router *gin.Engine, handler *Handlers) {
@@ -895,7 +895,7 @@ func TestRuleWriteEndpoints_roll_back_database_when_Caddy_apply_fails(t *testing
 			seed: func(t *testing.T) {
 				seedAuditRule(t, "lb_tx_disable", "disable", "disable-tx.example.test", 8080, true, "manual", false)
 				seedAuditUpstream(t, "lb_tx_disable")
-				// LBH79-历史问题：同上——补偿分支不可达，删除死夹具。
+				// 历史问题：同上——补偿分支不可达，删除死夹具。
 			},
 			mount: func(router *gin.Engine, handler *Handlers) {
 				router.POST("/rules/:caddy_id/disable", handler.DisableRule)
@@ -1344,7 +1344,7 @@ func TestUpdateRule_migrates_cert_job_domain_inplace(t *testing.T) {
 	if ruleDomain != "new.example.test" {
 		t.Fatalf("rule domain=%q, want new.example.test", ruleDomain)
 	}
-	// B2-12（历史）：原谓词 `status NOT IN ('retired')` 是死条件——db 的
+	// 历史修复（历史）：原谓词 `status NOT IN ('retired')` 是死条件——db 的
 	// CertJobStatuses 枚举无 retired 状态（全仓仅此测试出现该字面量），谓词
 	// 恒真，测试意图（只留一行）未被表达。改为按 rule_id 全量计数：本用例
 	// 目的就是「迁移就地进行、不留多余行」。
@@ -1395,7 +1395,7 @@ func TestUpdateRule_serializes_snapshot_commit_apply_and_restore(t *testing.T) {
 		close(secondDone)
 	}()
 	harness.release()
-	// LBH79-历史问题：通道读取加超时——回归时这里会退化为包级测试超时，
+	// 历史问题：通道读取加超时——回归时这里会退化为包级测试超时，
 	// 丢失「卡在哪个同步点」的诊断。
 	waitTestChannel(t, firstDone, "首个 UpdateRule 完成")
 	// 第二个请求在第一个释放 caddyOpMu 后进入临界区（快照 GET 信号），
@@ -1655,7 +1655,7 @@ func TestRuleWriteEndpoints_share_one_lock_order_under_concurrency(t *testing.T)
 	router.POST("/rules", handler.CreateRule)
 
 	done := make(chan struct{})
-	// B2-13（历史）：此前只断言「15s 内未死锁」+ `remaining > 2`（终态断言
+	// 历史修复（历史）：此前只断言「15s 内未死锁」+ `remaining > 2`（终态断言
 	// 过宽，且 Create 请求体缺 health_check_* 恒 400 → 根本未验证写成功）。
 	// 现按端点收集状态码并断言各自合法集（无 5xx/无未预期码），再断言终态
 	// 行数与被删/新建规则的存在性，既保留死锁门也证明并发写无丢失/异常。
@@ -1742,7 +1742,7 @@ func TestRuleWriteEndpoints_share_one_lock_order_under_concurrency(t *testing.T)
 	}
 }
 
-// N+12 用户裁决：删除/禁用在有 worker 正在执行签发时秒回 409 引导稍后重试，
+// 用户裁决：删除/禁用在有 worker 正在执行签发时秒回 409 引导稍后重试，
 // 替代悬挂最长 2 分钟的有界取消等待。仅拦「执行中」——queued 取消瞬时、
 // waiting_ca 冷却数小时均不拦（正确性仍由既有超时中止+回滚兜底）。
 func TestDeleteRule_returnsConflictWhenWorkerRunning(t *testing.T) {
@@ -1812,7 +1812,7 @@ func TestDeleteRule_queuedOnlyJobIsNotBlocked(t *testing.T) {
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/rules/lb_del_queued", nil))
 
-	// NEW-4（历史 历史问题）：此前只排他断言非 409——成功态与规则删除终态无钉。
+	// 历史修复（历史问题）：此前只排他断言非 409——成功态与规则删除终态无钉。
 	// 补 200 成功态 + 规则行确实删除（queued 任务走快速删除路径）。
 	if rec.Code != http.StatusOK {
 		t.Fatalf("queued-only job must allow fast delete: status=%d body=%s, want 200", rec.Code, rec.Body.String())
@@ -1826,7 +1826,7 @@ func TestDeleteRule_queuedOnlyJobIsNotBlocked(t *testing.T) {
 	}
 }
 
-// 审计 M16：host_header 指针化后「省略=保留原值、空串=清空」——空串必须
+// 历史修复：host_header 指针化后「省略=保留原值、空串=清空」——空串必须
 // 落库为空串，而非被合并逻辑吞回原值。
 func TestUpdateRule_empty_host_header_clears_value(t *testing.T) {
 	// Given
@@ -2055,7 +2055,7 @@ func TestRuleSave_appliesExactlyOnce(t *testing.T) {
 	}
 }
 
-// CERT41-4(历史):手动 TLS 保存侧的证书质量警告——自签单张证书(系统根
+// 历史修复(历史):手动 TLS 保存侧的证书质量警告——自签单张证书(系统根
 // 不认可→链不完整)不阻断保存,但警告必须随该写操作的审计详情留痕(可观察
 func TestCreateRule_manualTLSSelfSigned_recordsCertWarningAudit(t *testing.T) {
 	// Given
@@ -2097,7 +2097,7 @@ func TestCreateRule_manualTLSSelfSigned_recordsCertWarningAudit(t *testing.T) {
 	}
 }
 
-// CERT41-4 更新方向:替换为自签单张证书同样留痕(不阻断)。
+// 历史修复 更新方向:替换为自签单张证书同样留痕(不阻断)。
 func TestUpdateRule_manualTLSSelfSigned_recordsCertWarningAudit(t *testing.T) {
 	// Given：既有 manual-TLS 规则,本次更新替换证书材料为自签单张
 	handler, _, _ := newAuditRuleHandlers(t, 0)
@@ -2136,14 +2136,14 @@ func TestUpdateRule_manualTLSSelfSigned_recordsCertWarningAudit(t *testing.T) {
 	}
 }
 
-// CERT41-4 回归形状:链可信(注入测试根)且域名覆盖时不得误报——创建审计
+// 历史修复 回归形状:链可信(注入测试根)且域名覆盖时不得误报——创建审计
 // 详情不含证书警告。
 func TestCreateRule_manualTLSTrustedChain_omitsCertWarningAudit(t *testing.T) {
 	// Given
 	handler, _, _ := newAuditRuleHandlers(t, 0)
 	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
-	certPEM, keyPEM, roots := generateR41CAChain(t, []string{"tls-ok.example.test"})
-	injectR41Roots(t, roots)
+	certPEM, keyPEM, roots := generateTestCAChain(t, []string{"tls-ok.example.test"})
+	injectTestRoots(t, roots)
 	router := gin.New()
 	router.POST("/rules", handler.CreateRule)
 	payload, err := json.Marshal(map[string]any{
@@ -2176,7 +2176,7 @@ func TestCreateRule_manualTLSTrustedChain_omitsCertWarningAudit(t *testing.T) {
 	}
 }
 
-// CERT41-4 畸形形状:TCP 规则携带 TLS 证书材料——材料随 TCP 归一(历史问题 C-N1)
+// 历史修复 畸形形状:TCP 规则携带 TLS 证书材料——材料随 TCP 归一(历史问题)
 // 弃置,其质量警告不得随创建审计留痕(证书未落库,警告即误导)。
 func TestCreateRule_tcpTLSMaterialNormalized_omitsCertWarningAudit(t *testing.T) {
 	// Given
@@ -2411,7 +2411,7 @@ func wrapHandlerDBWithProbe(t *testing.T, probe *prepareProbe) {
 	})
 }
 
-// B2-01：域名迁移前「最新任务行」查询遇到真实 DB 错误（非 ErrNoRows）时，
+// 历史修复：域名迁移前「最新任务行」查询遇到真实 DB 错误（非 ErrNoRows）时，
 // 必须回滚迁移事务并退役旧域任务——不得空提交留下 issued+PEM 行永驻。
 func TestUpdateRule_domainMigrationReadFailureRetiresOldJob(t *testing.T) {
 	harness := newUpdateAuditRuleHandlers(t, "lb_a87_migfail", 0, false)
@@ -2473,7 +2473,7 @@ func TestUpdateRule_domainMigrationReadFailureRetiresOldJob(t *testing.T) {
 	}
 }
 
-// B2-02：PUT enabled=false 与 /disable 同语义——执行中签发必须前置 409，
+// 历史修复：PUT enabled=false 与 /disable 同语义——执行中签发必须前置 409，
 // 且不得把任务行翻成 disabled（用户以为已暂停而 worker 仍在跑）。
 func TestUpdateRule_disableWithRunningJobReturnsConflict(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)

@@ -21,7 +21,7 @@ import (
 
 // 5 分钟内 failed 的任务被立即重排队、反复消耗 CA 配额——须逐目标套用
 // certJobRetryBlocked，冷却中的任务跳过并在响应计数中单列 skipped_cooldown。
-func TestCERT44_2_IssueCertificate_batchSkipsCooldownFailedJobs(t *testing.T) {
+func TestIssueCertificate_batchSkipsCooldownFailedJobs(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
@@ -67,7 +67,7 @@ func TestCERT44_2_IssueCertificate_batchSkipsCooldownFailedJobs(t *testing.T) {
 
 // 与规则证书卡 formatDate 的本地时区口径不一致（Asia/Shanghai 下偏差一天）——
 // 须按配置时区（services.CurrentLocation）渲染。
-func TestCERT44_6_parseTLSCertificate_rendersDatesInConfiguredTimezone(t *testing.T) {
+func TestParseTLSCertificate_rendersDatesInConfiguredTimezone(t *testing.T) {
 	// Given：配置时区 Asia/Shanghai，证书 NotAfter=Asia/Shanghai 2026-01-01 00:30
 	// （即 UTC 2025-12-31T16:30:00Z；UTC 直出会得 2025-12-31）
 	previous := services.CurrentLocation()
@@ -79,7 +79,7 @@ func TestCERT44_6_parseTLSCertificate_rendersDatesInConfiguredTimezone(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	certPEM, keyPEM := selfSignedCertForCERT44(t, "parse44.test",
+	certPEM, keyPEM := selfSignedCertWithExpiry(t, "parse44.test",
 		time.Date(2025, 12, 30, 0, 0, 0, 0, time.UTC),
 		time.Date(2026, 1, 1, 0, 30, 0, 0, shanghai))
 
@@ -98,8 +98,8 @@ func TestCERT44_6_parseTLSCertificate_rendersDatesInConfiguredTimezone(t *testin
 	}
 }
 
-// selfSignedCertForCERT44 生成指定有效期的自签证书+私钥 PEM 对（CERT44-6 用）。
-func selfSignedCertForCERT44(t *testing.T, domain string, notBefore, notAfter time.Time) (string, string) {
+// selfSignedCertWithExpiry 生成指定有效期的自签证书+私钥 PEM 对。
+func selfSignedCertWithExpiry(t *testing.T, domain string, notBefore, notAfter time.Time) (string, string) {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 1024)
 	if err != nil {

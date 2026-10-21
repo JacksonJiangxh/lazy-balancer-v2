@@ -21,7 +21,7 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// apiKeyMaxPerUser 每用户 API Key 数量配额（历史 历史问题，用户裁定）。
+// apiKeyMaxPerUser 每用户 API Key 数量配额（历史问题，用户裁定）。
 const apiKeyMaxPerUser = 50
 
 // apiKeyWhitelistCachePurge 由 middleware 包注入（middleware 导入 handlers，
@@ -93,7 +93,7 @@ func (h *Handlers) CreateCurrentUserAPIKey(c *gin.Context) {
 func (h *Handlers) DeleteCurrentUserAPIKey(c *gin.Context) {
 	userID := int(contextUserID(c))
 	// scopedUserID==0 在 deleteAPIKey 中表示「全局删除」；自助入口缺少
-	// 认证上下文时必须拒绝，不能退化成管理员级删除（历史 B2-历史问题）。
+	// 认证上下文时必须拒绝，不能退化成管理员级删除（历史）。
 	if userID <= 0 {
 		c.JSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: "认证上下文缺失"})
 		return
@@ -105,11 +105,16 @@ func (h *Handlers) DeleteAPIKey(c *gin.Context) {
 	deleteAPIKey(c, 0)
 }
 
-// deleteAPIKey 删除 API 密钥（SYS-REST-F1 历史：DeleteAPIKey 与
+// deleteAPIKey 删除 API 密钥（历史修复：DeleteAPIKey 与
 // DeleteCurrentUserAPIKey 30+ 行逐字重复，仅作用域差异收敛为单实现）。
 // scopedUserID>0 时限本人创建（WHERE created_by=?），0 时全局删除；其余
 // （审计留痕、白名单缓存清扫、响应文案）两入口完全同源。
 func deleteAPIKey(c *gin.Context, scopedUserID int) {
+	// api_keys 在导入全量替代表清单内：窗口内写入会被静默覆盖或阻塞至
+	// busy_timeout——与节点写族同口径 409 fast-fail（历史修复），先于参数解析。
+	if rejectWriteDuringImport(c, "执行 API 密钥写操作") {
+		return
+	}
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil || id <= 0 {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "ID 参数无效"})
@@ -173,6 +178,10 @@ func scanAPIKeys(rows *sql.Rows) ([]models.APIKeyWithUserResponse, error) {
 }
 
 func createAPIKeyForUser(c *gin.Context, userID int) {
+	// 导入窗口 409（历史修复，同 deleteAPIKey），先于解析 body。
+	if rejectWriteDuringImport(c, "执行 API 密钥写操作") {
+		return
+	}
 	var req models.CreateAPIKeyRequest
 	if !guardConfiguredJSONBody(c) {
 		return
@@ -181,7 +190,7 @@ func createAPIKeyForUser(c *gin.Context, userID int) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求格式错误"})
 		return
 	}
-	// B43-3-3(历史):名称 TrimSpace 后非空且 ≤100 字符——空白名/超长名
+	// 历史修复(历史):名称 TrimSpace 后非空且 ≤100 字符——空白名/超长名
 	// 此前直接落库(api_keys.name VARCHAR(100) 在 SQLite 不强制长度),列表与
 	// 审计出现不可读名;修剪后落库。重名不拒绝(既有产品决策保持)。
 	req.Name = strings.TrimSpace(req.Name)
@@ -193,9 +202,9 @@ func createAPIKeyForUser(c *gin.Context, userID int) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "名称过长(上限 100 字符)"})
 		return
 	}
-	// 每用户配额 ≤50（历史 历史问题，用户裁定）：此前无数量上限，普通用户可
+	// 每用户配额 ≤50（历史问题，用户裁定）：此前无数量上限，普通用户可
 	// 无界增长 api_keys 表（自伤型资源膨胀）。判定与插入的原子化见下方单语句
-	// 条件插入（U7a-历史问题）。
+	// 条件插入（历史问题）。
 	if c.GetString("role") != "admin" {
 		req.ReadOnly = true
 	}
@@ -203,28 +212,28 @@ func createAPIKeyForUser(c *gin.Context, userID int) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "过期时间不能早于当前时间"})
 		return
 	}
-	// M6（2026-09 用户裁定）：特权 Key（非只读或 MCP）创建不验密码——API Key
+	// 历史修复（2026-09 用户裁定）：特权 Key（非只读或 MCP）创建不验密码——API Key
 	// 面向程序使用，创建/使用均不叠加交互确认；改密亦不吊销 Key（风险由后台
 	// 禁用 Key/账户与只读 Key 承载）。可选防线是「写操作验证」（mfa_write_guard）：
 	// 开启且创建者为启用 MFA 的 JWT 用户时，特权 Key 创建按 mfaStepUpGuard 同
 	// 语义要求 60 秒内 MFA 验证（428 → 全局弹码 → 携新 JWT 重试）；API Key
 	// 机器身份豁免（与路由级守卫一致），未启用 MFA 直通。
-	// U6a-3（历史）：下方内联检查与 middleware mfaStepUpGuard 同构——
-	// 历史问题 历史问题 为路由补前置守卫后，守卫开启时本层通常已被前置放行/拦截，保留
-	// 仅作纵深防御（历史问题 历史问题 前守卫独扛时代的产物）。
+	// 历史修复（历史）：下方内联检查与 middleware mfaStepUpGuard 同构——
+	// 历史问题 为路由补前置守卫后，守卫开启时本层通常已被前置放行/拦截，保留
+	// 仅作纵深防御（历史问题 前守卫独扛时代的产物）。
 	if !req.ReadOnly || req.MCPEnabled {
 		if c.GetString("auth_type") == "jwt" {
 			guardEnabled, guardErr := services.MFAWriteGuardEnabled()
 			if guardErr != nil {
-				// S历史问题：开关读取失败 fail-closed（与相邻 MFA 状态查询同口径，
-				// 历史问题 C-历史问题）——特权 Key 创建不能因「读不到开关」静默跳过第二因子。
+				// 历史问题：开关读取失败 fail-closed（与相邻 MFA 状态查询同口径，
+				// 历史问题）——特权 Key 创建不能因「读不到开关」静默跳过第二因子。
 				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "MFA 写操作验证开关读取失败"})
 				return
 			}
 			if guardEnabled {
 				var mfaEnabled bool
 				if err := db.DB.QueryRow("SELECT COALESCE(mfa_enabled,0) FROM users WHERE id=?", userID).Scan(&mfaEnabled); err != nil {
-					// 与 mfaStepUpGuard 同口径：MFA 状态查询失败 fail-closed（历史问题 C-历史问题）。
+					// 与 mfaStepUpGuard 同口径：MFA 状态查询失败 fail-closed（历史问题）。
 					c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "MFA 状态查询失败"})
 					return
 				}
@@ -265,7 +274,7 @@ func createAPIKeyForUser(c *gin.Context, userID int) {
 	if req.ExpiresAt != nil {
 		expiresAt = req.ExpiresAt
 	}
-	// U7a-历史问题（历史）：配额判定与插入原子化——此前 count-then-insert
+	// 历史问题（历史）：配额判定与插入原子化——此前 count-then-insert
 	// 两步在并发创建下 TOCTOU 越限（55 并发实测 55 全部越过 50 上限）。单语句
 	// 条件插入：计数子查询与写入同语句，SQLite 语句级原子，无判定窗口；
 	// WHERE 不满足时 0 行插入，按超限 400 拒绝。
@@ -342,6 +351,10 @@ func (h *Handlers) UpdateAPIKeyStatus(c *gin.Context) {
 }
 
 func updateAPIKeyStatus(c *gin.Context, currentUserOnly bool) {
+	// 导入窗口 409（历史修复，同 deleteAPIKey），先于参数解析。
+	if rejectWriteDuringImport(c, "执行 API 密钥写操作") {
+		return
+	}
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil || id <= 0 {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "ID 参数无效"})
@@ -436,7 +449,7 @@ func updateAPIKeyStatus(c *gin.Context, currentUserOnly bool) {
 		return
 	}
 	// 历史问题（历史）：更新审计记真 delta——启用态/MCP/只读/白名单是安全
-	// 相关变更，此前四个字段零留痕（同族先例：安全策略 历史问题/B1-历史问题）。
+	// 相关变更，此前四个字段零留痕（同族先例：安全策略 历史问题）。
 	auditDetail := services.FormatAuditDetail(fmt.Sprintf("密钥 %d", id), name)
 	changes := make([]string, 0, 4)
 	if req.IsEnabled != nil && *req.IsEnabled != (beforeEnabled == 1) {
@@ -459,7 +472,7 @@ func updateAPIKeyStatus(c *gin.Context, currentUserOnly bool) {
 	}
 	recordAudit(c, "更新", "API密钥", auditDetail)
 	// 历史问题-19①：禁用即清扫白名单解析缓存（条目随 Key 失活永不再命中）。
-	// U6a-5-6（历史）：在位编辑白名单也清扫——缓存键含白名单内容，旧键
+	// 历史修复（历史）：在位编辑白名单也清扫——缓存键含白名单内容，旧键
 	// 成为孤儿永不再命中（曾仅禁用/删除清扫）。
 	if (req.IsEnabled != nil && !*req.IsEnabled) || req.MCPIPWhitelist != nil {
 		purgeAPIKeyWhitelistCache(id)

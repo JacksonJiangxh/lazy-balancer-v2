@@ -1,9 +1,9 @@
 package handlers
 
 // 历史域 A（rows.Err 家族收敛）：三处 RED 钉测——
-//   - SEC-C-N1：GetThreatLib 迭代错误 → 500（历史问题/历史问题「残缺列表不得以 200」口径）
-//   - F-CORE-2：GetAuditLogOptions fetchDistinct 迭代/Scan 失败须 warn+不写缓存
-//   - F-SYSR-2：DeleteUser 级联 Key 清单迭代失败须 warn（白名单缓存清扫缺口留痕）
+//   - 历史修复：GetThreatLib 迭代错误 → 500（历史问题「残缺列表不得以 200」口径）
+//   - 历史修复：GetAuditLogOptions fetchDistinct 迭代/Scan 失败须 warn+不写缓存
+//   - 历史修复：DeleteUser 级联 Key 清单迭代失败须 warn（白名单缓存清扫缺口留痕）
 
 import (
 	"context"
@@ -86,8 +86,8 @@ func captureLog(t *testing.T) *strings.Builder {
 	return &buf
 }
 
-// SEC-C-N1（历史 历史问题·家族漏收敛）：GetThreatLib 主查询迭代错误（rows.Err）
-// 时此前仍以「部分/空列表 + 200」返回——与 历史问题/历史问题 在 GetSecurityOverview/
+// 历史修复（历史问题·家族漏收敛）：GetThreatLib 主查询迭代错误（rows.Err）
+// 时此前仍以「部分/空列表 + 200」返回——与 历史问题 在 GetSecurityOverview/
 // ListSecurityEvents 建立的「残缺列表不得以 200」口径冲突。修复：循环后补
 // rows.Err() → 500（与 Scan 失败分支同响应形）。
 func TestThreatLib_listIterationFailureReturns500(t *testing.T) {
@@ -112,7 +112,7 @@ func TestThreatLib_listIterationFailureReturns500(t *testing.T) {
 	}
 }
 
-// F-CORE-2（历史 历史问题）：fetchDistinct 单行 Scan 失败此前静默丢行、迭代错误
+// 历史修复（历史问题）：fetchDistinct 单行 Scan 失败此前静默丢行、迭代错误
 // （rows.Err）更整段吞掉且 fetchErr 不置位——空下拉会被 历史问题 缓存门放行
 // 写入 60s 缓存。修复：Scan 失败 warn；rows.Err 上抛 fetchErr（响应仍 200 部分
 // 数据，但缓存门按 历史问题 口径拦下故障轮）。本测试钉「迭代失败轮不毒化
@@ -181,7 +181,7 @@ func TestAuditLogOptions_iterationErrorRoundDoesNotPoisonCache(t *testing.T) {
 
 // deleteKeyIterFailConnector：DeleteUser 事务链驱动桩——目标用户单行查询
 // 正常返回、api_keys 级联清单「执行成功、迭代失败」、Exec 恒成功、Begin/Commit
-// 恒成功。用于注入 keyRows 迭代错误（F-SYSR-2）。
+// 恒成功。用于注入 keyRows 迭代错误（历史修复）。
 type deleteKeyIterFailConnector struct{}
 
 func (deleteKeyIterFailConnector) Connect(context.Context) (driver.Conn, error) {
@@ -235,9 +235,9 @@ func (r *deleteTargetUserRows) Next(dest []driver.Value) error {
 	return nil
 }
 
-// F-SYSR-2（历史 历史问题）：DeleteUser 级联 Key 清单迭代失败此前静默——部分
+// 历史修复（历史问题）：DeleteUser 级联 Key 清单迭代失败此前静默——部分
 // 删除的 Key 白名单解析缓存不清扫（孤儿缓存驻留）。修复：keyRows.Err() warn
-// 留痕（删除照常——warn-only 口径，与 SEC-A-F1 fail-closed 不同：本清单仅驱动
+// 留痕（删除照常——warn-only 口径，与 历史修复 fail-closed 不同：本清单仅驱动
 // 缓存清扫，孤儿缓存无越权面）。
 func TestDeleteUser_cascadeKeyIterationErrorWarns(t *testing.T) {
 	h := newBackupTestHandlers(t)

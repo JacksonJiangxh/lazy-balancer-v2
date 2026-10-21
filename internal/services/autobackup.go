@@ -29,7 +29,7 @@ func WriteAutoBackupFileSynced(path string, data []byte) error {
 }
 
 // SetAutoBackupExecutor 注入备份执行器（main.go 装配 handlers 实现；nil 解除）。
-// ctx 由引擎 Run 上下文透传（历史 历史问题-10）：demote/停止时在途备份
+// ctx 由引擎 Run 上下文透传（历史问题-10）：demote/停止时在途备份
 // 必须可被取消，而非跑完并记 success。
 func SetAutoBackupExecutor(fn func(ctx context.Context, trigger, operator string, engineRunID int64) error) {
 	autoBackupExecMu.Lock()
@@ -74,7 +74,7 @@ func writeAutoBackupEnabled(w autoBackupConfigWriter, enabled bool) error {
 }
 
 // SetAutoBackupEnabled 写自动备份业务开关并同步任务调度；off→on 保留
-// 既有水位线语义（停用期不追补），与设置页保存同口径。D1-历史问题：两条 Exec
+// 既有水位线语义（停用期不追补），与设置页保存同口径。历史问题：两条 Exec
 // （enabled 与启用时的水位线）必须同事务——生产设置页走
 // SetAutoBackupEnabledTx，本入口仅测试消费，此前直写形态可能留下半态。
 func SetAutoBackupEnabled(enabled bool) error {
@@ -198,8 +198,8 @@ func autoBackupDayHigh(freq string) int {
 }
 
 // normalizeAutoBackupDay 把读到的 day 收敛到 1..autoBackupDayHigh(freq)，越界
-// 回退 DB 默认 1——与 handlers 读侧 SYS-F1「越界存量值回退默认」同口径，保证
-// 「UI 显示的即生效值」（V87-TO-03，历史）。
+// 回退 DB 默认 1——与 handlers 读侧 历史修复「越界存量值回退默认」同口径，保证
+// 「UI 显示的即生效值」（历史修复，历史）。
 func normalizeAutoBackupDay(freq string, day int) int {
 	if day < 1 || day > autoBackupDayHigh(freq) {
 		return 1
@@ -219,7 +219,7 @@ type autoBackupSettingsRow struct {
 func loadAutoBackupSettings() (autoBackupSettingsRow, error) {
 	var row autoBackupSettingsRow
 	var lastRun sql.NullString
-	// B1-8（历史）：nil 库守卫（生产不可达）——EnabledFn/NextSlotFn 消费方
+	// 历史修复（历史）：nil 库守卫（生产不可达）——EnabledFn/NextSlotFn 消费方
 	// fail-closed（err 路径=已停止/零值槽）。
 	if db.DB == nil {
 		return row, sql.ErrConnDone
@@ -231,7 +231,7 @@ func loadAutoBackupSettings() (autoBackupSettingsRow, error) {
 	if err != nil {
 		return row, err
 	}
-	// V87-TO-03（历史）：读侧收敛 day 到写侧允许区间（weekly 1-7、
+	// 历史修复（历史）：读侧收敛 day 到写侧允许区间（weekly 1-7、
 	// daily/monthly 1-28）。带外写入的 29-31（集群快照直写不校验）会让
 	// monthly「已执行→步进」在短月回退到已执行的过去槽——水位线不再推进，
 	// 引擎每 tick 重跑备份；weekly 越界则让 autoBackupDueSlot ok=false，调度面

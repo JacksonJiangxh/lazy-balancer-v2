@@ -18,7 +18,7 @@ import (
 )
 
 func TestClusterStatus_syncIntervalDisplayClamp(t *testing.T) {
-	// S历史问题-13（历史）：每个子用例 db.Initialize 后必须 Close 并恢复
+	// 历史问题-13（历史）：每个子用例 db.Initialize 后必须 Close 并恢复
 	// 全局句柄（与 newClusterTestService 同款）——此前覆盖全局 db.DB 却无
 	// cleanup，-race/并行执行下可与其他用例互相污染，句柄也随全局注册表泄漏。
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
@@ -71,7 +71,7 @@ func TestNodeOfflineThreshold_clampsExcessiveSyncInterval(t *testing.T) {
 	}
 }
 
-// S历史问题-08：同一坏 health_json 行按 nodeID 60s 限频告警。
+// 历史问题-08：同一坏 health_json 行按 nodeID 60s 限频告警。
 func TestNodes_throttlesCorruptedHealthWarnings(t *testing.T) {
 	_, database := newClusterTestService(t)
 	service := NewClusterService(database, "")

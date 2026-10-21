@@ -13,7 +13,7 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// 历史修复 历史问题：服务层 ErrNotMasterNode → 403 必须与 requireMaster 门同源携带
+// 历史问题：服务层 ErrNotMasterNode → 403 必须与 requireMaster 门同源携带
 // X-LB-Error-Code: master_required——从端 Pull 的错误分类依赖该头
 // （cluster_sync.go），服务层降级竞态 403 此前不设头造成错误形状分叉。
 func TestClusterNodeAction_forbiddenCarriesMasterRequiredErrorCode(t *testing.T) {
@@ -52,7 +52,7 @@ func TestClusterNodeAction_forbiddenCarriesMasterRequiredErrorCode(t *testing.T)
 	}
 }
 
-// 历史修复 历史问题（同族收敛）：requireMaster 门路径本身已带头——钉住从节点直连
+// 历史问题（同族收敛）：requireMaster 门路径本身已带头——钉住从节点直连
 // 节点写端点的 403 形状，防回归。
 func TestUpdateClusterNodeSiteCoordinates_slaveGateCarriesErrorCode(t *testing.T) {
 	router := newClusterNodeSiteRouter(t)
@@ -72,7 +72,7 @@ func TestUpdateClusterNodeSiteCoordinates_slaveGateCarriesErrorCode(t *testing.T
 // 拒绝：从节点上的节点写操作必须返回同一个 ErrNotMasterNode 哨兵，且该
 // 错误经 clusterNodeAction 映射为 403 + X-LB-Error-Code（服务层若改回平行
 // 实现，handler 的 errors.Is 分类会静默失效 → 403 变 500）。
-func TestClusterA86_forbiddenMappingUsesSentinel(t *testing.T) {
+func TestClusterNodeAction_forbiddenMappingUsesSentinel(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	h.clusterService = services.NewClusterService(db.DB, t.TempDir())
 	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {

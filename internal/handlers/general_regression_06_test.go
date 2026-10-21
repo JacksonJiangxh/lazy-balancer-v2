@@ -13,9 +13,9 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// 历史修复 F-1/F-3 公共种子：一条可用的 DNS 提供商配置。
+// 历史修复 公共种子：一条可用的 DNS 提供商配置。
 
-// 历史修复 F-1 公共种子：当前启用的 CA 提供商 id。
+// 历史修复 公共种子：当前启用的 CA 提供商 id。
 func seedR52EnabledProviderID(t *testing.T) int {
 	t.Helper()
 	var providerID int
@@ -25,7 +25,7 @@ func seedR52EnabledProviderID(t *testing.T) int {
 	return providerID
 }
 
-// 历史修复 F-1（写侧）：CreateRule 必须拒绝引用不存在/已禁用 CA 提供商的
+// 历史修复（写侧）：CreateRule 必须拒绝引用不存在/已禁用 CA 提供商的
 // ca_provider_id——否则主节点静默回退到错误 CA 签发，从节点快照整包拒绝。
 func TestCreateRule_rejects_dangling_ca_provider_id(t *testing.T) {
 	// Given
@@ -54,7 +54,7 @@ func TestCreateRule_rejects_dangling_ca_provider_id(t *testing.T) {
 	}
 }
 
-// 历史修复 F-1（写侧）对照组：引用存在且启用的 CA 提供商必须放行并原样落库。
+// 历史修复（写侧）对照组：引用存在且启用的 CA 提供商必须放行并原样落库。
 func TestCreateRule_allows_valid_ca_provider_id(t *testing.T) {
 	// Given
 	handler, _, _ := newAuditRuleHandlers(t, 0)
@@ -87,7 +87,7 @@ func TestCreateRule_allows_valid_ca_provider_id(t *testing.T) {
 	}
 }
 
-// 历史修复 F-1（写侧）对照组：ca_provider_id=0（系统默认）语义不变，照常放行。
+// 历史修复（写侧）对照组：ca_provider_id=0（系统默认）语义不变，照常放行。
 func TestCreateRule_allows_zero_ca_provider_id(t *testing.T) {
 	// Given
 	handler, _, _ := newAuditRuleHandlers(t, 0)
@@ -112,7 +112,7 @@ func TestCreateRule_allows_zero_ca_provider_id(t *testing.T) {
 	}
 }
 
-// 历史修复 F-1（写侧）：UpdateRule 切换到 acme_dns 时同样拒绝悬挂 ca_provider_id。
+// 历史修复（写侧）：UpdateRule 切换到 acme_dns 时同样拒绝悬挂 ca_provider_id。
 func TestUpdateRule_rejects_dangling_ca_provider_id(t *testing.T) {
 	// Given
 	harness := newUpdateAuditRuleHandlers(t, "lb_upd_ca999", 0, false)
@@ -135,7 +135,7 @@ func TestUpdateRule_rejects_dangling_ca_provider_id(t *testing.T) {
 	}
 }
 
-// 历史修复 F-1（写侧）对照组：UpdateRule 携带有效 ca_provider_id 必须放行。
+// 历史修复（写侧）对照组：UpdateRule 携带有效 ca_provider_id 必须放行。
 func TestUpdateRule_allows_valid_ca_provider_id(t *testing.T) {
 	// Given
 	harness := newUpdateAuditRuleHandlers(t, "lb_upd_ca_valid", 0, false)
@@ -200,7 +200,7 @@ func TestUpdateRule_preserves_valid_ca_provider_when_omitted(t *testing.T) {
 	}
 }
 
-// 历史修复 F-2：EnableRule 不得把 enable_tls+acme_dns 且 acme_config_id=0 的
+// 历史修复：EnableRule 不得把 enable_tls+acme_dns 且 acme_config_id=0 的
 // 存量坏规则（导入残留）投入运行——与 历史修复 Create/Update 写侧 400 口径对齐。
 func TestEnableRule_rejects_acme_dns_without_certificate_config(t *testing.T) {
 	// Given
@@ -227,7 +227,7 @@ func TestEnableRule_rejects_acme_dns_without_certificate_config(t *testing.T) {
 	}
 }
 
-// 历史修复 F-3：CreateRule 必须拒绝引用不存在 certificate_configs 行的
+// 历史修复：CreateRule 必须拒绝引用不存在 certificate_configs 行的
 // acme_config_id（历史修复 门只挡 0 值，悬挂非 0 同样不得落库）。
 func TestCreateRule_rejects_dangling_acme_config_id(t *testing.T) {
 	// Given
@@ -254,7 +254,7 @@ func TestCreateRule_rejects_dangling_acme_config_id(t *testing.T) {
 	}
 }
 
-// 历史修复 F-3：manual 规则保留的存量 acme_config_id 若在 manual 期间被删除，
+// 历史修复：manual 规则保留的存量 acme_config_id 若在 manual 期间被删除，
 // 切换回 acme_dns（不带 acme_config_id，0=保留合并出悬挂 id）必须 400，
 // 不得静默复用已删除的 DNS 配置。
 func TestUpdateRule_rejects_dangling_acme_config_id_on_switch_back(t *testing.T) {
@@ -284,7 +284,7 @@ func TestUpdateRule_rejects_dangling_acme_config_id_on_switch_back(t *testing.T)
 	}
 }
 
-// 历史修复 F-3 对照组：切换到 acme_dns 且引用存在的配置必须放行。
+// 历史修复 对照组：切换到 acme_dns 且引用存在的配置必须放行。
 func TestUpdateRule_allows_acme_dns_with_valid_config(t *testing.T) {
 	// Given
 	harness := newUpdateAuditRuleHandlers(t, "lb_valid_cfg", 0, false)

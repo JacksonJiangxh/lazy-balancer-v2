@@ -50,7 +50,7 @@ func taskMonitorRouter() (*gin.Engine, *Handlers) {
 	return r, h
 }
 
-// A85历史问题-3：历史端点与 trigger/toggle 同口径做注册存在性门；
+// 历史问题：历史端点与 trigger/toggle 同口径做注册存在性门；
 // 已注册但零历史的任务仍返回 200 + 空数组。
 func TestGetSystemTaskHistory_checksTaskExistence(t *testing.T) {
 	newBackupTestHandlers(t)
@@ -392,7 +392,7 @@ func TestSystemTaskLogPath_certJobAndFallbackShapes(t *testing.T) {
 	}
 }
 
-// 历史问题/B3-历史问题：任务日志只读尾窗；偏移起点的残段（含整窗无换行的
+// 历史问题：任务日志只读尾窗；偏移起点的残段（含整窗无换行的
 // 巨型行）统一经 tailLogWindow 丢弃，小文件保持原样。
 func TestGetSystemTaskLogs_boundedTailDropsPartialFirstLine(t *testing.T) {
 	dir := t.TempDir()
@@ -532,7 +532,7 @@ func TestGetSystemTaskLogs_rotationBudgetUsesConcatenatedTail(t *testing.T) {
 	})
 }
 
-// A85历史问题-1：普通任务写侧只保留 1 份轮转副本，读侧不得按证书任务
+// 历史问题：普通任务写侧只保留 1 份轮转副本，读侧不得按证书任务
 // 扫描 .1～.5；仅最近 .1 前置到活动日志，避免读取不存在/越权保留代。
 func TestGetSystemTaskLogs_includesOnlyLatestOrdinaryRotation(t *testing.T) {
 	dir := t.TempDir()

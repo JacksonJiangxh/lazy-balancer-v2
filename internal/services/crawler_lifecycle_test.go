@@ -34,7 +34,7 @@ func TestRunCrawlerBotUpdate_taskLifecycleLogsAndTimestamps(t *testing.T) {
 		UPDATE security_crawler_sources SET update_enabled=1,url=? WHERE name='googlebot'`, ts.URL); err != nil {
 		t.Fatal(err)
 	}
-	// PD-04（历史）：内置首版已与官方快照对齐（googlebot 170 条），收缩门
+	// 历史修复（历史）：内置首版已与官方快照对齐（googlebot 170 条），收缩门
 	// 基线在「DB 无行」时取内置条数——2 条的合成响应会被判截断。生产形态恒有
 	// DB 行（首轮由 Prime 落库），此处按同一形态预置当前快照 2 条，使基线走
 	// DB 分支（本用例的断言对象是任务生命周期日志与时间，不是收缩门）。
@@ -131,10 +131,10 @@ func TestRunCrawlerBotUpdate_downloadFailureMarksFailedAndLogs(t *testing.T) {
 	}
 }
 
-// —— RunUpdate 取消/降级分支（SSA-87-09，历史） ——
+// —— RunUpdate 取消/降级分支（历史修复，历史） ——
 
 // 下载在途取消：源行落 cancelled、保留上次快照（排程槽与版本不动）。
-func TestSSA8709_runUpdateCancelMarksSourceCancelled(t *testing.T) {
+func TestCrawlerRunUpdate_cancelMarksSourceCancelled(t *testing.T) {
 	_, database := newClusterTestService(t)
 	oldFile := crawlerIPListFile
 	crawlerIPListFile = filepath.Join(t.TempDir(), "crawler-ip-lists.json")
@@ -208,7 +208,7 @@ func TestSSA8709_runUpdateCancelMarksSourceCancelled(t *testing.T) {
 
 // 下载在途降级为从节点（demote 同时取消 ctx）：任务落 skipped、源行不被改写
 // （从节点只读不变量）、名单不写。
-func TestSSA8709_runUpdateDemoteSkipsWithoutWriting(t *testing.T) {
+func TestCrawlerRunUpdate_demoteSkipsWithoutWriting(t *testing.T) {
 	_, database := newClusterTestService(t)
 	oldFile := crawlerIPListFile
 	crawlerIPListFile = filepath.Join(t.TempDir(), "crawler-ip-lists.json")

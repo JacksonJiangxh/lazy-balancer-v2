@@ -98,7 +98,7 @@ type ruleConflictCandidate struct {
 	tlsHTTPRedirect                 bool
 }
 
-// 历史 历史问题: v1（disableConvertedRuleConflicts）与 v2（disableV2RuleConflicts）
+// 历史问题: v1（disableConvertedRuleConflicts）与 v2（disableV2RuleConflicts）
 // 各自组装 ruleConflictCandidate 的字段清单此前重复两份，新增字段需同步两处；
 // 收敛为单一构造函数，双路径共用。
 func newRuleConflictCandidate(name, caddyID, protocol, domain string, listenPort int, enabled, enableTLS, tlsHTTPRedirect bool) ruleConflictCandidate {
@@ -142,7 +142,7 @@ func validateRuleConflictMatrix(candidates []ruleConflictCandidate) []disabledRu
 		domainSets[index] = set
 		byPort[candidates[index].listenPort] = append(byPort[candidates[index].listenPort], index)
 	}
-	// A85历史问题-1：同端口 TLS/明文混布（保存/启用链 checkPortTLSMix 的导入侧
+	// 历史问题：同端口 TLS/明文混布（保存/启用链 checkPortTLSMix 的导入侧
 	// 同口径落地）。Caddy 按端口生成单一 server，只要任一启用 HTTP 规则带证书
 	// 即生成 tls_connection_policies——同端口明文规则在该监听器上握手必败，
 	// 整条规则静默不可达。导入无法像保存链一样即时 400（备份可能来自旧版本/
@@ -187,16 +187,16 @@ func validateRuleConflictMatrix(candidates []ruleConflictCandidate) []disabledRu
 		reason := ""
 		switch {
 		case left.protocol == "http" && right.protocol == "http" && left.listenPort == right.listenPort:
-			// 历史 历史问题: 禁用规则无运行时占用——与禁用行的「同端口同域名」不构成
+			// 历史问题: 禁用规则无运行时占用——与禁用行的「同端口同域名」不构成
 			// 真实冲突，不得把启用中的一方静默置禁用（与跨端口分支同口径门控）。
-			// 历史问题 F1 放行禁用自环行后该组合首次可达此分支。
+			// 历史问题 放行禁用自环行后该组合首次可达此分支。
 			if left.enabled && right.enabled {
 				if domain, hit := intersectFirst(rightIndex, leftIndex); hit {
 					reason = fmt.Sprintf("HTTP 域名 %s 重复", domain)
 				}
 			}
 		case left.protocol == "http" && right.protocol == "http" && left.listenPort != right.listenPort:
-			// 历史 历史问题: 跨端口跳转遮蔽方向——TLS+跳转规则在 80 端口服务器头部
+			// 历史问题: 跨端口跳转遮蔽方向——TLS+跳转规则在 80 端口服务器头部
 			// 生成 terminal 301（caddy.go redirectRoutes），同域名直接监听 80 的规则
 			// 会被静默遮蔽为死规则。仅双方均启用时判定，按矩阵惯例冲突双方置禁用。
 			if left.enabled && right.enabled {
@@ -213,7 +213,7 @@ func validateRuleConflictMatrix(candidates []ruleConflictCandidate) []disabledRu
 		case left.listenPort != right.listenPort:
 			return
 		case left.protocol == "tcp" && right.protocol == "tcp":
-			// 历史 历史问题: 与 HTTP 同端口分支（历史 历史问题）同口径门控——
+			// 历史问题: 与 HTTP 同端口分支（历史）同口径门控——
 			// 禁用 TCP 规则不渲染（caddy.go WHERE enabled=1）、无运行时端口占用，
 			// 不得把启用中的一方静默置禁用。
 			if left.enabled && right.enabled {
@@ -426,7 +426,7 @@ func mapV1BalancerStrategy(value string) (string, bool) {
 }
 
 // validateConvertedV1Rules 的 portGate 与 validateV2BackupRules 同口径
-// （A85历史问题-5）：生产预览/导入传入进程实际管理端口门；省略退回包级默认。
+// （历史问题）：生产预览/导入传入进程实际管理端口门；省略退回包级默认。
 func validateConvertedV1Rules(rules []convertedRule, portGates ...func(string, int) error) ([]convertedRule, []string, []string) {
 	validatePort := validateRuleListenPort
 	if len(portGates) > 0 && portGates[0] != nil {
@@ -503,7 +503,7 @@ func validateConvertedV1Rules(rules []convertedRule, portGates ...func(string, i
 			skips = append(skips, fmt.Sprintf("规则 #%d（%s）：%v", index+1, rule.Name, err))
 			continue
 		}
-		// 历史问题 历史问题: 导入 INSERT 的探测超时硬编码 5s，历史 历史问题 的
+		// 历史问题: 导入 INSERT 的探测超时硬编码 5s，历史问题 的
 		// timeout<interval 不变量（保存侧门控）在导入链未生效——fail_timeout ≤ 5 的
 		// v1 规则会让活动检查单次耗时与间隔重叠。钳位 interval ≥ 6（语义近似保留，
 		// 仅活动检查启用时生效；被动检查的 fail_duration=interval*3 不受超时约束）。
@@ -511,7 +511,7 @@ func validateConvertedV1Rules(rules []convertedRule, portGates ...func(string, i
 			rule.HealthInt = 6
 			normalizations = append(normalizations, fmt.Sprintf("规则 #%d（%s）：v1 健康检查间隔过短，已提为 6 秒（探测超时 5 秒须小于间隔）", index+1, rule.Name))
 		}
-		// 历史问题 历史问题: TCP 规则在 v2 渲染侧不终结入站 TLS（buildTCPServer 不触碰 TLS
+		// 历史问题: TCP 规则在 v2 渲染侧不终结入站 TLS（buildTCPServer 不触碰 TLS
 		// 字段），v1 的 SSL 开关对 TCP 无意义；保留 enable_tls=1 + 空 manual 证书会因
 		// UpdateRule 非协议门控的手动证书检查使该规则任何编辑恒 400，且 UI 向导对
 		// TCP 隐藏 TLS 开关、无域名 TCP 规则无界面自救路径——导入即归一（与
@@ -529,7 +529,7 @@ func validateConvertedV1Rules(rules []convertedRule, portGates ...func(string, i
 			skips = append(skips, fmt.Sprintf("规则 #%d（%s）：启用 TLS 但证书或私钥为空，已跳过导入", index+1, rule.Name))
 			continue
 		}
-		// 历史问题 C-历史问题: 禁用的空证书 SSL 行此前原样落库（enable_tls=1 + tls_source=
+		// 历史问题: 禁用的空证书 SSL 行此前原样落库（enable_tls=1 + tls_source=
 		// 'manual' + 空证书），并随 v2 导出回流；导入时归一为 enable_tls=0（证书
 		// 可后续补齐再启用），逐条告警但不计入跳过数。
 		if !rule.Enabled && rule.Protocol == "http" && rule.EnableTLS &&
@@ -537,7 +537,7 @@ func validateConvertedV1Rules(rules []convertedRule, portGates ...func(string, i
 			rule.EnableTLS = false
 			normalizations = append(normalizations, fmt.Sprintf("规则 #%d（%s）：启用 TLS 但证书或私钥为空，已按关闭 TLS 导入（规则为禁用状态）", index+1, rule.Name))
 		}
-		// 历史 B4 / 历史 历史问题（审计 M15 前移）：strategy 白名单与 80 端口
+		// 历史 历史修复 / 历史问题（历史修复 前移）：strategy 白名单与 80 端口
 		// +TLS 跳转自环门自导入循环前移至此——预览/导入共用同门，summary 计数
 		// 与实际导入数保持一致；strategy 空值按导入循环同款默认补齐。
 		mappedStrategy := rule.Strategy
@@ -699,7 +699,7 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
 			return
 		}
-		// 历史问题-01（历史 历史问题）：users 键存在且为空数组——预览与导入
+		// 历史问题-01（历史）：users 键存在且为空数组——预览与导入
 		// 同位硬拒（同文案），此前预览显示「用户 0 个」仍 valid=true。
 		if rows, ok := backup.Tables["users"]; ok && len(rows) == 0 {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: "备份 users 表为空，导入将清空全部账户，已拒绝"}})
@@ -709,15 +709,15 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
 			return
 		}
-		// 历史 历史问题：与 ImportConfigBackup 同序——content_type 白名单值域收敛
+		// 历史问题：与 ImportConfigBackup 同序——content_type 白名单值域收敛
 		// 也进预览，「导入/预览双路径同序」不变量补齐（预览不回显该值，无可观察
 		// 面分叉，纯不变量对齐）。
 		normalizeBlockPageContentTypes(backup.Tables)
-		// B3-历史问题：与 ImportConfigBackup 同序——域名归一 + 冲突置禁用前移到
+		// 历史问题：与 ImportConfigBackup 同序——域名归一 + 冲突置禁用前移到
 		// 逐行校验之前（冲突可自愈备份不得在预览误报不可导入）。
 		canonicalizeBackupRuleDomains(backup.Tables["lb_rules"])
 		disabledConflicts := disableV2RuleConflicts(backup.Tables["lb_rules"])
-		// 历史问题 历史问题: 与 ImportConfigBackup 同序——skip 之后、逐行校验之前校验
+		// 历史问题: 与 ImportConfigBackup 同序——skip 之后、逐行校验之前校验
 		// upstreams/path_rules 引用存在性，预览结果与实际导入一致（否则悬挂引用
 		// 备份在预览显示可导入、实际导入才 400）。
 		if err := validateBackupRuleReferences(backup.Tables); err != nil {
@@ -729,7 +729,7 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 			return
 		}
 		// 与 ImportConfigBackup 同序：安全策略 CRS 字段校验也须进预览，否则坏
-		// 组号备份在预览显示可导入、实际导入才 400（历史问题 历史问题）。
+		// 组号备份在预览显示可导入、实际导入才 400（历史问题）。
 		// 历史问题-02（历史）：本次导入同时替换 CRS 规则树时，存在性基准
 		// 不是 live 索引——降级为形状校验并进预览警告（与导入侧同判据）。
 		previewLbbak := lbbakPayloadFromCtx(c)
@@ -738,7 +738,7 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
 			return
 		}
-		// 历史问题 历史问题：与 ImportConfigBackup 同序——TLS 形态校验在冲突置禁用之后
+		// 历史问题：与 ImportConfigBackup 同序——TLS 形态校验在冲突置禁用之后
 		// 执行，预览结果与实际导入一致（冲突可自愈备份不得在预览误报不可导入）。
 		// 与 ImportConfigBackup 同序——「导规则不导 cert 配置且备份
 		// 从未携带 cert 表」方向按 live 解析失败的 ACME 引用降级为悬挂警告。
@@ -756,13 +756,13 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
 			return
 		}
-		// 历史问题 历史问题：与 ImportConfigBackup 同序——坏 admin_tls_* 形态预览即报
+		// 历史问题：与 ImportConfigBackup 同序——坏 admin_tls_* 形态预览即报
 		// 不可导入，不得预览通过、导入才 400。
 		if err := validateV2BackupAdminTLS(backup.Config); err != nil {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
 			return
 		}
-		// D2/D3（历史）：自动封禁六列与受信代理三 TEXT 列导入门——
+		// 历史修复（历史）：自动封禁六列与受信代理三 TEXT 列导入门——
 		// 与 ImportConfigBackup 同序，畸形载荷预览即报不可导入（归一写回在
 		// 预览无可观察面，纯不变量对齐）。
 		if _, err := validateV2BackupAutobanConfig(backup.Config); err != nil {
@@ -773,7 +773,7 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
 			return
 		}
-		// 历史问题 / 历史问题：与 ImportConfigBackup 同序——运行期设置门与自动
+		// 历史问题：与 ImportConfigBackup 同序——运行期设置门与自动
 		// 备份设置组门。预览侧归一写回无可观察面（纯不变量对齐）。
 		if err := validateV2BackupRuntimeSettings(backup.Config, backup.Tables); err != nil {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
@@ -786,7 +786,7 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 		// 2026-09-18 用户裁定:操作者缺席不再阻断——降级为预览 warning(分类
 		// 未选系统数据时操作者不受影响;选了也尊重用户选择)。
 		// 同序后 sections 已知——未选系统数据/备份 users 缺席不再误告
-		// (与导入侧 历史问题-F3 口径一致)。
+		// (与导入侧 历史问题 口径一致)。
 		validateWarnings := skipWarnings[:0:0]
 		validateWarnings = append(validateWarnings, skipWarnings...)
 		if warning := backupProductVersionWarning(backup.Meta, h.cfg.Version); warning != "" {
@@ -804,7 +804,7 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 		}
 		hasWaf := false
 		if payload := lbbakPayloadFromCtx(c); payload != nil {
-			// 历史问题-历史问题（历史）：威胁库名单条目也是规则库数据文件
+			// 历史问题（历史）：威胁库名单条目也是规则库数据文件
 			// ——RDB 文件化后存在「仅威胁 .iplist、无 CRS/xdb」的合法 lbbak
 			// （只启用威胁库更新的节点）。此前 hasWaf 只认 CRS/xdb，预览据此
 			// 提示「不含规则库文件」而实际会落盘名单文件（文案与真实能力不符）。
@@ -832,10 +832,10 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 		// security_ip2region_version 两行表（历史逐函数核实），剔除先后无可观察
 		// 分叉。**未来新增读取这两表的校验器时，必须先把本步前移到
 		// validateBackupRuleReferences 之前与导入逐行对齐。**
-		// 历史问题-03（历史）：镜像导入侧 BE-历史问题 单侧文件缺失建模——
+		// 历史问题-03（历史）：镜像导入侧 历史问题 单侧文件缺失建模——
 		// 单侧缺失剔对应版本表并告警（此前仅建模双侧缺失，单侧形态预览计数
 		// 含两表且无警告，与导入实际落库分叉）；双侧缺失语义保持（历史问题，
-		// BE-历史问题「只有元数据=不导入」）。文案与导入侧共用常量（历史问题-F6）。
+		// 历史问题「只有元数据=不导入」）。文案与导入侧共用常量（历史问题）。
 		if sectionTables["security_crs_version"] {
 			previewPayload := lbbakPayloadFromCtx(c)
 			crsMissing := previewPayload == nil || previewPayload.CRSTarGz == nil
@@ -987,7 +987,7 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "清理旧规则失败，已回滚: " + err.Error()})
 		return
 	}
-	// 审计 M14：v1 导入覆盖 lb_rules 后须同步清空 security_policy_bindings——
+	// 历史修复：v1 导入覆盖 lb_rules 后须同步清空 security_policy_bindings——
 	// 绑定表对 rule_caddy_id 无外键级联，残留行会指向已删除规则成为悬挂绑定。
 	if _, err := tx.ExecContext(ctx, "DELETE FROM security_policy_bindings"); err != nil {
 		err = session.abort(err)
@@ -1067,9 +1067,9 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 	}
 	if err := session.commit(affectedRuleIDs, pendingCerts); err != nil {
 		// 队列阶段=DB 已提交，与 v2 同语义返回 200+partial（500 会让前端
-		// 按“已回滚”处理并诱发重复导入，历史 历史问题-1）。
+		// 按“已回滚”处理并诱发重复导入，历史问题-1）。
 		if importFailurePhase(err) == importPhaseQueue {
-			// 历史修复 历史问题（历史）：与 v2 尾部（config_backup.go queue
+			// 历史问题（历史）：与 v2 尾部（config_backup.go queue
 			// 分支后继续提交后收敛）对齐——此前提前返回丢失全部转换/跳过/
 			// 归一化警告、不写「重载」审计、不清陈旧 caddy_apply_error 横幅。
 			auditDetail := err.Error()
@@ -1106,7 +1106,7 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 	auditParts = append(auditParts, services.AuditResultPart("success"))
 	recordAudit(c, "导入", "配置备份", services.FormatAuditDetail(auditParts...))
 	recordAudit(c, "重载", "Caddy服务", "导入配置后自动重载")
-	// 2026-09-07 审计 L4：导入成功后清除陈旧 caddy_apply_error（对齐 N3/L2 口径）。
+	// 2026-09-07 历史修复：导入成功后清除陈旧 caddy_apply_error（对齐历史修复口径）。
 	h.recordCaddyApplyResult(nil)
 	tlsSuffix := ""
 	if tlsCount > 0 {

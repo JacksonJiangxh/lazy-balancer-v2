@@ -1,6 +1,6 @@
 package middleware
 
-// 历史 历史问题-19①：PurgeAPIKeyWhitelistCache 必须按 keyID 前缀精确清扫——
+// 历史问题-19①：PurgeAPIKeyWhitelistCache 必须按 keyID 前缀精确清扫——
 // "|" 分隔保证 keyID=3 不误伤 "30|…" 前缀；其他 Key 的条目不受影响。
 
 import (

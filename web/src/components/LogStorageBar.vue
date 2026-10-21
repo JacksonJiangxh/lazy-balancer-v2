@@ -105,7 +105,7 @@ let loadStatsSeq = 0
 const loadStats = async (): Promise<void> => {
   const seq = ++loadStatsSeq
   try {
-    // U04d-06：服务端按 key 收窄（只统计所看那一行）；缺省全量会为每个弹框
+    // 历史修复：服务端按 key 收窄（只统计所看那一行）；缺省全量会为每个弹框
     // 做全部 DB 计数与目录统计。
     const params: Record<string, string> = { key: props.logKey }
     if (props.caddyId) params.caddy_id = props.caddyId

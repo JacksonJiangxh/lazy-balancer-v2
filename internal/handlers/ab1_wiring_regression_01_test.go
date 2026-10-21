@@ -68,7 +68,7 @@ func TestRemoveIPFromList_autobanPresetUnbanSmoke(t *testing.T) {
 		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
 	}
 	if got := decodeRemove(t, rec).Data.Removed; !got {
-		t.Fatal("预置名单条目应可移除（F73-A 例外：删除即解封）")
+		t.Fatal("预置名单条目应可移除（历史修复 例外：删除即解封）")
 	}
 	var entriesJSON string
 	if err := db.DB.QueryRow(`SELECT COALESCE(entries,'[]') FROM security_ip_lists WHERE id=?`, presetID).Scan(&entriesJSON); err != nil {

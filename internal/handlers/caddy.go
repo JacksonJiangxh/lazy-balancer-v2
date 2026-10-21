@@ -38,16 +38,16 @@ var caddyStopCommand = func(adminURL string) *exec.Cmd {
 // caddyPauseFile 与 docker-entrypoint.sh 的 Caddy 监督器协调(历史问题):
 // stopCaddy 建文件 → 监督器见文件不重启(admin 停止是用户意图);
 // startCaddy 删文件 → 监督器 ≤1s 检测并启动;handler 等 admin 就绪。
-// LBH-B-U2（历史）：改为包级 var 作测试注入缝（caddyProcRoot 同模式）。
+// 历史修复（历史）：改为包级 var 作测试注入缝（caddyProcRoot 同模式）。
 var caddyPauseFile = "/tmp/lazy-balancer-caddy-paused"
 
 // caddySupervisorPidFile 是监督器在位标记(entrypoint 父壳在后台化监督器
-// 子 shell 后立即写入——$!=子 shell pid，INFRA-71-1 历史)——
+// 子 shell 后立即写入——$!=子 shell pid，历史修复)——
 // startCaddy 仅在标记在场时走监督器委托路径;测试环境(无监督器)直启不等待。
 var caddySupervisorPidFile = "/tmp/lazy-balancer-caddy-supervisor.pid"
 
 // caddySupervisorWaitTimeout 是监督器委托的 admin 就绪等待上限（生产 5s；
-// 测试调小）。LBH-B-U2 测试注入缝。
+// 测试调小）。历史修复 测试注入缝。
 var caddySupervisorWaitTimeout = 5 * time.Second
 
 // caddyStartupReplayMarkerFile 是监督器「启动回放阶段完成」标记（历史启动
@@ -71,8 +71,8 @@ var startupReplayWaitTimeout = 30 * time.Second
 // 手动重载/caddy-restart 到场时标记必已存在（本容器生命周期内监督器首启
 // 必写过），首轮探测即返回。
 //
-// START-1（历史）：超时放行路径的收敛兜底在监督器侧——admin 就绪逾 10
-// 探针时 slow-start 后台环补写 /tmp/caddy-restarted（绕过 V1 首启豁免），
+// 历史修复（历史）：超时放行路径的收敛兜底在监督器侧——admin 就绪逾 10
+// 探针时 slow-start 后台环补写 /tmp/caddy-restarted（绕过 历史修复 首启豁免），
 // caddy-restart watcher 随后走与启动同源的 DB 渲染→校验→应用强制重收敛；
 // 本函数的超时是有界的面板可用性保障，不因拉高等待上限换取就绪竞态收窄
 // （docker-entrypoint.sh slow-start 块 Ruling 注释）。
@@ -110,7 +110,7 @@ func caddyProcessRunning() bool {
 // parseProcStat 解析 /proc/<pid>/stat 行，返回 comm 与状态字节。stat 格式：
 // pid (comm) state ...；comm 可含空格与右括号，取最后一个 ')' 之后的单字符
 // 状态（R/S/D/T/Z…）。畸形行返回 ok=false。caddyLivePID 与 supervisorAlive
-// 共用本解析（LBH-B-N1，历史：监督器存活判定与 caddy 存活判定同口径排 Z）。
+// 共用本解析（历史修复，历史：监督器存活判定与 caddy 存活判定同口径排 Z）。
 func parseProcStat(line string) (comm string, state byte, ok bool) {
 	open := strings.Index(line, "(")
 	close := strings.LastIndex(line, ")")
@@ -158,8 +158,8 @@ func caddyAdminReady(adminURL string) bool {
 	return response.StatusCode < http.StatusInternalServerError
 }
 
-// supervisorAlive LBH-历史问题（历史 历史问题）：监督器在位判定——pid 标记在场且
-// 所记 pid 仍存活。LBH-B-N1（历史）：存活校验从「/proc/<pid> 目录在场」
+// supervisorAlive 历史问题（历史）：监督器在位判定——pid 标记在场且
+// 所记 pid 仍存活。历史修复（历史）：存活校验从「/proc/<pid> 目录在场」
 // 升级为读 /proc/<pid>/stat 状态字节——监督器 kill -9 后父进程（PID1 app，
 // Go 不回收非 exec 子进程）未回收期间僵尸滞留 /proc（目录在场、状态字节
 // Z），目录判定恒活会让 startCaddy 恒委托空等 5s 超时、直启兜底永不可达；
@@ -187,9 +187,9 @@ func supervisorAlive() bool {
 func startCaddy(adminURL string) error {
 	// 历史问题:监督器在场(标记文件)时优先委托(删 pause → 监督器 ≤1s 启动),
 	// 等 admin 就绪;标记不在场(测试环境/监督器死亡)直接 spawn。
-	// LBH-历史问题（历史 历史问题）：在场判定升级为 pid 存活校验——标记文件在但
+	// 历史问题（历史）：在场判定升级为 pid 存活校验——标记文件在但
 	// pid 已死（监督器被杀/容器异常重启残留）时，委托只会空等超时后报错；
-	// 落直启（与标记不在场同语义；标记留存不删，由 N1 存活判定消化）。
+	// 落直启（与标记不在场同语义；标记留存不删，由 历史修复 存活判定消化）。
 	if supervisorAlive() {
 		_ = os.Remove(caddyPauseFile)
 		supervisorDeadline := time.Now().Add(caddySupervisorWaitTimeout)
@@ -199,17 +199,17 @@ func startCaddy(adminURL string) error {
 			}
 			time.Sleep(200 * time.Millisecond)
 		}
-		// LBH-B-U2（历史）：委托超时不落直启——监督器活着但慢启动时
+		// 历史修复（历史）：委托超时不落直启——监督器活着但慢启动时
 		// 直启会双启抢 admin/监听端口，败者触发监督器崩溃重拉 churn（或
 		// 假 500：监督器实例其实已正常服务）。pause 已解除，监督器仍在
 		// 重试，返回明确错误即可。
 		return fmt.Errorf("Caddy 监督器在场但 %s 内未拉起就绪的 Caddy（pause 已解除，监督器仍在重试，请稍后复查或检查容器日志）", caddySupervisorWaitTimeout)
 	}
-	// LBH-B-N2（历史）：直启路径不再删 pid 标记——app 检查
+	// 历史修复（历史）：直启路径不再删 pid 标记——app 检查
 	// supervisorAlive 之后、监督器子 shell 首写标记之前，Remove 会误删刚
 	// 写入的在位标记（永久失标 → 下次直启与监督器拉起双启抢口）。陈旧
 	// 标记（死 pid）留存无害：supervisorAlive 按 pid 存活判定消化；标记
-	// 不在场时 Remove 本是 no-op。僵尸误报半边由 N1 的状态字节判定承接。
+	// 不在场时 Remove 本是 no-op。僵尸误报半边由 历史修复 的状态字节判定承接。
 	cmd := caddyRunCommand()
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -262,11 +262,11 @@ func stopCaddy(adminURL string) error {
 
 func (h *Handlers) GetConfig(c *gin.Context) {
 	var cfg models.GlobalConfig
-	// G4（历史）：治理默认值列的读路径 SQL 字面量是默认值的第三次复制
+	// 历史修复（历史）：治理默认值列的读路径 SQL 字面量是默认值的第三次复制
 	//（DDL DEFAULT+启动回填+此处）——改参数绑定 db.Default* 常量单源化，
 	// 常量变更不再需要三处同步。非治理列（log 级别/布尔/保留期等）字面量
 	// 原状（不在库值唯一真相治理批次内）。
-	// B1-09（历史）：threat_traffic_sample_n/security_events_retention_days/
+	// 历史修复（历史）：threat_traffic_sample_n/security_events_retention_days/
 	// security_events_row_cap 三处兜底字面量与 DDL DEFAULT+迁移回填对齐
 	//（历史问题 起改为绑定 db.Default* 常量，含 threat_screen_mode；均 NOT NULL+
 	// 回填，兜底实际不可达）。
@@ -320,7 +320,7 @@ func (h *Handlers) GetConfig(c *gin.Context) {
 	       last_sync, updated_at
 		FROM global_config WHERE id = 1
 	`,
-		// G4：占位符序=cert_expiry_days/caddy_log_size_mb/request_body_max_size_mb/
+		// 历史修复：占位符序=cert_expiry_days/caddy_log_size_mb/request_body_max_size_mb/
 		// http_read_timeout/http_write_timeout/http_idle_timeout；历史问题 追加
 		// 大屏/安全事件四列（threat_screen_mode/sample/retention/row_cap）。
 		db.DefaultCertExpiryDays, db.DefaultCaddyLogSizeMB, db.DefaultRequestBodyMaxSizeMB,
@@ -345,12 +345,12 @@ func (h *Handlers) GetConfig(c *gin.Context) {
 		return
 	}
 	// 历史问题-1(历史):展示口径与运行时 clamp 对齐(<10 → 60)。
-	// LBH-B-U3（历史）：钳位移到 err 判定之后——err 非 nil 时 cfg 为零值
+	// 历史修复（历史）：钳位移到 err 判定之后——err 非 nil 时 cfg 为零值
 	// 废弃对象，先行钳位是对废弃对象的无意义写（顺序误导读者）。
 	if cfg.SyncInterval < 10 {
 		cfg.SyncInterval = 60
 	} else if cfg.SyncInterval > 86400 {
-		// D2-历史问题：与运行时/节点状态阈值同界，存量脏数据不得原样展示。
+		// 历史问题：与运行时/节点状态阈值同界，存量脏数据不得原样展示。
 		cfg.SyncInterval = 86400
 	}
 	// 历史问题（2026-09-05 证书域审计裁定）：global_config.dns_credentials 为遗留字段
@@ -397,7 +397,7 @@ func validateUpdateConfigRequest(req *models.UpdateConfigRequest) error {
 		}
 	}
 
-	// A-5(2026-09-10 审计):与 LogLevel 同口径归一(ToLower+TrimSpace 后回写)
+	// 历史修复(2026-09-10 审计):与 LogLevel 同口径归一(ToLower+TrimSpace 后回写)
 	// ——此前仅校验不归一,"DEBUG"/" info " 形态 400 或原样落库,两字段口径漂移。
 	if req.CaddyLogLevel != nil {
 		level := strings.ToLower(strings.TrimSpace(*req.CaddyLogLevel))
@@ -413,7 +413,7 @@ func validateUpdateConfigRequest(req *models.UpdateConfigRequest) error {
 		if err := validateAccessLogFormat(*req.AccessLogFormat); err != nil {
 			return err
 		}
-		// A85历史问题-A：写侧归一强制携带 X-API-Key 脱敏行（渲染层另有恒等
+		// 历史问题：写侧归一强制携带 X-API-Key 脱敏行（渲染层另有恒等
 		// 不变量兜底旧库/直接改库/导入形态）——落库值即所见，UI 不再需要
 		// 猜测渲染层偷偷追加了什么。空格式保持为空（=「不裁剪原生字段」，
 		// 渲染层仍注入脱敏行）。
@@ -442,7 +442,7 @@ func validateUpdateConfigRequest(req *models.UpdateConfigRequest) error {
 		return errors.New("cert_renewal_attempts 必须在 1-10 之间")
 	}
 
-	// 历史问题 C-N5：cert_expiry_days 与另两个续签数值同边界（导入侧已按
+	// 历史问题：cert_expiry_days 与另两个续签数值同边界（导入侧已按
 	// [1,365] 钳制）——写侧缺校验会让 0/负值落库，续期窗口计算漂移。
 	if req.CertExpiryDays != nil && (*req.CertExpiryDays < 1 || *req.CertExpiryDays > 365) {
 		return errors.New("cert_expiry_days 必须在 1-365 之间")
@@ -454,7 +454,7 @@ func validateUpdateConfigRequest(req *models.UpdateConfigRequest) error {
 		}
 	}
 
-	// 历史问题 历史问题：上限 4096MB——无上限时天文数字在渲染侧 int64 乘法（MB→字节）
+	// 历史问题：上限 4096MB——无上限时天文数字在渲染侧 int64 乘法（MB→字节）
 	// 回绕可正可负。库值唯一真相（批 1+2）：request_body_max_size_mb 为类型①
 	// 值型列（0 无效，1-4096），0 不再是「跟随全局/不限」——落库值恒有效，
 	// 渲染直读零兜底。
@@ -500,7 +500,7 @@ func validateUpdateConfigRequest(req *models.UpdateConfigRequest) error {
 	if req.RuntimeLogSizeMB != nil && (*req.RuntimeLogSizeMB <= 0 || *req.RuntimeLogSizeMB > 1024) {
 		return errors.New("运行日志大小需在 1-1024MB 之间")
 	}
-	// 历史 历史问题: 审计日志轮转大小上限 512MB（主节点侧校验；从节点经集群
+	// 历史问题: 审计日志轮转大小上限 512MB（主节点侧校验；从节点经集群
 	// 同步照单全收，配置源始终为主节点）。
 	if req.AuditLogSizeMB != nil && *req.AuditLogSizeMB <= 0 {
 		return errors.New("审计日志轮转大小必须大于 0")
@@ -511,7 +511,7 @@ func validateUpdateConfigRequest(req *models.UpdateConfigRequest) error {
 	if req.JWTExpireMinutes != nil && (*req.JWTExpireMinutes <= 0 || *req.JWTExpireMinutes > 1440) {
 		return errors.New("jwt_expire_minutes 必须在 1-1440 之间")
 	}
-	// 历史问题 F3：audit_retention_months 服务端范围校验（UI 口径 1-12）——超大值使
+	// 历史问题：audit_retention_months 服务端范围校验（UI 口径 1-12）——超大值使
 	// 年龄裁剪的 datetime('now', '-N days') 越出 SQLite 年份范围返回 NULL，
 	// 年龄 DELETE 恒假静默失效（仅剩条数兜底）。
 	if req.AuditRetentionMonths != nil && (*req.AuditRetentionMonths < 1 || *req.AuditRetentionMonths > 12) {
@@ -576,7 +576,7 @@ func (h *Handlers) PreviewConfigUpdate(c *gin.Context) {
 		return
 	}
 	// 与 UpdateConfig 同门：preview 200 后 PUT 不应因存量规则聚合校验变 400
-	//（历史 历史问题-1）。
+	//（历史问题-1）。
 	if err := validateEnabledStoredRuleConfigs(c.Request.Context()); err != nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
@@ -609,7 +609,7 @@ func isPureConfigValidationError(err error) bool {
 }
 
 // writeConfigValidationFailure 映射聚合预校验错误。历史问题 新发现4：纯配置错误
-// 保持 400 且展示全部规则问题（历史 历史问题）；一旦混入非配置类错误（DB 故障
+// 保持 400 且展示全部规则问题（历史）；一旦混入非配置类错误（DB 故障
 // 等），改映射 500 通用文案并记日志——否则 400 消息携带底层 DB 错误文本，
 // 客户端会把服务端故障误判为配置问题。
 func writeConfigValidationFailure(c *gin.Context, err error) {
@@ -647,7 +647,7 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 
 	old, err := loadConfigSnapshot()
 	if err != nil {
-		// I-K（历史）：保存端点服务端失败分支留痕（操作者归因 + 错误详情），
+		// 历史修复（历史）：保存端点服务端失败分支留痕（操作者归因 + 错误详情），
 		// 此前仅成功路径写审计；动作复用既有 danger 词条「更新失败」。
 		recordAudit(c, "更新失败", "全局配置", services.FormatAuditDetail("读取当前配置失败", err.Error(), services.AuditResultPart("failure")))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取当前配置失败"})
@@ -665,9 +665,9 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 		return
 	}
 
-	// 2026-09-07 裁定 D1：撤 pre-tx /load 探针（与 ④'「探针已撤除」对齐）——
+	// 2026-09-07 裁定 历史修复：撤 pre-tx /load 探针（与 ④'「探针已撤除」对齐）——
 	// 候选合法性由 applyFromTxNote 内 CLI 真 validate-only + 事务内应用承担；
-	// 探针曾使 SQL 失败分支面临「运行配置已换候选但 DB 未提交」的分叉（M2），
+	// 探针曾使 SQL 失败分支面临「运行配置已换候选但 DB 未提交」的分叉（历史修复），
 	// 撤除后该窗口不存在。只读快照保留，仅供提交失败回弹使用。
 	oldRuntimeConfig, err := h.caddyService.GetConfig()
 	if err != nil {
@@ -784,7 +784,7 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 
 	reloadNote, applyErr := h.applyFromTxNote(c, tx, "保存配置后自动重载")
 	if applyErr != nil {
-		// 历史修复-1（历史）：CLI 预检/事务内应用两轮渲染已按未提交内容重写
+		// 历史修复（历史）：CLI 预检/事务内应用两轮渲染已按未提交内容重写
 		// 投影（tp.txt 等）——tx 回滚的同时把磁盘回退到已提交态（零 /load）。
 		h.caddyService.RollbackIPListProjectionsToCommittedInLock()
 		restoreErr := h.caddyService.ApplyConfig(oldRuntimeConfig)
@@ -797,7 +797,7 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 		}
 		h.recordCaddyApplyResult(applyErr)
 		recordAudit(c, "更新失败", "全局配置", services.FormatAuditDetail("Caddy 配置应用失败", applyErr.Error(), services.AuditResultPart("failure")))
-		// 2026-09-07 审计 N4：与规则域 D2 统一——配置拒绝→400，传输/系统→500。
+		// 2026-09-07 审计 历史修复：与规则域 历史修复 统一——配置拒绝→400，传输/系统→500。
 		if services.IsConfigRejected(applyErr) {
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Caddy 配置校验未通过，配置未保存: " + applyErr.Error()})
 		} else {
@@ -806,7 +806,7 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 		return
 	}
 	if err := tx.Commit(); err != nil {
-		// 历史问题 + A85历史问题-B: apply 已把未提交事务视图的投影/证书写盘并把
+		// 历史问题 + 历史问题: apply 已把未提交事务视图的投影/证书写盘并把
 		// 该内容写入 LKG；commit 失败统一走已提交视图恢复（回滚事务 + 重渲染
 		// /load + 回退 LKG——恢复 /load 失败时仍把已提交字节写回 LKG）。
 		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
@@ -818,7 +818,7 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 		return
 	}
 	committed = true
-	// 成功清横幅由 reloadNote 单收口（历史 历史问题-2）；此处重复 UPDATE
+	// 成功清横幅由 reloadNote 单收口（历史问题-2）；此处重复 UPDATE
 	// 只增加写放大且违反「note 唯一收口」约定。
 	services.ApplyLogLevel()
 	// 历史问题（历史）：task_log_size_mb 经本端点写库，服务端 5 分钟 TTL
@@ -827,7 +827,7 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 	services.InvalidateTaskLogSizeCache()
 	if req.Timezone != nil {
 		if _, err := services.ConfigureLocation(*req.Timezone); err != nil {
-			// B1-06（历史）：时区已在写库前经 time.LoadLocation 预校验，
+			// 历史修复（历史）：时区已在写库前经 time.LoadLocation 预校验，
 			// 此分支仅可能为环境级异常；配置已提交并应用，宣告 500 更新失败会
 			// 误导客户端（重试=重复写同一已生效值）。降级为错误日志，响应保持成功。
 			services.Logf("error", "配置已提交并应用，但运行时应用时区失败（提交前已预校验，疑似环境异常）: %v", err)
@@ -846,7 +846,7 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 }
 
 func (h *Handlers) ValidateConfig(c *gin.Context) {
-	// LBH79-历史问题：先读请求体再取写锁（UpdateConfig/PutCaddyConfig 同序）——
+	// 历史问题：先读请求体再取写锁（UpdateConfig/PutCaddyConfig 同序）——
 	// 已认证客户端的慢速/chunked 上传此前在持有 caddyOpMu 时读 body，会阻塞
 	// 全部规则/配置写与后台强制重载。全局 body 上限可配到 4096MB，窗口可观。
 	var configData map[string]interface{}
@@ -862,12 +862,12 @@ func (h *Handlers) ValidateConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的配置 JSON"})
 		return
 	}
-	// 历史问题 二十六次 W1-8：CLI 不可用回退路径仍执行真实 /load，保持与其他写
+	// 历史问题：CLI 不可用回退路径仍执行真实 /load，保持与其他写
 	// 端点共享 caddyOpMu。
 	h.caddyOpMu.Lock()
 	defer h.caddyOpMu.Unlock()
 	// 2026-09-06 裁定 ④' 收口：真 validate-only（caddy CLI，零运行时扰动），
-	// 与 apidocs「不触发 Caddy」的既有承诺对齐；CLI 不可用回退 历史问题 C-N3-c
+	// 与 apidocs「不触发 Caddy」的既有承诺对齐；CLI 不可用回退 历史问题-c
 	// 的 load+回弹口径。
 	if err := h.caddyService.ValidateJSONViaCLI(rendered); err == nil {
 		recordAudit(c, "校验成功", "Caddy配置", services.FormatAuditDetail("配置校验", services.AuditResultPart("success")))
@@ -878,8 +878,8 @@ func (h *Handlers) ValidateConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "配置验证失败", Data: err.Error()})
 		return
 	}
-	// CLI 校验器不可用回退：历史问题 C-N3-c——/load 无 validate-only 语义，候选
-	// 载荷会成为运行配置。LBH79-历史问题：候选可能已被 Caddy 加载后请求才
+	// CLI 校验器不可用回退：历史问题-c——/load 无 validate-only 语义，候选
+	// 载荷会成为运行配置。：候选可能已被 Caddy 加载后请求才
 	// 断连/超时（客户端看到传输错误），因此**无论 ValidateConfig 成功或
 	// 失败**都必须回弹 DB 权威全量配置；只有回弹成功才允许把错误归类为
 	// 「配置无效」（400），传输/系统错误映射 500，回弹失败一律 500 并
@@ -911,14 +911,14 @@ func (h *Handlers) ValidateConfig(c *gin.Context) {
 
 func (h *Handlers) ReloadCaddy(c *gin.Context) {
 	if err := h.applyCaddyConfigE(); err != nil {
-		// I-K（历史）：手动重载恰是最需要留痕的操作——失败分支记录
+		// 历史修复（历史）：手动重载恰是最需要留痕的操作——失败分支记录
 		// 操作者归因 + 错误详情（recordCaddyApplyResult 的系统级「应用失败」
 		// 不带用户身份，不能替代本条）。
 		recordAudit(c, "重载失败", "Caddy服务", services.FormatAuditDetail("手动重载 Caddy 配置", err.Error(), services.AuditResultPart("failure")))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Caddy 配置重载失败: " + err.Error()})
 		return
 	}
-	// I-K（历史）：手动重载成功同样需要留痕（69d809b4 曾误删本行）。
+	// 历史修复（历史）：手动重载成功同样需要留痕（69d809b4 曾误删本行）。
 	recordAudit(c, "重载", "Caddy服务", "手动重载 Caddy 配置")
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "Caddy 配置已重载"})
 }
@@ -980,13 +980,13 @@ func driftSinceText(drift services.ConfigDriftStatus) string {
 }
 
 func formatDriftBanner(missing, extra []string) string {
-	// LBH79-历史问题：文案与长度上限单源在 services（看门狗审计同源）——此处
+	// 历史问题：文案与长度上限单源在 services（看门狗审计同源）——此处
 	// 仅保留 handler 层命名供既有调用/测试使用。
 	return services.FormatDriftRoutes(missing, extra)
 }
 
 func (h *Handlers) GetCaddyConfig(c *gin.Context) {
-	// B1-历史问题：原始运行配置可能含经 PUT /caddy/config 逃生口写入的内联私钥
+	// 历史问题：原始运行配置可能含经 PUT /caddy/config 逃生口写入的内联私钥
 	// 或敏感 header——与 GetConfig 的 caddy_config 脱敏同口径：非管理员及
 	// 只读 API Key 一律拒绝（路由已收敛到 admin 组，此处为纵深防御）。
 	if c.GetString("role") != "admin" || (c.GetString("auth_type") == "api_key" && c.GetBool("api_key_read_only")) {
@@ -994,7 +994,7 @@ func (h *Handlers) GetCaddyConfig(c *gin.Context) {
 		return
 	}
 	client := &http.Client{Timeout: 5 * time.Second}
-	// D5-S3：与 GetCaddyStatus 同源取 cfg.CaddyAdminURL——此前硬编码
+	// 历史修复：与 GetCaddyStatus 同源取 cfg.CaddyAdminURL——此前硬编码
 	// localhost:2019，自定义 admin 地址的部署读到的是错误端点。
 	resp, err := client.Get(strings.TrimRight(h.cfg.CaddyAdminURL, "/") + "/config/")
 	if err != nil {
@@ -1006,7 +1006,7 @@ func (h *Handlers) GetCaddyConfig(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Caddy 返回错误状态"})
 		return
 	}
-	// 历史问题 同族防线（历史 历史问题，口径对齐 services/caddy.go 32MB）：
+	// 历史问题 同族防线（历史问题，口径对齐 services/caddy.go 32MB）：
 	// admin 响应无界读取兜底上限。
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	if err != nil {
@@ -1023,7 +1023,7 @@ func (h *Handlers) GetCaddyConfig(c *gin.Context) {
 
 // caddyLogPaths 四份 Caddy 日志的固定路径（写入端写死 /app/logs，与 LOG_FILE
 // 无关——见 logstats.go logPaths 注释）。包级 var 支持测试注入
-// （wafAuditLogFile/defaultRuntimeLogPath 同模式，LBH-B-U1 历史）。
+// （wafAuditLogFile/defaultRuntimeLogPath 同模式，历史修复）。
 var caddyLogPaths = map[string]string{
 	"runtime": "/app/logs/caddy.log",
 	"tls":     "/app/logs/caddy-tls.log",
@@ -1078,7 +1078,7 @@ func (h *Handlers) GetCaddyLogs(c *gin.Context) {
 		return
 	}
 
-	// 历史问题（历史 历史问题）：与 certjobs.readCertJobLogFile 同源形态——
+	// 历史问题（历史）：与 certjobs.readCertJobLogFile 同源形态——
 	// Stat 与 Read 之间日志增长（高流量 + 轮转滞后）时，裸 ReadAll 会突破
 	// 128KB 尾窗上限；LimitReader 把读取严格钉在窗口大小。
 	data, err := io.ReadAll(io.LimitReader(f, int64(maxBytes)))
@@ -1086,7 +1086,7 @@ func (h *Handlers) GetCaddyLogs(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取日志文件失败: " + err.Error()})
 		return
 	}
-	// LBH-B-U1（历史）：尾窗首行残段截断统一走 tailLogWindow（SYSB44-3
+	// 历史修复（历史）：尾窗首行残段截断统一走 tailLogWindow（历史修复
 	// 口径——窗口内无 '\n' 时整窗为同一巨行中段，输出为空；此前此处分叉
 	// 返回原始中段，多字节 rune 切断处 U+FFFD 污染）。
 	data = tailLogWindow(data, startOffset)
@@ -1127,7 +1127,7 @@ func convertLogTimezone(content string) string {
 }
 
 func (h *Handlers) PutCaddyConfig(c *gin.Context) {
-	// 历史问题 历史问题: 限制请求体大小防止超大 JSON 全量缓冲（与 CreateRule
+	// 历史问题: 限制请求体大小防止超大 JSON 全量缓冲（与 CreateRule
 	// maxCreateRuleBodyBytes 同口径）。
 	const maxPutCaddyConfigBytes int64 = 1 << 20 // 1MB
 	if c.Request.ContentLength > maxPutCaddyConfigBytes {
@@ -1136,14 +1136,14 @@ func (h *Handlers) PutCaddyConfig(c *gin.Context) {
 	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxPutCaddyConfigBytes)
 
-	// B1-02（历史）：先读请求体再取写锁（ValidateConfig LBH79-历史问题
+	// 历史修复：先读请求体再取写锁（ValidateConfig
 	// 同序）——已认证客户端的慢速/chunked 上传在持锁期间读 body 会阻塞全部
 	// 规则/配置写与后台强制重载。
 	var req struct {
 		Content string `json:"content"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		// 历史问题 历史问题: MaxBytesReader 超限（chunked/未知 ContentLength）映射 413，与导入路径口径一致
+		// 历史问题: MaxBytesReader 超限（chunked/未知 ContentLength）映射 413，与导入路径口径一致
 		if isRequestBodyTooLarge(err) {
 			c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: "请求体过大"})
 			return
@@ -1215,7 +1215,7 @@ func (h *Handlers) PutCaddyConfig(c *gin.Context) {
 		// 历史问题-2：回弹失败持久化横幅（事务已显式回滚）。
 		h.recordCaddyApplyResult(err)
 		recordAudit(c, "更新失败", "Caddy配置", services.FormatAuditDetail("Caddy 配置应用失败", err.Error(), services.AuditResultPart("failure")))
-		// 2026-09-07 审计 L6：与 D2/N4 统一——配置拒绝→400，传输/系统→500。
+		// 2026-09-07 审计 历史修复：与 历史修复 统一——配置拒绝→400，传输/系统→500。
 		if services.IsConfigRejected(err) {
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Caddy 拒绝配置: " + err.Error()})
 		} else {
@@ -1224,7 +1224,7 @@ func (h *Handlers) PutCaddyConfig(c *gin.Context) {
 		return
 	}
 	if err := tx.Commit(); err != nil {
-		// A85历史问题-B：commit 失败统一走已提交视图恢复（回滚事务 + 重渲染
+		// 历史问题：commit 失败统一走已提交视图恢复（回滚事务 + 重渲染
 		// /load + 回退 LKG/投影/证书物化——恢复 /load 失败时仍把已提交字节
 		// 写回 LKG，运行配置不停留在一次性逃生口载荷上）。
 		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
@@ -1235,7 +1235,7 @@ func (h *Handlers) PutCaddyConfig(c *gin.Context) {
 		return
 	}
 	committed = true
-	// 2026-09-07 裁定 L2：同 UpdateConfig——成功后清除既往失败标记。
+	// 2026-09-07 裁定 历史修复：同 UpdateConfig——成功后清除既往失败标记。
 	h.recordCaddyApplyResult(nil)
 
 	recordAudit(c, "更新", "Caddy配置", "保存 Caddy 全局配置")
@@ -1245,7 +1245,7 @@ func (h *Handlers) PutCaddyConfig(c *gin.Context) {
 	if loaded {
 		recordAudit(c, "重载", "Caddy服务", "保存配置后自动重载")
 	}
-	// 历史问题 二十六次 D3（裁决：保留逃生口 + 明示后果）：自定义 Caddy 配置是
+	// 历史问题（裁决：保留逃生口 + 明示后果）：自定义 Caddy 配置是
 	// 一次性逃生口，数据库生成器从不消费 caddy_config 列——任何后续规则/
 	// 配置变更或集群同步都会以权威生成配置覆盖它。保存成功即明示。
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "配置已保存（注意：自定义配置为一次性逃生口，任何后续规则/配置变更或集群同步都会以数据库生成的权威配置覆盖它）"})
@@ -1305,7 +1305,7 @@ func (h *Handlers) RestartCaddy(c *gin.Context) {
 // 此处是该契约的写入侧视图）。
 const accessLogRedactionLine = "request>headers>X-API-Key -> delete"
 
-// normalizeAccessLogRedaction 把脱敏行归一为规范形态（A85历史问题-A）：
+// normalizeAccessLogRedaction 把脱敏行归一为规范形态（历史问题）：
 // 移除任何既有的 X-API-Key 映射行（rename 会让头改道，delete 可能写在中间
 // 被后续行覆盖），再追加唯一的 delete 行——幂等。
 // 空白格式原样返回（默认形态：不裁剪原生字段，渲染层注入脱敏行）。
@@ -1350,7 +1350,7 @@ func validateAccessLogFormat(format string) error {
 				if r.action != "delete" {
 					continue
 				}
-				// 历史问题 历史问题：祖先路径同样致命——删除 request 整树会连带抹掉
+				// 历史问题：祖先路径同样致命——删除 request 整树会连带抹掉
 				// remote_ip/uri/headers 全部统计字段；精确相等或 r.path 是
 				// 受保护路径的祖先前缀（request 是 request>remote_ip 的前缀）
 				// 均视为删除。
@@ -1379,8 +1379,8 @@ func validateAccessLogFormat(format string) error {
 				if r.action == "delete" || r.action == "" {
 					continue
 				}
-				// 历史问题 历史问题：父级改名同样移走子树（request>headers 改名会把
-				// User-Agent 一并带走）——祖先前缀视为命中。
+				// 历史问题：父级改名同样移走子树（request>headers 改名会把
+				// 历史修复 一并带走）——祖先前缀视为命中。
 				if r.path != p && !strings.HasPrefix(p, r.path+">") {
 					continue
 				}
@@ -1404,8 +1404,8 @@ func validateAccessLogFormat(format string) error {
 	if err := renameAlias([]string{"request>uri"}, []string{"uri_path"}); err != nil {
 		return err
 	}
-	// LBH-B-L1（历史 历史问题）：祖先前缀同样命中——request>headers 或 request
-	// 整树改名会连带移走 User-Agent（与 :1082-1088 fieldKept 的祖先删除、
+	// 历史修复（历史）：祖先前缀同样命中——request>headers 或 request
+	// 整树改名会连带移走 历史修复（与 :1082-1088 fieldKept 的祖先删除、
 	// :1111-1114 renameAlias 的祖先前缀同口径）。
 	for _, r := range rules {
 		if r.action == "" || r.action == "delete" {

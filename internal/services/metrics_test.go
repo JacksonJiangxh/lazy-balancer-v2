@@ -16,7 +16,7 @@ import (
 	"lazy-balancer-v2/internal/models"
 )
 
-// isolateMetricsState 隔离包级状态转换 map（N+9 历史问题），测试间互不串扰。
+// isolateMetricsState 隔离包级状态转换 map（历史问题），测试间互不串扰。
 func isolateMetricsState(t *testing.T) {
 	t.Helper()
 	metricsStateMu.Lock()
@@ -64,7 +64,7 @@ func TestLogMetricsStateTransition_fail_ok_fail_emits_warn_info_warn(t *testing.
 }
 
 func TestMetricsService_collect_logs_failures_once_per_state_transition(t *testing.T) {
-	// N+9 历史问题：30s 周期持久失败不得逐 tick 刷日志——fail→ok→fail 应恰好
+	// 历史问题：30s 周期持久失败不得逐 tick 刷日志——fail→ok→fail 应恰好
 	// 2 条 warn + 1 条 info（状态转换口径）。
 	// Given
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
@@ -140,7 +140,7 @@ func (f *fixedResponseTransport) RoundTrip(*http.Request) (*http.Response, error
 }
 
 func TestMetricsService_collect_logs_read_failures_once_per_state_transition(t *testing.T) {
-	// N+11 D3-F4：body 中段读取错误此前裸 return（52fdb0f7 失败族枚举中唯一
+	// 历史修复：body 中段读取错误此前裸 return（52fdb0f7 失败族枚举中唯一
 	// 零信号成员）。现经状态转换日志（read 类别）：ok→fail 一次 warn、
 	// fail→ok 一次 info、持续同一状态静默。
 	// Given
@@ -348,7 +348,7 @@ func TestMetricsService_storePerHostMetrics_ruleLabelAggregation(t *testing.T) {
 	}
 	service := &MetricsService{}
 	// 历史问题:fixture 必须是真实 exposition 形态(class/direction 在前,
-	// rule 在后——client_golang 字典序);原 fixture rule 在前=假绿(R-8 形态)。
+	// rule 在后——client_golang 字典序);原 fixture rule 在前=假绿(历史修复 形态)。
 	text := `lazybalancer_requests_total{rule="lb_rl1"} 100
 lazybalancer_request_status_total{class="2xx",rule="lb_rl1"} 80
 lazybalancer_request_status_total{class="4xx",rule="lb_rl1"} 20
@@ -551,7 +551,7 @@ func TestMetricsServiceCleanupHistory_stillCleansWhenGlobalConfigDropped(t *test
 
 // 历史问题(历史问题,历史):正则标签顺序与真实 exposition 一致——
 // client_golang 字典序(class/direction 在前,rule 在后)。fixture 必须
-// 真实形态(R-8:副本与源分叉给假绿)。
+// 真实形态(历史修复:副本与源分叉给假绿)。
 func TestMetricsService_storePerHostMetrics_realExpositionOrder(t *testing.T) {
 	_, database := newClusterTestService(t)
 	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled) VALUES ('lb_rl5','rl5','a.example.com','http',8080,1)`); err != nil {
@@ -577,7 +577,7 @@ lazybalancer_bytes_total{direction="out",rule="lb_rl5"} 2048`
 	}
 }
 
-// LBS-B-历史问题（历史）：geoip 透传序列剔除的行为钉——携带
+// 历史问题（历史）：geoip 透传序列剔除的行为钉——携带
 // handler="http.handlers.geoip2region" 的序列整条剔除（同请求经透传路由+
 // 主路由双计，剔除后恢复真实计数）。钉与实现形态无关（Split+Join → Builder
 // 单副本重构的行为锚）。
@@ -605,7 +605,7 @@ func TestMetricsService_collect_filtersGeoipPassHandlerSeries(t *testing.T) {
 	}
 }
 
-// LBS-B-历史问题（历史 历史问题）：Start 进入循环前补一次 collect——曾 cleanup 立即
+// 历史问题（历史）：Start 进入循环前补一次 collect——曾 cleanup 立即
 // 跑而首次 collect 要等第一个 interval（默认 30s），口径不对称，重启后面板
 // 首屏 30s 全零。
 func TestMetricsService_Start_collectsBeforeFirstTick(t *testing.T) {

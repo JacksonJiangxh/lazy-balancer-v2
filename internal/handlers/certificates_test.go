@@ -393,7 +393,7 @@ func TestIssueCertificate_batch_preserves_running_jobs(t *testing.T) {
 			('lb_batch_download','download','http','download.example',9443,1,1,'acme_dns');
 		INSERT INTO cert_jobs (rule_id,domain,status,message,updated_at) VALUES
 			('lb_batch_order','order.example','creating_order','active message',datetime('now')),
-			-- CERT44-2：批量路径已套用冷却门，已部署任务须回拨越过 2 分钟守卫才重排队。
+			-- 历史修复：批量路径已套用冷却门，已部署任务须回拨越过 2 分钟守卫才重排队。
 			('lb_batch_download','download.example','downloaded','active message',datetime('now','-10 minutes'));
 	`); err != nil {
 		t.Fatalf("seed running jobs: %v", err)
@@ -406,7 +406,7 @@ func TestIssueCertificate_batch_preserves_running_jobs(t *testing.T) {
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/certificates/issue", strings.NewReader(`{"all":true}`)))
 
 	// 执行中的任务（creating_order）保持不变；已部署任务（downloaded）按
-	// 历史修复 A-M1 重新排队——再次触发签发对已部署证书必须生效，不得静默空转。
+	// 历史修复 重新排队——再次触发签发对已部署证书必须生效，不得静默空转。
 	if response.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
 	}
@@ -450,7 +450,7 @@ func assertLatestCertificateAudit(t *testing.T, wantScope, wantResult string) {
 }
 
 func TestMaskedDNSCredentialsRoundtrip(t *testing.T) {
-	// 历史问题 二十六次 D4：非 admin GET 到掩码 → 原样回传保存 → 按「未提交」处理；
+	// 历史问题：非 admin GET 到掩码 → 原样回传保存 → 按「未提交」处理；
 	// 真实新值正常提交；显式清空语义保留。
 	if !isMaskedDNSCredentials(map[string]string{"id": "***", "token": "***"}) {
 		t.Fatal("all-sentinel map must be detected as masked")
@@ -690,7 +690,7 @@ func TestIssueCertificate_bulk_requires_explicit_all_confirmation(t *testing.T) 
 	})
 }
 
-// 历史问题(C4):DNS 凭证最小可见性从「属主非 admin」扩为「属主非 admin 或
+// 历史问题(历史修复):DNS 凭证最小可见性从「属主非 admin」扩为「属主非 admin 或
 // Key 只读」——admin 的只读 API Key(机器身份)不得经列表端点读明文凭证;
 // admin JWT 路径不受影响(2026-09-05 用户裁定的 CA 凭证明文口径不在本端点)。
 func TestListCertificateConfigs_masksCredentials_forReadOnlyAPIKey(t *testing.T) {
@@ -752,7 +752,7 @@ func TestListCertificateConfigs_masksCredentials_forReadOnlyAPIKey(t *testing.T)
 	})
 }
 
-// （SYS-R5，历史：自 apikeys_current_test.go 迁回——本族为证书配置端点
+// （历史修复，历史：自 apikeys_current_test.go 迁回——本族为证书配置端点
 // NULL 凭据主题，此前仅因共用 newBackupTestHandlers 夹具寄居于 API Key 文件。）
 func TestCertificateConfigEndpointsHandleNullDNSCredentials(t *testing.T) {
 	h := newBackupTestHandlers(t)

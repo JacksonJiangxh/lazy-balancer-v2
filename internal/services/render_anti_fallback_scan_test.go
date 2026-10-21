@@ -2,7 +2,7 @@ package services
 
 // 库值唯一真相（批 1+2）机制级反兜底钉测：
 // 扫描 caddy.go 渲染函数体，断言不存在「零值守卫 + 字面量赋值」的写死
-// 兜底模式（`if x <= 0 { x = <N> }` / `if x == 0 { x = <N> }`）。G3（历史）
+// 兜底模式（`if x <= 0 { x = <N> }` / `if x == 0 { x = <N> }`）。历史修复（历史）
 // 形状扩展：字面量含 STRING（"5s"/"250ms" 类字符串兜底同在禁区）、命中面
 // 扩到 else 链（`if x > 0 {…} else { x = "…" }` 的尾 else 兜底形态）、
 // 赋值限定 plain `=`（:= 定义与 += 累加非兜底）。规则→全局变量回退
@@ -10,7 +10,7 @@ package services
 // 不在扫描命中面。允许列表逐条携带 Ruling（类型②省略型/治理范围外），
 // 双向精确匹配：扫描出清单外命中=有人往渲染层塞了写死兜底（FAIL）；
 // 清单条目在源码中消失=该条目已退役、清单过期（FAIL）——防允许列表腐化。
-// S历史问题（历史）：命中面扩展到 LSS(<0/<1)、NEQ(!=0)、GTR/GEQ 反向分支、
+// 历史问题（历史）：命中面扩展到 LSS(<0/<1)、NEQ(!=0)、GTR/GEQ 反向分支、
 // switch/case 零值守卫与非 map 非空复合字面量默认值，并为每形态配夹具（
 // TestFallbackScan_detectsEquivalentGuardShapes）——语义等价写法不得绕过机制。
 
@@ -63,7 +63,7 @@ var antiFallbackAllowlist = map[string]map[string]string{
 	},
 	"buildHTTPHandleChain": {
 		"weight = 1": "上游权重 weight<=0→1：同上（范围外，历史问题 分组层归一删除后链构建层唯一存留点）",
-		// G3（历史）Ruling：HTTP 侧 try_duration==0 → 5s/250ms——存量 HTTP 行
+		// 历史修复（历史）Ruling：HTTP 侧 try_duration==0 → 5s/250ms——存量 HTTP 行
 		// 恒 0（列语义「0=默认重试窗口」，2026-09 渲染审计+方案 C 协议分叉已披露
 		// UI/文档），行为不变的非治理形态；TCP 侧同列 0/-1 走显性报错/显式禁用，
 		// 协议分叉为披露语义非写死兜底。td==-1 分支发射 retries=0 为「显式禁用
@@ -186,8 +186,8 @@ func TestRenderLayer_hasNoHardcodedZeroFallbacks(t *testing.T) {
 
 // fallbackAssignmentsInFunction 扫描函数体内的「零值守卫 + 字面量赋值」兜底
 // 形态，返回赋值文本 → 位置。
-// G3 形状：INT/STRING 字面量、plain `=`、else 链纳入。
-// S历史问题 扩展：LSS(<0/<1)、NEQ(!=0 的 else 链)、GEQ(>=1 的 else 链) 零值守卫、
+// 历史修复 形状：INT/STRING 字面量、plain `=`、else 链纳入。
+// 历史问题 扩展：LSS(<0/<1)、NEQ(!=0 的 else 链)、GEQ(>=1 的 else 链) 零值守卫、
 // switch/case 的零值守卫分支、复合字面量默认值（`v = cfg{...}`）——原命中面
 // 可被这些语义等价写法绕过，机制失效时无红灯。
 func fallbackAssignmentsInFunction(fset *token.FileSet, fn *ast.FuncDecl) map[string]string {
@@ -201,7 +201,7 @@ func fallbackAssignmentsInFunction(fset *token.FileSet, fn *ast.FuncDecl) map[st
 		}
 		ast.Inspect(branch, func(m ast.Node) bool {
 			assign, ok := m.(*ast.AssignStmt)
-			// G3：仅 plain `=`（:= 定义与 += 累加非兜底赋值）。
+			// 历史修复：仅 plain `=`（:= 定义与 += 累加非兜底赋值）。
 			if !ok || assign.Tok != token.ASSIGN {
 				return true
 			}
@@ -226,7 +226,7 @@ func fallbackAssignmentsInFunction(fset *token.FileSet, fn *ast.FuncDecl) map[st
 	ast.Inspect(fn.Body, func(n ast.Node) bool {
 		switch node := n.(type) {
 		case *ast.IfStmt:
-			// S历史问题：逐级 else-if 链按各自守卫判定（外层守卫形态变化不改变
+			// 历史问题：逐级 else-if 链按各自守卫判定（外层守卫形态变化不改变
 			// 内层判定的独立性）。
 			matched := false
 			for current := node; current != nil; {
@@ -263,7 +263,7 @@ func fallbackAssignmentsInFunction(fset *token.FileSet, fn *ast.FuncDecl) map[st
 				}
 			}
 		case *ast.SwitchStmt:
-			// S历史问题：`switch { case x <= 0: x = 10 }` 与 `case x == 0:` 形态。
+			// 历史问题：`switch { case x <= 0: x = 10 }` 与 `case x == 0:` 形态。
 			for _, stmt := range node.Body.List {
 				clause, ok := stmt.(*ast.CaseClause)
 				if !ok {
@@ -389,7 +389,7 @@ func containsString(list []string, want string) bool {
 	return false
 }
 
-// S历史问题（历史）：兜底扫描命中面必须覆盖语义等价写法——原实现只认
+// 历史问题（历史）：兜底扫描命中面必须覆盖语义等价写法——原实现只认
 // `EQL/LEQ/GTR 对比 INT 0` 的 if 体，以下形态全部逃逸（机制失效时无红灯）：
 //   - `x < 1`（LSS 对比 1，整数域等价 x<=0）；
 //   - `x != 0 { … } else { x = 7 }`（NEQ 对比 0，兜底在 else 链）；

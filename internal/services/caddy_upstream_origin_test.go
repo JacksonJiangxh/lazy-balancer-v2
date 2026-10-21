@@ -115,7 +115,7 @@ func TestBuildHTTPHandleChain_staticSNIStripsHostHeaderPort(t *testing.T) {
 	}
 }
 
-// LBS-A-L2（历史 历史问题）：TLS 池 + 空后端域名 + 部分上游配回源域名时，
+// 历史修复（历史问题）：TLS 池 + 空后端域名 + 部分上游配回源域名时，
 // map defaults 的 Host 回退不能用 {http.request.hostport}——该占位符绑原始
 // 请求（replacer.go:128-129），恒为客户端 Host；而现状（无 map）TLS 传输
 // 默认注入 Host=选中上游 hostport（httptransport.go:631-642）。回退须为

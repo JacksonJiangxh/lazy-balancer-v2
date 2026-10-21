@@ -1,4 +1,4 @@
-// 威胁大屏地球引擎契约守卫（WT87-02/03/04/05/10/11）。
+// 威胁大屏地球引擎契约守卫。
 //
 // threatGlobe 依赖 globe.gl/three 的 WebGL 实例与 DOM，node:test 无法装载；
 // 其可确定性验证的数学已抽到 threatProjection（sphereSurfacePoint 往返见
@@ -29,7 +29,7 @@ function member(src: string, marker: string): string {
   return src.slice(start, end)
 }
 
-test('WT87-03 复位/返回必须作废在途省界加载（与地图引擎同源）', () => {
+test('复位/返回必须作废在途省界加载（与地图引擎同源）', () => {
   for (const name of ['zoomOut', 'resetView']) {
     const body = member(globeSrc, `${name}(): void {`)
     const seqIdx = body.indexOf('drillSeq += 1')
@@ -41,7 +41,7 @@ test('WT87-03 复位/返回必须作废在途省界加载（与地图引擎同�
   assert.match(globeSrc, /drillCommitAllowed\(seq, drillSeq, disposed\)/)
 })
 
-test('WT87-04 暂停态相机变更必须直接落点并补绘一帧', () => {
+test('暂停态相机变更必须直接落点并补绘一帧', () => {
   assert.match(globeSrc, /paused \? 0 : 700/, '下钻 pointOfView 必须按暂停态取 0 时长')
   const enter = member(globeSrc, 'function enterWorldView(')
   assert.match(enter, /paused \? 0 : duration/, '返回世界视角必须按暂停态取 0 时长')
@@ -49,7 +49,7 @@ test('WT87-04 暂停态相机变更必须直接落点并补绘一帧', () => {
   assert.match(globeSrc, /threeRenderer\.render\(scene, cam\)/, 'renderOnce 必须真正渲染一帧')
 })
 
-test('WT87-02/05 下钻衬底=低透明度世界点阵，hover 他国只提亮点，且不再有 H3 死配置', () => {
+test('下钻衬底=低透明度世界点阵，hover 他国只提亮点，且不再有 H3 死配置', () => {
   // 与 2D 地图同规则：非下钻国家降透明度点阵，不再使用国家多边形色块。
   assert.match(globeSrc, /worldDots\.filter\(\(d\) => d\.key !== drilledName\)/)
   assert.match(globeSrc, /DRILL_BACKDROP_OPACITY = 0\.22/)
@@ -66,7 +66,7 @@ test('WT87-02/05 下钻衬底=低透明度世界点阵，hover 他国只提亮�
   assert.match(globeSrc, /hoverDotsPoints/, '下钻态 hover 需要独立亮色点阵层')
 })
 
-test('WT87-10 首帧双 RAF 无条件应用图层（两帧内下钻不得残留世界点阵）', () => {
+test('首帧双 RAF 无条件应用图层（两帧内下钻不得残留世界点阵）', () => {
   assert.doesNotMatch(globeSrc, /if \(!drilledName\) applyLayer\(\)/)
   const start = globeSrc.indexOf('两个 RAF')
   const end = globeSrc.indexOf('let rafId = requestAnimationFrame(frame)')
@@ -74,7 +74,7 @@ test('WT87-10 首帧双 RAF 无条件应用图层（两帧内下钻不得残留�
   assert.match(globeSrc.slice(start, end), /^\s*applyLayer\(\)$/m, '双 RAF 回调必须无条件 applyLayer()')
 })
 
-test('WT87-11 海外下钻浮签显示「无省级统计」而不是 0', () => {
+test('海外下钻浮签显示「无省级统计」而不是 0', () => {
   assert.match(globeSrc, /hasProvinceStats\(drilledName\)/)
   assert.match(globeSrc, /无省级统计/)
 })

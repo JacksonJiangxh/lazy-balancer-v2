@@ -1,10 +1,10 @@
 package handlers
 
-//   D2① 自动封禁六列：布尔两键入 validateV2BackupBooleanTypes 枚举（非布尔
+//   历史修复① 自动封禁六列：布尔两键入 validateV2BackupBooleanTypes 枚举（非布尔
 //   形态整包 400 点名键）；threshold/window 数值钳制（写侧同边界 [1,10000]/
 //   [1,60]，非整数形态归一缺省）；duration/scope 枚举校验（空串/null 归一
 //   缺省、非空非法拒绝——镜像 security_policies mode 族口径），导入/预览双路径同序。
-//   D3 受信代理三 TEXT 列：复用保存侧 validateTrustedProxyFields 同一口径
+//   历史修复 受信代理三 TEXT 列：复用保存侧 validateTrustedProxyFields 同一口径
 //   （形态门+归一+引用存在性+总量上限），畸形值不得落库致渲染 fail-closed
 //   而面板宣称已启用。
 
@@ -180,7 +180,7 @@ func assertImportedAutobanText(t *testing.T, column, want string) {
 	}
 }
 
-// D3：受信代理三 TEXT 列导入门——畸形形态/畸形 JSON/悬空引用/非法条目/总量
+// 历史修复：受信代理三 TEXT 列导入门——畸形形态/畸形 JSON/悬空引用/非法条目/总量
 // 超限整包 400；合法载荷按保存侧同口径归一落库。
 func TestImportConfigBackup_trustedProxyTextColumnsGate(t *testing.T) {
 	t.Run("ranges 非字符串类型拒绝", func(t *testing.T) {

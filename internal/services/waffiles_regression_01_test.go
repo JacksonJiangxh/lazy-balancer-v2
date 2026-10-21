@@ -12,7 +12,7 @@ import (
 )
 
 func TestUntarGzTo_rejectsEntryWhenDeclaredSizeOverflowsInt64(t *testing.T) {
-	// 历史修复 A-#2：GNU base-256 尺寸允许 hdr.Size 接近 2^63-1。旧检查
+	// 历史修复：GNU base-256 尺寸允许 hdr.Size 接近 2^63-1。旧检查
 	// writtenBytes+hdr.Size > max 在已有写入（writtenBytes≥1）时 int64 溢出为负，
 	// 上限判定被绕过，256MB 写放大防护失效（gzip 炸弹可膨胀远超上限）。
 	// 修复后必须先减后比，按声明体积在写盘前拒绝。
@@ -49,7 +49,7 @@ func TestUntarGzTo_rejectsEntryWhenDeclaredSizeOverflowsInt64(t *testing.T) {
 }
 
 func TestUntarGzTo_budgetExactlyExhaustedBoundary(t *testing.T) {
-	// 历史修复 N-4：预算恰好用尽边界——writtenBytes == max 后 remaining=0，任何
+	// 历史修复：预算恰好用尽边界——writtenBytes == max 后 remaining=0，任何
 	// hdr.Size>0 的后续条目都必须按「先减后比」拒绝（边界 false-pass 会把
 	// 总量推超预算）；而恰好顶满预算本身不得被误拒（边界 false-reject）。
 	old := maxWafSyncExtractBytes

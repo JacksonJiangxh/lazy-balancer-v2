@@ -44,7 +44,7 @@ type mockIdP struct {
 	// usePref/prefUsername:覆盖 id_token 的 preferred_username(测空白用户名形状)
 	usePref      bool
 	prefUsername string
-	// claimName:覆盖 id_token 的 name（U04c-06：重复登录刷新显示名）
+	// claimName:覆盖 id_token 的 name（历史修复：重复登录刷新显示名）
 	claimName atomic.Value
 	// nonceByChallenge:PKCE challenge → nonce——并发双登录各自 authorize 后,
 	// 令牌交换按 code_verifier 派生 challenge 回查本登录的 nonce(单登录场景
@@ -428,7 +428,7 @@ func TestOIDC_disabled_state(t *testing.T) {
 	}
 }
 
-// B1-历史问题：公开 OIDC 状态端点在配置持续损坏时不得每请求写一条 warn；
+// 历史问题：公开 OIDC 状态端点在配置持续损坏时不得每请求写一条 warn；
 // 响应仍按未启用 fail-closed。
 func TestOIDCStatus_failureWarningIsThrottled(t *testing.T) {
 	idp := newMockIdP(t)
@@ -481,7 +481,7 @@ func TestOIDCCallback_bad_state_rejected(t *testing.T) {
 	}
 }
 
-// 场景 7:OAuth 配置组装(回调 URL 反代头尊重)。APIMCP41-5 后采信前提=直连
+// 场景 7:OAuth 配置组装(回调 URL 反代头尊重)。历史修复 后采信前提=直连
 // 对端为回环/私网可信反代,故 RemoteAddr 置 RFC1918 地址。
 func TestOIDC_requestOrigin_forwarded(t *testing.T) {
 	idp := newMockIdP(t)
@@ -498,7 +498,7 @@ func TestOIDC_requestOrigin_forwarded(t *testing.T) {
 	}
 }
 
-// APIMCP41-5(历史,2026-09-19 用户裁定按建议收窄):X-Forwarded-Proto/Host
+// 历史修复(历史,2026-09-19 用户裁定按建议收窄):X-Forwarded-Proto/Host
 // 仅当直连对端为回环/私网(RFC1918+ULA+链路本地)时采信;公网直连一律忽略转发
 // 头——路由器 SetTrustedProxies(nil) 意味着任何客户端都能伪造 X-Forwarded-Host,
 // 无来源校验会把回调 redirect_uri 与成功回跳基址(令牌走 fragment)指向攻击者域。
@@ -536,7 +536,7 @@ func TestOIDC_requestOrigin_trustedProxyGate(t *testing.T) {
 	}
 }
 
-// APIMCP41-5 端到端:公网直连伪造 X-Forwarded-Host 不得污染 OIDC redirect_uri。
+// 历史修复 端到端:公网直连伪造 X-Forwarded-Host 不得污染 OIDC redirect_uri。
 func TestOIDC_login_redirectURI_ignoresForwardedFromPublicRemote(t *testing.T) {
 	idp := newMockIdP(t)
 	router, _ := setupOIDCTest(t, idp)
@@ -575,7 +575,7 @@ func TestOIDC_normalize_issuer(t *testing.T) {
 // 场景 9(v2.3.0 裁定):OIDC 用户与本地 MFA 完全解耦——
 // 启用/禁用/激活/管理员重置全 403;登录从节点两道 MFA 门豁免。
 func TestOIDCUser_mfa_decoupled(t *testing.T) {
-	// B1-历史问题（历史）：初始化临时库必须完整快照并在 cleanup 恢复
+	// 历史问题（历史）：初始化临时库必须完整快照并在 cleanup 恢复
 	// 三个全局句柄（同 setupOIDCTest）——否则后续用例踩已关闭的临时库。
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	dir := t.TempDir()
@@ -630,7 +630,7 @@ func TestOIDCUser_mfa_decoupled(t *testing.T) {
 
 // 场景 10:登录从节点 MFA 门对 OIDC 会话豁免(本地用户仍要求)。
 func TestOIDCUser_slave_login_gate_exempt(t *testing.T) {
-	// B1-历史问题：完整快照/恢复全局 DB 句柄（同 setupOIDCTest）。
+	// 历史问题：完整快照/恢复全局 DB 句柄（同 setupOIDCTest）。
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	dir := t.TempDir()
 	if err := db.Initialize(dir); err != nil {
@@ -728,7 +728,7 @@ func TestOIDCSettingsTest_verifiesClientCredentials(t *testing.T) {
 	})
 }
 
-// 场景 11(U6a-1 历史):JIT 开户并发回调竞态——双请求同窗口双双走
+// 场景 11(历史修复):JIT 开户并发回调竞态——双请求同窗口双双走
 // no-rows 分支,u_oidc_identity 唯一索引保证至多一行;后到的 INSERT 撞索引后
 // 回退重 SELECT 命中既有行:两个回调都成功签发,最终恰一个身份行。
 func TestOIDCCallback_jit_race_conflict_falls_back_to_existing_row(t *testing.T) {
@@ -797,7 +797,7 @@ func TestOIDCCallback_jit_race_conflict_falls_back_to_existing_row(t *testing.T)
 }
 
 func TestIsUniqueConstraintError_coversDriverDialects(t *testing.T) {
-	// SYS-R2（历史）：users.go 两处 409 分支的双段判定（modernc「UNIQUE
+	// 历史修复（历史）：users.go 两处 409 分支的双段判定（modernc「UNIQUE
 	// constraint failed」+ 历史驱动兼容段「already exists」）并入本 helper——
 	// 钉住两口径，防单侧回归。
 	cases := []struct {
@@ -817,7 +817,7 @@ func TestIsUniqueConstraintError_coversDriverDialects(t *testing.T) {
 	}
 }
 
-// 历史 历史问题：正式路径（绑定开启）下 state 必须与发起登录的浏览器绑定。
+// 历史问题：正式路径（绑定开启）下 state 必须与发起登录的浏览器绑定。
 // 无 cookie / 另一 jar 的 cookie 交叉提交 code+state 都必须失败（302 error=，
 // 不含 token）；同 jar 正常流程成功。
 func TestOIDCCallback_stateBoundToBrowser(t *testing.T) {
@@ -900,7 +900,7 @@ func TestOIDCCookieSecure_forwardedProtoOnlyFromTrustedProxy(t *testing.T) {
 	}
 }
 
-// B1-历史问题（历史）：OIDC 配置读失败/损坏时更新端点必须整体拒绝——
+// 历史问题（历史）：OIDC 配置读失败/损坏时更新端点必须整体拒绝——
 // 旧实现以零值 cfg 继续合并并整体写回，会清空 issuer/client_id/secret。
 func TestOIDCSettingsUpdate_readFailureDoesNotOverwriteConfig(t *testing.T) {
 	router, _ := setupOIDCTest(t, newMockIdP(t))
@@ -923,7 +923,7 @@ func TestOIDCSettingsUpdate_readFailureDoesNotOverwriteConfig(t *testing.T) {
 	}
 }
 
-// B1-历史问题（历史）：OIDC 配置更新/删除审计必须带字段级 delta，
+// 历史问题（历史）：OIDC 配置更新/删除审计必须带字段级 delta，
 // secret 只记「已更换/已清除」不落值。
 func TestOIDCSettings_auditFieldDelta(t *testing.T) {
 	idp := newMockIdP(t)

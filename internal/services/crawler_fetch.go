@@ -187,7 +187,7 @@ func crawlerFetchBody(ctx context.Context, src crawlerSource) (string, error) {
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	// 历史问题：与 threatupdate 同口径——Content-Length 超限提前失败；读取
+	// 历史问题：与 threatupdate 同口径——历史修复 超限提前失败；读取
 	// cap+1 后显式拒绝截断文本（旧实现把截断内容当合法文本返回，可能残留
 	// 部分 CIDR 而「看似成功」，覆盖上次快照）。
 	const crawlerBodyCap = 16 << 20

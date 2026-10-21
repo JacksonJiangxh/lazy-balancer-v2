@@ -114,7 +114,7 @@ func TestClusterLoginTicketDatabaseFailureDoesNotConsumeTicket(t *testing.T) {
 }
 
 func TestGenerateLoginTicketRejectsStaleApprovedNode(t *testing.T) {
-	// M12 票据门：nodes.status 只在注册/上报时写入、从不回写 'offline'，
+	// 历史修复 票据门：nodes.status 只在注册/上报时写入、从不回写 'offline'，
 	// 陈旧 status='online' 不得再放行签发——已停止上报（last_seen 超过
 	// 2×sync_interval）的从节点按 ComputeNodeStatus 动态判定拒绝；恢复
 	// 上报后放行（判定依据 last_seen 而非陈旧列）。

@@ -607,7 +607,7 @@ func TestSyncService_applySnapshot_preservesOIDCIdentityAndConfig(t *testing.T) 
 	}
 }
 
-// S历史问题-11：nil 版本行规范化为空切片，空表不再恒判「有差异」。
+// 历史问题-11：nil 版本行规范化为空切片，空表不再恒判「有差异」。
 func TestSnapshotSecurityVersionRowsDiffer_normalizesNilRows(t *testing.T) {
 	_, database := newClusterTestService(t)
 	ctx := context.Background()
@@ -628,7 +628,7 @@ func TestSnapshotSecurityVersionRowsDiffer_normalizesNilRows(t *testing.T) {
 	}
 }
 
-// S历史问题-15：版本行读取列清单单源——排程列变化可被差分行观测（列清单分叉的
+// 历史问题-15：版本行读取列清单单源——排程列变化可被差分行观测（列清单分叉的
 // 历史教训：差分行漏列 → 变化永判无差异）。
 func TestClusterRuleLibVersionRows_diffSeesScheduleColumns(t *testing.T) {
 	service, database := newClusterTestService(t)

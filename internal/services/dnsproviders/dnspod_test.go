@@ -93,7 +93,7 @@ func TestDNSPod_Validate_rejects_whitespace_test_domain(t *testing.T) {
 	}
 }
 
-// 凭证字段的可见性/选项文案元数据（WS-13）：前端表单由 visible_when/
+// 凭证字段的可见性/选项文案元数据（历史修复）：前端表单由 visible_when/
 // option_labels 驱动（不再按 dnspod 两种认证模式硬编码字段名）。本测试钉住
 // DNSPod 的元数据形态，并反向校验每个 visible_when 条件键都是同 provider 声明的
 // select 字段（引用错键会让字段永远不显示）。

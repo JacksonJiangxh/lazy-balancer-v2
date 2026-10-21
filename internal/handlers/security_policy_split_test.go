@@ -419,7 +419,7 @@ func TestSplitSecurityPolicy_nonMixedRejected(t *testing.T) {
 func TestSplitSecurityPolicy_skipsRuleWithExistingStage2(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := splitRouter(t)
-	// Given：mixed 仅限流特征（G2）——拆分产出单个 stage2 子策略；
+	// Given：mixed 仅限流特征（历史修复）——拆分产出单个 stage2 子策略；
 	// 两条规则已并存绑定 [mixed, stage2]，一条规则仅绑 mixed
 	res, err := db.DB.Exec(`INSERT INTO security_policies (name,mode,rate_limit_enabled,rate_limit_rps,rate_limit_burst,policy_type,enabled)
 		VALUES ('legacy-rl','off',1,100,50,'mixed',1)`)

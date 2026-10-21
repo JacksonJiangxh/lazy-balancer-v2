@@ -213,7 +213,7 @@
                         </template>
                         <template v-if="group.details.geoipRegions && group.details.geoipRegions.length > 0">
                           <div class="flow-detail-block-title">地域拦截区域（{{ group.details.geoipRegions.length }} 个）</div>
-                          <!-- X1（历史）：国家条目展示层翻译（country_names_cn 单源），
+                          <!-- 历史修复（历史）：国家条目展示层翻译（country_names_cn 单源），
                                省份/省市联值/海外哨兵未命中回退原文；geoipRegions 值零改动 -->
                           <div class="flow-detail-chips">
                             <el-tag v-for="region in group.details.geoipRegions" :key="region" size="small" effect="plain" class="flow-detail-chip">{{ countryLabel(countryZh, region) }}</el-tag>
@@ -384,7 +384,7 @@ const props = defineProps<{
 const emit = defineEmits<{ 'update:modelValue': [value: boolean] }>()
 
 const isTcp = computed(() => props.target?.protocol === 'tcp')
-// X1（历史）：海外国家中文映射（模块级缓存，setup 期触发一次拉取；模板
+// 历史修复（历史）：海外国家中文映射（模块级缓存，setup 期触发一次拉取；模板
 // 读 ref 自动解包并注册响应依赖）。
 const countryZh = useCountryNamesCn()
 const protocolLabel = computed(() => {
@@ -514,7 +514,7 @@ const ensureDetails = async (): Promise<void> => {
         ? request.get<APIResponse<SecurityStagePolicyDetail[]>>(`/security/rules/${encodeURIComponent(caddyId)}/policy`, { silent: true })
         : Promise.resolve<APIResponse<SecurityStagePolicyDetail[]>>({ code: 0, data: [] }),
       request.get<APIResponse<SecurityStageCustomRule[]>>('/security/custom-rules', { silent: true }),
-      // 历史 历史问题:50=CRS 文件数假设(当前远小于 50;超页宽时组名映射静默回退裸组码)
+      // 历史问题:50=CRS 文件数假设(当前远小于 50;超页宽时组名映射静默回退裸组码)
       request.get<APIResponse<{ rules: CrsRuleFileOption[] }>>('/security/crs/rules?page_size=50', { silent: true }),
     ])
     // 续体落地前校验会话序号：弹框已切换（onDialogOpen ++）或更新一次拉取已发起
@@ -706,7 +706,7 @@ const onDialogOpen = (): void => {
   fullPolicies.value = new Map()
   customRules.value = []
   crsFiles.value = []
-  ipListEntryCache.value = new Map() // 引用名单条目缓存同重置（历史补充轮 历史问题：页间编辑名单后不再显示旧条目）
+  ipListEntryCache.value = new Map() // 引用名单条目缓存同重置（历史 历史问题：页间编辑名单后不再显示旧条目）
   const caddyId = props.target?.caddyId
   if (!caddyId) {
     statsSettled.value = true

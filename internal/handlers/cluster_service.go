@@ -50,7 +50,7 @@ func (h *Handlers) ControlClusterNodeService(c *gin.Context) {
 	if !h.requireMaster(c) {
 		return
 	}
-	// B2-历史问题（历史）：特权服务控制的所有失败早退（编号非法/体解析失败/
+	// 历史问题（历史）：特权服务控制的所有失败早退（编号非法/体解析失败/
 	// 动作不支持/票据签发失败）此前零审计，越权探测与故障签发在操作日志中不可见。
 	// 统一经 recordAudit 留痕「失败」；动作串经 registerAuditField 截断去控制字符。
 	auditFailure := func(nodeID int, detail string) {
@@ -176,7 +176,7 @@ func (h *Handlers) ClusterServiceControl(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, clusterServiceControlMaxBytes)
 	var req models.ClusterServiceControlRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		// CLUSTER-3（历史）：解析失败时 Action 多为零值空串，审计
+		// 历史修复（历史）：解析失败时 Action 多为零值空串，审计
 		// 「操作：」段落空——无法区分「动作未知的畸形请求」。部分绑定成功的
 		// 形态保留实际动作，空串以「<解析失败>」占位符显式留痕。
 		action := req.Action
@@ -219,7 +219,7 @@ func (h *Handlers) ClusterServiceControl(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: http.StatusInternalServerError, Message: err.Error()})
 		return
 	}
-	// F65:成功消息一并落审计——从节点操作日志可见「配置已从数据库载入」等
+	// 历史修复:成功消息一并落审计——从节点操作日志可见「配置已从数据库载入」等
 	// 实际执行细节(原仅记「成功」,消息只回传主节点不落从节点审计)
 	recordClusterServiceControlAuditBy(c, req.Action, "成功："+message, req.Operator)
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: message})

@@ -11,7 +11,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 历史修复 B-5: v2 备份导入此前原样恢复 security_policies 的 crs_rule_groups /
+// 历史修复: v2 备份导入此前原样恢复 security_policies 的 crs_rule_groups /
 // crs_excluded_rules，绕过保存侧 validateAndNormalizeCRSField——旧版备份中的
 // "941" 式组号（应为两位 "41"）落库后 REQUEST-9<code>-*.conf glob 零匹配，
 // blocking 模式静默无任何 CRS 规则生效。导入/预览须按同口径拒绝并点名策略。

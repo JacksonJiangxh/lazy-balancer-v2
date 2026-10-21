@@ -29,9 +29,9 @@ import (
 )
 
 // caddyInternalKeyPrefix 渲染层内部标记键统一前缀：caddyPayload 按前缀整体
-// 剔除（RC-1，历史）——内部键一律不得进 Caddy 载荷（真 Caddy
+// 剔除（历史修复，历史）——内部键一律不得进 Caddy 载荷（真 Caddy
 // StrictUnmarshalJSON 拒未知顶层字段返 400，内部键漏网会让降级配置被硬拒，
-// D3 可用性优先被反转）。新增内部键必须复用本前缀。
+// 历史修复 可用性优先被反转）。新增内部键必须复用本前缀。
 const caddyInternalKeyPrefix = "__lazy_balancer_"
 
 const (
@@ -147,7 +147,7 @@ func GenerateCaddyID() (string, error) {
 }
 
 // ApplyConfig pushes configuration to Caddy
-// 调用方 MUST 已持有 CaddyOpLock（与 GenerateAndApplyConfig 同契约，S历史问题）：
+// 调用方 MUST 已持有 CaddyOpLock（与 GenerateAndApplyConfig 同契约，历史问题）：
 // 本函数仅持 s.mu 保护 CaddyService 内部状态；跨层互斥（与后台重载/其他写路径
 // 的 apply→commit 窗口）由调用方的 CaddyOpLock 临界区承担——生产调用点
 // （handlers 写路径 / cluster_apply）均全程持锁，函数内自取锁会重入死锁。
@@ -202,10 +202,11 @@ func (s *CaddyService) GenerateAndApplyConfig() error {
 	return s.applyConfigLocked(generateCaddyConfigFromStore(db.DB), true)
 }
 
-// GenerateAndApplyConfigForce 强制重载变体：POST /load 带 Cache-Control:
+// GenerateAndApplyConfigForce 强制重载变体：POST /load 带 历史修复:
 // must-revalidate，绕过 Caddy 对字节相同配置的跳过（caddy v2.11.4 changeConfig
 // 对相同 JSON 短路返回 errSameConfig、不执行 provision）。xdb/CRS/证书文件是
-// 配置 JSON 之外的磁盘数据（geoip handler 恒为 {"handler":"geoip2region"}，
+// 配置 JSON 之外的磁盘数据（geoip handler 路径键仅在非默认 data_dir 形态
+// 发射、默认形态字节稳定——既有裁定，见 buildGeoipHandler；
 // CRS include 只嵌路径），替换后 JSON 不变——不强制重载时 Caddy 插件
 // （geoip searcher / coraza WAF / TLS 证书）内存仍停留旧库，更新流程却已报
 // 成功。所有「磁盘数据变化」的重载入口（IP 库/CRS/CA 证书队列）必须走本变体。
@@ -244,7 +245,7 @@ var CaddyOpLock = &CaddyWriteLock{}
 // 跳过 /load 调用（Caddy 端本就零 provision），调用方据此不落「重载」审计。
 var errSameConfig = errors.New("config byte-identical to running config")
 
-// caddyConfigDegradationKey 渲染降级标记（D3，历史）：渲染层某组件读库/
+// caddyConfigDegradationKey 渲染降级标记（历史修复，历史）：渲染层某组件读库/
 // 解析失败按安全侧兜底渲染（可用性优先，不 fail-visible——一份带外脏行不得
 // 阻断整份配置生成），但「渲染产物与 UI 宣称分叉」的事实随配置图携带，apply
 // 成功后落审计行+caddy_apply_error 横幅，面板可见。
@@ -275,7 +276,7 @@ func setLastRenderDegradation(msg string) {
 }
 
 // TakePendingRenderDegradationAudit 取走「事务内 apply 暂缓落审计」的降级说明
-// （空=无待落）。A85历史问题-1：事务内 apply（persist=false）立即写审计会在随后
+// （空=无待落）。历史问题：事务内 apply（persist=false）立即写审计会在随后
 // commit 失败时留下描述「从未提交配置」的降级事件——审计必须等 commit 成功
 // 后由 recordCaddyApplyResult 补落；非事务 apply 仍在应用成功时立即留痕。
 func TakePendingRenderDegradationAudit() string {
@@ -300,8 +301,8 @@ func (s *CaddyService) getRunningConfigBytes() ([]byte, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	// 历史问题 同族防线（历史 历史问题：全文件最后一处无界 admin 读取收口）。
-	// D1-历史问题：与 GetConfig 共用 readAdminConfigBody（状态分类 + 32MB+1 探测），
+	// 历史问题 同族防线（历史问题：全文件最后一处无界 admin 读取收口）。
+	// 历史问题：与 GetConfig 共用 readAdminConfigBody（状态分类 + 32MB+1 探测），
 	// 超限返回显式错误而非静默截断——比对方按 fail-open 照常 /load，但日志
 	// 可见「超限」而非「配置变化」的假象。
 	return readAdminConfigBody(resp)
@@ -311,9 +312,9 @@ func (s *CaddyService) applyConfigLocked(config map[string]interface{}, persistD
 	return s.applyConfigLockedOpt(config, false, persistDegradation)
 }
 
-// ApplyConfigForce 与 ApplyConfig 同语义，但强制 Caddy 重载（Cache-Control:
+// ApplyConfigForce 与 ApplyConfig 同语义，但强制 Caddy 重载（历史修复:
 // must-revalidate）——供数据类更新路径与测试使用。
-// 调用方 MUST 已持有 CaddyOpLock（S历史问题）：当前唯一生产调用方
+// 调用方 MUST 已持有 CaddyOpLock（历史问题）：当前唯一生产调用方
 // （cluster_apply.go 的同步应用路径）在锁内；本函数仅持 s.mu，新增调用方漏锁会
 // 重现 历史问题 的 apply→commit 混合态窗口。已持锁调用方不得再经
 // GenerateAndApplyConfigForce 自取锁（重入死锁）。
@@ -329,7 +330,7 @@ func (s *CaddyService) applyConfigLockedOpt(config map[string]interface{}, force
 		return &ConfigRejectedError{Err: errors.New(message)}
 	}
 	snapshot, hasSnapshot := config[caddyCertFilesSnapshotKey].(CertFilesSnapshot)
-	// 历史问题 二十六次 W1-1：本次生成实际写盘了证书文件（MaterializeCertPairs 检出
+	// 历史问题：本次生成实际写盘了证书文件（MaterializeCertPairs 检出
 	// 内容/权限差异，快照非空）而证书路径确定性意味着 JSON 可能字节相同——
 	// 不强制重载时 errSameConfig 短路会让 Caddy 内存里继续用旧证书（重传证书
 	// 静默不生效，DB/UI 全报成功）。快照非空即自动升级为强制。
@@ -355,12 +356,12 @@ func (s *CaddyService) applyConfigLockedOpt(config map[string]interface{}, force
 	if !force {
 		running, runningErr := s.getRunningConfigBytes()
 		if runningErr == nil && caddyConfigJSONEqual(running, data) {
-			// D1-历史问题：同字节短路同样收敛降级状态（见函数说明）。
+			// 历史问题：同字节短路同样收敛降级状态（见函数说明）。
 			applyRenderDegradationState(config, persistDegradation)
 			return errSameConfig
 		}
 		if errors.Is(runningErr, errCaddyAdminConfigTooLarge) {
-			// D1-历史问题：超限是形态异常（非常规瞬时读失败），跳过短路但显式留痕。
+			// 历史问题：超限是形态异常（非常规瞬时读失败），跳过短路但显式留痕。
 			Logf("warn", "Caddy 运行配置超过同字节比对上限，跳过短路照常 /load: %v", runningErr)
 		}
 	}
@@ -371,7 +372,7 @@ func (s *CaddyService) applyConfigLockedOpt(config map[string]interface{}, force
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if force {
-		// Caddy admin 官方逃生口（admin.go: forceReload := Header "Cache-Control"
+		// Caddy admin 官方逃生口（admin.go: forceReload := Header "历史修复"
 		// == "must-revalidate"）：相同 JSON 也执行完整 provision，磁盘数据
 		//（xdb/CRS/证书）的变化得以进入插件内存。
 		req.Header.Set("Cache-Control", "must-revalidate")
@@ -394,16 +395,16 @@ func (s *CaddyService) applyConfigLockedOpt(config map[string]interface{}, force
 	Logf("info", "Caddy config applied successfully")
 	s.persistLastGoodLocked(data)
 	// 整轮渲染 apply 成功（=本轮全部在役名单已投影且被 Caddy 接受）后统一
-	// GC 名单投影文件（历史补充轮 历史问题）——此时引用集落齐，差集安全。
+	// GC 名单投影文件（历史 历史问题）——此时引用集落齐，差集安全。
 	maybeGCStaleIPListFiles()
-	// D3（历史）：渲染降级随配置图到达此处——成功应用后落审计行+
+	// 历史修复（历史）：渲染降级随配置图到达此处——成功应用后落审计行+
 	// caddy_apply_error 横幅（不阻断应用）；干净渲染置空状态，handlers 侧
 	// recordCaddyApplyResult(nil) 据此恢复常规清除。
 	applyRenderDegradationState(config, persistDegradation)
 	return nil
 }
 
-// applyRenderDegradationState 收敛本轮渲染的降级状态（D3 历史；D1-历史问题）。
+// applyRenderDegradationState 收敛本轮渲染的降级状态（历史修复；历史问题）。
 // 必须在「同字节短路」与「成功 /load」两条出口都调用：降级键经 caddyPayload
 // 从载荷剔除、不参与字节比较，若只在真实 /load 后处理，则
 //   - 启用某特性但本轮渲染降级、产物又与运行配置同字节（如受信代理开启瞬间
@@ -414,8 +415,8 @@ func (s *CaddyService) applyConfigLockedOpt(config map[string]interface{}, force
 //     重新持久化。
 //
 // persist=false（事务内 apply）不写主库：未提交事务仍持写锁，持久化交给
-// commit 后的 recordCaddyApplyResult(nil)（历史问题/历史问题）。审计同样暂缓
-// （A85历史问题-1）：立即落「应用降级」会在 commit 失败时描述一份从未提交的
+// commit 后的 recordCaddyApplyResult(nil)（历史问题）。审计同样暂缓
+// （历史问题）：立即落「应用降级」会在 commit 失败时描述一份从未提交的
 // 配置；recordCaddyApplyResult 在成功收尾时经 TakePendingRenderDegradationAudit
 // 补落。非事务 apply（persist=true）仍即时留痕。
 func applyRenderDegradationState(config map[string]interface{}, persist bool) {
@@ -423,7 +424,7 @@ func applyRenderDegradationState(config map[string]interface{}, persist bool) {
 	renderDegradationMu.Lock()
 	lastRenderDegradationV = degraded
 	// persist=false（事务内 apply）只标记待落，commit 成功后由
-	// recordCaddyApplyResult 补审计（A85历史问题-1：否则 commit 失败会留下
+	// recordCaddyApplyResult 补审计（历史问题：否则 commit 失败会留下
 	// 「从未提交配置」的降级事件）。
 	renderDegradationAuditPendingV = degraded != "" && !persist
 	renderDegradationMu.Unlock()
@@ -456,7 +457,7 @@ func (s *CaddyService) persistLastGoodLocked(data []byte) {
 		return
 	}
 	tmp := s.lastGoodPath + ".tmp"
-	// D1-历史问题：0 字节 last-good 会让启动兜底失效——与 certstore 原子写同口径
+	// 历史问题：0 字节 last-good 会让启动兜底失效——与 certstore 原子写同口径
 	// （临时文件 fsync + 父目录 fsync 后 rename）。
 	if err := writeSyncedFile(tmp, data, 0o600); err != nil {
 		Logf("error", "last-known-good: write temp file failed: %v", err)
@@ -473,7 +474,7 @@ func (s *CaddyService) persistLastGoodLocked(data []byte) {
 
 // ApplyLastKnownGood 读取并原样应用最后一次成功下发的配置（启动兜底）。
 // 未配置/文件缺失/应用失败均返回错误，由调用方决定后续。
-// F-历史问题-03（历史）：/load 入 CaddyOpLock——此前仅持 s.mu，与持
+// 历史问题-03（历史）：/load 入 CaddyOpLock——此前仅持 s.mu，与持
 // CaddyOpLock 的并发「渲染+/load」写者（handler 写路径/后台 Force 重载）交错时，
 // last-good 的旧配置可后到覆盖新配置。持锁序 CaddyOpLock→s.mu 与
 // GenerateAndApplyConfigForce 同型（叶操作无 AB-BA）；唯一生产调用方
@@ -538,7 +539,7 @@ func execCaddyValidate(rendered []byte) error {
 	tmp.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), caddyCLIValidateTimeout)
 	defer cancel()
-	// S历史问题：输出收集侧有界——异常巨量输出（病态配置/插件刷屏）不得无界驻留
+	// 历史问题：输出收集侧有界——异常巨量输出（病态配置/插件刷屏）不得无界驻留
 	// 内存；超出上限的字节继续读取但不保留。
 	output := &cappedOutputBuffer{limit: caddyValidateOutputLimit}
 	cmd := exec.CommandContext(ctx, "caddy", "validate", "--config", tmpPath)
@@ -579,7 +580,7 @@ func (c *cappedOutputBuffer) Write(p []byte) (int, error) {
 }
 
 // boundedValidateDetail 生成嵌入 error 的校验输出详情：先按上限切字节、再回退
-// 到合法 UTF-8 边界（S历史问题，与 jobstate.go 消息截断、readCaddyErrorBody 同序
+// 到合法 UTF-8 边界（历史问题，与 jobstate.go 消息截断、readCaddyErrorBody 同序
 // ——先归一再按固定字节位硬切会把切口落在多字节字符中间，序列化后成为 U+FFFD
 // 残片）。
 func boundedValidateDetail(output []byte) []byte {
@@ -607,7 +608,7 @@ func (s *CaddyService) ValidateTxRenderViaCLI(tx *sql.Tx) error {
 		return nil
 	}
 	// 渲染会写 IP 名单投影；CLI 拒绝时必须自回滚，不能依赖每个调用方
-	//（历史 历史问题-5）。成功路径保留新投影供随后的 ApplyConfigFromTx 使用。
+	//（历史问题-5）。成功路径保留新投影供随后的 ApplyConfigFromTx 使用。
 	projectionSnapshot := SnapshotIPListProjections()
 	applied := false
 	defer func() {
@@ -616,7 +617,7 @@ func (s *CaddyService) ValidateTxRenderViaCLI(tx *sql.Tx) error {
 		}
 	}()
 	config := generateCaddyConfigFromStore(tx)
-	// 2026-09-07 审计 N2：渲染过程中 MaterializeCertPairs 可能已将证书文件
+	// 2026-09-07 历史修复：渲染过程中 MaterializeCertPairs 可能已将证书文件
 	// 写盘——无论校验结果如何都恢复快照（后续 ApplyConfigFromTx 会重新生成
 	// 并重新物化），使本函数真正「零运行时副作用」（事务回滚时磁盘不留
 	// 未提交证书）。快照为空（无证书差异）时 RestoreCertFiles 为 no-op。
@@ -660,7 +661,7 @@ func (s *CaddyService) ValidateJSONViaCLI(data []byte) error {
 
 // readCaddyErrorBody 读取 Caddy 管理接口错误响应体并截断到 1KB 内。Caddy 错误体被
 // 完整嵌入 error 后，会经 apply_ok_reload_failed 标记、集群 last_sync_error、证书
-// 任务 message 等有界通道传播（历史 F-历史问题）；按字节截断后回退到合法 UTF-8
+// 任务 message 等有界通道传播（历史）；按字节截断后回退到合法 UTF-8
 // 边界，避免多字节字符残片乱码（复用 cluster_sync.go 的 truncateValidUTF8Tail 模式）。
 func readCaddyErrorBody(body io.Reader) []byte {
 	limited, _ := io.ReadAll(io.LimitReader(body, caddyErrorBodyMaxBytes))
@@ -674,20 +675,20 @@ const caddyErrorBodyMaxBytes = 1024
 // 与 getRunningConfigBytes/看门狗同源，防止异常对端无界分配）。
 const caddyAdminConfigMaxBytes = 32 << 20
 
-// errCaddyAdminConfigTooLarge 标记 admin GET /config/ 超过比对上限（D1-历史问题）：
+// errCaddyAdminConfigTooLarge 标记 admin GET /config/ 超过比对上限（历史问题）：
 // 调用方据此把「超限」与瞬时读失败区分开留痕（二者都按 fail-open 照常 /load）。
 var errCaddyAdminConfigTooLarge = errors.New("Caddy admin 配置响应超过 32MB 上限")
 
 // readAdminConfigBody 读取 admin GET /config/ 的响应体：非 2xx 一律返回带状态码
 // 的错误（错误体经 readCaddyErrorBody 截断到 1KB 供诊断），2xx 时按 32MB 上限
-// 返回原始字节。U04a2-历史问题（历史）：此前 GetConfig/GetUpstreamHealthDetailed
+// 返回原始字节。历史问题（历史）：此前 GetConfig/GetUpstreamHealthDetailed
 // 直接解码响应体——Caddy 错误体本身是合法 JSON（{"error":"..."}），4xx/5xx 时错误
 // 对象会被当配置返回，健康查询更会静默退化为「无健康数据」的空表。
 func readAdminConfigBody(resp *http.Response) ([]byte, error) {
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return nil, fmt.Errorf("GET /config/ returned %d: %s", resp.StatusCode, strings.TrimSpace(string(readCaddyErrorBody(resp.Body))))
 	}
-	// D1-历史问题：+1 探测（metrics 16MB 家族同口径）——裸 LimitReader 静默截断
+	// 历史问题：+1 探测（metrics 16MB 家族同口径）——裸 LimitReader 静默截断
 	// 会让超限与「合法短响应」不可区分（配置结构比对恒不等 → 多余一次 /load；
 	// upstreams 解码静默失败为空表）。
 	data, err := io.ReadAll(io.LimitReader(resp.Body, caddyAdminConfigMaxBytes+1))
@@ -706,7 +707,7 @@ func (s *CaddyService) ValidateConfig(config map[string]interface{}) (err error)
 	// 加载路径，coraza 等插件照常编译并持有资源），与 apply 同为写操作——
 	// 跨层串行化契约：**调用方须持 CaddyOpLock** 进入（本函数仅持 s.mu 保护
 	// CaddyService 内部状态；与并发 apply/证书快照恢复的互斥由调用方的
-	// CaddyOpLock 临界区承担——RC-3，历史：原注释「必须持写锁串行化」
+	// CaddyOpLock 临界区承担——历史修复，历史：原注释「必须持写锁串行化」
 	// 误读为本函数自取跨层写锁）。
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -732,7 +733,7 @@ func (s *CaddyService) ValidateConfig(config map[string]interface{}) (err error)
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		// LBH79-历史问题：admin 4xx=候选配置被拒（可安全的 400 映射），
+		// 历史问题：admin 4xx=候选配置被拒（可安全的 400 映射），
 		// 传输/超时=系统故障（须 500 且仍需回弹权威配置）——用既有
 		// ConfigRejectedError 单源分类，调用侧 IsConfigRejected 判定。
 		return &ConfigRejectedError{Err: fmt.Errorf("validation failed: %s", string(readCaddyErrorBody(resp.Body)))}
@@ -744,7 +745,7 @@ func (s *CaddyService) ValidateConfig(config map[string]interface{}) (err error)
 func caddyPayload(config map[string]interface{}) map[string]interface{} {
 	payload := make(map[string]interface{}, len(config))
 	for key, value := range config {
-		// RC-1（历史）：按 __lazy_balancer_ 前缀整体剔除内部键
+		// 历史修复（历史）：按 __lazy_balancer_ 前缀整体剔除内部键
 		//（generation_error/cert_files_snapshot/degradation 及未来新增），
 		// 不再逐键枚举——漏一枚即被真 Caddy 严格解码 400 硬拒。
 		if strings.HasPrefix(key, caddyInternalKeyPrefix) {
@@ -758,7 +759,7 @@ func caddyPayload(config map[string]interface{}) map[string]interface{} {
 // RouteIDBelongsToRule 判断运行配置中的路由 @id 是否归属某规则：主路由
 // （@id == ruleID）或其带后缀的兄弟路由（ruleID_ 前缀：path_N / geoip /
 // redirect 等）。规则删除路径的路由清理与 handlers 侧
-// GetRuleCaddyConfig 的兄弟路由收集（LB-13）共用本口径。
+// GetRuleCaddyConfig 的兄弟路由收集（历史修复）共用本口径。
 func RouteIDBelongsToRule(routeID, ruleID string) bool {
 	return ruleID != "" && (routeID == ruleID || strings.HasPrefix(routeID, ruleID+"_"))
 }
@@ -771,7 +772,7 @@ func (s *CaddyService) GetConfig() (map[string]interface{}, error) {
 	}
 	defer resp.Body.Close()
 
-	// U04a2-历史问题：非 2xx 必须先拦（Caddy 错误体是合法 JSON，直接解码会把
+	// 历史问题：非 2xx 必须先拦（Caddy 错误体是合法 JSON，直接解码会把
 	// 错误对象当配置返回）；解码上限沿用 32MB 家族口径（历史问题-6）。
 	body, err := readAdminConfigBody(resp)
 	if err != nil {
@@ -790,7 +791,7 @@ func (s *CaddyService) GetConfig() (map[string]interface{}, error) {
 type UpstreamHealthDetail struct {
 	Healthy bool `json:"healthy"`
 	Unknown bool `json:"unknown"`
-	// Dynamic 标记动态 DNS 上游(S历史问题):Caddy 动态池按解析后 IP:port 键控
+	// Dynamic 标记动态 DNS 上游(历史问题):Caddy 动态池按解析后 IP:port 键控
 	// (reverseproxy/hosts.go),域名:port 键在指标/健康两数据源均不可命中——
 	// 域名级健康/请求数不可观测(N/A),负载均衡与被动健康运行时不受影响。
 	Dynamic     bool `json:"dynamic,omitempty"`
@@ -864,13 +865,13 @@ func cloneUpstreamHealthDetails(src map[string]map[string]*UpstreamHealthDetail)
 }
 
 // upstreamHealthAggregateTimeout 限制健康聚合一轮三轮 admin 读取的整体
-// deadline（D1-历史问题）：单请求 client 超时 30s × 3 串行最坏 ~90s，且单飞
+// deadline（历史问题）：单请求 client 超时 30s × 3 串行最坏 ~90s，且单飞
 // 让所有并发轮询者等待同一个 call.done。整体截止后按既有降级语义返回：
 // metrics 缺失=空表，config 读取失败=错误（不静默空表）。
 var upstreamHealthAggregateTimeout = 10 * time.Second
 
 // upstreamDetailFor 由被动指标与主动健康观测推导单个上游的展示明细——
-// HTTP 静态上游 / 动态上游 / layer4 三段共用此单源（S历史问题：原三份逐字
+// HTTP 静态上游 / 动态上游 / layer4 三段共用此单源（历史问题：原三份逐字
 // 重复的推导副本，健康语义修订需改三处且易漂移）。
 func upstreamDetailFor(dial string, metrics map[string]*upstreamMetric, health map[string]bool, dynamic bool) *UpstreamHealthDetail {
 	detail := &UpstreamHealthDetail{Dynamic: dynamic}
@@ -915,7 +916,7 @@ func (s *CaddyService) getUpstreamHealthDetailedUncached() (map[string]map[strin
 	}
 	defer resp.Body.Close()
 
-	// U04a2-历史问题：与 GetConfig 同源状态门——错误页/4xx/5xx 不得静默退化为
+	// 历史问题：与 GetConfig 同源状态门——错误页/4xx/5xx 不得静默退化为
 	// 「无上游健康数据」的空表（旧实现此处直接解码错误 JSON 后返回 nil error）。
 	body, err := readAdminConfigBody(resp)
 	if err != nil {
@@ -923,7 +924,7 @@ func (s *CaddyService) getUpstreamHealthDetailedUncached() (map[string]map[strin
 	}
 
 	var config map[string]interface{}
-	// 历史问题 同族防线（历史 历史问题）：admin 响应解码上限统一在
+	// 历史问题 同族防线（历史）：admin 响应解码上限统一在
 	// readAdminConfigBody（32MB，较 GetConfig 历史 4MB 宽：本端点返回完整
 	// routes 视图，超大部署体积大，上限只为异常对端兜底，不得截断正常健康视图）。
 	if err := json.Unmarshal(body, &config); err != nil {
@@ -990,7 +991,7 @@ func (s *CaddyService) getUpstreamHealthDetailedUncached() (map[string]map[strin
 							name, _ := dynamicUpstreams["name"].(string)
 							port, _ := dynamicUpstreams["port"].(string)
 							if name != "" {
-								// S历史问题:动态 DNS 上游按域名键展示,标记 Dynamic=true——
+								// 历史问题:动态 DNS 上游按域名键展示,标记 Dynamic=true——
 								// 引擎按解析后 IP 跟踪健康,域名级观测恒 N/A(UI 显示 N/A
 								// 而非误导性的「未知」)。查找保持原样(命中即附带数据)。
 								dial := net.JoinHostPort(name, port)
@@ -1045,7 +1046,7 @@ func (s *CaddyService) getUpstreamHealthDetailedUncached() (map[string]map[strin
 							if !ok || len(dialList) == 0 {
 								continue
 							}
-							// S历史问题：layer4 upstream 的 dial 是数组——遍历全部条目
+							// 历史问题：layer4 upstream 的 dial 是数组——遍历全部条目
 							// 逐个导出健康明细（原实现只取 dialList[0]，带外/外来
 							// 多 peer 配置的其余 peer 静默漏报）。本产品渲染恒单 dial，
 							// 常规路径形状不变。
@@ -1093,8 +1094,8 @@ func (s *CaddyService) getUpstreamMetrics(ctx context.Context) map[string]*upstr
 		return result
 	}
 
-	// 32MB 上限同族防线（历史 历史问题，口径见 GetUpstreamHealthDetailed）。
-	// D1-历史问题：+1 探测——裸 LimitReader 静默截断会让解码失败被当作「空表」，
+	// 32MB 上限同族防线（历史问题，口径见 GetUpstreamHealthDetailed）。
+	// 历史问题：+1 探测——裸 LimitReader 静默截断会让解码失败被当作「空表」，
 	// 运维无法区分「Caddy 无上游」与「响应超限」。
 	body, err := io.ReadAll(io.LimitReader(resp.Body, caddyAdminConfigMaxBytes+1))
 	if err != nil {
@@ -1159,7 +1160,7 @@ func (s *CaddyService) getUpstreamHealthFromMetrics(ctx context.Context) map[str
 		return result
 	}
 
-	// PER历史问题（历史）：与 handlers/metrics.go fetchCaddyMetrics 同型——
+	// 历史问题（历史）：与 handlers/metrics.go fetchCaddyMetrics 同型——
 	// limit+1 探测读取，超 16MB 按读取失败处理（返回空健康表），防指标基数
 	// 膨胀时裸 ReadAll 的无界内存分配。
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20+1))
@@ -1182,13 +1183,13 @@ func (s *CaddyService) getUpstreamHealthFromMetrics(ctx context.Context) map[str
 		}
 	}
 
-	// 历史问题 历史问题：健康表全量打印降为 debug——该函数被规则指标/总览轮询周期调用，
+	// 历史问题：健康表全量打印降为 debug——该函数被规则指标/总览轮询周期调用，
 	// 上游多时单行数 KB，INFO 级放大日志滚动。
 	Logf("debug", "Health metrics parsed: %v", result)
 	return result
 }
 
-// ExtractMetricLabel（LBS-A-2，历史 历史问题；LBS/LBH-7 历史收敛为单源）：
+// ExtractMetricLabel（历史修复，历史问题；LBS/历史修复收敛为单源）：
 // label 键必须以标签边界出现（历史问题 精确键匹配）。裸子串匹配会把
 // peer_upstream 等前缀兄弟标签的值误归到目标 label。handlers 侧同名叶函数
 // extractLabel 已删除并改调本函数（跨包唯一实现）。
@@ -1227,7 +1228,7 @@ type caddyConfigStore interface {
 type securityPolicyContext struct {
 	policyByRule  map[string][]*models.SecurityPolicy
 	blockPageByID map[int]string
-	// blockPageTypeByID 页 id → Content-Type（2026-09-25 用户裁定可配置）；
+	// blockPageTypeByID 页 id → 历史修复（2026-09-25 用户裁定可配置）；
 	// 缺失/空值在渲染处回退 text/html; charset=utf-8。
 	blockPageTypeByID map[int]string
 	// policySynthetic 是拦截页按触发策略归因的合成中断码分配（policy_id →
@@ -1237,7 +1238,7 @@ type securityPolicyContext struct {
 	// 码），避免合成码无路由承接泄漏到客户端。区间上限 599（合法状态码），
 	// 超出策略不进表（回落 403 兜底路由）。
 	policySynthetic map[int]int
-	// store 是预载所用 caddyConfigStore（事务内生成即 tx）：A-I1——
+	// store 是预载所用 caddyConfigStore（事务内生成即 tx）：历史修复——
 	// BuildCorazaDirectives → resolvePolicyCustomRules 必须沿同一 store 读取
 	// security_custom_rules，否则 v2 导入事务内重插的规则在渲染期静默丢失。
 	store caddyConfigStore
@@ -1464,7 +1465,7 @@ const trustedProxyProjectionScope = "tp"
 // （v2.3.x）：enabled=false 时返回 (nil, "")（未启用非降级）；读错/解析失败
 // /投影写失败时返回 (nil, 降级说明)——按未启用渲染（fail-closed=不注入，
 // 与「未启用」同形——宁可退回 socket IP 也不采信未校验的头），但降级说明
-// 随配置图携带落横幅（D3，历史：面板「已启用」与实际渲染分叉必须可见）。
+// 随配置图携带落横幅（历史修复，历史：面板「已启用」与实际渲染分叉必须可见）。
 // 启用：内联 ∪ 引用名单合并网段投影到稳定路径文件（2026-10-15 热路径化，
 // trustedProxyProjectionScope）+ 发射 trusted_proxies:{source:lb_file,path}
 // （http.ip_sources.lb_file 文件源 ≤1s stat 热感知，名单/网段变化零 /load；
@@ -1526,7 +1527,7 @@ func trustedProxyServerFields(store caddyConfigStore) (map[string]interface{}, s
 // TrustedProxyMinPrefixBits 返回受信代理允许的最小前缀长度（IPv4=/8，
 // IPv6=/29）。/29 覆盖 Cloudflare 官方最宽回源段 2a06:98c0::/29；
 // 过宽网段会让伪造的头在任意来源被采信。写侧（内联 ranges 与
-// 引用名单条目）与渲染侧共用本判据（U04d-01：两个输入通道不得有宽窄差）。
+// 引用名单条目）与渲染侧共用本判据（历史修复：两个输入通道不得有宽窄差）。
 func TrustedProxyMinPrefixBits(addr netip.Addr) int {
 	if addr.Is6() {
 		return 29
@@ -1536,7 +1537,7 @@ func TrustedProxyMinPrefixBits(addr netip.Addr) int {
 
 // TrustedProxyPrefixAllSpace 报告前缀是否覆盖全部地址空间（等同信任任意
 // 来源）：0.0.0.0/8、0.0.0.0/0、::/0 与 v4-mapped 全零 /96 两种规范写法。
-// 历史 历史问题 曾在内联通道显式拒绝这组形态，引用通道此前漏掉——判据
+// 历史问题 曾在内联通道显式拒绝这组形态，引用通道此前漏掉——判据
 // 单源后两通道同口径。
 func TrustedProxyPrefixAllSpace(prefix netip.Prefix) bool {
 	switch prefix.String() {
@@ -1585,7 +1586,7 @@ func expandTrustedProxyRanges(store caddyConfigStore, inline []string, refsJSON 
 		if _, dup := seen[prefix.String()]; dup {
 			return
 		}
-		// U04d-01 防御复检：写侧两通道（内联/引用）都已拒绝过宽网段，此处
+		// 历史修复 防御复检：写侧两通道（内联/引用）都已拒绝过宽网段，此处
 		// 覆盖带外改库与旧版本残留配置——过宽网段会让伪造头在任意来源被采信，
 		// 宁可跳过并留痕（运行配置缺该来源 = 退回 socket IP，偏安全侧）。
 		if TrustedProxyPrefixTooWide(prefix) {
@@ -1622,7 +1623,7 @@ func expandTrustedProxyRanges(store caddyConfigStore, inline []string, refsJSON 
 // （含 :80 默认站）；layer4/admin 不在此函数视野内，天然不注入。
 // 产出为共享实例（fields 同一份 map 经 maps.Copy 逐键并入各 server，
 // 值内嵌套结构仍被多 server 共享引用）——消费方禁变异，如需改动须先深拷贝。
-// 返回渲染降级说明（D3，历史；空=无降级），调用方随配置图携带。
+// 返回渲染降级说明（历史修复，历史；空=无降级），调用方随配置图携带。
 func mergeTrustedProxyServerFields(servers map[string]interface{}, store caddyConfigStore) string {
 	fields, degraded := trustedProxyServerFields(store)
 	if len(fields) == 0 {
@@ -1659,7 +1660,7 @@ func generateCaddyConfigFromStore(store caddyConfigStore, overrides ...*models.U
 	return generateCaddyConfigWithCertSource(store, db.DB, overrides...)
 }
 
-// generateCaddyConfigWithCertSource 渲染配置，证书候选源可指定（历史问题 A-N1）：
+// generateCaddyConfigWithCertSource 渲染配置，证书候选源可指定（历史问题）：
 //   - certSource=db.DB（默认）：历史问题.1 防护——UpdateConfig 类纯 global_config 事务
 //     的 tx 视角对 cert_jobs 纯陈旧性，已提交连接恒见最新证书。
 //   - certSource=tx（ApplyConfigFromTxCertAwareForce，v2 导入专用）：导入事务全量
@@ -1882,7 +1883,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 
 	acmeCerts := make(map[string][]CertificateCandidate)
 	if hasACMETLS {
-		// 历史问题 历史问题.1：证书候选固定走已提交连接（db.DB）而非传入 store——UpdateConfig 的
+		// 历史问题.1：证书候选固定走已提交连接（db.DB）而非传入 store——UpdateConfig 的
 		// ApplyConfigFromTx 会把 global_config 事务传入此处，该事务不写 cert_jobs，
 		// tx 视角对证书零信息增益、纯陈旧性：在途 ACME 部署（certissuer 不持 caddyOpMu，
 		// transitionJob 独立连接提交新证书）若在 tx 快照固定后落库，本查询经 tx 会读到
@@ -1901,7 +1902,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 				closeErr := certRows.Close()
 				return generationFailure("读取 ACME 证书阶段解析失败: %v", errors.Join(scanErr, closeErr))
 			}
-			// SV历史问题：装载阶段统一预解析（disabled 候选由 SelectCertificate
+			// 历史问题：装载阶段统一预解析（disabled 候选由 SelectCertificate
 			// 直接跳过，无需付解析成本），选择/后续复用走 Leaf 快路径。
 			if candidate.Status != "disabled" {
 				candidate.Leaf = ParseCertificateLeaf(candidate.CertPEM, candidate.KeyPEM)
@@ -1915,12 +1916,12 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		if closeErr := certRows.Close(); closeErr != nil {
 			return generationFailure("读取 ACME 证书阶段关闭结果集失败: %v", closeErr)
 		}
-		// 历史问题 A-N1（谓词 miss 补查）：主候选查询的 lb_rules 子查询在 certSource 的
+		// 历史问题（谓词 miss 补查）：主候选查询的 lb_rules 子查询在 certSource 的
 		// 视图上执行——tx 渲染路径中，事务对 lb_rules 的写入（UpdateRule 切换
 		// tls_source manual→acme_dns、EnableRule 置 enabled=1、导入插入新规则）使
 		// allRules（tx 视图）含 acme 规则而已提交视图的子查询将其排除，候选为空，
 		// 该规则按无证书渲染（TLS 静默丢失）。此时经 store（tx）做无子查询的
-		// per-rule 补查——补查读的是事务视图（历史问题 修正、历史问题 F-A5 校正举例：tx 内
+		// per-rule 补查——补查读的是事务视图（历史问题 修正、历史问题 校正举例：tx 内
 		// 写 cert_jobs 的调用点是 DisableRule 置 disabled、DeleteRule 删行、
 		// UpdateRule tcp 切换删除；UpdateRule 域名迁移的证书 UPDATE 在 commit 后
 		// 独立 certTx。对 tx 内写者，事务视图恰是渲染目标状态，行为正确）；
@@ -1986,7 +1987,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		proxyFlushInterval, proxyStreamCloseDelay                                                             int
 		serverTokensHidden                                                                                    bool
 	}
-	// S历史问题：dns_provider/acme_email 不参与 Caddy 渲染（签发链路 certissuer 侧
+	// 历史问题：dns_provider/acme_email 不参与 Caddy 渲染（签发链路 certissuer 侧
 	// 独立消费），渲染侧不再读列也不再接受 overrides 覆写——原读取+覆写后零消费
 	// 是死链，会让读者误判「改这两项会触发渲染」。
 	if err := store.QueryRow(`
@@ -2007,7 +2008,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		return generationFailure("load global config: %v", err)
 	}
 
-	// 历史 历史问题: 安全策略经同一 store 批量预载（常数级查询），替代逐规则走
+	// 历史问题: 安全策略经同一 store 批量预载（常数级查询），替代逐规则走
 	// 全局 db.DB 的 N+1——事务内生成（ApplyConfigFromTx）由此读到未提交的策略。
 	securityCtx, err := loadSecurityPolicyContext(store)
 	if err != nil {
@@ -2097,7 +2098,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		r := ru.rule
 		ups := ru.upstreams
 
-		// 历史问题 历史问题 同族收敛：全量路径与单规则路径共用 http/tcp 白名单，
+		// 历史问题 同族收敛：全量路径与单规则路径共用 http/tcp 白名单，
 		// 带外 https/udp 等脏值不得被静默暴露成原始 TCP 代理。
 		if r.Protocol != "http" && r.Protocol != "tcp" {
 			return generationFailure("rule %s: unsupported protocol: %s", r.CaddyID, r.Protocol)
@@ -2117,7 +2118,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 			continue
 		}
 
-		// A85历史问题-2：TLS 规则在证书就绪前不得发布——TLS 连接策略只对
+		// 历史问题：TLS 规则在证书就绪前不得发布——TLS 连接策略只对
 		// availableCerts 命中的规则生成，而 server 仍按端口创建且
 		// automatic_https.disable=true：无证书的同端口 server 会以明文监听器
 		// 对外提供该规则的后端转发（ACME 首签窗口，签发失败时持续）。证书
@@ -2186,7 +2187,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 				TCPTryInterval:                 r.TCPTryInterval,
 				GlobalUpstreamKeepaliveTimeout: global.upstreamKeepaliveTimeout,
 				GlobalServerTokensHidden:       global.serverTokensHidden,
-				// F73 修复（2026-10-14 用户报告）：全局请求体大小此前漏填——
+				// 历史修复 修复（2026-10-14 用户报告）：全局请求体大小此前漏填——
 				// resolveRuleOverrides 恒读 0 → 兜底 128，用户设置从未生效。
 				GlobalRequestBodyMaxSizeMB:       global.requestBodyMaxSizeMB,
 				CustomRoutesEnabled:              r.CustomRoutesEnabled,
@@ -2246,7 +2247,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		emittedSynthetic := make(map[string]struct{})
 		for _, ru := range rules {
 			r := ru.rule
-			// S历史问题：nil 上下文门必须在两个拦截页构建器之前——二者内部直接
+			// 历史问题：nil 上下文门必须在两个拦截页构建器之前——二者内部直接
 			// 解引用 securityCtx.blockPageByID（policiesForRule 虽支持 nil，但
 			// 页面查找不支持）。当前生产路径 loadSecurityPolicyContext 失败即
 			// generationFailure（ctx 恒非 nil），此门是未来调用点的 fail-safe。
@@ -2329,7 +2330,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		}
 
 		// 证书签发/续期由 cert_jobs（DNS-01）全权管理：禁止 Caddy 自动 HTTPS 的
-		// 一切行为（v2.11.4 autohttps.go）。S历史问题(历史):此前 80/443 仅
+		// 一切行为（v2.11.4 autohttps.go）。历史问题(历史):此前 80/443 仅
 		// disable_certificates,但引擎在 DisableCerts=true 时仍无条件向 http_80
 		// 追加 catch-all 308(autohttps.go appendCatchAll,无 host matcher)——被
 		// 项目落地页遮蔽成死路由,每个未匹配 :80 请求产生 superfluous
@@ -2343,7 +2344,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 
 	// Collect HTTP->HTTPS redirect routes from all TLS-enabled rules and place them on the HTTP (port 80) server.
 	var redirectRoutes []interface{}
-	// M1：判定提为闭包，供 r 自身与下方 other 遮蔽复核共用同款口径。
+	// 历史修复：判定提为闭包，供 r 自身与下方 other 遮蔽复核共用同款口径。
 	// 历史问题-4：提出循环外——闭包捕获空、无状态，每迭代重建纯属浪费。
 	hasEnabledUpstream := func(ups []upstream) bool {
 		for _, u := range ups {
@@ -2353,17 +2354,17 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		}
 		return false
 	}
-	// U04a2-历史问题（历史）：遮蔽复核索引一次构建——旧实现对每条跳转规则遍历
+	// 历史问题（历史）：遮蔽复核索引一次构建——旧实现对每条跳转规则遍历
 	// 全部规则并逐条 normalizedDomainSet（每次含 db.CanonicalDomains 规范化），
 	// R 条跳转 × N 条规则约 R×N 次规范化。索引只规范化 80 端口候选项一次（O(N)），
-	// 跳转循环内退化为 O(1) 域名查表；比较口径与 M1/历史 历史问题 完全不变。
+	// 跳转循环内退化为 O(1) 域名查表；比较口径与 历史问题 完全不变。
 	port80Candidates := make([]port80RuleCandidate, 0, len(allRules))
 	for _, other := range allRules {
 		otherRule := other.rule
 		if otherRule.Protocol != "http" || otherRule.ListenPort != 80 {
 			continue
 		}
-		// M1（审计）：遮蔽复核的比对方也过启用上游门——零启用上游的规则不生成
+		// 历史修复（审计）：遮蔽复核的比对方也过启用上游门——零启用上游的规则不生成
 		// 80 端口路由（死规则），不得作为遮蔽方压制兄弟域名的 HTTPS 跳转。
 		if !hasEnabledUpstream(other.upstreams) {
 			continue
@@ -2373,36 +2374,36 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 	port80DomainOwners := buildPort80DomainOwners(port80Candidates)
 	for _, ru := range allRules {
 		r := ru.rule
-		// 历史问题 F-A: 与规则渲染跳过同口径（上方按启用上游数 continue）——全部上游
+		// 历史修复: 与规则渲染跳过同口径（上方按启用上游数 continue）——全部上游
 		// 被禁用的启用规则不生成任何端口路由，同样不得生成 301 跳转，否则域名
 		// 被跳到无服务的 TLS 端口（此前按上游裸计数，禁用上游也被计入）。
 		if !hasEnabledUpstream(ru.upstreams) {
 			continue
 		}
 		if r.Protocol == "http" && r.EnableTLS && r.TLSHTTPRedirect {
-			// 历史修复 历史问题（历史，SVCA-86-历史问题）：跳转与 server 同判据——
+			// 历史问题（历史，历史修复-历史问题）：跳转与 server 同判据——
 			// 证书未就绪（availableCerts 未命中）即不发射 301，不分 tls_source。
 			// 旧判据只门 acme_dns：manual 脏行（空证书）形态下 server 按
-			// A85历史问题-2 跳过而 80 跳转仍发射，域名被 301 到无服务的 TLS 端口。
+			// 历史问题 跳过而 80 跳转仍发射，域名被 301 到无服务的 TLS 端口。
 			if _, hasCert := availableCerts[r.CaddyID]; !hasCert {
 				continue
 			}
 			domainHosts := splitAndTrim(r.Domain)
 			if len(domainHosts) > 0 {
-				// 历史 历史问题: 签发完成/重载时刻复核——acme_dns 规则在证书签发前不生成
+				// 历史问题: 签发完成/重载时刻复核——acme_dns 规则在证书签发前不生成
 				// 跳转（上方 continue），签发后跳转才出现；若此刻存在同域名直接监听 80 的
 				// 启用规则，terminal 301 会将其静默遮蔽为死规则。保存/启用路径已由
 				// queryRedirectShadowConflict 拦截，此处纯内存复核兜住存量/导入/签发迟滞
 				// 窗口，命中即跳过该域名跳转生成。
-				// 历史 历史问题: 比较双方均过规范化（db.CanonicalDomains 同源口径），
+				// 历史问题: 比较双方均过规范化（db.CanonicalDomains 同源口径），
 				// 导入态非规范化域名（"Example.COM"）不再失配。
-				// 历史 历史问题: 按域名粒度过滤——仅跳过与 80 端口规则冲突的域名，
+				// 历史问题: 按域名粒度过滤——仅跳过与 80 端口规则冲突的域名，
 				// 其余兄弟域名仍生成跳转（保存侧 queryRedirectShadowConflict 保持整规则
 				// 400 语义，报错含冲突域名，用户可拆规则）。
 				wantedDomains := normalizedDomainSet(r.Domain)
 				blockedDomains := make(map[string]struct{})
 				shadowedBy := ""
-				// U04a2-历史问题：索引查表替代 R×N 次规范化；自排除语义与旧实现
+				// 历史问题：索引查表替代 R×N 次规范化；自排除语义与旧实现
 				// otherRule.CaddyID == r.CaddyID 一致（仅自身拥有该域名不算遮蔽）。
 				// shadowedBy 取字典序最小命中域名，日志内容因此确定（旧实现取
 				// map 遍历首个命中，无序）。
@@ -2474,7 +2475,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 	layer4Servers := make(map[string]interface{})
 
 	for port, rules := range tcpServersByPort {
-		// 历史 历史问题: DynamicDNS 检测改为逐规则跳过（历史 误伤同端口其他规则）。
+		// 历史问题: DynamicDNS 检测改为逐规则跳过（历史 误伤同端口其他规则）。
 		filtered := rules[:0]
 		for _, ru := range rules {
 			if ru.rule.DynamicDNS {
@@ -2489,7 +2490,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		}
 		rules = filtered
 
-		// 历史 历史问题: TCP 同端口多规则禁止（用户决策）。历史 检测配置冲突跳过整个端口，
+		// 历史问题: TCP 同端口多规则禁止（用户决策）。历史 检测配置冲突跳过整个端口，
 		// 但 upstreams 仍被盲目合并导致重复 upstream 双倍权重。改为直接拒绝并记告警。
 		if len(rules) > 1 {
 			ids := make([]string, 0, len(rules))
@@ -2563,7 +2564,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		servers["http_80"] = defaultSite
 	} else {
 		server := servers["http_80"].(map[string]interface{})
-		// SEM44-2(历史):不再重复 applyTimeouts——server 在 :1456 创建时已
+		// 历史修复(历史):不再重复 applyTimeouts——server 在 :1456 创建时已
 		// 应用,两处之间无超时值变异,重复调用是幂等同值覆写。
 		routes, ok := server["routes"].([]interface{})
 		if !ok {
@@ -2586,7 +2587,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		servers["http_80"] = server
 	}
 
-	// 历史问题 历史问题：logger_names 按 server（端口）拆分——同域名跨端口双规则时全局
+	// 历史问题：logger_names 按 server（端口）拆分——同域名跨端口双规则时全局
 	// 共享映射会让后写覆盖先写（先建规则的日志文件永无条目），且任一端口上的
 	// 同域名请求（含 80 默认站跳转）都被误记入映射命中规则的日志。
 	loggerNamesByPort := map[int]map[string]interface{}{}
@@ -2601,9 +2602,9 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 			loggerNamesByPort[r.ListenPort] = perPort
 		}
 		for _, d := range splitAndTrim(r.Domain) {
-			// S历史问题:与 host matcher 同口径规范化——Caddy 日志查找大小写
+			// 历史问题:与 host matcher 同口径规范化——Caddy 日志查找大小写
 			// 敏感,混合大小写 Host 请求会落到默认 logger(归属错位)。
-			// LBS-A-R2（历史）：拆分复用 splitAndTrim（同型去重）。
+			// 历史修复（历史）：拆分复用 splitAndTrim（同型去重）。
 			perPort[normalizeHostForMatcher(d)] = "rule_" + r.CaddyID
 		}
 	}
@@ -2624,7 +2625,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 	}
 
 	// 受信代理（CDN 真实 IP）：每个 HTTP server（含 :80 默认站）注入；
-	// 未启用时零字段（行为不变）。降级说明随配置图携带（D3）。
+	// 未启用时零字段（行为不变）。降级说明随配置图携带（历史修复）。
 	trustedProxyDegraded := mergeTrustedProxyServerFields(servers, store)
 
 	apps := map[string]interface{}{
@@ -2666,7 +2667,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 
 	if logsMap, ok := logging["logs"].(map[string]interface{}); ok {
 		encoder := buildAccessLogEncoder(accessLogJSON, accessLogFormat)
-		// LBS-A-历史问题（历史）：ruleLogDir 创建移出逐规则循环（此前每条规则一次
+		// 历史问题（历史）：ruleLogDir 创建移出逐规则循环（此前每条规则一次
 		// 重复 syscall 且错误被丢弃）——有任一启用日志的 http 规则时创建一次，
 		// 失败记日志（writer 落不了盘会体现为 caddy 配置应用错误，此处点名目录）。
 		ruleLoggerNeeded := false
@@ -2720,7 +2721,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 	return conf
 }
 
-// accessLogAPIKeyHeaderPath 是访问日志恒脱敏的请求头路径（A85历史问题-A）。
+// accessLogAPIKeyHeaderPath 是访问日志恒脱敏的请求头路径（历史问题）。
 // X-API-Key 是面板机器接口凭证：出现在被记录路由（面板/API 反代、上游客户端
 // 同名头）即明文落盘。脱敏必须在渲染层成为恒等不变量——库值可能来自旧格式、
 // 直接改库或备份导入，任何写侧漏网都不得让明文进日志。
@@ -2824,8 +2825,8 @@ func buildCaddyLogging(level string, sizeMB int) map[string]interface{} {
 }
 
 // acmeCertCandidatesForRule 查询指定规则的 ACME 证书候选（PEM 非空行，
-// updated_at/id 倒序）。历史问题 A-N1 谓词 miss 补查与 loadACMECertificateFromStore
-// 共用本查询体（LBS-A-R1 历史去重——此前两处同一 SELECT+扫描循环逐字
+// updated_at/id 倒序）。历史问题 谓词 miss 补查与 loadACMECertificateFromStore
+// 共用本查询体（历史修复去重——此前两处同一 SELECT+扫描循环逐字
 // 重复）；status 过滤由调用方 SelectCertificate 后置执行。查询/解析失败仅记
 // 日志返回 nil（调用点按无证书渲染/判定，语义不变）。
 func acmeCertCandidatesForRule(store caddyConfigStore, ruleID string) []CertificateCandidate {
@@ -2849,7 +2850,7 @@ func acmeCertCandidatesForRule(store caddyConfigStore, ruleID string) []Certific
 			Logf("warn", "ACME 证书候选解析失败（规则 %s）: %v", ruleID, err)
 			return nil
 		}
-		// SV历史问题：与批量装载同口径预解析 Leaf（规则候选可能被
+		// 历史问题：与批量装载同口径预解析 Leaf（规则候选可能被
 		// loadACMECertificateFromStore 的多个消费点多轮选择）。
 		if candidate.Status != "disabled" {
 			candidate.Leaf = ParseCertificateLeaf(candidate.CertPEM, candidate.KeyPEM)
@@ -2866,7 +2867,7 @@ func acmeCertCandidatesForRule(store caddyConfigStore, ruleID string) []Certific
 // loadACMECertificateFromStore reads the issued ACME certificate and key from
 // cert_jobs (via store) for the given rule and domain. Returns
 // (certPEM, keyPEM, true) if issued.
-// LBS-A-R1（历史）：查询体委托 acmeCertCandidatesForRule，本函数只做
+// 历史修复（历史）：查询体委托 acmeCertCandidatesForRule，本函数只做
 // SelectCertificate 择优（此前两函数 SELECT+扫描循环逐字重复）。
 func loadACMECertificateFromStore(store caddyConfigStore, caddyID, domain string) (string, string, bool) {
 	selected, ok := SelectCertificate(acmeCertCandidatesForRule(store, caddyID), domain, time.Now())
@@ -2902,7 +2903,7 @@ func splitAndTrim(s string) []string {
 }
 
 // normalizedDomainSet 返回逗号分隔域名的规范化集合（小写+punycode），与保存侧
-// db.CanonicalDomains（normalizedRuleDomains）同源。历史 历史问题：渲染层遮蔽比较
+// db.CanonicalDomains（normalizedRuleDomains）同源。历史问题：渲染层遮蔽比较
 // 必须与保存侧口径一致，否则导入态非规范化域名（"Example.COM" vs "example.com"）
 // 比较失配——Caddy host matcher 大小写不敏感，遮蔽问题会经导入路径复发。
 // 整串无法规范化（手造脏数据）时回退小写拆分结果，渲染不因脏数据中断。
@@ -2938,7 +2939,7 @@ type port80RuleCandidate struct {
 }
 
 // buildPort80DomainOwners 一次性规范化候选域名，返回 域名→规则 ID 列表 索引。
-// U04a2-历史问题（历史）：渲染期 HTTP→HTTPS 跳转遮蔽复核原为每条跳转规则
+// 历史问题（历史）：渲染期 HTTP→HTTPS 跳转遮蔽复核原为每条跳转规则
 // 对全部规则逐对 normalizedDomainSet（每次含 db.CanonicalDomains），大规则量
 // 下约 R×N 次规范化；索引把规范化收敛为 O(N)，逐跳转规则只做 O(1) 域名查表。
 // 同一域名被多条 80 端口规则拥有时按 allRules 顺序追加 ID，供调用方做自排除
@@ -2958,7 +2959,7 @@ func buildPort80DomainOwners(candidates []port80RuleCandidate) map[string][]stri
 // 的 headers 会在运行时经过 replacer 替换（v2.11.4 modules/caddyhttp/staticresp.go），
 // 因此多域名规则（a.com,b.com）访问 b.com 时会跳回 b.com，而不是被劫持到首个域名。
 func httpsRedirectLocation(listenPort int) string {
-	// 历史问题 二十七次 N2（补正重写）：Location 必须追加 {http.request.uri}（path+query）
+	// 历史问题（补正重写）：Location 必须追加 {http.request.uri}（path+query）
 	// ——Caddy static_response 不会自动保留原 URI（原生 auto-HTTPS 重定向会保留），
 	// 缺失时 http://a.com/page?x=1 会被跳到根路径。首版实施因脚本断言中止丢失。
 	if listenPort != 443 {
@@ -3041,7 +3042,7 @@ type PathRuleConfig struct {
 	Upstreams    []UpstreamConfig
 	// 直接返回/301 跳转（2026-10-10 用户裁定）：ResponseMode ''=转发上游
 	// （现状，全链渲染）/static=静态响应/redirect=301 跳转——后两者不经
-	// 安全链与 reverse_proxy；LBS-A-U1（历史）起链首带 lb_rule_metrics
+	// 安全链与 reverse_proxy；历史修复（历史）起链首带 lb_rule_metrics
 	// 纯计数（指标不属于安全链）。
 	ResponseMode        string
 	ResponseStatus      int
@@ -3075,12 +3076,12 @@ type UpstreamConfig struct {
 // resolveRuleOverrides 规则级覆盖解析（库值唯一真相批 1+2 改造）：
 //   - 请求体上限：规则级>0 用规则级，否则全局值。全局 request_body_max_size_mb
 //     为类型①值型列（NOT NULL DEFAULT 128+启动回填），恒有效——原「仍 <=0 则
-//     写死 128」兜底（D40-2-1 读侧归一）废除：库值无效（<=0）即渲染显性报错
+//     写死 128」兜底（历史修复 读侧归一）废除：库值无效（<=0）即渲染显性报错
 //     （fail-visible），错误经 buildHTTPHandleChain→generationFailure 使配置
 //     生成失败、旧配置保留。
 //   - keepalive：规则级>0 否则全局值；类型②省略型（0=省略=继承 Caddy/Go
 //     Transport 默认 2 分钟，历史问题 用户裁定），渲染不发 keep_alive。
-//   - Server 头隐藏：2026-09-06 裁定（T-3）仅暴露全局开关（基础设置），规则级
+//   - Server 头隐藏：2026-09-06 裁定（历史修复）仅暴露全局开关（基础设置），规则级
 //     server_tokens_hidden 0/1/2 覆盖为 API/MCP 预留字段——无 UI 入口、不作为
 //     产品功能维护，UI 编辑透传保留 API 已设值。
 func resolveRuleOverrides(rule SingleRuleConfig) (requestBodyMaxSizeMB int, upstreamKeepalive int, hideServer bool, err error) {
@@ -3149,7 +3150,7 @@ func formatFlushInterval(v int) string {
 	return fmt.Sprintf("%ds", v)
 }
 
-// GenerateRuleServerContext builds a Caddy-config-shaped map containing only
+// GenerateRuleServerContext builds a 历史修复 map containing only
 // the server context hosting a single rule: the deterministic server identity
 // for its listen port, the same-port TLS connection policies (mirroring
 // generateCaddyConfigFromStore's available-cert semantics), and the rule's own
@@ -3173,12 +3174,12 @@ func GenerateRuleServerContext(caddyID string, listenPort int, protocol, domain 
 	if protocol == "http" {
 		var tlsSource string
 		var certPresent, keyPresent, enableTLS bool
-		// 历史 历史问题: 查询失败必须留痕，对话框不得静默显示"无证书"。
-		// N+12 历史问题：仅需存在性判断，投影 COALESCE!='' 布尔，不搬运 PEM 正文。
+		// 历史问题: 查询失败必须留痕，对话框不得静默显示"无证书"。
+		// 历史问题：仅需存在性判断，投影 COALESCE!='' 布尔，不搬运 PEM 正文。
 		if err := db.DB.QueryRow(`SELECT COALESCE(tls_source,'manual'), COALESCE(tls_cert,'') != '', COALESCE(tls_key,'') != '', COALESCE(enable_tls,0) FROM lb_rules WHERE caddy_id = ?`, caddyID).Scan(&tlsSource, &certPresent, &keyPresent, &enableTLS); err != nil {
 			Logf("error", "GenerateRuleServerContext: 读取规则 %s TLS 字段失败: %v", caddyID, err)
 		} else if enableTLS {
-			// 历史 历史问题: 与全量渲染 availableCerts 同口径（caddy.go 全量路径
+			// 历史问题: 与全量渲染 availableCerts 同口径（caddy.go 全量路径
 			// 要求 EnableTLS），未开 TLS 的规则不加载证书。
 			if tlsSource == "manual" && certPresent && keyPresent {
 				hasCert = true
@@ -3186,12 +3187,12 @@ func GenerateRuleServerContext(caddyID string, listenPort int, protocol, domain 
 				hasCert = isACMECertIssuedFromStore(db.DB, caddyID, domain)
 			}
 		}
-		// LBS-A-3（历史 历史问题）：初始化为空切片——nil 会让预览 JSON 输出
+		// 历史修复（历史）：初始化为空切片——nil 会让预览 JSON 输出
 		// tls_connection_policies: null（消费方按数组形状解构）。
 		policies := []interface{}{}
-		// 历史 历史问题: 与全量渲染 httpServersByPort 同口径——仅 enable_tls=1 且
+		// 历史问题: 与全量渲染 httpServersByPort 同口径——仅 enable_tls=1 且
 		// 存在启用上游的规则进入 TLS 策略（无上游/关 TLS 规则在真实配置中不存在）。
-		// N+12 历史问题：证书仅有无的判断在 SQL 侧完成，不再把整列 PEM 拉进进程。
+		// 历史问题：证书仅有无的判断在 SQL 侧完成，不再把整列 PEM 拉进进程。
 		rows, err := db.DB.Query(`SELECT COALESCE(caddy_id,''), COALESCE(domain,''), COALESCE(tls_source,'manual'), COALESCE(tls_cert,'') != '' AND COALESCE(tls_key,'') != ''
 			FROM lb_rules WHERE enabled = 1 AND protocol = 'http' AND listen_port = ? AND enable_tls = 1
 			AND EXISTS (SELECT 1 FROM upstreams u WHERE u.rule_id = lb_rules.caddy_id AND IIF(u.enabled IN ('1',1),1,0) = 1)
@@ -3223,7 +3224,7 @@ func GenerateRuleServerContext(caddyID string, listenPort int, protocol, domain 
 					},
 				})
 			}
-			// 历史 历史问题: 遍历中途 DB 错误会截断 TLS 策略且此前静默（仅关行），
+			// 历史问题: 遍历中途 DB 错误会截断 TLS 策略且此前静默（仅关行），
 			// 与规则主循环（:990-993）同口径显式留痕。
 			if err := rows.Err(); err != nil {
 				Logf("error", "GenerateRuleServerContext: 遍历端口 %d TLS 策略失败: %v", listenPort, err)
@@ -3253,7 +3254,7 @@ func GenerateRuleServerContext(caddyID string, listenPort int, protocol, domain 
 }
 
 func GenerateSingleRuleCaddyConfig(rule SingleRuleConfig) map[string]interface{} {
-	// 历史问题 历史问题: 与单规则渲染路径的硬错误对齐——https 等
+	// 历史问题: 与单规则渲染路径的硬错误对齐——https 等
 	// 非法协议不再静默按 TCP 渲染（遗留 https 行由 db 迁移归一为 http）。
 	if rule.Protocol != "http" && rule.Protocol != "tcp" {
 		return map[string]interface{}{
@@ -3306,7 +3307,7 @@ func GenerateSingleRuleCaddyConfig(rule SingleRuleConfig) map[string]interface{}
 		// 统一生成（端口 443 时 Location 不带自引用端口，见 httpsRedirectLocation）。
 		// 若未来需要在单规则配置里启用此分支，请先确认与全量生成逻辑保持一致。
 		//
-		// 口径说明(S历史问题 同步:S历史问题 后全量分支对全部端口统一
+		// 口径说明(历史问题 同步:历史问题 后全量分支对全部端口统一
 		// {disable: true}——引擎 autoHTTPS 整体关闭,HTTP→HTTPS 跳转由项目
 		// 自有 redirectRoutes 管理;此前的 disable_certificates 例外与「保留
 		// 自动跳转」描述已废止)。本分支(仅预览/校验用,输出不达 Caddy)仅对
@@ -3494,7 +3495,7 @@ func generateHTTPRouteObjects(rule SingleRuleConfig, securityCtx ...*securityPol
 		}
 	}
 	if geoipPassPolicy != nil {
-		// LB-13：GeoIP pass 路由补挂 @id（caddyID_geoip）——此前无 @id，
+		// 历史修复：GeoIP pass 路由补挂 @id（caddyID_geoip）——此前无 @id，
 		// GetRuleCaddyConfig 的兄弟路由收集与规则删除清理均无法识别。
 		geoipRoute := buildGeoipPassRoute(domainHosts, crawlerExempt)
 		tagRuleRoute(geoipRoute, rule.CaddyID, "geoip")
@@ -3508,7 +3509,7 @@ func generateHTTPRouteObjects(rule SingleRuleConfig, securityCtx ...*securityPol
 		for pathIndex, pathRule := range pathRules {
 			// 直接返回/301 跳转（2026-10-10 用户裁定）：不经安全链/改写/reverse_proxy
 			// （无上游可代理，静态响应天然无后端攻击面；安全策略不覆盖此类路径）。
-			// LBS-A-U1（历史）：链首补 lb_rule_metrics 纯计数——指标不属于
+			// 历史修复（历史）：链首补 lb_rule_metrics 纯计数——指标不属于
 			// 安全链，不修时规则全量流量指标漏计该类路径流量（指标页失真）。
 			if pathRule.ResponseMode == "static" || pathRule.ResponseMode == "redirect" {
 				staticRoute := map[string]interface{}{
@@ -3524,7 +3525,7 @@ func generateHTTPRouteObjects(rule SingleRuleConfig, securityCtx ...*securityPol
 				continue
 			}
 			upstreams := pathRule.Upstreams
-			// 历史 历史问题: 空数组与 nil 统一回退主上游——DB 中 upstreams_json="[]"
+			// 历史问题: 空数组与 nil 统一回退主上游——DB 中 upstreams_json="[]"
 			// 的存量路径规则此前因 `upstreams == nil` 不成立而走 buildHTTPHandleChain
 			// 硬失败（预校验特判放行、全量渲染失败的不对称），修复后两者语义一致。
 			if len(upstreams) == 0 {
@@ -3610,8 +3611,8 @@ func insertUpstreamPathRewrites(handle []interface{}, pathRule PathRuleConfig) [
 
 // buildStaticResponseHandler 渲染路径规则的直接返回/301 跳转 handler（全原生
 // http.handlers.static_response）：redirect=301+Location（目标经校验侧形状门）；
-// static=status_code+body+Content-Type，缺省兜底 200/text/plain。
-// LBS-A-历史问题（历史，语义声明）：static_response 的 headers 值与 body 在
+// static=status_code+body+历史修复，缺省兜底 200/text/plain。
+// 历史问题（历史，语义声明）：static_response 的 headers 值与 body 在
 // 运行时经 Caddy replacer 展开已知占位符（v2.11.6 staticresp.go:193-208 实证，
 // ReplaceKnown）——redirect_to/body 中的 {http.request.uri} 等会被改写为请求
 // 值（与 httpsRedirectLocation 的占位符用法同引擎机制）。校验侧有意不拒 '{'
@@ -3696,7 +3697,7 @@ func SplitDnsAddresses(s string) []string {
 }
 
 func joinUpstreamAddress(host string, port int) string {
-	// LBH79-历史问题：渲染侧与写侧同口径归一首尾空白——历史行/直改 DB 的
+	// 历史问题：渲染侧与写侧同口径归一首尾空白——历史行/直改 DB 的
 	// " up.test" 会渲染成非法 dial（该上游恒 502）。主机名/IP 字面量不含
 	// 有意义空白，TrimSpace 不改变合法配置。
 	return net.JoinHostPort(strings.TrimSpace(host), strconv.Itoa(port))
@@ -3738,8 +3739,8 @@ func stage1BlockStatus(securityCtx *securityPolicyContext, rule SingleRuleConfig
 	return 0
 }
 
-// blockPageContentType 渲染处 Content-Type 归一：空值回退默认 html；白名单
-// 双保险（历史 历史问题，用户裁定）——带外通道（备份导入/集群快照）落库的
+// blockPageContentType 渲染处 历史修复 归一：空值回退默认 html；白名单
+// 双保险（历史问题，用户裁定）——带外通道（备份导入/集群快照）落库的
 // 白名单外值同样归一默认，杜绝 CRLF 等脏值原样渲染进响应头。
 func blockPageContentType(contentType string) string {
 	if contentType == "" || !models.ValidBlockPageContentType(contentType) {
@@ -3811,7 +3812,7 @@ func decodePathUpstreams(raw string) ([]UpstreamConfig, error) {
 // 事务内生成可见未提交的策略变更。
 func buildBlockPageErrorRoute(ruleCaddyID string, domainHosts []string, securityCtx *securityPolicyContext) map[string]interface{} {
 	policies := policiesForRule(securityCtx, ruleCaddyID)
-	// 历史 历史问题（历史问题）：首个绑定拦截页的策略若页面内容为空（页面行已
+	// 历史问题（历史）：首个绑定拦截页的策略若页面内容为空（页面行已
 	// 删除），不得遮蔽后续仍有效页的策略——按绑定序取首个「内容非空」的页。
 	var pagePolicy *models.SecurityPolicy
 	var content string
@@ -3865,7 +3866,7 @@ func buildBlockPageErrorRoute(ruleCaddyID string, domainHosts []string, security
 func buildRateLimitErrorRoute(ruleCaddyID string, domainHosts []string, securityCtx *securityPolicyContext) map[string]interface{} {
 	policies := policiesForRule(securityCtx, ruleCaddyID)
 	rateLimited := false
-	// 历史 历史问题（历史问题）：同 buildBlockPageErrorRoute——空内容页不遮蔽
+	// 历史问题（历史）：同 buildBlockPageErrorRoute——空内容页不遮蔽
 	// 后续有效页。
 	var pagePolicy *models.SecurityPolicy
 	var content string
@@ -3887,7 +3888,7 @@ func buildRateLimitErrorRoute(ruleCaddyID string, domainHosts []string, security
 	// 限流的语义正确状态码，且使 caddy_http_requests_total{code="429"} 可单独
 	// 计量——Wave 6 状态统一后 403 与 WAF 拦截在指标中同形不可区分（实测：
 	// 错误路由响应继承主路由 handler 标签，无任何其他区分维度）。拦截页正文
-	// 不变（客户端体验一致），Retry-After 按限流 1s 窗口给出重试契约。
+	// 不变（客户端体验一致），历史修复 按限流 1s 窗口给出重试契约。
 	return map[string]interface{}{
 		"match": []interface{}{
 			map[string]interface{}{
@@ -3928,7 +3929,7 @@ func buildRateLimitHandler(ruleCaddyID string, policy *models.SecurityPolicy) (m
 	if policy.RateLimitRPS <= 0 {
 		return nil, fmt.Errorf("规则 %s 绑定策略 %q 限流已启用但 rate_limit_rps 无效（%d <=0）：该列为类型①值型列（写侧 rps>=1 校验+导入门 400 拒收+启动归一关停 enabled=1&rps<1 的历史脏行），疑似带外直写或旧备份绕过导入门", ruleCaddyID, policy.Name, policy.RateLimitRPS)
 	}
-	// 历史问题 C-N1：sweep_interval 是 caddy-ratelimit Handler 层字段（默认 1m），
+	// 历史问题：sweep_interval 是 caddy-ratelimit Handler 层字段（默认 1m），
 	// 不是 zone 字段——Caddy v2.11.4 对模块载荷 StrictUnmarshalJSON+
 	// DisallowUnknownFields，zone 级未知字段会使整个配置加载 400（开启限流
 	// 即配置停摆）。移到 handler 层（合法字段，10m 扫描周期语义保留）。
@@ -3967,8 +3968,20 @@ func buildRateLimitHandler(ruleCaddyID string, policy *models.SecurityPolicy) (m
 // buildGeoipHandler 渲染 geoip2region handler；crawlerExempt 为规则级门控
 // （任一绑定策略 GeoIPCrawlerExempt，历史问题）——caddygeoip 在 false 时只剥
 // 客户端伪造的验证头、不做 PTR/DNS 验证。
+// xdb 与爬虫快照路径随 data_dir 派生（ConfigureWafDirs
+// 单点真源），仅在派生值不同于插件 Provision 兜底默认时显式发射对应键——
+// 容器默认形态渲染字节不变（loadConfig 同字节短路依赖 handler 字节稳定，
+// 见 errSameConfig 注释），插件默认即生效；自定义 data_dir 形态显式发射，
+// 否则插件恒读 /app/data/...（写读分叉，GeoIP/爬虫豁免静默失效）。
 func buildGeoipHandler(crawlerExempt bool) map[string]interface{} {
-	return map[string]interface{}{"handler": "geoip2region", "crawler_exempt": crawlerExempt}
+	h := map[string]interface{}{"handler": "geoip2region", "crawler_exempt": crawlerExempt}
+	if ip2regionLivePath != defaultIP2RegionLivePath {
+		h["xdb_path"] = ip2regionLivePath
+	}
+	if crawlerIPListFile != defaultCrawlerIPListFile {
+		h["crawler_ip_list_file"] = crawlerIPListFile
+	}
+	return h
 }
 
 // buildGeoipPassRoute populates the region placeholders before the block matcher evaluates.
@@ -4020,7 +4033,7 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 	}
 
 	policies := policiesForRule(ctx, rule.CaddyID)
-	// A-I1：WAF 发射读取 security_custom_rules 必须与策略预载同 store——
+	// 历史修复：WAF 发射读取 security_custom_rules 必须与策略预载同 store——
 	// 无 ctx（非批量路径）时传 nil，由 resolvePolicyCustomRules 回退 db.DB。
 	var policyStore caddyConfigStore
 	var scopedCache scopedCRSListCache
@@ -4029,7 +4042,7 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 		scopedCache = ctx.scopedListCache
 	}
 	var handleChain []interface{}
-	// F3（v2.2.3）：链首注入 X-LB-Rule-ID——安全事件归因的一等信号（摄入侧优先
+	// 历史修复（v2.2.3）：链首注入 X-LB-Rule-ID——安全事件归因的一等信号（摄入侧优先
 	// 读头、回退 host 反查，同域名多规则/通配符场景归因从概率正确到确定正确）。
 	// 置于 IP 预检之前，预检与各策略 coraza 事务均可见；set 覆盖客户端伪造值；
 	// reverse_proxy 前无条件剥离（见 proxyRequestHeaders 删除清单），不直达上游。
@@ -4055,7 +4068,7 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 	// 中断(HandlerError 携 ID+4xx)按规则计数;限流 429 经 status==429
 	// 分支计入(424a400e 后;非 coraza tx.ID 但 caddyhttp.Error 生成 ID)。
 	securityLibsOK := SecurityLibrariesAvailable()
-	// 历史 历史问题:补 securityLibsOK(与 timing_pre/end 同口径)——库缺失时
+	// 历史问题:补 securityLibsOK(与 timing_pre/end 同口径)——库缺失时
 	// 链上无 coraza 收点,counter 的 timing ID 注入与拦截计数均无意义。
 	if securityLibsOK && rule.Protocol == "http" && len(policies) > 0 {
 		handleChain = append(handleChain, map[string]interface{}{
@@ -4102,7 +4115,7 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 	var securityChain []interface{}
 	if securityLibsOK && rule.Protocol == "http" && len(policies) >= 1 {
 		// 单行护栏错误（48KiB 超限）向上传播——保存侧经 CLI 校验/事务门控回滚。
-		// rule.CaddyID：u-* 投影 scope 编入规则身份（历史 HP-1）。
+		// rule.CaddyID：u-* 投影 scope 编入规则身份（历史修复）。
 		precheckHandler, err := buildIPPrecheckHandler(policies, stage1BlockStatus(ctx, rule), rule.CaddyID)
 		if err != nil {
 			return nil, err
@@ -4112,17 +4125,17 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 		}
 		// 预检段耗时收点(2026-09-27 分段计时):预检之后、body/限流/WAF 之前——
 		// 摄取管道预检段事件取 :pre,WAF 段取 :end-:pre(隔离 WAF 评估成本)。
-		// S历史问题：外层门已含 rule.Protocol=="http"，原嵌套同条件恒真已删；
+		// 历史问题：外层门已含 rule.Protocol=="http"，原嵌套同条件恒真已删；
 		// 未来若新增非 http 链，由外层门统一守卫。
 		securityChain = append(securityChain, map[string]interface{}{
 			"handler": "lb_security_timing_pre",
 		})
 	}
 
-	// R1(2026-09-10 审计):规则级压缩必须位于全部 waf 处理器之外侧(链序在前)
+	// 历史修复(2026-09-10 审计):规则级压缩必须位于全部 waf 处理器之外侧(链序在前)
 	// ——coraza 的响应拦截器包在 coraza handler 外层,encode 若在 waf 内侧,
 	// 响应体规则(95x 响应检查)扫描的是压缩后字节,≥512B 可压缩响应恒不匹配
-	// (coraza 全库无 Content-Encoding 检查,grep 实证)。置于 headers/预检之后、
+	// (coraza 全库无 历史修复 检查,grep 实证)。置于 headers/预检之后、
 	// 策略组之前:请求向处理不受影响,响应向 encode 包在所有 coraza 拦截器外。
 	if rule.EnableCompress && rule.CompressTypes != "" {
 		encodings := make(map[string]interface{})
@@ -4155,7 +4168,7 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 	// 阶段 2（限流）→ 阶段 3（WAF）：全部绑定启用策略（policy_id ASC）的
 	// rate_limit 集中在所有 WAF 引擎之前（限流恒 429；被前位 WAF 拦的请求也
 	// 消耗后位策略配额为已裁定口径），随后每策略独立 coraza 引擎（自定义规则
-	// +CRS）。审计 B5-F2 + M4：CRS 池指纹在单次链构建内不变——按链计算一次
+	// +CRS）。审计 历史修复 + 历史修复：CRS 池指纹在单次链构建内不变——按链计算一次
 	// 透传给各策略，替代逐 (规则×策略) 对的 DB 查询+stat（200 规则×3 策略
 	// ≈600 查询→200）；闭包缓存每链至多计算一次——零安全策略/非 http 链零
 	// 开销；http 链首个策略求值时计算（历史问题-1：全 off 策略的 http 链
@@ -4198,7 +4211,7 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 	// 安全处理耗时收点(2026-09-27 双点计时):放行事件的纯评估耗时在此记录
 	// (blocked_counter 只计拦截事件——其 next 返回值混入上游代理往返不可用)。
 	// 置于安全链末尾、reverse_proxy 之前;信任直通时随 subroute 整体跳过。
-	// 历史修复 历史问题（历史）：发射面从「链非空」收窄为「有策略」（=counter
+	// 历史问题（历史）：发射面从「链非空」收窄为「有策略」（=counter
 	// 在场同判据）——request_body 恒发射使旧判据对无策略规则也产 timing_end，
 	// 而无 counter 的路由无服务端 timing ID 注入/覆盖，客户端伪造的计时头会
 	// 直进进程内注册表（内存 DoS 面）；无 counter 即无任何计时写点。
@@ -4296,7 +4309,7 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 		if rule.Strategy == "cookie" {
 			selectionPolicy["name"] = "lb_sticky"
 		}
-		// 历史问题 C-N2：DynamicDNS 规则恰有 1 个启用上游（保存/启用/导入三链强制），
+		// 历史问题：DynamicDNS 规则恰有 1 个启用上游（保存/启用/导入三链强制），
 		// weighted_round_robin 会发射 weights=[1]——Caddy 的 WeightedRoundRobinSelection
 		// 对 len(Weights)<2 直接早退返回 pool[0]（不做可用性检查，reverseproxy.go:637
 		// 传入的动态解析池亦不过滤不可用主机，重试无失败记忆）→ 流量恒打解析列表
@@ -4454,8 +4467,8 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 	// 执行，已消费完毕），绝不允许透传上游后端。无条件剥离：geoip 关闭的规则
 	// 同时防客户端伪造同名头直达后端。头名清单与 caddygeoip/handler.go 的
 	// geoipCorazaHeaders(caddygeoip/handler.go) 同源，变更需双侧同步。X-LB-Rule-ID 同型：链首注入的归因头
-	//（F3）仅供 coraza 事务内消费，同口径无条件剥离。
-	// 历史 历史问题：爬虫验证控制头（X-LB-Crawler-Verified / X-LB-Crawler-Spoof）
+	//（历史修复）仅供 coraza 事务内消费，同口径无条件剥离。
+	// 历史问题：爬虫验证控制头（X-LB-Crawler-Verified / X-LB-Crawler-Spoof）
 	// 同样由 caddygeoip 在 coraza phase:1 之前注入、coraza 预检规则已消费；
 	// 与 geoip 头同口径**无条件**剥离——无 GeoIP 策略的规则（handler 不在场）
 	// 下客户端伪造的同名头也绝不能直达上游。常量名与 caddygeoip/handler.go
@@ -4498,7 +4511,7 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 	// 上游占位符再展开 headers/transport，重试换上游逐次重展开）。defaults 回退链
 	// 精确复现现状：Host=host_header 或池形态回退；SNI=host_header 剥端口或 dial
 	// 主机名（stdlib 空 server_name 默认）。originDialOrder 保持上游 SELECT 序。
-	// LBS-A-L2（历史 历史问题 修复）：Host 回退按池形态分流——{http.request.
+	// 历史修复（历史问题 修复）：Host 回退按池形态分流——{http.request.
 	// hostport} 绑原始请求（replacer.go:128-129），在 TLS 池恒为客户端 Host，
 	// 不等于现状的 transport 注入 hostport；TLS 池改 {http.reverse_proxy.
 	// upstream.hostport}（reverseproxy.go:664-668 先于 userOps 设置，可用）。
@@ -4551,8 +4564,8 @@ func (s *CaddyService) ApplyConfigFromTx(tx *sql.Tx) error {
 //     新内容。调用方提交后直接成功收尾，不落「重载」审计（审计真实性）。
 //   - (NeedForce, nil)  字节一致但本轮渲染经 MaterializeCertPairs 物化了证书
 //     文件（快照非空）——配置 JSON 因证书路径确定性而字节相同，errSameConfig
-//     短路会让 Caddy 内存停留旧证书（历史问题 W1-1「物化即有变⇒强制重载」在热路径
-//     失守，历史 CERT-1）。调用方必须走强制重载收敛
+//     短路会让 Caddy 内存停留旧证书（历史问题「物化即有变⇒强制重载」在热路径
+//     失守，历史修复）。调用方必须走强制重载收敛
 //     （GenerateAndApplyConfigForceInLock / ApplyConfigFromTxCertAwareForce）。
 //   - (Fallback, nil)   字节不一致（发射面变化：仅剩否定算子/非投影面形态）或
 //     运行配置不可读（无法证实零变化）→ 调用方回退既有全量渲染+应用链
@@ -4583,18 +4596,18 @@ func (s *CaddyService) RefreshIPListProjections() (IPListProjectionOutcome, erro
 }
 
 // RefreshIPListProjectionsInLock 投影热路径的 DB 视图 InLock 变体（自动封禁
-// merge 收敛用，AU-1 契约：名单读改写+收敛同一 CaddyOpLock 临界区，本变体
+// merge 收敛用，历史修复 契约：名单读改写+收敛同一 CaddyOpLock 临界区，本变体
 // 不得自取锁——调用方已持锁，自取=重入死锁）。返回语义同
 // RefreshIPListProjections。
 func (s *CaddyService) RefreshIPListProjectionsInLock() (IPListProjectionOutcome, error) {
 	return s.refreshIPListProjectionsInLock(db.DB)
 }
 
-// IPListProjectionOutcome 投影热路径三态（历史 CERT-1）：
+// IPListProjectionOutcome 投影热路径三态（历史修复）：
 //   - ProjectionConverged：投影已落盘 ∧ 与运行配置字节一致 ∧ 本轮渲染未物化
 //     证书 → 调用方零 /load 收尾；
 //   - ProjectionNeedForce：字节一致但本轮渲染物化了证书文件（快照非空）→
-//     调用方走强制重载收敛（errSameConfig 必须被击穿，历史问题 W1-1）；
+//     调用方走强制重载收敛（errSameConfig 必须被击穿，历史问题）；
 //   - ProjectionFallback：无法证实收敛（发射面变化/运行配置不可读）→ 调用方
 //     回退既有全量链。
 type IPListProjectionOutcome int
@@ -4612,7 +4625,7 @@ func (s *CaddyService) refreshIPListProjectionsInLock(store caddyConfigStore) (I
 		//（同 applyConfigLockedOpt 口径，调用方回退后得到一致错误语义）。
 		return ProjectionFallback, &ConfigRejectedError{Err: errors.New(message)}
 	}
-	// CERT-1（历史）：快照键仅在 MaterializeCertPairs 实际写盘了证书文件时
+	// 历史修复（历史）：快照键仅在 MaterializeCertPairs 实际写盘了证书文件时
 	// 才入配置图（generateCaddyConfigWithCertSource）——先记下物化事实，字节
 	// 一致时据此返回 NeedForce（否则快照随本函数局部配置图被丢弃，磁盘新证书
 	// 与 Caddy 内存旧证书静默分叉）。
@@ -4643,7 +4656,7 @@ func (s *CaddyService) refreshIPListProjectionsInLock(store caddyConfigStore) (I
 }
 
 // RollbackIPListProjectionsToCommittedInLock 拒绝/回滚分支的磁盘回退（历史
-// 历史修复-1/历史修复-5，用户裁定：拒绝=磁盘回滚到已提交态）：以已提交库值（db.DB）
+// 历史修复，用户裁定：拒绝=磁盘回滚到已提交态）：以已提交库值（db.DB）
 // 重渲染一次全量配置——投影文件经渲染副作用原子重写为已提交内容（同字节跳写
 // 保护在役文件），MaterializeCertPairs 把证书文件物化回归已提交 PEM——全程零
 // /load（不做运行配置读取与比对，不发射任何 admin 请求）。
@@ -4659,7 +4672,7 @@ func (s *CaddyService) refreshIPListProjectionsInLock(store caddyConfigStore) (I
 //     效果的惰性孤儿），由既有 24h GC 回收；内容级回滚由在役投影形状承载。
 //   - NeedForce 强制被拒时，证书物化内容本就是已提交 PEM（物化=已提交态），
 //     需回退的是投影与 DB 侧（本方法覆盖）；「磁盘新证书 × Caddy 内存旧证书」
-//     的 W1-1 债务在拒绝后依然存在，与一切 apply 被拒形态同边界，由下次成功
+//     的 历史修复 债务在拒绝后依然存在，与一切 apply 被拒形态同边界，由下次成功
 //     渲染/手动重载收敛（非本方法职责）。
 //   - 已提交视图渲染失败（数据损坏等）→ 仅 warn 不阻断拒绝收尾——拒绝分支
 //     的主语义（400/回滚）优先，磁盘分叉由下次成功渲染收敛（与修复前等同，
@@ -4679,7 +4692,7 @@ func (s *CaddyService) RollbackIPListProjectionsToCommittedInLock() {
 	// 不做运行配置比对、零 /load（拒绝语义：运行配置本就未被改动）。
 }
 
-// RestoreRuntimeToCommittedInLock 是提交失败分支的运行配置恢复（U04d-03）：
+// RestoreRuntimeToCommittedInLock 是提交失败分支的运行配置恢复（历史修复）：
 // 事务内 apply 已按未提交视图 /load 并写入 last-known-good（持久化发生在每次
 // 成功 /load 之后），commit 失败只回退投影会让数据面继续生效未提交内容、重启
 // 兜底也回到未提交配置。本方法以已提交库值（db.DB）重渲染并 /load：运行配置、
@@ -4719,12 +4732,12 @@ func (s *CaddyService) RestoreRuntimeToCommittedInLock() error {
 	return marshalErr
 }
 
-// ApplyConfigFromTxCertAwareForce：证书候选改读事务自身（历史问题 A-N1，restoreTable
+// ApplyConfigFromTxCertAwareForce：证书候选改读事务自身（历史问题，restoreTable
 // 保留原 id 重插证书行，已提交视图的旧行会经 MaterializeCertPairs 用旧 PEM 覆写
-// 导入刚落盘的新证书文件）+ 强制重载（历史问题 二十六次 W1-1：v2 导入在 apply 之前
+// 导入刚落盘的新证书文件）+ 强制重载（历史问题：v2 导入在 apply 之前
 // 已把新 PEM 落盘，生成期 MaterializeCertPairs 内容比对相等 → 快照为空 → 自动
 // 强制不触发，必须显式强制，否则同 JSON 导入新证书会被 errSameConfig 短路、
-// 旧证书继续服务）。非强制的 ApplyConfigFromTxCertAware 已于 历史问题 二十七次删除
+// 旧证书继续服务）。非强制的 ApplyConfigFromTxCertAware 已于 历史问题删除
 // （唯一生产调用方即本函数的调用点，保留旧版只会让未来调用方重新引入静默
 // 旧证书缺陷）。
 func (s *CaddyService) ApplyConfigFromTxCertAwareForce(tx *sql.Tx) error {

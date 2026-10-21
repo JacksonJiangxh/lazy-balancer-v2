@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-// 历史修复2：CRS 重载失败回滚若未能完整还原规则树，不得无条件把 VERSION 标记
+// 历史修复：CRS 重载失败回滚若未能完整还原规则树，不得无条件把 VERSION 标记
 // 与 DB 版本行回写成 prevTag——那会制造「live 新树 + 旧版本」跨代态（版本行
 // 是 crsPoolFingerprint 的池键输入）。此时保留更新后的版本并落 ERROR 留痕。
 func TestCRSRollback_skipsVersionRowWhenTreeNotRestored(t *testing.T) {
@@ -41,7 +41,7 @@ func TestCRSRollback_skipsVersionRowWhenTreeNotRestored(t *testing.T) {
 	}
 }
 
-// 历史修复4：备份创建失败时不得丢失上一运行崩溃现场残留的 rules.bak
+// 历史修复：备份创建失败时不得丢失上一运行崩溃现场残留的 rules.bak
 // （唯一恢复素材）。旧实现在安装段前无条件 RemoveAll(rules.bak)。
 func TestCRSBackupFailure_preservesStaleRulesBak(t *testing.T) {
 	m := newTestCRSManager(t)
@@ -75,7 +75,7 @@ func TestCRSBackupFailure_preservesStaleRulesBak(t *testing.T) {
 	}
 }
 
-// 历史修复3：快照持久化必须先构建完成再替换——拷贝中途失败时旧快照必须保持
+// 历史修复：快照持久化必须先构建完成再替换——拷贝中途失败时旧快照必须保持
 // 完整（旧实现先 RemoveAll(snapshotDir) 再逐项 copy）。
 func TestPersistCRSSnapshot_failureKeepsPreviousSnapshot(t *testing.T) {
 	liveDir := t.TempDir()
@@ -127,7 +127,7 @@ func TestRestoreCRSFromSnapshot_failureKeepsLiveTree(t *testing.T) {
 	}
 }
 
-// 历史修复6：规则数缓存必须可跨通道失效（集群同步 / 备份导入替换 live 树后）。
+// 历史修复：规则数缓存必须可跨通道失效（集群同步 / 备份导入替换 live 树后）。
 func TestCRSManager_InvalidateRuleCount_rescans(t *testing.T) {
 	m := newTestCRSManager(t)
 	writeTestFile(t, filepath.Join(m.crsDir, "rules", "REQUEST-901.conf"), "SecRule a\nSecRule b\n")

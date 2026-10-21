@@ -54,7 +54,7 @@ func clusterError(c *gin.Context, status int, message string, err error) {
 }
 
 // clusterMasterForbidden 统一服务层 ErrNotMasterNode → 403 的输出形状
-// （历史修复 历史问题）：与 requireMasterResult 同源携带 X-LB-Error-Code——从端
+// （历史问题）：与 requireMasterResult 同源携带 X-LB-Error-Code——从端
 // Pull 的错误分类（cluster_sync.go）依赖该头，服务层降级竞态 403 不得裸发。
 func clusterMasterForbidden(c *gin.Context, err error) {
 	c.Header("X-LB-Error-Code", masterRequiredErrorCode)

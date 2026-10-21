@@ -38,7 +38,7 @@ test('历史问题-01：全零与单行边界仍归一到 100', () => {
   assert.equal(single[0]!.weight, 100)
 })
 
-test('A85WT-历史问题：weightPercent 展示口径（禁用行=0、总和≤0→0、四舍五入）', () => {
+test('weightPercent 展示口径（禁用行=0、总和≤0→0、四舍五入）', () => {
   assert.equal(weightPercent(undefined, { weight: 1 }), 0)
   assert.equal(weightPercent([], { weight: 1 }), 0)
   assert.equal(weightPercent([{ weight: 0, enabled: true }], { weight: 0, enabled: true }), 0)
@@ -59,14 +59,14 @@ test('A85WT-历史问题：weightPercent 展示口径（禁用行=0、总和≤0
   )
 })
 
-test('A85WT-历史问题：超出 100 行上限的行权重清零且不参与分配', () => {
+test('超出 100 行上限的行权重清零且不参与分配', () => {
   const rows = Array.from({ length: 101 }, () => ({ weight: 1, enabled: true }))
   normalizeWeights(rows)
   assert.equal(rows[100]!.weight, 0, '第 101 行必须被清零')
   assert.equal(rows.slice(0, 100).reduce((sum, row) => sum + row.weight, 0), 100)
 })
 
-test('A86 D-3：payloadWeight 保存载荷边界——禁用行送 1、启用行原样、缺省 100', () => {
+test('payloadWeight 保存载荷边界——禁用行送 1、启用行原样、缺省 100', () => {
   // 禁用行草稿权重被 participatingItems 写 0，载荷边界送 1（后端 weight<1 响亮 400）
   assert.equal(payloadWeight({ weight: 0, enabled: false }), 1)
   assert.equal(payloadWeight({ weight: 50, enabled: false }), 1)

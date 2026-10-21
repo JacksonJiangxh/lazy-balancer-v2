@@ -26,7 +26,7 @@ const (
 	// 方案 A（2026-10-12）：stopped 退役——状态列只承载执行语义（调度语义归
 	// 开关列 loop_on；业务驱动任务另由业务开关决定是否启动）。disabled 仅
 	// cert-job 退役行集产出。
-	// B1-5（历史）：cancelled 常量删除——零产出零消费（取消只存在于
+	// 历史修复（历史）：cancelled 常量删除——零产出零消费（取消只存在于
 	// task_runs.result 字段，非 TaskStatus 状态产出）。
 )
 
@@ -81,7 +81,7 @@ func CollectSystemTasks() []TaskInfo {
 // collectCertJobRows 逐签发任务行：非终态（实时队列内容）+ 24h 内终态
 // （结果可见）；id=cert-job:{jobID}，日志走 /certificates/jobs/{id}/logs。
 func collectCertJobRows() []TaskInfo {
-	// TASK-L3（历史 历史问题）：db.DB nil 防护——与引擎侧导出 DB 函数同形
+	// 历史修复（历史问题）：db.DB nil 防护——与引擎侧导出 DB 函数同形
 	// （装配顺序变化即 nil panic，曾裸用）。
 	if db.DB == nil {
 		return nil
@@ -135,7 +135,7 @@ func collectCertJobRows() []TaskInfo {
 			// 触发语义（2026-10-11 用户裁定）：cert-job 行视为触发任务——可自动
 			// 调度（签发守护消费）即可手动调度（证书可重签发）；重试门（在途 409/
 			// 退役 429/冷却 429）由 TriggerSystemTask 的 cert-job 分支复用承担。
-			// TASK-3（历史 历史问题）：disabled 为恒终态退役行——重试门对其恒 429，
+			// 历史修复（历史问题）：disabled 为恒终态退役行——重试门对其恒 429，
 			// Triggerable=false 让按钮呈现禁用态（点击必 429 是交互噪音）。
 			Triggerable: status != "disabled",
 			LastRun: &TaskRunInfo{StartedAt: localDisplayUTC(updatedAt), FinishedAt: localDisplayUTC(updatedAt),
@@ -189,7 +189,7 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 				ti.Cadence = "每 " + humanInterval(m.IntervalSec)
 			}
 		case taskengine.KindScheduled:
-			// C2（历史）：Scheduled 族节奏补显——原缺分支恒空，前端显示「—」；
+			// 历史修复（历史）：Scheduled 族节奏补显——原缺分支恒空，前端显示「—」；
 			// 槽位由 NextSlotFn 按用户配置派生（每日时刻等），具体时间归「下次执行」列。
 			ti.Cadence = "定时排程"
 		case taskengine.KindDaemon:
@@ -197,7 +197,7 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 		case taskengine.KindOneshot:
 			ti.Cadence = "手动触发"
 		}
-		// TASK-L3（历史 历史问题）：db.DB nil 防护（与同层 collectCertJobRows 同形）。
+		// 历史修复（历史问题）：db.DB nil 防护（与同层 collectCertJobRows 同形）。
 		// 历史问题：LatestRun 单次查询复用（曾每任务两查）；历史问题-06：全部任务
 		// 合并为两条批量查询（RunOverview）。
 		latestRun := latestRuns[m.ID]

@@ -80,7 +80,7 @@ type threatScreenPayload struct {
 		HourlyHist         []models.SecurityAttackType `json:"hourly_hist"`
 		AttackTypeShare    []models.SecurityAttackType `json:"attack_type_share"`
 		RecentRate         float64                     `json:"recent_rate"`
-		// v2.4.x 大屏加固：logged=历史修复（夹 >=0）、限流可用性位、
+		// v2.4.x 大屏加固：logged=total-blocked（夹 >=0）、限流可用性位、
 		// 被攻击目标 Top3（name/domain/value）
 		LoggedEvents       int  `json:"logged_events"`
 		RatelimitAvailable bool `json:"ratelimit_available"`
@@ -884,7 +884,7 @@ func TestThreatFixMinute_groupsByRuleIdentityColumns(t *testing.T) {
 	}
 }
 
-// ---- 历史 A 域：历史修复 / 历史修复 / 历史修复 ----
+// ---- 历史 A 域：历史修复 ----
 
 func installThreatClock(t *testing.T, now time.Time) {
 	t.Helper()
@@ -1389,7 +1389,7 @@ func TestGetSecurityThreatScreen_topTargetsQueryFailureReturns500(t *testing.T) 
 func TestStartThreatRollupWarmer_takesOverFixation(t *testing.T) {
 	// Given: 窗口内 1 条事件；warmer 以已取消 ctx 启动（立即退出不执行固化，
 	// 但启动标志置位）；幂等二次启动不 panic。
-	// 历史 历史问题：启动标志 ≠ 已有可用覆盖——首轮从未成功时请求路径必须
+	// 历史问题：启动标志 ≠ 已有可用覆盖——首轮从未成功时请求路径必须
 	// 沿用懒固化（不得返回全零「无攻击」大屏）。
 	setupSecurityPolicyTestDB(t)
 	t.Cleanup(resetThreatRollupWarmerForTest)
@@ -1616,7 +1616,7 @@ func TestGetSecurityThreatScreen_hourlyHistDayBuckets(t *testing.T) {
 	if total != 2 {
 		t.Fatalf("hourly 总计=%d, want 2", total)
 	}
-	// 72h 日桶是滚动 24h 窗口（起点 历史修复），不是自然日；按事件在窗口内
+	// 72h 日桶是滚动 24h 窗口（起点 now-72h），不是自然日；按事件在窗口内
 	// 的偏移映射到桶，避免跨午夜/自然日假设造成的假失败。
 	bucketFor := func(at time.Time) string {
 		shifted := at.UTC().Add(time.Duration(offset) * time.Second)

@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// F73 修复：全局请求体大小必须贯通到渲染——此前 SingleRuleConfig 构造块漏填
+// 历史修复 修复：全局请求体大小必须贯通到渲染——此前 SingleRuleConfig 构造块漏填
 // GlobalRequestBodyMaxSizeMB（填了 keepalive/server_tokens 两个兄弟却漏了本字段），
 // resolveRuleOverrides 恒读 0 → 兜底 128，用户设置的非默认值从未生效。
 func TestGenerateCaddyConfig_globalRequestBodyMaxSizeReachesRender(t *testing.T) {
@@ -47,7 +47,7 @@ func TestGenerateCaddyConfig_ruleLevelRequestBodyOverridesGlobal(t *testing.T) {
 	}
 }
 
-// F73 全量值贯通核查（用户质询后的系统性补验）：全部全局 Caddy 配置项设非默认
+// 历史修复 全量值贯通核查（用户质询后的系统性补验）：全部全局 Caddy 配置项设非默认
 // 哨兵值 → 渲染 → 逐项断言渲染值=设置值。历史上只验默认值形状导致 request_body
 // 全局断裂漏检多年——本测试以非默认形态钉住全部全局→渲染链。
 func TestGenerateCaddyConfig_allGlobalOverridesReachRender(t *testing.T) {

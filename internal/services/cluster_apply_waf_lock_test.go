@@ -1,6 +1,6 @@
 package services
 
-// 历史问题-历史问题（历史 历史问题）：从端 applySnapshot 的 ApplyWafFileBundle 调用点
+// 历史问题（历史）：从端 applySnapshot 的 ApplyWafFileBundle 调用点
 // 此前不入 wafFileMu——与 lbbak 导入（caller-side 持锁，config_backup_lbbak.go）、
 // 三库更新器（内锁）与 BuildWafFileBundle 读相位（内锁）无互斥，同步落盘与导入/
 // 更新交错可打出混合 rules 树/撕裂 xdb，并沿 waf_files 节扩散到集群。修复=调用

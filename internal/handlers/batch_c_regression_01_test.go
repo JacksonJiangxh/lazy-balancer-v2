@@ -38,7 +38,7 @@ func TestValidateRuleConflictMatrix_reports_cross_rule_conflicts(t *testing.T) {
 			wantCount: 2,
 		},
 		{
-			name: "R32 F-2: 禁用 TCP 与启用 TCP 同端口不构成冲突（禁用规则无运行时占用）",
+			name: "禁用 TCP 与启用 TCP 同端口不构成冲突（禁用规则无运行时占用）",
 			candidates: []ruleConflictCandidate{
 				{name: "tcp-disabled", protocol: "tcp", listenPort: 9001, enabled: false},
 				{name: "tcp-enabled", protocol: "tcp", listenPort: 9001, enabled: true},
@@ -46,7 +46,7 @@ func TestValidateRuleConflictMatrix_reports_cross_rule_conflicts(t *testing.T) {
 			wantCount: 0,
 		},
 		{
-			name: "R32 F-2: 禁用 TCP 与启用 HTTP 同端口不构成冲突",
+			name: "禁用 TCP 与启用 HTTP 同端口不构成冲突",
 			candidates: []ruleConflictCandidate{
 				{name: "tcp-disabled", protocol: "tcp", listenPort: 8445, enabled: false},
 				{name: "http-enabled", protocol: "http", domain: "http.example.test", listenPort: 8445, enabled: true},
@@ -54,7 +54,7 @@ func TestValidateRuleConflictMatrix_reports_cross_rule_conflicts(t *testing.T) {
 			wantCount: 0,
 		},
 		{
-			name: "R32 F-2: 双方禁用 TCP 同端口不判定",
+			name: "双方禁用 TCP 同端口不判定",
 			candidates: []ruleConflictCandidate{
 				{name: "tcp-off-one", protocol: "tcp", listenPort: 9002, enabled: false},
 				{name: "tcp-off-two", protocol: "tcp", listenPort: 9002, enabled: false},
@@ -78,7 +78,7 @@ func TestValidateRuleConflictMatrix_reports_cross_rule_conflicts(t *testing.T) {
 			wantCount: 0,
 		},
 		{
-			name: "R31 C-1: 同端口同域名但一方禁用不构成冲突（禁用规则无运行时占用）",
+			name: "同端口同域名但一方禁用不构成冲突（禁用规则无运行时占用）",
 			candidates: []ruleConflictCandidate{
 				{name: "http-enabled", protocol: "http", domain: "shop.example.test", listenPort: 80, enabled: true},
 				{name: "http-disabled-legacy", protocol: "http", domain: "shop.example.test", listenPort: 80, enabled: false, enableTLS: true, tlsHTTPRedirect: true},
@@ -86,7 +86,7 @@ func TestValidateRuleConflictMatrix_reports_cross_rule_conflicts(t *testing.T) {
 			wantCount: 0,
 		},
 		{
-			name: "R31 C-1: 双方禁用同样不判定",
+			name: "双方禁用同样不判定",
 			candidates: []ruleConflictCandidate{
 				{name: "http-off-one", protocol: "http", domain: "off.example.test", listenPort: 8080, enabled: false},
 				{name: "http-off-two", protocol: "http", domain: "off.example.test", listenPort: 8080, enabled: false},

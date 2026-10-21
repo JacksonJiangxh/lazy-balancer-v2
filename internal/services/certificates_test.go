@@ -34,13 +34,13 @@ func resetCertificateServiceForTest(t *testing.T) {
 }
 
 func TestCanonicalACMEDomains_rejectsTrailingDot(t *testing.T) {
-	// The audit's 历史修复 example is not a valid alternate canonical form:
-	// the 历史修复 helper rejects it just like the SQL revival gate does.
+	// The audit's trailing-dot example is not a valid alternate canonical form:
+	// the single-source helper rejects it just like the SQL revival gate does.
 	if _, err := CanonicalACMEDomains("example.com."); err == nil {
 		t.Fatal("trailing-dot ACME domain must remain invalid")
 	}
 	// Regression: case, surrounding whitespace, and root/www ordering still
-	// canonicalize through the 历史修复 helper.
+	// canonicalize through the single-source helper.
 	got, err := CanonicalACMEDomains(" WWW.Example.COM , example.com ")
 	if err != nil {
 		t.Fatal(err)
@@ -148,7 +148,7 @@ func TestCreateOrRequeueCertJob_requeues_disabled_job_for_reenabled_rule(t *test
 
 func TestCreateOrRequeueCertJob_requeues_downloaded_job(t *testing.T) {
 	// Given：已部署（downloaded）任务——用户再次触发签发必须重新排队，
-	// 不能静默空转（历史修复 历史修复）
+	// 不能静默空转（历史修复）
 	_, database := newClusterTestService(t)
 	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source)
 		VALUES ('lb_downloaded','downloaded','downloaded.example','http',8443,1,1,'acme_dns');
@@ -284,7 +284,7 @@ func TestRequeueNonTerminalCertJobs_schedules_downloaded_deployment(t *testing.T
 }
 
 func TestRequeueNonTerminalCertJobs_skips_downloaded_job_missing_cert_material_when_paused(t *testing.T) {
-	// 历史问题 历史修复 起恢复排队走 EnqueueIfActive：暂停的队列管理器在 transition 之前
+	// 历史修复 起恢复排队走 EnqueueIfActive：暂停的队列管理器在 transition 之前
 	// 即拒绝（与 历史问题 PauseAndDrain 门控同语义），任务保持原状态等待下次恢复，
 	// 不写库、不入队、不报错。
 	// Given
@@ -425,10 +425,10 @@ func TestCertificateService_deployment_retry_deduplicates_job_id(t *testing.T) {
 }
 
 func TestCertificateService_scheduleDeploymentRetry_waits_for_inflight_callback_before_rescheduling(t *testing.T) {
-	// 历史问题 历史问题(a)：重试回调 C1 在途（Caddy reload 挂起超 30s 暂停等待上限）时，
+	// 历史问题(a)：重试回调 历史修复 在途（Caddy reload 挂起超 30s 暂停等待上限）时，
 	// Resume/Unblock 补扫会对同 jobID 重新 schedule——去重只查 pending timer
 	// （回调启动即自摘），不查在途回调，必然放行第二个并发回调部署同一证书。
-	// 不变量：同 jobID 永不并发部署——补扫必须取消并等待 C1 退出后才创建新
+	// 不变量：同 jobID 永不并发部署——补扫必须取消并等待 历史修复 退出后才创建新
 	// timer（串行重试，而非并发重试）。
 	// Given
 	service := NewCertificateService()
@@ -456,7 +456,7 @@ func TestCertificateService_scheduleDeploymentRetry_waits_for_inflight_callback_
 		close(rescheduled)
 	}()
 
-	// When：C1 在途期间补扫重排
+	// When：历史修复 在途期间补扫重排
 	// Then：不得返回、不得放行第二个并发回调
 	select {
 	case <-rescheduled:
@@ -470,7 +470,7 @@ func TestCertificateService_scheduleDeploymentRetry_waits_for_inflight_callback_
 	}
 	close(release)
 
-	// C1 退出后重排完成，新 timer 触发第二个回调（与 C1 串行）
+	// 历史修复 退出后重排完成，新 timer 触发第二个回调（与 历史修复 串行）
 	<-rescheduled
 	if jobID := <-calls; jobID != 42 {
 		t.Fatalf("rescheduled retry job ID=%d, want 42", jobID)
@@ -518,7 +518,7 @@ func TestCertificateService_cancelDeploymentRetry_waits_for_running_callback(t *
 }
 
 func TestCertificateService_cancelDeploymentRetry_boundedWaitOnStuckCallback(t *testing.T) {
-	// 历史问题 发现3：回调链条调到非 历史修复 的 caddyReloader，Caddy admin 异常
+	// 历史问题 发现3：回调链条调到非 context-aware 的 caddyReloader，Caddy admin 异常
 	// 挂起时 HTTP 调用方必须能在 cancelWaitTimeout 内返回，不能永久阻塞。
 	service := NewCertificateService()
 	resetCertificateServiceForTest(t)
@@ -645,7 +645,7 @@ func TestSetActiveCertificateService_preservesStoppedTasks(t *testing.T) {
 		te.StopLoop(id)
 	}
 
-	// When：历史修复 就绪触发 active 注入。
+	// When：cert-issuance 就绪触发 active 注入。
 	SetActiveCertificateService(NewCertificateService())
 
 	// Then：只能重置已开启任务的节拍，不得重新打开用户停止的调度或执行 Run。
@@ -1004,7 +1004,7 @@ func TestCertificateService_requeueWaitingCAJobs_pause_after_scan_start_leaves_j
 	GetCAQueueManager().Start()
 	manager := GetCAQueueManager()
 	t.Cleanup(ResetCAQueueManagerForTest)
-	// 历史修复 历史修复 起 requeue 守卫要求任务仍被启用中的 acme_dns TLS 规则引用，
+	// 历史修复 起 requeue 守卫要求任务仍被启用中的 acme_dns TLS 规则引用，
 	// 否则按孤儿转 disabled，不会进入 EnqueueIfActive 钩子路径。
 	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source) VALUES ('lb_pause_scan','lb_pause_scan','example.com','http',8080,1,1,'acme_dns')`); err != nil {
 		t.Fatalf("seed rule: %v", err)
@@ -1087,7 +1087,7 @@ func TestRequeueNonTerminalCertJobs_disables_jobs_outside_acme_rule_gate(t *test
 	}
 }
 
-// N+12 G1：恢复循环内任一任务的 CAS 冲突（快照 SELECT 后并发写入方迁移了
+// 历史修复：恢复循环内任一任务的 CAS 冲突（快照 SELECT 后并发写入方迁移了
 // 状态）不得中止整个循环——冲突任务由并发写入方收尾，其后任务照常恢复，
 // 与 sweepOrphanedCertJobs/requeueWaitingCAJobs 的冲突语义同型（creating_*/
 // downloading 状态无周期巡检救援，中止即滞留到下次重启）。
@@ -1135,10 +1135,10 @@ func TestRequeueNonTerminalCertJobs_continues_past_disable_transition_conflict(t
 	}
 }
 
-// N+12 G1：同上——"检测到已有有效证书"转 issued 的恢复转换（第二处 return
+// 历史修复：同上——"检测到已有有效证书"转 issued 的恢复转换（第二处 return
 // 站点）同样不得因单任务 CAS 冲突中止循环。
 func TestRequeueNonTerminalCertJobs_continues_past_existing_cert_transition_conflict(t *testing.T) {
-	// Given：job 2 在途（creating_order）且携带 90 天有效证书（历史修复 恢复
+	// Given：job 2 在途（creating_order）且携带 90 天有效证书（valid-cert 恢复
 	// 优化适用）；job 1 的部署重试回调先把它并发置为 failed，job 2 转 issued
 	// 即 CAS 冲突；job 3 为冲突后的对照任务。
 	_, database := newClusterTestService(t)
@@ -1517,7 +1517,7 @@ func TestRestoreCertJobs_skips_when_rule_recreated_with_different_domain(t *test
 	}
 }
 
-// 历史问题 历史修复 放弃语义的直接覆盖（历史问题 历史修复 + 历史问题 历史修复）：requeueCertJobsSnapshot 的
+// 历史修复 放弃语义的直接覆盖（历史修复 + 历史修复）：requeueCertJobsSnapshot 的
 // 四个跳过分支——规则行 ErrNoRows、规则 disabled/非 acme_dns、快照任务域名与规则
 // 当前域名时代不符、规则域名不可规范化（导入产生的非法 ACME 域）——均必须按成功
 // 收尾（返回 nil）且零入队。任一退化为返回错误都会
@@ -1622,7 +1622,7 @@ func TestRequeueCertJobsSnapshot_giveUpSemantics(t *testing.T) {
 		// Given：导入产生的非法 ACME 域规则（3 域——导入校验不验 ACME 域合法性，
 		// 仅保存侧校验）。该规则本就无法重排队（createOrRequeue 同样拒绝非法域），
 		// canonicalize 失败必须与 ErrNoRows/禁用分支同为放弃语义——返回错误会把
-		// 补偿拖入永久退避循环且租约永不释放（历史问题 历史修复）。
+		// 补偿拖入永久退避循环且租约永不释放（历史修复）。
 		_, database := newClusterTestService(t)
 		const ruleID = "lb_requeue_badacme"
 		snapshot := seedRuleAndJob(t, database, ruleID, "a.example.com,b.example.com,c.example.com", 1)
@@ -1636,7 +1636,7 @@ func TestRequeueCertJobsSnapshot_giveUpSemantics(t *testing.T) {
 	})
 }
 
-// N+8 补偿重排队路径必须在入队前把在途快照任务落库为 'queued'。快照保留
+// 历史修复 补偿重排队路径必须在入队前把在途快照任务落库为 'queued'。快照保留
 // 快照时刻的在途状态（waiting_ca/creating_order/validating 等），不归一化直接入队
 // 会让 provider 失效 drain 的 queuedJobStillExists 复核因 status≠'queued' 跳过
 // failJob，任务滞留队列外直到重启。
@@ -1939,7 +1939,7 @@ func TestCertificateService_resumeDeploymentRetries_reschedulesDroppedRetries(t 
 	service.resumeDeploymentRetries()
 
 	// Then：材料齐全且规则适用的任务被重排——窗口已过的 A 以 delay=0 立即，
-	// 窗口在未来的 B 以剩余等待 delay 重排（历史问题 历史修复，与启动恢复同口径，
+	// 窗口在未来的 B 以剩余等待 delay 重排（历史修复，与启动恢复同口径，
 	// 不再静默丢弃至重启）；缺材料的 C 与规则已删除的 D 仍不重排。
 	if len(scheduled) != 2 || scheduled[0] != 1 || scheduled[1] != 2 {
 		t.Fatalf("scheduled=%v, want jobs 1 and 2", scheduled)
@@ -1985,7 +1985,7 @@ func seedRequeueMaterialFixture(t *testing.T, domain, seedStatus, certPEM, keyPE
 		active:       true,
 		blockedRules: map[string]map[RuleBlockToken]struct{}{ruleID: {1: {}}},
 	}
-	// 预置 stub 执行队列（loop 在跑、executeFn 历史修复）：避免真实 Issue 执行触网，
+	// 预置 stub 执行队列（loop 在跑、executeFn no-op）：避免真实 Issue 执行触网，
 	// 也保证执行不写库——补偿路径自身的状态转换就是被测对象。
 	queue := newCAQueue(models.CAProvider{ID: 7, MaxConcurrent: 1}, func() error { return nil })
 	queue.executeFn = func(context.Context, queueItem, models.CAProvider) error { return nil }
@@ -2004,7 +2004,7 @@ func seedRequeueMaterialFixture(t *testing.T, domain, seedStatus, certPEM, keyPE
 	return database, snapshot, manager, jobID, &statusAtEnqueue
 }
 
-// N+9 历史问题：N+8（2b68044a）为 requeueCertJobsSnapshot 引入「downloaded+材料保持
+// 历史问题：历史修复（2b68044a）为 requeueCertJobsSnapshot 引入「downloaded+材料保持
 // 原状态直接入队」例外分支时，只补了无材料在途任务的归一化测试，例外分支本身
 // 缺直接测试。锁定：downloaded+材料的快照任务入队时刻与入队后均保持 'downloaded'
 // （Issue 快速路径重部署），不得被归一化为 'queued' 触发整轮重签（丢弃已签发证书）。
@@ -2032,12 +2032,12 @@ func TestRequeueCertJobsSnapshot_downloaded_with_material_stays_fast_path(t *tes
 	}
 }
 
-// N+9 历史问题：部署生命周期（cleanup_dns/cleanup_warning）+ 材料在身的快照任务同样
+// 历史问题：部署生命周期（cleanup_dns/cleanup_warning）+ 材料在身的快照任务同样
 // 只差部署——材料已落库、证书已签发（retryCertificateDeployment 从这些状态装载
 // 材料即为证）。补偿重排队必须归一化为 'downloaded' 走 Issue 快速路径重部署，
 // 不得转 'queued' 整轮重签（浪费 CA 配额并丢弃有效证书）。
 // 'queued'+材料为负对照：历史修复（历史）确立 queued 是显式重签请求
-// （RetryCertJob 全量重签 历史修复，材料为上轮残留），补偿不得借材料例外吞掉。
+// （RetryCertJob 全量重签 BY-DESIGN，材料为上轮残留），补偿不得借材料例外吞掉。
 func TestRequeueCertJobsSnapshot_deploy_stage_with_material_redeploys_not_reissues(t *testing.T) {
 	for _, tc := range []struct {
 		name, seedStatus, wantStatus string
@@ -2085,9 +2085,9 @@ func TestRequeueCertJobsSnapshot_deploy_stage_with_material_redeploys_not_reissu
 	}
 }
 
-// N+9 历史问题：referenced CA provider 不可用（禁用/删除且无 enabled 回退）时，
+// 历史问题：referenced CA provider 不可用（禁用/删除且无 enabled 回退）时，
 // enqueueCompensation→enqueueLocked 已同步 failJob（任务置 failed + job 日志 +
-// 审计——现有 历史修复/audit 通道即最终处置）。补偿不得把该错误上抛：否则
+// 审计——现有 job-status/audit 通道即最终处置）。补偿不得把该错误上抛：否则
 // StartRuleDeletionCompensation 的退避循环永久重试（每轮 restore 复活 failed 行
 // 再重新失败 + 问题 日志噪声），且规则租约（blockedRules）永不释放——该规则
 // 的所有证书操作（EnqueueIfActive）持续 409。语义：provider 不可用按「该任务
@@ -2140,7 +2140,7 @@ func TestCompensateRuleDeletion_provider_unavailable_fails_job_and_releases_leas
 	if manager.IsRuleBlocked(ruleID) {
 		t.Fatal("rule lease still held after compensation, want released")
 	}
-	// Then 3：任务经现有 历史修复/audit 通道定局为 failed + 明确归因
+	// Then 3：任务经现有 job-status/audit 通道定局为 failed + 明确归因
 	var status, message string
 	var attempts int
 	if err := database.QueryRow("SELECT status, COALESCE(message,''), COALESCE(renewal_attempts,0) FROM cert_jobs WHERE id=?", jobID).Scan(&status, &message, &attempts); err != nil {
@@ -2405,7 +2405,7 @@ func TestCertIssuer_deploymentFailed_persistsMaterial(t *testing.T) {
 }
 
 // 历史问题-03（历史）：续期扫描 Run 体不消费 rc.Ctx（SetRole 取消等价
-// 历史修复），入口角色检查只做一次——demote 落在最长 6h 扫描/多任务候选窗口时，
+// no-op），入口角色检查只做一次——demote 落在最长 6h 扫描/多任务候选窗口时，
 // 循环会在队列停止前继续入队（已入队签发要跑完 ACME 才被角色检查拦下，白烧
 // CA 配额）。逐任务入队前必须用同一 SQL 口径复核角色。
 func TestRenewalScanRechecksRoleBeforeEachEnqueue(t *testing.T) {
@@ -2466,9 +2466,9 @@ func TestRenewalScanRechecksRoleBeforeEachEnqueue(t *testing.T) {
 	}
 }
 
-// ---- 历史（SV历史问题）----
+// ---- 历史（历史问题）----
 
-// SV历史问题：续期扫描把达上限 waiting_ca 转 failed 时，必须与
+// 历史问题：续期扫描把达上限 waiting_ca 转 failed 时，必须与
 // markJobWaitingCA 上限分支同字段集清理冷却时间与 429 错误码。
 func TestRenewalScan_capped_waiting_ca_failure_clears_cooldown_fields(t *testing.T) {
 	_, database := newClusterTestService(t)
@@ -2673,7 +2673,7 @@ func TestRequeueCertJobsSnapshot_provider_unavailable_keeps_deployment_only_job_
 	}
 }
 
-// 历史修复/5 联动：restore 的行级 epoch 守卫保留了快照后的签发成果（行已推进为
+// 历史修复联动：restore 的行级 epoch 守卫保留了快照后的签发成果（行已推进为
 // downloaded 并携带新材料），补偿重排队必须按当前行判定——仍按快照状态会把刚签发
 // 完成的任务转 'queued' 触发整轮重签（丢弃有效证书、白烧 CA 配额）。
 func TestRequeueCertJobsSnapshot_uses_live_state_for_preserved_rows(t *testing.T) {

@@ -60,7 +60,7 @@ func TestSecurityTimingID_length(t *testing.T) {
 	}
 }
 
-// PLUG-R1（历史 历史问题）：security_timing_pre/end 两 ServeHTTP 逐字重复收敛为
+// 历史修复（历史）：security_timing_pre/end 两 ServeHTTP 逐字重复收敛为
 // recordSecurityTiming helper——钉 helper 契约：合法头对写一段注册表耗时，
 // 缺头对零写入（静默降级语义不变）。
 func TestRecordSecurityTiming_writesRegistrySegment(t *testing.T) {
@@ -179,7 +179,7 @@ func TestSecurityTimingEnd_recordsEndSegmentFromAnchor(t *testing.T) {
 	}
 }
 
-// E81-历史问题：挂钟回拨/异常起始头（未来时刻）产生的负时长不得注入审计行——
+// 历史问题：挂钟回拨/异常起始头（未来时刻）产生的负时长不得注入审计行——
 // 耗时下限钳 0（0µs 是合法计时值）。
 func TestRecordSecurityTiming_negativeClampedToZero(t *testing.T) {
 	useTestTimingRegistry(t)
@@ -210,7 +210,7 @@ func auditTimingEntriesSnapshotForTest(t *testing.T) map[string]*auditTimingEntr
 	return out
 }
 
-// 历史修复 历史问题（历史）：计时 ID 是注册表 key，客户端可对无 counter 的
+// 历史问题（历史）：计时 ID 是注册表 key，客户端可对无 counter 的
 // 路由伪造任意头值灌入注册表（内存 DoS）。recordSecurityTiming 只接受与
 // 服务端 securityTimingID 同形态的 16 字符 hex ID，其余一律静默忽略。
 func TestRecordSecurityTiming_rejectsForgedID(t *testing.T) {

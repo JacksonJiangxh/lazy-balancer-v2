@@ -37,7 +37,7 @@ func overrideWafPathsForServicesTest(t *testing.T) (crsDir, xdbPath string) {
 	return crsDir, xdbPath
 }
 
-// SVC-80-D1-02：driver.Rows.Next 的非 EOF 错误只能经 rows.Err 观测。
+// 历史修复：driver.Rows.Next 的非 EOF 错误只能经 rows.Err 观测。
 // 已应用哈希读到部分结果时必须回退全量重放，不得把截断视图当完整记录。
 func TestReadAppliedSectionHashes_iterationErrorDropsPartialView(t *testing.T) {
 	fake := sql.OpenDB(&fakeIterErrConnector{failNeedle: "FROM cluster_applied_sections"})
@@ -217,7 +217,7 @@ func TestDriftGuardSectionHashes_usersIncludesGlobalSettings(t *testing.T) {
 // 三分类合并·方案A(2026-09-19 裁定):文件态记账落 global_config 专用列
 // (applied_waf_ref_hash/applied_waf_ref_version,哈希域=纯 ref 含版本标签),
 // cluster_applied_sections 严格 3 行与 syncSections 同构——wafFilesDrifted
-// 的 304 兜底重拉与 历史问题 A-#4 标签自愈依赖该记录;随安全防护开关写入/冻结。
+// 的 304 兜底重拉与 历史问题 标签自愈依赖该记录;随安全防护开关写入/冻结。
 func TestRecordAppliedSectionHashes_wafFilesBookkeepingFollowsSecuritySwitch(t *testing.T) {
 	_, database := newClusterTestService(t)
 	snapshot := models.ClusterSnapshot{Version: 9, WafFiles: &models.ClusterWafFilesRef{CRSSha256: "abc", CRSVersion: "v9"}}
@@ -352,7 +352,7 @@ func oldBuildSecuritySectionHash(t *testing.T, service *ClusterService, database
 }
 
 func TestRecordAppliedSectionHashes_driftedSectionStoresLocalRebuiltHash(t *testing.T) {
-	// Given：E3 历史问题 混合版本循环场景——新构建从节点（COALESCE 口径）对旧构建
+	// Given：历史修复问题 混合版本循环场景——新构建从节点（COALESCE 口径）对旧构建
 	// 主节点（裸列口径）。本地 security_policies 在 COALESCE 列上含 NULL。
 	service, database := newClusterTestService(t)
 	ctx := context.Background()
@@ -409,15 +409,15 @@ func TestRecordAppliedSectionHashes_sameBuildDriftedChoiceImmaterial(t *testing.
 	}
 }
 
-// N+12 历史问题/历史问题 处置证据：从节点 apply 期归一化（历史问题 B1 双默认页降级）造成
+// 历史问题 处置证据：从节点 apply 期归一化（历史问题 双默认页降级）造成
 // 本地重建哈希与主节点快照哈希持久分歧时，同步周期必须收敛到稳态 304——
 // 首轮 changed 路径落快照侧哈希 h → 下一 304 周期漂移判定触发一次补偿全量
-// 重拉 → 漂移重放后 E3 历史问题 drifted 分支落本地重建哈希 lh → 此后
+// 重拉 → 漂移重放后 历史修复问题 drifted 分支落本地重建哈希 lh → 此后
 // local==applied 不再触发漂移。锁定「无每周期 ping-pong」不变式；残余成本
 // （每个主节点版本递增一次补偿周期）见上方裁定，接受为已知边界。
 func TestSectionSyncCycle_normalizationDivergenceConvergesAfterOneDriftCycle(t *testing.T) {
-	// Given：pre-历史问题 形态主节点快照——security 节携带两个 is_default=1 拦截页；
-	// 从节点 apply 后 历史问题 B1 降级仅保留 MIN(id)，本地重建哈希与快照侧持久分歧。
+	// Given：历史问题 形态主节点快照——security 节携带两个 is_default=1 拦截页；
+	// 从节点 apply 后 历史问题 降级仅保留 MIN(id)，本地重建哈希与快照侧持久分歧。
 	service, database := newClusterTestService(t)
 	ctx := context.Background()
 	for _, page := range []struct {
@@ -453,7 +453,7 @@ func TestSectionSyncCycle_normalizationDivergenceConvergesAfterOneDriftCycle(t *
 	master.Version = 5
 	master.SectionHashes = ComputeSnapshotSectionHashes(&master)
 	snapshotHash := master.SectionHashes["security"]
-	// 从节点落库 + 历史问题 B1 降级（cluster_apply.go applySecurityBlockPages 同语句）：
+	// 从节点落库 + 历史问题 降级（cluster_apply.go applySecurityBlockPages 同语句）：
 	if _, err := database.Exec(`UPDATE security_block_pages SET is_default=0 WHERE is_default=1 AND id != (SELECT MIN(id) FROM security_block_pages WHERE is_default=1)`); err != nil {
 		t.Fatal(err)
 	}

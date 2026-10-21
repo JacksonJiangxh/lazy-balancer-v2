@@ -87,7 +87,7 @@ func New(loginToken string) *Provider {
 	}
 }
 
-// Present creates a distinct _历史修复 TXT record (no upsert): a repeated
+// Present creates a distinct _acme-challenge TXT record (no upsert): a repeated
 // Present for the same name adds another record, and cleanup removes records by
 // ownership record ID / value (历史修复，历史).
 func (p *Provider) Present(ctx context.Context, zone, tokenFQDN, value string, ttl int) error {
@@ -147,7 +147,7 @@ func (p *Provider) Present(ctx context.Context, zone, tokenFQDN, value string, t
 	return nil
 }
 
-// CleanUp removes the _历史修复 TXT record.
+// CleanUp removes the _acme-challenge TXT record.
 func (p *Provider) CleanUp(ctx context.Context, zone, tokenFQDN string) error {
 	return p.cleanUp(ctx, zone, tokenFQDN, "", false)
 }
@@ -164,7 +164,7 @@ func (p *Provider) CleanUpValue(ctx context.Context, zone, tokenFQDN, value stri
 // 历史修复（历史登记）：本函数与 internal/dnsprovider/tencent/tencent.go 的
 // cleanUp 是同构双实现（有意保留——两者底层 SDK/记录 ID 类型不同，抽象共享
 // 收益低于耦合成本）。任一侧修改删除/自愈/兜底排空逻辑时，MUST 同步另一侧
-// 并保持语义一致（历史修复 自愈、ownership 条目留存、历史修复 兜底排空）。
+// 并保持语义一致（domain-id 自愈、ownership 条目留存、历史修复 兜底排空）。
 func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, byValue bool) error {
 	zone = strings.TrimSuffix(zone, ".")
 	subDomain := strings.TrimSuffix(tokenFQDN, ".")
@@ -268,7 +268,7 @@ func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, b
 			// 历史修复 independence: a record whose deletion failed keeps
 			// its ownership entry (the DNS record may still exist), but an
 			// earlier miss must not skip Remove for records that WERE
-			// deleted — that orphans them until 历史修复.
+			// deleted — that orphans them until self-heal.
 			if deleteOne(record.RecordID, record.Value) != nil {
 				continue
 			}
@@ -361,7 +361,7 @@ func (n *flexNumber) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// Int64 尽力解析；缺失/不可解析时返回 0（历史补充轮 历史问题 注释如实化：
+// Int64 尽力解析；缺失/不可解析时返回 0（历史 历史问题 注释如实化：
 // 调用处的翻页终止实际由 len(domains)==0 独立兜底，total=0 永不命中
 // total>0 分支——0 值语义是「不参与判定」而非「未知总量」）。
 func (n flexNumber) Int64() int64 {

@@ -39,7 +39,7 @@ const staleOwnershipAge = 75 * time.Minute
 var fileMu sync.Mutex
 
 // AcquireFileLockForTest exposes the package lock's contention boundary to
-// 历史修复 tests proving callers use the same writer. Production code must
+// cross-package tests proving callers use the same writer. Production code must
 // never call it; the returned release must be called exactly once.
 func AcquireFileLockForTest() func() {
 	fileMu.Lock()
@@ -201,12 +201,12 @@ func (s *Store) Matching(provider, zone, fqdn string) ([]Record, error) {
 	return matching, nil
 }
 
-// MatchingValue returns the 历史修复 records that a cleanup for one
+// MatchingValue returns the name-matching records that a cleanup for one
 // challenge value may remove: the record created with that value, legacy
-// entries persisted before value tracking (empty Value, 历史修复), and
+// entries persisted before value tracking (empty Value, best-effort), and
 // provably stale entries. A recent record of another value may belong to a
 // live concurrent issuance and is spared. An empty value disables the value
-// filter (legacy 历史修复 matching).
+// filter (legacy name-based matching).
 func (s *Store) MatchingValue(provider, zone, fqdn, value string) ([]Record, error) {
 	if value == "" {
 		return s.Matching(provider, zone, fqdn)
@@ -238,7 +238,7 @@ func (s *Store) MatchingValue(provider, zone, fqdn, value string) ([]Record, err
 // sameRecord 语义相等（历史问题，历史）：Record 结构内联 == 比较含
 // time.Time（wall/ext/loc 指针 + monotonic）——从文件读回经 Matching/
 // MatchingValue 得到的记录与调用方持有的原值逻辑时间相同，但 == 可能为
-// false（JSON 解码丢弃 monotonic、loc 指针不同），Remove 静默 历史修复 留下
+// false（JSON 解码丢弃 monotonic、loc 指针不同），Remove 静默 no-op 留下
 // 未清理记录。CreatedAt 用 Equal，其余字段逐项比较。
 func sameRecord(a, b Record) bool {
 	// Account 纳入相等判定：同一 name/value/record_id 但
@@ -280,9 +280,9 @@ func (s *Store) load() (state, error) {
 		decodeErr = fmt.Errorf("unsupported DNS ownership version %d", current.Version)
 	}
 	if decodeErr != nil {
-		// The ownership file is a 历史修复 cache: quarantine the bad bytes
+		// The ownership file is a best-effort cache: quarantine the bad bytes
 		// instead of failing every later Add/Matching/Remove (which would
-		// brick all 历史修复 issuance) until manual deletion. The quarantined
+		// brick all DNS-01 issuance) until manual deletion. The quarantined
 		// file stays on disk for inspection; only a failed quarantine (bytes
 		// not preserved) keeps returning the error.
 		// 历史修复（历史）：文件名原为秒级时间戳，同一秒内二次损坏会被
@@ -303,7 +303,7 @@ func (s *Store) load() (state, error) {
 var corruptClock = time.Now
 
 // quarantinePath 返回一个未被占用的隔离文件名：纳秒时间戳为基底，冲突时追加
-// 递增序号（os.Stat 探测为 历史修复，命中竞态时由 Rename 的覆盖语义兜底，
+// 递增序号（os.Stat 探测为 best-effort，命中竞态时由 Rename 的覆盖语义兜底，
 // 仅为取证样本，不参与业务判定）。
 func (s *Store) quarantinePath() string {
 	stamp := corruptClock().UnixNano()
@@ -341,7 +341,7 @@ func (s *Store) writeAtomic(data []byte) error {
 		return fmt.Errorf("write DNS ownership: %w", errors.Join(err, file.Close()))
 	}
 	// fsync before the rename so a crash never swaps in an empty or
-	// 历史修复 file (same durability contract as certstore.go /
+	// half-written file (same durability contract as certstore.go /
 	// cluster_apply.go)
 	if err := file.Sync(); err != nil {
 		return fmt.Errorf("sync DNS ownership: %w", errors.Join(err, file.Close()))

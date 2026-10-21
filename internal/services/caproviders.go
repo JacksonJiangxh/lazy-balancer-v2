@@ -30,8 +30,8 @@ const (
 // zerosslEABURL 是包级变量以便测试注入伪 ZeroSSL 端点。
 var zerosslEABURL = "https://api.zerossl.com/acme/eab-credentials-email"
 
-// zerosslEABProvisionTimeout 是 CA 测试路径 EAB 自动获取的超时上界（N+13
-// H3-S），包级变量以便测试注入缩短时限。
+// zerosslEABProvisionTimeout 是 CA 测试路径 EAB 自动获取的超时上界（历史修复）；
+// 包级变量以便测试注入缩短时限。
 var zerosslEABProvisionTimeout = 10 * time.Second
 
 type caProviderScanner interface {
@@ -69,8 +69,8 @@ func NewCAProviderService(dataDir ...string) *CAProviderService {
 // ListCAProviders returns all CA providers with actual credentials.
 // CA 凭证（含 ZeroSSL EAB）对全体登录用户明文可读为 2026-09-05 用户裁定口径
 // （所有登录用户至少全局只读、内部可信）；勿按 DNS 凭证掩码口径「修复」——
-// DNS 掩码（历史问题 D4）与 CA 明文并存是有意差异。
-// CERT-R1（历史）：列表直接返回 []models.CAProvider，删除与模型 1:1
+// DNS 掩码（历史问题）与 CA 明文并存是有意差异。
+// 历史修复（历史）：列表直接返回 []models.CAProvider，删除与模型 1:1
 // 同形的 CAProviderListItem 拷贝层（无脱敏/投影价值；JSON 键完全同形，
 // 唯一差异=credentials 空串时省略键，前端 parseCACredentials 对 falsy 兼容）。
 func (s *CAProviderService) ListCAProviders() ([]models.CAProvider, error) {
@@ -96,7 +96,7 @@ func (s *CAProviderService) ListCAProviders() ([]models.CAProvider, error) {
 
 // GetCAProvider returns a CA provider by ID, including credentials.
 // 凭证明文可读口径同 ListCAProviders：2026-09-05 用户裁定，全员可读、仅
-// admin 可写（写侧收敛见路由分组），与 DNS 凭证掩码（历史问题 D4）为有意差异。
+// admin 可写（写侧收敛见路由分组），与 DNS 凭证掩码（历史问题）为有意差异。
 func (s *CAProviderService) GetCAProvider(id int) (models.CAProvider, error) {
 	var p models.CAProvider
 	err := scanCAProvider(db.DB.QueryRow("SELECT "+caProviderColumns+" FROM ca_providers WHERE id=?", id), &p)
@@ -143,7 +143,7 @@ var ErrCAProviderMinIntervalTooHigh = errors.New("min_interval_ms must be <= 600
 var ErrCAProviderInUse = errors.New("CA 提供商正被启用中的 ACME 规则引用")
 
 // ErrCAProviderDefault：当前默认 CA 提供商不得禁用（否则 0 值引用/未显式
-// 选择 CA 的规则会在下次签发时静默改派，历史 历史问题-2）。
+// 选择 CA 的规则会在下次签发时静默改派，历史问题-2）。
 var ErrCAProviderDefault = errors.New("默认 CA 提供商不能禁用，请先切换默认提供商")
 
 // CAProviderInUseError 携带引用明细，供 handler 回显 409 文案（列表最多 5 条，
@@ -203,7 +203,7 @@ func caProviderReferences(tx *sql.Tx, providerID int) ([]string, int, error) {
 }
 
 // UpdateCAProvider updates a CA provider and returns the pre-update row as read
-// inside the same transaction (CERT-N1, 历史：调用方（handler 审计 changed
+// inside the same transaction (历史修复, 历史：调用方（handler 审计 changed
 // 清单）以事务内旧行为比对基线，消除「事务外预读 → 事务提交」窗口内并发
 // 写入导致的清单失真）。Returns ErrCAProviderNotFound if no rows were affected.
 func (s *CAProviderService) UpdateCAProvider(id int, req models.UpdateCAProviderRequest) (models.CAProvider, error) {
@@ -221,7 +221,7 @@ func (s *CAProviderService) UpdateCAProvider(id int, req models.UpdateCAProvider
 		}
 		return models.CAProvider{}, err
 	}
-	// CERT-N1：事务内旧行快照——existing 就地应用 req 变更后用于写库，
+	// 历史修复：事务内旧行快照——existing 就地应用 req 变更后用于写库，
 	// old 保持 SELECT 读到的原值供调用方做审计比对。
 	old := existing
 	if req.Name != nil {
@@ -230,8 +230,8 @@ func (s *CAProviderService) UpdateCAProvider(id int, req models.UpdateCAProvider
 	if req.Provider != nil {
 		existing.Provider = *req.Provider
 	}
-	// DirectoryURL 非用户可写字段（历史问题 历史问题：任何取值都被官方固定 URL 覆写，
-	// 历史 F2/F6 裁定删除死参数与审计失真源）。
+	// DirectoryURL 非用户可写字段（历史问题：任何取值都被官方固定 URL 覆写，
+	// 历史修复 裁定删除死参数与审计失真源）。
 	if req.Credentials != nil {
 		existing.Credentials = *req.Credentials
 	}
@@ -261,7 +261,7 @@ func (s *CAProviderService) UpdateCAProvider(id int, req models.UpdateCAProvider
 		return models.CAProvider{}, ErrCAProviderNameTooLong
 	}
 
-	// CERT-N2（历史）：LE 分支前移到 JSON 门之前——LE 凭证本就必须为空，
+	// 历史修复（历史）：LE 分支前移到 JSON 门之前——LE 凭证本就必须为空，
 	// 纯空白输入（用户清空 EAB 字段的残留）此前在 JSON 门被「凭证必须是有效
 	// 的 JSON」拒绝，永远无法保存；现在归一为空串落库（前端 parseCACredentials
 	// 对空串走 falsy 分支）。非 LE 提供商仍走完整 JSON 门。
@@ -293,7 +293,7 @@ func (s *CAProviderService) UpdateCAProvider(id int, req models.UpdateCAProvider
 		return models.CAProvider{}, ErrCAProviderMinIntervalTooHigh
 	}
 
-	// CERT-L1（历史）：「最后一个启用」守卫收敛进 UPDATE 的 WHERE 子查询——
+	// 历史修复（历史）：「最后一个启用」守卫收敛进 UPDATE 的 WHERE 子查询——
 	// 旧形态为 check-then-act（COUNT 读 + 裸 UPDATE 两句分置），守卫判定与写入不原子，
 	// 并发禁用仅剩的两个启用提供商时存在同穿窗口；原子形态下守卫在写锁内求值，
 	// 后提交者恒 0 行 → ErrCAProviderLastEnabled，不再依赖 _txlock=immediate 的
@@ -302,7 +302,7 @@ func (s *CAProviderService) UpdateCAProvider(id int, req models.UpdateCAProvider
 	// 历史问题-04：禁用引用守卫与 DNS 配置禁用同口径（失败即 409，点名引用方）。
 	// 放在事务内、UPDATE 之前：与写锁同事务，判定与写入原子。
 	if disabling {
-		// SV历史问题：默认提供商守卫不得 fail-open——读失败时此前静默跳过守卫，
+		// 历史问题：默认提供商守卫不得 fail-open——读失败时此前静默跳过守卫，
 		// 只剩「最后一个启用」兜底，可禁用当前默认提供商，令 ca_provider_id=0
 		// 的规则/未显式选择 CA 的规则在下次签发时静默改派。行缺失（ErrNoRows）
 		// 语义=未配置默认提供商（无守卫对象），DB 读故障则显性失败（fail-closed）。
@@ -397,7 +397,7 @@ func AutoProvisionZeroSSLEAB(ctx context.Context, provider *models.CAProvider) e
 	}
 	httpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	// 历史 B1: http.DefaultClient 无超时，ZeroSSL API 卡住会永久阻塞签发 worker。
+	// 历史 历史修复: http.DefaultClient 无超时，ZeroSSL API 卡住会永久阻塞签发 worker。
 	// 显式指定 30 秒超时兜底，与 ctx 取消形成双重保护。
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(httpReq)
@@ -443,7 +443,7 @@ func AutoProvisionZeroSSLEAB(ctx context.Context, provider *models.CAProvider) e
 			return fmt.Errorf("re-read zerossl EAB credentials: %w", err)
 		}
 		provider.Credentials = persisted
-		// SV历史问题：DB 凭据已被并发写入者改变——同样递增配置版本，令队列缓存的
+		// 历史问题：DB 凭据已被并发写入者改变——同样递增配置版本，令队列缓存的
 		// provider 快照（可能仍持空 EAB）按新凭据刷新，避免每个后续任务再请求
 		// 一次 ZeroSSL API（虽有 CAS 兜底，但外部调用重复且无谓）。
 		caProviderConfigVersion.Add(1)
@@ -451,7 +451,7 @@ func AutoProvisionZeroSSLEAB(ctx context.Context, provider *models.CAProvider) e
 		return nil
 	}
 	provider.Credentials = string(credsJSON)
-	// SV历史问题：EAB 落库后递增配置版本（与 UpdateCAProvider 同口径）——队列
+	// 历史问题：EAB 落库后递增配置版本（与 UpdateCAProvider 同口径）——队列
 	// 积压时缓存的 provider 快照仍持空 EAB，纯版本失效即可避免签发前再次
 	// 请求 ZeroSSL API；CAS 兜底只保证正确性、不消除这次外部调用。
 	caProviderConfigVersion.Add(1)
@@ -508,7 +508,7 @@ func (s *CAProviderService) TestCAProviderWithContext(ctx context.Context, id in
 
 	if p.Provider == ProviderZeroSSL {
 		Logf("info", "TestCAProvider: ensuring ZeroSSL EAB for provider %d", id)
-		// N+13 H3-S：EAB 自动获取与 RegisterAccount 同界 10s——原实现先无界
+		// 历史修复：EAB 自动获取与 RegisterAccount 同界 10s——原实现先无界
 		// 调用 AutoProvisionZeroSSLEAB、超时只裹其后的注册，ZeroSSL EAB API
 		// 挂起时 CA 测试页无限阻塞。
 		eabCtx, eabCancel := context.WithTimeout(ctx, zerosslEABProvisionTimeout)

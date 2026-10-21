@@ -51,7 +51,7 @@ func TestBecomeSlave_reopensPullAdmissionWhenTopologyWriteFails(t *testing.T) {
 }
 
 // Promote 失败路径（排干成功 + 提交失败）必须重开准入——原实现
-// 依赖「失败后重启 历史修复 → startLocked 重开」的隐式链，当用户此前关闭
+// 依赖「失败后重启 cluster-sync → startLocked 重开」的隐式链，当用户此前关闭
 // 调度或引擎缺失时准入永久关闭，从节点「立即同步」被静默拒绝。
 func TestPromote_reopensPullAdmissionOnCommitFailure(t *testing.T) {
 	service, database := newClusterTestService(t)
@@ -271,7 +271,7 @@ func TestCertificateService_StopWithoutStartReturns(t *testing.T) {
 }
 
 // 队列活动态由 历史修复 守护派生——初始化即停止；未启动时
-// 入队必须是无迁移的 历史修复（从节点/用户停调度后重启不得留下半启动子系统）。
+// 入队必须是无迁移的 no-op（从节点/用户停调度后重启不得留下半启动子系统）。
 func TestCAQueueManager_inactiveUntilDaemonStarts(t *testing.T) {
 	newClusterTestService(t)
 	ResetCAQueueManagerForTest()
@@ -544,7 +544,7 @@ func TestIPListTempFileName_forms(t *testing.T) {
 }
 
 // 角色读取单源语义——主/从/读失败（读失败返回错误，由调用方决定
-// 历史修复/closed；nil 库返回错误而非 panic）。
+// fail-open/closed；nil 库返回错误而非 panic）。
 func TestRoleOf_masterSlaveAndReadFailure(t *testing.T) {
 	_, database := newClusterTestService(t)
 	if role, err := RoleOf(context.Background(), database); err != nil || !role {

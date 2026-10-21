@@ -1,6 +1,6 @@
 package services
 
-// D1（历史·R74C）：自动封禁六列集群传播四段接线钉测——
+// 历史修复（历史）：自动封禁六列集群传播四段接线钉测——
 //   ①主端快照恒携带六列（指针非 nil+线格式六键，镜像 历史问题 自动备份组）；
 //   ②快照携带时从端 apply 落库；③旧主端快照缺席（全 nil）时从端保留本地值；
 //   ④主端保存（列变化）→ OF 触发器 bump（middleware 侧钉）→ 快照 → 从端收敛；
@@ -168,7 +168,7 @@ func TestClusterSync_autobanColumnsPropagate(t *testing.T) {
 }
 
 // 升主后调度恢复：从节点启动时未启用（调度未开）→ 主端快照把 autoban_enabled=1
-// 落到从端库（配置传播，D1 前四段）→ 升主。Promote 尾部必须按 AutobanEnabled()
+// 落到从端库（配置传播，历史修复 前四段）→ 升主。Promote 尾部必须按 AutobanEnabled()
 // 重开 autoban 调度——否则库值已启用而 loop 永不开（静默停摆）。
 func TestClusterService_Promote_resumesAutobanScheduling(t *testing.T) {
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB

@@ -8,7 +8,7 @@ import (
 	"lazy-balancer-v2/internal/models"
 )
 
-// W2：security_ip_lists 随 security 节同步——快照携带列表行与策略 refs 列，
+// 历史修复：security_ip_lists 随 security 节同步——快照携带列表行与策略 refs 列，
 // 全量替换语义下从节点忠实复制，策略引用端到端存活。
 func TestClusterSnapshot_securityIPListsRoundTrip(t *testing.T) {
 	// Given
@@ -83,7 +83,7 @@ func TestClusterSnapshot_securityIPListsRoundTrip(t *testing.T) {
 	}
 }
 
-// W2：security 节哈希必须感知 security_ip_lists 行变化——列表条目更新后
+// 历史修复：security 节哈希必须感知 security_ip_lists 行变化——列表条目更新后
 // 节哈希变化，从节点据此前置触发 security 节重放（而非依赖策略行变动）。
 func TestClusterSnapshot_securitySectionHashTracksIPLists(t *testing.T) {
 	// Given
@@ -116,7 +116,7 @@ func TestClusterSnapshot_securitySectionHashTracksIPLists(t *testing.T) {
 	}
 }
 
-// W2：空 SecurityIPLists 载荷的全量替换语义——主节点清空列表后从节点同步删除。
+// 历史修复：空 SecurityIPLists 载荷的全量替换语义——主节点清空列表后从节点同步删除。
 func TestApplySnapshot_emptySecurityIPListsDeletesRows(t *testing.T) {
 	// Given
 	_, database := newClusterTestService(t)

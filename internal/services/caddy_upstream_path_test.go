@@ -202,7 +202,7 @@ func TestGenerateHTTPRouteObjects_upstreamPathEmpty_chainByteIdenticalWithLegacy
 	}
 }
 
-// 历史 历史问题-8：前缀匹配的 upstream_path 尾斜杠会与剥前缀后的原 URI（以 / 开头）
+// 历史问题-8：前缀匹配的 upstream_path 尾斜杠会与剥前缀后的原 URI（以 / 开头）
 // 拼成双斜杠（`/v1/` + `/users` = `/v1//users`）——Go ServeMux 会 301 清洗、
 // 严格框架（Spring strict 等）404。校验侧允许尾斜杠（仅要求前导 / 且无空白?#），
 // 故渲染侧前缀分支拼接前须剥尾斜杠（精确匹配整体替换分支不受影响：其尾斜杠有语义）。

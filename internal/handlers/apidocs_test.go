@@ -271,7 +271,7 @@ func TestBuildOpenAPIYAML_wraps_business_examples_and_documents_exceptions(t *te
 			Description string `yaml:"description"`
 			Responses   map[string]struct {
 				Content map[string]struct {
-					// 历史问题(C1):/auth/oidc/login|callback 等跳转端点经
+					// 历史问题(历史修复):/auth/oidc/login|callback 等跳转端点经
 					// rawResponse 暴露裸字符串示例(302 形态),示例不再恒为
 					// 对象——本测试只对 /config 的对象形状断言。
 					Example any `yaml:"example"`
@@ -347,13 +347,13 @@ func TestAPIDocRoutes_document_validation_and_error_statuses(t *testing.T) {
 	}
 }
 
-// 历史问题/APIMCP41-3/APIMCP41-4(历史文档漂移转正)绊线:
+// 历史问题(历史文档漂移转正)绊线:
 // export 去不可达 413(GET 无请求体);download 补 428(mfaStepUpGuard GET 特例,
 // middleware.go:886-887);import 响应登记 data.summary/disabled_conflicts/warnings
 // (warnings 为软跳过/会话吊销/ACME 悬挂等警告的唯一机器可读出口);promote 描述
 // 对齐实现(不调 BumpClusterVersion,启动自动备份调度器);/mcp/tools 登记
 // read_only 字段语义(HTTP 语义只读,不代表只读 Key 可见性)。
-func TestAPIDocRoutes_A85L6V1ImportQueuePartialContract(t *testing.T) {
+func TestAPIDocRoutes_importQueuePartialContract(t *testing.T) {
 	routes := make(map[string]apiDocRoute, len(apiDocRoutes))
 	for _, route := range apiDocRoutes {
 		routes[route.Method+" "+route.Path] = route
@@ -372,7 +372,7 @@ func TestAPIDocRoutes_A85L6V1ImportQueuePartialContract(t *testing.T) {
 	}
 }
 
-func TestAPIDocRoutes_round41_documentation_contracts(t *testing.T) {
+func TestAPIDocRoutes_documentationContracts(t *testing.T) {
 	routes := make(map[string]apiDocRoute, len(apiDocRoutes))
 	for _, route := range apiDocRoutes {
 		routes[route.Method+" "+route.Path] = route
@@ -416,7 +416,7 @@ func TestAPIDocRoutes_round41_documentation_contracts(t *testing.T) {
 	}
 	// 历史问题（历史）：test_certificate_config 会写 DNS TXT 验证记录，
 	// 已移出只读探测集——对只读 Key 不可见（工具保留给管理员）。
-	// U04a2-历史问题（历史）：test_ca_provider 同理移出（ZeroSSL 缺 EAB 时
+	// 历史问题（历史）：test_ca_provider 同理移出（ZeroSSL 缺 EAB 时
 	// 会真实写 ca_providers.credentials）。
 	specs := mcpserver.ListToolSpecs()
 	if len(specs) == 0 {
@@ -680,7 +680,7 @@ func containsRouteError(errors []string, status string) bool {
 	return false
 }
 
-// 历史问题(C1)+历史问题(C2)+API历史修复(C7):OIDC 公开契约登记、lbbak 导出形态、
+// 历史问题(历史修复)+历史问题(历史修复)+历史修复(历史修复):OIDC 公开契约登记、lbbak 导出形态、
 // validate 128MB 上限与 settings/oidc 重试契约的文档漂移绊线。
 func TestBuildOpenAPIYAML_documents_oidc_public_lbbak_and_retry_contracts(t *testing.T) {
 	// Given
@@ -705,7 +705,7 @@ func TestBuildOpenAPIYAML_documents_oidc_public_lbbak_and_retry_contracts(t *tes
 		t.Fatalf("parse generated OpenAPI YAML: %v", err)
 	}
 
-	// C1:三条公开 OIDC 路由(登录页探测/授权跳转/回调)不得误标 bearerAuth。
+	// 历史修复:三条公开 OIDC 路由(登录页探测/授权跳转/回调)不得误标 bearerAuth。
 	for _, operation := range []struct {
 		path   string
 		method string
@@ -716,7 +716,7 @@ func TestBuildOpenAPIYAML_documents_oidc_public_lbbak_and_retry_contracts(t *tes
 		}
 	}
 
-	// C2①③:导出恒为 lbbak tar.gz(application/gzip),sections query 可选分类;
+	// 历史修复①③:导出恒为 lbbak tar.gz(application/gzip),sections query 可选分类;
 	// 描述不得再宣称「下载 JSON 备份文件」。
 	export := document.Paths["/config/export"]["get"]
 	if _, exists := export.Responses["200"].Content["application/gzip"]; !exists {
@@ -735,7 +735,7 @@ func TestBuildOpenAPIYAML_documents_oidc_public_lbbak_and_retry_contracts(t *tes
 		t.Errorf("C2: /config/export description=%q, want lbbak tar.gz form", export.Description)
 	}
 
-	// C2②:validate 上限与错误码按 128MB 实现口径(maxConfigImportBytes=128<<20)。
+	// 历史修复②:validate 上限与错误码按 128MB 实现口径(maxConfigImportBytes=128<<20)。
 	validate := routesEntry(t, "POST /config/import/validate")
 	if !strings.Contains(validate.Description, "128MB") || !containsRouteError(validate.Errors, "413") {
 		t.Errorf("C2: validate description=%q errors=%v, want 128MB limit text and 413 error", validate.Description, validate.Errors)
@@ -745,13 +745,13 @@ func TestBuildOpenAPIYAML_documents_oidc_public_lbbak_and_retry_contracts(t *tes
 			t.Errorf("C2: validate error %q retains stale 16 MiB limit", routeError)
 		}
 	}
-	// C2③:import 端点描述须覆盖二进制 lbbak 形态(tar.gz 而非仅 JSON)。
+	// 历史修复③:import 端点描述须覆盖二进制 lbbak 形态(tar.gz 而非仅 JSON)。
 	imp := routesEntry(t, "POST /config/import")
 	if !strings.Contains(imp.Description, "lbbak") {
 		t.Errorf("C2: /config/import description=%q, want binary lbbak form documented", imp.Description)
 	}
 
-	// C7:settings/oidc 三键重试契约(PUT/DELETE 幂等可重试,POST test 读探测可重试)。
+	// 历史修复:settings/oidc 三键重试契约(PUT/DELETE 幂等可重试,POST test 读探测可重试)。
 	for _, operation := range []struct {
 		path   string
 		method string
@@ -771,7 +771,7 @@ func TestBuildOpenAPIYAML_documents_oidc_public_lbbak_and_retry_contracts(t *tes
 			t.Errorf("C7: %s %s description=%q lacks retry contract", operation.method, operation.path, description)
 		}
 	}
-	// C7:回调错误表补 404 oidc_disabled/502 discovery;PUT 示例补 display_name。
+	// 历史修复:回调错误表补 404 oidc_disabled/502 discovery;PUT 示例补 display_name。
 	callback := routesEntry(t, "GET /auth/oidc/callback")
 	if !containsRouteError(callback.Errors, "404") || !containsRouteError(callback.Errors, "502") {
 		t.Errorf("C7: callback errors=%v, want 404 oidc_disabled and 502 discovery", callback.Errors)
@@ -793,7 +793,7 @@ func routesEntry(t *testing.T, key string) apiDocRoute {
 	return apiDocRoute{}
 }
 
-// APIMCP-A2（历史）：任务 ID 是 "threat"/"cert-job:5" 等字符串——OpenAPI
+// 历史修复（历史）：任务 ID 是 "threat"/"cert-job:5" 等字符串——OpenAPI
 // 对 /system/tasks/{id} 族六个端点的路径参数必须保留 type: string（与其余
 // 数字 :id 路由的 integer 判定分流）；MCP 侧同参数一直正确标 string，两侧
 // 此前自相矛盾。
@@ -881,8 +881,8 @@ func TestAPIDocs_threatScreenExampleKeysMatchImplementation(t *testing.T) {
 	}
 }
 
-// B2-历史问题（历史）：OpenAPI 总述的敏感材料可见性必须与实现同口径——
-// TLS 私钥（rules.go 历史问题）与 DNS 凭证（certificates.go 历史问题 D4）对非管理员
+// 历史问题（历史）：OpenAPI 总述的敏感材料可见性必须与实现同口径——
+// TLS 私钥（rules.go 历史问题）与 DNS 凭证（certificates.go 历史问题）对非管理员
 // 与只读 API Key 一律掩码，总述不得再声称「对所有已登录用户可读」。
 func TestBuildOpenAPIYAML_descriptionMatchesCredentialMasking(t *testing.T) {
 	openAPI := buildOpenAPIYAML()
@@ -905,7 +905,7 @@ func TestBuildOpenAPIYAML_descriptionMatchesCredentialMasking(t *testing.T) {
 	}
 }
 
-// 历史问题（历史 历史问题）：GET /certificates/jobs 的文档示例曾写成裸数组，
+// 历史问题（历史）：GET /certificates/jobs 的文档示例曾写成裸数组，
 // documentedResponse 会把它包成 data:[...]，与实现的 data.list/total/page/
 // page_size/status_counts 对象分叉——按文档生成 SDK/脚本的消费方解析必失败。
 // 钉测直接调用真实 handler 取 data 顶层键集，与 apiDocRoutes 示例双向比对。

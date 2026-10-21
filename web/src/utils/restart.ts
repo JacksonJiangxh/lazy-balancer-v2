@@ -1,21 +1,21 @@
 import { request, mfaAwareSuccess } from '@/utils/api'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
-// W1：POST /system/restart 返回后固定等 10s 再 reload 与容器冷启动时长无契约——
+// 历史修复：POST /system/restart 返回后固定等 10s 再 reload 与容器冷启动时长无契约——
 // 冷启动（DB 迁移/CRS 对账/Caddy 启动）超过 10s 时 reload 命中连接拒绝，落入浏览器原生错误页。
 // 改为每 2s 静默轮询 /caddy/status，服务就绪（任意 200 响应）即触发 reload；
 // 超过 60s 上限提示手动刷新。isDisposed 供组件卸载时提前终止轮询（不触发 reload/提示）。
 export const reloadAfterRestart = async (isDisposed?: () => boolean): Promise<boolean> => {
   const deadline = Date.now() + 60_000
   // 不用 Promise.withResolvers（Safari 17.4+/Chrome 119+）：旧浏览器会在
-  // 重启成功后抛错，导致页面永不刷新（历史 历史问题-3）。
+  // 重启成功后抛错，导致页面永不刷新（历史问题-3）。
   const sleep = (ms: number): Promise<void> => new Promise<void>((resolve) => setTimeout(resolve, ms))
   while (Date.now() < deadline) {
     await sleep(2000)
     if (isDisposed?.()) return false
     try {
       await request.get('/caddy/status', { silent: true })
-      // A85WB-历史问题：状态请求在途期间组件可能已卸载——reload 前复查，
+      // 历史修复：状态请求在途期间组件可能已卸载——reload 前复查，
       // 兑现「isDisposed 提前终止轮询（不触发 reload）」契约。
       if (isDisposed?.()) return false
       window.location.reload()
@@ -40,7 +40,7 @@ export interface RestartServiceOptions {
 }
 
 /**
- * 重启服务统一流程（历史问题-F10）：确认 → POST /system/restart → 成功提示 →
+ * 重启服务统一流程（历史问题）：确认 → POST /system/restart → 成功提示 →
  * 就绪轮询 reload。此前 AppLayout（漂移恢复）与 BasicSettings（设置页）逐字
  * 重复同一流程，仅确认文案不同——任一入口改文案/错误处理都易漏改另一入口。
  *

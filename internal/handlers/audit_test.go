@@ -10,7 +10,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// A-1(2026-09-10 审计):recordAudit 优先读中间件注入的 audit_ip(内部 MCP
+// 历史修复(2026-09-10 审计):recordAudit 优先读中间件注入的 audit_ip(内部 MCP
 // 转发请求的真实客户端 IP,经 constant-time 采信头),缺省回退 c.ClientIP()。
 // 此前 handler 审计路径全部 127.0.0.1。
 func TestRecordAudit_prefersContextAuditIP(t *testing.T) {
@@ -24,7 +24,7 @@ func TestRecordAudit_prefersContextAuditIP(t *testing.T) {
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
-		// B1-07（历史）：同步复位 currentDB，后台循环不得持有已关闭测试库
+		// 历史修复（历史）：同步复位 currentDB，后台循环不得持有已关闭测试库
 		db.SetDB(oldDB)
 	})
 	gin.SetMode(gin.TestMode)

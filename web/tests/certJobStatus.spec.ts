@@ -21,7 +21,7 @@ test('历史问题-04：缺失或畸形时间戳维持既有 fail-open 边界', 
   assert.equal(certJobRetryReady(120, 'not-a-date', now), true)
 })
 
-// WS-19：状态 label/tone 全表覆盖后端 db.certJobStatuses（26 态，DB CHECK 单源）。
+// 历史修复：状态 label/tone 全表覆盖后端 db.certJobStatuses（26 态，DB CHECK 单源）。
 // 前端枚举漂移会静默落入 unknown 分支（标签显示原始 token、tone 退 info），
 // 且无任何用例会失败——本条把两侧声明对表。
 test('WS-19：证书任务状态枚举覆盖后端 db.certJobStatuses 全 26 态', () => {

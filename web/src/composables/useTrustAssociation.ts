@@ -74,7 +74,7 @@ export const useTrustAssociation = (options: {
   /** 单击动作：把 IP 加入策略指定侧的列表（自动解析/创建目标列表并关联） */
   const ensureListAndJoin = async (policy: TrustPolicyLike, ip: string, side: ListSide): Promise<void> => {
     const cfg = SIDE_CONFIG[side]
-    // 历史 F5：单数 resolveSideList 已删（唯一内部消费点内联为 plural 首项）
+    // 历史修复：单数 resolveSideList 已删（唯一内部消费点内联为 plural 首项）
     const existing = resolveSideLists(policy, side)[0] ?? null
     if (existing) {
       const opt: IpListOption = { id: existing.id, name: existing.name, entry_count: 0 }
@@ -88,7 +88,7 @@ export const useTrustAssociation = (options: {
     const lead = parseRefIds(policy[cfg.refField]).length === 0
       ? `策略「${policy.name}」尚未关联${cfg.verb}用地址列表`
       : `策略「${policy.name}」同侧仅关联系统内置名单（快捷处置不直接操作系统名单）`
-    // A85WB-历史问题：确认框弹出前即占位——双击不再叠两个确认框/重复创建
+    // 历史修复：确认框弹出前即占位——双击不再叠两个确认框/重复创建
     // （原 creating 在 confirm 之后才置位）。
     if (creating.value) return
     creating.value = true
@@ -102,7 +102,7 @@ export const useTrustAssociation = (options: {
       } catch {
         return
       }
-      // 历史 历史问题：同侧已有同名未引用列表（历史创建后解绑）时复用而非
+      // 历史问题：同侧已有同名未引用列表（历史创建后解绑）时复用而非
       // 重复创建——按名称在现有列表中查找（category 无关，仅看名字精确相等）。
       const wantName = `${policy.name}${cfg.suffix}`
       const sameName = options.getList().find((l) => l.name === wantName && !l.system)
@@ -140,7 +140,7 @@ export const useTrustAssociation = (options: {
 
   /** 从引用列表移除 IP（关联保留） */
   const removeFromSideRef = async (list: TrustListRef, ip: string): Promise<void> => {
-    // A85WB-历史问题：确认框弹出前即占位（双击重入锁）
+    // 历史修复：确认框弹出前即占位（双击重入锁）
     if (creating.value) return
     creating.value = true
     try {

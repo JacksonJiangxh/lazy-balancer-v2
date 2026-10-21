@@ -144,7 +144,7 @@ func TestConfigWatchdog_slaveSkipsWholeRound(t *testing.T) {
 }
 
 func TestConfigWatchdog_subRoutesBelongToParentRule(t *testing.T) {
-	// Given：运行配置含子路由 @id（lb_x_redirect / lb_x_path_0）——历史问题 历史修复 误报场景
+	// Given：运行配置含子路由 @id（lb_x_redirect / lb_x_path_0）——历史修复 误报场景
 	_, database := newClusterTestService(t)
 	seedGenerationRule(t, database, "lb_watchdog_sub", false)
 	resetConfigWatchdogForTest(t)
@@ -282,8 +282,8 @@ func TestConfigWatchdog_heartbeatRetainsSkippedCountAcrossCleanWindow(t *testing
 		WatchdogCheckOnce()
 	}
 
-	// Then the public 历史修复 counter is zero, while the heartbeat's
-	// independent 历史修复 window still reports the skipped round.
+	// Then the public since-last-check counter is zero, while the heartbeat's
+	// independent since-last-heartbeat window still reports the skipped round.
 	if drift := CurrentConfigDrift(); drift.SkippedRounds != 0 {
 		t.Fatalf("status skipped rounds=%d, want 0 after real checks", drift.SkippedRounds)
 	}
@@ -434,7 +434,7 @@ func TestConfigWatchdog_successfulCheckResetsSkippedRounds(t *testing.T) {
 	WatchdogCheckOnce()
 
 	// Then the counter defined as "since the last real check" returns to zero,
-	// while the successful round still advances the 历史修复 window.
+	// while the successful round still advances the clean-round window.
 	if drift := CurrentConfigDrift(); drift.SkippedRounds != 0 {
 		t.Fatalf("skipped rounds after real consistent check=%d, want 0", drift.SkippedRounds)
 	}
@@ -445,7 +445,7 @@ func TestConfigWatchdog_successfulCheckResetsSkippedRounds(t *testing.T) {
 		t.Fatalf("clean rounds=%d, want 1", cleanRounds)
 	}
 
-	// And a later skipped round is counted from this new 历史修复 boundary.
+	// And a later skipped round is counted from this new real-check boundary.
 	watchdogAdminURLValue = "http://127.0.0.1:1"
 	WatchdogCheckOnce()
 	if drift := CurrentConfigDrift(); drift.SkippedRounds != 1 {

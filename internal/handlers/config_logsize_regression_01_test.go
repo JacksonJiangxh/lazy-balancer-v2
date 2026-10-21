@@ -11,7 +11,7 @@ import (
 
 // 下限,无上限——天文值落库使轮转实效、日志无限增长(caddy_log_size_mb 已在
 // (2026-09-25 用户裁定：上限由 10240 收窄为 1024——10240 过宽、1024 合理,
-// 前后端同口径;LB42-4 当时注释自称「UI :max=10240」先于现实。)
+// 前后端同口径;历史修复 当时注释自称「UI :max=10240」先于现实。)
 func TestUpdateConfig_rejectsExcessiveLogSizeMB(t *testing.T) {
 	// Given
 	handler := newBackupTestHandlers(t)

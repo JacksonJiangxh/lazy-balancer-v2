@@ -14,7 +14,7 @@ import (
 )
 
 // SelectRuleCertificate 未选中时直接报「ACME 证书尚未签发或不存在」——
-// 单规则路径(CERT40-1)已有「候选全过期按 expired 呈现」回退,批量端点缺
+// 单规则路径(历史修复)已有「候选全过期按 expired 呈现」回退,批量端点缺
 // 同型回退,同一规则在两个端点的过期呈现不一致。修复:共享 helper 两路径同用。
 func TestGetRulesCertInfo_reportsExpiredACMECandidate(t *testing.T) {
 	// Given:acme_dns 规则 + cert_jobs 候选 PEM 非空但已过期(不可选中)

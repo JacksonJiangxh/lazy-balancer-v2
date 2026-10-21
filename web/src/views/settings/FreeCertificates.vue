@@ -253,7 +253,7 @@ import DialogHeader from '@/components/DialogHeader.vue'
 import { credentialFieldVisible, credentialOptionLabel, defaultCredentialsFor, type CredentialFieldMeta } from '@/utils/dnsProviderFields'
 import type { APIResponse } from '@/types'
 
-// WS-13：字段可见性/选项文案由后端元数据驱动（visible_when/option_labels），
+// 历史修复：字段可见性/选项文案由后端元数据驱动（visible_when/option_labels），
 // 不再按 dnspod 的两种认证模式在前端硬编码字段名。
 type CredentialField = CredentialFieldMeta
 
@@ -308,7 +308,7 @@ const authStore = useAuthStore()
 const isReadOnly = computed(() => authStore.readOnlyReason !== null)
 
 const global = defineModel<GlobalCertificateConfig>('global', { required: true })
-// A85历史问题-C：父级 /config 加载完成前禁止保存——表单此刻仍是默认值，补填
+// 历史问题：父级 /config 加载完成前禁止保存——表单此刻仍是默认值，补填
 // 邮箱后保存会把 30/30/5/dnspod 等默认续签参数静默覆盖已定制值。
 // 与 BasicSettings/CaddyGlobalSettings 同一 configLoaded 契约。
 const props = defineProps<{ configLoaded: boolean }>()
@@ -316,13 +316,13 @@ const emit = defineEmits<{
   (e: 'save'): void
 }>()
 
-// 两个独立表单的保存态（历史 历史问题）：原共用一个 saving——任一保存
+// 两个独立表单的保存态（历史问题）：原共用一个 saving——任一保存
 // 期间另一表单的按钮/弹框被连带禁用。CA 提供商历来独立（savingCA）。
 const savingGlobal = ref(false)
 const savingConfig = ref(false)
 const configs = ref<CertConfig[]>([])
 const providers = ref<DNSProvider[]>([])
-// 历史问题-F5：证书配置/DNS 提供商/CA 提供商加载失败显性化（原仅 console，
+// 历史问题：证书配置/DNS 提供商/CA 提供商加载失败显性化（原仅 console，
 // 空列表与真实无数据不可区分）——聚合为单条横幅 + 重试。
 const configsError = ref(false)
 const providersError = ref(false)
@@ -351,7 +351,7 @@ const isTesting = computed(() => testingId.value !== null || testingCAId.value !
 const caDialogVisible = ref(false)
 const savingCA = ref(false)
 const editingCAProvider = ref<CAProvider | null>(null)
-// WS-12：表单副本不再携带 credentials——凭证经 caCreds（EAB 键对）单独编辑，
+// 历史修复：表单副本不再携带 credentials——凭证经 caCreds（EAB 键对）单独编辑，
 // 保存载荷按 provider 计算；原 `credentials: '{}'` 全文件零读取，误导读者以为
 // 表单凭证来源。（CAProvider.credentials 仍用于列表行解析，保留。）
 const caForm = reactive<Omit<CAProvider, 'credentials'>>({
@@ -373,7 +373,7 @@ const enabledCAProviders = computed(() => caProviders.value.filter(p => p.enable
 const selectedProvider = computed(() => providers.value.find(p => p.code === form.value.dns_provider))
 const authMode = computed(() => form.value.dns_credentials['auth_mode'] || '')
 
-// WS-13：可见性完全由后端元数据（visible_when）决定——新增 provider 的字段
+// 历史修复：可见性完全由后端元数据（visible_when）决定——新增 provider 的字段
 // 不会被隐藏，也不再依赖 dnspod 的字段名。
 const shouldShowField = (field: CredentialField) => credentialFieldVisible(field, form.value.dns_credentials)
 
@@ -478,7 +478,7 @@ const closeCADialog = (): void => {
 }
 
 const saveCAProvider = async () => {
-  // WS-11：写动作函数级守卫（弹框打开期间角色/节点模式可能变化）
+  // 历史修复：写动作函数级守卫（弹框打开期间角色/节点模式可能变化）
   if (isReadOnly.value || savingCA.value) return
 
   savingCA.value = true
@@ -509,7 +509,7 @@ const saveCAProvider = async () => {
 }
 
 const testCAProvider = async (p: CAProvider) => {
-  // WS-11：测试会真实申请 EAB（写 ca_providers.credentials），属写操作
+  // 历史修复：测试会真实申请 EAB（写 ca_providers.credentials），属写操作
   if (isReadOnly.value || isTesting.value) return
   testingCAId.value = p.id
   try {
@@ -556,7 +556,7 @@ const openConfigDialog = (config?: CertConfig) => {
     form.value = {
       name: '',
       dns_provider: providers.value[0]?.code || 'dnspod',
-      // WS-13：默认凭证由 provider 的 select 字段首个选项派生（不再写死 auth_mode）
+      // 历史修复：默认凭证由 provider 的 select 字段首个选项派生（不再写死 auth_mode）
       dns_credentials: defaultCredentialsFor(providers.value[0]?.credential_fields ?? []),
       enabled: true,
     }
@@ -573,7 +573,7 @@ const closeConfigDialog = (): void => {
 }
 
 const saveConfig = async () => {
-  // WS-11：写动作函数级守卫
+  // 历史修复：写动作函数级守卫
   if (isReadOnly.value || savingConfig.value) return
   const targetId = editingId.value
   const payload = {
@@ -597,7 +597,7 @@ const saveConfig = async () => {
   try {
     // 编辑保存前测试：表单凭证含全掩码 ***（非 admin GET 回显、用户未改）时仍测
     // DB 存量（:id/test）；用户实际改过凭证（无 ***）则内联新凭证走无 id 的 /test
-    // A85WA-历史问题：当前面板恒 admin JWT（GET 回显明文）且只读用户打不开本弹框，
+    // 历史修复：当前面板恒 admin JWT（GET 回显明文）且只读用户打不开本弹框，
     // 掩码回传分支在 UI 内不可达——保留作为非 UI 客户端（API Key/只读通道拿到
     // 掩码值直接回传）的防御路径；该分支只验证库中原值，不验证表单改动。
     const hasMaskedCred = Object.values(payload.dns_credentials).some(v => v === '***')
@@ -631,7 +631,7 @@ const saveConfig = async () => {
 }
 
 const deleteConfig = async (config: CertConfig) => {
-  // WS-11：savingConfig 在途时不得删除（保存 = test → PUT 两步，删除会让第二步
+  // 历史修复：savingConfig 在途时不得删除（保存 = test → PUT 两步，删除会让第二步
   // 打向已不存在的 id）；deletingId 防重入照旧。
   if (isReadOnly.value || savingConfig.value || deletingId.value !== null) return
   const configId = config.id
@@ -681,7 +681,7 @@ const promptTestDomain = async (isSave = false): Promise<string | null> => {
 }
 
 const testConfig = async (config: CertConfig) => {
-  // WS-11：测试会真实 Present+CleanUp DNS TXT（后端已移出只读豁免），属写操作
+  // 历史修复：测试会真实 Present+CleanUp DNS TXT（后端已移出只读豁免），属写操作
   if (isReadOnly.value || isTesting.value || !config.id) return
   testingId.value = config.id
   try {
@@ -758,7 +758,7 @@ onMounted(() => {
 </script>
 
 <style scoped>
-/* .cred-divider 并入 .section-divider（FE-R2，历史：同值双类合并） */
+/* .cred-divider 并入 .section-divider（历史修复，历史：同值双类合并） */
 .section-divider { margin: 24px 0 20px; }
 .section-divider :deep(.el-divider__text) { font-size: 14px; color: var(--text-secondary, #6b7280); font-weight: 600; }
 .lb-form :deep(.el-form-item) { margin-bottom: 18px; }

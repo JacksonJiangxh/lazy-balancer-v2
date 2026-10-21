@@ -17,21 +17,21 @@ const (
 	securityEventsRetentionDefaultMax  = db.DefaultSecurityEventsRowCap // 2026-09-14 用户裁定:10 万→100 万(索引全覆盖,无查询性能影响)
 	// securityEventsRetentionDeleteBatch 是年龄裁剪与 count 超限裁剪共用的单批
 	// 删除行数（历史问题 E 起年龄裁剪亦按此批次执行，同口径）：大批量单语句 DELETE
-	// 会长时间持指标库写锁，阻塞摄取 tick（历史问题 F9）。
+	// 会长时间持指标库写锁，阻塞摄取 tick（历史问题）。
 	// v2.3.8 批次上调（100/s 压力设计：摊销删除吞吐翻四倍，批间让写锁）
 	securityEventsRetentionDeleteBatch = 20000
 )
 
 // ThreatRollupEventHighwaterPrefix 分钟事件高水位键前缀（单源）：写入侧=大屏
 // rollup 固化（handlers 包引用本常量），清理侧=保留任务按同一 rollupCutoff
-// 删除——两处不得各自硬编码（A83A-历史问题 历史：写入存在而清理缺失）。
+// 删除——两处不得各自硬编码（历史问题：写入存在而清理缺失）。
 const ThreatRollupEventHighwaterPrefix = "threat_rollup_max_event_id:"
 
 // SecurityEventsRetentionSnapshot 一次读取策略并返回（面板摘要, 行数上限）：
 // 日志统计面板同一响应内需同时展示两项，历史修复（历史）收敛为单次
 // global_config 点查（此前 Summary 与 Max 各读一遍同一条 SQL）。
 // 历史修复（历史）：摘要必须同时表达 Days 与 Max 双口径——cleanup
-// 按 历史修复 裁剪，只写「保留 N 天」会让行帽提前裁剪的用户可见文案与实际
+// 按 count-max 裁剪，只写「保留 N 天」会让行帽提前裁剪的用户可见文案与实际
 // 行为漂移（securityEventsRetentionPolicy 本就 Days+Max 双口径）。
 func SecurityEventsRetentionSnapshot() (string, int) {
 	policy := securityEventsRetentionPolicyFromDB()
@@ -82,14 +82,14 @@ func securityEventsRetentionSettings() (days, max int) {
 // securityEventsRetentionCleanup deletes events older than the configured
 // retention window, then trims the oldest rows while the table still holds
 // more rows than the configured maximum. The DB handle is captured locally so
-// a concurrent test teardown (db.DB = nil) cannot 历史修复 历史修复.
+// a concurrent test teardown (db.DB = nil) cannot nil-deref mid-pass.
 // 历史问题：批间让出写锁的等待同时检查 ctx——Stop（cancel 后等待 worker 退出）
 // 得以在大批量首遍（如数据恢复后的百万行）中及时中止，不再被拖到 docker
 // SIGKILL 跳过 db.Close。
 // SecurityEventsRetentionCleanupCtxErr 单轮清理入口（导出面唯一形态）：任务体
 // 传 rc.Ctx（批间 ctx.Done() 分支才在生产可达，停机时百万行清理可及时中止，
 // 不拖过宽限期被 SIGKILL 跳过 db.Close/WAL 落盘），并返回本轮首个清理错误，
-// 供任务引擎把失败写进 task_runs（历史 历史问题-09）。
+// 供任务引擎把失败写进 task_runs（历史问题-09）。
 // 历史修复（历史）：Once（无 ctx 包装）与 Ctx（吞错误的 int 包装）全仓
 // 零调用，已删除——注释曾称「保留给测试/兼容调用」与事实不符。
 func SecurityEventsRetentionCleanupCtxErr(ctx context.Context) (int, error) {
@@ -104,7 +104,7 @@ func securityEventsRetentionCleanup(ctx context.Context) (int, error) {
 	days, max := securityEventsRetentionSettings()
 	total := 0
 	// 年龄裁剪同样分批执行（与 count 裁剪同口径）：大表单条 DELETE 长时间持
-	// 指标库写锁，阻塞摄取 tick（历史问题 E）。
+	// 指标库写锁，阻塞摄取 tick（历史问题）。
 	for {
 		res, err := database.Exec(`DELETE FROM security_events WHERE id IN (SELECT id FROM security_events WHERE event_time < datetime('now', printf('-%d days', ?)) ORDER BY id ASC LIMIT ?)`, days, securityEventsRetentionDeleteBatch)
 		if err != nil {
@@ -226,10 +226,10 @@ func securityEventsRetentionCleanup(ctx context.Context) (int, error) {
 	if targetDeleted > 0 {
 		Logf("info", "security events retention: target rollup cleanup removed %d rows older than %s", targetDeleted, rollupCutoff)
 	}
-	// A83A-历史问题（历史）：分钟事件高水位键 threat_rollup_max_event_id:<minute>
+	// 历史问题（历史）：分钟事件高水位键 threat_rollup_max_event_id:<minute>
 	// 与 rollup 同生命周期——此前每分钟一行常驻 metrics_state（约 1440 行/天、
 	// 52.5 万行/年），全仓无删除点。按同一 rollupCutoff 清理（键后缀为
-	// '历史修复 HH:MM' 同形态，字符串比较即时间序）。
+	// 'YYYY-MM-DD HH:MM' 同形态，字符串比较即时间序）。
 	highwaterDeleted := 0
 	for {
 		res, err := database.Exec(`DELETE FROM metrics_state WHERE key IN (

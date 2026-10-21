@@ -12,7 +12,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// U8a-历史问题（历史）：GET /metrics/history 无行数上限无分桶——默认配置
+// 历史问题（历史）：GET /metrics/history 无行数上限无分桶——默认配置
 // 7 天窗可达 ~2 万行（5s 间隔更甚）。修复=镜像 get_rule_metrics_history 的
 // 窗口函数分桶（每桶末行样本，≤720 桶上限）。
 

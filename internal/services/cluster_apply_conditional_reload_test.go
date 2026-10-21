@@ -1,6 +1,6 @@
 package services
 
-// F-历史问题-01（历史 历史问题）：从端 applySnapshot 尾段此前无条件
+// 历史问题-01（历史）：从端 applySnapshot 尾段此前无条件
 // CaddyOpLock{ApplyConfigForce}——主节点排程列/状态列等纯簿记变更（版本行
 // next_update/update_status/last_checked 族，不进节哈希，经
 // snapshotSecurityVersionRowsDiffer 差分门控重放） bump 快照版本后，从端渲染

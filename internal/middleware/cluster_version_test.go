@@ -46,7 +46,7 @@ func TestIsSynchronizedWrite_classifies_only_snapshot_content_mutations(t *testi
 		{"POST", "/api/v1/config/import/v1", true},
 		{"POST", "/api/v1/config/import/validate", false},
 		// 历史问题(历史评审):还原经 importConfigBackupCore 重写 lb_rules/
-		// upstreams 等全部同步表,必须与 /config/import 同口径 历史修复;
+		// upstreams 等全部同步表,必须与 /config/import 同口径 fail-closed;
 		// run/delete 仅写 auto_backups 本地簿记表(非同步表),不放行。
 		{"POST", "/api/v1/auto-backup/:id/restore", true},
 		{"POST", "/api/v1/auto-backup/7/restore", true},
@@ -59,8 +59,8 @@ func TestIsSynchronizedWrite_classifies_only_snapshot_content_mutations(t *testi
 		{"POST", "/api/v1/certificates/parse", false},
 		{"GET", "/api/v1/certificates/jobs/:id", false},
 		{"PUT", "/api/v1/ca-providers/:id", true},
-		// U04a2-历史问题（历史）：test 端点在 ZeroSSL 缺 EAB 时写
-		// ca_providers.credentials（同步表），与 PUT 同口径 历史修复。
+		// 历史问题（历史）：test 端点在 ZeroSSL 缺 EAB 时写
+		// ca_providers.credentials（同步表），与 PUT 同口径 fail-closed。
 		{"POST", "/api/v1/ca-providers/:id/test", true},
 		{"POST", "/api/v1/ca-providers/7/test", true},
 		{"POST", "/api/v1/certificate-configs", true},
@@ -84,7 +84,7 @@ func TestIsSynchronizedWrite_classifies_only_snapshot_content_mutations(t *testi
 		{"DELETE", "/api/v1/security/block-pages/:id", true},
 		{"PUT", "/api/v1/security/crs/auto-update", true},
 		{"POST", "/api/v1/security/crs/update", true},
-		// 手动任务触发可写版本表；整路由 历史修复，避免在中间件维护
+		// 手动任务触发可写版本表；整路由 fail-closed，避免在中间件维护
 		// 第二份任务 ID/同步写清单。其他任务操作不据此捕获。
 		{"POST", "/api/v1/system/tasks/:id/trigger", true},
 		{"POST", "/api/v1/system/tasks/:id/toggle", false},
@@ -95,9 +95,9 @@ func TestIsSynchronizedWrite_classifies_only_snapshot_content_mutations(t *testi
 		{"DELETE", "/api/v1/security/overview/threat-screen/collector", false},
 		{"GET", "/api/v1/security/policies", false},
 		{"GET", "/api/v1/security/custom-rules", false},
-		// 历史修复 登录锁传播（历史 历史问题-3）：密码登录与 MFA 验证步均写
+		// 历史修复 登录锁传播（历史问题-3）：密码登录与 MFA 验证步均写
 		// users 同步列（失败置锁 login_locked_until/成功清零解锁），触发器
-		// 不可用时须与 setup/OIDC 开户同口径 历史修复。
+		// 不可用时须与 setup/OIDC 开户同口径 fail-closed。
 		{"POST", "/api/v1/auth/login", true},
 		{"POST", "/api/v1/auth/mfa/verify", true},
 		// 票据登录不写 users 同步列（失败仅记审计）——不误伤从节点登录
@@ -261,7 +261,7 @@ func TestClusterVersionMiddleware_statementLevelAtomicityWithoutExplicitTx(t *te
 	}
 }
 
-// N+8 触发器安装失败时中间件必须按 {code,message} APIResponse 契约返回
+// 历史修复 触发器安装失败时中间件必须按 {code,message} APIResponse 契约返回
 // 500（此前是英文 gin.H{"error":...}，脱离 API 契约且未中文化）。
 func TestClusterVersionMiddleware_rejects_with_api_response_when_trigger_install_fails(t *testing.T) {
 	// Given：触发器安装失败（已关闭的连接让首次 Exec 报错）
@@ -1021,7 +1021,7 @@ func TestClusterVersionTrigger_brandingJSONBumps(t *testing.T) {
 	}
 }
 
-// S历史问题-1(历史):登录热路径同值写 login_locked_until(NULL→NULL、
+// 历史问题-1(历史):登录热路径同值写 login_locked_until(NULL→NULL、
 // CASE 保值)不得 bump——SQLite OF 触发器按 SET 列出现即触发,此前每次成功
 // 登录/失败尝试都引发全集群快照重放+从节点强制 Caddy 重载;真实置锁/解锁
 // 过渡(历史修复 锁传播)仍须 bump。
@@ -1122,7 +1122,7 @@ func TestClusterVersionTrigger_bumpsOnStagePageColumns(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 目标形状:仅写阶段页 4 列(历史修复 单事务 UPDATE 形态)必须 bump
+	// 目标形状:仅写阶段页 4 列(batch-block-pages 单事务 UPDATE 形态)必须 bump
 	if _, err := database.Exec(`UPDATE lb_rules SET block_page_stage1_id=7, block_page_stage1_status=403, block_page_stage3_id=8, block_page_stage3_status=503 WHERE caddy_id='lb_stage_of'`); err != nil {
 		t.Fatal(err)
 	}
@@ -1230,8 +1230,8 @@ func TestClusterVersionTriggers_bumpForTrustedProxyColumns(t *testing.T) {
 }
 
 // Given loginRateBuckets 已满 1024 桶（容量上限）。
-// When clusterRateLimit 命中新 IP（U6c-历史问题：曾建桶无检查——分布式攻击可推满
-// 共享 map 使登录限流对新源 历史修复）。
+// When clusterRateLimit 命中新 IP（历史问题：曾建桶无检查——分布式攻击可推满
+// 共享 map 使登录限流对新源 fail-open）。
 // Then LRU 淘汰最久未命中桶为新 IP 建桶：请求照常记账（历史问题-1 起不再放行
 // 不计数），map 规模保持上限。
 func TestClusterRateLimitRespectsBucketCap(t *testing.T) {
@@ -1319,7 +1319,7 @@ func TestClusterVersionTrigger_threatConsecutiveFailuresExcluded(t *testing.T) {
 // upstreams.origin_domain、path_rules.upstream_path/response_* 均为快照同步面列
 // （主端导出 SELECT 与从端 INSERT 均携带），OF 漏列则单列 UPDATE 不 bump
 // cluster_version → 快照缓存恒命中旧指纹 → 从端 304 循环，该列稳态永不传播
-// （历史问题 历史问题 MFA 列事故同型）。每步只写目标单列，钉该列自身的 OF 成员资格。
+// （历史问题 MFA 列事故同型）。每步只写目标单列，钉该列自身的 OF 成员资格。
 // 历史修复（历史）：NTLM 两列（lb_rules.ntlm_compatible/
 // upstream_force_http1，快照同步面列）补入 steps——900 字符单行 OF 清单无
 // 绊线，未来重构丢列会让 NTLM 切换在从节点稳态永不传播（基线钉测试：列

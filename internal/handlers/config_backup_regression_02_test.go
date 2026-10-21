@@ -2,18 +2,18 @@ package handlers
 
 //
 // 覆盖：
-//   U09-01 布尔列枚举补 5 项 + PRAGMA/语义列对照钉测
-//   U09-02 导出包体携带 sections，还原按包体分类过滤
-//   U09-03 auto backup 设置组导入门（frequency/HH:MM/day/keep/sections）
-//   U09-04 校验顺序=完整性→sections 过滤→行级门
-//   U09-08 冲突矩阵分桶预计算等价性
-//   L06-01 legacy（v1 仅 tables 校验和）早退改为标志位，后置门照常执行
-//   L06-02/03 lbbak 文件落盘失败/坏 xdb → 版本记录丢弃 + 响应明示
-//   L06-04 commit 后 ApplyLogLevel + admin TLS 重启提示
-//   L06-05 运行期设置门（timezone/坐标/枚举/超时/default_ca）
-//   L06-07 导入 off→on 水位线
-//   L06-10 sections 并集 == configBackupTables
-//   L04-02 cert_renewal_days 导入下界 1
+//   历史修复 布尔列枚举补 5 项 + PRAGMA/语义列对照钉测
+//   历史修复 导出包体携带 sections，还原按包体分类过滤
+//   历史修复 auto backup 设置组导入门（frequency/HH:MM/day/keep/sections）
+//   历史修复 校验顺序=完整性→sections 过滤→行级门
+//   历史修复 冲突矩阵分桶预计算等价性
+//   历史修复 legacy（v1 仅 tables 校验和）早退改为标志位，后置门照常执行
+//   历史修复/03 lbbak 文件落盘失败/坏 xdb → 版本记录丢弃 + 响应明示
+//   历史修复 commit 后 ApplyLogLevel + admin TLS 重启提示
+//   历史修复 运行期设置门（timezone/坐标/枚举/超时/default_ca）
+//   历史修复 导入 off→on 水位线
+//   历史修复 sections 并集 == configBackupTables
+//   历史修复 cert_renewal_days 导入下界 1
 
 import (
 	"encoding/json"
@@ -58,7 +58,7 @@ func r78BackupJSON(t *testing.T, tables map[string][]map[string]any, cfg map[str
 	return string(data)
 }
 
-// ── U09-01：布尔列枚举补项 + PRAGMA/语义列对照 ──
+// ── 历史修复：布尔列枚举补项 + PRAGMA/语义列对照 ──
 
 // 语义 0/1 列（PRAGMA 声明为 INTEGER，无法按 BOOLEAN 类型识别）——新增列须
 // 同步本清单与 backupBooleanTableColumns（本测试即两处漂移的机械拦截点）。
@@ -144,7 +144,7 @@ func TestBackupBooleanEnumeration_coversSchemaBooleanColumns(t *testing.T) {
 		}
 	}
 	if !isBackupBooleanConfigKey("auto_backup_enabled") {
-		t.Error("auto_backup_enabled 必须入 backupBooleanConfigKeys（U09-01）")
+		t.Error("auto_backup_enabled 必须入 backupBooleanConfigKeys（历史修复）")
 	}
 }
 
@@ -188,7 +188,7 @@ func TestValidateV2Backup_newlyEnumeratedBooleanColumnsRejectStrings(t *testing.
 	})
 }
 
-// ── U09-02：导出包体携带 sections；还原按包体过滤 ──
+// ── 历史修复：导出包体携带 sections；还原按包体过滤 ──
 
 func TestBuildLbbakExport_writesSectionsAndScopedRestore(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -241,7 +241,7 @@ func TestBuildLbbakExport_writesSectionsAndScopedRestore(t *testing.T) {
 	}
 }
 
-// ── U09-03：auto backup 设置组导入门 ──
+// ── 历史修复：auto backup 设置组导入门 ──
 
 func TestImportAutoBackupSettings_gatePreviewAndImport(t *testing.T) {
 	type tc struct {
@@ -292,7 +292,7 @@ func TestImportAutoBackupSettings_gatePreviewAndImport(t *testing.T) {
 	}
 }
 
-// ── U09-04：完整性 → sections 过滤 → 行级门 ──
+// ── 历史修复：完整性 → sections 过滤 → 行级门 ──
 
 func TestBackupValidationOrder_sectionsBeforeRowGates(t *testing.T) {
 	badSecurity := map[string][]map[string]any{
@@ -346,7 +346,7 @@ func TestBackupValidationOrder_sectionsBeforeRowGates(t *testing.T) {
 	})
 }
 
-// ── U09-08：冲突矩阵分桶预计算等价性 ──
+// ── 历史修复：冲突矩阵分桶预计算等价性 ──
 
 func TestValidateRuleConflictMatrix_bucketedEquivalence(t *testing.T) {
 	candidates := []ruleConflictCandidate{
@@ -405,7 +405,7 @@ func BenchmarkValidateRuleConflictMatrix_500UniqueDomains(b *testing.B) {
 	}
 }
 
-// ── L06-01：legacy 仅 tables 校验和路径继续执行后置门 ──
+// ── 历史修复：legacy 仅 tables 校验和路径继续执行后置门 ──
 
 func r78LegacyBackup(t *testing.T, mutate func(tables map[string][]map[string]any)) string {
 	t.Helper()
@@ -506,7 +506,7 @@ func TestValidateV2Backup_legacyStillRunsPostGates(t *testing.T) {
 	})
 }
 
-// ── L06-02/03/08：waf 文件失败 → 版本记录丢弃 + 响应明示 ──
+// ── 历史修复/03/08：waf 文件失败 → 版本记录丢弃 + 响应明示 ──
 
 func TestLbbakImport_badXdbRejectedKeepsLocal(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -542,7 +542,7 @@ func TestLbbakImport_badXdbRejectedKeepsLocal(t *testing.T) {
 	}
 }
 
-// L6-82-01：CRS 落盘失败只能丢弃备份版本行，不得抹掉导入前的本地版本/排程；
+// 历史修复：CRS 落盘失败只能丢弃备份版本行，不得抹掉导入前的本地版本/排程；
 // rearm 也不得用默认种子覆盖恢复后的本地行。
 func TestLbbakImport_crsFailureRestoresLocalVersionRow(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -666,7 +666,7 @@ func TestLbbakImport_threatSourceFailureWarnsAndKeepsLocal(t *testing.T) {
 	}
 }
 
-// ── L06-04：commit 后应用日志级别 + admin TLS 重启提示 ──
+// ── 历史修复：commit 后应用日志级别 + admin TLS 重启提示 ──
 
 func TestImportConfigBackup_appliesLogLevelAndAdminTLSTip(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -686,7 +686,7 @@ func TestImportConfigBackup_appliesLogLevelAndAdminTLSTip(t *testing.T) {
 	}
 }
 
-// ── L06-05：运行期设置门 ──
+// ── 历史修复：运行期设置门 ──
 
 func TestImportRuntimeSettings_gate(t *testing.T) {
 	cases := []struct {
@@ -739,7 +739,7 @@ func TestImportRuntimeSettings_gate(t *testing.T) {
 	}
 }
 
-// ── L06-07：导入 off→on 水位线 ──
+// ── 历史修复：导入 off→on 水位线 ──
 
 func TestImportConfigBackup_autobackupWatermarkOnEnable(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -768,7 +768,7 @@ func TestImportConfigBackup_autobackupWatermarkOnEnable(t *testing.T) {
 	}
 }
 
-// ── L06-10：sections 并集 == configBackupTables 且无重复 ──
+// ── 历史修复：sections 并集 == configBackupTables 且无重复 ──
 
 func TestConfigBackupSections_unionMatchesTables(t *testing.T) {
 	seen := map[string]string{}
@@ -790,7 +790,7 @@ func TestConfigBackupSections_unionMatchesTables(t *testing.T) {
 	}
 }
 
-// ── L04-02：cert_renewal_days 导入下界 1 ──
+// ── 历史修复：cert_renewal_days 导入下界 1 ──
 
 func TestImportConfigBackup_clampsZeroCertRenewalDays(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -817,7 +817,7 @@ func countAuditLike78(t *testing.T, fragment string) int {
 	return n
 }
 
-// ── U10-F01：导入后四族规则库首槽武装（DescribeAll NextSlot 非空的行为侧） ──
+// ── 历史修复：导入后四族规则库首槽武装（DescribeAll NextSlot 非空的行为侧） ──
 
 func TestImportConfigBackup_rearmsSecurityLibrarySlots(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -875,7 +875,7 @@ func TestImportConfigBackup_rearmsSecurityLibrarySlots(t *testing.T) {
 	}
 }
 
-// ── L06-06：证书队列未排空 → 导入 409 ──
+// ── 历史修复：证书队列未排空 → 导入 409 ──
 
 func TestImportConfigBackup_rejectsWhenCertDrainIncomplete(t *testing.T) {
 	h := newBackupTestHandlers(t)

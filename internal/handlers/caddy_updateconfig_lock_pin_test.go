@@ -1,12 +1,12 @@
 package handlers
 
-// 历史问题-L1（历史 U6 报告 历史问题）基线钉：审计判定「UpdateConfig 是配置/
+// 历史问题（历史）基线钉：审计判定「UpdateConfig 是配置/
 // 规则/安全写族中唯一不持 caddyOpMu 的 Caddy 写者（caddy.go:405-635 无锁）」
 // ——亲验不成立：UpdateConfig 在请求体校验后、全部业务逻辑前即取锁
 // （caddy.go:323-325，历史修复 统一锁序时引入，defer 覆盖函数全程，:405-635 位于
 // 锁内）。本钉测试以 caddy_test.go 生命周期探针同款模式锁行为：预持
 // caddyOpMu 期间 UpdateConfig 必须阻塞，释放后完成——证明取锁在位。
-// 基线钉测试（钉既有正确行为），按 R-1 豁免 RED，判定变更披露见修复报告。
+// 基线钉测试（钉既有正确行为），按 历史修复 豁免 RED，判定变更披露见修复报告。
 
 import (
 	"net/http"

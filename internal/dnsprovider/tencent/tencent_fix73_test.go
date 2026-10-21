@@ -40,7 +40,7 @@ func (transport *toggleDeleteFailTransport) RoundTrip(request *http.Request) (*h
 	return transport.recordTransport.RoundTrip(request)
 }
 
-// A-2（历史，tencent 侧同族）：ownership.Add 失败且回滚删除亦失败时
+// 历史修复（历史，tencent 侧同族）：ownership.Add 失败且回滚删除亦失败时
 // 告警留痕 + 回填内存兜底表；cleanUp 的 ownership 分支排空兜底表重试删除。
 func TestProvider_Present_ownershipAddAndRollbackFailureRefillsFallback(t *testing.T) {
 	// Given：ownership 文件路径被目录占据（root 下也必定读写失败）→ Add 失败；

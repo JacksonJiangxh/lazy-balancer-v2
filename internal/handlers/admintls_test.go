@@ -402,7 +402,7 @@ func TestUpdateAdminTLS_switchingToSelfsignedClearsUploadedMaterial(t *testing.T
 	}
 }
 
-// 历史修复（历史）：值未变更时 PUT /历史修复 此前仍写库并触发进程重启
+// 历史修复（历史）：值未变更时 PUT /admin-tls 此前仍写库并触发进程重启
 // （设置页重复保存=无谓停机）。未变更 → 200「未变更」、不写库、不重启。
 func TestUpdateAdminTLS_unchangedConfigSkipsWriteAndRestart(t *testing.T) {
 	initializeRuleFeatureTestDB(t)
@@ -437,7 +437,7 @@ func TestUpdateAdminTLS_unchangedConfigSkipsWriteAndRestart(t *testing.T) {
 	}
 }
 
-// B2-历史问题（历史）：携带证书材料但生效来源不是 upload 时不得静默丢弃
+// 历史问题（历史）：携带证书材料但生效来源不是 upload 时不得静默丢弃
 // （旧行为可能回「配置未变更」200）——必须 400 点名正确做法且不落库。
 func TestUpdateAdminTLSJSONBody_rejectsUploadPayloadWithoutUploadMode(t *testing.T) {
 	initializeRuleFeatureTestDB(t)
@@ -484,7 +484,7 @@ func TestUpdateAdminTLSJSONBody_rejectsUploadPayloadWithoutUploadMode(t *testing
 	}
 }
 
-// B2-历史问题：enabled 是安全开关，字符串值必须遵循 true/1/false/0 白名单；
+// 历史问题：enabled 是安全开关，字符串值必须遵循 true/1/false/0 白名单；
 // 非法拼写不得静默按 false 关闭 HTTPS 并触发重启，合法 "0" 保持回归。
 func TestUpdateAdminTLS_enabledValueWhitelist(t *testing.T) {
 	for _, tc := range []struct {
@@ -563,7 +563,7 @@ func TestUpdateAdminTLS_enabledValueWhitelist(t *testing.T) {
 
 // 历史问题（历史）：库内证书损坏/非 PEM（带外改库、旧版本导入）时，读路径
 // 此前静默省略 cert_info——UI 只见 enabled=true 无证书信息、运维零信号。
-// 现在必须显式暴露 cert_info_error（历史修复，与写路径严格校验同口径）。
+// 现在必须显式暴露 cert_info_error（fail-visible，与写路径严格校验同口径）。
 func TestGetAdminTLS_corruptStoredCertIsVisible(t *testing.T) {
 	initializeRuleFeatureTestDB(t)
 	if _, err := db.DB.Exec(`UPDATE global_config SET admin_tls_enabled=1, admin_tls_mode='upload',

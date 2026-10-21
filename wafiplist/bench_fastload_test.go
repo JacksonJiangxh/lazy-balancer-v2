@@ -12,7 +12,7 @@ import (
 )
 
 // RDB 验证（Steps 13-20）：20 万条不可聚合 /32 集——.fast 冷加载 vs 文本冷加载
-// 的耗时对照 + 同 IP 查询语义一致。（PLUG-D1：.fast 侧经 ReadFastFile 直读——
+// 的耗时对照 + 同 IP 查询语义一致。（历史修复：.fast 侧经 ReadFastFile 直读——
 // 算子 .fast 分支已删，.fast 的生产消费方为 services 侧从节点回退。）
 func TestFastLoad_vs_TextLoad_200k(t *testing.T) {
 	dir := t.TempDir()
@@ -27,7 +27,7 @@ func TestFastLoad_vs_TextLoad_200k(t *testing.T) {
 	}
 
 	// 编译 .fast（与生产 services.CompileFromIplistFile 同构：解析→聚合→
-	// WriteFastFile；PLUG-D2：EnsureFastFile mtime 门面已删，直调写件）
+	// WriteFastFile；历史修复：EnsureFastFile mtime 门面已删，直调写件）
 	raw, err := os.ReadFile(textPath)
 	if err != nil {
 		t.Fatal(err)

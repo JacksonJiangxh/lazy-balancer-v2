@@ -9,11 +9,11 @@ import (
 	"lazy-balancer-v2/internal/taskengine"
 )
 
-// TASK-L3（历史 历史问题）：聚合视图两处 db.DB 裸用（collectCertJobRows 的
+// 历史修复（历史问题）：聚合视图两处 db.DB 裸用（collectCertJobRows 的
 // cert_jobs 查询、cluster-sync 节奏的 sync_interval 查询）补 nil 防护——与
 // 引擎侧导出 DB 函数（History/Stats24h 等 7 处）同形契约。
 //
-// 历史 历史问题-09：cluster-sync 的 sync_interval 节奏覆写已删除（常驻族
+// 历史问题-09：cluster-sync 的 sync_interval 节奏覆写已删除（常驻族
 // 节奏统一为「常驻自管理」，不再读库），本测试当前覆盖的一处 db.DB 裸用是
 // collectCertJobRows；引擎族聚合走 RunOverview（内部 nil 守卫）。
 //
@@ -43,7 +43,7 @@ func TestCollectSystemTasks_nilDBGuards(t *testing.T) {
 	}
 }
 
-// TASK-3（历史 历史问题）：disabled 证书行 Triggerable 必须 false——行级重试门
+// 历史修复（历史问题）：disabled 证书行 Triggerable 必须 false——行级重试门
 // 对 disabled 恒 429（certJobRetryBlocked 首条），按钮亮着是交互噪音（点了必 429）。
 func TestCollectCertJobRows_disabledRowNotTriggerable(t *testing.T) {
 	oldDB, oldM, oldA := db.DB, db.MetricsDB, db.AuditDB

@@ -40,7 +40,7 @@ func TestCrawlerEngines_matchAndVerify(t *testing.T) {
 }
 
 // Given: 每个引擎一条代表性 UA（含不含 spider/bot 字样的裸标记：DeepSeek/
-// 历史修复/历史修复/历史修复/历史修复）与常见非爬虫 UA
+// 历史修复）与常见非爬虫 UA
 // When: 走带合并预筛的 MatchCrawlerEngine
 // Then: 每个引擎仍解析为自身 ID、浏览器 UA 为空串，且预筛与无预筛的全表
 // 逐条匹配结果完全等价（预筛只是短路，不改变匹配语义）。

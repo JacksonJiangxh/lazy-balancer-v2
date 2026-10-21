@@ -1,6 +1,6 @@
 package services
 
-// F-历史问题-02（历史，历史问题）：crs/ip2region 两 StatusFn 把 failed/skipped 持久
+// 历史问题-02（历史）：crs/ip2region 两 StatusFn 把 failed/skipped 持久
 // 终态也映射 running（现逻辑：非 idle/success/空→running）——更新失败后面板
 // 任务监控恒显「运行中」，终态失真。修复：仅 checking/downloading/installing/
 // reloading 在途阶段映射 running，持久终态（failed/skipped/success/idle/空）

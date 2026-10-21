@@ -8,7 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// U7c-5（历史）：CORS 反射任意 Origin 是有意设计（Authorization 头
+// 历史修复（历史）：CORS 反射任意 Origin 是有意设计（Authorization 头
 // 认证、无 cookie 凭据向量，反射 Origin 不构成渗透面）——本测试为基线钉：
 // 反射 Origin + Vary: Origin + 恒不带凭据头，防回归为通配/凭据形态。
 func TestCORSMiddleware_reflectsOriginWithoutCredentials(t *testing.T) {

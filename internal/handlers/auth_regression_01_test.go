@@ -3,7 +3,7 @@ package handlers
 //   历史修复 自助改密 current_password 不再被新密码策略 max=24 提前拦截；
 //   历史修复 MFA 挑战绑定签发时 password_version，改密吊销在册挑战；
 //   历史修复 自助改密复用 passwordResetColumns（清失败计数与锁定）；
-//   历史修复 锁定开关读取失败 历史修复（500，不消费挑战）；
+//   历史修复 锁定开关读取失败 fail-closed（500，不消费挑战）；
 //   历史修复 MFA 验证存储错误不按「验证码错误」计数；
 //   历史修复 OIDC 重复登录刷新 IdP 侧显示名；
 //   历史修复 OIDC state 封顶改为原子预留（并发不越界）；
@@ -492,7 +492,7 @@ func TestCreateOIDCUserWithRetry_survivesUsernameRace(t *testing.T) {
 	t.Cleanup(func() { oidcJITInsertAttemptHook = oldHook })
 
 	// 第一次 INSERT 前模拟「并发者已抢占 alice」：hook 落库对端身份行并返回
-	// 唯一冲突错误；重试时批量候选查询能看到对端行 → 选 历史修复 成功。
+	// 唯一冲突错误；重试时批量候选查询能看到对端行 → 选 alice-2 成功。
 	oidcJITInsertAttemptHook = func(attempt int) error {
 		if attempt != 1 {
 			return nil

@@ -16,7 +16,7 @@ import (
 )
 
 // TestDeleteCustomRuleRace_serializableIsolationBlocksConcurrentPolicyEnable
-// 串行模拟 历史修复 I1 交错：删除事务的引用检查 SELECT 之后、DELETE 之前，并发的
+// 串行模拟 历史修复 交错：删除事务的引用检查 SELECT 之后、DELETE 之前，并发的
 // 策略启用（UpdateSecurityPolicy 语义）不得提交。BEGIN IMMEDIATE 下引用检查即
 // 持写锁，策略启用只能等删除事务提交后执行——检查与删除之间不存在插队窗口。
 func TestDeleteCustomRuleRace_serializableIsolationBlocksConcurrentPolicyEnable(t *testing.T) {
@@ -77,10 +77,10 @@ func TestDeleteCustomRuleRace_serializableIsolationBlocksConcurrentPolicyEnable(
 	}()
 
 	// Then the concurrent enable is blocked by the write lock: it cannot commit
-	// between the reference check and the DELETE（回归：历史修复 I1 写窗口）
+	// between the reference check and the DELETE（回归：历史修复 写窗口）
 	select {
 	case err := <-updateDone:
-		t.Fatalf("并发策略启用已在检查与删除之间完成: %v（回归：R37 I1 写窗口）", err)
+		t.Fatalf("并发策略启用已在检查与删除之间完成: %v（回归：历史修复写窗口）", err)
 	case <-time.After(200 * time.Millisecond):
 	}
 
@@ -113,7 +113,7 @@ func TestDeleteCustomRuleRace_serializableIsolationBlocksConcurrentPolicyEnable(
 }
 
 // TestDeleteBlockPageRace_serializableIsolationBlocksConcurrentPolicyEnable
-// 同 历史修复 I1 模拟，针对 DeleteSecurityBlockPage：引用 COUNT 检查与 DELETE 同事务，
+// 同 历史修复 模拟，针对 DeleteSecurityBlockPage：引用 COUNT 检查与 DELETE 同事务，
 // 并发的策略启用无法插队到检查与 DELETE 之间。
 func TestDeleteBlockPageRace_serializableIsolationBlocksConcurrentPolicyEnable(t *testing.T) {
 	// Given a block page referenced only by a disabled policy (delete allowed)
@@ -164,10 +164,10 @@ func TestDeleteBlockPageRace_serializableIsolationBlocksConcurrentPolicyEnable(t
 	}()
 
 	// Then the concurrent enable is blocked: it cannot commit between the
-	// reference COUNT and the DELETE（回归：历史修复 I1 写窗口）
+	// reference COUNT and the DELETE（回归：历史修复 写窗口）
 	select {
 	case err := <-updateDone:
-		t.Fatalf("并发策略启用已在检查与删除之间完成: %v（回归：R37 I1 写窗口）", err)
+		t.Fatalf("并发策略启用已在检查与删除之间完成: %v（回归：历史修复写窗口）", err)
 	case <-time.After(200 * time.Millisecond):
 	}
 
@@ -201,7 +201,7 @@ func TestDeleteBlockPageRace_serializableIsolationBlocksConcurrentPolicyEnable(t
 
 // routedFakeConnector 返回一个按查询内容路由的假 db.DB：不同查询注入不同的
 // 行集行为（Scan 失败 / 迭代失败 / 正常），用于注入 ListSecurityPolicies 与
-// GetAllSecurityBindings 的循环故障（历史修复 S1/S2，同 历史修复 F2 的假连接器模式）。
+// GetAllSecurityBindings 的循环故障（历史修复，同 历史修复 的假连接器模式）。
 type routedFakeConnector struct {
 	rowsByKind map[string]driver.Rows
 }
@@ -249,7 +249,7 @@ func fakeDB(t *testing.T, rowsByKind map[string]driver.Rows) {
 }
 
 // TestListSecurityPolicies_bindingRowsScanFailureReturns500 验证绑定计数循环的
-// Scan 失败使列表显式返回 500，而不是忽略错误以 200 返回（历史修复 S1）。
+// Scan 失败使列表显式返回 500，而不是忽略错误以 200 返回（历史修复）。
 func TestListSecurityPolicies_bindingRowsScanFailureReturns500(t *testing.T) {
 	// Given a db whose binding-count query delivers a non-integer policy_id
 	setupSecurityPolicyTestDB(t)
@@ -268,7 +268,7 @@ func TestListSecurityPolicies_bindingRowsScanFailureReturns500(t *testing.T) {
 }
 
 // TestListSecurityPolicies_policyRowsIterationFailureReturns500 验证策略行循环的
-// rows.Err() 使列表显式返回 500，而不是「空/部分列表 + 200」（历史修复 S1，历史修复 F2 标准）。
+// rows.Err() 使列表显式返回 500，而不是「空/部分列表 + 200」（历史修复，历史修复 标准）。
 func TestListSecurityPolicies_policyRowsIterationFailureReturns500(t *testing.T) {
 	// Given a db whose policy query fails mid-iteration（第一步即失败）
 	setupSecurityPolicyTestDB(t)
@@ -289,7 +289,7 @@ func TestListSecurityPolicies_policyRowsIterationFailureReturns500(t *testing.T)
 
 // TestGetAllSecurityBindings_scanFailureSkipsZeroValueBinding 验证单行 Scan 失败
 // 时跳过该行而非写入零值绑定（policy_id=0/mode="" 会把规则错误呈现为
-// 「已绑定到空策略」）（历史修复 S2）。
+// 「已绑定到空策略」）（历史修复）。
 func TestGetAllSecurityBindings_scanFailureSkipsZeroValueBinding(t *testing.T) {
 	// Given one binding row whose policy_id cannot scan and one healthy row
 	setupSecurityPolicyTestDB(t)
@@ -331,7 +331,7 @@ func TestGetAllSecurityBindings_scanFailureSkipsZeroValueBinding(t *testing.T) {
 }
 
 // TestGetAllSecurityBindings_iterationFailureReturns500 验证绑定循环的 rows.Err()
-// 使接口显式返回 500，而不是「部分绑定 + 200」（历史修复 S2）。
+// 使接口显式返回 500，而不是「部分绑定 + 200」（历史修复）。
 func TestGetAllSecurityBindings_iterationFailureReturns500(t *testing.T) {
 	// Given a binding query that fails mid-iteration（一行之后迭代报错）
 	setupSecurityPolicyTestDB(t)
