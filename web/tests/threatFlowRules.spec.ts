@@ -15,7 +15,6 @@ import {
   nextFlowCursor,
   planFlowArcs,
   reconstructObservedRate,
-  shouldAggregate,
   stepAdaptiveSample,
   normalizeTrafficSampleN,
 } from '../src/utils/threatFlowRules.ts'
@@ -124,11 +123,6 @@ test('时间解析：无时区 DB 时间按 UTC；同一秒归同桶', () => {
   assert.equal(flowBucketKey('中国·广东省', 1792281600), '中国·广东省|1792281600')
 })
 
-test('阈值：10 条不聚合，11 条聚合', () => {
-  assert.equal(shouldAggregate(10), false)
-  assert.equal(shouldAggregate(11), true)
-})
-
 test('历史问题-5：采集租约重置后游标回零，正常递增与缺失值保持', () => {
   assert.equal(nextFlowCursor(500, { enabled: true, next_seq: 4 }), 0)
   assert.equal(nextFlowCursor(500, { enabled: false, next_seq: 501 }), 0)
@@ -159,24 +153,24 @@ test('正常流按地区+秒桶分组：跨秒不合并，中国精确到省', (
   assert.equal(gd.items.length, 2)
 })
 
-test('正常/攻击共用出弧计划：>10 聚合、≤10 逐条、单轮预算一致', () => {
+test('正常/攻击共用出弧计划：1-3 逐条、4-8 合并粗、>8 合并更粗，单轮预算一致', () => {
   const plan = planFlowArcs([
-    { key: 'a', count: 20 },
-    { key: 'b', count: 5 },
-    { key: 'c', count: 3 },
+    { key: 'a', count: 20, weight: 160 },
+    { key: 'b', count: 5, weight: 40 },
+    { key: 'c', count: 3, weight: 3 },
   ], 4)
   assert.equal(plan.length, 4)
-  assert.deepEqual(plan[0], { key: 'a', count: 20 })
-  assert.deepEqual(plan.slice(1), [
-    { key: 'b', count: 1 },
-    { key: 'b', count: 1 },
-    { key: 'b', count: 1 },
+  assert.deepEqual(plan[0], { key: 'a', weight: 160, aggregated: true })
+  assert.deepEqual(plan[1], { key: 'b', weight: 40, aggregated: true })
+  assert.deepEqual(plan.slice(2), [
+    { key: 'c', weight: 1, aggregated: false },
+    { key: 'c', weight: 1, aggregated: false },
   ])
-  const ten = planFlowArcs([{ key: 'd', count: 10 }], 3)
-  assert.deepEqual(ten, [
-    { key: 'd', count: 1 },
-    { key: 'd', count: 1 },
-    { key: 'd', count: 1 },
+  const small = planFlowArcs([{ key: 'd', count: 3, weight: 3 }], 3)
+  assert.deepEqual(small, [
+    { key: 'd', weight: 1, aggregated: false },
+    { key: 'd', weight: 1, aggregated: false },
+    { key: 'd', weight: 1, aggregated: false },
   ])
   assert.equal(FLOW_MAX_ARCS_PER_FLUSH, 12)
 })

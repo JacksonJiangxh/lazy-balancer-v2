@@ -4,8 +4,8 @@
 export const FLOW_NORMAL_COLOR = '#38bdf8'
 export const FLOW_ATTACK_COLOR = '#e25454'
 
-/** 同一地区同一秒超过该条数才合并为一条加权光流/弹框。 */
-export const FLOW_AGGREGATE_THRESHOLD = 10
+/** 同一地区同一秒超过 3 条（>=4）才进入聚合出弧；>8 为更粗档。 */
+export const FLOW_AGGREGATE_THRESHOLD = 3
 
 /** 单次飞行时长（毫秒）；2D 地图换算为秒，3D 地球直接用作 dash 周期。 */
 export const FLOW_FLIGHT_MS = 950

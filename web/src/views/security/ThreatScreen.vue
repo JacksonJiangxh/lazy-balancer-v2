@@ -819,7 +819,7 @@ const attackFlowTask = usePollingTask(async ({ signal, isCurrent }) => {
   // 引擎尚在异步装载：不消费游标，下一轮重新拉取，否则首波爆发的攻击流
   // 会在 threatMap=null 时被静默丢弃（页面刚打开/模式切换后必现）。
   if (!threatMap) return
-  const weighted = new Map<string, { key: string; region: string; count: number }>()
+  const weighted = new Map<string, { key: string; region: string; count: number; weight: number }>()
   const heavy = (data.events?.length ?? 0) > 60
   const now = Date.now()
   for (const ev of data.events ?? []) {
@@ -831,12 +831,16 @@ const attackFlowTask = usePollingTask(async ({ signal, isCurrent }) => {
     const key = heavy ? region : flowBucketKey(region, flowBucket(ev.at))
     const weight = Number.isFinite(ev.weight) && (ev.weight ?? 0) > 0 ? Number(ev.weight) : 1
     const cur = weighted.get(key)
-    if (cur) cur.count += weight
-    else weighted.set(key, { key, region, count: weight })
+    if (cur) {
+      cur.count += 1
+      cur.weight += weight
+    } else {
+      weighted.set(key, { key, region, count: 1, weight })
+    }
   }
   const regionByKey = new Map([...weighted.values()].map((g) => [g.key, g.region]))
   for (const item of planFlowArcs([...weighted.values()])) {
-    threatMap?.addArcForLocation(regionByKey.get(item.key) ?? item.key, item.count)
+    threatMap?.addArcForLocation(regionByKey.get(item.key) ?? item.key, item.weight)
   }
   attackFlowSince = nextFlowCursor(attackFlowSince, { enabled: true, next_seq: data.next_seq })
 }, { interval: ATTACK_FLOW_POLL_MS, onError: () => { /* 攻击流不可用不阻断大屏 */ } })
@@ -877,16 +881,13 @@ const flowTask = usePollingTask(async ({ signal, isCurrent }) => {
   // 同攻击流：引擎未装载时不得推进游标，否则首轮正常流事件被丢弃。
   if (!threatMap) return
   const events = data.events ?? []
-  // 正常流与攻击流同一规则：地区 + 秒桶分组，>10 条合并，单轮预算一致。
-  // 预算必须按“采样后事件数”计，不能先乘 sample_n：否则 1/8 下一个事件
-  // 会膨胀成 8 条重复弧，吃掉 12 条预算，其他地区正常弧被挤掉。
-  // sample_n 只还原每条弧的 weight（线宽/标签量级）。
+  // 正常流与攻击流同一规则：地区 + 秒桶分组；1-3 条逐条、4-8 合并粗光流、
+  // >8 合并更粗光流。是否聚合只看采样后条数，weight 只决定线宽/×N。
   const sampleFactor = data.sample_n && data.sample_n > 0 ? data.sample_n : Math.max(1, activeSampleN.value)
   const groups = groupNormalFlowEvents(events)
   const regionByKey = new Map(groups.map((g) => [g.key, g.region]))
-  for (const item of planFlowArcs(groups.map((g) => ({ key: g.key, count: g.items.length })))) {
-    const weight = Math.max(1, Math.round(item.count * sampleFactor))
-    threatMap?.addNormalArcForLocation(regionByKey.get(item.key) ?? item.key, weight)
+  for (const item of planFlowArcs(groups.map((g) => ({ key: g.key, count: g.items.length, weight: g.items.length * sampleFactor })))) {
+    threatMap?.addNormalArcForLocation(regionByKey.get(item.key) ?? item.key, item.weight)
   }
   flowSince = nextFlowCursor(flowSince, data)
   if (flowSampleN.value === -1 && activeSampleN.value > 0) {

@@ -41,10 +41,6 @@ export function flowBucketKey(region: string, bucket: number): string {
   return `${region}|${bucket}`
 }
 
-export function shouldAggregate(count: number): boolean {
-  return count > FLOW_AGGREGATE_THRESHOLD
-}
-
 /**
  * 后端采样契约：-1=自适应、0=关闭逐请求光流。全量档已退役（自适应本身从
  * 1/1 起步，低流量等价全量）；存量/外来 1 与固定 2-64 一律归一为自适应。
@@ -165,31 +161,49 @@ export const FLOW_MAX_ARCS_PER_FLUSH = 12
 
 export interface FlowArcPlan {
   key: string
+  /** 弧线 weight（线宽/×N 标签口径）：采样还原后的量级。 */
+  weight: number
+  /** 是否来自聚合（4-8/ >8）；仅用于语义，不改变引擎线宽。 */
+  aggregated: boolean
+}
+
+export interface FlowArcGroupLike {
+  /** 聚合地域 key（地区+秒桶；洪峰期仅地区）。 */
+  key: string
+  /** 采样后事件条数；是否聚合只用它判断，不用 weight。 */
   count: number
+  /** 还原量级（count × sample_n / sum(weight)）。 */
+  weight?: number
 }
 
 /**
  * 正常/攻击共用出弧计划：
- * - >10 条同地区同秒合并为一条加权弧；
- * - ≤10 逐条出弧；
- * - 单轮预算用尽即停止，下一轮继续（不把超出预算的请求再合并）。
+ * - 1-3 条（采样后）逐条出弧；
+ * - 4-8 条合并为一条粗光流；
+ * - >8 条合并为一条更粗光流（weight 仍连续，由 flowArcWidth 决定粗细）；
+ * - 单轮预算用尽即停止；weight 不参与是否聚合，避免 1/8 采样下 1 条事件
+ *   被误判成 8 条而吃掉全部预算。
  */
 export function planFlowArcs(
-  groups: readonly { key: string; count: number }[],
+  groups: readonly FlowArcGroupLike[],
   maxArcs = FLOW_MAX_ARCS_PER_FLUSH,
 ): FlowArcPlan[] {
-  const ordered = [...groups].sort((a, b) => b.count - a.count || a.key.localeCompare(b.key))
+  const ordered = [...groups].sort((a, b) => (b.weight ?? b.count) - (a.weight ?? a.count) || a.key.localeCompare(b.key))
   const plan: FlowArcPlan[] = []
   let budget = Math.max(0, maxArcs)
   for (const group of ordered) {
     if (budget <= 0) break
-    if (shouldAggregate(group.count)) {
-      plan.push({ key: group.key, count: group.count })
+    const count = Math.max(0, Math.floor(group.count))
+    const weight = group.weight ?? group.count
+    if (count <= 0 || weight <= 0) continue
+    if (count > FLOW_AGGREGATE_THRESHOLD) {
+      plan.push({ key: group.key, weight, aggregated: true })
       budget--
       continue
     }
-    const n = Math.min(group.count, budget)
-    for (let i = 0; i < n; i++) plan.push({ key: group.key, count: 1 })
+    const n = Math.min(count, budget)
+    const per = weight / count
+    for (let i = 0; i < n; i++) plan.push({ key: group.key, weight: per, aggregated: false })
     budget -= n
   }
   return plan

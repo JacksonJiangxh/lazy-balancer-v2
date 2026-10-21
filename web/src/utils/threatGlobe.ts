@@ -1097,10 +1097,10 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       if (paused) renderOnce()
     },
     setTraffic(entries: CountryHeat[]): void {
-      // 正常/攻击共用出弧计划：>10 聚合、≤10 逐条、单轮预算一致。
-      const plan = planFlowArcs(entries.filter((e) => e.count > 0).map((e) => ({ key: e.name, count: e.count })))
+      // 正常/攻击共用出弧计划：1-3 逐条、4-8 合并、>8 更粗；weight 决定线宽。
+      const plan = planFlowArcs(entries.filter((e) => e.count > 0).map((e) => ({ key: e.name, count: e.count, weight: e.count })))
       for (const item of plan) {
-        spawnArc(COUNTRY_CENTROIDS[item.key] ?? FALLBACK_CENTROID, true, item.count)
+        spawnArc(COUNTRY_CENTROIDS[item.key] ?? FALLBACK_CENTROID, true, item.weight)
       }
     },
     setServer(centroid: Centroid | null): void {
