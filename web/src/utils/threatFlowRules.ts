@@ -1,6 +1,6 @@
 // 威胁大屏光流/弹框聚合单源（纯函数，node:test 可覆盖）。
 // 口径：攻击类型不区分，只按地域；中国精确到省；同一地区同一秒为一桶。
-import { FLOW_AGGREGATE_THRESHOLD } from './threatTheme.ts'
+import { FLOW_AGGREGATE_THRESHOLD, type FlowArcTier } from './threatTheme.ts'
 
 export interface FlowGroup<T> {
   /** 聚合地域 key（中国精确到省，其余国家） */
@@ -160,16 +160,21 @@ export function groupNormalFlowEvents<T extends NormalFlowLike>(
 export const FLOW_MAX_ARCS_PER_FLUSH = 12
 
 export interface FlowArcPlan {
+  /** 分组键（地区|时间桶）。 */
   key: string
-  /** 弧线 weight（线宽/×N 标签口径）：采样还原后的量级。 */
+  /** 光流起点地区（中国精确到省；洪峰坍缩为国家）。 */
+  region: string
+  /** 弧线 weight（采样还原量级），只用于 ×N/强度，不参与聚合判断。 */
   weight: number
-  /** 是否来自聚合（4-8/ >8）；仅用于语义，不改变引擎线宽。 */
-  aggregated: boolean
+  /** 显式线宽档位：thin=逐条、coarse=4-8 合并、dense=>8 合并。 */
+  tier: FlowArcTier
 }
 
 export interface FlowArcGroupLike {
-  /** 聚合地域 key（地区+秒桶；洪峰期仅地区）。 */
+  /** 聚合地域 key（地区+时间桶）。 */
   key: string
+  /** 光流起点地区。 */
+  region?: string
   /** 采样后事件条数；是否聚合只用它判断，不用 weight。 */
   count: number
   /** 还原量级（count × sample_n / sum(weight)）。 */
@@ -178,11 +183,10 @@ export interface FlowArcGroupLike {
 
 /**
  * 正常/攻击共用出弧计划：
- * - 1-3 条（采样后）逐条出弧；
- * - 4-8 条合并为一条粗光流；
- * - >8 条合并为一条更粗光流（weight 仍连续，由 flowArcWidth 决定粗细）；
- * - 单轮预算用尽即停止；weight 不参与是否聚合，避免 1/8 采样下 1 条事件
- *   被误判成 8 条而吃掉全部预算。
+ * - 1-3 条（采样后）逐条出弧（thin）；
+ * - 4-8 条合并为一条粗光流（coarse）；
+ * - >8 条合并为一条更粗光流（dense）；
+ * - weight 不参与是否聚合，避免 1/8 采样下 1 条事件被误判成 8 条。
  */
 export function planFlowArcs(
   groups: readonly FlowArcGroupLike[],
@@ -196,15 +200,83 @@ export function planFlowArcs(
     const count = Math.max(0, Math.floor(group.count))
     const weight = group.weight ?? group.count
     if (count <= 0 || weight <= 0) continue
+    const region = group.region ?? group.key.split('|')[0]
     if (count > FLOW_AGGREGATE_THRESHOLD) {
-      plan.push({ key: group.key, weight, aggregated: true })
+      plan.push({ key: group.key, region, weight, tier: count > 8 ? 'dense' : 'coarse' })
       budget--
       continue
     }
     const n = Math.min(count, budget)
     const per = weight / count
-    for (let i = 0; i < n; i++) plan.push({ key: group.key, weight: per, aggregated: false })
+    for (let i = 0; i < n; i++) plan.push({ key: group.key, region, weight: per, tier: 'thin' })
     budget -= n
   }
   return plan
+}
+
+export interface FlowEventPlanInput {
+  country?: string
+  province?: string
+  at?: number
+  weight?: number
+}
+
+const FLOW_BUCKET_MS_LEVELS = [1000, 2000, 5000] as const
+
+function flowEventRegion(ev: FlowEventPlanInput): string {
+  const country = ev.country || ''
+  if (!country) return ''
+  return ev.province ? `${country}·${ev.province}` : country
+}
+
+function groupFlowEventsForPlan(
+  events: readonly FlowEventPlanInput[],
+  bucketMs: number,
+  collapseCountry: boolean,
+  now: number,
+): FlowArcGroupLike[] {
+  const groups = new Map<string, { key: string; region: string; count: number; weight: number }>()
+  for (const event of events) {
+    const rawRegion = flowEventRegion(event)
+    if (!rawRegion) continue
+    const region = collapseCountry ? (rawRegion.split('·')[0] || '未知') : rawRegion
+    const at = typeof event.at === 'number' && Number.isFinite(event.at) && event.at > 0 ? event.at : now
+    const bucket = Math.floor(at / bucketMs)
+    const key = `${region}|${bucket}`
+    const weight = Number.isFinite(event.weight) && (event.weight ?? 0) > 0 ? Number(event.weight) : 1
+    const cur = groups.get(key)
+    if (cur) {
+      cur.count += 1
+      cur.weight += weight
+    } else {
+      groups.set(key, { key, region, count: 1, weight })
+    }
+  }
+  return [...groups.values()]
+}
+
+function flowGroupArcCost(group: FlowArcGroupLike): number {
+  return group.count > FLOW_AGGREGATE_THRESHOLD ? 1 : Math.max(0, Math.floor(group.count))
+}
+
+/**
+ * 超预算时扩大时间桶而不是直接丢组：1s→2s→5s；最终仍超预算才按权重取前
+ * maxArcs（极端多地区场景仍需有界）。
+ */
+export function planFlowEvents(
+  events: readonly FlowEventPlanInput[],
+  now = Date.now(),
+  maxArcs = FLOW_MAX_ARCS_PER_FLUSH,
+): FlowArcPlan[] {
+  if (events.length === 0) return []
+  for (const bucketMs of FLOW_BUCKET_MS_LEVELS) {
+    const groups = groupFlowEventsForPlan(events, bucketMs, false, now)
+    const cost = groups.reduce((sum, g) => sum + flowGroupArcCost(g), 0)
+    if (cost <= maxArcs) return planFlowArcs(groups, maxArcs)
+  }
+  // 5s 桶仍超预算：把中国各省坍缩为国家，且强制每个组至少聚合一条
+  //（不再展开 1-3 条逐条），仍超出容量上限才取权重最高组。
+  const groups = groupFlowEventsForPlan(events, FLOW_BUCKET_MS_LEVELS[FLOW_BUCKET_MS_LEVELS.length - 1], true, now)
+  const forced = groups.map((g) => ({ ...g, count: Math.max(FLOW_AGGREGATE_THRESHOLD + 1, g.count) }))
+  return planFlowArcs(forced, maxArcs)
 }

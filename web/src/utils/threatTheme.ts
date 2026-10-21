@@ -14,12 +14,20 @@ export const FLOW_FLIGHT_MS = 950
 export const FLOW_NORMAL_ARC_COLORS = ['rgba(56, 189, 248, 0.1)', 'rgba(56, 189, 248, 0.85)'] as const
 export const FLOW_ATTACK_ARC_COLORS = ['rgba(226, 84, 84, 0.1)', 'rgba(226, 84, 84, 0.95)'] as const
 
-/** 正常/攻击光流共用线宽：2×(0.6+log)，上限 4；仅颜色不同。 */
-export function flowArcWidth(count: number): number {
-  return Math.min(4, 2 * (0.6 + Math.log10(Math.max(1, count))))
+/** 光流线宽档位：采样后 1-3 逐条细、4-8 合并中粗、>8 合并最粗。 */
+export type FlowArcTier = 'thin' | 'coarse' | 'dense'
+
+export const FLOW_THIN_ARC_WIDTH = 1.2
+export const FLOW_COARSE_ARC_WIDTH = 2.8
+export const FLOW_DENSE_ARC_WIDTH = 4.2
+
+export function flowArcTierWidth(tier: FlowArcTier): number {
+  if (tier === 'dense') return FLOW_DENSE_ARC_WIDTH
+  if (tier === 'coarse') return FLOW_COARSE_ARC_WIDTH
+  return FLOW_THIN_ARC_WIDTH
 }
 
-/** 聚合标签：仅在超过阈值时显示 ×N。 */
-export function flowArcLabel(count: number): string | undefined {
-  return count > FLOW_AGGREGATE_THRESHOLD ? `×${Math.round(count)}` : undefined
+/** 聚合标签：聚合弧显示 ×N；逐条弧即使 weight>1 也不显示，避免把采样还原值误读成聚合组。 */
+export function flowArcLabel(count: number, aggregated = count > FLOW_AGGREGATE_THRESHOLD): string | undefined {
+  return aggregated ? `×${Math.round(count)}` : undefined
 }

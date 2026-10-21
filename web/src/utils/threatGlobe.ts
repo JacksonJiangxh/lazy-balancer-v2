@@ -15,7 +15,7 @@ import { CHINA_PROVINCES } from '@/utils/chinaProvinces'
 import { loadAdmin1Tables, loadedAdmin1Tables } from '@/utils/admin1Loader'
 import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, arcEndpoints, adminShortName, normalizeCountryName, aggregateCountryCounts, drillCountryAllowed, DOT_LAND, arcOriginForLocation, hasProvinceStats, drillCommitAllowed, drillClickIntent } from '@/utils/threatShared'
 import type { ThreatScene, ThreatSceneOptions, CountryHeat } from '@/utils/threatScene'
-import { FLOW_ATTACK_COLOR, FLOW_NORMAL_COLOR, FLOW_FLIGHT_MS, flowArcLabel, flowArcWidth } from '@/utils/threatTheme'
+import { FLOW_ATTACK_COLOR, FLOW_NORMAL_COLOR, FLOW_FLIGHT_MS, flowArcLabel, flowArcTierWidth, type FlowArcTier } from '@/utils/threatTheme'
 import { planFlowArcs } from '@/utils/threatFlowRules'
 import { sphereSurfacePoint, DOT_LAT_TOP, DOT_LAT_BOTTOM } from '@/utils/threatProjection'
 import { buildSphericalArc, SPHERICAL_ARC_SAMPLES } from '@/utils/threatArcCurve'
@@ -27,6 +27,7 @@ interface ArcDatum {
   endLng: number
   color: string
   weight: number
+  tier: FlowArcTier
   label?: string
   born: number
   /** 球面大圆采样点 xyz 平铺；spawn 时生成一次，帧内只投影不重建。 */
@@ -886,7 +887,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
           else ctx.moveTo(x, y)
           drawing = true
         }
-        ctx.lineWidth = Math.max(1, flowArcWidth(arc.weight) * 0.8)
+        ctx.lineWidth = Math.max(1, flowArcTierWidth(arc.tier) * 0.8)
         ctx.strokeStyle = arc.color
         ctx.globalAlpha = alpha * 0.28
         ctx.stroke()
@@ -896,7 +897,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       // 渐变轴起点之外，被 Canvas 钳成透明（历史实测 300ms 后整条消失）。
       // 改为沿弧长分段绘制，段尾透明度按进度递增：尾隐头亮且覆盖全曲线。
       const chunks = Math.min(12, count)
-      ctx.lineWidth = flowArcWidth(arc.weight)
+      ctx.lineWidth = flowArcTierWidth(arc.tier)
       ctx.strokeStyle = arc.color
       for (let c = 0; c < chunks; c++) {
         const fromIdx = Math.floor((count * c) / chunks)
@@ -1044,7 +1045,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     )
   }
 
-  function spawnArc(from: Centroid, normal: boolean, weight = 1): void {
+  function spawnArc(from: Centroid, normal: boolean, weight = 1, tier: FlowArcTier = 'thin'): void {
     if (!siteConfigured) return
     // 正常/攻击共用容量：满池时拒绝新弧线，已开始的动画按 TTL 完整播完。
     if (arcs.length >= MAX_ARCS) return
@@ -1052,7 +1053,8 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       ...arcEndpoints(server, from),
       color: normal ? FLOW_NORMAL_COLOR : FLOW_ATTACK_COLOR,
       weight,
-      label: flowArcLabel(weight),
+      tier,
+      label: flowArcLabel(weight, tier !== 'thin'),
       born: performance.now(),
       curve: buildSphericalArc(from[1], from[0], server[1], server[0], globe.getGlobeRadius(), SPHERICAL_ARC_SAMPLES),
     })
@@ -1060,13 +1062,13 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   }
 
   return {
-    addArcForLocation(ipLocation: string, weight = 1): void {
+    addArcForLocation(ipLocation: string, weight = 1, tier: FlowArcTier = 'thin'): void {
       if (!ipLocation) return
-      spawnArc(arcOriginForLocation(ipLocation), false, weight)
+      spawnArc(arcOriginForLocation(ipLocation), false, weight, tier)
     },
-    addNormalArcForLocation(ipLocation: string, weight = 1): void {
+    addNormalArcForLocation(ipLocation: string, weight = 1, tier: FlowArcTier = 'thin'): void {
       if (!ipLocation) return
-      spawnArc(arcOriginForLocation(ipLocation), true, weight)
+      spawnArc(arcOriginForLocation(ipLocation), true, weight, tier)
     },
     setCountries(entries: CountryHeat[]): void {
       const nextCounts = aggregateCountryCounts(entries)
@@ -1100,7 +1102,7 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
       // 正常/攻击共用出弧计划：1-3 逐条、4-8 合并、>8 更粗；weight 决定线宽。
       const plan = planFlowArcs(entries.filter((e) => e.count > 0).map((e) => ({ key: e.name, count: e.count, weight: e.count })))
       for (const item of plan) {
-        spawnArc(COUNTRY_CENTROIDS[item.key] ?? FALLBACK_CENTROID, true, item.weight)
+        spawnArc(COUNTRY_CENTROIDS[item.key] ?? FALLBACK_CENTROID, true, item.weight, item.tier)
       }
     },
     setServer(centroid: Centroid | null): void {

@@ -125,7 +125,7 @@ test('地图静态层复用国家 Path2D 后按色批量填充', () => {
 
 test('地球光流叠加层复用地图的像素线宽/尾迹/粒子口径', () => {
   const overlay = member(globeSrc, 'function drawFlowOverlay(')
-  assert.match(overlay, /flowArcWidth\(arc\.weight\)/, '3D 光流线宽必须沿用地图像素公式')
+  assert.match(overlay, /flowArcTierWidth\(arc\.tier\)/, '3D 光流线宽必须沿用显式三档')
   assert.match(overlay, /ctx\.globalAlpha = alpha \* \(0\.05 \+ 0\.95 \* ratio\)/, '尾迹必须尾隐头亮（沿弧长分段，避免直线渐变裁剪）')
   assert.match(overlay, /FLOW_PARTICLES/, '必须绘制同地图亮头粒子')
   assert.doesNotMatch(globeSrc, /arcStroke\('strokeW'/, '3D tube 弧线必须退役，避免双套样式')

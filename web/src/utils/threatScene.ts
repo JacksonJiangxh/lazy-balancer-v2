@@ -21,7 +21,7 @@ import { CHINA_PROVINCES } from '@/utils/chinaProvinces'
 import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, adminShortName as sharedShortName, DOT_LAND as SHARED_DOT_LAND, normalizeCountryName, aggregateCountryCounts, POINTY_TOP_HEX_VERTICES, drillCountryAllowed, arcOriginForLocation, hasProvinceStats, drillCommitAllowed, drillClickIntent } from '@/utils/threatShared'
 import { COUNTRY_CENTROIDS, FALLBACK_CENTROID, type Centroid } from '@/utils/countryCentroids'
 import { loadAdmin1Tables } from '@/utils/admin1Loader'
-import { FLOW_ATTACK_COLOR as ATTACK_COLOR, FLOW_NORMAL_COLOR as NORMAL_COLOR, FLOW_FLIGHT_MS, flowArcLabel, flowArcWidth } from '@/utils/threatTheme'
+import { FLOW_ATTACK_COLOR as ATTACK_COLOR, FLOW_NORMAL_COLOR as NORMAL_COLOR, FLOW_FLIGHT_MS, flowArcLabel, flowArcTierWidth, type FlowArcTier } from '@/utils/threatTheme'
 import { planFlowArcs } from '@/utils/threatFlowRules'
 
 // 威胁大屏 2D 平面地图引擎（v16 终版：Canvas 2D，参考 Radware/Check Point 平面风格）。
@@ -69,9 +69,9 @@ export interface ThreatSceneOptions {
 }
 
 export interface ThreatScene {
-  addArcForLocation(ipLocation: string, weight?: number): void
+  addArcForLocation(ipLocation: string, weight?: number, tier?: FlowArcTier): void
   /** 正常请求光流（固定青色；逐请求事件流消费）。 */
-  addNormalArcForLocation(ipLocation: string, weight?: number): void
+  addNormalArcForLocation(ipLocation: string, weight?: number, tier?: FlowArcTier): void
   setCountries(entries: CountryHeat[]): void
   setProvinces(entries: CountryHeat[]): void
   setTraffic(entries: CountryHeat[]): void
@@ -98,6 +98,7 @@ interface Arc2D {
   pulsed: boolean
   normal: boolean
   weight: number
+  tier: FlowArcTier
   label?: string
 }
 
@@ -797,13 +798,13 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
   const ripples: Ripple2D[] = []
   let sweepAngle = 0
 
-  function spawnArc(origin: Centroid, normal: boolean, weight = 1): void {
+  function spawnArc(origin: Centroid, normal: boolean, weight = 1, tier: FlowArcTier = 'thin'): void {
     if (!siteConfigured) return
     // 正常/攻击共用容量：满池时拒绝新弧线，已开始的动画完整播完。
     if (arcs.length >= MAX_ACTIVE_ARCS) return
-    // 同一地区/秒 >10 条才带聚合标签；≤10 逐条无标签。
-    const label = flowArcLabel(weight)
-    arcs.push({ from: origin, elapsed: 0, flight: 0, flightT: 0, pulsed: false, normal, weight, label })
+    // 聚合弧显示 ×N；逐条弧不显示，避免把采样还原值误读成聚合组。
+    const label = flowArcLabel(weight, tier !== 'thin')
+    arcs.push({ from: origin, elapsed: 0, flight: 0, flightT: 0, pulsed: false, normal, weight, tier, label })
   }
 
   function spawnRipple(color: string): void {
@@ -882,7 +883,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
       if (hasPath) {
         const gradient = arcGradient(from, to, color)
         ctx.strokeStyle = gradient
-        ctx.lineWidth = flowArcWidth(arc.weight)
+        ctx.lineWidth = flowArcTierWidth(arc.tier)
         ctx.globalAlpha = Math.min(1, Math.max(0.05, (life - arc.elapsed) / 0.4))
         ctx.stroke()
         ctx.globalAlpha = 1
@@ -1220,14 +1221,14 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
   // 不在首屏 idle 预构建，避免地图刚打开后的秒级长任务（用户实测卡顿）。
 
   return {
-    addArcForLocation(ipLocation: string, weight = 1): void {
+    addArcForLocation(ipLocation: string, weight = 1, tier: FlowArcTier = 'thin'): void {
       if (!ipLocation) return
-      spawnArc(arcOriginForLocation(ipLocation), false, weight)
+      spawnArc(arcOriginForLocation(ipLocation), false, weight, tier)
       startLoop()
     },
-    addNormalArcForLocation(ipLocation: string, weight = 1): void {
+    addNormalArcForLocation(ipLocation: string, weight = 1, tier: FlowArcTier = 'thin'): void {
       if (!ipLocation) return
-      spawnArc(arcOriginForLocation(ipLocation), true, weight)
+      spawnArc(arcOriginForLocation(ipLocation), true, weight, tier)
       startLoop()
     },
     setCountries(entries: CountryHeat[]): void {
@@ -1250,7 +1251,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
       // 正常/攻击共用出弧计划：1-3 逐条、4-8 合并、>8 更粗；weight 决定线宽。
       const plan = planFlowArcs(entries.filter((e) => e.count > 0).map((e) => ({ key: e.name, count: e.count, weight: e.count })))
       for (const item of plan) {
-        spawnArc(COUNTRY_CENTROIDS[item.key] ?? FALLBACK_CENTROID, true, item.weight)
+        spawnArc(COUNTRY_CENTROIDS[item.key] ?? FALLBACK_CENTROID, true, item.weight, item.tier)
       }
       startLoop()
     },

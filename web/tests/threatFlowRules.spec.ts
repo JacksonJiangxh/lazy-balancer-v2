@@ -14,11 +14,12 @@ import {
   nextAdaptiveSampleN,
   nextFlowCursor,
   planFlowArcs,
+  planFlowEvents,
   reconstructObservedRate,
   stepAdaptiveSample,
   normalizeTrafficSampleN,
 } from '../src/utils/threatFlowRules.ts'
-import { flowArcWidth } from '../src/utils/threatTheme.ts'
+import { flowArcTierWidth } from '../src/utils/threatTheme.ts'
 
 test('流量采样配置：仅保留 -1/0，全量与固定 2-64 归一为自适应', () => {
   assert.equal(normalizeTrafficSampleN(-1), -1)
@@ -132,11 +133,12 @@ test('历史问题-5：采集租约重置后游标回零，正常递增与缺失
 })
 
 
-test('正常/攻击共用线宽：单条 1.2、10 条 3.2、上限 4', () => {
-  assert.equal(flowArcWidth(1), 1.2)
-  assert.ok(Math.abs(flowArcWidth(10) - 3.2) < 1e-9)
-  assert.equal(flowArcWidth(100), 4)
-  assert.ok(flowArcWidth(1) < flowArcWidth(10))
+test('正常/攻击共用显式线宽：thin 1.2、coarse 2.8、dense 4.2', () => {
+  assert.equal(flowArcTierWidth('thin'), 1.2)
+  assert.equal(flowArcTierWidth('coarse'), 2.8)
+  assert.equal(flowArcTierWidth('dense'), 4.2)
+  assert.ok(flowArcTierWidth('thin') < flowArcTierWidth('coarse'))
+  assert.ok(flowArcTierWidth('coarse') < flowArcTierWidth('dense'))
 })
 
 test('正常流按地区+秒桶分组：跨秒不合并，中国精确到省', () => {
@@ -153,24 +155,39 @@ test('正常流按地区+秒桶分组：跨秒不合并，中国精确到省', (
   assert.equal(gd.items.length, 2)
 })
 
-test('正常/攻击共用出弧计划：1-3 逐条、4-8 合并粗、>8 合并更粗，单轮预算一致', () => {
+test('正常/攻击共用出弧计划：1-3 逐条细、4-8 合并中粗、>8 合并最粗，单轮预算一致', () => {
   const plan = planFlowArcs([
-    { key: 'a', count: 20, weight: 160 },
-    { key: 'b', count: 5, weight: 40 },
-    { key: 'c', count: 3, weight: 3 },
+    { key: 'a|1', region: 'a', count: 20, weight: 160 },
+    { key: 'b|1', region: 'b', count: 5, weight: 40 },
+    { key: 'c|1', region: 'c', count: 3, weight: 3 },
   ], 4)
   assert.equal(plan.length, 4)
-  assert.deepEqual(plan[0], { key: 'a', weight: 160, aggregated: true })
-  assert.deepEqual(plan[1], { key: 'b', weight: 40, aggregated: true })
+  assert.deepEqual(plan[0], { key: 'a|1', region: 'a', weight: 160, tier: 'dense' })
+  assert.deepEqual(plan[1], { key: 'b|1', region: 'b', weight: 40, tier: 'coarse' })
   assert.deepEqual(plan.slice(2), [
-    { key: 'c', weight: 1, aggregated: false },
-    { key: 'c', weight: 1, aggregated: false },
+    { key: 'c|1', region: 'c', weight: 1, tier: 'thin' },
+    { key: 'c|1', region: 'c', weight: 1, tier: 'thin' },
   ])
-  const small = planFlowArcs([{ key: 'd', count: 3, weight: 3 }], 3)
+  const small = planFlowArcs([{ key: 'd|1', region: 'd', count: 3, weight: 3 }], 3)
   assert.deepEqual(small, [
-    { key: 'd', weight: 1, aggregated: false },
-    { key: 'd', weight: 1, aggregated: false },
-    { key: 'd', weight: 1, aggregated: false },
+    { key: 'd|1', region: 'd', weight: 1, tier: 'thin' },
+    { key: 'd|1', region: 'd', weight: 1, tier: 'thin' },
+    { key: 'd|1', region: 'd', weight: 1, tier: 'thin' },
   ])
   assert.equal(FLOW_MAX_ARCS_PER_FLUSH, 12)
+})
+
+test('出弧预算超限时扩大时间桶而不是直接丢组', () => {
+  const at = 1792281600000
+  // 13 个地区各 1 条：1s 桶预算 12 放不下；2s 桶内每组仍 1 条，仍超出。
+  // 5s 桶仍超预算时，坍缩为中国国家级并强制聚合，最高权重组必须保留。
+  const events = Array.from({ length: 13 }, (_, i) => ({
+    country: '中国',
+    province: `省${i}`,
+    at,
+    weight: 1,
+  }))
+  const plan = planFlowEvents(events, at + 100, 12)
+  assert.equal(plan.length, 1, '13 个省级洪峰最终坍缩为一条中国级聚合弧')
+  assert.deepEqual(plan[0], { key: '中国|358456320', region: '中国', weight: 13, tier: 'dense' })
 })
