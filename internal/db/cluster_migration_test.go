@@ -200,14 +200,8 @@ func TestImportNormalization_jsonTypeGateBlocksTopLevelString(t *testing.T) {
 	if _, err := DB.Exec(`INSERT INTO security_policies (name, mode, custom_rules) VALUES ('正常启用','off','[{"id":1,"enabled":true,"action":"block","score":5}]')`); err != nil {
 		t.Fatal(err)
 	}
-	// 与 config_backup.go:1776-1782 同款 SQL + json_type 双门
-	_, err := DB.Exec(`UPDATE security_policies SET mode='custom_only'
-WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALESCE(custom_rules,'[]')) IN ('array','object') AND EXISTS (
-  SELECT 1 FROM json_each(COALESCE(custom_rules,'[]')) je
-  WHERE json_extract(je.value,'$.enabled')=1
-     OR (json_type(je.value)='integer' AND EXISTS (
-          SELECT 1 FROM security_custom_rules r
-          WHERE r.id=je.value AND COALESCE(r.enabled,1)=1)))`)
+	// 导入与启动迁移共用同一 SQL 常量，测试不得再文本复刻第三份。
+	_, err := DB.Exec(SecurityPolicyCustomOnlyModeNormalizationSQL)
 	if err != nil {
 		t.Fatalf("导入归一双门 SQL 对顶层字符串不得报错: %v", err)
 	}

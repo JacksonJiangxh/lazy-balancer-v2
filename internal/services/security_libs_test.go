@@ -18,18 +18,20 @@ func stubSecurityLibsAvailable(t *testing.T) {
 	t.Helper()
 	tmp := t.TempDir()
 	crsDir := filepath.Join(tmp, "crs")
-	// 空 rules 目录即可视为可用（真实故障形态=目录缺失）；不写探针文件——
-	// 949 抬码等发射门以文件存在为条件，测试口径须与历史无库环境一致。
+	// 目录含基础设施探针文件——SecurityLibraryStatus 与安装门同口径，
+	// 空树不再算可用（949 抬码等发射门也以文件存在为条件）。
 	if err := os.MkdirAll(filepath.Join(crsDir, "rules"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(crsDir, "rules", crsRulesProbeFile), []byte("# fixture"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	xdb := filepath.Join(tmp, "ip2region.xdb")
 	if err := os.WriteFile(xdb, []byte("xdb"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	oldCRS, oldXdb := crsDirectivesDir, ip2regionLivePath
-	crsDirectivesDir, ip2regionLivePath = crsDir, xdb
-	t.Cleanup(func() { crsDirectivesDir, ip2regionLivePath = oldCRS, oldXdb })
+	restore := SetSecurityLibsDirsForTest(crsDir, xdb)
+	t.Cleanup(restore)
 }
 
 func TestGenerateCaddyConfig_missingSecurityLibs_disablesSecurityChain(t *testing.T) {
@@ -87,5 +89,57 @@ func TestGenerateCaddyConfig_missingSecurityLibs_disablesSecurityChain(t *testin
 	ip2regionLivePath = filepath.Join(tmp, "missing.xdb")
 	if renderHasWAF() {
 		t.Fatal("IP2Region 缺失时安全链不应渲染")
+	}
+}
+
+func TestSecurityLibraryStatus_matchesCRSIntegrityProbe(t *testing.T) {
+	cases := []struct {
+		name      string
+		files     []string
+		wantCRSOK bool
+	}{
+		{name: "missing rules", wantCRSOK: false},
+		{name: "empty rules", files: []string{}, wantCRSOK: false},
+		{name: "unrelated conf only", files: []string{"REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf"}, wantCRSOK: false},
+		{name: "901 probe present", files: []string{crsRulesProbeFile}, wantCRSOK: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			crsDir := filepath.Join(root, "crs")
+			if tc.files != nil {
+				if err := os.MkdirAll(filepath.Join(crsDir, "rules"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				for _, name := range tc.files {
+					if err := os.WriteFile(filepath.Join(crsDir, "rules", name), []byte("# fixture"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			xdb := filepath.Join(root, "ip2region.xdb")
+			if err := os.WriteFile(xdb, []byte("xdb"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			restore := SetSecurityLibsDirsForTest(crsDir, xdb)
+			t.Cleanup(restore)
+			crsOK, ip2regionOK := SecurityLibraryStatus()
+			if crsOK != tc.wantCRSOK || !ip2regionOK {
+				t.Fatalf("SecurityLibraryStatus=(%v,%v), want (%v,true)", crsOK, ip2regionOK, tc.wantCRSOK)
+			}
+		})
+	}
+}
+
+func TestSetSecurityLibsDirsForTest_forwardsCRSLiveRoot(t *testing.T) {
+	original := CRSLiveDir()
+	crsDir := filepath.Join(t.TempDir(), "crs")
+	restore := SetSecurityLibsDirsForTest(crsDir, filepath.Join(t.TempDir(), "ip2region.xdb"))
+	if got := CRSLiveDir(); got != crsDir {
+		t.Fatalf("CRSLiveDir=%q, want forwarded test root %q", got, crsDir)
+	}
+	restore()
+	if got := CRSLiveDir(); got != original {
+		t.Fatalf("restore left CRSLiveDir=%q, want %q", got, original)
 	}
 }

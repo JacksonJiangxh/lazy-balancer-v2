@@ -25,6 +25,31 @@ const (
 	ipListMaxGlobalCount       = 200
 )
 
+// loadSystemListIDs 一次读取全部 system=1 内置名单的 name→id 映射（威胁库与
+// 爬虫库列表共用）。缺行不制造默认值：调用方取 map 未命中得到 0（DTO 保留
+// list_id=0）；查询/扫描/迭代故障显式返回 error，由端点 500（残缺列表不得
+// 以 200 返回）。
+func loadSystemListIDs() (map[string]int, error) {
+	rows, err := db.DB.Query(`SELECT name, id FROM security_ip_lists WHERE system=1`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := map[string]int{}
+	for rows.Next() {
+		var name string
+		var id int
+		if err := rows.Scan(&name, &id); err != nil {
+			return nil, err
+		}
+		ids[name] = id
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
 // parseIPListRefsIDs 宽松解析 refs JSON 为 id 列表：畸形/空 → nil（重启用悬空
 // 引用门读取存量值用；存量列恒为写入侧校验过的合法形态，畸形仅见于带外改库）。
 // parseIPListRefsIDs 与 services.parseIPListRefs 为镜像实现（历史问题

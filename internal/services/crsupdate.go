@@ -37,8 +37,12 @@ const (
 	CRSStatusCancelled CRSUpdateStatus = "cancelled"
 )
 
+// defaultCRSLiveDir 是 CRS 活树容器内默认根：写侧（crsLiveDir）与渲染读侧
+// （crsDirectivesDir）共用同一声明，ConfigureWafDirs 与测试缝同批转发两变量。
+const defaultCRSLiveDir = "/app/waf/crs"
+
 var (
-	crsLiveDir     = "/app/waf/crs"
+	crsLiveDir     = defaultCRSLiveDir
 	crsSnapshotDir = "/app/data/crs"
 	crsDistDir     = "/app/waf.dist/crs"
 )
@@ -397,7 +401,14 @@ func (m *CRSUpdateManager) runWithContext(runCtx context.Context, trigger string
 	// 会写本地版本行、替换规则树并 reload，瞬时打破只读不变量。
 	// 历史问题（历史）：NULL 兜底归一为 1，与 IsMaster/readonly 写闸/
 	// 调度器 tick 的 COALESCE(is_master,1) 同口径（历史 NULL 视为主节点）。
-	if isMaster, err := RoleOf(context.Background(), db.DB); err != nil || !isMaster {
+	if isMaster, roleErr := RoleOf(context.Background(), db.DB); roleErr != nil {
+		// 角色读取失败（DB 瞬断/脏行）≠从节点——按失败落定（task_runs/任务
+		// 监控可见），不得静默跳过（历史问题：err!=nil||!isMaster 把 DB 故障
+		// 当从节点）。
+		m.fail(fmt.Errorf("角色读取失败，无法判定本节点是否主节点，已中止 CRS 更新: %w", roleErr), false)
+		m.advanceSlotIfAuto(trigger)
+		return
+	} else if !isMaster {
 		// 历史问题-05（历史）：从节点中止是正常跳过语义，对齐威胁族——
 		// 落 skipped 终态、审计「更新跳过」，不再记「更新失败」。
 		m.syncInstalledVersionToState()
@@ -431,7 +442,7 @@ func (m *CRSUpdateManager) runWithContext(runCtx context.Context, trigger string
 	if err != nil {
 		// 历史问题-01：runCtx 取消且已非主节点=demote 在途中止——落 skipped
 		// （与起点角色复查同语义），不走 fail（从节点中止非故障、不 restore）。
-		if master, known := updateRunRoleAtCancel(); runCtx.Err() != nil && known && !master {
+		if master, known := updateRunRole(); runCtx.Err() != nil && known && !master {
 			m.syncInstalledVersionToState()
 			m.setStage(CRSStatusSkipped, "节点已降级为从节点，终止 CRS 更新")
 			return
@@ -507,7 +518,7 @@ func (m *CRSUpdateManager) runWithContext(runCtx context.Context, trigger string
 	if installErr != nil {
 		// 历史问题-01：同上方 fetch 分支——demote 在途中止落 skipped（不 restore：
 		// 从节点不回滚不 reload，保持只读不变量）。
-		if master, known := updateRunRoleAtCancel(); runCtx.Err() != nil && known && !master {
+		if master, known := updateRunRole(); runCtx.Err() != nil && known && !master {
 			m.syncInstalledVersionToState()
 			m.setStage(CRSStatusSkipped, "节点已降级为从节点，终止 CRS 更新")
 			return

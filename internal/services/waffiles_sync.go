@@ -336,8 +336,7 @@ func wafRefStatSignature() (string, error) {
 		// 但会让「全量构建」从成功变为显式错误——不能因此命中旧引用。
 		fmt.Fprintf(h, "%s\x00%d\x00%d\x00%s\n", p, info.Size(), info.ModTime().UnixNano(), info.Mode())
 	}
-	rulesDir := filepath.Join(crsLiveDir, "rules")
-	if _, err := os.Stat(rulesDir); err == nil {
+	if _, err := os.Stat(crsLiveDir); err == nil {
 		if err := filepath.Walk(crsLiveDir, func(p string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
@@ -361,6 +360,17 @@ func wafRefStatSignature() (string, error) {
 			return "", err
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	// rules/ 缺失时上面的树遍历仍会覆盖活树根，但 VERSION 是引用构建的独立
+	// 输入：显式读取内容入签名（不依赖父目录/规则树存在），并区分「缺失」与
+	// 「存在但空」，保证版本内容变化恒改变签名。
+	versionPath := filepath.Join(crsLiveDir, "VERSION")
+	if data, err := os.ReadFile(versionPath); err == nil {
+		fmt.Fprintf(h, "crs-version\x00%d\x00%s\n", len(data), data)
+	} else if errors.Is(err, os.ErrNotExist) {
+		fmt.Fprint(h, "crs-version-missing\n")
+	} else {
 		return "", err
 	}
 	for _, p := range []string{ip2regionLivePath, ip2regionLivePath + ".version"} {

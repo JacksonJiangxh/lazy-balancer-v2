@@ -231,7 +231,7 @@ func TestBuildCorazaDirectives_unresolvedPolicyFallsBackToInline(t *testing.T) {
 func TestBuildCorazaDirectives_whitelistRefsMergedIntoTrustRule(t *testing.T) {
 	newClusterTestService(t)
 	listID := seedIPList(t, "trust-src", `[{"value":"198.51.100.7","remark":""}]`)
-	res, err := db.DB.Exec(`INSERT INTO security_policies (name, mode, ip_whitelist, ip_whitelist_refs, enabled) VALUES ('trustrefs', 'off', '["198.51.100.9"]', ?, 1)`, fmtListIDs(listID))
+	res, err := db.DB.Exec(`INSERT INTO security_policies (name, mode, anomaly_threshold, ip_whitelist, ip_whitelist_refs, enabled) VALUES ('trustrefs', 'blocking', 5, '["198.51.100.9"]', ?, 1)`, fmtListIDs(listID))
 	if err != nil {
 		t.Fatalf("seed policy: %v", err)
 	}

@@ -552,12 +552,12 @@ func TestCRSUpdateRun_cancelDuringReloadRollsBackVersionRowAndMarker(t *testing.
 	}
 }
 
-// 取消观察点用 updateRunStillMaster 做角色复核——DB 读
+// 取消观察点曾用二态角色复核（已退役的 updateRunStillMaster）——DB 读
 // 失败被并入「非主节点」而跳过同代回滚；随后 run() 的 cancel(..., true) 走
 // restoreBackup 只还文件树、不还 VERSION 标记与 DB 版本行 → 「旧树+新版本行」
 // 被下轮 tag==current「已是最新」短路永久固化（ReconcileCRSState 因
 // liveV==dbV 也不修复——版本行没回滚，liveV 反而是旧的，对账会把 live 标
-// 记成新版本的假象固化）。修复=三态门 updateRunRoleAtCancel：!known（角色
+// 记成新版本的假象固化）。修复=三态门 updateRunRole：!known（角色
 // 不可判定）按主节点口径执行同代回滚（主节点避免固化；真从节点多回滚一次
 // 由集群同步自愈）；known && !master（真降级）保持 历史问题-01 不回滚语义。
 //

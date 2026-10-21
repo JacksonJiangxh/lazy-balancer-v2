@@ -90,6 +90,34 @@ const (
 	securityDescriptionMaxRunes = 500
 )
 
+// validateBlockPagePayload 是拦截页创建/编辑共用的载荷门：名称/描述/内容
+// 必填与长度、64KB 内容上限、内容类型默认值与白名单。空 ContentType 归一为
+// 默认 html（原地写回）。错误文案沿用端点既有 400 语义。
+func validateBlockPagePayload(page *models.SecurityBlockPage) error {
+	if strings.TrimSpace(page.Name) == "" {
+		return fmt.Errorf("拦截页面名称不能为空")
+	}
+	if utf8.RuneCountInString(page.Name) > securityNameMaxRunes {
+		return fmt.Errorf("拦截页面名称不能超过 100 字符")
+	}
+	if utf8.RuneCountInString(page.Description) > securityDescriptionMaxRunes {
+		return fmt.Errorf("拦截页面描述不能超过 500 字符")
+	}
+	if strings.TrimSpace(page.Content) == "" {
+		return fmt.Errorf("拦截页面内容不能为空")
+	}
+	if len(page.Content) > 64<<10 {
+		return fmt.Errorf("拦截页面内容不能超过 64KB")
+	}
+	if page.ContentType == "" {
+		page.ContentType = models.DefaultBlockPageContentType
+	}
+	if !models.ValidBlockPageContentType(page.ContentType) {
+		return fmt.Errorf("内容类型不支持，可选：text/html、application/json、application/xml、text/plain（均 UTF-8）")
+	}
+	return nil
+}
+
 func validateSecurityCustomRule(rule *models.SecurityCustomRule) error {
 	// 历史问题-01（历史）：负 ID 发射 id:crID+10000 会生成重复（id:10 撞
 	// body processor）或负 SecRule id，整份 coraza 配置被拒——本函数是
@@ -423,36 +451,8 @@ func (h *Handlers) CreateSecurityBlockPage(c *gin.Context) {
 	}
 	h.caddyOpMu.Lock()
 	defer h.caddyOpMu.Unlock()
-	if strings.TrimSpace(req.Name) == "" {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "拦截页面名称不能为空"})
-		return
-	}
-	// 历史修复（历史）：name/description 补 rune 封顶（历史问题-4 家族漏收敛
-	// 点——策略/自定义规则同口径 100/500；DB 列无长度约束，超长串随列表响应/
-	// 审计详情放大）。
-	if utf8.RuneCountInString(req.Name) > securityNameMaxRunes {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "拦截页面名称不能超过 100 字符"})
-		return
-	}
-	if utf8.RuneCountInString(req.Description) > securityDescriptionMaxRunes {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "拦截页面描述不能超过 500 字符"})
-		return
-	}
-	if strings.TrimSpace(req.Content) == "" {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "拦截页面内容不能为空"})
-		return
-	}
-	// 历史问题-4:content 随 errors.routes 内联发射,封顶 64KB。
-	if len(req.Content) > 64<<10 {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "拦截页面内容不能超过 64KB"})
-		return
-	}
-	// 历史修复 白名单（2026-09-25 用户裁定）：空=默认 html。
-	if req.ContentType == "" {
-		req.ContentType = models.DefaultBlockPageContentType
-	}
-	if !models.ValidBlockPageContentType(req.ContentType) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "内容类型不支持，可选：text/html、application/json、application/xml、text/plain（均 UTF-8）"})
+	if err := validateBlockPagePayload(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
 	// API 不允许创建默认拦截页（历史问题）：默认页仅 db 种子行，第二个
@@ -499,34 +499,8 @@ func (h *Handlers) UpdateSecurityBlockPage(c *gin.Context) {
 	}
 	h.caddyOpMu.Lock()
 	defer h.caddyOpMu.Unlock()
-	if strings.TrimSpace(req.Name) == "" {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "拦截页面名称不能为空"})
-		return
-	}
-	// 历史修复（历史）：name/description rune 封顶（与创建同口径）。
-	if utf8.RuneCountInString(req.Name) > securityNameMaxRunes {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "拦截页面名称不能超过 100 字符"})
-		return
-	}
-	if utf8.RuneCountInString(req.Description) > securityDescriptionMaxRunes {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "拦截页面描述不能超过 500 字符"})
-		return
-	}
-	if strings.TrimSpace(req.Content) == "" {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "拦截页面内容不能为空"})
-		return
-	}
-	// 历史问题-4:content 随 errors.routes 内联发射,封顶 64KB(与创建同口径)。
-	if len(req.Content) > 64<<10 {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "拦截页面内容不能超过 64KB"})
-		return
-	}
-	// 历史修复 白名单（2026-09-25 用户裁定，与创建同口径）：空=默认 html。
-	if req.ContentType == "" {
-		req.ContentType = models.DefaultBlockPageContentType
-	}
-	if !models.ValidBlockPageContentType(req.ContentType) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "内容类型不支持，可选：text/html、application/json、application/xml、text/plain（均 UTF-8）"})
+	if err := validateBlockPagePayload(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
 	var isDefault, isBuiltin bool

@@ -13,7 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// A88 P2-11：创建即禁用（enabled 显式 false）跳过冲突门——禁用规则不渲染、
+// 创建即禁用：创建即禁用（enabled 显式 false）跳过冲突门——禁用规则不渲染、
 // 零冲突（UI 复制向导按预览「禁用」态创建副本，旧码被域名/端口门恒 400）；
 // 启用方向由 EnableRule 既有二次门把守（与 DuplicateRule 无门、UpdateRule
 // 启用方向检查同构）。enabled=true/缺省的创建行为完全不变。

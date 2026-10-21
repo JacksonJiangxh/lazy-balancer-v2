@@ -502,8 +502,8 @@ func persistCRSSnapshotFromInLock(liveDir, snapshotDir, version string) error {
 // observeCancelAfterSwap 树交换段之后的取消观察点：
 // 返回 nil=未取消；非 nil=已取消（调用方直接返回该错误）。
 //
-// 角色判定用三态 updateRunRoleAtCancel（taskrun.go），取代二态
-// updateRunStillMaster——后者把 DB 读失败并入「非主节点」而跳过回滚，随后
+// 角色判定用三态 updateRunRole（taskrun.go），取代已退役的二态角色复核
+// （updateRunStillMaster）——后者把 DB 读失败并入「非主节点」而跳过回滚，随后
 // run() 的 cancel(..., true) 走 restoreBackup 只还文件树、不还 VERSION 标记与
 // DB 版本行，留下「旧树+新版本行」被下轮 tag==current「已是最新」短路永久
 // 固化。门径：
@@ -518,7 +518,7 @@ func (m *CRSUpdateManager) observeCancelAfterSwap(parent context.Context, prevTa
 	if cerr == nil {
 		return nil
 	}
-	isMaster, known := updateRunRoleAtCancel()
+	isMaster, known := updateRunRole()
 	switch {
 	case !known:
 		WriteCRSUpdateLog("WARN", stage, "取消时节点角色不可判定（DB 读失败），按主节点口径执行同代回滚（防「旧树+新版本行」固化）")

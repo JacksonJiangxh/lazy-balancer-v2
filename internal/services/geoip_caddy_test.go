@@ -197,12 +197,18 @@ func TestBuildIPPrecheckDirectives_geoipMultiPolicyOrderAndTrust(t *testing.T) {
 		t.Fatalf("geoip chains must be ordered p1 < p2 < SecMarker:\n%s", directives)
 	}
 	// p1 信任续段：紧随其 X-LB-GeoIP-Loc 续段之后、p2 链之前。
-	locIdx := strings.Index(directives, ` SecRule REQUEST_HEADERS:X-LB-GeoIP-Loc "@rx ^(?:海外)$" "t:none"`)
+	// 三段链：中段（GeoIP）必须带 chain 才能把信任续段纳入同一链——否则续段
+	// 退化为无动作顶层规则，链内自抑制不存在（引擎门禁测试钉住编译与行为）。
+	locIdx := strings.Index(directives, ` SecRule REQUEST_HEADERS:X-LB-GeoIP-Loc "@rx ^(?:海外)$" "t:none,chain"`)
 	// v2.3.x：信任续段名单经 @ipListFast 文件投影（p%d-trust scope）。
 	trust := `SecRule REMOTE_ADDR "!@ipListFast `
 	trustIdx := strings.Index(directives, trust)
 	if locIdx < 0 || trustIdx < 0 || trustIdx < locIdx || trustIdx > idx2 {
-		t.Fatalf("p1 trust continuation must follow its X-LB-GeoIP-Loc segment and precede p2 chain:\n%s", directives)
+		t.Fatalf("p1 trust continuation must chain after its X-LB-GeoIP-Loc segment and precede p2 chain:\n%s", directives)
+	}
+	// p2 无信任续段：中段必须终止链（不得出现悬空 chain）。
+	if strings.Contains(directives[idx2:], `X-LB-GeoIP-Loc "@rx ^(?:江苏(?:/.*)?)$" "t:none,chain"`) {
+		t.Fatalf("p2 without trust continuation must terminate its chain:\n%s", directives)
 	}
 	if got := readRenderedIPList(t, directives[trustIdx:], "-trust"); got != "1.2.3.4/32\n" {
 		t.Fatalf("信任续段名单文件=%q, want 仅 1.2.3.4/32", got)

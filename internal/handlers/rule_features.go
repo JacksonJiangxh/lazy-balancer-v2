@@ -919,19 +919,40 @@ func contextUserID(c *gin.Context) int64 {
 
 // 历史问题: 列表查询不加载 tls_cert/tls_key 正文，减少大字段 I/O。
 // 由完整投影派生两个空占位，列顺序与 lbRuleColumns 恒一致，scanLbRules 无需修改。
-var lbRuleListColumns = strings.Replace(lbRuleColumns, "COALESCE(tls_cert,''), COALESCE(tls_key,'')", "'', ''", 1)
+// 列表投影派生断言：派生依赖「证书列字样必须命中」——字样改名/重排时 strings.Replace
+// 会静默返回原文（列表回读私钥正文且大字段 I/O 回归），故派生函数在命中
+// 失败时于包初始化 panic（fail-visible：全部入口拒绝以错误投影启动），另
+// 有钉测断言列表列不含 tls_cert/tls_key 字样。
+var lbRuleListColumns = deriveLbRuleListColumns()
 
-const lbRuleColumns = `COALESCE(id,0), COALESCE(caddy_id,''), name, COALESCE(description,''), protocol, COALESCE(domain,''), listen_port, COALESCE(strategy,''),
+// deriveLbRuleListColumns 从完整投影派生列表投影并断言替换命中（列表投影派生断言）。
+func deriveLbRuleListColumns() string {
+	const certColumns = "COALESCE(tls_cert,''), COALESCE(tls_key,'')"
+	if !strings.Contains(lbRuleColumns, certColumns) {
+		panic("lbRuleColumns 证书列字样缺失：lbRuleListColumns 派生失效（列表投影会回读 tls_cert/tls_key 正文）")
+	}
+	return strings.Replace(lbRuleColumns, certColumns, "'', ''", 1)
+}
+
+// lbRuleColumns 是规则完整投影（ListRules/GetRule/DuplicateRule 共用）。
+// 治理默认值单源：治理默认值列（健康检查间隔/超时/阈值、tcp_try_interval）的 SQL
+// 兜底字面量是默认值的第三次复制（DDL DEFAULT + 启动回填 + 本读路径）——
+// 改为 db.Default* 常量单源（与 GetConfig 的 COALESCE(col,?) 绑定同模式）。
+// 非治理列字面量维持原状。
+var lbRuleColumns = fmt.Sprintf(`COALESCE(id,0), COALESCE(caddy_id,''), name, COALESCE(description,''), protocol, COALESCE(domain,''), listen_port, COALESCE(strategy,''),
 	COALESCE(dynamic_dns,0), COALESCE(enable_dns_server,0), COALESCE(dns_server,''), COALESCE(dns_family,'ipv4'),
-	COALESCE(health_check_path,''), COALESCE(health_check_interval,10), COALESCE(health_check_timeout,2), COALESCE(health_check_unhealthy_threshold,3), COALESCE(health_check_healthy_threshold,2),
-	COALESCE(enable_active_health_check,0), COALESCE(tcp_health_check_port,0), COALESCE(tcp_proxy_protocol,0), COALESCE(tcp_try_duration,0), COALESCE(tcp_try_interval,250),
+	COALESCE(health_check_path,''), COALESCE(health_check_interval,%d), COALESCE(health_check_timeout,%d), COALESCE(health_check_unhealthy_threshold,%d), COALESCE(health_check_healthy_threshold,%d),
+	COALESCE(enable_active_health_check,0), COALESCE(tcp_health_check_port,0), COALESCE(tcp_proxy_protocol,0), COALESCE(tcp_try_duration,0), COALESCE(tcp_try_interval,%d),
 	COALESCE(request_body_max_size_mb,0), COALESCE(upstream_keepalive_timeout,0), COALESCE(server_tokens_hidden,0), COALESCE(ntlm_compatible,0), COALESCE(upstream_force_http1,0),
 	COALESCE(custom_routes_enabled,0),
 	COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
 	COALESCE(enable_tls,0), COALESCE(tls_source,'manual'), COALESCE(acme_config_id,0), COALESCE(ca_provider_id,0), COALESCE(tls_cert,''), COALESCE(tls_key,''),
 	COALESCE(tls_http_redirect,0), COALESCE(enable_compress,0), COALESCE(compress_types,'gzip'), IIF(enabled IN ('1',1),1,0), COALESCE(log_enabled,0),
 	created_by, created_at, updated_at, updated_by, COALESCE(host_header,''), COALESCE(health_check_host,''),
-	COALESCE(block_page_stage1_id,0), COALESCE(block_page_stage1_status,0), COALESCE(block_page_stage3_id,0), COALESCE(block_page_stage3_status,0)`
+	COALESCE(block_page_stage1_id,0), COALESCE(block_page_stage1_status,0), COALESCE(block_page_stage3_id,0), COALESCE(block_page_stage3_status,0)`,
+	db.DefaultHealthCheckInterval, db.DefaultHealthCheckTimeout,
+	db.DefaultHealthCheckUnhealthyThreshold, db.DefaultHealthCheckHealthyThreshold,
+	db.DefaultTCPTryInterval)
 
 // 规范化规则行扫描：ListRules/GetRule/DuplicateRule 共用，避免列清单多处漂移
 func scanLbRules(rows *sql.Rows) ([]models.LbRule, error) {

@@ -13,7 +13,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// P2-06：分类导入携带 security_ip_lists（名单表将被全量替换）且备份未携带
+// 导入受信代理引用复核：分类导入携带 security_ip_lists（名单表将被全量替换）且备份未携带
 // trusted_proxy_range_refs（未选系统数据/Config 缺席或 Config 未含该键）时，
 // 导入后 refs=live 值、名单=备份行集合——live refs 指向不在备份内的名单 id
 // 即导入后悬空。锁内复核必须按备份名单 id 集合重验 live refs 并 400。
@@ -71,7 +71,7 @@ func TestRevalidateImportTrustedProxyRefsAgainstCarriedLists(t *testing.T) {
 	}
 }
 
-// P2-09：备份携带 lb_rules（引用阶段拦截页）且未携带 security_block_pages 时，
+// 导入拦截页引用复核：备份携带 lb_rules（引用阶段拦截页）且未携带 security_block_pages 时，
 // 初检按锁外 live 页集合放行后、加锁前窗口内被引用页可被删除（live 删除守卫
 // 只看 live 规则，看不到备份行的引用）。锁内必须按事务视图重验并 400。
 func TestRevalidateImportStageBlockPagesCatchesWindowDeletion(t *testing.T) {
@@ -139,7 +139,7 @@ func TestRevalidateImportStageBlockPagesCatchesWindowDeletion(t *testing.T) {
 	}
 }
 
-// P2-10：用户/API 密钥写端点（users 与 api_keys 均在导入全量替代表清单内）
+// 导入窗口写门：用户/API 密钥写端点（users 与 api_keys 均在导入全量替代表清单内）
 // 在导入会话窗口内必须 409 fast-fail——窗口内写入要么被全量替换静默覆盖，
 // 要么阻塞至 busy_timeout 后 500。与节点写族同口径。
 func TestUserAndAPIKeyWrites409DuringImport(t *testing.T) {

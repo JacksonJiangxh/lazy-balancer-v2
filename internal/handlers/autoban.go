@@ -77,11 +77,12 @@ func autobanScopeText(scope string) string {
 // 未清理条目）。
 func (h *Handlers) GetAutobanStatus(c *gin.Context) {
 	cfg := services.GetAutobanConfig()
-	entries, _, err := services.AutobanListEntries()
+	entries, listID, err := services.AutobanListEntries()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取自动封禁名单失败: " + err.Error()})
 		return
 	}
+	preset := autobanPresetListState{id: listID, entries: entries}
 	isMaster := services.AutobanIsMaster()
 	suggestions := services.AutobanSuggestions()
 	for i := range suggestions {
@@ -98,12 +99,12 @@ func (h *Handlers) GetAutobanStatus(c *gin.Context) {
 		"scope":           cfg.Scope,
 		"banned_today":    services.AutobanBannedToday(),
 		"list_entries":    len(services.AutobanActiveEntries(entries)),
-		"list_referenced": h.autobanListReferenced(),
+		"list_referenced": h.autobanListReferenced(preset),
 		// 历史问题-02：黄条真正需要的是「封禁是否生效」——名单被 deny + IP 访问
 		// 控制启用的策略引用且名单非空才生效；list_referenced 复用热路径资格门
 		// 的四面引用集（含白名单/受信代理/CRS 排除），不能区分「引用」与「拦截
 		// 生效」，曾抑制唯一的不生效告警。
-		"ban_effective": h.autobanBanEffective(),
+		"ban_effective": h.autobanBanEffective(preset),
 		"tracked_ips":   services.AutobanTrackedIPs(),
 		"suggestions":   suggestions,
 		"is_master":     isMaster,
@@ -131,6 +132,15 @@ func (h *Handlers) GetAutobanStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: resp})
 }
 
+// autobanPresetListState 是一次请求内预置名单的单一读取结果：id 缺失/查询
+// 故障（err 非空）与条目快照一并传入两个黄条判据，避免同一状态端点三次
+// 查同一行（历史问题）。err/id 丢失时两判据均 fail-closed=true。
+type autobanPresetListState struct {
+	id      int64
+	entries []models.IPListEntry
+	err     error
+}
+
 // autobanListReferenced 启用中的策略是否引用预置名单（黄条判据）。引用面判定
 // 单源 services.IPListsReferencedByEnabledPolicy（历史修复，历史：原第二份
 // 窄引用实现只查 ip_acl_list_refs/ip_whitelist_refs，与热路径资格门 历史修复
@@ -138,12 +148,11 @@ func (h *Handlers) GetAutobanStatus(c *gin.Context) {
 // 引用的名单会被黄条误报「名单未生效」；错误日志沿用单源通用前缀「IP 名单
 // 写路径」）。查询失败 fail-closed（按已引用处理——不弹黄条，避免误报「未
 // 生效」），与单源内部口径一致。
-func (h *Handlers) autobanListReferenced() bool {
-	var listID int64
-	if err := db.DB.QueryRow(`SELECT id FROM security_ip_lists WHERE name=? AND COALESCE(system,0)=1`, services.AutobanPresetListName).Scan(&listID); err != nil {
+func (h *Handlers) autobanListReferenced(preset autobanPresetListState) bool {
+	if preset.err != nil || preset.id <= 0 {
 		return true
 	}
-	return services.IPListsReferencedByEnabledPolicy([]int{int(listID)})
+	return services.IPListsReferencedByEnabledPolicy([]int{int(preset.id)})
 }
 
 // autobanBanEffective 封禁是否真正生效（历史问题-02 黄条判据）：预置名单存在且
@@ -158,15 +167,11 @@ func (h *Handlers) autobanListReferenced() bool {
 // 文件就绪探测），在此复制判据会形成第二份实现；签发起步通常以分钟计，且
 // 证书就绪后自动重载，黄条在窗口内可能短暂假阴性。
 // 查询失败 fail-closed（返回 true，不弹误导性黄条——与 list_referenced 同口径）。
-func (h *Handlers) autobanBanEffective() bool {
-	var listID int64
-	if err := db.DB.QueryRow(`SELECT id FROM security_ip_lists WHERE name=? AND COALESCE(system,0)=1`, services.AutobanPresetListName).Scan(&listID); err != nil {
+func (h *Handlers) autobanBanEffective(preset autobanPresetListState) bool {
+	if preset.err != nil || preset.id <= 0 {
 		return true
 	}
-	entries, _, err := services.AutobanListEntries()
-	if err != nil {
-		return true
-	}
+	entries := preset.entries
 	if len(services.AutobanActiveEntries(entries)) == 0 {
 		return false // 空名单：即便被 deny 策略引用也不拦截任何 IP
 	}
@@ -180,7 +185,7 @@ func (h *Handlers) autobanBanEffective() bool {
 		              WHERE b.policy_id=p.id AND r.protocol='http' AND COALESCE(r.enabled,0)=1
 		                AND EXISTS (SELECT 1 FROM upstreams u
 		                            WHERE u.rule_id=r.caddy_id AND IIF(u.enabled IN ('1',1),1,0)=1))`,
-		listID).Scan(&count); err != nil {
+		preset.id).Scan(&count); err != nil {
 		return true
 	}
 	return count > 0

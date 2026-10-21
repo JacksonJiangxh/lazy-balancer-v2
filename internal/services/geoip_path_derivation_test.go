@@ -2,7 +2,7 @@ package services
 
 import "testing"
 
-// 第 88 轮 P2-02/P2-03 钉测：xdb 与爬虫快照路径必须随 data_dir 派生并发射进
+//  GeoIP 路径派生/爬虫快照路径派生 钉测：xdb 与爬虫快照路径必须随 data_dir 派生并发射进
 // geoip2region handler。非默认形态下若渲染侧不发射，Caddy 侧 caddygeoip 插件
 // 按自身 Provision 兜底默认（/app/data/...）读库——自定义 data_dir 部署的
 // GeoIP 解析与爬虫 IP 段豁免静默失效（写侧已随 data_dir 派生，读侧却读 /app）。

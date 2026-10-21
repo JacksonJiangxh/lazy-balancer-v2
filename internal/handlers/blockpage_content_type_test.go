@@ -16,6 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/models"
 	"lazy-balancer-v2/internal/services"
 )
 
@@ -178,5 +179,34 @@ func TestListSecurityBlockPages_ruleRefCount(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("列表未包含新建页面")
+	}
+}
+
+func TestValidateBlockPagePayload_sharedContract(t *testing.T) {
+	valid := models.SecurityBlockPage{Name: "page", Content: "<html>x</html>"}
+	if err := validateBlockPagePayload(&valid); err != nil {
+		t.Fatalf("valid payload rejected: %v", err)
+	}
+	if valid.ContentType != models.DefaultBlockPageContentType {
+		t.Fatalf("empty content type=%q, want default %q", valid.ContentType, models.DefaultBlockPageContentType)
+	}
+	cases := []struct {
+		name string
+		page models.SecurityBlockPage
+	}{
+		{name: "empty name", page: models.SecurityBlockPage{Content: "x"}},
+		{name: "long name", page: models.SecurityBlockPage{Name: strings.Repeat("名", securityNameMaxRunes+1), Content: "x"}},
+		{name: "long description", page: models.SecurityBlockPage{Name: "page", Description: strings.Repeat("述", securityDescriptionMaxRunes+1), Content: "x"}},
+		{name: "empty content", page: models.SecurityBlockPage{Name: "page"}},
+		{name: "oversize content", page: models.SecurityBlockPage{Name: "page", Content: strings.Repeat("x", 64<<10+1)}},
+		{name: "unknown content type", page: models.SecurityBlockPage{Name: "page", Content: "x", ContentType: "image/png"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			page := tc.page
+			if err := validateBlockPagePayload(&page); err == nil {
+				t.Fatal("invalid payload must be rejected")
+			}
+		})
 	}
 }

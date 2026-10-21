@@ -11,9 +11,10 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 节点降级途中的中止必须给源行落终态——否则源行永久停留
-// update_status='running'，从节点 UI 长期显示「运行中」且不自愈。
-func TestThreatUpdate_demoteMidRun_writesSourceTerminalState(t *testing.T) {
+// 降级零写 裁定（从节点零写优先）：节点降级途中的中止不再给源行落终态——
+// 从节点 DB 由集群同步收敛，中止仅以任务日志「降级中止」留痕；源行滞留
+// running 由下次主节点同步覆盖（旧形态写 skipped 终态，违反从节点只读不变量）。
+func TestThreatUpdate_demoteMidRun_doesNotWriteSourceRow(t *testing.T) {
 	overrideWafDirForTest(t)
 	newClusterTestService(t)
 	setupThreatTest(t, nil, nil, nil)
@@ -39,14 +40,13 @@ func TestThreatUpdate_demoteMidRun_writesSourceTerminalState(t *testing.T) {
 	if err := db.DB.QueryRow(`SELECT update_status, COALESCE(message,'') FROM security_threat_sources WHERE id=?`, id).Scan(&status, &message); err != nil {
 		t.Fatal(err)
 	}
-	if status == "running" {
-		t.Fatalf("源行状态滞留 running（demote 中止必须落终态）")
+	// 源行保持中止前由 running 标记写入的状态——降级中止零写（ skipped
+	// 终态落库已随「从节点零写优先」裁定退役）。
+	if status != "running" {
+		t.Fatalf("status=%q, want running（demote 中止不得写源行终态，从节点零写）", status)
 	}
-	if status != "skipped" {
-		t.Fatalf("status=%q, want skipped（与任务级 skipped 同语义）", status)
-	}
-	if message == "" {
-		t.Fatal("skipped 终态必须带原因文案")
+	if message != "" {
+		t.Fatalf("message=%q, want 空（降级中止不写库，留痕仅走任务日志）", message)
 	}
 }
 

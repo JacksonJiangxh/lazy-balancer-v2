@@ -23,6 +23,10 @@ import (
 	"lazy-balancer-v2/internal/taskengine"
 )
 
+// CrawlerTaskID 是爬虫地址库更新任务 ID（taskengine 注册、handler 状态/
+// 触发/日志、任务监控共用；字面量只允许存在于本常量与任务注册处）。
+const CrawlerTaskID = "crawlerbot-update"
+
 // CrawlerUpdateManager 爬虫地址库更新入口（与威胁库同为 Manager 形态；
 // 当前无运行态字段，单例仅统一生命周期与调用契约）。
 type CrawlerUpdateManager struct{}
@@ -252,7 +256,13 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 		outcome = "failed"
 		return errors.New("主库未初始化")
 	}
-	if !updateRunStillMaster() {
+	if isMaster, roleErr := RoleOf(context.Background(), db.DB); roleErr != nil {
+		// 角色读取失败（DB 瞬断/脏行）≠从节点——按失败返回（task_runs/任务
+		// 监控可见），不得静默跳过（历史问题：二态复核把 DB 故障当从节点）。
+		outcome = "failed"
+		TaskLogfWarn("crawlerbot-update", "failed", "角色读取失败，无法判定本节点是否主节点，已中止爬虫地址更新: %v", roleErr)
+		return fmt.Errorf("角色读取失败: %w", roleErr)
+	} else if !isMaster {
 		outcome = "skipped"
 		TaskLogfWarn("crawlerbot-update", "skipped", "当前节点为从节点，终止爬虫地址更新")
 		return taskengine.ErrTaskSkipped
@@ -280,7 +290,12 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 	var firstErr error
 	successCount, failedCount, totalEntries, changedCount := 0, 0, 0, 0
 	for _, src := range sources {
-		if !updateRunStillMaster() {
+		if isMaster, known := updateRunRole(); !known {
+			// 角色读取失败≠降级——按失败返回（任务可见），不误报「从节点」。
+			outcome = "failed"
+			TaskLogfWarn("crawlerbot-update", "failed", "角色读取失败，无法判定本节点是否主节点，终止爬虫地址更新（已完成源保留）")
+			return errors.New("角色读取失败，无法判定本节点是否主节点")
+		} else if !isMaster {
 			outcome = "skipped"
 			TaskLogfWarn("crawlerbot-update", "skipped", "节点已降级为从节点，终止爬虫地址更新（已完成源保留）")
 			return taskengine.ErrTaskSkipped
@@ -308,7 +323,13 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 		})
 		if err != nil {
 			if ctx.Err() != nil {
-				if !updateRunStillMaster() {
+				if master, known := updateRunRole(); !known {
+					// 取消归因不可判定（角色读取失败）——按失败返回（任务可见），
+					// 不得并入「降级」或「手动取消」。
+					outcome = "failed"
+					TaskLogfWarn("crawlerbot-update", "failed", "角色读取失败，无法判定中止原因（降级/手动取消不可判定），终止爬虫地址更新")
+					return errors.New("角色读取失败，无法判定中止原因")
+				} else if !master {
 					outcome = "skipped"
 					TaskLogfWarn("crawlerbot-update", "skipped", "节点已降级为从节点，终止爬虫地址更新（已完成源保留）")
 					return taskengine.ErrTaskSkipped
@@ -355,6 +376,13 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 		}
 		changed, err := upsertCrawlerIPListChanged(src.Name, entries)
 		if err != nil {
+			// 部分提交收敛 部分提交收敛：DB 已更新而快照写失败时 upsert 返回
+			// changed=true + err——DB 与投影/插件快照已分叉，仍须计入收敛面，
+			// 由下方 changedCount>0 分支触发投影收敛对齐 DB（插件快照由下一轮
+			// 源重试的 crawlerSnapshotMatchesEngine 校验自愈）。
+			if changed {
+				changedCount++
+			}
 			if firstErr == nil {
 				firstErr = fmt.Errorf("源 %s 写名单失败: %w", src.Name, err)
 			}

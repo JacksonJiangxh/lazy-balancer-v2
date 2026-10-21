@@ -72,12 +72,10 @@ func loadConfigSnapshot() (configSnapshot, error) {
 	//（NOT NULL DEFAULT+每启动回填报证不可达；upstream_keepalive_timeout 为
 	// 类型②省略型保留 COALESCE 0）。
 	var old configSnapshot
-	// 历史修复（历史）：cert_expiry_days 字面量 30 → db.DefaultCertExpiryDays 绑定
-	// 参数（caddy.go 历史修复 形态）；同句 cert_renewal_days/attempts 属 cert_renewal_*
-	// 列族，不在本轮 cert_expiry_days 收敛范围。缺行仍整体报错（预览面拒绝
-	// 「以零值快照误报全字段变更」）。
+	// 证书到期/续签天数/重试次数三列兜底统一绑定 db.Default*（caddy.go 与
+	// 集群快照同口径）；缺行仍整体报错（预览面拒绝「以零值快照误报全字段变更」）。
 	err := db.DB.QueryRow(`SELECT COALESCE(acme_email,''), COALESCE(dns_provider,'dnspod'), COALESCE(dns_credentials,''),
-		COALESCE(cert_expiry_days,?), COALESCE(cert_renewal_days,30), COALESCE(cert_renewal_attempts,5),
+		COALESCE(cert_expiry_days,?), COALESCE(cert_renewal_days,?), COALESCE(cert_renewal_attempts,?),
 		COALESCE(default_ca_provider_id,0), COALESCE(log_level,'info'),
 		COALESCE(timezone,'Asia/Shanghai'),
 		COALESCE(caddy_log_level,'info'), caddy_log_size_mb, request_body_max_size_mb,
@@ -94,7 +92,7 @@ func loadConfigSnapshot() (configSnapshot, error) {
 		COALESCE(mfa_lockout_enabled,0),
 		COALESCE(trusted_proxy_enabled,0), COALESCE(trusted_proxy_ranges,'[]'), COALESCE(trusted_proxy_range_refs,'[]'), COALESCE(trusted_proxy_headers,'[]'), COALESCE(trusted_proxy_strict,1),
 		COALESCE(server_map_lat,0), COALESCE(server_map_lon,0), COALESCE(threat_screen_mode,?), COALESCE(threat_traffic_sample_n,?), COALESCE(security_events_retention_days,?), COALESCE(security_events_row_cap,?)
-		FROM global_config WHERE id=1`, db.DefaultCertExpiryDays, db.DefaultThreatScreenMode, db.DefaultThreatTrafficSampleN, db.DefaultSecurityEventsRetentionDays, db.DefaultSecurityEventsRowCap).Scan(
+		FROM global_config WHERE id=1`, db.DefaultCertExpiryDays, db.DefaultCertRenewalDays, db.DefaultCertRenewalAttempts, db.DefaultThreatScreenMode, db.DefaultThreatTrafficSampleN, db.DefaultSecurityEventsRetentionDays, db.DefaultSecurityEventsRowCap).Scan(
 		&old.ACMEEmail, &old.DNSProvider, &old.DNSCredentials,
 		&old.CertExpiryDays, &old.CertRenewalDays, &old.CertRenewalAttempts,
 		&old.DefaultCAProviderID, &old.LogLevel,

@@ -89,12 +89,19 @@ func WatchdogCheckOnce() (runErr error) {
 	if db.DB == nil {
 		return nil
 	}
-	if isMaster, err := RoleOf(context.Background(), db.DB); err != nil || !isMaster {
-		if err != nil {
-			// 查询失败与「非主节点」同为跳过，失败留痕（历史问题 标准——
-			// 静默吞错会掩盖 DB 异常）。
-			Logf("warn", "配置看门狗: 读取集群角色失败，本轮跳过: %v", err)
-		}
+	if isMaster, err := RoleOf(context.Background(), db.DB); err != nil {
+		// 看门狗角色读失败留痕：角色读失败=本轮未判定——计入跳过轮簿记（不宣称一致、
+		// 不发假心跳，与下方 !checked 跳轮同口径），留痕并以错误返回，
+		// 让 task_runs/任务监控可见（此前 return nil → 恒 success 掩盖 DB 异常）。
+		Logf("warn", "配置看门狗: 角色读取失败，本轮跳过: %v", err)
+		configDriftMu.Lock()
+		configDriftSkipped++
+		configDriftHeartbeatSkipped++
+		configDriftStatus.SkippedRounds = configDriftSkipped
+		configDriftMu.Unlock()
+		TaskLogfWarn("config-watchdog", "skipped", "配置检查未完成：角色读取失败（%v），本轮未判定，不计入一致轮", err)
+		return fmt.Errorf("角色读取失败: %w", err)
+	} else if !isMaster {
 		return nil
 	}
 	defer func() {

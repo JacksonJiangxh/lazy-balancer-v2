@@ -301,7 +301,11 @@ func restoreCRSFromSnapshotInLock(liveDir, snapshotDir, version string) error {
 // （restore/correct）都必须显式 BumpClusterVersion，否则从节点在下一次无关
 // 版本 bump 前仍持旧规则引用。
 func ReconcileCRSState() {
-	if isMaster, err := RoleOf(context.Background(), db.DB); err != nil || !isMaster {
+	if isMaster, err := RoleOf(context.Background(), db.DB); err != nil {
+		// 角色读取失败≠从节点——留痕后跳过本轮对账（静默跳过会掩盖 DB 异常）。
+		Logf("warn", "CRS 状态对账: 角色读取失败，本轮跳过: %v", err)
+		return
+	} else if !isMaster {
 		return
 	}
 	reconcileCRSStateFrom(crsLiveDir, crsSnapshotDir, currentCRSVersion())

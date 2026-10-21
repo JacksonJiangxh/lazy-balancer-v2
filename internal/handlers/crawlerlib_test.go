@@ -10,6 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/services"
 )
 
 // 爬虫地址库管理面：列表+开关+独立排程+状态/日志端点（手动更新经任务引擎，同威胁库口径）。
@@ -205,7 +206,7 @@ func TestCrawlerLibUpdateStatus_readsOwnTaskHistory(t *testing.T) {
 	router := newCrawlerTestRouter(t)
 	initTaskEngineForTest(t)
 	if _, err := db.DB.Exec(`INSERT INTO task_runs (task_id,family,trigger,operator,status,started_at,finished_at,duration_ms)
-		VALUES ('crawlerbot-update','security','manual','alice','success','2026-10-17 01:00:00','2026-10-17 01:00:05',5000)`); err != nil {
+		VALUES (?,'security','manual','alice','success','2026-10-17 01:00:00','2026-10-17 01:00:05',5000)`, services.CrawlerTaskID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -231,5 +232,25 @@ func TestCrawlerLibUpdateStatus_readsOwnTaskHistory(t *testing.T) {
 	}
 	if payload.Data.Running || payload.Data.Trigger != "manual" || payload.Data.StartedAt != "2026-10-17 01:00:00" || payload.Data.FinishedAt != "2026-10-17 01:00:05" || payload.Data.Outcome != "success" {
 		t.Fatalf("爬虫任务状态错误: %+v", payload.Data)
+	}
+}
+
+func TestLoadSystemListIDs_readsBuiltinNameMapping(t *testing.T) {
+	newBackupTestHandlers(t)
+	var wantID int
+	if err := db.DB.QueryRow(`SELECT id FROM security_ip_lists WHERE system=1 ORDER BY id LIMIT 1`).Scan(&wantID); err != nil {
+		t.Fatal(err)
+	}
+	var wantName string
+	if err := db.DB.QueryRow(`SELECT name FROM security_ip_lists WHERE id=?`, wantID).Scan(&wantName); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := loadSystemListIDs()
+	if err != nil {
+		t.Fatalf("load system list ids: %v", err)
+	}
+	if got[wantName] != wantID {
+		t.Fatalf("list id for %q=%d, want %d (full map=%v)", wantName, got[wantName], wantID, got)
 	}
 }

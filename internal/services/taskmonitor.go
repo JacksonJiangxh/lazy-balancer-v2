@@ -104,6 +104,8 @@ func collectCertJobRows() []TaskInfo {
 		WHERE ?=1 OR COALESCE(message,'') NOT LIKE '从主节点同步%'
 		ORDER BY COALESCE(updated_at,created_at) DESC LIMIT 100`, isMaster)
 	if err != nil {
+		// 任务行读失败留痕：查询失败不再静默空列表（对照下方 rows.Err 留痕形态）。
+		Logf("warn", "cert 任务行查询失败: %v", err)
 		return nil
 	}
 	defer rows.Close()
@@ -112,6 +114,8 @@ func collectCertJobRows() []TaskInfo {
 		var id int
 		var ruleID, domain, status, message, updatedAt string
 		if err := rows.Scan(&id, &ruleID, &domain, &status, &message, &updatedAt); err != nil {
+			// 任务行读失败留痕：单行扫描失败留痕后跳过该行（此前静默 continue）。
+			Logf("warn", "cert 任务行扫描失败: %v", err)
 			continue
 		}
 		// 终态计数（24h 窗口内 issued=成功 1、failed=失败 1；超窗行显示

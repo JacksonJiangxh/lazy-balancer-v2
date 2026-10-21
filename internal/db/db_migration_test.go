@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -21,6 +22,28 @@ func TestCreateTables_omits_dead_upstream_accessURL_column(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("upstreams.access_url count=%d, want 0", count)
+	}
+}
+
+func TestRunMigrations_oneShotMarkersRegisteredInNewColumns(t *testing.T) {
+	data, err := os.ReadFile("db.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	start := strings.Index(text, "newColumns := map[string]string{")
+	if start < 0 {
+		t.Fatal("newColumns registry not found")
+	}
+	end := strings.Index(text[start:], "\n\t}\n")
+	if end < 0 {
+		t.Fatal("newColumns registry end not found")
+	}
+	registry := text[start : start+end]
+	for _, key := range []string{"global_config.waf_mode4_migrated", "global_config.sync_switches_migrated"} {
+		if !strings.Contains(registry, `"`+key+`"`) {
+			t.Errorf("one-shot migration marker %s must use the idempotent newColumns ALTER path", key)
+		}
 	}
 }
 

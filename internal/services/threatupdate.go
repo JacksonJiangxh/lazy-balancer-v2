@@ -341,7 +341,16 @@ func (m *ThreatUpdateManager) runWithContext(runCtx context.Context, trigger str
 	// 守卫与更新启动之间存在 demote 竞态窗口——从节点继续执行会写
 	// security_ip_lists 并触发重载，打破只读不变量。NULL 兜底归一为 1（同
 	// crsupdate/ip2regionupdate 口径）。
-	if isMaster, err := RoleOf(context.Background(), db.DB); err != nil || !isMaster {
+	if isMaster, roleErr := RoleOf(context.Background(), db.DB); roleErr != nil {
+		// 角色读取失败（DB 瞬断/脏行）≠从节点——按失败落定（任务监控可见），
+		// 不得静默跳过（历史问题：err!=nil||!isMaster 把 DB 故障当从节点）。
+		AppendThreatUpdateLog("WARN", "failed", fmt.Sprintf("角色读取失败，无法判定本节点是否主节点，已中止威胁情报库更新: %v", roleErr))
+		m.mu.Lock()
+		m.lastFinishedAt = time.Now().UTC().Format(crsTimeLayout)
+		m.lastTaskOutcome = "failed"
+		m.mu.Unlock()
+		return
+	} else if !isMaster {
 		AppendThreatUpdateLog("WARN", "skipped", "当前节点为从节点，终止威胁情报库更新")
 		m.mu.Lock()
 		m.lastFinishedAt = time.Now().UTC().Format(crsTimeLayout) // 历史：早退同样落终态
@@ -376,7 +385,7 @@ func (m *ThreatUpdateManager) runWithContext(runCtx context.Context, trigger str
 		if runCtx.Err() != nil {
 			// 历史问题-01：取消源分流——demote（角色已翻转）落 skipped（与起点
 			// 角色复查同语义：从节点中止非故障）；主节点=手动取消 cancelled。
-			if master, known := updateRunRoleAtCancel(); known && !master {
+			if master, known := updateRunRole(); known && !master {
 				demoted = true
 				AppendThreatUpdateLog("WARN", "skipped", "节点已降级为从节点，终止威胁情报库更新（已完成源的结果保留）")
 			} else {
@@ -395,7 +404,7 @@ func (m *ThreatUpdateManager) runWithContext(runCtx context.Context, trigger str
 	// 中止点归一（历史问题-01）：末源在途取消时循环自然结束（无下一轮顶部
 	// 检查）——补判一次取消源；demote 优先于源失败（中止非故障）。
 	if !demoted && !cancelled && runCtx.Err() != nil {
-		if master, known := updateRunRoleAtCancel(); known && !master {
+		if master, known := updateRunRole(); known && !master {
 			demoted = true
 		} else {
 			cancelled = true
@@ -413,6 +422,12 @@ func (m *ThreatUpdateManager) runWithContext(runCtx context.Context, trigger str
 		m.lastTaskOutcome = "success"
 	}
 	m.mu.Unlock()
+	// demote 中止直接返回（降级中止收敛门，与 crawler_update 降级中止同构）：从节点
+	// 零写优先——收敛段会写投影文件并可能回退 /load，降级节点不得触碰；
+	// 已完成源的名单内容由集群同步与主节点后续轮次收敛。
+	if demoted {
+		return
+	}
 	// 名单内容变化后的收敛（热路径架构，2026-10-15 用户裁定：threatReloader
 	// 重载门退役）：threat-<source>.iplist 同稳定路径原子重写（上面
 	// writeThreatIplistCompiled）+ 引用面投影文件热路径重写即收敛，零 /load
@@ -576,11 +591,11 @@ func (m *ThreatUpdateManager) updateOneSource(ctx context.Context, source threat
 	finished := time.Now().UTC().Format(crsTimeLayout)
 	if err != nil {
 		if ctx.Err() != nil {
-			if master, known := updateRunRoleAtCancel(); known && !master {
-				// demote 中止必须落源行终态（此前不写 → 源行滞留
-				// running，从节点 UI 长期「运行中」且不自愈）。
-				skipSourceRow(source.id, finished, "节点已降级为从节点，中止更新")
-				AppendThreatUpdateLog("WARN", "skipped", fmt.Sprintf("节点已降级，源 %s 更新中止", source.name))
+			if master, known := updateRunRole(); known && !master {
+				// demote 中止从节点零写（降级零写 裁定=从节点零写优先）：
+				// 不写源行终态（从节点 DB 由集群同步收敛），仅以任务日志
+				// 「降级中止」留痕；源行滞留 running 由下次主节点同步覆盖。
+				AppendThreatUpdateLog("WARN", "skipped", fmt.Sprintf("节点已降级，源 %s 更新降级中止（从节点零写，源行由集群同步收敛）", source.name))
 			} else {
 				cancelSourceRow(source.id, finished, ctx.Err())
 				AppendThreatUpdateLog("WARN", "cancelled", fmt.Sprintf("源 %s 更新已手动取消（保留上次快照）", source.name))
@@ -791,15 +806,6 @@ func cancelSourceRow(id int, finished string, cause error) {
 	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_status='cancelled', message=?, finished_at=?, updated_at=datetime('now') WHERE id=?`,
 		cause.Error(), finished, id); err != nil {
 		Logf("error", "威胁情报库: 取消状态落库失败: %v", err)
-	}
-}
-
-// skipSourceRow 节点降级中止落库：与 cancelSourceRow 同形但不改
-// 失败计数、不推进排程槽——从节点角色门会阻止后续运行，终态用于 UI/审计可见性。
-func skipSourceRow(id int, finished string, reason string) {
-	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_status='skipped', message=?, finished_at=?, updated_at=datetime('now') WHERE id=?`,
-		reason, finished, id); err != nil {
-		Logf("error", "威胁情报库: 跳过状态落库失败: %v", err)
 	}
 }
 

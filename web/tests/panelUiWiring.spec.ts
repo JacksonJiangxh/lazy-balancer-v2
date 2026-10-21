@@ -106,6 +106,16 @@ test('自动封禁卡片主体恢复配置点击入口', () => {
   assert.match(source('src/views/security/SecurityEvents.vue'), /<div\s+class="autoban-main"[^>]*@click="openAutobanConfig"/)
 })
 
+test('自动封禁卡片主体与函数入口统一受只读和节点门控', () => {
+  const text = source('src/views/security/SecurityEvents.vue')
+  assert.match(text, /<el-tooltip[^>]*:content="autobanConfigTooltip"[^>]*:disabled="autobanWritable"/)
+  assert.match(text, /:tabindex="autobanWritable \? 0 : -1"/)
+  assert.match(text, /:aria-disabled="!autobanWritable"/)
+  const open = section(text, 'const openAutobanConfig', 'const saveAutobanConfig')
+  assert.match(open, /if \(!autobanWritable\.value\) return/)
+  assert.match(text, /自动封禁状态加载中，暂不可配置/)
+})
+
 test('默认上游分支不得显示无启用上游', () => {
   const text = source('src/components/RuleFlowDialog.vue')
   assert.match(text, /v-else-if="pr\.upstreams === null"/)

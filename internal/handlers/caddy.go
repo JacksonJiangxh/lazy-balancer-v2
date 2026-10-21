@@ -260,6 +260,10 @@ func stopCaddy(adminURL string) error {
 	return errors.New("停止后 Caddy Admin API 仍可达")
 }
 
+// ImportSecurityPolicyCustomOnlyModeSQL 供导入路径与测试共用的归一 SQL；
+// 唯一事实源在 db.SecurityPolicyCustomOnlyModeNormalizationSQL。
+const ImportSecurityPolicyCustomOnlyModeSQL = db.SecurityPolicyCustomOnlyModeNormalizationSQL
+
 func (h *Handlers) GetConfig(c *gin.Context) {
 	var cfg models.GlobalConfig
 	// 历史修复（历史）：治理默认值列的读路径 SQL 字面量是默认值的第三次复制
@@ -273,8 +277,8 @@ func (h *Handlers) GetConfig(c *gin.Context) {
 	err := db.DB.QueryRow(`
 		SELECT id, caddy_config, dns_provider,
 		       COALESCE(acme_email,'') as acme_email, COALESCE(cert_expiry_days,?) as cert_expiry_days,
-		       COALESCE(cert_renewal_days,30) as cert_renewal_days,
-		       COALESCE(cert_renewal_attempts,5) as cert_renewal_attempts,
+		       COALESCE(cert_renewal_days,?) as cert_renewal_days,
+		       COALESCE(cert_renewal_attempts,?) as cert_renewal_attempts,
 		       COALESCE(default_ca_provider_id,0) as default_ca_provider_id,
 		       log_level,
 
@@ -320,10 +324,11 @@ func (h *Handlers) GetConfig(c *gin.Context) {
 	       last_sync, updated_at
 		FROM global_config WHERE id = 1
 	`,
-		// 历史修复：占位符序=cert_expiry_days/caddy_log_size_mb/request_body_max_size_mb/
-		// http_read_timeout/http_write_timeout/http_idle_timeout；历史问题 追加
-		// 大屏/安全事件四列（threat_screen_mode/sample/retention/row_cap）。
-		db.DefaultCertExpiryDays, db.DefaultCaddyLogSizeMB, db.DefaultRequestBodyMaxSizeMB,
+		// 历史修复：占位符序=cert_expiry_days/cert_renewal_days/cert_renewal_attempts/
+		// caddy_log_size_mb/request_body_max_size_mb/http_read_timeout/http_write_timeout/
+		// http_idle_timeout；历史问题 追加大屏/安全事件四列。
+		db.DefaultCertExpiryDays, db.DefaultCertRenewalDays, db.DefaultCertRenewalAttempts,
+		db.DefaultCaddyLogSizeMB, db.DefaultRequestBodyMaxSizeMB,
 		db.DefaultHTTPReadTimeout, db.DefaultHTTPWriteTimeout, db.DefaultHTTPIdleTimeout,
 		db.DefaultThreatScreenMode, db.DefaultThreatTrafficSampleN,
 		db.DefaultSecurityEventsRetentionDays, db.DefaultSecurityEventsRowCap,

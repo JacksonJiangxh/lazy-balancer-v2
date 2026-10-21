@@ -1027,7 +1027,12 @@ func RunAutobanCycle(rc taskengine.RunContext) error {
 		default:
 		}
 	}
-	if !updateRunStillMaster() {
+	if isMaster, known := updateRunRole(); !known {
+		// 角色读取失败（DB 瞬断/脏行）≠从节点——按失败返回（task_runs/任务
+		// 监控可见），不得静默跳过（历史问题：二态复核把 DB 故障当从节点）。
+		TaskLogfWarn(AutobanTaskID, "failed", "角色读取失败，无法判定本节点是否主节点，本轮自动封禁未执行")
+		return errors.New("角色读取失败，无法判定本节点是否主节点")
+	} else if !isMaster {
 		return taskengine.ErrTaskSkipped
 	}
 	if !AutobanEnabled() && !autobanRecheckEnabled() {

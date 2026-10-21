@@ -25,10 +25,13 @@
         <span class="info-note-desc">{{ autobanBlockedReason }}</span>
       </div>
       <div class="autoban-bar">
+        <el-tooltip :content="autobanConfigTooltip" :disabled="autobanWritable" placement="top" :show-after="200">
           <div
             class="autoban-main"
-            role="button"
-            tabindex="0"
+            :class="{ 'is-disabled': !autobanWritable }"
+            :role="autobanWritable ? 'button' : undefined"
+            :tabindex="autobanWritable ? 0 : -1"
+            :aria-disabled="!autobanWritable"
             @click="openAutobanConfig"
             @keydown.enter.prevent="openAutobanConfig"
             @keydown.space.prevent="openAutobanConfig"
@@ -56,6 +59,7 @@
               <span class="autoban-stat">名单 <b>{{ autobanStatus.list_entries }} 条</b></span>
             </div>
           </div>
+        </el-tooltip>
         <div class="autoban-actions">
           <template v-if="autobanStatus.enabled">
             <el-button size="small" type="danger" plain :disabled="!autobanWritable" :loading="autobanToggling" @click="toggleAutobanEnabled">禁用</el-button>
@@ -437,6 +441,12 @@ const autobanBlockedReason = computed(() => {
   if (!autobanStatus.value.is_master) return '仅主节点可修改自动封禁配置'
   return ''
 })
+const autobanConfigTooltip = computed(() => {
+  if (autobanWritable.value) return ''
+  if (autobanStatusLoading.value) return '自动封禁状态加载中，暂不可配置'
+  if (autobanStatusError.value) return '自动封禁状态加载失败，请刷新后重试'
+  return autobanBlockedReason.value
+})
 const autobanScopeText = computed(() => AUTOBAN_SCOPES.find((s) => s.value === autobanStatus.value.scope)?.label ?? autobanStatus.value.scope)
 const autobanDurationText = computed(() => AUTOBAN_DURATIONS.find((d) => d.value === autobanStatus.value.duration)?.label ?? autobanStatus.value.duration)
 
@@ -484,9 +494,9 @@ const autobanDialogVisible = ref(false)
 const autobanSaving = ref(false)
 const autobanForm = ref({ enabled: false, dry_run: true, threshold: 100, window_minutes: 5, duration: '1h', scope: 'all' })
 const openAutobanConfig = (): void => {
-  // 状态加载中不进配置：表单从 autobanStatus 回填，此刻会拿到默认值，
-  // 保存将覆盖真实配置
-  if (autobanStatusLoading.value) return
+  // 卡片主体/编辑/启用共用门：只读、从节点、状态加载中或加载失败均不打开
+  // 配置弹框；表单从 autobanStatus 回填，错误态默认值保存会覆盖真实配置。
+  if (!autobanWritable.value) return
   autobanForm.value = {
     enabled: autobanStatus.value.enabled, dry_run: autobanStatus.value.dry_run,
     threshold: autobanStatus.value.threshold, window_minutes: autobanStatus.value.window_minutes,
@@ -865,6 +875,8 @@ const refreshPage = (): void => {
    padding+负 margin 扩大热区而不改变行内布局 */
 .autoban-main { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; flex: 1; min-width: 0; cursor: pointer; padding: 4px; margin: -4px; border-radius: 6px; }
 .autoban-main:hover { background: #f9fafb; }
+.autoban-main.is-disabled { cursor: default; }
+.autoban-main.is-disabled:hover { background: transparent; }
 .autoban-main:focus-visible { outline: 2px solid var(--el-color-primary); outline-offset: 2px; }
 .autoban-title { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; color: #111827; flex-shrink: 0; }
 .autoban-title .title-icon { font-size: 16px; color: #3b82f6; }

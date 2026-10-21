@@ -349,10 +349,11 @@ func TestAutobanStatus_listReferencedFailClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := &Handlers{}
-	if !h.autobanListReferenced() {
+	state := autobanPresetListState{err: fmt.Errorf("injected preset lookup failure")}
+	if !h.autobanListReferenced(state) {
 		t.Fatal("list_referenced 查询失败必须 fail-closed 返回 true（不弹黄条）")
 	}
-	if !h.autobanBanEffective() {
+	if !h.autobanBanEffective(state) {
 		t.Fatal("ban_effective 查询失败必须 fail-closed 返回 true（不弹黄条）")
 	}
 }

@@ -1,6 +1,6 @@
 package services
 
-// 第 88 轮审计 P2-01：部署链（certissuer 持 DeployLock → caddyReloader 内取
+// 部署锁序：部署链（certissuer 持 DeployLock → caddyReloader 内取
 // CaddyOpLock，services/caddy.go GenerateAndApplyConfigForce）与恢复链
 //（handlers UpdateRule/EnableRule 补偿全程持 caddyOpMu=CaddyOpLock →
 // RestoreCertJobsForRule 取 DeployLock，certificates.go）锁序相反，双向互等

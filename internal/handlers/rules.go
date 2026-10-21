@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gin-gonic/gin/binding"
@@ -717,6 +719,23 @@ type tcpDeadFields struct {
 	// r.Protocol=="http" 门控），TCP 行的 log_enabled 是死配置——UI 已对
 	// TCP 隐藏开关，API/导入仍可写入，随导出/快照放大。
 	LogEnabled *bool
+	// TCP 自愈族（2026-10-22）：代理超时族与自定义上层/路径同属 HTTP
+	// 语义（buildTCPServer/buildTCPProxyRoute 零消费，validateRuleFeatures
+	// TCP 分支显式拒绝）——存量行携带这些死值会让任何无关编辑/复制命中
+	// 保存门恒 400 死端（指针合并 nil=沿用存量）。save/update/duplicate
+	// 三入口归一为 0，与导入/启动迁移 SQL 同族。
+	ProxyDialTimeout           *int
+	ProxyResponseHeaderTimeout *int
+	ProxyReadTimeout           *int
+	ProxyWriteTimeout          *int
+	ProxyStreamTimeout         *int
+	ProxyFlushInterval         *int
+	ProxyStreamCloseDelay      *int
+	CustomRoutesEnabled        *bool
+	DynamicDNS                 *bool
+	// Strategy：TCP 策略白名单外唯一 HTTP-only 值是 cookie
+	//（validateStrategyForProtocol）——归一为 DDL 默认策略而非清空。
+	Strategy *string
 }
 
 // tcpDeadFieldReset 是 TCP 规则归一的单一事实源（历史问题，2026-10-18）：
@@ -728,13 +747,18 @@ func tcpDeadFieldReset(protocol string, fields tcpDeadFields) {
 		return
 	}
 	deadFalse, deadZero, deadEmpty := false, 0, ""
-	for _, target := range []*bool{fields.EnableTLS, fields.TLSHTTPRedirect, fields.EnableCompress, fields.LogEnabled} {
+	for _, target := range []*bool{fields.EnableTLS, fields.TLSHTTPRedirect, fields.EnableCompress, fields.LogEnabled, fields.CustomRoutesEnabled, fields.DynamicDNS} {
 		if target != nil {
 			*target = deadFalse
 		}
 	}
 	if fields.TLSSource != nil {
 		*fields.TLSSource = "manual"
+	}
+	// cookie 是 TCP 策略白名单外的唯一 HTTP-only 值——归一为 DDL 默认策略
+	// （weighted_round_robin，与导入/启动迁移 SQL 的 CASE 同终态），不清空。
+	if fields.Strategy != nil && *fields.Strategy == "cookie" {
+		*fields.Strategy = "weighted_round_robin"
 	}
 	for _, target := range []*string{fields.TLSCert, fields.TLSKey, fields.Domain, fields.HostHeader, fields.HealthCheckPath, fields.HealthCheckHost, fields.CompressTypes} {
 		if target != nil {
@@ -747,6 +771,10 @@ func tcpDeadFieldReset(protocol string, fields tcpDeadFields) {
 		fields.NTLMCompatible, fields.UpstreamForceHTTP1,
 		fields.BlockPageStage1ID, fields.BlockPageStage1Status,
 		fields.BlockPageStage3ID, fields.BlockPageStage3Status,
+		fields.ProxyDialTimeout, fields.ProxyResponseHeaderTimeout,
+		fields.ProxyReadTimeout, fields.ProxyWriteTimeout,
+		fields.ProxyStreamTimeout, fields.ProxyFlushInterval,
+		fields.ProxyStreamCloseDelay,
 	} {
 		if target != nil {
 			*target = deadZero
@@ -759,6 +787,9 @@ func tcpDeadFieldReset(protocol string, fields tcpDeadFields) {
 // HealthCheckHost 亦留空（历史问题）：HTTP-only 字段由保存门
 // validateRulePayloadBeforeSave 显式 400（既有行为，与 NTLM 同格的「显式
 // 携带即拒」），仅存量/复制/传输路径沉默归一。
+// TCP 自愈族：代理超时族/自定义路由/动态上游/策略(cookie) 同样留空——
+// Create 的请求值全部显式、无存量可愈，显式携带继续由 validateRuleFeatures
+// TCP 分支 400 点名；同协议编辑/复制路径（update/stored 适配器）才需自愈。
 func createRuleTCPDeadFields(req *models.CreateRuleRequest) tcpDeadFields {
 	return tcpDeadFields{
 		EnableTLS:                &req.EnableTLS,
@@ -811,6 +842,18 @@ func updateRuleTCPDeadFields(req *models.UpdateRuleRequest) tcpDeadFields {
 		BlockPageStage3ID:        req.BlockPageStage3ID,
 		BlockPageStage3Status:    req.BlockPageStage3Status,
 		LogEnabled:               req.LogEnabled,
+		// TCP 自愈族：同协议编辑自愈族（调用点已保证非 nil）——
+		// 存量死值不再让无关编辑恒 400 死端。
+		ProxyDialTimeout:           req.ProxyDialTimeout,
+		ProxyResponseHeaderTimeout: req.ProxyResponseHeaderTimeout,
+		ProxyReadTimeout:           req.ProxyReadTimeout,
+		ProxyWriteTimeout:          req.ProxyWriteTimeout,
+		ProxyStreamTimeout:         req.ProxyStreamTimeout,
+		ProxyFlushInterval:         req.ProxyFlushInterval,
+		ProxyStreamCloseDelay:      req.ProxyStreamCloseDelay,
+		CustomRoutesEnabled:        req.CustomRoutesEnabled,
+		DynamicDNS:                 req.DynamicDNS,
+		Strategy:                   &req.Strategy,
 	}
 }
 
@@ -840,6 +883,19 @@ func storedRuleTCPDeadFields(rule *models.LbRule) tcpDeadFields {
 		BlockPageStage3ID:        &rule.BlockPageStage3ID,
 		BlockPageStage3Status:    &rule.BlockPageStage3Status,
 		LogEnabled:               &rule.LogEnabled,
+		// TCP 自愈族：TCP 源行携带的 HTTP 专属代理/路由/策略死值不得
+		// 原样放大到副本（复制路径此前让 tcp+cookie、tcp+proxy 超时、
+		// tcp+自定义路径的存量行复制即 400 死端）。
+		ProxyDialTimeout:           &rule.ProxyDialTimeout,
+		ProxyResponseHeaderTimeout: &rule.ProxyResponseHeaderTimeout,
+		ProxyReadTimeout:           &rule.ProxyReadTimeout,
+		ProxyWriteTimeout:          &rule.ProxyWriteTimeout,
+		ProxyStreamTimeout:         &rule.ProxyStreamTimeout,
+		ProxyFlushInterval:         &rule.ProxyFlushInterval,
+		ProxyStreamCloseDelay:      &rule.ProxyStreamCloseDelay,
+		CustomRoutesEnabled:        &rule.CustomRoutesEnabled,
+		DynamicDNS:                 &rule.DynamicDNS,
+		Strategy:                   &rule.Strategy,
 	}
 }
 
@@ -850,6 +906,39 @@ func validateRuleRequestBodyMaxSizeMB(value int) error {
 		return fmt.Errorf("请求体大小限制必须在 0-4096 MB 之间")
 	}
 	return nil
+}
+
+// 规则文本列长度上限（规则文本长度上限，Ruling：取 DDL 声明值）：lb_rules.name
+// VARCHAR(100)、description VARCHAR(300)（db.go 建表/重建 DDL 两处同值）。
+// SQLite 不强制 VARCHAR 长度，无本门时超长文本可经 API 落库并随导出/快照/
+// 备份放大。按 rune 计数（与前端 maxlength 的字符语义一致）。
+const (
+	maxRuleNameRunes        = 100
+	maxRuleDescriptionRunes = 300
+)
+
+// validateRuleTextLengths 是 name/description 长度门的单一事实源
+// （Create/Update/Duplicate 三入口共用）。
+func validateRuleTextLengths(name, description string) error {
+	if n := utf8.RuneCountInString(name); n > maxRuleNameRunes {
+		return fmt.Errorf("规则名称过长（最多 %d 个字符，当前 %d 个）", maxRuleNameRunes, n)
+	}
+	if n := utf8.RuneCountInString(description); n > maxRuleDescriptionRunes {
+		return fmt.Errorf("规则描述过长（最多 %d 个字符，当前 %d 个）", maxRuleDescriptionRunes, n)
+	}
+	return nil
+}
+
+// ruleDuplicateName 生成副本名「源名（副本）」并保证累积后缀不突破长度
+// 上限（规则文本长度上限）：反复复制时源名本身已含「（副本）」后缀——截断基名而不是
+// 后缀，否则后缀会被截掉导致副本名无法辨识。
+func ruleDuplicateName(sourceName string) string {
+	const suffix = "（副本）"
+	base := []rune(sourceName)
+	if limit := maxRuleNameRunes - utf8.RuneCountInString(suffix); len(base) > limit {
+		base = base[:limit]
+	}
+	return string(base) + suffix
 }
 
 // duplicateRulePayloadRequest 把存量源行投影为共享保存输入，供
@@ -988,6 +1077,11 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 
 	if req.Name == "" {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "名称不能为空"})
+		return
+	}
+	// 规则文本长度上限：name/description 长度门（DDL 声明值，SQLite 不强制）。
+	if err := validateRuleTextLengths(req.Name, req.Description); err != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
 	if req.Protocol == "" {
@@ -1305,6 +1399,10 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 			restoreErr = errors.Join(restoreErr, certErr)
 		}
 		services.Logf("error", "CreateRule transaction commit error: %v", err)
+		// 提交后失败审计：Explicit 审计策略下提交后失败必须留痕（与
+		// respondRuleApplyError / EnableRule failEnableWithStatus 同口径）。
+		recordAudit(c, "创建失败", "负载规则", services.FormatAuditDetail(
+			services.AuditRulePart(caddyID), "提交已创建规则事务失败: "+errors.Join(err, restoreErr).Error(), services.AuditResultPart("failure")))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交规则失败: " + errors.Join(err, restoreErr).Error()})
 		return
 	}
@@ -1351,16 +1449,32 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 	if enabledVal == 1 && req.EnableTLS && req.TLSSource == "acme_dns" && req.Protocol == "http" && req.Domain != "" {
 		qm := services.GetCAQueueManager()
 		if qm == nil {
-			if restoreErr := restoreCreatedRule(); restoreErr != nil {
+			restoreErr := restoreCreatedRule()
+			if restoreErr != nil {
 				services.Logf("error", "问题: CreateRule ACME compensation failed for caddy_id=%s: %v", caddyID, restoreErr)
 			}
+			// 提交后失败审计：提交后失败（含补偿）必须落操作审计。
+			detail := "证书任务入队失败：CA 队列未初始化，已回滚创建"
+			if restoreErr != nil {
+				detail = "证书任务入队失败（CA 队列未初始化），补偿恢复失败: " + restoreErr.Error()
+			}
+			recordAudit(c, "创建失败", "负载规则", services.FormatAuditDetail(
+				services.AuditRulePart(caddyID), detail, services.AuditResultPart("failure")))
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "CA 队列未初始化"})
 			return
 		}
 		if _, err := services.CreateOrRequeueCertJob(caddyID, req.Domain, req.CAProviderID, qm); err != nil {
-			if restoreErr := restoreCreatedRule(); restoreErr != nil {
+			restoreErr := restoreCreatedRule()
+			if restoreErr != nil {
 				services.Logf("error", "问题: CreateRule ACME compensation failed for caddy_id=%s: %v", caddyID, restoreErr)
 			}
+			// 提交后失败审计：入队失败 + 补偿结果一并留痕（补偿失败时点名）。
+			detail := "证书任务入队失败，已回滚创建: " + err.Error()
+			if restoreErr != nil {
+				detail = "证书任务入队失败，补偿恢复失败: " + errors.Join(err, restoreErr).Error()
+			}
+			recordAudit(c, "创建失败", "负载规则", services.FormatAuditDetail(
+				services.AuditRulePart(caddyID), detail, services.AuditResultPart("failure")))
 			// 历史问题-05：证书签发任务未运行（队列 paused/inactive）与手工签发
 			// 同口径 409，不再折成 500 误报内部故障。
 			status, message := certEnqueueErrorResponse("创建证书任务失败", err)
@@ -1695,6 +1809,11 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	if req.Description == nil {
 		req.Description = &existingRule.Description
 	}
+	// 规则文本长度上限：合并后的 name/description 长度门（DDL 声明值）。
+	if err := validateRuleTextLengths(req.Name, *req.Description); err != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
+		return
+	}
 
 	protocolChanged := requestedProtocol != "" && requestedProtocol != existingRule.Protocol
 
@@ -1772,6 +1891,30 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		if req.LogEnabled == nil {
 			tcpLogOff := false
 			req.LogEnabled = &tcpLogOff
+		}
+		// TCP 自愈族：代理超时族/自定义路径同协议编辑自愈——这些字段
+		// 在 UpdateRule 是「仅非 nil 才写库」的指针语义，nil 合并会沿用存量
+		// 死值并喂进 validateRuleFeatures TCP 分支，使任何无关编辑恒 400
+		// 死端（存量 v1 导入/直改 DB 行携带）。显式补零指针：与协议切换块
+		// 同口径（TCP 终态不携带这些 HTTP 专属配置）；path_rules 由指针填充
+		// 为空集后经 replacePathRulesTx 删除存量行。
+		for _, target := range []**int{
+			&req.ProxyDialTimeout, &req.ProxyResponseHeaderTimeout,
+			&req.ProxyReadTimeout, &req.ProxyWriteTimeout,
+			&req.ProxyStreamTimeout, &req.ProxyFlushInterval,
+			&req.ProxyStreamCloseDelay,
+		} {
+			if *target == nil {
+				*target = &tcpZero
+			}
+		}
+		if req.CustomRoutesEnabled == nil {
+			tcpRoutesOff := false
+			req.CustomRoutesEnabled = &tcpRoutesOff
+		}
+		if req.PathRules == nil {
+			emptyPathRules := []models.PathRule{}
+			req.PathRules = &emptyPathRules
 		}
 		tcpDeadFieldReset(req.Protocol, updateRuleTCPDeadFields(&req))
 		// 历史修复（历史）：重试窗口是 http/tcp 共用字段（方案 C），http 侧
@@ -2387,10 +2530,22 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		//（回滚事务 + 重渲染 /load + 回退 LKG/投影/证书物化）。
 		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
 		services.Logf("error", "UpdateRule transaction commit failed for caddy_id=%s: %v", caddyID, err)
+		// 提交后失败审计：提交后失败留痕（Explicit 审计策略，中间件不兜底）。
+		recordAudit(c, "更新失败", "负载规则", services.FormatAuditDetail(
+			services.AuditRulePart(caddyID), "提交规则更新事务失败: "+errors.Join(err, restoreErr).Error(), services.AuditResultPart("failure")))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交规则更新失败: " + errors.Join(err, restoreErr).Error()})
 		return
 	}
 	committed = true
+
+	// 并发修改复核：并发修改基线——本请求提交后的规则形态（lb_rules 行 +
+	// upstreams + path_rules）。下方放锁窗口内他人 UpdateRule 可完整提交；
+	// 基线用于窗口后判定「补偿是否仍只回退本请求」，指纹读取失败时降级为
+	// 不判定（仍走既有 delete 复核与恢复链）。
+	postCommitFingerprint, fingerprintErr := ruleMutationFingerprint(caddyID)
+	if fingerprintErr != nil {
+		services.Logf("error", "UpdateRule: 记录规则并发基线失败 for caddy_id=%s: %v", caddyID, fingerprintErr)
+	}
 
 	if droppedBindings > 0 {
 		recordAudit(c, "更新", "安全策略", fmt.Sprintf("规则 %s 切换为 TCP，已解除 %d 条安全策略绑定（TCP 不参与策略渲染）", caddyID, droppedBindings))
@@ -2416,6 +2571,9 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 			h.caddyOpMu.Unlock()
 			func() {
 				defer h.caddyOpMu.Lock()
+				if updateRuleLockWindowHook != nil {
+					updateRuleLockWindowHook(caddyID, 1)
+				}
 				cancelCtx, cancel := context.WithTimeout(c.Request.Context(), cancelRuleJobsTimeout)
 				defer cancel()
 				if err := cancelRuleJobs(cancelCtx, qm, caddyID); err != nil {
@@ -2425,6 +2583,10 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 			qm.UnblockJobsForRule(caddyID, blockToken)
 			// 放锁窗口内可能已并发删除本规则；继续后续迁移/补偿会把它复活。
 			if abortIfRuleDeleted(c, caddyID) {
+				return
+			}
+			// 并发修改复核：窗口内他人提交的更新不得被本请求的失败补偿回退。
+			if fingerprintErr == nil && abortIfRuleConcurrentlyModified(c, caddyID, postCommitFingerprint) {
 				return
 			}
 		}
@@ -2480,10 +2642,18 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 				h.caddyOpMu.Unlock()
 				cancelCertJob(inFlightJobID)
 				h.caddyOpMu.Lock()
+				if updateRuleLockWindowHook != nil {
+					updateRuleLockWindowHook(caddyID, 2)
+				}
 				// 取消等待期间并发 DeleteRule 可完整提交；此时继续
 				// createOrRequeueCertJobVerified 会命中「规则已删除」并走
 				// restoreACMEState → 按快照复活规则。改为在窗口后直接复核。
 				if abortIfRuleDeleted(c, caddyID) {
+					return
+				}
+				// 并发修改复核：同一窗口内的并发更新同样中止（后续恢复按请求前
+				// 快照回滚会覆盖他人已提交内容）。
+				if fingerprintErr == nil && abortIfRuleConcurrentlyModified(c, caddyID, postCommitFingerprint) {
 					return
 				}
 			}
@@ -2635,6 +2805,13 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 			queueManager = services.GetCAQueueManager()
 			if queueManager == nil {
 				restoreErr := restoreACMEState()
+				// 提交后失败审计：提交后失败留痕（补偿结果一并点名）。
+				detail := "证书任务入队失败：CA 队列未初始化"
+				if restoreErr != nil {
+					detail = "证书任务入队失败且恢复失败: " + restoreErr.Error()
+				}
+				recordAudit(c, "更新失败", "负载规则", services.FormatAuditDetail(
+					services.AuditRulePart(caddyID), detail, services.AuditResultPart("failure")))
 				if restoreErr != nil {
 					services.Logf("error", "问题: UpdateRule ACME enqueue failed and restore failed for caddy_id=%s: restore=%v", caddyID, restoreErr)
 					c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: fmt.Sprintf("CA 队列未初始化且恢复失败: %v", restoreErr)})
@@ -2650,6 +2827,13 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 			}
 			if err != nil {
 				restoreErr := restoreACMEState()
+				// 提交后失败审计：入队失败 + 补偿结果留痕。
+				detail := "创建证书任务失败，已回滚更新: " + err.Error()
+				if restoreErr != nil {
+					detail = "创建证书任务失败且恢复失败: " + errors.Join(err, restoreErr).Error()
+				}
+				recordAudit(c, "更新失败", "负载规则", services.FormatAuditDetail(
+					services.AuditRulePart(caddyID), detail, services.AuditResultPart("failure")))
 				if restoreErr != nil {
 					services.Logf("error", "问题: UpdateRule ACME enqueue failed and restore failed for caddy_id=%s: enqueue=%v restore=%v", caddyID, err, restoreErr)
 					c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: fmt.Sprintf("创建证书任务失败且恢复失败: %v; %v", err, restoreErr)})
@@ -2759,6 +2943,10 @@ func (h *Handlers) DeleteRule(c *gin.Context) {
 			} else {
 				compensationStarted = true
 			}
+			// 提交后失败审计：提交前失败同样必须留痕（Explicit 审计策略）——
+			// 规则与证书未变，原因点名取消超时。
+			recordAudit(c, "删除失败", "负载规则", services.FormatAuditDetail(
+				services.AuditRulePart(caddyID), "取消证书任务超时，规则与证书保持不变: "+cancelErr.Error(), services.AuditResultPart("failure")))
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "取消证书任务超时，规则与证书保持不变: " + cancelErr.Error()})
 			return
 		}
@@ -2851,6 +3039,13 @@ func (h *Handlers) DeleteRule(c *gin.Context) {
 		if restoreErr != nil {
 			services.Logf("error", "问题: DeleteRule commit and runtime restore failed for caddy_id=%s: commit=%v restore=%v", caddyID, err, restoreErr)
 		}
+		// 提交后失败审计：提交失败留痕（补偿结果一并点名）。
+		detail := "提交规则删除事务失败: " + err.Error()
+		if restoreErr != nil {
+			detail = "提交规则删除事务失败且恢复失败: " + errors.Join(err, restoreErr).Error()
+		}
+		recordAudit(c, "删除失败", "负载规则", services.FormatAuditDetail(
+			services.AuditRulePart(caddyID), detail, services.AuditResultPart("failure")))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交规则删除失败"})
 		return
 	}
@@ -2941,6 +3136,10 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 	// ACME 任务永不消费证书、HTTP 专属字段 TCP 渲染零消费）。
 	if rule.Protocol == "tcp" {
 		tcpDeadFieldReset(rule.Protocol, storedRuleTCPDeadFields(&rule))
+		// TCP 自愈族：custom_routes_enabled 归零后源行残留 path_rules 不得
+		// 进入保存门（TCP 分支对 len(PathRules)>0 显式 400）或复制到副本——
+		// hydrateRuleRelations 不按开关过滤，须在此显式清空。
+		rule.PathRules = []models.PathRule{}
 		// 历史修复 同族（历史修复 收敛）：负值重试窗口不喂进复制校验（td/ti 原样
 		// 传入会让直改 DB 残留的 tcp 源行复制即 400 死端），也不放大到副本——
 		// 与 UpdateRule 最终协议 tcp 块负值自愈同格；非负窗口是合法 tcp 配置，
@@ -3060,7 +3259,12 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 	duplicate := rule
 	duplicate.ID = 0
 	duplicate.CaddyID = newCaddyID
-	duplicate.Name = rule.Name + "（副本）"
+	// 规则文本长度上限：副本名累积后缀截断到上限内（源名可能已含后缀或接近上限）。
+	duplicate.Name = ruleDuplicateName(rule.Name)
+	if err := validateRuleTextLengths(duplicate.Name, rule.Description); err != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("源规则 %s（%s）：%s", rule.Name, caddyID, err.Error())})
+		return
+	}
 	duplicate.Enabled = false
 	duplicate.CreatedBy = int(userIDInt)
 	duplicate.UpdatedBy = int(userIDInt)
@@ -3874,6 +4078,79 @@ func abortIfRuleDeleted(c *gin.Context, caddyID string) bool {
 	return false
 }
 
+// updateRuleLockWindowHook / disableRuleLockWindowHook 是测试专用钩子：在
+// UpdateRule（window=1 证书取消窗口 / window=2 域名迁移取消窗口）与
+// DisableRule 的放锁窗口内触发，用于模拟窗口内并发的规则删除/更新
+// （并发修改复核 并发修改复核与 删除复核 删除复核的回归测试）。
+var (
+	updateRuleLockWindowHook  func(caddyID string, window int)
+	disableRuleLockWindowHook func(caddyID string)
+)
+
+// ruleMutationFingerprint 计算规则形态指纹（并发修改复核）：lb_rules 行 +
+// upstreams + path_rules 三面的完整投影。map 序列化由 encoding/json 按键名
+// 排序；关系行按 id 排序。用于判定主动放锁窗口内是否有人提交了对同一规则的
+// 修改（本请求提交后的指纹为基线）。
+func ruleMutationFingerprint(caddyID string) (string, error) {
+	ctx := context.Background()
+	ruleRow, err := dumpRowByKey(ctx, "lb_rules", "caddy_id", caddyID)
+	if err != nil {
+		return "", err
+	}
+	ruleJSON, err := json.Marshal(ruleRow)
+	if err != nil {
+		return "", fmt.Errorf("序列化规则行指纹: %w", err)
+	}
+	upstreamRows, err := queryRowsAsMaps(ctx, db.DB, rowQuery{
+		label: "上游指纹",
+		query: "SELECT * FROM upstreams WHERE rule_id = ? ORDER BY id",
+		args:  []any{caddyID},
+	})
+	if err != nil {
+		return "", err
+	}
+	upstreamJSON, err := json.Marshal(upstreamRows)
+	if err != nil {
+		return "", fmt.Errorf("序列化上游指纹: %w", err)
+	}
+	pathRows, err := queryRowsAsMaps(ctx, db.DB, rowQuery{
+		label: "路径规则指纹",
+		query: "SELECT * FROM path_rules WHERE rule_id = ? ORDER BY id",
+		args:  []any{caddyID},
+	})
+	if err != nil {
+		return "", err
+	}
+	pathJSON, err := json.Marshal(pathRows)
+	if err != nil {
+		return "", fmt.Errorf("序列化路径规则指纹: %w", err)
+	}
+	return string(ruleJSON) + "\n" + string(upstreamJSON) + "\n" + string(pathJSON), nil
+}
+
+// abortIfRuleConcurrentlyModified 在放锁窗口结束后复核规则是否被并发修改
+// （并发修改复核）：窗口内他人 UpdateRule 可完整提交；本请求若继续并随后失败，
+// restoreRuleDBSnapshot/restoreImportRuntime 会按请求前快照把他人已提交内容
+// 整体回退。检测到不一致即中止（409 + 审计「并发修改」），并跳过整份恢复
+// ——中止时运行态与本请求提交后的 DB 视图一致，恢复反而会回退他人路由。
+// 指纹读取失败时不判定（返回 false，维持既有恢复链语义）。
+// 返回 true 表示已写出错误响应，调用方必须立即 return。
+func abortIfRuleConcurrentlyModified(c *gin.Context, caddyID, baseline string) bool {
+	current, err := ruleMutationFingerprint(caddyID)
+	if err != nil {
+		services.Logf("error", "UpdateRule: 复核规则并发修改失败 for caddy_id=%s: %v", caddyID, err)
+		return false
+	}
+	if current == baseline {
+		return false
+	}
+	services.Logf("warn", "UpdateRule: 规则 %s 已在放锁窗口内被并发修改，中止后续迁移/补偿（不回退他人已提交内容）", caddyID)
+	recordAudit(c, "更新失败", "负载规则", services.FormatAuditDetail(
+		services.AuditRulePart(caddyID), "放锁窗口内检测到并发修改，已中止后续迁移/补偿（不回退他人已提交内容）", services.AuditResultPart("failure")))
+	c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "规则已被并发修改，本次更新已中止，请刷新后重试"})
+	return true
+}
+
 func (h *Handlers) DisableRule(c *gin.Context) {
 	caddyID := c.Param("caddy_id")
 
@@ -3947,6 +4224,9 @@ func (h *Handlers) DisableRule(c *gin.Context) {
 		//  + 历史问题：commit 失败统一走已提交视图恢复
 		//（回滚事务 + 重渲染 /load + 回退 LKG/投影/证书物化）。
 		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
+		// 提交后失败审计：提交失败留痕（Explicit 审计策略）。
+		recordAudit(c, "禁用失败", "负载规则", services.FormatAuditDetail(
+			services.AuditRulePart(caddyID), "提交规则禁用事务失败: "+errors.Join(err, restoreErr).Error(), services.AuditResultPart("failure")))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交规则禁用失败: " + errors.Join(err, restoreErr).Error()})
 		return
 	}
@@ -3962,6 +4242,9 @@ func (h *Handlers) DisableRule(c *gin.Context) {
 		h.caddyOpMu.Unlock()
 		func() {
 			defer h.caddyOpMu.Lock()
+			if disableRuleLockWindowHook != nil {
+				disableRuleLockWindowHook(caddyID)
+			}
 			cancelCtx, cancel := context.WithTimeout(c.Request.Context(), cancelRuleJobsTimeout)
 			defer cancel()
 			if err := cancelRuleJobs(cancelCtx, qm, caddyID); err != nil {
@@ -3969,6 +4252,12 @@ func (h *Handlers) DisableRule(c *gin.Context) {
 			}
 		}()
 		qm.UnblockJobsForRule(caddyID, blockToken)
+		// 删除复核：放锁窗口内并发的 DeleteRule 可完整提交（含证书任务/绑定
+		// 清理）——此时不得再写「禁用」成功审计（会留下指向已不存在规则的
+		// 成功留痕），按冲突中止；与 UpdateRule 同用 abortIfRuleDeleted。
+		if abortIfRuleDeleted(c, caddyID) {
+			return
+		}
 	}
 
 	recordAudit(c, "禁用", "负载规则", services.FormatAuditDetail(services.AuditRulePart(caddyID), "状态：已禁用"))

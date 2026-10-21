@@ -55,25 +55,13 @@ func runWithInTaskRetry(ctx context.Context, op func() error, onWait func(nextAt
 	}
 }
 
-// updateRunStillMaster 运行中角色复核（demote 在途中止判定）——
-// 与三库起点角色复查同一 SQL 口径（COALESCE(is_master,1)；查询失败按非主
-// 节点→跳过语义，宁停勿写）。
-func updateRunStillMaster() bool {
-	// 历史问题：与同族 历史修复 口径一致——nil 库 fail-closed（按非主节点）。
-	if db.DB == nil {
-		return false
-	}
-	if isMaster, err := RoleOf(context.Background(), db.DB); err != nil || !isMaster {
-		return false
-	}
-	return true
-}
-
-// updateRunRoleAtCancel 取消归因用的角色三态：(是否主节点, 角色是否
-// 已判定)。角色读故障必须是「不可判定」而非并入 demote——否则 DB 瞬断会把手动
-// 取消报成「节点已降级」，源行终态与审计失真。已知从节点仍按 demote 处理
-// （宁停勿写不变）。
-func updateRunRoleAtCancel() (bool, bool) {
+// updateRunRole 运行期角色三态：(是否主节点, 角色是否已判定)——起点角色门、
+// demote 在途中止复核、取消归因共用同一 SQL 口径（COALESCE(is_master,1)）。
+// 角色读故障必须是「不可判定」而非并入「非主节点」——否则 DB 瞬断会被误报成
+// 「节点已降级」（源行终态与审计失真），或被当作从节点静默跳过本轮（任务监控
+// 恒 success 掩盖 DB 异常）。消费口径：!known → 返回错误/记 failed（任务
+// 可见）+ warn 留痕；known && !master → 从节点跳过语义（宁停勿写不变）。
+func updateRunRole() (bool, bool) {
 	if db.DB == nil {
 		return false, false
 	}

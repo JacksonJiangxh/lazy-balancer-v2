@@ -891,20 +891,34 @@ func restoreTable(ctx context.Context, tx *sql.Tx, database *sql.DB, table strin
 }
 
 // tcpRuleDeadFieldsResetSQL：TCP 行 HTTP 专属死值清零（七 HTTP 专属字段 +
-// NTLM 开关 + force_http1 + TLS 三字段，共 12 列 SET）的 SQL 字面量。启动迁移
+// NTLM 开关 + force_http1 + TLS 三字段 + 代理超时族七列 + 自定义路由 +
+// dynamic_dns + strategy(cookie)，共 22 列 SET）的 SQL 字面量。启动迁移
 // db.migrateTCPRuleDeadFields 持有逐字相同的第二份（跨包不可共享常量）；
-// 历史修复（历史）parity 钉测试（tcp_dead_fields_parity_test.go）读取
-// 两侧源码断言 SET 列集合与 WHERE 逐字一致，防双份漂移。
+// 历史修复（历史）/ TCP 自愈族parity 钉测试
+// （tcp_dead_fields_parity_test.go）读取两侧源码断言 SET 列集合、WHERE 与
+// path_rules 清理 DELETE 逐字一致，防双份漂移。
 const tcpRuleDeadFieldsResetSQL = `UPDATE lb_rules SET
 	host_header='', health_check_path='', enable_compress=0, compress_types='',
 	request_body_max_size_mb=0, upstream_keepalive_timeout=0, server_tokens_hidden=0, ntlm_compatible=0, upstream_force_http1=0,
+	proxy_dial_timeout=0, proxy_response_header_timeout=0, proxy_read_timeout=0, proxy_write_timeout=0, proxy_stream_timeout=0, proxy_flush_interval=0, proxy_stream_close_delay=0,
+	custom_routes_enabled=0, dynamic_dns=0,
+	strategy=CASE WHEN strategy='cookie' THEN 'weighted_round_robin' ELSE strategy END,
 	enable_tls=0, tls_cert='', tls_key=''
 	WHERE protocol='tcp' AND (
 		COALESCE(host_header,'')<>'' OR COALESCE(health_check_path,'')<>''
 		OR enable_compress=1 OR COALESCE(compress_types,'')<>''
 		OR request_body_max_size_mb<>0 OR upstream_keepalive_timeout<>0 OR server_tokens_hidden<>0 OR ntlm_compatible<>0 OR upstream_force_http1<>0
+		OR proxy_dial_timeout<>0 OR proxy_response_header_timeout<>0 OR proxy_read_timeout<>0 OR proxy_write_timeout<>0 OR proxy_stream_timeout<>0 OR proxy_flush_interval<>0 OR proxy_stream_close_delay<>0
+		OR custom_routes_enabled=1 OR dynamic_dns=1
+		OR COALESCE(strategy,'')='cookie'
 		OR enable_tls=1
 	)`
+
+// tcpRulePathRulesResetSQL：TCP 规则残留路径规则清理（TCP 自愈族）——
+// custom_routes_enabled 归零后 path_rules 行成为孤儿（TCP 渲染零消费路径
+// 分支），随导出/备份导入被引用校验放大。与启动迁移
+// db.migrateTCPRuleDeadFields 第二份 DELETE 逐字一致（parity 钉测试比对）。
+const tcpRulePathRulesResetSQL = `DELETE FROM path_rules WHERE rule_id IN (SELECT caddy_id FROM lb_rules WHERE protocol='tcp')`
 
 // normalizeRuleRowsForTransport（历史修复）：导入事务内的规则行
 // 存储归一共享实现——v1 导入与 v2 备份导入两条写路径的唯一归一点：
@@ -921,6 +935,11 @@ const tcpRuleDeadFieldsResetSQL = `UPDATE lb_rules SET
 func normalizeRuleRowsForTransport(ctx context.Context, tx *sql.Tx) (int64, error) {
 	if _, err := tx.ExecContext(ctx, tcpRuleDeadFieldsResetSQL); err != nil {
 		return 0, fmt.Errorf("规则 TCP 死值归一失败: %w", err)
+	}
+	// TCP 自愈族：TCP 残留路径规则同事务清理——custom_routes_enabled
+	// 已归零，孤儿 path_rules 行随导出/备份往返被引用校验放大。
+	if _, err := tx.ExecContext(ctx, tcpRulePathRulesResetSQL); err != nil {
+		return 0, fmt.Errorf("规则 TCP 路径规则归一失败: %w", err)
 	}
 	// 历史问题：TCP log_enabled 为死配置（logger_names 仅 HTTP 生成），与
 	// tcpRuleDeadFieldsResetSQL 分开执行——后者与 db 启动迁移有逐字 parity 钉测，
@@ -4873,13 +4892,7 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	// 归一为 custom_only(规则从全关静默变生效)。行为与启动迁移一致(旧世界
 	// 数据归一),但在此留审计提示,运维可从事件日志追溯。
 	if policiesReplaced {
-		if result, err := tx.ExecContext(ctx, `UPDATE security_policies SET mode='custom_only'
-WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALESCE(custom_rules,'[]')) IN ('array','object') AND EXISTS (
-  SELECT 1 FROM json_each(COALESCE(custom_rules,'[]')) je
-  WHERE json_extract(je.value,'$.enabled')=1
-     OR (json_type(je.value)='integer' AND EXISTS (
-          SELECT 1 FROM security_custom_rules r
-          WHERE r.id=je.value AND COALESCE(r.enabled,1)=1)))`); err != nil {
+		if result, err := tx.ExecContext(ctx, ImportSecurityPolicyCustomOnlyModeSQL); err != nil {
 			err = session.abort(err)
 			recordAudit(c, action+"失败", "配置备份", "off→custom_only 归一: "+err.Error())
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: action + "失败，已回滚: " + err.Error()})

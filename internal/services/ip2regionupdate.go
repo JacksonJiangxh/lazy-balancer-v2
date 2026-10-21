@@ -263,7 +263,14 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 	// is_master 守卫后节点被降级时，从节点上的 in-flight 更新必须立即终止。
 	// 历史问题（历史）：NULL 兜底归一为 1，与 IsMaster/readonly 写闸/
 	// 调度器 tick 的 COALESCE(is_master,1) 同口径（历史 NULL 视为主节点）。
-	if isMaster, err := RoleOf(context.Background(), db.DB); err != nil || !isMaster {
+	if isMaster, roleErr := RoleOf(context.Background(), db.DB); roleErr != nil {
+		// 角色读取失败（DB 瞬断/脏行）≠从节点——按失败落定（task_runs/任务
+		// 监控可见），不得静默跳过（历史问题：err!=nil||!isMaster 把 DB 故障
+		// 当从节点）。
+		m.fail(fmt.Errorf("角色读取失败，无法判定本节点是否主节点，已中止 IP2Region 更新: %w", roleErr))
+		m.advanceSlotIfAuto(trigger)
+		return
+	} else if !isMaster {
 		// 历史问题-01（历史）：从节点中止是正常跳过语义，镜像 CRS——
 		// 落 skipped 终态、审计「更新跳过」，不再记「更新失败」。
 		m.syncInstalledVersionToState()
@@ -299,7 +306,7 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 	if err != nil {
 		// 历史问题-01：runCtx 取消且已非主节点=demote 在途中止——落 skipped
 		// （与起点角色复查同语义），不走 fail（从节点中止非故障）。
-		if master, known := updateRunRoleAtCancel(); runCtx.Err() != nil && known && !master {
+		if master, known := updateRunRole(); runCtx.Err() != nil && known && !master {
 			m.syncInstalledVersionToState()
 			m.setStage(IP2RegionStatusSkipped, "节点已降级为从节点，终止 IP2Region 更新")
 			return
@@ -380,7 +387,7 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 	if installErr != nil && !errors.Is(installErr, errIP2RegionReload) {
 		// 历史问题-01：同上方 fetch 分支——demote 在途中止落 skipped（不回滚
 		// 不重载：从节点保持只读不变量）。
-		if master, known := updateRunRoleAtCancel(); runCtx.Err() != nil && known && !master {
+		if master, known := updateRunRole(); runCtx.Err() != nil && known && !master {
 			m.syncInstalledVersionToState()
 			m.setStage(IP2RegionStatusSkipped, "节点已降级为从节点，终止 IP2Region 更新")
 			return

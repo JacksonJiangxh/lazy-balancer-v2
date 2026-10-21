@@ -1,6 +1,6 @@
 package handlers
 
-// 第 88 轮审计 P2-08：ntlm_compatible 列与渲染脱钩——渲染对该列零感知
+// NTLM 接管一致性：ntlm_compatible 列与渲染脱钩——渲染对该列零感知
 // （caddy.go buildHTTPHandleChain 注释自述），真实 NTLM 行为由 UI 修改器
 // （Rules.vue applyNtlmTakeover）落下的四列接管形态决定：
 // tcp_try_duration=-1（禁用跨上游重试）/upstream_force_http1=1/

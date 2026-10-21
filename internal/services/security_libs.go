@@ -12,10 +12,11 @@ import (
 // 面板侧提示：规则库卡片头部摘要（缺库异常描述）+ 本渲染告警日志。
 
 // SecurityLibraryStatus 探测安全链依赖的两类规则库可用性：
-// CRS=规则目录存在且为目录（空目录下 Include glob 编译为空规则集，配置仍合法；
-// 真实故障形态是目录缺失）；IP2Region=库文件存在且非空。
+// CRS=规则树满足安装完整性探针（≥1 个 .conf + 901 探针文件，与安装/恢复
+// 门 crsRulesTreeIntact 同口径；空树/残树下 Include glob 虽可能编译但运行时
+// 偏执级守卫空转，面板不得宣称“库可用”）；IP2Region=库文件存在且非空。
 func SecurityLibraryStatus() (crsOK, ip2regionOK bool) {
-	if st, err := os.Stat(filepath.Join(crsDirectivesDir, "rules")); err == nil && st.IsDir() {
+	if crsRulesTreeIntact(filepath.Join(crsDirectivesDir, "rules")) {
 		crsOK = true
 	}
 	if st, err := os.Stat(ip2regionLivePath); err == nil && st.Size() > 0 {
@@ -49,7 +50,7 @@ func securityLibrariesMissingDesc() string {
 // SetSecurityLibsDirsForTest 注入 CRS/IP2Region 库路径（handlers 等跨包渲染类
 // 测试用——缺库形态安全链整体不渲染，名单投影/热路径无从谈起）。返回恢复函数。
 func SetSecurityLibsDirsForTest(crsDir, xdbPath string) (restore func()) {
-	oldCRS, oldXdb := crsDirectivesDir, ip2regionLivePath
-	crsDirectivesDir, ip2regionLivePath = crsDir, xdbPath
-	return func() { crsDirectivesDir, ip2regionLivePath = oldCRS, oldXdb }
+	oldLive, oldCRS, oldXdb := crsLiveDir, crsDirectivesDir, ip2regionLivePath
+	crsLiveDir, crsDirectivesDir, ip2regionLivePath = crsDir, crsDir, xdbPath
+	return func() { crsLiveDir, crsDirectivesDir, ip2regionLivePath = oldLive, oldCRS, oldXdb }
 }

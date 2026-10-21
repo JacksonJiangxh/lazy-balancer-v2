@@ -70,3 +70,50 @@ func TestBuildWafFileRef_cheapSignatureShortCircuitsFullBuild(t *testing.T) {
 		t.Fatalf("ref after change = %+v, want different CRS hash", third)
 	}
 }
+
+func TestWafRefStatSignature_tracksCRSVersionWithoutRules(t *testing.T) {
+	oldCrs, oldXdb, oldWaf := crsLiveDir, ip2regionLivePath, wafDir
+	t.Cleanup(func() { crsLiveDir, ip2regionLivePath, wafDir = oldCrs, oldXdb, oldWaf })
+	root := t.TempDir()
+	crsLiveDir = filepath.Join(root, "crs")
+	ip2regionLivePath = filepath.Join(root, "missing.xdb")
+	wafDir = filepath.Join(root, "waf")
+	if err := os.MkdirAll(crsLiveDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	versionPath := filepath.Join(crsLiveDir, "VERSION")
+	fixed := time.Unix(1700000000, 0)
+	writeVersion := func(value string) {
+		t.Helper()
+		if err := os.WriteFile(versionPath, []byte(value), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(versionPath, fixed, fixed); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeVersion("v1")
+	first, err := wafRefStatSignature()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Same length and same mtime: the readable VERSION value itself must be signed.
+	writeVersion("v2")
+	second, err := wafRefStatSignature()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatal("VERSION content change must change the reference signature without a rules directory")
+	}
+	if err := os.Remove(versionPath); err != nil {
+		t.Fatal(err)
+	}
+	missing, err := wafRefStatSignature()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if missing == second {
+		t.Fatal("missing VERSION must have an explicit signature state distinct from a readable value")
+	}
+}

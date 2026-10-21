@@ -178,11 +178,16 @@ func TestValidateRuleFeatures_rejects_tcp_with_dynamic_dns(t *testing.T) {
 	}
 }
 
-func TestDuplicateRule_rejects_TCP_with_cookie_strategy(t *testing.T) {
-	// Given：源规则为 TCP + cookie 策略，复制时必须拒绝（cookie 仅 HTTP 支持）
+// TCP 自愈族：TCP+cookie 源行不再「复制即 400」——
+// 保存族自愈把 HTTP-only 策略归一为默认策略后复制（与此前 400 拒绝的
+// 历史裁定相比，死端被消除；显式创建仍 400，见 CreateRule 门）。
+func TestDuplicateRule_heals_TCP_with_cookie_strategy(t *testing.T) {
+	// Given：源规则为 TCP + cookie 策略（直改 DB/旧导入残留形态）
 	handler, _ := newRuleFeatureTestHandlersWithCapture(t)
 	gin.SetMode(gin.TestMode)
-	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,listen_port,strategy,enabled,enable_compress) VALUES ('lb_duptcpcookie','tcp-cookie','tcp',13010,'cookie',1,1)`); err != nil {
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,listen_port,strategy,enabled,enable_compress,
+		health_check_interval,health_check_timeout,health_check_unhealthy_threshold,health_check_healthy_threshold)
+		VALUES ('lb_duptcpcookie','tcp-cookie','tcp',13010,'cookie',1,1,10,2,3,2)`); err != nil {
 		t.Fatalf("seed tcp cookie rule: %v", err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb_duptcpcookie','127.0.0.1',9000,1,1,'tcp')`); err != nil {
@@ -199,16 +204,16 @@ func TestDuplicateRule_rejects_TCP_with_cookie_strategy(t *testing.T) {
 	// When
 	router.ServeHTTP(response, request)
 
-	// Then
-	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "TCP 规则仅支持") {
-		t.Fatalf("duplicate tcp+cookie status=%d body=%s, want 400", response.Code, response.Body.String())
+	// Then：201，副本策略归一为默认（cookie 属 HTTP-only）
+	if response.Code != http.StatusCreated {
+		t.Fatalf("duplicate tcp+cookie status=%d body=%s, want 201（自愈）", response.Code, response.Body.String())
 	}
-	var count int
-	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM lb_rules WHERE caddy_id != 'lb_duptcpcookie'`).Scan(&count); err != nil {
-		t.Fatalf("count duplicated rules: %v", err)
+	var strategy string
+	if err := db.DB.QueryRow(`SELECT strategy FROM lb_rules WHERE caddy_id != 'lb_duptcpcookie'`).Scan(&strategy); err != nil {
+		t.Fatalf("read duplicated strategy: %v", err)
 	}
-	if count != 0 {
-		t.Fatalf("duplicated rule count=%d, want 0", count)
+	if strategy != "weighted_round_robin" {
+		t.Fatalf("duplicated strategy=%q, want weighted_round_robin", strategy)
 	}
 }
 

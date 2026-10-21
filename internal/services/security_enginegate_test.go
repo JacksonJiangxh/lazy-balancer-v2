@@ -269,3 +269,73 @@ func TestEngineGate_blockStatusSyntheticShapes(t *testing.T) {
 		compileForEngineGate(t, directives)
 	})
 }
+
+func TestEngineGate_precheckGeoIPTrustContinuationExemptsTrustedIP(t *testing.T) {
+	// Given a three-segment GeoIP chain: private-IP guard, location, then NOT trust.
+	policy := &models.SecurityPolicy{
+		ID: 77, Mode: "off", GeoIPMode: "deny", GeoIPCountries: json.RawMessage(`["海外"]`),
+		IPWhitelistEnabled: true, IPWhitelist: json.RawMessage(`["203.0.113.9"]`),
+	}
+	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{policy}, 403, "lb_geoip_trust"))
+	if !strings.Contains(directives, `X-LB-GeoIP-Loc "@rx ^(?:海外)$" "t:none,chain"`) {
+		t.Fatalf("location segment must chain to the trust continuation:\n%s", directives)
+	}
+	compileForEngineGate(t, directives)
+	waf := newPrecheckBehaviorWAF(t, directives)
+	run := func(clientIP string) bool {
+		tx := waf.NewTransaction()
+		defer func() { _ = tx.Close() }()
+		tx.ProcessConnection(clientIP, 12345, "127.0.0.1", 443)
+		tx.ProcessURI("/", "GET", "HTTP/1.1")
+		tx.AddRequestHeader("X-LB-GeoIP-Loc", "海外")
+		return tx.ProcessRequestHeaders() != nil
+	}
+
+	// When/Then the trusted address fails the negated third segment and is not denied.
+	if run("203.0.113.9") {
+		t.Fatal("trusted IP must be exempted by the third chain segment")
+	}
+	// Regression shape: an untrusted overseas address still reaches the chain-head deny.
+	if !run("198.51.100.7") {
+		t.Fatal("untrusted overseas IP must be denied")
+	}
+
+	// Without the optional third segment, the location segment must terminate the chain.
+	policy.IPWhitelist = json.RawMessage(`[]`)
+	withoutTrust := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{policy}, 403, "lb_geoip_no_trust"))
+	if strings.Contains(withoutTrust, `X-LB-GeoIP-Loc "@rx ^(?:海外)$" "t:none,chain"`) {
+		t.Fatalf("location segment must not chain to a missing trust segment:\n%s", withoutTrust)
+	}
+	compileForEngineGate(t, withoutTrust)
+}
+
+func TestEngineGate_trustOnlyOffAndCustomOnlyDoNotEmitIdleWAF(t *testing.T) {
+	trust := json.RawMessage(`["203.0.113.9"]`)
+	enabledCustom := json.RawMessage(`[{"id":1,"name":"r","enabled":true,"action":"block","score":5,"conditions":[{"target":"uri","operator":"contains","pattern":"/x"}]}]`)
+	cases := []struct {
+		name       string
+		policy     *models.SecurityPolicy
+		wantEngine bool
+	}{
+		{name: "off trust only", policy: &models.SecurityPolicy{Mode: "off", IPWhitelistEnabled: true, IPWhitelist: trust}},
+		{name: "custom only trust only", policy: &models.SecurityPolicy{Mode: "custom_only", IPWhitelistEnabled: true, IPWhitelist: trust}},
+		{name: "custom only trust and custom", policy: &models.SecurityPolicy{Mode: "custom_only", IPWhitelistEnabled: true, IPWhitelist: trust, CustomRules: enabledCustom}, wantEngine: true},
+		{name: "off trust and ACL", policy: &models.SecurityPolicy{Mode: "off", IPWhitelistEnabled: true, IPWhitelist: trust, IPACLEnabled: true, IPACLMode: "deny", IPACLList: `["198.51.100.7"]`}, wantEngine: true},
+		{name: "off trust and parked custom", policy: &models.SecurityPolicy{Mode: "off", IPWhitelistEnabled: true, IPWhitelist: trust, CustomRules: enabledCustom}},
+		{name: "stage0 trust", policy: &models.SecurityPolicy{Mode: "off", PolicyType: models.PolicyTypeStage0, IPWhitelistEnabled: true, IPWhitelist: trust}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			directives := mustDirectives(BuildCorazaDirectives(tc.policy, nil, "", false, 0, "lb_idle_trust"))
+			if got := directives != ""; got != tc.wantEngine {
+				t.Fatalf("engine emitted=%v, want %v:\n%s", got, tc.wantEngine, directives)
+			}
+			if got := SecurityPolicyHasIPControl(tc.policy); got != tc.wantEngine {
+				t.Fatalf("SecurityPolicyHasIPControl=%v, want %v", got, tc.wantEngine)
+			}
+			if tc.wantEngine {
+				compileForEngineGate(t, directives)
+			}
+		})
+	}
+}

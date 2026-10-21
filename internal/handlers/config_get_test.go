@@ -83,6 +83,8 @@ func TestGetConfig_noGovernedDefaultLiterals(t *testing.T) {
 	body := string(src)[start : start+end]
 	for _, pattern := range []string{
 		`cert_expiry_days,` + "\r?`?\\s*" + `30`,
+		`cert_renewal_days,` + "\r?`?\\s*" + `30`,
+		`cert_renewal_attempts,` + "\r?`?\\s*" + `5`,
 		`caddy_log_size_mb,` + "\r?`?\\s*" + `100`,
 		`ELSE\s+128`,
 		`http_read_timeout,` + "\r?`?\\s*" + `60`,
@@ -132,7 +134,12 @@ func TestGetConfig_nullCertExpiryDaysFallsBackToConstant(t *testing.T) {
 // 绑定 db.DefaultCertExpiryDays（caddy.go 形态），Go 降级分支一律取治理常量
 // （services/certinfo.go GetCertExpiryThreshold 基准）。库值唯一真相（批 3）
 // 的读侧防回流钉；caddy.go GetConfig 本体已由 TestGetConfig_noGovernedDefaultLiterals 覆盖。
-func TestCertExpiryDays_noDefaultLiteralsAcrossConsumers(t *testing.T) {
+func TestGovernedConfigDefaults_noDefaultLiteralsAcrossConsumers(t *testing.T) {
+	governedSQLPatterns := []string{
+		`COALESCE\(cert_expiry_days\s*,\s*30\)`,
+		`COALESCE\(cert_renewal_days\s*,\s*30\)`,
+		`COALESCE\(cert_renewal_attempts\s*,\s*5\)`,
+	}
 	cases := []struct {
 		file     string
 		scope    string   // 非空=只扫该函数体（func 起点到下一个 "\nfunc"）
@@ -161,6 +168,11 @@ func TestCertExpiryDays_noDefaultLiteralsAcrossConsumers(t *testing.T) {
 				t.Fatalf("%s: scope %q end not found", tc.file, tc.scope)
 			}
 			body = body[start : start+end]
+		}
+		for _, pattern := range governedSQLPatterns {
+			if regexp.MustCompile(pattern).MatchString(body) {
+				t.Errorf("%s 治理默认值 SQL 字面量回流 %q——改用对应 db.Default* 单源", tc.file, pattern)
+			}
 		}
 		for _, pattern := range tc.patterns {
 			if regexp.MustCompile(pattern).MatchString(body) {

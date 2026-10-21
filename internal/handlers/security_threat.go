@@ -78,30 +78,13 @@ func (h *Handlers) GetThreatLib(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取威胁情报库失败: " + err.Error()})
 		return
 	}
-	// 与 GetCrawlerLib 同一批量形态：内置名单最多 200 行，一次预载代替逐源
-	// 点查；缺行保留 list_id=0，查询/扫描/迭代故障均显式 500。
-	listRows, err := db.DB.Query(`SELECT name, id FROM security_ip_lists WHERE system=1`)
+	// 与 GetCrawlerLib 共用 loadSystemListIDs：一次预载代替逐源点查；缺行保留
+	// list_id=0，查询/扫描/迭代故障均显式 500。
+	listIDs, err := loadSystemListIDs()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取内置名单失败: " + err.Error()})
 		return
 	}
-	listIDs := map[string]int{}
-	for listRows.Next() {
-		var name string
-		var id int
-		if err := listRows.Scan(&name, &id); err != nil {
-			listRows.Close()
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取内置名单失败: " + err.Error()})
-			return
-		}
-		listIDs[name] = id
-	}
-	if err := listRows.Err(); err != nil {
-		listRows.Close()
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取内置名单失败: " + err.Error()})
-		return
-	}
-	listRows.Close()
 	for i := range sources {
 		sources[i].ListID = listIDs[db.ThreatListNameBySource(sources[i].Name)]
 	}

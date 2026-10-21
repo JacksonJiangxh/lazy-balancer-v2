@@ -1,6 +1,12 @@
 package handlers
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"reflect"
+	"strconv"
+	"strings"
 	"testing"
 
 	"lazy-balancer-v2/internal/models"
@@ -72,7 +78,57 @@ func TestPlanConfigChangesDedupesSharedLabel(t *testing.T) {
 	if len(plan.Changes) != 1 || plan.Changes[0] != "大屏本站坐标" {
 		t.Fatalf("changes=%v, want 单条「大屏本站坐标」", plan.Changes)
 	}
-	if got := plan.SectionChanges["基础设置"]; len(got) != 1 || got[0] != "大屏本站坐标" {
+	got := plan.SectionChanges["基础设置"]
+	if len(got) != 1 || got[0] != "大屏本站坐标" {
 		t.Fatalf("section changes=%v, want 单条", got)
+	}
+}
+
+func TestPlanConfigChanges_tracksEveryUpdateConfigPointerField(t *testing.T) {
+	expected := map[string]bool{}
+	typ := reflect.TypeOf(models.UpdateConfigRequest{})
+	for i := range typ.NumField() {
+		field := typ.Field(i)
+		if field.Name == "Source" || field.Type.Kind() != reflect.Ptr {
+			continue
+		}
+		jsonName, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+		expected[jsonName] = true
+	}
+
+	parsed, err := parser.ParseFile(token.NewFileSet(), "config_changes.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse config_changes.go: %v", err)
+	}
+	actual := map[string]bool{}
+	ast.Inspect(parsed, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok || len(call.Args) == 0 {
+			return true
+		}
+		ident, ok := call.Fun.(*ast.Ident)
+		if !ok || ident.Name != "add" {
+			return true
+		}
+		literal, ok := call.Args[0].(*ast.BasicLit)
+		if !ok || literal.Kind != token.STRING {
+			t.Fatalf("add first argument must be a field-name string literal, got %T", call.Args[0])
+		}
+		name, err := strconv.Unquote(literal.Value)
+		if err != nil {
+			t.Fatalf("unquote add field: %v", err)
+		}
+		actual[name] = true
+		return true
+	})
+	for name := range expected {
+		if !actual[name] {
+			t.Errorf("UpdateConfigRequest.%s is missing from planConfigChanges add calls", name)
+		}
+	}
+	for name := range actual {
+		if !expected[name] {
+			t.Errorf("planConfigChanges tracks %q without an UpdateConfigRequest pointer field", name)
+		}
 	}
 }

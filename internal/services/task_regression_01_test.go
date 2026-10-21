@@ -97,8 +97,8 @@ func TestTaskRunHelpers_nilDBNeitherPanics(t *testing.T) {
 	db.DB = nil
 	t.Cleanup(func() { db.DB = old })
 
-	if updateRunStillMaster() {
-		t.Fatal("nil 库时角色复核必须 fail-closed 返回 false")
+	if master, known := updateRunRole(); known || master {
+		t.Fatal("nil 库时角色复核必须 fail-closed 返回 (false,false)（不可判定）")
 	}
 	got := taskRunStartedAt(nil)
 	if _, err := time.Parse(crsTimeLayout, got); err != nil {

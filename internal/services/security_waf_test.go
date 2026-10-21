@@ -1,8 +1,10 @@
 package services
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,9 +15,9 @@ import (
 
 func useCRSDirectivesDir(t *testing.T, dir string) {
 	t.Helper()
-	old := crsDirectivesDir
-	crsDirectivesDir = dir
-	t.Cleanup(func() { crsDirectivesDir = old })
+	oldLive, old := crsLiveDir, crsDirectivesDir
+	crsLiveDir, crsDirectivesDir = dir, dir
+	t.Cleanup(func() { crsLiveDir, crsDirectivesDir = oldLive, old })
 }
 
 func TestBuildCorazaDirectives_WAFAuditLogPartsIncludeK(t *testing.T) {
@@ -630,5 +632,28 @@ func TestBuildCorazaDirectives_responseBodyAccessGatedByCRSMode(t *testing.T) {
 		IPACLEnabled: true, IPACLMode: "deny", IPACLList: `["1.2.3.4"]`}, nil, "", false, 0, "lb_test"))
 	if strings.Contains(d, "SecResponseBodyAccess On") {
 		t.Fatalf("off+IP控制 SecResponseBodyAccess On 应不发射:\n%s", d)
+	}
+}
+
+func TestBuildCorazaDirectives_malformedCRSRuleGroupsLogsWarnAndUsesAll(t *testing.T) {
+	var logBuf bytes.Buffer
+	oldLog := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(oldLog) })
+	policy := &models.SecurityPolicy{ID: 7, Name: "broken-groups", Mode: "blocking", AnomalyThreshold: 5, CRSRuleGroups: json.RawMessage(`{"not":"an array"`)}
+
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_broken_groups"))
+	if !strings.Contains(logBuf.String(), "crs_rule_groups 畸形") {
+		t.Fatalf("malformed crs_rule_groups must leave a WARN trail, log:\n%s", logBuf.String())
+	}
+	if !strings.Contains(directives, "Include /app/waf/crs/rules/REQUEST-*.conf") {
+		t.Fatalf("malformed groups must retain empty-means-all behavior:\n%s", directives)
+	}
+
+	logBuf.Reset()
+	policy.CRSRuleGroups = json.RawMessage(`[]`)
+	_ = mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_valid_groups"))
+	if strings.Contains(logBuf.String(), "crs_rule_groups 畸形") {
+		t.Fatalf("valid empty groups must not warn:\n%s", logBuf.String())
 	}
 }

@@ -81,6 +81,11 @@ func newHotPathIPListFixture(t *testing.T) *hotPathIPListFixture {
 	if err := os.MkdirAll(filepath.Join(crsDir, "rules"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// SecurityLibraryStatus 与安装完整性探针同口径——空树视为缺库，安全链
+	// 整体不渲染，投影热路径测试将失去被测对象。
+	if err := os.WriteFile(filepath.Join(crsDir, "rules", "REQUEST-901-INITIALIZATION.conf"), []byte("# fixture"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	xdb := filepath.Join(f.dir, "ip2region.xdb")
 	if err := os.WriteFile(xdb, []byte("xdb"), 0o644); err != nil {
 		t.Fatal(err)

@@ -516,20 +516,19 @@ func parseSnapshotExpiry(value string) (time.Time, error) {
 // 三分类合并(2026-09-19):全局配置并入系统数据节(恒同步)——装载不再受
 // sync_global_config 开关裁剪(列已删除,快照恒携带)。
 func (s *ClusterService) loadSnapshotGlobalSettings(ctx context.Context, store snapshotStore, snapshot *models.ClusterSnapshot) error {
-	// 历史修复（历史）：cert_expiry_days 兜底经 db.DefaultCertExpiryDays 参数绑定
-	// （消费点族单源，读侧禁字面量回流——其余 COALESCE 字面量属 cert_renewal_*
-	// 列族/既有批 1+2 口径，不在本轮收敛范围）。
+	// 证书到期/续签天数/重试次数三列兜底统一绑定 db.Default*（消费点族单源，
+	// 读侧禁字面量回流；其余既有批 1+2 口径见各 COALESCE 注释）。
 	var caddyConfig string
 	var brandingJSON string
 	err := store.QueryRowContext(ctx, `SELECT COALESCE(cluster_version,0), COALESCE(caddy_config,'{}'), COALESCE(branding_json,''),
 		COALESCE(log_level,'info'),
 		COALESCE(task_log_size_mb,10), COALESCE(audit_log_size_mb,10), COALESCE(runtime_log_size_mb,100), COALESCE(audit_retention_months,3), COALESCE(jwt_expire_minutes,20), COALESCE(timezone,'Asia/Shanghai'),
-		COALESCE(acme_email,''), COALESCE(cert_expiry_days,?), COALESCE(cert_renewal_days,30), COALESCE(cert_renewal_attempts,5),
+		COALESCE(acme_email,''), COALESCE(cert_expiry_days,?), COALESCE(cert_renewal_days,?), COALESCE(cert_renewal_attempts,?),
 		COALESCE(default_ca_provider_id,0), COALESCE(dns_provider,''), COALESCE(dns_credentials,''), COALESCE(sync_interval,60),
 		COALESCE(admin_tls_enabled,0), COALESCE(admin_tls_mode,'selfsigned'), COALESCE(admin_tls_cert,''), COALESCE(admin_tls_key,''),
 		COALESCE(mfa_write_guard,0), COALESCE(mfa_lockout_enabled,0), COALESCE(github_proxy_url,'https://v4.gh-proxy.org/'),
 		COALESCE(oidc_config,'')
-		FROM global_config WHERE id=1`, db.DefaultCertExpiryDays).Scan(&snapshot.Version, &caddyConfig, &brandingJSON,
+		FROM global_config WHERE id=1`, db.DefaultCertExpiryDays, db.DefaultCertRenewalDays, db.DefaultCertRenewalAttempts).Scan(&snapshot.Version, &caddyConfig, &brandingJSON,
 		&snapshot.BasicSettings.LogLevel,
 		&snapshot.BasicSettings.TaskLogSizeMB, &snapshot.BasicSettings.AuditLogSizeMB, &snapshot.BasicSettings.RuntimeLogSizeMB, &snapshot.BasicSettings.AuditRetentionMonths, &snapshot.BasicSettings.JWTExpireMinutes, &snapshot.BasicSettings.Timezone,
 		&snapshot.BasicSettings.ACMEEmail, &snapshot.BasicSettings.CertExpiryDays, &snapshot.BasicSettings.CertRenewalDays, &snapshot.BasicSettings.CertRenewalAttempts,

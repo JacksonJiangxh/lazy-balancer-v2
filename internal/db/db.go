@@ -968,7 +968,11 @@ func runMigrations() error {
 		"upstreams.origin_domain":          "TEXT NOT NULL DEFAULT ''",
 		"lb_rules.health_check_host":       "TEXT NOT NULL DEFAULT ''",
 		"global_config.threat_auto_update": "INTEGER NOT NULL DEFAULT 1",
-		"security_ip_lists.system":         "INTEGER NOT NULL DEFAULT 0",
+		// 一次性迁移旗标列：迁移函数只读/置位，列创建统一走本登记点
+		// （幂等 ensureNewColumns），不再各自 pragma 探测 + ALTER。
+		"global_config.waf_mode4_migrated":     "BOOLEAN DEFAULT 0",
+		"global_config.sync_switches_migrated": "BOOLEAN DEFAULT 0",
+		"security_ip_lists.system":             "INTEGER NOT NULL DEFAULT 0",
 		// MFA 登录挑战绑定签发时密码版本（历史修复）。
 		"mfa_challenges.password_version":      "INTEGER NOT NULL DEFAULT 0",
 		"path_rules.upstream_path":             "TEXT NOT NULL DEFAULT ''",
@@ -1875,15 +1879,22 @@ func migrateDropMergedSyncSwitchColumns() error {
 // 同 sync_switches_migrated 先例):迁移后用户主动保存的 off+自定义规则
 // 属新语义合法状态,不得在下次重启被再次改写。json_each/json_extract 为
 // modernc sqlite 内建 JSON1。
+// SecurityPolicyCustomOnlyModeNormalizationSQL 是旧世界 off+启用自定义规则
+// 归一为 custom_only 的唯一 SQL 事实源：启动一次性迁移与配置导入共用，
+// 测试直接引用本常量（不得文本复刻）。json_type 双门保证顶层字符串/畸形
+// JSON 不触发 json_each 报错。
+const SecurityPolicyCustomOnlyModeNormalizationSQL = `UPDATE security_policies SET mode='custom_only'
+WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALESCE(custom_rules,'[]')) IN ('array','object') AND EXISTS (
+  SELECT 1 FROM json_each(COALESCE(custom_rules,'[]')) je
+  WHERE json_extract(je.value,'$.enabled')=1
+     OR (json_type(je.value)='integer' AND EXISTS (
+          SELECT 1 FROM security_custom_rules r
+          WHERE r.id=je.value AND COALESCE(r.enabled,1)=1)))`
+
 func migrateSecurityPolicyCustomOnlyMode() error {
-	var marker int
-	if err := DB.QueryRow("SELECT COUNT(*) FROM pragma_table_info('global_config') WHERE name='waf_mode4_migrated'").Scan(&marker); err != nil {
+	// 直调兼容：marker 列的 canonical 登记点是 newColumns（见 migrateSyncSwitches 同款说明）。
+	if err := ensureNewColumns(map[string]string{"global_config.waf_mode4_migrated": "BOOLEAN DEFAULT 0"}, nil); err != nil {
 		return err
-	}
-	if marker == 0 {
-		if _, err := DB.Exec("ALTER TABLE global_config ADD COLUMN waf_mode4_migrated BOOLEAN DEFAULT 0"); err != nil {
-			return err
-		}
 	}
 	var done bool
 	if err := DB.QueryRow("SELECT COALESCE(waf_mode4_migrated,0) FROM global_config WHERE id=1").Scan(&done); err != nil && err != sql.ErrNoRows {
@@ -1892,13 +1903,7 @@ func migrateSecurityPolicyCustomOnlyMode() error {
 	if done {
 		return nil
 	}
-	res, err := DB.Exec(`UPDATE security_policies SET mode='custom_only'
-WHERE mode='off' AND json_valid(COALESCE(custom_rules,'[]')) AND json_type(COALESCE(custom_rules,'[]')) IN ('array','object') AND EXISTS (
-  SELECT 1 FROM json_each(COALESCE(custom_rules,'[]')) je
-  WHERE json_extract(je.value,'$.enabled')=1
-     OR (json_type(je.value)='integer' AND EXISTS (
-          SELECT 1 FROM security_custom_rules r
-          WHERE r.id=je.value AND COALESCE(r.enabled,1)=1)))`)
+	res, err := DB.Exec(SecurityPolicyCustomOnlyModeNormalizationSQL)
 	if err != nil {
 		return fmt.Errorf("failed to migrate off-mode policies with custom rules: %w", err)
 	}
@@ -3587,14 +3592,10 @@ func generateCaddyIDForMigration() string {
 }
 
 func migrateSyncSwitches() error {
-	var marker int
-	if err := DB.QueryRow("SELECT COUNT(*) FROM pragma_table_info('global_config') WHERE name='sync_switches_migrated'").Scan(&marker); err != nil {
+	// 直调兼容：marker 列的 canonical 登记点是 newColumns；此处保证单函数被
+	// 直接调用（测试/局部迁移）时列已存在，行为与 runMigrations 路径一致。
+	if err := ensureNewColumns(map[string]string{"global_config.sync_switches_migrated": "BOOLEAN DEFAULT 0"}, nil); err != nil {
 		return err
-	}
-	if marker == 0 {
-		if _, err := DB.Exec("ALTER TABLE global_config ADD COLUMN sync_switches_migrated BOOLEAN DEFAULT 0"); err != nil {
-			return err
-		}
 	}
 	var done bool
 	if err := DB.QueryRow("SELECT COALESCE(sync_switches_migrated,0) FROM global_config WHERE id=1").Scan(&done); err != nil && err != sql.ErrNoRows {
@@ -3751,11 +3752,17 @@ func migrateTCPRuleDeadFields() error {
 	res, err := tx.Exec(`UPDATE lb_rules SET
 		host_header='', health_check_path='', enable_compress=0, compress_types='',
 		request_body_max_size_mb=0, upstream_keepalive_timeout=0, server_tokens_hidden=0, ntlm_compatible=0, upstream_force_http1=0,
+		proxy_dial_timeout=0, proxy_response_header_timeout=0, proxy_read_timeout=0, proxy_write_timeout=0, proxy_stream_timeout=0, proxy_flush_interval=0, proxy_stream_close_delay=0,
+		custom_routes_enabled=0, dynamic_dns=0,
+		strategy=CASE WHEN strategy='cookie' THEN 'weighted_round_robin' ELSE strategy END,
 		enable_tls=0, tls_cert='', tls_key=''
 		WHERE protocol='tcp' AND (
 			COALESCE(host_header,'')<>'' OR COALESCE(health_check_path,'')<>''
 			OR enable_compress=1 OR COALESCE(compress_types,'')<>''
 			OR request_body_max_size_mb<>0 OR upstream_keepalive_timeout<>0 OR server_tokens_hidden<>0 OR ntlm_compatible<>0 OR upstream_force_http1<>0
+			OR proxy_dial_timeout<>0 OR proxy_response_header_timeout<>0 OR proxy_read_timeout<>0 OR proxy_write_timeout<>0 OR proxy_stream_timeout<>0 OR proxy_flush_interval<>0 OR proxy_stream_close_delay<>0
+			OR custom_routes_enabled=1 OR dynamic_dns=1
+			OR COALESCE(strategy,'')='cookie'
 			OR enable_tls=1
 		)`)
 	if err != nil {
@@ -3765,7 +3772,19 @@ func migrateTCPRuleDeadFields() error {
 	if err != nil {
 		return fmt.Errorf("failed to read zeroed TCP rule count: %w", err)
 	}
-	if affected > 0 {
+	// TCP 自愈族：TCP 渲染零消费路径规则（buildTCPProxyRoute 无自定义
+	// 路径分支）——custom_routes_enabled 归零后残留 path_rules 行成为孤儿，
+	// 随导出/备份导入被引用校验放大。与 SET 同事务删除（幂等：无 TCP 规则时
+	// 零行命中）。历史修复（历史）parity 钉测试逐字比对两侧 DELETE 字面量。
+	pathRes, err := tx.Exec(`DELETE FROM path_rules WHERE rule_id IN (SELECT caddy_id FROM lb_rules WHERE protocol='tcp')`)
+	if err != nil {
+		return fmt.Errorf("failed to delete TCP rule path rules: %w", err)
+	}
+	removedPathRules, err := pathRes.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to read deleted TCP path rule count: %w", err)
+	}
+	if affected > 0 || removedPathRules > 0 {
 		// 快照缓存随版本失效；bump 让从端下一轮拉到归一后 canonical，
 		// rules 节哈希两侧收敛（「分区滞后」自愈）。
 		if _, err := tx.Exec(`UPDATE global_config SET cluster_version=COALESCE(cluster_version,0)+1 WHERE id=1`); err != nil {
@@ -3776,10 +3795,10 @@ func migrateTCPRuleDeadFields() error {
 		return fmt.Errorf("failed to commit TCP dead-field cleanup: %w", err)
 	}
 	committed = true
-	if affected > 0 {
+	if affected > 0 || removedPathRules > 0 {
 		// 历史问题：用户规则数据被改写须留痕（与 TCP stale DNS / legacy HTTPS /
 		// 孤儿 upstream 三个姊妹迁移同口径，聚合一行+计数）。
-		detail := fmt.Sprintf("存量 TCP 规则 HTTP 专属死字段已清零：%d 条（主端库/导出 canonical/从端落库三面同值）", affected)
+		detail := fmt.Sprintf("存量 TCP 规则 HTTP 专属死字段已清零：%d 条（含路径规则 %d 条；主端库/导出 canonical/从端落库三面同值）", affected, removedPathRules)
 		log.Print(detail)
 		recordSystemAudit("启动迁移", "系统配置", detail)
 	}

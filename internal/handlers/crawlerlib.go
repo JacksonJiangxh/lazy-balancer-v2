@@ -60,28 +60,11 @@ func (h *Handlers) GetCrawlerLib(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取爬虫源失败: " + err.Error()})
 		return
 	}
-	listRows, err := db.DB.Query(`SELECT name, id FROM security_ip_lists WHERE system=1`)
+	listIDs, err := loadSystemListIDs()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取爬虫源失败: " + err.Error()})
 		return
 	}
-	listIDs := map[string]int{}
-	for listRows.Next() {
-		var name string
-		var id int
-		if err := listRows.Scan(&name, &id); err != nil {
-			listRows.Close()
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取爬虫源失败: " + err.Error()})
-			return
-		}
-		listIDs[name] = id
-	}
-	if err := listRows.Err(); err != nil {
-		listRows.Close()
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取爬虫源失败: " + err.Error()})
-		return
-	}
-	listRows.Close()
 	for i := range sources {
 		sources[i].ListID = listIDs[services.CrawlerIPListName(sources[i].Name)]
 	}
@@ -106,14 +89,14 @@ func (h *Handlers) StartCrawlerLibUpdate(c *gin.Context) {
 		respondTaskEngineUnavailable(c)
 		return
 	}
-	if te.IsTaskInFlight("crawlerbot-update") {
+	if te.IsTaskInFlight(services.CrawlerTaskID) {
 		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "任务运行中，请稍后重试"})
 		return
 	}
 	op := auditOperator(c)
 	// 历史问题：响应前同步预占位；自记族成功零 handler 审计，
 	// ErrAlreadyRunning/ErrTaskSkipped 静默，真失败留补偿审计。
-	if err := services.TriggerTaskAsync(te, "crawlerbot-update", services.TriggerAuditContext{
+	if err := services.TriggerTaskAsync(te, services.CrawlerTaskID, services.TriggerAuditContext{
 		Operator: op, Family: "爬虫地址库", Name: "爬虫地址更新",
 	}); err != nil {
 		respondTaskTriggerAdmissionError(c, err)
@@ -164,13 +147,13 @@ func (h *Handlers) GetCrawlerLibUpdateStatus(c *gin.Context) {
 		return
 	}
 	data := gin.H{
-		"running":     te.IsTaskInFlight("crawlerbot-update"),
+		"running":     te.IsTaskInFlight(services.CrawlerTaskID),
 		"trigger":     "",
 		"started_at":  "",
 		"finished_at": "",
 		"outcome":     "",
 	}
-	if history := te.History("crawlerbot-update", 1); len(history) > 0 {
+	if history := te.History(services.CrawlerTaskID, 1); len(history) > 0 {
 		latest := history[0]
 		data["trigger"] = latest.Trigger
 		data["started_at"] = latest.StartedAt
@@ -239,6 +222,6 @@ func (h *Handlers) UpdateCrawlerLibFlags(c *gin.Context) {
 
 // GetCrawlerLibUpdateLogs 爬虫更新任务日志（tasks/crawlerbot-update.log 尾读，含轮转副本）。
 func (h *Handlers) GetCrawlerLibUpdateLogs(c *gin.Context) {
-	content := readUpdateLogWithRotation(taskengine.TaskLogPath("crawlerbot-update"))
+	content := readUpdateLogWithRotation(taskengine.TaskLogPath(services.CrawlerTaskID))
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"content": content}})
 }

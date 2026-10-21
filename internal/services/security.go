@@ -22,7 +22,7 @@ import (
 
 // crsDirectivesDir is a test seam (mirroring crsLiveDir in crsupdate.go);
 // emitted Include directives always use the container path.
-var crsDirectivesDir = "/app/waf/crs"
+var crsDirectivesDir = defaultCRSLiveDir
 
 // scanSecurityPolicyByID 按主键加载一条 enabled 策略行，并把 JSON 文本列转为
 // json.RawMessage；行缺失或 disabled 时返回 nil。GetSecurityPoliciesForRule 与
@@ -234,7 +234,8 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 	// 历史问题-02：启用 allow 时即使合并后有效条目为空也必须发射
 	// 否定算子（空文件 = 全不匹配 = 恒拒），覆盖备份导入、带外改库和条目
 	// 自然到期三条路径；内容门只用于语义不等价的信任/黑名单/deny。
-	emitIPControl := (p.IPWhitelistEnabled && p.PolicyType != models.PolicyTypeStage0 && len(ipWL) > 0) || len(ipBL) > 0 || p.IPACLEnabled
+	hasNonTrustIPControl := len(ipBL) > 0 || p.IPACLEnabled
+	emitTrustControl := p.IPWhitelistEnabled && p.PolicyType != models.PolicyTypeStage0 && len(ipWL) > 0
 	customRules := policyCustomRulesCached(p, store)
 	hasCustomRules := false
 	for _, cr := range customRules {
@@ -243,6 +244,11 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 			break
 		}
 	}
+	// 空转引擎收窄：信任名单本身只在已有引擎承载的形态里发射——off/custom_only
+	// 且无其他发射内容（无自定义规则/ACL/黑名单）时不单为信任起引擎。
+	// blocking/detection 恒有 CRS、custom_only 有自定义规则、或存在 ACL/
+	// 黑名单时保留信任规则与原引擎判定。
+	emitIPControl := hasNonTrustIPControl || (emitTrustControl && (p.Mode != "off" && p.Mode != "custom_only" || p.Mode == "custom_only" && hasCustomRules))
 
 	// 2026-09-09 裁定:WAF 模式四态化。
 	//   off:CRS 与自定义规则均不生效(引擎仅为 IP 控制而开;GeoIP 已迁预检);
@@ -254,16 +260,14 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 	customActive := p.Mode == "custom_only" || crsActive
 	switch {
 	case crsActive:
-		if p.Mode == "detection" {
-			// 检测模式仍保持 IP 控制与自定义规则强制生效:引擎以 On 启动,使下方的
-			// IP ACL deny 规则与自定义拦截规则(在 DetectionOnly 切换之前发出)真实
-			// 阻断;随后通过 phase:1 的 SecAction 仅将 CRS 规则集切换为
-			// DetectionOnly(该切换在 CRS Include 之前生效),自定义拦截规则与 IP
-			// ACL 不受影响,仍在检测模式下强制阻断。
-			// 例外(历史修复):body 目标的自定义拦截规则发射为 phase:2(REQUEST_BODY
-			// 仅 phase:2 可读),而 DetectionOnly ctl 是事务级指令持续到 phase:2——
-			// 该类规则在检测模式下仅记录不阻断(见 emitCustomRules 相位说明)。
-		}
+		// 检测模式仍保持 IP 控制与自定义规则强制生效:引擎以 On 启动,使下方的
+		// IP ACL deny 规则与自定义拦截规则(在 DetectionOnly 切换之前发出)真实
+		// 阻断;随后通过 phase:1 的 SecAction 仅将 CRS 规则集切换为
+		// DetectionOnly(该切换在 CRS Include 之前生效),自定义拦截规则与 IP
+		// ACL 不受影响,仍在检测模式下强制阻断。
+		// 例外(历史修复):body 目标的自定义拦截规则发射为 phase:2(REQUEST_BODY
+		// 仅 phase:2 可读),而 DetectionOnly ctl 是事务级指令持续到 phase:2——
+		// 该类规则在检测模式下仅记录不阻断(见 emitCustomRules 相位说明)。
 		sb.WriteString("SecRuleEngine On\n")
 	case p.Mode == "custom_only" && (hasCustomRules || emitIPControl):
 		// 仅自定义:CRS 不加载,引擎为自定义规则/IP 控制而开;空策略
@@ -466,7 +470,11 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 
 	if p.Mode == "blocking" || p.Mode == "detection" {
 		var groups []string
-		json.Unmarshal(p.CRSRuleGroups, &groups)
+		if err := json.Unmarshal(p.CRSRuleGroups, &groups); err != nil {
+			// D7 同族（geoip_countries 先例）：畸形列不 fail-visible，按空=全量
+			// 发射；WARN 留痕供带外改库/旧备份残留诊断。
+			Logf("warn", "策略 %q（#%d）crs_rule_groups 畸形 JSON，渲染按空=全量规则组处理: %v", p.Name, p.ID, err)
+		}
 		// 历史修复（读取面兜底）：存量/带外数据（写入面剥离生效前落库、集群同步旧快照）
 		// 可能仍含基础设施组号——按数组原位发射 REQUEST-901/949/959-*.conf glob
 		// 会破坏 901 最前/949、959 殿后的强制序（偏执级守卫空转、阻断静默漏拦）。
@@ -968,7 +976,11 @@ func SecurityPolicyHasIPControl(p *models.SecurityPolicy) bool {
 	// 信任名单：stage0 策略的信任不属于本引擎（路由层直通/预检承载）；
 	// 内容门取合并集（inline ∪ 已解析引用条目）——引用的列表为空/已被删除
 	// 时发射面零信任规则，摘要同步 false。
-	if p.IPWhitelistEnabled && p.PolicyType != models.PolicyTypeStage0 && len(mergedWhitelist(p)) > 0 {
+	emitTrustControl := p.IPWhitelistEnabled && p.PolicyType != models.PolicyTypeStage0 && len(mergedWhitelist(p)) > 0
+	// 空转收窄：off/custom_only 且仅信任名单时，只有 custom_only 同时存在
+	// 启用自定义规则才由该引擎承载信任规则；其余模式（blocking/detection）
+	// 恒有 CRS 引擎。摘要与 BuildCorazaDirectives 的 emitIPControl 同式。
+	if emitTrustControl && p.Mode != "off" && p.Mode != "custom_only" {
 		return true
 	}
 	// ACL：开启即发射（allow 空集=否定空集恒拒；deny/绕过 空集不命中但
@@ -980,7 +992,10 @@ func SecurityPolicyHasIPControl(p *models.SecurityPolicy) bool {
 	if err := json.Unmarshal(p.IPBlacklist, &ipBL); err != nil {
 		logMalformedInlineIPList(p.ID, "ip_blacklist", err)
 	}
-	return len(aggregateIPEntries(ipBL)) > 0
+	if len(aggregateIPEntries(ipBL)) > 0 {
+		return true
+	}
+	return emitTrustControl && p.Mode == "custom_only" && CountEnabledCustomRules(p.CustomRules) > 0
 }
 
 // CountEnabledCustomRules returns how many of the policy's referenced custom
@@ -1648,19 +1663,25 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 				}
 			}
 		}
+		trusted := mergedWhitelist(p)
+		trustContinuation := p.IPWhitelistEnabled && len(trusted) > 0
+		locationActions := "t:none"
+		if trustContinuation {
+			// 中段仅在第三段（信任续段）存在时续链；无信任时以 t:none 终止，
+			// 避免悬空 chain 使引擎拒绝整份预检配置。
+			locationActions = "t:none,chain"
+		}
 		sb.WriteString(fmt.Sprintf("SecRule REMOTE_ADDR \"!@ipMatch %s\" \"id:%d,phase:1,deny%s,log,msg:'GeoIP 区域拦截',skipAfter:SECURITY_RULES_END,chain\"\n", strings.Join(geoipPrivateRanges, ","), geoipRuleID, geoipStatusFragment))
-		sb.WriteString(fmt.Sprintf(" SecRule REQUEST_HEADERS:X-LB-GeoIP-Loc \"%s\" \"t:none\"\n", escapeCorazaPattern(geoipLocOperator(geoipCountries(p), p.GeoIPMode == "allow", geoipCountryExact))))
-		if p.IPWhitelistEnabled {
+		sb.WriteString(fmt.Sprintf(" SecRule REQUEST_HEADERS:X-LB-GeoIP-Loc \"%s\" \"%s\"\n", escapeCorazaPattern(geoipLocOperator(geoipCountries(p), p.GeoIPMode == "allow", geoipCountryExact)), locationActions))
+		if trustContinuation {
 			// 信任维持内容门控（不收敛，2026-10-15：ip_whitelist_enabled 表
 			// 默认值=1 非刻意 opt-in，flag 门控会使每条 GeoIP 链凭空获得恒真
 			// 续段——门禁钉测实证）。
-			if trusted := mergedWhitelist(p); len(trusted) > 0 {
-				operand, err := ipListRuleOperand(fmt.Sprintf("p%d-trust", p.ID), trusted, true)
-				if err != nil {
-					return "", err
-				}
-				sb.WriteString(fmt.Sprintf("SecRule REMOTE_ADDR \"%s\" \"t:none\"\n", operand))
+			operand, err := ipListRuleOperand(fmt.Sprintf("p%d-trust", p.ID), trusted, true)
+			if err != nil {
+				return "", err
 			}
+			sb.WriteString(fmt.Sprintf("SecRule REMOTE_ADDR \"%s\" \"t:none\"\n", operand))
 		}
 	}
 	sb.WriteString("SecMarker SECURITY_RULES_END\n")
