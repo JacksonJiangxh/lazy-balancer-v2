@@ -3882,7 +3882,7 @@ func (h *Handlers) ListSecurityEvents(c *gin.Context) {
 		// 路径同形状（events——历史修正，此前误用 list 键）；
 		// page/page_size 回显请求值（与成功路径一致，前端/Agent 的分页
 		// 字段假设不因降级失真）。
-		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]any{"events": []any{}, "total": 0, "page": page, "page_size": pageSize, "ingestion": services.SecurityEventsIngestionHealthSnapshot()}})
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]any{"events": []any{}, "total": 0, "page": page, "page_size": pageSize, "includes_reserved": true, "ingestion": services.SecurityEventsIngestionHealthSnapshot()}})
 		return
 	}
 	// event_time 恒为 'YYYY-MM-DD HH:MM:SS' UTC 字符串，参数同形 —— 直接字符串比较
@@ -3956,7 +3956,10 @@ func (h *Handlers) ListSecurityEvents(c *gin.Context) {
 	if events == nil {
 		events = []models.SecurityEvent{}
 	}
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"events": events, "total": total, "page": page, "page_size": pageSize, "ingestion": services.SecurityEventsIngestionHealthSnapshot()}})
+	// includes_reserved 披露口径：事件列表 total/events 含私网/保留地址
+	//（与安全总览同键披露；威胁大屏 rollup 排除——三面口径对称可见，
+	// 跨面比数不等时该字段即解释）。
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"events": events, "total": total, "page": page, "page_size": pageSize, "includes_reserved": true, "ingestion": services.SecurityEventsIngestionHealthSnapshot()}})
 }
 
 const securityEventListFieldCap = 16 * 1024

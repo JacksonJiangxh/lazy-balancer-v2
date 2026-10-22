@@ -3,6 +3,7 @@ package services
 import (
 	"encoding/json"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -31,6 +32,45 @@ func TestUpstreamEnabledPredicateHasOneLiteral(t *testing.T) {
 		}
 		if strings.Contains(string(data), "u.enabled IN") {
 			t.Fatalf("%s 内联了上游启用表达式（应复用单源谓词）", path)
+		}
+	}
+
+	// handlers 侧同族守卫（上游启用判定全仓收敛后）：别名 u 的谓词直写
+	// （u.enabled=1 / u.enabled IN）一律禁止；upstreams 查询字面量内的
+	// 投影形态（IIF(...enabled IN...)）与 WHERE 直写（enabled=1）同样禁止——
+	// 一律引用 services.UpstreamEnabledSQLValue / UpstreamEnabledSQLPredicate。
+	// 注意 lb_rules.enabled（规则启用列）不属本族，不在禁止范围。
+	entries, err := os.ReadDir("../handlers")
+	if err != nil {
+		t.Fatalf("read handlers dir: %v", err)
+	}
+	upstreamsStringLiteral := regexp.MustCompile("(?s:`[^`]*`)|\"([^\"\\\\]|\\\\.)*\"")
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		data, err := os.ReadFile("../handlers/" + name)
+		if err != nil {
+			t.Fatalf("read handlers/%s: %v", name, err)
+		}
+		src := string(data)
+		for _, pat := range []string{"u.enabled=1", "u.enabled = 1", "u.enabled IN"} {
+			if strings.Contains(src, pat) {
+				t.Fatalf("handlers/%s 内联上游启用谓词 %q（应引用 services.UpstreamEnabledSQLPredicate）", name, pat)
+			}
+		}
+		for _, lit := range upstreamsStringLiteral.FindAllString(src, -1) {
+			if !strings.Contains(lit, "FROM upstreams") {
+				continue
+			}
+			if strings.Contains(lit, "enabled IN (") {
+				t.Fatalf("handlers/%s 的 upstreams 查询内联启用投影（应引用 services.UpstreamEnabledSQLValue）: %.80q", name, lit)
+			}
+			tail := lit[strings.LastIndex(lit, "FROM upstreams"):]
+			if regexp.MustCompile(`enabled\s*=\s*1`).MatchString(tail) {
+				t.Fatalf("handlers/%s 的 upstreams 查询内联启用过滤（应引用 services.UpstreamEnabledSQLPredicate）: %.80q", name, lit)
+			}
 		}
 	}
 }

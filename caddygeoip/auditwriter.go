@@ -1102,6 +1102,10 @@ type auditPipeline struct {
 	statsDirty     atomic.Bool
 	statsMu        sync.Mutex
 	lastStatsWrite time.Time
+	// lastStatsFailLog 是侧车写盘失败的节流留痕时间（statsMu 保护）：
+	// 磁盘满/目录只读时侧车双向失效（写不进也读不到），不留痕则写侧
+	// 丢弃/IO 计数对外恒 0、健康位假绿。
+	lastStatsFailLog time.Time
 }
 
 // auditWriterStatsSuffix 是写侧失败计数侧车文件名后缀（紧跟审计日志目标路径）。
@@ -1412,13 +1416,29 @@ func (p *auditPipeline) writeWriterStatsIfDue(now time.Time) {
 	path := auditWriterStatsPath(p.target)
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, body, 0o644); err != nil {
-		return // 尽力而为：计数仍在内存，下次变化/重试再写
+		// 尽力而为但可观测：恢复脏标记下个 drain 节拍重试（否则计数不再
+		// 变化时永不重试，侧车永久缺失），并按分钟节流留痕一次。
+		p.statsDirty.Store(true)
+		p.logStatsWriteFailureLocked(now, err)
+		return
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
+		p.statsDirty.Store(true)
+		p.logStatsWriteFailureLocked(now, err)
 		return
 	}
 	p.lastStatsWrite = now
+}
+
+// logStatsWriteFailureLocked 侧车写盘失败节流留痕（调用方已持 statsMu，
+// 每分钟至多一条；与 reportIOError 的节流口径同族）。
+func (p *auditPipeline) logStatsWriteFailureLocked(now time.Time, err error) {
+	if !p.lastStatsFailLog.IsZero() && now.Sub(p.lastStatsFailLog) < time.Minute {
+		return
+	}
+	p.lastStatsFailLog = now
+	auditIOLogf("audit writer: writer-stats sidecar write failed for %s (writer counters unavailable to panel until retry succeeds): %v", p.target, err)
 }
 
 // processSafely 隔离单条审计行处理的 panic（formatter/快照实现异常）：

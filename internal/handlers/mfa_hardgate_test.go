@@ -19,7 +19,8 @@ import (
 
 // 2026-09 用户裁定后的 MFA 端点语义：登录后不再有密码输入要求（改密是唯一
 // 例外，见 auth 侧测试）；disable/setup 重绑仅验当前有效验证码，验码失败只
-// 提示 401 不计数不锁定；恢复码重生成仅凭 JWT 会话；全系统唯一锁定为登录
+// 提示 401 不计数不锁定（另有 per-user 滑动窗仅限流门：60 秒 5 次失败 → 429，
+// 成功清零，不落库不置锁）；恢复码重生成仅凭 JWT 会话；全系统唯一锁定为登录
 // 阶段 5 次/10 分钟、受「登录失败锁定」开关控制。本文件钉住该契约。
 
 // seedMfaGateUser 种 id=1 已启用 MFA 操作者（登录后端点无密码段）。
@@ -41,6 +42,10 @@ func mfaSetupTestRouter(h *Handlers) *gin.Engine {
 
 func seedMfaRulingUser(t *testing.T) string {
 	t.Helper()
+	// 登录后验码限流为进程内内存态——同 user id 的跨用例残留会让后序用例
+	// 误中 429，播种即清并在用例结束时再清。
+	services.MFAResetVerifyAttemptsForTest()
+	t.Cleanup(services.MFAResetVerifyAttemptsForTest)
 	// MFA 列/挑战表统一由 ensureMFATestSchema 单源提供
 	hash, err := bcrypt.GenerateFromPassword([]byte("irrelevant"), bcrypt.MinCost)
 	if err != nil {
@@ -88,26 +93,31 @@ func postMfa(router *gin.Engine, path, body string) int {
 	return recorder.Code
 }
 
-// 验码失败恒 401 且不产生任何计数/锁定（第 N 次与第 1 次同形）。
+// 验码失败 401 且不产生任何计数/锁定；登录后验码另有 per-user 仅限流门
+// （60 秒内失败 5 次后 429，成功清零——不落 login_* 列、不置锁）。
 func TestMFAVerifyFailures_NeverCountOrLock(t *testing.T) {
 	setupAuthTestDB(t)
 	seedMfaRulingUser(t)
 	h := &Handlers{cfg: &config.Config{JWTSecret: "test-secret"}}
 	router := mfaRulingRouter(h)
-	for i := 1; i <= 12; i++ {
+	for i := 1; i <= 5; i++ {
 		if code := postMfa(router, "/auth/mfa/disable", `{"code":"000000"}`); code != http.StatusUnauthorized {
-			t.Fatalf("attempt %d: status=%d, want 401（验码失败只提示，不计数不锁定）", i, code)
+			t.Fatalf("attempt %d: status=%d, want 401（限流窗内验码失败只提示）", i, code)
 		}
 	}
+	// 第 6 次失败尝试触发仅限流门（429）——不锁定、不计 login_* 列。
+	if code := postMfa(router, "/auth/mfa/disable", `{"code":"000000"}`); code != http.StatusTooManyRequests {
+		t.Fatalf("attempt 6: status=%d, want 429（滑动窗限流）", code)
+	}
 	// 断言迁移到 login_* 列(生产 schema 已删
-	// mfa_failed_attempts/mfa_locked_until 死列)——MFA 验码失败不计数。
+	// mfa_failed_attempts/mfa_locked_until 死列)——MFA 验码失败不计数不锁定。
 	var loginAttempts int
 	var loginLocked sql.NullString
 	if err := db.DB.QueryRow("SELECT COALESCE(login_failed_attempts,0), login_locked_until FROM users WHERE id=1").Scan(&loginAttempts, &loginLocked); err != nil {
 		t.Fatal(err)
 	}
 	if loginAttempts != 0 || loginLocked.Valid {
-		t.Fatalf("login_attempts=%d login_locked=%v, want 0/NULL（MFA 验码失败不计数不锁定）", loginAttempts, loginLocked)
+		t.Fatalf("login_attempts=%d login_locked=%v, want 0/NULL（MFA 验码失败不计数不锁定，仅限流）", loginAttempts, loginLocked)
 	}
 }
 

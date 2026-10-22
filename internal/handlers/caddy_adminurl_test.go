@@ -3,6 +3,7 @@ package handlers
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
@@ -49,6 +50,45 @@ func TestGetCaddyConfig_dialsConfiguredAdminURL(t *testing.T) {
 	}
 	if !hit {
 		t.Fatalf("GetCaddyConfig 未拨号 cfg.CaddyAdminURL（%s）下的 GET /config/", fake.URL)
+	}
+}
+
+// GetCaddyConfig 的 admin 响应体上限（32MB+1 探测，与 services 家族同口径）：
+// 超限必须报「超过 32MB 上限」的显式读取错误，而非静默截断后误报「解析失败」。
+func TestGetCaddyConfig_oversizeBodyReportedAsLimitNotParseFailure(t *testing.T) {
+	// Given 假 admin 端点返回 >32MB 的合法前缀 JSON 碎片（填充注释式重复键）
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		// 32MB+1 探测：写出超过上限的字节流（重复空白即可，无需合法 JSON——
+		// 超限判定先于解析）。
+		chunk := []byte("                                                                ")
+		var written int64
+		for written < 33<<20 {
+			n, _ := w.Write(chunk)
+			written += int64(n)
+		}
+	}))
+	t.Cleanup(fake.Close)
+	h := &Handlers{cfg: &config.Config{CaddyAdminURL: fake.URL}}
+	router := gin.New()
+	router.Use(func(c *gin.Context) { c.Set("role", "admin"); c.Next() })
+	router.GET("/config", h.GetCaddyConfig)
+
+	// When
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/config", nil))
+
+	// Then 500 且错误文案指认超限而非解析失败
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d, want 500", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "超过 32MB 上限") {
+		t.Fatalf("超限必须报上限错误（不得误报解析失败）: %s", body)
+	}
+	if strings.Contains(body, "解析 Caddy 配置失败") {
+		t.Fatalf("超限不得误报为解析失败: %s", body)
 	}
 }
 

@@ -893,37 +893,16 @@ func restoreTable(ctx context.Context, tx *sql.Tx, database *sql.DB, table strin
 // tcpRuleDeadFieldsResetSQL：TCP 行 HTTP 专属死值清零（HTTP 头/健康检查/
 // 压缩/请求体/NTLM/force_http1 + TLS 来源、跳转与材料 + 代理超时族七列 +
 // 自定义路由 + dynamic_dns + strategy(cookie) + 阶段页四列 + log_enabled，
-// 共 31 列 SET）的 SQL 字面量。启动迁移
-// db.migrateTCPRuleDeadFields 持有逐字相同的第二份（跨包不可共享常量）；
-// / TCP 自愈族parity 钉测试
-// （tcp_dead_fields_parity_test.go）读取两侧源码断言 SET 列集合、WHERE 与
-// path_rules 清理 DELETE 逐字一致，防双份漂移。
-const tcpRuleDeadFieldsResetSQL = `UPDATE lb_rules SET
-	host_header='', health_check_path='', health_check_host='', domain='', enable_compress=0, compress_types='',
-	request_body_max_size_mb=0, upstream_keepalive_timeout=0, server_tokens_hidden=0, ntlm_compatible=0, upstream_force_http1=0,
-	proxy_dial_timeout=0, proxy_response_header_timeout=0, proxy_read_timeout=0, proxy_write_timeout=0, proxy_stream_timeout=0, proxy_flush_interval=0, proxy_stream_close_delay=0,
-	custom_routes_enabled=0, dynamic_dns=0,
-	strategy=CASE WHEN strategy='cookie' THEN 'weighted_round_robin' ELSE strategy END,
-	enable_tls=0, tls_source='manual', tls_http_redirect=0, tls_cert='', tls_key='',
-	block_page_stage1_id=0, block_page_stage1_status=0, block_page_stage3_id=0, block_page_stage3_status=0, log_enabled=0
-	WHERE protocol='tcp' AND (
-		COALESCE(host_header,'')<>'' OR COALESCE(health_check_path,'')<>'' OR COALESCE(health_check_host,'')<>'' OR COALESCE(domain,'')<>''
-		OR enable_compress=1 OR COALESCE(compress_types,'')<>''
-		OR request_body_max_size_mb<>0 OR upstream_keepalive_timeout<>0 OR server_tokens_hidden<>0 OR ntlm_compatible<>0 OR upstream_force_http1<>0
-		OR proxy_dial_timeout<>0 OR proxy_response_header_timeout<>0 OR proxy_read_timeout<>0 OR proxy_write_timeout<>0 OR proxy_stream_timeout<>0 OR proxy_flush_interval<>0 OR proxy_stream_close_delay<>0
-		OR custom_routes_enabled=1 OR dynamic_dns=1
-		OR COALESCE(strategy,'')='cookie'
-		OR enable_tls=1 OR COALESCE(tls_source,'')<>'manual' OR tls_http_redirect=1
-		OR COALESCE(block_page_stage1_id,0)<>0 OR COALESCE(block_page_stage1_status,0)<>0
-		OR COALESCE(block_page_stage3_id,0)<>0 OR COALESCE(block_page_stage3_status,0)<>0
-		OR COALESCE(log_enabled,0)<>0
-	)`
+// 共 31 列 SET）——字面量单源已下沉 db 包（启动迁移与导入归一共用同一
+// 常量，消灭跨包双份逐字镜像的漂移面）；本别名仅保留 handlers 包内既有
+// 引用点与派生（下方单规则变体）。
+const tcpRuleDeadFieldsResetSQL = db.TCPRuleDeadFieldsResetSQL
 
 // tcpRulePathRulesResetSQL：TCP 规则残留路径规则清理（TCP 自愈族）——
 // custom_routes_enabled 归零后 path_rules 行成为孤儿（TCP 渲染零消费路径
-// 分支），随导出/备份导入被引用校验放大。与启动迁移
-// db.migrateTCPRuleDeadFields 第二份 DELETE 逐字一致（parity 钉测试比对）。
-const tcpRulePathRulesResetSQL = `DELETE FROM path_rules WHERE rule_id IN (SELECT caddy_id FROM lb_rules WHERE protocol='tcp')`
+// 分支），随导出/备份导入被引用校验放大。字面量单源=db 包导出常量（与
+// 启动迁移共用）。
+const tcpRulePathRulesResetSQL = db.TCPRulePathRulesResetSQL
 
 // tcpRuleDeadFieldsResetForRuleSQL 复用同一份 SET 投影，供启用单条 TCP 规则时
 // 在事务内落库归一；WHERE 收敛为单规则，避免触碰其他禁用行。
@@ -3104,8 +3083,8 @@ func validateV2BackupRuntimeSettings(config map[string]any, tables map[string][]
 		def   int64
 		label string
 	}{
-		{key: "security_events_retention_days", max: 3650, def: db.DefaultSecurityEventsRetentionDays, label: "安全事件保留天数"},
-		{key: "security_events_row_cap", max: 100000000, def: db.DefaultSecurityEventsRowCap, label: "安全事件行数上限"},
+		{key: "security_events_retention_days", max: db.MaxSecurityEventsRetentionDays, def: db.DefaultSecurityEventsRetentionDays, label: "安全事件保留天数"},
+		{key: "security_events_row_cap", max: db.MaxSecurityEventsRowCap, def: db.DefaultSecurityEventsRowCap, label: "安全事件行数上限"},
 	} {
 		if raw, exists := config[item.key]; exists && raw != nil {
 			value, ok := backupInteger(raw)

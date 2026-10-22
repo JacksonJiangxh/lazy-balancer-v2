@@ -597,11 +597,11 @@ func validateUpdateConfigRequest(req *models.UpdateConfigRequest) error {
 	// 显式值（天数 1-3650、行数上限 1-1 亿）。此前接受 0 但启动迁移每次把 0
 	// 改写成 90/1000000，用户显式保存的 0 重启即被静默改写（库值不再反映输入）。
 	// 存量 0/NULL 由 SVC 的一次性 marker 迁移收敛，服务层保留 legacy 防御。
-	if req.SecurityEventsRetentionDays != nil && (*req.SecurityEventsRetentionDays < 1 || *req.SecurityEventsRetentionDays > 3650) {
-		return errors.New("安全事件保留天数必须在 1 到 3650 之间")
+	if req.SecurityEventsRetentionDays != nil && (*req.SecurityEventsRetentionDays < 1 || *req.SecurityEventsRetentionDays > db.MaxSecurityEventsRetentionDays) {
+		return fmt.Errorf("安全事件保留天数必须在 1 到 %d 之间", db.MaxSecurityEventsRetentionDays)
 	}
-	if req.SecurityEventsRowCap != nil && (*req.SecurityEventsRowCap < 1 || *req.SecurityEventsRowCap > 100000000) {
-		return errors.New("安全事件行数上限必须在 1 到 100000000 之间")
+	if req.SecurityEventsRowCap != nil && (*req.SecurityEventsRowCap < 1 || *req.SecurityEventsRowCap > db.MaxSecurityEventsRowCap) {
+		return fmt.Errorf("安全事件行数上限必须在 1 到 %d 之间", db.MaxSecurityEventsRowCap)
 	}
 	if req.Timezone != nil {
 		// 空串必须显式拒绝（time.LoadLocation("") 是合法特殊值=UTC）：否则
@@ -710,6 +710,30 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 		recordAudit(c, "更新失败", "全局配置", services.FormatAuditDetail("读取当前配置失败", err.Error(), services.AuditResultPart("failure")))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取当前配置失败"})
 		return
+	}
+	// access_log_json=false 时 access_log_format 不生效（渲染层
+	// buildAccessLogEncoder 仅在 json=true 时消费自定义映射）。同一请求显式
+	// 携带非空格式 → 400（不静默丢弃用户输入）；json 关闭后的存量残留格式 →
+	// 归一清空并在响应披露（配置变更审计的 access_log_format 字段变更同时留痕）。
+	formatCleared := false
+	effectiveAccessLogJSON := old.AccessLogJSON
+	if req.AccessLogJSON != nil {
+		effectiveAccessLogJSON = *req.AccessLogJSON
+	}
+	if !effectiveAccessLogJSON {
+		if req.AccessLogFormat != nil && strings.TrimSpace(*req.AccessLogFormat) != "" {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "访问日志 JSON 输出已关闭，自定义字段映射不生效：请先开启 JSON 输出，或清空访问日志格式"})
+			return
+		}
+		storedFormat := old.AccessLogFormat
+		if req.AccessLogFormat != nil {
+			storedFormat = *req.AccessLogFormat
+		}
+		if storedFormat != "" {
+			emptyFormat := ""
+			req.AccessLogFormat = &emptyFormat
+			formatCleared = true
+		}
 	}
 	plan := planConfigChanges(req, old)
 	if !plan.Changed {
@@ -840,7 +864,9 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 		}
 	}
 
-	reloadNote, applyErr := h.applyFromTxNote(c, tx, "保存配置后自动重载")
+	// rulesWrittenInTx=false：本事务只写 global_config（lb_rules 视图与已提交
+	// 视图恒一致），ACME 谓词 miss 补查在本路径无意义（逐 acme 规则空查）。
+	reloadNote, applyErr := h.applyFromTxNote(c, tx, "保存配置后自动重载", false)
 	if applyErr != nil {
 		// CLI 预检/事务内应用两轮渲染已按未提交内容重写
 		// 投影（tp.txt 等）——tx 回滚的同时把磁盘回退到已提交态（零 /load）。
@@ -900,7 +926,11 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 
 	reloadNote()
 
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "配置已更新并应用", Data: plan})
+	message := "配置已更新并应用"
+	if formatCleared {
+		message += "（访问日志 JSON 已关闭，自定义格式已清空：该格式不生效）"
+	}
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: message, Data: plan})
 }
 
 func (h *Handlers) ValidateConfig(c *gin.Context) {
@@ -1063,13 +1093,9 @@ func (h *Handlers) GetCaddyConfig(c *gin.Context) {
 		return
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 500 {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Caddy 返回错误状态"})
-		return
-	}
-	// 同族防线（口径对齐 services/caddy.go 32MB）
-	// admin 响应无界读取兜底上限。
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	// 状态分类 + 32MB+1 探测统一走 services.ReadAdminConfigBody（裸 LimitReader
+	// 静默截断会把「超限」误报为下游「解析失败」，排障误导）。
+	body, err := services.ReadAdminConfigBody(resp)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取 Caddy 配置失败: " + err.Error()})
 		return

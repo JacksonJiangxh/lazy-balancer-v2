@@ -389,10 +389,10 @@ func buildRuleCaddyContext(fullConfig map[string]interface{}, caddyID string, do
 }
 
 // ruleCaddyRoutes 从运行配置收集归属该规则的全部路由：遍历 http 与
-// layer4 两个 app 的全部 server，按 services.RouteIDBelongsToRule（与
-// DeleteRule 系列的路由清理同口径）识别主路由（@id == caddyID）与兄弟路由
-// （caddyID_path_N / caddyID_geoip / caddyID_redirect）。同一 server 内保持
-// 运行顺序；跨 server（如 80 端口跳转路由）顺序不保证。
+// layer4 两个 app 的全部 server，按 services.RouteIDBelongsToRule 识别
+// 主路由（@id == caddyID）与兄弟路由（caddyID_path_N / caddyID_geoip /
+// caddyID_redirect）。同一 server 内保持运行顺序；跨 server（如 80 端口
+// 跳转路由）顺序不保证。
 func ruleCaddyRoutes(full map[string]interface{}, caddyID string) (main map[string]interface{}, all []interface{}) {
 	apps, _ := full["apps"].(map[string]interface{})
 	if apps == nil {
@@ -575,7 +575,10 @@ func (h *Handlers) validateRuleListenPortForSave(protocol string, port int) erro
 	if err := validateRuleListenPort(protocol, port); err != nil {
 		return err
 	}
-	if port == h.adminPanelListenPort() || port == h.caddyAdminListenPort() {
+	// 管理端口族：面板端口、caddy_admin_url 引导端口、渲染产物 admin 稳态
+	// 端口（services.CaddyAdminListenPort=2019，/load 后 admin 恒迁至此）——
+	// 三者在不同窗口期都可能被占用，一律禁止规则监听。
+	if port == h.adminPanelListenPort() || port == h.caddyAdminListenPort() || port == services.CaddyAdminListenPort {
 		return fmt.Errorf("端口 %d 为管理端口，不可使用", port)
 	}
 	return nil
@@ -588,6 +591,11 @@ func (h *Handlers) adminPanelListenPort() int {
 	return 8000
 }
 
+// caddyAdminListenPort 返回 caddy_admin_url 配置解析出的端口（引导期占用）——
+// 首次成功 /load 之前 Caddy admin 在该端口监听。稳态端口恒为
+// services.CaddyAdminListenPort（渲染产物 admin listen 单源，/load 后 admin
+// 迁到该端口）——两端口都可能是管理端口，调用方必须同时保留（见
+// validateRuleListenPortForSave），单看任一口径都会漏拦一个窗口期。
 func (h *Handlers) caddyAdminListenPort() int {
 	if h.cfg != nil && h.cfg.CaddyAdminURL != "" {
 		if parsed, err := url.Parse(h.cfg.CaddyAdminURL); err == nil {
@@ -596,7 +604,7 @@ func (h *Handlers) caddyAdminListenPort() int {
 			}
 		}
 	}
-	return 2019
+	return services.CaddyAdminListenPort
 }
 
 // enabledRuleDomainConflict 同域名同端口冲突检查（删除
@@ -629,13 +637,13 @@ func queryRedirectShadowConflict(domain string, listenPort int, enableTLS, tlsHT
 		// 镜像 2026-09 复审裁定 2(跳转分支同款 EXISTS)
 		// 全部上游被禁用的规则不产生 host 路由与跳转(caddy.go ),
 		// 不作为占用方;此前裁定只落了单侧,该形态下 80 规则被纯误拦 400。
-		rows, err = db.DB.Query(`SELECT caddy_id, name, COALESCE(domain,'') FROM lb_rules WHERE protocol='http' AND enabled=1 AND enable_tls=1 AND tls_http_redirect=1 AND listen_port != 80 AND caddy_id != ? AND EXISTS (SELECT 1 FROM upstreams u WHERE u.rule_id=lb_rules.caddy_id AND u.enabled=1)`, excludeCaddyID)
+		rows, err = db.DB.Query(`SELECT caddy_id, name, COALESCE(domain,'') FROM lb_rules WHERE protocol='http' AND enabled=1 AND enable_tls=1 AND tls_http_redirect=1 AND listen_port != 80 AND caddy_id != ? AND EXISTS (SELECT 1 FROM upstreams u WHERE u.rule_id=lb_rules.caddy_id AND `+services.UpstreamEnabledSQLPredicate+`)`, excludeCaddyID)
 	case enableTLS && tlsHTTPRedirect:
 		// 2026-09 复审裁定 2：与渲染面同口径——全部上游被禁用的 80 规则不产生
 		// host 路由、不会遮蔽跳转，不再作为占用方（报错与真实渲染行为一致）。
 		rows, err = db.DB.Query(`SELECT r.caddy_id, r.name, COALESCE(r.domain,'') FROM lb_rules r
 			WHERE r.protocol='http' AND r.enabled=1 AND r.listen_port=80 AND r.caddy_id != ?
-			AND EXISTS (SELECT 1 FROM upstreams u WHERE u.rule_id=r.caddy_id AND u.enabled=1)`, excludeCaddyID)
+			AND EXISTS (SELECT 1 FROM upstreams u WHERE u.rule_id=r.caddy_id AND `+services.UpstreamEnabledSQLPredicate+`)`, excludeCaddyID)
 	default:
 		return "", "", nil
 	}
@@ -722,6 +730,40 @@ func (h *Handlers) respondRuleApplyError(c *gin.Context, applyErr, restoreErr er
 		return
 	}
 	c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Caddy 配置应用失败，规则未" + verb + ": " + applyErr.Error()})
+}
+
+// normalizeInactiveHealthCheckFields 主动健康检查未启用时，其专属字段
+// （health_check_path / health_check_host / tcp_health_check_port）渲染零消费
+// （caddy.go 的 health_checks.active 块仅在 enable_active_health_check=1 时发射）——
+// 保存侧归一清零，防止死配置随导出/备份/集群快照放大（API/MCP 可写入 UI
+// 隐藏的字段，无服务端披露则用户以为生效）。返回被清字段名（审计明细披露，
+// 空=无变化）。指针形参使 Create（值字段）与 Update（指针字段）两入口共用。
+func normalizeInactiveHealthCheckFields(enabled bool, path *string, host *string, port *int) []string {
+	if enabled {
+		return nil
+	}
+	var cleared []string
+	if path != nil && *path != "" {
+		*path = ""
+		cleared = append(cleared, "health_check_path")
+	}
+	if host != nil && *host != "" {
+		*host = ""
+		cleared = append(cleared, "health_check_host")
+	}
+	if port != nil && *port != 0 {
+		*port = 0
+		cleared = append(cleared, "tcp_health_check_port")
+	}
+	return cleared
+}
+
+// inactiveHealthCheckAuditHint 把归一清零结果转成审计明细披露片段。
+func inactiveHealthCheckAuditHint(cleared []string) string {
+	if len(cleared) == 0 {
+		return ""
+	}
+	return "已清空未启用主动健康检查的死配置：" + strings.Join(cleared, ", ")
 }
 
 // tcpDeadFields 是 TCP 写入侧「HTTP 专属字段」的指针视图：CreateRule（值
@@ -1358,6 +1400,11 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		enabledVal = 0
 	}
 
+	// 主动健康检查未启用时其专属字段渲染零消费——保存侧归一清零（死配置
+	// 不随导出/备份/快照放大），清零结果进成功审计披露。
+	clearedDeadHealthCheck := normalizeInactiveHealthCheckFields(req.EnableActiveHealthCheck,
+		&req.HealthCheckPath, &req.HealthCheckHost, &req.TCPHealthCheckPort)
+
 	// INSERT 列清单与值投影走唯一事实源（services.LbRuleInsertSQL/
 	// LbRuleInsertArgs）——新建排除 id/created_at/updated_by（主键自增分配、
 	// created_at 走 schema 默认、updated_by 留 NULL 待首次更新），列形态与
@@ -1426,7 +1473,7 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		return
 	}
 
-	reloadNote, applyErr := h.applyFromTxNote(c, tx, txReloadDetail("rule_create", caddyID))
+	reloadNote, applyErr := h.applyFromTxNote(c, tx, txReloadDetail("rule_create", caddyID), true)
 	if applyErr != nil {
 		restoreErr := h.restoreImportRuntime(runtimeSnapshot)
 		h.respondRuleApplyError(c, applyErr, restoreErr, "创建")
@@ -1530,6 +1577,9 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 
 	services.Logf("info", "Rule created with caddy_id=%s", caddyID)
 	createAuditParts := []string{services.AuditRulePart(caddyID), req.Name, fmt.Sprintf("协议：%s", req.Protocol), fmt.Sprintf("端口：%d", req.ListenPort), req.Domain}
+	if hint := inactiveHealthCheckAuditHint(clearedDeadHealthCheck); hint != "" {
+		createAuditParts = append(createAuditParts, hint)
+	}
 	if len(certWarnings) > 0 {
 		// 证书链/域名警告随成功审计留痕(不阻断)。
 		createAuditParts = append(createAuditParts, "证书警告："+strings.Join(certWarnings, "；"))
@@ -1673,9 +1723,9 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 
 	// Capture old upstreams for potential DB rollback.
 	// 存量 upstreams.enabled 无 NOT NULL，NULL 行裸 scan 进 bool 会 500；
-	// IIF 与生成侧（services/caddy.go）同口径：NULL 视同禁用，回写/回滚保持同一有效状态。
+	// 启用判定引用 services 单源常量（NULL 视同禁用），回写/回滚保持同一有效状态。
 	var oldUpstreams []models.Upstream
-	oldUpstreamRows, err := db.DB.Query("SELECT host, port, COALESCE(weight,1), COALESCE(dynamic_dns,0), IIF(enabled IN ('1',1),1,0), COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(origin_domain,'') FROM upstreams WHERE rule_id = ?", caddyID)
+	oldUpstreamRows, err := db.DB.Query("SELECT host, port, COALESCE(weight,1), COALESCE(dynamic_dns,0), "+services.UpstreamEnabledSQLValue+", COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(origin_domain,'') FROM upstreams u WHERE rule_id = ?", caddyID)
 	if err != nil {
 		services.Logf("error", "UpdateRule failed to read existing upstreams for caddy_id=%s: %v", caddyID, err)
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取现有上游服务器失败"})
@@ -1851,6 +1901,11 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	if req.HealthCheckHost == nil {
 		req.HealthCheckHost = &existingRule.HealthCheckHost
 	}
+	// 主动健康检查未启用时三专属字段渲染零消费——仅在本次请求显式关闭
+	// active 时归一清零（显式动作的派生字段同请求清空；nil=沿用存量的部分
+	// 更新契约不变——缺席字段不得被静默改写），清零结果进成功审计披露。
+	clearedDeadHealthCheck := normalizeInactiveHealthCheckFields(req.EnableActiveHealthCheck != nil && !*req.EnableActiveHealthCheck,
+		req.HealthCheckPath, req.HealthCheckHost, req.TCPHealthCheckPort)
 	if req.Name == "" {
 		req.Name = existingRule.Name
 	}
@@ -2562,7 +2617,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		}
 	}
 
-	reloadNote, applyErr := h.applyFromTxNote(c, tx, txReloadDetail("rule_update", caddyID))
+	reloadNote, applyErr := h.applyFromTxNote(c, tx, txReloadDetail("rule_update", caddyID), true)
 	if applyErr != nil {
 		restoreErr := h.restoreImportRuntime(runtimeSnapshot)
 		h.respondRuleApplyError(c, applyErr, restoreErr, "更新")
@@ -2912,6 +2967,9 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		tlsPart = fmt.Sprintf("TLS：%s", boolText(*req.EnableTLS))
 	}
 	auditParts := []string{services.AuditRulePart(caddyID), req.Name, fmt.Sprintf("协议：%s", req.Protocol), domain, tlsPart}
+	if hint := inactiveHealthCheckAuditHint(clearedDeadHealthCheck); hint != "" {
+		auditParts = append(auditParts, hint)
+	}
 	if len(certWarnings) > 0 {
 		// 证书链/域名警告随成功审计留痕(不阻断)。
 		auditParts = append(auditParts, "证书警告："+strings.Join(certWarnings, "；"))
@@ -3063,7 +3121,7 @@ func (h *Handlers) DeleteRule(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "备份当前运行配置失败"})
 		return
 	}
-	reloadNote, applyErr := h.applyFromTxNote(c, tx, txReloadDetail("rule_delete", caddyID))
+	reloadNote, applyErr := h.applyFromTxNote(c, tx, txReloadDetail("rule_delete", caddyID), true)
 	if applyErr != nil {
 		restoreErr := h.restoreImportRuntime(runtimeSnapshot)
 		if restoreErr != nil {
@@ -3347,8 +3405,8 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 	// dynamic_dns 同列同病——legacy NULL 行裸 scan
 	// NULL→bool 报错恒 500，按 0 归一（遗留死列，渲染只读规则级值）。
 	upstreamRows, err := tx.Query(`
-		SELECT host, port, COALESCE(weight,1), COALESCE(dynamic_dns,0), IIF(enabled IN ('1',1),1,0), COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(origin_domain,'')
-		FROM upstreams WHERE rule_id = ?
+		SELECT host, port, COALESCE(weight,1), COALESCE(dynamic_dns,0), `+services.UpstreamEnabledSQLValue+`, COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(origin_domain,'')
+		FROM upstreams u WHERE rule_id = ?
 	`, caddyID)
 	if err != nil {
 		fail(http.StatusInternalServerError, "读取上游失败，已回滚: "+err.Error())
@@ -3467,9 +3525,9 @@ type storedUpstream struct {
 // （weight 0→1、protocol 默认、tls 校验），内容比较以终值为准。
 func replaceUpstreamsTx(ctx context.Context, tx *sql.Tx, ruleID string, upstreams []models.Upstream) error {
 	rows, err := tx.QueryContext(ctx, `SELECT id, host, port, COALESCE(weight,1), COALESCE(dynamic_dns,0),
-		IIF(enabled IN ('1',1),1,0), COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(origin_domain,''),
+		`+services.UpstreamEnabledSQLValue+`, COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(origin_domain,''),
 		(weight IS NULL OR dynamic_dns IS NULL OR enabled IS NULL OR protocol IS NULL OR max_connections IS NULL)
-		FROM upstreams WHERE rule_id = ? ORDER BY id`, ruleID)
+		FROM upstreams u WHERE rule_id = ? ORDER BY id`, ruleID)
 	if err != nil {
 		return fmt.Errorf("读取规则 %s 的上游: %w", ruleID, err)
 	}
@@ -3734,7 +3792,7 @@ func (h *Handlers) BatchRuleBlockPages(c *gin.Context) {
 		}
 	}
 	h.finishTxApply(c, tx, txApplyFinish{
-		Resource: "负载规则", AuditAction: "更新",
+		Resource: "负载规则", AuditAction: "更新", RulesWrittenInTx: true,
 		AuditDetail: fmt.Sprintf("批量设置阶段拦截页（阶段 1 页 %d/码 %d，阶段 3 页 %d/码 %d）：成功 %d 条，不变 %d 条，跳过 %d 条",
 			req.BlockPageStage1ID, req.BlockPageStage1Status, req.BlockPageStage3ID, req.BlockPageStage3Status, bound, unchanged, len(skipped)),
 		SuccessMsg: "批量设置阶段拦截页完成",
@@ -3876,7 +3934,7 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "启用规则失败"})
 		return
 	}
-	reloadNote, applyErr := h.applyFromTxNote(c, tx, txReloadDetail("rule_enable", caddyID))
+	reloadNote, applyErr := h.applyFromTxNote(c, tx, txReloadDetail("rule_enable", caddyID), true)
 	if applyErr != nil {
 		restoreErr := h.restoreImportRuntime(runtimeSnapshot)
 		h.respondRuleApplyError(c, applyErr, restoreErr, "启用")
@@ -4319,7 +4377,7 @@ func (h *Handlers) DisableRule(c *gin.Context) {
 			return
 		}
 	}
-	reloadNote, applyErr := h.applyFromTxNote(c, tx, txReloadDetail("rule_disable", caddyID))
+	reloadNote, applyErr := h.applyFromTxNote(c, tx, txReloadDetail("rule_disable", caddyID), true)
 	if applyErr != nil {
 		restoreErr := h.restoreImportRuntime(runtimeSnapshot)
 		h.respondRuleApplyError(c, applyErr, restoreErr, "禁用")

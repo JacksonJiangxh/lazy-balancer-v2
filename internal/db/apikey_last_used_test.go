@@ -12,7 +12,9 @@ func TestCleanupExpiredRegistrationSecretsClearsDeliveredSecretAfterWindow(t *te
 	database := openMigrationTestDB(t)
 	if _, err := database.Exec(`CREATE TABLE nodes (id INTEGER PRIMARY KEY, registration_secret TEXT, registration_secret_expires_at DATETIME);
 		INSERT INTO nodes VALUES (1,'expired',datetime('now','-1 second'));
-		INSERT INTO nodes VALUES (2,'active',datetime('now','+1 hour'));`); err != nil {
+		INSERT INTO nodes VALUES (2,'active',datetime('now','+1 hour'));
+		CREATE TABLE global_config (id INTEGER PRIMARY KEY, is_master INTEGER);
+		INSERT INTO global_config VALUES (1,1);`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -138,5 +140,32 @@ func TestCloseFlushesDirtyAPIKeyUsage(t *testing.T) {
 	}
 	if !lastUsed.Valid {
 		t.Fatal("last_used is NULL after Close")
+	}
+}
+
+// nodes 是集群拓扑簿记表：过期注册密钥清理必须带主节点角色条件——flusher
+// 主/从两角色都跑，从端不得经此旁路写拓扑数据（「从端零写」不变量）。
+func TestCleanupExpiredRegistrationSecrets_slaveRoleSkipsTopologyWrite(t *testing.T) {
+	// Given：从节点角色 + 一枚已过期的注册密钥。
+	database := openMigrationTestDB(t)
+	if _, err := database.Exec(`CREATE TABLE nodes (id INTEGER PRIMARY KEY, registration_secret TEXT, registration_secret_expires_at DATETIME);
+		INSERT INTO nodes VALUES (1,'expired',datetime('now','-1 second'));
+		CREATE TABLE global_config (id INTEGER PRIMARY KEY, is_master INTEGER);
+		INSERT INTO global_config VALUES (1,0);`); err != nil {
+		t.Fatal(err)
+	}
+
+	// When
+	if err := cleanupExpiredRegistrationSecrets(context.Background(), database); err != nil {
+		t.Fatal(err)
+	}
+
+	// Then：从端零写——过期密钥保持原样（主端补清由主端 flusher 负责）。
+	var secret sql.NullString
+	if err := database.QueryRow("SELECT registration_secret FROM nodes WHERE id=1").Scan(&secret); err != nil {
+		t.Fatal(err)
+	}
+	if !secret.Valid || secret.String != "expired" {
+		t.Fatalf("slave cleanup secret=%#v, want 保留（从端不得写拓扑簿记）", secret)
 	}
 }

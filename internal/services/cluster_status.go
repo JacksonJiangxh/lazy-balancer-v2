@@ -141,6 +141,13 @@ func (s *ClusterService) BecomeSlave(ctx context.Context, masterURL string, regi
 	s.clearAllSectionReports()
 	// 角色翻转由引擎 SetRole 唯一驱动：master-only 任务统一停调，cluster-sync
 	// 经 RestartOnRoleFlip 换代为从节点分支；无管理器/旧调度器旁路。
+	// 已知有界缺口（登记，勿再上报）：拓扑事务 Commit（is_master=0）到下方
+	// SetRole(false) 之间存在毫秒级窗口，窗口内引擎仍按 master 角色调度，
+	// master-only 在途工作中「已过角色复核、未到写库」的极窄段可继续写主库。
+	// 该窗口不下沉为零，现有三处覆盖：①cert-issuance 在 deploy 前经
+	// checkCertificateIssuanceRole 二次复核兜住主路径；②长跑任务族由
+	// updateRunWriteGate（taskrun.go）在写 task_runs 前复核；③其余
+	// master-only 写族全部携带 masterRoleConditionSQL，降级后恒 0 行。
 	// 看门狗漂移状态必须先于 SetRole 复位——放末尾会在 SetRole(false)
 	// 与复位之间打开窗口，在途看门狗轮次按从节点角色对旧主节点的漂移状态
 	// 误报一次「配置漂移」。升主路径（cluster.go Promote）已是先复位后换角色。
@@ -584,7 +591,10 @@ func (s *ClusterService) ReportNode(ctx context.Context, nodeID int, report mode
 	if err != nil {
 		return fmt.Errorf("编码节点健康状态: %w", err)
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE nodes SET status='online',last_seen=?,reported_version=?,health_json=?,last_sync_at=?,last_sync_error=? WHERE id=? AND is_approved=1 AND `+masterRoleConditionSQL, now.UTC(), report.AppliedVersion, string(encoded), nullableString(report.LastSyncAt), report.LastSyncError, nodeID)
+	// nodes.last_sync_at 刻意不写：全仓无读者（列表/状态走 health_json 与
+	// global_config.last_sync，备份导入直接剔除该列），且该列的 RFC3339 文本
+	// 与全库平面 UTC 格式不一致——保留写点只会给未来读者埋格式雷。
+	result, err := s.db.ExecContext(ctx, `UPDATE nodes SET status='online',last_seen=?,reported_version=?,health_json=?,last_sync_error=? WHERE id=? AND is_approved=1 AND `+masterRoleConditionSQL, now.UTC(), report.AppliedVersion, string(encoded), report.LastSyncError, nodeID)
 	if err != nil {
 		return fmt.Errorf("更新节点上报: %w", err)
 	}
@@ -614,13 +624,16 @@ func resolveNodeAccessURL(ipAddress string, port int, protocol, accessURL string
 }
 
 // nodePinPathFromAccessURL 由节点访问地址定位其 TOFU pin 文件（单源：
-// ForgetNodePin/DeleteNode 原各自重复「解析 URL → clusterPinPathForDatabase」）。
-func nodePinPathFromAccessURL(database *sql.DB, accessURL string) (pinPath, host string, err error) {
+// ForgetNodePin/DeleteNode 原各自重复「解析 URL → pin 路径」）。
+// dataDir 与写入/校验侧同源（调用方传 ClusterService.dataDir，空串时
+// clusterPinPath 内部回退数据库文件目录推导）——删除/清理不得再走
+// 独立的 DB 目录推导而与写入侧分叉。
+func nodePinPathFromAccessURL(dataDir string, database *sql.DB, accessURL string) (pinPath, host string, err error) {
 	parsed, err := url.Parse(accessURL)
 	if err != nil || parsed.Host == "" {
 		return "", "", fmt.Errorf("节点访问地址无效: %q", accessURL)
 	}
-	pinPath, err = clusterPinPathForDatabase(database, parsed.Host)
+	pinPath, err = clusterPinPath(dataDir, database, parsed.Host)
 	if err != nil {
 		return "", "", err
 	}
@@ -669,7 +682,7 @@ func (s *ClusterService) DeleteNode(ctx context.Context, nodeID int) error {
 	}
 	if addrErr == nil {
 		accessURL = resolveNodeAccessURL(ipAddress, port, protocol, accessURL)
-		if pinPath, host, perr := nodePinPathFromAccessURL(s.db, accessURL); perr == nil {
+		if pinPath, host, perr := nodePinPathFromAccessURL(s.dataDir, s.db, accessURL); perr == nil {
 			if rerr := os.Remove(pinPath); rerr == nil {
 				RecordAuditLog("system", "清除", "证书指纹", FormatAuditDetail(fmt.Sprintf("节点删除伴随清除 pin：%s", host), AuditResultPart("success")), "")
 			} else if !errors.Is(rerr, os.ErrNotExist) {

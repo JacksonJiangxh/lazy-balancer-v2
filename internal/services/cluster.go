@@ -103,6 +103,10 @@ func unregisterClusterService(service *ClusterService) {
 	// 同族句柄回收：三节哈希缓存以库句柄为键，注销即释放（防全局缓存强引用
 	// 已关闭句柄；未走注销的死条目由重建路径的 clusterDBHandleAlive 兜底剔除）。
 	forgetClusterSectionHashCache(service.db)
+	// 快照缓存（clusterSnapshotCaches）同样以库句柄为键且持有完整快照
+	//（canonical bytes/证书/规则）：注销不释放会把已 Close 的句柄与其快照
+	// 驻留到进程退出——与节哈希缓存同口径，注销即删。
+	clusterSnapshotCaches.Delete(service.db)
 }
 
 // clusterDBHandleAlive 报告句柄是否仍可 Ping（的兜底回收：库已
@@ -119,8 +123,10 @@ func clusterServicesFor(database *sql.DB) []*ClusterService {
 	if database == nil {
 		return nil
 	}
+	// Ping 在锁外执行（与 pruneDeadClusterSectionHashCacheEntries 同范式）：
+	// 死/卡句柄的 Ping 最长 1s，持锁等待会阻塞全部查表与 Promote/BecomeSlave
+	// 排干。锁内只拷贝列表，锁外探活，回锁再删。
 	clusterServicesMu.Lock()
-	defer clusterServicesMu.Unlock()
 	registered := clusterServices[database]
 	services := make([]*ClusterService, 0, len(registered))
 	for _, service := range registered {
@@ -130,10 +136,14 @@ func clusterServicesFor(database *sql.DB) []*ClusterService {
 	}
 	if len(services) == 0 {
 		delete(clusterServices, database)
+		clusterServicesMu.Unlock()
 		return nil
 	}
+	clusterServicesMu.Unlock()
 	if !clusterDBHandleAlive(database) {
+		clusterServicesMu.Lock()
 		delete(clusterServices, database)
+		clusterServicesMu.Unlock()
 		return nil
 	}
 	return services
@@ -408,13 +418,10 @@ func (s *ClusterService) ApproveNode(ctx context.Context, nodeID int, now time.T
 		return fmt.Errorf("读取审批结果: %w", err)
 	}
 	if updated != 1 {
-		// 先区分「已降级」（403 语义）与节点状态/存在性问题。
-		isMaster, roleErr := RoleOf(ctx, s.db)
-		if roleErr != nil {
-			return fmt.Errorf("复核节点角色: %w", roleErr)
-		}
-		if !isMaster {
-			return ErrNotMasterNode
+		// 先区分「已降级」（403 语义）与节点状态/存在性问题——角色复核
+		// 单源 masterScopeMissError（fallback=nil：主节点继续下方分判）。
+		if roleErr := s.masterScopeMissError(ctx, nil); roleErr != nil {
+			return roleErr
 		}
 		// 0 行命中分判——节点存在但非 pending(重复审批/已拒绝)
 		// 返回 409 语义错误;不存在维持 404。
@@ -657,6 +664,14 @@ func (s *ClusterService) Promote(ctx context.Context) error {
 		te.SetRole(true)
 		if clusterSyncWasOn {
 			te.StartLoop("cluster-sync")
+		} else {
+			// cluster-sync 两角色语义不同：从端=拉取，主端=服务面巡检（从节点
+			// 离线/版本滞后判定，cluster_masterserving.go）。升主不擅自武装被
+			// 用户停掉的调度（偏好保留，既有钉测锁定），但巡检缺位必须可见——
+			// 否则从节点离线/版本滞后不再告警且无任何信号。
+			detail := "cluster-sync 调度保持停止（用户偏好保留）：主节点服务面巡检（从节点离线/版本滞后判定）未启用，需要时请在任务监控启动「集群同步」"
+			Logf("warn", "Promote: %s", detail)
+			RecordAuditLog("system", "提升完成", "集群节点", FormatAuditDetail(detail, AuditResultPart("warning")), "")
 		}
 	}
 	// 升主后按库实态统一恢复六个业务驱动任务，而非只恢复 autoban。
@@ -705,7 +720,10 @@ func (s *ClusterService) detachFromMaster(ctx context.Context, masterURL, oldTok
 		// 为从节点时引发一次 PinMismatch，forget-pins 可恢复。
 		return
 	}
-	pinPath, err := clusterPinPathForDatabase(s.db, parsedMasterURL.Host)
+	// pin 目录解析单源=本服务的 dataDir（写入/校验侧 SyncService 同口径
+	// 经 cfg.DataDir）；dataDir 为空（测试构造）时 clusterPinPath 内部
+	// 回退数据库文件目录推导。
+	pinPath, err := clusterPinPath(s.dataDir, s.db, parsedMasterURL.Host)
 	if err != nil {
 		Logf("info", "locate old cluster master pin after promotion: %v", err)
 		RecordAuditLog("system", "清理失败", "证书指纹", FormatAuditDetail("旧主节点："+parsedMasterURL.Scheme+"://"+parsedMasterURL.Host, err.Error()), "")

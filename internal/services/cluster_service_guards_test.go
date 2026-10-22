@@ -93,7 +93,7 @@ func TestClusterService_ForgetNodePin_requiresMasterRole(t *testing.T) {
 	if _, err := database.Exec(`INSERT INTO nodes (id,name,ip_address,port,protocol,is_approved) VALUES (21,'slave-pin','10.0.0.21',8000,'http',1)`); err != nil {
 		t.Fatalf("seed node: %v", err)
 	}
-	pinPath, err := clusterPinPathForDatabase(database, "10.0.0.21:8000")
+	pinPath, err := clusterPinPath("", database, "10.0.0.21:8000")
 	if err != nil {
 		t.Fatalf("resolve pin path: %v", err)
 	}
@@ -213,11 +213,11 @@ func TestClusterService_UpdateNodeSiteCoordinates_noopDoesNotBump(t *testing.T) 
 	}
 }
 
-// 静态锚点：clusterPinPathForDatabase 命名核对（sha256(host) hex 文件名），
+// 静态锚点：pin 路径推导命名核对（sha256(host) hex 文件名），
 // 防止测试与生产路径推导漂移。
 func TestClusterService_pinPathDerivationMatchesTOFUNaming(t *testing.T) {
 	_, database := newClusterTestService(t)
-	pinPath, host, err := nodePinPathFromAccessURL(database, "http://10.0.0.21:8000")
+	pinPath, host, err := nodePinPathFromAccessURL("", database, "http://10.0.0.21:8000")
 	if err != nil {
 		t.Fatalf("resolve pin path: %v", err)
 	}

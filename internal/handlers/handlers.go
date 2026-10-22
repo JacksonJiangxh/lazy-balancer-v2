@@ -210,13 +210,15 @@ func (h *Handlers) caddyApplyNoteLocked() string {
 // 同一次调用里，返回提交成功后必须调用的 note：漏调即 unused variable
 // 编译错误，69d809b4 式的静默删行在此形态下不再可能。归因明细由调用点
 // 提供（txReloadDetail 或固定文案）。
-func (h *Handlers) applyFromTxNote(c *gin.Context, tx *sql.Tx, reloadDetail string) (func(), error) {
+// rulesWrittenInTx：事务是否写过 lb_rules（ACME 谓词 miss 补查门控——
+// 规则写路径 true；UpdateConfig/名单/策略等不触碰 lb_rules 的路径 false）。
+func (h *Handlers) applyFromTxNote(c *gin.Context, tx *sql.Tx, reloadDetail string, rulesWrittenInTx bool) (func(), error) {
 	// 裁定 ④'：Caddy CLI 层预检（真 validate-only，零运行时副作用）——校验
 	// 输入即事务视图的最终渲染。校验器不可用时放行（记日志），事务内应用
 	// 仍是最终门控。
 	cliValidated := true
 	cliStart := time.Now()
-	if err := h.caddyService.ValidateTxRenderViaCLI(tx); err != nil {
+	if err := h.caddyService.ValidateTxRenderViaCLI(tx, rulesWrittenInTx); err != nil {
 		if !errors.Is(err, services.ErrCLIValidatorUnavailable) {
 			return nil, err
 		}
@@ -225,7 +227,7 @@ func (h *Handlers) applyFromTxNote(c *gin.Context, tx *sql.Tx, reloadDetail stri
 	}
 	services.Logf("info", "保存链计时: cli_validate=%dms", time.Since(cliStart).Milliseconds())
 	applyStart := time.Now()
-	if err := h.caddyService.ApplyConfigFromTx(tx); err != nil {
+	if err := h.caddyService.ApplyConfigFromTx(tx, rulesWrittenInTx); err != nil {
 		// 审计真实性裁定（2026-09-25 用户裁定）：同字节短路=未发生真实重载——
 		// 按成功收尾但 note 不落「重载」审计（否则出现从未发生的重载记录）。
 		if services.IsSameConfig(err) {
@@ -256,14 +258,17 @@ func txReloadDetail(source, ruleID string) string {
 
 // txApplyFinish 是 finishTxApply 的收尾选项。Resource/AuditAction/AuditDetail/
 // SuccessMsg 必填；SuccessStatus 默认 200；ReloadDetail 默认「配置变更后自动重载」。
+// RulesWrittenInTx：事务是否写过 lb_rules（ACME 谓词 miss 补查门控，默认 false
+// ——安全策略/名单等路径不触碰 lb_rules；规则写路径必须显式置 true）。
 type txApplyFinish struct {
-	Resource      string
-	AuditAction   string
-	AuditDetail   string
-	SuccessMsg    string
-	SuccessStatus int
-	Data          any
-	ReloadDetail  string
+	Resource         string
+	AuditAction      string
+	AuditDetail      string
+	SuccessMsg       string
+	SuccessStatus    int
+	Data             any
+	ReloadDetail     string
+	RulesWrittenInTx bool
 }
 
 // finishTxApply 事务内应用的统一收尾（2026-09-06 裁定 ①②：只有可渲染配置可落库，
@@ -279,7 +284,7 @@ type txApplyFinish struct {
 // 本方法自行提交或放行回滚；调用方的 rollback defer 必须容忍 ErrTxDone
 // （既有各 defer 均已容忍）。返回后请求即已终结，调用方立即 return。
 func (h *Handlers) finishTxApply(c *gin.Context, tx *sql.Tx, f txApplyFinish) {
-	reloadNote, applyErr := h.applyFromTxNote(c, tx, reloadDetailFor(f))
+	reloadNote, applyErr := h.applyFromTxNote(c, tx, reloadDetailFor(f), f.RulesWrittenInTx)
 	status := f.SuccessStatus
 	if status == 0 {
 		status = http.StatusOK

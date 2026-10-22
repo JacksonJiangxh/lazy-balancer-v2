@@ -34,6 +34,9 @@ func mfaResetCurrentCode(t *testing.T, secret string, now time.Time) string {
 // seedMfaResetUsers 种操作者（id=1，可带 MFA）与目标用户（id=2，启用 MFA 待重置）。
 func seedMfaResetUsers(t *testing.T, operatorMfa bool) (operatorSecret string) {
 	t.Helper()
+	// 登录后验码限流为进程内内存态——播种即清，防跨用例残留误中 429。
+	services.MFAResetVerifyAttemptsForTest()
+	t.Cleanup(services.MFAResetVerifyAttemptsForTest)
 	if _, err := db.DB.Exec("INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (1,'operator','x','admin',1),(2,'target','x','viewer',1)"); err != nil {
 		t.Fatalf("seed users: %v", err)
 	}
@@ -60,7 +63,8 @@ func mfaResetRouter(h *Handlers, authType string) *gin.Engine {
 }
 
 // mfaResetRouterWithGuard 模拟守卫态:guardMarker=true 时前置注入
-// mfa_stepup_verified（生产由 mfaStepUpGuard 开启态放行路径置)。
+// mfa_stepup_verified + 验码年龄 0s（生产由 mfaStepUpGuard 开启态放行路径
+// 同时置两键；拆除 MFA 的免验另要求年龄 ≤15s 窄窗）。
 func mfaResetRouterWithGuard(h *Handlers, authType string, guardMarker bool) *gin.Engine {
 	router := gin.New()
 	router.POST("/users/:id/mfa/reset", func(c *gin.Context) {
@@ -69,6 +73,7 @@ func mfaResetRouterWithGuard(h *Handlers, authType string, guardMarker bool) *gi
 		c.Set("auth_type", authType)
 		if guardMarker {
 			c.Set("mfa_stepup_verified", true)
+			c.Set("mfa_stepup_seconds_ago", int64(0))
 		}
 		h.MFAResetByAdmin(c)
 	})

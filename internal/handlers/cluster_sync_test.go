@@ -2,8 +2,10 @@ package handlers
 
 import (
 	"context"
+	"database/sql"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -46,7 +48,7 @@ func TestPullClusterSnapshot_persists_manual_sync_failure(t *testing.T) {
 		t.Fatal(err)
 	}
 	syncService := services.NewSyncService(db.DB, &config.Config{DataDir: t.TempDir()}, nil)
-	h := &Handlers{syncService: syncService}
+	h := &Handlers{syncService: syncService, clusterService: services.NewClusterService(db.DB, "")}
 	response := httptest.NewRecorder()
 	request := httptest.NewRequest("POST", "/api/v1/cluster/sync/pull", nil).WithContext(context.Background())
 	ginContext, _ := gin.CreateTestContext(response)
@@ -122,7 +124,7 @@ func TestPullClusterSnapshot_master_rejected_without_sync_error(t *testing.T) {
 		t.Fatal(err)
 	}
 	syncService := services.NewSyncService(db.DB, &config.Config{DataDir: t.TempDir()}, nil)
-	h := &Handlers{syncService: syncService}
+	h := &Handlers{syncService: syncService, clusterService: services.NewClusterService(db.DB, "")}
 	response := httptest.NewRecorder()
 	request := httptest.NewRequest("POST", "/api/v1/cluster/sync/pull", nil).WithContext(context.Background())
 	ginContext, _ := gin.CreateTestContext(response)
@@ -303,5 +305,46 @@ func TestGetClusterSnapshot_auditNodeNameReadsServiceHandle(t *testing.T) {
 	}
 	if strings.Contains(detail, "global-named") {
 		t.Fatalf("audit detail=%q, 不得读取全局 db.DB 库中的节点名", detail)
+	}
+}
+
+// 手动同步角色读取必须走 h.clusterService 句柄（与 GetClusterSnapshot/
+// ForgetClusterPins 同口径）：装配缺失 → 503，角色查询失败 → 500——瞬时 DB
+// 故障不得伪装成「主节点无需手动同步」400 误导排障。
+func TestPullClusterSnapshot_missingClusterServiceReturnsUnavailable(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	h.clusterService = nil
+	h.syncService = &services.SyncService{}
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(gin.Recovery())
+	router.POST("/cluster/sync/pull", h.PullClusterSnapshot)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/cluster/sync/pull", nil))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s, want 503（装配缺失）", response.Code, response.Body.String())
+	}
+}
+
+func TestPullClusterSnapshot_roleQueryFailureReturns500(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	// 已关闭的库句柄：角色查询必然失败。
+	closedDB, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "closed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := closedDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	h.clusterService = services.NewClusterService(closedDB, "")
+	h.syncService = &services.SyncService{}
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(gin.Recovery())
+	router.POST("/cluster/sync/pull", h.PullClusterSnapshot)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/cluster/sync/pull", nil))
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s, want 500（角色查询失败不得误映射 400 主节点语义）", response.Code, response.Body.String())
 	}
 }

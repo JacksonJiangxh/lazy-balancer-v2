@@ -12,6 +12,8 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+
+	"lazy-balancer-v2/internal/db"
 )
 
 func TestValidateAccessLogFormat_rejectsUARenameIncludingAncestors(t *testing.T) {
@@ -96,5 +98,48 @@ func TestUpdateConfig_accessLogFormatInvalidLine400(t *testing.T) {
 	save := post(h.UpdateConfig, http.MethodPut, "/config", body)
 	if save.Code != http.StatusBadRequest || !strings.Contains(save.Body.String(), "第 2 行") {
 		t.Fatalf("save status=%d body=%s, want 400 含行号", save.Code, save.Body.String())
+	}
+}
+
+// access_log_json=false 时自定义格式不生效（渲染层仅在 json=true 消费映射）：
+// 现状保存成功但运行态零生效（五链断裂、无告警）。写侧口径：
+//  1. 同一请求显式携带非空格式且 json=false → 400（不静默丢弃用户输入）；
+//  2. json 关闭后的存量残留格式 → 归一清空并在响应披露（不再静默忽略）。
+func TestUpdateConfig_accessLogFormatIgnoredWhenJSONDisabled(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.PUT("/config", h.UpdateConfig)
+	put := func(body string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPut, "/config", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		return response
+	}
+	if _, err := db.DB.Exec(`UPDATE global_config SET access_log_json=1, access_log_format='request>host -> h' WHERE id=1`); err != nil {
+		t.Fatalf("seed format: %v", err)
+	}
+
+	// 显式携带非空格式 + json=false → 400 点名不生效。
+	rejected := put(`{"access_log_json":false,"access_log_format":"request>host -> h"}`)
+	if rejected.Code != http.StatusBadRequest || !strings.Contains(rejected.Body.String(), "不生效") {
+		t.Fatalf("json=false + 非空格式必须 400 点名，status=%d body=%s", rejected.Code, rejected.Body.String())
+	}
+
+	// 仅关闭 json（不携带格式）→ 归一清空存量格式并披露。
+	saved := put(`{"access_log_json":false}`)
+	if saved.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", saved.Code, saved.Body.String())
+	}
+	if !strings.Contains(saved.Body.String(), "自定义格式已清空") {
+		t.Fatalf("归一清空必须披露，body=%s", saved.Body.String())
+	}
+	var storedJSON, storedFormat string
+	if err := db.DB.QueryRow(`SELECT COALESCE(access_log_json,1), COALESCE(access_log_format,'') FROM global_config WHERE id=1`).Scan(&storedJSON, &storedFormat); err != nil {
+		t.Fatalf("read stored: %v", err)
+	}
+	if storedJSON != "0" || storedFormat != "" {
+		t.Fatalf("落库終态 json=%s format=%q, want 0/空", storedJSON, storedFormat)
 	}
 }

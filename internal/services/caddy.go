@@ -39,22 +39,35 @@ const (
 	caddyCertFilesSnapshotKey     = caddyInternalKeyPrefix + "cert_files_snapshot"
 )
 
+// CaddyAdminListenAddr 是渲染产物中 Caddy admin 的监听地址（单源常量）。
+// 首次成功 /load 后 Caddy admin 即迁到本地址——cfg.CaddyAdminURL 仅是
+// 「首次 /load 之前」的引导端点，稳态必须指向同一地址，否则面板配置的
+// 端点在首次 /load 后失联（启动期一致性 WARN 见 config.Load）。
+const CaddyAdminListenAddr = "127.0.0.1:2019"
+
+// CaddyAdminListenPort 是 CaddyAdminListenAddr 的端口部分（规则端口冲突门
+// 等只需端口的消费方使用——稳态 admin 恒听本端口，与 caddy_admin_url 配置
+// 无关）。
+const CaddyAdminListenPort = 2019
+
 // ErrNoEnabledUpstreams 规则（或路径规则）没有启用上游时生成的哨兵错误。
 // 生成侧两处产出点（GenerateSingleRuleCaddyConfig 直返、buildHTTPHandleChain
 // %w 包装）统一引用；handlers 侧以 errors.Is 特判零上游为「跳过而非失败」
 // 语义，未来追加规则上下文包装后特判不会静默失效。
 var ErrNoEnabledUpstreams = errors.New("no enabled upstreams")
 
-// upstreamEnabledSQLValue 上游「启用」判定的 SQL 值形态（0/1 投影，供 SELECT
-// 取布尔列）；谓词形态由本常量派生，整个仓库只此一处 IIF 字面量。
-// 别名约定：u=upstreams。
-const upstreamEnabledSQLValue = `IIF(u.enabled IN ('1',1),1,0)`
+// UpstreamEnabledSQLValue 上游「启用」判定的 SQL 值形态（0/1 投影，供 SELECT
+// 取布尔列）；谓词形态由本常量派生，整个仓库只此一处 IIF 字面量（services 渲染
+// 装载/预览/看门狗与 handlers 的上游读取/冲突门全部引用本常量或其谓词形态，
+// 源码级单源钉测见 caddy_render_surface_test.go）。
+// 别名约定：u=upstreams（单表查询须给表加 u 别名后引用）。
+const UpstreamEnabledSQLValue = `IIF(u.enabled IN ('1',1),1,0)`
 
 // UpstreamEnabledSQLPredicate 上游「启用」的 SQL 判定单源（渲染上游装载查询、
 // 单规则服务上下文预览、看门狗发布谓词与 handlers 的自动封禁生效判定共用——
 // 多处各写一份 IIF 表达式易单侧漂移，；源码级单源断言在 services
 // 测试内，新增第二处谓词字面量即红）。别名约定：u=upstreams。
-const UpstreamEnabledSQLPredicate = upstreamEnabledSQLValue + ` = 1`
+const UpstreamEnabledSQLPredicate = UpstreamEnabledSQLValue + ` = 1`
 
 // publishableRulesSQLPredicate 「哪些规则会被发布到运行配置」的 SQL 谓词
 // 单源：规则启用 ∧ 至少一个启用上游。两个消费层必须恒等：
@@ -323,10 +336,10 @@ func (s *CaddyService) getRunningConfigBytes() ([]byte, error) {
 	}
 	defer resp.Body.Close()
 	// 同族防线（全文件最后一处无界 admin 读取收口）。
-	// 与 GetConfig 共用 readAdminConfigBody（状态分类 + 32MB+1 探测），
+	// 与 GetConfig 共用 ReadAdminConfigBody（状态分类 + 32MB+1 探测），
 	// 超限返回显式错误而非静默截断——比对方按 fail-open 照常 /load，但日志
 	// 可见「超限」而非「配置变化」的假象。
-	return readAdminConfigBody(resp)
+	return ReadAdminConfigBody(resp)
 }
 
 func (s *CaddyService) applyConfigLocked(config map[string]interface{}, persistDegradation bool) (err error) {
@@ -658,7 +671,9 @@ var ErrUnvalidatedApply = errors.New("config unvalidated by any Caddy-level chec
 // 校验输入=最终将应用的渲染本身（裁定 2026-09-06 ④'：任意 Caddy 修改三层
 // 校验的 Caddy 层），零运行时副作用。未启用时返回 nil。分类：拒绝→
 // *ConfigRejectedError（门控回滚 400）；不可用→ErrCLIValidatorUnavailable。
-func (s *CaddyService) ValidateTxRenderViaCLI(tx *sql.Tx) error {
+// rulesWrittenInTx：调用方事务是否写过 lb_rules（ACME 谓词 miss 补查门控，
+// 见 generateCaddyConfigWithCertSource）。
+func (s *CaddyService) ValidateTxRenderViaCLI(tx *sql.Tx, rulesWrittenInTx bool) error {
 	s.mu.Lock()
 	validator := s.cliValidate
 	s.mu.Unlock()
@@ -675,7 +690,7 @@ func (s *CaddyService) ValidateTxRenderViaCLI(tx *sql.Tx) error {
 			RestoreIPListProjections(projectionSnapshot)
 		}
 	}()
-	config := generateCaddyConfigFromStore(tx)
+	config := generateCaddyConfigWithCertSource(tx, db.DB, rulesWrittenInTx)
 	// 2026-09-07：渲染过程中 MaterializeCertPairs 可能已将证书文件
 	// 写盘——无论校验结果如何都恢复快照（后续 ApplyConfigFromTx 会重新生成
 	// 并重新物化），使本函数真正「零运行时副作用」（事务回滚时磁盘不留
@@ -739,12 +754,15 @@ const caddyAdminConfigMaxBytes = 32 << 20
 // 调用方据此把「超限」与瞬时读失败区分开留痕（二者都按 fail-open 照常 /load）。
 var errCaddyAdminConfigTooLarge = errors.New("Caddy admin 配置响应超过 32MB 上限")
 
-// readAdminConfigBody 读取 admin GET /config/ 的响应体：非 2xx 一律返回带状态码
+// ReadAdminConfigBody 读取 admin GET /config/ 的响应体：非 2xx 一律返回带状态码
 // 的错误（错误体经 readCaddyErrorBody 截断到 1KB 供诊断），2xx 时按 32MB 上限
-// 返回原始字节。此前 GetConfig/GetUpstreamHealthDetailed
+// 返回原始字节（超限经 +1 探测返回 errCaddyAdminConfigTooLarge 显式错误，
+// 绝不静默截断）。此前 GetConfig/GetUpstreamHealthDetailed
 // 直接解码响应体——Caddy 错误体本身是合法 JSON（{"error":"..."}），4xx/5xx 时错误
 // 对象会被当配置返回，健康查询更会静默退化为「无健康数据」的空表。
-func readAdminConfigBody(resp *http.Response) ([]byte, error) {
+// 跨包单源：handlers.GetCaddyConfig 同样复用本函数（裸 LimitReader 会把超限
+// 误报为「解析失败」，排障误导）。
+func ReadAdminConfigBody(resp *http.Response) ([]byte, error) {
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return nil, fmt.Errorf("GET /config/ returned %d: %s", resp.StatusCode, strings.TrimSpace(string(readCaddyErrorBody(resp.Body))))
 	}
@@ -818,8 +836,9 @@ func caddyPayload(config map[string]interface{}) map[string]interface{} {
 
 // RouteIDBelongsToRule 判断运行配置中的路由 @id 是否归属某规则：主路由
 // （@id == ruleID）或其带后缀的兄弟路由（ruleID_ 前缀：path_N / geoip /
-// redirect 等）。规则删除路径的路由清理与 handlers 侧
-// GetRuleCaddyConfig 的兄弟路由收集共用本口径。
+// redirect 等）。当前唯一生产消费点是 handlers 侧 GetRuleCaddyConfig 的
+// 兄弟路由收集（规则删除依赖全量重渲染收敛，不做路由清理扫描）——跨包
+// 复用故保持导出。
 func RouteIDBelongsToRule(routeID, ruleID string) bool {
 	return ruleID != "" && (routeID == ruleID || strings.HasPrefix(routeID, ruleID+"_"))
 }
@@ -834,7 +853,7 @@ func (s *CaddyService) GetConfig() (map[string]interface{}, error) {
 
 	// 非 2xx 必须先拦（Caddy 错误体是合法 JSON，直接解码会把
 	// 错误对象当配置返回）；解码上限沿用 32MB 家族口径。
-	body, err := readAdminConfigBody(resp)
+	body, err := ReadAdminConfigBody(resp)
 	if err != nil {
 		return nil, err
 	}
@@ -1005,14 +1024,14 @@ func (s *CaddyService) getUpstreamHealthDetailedUncached() (map[string]map[strin
 
 	// 与 GetConfig 同源状态门——错误页/4xx/5xx 不得静默退化为
 	// 「无上游健康数据」的空表（旧实现此处直接解码错误 JSON 后返回 nil error）。
-	body, err := readAdminConfigBody(resp)
+	body, err := ReadAdminConfigBody(resp)
 	if err != nil {
 		return nil, err
 	}
 
 	var config map[string]interface{}
 	// 同族防线：admin 响应解码上限统一在
-	// readAdminConfigBody（32MB，较 GetConfig 历史 4MB 宽：本端点返回完整
+	// ReadAdminConfigBody（32MB，较 GetConfig 历史 4MB 宽：本端点返回完整
 	// routes 视图，超大部署体积大，上限只为异常对端兜底，不得截断正常健康视图）。
 	if err := json.Unmarshal(body, &config); err != nil {
 		return nil, err
@@ -1339,6 +1358,22 @@ type securityPolicyContext struct {
 	securityLibsOK bool
 	// securityLibsWarnOnce 库缺失 WARN 每次生成一条（替代逐规则一条）。
 	securityLibsWarnOnce sync.Once
+	// crsFingerprintOnce/crsFingerprint：CRS 池指纹的渲染批次级缓存——同一轮
+	// 全量渲染内 CRS 文件与版本行不会变，逐链求值（每链 1 次 SELECT + 1 次
+	// stat）在 R 条有策略的 HTTP 规则下放大为 R 次查询+stat（单次保存最多
+	// 3 轮渲染 → 3R）。批次级一次求值后透传，正确性零变化。
+	crsFingerprintOnce sync.Once
+	crsFingerprint     string
+}
+
+// crsPoolFingerprintCached 返回本渲染批次的 CRS 池指纹（首次调用时求值并
+// 缓存）。仅批量预载上下文（全量渲染）使用；单规则/无上下文路径由调用方
+// 自行缓存（见 buildHTTPHandleChain 的 needFingerprint 闭包）。
+func (ctx *securityPolicyContext) crsPoolFingerprintCached() string {
+	ctx.crsFingerprintOnce.Do(func() {
+		ctx.crsFingerprint = crsPoolFingerprint()
+	})
+	return ctx.crsFingerprint
 }
 
 // loadSecurityPolicyContext 一次性查询 security_policy_bindings +
@@ -1750,9 +1785,10 @@ const acmeCertCandidatesQuery = `
 `
 
 // generateCaddyConfigFromStore 以已提交连接（db.DB）为证书候选源渲染配置（.1
-// 默认语义）；规则/安全段读传入 store。
+// 默认语义）；规则/安全段读传入 store。兼容包装：等价于 rulesWrittenInTx=true
+// （保守补查，与历史行为一致）——生产路径应改用带显式门控的入口（见下）。
 func generateCaddyConfigFromStore(store caddyConfigStore, overrides ...*models.UpdateConfigRequest) map[string]interface{} {
-	return generateCaddyConfigWithCertSource(store, db.DB, overrides...)
+	return generateCaddyConfigWithCertSource(store, db.DB, true, overrides...)
 }
 
 // generateCaddyConfigWithCertSource 渲染配置，证书候选源可指定
@@ -1764,8 +1800,15 @@ func generateCaddyConfigFromStore(store caddyConfigStore, overrides ...*models.U
 //	  视图会返回将被替换的旧行——MaterializeCertPairs 用旧 PEM 覆写
 //	  materializeImportCertificates 刚写入的新文件，DB=新证/磁盘=旧证静默分叉。
 //
+// rulesWrittenInTx 是「谓词 miss 补查」的显式门控：true=调用方事务写过
+// lb_rules（UpdateRule 切 acme/EnableRule/导入），store 的规则视图与 certSource
+// 已提交视图可能分叉，需要 per-rule 补查；false=事务未触碰 lb_rules
+// （UpdateConfig/名单-only 等），主候选查询在 certSource 视图已完备，补查是
+// 纯冗余（此前粗门 certSource!=store 让 UpdateConfig 形态每轮渲染为每条
+// 无候选 acme 规则空跑一次 SELECT，单次保存最多 3 轮 → 3N）。
+//
 // 导入期 CA 队列已 PauseAndDrain，无并发证书提交，tx 视图即最新真相。
-func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overrides ...*models.UpdateConfigRequest) map[string]interface{} {
+func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rulesWrittenInTx bool, overrides ...*models.UpdateConfigRequest) map[string]interface{} {
 	var filesSnapshot CertFilesSnapshot
 	generationFailure := func(format string, args ...any) map[string]interface{} {
 		err := fmt.Errorf(format, args...)
@@ -1909,7 +1952,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 	}
 
 	upstreamRows, err := store.Query(`
-		SELECT u.rule_id, u.host, u.port, COALESCE(u.weight,1), ` + upstreamEnabledSQLValue + `, COALESCE(u.protocol,'http'), COALESCE(u.max_connections,0), COALESCE(u.origin_domain,'')
+		SELECT u.rule_id, u.host, u.port, COALESCE(u.weight,1), ` + UpstreamEnabledSQLValue + `, COALESCE(u.protocol,'http'), COALESCE(u.max_connections,0), COALESCE(u.origin_domain,'')
 		FROM upstreams u JOIN lb_rules r ON r.caddy_id = u.rule_id
 		WHERE ` + UpstreamEnabledSQLPredicate + ` AND r.enabled = 1 ORDER BY u.rule_id, u.id
 	`)
@@ -2022,11 +2065,12 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		// UpdateRule tcp 切换删除；UpdateRule 域名迁移的证书 UPDATE 在 commit 后
 		// 独立 certTx。对 tx 内写者，事务视图恰是渲染目标状态，行为正确）；
 		// SelectCertificate 仍按 status 过滤 disabled。
-		// UpdateConfig（tx 只写 global_config）不产生谓词 miss，.1 防护不受影响。
-		// （C 域改进项）：门控收紧为 certSource!= store——补查仅在「子查询
-		// 视图 ≠ allRules 视图」时需要；CertAware 路径两者同为 tx（主查询已完备），
-		// 不再为每个无候选 acme 规则空跑一次 per-rule 查询。
-		if certSource != store {
+		// 门控显式化：补查仅当调用方声明 rulesWrittenInTx（事务写过 lb_rules，
+		// 规则视图与 certSource 已提交视图可能分叉）时执行；UpdateConfig（tx 只写
+		// global_config）、名单-only 热路径等形态传 false——两视图恒一致，
+		// 主查询已完备，不再为每个无候选 acme 规则空跑 per-rule 查询。
+		// CertAware 路径 certSource==store（主查询已完备），门控同样不触发。
+		if rulesWrittenInTx && certSource != store {
 			for _, ru := range allRules {
 				r := ru.rule
 				if !r.EnableTLS || r.TLSSource != "acme_dns" || len(acmeCerts[r.CaddyID]) > 0 {
@@ -2814,13 +2858,16 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, overr
 		}
 	}
 
-	// （2026-09-19 历史裁定）：Caddy admin 恒 127.0.0.1:2019。
-	// cfg.CaddyAdminURL 配置文件字段仅服务测试注入（main_test.go 死端口隔离），
-	// 生产部署（-config 未使用）两侧恒一致，admin 监听地址不随配置变化。
+	// （2026-09-19 历史裁定）：Caddy admin 恒 CaddyAdminListenAddr（127.0.0.1:2019）。
+	// cfg.CaddyAdminURL 只是首次 /load 之前的引导端点（面板经它把首份配置推给
+	// Caddy）——首次成功 /load 后 admin 监听即被本渲染产物迁到 127.0.0.1:2019，
+	// 此后一切 admin 请求（含 cfg.CaddyAdminURL 指向的客户端）必须打同一地址。
+	// caddy_admin_url 配成其他地址的部署会在首次 /load 后失联，启动期
+	// config.Load 对此发 WARN（fail-visible）。
 
 	conf := map[string]interface{}{
 		"admin": map[string]interface{}{
-			"listen": "127.0.0.1:2019",
+			"listen": CaddyAdminListenAddr,
 		},
 		"apps":    apps,
 		"logging": logging,
@@ -3478,59 +3525,11 @@ func GenerateSingleRuleCaddyConfig(rule SingleRuleConfig) map[string]interface{}
 			return map[string]interface{}{"error": err}
 		}
 
-		// HTTP→HTTPS 跳转路由插在 GeoIP 路由之后、路径/主路由之前。generateHTTPRouteObjects
-		// 已将 GeoIP pass 路由前置到头部（v2.2.0 地域拦截改走 coraza 后仅剩 pass 路由，
-		// 至多一条；无 Caddy 原生 block 路由）。
-		//
-		// 可达性说明（防止误用）：此单规则跳转形态当前并无调用方会触发——
-		// handlers.go 的规则验证中 HTTP 协议走单规则渲染校验（合并进既有端口验证），
-		// 仅 TCP 协议调用 GenerateSingleRuleCaddyConfig；rule_features.go 的
-		// validateRuleConfigGeneration 也不填 EnableTLS/TLSHTTPRedirect 字段。
-		// 生产环境的 HTTP→HTTPS 跳转由 generateCaddyConfigFromStore 的 redirectRoutes
-		// 统一生成（端口 443 时 Location 不带自引用端口，见 httpsRedirectLocation）。
-		// 若未来需要在单规则配置里启用此分支，请先确认与全量生成逻辑保持一致。
-		//
-		// 口径说明( 同步: 后全量分支对全部端口统一
-		// {disable: true}——引擎 autoHTTPS 整体关闭,HTTP→HTTPS 跳转由项目
-		// 自有 redirectRoutes 管理;此前的 disable_certificates 例外与「保留
-		// 自动跳转」描述已废止)。本分支(仅预览/校验用,输出不达 Caddy)仅对
-		// 非 80/443 端口写 {disable: true},80/443 不写 automatic_https;
-		// 若未来启用此分支,应与全量分支同口径统一 {disable: true}。
-		if rule.EnableTLS && rule.TLSHTTPRedirect && len(domainHosts) > 0 {
-			// 与 generateHTTPRouteObjects 同口径：任一启用策略带 geoip 时仅一条
-			// pass 路由（地域拦截已改走 coraza，无逐策略 block 路由）。
-			geoipCount := 0
-			for _, policy := range GetSecurityPoliciesForRule(rule.CaddyID) {
-				if PolicyHasGeoIP(policy) {
-					geoipCount = 1
-					break
-				}
-			}
-			redirectRoute := map[string]interface{}{
-				"match": []interface{}{
-					map[string]interface{}{
-						"host": domainHosts,
-					},
-				},
-				"handle": []interface{}{
-					map[string]interface{}{
-						"handler":     "static_response",
-						"status_code": 301,
-						"headers": map[string]interface{}{
-							"Location": []string{httpsRedirectLocation(rule.ListenPort)},
-						},
-					},
-				},
-				"terminal": true,
-			}
-			tagRuleRoute(redirectRoute, rule.CaddyID, "redirect")
-			withRedirect := make([]map[string]interface{}, 0, len(routes)+1)
-			withRedirect = append(withRedirect, routes[:geoipCount]...)
-			withRedirect = append(withRedirect, redirectRoute)
-			withRedirect = append(withRedirect, routes[geoipCount:]...)
-			routes = withRedirect
-		}
-
+		// 单规则形态仅服务 TCP/HTTP 预检（rule_features.go precheckRuleConfig
+		// 不填 EnableTLS/TLSHTTPRedirect）——HTTP→HTTPS 跳转路由由全量渲染的
+		// redirectRoutes 统一生成，此处不插跳转分支（历史死分支已删除：其
+		// automatic_https 仅对非 80/443 发射，与全量分支「全部 {disable:true}」
+		// 口径分叉，启用即静默行为分叉）。
 		routeValues := make([]interface{}, len(routes))
 		for i, r := range routes {
 			routeValues[i] = r
@@ -3579,7 +3578,7 @@ func GenerateSingleRuleCaddyConfig(rule SingleRuleConfig) map[string]interface{}
 
 		conf := map[string]interface{}{
 			"admin": map[string]interface{}{
-				"listen": "127.0.0.1:2019",
+				"listen": CaddyAdminListenAddr,
 				// 流量统计走 caddygeoip admin.api 全量自动挂载（无需配置启用）。
 			},
 			"apps": apps,
@@ -3619,7 +3618,7 @@ func GenerateSingleRuleCaddyConfig(rule SingleRuleConfig) map[string]interface{}
 
 	conf := map[string]interface{}{
 		"admin": map[string]interface{}{
-			"listen": "127.0.0.1:2019",
+			"listen": CaddyAdminListenAddr,
 		},
 		"apps": apps,
 	}
@@ -4367,14 +4366,18 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 	// 阶段 2（限流）→ 阶段 3（WAF）：全部绑定启用策略（policy_id ASC）的
 	// rate_limit 集中在所有 WAF 引擎之前（限流恒 429；被前位 WAF 拦的请求也
 	// 消耗后位策略配额为已裁定口径），随后每策略独立 coraza 引擎（自定义规则
-	// +CRS）。审计 +：CRS 池指纹在单次链构建内不变——按链计算一次
-	// 透传给各策略，替代逐 (规则×策略) 对的 DB 查询+stat（200 规则×3 策略
-	// ≈600 查询→200）；闭包缓存每链至多计算一次——零安全策略/非 http 链零
-	// 开销；http 链首个策略求值时计算（全 off 策略的 http 链
+	// 审计 +：CRS 池指纹按渲染批次缓存——批量预载上下文在场时一次求值
+	// 全批透传（同轮内 CRS 文件不会变，正确性零变化；R 条有策略规则从
+	// R 次 SELECT+stat 收敛到 1 次）；无上下文路径（单规则预检等）退化为
+	// 链内闭包缓存（每链至多一次——零安全策略/非 http 链零开销；http 链
+	// 首个策略求值时计算（全 off 策略的 http 链
 	// 仍付一次 SELECT+2×stat——实参求值在 buildWafHandlerWithPolicy 调用前，
-	// 真惰性需改 BuildCorazaDirectives 签名,安全关键函数不值,裁定接受）。
+	// 真惰性需改 BuildCorazaDirectives 签名,安全关键函数不值,裁定接受））。
 	var chainFingerprint string
 	needFingerprint := func() string {
+		if ctx != nil {
+			return ctx.crsPoolFingerprintCached()
+		}
 		if chainFingerprint == "" {
 			chainFingerprint = crsPoolFingerprintForChain()
 		}
@@ -4560,6 +4563,10 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 		hcThreshold := rule.HealthCheckUnhealthyThreshold
 		healthChecks := map[string]interface{}{
 			"passive": map[string]interface{}{
+				// 披露：被动熔断窗口复用主动探测间隔（fail_duration=interval*3），
+				// 无独立配置项——interval=60s 时失败上游被熔断 180s，interval=1s
+				// 时仅 3s。UI/文档未声明该耦合；如需独立控制需新增值型列
+				// （schema+写侧+渲染三件套），当前裁定仅披露不新增。
 				"fail_duration": fmt.Sprintf("%ds", hcInterval*3),
 				"max_fails":     hcThreshold,
 				// 5 是 Caddy 官方类码语义（StatusCodeMatches：configured<100 匹配整百段，
@@ -4749,10 +4756,11 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 
 // ApplyConfigFromTx renders the Caddy config from an uncommitted transaction
 // and applies it, keeping the database unchanged when Caddy rejects the config.
-func (s *CaddyService) ApplyConfigFromTx(tx *sql.Tx) error {
+// rulesWrittenInTx：调用方事务是否写过 lb_rules（ACME 谓词 miss 补查门控）。
+func (s *CaddyService) ApplyConfigFromTx(tx *sql.Tx, rulesWrittenInTx bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.applyConfigLocked(generateCaddyConfigFromStore(tx), false)
+	return s.applyConfigLocked(generateCaddyConfigWithCertSource(tx, db.DB, rulesWrittenInTx), false)
 }
 
 // RefreshIPListProjectionsFromTxInLock 投影热路径（2026-10-15 用户裁定）：
@@ -4818,7 +4826,10 @@ const (
 )
 
 func (s *CaddyService) refreshIPListProjectionsInLock(store caddyConfigStore) (IPListProjectionOutcome, error) {
-	config := generateCaddyConfigFromStore(store)
+	// rulesWrittenInTx=false：本路径全部调用方（名单写路径 tx / 后台任务 db.DB）
+	// 均不触碰 lb_rules——名单-only 变更的规则视图与已提交视图恒一致，
+	// ACME 谓词 miss 补查在本路径是纯冗余。
+	config := generateCaddyConfigWithCertSource(store, db.DB, false)
 	if message, ok := config[caddyConfigGenerationErrorKey].(string); ok {
 		// 生成失败 = 该视图渲染不出合法配置——回退全量链按「配置被拒」拒绝
 		//（同 applyConfigLockedOpt 口径，调用方回退后得到一致错误语义）。
@@ -4942,9 +4953,14 @@ func (s *CaddyService) RestoreRuntimeToCommittedInLock() error {
 func (s *CaddyService) ApplyConfigFromTxCertAwareForce(tx *sql.Tx) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.applyConfigLockedOpt(generateCaddyConfigWithCertSource(tx, tx), true, false)
+	return s.applyConfigLockedOpt(generateCaddyConfigWithCertSource(tx, tx, true), true, false)
 }
 
+// normalizeWeights 按 gcd 约分权重表（Caddy WRR 权重越小越高效）。
+// 可达性披露：当前唯一调用点（HTTP 代理链构建）的上游权重已在收集层
+// 归一（weight<=0→1），输入恒 ≥1——g==0（全零输入）与 w<=0 跳过两分支
+// 对当前调用方不可达，属防未来调用方绕过收集层的防御性保留（删除会削弱
+// 防御，有意保留）。
 func normalizeWeights(weights []int) []int {
 	g := 0
 	for _, w := range weights {
@@ -5052,6 +5068,8 @@ func buildTCPProxyRoute(rule SingleRuleConfig) (map[string]interface{}, error) {
 	unhealthyThreshold := rule.HealthCheckUnhealthyThreshold
 	healthChecks := map[string]interface{}{
 		"passive": map[string]interface{}{
+			// 披露（与 HTTP 侧同口径）：被动熔断窗口=health_check_interval*3，
+			// 复用主动探测间隔、无独立配置项（interval 越小熔断窗口越短）。
 			"fail_duration": fmt.Sprintf("%ds", healthCheckInterval*3),
 			"max_fails":     unhealthyThreshold,
 		},

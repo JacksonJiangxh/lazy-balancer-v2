@@ -11,6 +11,9 @@
  * - `验证码错误`（verify-step / setup 重绑 / disable / 管理员 reset）
  * - `验证码错误次数过多，绑定已作废，请重新开始绑定`（activate 失败上限）
  * - `MFA 挑战无效或已过期，请重新登录` / `MFA 挑战已被使用，请重新登录`（登录第二步）
+ *
+ * 429 无需入白名单：登录后验码限流（60 秒 5 次失败 → `验证码尝试过于频繁，请稍后再试`）
+ * 走全局默认分支直接透传后端文案 toast，不触发会话失效流程，也不重试原请求。
  */
 const MFA_CREDENTIAL_REJECTION_MESSAGES: readonly string[] = [
   '验证码错误',

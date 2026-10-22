@@ -130,6 +130,38 @@ func TestLoad_warnsOnUnsupportedConfigFileKeys(t *testing.T) {
 	}
 }
 
+// caddy_admin_url 与渲染产物 admin 监听（127.0.0.1:2019）不一致时启动期
+// 必须 WARN（首次 /load 后该端点失联）；一致/缺省/畸形（由连接方报错）不告警。
+func TestLoad_warnsOnMismatchedCaddyAdminURL(t *testing.T) {
+	t.Setenv("JWT_SECRET", "test-secret")
+
+	writeConfig := func(t *testing.T, adminURL string) string {
+		configPath := filepath.Join(t.TempDir(), "config.json")
+		content := `{"data_dir":"/tmp/config-test-data","caddy_admin_url":` + adminURL + `}`
+		if err := os.WriteFile(configPath, []byte(content), 0600); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+		return configPath
+	}
+
+	// 不一致 → WARN。
+	var logBuf bytes.Buffer
+	origOut := log.Writer()
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(origOut)
+	Load(writeConfig(t, `"http://127.0.0.1:2020"`))
+	if !strings.Contains(logBuf.String(), "caddy_admin_url") || !strings.Contains(logBuf.String(), "127.0.0.1:2019") {
+		t.Fatalf("非 2019 的 caddy_admin_url 必须 WARN, log=%q", logBuf.String())
+	}
+
+	// 一致（含 scheme 默认端口形态之外的显式 2019）→ 零告警。
+	logBuf.Reset()
+	Load(writeConfig(t, `"http://127.0.0.1:2019"`))
+	if strings.Contains(logBuf.String(), "caddy_admin_url") {
+		t.Fatalf("一致的 caddy_admin_url 不应告警, log=%q", logBuf.String())
+	}
+}
+
 func TestLoad_warnsOnSupportedConfigFileKeyTypeMismatch(t *testing.T) {
 	// Given：六个支持键全部使用错误 JSON 类型。
 	t.Setenv("JWT_SECRET", "test-secret")

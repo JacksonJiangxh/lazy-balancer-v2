@@ -307,7 +307,10 @@ service.interceptors.response.use(
         const code = await promptMfaCode()
         if (code) {
           // 并发 428 共享同一次 verify-step（同码重放会被后端 mfa_last_timestep
-          // 拒绝并计失败锁定），所有等待者用刷新后的 token 各自重试原请求。
+          // 拒绝并计入登录后验码限流——每用户 60 秒内失败 5 次后 verify-step
+          // 返回 429「验证码尝试过于频繁，请稍后再试」，此处按普通错误透传后端
+          // 文案、不重试原请求；仅限流不锁定，等待窗口滑动即可再试），
+          // 所有等待者用刷新后的 token 各自重试原请求。
           if (!mfaStepUpRefresh) {
             mfaStepUpRefresh = authStore.refreshMfaStep(code).finally(() => {
               mfaStepUpRefresh = null

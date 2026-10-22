@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -249,7 +250,39 @@ func Load(path string) *Config {
 		cfg.Port = 8000
 	}
 
+	// caddy_admin_url 一致性校验（fail-visible）：渲染产物的 admin 监听恒为
+	// 127.0.0.1:2019（services.CaddyAdminListenAddr 单源），首次成功 /load 后
+	// Caddy admin 即迁到该地址。caddy_admin_url 只是「首次 /load 之前」的引导
+	// 端点——指向其他地址时面板配置的端点在首次 /load 后失联（需人工恢复），
+	// 启动期必须可见而非届时静默断联。
+	if listen, ok := adminURLListen(cfg.CaddyAdminURL); ok && listen != "127.0.0.1:2019" {
+		log.Printf("config: caddy_admin_url=%q 的监听地址与渲染产物 admin 监听 127.0.0.1:2019 不一致——首次成功 /load 后 Caddy admin 将迁到 127.0.0.1:2019，本配置端点随即失联；请改为 http://127.0.0.1:2019 或移除该配置项", cfg.CaddyAdminURL)
+	}
+
 	return cfg
+}
+
+// adminURLListen 解析 caddy_admin_url 的 host:port（失败时 ok=false——畸形 URL
+// 由使用方连接时报错，此处不重复告警）。
+func adminURLListen(rawURL string) (string, bool) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Host == "" {
+		return "", false
+	}
+	host := parsed.Hostname()
+	port := parsed.Port()
+	if port == "" {
+		// 未显式写端口时按 scheme 默认端口判定。
+		switch parsed.Scheme {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		default:
+			return "", false
+		}
+	}
+	return host + ":" + port, true
 }
 
 func getEnv(key, defaultValue string) string {

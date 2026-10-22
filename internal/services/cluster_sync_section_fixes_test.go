@@ -2,10 +2,8 @@ package services
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -88,7 +86,11 @@ func TestRecordAppliedSectionHashes_unchangedBranchInsertsMissingRow(t *testing.
 		sk.unchanged[sec.Key] = true
 	}
 
-	recordAppliedSectionHashes(database, snapshot, sk, switches, nil)
+	if err := recordAppliedSectionHashes(context.Background(), database, snapshot, sk, switches, nil); err != nil {
+
+		t.Fatalf("record applied section hashes: %v", err)
+
+	}
 
 	var count int
 	if err := database.QueryRow(`SELECT COUNT(*) FROM cluster_applied_sections WHERE applied_version=42`).Scan(&count); err != nil {
@@ -116,6 +118,3 @@ func TestClusterSyncFailureSummaryOmitsNilSide(t *testing.T) {
 		t.Fatalf("task log=%q, want 分别点名单侧失败", string(data))
 	}
 }
-
-var _ = filepath.Join
-var _ = sql.ErrNoRows

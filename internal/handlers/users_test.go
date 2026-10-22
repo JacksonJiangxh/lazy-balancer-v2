@@ -35,6 +35,28 @@ func TestDeleteUser_deletesOwnedAPIKeys(t *testing.T) {
 	}
 }
 
+func TestDeleteUser_cleansMFAChallenges(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	seedUserAuditTest(t, 1, "admin", "admin", true)
+	seedUserAuditTest(t, 2, "target", "user", true)
+	// 未过期的 MFA 登录挑战残留——删除用户后不应依赖惰性过期清理。
+	if _, err := db.DB.Exec(`INSERT INTO mfa_challenges (token,user_id,expires_at,password_version) VALUES ('tok-target',2,datetime('now','+5 minutes'),0)`); err != nil {
+		t.Fatal(err)
+	}
+
+	response := serveUserMutation(h, http.MethodDelete, "/users/2", "", 1, h.DeleteUser)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var challenges int
+	if err := db.DB.QueryRow("SELECT COUNT(*) FROM mfa_challenges WHERE user_id=2").Scan(&challenges); err != nil {
+		t.Fatal(err)
+	}
+	if challenges != 0 {
+		t.Fatalf("remaining mfa_challenges=%d, want 0（删除用户须连带清理挑战残留）", challenges)
+	}
+}
+
 func TestDeleteUser_rejectsSelfDeletion(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	seedUserAuditTest(t, 1, "admin", "admin", true)

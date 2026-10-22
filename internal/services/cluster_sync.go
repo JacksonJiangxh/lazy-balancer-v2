@@ -342,10 +342,6 @@ func (s *SyncService) clusterPinPath(host string) (string, error) {
 	return clusterPinPath(dataDir, s.db, host)
 }
 
-func clusterPinPathForDatabase(database *sql.DB, host string) (string, error) {
-	return clusterPinPath("", database, host)
-}
-
 // clusterPinDirectory 返回 pin 文件所在目录（<dataDir>/cluster_ca_pins）；
 // dataDir 为空且带数据库时从数据库文件路径推导（与 clusterPinPath 既有口径
 // 一致，抽出供 ForgetPins 整目录清理复用）。
@@ -680,6 +676,13 @@ func unregisterSyncDrainer(service *SyncService) {
 		syncDrainers[service.db] = remaining
 	}
 	syncDrainersMu.Unlock()
+	// NewSyncService 内建并登记一个 ClusterService（service.cluster）：
+	// 只注销排干登记会让该内建实例连同其快照缓存继续驻留全局表——
+	// 同步服务 teardown 时一并注销（unregisterClusterService 幂等，
+	// 外部独立登记的 ClusterService 不受影响）。
+	if service.cluster != nil {
+		unregisterClusterService(service.cluster)
+	}
 }
 
 // syncDrainersFor 返回该库登记的全部同步服务实例：Promote/BecomeSlave 必须
@@ -688,8 +691,9 @@ func syncDrainersFor(database *sql.DB) []*SyncService {
 	if database == nil {
 		return nil
 	}
+	// Ping 在锁外执行（同 clusterServicesFor）：死句柄探活最长 1s，
+	// 持锁等待会阻塞全部排干查表。
 	syncDrainersMu.Lock()
-	defer syncDrainersMu.Unlock()
 	registered := syncDrainers[database]
 	services := make([]*SyncService, 0, len(registered))
 	for _, service := range registered {
@@ -699,12 +703,16 @@ func syncDrainersFor(database *sql.DB) []*SyncService {
 	}
 	if len(services) == 0 {
 		delete(syncDrainers, database)
+		syncDrainersMu.Unlock()
 		return nil
 	}
+	syncDrainersMu.Unlock()
 	// 死句柄兜底回收（同 clusterServicesFor）：库已 Close 时条目不再可用，
 	// 查询路径顺手剔除，防止测试/重建场景无限累积。
 	if !clusterDBHandleAlive(database) {
+		syncDrainersMu.Lock()
 		delete(syncDrainers, database)
+		syncDrainersMu.Unlock()
 		return nil
 	}
 	return services
@@ -1134,7 +1142,7 @@ func (s *SyncService) driftedSections(ctx context.Context) string {
 		Logf("warn", "本地漂移守卫哈希重建失败，跳过漂移检测: %v", err)
 		return ""
 	}
-	applied := readAppliedSectionHashes(s.db)
+	applied := readAppliedSectionHashes(ctx, s.db)
 	switches, err := readSyncSwitches(ctx, s.db)
 	if err != nil {
 		switches = SyncSwitches{Users: true, Rules: true, Security: true}

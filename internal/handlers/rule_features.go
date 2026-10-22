@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -900,21 +901,38 @@ func derefBool(p *bool) bool {
 	return p != nil && *p
 }
 
-// JWT 中间件存 float64，API Key 中间件存 int，统一在此收敛
-func contextUserID(c *gin.Context) int64 {
+// userIDFromContext 类型化读取上下文 user_id（单源：contextUserID 与
+// step-up 判定共用）。生产 jwtAuth 链路恒存 float64，apiKeyAuth 存 int；
+// int64/string 分支为测试与 MCP 调用路径的防御性兼容（单测直连 handler 常
+// 注入 int，MCP 内部转发可能注入 string 数字），生产 JWT 链路不依赖；
+// 删除会让这些路径静默退回「无 user_id 直通」。gin GetString 对数字恒返回
+// 空串，不得用。返回 (0,false) 表示缺失/类型未知/不可解析。
+func userIDFromContext(c *gin.Context) (int, bool) {
 	v, ok := c.Get("user_id")
 	if !ok || v == nil {
-		return 0
+		return 0, false
 	}
 	switch id := v.(type) {
 	case float64:
-		return int64(id)
+		return int(id), true
 	case int:
-		return int64(id)
+		return id, true
 	case int64:
-		return id
+		return int(id), true
+	case string:
+		parsed, err := strconv.Atoi(id)
+		if err != nil {
+			return 0, false
+		}
+		return parsed, true
 	}
-	return 0
+	return 0, false
+}
+
+// JWT 中间件存 float64，API Key 中间件存 int，统一在此收敛
+func contextUserID(c *gin.Context) int64 {
+	id, _ := userIDFromContext(c)
+	return int64(id)
 }
 
 // 列表查询不加载 tls_cert/tls_key 正文，减少大字段 I/O。
@@ -1043,10 +1061,10 @@ func loadUpstreamsBatch(ctx context.Context, ruleIDs []string) (map[string][]mod
 			placeholders[i] = "?"
 			args[i] = id
 		}
-		// 与渲染侧同口径（IIF(enabled IN ('1',1),1,0)，NULL 视禁用）——
+		// 与渲染侧同口径（services.UpstreamEnabledSQLValue 单源，NULL 视禁用）——
 		// 此前 COALESCE(enabled,1) 将遗留 NULL 行视为启用，UI 显示与生成配置分裂。
-		rows, err := db.DB.QueryContext(ctx, `SELECT id, rule_id, host, port, COALESCE(weight,1), COALESCE(dynamic_dns,0), IIF(enabled IN ('1',1),1,0), COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(origin_domain,'')
-			FROM upstreams WHERE rule_id IN (`+strings.Join(placeholders, ",")+`) ORDER BY id`, args...)
+		rows, err := db.DB.QueryContext(ctx, `SELECT id, rule_id, host, port, COALESCE(weight,1), COALESCE(dynamic_dns,0), `+services.UpstreamEnabledSQLValue+`, COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(origin_domain,'')
+			FROM upstreams u WHERE rule_id IN (`+strings.Join(placeholders, ",")+`) ORDER BY id`, args...)
 		if err != nil {
 			return fmt.Errorf("批量读取上游: %w", err)
 		}

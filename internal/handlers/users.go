@@ -319,12 +319,21 @@ func (h *Handlers) UpdateUser(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "用户更新成功", Data: response})
 }
 
+// authProviderOf 读取用户身份来源（单源：isOIDCUser 与
+// rejectOIDCUserMFAOperation 共用同一查询与归一化，调用方只保留各自的
+// 错误→响应映射）。返回原始错误（含 sql.ErrNoRows），归一化口径与 users
+// 列默认值一致（空→'local'）。
+func authProviderOf(ctx context.Context, userID int) (string, error) {
+	var provider string
+	err := db.DB.QueryRowContext(ctx, "SELECT COALESCE(auth_provider,'local') FROM users WHERE id=?", userID).Scan(&provider)
+	return provider, err
+}
+
 // isOIDCUser 判定用户是否 OIDC 来源（读失败与「非 OIDC」分判——
 // 身份来源不可判定时调用方必须拒绝写操作,不得静默放行;ErrNoRows 除外:
 // 用户不存在是调用方可判定的已知条件,交由后续 0 行 UPDATE → 404)。
 func isOIDCUser(ctx context.Context, userID int) (bool, error) {
-	var provider string
-	err := db.DB.QueryRowContext(ctx, "SELECT COALESCE(auth_provider,'') FROM users WHERE id=?", userID).Scan(&provider)
+	provider, err := authProviderOf(ctx, userID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			// 用户不存在是调用方可判定的已知条件(后续 UPDATE 0 行 → 404),
@@ -423,6 +432,13 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 	}
 	keyRows.Close()
 	if _, err := tx.ExecContext(c.Request.Context(), "DELETE FROM api_keys WHERE created_by = ?", id); err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "删除用户失败"})
+		return
+	}
+	// 连带清理该用户的 MFA 登录挑战——无越权面（消费端按 token+user_id 判定
+	// 且登录第二步 JOIN users），但簿记残留不应依赖 MFAIssueChallenge 的
+	// 惰性过期清理（过期才删；未过期行会残留至到期）。
+	if _, err := tx.ExecContext(c.Request.Context(), "DELETE FROM mfa_challenges WHERE user_id = ?", id); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "删除用户失败"})
 		return
 	}

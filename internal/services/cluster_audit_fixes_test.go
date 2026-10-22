@@ -186,7 +186,7 @@ func TestClusterService_ForgetNodePin_removesOnlyTargetNodePin(t *testing.T) {
 		t.Fatal(err)
 	}
 	writePin := func(host string) string {
-		pinPath, err := clusterPinPathForDatabase(database, host)
+		pinPath, err := clusterPinPath("", database, host)
 		if err != nil {
 			t.Fatal(err)
 		}

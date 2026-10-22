@@ -16,6 +16,7 @@ import (
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
+	"lazy-balancer-v2/internal/services"
 )
 
 var caddyMetricsHTTPClient = &http.Client{Timeout: 10 * time.Second}
@@ -184,7 +185,7 @@ func (h *Handlers) buildMetricsDashboard(ctx context.Context) metricsDashboardOu
 
 	upstreamRows, err := db.DB.QueryContext(ctx, `
 		SELECT rule_id, COALESCE(host,''), COALESCE(port,0), COALESCE(enabled,0)
-		FROM upstreams WHERE enabled=1`)
+		FROM upstreams u WHERE `+services.UpstreamEnabledSQLPredicate)
 	if err != nil {
 		return metricsDashboardOutcome{status: http.StatusInternalServerError, message: "读取规则上游失败"}
 	}
@@ -575,7 +576,7 @@ func loadRuleUpstreams(ruleID string) ([]models.Upstream, error) {
 		SELECT COALESCE(id,0), COALESCE(rule_id,''), COALESCE(host,''), COALESCE(port,0), COALESCE(weight,0),
 		       COALESCE(dynamic_dns,0), COALESCE(enabled,0), COALESCE(protocol,''),
 		       COALESCE(max_connections,0)
-		FROM upstreams WHERE rule_id = ? AND enabled = 1
+		FROM upstreams u WHERE rule_id = ? AND `+services.UpstreamEnabledSQLPredicate+`
 	`, ruleID)
 	if err != nil {
 		return nil, err

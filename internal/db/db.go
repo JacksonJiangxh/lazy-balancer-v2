@@ -65,8 +65,16 @@ const (
 	// 读侧绑定参数/导入归一全部引用，db_truth_defaults_test 双向钉死。
 	DefaultSecurityEventsRetentionDays = 90
 	DefaultSecurityEventsRowCap        = 1000000
-	DefaultThreatTrafficSampleN        = -1 // -1=自适应/0=关闭（全量与固定档已废除）
-	DefaultThreatScreenMode            = "map"
+	// 保留边界的上限同样单源：写侧校验（caddy.go）、导入钳制
+	// （config_backup.go）、从端 apply 归一（cluster_apply.go）与 MCP schema
+	// 四处引用，调整边界只改这里。
+	MaxSecurityEventsRetentionDays = 3650
+	MaxSecurityEventsRowCap        = 100000000
+	DefaultThreatTrafficSampleN    = -1 // -1=自适应/0=关闭（全量与固定档已废除）
+	DefaultThreatScreenMode        = "map"
+	// DefaultJWTExpireMinutes 是 jwt_expire_minutes 的治理默认：schema
+	// DEFAULT/迁移回填/从端 apply 归一（cluster_apply.go）共用此常量。
+	DefaultJWTExpireMinutes = 20
 	// DefaultTimezone 是 global_config.timezone 的治理默认（fresh DDL DEFAULT
 	// 与启动归一单源）。空串不是合法库值：time.LoadLocation("") 是 Go 的
 	// 特殊值（返回 UTC），读侧 COALESCE 只兜 NULL——空串落库会让全站展示/
@@ -514,7 +522,7 @@ func createTables() error {
 		access_log_json BOOLEAN DEFAULT TRUE,
 		access_log_format TEXT DEFAULT '',
 		audit_retention_months INTEGER DEFAULT 3,
-		jwt_expire_minutes INTEGER DEFAULT 20,
+		jwt_expire_minutes INTEGER DEFAULT ` + fmt.Sprint(DefaultJWTExpireMinutes) + `,
 		timezone VARCHAR(50) DEFAULT 'Asia/Shanghai',
 		github_proxy_url TEXT NOT NULL DEFAULT 'https://v4.gh-proxy.org/',
 		-- 可选 GITHUB_TOKEN（2026-09-25 用户裁定）：未认证 GitHub API 限流
@@ -1075,7 +1083,7 @@ func runMigrations() error {
 		"global_config.access_log_json":                        "BOOLEAN DEFAULT TRUE",
 		"global_config.access_log_format":                      "TEXT DEFAULT ''",
 		"global_config.audit_retention_months":                 "INTEGER DEFAULT 3",
-		"global_config.jwt_expire_minutes":                     "INTEGER DEFAULT 20",
+		"global_config.jwt_expire_minutes":                     fmt.Sprintf("INTEGER DEFAULT %d", DefaultJWTExpireMinutes),
 		"global_config.timezone":                               "VARCHAR(50) DEFAULT 'Asia/Shanghai'",
 		"global_config.github_proxy_url":                       "TEXT NOT NULL DEFAULT 'https://v4.gh-proxy.org/'",
 		"global_config.github_token":                           "TEXT NOT NULL DEFAULT ''",
@@ -1305,7 +1313,7 @@ func runMigrations() error {
 	// 移除原第 3 条「追加 UA rename 行」的 UPDATE——该行每次启动都被下方
 	// 清理循环无条件剔除（死代码），且引发每启动一次无谓写放大。
 	defaultUpdates := []string{
-		"UPDATE global_config SET jwt_expire_minutes=20 WHERE jwt_expire_minutes IS NULL OR jwt_expire_minutes<=0 OR jwt_expire_minutes>1440",
+		fmt.Sprintf("UPDATE global_config SET jwt_expire_minutes=%d WHERE jwt_expire_minutes IS NULL OR jwt_expire_minutes<=0 OR jwt_expire_minutes>1440", DefaultJWTExpireMinutes),
 		"UPDATE global_config SET access_log_format='' WHERE access_log_format LIKE '{%'",
 		// 空串/空白 timezone 归一（带外直写或旧备份恢复的脏行在下次启动收敛；
 		// 写侧已拒绝空串，读侧 COALESCE 只兜 NULL 不兜空串）。
@@ -3817,6 +3825,40 @@ func normalizeRuleTimestampsMigration() error {
 // 的 canonical 变化由本迁移写侧触发 cluster_version bump 随下轮同步收敛。
 // WHERE 谓词与归一函数逐字对齐：enable_tls=1 即入选（
 // 此前要求证书材料非空会漏掉「TCP+enable_tls=1+双空证书」形态的存量行）。
+// TCPRuleDeadFieldsResetSQL：TCP 行 HTTP 专属死值清零（HTTP 头/健康检查/
+// 压缩/请求体/NTLM/force_http1 + TLS 来源、跳转与材料 + 代理超时族七列 +
+// 自定义路由 + dynamic_dns + strategy(cookie) + 阶段页四列 + log_enabled，
+// 共 31 列 SET）的 SQL 字面量单源——启动迁移（migrateTCPRuleDeadFields）
+// 与导入归一（handlers normalizeRuleRowsForTransport）共用本常量；此前跨包
+// 双份逐字镜像靠测试字符串 parity 维系，任一侧扩列漏同步即终态漂移。
+// WHERE 谓词与 tcpDeadFieldsProbeSQL 逐字对齐（改一侧必改另一侧）。
+const TCPRuleDeadFieldsResetSQL = `UPDATE lb_rules SET
+	host_header='', health_check_path='', health_check_host='', domain='', enable_compress=0, compress_types='',
+	request_body_max_size_mb=0, upstream_keepalive_timeout=0, server_tokens_hidden=0, ntlm_compatible=0, upstream_force_http1=0,
+	proxy_dial_timeout=0, proxy_response_header_timeout=0, proxy_read_timeout=0, proxy_write_timeout=0, proxy_stream_timeout=0, proxy_flush_interval=0, proxy_stream_close_delay=0,
+	custom_routes_enabled=0, dynamic_dns=0,
+	strategy=CASE WHEN strategy='cookie' THEN 'weighted_round_robin' ELSE strategy END,
+	enable_tls=0, tls_source='manual', tls_http_redirect=0, tls_cert='', tls_key='',
+	block_page_stage1_id=0, block_page_stage1_status=0, block_page_stage3_id=0, block_page_stage3_status=0, log_enabled=0
+	WHERE protocol='tcp' AND (
+		COALESCE(host_header,'')<>'' OR COALESCE(health_check_path,'')<>'' OR COALESCE(health_check_host,'')<>'' OR COALESCE(domain,'')<>''
+		OR enable_compress=1 OR COALESCE(compress_types,'')<>''
+		OR request_body_max_size_mb<>0 OR upstream_keepalive_timeout<>0 OR server_tokens_hidden<>0 OR ntlm_compatible<>0 OR upstream_force_http1<>0
+		OR proxy_dial_timeout<>0 OR proxy_response_header_timeout<>0 OR proxy_read_timeout<>0 OR proxy_write_timeout<>0 OR proxy_stream_timeout<>0 OR proxy_flush_interval<>0 OR proxy_stream_close_delay<>0
+		OR custom_routes_enabled=1 OR dynamic_dns=1
+		OR COALESCE(strategy,'')='cookie'
+		OR enable_tls=1 OR COALESCE(tls_source,'')<>'manual' OR tls_http_redirect=1
+		OR COALESCE(block_page_stage1_id,0)<>0 OR COALESCE(block_page_stage1_status,0)<>0
+		OR COALESCE(block_page_stage3_id,0)<>0 OR COALESCE(block_page_stage3_status,0)<>0
+		OR COALESCE(log_enabled,0)<>0
+	)`
+
+// TCPRulePathRulesResetSQL：TCP 规则残留路径规则清理——custom_routes_enabled
+// 归零后 path_rules 行成为孤儿（TCP 渲染零消费路径分支），随导出/备份导入
+// 被引用校验放大。与 TCPRuleDeadFieldsResetSQL 同为跨包单源（启动迁移与
+// 导入归一共用）。
+const TCPRulePathRulesResetSQL = `DELETE FROM path_rules WHERE rule_id IN (SELECT caddy_id FROM lb_rules WHERE protocol='tcp')`
+
 // tcpDeadFieldsProbeSQL 死值探测（与下方 UPDATE 同谓词 + TCP 孤儿路径规则）：
 // 无命中时零写事务、零版本扰动。谓词必须与 UPDATE WHERE 逐字对齐（改一侧
 // 必改另一侧）。
@@ -3860,26 +3902,7 @@ func migrateTCPRuleDeadFields() error {
 			_ = tx.Rollback()
 		}
 	}()
-	res, err := tx.Exec(`UPDATE lb_rules SET
-		host_header='', health_check_path='', health_check_host='', domain='', enable_compress=0, compress_types='',
-		request_body_max_size_mb=0, upstream_keepalive_timeout=0, server_tokens_hidden=0, ntlm_compatible=0, upstream_force_http1=0,
-		proxy_dial_timeout=0, proxy_response_header_timeout=0, proxy_read_timeout=0, proxy_write_timeout=0, proxy_stream_timeout=0, proxy_flush_interval=0, proxy_stream_close_delay=0,
-		custom_routes_enabled=0, dynamic_dns=0,
-		strategy=CASE WHEN strategy='cookie' THEN 'weighted_round_robin' ELSE strategy END,
-		enable_tls=0, tls_source='manual', tls_http_redirect=0, tls_cert='', tls_key='',
-		block_page_stage1_id=0, block_page_stage1_status=0, block_page_stage3_id=0, block_page_stage3_status=0, log_enabled=0
-		WHERE protocol='tcp' AND (
-			COALESCE(host_header,'')<>'' OR COALESCE(health_check_path,'')<>'' OR COALESCE(health_check_host,'')<>'' OR COALESCE(domain,'')<>''
-			OR enable_compress=1 OR COALESCE(compress_types,'')<>''
-			OR request_body_max_size_mb<>0 OR upstream_keepalive_timeout<>0 OR server_tokens_hidden<>0 OR ntlm_compatible<>0 OR upstream_force_http1<>0
-			OR proxy_dial_timeout<>0 OR proxy_response_header_timeout<>0 OR proxy_read_timeout<>0 OR proxy_write_timeout<>0 OR proxy_stream_timeout<>0 OR proxy_flush_interval<>0 OR proxy_stream_close_delay<>0
-			OR custom_routes_enabled=1 OR dynamic_dns=1
-			OR COALESCE(strategy,'')='cookie'
-			OR enable_tls=1 OR COALESCE(tls_source,'')<>'manual' OR tls_http_redirect=1
-			OR COALESCE(block_page_stage1_id,0)<>0 OR COALESCE(block_page_stage1_status,0)<>0
-			OR COALESCE(block_page_stage3_id,0)<>0 OR COALESCE(block_page_stage3_status,0)<>0
-			OR COALESCE(log_enabled,0)<>0
-		)`)
+	res, err := tx.Exec(TCPRuleDeadFieldsResetSQL)
 	if err != nil {
 		return fmt.Errorf("failed to zero TCP dead fields: %w", err)
 	}
@@ -3890,8 +3913,8 @@ func migrateTCPRuleDeadFields() error {
 	// TCP 自愈族：TCP 渲染零消费路径规则（buildTCPProxyRoute 无自定义
 	// 路径分支）——custom_routes_enabled 归零后残留 path_rules 行成为孤儿，
 	// 随导出/备份导入被引用校验放大。与 SET 同事务删除（幂等：无 TCP 规则时
-	// 零行命中）。parity 钉测试逐字比对两侧 DELETE 字面量。
-	pathRes, err := tx.Exec(`DELETE FROM path_rules WHERE rule_id IN (SELECT caddy_id FROM lb_rules WHERE protocol='tcp')`)
+	// 零行命中）。字面量单源=TCPRulePathRulesResetSQL（导入归一共用）。
+	pathRes, err := tx.Exec(TCPRulePathRulesResetSQL)
 	if err != nil {
 		return fmt.Errorf("failed to delete TCP rule path rules: %w", err)
 	}

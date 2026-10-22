@@ -307,8 +307,8 @@ func TestTxApplyDefersRenderDegradationAuditUntilCommit(t *testing.T) {
 	if _, err := tx.Exec(`UPDATE global_config SET trusted_proxy_enabled=1, trusted_proxy_ranges='not-json' WHERE id=1`); err != nil {
 		t.Fatalf("tx update: %v", err)
 	}
-	// When：事务内 apply（persist=false）
-	if err := h.caddyService.ApplyConfigFromTx(tx); err != nil {
+	// When：事务内 apply（persist=false；事务只写 global_config → 补查门控 false）
+	if err := h.caddyService.ApplyConfigFromTx(tx, false); err != nil {
 		t.Fatalf("tx apply: %v", err)
 	}
 	if msg := services.LastRenderDegradation(); msg == "" {

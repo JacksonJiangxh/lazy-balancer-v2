@@ -37,7 +37,7 @@ func clusterVersionMiddleware(database *sql.DB) gin.HandlerFunc {
 					return
 				}
 			}
-			_ = c.Error(installErr)
+			_ = c.Error(installErr) // 请求日志尾部列输出（requestLogFormatter 消费 ErrorMessage）
 			c.AbortWithStatusJSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "集群版本触发器不可用"})
 			return
 		}

@@ -157,7 +157,7 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	}
 	// 本地重建哈希用于漂移检测：记录哈希与主节点一致但本地数据不符时，
 	// 哈希跳过让位于强制重放，避免数据丢失被永久掩盖。
-	skip := computeSectionSkips(s.db, snapshot, switches, previous.SectionHashes)
+	skip := computeSectionSkips(ctx, s.db, snapshot, switches, previous.SectionHashes)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("开始快照事务: %w", err)
@@ -266,17 +266,26 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	// 漂移强制重放后本地数据已镜像主节点——drifted 节必须存本地重建口径哈希作为
 	// 稳定参照，否则跨构建口径分歧时（如 COALESCE 加固前后）漂移判定永远不一致、
 	// 每周期全量重拉+Caddy 重载。
-	recordAppliedSectionHashes(s.db, snapshot, skip, switches, previous.SectionHashes)
+	bookkeepingErr := recordAppliedSectionHashes(ctx, s.db, snapshot, skip, switches, previous.SectionHashes)
+	if bookkeepingErr != nil {
+		// 记账失败不回滚已提交的快照应用（本地数据已镜像主节点），但必须
+		// 可见：漂移/跳过判定在下轮起失真前，节流审计暴露该故障。
+		detail := fmt.Sprintf("记录已应用节哈希失败: %v", bookkeepingErr)
+		if s.syncFailureAuditDue("同步失败", "集群同步", detail) {
+			RecordAuditLog("system", "同步失败", "集群同步", detail, "")
+		}
+	}
 	logSyncSwitchGuards(s.db, snapshot, skip, switches)
 
-	// 门控必须与漂移判定同口径开路：wafFilesDrifted 比较含版本标签的节
-	// 哈希，wafFilesRefDiffers 只比较内容 sha。内容一致而标签分叉时（如
-	// .version 陈旧），仅 sha 比较会把本分支短路，
-	// rewriteVersionIfMissingOrStale 永不执行——304 分支兜底重拉 → 应用
-	// 跳过 → 每周期全量重拉死循环（主节点「同步下发」审计随之刷屏）。
+	// 门控常态只走 wafFilesDrifted（stat 签名缓存 + 含版本标签的记账比对），
+	// 不再每次 apply 对 CRS 全树 tar.gz+xdb 做全量内容哈希；仅当本轮记账
+	// 写入失败（applied_waf_ref_* 不可信）时回退 wafFilesRefDiffers 的
+	// 「不依赖 DB 记账」内容哈希兜底——标签分叉（如 .version 陈旧）由
+	// wafFilesDrifted 的含标签比对开路，内容哈希比较只作记账失败时的补充，
+	// 不会短路标签自愈（fetch 路径内 rewriteVersionIfMissingOrStale）。
 	// changed 标志在函数作用域声明，供末段条件重载判定。
 	var crsChanged, xdbChanged, threatChanged bool
-	if switches.Security && (wafFilesRefDiffers(snapshot.WafFiles) || s.wafFilesDrifted(ctx)) {
+	if switches.Security && (s.wafFilesDrifted(ctx) || (bookkeepingErr != nil && wafFilesRefDiffers(snapshot.WafFiles))) {
 		// 同步校验/应用只写应用日志与审计，不写其他任务的三库日志。
 		bundle, ferr := s.fetchWafFiles(ctx, snapshot.WafFiles)
 		// 调用点持 WafFileLock——与 lbbak 导入
@@ -1381,15 +1390,10 @@ func insertSnapshotPathRules(ctx context.Context, tx *sql.Tx, ruleID string, pat
 	return nil
 }
 
-const (
-	snapshotSecurityEventsRetentionDaysMax = 3650
-	snapshotSecurityEventsRowCapMax        = 100000000
-)
-
 func updateSnapshotSettings(ctx context.Context, tx *sql.Tx, snapshot models.ClusterSnapshot) error {
 	settings := snapshot.BasicSettings
 	if settings.JWTExpireMinutes != nil && (*settings.JWTExpireMinutes <= 0 || *settings.JWTExpireMinutes > 1440) {
-		settings.JWTExpireMinutes = new(20)
+		settings.JWTExpireMinutes = new(db.DefaultJWTExpireMinutes)
 	}
 	var baseClauses []string
 	var baseArgs []any
@@ -1627,7 +1631,7 @@ func updateSnapshotSettings(ctx context.Context, tx *sql.Tx, snapshot models.Clu
 	// 携带——跳过写入保留从端本地值，不清零；新主端恒携带全组，升主即生效）。
 	if settings.SecurityEventsRetentionDays != nil {
 		days := *settings.SecurityEventsRetentionDays
-		if days <= 0 || days > snapshotSecurityEventsRetentionDaysMax {
+		if days <= 0 || days > db.MaxSecurityEventsRetentionDays {
 			days = securityEventsRetentionDefaultDays
 		}
 		settingClauses = append(settingClauses, "security_events_retention_days=?")
@@ -1635,7 +1639,7 @@ func updateSnapshotSettings(ctx context.Context, tx *sql.Tx, snapshot models.Clu
 	}
 	if settings.SecurityEventsRowCap != nil {
 		rowCap := *settings.SecurityEventsRowCap
-		if rowCap <= 0 || rowCap > snapshotSecurityEventsRowCapMax {
+		if rowCap <= 0 || rowCap > db.MaxSecurityEventsRowCap {
 			rowCap = securityEventsRetentionDefaultMax
 		}
 		settingClauses = append(settingClauses, "security_events_row_cap=?")
@@ -1643,8 +1647,10 @@ func updateSnapshotSettings(ctx context.Context, tx *sql.Tx, snapshot models.Clu
 	}
 	if settings.ThreatTrafficSampleN != nil {
 		sample := *settings.ThreatTrafficSampleN
-		if sample != -1 && sample != 0 {
-			sample = -1
+		// 合法域=自适应默认或 0（关闭）；其余归一为默认（与装载侧
+		// cluster_snapshot.go 同常量，默认值单源）。
+		if sample != db.DefaultThreatTrafficSampleN && sample != 0 {
+			sample = db.DefaultThreatTrafficSampleN
 		}
 		settingClauses = append(settingClauses, "threat_traffic_sample_n=?")
 		settingArgs = append(settingArgs, sample)

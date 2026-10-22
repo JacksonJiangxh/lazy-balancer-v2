@@ -1,8 +1,9 @@
 package handlers
 
 // OIDC 集成(2026-09-17 v2.3.0,用户裁定方案):
-//   · 单提供商,4 项配置(issuer/client_id/client_secret/enabled)——端点经
-//     OIDC Discovery 自动获取,用户零高级配置
+//   · 单提供商,核心 4 项配置(issuer/client_id/client_secret/enabled)——端点经
+//     OIDC Discovery 自动获取,用户零高级配置;另支持可选访问白名单
+//     (allowed_email_domains/allowed_groups,缺省空=不限制,fail-visible 拒登)
 //   · OIDC 用户不绑定本地账号:每次首登独立 JIT 开户(auth_provider='oidc',
 //     默认普通角色),重复登录按 (issuer, subject) 命中
 //   · 写保护矩阵:绑本地 MFA→TOTP 弹码;OIDC 会话(auth_method=oidc)与本地
@@ -26,6 +27,8 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -48,6 +51,14 @@ type OIDCConfig struct {
 	ClientID     string `json:"client_id"`
 	ClientSecret string `json:"client_secret"`
 	DisplayName  string `json:"display_name"`
+	// AllowedEmailDomains / AllowedGroups JIT 与重复登录的访问白名单
+	// （可选，均空=不限制，保持历史行为）。JIT 开户默认 user 角色 ×
+	// 「所有登录用户全局只读（含证书私钥，已裁定设计）」意味着开启 OIDC 即对
+	// IdP 全体可认证用户开放面板只读——白名单是面板侧唯一收口。
+	// fail-visible：配置了名单但 IdP 未返回 email/groups 声明 → 拒登，
+	// 不静默放行。登录每次回调都判定（IdP 侧变更即时生效），不止首登 JIT。
+	AllowedEmailDomains []string `json:"allowed_email_domains,omitempty"`
+	AllowedGroups       []string `json:"allowed_groups,omitempty"`
 }
 
 // oidcStateEntry 登录跳转与回调之间的一次性状态(state 防 CSRF,nonce 防
@@ -157,6 +168,99 @@ func saveOIDCConfig(cfg OIDCConfig) error {
 		return fmt.Errorf("保存 OIDC 配置失败：影响行数 %d（global_config 行缺失）", affected)
 	}
 	return nil
+}
+
+// oidcAccessAllowed 访问白名单判定（单源，OIDC 回调每次登录调用）。
+// 两项名单均空=不限制（历史行为）。配置了 email 域名单 → email 声明必须
+// 存在且其域（@ 后部分，大小写不敏感）在名单内；配置了组名单 → groups
+// 声明必须存在且交集非空。IdP 不返回对应声明 = fail-visible 拒登，
+// 不静默放行。返回 (false, reason) 时 reason 供审计留痕。
+func oidcAccessAllowed(cfg OIDCConfig, email string, groups []string) (bool, string) {
+	if len(cfg.AllowedEmailDomains) > 0 {
+		if strings.TrimSpace(email) == "" {
+			return false, "IdP 未返回 email 声明（已配置域名单）"
+		}
+		domain := ""
+		if at := strings.LastIndex(email, "@"); at >= 0 {
+			domain = strings.ToLower(strings.TrimSpace(email[at+1:]))
+		}
+		matched := false
+		for _, d := range cfg.AllowedEmailDomains {
+			if domain == d {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false, "email 域不在允许范围"
+		}
+	}
+	if len(cfg.AllowedGroups) > 0 {
+		if len(groups) == 0 {
+			return false, "IdP 未返回 groups 声明（已配置组名单）"
+		}
+		matched := false
+		for _, want := range cfg.AllowedGroups {
+			for _, got := range groups {
+				if got == want {
+					matched = true
+					break
+				}
+			}
+			if matched {
+				break
+			}
+		}
+		if !matched {
+			return false, "groups 不在允许范围"
+		}
+	}
+	return true, ""
+}
+
+// oidcAllowedDomainRe 允许的 email 域条目形态（小写字母/数字/点/连字符，
+// 不含 @ 与空白）。规范化在写入侧完成（trim+小写+去空），校验失败 400。
+var oidcAllowedDomainRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$`)
+
+// normalizeOIDCAllowedDomains 写入侧规范化 email 域名单：trim+小写、去空去重、
+// 逐条形态校验。顺序保持（管理语义：列表即配置）。
+func normalizeOIDCAllowedDomains(raw []string) ([]string, error) {
+	out := make([]string, 0, len(raw))
+	seen := map[string]struct{}{}
+	for _, item := range raw {
+		d := strings.ToLower(strings.TrimSpace(item))
+		if d == "" {
+			continue
+		}
+		if !oidcAllowedDomainRe.MatchString(d) || strings.Contains(d, "..") {
+			return nil, fmt.Errorf("允许的 email 域 %q 无效（应形如 example.com）", item)
+		}
+		if _, dup := seen[d]; dup {
+			continue
+		}
+		seen[d] = struct{}{}
+		out = append(out, d)
+	}
+	return out, nil
+}
+
+// normalizeOIDCAllowedGroups 写入侧规范化组名单：trim、去空去重
+// （组名大小写敏感——IdP 组声明原样匹配）。
+func normalizeOIDCAllowedGroups(raw []string) []string {
+	out := make([]string, 0, len(raw))
+	seen := map[string]struct{}{}
+	for _, item := range raw {
+		g := strings.TrimSpace(item)
+		if g == "" {
+			continue
+		}
+		if _, dup := seen[g]; dup {
+			continue
+		}
+		seen[g] = struct{}{}
+		out = append(out, g)
+	}
+	return out
 }
 
 // oidcProvider 按 issuer 获取(带缓存的 discovery)。
@@ -740,11 +844,12 @@ func (h *Handlers) OIDCCallback(c *gin.Context) {
 		return
 	}
 	var claims struct {
-		Sub               string `json:"sub"`
-		Nonce             string `json:"nonce"`
-		Email             string `json:"email"`
-		PreferredUsername string `json:"preferred_username"`
-		Name              string `json:"name"`
+		Sub               string   `json:"sub"`
+		Nonce             string   `json:"nonce"`
+		Email             string   `json:"email"`
+		PreferredUsername string   `json:"preferred_username"`
+		Name              string   `json:"name"`
+		Groups            []string `json:"groups"`
 	}
 	if err := idToken.Claims(&claims); err != nil {
 		fail("解析用户信息失败", "OIDC claims 解析失败")
@@ -758,6 +863,12 @@ func (h *Handlers) OIDCCallback(c *gin.Context) {
 	// oidc_subject='' 同一行——fail-visible，不建空主体身份。
 	if strings.TrimSpace(claims.Sub) == "" {
 		fail("提供商未返回用户标识(sub)", "OIDC 缺少 sub")
+		return
+	}
+	// 访问白名单（可选，缺省空=不限制）：每次回调都判定（IdP 侧变更即时
+	// 生效），先于身份命中/JIT——不在名单内的主体连 JIT 开户都不发生。
+	if allowed, reason := oidcAccessAllowed(cfg, claims.Email, claims.Groups); !allowed {
+		fail("账号不在允许登录的范围，请联系管理员", "OIDC 白名单拒绝："+reason)
 		return
 	}
 
@@ -910,6 +1021,9 @@ func (h *Handlers) OIDCSettings(c *gin.Context) {
 		"client_secret_masked": masked, "has_secret": cfg.ClientSecret != "",
 		"display_name":  cfg.DisplayName,
 		"callback_hint": "/api/v1/auth/oidc/callback",
+		// 访问白名单回显（admin 端点，值非敏感——域/组名本就是配置面数据）。
+		"allowed_email_domains": cfg.AllowedEmailDomains,
+		"allowed_groups":        cfg.AllowedGroups,
 	}})
 }
 
@@ -922,11 +1036,13 @@ func (h *Handlers) OIDCSettingsUpdate(c *gin.Context) {
 		return
 	}
 	var req struct {
-		Enabled      *bool   `json:"enabled"`
-		Issuer       *string `json:"issuer"`
-		ClientID     *string `json:"client_id"`
-		ClientSecret *string `json:"client_secret"`
-		DisplayName  *string `json:"display_name"`
+		Enabled             *bool     `json:"enabled"`
+		Issuer              *string   `json:"issuer"`
+		ClientID            *string   `json:"client_id"`
+		ClientSecret        *string   `json:"client_secret"`
+		DisplayName         *string   `json:"display_name"`
+		AllowedEmailDomains *[]string `json:"allowed_email_domains"`
+		AllowedGroups       *[]string `json:"allowed_groups"`
 	}
 	if !guardConfiguredJSONBody(c) {
 		return
@@ -972,6 +1088,18 @@ func (h *Handlers) OIDCSettingsUpdate(c *gin.Context) {
 	}
 	if req.DisplayName != nil {
 		cfg.DisplayName = strings.TrimSpace(*req.DisplayName)
+	}
+	// 访问白名单（可选）：nil=不动，空数组=清除（恢复不限制）。
+	if req.AllowedEmailDomains != nil {
+		domains, derr := normalizeOIDCAllowedDomains(*req.AllowedEmailDomains)
+		if derr != nil {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: derr.Error()})
+			return
+		}
+		cfg.AllowedEmailDomains = domains
+	}
+	if req.AllowedGroups != nil {
+		cfg.AllowedGroups = normalizeOIDCAllowedGroups(*req.AllowedGroups)
 	}
 	// 启用前置门:issuer+client_id+secret 三者齐备才允许 enabled=true。
 	if cfg.Enabled && (cfg.Issuer == "" || cfg.ClientID == "" || cfg.ClientSecret == "") {
@@ -1022,6 +1150,18 @@ func oidcConfigUpdateAuditDetail(before, after OIDCConfig) string {
 	}
 	if before.DisplayName != after.DisplayName {
 		changed = append(changed, "展示名称："+shown(before.DisplayName)+"→"+shown(after.DisplayName))
+	}
+	listText := func(v []string) string {
+		if len(v) == 0 {
+			return "（不限制）"
+		}
+		return strings.Join(v, ",")
+	}
+	if !slices.Equal(before.AllowedEmailDomains, after.AllowedEmailDomains) {
+		changed = append(changed, "允许的 email 域："+listText(before.AllowedEmailDomains)+"→"+listText(after.AllowedEmailDomains))
+	}
+	if !slices.Equal(before.AllowedGroups, after.AllowedGroups) {
+		changed = append(changed, "允许的组："+listText(before.AllowedGroups)+"→"+listText(after.AllowedGroups))
 	}
 	if len(changed) == 0 {
 		return "认证集成（无字段变化）"

@@ -162,14 +162,9 @@ func (s *ClusterService) ConfirmRegistration(ctx context.Context, token string) 
 		return fmt.Errorf("读取集群令牌确认结果: %w", err)
 	}
 	if updated == 0 {
-		isMaster, roleErr := RoleOf(ctx, s.db)
-		if roleErr != nil {
-			return fmt.Errorf("复核节点角色: %w", roleErr)
-		}
-		if !isMaster {
-			return ErrNotMasterNode
-		}
-		return ErrInvalidClusterAuth
+		// 角色复核单源 masterScopeMissError：已降级 → ErrNotMasterNode(403)，
+		// 主节点下的 0 行 → 令牌不匹配（ErrInvalidClusterAuth）。
+		return s.masterScopeMissError(ctx, ErrInvalidClusterAuth)
 	}
 	return nil
 }
@@ -186,9 +181,18 @@ func (s *ClusterService) cachedSnapshot(ctx context.Context) (models.ClusterSnap
 	}
 	defer tx.Rollback()
 
+	// 版本读取与角色复核并入同一行读取（零额外查询，304 轮也执行）：
+	// handler 的 requireMaster 与本读之间无共享锁，BecomeSlave 可在窗口内
+	// 提交 is_master=0——读路径不带角色条件时降级瞬间仍会下发一次完整
+	// 快照（含用户 hash/证书私钥/凭据）。is_master=0 即返回降级哨兵，
+	// handler 映射 403（从端 Pull 已有「目标降级，可重试」分类）。
+	var isMaster int
 	var version int
-	if err := tx.QueryRowContext(ctx, "SELECT COALESCE(cluster_version,0) FROM global_config WHERE id=1").Scan(&version); err != nil {
+	if err := tx.QueryRowContext(ctx, "SELECT COALESCE(is_master,1), COALESCE(cluster_version,0) FROM global_config WHERE id=1").Scan(&isMaster, &version); err != nil {
 		return models.ClusterSnapshot{}, nil, "", fmt.Errorf("读取集群版本: %w", err)
+	}
+	if isMaster == 0 {
+		return models.ClusterSnapshot{}, nil, "", ErrNotMasterNode
 	}
 	ownershipHash, err := snapshotOwnershipHash(ctx, tx)
 	if err != nil {

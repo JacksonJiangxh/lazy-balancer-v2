@@ -369,7 +369,7 @@ func TestAdminAPIKeyReadOnlySettingIsUnchanged(t *testing.T) {
 	ctx.Set("user_id", 1)
 	ctx.Set("role", "admin")
 
-	(&Handlers{}).CreateAPIKey(ctx)
+	(&Handlers{}).CreateCurrentUserAPIKey(ctx)
 
 	if recorder.Code != http.StatusCreated {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
@@ -579,5 +579,31 @@ func TestUpdateAPIKey_auditDetailRecordsSecurityDelta(t *testing.T) {
 		if !strings.Contains(detail, want) {
 			t.Fatalf("audit detail=%q, want 含 %q", detail, want)
 		}
+	}
+}
+
+// 创建路径与删除路径同形守卫：认证上下文缺失（user_id 缺/类型未知 → 0）时
+// 必须 401——不得写入 created_by=0 的孤儿 Key（配额按 0 计数且列表 JOIN
+// users 隐藏它，不可见但可用）。
+func TestCreateAPIKey_missingUserContextRejected(t *testing.T) {
+	setupAPIKeyTestDB(t)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/v1/users/me/api-keys", strings.NewReader(`{"name":"orphan"}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	ctx.Set("role", "admin")
+	// 刻意不置 user_id——生产链 jwtAuth/apiKeyAuth 必写，此为防御门。
+
+	(&Handlers{}).CreateCurrentUserAPIKey(ctx)
+
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s, want 401（认证上下文缺失）", recorder.Code, recorder.Body.String())
+	}
+	var orphanKeys int
+	if err := db.DB.QueryRow("SELECT COUNT(*) FROM api_keys WHERE created_by=0").Scan(&orphanKeys); err != nil {
+		t.Fatal(err)
+	}
+	if orphanKeys != 0 {
+		t.Fatalf("orphan keys=%d, want 0（不得写入 created_by=0 的孤儿 Key）", orphanKeys)
 	}
 }

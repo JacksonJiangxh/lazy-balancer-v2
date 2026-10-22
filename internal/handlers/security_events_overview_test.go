@@ -1475,3 +1475,24 @@ func TestTruncateEventListBody_base64PayloadAlignment(t *testing.T) {
 		}
 	}
 }
+
+// 事件列表 total/events 含私网/保留地址，与总览 includes_reserved 同键披露
+// （大屏 rollup 排除私网/保留——三面口径对称后跨面比数不等时有据可查）。
+func TestListSecurityEvents_disclosesIncludesReserved(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	recorder := getRequest(t, newSecurityEventsRouter(t), "/security/events")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var payload struct {
+		Data struct {
+			IncludesReserved *bool `json:"includes_reserved"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Data.IncludesReserved == nil || !*payload.Data.IncludesReserved {
+		t.Fatalf("includes_reserved=%v, want true（口径披露与安全总览同键）", payload.Data.IncludesReserved)
+	}
+}

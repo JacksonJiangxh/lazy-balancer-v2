@@ -44,7 +44,7 @@ func overrideWafPathsForServicesTest(t *testing.T) (crsDir, xdbPath string) {
 func TestReadAppliedSectionHashes_iterationErrorDropsPartialView(t *testing.T) {
 	fake := sql.OpenDB(&fakeIterErrConnector{failNeedle: "FROM cluster_applied_sections"})
 	t.Cleanup(func() { _ = fake.Close() })
-	if got := readAppliedSectionHashes(fake); got != nil {
+	if got := readAppliedSectionHashes(context.Background(), fake); got != nil {
 		t.Fatalf("iteration error returned partial applied hashes: %#v", got)
 	}
 }
@@ -89,7 +89,7 @@ func TestComputeSectionSkips_switchOffAndHashMatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sk := computeSectionSkips(database, snapshot, switches, nil)
+	sk := computeSectionSkips(context.Background(), database, snapshot, switches, nil)
 
 	if !sk.disabled["rules"] {
 		t.Fatal("rules switch off must mark section disabled")
@@ -117,7 +117,7 @@ func TestComputeSectionSkips_allOnFirstSyncAppliesEverything(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sk := computeSectionSkips(database, snapshot, switches, nil)
+	sk := computeSectionSkips(context.Background(), database, snapshot, switches, nil)
 	for _, key := range []string{"users", "rules", "security"} {
 		if sk.skip(key) {
 			t.Fatalf("first sync with all switches on must apply %s", key)
@@ -225,7 +225,9 @@ func TestRecordAppliedSectionHashes_wafFilesBookkeepingFollowsSecuritySwitch(t *
 	snapshot := models.ClusterSnapshot{Version: 9, WafFiles: &models.ClusterWafFilesRef{CRSSha256: "abc", CRSVersion: "v9"}}
 	switches := SyncSwitches{Users: true, Rules: true, Security: true}
 	sk := &sectionSkips{disabled: map[string]bool{}, unchanged: map[string]bool{}}
-	recordAppliedSectionHashes(database, snapshot, sk, switches, nil)
+	if err := recordAppliedSectionHashes(context.Background(), database, snapshot, sk, switches, nil); err != nil {
+		t.Fatalf("record applied section hashes: %v", err)
+	}
 
 	wantHash, err := wafFilesSectionHash(snapshot.WafFiles)
 	if err != nil {
@@ -245,7 +247,9 @@ func TestRecordAppliedSectionHashes_wafFilesBookkeepingFollowsSecuritySwitch(t *
 	if _, err := database.Exec(`UPDATE global_config SET applied_waf_ref_hash='stale' WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
-	recordAppliedSectionHashes(database, snapshot, sk, SyncSwitches{Users: true, Rules: true, Security: false}, nil)
+	if err := recordAppliedSectionHashes(context.Background(), database, snapshot, sk, SyncSwitches{Users: true, Rules: true, Security: false}, nil); err != nil {
+		t.Fatalf("record applied section hashes: %v", err)
+	}
 	if err := database.QueryRow(`SELECT COALESCE(applied_waf_ref_hash,'') FROM global_config WHERE id=1`).Scan(&hash); err != nil || hash != "stale" {
 		t.Fatalf("security off must freeze the bookkeeping columns, got hash=%q err=%v", hash, err)
 	}
@@ -259,10 +263,6 @@ func TestWafFilesDrifted_securitySwitchOffReturnsFalse(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(xdbPath, []byte("XDB"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	localHash, err := wafFilesSectionHash(BuildWafFileRef())
-	if err != nil {
 		t.Fatal(err)
 	}
 	seedAppliedWafRefHash(t, database, "definitely-different-hash")
@@ -280,7 +280,6 @@ func TestWafFilesDrifted_securitySwitchOffReturnsFalse(t *testing.T) {
 	if !service.wafFilesDrifted(context.Background()) {
 		t.Fatal("wafFilesDrifted must detect local/applied divergence with security switch on")
 	}
-	_ = localHash
 }
 
 // 开关读取失败必须留痕（与 driftedSections 的「重建失败，跳过漂移检测」同族）：
@@ -361,7 +360,9 @@ func TestRecordAppliedSectionHashes_persistsAndUpdates(t *testing.T) {
 	snapshot := models.ClusterSnapshot{Version: 7}
 	snapshot.SectionHashes = map[string]string{"rules": "r7"}
 	switches := SyncSwitches{Rules: true}
-	recordAppliedSectionHashes(database, snapshot, &sectionSkips{disabled: map[string]bool{}, unchanged: map[string]bool{}}, switches, nil)
+	if err := recordAppliedSectionHashes(context.Background(), database, snapshot, &sectionSkips{disabled: map[string]bool{}, unchanged: map[string]bool{}}, switches, nil); err != nil {
+		t.Fatalf("record applied section hashes: %v", err)
+	}
 
 	var hash string
 	var version int
@@ -371,7 +372,9 @@ func TestRecordAppliedSectionHashes_persistsAndUpdates(t *testing.T) {
 
 	// switch-off sections must not be recorded
 	snapshot.SectionHashes = map[string]string{"users": "u7"}
-	recordAppliedSectionHashes(database, snapshot, &sectionSkips{disabled: map[string]bool{"users": true}, unchanged: map[string]bool{}}, SyncSwitches{Users: false}, nil)
+	if err := recordAppliedSectionHashes(context.Background(), database, snapshot, &sectionSkips{disabled: map[string]bool{"users": true}, unchanged: map[string]bool{}}, SyncSwitches{Users: false}, nil); err != nil {
+		t.Fatalf("record applied section hashes: %v", err)
+	}
 	var count int
 	database.QueryRow("SELECT COUNT(*) FROM cluster_applied_sections WHERE section='users'").Scan(&count)
 	if count != 0 {
@@ -447,11 +450,13 @@ func TestRecordAppliedSectionHashes_driftedSectionStoresLocalRebuiltHash(t *test
 	switches := SyncSwitches{Users: true, Rules: true, Security: true}
 
 	// When：漂移强制重放后记录已应用节哈希
-	recordAppliedSectionHashes(database, snapshot, sk, switches, local)
+	if err := recordAppliedSectionHashes(context.Background(), database, snapshot, sk, switches, local); err != nil {
+		t.Fatalf("record applied section hashes: %v", err)
+	}
 
 	// Then：漂移节必须落本地重建口径——下一 304 周期 driftGuardSectionHashes
 	// 与 cluster_applied_sections 一致（收敛），不再触发全量重拉。
-	applied := readAppliedSectionHashes(database)
+	applied := readAppliedSectionHashes(context.Background(), database)
 	if applied["security"] != localView {
 		t.Fatalf("漂移节必须存本地重建哈希作为稳定参照：got %q, want local %q（存快照侧旧口径 %q 会让漂移判定每周期复发）", applied["security"], localView, oldView)
 	}
@@ -467,10 +472,12 @@ func TestRecordAppliedSectionHashes_sameBuildDriftedChoiceImmaterial(t *testing.
 	sk := &sectionSkips{disabled: map[string]bool{}, unchanged: map[string]bool{}, drifted: []string{"security"}}
 
 	// When
-	recordAppliedSectionHashes(database, snapshot, sk, SyncSwitches{Security: true}, local)
+	if err := recordAppliedSectionHashes(context.Background(), database, snapshot, sk, SyncSwitches{Security: true}, local); err != nil {
+		t.Fatalf("record applied section hashes: %v", err)
+	}
 
 	// Then
-	if applied := readAppliedSectionHashes(database); applied["security"] != "same-hash" {
+	if applied := readAppliedSectionHashes(context.Background(), database); applied["security"] != "same-hash" {
 		t.Fatalf("同构建：落库哈希必须等于双方一致值，got %q", applied["security"])
 	}
 }
@@ -534,9 +541,11 @@ func TestSectionSyncCycle_normalizationDivergenceConvergesAfterOneDriftCycle(t *
 	switches := SyncSwitches{Users: true, Rules: true, Security: true}
 
 	// When：模拟同步周期序列（首轮 changed 应用 → 304 漂移补偿 → 漂移重放 → 稳态）
-	sk1 := computeSectionSkips(database, master, switches, local)
-	recordAppliedSectionHashes(database, master, sk1, switches, local)
-	firstApplied := readAppliedSectionHashes(database)["security"]
+	sk1 := computeSectionSkips(context.Background(), database, master, switches, local)
+	if err := recordAppliedSectionHashes(context.Background(), database, master, sk1, switches, local); err != nil {
+		t.Fatalf("record applied section hashes: %v", err)
+	}
+	firstApplied := readAppliedSectionHashes(context.Background(), database)["security"]
 	if firstApplied != snapshotHash {
 		t.Fatalf("首轮 changed 路径应落快照侧哈希：got %q want %q", firstApplied, snapshotHash)
 	}
@@ -553,14 +562,16 @@ func TestSectionSyncCycle_normalizationDivergenceConvergesAfterOneDriftCycle(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	sk3 := computeSectionSkips(database, master, switches, localReplay)
+	sk3 := computeSectionSkips(context.Background(), database, master, switches, localReplay)
 	if !sk3.wasDrifted("security") {
 		t.Fatal("漂移重放周期必须把 security 标记为 drifted")
 	}
-	recordAppliedSectionHashes(database, master, sk3, switches, localReplay)
+	if err := recordAppliedSectionHashes(context.Background(), database, master, sk3, switches, localReplay); err != nil {
+		t.Fatalf("record applied section hashes: %v", err)
+	}
 
 	// Then：收敛——稳态 304 周期 local==applied，不再触发漂移补偿
-	applied := readAppliedSectionHashes(database)
+	applied := readAppliedSectionHashes(context.Background(), database)
 	if applied["security"] != localHash {
 		t.Fatalf("漂移重放后应落本地重建哈希：got %q want %q", applied["security"], localHash)
 	}
@@ -653,7 +664,7 @@ func TestUpdateSettings_rejectsDisablingSyncUsers(t *testing.T) {
 func TestComputeSectionSkips_neverDisablesUsers(t *testing.T) {
 	_, database := newClusterTestService(t)
 	sw := SyncSwitches{Users: false, Rules: true, Security: true}
-	sk := computeSectionSkips(database, models.ClusterSnapshot{SectionHashes: map[string]string{}}, sw, nil)
+	sk := computeSectionSkips(context.Background(), database, models.ClusterSnapshot{SectionHashes: map[string]string{}}, sw, nil)
 	if sk.disabled["users"] {
 		t.Error("users section must never be disabled (恒同步裁定)")
 	}

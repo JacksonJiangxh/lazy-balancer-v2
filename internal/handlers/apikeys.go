@@ -87,6 +87,9 @@ func (h *Handlers) ListCurrentUserAPIKeys(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: keys})
 }
 
+// CreateCurrentUserAPIKey 是唯一的创建入口——管理端路由 POST /api-keys
+// 直接复用本 handler（管理端无「指定属主」参数，属主恒为当前认证身份，
+// 与自助语义一致）；此前两个逐字相同的 handler 已收敛。
 func (h *Handlers) CreateCurrentUserAPIKey(c *gin.Context) {
 	createAPIKeyForUser(c, int(contextUserID(c)))
 }
@@ -179,6 +182,13 @@ func scanAPIKeys(rows *sql.Rows) ([]models.APIKeyWithUserResponse, error) {
 }
 
 func createAPIKeyForUser(c *gin.Context, userID int) {
+	// userID<=0 表示认证上下文缺失——与删除路径同形守卫：不得写入
+	// created_by=0 的孤儿 Key（配额按 0 计数，列表 JOIN users 隐藏它 →
+	// 不可见但可用）。生产链 jwtAuth/apiKeyAuth 必写 user_id，此为防御门。
+	if userID <= 0 {
+		c.JSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: "认证上下文缺失"})
+		return
+	}
 	// 导入窗口 409，先于解析 body。
 	if rejectWriteDuringImport(c, "执行 API 密钥写操作") {
 		return
@@ -324,10 +334,6 @@ func (h *Handlers) ListAPIKeys(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: keys})
-}
-
-func (h *Handlers) CreateAPIKey(c *gin.Context) {
-	createAPIKeyForUser(c, int(contextUserID(c)))
 }
 
 func (h *Handlers) UpdateCurrentUserAPIKeyStatus(c *gin.Context) {

@@ -1365,6 +1365,11 @@ func (t *securityEventsTailer) securityEventsGenerationGuard(offset int64) (int6
 		t.lastInfo = nil
 		t.stallOffset, t.stallCount = 0, 0
 		t.failOffset = -1
+		// 代际重放会把整份 audit.log 重新过一遍（新库为空，每行
+		// RowsAffected=1 全部再喂 autobanBatch）；自动封禁计数器在内存、
+		// 不随库重置——不重置则窗口内事件被二次计数，阈值提前达成误封。
+		// 重置后由重放按事件时间重建窗口计数，净效果=恰好一次。
+		ResetAutobanCounters()
 		if err := securityEventsWriteOffset(t.offsetPath, 0); err != nil {
 			return offset, fmt.Errorf("security events: persist offset reset for new library generation: %w", err)
 		}
@@ -2085,12 +2090,22 @@ type SecurityEventsIngestionStatus struct {
 	WriterIOErrors      uint64 `json:"writer_io_errors"`
 	WriterDegraded      bool   `json:"writer_degraded"`
 	WriterLastFailureAt string `json:"writer_last_failure_at,omitempty"`
+	// WriterStatsUnavailable：侧车计数文件连续读取/解析失败达阈值——写侧
+	// 丢弃/IO 计数对外不可用（磁盘满/目录只读正是侧车要覆盖的故障形态），
+	// 计数恒 0 不代表无丢弃。
+	WriterStatsUnavailable bool `json:"writer_stats_unavailable,omitempty"`
 	// Skipped* 是摄取侧「畸形区跳过」累计（跳过=该段审计数据的事件永久
 	// 丢弃）：与写侧计数同为一等健康信号——窗口内（15min）有跳过即降级，
 	// 累计量供事件列表/总览/大屏三面披露与任务日志边沿留痕。
 	SkippedBytes   uint64 `json:"skipped_bytes"`
 	SkippedRegions uint64 `json:"skipped_regions"`
 	LastSkipAt     string `json:"last_skip_at,omitempty"`
+	// DataLoss 与 WriterDegraded 分离表达：degraded 只回答「当前窗口内是否
+	// 仍在失败」（窗口滑出即恢复），data_loss 回答「本进程启动以来是否曾
+	// 永久丢失事件」（写侧丢弃/写盘错误累计>0 或畸形区跳过>0）——丢失事实
+	// 不随窗口滑出而消失，进程重启或测试重置才清零。前端据此区分
+	// 「正在失败」与「曾丢失 N 条」两类文案。
+	DataLoss bool `json:"data_loss"`
 }
 
 var securityEventsIngestionHealth struct {
@@ -2173,6 +2188,8 @@ func securityEventsAuditWriterStatsPath() string {
 // securityEventsWriterHealth 是侧车计数的进程内累计状态：baseline 是上一次
 // 观测到的插件计数（插件重启计数回落时按新基线处理），totals 是本进程启动
 // 以来实际观测到的失败量，window* 是「窗口内失败量」（阈值判据）。
+// sidecar* 是侧车文件自身的可用性：读取/解析连续失败达阈值即「写侧计数
+// 不可用」——磁盘满/目录只读正是侧车要覆盖的故障形态，双向失效不得静默。
 var securityEventsWriterHealth struct {
 	mu              sync.Mutex
 	baselineDropped uint64
@@ -2182,13 +2199,28 @@ var securityEventsWriterHealth struct {
 	windowStart     time.Time
 	windowFailures  uint64
 	lastFailureAt   time.Time
+	// sidecarReadFailures 连续读取/解析失败计数（文件缺失不计——插件未
+	// 产生失败/未启动是正常形态）；sidecarLastOK 是最近一次成功读取时间。
+	sidecarReadFailures int
+	sidecarLastOK       time.Time
 }
 
 // securityEventsObserveAuditWriterStats 读取插件侧车计数并累计增量。文件缺失
-// （插件未产生失败/未启动）与畸形内容都视为「本轮无信号」，不改变状态。
+// （插件未产生失败/未启动）视为「本轮无信号」且复位连续失败计数；读取/解析
+// 失败计入 sidecarReadFailures——侧车不可用时写侧丢弃/IO 计数恒 0，
+// 必须由 writer_stats_unavailable 健康信号暴露而非保持假绿。
 func securityEventsObserveAuditWriterStats() {
 	data, err := os.ReadFile(securityEventsAuditWriterStatsPath())
 	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			securityEventsWriterHealth.mu.Lock()
+			securityEventsWriterHealth.sidecarReadFailures++
+			securityEventsWriterHealth.mu.Unlock()
+		} else {
+			securityEventsWriterHealth.mu.Lock()
+			securityEventsWriterHealth.sidecarReadFailures = 0
+			securityEventsWriterHealth.mu.Unlock()
+		}
 		return
 	}
 	var payload struct {
@@ -2196,6 +2228,9 @@ func securityEventsObserveAuditWriterStats() {
 		IOErrors uint64 `json:"io_errors"`
 	}
 	if err := json.Unmarshal(data, &payload); err != nil {
+		securityEventsWriterHealth.mu.Lock()
+		securityEventsWriterHealth.sidecarReadFailures++
+		securityEventsWriterHealth.mu.Unlock()
 		return
 	}
 	delta := func(current uint64, baseline *uint64) uint64 {
@@ -2209,6 +2244,8 @@ func securityEventsObserveAuditWriterStats() {
 	now := time.Now()
 	securityEventsWriterHealth.mu.Lock()
 	defer securityEventsWriterHealth.mu.Unlock()
+	securityEventsWriterHealth.sidecarReadFailures = 0
+	securityEventsWriterHealth.sidecarLastOK = now
 	droppedDelta := delta(payload.Dropped, &securityEventsWriterHealth.baselineDropped)
 	ioDelta := delta(payload.IOErrors, &securityEventsWriterHealth.baselineIO)
 	securityEventsWriterHealth.droppedTotal += droppedDelta
@@ -2277,8 +2314,10 @@ func securityEventsSkipHealthSnapshot() (skippedBytes, skippedRegions uint64, de
 	return skippedBytes, skippedRegions, degraded, lastSkipAt
 }
 
-// securityEventsWriterHealthSnapshot 返回累计计数与窗口内是否降级。
-func securityEventsWriterHealthSnapshot() (dropped, ioErrors uint64, degraded bool, lastFailureAt time.Time) {
+// securityEventsWriterHealthSnapshot 返回累计计数、窗口内是否降级，以及侧车
+// 计数是否不可用（连续读取/解析失败达阈值——侧车双向失效时写侧计数恒 0，
+// 不可用事实必须作为一等健康信号上抛）。
+func securityEventsWriterHealthSnapshot() (dropped, ioErrors uint64, degraded, statsUnavailable bool, lastFailureAt time.Time) {
 	securityEventsWriterHealth.mu.Lock()
 	defer securityEventsWriterHealth.mu.Unlock()
 	dropped, ioErrors = securityEventsWriterHealth.droppedTotal, securityEventsWriterHealth.ioTotal
@@ -2288,7 +2327,8 @@ func securityEventsWriterHealthSnapshot() (dropped, ioErrors uint64, degraded bo
 		securityEventsWriterHealth.windowFailures >= securityEventsWriterFailureThreshold {
 		degraded = true
 	}
-	return dropped, ioErrors, degraded, lastFailureAt
+	statsUnavailable = securityEventsWriterHealth.sidecarReadFailures >= securityEventsWriterFailureThreshold
+	return dropped, ioErrors, degraded, statsUnavailable, lastFailureAt
 }
 
 // securityEventsOverlayIngestionHealth 把进程级信号叠加到 tick 记账结果上：
@@ -2302,13 +2342,20 @@ func securityEventsOverlayIngestionHealth(status SecurityEventsIngestionStatus) 
 			status.Healthy = false
 		}
 	}
-	dropped, ioErrors, degraded, lastFailureAt := securityEventsWriterHealthSnapshot()
+	dropped, ioErrors, degraded, statsUnavailable, lastFailureAt := securityEventsWriterHealthSnapshot()
 	status.WriterDropped, status.WriterIOErrors = dropped, ioErrors
 	status.WriterDegraded = degraded
 	if !lastFailureAt.IsZero() {
 		status.WriterLastFailureAt = lastFailureAt.UTC().Format(time.RFC3339)
 	}
 	if degraded {
+		status.Observed = true
+		status.Healthy = false
+	}
+	// 侧车不可用=写侧计数不可信：与窗口降级同一位置暴露（计数恒 0 的
+	// 假绿比显式 unhealthy 更糟）。
+	if statsUnavailable {
+		status.WriterStatsUnavailable = true
 		status.Observed = true
 		status.Healthy = false
 	}
@@ -2324,6 +2371,9 @@ func securityEventsOverlayIngestionHealth(status SecurityEventsIngestionStatus) 
 		status.Observed = true
 		status.Healthy = false
 	}
+	// 丢失事实与「当前是否仍在失败」分离：任一侧的累计丢失>0 即置位，
+	// 窗口滑出 degraded 恢复后仍保持（见字段注释）。
+	status.DataLoss = dropped > 0 || ioErrors > 0 || skippedRegions > 0
 	return status
 }
 
@@ -2343,6 +2393,8 @@ func SecurityEventsSetIngestionHealthForTest(status SecurityEventsIngestionStatu
 	securityEventsWriterHealth.windowStart = time.Time{}
 	securityEventsWriterHealth.windowFailures = 0
 	securityEventsWriterHealth.lastFailureAt = time.Time{}
+	securityEventsWriterHealth.sidecarReadFailures = 0
+	securityEventsWriterHealth.sidecarLastOK = time.Time{}
 	securityEventsWriterHealth.mu.Unlock()
 	// 跳过累计同属健康位整体，重置时一并清空（防跨用例泄漏）。
 	securityEventsSkipHealth.mu.Lock()
@@ -2399,6 +2451,7 @@ func runIngestionLoop(ctx context.Context) error {
 	defer ticker.Stop()
 	var lastRotateFailureSummaryAt time.Time
 	lastWriterDegraded := false
+	lastWriterStatsUnavailable := false
 	// 畸形区跳过的边沿留痕基线（跳过=事件永久丢弃，必须进任务日志——
 	// 仅 Logf 应用日志会让排障翻不到任务日志）。
 	lastSkippedRegions := uint64(0)
@@ -2425,6 +2478,16 @@ func runIngestionLoop(ctx context.Context) error {
 					TaskLogf("security-events-ingestion", "audit-writer", "审计日志写侧失败已回落至阈值以下（累计丢弃 %d 条、写盘错误 %d 次）", status.WriterDropped, status.WriterIOErrors)
 				}
 				lastWriterDegraded = status.WriterDegraded
+			}
+			// 侧车不可用边沿留痕（磁盘满/目录只读时写侧计数对外恒 0，
+			// 假绿比显式不可用更糟）；恢复一行便于排障闭环。
+			if status.WriterStatsUnavailable != lastWriterStatsUnavailable {
+				if status.WriterStatsUnavailable {
+					TaskLogfWarn("security-events-ingestion", "audit-writer", "审计写侧计数侧车连续读取失败：写侧丢弃/写盘错误计数不可用（显示 0 不代表无丢弃），请检查审计日志目录的磁盘空间与权限")
+				} else {
+					TaskLogf("security-events-ingestion", "audit-writer", "审计写侧计数侧车读取已恢复")
+				}
+				lastWriterStatsUnavailable = status.WriterStatsUnavailable
 			}
 			// 轮转失败写任务摘要——此前任务日志仅在
 			// ingested>0 时留痕，轮转持续失败零可见性。2s 节拍下持续失败每

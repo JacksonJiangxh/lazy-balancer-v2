@@ -17,7 +17,7 @@ import (
 )
 
 func TestRequireMasterResult_truthTable(t *testing.T) {
-	options := masterGateOptions{queryFailure: "节点角色查询失败", forbidden: "仅主节点支持管理自动备份", errorCode: "master_required"}
+	options := masterGateOptions{queryFailure: "节点角色查询失败", forbidden: "仅主节点支持管理自动备份"}
 	for _, tc := range []struct {
 		name        string
 		isMaster    bool

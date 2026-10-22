@@ -1683,3 +1683,57 @@ func TestAuditPipeline_enqueueDropsWhenByteBudgetExceeded(t *testing.T) {
 		t.Fatalf("被丢弃条目不得落盘: %s", content)
 	}
 }
+
+// 侧车写盘失败必须可观测且可重试：失败时保留脏标记（下一 drain 节拍重试）
+// 并经 auditIOLogf 节流留痕——磁盘满/目录只读时侧车双向失效，静默 return
+// 会让写侧丢弃/IO 计数对面板恒 0（假绿）。
+func TestWriteWriterStatsIfDue_failureKeepsDirtyAndLogs(t *testing.T) {
+	var mu sync.Mutex
+	var logs []string
+	oldLog := auditIOLogf
+	auditIOLogf = func(format string, args ...any) {
+		mu.Lock()
+		logs = append(logs, fmt.Sprintf(format, args...))
+		mu.Unlock()
+	}
+	t.Cleanup(func() { auditIOLogf = oldLog })
+
+	target := filepath.Join(t.TempDir(), "audit.log")
+	// 侧车路径占位为目录 → WriteFile(tmp) 可行但 Rename(tmp, 目录) 失败。
+	sidecar := auditWriterStatsPath(target)
+	if err := os.Mkdir(sidecar, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := &auditPipeline{target: target, mode: 0o644}
+	p.dropped.Store(2)
+	p.statsDirty.Store(true)
+
+	p.writeWriterStatsIfDue(time.Now())
+
+	if !p.statsDirty.Load() {
+		t.Fatal("sidecar write failure must keep dirty flag（下节拍重试）")
+	}
+	mu.Lock()
+	if len(logs) == 0 {
+		mu.Unlock()
+		t.Fatal("sidecar write failure must be surfaced via auditIOLogf")
+	}
+	mu.Unlock()
+
+	// 故障排除后同一管线重试成功落盘。
+	if err := os.Remove(sidecar); err != nil {
+		t.Fatal(err)
+	}
+	p.lastStatsWrite = time.Time{} // 越过节流窗口直验重试
+	p.writeWriterStatsIfDue(time.Now().Add(auditWriterStatsInterval + time.Second))
+	if p.statsDirty.Load() {
+		t.Fatal("retry after recovery must clear dirty flag")
+	}
+	data, err := os.ReadFile(sidecar)
+	if err != nil {
+		t.Fatalf("sidecar not written after recovery: %v", err)
+	}
+	if !strings.Contains(string(data), `"dropped":2`) {
+		t.Fatalf("sidecar=%s, want dropped=2", data)
+	}
+}

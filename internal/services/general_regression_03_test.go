@@ -182,7 +182,7 @@ func TestReadAdminConfigBody_rejectsOversize(t *testing.T) {
 		StatusCode: http.StatusOK,
 		Body:       io.NopCloser(&spaceFillReader{remaining: caddyAdminConfigMaxBytes + 1}),
 	}
-	if _, err := readAdminConfigBody(resp); !errors.Is(err, errCaddyAdminConfigTooLarge) {
+	if _, err := ReadAdminConfigBody(resp); !errors.Is(err, errCaddyAdminConfigTooLarge) {
 		t.Fatalf("err=%v, want errCaddyAdminConfigTooLarge", err)
 	}
 }

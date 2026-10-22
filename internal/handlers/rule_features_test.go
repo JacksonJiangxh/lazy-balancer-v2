@@ -1048,7 +1048,7 @@ func TestRuleRelationBatchQueriesChunkLargeRuleSets(t *testing.T) {
 	if _, err := loadUpstreamsBatch(context.Background(), ids); err != nil {
 		t.Fatalf("load upstreams: %v", err)
 	}
-	if count := probe.count("FROM upstreams WHERE rule_id IN"); count != 3 {
+	if count := probe.count("FROM upstreams u WHERE rule_id IN"); count != 3 {
 		t.Errorf("上游批量查询 %d 次, want 3（1200/500 向上取整）", count)
 	}
 	if _, err := loadPathRulesBatch(context.Background(), ids); err != nil {
@@ -1056,5 +1056,33 @@ func TestRuleRelationBatchQueriesChunkLargeRuleSets(t *testing.T) {
 	}
 	if count := probe.count("FROM path_rules WHERE rule_id IN"); count != 3 {
 		t.Errorf("路径规则批量查询 %d 次, want 3（1200/500 向上取整）", count)
+	}
+}
+
+// LB-09：主动健康检查未启用时其专属字段（path/host/port）渲染零消费——
+// 保存侧归一清零并返回被清字段名（审计披露）；启用时零触碰。
+func TestNormalizeInactiveHealthCheckFields(t *testing.T) {
+	path, host, port := "/health", "probe.example.test", 8081
+	cleared := normalizeInactiveHealthCheckFields(false, &path, &host, &port)
+	if path != "" || host != "" || port != 0 {
+		t.Fatalf("active=false 必须清零三字段: path=%q host=%q port=%d", path, host, port)
+	}
+	if len(cleared) != 3 {
+		t.Fatalf("披露字段=%v, want 3 项", cleared)
+	}
+	if hint := inactiveHealthCheckAuditHint(cleared); !strings.Contains(hint, "health_check_path") || !strings.Contains(hint, "tcp_health_check_port") {
+		t.Fatalf("审计披露缺字段名: %q", hint)
+	}
+
+	// active=true：零触碰。
+	path2, host2, port2 := "/health", "probe.example.test", 8081
+	if got := normalizeInactiveHealthCheckFields(true, &path2, &host2, &port2); len(got) != 0 {
+		t.Fatalf("active=true 不得归一: %v", got)
+	}
+	if path2 != "/health" || host2 != "probe.example.test" || port2 != 8081 {
+		t.Fatalf("active=true 不得改值: %q %q %d", path2, host2, port2)
+	}
+	if inactiveHealthCheckAuditHint(nil) != "" {
+		t.Fatal("无清零时披露必须为空")
 	}
 }

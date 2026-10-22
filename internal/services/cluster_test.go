@@ -612,7 +612,7 @@ func TestClusterService_Promote_removes_old_master_pin_and_audits(t *testing.T) 
 	if _, err := database.Exec("UPDATE global_config SET is_master=0, master_url=?, cluster_token='secret' WHERE id=1", masterURL); err != nil {
 		t.Fatal(err)
 	}
-	pinPath, err := clusterPinPathForDatabase(database, "master.example:8443")
+	pinPath, err := clusterPinPath("", database, "master.example:8443")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -649,7 +649,7 @@ func TestClusterService_Promote_succeeds_when_pin_cleanup_fails_then_retries_on_
 	if _, err := database.Exec("UPDATE global_config SET is_master=0, master_url=?, cluster_token='secret' WHERE id=1", masterURL); err != nil {
 		t.Fatal(err)
 	}
-	pinPath, err := clusterPinPathForDatabase(database, "master.example:8443")
+	pinPath, err := clusterPinPath("", database, "master.example:8443")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -990,6 +990,11 @@ func TestSyncService_applySnapshot_invalidates_cache_only_after_commit(t *testin
 	snapshotA := v3SnapshotWithACMESection(models.ClusterSnapshot{Version: 1, Users: []models.ClusterUser{{ID: 1, Username: "user-a", PasswordHash: "hash", Role: "admin", IsEnabled: true}}, BasicSettings: models.ClusterBasicSettings{LogLevel: new("info"), Timezone: new("Asia/Shanghai")}})
 	if err := syncService.applySnapshot(context.Background(), snapshotA); err != nil {
 		t.Fatalf("apply snapshot A: %v", err)
+	}
+	// 快照读取是主节点-only 契约（读路径 SQL 角色复核）：缓存检查前切主角色
+	// （apply 直调路径的零值守卫不校验角色，语义不受影响）。
+	if _, err := database.Exec("UPDATE global_config SET is_master=1 WHERE id=1"); err != nil {
+		t.Fatal(err)
 	}
 	cachedA, _, err := service.Snapshot(context.Background(), 0, "", "")
 	if err != nil || len(cachedA.Users) != 1 || cachedA.Users[0].Username != "user-a" {

@@ -53,3 +53,69 @@ func TestLogin_lockedMessageReflectsRemainingMinutes(t *testing.T) {
 		t.Fatalf("body=%s, 不得为硬编码「10 分钟」", recorder.Body.String())
 	}
 }
+
+// 锁定时间的带外形态（导入/手工修库写入的 RFC3339）必须按时间值解析——
+// 字符串比较对「'T' > ' '」恒判已锁定且文案恒兜底全长；统一多格式解析后
+// 判定与剩余分钟均正确。
+func TestLogin_lockedMessageParsesRFC3339LockedUntil(t *testing.T) {
+	// Given：开启「登录失败锁定」+ RFC3339 形态锁定值（剩余约 3.5 分钟）
+	database := setupAuthTestDB(t)
+	if _, err := database.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, mfa_lockout_enabled INTEGER);
+		INSERT INTO global_config VALUES (1, 1)`); err != nil {
+		t.Fatalf("create global config: %v", err)
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte("Secret123!"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockedUntil := time.Now().UTC().Add(3*time.Minute + 30*time.Second).Format(time.RFC3339)
+	if _, err := database.Exec(`INSERT INTO users (username,password_hash,role,is_enabled,login_locked_until) VALUES ('locked',?,'admin',1,?)`, string(hash), lockedUntil); err != nil {
+		t.Fatalf("seed locked user: %v", err)
+	}
+	h := &Handlers{cfg: &config.Config{JWTSecret: "test-secret"}}
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/auth/login", h.Login)
+
+	// When
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/auth/login",
+		strings.NewReader(`{"username":"locked","password":"whatever"}`)))
+
+	// Then：429 且文案按 RFC3339 值派生剩余分钟（向上取整=4），非兜底 10
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("status=%d body=%s, want 429（RFC3339 锁值须判锁定）", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "请 4 分钟后重试") {
+		t.Fatalf("body=%s, want 「请 4 分钟后重试」（RFC3339 解析派生，非兜底全长）", recorder.Body.String())
+	}
+}
+
+// 已过期的锁定值按时间值比较判未锁——同日边界不再因字符串字典序误判。
+func TestLogin_expiredLockSameDayBoundaryNotLocked(t *testing.T) {
+	database := setupAuthTestDB(t)
+	if _, err := database.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, mfa_lockout_enabled INTEGER);
+		INSERT INTO global_config VALUES (1, 1)`); err != nil {
+		t.Fatalf("create global config: %v", err)
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte("Secret123!"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 锁定值已过期 1 分钟（UTC 同日或跨日均按时间值判定）
+	expired := time.Now().UTC().Add(-time.Minute).Format("2006-01-02 15:04:05")
+	if _, err := database.Exec(`INSERT INTO users (username,password_hash,role,is_enabled,login_locked_until) VALUES ('unlocked',?,'admin',1,?)`, string(hash), expired); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	h := &Handlers{cfg: &config.Config{JWTSecret: "test-secret"}}
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/auth/login", h.Login)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/auth/login",
+		strings.NewReader(`{"username":"unlocked","password":"Secret123!"}`)))
+	if recorder.Code == http.StatusTooManyRequests {
+		t.Fatalf("status=429 body=%s, want 非 429（过期锁值不得判锁定）", recorder.Body.String())
+	}
+}

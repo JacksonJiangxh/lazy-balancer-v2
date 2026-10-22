@@ -35,6 +35,34 @@ func TestRequestLogFormatterPrintsMethodAndPathOnce(t *testing.T) {
 	}
 }
 
+// c.Error() 附加的错误须有日志落点——formatter 尾部追加 ErrorMessage 列
+// （有值才输出）；无错误时列结构不变（上方列结构钉测覆盖）。
+func TestRequestLogFormatterAppendsErrorMessage(t *testing.T) {
+	withErr := requestLogFormatter(gin.LogFormatterParams{
+		TimeStamp:    time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC),
+		Method:       "POST",
+		StatusCode:   500,
+		Latency:      time.Millisecond,
+		ClientIP:     "192.0.2.1",
+		Path:         "/api/v1/rules",
+		ErrorMessage: "集群版本触发器不可用",
+	})
+	if !strings.Contains(withErr, "集群版本触发器不可用") {
+		t.Fatalf("ErrorMessage 未输出: %q", withErr)
+	}
+	withoutErr := requestLogFormatter(gin.LogFormatterParams{
+		TimeStamp:  time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC),
+		Method:     "GET",
+		StatusCode: 200,
+		Latency:    time.Millisecond,
+		ClientIP:   "192.0.2.1",
+		Path:       "/api/v1/rules",
+	})
+	if strings.Count(withoutErr, "|") != 3 {
+		t.Fatalf("无错误时列结构变化: %q（want 3 个分隔符，无尾部错误列）", withoutErr)
+	}
+}
+
 func TestShouldLogRequestAppliesConfiguredThreshold(t *testing.T) {
 	tests := []struct {
 		name    string

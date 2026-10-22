@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
@@ -154,7 +155,12 @@ func crsPoolFingerprintForChain() string {
 	return crsPoolFingerprint()
 }
 
+// crsPoolFingerprintEvals 是测试可观察的指纹求值计数器：批次级缓存的钉测
+// 断言同一轮全量渲染只求值一次（生产零消费，仅原子自增）。
+var crsPoolFingerprintEvals atomic.Int64
+
 func crsPoolFingerprint() string {
+	crsPoolFingerprintEvals.Add(1)
 	var version string
 	if db.DB == nil {
 		version = "unknown"

@@ -8,7 +8,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 	"lazy-balancer-v2/internal/services"
 )
@@ -27,6 +26,12 @@ func (h *Handlers) GetClusterSnapshot(c *gin.Context) {
 	sinceVersion, _ := strconv.Atoi(c.Query("since_version"))
 	snapshot, changed, err := h.clusterService.Snapshot(c.Request.Context(), sinceVersion, c.Query("fingerprint"), authenticatedClusterToken(c))
 	if err != nil {
+		if errors.Is(err, services.ErrNotMasterNode) {
+			// 降级竞态（requireMaster 门通过后角色翻转）：与服务层节点写族
+			// 同口径 403 + X-LB-Error-Code，从端 Pull 按「目标降级」分类重试。
+			clusterMasterForbidden(c, err)
+			return
+		}
 		clusterError(c, http.StatusInternalServerError, "生成集群快照失败", err)
 		return
 	}
@@ -64,11 +69,21 @@ func (h *Handlers) PullClusterSnapshot(c *gin.Context) {
 	// 主节点无同步对象：入口直接拒绝，不调 Pull——否则「主节点不能从其他
 	// 节点同步」会经 recordSyncError 写入 last_sync_error 且无自动清除路径，
 	// 节点页面持续显示假错误。前端按钮只对从节点渲染，此为后端防御。
-	// 门控查询失败时按主节点语义拒绝：放行会让主节点走 Pull
-	// 命中 errSyncMasterNoPull 返回 500 + 误导审计「同步失败」，实际
-	// 只是瞬时 DB 读错。400 文案与真主节点一致，前端无歧义。
-	if role, err := services.RoleOf(c.Request.Context(), db.DB); err != nil || role {
-		clusterError(c, http.StatusBadRequest, "主节点无需手动同步", err)
+	// 角色读取走 h.clusterService 句柄（与 GetClusterSnapshot/ForgetClusterPins
+	// 同口径，不直读全局 db.DB——多库注入时读错库会误判角色）；
+	// 装配缺失 503、角色查询失败 500（与 ForgetClusterPins 的 fail-closed
+	// 口径一致：瞬时 DB 故障不得伪装成「主节点」400 误导排障）。
+	if h.clusterService == nil {
+		clusterError(c, http.StatusServiceUnavailable, "集群服务未初始化", nil)
+		return
+	}
+	isMaster, roleErr := h.clusterService.IsMaster(c.Request.Context())
+	if roleErr != nil {
+		clusterError(c, http.StatusInternalServerError, "节点角色查询失败", roleErr)
+		return
+	}
+	if isMaster {
+		clusterError(c, http.StatusBadRequest, "主节点无需手动同步", nil)
 		return
 	}
 	// 与 SetClusterMode/Promote/

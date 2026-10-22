@@ -354,7 +354,7 @@ const configWatchdogHeartbeatRounds = 60
 
 // runningRuleRouteIDs 从 Caddy 运行配置收集规则路由 @id（lb_ 前缀），
 // 覆盖 http 与 layer4 两类服务器。
-// 读取/上限/状态分类统一委托 readAdminConfigBody（caddy.go）——
+// 读取/上限/状态分类统一委托 ReadAdminConfigBody（caddy.go）——
 // 32MB+1 超限探测、非 2xx 显式错误、超限返回 errCaddyAdminConfigTooLarge，
 // 与 GetConfig/getRunningConfigBytes 同源；裸 LimitReader 会让「超限」与
 // 「瞬时读失败」不可区分，超大部署漂移检测长期静默。
@@ -365,7 +365,7 @@ func runningRuleRouteIDs(adminURL string) (map[string]bool, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, err := readAdminConfigBody(resp)
+	body, err := ReadAdminConfigBody(resp)
 	if err != nil {
 		return nil, err
 	}

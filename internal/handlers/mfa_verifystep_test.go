@@ -27,6 +27,9 @@ import (
 // seedMfaVerifyStepUser 种 id=1 且已启用 MFA 的操作者，返回其 TOTP secret。
 func seedMfaVerifyStepUser(t *testing.T) string {
 	t.Helper()
+	// 登录后验码限流为进程内内存态——播种即清，防跨用例残留误中 429。
+	services.MFAResetVerifyAttemptsForTest()
+	t.Cleanup(services.MFAResetVerifyAttemptsForTest)
 	if _, err := db.DB.Exec("INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (1,'operator','x','admin',1)"); err != nil {
 		t.Fatalf("seed user: %v", err)
 	}

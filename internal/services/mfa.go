@@ -146,6 +146,72 @@ func MFALockoutEnabled() (bool, error) {
 	return v == 1, nil
 }
 
+// —— 登录后验码限流（仅限流不锁定，与「不计数不锁定」裁定相邻的独立层）——
+
+// 登录后 MFA 验码入口（verify-step/禁用/重绑确认/管理员重置前置验码）此前
+// 无任何速率门：6 位码 10⁶ 空间在会话有效期内可枚举，且共用全局 mfaMu 的
+// 持续灌压会拖慢全体用户登录。此处加 per-user 滑动窗限流：窗口内失败达上限
+// 后调用方回 429，验码成功清零。刻意不落库、不置锁（2026-09「登录后验码
+// 只提示不计数不锁定」裁定保持——本层只是速率收敛，重启即失的内存态）。
+const (
+	mfaVerifyAttemptLimit  = 5
+	mfaVerifyAttemptWindow = time.Minute
+)
+
+var mfaVerifyAttempts = struct {
+	sync.Mutex
+	failures map[int][]time.Time
+}{failures: make(map[int][]time.Time)}
+
+// mfaPruneVerifyAttemptsLocked 清理窗口外条目（调用方须持锁）。
+func mfaPruneVerifyAttemptsLocked(userID int, now time.Time) []time.Time {
+	kept := mfaVerifyAttempts.failures[userID][:0]
+	for _, at := range mfaVerifyAttempts.failures[userID] {
+		if now.Sub(at) < mfaVerifyAttemptWindow {
+			kept = append(kept, at)
+		}
+	}
+	if len(kept) == 0 {
+		delete(mfaVerifyAttempts.failures, userID)
+		return nil
+	}
+	mfaVerifyAttempts.failures[userID] = kept
+	return kept
+}
+
+// MFAVerifyAttemptLimited 报告该用户登录后验码是否已触发限流（滑动窗内
+// 失败次数达上限）。now 由调用方注入以便测试。
+func MFAVerifyAttemptLimited(userID int, now time.Time) bool {
+	mfaVerifyAttempts.Lock()
+	defer mfaVerifyAttempts.Unlock()
+	return len(mfaPruneVerifyAttemptsLocked(userID, now)) >= mfaVerifyAttemptLimit
+}
+
+// MFARecordVerifyAttemptFailure 记一次登录后验码失败（仅真验证码错误时调用；
+// 基础设施故障与业务态哨兵不计入）。
+func MFARecordVerifyAttemptFailure(userID int, now time.Time) {
+	mfaVerifyAttempts.Lock()
+	defer mfaVerifyAttempts.Unlock()
+	kept := mfaPruneVerifyAttemptsLocked(userID, now)
+	mfaVerifyAttempts.failures[userID] = append(kept, now)
+}
+
+// MFAClearVerifyAttempts 验码成功后清零该用户的限流计数（正常用户不被
+// 历史失败拖入 429）。
+func MFAClearVerifyAttempts(userID int) {
+	mfaVerifyAttempts.Lock()
+	delete(mfaVerifyAttempts.failures, userID)
+	mfaVerifyAttempts.Unlock()
+}
+
+// MFAResetVerifyAttemptsForTest 清空全部限流状态（仅测试：内存态跨用例残留
+// 会让同 user id 的后序用例误中 429）。
+func MFAResetVerifyAttemptsForTest() {
+	mfaVerifyAttempts.Lock()
+	mfaVerifyAttempts.failures = make(map[int][]time.Time)
+	mfaVerifyAttempts.Unlock()
+}
+
 // —— 登录二步挑战 ——
 
 // MFAIssueChallenge 密码验证通过后签发 5 分钟单次挑战令牌。

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -45,6 +46,57 @@ func TestGenerateCaddyConfig_txFallbackFillsCandidatesForPredicateMiss(t *testin
 	}
 }
 
+// 补查门控显式化：per-rule 补查只在「事务写过 lb_rules」（rulesWrittenInTx=true，
+// store 的规则视图与已提交视图可能分叉）时执行。UpdateConfig 形态的事务（只写
+// global_config）传 false——其 lb_rules 视图与 certSource 已提交视图恒一致，
+// 主候选查询已完备，补查是纯冗余（N 条无候选 acme 规则 × 每轮渲染一次 SELECT）。
+// false 时谓词 miss 规则按已提交视图渲染（无证书 → TLS 等待，any_tag 缺席）；
+// true 时保持补查语义（any_tag 在场）。
+func TestGenerateCaddyConfig_txFallbackGateHonorsRulesWrittenFlag(t *testing.T) {
+	useTemporaryCertDir(t)
+	_, database := newClusterTestService(t)
+	certPEM, keyPEM := matchingCertificatePair(t, "gated.test")
+
+	ctx := context.Background()
+	tx, err := database.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled,enable_tls,tls_source)
+		VALUES ('lb_gated_probe','gated-probe','http','gated.test',443,1,1,'acme_dns');
+		INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb_gated_probe','127.0.0.1',9445,1,1,'http');
+		INSERT INTO cert_jobs (rule_id,domain,status,cert_pem,key_pem) VALUES ('lb_gated_probe','gated.test','issued',?,?)`, certPEM, keyPEM); err != nil {
+		t.Fatalf("seed in tx: %v", err)
+	}
+
+	// rulesWrittenInTx=false（UpdateConfig 形态）：不补查 → 证书不入场。
+	gated := generateCaddyConfigWithCertSource(tx, database, false)
+	if message, failed := gated[caddyConfigGenerationErrorKey].(string); failed {
+		t.Fatalf("generate gated config: %s", message)
+	}
+	gatedJSON, err := json.Marshal(gated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(gatedJSON), `"any_tag":["lb_gated_probe"]`) {
+		t.Fatalf("rulesWrittenInTx=false 不应补查谓词 miss 规则（any_tag 应缺席）: %s", gatedJSON)
+	}
+
+	// rulesWrittenInTx=true（规则写事务形态）：补查 → 证书入场。
+	ungated := generateCaddyConfigWithCertSource(tx, database, true)
+	if message, failed := ungated[caddyConfigGenerationErrorKey].(string); failed {
+		t.Fatalf("generate ungated config: %s", message)
+	}
+	ungatedJSON, err := json.Marshal(ungated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(ungatedJSON), `"any_tag":["lb_gated_probe"]`) {
+		t.Fatalf("rulesWrittenInTx=true 必须补查谓词 miss 规则（any_tag 缺失）: %s", ungatedJSON)
+	}
+}
+
 // 同 id 全量替换（v2 导入形态）：certSource=tx（ApplyConfigFromTxCertAwareForce）时
 // 渲染并物化事务内的新 PEM——已提交视图的旧行不得覆写导入的新证书。
 func TestGenerateCaddyConfig_txCertSourceUsesInTxPEM(t *testing.T) {
@@ -72,7 +124,7 @@ func TestGenerateCaddyConfig_txCertSourceUsesInTxPEM(t *testing.T) {
 		t.Fatalf("rewrite in tx: %v", err)
 	}
 
-	generated := generateCaddyConfigWithCertSource(tx, tx)
+	generated := generateCaddyConfigWithCertSource(tx, tx, true)
 	if message, failed := generated[caddyConfigGenerationErrorKey].(string); failed {
 		t.Fatalf("generate config: %s", message)
 	}
@@ -83,5 +135,32 @@ func TestGenerateCaddyConfig_txCertSourceUsesInTxPEM(t *testing.T) {
 	}
 	if strings.TrimSpace(string(content)) != strings.TrimSpace(newPEM) {
 		t.Fatalf("物化证书与 tx 内新 PEM 不一致——已提交旧 PEM 覆写了导入证书")
+	}
+}
+
+// CRS 池指纹批次级缓存：同一轮全量渲染内指纹只求值一次（此前逐链求值——
+// R 条有策略的 HTTP 规则 = R 次 SELECT+stat，单次保存最多 3 轮 → 3R）。
+func TestGenerateCaddyConfig_crsPoolFingerprintEvaluatedOncePerBatch(t *testing.T) {
+	seedInfraCRSFiles(t)
+	xdb := filepath.Join(t.TempDir(), "ip2region.xdb")
+	if err := os.WriteFile(xdb, []byte("fake-xdb-bytes"), 0o644); err != nil {
+		t.Fatalf("seed ip2region: %v", err)
+	}
+	oldXdb := ip2regionLivePath
+	ip2regionLivePath = xdb
+	t.Cleanup(func() { ip2regionLivePath = oldXdb })
+	_, database := newClusterTestService(t)
+	for i, id := range []string{"lb_fp_a", "lb_fp_b", "lb_fp_c"} {
+		seedHTTPRuleForGeneration(t, database, id, id+".example.test", 18080+i)
+		seedBoundSecurityPolicy(t, database, id, "detection", true)
+	}
+
+	before := crsPoolFingerprintEvals.Load()
+	generated := generateCaddyConfigFromStore(database)
+	if message, failed := generated[caddyConfigGenerationErrorKey].(string); failed {
+		t.Fatalf("generate config: %s", message)
+	}
+	if delta := crsPoolFingerprintEvals.Load() - before; delta != 1 {
+		t.Fatalf("单轮渲染指纹求值 %d 次, want 1（批次级缓存必须收敛为一次）", delta)
 	}
 }

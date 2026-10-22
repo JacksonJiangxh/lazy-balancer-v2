@@ -372,7 +372,9 @@ func (session *configImportSession) commit(affectedRuleIDs []string, certificate
 	// 2026-09-06 裁定 ④' 边界补齐：导入同样过 Caddy CLI 校验层（校验输入=
 	// 事务视图渲染）。校验器不可用放行——下方 ApplyConfigFromTxCertAwareForce
 	// 仍是门控（全有全无）。
-	if err := session.h.caddyService.ValidateTxRenderViaCLI(session.tx); err != nil && !errors.Is(err, services.ErrCLIValidatorUnavailable) {
+	// rulesWrittenInTx=true：导入事务可能重插 lb_rules（含新 acme 规则），
+	// 谓词 miss 补查必须开启（证书候选源为已提交视图时新规则会被子查询排除）。
+	if err := session.h.caddyService.ValidateTxRenderViaCLI(session.tx, true); err != nil && !errors.Is(err, services.ErrCLIValidatorUnavailable) {
 		return &importCoordinatorError{phase: importPhaseCaddy, err: session.abort(err), caddyRejected: services.IsConfigRejected(err), action: session.action}
 	}
 	session.runtimeApplyAttempted = true

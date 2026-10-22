@@ -12,25 +12,20 @@ import (
 type masterGateOptions struct {
 	queryFailure string
 	forbidden    string
-	errorCode    string
 }
 
 const masterRequiredErrorCode = "master_required"
 
 // requireMasterResult 统一三种入口的角色门结果：查询错误恒 500，确认从节点
 // 恒 403，主节点放行。角色读取仍复用 services.RoleOf（ClusterService.IsMaster
-// 是其薄包装）；端点仅保留自己的文案与机器错误码。
+// 是其薄包装）；端点仅保留自己的文案，机器错误码恒为 master_required。
 func requireMasterResult(c *gin.Context, isMaster bool, err error, options masterGateOptions) bool {
 	if err != nil {
 		clusterError(c, http.StatusInternalServerError, options.queryFailure, err)
 		return false
 	}
 	if !isMaster {
-		errorCode := options.errorCode
-		if errorCode == "" {
-			errorCode = masterRequiredErrorCode
-		}
-		c.Header("X-LB-Error-Code", errorCode)
+		c.Header("X-LB-Error-Code", masterRequiredErrorCode)
 		clusterError(c, http.StatusForbidden, options.forbidden, nil)
 		return false
 	}
@@ -42,7 +37,6 @@ func (h *Handlers) requireMaster(c *gin.Context) bool {
 	return requireMasterResult(c, isMaster, err, masterGateOptions{
 		queryFailure: "读取节点模式失败",
 		forbidden:    "该操作仅允许在主节点执行",
-		errorCode:    masterRequiredErrorCode,
 	})
 }
 

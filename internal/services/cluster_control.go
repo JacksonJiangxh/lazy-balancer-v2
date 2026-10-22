@@ -107,7 +107,7 @@ func (s *ClusterService) ForgetNodePin(ctx context.Context, nodeID int) (string,
 		return "", fmt.Errorf("读取节点访问地址: %w", err)
 	}
 	accessURL = resolveNodeAccessURL(ipAddress, port, protocol, accessURL)
-	pinPath, host, err := nodePinPathFromAccessURL(s.db, accessURL)
+	pinPath, host, err := nodePinPathFromAccessURL(s.dataDir, s.db, accessURL)
 	if err != nil {
 		return "", err
 	}

@@ -151,7 +151,12 @@ func TestUserAndAPIKeyWrites409DuringImport(t *testing.T) {
 	router.DELETE("/users/:id", h.DeleteUser)
 	router.PUT("/users/:id/status", h.ToggleUserStatus)
 	router.POST("/users/:id/reset-password", h.ResetUserPassword)
-	router.POST("/api-keys", h.CreateAPIKey)
+	// 创建路径的认证上下文守卫先于导入窗口门（与删除路径同形）——本用例的
+	// 主题是导入窗口 fast-fail，故模拟认证中间件注入 user_id。
+	router.POST("/api-keys", func(c *gin.Context) {
+		c.Set("user_id", 1)
+		h.CreateCurrentUserAPIKey(c)
+	})
 	router.DELETE("/api-keys/:id", h.DeleteAPIKey)
 	router.PUT("/api-keys/:id/status", h.UpdateAPIKeyStatus)
 	router.PUT("/users/current", h.UpdateCurrentUser)

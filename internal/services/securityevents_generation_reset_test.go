@@ -4,6 +4,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"lazy-balancer-v2/internal/db"
 )
@@ -72,5 +73,47 @@ func TestSecurityEventsTick_resetsOffsetWhenMetricsDBGenerationChanges(t *testin
 	}
 	if n := stallEventCount(t); n != 3 {
 		t.Fatalf("count after idle tick=%d, want 3 (no replay under the same generation)", n)
+	}
+}
+
+// 代际复位=整份 audit.log 从头重放（新库为空、每行 RowsAffected=1 全部再喂
+// autobanBatch）；自动封禁计数器在内存、不随库重置——不复位则窗口内事件被
+// 二次计数、阈值提前达成误封。契约：代际变化复位 offset 的同时清空计数器，
+// 由重放按事件时间恰好重建一次。
+func TestSecurityEventsGenerationGuard_resetsAutobanCountersOnReplay(t *testing.T) {
+	logPath, offsetPath := stallSetup(t)
+	tailer := securityEventsNewTailer(logPath, offsetPath)
+	// Given：登记当前代际（首次只见证、不复位），并预置窗口内计数。
+	if _, err := tailer.securityEventsGenerationGuard(0); err != nil {
+		t.Fatalf("first guard: %v", err)
+	}
+	ResetAutobanCounters()
+	t.Cleanup(ResetAutobanCounters)
+	autobanMu.Lock()
+	autobanWindows["198.51.100.77"] = &autobanCounter{Count: 4, WindowStart: time.Now(), LastSeen: time.Now()}
+	autobanMu.Unlock()
+
+	// When：metrics 库隔离重建（新代际）→ 代际复位。
+	oldMetrics := db.MetricsDB
+	if err := db.InitializeMetricsDB(t.TempDir()); err != nil {
+		t.Fatalf("initialize rebuilt metrics db: %v", err)
+	}
+	t.Cleanup(func() {
+		if db.MetricsDB != nil && db.MetricsDB != oldMetrics {
+			_ = db.MetricsDB.Close()
+		}
+		db.MetricsDB = oldMetrics
+	})
+	offset, err := tailer.securityEventsGenerationGuard(4096)
+
+	// Then：offset 归零，且自动封禁计数器随代际复位清空（重放不二次计数）。
+	if err != nil {
+		t.Fatalf("guard after rebuild: %v", err)
+	}
+	if offset != 0 {
+		t.Fatalf("offset=%d, want 0（代际复位）", offset)
+	}
+	if got := autobanTrackedCount(); got != 0 {
+		t.Fatalf("autoban tracked IPs=%d, want 0（代际重放不得二次喂计数器）", got)
 	}
 }

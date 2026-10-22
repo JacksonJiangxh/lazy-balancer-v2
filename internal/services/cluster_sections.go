@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"lazy-balancer-v2/internal/models"
@@ -41,6 +42,10 @@ func ComputeSnapshotSectionHashes(s *models.ClusterSnapshot) map[string]string {
 	for _, sec := range syncSections {
 		data, err := json.Marshal(sectionPayloadFor(sec.Key, s))
 		if err != nil {
+			// 静默 continue 会让该节哈希键缺失：跳过判定恒不命中、记账恒缺 →
+			// 每周期隐式强制重放且零信号。当前载荷均为可序列化类型（实际不可达），
+			// 一旦新增不可序列化字段/非法 RawMessage 必须立刻可见。
+			Logf("error", "集群节哈希序列化失败（section=%s，该节将每周期强制重放）: %v", sec.Key, err)
 			continue
 		}
 		sum := sha256.Sum256(data)
@@ -226,11 +231,11 @@ func (sk *sectionSkips) wasDrifted(key string) bool {
 	return false
 }
 
-func readAppliedSectionHashes(dbh *sql.DB) map[string]string {
+func readAppliedSectionHashes(ctx context.Context, dbh *sql.DB) map[string]string {
 	if dbh == nil {
 		return nil
 	}
-	rows, err := dbh.Query(`SELECT section, hash FROM cluster_applied_sections`)
+	rows, err := dbh.QueryContext(ctx, `SELECT section, hash FROM cluster_applied_sections`)
 	if err != nil {
 		// 吞错会让漂移检测静默回退全量重放（良性但不可见）——warn 一行暴露
 		// 基础设施故障信号，行为不变。
@@ -259,12 +264,12 @@ func readAppliedSectionHashes(dbh *sql.DB) map[string]string {
 // 由 wafFilesDrifted 专用通道比对,不纳入表级守卫。
 var driftGuardSections = []string{"rules", "users", "security"}
 
-func computeSectionSkips(dbh *sql.DB, snapshot models.ClusterSnapshot, switches SyncSwitches, localHashes map[string]string) *sectionSkips {
+func computeSectionSkips(ctx context.Context, dbh *sql.DB, snapshot models.ClusterSnapshot, switches SyncSwitches, localHashes map[string]string) *sectionSkips {
 	sk := &sectionSkips{disabled: map[string]bool{}, unchanged: map[string]bool{}}
 	if dbh == nil {
 		return sk
 	}
-	applied := readAppliedSectionHashes(dbh)
+	applied := readAppliedSectionHashes(ctx, dbh)
 	for _, sec := range syncSections {
 		if sec.Key == "users" {
 			// 系统数据恒同步(2026-09-11 裁定):纵使快照携带旧主节点的
@@ -324,10 +329,15 @@ func sectionOutcomeNames(sk *sectionSkips) (applied, hashSkipped, disSkipped []s
 	return applied, hashSkipped, disSkipped
 }
 
-func recordAppliedSectionHashes(dbh *sql.DB, snapshot models.ClusterSnapshot, sk *sectionSkips, switches SyncSwitches, localHashes map[string]string) {
+// recordAppliedSectionHashes 落已应用节哈希与文件态记账。写入失败聚合为
+// error 返回（仍逐条 warn 留痕）：调用方不回滚已提交的快照应用，但必须
+// 感知失败——记账陈旧时漂移/跳过判定失真，apply 的 WAF 门据此回退
+// 「不依赖 DB 记账」的内容哈希兜底。
+func recordAppliedSectionHashes(ctx context.Context, dbh *sql.DB, snapshot models.ClusterSnapshot, sk *sectionSkips, switches SyncSwitches, localHashes map[string]string) error {
 	if dbh == nil {
-		return
+		return nil
 	}
+	var errs []error
 	for _, sec := range syncSections {
 		if !switches.sectionEnabled(sec.Key) {
 			continue
@@ -340,7 +350,7 @@ func recordAppliedSectionHashes(dbh *sql.DB, snapshot models.ClusterSnapshot, sk
 			// UPDATE 命中 0 行（行被并发清理/Role flip 清表）
 			// 时 err==nil 仍 continue，会静默不记账 → 下一次 304 多一轮漂移重放。
 			// 只有真正更新到行才跳过落哈希。
-			result, err := dbh.Exec(`UPDATE cluster_applied_sections SET applied_version=?, applied_at=datetime('now') WHERE section=?`, snapshot.Version, sec.Key)
+			result, err := dbh.ExecContext(ctx, `UPDATE cluster_applied_sections SET applied_version=?, applied_at=datetime('now') WHERE section=?`, snapshot.Version, sec.Key)
 			if err == nil {
 				if n, rowsErr := result.RowsAffected(); rowsErr == nil && n > 0 {
 					continue
@@ -357,9 +367,10 @@ func recordAppliedSectionHashes(dbh *sql.DB, snapshot models.ClusterSnapshot, sk
 				h = lh
 			}
 		}
-		if _, err := dbh.Exec(`INSERT INTO cluster_applied_sections (section, hash, applied_version, applied_at) VALUES (?,?,?,datetime('now'))
+		if _, err := dbh.ExecContext(ctx, `INSERT INTO cluster_applied_sections (section, hash, applied_version, applied_at) VALUES (?,?,?,datetime('now'))
 			ON CONFLICT(section) DO UPDATE SET hash=excluded.hash, applied_version=excluded.applied_version, applied_at=excluded.applied_at`, sec.Key, h, snapshot.Version); err != nil {
 			Logf("warn", "记录已应用节哈希失败（section=%s）: %v", sec.Key, err)
+			errs = append(errs, fmt.Errorf("节 %s: %w", sec.Key, err))
 		}
 	}
 
@@ -375,10 +386,12 @@ func recordAppliedSectionHashes(dbh *sql.DB, snapshot models.ClusterSnapshot, sk
 				refHash = hh
 			}
 		}
-		if _, err := dbh.Exec(`UPDATE global_config SET applied_waf_ref_hash=?, applied_waf_ref_version=? WHERE id=1`, refHash, snapshot.Version); err != nil {
+		if _, err := dbh.ExecContext(ctx, `UPDATE global_config SET applied_waf_ref_hash=?, applied_waf_ref_version=? WHERE id=1`, refHash, snapshot.Version); err != nil {
 			Logf("warn", "记录文件态记账失败（applied_waf_ref_*）: %v", err)
+			errs = append(errs, fmt.Errorf("applied_waf_ref_*: %w", err))
 		}
 	}
+	return errors.Join(errs...)
 }
 
 // logSyncSwitchGuards surfaces cross-section drift: security-switch-off nodes

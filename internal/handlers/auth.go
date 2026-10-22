@@ -104,15 +104,36 @@ func recordLoginFailure(userID int) {
 		now.Add(loginLockCooldown).UTC().Format("2006-01-02 15:04:05"), userID)
 }
 
+// parseLoginLockedUntil 锁定时间解析单源——写侧恒为 UTC「2006-01-02 15:04:05」，
+// 兼容带外写入的 RFC3339 形态（导入/手工修库）。两函数（判定与文案）共用，
+// 不再字符串比较（'T' 与 ' ' 的字典序比较在同日边界会错判且对 RFC3339 形态
+// 恒判已锁定）。
+func parseLoginLockedUntil(raw string) (time.Time, bool) {
+	for _, layout := range []string{"2006-01-02 15:04:05", time.RFC3339} {
+		if t, err := time.Parse(layout, raw); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
 // loginLockedNow 账户当前是否处于登录锁定（开关关闭视为未锁）。
 // 开关读取失败返回错误，由调用方 fail-closed（500），不得把
-// 「读不到」当作「未锁定」放行。
+// 「读不到」当作「未锁定」放行。锁值非空但解析失败（损坏形态）同样
+// fail-closed 按锁定处理——存在锁值即不放行。
 func loginLockedNow(lockedUntil sql.NullString) (bool, error) {
 	enabled, err := loginLockoutEnabled()
 	if err != nil {
 		return false, err
 	}
-	return enabled && lockedUntil.Valid && lockedUntil.String > time.Now().UTC().Format("2006-01-02 15:04:05"), nil
+	if !enabled || !lockedUntil.Valid {
+		return false, nil
+	}
+	until, ok := parseLoginLockedUntil(lockedUntil.String)
+	if !ok {
+		return true, nil
+	}
+	return until.After(time.Now().UTC()), nil
 }
 
 // loginLockRemainingMinutes 剩余锁定时长（分钟，向上取整，下限 1）——锁定
@@ -123,8 +144,8 @@ func loginLockRemainingMinutes(lockedUntil sql.NullString, now time.Time) int {
 	if !lockedUntil.Valid {
 		return fallback
 	}
-	until, err := time.Parse("2006-01-02 15:04:05", lockedUntil.String)
-	if err != nil {
+	until, ok := parseLoginLockedUntil(lockedUntil.String)
+	if !ok {
 		return fallback
 	}
 	remaining := int(math.Ceil(until.Sub(now).Minutes()))

@@ -549,10 +549,9 @@ func TestApplyConfig_restoresCertificateSnapshotWhenLoadRejects(t *testing.T) {
 }
 
 func TestGenerateSingleRuleCaddyConfig_tagsEveryOwnedAuxiliaryRoute(t *testing.T) {
-	// Given
+	// Given（单规则形态仅服务预检，不插 HTTP→HTTPS 跳转分支——跳转由全量
+	// 渲染 redirectRoutes 统一生成；辅助路由打钉覆盖路径路由形态）
 	rule := baseHTTPRule()
-	rule.EnableTLS = true
-	rule.TLSHTTPRedirect = true
 	rule.CustomRoutesEnabled = true
 	rule.PathRules = []PathRuleConfig{{SortOrder: 10, MatchType: "prefix", Path: "/api/"}}
 
@@ -560,7 +559,7 @@ func TestGenerateSingleRuleCaddyConfig_tagsEveryOwnedAuxiliaryRoute(t *testing.T
 	routes := renderedHTTPRoutes(t, GenerateSingleRuleCaddyConfig(rule))
 
 	// Then
-	assertRouteIDs(t, routes, []string{"rule-http_redirect", "rule-http_path_0", "rule-http"})
+	assertRouteIDs(t, routes, []string{"rule-http_path_0", "rule-http"})
 }
 
 func TestGenerateHTTPRouteObjects_tagsEveryOwnedAuxiliaryRoute(t *testing.T) {
@@ -849,39 +848,6 @@ func TestGenerateRouteObject_dynamicDNS_emitsResolverInsideDynamicUpstreams(t *t
 	assertEqual(t, resolver["addresses"], []string{"10.0.0.53:53"})
 }
 
-func TestGenerateSingleRuleCaddyConfig_httpsRedirect_includesNonStandardListenPort(t *testing.T) {
-	// Given
-	rule := baseHTTPRule()
-	rule.EnableTLS = true
-	rule.TLSHTTPRedirect = true
-	rule.ListenPort = 8443
-
-	// When
-	config := GenerateSingleRuleCaddyConfig(rule)
-
-	// Then
-	routes := httpRoutesFromServer(t, config, "http_8443")
-	response := firstHandler(t, routes[0])
-	if response["handler"] != "static_response" || response["status_code"] != 301 {
-		t.Fatalf("unexpected redirect handler: %#v", response)
-	}
-	headers := mustMap(t, response["headers"], "redirect headers")
-	// Location 使用 {http.request.host} 占位符：static_response 的 headers 会经过
-	// Caddy replacer 替换（v2.11.4 modules/caddyhttp/staticresp.go），
-	// 多域名规则（本例 example.com + www.example.com）访问任一域名都跳回该域名，
-	// 而不是被劫持到首个域名；非 443 监听端口追加端口后缀。
-	assertEqual(t, headers["Location"], []string{"https://{http.request.host}:8443{http.request.uri}"})
-
-	// When the rule listens on the default HTTPS port
-	rule.ListenPort = 443
-	config = GenerateSingleRuleCaddyConfig(rule)
-
-	// Then the port is omitted
-	routes = httpRoutesFromServer(t, config, "http_443")
-	headers = mustMap(t, firstHandler(t, routes[0])["headers"], "redirect headers")
-	assertEqual(t, headers["Location"], []string{"https://{http.request.host}{http.request.uri}"})
-}
-
 func TestGenerateCaddyConfig_httpsRedirect_includesNonStandardListenPort(t *testing.T) {
 	// Given
 	useTemporaryCertDir(t)
@@ -938,27 +904,6 @@ func TestGenerateCaddyConfig_httpsRedirect_multiDomainUsesRequestHostPlaceholder
 	}
 	headers := mustMap(t, response["headers"], "redirect headers")
 	assertEqual(t, headers["Location"], []string{"https://{http.request.host}{http.request.uri}"})
-}
-
-func TestGenerateSingleRuleCaddyConfig_httpsRedirect_multiDomainUsesRequestHostPlaceholder(t *testing.T) {
-	// Given
-	rule := baseHTTPRule()
-	rule.Domain = "a.example.test, b.example.test"
-	rule.EnableTLS = true
-	rule.TLSHTTPRedirect = true
-	rule.ListenPort = 8443
-
-	// When
-	config := GenerateSingleRuleCaddyConfig(rule)
-
-	// Then: 非 443 监听端口追加端口后缀，且不固定为首个域名
-	routes := httpRoutesFromServer(t, config, "http_8443")
-	response := firstHandler(t, routes[0])
-	if response["handler"] != "static_response" || response["status_code"] != 301 {
-		t.Fatalf("unexpected redirect handler: %#v", response)
-	}
-	headers := mustMap(t, response["headers"], "redirect headers")
-	assertEqual(t, headers["Location"], []string{"https://{http.request.host}:8443{http.request.uri}"})
 }
 
 func TestGenerateSingleRuleCaddyConfig_serverTokensHiddenDefersServerHeaderDelete(t *testing.T) {

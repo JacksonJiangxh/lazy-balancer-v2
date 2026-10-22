@@ -86,7 +86,7 @@ func (s *SyncService) Report(ctx context.Context) error {
 		// recordAppliedSectionHashes 维护，含漂移重放后的本地重建口径）：
 		// 代表本地当前已落库内容，无需为上报重建全量快照。从未同步过的节点
 		// 表为空 → nil → 主节点按「旧版本从节点」占位展示，首个同步周期后自愈。
-		SectionHashes: readAppliedSectionHashes(s.db),
+		SectionHashes: readAppliedSectionHashes(ctx, s.db),
 		Health: models.ClusterHealth{
 			CaddyOK:          caddyErr == nil,
 			RulesCount:       rulesCount,

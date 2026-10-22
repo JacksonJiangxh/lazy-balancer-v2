@@ -432,10 +432,16 @@ func startLoginRateLimitCleanup() {
 // requestLogFormatter 请求日志行格式（独立函数以便格式钉测试消费）。
 // 列结构对齐 gin 默认约定：[time] status | latency | clientIP | METHOD "path"
 // 修复前 method 传入两次（| GET | GET "/path"）。
+// c.Error() 附带的错误（param.ErrorMessage）有值时追加尾部列——
+// 无消费者时 c.Error 等同死调用（v2.3.8 formatter 重写曾丢失该列）。
 func requestLogFormatter(param gin.LogFormatterParams) string {
-	return fmt.Sprintf("[%s] %3d | %13v | %15s | %-7s %#v\n",
+	line := fmt.Sprintf("[%s] %3d | %13v | %15s | %-7s %#v",
 		param.TimeStamp.In(services.CurrentLocation()).Format("2006/01/02 15:04:05"),
 		param.StatusCode, param.Latency, param.ClientIP, param.Method, param.Path)
+	if msg := strings.TrimSpace(param.ErrorMessage); msg != "" {
+		line += " | " + msg
+	}
+	return line + "\n"
 }
 
 // recordingRouterGroup 在注册 admin 组路由的同时记录「METHOD + 完整 gin 路径」
@@ -481,6 +487,15 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 	services.ApplyLogLevel()
 
 	r := gin.New()
+	// 受信代理三判据的口径裁定（2026-10-22）：三 surface 有意分离，不合并——
+	// ① 面板管理面（本路由）：仅支持直连部署，SetTrustedProxies(nil) 使
+	//   ClientIP 恒为 RemoteAddr；登录限流桶/API Key IP 白名单/审计源 IP 均以此
+	//   为准。面板置于反代后时限流退化为全站共享桶、白名单只能写代理 IP——
+	//   部署约束，需在反代上不做源地址伪装或直连面板端口。
+	// ② OIDC 回调基址（auth_oidc.go trustedProxyRemoteAddr）：面板侧唯一例外，
+	//   仅当直连对端为回环/私网（可信反代）时采信 X-Forwarded-Proto/Host。
+	// ③ global_config.trusted_proxy_*：数据面（CDN 真实 IP，规则渲染侧）专用，
+	//   与面板管理面语义不同（CDN 网段不是面板反代），不得接入 gin。
 	r.SetTrustedProxies(nil)
 	r.Use(gin.LoggerWithFormatter(func(param gin.LogFormatterParams) string {
 		if !shouldLogRequest(param.StatusCode, param.Latency) {
@@ -568,7 +583,10 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 		// login 的 state 表在册封顶;
 		// login 与 /auth/login 共用 IP 限流桶(callback 不挂——回调由 state
 		// 表门控,伪造回调不应消耗真实登录额度)。
-		v1.GET("/auth/oidc/status", h.OIDCStatus)
+		// status 此前无任何限流——公开端点每请求 1 次 global_config 读+
+		// JSON 反序列化，分布式探测可放大 DB 读；挂独立宽桶（60/min/IP，
+		// 不消耗登录额度）。
+		v1.GET("/auth/oidc/status", clusterRateLimit("oidc-status", 60, "OIDC 状态查询过于频繁，请稍后再试"), h.OIDCStatus)
 		v1.GET("/auth/oidc/login", loginRateLimit(), h.OIDCLogin)
 		// callback 匿名可达且失败分支会写审计行；独立桶限流（不消耗登录
 		// 额度），防止伪造回调线速灌审计库。
@@ -634,8 +652,8 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 				admin.POST("/caddy/stop", h.StopCaddy)
 				admin.POST("/caddy/restart", h.RestartCaddy)
 
-				// API Keys
-				admin.POST("/api-keys", h.CreateAPIKey)
+				// API Keys（创建与自助同实现：属主恒为当前认证身份）
+				admin.POST("/api-keys", h.CreateCurrentUserAPIKey)
 				admin.PATCH("/api-keys/:id/status", h.UpdateAPIKeyStatus)
 				admin.DELETE("/api-keys/:id", h.DeleteAPIKey)
 
@@ -1310,6 +1328,9 @@ func mfaStepUpGuard() gin.HandlerFunc {
 			// 重读开关，消除开关在中间件后翻转的毫秒窗 TOCTOU。置位必须在
 			// 放行分支内：428 拒绝路径不得留下「假已验证」标记。
 			c.Set("mfa_stepup_verified", true)
+			// 验码年龄随标记注入——拆除/重绑 MFA 的 handler 据此把免验收窄到
+			// ≤15s 窄窗（mfaDestructiveStepUpWindow），通用宽限窗语义不变。
+			c.Set("mfa_stepup_seconds_ago", decision.SecondsAgo)
 			// 宽限窗内静默放行时告知用户（TOTP 同片不可重用，窗口内的操作
 			// 没有可用码也照常执行），前端据此提示「xx 秒内已验证」。
 			c.Header("X-Mfa-Verified-Seconds-Ago", strconv.FormatInt(decision.SecondsAgo, 10))

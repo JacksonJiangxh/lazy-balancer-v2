@@ -17,7 +17,8 @@ import (
 )
 
 // mfaSelfServiceRouter 模拟 JWT 用户(user_id=1)经守卫后的自助端点;
-// guardMarker=true 时注入 mfa_stepup_verified(生产由 mfaStepUpGuard 放行路径置)。
+// guardMarker=true 时注入 mfa_stepup_verified + 验码年龄 0s(生产由
+// mfaStepUpGuard 放行路径同时置两键;拆除/重绑的免验另要求年龄 ≤15s 窄窗)。
 func mfaSelfServiceRouter(h *Handlers, guardMarker bool) *gin.Engine {
 	router := gin.New()
 	wrap := func(handler gin.HandlerFunc) gin.HandlerFunc {
@@ -27,6 +28,7 @@ func mfaSelfServiceRouter(h *Handlers, guardMarker bool) *gin.Engine {
 			c.Set("auth_type", "jwt")
 			if guardMarker {
 				c.Set("mfa_stepup_verified", true)
+				c.Set("mfa_stepup_seconds_ago", int64(0))
 			}
 			handler(c)
 		}

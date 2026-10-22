@@ -29,12 +29,6 @@ func TestRequireMasterResult_MachineErrorCodeTruthTable(t *testing.T) {
 			wantCode:   "master_required",
 		},
 		{
-			name:       "custom code preserved",
-			options:    masterGateOptions{forbidden: "仅主节点", errorCode: "custom_master_required"},
-			wantStatus: http.StatusForbidden,
-			wantCode:   "custom_master_required",
-		},
-		{
 			name:       "role query error has no role code",
 			err:        errors.New("role db down"),
 			options:    masterGateOptions{queryFailure: "角色查询失败", forbidden: "仅主节点"},

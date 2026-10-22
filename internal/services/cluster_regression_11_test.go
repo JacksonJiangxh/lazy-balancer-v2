@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"lazy-balancer-v2/internal/config"
+	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 )
 
@@ -120,8 +121,8 @@ func TestSyncService_Pull_rejectsValidV2PublisherFixture(t *testing.T) {
 func TestClusterSnapshot_HTTPPublisherPullAndFingerprint304(t *testing.T) {
 	// Given
 	const token = "cluster-token"
-	publisher, database := newClusterTestService(t)
-	if _, err := database.Exec("UPDATE global_config SET cluster_version=7"); err != nil {
+	publisher, pubDB := newClusterTestService(t)
+	if _, err := pubDB.Exec("UPDATE global_config SET cluster_version=7"); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := publisher.Snapshot(context.Background(), 0, "", token); err != nil {
@@ -150,10 +151,22 @@ func TestClusterSnapshot_HTTPPublisherPullAndFingerprint304(t *testing.T) {
 		response.WriteHeader(http.StatusOK)
 	}))
 	defer caddy.Close()
-	if _, err := database.Exec("UPDATE global_config SET is_master=0, master_url=?, cluster_token=?, applied_version=0, sync_fingerprint='' WHERE id=1", master.URL, token); err != nil {
+	// 快照读取是主节点-only 契约（读路径 SQL 角色复核）：发布方与拉取方
+	// 不得共用同一库句柄（回环形态下拉取侧把共享库降级为从角色后，发布侧
+	// 快照会被正确拒绝）——从端独立建库，与生产双进程形态一致。
+	pubGlobalsDB, pubGlobalsMetrics, pubGlobalsAudit := db.DB, db.MetricsDB, db.AuditDB
+	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
-	service := NewSyncService(database, &config.Config{DataDir: t.TempDir(), CaddyAdminURL: caddy.URL}, NewCaddyService(caddy.URL))
+	slaveDB := db.DB
+	t.Cleanup(func() {
+		_ = db.Close()
+		db.DB, db.MetricsDB, db.AuditDB = pubGlobalsDB, pubGlobalsMetrics, pubGlobalsAudit
+	})
+	if _, err := slaveDB.Exec("UPDATE global_config SET is_master=0, master_url=?, cluster_token=?, applied_version=0, sync_fingerprint='' WHERE id=1", master.URL, token); err != nil {
+		t.Fatal(err)
+	}
+	service := NewSyncService(slaveDB, &config.Config{DataDir: t.TempDir(), CaddyAdminURL: caddy.URL}, NewCaddyService(caddy.URL))
 
 	// When
 	first, firstErr := service.Pull(context.Background())

@@ -1,85 +1,18 @@
 package handlers
 
-// TCP 死值清零 SQL 双实现 parity 钉——启动迁移
-// db.migrateTCPRuleDeadFields（db.go）与导入归一
-// handlers.normalizeRuleRowsForTransport（config_backup.go:tcpRuleDeadFieldsResetSQL）
-// 持有两份逐字相同的 UPDATE 字面量（11 列 SET + TCP 谓词），跨包无法共享常量，
-// 无门禁时一侧改动另一侧静默漂移（启动迁移与导入归一对同一存量行产出不同终态）。
-// 本测试读取两侧源码/常量，断言 SET 列集合与 WHERE 谓词逐字一致。
+// TCP 死值归一钉测集：SQL 字面量单源已下沉 db 包
+// （db.TCPRuleDeadFieldsResetSQL / db.TCPRulePathRulesResetSQL——启动迁移
+// migrateTCPRuleDeadFields 与导入归一 normalizeRuleRowsForTransport 共用同一
+// 常量，消灭跨包双份镜像）。本文件保留两道防线：
+//  1. 保存族 ↔ SQL 列覆盖双向对账（SQL 扩列必须同步保存族结构体/适配器）；
+//  2. 保存族字段反向对账（新增字段要么进 SQL 归一，要么进显式豁免清单附裁定）。
 
 import (
 	"os"
-	"regexp"
+	"reflect"
 	"strings"
 	"testing"
 )
-
-var goRawStringLiteral = regexp.MustCompile("`[^`]*`")
-
-func TestTCPRuleDeadFieldsSQL_parityWithStartupMigration(t *testing.T) {
-	src, err := os.ReadFile("../db/db.go")
-	if err != nil {
-		t.Fatalf("read db.go: %v", err)
-	}
-	// 锚定到 migrateTCPRuleDeadFields 函数体后第一个原始字符串字面量（db.go 内
-	// 另有多个含 protocol='tcp' 的 UPDATE 字面量，仅按内容过滤会歧义）。
-	body := string(src)
-	anchor := strings.Index(body, "func migrateTCPRuleDeadFields(")
-	if anchor < 0 {
-		t.Fatalf("db.go 未找到 migrateTCPRuleDeadFields 函数")
-	}
-	loc := goRawStringLiteral.FindStringIndex(body[anchor:])
-	if loc == nil {
-		t.Fatalf("migrateTCPRuleDeadFields 内未找到 SQL 字面量")
-	}
-	migrationSQL := strings.Trim(body[anchor+loc[0]:anchor+loc[1]], "`")
-	if !strings.Contains(migrationSQL, "UPDATE lb_rules SET") || !strings.Contains(migrationSQL, "protocol='tcp'") {
-		t.Fatalf("migrateTCPRuleDeadFields 首个字面量非 TCP 死值 SQL: %q", migrationSQL)
-	}
-
-	migCols, migWhere := splitTCPDeadFieldsSQL(t, migrationSQL)
-	localCols, localWhere := splitTCPDeadFieldsSQL(t, tcpRuleDeadFieldsResetSQL)
-
-	if strings.Join(migCols, ",") != strings.Join(localCols, ",") {
-		t.Fatalf("SET 列集合分叉:\n  db.go        = %v\n  config_backup = %v", migCols, localCols)
-	}
-	// TCP 自愈族：七 HTTP 专属 + NTLM + force_http1 + TLS 来源与材料
-	// + 代理超时族七列 + custom_routes_enabled + dynamic_dns + strategy
-	// + domain/health_check_host/tls_http_redirect + 阶段页四列 + log_enabled。
-	if len(migCols) != 31 {
-		t.Fatalf("SET 列数=%d, want 31: %v", len(migCols), migCols)
-	}
-	if migWhere != localWhere {
-		t.Fatalf("WHERE 谓词分叉:\n  db.go        = %q\n  config_backup = %q", migWhere, localWhere)
-	}
-	// 整体兜底：空白归一后两份字面量须逐字一致（列集合/谓词之外的值部分同样受钉）
-	if normalizeSQLWhitespace(migrationSQL) != normalizeSQLWhitespace(tcpRuleDeadFieldsResetSQL) {
-		t.Fatalf("TCP 死值 SQL 逐字分叉:\n  db.go        = %q\n  config_backup = %q",
-			normalizeSQLWhitespace(migrationSQL), normalizeSQLWhitespace(tcpRuleDeadFieldsResetSQL))
-	}
-
-	// TCP 自愈族：TCP 残留路径规则清理 DELETE 同样跨包双份——逐字比对。
-	migrationDelete := secondRawLiteralAfter(t, body, anchor+loc[1], "DELETE FROM path_rules")
-	if normalizeSQLWhitespace(migrationDelete) != normalizeSQLWhitespace(tcpRulePathRulesResetSQL) {
-		t.Fatalf("TCP 路径规则清理 SQL 分叉:\n  db.go        = %q\n  config_backup = %q",
-			normalizeSQLWhitespace(migrationDelete), normalizeSQLWhitespace(tcpRulePathRulesResetSQL))
-	}
-}
-
-// secondRawLiteralAfter 返回 offset 之后首个包含 marker 的原始字符串字面量。
-func secondRawLiteralAfter(t *testing.T, body string, offset int, marker string) string {
-	t.Helper()
-	rest := body[offset:]
-	idx := strings.Index(rest, "`"+marker)
-	if idx < 0 {
-		t.Fatalf("offset 之后未找到含 %q 的原始字符串字面量", marker)
-	}
-	end := strings.Index(rest[idx+1:], "`")
-	if end < 0 {
-		t.Fatalf("字面量未闭合: %q", marker)
-	}
-	return rest[idx+1 : idx+1+end]
-}
 
 // tcpSQLColumnFallback：SET 列 → tcpDeadFields 字段名的单源映射（TCP 自愈族
 // 三处 parity 的第三处）：SQL 归一扩列时，保存族（rules.go tcpDeadFieldReset
@@ -161,6 +94,44 @@ func TestTCPDeadFieldsSaveFamily_coversSQLColumns(t *testing.T) {
 	for col := range tcpSQLColumnFallback {
 		if !sqlColumns[col] {
 			t.Fatalf("保存族列 %q 未纳入 SQL 归一（双向 parity 缺口）", col)
+		}
+	}
+}
+
+// TestTCPDeadFieldsSaveFamily_fieldsCoveredOrExempted 反向对账（字段 ⊆ SQL ∪ 豁免）：
+// 保存族 tcpDeadFields 每新增一个字段，要么进 SQL 归一映射
+// （tcpSQLColumnFallback），要么进下方显式豁免清单并附裁定理由——防止
+// 「保存族清零、启动迁移/导入 SQL 漏列」的静默分叉随新字段重演。
+func TestTCPDeadFieldsSaveFamily_fieldsCoveredOrExempted(t *testing.T) {
+	// 豁免裁定：acme_config_id/ca_provider_id 有意不入 SQL 归一——全部 ACME
+	// 消费方（签发/续签/证书回插）以 enable_tls=1 联合门控，而 enable_tls 对
+	// TCP 行恒归 0（SQL 第 23 列），残留引用不可达（惰性无害，已逐消费方
+	// 推演）；SQL 扩列会改变集群快照 canonical 哈希基线、触发一轮全量重放，
+	// 代价大于收益。残留值由下次规则编辑经保存族（tcpDeadFieldReset）清零
+	// 自愈。未来新增不依赖 enable_tls 门控的 ACME 消费方时，本豁免必须重审。
+	exempted := map[string]string{
+		"ACMEConfigID": "ACME 消费方全部 enable_tls=1 联合门控，TCP 恒归 0 后残留引用不可达",
+		"CAProviderID": "同上（ResolveCAProviderID 仅在 acme_dns 签发路径消费）",
+	}
+	covered := make(map[string]bool, len(tcpSQLColumnFallback))
+	for _, field := range tcpSQLColumnFallback {
+		covered[field] = true
+	}
+	typ := reflect.TypeOf(tcpDeadFields{})
+	for i := range typ.NumField() {
+		name := typ.Field(i).Name
+		if covered[name] {
+			continue
+		}
+		if _, ok := exempted[name]; ok {
+			continue
+		}
+		t.Fatalf("tcpDeadFields 字段 %s 既不在 SQL 归一映射也不在豁免清单——新增字段必须二选一并附裁定", name)
+	}
+	// 豁免清单不得腐化：字段被移除/改名时豁免项必须同步删除。
+	for name := range exempted {
+		if _, ok := typ.FieldByName(name); !ok {
+			t.Fatalf("豁免字段 %s 已不存在于 tcpDeadFields，请同步删除豁免项", name)
 		}
 	}
 }

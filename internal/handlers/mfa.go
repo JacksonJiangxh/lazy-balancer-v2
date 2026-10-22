@@ -175,8 +175,8 @@ func rejectOIDCUserMFAOperation(c *gin.Context, targetUserID int) bool {
 	if uid == 0 {
 		uid = int(contextUserID(c))
 	}
-	var provider string
-	if err := db.DB.QueryRow("SELECT COALESCE(auth_provider,'local') FROM users WHERE id=?", uid).Scan(&provider); err != nil {
+	provider, err := authProviderOf(c.Request.Context(), uid)
+	if err != nil {
 		// ErrNoRows=目标用户不存在(输入错误,404);真实读故障才是 500。
 		// 两者都必须拒绝操作——身份来源不可判定时不按非 OIDC 放行。
 		if errors.Is(err, sql.ErrNoRows) {
@@ -256,9 +256,15 @@ func (h *Handlers) MFASetup(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求格式错误"})
 			return
 		}
-		// 守卫验码放行路径跳过本层验码(同 MFADisable)。
-		if !mfaStepUpVerifiedInContext(c) {
-			if ok, verr := services.MFAVerifyTOTPCode(userID, req.Code, time.Now()); !ok {
+		// 守卫验码放行路径跳过本层验码(同 MFADisable)——拆除/重绑属高敏操作，
+		// 仅守卫验码 ≤15s 的窄窗内豁免（mfaDestructiveStepUpWindow）。
+		if !mfaStepUpVerifiedForDestructiveOp(c) {
+			if mfaVerifyRateLimitedRejection(c, userID) {
+				return
+			}
+			ok, verr := services.MFAVerifyTOTPCode(userID, req.Code, time.Now())
+			mfaRecordVerifyOutcome(userID, ok, verr)
+			if !ok {
 				mfaVerifyFailureResponse(c, verr, services.FormatAuditDetail("重绑 MFA 前验证失败", services.AuditResultPart("failure")))
 				return
 			}
@@ -365,8 +371,15 @@ func (h *Handlers) MFADisable(c *gin.Context) {
 	// 守卫验码放行路径(标记在)跳过
 	// 本层验码——守卫/verify-step 已消费 TOTP 时间片,前端 428 重试带同码时
 	// 同片重放拒绝使禁用流程结构性必 401;机器身份/守卫关(无标记)本层验码保持。
-	if !mfaStepUpVerifiedInContext(c) {
-		if ok, verr := services.MFAVerifyTOTPCode(userID, req.Code, time.Now()); !ok {
+	// 拆除 MFA 收窄为 ≤15s 窄窗豁免（mfaDestructiveStepUpWindow）——60s 通用
+	// 宽限窗内「仅凭会话拆第二因子」的链路由此关闭。
+	if !mfaStepUpVerifiedForDestructiveOp(c) {
+		if mfaVerifyRateLimitedRejection(c, userID) {
+			return
+		}
+		ok, verr := services.MFAVerifyTOTPCode(userID, req.Code, time.Now())
+		mfaRecordVerifyOutcome(userID, ok, verr)
+		if !ok {
 			// 高敏动作的失败尝试与成功同等可审计（对齐 MFAResetByAdmin 前置验码失败留痕）。
 			mfaVerifyFailureResponse(c, verr, services.FormatAuditDetail("禁用 MFA 前验证失败", services.AuditResultPart("failure")))
 			return
@@ -432,7 +445,12 @@ func (h *Handlers) MFAVerifyStep(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求格式错误"})
 		return
 	}
-	if ok, verr := services.MFAVerifyTOTPCode(userID, req.Code, time.Now()); !ok {
+	if mfaVerifyRateLimitedRejection(c, userID) {
+		return
+	}
+	ok, verr := services.MFAVerifyTOTPCode(userID, req.Code, time.Now())
+	mfaRecordVerifyOutcome(userID, ok, verr)
+	if !ok {
 		mfaVerifyFailureResponse(c, verr, services.FormatAuditDetail("MFA", "step-up 验证失败"))
 		return
 	}
@@ -513,7 +531,7 @@ func DecideMFAStepUp(c *gin.Context, covered bool, mfaEnabledCheck func(int) (bo
 	if !guardEnabled {
 		return MFAStepUpDecision{}, nil
 	}
-	userID, ok := mfaStepUpUserID(c)
+	userID, ok := userIDFromContext(c)
 	if !ok {
 		return MFAStepUpDecision{}, nil
 	}
@@ -533,32 +551,9 @@ func DecideMFAStepUp(c *gin.Context, covered bool, mfaEnabledCheck func(int) (bo
 	return MFAStepUpDecision{Applies: true}, nil
 }
 
-// mfaStepUpUserID 类型化读取 JWT 用户 ID——生产 jwtAuth 链路恒存 float64。
-// int/int64/string 分支为测试与 MCP 调用路径的防御性兼容（单测直连 handler
-// 常注入 int，MCP 内部转发可能注入 string 数字），生产 JWT 链路不依赖；
-// 删除会让这些路径静默退回「无 user_id 直通」。gin GetString 对数字恒返回
-// 空串，不得用。
-func mfaStepUpUserID(c *gin.Context) (int, bool) {
-	v, exists := c.Get("user_id")
-	if !exists {
-		return 0, false
-	}
-	switch id := v.(type) {
-	case float64:
-		return int(id), true
-	case int:
-		return id, true
-	case int64:
-		return int(id), true
-	case string:
-		parsed, err := strconv.Atoi(id)
-		if err != nil {
-			return 0, false
-		}
-		return parsed, true
-	}
-	return 0, false
-}
+// user_id 的类型化读取单源已收敛至 rule_features.go 的
+// userIDFromContext（含 float64/int/int64/string 分支；string 分支为测试与
+// MCP 转发路径的防御性兼容，生产 JWT 链路恒 float64）。
 
 // —— Admin 端点 ——
 
@@ -570,6 +565,56 @@ func mfaStepUpUserID(c *gin.Context) (int, bool) {
 func mfaStepUpVerifiedInContext(c *gin.Context) bool {
 	v, ok := c.Get("mfa_stepup_verified")
 	return ok && v == true
+}
+
+// mfaDestructiveStepUpWindow 拆除/重绑 MFA 的免码窗：通用 60s 宽限窗对
+// 「拆第二因子」过宽——持会话者（XSS/令牌泄露）可在窗口内免码禁用 MFA 或
+// 轮换 pending secret，把账户永久降级为单因子。收窄为 ≤15s：守卫验码后
+// 立即发起的拆除操作沿用标记免验（同片重放结构性 401 的接缝语义保持），
+// 超过 15s 回落本层验码（需提供下一时间片的有效码）。
+// 取舍：可用性让渡——窗口外的拆除操作需再等一个时间片输码，
+// 换取「60s 窗内仅凭会话拆 MFA」链路的关闭。
+const mfaDestructiveStepUpWindow = 15 * time.Second
+
+// mfaStepUpVerifiedForDestructiveOp 拆除/重绑 MFA 的标记判定：标记在且
+// 守卫验码距今 ≤15s 才豁免本层验码；年龄键缺失/类型不符（旧守卫或测试
+// 注入缺键）一律不免验，回落本层验码（fail-safe）。
+func mfaStepUpVerifiedForDestructiveOp(c *gin.Context) bool {
+	if !mfaStepUpVerifiedInContext(c) {
+		return false
+	}
+	ago, ok := c.Get("mfa_stepup_seconds_ago")
+	secs, isInt64 := ago.(int64)
+	if !ok || !isInt64 {
+		return false
+	}
+	return secs <= int64(mfaDestructiveStepUpWindow.Seconds())
+}
+
+// mfaVerifyRateLimitedRejection 登录后验码的仅限流门（per-user 滑动窗
+// 5 次失败/60s → 429，成功清零；不置锁不锁定——2026-09「登录后验码只提示
+// 不计数不锁定」裁定保持，本层只是爆破速率收敛）。四处登录后验码入口
+// （verify-step/禁用/重绑确认/管理员重置前置验码）共用。
+func mfaVerifyRateLimitedRejection(c *gin.Context, userID int) bool {
+	if !services.MFAVerifyAttemptLimited(userID, time.Now()) {
+		return false
+	}
+	recordAudit(c, "认证拒绝", "用户认证", services.FormatAuditDetail("MFA", "验码尝试过于频繁（限流）"))
+	c.JSON(http.StatusTooManyRequests, models.APIResponse{Code: 429, Message: "验证码尝试过于频繁，请稍后再试"})
+	return true
+}
+
+// mfaRecordVerifyOutcome 验码结果记账单源：真验证码错误（verr==nil）计一次
+// 限流失败；成功清零。基础设施故障与业务态哨兵（ErrMFANotEnabled）不计——
+// 抖动不得消耗用户的限流预算。
+func mfaRecordVerifyOutcome(userID int, ok bool, verr error) {
+	if ok {
+		services.MFAClearVerifyAttempts(userID)
+		return
+	}
+	if verr == nil {
+		services.MFARecordVerifyAttemptFailure(userID, time.Now())
+	}
 }
 
 // MFAResetByAdmin POST /users/:id/mfa/reset — 仅 admin 组可达（middleware.go
@@ -604,7 +649,8 @@ func (h *Handlers) MFAResetByAdmin(c *gin.Context) {
 	// MFADisable 的双重确认同语义；无密码项：admin 路由已过 JWT + 用户管理
 	// 确认弹框承担意图确认）。
 	// （用户裁决）：写操作守卫（mfaStepUpGuard）开启时第一层豁免——守卫已对
-	// 本写操作完成验码（60 秒窗内静默放行或 428→verify-step 刷新 mfa_ts），再验
+	// 本写操作完成验码（60 秒窗内静默放行或 428→verify-step 刷新 mfa_ts；拆除
+	// MFA 另收窄为验码 ≤15s 窄窗，见 mfaDestructiveStepUpWindow），再验
 	// 一次会在 TOTP 重放保护下同片互斥：verify-step 消费时间片后第一层无码可用，
 	// 必 401（验证码错误→踢出登录→连续失败触发 10 分钟锁定）。
 	// mfaStepUpVerifiedInContext:守卫(开启态)验码放行路径的标记优先;开关
@@ -619,8 +665,14 @@ func (h *Handlers) MFAResetByAdmin(c *gin.Context) {
 	if operatorMfa, err := services.MFAUserEnabled(operatorID); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取操作者 MFA 状态失败"})
 		return
-	} else if operatorMfa && !mfaStepUpVerifiedInContext(c) {
-		if ok, verr := services.MFAVerifyCode(operatorID, req.Code, time.Now()); !ok {
+	} else if operatorMfa && !mfaStepUpVerifiedForDestructiveOp(c) {
+		// 管理员拆除 MFA 同样收窄为守卫验码 ≤15s 窄窗豁免（与自助 disable 同口径）。
+		if mfaVerifyRateLimitedRejection(c, operatorID) {
+			return
+		}
+		ok, verr := services.MFAVerifyCode(operatorID, req.Code, time.Now())
+		mfaRecordVerifyOutcome(operatorID, ok, verr)
+		if !ok {
 			// 重置前置验码失败留痕——高敏动作的失败尝试与成功同等
 			// 可审计（含 brute 尝试面）。
 			mfaVerifyFailureResponse(c, verr, services.FormatAuditDetail("重置 MFA 前验证失败", services.AuditResultPart("failure")))
