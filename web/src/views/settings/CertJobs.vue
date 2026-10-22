@@ -8,6 +8,9 @@
     </template>
     <div class="polling-error-meta">{{ jobsPollingErrorDescription }}</div>
   </el-alert>
+  <!-- 宽度观测容器：容器变窄时按优先级隐藏低价值列（见 utils/certJobColumns），
+       任何宽度都不出现水平滚动条。 -->
+  <div ref="tableWrapRef" class="cert-jobs-wrap">
   <el-table
     v-if="loading || jobs.length > 0"
     :data="jobs"
@@ -17,8 +20,14 @@
     class="cert-jobs-table"
     :fit="true"
   >
-    <el-table-column prop="rule_id" label="规则 ID" width="96" show-overflow-tooltip />
-    <el-table-column prop="domain" label="域名" width="170" show-overflow-tooltip />
+    <el-table-column v-if="visibleColumns.has('rule_id')" prop="rule_id" label="规则 ID" width="96" show-overflow-tooltip />
+    <el-table-column prop="domain" label="域名" width="170">
+      <template #default="{ row }">
+        <!-- 规则 ID 列让位后并入域名单元格副行，信息不丢失 -->
+        <span class="cell-text">{{ row.domain }}</span>
+        <span v-if="!visibleColumns.has('rule_id')" class="cell-sub">#{{ row.rule_id }}</span>
+      </template>
+    </el-table-column>
     <el-table-column prop="status" label="状态" width="84" align="center">
       <template #default="{ row }">
         <!-- message 不再单列：hover 状态标签看失败原因/在途说明（空则不挂空 tooltip） -->
@@ -27,7 +36,7 @@
         </el-tooltip>
       </template>
     </el-table-column>
-    <el-table-column label="颁发者" width="96" show-overflow-tooltip>
+    <el-table-column v-if="visibleColumns.has('issuer')" label="颁发者" width="96" show-overflow-tooltip>
       <template #default="{ row }">
         <span :class="row.issuer ? 'cell-text' : 'cell-empty'">{{ row.issuer || '-' }}</span>
       </template>
@@ -42,7 +51,7 @@
         <span v-else class="cell-empty">-</span>
       </template>
     </el-table-column>
-    <el-table-column label="自动重签时间" width="110">
+    <el-table-column v-if="visibleColumns.has('renewal')" label="自动重签时间" width="110">
       <template #default="{ row }">
         <el-tooltip v-if="row.status === 'issued' && renewalAt(row)" :content="formatDate(renewalAt(row))">
           <span class="cell-text">{{ formatDateCompact(renewalAt(row)) }}</span>
@@ -50,7 +59,7 @@
         <span v-else class="cell-empty">-</span>
       </template>
     </el-table-column>
-    <el-table-column label="更新时间" width="110">
+    <el-table-column v-if="visibleColumns.has('updated')" label="更新时间" width="110">
       <template #default="{ row }">
         <el-tooltip v-if="formatDate(row.updated_at)" :content="formatDate(row.updated_at)">
           <span class="cell-text">{{ formatDateCompact(row.updated_at) }}</span>
@@ -60,11 +69,14 @@
     </el-table-column>
     <el-table-column label="重试次数" width="64" align="center">
       <template #default="{ row }">
-        <span v-if="row.renewal_attempts && row.renewal_attempts > 0" class="cell-text">{{ row.renewal_attempts }}</span>
-        <span v-else class="cell-empty">-</span>
+        <!-- 冷却列让位时，等待 CA 的冷却值并入本格 tooltip -->
+        <el-tooltip :disabled="visibleColumns.has('cooling') || !coolingHint(row)" :content="coolingHint(row)">
+          <span v-if="row.renewal_attempts && row.renewal_attempts > 0" class="cell-text">{{ row.renewal_attempts }}</span>
+          <span v-else class="cell-empty">-</span>
+        </el-tooltip>
       </template>
     </el-table-column>
-    <el-table-column label="冷却时间" width="104" show-overflow-tooltip>
+    <el-table-column v-if="visibleColumns.has('cooling')" label="冷却时间" width="104" show-overflow-tooltip>
       <template #default="{ row }">
         <span v-if="row.status === 'waiting_ca' && row.ca_available_after" class="cell-text">{{ formatCoolingTime(row.ca_available_after) }}</span>
         <span v-else class="cell-empty">-</span>
@@ -81,6 +93,7 @@
       </template>
     </el-table-column>
   </el-table>
+  </div>
   <!-- 首拉失败且无数据时改「加载失败」，与顶部错误横幅口径一致，避免误
        导作「暂无签发任务」（有数据时保留最后列表，此空态不渲染）。-->
   <el-empty v-if="!loading && jobs.length === 0" :description="jobsPollingError.errorMessage.value ? '加载失败' : '暂无签发任务'" :image-size="60" />
@@ -129,6 +142,7 @@ import { request, mfaAwareSuccess } from '@/utils/api'
 import { useLogTailPolling } from '@/composables/useLogTailPolling'
 import LogStorageBar from '@/components/LogStorageBar.vue'
 import { formatDate, formatDateCompact, formatDateShort } from '@/utils/date'
+import { pickVisibleCertJobColumns } from '@/utils/certJobColumns'
 import { escapeHtml } from '@/utils/escape'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
@@ -163,6 +177,18 @@ const isReadOnly = computed(() => authStore.readOnlyReason !== null)
 let disposed = false
 // （过度修复审查 REMOVE：jobsRequestSeq 已删——入口 loading 门 + disposed
 // 析取使其作为裁决条件永不为真，且全部调用经 jobsPolling drain 串行。）
+
+// 表格容器宽度 → 可见列集合（贪心让位，见 utils/certJobColumns）。
+// 初始 Infinity = 未测量：先按全列渲染，ResizeObserver 给出真实宽度后收敛。
+const tableWrapRef = ref<HTMLDivElement | null>(null)
+const tableWrapWidth = ref(Number.POSITIVE_INFINITY)
+const visibleColumns = computed(() => pickVisibleCertJobColumns(tableWrapWidth.value))
+let tableWrapObserver: ResizeObserver | null = null
+
+const coolingHint = (row: CertJob): string => {
+  if (row.status !== 'waiting_ca' || !row.ca_available_after) return ''
+  return `冷却：${formatCoolingTime(row.ca_available_after)}`
+}
 
 const jobs = ref<CertJob[]>([])
 const loading = ref(false)
@@ -362,11 +388,22 @@ const retryJobsPolling = async (): Promise<void> => {
 onMounted(() => {
   void jobsPolling.run()
   jobsPolling.start()
+  // 容器宽度观测：驱动列让位（避免任何宽度下出现水平滚动条）
+  const wrap = tableWrapRef.value
+  if (wrap && typeof ResizeObserver !== 'undefined') {
+    tableWrapObserver = new ResizeObserver((entries) => {
+      const width = entries[0]?.contentRect?.width ?? 0
+      if (width > 0) tableWrapWidth.value = width
+    })
+    tableWrapObserver.observe(wrap)
+  }
 })
 
 onUnmounted(() => {
   disposed = true
   logTail.stop()
+  tableWrapObserver?.disconnect()
+  tableWrapObserver = null
 })
 </script>
 
@@ -408,8 +445,19 @@ onUnmounted(() => {
 .cert-days.expired {
   color: #ef4444;
 }
+.cert-jobs-wrap {
+  /* 表格自身按列宽自适应；容器裁掉任何溢出，杜绝页面级/卡片级横向滚动 */
+  overflow: hidden;
+}
 .cert-jobs-table {
   width: 100%;
+}
+.cell-sub {
+  display: block;
+  margin-top: 2px;
+  font-size: 11px;
+  line-height: 1.2;
+  color: #9ca3af;
 }
 .cert-jobs-pagination { display: flex; justify-content: flex-end; margin-top: 16px; }
 .polling-error-alert { margin-bottom: 16px; }
