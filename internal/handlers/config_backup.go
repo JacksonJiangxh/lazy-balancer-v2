@@ -2081,7 +2081,35 @@ func validateV2BackupTLSShapeSoft(tables map[string][]map[string]any, softLiveAC
 // 用于校验侧会把 "a.com,b.org" 等不可规范化形态假放行；与运行期
 // certJobRuleApplicable 的严格 CanonicalACMEDomains 全等语义对齐，不可规范化即
 // 响亮拒绝。两侧规范化后大小写/空白/顺序变体天然归一（排序规范形式）。
-func validateV2BackupCertJobs(tables map[string][]map[string]any) error {
+func validateV2BackupCertJobs(tables map[string][]map[string]any) ([]string, error) {
+	var warnings []string
+	// cert_jobs.ca_provider_id 参与导入期可解析性校验（与 lb_rules 的
+	// ACME 引用同一索引语义：备份表优先、缺表回退 live）：悬挂/已禁用的
+	// 提供商会让非终态任务首次入队即落 failed 终态（loadCAProvider 对
+	// 「存在但禁用」显性报错）——归一为 0（跟随默认，loadCAProvider 的
+	// 既有默认语义承担）并显式警告，不整包拒绝。
+	var providerRefs *acmeImportRefIndex
+	danglingProviderJobs := 0
+	for _, job := range tables["cert_jobs"] {
+		caProviderID, ok := backupInteger(job["ca_provider_id"])
+		if !ok || caProviderID == 0 {
+			continue
+		}
+		if providerRefs == nil {
+			providerRefs = newACMEImportRefIndex(tables)
+		}
+		providerOK, err := providerRefs.resolveEnabled("ca_providers", caProviderID)
+		if err != nil {
+			return nil, fmt.Errorf("校验证书任务 CA 提供商失败: %w", err)
+		}
+		if !providerOK {
+			job["ca_provider_id"] = 0
+			danglingProviderJobs++
+		}
+	}
+	if danglingProviderJobs > 0 {
+		warnings = append(warnings, fmt.Sprintf("%d 条证书任务引用的 CA 提供商不存在或已禁用，已归一为跟随默认提供商（原引用会导致任务首次入队即失败）", danglingProviderJobs))
+	}
 	type certJobShape struct {
 		domain string
 		status string
@@ -2116,18 +2144,18 @@ func validateV2BackupCertJobs(tables map[string][]map[string]any) error {
 		}
 		jobDomains := jobsByRule[backupString(rule["caddy_id"])]
 		if len(jobDomains) == 0 {
-			return fmt.Errorf("规则 #%d（%s）：启用的 ACME 规则缺少证书签发任务（cert_jobs 无非 disabled 行），导入后将无法自动续签", index+1, backupString(rule["name"]))
+			return nil, fmt.Errorf("规则 #%d（%s）：启用的 ACME 规则缺少证书签发任务（cert_jobs 无非 disabled 行），导入后将无法自动续签", index+1, backupString(rule["name"]))
 		}
 		canonical, err := services.CanonicalACMEDomains(backupString(rule["domain"]))
 		if err != nil {
-			return fmt.Errorf("规则 #%d（%s）：ACME 域名不合法（仅支持单域名或根域+www 二级域名），导入后将无法自动续签", index+1, backupString(rule["name"]))
+			return nil, fmt.Errorf("规则 #%d（%s）：ACME 域名不合法（仅支持单域名或根域+www 二级域名），导入后将无法自动续签", index+1, backupString(rule["name"]))
 		}
 		matched := false
 		emptyMaterial := false
 		for _, job := range jobDomains {
 			jobCanonical, err := services.CanonicalACMEDomains(job.domain)
 			if err != nil {
-				return fmt.Errorf("规则 #%d（%s）：证书任务域名 %q 不合法（仅支持单域名或根域+www 二级域名），导入后将无法自动续签", index+1, backupString(rule["name"]), job.domain)
+				return nil, fmt.Errorf("规则 #%d（%s）：证书任务域名 %q 不合法（仅支持单域名或根域+www 二级域名），导入后将无法自动续签", index+1, backupString(rule["name"]), job.domain)
 			}
 			if jobCanonical != canonical {
 				continue
@@ -2141,9 +2169,9 @@ func validateV2BackupCertJobs(tables map[string][]map[string]any) error {
 		}
 		if !matched {
 			if emptyMaterial {
-				return fmt.Errorf("规则 #%d（%s）：证书任务标记为已签发但证书材料为空，导入后 TLS 端口将无证书可用", index+1, backupString(rule["name"]))
+				return nil, fmt.Errorf("规则 #%d（%s）：证书任务标记为已签发但证书材料为空，导入后 TLS 端口将无证书可用", index+1, backupString(rule["name"]))
 			}
-			return fmt.Errorf("规则 #%d（%s）：证书任务域名与规则域名不一致，导入后将无法自动续签", index+1, backupString(rule["name"]))
+			return nil, fmt.Errorf("规则 #%d（%s）：证书任务域名与规则域名不一致，导入后将无法自动续签", index+1, backupString(rule["name"]))
 		}
 		allowed := map[string]struct{}{canonical: {}}
 		for _, d := range strings.Split(canonical, ",") {
@@ -2152,11 +2180,11 @@ func validateV2BackupCertJobs(tables map[string][]map[string]any) error {
 		for _, job := range jobDomains {
 			jobCanonical, _ := services.CanonicalACMEDomains(job.domain)
 			if _, ok := allowed[jobCanonical]; !ok {
-				return fmt.Errorf("规则 #%d（%s）：证书任务包含规则当前域名之外的旧域行 %q，导入后任务视图与对账无法收敛", index+1, backupString(rule["name"]), job.domain)
+				return nil, fmt.Errorf("规则 #%d（%s）：证书任务包含规则当前域名之外的旧域行 %q，导入后任务视图与对账无法收敛", index+1, backupString(rule["name"]), job.domain)
 			}
 		}
 	}
-	return nil
+	return warnings, nil
 }
 
 // backupSystemIPListNames 内置（system=1）名单名全集：威胁库三源内置名单 ∪
@@ -4646,8 +4674,10 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	}
 	// 任务不变量在冲突置禁用之后执行——将自动禁用的规则不投入
 	// 运行，不参与运行态不变量（导入/预览双路径同序，见 ValidateConfigImport）。
-	if err := validateV2BackupCertJobs(backup.Tables); err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
+	// cert_jobs 的 CA 提供商悬挂/禁用引用在本处归一为跟随默认并产出警告。
+	certJobProviderWarnings, certJobsErr := validateV2BackupCertJobs(backup.Tables)
+	if certJobsErr != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: certJobsErr.Error()})
 		return
 	}
 	// 写全局配置前按 UpdateAdminTLS 同口径校验 admin_tls_*——坏配置
@@ -5129,6 +5159,9 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 		}
 	}
 	_, certJobsReplaced := backup.Tables["cert_jobs"]
+	// 产物清理门：仅当本次导入替换了规则/证书任务面时才允许清理消失规则
+	// 与失效任务（users-only 等分类导入对 live 数据零触碰）。
+	session.replaceRuleArtifacts = rulesReplaced || certJobsReplaced
 	if rulesReplaced || certJobsReplaced {
 		if _, err := tx.ExecContext(ctx, "DELETE FROM cert_jobs WHERE rule_id NOT IN (SELECT caddy_id FROM lb_rules)"); err != nil {
 			err = session.abort(err)
@@ -5545,6 +5578,10 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	// 方向不同:此处为导入规则引用 live 缺失)。
 	if acmeDanglingImported > 0 {
 		responseWarnings = append(append([]string{}, responseWarnings...), fmt.Sprintf(action+"后 %d 条启用规则的 DNS 提供商配置悬挂（引用未随备份导入，且现有配置中不存在或已禁用）——下一次签发/续签将失败，请及时补齐", acmeDanglingImported))
+	}
+	// 证书任务级 CA 提供商悬挂/禁用引用的归一警告（validateV2BackupCertJobs 产出）。
+	if len(certJobProviderWarnings) > 0 {
+		responseWarnings = append(append([]string{}, responseWarnings...), certJobProviderWarnings...)
 	}
 	// 证书链/域名警告并入响应(行内容类警告,不阻断)。
 	if len(importCertWarnings) > 0 {

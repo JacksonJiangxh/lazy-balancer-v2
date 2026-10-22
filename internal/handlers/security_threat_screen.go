@@ -73,23 +73,37 @@ func describeThreatRuleName(key string) string {
 	case 429:
 		return "限流触发（#429）"
 	}
-	// 阶段 1 预检段（段界单一事实源在 services/security.go）：
-	// GeoIP 800000+policyID、爬虫豁免 810000+policyID*slots+idx、爬虫伪装 850000+policyID。
-	switch {
-	case n > 800000 && n < 810000:
-		return fmt.Sprintf("地域拦截（策略 #%d）", n-800000)
-	case n >= 810000 && n < 850000:
+	// 阶段 1 预检段经 services.DecodePrecheckRuleID 单一事实源解码
+	// （段界字面量禁止复写——段基址调整时 handlers 不得静默分叉）。
+	if family, policyID, _, ok := services.DecodePrecheckRuleID(key); ok {
+		switch family {
+		case services.PrecheckRuleFamilyGeoIP:
+			if policyID > 0 {
+				return fmt.Sprintf("地域拦截（策略 #%d）", policyID)
+			}
+		case services.PrecheckRuleFamilyCrawlerExempt:
+			return "爬虫校验（#" + key + "）"
+		case services.PrecheckRuleFamilyCrawlerSpoof:
+			return "爬虫伪装拦截（#" + key + "）"
+		}
+	}
+	// 属主不可解码的段内边界形态（p=0，发射侧已拒绝、生产不可达）：
+	// 按段归类展示，不猜属主（归因侧禁令同口径）。
+	switch services.PrecheckRuleFamilyOf(n) {
+	case services.PrecheckRuleFamilyCrawlerExempt:
 		return "爬虫校验（#" + key + "）"
-	case n >= 850000 && n < 900000:
+	case services.PrecheckRuleFamilyCrawlerSpoof:
 		return "爬虫伪装拦截（#" + key + "）"
-	case n >= 900000 && n <= 999999:
+	}
+	switch {
+	case n >= services.GeoIPPrecheckSegmentLimit && n < services.SyntheticCustomRuleIDBase:
 		if idx := services.GetCRSRuleIndex(); idx != nil {
 			if entry := idx.Find(key); entry != nil && strings.TrimSpace(entry.Msg) != "" {
 				return fmt.Sprintf("%s（#%s）", strings.TrimSpace(entry.Msg), key)
 			}
 		}
 		return "CRS 规则（#" + key + "）"
-	case n > 10000 && n < 800000:
+	case n > 10000 && n < services.GeoIPPrecheckSegmentBase:
 		// 自定义规则 emit id = DB id + 10000（emit 侧对 DB id ≥790000 有守卫）。
 		if db.DB != nil {
 			var name string
@@ -179,6 +193,17 @@ const (
 	// 递增 threatRollupClassifierVersion，代际不一致按空覆盖重固。
 	threatRollupClassifierVersionKey = "threat_rollup_classifier_version"
 	threatRollupClassifierVersion    = "2"
+	// threatRollupPredicateVersionKey / threatRollupPredicateVersion 保留地址
+	// 排除谓词（isReservedIP 族）的口径代际：谓词变更会让已固化分钟的口径
+	// 静默过时（水位机制只保护迟到事件，不保护语义变更）——修改保留地址
+	// 排除口径时必须 bump 本版本，代际不一致按空覆盖重固。
+	threatRollupPredicateVersionKey = "threat_rollup_predicate_version"
+	threatRollupPredicateVersion    = "1"
+	// threatRollupActionEnumVersionKey / threatRollupActionEnumVersion 事件
+	// action 取值枚举（blocked/logged 族）的口径代际：枚举/命名变更必须
+	// bump，否则大屏 blocked/总量比例静默漂移。
+	threatRollupActionEnumVersionKey = "threat_rollup_action_enum_version"
+	threatRollupActionEnumVersion    = "1"
 	// threatRollupRebuildFromKey 未完成的全量重建意图起点
 	// 目标维度就绪标记缺失 / GeoIP 代际变化的触发窗口起点。意图存在期间每次
 	// 固化都按 fullRebuild 处理并把回填下界扩到该起点，覆盖底端推进到起点后
@@ -429,6 +454,19 @@ func ensureThreatRollupWithYields(hours int) error {
 		emptyCoverage = true
 		rebuildNeeded = true
 	}
+	// 谓词/action 枚举代际同上——写侧语义变更必须重固（水位只保护迟到
+	// 事件，不保护语义变更）。
+	for _, kv := range [][2]string{
+		{threatRollupPredicateVersionKey, threatRollupPredicateVersion},
+		{threatRollupActionEnumVersionKey, threatRollupActionEnumVersion},
+	} {
+		if cur, ok, sErr := loadThreatRollupRawState(database, kv[0]); sErr != nil {
+			return sErr
+		} else if !ok || cur != kv[1] {
+			emptyCoverage = true
+			rebuildNeeded = true
+		}
+	}
 	if emptyCoverage {
 		coveredFrom = dTo.Add(time.Minute)
 		lastFixed = dTo
@@ -600,6 +638,15 @@ func ensureThreatRollupWithYields(hours int) error {
 			threatRollupClassifierVersionKey, threatRollupClassifierVersion); err != nil {
 			tx.Rollback()
 			return err
+		}
+		// 谓词/action 枚举代际与固化结果同事务落库。
+		for _, kv := range [][2]string{
+			{threatRollupPredicateVersionKey, threatRollupPredicateVersion},
+			{threatRollupActionEnumVersionKey, threatRollupActionEnumVersion},
+		} {
+			if _, err := tx.Exec(`INSERT INTO metrics_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, kv[0], kv[1]); err != nil {
+				return err
+			}
 		}
 		if err := tx.Commit(); err != nil {
 			return err
@@ -783,11 +830,19 @@ func resetThreatRollupWarmerForTest() {
 	threatRollupRequestedHoursAt.Store(0)
 }
 
-// queryThreatRecentBlocked 近 5 分钟 blocked 计数（大屏 recent_rate 数据源）。
+// threatRollupBlockedAction 大屏 blocked 计数的 action 取值单一事实源：
+// queryThreatRecentBlocked（SUM 路径）与主扫描（Go 侧逐行累加）共用——
+// 两侧口径漂移会被同一钉测捕获。
+const threatRollupBlockedAction = "blocked"
+
+// queryThreatRecentBlocked 近 N 个完整分钟 [fromMinute, toMinute) 的 blocked
+// 计数（大屏 recent_rate 数据源）。上界开区间排除当前未满分钟——把不足
+// 60s 的当前分钟按整分钟并入会使口径随秒数漂移（最坏偏高 ~20%），与
+// rollup「最新完整分钟」语义对齐（指标滞后 ≤60s，可接受）。
 // 测试注入缝：需要只让最后一条 SUM 失败，验证 500 不被 200 吞掉。
-var queryThreatRecentBlocked = func(sinceMinute string) (int, error) {
+var queryThreatRecentBlocked = func(fromMinute, toMinute string) (int, error) {
 	var blocked int
-	err := db.MetricsDB.QueryRow(`SELECT COALESCE(SUM(count),0) FROM security_event_rollup WHERE minute >= ? AND action='blocked'`, sinceMinute).Scan(&blocked)
+	err := db.MetricsDB.QueryRow(`SELECT COALESCE(SUM(count),0) FROM security_event_rollup WHERE minute >= ? AND minute < ? AND action='`+threatRollupBlockedAction+`'`, fromMinute, toMinute).Scan(&blocked)
 	return blocked, err
 }
 
@@ -1195,7 +1250,9 @@ func fetchThreatTrafficSnapshot(adminURL string) (gin.H, bool) {
 	}, true
 }
 
-// threatBucketStep 是直方图槽生成与 rollup 落槽共用的小时/日桶判据单源。
+// threatBucketStep 是大屏滑动直方图槽（小时/日桶）的步长判据——仅
+// threatHourlyBuckets 消费；rollup 落槽是分钟粒度固化，不使用本函数
+// （调整桶步长不影响 rollup 聚合口径）。
 func threatBucketStep(hours int) time.Duration {
 	if hours <= 24 {
 		return time.Hour
@@ -1386,7 +1443,9 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 			var count int
 			trackErr(rollRows.Scan(&minute, &country, &province, &family, &rule, &action, &count))
 			total += count
-			if action == "blocked" {
+			// action 取值与 queryThreatRecentBlocked 同单一事实源
+			// （threatRollupBlockedAction），两侧口径漂移由同一钉测捕获。
+			if action == threatRollupBlockedAction {
 				blocked += count
 			}
 			if country != "" {
@@ -1445,9 +1504,13 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 		// 一位小数（百分比展示口径）
 		blockRate = float64(int(blockRate*10+0.5)) / 10
 	}
-	// recent_rate：近 5 分钟 blocked/min（rollup 单前缀扫描；logged 不计）
-	since5Minute := threatScreenNow().UTC().Add(-5 * time.Minute).Truncate(time.Minute).Format("2006-01-02 15:04")
-	blocked5, rerr := queryThreatRecentBlocked(since5Minute)
+	// recent_rate：近 5 个完整分钟 blocked/min（rollup 单前缀扫描；logged 不计）。
+	// 当前未满分钟不参与——窗口跨度恒定 5.00 分钟（与 rollup 完整分钟语义一致）。
+	nowMinute := threatScreenNow().UTC().Truncate(time.Minute)
+	blocked5, rerr := queryThreatRecentBlocked(
+		nowMinute.Add(-5*time.Minute).Format("2006-01-02 15:04"),
+		nowMinute.Format("2006-01-02 15:04"),
+	)
 	trackErr(rerr)
 	// 计算/响应前的最终错误检查——旧实现只在 rollup/active 扫描后
 	// 检查一次，recent_rate 的 SUM 失败会被 200 响应吞掉（部分维度静默为 0）。
@@ -1848,16 +1911,20 @@ func (h *Handlers) GetSecurityEventFeed(c *gin.Context) {
 // WAF 拆 CRS/自定义（各数值段互斥：10000-799999 与 1000000+=自定义、
 // 900000-999999=CRS）；429→限流、GeoIP 老 id:8 兼容。
 func triggerTypeForRule(ruleTriggered string) string {
+	// 预检段家族判定经 services.PrecheckRuleFamilyOf 单一事实源（段界
+	// 字面量禁止复写——段基址调整时 handlers 不得静默分叉）。
 	n, err := strconv.Atoi(ruleTriggered)
 	if err == nil {
-		switch {
-		case n >= 810000 && n < 900000:
-			return "爬虫Bot"
-		case n >= 800000 && n < 810000:
+		switch services.PrecheckRuleFamilyOf(n) {
+		case services.PrecheckRuleFamilyGeoIP:
 			return "地域拦截"
-		case n >= 900000 && n < 1000000:
+		case services.PrecheckRuleFamilyCrawlerExempt, services.PrecheckRuleFamilyCrawlerSpoof:
+			return "爬虫Bot"
+		}
+		switch {
+		case n >= services.GeoIPPrecheckSegmentLimit && n < services.SyntheticCustomRuleIDBase:
 			return "WAF·CRS"
-		case n >= 10000 && n < 800000, n >= 1000000:
+		case n >= 10000 && n < services.GeoIPPrecheckSegmentBase, n >= services.SyntheticCustomRuleIDBase:
 			return "WAF·自定义"
 		}
 	}

@@ -87,6 +87,42 @@ func TestNormalizeLegacySecurityPolicyEnums_normalizesAndBumps_whenLegacyRowsExi
 	}
 }
 
+// 非空非法枚举（带外直写/跨版本快照绕过写侧白名单落库）同样随启动归一
+// 收敛——渲染端对枚举外值零产出规则/落入错误分支，与遗留空串同型。
+func TestNormalizeLegacySecurityPolicyEnums_normalizesNonEnumValues(t *testing.T) {
+	setupSecurityEnumTestDB(t)
+	insertLegacyPolicyRow(t, "dirty-mode", "BLOCKING", "deny", "off")
+	insertLegacyPolicyRow(t, "dirty-acl", "off", "DENY", "off")
+	insertLegacyPolicyRow(t, "dirty-geo", "off", "deny", "banana")
+	insertLegacyPolicyRow(t, "valid", "blocking", "allow", "allow")
+	before := clusterVersion(t)
+
+	NormalizeLegacySecurityPolicyEnums(context.Background())
+
+	rows := map[string][3]string{}
+	for _, name := range []string{"dirty-mode", "dirty-acl", "dirty-geo", "valid"} {
+		var mode, aclMode, geoMode string
+		if err := db.DB.QueryRow("SELECT mode, ip_acl_mode, geoip_mode FROM security_policies WHERE name=?", name).Scan(&mode, &aclMode, &geoMode); err != nil {
+			t.Fatal(err)
+		}
+		rows[name] = [3]string{mode, aclMode, geoMode}
+	}
+	want := map[string][3]string{
+		"dirty-mode": {"off", "deny", "off"},
+		"dirty-acl":  {"off", "deny", "off"},
+		"dirty-geo":  {"off", "deny", "deny"},
+		"valid":      {"blocking", "allow", "allow"},
+	}
+	for name, w := range want {
+		if rows[name] != w {
+			t.Fatalf("policy %s = %v, want %v", name, rows[name], w)
+		}
+	}
+	if v := clusterVersion(t); v != before+1 {
+		t.Fatalf("cluster_version=%d, want +1", v)
+	}
+}
+
 // TestNormalizeLegacySecurityPolicyEnums_disablesRateLimitWithInvalidRPS
 // （enabled=1 & rps<1，修复前 Update 缺陷可落库）绑定启用规则时整份配置
 // 生成失败（render fail-visible）。启动归一关停业务开关（enabled=0，rps 库值

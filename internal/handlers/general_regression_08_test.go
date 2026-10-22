@@ -90,7 +90,7 @@ func TestValidateV2BackupTLSShape_allows_valid_acme_dns_row(t *testing.T) {
 	if err := validateV2BackupTLSShape(tables); err != nil {
 		t.Fatalf("validateV2BackupTLSShape unexpected error: %v", err)
 	}
-	if err := validateV2BackupCertJobs(tables); err != nil {
+	if _, err := validateV2BackupCertJobs(tables); err != nil {
 		t.Fatalf("validateV2BackupCertJobs unexpected error: %v", err)
 	}
 }
@@ -153,7 +153,7 @@ func TestValidateV2BackupCertJobs_domain_matching(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			newBackupTestHandlers(t)
-			err := validateV2BackupCertJobs(tt.tables)
+			_, err := validateV2BackupCertJobs(tt.tables)
 			if tt.wantErrText != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErrText) {
 					t.Fatalf("validateV2BackupCertJobs err=%v, want contains %q", err, tt.wantErrText)
@@ -183,7 +183,7 @@ func TestValidateV2BackupCertJobs_accepts_reversed_dual_domain(t *testing.T) {
 		// cert_jobs.domain 按排序规范形式存储
 		"cert_jobs": {{"rule_id": "lb_bak_acme", "domain": "bak-acme.example.test,www.bak-acme.example.test", "status": "queued"}},
 	}
-	if err := validateV2BackupCertJobs(tables); err != nil {
+	if _, err := validateV2BackupCertJobs(tables); err != nil {
 		t.Fatalf("validateV2BackupCertJobs unexpected error: %v", err)
 	}
 }
@@ -212,7 +212,7 @@ func TestValidateV2BackupCertJobs_skips_conflict_disabled_rules(t *testing.T) {
 	if len(conflicts) == 0 {
 		t.Fatal("fixture 未构造出冲突，前置条件不成立")
 	}
-	if err := validateV2BackupCertJobs(tables); err != nil {
+	if _, err := validateV2BackupCertJobs(tables); err != nil {
 		t.Fatalf("冲突置禁用规则不得参与运行态不变量: %v", err)
 	}
 }

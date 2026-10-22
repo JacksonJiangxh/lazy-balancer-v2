@@ -1,6 +1,7 @@
 package services
 
 import (
+	"bytes"
 	"encoding/binary"
 	"log"
 	"os"
@@ -489,5 +490,79 @@ func TestGetIP2RegionProvinces_memoizesByStatKey(t *testing.T) {
 	}
 	if strings.Join(first, ",") != strings.Join(third, ",") {
 		t.Fatalf("同内容重扫结果应一致: %v vs %v", first, third)
+	}
+}
+
+// live 库存在但不可装载（掉电半写/带外损坏）时必须回退镜像内置库并留痕
+// （版本行 bundled），而不是放弃装载让归属地长期为空。
+func Test_InitIP2Region_fallsBackToDistWhenLiveUnreadable(t *testing.T) {
+	if err := db.Initialize(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	live := filepath.Join(dir, "ip2region.xdb")
+	dist := filepath.Join(dir, "waf.dist", "ip2region.xdb")
+	if err := os.MkdirAll(filepath.Dir(dist), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestXDB(t, dist, testSegments)
+	if err := os.WriteFile(live, []byte("corrupt-half-written-xdb"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	withIP2RegionPaths(t, live, dist)
+
+	InitIP2Region()
+
+	if got := Lookup("1.2.3.100"); got != "US" {
+		t.Fatalf("损坏 live 未回退 dist: Lookup=%q, want US", got)
+	}
+	want, err := os.ReadFile(dist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(live)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("live 必须被替换为 dist 内容")
+	}
+	if v, verr := GetIP2RegionVersion(); verr != nil || v != "bundled" {
+		t.Fatalf("version=%q,%v, want bundled 保守标识", v, verr)
+	}
+}
+
+// 结构自检门：合法 xdb 通过；截断/指针越界拒绝（装载路径的前置门，
+// 坏文件不得进入绑定库的无边界切片）。
+// REDISABLED
+func TestCheckIP2RegionXDBStructure(t *testing.T) {
+	dir := t.TempDir()
+	valid := filepath.Join(dir, "valid.xdb")
+	writeTestXDB(t, valid, testSegments)
+	if err := checkIP2RegionXDBStructure(valid); err != nil {
+		t.Fatalf("合法 xdb 须通过结构门: %v", err)
+	}
+
+	data, err := os.ReadFile(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	truncated := filepath.Join(dir, "truncated.xdb")
+	if err := os.WriteFile(truncated, data[:100000], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkIP2RegionXDBStructure(truncated); err == nil {
+		t.Fatal("截断文件须被结构门拒绝")
+	}
+
+	// 头内段索引指针越出文件（尺寸足够，指针损坏）
+	badPtr := filepath.Join(dir, "badptr.xdb")
+	corrupt := append([]byte(nil), data...)
+	binary.LittleEndian.PutUint32(corrupt[12:], uint32(len(corrupt)))
+	if err := os.WriteFile(badPtr, corrupt, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkIP2RegionXDBStructure(badPtr); err == nil {
+		t.Fatal("段索引指针越界须被结构门拒绝")
 	}
 }

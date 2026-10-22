@@ -317,7 +317,9 @@ const retryJob = async (row: CertJob) => {
   if (disposed || retryingJobIds.value.has(row.id)) return
   retryingJobIds.value = new Set(retryingJobIds.value).add(row.id)
   try {
-    await request.post(`/certificates/jobs/${row.id}/retry`, undefined, { signal: jobsPolling.signal })
+    // 上方确认对话框已是显式用户确认；force=true 让服务端越过 waiting_ca
+    // 的 CA 冷却门（未确认的直接调用会被 429 拒绝并提示剩余冷却时长）。
+    await request.post(`/certificates/jobs/${row.id}/retry?force=true`, undefined, { signal: jobsPolling.signal })
     if (disposed) return
     mfaAwareSuccess('重新签发已触发')
     // run() 恰逢在途轮询时只把 pending 合并进当前 drain——若撞上 drain 已退出

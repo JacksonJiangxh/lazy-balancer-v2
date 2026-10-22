@@ -67,48 +67,15 @@ func (h *Handlers) GetRuleStageStats(c *gin.Context) {
 		return
 	}
 	ruleCaddyID := c.Param("caddy_id")
-	rows, err := db.MetricsDB.Query(`SELECT rule_triggered, COUNT(*) FROM security_events WHERE rule_caddy_id=? AND action='blocked' AND event_time >= datetime('now','-1 day') GROUP BY rule_triggered`, ruleCaddyID)
+	// 24h 分桶 + 分段耗时经 30s 缓存（规则流程抽屉按秒级轮询/多页签并存，
+	// 单规则 24h 全窗口两次聚合在高事件量下达数百 ms）——与策略 24h 计数
+	// 缓存（security_policy_counts_cache.go）同范式；失败不缓存。
+	stats, err := loadRuleStageStats(db.MetricsDB, ruleCaddyID, time.Now())
 	if err != nil {
 		services.Logf("error", "stage-stats query failed for %s: %v", ruleCaddyID, err)
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "阶段统计查询失败"})
 		return
 	}
-	stage1, stage3, unattributed := 0, 0, 0
-	for rows.Next() {
-		var triggered string
-		var count int
-		if err := rows.Scan(&triggered, &count); err != nil {
-			rows.Close()
-			services.Logf("error", "stage-stats scan failed for %s: %v", ruleCaddyID, err)
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "阶段统计查询失败"})
-			return
-		}
-		n, convErr := strconv.Atoi(triggered)
-		switch {
-		case triggered == "429":
-			// 限流拦截（429）由 ratelimit_blocks_reload（/metrics
-			// 429 计数）单独供给阶段 2 chip；此前落入 else 分支被计入
-			// stage3_blocked_24h，导致同一拦截同时出现在阶段 2 与阶段 3。
-			continue
-		case convErr == nil && services.IsStage1PrecheckID(n): // 历史收敛：五元组单一事实源
-			stage1 += count
-		case convErr != nil:
-			// 非数字 triggered（空串/垃圾串/带前缀 ID）不是阶段 1 也不是阶段 3：
-			// 与同域 categorizeAttack/attackFamilyClassOf 的「其他/未归因」口径
-			// 一致，归独立桶披露（旧实现 default 直接计入阶段 3=WAF，把未归因
-			// 事件伪装成策略命中的错误归属）。
-			unattributed += count
-		default:
-			stage3 += count
-		}
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		services.Logf("error", "stage-stats rows iteration failed for %s: %v", ruleCaddyID, err)
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "阶段统计查询失败"})
-		return
-	}
-	rows.Close()
 
 	var domain string
 	if err := db.DB.QueryRow(`SELECT COALESCE(domain,'') FROM lb_rules WHERE caddy_id=?`, ruleCaddyID).Scan(&domain); err != nil {
@@ -143,25 +110,118 @@ func (h *Handlers) GetRuleStageStats(c *gin.Context) {
 			}
 		}
 	}
-	// 分段平均处理耗时：预检段使用全部正 precheck_us 快照（含 WAF 事件）；
-	// WAF 段只使用非预检事件的正 duration_us。两个分桶共用
-	// Stage1PrecheckSegmentSQL，避免 SQL 选值与 Go 分组谓词分叉；升级前
-	// precheck_us=0 的存量行不进入任何均值样本。
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{
+		"stage1_blocked_24h":      stats.stage1,
+		"stage3_blocked_24h":      stats.stage3,
+		"stage_unattributed_24h":  stats.unattributed,
+		"ratelimit_blocks_reload": ratelimit,
+		"precheck_avg_us":         stats.preAvg,
+		"precheck_samples":        stats.preCnt,
+		"waf_avg_us":              stats.wafAvg,
+		"waf_samples":             stats.wafCnt,
+	}})
+}
+
+// ruleStageStatsSnapshot 是单规则 24h 阶段计数 + 分段耗时的缓存单元。
+type ruleStageStatsSnapshot struct {
+	stage1, stage3, unattributed int
+	preAvg, wafAvg               float64
+	preCnt, wafCnt               int
+}
+
+// ruleStageStatsCacheTTL 缓存有效期（测试可缩短）。
+var ruleStageStatsCacheTTL = 30 * time.Second
+
+type ruleStageStatsCacheKey struct {
+	metrics *sql.DB
+	rule    string
+	anchor  string // 24h 窗口锚点（UTC 分钟串）
+}
+
+type ruleStageStatsCacheEntry struct {
+	snapshot  ruleStageStatsSnapshot
+	expiresAt time.Time
+}
+
+var (
+	ruleStageStatsMu    sync.Mutex
+	ruleStageStatsCache = map[ruleStageStatsCacheKey]ruleStageStatsCacheEntry{}
+)
+
+// resetRuleStageStatsCacheForTest 测试缝：清空缓存（生产不调用）。
+func resetRuleStageStatsCacheForTest() {
+	ruleStageStatsMu.Lock()
+	ruleStageStatsCache = map[ruleStageStatsCacheKey]ruleStageStatsCacheEntry{}
+	ruleStageStatsMu.Unlock()
+}
+
+// loadRuleStageStats 返回单规则近 24h 的阶段分桶计数与分段耗时（命中缓存时
+// 零查询）。分桶口径：阶段 1={2,4,7,8,14}∪[800000,900000) 预检段（
+// IsStage1PrecheckID 单一事实源），429 由 ratelimit_blocks_reload 单独供给
+// 阶段 2 chip（不计入阶段 3），非数字 triggered 归「未归因」独立桶（与
+// categorizeAttack 的「其他/未归因」口径一致），其余归阶段 3。
+// 分桶查询失败显式上抛（不缓存）；耗时为增强信息——失败留 warn 按零值并入
+// 快照（响应仍返回其余已取数据，与缓存前口径一致）。
+func loadRuleStageStats(metricsDB *sql.DB, ruleCaddyID string, now time.Time) (ruleStageStatsSnapshot, error) {
+	key := ruleStageStatsCacheKey{metrics: metricsDB, rule: ruleCaddyID, anchor: now.UTC().Format("2006-01-02 15:04")}
+	if ruleStageStatsCacheTTL > 0 {
+		ruleStageStatsMu.Lock()
+		if entry, ok := ruleStageStatsCache[key]; ok && now.Before(entry.expiresAt) {
+			snapshot := entry.snapshot
+			ruleStageStatsMu.Unlock()
+			return snapshot, nil
+		}
+		ruleStageStatsMu.Unlock()
+	}
+
+	var snapshot ruleStageStatsSnapshot
+	rows, err := metricsDB.Query(`SELECT rule_triggered, COUNT(*) FROM security_events WHERE rule_caddy_id=? AND action='blocked' AND event_time >= datetime('now','-1 day') GROUP BY rule_triggered`, ruleCaddyID)
+	if err != nil {
+		return snapshot, err
+	}
+	for rows.Next() {
+		var triggered string
+		var count int
+		if err := rows.Scan(&triggered, &count); err != nil {
+			rows.Close()
+			return snapshot, err
+		}
+		n, convErr := strconv.Atoi(triggered)
+		switch {
+		case triggered == "429":
+			continue
+		case convErr == nil && services.IsStage1PrecheckID(n):
+			snapshot.stage1 += count
+		case convErr != nil:
+			snapshot.unattributed += count
+		default:
+			snapshot.stage3 += count
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return snapshot, err
+	}
+	rows.Close()
+
 	preAvg, preCnt, wafAvg, wafCnt, terr := queryRuleStageTimings(ruleCaddyID)
 	if terr != nil {
-		// 耗时为增强信息：查询失败留 warn，响应仍返回其余已取数据。
 		services.Logf("warn", "stage-stats timing query failed for %s: %v", ruleCaddyID, terr)
+	} else {
+		snapshot.preAvg, snapshot.preCnt, snapshot.wafAvg, snapshot.wafCnt = preAvg, preCnt, wafAvg, wafCnt
 	}
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{
-		"stage1_blocked_24h":      stage1,
-		"stage3_blocked_24h":      stage3,
-		"stage_unattributed_24h":  unattributed,
-		"ratelimit_blocks_reload": ratelimit,
-		"precheck_avg_us":         preAvg,
-		"precheck_samples":        preCnt,
-		"waf_avg_us":              wafAvg,
-		"waf_samples":             wafCnt,
-	}})
+
+	if ruleStageStatsCacheTTL > 0 {
+		ruleStageStatsMu.Lock()
+		// 键含分钟锚点+规则身份：条目数受 TTL 与活跃规则数约束；超界重建
+		// 防长尾规则集膨胀（与策略计数缓存同范式）。
+		if len(ruleStageStatsCache) > 256 {
+			ruleStageStatsCache = map[ruleStageStatsCacheKey]ruleStageStatsCacheEntry{}
+		}
+		ruleStageStatsCache[key] = ruleStageStatsCacheEntry{snapshot: snapshot, expiresAt: now.Add(ruleStageStatsCacheTTL)}
+		ruleStageStatsMu.Unlock()
+	}
+	return snapshot, nil
 }
 
 // queryRuleStageTimings 分段平均处理耗时聚合（预检段 / WAF 段）。

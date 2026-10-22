@@ -1,8 +1,10 @@
 package services
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"lazy-balancer-v2/internal/db"
@@ -173,5 +175,74 @@ func TestSecurityEventsTick_permanentGarbageSkippedAfterStallLimit(t *testing.T)
 	}
 	if n := stallEventCount(t); n != 2 {
 		t.Fatalf("event count=%d, want 2 (doc1 + doc3 only)", n)
+	}
+}
+
+// 畸形区跳过=该段事件永久丢弃——跳过那一轮 tick 成功返回（记账会重置连续
+// 失败计数），若不登记跳过信号，事件列表/总览/大屏三面仍显示 healthy。
+// 跳过必须计数并降级健康位（窗口内），任务日志边沿行由摄取 daemon 写。
+func TestSecurityEventsTick_skipRegistersHealthSignal(t *testing.T) {
+	SecurityEventsSetIngestionHealthForTest(SecurityEventsIngestionStatus{})
+	t.Cleanup(func() { SecurityEventsSetIngestionHealthForTest(SecurityEventsIngestionStatus{}) })
+	logPath, offsetPath := stallSetup(t)
+	if err := os.WriteFile(logPath, stallFixtureBytes(stallFixtureDoc2Partial2, stallFixtureDoc3), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tailer := securityEventsNewTailer(logPath, offsetPath)
+	for i := 1; i <= securityEventsDecodeStallLimit; i++ {
+		if err := tailer.securityEventsTick(); err == nil {
+			t.Fatalf("tick %d: expected stall error while garbage is within stall limit", i)
+		}
+	}
+	// 跳过一个畸形区（残缺文档本体）后 tick 成功返回。
+	if err := tailer.securityEventsTick(); err != nil {
+		t.Fatalf("tick after stall limit should skip garbage and succeed: %v", err)
+	}
+
+	st := SecurityEventsIngestionHealthSnapshot()
+	if st.SkippedRegions != 1 {
+		t.Fatalf("SkippedRegions=%d, want 1（跳过必须计数）", st.SkippedRegions)
+	}
+	wantBytes := uint64(len(stallFixtureDoc2Partial2) + 1)
+	if st.SkippedBytes != wantBytes {
+		t.Fatalf("SkippedBytes=%d, want %d（被跳过区段字节数）", st.SkippedBytes, wantBytes)
+	}
+	if st.LastSkipAt == "" {
+		t.Fatal("LastSkipAt 必须记录跳过时刻")
+	}
+	if st.Healthy {
+		t.Fatal("窗口内有跳过（事件永久丢弃）时健康位必须为 false")
+	}
+}
+
+// 摄取事务字节触发：大 body 洪峰下不等 500 行满批——累计 headers+body
+// 超 8MiB 即提前提交，单事务驻留有界（不与行数批叠加放大进程峰值）。
+func TestSecurityEventsTick_batchCommitsOnByteCap(t *testing.T) {
+	logPath, offsetPath := stallSetup(t)
+	body := strings.Repeat("b", 100*1024)
+	line := func(id string) string {
+		return `{"transaction":{"id":"` + id + `","unix_timestamp":1789740000,"client_ip":"203.0.113.9","server_id":"cap.test","request":{"method":"POST","uri":"/u","headers":{"host":["cap.test"]},"body":"` + body + `"},"response":{"status":200},"is_interrupted":false},"messages":[]}`
+	}
+	var sb strings.Builder
+	// 单事件 body 经安全截断（64KiB）入批——需 ≥129 条才越过 8MiB 字节
+	// 触发线（行数批 500 远未到达）。
+	const events = 150
+	for i := 0; i < events; i++ {
+		sb.WriteString(line(fmt.Sprintf("tx-cap-%d", i)))
+		sb.WriteString("\n")
+	}
+	if err := os.WriteFile(logPath, []byte(sb.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	base := securityEventsIngestCommits.Load()
+	tailer := securityEventsNewTailer(logPath, offsetPath)
+	if err := tailer.securityEventsTick(); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if got := securityEventsIngestCommits.Load() - base; got < 2 {
+		t.Fatalf("本 pass 提交次数=%d, want ≥2（字节触发提前提交）", got)
+	}
+	if n := stallEventCount(t); n != events {
+		t.Fatalf("event count=%d, want %d（字节触发不得丢事件）", n, events)
 	}
 }

@@ -164,6 +164,10 @@ type SecurityPolicySummary struct {
 	// 摘要携带 CRS 规则组原始 JSON——前端向导跨策略重复告警直接消费摘要，
 	// 不再对每条启用策略 N+1 拉取详情。
 	CRSRuleGroups json.RawMessage `json:"crs_rule_groups"`
+	// CRSStaleSelections：crs_rule_groups 含本地规则索引中已不存在的组号/
+	// 规则 ID（CRS 更替后的陈旧选择——该部分保护静默失效，渲染侧仅
+	// skip+WARN）。列表给出可观测标记，供 UI 标注「选择已失效」。
+	CRSStaleSelections bool `json:"crs_stale_selections"`
 	// 追加（多策略绑定根因 1）：ruleProtections 的 GeoIP/自定义
 	// 规则行此前永远没有数据（接口只给 has_ip_control/has_rate_limit）。
 	HasGeoIP            bool   `json:"has_geoip"`

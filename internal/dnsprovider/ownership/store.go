@@ -29,12 +29,12 @@ func SetLogf(f func(level, format string, args ...any)) {
 
 const ownershipFileName = "acme_dns_ownership.json"
 
-// staleOwnershipAge is the age beyond which an ownership entry can no longer
+// StaleOwnershipAge is the age beyond which an ownership entry can no longer
 // belong to a live issuance: the CA queue caps execution at 60 minutes and the
 // deferred cleanup budget is capped at 8 minutes (acme dnsCleanupBudgetMax,
 // so anything older is provably abandoned and may be removed by any
 // later cleanup without endangering a concurrent challenge.
-const staleOwnershipAge = 75 * time.Minute
+const StaleOwnershipAge = 75 * time.Minute
 
 var fileMu sync.Mutex
 
@@ -66,19 +66,23 @@ type Record struct {
 }
 
 // Stale 报告该条目是否已超出任何在途签发的生命周期（CA 队列 60min + 清理
-// 预算 8min 的上界，见 staleOwnershipAge），即已可被任意后续清理回收。
+// 预算 8min 的上界，见 StaleOwnershipAge），即已可被任意后续清理回收。
 // 零值 CreatedAt（更早版本写入且从未回填）不判 stale：无法证明它已过期，
 // 保守按「可能仍在本轮签发中」处理（与 MatchingValue 的既有口径一致）。
 func (r Record) Stale(now time.Time) bool {
-	return !r.CreatedAt.IsZero() && now.Sub(r.CreatedAt) > staleOwnershipAge
+	return !r.CreatedAt.IsZero() && now.Sub(r.CreatedAt) > StaleOwnershipAge
 }
 
-// AccountDigest 由凭据派生账户身份（sha256 前 4 字节 = 8 位十六进制），
+// AccountDigest 由凭据派生账户身份（sha256 前 8 字节 = 16 位十六进制），
 // 与 dnspod 的 domainIDCacheKey 同源口径：不落凭据明文（所有权文件是明文
 // JSON，落盘/集群快照/排障转储都可读），且同一凭据多进程/多实例得到同一值。
+// 该摘要是 DecideRemoval「按 record_id 删除还是只丢本地条目」的归属判据，
+// 8 字节把碰撞界推到密码学可忽略域（32 位生日界约 7.7 万账户即有过半碰撞）。
+// 口径变更后既有账本的 8 位摘要不再匹配当前凭据——旧条目按 legacy/他账户
+// 语义降级为「只丢弃不删除」（DecideRemoval 保守方向），随同名清理自然淘汰。
 func AccountDigest(secret string) string {
 	sum := sha256.Sum256([]byte(secret))
-	return hex.EncodeToString(sum[:4])
+	return hex.EncodeToString(sum[:8])
 }
 
 // Disposition 是清理方对一条所有权条目的处置结论。
@@ -250,6 +254,18 @@ func sameRecord(a, b Record) bool {
 }
 
 func (s *Store) Remove(removed Record) error {
+	return s.RemoveMany([]Record{removed})
+}
+
+// RemoveMany 在一次 load/save（一次全量重写 + fsync）内移除多条记录——
+// 清理链逐条 Remove 的代价是 O(记录数) 字节 × 条目数（每条一次全文件
+// fsync 重写），批量收敛后一次清理只付一次。语义与逐条 Remove 一致：
+// 按 sameRecord 精确匹配，未命中的条目静默忽略（调用方只传「远端已删除/
+// 判定丢弃」的条目，删除失败的条目不得传入——否则丢失重试追踪）。
+func (s *Store) RemoveMany(removed []Record) error {
+	if len(removed) == 0 {
+		return nil
+	}
 	fileMu.Lock()
 	defer fileMu.Unlock()
 	current, err := s.load()
@@ -258,9 +274,20 @@ func (s *Store) Remove(removed Record) error {
 	}
 	remaining := make([]Record, 0, len(current.Records))
 	for _, record := range current.Records {
-		if !sameRecord(record, removed) {
+		drop := false
+		for _, target := range removed {
+			if sameRecord(record, target) {
+				drop = true
+				break
+			}
+		}
+		if !drop {
 			remaining = append(remaining, record)
 		}
+	}
+	if len(remaining) == len(current.Records) {
+		// 零命中（调用方条目与账本漂移）——无变化不写盘，省一次全量 fsync。
+		return nil
 	}
 	current.Records = remaining
 	return s.save(current)

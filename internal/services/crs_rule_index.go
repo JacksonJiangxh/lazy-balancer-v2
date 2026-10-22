@@ -10,9 +10,12 @@ package services
 //      组号的存在性校验（陈旧 → 400）。
 // 从节点携带本地 CRS 文件，同一索引在其本地构建即可判陈旧（与主端解耦）。
 //
-// 缓存：键 = security_crs_version 行值 + 规则目录的（文件数, 最大 mtime,
-// 总 size）——CRS 手动/自动更新与从节点 waf_files 同步只写文件与版本行，
-// 任一变化即键变重建；命中率稳态下每次取值 ~50 次 stat + 1 次 DB 查询。
+// 缓存：键 = security_crs_version 行值 + 目录路径 + 规则目录的（文件数,
+// 最大 mtime, 总 size）——CRS 手动/自动更新与从节点 waf_files 同步会写文件
+// 与版本行，增删文件/mtime/size/版本变化即键变重建；目录路径编入键使测试
+// 夹具/多目录的同统计量场景不会错命中。已知边界：同大小内容替换且 mtime
+// 不变的逐字节改写不改键（键是代际判别器，非内容指纹）。命中率稳态下每次
+// 取值 ~50 次 stat + 1 次 DB 查询。
 
 import (
 	"fmt"
@@ -378,12 +381,15 @@ func crsRuleIndexVersion() string {
 	return version
 }
 
-// crsRuleIndexCacheKey 计算（键, 是否可解析目录）。文件聚合 stat：数量 +
-// 最大 mtime + 总 size——任一文件内容/时间戳变化或增删文件都会改变键。
+// crsRuleIndexCacheKey 计算（键, 是否可解析目录）。键 = 版本 + 目录路径 +
+// 文件聚合 stat（数量 + 最大 mtime + 总 size）。目录路径必须在键内——同
+// 统计量的不同目录（测试夹具/多目录场景）不得命中同一缓存。注意边界：
+// 「同大小内容替换且 mtime 不变」不改键（tar 解包保留 mtime 时理论可达），
+// 文件内容的逐字节变化不在键的覆盖范围内——键是代际判别器而非内容指纹。
 func crsRuleIndexCacheKey(version string) string {
 	entries, err := os.ReadDir(CRSRuleIndexDir)
 	if err != nil {
-		return version + "|-"
+		return version + "|" + CRSRuleIndexDir + "|-"
 	}
 	var maxMtime, totalSize int64
 	count := 0
@@ -401,7 +407,7 @@ func crsRuleIndexCacheKey(version string) string {
 		}
 		totalSize += info.Size()
 	}
-	return fmt.Sprintf("%s|%d|%d|%d", version, count, maxMtime, totalSize)
+	return fmt.Sprintf("%s|%s|%d|%d|%d", version, CRSRuleIndexDir, count, maxMtime, totalSize)
 }
 
 // buildCRSRuleIndex 全量解析规则目录：文件名升序遍历（确定性），同 ID

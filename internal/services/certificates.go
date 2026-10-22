@@ -840,9 +840,10 @@ func (s *CertificateService) resumeDeploymentRetries() {
 // rescanDroppedDeploymentRetries 重新调度暂停期间被丢弃、或部署失败状态回写
 // 失败而未登记 timer 的部署重试：`downloaded` 需已有 available_after；`cleanup_*`
 // 的失败写回可能连窗口列都没更新，仍须由周期补扫拾起。
-func (s *CertificateService) rescanDroppedDeploymentRetries() {
+// 返回本轮实际重排的部署重试数（供 30s 补扫节拍的动作计数摘要）。
+func (s *CertificateService) rescanDroppedDeploymentRetries() (rescheduled int) {
 	if db.DB == nil {
-		return
+		return 0
 	}
 	rows, err := db.DB.Query(`
 		SELECT j.id, COALESCE(j.rule_id,''), COALESCE(j.domain,''), COALESCE(j.ca_provider_id,0), COALESCE(j.deployment_attempts,0),
@@ -911,7 +912,9 @@ func (s *CertificateService) rescanDroppedDeploymentRetries() {
 			Logf("warn", "证书任务 %d：deployment_available_after=%q 无法解析，按立即重试处理", job.id, job.availableAfter)
 		}
 		s.deploymentRetry(job.id, issuedCertificate{ruleID: job.ruleID, providerID: job.providerID, deploymentAttempt: job.deploymentAttempts}, delay)
+		rescheduled++
 	}
+	return rescheduled
 }
 
 func (s *CertificateService) Start() {
@@ -1013,17 +1016,22 @@ func certJobsActive() bool {
 // CertWaitingCATickOnce CA 等待/滞留补扫（30s 节拍）。
 // 门控（2026-09-29 用户裁定）：无非终态证书任务即退出——零扫描零动作；
 // 孤儿任务均为非终态，门控天然覆盖，不漏扫。
+// 摘要行只在有真实动作时落盘并携带分项计数——waiting_ca 冷却可长达 3h，
+// 无条件写行会让 30s 轮次空转刷屏（≈2880 行/日）掩盖真正动作行。
 func CertWaitingCATickOnce() {
 	if !certJobsActive() {
 		return
 	}
 	withActiveCertServiceTick("cert-waiting-ca", "rescan", func(s *CertificateService) {
-		s.requeueWaitingCAJobs()
+		requeued, disabled := s.requeueWaitingCAJobs()
+		stranded := 0
 		if qm := GetCAQueueManager(); qm != nil {
-			qm.requeueStrandedQueuedJobs()
+			stranded = qm.requeueStrandedQueuedJobs()
 		}
-		s.rescanDroppedDeploymentRetries()
-		TaskLogf("cert-waiting-ca", "rescan", "补扫完成：CA 冷却重排/滞留重入队/断链重建一轮（活跃任务明细见 cert_jobs）")
+		redeployed := s.rescanDroppedDeploymentRetries()
+		if requeued+disabled+stranded+redeployed > 0 {
+			TaskLogf("cert-waiting-ca", "rescan", "补扫完成：CA 冷却重排 %d、孤儿禁用 %d、滞留重入队 %d、部署重建 %d", requeued, disabled, stranded, redeployed)
+		}
 	})
 }
 
@@ -1033,15 +1041,15 @@ func CertWaitingCATickOnce() {
 // 任务监控呈现假健康。服务缺失不适用（本函数无服务依赖）。
 func CertReconcileOnce() error {
 	rebuilt, reconcileErr := reconcileMissingCertFiles(db.DB)
-	swept := sweepOrphanedCertJobs(context.Background())
+	swept, sweepErr := sweepOrphanedCertJobs(context.Background())
 	// 兜底：6h 对账同时补建「启用 ACME 但无任务行」的规则——覆盖
 	// 提升窗口之外的行丢失（快照整树替换后残留的中间态）。
 	created, backfillErr := BackfillMissingACMECertJobs(context.Background(), GetCAQueueManager())
 	if backfillErr != nil {
 		Logf("warn", "证书任务对账补建失败: %v", backfillErr)
 	}
-	if err := errors.Join(reconcileErr, backfillErr); err != nil {
-		TaskLogf("cert-reconcile", "reconcile", "状态对账失败：%v（失败轮结果不可信，下一周期重试；已收敛 %d 个断链、%d 个孤儿）", err, rebuilt, swept)
+	if err := errors.Join(reconcileErr, sweepErr, backfillErr); err != nil {
+		TaskLogf("cert-reconcile", "reconcile", "状态对账失败：%v（失败轮结果不可信，下一周期重试；已收敛 %d 个断链、%d 个孤儿——均为部分计数）", err, rebuilt, swept)
 		return err
 	}
 	TaskLogf("cert-reconcile", "reconcile", "状态对账完成：断链重建 %d 个、孤儿清理 %d 个、任务补建 %d 个（一致时为 0）", rebuilt, swept, created)
@@ -1051,10 +1059,12 @@ func CertReconcileOnce() error {
 // requeueWaitingCAJobs re-enqueues cert jobs parked in 'waiting_ca' once
 // their CA cooling period has elapsed. This covers first-time issuance jobs
 // (expires_at IS NULL) that renewExpiringCertificates cannot see.
-func (s *CertificateService) requeueWaitingCAJobs() {
+// 返回（冷却到期重排队数, 孤儿禁用数）——供 30s 补扫节拍的动作计数摘要
+// （无动作不写空转行）。
+func (s *CertificateService) requeueWaitingCAJobs() (requeued, disabled int) {
 	qm := GetCAQueueManager()
 	if qm == nil {
-		return
+		return 0, 0
 	}
 
 	s.mu.Lock()
@@ -1112,6 +1122,7 @@ func (s *CertificateService) requeueWaitingCAJobs() {
 				continue
 			}
 			RecordAuditLog("system", "禁用", "证书任务", FormatAuditDetail(AuditJobPart(job.id), AuditRulePart(job.ruleID), AuditSourcePart("ca_cooldown")), "")
+			disabled++
 			continue
 		}
 		_, changed, err := qm.EnqueueIfActive(job.caProviderID, job.id, job.ruleID, job.domain, func() (int, bool, error) {
@@ -1128,8 +1139,10 @@ func (s *CertificateService) requeueWaitingCAJobs() {
 		if !changed {
 			continue
 		}
+		requeued++
 		RecordAuditLog("system", "重新排队", "证书任务", FormatAuditDetail(AuditJobPart(job.id), AuditRulePart(job.ruleID), AuditSourcePart("ca_cooldown")), "")
 	}
+	return requeued, disabled
 }
 
 // recoverCertJobs re-enqueues cert jobs that were not in a terminal state when
@@ -1384,7 +1397,9 @@ func certJobRuleApplicable(ruleBound bool, ruleDomain, jobDomain string) bool {
 // sweepOrphanedCertJobs 禁用规则已不再引用的非终态证书任务（域名迁移/规则停用/删除后
 // 遗留，启动恢复 requeueNonTerminalCertJobs 只在重启时处理一次），随 6 小时对账巡检执行，
 // 避免孤儿任务滞留到重启或被 waiting_ca 重排队白白签发。
-func sweepOrphanedCertJobs(ctx context.Context) int {
+// 读/迭代失败必须上抛（fail-visible）——此前只 Logf + return 0，对账轮摘要
+// 仍写「孤儿清理 0 个」，任务监控无法区分「一致」与「扫描失败」。
+func sweepOrphanedCertJobs(ctx context.Context) (int, error) {
 	swept := 0
 	rows, err := db.DB.QueryContext(ctx, `
 		SELECT j.id, j.rule_id, j.status, COALESCE(j.domain,''), COALESCE(r.domain,''),
@@ -1395,7 +1410,7 @@ func sweepOrphanedCertJobs(ctx context.Context) int {
 	`)
 	if err != nil {
 		Logf("error", "cert sweep: query certificate jobs failed: %v", err)
-		return 0
+		return 0, fmt.Errorf("查询证书任务: %w", err)
 	}
 	type orphanCandidate struct {
 		id         int
@@ -1411,7 +1426,7 @@ func sweepOrphanedCertJobs(ctx context.Context) int {
 		if err := rows.Scan(&job.id, &job.ruleID, &job.status, &job.jobDomain, &job.ruleDomain, &job.ruleBound); err != nil {
 			rows.Close()
 			Logf("error", "cert sweep: scan certificate job failed: %v", err)
-			return 0
+			return 0, fmt.Errorf("读取证书任务行: %w", err)
 		}
 		if JobIsTerminal(job.status) {
 			continue
@@ -1423,18 +1438,22 @@ func sweepOrphanedCertJobs(ctx context.Context) int {
 	if err := rows.Err(); err != nil {
 		rows.Close()
 		Logf("error", "cert sweep: iterate certificate jobs failed: %v", err)
-		return 0
+		return 0, fmt.Errorf("遍历证书任务: %w", err)
 	}
 	rows.Close()
+	var sweepErr error
 	for _, job := range orphans {
 		if err := ctx.Err(); err != nil {
-			return 0
+			return swept, errors.Join(sweepErr, fmt.Errorf("孤儿清理被中止: %w", err))
 		}
 		if err := transitionJob(db.DB, job.id, nonTerminalJobStatuses, "disabled", map[string]any{"message": "关联规则已不再使用当前 ACME 证书任务"}); err != nil {
 			if errors.Is(err, ErrJobTransitionConflict) {
 				continue
 			}
 			Logf("error", "cert sweep: disable orphaned certificate job %d failed: %v", job.id, err)
+			// 单行写失败不再静默放行——失败行意味着残留孤儿，对账摘要
+			// 必须按失败轮呈现（swept 只计实际收敛，失败原因并入错误链）。
+			sweepErr = errors.Join(sweepErr, fmt.Errorf("禁用孤儿任务 %d: %w", job.id, err))
 			continue
 		}
 		// swept 只计实际收敛的行——消费方 CertReconcileOnce 的
@@ -1443,7 +1462,7 @@ func sweepOrphanedCertJobs(ctx context.Context) int {
 		RecordAuditLog("system", "禁用", "证书任务", FormatAuditDetail(AuditJobPart(job.id), AuditRulePart(job.ruleID), AuditSourcePart("runtime_sweep")), "")
 	}
 
-	return swept
+	return swept, sweepErr
 }
 func (s *CertificateService) Stop() {
 	s.timerMu.Lock()
@@ -1541,6 +1560,12 @@ func upsertQueuedCertJob(ruleID string, list []string, caProviderID int) (int, b
 	return id, err == nil, err
 }
 
+// ErrCertRuleBusy 标记「规则证书任务屏障期」导致的入队拒绝——规则正在
+// 删除/禁用/更新的取消窗口（BlockJobsForRule 租约）内，瞬时冲突语义。
+// 与 ErrCertificateQueueInactive/ErrCertRuleStateConflict 同族：handler 必须
+// 映射 409（可重试的并发冲突），不得折成 500 让并发操作看起来像内部故障。
+var ErrCertRuleBusy = errors.New("规则证书任务正在变更（删除/禁用/更新中），请稍后重试")
+
 // CreateOrRequeueCertJob creates a queued cert job and verifies it is either
 // active in the queue or the caller can report a precise enqueue failure.
 func CreateOrRequeueCertJob(ruleID, domains string, caProviderID int, qm *CAQueueManager) (int, error) {
@@ -1552,6 +1577,10 @@ func CreateOrRequeueCertJob(ruleID, domains string, caProviderID int, qm *CAQueu
 // signal needed by rule-write compensation. It preserves the raw WithChange
 // result for manual issuance, but rejects a no-change result whose job is not
 // actually active in a running queue.
+// 未入队归因顺序：在途（幂等放行）→ 队列停用（ErrCertificateQueueInactive）
+// → 规则屏障（ErrCertRuleBusy）→ 其余（裸错）。屏障归因必须显式——
+// EnqueueIfActive 的注释承诺「changed=false 让 handler 走 409」，裸错会
+// 折成 500。
 func CreateOrRequeueCertJobVerified(ruleID, domains string, caProviderID int, qm *CAQueueManager) (int, bool, error) {
 	jobID, changed, err := CreateOrRequeueCertJobWithChange(ruleID, domains, caProviderID, qm)
 	if err != nil || changed {
@@ -1562,6 +1591,9 @@ func CreateOrRequeueCertJobVerified(ruleID, domains string, caProviderID int, qm
 	}
 	if qm != nil && !qm.IsActive() {
 		return jobID, false, fmt.Errorf("%w（任务 %d 未入队）", ErrCertificateQueueInactive, jobID)
+	}
+	if qm != nil && qm.IsRuleBlocked(ruleID) {
+		return jobID, false, fmt.Errorf("%w（任务 %d 未入队）", ErrCertRuleBusy, jobID)
 	}
 	return jobID, false, fmt.Errorf("certificate job %d was not queued", jobID)
 }
@@ -1598,6 +1630,12 @@ func CreateOrRequeueCertJobWithChange(ruleID, domains string, caProviderID int, 
 		}
 		if !qm.IsActive() {
 			return 0, false, fmt.Errorf("%w（任务未入队）", ErrCertificateQueueInactive)
+		}
+		// 队列激活但入队被拒且无既有行——唯一剩余成因是规则屏障租约
+		// （EnqueueIfActive 的 admission 三分支：在途/停用/屏障）。屏障是
+		// 瞬时冲突语义，必须归因为 409 族而非泛化 500。
+		if qm.IsRuleBlocked(ruleID) {
+			return 0, false, ErrCertRuleBusy
 		}
 		return 0, false, fmt.Errorf("CA queue is paused")
 	}

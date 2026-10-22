@@ -19,7 +19,7 @@ func TestValidateV2BackupCertJobs_rejectsIssuedWithoutMaterial(t *testing.T) {
 			"expires_at": "2099-01-01 00:00:00", "cert_pem": "", "key_pem": "",
 		}},
 	}
-	err := validateV2BackupCertJobs(tables)
+	_, err := validateV2BackupCertJobs(tables)
 	if err == nil || !strings.Contains(err.Error(), "证书材料") {
 		t.Fatalf("err=%v, want empty certificate material rejection", err)
 	}
@@ -42,7 +42,7 @@ func TestValidateV2BackupCertJobs_acceptsIssuedWithMaterialOrQueued(t *testing.T
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			tables := map[string][]map[string]any{"lb_rules": {baseRule}, "cert_jobs": {tc.job}}
-			if err := validateV2BackupCertJobs(tables); err != nil {
+			if _, err := validateV2BackupCertJobs(tables); err != nil {
 				t.Fatalf("unexpected rejection: %v", err)
 			}
 		})

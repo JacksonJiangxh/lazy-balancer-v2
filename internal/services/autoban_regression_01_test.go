@@ -27,7 +27,10 @@ func installAutobanEngineFixture(t *testing.T) *taskengine.Engine {
 	SetConfigLoadRerun(func(operator string) error { return nil })
 	t.Cleanup(func() { SetConfigLoadRerun(nil) })
 	te := InitTaskEngine("", t.TempDir()+"/app.log")
-	t.Cleanup(te.Stop)
+	// 清理必须连全局指针一并复位（StopTaskEngine=Stop+nil）——仅 te.Stop
+	// 会把「已停止的引擎」留在包级全局，后续用例经 TaskEngine() 读到
+	// 停止态（任务 Lookup 命中 stopped）被健康位 overlay 误判降级。
+	t.Cleanup(StopTaskEngine)
 	return te
 }
 

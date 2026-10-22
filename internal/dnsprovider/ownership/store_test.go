@@ -114,7 +114,7 @@ func TestStore_MatchingValue_includes_stale_but_spares_recent(t *testing.T) {
 		FQDN:      "_acme-challenge.example.com.",
 		Value:     "abandoned-order",
 		RecordID:  "100",
-		CreatedAt: time.Now().Add(-(staleOwnershipAge + time.Minute)),
+		CreatedAt: time.Now().Add(-(StaleOwnershipAge + time.Minute)),
 	}
 	if err := store.Add(stale); err != nil {
 		t.Fatalf("add stale: %v", err)
@@ -611,7 +611,52 @@ func TestAccountDigest_stableAndOpaque(t *testing.T) {
 	if first == AccountDigest("id,othertoken") {
 		t.Fatal("不同凭据得到相同摘要")
 	}
-	if strings.Contains(first, "token") || len(first) != 8 {
-		t.Fatalf("digest=%q, want 8 位十六进制且不含凭据明文", first)
+	if strings.Contains(first, "token") || len(first) != 16 {
+		t.Fatalf("digest=%q, want 16 位十六进制且不含凭据明文", first)
+	}
+}
+
+// RemoveMany 批量语义：一次调用移除多条记录（单次全量重写），未命中条目
+// 静默忽略；零命中时不重写文件（省一次全量 fsync，账本字节零漂移）。
+func TestStore_RemoveMany(t *testing.T) {
+	store := newStore(t)
+	now := time.Now()
+	// CreatedAt 显式赋值——Add 会回填零值时间戳，持有原值的调用方与
+	// 读回记录靠 sameRecord（CreatedAt.Equal）匹配。
+	alpha := Record{Provider: "dnspod", Zone: "example.com", FQDN: "_acme-challenge.example.com.", Value: "alpha", RecordID: "200", CreatedAt: now}
+	beta := Record{Provider: "dnspod", Zone: "example.com", FQDN: "_acme-challenge.example.com.", Value: "beta", RecordID: "201", CreatedAt: now}
+	gamma := Record{Provider: "dnspod", Zone: "example.com", FQDN: "_acme-challenge.other.example.com.", Value: "gamma", RecordID: "202", CreatedAt: now}
+	for _, record := range []Record{alpha, beta, gamma} {
+		if err := store.Add(record); err != nil {
+			t.Fatalf("add %+v: %v", record, err)
+		}
+	}
+	if err := store.RemoveMany([]Record{alpha, beta}); err != nil {
+		t.Fatalf("remove many: %v", err)
+	}
+	left := readStoreRecords(t, store)
+	if len(left) != 1 || left[0].RecordID != "202" {
+		t.Fatalf("records=%+v, want 仅保留 gamma", left)
+	}
+
+	// 零命中：文件字节必须原样（无写盘）
+	before, err := os.ReadFile(store.path)
+	if err != nil {
+		t.Fatalf("read store: %v", err)
+	}
+	ghost := Record{Provider: "dnspod", Zone: "example.com", FQDN: "_acme-challenge.ghost.example.com.", Value: "ghost", RecordID: "999"}
+	if err := store.RemoveMany([]Record{ghost}); err != nil {
+		t.Fatalf("zero-hit remove many: %v", err)
+	}
+	after, err := os.ReadFile(store.path)
+	if err != nil {
+		t.Fatalf("re-read store: %v", err)
+	}
+	if string(before) != string(after) {
+		t.Fatal("零命中 RemoveMany 不得重写账本文件")
+	}
+	// 空输入快速返回
+	if err := store.RemoveMany(nil); err != nil {
+		t.Fatalf("empty remove many: %v", err)
 	}
 }

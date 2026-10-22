@@ -205,6 +205,19 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 	if ruleCaddyID == "" {
 		return "", fmt.Errorf("u-trust12 引擎投影缺少规则身份（ruleCaddyID 为空）——id:12 逐规则渲染，scope 必须编入规则身份（历史 HP-1）")
 	}
+	// 渲染守卫（带外直写/旧快照残留）：mode 非四态枚举时下方 switch 静默落入
+	// 「仅 IP 控制/空串」分支——blocking 宣称与实际零 WAF 发射漂移。写侧/导入
+	// 已 400、启动归一把枚举外全集收敛为 off，此处为两窗口之间的带外脏行留痕
+	// （60s 限流与同族 geoip_countries/crs_rule_groups 同口径，不 fail-visible：
+	// 一行脏数据不得拖垮整份配置生成）。
+	switch p.Mode {
+	case "off", "custom_only", "detection", "blocking":
+	default:
+		msg := fmt.Sprintf("策略 %q（#%d）mode 非枚举值 %q，WAF 面按无模式渲染（疑似带外直写/旧快照，启动归一将收敛为 off）", p.Name, p.ID, p.Mode)
+		if auditFailureShouldLog(msg) {
+			Logf("warn", "%s", msg)
+		}
+	}
 	var sb strings.Builder
 	// 嵌 coraza 池键指纹（见 crsPoolFingerprint）——CRS 文件
 	// 替换/手动改 overrides 后池键必须变化，否则新 Caddy 配置复用旧 WAF
@@ -359,6 +372,17 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 			return "", err
 		}
 		aclOperand = operand
+		// 渲染守卫：ip_acl_mode 非三态枚举时 ACL 开关已开但下方发射 switch
+		// 零规则——「已启用 IP 访问控制」静默零强制。写侧/导入 400、启动归一
+		// 收敛为 deny，此处为带外脏行留痕（60s 限流，可用性优先不 fail-visible）。
+		switch p.IPACLMode {
+		case "allow", "deny", "绕过":
+		default:
+			msg := fmt.Sprintf("策略 %q（#%d）ip_acl_mode 非枚举值 %q，ACL 已启用但无规则发射（疑似带外直写/旧快照，启动归一将收敛为 deny）", p.Name, p.ID, p.IPACLMode)
+			if auditFailureShouldLog(msg) {
+				Logf("warn", "%s", msg)
+			}
+		}
 	}
 	if p.IPWhitelistEnabled && len(ipWL) > 0 {
 		operand, err := ipListRuleOperand(trustScope, ipWL, false)
@@ -368,14 +392,14 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 		trustOperand = operand
 		negTrustOperand = "!" + operand
 	}
-	绕过Emitted := false
-	if p.IPACLEnabled && p.IPACLMode == "绕过" {
-		sb.WriteString(fmt.Sprintf("SecRule REMOTE_ADDR \"%s\" \"id:3,phase:1,pass,nolog,ctl:ruleEngine=Off,ctl:auditEngine=Off\"\n", aclOperand))
-		绕过Emitted = true
-	}
+	// 发射序（绕过优先于信任的终态保证）：coraza ctl 同相位后写覆盖前写——
+	// 信任名单 DetectionOnly 必须先发、绕过 Off 后发，同一 IP 同列两名册时
+	// 绕过（Off 短路，2026-09-15 裁定语义）才是事务终态；反之绕过被降级为
+	// 「全评估仅记录」，与文档语义不符。
+	绕过WillEmit := p.IPACLEnabled && p.IPACLMode == "绕过"
 	if p.PolicyType != models.PolicyTypeStage0 && p.IPWhitelistEnabled && len(ipWL) > 0 {
 		trustID := 3
-		if 绕过Emitted {
+		if 绕过WillEmit {
 			trustID = 5
 		}
 		// 2026-09-15 用户裁定:信任名单从「完全静默」改「可见放行」——
@@ -383,6 +407,9 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 		// 删 ctl:auditEngine=Off(原为实现信任完全静默同步关审计,现反向需求:
 		// 信任流量必须进事件日志可见)。
 		sb.WriteString(fmt.Sprintf("SecRule REMOTE_ADDR \"%s\" \"id:%d,phase:1,pass,nolog,ctl:ruleEngine=DetectionOnly\"\n", trustOperand, trustID))
+	}
+	if 绕过WillEmit {
+		sb.WriteString(fmt.Sprintf("SecRule REMOTE_ADDR \"%s\" \"id:3,phase:1,pass,nolog,ctl:ruleEngine=Off,ctl:auditEngine=Off\"\n", aclOperand))
 	}
 	// 阶段 0 保留检测（2026-09-20 用户裁定）：信任名单策略 trust_detection=1
 	// 时,绑定规则的每个策略引擎发射 id:12 DetectionOnly——信任 IP 全评估全
@@ -472,7 +499,7 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 	// 形状下上方 SecRequestBodyAccess 恒 Off（BodyAccessTruthTable 已钉），
 	// id:9/10/11 无消费者，发射即死指令。
 	if p.Mode == "custom_only" && hasCustomRules {
-		emitBodyProcessorRules(&sb)
+		emitBodyProcessorRules(&sb, p.AnomalyThreshold)
 	}
 
 	if p.Mode == "blocking" || p.Mode == "detection" {
@@ -523,6 +550,13 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 				scoped = append(scoped, entry)
 				continue
 			}
+			// 渲染守卫：未知 scope（带外直写/旧版快照可绕过写侧白名单）不得
+			// 静默降级为 scope=all——那是「对所有客户端删除该规则」，WAF 保护面
+			// 静默扩大。跳过方向安全（排除减少=拦截更多）。
+			if entry.Scope != "all" {
+				Logf("warn", "跳过未知 scope 的 CRS 排除条目 %q（scope=%q，策略 %q）：未知 scope 不降级为全局排除", entry.Target, entry.Scope, p.Name)
+				continue
+			}
 			ruleID := strings.TrimSpace(entry.Target)
 			if ruleID == "" {
 				continue
@@ -543,7 +577,14 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 				return "", err
 			}
 		}
-		emitBodyProcessorRules(&sb)
+		emitBodyProcessorRules(&sb, p.AnomalyThreshold)
+		// 部署契约（唯一支持形态=Go 进程与 Caddy 同容器共享文件系统、
+		// data_dir=/app/data）：Include 根硬编码 /app/waf/crs——渲染产物写给
+		// Caddy 进程消费，路径必须是 Caddy 视角的绝对路径；存在性门/索引/
+		// 指纹读侧走 crsDirectivesDir（ConfigureWafDirs 按 data_dir 派生）。
+		// 容器默认形态下两者同树（/app/waf）；自定义 data_dir 的非容器部署
+		// 中派生树与 /app/waf 分叉——该形态不在支持矩阵内（仅容器默认
+		// data_dir 为正式支持）。
 		sb.WriteString("Include /app/waf/crs/crs-setup.conf\n")
 		if _, err := os.Stat(filepath.Join(crsDirectivesDir, "zz-user-overrides.conf")); err == nil {
 			sb.WriteString("Include /app/waf/crs/zz-user-overrides.conf\n")
@@ -609,6 +650,15 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 		if blockStatus > 0 {
 			if _, err := os.Stat(filepath.Join(crsDirectivesDir, "rules", "REQUEST-949-BLOCKING-EVALUATION.conf")); err == nil {
 				sb.WriteString(fmt.Sprintf("SecRuleUpdateActionById 949110 \"deny,status:%d\"\n", blockStatus))
+			}
+			// 出站同款：响应体检查开启时 RESPONSE-959 被强制 Include，其评估
+			// 规则 959100 的 deny 不抬码会把出站拦截落到 host 兜底页/Caddy
+			// 默认 403 而非配置的阶段 3/属主策略页——与 949110 同门（文件存在
+			// 门）同位（Include 之后、配置期 RemoveById 之前）抬码。
+			if p.WAFCheckResponse {
+				if _, err := os.Stat(filepath.Join(crsDirectivesDir, "rules", "RESPONSE-959-BLOCKING-EVALUATION.conf")); err == nil {
+					sb.WriteString(fmt.Sprintf("SecRuleUpdateActionById 959100 \"deny,status:%d\"\n", blockStatus))
+				}
 			}
 		}
 		// 配置期 SecRuleRemoveById：Include 之后（此时 CRS 规则已注册，
@@ -699,13 +749,15 @@ func hasStage0TrustDetection(policies []*models.SecurityPolicy) bool {
 // 值大小写不受控(coraza 仅小写化 header 名）。
 // id:11:畸形 JSON/XML 解析失败后所有 body 集合为空且 901340
 // 不再 force,CRS 4.29 无任何规则消费 REQBODY_PROCESSOR_ERROR(grep 实证)——
-// 「声明 JSON + 发非法 JSON」可对全部 body 规则隐身;守卫计满临界异常分
-// (阈值 5:拦截模式 949 即拦,检测模式仅记录),与 coraza ctl.go 文档建议的
-// 使用者自检口径一致。
-func emitBodyProcessorRules(sb *strings.Builder) {
+// 「声明 JSON + 发非法 JSON」可对全部 body 规则隐身;守卫计分=策略异常阈值
+// （anomalyThreshold 形参）：固定 +5 在阈值 10/15/20 时达不到 949 拦截线，
+// body-processor 逃逸仅留事件不阻断，与守卫目的（阻止 body 规则隐身）不符；
+// 计满阈值后任意阈值配置下 949 评估即拦（拦截模式；检测模式仅记录，语义不变）。
+// custom_only 模式无 949 消费者，计分退化为事件留痕（与既有口径一致）。
+func emitBodyProcessorRules(sb *strings.Builder, anomalyThreshold int) {
 	sb.WriteString(`SecRule REQUEST_HEADERS:Content-Type "@rx (?i)^application/(?:[\w.+-]+?\+)?json(?:\s*;|$)" "id:9,phase:1,pass,nolog,ctl:requestBodyProcessor=JSON"` + "\n")
 	sb.WriteString(`SecRule REQUEST_HEADERS:Content-Type "@rx (?i)^(?:application|text)/(?:[\w.+-]+?\+)?xml(?:\s*;|$)" "id:10,phase:1,pass,nolog,ctl:requestBodyProcessor=XML"` + "\n")
-	sb.WriteString(`SecRule REQBODY_PROCESSOR_ERROR "@eq 1" "id:11,phase:2,pass,log,setvar:tx.inbound_anomaly_score_pl1=+5,msg:'请求体解析失败'"` + "\n")
+	sb.WriteString(fmt.Sprintf(`SecRule REQBODY_PROCESSOR_ERROR "@eq 1" "id:11,phase:2,pass,log,setvar:tx.inbound_anomaly_score_pl1=+%d,msg:'请求体解析失败'"`, anomalyThreshold) + "\n")
 }
 
 // geoipLocOverseas 是 X-LB-GeoIP-Loc 的海外哨兵值：caddygeoip 对解析失败/
@@ -870,8 +922,9 @@ func customRulePhase(cr models.CustomRule) int {
 
 func emitCustomRules(sb *strings.Builder, customRules []models.CustomRule, blockStatus int) {
 	// 旧版内嵌规则可能没有 id（0）：全部发射 id:10000 会在同一份 coraza 配置中
-	// 产生重复 SecRule id，按序分配唯一合成 id（1000000+序号，避开 CRS 的
-	// 100000-999999 保留段）。synthetic 只在无 id 规则上递增，保证彼此唯一。
+	// 产生重复 SecRule id，按序分配唯一合成 id（1000000+序号——本地合成段，
+	// 避开 800000+ GeoIP 预检段与 9xxxxx CRS 规则段）。synthetic 只在无 id
+	// 规则上递增，保证彼此唯一。
 	synthetic := 0
 	for _, cr := range customRules {
 		if !cr.Enabled {
@@ -1263,6 +1316,53 @@ func IsGeoIPPrecheckID(n int) bool {
 	return n >= geoipPrecheckRuleBase && n < geoipPrecheckRuleLimit
 }
 
+// —— 展示层导出（handlers 大屏/事件列表消费的单一事实源入口）——
+// 段界字面量曾在 handlers 复写多处并出现边界口径分叉（n>800000 vs
+// n>=800000）；下列导出是展示侧唯一合法取径，禁止再复写字面量。
+
+// PrecheckRuleFamily 是 precheckRuleFamily 的导出别名（展示层家族判定用）。
+type PrecheckRuleFamily = precheckRuleFamily
+
+// 预检家族枚举的导出名（与内部常量同值同点维护）。
+const (
+	PrecheckRuleFamilyUnknown       = precheckRuleFamilyUnknown
+	PrecheckRuleFamilyGeoIP         = precheckRuleFamilyGeoIP
+	PrecheckRuleFamilyCrawlerExempt = precheckRuleFamilyCrawlerExempt
+	PrecheckRuleFamilyCrawlerSpoof  = precheckRuleFamilyCrawlerSpoof
+)
+
+// 展示层段界导出：预检段 [800000,900000) 的起止与合成自定义 ID 基址
+// （1000000+，即 CRS 段 [900000,1000000) 的右开界）。值与 emit/decode
+// 同点维护，段基址调整时只改本块。
+const (
+	GeoIPPrecheckSegmentBase  = geoipPrecheckRuleBase
+	GeoIPPrecheckSegmentLimit = geoipPrecheckRuleLimit
+	SyntheticCustomRuleIDBase = 1000000
+)
+
+// DecodePrecheckRuleID 是 decodePrecheckRuleID 的导出版：事件展示层
+// （大屏命中规则/触发类型/攻击族分类）取预检家族与属主策略的唯一入口。
+// 非预检 ID 或不可唯一解码（p=0 边界值，发射侧已拒绝）返回 ok=false。
+func DecodePrecheckRuleID(ruleID string) (family PrecheckRuleFamily, policyID, engineIndex int, ok bool) {
+	return decodePrecheckRuleID(ruleID)
+}
+
+// PrecheckRuleFamilyOf 报告 n 落在哪个预检家族段（展示层类型分桶用，
+// 不校验属主可解码性——p=0 边界值发射侧不可达，展示按段归类即可，
+// 与 IsGeoIPPrecheckID 同含端点语义）。归因/属主解码仍须用
+// DecodePrecheckRuleID（禁止用 n-800000 猜属主）。
+func PrecheckRuleFamilyOf(n int) PrecheckRuleFamily {
+	switch {
+	case n >= geoipPrecheckRuleBase && n < geoipCrawlerRuleBase:
+		return precheckRuleFamilyGeoIP
+	case n >= geoipCrawlerRuleBase && n < geoipCrawlerSpoofRuleBase:
+		return precheckRuleFamilyCrawlerExempt
+	case n >= geoipCrawlerSpoofRuleBase && n < geoipPrecheckRuleLimit:
+		return precheckRuleFamilyCrawlerSpoof
+	}
+	return precheckRuleFamilyUnknown
+}
+
 // IsStage1PrecheckID 判定事件触发 id 是否属阶段 1 预检族
 // 收敛：{2,4,7,8,14} 五元组此前在 services 谓词与 handlers/security_overview
 // 两处独立字面量维护——阶段 1 新增预检 id 时两处漏改即分叉。单一事实源在此，
@@ -1490,6 +1590,15 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 			break
 		}
 	}
+	// allow+空名单守卫必须在早退之前：PolicyHasGeoIP 为 false 时该策略零
+	// GeoIP 特征，若无其他预检内容函数会提前返回空串——allow+空的渲染语义
+	// 是放行全部请求（fail-open，最危险方向），写侧 400 的形状经带外直写
+	// 绕过时必须 fail-visible 拒绝生成。
+	for _, p := range policies {
+		if p != nil && p.GeoIPMode == "allow" && len(geoipCountries(p)) == 0 {
+			return "", fmt.Errorf("策略 %q（#%d）geoip_mode=allow 但地域名单为空：渲染语义为放行全部请求（fail-open），疑似带外直写绕过写侧校验——拒绝生成，请修正策略或关闭地域控制", p.Name, p.ID)
+		}
+	}
 	detectionTrust, _ := stage0TrustSets(policies)
 	hasStage0Detection := hasStage0TrustDetection(policies)
 	// 早退条件以发射面 flag/内容表达：deny ACL 收敛到 flag（始终发射，
@@ -1637,7 +1746,30 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 		return nil
 	}
 	for _, p := range policies {
-		if p == nil || !PolicyHasGeoIP(p) {
+		if p == nil {
+			continue
+		}
+		// 渲染守卫（写侧 ValidateGeoIPCountries/枚举门之外的最后一道，
+		// 面向带外直写/旧快照残留）：
+		// - geoip_mode 非枚举值：geoipLocOperator 的 allowMode=false 默认分支
+		//   会把脏值按 deny 方向静默执行（与 UI 宣称可能相反）——按关闭处理
+		//   +60s 限流 WARN（可用性优先，启动归一将把枚举外全集收敛为 deny）。
+		//   空串为历史兼容形态（启动归一 ''→deny），保持原行为不拦。
+		// - allow+空名单：PolicyHasGeoIP 为 false 时整链不发射=全放行
+		//   （fail-open，最危险方向）——fail-visible 拒绝生成。
+		switch p.GeoIPMode {
+		case "", "off", "allow", "deny":
+		default:
+			msg := fmt.Sprintf("策略 %q（#%d）geoip_mode 非枚举值 %q，地域控制按关闭处理（疑似带外直写/旧快照）", p.Name, p.ID, p.GeoIPMode)
+			if auditFailureShouldLog(msg) {
+				Logf("warn", "%s", msg)
+			}
+			continue
+		}
+		if p.GeoIPMode == "allow" && len(geoipCountries(p)) == 0 {
+			return "", fmt.Errorf("策略 %q（#%d）geoip_mode=allow 但地域名单为空：渲染语义为放行全部请求（fail-open），疑似带外直写绕过写侧校验——拒绝生成，请修正策略或关闭地域控制", p.Name, p.ID)
+		}
+		if !PolicyHasGeoIP(p) {
 			continue
 		}
 		// 策略编号越出普通 GeoIP 段 [800001,810000) 时
@@ -1759,6 +1891,12 @@ func policyCustomRulesCached(p *models.SecurityPolicy, store caddyConfigStore) [
 
 func resolvePolicyCustomRules(raw json.RawMessage, store caddyConfigStore) []models.CustomRule {
 	if len(raw) == 0 {
+		// 空串载荷（列默认值/写侧归一恒为 "[]"，空串只能来自带外直写）——
+		// 与同族（geoip_countries/crs_rule_groups/内联名单）同口径 60s 限流
+		// WARN：自定义拦截规则静默全丢必须留痕。
+		if auditFailureShouldLog("custom_rules 空串载荷") {
+			Logf("warn", "策略 custom_rules 为空串载荷（疑似带外直写），自定义规则按空处理")
+		}
 		return nil
 	}
 	var ids []int
@@ -1862,14 +2000,23 @@ func resolvePolicyCustomRules(raw json.RawMessage, store caddyConfigStore) []mod
 	if err := json.Unmarshal(raw, &embedded); err == nil {
 		return embedded
 	}
+	// 两种载荷形态（ID 数组/内嵌对象数组）均不可解析——自定义规则静默全丢
+	// 必须留痕（与同族畸形列 WARN 同口径，60s 限流防脏行逐策略刷日志）。
+	msg := fmt.Sprintf("策略 custom_rules 载荷不可解析（%d 字节），自定义规则按空处理: %.80s", len(raw), string(raw))
+	if auditFailureShouldLog(msg) {
+		Logf("warn", "%s", msg)
+	}
 	return nil
 }
 
 // validSecRuleRemoveTarget 判定 SecRuleRemoveById 目标是否为 coraza 可编译
 // 且不越界的形态：纯数字，或 a-b 区间。边界依据：本地规则 ID 空间为 IP ACL
 // 2-5 与自定义规则 10000+，CRS 规则 ID 恒为 9xxxxx（六位、首位 9）——
-// 下界 <900000 或上界 >999999 的区间会静默删除本地/自定义规则或全部 CRS
-// 规则，与"合法但删除一切"的越界形态同等拒绝。
+// 下界 <900000 或上界 >999999 的区间会静默删除本地/自定义规则，一律拒绝。
+// 注意：界内宽区间（如 902000-999999）可通过本门——它删除除 901 段外的
+// 全部 CRS 规则，属管理员的显式选择（与 901 初始化组相交的区间由
+// CRSExclusionTargetRemovesInit 另一道守卫拒绝），本门只管「不越界出
+// 9xxxxx CRS 空间」。
 func validSecRuleRemoveTarget(s string) bool {
 	if n, err := strconv.Atoi(s); err == nil {
 		return n >= 900000 && n <= 999999
@@ -1892,10 +2039,15 @@ func CRSExcludedEntryEffective(entry string) bool {
 	return validSecRuleRemoveTarget(crsFilenameToRuleIDRange(strings.TrimSpace(entry)))
 }
 
+// crsFilenameToRuleIDRange 仅把真实 CRS 文件名形态（REQUEST-9XX-…/
+// RESPONSE-9XX-…）映射为规则 ID 区间；纯数字的「数字-数字」段（如
+// "101-942"）不是文件名——若按 parts[1] 映射会把用户输入静默解释为另一个
+// CRS 组并整组删除，与字面语义不符（纯数字区间由 validSecRuleRemoveTarget
+// 的 6 位边界门独立裁决）。
 func crsFilenameToRuleIDRange(s string) string {
 	parts := strings.SplitN(s, "-", 3)
-	if len(parts) >= 2 {
-		if n, err := strconv.Atoi(parts[1]); err == nil && n >= 100 && n <= 999 {
+	if len(parts) >= 2 && (parts[0] == "REQUEST" || parts[0] == "RESPONSE") {
+		if n, err := strconv.Atoi(parts[1]); err == nil && n >= 900 && n <= 999 {
 			return fmt.Sprintf("%d000-%d999", n, n)
 		}
 	}
@@ -1905,6 +2057,57 @@ func crsFilenameToRuleIDRange(s string) string {
 // CRSExcludedRulesMaxEntries 新格式 crs_excluded_rules 的条目上限（旧 []string
 // 格式无上限，保持现状兼容；50 条上限口径）。
 const CRSExcludedRulesMaxEntries = 50
+
+// CRSRuleGroupsMaxEntries crs_rule_groups 的条目上限（按原始条目数计，去重
+// 之前）。与 crs_excluded_rules 同族限量：每条 6 位 ID 触发索引 Find 与一行
+// SecRuleRemoveById 输出，超大数组放大配置体积/生成时间。200 远高于 UI
+// 选择器真实可达规模（CRS 组约 20 个 + 少量单规则 ID），只挡带外畸形载荷。
+const CRSRuleGroupsMaxEntries = 200
+
+// DedupeCRSGroupEntries 按首见保序去重（trim 后判定，保留原条目形态）——
+// 写入面归一与渲染面共用同一去重口径：重复组号会产生重复 Include，coraza
+// 对重复注册规则 ID 直接编译拒绝（duplicated rule id）。
+func DedupeCRSGroupEntries(entries []string) []string {
+	seen := make(map[string]struct{}, len(entries))
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		key := strings.TrimSpace(entry)
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, entry)
+	}
+	return out
+}
+
+// CRSStaleGroupSelections 报告 crs_rule_groups 载荷是否含本地规则索引中已
+// 不存在的组号/规则 ID（CRS 更替后的陈旧选择——该部分保护静默失效，摘要
+// 层暴露供 UI 标注；渲染侧仍按 skip+WARN 保持可用性，不 fail-loud）。
+// 解析失败/空载荷/索引不可用均按无陈旧处理（畸形与存在性是两条正交防线）。
+func CRSStaleGroupSelections(raw json.RawMessage, index *CRSRuleIndex) bool {
+	if index == nil {
+		return false
+	}
+	var groups []string
+	if err := json.Unmarshal(raw, &groups); err != nil {
+		return false
+	}
+	for _, g := range groups {
+		trimmed := strings.TrimSpace(g)
+		switch {
+		case IsCRSRuleIDTarget(trimmed):
+			if !index.Has(trimmed) {
+				return true
+			}
+		case IsCRSGroupCode(trimmed):
+			if !index.HasGroup(trimmed) {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // CRSExcludedEntry 是 crs_excluded_rules 列的归一化单条：Target 为两位组号
 // （"42"）、6 位 CRS 规则 ID（"942100"）或遗留文件名/区间形态（仅 scope=all）；
@@ -2288,6 +2491,9 @@ func emitCRSRuleGroupSelection(sb *strings.Builder, p *models.SecurityPolicy, gr
 	groupSet := make(map[string]struct{}, len(groups))
 	var idTargets []string
 	seenID := make(map[string]struct{})
+	// 组号同样去重（此前仅 6 位 ID 去重）：重复组号渲染出两条同 glob
+	// Include，coraza 对重复注册规则 ID 直接编译拒绝（duplicated rule id）。
+	seenGroup := make(map[string]struct{})
 	for _, g := range groups {
 		// 历史遗留行可能含首尾空白（旧校验曾放行），trim 后拼接，
 		// 保证 glob 恒为 REQUEST-9<code>-*.conf 的合法形态（镜像下方排除项的 trim）。
@@ -2299,6 +2505,22 @@ func emitCRSRuleGroupSelection(sb *strings.Builder, p *models.SecurityPolicy, gr
 			}
 			continue
 		}
+		// 渲染侧组号形态门（写侧/导入门之外的最后一道）：集群 apply 与旧
+		// 快照通道可绕过写侧校验直写库值，任意字符串会被直拼进 Include
+		// glob——注入载荷（含换行的条目）可渲染出独立 coraza 指令行，零匹配
+		// glob 则静默失效。仅接受两位数字组号，其余跳过+限流 WARN（skip
+		// 保持可用性，与陈旧 ID 的现有 skip 语义一致）。
+		if !IsCRSGroupCode(g) {
+			msg := fmt.Sprintf("跳过非法 CRS 规则组号条目 %q（策略 %q）：非两位数字组号/6 位规则 ID 形态，疑似带外直写或旧快照残留", g, p.Name)
+			if auditFailureShouldLog(msg) {
+				Logf("warn", "%s", msg)
+			}
+			continue
+		}
+		if _, dup := seenGroup[g]; dup {
+			continue
+		}
+		seenGroup[g] = struct{}{}
 		if !chainIndex().HasGroup(g) {
 			Logf("warn", "CRS 规则组 %q（策略 %q）不存在于本地规则索引，Include 可能零匹配", g, p.Name)
 		}
@@ -2322,6 +2544,13 @@ func emitCRSRuleGroupSelection(sb *strings.Builder, p *models.SecurityPolicy, gr
 		entry := index.Find(id)
 		if entry == nil {
 			Logf("warn", "跳过陈旧 CRS 规则组 ID %q（策略 %q）：不存在于本地规则索引", id, p.Name)
+			continue
+		}
+		// 响应侧规则与响应检查开关联动：waf_check_response=off 时
+		// SecResponseBodyAccess Off，RESPONSE 父文件的规则永不消费响应体——
+		// 选择零效果。跳过+WARN（保持兼容不 400），UI/摘要侧另有可见性。
+		if !p.WAFCheckResponse && strings.HasPrefix(entry.File, "RESPONSE-") {
+			Logf("warn", "跳过响应侧 CRS 规则 ID %q（策略 %q）：waf_check_response=off 时响应规则零效果，请开启「检查响应体」或移除该选择", id, p.Name)
 			continue
 		}
 		if group := crsFileGroupPattern.FindStringSubmatch(entry.File); group != nil {

@@ -658,3 +658,50 @@ func TestLbRuleColumns_governedDefaultsBindConstants(t *testing.T) {
 		}
 	}
 }
+
+// 并发修改复核（DisableRule）：放锁取消窗口内并发启用/更新完整提交
+// （指纹偏离本请求提交后的基线）→ 409 中止 + 审计「并发修改」，不再写
+// 「禁用」成功审计（否则成功留痕与最终状态矛盾——启用侧重新入队的
+// 任务已被本请求取消）。
+func TestDisableRule_abortsWhenRuleConcurrentlyModifiedInLockWindow(t *testing.T) {
+	// Given
+	handler, _, _ := newAuditRuleHandlers(t, 0)
+	seedAuditRule(t, "lb_dis_conc", "disconc", "disconc.example.test", 18011, true, "acme_dns", true)
+	seedAuditUpstream(t, "lb_dis_conc")
+	services.ResetCAQueueManagerForTest()
+	services.InitCAQueueManager(nil, t.TempDir())
+	services.GetCAQueueManager().Start()
+	t.Cleanup(services.ResetCAQueueManagerForTest)
+	disableRuleLockWindowHook = func(caddyID string) {
+		// 模拟并发 EnableRule 提交（窗口内重新启用）
+		if _, err := db.DB.Exec("UPDATE lb_rules SET enabled=1, updated_at=datetime('now') WHERE caddy_id=?", caddyID); err != nil {
+			t.Errorf("re-enable rule in lock window: %v", err)
+		}
+	}
+	t.Cleanup(func() { disableRuleLockWindowHook = nil })
+	router := gin.New()
+	router.POST("/rules/:caddy_id/disable", handler.DisableRule)
+
+	// When
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/rules/lb_dis_conc/disable", nil))
+
+	// Then：409 并发修改中止；规则保持他人提交的启用态；无「禁用」成功审计
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "并发修改") {
+		t.Fatalf("disable status=%d body=%s, want 409 并发修改", response.Code, response.Body.String())
+	}
+	var enabled int
+	if err := db.DB.QueryRow("SELECT enabled FROM lb_rules WHERE caddy_id='lb_dis_conc'").Scan(&enabled); err != nil {
+		t.Fatalf("read rule enabled: %v", err)
+	}
+	if enabled != 1 {
+		t.Fatalf("enabled=%d, want 1（他人已提交的启用不得被回退）", enabled)
+	}
+	var successAudit int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='禁用' AND resource='负载规则' AND detail LIKE '%lb_dis_conc%'`).Scan(&successAudit); err != nil {
+		t.Fatalf("read disable audit: %v", err)
+	}
+	if successAudit != 0 {
+		t.Fatalf("禁用 success audit=%d, want 0 when concurrently modified in lock window", successAudit)
+	}
+}

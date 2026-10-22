@@ -84,9 +84,12 @@ func TestSweepOrphanedCertJobs_countsDisabledOrphans(t *testing.T) {
 	disabledID := seedOrphanCertJob(t, "lb_ghost_c", "ghost-c.example.test", "disabled")
 
 	// When
-	swept := sweepOrphanedCertJobs(context.Background())
+	swept, err := sweepOrphanedCertJobs(context.Background())
 
-	// Then：计数=实际翻转行数；disabled 行不被触碰
+	// Then：计数=实际翻转行数；disabled 行不被触碰；健康库无错误
+	if err != nil {
+		t.Fatalf("sweep orphaned cert jobs: %v", err)
+	}
 	if swept != 2 {
 		t.Fatalf("swept=%d, want 2（返回值必须等于实际收敛的孤儿任务数）", swept)
 	}
@@ -328,5 +331,100 @@ func TestTaskEngineWire_certManualPollPropagatesRunFailure(t *testing.T) {
 	// Then
 	if err := te.Trigger("cert-manual-poll", "manual", ""); err == nil {
 		t.Fatal("cert-manual-poll Run 未上抛巡检读失败（任务监控会显示 success）")
+	}
+}
+
+// 30s 补扫节拍的摘要行只在有真实动作时落盘并带分项计数——waiting_ca
+// 冷却期（1-3h）内的空转轮不得写行（无条件写 ≈2880 行/日，掩盖真正动作行）。
+func TestCertWaitingCATickOnce_summaryLineOnlyOnActions(t *testing.T) {
+	useCertSweepTickTestEnv(t)
+	resetCertificateServiceForTest(t)
+	SetActiveCertificateService(NewCertificateService())
+	oldManager := caQueueManager
+	caQueueManager = &CAQueueManager{
+		queues:       make(map[int]*caQueue),
+		blockedRules: make(map[string]map[RuleBlockToken]struct{}),
+		active:       true,
+		reloader:     func() error { return nil },
+	}
+	t.Cleanup(func() { caQueueManager.Stop(); caQueueManager = oldManager })
+
+	// Given：适用规则 + 一条冷却未到期的 waiting_ca 任务
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source) VALUES ('lb_tick_quiet','tick-quiet','quiet.example.test','http',8443,1,1,'acme_dns')`); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO ca_providers (id,name,provider,directory_url,enabled) VALUES (7,'tick CA','letsencrypt','https://invalid.example/directory',1)`); err != nil {
+		t.Fatalf("seed provider: %v", err)
+	}
+	jobID := seedOrphanCertJob(t, "lb_tick_quiet", "quiet.example.test", "waiting_ca")
+	if _, err := db.DB.Exec(`UPDATE cert_jobs SET ca_provider_id=7, ca_available_after=datetime('now','+1 hour') WHERE id=?`, jobID); err != nil {
+		t.Fatalf("park job: %v", err)
+	}
+
+	// When：冷却期内的补扫轮（零动作）
+	CertWaitingCATickOnce()
+
+	// Then：无摘要行
+	logPath := taskengine.TaskLogPath("cert-waiting-ca")
+	if data, err := os.ReadFile(logPath); err == nil && strings.Contains(string(data), "补扫完成") {
+		t.Fatalf("零动作轮不得写补扫摘要行: %q", string(data))
+	}
+
+	// When：冷却到期后的补扫轮（有动作）
+	if _, err := db.DB.Exec(`UPDATE cert_jobs SET ca_available_after=datetime('now','-1 minute') WHERE id=?`, jobID); err != nil {
+		t.Fatalf("expire cooling: %v", err)
+	}
+	CertWaitingCATickOnce()
+
+	// Then：摘要行携带分项计数
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read task log: %v", err)
+	}
+	if !strings.Contains(string(data), "补扫完成：CA 冷却重排 1") {
+		t.Fatalf("动作轮摘要行须带分项计数: %q", string(data))
+	}
+}
+
+// sweepOrphanedCertJobs 的读失败/中止必须经返回值上抛（fail-visible）——
+// 吞掉会让对账轮摘要写「孤儿清理 0 个」假健康（与 reconcileMissingCertFiles
+// 的读失败上抛同口径）。
+func TestSweepOrphanedCertJobs_propagatesContextCancellation(t *testing.T) {
+	useCertSweepTickTestEnv(t)
+	seedOrphanCertJob(t, "lb_ghost_cancel", "ghost-cancel.example.test", "queued")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := sweepOrphanedCertJobs(ctx); err == nil {
+		t.Fatal("中止的 sweep 必须返回错误（失败轮结果不可信）")
+	}
+}
+
+// jobLogger 进度迁移的 from 集合不得含终态——并发部署回调先把行提交为
+// issued 时，进度日志不得把它拉回 in-flight（终态不可逆的静态防线）；
+// 快速重部署路径的 issued→downloaded 由显式白名单放行。
+func TestJobLogger_Log_neverMovesTerminalJobBackToInflight(t *testing.T) {
+	useCertSweepTickTestEnv(t)
+	jobID := seedOrphanCertJob(t, "lb_logger_guard", "logger-guard.example.test", "issued")
+
+	logger := &jobLogger{jobID: jobID, ruleID: "lb_logger_guard", file: NewCertJobFileLogger("lb_logger_guard")}
+	logger.Log("creating_account", "并发进度写")
+
+	var status string
+	if err := db.DB.QueryRow("SELECT status FROM cert_jobs WHERE id=?", jobID).Scan(&status); err != nil {
+		t.Fatalf("read job status: %v", err)
+	}
+	if status != "issued" {
+		t.Fatalf("status=%q, want issued（终态不得被进度日志拉回）", status)
+	}
+
+	// 白名单形态：from={issued,downloaded} 时 issued→downloaded 合法
+	// （redeployDownloadedInLock 快速路径语义）。
+	whitelist := &jobLogger{jobID: jobID, ruleID: "lb_logger_guard", file: NewCertJobFileLogger("lb_logger_guard"), from: []string{"issued", "downloaded"}}
+	whitelist.Log("downloaded", "快速路径重部署")
+	if err := db.DB.QueryRow("SELECT status FROM cert_jobs WHERE id=?", jobID).Scan(&status); err != nil {
+		t.Fatalf("re-read job status: %v", err)
+	}
+	if status != "downloaded" {
+		t.Fatalf("status=%q, want downloaded（白名单 from 必须放行快速路径）", status)
 	}
 }

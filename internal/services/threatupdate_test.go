@@ -1219,3 +1219,56 @@ func TestThreatStartUpdate_registersCancelBeforeReturn(t *testing.T) {
 		t.Fatalf("终态=%q, want cancelled", got)
 	}
 }
+
+// 快速路径（raw_hash 一致）的内置名单存在性判定必须限定 system=1：
+// 同名用户自建列表（system=0）不得抑制内置行穿透补建——否则引用旧 id 的
+// 策略漏拦且无任何告警，直到上游内容变化才自愈。
+func TestThreatUpdate_fastPathRebuildsSystemListDespiteSameNameUserList(t *testing.T) {
+	overrideWafDirForTest(t)
+	newClusterTestService(t)
+	setupThreatTest(t, nil, nil, nil)
+
+	// Given：run1 成功（raw_hash 落库 + system=1 名单行存在）
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
+		t.Fatalf("run1: %v", err)
+	}
+	if status, _, _, _, _ := readThreatRow(t, "ustc"); status != "success" {
+		t.Fatalf("run1 ustc status=%s, want success", status)
+	}
+	listName := db.ThreatListNameBySource("ustc")
+	// 内置行被删（备份还原/异常清理形态），同时存在同名用户自建列表
+	if _, err := db.DB.Exec(`DELETE FROM security_ip_lists WHERE name=? AND system=1`, listName); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO security_ip_lists (name, entries, system) VALUES (?, '[]', 0)`, listName); err != nil {
+		t.Fatal(err)
+	}
+	// 聚焦 ustc 单源
+	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_enabled=0 WHERE name!='ustc'`); err != nil {
+		t.Fatal(err)
+	}
+
+	// When：同内容 run2——原始哈希一致进入快速路径
+	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err != nil {
+		t.Fatalf("run2: %v", err)
+	}
+
+	// Then：内置行必须被穿透补建（system=1 与同名用户行并存）
+	var system int
+	if err := db.DB.QueryRow(`SELECT system FROM security_ip_lists WHERE name=? AND system=1`, listName).Scan(&system); err != nil {
+		t.Fatalf("内置名单行未被穿透补建: %v", err)
+	}
+	// 条目经 .iplist 文件落盘（RDB 文件化形态），直读验证非空。
+	raw, err := os.ReadFile(filepath.Join(wafDir, "threat-ustc.iplist"))
+	if err != nil {
+		t.Fatalf("内置名单文件未重建: %v", err)
+	}
+	entryCount := 0
+	iterIPListTextLines(raw, func(string) bool { entryCount++; return true })
+	if entryCount == 0 {
+		t.Fatal("补建的内置名单条目不得为空")
+	}
+	if status, _, _, _, _ := readThreatRow(t, "ustc"); status != "success" {
+		t.Fatalf("run2 ustc status=%s, want success", status)
+	}
+}

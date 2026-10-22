@@ -317,6 +317,11 @@ var autobanFeedDegradedWarned bool
 // 停环」的共同终态（引擎 restartExhausted 同时置 LoopOn=false）；瞬时态
 // （LoopOn=true 而 Run 正处于 1s/5s/30s 重拉退避）不报——自愈通道仍在。
 // 引擎未装配/任务未注册=不判定（测试与装配早期，避免误报）。
+//
+// 调度态之外叠加摄取健康位：摄取循环对 tick 失败只记账不退出（LoopOn 恒
+// true），metrics 库写失败/磁盘满等形态下事件停更、计数恒 0，而调度态
+// 一切正常——单看调度态是「健康位分裂」型静默失效。摄取健康快照已含
+// 写侧降级折算；stalled 停等瞬态不入失败计数，不会误报。
 func AutobanFeedHealth() (degraded bool, reason string) {
 	te := TaskEngine()
 	if te == nil {
@@ -331,6 +336,12 @@ func AutobanFeedHealth() (degraded bool, reason string) {
 		return true, "安全事件采集任务异常自愈预算已用尽并停止调度，自动封禁计数不再更新"
 	case !m.LoopOn:
 		return true, "安全事件采集任务调度已停止，自动封禁计数不再更新"
+	}
+	if st := SecurityEventsIngestionHealthSnapshot(); st.Observed && !st.Healthy {
+		if st.LastError != "" {
+			return true, "安全事件采集连续失败：自动封禁计数不再更新（" + st.LastError + "）"
+		}
+		return true, "安全事件采集处于非健康状态（任务停止或写侧持续失败），自动封禁计数不再更新"
 	}
 	return false, ""
 }

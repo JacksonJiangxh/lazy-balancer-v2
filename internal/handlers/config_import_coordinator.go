@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -137,6 +138,10 @@ type configImportSession struct {
 	// （配置导入的 WAF 文件锁）。close 在 caddyOpMu 之后释放，
 	// 保持与获取顺序相反的锁序。
 	releaseBeforeLock func()
+	// replaceRuleArtifacts 标记本次导入是否替换了规则/证书任务数据面。
+	// 仅此情形才允许清理「消失规则」与「失效证书任务」——users-only 等
+	// 分类导入必须对 live 的 cert_jobs/证书文件零触碰。
+	replaceRuleArtifacts bool
 }
 
 // errCertQueueDrainIncomplete 证书队列排空未完成：PauseAndDrain
@@ -415,6 +420,9 @@ func importFailureCaddyRejected(err error) bool {
 // 证书文件、孤儿 cert_jobs 行、指标与规则/证书日志。提交成功后调用；失败仅
 // 审计留痕，不否决导入。
 func (session *configImportSession) cleanupDisappearedRuleArtifacts() {
+	if !session.replaceRuleArtifacts {
+		return
+	}
 	currentIDs, err := currentRuleIDs(session.ctx)
 	if err != nil {
 		services.Logf("error", "导入清理：读取当前规则失败（跳过孤儿清理）: %v", err)
@@ -432,21 +440,23 @@ func (session *configImportSession) cleanupDisappearedRuleArtifacts() {
 		}
 	}
 	if len(disappeared) == 0 {
-		return
-	}
-	for _, id := range disappeared {
-		if err := services.RemoveCertFiles(id); err != nil {
-			services.Logf("warn", "导入清理：删除消失规则 %s 的证书文件失败: %v", id, err)
-		}
-		if db.MetricsDB != nil {
-			if _, err := db.MetricsDB.ExecContext(session.ctx, "DELETE FROM metrics_history WHERE rule_id=?", id); err != nil {
-				services.Logf("error", "导入清理：删除消失规则 %s 的指标失败: %v", id, err)
+		// 无消失规则仍可能有「规则仍在但失去证书材料」的清理（导入事务
+		// 剪枝只动 DB 行）——跳过消失规则段，继续下方任务行与材料清理。
+	} else {
+		for _, id := range disappeared {
+			if err := services.RemoveCertFiles(id); err != nil {
+				services.Logf("warn", "导入清理：删除消失规则 %s 的证书文件失败: %v", id, err)
 			}
-		}
-		removeImportRuleLogFiles(id)
-		if err := removeImportCertJobLogFiles(id); err != nil {
-			services.Logf("error", "导入清理：删除消失规则 %s 的证书日志失败: %v", id, err)
-			services.RecordAuditLog("system", "清理失败", "证书日志", fmt.Sprintf("导入后清理规则 %s 的证书日志失败：%v", id, err), "")
+			if db.MetricsDB != nil {
+				if _, err := db.MetricsDB.ExecContext(session.ctx, "DELETE FROM metrics_history WHERE rule_id=?", id); err != nil {
+					services.Logf("error", "导入清理：删除消失规则 %s 的指标失败: %v", id, err)
+				}
+			}
+			removeImportRuleLogFiles(id)
+			if err := removeImportCertJobLogFiles(id); err != nil {
+				services.Logf("error", "导入清理：删除消失规则 %s 的证书日志失败: %v", id, err)
+				services.RecordAuditLog("system", "清理失败", "证书日志", fmt.Sprintf("导入后清理规则 %s 的证书日志失败：%v", id, err), "")
+			}
 		}
 	}
 	// 与 v2 导入事务内的孤儿清理同语句（幂等重复无害）；覆盖 v1 路径与
@@ -465,5 +475,93 @@ func (session *configImportSession) cleanupDisappearedRuleArtifacts() {
 		services.RecordAuditLog("system", "清理失败", "证书任务", fmt.Sprintf("导入后清理失效证书任务失败：%v", err), "")
 		return
 	}
-	services.RecordAuditLog("system", "清理", "证书产物", fmt.Sprintf("导入移除 %d 条规则，已清理其证书文件、任务行、指标与日志", len(disappeared)), "")
+	// 上述清理只动 DB——仍存在但已失去全部可用证书材料的规则（切 manual
+	// 无证/关 TLS/导入行不再带 ACME 材料），其 ACME cert/key 文件会滞留
+	// 数据卷（与 DeleteRule/orphanACME「失去材料即删私钥」约定不对称，
+	// 卷读权限者可恢复管理员以为已丢弃的密钥）。按同一约定 best-effort 清理：
+	// 失败仅 warn+审计，不否决已提交的导入。
+	if cleaned := cleanupRulesWithoutUsableCertMaterial(session.ctx); cleaned > 0 {
+		services.RecordAuditLog("system", "清理", "证书产物", fmt.Sprintf("导入后 %d 条规则已无任何可用证书材料，其残留证书文件已清理", cleaned), "")
+	}
+	if len(disappeared) > 0 {
+		services.RecordAuditLog("system", "清理", "证书产物", fmt.Sprintf("导入移除 %d 条规则，已清理其证书文件、任务行、指标与日志", len(disappeared)), "")
+	}
+}
+
+// cleanupRulesWithoutUsableCertMaterial 清理「仍存在但已无任何可用证书材料」
+// 规则的 ACME 证书/私钥文件：手动证书材料在库（tls_source=manual 且
+// cert/key 非空）或有域名适用的 issued/downloaded 任务材料时跳过。返回实际
+// 执行了文件清理的规则数（幂等 best-effort，单规则失败仅告警留痕）。
+func cleanupRulesWithoutUsableCertMaterial(ctx context.Context) int {
+	rows, err := db.DB.QueryContext(ctx,
+		`SELECT caddy_id, COALESCE(tls_source,''), COALESCE(tls_cert,''), COALESCE(tls_key,'') FROM lb_rules`)
+	if err != nil {
+		services.Logf("error", "导入清理：读取规则证书形态失败（跳过材料清理）: %v", err)
+		services.RecordAuditLog("system", "清理失败", "证书产物", fmt.Sprintf("导入后清理无材料规则证书文件失败（读取规则集）：%v", err), "")
+		return 0
+	}
+	type ruleCertShape struct {
+		id        string
+		tlsSource string
+		hasManual bool
+	}
+	var rules []ruleCertShape
+	for rows.Next() {
+		var rule ruleCertShape
+		var tlsCert, tlsKey string
+		if err := rows.Scan(&rule.id, &rule.tlsSource, &tlsCert, &tlsKey); err != nil {
+			services.Logf("error", "导入清理：读取规则行失败: %v", err)
+			continue
+		}
+		rule.hasManual = rule.tlsSource == "manual" && strings.TrimSpace(tlsCert) != "" && strings.TrimSpace(tlsKey) != ""
+		rules = append(rules, rule)
+	}
+	if err := rows.Err(); err != nil {
+		services.Logf("error", "导入清理：遍历规则失败: %v", err)
+	}
+	rows.Close()
+
+	cleaned := 0
+	for _, rule := range rules {
+		if rule.hasManual {
+			continue
+		}
+		var domain string
+		if err := db.DB.QueryRowContext(ctx, `SELECT COALESCE(domain,'') FROM lb_rules WHERE caddy_id=?`, rule.id).Scan(&domain); err != nil {
+			services.Logf("error", "导入清理：读取规则 %s 域名失败（跳过该规则）: %v", rule.id, err)
+			continue
+		}
+		// 域名适用性复核（旧域残留行不算可用材料）——与 certJobRuleApplicable
+		// 同语义：两侧均须可规范化且规范形式全等。
+		usable := 0
+		jobRows, err := db.DB.QueryContext(ctx, `SELECT COALESCE(domain,'') FROM cert_jobs
+			WHERE rule_id=? AND status IN ('issued','downloaded')
+			  AND COALESCE(cert_pem,'')<>'' AND COALESCE(key_pem,'')<>''`, rule.id)
+		if err != nil {
+			services.Logf("error", "导入清理：查询规则 %s 任务材料失败（跳过该规则）: %v", rule.id, err)
+			continue
+		}
+		for jobRows.Next() {
+			var jobDomain string
+			if err := jobRows.Scan(&jobDomain); err != nil {
+				continue
+			}
+			jobCanonical, jobErr := services.CanonicalACMEDomains(jobDomain)
+			ruleCanonical, ruleErr := services.CanonicalACMEDomains(domain)
+			if jobErr == nil && ruleErr == nil && jobCanonical == ruleCanonical {
+				usable++
+			}
+		}
+		jobRows.Close()
+		if usable > 0 {
+			continue
+		}
+		if err := services.RemoveCertFiles(rule.id); err != nil {
+			services.Logf("warn", "导入清理：删除无材料规则 %s 的证书文件失败: %v", rule.id, err)
+			services.RecordAuditLog("system", "清理失败", "证书产物", fmt.Sprintf("导入后清理规则 %s 的残留证书文件失败：%v", rule.id, err), "")
+			continue
+		}
+		cleaned++
+	}
+	return cleaned
 }

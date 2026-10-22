@@ -764,6 +764,9 @@ func (h *Handlers) ListSecurityPolicies(c *gin.Context) {
 	// 列表为空/缺失时不再虚报「IP 访问控制已启用」）——批次内一次批量查询。
 	services.ResolvePolicyIPListRefsForSummary(policyPointers)
 	customRuleCounts := services.CountEnabledCustomRulesBatch(policyPointers)
+	// CRS 陈旧选择检测复用同一份索引（缓存命中零重建；索引键含目录+版本+
+	// 聚合 stat，CRS 更替后自动重判）。
+	crsIndex := services.GetCRSRuleIndex()
 	for i := range loadedPolicies {
 		p := loadedPolicies[i].p
 		customRulesCount := customRuleCounts[i]
@@ -786,6 +789,7 @@ func (h *Handlers) ListSecurityPolicies(c *gin.Context) {
 			RateLimitBurst:     p.RateLimitBurst,
 			CRSExcludedCount:   loadedPolicies[i].crsExcludedCount,
 			CRSRuleGroups:      p.CRSRuleGroups,
+			CRSStaleSelections: services.CRSStaleGroupSelections(p.CRSRuleGroups, crsIndex),
 			CustomRulesCount:   customRulesCount,
 			UpdatedBy:          p.UpdatedBy,
 			UpdatedAt:          p.UpdatedAt,
@@ -1281,6 +1285,11 @@ func validateAndNormalizeCRSField(name string, val *string, checkIndices bool) e
 	if err := json.Unmarshal([]byte(*val), &entries); err != nil {
 		return fmt.Errorf("%s 需为 JSON 数组字符串", name)
 	}
+	// crs_rule_groups 条数上限（与 crs_excluded_rules 50 条同族限量）：
+	// 超大数组放大配置体积与生成时间，UI 选择器真实规模远低于 200。
+	if name == "crs_rule_groups" && len(entries) > services.CRSRuleGroupsMaxEntries {
+		return fmt.Errorf("%s 条目不能超过 %d 条", name, services.CRSRuleGroupsMaxEntries)
+	}
 	var index *services.CRSRuleIndex
 	for _, entry := range entries {
 		trimmed, err := validateCRSLegacyEntryCharset(name, entry)
@@ -1324,6 +1333,9 @@ func validateAndNormalizeCRSField(name string, val *string, checkIndices bool) e
 	// 陷阱；剥离即「始终生效」的诚实表达。剥离后为空等价显式空选（"[]"=全量
 	// glob），至少是一个可工作的策略，优于「仅选初始化组」的空转配置。
 	if name == "crs_rule_groups" {
+		// 去重（与渲染面 seenGroup 同口径）：重复组号/ID 会产生重复
+		// Include，coraza 对重复注册规则 ID 直接编译拒绝。
+		entries = services.DedupeCRSGroupEntries(entries)
 		kept := entries[:0]
 		for _, entry := range entries {
 			if services.IsCRSInfraGroupCode(entry) || services.IsCRSInfraRuleID(entry) {
@@ -1341,15 +1353,22 @@ func validateAndNormalizeCRSField(name string, val *string, checkIndices bool) e
 }
 
 // validateCRSExcludedRulesPayload 校验 crs_excluded_rules 双格式载荷（空串已在
-// 调用方归一为 "[]"）。旧 []string 走既有口径（字符集 + 首尾空白 +
-// services.CRSExcludedEntryEffective 发射门），与发射端 scope=all 路径同款，
-// 不加索引存在性校验（现状兼容）。新 []对象逐条校验 target/scope/ips/listRefs；
-// 完全相同条目由读侧归一去重，此处放行。引用的 IP 列表存在性在同事务内由
-// validateIPListRefsExistence 单批校验（见 crsExcludedListRefs 调用点）。
+// 调用方归一为 "[]"）。旧 []string 走字符集 + 首尾空白 +
+// services.CRSExcludedEntryEffective 发射门，与发射端 scope=all 路径同款；
+// checkIndices=true 时两位组号/6 位 ID 与新格式同一道索引存在性门（陈旧
+// 排除永不命中=过度拦截方向的静默失效）。新 []对象逐条校验 target/scope/
+// ips/listRefs；完全相同条目由读侧归一去重，此处放行。引用的 IP 列表存在性
+// 在同事务内由 validateIPListRefsExistence 单批校验（见 crsExcludedListRefs 调用点）。
 func validateCRSExcludedRulesPayload(val *string, checkIndices bool) error {
 	raw := *val
 	var legacy []string
 	if err := json.Unmarshal([]byte(raw), &legacy); err == nil {
+		// checkIndices=true 时旧格式与新格式同一门：两位组号/6 位 ID 必须
+		// 存在于本地规则索引——陈旧 ID 落库后排除永不命中（用户以为已放行
+		// 某类流量，实际仍被拦），属「过度拦截」方向的静默失效。文件名形态
+		// 无法按组粒度核对存在性，维持形状门。checkIndices=false（导入同时
+		// 替换 CRS 树）豁免通道承接可自愈的旧备份。
+		var index *services.CRSRuleIndex
 		for _, entry := range legacy {
 			trimmed, err := validateCRSLegacyEntryCharset("crs_excluded_rules", entry)
 			if err != nil {
@@ -1369,6 +1388,18 @@ func validateCRSExcludedRulesPayload(val *string, checkIndices bool) error {
 			// 守卫按 0 处理整段跳过、策略静默空转——无合法用途，保存即拒。
 			if services.CRSExclusionTargetRemovesInit(entry) {
 				return fmt.Errorf("crs_excluded_rules 条目 %q 命中初始化规则组（901xxx）：初始化规则为系统强制加载，不能排除", entry)
+			}
+			if checkIndices {
+				if index == nil {
+					index = services.GetCRSRuleIndex()
+				}
+				if services.IsCRSGroupCode(trimmed) {
+					if !index.HasGroup(trimmed) {
+						return fmt.Errorf("规则组不存在于当前 CRS: %q", entry)
+					}
+				} else if services.IsCRSRuleIDTarget(trimmed) && !index.Has(trimmed) {
+					return fmt.Errorf("规则 ID 不存在于当前 CRS: %q", entry)
+				}
 			}
 		}
 		return nil
@@ -1948,16 +1979,58 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 			return
 		}
 		if !stored.IPACLEnabled {
-			// 门条件按有效类型（effType=显式 policy_type ?? 存量类型）判定：
-			// 显式切换 stage1 时阶段外字段已由归零矩阵落零，ACL 是 stage1 合法
-			// 字段，一步「类型切换+启用 ACL」不产生 mixed 漂移，不得误拒；
-			// 缺省类型（nil）仍按存量类型拦（防「缺省提交+启用 ACL」重推断成
-			// mixed）。
+			// 门条件按有效类型（effType=显式 policy_type ?? 存量类型）+「合并后
+			// 终态特征」判定：特征集必须取「存量行叠加本请求」的合并模型——
+			// 同一请求内关停自身阶段特征（如 stage2 限流 enabled:false/rps:0、
+			// stage3 mode:off）再启用 ACL 时，合并终态只剩 G1，重推断落
+			// stage1 不产生 mixed 漂移，按存量特征误拒会把一步合法转换卡死。
+			// 显式切换 stage1 时阶段外字段已由归零矩阵落零（req 指针即零值，
+			// 叠加后合并模型自然反映），一步「类型切换+启用 ACL」不误拒；
+			// 自身阶段特征在合并后仍在位（缺省类型不动限流/WAF）才拦——
+			// 该形态 UPDATE 后会重推断成 mixed（类型与内容漂移）。
 			effType := stored.PolicyType
 			if req.PolicyType != nil {
 				effType = *req.PolicyType
 			}
-			fs := models.PolicyTypeFeatures(&stored)
+			merged := stored
+			merged.IPACLEnabled = true // 本分支语义即「启用 ACL」
+			if req.IPACLList != nil {
+				merged.IPACLList = *req.IPACLList
+			}
+			if req.IPACLListRefs != nil {
+				merged.IPACLListRefs = *req.IPACLListRefs
+			}
+			if req.IPWhitelistEnabled != nil {
+				merged.IPWhitelistEnabled = *req.IPWhitelistEnabled
+			}
+			if req.IPWhitelist != nil {
+				merged.IPWhitelist = json.RawMessage(*req.IPWhitelist)
+			}
+			if req.IPWhitelistRefs != nil {
+				merged.IPWhitelistRefs = *req.IPWhitelistRefs
+			}
+			if req.IPBlacklist != nil {
+				merged.IPBlacklist = json.RawMessage(*req.IPBlacklist)
+			}
+			if req.GeoIPMode != nil {
+				merged.GeoIPMode = *req.GeoIPMode
+			}
+			if req.GeoIPCountries != nil {
+				merged.GeoIPCountries = json.RawMessage(*req.GeoIPCountries)
+			}
+			if req.RateLimitEnabled != nil {
+				merged.RateLimitEnabled = *req.RateLimitEnabled
+			}
+			if req.RateLimitRPS != nil {
+				merged.RateLimitRPS = *req.RateLimitRPS
+			}
+			if req.Mode != nil {
+				merged.Mode = *req.Mode
+			}
+			if req.CustomRules != nil {
+				merged.CustomRules = json.RawMessage(*req.CustomRules)
+			}
+			fs := models.PolicyTypeFeatures(&merged)
 			ownStageFeature := (effType == models.PolicyTypeStage0 && fs.G0) ||
 				(effType == models.PolicyTypeStage2 && fs.G2) ||
 				(effType == models.PolicyTypeStage3 && fs.G3)
@@ -2077,6 +2150,12 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 				}
 				reinferredFrom, reinferredTo = merged.PolicyType, inferred
 			}
+		} else {
+			// 重推断读失败不得静默跳过——policy_type 停留旧值（含 '' 存量态）
+			// 且审计 delta 不含类型变更；告警留痕并披露「类型未校正」（不 500
+			// 回滚：主更新已就绪，类型校正可下次编辑收敛——可用性优先 Ruling，
+			// 与同函数审计名读取失败的留痕口径一致）。
+			services.Logf("warn", "更新策略 #%s 后重推断读取失败（policy_type 未按合并内容校正，审计不含类型变更）: %v", id, err)
 		}
 	}
 	// 审计用 username（非数字 ID）+ 真 delta 变更详情（2026-09-25 用户裁定
@@ -2895,6 +2974,7 @@ func (h *Handlers) BatchBindSecurityPolicies(c *gin.Context) {
 		Reason string `json:"reason"`
 	}
 	bound := 0
+	unchanged := 0
 	skipped := make([]skippedRule, 0)
 	for _, ruleCaddyID := range req.RuleIDs {
 		ruleCaddyID = strings.TrimSpace(ruleCaddyID)
@@ -2991,7 +3071,14 @@ func (h *Handlers) BatchBindSecurityPolicies(c *gin.Context) {
 				}
 			}
 		}
-		bound++
+		// bound 只计真实写入（DELETE+INSERT 发生）；幂等 merge（目标集与现
+		// 绑定逐条一致）零写入计 unchanged——与同族 batch-block-pages 的
+		// bound/unchanged 双计数口径一致，取证时区分真实变更与零写入。
+		if changed {
+			bound++
+		} else {
+			unchanged++
+		}
 	}
 	idStrs := make([]string, len(uniqueIDs))
 	for i, id := range uniqueIDs {
@@ -2999,9 +3086,9 @@ func (h *Handlers) BatchBindSecurityPolicies(c *gin.Context) {
 	}
 	h.finishTxApply(c, tx, txApplyFinish{
 		Resource: "安全策略", AuditAction: "更新",
-		AuditDetail: fmt.Sprintf("批量绑定安全策略 [%s]（%s）：成功 %d 条，跳过 %d 条", strings.Join(idStrs, ","), req.Mode, bound, len(skipped)),
+		AuditDetail: fmt.Sprintf("批量绑定安全策略 [%s]（%s）：成功 %d 条，不变 %d 条，跳过 %d 条", strings.Join(idStrs, ","), req.Mode, bound, unchanged, len(skipped)),
 		SuccessMsg:  "批量绑定完成",
-		Data:        gin.H{"bound": bound, "skipped": skipped},
+		Data:        gin.H{"bound": bound, "unchanged": unchanged, "skipped": skipped},
 	})
 }
 
@@ -3098,6 +3185,24 @@ func (h *Handlers) SplitSecurityPolicy(c *gin.Context) {
 	if utf8.RuneCountInString(p.Name)+utf8.RuneCountInString(stageSuffix[models.PolicyTypeStage3]) > securityNameMaxRunes {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "拆分后的子策略名称将超过 100 字符，请先缩短原策略名称"})
 		return
+	}
+	// 拆分是「新建策略」路径，与 Create 同门：子策略写入前校验拦截页/自定义
+	// 规则引用存在性。禁用态混合策略的引用可悬空（删除门只拦启用策略，
+	// security_regression_13 钉住），直接复制给子策略会让启用后的拦截响应
+	// 静默回落 Caddy 默认页/自定义拦截静默缺席，且归因困难（启用门在
+	// 「另一次操作」才报错）。拒绝拆分并指引先修原策略——不产生半截子策略。
+	if features.G1 || features.G2 || features.G3 {
+		childCustomRules := ""
+		if features.G3 {
+			childCustomRules = rawJSONString(p.CustomRules)
+		}
+		if msg, err := validateSecurityPolicyReferences(tx, p.BlockPageID, childCustomRules); err != nil {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
+			return
+		} else if msg != "" {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "拆分迁移中止：原策略" + msg + "，请先修正原策略的引用后重试"})
+			return
+		}
 	}
 	if trustEntriesNonEmpty {
 		if err := insertChild(models.PolicyTypeStage0, p.Name+stageSuffix[models.PolicyTypeStage0], "off", "deny", "[]", false,
@@ -3352,20 +3457,6 @@ func formatIP2RegionLocation(region string) string {
 		parts = append(parts, isp)
 	}
 	return strings.Join(parts, "·")
-}
-
-// enrichIPLocation 返回 IP 的归属地展示文本；xdb 未安装或查询失败返回 ""（前端
-// 隐藏归属地标签），永不报错。
-func enrichIPLocation(ip string) string {
-	if ip == "" {
-		return ""
-	}
-	// 保留地址前置拦截:xdb 仅 IPv4(NewV4Config),IPv6 回环/链路本地等
-	// 查库返回空串会裸显示 IP;私网/回环/链路本地/未指定一律「保留地址」。
-	if isReservedIP(ip) {
-		return "保留地址"
-	}
-	return formatIP2RegionLocation(services.LookupRegion(ip))
 }
 
 var reservedIPPrefixes = [...]netip.Prefix{
@@ -3688,7 +3779,11 @@ func parseStrictPaginationParam(c *gin.Context, name string, def, cap int) (int,
 }
 
 func (h *Handlers) ListSecurityEvents(c *gin.Context) {
-	page, ok := parseStrictPaginationParam(c, "page", 1, 100000)
+	// page 上限 1000：SQLite OFFSET 线性丢弃，page_size=100 × page=100000 的
+	// 深翻页单请求扫近千万行（秒级 CPU/IO，任意登录用户可触发且无端点级
+	// 限流）。1000 页 × 100 条 = 覆盖最近 10 万事件，足够「跳末页」交互；
+	// 更深的历史翻查走筛选/导出语义而非深 OFFSET。
+	page, ok := parseStrictPaginationParam(c, "page", 1, 1000)
 	if !ok {
 		return
 	}
@@ -3696,14 +3791,8 @@ func (h *Handlers) ListSecurityEvents(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if page < 1 {
-		page = 1
-	}
-	// 超上限钳到上限(此前回落默认 20——显式要 150 条拿到 20 条);
-	// 低于 1 回默认（既有契约，见 TestListSecurityEvents_pageSizeClampsToCap）。
-	if pageSize < 1 {
-		pageSize = 20
-	}
+	// 解析器已保证 1≤page≤cap、1≤pageSize≤cap（<1 回默认值，>cap 钳到
+	// cap——契约见 TestListSecurityEvents_pageSizeClampsToCap）。
 	offset := (page - 1) * pageSize
 
 	where := " WHERE 1=1"
@@ -4118,7 +4207,16 @@ const (
 )
 
 // attackFamilyClassOf 共享形态谓词——两个 Go 视图函数的唯一分类入口。
+// 预检 8xxxxx 段的家族/边界经 services.DecodePrecheckRuleID 单一事实源
+// 解码（段界字面量禁止在 handlers 复写——历史分叉：n>800000 vs n>=800000）。
 func attackFamilyClassOf(ruleTriggered, ruleMsg string) attackFamilyClass {
+	// 预检家族经 services.PrecheckRuleFamilyOf 单一事实源判定（段界字面量
+	// 禁止在 handlers 复写——历史分叉：n>800000 vs n>=800000）；非数字/段外
+	// ID 得 Unknown，不影响后续形态分支。
+	precheckFamily := services.PrecheckRuleFamilyUnknown
+	if n, perr := strconv.Atoi(ruleTriggered); perr == nil {
+		precheckFamily = services.PrecheckRuleFamilyOf(n)
+	}
 	switch {
 	case len(ruleTriggered) == 5:
 		// 5 位 ID 恒为自定义规则(发射 id=crID+10000 落 10000-99999;
@@ -4142,12 +4240,13 @@ func attackFamilyClassOf(ruleTriggered, ruleMsg string) attackFamilyClass {
 		// 14 = 威胁情报库预检拦截（阶段 1，v2.3.x）。精确匹配——LIKE 前缀
 		// 会误并自定义规则发射 id 14xxxx（emit=DB id+10000）。
 		return attackFamilyThreatIntel
-	case len(ruleTriggered) == 6 && ruleTriggered[0] == '8' && ruleTriggered[1] != '0':
-		// 爬虫两族 [810000,900000) 与地域段 [800000,810000) 互斥。
+	case precheckFamily == services.PrecheckRuleFamilyCrawlerExempt || precheckFamily == services.PrecheckRuleFamilyCrawlerSpoof:
+		// 爬虫两族 [810000,900000) 与地域段 [800000,810000) 互斥（段界由
+		// services 单一事实源保证）。
 		return attackFamilyCrawler
-	case ruleTriggered == "8" || (len(ruleTriggered) == 6 && strings.HasPrefix(ruleTriggered, "80")) || strings.Contains(ruleMsg, "GeoIP 区域拦截"):
-		// 8 = 旧共享 GeoIP id（策略引擎时代历史事件）；6 位 8xxxxx = 预检精确段
-		// 800000+policyID（阶段化模型，buildIPPrecheckDirectives 逐策略链）。
+	case ruleTriggered == "8" || precheckFamily == services.PrecheckRuleFamilyGeoIP || strings.Contains(ruleMsg, "GeoIP 区域拦截"):
+		// 8 = 旧共享 GeoIP id（策略引擎时代历史事件）；预检 GeoIP 族 = 逐策略
+		// 精确段 800000+policyID（阶段化模型，buildIPPrecheckDirectives 逐策略链）。
 		return attackFamilyGeoIP
 	case strings.Contains(ruleMsg, "IP 黑名单") || strings.Contains(ruleMsg, "IP 白名单") || strings.Contains(ruleMsg, "IP 访问控制") ||
 		ruleTriggered == "2" || ruleTriggered == "4" || ruleTriggered == "5" || ruleTriggered == "7":

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -188,6 +189,16 @@ func (m *ThreatUpdateManager) StartUpdate(trigger string, rc *taskengine.RunCont
 	go func() {
 		defer close(done)
 		defer runCancel()
+		// 自建 goroutine 不被引擎 runGuarded 覆盖——未捕获 panic=整个
+		// admin 进程退出（与 ip2region/CRS 族同形护栏）。
+		defer func() {
+			if r := recover(); r != nil {
+				Logf("error", "threat update: run panicked: %v\n%s", r, debug.Stack())
+				m.mu.Lock()
+				m.running = false
+				m.mu.Unlock()
+			}
+		}()
 		m.runWithContext(runCtx, trigger, rc)
 		m.mu.Lock()
 		m.running = false
@@ -637,9 +648,12 @@ func (m *ThreatUpdateManager) updateOneSource(ctx context.Context, source threat
 		Logf("error", "威胁情报库: 读源 %s 原始哈希失败: %v", source.name, err)
 	}
 	if storedRaw != "" && storedRaw == rawHash {
-		// 名单行缺失（备份还原/异常清理）须穿透快速路径补建
+		// 名单行缺失（备份还原/异常清理）须穿透快速路径补建——存在性判定
+		// 与写路径同口径限定 system=1（:793 慢路径同款）：同名用户自建列表
+		// （system=0）不得抑制内置行补建，否则引用旧 id 的策略漏拦且无任何
+		// 告警，直到上游内容变化才自愈。
 		var listExists int
-		err := db.DB.QueryRow(`SELECT COUNT(*) FROM security_ip_lists WHERE name=?`, db.ThreatListNameBySource(source.name)).Scan(&listExists)
+		err := db.DB.QueryRow(`SELECT COUNT(*) FROM security_ip_lists WHERE name=? AND system=1`, db.ThreatListNameBySource(source.name)).Scan(&listExists)
 		switch {
 		case err != nil:
 			// 存在性判定失败不得按「存在」跳过（名单可能已缺失，
@@ -913,16 +927,14 @@ func downloadAndParseThreatSourceCtx(parent context.Context, source threatSource
 
 	var entries []string
 	total := 0
-	for _, line := range strings.Split(string(body), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
-			continue
-		}
+	// 行过滤口径单源 iterIPListTextLines（与渲染/编译侧同口径）。
+	iterIPListTextLines(body, func(line string) bool {
 		total++
 		if _, err := wafiplist.ParseIPEntry(line); err == nil {
 			entries = append(entries, line)
 		}
-	}
+		return true
+	})
 	if total == 0 {
 		return nil, "", fmt.Errorf("响应无可解析条目（空名单）")
 	}
@@ -976,16 +988,14 @@ func healThreatFastFromText(source string) ([]string, string, bool) {
 	}
 	entries := make([]string, 0, 1024)
 	total := 0
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
-			continue
-		}
+	// 行过滤口径单源 iterIPListTextLines（与下载侧/渲染侧同口径）。
+	iterIPListTextLines(data, func(line string) bool {
 		total++
 		if _, err := wafiplist.ParseIPEntry(line); err == nil {
 			entries = append(entries, line)
 		}
-	}
+		return true
+	})
 	if total == 0 {
 		Logf("warn", "威胁情报库: 源 %s .iplist 为空/仅注释，拒绝以空集重建 .fast（保留上次快照）", source)
 		return nil, "", false

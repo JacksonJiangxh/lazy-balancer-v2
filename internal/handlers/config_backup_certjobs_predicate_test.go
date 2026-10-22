@@ -10,6 +10,7 @@ package handlers
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 
 	"lazy-balancer-v2/internal/db"
@@ -97,7 +98,7 @@ func TestValidateV2BackupCertJobs_canonicalizesStoredDomain(t *testing.T) {
 			"rule_id": "lb_jobdomain", "domain": " WWW.JobDomain.example.test, JOBDOMAIN.example.test ", "status": "disabled",
 		}},
 	}
-	if err := validateV2BackupCertJobs(tables); err != nil {
+	if _, err := validateV2BackupCertJobs(tables); err != nil {
 		t.Fatalf("validate cert jobs: %v", err)
 	}
 	if got := tables["cert_jobs"][0]["domain"]; got != "jobdomain.example.test,www.jobdomain.example.test" {
@@ -134,4 +135,91 @@ func TestImportConfigBackup_canonicalizesACMEJobDomains(t *testing.T) {
 	if count != 1 || domain != "jobdomain.example.test,www.jobdomain.example.test" {
 		t.Fatalf("cert jobs count=%d domain=%q, want one canonical domain", count, domain)
 	}
+}
+
+// cert_jobs.ca_provider_id 参与导入期可解析性校验：悬挂/已禁用引用会让
+// 非终态任务首次入队即落 failed 终态（loadCAProvider 对「存在但禁用」显性
+// 报错）——导入期归一为 0（跟随默认）并产出警告，而不是静默带入运行态。
+func TestValidateV2BackupCertJobs_normalizesDanglingCAProvider(t *testing.T) {
+	enabledACMERule := map[string]any{
+		"caddy_id": "bak-acme", "name": "bak-acme", "protocol": "http",
+		"domain": "jobdomain.example.test", "enabled": int64(1), "enable_tls": int64(1), "tls_source": "acme_dns",
+		"acme_config_id": int64(3),
+	}
+	jobWithProvider := func(id any) map[string]any {
+		return map[string]any{"rule_id": "bak-acme", "domain": "jobdomain.example.test", "status": "queued", "ca_provider_id": id}
+	}
+
+	t.Run("已禁用提供商归一为跟随默认", func(t *testing.T) {
+		job := jobWithProvider(int64(9))
+		tables := map[string][]map[string]any{
+			"lb_rules":            {enabledACMERule},
+			"cert_jobs":           {job},
+			"ca_providers":        {{"id": int64(9), "enabled": int64(0)}},
+			"certificate_configs": {{"id": int64(3), "enabled": int64(1)}},
+		}
+		warnings, err := validateV2BackupCertJobs(tables)
+		if err != nil {
+			t.Fatalf("unexpected rejection: %v", err)
+		}
+		if got := job["ca_provider_id"]; got != 0 {
+			t.Fatalf("ca_provider_id=%v, want 0（归一跟随默认）", got)
+		}
+		if len(warnings) != 1 || !strings.Contains(warnings[0], "CA 提供商") {
+			t.Fatalf("warnings=%v, want 1 条提供商归一警告", warnings)
+		}
+	})
+
+	t.Run("悬挂引用同样归一", func(t *testing.T) {
+		job := jobWithProvider(int64(99))
+		tables := map[string][]map[string]any{
+			"lb_rules":            {enabledACMERule},
+			"cert_jobs":           {job},
+			"ca_providers":        {{"id": int64(9), "enabled": int64(1)}},
+			"certificate_configs": {{"id": int64(3), "enabled": int64(1)}},
+		}
+		warnings, err := validateV2BackupCertJobs(tables)
+		if err != nil {
+			t.Fatalf("unexpected rejection: %v", err)
+		}
+		if got := job["ca_provider_id"]; got != 0 {
+			t.Fatalf("ca_provider_id=%v, want 0（悬挂归一）", got)
+		}
+		if len(warnings) != 1 {
+			t.Fatalf("warnings=%v, want 1 条警告", warnings)
+		}
+	})
+
+	t.Run("启用提供商不受影响", func(t *testing.T) {
+		job := jobWithProvider(int64(9))
+		tables := map[string][]map[string]any{
+			"lb_rules":            {enabledACMERule},
+			"cert_jobs":           {job},
+			"ca_providers":        {{"id": int64(9), "enabled": int64(1)}},
+			"certificate_configs": {{"id": int64(3), "enabled": int64(1)}},
+		}
+		warnings, err := validateV2BackupCertJobs(tables)
+		if err != nil {
+			t.Fatalf("unexpected rejection: %v", err)
+		}
+		if got := job["ca_provider_id"]; got != int64(9) {
+			t.Fatalf("ca_provider_id=%v, want 9（启用引用保持）", got)
+		}
+		if len(warnings) != 0 {
+			t.Fatalf("warnings=%v, want 空", warnings)
+		}
+	})
+
+	t.Run("无提供商引用零告警零数据库依赖", func(t *testing.T) {
+		job := map[string]any{"rule_id": "bak-acme", "domain": "jobdomain.example.test", "status": "queued"}
+		tables := map[string][]map[string]any{
+			"lb_rules":            {enabledACMERule},
+			"cert_jobs":           {job},
+			"certificate_configs": {{"id": int64(3), "enabled": int64(1)}},
+		}
+		warnings, err := validateV2BackupCertJobs(tables)
+		if err != nil || len(warnings) != 0 {
+			t.Fatalf("warnings=%v err=%v, want 空/nil（无引用不得触碰 ca_providers）", warnings, err)
+		}
+	})
 }

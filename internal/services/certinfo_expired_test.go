@@ -149,3 +149,60 @@ func TestGetRuleCertInfo_acme_without_candidates_is_missing_info(t *testing.T) {
 		t.Fatalf("info=%+v, want missing ACME 信息（unknown + 尚未签发）", info)
 	}
 }
+
+// 「已签发但未生效」（未来 NotBefore——证书已写盘+已 reload）不得误报
+// 「尚未签发或不存在」：运维会误判并重复触发签发（白烧 CA 配额），且与
+// 磁盘/Caddy 实际部署状态矛盾。按 unknown + 「尚未生效」单列呈现。
+func TestGetRuleCertInfo_reportsNotYetValidACMECert(t *testing.T) {
+	_, database := newClusterTestService(t)
+
+	// Given：ACME 规则 + cert_jobs 携带未来时钟证书（SelectCertificate 因
+	// now<NotBefore 跳过）
+	certPEM, keyPEM := futureShapeCertAndKey(t, "future.test", time.Now().Add(24*time.Hour))
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source) VALUES ('lb_future','future','future.test','http',8080,1,1,'acme_dns')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, cert_pem, key_pem, updated_at) VALUES ('lb_future', 'future.test', 'issued', ?, ?, datetime('now'))`, certPEM, keyPEM); err != nil {
+		t.Fatal(err)
+	}
+
+	// When
+	info, err := GetRuleCertInfo("lb_future")
+	if err != nil {
+		t.Fatalf("GetRuleCertInfo: %v", err)
+	}
+
+	// Then：尚未生效，而非「尚未签发或不存在」
+	if info == nil {
+		t.Fatal("info is nil")
+	}
+	if info.Status != "unknown" {
+		t.Fatalf("status=%q, want unknown（未生效单列，不占 valid/expired）", info.Status)
+	}
+	if !strings.Contains(info.Error, "尚未生效") {
+		t.Fatalf("error=%q, want ACME 证书尚未生效（不得误报尚未签发）", info.Error)
+	}
+}
+
+// futureShapeCertAndKey 生成指定域名、NotBefore 在未来的证书+私钥 PEM 对。
+func futureShapeCertAndKey(t *testing.T, domain string, notBefore time.Time) (string, string) {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(3),
+		Subject:      pkix.Name{CommonName: domain},
+		DNSNames:     []string{domain},
+		NotBefore:    notBefore,
+		NotAfter:     notBefore.Add(90 * 24 * time.Hour),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+	certPEM := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+	keyPEM := string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}))
+	return certPEM, keyPEM
+}

@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"lazy-balancer-v2/internal/taskengine"
 	"os"
@@ -1206,5 +1207,80 @@ func TestIP2RegionUpdateRun_freshInstallKeepsStaleBakOnRenameFailure(t *testing.
 	got, err := os.ReadFile(live + ".bak")
 	if err != nil || string(got) != string(stale) {
 		t.Fatalf("rename 失败路径删除了非本运行创建的陈旧 .bak: %q, %v", got, err)
+	}
+}
+
+// 截断 xdb（头部完好、整体短小）必须被安装校验拒绝且不得 panic：
+// BufferCache 装载只校验 256B 头，探针搜索的向量索引切片越界在旧实现是
+// 进程级 panic。
+func TestValidateIP2RegionXDB_rejectsTruncatedXDBWithoutPanic(t *testing.T) {
+	dir := t.TempDir()
+	full := filepath.Join(dir, "full.xdb")
+	writeTestXDB(t, full, testSegments)
+	data, err := os.ReadFile(full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 头部（256B）+ 部分向量索引：NewV4Config 全部校验通过，但
+	// 114.114.114.114 探针的向量索引偏移 234640 已越出文件。
+	truncated := filepath.Join(dir, "truncated.xdb")
+	if err := os.WriteFile(truncated, data[:100000], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateIP2RegionXDB(truncated); err == nil {
+		t.Fatal("截断的 xdb 必须被校验拒绝")
+	}
+}
+
+// 结构自检门通过但段数据指针损坏的 xdb：探针搜索在绑定库内 panic，
+// 校验必须把 panic 转成错误（不得外溢为进程崩溃）。
+func TestValidateIP2RegionXDB_recoversProbePanicOnCorruptSegment(t *testing.T) {
+	dir := t.TempDir()
+	full := filepath.Join(dir, "corrupt.xdb")
+	writeTestXDB(t, full, testSegments)
+	data, err := os.ReadFile(full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 改写 114.114.x.x 的向量索引条目：非零起点（绕过零指针短路）+
+	// 巨大终点 → 二分首读即越出内容缓冲（头内段索引指针保持原值，
+	// 结构自检门不受影响）。
+	const vectorEntryOff = 256 + (114*256+114)*8
+	binary.LittleEndian.PutUint32(data[vectorEntryOff:], 524544)
+	binary.LittleEndian.PutUint32(data[vectorEntryOff+4:], 0x7FFFFF00)
+	if err := os.WriteFile(full, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateIP2RegionXDB(full); err == nil {
+		t.Fatal("段数据指针损坏的 xdb 必须被校验拒绝（recover 转错误）")
+	} else if !strings.Contains(err.Error(), "内部异常") && !strings.Contains(err.Error(), "搜索失败") {
+		t.Fatalf("错误须指明校验失败: %v", err)
+	}
+}
+
+// 更新 goroutine 内的 panic（热换/reloader 等任意环节）必须被拦截并落定
+// failed 终态——裸 goroutine 的未捕获 panic=进程退出。
+func TestIP2RegionStartUpdate_recoversPanickingRun(t *testing.T) {
+	m := newTestIP2RegionManager(t)
+	seedIP2RegionVersionRow(t, "v3.0.0", true)
+	m.fetchLatestTag = func(context.Context) (string, error) { return "v3.1.0", nil }
+	m.downloadXDB = fakeIP2RegionDownload(t, true)
+	m.reloader = func() error { panic("injected reloader panic") }
+
+	done, err := m.StartUpdate("manual", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-done
+
+	_, status, message, _, _, _, _ := ip2RegionVersionRow(t)
+	if status != "failed" {
+		t.Fatalf("status=%q, want failed（panic 必须落定失败终态）", status)
+	}
+	if !strings.Contains(message, "injected reloader panic") {
+		t.Fatalf("message=%q, want 携带 panic 内容", message)
+	}
+	if m.IsRunning() {
+		t.Fatal("running 标记必须已复位")
 	}
 }

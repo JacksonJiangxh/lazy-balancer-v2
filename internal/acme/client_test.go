@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -472,9 +473,6 @@ func TestNewClientRetryBackoff_curve(t *testing.T) {
 	}
 }
 
-// 既有账户密钥可用时，元数据（卫生清理输入）
-// 写失败不得阻断签发。
-
 // 既有账户密钥可用时，元数据（卫生清理输入）写失败不得阻断签发。
 func TestLoadOrCreateAccountKey_metadataWriteFailureDoesNotBlockIssuance(t *testing.T) {
 	dir := t.TempDir()
@@ -546,5 +544,31 @@ func TestClient_DiscardFinalizedCert_fallsBackToNetwork(t *testing.T) {
 	}
 	if requests != 1 {
 		t.Fatalf("requests=%d, want 1（丢弃缓存后回退网络下载）", requests)
+	}
+}
+
+// 未知密钥类型必须 fail-loud（历史形态静默返回空串——空 keyPEM 会交给
+// 部署层落成无私钥的规则）；RSA/ECDSA 分支保持有效 PEM 输出。
+func TestEncodeKeyPEM_unknownTypeFailsLoudly(t *testing.T) {
+	// Given/When/Then：未知类型
+	if pemText, err := EncodeKeyPEM(nil); err == nil || pemText != "" {
+		t.Fatalf("EncodeKeyPEM(nil)=(%q,%v), want 空串+错误", pemText, err)
+	}
+	// 回归形状：RSA 与 ECDSA 均产出可解码 PEM
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate rsa key: %v", err)
+	}
+	rsaPEM, err := EncodeKeyPEM(rsaKey)
+	if err != nil || !strings.Contains(rsaPEM, "RSA PRIVATE KEY") {
+		t.Fatalf("EncodeKeyPEM(rsa)=(%q,%v), want RSA PEM", rsaPEM, err)
+	}
+	ecKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate ec key: %v", err)
+	}
+	ecPEM, err := EncodeKeyPEM(ecKey)
+	if err != nil || !strings.Contains(ecPEM, "EC PRIVATE KEY") {
+		t.Fatalf("EncodeKeyPEM(ecdsa)=(%q,%v), want EC PEM", ecPEM, err)
 	}
 }

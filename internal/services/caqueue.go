@@ -526,18 +526,19 @@ func (m *CAQueueManager) requeueLifecycleStrandedJobs() {
 // 'queued' 而队列中无此任务，Resume 之外的周期巡检原先均不覆盖纯 'queued'，任务
 // 会滞停至下次角色翻转/重启。CertificateService 的 30s waitingCA ticker 顺带调用
 // 本函数，把滞停窗口收敛到 30s。只扫 'queued'：'waiting_ca' 有独立冷却语义，由
-// requeueWaitingCAJobs 负责，此处不碰。
-func (m *CAQueueManager) requeueStrandedQueuedJobs() {
-	m.requeueStrandedJobs(`j.status='queued'`, "周期巡检发现队列外滞留，重新排队", "CA queue periodic scan")
+// requeueWaitingCAJobs 负责，此处不碰。返回本轮实际重入队的任务数
+// （供 30s 补扫节拍的动作计数摘要）。
+func (m *CAQueueManager) requeueStrandedQueuedJobs() int {
+	return m.requeueStrandedJobs(`j.status='queued'`, "周期巡检发现队列外滞留，重新排队", "CA queue periodic scan")
 }
 
 // requeueStrandedJobs 是 Resume 与周期巡检共用的滞留任务重入队实现：按 whereClause
 // 扫描任务，逐个经 IsJobActive（在途/滞行任务防双执行）与
 // certJobRuleApplicable（孤儿交周期 sweep 禁用）守卫后，以归一化转换 +
-// EnqueueIfActive 重排队。
-func (m *CAQueueManager) requeueStrandedJobs(whereClause, message, logPrefix string) {
+// EnqueueIfActive 重排队。返回本轮实际重入队的任务数。
+func (m *CAQueueManager) requeueStrandedJobs(whereClause, message, logPrefix string) (requeued int) {
 	if db.DB == nil {
-		return
+		return 0
 	}
 	rows, err := db.DB.Query(`
 		SELECT j.id, COALESCE(j.rule_id,''), COALESCE(j.domain,''), j.status, COALESCE(j.ca_provider_id,0),
@@ -595,7 +596,7 @@ func (m *CAQueueManager) requeueStrandedJobs(whereClause, message, logPrefix str
 		// 状态已 'queued' 的任务也走一次归一化转换（'queued'→'queued' 幂等），
 		// 让 EnqueueIfActive 以 changed=true 真正入队；并发改过状态的行由
 		// transitionJob 的 WHERE status IN (...) 守卫跳过。
-		_, _, err := m.EnqueueIfActive(job.providerID, job.id, job.ruleID, job.domain, func() (int, bool, error) {
+		_, changed, err := m.EnqueueIfActive(job.providerID, job.id, job.ruleID, job.domain, func() (int, bool, error) {
 			err := transitionJob(db.DB, job.id, []string{job.status}, "queued", map[string]any{"message": message})
 			if errors.Is(err, ErrJobTransitionConflict) {
 				return job.id, false, nil
@@ -604,8 +605,13 @@ func (m *CAQueueManager) requeueStrandedJobs(whereClause, message, logPrefix str
 		})
 		if err != nil {
 			Logf("error", "%s: requeue stranded job %d failed: %v", logPrefix, job.id, err)
+			continue
+		}
+		if changed {
+			requeued++
 		}
 	}
+	return requeued
 }
 
 // HasRunningJobForRule 报告该规则当前是否有 worker 正在执行证书任务。

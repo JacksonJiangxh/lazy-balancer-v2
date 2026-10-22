@@ -105,8 +105,8 @@ func TestNewProviderFromCredentials_authModeOverridesStrayMode(t *testing.T) {
 	if !ok {
 		t.Fatalf("provider=%T, want *dnspod.Provider（auth_mode 优先）", provider)
 	}
-	if dnspodProvider.LoginToken != "123,abc" {
-		t.Fatalf("login token=%q, want 123,abc（UI 字段为凭据真相）", dnspodProvider.LoginToken)
+	if dnspodProvider.LoginToken() != "123,abc" {
+		t.Fatalf("login token=%q, want 123,abc（UI 字段为凭据真相）", dnspodProvider.LoginToken())
 	}
 }
 
@@ -121,7 +121,7 @@ func TestNewProviderFromCredentials_uiFieldsOverrideStaleAPIToken(t *testing.T) 
 	if !ok {
 		t.Fatalf("provider=%T, want *dnspod.Provider", provider)
 	}
-	if dnspodProvider.LoginToken != "123,abc" {
-		t.Fatalf("login token=%q, want 123,abc（app_id/app_token 优先）", dnspodProvider.LoginToken)
+	if dnspodProvider.LoginToken() != "123,abc" {
+		t.Fatalf("login token=%q, want 123,abc（app_id/app_token 优先）", dnspodProvider.LoginToken())
 	}
 }

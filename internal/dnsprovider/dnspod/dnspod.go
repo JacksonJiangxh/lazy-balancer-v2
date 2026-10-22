@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,7 +49,9 @@ type ownedRecord struct {
 
 // Provider implements dnsprovider.Provider for DNSPod (dnsapi.cn).
 type Provider struct {
-	LoginToken string
+	// loginToken 凭据保持私有——导出字段任何一次 %+v/JSON 序列化即泄密；
+	// 读取走 LoginToken() 访问器，日志形态走 String() 脱敏。
+	loginToken string
 	client     *http.Client
 	mu         sync.Mutex
 	owned      map[string][]ownedRecord
@@ -58,6 +61,12 @@ type Provider struct {
 	// 命中新账户下的无关记录。
 	account string
 }
+
+// LoginToken 返回凭据原文（仅构造 API 请求/缓存键派生使用；禁止打印）。
+func (p *Provider) LoginToken() string { return p.loginToken }
+
+// String 脱敏形态：只暴露账户摘要，任何日志/序列化路径不得回显凭据。
+func (p *Provider) String() string { return "dnspod.Provider{account:" + p.account + "}" }
 
 func NewPersistent(loginToken, dataDir string) (*Provider, error) {
 	store, err := ownership.New(dataDir)
@@ -72,7 +81,7 @@ func NewPersistent(loginToken, dataDir string) (*Provider, error) {
 // New creates a DNSPod provider. loginToken must be "id,key" format.
 func New(loginToken string) *Provider {
 	return &Provider{
-		LoginToken: loginToken,
+		loginToken: loginToken,
 		client: &http.Client{
 			// 覆盖整个重试包络（3 次尝试 + 每次至多 30s 退避/
 			// 等待计入同一 RoundTrip），不能把退火循环中途掐断
@@ -159,6 +168,38 @@ func (p *Provider) CleanUpValue(ctx context.Context, zone, tokenFQDN, value stri
 	return p.cleanUp(ctx, zone, tokenFQDN, value, true)
 }
 
+// CountCleanupRecords 实现 dnsprovider.CleanupCounter：纯本地计数一次按值
+// 清理将选中的记录条数（ownership 账本 MatchingValue + 内存兜底表条目）。
+// 兜底表键含 domain_id，计数按 "|"+subDomain 后缀跨键聚合（避免为计数引入
+// getDomainID 网络解析；跨 zone 同名子域的少量多计只会让预算偏大，方向安全）。
+func (p *Provider) CountCleanupRecords(zone, tokenFQDN, value string) int {
+	zone = strings.TrimSuffix(zone, ".")
+	subDomain := strings.TrimSuffix(tokenFQDN, ".")
+	subDomain = strings.TrimSuffix(subDomain, "."+zone)
+	p.mu.Lock()
+	fallback := 0
+	for key, entries := range p.owned {
+		if !strings.HasSuffix(key, "|"+subDomain) {
+			continue
+		}
+		for _, entry := range entries {
+			if value == "" || entry.value == value {
+				fallback++
+			}
+		}
+	}
+	p.mu.Unlock()
+	if p.ownership == nil {
+		return fallback
+	}
+	records, err := p.ownership.MatchingValue("dnspod", zone, tokenFQDN, value)
+	if err != nil {
+		// 账本读失败按至少 1 条计——预算宁大勿小（清理本身会再上抛该错误）。
+		return max(fallback, 1)
+	}
+	return len(records) + fallback
+}
+
 // cleanUp 是 CleanUp/CleanUpValue 的共享实现（按值定向删除+陈旧条目清理）。
 //
 // 本函数与 internal/dnsprovider/tencent/tencent.go 的
@@ -217,19 +258,18 @@ func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, b
 				err = errors.Join(err, resolveErr)
 			} else {
 				// 自愈换新 domain_id 后 bookkeeping 键
-				// 随之换代——残留旧键条目（kept 未选中之值/failed 回填）同步迁移
-				// 新键。否则后续 cleanUp/Present 按新键查找，旧键条目永不可达，
-				// 「failed 回填供后续清理重试」失效（仅内存模式；ownership 存储
-				// 不含 domain_id，无此问题）。
-				if p.ownership == nil {
-					p.mu.Lock()
-					if freshKey := freshID + "|" + subDomain; freshKey != key {
-						p.owned[freshKey] = append(p.owned[freshKey], p.owned[key]...)
-						delete(p.owned, key)
-						key = freshKey
-					}
-					p.mu.Unlock()
+				// 随之换代——残留旧键条目（kept 未选中之值/failed 回填/ownership
+				// 模式的兜底表条目）同步迁移新键。否则后续 cleanUp/Present 按新键
+				// 查找，旧键条目永不可达，「failed 回填供后续清理重试」失效。
+				// 兜底表 p.owned 在 ownership 模式同样以 domainID+"|"+subDomain
+				// 为键（Present 双失败回填/排空失败回填），故迁移不区分模式。
+				p.mu.Lock()
+				if freshKey := freshID + "|" + subDomain; freshKey != key {
+					p.owned[freshKey] = append(p.owned[freshKey], p.owned[key]...)
+					delete(p.owned, key)
+					key = freshKey
 				}
+				p.mu.Unlock()
 				domainID = freshID
 				err = p.deleteRecord(ctx, freshID, recordID)
 			}
@@ -255,6 +295,11 @@ func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, b
 		return nil
 	}
 	if p.ownership != nil {
+		// 批量收敛：成功删除/判定丢弃的条目攒批，循环结束后一次
+		// RemoveMany（单次全量重写+fsync）——逐条 Remove 的代价是
+		// O(账本大小) 字节 × 条目数。中途崩溃只让已删记录的条目多留一轮
+		// （下次清理命中 code 8 幂等删除后再移除），收敛语义不变。
+		var removable []ownership.Record
 		for _, record := range records {
 			// 账户归属先于删除。换凭据后旧账户遗留条目仍按
 			// name/value 被选中，但 record_id 属于旧账户——在新账户里可能指向
@@ -262,18 +307,19 @@ func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, b
 			// 留痕（TXT 若仍在旧账户则永远不可达，属已知代价）。
 			if ownership.DecideRemoval(record, p.account, time.Now()) == ownership.DispositionDrop {
 				logf("warn", "dnspod: 所有权条目无法归属当前账户（%s, recordID=%s, account=%q），仅丢弃本地条目、不调用删除", tokenFQDN, record.RecordID, record.Account)
-				cleanupErr = errors.Join(cleanupErr, p.ownership.Remove(record))
+				removable = append(removable, record)
 				continue
 			}
 			// independence: a record whose deletion failed keeps
 			// its ownership entry (the DNS record may still exist), but an
-			// earlier miss must not skip Remove for records that WERE
+			// earlier miss must not skip removal for records that WERE
 			// deleted — that orphans them until self-heal.
 			if deleteOne(record.RecordID, record.Value) != nil {
 				continue
 			}
-			cleanupErr = errors.Join(cleanupErr, p.ownership.Remove(record))
+			removable = append(removable, record)
 		}
+		cleanupErr = errors.Join(cleanupErr, p.ownership.RemoveMany(removable))
 		// 兜底排空：Present 在「ownership.Add 失败 + 回滚删除
 		// 失败」时把 recordID 回填进内存兜底表（store 无条目可追踪）。此处重试
 		// 删除这些兜底条目——成功即清除，失败回填供下次重试（幂等）。store 模式
@@ -311,7 +357,7 @@ type apiStatus struct {
 const httpErrorBodyLimit = 512
 
 func (p *Provider) apiCall(ctx context.Context, method string, params url.Values, result interface{}) error {
-	params.Set("login_token", p.LoginToken)
+	params.Set("login_token", p.loginToken)
 	params.Set("format", "json")
 	if params.Get("lang") == "" {
 		params.Set("lang", "cn")
@@ -339,7 +385,7 @@ func (p *Provider) apiCall(ctx context.Context, method string, params url.Values
 	// 整读既无诊断增量又可能把响应体读进内存。
 	if resp.StatusCode >= http.StatusBadRequest {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, httpErrorBodyLimit))
-		return fmt.Errorf("%s failed: HTTP %d: %s", method, resp.StatusCode, strings.TrimSpace(string(body)))
+		return fmt.Errorf("%s failed: HTTP %d: %s", method, resp.StatusCode, sanitizeHTTPErrorBody(string(body)))
 	}
 	if result != nil {
 		if err := json.NewDecoder(resp.Body).Decode(result); err != nil {
@@ -351,6 +397,22 @@ func (p *Provider) apiCall(ctx context.Context, method string, params url.Values
 		}
 	}
 	return nil
+}
+
+// loginTokenEchoPattern 匹配中间网关/WAF 拦截页可能回声的 POST 表单凭据
+// （login_token=<id>,<key>）。错误体取样会经 failJob 落 cert_jobs 文案与
+// 任务日志（全体登录用户可读），凭据回声必须脱敏后才允许进入错误链。
+var loginTokenEchoPattern = regexp.MustCompile(`login_token=[^&\s"']+`)
+
+// sanitizeHTTPErrorBody 脱敏 HTTP 错误响应体取样：login_token 参数值替换为
+// ***；替换后仍残留 login_token= 形态（非 & 分隔等异常编码）时整段丢弃
+// （fail-closed），只保留长度指纹——凭据不进日志优先于排障原文。
+func sanitizeHTTPErrorBody(body string) string {
+	redacted := loginTokenEchoPattern.ReplaceAllString(body, "login_token=***")
+	if strings.Contains(redacted, "login_token=") && !strings.Contains(redacted, "login_token=***") {
+		return fmt.Sprintf("[response body withheld: %d bytes]", len(body))
+	}
+	return strings.TrimSpace(redacted)
 }
 
 // flexNumber 接受 DNSPod 数字字段的历史两种形态（JSON 数字与带引号字符串）。
@@ -377,11 +439,15 @@ func (n flexNumber) Int64() int64 {
 // 陈旧时由 Present 与 cleanUp 捕获，作废缓存重解析后重试一次。
 var errStaleDomainID = errors.New("dnspod: 域名 ID 已失效")
 
-// isDomainGoneStatus 判定 dnsapi.cn 状态是否属于「域名不存在」类：code 6
-// （域名ID错误）/7（域名不存在），或消息显式含域名缺失字样（apiCall 固定
-// lang=cn，消息为中文）。
+// isDomainGoneStatus 判定 dnsapi.cn 状态是否属于「域名 ID 失效」类：code 6
+// （Record.Remove/List 的 Invalid domain id / 域名ID错误），或消息显式含
+// 域名缺失字样（apiCall 固定 lang=cn，消息为中文）。
+// code 7 一律是「没有权限」（官方码表：Create/Remove 的 7=You don't have the
+// permission），曾误入本分类——受限 Token 下权限拒绝被当成域名消失，触发
+// 缓存作废 + 全量 Domain.List 重扫 + 重复写/删。权限错误的真实「域名不存在」
+// 由消息字样分支命中，无需 code 7 快路径。
 func isDomainGoneStatus(code, message string) bool {
-	if code == "6" || code == "7" {
+	if code == "6" {
 		return true
 	}
 	return strings.Contains(message, "域名不存在") ||
@@ -408,12 +474,12 @@ var (
 	domainIDCache   = map[string]string{}
 )
 
-// domainIDCacheKey 返回本账户隔离的缓存键：sha256(login_token) 前 8 位
-// 十六进制 + "|" + zone。摘要口径与 ownership.AccountDigest 单源——缓存隔离
+// domainIDCacheKey 返回本账户隔离的缓存键：AccountDigest(login_token)（16 位
+// 十六进制）+ "|" + zone。摘要口径与 ownership.AccountDigest 单源——缓存隔离
 // 与所有权账户身份必须由同一凭据派生，两处各自求值会出现「缓存按账户隔离、
 // 所有权按另一账户身份判定」的漂移。
 func (p *Provider) domainIDCacheKey(zone string) string {
-	return ownership.AccountDigest(p.LoginToken) + "|" + zone
+	return ownership.AccountDigest(p.loginToken) + "|" + zone
 }
 
 func (p *Provider) getDomainID(ctx context.Context, zone string) (string, error) {

@@ -11,6 +11,40 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// 穿越门与尺寸门的回归钉：../ 与 / 形态的 filename 必须 400（此前只有
+// 测试缝用例覆盖 200 路径）；超 1MB 文件必须 413 而非静默截断。
+func TestGetCRSRuleContent_rejectsTraversalAndOversize(t *testing.T) {
+	dir := t.TempDir()
+	oldDir := crsRulesDir
+	crsRulesDir = dir
+	t.Cleanup(func() { crsRulesDir = oldDir })
+
+	for _, filename := range []string{"../x.conf", "..\\x.conf", "a/b.conf"} {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodGet, "/security/crs/rules/"+filename, nil)
+		ctx.Params = gin.Params{{Key: "filename", Value: filename}}
+		newBackupTestHandlers(t).GetCRSRuleContent(ctx)
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("filename %q = %d body=%s, want 400（路径穿越门）", filename, recorder.Code, recorder.Body.String())
+		}
+	}
+
+	// 超 1MB 规则文件 → 413（LimitReader 1MB+1 哨兵）
+	oversize := strings.Repeat("#", 1<<20+8)
+	if err := os.WriteFile(filepath.Join(dir, "REQUEST-999-BIG.conf"), []byte(oversize), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/security/crs/rules/REQUEST-999-BIG.conf", nil)
+	ctx.Params = gin.Params{{Key: "filename", Value: "REQUEST-999-BIG.conf"}}
+	newBackupTestHandlers(t).GetCRSRuleContent(ctx)
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversize file = %d body=%.200s, want 413", recorder.Code, recorder.Body.String())
+	}
+}
+
 // （WAF 域划入 handlers/security.go · 批准修复）：GetCRSRuleContent 必须经
 // crsRulesDir 测试缝（文件头声明，ListCRSRules 同源）解析规则文件路径——此前
 // 局部变量硬编码 "/app/waf/crs/rules" 且遮蔽 filepath 包名，与缝声明构成双真源，

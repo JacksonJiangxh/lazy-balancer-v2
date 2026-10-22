@@ -20,6 +20,22 @@ import (
 //   - 集群同步收到 .iplist 后（从节点本地编译）
 //   - 容器重启时（ApplyConfigOnStartup → 渲染 → 编译）
 
+// iterIPListTextLines 遍历 .iplist 文本的有效条目行（空行与 #/; 注释行
+// 跳过）——渲染/UI/下载/编译四处行过滤口径的单一事实源（多处各自实现
+// 曾致「补注释行」行为漂移，靠专项钉测才发现分叉）。fn 返回 false 提前
+// 终止。回调形态避免为「边过滤边解析」的消费方额外线性分配。
+func iterIPListTextLines(raw []byte, fn func(line string) bool) {
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		if !fn(line) {
+			return
+		}
+	}
+}
+
 // CompileFromIplistFile 从 .iplist 纯文本源文件编译 .fast 二进制。
 // 源文件格式：每行一个 IP/CIDR，# 或 ; 开头为注释，空行跳过。
 // 非法行跳过并计数（WARN 语义——合法行正常编译，不因单行损坏全量失败）。
@@ -28,23 +44,20 @@ func CompileFromIplistFile(iplistPath string) error {
 	if err != nil {
 		return fmt.Errorf("读取 .iplist %s: %w", iplistPath, err)
 	}
-	lines := strings.Split(string(raw), "\n")
 	// 逐条目只解析一次：解析产物直接进聚合，不再
 	// 「校验解析一次 + AggregatePrefixes 再解析一次」。
+	lines := strings.Split(string(raw), "\n")
 	prefixes := make([]netip.Prefix, 0, len(lines))
 	skipped := 0
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
-			continue
-		}
+	iterIPListTextLines(raw, func(line string) bool {
 		prefix, err := wafiplist.ParseIPEntry(line)
 		if err != nil {
 			skipped++
-			continue
+			return true
 		}
 		prefixes = append(prefixes, prefix)
-	}
+		return true
+	})
 	if skipped > 0 {
 		Logf("warn", "编译 %s: 跳过 %d 条非法行", iplistPath, skipped)
 	}

@@ -1175,3 +1175,58 @@ func TestRetryCertJobNotBlockedWhenNoImport(t *testing.T) {
 		t.Fatalf("无导入会话时命中导入窗口门: body=%s", recorder.Body.String())
 	}
 }
+
+// waiting_ca 的 CA 冷却（429 退避 1-3h）有明确到期时间：手动重试默认不得
+// 静默越过——冷却未到期且未显式 force 时 429 并给出剩余时长；force=true
+// （前端确认对话框已明示风险）显式越过，审计必须留下「手动越过 CA 冷却」
+// 与「重试预算已重置」痕迹。
+func TestRetryCertJob_waitingCACoolingRequiresForce(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	services.ResetCAQueueManagerForTest()
+	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+	services.GetCAQueueManager().Start()
+	t.Cleanup(services.ResetCAQueueManagerForTest)
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled,enable_tls,tls_source)
+		VALUES ('lb_cooling','cooling','http','cooling.example.test',8080,1,1,'acme_dns');
+		INSERT INTO ca_providers (id,name,provider,directory_url,enabled) VALUES (7,'cooling CA','letsencrypt','https://invalid.example/directory',1);
+		INSERT INTO cert_jobs (rule_id,domain,status,ca_provider_id,renewal_attempts,ca_available_after,updated_at)
+		VALUES ('lb_cooling','cooling.example.test','waiting_ca',7,2,datetime('now','+1 hour'),datetime('now','-2 hours'))`); err != nil {
+		t.Fatalf("seed cooling job: %v", err)
+	}
+	router := gin.New()
+	router.POST("/jobs/:id/retry", h.RetryCertJob)
+
+	// When：未带 force
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/jobs/1/retry", nil))
+
+	// Then：429 + 剩余时长，状态保持 waiting_ca
+	if response.Code != http.StatusTooManyRequests || !strings.Contains(response.Body.String(), "冷却未到期") {
+		t.Fatalf("status=%d body=%s, want 429 冷却未到期", response.Code, response.Body.String())
+	}
+	var status string
+	if err := db.DB.QueryRow("SELECT status FROM cert_jobs WHERE id=1").Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "waiting_ca" {
+		t.Fatalf("status=%q, want waiting_ca（未 force 不得越过冷却）", status)
+	}
+
+	// When：force=true（用户确认越过）
+	response = httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/jobs/1/retry?force=true", nil))
+
+	// Then：重排受理（200）。入队后 worker 立即异步执行（本夹具无 ACME
+	// 邮箱，任务会快速失败）——DB 终态竞态不可断言，越过冷却的留痕义务
+	// 由审计行承担。
+	if response.Code != http.StatusOK {
+		t.Fatalf("force retry status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	var auditDetail string
+	if err := db.AuditDB.QueryRow(`SELECT COALESCE(detail,'') FROM audit_log WHERE action='重试' AND resource='证书任务' ORDER BY id DESC LIMIT 1`).Scan(&auditDetail); err != nil {
+		t.Fatalf("read retry audit: %v", err)
+	}
+	if !strings.Contains(auditDetail, "手动越过 CA 冷却") || !strings.Contains(auditDetail, "重试预算已重置") {
+		t.Fatalf("audit detail=%q, want 手动越过冷却 + 预算重置留痕", auditDetail)
+	}
+}

@@ -456,3 +456,62 @@ func TestSecurityEventsRetention_summaryIncludesRowCap(t *testing.T) {
 		t.Fatalf("默认 summary=%q, want 含 90 天与 1000000 行", summary)
 	}
 }
+
+// WAL TRUNCATE 检查点低频门控：本轮有删除时不再每次清理批尾都执行
+// （与活跃写者 busy_timeout 叠加放大 tick 延迟），间隔内重复触发被跳过，
+// 过窗后恢复执行。
+func TestSecurityEventsCheckpointWAL_lowFrequencyGate(t *testing.T) {
+	setupSecurityEventsRetentionTestDB(t)
+	oldInterval := securityEventsWalCheckpointMinInterval
+	securityEventsWalCheckpointMinInterval = 10 * time.Minute
+	securityEventsWalCheckpointState.mu.Lock()
+	securityEventsWalCheckpointState.lastRun = time.Time{}
+	securityEventsWalCheckpointState.runCount = 0
+	securityEventsWalCheckpointState.busyCount = 0
+	securityEventsWalCheckpointState.mu.Unlock()
+	t.Cleanup(func() {
+		securityEventsWalCheckpointMinInterval = oldInterval
+		securityEventsWalCheckpointState.mu.Lock()
+		securityEventsWalCheckpointState.lastRun = time.Time{}
+		securityEventsWalCheckpointState.mu.Unlock()
+	})
+
+	now := time.Now()
+	securityEventsCheckpointWALIfDue(db.MetricsDB, now)
+	securityEventsCheckpointWALIfDue(db.MetricsDB, now.Add(time.Minute))
+	securityEventsCheckpointWALIfDue(db.MetricsDB, now.Add(11*time.Minute))
+
+	securityEventsWalCheckpointState.mu.Lock()
+	runs := securityEventsWalCheckpointState.runCount
+	securityEventsWalCheckpointState.mu.Unlock()
+	if runs != 2 {
+		t.Fatalf("checkpoint 执行次数=%d, want 2（间隔内触发被门控跳过）", runs)
+	}
+}
+
+// 检查点 BUSY 让出（活跃写者下的正常形态）显式计数——观测而非吞掉。
+func TestSecurityEventsCheckpointWAL_busyCounted(t *testing.T) {
+	setupSecurityEventsRetentionTestDB(t)
+	securityEventsWalCheckpointState.mu.Lock()
+	securityEventsWalCheckpointState.lastRun = time.Time{}
+	securityEventsWalCheckpointState.busyCount = 0
+	securityEventsWalCheckpointState.mu.Unlock()
+
+	// 持写锁事务制造 BUSY：检查点在写者活跃时让出（busy=1）。
+	tx, err := db.MetricsDB.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`INSERT INTO security_events (event_time, client_ip, event_type) VALUES (datetime('now'), '198.51.100.9', 'lock-holder')`); err != nil {
+		t.Fatal(err)
+	}
+	securityEventsCheckpointWALIfDue(db.MetricsDB, time.Now())
+	_ = tx.Rollback()
+
+	securityEventsWalCheckpointState.mu.Lock()
+	busy := securityEventsWalCheckpointState.busyCount
+	securityEventsWalCheckpointState.mu.Unlock()
+	if busy != 1 {
+		t.Fatalf("busyCount=%d, want 1（写者活跃时检查点让出必须计数）", busy)
+	}
+}

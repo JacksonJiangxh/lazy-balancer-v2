@@ -57,6 +57,26 @@ var (
 	}
 )
 
+// deploymentLifecycleJobStatuses / deploymentLifecycleJobStatusSQL 由
+// jobLifecycleByStatus 派生（JobLifecycle==downloaded 单源）——状态集新增时
+// 只改映射表，切片与 SQL IN 片段不再双份真源。消费方：transitionJob 的
+// from 集合（certissuer.go）与 cluster_report.go 的 SQL IN。
+var (
+	deploymentLifecycleJobStatuses = func() []string {
+		statuses := make([]string, 0, 3)
+		for status, lifecycle := range jobLifecycleByStatus {
+			if lifecycle == JobLifecycleDownloaded {
+				statuses = append(statuses, status)
+			}
+		}
+		sort.Strings(statuses)
+		return statuses
+	}()
+	// deploymentLifecycleJobStatusSQL 供 SQL IN (...) 复用（由同一切片派生，
+	// 非编译期常量——拼接点均为运行时字符串构造）。
+	deploymentLifecycleJobStatusSQL = "'" + strings.Join(deploymentLifecycleJobStatuses, "','") + "'"
+)
+
 type jobTransitionExecutor interface {
 	Exec(query string, args ...any) (sql.Result, error)
 }

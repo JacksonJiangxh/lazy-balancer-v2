@@ -318,15 +318,13 @@ func readThreatIplistPath(iplistPath string) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		// 三处行过滤契约（渲染/UI/编译）同口径：空行与 #/; 注释跳过。
+		// 行过滤口径单源 iterIPListTextLines（渲染/UI/编译/下载四处
+		// 同口径：空行与 #/; 注释跳过）。
 		vals := make([]string, 0, 1024)
-		for _, line := range strings.Split(string(raw), "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
-				continue
-			}
+		iterIPListTextLines(raw, func(line string) bool {
 			vals = append(vals, line)
-		}
+			return true
+		})
 		return vals, nil
 	}
 	readFast := func() ([]string, error) { return expandThreatFastEntries(fastPath) }

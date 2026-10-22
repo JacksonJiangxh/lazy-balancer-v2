@@ -83,8 +83,9 @@ func TestThreatScreenAttackFlowRecordBatch_trimsToRingMax(t *testing.T) {
 	}
 }
 
-// 并发安全：多 goroutine 并发批量写入后，事件数与序号集合必须完整且无重复
-// （-race 下同时验证加锁正确性）。
+// 并发安全：多 goroutine 并发批量写入后，事件数与序号集合必须完整且无重复，
+// 且环形缓冲内 Seq 严格递增（消费者按 Seq<=since 线性推进游标，乱序入环
+// 会让事件重复返回/游标回退）。（-race 下同时验证加锁正确性）。
 func TestThreatScreenAttackFlowRecordBatch_concurrentBatches(t *testing.T) {
 	enableAttackFlowSampling(t)
 	const (
@@ -111,11 +112,14 @@ func TestThreatScreenAttackFlowRecordBatch_concurrentBatches(t *testing.T) {
 		t.Fatalf("事件条数=%d, want %d", len(events), want)
 	}
 	seen := make(map[uint64]struct{}, want)
-	for _, ev := range events {
+	for i, ev := range events {
 		if _, dup := seen[ev.Seq]; dup {
 			t.Fatalf("序号 %d 重复", ev.Seq)
 		}
 		seen[ev.Seq] = struct{}{}
+		if i > 0 && ev.Seq <= events[i-1].Seq {
+			t.Fatalf("环内序号非严格递增：第 %d 条 %d 前置 %d（跨批乱序会让消费游标重复/停滞）", i, ev.Seq, events[i-1].Seq)
+		}
 	}
 	if len(seen) != want {
 		t.Fatalf("唯一序号数=%d, want %d", len(seen), want)

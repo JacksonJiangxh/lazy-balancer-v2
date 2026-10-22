@@ -68,8 +68,12 @@ func TestBuildCorazaDirectives_BypassAndTrustListUseDistinctIDs(t *testing.T) {
 	if count := strings.Count(directives, "id:5,"); count != 1 {
 		t.Fatalf("id:5 occurrences = %d, want exactly 1 (duplicate SecRule id):\n%s", count, directives)
 	}
-	if strings.Index(directives, 绕过Rule) > strings.Index(directives, trustRule) {
-		t.Fatalf("绕过 rule must precede the trust-list rule:\n%s", directives)
+	// 发射序钉（绕过终态保证）：coraza ctl 同相位后写覆盖前写——信任
+	// DetectionOnly 先发、绕过 Off 后发，同一 IP 同列两名册时绕过才是
+	// 事务终态；反之绕过被降级为「全评估仅记录」。真实事务级断言见
+	// security_render_guard_test.go 的引擎门禁用例。
+	if strings.Index(directives, trustRule) > strings.Index(directives, 绕过Rule) {
+		t.Fatalf("trust-list rule must precede the 绕过 rule（后写覆盖前写，绕过必须是终态）:\n%s", directives)
 	}
 	if got := readRenderedIPList(t, directives, "-acl"); got != "192.0.2.7/32\n203.0.113.0/24\n" {
 		t.Fatalf("绕过 名单文件=%q, want 聚合排序两条", got)

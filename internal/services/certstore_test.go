@@ -480,3 +480,43 @@ func TestMaterializeAllCertsFromDB_counts_only_actual_writes(t *testing.T) {
 		t.Fatalf("recovery audit rows=%d after no-op materialization, want unchanged %d（零写不得计为恢复）", afterSecond, afterFirst)
 	}
 }
+
+// 写/删按规则并行：规则 A 的 per-rule 锁不得阻塞规则 B 的写入（全局互斥
+// 时代 /load 渲染 N 条规则串行 N 组 fsync）；跨规则快照回滚
+// （RestoreCertFiles）仍全局互斥——读锁在持时恢复必须等待。
+func TestCertStore_perRuleWritesParallelGlobalRestoreExclusive(t *testing.T) {
+	restore := SetCertDirForTest(t.TempDir())
+	t.Cleanup(restore)
+
+	// Given：规则 A 的 per-rule 锁被占用（模拟在途写/删）
+	ruleLockA := lockCertRuleFile("lb_para_a")
+	ruleLockA.Lock()
+	defer ruleLockA.Unlock()
+
+	// When/Then：规则 B 的写入照常完成（不被 A 阻塞）
+	done := make(chan error, 1)
+	go func() { done <- WriteCertFiles("lb_para_b", "cert-b", "key-b") }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("concurrent write for unrelated rule: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("规则 B 写入被规则 A 的锁阻塞——per-rule 并行失效")
+	}
+
+	// When/Then：读锁在持时 Restore（写锁）必须等待；释放后放行
+	certWriteMu.RLock()
+	restoreDone := make(chan error, 1)
+	go func() { restoreDone <- RestoreCertFiles(CertFilesSnapshot{}) }()
+	select {
+	case err := <-restoreDone:
+		certWriteMu.RUnlock()
+		t.Fatalf("跨规则回滚在并发文件操作进行中放行: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	certWriteMu.RUnlock()
+	if err := <-restoreDone; err != nil {
+		t.Fatalf("restore after lock release: %v", err)
+	}
+}

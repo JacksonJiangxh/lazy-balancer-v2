@@ -321,8 +321,10 @@ func getACMECertInfo(caddyID, ruleDomain string) (*models.RuleCertInfo, error) {
 
 // ExpiredACMECertInfoFallback:候选集 PEM 非空但
 // SelectRuleCertificate 无一可选中时,逐个解析——首个非 disabled 且 PEM 非空
-// 的已过期候选按 expired 呈现(Error=「ACME 证书已过期」),不再误报「尚未
-// 签发或不存在」;无已过期候选(解析失败/未过期)返回 nil,调用方维持原口径。
+// 的已过期候选按 expired 呈现(Error=「ACME 证书已过期」)、尚未生效
+// （NotBefore 在未来，certissuer 的未来时钟证书已写盘+已 reload 形态）候选按
+// unknown + 「证书尚未生效」呈现,两者都不再误报「尚未签发或不存在」;
+// 无已过期/未生效候选(解析失败)返回 nil,调用方维持原口径。
 // 单规则(GetRuleCertInfo)与批量(handlers GetRulesCertInfo)两路径同用。
 // expiryDays/now 由调用方一次性提供（批量端点已有阈值与 now），
 // 避免每个候选一次 global_config 查询；解析结果直接复用 FormatRuleCertInfo。
@@ -334,6 +336,18 @@ func ExpiredACMECertInfoFallback(candidates []CertificateCandidate, caddyID, rul
 		info := formatRuleCertInfo(candidate.CertPEM, candidate.Leaf, "acme_dns", ruleDomain, caddyID, expiryDays, now)
 		if info.Status == "expired" {
 			info.Error = "ACME 证书已过期"
+			return info
+		}
+		// 已签发但未生效：SelectCertificate 因 now<NotBefore 跳过该候选，
+		// 回退若仍报「尚未签发或不存在」会诱导运维重复触发签发（白烧 CA
+		// 配额），且与磁盘/Caddy 实际部署状态矛盾。
+		leaf := candidate.Leaf
+		if leaf == nil {
+			leaf = ParseCertificateLeaf(candidate.CertPEM, candidate.KeyPEM)
+		}
+		if leaf != nil && now.Before(leaf.NotBefore) {
+			info.Status = "unknown"
+			info.Error = fmt.Sprintf("ACME 证书尚未生效（NotBefore %s）", leaf.NotBefore.Format("2006-01-02 15:04:05"))
 			return info
 		}
 	}

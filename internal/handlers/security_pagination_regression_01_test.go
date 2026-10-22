@@ -47,6 +47,39 @@ func TestListSecurityEvents_pageSizeClampsToCap(t *testing.T) {
 	}
 }
 
+// 事件列表 page 上限 1000：深翻页（page=100000 × page_size=100 → OFFSET 近
+// 千万）在百万~千万行事件表上单请求秒级扫描，任意登录用户可触发——钳到
+// cap 而非放行。
+func TestListSecurityEvents_pageClampsToCap(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newSecurityEventsRouter(t)
+	get := func(query string) int {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/security/events?"+query, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("query=%s status=%d body=%s", query, rec.Code, rec.Body.String())
+		}
+		var resp struct {
+			Data struct {
+				Page int `json:"page"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		return resp.Data.Page
+	}
+	if got := get("page=100000"); got != 1000 {
+		t.Fatalf("page=100000 → %d, want clamp to cap 1000", got)
+	}
+	if got := get("page=0"); got != 1 {
+		t.Fatalf("page=0 → %d, want default 1", got)
+	}
+	if got := get("page=7"); got != 7 {
+		t.Fatalf("page=7 → %d, want 7", got)
+	}
+}
+
 func TestListCRSRules_pageSizeClampsToCap(t *testing.T) {
 	// Given:经 crsRulesDir 测试缝挂一条 stub 规则
 	oldDir := crsRulesDir

@@ -102,6 +102,12 @@ func (h *Handlers) GetThreatLib(c *gin.Context) {
 // UpdateCRSAutoUpdate/UpdateIP2RegionAutoUpdate 形态）。逐源 update_enabled
 // 决定任务更新哪些源（弹框内开关），与总闸解耦。
 func (h *Handlers) UpdateThreatAutoUpdate(c *gin.Context) {
+	// security_threat_sources 在导入全量替换清单内（configBackupTables）：
+	// 窗口内写会被导入静默覆盖或撞写锁 500——与同族 CRS/IP2Region 端点
+	// 同口径 409 fast-fail（先于 body 解析）。
+	if rejectWriteDuringImport(c, "修改威胁情报库设置（配置导入进行中）") {
+		return
+	}
 	if !guardConfiguredJSONBody(c) {
 		return
 	}
@@ -141,6 +147,10 @@ func (h *Handlers) UpdateThreatSchedule(c *gin.Context) {
 // 策略引用名单（无独立 apply 开关）。请求体携带的其余字段一律忽略
 // （内置源不可变造）。
 func (h *Handlers) UpdateThreatSourceFlags(c *gin.Context) {
+	// 与 UpdateThreatAutoUpdate 同口径导入门（先于 body 解析）。
+	if rejectWriteDuringImport(c, "修改威胁情报库设置（配置导入进行中）") {
+		return
+	}
 	if !guardConfiguredJSONBody(c) {
 		return
 	}

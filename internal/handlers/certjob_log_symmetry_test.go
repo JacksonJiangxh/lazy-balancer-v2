@@ -177,3 +177,111 @@ func TestUpdateRule_editWithoutReEnableWritesNoResumedLog(t *testing.T) {
 		t.Fatalf("cert job log=%q, 未启用变化不得写 resumed 行", log)
 	}
 }
+
+const (
+	certJobLogRenew    = "[INFO] renew - 规则已启用，证书即将过期，已重新排队续签"
+	certJobLogRetry    = "[INFO] retry - 规则已启用，证书任务已重新排队"
+	certJobLogInFlight = "[INFO] in_flight - 规则已启用，签发任务已在进行中"
+)
+
+// 启用侧留痕对称性（续签分支）：过期后启用 → 续签排队必须写 certjob 日志
+// （对照禁用侧恒写 [WARN] cancelled）。
+func TestEnableRule_renewWritesCertJobLog(t *testing.T) {
+	// Given：禁用规则 + issued 任务 + 10 天后到期（续签窗口内）→ Renew 分支
+	handler, _, _ := newAuditRuleHandlers(t, 0)
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
+	useTempCertJobLogDir(t)
+	jobID := seedACMEManualSwitchFixture(t, "lb_log_renew", "log-renew.example.test", "issued")
+	if _, err := db.DB.Exec(`UPDATE lb_rules SET enabled=0 WHERE caddy_id=?`, "lb_log_renew"); err != nil {
+		t.Fatalf("disable seeded rule: %v", err)
+	}
+	certPEM, keyPEM := selfSignedPEM(t, "log-renew.example.test")
+	expiresAt := time.Now().UTC().Add(10 * 24 * time.Hour).Format("2006-01-02 15:04:05")
+	if _, err := db.DB.Exec(`UPDATE cert_jobs SET cert_pem=?, key_pem=?, expires_at=? WHERE id=?`, certPEM, keyPEM, expiresAt, jobID); err != nil {
+		t.Fatalf("attach expiring certificate: %v", err)
+	}
+	oldCreate := createOrRequeueCertJobVerified
+	createOrRequeueCertJobVerified = func(string, string, int, *services.CAQueueManager) (int, bool, error) {
+		return 43, true, nil
+	}
+	t.Cleanup(func() { createOrRequeueCertJobVerified = oldCreate })
+	services.ResetCAQueueManagerForTest()
+	services.InitCAQueueManager(nil, t.TempDir())
+	services.GetCAQueueManager().Start()
+	t.Cleanup(services.ResetCAQueueManagerForTest)
+	router := gin.New()
+	router.POST("/rules/:caddy_id/enable", handler.EnableRule)
+	response := httptest.NewRecorder()
+
+	// When
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/rules/lb_log_renew/enable", nil))
+
+	// Then
+	if response.Code != http.StatusOK {
+		t.Fatalf("enable status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	if log := readCertJobLogContent(t, "lb_log_renew"); !strings.Contains(log, certJobLogRenew) {
+		t.Fatalf("cert job log=%q, want %q", log, certJobLogRenew)
+	}
+}
+
+// 启用侧留痕对称性（重试分支）：失败任务经启用重新排队必须写 certjob 日志。
+func TestEnableRule_retryWritesCertJobLog(t *testing.T) {
+	// Given：禁用规则 + failed 任务 → Retry 分支
+	handler, _, _ := newAuditRuleHandlers(t, 0)
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
+	useTempCertJobLogDir(t)
+	seedCertJobLogRule(t, "lb_log_retry", "log-retry.example.test", "failed")
+	// Retry 分支要求临期（failed + 未临期会落 Resume）——把到期日移入续签窗口
+	expiringAt := time.Now().UTC().Add(10 * 24 * time.Hour).Format("2006-01-02 15:04:05")
+	if _, err := db.DB.Exec(`UPDATE cert_jobs SET expires_at=? WHERE rule_id=?`, expiringAt, "lb_log_retry"); err != nil {
+		t.Fatalf("move expiry into renewal window: %v", err)
+	}
+	oldCreate := createOrRequeueCertJobVerified
+	createOrRequeueCertJobVerified = func(string, string, int, *services.CAQueueManager) (int, bool, error) {
+		return 44, true, nil
+	}
+	t.Cleanup(func() { createOrRequeueCertJobVerified = oldCreate })
+	services.ResetCAQueueManagerForTest()
+	services.InitCAQueueManager(nil, t.TempDir())
+	services.GetCAQueueManager().Start()
+	t.Cleanup(services.ResetCAQueueManagerForTest)
+	router := gin.New()
+	router.POST("/rules/:caddy_id/enable", handler.EnableRule)
+	response := httptest.NewRecorder()
+
+	// When
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/rules/lb_log_retry/enable", nil))
+
+	// Then
+	if response.Code != http.StatusOK {
+		t.Fatalf("enable status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	if log := readCertJobLogContent(t, "lb_log_retry"); !strings.Contains(log, certJobLogRetry) {
+		t.Fatalf("cert job log=%q, want %q", log, certJobLogRetry)
+	}
+}
+
+// 启用侧留痕对称性（在途分支）：任务已在签发中（queued）时启用动作
+// 本身也要留痕——用户在 certjob-<rule>.log 能看到「启用时任务已在进行」。
+func TestEnableRule_inFlightWritesCertJobLog(t *testing.T) {
+	// Given：禁用规则 + queued（在途）任务 → default 分支
+	handler, _, _ := newAuditRuleHandlers(t, 0)
+	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
+	useTempCertJobLogDir(t)
+	seedCertJobLogRule(t, "lb_log_inflight", "log-inflight.example.test", "queued")
+	router := gin.New()
+	router.POST("/rules/:caddy_id/enable", handler.EnableRule)
+	response := httptest.NewRecorder()
+
+	// When
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/rules/lb_log_inflight/enable", nil))
+
+	// Then
+	if response.Code != http.StatusOK {
+		t.Fatalf("enable status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	if log := readCertJobLogContent(t, "lb_log_inflight"); !strings.Contains(log, certJobLogInFlight) {
+		t.Fatalf("cert job log=%q, want %q", log, certJobLogInFlight)
+	}
+}

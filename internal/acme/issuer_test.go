@@ -17,6 +17,8 @@ import (
 
 	"github.com/miekg/dns"
 	"golang.org/x/crypto/acme"
+
+	"lazy-balancer-v2/internal/dnsprovider/ownership"
 )
 
 type cleanupTrackingProvider struct {
@@ -1099,22 +1101,26 @@ func TestIssuer_waitForValidation_propagatesRateLimitFromInvalidAuthorization(t 
 	}
 }
 
-// deferred 清理预算必须随挑战数缩放——单条删除链最坏 90s，固定
-// 2min 会让第二个 TXT 的清理被 ctx 取消。判定用 provider 观察到的 ctx 截止时间。
+// deferred 清理预算必须随挑战数+待删条目数缩放——单挑战真实最坏链=
+// （1+K）×90s（域名解析 90s 上限 + K 条逐条删除），固定 2min 或只按挑战数
+// 都会让 legacy/stale 残留较多时的清理被 ctx 截断。判定用 provider 观察到的
+// ctx 截止时间。
 func TestIssuer_cleanupBudget_scalesWithChallengeCount(t *testing.T) {
-	// 单元口径：预算公式
+	// 单元口径：预算公式（挑战数 + 选中记录数）
 	for _, tc := range []struct {
 		challenges int
+		records    int
 		want       time.Duration
 	}{
-		{0, 2 * time.Minute},
-		{1, 2 * time.Minute},
-		{2, 200 * time.Second},
-		{4, 400 * time.Second},
-		{10, 8 * time.Minute},
+		{0, 0, 2 * time.Minute},
+		{1, 1, 180 * time.Second}, // (1+1)×90s
+		{2, 2, 360 * time.Second}, // (2+2)×90s
+		{1, 4, 450 * time.Second}, // 单挑战 + 3 条残留：(1+4)×90s——旧公式只给 2min
+		{2, 5, 8 * time.Minute},   // (2+5)×90s=630s 超上限 → 8min
+		{10, 10, 8 * time.Minute},
 	} {
-		if got := dnsCleanupBudget(tc.challenges); got != tc.want {
-			t.Fatalf("dnsCleanupBudget(%d)=%v, want %v", tc.challenges, got, tc.want)
+		if got := dnsCleanupBudget(tc.challenges, tc.records); got != tc.want {
+			t.Fatalf("dnsCleanupBudget(%d, %d)=%v, want %v", tc.challenges, tc.records, got, tc.want)
 		}
 	}
 
@@ -1137,5 +1143,16 @@ func TestIssuer_cleanupBudget_scalesWithChallengeCount(t *testing.T) {
 		if remaining < 180*time.Second {
 			t.Fatalf("两个挑战的清理预算=%v, want ≥180s（固定 120s 会取消第二个 TXT 清理）", remaining)
 		}
+	}
+}
+
+// 清理预算上限与 ownership 陈旧判定的耦合断言：CA 队列执行预算（60min，
+// services/caqueue.go caExecutionTimeout）+ 清理上限必须仍小于
+// staleOwnershipAge——否则在途清理中的条目会被他方清理判为陈旧而并发删除。
+func TestDNSCleanupBudget_staysBelowStaleOwnershipAge(t *testing.T) {
+	const caExecutionBudget = 60 * time.Minute // 镜像 services caExecutionTimeout
+	if caExecutionBudget+dnsCleanupBudgetMax >= ownership.StaleOwnershipAge {
+		t.Fatalf("执行预算 %v + 清理上限 %v 必须 < staleOwnershipAge %v",
+			caExecutionBudget, dnsCleanupBudgetMax, ownership.StaleOwnershipAge)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/services"
 
 	"github.com/gin-gonic/gin"
 )
@@ -296,5 +297,44 @@ func TestListSecurityPolicies_enabledFilter(t *testing.T) {
 	}
 	if len(allResp.Data) != 2 {
 		t.Fatalf("policies without filter = %s, want both", all.Body.String())
+	}
+}
+
+// 归属地富化缓存：同一 IP 重复富化只查一次库（大屏逐行富化同一批攻击源
+// IP）；xdb 代际变化（库热换/重置）后旧值失效重查。
+func TestEnrichIPLocation_cachesPerIPUntilGenerationChange(t *testing.T) {
+	old := enrichIPLocationLookup
+	calls := 0
+	enrichIPLocationLookup = func(string) string {
+		calls++
+		return "美国|0|0|0|US"
+	}
+	t.Cleanup(func() { enrichIPLocationLookup = old })
+	enrichLocationCache.Lock()
+	enrichLocationCache.entries = make(map[string]enrichLocationCacheEntry)
+	enrichLocationCache.Unlock()
+	t.Cleanup(func() {
+		enrichLocationCache.Lock()
+		enrichLocationCache.entries = make(map[string]enrichLocationCacheEntry)
+		enrichLocationCache.Unlock()
+	})
+
+	const ip = "93.184.216.77"
+	if got := enrichIPLocation(ip); got != "美国" {
+		t.Fatalf("enrichIPLocation=%q, want 美国", got)
+	}
+	if got := enrichIPLocation(ip); got != "美国" {
+		t.Fatalf("enrichIPLocation(2nd)=%q, want 美国", got)
+	}
+	if calls != 1 {
+		t.Fatalf("lookup calls=%d, want 1（同 IP 缓存命中，不再逐行查库）", calls)
+	}
+	// 代际变化（searcher 重置/热换）后必须重查——旧库归属地不得脏读。
+	services.ResetIP2RegionSearcherForTest()
+	if got := enrichIPLocation(ip); got != "美国" {
+		t.Fatalf("enrichIPLocation(after generation change)=%q, want 美国", got)
+	}
+	if calls != 2 {
+		t.Fatalf("lookup calls=%d, want 2（代际变化后缓存失效）", calls)
 	}
 }

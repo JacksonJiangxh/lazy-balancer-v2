@@ -171,3 +171,22 @@ func TestEnableRule_generationFailureMapsTo400(t *testing.T) {
 		t.Fatal("生成的预检失败不得把规则置为启用")
 	}
 }
+
+// 规则屏障期（删除/禁用/更新的取消窗口）并发入队必须 409（瞬时冲突、
+// 可重试），不得折成 500「内部故障」——EnqueueIfActive 注释承诺的
+// 「changed=false → handler 409」语义闭环。
+func TestCertEnqueueErrorResponse_mapsRuleBusyTo409(t *testing.T) {
+	status, message := certEnqueueErrorResponse("创建证书任务失败", services.ErrCertRuleBusy)
+	if status != http.StatusConflict {
+		t.Fatalf("status=%d, want 409（屏障期是瞬时冲突）", status)
+	}
+	if !strings.Contains(message, "稍后重试") {
+		t.Fatalf("message=%q, want 可操作的重试提示", message)
+	}
+	if wrapped := fmt.Errorf("create or enqueue cert job: %w", services.ErrCertRuleBusy); func() int {
+		code, _ := certEnqueueErrorResponse("x", wrapped)
+		return code
+	}() != http.StatusConflict {
+		t.Fatal("包装后的屏障期错误也必须映射 409")
+	}
+}

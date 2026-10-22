@@ -166,6 +166,11 @@ var threatScreenAttackFlowFlushCalls atomic.Int64
 
 // threatScreenAttackFlowRecordBatch 在 security_events 事务提交成功后调用。
 // 采样在环形缓冲写入前完成；失败/回滚的日志批次不得进入光流。
+//
+// 并发不变量：环形缓冲内 Seq 必须严格递增（消费者按 `Seq <= since` 线性
+// 推进游标，乱序入环会让事件重复返回/游标回退）。采样计数与序号分配因此
+// 与 append 同处一个临界区（每批一次加锁，成本=批内原子加）；逐事件加锁
+// 会让锁往返与 O(ring) 尾部搬移按事件数放大。
 func threatScreenAttackFlowRecordBatch(items []threatScreenAttackFlowItem) {
 	if len(items) == 0 {
 		return
@@ -174,9 +179,8 @@ func threatScreenAttackFlowRecordBatch(items []threatScreenAttackFlowItem) {
 	if n == 0 {
 		return
 	}
-	// 采样与序号分配在锁外完成（原子计数本就无锁），攒批后一次性进入环形
-	// 缓冲：一次加锁 + 批量 append + 一次裁剪。逐事件加锁会让锁往返与
-	// O(ring) 的尾部搬移按事件数放大（一次事务提交可达数百条事件）。
+	threatScreenAttackFlowFlushCalls.Add(1)
+	threatScreenAttackFlowMu.Lock()
 	batch := make([]ThreatScreenAttackFlowEvent, 0, len(items))
 	for _, item := range items {
 		if n > 1 && threatScreenAttackFlowAttempt.Add(1)%uint64(n) != 0 {
@@ -196,10 +200,9 @@ func threatScreenAttackFlowRecordBatch(items []threatScreenAttackFlowItem) {
 		})
 	}
 	if len(batch) == 0 {
+		threatScreenAttackFlowMu.Unlock()
 		return
 	}
-	threatScreenAttackFlowFlushCalls.Add(1)
-	threatScreenAttackFlowMu.Lock()
 	threatScreenAttackFlowEvents = append(threatScreenAttackFlowEvents, batch...)
 	if over := len(threatScreenAttackFlowEvents) - threatScreenAttackFlowRingMax; over > 0 {
 		threatScreenAttackFlowEvents = threatScreenAttackFlowEvents[over:]

@@ -3696,7 +3696,7 @@ func TestSecurityEventsCRSExclusionMatcher_shapes(t *testing.T) {
 		{name: "range miss", set: build(`["941000-941999"]`, nil), rule: "942100"},
 		{name: "901 init skipped", set: build(`["901100"]`, nil), rule: "901100"},
 		{name: "invalid target", set: build(`["999999999"]`, nil), rule: "942100"},
-		{name: "unknown scope treated all", set: build(`[{"target":"949110","scope":"bogus"}]`, nil), rule: "949110", removed: true},
+		{name: "unknown scope not claimed", set: build(`[{"target":"949110","scope":"bogus"}]`, nil), rule: "949110"},
 		{name: "non CRS rule", set: build(`["949110"]`, nil), rule: "10003"},
 	}
 	for _, tc := range cases {
@@ -4166,5 +4166,43 @@ func TestSecurityEventsContainsRule_parsesPolicyJSONOncePerPolicy(t *testing.T) 
 	}
 	if !securityEventsPolicyContainsRule(p, "10003", "") || securityEventsPolicyContainsRule(p, "10004", "") {
 		t.Fatal("custom_rules 判定必须复用首次解析缓存")
+	}
+}
+
+// pass 内 host→rule 映射记忆化：同一 host 的连续事件只做一次 IDNA
+// 规范化（CanonicalDomains 含 punycode 分配；积压补采万级同 host 事件时
+// 逐事件调用是纯重复劳动），且归因结果不变。
+func TestSecurityEventsTick_memoizesHostMappingWithinPass(t *testing.T) {
+	logPath, offsetPath := stallSetup(t)
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled) VALUES ('lb_memo1','memo rule','http','memo.example.com',443,1)`); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	old := securityEventsCanonicalDomains
+	securityEventsCanonicalDomains = func(v string) (string, error) { calls++; return old(v) }
+	t.Cleanup(func() { securityEventsCanonicalDomains = old })
+
+	line := func(id string) string {
+		// host 来自 server_id（parse 优先）；大写形态精确键不命中，强制走
+		// CanonicalDomains 规范化路径（规则域名库存为小写 memo.example.com）。
+		return `{"transaction":{"id":"` + id + `","unix_timestamp":1789740000,"client_ip":"203.0.113.9","server_id":"MEMO.EXAMPLE.COM","request":{"method":"GET","uri":"/a","headers":{"host":["MEMO.EXAMPLE.COM"]}},"response":{"status":200},"is_interrupted":false},"messages":[]}`
+	}
+	content := line("tx-memo-1") + "\n" + line("tx-memo-2") + "\n" + line("tx-memo-3") + "\n"
+	if err := os.WriteFile(logPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tailer := securityEventsNewTailer(logPath, offsetPath)
+	if err := tailer.securityEventsTick(); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("CanonicalDomains calls=%d, want 1（同 host 记忆化，逐事件 IDNA 已消除）", calls)
+	}
+	var n int
+	if err := db.MetricsDB.QueryRow(`SELECT COUNT(*) FROM security_events WHERE rule_caddy_id='lb_memo1'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Fatalf("attributed events=%d, want 3（记忆化不得改变归因结果）", n)
 	}
 }

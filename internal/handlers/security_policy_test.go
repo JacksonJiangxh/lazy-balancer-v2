@@ -1190,21 +1190,23 @@ func TestUpdateSecurityPolicy_rateLimitGateUsesEffectiveValues(t *testing.T) {
 
 	// When:只发 enabled=true(重启用,不带 rps——存量 rps=10 应回落)
 	recorder := putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{"rate_limit_enabled": true})
-	// Then:不应 400(存量 rps=10 是有效值)
-	if recorder.Code == http.StatusBadRequest {
-		t.Fatalf("部分重启用被 400 误报: %s", recorder.Body.String())
+	// Then:必须精确 200——只排 400 会让退化成 500 的回归隐身
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("部分重启用必须 200, got %d: %s", recorder.Code, recorder.Body.String())
 	}
 
 	// When:显式 rps=0(存量 enabled=1)
 	recorder = putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{"rate_limit_rps": 0})
-	// Then:不应落库 enabled=1+rps=0 形态
-	if recorder.Code == http.StatusOK {
-		var rps int
-		var enabled bool
-		db.DB.QueryRow("SELECT COALESCE(rate_limit_rps,0), COALESCE(rate_limit_enabled,0) FROM security_policies WHERE id=?", id).Scan(&rps, &enabled)
-		if enabled && rps == 0 {
-			t.Fatalf("落库 enabled=true+rps=0: UI 宣称限流启用实际零强制")
-		}
+	// Then:精确 400（校验门拒绝），500 意味着校验缺失/内部错误
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("显式 rps=0 重启用必须 400, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	// 且不得落库 enabled=1+rps=0 形态
+	var rps int
+	var enabled bool
+	db.DB.QueryRow("SELECT COALESCE(rate_limit_rps,0), COALESCE(rate_limit_enabled,0) FROM security_policies WHERE id=?", id).Scan(&rps, &enabled)
+	if enabled && rps == 0 {
+		t.Fatalf("落库 enabled=true+rps=0: UI 宣称限流启用实际零强制")
 	}
 }
 

@@ -1601,3 +1601,85 @@ func TestSnapshotAuditHeaders_boundedWithMarker(t *testing.T) {
 		}
 	})
 }
+
+// 队列字节预算：条数上限不界字节——大快照洪峰下按字节收敛驻留。
+// 超预算立即丢弃（非阻塞，不走 2s 入队等待）并计数；drain 消费后预算释放，
+// 后续条目照常入队。
+func TestAuditPipeline_enqueueDropsWhenByteBudgetExceeded(t *testing.T) {
+	useTestAuditPipeline(t)
+	oldBudget := auditQueueByteBudget
+	auditQueueByteBudget = 128 * 1024
+	t.Cleanup(func() { auditQueueByteBudget = oldBudget })
+
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	p := &auditPipeline{
+		target: logPath,
+		queue:  make(chan lbAuditItem, 8),
+		done:   make(chan struct{}),
+	}
+	if err := p.openFile(0o644); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	bigItem := func(marker string) lbAuditItem {
+		snap := &auditSnapshot{}
+		snap.Transaction_.ID_ = marker
+		snap.Transaction_.Request_ = &auditSnapshotRequest{Body_: strings.Repeat("x", 64*1024)}
+		return lbAuditItem{snap: snap, formatter: cannedFormatter{body: []byte(`{"row":"` + marker + `"}`)}}
+	}
+
+	// 第 1 条（~64.5KiB）在预算内入队；第 2 条使驻留 ~129KiB 超 128KiB 预算
+	// → 立即丢弃（不等待、不占队）。
+	p.enqueue(bigItem("AAA111"))
+	if got := p.queueBytes.Load(); got <= 64*1024 {
+		t.Fatalf("queueBytes=%d, want >64KiB after first enqueue", got)
+	}
+	start := time.Now()
+	p.enqueue(bigItem("BBB222"))
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("超预算入队必须立即丢弃，不得走有界等待: %v", elapsed)
+	}
+	if got := p.dropped.Load(); got != 1 {
+		t.Fatalf("dropped=%d, want 1", got)
+	}
+	if got := len(p.queue); got != 1 {
+		t.Fatalf("queue length=%d, want 1（被丢弃条不占队）", got)
+	}
+
+	// 超单条上限的快照即使空队也直接丢弃。
+	huge := &auditSnapshot{}
+	huge.Transaction_.Request_ = &auditSnapshotRequest{Body_: strings.Repeat("y", 400*1024)}
+	p.enqueue(lbAuditItem{snap: huge, formatter: cannedFormatter{body: []byte(`{"row":"HHH999"}`)}})
+	if got := p.dropped.Load(); got != 2 {
+		t.Fatalf("dropped=%d, want 2（单条超限丢弃）", got)
+	}
+	if got := len(p.queue); got != 1 {
+		t.Fatalf("queue length=%d, want 1（超限条不占队）", got)
+	}
+
+	// drain 消费后字节预算释放，新条目照常入队落盘。
+	go p.drain()
+	// 等 AAA111 被消费（预算释放）再入队 CCC333——否则 CCC333 的占额与
+	// 尚在队中的 AAA111 叠加超预算被丢弃（竞态非确定性）。
+	deadline := time.Now().Add(2 * time.Second)
+	for p.queueBytes.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	p.enqueue(bigItem("CCC333"))
+	close(p.queue)
+	<-p.done
+	if got := p.queueBytes.Load(); got != 0 {
+		t.Fatalf("drain 完成后 queueBytes=%d, want 0", got)
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read audit log: %v", err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "AAA111") || !strings.Contains(content, "CCC333") {
+		t.Fatalf("预算内条目必须落盘: %s", content)
+	}
+	if strings.Contains(content, "BBB222") || strings.Contains(content, "HHH999") {
+		t.Fatalf("被丢弃条目不得落盘: %s", content)
+	}
+}

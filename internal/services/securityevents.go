@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -720,6 +721,12 @@ func securityEventsCRSExclusionRemovesRule(set securityEventsPolicyCRSExclusions
 			if !securityEventsIPInList(clientIP, match) {
 				continue
 			}
+		} else if entry.Scope != "" && entry.Scope != "all" {
+			// 未知 scope 不认领移除——与渲染侧同口径（未知 scope 跳过、
+			// 不降级为 scope=all 全局排除）：渲染未排除该规则，归因侧也不得
+			// 按「已排除」把事件从候选策略上摘走（两侧口径漂移会让「策略
+			// 实际拦截的事件」被误判为「该策略不可能产出」）。
+			continue
 		}
 		if securityEventsCRSExclusionTargetMatches(entry.Target, ruleID) {
 			return true
@@ -1253,6 +1260,10 @@ func securityEventsAttributePolicyWithExclusions(ruleCaddyID, ruleTriggered, act
 	return 0, ""
 }
 
+// securityEventsCanonicalDomains host 规范化（IDNA/端口剥离）的调用缝
+// （db.CanonicalDomains）——var 供测试观测调用次数（pass 内记忆化钉测）。
+var securityEventsCanonicalDomains = db.CanonicalDomains
+
 // securityEventsMapHost resolves a request host to its lb_rule; zero-value ref
 // when nothing matches. Policy attribution is handled separately by
 // securityEventsAttributePolicy, which needs the triggered rule id from the
@@ -1265,7 +1276,7 @@ func securityEventsMapHost(host string, rules map[string]securityEventsRuleRef) 
 	if rule, ok := rules[host]; ok {
 		return rule
 	}
-	canonical, err := db.CanonicalDomains(host)
+	canonical, err := securityEventsCanonicalDomains(host)
 	if err != nil {
 		return securityEventsRuleRef{} // IPs and invalid domains never match a domain rule
 	}
@@ -1506,6 +1517,10 @@ func notifySecurityEventsRollupRewrite(minute time.Time) {
 	securityEventsRollupRewriteHook(minute)
 }
 
+// securityEventsIngestCommits 摄取事务提交次数（测试观测批次节奏——行数批
+// 之外的字节触发钉测；生产为单调计数器，无消费方）。
+var securityEventsIngestCommits atomic.Int64
+
 // securityEventsTailer streams new audit transactions from the log file,
 // persisting its byte offset between passes so restarts resume in place.
 type securityEventsTailer struct {
@@ -1637,6 +1652,11 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 	}
 	trustMatcher := securityEventsBuildTrustMatcher(bindings, policyByID)
 	crsExclusionMatcher := securityEventsBuildCRSExclusionMatcher(policyByID)
+	// host→rule 映射在 pass 生命周期内稳定（rules/绑定映射本 pass 一次性
+	// 加载）——无注入头事件的逐事件 IDNA（CanonicalDomains 含 punycode
+	// 分配）在积压补采万级事件时是纯重复劳动，pass 内记忆化（map 随
+	// pass 回收，无失效问题）。
+	hostRuleMemo := make(map[string]securityEventsRuleRef)
 	if _, err := f.Seek(offset, io.SeekStart); err != nil {
 		return offset, fmt.Errorf("security events: seek audit log: %w", err)
 	}
@@ -1662,6 +1682,11 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 	decoderStart := offset
 	decoder := json.NewDecoder(f)
 	const batchSize = 500
+	// batchBytes 当前未提交事务内 headers+body 的累计字节：行数批（500）
+	// 之外加字节触发（8MiB）——大 body 洪峰下单事务驻留 ~64MiB 字符串 +
+	// driver 绑定，抬高进程峰值。8MiB 上界让大 body 批次提前提交。
+	const batchByteCap = 8 << 20
+	batchBytes := 0
 	// batchCount 只控「每 500 条尝试提交」的批次节奏；它必须与 pass 级实际
 	// 插入计数分离——旧实现复用一个 count，批次提交清零后 EOF 写出的
 	// lastIngested 只剩余数（1000 条→0、501 条→1），PollOnce 的任务日志条数
@@ -1690,6 +1715,7 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 		if err := tx.Commit(); err != nil {
 			return err
 		}
+		securityEventsIngestCommits.Add(1)
 		passInsertedTotal += batchInserted
 		batchInserted = 0
 		autobanObserveBatch(autobanBatch)
@@ -1749,9 +1775,13 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 						if cerr := commit(); cerr != nil {
 							return committedOffset, fmt.Errorf("security events: commit inserts: %w", cerr)
 						}
+						// 不可恢复尾部=该段事件永久丢弃——计入跳过健康信号
+						// （跳过≠失败返回，不登记则本轮三面仍显示 healthy）。
+						securityEventsRecordSkips(info.Size()-offset, 1)
 						Logf("error", "security events ingestion: unrecoverable unreadable audit data at offset %d in archive, ending pass", decoderStart+decoder.InputOffset())
 						return offset, nil
 					}
+					securityEventsRecordSkips(next-offset, 1)
 					Logf("error", "security events ingestion: skipping unreadable audit data before offset %d: %v", next, err)
 					offset = next
 					decoderStart = next
@@ -1810,6 +1840,7 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 				// 以偏移变化自然重置计数，恢复完整宽限。
 				t.stallOffset, t.stallCount = next, securityEventsDecodeStallLimit+1
 			}
+			securityEventsRecordSkips(next-offset, 1)
 			Logf("error", "security events ingestion: skipping unreadable audit data before offset %d (stalled %d ticks): %v", next, t.stallCount, err)
 			offset = next
 			decoderStart = next
@@ -1837,7 +1868,12 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 				rule = rulesByID[rec.AttributionRuleID]
 			}
 			if rule.caddyID == "" {
-				rule = securityEventsMapHost(rec.Host, rules)
+				if memo, hit := hostRuleMemo[rec.Host]; hit {
+					rule = memo
+				} else {
+					rule = securityEventsMapHost(rec.Host, rules)
+					hostRuleMemo[rec.Host] = rule
+				}
 			}
 			policyID, policyName := securityEventsAttributePolicyWithExclusions(rule.caddyID, rec.RuleTriggered, rec.Action, rec.ClientIP, policyByID, bindings, crsExclusionMatcher)
 			// 链式自定义规则起始条的 raw 不含评分字面量，按发射 id 补分
@@ -1895,7 +1931,8 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 				}
 			}
 			batchCount++
-			if batchCount >= batchSize {
+			batchBytes += len(rec.RequestHeaders) + len(rec.RequestBody)
+			if batchCount >= batchSize || batchBytes >= batchByteCap {
 				stmt.Close()
 				if cerr := commit(); cerr != nil {
 					return committedOffset, fmt.Errorf("security events: commit batch: %w", cerr)
@@ -1913,6 +1950,7 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 					return committedOffset, fmt.Errorf("security events: prepare batch insert: %w", err)
 				}
 				batchCount = 0
+				batchBytes = 0
 			}
 		}
 		offset = docEnd
@@ -2027,8 +2065,9 @@ var securityEventsPollState struct {
 const securityEventsIngestionFailureThreshold = 3
 
 // SecurityEventsIngestionStatus 是采集 daemon 的进程内健康快照（不改变任务
-// 调度状态）：连续非停等 tick 失败达到阈值、采集任务未运行、或审计写侧累计
-// 失败达阈值时健康位为 false，供事件列表/安全总览/威胁大屏三处同源提示。
+// 调度状态）：连续非停等 tick 失败达到阈值、采集任务未运行、审计写侧累计
+// 失败达阈值、或窗口内有畸形区跳过（事件永久丢弃）时健康位为 false，
+// 供事件列表/安全总览/威胁大屏三处同源提示。
 type SecurityEventsIngestionStatus struct {
 	Observed            bool   `json:"observed"`
 	Healthy             bool   `json:"healthy"`
@@ -2046,6 +2085,12 @@ type SecurityEventsIngestionStatus struct {
 	WriterIOErrors      uint64 `json:"writer_io_errors"`
 	WriterDegraded      bool   `json:"writer_degraded"`
 	WriterLastFailureAt string `json:"writer_last_failure_at,omitempty"`
+	// Skipped* 是摄取侧「畸形区跳过」累计（跳过=该段审计数据的事件永久
+	// 丢弃）：与写侧计数同为一等健康信号——窗口内（15min）有跳过即降级，
+	// 累计量供事件列表/总览/大屏三面披露与任务日志边沿留痕。
+	SkippedBytes   uint64 `json:"skipped_bytes"`
+	SkippedRegions uint64 `json:"skipped_regions"`
+	LastSkipAt     string `json:"last_skip_at,omitempty"`
 }
 
 var securityEventsIngestionHealth struct {
@@ -2180,6 +2225,58 @@ func securityEventsObserveAuditWriterStats() {
 	securityEventsWriterHealth.windowFailures += newFailures
 }
 
+// securityEventsSkipHealth 是畸形区跳过的进程内累计状态：跳过=该段审计数据
+// 的事件被永久丢弃（崩溃残片/不可恢复畸形区），必须是与写侧计数同族的一等
+// 健康信号——窗口内（securityEventsWriterFailureWindow，与写侧同口径）出现
+// 跳过即降级健康位，累计量供三面披露；窗口滑过后健康位恢复但累计计数保留
+// （「曾丢失」与「正在失败」分离表达）。
+var securityEventsSkipHealth struct {
+	mu             sync.Mutex
+	skippedBytes   uint64
+	skippedRegions uint64
+	windowStart    time.Time
+	windowSkips    uint64
+	lastSkipAt     time.Time
+}
+
+// securityEventsRecordSkips 累计一次畸形区跳过（摄取 pass 内三处跳过分支的
+// 唯一登记点，覆盖活文件停等跳过与归档补采的有界扫描/不可恢复尾部）。
+func securityEventsRecordSkips(bytes int64, regions int) {
+	if bytes <= 0 && regions <= 0 {
+		return
+	}
+	now := time.Now()
+	securityEventsSkipHealth.mu.Lock()
+	defer securityEventsSkipHealth.mu.Unlock()
+	if bytes > 0 {
+		securityEventsSkipHealth.skippedBytes += uint64(bytes)
+	}
+	if regions > 0 {
+		securityEventsSkipHealth.skippedRegions += uint64(regions)
+		securityEventsSkipHealth.windowSkips += uint64(regions)
+	}
+	securityEventsSkipHealth.lastSkipAt = now
+	if securityEventsSkipHealth.windowStart.IsZero() ||
+		now.Sub(securityEventsSkipHealth.windowStart) >= securityEventsWriterFailureWindow {
+		securityEventsSkipHealth.windowStart = now
+		securityEventsSkipHealth.windowSkips = uint64(regions)
+	}
+}
+
+// securityEventsSkipHealthSnapshot 返回跳过累计与窗口内是否降级。
+func securityEventsSkipHealthSnapshot() (skippedBytes, skippedRegions uint64, degraded bool, lastSkipAt time.Time) {
+	securityEventsSkipHealth.mu.Lock()
+	defer securityEventsSkipHealth.mu.Unlock()
+	skippedBytes, skippedRegions = securityEventsSkipHealth.skippedBytes, securityEventsSkipHealth.skippedRegions
+	lastSkipAt = securityEventsSkipHealth.lastSkipAt
+	if !securityEventsSkipHealth.windowStart.IsZero() &&
+		time.Since(securityEventsSkipHealth.windowStart) < securityEventsWriterFailureWindow &&
+		securityEventsSkipHealth.windowSkips > 0 {
+		degraded = true
+	}
+	return skippedBytes, skippedRegions, degraded, lastSkipAt
+}
+
 // securityEventsWriterHealthSnapshot 返回累计计数与窗口内是否降级。
 func securityEventsWriterHealthSnapshot() (dropped, ioErrors uint64, degraded bool, lastFailureAt time.Time) {
 	securityEventsWriterHealth.mu.Lock()
@@ -2215,6 +2312,18 @@ func securityEventsOverlayIngestionHealth(status SecurityEventsIngestionStatus) 
 		status.Observed = true
 		status.Healthy = false
 	}
+	// 畸形区跳过叠加：窗口内有跳过（事件已永久丢弃）即降级——与写侧
+	// 失败同一位；跳过那一轮 tick 本身成功返回 nil（记账会重置连续失败
+	// 计数），不靠 tick 记账就无法暴露丢弃事实。
+	skippedBytes, skippedRegions, skipDegraded, lastSkipAt := securityEventsSkipHealthSnapshot()
+	status.SkippedBytes, status.SkippedRegions = skippedBytes, skippedRegions
+	if !lastSkipAt.IsZero() {
+		status.LastSkipAt = lastSkipAt.UTC().Format(time.RFC3339)
+	}
+	if skipDegraded {
+		status.Observed = true
+		status.Healthy = false
+	}
 	return status
 }
 
@@ -2235,6 +2344,14 @@ func SecurityEventsSetIngestionHealthForTest(status SecurityEventsIngestionStatu
 	securityEventsWriterHealth.windowFailures = 0
 	securityEventsWriterHealth.lastFailureAt = time.Time{}
 	securityEventsWriterHealth.mu.Unlock()
+	// 跳过累计同属健康位整体，重置时一并清空（防跨用例泄漏）。
+	securityEventsSkipHealth.mu.Lock()
+	securityEventsSkipHealth.skippedBytes = 0
+	securityEventsSkipHealth.skippedRegions = 0
+	securityEventsSkipHealth.windowStart = time.Time{}
+	securityEventsSkipHealth.windowSkips = 0
+	securityEventsSkipHealth.lastSkipAt = time.Time{}
+	securityEventsSkipHealth.mu.Unlock()
 }
 
 // SecurityEventsPollOnce 单轮摄取（先采集后轮转——引擎 2s 节拍调用）。
@@ -2282,6 +2399,9 @@ func runIngestionLoop(ctx context.Context) error {
 	defer ticker.Stop()
 	var lastRotateFailureSummaryAt time.Time
 	lastWriterDegraded := false
+	// 畸形区跳过的边沿留痕基线（跳过=事件永久丢弃，必须进任务日志——
+	// 仅 Logf 应用日志会让排障翻不到任务日志）。
+	lastSkippedRegions := uint64(0)
 	for {
 		select {
 		case <-ctx.Done():
@@ -2294,6 +2414,10 @@ func runIngestionLoop(ctx context.Context) error {
 			// 审计写侧失败状态变化才留痕（避免每 2s 重复写同一结论）：达阈值
 			// 降级与恢复各一行，随任务日志导出排障上下文。
 			status := SecurityEventsIngestionHealthSnapshot()
+			if status.SkippedRegions > lastSkippedRegions {
+				TaskLogfWarn("security-events-ingestion", "skip", "审计日志畸形区被跳过：累计 %d 段 / %d 字节，相关安全事件已永久丢失", status.SkippedRegions, status.SkippedBytes)
+				lastSkippedRegions = status.SkippedRegions
+			}
 			if status.WriterDegraded != lastWriterDegraded {
 				if status.WriterDegraded {
 					TaskLogfWarn("security-events-ingestion", "audit-writer", "审计日志写侧失败：窗口内累计丢弃 %d 条、写盘错误 %d 次（累计值），安全事件可能缺失", status.WriterDropped, status.WriterIOErrors)

@@ -7,6 +7,7 @@ import (
 	"lazy-balancer-v2/internal/taskengine"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -176,6 +177,15 @@ func (m *IP2RegionUpdateManager) StartUpdate(trigger string, rc *taskengine.RunC
 	go func() {
 		defer close(done)
 		defer runCancel()
+		// 自建 goroutine 不被引擎 runGuarded 覆盖——未捕获 panic=整个
+		// admin 进程退出。拦截后按失败落定（版本行+更新日志），堆栈入
+		// 应用日志供排障（对齐 caqueue.go 的 goroutine 护栏先例）。
+		defer func() {
+			if r := recover(); r != nil {
+				Logf("error", "ip2region update: run panicked: %v\n%s", r, debug.Stack())
+				m.fail(fmt.Errorf("更新任务内部异常（已拦截进程级崩溃）: %v", r))
+			}
+		}()
 		m.runWithContext(runCtx, trigger, rc)
 	}()
 	return done, nil
@@ -658,6 +668,12 @@ func (m *IP2RegionUpdateManager) downloadAndInstall(parent context.Context, tag 
 		wafFileMu.Unlock()
 		return fmt.Errorf("安装 ip2region xdb: %w", err)
 	}
+	// rename 后同步父目录项（与 writeFileAtomicSynced 同口径）——掉电
+	// 窗口内未持久化的目录项会让重启看到旧/缺失的 live 文件。同步失败
+	// 无法回退已完成的 rename，仅记错误（持久性降级，非功能性失败）。
+	if err := syncParentDir(ip2regionLivePath); err != nil {
+		Logf("error", "ip2region update: 安装段父目录同步失败（掉电持久性降级）: %v", err)
+	}
 	// 版本行与.version sidecar 收进安装段同一互斥
 	// 区——此前在锁外 run() 成功路径，写相位中段（xdb 已换、行/sidecar 未写）
 	// 导出侧（BuildWafFileBundle/BuildWafFileRef 读相位持同一锁）可打出「文件
@@ -880,7 +896,16 @@ func (m *IP2RegionUpdateManager) successAfterReloadFailOpen(tag string, reloadEr
 }
 
 // validateIP2RegionXDB opens the staged xdb and performs a probe search.
-func validateIP2RegionXDB(path string) error {
+// recover 兜底：结构自检门只覆盖已知布局（头/向量索引/段索引指针），绑定库
+// 对内容缓冲区的其余无边界切片（段数据 dataPtr 带外等）仍以 panic 呈现
+// ——校验必须把 panic 转成错误并留堆栈，绝不让待安装工件崩溃进程。
+func validateIP2RegionXDB(path string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			Logf("error", "ip2region update: probe search panicked on staged xdb %s: %v\n%s", path, r, debug.Stack())
+			err = fmt.Errorf("校验 ip2region xdb: 探针搜索触发内部异常（文件损坏）: %v", r)
+		}
+	}()
 	searcher, err := openIP2RegionSearcher(path)
 	if err != nil {
 		return fmt.Errorf("校验 ip2region xdb: %w", err)

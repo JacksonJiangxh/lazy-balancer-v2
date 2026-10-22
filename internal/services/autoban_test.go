@@ -1892,3 +1892,40 @@ func TestAutobanDisableFlush_forgetsExpiredCounters(t *testing.T) {
 		t.Fatal("未到期条目的计数桶不得清空（仅到期解封同步清桶）")
 	}
 }
+
+// 调度态正常（LoopOn=true）但摄取 tick 连续失败时，喂入源健康必须降级——
+// 摄取循环对 tick 失败只记账不退出，单看调度态会让「事件停更、计数恒 0」
+// 呈现为 feed_degraded=false（健康位分裂型静默失效）。
+func TestAutobanFeedHealth_reportsIngestionTickFailures(t *testing.T) {
+	installAutobanFixture(t, "2026-10-14 10:00:00")
+	te := installFeedHealthTestEngine(t)
+	te.StartLoop(AutobanFeedTaskID)
+	t.Cleanup(func() {
+		te.StopLoop(AutobanFeedTaskID)
+		SecurityEventsSetIngestionHealthForTest(SecurityEventsIngestionStatus{})
+	})
+
+	// 未观测到任何摄取结果（Observed=false，装配早期）不误报。
+	SecurityEventsSetIngestionHealthForTest(SecurityEventsIngestionStatus{})
+	if degraded, reason := AutobanFeedHealth(); degraded {
+		t.Fatalf("未观测前不得报降级: %q", reason)
+	}
+	// 摄取健康：不降级。
+	SecurityEventsSetIngestionHealthForTest(SecurityEventsIngestionStatus{Observed: true, Healthy: true})
+	if degraded, reason := AutobanFeedHealth(); degraded {
+		t.Fatalf("摄取健康时不得报降级: %q", reason)
+	}
+	// 连续失败越阈：降级且携带底层原因。
+	SecurityEventsSetIngestionHealthForTest(SecurityEventsIngestionStatus{
+		Observed: true, Healthy: false, ConsecutiveFailures: 3, LastError: "metrics db unavailable",
+	})
+	degraded, reason := AutobanFeedHealth()
+	if !degraded || !strings.Contains(reason, "metrics db unavailable") {
+		t.Fatalf("degraded=%v reason=%q, want 摄取连续失败降级并携带原因", degraded, reason)
+	}
+	// 恢复健康后不再降级。
+	SecurityEventsSetIngestionHealthForTest(SecurityEventsIngestionStatus{Observed: true, Healthy: true})
+	if degraded, reason := AutobanFeedHealth(); degraded {
+		t.Fatalf("摄取恢复健康后不得继续报降级: %q", reason)
+	}
+}

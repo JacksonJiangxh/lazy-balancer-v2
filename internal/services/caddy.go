@@ -1332,6 +1332,13 @@ type securityPolicyContext struct {
 	// scopedListCache 单次全量生成的 CRS 作用域排除列表引用缓存
 	// 键=排序后的 listRefs，避免规则×策略重复读库/整文件。
 	scopedListCache scopedCRSListCache
+	// securityLibsOK 随上下文一次计算并透传：逐规则重探（ReadDir/WalkDir
+	// rules 目录）在千条规则全量渲染下放大为千次探测与千条重复 WARN；且
+	// CRS 树交换（RemoveAll→moveTree，不持 CaddyOpLock）与生成并发时逐规则
+	// 探测会让同一份配置前后规则得到不同的可用性结论（半链窗口）。
+	securityLibsOK bool
+	// securityLibsWarnOnce 库缺失 WARN 每次生成一条（替代逐规则一条）。
+	securityLibsWarnOnce sync.Once
 }
 
 // loadSecurityPolicyContext 一次性查询 security_policy_bindings +
@@ -1349,6 +1356,7 @@ func loadSecurityPolicyContext(store caddyConfigStore) (*securityPolicyContext, 
 		policySynthetic:   make(map[int]int),
 		store:             store,
 		scopedListCache:   make(scopedCRSListCache),
+		securityLibsOK:    SecurityLibrariesAvailable(),
 	}
 	bindingRows, err := store.Query(`SELECT rule_caddy_id, policy_id FROM security_policy_bindings ORDER BY rule_caddy_id, policy_id ASC`)
 	if err != nil {
@@ -4243,6 +4251,11 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 	// 中断(HandlerError 携 ID+4xx)按规则计数;限流 429 经 status==429
 	// 分支计入(424a400e 后;非 coraza tx.ID 但 caddyhttp.Error 生成 ID)。
 	securityLibsOK := SecurityLibrariesAvailable()
+	if ctx != nil {
+		// 批量路径：随生成上下文一次计算的结论（同一份配置内全部规则
+		// 共享同一可用性判定，消除逐规则重探与半链窗口）。
+		securityLibsOK = ctx.securityLibsOK
+	}
 	// 补 securityLibsOK(与 timing_pre/end 同口径)——库缺失时
 	// 链上无 coraza 收点,counter 的 timing ID 注入与拦截计数均无意义。
 	if securityLibsOK && rule.Protocol == "http" && len(policies) > 0 {
@@ -4285,7 +4298,14 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 			detectionTrust = nil
 		}
 	} else if rule.Protocol == "http" && len(policies) >= 1 {
-		Logf("warn", "安全规则库缺失（%s），规则 %s 的所有安全规则本次渲染不生效", securityLibrariesMissingDesc(), rule.CaddyID)
+		if ctx != nil {
+			// 每次生成一条（而非逐规则一条）：缺失描述经 sync.Once 重探一次。
+			ctx.securityLibsWarnOnce.Do(func() {
+				Logf("warn", "安全规则库缺失（%s），本次生成的全部规则安全链不渲染", securityLibrariesMissingDesc())
+			})
+		} else {
+			Logf("warn", "安全规则库缺失（%s），规则 %s 的所有安全规则本次渲染不生效", securityLibrariesMissingDesc(), rule.CaddyID)
+		}
 	}
 	var securityChain []interface{}
 	if securityLibsOK && rule.Protocol == "http" && len(policies) >= 1 {

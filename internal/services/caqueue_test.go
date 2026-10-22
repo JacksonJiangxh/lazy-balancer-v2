@@ -2265,3 +2265,32 @@ func TestCAQueueManager_PauseAndDrain_zombieJobsBlockDrain(t *testing.T) {
 		t.Fatal("PauseAndDrain drained=true, want false（zombieJobs 非空代表仍有未知在途签发）")
 	}
 }
+
+// 屏障期入队拒绝必须携带 ErrCertRuleBusy 哨兵（瞬时冲突语义）——
+// CreateOrRequeueCertJobVerified 对「队列激活 + 任务不在途 + 规则被
+// BlockJobsForRule 租约屏障」的归因此前是裸错「was not queued」，
+// handler 侧折成 500；哨兵使 handler 映射 409。
+func TestCreateOrRequeueCertJobVerified_blockedRuleReturnsBusySentinel(t *testing.T) {
+	_, database := newClusterTestService(t)
+	manager := &CAQueueManager{
+		queues:       make(map[int]*caQueue),
+		blockedRules: make(map[string]map[RuleBlockToken]struct{}),
+		active:       true,
+	}
+	t.Cleanup(manager.Stop)
+	token := manager.BlockJobsForRule("lb_busy_rule")
+	defer manager.UnblockJobsForRule("lb_busy_rule", token)
+
+	_, _, err := CreateOrRequeueCertJobVerified("lb_busy_rule", "busy.example.test", 0, manager)
+	if !errors.Is(err, ErrCertRuleBusy) {
+		t.Fatalf("err=%v, want ErrCertRuleBusy（屏障期哨兵）", err)
+	}
+	// 行未落库（屏障期不得创建任务行）
+	var count int
+	if err := database.QueryRow("SELECT COUNT(*) FROM cert_jobs WHERE rule_id='lb_busy_rule'").Scan(&count); err != nil {
+		t.Fatalf("count jobs: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("cert_jobs count=%d, want 0（屏障期不得落行）", count)
+	}
+}

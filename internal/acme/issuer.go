@@ -89,11 +89,15 @@ func (i *Issuer) Issue(ctx context.Context, domains []string) (certPEM, keyPEM s
 	var localChallenges []challengeInfo
 	var presentedChallenges []ChallengeInfo
 	defer func() {
-		// 清理预算按挑战数缩放——Cleanup 串行删除，单条
+		// 清理预算按挑战数+选中记录数缩放——Cleanup 串行删除，单条
 		// 删除链最坏 90s（dnspod http.Client.Timeout / tencent ReqTimeout=90），
-		// 固定 2min 会让 root+www 两域名的第二个 TXT 清理被 ctx 取消
-		//（cleanup_warning + 残留延长）。
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), dnsCleanupBudget(len(presentedChallenges)))
+		// 冷缓存域名解析同包络；K>1（legacy/stale 残留）时按挑战数的预算会
+		// 让清理被 ctx 截断（cleanup_warning + 残留延长）。
+		recordCount := 0
+		for _, ci := range presentedChallenges {
+			recordCount += dnsprovider.CountChallengeCleanupRecords(i.Provider, zoneFromDomain(ci.Domain), ci.TokenFQDN, ci.Value)
+		}
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), dnsCleanupBudget(len(presentedChallenges), recordCount))
 		defer cleanupCancel()
 		log("cleanup_dns", "清理 ACME DNS TXT 记录")
 		i.Cleanup(cleanupCtx, presentedChallenges)
@@ -230,6 +234,10 @@ func (i *Issuer) Issue(ctx context.Context, domains []string) (certPEM, keyPEM s
 	if err != nil {
 		return "", "", err
 	}
+	// 不可达防御：x/crypto CreateOrderCert 成功路径已 WaitOrder 到 valid 并
+	// fetchCertRFC 取回证书，certURL 必非空——本分支仅防御上游库未来行为
+	// 漂移。空 CertURL 无缓存条目可弃（DiscardFinalizedCert 以 URL 为键），
+	// 故此处不适用「失败路径必须显式丢弃缓存」的口径。
 	if finalizedOrder.CertURL == "" {
 		return "", "", fmt.Errorf("finalize returned empty cert url")
 	}
@@ -269,7 +277,10 @@ func (i *Issuer) Issue(ctx context.Context, domains []string) (certPEM, keyPEM s
 	log("downloaded", "证书下载完成")
 
 	certPEM = EncodeCertPEM(certDER)
-	keyPEM = EncodeKeyPEM(key)
+	keyPEM, err = EncodeKeyPEM(key)
+	if err != nil {
+		return "", "", fmt.Errorf("encode private key: %w", err)
+	}
 	return certPEM, keyPEM, nil
 }
 
@@ -303,24 +314,28 @@ func (i *Issuer) Cleanup(ctx context.Context, challenges []ChallengeInfo) {
 
 // 清理预算：单条删除链最坏 90s（dnspod
 // http.Client.Timeout / tencent HttpProfile.ReqTimeout=90s，覆盖重试包络），
-// Cleanup 串行处理全部挑战，故预算须随挑战数线性放大；下限保留原 2min，
-// 上限 8min 保证「CA 队列执行预算 60min + 清理 ≤8min < staleOwnershipAge
-// 75min」——ownership 条目不会在清理进行中被他方判为陈旧。上限覆盖到
-// 4 个域名（4×100s=400s），更多域名按 8min 尽力清理，失败条目由
-// ownership 自愈兜底（记录不泄漏）。
+// 且每个挑战还要先解析 domain_id（冷缓存时 Domain.List 分页同包络）。
+// 真实最坏链 = Σ(1+K_i)×90s（K_i=该挑战选中条目数：本挑战记录+legacy/stale
+// 回收），故预算按「挑战数+选中记录数」缩放——只按挑战数会让带历史残留的
+// 清理在 8min 内被 ctx 截断（cleanup_warning + 残留延长）。下限保留原
+// 2min，上限 8min 保证「CA 队列执行预算 60min + 清理 ≤8min <
+// StaleOwnershipAge 75min」——ownership 条目不会在清理进行中被他方判为
+// 陈旧（耦合由 TestDNSCleanupBudget_staysBelowStaleOwnershipAge 钉住）。
+// 超出上限时按 8min 尽力清理，失败条目由 ownership 自愈兜底（记录不泄漏）。
 const (
-	dnsCleanupBudgetMin          = 2 * time.Minute
-	dnsCleanupBudgetPerChallenge = 100 * time.Second
-	dnsCleanupBudgetMax          = 8 * time.Minute
+	dnsCleanupBudgetMin       = 2 * time.Minute
+	dnsCleanupBudgetPerRecord = 90 * time.Second
+	dnsCleanupBudgetMax       = 8 * time.Minute
 )
 
-// dnsCleanupBudget 返回给定挑战数下的清理总预算（下限 2min、逐挑战 100s、
-// 上限 8min）。
-func dnsCleanupBudget(challengeCount int) time.Duration {
-	if challengeCount <= 1 {
+// dnsCleanupBudget 返回给定挑战数与选中记录总数下的清理总预算
+// （下限 2min、每挑战/记录各 90s、上限 8min）。recordCount 由各 provider 的
+// CleanupCounter 本地计数汇总；无计数能力时按每挑战 1 条计。
+func dnsCleanupBudget(challengeCount, recordCount int) time.Duration {
+	if challengeCount <= 0 && recordCount <= 0 {
 		return dnsCleanupBudgetMin
 	}
-	budget := time.Duration(challengeCount) * dnsCleanupBudgetPerChallenge
+	budget := time.Duration(challengeCount+recordCount) * dnsCleanupBudgetPerRecord
 	return min(max(budget, dnsCleanupBudgetMin), dnsCleanupBudgetMax)
 }
 
@@ -529,6 +544,8 @@ func (i *Issuer) waitForDNS(ctx context.Context, fqdn, expected string, timeout 
 	consensusRounds := 0
 	firstProbeAt := time.Now()
 	divergenceDiagnosed := false
+	// 权威清单全失败后的重发现计数（上限 maxAuthRediscoveries，防抖）。
+	authRediscoveries := 0
 	// 逐台命中/失败/未命中行仅在「状态变化」时输出——
 	// 镜像 waitForValidation 的 lastChalStatus 先例，避免 5min 传播预算内
 	// 每轮逐台刷屏（单轮 4 递归 + N 权威，5min/3s≈100 轮可达数百行）。
@@ -551,6 +568,21 @@ func (i *Issuer) waitForDNS(ctx context.Context, fqdn, expected string, timeout 
 		}
 		if authReady {
 			return nil
+		}
+		// 一轮全失败（RTT 抖动/权威限流使所有探针同时超时）后清单会永久
+		// 变空——曾有权威的域名只剩递归共识一条路，公共递归不可达时烧满
+		// 预算报超时（记录其实已正确写入权威）。本轮存活集合变空时按上限
+		// 重发现一次清单（≤2 次 NS 查询+地址解析/次，次数防抖），次轮直接
+		// 探测新清单。递归共识/单台兜底判据不变（initialAuthServers 非空时
+		// 单台兜底仍关闭）。
+		if len(authServers) == 0 && len(initialAuthServers) > 0 && authRediscoveries < maxAuthRediscoveries {
+			authRediscoveries++
+			log("权威 DNS 全部探测失败，重新发现权威服务器（第 %d/%d 次）", authRediscoveries, maxAuthRediscoveries)
+			if rediscovered := resolveAuthoritativeNSFn(ctx, fqdn, resolvers[0]); len(rediscovered) > 0 {
+				authServers = rediscovered
+				log("权威 DNS 重新发现: %s", strings.Join(rediscovered, ", "))
+				continue
+			}
 		}
 
 		// （用户裁定）：每轮并行于权威探测公共递归做共识统计。
@@ -673,6 +705,9 @@ var (
 	// 钉死（单台/双台缓存超前不得放行，2026-10-13 用户裁定 2→3）。
 	propagationConsensusMinHits   = 3
 	propagationConsensusMinRounds = 2
+	// maxAuthRediscoveries 权威清单一轮全失败后的重发现次数上限（防抖：
+	// 避免对 DNS 加压；每次重发现 ≤2 次 NS 查询 + NS 地址解析）。
+	maxAuthRediscoveries = 2
 )
 
 // recursiveDNSPollInterval / recursiveDNSDeadline 是 checkRecursiveDNS 的

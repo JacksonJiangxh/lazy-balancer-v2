@@ -71,12 +71,34 @@ func defaultDownloadIP2RegionXDB(ctx context.Context, tag, destPath string, prog
 		return err
 	}
 	copyErr := writeRuleSetDownload(out, resp, ip2RegionXDBDownloadSizeCap, progress)
+	// 落盘持久化屏障：staging 文件随后被 rename 进 live 路径，掉电窗口内
+	// 未 fsync 的页缓存会留下半截 live 库（与 writeFileAtomicSynced 同口径，
+	// 先 Sync 再 Close）。
+	var syncErr error
+	if copyErr == nil {
+		syncErr = out.Sync()
+	}
 	closeErr := out.Close()
 	if copyErr != nil {
 		return copyErr
 	}
+	if syncErr != nil {
+		return fmt.Errorf("ip2region xdb 落盘同步失败: %w", syncErr)
+	}
 	if closeErr != nil {
 		return closeErr
+	}
+	// Content-Length 回读比对：声明长度的响应被中间层截断时落盘字节数
+	// 与声明值不一致，直接拒收；chunked 无声明长度，由安装前的结构自检
+	// 门兜底（见 validateIP2RegionXDB）。
+	if resp.ContentLength >= 0 {
+		fi, serr := os.Stat(destPath)
+		if serr != nil {
+			return fmt.Errorf("ip2region xdb 落盘回读失败: %w", serr)
+		}
+		if fi.Size() != resp.ContentLength {
+			return fmt.Errorf("ip2region xdb 落盘字节 %d 与响应声明长度 %d 不一致（疑似截断）", fi.Size(), resp.ContentLength)
+		}
 	}
 	return nil
 }

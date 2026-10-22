@@ -47,9 +47,10 @@ var cancelCertJob = func(id int) {
 	}
 }
 
-// certJobLogMaxRotatedBackups 对齐 services/certjoblog.go 的 maxRotatedFiles=5
-// （.1 最新 → .5 最旧）；写侧未来扩大保留数时读侧须同步调整。
-const certJobLogMaxRotatedBackups = logRotatedBackups
+// certJobLogMaxRotatedBackups 直读 services 写侧保留份数（.1 最新 → .N 最旧）
+// ——读侧与写侧同源由消费关系保证（此前 const=logRotatedBackups 靠巧合同值，
+// 写侧改保留数时读侧漏同步）。Caddy 日志族保留数仍由 logRotatedBackups 服务。
+var certJobLogMaxRotatedBackups = services.CertJobLogMaxRotatedFiles()
 
 const maxCertJobPage int64 = 1_000_000
 
@@ -59,6 +60,66 @@ func certJobOperationLock(id int) *sync.Mutex {
 		index += len(certJobOperationLocks)
 	}
 	return &certJobOperationLocks[index]
+}
+
+// certJobListItem 是证书任务列表/详情的统一投影（证书材料本体 cert_pem
+// 不外发）——详情与列表字段同源，新消费方（如任务监控详情）不会踩空
+// 「列表有、详情无」的字段分叉。
+type certJobListItem struct {
+	ID                   int                 `json:"id"`
+	RuleID               string              `json:"rule_id"`
+	Domain               string              `json:"domain"`
+	CAProviderID         int                 `json:"ca_provider_id"`
+	CAProviderName       string              `json:"ca_provider_name,omitempty"`
+	Status               string              `json:"status"`
+	Message              string              `json:"message"`
+	Issuer               string              `json:"issuer"`
+	DaysRemaining        int                 `json:"days_remaining"`
+	CertificateStatus    string              `json:"certificate_status"`
+	RenewalAttempts      int                 `json:"renewal_attempts,omitempty"`
+	CAAvailableAfter     models.JSONNullTime `json:"ca_available_after,omitempty"`
+	LastErrorCode        string              `json:"last_error_code,omitempty"`
+	ExpiresAt            models.JSONNullTime `json:"expires_at"`
+	CreatedAt            time.Time           `json:"created_at"`
+	UpdatedAt            models.JSONNullTime `json:"updated_at"`
+	RetryCooldownSeconds *int64              `json:"retry_cooldown_seconds"`
+}
+
+// certJobListSelectSQL 列表/详情共用的列投影与 provider 联表。
+// cert_pem 只取首证书块——certificateIssuer 仅解析首块，全链（LE ~6KB）
+// 全量传输纯属浪费；INSTR 定位首个 END 边界，空串/单块形态 SUBSTR 原样返回。
+const certJobListSelectSQL = `SELECT j.id, j.rule_id, j.domain, j.status, COALESCE(j.message,'') AS message,
+	CASE WHEN INSTR(j.cert_pem,'-----END CERTIFICATE-----') > 0
+	     THEN SUBSTR(j.cert_pem, 1, INSTR(j.cert_pem,'-----END CERTIFICATE-----') + 25)
+	     ELSE COALESCE(j.cert_pem,'') END AS cert_pem,
+	j.expires_at, j.created_at, j.updated_at, COALESCE(j.renewal_attempts,0) AS renewal_attempts, j.ca_available_after, COALESCE(j.last_error_code,'') AS last_error_code, COALESCE(j.ca_provider_id,0) AS ca_provider_id, COALESCE(p.name,'') AS ca_provider_name FROM cert_jobs j LEFT JOIN ca_providers p ON p.id = j.ca_provider_id`
+
+// certJobScanner 抽象 *sql.Rows/*sql.Row 的 Scan（列表逐行与详情单行同源填充）。
+type certJobScanner interface {
+	Scan(dest ...any) error
+}
+
+// scanFrom 从当前行填充投影并计算派生字段（重试冷却/issuer/到期状态）。
+// 剩余天数收敛 services.CertDaysRemaining 单源；状态判定收敛
+// services.CertificateExpiryStatus（天粒度，与 certinfo 截断天数同口径）。
+func (j *certJobListItem) scanFrom(scanner certJobScanner, now time.Time, expiryDays int) error {
+	var certPEM string
+	if err := scanner.Scan(&j.ID, &j.RuleID, &j.Domain, &j.Status, &j.Message, &certPEM,
+		&j.ExpiresAt, &j.CreatedAt, &j.UpdatedAt, &j.RenewalAttempts, &j.CAAvailableAfter, &j.LastErrorCode, &j.CAProviderID, &j.CAProviderName,
+	); err != nil {
+		return err
+	}
+	if cooldown, retryable := certJobRetryCooldown(j.Status); retryable {
+		seconds := int64(cooldown / time.Second)
+		j.RetryCooldownSeconds = &seconds
+	}
+	j.Issuer = certificateIssuerCached(certPEM)
+	j.CertificateStatus = "unknown"
+	if j.ExpiresAt.Valid {
+		j.DaysRemaining = services.CertDaysRemaining(j.ExpiresAt.Time, now)
+		j.CertificateStatus = services.CertificateExpiryStatus(j.ExpiresAt.Time, now, expiryDays)
+	}
+	return nil
 }
 
 func (h *Handlers) ListCertJobs(c *gin.Context) {
@@ -118,15 +179,7 @@ func (h *Handlers) ListCertJobs(c *gin.Context) {
 	// 会让列表「即将过期」标记与续签扫描口径分叉；单源 helper 越界时显性留痕
 	// 并降级治理默认。
 	expiryDays := services.GetCertExpiryThreshold()
-	// cert_pem 只取首证书块——certificateIssuer 仅
-	// 解析首块,全链(LE ~6KB)全量传输纯属浪费;INSTR 定位首个 END 边界,
-	// 空串/单块形态 SUBSTR 原样返回(与全量读取行为一致)。
-	query := `SELECT j.id, j.rule_id, j.domain, j.status, COALESCE(j.message,'') AS message,
-		CASE WHEN INSTR(j.cert_pem,'-----END CERTIFICATE-----') > 0
-		     THEN SUBSTR(j.cert_pem, 1, INSTR(j.cert_pem,'-----END CERTIFICATE-----') + 25)
-		     ELSE COALESCE(j.cert_pem,'') END AS cert_pem,
-		j.expires_at, j.created_at, j.updated_at, COALESCE(j.renewal_attempts,0) AS renewal_attempts, j.ca_available_after, COALESCE(j.last_error_code,'') AS last_error_code, COALESCE(j.ca_provider_id,0) AS ca_provider_id, COALESCE(p.name,'') AS ca_provider_name FROM cert_jobs j LEFT JOIN ca_providers p ON p.id = j.ca_provider_id`
-	query += whereClause
+	query := certJobListSelectSQL + whereClause
 	args := append([]interface{}{}, filterArgs...)
 	query += " ORDER BY j.created_at DESC LIMIT ? OFFSET ?"
 	args = append(args, pageSize, offset)
@@ -138,48 +191,13 @@ func (h *Handlers) ListCertJobs(c *gin.Context) {
 	}
 	defer rows.Close()
 
-	type certJobListItem struct {
-		ID                   int                 `json:"id"`
-		RuleID               string              `json:"rule_id"`
-		Domain               string              `json:"domain"`
-		CAProviderID         int                 `json:"ca_provider_id"`
-		CAProviderName       string              `json:"ca_provider_name,omitempty"`
-		Status               string              `json:"status"`
-		Message              string              `json:"message"`
-		Issuer               string              `json:"issuer"`
-		DaysRemaining        int                 `json:"days_remaining"`
-		CertificateStatus    string              `json:"certificate_status"`
-		RenewalAttempts      int                 `json:"renewal_attempts,omitempty"`
-		CAAvailableAfter     models.JSONNullTime `json:"ca_available_after,omitempty"`
-		LastErrorCode        string              `json:"last_error_code,omitempty"`
-		ExpiresAt            models.JSONNullTime `json:"expires_at"`
-		CreatedAt            time.Time           `json:"created_at"`
-		UpdatedAt            models.JSONNullTime `json:"updated_at"`
-		RetryCooldownSeconds *int64              `json:"retry_cooldown_seconds"`
-	}
 	jobs := make([]certJobListItem, 0, pageSize)
 	now := time.Now()
 	for rows.Next() {
 		var j certJobListItem
-		var certPEM string
-		if err := rows.Scan(&j.ID, &j.RuleID, &j.Domain, &j.Status, &j.Message, &certPEM,
-			&j.ExpiresAt, &j.CreatedAt, &j.UpdatedAt, &j.RenewalAttempts, &j.CAAvailableAfter, &j.LastErrorCode, &j.CAProviderID, &j.CAProviderName,
-		); err != nil {
+		if err := j.scanFrom(rows, now, expiryDays); err != nil {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取证书任务失败: " + err.Error()})
 			return
-		}
-		if cooldown, retryable := certJobRetryCooldown(j.Status); retryable {
-			seconds := int64(cooldown / time.Second)
-			j.RetryCooldownSeconds = &seconds
-		}
-		j.Issuer = certificateIssuer(certPEM)
-		j.CertificateStatus = "unknown"
-		if j.ExpiresAt.Valid {
-			// 剩余天数收敛 CertDaysRemaining 单源；
-			// 状态判定收敛 CertificateExpiryStatus（天粒度——原 `<= days*24h`
-			// 纳秒口径与 certinfo 截断天数在阈值 +1m 处结论分叉）。
-			j.DaysRemaining = services.CertDaysRemaining(j.ExpiresAt.Time, now)
-			j.CertificateStatus = services.CertificateExpiryStatus(j.ExpiresAt.Time, now, expiryDays)
 		}
 		jobs = append(jobs, j)
 	}
@@ -264,6 +282,34 @@ func certificateIssuer(certPEM string) string {
 	return cert.Issuer.CommonName
 }
 
+// certIssuerCache 按证书 PEM 首块缓存 issuer 解析结果——pem.Decode+
+// x509.ParseCertificate 单次约 20-60µs，列表页 50-200 行/请求且
+// usePollingTask 周期轮询（多标签页线性叠加），同一证书不应每请求重解析。
+// 有界（256 条）；写满整表清空重建（证书总量小，重建代价可忽略）。
+var certIssuerCache = struct {
+	sync.Mutex
+	entries map[string]string
+}{entries: map[string]string{}}
+
+const certIssuerCacheMax = 256
+
+func certificateIssuerCached(certPEM string) string {
+	if certPEM == "" {
+		return ""
+	}
+	certIssuerCache.Lock()
+	defer certIssuerCache.Unlock()
+	if issuer, ok := certIssuerCache.entries[certPEM]; ok {
+		return issuer
+	}
+	issuer := certificateIssuer(certPEM)
+	if len(certIssuerCache.entries) >= certIssuerCacheMax {
+		certIssuerCache.entries = map[string]string{}
+	}
+	certIssuerCache.entries[certPEM] = issuer
+	return issuer
+}
+
 func (h *Handlers) RetryCertJob(c *gin.Context) {
 
 	id, err := strconv.Atoi(c.Param("id"))
@@ -292,15 +338,26 @@ func (h *Handlers) retryCertJobByID(c *gin.Context, id int) {
 	operationLock.Lock()
 	defer operationLock.Unlock()
 	var ruleID, domain, status string
-	var caProviderID int
-	var updatedAt, createdAt sql.NullTime
-	err := db.DB.QueryRow("SELECT rule_id, domain, status, updated_at, created_at, COALESCE(ca_provider_id,0) FROM cert_jobs WHERE id=?", id).Scan(&ruleID, &domain, &status, &updatedAt, &createdAt, &caProviderID)
+	var caProviderID, renewalAttempts int
+	var updatedAt, createdAt, caAvailableAfter sql.NullTime
+	err := db.DB.QueryRow("SELECT rule_id, domain, status, updated_at, created_at, COALESCE(ca_provider_id,0), COALESCE(renewal_attempts,0), ca_available_after FROM cert_jobs WHERE id=?", id).Scan(&ruleID, &domain, &status, &updatedAt, &createdAt, &caProviderID, &renewalAttempts, &caAvailableAfter)
 	if dbQueryNotFound(c, err, "任务不存在", "RetryCertJob query job") {
 		return
 	}
 
 	if blocked, statusCode, message := certJobRetryBlocked(status, updatedAt, createdAt, time.Now()); blocked {
 		c.JSON(statusCode, models.APIResponse{Code: statusCode, Message: message})
+		return
+	}
+
+	// waiting_ca 的 CA 冷却（429 退避 1-3h）有明确到期时间——手动重试默认
+	// 不得静默越过：冷却未到期且未显式 force 时 429 并给出剩余时长；
+	// force=true（前端确认对话框已明示风险）显式越过并留审计痕迹。
+	forceRetry := c.Query("force") == "true"
+	if status == "waiting_ca" && caAvailableAfter.Valid && time.Now().Before(caAvailableAfter.Time) && !forceRetry {
+		remaining := time.Until(caAvailableAfter.Time).Round(time.Second)
+		c.JSON(http.StatusTooManyRequests, models.APIResponse{Code: http.StatusTooManyRequests,
+			Message: fmt.Sprintf("CA 限流冷却未到期（剩余约 %s）。冷却到期后将自动重排；确需立即重签请确认后强制重试（可能再次被 CA 拒绝）", remaining)})
 		return
 	}
 
@@ -397,7 +454,17 @@ func (h *Handlers) retryCertJobByID(c *gin.Context, id int) {
 	// 绕过单点唤醒，任务滞留至 cert-reconcile 周期至多 6h）。
 	// 入队成功即真实工作，唤醒入口不重查活跃态（队列可能已快速失败）。
 	services.WakeCertWaitingCAForEnqueuedJob()
-	recordAudit(c, "重试", "证书任务", services.FormatAuditDetail(services.AuditJobPart(id), services.AuditRulePart(ruleID), domain, fmt.Sprintf("原状态：%s", status), services.AuditResultPart("queued")))
+	auditParts := []string{services.AuditJobPart(id), services.AuditRulePart(ruleID), domain, fmt.Sprintf("原状态：%s", status)}
+	if status == "waiting_ca" && forceRetry {
+		// 越过冷却必须可见（运维逃生通道的留痕义务）
+		auditParts = append(auditParts, "手动越过 CA 冷却")
+	}
+	if renewalAttempts > 0 {
+		// 重试会把 renewal_attempts 归零（最大重试预算对人工操作重新计）——留痕
+		auditParts = append(auditParts, fmt.Sprintf("重试预算已重置（原重试次数 %d）", renewalAttempts))
+	}
+	auditParts = append(auditParts, services.AuditResultPart("queued"))
+	recordAudit(c, "重试", "证书任务", services.FormatAuditDetail(auditParts...))
 
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "Retry triggered"})
 }
@@ -760,9 +827,10 @@ func (h *Handlers) GetCertJob(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Invalid job ID"})
 		return
 	}
-	var j models.CertJob
-	err = db.DB.QueryRow("SELECT id, rule_id, domain, status, COALESCE(message,'') AS message, expires_at, created_at, updated_at, ca_available_after FROM cert_jobs WHERE id=?", id).
-		Scan(&j.ID, &j.RuleID, &j.Domain, &j.Status, &j.Message, &j.ExpiresAt, &j.CreatedAt, &j.UpdatedAt, &j.CAAvailableAfter)
+	// 详情与列表共用同一投影（certJobListItem，cert_pem 材料本体除外）——
+	// 此前详情字段是列表的真子集，新消费方取 issuer/冷却码/重试次数会踩空。
+	var j certJobListItem
+	err = j.scanFrom(db.DB.QueryRow(certJobListSelectSQL+" WHERE j.id=?", id), time.Now(), services.GetCertExpiryThreshold())
 	if dbQueryNotFound(c, err, "Job not found", "GetCertJob query job") {
 		return
 	}

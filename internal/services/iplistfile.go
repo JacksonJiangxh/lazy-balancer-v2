@@ -2,6 +2,7 @@ package services
 
 import (
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -108,6 +109,34 @@ func validIPListScope(scope string) bool {
 	return true
 }
 
+// ipListProjectionMemo 进程级投影备忘：scope 路径 → (原始输入指纹, 落盘后
+// mtime/size)。渲染按 (规则×策略) 对调用，同一 scope 的名单聚合（排序/合并）
+// 与整文件读回会被逐对重复——大名单×多规则时是生成期的显性 CPU/IO 放大。
+// 命中（输入指纹一致且文件 mtime/size 与落盘记录一致）即跳过聚合与读回。
+// 残余风险披露：外部改写内容但保持 mtime+size 不变时不被检测（原整文件
+// 读回可比对字节）——投影目录由本进程独占写入，该形态只可能来自刻意带外
+// 构造；文件被删/mtime 漂移仍走完整重写路径。RestoreIPListProjections
+// 回滚重写文件后清空备忘（防陈旧命中跳过必要重写）。
+var (
+	ipListProjectionMemoMu sync.Mutex
+	ipListProjectionMemo   = map[string]ipListProjectionMemoEntry{}
+)
+
+type ipListProjectionMemoEntry struct {
+	inputHash uint64
+	mtimeNano int64
+	size      int64
+}
+
+func ipListInputHash(entries []string) uint64 {
+	h := fnv.New64a()
+	for _, entry := range entries {
+		_, _ = h.Write([]byte(entry))
+		_, _ = h.Write([]byte{0})
+	}
+	return h.Sum64()
+}
+
 func writeIPListFile(scope string, merged []string) (string, error) {
 	if !validIPListScope(scope) {
 		return "", fmt.Errorf("IP 名单投影 scope 含非法字符或超出长度限制: %q", scope)
@@ -122,6 +151,19 @@ func writeIPListFile(scope string, merged []string) (string, error) {
 			return "", fmt.Errorf("IP 名单投影条目含换行符（scope=%s）: %q", scope, entry)
 		}
 	}
+	name := scope + ".txt"
+	path := filepath.Join(IPListDataDir, name)
+	noteIPListRenderRef(path)
+	// memo 快路：同输入指纹 + 文件落盘态一致 → 跳过聚合与读回。
+	inputHash := ipListInputHash(merged)
+	ipListProjectionMemoMu.Lock()
+	memo, memoOK := ipListProjectionMemo[path]
+	ipListProjectionMemoMu.Unlock()
+	if memoOK && memo.inputHash == inputHash {
+		if st, err := os.Stat(path); err == nil && st.ModTime().UnixNano() == memo.mtimeNano && st.Size() == memo.size {
+			return path, nil
+		}
+	}
 	merged = wafiplist.AggregateIPEntries(merged)
 	// 内容先于 stat 构建：稳定命名下「同路径」不再蕴含「同内容」——字节比对
 	// 才是跳写判据（内容寻址时代的 stat 命中=同内容前提已随热路径改造失效）。
@@ -132,10 +174,17 @@ func writeIPListFile(scope string, merged []string) (string, error) {
 		sb.WriteString("\n")
 	}
 	content := sb.String()
-	name := scope + ".txt"
-	path := filepath.Join(IPListDataDir, name)
-	noteIPListRenderRef(path)
+	// 记录备忘（同字节跳写与重写两条成功路径同点）——stat 失败时跳过记录，
+	// 下轮走完整路径。
+	recordMemo := func() {
+		if st, err := os.Stat(path); err == nil {
+			ipListProjectionMemoMu.Lock()
+			ipListProjectionMemo[path] = ipListProjectionMemoEntry{inputHash: inputHash, mtimeNano: st.ModTime().UnixNano(), size: st.Size()}
+			ipListProjectionMemoMu.Unlock()
+		}
+	}
 	if existing, err := os.ReadFile(path); err == nil && string(existing) == content {
+		recordMemo()
 		return path, nil // 同字节跳写
 	}
 	if err := EnsureIPListDir(); err != nil {
@@ -173,6 +222,7 @@ func writeIPListFile(scope string, merged []string) (string, error) {
 	if err := syncParentDir(path); err != nil {
 		return "", fmt.Errorf("同步 IP 名单目录失败 %s: %w", name, err)
 	}
+	recordMemo()
 	return path, nil
 }
 
@@ -200,6 +250,11 @@ func SnapshotIPListProjections() IPListProjectionSnapshot {
 
 // RestoreIPListProjections 删除渲染新增的 .txt 并回写快照内容。
 func RestoreIPListProjections(snapshot IPListProjectionSnapshot) {
+	// 回滚直接重写/删除投影文件——备忘的落盘态记录随之失效，清空防陈旧
+	// 命中跳过必要重写。
+	ipListProjectionMemoMu.Lock()
+	ipListProjectionMemo = map[string]ipListProjectionMemoEntry{}
+	ipListProjectionMemoMu.Unlock()
 	entries, err := os.ReadDir(IPListDataDir)
 	if err == nil {
 		for _, entry := range entries {

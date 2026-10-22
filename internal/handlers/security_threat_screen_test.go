@@ -1100,7 +1100,7 @@ func TestThreatScreen_lastSumQueryFailure_returns500(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
 	old := queryThreatRecentBlocked
-	queryThreatRecentBlocked = func(string) (int, error) { return 0, fmt.Errorf("injected sum failure") }
+	queryThreatRecentBlocked = func(string, string) (int, error) { return 0, fmt.Errorf("injected sum failure") }
 	t.Cleanup(func() { queryThreatRecentBlocked = old })
 
 	recorder := getRequest(t, router, "/security/overview/threat-screen")
@@ -1687,6 +1687,10 @@ func TestThreatRollup_ingestBackfillRewindsCoverage(t *testing.T) {
 		threatRollupTargetReadyKey:       lastComplete.Format("2006-01-02 15:04"),
 		threatRollupGeoIPGenerationKey:   fmt.Sprintf("%d", services.GeoIPDataGeneration()),
 		threatRollupClassifierVersionKey: threatRollupClassifierVersion,
+		// 谓词/action 枚举代际同样预置：缺失会触发整窗重固，掩盖“repair
+		// 窗口触不到”的前提（本用例只验证水位回退）。
+		threatRollupPredicateVersionKey:  threatRollupPredicateVersion,
+		threatRollupActionEnumVersionKey: threatRollupActionEnumVersion,
 	} {
 		if _, err := db.MetricsDB.Exec(`INSERT INTO metrics_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value); err != nil {
 			t.Fatal(err)
@@ -2055,5 +2059,72 @@ func TestGetSecurityThreatScreen_hourlyHistDSTTransitionBuckets(t *testing.T) {
 		if slot.Value != want {
 			t.Fatalf("hist[%d](%s)=%d, want %d——回退点前事件必须按切换前 EDT(-4) 落桶，单一当前偏移（-5）会错配相邻柱", i, slot.Name, slot.Value, want)
 		}
+	}
+}
+
+// recent_rate 只计 5 个完整分钟：当前未满分钟不并入（旧口径把不足 60s 的
+// 当前分钟按整分钟计入，窗口实际跨度最多 5.98 分钟而除数恒 5.0——最坏
+// 偏高 ~20%，与 rollup「最新完整分钟」语义不一致）。
+// 同测钉住两条读路径同谓词：queryThreatRecentBlocked（SUM）与主扫描
+// （逐行累加）的 blocked 计数必须一致。
+func TestGetSecurityThreatScreen_recentRateUsesCompleteMinutesOnly(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	// 固定时钟在 :59 秒——当前分钟已走 59/60，旧口径漂移最大的形态。
+	base := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Minute).Add(59 * time.Second)
+	installThreatClock(t, base)
+	// 当前未满分钟 1 条 blocked + 上一完整分钟 1 条 blocked。
+	seedThreatScreenEvent(t, base.Add(-30*time.Second).Format("2006-01-02 15:04:05"), "93.184.216.7", "942100", "SQL Injection", "blocked")
+	seedThreatScreenEvent(t, base.Add(-90*time.Second).Format("2006-01-02 15:04:05"), "185.199.108.5", "941100", "XSS", "blocked")
+	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
+
+	response := getRequest(t, router, "/security/overview/threat-screen")
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload threatScreenPayload
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	// 新口径：仅上一完整分钟 1 条 → 1/5=0.2；旧口径：当前分钟并入 → 2/5=0.4。
+	if payload.Data.RecentRate != 0.2 {
+		t.Fatalf("recent_rate=%v, want 0.2（当前未满分钟不参与）", payload.Data.RecentRate)
+	}
+	// 主扫描（24h 窗口）覆盖两条 blocked——SUM 路径与行累加路径同谓词。
+	if payload.Data.BlockedEvents != 2 {
+		t.Fatalf("blocked_events=%d, want 2（两条读路径口径必须一致）", payload.Data.BlockedEvents)
+	}
+}
+
+// rollup 语义代际键（保留地址排除谓词 / action 枚举）：固化时落库、
+// 漂移（升级残留旧值/缺失）时按空覆盖重固——写侧口径变更不得静默改
+// 大屏数字（水位机制只保护迟到事件，不保护语义变更）。
+func TestEnsureThreatRollup_semanticVersionKeysPersistedAndRefixedOnDrift(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	seedThreatScreenEvent(t, utcStringAgo(2*time.Hour), "93.184.216.7", "942100", "SQL Injection", "blocked")
+	if err := ensureThreatRollup(24); err != nil {
+		t.Fatal(err)
+	}
+	readKey := func(key string) string {
+		var v string
+		if err := db.MetricsDB.QueryRow(`SELECT value FROM metrics_state WHERE key=?`, key).Scan(&v); err != nil {
+			t.Fatalf("代际键 %s 未随固化落库: %v", key, err)
+		}
+		return v
+	}
+	if got := readKey(threatRollupPredicateVersionKey); got != threatRollupPredicateVersion {
+		t.Fatalf("predicate version=%q, want %q", got, threatRollupPredicateVersion)
+	}
+	if got := readKey(threatRollupActionEnumVersionKey); got != threatRollupActionEnumVersion {
+		t.Fatalf("action enum version=%q, want %q", got, threatRollupActionEnumVersion)
+	}
+	// 漂移（模拟口径升级后库内残留旧值）→ 重固并重写为当前版本。
+	if _, err := db.MetricsDB.Exec(`UPDATE metrics_state SET value='0-stale' WHERE key=?`, threatRollupPredicateVersionKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureThreatRollup(24); err != nil {
+		t.Fatal(err)
+	}
+	if got := readKey(threatRollupPredicateVersionKey); got != threatRollupPredicateVersion {
+		t.Fatalf("漂移后 predicate version=%q, want 重固回写 %q", got, threatRollupPredicateVersion)
 	}
 }

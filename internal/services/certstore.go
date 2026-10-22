@@ -22,8 +22,50 @@ func SetCertDirForTest(dir string) func() {
 	return func() { certDir = old }
 }
 
-// 序列化证书对文件操作，避免并发写入、恢复或删除产生撕裂的 cert/key 组合。
-var certWriteMu sync.Mutex
+// certWriteMu 保护证书文件操作的层级互斥：读锁（RLock）覆盖按规则并行的
+// 写/删/快照/物化，写锁（Lock）只留给「跨规则快照回滚」（RestoreCertFiles
+// 全有全无，必须排斥一切并发文件操作）。全局互斥时代 /load 渲染 N 条
+// ACME 规则在同一锁内串行 N 组 fsync（机械盘合计数百 ms～秒级），跨规则
+// 部署/删除彼此阻塞，per-rule DeployLock 因此无实际收益。
+var certWriteMu sync.RWMutex
+
+// certRuleFileLocks 按 ruleID 串行化同一规则的 cert/key 文件操作
+// （内容比对→tmp→rename 序列不得与同规则并发写交错产生撕裂组合）。
+// 键空间=规则数，无需回收（与 certJobLogWriteLocks 同口径）。
+var certRuleFileLocks sync.Map
+
+// lockCertRuleFile 返回单规则的 per-rule 文件锁。调用方必须先持
+// certWriteMu.RLock（锁序：certWriteMu → per-rule，单向不逆）。
+func lockCertRuleFile(ruleID string) *sync.Mutex {
+	lock, _ := certRuleFileLocks.LoadOrStore(ruleID, &sync.Mutex{})
+	return lock.(*sync.Mutex)
+}
+
+// lockCertRuleFiles 按序取多条规则的 per-rule 锁（排序+去重防死锁/自锁），
+// 返回统一解锁函数。调用方必须先持 certWriteMu.RLock。
+func lockCertRuleFiles(ruleIDs []string) func() {
+	unique := make([]string, 0, len(ruleIDs))
+	seen := make(map[string]struct{}, len(ruleIDs))
+	for _, ruleID := range ruleIDs {
+		if _, ok := seen[ruleID]; ok {
+			continue
+		}
+		seen[ruleID] = struct{}{}
+		unique = append(unique, ruleID)
+	}
+	sort.Strings(unique)
+	locks := make([]*sync.Mutex, 0, len(unique))
+	for _, ruleID := range unique {
+		lock := lockCertRuleFile(ruleID)
+		lock.Lock()
+		locks = append(locks, lock)
+	}
+	return func() {
+		for i := len(locks) - 1; i >= 0; i-- {
+			locks[i].Unlock()
+		}
+	}
+}
 
 var certificateDeployLocks sync.Map
 var certificateDeployLocksMu sync.Mutex
@@ -103,8 +145,11 @@ func CertFilePaths(ruleID string) (certPath, keyPath string) {
 }
 
 func WriteCertFiles(ruleID, certPEM, keyPEM string) error {
-	certWriteMu.Lock()
-	defer certWriteMu.Unlock()
+	certWriteMu.RLock()
+	defer certWriteMu.RUnlock()
+	ruleLock := lockCertRuleFile(ruleID)
+	ruleLock.Lock()
+	defer ruleLock.Unlock()
 	if err := os.MkdirAll(certDir, 0755); err != nil {
 		return fmt.Errorf("创建证书目录: %w", err)
 	}
@@ -203,8 +248,11 @@ func removeTemporaryCertFile(path string) error {
 }
 
 func RemoveCertFiles(ruleID string) error {
-	certWriteMu.Lock()
-	defer certWriteMu.Unlock()
+	certWriteMu.RLock()
+	defer certWriteMu.RUnlock()
+	ruleLock := lockCertRuleFile(ruleID)
+	ruleLock.Lock()
+	defer ruleLock.Unlock()
 
 	certPath, keyPath := CertFilePaths(ruleID)
 	if certPath == "" {
@@ -221,8 +269,10 @@ func RemoveCertFiles(ruleID string) error {
 }
 
 func SnapshotCertFiles(ruleIDs []string) (CertFilesSnapshot, error) {
-	certWriteMu.Lock()
-	defer certWriteMu.Unlock()
+	certWriteMu.RLock()
+	defer certWriteMu.RUnlock()
+	unlock := lockCertRuleFiles(ruleIDs)
+	defer unlock()
 	return snapshotCertFilesLocked(ruleIDs)
 }
 
@@ -249,6 +299,8 @@ func snapshotCertFilesLocked(ruleIDs []string) (CertFilesSnapshot, error) {
 	return snapshot, nil
 }
 
+// RestoreCertFiles 恢复整份快照（任一失败→全部回滚）。跨规则回滚必须全局
+// 互斥：写锁排斥一切并发文件操作（其余路径均持 RLock + per-rule 锁）。
 func RestoreCertFiles(snapshot CertFilesSnapshot) error {
 	certWriteMu.Lock()
 	defer certWriteMu.Unlock()
@@ -299,8 +351,14 @@ func restoreCertFilesBestEffortLocked(snapshot CertFilesSnapshot) error {
 }
 
 func MaterializeCertPairs(materials []CertMaterial) (CertFilesSnapshot, error) {
-	certWriteMu.Lock()
-	defer certWriteMu.Unlock()
+	certWriteMu.RLock()
+	defer certWriteMu.RUnlock()
+	materialRuleIDs := make([]string, 0, len(materials))
+	for _, material := range materials {
+		materialRuleIDs = append(materialRuleIDs, material.RuleID)
+	}
+	unlock := lockCertRuleFiles(materialRuleIDs)
+	defer unlock()
 
 	lastMaterialByRule := make(map[string]int, len(materials))
 	for i, material := range materials {

@@ -94,10 +94,10 @@ func TestValidateCRSExcludedRulesPayload_matrix(t *testing.T) {
 		payload string
 		wantErr string
 	}{
-		// 旧格式：现状兼容，不加索引校验
+		// 旧格式：字符集/形状门 + checkIndices 时与新格式同一道索引存在性门
 		{"legacy ID", `["942100"]`, ""},
 		{"legacy filename", `["REQUEST-942-APPLICATION-ATTACK-SQLI.conf"]`, ""},
-		{"legacy stale ID passes (现状)", `["999888"]`, ""},
+		{"legacy stale ID rejected", `["999888"]`, "规则 ID 不存在于当前 CRS"},
 		{"legacy illegal form", `["942100L"]`, "必须是 CRS 规则 ID"},
 		// 新格式：合法形态
 		{"group in index", `[{"target":"42","scope":"all"}]`, ""},

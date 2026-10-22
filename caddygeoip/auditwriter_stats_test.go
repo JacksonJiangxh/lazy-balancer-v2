@@ -23,7 +23,7 @@ func TestAuditPipeline_writesWriterStatsSidecar(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p.reportDropped()
+	p.reportDropped("queue full")
 	p.reportIOError("write", errors.New("injected disk failure"))
 
 	statsPath := auditWriterStatsPath(target)

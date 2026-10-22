@@ -88,6 +88,15 @@ var (
 	// auditQueueSize 有界队列容量：2048 条 × 典型 2-8KB；part C/E 另由快照侧
 	// 64KiB 硬限。打满后入队有界等待，超时丢弃并计数告警。
 	auditQueueSize = 2048
+	// auditQueueByteBudget 队列驻留字节总预算：条数上限不界字节——单条快照
+	// 最坏 ≈256KiB（请求体/响应体/请求头/响应头各 64KiB 硬限）+messages，
+	// 2048 深度下大 body/大 header 洪峰可驻留 ~512MiB 撞容器内存上限。
+	// 按字节收敛后驻留有界；超预算立即丢弃（走既有 reportDropped 计数/
+	// 节流告警/健康位联动），请求路径不再为超预算快照付 2s 入队等待。
+	auditQueueByteBudget = int64(64 << 20)
+	// auditItemMaxBytes 单条快照字节硬上限（四个 64KiB 截断段 + messages/
+	// 元数据余量）：超限条目直接丢弃计数——异常巨型快照不得独占队列预算。
+	auditItemMaxBytes = int64(320 * 1024)
 	// auditFlushThreshold bufio 批量刷盘字节数阈值；auditFlushInterval 周期
 	// 兜底（低流量下 bufio 滞留行不超周期）。
 	auditFlushThreshold = 32 * 1024
@@ -1050,6 +1059,9 @@ type lbAuditItem struct {
 	snap      *auditSnapshot
 	formatter plugintypes.AuditLogFormatter
 	tid       string
+	// bytes 是快照驻留字节估算（enqueue 时计算一次，drain 消费后从队列
+	// 字节预算中扣减）。
+	bytes int64
 }
 
 // auditPipeline 是按目标路径共享的落盘管线（单 drain goroutine + 单 fd +
@@ -1071,6 +1083,9 @@ type auditPipeline struct {
 	bw   *bufio.Writer
 	// dropped 是入队超时丢弃的审计行累计计数（进程级管线全生命周期）。
 	dropped atomic.Uint64
+	// queueBytes 是队列驻留字节估算（enqueue 占额、drain 消费扣减、丢弃
+	// 回滚）——auditQueueByteBudget 的记账源。
+	queueBytes atomic.Int64
 	// ioErrors 是落盘/格式化错误累计计数（写盘/刷盘/重开/格式化/关闭）：
 	// 与 dropped 一起由 drain 低频写入侧车文件，供根服务健康位消费。
 	ioErrors atomic.Uint64
@@ -1240,11 +1255,70 @@ func (p *auditPipeline) openFile(mode os.FileMode) error {
 	return nil
 }
 
+// estimateAuditSnapshotBytes 估算快照驻留字节：只做 len() 求和（常数级
+// 开销，请求路径可付），是预算防线的保守上界而非精确计量。
+func estimateAuditSnapshotBytes(s *auditSnapshot) int64 {
+	if s == nil {
+		return 0
+	}
+	headerBytes := func(hs map[string][]string) int64 {
+		var n int64
+		for k, vs := range hs {
+			n += int64(len(k))
+			for _, v := range vs {
+				n += int64(len(v))
+			}
+		}
+		return n
+	}
+	n := int64(512) // 结构/固定字段包底
+	t := &s.Transaction_
+	n += int64(len(t.Timestamp_) + len(t.ID_) + len(t.ClientIP_) + len(t.HostIP_) +
+		len(t.ServerID_) + len(t.HighestSeverity_))
+	if r := t.Request_; r != nil {
+		n += int64(len(r.Method_) + len(r.Protocol_) + len(r.URI_) + len(r.HTTPVersion_) + len(r.Body_))
+		n += headerBytes(r.Headers_)
+	}
+	if q := t.Response_; q != nil {
+		n += int64(len(q.Protocol_) + len(q.Body_))
+		n += headerBytes(q.Headers_)
+	}
+	if pr := t.Producer_; pr != nil {
+		n += int64(len(pr.Connector_) + len(pr.Version_) + len(pr.Server_) + len(pr.RuleEngine_) + len(pr.Stopwatch_))
+		for _, rs := range pr.Rulesets_ {
+			n += int64(len(rs))
+		}
+	}
+	for _, m := range s.Messages_ {
+		if isNilInterface(m) {
+			continue
+		}
+		n += int64(len(m.Actionset())+len(m.Message())) + 256 // 规则数据段包底
+	}
+	return n
+}
+
 // enqueue 有界入队：空位直接入队；队列满时最多等待 auditEnqueueTimeout，
 // 超时丢弃该条、累计 dropped 并按分钟节流告警——请求路径不再被 drain 沉陷
 // 无限期拖住。queue 创建后只读且永不关闭（进程级单例，见
 // acquireAuditPipeline），因此发送无需锁、也不存在竞态。
+//
+// 字节预算（auditQueueByteBudget/auditItemMaxBytes）先于容量等待判定：
+// 占额成功才进入入队/等待，超预算或超单条上限立即丢弃——恒压下在途
+// 等待者同样持有快照，字节占额把「队列+等待中」的总驻留一并约束。
+// 占额先加后验（超预算回滚），并发瞬时过冲有界于同窗口入队者×单条上限。
 func (p *auditPipeline) enqueue(item lbAuditItem) error {
+	size := estimateAuditSnapshotBytes(item.snap)
+	if size > auditItemMaxBytes {
+		p.reportDropped("item exceeds per-item size cap")
+		return nil
+	}
+	item.bytes = size
+	if p.queueBytes.Add(size) > auditQueueByteBudget {
+		p.queueBytes.Add(-size)
+		p.reportDropped("byte budget exceeded")
+		return nil
+	}
 	select {
 	case p.queue <- item:
 		return nil
@@ -1256,14 +1330,16 @@ func (p *auditPipeline) enqueue(item lbAuditItem) error {
 	case p.queue <- item:
 		return nil
 	case <-timer.C:
-		p.reportDropped()
+		p.queueBytes.Add(-size)
+		p.reportDropped("queue full")
 		return nil
 	}
 }
 
 // reportDropped 累计丢弃计数并节流告警（首次立即记录，其后每分钟至多一条，
-// 携带被抑制计数与累计总数）——丢弃必须是可观测事件。
-func (p *auditPipeline) reportDropped() {
+// 携带被抑制计数与累计总数）——丢弃必须是可观测事件。reason 标明丢弃根因
+// （queue full / byte budget exceeded / per-item cap），排障不必猜路径。
+func (p *auditPipeline) reportDropped(reason string) {
 	total := p.dropped.Add(1)
 	p.statsDirty.Store(true)
 	p.dropLogMu.Lock()
@@ -1277,7 +1353,7 @@ func (p *auditPipeline) reportDropped() {
 	}
 	p.dropLogMu.Unlock()
 	if logNow {
-		auditDropLogf("audit writer: queue full for %s, dropped audit line (total dropped %d, suppressed %d since last report)", p.target, total, suppressed)
+		auditDropLogf("audit writer: %s for %s, dropped audit line (total dropped %d, suppressed %d since last report)", reason, p.target, total, suppressed)
 	}
 }
 
@@ -1297,6 +1373,7 @@ func (p *auditPipeline) drain() {
 				p.closeFile()
 				return
 			}
+			p.queueBytes.Add(-item.bytes)
 			p.processSafely(item)
 		case <-ticker.C:
 			p.flushPendingSafely()

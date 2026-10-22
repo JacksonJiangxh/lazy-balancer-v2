@@ -213,10 +213,15 @@ func RemoveCertJobLogFiles(ruleID string) error {
 	lockCertJobLog(ruleID).Lock()
 	defer lockCertJobLog(ruleID).Unlock()
 	path := CertJobLogPath(ruleID)
-	candidates := make([]string, 0, maxRotatedFiles+2)
+	// 仓内轮转只做 rename（rotateTaskLogFile 不压缩），但 logstats 读侧承认
+	// 外部 logrotate 留下的整文件 gzip 归档形态（<base>.gz）；删除规则时
+	// 连历史压缩代（.N.gz）一并清理，否则残留孤儿文件只能靠保留期兜底。
+	candidates := make([]string, 0, 2*maxRotatedFiles+2)
 	candidates = append(candidates, path, path+".gz")
 	for index := 1; index <= maxRotatedFiles; index++ {
-		candidates = append(candidates, fmt.Sprintf("%s.%d", path, index))
+		candidates = append(candidates,
+			fmt.Sprintf("%s.%d", path, index),
+			fmt.Sprintf("%s.%d.gz", path, index))
 	}
 	var cleanupErrors []error
 	for _, candidate := range candidates {

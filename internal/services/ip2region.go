@@ -65,7 +65,34 @@ func InitIP2Region() {
 	searcher, err := openIP2RegionSearcher(ip2regionLivePath)
 	if err != nil {
 		Logf("error", "ip2region: failed to load %s: %v", ip2regionLivePath, err)
-		return
+		// live 存在但不可装载（掉电半写/带外损坏）：旧行为直接放弃——
+		// 面板归属地全空、渲染侧 size>0 仍照常发射 geoip 策略而 Caddy 侧
+		// Provision 失败 pass-through，地域拦截静默失效且无自愈通道。
+		// 回退镜像内置库（仅在装载失败时，不做任何版本优劣判断），
+		// 版本行/sidecar 写保守标识 bundled 并记审计——回退必须可见，
+		// 否则等于静默降级为旧库。
+		if _, distErr := os.Stat(ip2regionDistPath); distErr == nil {
+			if cErr := copyFile(ip2regionDistPath, ip2regionLivePath); cErr != nil {
+				Logf("error", "ip2region: 损坏 live 库的 dist 回退拷贝失败: %v", cErr)
+			} else if fallback, oErr := openIP2RegionSearcher(ip2regionLivePath); oErr != nil {
+				Logf("error", "ip2region: dist 回退库装载失败: %v", oErr)
+			} else {
+				searcher = fallback
+				Logf("warn", "ip2region: 损坏的 live 库已回退为镜像内置库（标记 bundled，待下次成功更新自愈）")
+				RecordAuditLog("system", "更新", "IP数据库", "启动检测到 IP 数据库文件损坏不可装载，已回退镜像内置库（待下次成功更新恢复）", "")
+				if db.DB != nil {
+					if _, uErr := db.DB.Exec("UPDATE security_ip2region_version SET version='bundled', updated_at=datetime('now') WHERE id=1"); uErr != nil {
+						Logf("error", "ip2region: 写入 dist 回退标识失败: %v", uErr)
+					}
+					if rErr := rewriteVersionIfMissingOrStale(ip2regionLivePath+".version", "bundled"); rErr != nil {
+						Logf("error", "ip2region: 写入 dist 回退 sidecar 失败: %v", rErr)
+					}
+				}
+			}
+		}
+		if searcher == nil {
+			return
+		}
 	}
 	ip2regionMu.Lock()
 	swapIP2RegionSearcher(searcher)
@@ -245,9 +272,54 @@ func GetCachedProvinces() []string {
 	return provinces
 }
 
+// xdb v4 文件布局（绑定库 xdb/header.go 锚定 structure 2.0/3.0 的 v4 形态）：
+// 256B 头 + 256*256*8B 向量索引 + 数据区 + 段索引区（每段 14B），头内
+// [8:12]/[12:16] 为段索引区首/末段起点指针。BufferCache 打开路径对内容
+// 缓冲区做无边界切片（向量索引/段索引/region 读取），头部完好的截断文件
+// 能通过装载却在首次搜索时进程级 panic——打开前必须先过结构自检门。
+const (
+	ip2RegionXDBHeaderSize      = 256
+	ip2RegionXDBVectorIndexSize = 256 * 256 * 8
+	ip2RegionXDBSegmentSize     = 14
+)
+
+// checkIP2RegionXDBStructure 结构自检门：最小尺寸（头+完整向量索引+至少
+// 一段）+ 头内段索引指针边界（段索引区恒在向量索引之后、末段终点不越出
+// 文件）。不满足即按「不可装载」显式报错，绝不交给绑定库的无边界切片。
+func checkIP2RegionXDBStructure(path string) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat xdb: %w", err)
+	}
+	const minSize = int64(ip2RegionXDBHeaderSize + ip2RegionXDBVectorIndexSize + ip2RegionXDBSegmentSize)
+	if fi.Size() < minSize {
+		return fmt.Errorf("xdb 文件大小 %d 小于最小结构尺寸 %d（截断/残缺）", fi.Size(), minSize)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open xdb: %w", err)
+	}
+	defer f.Close()
+	header := make([]byte, 20)
+	if _, err := f.ReadAt(header, 0); err != nil {
+		return fmt.Errorf("read xdb header: %w", err)
+	}
+	startPtr := binary.LittleEndian.Uint32(header[8:12])
+	endPtr := binary.LittleEndian.Uint32(header[12:16])
+	const segmentRegionMin = uint64(ip2RegionXDBHeaderSize + ip2RegionXDBVectorIndexSize)
+	if uint64(startPtr) < segmentRegionMin || endPtr < startPtr ||
+		uint64(endPtr)+ip2RegionXDBSegmentSize > uint64(fi.Size()) {
+		return fmt.Errorf("xdb 头段索引指针越界（start=%d end=%d size=%d，截断/损坏）", startPtr, endPtr, fi.Size())
+	}
+	return nil
+}
+
 // openIP2RegionSearcher opens the xdb at path with the whole file buffered
 // in memory for concurrent read safety.
 func openIP2RegionSearcher(path string) (*ip2regionService.Ip2Region, error) {
+	if err := checkIP2RegionXDBStructure(path); err != nil {
+		return nil, err
+	}
 	config, err := ip2regionService.NewV4Config(ip2regionService.BufferCache, path, 1)
 	if err != nil {
 		return nil, err

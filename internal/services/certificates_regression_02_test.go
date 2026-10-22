@@ -26,7 +26,9 @@ func TestSweepOrphanedCertJobs_disables_unreferenced_non_terminal_jobs(t *testin
 	}
 
 	// When
-	sweepOrphanedCertJobs(context.Background())
+	if _, err := sweepOrphanedCertJobs(context.Background()); err != nil {
+		t.Fatalf("sweep orphaned cert jobs: %v", err)
+	}
 
 	// Then
 	var okCount, migratedCount int
@@ -71,7 +73,9 @@ func TestSweepOrphanedCertJobs_disables_jobs_of_disabled_rules(t *testing.T) {
 	}
 
 	// When
-	sweepOrphanedCertJobs(context.Background())
+	if _, err := sweepOrphanedCertJobs(context.Background()); err != nil {
+		t.Fatalf("sweep orphaned cert jobs: %v", err)
+	}
 
 	// Then
 	var status string

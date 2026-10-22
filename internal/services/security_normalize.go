@@ -11,9 +11,14 @@ import (
 // 默认值：空串行在发射端零产出规则而 UI 宣称控制已启用，且
 // Update 对空串 400 拒绝导致无法手动修复，集群快照又原样镜像到从节点。
 var legacySecurityEnumBackfills = []string{
-	"UPDATE security_policies SET ip_acl_mode='deny' WHERE COALESCE(TRIM(ip_acl_mode),'')=''",
-	"UPDATE security_policies SET mode='off' WHERE COALESCE(TRIM(mode),'')=''",
-	"UPDATE security_policies SET geoip_mode='deny' WHERE COALESCE(TRIM(geoip_mode),'')=''",
+	// 口径从「空串」扩为「枚举外全集」（对齐 block_status_code 的既有做法）：
+	// 非空非法枚举（带外直写/跨版本快照，如 mode='BLOCKING'、ip_acl_mode=
+	// 'DENY'）在渲染端同样零产出规则/落入错误分支而 UI 宣称启用，与空串
+	// 同型；Update 400 拒修、集群快照原样镜像，启动归一是唯一自愈路径。
+	// 归一目标值沿用空串先例（deny/off/deny=Create 侧默认值族）。
+	"UPDATE security_policies SET ip_acl_mode='deny' WHERE COALESCE(TRIM(ip_acl_mode),'') NOT IN ('allow','deny','绕过')",
+	"UPDATE security_policies SET mode='off' WHERE COALESCE(TRIM(mode),'') NOT IN ('off','custom_only','detection','blocking')",
+	"UPDATE security_policies SET geoip_mode='deny' WHERE COALESCE(TRIM(geoip_mode),'') NOT IN ('off','allow','deny')",
 	// 之前落库的 threshold=0 行——UI 显示 0、发射端 >0 判断
 	// 跳过阈值 SecAction 而 CRS 回落默认 5（「UI 宣称 0、实际 5」的展示/行为
 	// 漂移，与空串枚举行同型）。归一到 Create 侧 max1(x,5) 的默认值 5。

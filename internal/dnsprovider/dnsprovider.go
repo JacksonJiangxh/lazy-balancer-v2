@@ -27,3 +27,22 @@ func CleanUpChallenge(ctx context.Context, provider Provider, zone, tokenFQDN, v
 	}
 	return provider.CleanUp(ctx, zone, tokenFQDN)
 }
+
+// CleanupCounter 是可选能力：报告一次按值清理将选中的记录条数。计数必须
+// 纯本地（ownership 账本/内存表），不得引入网络往返——调用方在 deferred
+// 清理开始前排定预算。读取失败按至少 1 条计（预算宁大勿小）。
+type CleanupCounter interface {
+	CountCleanupRecords(zone, tokenFQDN, value string) int
+}
+
+// CountChallengeCleanupRecords 返回一个挑战的按值清理将尝试删除的记录条数
+// （本挑战自建记录 + 同名 legacy/stale 回收条目）。provider 无计数能力时按
+// 1 条计（本挑战自建记录恒在）。
+func CountChallengeCleanupRecords(provider Provider, zone, tokenFQDN, value string) int {
+	if counter, ok := provider.(CleanupCounter); ok {
+		if n := counter.CountCleanupRecords(zone, tokenFQDN, value); n > 0 {
+			return n
+		}
+	}
+	return 1
+}

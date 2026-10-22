@@ -3,6 +3,7 @@ package acme
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -270,5 +271,66 @@ func TestIssuer_waitForDNS_emptyResolverListReturnsError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "递归解析器") {
 		t.Fatalf("error=%v, want 缺少递归解析器清单的显式错误", err)
+	}
+}
+
+// 权威一轮全失败（RTT 抖动/限流）后清单不得永久变空——按上限重发现
+// 权威 NS，次轮探测新清单命中即放行（快路径自愈；递归共识判据不变）。
+func TestIssuer_waitForDNS_rediscoversAuthoritativeAfterTotalProbeFailure(t *testing.T) {
+	const expected = "rediscovery-value"
+	const fqdn = "_acme-challenge.rediscover.example.com."
+	authGood := startFakeDNSServer(t, txtResponder(true, expected))
+	recMiss := startFakeDNSServer(t, txtResponder(false, expected))
+	logger := setupPropagationSeams(t, []string{"127.0.0.1:1"})
+	var mu sync.Mutex
+	resolveCalls := 0
+	resolveAuthoritativeNSFn = func(ctx context.Context, name, bootstrap string) []string {
+		mu.Lock()
+		defer mu.Unlock()
+		resolveCalls++
+		if resolveCalls == 1 {
+			return []string{"127.0.0.1:1"} // 首轮全失败（无监听）
+		}
+		return []string{authGood}
+	}
+	propagationRecursiveResolvers = []string{recMiss}
+
+	issuer := &Issuer{Logger: logger}
+	if err := issuer.waitForDNS(context.Background(), fqdn, expected, 3*time.Second); err != nil {
+		t.Fatalf("权威全瞬时失败后重发现恢复必须放行: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if resolveCalls < 2 {
+		t.Fatalf("resolve calls=%d, want ≥2（全失败后重新发现权威清单）", resolveCalls)
+	}
+}
+
+// 重发现次数有上限：重发现清单持续失败时不得无限重试（对 DNS 加压），
+// 烧满传播预算后如实报超时。
+func TestIssuer_waitForDNS_rediscoveryCapped(t *testing.T) {
+	const expected = "rediscovery-cap-value"
+	const fqdn = "_acme-challenge.rediscovercap.example.com."
+	recMiss := startFakeDNSServer(t, txtResponder(false, expected))
+	logger := setupPropagationSeams(t, []string{"127.0.0.1:1"})
+	var mu sync.Mutex
+	resolveCalls := 0
+	resolveAuthoritativeNSFn = func(ctx context.Context, name, bootstrap string) []string {
+		mu.Lock()
+		defer mu.Unlock()
+		resolveCalls++
+		return []string{"127.0.0.1:1"}
+	}
+	propagationRecursiveResolvers = []string{recMiss}
+
+	issuer := &Issuer{Logger: logger}
+	err := issuer.waitForDNS(context.Background(), fqdn, expected, 500*time.Millisecond)
+	if err == nil {
+		t.Fatal("重发现清单持续失败时必须报传播超时")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if resolveCalls != 1+maxAuthRediscoveries {
+		t.Fatalf("resolve calls=%d, want %d（首次发现 + %d 次重发现上限）", resolveCalls, 1+maxAuthRediscoveries, maxAuthRediscoveries)
 	}
 }

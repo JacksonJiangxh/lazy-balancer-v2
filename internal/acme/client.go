@@ -518,13 +518,19 @@ func EncodeCertPEM(derChain [][]byte) string {
 }
 
 // EncodeKeyPEM converts a private key to PEM string.
-func EncodeKeyPEM(key crypto.Signer) string {
+// 未知密钥类型必须 fail-loud——静默返回空串会把「keyPEM=""」交给部署层，
+// 落成一条无私钥的规则（生产密钥恒来自 CreateCSR 的 RSA-2048，ecdsa 分支
+// 是防御性覆盖）。
+func EncodeKeyPEM(key crypto.Signer) (string, error) {
 	switch k := key.(type) {
 	case *rsa.PrivateKey:
-		return string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(k)}))
+		return string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(k)})), nil
 	case *ecdsa.PrivateKey:
-		der, _ := x509.MarshalECPrivateKey(k)
-		return string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der}))
+		der, err := x509.MarshalECPrivateKey(k)
+		if err != nil {
+			return "", fmt.Errorf("marshal EC private key: %w", err)
+		}
+		return string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der})), nil
 	}
-	return ""
+	return "", fmt.Errorf("unsupported private key type %T", key)
 }

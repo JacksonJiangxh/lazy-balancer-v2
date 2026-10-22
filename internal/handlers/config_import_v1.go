@@ -752,8 +752,9 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 		}
 		// 与 ImportConfigBackup 同序——任务不变量在冲突置禁用之后
 		// 执行，预览结果与实际导入一致（冲突可自愈备份不得在预览误报不可导入）。
-		if err := validateV2BackupCertJobs(backup.Tables); err != nil {
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
+		certJobProviderWarnings, certJobsErr := validateV2BackupCertJobs(backup.Tables)
+		if certJobsErr != nil {
+			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: certJobsErr.Error()}})
 			return
 		}
 		// 与 ImportConfigBackup 同序——坏 admin_tls_* 形态预览即报
@@ -802,6 +803,8 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 		if acmeDanglingImported > 0 {
 			validateWarnings = append(validateWarnings, fmt.Sprintf("导入后 %d 条启用规则的 DNS 提供商配置悬挂（引用未随备份导入，且现有配置中不存在或已禁用）——下一次签发/续签将失败，请及时补齐", acmeDanglingImported))
 		}
+		// 证书任务级 CA 提供商悬挂/禁用引用的归一警告（与导入同通道）。
+		validateWarnings = append(validateWarnings, certJobProviderWarnings...)
 		hasWaf := false
 		if payload := lbbakPayloadFromCtx(c); payload != nil {
 			// 威胁库名单条目也是规则库数据文件
@@ -965,6 +968,8 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 		return
 	}
 	defer session.close()
+	// v1 全量导入替换规则面：允许导入后清理消失规则产物。
+	session.replaceRuleArtifacts = true
 	tx := session.tx
 	restoreImportNodeRole, err := suppressImportClusterVersionBumps(ctx, tx)
 	if err != nil {

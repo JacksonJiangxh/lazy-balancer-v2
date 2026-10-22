@@ -1543,13 +1543,18 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 // 证书签发任务未运行（队列 paused/inactive）→ 409 点名可操作原因，与手工
 // 签发端点同口径；规则当前态守卫拒绝（服务层
 // ErrCertRuleStateConflict——并发禁用/改域/删除，services/certificates.go
-// 明确要求 handler 409、不得折成 500）同样映射 409；其余内部失败维持 500。
+// 明确要求 handler 409、不得折成 500）同样映射 409；规则屏障期
+// （ErrCertRuleBusy——删除/禁用/更新的取消窗口内并发入队）是瞬时冲突，
+// 同样 409 可重试；其余内部失败维持 500。
 func certEnqueueErrorResponse(prefix string, err error) (int, string) {
 	if errors.Is(err, services.ErrCertificateQueueInactive) {
 		return http.StatusConflict, prefix + "：证书签发任务已停止，请先在任务监控中恢复后再试（" + err.Error() + "）"
 	}
 	if errors.Is(err, services.ErrCertRuleStateConflict) {
 		return http.StatusConflict, prefix + "：规则状态已变更，请刷新后重试（" + err.Error() + "）"
+	}
+	if errors.Is(err, services.ErrCertRuleBusy) {
+		return http.StatusConflict, prefix + "：" + err.Error()
 	}
 	return http.StatusInternalServerError, prefix + ": " + err.Error()
 }
@@ -2503,12 +2508,6 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "证书申请中，请等待完成或失败后再修改规则"})
 		return
 	}
-	// 此处曾有 protocolChanged&&tcp 的二次
-	// `DELETE FROM cert_jobs WHERE rule_id=?`——恒 0 行 协议切到 tcp 时
-	// req.EnableTLS 已置 false，上方 orphanACME（!EnableTLS||TLSSource!="acme_dns"）
-	// 的删除已先行命中同一 rule_id（cert_jobs 按 rule_id 唯一），且 409 早退
-	// 保证无在途非终态行。文件清理段（下方 RemoveCertFiles）保留。
-
 	// HTTP→TCP 协议切换同事务解除安全策略绑定——TCP 渲染链
 	// （buildTCPProxyRoute）不加载策略，绑定残留会在策略页 rule_count/绑定视图
 	// 中显示为生效而运行态零防护；绑定写接口又拒绝 TCP，用户无法在面板内自救。
@@ -4048,6 +4047,8 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 				failCertEnqueue("续签排队失败", err)
 				return
 			}
+			// 与禁用侧同通道留痕（对照 [WARN] cancelled）：入队成功后才写。
+			services.WriteCertJobLogByRule(caddyID, "INFO", "renew", "规则已启用，证书即将过期，已重新排队续签")
 			recordAudit(c, "续签", "证书任务", fmt.Sprintf("启用规则 %s，证书即将过期，重新排队续签", caddyID))
 		case EnableCertJobRetry:
 			if queueManager == nil {
@@ -4059,8 +4060,12 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 				failCertEnqueue("重试排队失败", err)
 				return
 			}
+			// 与禁用侧同通道留痕：失败/暂停任务经启用重新排队。
+			services.WriteCertJobLogByRule(caddyID, "INFO", "retry", "规则已启用，证书任务已重新排队")
 			recordAudit(c, "重试", "证书任务", fmt.Sprintf("启用规则 %s，任务之前已暂停/失败，重新排队", caddyID))
 		default:
+			// 在途跳过同样留痕——启用动作发生但任务已在签发中（无需操作）。
+			services.WriteCertJobLogByRule(caddyID, "INFO", "in_flight", fmt.Sprintf("规则已启用，签发任务已在进行中（状态: %s）", jobStatus))
 			recordAudit(c, "启用", "证书任务", fmt.Sprintf("启用规则 %s，签发任务已在进行中 (状态: %s)", caddyID, jobStatus))
 		}
 	}
@@ -4223,18 +4228,31 @@ func ruleMutationFingerprint(ctx context.Context, caddyID string) (string, error
 // 指纹读取失败时不判定（返回 false，维持既有恢复链语义）。
 // 返回 true 表示已写出错误响应，调用方必须立即 return。
 func abortIfRuleConcurrentlyModified(c *gin.Context, caddyID, baseline string) bool {
+	return abortIfRuleConcurrentlyModifiedAs(c, caddyID, baseline, "更新")
+}
+
+// abortIfRuleConcurrentlyModifiedAs 与 abortIfRuleConcurrentlyModified 同实现，
+// opName 区分调用入口的审计/日志动作词（UpdateRule=更新 / DisableRule=禁用）。
+func abortIfRuleConcurrentlyModifiedAs(c *gin.Context, caddyID, baseline, opName string) bool {
 	current, err := ruleMutationFingerprint(c.Request.Context(), caddyID)
 	if err != nil {
-		services.Logf("error", "UpdateRule: 复核规则并发修改失败 for caddy_id=%s: %v", caddyID, err)
+		services.Logf("error", "%s: 复核规则并发修改失败 for caddy_id=%s: %v", opName, caddyID, err)
 		return false
 	}
 	if current == baseline {
 		return false
 	}
-	services.Logf("warn", "UpdateRule: 规则 %s 已在放锁窗口内被并发修改，中止后续迁移/补偿（不回退他人已提交内容）", caddyID)
-	recordAudit(c, "更新失败", "负载规则", services.FormatAuditDetail(
-		services.AuditRulePart(caddyID), "放锁窗口内检测到并发修改，已中止后续迁移/补偿（不回退他人已提交内容）", services.AuditResultPart("failure")))
-	c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "规则已被并发修改，本次更新已中止，请刷新后重试"})
+	services.Logf("warn", "%s: 规则 %s 已在放锁窗口内被并发修改，中止后续迁移/补偿（不回退他人已提交内容）", opName, caddyID)
+	detail := services.FormatAuditDetail(
+		services.AuditRulePart(caddyID), "放锁窗口内检测到并发修改，已中止后续迁移/补偿（不回退他人已提交内容）", services.AuditResultPart("failure"))
+	// 审计词条必须为字面量（词汇门禁校验），按入口分支各写一次。
+	switch opName {
+	case "禁用":
+		recordAudit(c, "禁用失败", "负载规则", detail)
+	default:
+		recordAudit(c, "更新失败", "负载规则", detail)
+	}
+	c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "规则已被并发修改，本次操作已中止，请刷新后重试"})
 	return true
 }
 
@@ -4318,6 +4336,16 @@ func (h *Handlers) DisableRule(c *gin.Context) {
 		return
 	}
 	committed = true
+	// 并发修改复核基线=本请求提交后的规则形态指纹（与 UpdateRule 同口径）——
+	// 下方放锁取消窗口内并发 EnableRule/UpdateRule 可完整提交，窗口后必须
+	// 复核，否则「禁用成功」审计与最终状态可能不一致（启用侧重新入队的
+	// 任务已被本请求取消）。指纹读取失败时按既有语义跳过复核（不判定）。
+	var disableFingerprintBaseline string
+	if baseline, fpErr := ruleMutationFingerprint(c.Request.Context(), caddyID); fpErr != nil {
+		services.Logf("error", "DisableRule: 计算并发修改复核基线失败 for caddy_id=%s: %v", caddyID, fpErr)
+	} else {
+		disableFingerprintBaseline = baseline
+	}
 	if disabledJobs > 0 {
 		services.WriteCertJobLogByRule(caddyID, "WARN", "cancelled", "规则已禁用，证书任务已暂停")
 		recordAudit(c, "禁用", "证书任务", fmt.Sprintf("规则 %s 已禁用，%d 个证书任务状态设为已禁用", caddyID, disabledJobs))
@@ -4343,6 +4371,12 @@ func (h *Handlers) DisableRule(c *gin.Context) {
 		// 清理）——此时不得再写「禁用」成功审计（会留下指向已不存在规则的
 		// 成功留痕），按冲突中止；与 UpdateRule 同用 abortIfRuleDeleted。
 		if abortIfRuleDeleted(c, caddyID) {
+			return
+		}
+		// 并发修改复核：窗口内并发 EnableRule/UpdateRule 完整提交（指纹偏离
+		// 基线）时按冲突中止——本请求写入的「禁用」已被他人覆盖，成功审计
+		// 会与最终状态矛盾。
+		if disableFingerprintBaseline != "" && abortIfRuleConcurrentlyModifiedAs(c, caddyID, disableFingerprintBaseline, "禁用") {
 			return
 		}
 	}

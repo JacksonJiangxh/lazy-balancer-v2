@@ -237,7 +237,7 @@ func TestTransport_does_not_retry_client_errors(t *testing.T) {
 }
 
 func TestTransport_caps_wait_at_max_backoff(t *testing.T) {
-	// Given: 429 with a huge; MaxBackoff clamps the wait
+	// Given: 429 with a huge Retry-After; MaxBackoff clamps the wait
 	base := &countingTransport{statuses: []int{http.StatusTooManyRequests}}
 	transport := &Transport{Base: &retryAfterTransport{next: base}, InitialBackoff: time.Millisecond, MaxBackoff: 5 * time.Millisecond}
 

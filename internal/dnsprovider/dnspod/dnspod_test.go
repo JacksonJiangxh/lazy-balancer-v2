@@ -620,7 +620,8 @@ func TestNew_client_timeout_covers_retry_envelope(t *testing.T) {
 }
 
 // removeFailTransport fails Record.Remove for one specific record ID while
-// every other removal succeeds.
+// every other removal succeeds. 失败形态用 code 7（官方码表=没有权限）——
+// 权限错误是普通失败，不得触发「域名失效」自愈（缓存作废+重解析+重试）。
 type removeFailTransport struct {
 	dnsPodRecordTransport
 	failRecordID string
@@ -698,8 +699,9 @@ func TestProvider_CleanUp_removes_ownership_of_independently_deleted_records(t *
 }
 
 // staleRemoveTransport 模拟 cleanUp 阶段的陈旧 zone→domain_id
-// Domain.List 恒返回 currentID；Record.Remove 对 staleID 报「域名不存在」
-// （code 7），对 currentID 默认删除成功（failFreshID 时改报非域名类错误）。
+// Domain.List 恒返回 currentID；Record.Remove 对 staleID 报「域名 ID 失效」
+// （code 6，官方码表 Record.Remove 的 Invalid domain id），对 currentID 默认
+// 删除成功（failFreshID 时改报权限错误 code 11——权限码不得参与陈旧分类）。
 // 记录每次 Remove 的 {domain_id, record_id} 与 Domain.List 调用数。
 type staleRemoveTransport struct {
 	mu          sync.Mutex
@@ -740,7 +742,7 @@ func (transport *staleRemoveTransport) RoundTrip(request *http.Request) (*http.R
 		transport.removes = append(transport.removes, removal)
 		switch {
 		case removal[0] == transport.staleID:
-			responseBody = `{"status":{"code":"7","message":"域名不存在"}}`
+			responseBody = `{"status":{"code":"6","message":"域名ID错误"}}`
 		case transport.failFreshID:
 			responseBody = `{"status":{"code":"11","message":"没有权限"}}`
 		default:

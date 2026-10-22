@@ -43,11 +43,7 @@ type issuedCertificate struct {
 	deploymentAttempt int
 }
 
-var deploymentLifecycleJobStatuses = []string{"downloaded", "cleanup_dns", "cleanup_warning"}
-
-// deploymentLifecycleJobStatusSQL 供 SQL IN (...) 复用，避免状态集新增时
-// 多处字面量分叉。
-const deploymentLifecycleJobStatusSQL = "'downloaded','cleanup_dns','cleanup_warning'"
+var _ = deploymentLifecycleJobStatuses // 声明已单源上移至 jobstate.go（由 jobLifecycleByStatus 派生）
 
 type certificateDeploymentError struct {
 	err error
@@ -345,16 +341,26 @@ func certificateDeploymentBackoff(attempt int) time.Duration {
 }
 
 // jobLogger writes issuance progress to cert job log files and updates cert_jobs.status.
+// from 是进度迁移的允许源态集合：主签发路径为 nonTerminalJobStatuses——
+// 「终态不可逆」不能只靠队列在途+部署 CAS 运行时保证，进度写点必须有静态防线
+// （并发部署回调先把行提交为 issued 时，进度日志不得把它拉回 in-flight）。
+// 快速重部署路径（redeployDownloadedInLock）需要 issued→downloaded，构造时
+// 显式换 {issued,downloaded} 白名单。
 type jobLogger struct {
 	jobID  int
 	ruleID string
 	file   *CertJobFileLogger
+	from   []string
 }
 
 func (l *jobLogger) Log(stage, message string) {
 	l.file.Log(stage, message)
 	message = truncateJobMessage(message)
-	if err := transitionJob(db.DB, l.jobID, jobStatusesExceptDisabled, stage, map[string]any{"message": message}); err != nil {
+	from := l.from
+	if len(from) == 0 {
+		from = nonTerminalJobStatuses
+	}
+	if err := transitionJob(db.DB, l.jobID, from, stage, map[string]any{"message": message}); err != nil {
 		Logf("error", "cert job %d status update failed: %v", l.jobID, err)
 	}
 }
@@ -447,7 +453,8 @@ func (s *CertIssuer) Issue(ctx context.Context, jobID int, ruleID, domains strin
 	logger.Log("creating_account", "CA 提供商测试通过")
 
 	// Reset the existing job row (queue manager already created/reused it).
-	if err := transitionJob(db.DB, jobID, jobStatusesExceptDisabled, "creating_account", map[string]any{"message": "开始申请证书"}); err != nil {
+	// from 集合不含终态——终态不可逆由写点静态保证，不只靠队列在途+CAS 运行时序。
+	if err := transitionJob(db.DB, jobID, nonTerminalJobStatuses, "creating_account", map[string]any{"message": "开始申请证书"}); err != nil {
 		return fmt.Errorf("update cert job status: %w", err)
 	}
 
@@ -584,6 +591,10 @@ func (s *CertIssuer) redeployDownloadedInLock(ctx context.Context, jobID int, ma
 		RecordAuditLog("system", "签发成功", "证书任务", fmt.Sprintf("规则 %s 证书已部署，无需重新部署", ruleID), "")
 		return nil
 	}
+	// 快速路径的进度迁移确实需要 issued→downloaded（任务已签发、材料在库），
+	// 显式白名单替代全局含终态的 from 集合——主签发路径（Issue）保持
+	// nonTerminalJobStatuses 静态防线。
+	logger.from = []string{"issued", "downloaded"}
 	logger.Log("downloaded", "检测到已签发的有效证书，直接重新部署文件")
 	snapshot, snapshotErr := SnapshotCertFiles([]string{ruleID})
 	if snapshotErr != nil {

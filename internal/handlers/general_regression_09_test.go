@@ -109,7 +109,7 @@ func TestValidateV2BackupCertJobs_rejects_uncanonicalizable_domains(t *testing.T
 				"certificate_configs": {{"id": 7, "name": "dns", "enabled": 1}},
 				"cert_jobs":           {{"rule_id": "lb_bak_acme", "domain": tt.jobDomain, "status": "queued"}},
 			}
-			err := validateV2BackupCertJobs(tables)
+			_, err := validateV2BackupCertJobs(tables)
 			if err == nil {
 				t.Fatalf("validateV2BackupCertJobs 放行了不可规范化域名（rule=%q job=%q）", tt.ruleDomain, tt.jobDomain)
 			}
@@ -175,7 +175,7 @@ func TestValidateV2Backup_accepts_legal_root_www_acme_shape(t *testing.T) {
 	if err := validateV2BackupTLSShape(tables); err != nil {
 		t.Fatalf("validateV2BackupTLSShape unexpected error: %v", err)
 	}
-	if err := validateV2BackupCertJobs(tables); err != nil {
+	if _, err := validateV2BackupCertJobs(tables); err != nil {
 		t.Fatalf("validateV2BackupCertJobs unexpected error: %v", err)
 	}
 }

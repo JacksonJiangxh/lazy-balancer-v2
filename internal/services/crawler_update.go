@@ -187,24 +187,14 @@ func crawlerPrefixCoverageSufficient(off netip.Prefix, retained []netip.Prefix) 
 	return covered.Lsh(covered, 3).Cmp(total) >= 0
 }
 
-// crawlerSnapshotBaseline 当前快照条数与「有可对照口径」标志：DB 行优先
-// （运行期唯一真相），无行回退内置首版（首轮更新也受门），两者皆无 → known=false
-// （无可对照口径，条数门放行）。基线读取失败按失败处理（保留上次快照，方向安全）。
+// crawlerSnapshotBaseline 单次现读包装（测试/独立调用方直调路径）：当前
+// 快照条数与「有可对照口径」标志——DB 行优先（运行期唯一真相），无行回退
+// 内置首版（首轮更新也受门），两者皆无 → known=false（无可对照口径，条数门
+// 放行）；基线读取失败按失败处理（保留上次快照，方向安全）。策略口径单源
+// 在 crawlerBaselineSet.baseline，本函数只是「现读一份基线集再取」。
 func crawlerSnapshotBaseline(engineID string) (count int, known bool, err error) {
-	if entries, ok := crawlerBuiltinSnapshot[engineID]; ok {
-		count, known = len(entries), true
-	}
-	if db.DB == nil {
-		return count, known, nil
-	}
-	all, err := loadCrawlerIPListsFromDB()
-	if err != nil {
-		return 0, false, err
-	}
-	if current, ok := all[engineID]; ok {
-		return len(current), true, nil
-	}
-	return count, known, nil
+	set := loadCrawlerBaselineSet()
+	return set.baseline(engineID)
 }
 
 // crawlerSnapshotShrinkGuard 条数收缩门：新名单条数较当前快照

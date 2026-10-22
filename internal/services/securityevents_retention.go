@@ -2,7 +2,9 @@ package services
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"sync"
 	"time"
 
 	"lazy-balancer-v2/internal/db"
@@ -262,11 +264,54 @@ func securityEventsRetentionCleanup(ctx context.Context) (int, error) {
 	if highwaterDeleted > 0 {
 		Logf("info", "security events retention: rollup highwater cleanup removed %d keys older than %s", highwaterDeleted, rollupCutoff)
 	}
-	// v2.3.8：本轮有删除时截断 WAL（含仅 rollup 清理；100/s 持续写入+滚动删除下防 WAL 无界）
+	// 本轮有删除时考虑截断 WAL（含仅 rollup 清理；100/s 持续写入+滚动删除
+	// 下防 WAL 无界）。TRUNCATE 检查点在活跃写者（摄取 tick/rollup warmer）
+	// 下易遇 BUSY 且与 30s busy_timeout 叠加放大 tick 延迟——不再每轮清理
+	// 批尾执行，收敛为低频门控 + BUSY 显式计数观测（语义不变，频次解耦）。
 	if total > 0 || rollupDeleted > 0 || targetDeleted > 0 || highwaterDeleted > 0 {
-		if _, err := database.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
-			Logf("warn", "security events retention: wal checkpoint failed: %v", err)
-		}
+		securityEventsCheckpointWALIfDue(database, time.Now())
 	}
 	return total, nil
+}
+
+// securityEventsWalCheckpointMinInterval 是 WAL TRUNCATE 检查点的最小间隔
+// （var 供测试收窄）。
+var securityEventsWalCheckpointMinInterval = 10 * time.Minute
+
+// securityEventsWalCheckpointState 低频门控与 BUSY 观测状态（测试可重置）。
+var securityEventsWalCheckpointState struct {
+	mu        sync.Mutex
+	lastRun   time.Time
+	runCount  int
+	busyCount int
+}
+
+// securityEventsCheckpointWALIfDue 距上次检查点超过最小间隔才执行
+// wal_checkpoint(TRUNCATE)。BUSY（结果行 busy=1，活跃写者下的正常让出）
+// 显式计数并留痕——观测而非改语义；错误告警同旧口径。
+func securityEventsCheckpointWALIfDue(database *sql.DB, now time.Time) {
+	securityEventsWalCheckpointState.mu.Lock()
+	if now.Sub(securityEventsWalCheckpointState.lastRun) < securityEventsWalCheckpointMinInterval {
+		securityEventsWalCheckpointState.mu.Unlock()
+		return
+	}
+	securityEventsWalCheckpointState.lastRun = now
+	securityEventsWalCheckpointState.mu.Unlock()
+
+	var busy, logFrames, checkpointed int
+	err := database.QueryRow(`PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logFrames, &checkpointed)
+	securityEventsWalCheckpointState.mu.Lock()
+	securityEventsWalCheckpointState.runCount++
+	if busy != 0 {
+		securityEventsWalCheckpointState.busyCount++
+	}
+	busyTotal := securityEventsWalCheckpointState.busyCount
+	securityEventsWalCheckpointState.mu.Unlock()
+	if err != nil {
+		Logf("warn", "security events retention: wal checkpoint failed: %v", err)
+		return
+	}
+	if busy != 0 {
+		Logf("info", "security events retention: wal checkpoint busy（活跃写者让出，累计 %d 次）", busyTotal)
+	}
 }

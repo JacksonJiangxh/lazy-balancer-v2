@@ -39,8 +39,10 @@ type ownedRecord struct {
 
 // Provider implements dnsprovider.Provider for Tencent Cloud DNSPod.
 type Provider struct {
-	SecretID  string
-	SecretKey string
+	// secretID/secretKey 凭据保持私有（与 dnspod.Provider 同口径）——
+	// 导出字段任何一次 %+v/JSON 序列化即泄密；日志形态走 String() 脱敏。
+	secretID  string
+	secretKey string
 	client    *dnspod.Client
 	mu        sync.Mutex
 	owned     map[string][]ownedRecord
@@ -50,6 +52,15 @@ type Provider struct {
 	// 命中新账户下的无关记录。
 	account string
 }
+
+// SecretID 返回凭据 SecretID（仅构造 SDK 凭证使用；禁止打印）。
+func (p *Provider) SecretID() string { return p.secretID }
+
+// SecretKey 返回凭据 SecretKey（仅构造 SDK 凭证使用；禁止打印）。
+func (p *Provider) SecretKey() string { return p.secretKey }
+
+// String 脱敏形态：只暴露账户摘要，任何日志/序列化路径不得回显凭据。
+func (p *Provider) String() string { return "tencent.Provider{account:" + p.account + "}" }
 
 func NewPersistent(secretID, secretKey, dataDir string) (*Provider, error) {
 	provider, err := New(secretID, secretKey)
@@ -79,8 +90,8 @@ func New(secretID, secretKey string) (*Provider, error) {
 	// 429/5xx 重试在传输层统一处理，瞬时 API 故障不再直接打挂挑战
 	client.WithHttpTransport(&retry.Transport{})
 	return &Provider{
-		SecretID:  secretID,
-		SecretKey: secretKey,
+		secretID:  secretID,
+		secretKey: secretKey,
 		client:    client,
 		owned:     make(map[string][]ownedRecord),
 		// 账户身份由凭据对派生（不落明文）：「同一个域换另一账户的密钥」是本
@@ -135,6 +146,37 @@ func (p *Provider) CleanUp(ctx context.Context, zone, tokenFQDN string) error {
 // issuance's recent record of another value is spared.
 func (p *Provider) CleanUpValue(ctx context.Context, zone, tokenFQDN, value string) error {
 	return p.cleanUp(ctx, zone, tokenFQDN, value, true)
+}
+
+// CountCleanupRecords 实现 dnsprovider.CleanupCounter（与 dnspod 侧同构）：
+// 纯本地计数按值清理将选中的记录条数。键为 zone+"|"+subDomain——按
+// "|"+subDomain 后缀聚合，跨 zone 同名子域的少量多计只会让预算偏大。
+func (p *Provider) CountCleanupRecords(zone, tokenFQDN, value string) int {
+	zone = strings.TrimSuffix(zone, ".")
+	subDomain := strings.TrimSuffix(tokenFQDN, ".")
+	subDomain = strings.TrimSuffix(subDomain, "."+zone)
+	p.mu.Lock()
+	fallback := 0
+	for key, entries := range p.owned {
+		if !strings.HasSuffix(key, "|"+subDomain) {
+			continue
+		}
+		for _, entry := range entries {
+			if value == "" || entry.value == value {
+				fallback++
+			}
+		}
+	}
+	p.mu.Unlock()
+	if p.ownership == nil {
+		return fallback
+	}
+	records, err := p.ownership.MatchingValue("tencent", zone, tokenFQDN, value)
+	if err != nil {
+		// 账本读失败按至少 1 条计——预算宁大勿小（清理本身会再上抛该错误）。
+		return max(fallback, 1)
+	}
+	return len(records) + fallback
 }
 
 // cleanUp 是 CleanUp/CleanUpValue 的共享实现（按值定向删除+陈旧条目清理）。
@@ -198,6 +240,10 @@ func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, b
 		return nil
 	}
 	if p.ownership != nil {
+		// 批量收敛（与 dnspod 侧同构）：成功删除/判定丢弃的条目攒批，
+		// 循环结束后一次 RemoveMany（单次全量重写+fsync）。中途崩溃只让
+		// 已删记录的条目多留一轮（下次清理幂等删除后再移除），语义不变。
+		var removable []ownership.Record
 		for _, record := range records {
 			// 账户归属先于删除（与 dnspod 侧同口径，判定
 			// 单源在 ownership.DecideRemoval）。换凭据后旧账户遗留条目的
@@ -205,7 +251,7 @@ func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, b
 			// 只丢弃本地条目并留痕。
 			if ownership.DecideRemoval(record, p.account, time.Now()) == ownership.DispositionDrop {
 				logf("warn", "tencent: 所有权条目无法归属当前账户（%s, recordID=%s, account=%q），仅丢弃本地条目、不调用删除", tokenFQDN, record.RecordID, record.Account)
-				cleanupErr = errors.Join(cleanupErr, p.ownership.Remove(record))
+				removable = append(removable, record)
 				continue
 			}
 			recordID, parseErr := strconv.ParseUint(record.RecordID, 10, 64)
@@ -214,18 +260,20 @@ func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, b
 				// 无法解析的 ID 永远无法调用删除 API；保留条目只会让每次清理
 				// 永久重复报错。告警并移除该不可恢复条目，本轮仍返回解析错误。
 				logf("warn", "tencent: 所有权 RecordID %q 无法解析，按不可恢复条目处理: %v", record.RecordID, parseErr)
-				cleanupErr = errors.Join(cleanupErr, parseFailure, p.ownership.Remove(record))
+				cleanupErr = errors.Join(cleanupErr, parseFailure)
+				removable = append(removable, record)
 				continue
 			}
 			// independence: a record whose deletion failed keeps
 			// its ownership entry (the DNS record may still exist), but an
-			// earlier miss must not skip Remove for records that WERE
+			// earlier miss must not skip removal for records that WERE
 			// deleted — that orphans them until self-heal.
 			if deleteOne(recordID, record.Value) != nil {
 				continue
 			}
-			cleanupErr = errors.Join(cleanupErr, p.ownership.Remove(record))
+			removable = append(removable, record)
 		}
+		cleanupErr = errors.Join(cleanupErr, p.ownership.RemoveMany(removable))
 		// 兜底排空：Present 在「ownership.Add 失败 + 回滚删除
 		// 失败」时把 recordID 回填进内存兜底表（store 无条目可追踪）。此处重试
 		// 删除这些兜底条目——成功即清除，失败回填供下次重试（幂等）。store 模式

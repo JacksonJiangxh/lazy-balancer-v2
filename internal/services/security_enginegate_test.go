@@ -28,10 +28,12 @@ import (
 //     TestAuditWriter_registeredAndInjectsLateTiming 端到端钉住;
 //   - Include <crs 路径>:CRS 文件仅存在于镜像内——引擎接受「文件缺失」
 //     与否不是被测对象(镜像内由 caddy validate 覆盖全量);
-//   - SecRuleUpdateActionById 949110:拦截页归因的 CRS 抬码指令——Include
-//     被过滤后 949110 不存在,该指令编译必然报错(规则缺失是环境产物,
-//     非被测形状);指令对 949110 的真实抬码由
-//     security_block_status_test.go 的引擎行为实证覆盖(桩规则+真实事务)。
+//   - SecRuleUpdateActionById 949110/959100:拦截页归因的 CRS 出入站抬码
+//     指令——Include 被过滤后 949110/959100 不存在,该指令编译必然报错
+//     （规则缺失是环境产物,非被测形状）;指令对 949110 的真实抬码由
+//     security_block_status_test.go 的引擎行为实证覆盖(桩规则+真实事务)；
+//     抬码对象存在性与 Include 全链路由本文件
+//     TestEngineGate_crsFixtureTreeCompiles 的夹具树编译覆盖。
 //
 // 其余全部逐字送编译——我们自己发射的 SecRule/SecAction/SecMarker 形状
 // 是本门禁的被测对象,零裁剪( 验证源直取:指令文本来自真实渲染调用)。

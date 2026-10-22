@@ -53,9 +53,6 @@ func (transport *staleDomainIDTransport) RoundTrip(request *http.Request) (*http
 	}, nil
 }
 
-// seedDomainIDCache 以裸 zone→id 形式给出条目，内部按 provider 的
-// login_token 换算为账户隔离键后写入。
-
 // domain_id 缓存可能是陈旧值（域名移出账户/删除后重建，新 ID 与缓存不符）——
 // 须作废该 zone 缓存并重解析一次再重试一次，而非直接把错误抛给签发链。
 func TestProvider_Present_retriesWithFreshDomainIDOnStaleCache(t *testing.T) {

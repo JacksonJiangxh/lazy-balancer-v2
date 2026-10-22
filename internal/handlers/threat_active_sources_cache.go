@@ -9,6 +9,8 @@ import (
 	"database/sql"
 	"sync"
 	"time"
+
+	"lazy-balancer-v2/internal/services"
 )
 
 // threatActiveSourcesCacheTTL 缓存有效期（≤10s：与活跃窗口的 10 分钟粒度相比
@@ -86,4 +88,63 @@ func threatActiveSourcesCount(metricsDB *sql.DB, activeSince string, now time.Ti
 		threatActiveSourcesMu.Unlock()
 	}
 	return count, nil
+}
+
+// —— 归属地富化缓存（事件列表/大屏 feed/toast/光流逐行富化共用）——
+
+// enrichIPLocationLookup 归属地查询缝（services.LookupRegion）——var 供
+// 测试观测调用次数（富化缓存钉测）。
+var enrichIPLocationLookup = services.LookupRegion
+
+// enrichLocationCacheMax 归属地富化缓存条目上限（超限整体重置——有界
+// 增长优先于精确 LRU 逐出，攻击源 IP 集洪峰下内存封顶）。
+const enrichLocationCacheMax = 8192
+
+type enrichLocationCacheEntry struct {
+	location   string
+	generation int64
+}
+
+var enrichLocationCache = struct {
+	sync.Mutex
+	entries map[string]enrichLocationCacheEntry
+}{entries: make(map[string]enrichLocationCacheEntry)}
+
+// enrichIPLocation 返回 IP 的归属地展示文本；xdb 未安装或查询失败返回 ""（前端
+// 隐藏归属地标签），永不报错。
+//
+// 大屏 feed/toast/光流逐行富化同一批攻击源 IP——xdb 查询 O(log n) 便宜，
+// 成本在字符串分配与格式化（200 行/30s、1200 行/toast 量级）。进程内缓存
+// 键含 xdb 代际（GeoIPDataGeneration），库热换后旧值自然失效；容量有界
+// （超限整体重置，与本文件活跃源缓存同形态）。
+func enrichIPLocation(ip string) string {
+	if ip == "" {
+		return ""
+	}
+	// 保留地址前置拦截:xdb 仅 IPv4(NewV4Config),IPv6 回环/链路本地等
+	// 查库返回空串会裸显示 IP;私网/回环/链路本地/未指定一律「保留地址」。
+	if isReservedIP(ip) {
+		return "保留地址"
+	}
+	return enrichIPLocationCached(ip)
+}
+
+// enrichIPLocationCached 缓存版实现：键含 GeoIP 数据代际，代际变更整体失效。
+func enrichIPLocationCached(ip string) string {
+	gen := services.GeoIPDataGeneration()
+	enrichLocationCache.Lock()
+	if e, ok := enrichLocationCache.entries[ip]; ok && e.generation == gen {
+		location := e.location
+		enrichLocationCache.Unlock()
+		return location
+	}
+	enrichLocationCache.Unlock()
+	location := formatIP2RegionLocation(enrichIPLocationLookup(ip))
+	enrichLocationCache.Lock()
+	if len(enrichLocationCache.entries) >= enrichLocationCacheMax {
+		enrichLocationCache.entries = make(map[string]enrichLocationCacheEntry)
+	}
+	enrichLocationCache.entries[ip] = enrichLocationCacheEntry{location: location, generation: gen}
+	enrichLocationCache.Unlock()
+	return location
 }
