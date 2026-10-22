@@ -251,6 +251,14 @@ func (h *Handlers) applyFromTxNote(c *gin.Context, tx *sql.Tx, reloadDetail stri
 	}, nil
 }
 
+// commitUncertainLabel 事务提交失败的用户/审计文案单源（与导入协调器
+// importFailurePhaseDescription 的 importPhaseCommit 同口径）：SQLite 在
+// Commit 返回错误时无法区分「未提交」与「已提交但确认丢失」，断言「失败/未
+// 生效」会诱导操作者重试并产生重复写入（重复审计行/重复创建），与「审计不得
+// 出现与事实相反的记录」相悖。全部提交失败分支（finishTxApply 家族与名单热
+// 路径）共用本常量，禁止各自另写文案。
+const commitUncertainLabel = "数据库提交结果不确定（可能已生效，请先核对）"
+
 // txReloadDetail 生成规则生命周期路径的重载审计明细（来源 + 规则归因 + 结果）。
 func txReloadDetail(source, ruleID string) string {
 	return services.FormatAuditDetail(services.AuditSourcePart(source), services.AuditRulePart(ruleID), services.AuditResultPart("success"))
@@ -298,8 +306,8 @@ func (h *Handlers) finishTxApply(c *gin.Context, tx *sql.Tx, f txApplyFinish) {
 			// commit 失败必须把运行配置/LKG/投影/证书统一回退到已提交视图。
 			restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
 			joined := errors.Join(err, restoreErr)
-			recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail("提交事务失败", joined.Error(), services.AuditResultPart("failure")))
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交事务失败: " + joined.Error()})
+			recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail(commitUncertainLabel, joined.Error(), services.AuditResultPart("failure")))
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + ": " + joined.Error()})
 			return
 		}
 		recordAudit(c, f.AuditAction, f.Resource, f.AuditDetail)
@@ -347,8 +355,8 @@ func (h *Handlers) finishTxApply(c *gin.Context, tx *sql.Tx, f txApplyFinish) {
 		// 传输失败前 /load 已生效）留下运行配置分叉——与成功分支同一收口。
 		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
 		joined := errors.Join(err, restoreErr)
-		recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail("提交事务失败", joined.Error(), services.AuditResultPart("failure")))
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交事务失败: " + joined.Error()})
+		recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail(commitUncertainLabel, joined.Error(), services.AuditResultPart("failure")))
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + ": " + joined.Error()})
 		return
 	}
 	h.recordCaddyApplyResult(applyErr)

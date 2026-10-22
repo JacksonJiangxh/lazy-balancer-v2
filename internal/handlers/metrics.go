@@ -84,13 +84,103 @@ var metricsDashboardState struct {
 	valid     bool
 }
 
-// resetMetricsDashboardCacheForTest 测试缝：清空面板缓存（生产不调用）。
+// 指标抓取快照：规则/主机/Caddy/面板四个消费面读同一
+// CaddyMetricsURL，每请求各拉一次最多 16MB Prometheus 文本并各自解析是纯放大。
+// 快照按 URL 共享 TTL，并发 miss 合并为一趟，失败短负缓存（到期即重试）。
+// 各端点仍各自解析（解析产物按端点形态不同），共享的是抓取字节。
+var (
+	caddyMetricsSnapshotTTL         = 5 * time.Second
+	caddyMetricsSnapshotNegativeTTL = 2 * time.Second
+	caddyMetricsSnapshotGroup       singleflight.Group
+)
+
+type caddyMetricsSnapshot struct {
+	body      []byte
+	err       error
+	expiresAt time.Time
+}
+
+func resetCaddyMetricsSnapshotCacheForTest() {
+	caddyMetricsSnapshots.Lock()
+	caddyMetricsSnapshots.entries = nil
+	caddyMetricsSnapshots.Unlock()
+}
+
+var caddyMetricsSnapshots struct {
+	sync.Mutex
+	entries map[string]caddyMetricsSnapshot
+}
+
+func readCaddyMetricsSnapshot(url string, now time.Time) ([]byte, error, bool) {
+	caddyMetricsSnapshots.Lock()
+	defer caddyMetricsSnapshots.Unlock()
+	entry, ok := caddyMetricsSnapshots.entries[url]
+	if !ok || !now.Before(entry.expiresAt) {
+		return nil, nil, false
+	}
+	return entry.body, entry.err, true
+}
+
+func storeCaddyMetricsSnapshot(url string, body []byte, err error, now time.Time) {
+	ttl := caddyMetricsSnapshotTTL
+	if err != nil {
+		ttl = caddyMetricsSnapshotNegativeTTL
+	}
+	if ttl <= 0 {
+		return
+	}
+	caddyMetricsSnapshots.Lock()
+	if caddyMetricsSnapshots.entries == nil {
+		caddyMetricsSnapshots.entries = map[string]caddyMetricsSnapshot{}
+	}
+	caddyMetricsSnapshots.entries[url] = caddyMetricsSnapshot{body: body, err: err, expiresAt: now.Add(ttl)}
+	caddyMetricsSnapshots.Unlock()
+}
+
+// loadCaddyMetricsSnapshot 返回 Caddy 指标端点原文：TTL 内共享、并发合并。
+// 抓取用首个请求的 context（请求取消可中止真实抓取），取消/超时错误不写
+// 负缓存——否则一次客户端断开会让同窗内其余请求拿到伪造的上游失败。
+//
+// cacheFailure 控制失败是否也短缓存：面板已有自己的负缓存窗口（其重试节奏
+// 是产品语义的一部分，不能被更长的上游负缓存悄悄收窄），故面板传 false——
+// 成功快照仍共享，失败每次都重新抓取。其余指标端点传 true（避免失败窗口内
+// 多客户端反复击穿 Caddy）。
+func loadCaddyMetricsSnapshot(ctx context.Context, url string, cacheFailure bool) ([]byte, error) {
+	if body, err, ok := readCaddyMetricsSnapshot(url, time.Now()); ok && (err == nil || cacheFailure) {
+		return body, err
+	}
+	type snapshotResult struct {
+		body []byte
+		err  error
+	}
+	value, _, _ := caddyMetricsSnapshotGroup.Do(url, func() (any, error) {
+		now := time.Now()
+		if body, err, ok := readCaddyMetricsSnapshot(url, now); ok {
+			return snapshotResult{body: body, err: err}, nil
+		}
+		body, err := metricsDashboardFetch(ctx, url)
+		switch {
+		case err == nil:
+			storeCaddyMetricsSnapshot(url, body, nil, now)
+		case cacheFailure && ctx.Err() == nil:
+			storeCaddyMetricsSnapshot(url, nil, err, now)
+		}
+		return snapshotResult{body: body, err: err}, nil
+	})
+	result, _ := value.(snapshotResult)
+	return result.body, result.err
+}
+
+// resetMetricsDashboardCacheForTest 测试缝：清空面板缓存与共享抓取快照
+// （生产不调用；两者同属指标读路径，隔离必须同步，否则跨用例读到上一夹具
+// 的抓取字节）。
 func resetMetricsDashboardCacheForTest() {
 	metricsDashboardState.Lock()
 	metricsDashboardState.outcome = metricsDashboardOutcome{}
 	metricsDashboardState.expiresAt = time.Time{}
 	metricsDashboardState.valid = false
 	metricsDashboardState.Unlock()
+	resetCaddyMetricsSnapshotCacheForTest()
 }
 
 func (h *Handlers) GetMetricsDashboard(c *gin.Context) {
@@ -149,7 +239,7 @@ func storeMetricsDashboardOutcome(outcome metricsDashboardOutcome, now time.Time
 }
 
 func (h *Handlers) buildMetricsDashboard(ctx context.Context) metricsDashboardOutcome {
-	body, err := metricsDashboardFetch(ctx, h.cfg.CaddyMetricsURL)
+	body, err := loadCaddyMetricsSnapshot(ctx, h.cfg.CaddyMetricsURL, false)
 	if err != nil {
 		return metricsDashboardOutcome{status: http.StatusBadGateway, message: "采集 Caddy 指标失败: " + err.Error()}
 	}
@@ -240,16 +330,14 @@ func (h *Handlers) GetRuleMetrics(c *gin.Context) {
 	var rule models.LbRule
 	err := db.DB.QueryRow(`SELECT COALESCE(domain,''), listen_port, COALESCE(protocol,''), COALESCE(enable_tls,0) FROM lb_rules WHERE caddy_id = ?`, ruleID).Scan(
 		&rule.Domain, &rule.ListenPort, &rule.Protocol, &rule.EnableTLS)
-	if err == sql.ErrNoRows {
-		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "Rule not found"})
-		return
-	}
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "数据库错误"})
+	// 错误分类走 dbQueryNotFound 单源（errors.Is 支持 %w 包装）——此前直接
+	// 比较 sql.ErrNoRows 并与 500 共用「数据库错误」，包装过的 ErrNoRows 会被
+	// 误判为服务故障，且响应形态与规则历史/证书任务等同族端点分裂。
+	if dbQueryNotFound(c, err, "规则不存在", "GetRuleMetrics query rule") {
 		return
 	}
 
-	body, err := fetchCaddyMetrics(c.Request.Context(), h.cfg.CaddyMetricsURL)
+	body, err := loadCaddyMetricsSnapshot(c.Request.Context(), h.cfg.CaddyMetricsURL, true)
 	if err != nil {
 		caddyMetricsError(c, err)
 		return
@@ -542,7 +630,7 @@ func (h *Handlers) GetMetricsHistory(c *gin.Context) {
 }
 
 func (h *Handlers) GetCaddyMetrics(c *gin.Context) {
-	body, err := fetchCaddyMetrics(c.Request.Context(), h.cfg.CaddyMetricsURL)
+	body, err := loadCaddyMetricsSnapshot(c.Request.Context(), h.cfg.CaddyMetricsURL, true)
 	if err != nil {
 		caddyMetricsError(c, err)
 		return
@@ -557,7 +645,7 @@ func (h *Handlers) GetCaddyMetrics(c *gin.Context) {
 }
 
 func (h *Handlers) GetHostMetrics(c *gin.Context) {
-	body, err := fetchCaddyMetrics(c.Request.Context(), h.cfg.CaddyMetricsURL)
+	body, err := loadCaddyMetricsSnapshot(c.Request.Context(), h.cfg.CaddyMetricsURL, true)
 	if err != nil {
 		caddyMetricsError(c, err)
 		return

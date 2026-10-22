@@ -101,8 +101,9 @@ var auditLogSizeBytes = getAuditLogSizeBytes
 // auditLogCopyFile 将当前日志归档为 .1；测试可注入以模拟复制失败。
 var auditLogCopyFile = copyAuditLogTo
 
-// rotateAuditLogIfNeeded 在审计日志超过大小阈值时轮转：先滚动历史副本
-// （.4→.5 … .1→.2），再将当前日志以 copytruncate 方式归档为 .1 并截断原文件。
+// rotateAuditLogIfNeeded 在审计日志超过大小阈值时轮转：先把当前日志复制到
+// 暂存名 .1.new，成功后滚动历史副本（.4→.5 … .1→.2）并把暂存归档提升为 .1，
+// 最后截断原文件（copytruncate）。复制/提升失败不改变归档代际、不截断活文件。
 //
 // 为什么用 copytruncate 而不是 rename：Coraza 通过长生命周期文件描述符持续
 // 写入 audit.log，rename 会把写者"孤立"在已改名的 inode 上继续写 .1，而
@@ -169,22 +170,46 @@ func rotateAuditLogIfNeeded() (total int, rotErr error) {
 	}
 	dir := filepath.Dir(auditLogPath)
 	base := auditLogBaseName()
-	// 先滚动历史副本：.4→.5、.3→.4、.2→.3、.1→.2
+	current := filepath.Join(dir, base+".1")
+	// 先把当前日志完整复制到暂存名 .1.new，成功后才滚动历史归档并把它提升
+	// 为 .1——复制失败（磁盘满/只读挂载/IO 错误）不得改变归档代际。旧序
+	// （先 .4→.5 … .1→.2 再复制）在持续复制失败时每 tick（2s 驱动）蚕食一代：
+	// .1..5 全存在时约 4 个 tick 即丢掉 4 代审计证据，仅留 60s 限流 warn。
+	staging := current + ".new"
+	if err := auditLogCopyFile(auditLogPath, staging); err != nil {
+		_ = os.Remove(staging)
+		throttledAuditFailureLogf("audit log rotation: copy to .1 failed (not truncating): %v", err)
+		return total, fmt.Errorf("copy to .1 failed (not truncating): %w", err)
+	}
+	// 新归档已完整落盘（copy helper 内含临时文件 fsync+父目录 fsync）后才
+	// 滚动历史副本：.4→.5、.3→.4、.2→.3、.1→.2。
 	for i := 4; i >= 1; i-- {
 		old := filepath.Join(dir, fmt.Sprintf("%s.%d", base, i))
 		newer := filepath.Join(dir, fmt.Sprintf("%s.%d", base, i+1))
 		if _, err := os.Stat(old); err == nil {
 			if rerr := os.Rename(old, newer); rerr != nil {
 				throttledAuditFailureLogf("audit log rotation: shift %s → %s failed: %v", old, newer, rerr)
+				if i == 1 {
+					// .1 未能让位时不得提升暂存归档：rename 会静默覆盖上一代
+					// .1（.2 没有接住它）＝丢一代审计证据。本轮中止、保留现场。
+					_ = os.Remove(staging)
+					return total, fmt.Errorf("shift %s → %s: %w", old, newer, rerr)
+				}
 				noteErr(fmt.Errorf("shift %s → %s: %w", old, newer, rerr))
 			}
 		}
 	}
-	// 归档当前日志到 .1；复制失败绝不截断，避免丢失尚未归档的数据。
-	current := filepath.Join(dir, base+".1")
-	if err := auditLogCopyFile(auditLogPath, current); err != nil {
-		throttledAuditFailureLogf("audit log rotation: copy to .1 failed (not truncating): %v", err)
-		return total, fmt.Errorf("copy to .1 failed (not truncating): %w", err)
+	// 提升暂存归档为 .1——新归档在此刻才对外可见；失败清理暂存且不截断活文件。
+	if err := os.Rename(staging, current); err != nil {
+		_ = os.Remove(staging)
+		throttledAuditFailureLogf("audit log rotation: promote staged archive to .1 failed (not truncating): %v", err)
+		return total, fmt.Errorf("promote staged archive (not truncating): %w", err)
+	}
+	// rename 产生的目录项必须落盘（copy helper 只同步了 .1.new 的目录项）；
+	// 失败仅留痕不中止——内容已在 .1，掉电最多回退到暂存形态。
+	if serr := syncParentDir(current); serr != nil {
+		throttledAuditFailureLogf("audit log rotation: sync archive dir after promote failed: %v", serr)
+		noteErr(fmt.Errorf("sync archive dir after promote: %w", serr))
 	}
 	archInfo, err := os.Stat(current)
 	if err != nil {

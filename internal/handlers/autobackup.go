@@ -364,11 +364,14 @@ func (h *Handlers) RunAutoBackupOnce(ctx context.Context, trigger, operator stri
 	if trigger == "manual" {
 		triggerLabel = "手动"
 	}
-	// 目录权限 0700——备份含私钥与凭证明文（文件 0600），
-	// 目录本身不得放宽到组/其他可读（0700 不受 umask 削弱）。
+	// 目录权限 0700——备份含私钥与凭证明文（文件由
+	// services.WriteAutoBackupFileSynced 以 0600 原子写），目录本身不得放宽到
+	// 组/其他可读。MkdirAll 的 0700 只对新目录生效，对已存在目录（旧版本创建/
+	// 手工 mkdir/宿主机 bind mount 的 0755）是 no-op，故创建后显式 Chmod 收敛；
+	// chmod 失败仅告警不阻断备份（NFS/只读挂载可能拒绝改权限，文件本体仍 0600）。
 	// 目录先于文件名分配校验：父路径不可用时应落「创建备份目录失败」，
 	// 而不是被文件名 Stat 抢先变成无法归因的命名错误。
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.MkdirAll(dir, autoBackupDirPerm); err != nil {
 		failureName := autoBackupFilenameBase(trigger, now) + ".lbbak.unavailable"
 		if _, ierr := insertAutoBackupRow(failureName, "failed", 0, "[]", trigger, "创建备份目录失败: "+err.Error(), h.cfg.Version); ierr != nil {
 			services.Logf("warn", "自动备份：failed 行落库失败: %v", ierr)
@@ -380,6 +383,7 @@ func (h *Handlers) RunAutoBackupOnce(ctx context.Context, trigger, operator stri
 			"触发："+triggerLabel, "文件："+failureName, "创建备份目录失败："+err.Error(), services.AuditResultPart("failed")), "")
 		return autoBackupRowView{}, fmt.Errorf("创建备份目录失败: %w", err)
 	}
+	convergeAutoBackupDirPermissions(dir)
 	filename, ferr := nextAutoBackupFilename(dir, trigger, now)
 	if ferr != nil {
 		// 无安全可归因文件名，不落 failed 行；审计与任务日志留痕。
@@ -708,6 +712,31 @@ func (h *Handlers) UpdateAutoBackupSettings(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "自动备份设置已保存"})
 }
 
+// autoBackupDirPerm 备份目录权限：目录内是含私钥与凭证明文的备份文件
+// （文件本体由 services.WriteAutoBackupFileSynced 以 0600 原子写），目录不得
+// 放宽到组/其他可读（仅文件名/触发类型/时间戳可被列出）。
+const autoBackupDirPerm = 0o700
+
+// convergeAutoBackupDirPermissions 把既有备份目录权限收敛到 autoBackupDirPerm。
+// os.MkdirAll 对已存在目录不修改权限——旧版本创建、手工 mkdir 或宿主机 bind
+// mount 的 0755 目录会长期保持宽松。只收窄「组/其他可读」位（perm&0o077）：
+// 刻意设为 0500 等只读形态的目录保持原样，不因收敛而额外授予属主写权限。
+// chmod 失败仅告警不阻断：NFS/只读挂载可能拒绝改权限，文件本体仍为 0600，
+// 备份可用性优先。
+func convergeAutoBackupDirPermissions(dir string) {
+	info, err := os.Stat(dir)
+	if err != nil {
+		services.Logf("warn", "自动备份：读取备份目录权限失败（%s）", err)
+		return
+	}
+	if info.Mode().Perm()&0o077 == 0 {
+		return
+	}
+	if err := os.Chmod(dir, autoBackupDirPerm); err != nil {
+		services.Logf("warn", "自动备份：备份目录权限收敛为 0700 失败（%s）——文件本体仍为 0600", err)
+	}
+}
+
 func autoBackupDayLabel(freq string, day int) string {
 	if freq == "weekly" {
 		return []string{"", "周一", "周二", "周三", "周四", "周五", "周六", "周日"}[day]
@@ -735,8 +764,8 @@ func autoBackupSectionLabels(sections []string) []string {
 
 // RunAutoBackupNow POST /api/v1/auto-backup/run：手动触发一次完整备份。
 //
-// 响应前转后台——此前同步 te.RunSync 让「备份 >60s」
-// 撞 main.go WriteTimeout(60s) 截断响应。
+// 响应前转后台（此前同步 te.RunSync 会整段占住请求线程，客户端需等备份
+// 完成才拿到响应，前端只能靠轮询/超时判断结果）。
 // 占位改为引擎原子预留（RunAsync）——
 // 入口门（paused/stopped/角色/单飞）与 running CAS 在请求线程内完成，
 // 失败在 202 之前同步映射 409/403/503 并留审计；不再出现「已受理但后台

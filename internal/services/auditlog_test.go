@@ -250,3 +250,49 @@ func TestCleanupAuditLogs_deletesInBatches(t *testing.T) {
 		t.Fatalf("剩余行=%d, want 1（保留期内行不得被删）", remaining)
 	}
 }
+
+// 保留月数读取的「非 ErrNoRows」失败必须跳过本轮删除：不可逆删除不得在
+// 口径未知时按更短默认（3 月）执行——用户配置 12 月保留时一次配置表瞬断
+// 会让当日清理永久删掉 3~12 月前的审计证据。
+func TestCleanupAuditLogs_skipsDeletionWhenRetentionReadFails(t *testing.T) {
+	// Given：审计库有超 3 月陈旧行；主库查询恒失败（非 ErrNoRows 形态）
+	oldDB, oldAuditDB := db.DB, db.AuditDB
+	auditDB, err := sql.Open("sqlite", t.TempDir()+"/audit.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := auditDB.Exec(`CREATE TABLE audit_log (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		username VARCHAR(100), action VARCHAR(50) NOT NULL, resource VARCHAR(100),
+		detail TEXT, ip_address VARCHAR(45), created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := auditDB.Exec(`INSERT INTO audit_log (username, action, resource, created_at) VALUES ('u','登录','认证','2020-01-01 00:00:00')`); err != nil {
+		t.Fatal(err)
+	}
+	db.AuditDB = auditDB
+	t.Cleanup(func() {
+		db.DB, db.AuditDB = oldDB, oldAuditDB
+		_ = auditDB.Close()
+	})
+	swapBrokenDB(t)
+
+	// When
+	n, err := CleanupAuditLogs()
+
+	// Then：本轮不删除任何行，失败上抛（任务面落 failed）
+	if err == nil {
+		t.Fatal("保留月数读取失败必须返回错误（不得按默认 3 月静默删除）")
+	}
+	if n != 0 {
+		t.Fatalf("CleanupAuditLogs()=%d, want 0（口径未知时不得删除）", n)
+	}
+	var rows int
+	if err := auditDB.QueryRow(`SELECT COUNT(*) FROM audit_log`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 {
+		t.Fatalf("审计证据行数=%d, want 1（不得删除）", rows)
+	}
+}

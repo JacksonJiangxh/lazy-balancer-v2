@@ -1315,7 +1315,7 @@ func TestValidateConfigImport_rejects_v2_backup_missing_required_contract(t *tes
 		wantValid  bool
 		wantErrSub string
 	}{
-		{name: "unsupported version", body: v2BackupBody(t, 3, map[string][]map[string]any{"lb_rules": {}}, nil), wantErrSub: "不支持的备份版本"},
+		{name: "unsupported version", body: v2BackupBody(t, 4, map[string][]map[string]any{"lb_rules": {}}, nil), wantErrSub: "不支持的备份版本"},
 		{name: "missing tables", body: v2BackupBody(t, 2, nil, nil), wantErrSub: "不是有效的 Lazy Balancer 备份文件"},
 		// 分类导出（无 users 键）合法：本地用户保留，管理员门跳过。
 		{name: "missing users 分类形态合法", body: v2BackupBody(t, 2, map[string][]map[string]any{"lb_rules": {}}, nil), wantValid: true},

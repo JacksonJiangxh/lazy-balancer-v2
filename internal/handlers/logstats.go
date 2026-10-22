@@ -16,6 +16,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 	"lazy-balancer-v2/internal/services"
+	"lazy-balancer-v2/internal/taskengine"
 )
 
 // logRotatedBackups 是读侧轮转展示统一保留份数；与 services 写侧常量由
@@ -27,18 +28,21 @@ const logRotatedBackups = 5
 // 大小型日志（达到 LimitBytes 即轮转）提供 LimitBytes 与 KeepCount；
 // 时间型清理（每日按保留期删除）提供 RetentionNote。
 type LogStorageInfo struct {
-	Key           string `json:"key"`
-	Name          string `json:"name"`
-	SizeBytes     int64  `json:"size_bytes"`
-	RotatedBytes  int64  `json:"rotated_bytes"`
-	RotatedCount  int    `json:"rotated_count"` // 当前归档份数(与 keep_count 上限对照)
-	LimitBytes    *int64 `json:"limit_bytes,omitempty"`
-	LimitRows     *int64 `json:"limit_rows,omitempty"`
-	DBBytes       *int64 `json:"db_bytes,omitempty"`
-	KeepCount     int    `json:"keep_count"`
-	Rows          *int64 `json:"rows,omitempty"`
-	RetentionNote string `json:"retention_note,omitempty"`
-	ConfigSource  string `json:"config_source"`
+	Key          string `json:"key"`
+	Name         string `json:"name"`
+	SizeBytes    int64  `json:"size_bytes"`
+	RotatedBytes int64  `json:"rotated_bytes"`
+	RotatedCount int    `json:"rotated_count"` // 当前归档份数(与 keep_count 上限对照)
+	LimitBytes   *int64 `json:"limit_bytes,omitempty"`
+	LimitRows    *int64 `json:"limit_rows,omitempty"`
+	DBBytes      *int64 `json:"db_bytes,omitempty"`
+	KeepCount    int    `json:"keep_count"`
+	Rows         *int64 `json:"rows,omitempty"`
+	// RowsUnavailable 行数读取失败时置位：消费方据此保持「条数口径」并标注
+	// 计数暂不可用，而不是静默退回字节口径（行数缺席与「0 行」不可混淆）。
+	RowsUnavailable bool   `json:"rows_unavailable,omitempty"`
+	RetentionNote   string `json:"retention_note,omitempty"`
+	ConfigSource    string `json:"config_source"`
 }
 
 // dirBytes 返回 path 的活跃文件大小与轮转副本合计。两类轮转家族都统计
@@ -233,6 +237,18 @@ func aggregateDirStats(dir string, match func(name string) bool) map[string]dirS
 			out[base] = st
 			continue
 		}
+		// 虚拟 base：活跃文件已缺席（改名/删除/轮转窗口）但只留 .N / 时间戳
+		// 副本时，dirBytes 仍按固定基名计入归档字节，聚合行却因 bases 里没有
+		// 该基名而少算（同一响应内两行口径分叉）。副本形态自带基名，按形态
+		// 派生基名归并即可与 dirBytes 一致，且不产生无人消费的独立条目
+		// （派生基名即原基名，固定名消费方照常命中）。
+		if base, ok := rotationCopyBaseName(name); ok && match(base) {
+			st := out[base]
+			st.Rotated += info.Size()
+			st.RotCount++
+			out[base] = st
+			continue
+		}
 		if strings.HasSuffix(name, ".gz") {
 			st := out[name]
 			st.Rotated += info.Size()
@@ -314,6 +330,43 @@ func rotationCopyBaseOf(name string, bases map[string]struct{}, stemToBase map[s
 		// stem 后紧跟的 '-<ts>' 段须以数字开头（区分 caddy 与 caddy-tls）
 		if len(rest) > 1 && rest[1] >= '0' && rest[1] <= '9' {
 			return base, true
+		}
+	}
+	return "", false
+}
+
+// rotationCopyBaseName 仅按副本文件名形态派生所属基名（不依赖目录内是否
+// 存在 base）——与 dirBytes/timestampedRotationStatsWithEntries 的三族口径
+// 一致：整文件 .gz 归档、.1..9 移位副本、运行日志族 16 字符时间戳后缀、
+// timberjack <stem>-<ts>-size.log[.gz]。
+func rotationCopyBaseName(name string) (string, bool) {
+	if base, ok := strings.CutSuffix(name, ".gz"); ok && base != "" {
+		return base, true
+	}
+	if dot := strings.LastIndexByte(name, '.'); dot > 0 && isDigits(name[dot+1:]) {
+		if n, err := strconv.Atoi(name[dot+1:]); err == nil && n >= 1 && n <= 9 && dot > 0 {
+			return name[:dot], true
+		}
+	}
+	if len(name) > 17 {
+		rest := name[len(name)-16:]
+		if rest[0] == '.' && isDigits(rest[1:9]) && rest[9] == '-' && isDigits(rest[10:]) {
+			return name[:len(name)-16], true
+		}
+	}
+	for i := range name {
+		if name[i] != '-' {
+			continue
+		}
+		rest := name[i:]
+		if !strings.HasSuffix(rest, "-size.log") && !strings.HasSuffix(rest, "-size.log.gz") {
+			continue
+		}
+		// timberjack 副本的 stem 后紧跟的 '-<ts>' 必须以数字开头（区分
+		// caddy 与兄弟文件 caddy-tls：caddy-tls-<ts>-size.log 的 stem 是
+		// caddy-tls，故逐 '-' 位置试）。
+		if len(rest) > 1 && rest[1] >= '0' && rest[1] <= '9' {
+			return name[:i] + ".log", true
 		}
 	}
 	return "", false
@@ -602,6 +655,10 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		if db.MetricsDB != nil {
 			if n, ok := cachedLogTableCount(db.MetricsDB, "logstats-security-events-count", "SELECT COUNT(*) FROM security_events"); ok {
 				byKey("security_events").Rows = &n
+			} else if info := byKey("security_events"); info != nil {
+				// 计数失败显式披露：此前响应只是缺席 rows，前端遂静默从
+				// 「N / 上限 条」退回「字节 / 上限」，用户以为口径被改。
+				info.RowsUnavailable = true
 			}
 		}
 		if st, err := os.Stat(filepath.Join(dataDir, db.MetricsDBFilename)); err == nil {
@@ -649,7 +706,15 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 	}
 	// 单一日志数据源（2026-09-29 用户裁定）：三库更新行与任务日志同文件
 	// （tasks/{crs|ip2region|threat}.log）——统计与内容同源。
-	tasksDir := filepath.Join(filepath.Dir(runtimePath), "tasks")
+	// 目录取引擎实际装配的任务日志目录（taskengine.LogDir）——统计侧自行按
+	// 运行日志目录推导会在「日志写入器打开失败」（runtimeLogFile 空 → 引擎回落
+	// /app/logs）时读错目录恒 0B，而同响应内的逐任务行
+	// （systemTaskLogPath→TaskLogPath）正确。引擎未装配（单测/嵌入式）时按同一
+	// 回落规则派生。
+	tasksDir := taskengine.LogDir()
+	if tasksDir == "" {
+		tasksDir = filepath.Join(filepath.Dir(runtimePath), "tasks")
+	}
 	taskFileBytes := func(id string) (int64, int64, int) {
 		return dirBytes(filepath.Join(tasksDir, id+".log"))
 	}
@@ -689,10 +754,6 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		}
 	}
 	var taskLogPath systemTaskLogPathResolver
-	// certJobsTruncated 透传 CollectSystemTasks 的第二返回值：证书动态行触达
-	// 上限时任务族清单被截断（面板因此可能缺行）。单行/全量响应都携带该标记
-	// ——此前消费端直接丢弃，「列表少了」与「本来就没有」不可区分。
-	certJobsTruncated := false
 	taskDirEntries := map[string][]os.DirEntry{}
 	readTaskDir := func(dir string) []os.DirEntry {
 		if entries, ok := taskDirEntries[dir]; ok {
@@ -706,10 +767,10 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		return entries
 	}
 	if wantsPerTaskRows {
-		var tasksTruncated bool
 		var taskRows []services.TaskInfo
-		taskRows, tasksTruncated = services.CollectSystemTasks()
-		certJobsTruncated = tasksTruncated
+		// 清单截断位由 /system/tasks 端点负责披露（任务监控页消费）；本端点
+		// 不重复携带无人消费的同名字段（契约噪声与「采集白付」同源）。
+		taskRows, _ = services.CollectSystemTasks()
 		for _, task := range taskRows {
 			key := "task:" + task.ID
 			if !want(key) {
@@ -792,7 +853,7 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		}
 		infos = filtered
 	}
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]interface{}{"logs": infos, "cert_jobs_truncated": certJobsTruncated}})
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]interface{}{"logs": infos}})
 }
 
 // isCertJobLogName 证书任务日志文件名（含 .N 移位副本与 .gz 压缩归档）。

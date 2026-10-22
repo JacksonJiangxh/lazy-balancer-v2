@@ -142,6 +142,13 @@
               <el-link type="primary" underline="never" size="small" style="margin-left: 6px" @click="retryLoadAdminTls">重试</el-link>
             </template>
             <span v-else class="form-tip-inline">启用后 :8000 仅经 HTTPS 访问，需重启服务生效</span>
+            <!-- 库内证书不可读（fail-visible）：后端以 cert_info_error 显式申报，
+                 页面必须消费——否则损坏证书与「未配置证书」在界面上无法区分。 -->
+            <div v-if="adminTlsCertBroken" class="info-note-bar">
+              <el-text type="danger" size="small" class="info-note-desc">
+                已保存的管理面板证书无法解析（{{ adminTlsCertError }}），HTTPS 可能无法正常访问；请点「配置证书」重新上传，或切换为自签名后保存以修复。
+              </el-text>
+            </div>
           </el-form-item>
           <el-form-item label="运行日志">
             <el-button size="small" :icon="View" @click="openAppLogDialog">查看日志</el-button>
@@ -1335,6 +1342,10 @@ watch(() => settings.value.threat_traffic_sample_n, (v) => {
 const adminTls = ref({ enabled: false, mode: 'selfsigned' })
 const adminTlsSaved = ref({ enabled: false, mode: 'selfsigned' })
 const adminTlsHasCert = ref(false)
+// 库内证书解析失败的原因（后端 fail-visible 字段 cert_info_error）。仅申报不
+// 消费会让「带外改库/旧导入造成的损坏证书」继续表现为「无证书信息」——用户
+// 看到 enabled=true 却查无原因，排障靠猜。
+const adminTlsCertError = ref('')
 const adminTlsForm = ref<AdminTlsForm>({ mode: 'selfsigned', certFile: null, keyFile: null, certInfo: null, inspecting: false })
 const stagedAdminTlsCert = ref<{ certFile: File; keyFile: File; certInfo: AdminTlsCertInfo } | null>(null)
 const adminTlsDialogVisible = ref(false)
@@ -1345,6 +1356,9 @@ const pickTlsFile = (kind: 'cert' | 'key'): void => {
   ;(kind === 'cert' ? tlsCertFileInput.value : tlsKeyFileInput.value)?.click()
 }
 
+// 存量 upload 证书损坏（含带外改库/旧版本导入形态）：以已保存的 mode 判定，
+// 不受弹框内未提交的切换影响。
+const adminTlsCertBroken = computed(() => adminTlsSaved.value.mode === 'upload' && adminTlsCertError.value !== '')
 const adminTlsDirty = computed(() => {
   if (adminTls.value.enabled !== adminTlsSaved.value.enabled) return true
   if (!adminTls.value.enabled) return false
@@ -1366,6 +1380,7 @@ const loadAdminTls = async () => {
       adminTlsSaved.value = saved
       adminTls.value = { ...saved }
       adminTlsHasCert.value = res.data.cert_info != null || saved.mode === 'selfsigned'
+      adminTlsCertError.value = res.data.cert_info_error || ''
       stagedAdminTlsCert.value = null
       adminTlsLoaded.value = true
     }

@@ -258,8 +258,14 @@ func readBrandingFile(path string) (brandingConfig, bool, error) {
 //   - 畸形 JSON → 不动(保守:不破坏用户数据;运行时按字段级回退并日志告警)
 //
 // 落盘统一走 services.MaterializeBranding 原子写（tmp+fsync+rename+父目录
-// fsync，此前 os.WriteFile 直写，进程崩溃可留半截 branding.json）；
-// 顺带完成 landing 文案注入（与 SyncDefaultLandingText 幂等同源）。
+// fsync，此前 os.WriteFile 直写，进程崩溃可留半截 branding.json）。
+//
+// 注意：本函数只保证文件字段齐备。写入分支经 services.MaterializeBranding
+// 落盘时顺带按内容注入 landing 文案；但「文件已齐备」分支零写入、零注入——
+// 调用方不得假定本函数已完成 landing 注入，须随后调用
+// SyncDefaultLandingText / SeedDefaultBlockPage（启动装配
+// cmd/server/main.go 即该顺序）。单点调用者漏掉这两步就会出现「文件齐备但
+// 默认站点文案未生效」。
 func EnsureBrandingFile(dataDir string) error {
 	path := filepath.Join(dataDir, "branding.json")
 	data, err := os.ReadFile(path)
@@ -312,18 +318,63 @@ type brandingResponse struct {
 // 集群同步文件，无管理面写路径（因此无需写侧主动失效）；内容热重载由 stat
 // 即时检测，仅幂等同步（landing 注入/拦截页种子/镜像）受本 60s 门约束。
 var (
-	brandingSyncMu   sync.Mutex
-	brandingSyncLast time.Time
+	brandingSyncMu          sync.Mutex
+	brandingSyncLast        time.Time
+	brandingSyncFingerprint string
 )
 
-func brandingSyncGateAllow() bool {
+// brandingFileFingerprint 返回 branding.json 的内容指纹（mtime+size）；stat
+// 失败返回空串（调用方跳过本轮，下次重试）。
+func brandingFileFingerprint(dataDir string) string {
+	info, err := os.Stat(filepath.Join(dataDir, "branding.json"))
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("%d.%d", info.ModTime().UnixNano(), info.Size())
+}
+
+// brandingSyncGateAllow 判定本轮是否需要跑幂等写副作用（landing 注入/拦截页
+// 种子/镜像刷新）。两道门串联：
+//  1. 内容指纹门：branding.json 未变化即完全跳过——稳态下匿名 GET /branding
+//     零写（旧实现仅 60s 时间门，每分钟仍无条件跑一轮 ~7 条 SQL，多副本时每个
+//     副本各跑一份）；
+//  2. 60s 采样门：指纹变化后最多每 60s 处理一次（连续编辑合并；手工编辑最坏
+//     延迟 60s 可见，与该端点的既有语义一致）。
+//
+// 写入仍保持幂等：指纹只记「本轮已处理」，失败时由调用方 brandingSyncMarkFailed
+// 清空，下一轮（≥60s）重试。
+func brandingSyncGateAllow(dataDir string) bool {
+	fingerprint := brandingFileFingerprint(dataDir)
+	if fingerprint == "" {
+		return false
+	}
 	brandingSyncMu.Lock()
 	defer brandingSyncMu.Unlock()
-	if time.Since(brandingSyncLast) < time.Minute {
+	if fingerprint == brandingSyncFingerprint {
+		return false
+	}
+	if !brandingSyncLast.IsZero() && time.Since(brandingSyncLast) < time.Minute {
 		return false
 	}
 	brandingSyncLast = time.Now()
+	brandingSyncFingerprint = fingerprint
 	return true
+}
+
+// brandingSyncMarkFailed 清空已处理指纹：本轮写副作用失败时不得把失败当成
+// 「已处理」固化（否则文件不再变化就不再重试）。
+func brandingSyncMarkFailed() {
+	brandingSyncMu.Lock()
+	brandingSyncFingerprint = ""
+	brandingSyncMu.Unlock()
+}
+
+// resetBrandingSyncGateForTest 清空采样门状态（跨用例隔离）。
+func resetBrandingSyncGateForTest() {
+	brandingSyncMu.Lock()
+	brandingSyncLast = time.Time{}
+	brandingSyncFingerprint = ""
+	brandingSyncMu.Unlock()
 }
 
 func (h *Handlers) GetBranding(c *gin.Context) {
@@ -351,15 +402,18 @@ func (h *Handlers) GetBranding(c *gin.Context) {
 	// 每请求 ~7 条 SQL 是公开无鉴权端点的残余放大面；门内跳过同步/种子/镜像
 	// （branding.json 为手工编辑的文档化用法，无管理写路径，带外手工编辑
 	// 最坏经门内采样延迟 60s 可见，与上方门语义一致）。
-	if brandingSyncGateAllow() {
+	if brandingSyncGateAllow(h.cfg.DataDir) {
 		needApply := false
+		syncFailed := false
 		if changed, err := SyncDefaultLandingText(h.cfg.DataDir); err != nil {
 			services.Logf("warn", "branding landing 同步失败: %v", err)
+			syncFailed = true
 		} else if changed {
 			needApply = true
 		}
 		if changed, err := SeedDefaultBlockPage(h.cfg.DataDir); err != nil {
 			services.Logf("warn", "branding 默认拦截页播种失败: %v", err)
+			syncFailed = true
 		} else if changed {
 			needApply = true
 		}
@@ -368,6 +422,10 @@ func (h *Handlers) GetBranding(c *gin.Context) {
 		// Caddy 重载(本地渲染变化已由上方 Sync/Seed 的 needApply 覆盖)。
 		if _, err := services.RefreshBrandingMirror(h.cfg.DataDir); err != nil {
 			services.Logf("error", "branding 镜像刷新失败: %v", err)
+			syncFailed = true
+		}
+		if syncFailed {
+			brandingSyncMarkFailed()
 		}
 		if needApply {
 			go func() {

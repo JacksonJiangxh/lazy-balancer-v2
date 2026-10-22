@@ -287,21 +287,34 @@ func crawlerNextSlot(now time.Time) string {
 
 // earliestEnabledSourceUpdate 返回启用源最早排程槽（空=无排程）。
 // sourceTable 仅由包内固定传入，不接受外部输入。
+//
+// 排序按 datetime() 归一后的时间序而非原始串 MIN：库内允许 crsTimeLayout
+// （空格）与 RFC3339（T 分隔）双形态（parseUTCSlot 明确兼容），字典序把
+// "YYYY-MM-DD 05:00:00"（空格 0x20）排在 "...THH:MM:SS"（T 0x54）之前，选出的
+// 「最早槽」可能不是真实最早（集群快照/备份导入/旧版本残留可产生混格式）。
+// datetime() 同时把两种形态转成同一 UTC 形态，返回值即归一为 crsTimeLayout；
+// 非法串 datetime()=NULL 被排除（旧实现对垃圾串会直接选中垃圾串）。
 func earliestEnabledSourceUpdate(sourceTable string) string {
 	if db.DB == nil {
 		return ""
 	}
 	var next string
-	// 读失败不得静默归零（引擎按零槽停摆）——接 logScheduleReadFailure
-	// 单源首报留痕，恢复补 info；next=="9999" 是「无启用源排程」正常形态非错误。
-	if err := db.DB.QueryRow(`SELECT MIN(COALESCE(NULLIF(next_update,''), '9999')) FROM ` + sourceTable + ` WHERE update_enabled=1`).Scan(&next); err != nil {
+	if err := db.DB.QueryRow(`SELECT datetime(next_update) FROM ` + sourceTable + `
+		WHERE update_enabled=1
+		  AND NULLIF(next_update,'') IS NOT NULL
+		  AND datetime(next_update) IS NOT NULL
+		ORDER BY datetime(next_update) ASC LIMIT 1`).Scan(&next); err != nil {
+		// 「无启用源/无有效排程」＝正常形态（旧 SQL 的 MIN 返回 NULL 被当成
+		// 读失败留痕）。读错误不得静默归零（引擎按零槽停摆）——接
+		// logScheduleReadFailure 单源首报留痕，恢复补 info。
+		if errors.Is(err, sql.ErrNoRows) {
+			logScheduleReadRecovered("schedule-earliest-" + sourceTable)
+			return ""
+		}
 		logScheduleReadFailure("schedule-earliest-"+sourceTable, err)
 		return ""
 	}
 	logScheduleReadRecovered("schedule-earliest-" + sourceTable)
-	if next == "9999" {
-		return ""
-	}
 	return next
 }
 

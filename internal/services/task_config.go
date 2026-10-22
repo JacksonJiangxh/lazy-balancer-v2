@@ -21,13 +21,18 @@ func setGlobalTaskAutoUpdate(prefix string, enabled bool) error {
 }
 
 // globalTaskAutoUpdateEnabled 读任务级总闸（读错 fail-closed=视为关）。
+// 与 AutoBackupEnabled 同族口径：读错必须留痕，否则库故障与「用户关闭」在
+// 任务面完全同形（静默停摆、零失败行）。
 func globalTaskAutoUpdateEnabled(prefix string) bool {
 	if db.DB == nil {
 		return false
 	}
 	var v int
+	key := "schedule-read-" + prefix + "-auto-update"
 	if err := db.DB.QueryRow(`SELECT COALESCE(` + prefix + `_auto_update,1) FROM global_config WHERE id=1`).Scan(&v); err != nil {
+		logScheduleReadFailure(key, err)
 		return false
 	}
+	logScheduleReadRecovered(key)
 	return v != 0
 }

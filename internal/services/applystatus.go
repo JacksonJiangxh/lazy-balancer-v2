@@ -21,7 +21,11 @@ import (
 type BackgroundApplyFailure struct {
 	Source  string `json:"source"`
 	Message string `json:"message"`
-	At      string `json:"at"` // 配置时区墙串
+	At      string `json:"at"` // 配置时区墙串（展示用）
+	// at 是 At 的时间基准（UTC，秒级），只供选源比较。At 是配置时区墙串，
+	// 运行时区变更（30s 刷新）后字符串序不再等价于时间序：UTC+8 → UTC 后
+	// 新失败串（UTC 墙钟）可能小于旧失败串（+8 墙钟），横幅会长期展示旧源。
+	at time.Time
 }
 
 type backgroundApplyState struct {
@@ -63,10 +67,12 @@ func recordBackgroundApplyResult(source BackgroundApplySource, err error) {
 		delete(backgroundApplyStore.failures, string(source))
 		return
 	}
+	now := time.Now()
 	backgroundApplyStore.failures[string(source)] = BackgroundApplyFailure{
 		Source:  string(source),
 		Message: err.Error(),
-		At:      time.Now().In(CurrentLocation()).Format("2006-01-02 15:04:05"),
+		At:      now.In(CurrentLocation()).Format("2006-01-02 15:04:05"),
+		at:      now.UTC(),
 	}
 }
 
@@ -82,8 +88,8 @@ func ClearBackgroundApplyFailure(source BackgroundApplySource) {
 }
 
 // BackgroundApplyFailureSnapshot 返回最近一次后台重载失败（无失败为 nil）。
-// 多来源并存时按时间取最新一条；同秒（At 为秒级墙串）并存时按来源名
-// 字典序取最小者——map 遍历顺序随机，缺 tie-break 会让横幅在同秒多来源
+// 多来源并存时按失败时刻（UTC 基准 at，秒精度）取最新一条；同一秒内并存时按
+// 来源名字典序取最小者——map 遍历顺序随机，缺 tie-break 会让横幅在同秒多来源
 // 失败下每次调用换源（前端轮询可见抖动，排障指向不稳定）。
 func BackgroundApplyFailureSnapshot() *BackgroundApplyFailure {
 	backgroundApplyStore.mu.Lock()
@@ -91,12 +97,45 @@ func BackgroundApplyFailureSnapshot() *BackgroundApplyFailure {
 	var latest *BackgroundApplyFailure
 	for _, failure := range backgroundApplyStore.failures {
 		current := failure
-		if latest == nil || current.At > latest.At ||
-			(current.At == latest.At && current.Source < latest.Source) {
+		if latest == nil {
 			latest = &current
+			continue
+		}
+		switch compareBackgroundApplyTime(current, *latest) {
+		case 1:
+			latest = &current
+		case 0:
+			if current.Source < latest.Source {
+				latest = &current
+			}
 		}
 	}
 	return latest
+}
+
+// compareBackgroundApplyTime 按时间基准比较两条失败记录（1=前更新、-1=后更新、
+// 0=同一秒）。at 未落（外部构造的字面量，如测试/历史形态）时回退解析 At 墙串；
+// 都无法解析按「更早」处理（不抢占可比记录）。
+func compareBackgroundApplyTime(a, b BackgroundApplyFailure) int {
+	ta, tb := backgroundApplyFailureTime(a), backgroundApplyFailureTime(b)
+	switch {
+	case ta.After(tb):
+		return 1
+	case ta.Before(tb):
+		return -1
+	default:
+		return 0
+	}
+}
+
+func backgroundApplyFailureTime(f BackgroundApplyFailure) time.Time {
+	if !f.at.IsZero() {
+		return f.at.Truncate(time.Second)
+	}
+	if parsed, err := time.ParseInLocation("2006-01-02 15:04:05", f.At, CurrentLocation()); err == nil {
+		return parsed.UTC().Truncate(time.Second)
+	}
+	return time.Time{}
 }
 
 // BackgroundApplyFailureBanner 单行横幅文案（无失败为空串）。

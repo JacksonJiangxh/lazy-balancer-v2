@@ -1494,8 +1494,8 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		// 提交后失败审计：Explicit 审计策略下提交后失败必须留痕（与
 		// respondRuleApplyError / EnableRule failEnableWithStatus 同口径）。
 		recordAudit(c, "创建失败", "负载规则", services.FormatAuditDetail(
-			services.AuditRulePart(caddyID), "提交已创建规则事务失败: "+errors.Join(err, restoreErr).Error(), services.AuditResultPart("failure")))
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交规则失败: " + errors.Join(err, restoreErr).Error()})
+			services.AuditRulePart(caddyID), commitUncertainLabel+"："+errors.Join(err, restoreErr).Error(), services.AuditResultPart("failure")))
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + "：" + errors.Join(err, restoreErr).Error()})
 		return
 	}
 	committed = true
@@ -2630,8 +2630,8 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		services.Logf("error", "UpdateRule transaction commit failed for caddy_id=%s: %v", caddyID, err)
 		// 提交后失败审计：提交后失败留痕（Explicit 审计策略，中间件不兜底）。
 		recordAudit(c, "更新失败", "负载规则", services.FormatAuditDetail(
-			services.AuditRulePart(caddyID), "提交规则更新事务失败: "+errors.Join(err, restoreErr).Error(), services.AuditResultPart("failure")))
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交规则更新失败: " + errors.Join(err, restoreErr).Error()})
+			services.AuditRulePart(caddyID), commitUncertainLabel+"："+errors.Join(err, restoreErr).Error(), services.AuditResultPart("failure")))
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + "：" + errors.Join(err, restoreErr).Error()})
 		return
 	}
 	committed = true
@@ -3158,13 +3158,13 @@ func (h *Handlers) DeleteRule(c *gin.Context) {
 			services.Logf("error", "问题: DeleteRule commit and runtime restore failed for caddy_id=%s: commit=%v restore=%v", caddyID, err, restoreErr)
 		}
 		// 提交后失败审计：提交失败留痕（补偿结果一并点名）。
-		detail := "提交规则删除事务失败: " + err.Error()
+		detail := commitUncertainLabel + "：" + err.Error()
 		if restoreErr != nil {
-			detail = "提交规则删除事务失败且恢复失败: " + errors.Join(err, restoreErr).Error()
+			detail = commitUncertainLabel + "，且恢复失败：" + errors.Join(err, restoreErr).Error()
 		}
 		recordAudit(c, "删除失败", "负载规则", services.FormatAuditDetail(
 			services.AuditRulePart(caddyID), detail, services.AuditResultPart("failure")))
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交规则删除失败"})
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel})
 		return
 	}
 	committed = true
@@ -3944,7 +3944,7 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 		//  +：commit 失败统一走已提交视图恢复
 		//（回滚事务 + 重渲染 /load + 回退 LKG/投影/证书物化）。
 		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交规则启用失败: " + errors.Join(err, restoreErr).Error()})
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + "：" + errors.Join(err, restoreErr).Error()})
 		return
 	}
 	committed = true
@@ -4389,8 +4389,8 @@ func (h *Handlers) DisableRule(c *gin.Context) {
 		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
 		// 提交后失败审计：提交失败留痕（Explicit 审计策略）。
 		recordAudit(c, "禁用失败", "负载规则", services.FormatAuditDetail(
-			services.AuditRulePart(caddyID), "提交规则禁用事务失败: "+errors.Join(err, restoreErr).Error(), services.AuditResultPart("failure")))
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交规则禁用失败: " + errors.Join(err, restoreErr).Error()})
+			services.AuditRulePart(caddyID), commitUncertainLabel+"："+errors.Join(err, restoreErr).Error(), services.AuditResultPart("failure")))
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + "：" + errors.Join(err, restoreErr).Error()})
 		return
 	}
 	committed = true

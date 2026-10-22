@@ -195,7 +195,8 @@ func TestMaterializeBranding_atomicReplaceDoesNotMutateExistingInode(t *testing.
 	if err != nil || string(gotNew) != newContent {
 		t.Fatalf("new branding content=%q err=%v", gotNew, err)
 	}
-	matches, err := filepath.Glob(filepath.Join(dataDir, ".branding-*.tmp"))
+	// 临时文件名由原子落盘单源生成（.<base>-*.tmp），断言口径随之通用化。
+	matches, err := filepath.Glob(filepath.Join(dataDir, "*.tmp"))
 	if err != nil || len(matches) != 0 {
 		t.Fatalf("atomic temp files remain: %v err=%v", matches, err)
 	}

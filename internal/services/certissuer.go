@@ -43,8 +43,6 @@ type issuedCertificate struct {
 	deploymentAttempt int
 }
 
-var _ = deploymentLifecycleJobStatuses // 声明已单源上移至 jobstate.go（由 jobLifecycleByStatus 派生）
-
 type certificateDeploymentError struct {
 	err error
 }

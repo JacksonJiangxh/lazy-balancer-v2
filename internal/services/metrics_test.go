@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -631,4 +632,189 @@ func TestMetricsService_Start_collectsBeforeFirstTick(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("首个采集周期（3600s）前 overview 仍为零——启动首轮空窗")
+}
+
+// 采样采集必须单趟解析：旧实现每周期 10 趟全文正则（全局 6 + 规则 4），
+// 16MB body 时 ≈144MB 正则输入。此钉用扫描钩子把「每周期 1 趟」变成机器
+// 可判定断言（生产钩子恒 nil）。
+func TestMetricsService_collect_singleExpositionScanPerCycle(t *testing.T) {
+	setupMetricsRetentionTest(t)
+	isolateMetricsState(t)
+	text := strings.Join([]string{
+		`caddy_http_requests_total{handler="reverse_proxy",host="example.com"} 20`,
+		`caddy_http_request_duration_seconds_count{code="200",handler="reverse_proxy",host="example.com"} 20`,
+		`caddy_http_response_size_bytes_sum{handler="reverse_proxy",host="example.com"} 4096`,
+		`caddy_http_request_size_bytes_sum{handler="reverse_proxy",host="example.com"} 1024`,
+		`caddy_http_request_duration_seconds_bucket{le="0.5",host="example.com"} 20`,
+		`lazybalancer_requests_total{rule="lb_scan"} 20`,
+		`lazybalancer_request_status_total{class="2xx",rule="lb_scan"} 20`,
+		`lazybalancer_bytes_total{direction="in",rule="lb_scan"} 1024`,
+	}, "\n")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(text))
+	}))
+	t.Cleanup(server.Close)
+	scans := 0
+	prometheusScanHook = func(string) { scans++ }
+	t.Cleanup(func() { prometheusScanHook = nil })
+	service := NewMetricsService(server.URL, 30)
+
+	// When
+	service.collect()
+
+	// Then：恰好 1 趟全文扫描，且全局与规则级样本都被正确落库
+	if scans != 1 {
+		t.Fatalf("全文扫描次数=%d, want 1（单趟聚合）", scans)
+	}
+	if got := service.GetOverview().TotalRequests; got != 20 {
+		t.Fatalf("TotalRequests=%d, want 20（全局样本）", got)
+	}
+	var ruleRows int
+	if err := db.MetricsDB.QueryRow(`SELECT COUNT(*) FROM metrics_history WHERE rule_id='lb_scan'`).Scan(&ruleRows); err != nil {
+		t.Fatal(err)
+	}
+	if ruleRows != 1 {
+		t.Fatalf("规则级行数=%d, want 1（同一趟扫描的规则级样本）", ruleRows)
+	}
+}
+
+// 规则级历史行必须单事务批量写：任一行失败整批回滚（旧实现每规则一条独立
+// Exec，部分成功即留下半批行、且每规则一次写事务）。
+func TestMetricsService_storePerRuleMetrics_isAtomicBatch(t *testing.T) {
+	newClusterTestService(t)
+	if _, err := db.MetricsDB.Exec(`CREATE TRIGGER abort_bad_rule BEFORE INSERT ON metrics_history WHEN NEW.rule_id='lb_bad' BEGIN SELECT RAISE(ABORT, 'injected insert failure'); END;`); err != nil {
+		t.Fatal(err)
+	}
+	service := &MetricsService{}
+	byRule := map[string]*ruleLabelAggregate{
+		"lb_good": {requests: 1},
+		"lb_bad":  {requests: 2},
+	}
+
+	// When
+	err := service.storePerRuleMetrics(byRule)
+
+	// Then：错误上抛且整批回滚（0 行）
+	if err == nil {
+		t.Fatal("单行写入失败必须上抛")
+	}
+	var rows int
+	if qerr := db.MetricsDB.QueryRow(`SELECT COUNT(*) FROM metrics_history`).Scan(&rows); qerr != nil {
+		t.Fatal(qerr)
+	}
+	if rows != 0 {
+		t.Fatalf("metrics_history 行数=%d, want 0（整批回滚，不留半批）", rows)
+	}
+}
+
+// 指标库未初始化时清理/写入必须显式返回而不 nil deref（生产启动链不可达，
+// 与 refreshDBOverviewMetrics 的 nil 守卫同口径）。
+func TestMetricsService_nilMetricsDBGuards(t *testing.T) {
+	oldMetricsDB := db.MetricsDB
+	db.MetricsDB = nil
+	t.Cleanup(func() { db.MetricsDB = oldMetricsDB })
+	service := &MetricsService{}
+
+	if err := service.storeMetrics(parsedMetrics{}); err == nil {
+		t.Fatal("storeMetrics 在 nil 指标库时必须返回错误")
+	}
+	if err := service.storePerRuleMetrics(map[string]*ruleLabelAggregate{"lb_x": {}}); err == nil {
+		t.Fatal("storePerRuleMetrics 在 nil 指标库时必须返回错误")
+	}
+	service.cleanupHistory() // 不得 panic
+}
+
+// 历史清理与采集不再串行：清理在独立 goroutine 推进（积压大时整轮可达数十秒），
+// 期间采集节拍不受影响；重复进入按单飞跳过。
+func TestMetricsService_startHistoryCleanup_isAsyncAndSingleFlight(t *testing.T) {
+	setupMetricsRetentionTest(t)
+	service := NewMetricsService("", 30)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	entered := make(chan struct{})
+	var runs atomic.Int64
+	metricsCleanupHook = func() {
+		runs.Add(1)
+		close(entered)
+		<-release
+	}
+	t.Cleanup(func() {
+		metricsCleanupHook = nil
+		unblock()
+	})
+
+	// When：清理在途（被钩子挂起）
+	done := make(chan struct{})
+	go func() {
+		service.startHistoryCleanup()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("startHistoryCleanup 必须异步返回（清理不得阻塞调用方/采集循环）")
+	}
+	<-entered
+	// 清理在途时再次触发：单飞跳过
+	service.startHistoryCleanup()
+	unblock()
+	service.cleanupWG.Wait()
+
+	// Then：清理只跑了一轮
+	if got := runs.Load(); got != 1 {
+		t.Fatalf("清理执行轮数=%d, want 1（在途时重复触发须跳过）", got)
+	}
+}
+
+// 概览 DB 派生指标每采集周期只刷新一次：旧形态 collect 与 updateOverview 各
+// 刷一次（6 条 COUNT/周期）。钩子把「每周期 1 次」变成机器可判定断言。
+func TestMetricsService_collect_refreshesOverviewCountsOncePerCycle(t *testing.T) {
+	setupMetricsRetentionTest(t)
+	isolateMetricsState(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`caddy_http_requests_total{handler="reverse_proxy",host="example.com"} 5` + "\n"))
+	}))
+	t.Cleanup(server.Close)
+	refreshes := 0
+	overviewRefreshHook = func() { refreshes++ }
+	t.Cleanup(func() { overviewRefreshHook = nil })
+	service := NewMetricsService(server.URL, 30)
+
+	service.collect()
+
+	if refreshes != 1 {
+		t.Fatalf("DB 派生指标刷新次数=%d, want 1（每周期一次，旧形态两次）", refreshes)
+	}
+	if got := service.GetOverview().TotalRequests; got != 5 {
+		t.Fatalf("TotalRequests=%d, want 5", got)
+	}
+}
+
+// 概览 COUNT 失败必须按状态转换去重（30s 周期持久故障时此前 2~3 行/天→每轮
+// 各一条 error；5s 间隔时 ×6）。
+func TestMetricsService_refreshDBOverviewMetrics_dedupesFailureLogs(t *testing.T) {
+	setupMetricsRetentionTest(t)
+	isolateMetricsState(t)
+	originalWriter := log.Writer()
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(originalWriter) })
+	swapBrokenDB(t)
+	service := NewMetricsService("", 30)
+
+	// When：连续两个周期都查失败
+	service.refreshDBOverviewMetrics()
+	service.refreshDBOverviewMetrics()
+
+	// Then：每个类别只首报一次
+	for _, key := range []string{"query active rules failed", "query total rules failed", "query online nodes failed"} {
+		if count := strings.Count(logs.String(), key); count != 1 {
+			t.Fatalf("%q 日志次数=%d, want 1（状态转换去重）: %s", key, count, logs.String())
+		}
+	}
+	// 计数保留前值（0）而非任意归零行为变化
+	if got := service.GetOverview().ActiveRules; got != 0 {
+		t.Fatalf("ActiveRules=%d, want 0", got)
+	}
 }

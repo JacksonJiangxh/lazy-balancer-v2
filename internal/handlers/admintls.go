@@ -259,23 +259,31 @@ func (h *Handlers) InspectAdminTLSCert(c *gin.Context) {
 }
 
 func readAdminTLSFiles(c *gin.Context) (string, string, error) {
-	read := func(field string) (string, error) {
+	// 单文件上限 1 MiB（整体 body 上限 2 MiB 见调用方的 MaxBytesReader）。
+	// limit+1 探测：超限必须显式 400——静默截断后的 PEM 进入
+	// tls.X509KeyPair/证书解析只会得到「证书与私钥不匹配」这类误导性材料
+	// 错误，用户无从知道是大小超限。
+	const maxAdminTLSFileBytes = 1 << 20
+	read := func(field, label string) (string, error) {
 		f, _, err := c.Request.FormFile(field)
 		if err != nil {
 			return "", errors.New("请上传" + field + " 文件")
 		}
 		defer f.Close()
-		data, err := io.ReadAll(io.LimitReader(f, 1<<20))
+		data, err := io.ReadAll(io.LimitReader(f, maxAdminTLSFileBytes+1))
 		if err != nil {
 			return "", err
 		}
+		if len(data) > maxAdminTLSFileBytes {
+			return "", fmt.Errorf("%s 超过 1 MiB 上限，请裁剪后重试", label)
+		}
 		return string(data), nil
 	}
-	certPEM, err := read("cert_file")
+	certPEM, err := read("cert_file", "证书文件")
 	if err != nil {
 		return "", "", err
 	}
-	keyPEM, err := read("key_file")
+	keyPEM, err := read("key_file", "私钥文件")
 	if err != nil {
 		return "", "", err
 	}
@@ -316,6 +324,11 @@ func auditAdminTLSFailure(c *gin.Context, reason string) {
 }
 
 func (h *Handlers) UpdateAdminTLS(c *gin.Context) {
+	// global_config(admin_tls_*) 写者：导入窗口内提交会被导入静默覆盖，事务
+	// 开启后排队至导入结束——与同族 settings 写者同口径 409 fast-fail。
+	if rejectWriteDuringImport(c, "保存管理面板 HTTPS 配置（配置导入进行中）") {
+		return
+	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 2<<20)
 	input, err := decodeAdminTLSInput(c)
 	if err != nil {
@@ -394,19 +407,26 @@ func (h *Handlers) UpdateAdminTLS(c *gin.Context) {
 		cert, key = "", ""
 	}
 	// 值未变更不写库不重启——此前无条件 UPDATE+
-	// restartProcess，设置页重复保存产生无谓进程重启。未变更即无状态迁移，
-	// 不再重复校验（存量值保存时已过同一校验链）。
-	if enabled == current.Enabled && mode == current.Mode && cert == current.Cert && key == current.Key {
-		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "配置未变更，无需重启"})
-		return
-	}
+	// restartProcess，设置页重复保存产生无谓进程重启。
+	unchanged := enabled == current.Enabled && mode == current.Mode && cert == current.Cert && key == current.Key
 
 	// 形态校验（mode 值域 + 启用态必选来源 + upload 配对/有效期）与 v2 备份
 	// 导入（config_backup.go）共用同一实现（收敛：原内联校验与
 	// validateAdminTLSConfigValues 双份——改一处漏一处即分叉）。
+	// 校验前置于「未变更」短路：存量值可能来自带外改库/坏导入，原样提交若直接
+	// 200「未变更」会把非法组合无声固化且不给修复提示（纯 CPU 校验、无副作用）。
 	if err := validateAdminTLSConfigValues(services.AdminTLSConfig{Enabled: enabled, Mode: mode, Cert: cert, Key: key}); err != nil {
+		if unchanged {
+			auditAdminTLSFailure(c, "存量配置无效（本次值未变更）: "+err.Error())
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "当前已保存的管理面板 HTTPS 配置无效（" + err.Error() + "），本次提交未做修改；请重新选择证书来源或上传证书后保存以修复"})
+			return
+		}
 		auditAdminTLSFailure(c, "配置校验失败: "+err.Error())
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
+		return
+	}
+	if unchanged {
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "配置未变更，无需重启"})
 		return
 	}
 	// 独有探针：启用态以真实落盘目录探测证书可用性（自签名生成/文件读写），

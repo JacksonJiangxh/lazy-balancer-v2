@@ -1,14 +1,17 @@
 package handlers
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
-
-	"github.com/gin-gonic/gin"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gin-gonic/gin"
+	"golang.org/x/sync/singleflight"
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
@@ -43,24 +46,129 @@ func (h *Handlers) GetAuditLogOptions(c *gin.Context) {
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]interface{}{}})
 		return
 	}
+	// 缓存命中直返；并发 miss 经 single-flight 只跑一趟三条 GROUP BY（其余
+	// 等待同一结果）——60s 边界或多人同时打开筛选面板不再以 3N 次全表聚合
+	// 打到 SQLite。锁只保护缓存读写（double-check），查询在无锁状态执行。
+	if payload, ok := loadAuditOptionsCache(time.Now()); ok {
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: payload})
+		return
+	}
+	// 聚合脱离首个请求的取消信号（首请求断开不应让同批等待者失败），保留
+	// 总时长上限。
+	value, _, _ := auditOptionsGroup.Do("audit-options", func() (any, error) {
+		if payload, ok := loadAuditOptionsCache(time.Now()); ok {
+			return payload, nil
+		}
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), 10*time.Second)
+		defer cancel()
+		payload, fetchErr := auditOptionsFetch(ctx)
+		// 任一 fetchDistinct 出错即跳过本轮缓存写入——空结果是故障形态,
+		// 缓存它会让一次瞬态错误在 60s 窗口内持续喂空下拉。
+		// 故障轮响应携带可选 partial=true（旧字段原样保留，前端/JSON
+		// 消费方兼容），让「部分下拉」与「真空库」可区分。
+		if fetchErr == nil {
+			storeAuditOptionsCache(payload, time.Now())
+		} else {
+			payload["partial"] = true
+		}
+		return payload, nil
+	})
+	payload, _ := value.(map[string]interface{})
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: payload})
+}
+
+// auditOptionsGroup 并发 miss 合并组：同一时刻只跑一趟下拉聚合。
+var auditOptionsGroup singleflight.Group
+
+// auditOptionsFetch 是下拉聚合的抓取入口（测试缝：计数/慢响应注入）。
+var auditOptionsFetch = fetchAuditLogOptions
+
+func loadAuditOptionsCache(now time.Time) (map[string]interface{}, bool) {
+	auditOptionsCache.Lock()
+	defer auditOptionsCache.Unlock()
+	if auditOptionsCache.payload != nil && now.Before(auditOptionsCache.expiresAt) {
+		return auditOptionsCache.payload, true
+	}
+	return nil, false
+}
+
+func storeAuditOptionsCache(payload map[string]interface{}, now time.Time) {
+	auditOptionsCache.Lock()
+	auditOptionsCache.payload = payload
+	auditOptionsCache.expiresAt = now.Add(60 * time.Second)
+	auditOptionsCache.Unlock()
+}
+
+// auditLogCountCacheTTL 审计列表 total（全表 COUNT(*)）的进程内缓存窗口：
+// 审计库为百万行级（见 logstats 全表计数注释），每次翻页/筛选都付一次全表
+// 计数；行数是展示与翻页锚点，5s 陈旧对用户不可感知。键=筛选条件签名——
+// 不同筛选各自成桶，读失败不缓存（下一请求重试）。响应以 total_stale
+// 披露「本次计数来自缓存」，消费方据此判断是否需要刷新核对。
+var auditLogCountCacheTTL = 5 * time.Second
+
+type auditLogCountEntry struct {
+	total int64
+	at    time.Time
+}
+
+var auditLogCounts struct {
+	sync.Mutex
+	entries map[string]auditLogCountEntry
+}
+
+// resetAuditLogCountCacheForTest 仅供测试隔离（跨用例的审计库交换后不得
+// 读到上一夹具的计数）。
+func resetAuditLogCountCacheForTest() {
+	auditLogCounts.Lock()
+	auditLogCounts.entries = nil
+	auditLogCounts.Unlock()
+}
+
+func auditLogCountCacheKey(where string, args []interface{}) string {
+	var b strings.Builder
+	b.WriteString(where)
+	for _, arg := range args {
+		b.WriteString("\x1f")
+		b.WriteString(fmt.Sprint(arg))
+	}
+	return b.String()
+}
+
+// cachedAuditLogTotal 返回当前筛选条件的 total；stale=true 表示来自缓存。
+// 缓存桶上限 64（任意筛选组合不得让缓存无界增长），越界整表重置。
+func cachedAuditLogTotal(database *sql.DB, where string, args []interface{}) (int64, bool, error) {
+	key := auditLogCountCacheKey(where, args)
+	now := time.Now()
+	auditLogCounts.Lock()
+	entry, ok := auditLogCounts.entries[key]
+	auditLogCounts.Unlock()
+	if ok && now.Sub(entry.at) < auditLogCountCacheTTL {
+		return entry.total, true, nil
+	}
+	var total int64
+	if err := database.QueryRow("SELECT COUNT(*) FROM audit_log"+where, args...).Scan(&total); err != nil {
+		return 0, false, err
+	}
+	auditLogCounts.Lock()
+	if len(auditLogCounts.entries) >= 64 {
+		auditLogCounts.entries = nil
+	}
+	if auditLogCounts.entries == nil {
+		auditLogCounts.entries = map[string]auditLogCountEntry{}
+	}
+	auditLogCounts.entries[key] = auditLogCountEntry{total: total, at: now}
+	auditLogCounts.Unlock()
+	return total, false, nil
+}
+
+// fetchAuditLogOptions 执行三条去重聚合（调用方保证同一时刻只跑一趟）。
+func fetchAuditLogOptions(ctx context.Context) (map[string]interface{}, error) {
 	type optionRow struct {
 		Value string `json:"value"`
 		Count int64  `json:"count"`
 	}
-	// 锁只保护缓存读写（double-check，与 brandingStore 慢
-	// 路径同型）——此前持锁执行三条全表 GROUP BY，深审计库/IO 抖动时全部
-	// 筛选面板请求（含命中缓存路径）被串行阻塞。缓存 miss 时释放锁再查询，
-	// 并发 miss 各自查询后写回（同内容，最后写入者胜，无撕裂读）。
-	auditOptionsCache.Lock()
-	if time.Now().Before(auditOptionsCache.expiresAt) && auditOptionsCache.payload != nil {
-		payload := auditOptionsCache.payload
-		auditOptionsCache.Unlock()
-		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: payload})
-		return
-	}
-	auditOptionsCache.Unlock()
 	fetchDistinct := func(column string, limit int) ([]optionRow, error) {
-		rows, err := db.AuditDB.QueryContext(c.Request.Context(), `
+		rows, err := db.AuditDB.QueryContext(ctx, `
 			SELECT `+column+`, COUNT(*) AS cnt FROM audit_log
 			WHERE `+column+` != ''
 			GROUP BY `+column+`
@@ -115,19 +223,7 @@ func (h *Handlers) GetAuditLogOptions(c *gin.Context) {
 		"actions":   collect("action", 100),
 		"resources": collect("COALESCE(resource,'')", 50),
 	}
-	// 任一 fetchDistinct 出错即跳过本轮缓存写入——空结果是故障形态,
-	// 缓存它会让一次瞬态错误在 60s 窗口内持续喂空下拉。
-	// 故障轮响应携带可选 partial=true（旧字段原样保留，前端/JSON
-	// 消费方兼容），让「部分下拉」与「真空库」可区分。
-	if fetchErr == nil {
-		auditOptionsCache.Lock()
-		auditOptionsCache.payload = payload
-		auditOptionsCache.expiresAt = time.Now().Add(60 * time.Second)
-		auditOptionsCache.Unlock()
-	} else {
-		payload["partial"] = true
-	}
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: payload})
+	return payload, fetchErr
 }
 
 // buildAuditLogFilters 组装列筛选 WHERE 子句。时间参数按配置时区解析后
@@ -236,20 +332,30 @@ func (h *Handlers) GetAuditLogs(c *gin.Context) {
 	// 时间范围为配置时区的本地时间（created_at 按 UTC 存储，比较前换算）。
 	loc := time.UTC
 	var tzStr string
+	// 时区读取失败/非法值的留痕走 services 状态转换单源（首报 warn、恢复
+	// info）——此前两分支都直接 Logf("error")，带外写入非法时区后审计页每次
+	// 轮询都记一条 error 淹没真实故障，且恢复无「已恢复」信号（与日志统计
+	// 阈值读取同域口径分裂）。读失败与「值非法」用不同 key 区分。
 	if err := db.DB.QueryRow("SELECT COALESCE(timezone,?) FROM global_config WHERE id=1", db.DefaultTimezone).Scan(&tzStr); err != nil {
-		services.Logf("error", "GetAuditLogs: failed to read configured timezone, using UTC: %v", err)
+		services.LogConfigReadFailure("audit-log-timezone", fmt.Errorf("审计日志筛选时区读取失败（按 UTC 继续）: %w", err))
 	} else if l, lerr := time.LoadLocation(tzStr); lerr == nil {
+		services.LogConfigReadRecovered("audit-log-timezone")
+		services.LogConfigReadRecovered("audit-log-timezone-value")
 		loc = l
 	} else {
-		services.Logf("error", "GetAuditLogs: failed to load timezone %q, using UTC: %v", tzStr, lerr)
+		services.LogConfigReadRecovered("audit-log-timezone")
+		services.LogConfigReadFailure("audit-log-timezone-value", fmt.Errorf("审计日志筛选时区 %q 非法（按 UTC 继续）: %w", tzStr, lerr))
 	}
 	where, args, aborted := buildAuditLogFilters(c, loc)
 	if aborted {
 		return
 	}
 
-	var total int64
-	if err := db.AuditDB.QueryRow("SELECT COUNT(*) FROM audit_log"+where, args...).Scan(&total); err != nil {
+	// total 走 5s 进程缓存（键=筛选条件签名）：百万行审计库下每请求一次
+	// 全表 COUNT(*) 是首屏固定成本，翻页/筛选反复支付；行数是展示与翻页
+	// 锚点，短陈旧不可感知，响应以 total_stale 披露来源（不静默）。
+	total, totalStale, err := cachedAuditLogTotal(db.AuditDB, where, args)
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "查询操作日志失败"})
 		return
 	}
@@ -339,9 +445,10 @@ func (h *Handlers) GetAuditLogs(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]interface{}{
-		"list":      logs,
-		"total":     total,
-		"page":      page,
-		"page_size": pageSize,
+		"list":        logs,
+		"total":       total,
+		"total_stale": totalStale,
+		"page":        page,
+		"page_size":   pageSize,
 	}})
 }

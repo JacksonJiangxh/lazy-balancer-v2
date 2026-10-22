@@ -1,6 +1,7 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -389,15 +390,17 @@ func TestConfigWatchdog_debounceRoundDoesNotCountOrHeartbeat(t *testing.T) {
 	// When：第 60 个检查周期（防抖轮）
 	WatchdogCheckOnce(context.Background())
 
-	// Then：不写心跳，干净轮不增
+	// Then：不写心跳，干净轮归零（防抖轮已观测到不一致：既不是一致证据，
+	// 也不得让窗口跨过它继续累计——否则凑满 60 个干净轮即发出「近 60 轮无漂移」
+	// 的反事实心跳）
 	if data, err := os.ReadFile(taskengine.TaskLogPath("config-watchdog")); err == nil && strings.Contains(string(data), "配置一致") {
 		t.Fatalf("防抖轮不得输出「配置一致」心跳: %q", string(data))
 	}
 	configDriftMu.RLock()
 	rounds, streak := configDriftCleanRounds, configDriftStreak
 	configDriftMu.RUnlock()
-	if rounds != configWatchdogHeartbeatRounds-1 {
-		t.Fatalf("干净轮=%d, want %d（防抖轮不是一致证据）", rounds, configWatchdogHeartbeatRounds-1)
+	if rounds != 0 {
+		t.Fatalf("干净轮=%d, want 0（防抖不一致轮清空窗口）", rounds)
 	}
 	if streak != 1 {
 		t.Fatalf("防抖 streak=%d, want 1", streak)
@@ -641,5 +644,101 @@ func TestConfigWatchdog_checkedRoundSucceeds(t *testing.T) {
 
 	if err := te.Trigger("config-watchdog", "manual", ""); err != nil {
 		t.Fatalf("真实完成的一致轮必须成功: %v", err)
+	}
+}
+
+// 看门狗角色读取持久失败必须按状态转换留痕（首报一次 + 恢复 info）：此前
+// 每 60s 一条裸 warn＝1440 行/天同一消息，加速应用日志轮转并淹没真实信号。
+func TestConfigWatchdog_roleReadFailureLogsOnceAndRecovers(t *testing.T) {
+	newClusterTestService(t)
+	resetConfigWatchdogForTest(t)
+	isolateMetricsState(t)
+	newTaskLogDir(t)
+	oldURL := watchdogAdminURLValue
+	t.Cleanup(func() { watchdogAdminURLValue = oldURL })
+	watchdogAdminURLValue = fakeCaddyWithRoutes(t, emptyCaddyConfig).URL
+	originalWriter := log.Writer()
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(originalWriter) })
+
+	// When：角色读取连续两轮失败
+	swapBrokenDB(t)
+	for range 2 {
+		if err := WatchdogCheckOnce(context.Background()); err == nil {
+			t.Fatal("角色读取失败必须让本轮返回错误（task_runs failed）")
+		}
+	}
+	if count := strings.Count(logs.String(), "角色读取失败"); count != 1 {
+		t.Fatalf("角色读取失败日志次数=%d, want 1（状态转换去重）: %s", count, logs.String())
+	}
+}
+
+// 看门狗持锁期间不得做日志 I/O：日志落盘慢（轮转 writer/stdout 背压）时
+// 读接口（GetCaddyStatus → CurrentConfigDrift RLock）会被连带阻塞。
+func TestConfigWatchdog_doesNotHoldDriftLockDuringLogIO(t *testing.T) {
+	newClusterTestService(t)
+	resetConfigWatchdogForTest(t)
+	newTaskLogDir(t)
+	oldURL := watchdogAdminURLValue
+	t.Cleanup(func() { watchdogAdminURLValue = oldURL })
+	// 运行配置不可解析 → 读失败分支（该分支历史上在锁内 Logf）
+	watchdogAdminURLValue = fakeCaddyWithRoutes(t, "not-a-config").URL
+	writer := &blockingLogWriter{marker: "读取运行配置失败", entered: make(chan struct{}), release: make(chan struct{})}
+	originalWriter := log.Writer()
+	log.SetOutput(writer)
+	t.Cleanup(func() {
+		log.SetOutput(originalWriter)
+		writer.unblock()
+	})
+
+	done := make(chan struct{})
+	go func() {
+		_ = WatchdogCheckOnce(context.Background())
+		close(done)
+	}()
+	select {
+	case <-writer.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("未进入读失败日志写入（夹具失效）")
+	}
+
+	// Then：日志写入阻塞中，状态读者必须仍能取得快照
+	read := make(chan struct{})
+	go func() {
+		_ = CurrentConfigDrift()
+		close(read)
+	}()
+	select {
+	case <-read:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("日志 I/O 阻塞时仍持有 configDriftMu → CurrentConfigDrift 被阻塞")
+	}
+	writer.unblock()
+	<-done
+}
+
+// blockingLogWriter 在写入含 marker 的首行时阻塞，直到 unblock（模拟日志
+// 落盘慢/背压）；其他行直接放行。
+type blockingLogWriter struct {
+	marker  string
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (w *blockingLogWriter) Write(p []byte) (int, error) {
+	if w.marker != "" && strings.Contains(string(p), w.marker) {
+		w.once.Do(func() { close(w.entered) })
+		<-w.release
+	}
+	return len(p), nil
+}
+
+func (w *blockingLogWriter) unblock() {
+	select {
+	case <-w.release:
+	default:
+		close(w.release)
 	}
 }

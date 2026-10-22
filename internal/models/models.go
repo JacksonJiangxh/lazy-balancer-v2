@@ -704,6 +704,9 @@ type SystemMetrics struct {
 	DiskTotal     uint64  `json:"disk_total"`
 	DiskUsed      uint64  `json:"disk_used"`
 	DiskPercent   float64 `json:"disk_percent"`
+	// Degraded 列出本次采集失败的分项（memory/disk/cpu）——分项降级时
+	// 对应数值为 0，消费方据此区分「真的是 0」与「采集失败」。
+	Degraded []string `json:"degraded,omitempty"`
 }
 
 // RealtimeTraffic contains real-time network traffic data

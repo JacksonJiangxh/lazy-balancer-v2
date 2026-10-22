@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
@@ -181,6 +182,74 @@ func parseSectionsParam(qs string) []string {
 	}
 	return sel
 }
+
+// resolveImportSectionSelection 解析本次导入/预览的有效分类选择——单源，
+// 两条路径各调一次，保证「预览通过=导入可提交」。
+//   - lbbak 通道的分类选择经 ?sections= query 传输（与导出对称），体内
+//     sections 是打包时的分类记录：两者同时给值时取交集——query 选到备份未含
+//     的分类会过滤掉全部表，替换式覆盖会让「零导入」冒充成功；
+//   - 纯 JSON 通道无 query 语义，体内 sections 即有效选择（归一 legacy 键）。
+//
+// 交集为空返回与导入 400 完全一致的文案错误（预览以 valid=false 呈现）。
+func resolveImportSectionSelection(backup *configBackup, queryRaw string, viaLbbak bool) error {
+	bodySections := normalizeBackupSectionKeys(backup.Sections)
+	if !viaLbbak {
+		backup.Sections = bodySections
+		return nil
+	}
+	querySections := normalizeBackupSectionKeys(parseSectionsParam(queryRaw))
+	switch {
+	case len(querySections) == 0:
+		// query 未指定：沿用体内 sections（lbbak 打包时的分类记录）。
+		backup.Sections = bodySections
+		return nil
+	case len(bodySections) == 0:
+		backup.Sections = querySections
+		return nil
+	}
+	allowed := make(map[string]bool, len(bodySections))
+	for _, key := range bodySections {
+		allowed[key] = true
+	}
+	intersection := make([]string, 0, len(querySections))
+	for _, key := range querySections {
+		if allowed[key] {
+			intersection = append(intersection, key)
+		}
+	}
+	if len(intersection) == 0 {
+		return fmt.Errorf("所选分类与备份内容无交集（请求：%s；备份：%s），未导入任何数据",
+			strings.Join(querySections, ","), strings.Join(bodySections, ","))
+	}
+	backup.Sections = intersection
+	return nil
+}
+
+// assertImportScopeHasContent 校验分类过滤（以及其后的软跳过/剔除步）之后
+// 本次导入仍有内容可落库——预览/导入共用同一判据与文案，杜绝「什么都没导入
+// 但提示成功」。判据：任一待导表存在（空表也算内容——导入=清空本地表），或
+// 选中了全局配置区。
+//
+// stage 区分两种成因，文案不混用：
+//   - importScopeFiltered：仅完成分类过滤（请求选择与备份内容无交集）；
+//   - importScopeSkipped：已执行软跳过/剔除步（分类内容被全部跳过或保留本地）。
+func assertImportScopeHasContent(tables map[string][]map[string]any, includeGlobal bool, sections []string, stage importScopeStage) error {
+	if includeGlobal || len(tables) > 0 {
+		return nil
+	}
+	requested := strings.Join(normalizeBackupSectionKeys(sections), ",")
+	if stage == importScopeSkipped {
+		return fmt.Errorf("所选分类内容均被跳过或保留本地，未导入任何数据（请求：%s）", requested)
+	}
+	return fmt.Errorf("所选分类与备份内容无交集（请求：%s），未导入任何数据", requested)
+}
+
+type importScopeStage int
+
+const (
+	importScopeFiltered importScopeStage = iota
+	importScopeSkipped
+)
 
 var configBackupV1Tables = []string{"lb_rules", "upstreams", "users", "api_keys", "ca_providers", "certificate_configs", "cert_jobs"}
 
@@ -1319,6 +1388,29 @@ func validateImportedSecurityCustomRules(rows []map[string]any) error {
 	return nil
 }
 
+// configBackupChecksumPayload 序列化完整性校验和载荷——导出与校验共用的
+// 单一实现，杜绝算法双份漂移。
+//
+// version 3 起把 meta 与体内 sections（还原范围）纳入摘要：还原范围完全取自
+// sections，篡改它必须触发「已篡改」而不是静默改变还原范围。version 1/2 的
+// 存量包仍按旧口径 {tables,config} 校验——改旧口径会让全部存量备份误报篡改。
+func configBackupChecksumPayload(backup configBackup) ([]byte, error) {
+	if backup.Meta.Version >= 3 {
+		meta := backup.Meta
+		meta.Checksum = "" // 校验和自身不入摘要（omitempty 保证字节稳定）
+		return json.Marshal(struct {
+			Meta     configBackupMeta            `json:"meta"`
+			Sections []string                    `json:"sections,omitempty"`
+			Tables   map[string][]map[string]any `json:"tables"`
+			Config   map[string]any              `json:"config"`
+		}{meta, backup.Sections, backup.Tables, backup.Config})
+	}
+	return json.Marshal(struct {
+		Tables map[string][]map[string]any `json:"tables"`
+		Config map[string]any              `json:"config"`
+	}{backup.Tables, backup.Config})
+}
+
 // verifyBackupIntegrity 整包完整性校验：结构/版本/导出口径、checksum（对全量
 // tables+config 计算，未选分类同样覆盖）、布尔 NULL 归一、必需表门、管理员门。
 // 在 sections 过滤之前执行。返回 usedLegacyChecksum=true 表示走了旧格式
@@ -1329,27 +1421,24 @@ func verifyBackupIntegrity(backup configBackup) (bool, error) {
 	if backup.Meta.App != "lazy-balancer-v2" || backup.Tables == nil {
 		return false, errors.New("不是有效的 Lazy Balancer 备份文件")
 	}
-	if backup.Meta.Version != 1 && backup.Meta.Version != 2 {
+	if backup.Meta.Version < 1 || backup.Meta.Version > 3 {
 		return false, fmt.Errorf("不支持的备份版本: %d", backup.Meta.Version)
 	}
 	// v2.3.0 分类导出可不带全局配置区(未勾选「全局配置」):Config=nil 合法,
 	// 校验和按导出时的实际内容(含 null 形态)计算仍完整覆盖;从完整导出中
 	// 恶意剥离 Config 会触发校验和不一致而被拒。
-	// v2 备份必带导出时间戳与校验和（v2.1.1 起导出即两者齐备）。剥掉
-	// exported_at 或 checksum 的 v2 文件一律按不兼容拒绝——旧格式校验和回退仅限
+	// v2/v3 备份必带导出时间戳与校验和（v2.1.1 起导出即两者齐备）。剥掉
+	// exported_at 或 checksum 的文件一律按不兼容拒绝——旧格式校验和回退仅限
 	// Version==1 的史前导出，防止 Config 区（dns_credentials/acme_email/管理面板
 	// TLS 材料）借字段剥离绕过完整性校验。
-	if backup.Meta.Version == 2 && backup.Meta.ExportedAt == "" {
+	if backup.Meta.Version >= 2 && backup.Meta.ExportedAt == "" {
 		return false, errors.New("备份由 v2.1.1 或更早版本导出，校验和格式不兼容，请使用 v2.1.2 及以上版本重新导出后再导入")
 	}
-	if backup.Meta.Version == 2 && backup.Meta.Checksum == "" {
+	if backup.Meta.Version >= 2 && backup.Meta.Checksum == "" {
 		return false, errors.New("备份缺少完整性校验和，请使用 v2.1.2 及以上版本重新导出后再导入")
 	}
 	if backup.Meta.Checksum != "" {
-		checksumPayload, err := json.Marshal(struct {
-			Tables map[string][]map[string]any `json:"tables"`
-			Config map[string]any              `json:"config"`
-		}{backup.Tables, backup.Config})
+		checksumPayload, err := configBackupChecksumPayload(backup)
 		if err != nil {
 			return false, fmt.Errorf("计算备份校验和失败: %w", err)
 		}
@@ -1363,15 +1452,14 @@ func verifyBackupIntegrity(backup configBackup) (bool, error) {
 			tablesJSON, _ := json.Marshal(backup.Tables)
 			oldSum := sha256.Sum256(tablesJSON)
 			tablesOnlyMatch := hex.EncodeToString(oldSum[:]) == backup.Meta.Checksum
-			if backup.Meta.ExportedAt == "" && backup.Meta.Version == 1 {
-				if tablesOnlyMatch {
-					// legacy 形态是受支持路径——只跳过「checksum 不匹配
-					// 即拒」，置标志位后继续执行布尔/cert 状态/CA 白名单/凭证/
-					// 管理员门（此前 early-return 让这些门对 legacy 全失效）。
-					usedLegacyChecksum = true
-					goto afterChecksum
-				}
-			} else if tablesOnlyMatch {
+			if backup.Meta.ExportedAt == "" && backup.Meta.Version == 1 && tablesOnlyMatch {
+				// legacy 形态是受支持路径——只跳过「checksum 不匹配
+				// 即拒」，置标志位后继续执行布尔/cert 状态/CA 白名单/凭证/
+				// 管理员门（此前 early-return 让这些门对 legacy 全失效）。
+				usedLegacyChecksum = true
+				goto afterChecksum
+			}
+			if backup.Meta.Version == 2 && tablesOnlyMatch {
 				// v2.1.1（及更早）导出即「tables-only 校验和 + exported_at
 				// 非空」形态——tables 区完整性成立，是合法旧版文件而非篡改证据；
 				// 但 Config 区不受旧校验和保护，仍须拒绝导入，仅改报兼容性提示。
@@ -1430,12 +1518,14 @@ afterChecksum:
 	if len(backup.Tables["users"]) == 0 {
 		return usedLegacyChecksum, nil
 	}
+	// 管理员可用性门：启用且「可登录」——仅 role+is_enabled 会让空哈希/缺
+	// OIDC 身份的账号名义通过；导入事务随后吊销全部会话，面板将无人可登录。
 	for _, user := range backup.Tables["users"] {
-		if role, _ := user["role"].(string); role == "admin" && backupBooleanEnabled(user["is_enabled"]) {
+		if role, _ := user["role"].(string); role == "admin" && backupBooleanEnabled(user["is_enabled"]) && backupUserLoginCapable(user) {
 			return usedLegacyChecksum, nil
 		}
 	}
-	return false, errors.New("备份必须至少包含一个已启用的管理员账号")
+	return false, errors.New("备份必须至少包含一个已启用的管理员账号，且该账号具备可用登录凭据（本地密码或完整 OIDC 身份）")
 }
 
 // validateV2BackupCertJobStatuses 在空域名规则及其任务软跳过之后执行，
@@ -1600,6 +1690,65 @@ func validateV2BackupNodeRows(rows []map[string]any) error {
 	return nil
 }
 
+// validateV2BackupUserRows：users 行级「可登录凭据」门。恢复路径（restoreTable）
+// 原样直插 password_hash / mfa_secret / auth_provider，行级门是登录可用性的
+// 唯一提前判据——不可登录的管理员一旦落库，导入事务又会递增
+// password_version 吊销全部会话，面板将永久锁死（只能改库恢复）。
+//
+// 口径为「最低可用门」而非 bcrypt 严格门：OIDC JIT 行合法持有空哈希，
+// 历史导出中的占位哈希不额外放大风险（密码校验本身失败即拒绝登录）。
+func validateV2BackupUserRows(rows []map[string]any) error {
+	for index, row := range rows {
+		line := fmt.Sprintf("备份校验失败：users 第 %d 行", index+1)
+		username, ok := row["username"].(string)
+		if !ok || strings.TrimSpace(username) == "" {
+			return fmt.Errorf("%s username 必须为非空字符串", line)
+		}
+		if username != strings.TrimSpace(username) || strings.ContainsFunc(username, unicode.IsControl) {
+			return fmt.Errorf("%s username 不能含首尾空白或控制字符", line)
+		}
+		if raw, exists := row["role"]; exists && raw != nil {
+			role, ok := raw.(string)
+			if !ok || (role != "admin" && role != "user") {
+				return fmt.Errorf("%s role 仅支持 admin 或 user", line)
+			}
+		}
+		provider := backupString(row["auth_provider"])
+		switch provider {
+		case "", "local":
+			if backupString(row["password_hash"]) == "" {
+				return fmt.Errorf("%s 本地用户的 password_hash 不能为空（该账号将无法登录）", line)
+			}
+		case "oidc":
+			if strings.TrimSpace(backupString(row["oidc_subject"])) == "" || strings.TrimSpace(backupString(row["oidc_issuer"])) == "" {
+				return fmt.Errorf("%s OIDC 用户必须同时携带 oidc_subject 与 oidc_issuer（缺一无法登录）", line)
+			}
+		default:
+			return fmt.Errorf("%s auth_provider 仅支持 local 或 oidc，实际 %q", line, provider)
+		}
+		if backupBooleanEnabled(row["mfa_enabled"]) && strings.TrimSpace(backupString(row["mfa_secret"])) == "" {
+			return fmt.Errorf("%s 已启用 MFA 但 mfa_secret 为空（该账号将无法完成登录）", line)
+		}
+	}
+	return nil
+}
+
+// backupUserLoginCapable 判定备份行是否为「可登录」账号（管理员可用性门用）：
+// local 需非空 password_hash，oidc 需完整 subject+issuer；启用 MFA 的行还需
+// 非空密钥，否则登录恒卡在 MFA 校验。
+func backupUserLoginCapable(user map[string]any) bool {
+	if backupBooleanEnabled(user["mfa_enabled"]) && strings.TrimSpace(backupString(user["mfa_secret"])) == "" {
+		return false
+	}
+	switch backupString(user["auth_provider"]) {
+	case "oidc":
+		return strings.TrimSpace(backupString(user["oidc_subject"])) != "" &&
+			strings.TrimSpace(backupString(user["oidc_issuer"])) != ""
+	default:
+		return backupString(user["password_hash"]) != ""
+	}
+}
+
 // validateV2BackupRows 行级门（布尔类型/白名单/凭证），必须在
 // sections 过滤之后执行：未选分类的坏行不误拒整包，选中分类照常
 // 严格校验。checksum 已在 verifyBackupIntegrity 对全量计算。
@@ -1628,6 +1777,19 @@ func validateV2BackupRows(backup configBackup) error {
 	// 已删除、pending 语义已归一，本门只面对落库候选形态。
 	if rows, ok := backup.Tables["nodes"]; ok {
 		if err := validateV2BackupNodeRows(rows); err != nil {
+			return err
+		}
+	}
+	// users 行级「可登录凭据」门——管理员可用性门（verifyBackupIntegrity）只
+	// 能证明存在启用管理员；空哈希/空 MFA 密钥/缺 OIDC 身份的账号导入后
+	// 全站会话已吊销且无人可登录（面板永久锁死，需改库恢复）。本门按行点名：
+	//   - local（含缺省 auth_provider）必须携带非空 password_hash；
+	//   - oidc 必须同时携带 oidc_subject 与 oidc_issuer（登录按三元组命中身份行）；
+	//   - mfa_enabled=1 必须有非空 mfa_secret（否则登录恒卡在 MFA 校验）。
+	// 不做 bcrypt 形态严格门：OIDC JIT 行合法持有空哈希，历史/第三方导出的
+	// 占位哈希亦不构成「不可登录」以外的数据风险（本级只堵登录失效）。
+	if rows, ok := backup.Tables["users"]; ok {
+		if err := validateV2BackupUserRows(rows); err != nil {
 			return err
 		}
 	}
@@ -1733,7 +1895,260 @@ func validateV2BackupRows(backup configBackup) error {
 			return fmt.Errorf("备份的 DNS 提供商凭证无效: %w", err)
 		}
 	}
+	// 主键/唯一键预检——脏备份的键冲突必须在校验期以 400 点名表与键退出；
+	// 落到 restoreTable 直插时只会以 500「写入表 …」整体回滚。
+	if err := validateBackupUniqueKeys(backup.Tables); err != nil {
+		return err
+	}
 	return nil
+}
+
+// backupPartialUniqueKeyPredicates 部分唯一索引的谓词单源：SQLite 唯一索引
+// 只约束满足 WHERE 的行，导入预检必须按同一谓词圈定参与比对的行。
+var backupPartialUniqueKeyPredicates = map[string]func(map[string]any) bool{
+	// security_ip_lists(name) WHERE system=1（内含系统名单同名唯一）。
+	"u_security_ip_lists_system_name": func(row map[string]any) bool {
+		return backupBooleanEnabled(row["system"])
+	},
+	// users(oidc_issuer, oidc_subject) WHERE auth_provider='oidc' AND oidc_subject<>''。
+	"u_oidc_identity": func(row map[string]any) bool {
+		return backupString(row["auth_provider"]) == "oidc" && backupString(row["oidc_subject"]) != ""
+	},
+}
+
+// backupUniqueKeySpec 一条参与预检的键约束（主键或唯一索引）。
+type backupUniqueKeySpec struct {
+	label     string
+	columns   []string
+	predicate func(map[string]any) bool
+}
+
+// validateBackupUniqueKeys 按实际 schema 派生的主键/唯一键做导入前预检：
+// 重复行在 restoreTable 直插时只会以 500「写入表 …」整体回滚，此处以 400
+// 点名表/行/键退出，与 nodes 的 (ip_address,port) 行门同口径。
+//
+// 键集从 PRAGMA 派生（新增表/键自动覆盖，不形成逐表手写清单）；部分唯一索引
+// 按 backupPartialUniqueKeyPredicates 谓词过滤，未注册谓词的部分索引跳过
+// （保守不误拒）；含 NULL/缺列的行按 SQLite 语义不参与唯一性比对。
+func validateBackupUniqueKeys(tables map[string][]map[string]any) error {
+	if db.DB == nil {
+		return nil
+	}
+	for _, table := range configBackupTables {
+		rows, carried := tables[table]
+		if !carried || len(rows) < 2 {
+			continue
+		}
+		specs, err := backupUniqueKeySpecs(table)
+		if err != nil {
+			return err
+		}
+		for _, spec := range specs {
+			seen := make(map[string]int, len(rows))
+			for index, row := range rows {
+				if spec.predicate != nil && !spec.predicate(row) {
+					continue
+				}
+				key, ok := backupUniqueKeyValue(row, spec.columns)
+				if !ok {
+					continue
+				}
+				if previous, duplicate := seen[key]; duplicate {
+					return fmt.Errorf("备份校验失败：%s 第 %d 行与第 %d 行 %s 重复（导入会触发唯一约束）",
+						table, index+1, previous+1, spec.label)
+				}
+				seen[key] = index
+			}
+		}
+	}
+	return nil
+}
+
+// backupUniqueKeySpecs 读取表的键约束：主键列（PRAGMA table_info 的 pk 序号）
+// 与唯一索引（PRAGMA index_list unique=1；部分索引带 partial=1）。
+func backupUniqueKeySpecs(table string) ([]backupUniqueKeySpec, error) {
+	specs := make([]backupUniqueKeySpec, 0, 3)
+	primaryKey, err := backupPrimaryKeyColumns(table)
+	if err != nil {
+		return nil, err
+	}
+	if len(primaryKey) > 0 {
+		specs = append(specs, backupUniqueKeySpec{
+			label:   "主键 " + strings.Join(primaryKey, "+"),
+			columns: primaryKey,
+		})
+	}
+	indexRows, err := db.DB.Query(`PRAGMA index_list('` + table + `')`)
+	if err != nil {
+		return nil, fmt.Errorf("读取表 %s 索引: %w", table, err)
+	}
+	type indexEntry struct {
+		name    string
+		unique  int
+		partial int
+	}
+	entries := make([]indexEntry, 0, 2)
+	for indexRows.Next() {
+		var (
+			seq    int
+			entry  indexEntry
+			origin string
+		)
+		if err := indexRows.Scan(&seq, &entry.name, &entry.unique, &origin, &entry.partial); err != nil {
+			return nil, fmt.Errorf("读取表 %s 索引: %w", table, err)
+		}
+		if entry.unique == 1 {
+			entries = append(entries, entry)
+		}
+	}
+	if err := indexRows.Err(); err != nil {
+		_ = indexRows.Close()
+		return nil, fmt.Errorf("读取表 %s 索引: %w", table, err)
+	}
+	// 显式关闭后再发起 index_info 查询——单连接池下未关闭的 Rows 会占住连接。
+	if err := indexRows.Close(); err != nil {
+		return nil, fmt.Errorf("读取表 %s 索引: %w", table, err)
+	}
+	for _, entry := range entries {
+		var predicate func(map[string]any) bool
+		if entry.partial == 1 {
+			// 未注册谓词的部分索引无法判定圈定范围——跳过（宁可不报，不误拒）。
+			predicate = backupPartialUniqueKeyPredicates[entry.name]
+			if predicate == nil {
+				continue
+			}
+		}
+		columns, err := backupIndexColumns(entry.name)
+		if err != nil {
+			return nil, err
+		}
+		if len(columns) == 0 {
+			continue // 表达式索引（index_info 无列名）不在预检范围
+		}
+		specs = append(specs, backupUniqueKeySpec{
+			label:     "唯一键 " + strings.Join(columns, "+"),
+			columns:   columns,
+			predicate: predicate,
+		})
+	}
+	return specs, nil
+}
+
+// backupPrimaryKeyColumns 返回主键列（按 pk 序号排列）；无主键返回 nil。
+func backupPrimaryKeyColumns(table string) ([]string, error) {
+	rows, err := db.DB.Query(`PRAGMA table_info('` + table + `')`)
+	if err != nil {
+		return nil, fmt.Errorf("读取表 %s 结构: %w", table, err)
+	}
+	defer rows.Close()
+	ordered := map[int]string{}
+	maxOrdinal := 0
+	for rows.Next() {
+		var (
+			cid        int
+			name       string
+			columnType string
+			notNull    int
+			defaultVal any
+			pkOrdinal  int
+		)
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultVal, &pkOrdinal); err != nil {
+			return nil, fmt.Errorf("读取表 %s 结构: %w", table, err)
+		}
+		if pkOrdinal > 0 {
+			ordered[pkOrdinal] = name
+			if pkOrdinal > maxOrdinal {
+				maxOrdinal = pkOrdinal
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("读取表 %s 结构: %w", table, err)
+	}
+	if maxOrdinal == 0 {
+		return nil, nil
+	}
+	columns := make([]string, 0, maxOrdinal)
+	for ordinal := 1; ordinal <= maxOrdinal; ordinal++ {
+		name, ok := ordered[ordinal]
+		if !ok {
+			return nil, nil // 异常主键序（部分列缺失）→ 预检放弃，不猜
+		}
+		columns = append(columns, name)
+	}
+	return columns, nil
+}
+
+// backupIndexColumns 返回唯一索引的列名（顺序按索引定义）。
+func backupIndexColumns(indexName string) ([]string, error) {
+	rows, err := db.DB.Query(`PRAGMA index_info('` + indexName + `')`)
+	if err != nil {
+		return nil, fmt.Errorf("读取索引 %s 列: %w", indexName, err)
+	}
+	defer rows.Close()
+	type columnEntry struct {
+		seqno int
+		name  string
+	}
+	ordered := map[int]string{}
+	maxSeqno := -1
+	for rows.Next() {
+		var seqno, cid int
+		var name sql.NullString
+		if err := rows.Scan(&seqno, &cid, &name); err != nil {
+			return nil, fmt.Errorf("读取索引 %s 列: %w", indexName, err)
+		}
+		if !name.Valid {
+			return nil, nil // 表达式索引列无名字
+		}
+		ordered[seqno] = name.String
+		if seqno > maxSeqno {
+			maxSeqno = seqno
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("读取索引 %s 列: %w", indexName, err)
+	}
+	columns := make([]string, 0, maxSeqno+1)
+	for seqno := 0; seqno <= maxSeqno; seqno++ {
+		name, ok := ordered[seqno]
+		if !ok {
+			return nil, nil
+		}
+		columns = append(columns, name)
+	}
+	return columns, nil
+}
+
+// backupUniqueKeyValue 生成唯一性比对键：任一列 NULL/缺列即返回 false
+// （SQLite 唯一索引对含 NULL 的行不作约束）；未知形态交给类型门，不猜。
+func backupUniqueKeyValue(row map[string]any, columns []string) (string, bool) {
+	parts := make([]string, len(columns))
+	for index, column := range columns {
+		value, exists := row[column]
+		if !exists || value == nil {
+			return "", false
+		}
+		switch typed := value.(type) {
+		case string:
+			parts[index] = "s:" + typed
+		case bool:
+			if typed {
+				parts[index] = "b:1"
+			} else {
+				parts[index] = "b:0"
+			}
+		case float64:
+			parts[index] = "f:" + strconv.FormatFloat(typed, 'g', -1, 64)
+		case int:
+			parts[index] = "i:" + strconv.Itoa(typed)
+		case int64:
+			parts[index] = "i:" + strconv.FormatInt(typed, 10)
+		default:
+			return "", false
+		}
+	}
+	return strings.Join(parts, "\x00"), true
 }
 
 // validateV2BackupRules 逐行校验备份 lb_rules 的端口与特性（校验侧保守口径）。
@@ -4212,7 +4627,7 @@ func (h *Handlers) buildLbbakExport(ctx context.Context, sel []string) (payload 
 	}
 	backup := configBackup{
 		Sections: exportedSections,
-		Meta:     configBackupMeta{App: "lazy-balancer-v2", Version: 2, AppVersion: h.cfg.Version, ExportedAt: time.Now().UTC().Format(time.RFC3339)},
+		Meta:     configBackupMeta{App: "lazy-balancer-v2", Version: 3, AppVersion: h.cfg.Version, ExportedAt: time.Now().UTC().Format(time.RFC3339)},
 		Tables:   map[string][]map[string]any{},
 	}
 	// DB 快照与 WAF 文件 bundle 必须来自同一稳定代。锁序
@@ -4281,10 +4696,7 @@ func (h *Handlers) buildLbbakExport(ctx context.Context, sel []string) (payload 
 		services.WafFileLock().Unlock()
 		wafLocked = false
 	}
-	checksumPayload, err := json.Marshal(struct {
-		Tables map[string][]map[string]any `json:"tables"`
-		Config map[string]any              `json:"config"`
-	}{backup.Tables, backup.Config})
+	checksumPayload, err := configBackupChecksumPayload(backup)
 	if err != nil {
 		return nil, nil, "", false, err
 	}
@@ -4459,43 +4871,19 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	for table := range backup.Tables {
 		exportedTables[table] = true
 	}
-	// lbbak 二进制备份无法在请求体内携带 sections——分类选择经
-	// ?sections= query 传输(与导出对称);JSON 备份以体内 sections 字段为准。
-	// 两处同时给值时不得让 query 单向覆盖体内选择（query 选到备份
-	// 未含的分类会过滤掉全部表 → 零导入仍报成功）。改为取交集；交集为空
-	// 显式 400 点名双方选择，杜绝「什么都没导入但提示成功」。
-	if lbbakFiles != nil {
-		querySections := normalizeBackupSectionKeys(parseSectionsParam(c.Query("sections")))
-		bodySections := normalizeBackupSectionKeys(backup.Sections)
-		switch {
-		case len(querySections) == 0:
-			// query 未指定：沿用体内 sections（lbbak 打包时的分类记录）。
-		case len(bodySections) == 0:
-			backup.Sections = querySections
-		default:
-			allowed := make(map[string]bool, len(bodySections))
-			for _, key := range bodySections {
-				allowed[key] = true
-			}
-			intersection := make([]string, 0, len(querySections))
-			for _, key := range querySections {
-				if allowed[key] {
-					intersection = append(intersection, key)
-				}
-			}
-			if len(intersection) == 0 {
-				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf(
-					"所选分类与备份内容无交集（请求：%s；备份：%s），未导入任何数据",
-					strings.Join(querySections, ","), strings.Join(bodySections, ","))})
-				return
-			}
-			backup.Sections = intersection
-		}
-	}
 	// 完整性（checksum/结构/必需表/管理员门）先于 sections 过滤；行级门
 	// （布尔/白名单/cert 状态/凭证）在过滤之后执行，未选分类的坏行不误拒整包。
 	usedLegacyChecksum, err := verifyBackupIntegrity(backup)
 	if err != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
+		return
+	}
+	// 有效分类选择单源（与预览共用 resolveImportSectionSelection）：
+	// lbbak 通道的 ?sections= 与体内 sections 取交集，纯 JSON 通道以体内
+	// sections 为准；交集为空显式 400 点名双方选择。
+	// 必须在完整性校验之后解析——v3 校验和覆盖体内 sections（还原范围），
+	// 用请求交集覆盖后再校验会把合法的子集导入误判为篡改。
+	if err := resolveImportSectionSelection(&backup, c.Query("sections"), lbbakFiles != nil); err != nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
@@ -4543,14 +4931,11 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	if !includeGlobal {
 		backup.Config = nil
 	}
-	// 纯 JSON 备份的零导入交集判据（与 lbbak 通道的 query×body 交集同口径）：
-	// 分类选择与备份实际内容无交集（过滤后既无表、也未选系统数据）时显式 400
-	// 点名双方，杜绝「什么都没导入但提示成功」。lbbak 通道已在入口按
-	// query/body 交集拦截；纯 JSON 无 query 通道，交集即「选择∩备份表集」。
-	if lbbakFiles == nil && len(backup.Tables) == 0 && !includeGlobal {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf(
-			"所选分类与备份内容无交集（请求：%s），未导入任何数据",
-			strings.Join(normalizeBackupSectionKeys(backup.Sections), ","))})
+	// 分类过滤后的零导入判据（与预览共用 assertImportScopeHasContent）：
+	// 选择与备份内容无交集（过滤后既无表、也未选系统数据）时显式 400 点名，
+	// 杜绝「什么都没导入但提示成功」。软跳过之后的二次判据在同序位置。
+	if err := assertImportScopeHasContent(backup.Tables, includeGlobal, backup.Sections, importScopeFiltered); err != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
 	// 纯 JSON 威胁源与软跳过行在结构门之前收敛（预览共用同一准备序列）。
@@ -4609,6 +4994,12 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 		}
 	}
 	if err := validateV2BackupCertJobStatuses(backup.Tables); err != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
+		return
+	}
+	// 软跳过/剔除步之后的零导入判据（与预览同序同位）：软跳过清空表集后
+	// 继续提交会 200 报「成功」但实际零写入——此处以与预览一致的文案 400。
+	if err := assertImportScopeHasContent(backup.Tables, includeGlobal, backup.Sections, importScopeSkipped); err != nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}

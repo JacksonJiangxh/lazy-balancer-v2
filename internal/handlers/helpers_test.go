@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
@@ -12,6 +13,7 @@ import (
 	"errors"
 	"math/big"
 	"os/exec"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -95,37 +97,123 @@ func TestParseNetDevTotals_falls_back_to_physical_interfaces_when_no_default_rou
 	}
 }
 
-func TestGetSystemMetrics_returns_error_when_meminfo_read_fails(t *testing.T) {
-	original := systemMetricsReadFile
-	systemMetricsReadFile = func(string) ([]byte, error) { return nil, errors.New("permission denied") }
-	t.Cleanup(func() { systemMetricsReadFile = original })
-
-	metrics, err := getSystemMetrics()
-	if err == nil || !strings.Contains(err.Error(), "读取系统内存指标失败") {
-		t.Fatalf("metrics=%#v error=%v, want explicit memory error", metrics, err)
-	}
-}
-
-func TestGetSystemMetrics_returns_error_when_df_output_is_invalid(t *testing.T) {
+// 分项降级契约：内存采集失败只让 memory 从结果里缺席（Degraded 披露），
+// 不得连带丢失磁盘/CPU——排障窗口里 CPU 单点故障曾让整卡数据消失。
+func TestGetSystemMetrics_memoryFailureDegradesWithoutLosingOtherParts(t *testing.T) {
 	originalReadFile, originalDFCommand := systemMetricsReadFile, systemMetricsDFCommand
-	systemMetricsReadFile = func(string) ([]byte, error) {
-		return []byte("MemTotal: 1000 kB\nMemAvailable: 400 kB\n"), nil
+	resetDiskUsageCacheForTest(t)
+	resetCPUSampleStateForTest(t)
+	systemMetricsReadFile = func(path string) ([]byte, error) {
+		switch path {
+		case "/proc/meminfo":
+			return nil, errors.New("permission denied")
+		case "/proc/stat":
+			return []byte("cpu 100 0 0 100 0\n"), nil
+		default:
+			return originalReadFile(path)
+		}
 	}
-	systemMetricsDFCommand = func() *exec.Cmd { return exec.Command("sh", "-c", "printf invalid") }
+	systemMetricsDFCommand = func(ctx context.Context) *exec.Cmd {
+		return exec.CommandContext(ctx, "sh", "-c", "printf 'Filesystem 1B-blocks Used Available Use%% Mounted on\n/dev/x 1000 250 750 25%% /\n'")
+	}
 	t.Cleanup(func() {
 		systemMetricsReadFile = originalReadFile
 		systemMetricsDFCommand = originalDFCommand
 	})
 
 	metrics, err := getSystemMetrics()
-	if err == nil || !strings.Contains(err.Error(), "解析系统磁盘指标失败") {
-		t.Fatalf("metrics=%#v error=%v, want explicit disk parse error", metrics, err)
+	if err != nil {
+		t.Fatalf("仅内存失败不得让整次采集失败: %v", err)
+	}
+	if !slices.Contains(metrics.Degraded, "memory") {
+		t.Fatalf("degraded=%v, want 含 memory", metrics.Degraded)
+	}
+	if metrics.MemoryTotal != 0 || metrics.MemoryPercent != 0 {
+		t.Fatalf("内存指标=%+v, want 零值（失败分项不伪造数据）", metrics)
+	}
+	if metrics.DiskTotal != 1000 || metrics.DiskUsed != 250 {
+		t.Fatalf("磁盘指标=%d/%d, want 1000/250（内存失败不得连带丢失）", metrics.DiskTotal, metrics.DiskUsed)
+	}
+	for _, part := range metrics.Degraded {
+		if part == "disk" {
+			t.Fatalf("degraded=%v, 磁盘采集成功不得标记失败", metrics.Degraded)
+		}
+	}
+}
+
+// 磁盘解析失败同样只降级该项。
+func TestGetSystemMetrics_diskFailureDegradesWithoutLosingOtherParts(t *testing.T) {
+	originalReadFile, originalDFCommand := systemMetricsReadFile, systemMetricsDFCommand
+	resetDiskUsageCacheForTest(t)
+	resetCPUSampleStateForTest(t)
+	systemMetricsReadFile = func(path string) ([]byte, error) {
+		switch path {
+		case "/proc/meminfo":
+			return []byte("MemTotal: 1000 kB\nMemAvailable: 400 kB\n"), nil
+		case "/proc/stat":
+			return []byte("cpu 100 0 0 100 0\n"), nil
+		default:
+			return originalReadFile(path)
+		}
+	}
+	systemMetricsDFCommand = func(ctx context.Context) *exec.Cmd {
+		return exec.CommandContext(ctx, "sh", "-c", "printf invalid")
+	}
+	t.Cleanup(func() {
+		systemMetricsReadFile = originalReadFile
+		systemMetricsDFCommand = originalDFCommand
+	})
+
+	metrics, err := getSystemMetrics()
+	if err != nil {
+		t.Fatalf("仅磁盘失败不得让整次采集失败: %v", err)
+	}
+	if !slices.Contains(metrics.Degraded, "disk") {
+		t.Fatalf("degraded=%v, want 含 disk", metrics.Degraded)
+	}
+	if metrics.DiskTotal != 0 || metrics.DiskPercent != 0 {
+		t.Fatalf("磁盘指标=%+v, want 零值（失败分项不伪造数据）", metrics)
+	}
+	if metrics.MemoryTotal == 0 {
+		t.Fatalf("内存指标缺失：磁盘失败不得连带丢失 healthy 分项")
+	}
+	for _, part := range metrics.Degraded {
+		if part == "memory" {
+			t.Fatalf("degraded=%v, 内存采集成功不得标记失败", metrics.Degraded)
+		}
+	}
+}
+
+// 三项全失败才失败（此时确实无可展示数据）。
+func TestGetSystemMetrics_allPartsFailingReturnsError(t *testing.T) {
+	originalReadFile, originalDFCommand := systemMetricsReadFile, systemMetricsDFCommand
+	resetDiskUsageCacheForTest(t)
+	systemMetricsReadFile = func(string) ([]byte, error) { return nil, errors.New("unavailable") }
+	systemMetricsDFCommand = func(ctx context.Context) *exec.Cmd {
+		return exec.CommandContext(ctx, "sh", "-c", "exit 3")
+	}
+	t.Cleanup(func() {
+		systemMetricsReadFile = originalReadFile
+		systemMetricsDFCommand = originalDFCommand
+	})
+
+	_, err := getSystemMetrics()
+	if err == nil {
+		t.Fatal("三项全失败必须返回 error（后端不得以全零冒充健康）")
+	}
+	for _, fragment := range []string{"内存", "磁盘", "CPU"} {
+		if !strings.Contains(err.Error(), fragment) {
+			t.Fatalf("error=%q, want 含 %q（逐项点名失败原因）", err.Error(), fragment)
+		}
 	}
 }
 
 func TestGetConnectionStats_returns_netstat_error(t *testing.T) {
 	original := netstatCommand
-	netstatCommand = func() *exec.Cmd { return exec.Command("sh", "-c", "exit 17") }
+	resetConnectionStatsCacheForTest(t)
+	netstatCommand = func(ctx context.Context) *exec.Cmd {
+		return exec.CommandContext(ctx, "sh", "-c", "exit 17")
+	}
 	t.Cleanup(func() { netstatCommand = original })
 	_, err := getConnectionStats()
 	if err == nil || !strings.Contains(err.Error(), "netstat -tan") {
@@ -530,6 +618,8 @@ func TestParseCPUSnapshot_includes_idle_and_iowait(t *testing.T) {
 }
 
 func TestGetCPUPercent_serializes_sample_read_with_baseline_update(t *testing.T) {
+	// 关闭采样窗口：本用例钉的是「采样读与基线更新串行」，需要每次调用都读样本。
+	disableCPUSampleWindowForTest(t)
 	// Given
 	originalReader := systemMetricsReadFile
 	lastCPUStats.mu.Lock()
@@ -596,6 +686,7 @@ func TestGetCPUPercent_serializes_sample_read_with_baseline_update(t *testing.T)
 }
 
 func TestGetCPUPercent_rebaselines_after_counter_rollback(t *testing.T) {
+	disableCPUSampleWindowForTest(t)
 	// Given
 	originalReader := systemMetricsReadFile
 	lastCPUStats.mu.Lock()
@@ -636,6 +727,8 @@ func TestGetCPUPercent_rebaselines_after_counter_rollback(t *testing.T) {
 }
 
 func TestGetRealtimeTraffic_serializes_sample_read_with_baseline_update(t *testing.T) {
+	// 关闭采样窗口：本用例钉的是「采样读与基线更新串行」，需要每次调用都读样本。
+	disableNetSampleWindowForTest(t)
 	// Given
 	originalReader := systemMetricsReadFile
 	lastNetStats.mu.Lock()
@@ -713,6 +806,7 @@ func TestGetRealtimeTraffic_serializes_sample_read_with_baseline_update(t *testi
 }
 
 func TestGetRealtimeTraffic_rebaselines_after_counter_rollback(t *testing.T) {
+	disableNetSampleWindowForTest(t)
 	// Given
 	originalReader := systemMetricsReadFile
 	lastNetStats.mu.Lock()

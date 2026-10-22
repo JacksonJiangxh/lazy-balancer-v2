@@ -1,7 +1,10 @@
 package services
 
 import (
+	"bytes"
 	"context"
+	"log"
+	"strings"
 	"testing"
 	"time"
 
@@ -434,5 +437,70 @@ func TestAutoBackupNextSlot_outOfRangeWeeklyDayStillSchedules(t *testing.T) {
 	if slot.After(now) {
 		// 未跑过 → 返回最近过去槽（≤now，跨停机补跑）；形态断言即可。
 		t.Fatalf("slot=%v 应 ≤now（未执行过时返回最近槽）", slot)
+	}
+}
+
+// 自动备份开关读失败必须留痕（首报一次）：引擎先求值 EnabledFn 再求值
+// NextSlotFn，EnabledFn 读错即 LoopOn=false 短路——nextAutoBackupSlot 的
+// schedule-read-auto-backup 告警永远不会被求值，静默 fail-closed 让「库故障」
+// 与「用户关闭」在任务面完全同形。同类静默 reader（threat/crawler 总闸）同断言。
+func TestAutoBackupEnabled_logsReadFailureOnceAndRecovers(t *testing.T) {
+	setupAutoBackupTestDB(t)
+	isolateMetricsState(t)
+	originalWriter := log.Writer()
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(originalWriter) })
+
+	// When：主库查询恒失败 ×2
+	swapBrokenDB(t)
+	if AutoBackupEnabled() {
+		t.Fatal("读失败必须 fail-closed（视为关）")
+	}
+	if globalTaskAutoUpdateEnabled("threat") {
+		t.Fatal("读失败必须 fail-closed（视为关）")
+	}
+	AutoBackupEnabled()
+	globalTaskAutoUpdateEnabled("threat")
+
+	// Then：每类只首报一次（状态转换口径，30s×2880 行/天的历史形态）
+	if count := strings.Count(logs.String(), "schedule-read-auto-backup-enabled"); count != 1 {
+		t.Fatalf("auto-backup 开关读失败日志次数=%d, want 1（状态转换去重）: %s", count, logs.String())
+	}
+	if count := strings.Count(logs.String(), "schedule-read-threat-auto-update"); count != 1 {
+		t.Fatalf("threat 总闸读失败日志次数=%d, want 1: %s", count, logs.String())
+	}
+}
+
+// 水位线写失败必须让本轮失败：槽不推进时引擎只在「failed 且槽未推进」才退避，
+// 返回 success 会让默认 1s tick 每秒重投一次完整备份（每次一行 task_runs）。
+func TestAutoBackupScheduled_failsWhenWatermarkUpdateFails(t *testing.T) {
+	setupAutoBackupTestDB(t)
+	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_enabled=1, auto_backup_frequency='daily', auto_backup_time='03:00' WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	// 只让 global_config 的 UPDATE 失败（读路径不受影响）
+	if _, err := db.DB.Exec(`CREATE TRIGGER ab_fail_watermark BEFORE UPDATE ON global_config BEGIN SELECT RAISE(ABORT, 'injected watermark failure'); END;`); err != nil {
+		t.Fatal(err)
+	}
+	var calls []string
+	setAutoBackupTestExecutor(t, &calls, nil)
+
+	// When：备份业务本身成功
+	err := runAutoBackupScheduled(context.Background(), 0)
+
+	// Then：本轮必须返回错误（让引擎退避），且执行器只跑一次
+	if err == nil {
+		t.Fatal("水位线写失败必须让本轮返回 error（否则引擎无退避、每秒重投完整备份）")
+	}
+	if len(calls) != 1 {
+		t.Fatalf("calls=%v, want 单次执行", calls)
+	}
+	var lastRun *string
+	if qerr := db.DB.QueryRow(`SELECT auto_backup_last_run FROM global_config WHERE id=1`).Scan(&lastRun); qerr != nil {
+		t.Fatal(qerr)
+	}
+	if lastRun != nil {
+		t.Fatalf("last_run=%q, want 未推进（UPDATE 失败）", *lastRun)
 	}
 }

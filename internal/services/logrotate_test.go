@@ -3,6 +3,7 @@ package services
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -351,8 +352,12 @@ func TestRuntimeLogCleanupOnce_reportsRetentionMonthsSingleSource(t *testing.T) 
 	res := RuntimeLogCleanupOnce(logFile)
 
 	// Then：保留月数=单源取值，且与实际删除口径一致（13 月前副本超 6 月保留期）
-	if got, want := res.RetentionMonths, auditRetentionMonths(); got != want || got != 6 {
-		t.Fatalf("RetentionMonths=%d, want %d（单源 auditRetentionMonths）", got, want)
+	wantMonths, monthsErr := auditRetentionMonths()
+	if monthsErr != nil {
+		t.Fatalf("读取保留月数: %v", monthsErr)
+	}
+	if got := res.RetentionMonths; got != wantMonths || got != 6 {
+		t.Fatalf("RetentionMonths=%d, want %d（单源 auditRetentionMonths）", got, wantMonths)
 	}
 	if res.AppRemoved != 1 {
 		t.Fatalf("AppRemoved=%d, want 1（13 月前副本超 6 月保留期须删除）", res.AppRemoved)
@@ -468,5 +473,133 @@ func TestStopLogRotateWithin_fastPathDoesNotConsumeBudget(t *testing.T) {
 	}
 	if elapsed := time.Since(begin); elapsed > 2*time.Second {
 		t.Fatalf("正常路径耗时 %s，不得在预算内空等", elapsed)
+	}
+}
+
+// 清理失败必须聚合进结果并让日志行不称「完成」：waf-audit 兜底轮转错误
+// （daemon 停机 + 复制失败）此前被完全丢弃——任务日志仍称「日志清理完成」、
+// task_runs 恒绿，磁盘被审计文件填满后才由写侧被动暴露。
+func TestLogCleanupRound_wafFallbackRotationFailureIsReported(t *testing.T) {
+	initServicesDB(t)
+	if err := db.InitializeMetricsDB(t.TempDir()); err != nil {
+		t.Fatalf("initialize metrics db: %v", err)
+	}
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	oldLogPath, oldOffsetPath, oldSizeBytes, oldCopy := auditLogPath, securityEventsOffsetPath, auditLogSizeBytes, auditLogCopyFile
+	auditLogPath, securityEventsOffsetPath = logPath, filepath.Join(dir, "security_events.offset")
+	auditLogSizeBytes = func() int64 { return 1024 }
+	t.Cleanup(func() {
+		auditLogPath, securityEventsOffsetPath, auditLogSizeBytes, auditLogCopyFile = oldLogPath, oldOffsetPath, oldSizeBytes, oldCopy
+	})
+	resetSecurityEventsPollState(t)
+	// daemon 停机形态：超阈且无人轮转；兜底轮转自身失败（复制失败）
+	if err := os.WriteFile(logPath, bytes.Repeat([]byte("x"), 2048), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	auditLogCopyFile = func(string, string) error { return errors.New("injected copy failure") }
+
+	// When
+	res, line := logCleanupRound(filepath.Join(dir, "app.log"))
+
+	// Then：失败进结果、Err 非空、摘要不得称完成
+	if res.WafAuditError == "" {
+		t.Fatal("waf-audit 兜底轮转失败必须进结果（此前错误被丢弃）")
+	}
+	if err := res.Err(); err == nil {
+		t.Fatal("清理失败必须聚合为 Err（任务体据此落 failed）")
+	}
+	if strings.Contains(line, "日志清理完成") {
+		t.Fatalf("失败轮不得称「日志清理完成」: %q", line)
+	}
+	if !strings.HasPrefix(line, "日志清理未完成") || !strings.Contains(line, "injected copy failure") {
+		t.Fatalf("摘要行必须标明未完成与失败原因: %q", line)
+	}
+}
+
+// 保留月数读取失败（非 ErrNoRows）时保留期删除一律跳过：应用日志副本与任务
+// 日志都不得按更短默认删除。
+func TestRuntimeLogCleanupOnce_skipsRetentionDeletionWhenReadFails(t *testing.T) {
+	// Given：陈旧副本 + 陈旧任务日志 + 主库查询恒失败
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "app.log")
+	writeStaleAppLogCopy(t, dir, "app.log.1")
+	tasksDir := filepath.Join(dir, "tasks")
+	if err := os.MkdirAll(tasksDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	staleTaskLog := filepath.Join(tasksDir, "stale.log")
+	if err := os.WriteFile(staleTaskLog, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldTime := time.Now().AddDate(0, -13, 0)
+	if err := os.Chtimes(staleTaskLog, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+	oldAuditLogPath := auditLogPath
+	auditLogPath = filepath.Join(dir, "audit.log") // 不存在：兜底 stat 不算失败
+	t.Cleanup(func() { auditLogPath = oldAuditLogPath })
+	swapBrokenDB(t)
+
+	// When
+	res := RuntimeLogCleanupOnce(logFile)
+
+	// Then：一条都不删，失败原因可见
+	if res.RetentionError == "" {
+		t.Fatal("保留月数读取失败必须记入 RetentionError")
+	}
+	if res.AppRemoved != 0 {
+		t.Fatalf("AppRemoved=%d, want 0（口径未知时不得删除）", res.AppRemoved)
+	}
+	if len(res.TaskLogs.Deleted) != 0 {
+		t.Fatalf("TaskLogs.Deleted=%v, want 空（口径未知时不得删除）", res.TaskLogs.Deleted)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "app.log.1")); err != nil {
+		t.Fatalf("应用日志副本必须保留: %v", err)
+	}
+	if _, err := os.Stat(staleTaskLog); err != nil {
+		t.Fatalf("任务日志必须保留: %v", err)
+	}
+	if err := res.Err(); err == nil {
+		t.Fatal("保留月数读取失败必须让本轮失败")
+	}
+	if _, line := logCleanupRound(logFile); !strings.Contains(line, "保留月数读取失败") {
+		t.Fatalf("摘要行必须披露保留月数读取失败: %q", line)
+	}
+}
+
+// 任务日志单文件删除失败必须计数并进摘要（旧实现 err 直接忽略，摘要看起来
+// 只是「没有过期文件」）。
+func TestTaskLogsHousekeeping_countsDeletionFailures(t *testing.T) {
+	initServicesDB(t)
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "app.log")
+	tasksDir := filepath.Join(dir, "tasks")
+	if err := os.MkdirAll(tasksDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(tasksDir, "stale.log")
+	if err := os.WriteFile(stale, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldTime := time.Now().AddDate(0, -13, 0)
+	if err := os.Chtimes(stale, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+	// 目录只读：可列出/stat，删除必然失败（权限形态）。
+	if err := os.Chmod(tasksDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(tasksDir, 0o755) })
+
+	// When
+	res := taskLogsHousekeeping(logFile)
+
+	// Then
+	if res.RemoveFailed != 1 {
+		t.Fatalf("RemoveFailed=%d, want 1（删除失败必须计数）", res.RemoveFailed)
+	}
+	if summary := res.Summary(); !strings.Contains(summary, "删除失败 1 个") {
+		t.Fatalf("摘要必须披露删除失败数: %q", summary)
 	}
 }

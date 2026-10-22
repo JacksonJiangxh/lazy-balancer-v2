@@ -106,24 +106,22 @@ func TestPureJSONThreatPreviewMatchesImport(t *testing.T) {
 		"security_threat_sources": {threatRowShared("firehol_l1")},
 	}, nil, []string{"security"})
 
+	// 纯 JSON 的威胁源表保留本地（不导入），该包实际零导入——预览与导入
+	// 必须同判定拒绝（此前预览 valid=true 且只给告警、导入 200 谎报成功）。
 	preview := postValidateBytes(t, h, body)
-	if !preview.Valid {
-		t.Fatalf("preview rejected valid backup: %s", preview.Error)
+	if preview.Valid {
+		t.Fatalf("threat-only pure JSON must be rejected as zero-import: %+v", preview)
 	}
-	if _, exists := preview.Summary["security_threat_sources"]; exists {
-		t.Fatalf("pure JSON preview still promises threat replacement: %#v", preview.Summary)
-	}
-	foundWarning := false
-	for _, warning := range preview.Warnings {
-		foundWarning = foundWarning || strings.Contains(warning, "纯 JSON 备份不携带威胁名单文件")
-	}
-	if !foundWarning {
-		t.Fatalf("preview warnings=%v, want local-threat preservation warning", preview.Warnings)
+	if !strings.Contains(preview.Error, "均被跳过") {
+		t.Fatalf("preview error=%q, want zero-import explanation", preview.Error)
 	}
 
 	rec := postImportBytes(t, h, body)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("import status=%d body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("import status=%d body=%s, want 400（零导入）", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "均被跳过") {
+		t.Fatalf("import error=%s, want zero-import explanation", rec.Body.String())
 	}
 	var name string
 	if err := db.DB.QueryRow(`SELECT name FROM security_threat_sources`).Scan(&name); err != nil {

@@ -116,34 +116,11 @@ func MaterializeBranding(dataDir, content string) error {
 	if info, statErr := os.Stat(path); statErr == nil {
 		mode = info.Mode().Perm()
 	}
-	temporary, err := os.CreateTemp(dataDir, ".branding-*.tmp")
-	if err != nil {
-		return fmt.Errorf("创建品牌配置临时文件: %w", err)
-	}
-	temporaryPath := temporary.Name()
-	defer func() { _ = os.Remove(temporaryPath) }()
-	if err := temporary.Chmod(mode); err != nil {
-		_ = temporary.Close()
-		return fmt.Errorf("设置品牌配置文件权限: %w", err)
-	}
-	if _, err := temporary.WriteString(content); err != nil {
-		_ = temporary.Close()
-		return fmt.Errorf("写入品牌配置临时文件: %w", err)
-	}
-	// tmp+rename 缺 fsync 可留 0 字节品牌文件（与 certstore 原子写
-	// 同口径：临时文件 fsync + 父目录 fsync）。
-	if err := temporary.Sync(); err != nil {
-		_ = temporary.Close()
-		return fmt.Errorf("同步品牌配置临时文件: %w", err)
-	}
-	if err := temporary.Close(); err != nil {
-		return fmt.Errorf("关闭品牌配置临时文件: %w", err)
-	}
-	if err := os.Rename(temporaryPath, path); err != nil {
-		return fmt.Errorf("原子替换品牌配置文件: %w", err)
-	}
-	if err := syncParentDir(path); err != nil {
-		return fmt.Errorf("同步品牌配置目录: %w", err)
+	// 单源原子落盘（同目录唯一临时文件 → chmod → 写入 → fsync → close →
+	// rename → 父目录 fsync）：本函数曾逐项复刻同包 writeFileAtomicSynced，
+	// 掉电一致性修复必须改两处、遗漏即品牌文件与备份/完整性文件耐久性分裂。
+	if err := writeFileAtomicSynced(path, []byte(content), mode); err != nil {
+		return fmt.Errorf("原子写入品牌配置文件: %w", err)
 	}
 	injectLandingFromBranding(content)
 	return nil

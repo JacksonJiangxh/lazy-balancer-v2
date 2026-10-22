@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,14 +39,21 @@ func SetAutoBackupExecutor(fn func(ctx context.Context, trigger, operator string
 }
 
 // AutoBackupEnabled 读自动备份业务开关（读错 fail-closed）。
+// 读错必须留痕：引擎先求值 EnabledFn 再求值 NextSlotFn（engine.go），失败即
+// LoopOn=false 短路——nextAutoBackupSlot 里已有的 schedule-read-auto-backup
+// 告警永远不会被求值，静默 fail-closed 让「库故障」与「用户关闭」在任务面
+// 完全同形（零执行、零失败行、零日志）。状态转换口径（首报 warn + 恢复 info）
+// 与同族排程读取单源。
 func AutoBackupEnabled() bool {
 	if db.DB == nil {
 		return false
 	}
 	var enabled int
 	if err := db.DB.QueryRow(`SELECT COALESCE(auto_backup_enabled,0) FROM global_config WHERE id=1`).Scan(&enabled); err != nil {
+		logScheduleReadFailure("schedule-read-auto-backup-enabled", err)
 		return false
 	}
+	logScheduleReadRecovered("schedule-read-auto-backup-enabled")
 	return enabled == 1
 }
 
@@ -73,33 +81,13 @@ func writeAutoBackupEnabled(w autoBackupConfigWriter, enabled bool) error {
 	return nil
 }
 
-// SetAutoBackupEnabled 写自动备份业务开关并同步任务调度；off→on 保留
-// 既有水位线语义（停用期不追补），与设置页保存同口径。两条 Exec
-// （enabled 与启用时的水位线）必须同事务——生产设置页走
-// SetAutoBackupEnabledTx，本入口仅测试消费，此前直写形态可能留下半态。
-func SetAutoBackupEnabled(enabled bool) error {
-	if db.DB == nil {
-		return errors.New("数据库未初始化")
-	}
-	tx, err := db.DB.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	if err := writeAutoBackupEnabled(tx, enabled); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	syncTaskLoop("auto-backup", enabled)
-	return nil
-}
-
 // SetAutoBackupEnabledTx 在调用方事务内写业务开关与启用水位线
 // 设置页「四列设置 + 开关」必须同事务——修复前设置先落库、开关后写，开关
 // 失败返回 500 但设置已生效）。事务提交后由调用方经 SyncAutoBackupTaskLoop
 // 同步引擎调度。
+//
+// 生产写侧唯一入口：本包不再提供自开事务的 SetAutoBackupEnabled（生产引用
+// 为零、仅测试消费，且绕过调用方事务边界——测试请直接用本函数 + 事务）。
 func SetAutoBackupEnabledTx(tx *sql.Tx, enabled bool) error {
 	return writeAutoBackupEnabled(tx, enabled)
 }
@@ -316,8 +304,12 @@ func runAutoBackupScheduled(ctx context.Context, engineRunID int64) error {
 		// 备份槽记作已执行，恢复后不再补跑。
 		return execErr
 	}
-	advanceAutoBackupWatermark(startedAt)
-	return execErr
+	// 水位线写失败必须让本轮返回 error：槽不推进 ⇒ 引擎判定「失败且槽未推进」
+	// 才退避，否则默认 1s tick 下每秒重投一次完整备份（每条一行 task_runs）。
+	// 口径：备份业务本身可能已成功，失败信号表达的是「本槽未被记账」——
+	// 面板短暂 failed 优于每秒重跑全文备份；下次成功记账即恢复正常。
+	advanceErr := advanceAutoBackupWatermark(startedAt)
+	return errors.Join(execErr, advanceErr)
 }
 
 // autoBackupWatermarkSlot 返回本次执行应写入水位线的槽：以触发
@@ -340,14 +332,18 @@ func autoBackupWatermarkSlot(startedAt time.Time) (time.Time, bool) {
 }
 
 // advanceAutoBackupWatermark 把水位线推进到本次实际执行的槽；SQL 侧同样带
-// 「仅前进」守卫（并发手动/定时执行的更晚槽不被回退）。
-func advanceAutoBackupWatermark(startedAt time.Time) {
+// 「仅前进」守卫（并发手动/定时执行的更晚槽不被回退）。返回错误供调用方
+// 让本轮失败（触发引擎退避），不再是只 warn 的尽力而为。
+func advanceAutoBackupWatermark(startedAt time.Time) error {
 	slot, ok := autoBackupWatermarkSlot(startedAt)
 	if !ok {
-		return
+		// 无需推进（无槽/已覆盖）：不是失败。
+		return nil
 	}
 	formatted := slot.Format(time.RFC3339)
 	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_last_run=? WHERE id=1 AND (auto_backup_last_run IS NULL OR auto_backup_last_run='' OR datetime(auto_backup_last_run) < datetime(?))`, formatted, formatted); err != nil {
 		Logf("warn", "自动备份：更新 auto_backup_last_run 失败: %v", err)
+		return fmt.Errorf("更新自动备份水位线（槽 %s）失败: %w", formatted, err)
 	}
+	return nil
 }

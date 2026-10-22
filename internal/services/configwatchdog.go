@@ -96,19 +96,28 @@ func WatchdogCheckOnce(ctx context.Context) (runErr error) {
 	if ctx != nil && ctx.Err() != nil {
 		return ctx.Err()
 	}
-	if isMaster, err := RoleOf(context.Background(), db.DB); err != nil {
+	isMaster, roleErr := RoleOf(context.Background(), db.DB)
+	if roleErr != nil {
 		// 看门狗角色读失败留痕：角色读失败=本轮未判定——计入跳过轮簿记（不宣称一致、
 		// 不发假心跳，与下方 !checked 跳轮同口径），留痕并以错误返回，
 		// 让 task_runs/任务监控可见（此前 return nil → 恒 success 掩盖 DB 异常）。
-		Logf("warn", "配置看门狗: 角色读取失败，本轮跳过: %v", err)
+		// 状态转换口径（首报 warn + 恢复 info）：角色读取持久失败（is_master
+		// 行损坏/库瞬断）时此前每 60s 一条裸 warn = 1440 行/天同一消息。
+		if lvl := logStateTransition("config-watchdog-role", true); lvl != "" {
+			Logf(lvl, "配置看门狗: 角色读取失败，本轮跳过: %v", roleErr)
+		}
 		configDriftMu.Lock()
 		configDriftSkipped++
 		configDriftHeartbeatSkipped++
 		configDriftStatus.SkippedRounds = configDriftSkipped
 		configDriftMu.Unlock()
-		TaskLogfWarn("config-watchdog", "skipped", "配置检查未完成：角色读取失败（%v），本轮未判定，不计入一致轮", err)
-		return fmt.Errorf("角色读取失败: %w", err)
-	} else if !isMaster {
+		TaskLogfWarn("config-watchdog", "skipped", "配置检查未完成：角色读取失败（%v），本轮未判定，不计入一致轮", roleErr)
+		return fmt.Errorf("角色读取失败: %w", roleErr)
+	}
+	if lvl := logStateTransition("config-watchdog-role", false); lvl != "" {
+		Logf(lvl, "配置看门狗：角色读取已恢复")
+	}
+	if !isMaster {
 		return nil
 	}
 	defer func() {
@@ -133,13 +142,21 @@ func WatchdogCheckOnce(ctx context.Context) (runErr error) {
 	// 并发出「配置一致」假心跳。跳过轮单独计数并附在心跳文案里。
 	configDriftMu.Lock()
 	driftInProgress := configDriftStreak > 0
-	if !checked {
+	switch {
+	case !checked:
 		configDriftSkipped++
 		configDriftHeartbeatSkipped++
-	} else if configDriftStatus.Consistent && !driftInProgress {
+	case driftInProgress && configDriftStatus.Consistent:
+		// 防抖轮（streak=1，状态仍为 Consistent）已观测到一轮不一致：
+		// 它既不是「一致」证据，也必须清空本窗口——旧实现只是不计入
+		// cleanRounds，窗口继续累计，随后凑满 60 个干净轮即写出「近 60 轮无
+		// 漂移」的反事实心跳（漂移征兆落在窗口内）。重置后心跳窗口语义恢复为
+		// 「自最近一次不一致观测以来连续无漂移」。
+		configDriftCleanRounds = 0
+	case configDriftStatus.Consistent:
 		configDriftCleanRounds++
 		configDriftSkipped = 0 // 字段口径为「自上次真实检查以来」；真实检查成功即开启新窗口。
-	} else if !configDriftStatus.Consistent {
+	default:
 		configDriftCleanRounds = 0
 		configDriftSkipped = 0 // 漂移证据丢弃本窗口（恢复后重新累计）
 		configDriftHeartbeatSkipped = 0
@@ -198,29 +215,36 @@ func checkConfigConsistency(adminURL string) (checked bool, err error) {
 	// 背靠背同一句 is_master 查询曾每轮白打一次主库；外层若删会双条 warn）。
 	expected, err := expectedRenderedRules()
 	if err != nil {
+		// 锁内只改状态（configDriftQueryWarned），日志在锁外输出
+		// ——审计/日志落盘慢（轮转 writer、stdout 背压）时不得连带阻塞读者
+		// （GetCaddyStatus → CurrentConfigDrift RLock），与 updateConfigDrift
+		// 「锁内只改状态」铁律一致。
 		configDriftMu.Lock()
-		if !configDriftQueryWarned {
-			configDriftQueryWarned = true
+		shouldWarn := !configDriftQueryWarned
+		configDriftQueryWarned = true
+		configDriftMu.Unlock()
+		if shouldWarn {
 			Logf("warn", "配置一致性看门狗：读取规则失败（本轮起跳过检查）: %v", err)
 		}
-		configDriftMu.Unlock()
 		return false, err
 	}
 	running, err := runningRuleRouteIDs(adminURL)
 	if err != nil {
 		// Caddy 不可达由 GetCaddyStatus 的 status 通道报告；但「配置超解析上限/
 		// 解析失败」会让看门狗永久静默——须留痕（首次失败告警，恢复后复位）。
-		// 超限（与瞬时读失败不同——不会自愈）单独留痕文案。
+		// 超限（与瞬时读失败不同——不会自愈）单独留痕文案。同样锁外输出。
+		tooLarge := errors.Is(err, errCaddyAdminConfigTooLarge)
 		configDriftMu.Lock()
-		if !configDriftReadWarned {
-			configDriftReadWarned = true
-			if errors.Is(err, errCaddyAdminConfigTooLarge) {
+		shouldWarn := !configDriftReadWarned
+		configDriftReadWarned = true
+		configDriftMu.Unlock()
+		if shouldWarn {
+			if tooLarge {
 				Logf("warn", "配置一致性看门狗：运行配置超过 %d 字节上限，漂移检测无法进行（本轮起跳过，直至配置缩回上限内）: %v", caddyAdminConfigMaxBytes, err)
 			} else {
 				Logf("warn", "配置一致性看门狗：读取运行配置失败（本轮起跳过检查）: %v", err)
 			}
 		}
-		configDriftMu.Unlock()
 		return false, err
 	}
 	configDriftMu.Lock()

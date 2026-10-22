@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -223,17 +224,56 @@ type RuntimeCleanupResult struct {
 	// 目录不可读时曾静默返回 AppRemoved=0——任务日志称「删除 0 个」，
 	// 与「无过期副本」不可区分；失败原因必须随摘要行与任务日志可见。
 	AppCleanupError string
+	// AppRemoveFailed 应用日志副本单文件删除失败数（权限/占用/IO）。
+	// 曾只打应用日志、不进结果——摘要行仍称「删除 N 个」而实际残留。
+	AppRemoveFailed int
 	// RetentionMonths 本轮生效的保留月数（单一来源 auditRetentionMonths 回填，
 	// 任务日志摘要行直接展示本字段——此前 wire 处自行查库复算，
 	// 同值两实现会在默认值/钳位逻辑变更时与实际清理口径分裂）。
 	RetentionMonths int
-	TaskLogs        TaskLogHousekeepingResult
-	WafAudit        []string // waf-audit 目录兜底动作明细（daemon 停机时的超阈轮转/截断）
+	// RetentionError 保留月数读取失败原因（空=正常）。非空表示本轮所有保留期
+	// 删除（应用日志副本 + 任务日志）被跳过——不可逆删除不得在口径未知时
+	// 按更短默认执行。
+	RetentionError string
+	TaskLogs       TaskLogHousekeepingResult
+	WafAudit       []string // waf-audit 目录兜底动作明细（daemon 停机时的超阈轮转）
+	// WafAuditError waf-audit 兜底轮转失败原因（空=正常）。曾完全丢弃
+	// SecurityEventsPollOnce 的轮转错误——daemon 停机时审计文件无界增长这一
+	// 兜底场景失效，任务日志仍称「日志清理完成」。
+	WafAuditError string
+}
+
+// Err 聚合本轮全部清理失败（nil=一轮内每个清理动作都成功）。
+// log-cleanup 任务体据此落 failed 终态并停用「完成」措辞——此前清理失败
+// 只打应用日志、Run 恒返回 nil，任务监控恒绿（与同族 audit-retention /
+// security-events-retention / metrics-orphan-cleanup 的失败上抛口径不对称）。
+func (r RuntimeCleanupResult) Err() error {
+	var errs []error
+	if r.RetentionError != "" {
+		errs = append(errs, fmt.Errorf("保留月数读取失败，本轮跳过保留期删除: %s", r.RetentionError))
+	}
+	if r.AppCleanupError != "" {
+		errs = append(errs, fmt.Errorf("应用日志副本目录读取失败: %s", r.AppCleanupError))
+	}
+	if r.AppRemoveFailed > 0 {
+		errs = append(errs, fmt.Errorf("应用日志副本删除失败 %d 个", r.AppRemoveFailed))
+	}
+	if r.TaskLogs.RemoveFailed > 0 {
+		errs = append(errs, fmt.Errorf("任务日志删除失败 %d 个", r.TaskLogs.RemoveFailed))
+	}
+	if r.WafAuditError != "" {
+		errs = append(errs, fmt.Errorf("waf-audit 兜底轮转失败: %s", r.WafAuditError))
+	}
+	return errors.Join(errs...)
 }
 
 // TaskLogHousekeepingResult 任务日志清理明细。
 type TaskLogHousekeepingResult struct {
 	Deleted []string // 超保留期删除（文件名）
+	// RemoveFailed 单文件删除失败数（权限/占用/IO）。曾 `err != nil` 直接
+	// 忽略——失败文件既不出现在 Deleted 也不进任何结果字段，摘要看起来
+	// 只是「没有过期文件」。
+	RemoveFailed int
 }
 
 // Summary 一行明细摘要（列表超 5 个收敛为「等 N 个」；空=「无」）。
@@ -247,21 +287,40 @@ func (r TaskLogHousekeepingResult) Summary() string {
 		}
 		return strings.Join(names, "、")
 	}
-	return fmt.Sprintf("任务日志：超期删除 %d 个[%s]（尺寸滚动由写入侧统一执行）", len(r.Deleted), list(r.Deleted))
+	summary := fmt.Sprintf("任务日志：超期删除 %d 个[%s]（尺寸滚动由写入侧统一执行）", len(r.Deleted), list(r.Deleted))
+	if r.RemoveFailed > 0 {
+		summary = fmt.Sprintf("任务日志：超期删除 %d 个[%s]、删除失败 %d 个（尺寸滚动由写入侧统一执行）", len(r.Deleted), list(r.Deleted), r.RemoveFailed)
+	}
+	return summary
 }
 
 // RuntimeLogCleanupOnce 单轮清理：应用日志过期副本删除 + 任务日志统一
-// 清理轮转（taskLogsHousekeeping）。由任务引擎 log-cleanup 族驱动（自此
-// 无独立启动器）。
+// 清理轮转（taskLogsHousekeeping）+ waf-audit 兜底。由任务引擎 log-cleanup
+// 族驱动（自此无独立启动器）。所有失败聚合进 RuntimeCleanupResult（Err()），
+// 由任务体决定 failed 终态与摘要措辞。
 func RuntimeLogCleanupOnce(logFile string) RuntimeCleanupResult {
-	result := RuntimeCleanupResult{TaskLogs: taskLogsHousekeeping(logFile), WafAudit: wafAuditHousekeeping()}
+	result := RuntimeCleanupResult{}
+	// waf-audit 兜底不依赖保留期口径，先独立执行（失败也照常尝试其余清理）。
+	wafActions, wafErr := wafAuditHousekeeping()
+	result.WafAudit = wafActions
+	if wafErr != nil {
+		result.WafAuditError = wafErr.Error()
+	}
 	// 库未初始化不再整体跳过——保留期单源
 	// auditRetentionMonths 自带 nil 库回退默认 3 月；此前 `months := 3` 后
 	// 直接 return 使应用日志副本清理被静默跳过（AppRemoved=0），与「清理不得
 	// 静默跳过」口径相反。死初值一并删除（唯一使用点必被 auditRetentionMonths
 	// 覆盖）。
-	months := auditRetentionMonths()
+	months, monthsErr := auditRetentionMonths()
 	result.RetentionMonths = months
+	result.TaskLogs = taskLogsHousekeepingWithRetention(logFile, months, monthsErr)
+	if monthsErr != nil {
+		// 保留期口径未知：应用日志副本与任务日志的保留期删除一律跳过
+		// （不可逆删除不得按更短默认执行）；taskLogsHousekeeping 内部同口径
+		// 自行跳过，此处只需记录失败原因。
+		result.RetentionError = monthsErr.Error()
+		return result
+	}
 	cutoff := time.Now().AddDate(0, -months, 0)
 
 	dir := filepath.Dir(logFile)
@@ -284,6 +343,7 @@ func RuntimeLogCleanupOnce(logFile string) RuntimeCleanupResult {
 		if info.ModTime().Before(cutoff) {
 			if err := os.Remove(filepath.Join(dir, e.Name())); err != nil {
 				Logf("error", "清理过期运行日志失败 %s: %v", e.Name(), err)
+				result.AppRemoveFailed++
 			} else {
 				removed++
 				Logf("info", "已清理过期运行日志 %s", e.Name())
@@ -294,24 +354,48 @@ func RuntimeLogCleanupOnce(logFile string) RuntimeCleanupResult {
 	return result
 }
 
-// logCleanupSummaryLine log-cleanup 任务单轮摘要行（从 wire 描述符闭包抽出，
-// 便于对「摘要行口径 = 实际清理口径」直接钉测）。
-func logCleanupSummaryLine(logFile string) string {
+// logCleanupRound 执行单轮清理并返回结果与任务日志摘要行——摘要行在存在任何
+// 清理失败时不得称「完成」（失败轮谎报完成会把排障方向带偏，与
+// audit-retention 同口径）。logFile 为空（旋转写入器打开失败）时返回零值结果
+// 与显式「未启用」摘要。
+func logCleanupRound(logFile string) (RuntimeCleanupResult, string) {
 	// 旋转写入器打开失败（runtimeLogFile 为空，
 	// main.go 已有 error 留痕）时不得让 log-cleanup 静默零动作——任务监控恒绿
 	// 却没有任何留痕，排障时看不出「清理为什么没跑」。
 	if logFile == "" {
-		return "日志清理未启用：运行日志文件未打开（应用日志副本清理与 waf-audit 兜底跳过）"
+		return RuntimeCleanupResult{}, "日志清理未启用：运行日志文件未打开（应用日志副本清理与 waf-audit 兜底跳过）"
 	}
 	res := RuntimeLogCleanupOnce(logFile)
+	if err := res.Err(); err != nil {
+		return res, "日志清理未完成：" + logCleanupDetail(res) + "；错误：" + err.Error()
+	}
+	return res, "日志清理完成：" + logCleanupDetail(res)
+}
+
+// logCleanupSummaryLine log-cleanup 任务单轮摘要行（从 wire 描述符闭包抽出，
+// 便于对「摘要行口径 = 实际清理口径」直接钉测）。
+func logCleanupSummaryLine(logFile string) string {
+	_, line := logCleanupRound(logFile)
+	return line
+}
+
+// logCleanupDetail 摘要行的明细段（各自独立失败原因可见）。
+func logCleanupDetail(res RuntimeCleanupResult) string {
 	// 保留月数取 RuntimeCleanupResult 的单源回填值（与实际删除口径
 	// 同源），不再在本层复算。
-	appPart := fmt.Sprintf("应用日志副本删除 %d 个（保留 %d 月，无过期为 0）", res.AppRemoved, res.RetentionMonths)
-	if res.AppCleanupError != "" {
+	var appPart string
+	switch {
+	case res.RetentionError != "":
+		appPart = "应用日志副本未清理（保留月数读取失败，本轮跳过删除）"
+	case res.AppCleanupError != "":
 		// 目录不可读不得呈现为「删除 0 个」——任务日志必须留痕失败原因。
 		appPart = fmt.Sprintf("应用日志副本未清理（保留 %d 月）：读取目录失败 %s", res.RetentionMonths, res.AppCleanupError)
+	case res.AppRemoveFailed > 0:
+		appPart = fmt.Sprintf("应用日志副本删除 %d 个、删除失败 %d 个（保留 %d 月）", res.AppRemoved, res.AppRemoveFailed, res.RetentionMonths)
+	default:
+		appPart = fmt.Sprintf("应用日志副本删除 %d 个（保留 %d 月，无过期为 0）", res.AppRemoved, res.RetentionMonths)
 	}
-	summary := "日志清理完成：" + appPart + "；" + res.TaskLogs.Summary()
+	summary := appPart + "；" + res.TaskLogs.Summary()
 	// daemon 停机时的 waf-audit 兜底动作如实进
 	// 任务日志（2026-10-01 用户裁定：清理了哪个文件必须可见）；无动作时不加
 	// 尾段，日志行形态不变。
@@ -336,36 +420,58 @@ func logCleanupSummaryLine(logFile string) string {
 // 本目录仅剩 audit.log 家族文件，无需独立截断兜底。）
 //
 // 返回动作明细（log-cleanup 任务日志与运行日志双写——清理了哪个文件必须
-// 可见，2026-10-01 用户裁定口径）。
-func wafAuditHousekeeping() []string {
+// 可见，2026-10-01 用户裁定口径）与兜底错误：SecurityEventsPollOnce 的轮转
+// 错误此前被完全丢弃——daemon 停机 + 轮转失败（pending 标记损坏/复制失败）
+// 时审计文件继续无界增长，而任务日志仍称「日志清理完成」、task_runs 恒绿。
+func wafAuditHousekeeping() ([]string, error) {
 	var actions []string
 	maxBytes := auditLogSizeBytes()
-	if info, err := os.Stat(auditLogPath); err == nil && info.Size() >= maxBytes {
-		sizeBefore := info.Size()
-		SecurityEventsPollOnce()
-		if after, aerr := os.Stat(auditLogPath); aerr == nil && after.Size() < sizeBefore {
-			actions = append(actions, fmt.Sprintf("audit.log %.1fMB≥%dMB（摄取+轮转）",
-				float64(sizeBefore)/1024/1024, maxBytes/1024/1024))
+	info, statErr := os.Stat(auditLogPath)
+	if statErr != nil {
+		if errors.Is(statErr, os.ErrNotExist) {
+			// 审计文件不存在（从未产生审计/已迁移）不是失败形态。
+			return nil, nil
 		}
+		return nil, fmt.Errorf("stat %s: %w", auditLogPath, statErr)
+	}
+	if info.Size() < maxBytes {
+		return nil, nil
+	}
+	sizeBefore := info.Size()
+	if _, rotErr := SecurityEventsPollOnce(); rotErr != nil {
+		return nil, fmt.Errorf("超阈兜底轮转失败（audit.log %d 字节 ≥ %d 字节）: %w", sizeBefore, maxBytes, rotErr)
+	}
+	if after, aerr := os.Stat(auditLogPath); aerr != nil {
+		return nil, fmt.Errorf("轮转后 stat %s: %w", auditLogPath, aerr)
+	} else if after.Size() < sizeBefore {
+		actions = append(actions, fmt.Sprintf("audit.log %.1fMB≥%dMB（摄取+轮转）",
+			float64(sizeBefore)/1024/1024, maxBytes/1024/1024))
 	}
 	for _, action := range actions {
 		Logf("info", "waf-audit 兜底轮转：%s", action)
 		TaskLogf("log-cleanup", "waf-audit", "兜底轮转：%s", action)
 	}
-	return actions
+	return actions, nil
 }
 
 // taskLogsHousekeeping 任务日志统一清理与轮转（log-cleanup 任务体）——
-// 返回清理明细（哪个文件被删/轮转——用户可见）。
+// 返回清理明细（哪个文件被删/轮转——用户可见）。保留月数自行读取（测试/独立
+// 调用入口）；RuntimeLogCleanupOnce 复用同一实现并传入自己已读取的口径，
+// 避免一轮两次查库。
 func taskLogsHousekeeping(logFile string) TaskLogHousekeepingResult {
+	months, monthsErr := auditRetentionMonths()
+	return taskLogsHousekeepingWithRetention(logFile, months, monthsErr)
+}
+
+// taskLogsHousekeepingWithRetention 以调用方给定的保留期执行任务日志清理。
+// monthsErr 非空时跳过全部保留期删除（不可逆删除不得在口径未知时按更短默认
+// 执行）——不变量：本函数永不在保留期未知时删除任何文件。
+func taskLogsHousekeepingWithRetention(logFile string, months int, monthsErr error) TaskLogHousekeepingResult {
 	result := TaskLogHousekeepingResult{}
 	// tasks 根 + certjobs 子目录统一扫描（证书任务日志并入任务日志体系）
 	dir := filepath.Join(filepath.Dir(logFile), "tasks")
 	certDir := filepath.Join(dir, "certjobs")
-	dirs := []string{dir}
-	if certDir != dir {
-		dirs = append(dirs, certDir)
-	}
+	dirs := []string{dir, certDir}
 	type fileInfo struct {
 		path string
 		dir  string
@@ -392,9 +498,10 @@ func taskLogsHousekeeping(logFile string) TaskLogHousekeepingResult {
 	if len(all) == 0 {
 		return result
 	}
-	// 统一经 auditRetentionMonths（读取失败回退默认
-	// 3 月 + warn 留痕；nil DB 时静默默认——与既有形态一致）。
-	months := auditRetentionMonths()
+	// 保留期读取失败：本轮一个文件都不删（调用方已把错误聚合进结果）。
+	if monthsErr != nil {
+		return result
+	}
 	cutoff := time.Now().AddDate(0, -months, 0)
 	// 尺寸滚动已统一归 taskengine 写入前检查（tasks/*.log 与 certjobs/ 同一
 	// RotateTaskLogBeforeWrite）；本清理任务只处理保留期，不再二次滚动。
@@ -412,7 +519,21 @@ func taskLogsHousekeeping(logFile string) TaskLogHousekeepingResult {
 				lock := lockCertJobLog(ruleID)
 				lock.Lock()
 				info, statErr := os.Stat(f.path)
-				removed := statErr == nil && info.ModTime().Before(cutoff) && os.Remove(f.path) == nil
+				removed := false
+				switch {
+				case statErr != nil:
+					// 文件在扫描后消失＝已删除，不算失败；其余 stat 错误＝无法
+					// 确认/删除，必须留痕（旧实现与「未过期」同形，静默吞掉）。
+					if !errors.Is(statErr, os.ErrNotExist) {
+						result.RemoveFailed++
+					}
+				case info.ModTime().Before(cutoff):
+					if removeErr := os.Remove(f.path); removeErr != nil {
+						result.RemoveFailed++
+					} else {
+						removed = true
+					}
+				}
 				lock.Unlock()
 				if removed {
 					result.Deleted = append(result.Deleted, f.name)
@@ -421,7 +542,11 @@ func taskLogsHousekeeping(logFile string) TaskLogHousekeepingResult {
 			}
 		}
 		removed, err := taskengine.RemoveTaskLogIfModifiedBefore(f.path, cutoff)
-		if err == nil && removed {
+		if err != nil {
+			result.RemoveFailed++
+			continue
+		}
+		if removed {
 			result.Deleted = append(result.Deleted, f.name)
 		}
 	}

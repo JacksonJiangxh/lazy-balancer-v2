@@ -152,7 +152,7 @@ func TestConfigBackup_lbbakRoundTrip(t *testing.T) {
 	for k, v := range pack {
 		entries[k] = v
 	}
-	entries["config.json"] = []byte(strings.Replace(string(pack["config.json"]), `"version":2`, `"version":9`, 1))
+	entries["config.json"] = []byte(strings.Replace(string(pack["config.json"]), `"version":3`, `"version":9`, 1))
 	names := []string{"manifest.json", "config.json", "waf/crs.tar.gz", "waf/ip2region.xdb"}
 	for _, n := range names {
 		writeEntry(n, entries[n])

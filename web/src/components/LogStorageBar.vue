@@ -36,6 +36,9 @@ interface LogStorageInfo {
   db_bytes?: number | null
   keep_count: number
   rows?: number | null
+  // 行数读取失败披露：为真时保持条数口径并标注「计数暂不可用」，不再静默
+  // 退回字节口径（口径切换会让用户以为统计规则被改）。
+  rows_unavailable?: boolean
   retention_note: string
   config_source: string
 }
@@ -54,11 +57,19 @@ const isEmpty = computed(() => {
   return !!i.limit_bytes && i.size_bytes === 0 && i.rotated_bytes === 0
 })
 
+// 条数口径形态（安全事件：进度=条数/上限，2026-09-14 用户裁定）——即使行数
+// 读取失败也保持该形态（进度置 0 且文案标注不可用），不得滑到字节口径。
+const rowsMode = computed(() => !!info.value?.limit_rows)
+const rowsUnavailable = computed(() => rowsMode.value && info.value?.rows == null)
+
 const percentage = computed(() => {
   const i = info.value
   if (!i) return 0
   // 条数上限(安全事件:进度=条数/上限,2026-09-14 用户裁定)
-  if (i.limit_rows && i.rows != null) return Math.min(100, Math.round((i.rows / i.limit_rows) * 100))
+  if (i.limit_rows) {
+    if (i.rows == null) return 0
+    return Math.min(100, Math.round((i.rows / i.limit_rows) * 100))
+  }
   if (i.limit_bytes) return Math.min(100, Math.round((i.size_bytes / i.limit_bytes) * 100))
   return 0
 })
@@ -68,8 +79,10 @@ const progressColor = computed(() => (percentage.value >= 90 ? '#f56c6c' : perce
 const sizeText = computed(() => {
   const i = info.value
   if (!i) return ''
-  if (i.limit_rows && i.rows != null) {
-    const base = `${i.rows.toLocaleString()} / ${i.limit_rows.toLocaleString()} 条`
+  if (i.limit_rows) {
+    const base = i.rows == null
+      ? `计数暂不可用 / ${i.limit_rows.toLocaleString()} 条`
+      : `${i.rows.toLocaleString()} / ${i.limit_rows.toLocaleString()} 条`
     const parts = [base]
     if (i.size_bytes > 0) parts.push(`日志 ${humanSize(i.size_bytes)}`)
     if (i.db_bytes) parts.push(`库 ${humanSize(i.db_bytes)}`)
@@ -84,7 +97,10 @@ const noteText = computed(() => {
   const i = info.value
   if (!i) return ''
   // 条数上限形态(安全事件)
-  if (i.limit_rows) return `超限后每日清理按最旧优先裁剪${i.retention_note ? '，' + i.retention_note : ''}`
+  if (i.limit_rows) {
+    const note = `超限后每日清理按最旧优先裁剪${i.retention_note ? '，' + i.retention_note : ''}`
+    return rowsUnavailable.value ? `行数暂不可用（稍后自动重试）；${note}` : note
+  }
   const parts: string[] = []
   if (i.limit_bytes) parts.push(`满 ${humanSize(i.limit_bytes)} 轮转`)
   if (i.keep_count > 0) {

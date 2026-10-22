@@ -1,35 +1,25 @@
 package services
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"net/http"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 )
 
-var (
-	prometheusRequestTotalPattern  = regexp.MustCompile(`caddy_http_requests_total\{[^}]*\}\s+(\S+)`)
-	prometheusStatusCountPattern   = regexp.MustCompile(`caddy_http_request_duration_seconds_count\{[^}]*code="(\d+)"[^}]*\}\s+(\S+)`)
-	prometheusResponseSizePattern  = regexp.MustCompile(`caddy_http_response_size_bytes_sum.*?\}\s+(\S+)`)
-	prometheusRequestSizePattern   = regexp.MustCompile(`caddy_http_request_size_bytes_sum.*?\}\s+(\S+)`)
-	prometheusLatencyBucketPattern = regexp.MustCompile(`caddy_http_request_duration_seconds_bucket\{[^}]*le="([^"]+)"[^}]*\}\s+(\S+)`)
-	prometheusBlockedPattern       = regexp.MustCompile(`lazybalancer_security_blocked_total\{[^}]*rule="([^"]+)"[^}]*\}\s+(\S+)`)
-	prometheusRuleRequestsPattern  = regexp.MustCompile(`lazybalancer_requests_total\{[^}]*rule="([^"]+)"[^}]*\}\s+(\S+)`)
-	// client_golang MakeLabelPairs 字典序排序
-	// (value.go:235)——真实 exposition 是 class/direction 在前、rule 在后,
-	// 原正则要求 rule 在前恒不匹配(状态码/字节系列恒 0,已随 v2.2.10 发布)。
-	prometheusRuleStatusPattern = regexp.MustCompile(`lazybalancer_request_status_total\{[^}]*class="([^"]+)"[^}]*rule="([^"]+)"[^}]*\}\s+(\S+)`)
-	prometheusRuleBytesPattern  = regexp.MustCompile(`lazybalancer_bytes_total\{[^}]*direction="([^"]+)"[^}]*rule="([^"]+)"[^}]*\}\s+(\S+)`)
-)
+// exposition 解析不再使用逐族全文正则：单趟按指标名前缀分派（见
+// aggregatePrometheusText）。原先 9 条 prometheus*Pattern 每周期各扫一遍全文，
+// 16MB body 形态 ≈144MB 正则输入，已随单趟聚合统一移除。
 
 // MetricsService collects and stores metrics from Caddy
 type MetricsService struct {
@@ -43,6 +33,11 @@ type MetricsService struct {
 	lastTotal     int64
 	lastSampleAt  time.Time
 	hasLastSample bool
+	// cleanupRunning 保证历史清理单飞（24h 节拍 + 慢清理形态下的重叠防御）；
+	// cleanupWG 让 Start/Stop 有界等待清理 goroutine 收尾，避免拆除后继续
+	// 访问已关闭的指标库。
+	cleanupRunning atomic.Bool
+	cleanupWG      sync.WaitGroup
 }
 
 func NewMetricsService(metricsURL string, interval int) *MetricsService {
@@ -62,7 +57,11 @@ func (m *MetricsService) Start() {
 	cleanupTicker := time.NewTicker(24 * time.Hour)
 	defer ticker.Stop()
 	defer cleanupTicker.Stop()
-	m.cleanupHistory()
+	// 历史清理移出采集 goroutine：清理按 5000 行/批 + 10ms 让锁推进，积压大时
+	// （7 天保留 × 300 规则/5s ≈ 36M 行，单日约 5M 行删）整轮可达数十秒——此前
+	// 与采集串行，期间 /metrics 零采样、overview 冻结。现在清理在独立 goroutine
+	// 内推进，采集节拍不受积压影响。
+	m.startHistoryCleanup()
 	// 启动即采集一轮——曾首 collect 等首个 interval
 	// （默认 30s），重启后面板首屏 30s 全零；与 cleanupHistory 同点对称。
 	m.collect()
@@ -72,15 +71,48 @@ func (m *MetricsService) Start() {
 		case <-ticker.C:
 			m.collect()
 		case <-cleanupTicker.C:
-			m.cleanupHistory()
+			m.startHistoryCleanup()
 		case <-m.stopCh:
+			// 等待在途清理收尾（有界），Start 返回即代表清理 goroutine 已退出。
+			m.cleanupWG.Wait()
 			return
 		}
 	}
 }
 
+// startHistoryCleanup 在独立 goroutine 中执行一轮历史清理；上一轮未结束时
+// 直接跳过（慢清理形态下的单飞防御）。清理自身按批让出写锁
+// （CleanupMetricsHistory 的 5000/批 + 10ms），采集不再等待整轮清理完成。
+func (m *MetricsService) startHistoryCleanup() {
+	if !m.cleanupRunning.CompareAndSwap(false, true) {
+		return
+	}
+	m.cleanupWG.Add(1)
+	go func() {
+		defer m.cleanupWG.Done()
+		defer m.cleanupRunning.Store(false)
+		m.cleanupHistory()
+	}()
+}
+
+// cleanupStopWait 是 Stop 等待在途历史清理退出的预算：清理可能正在删数十万
+// 行，不得无界阻塞关停路径（main 的关停预算与进程退出优先）；超时放弃等待并
+// warn，残留 goroutine 随进程消亡。
+const cleanupStopWait = 3 * time.Second
+
 func (m *MetricsService) Stop() {
 	m.stopOnce.Do(func() { close(m.stopCh) })
+	// 有界等待清理 goroutine：测试/嵌入形态下拆除后不得继续访问已关闭的库。
+	done := make(chan struct{})
+	go func() {
+		m.cleanupWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(cleanupStopWait):
+		Logf("warn", "metrics 历史清理未在 %s 内退出，放弃等待（残留 goroutine 随进程消亡）", cleanupStopWait)
+	}
 }
 
 // metrics 采集失败族状态转换日志。30s 采集周期下，持久性失败
@@ -89,9 +121,9 @@ func (m *MetricsService) Stop() {
 // （warn）、fail→ok 恢复记一次（info）、持续同一状态静默。状态按失败类别
 // （key）独立跟踪：前置类别失败（如 Get 失败）不评估后续类别，其恢复标记
 // 只在后续 tick 实际通过该检查时才落，避免「仍失败却记恢复」。map 有界：
-// 生产类别集固定 7 个（增补 body 中段读取失败类别——原枚举漏掉的
-// 唯一零信号成员），清扫上限仅为防御动态键场景——超上限整体
-// 重置，各类别至多重复放行一条，无数据影响。
+// 生产类别集固定 8 个（含 body 中段读取失败与规则级解析失败两个独立类别），
+// 清扫上限仅为防御动态键场景——超上限整体重置，各类别至多重复放行一条，
+// 无数据影响。
 var (
 	metricsStateMu     sync.Mutex
 	metricsStateFailed = map[string]bool{}
@@ -140,6 +172,7 @@ const (
 	metricsFailureRead         = "read"
 	metricsFailureBodyCap      = "body-cap"
 	metricsFailureParse        = "parse"
+	metricsFailureParseRules   = "parse-rules"
 	metricsFailureStore        = "store"
 	metricsFailureStorePerHost = "store-per-host"
 )
@@ -239,15 +272,26 @@ func (m *MetricsService) collect() {
 	if strings.Contains(text, geoipPassSeriesMarker) {
 		text = filterGeoipPassSeries(text)
 	}
-	metrics, err := m.parsePrometheusMetrics(text)
-	if err != nil {
+	// 单趟聚合：全局样本与规则级样本共用一次全文遍历（旧实现全局 6 趟 +
+	// 规则 4 趟全文正则，且同一 text 喂两条解析链）。两族错误语义独立——规则级
+	// 畸形只丢 per-rule 行，不影响全局样本与 overview。
+	scan := aggregatePrometheusText(text, prometheusScanGlobal|prometheusScanRules)
+	metrics := scan.global
+	if scan.globalErr != nil {
 		if logMetricsStateTransition(metricsFailureParse, true) != "" {
-			Logf("warn", "Failed to parse metrics: %v", err)
+			Logf("warn", "Failed to parse metrics: %v", scan.globalErr)
 		}
 		return
 	}
 	if lvl := logMetricsStateTransition(metricsFailureParse, false); lvl != "" {
 		Logf("info", "metrics parse recovered")
+	}
+	if scan.rulesErr != nil {
+		if logMetricsStateTransition(metricsFailureParseRules, true) != "" {
+			Logf("warn", "Failed to parse per-rule metrics: %v", scan.rulesErr)
+		}
+	} else if lvl := logMetricsStateTransition(metricsFailureParseRules, false); lvl != "" {
+		Logf("info", "per-rule metrics parse recovered")
 	}
 	if err := m.storeMetrics(metrics); err != nil {
 		if logMetricsStateTransition(metricsFailureStore, true) != "" {
@@ -259,14 +303,16 @@ func (m *MetricsService) collect() {
 	} else if lvl := logMetricsStateTransition(metricsFailureStore, false); lvl != "" {
 		Logf("info", "metrics store recovered")
 	}
-	if err := m.storePerHostMetrics(text); err != nil {
-		if logMetricsStateTransition(metricsFailureStorePerHost, true) != "" {
-			Logf("warn", "Failed to store per-host metrics: %v", err)
+	if scan.rulesErr == nil {
+		if err := m.storePerRuleMetrics(scan.rules); err != nil {
+			if logMetricsStateTransition(metricsFailureStorePerHost, true) != "" {
+				Logf("warn", "Failed to store per-host metrics: %v", err)
+			}
+		} else if lvl := logMetricsStateTransition(metricsFailureStorePerHost, false); lvl != "" {
+			Logf("info", "metrics per-host store recovered")
 		}
-	} else if lvl := logMetricsStateTransition(metricsFailureStorePerHost, false); lvl != "" {
-		Logf("info", "metrics per-host store recovered")
 	}
-	m.updateOverview(metrics)
+	m.applyTrafficSample(metrics)
 }
 
 type parsedMetrics struct {
@@ -309,72 +355,293 @@ func classifyStatusCodes(codes map[int]int64) statusClassCounts {
 	return counts
 }
 
-func (m *MetricsService) parsePrometheusMetrics(text string) (parsedMetrics, error) {
-	metrics := parsedMetrics{}
-	codes := make(map[int]int64)
+// prometheusScanHook 仅供测试观测全文扫描次数（生产恒 nil）。聚合改为单趟
+// 分派后，测试以此钉住「每个采集周期恰 1 趟全文扫描」（旧实现每周期 10 趟
+// 全文正则：全局 6 + 规则 4，16MB body 时约 144MB 正则输入）。
+var prometheusScanHook func(text string)
 
-	// Request totals come from caddy_http_requests_total, which carries no
-	// code label; status classes come from caddy_http_request_duration_seconds_count.
-	for _, match := range prometheusRequestTotalPattern.FindAllStringSubmatch(text, -1) {
-		if len(match) >= 2 {
-			value, err := parsePrometheusInteger(match[1])
-			if err != nil {
-				return parsedMetrics{}, fmt.Errorf("parse request count %q: %w", match[1], err)
+// overviewRefreshHook 仅供测试观测 DB 派生指标刷新次数（生产恒 nil）：钉住
+// 「每采集周期只刷新一次」（旧形态 collect + updateOverview 各刷一次 = 6 条
+// COUNT/周期）。
+var overviewRefreshHook func()
+
+// metricsCleanupHook 仅供测试观测/控速历史清理（生产恒 nil）：钉住清理与采集
+// 不再串行（清理在途时采集仍按节拍推进）与单飞语义。
+var metricsCleanupHook func()
+
+// prometheusScanMode 选择本次聚合要解析的指标族——全局样本与规则级样本的
+// 错误语义独立（规则级畸形只丢 per-rule 行，不影响全局样本与 overview）。
+type prometheusScanMode uint8
+
+const (
+	prometheusScanGlobal prometheusScanMode = 1 << iota
+	prometheusScanRules
+)
+
+// prometheusScanResult 单趟扫描的聚合结果（逐族首个错误独立保留）。
+type prometheusScanResult struct {
+	global    parsedMetrics
+	globalErr error
+	codes     map[int]int64
+	buckets   map[float64]int64
+	rules     map[string]*ruleLabelAggregate
+	rulesErr  error
+}
+
+// prometheusSampleValue 取单行 exposition 样本值：标签块 `}` 后的首个 token
+// （与旧正则 `\}\s+(\S+)` 同语义；缺失标签块/值返回 false，该行按非样本跳过）。
+func prometheusSampleValue(line string) (string, bool) {
+	idx := strings.IndexByte(line, '}')
+	if idx < 0 {
+		return "", false
+	}
+	rest := strings.TrimSpace(line[idx+1:])
+	if rest == "" {
+		return "", false
+	}
+	if sp := strings.IndexByte(rest, ' '); sp >= 0 {
+		rest = rest[:sp]
+	}
+	return rest, true
+}
+
+// prometheusLabelValue 取标签块内 name="value" 的值（与旧正则 `name="([^"]+)"`
+// 同语义，含同样的「标签名后缀误命中」宽容度）。
+func prometheusLabelValue(line, name string) (string, bool) {
+	needle := name + `="`
+	idx := strings.Index(line, needle)
+	if idx < 0 {
+		return "", false
+	}
+	start := idx + len(needle)
+	end := strings.IndexByte(line[start:], '"')
+	if end < 0 {
+		return "", false
+	}
+	return line[start : start+end], true
+}
+
+// aggregatePrometheusText 单趟遍历 exposition 文本，按指标名前缀分派到各族
+// 解析器——替代此前每族一次全文 FindAllStringSubmatch（每周期 10 趟全文正则
+// + 同文本重复喂给两条解析链）。族内取值语义与错误文案保持不变。
+func aggregatePrometheusText(text string, mode prometheusScanMode) prometheusScanResult {
+	if prometheusScanHook != nil {
+		prometheusScanHook(text)
+	}
+	wantGlobal := mode&prometheusScanGlobal != 0
+	wantRules := mode&prometheusScanRules != 0
+	res := prometheusScanResult{
+		codes:   make(map[int]int64),
+		buckets: make(map[float64]int64),
+	}
+	if wantRules {
+		res.rules = make(map[string]*ruleLabelAggregate)
+	}
+	ruleAgg := func(rule string) *ruleLabelAggregate {
+		agg := res.rules[rule]
+		if agg == nil {
+			agg = &ruleLabelAggregate{}
+			res.rules[rule] = agg
+		}
+		return agg
+	}
+
+	for line := range strings.SplitSeq(text, "\n") {
+		switch {
+		// --- 全局指标族 ---
+		case strings.HasPrefix(line, "caddy_http_requests_total{"):
+			// Request totals come from caddy_http_requests_total, which carries no
+			// code label; status classes come from caddy_http_request_duration_seconds_count.
+			if !wantGlobal || res.globalErr != nil {
+				continue
 			}
-			metrics.requestsTotal += value
+			raw, ok := prometheusSampleValue(line)
+			if !ok {
+				continue
+			}
+			value, err := parsePrometheusInteger(raw)
+			if err != nil {
+				res.globalErr = fmt.Errorf("parse request count %q: %w", raw, err)
+				continue
+			}
+			res.global.requestsTotal += value
+		case strings.HasPrefix(line, "caddy_http_request_duration_seconds_count{"):
+			if !wantGlobal || res.globalErr != nil {
+				continue
+			}
+			rawCode, hasCode := prometheusLabelValue(line, "code")
+			rawValue, hasValue := prometheusSampleValue(line)
+			if !hasCode || !hasValue {
+				continue
+			}
+			code, err := strconv.ParseInt(rawCode, 10, 64)
+			if err != nil {
+				res.globalErr = fmt.Errorf("parse HTTP status code %q: %w", rawCode, err)
+				continue
+			}
+			value, err := parsePrometheusInteger(rawValue)
+			if err != nil {
+				res.globalErr = fmt.Errorf("parse status class count %q: %w", rawValue, err)
+				continue
+			}
+			res.codes[int(code)] += value
+		case strings.HasPrefix(line, "caddy_http_response_size_bytes_sum{"):
+			if !wantGlobal || res.globalErr != nil {
+				continue
+			}
+			raw, ok := prometheusSampleValue(line)
+			if !ok {
+				continue
+			}
+			value, err := parsePrometheusInteger(raw)
+			if err != nil {
+				res.globalErr = fmt.Errorf("parse response size %q: %w", raw, err)
+				continue
+			}
+			res.global.bytesOut += value
+		case strings.HasPrefix(line, "caddy_http_request_size_bytes_sum{"):
+			if !wantGlobal || res.globalErr != nil {
+				continue
+			}
+			raw, ok := prometheusSampleValue(line)
+			if !ok {
+				continue
+			}
+			value, err := parsePrometheusInteger(raw)
+			if err != nil {
+				res.globalErr = fmt.Errorf("parse request size %q: %w", raw, err)
+				continue
+			}
+			res.global.bytesIn += value
+		case strings.HasPrefix(line, "caddy_http_request_duration_seconds_bucket{"):
+			if !wantGlobal || res.globalErr != nil {
+				continue
+			}
+			if err := parsePrometheusBucketSample(line, res.buckets); err != nil {
+				res.globalErr = err
+			}
+		// --- 规则级指标族（lazybalancer_*，rule label 聚合）---
+		case strings.HasPrefix(line, "lazybalancer_requests_total{"):
+			if !wantRules || res.rulesErr != nil {
+				continue
+			}
+			rule, hasRule := prometheusLabelValue(line, "rule")
+			raw, hasValue := prometheusSampleValue(line)
+			if !hasRule || !hasValue {
+				continue
+			}
+			v, err := parsePrometheusInteger(raw)
+			if err != nil {
+				res.rulesErr = fmt.Errorf("parse rule requests %q: %w", raw, err)
+				continue
+			}
+			ruleAgg(rule).requests += v
+		case strings.HasPrefix(line, "lazybalancer_request_status_total{"):
+			if !wantRules || res.rulesErr != nil {
+				continue
+			}
+			class, hasClass := prometheusLabelValue(line, "class")
+			rule, hasRule := prometheusLabelValue(line, "rule")
+			raw, hasValue := prometheusSampleValue(line)
+			if !hasClass || !hasRule || !hasValue {
+				continue
+			}
+			v, err := parsePrometheusInteger(raw)
+			if err != nil {
+				res.rulesErr = fmt.Errorf("parse rule status %q: %w", raw, err)
+				continue
+			}
+			agg := ruleAgg(rule)
+			switch class {
+			case "2xx":
+				agg.status2xx += v
+			case "3xx":
+				agg.status3xx += v
+			case "4xx":
+				agg.status4xx += v
+			case "5xx":
+				agg.status5xx += v
+			}
+		case strings.HasPrefix(line, "lazybalancer_bytes_total{"):
+			if !wantRules || res.rulesErr != nil {
+				continue
+			}
+			direction, hasDirection := prometheusLabelValue(line, "direction")
+			rule, hasRule := prometheusLabelValue(line, "rule")
+			raw, hasValue := prometheusSampleValue(line)
+			if !hasDirection || !hasRule || !hasValue {
+				continue
+			}
+			v, err := parsePrometheusInteger(raw)
+			if err != nil {
+				res.rulesErr = fmt.Errorf("parse rule bytes %q: %w", raw, err)
+				continue
+			}
+			agg := ruleAgg(rule)
+			if direction == "in" {
+				agg.bytesIn += v
+			} else {
+				agg.bytesOut += v
+			}
+		case strings.HasPrefix(line, "lazybalancer_security_blocked_total{"):
+			if !wantRules || res.rulesErr != nil {
+				continue
+			}
+			rule, hasRule := prometheusLabelValue(line, "rule")
+			raw, hasValue := prometheusSampleValue(line)
+			if !hasRule || !hasValue {
+				continue
+			}
+			v, err := parsePrometheusInteger(raw)
+			if err != nil {
+				res.rulesErr = fmt.Errorf("parse blocked count %q: %w", raw, err)
+				continue
+			}
+			ruleAgg(rule).blocked += v
 		}
 	}
-	for _, match := range prometheusStatusCountPattern.FindAllStringSubmatch(text, -1) {
-		if len(match) >= 3 {
-			code, err := strconv.ParseInt(match[1], 10, 64)
-			if err != nil {
-				return parsedMetrics{}, fmt.Errorf("parse HTTP status code %q: %w", match[1], err)
-			}
-			value, err := parsePrometheusInteger(match[2])
-			if err != nil {
-				return parsedMetrics{}, fmt.Errorf("parse status class count %q: %w", match[2], err)
-			}
-			codes[int(code)] += value
-		}
-	}
-	classified := classifyStatusCodes(codes)
-	metrics.requests2xx = classified.status2xx
-	metrics.requests3xx = classified.status3xx
-	metrics.requests4xx = classified.status4xx
-	metrics.requests5xx = classified.status5xx
 
-	// Parse response size
-	// caddy_http_response_size_bytes_sum{...}
-	matches := prometheusResponseSizePattern.FindAllStringSubmatch(text, -1)
-	for _, match := range matches {
-		if len(match) >= 2 {
-			value, err := parsePrometheusInteger(match[1])
-			if err != nil {
-				return parsedMetrics{}, fmt.Errorf("parse response size %q: %w", match[1], err)
-			}
-			metrics.bytesOut += value
-		}
+	if wantGlobal && res.globalErr == nil {
+		classified := classifyStatusCodes(res.codes)
+		res.global.requests2xx = classified.status2xx
+		res.global.requests3xx = classified.status3xx
+		res.global.requests4xx = classified.status4xx
+		res.global.requests5xx = classified.status5xx
+		res.global.latencyP50, res.global.latencyP95, res.global.latencyP99 = latencyPercentilesFromBuckets(res.buckets)
 	}
+	return res
+}
 
-	// Parse request size
-	matches = prometheusRequestSizePattern.FindAllStringSubmatch(text, -1)
-	for _, match := range matches {
-		if len(match) >= 2 {
-			value, err := parsePrometheusInteger(match[1])
-			if err != nil {
-				return parsedMetrics{}, fmt.Errorf("parse request size %q: %w", match[1], err)
-			}
-			metrics.bytesIn += value
-		}
+// parsePrometheusBucketSample 解析一行 duration bucket 样本并累加到 byLE
+// （同一 le 的多 host/handler 序列求和）。无 le 标签/无值的行按非样本跳过。
+func parsePrometheusBucketSample(line string, byLE map[float64]int64) error {
+	rawLE, hasLE := prometheusLabelValue(line, "le")
+	rawValue, hasValue := prometheusSampleValue(line)
+	if !hasLE || !hasValue {
+		return nil
 	}
-
-	latencyP50, latencyP95, latencyP99, err := estimateLatencyPercentiles(text)
+	le, err := strconv.ParseFloat(rawLE, 64)
 	if err != nil {
-		return parsedMetrics{}, err
+		return fmt.Errorf("parse latency bucket boundary %q: %w", rawLE, err)
 	}
-	metrics.latencyP50, metrics.latencyP95, metrics.latencyP99 = latencyP50, latencyP95, latencyP99
+	count, err := parsePrometheusInteger(rawValue)
+	if err != nil {
+		return fmt.Errorf("parse latency bucket count %q: %w", rawValue, err)
+	}
+	if count < 0 {
+		return fmt.Errorf("latency bucket count %q is negative", rawValue)
+	}
+	byLE[le] += count
+	return nil
+}
 
-	return metrics, nil
+// parsePrometheusMetrics 全局样本解析入口（测试/独立调用）：单趟扫描。
+func (m *MetricsService) parsePrometheusMetrics(text string) (parsedMetrics, error) {
+	res := aggregatePrometheusText(text, prometheusScanGlobal)
+	if res.globalErr != nil {
+		return parsedMetrics{}, res.globalErr
+	}
+	return res.global, nil
 }
 
 func parsePrometheusInteger(raw string) (int64, error) {
@@ -390,29 +657,31 @@ func parsePrometheusInteger(raw string) (int64, error) {
 
 // estimateLatencyPercentiles computes p50/p95/p99 in milliseconds from the
 // cumulative caddy_http_request_duration_seconds_bucket histogram.
+// 单族入口（测试/独立调用）：单趟读取 bucket 行后交给
+// latencyPercentilesFromBuckets；采集主路径在同一趟聚合里复用后者。
 func estimateLatencyPercentiles(text string) (int, int, int, error) {
-	matches := prometheusLatencyBucketPattern.FindAllStringSubmatch(text, -1)
+	byLE := map[float64]int64{}
+	for line := range strings.SplitSeq(text, "\n") {
+		if !strings.HasPrefix(line, "caddy_http_request_duration_seconds_bucket{") {
+			continue
+		}
+		if err := parsePrometheusBucketSample(line, byLE); err != nil {
+			return 0, 0, 0, err
+		}
+	}
+	p50, p95, p99 := latencyPercentilesFromBuckets(byLE)
+	return p50, p95, p99, nil
+}
+
+// latencyPercentilesFromBuckets 从按 le 聚合的累计直方图估算 p50/p95/p99
+// （毫秒）。纯计算，无可失败点（解析错误在 bucket 采样阶段已回报）。
+func latencyPercentilesFromBuckets(byLE map[float64]int64) (int, int, int) {
 	type bucket struct {
 		le    float64
 		count int64
 	}
-	byLE := map[float64]int64{}
-	for _, m := range matches {
-		le, err := strconv.ParseFloat(m[1], 64)
-		if err != nil {
-			return 0, 0, 0, fmt.Errorf("parse latency bucket boundary %q: %w", m[1], err)
-		}
-		count, err := parsePrometheusInteger(m[2])
-		if err != nil {
-			return 0, 0, 0, fmt.Errorf("parse latency bucket count %q: %w", m[2], err)
-		}
-		if count < 0 {
-			return 0, 0, 0, fmt.Errorf("latency bucket count %q is negative", m[2])
-		}
-		byLE[le] += count
-	}
 	if len(byLE) == 0 {
-		return 0, 0, 0, nil
+		return 0, 0, 0
 	}
 	buckets := make([]bucket, 0, len(byLE))
 	var total int64
@@ -457,12 +726,9 @@ func estimateLatencyPercentiles(text string) (int, int, int, error) {
 			prevCum = b.count
 		}
 		// rank 超出全部累计（畸形输入兜底）——最大有限桶边。
-		if len(buckets) > 0 {
-			return int(math.Round(buckets[len(buckets)-1].le * 1000))
-		}
-		return 0
+		return int(math.Round(buckets[len(buckets)-1].le * 1000))
 	}
-	return percentile(0.5), percentile(0.95), percentile(0.99), nil
+	return percentile(0.5), percentile(0.95), percentile(0.99)
 }
 
 // ruleLabelAggregate 是 lazybalancer_* 指标按 rule label 聚合的结构。
@@ -474,102 +740,105 @@ type ruleLabelAggregate struct {
 }
 
 // parseRuleLabelMetrics 解析 lazybalancer_* 指标按 rule label 聚合(2026-09-15
-// 用户裁定:caddy_id 直接匹配替代域名/host 匹配)。
+// 用户裁定:caddy_id 直接匹配替代域名/host 匹配)。单族入口（测试/独立调用）：
+// 单趟扫描；采集主路径在同趟聚合里与全局样本共用一次遍历。
 func parseRuleLabelMetrics(text string) (map[string]*ruleLabelAggregate, error) {
-	byRule := map[string]*ruleLabelAggregate{}
-	get := func(rule string) *ruleLabelAggregate {
-		agg, ok := byRule[rule]
-		if !ok {
-			agg = &ruleLabelAggregate{}
-			byRule[rule] = agg
-		}
-		return agg
+	res := aggregatePrometheusText(text, prometheusScanRules)
+	if res.rulesErr != nil {
+		return nil, res.rulesErr
 	}
-	for _, m := range prometheusRuleRequestsPattern.FindAllStringSubmatch(text, -1) {
-		v, err := parsePrometheusInteger(m[2])
-		if err != nil {
-			return nil, fmt.Errorf("parse rule requests %q: %w", m[2], err)
-		}
-		get(m[1]).requests += v
-	}
-	for _, m := range prometheusRuleStatusPattern.FindAllStringSubmatch(text, -1) {
-		v, err := parsePrometheusInteger(m[3])
-		if err != nil {
-			return nil, fmt.Errorf("parse rule status %q: %w", m[3], err)
-		}
-		agg := get(m[2]) // 组序对调后 m[2]=rule, m[1]=class
-		switch m[1] {
-		case "2xx":
-			agg.status2xx += v
-		case "3xx":
-			agg.status3xx += v
-		case "4xx":
-			agg.status4xx += v
-		case "5xx":
-			agg.status5xx += v
-		}
-	}
-	for _, m := range prometheusRuleBytesPattern.FindAllStringSubmatch(text, -1) {
-		v, err := parsePrometheusInteger(m[3])
-		if err != nil {
-			return nil, fmt.Errorf("parse rule bytes %q: %w", m[3], err)
-		}
-		agg := get(m[2]) // 组序对调后 m[2]=rule, m[1]=direction
-		if m[1] == "in" {
-			agg.bytesIn += v
-		} else {
-			agg.bytesOut += v
-		}
-	}
-	for _, m := range prometheusBlockedPattern.FindAllStringSubmatch(text, -1) {
-		v, err := parsePrometheusInteger(m[2])
-		if err != nil {
-			return nil, fmt.Errorf("parse blocked count %q: %w", m[2], err)
-		}
-		get(m[1]).blocked += v
-	}
-	return byRule, nil
+	return res.rules, nil
 }
 
 // storePerHostMetrics 按 rule label(lazybalancer_*)写规则级历史行——
 // 2026-09-15 用户裁定:caddy_id 直接匹配替代域名/host 匹配(通配符/大小写/
 // IDNA/多域名/空域名全部天然正确,且不再有静默 continue 失配)。
-// TCP 规则无行(caddy-l4 无规则级流量计数器)。
+// TCP 规则无行(caddy-l4 无规则级流量计数器)。文本入口保留给测试/独立调用，
+// 采集主路径持有已聚合结果，直接走 storePerRuleMetrics（免二次解析）。
 func (m *MetricsService) storePerHostMetrics(text string) error {
 	byRule, err := parseRuleLabelMetrics(text)
 	if err != nil {
 		return err
 	}
+	return m.storePerRuleMetrics(byRule)
+}
+
+// storePerRuleMetrics 在单个事务内批量写入规则级历史行（每规则一条）。
+// 此前每规则一条独立 Exec（各自隐式事务＝独立 WAL 提交）：300 规则形态每
+// 采集周期 300 次写事务。单事务 + 预处理语句把提交次数收敛为 1；批内共用
+// 同一时间戳，使同一周期的规则行属于同一采样点。
+func (m *MetricsService) storePerRuleMetrics(byRule map[string]*ruleLabelAggregate) error {
+	if db.MetricsDB == nil {
+		return errMetricsDBUnavailable
+	}
 	if len(byRule) == 0 {
 		return nil
 	}
+	timestamp := time.Now().UTC().Format("2006-01-02 15:04:05")
+	tx, err := db.MetricsDB.Begin()
+	if err != nil {
+		return fmt.Errorf("begin per-rule metrics batch: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	stmt, err := tx.Prepare(`
+		INSERT INTO metrics_history
+		(rule_id, timestamp, requests_total, requests_2xx, requests_3xx,
+		 requests_4xx, requests_5xx, requests_blocked, bytes_in, bytes_out,
+		 latency_p50, latency_p95, latency_p99)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0)
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare per-rule metrics batch: %w", err)
+	}
+	defer func() { _ = stmt.Close() }()
 	for ruleID, agg := range byRule {
-		if _, err := db.MetricsDB.Exec(`
-			INSERT INTO metrics_history
-			(rule_id, timestamp, requests_total, requests_2xx, requests_3xx,
-			 requests_4xx, requests_5xx, requests_blocked, bytes_in, bytes_out,
-			 latency_p50, latency_p95, latency_p99)
-			VALUES (?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0)
-		`, ruleID, agg.requests, agg.status2xx, agg.status3xx, agg.status4xx, agg.status5xx, agg.blocked, agg.bytesIn, agg.bytesOut); err != nil {
+		if _, err := stmt.Exec(ruleID, timestamp, agg.requests, agg.status2xx, agg.status3xx, agg.status4xx, agg.status5xx, agg.blocked, agg.bytesIn, agg.bytesOut); err != nil {
 			return fmt.Errorf("store per-rule metrics for %s: %w", ruleID, err)
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit per-rule metrics batch: %w", err)
 	}
 	return nil
 }
 
 func (m *MetricsService) cleanupHistory() {
+	if metricsCleanupHook != nil {
+		metricsCleanupHook()
+	}
 	// 2026-09-15 用户裁定:指标历史固定保留最近 7 天(覆盖复用「日志
 	// 保留」的裁定——用户明确指标类数据独立于日志保留配置);实时接口
 	// (/metrics/*)不受影响,仅历史图窗口收敛到 7 天。
 	const retentionDays = 7
+	if db.MetricsDB == nil {
+		// 守卫与 refreshDBOverviewMetrics 同口径（生产启动链不可达；防
+		// 独立清理 goroutine 在 nil 库形态下 panic）。
+		if lvl := logStateTransition("metrics-history-cleanup", true); lvl != "" {
+			Logf(lvl, "Failed to clean up metrics history: metrics database is not initialized")
+		}
+		return
+	}
 	if err := db.CleanupMetricsHistory(retentionDays); err != nil {
-		Logf("warn", "Failed to clean up metrics history: %v", err)
+		if lvl := logStateTransition("metrics-history-cleanup", true); lvl != "" {
+			Logf(lvl, "Failed to clean up metrics history: %v", err)
+		}
+		return
+	}
+	if lvl := logStateTransition("metrics-history-cleanup", false); lvl != "" {
+		Logf(lvl, "metrics history cleanup recovered")
 	}
 }
+
+// errMetricsDBUnavailable 指标库未初始化。生产启动链（db.Initialize 失败即
+// 退出）不可达；守卫防测试/嵌入形态下 goroutine 直接 nil deref 崩溃。
+var errMetricsDBUnavailable = errors.New("metrics database not initialized")
 
 // storeMetrics 将全局指标写入独立 metrics 库；错误返回给调用方
 // （collect）按状态转换口径记日志，避免本方法与 collect 双通道重复记录。
 func (m *MetricsService) storeMetrics(metrics parsedMetrics) error {
+	if db.MetricsDB == nil {
+		return errMetricsDBUnavailable
+	}
 	// Store global metrics in independent metrics database
 	_, err := db.MetricsDB.Exec(`
 		INSERT INTO metrics_history 
@@ -589,6 +858,9 @@ func (m *MetricsService) storeMetrics(metrics parsedMetrics) error {
 // 不可达期间（含空库启动、运维最需要节点状态的时刻）三项指标永久冻结在 0。
 // 现在它们随每个采集周期独立刷新，只有流量样本受 /metrics 可用性影响。
 func (m *MetricsService) refreshDBOverviewMetrics() {
+	if overviewRefreshHook != nil {
+		overviewRefreshHook()
+	}
 	database := db.DB
 	if database == nil {
 		return
@@ -599,11 +871,22 @@ func (m *MetricsService) refreshDBOverviewMetrics() {
 
 	// 错误必须显式处理，否则 DB 故障时 overview 三项指标静默归零。
 	// 查询失败时保留既有 overview 行中的前值（与 onlineNodes 分支同口径）。
+	// 日志走状态转换口径（首报 warn + 恢复 info）：30s×2~3 行/天的同一消息
+	// 会淹没真实信号并加速应用日志轮转（与全项目「日志只记真实执行/状态转换
+	// 去重」裁定一致）；「keeping previous value=N」语义保留在首报行。
 	if err := database.QueryRow("SELECT COUNT(*) FROM lb_rules WHERE enabled = 1").Scan(&activeRules); err != nil {
-		Logf("error", "updateOverview: query active rules failed: %v (keeping previous value=%d)", err, activeRules)
+		if lvl := logStateTransition("overview-count-active-rules", true); lvl != "" {
+			Logf(lvl, "updateOverview: query active rules failed: %v (keeping previous value=%d)", err, activeRules)
+		}
+	} else if lvl := logStateTransition("overview-count-active-rules", false); lvl != "" {
+		Logf(lvl, "updateOverview: query active rules recovered")
 	}
 	if err := database.QueryRow("SELECT COUNT(*) FROM lb_rules").Scan(&totalRules); err != nil {
-		Logf("error", "updateOverview: query total rules failed: %v (keeping previous value=%d)", err, totalRules)
+		if lvl := logStateTransition("overview-count-total-rules", true); lvl != "" {
+			Logf(lvl, "updateOverview: query total rules failed: %v (keeping previous value=%d)", err, totalRules)
+		}
+	} else if lvl := logStateTransition("overview-count-total-rules", false); lvl != "" {
+		Logf(lvl, "updateOverview: query total rules recovered")
 	}
 
 	// 在线节点数口径与 ComputeNodeStatus 统一：nodes.status 只在注册/上报时写入、
@@ -622,7 +905,11 @@ func (m *MetricsService) refreshDBOverviewMetrics() {
 		  AND last_seen IS NOT NULL
 		  AND datetime(last_seen) >= datetime('now', printf('-%d seconds', ?))
 	`, offlineThresholdSeconds).Scan(&onlineNodes); err != nil {
-		Logf("error", "updateOverview: query online nodes failed: %v (keeping previous value=%d)", err, onlineNodes)
+		if lvl := logStateTransition("overview-count-online-nodes", true); lvl != "" {
+			Logf(lvl, "updateOverview: query online nodes failed: %v (keeping previous value=%d)", err, onlineNodes)
+		}
+	} else if lvl := logStateTransition("overview-count-online-nodes", false); lvl != "" {
+		Logf(lvl, "updateOverview: query online nodes recovered")
 	}
 
 	m.mu.Lock()
@@ -634,8 +921,15 @@ func (m *MetricsService) refreshDBOverviewMetrics() {
 
 func (m *MetricsService) updateOverview(metrics parsedMetrics) {
 	// 兼容直接调用方（测试/非 collect 路径）：DB 派生三项在覆盖流量样本前刷新。
-	// collect 也会先刷新一次；重复查询仅 30s 周期，可接受。
+	// collect 不走上层入口（它已在周期开始刷新一次并调 applyTrafficSample）——
+	// 旧形态每周期刷新两次（6 条 COUNT/周期，注释自认「可接受」），现收敛为 3 条。
 	m.refreshDBOverviewMetrics()
+	m.applyTrafficSample(metrics)
+}
+
+// applyTrafficSample 只覆盖 /metrics 流量样本（DB 派生三项由
+// refreshDBOverviewMetrics 维护，这里原样保留）。
+func (m *MetricsService) applyTrafficSample(metrics parsedMetrics) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var rps float64

@@ -685,7 +685,12 @@ func writeConfigValidationFailure(c *gin.Context, err error) {
 }
 
 func (h *Handlers) UpdateConfig(c *gin.Context) {
-
+	// global_config 全量替换的写者：导入窗口内提交会被导入静默覆盖，事务开启
+	// 后则排队至导入结束（客户端早已超时但请求仍在导入后落库）——与同族
+	// settings 写者同口径 409 fast-fail，且必须在取 caddyOpMu 之前早退。
+	if rejectWriteDuringImport(c, "保存基础设置（配置导入进行中）") {
+		return
+	}
 	var req models.UpdateConfigRequest
 	if !guardConfiguredJSONBody(c) {
 		return
@@ -897,8 +902,8 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 		err = errors.Join(err, restoreErr)
 		// 提交失败后的回弹同样可能失败——持久化横幅（事务已回滚）。
 		h.recordCaddyApplyResult(err)
-		recordAudit(c, "更新失败", "全局配置", services.FormatAuditDetail("提交配置失败", err.Error(), services.AuditResultPart("failure")))
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交配置失败: " + err.Error()})
+		recordAudit(c, "更新失败", "全局配置", services.FormatAuditDetail(commitUncertainLabel+"："+err.Error(), services.AuditResultPart("failure")))
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + "：" + err.Error()})
 		return
 	}
 	committed = true

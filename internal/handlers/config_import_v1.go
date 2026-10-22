@@ -644,13 +644,6 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: "备份文件格式不正确: " + err.Error()}})
 			return
 		}
-		// 与 ImportConfigBackup 同序——lbbak 的分类选择经 ?sections=
-		// query 传输(JSON 备份以体内 sections 字段为准)。
-		if lbbakPayloadFromCtx(c) != nil {
-			if sel := parseSectionsParam(c.Query("sections")); len(sel) > 0 {
-				backup.Sections = sel
-			}
-		}
 		// validateV2Backup 会回填缺失表(校验均匀性),快照真实携带
 		// 表集——缺席还原与反向悬挂降级口径都依赖「备份原本是否携带」。
 		exportedTables := map[string]bool{}
@@ -660,6 +653,15 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 		backupCarriedCertTables := exportedTables["certificate_configs"] || exportedTables["ca_providers"]
 		// 与导入同序——完整性先于 sections 过滤，行级门在过滤之后。
 		if _, err := verifyBackupIntegrity(backup); err != nil {
+			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
+			return
+		}
+		// 有效分类选择单源（与 ImportConfigBackup 共用
+		// resolveImportSectionSelection）：lbbak 的 ?sections= 与体内 sections
+		// 取交集而非替换，纯 JSON 以体内 sections 为准；交集为空与导入同文案
+		// valid=false（此前预览替换后可能「可导入」而导入 400）。
+		// 须在完整性校验之后——v3 校验和覆盖体内 sections（还原范围）。
+		if err := resolveImportSectionSelection(&backup, c.Query("sections"), lbbakPayloadFromCtx(c) != nil); err != nil {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
 			return
 		}
@@ -686,6 +688,13 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 		}
 		if !includeGlobal {
 			backup.Config = nil
+		}
+		// 零导入交集门（与 ImportConfigBackup 共用 assertImportScopeHasContent）：
+		// 过滤后既无表、也未选全局配置时 valid=false，文案与导入 400 完全一致
+		// （此前预览对同形态返回 valid=true，管理员点了导入才 400）。
+		if err := assertImportScopeHasContent(backup.Tables, includeGlobal, backup.Sections, importScopeFiltered); err != nil {
+			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
+			return
 		}
 		// 与导入共用准备序列：纯 JSON 威胁源保留本地、空域名规则/空内容页软跳过，
 		// 然后才执行行级结构门，保证预览摘要/告警与实际导入一致。
@@ -856,6 +865,12 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 				delete(backup.Tables, "security_ip2region_version")
 				validateWarnings = append(validateWarnings, warningWafXdbMetadataSkipped)
 			}
+		}
+		// 软跳过/剔除步之后的零导入判据（与 ImportConfigBackup 同位同文案）：
+		// 剔除后无表且未选全局配置时 valid=false，不再出现「摘要为空但可导入」。
+		if err := assertImportScopeHasContent(backup.Tables, includeGlobal, backup.Sections, importScopeSkipped); err != nil {
+			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
+			return
 		}
 		summary := map[string]int{}
 		for table, rows := range backup.Tables {

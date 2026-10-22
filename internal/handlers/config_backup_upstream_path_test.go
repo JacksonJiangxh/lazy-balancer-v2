@@ -60,22 +60,16 @@ func TestImportConfigBackup_legacyBackupWithoutUpstreamPath_restoresEmptyDefault
 	})
 	tables["path_rules"] = pathRows
 
-	// 与导入侧同构重算校验和（sha256 over {tables, config} 重编组）
+	// 与导入侧同一单源重算校验和（导出为 v3：覆盖 meta+sections+tables+config）
 	remarshaled, err := json.Marshal(exportPayload)
 	if err != nil {
 		t.Fatalf("encode mutated backup: %v", err)
 	}
-	var rebackup struct {
-		Tables map[string][]map[string]any `json:"tables"`
-		Config map[string]any              `json:"config"`
-	}
+	var rebackup configBackup
 	if err := json.Unmarshal(remarshaled, &rebackup); err != nil {
 		t.Fatalf("decode mutated backup: %v", err)
 	}
-	checksumPayload, err := json.Marshal(struct {
-		Tables map[string][]map[string]any `json:"tables"`
-		Config map[string]any              `json:"config"`
-	}{rebackup.Tables, rebackup.Config})
+	checksumPayload, err := configBackupChecksumPayload(rebackup)
 	if err != nil {
 		t.Fatalf("encode checksum payload: %v", err)
 	}

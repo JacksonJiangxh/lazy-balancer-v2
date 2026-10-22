@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"crypto"
 	"crypto/tls"
 	"crypto/x509"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"golang.org/x/sync/singleflight"
 
 	"lazy-balancer-v2/internal/models"
 	"lazy-balancer-v2/internal/services"
@@ -25,7 +27,15 @@ import (
 var startTime = time.Now()
 
 var systemMetricsReadFile = os.ReadFile
-var systemMetricsDFCommand = func() *exec.Cmd { return exec.Command("df", "-B1", "/") }
+
+// systemMetricsCommandTimeout 外部命令（df/netstat）单次执行超时上限：宿主
+// 文件系统/网络栈卡住时，读路径不得无上限阻塞（老实现无 context，命令卡死即
+// 等待者全部挂起）。
+var systemMetricsCommandTimeout = 2 * time.Second
+
+var systemMetricsDFCommand = func(ctx context.Context) *exec.Cmd {
+	return exec.CommandContext(ctx, "df", "-B1", "/")
+}
 
 const systemSampleTTL = 5 * time.Second
 
@@ -364,24 +374,48 @@ func getUptime() int64 {
 	return int64(time.Since(startTime).Seconds())
 }
 
+// getSystemMetrics 采集内存/磁盘/CPU——分项降级：任一项失败只把该项从结果中
+// 移除并在 Degraded 中披露（留痕走状态转换单源），不再「全或无」（旧实现
+// CPU 单点故障即让整卡内存/磁盘数据消失，排障窗口反而看不到健康维度）。
+// 三项全部失败才返回错误（此时确实无可展示数据）。
 func getSystemMetrics() (models.SystemMetrics, error) {
-	vmStat, err := systemMetricsReadFile("/proc/meminfo")
-	if err != nil {
-		return models.SystemMetrics{}, fmt.Errorf("读取系统内存指标失败: %w", err)
-	}
-	memoryTotal, memoryUsed, err := parseMemInfo(string(vmStat))
-	if err != nil {
-		return models.SystemMetrics{}, err
+	failures := map[string]error{}
+	order := []string{"memory", "disk", "cpu"}
+
+	memoryTotal, memoryUsed := uint64(0), uint64(0)
+	if vmStat, err := systemMetricsReadFile("/proc/meminfo"); err != nil {
+		failures["memory"] = fmt.Errorf("读取系统内存指标失败: %w", err)
+	} else if total, used, err := parseMemInfo(string(vmStat)); err != nil {
+		failures["memory"] = err
+	} else {
+		memoryTotal, memoryUsed = total, used
 	}
 
-	diskTotal, diskUsed, err := getCachedDiskUsage(time.Now())
-	if err != nil {
-		return models.SystemMetrics{}, err
+	diskTotal, diskUsed := uint64(0), uint64(0)
+	if total, used, err := getCachedDiskUsage(time.Now()); err != nil {
+		failures["disk"] = err
+	} else {
+		diskTotal, diskUsed = total, used
 	}
 
-	cpuPercent, err := getCPUPercent()
-	if err != nil {
-		return models.SystemMetrics{}, fmt.Errorf("读取系统 CPU 指标失败: %w", err)
+	cpuPercent := float64(0)
+	if percent, err := getCPUPercent(); err != nil {
+		failures["cpu"] = fmt.Errorf("读取系统 CPU 指标失败: %w", err)
+	} else {
+		cpuPercent = percent
+	}
+
+	// 分项留痕按状态转换去重（面板 5s 一轮轮询，不得每轮刷一条 warn）。
+	var degraded []string
+	var joined []error
+	for _, part := range order {
+		if err, failed := failures[part]; failed {
+			degraded = append(degraded, part)
+			joined = append(joined, err)
+			services.LogConfigReadFailure("system-metrics-"+part, err)
+			continue
+		}
+		services.LogConfigReadRecovered("system-metrics-" + part)
 	}
 
 	var memPercent float64
@@ -393,7 +427,7 @@ func getSystemMetrics() (models.SystemMetrics, error) {
 		diskPercent = float64(diskUsed) / float64(diskTotal) * 100
 	}
 
-	return models.SystemMetrics{
+	metrics := models.SystemMetrics{
 		CPUPercent:    cpuPercent,
 		MemoryTotal:   memoryTotal,
 		MemoryUsed:    memoryUsed,
@@ -401,27 +435,60 @@ func getSystemMetrics() (models.SystemMetrics, error) {
 		DiskTotal:     diskTotal,
 		DiskUsed:      diskUsed,
 		DiskPercent:   diskPercent,
-	}, nil
+		Degraded:      degraded,
+	}
+	if len(joined) == len(order) {
+		return metrics, errors.Join(joined...)
+	}
+	return metrics, nil
 }
+
+// diskUsageGroup / connectionStatsGroup 合并并发刷新：同一刷新窗口内并发请求
+// 等待同一趟外部命令，不各跑一遍。
+var (
+	diskUsageGroup       singleflight.Group
+	connectionStatsGroup singleflight.Group
+)
 
 func getCachedDiskUsage(now time.Time) (uint64, uint64, error) {
 	diskUsageCache.Lock()
-	defer diskUsageCache.Unlock()
 	if now.Before(diskUsageCache.expiresAt) {
-		return diskUsageCache.total, diskUsageCache.used, nil
+		total, used := diskUsageCache.total, diskUsageCache.used
+		diskUsageCache.Unlock()
+		return total, used, nil
 	}
-	dfOutput, err := systemMetricsDFCommand().Output()
+	diskUsageCache.Unlock()
+	// 外部命令在锁外执行（旧实现持锁 Output()：df 卡顿时连命中缓存的请求都
+	// 被串行阻塞），并发 miss 经 single-flight 合并。
+	value, err, _ := diskUsageGroup.Do("disk-usage", func() (any, error) {
+		diskUsageCache.Lock()
+		if time.Now().Before(diskUsageCache.expiresAt) {
+			total, used := diskUsageCache.total, diskUsageCache.used
+			diskUsageCache.Unlock()
+			return [2]uint64{total, used}, nil
+		}
+		diskUsageCache.Unlock()
+		ctx, cancel := context.WithTimeout(context.Background(), systemMetricsCommandTimeout)
+		defer cancel()
+		dfOutput, err := systemMetricsDFCommand(ctx).Output()
+		if err != nil {
+			return [2]uint64{}, fmt.Errorf("读取系统磁盘指标失败: %w", err)
+		}
+		total, used, ok := parseDFOutput(string(dfOutput))
+		if !ok {
+			return [2]uint64{}, fmt.Errorf("解析系统磁盘指标失败")
+		}
+		diskUsageCache.Lock()
+		diskUsageCache.total, diskUsageCache.used = total, used
+		diskUsageCache.expiresAt = time.Now().Add(systemSampleTTL)
+		diskUsageCache.Unlock()
+		return [2]uint64{total, used}, nil
+	})
 	if err != nil {
-		return 0, 0, fmt.Errorf("读取系统磁盘指标失败: %w", err)
+		return 0, 0, err
 	}
-	total, used, ok := parseDFOutput(string(dfOutput))
-	if !ok {
-		return 0, 0, fmt.Errorf("解析系统磁盘指标失败")
-	}
-	diskUsageCache.total = total
-	diskUsageCache.used = used
-	diskUsageCache.expiresAt = now.Add(systemSampleTTL)
-	return total, used, nil
+	values, _ := value.([2]uint64)
+	return values[0], values[1], nil
 }
 
 func parseMemInfo(input string) (uint64, uint64, error) {
@@ -444,9 +511,23 @@ func parseMemInfo(input string) (uint64, uint64, error) {
 	return total, total - available, nil
 }
 
+// cpuSampleWindow / netSampleWindow 采样窗口：窗口内的读取共享同一次采样与
+// 同一速率（速率=固定窗口差分）。旧实现以「上一次 HTTP 请求」为基线——多页签
+// 同时轮询或轮询周期变化时，A 客户端的请求会把 B 的基线拉近，算出尖峰或归零
+// 的假速率，不能作运维判据。窗口值 ≤0 = 不缓存（测试隔离用）。
+var (
+	cpuSampleWindow = time.Second
+	netSampleWindow = time.Second
+)
+
 func getCPUPercent() (float64, error) {
 	lastCPUStats.mu.Lock()
 	defer lastCPUStats.mu.Unlock()
+
+	now := time.Now()
+	if lastCPUStats.hasValue && cpuSampleWindow > 0 && now.Sub(lastCPUStats.sampledAt) < cpuSampleWindow {
+		return lastCPUStats.percent, nil
+	}
 
 	stat, err := systemMetricsReadFile("/proc/stat")
 	if err != nil {
@@ -457,12 +538,14 @@ func getCPUPercent() (float64, error) {
 		return 0, fmt.Errorf("解析 /proc/stat 失败")
 	}
 	previous := lastCPUStats.snapshot
+	lastCPUStats.snapshot = current
+	lastCPUStats.sampledAt = now
+	lastCPUStats.hasValue = true
+	lastCPUStats.percent = 0
 	if previous.total == 0 {
-		lastCPUStats.snapshot = current
 		return 0, nil
 	}
 	if current.total < previous.total || current.idle < previous.idle {
-		lastCPUStats.snapshot = current
 		return 0, nil
 	}
 	totalDelta := current.total - previous.total
@@ -470,11 +553,11 @@ func getCPUPercent() (float64, error) {
 	if idleDelta > totalDelta {
 		return 0, fmt.Errorf("CPU 空闲计数器增量无效")
 	}
-	lastCPUStats.snapshot = current
 	if totalDelta == 0 {
 		return 0, nil
 	}
-	return float64(totalDelta-idleDelta) / float64(totalDelta) * 100, nil
+	lastCPUStats.percent = float64(totalDelta-idleDelta) / float64(totalDelta) * 100
+	return lastCPUStats.percent, nil
 }
 
 var lastNetStats struct {
@@ -482,11 +565,19 @@ var lastNetStats struct {
 	bytesIn  uint64
 	bytesOut uint64
 	time     time.Time
+	rateIn   int64
+	rateOut  int64
+	hasValue bool
 }
 
 func getRealtimeTraffic() (models.RealtimeTraffic, error) {
 	lastNetStats.mu.Lock()
 	defer lastNetStats.mu.Unlock()
+
+	now := time.Now()
+	if lastNetStats.hasValue && netSampleWindow > 0 && now.Sub(lastNetStats.time) < netSampleWindow {
+		return models.RealtimeTraffic{BytesIn: lastNetStats.rateIn, BytesOut: lastNetStats.rateOut}, nil
+	}
 
 	netStat, err := systemMetricsReadFile("/proc/net/dev")
 	if err != nil {
@@ -498,7 +589,6 @@ func getRealtimeTraffic() (models.RealtimeTraffic, error) {
 		return models.RealtimeTraffic{}, err
 	}
 
-	now := time.Now()
 	var rateIn, rateOut int64
 
 	if !lastNetStats.time.IsZero() {
@@ -519,6 +609,9 @@ func getRealtimeTraffic() (models.RealtimeTraffic, error) {
 	lastNetStats.bytesIn = totalBytesIn
 	lastNetStats.bytesOut = totalBytesOut
 	lastNetStats.time = now
+	lastNetStats.rateIn = rateIn
+	lastNetStats.rateOut = rateOut
+	lastNetStats.hasValue = true
 
 	return models.RealtimeTraffic{
 		BytesIn:  rateIn,
@@ -607,8 +700,11 @@ type cpuSnapshot struct {
 }
 
 var lastCPUStats struct {
-	mu       sync.Mutex
-	snapshot cpuSnapshot
+	mu        sync.Mutex
+	snapshot  cpuSnapshot
+	percent   float64
+	sampledAt time.Time
+	hasValue  bool
 }
 
 func parseCPUSnapshot(stat string) (cpuSnapshot, bool) {
@@ -653,17 +749,40 @@ func parseDFOutput(output string) (uint64, uint64, bool) {
 func getConnectionStats() (models.ConnectionStats, error) {
 	now := time.Now()
 	connectionStatsCache.Lock()
-	defer connectionStatsCache.Unlock()
 	if now.Before(connectionStatsCache.expiresAt) {
-		return connectionStatsCache.stats, nil
+		stats := connectionStatsCache.stats
+		connectionStatsCache.Unlock()
+		return stats, nil
 	}
-	output, err := netstatCommand().Output()
+	connectionStatsCache.Unlock()
+	// 外部命令在锁外执行且带超时、并发合并（旧实现持锁无超时执行
+	// netstat：宿主网络栈卡住时所有并发请求串行挂起）。
+	value, err, _ := connectionStatsGroup.Do("connection-stats", func() (any, error) {
+		connectionStatsCache.Lock()
+		if time.Now().Before(connectionStatsCache.expiresAt) {
+			stats := connectionStatsCache.stats
+			connectionStatsCache.Unlock()
+			return stats, nil
+		}
+		connectionStatsCache.Unlock()
+		ctx, cancel := context.WithTimeout(context.Background(), systemMetricsCommandTimeout)
+		defer cancel()
+		output, err := netstatCommand(ctx).Output()
+		if err != nil {
+			return models.ConnectionStats{}, fmt.Errorf("execute netstat -tan: %w", err)
+		}
+		stats := parseConnectionStats(string(output))
+		connectionStatsCache.Lock()
+		connectionStatsCache.stats = stats
+		connectionStatsCache.expiresAt = time.Now().Add(systemSampleTTL)
+		connectionStatsCache.Unlock()
+		return stats, nil
+	})
 	if err != nil {
-		return models.ConnectionStats{}, fmt.Errorf("execute netstat -tan: %w", err)
+		return models.ConnectionStats{}, err
 	}
-	connectionStatsCache.stats = parseConnectionStats(string(output))
-	connectionStatsCache.expiresAt = now.Add(systemSampleTTL)
-	return connectionStatsCache.stats, nil
+	stats, _ := value.(models.ConnectionStats)
+	return stats, nil
 }
 
 func parseConnectionStats(output string) models.ConnectionStats {
@@ -723,8 +842,8 @@ func parseConnectionStats(output string) models.ConnectionStats {
 	return stats
 }
 
-var netstatCommand = func() *exec.Cmd {
-	return exec.Command("netstat", "-tan")
+var netstatCommand = func(ctx context.Context) *exec.Cmd {
+	return exec.CommandContext(ctx, "netstat", "-tan")
 }
 
 type prometheusSample struct {

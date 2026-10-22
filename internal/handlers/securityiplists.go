@@ -1133,7 +1133,7 @@ func (h *Handlers) AddIPToList(c *gin.Context) {
 		}
 		if len(services.AutobanActiveEntries([]models.IPListEntry{entry})) > 0 {
 			if err := tx.Commit(); err != nil {
-				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交事务失败: " + err.Error()})
+				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + ": " + err.Error()})
 				return
 			}
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"added": false}})
@@ -1255,7 +1255,7 @@ func (h *Handlers) RemoveIPFromList(c *gin.Context) {
 	}
 	if !removed {
 		if err := tx.Commit(); err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交事务失败: " + err.Error()})
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + ": " + err.Error()})
 			return
 		}
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"removed": false}})
@@ -1393,8 +1393,8 @@ func (h *Handlers) tryIPListHotPathApply(c *gin.Context, tx *sql.Tx, id string, 
 			if err := commitIPListTx(tx); err != nil {
 				restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
 				joined := errors.Join(err, restoreErr)
-				recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail("提交事务失败", joined.Error(), services.AuditResultPart("failure")))
-				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交事务失败: " + joined.Error()})
+				recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail(commitUncertainLabel, joined.Error(), services.AuditResultPart("failure")))
+				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + ": " + joined.Error()})
 				return true
 			}
 			h.recordCaddyApplyResult(applyErr)
@@ -1411,8 +1411,8 @@ func (h *Handlers) tryIPListHotPathApply(c *gin.Context, tx *sql.Tx, id string, 
 		if err := commitIPListTx(tx); err != nil {
 			restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
 			joined := errors.Join(err, restoreErr)
-			recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail("提交事务失败", joined.Error(), services.AuditResultPart("failure")))
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交事务失败: " + joined.Error()})
+			recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail(commitUncertainLabel, joined.Error(), services.AuditResultPart("failure")))
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + ": " + joined.Error()})
 			return true
 		}
 		h.recordCaddyApplyResult(nil)
@@ -1436,8 +1436,8 @@ func (h *Handlers) tryIPListHotPathApply(c *gin.Context, tx *sql.Tx, id string, 
 		// 且泄漏事务无人释放。
 		rollbackLeakedTx()
 		h.caddyService.RollbackIPListProjectionsToCommittedInLock()
-		recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail("提交事务失败", err.Error(), services.AuditResultPart("failure")))
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交事务失败: " + err.Error()})
+		recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail(commitUncertainLabel, err.Error(), services.AuditResultPart("failure")))
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + ": " + err.Error()})
 		return true
 	}
 	h.recordCaddyApplyResult(nil) // 比对证实运行配置=已提交 DB 视图，清除既往失败标记

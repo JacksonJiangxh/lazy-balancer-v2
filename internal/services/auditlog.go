@@ -1,6 +1,8 @@
 package services
 
 import (
+	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -148,27 +150,41 @@ func AppendAPIKeyAuditDetail(detail string, keyID int, keyName string) string {
 }
 
 // auditRetentionMonths 读取审计保留月数（audit_retention_months，默认 3）。
-// 三消费点（CleanupAuditLogs/RuntimeLogCleanupOnce/
-// taskLogsHousekeeping）统一口径——读取失败（含 global_config 行缺失的
-// ErrNoRows）回退默认 3 月 + warn 留痕（曾静默跳过/静默默认三态分裂）；
-// 值越界（<1）同回退默认（写侧 1-12 校验+启动钳位兜底，正常不可达）。
+// 三消费点（CleanupAuditLogs/RuntimeLogCleanupOnce/taskLogsHousekeeping）
+// 统一口径，返回 (月数, 错误)：
+//
+//   - 只有「口径已知」的错误形态才回退默认：nil 库（脚手架/极端测试形态）与
+//     ErrNoRows（全新库/配置行缺失——从未配置过，默认即用户口径）按默认 3 月
+//     继续，不返回错误。
+//   - 其他读错误（迁移窗口缺列、锁超时、库瞬断）返回 error：**不可逆删除不得
+//     在口径未知时按更短默认执行**——用户配置 12 月保留时一次读失败会让
+//     当日清理按 3 月永久删掉 9 个月审计证据。调用方据此跳过本轮删除并让
+//     任务落 failed（下轮重试）。
+//   - 越界值（<1）同回退默认（写侧 1-12 校验+启动钳位兜底，正常不可达）。
+//
 // log-cleanup 摘要行不再自行查库复算月数，改为复用
 // RuntimeLogCleanupOnce 回填的 RuntimeCleanupResult.RetentionMonths——仍在
 // 上述三消费点内，未新增第四份口径。
-func auditRetentionMonths() int {
+func auditRetentionMonths() (int, error) {
 	const defaultMonths = 3
 	if db.DB == nil {
-		return defaultMonths
+		return defaultMonths, nil
 	}
 	var months int
 	if err := db.DB.QueryRow("SELECT COALESCE(audit_retention_months, 3) FROM global_config WHERE id=1").Scan(&months); err != nil {
-		Logf("warn", "读取审计保留月数失败，按默认 %d 个月执行: %v", defaultMonths, err)
-		return defaultMonths
+		if errors.Is(err, sql.ErrNoRows) {
+			// 配置行缺失＝从未配置：默认值即用户口径，继续清理（仍留痕，
+			// 与「读取失败不得静默」口径一致）。
+			Logf("warn", "审计保留月数配置行缺失，按默认 %d 个月执行: %v", defaultMonths, err)
+			return defaultMonths, nil
+		}
+		Logf("warn", "读取审计保留月数失败，本轮跳过保留期删除（不按默认 %d 个月删除证据）: %v", defaultMonths, err)
+		return 0, fmt.Errorf("读取审计保留月数失败: %w", err)
 	}
 	if months < 1 {
-		return defaultMonths
+		return defaultMonths, nil
 	}
-	return months
+	return months, nil
 }
 
 // auditCleanupBatchSize 保留清理单批上限：分批 DELETE 避免长写锁阻塞
@@ -180,7 +196,11 @@ var auditCleanupBatchSize = 5000
 // 「清理完成」（此前失败静默返回 0——任务监控全绿、摘要谎报完成）。
 // 分批删除：每批至多 auditCleanupBatchSize 行循环至删净，批间释放写锁。
 func CleanupAuditLogs() (int, error) {
-	retentionMonths := auditRetentionMonths()
+	retentionMonths, monthsErr := auditRetentionMonths()
+	if monthsErr != nil {
+		// 保留期口径未知时一条都不删：按更短默认删除是不可逆的证据损失。
+		return 0, monthsErr
+	}
 	cutoff := time.Now().UTC().AddDate(0, -retentionMonths, 0).Format("2006-01-02 15:04:05")
 	if db.AuditDB == nil {
 		Logf("warn", "audit log cleanup skipped: audit database is not initialized")

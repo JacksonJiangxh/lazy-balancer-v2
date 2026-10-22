@@ -1,9 +1,11 @@
 package handlers
 
 import (
+	"fmt"
 	"net/http"
 
 	"lazy-balancer-v2/internal/models"
+	"lazy-balancer-v2/internal/services"
 
 	"github.com/gin-gonic/gin"
 )
@@ -16,7 +18,15 @@ import (
 func configuredRequestBodyBytes() int64 {
 	mb := globalConfigInt("request_body_max_size_mb", 128)
 	if mb < 1 || mb > 4096 {
+		// 带外改库/旧备份越界值：回退默认必须留痕（读失败已有
+		// LogConfigReadFailure；此前越界静默回退——所有受本上限约束的端点悄悄
+		// 变成 128MB 且零信号，与「库值唯一真相/fail-visible」取向相悖）。
+		// 按状态转换去重（面板轮询不刷屏），值恢复合法即补「已恢复」。
+		services.LogConfigReadFailure("request-body-max-size-out-of-range",
+			fmt.Errorf("request_body_max_size_mb=%d 越界（合法 1-4096），按 128MB 继续", mb))
 		mb = 128
+	} else {
+		services.LogConfigReadRecovered("request-body-max-size-out-of-range")
 	}
 	return mb * 1024 * 1024
 }

@@ -295,3 +295,27 @@ func TestApplicationLogWriter_filtersEachLineOfMultilinePayload(t *testing.T) {
 		}
 	})
 }
+
+// 时区刷新路径必须与写侧同一校验器：空/空白时区（LoadLocation("")=UTC 合法）
+// 不得静默把全站切到 UTC——刷新失败保留旧时区并返回错误（状态机留痕）。
+func TestRefreshLocation_rejectsBlankTimezone(t *testing.T) {
+	initServicesDB(t)
+	if _, err := ConfigureLocation("Asia/Shanghai"); err != nil {
+		t.Fatalf("seed location: %v", err)
+	}
+	t.Cleanup(func() { _, _ = ConfigureLocation("UTC") })
+	if _, err := db.DB.Exec(`UPDATE global_config SET timezone='' WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+
+	// When
+	err := refreshLocation()
+
+	// Then：拒绝空串、保留旧时区
+	if err == nil {
+		t.Fatal("空时区必须被拒绝（LoadLocation(\"\") 会静默返回 UTC）")
+	}
+	if got := CurrentLocation().String(); got != "Asia/Shanghai" {
+		t.Fatalf("时区被静默切走: %q, want Asia/Shanghai", got)
+	}
+}

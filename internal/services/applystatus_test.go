@@ -88,3 +88,25 @@ func TestBackgroundApplyFailureSnapshot_stableSelection(t *testing.T) {
 		t.Fatalf("横幅文案缺来源/时间/消息: %q", banner)
 	}
 }
+
+// 横幅选源必须按时间基准而非「配置时区墙串」比较：时区从 UTC+8 改为 UTC 后，
+// 新失败串（UTC 墙钟）可能小于旧失败串（+8 墙钟），旧实现会长期展示旧失败源。
+func TestBackgroundApplyFailureSnapshot_ordersByUTCBasisAcrossTimezoneChange(t *testing.T) {
+	resetBackgroundApplyFailures(t)
+	oldLoc := CurrentLocation()
+	_, _ = ConfigureLocation("Asia/Shanghai")
+	t.Cleanup(func() { _, _ = ConfigureLocation(oldLoc.String()) })
+
+	// Given：旧失败发生在 +8 的 10:00（UTC 02:00）
+	recordBackgroundApplyResult(BackgroundApplyThreat, errors.New("threat 失败"))
+
+	// When：切到 UTC 后新失败发生在 09:00（UTC 09:00，晚于旧失败）
+	_, _ = ConfigureLocation("UTC")
+	recordBackgroundApplyResult(BackgroundApplyCRS, errors.New("crs 失败"))
+
+	// Then：按真实时间选最新＝CRS（墙串 09:00 < 10:00 的旧实现在此选错）
+	failure := BackgroundApplyFailureSnapshot()
+	if failure == nil || failure.Source != string(BackgroundApplyCRS) {
+		t.Fatalf("横幅选源=%+v, want CRS（按 UTC 时间基准比较）", failure)
+	}
+}

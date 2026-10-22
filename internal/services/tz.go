@@ -126,6 +126,13 @@ func refreshLocation() error {
 	if err := database.QueryRow("SELECT COALESCE(timezone,?) FROM global_config WHERE id=1", db.DefaultTimezone).Scan(&tz); err != nil {
 		return fmt.Errorf("read configured timezone: %w", err)
 	}
+	// 刷新路径必须与写侧同一校验器：ValidateLocationName 显式拒绝空/空白
+	// 串（time.LoadLocation("") 合法返回 UTC——放行会静默把全站展示/审计窗口
+	// 切成 UTC，只有一次状态转换 warn、无失败终态）。校验失败保留旧时区，
+	// 由调用方状态机留痕（启动迁移已兜底存量脏值，此处为防御纵深）。
+	if err := ValidateLocationName(tz); err != nil {
+		return fmt.Errorf("configured timezone %q rejected (keeping previous): %w", tz, err)
+	}
 	if _, err := ConfigureLocation(tz); err != nil {
 		return fmt.Errorf("load configured timezone %q: %w", tz, err)
 	}

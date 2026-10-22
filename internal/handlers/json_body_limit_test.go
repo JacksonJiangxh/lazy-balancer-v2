@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,7 +14,8 @@ import (
 
 // （2026-09-19 用户裁定「统一遵循请求体大小配置项限制」）
 // 写/读探测端点的请求体上限统一取全局配置 request_body_max_size_mb
-// （0=默认 128，写侧 0-4096），不再逐端点裸奔或各定各的常量。
+// （读侧 0/缺列/越界回退 128MB；写侧值域 1-4096，0 被 400 拒绝），
+// 不再逐端点裸奔或各定各的常量。
 func TestGuardConfiguredJSONBody(t *testing.T) {
 	setupAuthTestDB(t)
 	if _, err := db.DB.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, request_body_max_size_mb INTEGER, mfa_lockout_enabled BOOLEAN); INSERT INTO global_config VALUES (1,1,1)`); err != nil {
@@ -99,5 +101,43 @@ func TestGuardConfiguredJSONBody_nilDBFallsBack(t *testing.T) {
 	r.ServeHTTP(response, request)
 	if response.Code != http.StatusOK {
 		t.Fatalf("status=%d, want 200（nil DB 回退默认上限放行）", response.Code)
+	}
+}
+
+// 越界配置回退 128MB 必须留痕（此前静默）：按状态转换去重——连续越界只首报
+// 一条 warn，值恢复合法补一条「已恢复」。读失败留痕由 globalConfigInt 负责，
+// 本用例只钉「值越界」这一此前完全静默的分支。
+func TestConfiguredRequestBodyBytes_outOfRangeFallbackIsLogged(t *testing.T) {
+	setupAuthTestDB(t)
+	if _, err := db.DB.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, request_body_max_size_mb INTEGER); INSERT INTO global_config VALUES (1, 99999)`); err != nil {
+		t.Fatalf("create global config: %v", err)
+	}
+	oldWriter := log.Writer()
+	var logs strings.Builder
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(oldWriter) })
+
+	// When：连续 5 次读到越界值。
+	for range 5 {
+		if got := configuredRequestBodyBytes(); got != 128*1024*1024 {
+			t.Fatalf("越界回退=%d, want 128MB", got)
+		}
+	}
+	// Then：只首报一条（状态转换去重，不随轮询刷屏）。
+	if got := strings.Count(logs.String(), "request_body_max_size_mb=99999"); got > 1 {
+		t.Fatalf("越界留痕 %d 条, want ≤1（状态转换去重）: %q", got, logs.String())
+	}
+
+	// When：配置恢复合法值。
+	logs.Reset()
+	if _, err := db.DB.Exec(`UPDATE global_config SET request_body_max_size_mb=7 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	if got := configuredRequestBodyBytes(); got != 7*1024*1024 {
+		t.Fatalf("合法值=%d, want 7MB", got)
+	}
+	// Then：补一条「已恢复」（此前越界已置失败态，故本次必为状态转换）。
+	if !strings.Contains(logs.String(), "request-body-max-size-out-of-range") {
+		t.Fatalf("恢复未留痕（应含 key）: %q", logs.String())
 	}
 }
