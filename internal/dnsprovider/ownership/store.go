@@ -36,6 +36,13 @@ const ownershipFileName = "acme_dns_ownership.json"
 // later cleanup without endangering a concurrent challenge.
 const StaleOwnershipAge = 75 * time.Minute
 
+// OwnershipRetention 是账本条目的本地保留期：记录只服务「本轮挑战的清理归属
+// 判定」，历史域名/失败中断留下的条目长期滞留没有价值，且账本是明文 JSON（含
+// FQDN/记录 ID/账户摘要）。超过保留期的已归属条目在下一次写入时退役（只动本地
+// 文件，不触碰远端 DNS，避免误删并发实例仍在使用的记录）；无法证明年龄的
+// legacy 条目（CreatedAt 零值）保留，由 DecideRemoval 的保守口径处理。
+const OwnershipRetention = 30 * 24 * time.Hour
+
 var fileMu sync.Mutex
 
 // AcquireFileLockForTest exposes the package lock's contention boundary to
@@ -349,6 +356,17 @@ func (s *Store) quarantinePath() string {
 }
 
 func (s *Store) save(current state) error {
+	if len(current.Records) > 0 {
+		now := time.Now()
+		kept := current.Records[:0]
+		for _, record := range current.Records {
+			if record.Stale(now) && now.Sub(record.CreatedAt) > OwnershipRetention {
+				continue
+			}
+			kept = append(kept, record)
+		}
+		current.Records = kept
+	}
 	data, err := json.Marshal(current)
 	if err != nil {
 		return fmt.Errorf("encode DNS ownership: %w", err)

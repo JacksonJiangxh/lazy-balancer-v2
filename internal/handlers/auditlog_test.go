@@ -305,29 +305,12 @@ func TestGetAuditLogs_hugePageDoesNot500(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/audit-logs?page=9223372036854775807", nil))
 
-	// Then：200 空页而非 500（clamp 后 OFFSET 合法，；上限收紧
-	// 100000→10000——深翻页无命中语义只浪费扫描）。
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
+	// Then：400 而非 500（溢出页被深翻页门显式拒绝并指引筛选）。
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s, want 400", recorder.Code, recorder.Body.String())
 	}
-	var resp struct {
-		Code int `json:"code"`
-		Data struct {
-			List []json.RawMessage `json:"list"`
-			Page int               `json:"page"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if resp.Code != 0 {
-		t.Fatalf("code=%d body=%s, want 0", resp.Code, recorder.Body.String())
-	}
-	if len(resp.Data.List) != 0 {
-		t.Fatalf("list len=%d, want empty (offset beyond one row)", len(resp.Data.List))
-	}
-	if resp.Data.Page != 10000 {
-		t.Fatalf("page=%d, want clamped 10000", resp.Data.Page)
+	if !strings.Contains(recorder.Body.String(), "筛选") {
+		t.Fatalf("deep page message must guide filtering: %s", recorder.Body.String())
 	}
 }
 

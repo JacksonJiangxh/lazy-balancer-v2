@@ -79,15 +79,29 @@ fi
 # Dockerfile 后端阶段用显式 COPY 清单（避免 web/docs/scripts 等非 Go 变更 bust
 # Go 编译层）——清单漏项只会在镜像构建时才暴露（go build 缺包），故在此比对：
 # git 跟踪的顶层 Go 目录必须全部在清单内。
-backend_copy_line="$(grep -E '^COPY [a-z].*\./$' Dockerfile | grep -F 'internal/' | head -1)"
-if [[ -z "$backend_copy_line" ]]; then
-  echo "Dockerfile: 未找到 backend 阶段的显式 COPY 清单（形如 COPY cmd/ internal/ ... ./）" >&2
+# 解析所有 COPY 源（多行逐目录形态与单行多源形态都支持）；用 backend 阶段
+# 标志（任一源含 internal/）界定范围，末位 token 是目标路径不计入源。
+copy_dirs=()
+while IFS= read -r line; do
+  read -r -a toks <<< "${line#COPY }"
+  (( ${#toks[@]} < 2 )) && continue
+  for ((i=0; i<${#toks[@]}-1; i++)); do
+    tok="${toks[i]%/}"
+    [[ -z "$tok" || "$tok" == "." ]] && continue
+    copy_dirs+=("$tok")
+  done
+done < <(grep -E '^COPY ' Dockerfile | grep -v '^COPY --from' || true)
+if (( ${#copy_dirs[@]} == 0 )); then
+  echo "Dockerfile: 未找到 backend 阶段的显式 COPY 清单（形如 COPY internal/ ./internal/）" >&2
   exit 1
 fi
-copy_dirs=()
-for token in ${backend_copy_line#COPY }; do
-  [[ "$token" == "./" ]] && continue
-  copy_dirs+=("${token%/}")
+# go.mod/go.sum 必须在清单内：目录源复制的是「内容」，漏掉模块文件会让
+# 镜像内 go build 直接报 no Go files / no required module（本地构建发现不了）。
+for required in go.mod go.sum; do
+  printf '%s\n' "${copy_dirs[@]}" | grep -qxF "$required" || {
+    echo "Dockerfile backend COPY 清单缺少 $required" >&2
+    exit 1
+  }
 done
 top_go_dirs="$(git ls-files '*.go' | awk -F/ 'NF>1{print $1}' | LC_ALL=C sort -u)"
 missing_dirs=""

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"lazy-balancer-v2/internal/db"
@@ -43,19 +44,13 @@ func TestAuditLogs_pageClamp(t *testing.T) {
 	router, _ := newAuditLogRouter(t)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/audit-logs?page=10001", nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("page clamp: %d %s", rec.Code, rec.Body.String())
+	// 深翻页语义：不再静默 clamp（用户会以为翻到了第 10001 页），改为 400
+	// 并指引用筛选缩小范围。
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("deep page: %d %s, want 400", rec.Code, rec.Body.String())
 	}
-	var resp struct {
-		Data struct {
-			Page int `json:"page"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatal(err)
-	}
-	if resp.Data.Page != 10000 {
-		t.Fatalf("page=10001 must clamp to 10000, got %d", resp.Data.Page)
+	if !strings.Contains(rec.Body.String(), "筛选") {
+		t.Fatalf("deep page message must guide filtering: %s", rec.Body.String())
 	}
 }
 

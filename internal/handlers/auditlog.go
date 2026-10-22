@@ -303,6 +303,9 @@ func buildAuditLogFilters(c *gin.Context, loc *time.Location) (string, []interfa
 	return " WHERE 1=1" + strings.Join(conds, ""), args, false
 }
 
+// auditLogDeepPageLimit 审计列表深翻页上限（页码分页保留跳页能力，超限 400）。
+const auditLogDeepPageLimit = 500
+
 func (h *Handlers) GetAuditLogs(c *gin.Context) {
 	// 与 GetAuditLogOptions 同口径的 nil 守卫。
 	if db.AuditDB == nil {
@@ -325,6 +328,14 @@ func (h *Handlers) GetAuditLogs(c *gin.Context) {
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
 	if pageSize < 1 || pageSize > 100 {
 		pageSize = 20
+	}
+	// 深翻页折中：页码分页保留（可跳页、有总页数），但超过阈值显式 400 并给出
+	// 筛选指引——OFFSET 深页在大审计库上是秒级全表扫描，静默 clamp 会让用户
+	// 以为「翻到了第 501 页」却拿到错位结果。
+	if page > auditLogDeepPageLimit {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf(
+			"结果过多（超过 %d 页），请使用时间范围/用户/动作筛选缩小范围", auditLogDeepPageLimit)})
+		return
 	}
 	offset := (page - 1) * pageSize
 
