@@ -20,11 +20,14 @@
     class="cert-jobs-table"
     :fit="true"
   >
-    <el-table-column v-if="visibleColumns.has('rule_id')" prop="rule_id" label="规则 ID" width="96" show-overflow-tooltip />
-    <el-table-column prop="domain" label="域名" width="170">
+    <el-table-column v-if="visibleColumns.has('rule_id')" prop="rule_id" label="规则 ID" min-width="120" show-overflow-tooltip />
+    <el-table-column prop="domain" label="域名" min-width="230">
       <template #default="{ row }">
-        <!-- 规则 ID 列让位后并入域名单元格副行，信息不丢失 -->
-        <span class="cell-text">{{ row.domain }}</span>
+        <!-- 多域名规则可能超长：单元格内尽量显示，hover 看完整域名。
+             规则 ID 列让位后并入副行，信息不丢失 -->
+        <el-tooltip :content="row.domain">
+          <span class="cell-text">{{ row.domain }}</span>
+        </el-tooltip>
         <span v-if="!visibleColumns.has('rule_id')" class="cell-sub">#{{ row.rule_id }}</span>
       </template>
     </el-table-column>
@@ -36,12 +39,12 @@
         </el-tooltip>
       </template>
     </el-table-column>
-    <el-table-column v-if="visibleColumns.has('issuer')" label="颁发者" width="96" show-overflow-tooltip>
+    <el-table-column v-if="visibleColumns.has('issuer')" label="颁发者" min-width="90" show-overflow-tooltip>
       <template #default="{ row }">
         <span :class="row.issuer ? 'cell-text' : 'cell-empty'">{{ row.issuer || '-' }}</span>
       </template>
     </el-table-column>
-    <el-table-column label="证书有效期" width="170">
+    <el-table-column label="证书有效期" min-width="160">
       <template #default="{ row }">
         <!-- 过期时间与剩余天数合并一列：列内只留日期，精确时间（配置时区）进 tooltip。
              过期证书不渲染裸负数——色弱/黑白场景下「-1 天」无文字语义。 -->
@@ -51,23 +54,23 @@
         <span v-else class="cell-empty">-</span>
       </template>
     </el-table-column>
-    <el-table-column v-if="visibleColumns.has('renewal')" label="自动重签时间" width="110">
+    <el-table-column v-if="visibleColumns.has('renewal')" label="自动重签时间" min-width="100">
       <template #default="{ row }">
         <el-tooltip v-if="row.status === 'issued' && renewalAt(row)" :content="formatDate(renewalAt(row))">
-          <span class="cell-text">{{ formatDateCompact(renewalAt(row)) }}</span>
+          <span class="cell-text">{{ formatDateShort(renewalAt(row)) }}</span>
         </el-tooltip>
         <span v-else class="cell-empty">-</span>
       </template>
     </el-table-column>
-    <el-table-column v-if="visibleColumns.has('updated')" label="更新时间" width="110">
+    <el-table-column v-if="visibleColumns.has('updated')" label="更新时间" min-width="100">
       <template #default="{ row }">
         <el-tooltip v-if="formatDate(row.updated_at)" :content="formatDate(row.updated_at)">
-          <span class="cell-text">{{ formatDateCompact(row.updated_at) }}</span>
+          <span class="cell-text">{{ formatDateShort(row.updated_at) }}</span>
         </el-tooltip>
         <span v-else class="cell-empty">-</span>
       </template>
     </el-table-column>
-    <el-table-column label="重试次数" width="64" align="center">
+    <el-table-column label="重试次数" width="60" align="center">
       <template #default="{ row }">
         <!-- 冷却列让位时，等待 CA 的冷却值并入本格 tooltip -->
         <el-tooltip :disabled="visibleColumns.has('cooling') || !coolingHint(row)" :content="coolingHint(row)">
@@ -76,7 +79,7 @@
         </el-tooltip>
       </template>
     </el-table-column>
-    <el-table-column v-if="visibleColumns.has('cooling')" label="冷却时间" width="104" show-overflow-tooltip>
+    <el-table-column v-if="visibleColumns.has('cooling')" label="冷却时间" min-width="96" show-overflow-tooltip>
       <template #default="{ row }">
         <span v-if="row.status === 'waiting_ca' && row.ca_available_after" class="cell-text">{{ formatCoolingTime(row.ca_available_after) }}</span>
         <span v-else class="cell-empty">-</span>
@@ -141,7 +144,7 @@ import { Timer } from '@element-plus/icons-vue'
 import { request, mfaAwareSuccess } from '@/utils/api'
 import { useLogTailPolling } from '@/composables/useLogTailPolling'
 import LogStorageBar from '@/components/LogStorageBar.vue'
-import { formatDate, formatDateCompact, formatDateShort } from '@/utils/date'
+import { formatDate, formatDateShort } from '@/utils/date'
 import { pickVisibleCertJobColumns } from '@/utils/certJobColumns'
 import { escapeHtml } from '@/utils/escape'
 import { ElMessage, ElMessageBox } from 'element-plus'

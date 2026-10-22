@@ -21,7 +21,7 @@ const page = source('src/views/settings/CertJobs.vue')
 const tableBody = section(page, 'class="cert-jobs-table"', '</el-table>')
 
 test('全列宽度单源与组件声明一致（1100px）', () => {
-  assert.equal(CERT_JOB_COLUMNS_TOTAL_WIDTH, 1100)
+  assert.equal(CERT_JOB_COLUMNS_TOTAL_WIDTH, 1136)
   assert.equal(CERT_JOB_COLUMNS.length, 10)
   for (const id of CERT_JOB_COLUMNS) {
     const width = CERT_JOB_COLUMN_WIDTHS[id]
@@ -35,13 +35,15 @@ test('全列宽度单源与组件声明一致（1100px）', () => {
 })
 
 test('贪心让位：容器不足时按优先级隐藏，且隐藏后合计不超过容器', () => {
+  // 让位顺序：冷却 → 更新时间 → 自动重签 → 颁发者 → 规则 ID（主键最后让位）
   const cases: Array<{ width: number; hidden: string[] }> = [
     { width: 1200, hidden: [] },
-    { width: 1100, hidden: [] },
-    { width: 1064, hidden: ['rule_id'] },
-    { width: 978, hidden: ['rule_id', 'cooling'] },
-    { width: 722, hidden: ['rule_id', 'cooling', 'updated', 'issuer'] },
-    { width: 600, hidden: ['rule_id', 'cooling', 'updated', 'issuer', 'renewal'] },
+    { width: 1136, hidden: [] },
+    { width: 1066, hidden: ['cooling'] },
+    { width: 980, hidden: ['cooling', 'updated'] },
+    { width: 860, hidden: ['cooling', 'updated', 'renewal'] },
+    { width: 760, hidden: ['cooling', 'updated', 'renewal', 'issuer'] },
+    { width: 600, hidden: ['cooling', 'updated', 'renewal', 'issuer', 'rule_id'] },
   ]
   for (const { width, hidden } of cases) {
     const visible = pickVisibleCertJobColumns(width)

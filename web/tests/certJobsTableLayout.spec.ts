@@ -44,28 +44,35 @@ test('消息列已删除：message 由状态标签 hover tooltip 承载', () => 
   assert.match(status, /certJobStatusLabel\(row\.status\)/)
 })
 
-test('列定宽收敛：合计 1100px 且不再使用 min-width 撑宽', () => {
+test('列宽基线 1136px：弹性列 min-width 占满整宽，固定列 width', () => {
   const tags = columnTags()
   assert.equal(tags.length, 10, `列数应为 10，实际 ${tags.length}`)
-  assert.doesNotMatch(tableBody, /min-width=/, '必须全部定宽，min-width 会在窄容器内撑出滚动条')
-  const expected: Record<string, number> = {
-    '规则 ID': 96,
-    域名: 170,
+  const flexible: Record<string, number> = {
+    '规则 ID': 120,
+    域名: 230,
+    颁发者: 90,
+    证书有效期: 160,
+    自动重签时间: 100,
+    更新时间: 100,
+    冷却时间: 96,
+  }
+  const fixed: Record<string, number> = {
     状态: 84,
-    颁发者: 96,
-    证书有效期: 170,
-    自动重签时间: 110,
-    更新时间: 110,
-    重试次数: 64,
-    冷却时间: 104,
+    重试次数: 60,
     操作: 96,
   }
-  for (const [label, width] of Object.entries(expected)) {
-    assert.match(openTagOf(label), new RegExp(`\\bwidth="${width}"`), `列「${label}」宽度应为 ${width}px`)
+  for (const [label, width] of Object.entries(flexible)) {
+    const tag = openTagOf(label)
+    assert.match(tag, new RegExp(`\\bmin-width="${width}"`), `弹性列「${label}」应为 min-width ${width}px`)
+    assert.doesNotMatch(tag, /(?<!min-)width="/, `弹性列「${label}」不得用固定 width（会留白）`)
   }
-  const total = tags.reduce((sum, tag) => sum + Number(tag.match(/\bwidth="(\d+)"/)?.[1] ?? 0), 0)
-  assert.equal(total, 1100, `列宽合计应为 1100px，实际 ${total}px`)
-  assert.ok(total <= 1200)
+  for (const [label, width] of Object.entries(fixed)) {
+    const tag = openTagOf(label)
+    assert.match(tag, new RegExp(`(?<!min-)width="${width}"`), `固定列「${label}」宽度应为 ${width}px`)
+    assert.doesNotMatch(tag, /min-width="/, `固定列「${label}」不应弹性伸展`)
+  }
+  const total = tags.reduce((sum, tag) => sum + Number(tag.match(/(?:min-)?width="(\d+)"/)?.[1] ?? 0), 0)
+  assert.equal(total, 1136, `列宽基线合计应为 1136px，实际 ${total}px`)
   assert.match(tableBody, /:fit="true"/)
 })
 
@@ -73,7 +80,7 @@ test('证书有效期合并单列：日期 + 剩余/已过期天数，精确时�
   assert.doesNotMatch(tableBody, /label="过期时间"/)
   assert.doesNotMatch(tableBody, /label="剩余天数"/)
   const body = columnBody('证书有效期')
-  assert.match(body, /\bwidth="170"/)
+  assert.match(body, /\bmin-width="160"/)
   assert.match(body, /formatDateShort\(row\.expires_at\)/)
   assert.ok(body.includes('剩 ${row.days_remaining} 天'), '缺少「剩 N 天」分支')
   assert.ok(body.includes('已过期 ${Math.abs(row.days_remaining)} 天'), '缺少「已过期 N 天」分支')
@@ -82,14 +89,14 @@ test('证书有效期合并单列：日期 + 剩余/已过期天数，精确时�
   assert.match(body, /class="cell-empty"/, '非 issued/缺失必须沿用 cell-empty 占位')
 })
 
-test('时间列走配置时区紧凑格式（formatDateCompact），tooltip 承载完整时间', () => {
-  assert.match(page, /import \{[^}]*formatDateCompact[^}]*\} from '@\/utils\/date'/)
+test('时间列显示 YYYY-MM-DD（配置时区），tooltip 承载完整时间', () => {
+  assert.doesNotMatch(page, /formatDateCompact/)
   for (const [label, body] of [
     ['自动重签时间', columnBody('自动重签时间')],
     ['更新时间', columnBody('更新时间')],
   ] as const) {
-    assert.match(body, /\bwidth="110"/, `列「${label}」宽度应为 110px`)
-    assert.match(body, /formatDateCompact\(/, `列「${label}」必须消费时区感知紧凑格式`)
+    assert.match(body, /\bmin-width="100"/, `列「${label}」最小宽度应为 100px`)
+    assert.match(body, /formatDateShort\(/, `列「${label}」必须显示配置时区的日期`)
     assert.doesNotMatch(body, /toLocaleString|toLocaleDateString|toLocaleTimeString/, `列「${label}」不得绕过配置时区`)
     assert.match(body, /<el-tooltip[^>]*:content="[^"]*formatDate\(/, `列「${label}」tooltip 必须承载完整时间`)
   }

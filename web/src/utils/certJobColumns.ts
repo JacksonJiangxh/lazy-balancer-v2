@@ -1,7 +1,11 @@
-// 证书任务表列宽与「按容器宽收敛」单源：表格列宽固定，容器变窄时按优先级
-// 隐藏低价值列，避免出现水平滚动条（隐藏列的信息由相邻单元格 tooltip / 日志
-// 弹框承载，见 CertJobs.vue）。
+// 证书任务表列宽与「按容器宽收敛」单源。
 //
+// 两条约束同时成立：
+// ① 容器更宽时表格必须占满整宽——弹性列声明 min-width，Element Plus 把多余宽度
+//    均分给这些列（固定宽的只有状态/重试/操作）；
+// ② 容器更窄时按优先级隐藏低价值列——min-width 之和超过容器仍会撑出滚动条。
+//
+// 下方 WIDTHS 即「每列最小宽度」，既用于 ② 的让位判据，也是 ① 的弹性基线。
 // 纯函数便于单测：给定容器宽度返回应显示的列集合。
 
 export type CertJobColumnId =
@@ -18,15 +22,15 @@ export type CertJobColumnId =
 
 /** 各列固定宽度（px）；合计须与 CertJobs.vue 的 width 声明一致。 */
 export const CERT_JOB_COLUMN_WIDTHS: Record<CertJobColumnId, number> = {
-  rule_id: 96,
-  domain: 170,
+  rule_id: 120,
+  domain: 230,
   status: 84,
-  issuer: 96,
-  validity: 170,
-  renewal: 110,
-  updated: 110,
-  attempts: 64,
-  cooling: 104,
+  issuer: 90,
+  validity: 160,
+  renewal: 100,
+  updated: 100,
+  attempts: 60,
+  cooling: 96,
   actions: 96,
 }
 
@@ -44,16 +48,16 @@ export const CERT_JOB_COLUMNS: readonly CertJobColumnId[] = [
 ]
 
 /**
- * 隐藏优先级：容器不足时依次让位。规则 ID 先让位（并入域名单元格副行），
- * 其次冷却时间（并入重试单元格 tooltip）、更新时间、颁发者、自动重签时间。
- * 域名/状态/有效期/重试/操作恒保留——没有它们表格失去意义。
+ * 隐藏优先级：容器不足时依次让位。规则 ID 与域名是排查主键，**最后**让位；
+ * 先让位低价值列：冷却时间（并入重试单元格 tooltip）、更新时间、自动重签时间、
+ * 颁发者。域名/状态/有效期/重试/操作恒保留——没有它们表格失去意义。
  */
 export const CERT_JOB_COLUMN_HIDE_ORDER: readonly CertJobColumnId[] = [
-  'rule_id',
   'cooling',
   'updated',
-  'issuer',
   'renewal',
+  'issuer',
+  'rule_id',
 ]
 
 export const certJobColumnsWidth = (columns: Iterable<CertJobColumnId>): number => {
