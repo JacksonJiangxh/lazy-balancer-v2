@@ -84,3 +84,24 @@ func seedCertJobRowForTaskMonitor(t *testing.T, ruleID, domain, status string) {
 		t.Fatalf("seed cert job %s: %v", ruleID, err)
 	}
 }
+
+// Given cert_jobs 查询持续失败（5s 轮询形态）。
+// When 连续两轮收集。
+// Then 失败日志按状态转换节流（首轮一条 WARNING，持续失败静默）——旧形态
+// 每个标签页每 5s 刷一条。
+func TestCollectCertJobRows_throttlesReadFailureLogs(t *testing.T) {
+	initServicesDB(t)
+	buf := captureServiceLog(t)
+	resetLogStateTransitionForTest(taskMonitorCertJobsLogKey)
+	t.Cleanup(func() { resetLogStateTransitionForTest(taskMonitorCertJobsLogKey) })
+	if err := db.DB.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	collectCertJobRows()
+	collectCertJobRows()
+
+	if got := countLogLines(buf, "cert 任务行查询失败"); got != 1 {
+		t.Fatalf("失败日志行数=%d, want 1（状态未翻转不得重复告警）:\n%s", got, buf.String())
+	}
+}

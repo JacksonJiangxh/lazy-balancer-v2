@@ -943,25 +943,24 @@ func TestIP2RegionUpdateFail_auditRecordedByRunDeferPerRun(t *testing.T) {
 	}
 }
 
-func TestIP2RegionUpdateFail_counterUpdateFailureDoesNotReaudit(t *testing.T) {
+// 计数 UPDATE 失败不得影响审计口径：run() 的 defer 每轮恰记 1 条失败审计，
+// 与 fail() 中连续失败计数（同一版本行 UPDATE）是否落库完全解耦。
+// （旧用例断言「预读计数+1 判定审计」——该内联审计早已撤销，用例恒真。）
+func TestIP2RegionUpdateFail_counterUpdateFailureStillAuditsOncePerRun(t *testing.T) {
 	m := newTestIP2RegionManager(t)
 	seedIP2RegionVersionRow(t, "v3.0.0", true)
-	// 模拟第 1 次失败已落库（计数=1、已审计）；随后计数 UPDATE 持续失败（RAISE
-	// ABORT 触发器）：审计判定必须用「预读计数+1」=2，不得回退到旧计数 1 导致
-	// 第 2 次失败重复写审计。
-	if _, err := db.DB.Exec("UPDATE security_ip2region_version SET consecutive_failures=1 WHERE id=1"); err != nil {
-		t.Fatal(err)
-	}
+	// 注入版本行 UPDATE 失败（fail() 的计数落库与 run 的 mark-start 同表）
 	if _, err := db.DB.Exec(`CREATE TRIGGER ip2r_fail_counter_update BEFORE UPDATE ON security_ip2region_version
 		BEGIN SELECT RAISE(ABORT, 'injected counter update failure'); END`); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _, _ = db.DB.Exec("DROP TRIGGER IF EXISTS ip2r_fail_counter_update") })
 
-	m.fail(errors.New("第二次失败"))
+	m.fetchLatestTag = func(context.Context) (string, error) { return "", errors.New("查询失败") }
+	m.run("auto", nil)
 
-	if got := countIP2RegionFailedAudits(t); got != 0 {
-		t.Fatalf("failed audits = %d, want 0（UPDATE 失败时旧代码会重复审计）", got)
+	if got := countIP2RegionFailedAudits(t); got != 1 {
+		t.Fatalf("失败 run 的审计条数=%d, want 1（计数落库失败不得改变审计口径）", got)
 	}
 }
 

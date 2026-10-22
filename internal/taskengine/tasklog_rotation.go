@@ -73,7 +73,17 @@ func RemoveTaskLogIfModifiedBefore(path string, cutoff time.Time) (bool, error) 
 
 // RotateTaskLogBeforeWrite 在 size+incoming 超阈时先滚动再写入。
 // keep=归档份数（主流水 1、证书任务 5）；返回是否发生滚动。
+//
+// 阈值在调用时读取（sizeFn 可能读库）：已持路径写锁的调用方应改用
+// rotateTaskLogBeforeWrite 并把锁外取到的阈值传入——持锁读库会把同条件的
+// 其他日志写者一起拖到 busy_timeout。
 func RotateTaskLogBeforeWrite(path string, incoming int64, keep int) (bool, error) {
+	return rotateTaskLogBeforeWrite(path, incoming, keep, taskLogSizeBytes())
+}
+
+// rotateTaskLogBeforeWrite 与 RotateTaskLogBeforeWrite 同语义，阈值由调用方
+// 提供（锁序：先取阈值再取路径锁）。
+func rotateTaskLogBeforeWrite(path string, incoming int64, keep int, sizeLimit int64) (bool, error) {
 	info, err := os.Stat(path)
 	if os.IsNotExist(err) {
 		return false, nil
@@ -81,7 +91,7 @@ func RotateTaskLogBeforeWrite(path string, incoming int64, keep int) (bool, erro
 	if err != nil {
 		return false, err
 	}
-	if info.Size()+incoming <= taskLogSizeBytes() {
+	if info.Size()+incoming <= sizeLimit {
 		return false, nil
 	}
 	if err := rotateTaskLogFile(path, keep); err != nil {

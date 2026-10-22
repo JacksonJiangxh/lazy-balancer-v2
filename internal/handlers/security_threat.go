@@ -13,7 +13,6 @@ import (
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 	"lazy-balancer-v2/internal/services"
-	"lazy-balancer-v2/internal/taskengine"
 )
 
 // 威胁情报库（v2.3.2 名单化重构）：内置只读三源的管理面——状态展示、
@@ -55,7 +54,7 @@ func (h *Handlers) GetThreatLib(c *gin.Context) {
 		FROM security_threat_sources t
 		WHERE %s ORDER BY t.id`, where), args...)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取威胁情报库失败: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: serverErrMsg("读取威胁情报库失败", err)})
 		return
 	}
 	defer rows.Close()
@@ -65,7 +64,7 @@ func (h *Handlers) GetThreatLib(c *gin.Context) {
 		var s threatSourceDTO
 		if err := rows.Scan(&s.ID, &s.Name, &s.DisplayName, &s.URL, &s.Format, &s.UpdateEnabled,
 			&s.EntryCount, &s.Version, &s.UpdateStatus, &s.Message, &s.LastChecked, &s.NextUpdate); err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取威胁情报库失败: " + err.Error()})
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: serverErrMsg("读取威胁情报库失败", err)})
 			return
 		}
 		sources = append(sources, s)
@@ -75,14 +74,14 @@ func (h *Handlers) GetThreatLib(c *gin.Context) {
 	// 「部分/空列表 + 200」返回——与在总览/事件列表建立的
 	// 「残缺列表不得以 200」口径对齐（Scan 失败分支同响应形）。
 	if err := rows.Err(); err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取威胁情报库失败: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: serverErrMsg("读取威胁情报库失败", err)})
 		return
 	}
 	// 与 GetCrawlerLib 共用 loadSystemListIDs：一次预载代替逐源点查；缺行保留
 	// list_id=0，查询/扫描/迭代故障均显式 500。
 	listIDs, err := loadSystemListIDs()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取内置名单失败: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: serverErrMsg("读取内置名单失败", err)})
 		return
 	}
 	for i := range sources {
@@ -104,30 +103,15 @@ func (h *Handlers) GetThreatLib(c *gin.Context) {
 func (h *Handlers) UpdateThreatAutoUpdate(c *gin.Context) {
 	// security_threat_sources 在导入全量替换清单内（configBackupTables）：
 	// 窗口内写会被导入静默覆盖或撞写锁 500——与同族 CRS/IP2Region 端点
-	// 同口径 409 fast-fail（先于 body 解析）。
-	if rejectWriteDuringImport(c, "修改威胁情报库设置（配置导入进行中）") {
+	// 同口径 409 fast-fail（见 libAutoUpdate，先于 body 解析）。
+	autoUpdate, ok := h.libAutoUpdate(c, libAutoUpdateSpec{
+		ImportAction:   "修改威胁情报库设置（配置导入进行中）",
+		InvalidMessage: "请求无效",
+	}, services.SetThreatAutoUpdate)
+	if !ok {
 		return
 	}
-	if !guardConfiguredJSONBody(c) {
-		return
-	}
-	var body struct {
-		AutoUpdate *bool `json:"auto_update"`
-	}
-	if err := c.ShouldBindJSON(&body); err != nil || body.AutoUpdate == nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求无效"})
-		return
-	}
-	// 与 UpdateCRSAutoUpdate 同口径主节点门——从节点
-	// 状态行在集群同步段内，本地写会被下次快照覆盖。
-	if !requireMasterNode(c) {
-		return
-	}
-	if err := services.SetThreatAutoUpdate(*body.AutoUpdate); err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新失败: " + err.Error()})
-		return
-	}
-	recordAudit(c, "更新", "威胁情报库", "自动更新总开关："+enabledStateLabel(*body.AutoUpdate))
+	recordAudit(c, "更新", "威胁情报库", "自动更新总开关："+enabledStateLabel(autoUpdate))
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已更新"})
 }
 
@@ -182,7 +166,7 @@ func (h *Handlers) UpdateThreatSourceFlags(c *gin.Context) {
 		if errors.Is(err, sql.ErrNoRows) {
 			c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "威胁库源不存在"})
 		} else {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取威胁库源失败: " + err.Error()})
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: serverErrMsg("读取威胁库源失败", err)})
 		}
 		return
 	}
@@ -196,14 +180,14 @@ func (h *Handlers) UpdateThreatSourceFlags(c *gin.Context) {
 			query = `UPDATE security_threat_sources SET update_enabled=1, update_status='idle', message='', consecutive_failures=0, updated_at=datetime('now') WHERE id=?`
 		}
 		if _, err := db.DB.Exec(query, id); err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新失败: " + err.Error()})
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: serverErrMsg("更新失败", err)})
 			return
 		}
 	} else {
 		// 关闭即退出更新任务：清掉关闭前的瞬时失败态与排程槽，否则列表/库头
 		// 继续显示「更新失败」，重新启用还会因残留未来槽无法武装首槽。
 		if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_enabled=0, update_status='idle', message='已关闭自动更新', next_update=NULL, consecutive_failures=0, updated_at=datetime('now') WHERE id=?`, id); err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新失败: " + err.Error()})
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: serverErrMsg("更新失败", err)})
 			return
 		}
 	}
@@ -217,44 +201,18 @@ func (h *Handlers) UpdateThreatSourceFlags(c *gin.Context) {
 // StartThreatLibUpdate 手动触发更新（主节点；镜像 StartCRSUpdate 的受理/
 // 重复任务 409 语义）。
 func (h *Handlers) StartThreatLibUpdate(c *gin.Context) {
-	if !requireMasterNode(c) {
-		return
-	}
-	// V2（用户裁定）：手动触发统一经任务引擎（同 StartCRSUpdate）。
-	te := services.TaskEngine()
-	if te == nil {
-		respondTaskEngineUnavailable(c)
-		return
-	}
-	if te.IsTaskInFlight("threat") {
-		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "任务运行中，请稍后重试"})
-		return
-	}
-	op := auditOperator(c)
-	// 响应前同步预占位，拒绝时不得伪报 running。
-	if err := services.TriggerTaskAsync(te, "threat", services.TriggerAuditContext{
-		Operator: op, Family: "威胁情报库", Name: "威胁情报库更新",
-	}); err != nil {
-		respondTaskTriggerAdmissionError(c, err)
-		return
-	}
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"status": "running", "trigger": "manual"}})
+	// 手动更新仅限主节点；受理/重复任务 409 语义与 CRS/IP2Region 单源。
+	h.startLibUpdate(c, "threat", "威胁情报库", "威胁情报库更新")
 }
 
 // GetThreatLibUpdateStatus 任务级状态（弹框轮询；镜像 GetCRSUpdateStatus 形态）。
 func (h *Handlers) GetThreatLibUpdateStatus(c *gin.Context) {
-	mgr := services.GetThreatUpdateManager()
-	if mgr == nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "威胁库更新服务未初始化"})
-		return
-	}
-	snap := mgr.StatusSnapshot()
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: snap})
+	libUpdateStatus(c, "威胁库", services.GetThreatUpdateManager(), func(mgr *services.ThreatUpdateManager) any {
+		return mgr.StatusSnapshot()
+	})
 }
 
-// GetThreatLibUpdateLogs 更新日志（含上一代轮转文件，镜像 GetCRSUpdateLogs）。
+// GetThreatLibUpdateLogs 更新日志（含上一代轮转文件，与 CRS/IP2Region 单源）。
 func (h *Handlers) GetThreatLibUpdateLogs(c *gin.Context) {
-	// 单一日志数据源：同 GetCRSUpdateLogs。
-	logPath := taskengine.TaskLogPath("threat")
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]string{"content": readUpdateLogWithRotation(logPath)}})
+	libUpdateLogs(c, "threat")
 }

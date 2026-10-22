@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -227,8 +228,168 @@ func resetThreatScreenCachesForTest() {
 	topTargetsCacheMu.Lock()
 	topTargetsCache = map[topTargetsCacheKey]topTargetsCacheEntry{}
 	topTargetsCacheMu.Unlock()
+	threatRollupDimAggregateCacheMu.Lock()
+	threatRollupDimAggregateCache = map[threatRollupDimAggregateKey]threatRollupDimAggregateEntry{}
+	threatRollupDimAggregateCacheMu.Unlock()
 	threatTrafficCache.Range(func(key, _ any) bool {
 		threatTrafficCache.Delete(key)
 		return true
 	})
+}
+
+// ---- rollup 维度聚合（大屏同屏全部维度）：SQL 侧聚合 + 30s 缓存 ----
+
+// threatRollupDimAggregateTTL 与安全总览/规则阶段统计同族（30s）：大屏 30s
+// 轮询在同一窗口锚点内复用一次聚合，宽窗口（hours 上限 720）不再每请求全量
+// 拉行。
+const threatRollupDimAggregateTTL = 30 * time.Second
+
+// threatRollupDimAggregate 是 rollup 窗口的聚合结果（总量/拦截/国家/省/攻击族/
+// 规则/按槽分钟总量）。map 只读共享给同屏各卡片（topN 与 JSON 序列化均只读）。
+type threatRollupDimAggregate struct {
+	total, blocked                                      int
+	countries, chinaProvinces, familyCounts, ruleCounts map[string]int
+	// bucketTotals 与查询键里的槽界一一对应（长度=槽数）。
+	bucketTotals []int
+}
+
+type threatRollupDimAggregateKey struct {
+	metrics *sql.DB
+	// sinceMinute 是窗口下界（分钟锚点）：每分钟前移即换键。
+	sinceMinute string
+	// bucketLayout 是槽界签名（首槽 UnixNano + 槽数）：槽界由请求时刻（秒级）
+	// 推导，同分钟内两次请求的槽界可能不同，必须进键，否则落桶错位。
+	bucketLayout string
+	// coverage 是固化覆盖水位（coveredFrom）：宽窗口头部回填推进会使同一
+	// 窗口的聚合内容变化——不参与键会把回填中的空/少计结果锁在 30s 缓存里
+	// （大屏看板与回填进度自相矛盾）。
+	coverage string
+}
+
+type threatRollupDimAggregateEntry struct {
+	agg       threatRollupDimAggregate
+	expiresAt time.Time
+}
+
+var (
+	threatRollupDimAggregateCacheMu sync.Mutex
+	threatRollupDimAggregateCache   = map[threatRollupDimAggregateKey]threatRollupDimAggregateEntry{}
+)
+
+// threatRollupBucketLayout 槽界签名（空槽集=空串）。
+func threatRollupBucketLayout(bucketStarts []time.Time) string {
+	if len(bucketStarts) == 0 {
+		return ""
+	}
+	return strconv.FormatInt(bucketStarts[0].UnixNano(), 10) + "|" + strconv.Itoa(len(bucketStarts))
+}
+
+// threatRollupDimAggregateQuery 聚合窗口内 rollup：
+//   - 维度聚合走 SQL GROUP BY——传输行数从「分钟数 × 维度基数」压到「维度
+//     组合数」（30 天 × 每分钟数十~数百行 → 数百~数千行），Go 侧不再逐行 Scan；
+//   - 按槽分钟总量另用 GROUP BY minute（≤43,200 行，与维度无关），槽界归属
+//     仍在 Go 侧按真实时刻二分（槽界携带配置时区，DST 两侧各自正确）；
+//   - 失败不缓存、错误上抛（调用方整卡 500，与现有错误口径一致）。
+//
+// cacheable=false（窗口头部回填未完成）时既不读也不写缓存：不完整的聚合
+// 被缓存会让同一窗口在 30s 内锁死少计结果，与回填进度自相矛盾。
+func threatRollupDimAggregateQuery(database *sql.DB, sinceMinute string, bucketStarts []time.Time, coverage string, cacheable bool) (threatRollupDimAggregate, error) {
+	agg := threatRollupDimAggregate{
+		countries:      map[string]int{},
+		chinaProvinces: map[string]int{},
+		familyCounts:   map[string]int{},
+		ruleCounts:     map[string]int{},
+		bucketTotals:   make([]int, len(bucketStarts)),
+	}
+	if database == nil {
+		return agg, errors.New("database unavailable")
+	}
+	key := threatRollupDimAggregateKey{
+		metrics:      database,
+		sinceMinute:  sinceMinute,
+		bucketLayout: threatRollupBucketLayout(bucketStarts),
+	}
+	now := time.Now()
+	if cacheable {
+		threatRollupDimAggregateCacheMu.Lock()
+		if entry, ok := threatRollupDimAggregateCache[key]; ok && now.Before(entry.expiresAt) {
+			cached := entry.agg
+			threatRollupDimAggregateCacheMu.Unlock()
+			return cached, nil
+		}
+		threatRollupDimAggregateCacheMu.Unlock()
+	}
+
+	rows, err := database.Query(`SELECT COALESCE(country,''), COALESCE(province,''), COALESCE(family,''), COALESCE(rule,''), COALESCE(action,''), SUM(count)
+		FROM security_event_rollup WHERE minute >= ? GROUP BY 1,2,3,4,5`, sinceMinute)
+	if err != nil {
+		return agg, err
+	}
+	for rows.Next() {
+		var country, province, family, rule, action string
+		var count int
+		if err := rows.Scan(&country, &province, &family, &rule, &action, &count); err != nil {
+			rows.Close()
+			return agg, err
+		}
+		agg.total += count
+		// action 取值与 queryThreatRecentBlocked 同单一事实源
+		// （threatRollupBlockedAction），两侧口径漂移由同一钉测捕获。
+		if action == threatRollupBlockedAction {
+			agg.blocked += count
+		}
+		if country != "" {
+			agg.countries[country] += count
+		}
+		if province != "" {
+			agg.chinaProvinces[province] += count
+		}
+		agg.familyCounts[family] += count
+		if rule != "" {
+			agg.ruleCounts[rule] += count
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return agg, err
+	}
+	rows.Close()
+
+	if len(bucketStarts) > 0 {
+		minuteRows, merr := database.Query(`SELECT minute, SUM(count) FROM security_event_rollup WHERE minute >= ? GROUP BY minute`, sinceMinute)
+		if merr != nil {
+			return agg, merr
+		}
+		for minuteRows.Next() {
+			var minute string
+			var count int
+			if serr := minuteRows.Scan(&minute, &count); serr != nil {
+				minuteRows.Close()
+				return agg, serr
+			}
+			// 滑动窗口落桶：rollup 分钟串为 UTC，按槽界真实时刻二分定位。
+			if mt, perr := time.ParseInLocation("2006-01-02 15:04", minute, time.UTC); perr == nil {
+				agg.bucketTotals[threatBucketIndex(mt, bucketStarts)] += count
+			}
+		}
+		if err := minuteRows.Err(); err != nil {
+			minuteRows.Close()
+			return agg, err
+		}
+		minuteRows.Close()
+	}
+
+	if !cacheable {
+		return agg, nil
+	}
+	threatRollupDimAggregateCacheMu.Lock()
+	// 键含分钟锚点/槽界——插入时顺带清过期项，防 map 无限增长。
+	for k, entry := range threatRollupDimAggregateCache {
+		if !now.Before(entry.expiresAt) {
+			delete(threatRollupDimAggregateCache, k)
+		}
+	}
+	threatRollupDimAggregateCache[key] = threatRollupDimAggregateEntry{agg: agg, expiresAt: now.Add(threatRollupDimAggregateTTL)}
+	threatRollupDimAggregateCacheMu.Unlock()
+	return agg, nil
 }

@@ -86,13 +86,12 @@ func TestListSecurityPolicies_24hCountsCachedWithinWindow(t *testing.T) {
 
 // 退避形状（失败不缓存）：缓存仍应保持空表——错误不落缓存，下一请求重试。
 func TestLoadSecurityPolicy24hCounts_failureNotCached(t *testing.T) {
-	h := newBackupTestHandlers(t)
+	newBackupTestHandlers(t)
 	resetSecurityPolicy24hCountsCacheForTest()
 	t.Cleanup(resetSecurityPolicy24hCountsCacheForTest)
 	oldTTL := securityPolicy24hCountsCacheTTL
 	securityPolicy24hCountsCacheTTL = time.Minute
 	t.Cleanup(func() { securityPolicy24hCountsCacheTTL = oldTTL })
-	_ = h
 
 	// Given 指标库被关闭（查询必失败）。
 	closed := db.MetricsDB

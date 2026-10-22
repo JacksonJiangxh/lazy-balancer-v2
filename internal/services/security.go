@@ -98,7 +98,16 @@ func GetSecurityPoliciesForRule(ruleCaddyID string) []*models.SecurityPolicy {
 	// 批次引用解析：跨全部已加载策略收集列表 id，一次批量查询（预算：与策略数
 	// 无关的常数一次），合并集附加到各策略的 Merged* 字段供发射端消费。
 	resolvePolicyIPListRefs(policies, nil)
-	return policies
+	// RDB 严格模式：引用的威胁库文件缺失（IPRefMissing）的策略在生产批量生成
+	// 路径被跳过（loadSecurityPolicyContext），单规则路径此前不过滤——规则保存
+	// 前置校验用的正是这条路径，校验通过 ≠ 生产发射形态。三处同源。
+	emitted := policies[:0]
+	for _, p := range policies {
+		if p != nil && !p.IPRefMissing {
+			emitted = append(emitted, p)
+		}
+	}
+	return emitted
 }
 
 // geoipCountries parses the policy's geoip_countries JSON array, skipping
@@ -203,11 +212,25 @@ type scopedCRSListResult struct {
 
 type scopedCRSListCache map[string]scopedCRSListResult
 
+// chainIndex 为 CRS 规则索引的取值函数（nil=本策略自建惰性链）。批量生成
+// 路径传入生成上下文级实例：索引指纹键（ReadDir+全量 stat+版本查询）每轮
+// 只算一次，而不是逐（规则×策略）一次。
 func BuildCorazaDirectives(p *models.SecurityPolicy, store caddyConfigStore, crsFingerprint string, multiPolicy bool, blockStatus int, ruleCaddyID string, stage0DetectionTrust ...[]string) (string, error) {
 	return buildCorazaDirectivesWithScopedCache(p, store, crsFingerprint, multiPolicy, blockStatus, ruleCaddyID, nil, stage0DetectionTrust...)
 }
 
 func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyConfigStore, crsFingerprint string, multiPolicy bool, blockStatus int, ruleCaddyID string, scopedCache scopedCRSListCache, stage0DetectionTrust ...[]string) (string, error) {
+	var trust []string
+	if len(stage0DetectionTrust) > 0 {
+		trust = stage0DetectionTrust[0]
+	}
+	return buildCorazaDirectivesWithIndex(p, store, crsFingerprint, multiPolicy, blockStatus, ruleCaddyID, scopedCache, nil, trust)
+}
+
+// buildCorazaDirectivesWithIndex 同上，另接受生成上下文级的 CRS 规则索引取值
+// 函数（nil=本策略自建惰性链）。批量路径用它避免逐（规则×策略）重算索引
+// 指纹键；单规则/校验路径走上方无索引变体。
+func buildCorazaDirectivesWithIndex(p *models.SecurityPolicy, store caddyConfigStore, crsFingerprint string, multiPolicy bool, blockStatus int, ruleCaddyID string, scopedCache scopedCRSListCache, chainIndex func() *CRSRuleIndex, stage0DetectionTrust []string) (string, error) {
 	if ruleCaddyID == "" {
 		return "", fmt.Errorf("u-trust12 引擎投影缺少规则身份（ruleCaddyID 为空）——id:12 逐规则渲染，scope 必须编入规则身份（历史 HP-1）")
 	}
@@ -368,8 +391,8 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 	// 值=1 非刻意 opt-in，flag 门控会使全部默认策略凭空获得信任规则——门禁
 	// 钉测实证；空↔非空仍走全量链）。allow 模式的 ACL 规则为 !@ipListFast
 	//（否定算子）：空集=恒命中=全拒，与「无规则=全放」语义不等价且有全站
-	// 锁死风险——同样维持内容门控。遗留黑名单为内联字段，仅经策略保存（全
-	// 量链）变化，维持内容门控。
+	// 锁死风险——因此 allow 侧不设内容门（见下方无条件发射）。遗留黑名单为
+	// 内联字段，仅经策略保存（全量链）变化，维持内容门控。
 	// allow 内容的空集不是“无规则”：否定算子空文件=恒拒。删除内容门，
 	// 让条目全部过期/备份导入空引用时仍发射 deny。
 	if p.IPACLEnabled {
@@ -421,8 +444,8 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 	// 时,绑定规则的每个策略引擎发射 id:12 DetectionOnly——信任 IP 全评估全
 	// 记录不拦（事件动作=检测）。直通形态（trust_detection=0）由路由层
 	// subroute 短路,不经任何引擎。
-	if len(stage0DetectionTrust) > 0 {
-		operand, err := ipListRuleOperand(precheckProjectionScope("trust12", ruleCaddyID), stage0DetectionTrust[0], false)
+	if stage0DetectionTrust != nil {
+		operand, err := ipListRuleOperand(precheckProjectionScope("trust12", ruleCaddyID), stage0DetectionTrust, false)
 		if err != nil {
 			return "", err
 		}
@@ -528,10 +551,13 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 			Logf("debug", "策略 %q 的 crs_rule_groups 含基础设施组号 %v，发射时已剥离（由强制 Include 按正确次序补齐）", p.Name, stripped)
 			groups = kept
 		}
-		// 索引取值链级惰性一次——下方三个消费点（crsCoveredInfraGroupCodes/
-		// emitCRSRuleGroupSelection/emitScopedCRSExclusions）各自直调 GetCRSRuleIndex
-		// 会各付一次缓存键计算（ReadDir+全量 stat），全量生成时数百次纯浪费。
-		chainIndex := lazyCRSRuleIndex()
+		// 索引取值链级惰性一次——下方消费点（emitCRSRuleGroupSelection/
+		// emitScopedCRSExclusions）各自直调 GetCRSRuleIndex 会各付一次缓存键
+		// 计算（ReadDir+全量 stat），全量生成时数百次纯浪费。批量生成路径经
+		// buildCorazaDirectivesWithIndex 传入生成级实例（每轮一次）。
+		if chainIndex == nil {
+			chainIndex = lazyCRSRuleIndex()
+		}
 		// SecRuleRemoveById（配置期删除）与
 		// ctl:ruleRemoveById（运行时跳过）需要**相反**的发射顺序——
 		//   配置期：必须在 Include 之后（coraza 单遍解析，DeleteByID 只删已注册规则，
@@ -543,7 +569,19 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 		// 作用域限定（ip/list）条目收集后统一发射：列表引用需单批解析，合并去重。
 		var scoped []CRSExcludedEntry
 		var scopeAllTargets []string
-		for _, entry := range ParseCRSExcludedRules(string(p.CRSExcludedRules)) {
+		excludedEntries := ParseCRSExcludedRules(string(p.CRSExcludedRules))
+		if len(excludedEntries) == 0 {
+			if raw := strings.TrimSpace(string(p.CRSExcludedRules)); raw != "" && raw != "[]" {
+				// 与同族（geoip_countries/crs_rule_groups/custom_rules）同口径：
+				// 非空载荷解析为空 = 用户配置的排除项全部消失（方向是过度拦截
+				// fail-safe，但零留痕会让排障无从下手）。60s 限流 WARN。
+				msg := fmt.Sprintf("渲染: 策略 %q（#%d）crs_excluded_rules 载荷无法解析（%d 字节），排除项按空集处理: %q", p.Name, p.ID, len(p.CRSExcludedRules), clipForLog(raw, 120))
+				if auditFailureShouldLog(msg) {
+					Logf("warn", "%s", msg)
+				}
+			}
+		}
+		for _, entry := range excludedEntries {
 			// 存量兜底：命中 901 初始化组的排除一律跳过——初始化组已由下方
 			// 去重强制包含，排除若放行会在 Include 后（scope=all）或运行时
 			//（scoped ctl）将其删除，守卫按 0 处理、策略空转。写入面对新提交
@@ -591,7 +629,16 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 		// 容器默认形态下两者同树（/app/waf）；自定义 data_dir 的非容器部署
 		// 中派生树与 /app/waf 分叉——该形态不在支持矩阵内（仅容器默认
 		// data_dir 为正式支持）。
-		sb.WriteString("Include /app/waf/crs/crs-setup.conf\n")
+		// 与 infra 文件同格的存在性门：coraza 对缺失的精确路径 Include 是致命
+		// 错误（seclang ReadFile → 整份配置加载失败、全站停摆）。crs-setup.conf
+		// 被带外删除/部分挂载/恢复流程只还原 rules 时，无条件 Include 会让保存
+		// 永久失败、Caddy 重启无法加载 autosave 配置；跳过时 901 初始化仍提供
+		// 偏执级默认（语义可运行），仅告警。
+		if _, err := os.Stat(filepath.Join(crsDirectivesDir, "crs-setup.conf")); err == nil {
+			sb.WriteString("Include /app/waf/crs/crs-setup.conf\n")
+		} else {
+			Logf("warn", "CRS 基线配置 crs-setup.conf 缺失，跳过 Include（策略 %q）：请重新安装/恢复规则库", p.Name)
+		}
 		if _, err := os.Stat(filepath.Join(crsDirectivesDir, "zz-user-overrides.conf")); err == nil {
 			sb.WriteString("Include /app/waf/crs/zz-user-overrides.conf\n")
 		}
@@ -631,18 +678,15 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 					Logf("warn", "CRS 基础设施规则文件缺失，跳过强制 Include（%s，策略 %q）", name, p.Name)
 				}
 			}
-			covered := crsCoveredInfraGroupCodes(chainIndex, groups)
-			if _, ok := covered["01"]; !ok {
-				emitInfraInclude("REQUEST-901-INITIALIZATION.conf")
-			}
+			// infra 组号/规则 ID 已在上游 stripInfraCRSGroupCodes 剥离，故此处
+			// 无条件强制 Include（不再做「用户是否已选覆盖」判定——剥离后该判定
+			// 恒为空、属不可达的虚假防线）。序：901 先于被选组（phase:1 默认值），
+			// 949/959 在检测规则之后（插入序=执行序）。
+			emitInfraInclude("REQUEST-901-INITIALIZATION.conf")
 			emitCRSRuleGroupSelection(&sb, p, groups, chainIndex)
-			if _, ok := covered["49"]; !ok {
-				emitInfraInclude("REQUEST-949-BLOCKING-EVALUATION.conf")
-			}
+			emitInfraInclude("REQUEST-949-BLOCKING-EVALUATION.conf")
 			if p.WAFCheckResponse {
-				if _, ok := covered["59"]; !ok {
-					emitInfraInclude("RESPONSE-959-BLOCKING-EVALUATION.conf")
-				}
+				emitInfraInclude("RESPONSE-959-BLOCKING-EVALUATION.conf")
 			}
 		}
 		// 拦截页按触发策略归因：blockStatus>0 时把 CRS 入站拦截评估规则
@@ -949,7 +993,7 @@ func emitCustomRules(sb *strings.Builder, customRules []models.CustomRule, block
 		// +10000 后撞入 GeoIP 预检段(800000-899999,geoipPrecheckRuleBase 起)——
 		// 同 id 冲突会使整份 coraza 配置编译失败;≥890000 仍撞 CRS 保留段
 		// (900000+)。发射侧跳过并告警(镜像上方坏规则兜底同款)。
-		if cr.ID >= 790000 {
+		if cr.ID >= customRuleEmitIDBound {
 			Logf("warn", "自定义规则 %d(%s) 发射 id 将撞入 GeoIP 预检段/CRS 保留空间，已跳过发射", cr.ID, cr.Name)
 			continue
 		}
@@ -1046,7 +1090,7 @@ func SecurityPolicyHasIPControl(p *models.SecurityPolicy) bool {
 	// 信任名单：stage0 策略的信任不属于本引擎（路由层直通/预检承载）；
 	// 内容门取合并集（inline ∪ 已解析引用条目）——引用的列表为空/已被删除
 	// 时发射面零信任规则，摘要同步 false。
-	emitTrustControl := p.IPWhitelistEnabled && p.PolicyType != models.PolicyTypeStage0 && len(mergedWhitelist(p)) > 0
+	emitTrustControl := p.IPWhitelistEnabled && p.PolicyType != models.PolicyTypeStage0 && policyWhitelistHasEntries(p)
 	// 空转收窄：off/custom_only 且仅信任名单时，只有 custom_only 同时存在
 	// 启用自定义规则才由该引擎承载信任规则；其余模式（blocking/detection）
 	// 恒有 CRS 引擎。摘要与 BuildCorazaDirectives 的 emitIPControl 同式。
@@ -1068,6 +1112,27 @@ func SecurityPolicyHasIPControl(p *models.SecurityPolicy) bool {
 	return emitTrustControl && p.Mode == "custom_only" && CountEnabledCustomRules(p.CustomRules) > 0
 }
 
+// policyWhitelistHasEntries 报告信任名单在发射面是否非空（与 mergedWhitelist
+// 同判定，另支持摘要的轻量路径）。
+//   - 渲染路径：MergedWhitelist 已携带「inline ∪ 引用条目」的合并集，直接判空；
+//   - 摘要路径：引用的名单只做了「是否含条目」判定（IPWhitelistRefsNonEmpty），
+//     未装载内容——此时 inline 与引用非空判定取并集，避免为一次列表请求做
+//     全量条目 JSON 解析。
+func policyWhitelistHasEntries(p *models.SecurityPolicy) bool {
+	if p.MergedWhitelist != nil {
+		return len(p.MergedWhitelist) > 0
+	}
+	if p.IPWhitelistRefsNonEmpty {
+		return true
+	}
+	var inline []string
+	if err := json.Unmarshal(p.IPWhitelist, &inline); err != nil {
+		logMalformedInlineIPList(p.ID, "ip_whitelist", err)
+		return false
+	}
+	return len(aggregateIPEntries(inline)) > 0
+}
+
 // CountEnabledCustomRules returns how many of the policy's referenced custom
 // rules are enabled, mirroring emission (emitCustomRules skips disabled rules).
 // The summary's custom_rules_count must not count disabled rules, otherwise the
@@ -1075,11 +1140,41 @@ func SecurityPolicyHasIPControl(p *models.SecurityPolicy) bool {
 func CountEnabledCustomRules(raw json.RawMessage) int {
 	count := 0
 	for _, cr := range resolvePolicyCustomRules(raw, nil) {
-		if cr.Enabled {
+		if customRuleEmittable(cr) {
 			count++
 		}
 	}
 	return count
+}
+
+// clipForLog 截断日志里的用户载荷（避免整列 JSON 刷屏；按 rune 截断不切坏
+// 多字节字符）。
+func clipForLog(raw string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	runes := []rune(raw)
+	if len(runes) <= limit {
+		return raw
+	}
+	return string(runes[:limit]) + "…"
+}
+
+// customRuleEmitIDBound 是自定义规则 DB id 的发射上界：id+10000 偏移后不得撞入
+// GeoIP 预检段（800000+）与 CRS 保留段（900000+）。发射与摘要计数共用本常量。
+const customRuleEmitIDBound = 790000
+
+// customRuleEmittable 是「该自定义规则会真实发射」的单一判据（= 发射侧跳过
+// 条件的反面）：启用 ∧ 无发射缺陷 ∧ id 不撞预检/保留段。摘要计数必须复用
+// 同一判据，否则列表宣称「已启用 N 条自定义规则」而引擎实际零发射。
+func customRuleEmittable(cr models.CustomRule) bool {
+	if !cr.Enabled {
+		return false
+	}
+	if cr.ID >= customRuleEmitIDBound {
+		return false
+	}
+	return customRuleEmissionIssue(cr) == ""
 }
 
 // CountEnabledCustomRulesBatch 批量统计策略的自定义规则引用：所有 ID 引用合并
@@ -1112,7 +1207,10 @@ func CountEnabledCustomRulesBatch(policies []*models.SecurityPolicy) []int {
 	for id := range all {
 		ids = append(ids, id)
 	}
-	enabled := make(map[int]bool, len(ids))
+	// 与单策略路径同判据（customRuleEmittable）：只查 enabled 会把「存在但
+	// 发射侧必跳过」的规则计进摘要，UI 宣称 N 条而引擎零发射。列集与
+	// resolvePolicyCustomRules 同一查询形态，判据单一。
+	emittable := make(map[int]bool, len(ids))
 	for start := 0; start < len(ids); start += policyCustomRuleChunkSize {
 		end := start + policyCustomRuleChunkSize
 		if end > len(ids) {
@@ -1124,19 +1222,29 @@ func CountEnabledCustomRulesBatch(policies []*models.SecurityPolicy) []int {
 		for i, id := range chunk {
 			args[i] = id
 		}
-		rows, err := db.DB.Query("SELECT id, COALESCE(enabled,1) FROM security_custom_rules WHERE id IN ("+placeholders+")", args...)
+		rows, err := db.DB.Query("SELECT id, name, COALESCE(conditions,'[]'), COALESCE(action,'block'), COALESCE(score,5), COALESCE(enabled,1) FROM security_custom_rules WHERE id IN ("+placeholders+")", args...)
 		if err != nil {
 			Logf("warn", "策略列表: 批量读取自定义规则失败（该块计数为 0）: %v", err)
 			continue
 		}
 		for rows.Next() {
 			var id int
+			var name, conditionsJSON, action string
+			var score int
 			var on bool
-			if err := rows.Scan(&id, &on); err != nil {
+			if err := rows.Scan(&id, &name, &conditionsJSON, &action, &score, &on); err != nil {
 				Logf("warn", "策略列表: 自定义规则行扫描失败（该行丢弃）: %v", err)
 				continue
 			}
-			enabled[id] = on
+			var conditions []models.CustomRuleCondition
+			if err := json.Unmarshal([]byte(conditionsJSON), &conditions); err != nil {
+				// 畸形条件 = 发射侧同样无法发射（skip+warn），计数不计入。
+				emittable[id] = false
+				continue
+			}
+			emittable[id] = customRuleEmittable(models.CustomRule{
+				ID: id, Name: name, Conditions: conditions, Action: action, Score: score, Enabled: on,
+			})
 		}
 		if err := rows.Err(); err != nil {
 			Logf("warn", "策略列表: 自定义规则迭代失败（该块计数可能不完整）: %v", err)
@@ -1145,7 +1253,7 @@ func CountEnabledCustomRulesBatch(policies []*models.SecurityPolicy) []int {
 	}
 	for i, set := range idSets {
 		for id := range set {
-			if enabled[id] {
+			if emittable[id] {
 				counts[i]++
 			}
 		}
@@ -1163,19 +1271,28 @@ func CountEnabledCustomRulesBatch(policies []*models.SecurityPolicy) []int {
 // 检测策略（不发射 id:12）；非 nil（可空切片）=存在——恒发射 id:12（空集
 // 文件算子永不命中=与无规则等价，空↔非空纯内容变化走热路径）。
 func buildWafHandlerWithPolicy(ruleCaddyID string, policy *models.SecurityPolicy, store caddyConfigStore, crsFp string, multiPolicy bool, blockStatus int, bodyLimitMB int, stage0DetectionTrust []string, scopedCaches ...scopedCRSListCache) (map[string]interface{}, error) {
-	if policy == nil {
-		return nil, nil
-	}
 	var scopedCache scopedCRSListCache
 	if len(scopedCaches) > 0 {
 		scopedCache = scopedCaches[0]
 	}
+	return buildWafHandlerWithIndex(ruleCaddyID, policy, store, crsFp, multiPolicy, blockStatus, bodyLimitMB, stage0DetectionTrust, nil, scopedCache)
+}
+
+// buildWafHandlerWithIndex 是带生成上下文级 CRS 规则索引的变体（批量生成
+// 路径专用）：索引指纹键每轮只算一次，而不是逐（规则×策略）一次。
+func buildWafHandlerWithIndex(ruleCaddyID string, policy *models.SecurityPolicy, store caddyConfigStore, crsFp string, multiPolicy bool, blockStatus int, bodyLimitMB int, stage0DetectionTrust []string, chainIndex func() *CRSRuleIndex, scopedCache scopedCRSListCache) (map[string]interface{}, error) {
+	if policy == nil {
+		return nil, nil
+	}
+	if chainIndex == nil {
+		chainIndex = lazyCRSRuleIndex()
+	}
 	var directives string
 	var err error
 	if stage0DetectionTrust == nil {
-		directives, err = buildCorazaDirectivesWithScopedCache(policy, store, crsFp, multiPolicy, blockStatus, ruleCaddyID, scopedCache)
+		directives, err = buildCorazaDirectivesWithIndex(policy, store, crsFp, multiPolicy, blockStatus, ruleCaddyID, scopedCache, chainIndex, nil)
 	} else {
-		directives, err = buildCorazaDirectivesWithScopedCache(policy, store, crsFp, multiPolicy, blockStatus, ruleCaddyID, scopedCache, stage0DetectionTrust)
+		directives, err = buildCorazaDirectivesWithIndex(policy, store, crsFp, multiPolicy, blockStatus, ruleCaddyID, scopedCache, chainIndex, stage0DetectionTrust)
 	}
 	if err != nil {
 		return nil, err
@@ -1414,6 +1531,23 @@ func IsStage1PrecheckEventID(n int) bool {
 const Stage1PrecheckSegmentSQL = "rule_triggered IN " + Stage1PrecheckIDSQLList +
 	" OR (LENGTH(rule_triggered)=6 AND rule_triggered LIKE '8%')"
 
+// allowPolicySetSignature 返回规则绑定的 allow 模式策略身份签名（升序 id，
+// 逗号分隔）。签名只用于生成轮内的交集缓存键：同一轮内策略的合并名单不可变，
+// 因此身份集相同即交集相同。无 allow 策略返回空串（不走缓存）。
+func allowPolicySetSignature(policies []*models.SecurityPolicy) string {
+	var ids []string
+	for _, p := range policies {
+		if p == nil || !p.IPACLEnabled || p.IPACLMode != "allow" {
+			continue
+		}
+		ids = append(ids, strconv.Itoa(p.ID))
+	}
+	if len(ids) == 0 {
+		return ""
+	}
+	return strings.Join(ids, ",")
+}
+
 // intersectIPLists 返回多组 IP/CIDR 名单的网络感知交集（裁定 2026-09-07）
 // 对每对条目判断 CIDR 包含关系，保留更具体的一方（10.0.0.0/8 ∩ 10.1.0.5
 // = 10.1.0.5）。字符串精确匹配兼容（相同文本=同网络）。空交集返回 nil。
@@ -1554,7 +1688,11 @@ func precheckProjectionScope(kind, ruleCaddyID string) string {
 // （fail-loud，禁止静默退回全局名重建冲突）。爆炸半径=整份配置被拒——
 // 已裁定维持 fail-loud 不收窄（跳过+告警=IP 控制面静默缺失，
 // fail-closed 整拒更安全），载体见 BuildCorazaDirectives 同名注释。
-func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int, ruleCaddyID string) (string, error) {
+func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int, ruleCaddyID string, securityCtxs ...*securityPolicyContext) (string, error) {
+	var securityCtx *securityPolicyContext
+	if len(securityCtxs) > 0 {
+		securityCtx = securityCtxs[0]
+	}
 	if ruleCaddyID == "" {
 		return "", fmt.Errorf("u-* 预检投影缺少规则身份（ruleCaddyID 为空）——预检逐规则渲染，scope 必须编入规则身份（历史 HP-1）")
 	}
@@ -1688,7 +1826,12 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 	// 拒绝」（deny 侧精确语义）；id:7 只对「未被显式 deny 且不在 allow 交集」的
 	// IP 生效。拦截结果与既有语义等价（同 deny+status+skipAfter）。
 	if len(allowLists) > 0 {
-		allowIntersection = aggregateIPEntries(intersectIPLists(allowLists))
+		// allow 交集只依赖「绑定的 allow 策略集合」（同一生成轮内名单内容固定）：
+		// 按策略身份签名在同轮内复用，避免同策略集的多条规则重复计算。
+		signature := allowPolicySetSignature(policies)
+		allowIntersection = aggregateIPEntries(securityCtx.allowIntersectionCached(signature, func() []string {
+			return intersectIPLists(allowLists)
+		}))
 		// 多条 allow 名单互不相交（交集为空）= 逐策略顺序评估下任意 IP 都会被
 		// 某个名单拒绝：恒拒规则等价表达（REMOTE_ADDR 恒非空）。
 		if len(allowIntersection) == 0 {
@@ -1792,9 +1935,11 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 		}
 		// v2.3.8 爬虫豁免（用户裁定方案 B）：已验证爬虫（caddygeoip handler 双跳
 		// PTR/官方 IP 段验证后注入 X-LB-Crawler-Verified=引擎 ID）逐引擎放行——
-		// ctl 移除本策略 GeoIP 链；伪装（UA 声称引擎但验证失败，handler 置
-		// X-LB-Crawler-Spoof=引擎 ID，旧注释的「=1」与发射值矛盾）
-		// 独立事件族显式拒绝。id 编码见
+		// ctl 移除本策略 GeoIP 链；伪装（UA 声称引擎但验证**确定否定**，
+		// handler 置 X-LB-Crawler-Spoof=引擎 ID，旧注释的「=1」与发射值矛盾）
+		// 独立事件族显式拒绝。验证三态化后瞬态（DNS 抖动/并发饱和/快照不可用）
+		// 不置伪装头——本规则只对确定性伪装生效，不误封真爬虫、不产生伪事件。
+		// id 编码见
 		// encodeCrawlerExemptRuleID/encodeCrawlerSpoofRuleID（豁免 id
 		// 越出 [810000,850000) 时跳过+告警，不再溢出伪装段）。
 		if p.GeoIPCrawlerExempt {
@@ -1816,6 +1961,17 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 					return "", err
 				}
 				sb.WriteString(fmt.Sprintf("SecRule REQUEST_HEADERS:X-LB-Crawler-Verified \"@streq %s\" \"id:%d,phase:1,pass,log,msg:'搜索引擎爬虫放行（已验证）',ctl:ruleRemoveById=%d\"\n", engine.ID, crawlerRuleID, geoipRuleID))
+			}
+			if len(selectedEngines) == 0 {
+				// 引擎集非空但没有任何条目命中注册表（注册表更替/导入脏值）：
+				// 豁免块整块不发射，UI 仍显示「爬虫豁免已启用」——静默漂移。
+				// 方向 fail-closed（更多拦截），仅留痕。
+				if raw := strings.TrimSpace(string(p.GeoIPCrawlerEngines)); raw != "" && raw != "[]" {
+					msg := fmt.Sprintf("渲染: 策略 %q（#%d）的爬虫豁免引擎集 %s 未命中任何已知引擎，豁免与伪装规则均不发射", p.Name, p.ID, clipForLog(raw, 120))
+					if auditFailureShouldLog(msg) {
+						Logf("warn", "%s", msg)
+					}
+				}
 			}
 			if len(selectedEngines) > 0 {
 				if spoofRuleID, ok := encodeCrawlerSpoofRuleID(p.ID); !ok {
@@ -1857,9 +2013,12 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 	return sb.String(), nil
 }
 
-// buildIPPrecheckHandler returns the consolidated stage-1 precheck coraza handler
-func buildIPPrecheckHandler(policies []*models.SecurityPolicy, denyStatus int, ruleCaddyID string) (map[string]interface{}, error) {
-	directives, err := buildIPPrecheckDirectives(policies, denyStatus, ruleCaddyID)
+// buildIPPrecheckHandler returns the consolidated stage-1 precheck coraza handler。
+// securityCtx 供生成级缓存（allow 交集按策略集签名复用）：同一策略集绑定的
+// 多条规则此前各自重算多名单交集（64 份满额名单 × 5000 条最坏 2500 万次比较/
+// 对，且全程持 CaddyOpLock）。nil=非批量路径（单规则生成），照常自算。
+func buildIPPrecheckHandler(policies []*models.SecurityPolicy, denyStatus int, ruleCaddyID string, securityCtxs ...*securityPolicyContext) (map[string]interface{}, error) {
+	directives, err := buildIPPrecheckDirectives(policies, denyStatus, ruleCaddyID, securityCtxs...)
 	if err != nil {
 		return nil, err
 	}
@@ -2444,31 +2603,6 @@ func crsNumericIDRange(s string) (int, int, bool) {
 	return lo, hi, true
 }
 
-// crsCoveredInfraGroupCodes 计算混合选择已覆盖的组号集合：两位组号直接计入；
-// 6 位 ID 条目经索引定位父文件后其父文件组号同样计入（emitCRSRuleGroupSelection
-// 会 Include 该父文件）。陈旧 ID（索引不存在）与 emit 同口径跳过。chainIndex
-// 为链级惰性索引取值闭包，仅在遇到 6 位 ID 时才真正取值。
-func crsCoveredInfraGroupCodes(chainIndex func() *CRSRuleIndex, groups []string) map[string]struct{} {
-	covered := make(map[string]struct{}, len(groups))
-	var index *CRSRuleIndex
-	for _, g := range groups {
-		g = strings.TrimSpace(g)
-		if IsCRSRuleIDTarget(g) {
-			if index == nil {
-				index = chainIndex()
-			}
-			if entry := index.Find(g); entry != nil {
-				if m := crsFileGroupPattern.FindStringSubmatch(entry.File); m != nil {
-					covered[m[1]] = struct{}{}
-				}
-			}
-			continue
-		}
-		covered[g] = struct{}{}
-	}
-	return covered
-}
-
 // stripInfraCRSGroupCodes从 crs_rule_groups 载荷剥离基础设施
 // 组号（01/49/59）及其文件内规则 ID，返回（保留条目, 被剥条目）。判定复用
 // IsCRSInfraGroupCode/IsCRSInfraRuleID——与写入面 validateAndNormalizeCRSField
@@ -2494,6 +2628,13 @@ func stripInfraCRSGroupCodes(groups []string) (kept, stripped []string) {
 // 整组剔除，补删必须逐 ID，不能用区间以免误删同文件被选 ID）。陈旧 ID（索引
 // 不存在）跳过+warn。纯组号载荷的输出与既有实现逐行一致（等价回归锁定）。
 func emitCRSRuleGroupSelection(sb *strings.Builder, p *models.SecurityPolicy, groups []string, chainIndex func() *CRSRuleIndex) {
+	// 渲染侧同样按写入侧上限截断（防御深度）：带外/旧快照写入 1 万条组号时，
+	// 逐条 HasGroup（O(规则数)）与上万行 Include 会放大配置体积与生成耗时。
+	// 写入 API 已 400，此门只对绕过写侧的数据生效。
+	if len(groups) > CRSRuleGroupsMaxEntries {
+		Logf("warn", "策略 %q 的 crs_rule_groups 条目数 %d 超过上限 %d（疑似带外/旧快照写入），已截断渲染", p.Name, len(groups), CRSRuleGroupsMaxEntries)
+		groups = groups[:CRSRuleGroupsMaxEntries]
+	}
 	groupSet := make(map[string]struct{}, len(groups))
 	var idTargets []string
 	seenID := make(map[string]struct{})
@@ -2604,7 +2745,7 @@ func ValidateGeoIPCountries(raw string, geoipMode string) error {
 	// 整链跳过 = 全部放行。deny 空名单是历史「未配置」语义，
 	// PolicyHasGeoIP 同样不发射；其与 off 等价，保留兼容（导入/存量）。
 	if geoipMode == "allow" && len(entries) == 0 {
-		return fmt.Errorf("地域控制为仅允许模式时区域名单不能为空（空名单会放行所有请求）")
+		return fmt.Errorf("地域控制为仅允许模式时区域名单不能为空（空名单会拒绝所有请求）")
 	}
 	// （裁决）：IP 库未装载时拒绝启用任何地域条目（含海外——
 	// 海外拦截同样依赖 live searcher 设置占位变量，缺库时 CEL 全部恒假、

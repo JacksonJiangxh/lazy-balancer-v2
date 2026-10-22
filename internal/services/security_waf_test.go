@@ -286,6 +286,11 @@ func TestBuildCorazaDirectives_includesUserOverridesWhenFileExists(t *testing.T)
 	if err := os.WriteFile(filepath.Join(dir, "zz-user-overrides.conf"), []byte("# user overrides"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// crs-setup.conf 有存在性门（缺失不发射，防致命 Include）——本用例验证
+	// 「setup 先于 overrides」，文件必须在场。
+	if err := os.WriteFile(filepath.Join(dir, "crs-setup.conf"), []byte("# setup"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	useCRSDirectivesDir(t, dir)
 
 	// When
@@ -328,6 +333,13 @@ func TestBuildCorazaDirectives_omitsUserOverridesWhenFileMissing(t *testing.T) {
 // 值大小写不受控（coraza 仅小写化 header 名），
 // 激活正则必须 (?i)，否则 Application/JSON 变体按请求退回兜底误报路径。
 func TestBuildCorazaDirectives_activatesJSONXMLBodyProcessors(t *testing.T) {
+	// crs-setup.conf 存在性门：夹具目录须含该文件（本用例按 setup Include 定位
+	// 顺序，缺失时无法断言）。
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "crs-setup.conf"), []byte("# setup"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	useCRSDirectivesDir(t, dir)
 	jsonRule := `SecRule REQUEST_HEADERS:Content-Type "@rx (?i)^application/(?:[\w.+-]+?\+)?json(?:\s*;|$)" "id:9,phase:1,pass,nolog,ctl:requestBodyProcessor=JSON"`
 	xmlRule := `SecRule REQUEST_HEADERS:Content-Type "@rx (?i)^(?:application|text)/(?:[\w.+-]+?\+)?xml(?:\s*;|$)" "id:10,phase:1,pass,nolog,ctl:requestBodyProcessor=XML"`
 

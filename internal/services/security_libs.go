@@ -1,8 +1,10 @@
 package services
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 )
 
 // 缺库降级（2026-09-24 用户裁定）：CRS 规则库或 IP2Region 库缺失时，安全链
@@ -47,10 +49,32 @@ func securityLibrariesMissingDesc() string {
 	return missing
 }
 
+// errCRSTreeSwapInFlight 表示渲染恰好落在 CRS 规则树交换窗口内。窗口内规则树
+// 可能整体缺失（RemoveAll 后、rename 前）或只拷入一部分（copyDir 回退中断）：
+// 前者会让安全链探测失败后「成功发布无安全链配置」，后者探测通过但只匹配到
+// 部分 CRS 文件（WAF 静默弱化）。两种形态都必须在生成期拒绝，而不是发布一份
+// 降级/弱化配置（窗口为百毫秒级，调用方重试即可）。
+var errCRSTreeSwapInFlight = errors.New("CRS 规则树正在更新（树交换中），本轮配置生成已中止；请稍后重试")
+
+// crsTreeSwapInFlight 标记树交换窗口（swapCRSTreeFromStaging 的
+// RemoveAll→moveTree→setup 落盘段）。渲染侧不持 wafFileMu（导入/更新路径的
+// 锁序 CaddyOpLock→wafFileMu 不可反转），故以代际标记代替加锁：窗口内
+// 生成直接失败，窗口结束后由调用方重试。
+var crsTreeSwapInFlight atomic.Bool
+
+// crsTreeSwapInFlightNow 报告是否处于 CRS 树交换窗口（生成期互斥探针）。
+func crsTreeSwapInFlightNow() bool { return crsTreeSwapInFlight.Load() }
+
 // SetSecurityLibsDirsForTest 注入 CRS/IP2Region 库路径（handlers 等跨包渲染类
 // 测试用——缺库形态安全链整体不渲染，名单投影/热路径无从谈起）。返回恢复函数。
+// CRSRuleIndexDir 必须同步派生（与 ConfigureWafDirs 同口径）：否则跨包测试注入
+// 库目录后索引仍指向生产 /app/waf/crs/rules（不存在→空索引），「选组/排除
+// 存在性」行为在测试中不可复现。
 func SetSecurityLibsDirsForTest(crsDir, xdbPath string) (restore func()) {
-	oldLive, oldCRS, oldXdb := crsLiveDir, crsDirectivesDir, ip2regionLivePath
+	oldLive, oldCRS, oldXdb, oldIndexDir := crsLiveDir, crsDirectivesDir, ip2regionLivePath, CRSRuleIndexDir
 	crsLiveDir, crsDirectivesDir, ip2regionLivePath = crsDir, crsDir, xdbPath
-	return func() { crsLiveDir, crsDirectivesDir, ip2regionLivePath = oldLive, oldCRS, oldXdb }
+	CRSRuleIndexDir = filepath.Join(crsDir, "rules")
+	return func() {
+		crsLiveDir, crsDirectivesDir, ip2regionLivePath, CRSRuleIndexDir = oldLive, oldCRS, oldXdb, oldIndexDir
+	}
 }

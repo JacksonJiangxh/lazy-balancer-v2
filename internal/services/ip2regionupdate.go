@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"lazy-balancer-v2/internal/taskengine"
@@ -178,8 +179,8 @@ func (m *IP2RegionUpdateManager) StartUpdate(trigger string, rc *taskengine.RunC
 		defer close(done)
 		defer runCancel()
 		// 自建 goroutine 不被引擎 runGuarded 覆盖——未捕获 panic=整个
-		// admin 进程退出。拦截后按失败落定（版本行+更新日志），堆栈入
-		// 应用日志供排障（对齐 caqueue.go 的 goroutine 护栏先例）。
+		// admin 进程退出。正常路径由 runWithContext 内部 recover 先行落定
+		// failed 终态（审计同口径），此处仅兜底（defer 自身 panic 等）。
 		defer func() {
 			if r := recover(); r != nil {
 				Logf("error", "ip2region update: run panicked: %v\n%s", r, debug.Stack())
@@ -237,11 +238,15 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 		m.mu.Lock()
 		status, message := string(m.state.status), m.state.message
 		m.mu.Unlock()
-		// 状态中文归一（曾混英文 status token，与 threat 族口径不一）
+		// 状态中文归一（曾混英文 status token，与 threat 族口径不一）。
+		// 中间阶段三档也必须映射——任何早退/异常形态读到中间状态时不得回落
+		// 成英文 token（panic 路径由下方 recover 先落定 failed，此处是兜底）。
 		statusLabel := map[string]string{
 			string(IP2RegionStatusSuccess): "成功", string(IP2RegionStatusFailed): "失败",
 			string(IP2RegionStatusSkipped): "跳过", string(IP2RegionStatusCancelled): "已取消",
 			string(IP2RegionStatusIdle): "空闲", string(IP2RegionStatusChecking): "检测中",
+			string(IP2RegionStatusDownloading): "下载中", string(IP2RegionStatusInstalling): "安装中",
+			string(IP2RegionStatusReloading): "重载中",
 		}[status]
 		if statusLabel == "" {
 			statusLabel = status
@@ -267,6 +272,18 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 		m.mu.Lock()
 		m.running = false
 		m.mu.Unlock()
+	}()
+
+	// 函数内 recover：本 defer 注册在上方审计 defer 之后，恢复先于审计执行
+	// ——panic 轮先落定 failed 终态，审计读到终态（此前 goroutine 层 recover
+	// 在审计 defer 之后才运行，审计读到 downloading/installing/reloading 等
+	// 中间阶段，记成「更新」+英文 token，且此后不再有「更新失败」审计）。
+	// 外层 goroutine 的 recover 退化为兜底（defer 自身 panic 等形态）。
+	defer func() {
+		if r := recover(); r != nil {
+			Logf("error", "ip2region update: run panicked: %v\n%s", r, debug.Stack())
+			m.fail(fmt.Errorf("更新任务内部异常（已拦截进程级崩溃）: %v", r))
+		}
 	}()
 
 	// 起点角色复查：与 CRS 更新同一 demote 竞态窗口——tick 越过
@@ -554,11 +571,31 @@ func (m *IP2RegionUpdateManager) advanceSlotIfAuto(trigger string) {
 	advanceVersionSlotIfDue("security_ip2region_version")
 }
 
+// backupIP2RegionXDB 备份 live xdb：优先硬链接（同目录同文件系统零拷贝，
+// 免去 ~11MB 全量读+写+两次 fsync 在 wafFileMu 内的锁占用；.bak 只被本节
+// 回滚以 rename/只读复制消费，硬链接共享 inode 不影响语义——安装段用 rename
+// 换目录项，旧 inode 由 .bak 继续引用）。硬链接失败（跨设备/不支持）回退
+// 整文件复制（与 WriteThreatIplistCompiled 的 .fast 备份同一升级链）。
+func backupIP2RegionXDB(src, dst string) error {
+	if err := osLink(src, dst); err == nil {
+		return nil
+	}
+	return copyFile(src, dst)
+}
+
 // syncInstalledVersionToState 终态（失败/取消/跳过）把 state.version 归位为
 // 已安装版本：与 CRS 侧同形——run 安装前写入远端 tag，失败/取消
 // 后不复位会让 status 端点把未安装的版本当作当前版本返回。
+// 读故障与「读取到空值」在这里都归「unknown」，但故障必须留痕（该字段只服务
+// status 展示，权威值在版本行；写回路径不得复刻此折叠，见 downloadAndInstall）。
 func (m *IP2RegionUpdateManager) syncInstalledVersionToState() {
-	installed := ip2RegionCurrentVersionForRun()
+	installed, err := GetIP2RegionVersion()
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			Logf("warn", "ip2region update: 终态读取已安装版本失败（status 显示 unknown）: %v", err)
+		}
+		installed = ""
+	}
 	if installed == "" {
 		installed = "unknown"
 	}
@@ -649,10 +686,20 @@ func (m *IP2RegionUpdateManager) downloadAndInstall(parent context.Context, tag 
 	// 备份+rename 是 wafFileMu 互斥的安装文件段（网络下载在锁外
 	// staging 先行；内存热换在锁外）——与 lbbak 导入直写/集群同步落盘串行，
 	// 杜绝撕裂 xdb 与元数据瞬时错位。
+	// 安装前读取版本行：读故障不得折叠成 "unknown" 哨兵继续安装——
+	// 重载失败回滚时会把真实 tag 覆写成哨兵（非空故通过 prevVersion 门），
+	// 版本溯源丢失且下轮按哨兵重装。读故障按安装失败落定（任务内重试可吸收
+	// 瞬时 DB 故障）；行缺失（ErrNoRows）等价「无既有版本」，留空串让回滚
+	// 不写版本行。与 GetIP2RegionVersion 的错误语义同源（读故障 vs 行缺失）。
+	prevVersion, verr := GetIP2RegionVersion()
+	if verr != nil && !errors.Is(verr, sql.ErrNoRows) {
+		return fmt.Errorf("读取安装前 IP2Region 版本行: %w", verr)
+	}
+	m.prevVersion = prevVersion
 	liveBak := ip2regionLivePath + ".bak"
 	wafFileMu.Lock()
 	if _, err := os.Stat(ip2regionLivePath); err == nil {
-		if err := copyFile(ip2regionLivePath, liveBak); err != nil {
+		if err := backupIP2RegionXDB(ip2regionLivePath, liveBak); err != nil {
 			wafFileMu.Unlock()
 			return fmt.Errorf("备份旧 ip2region xdb: %w", err)
 		}
@@ -679,8 +726,8 @@ func (m *IP2RegionUpdateManager) downloadAndInstall(parent context.Context, tag 
 	// 导出侧（BuildWafFileBundle/BuildWafFileRef 读相位持同一锁）可打出「文件
 	// 新/行旧」偏斜并沿 waf_files 通道扩散。单行 UPDATE+小文件原子写毫秒级，
 	// 与段内 rename 同量级，不新增锁内长阻塞。写失败仅记日志：run() 成功路径
-	// 稍后重写全量行与 sidecar，重载失败 restored 分支用 prevVersion 回滚。
-	m.prevVersion = currentIP2RegionVersion()
+	// 稍后重写全量行与 sidecar，重载失败 restored 分支用 prevVersion 回滚
+	// （prevVersion 已在进入互斥段前按「读故障 vs 行缺失」语义取好）。
 	if _, err := db.DB.Exec(
 		"UPDATE security_ip2region_version SET version=?, updated_at=datetime('now') WHERE id=1",
 		tag,

@@ -738,6 +738,27 @@ func (h *Handlers) respondRuleApplyError(c *gin.Context, applyErr, restoreErr er
 	c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Caddy 配置应用失败，规则未" + verb + ": " + applyErr.Error()})
 }
 
+// respondRuleSnapshotError 规则×5 运行配置快照失败的统一收尾：500 + 操作
+// 审计（这些路由均为 Explicit 审计策略，中间件不补失败留痕）+ 错误详情。
+// 快照失败发生在事务开启前，DB 零变更；失败审计仍必须留痕（与配置域
+// 「Caddy 不可达」同口径）。verb 取固定五值字面量（词汇表门禁禁动态 action）。
+func (h *Handlers) respondRuleSnapshotError(c *gin.Context, verb string, err error) {
+	detail := services.FormatAuditDetail("备份当前运行配置失败", err.Error(), services.AuditResultPart("failure"))
+	switch verb {
+	case "创建":
+		recordAudit(c, "创建失败", "负载规则", detail)
+	case "更新":
+		recordAudit(c, "更新失败", "负载规则", detail)
+	case "删除":
+		recordAudit(c, "删除失败", "负载规则", detail)
+	case "启用":
+		recordAudit(c, "启用失败", "负载规则", detail)
+	case "禁用":
+		recordAudit(c, "禁用失败", "负载规则", detail)
+	}
+	c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "备份当前运行配置失败: " + err.Error()})
+}
+
 // normalizeInactiveHealthCheckFields 主动健康检查未启用时，其专属字段
 // （health_check_path / health_check_host / tcp_health_check_port）渲染零消费
 // （caddy.go 的 health_checks.active 块仅在 enable_active_health_check=1 时发射）——
@@ -1116,6 +1137,12 @@ func (h *Handlers) validateDuplicateRulePayload(rule models.LbRule) error {
 //     具体原因，数据库与运行配置不会因保存路径产生不一致。
 func (h *Handlers) CreateRule(c *gin.Context) {
 
+	// 导入窗口 fast-fail：规则写要等 caddyOpMu（导入全程持有，可达分钟级），
+	// 排队到导入后再按导入后的库校验/落库会让客户端看到「提交的是哪一版」
+	// 漂移（无数据丢失但语义错乱）。门必须先于请求体读取与取锁。
+	if rejectWriteDuringImport(c, "执行规则写操作") {
+		return
+	}
 	// 历史 问题: 限制请求体大小防止 OOM（与 config_backup.go limitConfigImportBody 一致策略）。
 	const maxCreateRuleBodyBytes int64 = 1 << 20 // 1MB
 	if c.Request.ContentLength > maxCreateRuleBodyBytes {
@@ -1371,7 +1398,7 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 	// 的 CLI 层承担）。
 	runtimeSnapshot, snapErr := h.snapshotImportRuntime([]string{caddyID})
 	if snapErr != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "备份当前运行配置失败"})
+		h.respondRuleSnapshotError(c, "创建", snapErr)
 		return
 	}
 	if req.Protocol == "http" && req.EnableTLS && req.TLSSource == "acme_dns" {
@@ -1645,6 +1672,9 @@ func retireOldDomainCertJobOrAudit(c *gin.Context, caddyID string, existingRule 
 
 func (h *Handlers) UpdateRule(c *gin.Context) {
 
+	if rejectWriteDuringImport(c, "执行规则写操作") {
+		return
+	}
 	caddyID := c.Param("caddy_id")
 
 	// 与 CreateRule同口径的请求体上限——UpdateRule
@@ -2287,7 +2317,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	runtimeSnapshot, snapErr := h.snapshotImportRuntime([]string{caddyID})
 	if snapErr != nil {
 		services.Logf("error", "UpdateRule runtime snapshot failed for caddy_id=%s: %v", caddyID, snapErr)
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "备份当前运行配置失败"})
+		h.respondRuleSnapshotError(c, "更新", snapErr)
 		return
 	}
 
@@ -3007,6 +3037,9 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 
 func (h *Handlers) DeleteRule(c *gin.Context) {
 
+	if rejectWriteDuringImport(c, "执行规则写操作") {
+		return
+	}
 	caddyID := c.Param("caddy_id")
 
 	// 与 UpdateRule 同一锁序：先 caddyOpMu 后 DB 事务，避免 AB-BA 循环等待
@@ -3144,7 +3177,7 @@ func (h *Handlers) DeleteRule(c *gin.Context) {
 	runtimeSnapshot, err := h.snapshotImportRuntime([]string{caddyID})
 	if err != nil {
 		services.Logf("error", "DeleteRule runtime snapshot failed for caddy_id=%s: %v", caddyID, err)
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "备份当前运行配置失败"})
+		h.respondRuleSnapshotError(c, "删除", err)
 		return
 	}
 	reloadNote, applyErr := h.applyFromTxNote(c, tx, txReloadDetail("rule_delete", caddyID), true)
@@ -3834,6 +3867,9 @@ func (h *Handlers) BatchRuleBlockPages(c *gin.Context) {
 }
 
 func (h *Handlers) EnableRule(c *gin.Context) {
+	if rejectWriteDuringImport(c, "执行规则写操作") {
+		return
+	}
 	caddyID := c.Param("caddy_id")
 
 	h.caddyOpMu.Lock()
@@ -3933,7 +3969,7 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 	}
 	runtimeSnapshot, err := h.snapshotImportRuntime([]string{caddyID})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "备份当前运行配置失败: " + err.Error()})
+		h.respondRuleSnapshotError(c, "启用", err)
 		return
 	}
 	tx, err := db.DB.BeginTx(c.Request.Context(), nil)
@@ -4355,6 +4391,9 @@ func abortIfRuleConcurrentlyModifiedAs(c *gin.Context, caddyID, baseline, opName
 }
 
 func (h *Handlers) DisableRule(c *gin.Context) {
+	if rejectWriteDuringImport(c, "执行规则写操作") {
+		return
+	}
 	caddyID := c.Param("caddy_id")
 
 	h.caddyOpMu.Lock()
@@ -4385,7 +4424,7 @@ func (h *Handlers) DisableRule(c *gin.Context) {
 
 	runtimeSnapshot, err := h.snapshotImportRuntime([]string{caddyID})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "备份当前运行配置失败: " + err.Error()})
+		h.respondRuleSnapshotError(c, "禁用", err)
 		return
 	}
 	tx, err := db.DB.BeginTx(c.Request.Context(), nil)

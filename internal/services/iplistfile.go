@@ -409,6 +409,14 @@ func gcStaleIPListFiles(now time.Time, maxAge time.Duration) (removed int) {
 	}
 	if len(deleted) > 0 {
 		wafiplist.EvictIPListCache(deleted...)
+		// 投影备忘与文件同生命周期：memo 键是投影路径，GC 删文件时不清条目会
+		// 让「规则删除/改名」后的 scope 永久驻留（进程级缓慢增长）。memo 只是
+		// 快路，清除无正确性代价。
+		ipListProjectionMemoMu.Lock()
+		for _, path := range deleted {
+			delete(ipListProjectionMemo, path)
+		}
+		ipListProjectionMemoMu.Unlock()
 		Logf("info", "IP 名单 GC: 清理 %d 个超龄未引用名单文件", len(deleted))
 	}
 	// 顺带 prune 引用集中早于 maxAge 的条目——文件已删

@@ -1428,46 +1428,24 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 			}
 		}
 	}
-	var total, blocked int
-	countries := map[string]int{}
-	chinaProvinces := map[string]int{}
-	familyCounts := map[string]int{}
-	ruleCounts := map[string]int{}
 	sinceMinute := now.UTC().Add(-time.Duration(hours) * time.Hour).Truncate(time.Minute).Format("2006-01-02 15:04")
 	bucketStarts, hourly := threatHourlyBuckets(hours, now, loc)
-	if rollRows, err := db.MetricsDB.Query(`SELECT minute, country, province, family, rule, action, count FROM security_event_rollup WHERE minute >= ?`, sinceMinute); err != nil {
-		trackErr(err)
-	} else {
-		for rollRows.Next() {
-			var minute, country, province, family, rule, action string
-			var count int
-			trackErr(rollRows.Scan(&minute, &country, &province, &family, &rule, &action, &count))
-			total += count
-			// action 取值与 queryThreatRecentBlocked 同单一事实源
-			// （threatRollupBlockedAction），两侧口径漂移由同一钉测捕获。
-			if action == threatRollupBlockedAction {
-				blocked += count
-			}
-			if country != "" {
-				countries[country] += count
-			}
-			if province != "" {
-				chinaProvinces[province] += count
-			}
-			familyCounts[family] += count
-			if rule != "" {
-				ruleCounts[rule] += count
-			}
-			// 滑动窗口落桶：rollup 分钟串为 UTC，按槽界真实时刻二分定位（槽界
-			// 携带配置时区，DST 切换两侧各自正确——单一偏移平移在跨切换点窗口
-			// 会把切换前事件错配 1h 到相邻柱）。
-			mt, err := time.ParseInLocation("2006-01-02 15:04", minute, time.UTC)
-			if err == nil && len(bucketStarts) > 0 {
-				hourly[threatBucketIndex(mt, bucketStarts)].Value += count
-			}
+	// 单次 SQL 侧聚合产出同屏全部维度（总量/拦截/国家/省/攻击族/规则/按槽
+	// 分钟总量），30s 进程内缓存。旧实现逐行拉「分钟×维度基数」（30 天可达
+	// 数百万行）到 Go 侧累加，宽窗口请求与 30s 轮询线性相乘。
+	// 回填未完成（窗口头部尚未覆盖）时聚合不完整——本轮不缓存，避免少计
+	// 结果在 30s 内被后续轮询复用。
+	agg, aggErr := threatRollupDimAggregateQuery(db.MetricsDB, sinceMinute, bucketStarts, coverageFrom, !backfillIncomplete)
+	trackErr(aggErr)
+	total, blocked := agg.total, agg.blocked
+	countries := agg.countries
+	chinaProvinces := agg.chinaProvinces
+	familyCounts := agg.familyCounts
+	ruleCounts := agg.ruleCounts
+	for i, value := range agg.bucketTotals {
+		if i < len(hourly) {
+			hourly[i].Value += value
 		}
-		trackErr(rollRows.Err())
-		rollRows.Close()
 	}
 	// 活跃攻击源：近 10min 去重 client_ip，保留/私网排除（与总量同口径）。
 	// 短 TTL（≤10s）缓存同窗口结果——大屏 30s 轮询不再每轮重扫原始表。

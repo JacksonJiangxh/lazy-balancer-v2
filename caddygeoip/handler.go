@@ -196,11 +196,16 @@ const (
 	crawlerSpoofHeader    = "X-LB-Crawler-Spoof"
 )
 
-// applyCrawlerVerification UA 命中引擎 → PTR 双跳验证：通过置 Verified=引擎 ID
-// （下游豁免规则 @streq 消费）；未通过置 Spoof=引擎 ID（伪装事件规则消费——
-// 渲染侧按策略已选引擎集合 @rx^(?:engine|…)$ 匹配，见 buildIPPrecheckDirectives。
-// 旧注释写 Spoof=1 与实际发射的引擎 ID 矛盾，按旧注释把规则改回
-// @eq 1 会让伪装事件族静默永不命中）。
+// applyCrawlerVerification UA 命中引擎 → PTR 双跳验证三态置头：
+//   - Verified=引擎 ID（下游豁免规则 @streq 消费）；
+//   - Spoof=引擎 ID（伪装事件规则消费——渲染侧按策略已选引擎集合
+//     @rx^(?:engine|…)$ 匹配，见 buildIPPrecheckDirectives。旧注释写 Spoof=1
+//     与实际发射的引擎 ID 矛盾，按旧注释把规则改回 @eq 1 会让伪装事件族
+//     静默永不命中）；
+//   - 瞬态（DNS 抖动/超时/并发饱和/官方段快照不可用/客户端地址不可解析）：
+//     不置任何头——本次既不豁免也不判伪装。二态实现曾把瞬态一律置 Spoof，
+//     真实爬虫在 DNS 抖动下被伪装规则实际阻断并产生伪安全事件。
+//
 // 非爬虫 UA 不做 DNS/PTR，但 MatchCrawlerEngine 仍需顺序扫描引擎正则表；
 // 未命中时承担全表预编译正则成本，命中时每个 UA 只匹配一次。
 func (h *GeoIPHandler) applyCrawlerVerification(r *http.Request) {
@@ -216,12 +221,19 @@ func (h *GeoIPHandler) applyCrawlerVerification(r *http.Request) {
 		return
 	}
 	ip := clientIPForVerify(r)
-	if ip != "" && VerifyCrawler(ip, engine) {
+	verdict := CrawlerVerdictTransient
+	if ip != "" {
+		verdict = VerifyCrawler(ip, engine)
+	}
+	switch verdict {
+	case CrawlerVerdictVerified:
 		r.Header.Set(crawlerVerifiedHeader, engine)
-	} else {
+	case CrawlerVerdictSpoof:
 		// 值携带引擎 ID（与 Verified 对称）——coraza 伪装规则按
 		// 策略已选引擎集合匹配，不再全局 @eq 1。
 		r.Header.Set(crawlerSpoofHeader, engine)
+	default:
+		// 瞬态：不置头（见上方三态说明）。
 	}
 }
 

@@ -247,3 +247,48 @@ func TestUserWritesAllowedOutsideImportWindow(t *testing.T) {
 		t.Fatalf("status=409, want 非冲突（导入窗口外必须放行）: %s", rec.Body.String())
 	}
 }
+
+// 导入窗口写门同族覆盖（规则×5 与原始配置逃生口/手动重载/校验）：这些端点
+// 只在 caddyOpMu 上排队，导入期间（可达分钟级）请求悬挂并在导入后按「导入后的
+// 库」重新校验落库——客户端早已超时，语义漂移。与 settings/users 写端点同口径
+// 409 fast-fail，且门先于请求体读取与取锁。
+func TestRuleAndRawConfigWrites409DuringImport(t *testing.T) {
+	h := &Handlers{}
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/rules", h.CreateRule)
+	router.PUT("/rules/:caddy_id", h.UpdateRule)
+	router.DELETE("/rules/:caddy_id", h.DeleteRule)
+	router.POST("/rules/:caddy_id/enable", h.EnableRule)
+	router.POST("/rules/:caddy_id/disable", h.DisableRule)
+	router.POST("/config/reload", h.ReloadCaddy)
+	router.POST("/config/validate", h.ValidateConfig)
+	router.PUT("/caddy/config", h.PutCaddyConfig)
+
+	configImportBeginMu.Lock()
+	defer configImportBeginMu.Unlock()
+
+	calls := []struct{ method, path, body string }{
+		{"POST", "/rules", `{"name":"r","protocol":"http","listen_port":8080}`},
+		{"PUT", "/rules/lb_x", `{"name":"r"}`},
+		{"DELETE", "/rules/lb_x", ""},
+		{"POST", "/rules/lb_x/enable", ""},
+		{"POST", "/rules/lb_x/disable", ""},
+		{"POST", "/config/reload", ""},
+		{"POST", "/config/validate", `{}`},
+		{"PUT", "/caddy/config", `{"content":"{}"}`},
+	}
+	for _, call := range calls {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(call.method, call.path, strings.NewReader(call.body))
+		req.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("%s %s status=%d body=%s, want 409（导入窗口内规则/原始配置写必须 fast-fail）",
+				call.method, call.path, rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "配置导入进行中") {
+			t.Fatalf("%s %s body=%s, want 配置导入进行中 文案", call.method, call.path, rec.Body.String())
+		}
+	}
+}

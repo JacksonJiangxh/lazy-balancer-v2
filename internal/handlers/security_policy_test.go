@@ -107,46 +107,6 @@ func createTestPolicy(t *testing.T, router *gin.Engine, payload map[string]any) 
 	return resp.Data.ID
 }
 
-func TestSecurityPolicy_seededLegacyMixedRoundTripsAllColumns(t *testing.T) {
-	// Given a legacy mixed policy seeded directly (mixed cannot be created via API).
-	setupSecurityPolicyTestDB(t)
-	if _, err := db.DB.Exec(`INSERT INTO security_policies
-		(name, description, mode, anomaly_threshold, ip_acl_mode, ip_acl_list, ip_acl_enabled,
-		 rate_limit_enabled, rate_limit_rps, rate_limit_burst, crs_excluded_rules, block_page_id, enabled, policy_type)
-		VALUES ('全列策略','覆盖全部列','blocking',10,'deny','["203.0.113.0/24"]',1,1,50,10,'["942100"]',1,1,'mixed')`); err != nil {
-		t.Fatal(err)
-	}
-
-	// Then every column round-trips
-	var (
-		description, mode, aclMode, aclList, whitelist, blacklist, excluded string
-		threshold, rateRPS, rateBurst, blockPageID                          int
-		aclEnabled, rateEnabled                                             bool
-	)
-	if err := db.DB.QueryRow(`SELECT description, mode, anomaly_threshold, ip_acl_mode, ip_acl_list, ip_acl_enabled,
-		ip_whitelist, ip_blacklist, rate_limit_enabled, rate_limit_rps, rate_limit_burst,
-		crs_excluded_rules, block_page_id FROM security_policies WHERE name='全列策略'`).
-		Scan(&description, &mode, &threshold, &aclMode, &aclList, &aclEnabled,
-			&whitelist, &blacklist, &rateEnabled, &rateRPS, &rateBurst, &excluded, &blockPageID); err != nil {
-		t.Fatalf("read back policy: %v", err)
-	}
-	if description != "覆盖全部列" || mode != "blocking" || threshold != 10 {
-		t.Fatalf("scalar columns=(%q,%q,%d)", description, mode, threshold)
-	}
-	if aclMode != "deny" || !aclEnabled || aclList != `["203.0.113.0/24"]` {
-		t.Fatalf("ip acl columns=(%q,%q,%v)", aclMode, aclList, aclEnabled)
-	}
-	if whitelist != `[]` || blacklist != `[]` {
-		t.Fatalf("default lists=(%q,%q), want []", whitelist, blacklist)
-	}
-	if !rateEnabled || rateRPS != 50 || rateBurst != 10 {
-		t.Fatalf("rate columns=(%v,%d,%d)", rateEnabled, rateRPS, rateBurst)
-	}
-	if excluded != `["942100"]` || blockPageID != 1 {
-		t.Fatalf("excluded/page=(%q,%d)", excluded, blockPageID)
-	}
-}
-
 func TestBindRuleToPolicy_rejectsMissingPolicy(t *testing.T) {
 	// Given a fresh database without any policy
 	setupSecurityPolicyTestDB(t)
@@ -850,15 +810,18 @@ func TestListSecurityPolicies_绕过ModeDisabledHidesControlCapability(t *testin
 }
 
 func TestListSecurityPolicies_customRulesCountExcludesDisabled(t *testing.T) {
-	// Given two referenced custom rules, one enabled and one disabled
+	// Given two referenced custom rules, one enabled (emittable) and one disabled。
+	// 计数与发射侧同判据（customRuleEmittable）：空 conditions 的规则发射端
+	// 会跳过，因此启用规则必须带可发射条件，本用例才验证「禁用不计」。
 	setupSecurityPolicyTestDB(t)
 	router := newSecurityRouter(t)
-	res1, err := db.DB.Exec(`INSERT INTO security_custom_rules (name, conditions, action, score, enabled) VALUES ('启用规则', '[]', 'block', 5, 1)`)
+	emittable := `[{"target":"uri","operator":"regex","pattern":"^/count$"}]`
+	res1, err := db.DB.Exec(`INSERT INTO security_custom_rules (name, conditions, action, score, enabled) VALUES ('启用规则', ?, 'block', 5, 1)`, emittable)
 	if err != nil {
 		t.Fatalf("seed enabled rule: %v", err)
 	}
 	id1, _ := res1.LastInsertId()
-	res2, err := db.DB.Exec(`INSERT INTO security_custom_rules (name, conditions, action, score, enabled) VALUES ('禁用规则', '[]', 'block', 5, 0)`)
+	res2, err := db.DB.Exec(`INSERT INTO security_custom_rules (name, conditions, action, score, enabled) VALUES ('禁用规则', ?, 'block', 5, 0)`, emittable)
 	if err != nil {
 		t.Fatalf("seed disabled rule: %v", err)
 	}

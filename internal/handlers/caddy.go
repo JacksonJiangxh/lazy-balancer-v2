@@ -877,6 +877,11 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 		// 投影（tp.txt 等）——tx 回滚的同时把磁盘回退到已提交态（零 /load）。
 		h.caddyService.RollbackIPListProjectionsToCommittedInLock()
 		restoreErr := h.caddyService.ApplyConfig(oldRuntimeConfig)
+		if services.IsSameConfig(restoreErr) {
+			// 回弹目标=请求前运行配置：拒绝/生成失败时字节相同，回升是
+			// 成功空操作，不得 join 成「恢复失败」假信号（横幅/审计污染）。
+			restoreErr = nil
+		}
 		applyErr = errors.Join(applyErr, restoreErr)
 		// 回弹也可能失败（Caddy 不可达/超时）——运行
 		// 配置可能停留候选态而 DB 已回滚，仅响应+审计会在重启后消失。先显式
@@ -944,6 +949,11 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 }
 
 func (h *Handlers) ValidateConfig(c *gin.Context) {
+	// 导入窗口 fast-fail：CLI 不可用回退路径会真实 /load 并回弹配置，
+	// 且全程要等 caddyOpMu（导入持有）——排队到导入后的语义不可接受。
+	if rejectWriteDuringImport(c, "校验 Caddy 配置（配置导入进行中）") {
+		return
+	}
 	// 先读请求体再取写锁（UpdateConfig/PutCaddyConfig 同序）——
 	// 已认证客户端的慢速/chunked 上传此前在持有 caddyOpMu 时读 body，会阻塞
 	// 全部规则/配置写与后台强制重载。全局 body 上限可配到 4096MB，窗口可观。
@@ -984,6 +994,10 @@ func (h *Handlers) ValidateConfig(c *gin.Context) {
 	// join 双错误（与 UpdateConfig/PutCaddyConfig 的失败快照恢复同口径）。
 	validateErr := h.caddyService.ValidateConfig(configData)
 	restoreErr := h.caddyService.ApplyConfig(services.GenerateCaddyConfig())
+	if services.IsSameConfig(restoreErr) {
+		// 候选=权威配置时回升是同字节空操作（不是恢复失败）。
+		restoreErr = nil
+	}
 	if restoreErr != nil {
 		joined := errors.Join(validateErr, restoreErr)
 		recordAudit(c, "校验失败", "Caddy配置", services.FormatAuditDetail(
@@ -1008,6 +1022,11 @@ func (h *Handlers) ValidateConfig(c *gin.Context) {
 }
 
 func (h *Handlers) ReloadCaddy(c *gin.Context) {
+	// 导入窗口 fast-fail：手动重载要等 caddyOpMu（导入持有），且会在导入
+	// 事务未提交时按旧库渲染——导入结束再执行已与用户意图脱节。
+	if rejectWriteDuringImport(c, "重载 Caddy 配置（配置导入进行中）") {
+		return
+	}
 	if err := h.applyCaddyConfigE(); err != nil {
 		// 手动重载恰是最需要留痕的操作——失败分支记录
 		// 操作者归因 + 错误详情（recordCaddyApplyResult 的系统级「应用失败」
@@ -1224,6 +1243,12 @@ func convertLogTimezone(content string) string {
 }
 
 func (h *Handlers) PutCaddyConfig(c *gin.Context) {
+	// 导入窗口 fast-fail：原始配置逃生口写 global_config.caddy_config 并
+	// 立即应用；导入全量替换后排队重放会把「按导入前用户意图」的载荷写成
+	// 导入后的运行配置（语义漂移）。
+	if rejectWriteDuringImport(c, "保存原始 Caddy 配置（配置导入进行中）") {
+		return
+	}
 	// 限制请求体大小防止超大 JSON 全量缓冲（与 CreateRule
 	// maxCreateRuleBodyBytes 同口径）。
 	const maxPutCaddyConfigBytes int64 = 1 << 20 // 1MB

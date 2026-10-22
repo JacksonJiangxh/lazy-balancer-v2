@@ -1,6 +1,7 @@
 package services
 
 import (
+	"bytes"
 	"fmt"
 	"net/netip"
 	"os"
@@ -46,8 +47,10 @@ func CompileFromIplistFile(iplistPath string) error {
 	}
 	// 逐条目只解析一次：解析产物直接进聚合，不再
 	// 「校验解析一次 + AggregatePrefixes 再解析一次」。
-	lines := strings.Split(string(raw), "\n")
-	prefixes := make([]netip.Prefix, 0, len(lines))
+	// 容量估算用换行计数（bytes.Count 零分配）——旧实现在此再
+	// `strings.Split` 一遍整份文本只为取 len(lines)，20 万条名单多出一份
+	// []string 头 + 全量字符串复制，且与 iterIPListTextLines 内部的切分重复。
+	prefixes := make([]netip.Prefix, 0, bytes.Count(raw, []byte("\n"))+1)
 	skipped := 0
 	iterIPListTextLines(raw, func(line string) bool {
 		prefix, err := wafiplist.ParseIPEntry(line)

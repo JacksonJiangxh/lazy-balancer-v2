@@ -80,37 +80,66 @@ var (
 	crawlerCacheMax = 200_000
 )
 
+// CrawlerVerdict 是爬虫验证的三态结论。
+//
+// 二态（bool）曾把「确定否定」与「无法判定」压成同一个 false，下游一律置
+// X-LB-Crawler-Spoof → 真实搜索引擎爬虫在 DNS 抖动/并发饱和时被当成伪装
+// 并实际阻断（还产生伪伪装事件）。三态后仅确定否定计伪装：瞬态既不豁免也
+// 不判伪装（不误封真爬虫、不伪造安全事件），豁免面保持 fail-closed。
+type CrawlerVerdict uint8
+
+const (
+	// CrawlerVerdictTransient 本次无法得出结论（信号量饱和/超时/解析错误/
+	// 官方段快照不可用）：不置任何验证头。
+	CrawlerVerdictTransient CrawlerVerdict = iota
+	// CrawlerVerdictVerified 确定性通过（PTR+正向回验 / 官方段命中）。
+	CrawlerVerdictVerified
+	// CrawlerVerdictSpoof 确定性否定（PTR 不属官方域/正向回验不含原 IP/
+	// 官方段内无命中/地址不可解析）。
+	CrawlerVerdictSpoof
+)
+
 // VerifyCrawler 验证客户端 IP 是否为该引擎官方爬虫出口（带缓存）。
-// 返回 false = 当前请求未通过（fail-closed）。只有确定性验证结论进入缓存；
-// 信号量饱和、DNS 错误和超时仅作用于本次请求，不写 10 分钟负缓存。
-func VerifyCrawler(ip, engineID string) bool {
+// 只有确定性结论（Verified/Spoof）进入缓存；瞬态结论仅作用于本次请求，
+// 不写 10 分钟负缓存。
+func VerifyCrawler(ip, engineID string) CrawlerVerdict {
 	key := ip + "|" + engineID
 	now := time.Now()
 	crawlerCacheMu.Lock()
 	if entry, hit := crawlerCache[key]; hit && now.Before(entry.expires) {
 		crawlerCacheMu.Unlock()
-		return entry.ok
+		if entry.ok {
+			return CrawlerVerdictVerified
+		}
+		return CrawlerVerdictSpoof
 	}
 	crawlerCacheMu.Unlock()
 
-	ok, cacheable := false, true
+	verdict := CrawlerVerdictTransient
+	cacheable := false
 	if geoipnames.CrawlerEngineVerifyMethod(engineID) == geoipnames.CrawlerVerifyIPRange {
 		// 官方声明不支持 nslookup 的厂商（360）：官方 IP 段验证（名单表=
 		// 定时更新任务的快照，更新即生效，无需重载）。O(log n) 查找本身很便宜，
-		// 不缓存正向结论——否则 CIDR 被官方移除后仍可豁免至多 1h
-		//
-		ok = verifyCrawlerIPRangeFromList(ip, engineID)
-		cacheable = false
+		// 不缓存结论——否则 CIDR 被官方移除后仍可豁免至多 1h（负结论同样不
+		// 缓存：快照更新即时生效）。
+		verdict = verifyCrawlerIPRangeVerdict(ip, engineID)
 	} else {
 		if !acquireCrawlerSlot() {
-			return false // 瞬态资源饱和：本次 fail-closed，但不形成持久结论。
+			return CrawlerVerdictTransient // 瞬态资源饱和：本次不形成持久结论。
 		}
-		ok, cacheable = verifyCrawlerDNS(ip, engineID)
+		verified, dnsCacheable := verifyCrawlerDNS(ip, engineID)
 		releaseCrawlerSlot()
+		cacheable = dnsCacheable
+		if verified {
+			verdict = CrawlerVerdictVerified
+		} else if cacheable {
+			verdict = CrawlerVerdictSpoof
+		}
 	}
-	if !cacheable {
-		return ok
+	if !cacheable || verdict == CrawlerVerdictTransient {
+		return verdict
 	}
+	ok := verdict == CrawlerVerdictVerified
 	ttl := crawlerCacheNegativeTTL
 	if ok {
 		ttl = crawlerCachePositiveTTL
@@ -136,7 +165,7 @@ func VerifyCrawler(ip, engineID string) bool {
 		crawlerCache[key] = crawlerVerifyCache{ok: ok, expires: now.Add(ttl)}
 	}
 	crawlerCacheMu.Unlock()
-	return ok
+	return verdict
 }
 
 // verifyCrawlerDNS 双跳验证本体（无缓存、需已持信号量）。第二个返回值表示
@@ -410,24 +439,31 @@ func commitCrawlerIPRangeSnapshot(next *crawlerIPRangeSnapshot) *crawlerIPRangeS
 // verifyCrawlerIPRangeFromList 从共享快照文件验证 IP 段命中（缺失/为空=fail-closed；
 // 快照每 10 分钟定时重读，不依赖 mtime/stat 触发）。
 func verifyCrawlerIPRangeFromList(ipStr, engineID string) bool {
+	return verifyCrawlerIPRangeVerdict(ipStr, engineID) == CrawlerVerdictVerified
+}
+
+// verifyCrawlerIPRangeVerdict 官方 IP 段验证三态：快照不可用（缺失/损坏/
+// 无该引擎段）=瞬态（无法判定，不得据此判伪装）；地址不可解析（含带 zone
+// 形态）与段外 = 确定否定。
+func verifyCrawlerIPRangeVerdict(ipStr, engineID string) CrawlerVerdict {
 	snap := loadCrawlerIPRangeSnapshot()
 	entries := snap.prefixes[engineID]
-	if len(entries) == 0 {
-		return false
+	if !snap.ok || len(entries) == 0 {
+		return CrawlerVerdictTransient
 	}
 	// 畸形地址不得 panic（MustParseAddr 旧实现可直接崩进程）——
-	// 解析失败即 fail-closed。
+	// 解析失败即确定为非该引擎出口。
 	// 带 zone 拒绝 + 4in6 映射形态 Unmap 归一——netip 的 v4
 	// 前缀不含 4in6 地址，不归一则映射形态的真爬虫恒不命中（误判为伪装）。
 	ip, err := netip.ParseAddr(ipStr)
 	if err != nil || ip.Zone() != "" {
-		return false
+		return CrawlerVerdictSpoof
 	}
 	ip = ip.Unmap()
 	for _, prefix := range entries {
 		if prefix.Contains(ip) {
-			return true
+			return CrawlerVerdictVerified
 		}
 	}
-	return false
+	return CrawlerVerdictSpoof
 }

@@ -112,13 +112,17 @@ func collectCertJobRows() ([]TaskInfo, bool) {
 	if role, err := RoleOf(context.Background(), db.DB); err == nil && !role {
 		isMaster = 0
 	}
+	readFailed := false
 	rows, err := db.DB.Query(`SELECT id, rule_id, domain, status, COALESCE(message,''), COALESCE(updated_at,created_at)
 		FROM cert_jobs
 		WHERE ?=1 OR COALESCE(message,'') NOT LIKE '从主节点同步%'
 		ORDER BY COALESCE(updated_at,created_at) DESC LIMIT ?`, isMaster, certJobRowsLimit+1)
 	if err != nil {
 		// 任务行读失败留痕：查询失败不再静默空列表（对照下方 rows.Err 留痕形态）。
-		Logf("warn", "cert 任务行查询失败: %v", err)
+		// 5s 轮询下按失败态转换留痕（首报一条，故障持续期静默，恢复补一条）。
+		if lvl := logStateTransition(taskMonitorCertJobsLogKey, true); lvl != "" {
+			Logf(lvl, "cert 任务行查询失败: %v", err)
+		}
 		return nil, false
 	}
 	defer rows.Close()
@@ -128,7 +132,10 @@ func collectCertJobRows() ([]TaskInfo, bool) {
 		var ruleID, domain, status, message, updatedAt string
 		if err := rows.Scan(&id, &ruleID, &domain, &status, &message, &updatedAt); err != nil {
 			// 任务行读失败留痕：单行扫描失败留痕后跳过该行（此前静默 continue）。
-			Logf("warn", "cert 任务行扫描失败: %v", err)
+			readFailed = true
+			if lvl := logStateTransition(taskMonitorCertJobsLogKey, true); lvl != "" {
+				Logf(lvl, "cert 任务行扫描失败: %v", err)
+			}
 			continue
 		}
 		// 终态计数（24h 窗口内 issued=成功 1、failed=失败 1；超窗行显示
@@ -176,7 +183,15 @@ func collectCertJobRows() ([]TaskInfo, bool) {
 	}
 	if err := rows.Err(); err != nil {
 		// 迭代失败不再静默部分列表（曾 rows.Err 未查）
-		Logf("warn", "cert 任务行迭代失败: %v", err)
+		readFailed = true
+		if lvl := logStateTransition(taskMonitorCertJobsLogKey, true); lvl != "" {
+			Logf(lvl, "cert 任务行迭代失败: %v", err)
+		}
+	}
+	if !readFailed {
+		if lvl := logStateTransition(taskMonitorCertJobsLogKey, false); lvl != "" {
+			Logf(lvl, "cert 任务行读取恢复")
+		}
 	}
 	truncated := len(out) > certJobRowsLimit
 	if truncated {
@@ -187,6 +202,10 @@ func collectCertJobRows() ([]TaskInfo, bool) {
 
 // certJobRowsLimit 任务监控视图内 cert-job 动态行上限（探针行 +1 由查询侧承担）。
 const certJobRowsLimit = 100
+
+// taskMonitorCertJobsLogKey cert-job 任务行读取失败态转换键（首报/恢复各一条，
+// 避免 5s 轮询在库故障期间刷 WARNING 洪峰）。
+const taskMonitorCertJobsLogKey = "task-monitor-cert-jobs"
 
 // collectEngineFamilies 引擎注册族统一视图（终态：零特化零收集器——
 // 元数据/开关/下一槽/状态镜像全来自 DescribeAll，最近运行与 24h 统计

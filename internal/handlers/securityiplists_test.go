@@ -685,8 +685,10 @@ func TestSecurityPolicyAllowMode_effectiveListNonEmpty(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("create with empty referenced list status=%d body=%s, want 400", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "放行所有请求") {
-		t.Fatalf("empty allow message must explain fail-open semantics, got %s", rec.Body.String())
+	// 文案方向必须与发射语义一致：allow 空集 = 否定算子恒命中 = 拒绝全部
+	// （全站锁死），不是「放行所有请求」。
+	if !strings.Contains(rec.Body.String(), "拒绝所有请求") {
+		t.Fatalf("empty allow message must explain fail-closed semantics, got %s", rec.Body.String())
 	}
 
 	// 形状 2：引用条目非空 → 通过。

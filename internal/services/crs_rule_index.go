@@ -25,6 +25,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"lazy-balancer-v2/internal/db"
 )
@@ -386,7 +387,12 @@ func crsRuleIndexVersion() string {
 // 统计量的不同目录（测试夹具/多目录场景）不得命中同一缓存。注意边界：
 // 「同大小内容替换且 mtime 不变」不改键（tar 解包保留 mtime 时理论可达），
 // 文件内容的逐字节变化不在键的覆盖范围内——键是代际判别器而非内容指纹。
+// crsRuleIndexKeyEvals 是测试可观察的指纹键求值计数（生产零消费，仅原子
+// 自增）：钉住「生成上下文级索引令牌 → 每轮渲染只求值一次」。
+var crsRuleIndexKeyEvals atomic.Int64
+
 func crsRuleIndexCacheKey(version string) string {
+	crsRuleIndexKeyEvals.Add(1)
 	entries, err := os.ReadDir(CRSRuleIndexDir)
 	if err != nil {
 		return version + "|" + CRSRuleIndexDir + "|-"

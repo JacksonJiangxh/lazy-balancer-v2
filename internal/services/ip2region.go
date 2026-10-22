@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
@@ -46,6 +47,24 @@ var (
 // 更新热换递增）。纯读，供上层判断派生聚合是否需要按新库重算。
 func GeoIPDataGeneration() int64 { return ip2regionGeneration.Load() }
 
+// ip2RegionStartupRepairWritesAllowed 启动期本地修复（版本行/.version sidecar
+// 写入）是否允许执行：从节点的 IP 库文件与版本行都由集群同步治理，本地改写
+// 会与主端声明打架并触发/延长整库漂移重拉（镜像 ReconcileCRSState 的显式
+// 口径）。角色读故障按「不写」处理并留痕——角色不可证实时宁停勿写，由下次
+// 启动或集群同步自愈。内存 searcher 装载/回退与审计不受此门约束（本地读面/
+// 节点本地面）。
+func ip2RegionStartupRepairWritesAllowed() bool {
+	if db.DB == nil {
+		return false
+	}
+	isMaster, err := RoleOf(context.Background(), db.DB)
+	if err != nil {
+		Logf("warn", "ip2region: 读取节点角色失败，跳过启动期版本行/sidecar 本地修复（角色不可证实，宁停勿写）: %v", err)
+		return false
+	}
+	return isMaster
+}
+
 // InitIP2Region loads the GeoIP database into the singleton searcher using
 // BufferCache mode (whole xdb in memory, zero-contention reads). The live
 // xdb wins when present; otherwise the bundled distribution copy is copied
@@ -80,7 +99,9 @@ func InitIP2Region() {
 				searcher = fallback
 				Logf("warn", "ip2region: 损坏的 live 库已回退为镜像内置库（标记 bundled，待下次成功更新自愈）")
 				RecordAuditLog("system", "更新", "IP数据库", "启动检测到 IP 数据库文件损坏不可装载，已回退镜像内置库（待下次成功更新恢复）", "")
-				if db.DB != nil {
+				// 版本行/sidecar 只在主节点写：从节点由集群同步治理（见
+				// ip2RegionStartupRepairWritesAllowed）；审计照记（节点本地面）。
+				if ip2RegionStartupRepairWritesAllowed() {
 					if _, uErr := db.DB.Exec("UPDATE security_ip2region_version SET version='bundled', updated_at=datetime('now') WHERE id=1"); uErr != nil {
 						Logf("error", "ip2region: 写入 dist 回退标识失败: %v", uErr)
 					}
@@ -88,6 +109,11 @@ func InitIP2Region() {
 						Logf("error", "ip2region: 写入 dist 回退 sidecar 失败: %v", rErr)
 					}
 				}
+				// dist 回退把 live 换成镜像旧库（内容代际变化）：树缓存有效性
+				// 判据只看修订号/ASCII 残留，不参与内容代际比较——不显式重建会
+				// 留下「新库的省市树」给在役旧库用（扫描失败时展示错误选项树）。
+				// 与更新路径 SetIP2RegionVersion 的无条件重建口径对齐。
+				writeRegionTreeCache(regionTreeFromXDB(ip2regionLivePath))
 			}
 		}
 		if searcher == nil {
@@ -101,8 +127,9 @@ func InitIP2Region() {
 	// 版本同步：xdb 文件存在但 DB 版本仍为种子值 'unknown' 时，从 .version
 	// 伴生文件读取实际版本写回 DB；伴生文件缺失（清理/手工删除后仅 xdb 残留）
 	// 则写 'bundled' 标记为镜像内置版本——消除 unknown+已最新 矛盾态。
-	// db.DB nil 守卫：单元测试可能不初始化数据库直接调 InitIP2Region。
-	if db.DB != nil {
+	// 写入门与 CRS 同口径（从节点的文件与版本行由集群同步治理）；角色读故障
+	// 按不写处理并留痕。
+	if ip2RegionStartupRepairWritesAllowed() {
 		// 只有「行缺失」或哨兵值才同步种子版本——读取故障（非
 		// ErrNoRows）时保留原版本行并留痕，否则会把真实版本覆盖成 bundled
 		// （版本溯源丢失、下次更新按哨兵重装）。

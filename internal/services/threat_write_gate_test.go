@@ -192,7 +192,7 @@ func TestHealThreatFastFromText_rejectsLowParseRatio(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	entries, _, ok := healThreatFastFromText("ustc")
+	entries, ok := healThreatFastFromText("ustc")
 
 	if ok {
 		t.Fatalf("可解析率 2/10 低于 50%% 必须拒绝修复，得到 ok=true（%d 条）", len(entries))
@@ -213,16 +213,13 @@ func TestHealThreatFastFromText_acceptsHealthyText(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	entries, sum, ok := healThreatFastFromText("ustc")
+	entries, ok := healThreatFastFromText("ustc")
 
 	if !ok {
 		t.Fatal("可解析率 3/4 应通过修复门")
 	}
 	if len(entries) != 3 {
 		t.Fatalf("entries=%v, want 3 条合法条目（垃圾行不得入列）", entries)
-	}
-	if sum == "" {
-		t.Fatal("修复成功须返回文本哈希")
 	}
 	if _, err := os.Stat(iplistPath + ".fast"); err != nil {
 		t.Fatalf("修复成功须落 .fast: %v", err)

@@ -20,8 +20,6 @@ func TestSecurityOverviewAndThreatScreen_discloseIngestionHealth(t *testing.T) {
 		Healthy:             false,
 		ConsecutiveFailures: 4,
 		LastError:           "injected ingest failure",
-		TaskState:           "running",
-		TaskRunning:         true,
 	})
 	t.Cleanup(func() { services.SecurityEventsSetIngestionHealthForTest(services.SecurityEventsIngestionStatus{}) })
 
@@ -55,8 +53,10 @@ func TestSecurityOverviewAndThreatScreen_discloseIngestionHealth(t *testing.T) {
 			if got.Healthy || got.ConsecutiveFailures != 4 || got.LastError != "injected ingest failure" {
 				t.Fatalf("%s ingestion=%+v, want the shared unhealthy snapshot", tc.name, got)
 			}
-			if !got.TaskRunning || got.TaskState != "running" {
-				t.Fatalf("%s ingestion task state=%q running=%v, want running", tc.name, got.TaskState, got.TaskRunning)
+			// 任务实态由 overlay 从 taskengine 读取（未装配=unknown），不得沿用
+			// 注入快照里的旧值——字段契约是闭合的 running/stopped/unknown 三态。
+			if got.TaskRunning || got.TaskState != "unknown" {
+				t.Fatalf("%s ingestion task state=%q running=%v, want unknown（未装配引擎）", tc.name, got.TaskState, got.TaskRunning)
 			}
 		})
 	}

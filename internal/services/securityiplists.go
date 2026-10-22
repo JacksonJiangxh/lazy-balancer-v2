@@ -286,18 +286,26 @@ func loadIPListEntriesVia(store caddyConfigStore, ids []int64) (map[int64][]stri
 
 // threatTextParseRatio 文本可解析率（渲染侧口径）：与下载解析的
 // threatMinParseRatio 同源——文本被截断/损坏（乱码行）时解析率显著低于
-// 正常名单，渲染若直接采用会让拦截面静默缩水。
-func threatTextParseRatio(vals []string) float64 {
-	if len(vals) == 0 {
-		return 0
-	}
-	parsed := 0
+// 正常名单，渲染若直接采用会让拦截面静默缩水。返回 (可解析条数, 总条数)，
+// 调用方按需算比率并打印真实分子（旧实现只返回比率，日志两个参数都用
+// len(vals)，恒打印 N/N=100% 自相矛盾）。
+func threatTextParseRatio(vals []string) (parsed, total int) {
+	total = len(vals)
 	for _, v := range vals {
 		if _, err := wafiplist.ParseIPEntry(v); err == nil {
 			parsed++
 		}
 	}
-	return float64(parsed) / float64(len(vals))
+	return parsed, total
+}
+
+// threatTextParseRatioValue 可解析率比值（0..1；空文本为 0）。
+func threatTextParseRatioValue(vals []string) float64 {
+	parsed, total := threatTextParseRatio(vals)
+	if total == 0 {
+		return 0
+	}
+	return float64(parsed) / float64(total)
 }
 
 // readThreatIplistPath 按代际读取威胁名单文件：文本与
@@ -338,14 +346,15 @@ func readThreatIplistPath(iplistPath string) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		if threatTextParseRatio(vals) >= threatMinParseRatio {
+		if threatTextParseRatioValue(vals) >= threatMinParseRatio {
 			return vals, nil
 		}
 		if fastErr == nil {
 			fastVals, fastReadErr := readFast()
 			if fastReadErr == nil {
+				parsed, total := threatTextParseRatio(vals)
 				Logf("warn", "威胁名单 %s 文本可解析率 %d/%d 低于 50%%（疑似损坏），改用 .fast",
-					iplistPath, len(vals), len(vals))
+					iplistPath, parsed, total)
 				return fastVals, nil
 			}
 			Logf("warn", "威胁名单 %s 文本损坏且 .fast 不可读（按文本装载，待下轮更新重写）: %v", iplistPath, fastReadErr)
@@ -450,11 +459,163 @@ func danglingIPListRefs(p *models.SecurityPolicy, listsByID map[int64][]string, 
 	return dangling
 }
 
-// ResolvePolicyIPListRefsForSummary 供摘要/列表路径批量解析引用 IP 名单
-// （SecurityPolicyHasIPControl 需要与发射面一致的合并集内容判定）。
-// 与渲染加载路径同一实现（store=nil → db.DB）；批次内零引用时零查询。
+// ResolvePolicyIPListRefsForSummary 供摘要/列表路径批量解析引用 IP 名单。
+// 摘要只需要「引用的名单是否有条目」这一判定（SecurityPolicyHasIPControl 与
+// 发射面同式），不需要合并集内容——列表端点按秒级轮询，全量装载最坏
+// 64 refs × 2000 条目/请求（每秒 MB 级 JSON 解析 + 主库读）纯属浪费。
+// 因此走 loadIPListRefPresenceVia：SQL 侧只回 id/条数，威胁库文件型名单仍
+// 读文件（失败判定必须与渲染一致）。
+// 语义与渲染路径对齐：装载失败（威胁库文件缺失/自定义 entries 畸形）→
+// IPRefMissing（摘要不得在策略会被跳过渲染时宣称已启用 IP 控制）；列表已
+// 删除 → 仅日志 warn（合并集退化 inline-only，与渲染同向）。
+// 读路径只写日志、不写审计——「渲染跳过」审计归渲染路径（读端点带写副作用
+// 会污染审计追溯）。
 func ResolvePolicyIPListRefsForSummary(policies []*models.SecurityPolicy) {
-	resolvePolicyIPListRefs(policies, nil)
+	if db.DB == nil {
+		return
+	}
+	seen := make(map[int64]struct{})
+	var ids []int64
+	collect := func(raw string) {
+		// 畸形 refs 按空集处理（与渲染路径同解析语义；渲染侧的限流留痕由
+		// parseIPListRefsLogged 承担，摘要不重复刷屏）。
+		for _, id := range parseIPListRefs(raw) {
+			if _, dup := seen[id]; dup {
+				continue
+			}
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+		}
+	}
+	for _, p := range policies {
+		if p == nil {
+			continue
+		}
+		collect(p.IPACLListRefs)
+		collect(p.IPWhitelistRefs)
+	}
+	if len(ids) == 0 {
+		return
+	}
+	presence, failed := loadIPListRefPresenceVia(db.DB, ids)
+	for _, p := range policies {
+		if p == nil {
+			continue
+		}
+		aclIDs := parseIPListRefs(p.IPACLListRefs)
+		wlIDs := parseIPListRefs(p.IPWhitelistRefs)
+		// 严格模式失败判定：与渲染同序（ACL 优先），首命中即置位并留痕。
+		markFailed := func(id int64) {
+			p.IPRefMissing = true
+			msg := fmt.Sprintf("策略 %q 引用的 IP 列表(id=%d)装载失败", p.Name, id)
+			if auditFailureShouldLog(msg) {
+				Logf("error", "%s——该策略将被跳过渲染", msg)
+			}
+		}
+		for _, id := range aclIDs {
+			if failed[id] {
+				markFailed(id)
+				break
+			}
+		}
+		if !p.IPRefMissing {
+			for _, id := range wlIDs {
+				if failed[id] {
+					markFailed(id)
+					break
+				}
+			}
+		}
+		if p.IPRefMissing {
+			continue
+		}
+		for _, id := range wlIDs {
+			if presence[id] {
+				p.IPWhitelistRefsNonEmpty = true
+				break
+			}
+		}
+		for _, id := range append(append([]int64{}, aclIDs...), wlIDs...) {
+			if _, exists := presence[id]; exists || failed[id] {
+				continue
+			}
+			msg := fmt.Sprintf("策略 %q 引用的 IP 列表(id=%d)不存在（列表已删除或导入残留），仅保留 inline 条目", p.Name, id)
+			if auditFailureShouldLog(msg) {
+				Logf("warn", "%s", msg)
+			}
+		}
+	}
+}
+
+// loadIPListRefPresenceVia 是摘要路径的轻量装载：只判定「引用名单是否有条目」
+// 与「装载是否失败」，不把 entries 内容搬进内存。
+// 失败判定与 loadIPListEntriesVia 同语义：威胁库（system=1 且名字映射到威胁
+// 源）读 .iplist/.fast 文件，读取失败即失败；自定义名单 entries 畸形（非 JSON
+// 数组）即失败；查询/迭代失败按 chunk 全失败处理。
+// 条数口径：json_array_length（写侧 validateIPListShape 拒绝空值/非法条目，
+// 自动封禁名单只允许 deny 引用、不参与信任非空判定）。
+func loadIPListRefPresenceVia(store caddyConfigStore, ids []int64) (map[int64]bool, map[int64]bool) {
+	presence := make(map[int64]bool, len(ids))
+	failed := make(map[int64]bool)
+	for start := 0; start < len(ids); start += ipListChunkSize {
+		end := start + ipListChunkSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunk := ids[start:end]
+		placeholders := strings.Repeat("?,", len(chunk))
+		placeholders = placeholders[:len(placeholders)-1]
+		args := make([]interface{}, len(chunk))
+		for i, id := range chunk {
+			args[i] = id
+		}
+		rows, err := store.Query(`SELECT id, COALESCE(system,0), COALESCE(name,''),
+			CASE WHEN json_valid(COALESCE(entries,'[]'))=0 THEN -1
+			     WHEN json_type(COALESCE(entries,'[]')) <> 'array' THEN -1
+			     ELSE json_array_length(COALESCE(entries,'[]')) END
+			FROM security_ip_lists WHERE id IN (`+placeholders+`)`, args...)
+		if err != nil {
+			Logf("error", "摘要: security_ip_lists 存在性查询失败（本块 %d 个列表按装载失败处理）: %v", len(chunk), err)
+			for _, id := range chunk {
+				failed[id] = true
+			}
+			continue
+		}
+		for rows.Next() {
+			var id int64
+			var system, entryCount int
+			var name string
+			if err := rows.Scan(&id, &system, &name, &entryCount); err != nil {
+				Logf("warn", "摘要: security_ip_lists 行扫描失败（该行丢弃）: %v", err)
+				failed[id] = true
+				continue
+			}
+			if system == 1 && threatSourceByListName(name) != "" {
+				vals, ferr := readThreatIplistEntries(name)
+				if ferr != nil {
+					Logf("error", "摘要: 威胁库 %q 文件读取失败: %v（严格模式：引用该列表的策略按装载失败处理）", name, ferr)
+					failed[id] = true
+					continue
+				}
+				presence[id] = len(vals) > 0
+				continue
+			}
+			if entryCount < 0 {
+				Logf("error", "摘要: 自定义 IP 列表(id=%d) entries 畸形（引用策略按装载失败处理）", id)
+				failed[id] = true
+				continue
+			}
+			presence[id] = entryCount > 0
+		}
+		if err := rows.Err(); err != nil {
+			Logf("error", "摘要: security_ip_lists 迭代失败（本块 %d 个列表按装载失败处理）: %v", len(chunk), err)
+			for _, id := range chunk {
+				failed[id] = true
+			}
+		}
+		rows.Close()
+	}
+	return presence, failed
 }
 
 // resolvePolicyIPListRefs 在策略加载路径上完成引用解析：跨整个已加载批次收集

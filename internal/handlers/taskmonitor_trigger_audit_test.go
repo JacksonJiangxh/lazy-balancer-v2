@@ -1,12 +1,13 @@
 package handlers
 
-// 7/12 可手动触发族手动触发在 audit_log 无痕——
-// AuditPolicySkip 的前提「任务体 defer 单记审计」随 v2.0
-// 可触发族扩容失效：现 12 族中 5 族自记（threat/crs/ip2region 任务体 defer +
-// auto-backup 执行器 + startup:config-load 载入审计），7 族任务体零审计
-// （log-cleanup/audit-retention/security-events-retention/cert-renewal-scan/
-// cert-reconcile/cert-manual-poll/cert-waiting-ca）。自动执行有审计（自记族）
-// 而手动（更高特权）反而无痕的倒挂随 trigger 路由整族豁免固化。
+// 可手动触发族中「任务体不自记」的族，手动触发需 handler 显式补记审计——
+// AuditPolicySkip 的前提「任务体 defer 单记审计」不覆盖全部可触发族。
+// 现状（以 taskTriggerSelfAuditIDs 为唯一清单）：16 个可触发族中 6 族自记
+// （threat/crs/ip2region/crawlerbot-update/auto-backup/startup:config-load），
+// 其余 10 族任务体零审计（config-watchdog/log-cleanup/audit-retention/
+// security-events-retention/metrics-orphan-cleanup/cert-renewal-scan/
+// cert-reconcile/cert-manual-poll/cert-waiting-ca/autoban）。自动执行有审计
+// （自记族）而手动（更高特权）反而无痕的倒挂随 trigger 路由整族豁免固化。
 // 修复口径：trigger handler 对非自记族显式补记「触发/任务监控」，自记族复记
 // 会违反 单记裁定（2026-09-29 用户裁定），必须跳过。
 

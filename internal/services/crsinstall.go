@@ -373,6 +373,11 @@ func (m *CRSUpdateManager) downloadAndInstall(parent context.Context, tag string
 func (m *CRSUpdateManager) swapCRSTreeFromStaging(staging, setupPath string, pendingOverrides []byte, tag string) (prevTag string, err error) {
 	wafFileMu.Lock()
 	defer wafFileMu.Unlock()
+	// 窗口标记：RemoveAll→moveTree→setup 落盘期间 rules 树可能整体缺失或部分
+	// 拷贝；渲染侧不持 wafFileMu（锁序不可反转），据此在生成期拒绝发布降级/
+	// 弱化配置（见 errCRSTreeSwapInFlight）。
+	crsTreeSwapInFlight.Store(true)
+	defer crsTreeSwapInFlight.Store(false)
 	rulesPath := filepath.Join(m.crsDir, "rules")
 	if err := os.RemoveAll(rulesPath); err != nil {
 		m.restoreBackupInLock()

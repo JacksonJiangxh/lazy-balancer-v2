@@ -1407,14 +1407,30 @@ func TestAPIDocs_systemTasksExampleKeysMatchImplementation(t *testing.T) {
 			t.Errorf("GET /system/tasks 示例 tasks[] 键 %q 不在 TaskInfo", key)
 		}
 	}
-	// 此前缺失的三个键（任务说明/运行节奏/常驻启动时刻）必须在示例中。
-	for _, key := range []string{"description", "cadence", "started_at"} {
+	// 任务说明/运行节奏必须在示例中；started_at 仍属 TaskInfo 全集但仅
+	// 常驻族有值（Scheduled 示例不得携带）。
+	for _, key := range []string{"description", "cadence"} {
 		if !taskAll[key] {
 			t.Fatalf("TaskInfo 已无 %q 字段——本钉测需同步", key)
 		}
 		if _, ok := item[key]; !ok {
 			t.Errorf("GET /system/tasks 示例 tasks[] 缺 %q", key)
 		}
+	}
+	if !taskAll["started_at"] {
+		t.Fatal("TaskInfo 已无 started_at 字段——本钉测需同步")
+	}
+	// 示例值必须与实现口径一致（键集测试拦不住值漂移）：
+	// Scheduled 的 cadence 恒「定时排程」；threat 可取消（Cancelable=true）；
+	// started_at 仅常驻族非空（Scheduled 示例不得携带）。
+	if got, _ := item["cadence"].(string); got != "定时排程" {
+		t.Errorf("GET /system/tasks 示例 cadence=%q, want 定时排程（Scheduled 实现口径）", got)
+	}
+	if got, ok := item["cancellable"].(bool); !ok || !got {
+		t.Errorf("GET /system/tasks 示例 cancellable=%v, want true（threat 注册 Cancelable=true）", item["cancellable"])
+	}
+	if _, exists := item["started_at"]; exists {
+		t.Error("GET /system/tasks 示例不得为 Scheduled 任务携带 started_at（仅常驻族非空）")
 	}
 	lastRun, ok := item["last_run"].(map[string]any)
 	if !ok {

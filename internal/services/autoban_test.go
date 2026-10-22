@@ -1782,7 +1782,7 @@ func installFeedHealthTestEngine(t *testing.T) *taskengine.Engine {
 	}); err != nil {
 		t.Fatalf("register feed task: %v", err)
 	}
-	old := taskEngine
+	old := TaskEngine()
 	SetTaskEngineForTest(te)
 	t.Cleanup(func() { SetTaskEngineForTest(old) })
 	return te
@@ -1794,9 +1794,9 @@ func TestAutobanFeedHealth_reportsStoppedIngestion(t *testing.T) {
 	installAutobanFixture(t, "2026-10-14 10:00:00")
 
 	// 引擎未装配：不判定（测试/装配早期，避免误报）。
-	prevEngine := taskEngine
-	t.Cleanup(func() { taskEngine = prevEngine })
-	taskEngine = nil
+	prevEngine := TaskEngine()
+	t.Cleanup(func() { SetTaskEngineForTest(prevEngine) })
+	SetTaskEngineForTest(nil)
 	if degraded, reason := AutobanFeedHealth(); degraded {
 		t.Fatalf("引擎未装配时不得报降级: reason=%q", reason)
 	}

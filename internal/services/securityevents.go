@@ -6,6 +6,7 @@ package services
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -242,7 +243,7 @@ func securityEventsParseTransaction(raw json.RawMessage) (*securityEventRecord, 
 		case securityEventsIsCrawlerExemptRule(rec.RuleTriggered):
 			rec.AnomalyScore = 0 // 已验证爬虫放行：审计轨迹，不计威胁分
 		case securityEventsIsCrawlerSpoofRule(rec.RuleTriggered):
-			rec.AnomalyScore = 12 // 爬虫伪装（PTR 验证失败）：高危
+			rec.AnomalyScore = 12 // 爬虫伪装（验证确定否定）：高危
 		case securityEventsIsGeoIPScoringRule(rec.RuleTriggered):
 			rec.AnomalyScore = 6 // GeoIP 区域拦截：中危
 		case securityEventsIsPrecheckRule(rec.RuleTriggered):
@@ -1640,6 +1641,25 @@ func (t *securityEventsTailer) securityEventsTick() error {
 	return passErr
 }
 
+// securityEventsRollbackLeakedTx 在批次提交失败后补发 ROLLBACK。提交失败时
+// database/sql 已把 Tx 标记 done 且不再调用 driver.Rollback：SQLite 的
+// deferred 约束/IO 类失败会让底层事务保持活动，连接归还池后仍持写事务
+// （写锁滞留，后续 Begin/INSERT 持续 "database is locked"，摄取永久停摆）。
+// 语义与 handlers 侧的 rollbackLeakedTx 同源（连接池 LIFO：泄漏连接优先被
+// 取到；命中无事务连接时报 "no transaction is active"，重试至命中或用尽）。
+func securityEventsRollbackLeakedTx(database *sql.DB) {
+	if database == nil {
+		return
+	}
+	for attempt := range 5 {
+		if _, err := database.Exec("ROLLBACK"); err == nil {
+			return
+		} else if !strings.Contains(err.Error(), "no transaction is active") {
+			Logf("warn", "security events ingestion: 提交失败后补发 ROLLBACK 失败（第 %d 次）: %v", attempt+1, err)
+		}
+	}
+}
+
 // securityEventsProcessPass decodes and inserts every complete transaction
 // from offset to EOF, returning the furthest offset safe to persist. A
 // database error stops the pass so the next tick retries the same offset; a
@@ -1717,6 +1737,9 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 	var batchOldestMinute time.Time
 	commit := func() error {
 		if err := tx.Commit(); err != nil {
+			// 提交失败必须补发 ROLLBACK（见 securityEventsRollbackLeakedTx）：
+			// 泄漏的写事务会让后续 tick 永久 "database is locked"。
+			securityEventsRollbackLeakedTx(metricsDB)
 			return err
 		}
 		securityEventsIngestCommits.Add(1)
@@ -1781,8 +1804,13 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 						}
 						// 不可恢复尾部=该段事件永久丢弃——计入跳过健康信号
 						// （跳过≠失败返回，不登记则本轮三面仍显示 healthy）。
+						// 字节口径=[offset, EOF)：offset 恒等于 decoderStart，即
+						// 最后一条成功摄取文档的末尾=畸形区起点；解码已消费的前缀
+						// （decoder.InputOffset()）仍属被丢弃的畸形文档字节，必须
+						// 计入，故不得改成 offset+InputOffset（那会少报丢失规模）。
+						malformedStart := decoderStart + decoder.InputOffset()
 						securityEventsRecordSkips(info.Size()-offset, 1)
-						Logf("error", "security events ingestion: unrecoverable unreadable audit data at offset %d in archive, ending pass", decoderStart+decoder.InputOffset())
+						Logf("error", "security events ingestion: unrecoverable unreadable audit data at offset %d in archive, ending pass", malformedStart)
 						return offset, nil
 					}
 					securityEventsRecordSkips(next-offset, 1)
@@ -2126,6 +2154,10 @@ func securityEventsRecordPollResult(err error) {
 		status.ConsecutiveFailures = 0
 		status.Healthy = true
 		status.LastSuccessAt = now.Format(time.RFC3339)
+		// 成功 tick 必须清空错误字段：保留旧 last_error/last_error_at 会让
+		// healthy=true 的快照同时带「健康」与「报错」矛盾信息（三面同源消费）。
+		status.LastError = ""
+		status.LastErrorAt = ""
 		return
 	}
 	status.ConsecutiveFailures++
@@ -2174,14 +2206,23 @@ func securityEventsIngestionTaskState() (string, bool) {
 //     一条任务日志业务行（仅状态变化，低频）。
 const (
 	securityEventsAuditWriterStatsSuffix = ".writer-stats.json"
-	securityEventsWriterFailureThreshold = 3
-	securityEventsWriterFailureWindow    = 15 * time.Minute
+	// securityEventsAuditWriterStatsFailureSuffix 是插件侧车写盘失败标记后缀
+	// （跨 module 协议第三段，与 caddygeoip 的 auditWriterStatsFailureSuffix
+	// 同值）：计数侧车写不进去时标记文件在场——文件缺失不再等于「正常」。
+	securityEventsAuditWriterStatsFailureSuffix = ".failed"
+	securityEventsWriterFailureThreshold        = 3
+	securityEventsWriterFailureWindow           = 15 * time.Minute
 )
 
 // securityEventsAuditWriterStatsPath 返回插件侧车计数文件路径（默认与审计日志
 // 同目录）。auditLogPath 是包级变量，测试可注入临时路径。
 func securityEventsAuditWriterStatsPath() string {
 	return auditLogPath + securityEventsAuditWriterStatsSuffix
+}
+
+// securityEventsAuditWriterStatsFailurePath 返回插件侧车写盘失败标记路径。
+func securityEventsAuditWriterStatsFailurePath() string {
+	return securityEventsAuditWriterStatsPath() + securityEventsAuditWriterStatsFailureSuffix
 }
 
 // securityEventsWriterHealth 是侧车计数的进程内累计状态：baseline 是上一次
@@ -2202,6 +2243,25 @@ var securityEventsWriterHealth struct {
 	// 产生失败/未启动是正常形态）；sidecarLastOK 是最近一次成功读取时间。
 	sidecarReadFailures int
 	sidecarLastOK       time.Time
+	// sidecarWriteFailureHits 连续观测到插件写盘失败标记的轮数：标记在场=
+	// 插件写不进计数侧车（磁盘满/目录只读），此刻读到的是旧值、文件可能
+	// 根本不存在（首写即失败）——计数不可信，按阈值置 unavailable。
+	sidecarWriteFailureHits int
+}
+
+// securityEventsObserveWriterStatsFailureMarker 观测插件侧车写盘失败标记
+// （跨 module 协议第三段，见 caddygeoip auditWriterStatsFailureSuffix）。
+// 标记在场或不可 stat 即计一轮失败；缺失则复位连续计数。
+func securityEventsObserveWriterStatsFailureMarker(now time.Time) {
+	_, err := os.Stat(securityEventsAuditWriterStatsFailurePath())
+	securityEventsWriterHealth.mu.Lock()
+	defer securityEventsWriterHealth.mu.Unlock()
+	if err != nil && errors.Is(err, os.ErrNotExist) {
+		securityEventsWriterHealth.sidecarWriteFailureHits = 0
+		return
+	}
+	securityEventsWriterHealth.sidecarWriteFailureHits++
+	securityEventsWriterHealth.lastFailureAt = now
 }
 
 // securityEventsObserveAuditWriterStats 读取插件侧车计数并累计增量。文件缺失
@@ -2209,6 +2269,7 @@ var securityEventsWriterHealth struct {
 // 失败计入 sidecarReadFailures——侧车不可用时写侧丢弃/IO 计数恒 0，
 // 必须由 writer_stats_unavailable 健康信号暴露而非保持假绿。
 func securityEventsObserveAuditWriterStats() {
+	securityEventsObserveWriterStatsFailureMarker(time.Now())
 	data, err := os.ReadFile(securityEventsAuditWriterStatsPath())
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
@@ -2326,7 +2387,8 @@ func securityEventsWriterHealthSnapshot() (dropped, ioErrors uint64, degraded, s
 		securityEventsWriterHealth.windowFailures >= securityEventsWriterFailureThreshold {
 		degraded = true
 	}
-	statsUnavailable = securityEventsWriterHealth.sidecarReadFailures >= securityEventsWriterFailureThreshold
+	statsUnavailable = securityEventsWriterHealth.sidecarReadFailures >= securityEventsWriterFailureThreshold ||
+		securityEventsWriterHealth.sidecarWriteFailureHits >= securityEventsWriterFailureThreshold
 	return dropped, ioErrors, degraded, statsUnavailable, lastFailureAt
 }
 
@@ -2340,6 +2402,11 @@ func securityEventsOverlayIngestionHealth(status SecurityEventsIngestionStatus) 
 			status.Observed = true
 			status.Healthy = false
 		}
+	} else {
+		// 字段契约 running/stopped/unknown 是闭合三态：引擎未装配/任务未注册
+		// （测试/嵌入形态）必须显式落 unknown，空串会让按 unknown 分支消费的
+		// 调用方失效。
+		status.TaskState, status.TaskRunning = "unknown", false
 	}
 	dropped, ioErrors, degraded, statsUnavailable, lastFailureAt := securityEventsWriterHealthSnapshot()
 	status.WriterDropped, status.WriterIOErrors = dropped, ioErrors
@@ -2394,6 +2461,7 @@ func SecurityEventsSetIngestionHealthForTest(status SecurityEventsIngestionStatu
 	securityEventsWriterHealth.lastFailureAt = time.Time{}
 	securityEventsWriterHealth.sidecarReadFailures = 0
 	securityEventsWriterHealth.sidecarLastOK = time.Time{}
+	securityEventsWriterHealth.sidecarWriteFailureHits = 0
 	securityEventsWriterHealth.mu.Unlock()
 	// 跳过累计同属健康位整体，重置时一并清空（防跨用例泄漏）。
 	securityEventsSkipHealth.mu.Lock()

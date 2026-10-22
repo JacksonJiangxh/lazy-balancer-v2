@@ -330,7 +330,9 @@ func (h *Handlers) RunAutoBackupOnce(ctx context.Context, trigger, operator stri
 	}
 	// 任务日志 tee（手动/自动备份各阶段在 tasks/auto-backup.log 留痕）
 	backupTee := func(stage, msg string) {
-		taskengine.TeeTaskLog("auto-backup", time.Now().In(services.CurrentLocation()).Format("2006/01/02 15:04:05"), "INFO", stage, msg)
+		// 时间戳/级别/阶段口径唯一来源（services.TaskLogf→TeeTaskLogTime）：
+		// 禁止自算时间戳再调 TeeTaskLog（第二个写点会在格式/时区变更时漏改）。
+		services.TaskLogf("auto-backup", stage, "%s", msg)
 	}
 	backupTee("backup", "备份开始（触发："+trigger+"）")
 	defer func() {

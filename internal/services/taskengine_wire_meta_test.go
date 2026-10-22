@@ -345,9 +345,9 @@ func TestTaskEngineWire_canTriggerDerivedFromKind(t *testing.T) {
 // 会 nil 解引用 panic。同族 cert-renewal-scan / cert-waiting-ca 已固定句柄
 // 本处为第三处。
 func TestClusterSyncDaemonRun_nilEngineReturnsWithoutPanic(t *testing.T) {
-	old := taskEngine
-	taskEngine = nil
-	t.Cleanup(func() { taskEngine = old })
+	old := TaskEngine()
+	SetTaskEngineForTest(nil)
+	t.Cleanup(func() { SetTaskEngineForTest(old) })
 	if err := clusterSyncDaemonRun(taskengine.RunContext{Ctx: context.Background()}); err != nil {
 		t.Fatalf("引擎已置 nil（关机窄窗）时集群同步 Run 必须安全退出, got err=%v", err)
 	}

@@ -215,6 +215,41 @@ func TestSecurityEventsTick_skipRegistersHealthSignal(t *testing.T) {
 	}
 }
 
+// 归档补采的不可恢复尾部：跳过字节数口径=[最后一条成功摄取文档末尾, EOF)
+// ——畸形区整段（含解码已消费的前缀）都是被丢弃的字节。反向形状：不得只
+// 统计「畸形区真实起点→EOF」而漏掉前缀（少报丢失规模）。
+func TestSecurityEventsArchiveSkipBytes_coversWholeDiscardedTail(t *testing.T) {
+	SecurityEventsSetIngestionHealthForTest(SecurityEventsIngestionStatus{})
+	t.Cleanup(func() { SecurityEventsSetIngestionHealthForTest(SecurityEventsIngestionStatus{}) })
+	logPath, _ := stallSetup(t)
+	// doc1 完整（可摄取），其后是超过扫描窗口的无文档头畸形区（归档不再生长，
+	// 走 scan-to-EOF：找不到下一个 "\n{" → 不可恢复尾部）。畸形区以截断 JSON
+	// 前缀开头（解码会消费掉一段前缀），确保「含前缀」与「不含前缀」可区分。
+	garbage := `{"transaction":{"id":"tail` + strings.Repeat("y", int(securityEventsScanWindowLimit))
+	payload := []byte(stallFixtureDoc1 + "\n" + garbage)
+	if err := os.WriteFile(logPath, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := securityEventsIngestDeltaFrom(logPath, 0, true); err != nil {
+		t.Fatalf("archive pass: %v", err)
+	}
+	if !stallHasEvent(t, "tx-stall-a") {
+		t.Fatal("畸形区之前的完整文档必须已摄取")
+	}
+	st := SecurityEventsIngestionHealthSnapshot()
+	if st.SkippedRegions != 1 {
+		t.Fatalf("SkippedRegions=%d, want 1", st.SkippedRegions)
+	}
+	// offset = 最后一条成功文档末尾（含其行尾换行）→ 跳过字节=整段畸形区。
+	wantBytes := uint64(len(garbage))
+	if st.SkippedBytes != wantBytes {
+		t.Fatalf("SkippedBytes=%d, want %d（整段丢弃尾部，含解码已消费前缀）", st.SkippedBytes, wantBytes)
+	}
+	if st.Healthy {
+		t.Fatal("不可恢复尾部丢弃必须降级健康位")
+	}
+}
+
 // 摄取事务字节触发：大 body 洪峰下不等 500 行满批——累计 headers+body
 // 超 8MiB 即提前提交，单事务驻留有界（不与行数批叠加放大进程峰值）。
 func TestSecurityEventsTick_batchCommitsOnByteCap(t *testing.T) {

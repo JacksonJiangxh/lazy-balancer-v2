@@ -306,8 +306,6 @@ func (bindingWriteErrConn) Begin() (driver.Tx, error) { return bindingWriteErrTx
 
 func (bindingWriteErrConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
 	switch {
-	case strings.Contains(query, "COALESCE(SUM(policy_type='mixed')"):
-		return &bindingWriteErrRows{cols: []string{"c", "m"}, rows: [][]driver.Value{{int64(1), int64(0)}}}, nil
 	case strings.Contains(query, "COALESCE(MAX(policy_type)"):
 		return &bindingWriteErrRows{cols: []string{"c", "t"}, rows: [][]driver.Value{{int64(1), "stage3"}}}, nil
 	case strings.Contains(query, "policy_type='mixed'"):

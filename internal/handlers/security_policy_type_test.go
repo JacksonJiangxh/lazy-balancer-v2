@@ -736,24 +736,30 @@ func TestCreateSecurityPolicy_keepsTrustDetectionForStage0(t *testing.T) {
 	}
 }
 
-// 显式 stage1 类型更新携带 trust_detection=true 恒写 0。
-func TestUpdateSecurityPolicy_zeroesTrustDetectionForExplicitStage1(t *testing.T) {
+// 显式 stage1 类型更新携带 trust_detection=true：更新路径不再静默归零，
+// 而是 400 显式拒绝（阶段外字段显式生效 = 矛盾载荷；静默丢弃会让 API/MCP 无法
+// 从 200 区分「已生效」与「被忽略」）。类型切换的调用方需显式清除该字段。
+func TestUpdateSecurityPolicy_rejectsTrustDetectionForExplicitStage1(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newSecurityRouter(t)
 	id := createTestPolicy(t, router, map[string]any{"name": "更新信任漂移"})
+	var before int
+	if err := db.DB.QueryRow(`SELECT COALESCE(trust_detection,0) FROM security_policies WHERE id=?`, id).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
 
 	recorder := putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{
 		"policy_type": "stage1", "trust_detection": true,
 	})
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("update status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "阶段 0") {
+		t.Fatalf("update status=%d body=%s, want 400 指引阶段 0", recorder.Code, recorder.Body.String())
 	}
-	var stored int
-	if err := db.DB.QueryRow(`SELECT COALESCE(trust_detection,0) FROM security_policies WHERE id=?`, id).Scan(&stored); err != nil {
+	var after int
+	if err := db.DB.QueryRow(`SELECT COALESCE(trust_detection,0) FROM security_policies WHERE id=?`, id).Scan(&after); err != nil {
 		t.Fatal(err)
 	}
-	if stored != 0 {
-		t.Fatalf("stage1 policy trust_detection=%d after update, want 0", stored)
+	if after != before {
+		t.Fatalf("被拒绝的更新不得落库: before=%d after=%d", before, after)
 	}
 }
 

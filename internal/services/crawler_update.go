@@ -470,7 +470,16 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 		if changed {
 			changedCount++
 		}
-		markCrawlerSourceSuccess(src.Name, rc.Trigger, len(entries))
+		if merr := markCrawlerSourceSuccess(src.Name, rc.Trigger, len(entries)); merr != nil {
+			// 名单内容已写，但源状态机未闭环（源行停留 running/旧槽）：
+			// 任务终态必须与源状态一致地记为失败，不得 success 掩盖。
+			if firstErr == nil {
+				firstErr = fmt.Errorf("源 %s 写成功态失败: %w", src.Name, merr)
+			}
+			failedCount++
+			taskengine.TeeTaskLogTime("crawlerbot-update", "ERROR", "failed", fmt.Sprintf("源 %s 写成功态失败: %v", src.Name, merr))
+			continue
+		}
 		successCount++
 		totalEntries += len(entries)
 		TaskLogf("crawlerbot-update", "success", "源 %s 更新成功（%d 条，版本 %s）", src.Name, len(entries), time.Now().UTC().Format("2006.01.02"))
@@ -552,31 +561,37 @@ func markCrawlerSourceRunning(name, trigger, started string) error {
 const crawlerSlotAdvanceSQL = `next_update=IIF(` + slotAdvanceGateSQL + `, ?, next_update)`
 
 // markCrawlerSourceSuccess 源成功态：entry_count 更新 + version=成功日期 +
-// consecutive_failures 清零 + next_update 按排程槽推进门更新。
-func markCrawlerSourceSuccess(name, trigger string, entryCount int) {
+// consecutive_failures 清零 + next_update 按排程槽推进门更新。返回落库错误
+// （与威胁族 markSourceSuccess 同口径）：吞错会让任务终态 success 而源行停留
+// running、next_update 不推进——任务日志与源状态机互相矛盾。
+func markCrawlerSourceSuccess(name, trigger string, entryCount int) error {
 	next := crawlerNextSlot(time.Now().UTC())
 	_, err := db.DB.Exec(`UPDATE security_crawler_sources SET entry_count=?, version=?, update_status='success', message='', consecutive_failures=0, `+crawlerSlotAdvanceSQL+`, finished_at=datetime('now') WHERE name=?`,
 		entryCount, time.Now().UTC().Format("2006.01.02"), trigger, next, name)
 	if err != nil {
 		Logf("error", "crawlerbot-update: 源 %s 写成功态失败: %v", name, err)
 	}
+	return err
 }
 
 // markCrawlerSourceCancelled 用户取消终态：保留上次快照、版本与失败计数，
-// 不推进排程槽。
-func markCrawlerSourceCancelled(name string) {
+// 不推进排程槽。返回落库错误（取消轮本身已记终态，调用方仅留痕）。
+func markCrawlerSourceCancelled(name string) error {
 	_, err := db.DB.Exec(`UPDATE security_crawler_sources SET update_status='cancelled', message='已手动取消（保留上次快照）', finished_at=datetime('now') WHERE name=?`, name)
 	if err != nil {
 		Logf("error", "crawlerbot-update: 源 %s 写取消态失败: %v", name, err)
 	}
+	return err
 }
 
 // markCrawlerSourceFailed 源失败态：consecutive_failures+1、next_update 按
 // 同一推进门更新（退避机制已撤除；失败保留上次快照，内容表 entries 不动）。
-func markCrawlerSourceFailed(name, trigger string) {
+// 返回落库错误（同 markCrawlerSourceSuccess）。
+func markCrawlerSourceFailed(name, trigger string) error {
 	next := crawlerNextSlot(time.Now().UTC())
 	_, err := db.DB.Exec(`UPDATE security_crawler_sources SET update_status='failed', message='下载或解析失败（保留上次快照）', consecutive_failures=consecutive_failures+1, `+crawlerSlotAdvanceSQL+`, finished_at=datetime('now') WHERE name=?`, trigger, next, name)
 	if err != nil {
 		Logf("error", "crawlerbot-update: 源 %s 写失败态失败: %v", name, err)
 	}
+	return err
 }

@@ -2294,3 +2294,30 @@ func TestCreateOrRequeueCertJobVerified_blockedRuleReturnsBusySentinel(t *testin
 		t.Fatalf("cert_jobs count=%d, want 0（屏障期不得落行）", count)
 	}
 }
+
+// Given 配置导入窗口（粘性 hold）内常驻 cert-issuance 重启触发
+// CAQueueManager.Start。
+// When 调用 Start。
+// Then 队列保持 inactive（不恢复部署重试），意图延迟到 EndConfigImportHold
+// 兑现——旧形态 Start 直接置 active=true 并恢复部署重试，绕开导入排空屏障。
+func TestCAQueueManager_StartDeferredDuringImportHold(t *testing.T) {
+	installCAQueueTestFixture(t)
+	ResetCAQueueManagerForTest()
+	InitCAQueueManager(func() error { return nil }, t.TempDir())
+	t.Cleanup(ResetCAQueueManagerForTest)
+	manager := GetCAQueueManager()
+	manager.PauseAndDrain()
+	if manager.IsActive() {
+		t.Fatal("前置态错误：队列应为 inactive")
+	}
+
+	BeginConfigImportHold()
+	manager.Start()
+	if manager.IsActive() {
+		t.Fatal("导入屏障窗口内 Start 打开了 CA 队列（排空隔离被绕过）")
+	}
+	EndConfigImportHold()
+	if !manager.IsActive() {
+		t.Fatal("导入屏障解除后未兑现延迟的启动意图（证书签发永久停摆）")
+	}
+}

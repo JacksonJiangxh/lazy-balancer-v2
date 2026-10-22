@@ -346,8 +346,12 @@ func TestIntersectIPLists_badEntryDoesNotFabricateIntersection(t *testing.T) {
 
 func TestCountEnabledCustomRulesBatch_matchesSingles(t *testing.T) {
 	newClusterTestService(t)
+	// 计数与发射侧同判据（customRuleEmittable）：空 conditions 的规则发射端会
+	// 跳过，夹具须给「启用」行可发射条件，本用例才验证「禁用不计」与批量/
+	// 单策略一致性。
+	cond := `[{"target":"uri","operator":"regex","pattern":"^/ok$"}]`
 	_, err := db.DB.Exec(`INSERT INTO security_custom_rules (name, conditions, action, score, enabled) VALUES
-		('on', '[]', 'block', 5, 1), ('off', '[]', 'block', 5, 0)`)
+		('on', ?, 'block', 5, 1), ('off', ?, 'block', 5, 0)`, cond, cond)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -360,7 +364,7 @@ func TestCountEnabledCustomRulesBatch_matchesSingles(t *testing.T) {
 	}
 	policies := []*models.SecurityPolicy{
 		{CustomRules: json.RawMessage(fmt.Sprintf("[%d,%d,999999]", onID, offID))},
-		{CustomRules: json.RawMessage(`[{"id":1,"enabled":true},{"id":2,"enabled":false}]`)},
+		{CustomRules: json.RawMessage(`[{"id":1,"enabled":true,"conditions":[{"target":"uri","operator":"regex","pattern":"^/ok$"}]},{"id":2,"enabled":false,"conditions":[{"target":"uri","operator":"regex","pattern":"^/ok$"}]}]`)},
 		{CustomRules: json.RawMessage(`[]`)},
 	}
 	got := CountEnabledCustomRulesBatch(policies)

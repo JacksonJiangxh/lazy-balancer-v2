@@ -506,7 +506,73 @@ func (m *CAQueueManager) IsActive() bool {
 	return m.active
 }
 
+// 配置导入窗口的证书队列屏障（粘性）：导入以 PauseAndDrain 建立隔离，但
+// 常驻 cert-issuance 的 Run 在异常退出有界重拉/角色对账 SetRole(true) 时会
+// 再走 StartACME→CAQueueManager.Start（置 active + 恢复部署重试），把已排空
+// 的队列重新打开并与导入事务并发写库。hold 期间 Start/Resume 被延迟为
+// 「待恢复意图」，只在 EndConfigImportHold 真正打开；depth 支持嵌套会话。
+var configImportHold struct {
+	sync.Mutex
+	depth        int
+	pendingStart bool
+}
+
+// BeginConfigImportHold 进入导入屏障（在 PauseAndDrain 之前调用——覆盖
+// 「排空完成到会话建立」的窗口）。
+func BeginConfigImportHold() {
+	configImportHold.Lock()
+	configImportHold.depth++
+	configImportHold.Unlock()
+}
+
+// EndConfigImportHold 退出导入屏障；最后一层退出时兑现被延迟的启动意图，
+// 并补启动被导入窗口延迟的证书生命周期（cert-issuance daemon 启动）。
+func EndConfigImportHold() {
+	configImportHold.Lock()
+	if configImportHold.depth > 0 {
+		configImportHold.depth--
+	}
+	release := configImportHold.depth == 0
+	pending := release && configImportHold.pendingStart
+	if release {
+		configImportHold.pendingStart = false
+	}
+	configImportHold.Unlock()
+	if !release {
+		return
+	}
+	if pending {
+		if manager := GetCAQueueManager(); manager != nil {
+			manager.startIgnoringHold()
+		}
+	}
+	resumeDeferredCertIssuanceLifecycle()
+}
+
+// configImportHoldActive 当前是否处于导入屏障窗口。
+func configImportHoldActive() bool {
+	configImportHold.Lock()
+	defer configImportHold.Unlock()
+	return configImportHold.depth > 0
+}
+
+// deferCAQueueStartLocked 记录被屏障延迟的启动意图（调用方不持 hold 锁）。
+func deferCAQueueStartLocked() {
+	configImportHold.Lock()
+	configImportHold.pendingStart = true
+	configImportHold.Unlock()
+}
+
 func (m *CAQueueManager) Resume() {
+	if configImportHoldActive() {
+		deferCAQueueStartLocked()
+		return
+	}
+	m.resumeIgnoringHold()
+}
+
+// resumeIgnoringHold 恢复活动态并重扫滞留任务（跳过导入屏障判定）。
+func (m *CAQueueManager) resumeIgnoringHold() {
 	m.mu.Lock()
 	m.active = true
 	m.mu.Unlock()
@@ -936,6 +1002,18 @@ func (m *CAQueueManager) enqueueCompensation(providerID int, jobID int, ruleID, 
 }
 
 func (m *CAQueueManager) Start() {
+	if configImportHoldActive() {
+		// 导入窗口：只登记意图，不得打开队列（否则 StartACME 的部署重试
+		// 恢复会与导入事务并发写证书/库）。EndConfigImportHold 兑现。
+		deferCAQueueStartLocked()
+		return
+	}
+	m.startIgnoringHold()
+}
+
+// startIgnoringHold 实际启动（跳过导入屏障判定；EndConfigImportHold 兑现
+// 延迟意图与正常路径共用）。
+func (m *CAQueueManager) startIgnoringHold() {
 	m.mu.Lock()
 	if m.compensationCtx == nil || m.compensationCtx.Err() != nil {
 		m.compensationCtx, m.compensationCancel = context.WithCancel(context.Background())
@@ -959,6 +1037,11 @@ func (m *CAQueueManager) Stop() {
 	// 补偿可能仍在退避中），清租约会让在途补偿的 enqueueCompensation 永久失败。
 	m.releaseAllRuleBlocks()
 	m.PauseAndDrain()
+	// 显式停止作废导入窗口内登记的延迟启动意图：停止是用户/生命周期意图，
+	// 导入结束不得把它兑现成启动。
+	configImportHold.Lock()
+	configImportHold.pendingStart = false
+	configImportHold.Unlock()
 }
 
 // releaseAllRuleBlocks 回收全部规则删除屏障租约。锁序与 UnblockJobsForRule 一致：

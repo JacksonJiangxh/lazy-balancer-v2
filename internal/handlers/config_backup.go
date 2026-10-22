@@ -744,15 +744,23 @@ func normalizeBackupBooleanValue(value any) any {
 type importQueueRecovery struct {
 	manager   *services.CAQueueManager
 	wasActive bool
-	done      bool
+	// hold 标记本会话持有配置导入队列屏障（BeginConfigImportHold 已调用）：
+	// finish 先解除屏障再按原活动态恢复，保证导入窗口内被延迟的启动意图
+	// 只在此刻兑现。
+	hold bool
+	done bool
 }
 
 func (recovery *importQueueRecovery) finish() error {
-	if recovery.manager == nil || recovery.done {
+	if recovery.done {
 		return nil
 	}
 	recovery.done = true
-	if !recovery.wasActive {
+	if recovery.hold {
+		recovery.hold = false
+		services.EndConfigImportHold()
+	}
+	if recovery.manager == nil || !recovery.wasActive {
 		return nil
 	}
 	recovery.manager.Resume()
@@ -1098,9 +1106,17 @@ func (h *Handlers) snapshotImportRuntime(ruleIDs []string) (importRuntimeSnapsho
 	return importRuntimeSnapshot{caddyConfig: caddyConfig, certFiles: certFiles}, nil
 }
 
+// restoreImportRuntime 把运行配置/证书文件回退到快照。
+// ApplyConfig 在「运行配置与快照字节一致」时返回 errSameConfig 哨兵——
+// 这是成功的空操作（拒绝/快照失败等路径运行配置本就没变），不是恢复失败：
+// 不过滤会把确定性命中的同字节短路 join 进响应/审计/失败横幅（「恢复失败」
+// 假信号）。证书文件恢复仍按真实错误上报。
 func (h *Handlers) restoreImportRuntime(snapshot importRuntimeSnapshot) error {
 	certErr := services.RestoreCertFiles(snapshot.certFiles)
 	caddyErr := h.caddyService.ApplyConfig(snapshot.caddyConfig)
+	if services.IsSameConfig(caddyErr) {
+		caddyErr = nil
+	}
 	return errors.Join(caddyErr, certErr)
 }
 

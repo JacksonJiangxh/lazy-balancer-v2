@@ -51,6 +51,11 @@ func ip2RegionXDBBaselineKey(tag string) string {
 // admin 进程。100MB 内的损坏文件仅使探针搜索失败、拒绝安装。
 const ip2RegionXDBDownloadSizeCap = int64(100 << 20)
 
+// ip2RegionDownloadSync 是落盘同步的测试缝（生产恒为 (*os.File).Sync）：
+// Sync 失败分支是掉电持久性门，无法用真实文件注入（只能靠磁盘故障），
+// 经缝覆盖「同步失败不得把 staging 文件当成功」。
+var ip2RegionDownloadSync = func(f *os.File) error { return f.Sync() }
+
 // defaultDownloadIP2RegionXDB downloads the ip2region v4 xdb to destPath.
 func defaultDownloadIP2RegionXDB(ctx context.Context, tag, destPath string, progress downloadProgressFunc) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
@@ -76,7 +81,7 @@ func defaultDownloadIP2RegionXDB(ctx context.Context, tag, destPath string, prog
 	// 先 Sync 再 Close）。
 	var syncErr error
 	if copyErr == nil {
-		syncErr = out.Sync()
+		syncErr = ip2RegionDownloadSync(out)
 	}
 	closeErr := out.Close()
 	if copyErr != nil {

@@ -888,3 +888,24 @@ func TestCrawlerVerification_gatedByRenderFlag(t *testing.T) {
 		t.Fatal("crawler_exempt=true must keep the verification path")
 	}
 }
+
+// 瞬态验证结论（DNS 解析失败/超时/并发饱和）不得置伪装头：真实搜索引擎
+// 爬虫在 DNS 抖动时既不被伪装规则阻断，也不产生伪伪装事件。
+func TestCrawlerVerification_transientSetsNoSpoofHeader(t *testing.T) {
+	ResetCrawlerVerifyCacheForTest(&fakeResolver{
+		ptrErr: map[string]error{"66.249.66.1": context.DeadlineExceeded},
+	})
+	h := &GeoIPHandler{CrawlerExempt: true}
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "66.249.66.1:443"
+	req.Header.Set("User-Agent", googlebotUA)
+
+	h.applyCrawlerVerification(req)
+
+	if got := req.Header.Get(crawlerSpoofHeader); got != "" {
+		t.Fatalf("瞬态验证不得置伪装头，got %q", got)
+	}
+	if got := req.Header.Get(crawlerVerifiedHeader); got != "" {
+		t.Fatalf("瞬态验证不得置已验证头，got %q", got)
+	}
+}

@@ -663,3 +663,21 @@ func TestPreviewHasWafFilesIncludesThreatOnlyLbbak(t *testing.T) {
 		t.Fatalf("has_waf_files=false, want true（仅含威胁库名单条目的合法 lbbak）: %s", rec.Body.String())
 	}
 }
+
+// Given 拒绝路径（导入在证书校验阶段失败，运行配置未变）与运行时快照同字节。
+// When restoreImportRuntime 回弹快照。
+// Then 同字节短路（errSameConfig）视为恢复成功——不得把无副作用的空操作
+// 变成「恢复运行配置失败」的假信号（响应/审计/失败横幅污染）。
+func TestRestoreImportRuntime_sameConfigIsSuccessNoop(t *testing.T) {
+	harness := newImportRollbackHarness(t)
+	snapshot := importRuntimeSnapshot{caddyConfig: map[string]interface{}{"marker": "before-import"}}
+	if err := harness.handler.restoreImportRuntime(snapshot); err != nil {
+		t.Fatalf("同字节回弹应成功（同字节短路），got %v", err)
+	}
+	if harness.loadCalls() != 0 {
+		t.Fatalf("同字节回弹不应触发 /load, got %d", harness.loadCalls())
+	}
+	if got := harness.currentConfig(); got != `{"marker":"before-import"}` {
+		t.Fatalf("运行配置被改写: %s", got)
+	}
+}

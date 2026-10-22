@@ -22,7 +22,7 @@ func TestQueryRuleStageTimings_emptyWindowIsNotAnError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	preAvg, preCnt, wafAvg, wafCnt, err := queryRuleStageTimings("lb_empty")
+	preAvg, preCnt, wafAvg, wafCnt, err := queryRuleStageTimings(db.MetricsDB, "lb_empty")
 	if err != nil {
 		t.Fatalf("空窗口不得报查询故障: %v", err)
 	}
@@ -42,7 +42,7 @@ func TestQueryRuleStageTimings_countsSamples(t *testing.T) {
 	preAvg, preCnt, wafCnt := 0.0, 0, 0
 	var wafAvg float64
 	var err error
-	preAvg, preCnt, wafAvg, wafCnt, err = queryRuleStageTimings("lb_hot")
+	preAvg, preCnt, wafAvg, wafCnt, err = queryRuleStageTimings(db.MetricsDB, "lb_hot")
 	if err != nil {
 		t.Fatal(err)
 	}

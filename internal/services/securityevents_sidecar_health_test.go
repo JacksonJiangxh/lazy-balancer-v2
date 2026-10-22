@@ -99,3 +99,43 @@ func TestIngestionHealth_dataLossOutlivesDegradedWindow(t *testing.T) {
 		t.Fatal("畸形区跳过累计>0 也必须保持 data_loss=true")
 	}
 }
+
+// 插件写不进侧车时（磁盘满/目录只读、首写即失败 → 计数文件永不存在）必须
+// 留下失败标记：根侧据标记判「写侧计数不可用」，而不是把文件缺失当正常。
+func TestWriterStatsHealth_writeFailureMarkerBecomesUnavailable(t *testing.T) {
+	dir := t.TempDir()
+	oldPath := auditLogPath
+	auditLogPath = filepath.Join(dir, "audit.log")
+	t.Cleanup(func() { auditLogPath = oldPath })
+	SecurityEventsSetIngestionHealthForTest(SecurityEventsIngestionStatus{Observed: true, Healthy: true})
+	t.Cleanup(func() {
+		SecurityEventsSetIngestionHealthForTest(SecurityEventsIngestionStatus{})
+	})
+
+	if err := os.WriteFile(securityEventsAuditWriterStatsFailurePath(), []byte("writer-stats sidecar write failed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for range securityEventsWriterFailureThreshold {
+		securityEventsObserveAuditWriterStats()
+	}
+	status := SecurityEventsIngestionHealthSnapshot()
+	if !status.WriterStatsUnavailable || status.Healthy {
+		t.Fatalf("failure marker: unavailable=%v healthy=%v, want unavailable+unhealthy", status.WriterStatsUnavailable, status.Healthy)
+	}
+	if status.WriterLastFailureAt == "" {
+		t.Fatal("失败标记在场必须披露 writer_last_failure_at")
+	}
+
+	// 插件恢复写盘（标记清除）→ 下一轮观测即恢复可用。
+	if err := os.Remove(securityEventsAuditWriterStatsFailurePath()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(securityEventsAuditWriterStatsPath(), []byte(`{"dropped":0,"io_errors":0}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	securityEventsObserveAuditWriterStats()
+	status = SecurityEventsIngestionHealthSnapshot()
+	if status.WriterStatsUnavailable || !status.Healthy {
+		t.Fatalf("marker cleared: unavailable=%v healthy=%v, want available+healthy", status.WriterStatsUnavailable, status.Healthy)
+	}
+}

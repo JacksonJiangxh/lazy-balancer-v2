@@ -35,7 +35,7 @@ func TestListSecurityEvents_hugePageDoesNot500(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/security/events?page=9223372036854775807", nil)
 	router.ServeHTTP(recorder, req)
 
-	// Then：200 空页而非 500（clamp 到 100000 后 OFFSET 合法）
+	// Then：200 空页而非 500（page 钳到上限 1000，OFFSET 恒在合法范围）
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
 	}

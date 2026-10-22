@@ -20,8 +20,8 @@
 ### 1.1 引擎调度循环（每 1s tick）
 
 ```
-Scheduled: loopEnabled && !running && EnabledFn()≠false && NextSlotFn() ≤ now → Run
-           （每 tick 重读槽——µs 级 SELECT；EnabledFn=false 整分支跳过：零评估零落行）
+Scheduled: loopEnabled && !running && EnabledFn()≠false && 槽已到期 && 槽未消费 → Run
+           （槽缓存 + 降频求值；EnabledFn=false 整分支跳过：零评估零落行）
 Periodic : loopEnabled && !running && now-lastCheck ≥ IntervalFn() → Run
            （EnabledFn=false 同跳过且不推进节拍——恢复后下一 tick 到期即跑）
 Daemon   : 不进 tick——StartLoop 启动 Run 一次（阻塞）；StopLoop 取消 ctx；
@@ -29,6 +29,22 @@ Daemon   : 不进 tick——StartLoop 启动 Run 一次（阻塞）；StopLoop �
            常驻业务门归 Run 体首行）
 Oneshot  : 不进 tick——仅 Trigger
 ```
+
+Scheduled 槽语义（槽缓存 + 同一槽只执行一次）：
+
+- **降频求值**：槽由 `NextSlotFn` 求值后缓存；仅「到期前导窗内（`schedSlotEvalLead`=30s）」
+  与「重评地板到点（`schedSlotEvalFloor`=1min）」重读，其余 tick 零闭包求值零 DB 读。
+  槽为零（未武装，或全局开关开但所有单源关）同样受地板约束——首槽武装的发现延迟
+  上界=地板周期。
+- **同一槽只执行一次**：成功落定后重读槽仍未到期推进（仍过期/未变）即写入
+  `schedDoneSlot` 消费本槽，tick 要求 `slot > schedDoneSlot`；业务推进/重排为新槽后
+  自然恢复。失败轮不消费（走 1s→5s→30s 退避重投，仅「已到期槽未推进+failed」形态）。
+- **用户取消**：仅**自动轮**的**已到期**槽被消费（取消=显式放弃本槽）。手动触发轮不改
+  预约（未来槽是下一次预约，与手动轮无归属关系），取消手动轮也不得消费槽——否则未来
+  槽被水位永久压住，自动更新静默停摆。`CancelHook` 返回 false（取消未生效）不消费。
+- **显式复位**：`StartLoop` 关→开与业务侧重排槽（`RearmSecurityLibrarySlots`）经
+  `ResetScheduleProgress` 清空槽缓存/水位/退避——否则旧水位会压住新预约。
+- **导入排空**（`CancelInFlightRuns`）与 demote 取消不消费槽：恢复后到期轮补跑。
 
 单飞：引擎 CAS 强制（in-flight 拒绝重入，全部 Kind 统一）。
 
@@ -230,6 +246,11 @@ queued/pending/waiting_ca 限流停车）=运行中。业务生命周期态
 | 触发执行 | 1 行 | [start]/[done]+业务 |
 | 手动触发 | 1 行（trigger=manual） | 同上 |
 | 崩溃恢复 | 残留 running → interrupted | — |
+| 用户取消自动轮 | 本轮 1 行（终态 cancelled） | [done] cancelled |
+
+用户取消（`Cancel`）只消费「自动轮所属的已到期槽」：本轮 `task_runs` 落 cancelled，
+本槽不再投递；业务推进/重排新槽后恢复。手动触发轮被取消不改预约（不消费槽），
+`CancelHook` 返回 false（取消未生效）同样不消费。
 
 task_runs 保留 90 天（audit-retention 每日清理）。`Engine.Stop` 先取消全部运行，再等待 Scheduled/Periodic/Oneshot 在途 Run 与全部 daemon 落定终态；停止后新的 Trigger/RunSync 返回 `ErrEngineStopped`。
 
@@ -266,6 +287,7 @@ task_runs 保留 90 天（audit-retention 每日清理）。`Engine.Stop` 先取
 
 ## 7. 修订记录
 
+- v2.0.4（2026-10-23）：补充 §1.1 Scheduled 槽语义——槽缓存降频求值（前导窗 30s/地板 1min）、同一槽只执行一次（成功/自动轮到期的用户取消消费；失败退避不消费）、取消只消费「自动轮已到期槽」、`ResetScheduleProgress` 显式复位、导入排空/demote 不消费。同步 §5 记录口径（用户取消自动轮=放弃本槽）。
 - v2.0.3（2026-10-14，用户裁定「启用后按配置调度」）：autoban 调度模型收编——Descriptor 去除 EnabledFn（任务监控只认 `loop_on`，启停语义全在调度开关+事件页业务开关）；PUT /security/autoban 保存联动启停（enabled=true→StartLoop、false→StopLoop；历史补：禁用保存先收敛已到期条目与暂存重载再停调度——禁用后无循环 flush/到期清理点）；启动按库内业务开关实态对齐调度；手动开调度/手动触发但未启用由 Run 体首行业务门拦停（TaskLogf「手动调度，执行失败：未启用」+task_runs failed 行+StopLoop 重禁调度）；POST /security/autoban/run「立即执行」端点与前端按钮删除。
 
 - v2.0.2（2026-10-14，用户裁定）：新增 autoban 循环任务（60s/主节点/EnabledFn=autoban_enabled 业务开关联动）——WAF 事件固定窗口计数（摄取提交点喂入）→ 阈值判定 →「自动封禁名单」merge（清到期/保留手动/已在名单过滤/超限挤最早到期）→ 重载 60s 节流暂存合并；观察模式（dry_run 默认开）仅记建议；每轮 TaskLogf 摘要行入 tasks/autoban.log。

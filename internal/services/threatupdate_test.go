@@ -1076,7 +1076,7 @@ func TestHealThreatFastFromText_skipsComments(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	entries, _, ok := healThreatFastFromText("ustc")
+	entries, ok := healThreatFastFromText("ustc")
 	if !ok {
 		t.Fatal("heal .fast from valid text failed")
 	}
@@ -1093,7 +1093,7 @@ func TestHealThreatFastFromText_rejectsEmptyList(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wafDir, "threat-ustc.iplist"), []byte("# only comments\n\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, ok := healThreatFastFromText("ustc"); ok {
+	if _, ok := healThreatFastFromText("ustc"); ok {
 		t.Fatal("empty .iplist must not heal into an empty active list")
 	}
 	if _, err := os.Stat(filepath.Join(wafDir, "threat-ustc.iplist.fast")); !os.IsNotExist(err) {

@@ -32,6 +32,9 @@ func newSecurityEventsRouter(t *testing.T) *gin.Engine {
 	return router
 }
 
+// seedSecurityEvent 播种一条**带归因快照**的事件：rule_name/policy_name 取自
+// 当前规则/策略名并写入事件行（与摄取路径的真实形态一致）。列表查询只读快照
+// 列（无 JOIN），所以「快照为空 → 名称列为空」的形态需直接 INSERT。
 func seedSecurityEvent(t *testing.T, eventTime, ruleCaddyID string, policyID any, ruleTriggered, ruleMsg string) {
 	t.Helper()
 	var ruleName, policyName string
@@ -85,7 +88,7 @@ func TestListSecurityEvents_returnsRuleAndPolicyNames(t *testing.T) {
 	// When the events list is requested
 	recorder := getRequest(t, router, "/security/events")
 
-	// Then each event carries the joined rule/policy name, falling back to empty when unbound
+	// Then each event carries its ingest-time snapshot name; unbound events show empty
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("list status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
@@ -140,28 +143,23 @@ func TestListSecurityEvents_excludeKeepsNullRuleTriggered(t *testing.T) {
 	}
 }
 
-func TestListSecurityEvents_legacyRowsFallBackToJoinedNames(t *testing.T) {
-	// Given a rule and policy, plus a pre-migration event with empty snapshot columns
+func TestListSecurityEvents_emptySnapshotRendersEmptyNames(t *testing.T) {
+	// 契约：列表只读事件快照列（SELECT 无 JOIN lb_rules/security_policies）——
+	// 快照为空的存量行显示空名称，不做事后 join 回退。本用例直接 INSERT 空快照，
+	// 保证断言验证的是该契约本身，而不是种子自己写入的字段。
 	setupSecurityPolicyTestDB(t)
 	router := newSecurityEventsRouter(t)
 
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id, name, protocol, listen_port) VALUES ('lb_legacy1', '遗留规则', 'http', 8080)`); err != nil {
 		t.Fatalf("seed rule: %v", err)
 	}
-	res, err := db.DB.Exec(`INSERT INTO security_policies (name) VALUES ('遗留策略')`)
-	if err != nil {
-		t.Fatalf("seed policy: %v", err)
+	// 规则/策略存在但事件快照列为空（迁移前写入的形态）
+	if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time, rule_caddy_id, policy_id, client_ip, method, uri, event_type, rule_triggered, rule_msg, action, rule_name, policy_name)
+		VALUES ('2026-08-12 10:00:01','lb_legacy1',1,'185.199.109.9','GET','/a','crs','942100','SQL Injection','blocked','','')`); err != nil {
+		t.Fatalf("seed legacy event: %v", err)
 	}
-	policyID, err := res.LastInsertId()
-	if err != nil {
-		t.Fatalf("policy id: %v", err)
-	}
-	seedSecurityEvent(t, "2026-08-12 10:00:01", "lb_legacy1", policyID, "942100", "SQL Injection")
 
-	// When the events list is requested
 	recorder := getRequest(t, router, "/security/events")
-
-	// Then the empty snapshots fall back to the joined rule/policy names
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("list status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
@@ -180,8 +178,8 @@ func TestListSecurityEvents_legacyRowsFallBackToJoinedNames(t *testing.T) {
 	if len(resp.Data.Events) != 1 {
 		t.Fatalf("events = %s", recorder.Body.String())
 	}
-	if got := resp.Data.Events[0]; got.RuleName != "遗留规则" || got.PolicyName != "遗留策略" {
-		t.Fatalf("legacy event = %+v, want joined names 遗留规则/遗留策略", got)
+	if got := resp.Data.Events[0]; got.RuleName != "" || got.PolicyName != "" {
+		t.Fatalf("empty-snapshot event = %+v, want empty names（列表不做 join 回退）", got)
 	}
 }
 

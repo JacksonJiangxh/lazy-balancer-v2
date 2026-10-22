@@ -56,19 +56,19 @@ func TestVerifyCrawler_passFailMatrix(t *testing.T) {
 		},
 	})
 	// 真 Googlebot：PTR 属域 + 正向回验含原 IP → 通过
-	if !VerifyCrawler("66.249.66.1", "googlebot") {
+	if VerifyCrawler("66.249.66.1", "googlebot") != CrawlerVerdictVerified {
 		t.Error("真 Googlebot 应通过")
 	}
 	// GCP 机房伪装：PTR 后缀不属引擎域 → 拒
-	if VerifyCrawler("34.100.1.1", "googlebot") {
-		t.Error("GCP PTR 伪装应拒绝")
+	if VerifyCrawler("34.100.1.1", "googlebot") != CrawlerVerdictSpoof {
+		t.Error("GCP PTR 伪装应判确定否定")
 	}
 	// 伪造 PTR 指向官方域：正向回验不含原 IP → 拒
-	if VerifyCrawler("1.2.3.4", "googlebot") {
-		t.Error("伪造 PTR（正向不含原 IP）应拒绝")
+	if VerifyCrawler("1.2.3.4", "googlebot") != CrawlerVerdictSpoof {
+		t.Error("伪造 PTR（正向不含原 IP）应判确定否定")
 	}
 	// 缓存：同 IP 二次询问不再触 DNS（通过结论已缓存）
-	if !VerifyCrawler("66.249.66.1", "googlebot") {
+	if VerifyCrawler("66.249.66.1", "googlebot") != CrawlerVerdictVerified {
 		t.Error("缓存命中应直接通过")
 	}
 }
@@ -88,8 +88,8 @@ func TestVerifyCrawler_transientFailuresNotCached(t *testing.T) {
 			}
 		})
 
-		if VerifyCrawler("9.8.7.6", "googlebot") {
-			t.Fatal("saturated verifier must fail closed for the current request")
+		if got := VerifyCrawler("9.8.7.6", "googlebot"); got != CrawlerVerdictTransient {
+			t.Fatalf("saturated verifier must yield transient, got %v", got)
 		}
 		crawlerCacheMu.Lock()
 		_, cached := crawlerCache["9.8.7.6|googlebot"]
@@ -109,8 +109,8 @@ func TestVerifyCrawler_transientFailuresNotCached(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ResetCrawlerVerifyCacheForTest(&fakeResolver{ptrErr: map[string]error{tc.ip: tc.err}})
-			if VerifyCrawler(tc.ip, "googlebot") {
-				t.Fatal("DNS failure must fail closed")
+			if got := VerifyCrawler(tc.ip, "googlebot"); got != CrawlerVerdictTransient {
+				t.Fatalf("DNS failure must yield transient, got %v", got)
 			}
 			crawlerCacheMu.Lock()
 			_, cached := crawlerCache[tc.ip+"|googlebot"]
@@ -130,8 +130,8 @@ func TestVerifyCrawler_transientFailuresNotCached(t *testing.T) {
 			ptr:     map[string][]string{ip: {host + "."}},
 			hostErr: map[string]error{host: errors.New("forward resolver down")},
 		})
-		if VerifyCrawler(ip, "googlebot") {
-			t.Fatal("failed forward verification must fail closed")
+		if got := VerifyCrawler(ip, "googlebot"); got != CrawlerVerdictTransient {
+			t.Fatalf("failed forward verification is transient, got %v", got)
 		}
 		crawlerCacheMu.Lock()
 		_, cached := crawlerCache[ip+"|googlebot"]
@@ -146,8 +146,8 @@ func TestVerifyCrawler_transientFailuresNotCached(t *testing.T) {
 		ResetCrawlerVerifyCacheForTest(&fakeResolver{ptr: map[string][]string{
 			ip: {"vm-34-100-1-1.bc.googleusercontent.com."},
 		}})
-		if VerifyCrawler(ip, "googlebot") {
-			t.Fatal("non-official PTR must not verify")
+		if got := VerifyCrawler(ip, "googlebot"); got != CrawlerVerdictSpoof {
+			t.Fatalf("non-official PTR must be spoof, got %v", got)
 		}
 		crawlerCacheMu.Lock()
 		entry, cached := crawlerCache[ip+"|googlebot"]
@@ -177,8 +177,8 @@ func TestVerifyCrawler_cacheCapacityPreservesLiveEntries(t *testing.T) {
 		crawlerCache["expired|googlebot"] = crawlerVerifyCache{ok: true, expires: now.Add(-time.Minute)}
 		crawlerCacheMu.Unlock()
 
-		if VerifyCrawler(newIP, "googlebot") {
-			t.Fatal("test input must produce a deterministic negative")
+		if got := VerifyCrawler(newIP, "googlebot"); got != CrawlerVerdictSpoof {
+			t.Fatalf("test input must produce a deterministic negative, got %v", got)
 		}
 		crawlerCacheMu.Lock()
 		keep, keepExists := crawlerCache["keep|googlebot"]
@@ -208,8 +208,8 @@ func TestVerifyCrawler_cacheCapacityPreservesLiveEntries(t *testing.T) {
 		crawlerCache["keep-b|googlebot"] = crawlerVerifyCache{ok: true, expires: now.Add(time.Hour)}
 		crawlerCacheMu.Unlock()
 
-		if VerifyCrawler(newIP, "googlebot") {
-			t.Fatal("test input must produce a deterministic negative")
+		if got := VerifyCrawler(newIP, "googlebot"); got != CrawlerVerdictSpoof {
+			t.Fatalf("test input must produce a deterministic negative, got %v", got)
 		}
 		crawlerCacheMu.Lock()
 		_, keepA := crawlerCache["keep-a|googlebot"]
@@ -242,8 +242,8 @@ func TestVerifyCrawler_cacheCapacityPruneWorkBounded(t *testing.T) {
 	crawlerCachePruneVisitsForTest = 0
 	crawlerCacheMu.Unlock()
 
-	if VerifyCrawler(newIP, "googlebot") {
-		t.Fatal("test input must produce a deterministic negative")
+	if got := VerifyCrawler(newIP, "googlebot"); got != CrawlerVerdictSpoof {
+		t.Fatalf("test input must produce a deterministic negative, got %v", got)
 	}
 	crawlerCacheMu.Lock()
 	visits := crawlerCachePruneVisitsForTest
@@ -280,8 +280,8 @@ func TestVerifyCrawler_dnsFailureFailClosed(t *testing.T) {
 	ResetCrawlerVerifyCacheForTest(&fakeResolver{
 		ptrErr: map[string]error{"5.6.7.8": errors.New("resolver down")},
 	})
-	if VerifyCrawler("5.6.7.8", "googlebot") {
-		t.Error("DNS 失败必须 fail-closed 拒绝")
+	if got := VerifyCrawler("5.6.7.8", "googlebot"); got != CrawlerVerdictTransient {
+		t.Fatalf("DNS 失败是瞬态（不得判伪装）, got %v", got)
 	}
 }
 
@@ -378,16 +378,16 @@ func TestVerifyCrawlerDNS_v4MappedFormsUnified(t *testing.T) {
 	})
 	// 目标形状：4in6 客户端 + v4 规范正向应答 = 同地址，须通过
 	// （旧字符串比较 "::ffff:66.249.66.1" == "66.249.66.1" 恒假 → 真爬虫误杀）。
-	if !VerifyCrawler("::ffff:66.249.66.1", "googlebot") {
+	if VerifyCrawler("::ffff:66.249.66.1", "googlebot") != CrawlerVerdictVerified {
 		t.Error("4in6 客户端与 v4 正向应答同地址应通过（Unmap 归一）")
 	}
 	// 回归形状：映射形态但正向回验不含原 IP → 仍 fail-closed。
-	if VerifyCrawler("::ffff:66.249.66.2", "googlebot") {
-		t.Error("4in6 客户端正向不含原 IP 仍须拒绝")
+	if VerifyCrawler("::ffff:66.249.66.2", "googlebot") != CrawlerVerdictSpoof {
+		t.Error("4in6 客户端正向不含原 IP 仍须判确定否定")
 	}
 	// 畸形形状：带 zone 地址不得命中（fail-closed）。
-	if VerifyCrawler("2001:db8::1%eth0", "googlebot") {
-		t.Error("带 zone 地址必须 fail-closed")
+	if VerifyCrawler("2001:db8::1%eth0", "googlebot") != CrawlerVerdictSpoof {
+		t.Error("带 zone 地址是确定否定（不可解析）")
 	}
 }
 
@@ -631,5 +631,32 @@ func TestProvision_crawlerIPListFileDefaultsToAppData(t *testing.T) {
 	}
 	if h.CrawlerIPListFile != "/app/data/crawler-ip-lists.json" {
 		t.Fatalf("Provision 未回填默认: %q", h.CrawlerIPListFile)
+	}
+}
+
+// 官方 IP 段快照不可用 = 无法判定（瞬态）：不得据此判伪装（会误封该引擎的
+// 真爬虫并产生伪事件）；快照可用但段外才是确定否定。
+func TestVerifyCrawlerIPRange_snapshotUnavailableIsTransient(t *testing.T) {
+	oldFile := crawlerIPListFile
+	crawlerIPListFile = filepath.Join(t.TempDir(), "missing-crawler-ip-lists.json")
+	t.Cleanup(func() { crawlerIPListFile = oldFile })
+	resetCrawlerIPRangeCacheForTest()
+	ResetCrawlerVerifyCacheForTest(nil)
+
+	if got := VerifyCrawler("42.236.8.1", "so360spider"); got != CrawlerVerdictTransient {
+		t.Fatalf("missing snapshot verdict=%v, want transient（快照不可用不得判伪装）", got)
+	}
+
+	if err := os.WriteFile(crawlerIPListFile, []byte(`{"so360spider":["42.236.8.0/21"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	crawlerFileCacheMu.Lock()
+	crawlerFileCacheSnap.loadedAt = time.Now().Add(-2 * time.Minute) // 失败节流期已过
+	crawlerFileCacheMu.Unlock()
+	if got := VerifyCrawler("42.236.8.1", "so360spider"); got != CrawlerVerdictVerified {
+		t.Fatalf("official range verdict=%v, want verified", got)
+	}
+	if got := VerifyCrawler("42.236.16.1", "so360spider"); got != CrawlerVerdictSpoof {
+		t.Fatalf("outside official range verdict=%v, want spoof", got)
 	}
 }

@@ -1364,6 +1364,46 @@ type securityPolicyContext struct {
 	// 3 轮渲染 → 3R）。批次级一次求值后透传，正确性零变化。
 	crsFingerprintOnce sync.Once
 	crsFingerprint     string
+	// crsIndexOnce：本轮生成的 CRS 规则索引惰性求值（首次消费才读目录）。
+	// 索引指纹键含 ReadDir+全量 stat+版本查询，逐（规则×策略）重算在
+	// 1000 规则 × 2 策略下带来 1~2s 的锁内开销——提到生成上下文后每轮一次。
+	// BuildCorazaDirectives 的三个消费点共享同一实例；无选组/无作用域排除时
+	// 零触发（惰性）。
+	crsIndexOnce func() *CRSRuleIndex
+	// allowIntersectionMu/allowIntersection：allow 模式多策略交集按「绑定策略
+	// 集合签名」缓存（交集只依赖 allow 策略的身份与名单条目，同一策略集绑定
+	// 的多条规则此前各算一遍：64 名单 × 5000 条最坏 2500 万次比较/对）。
+	allowIntersectionMu sync.Mutex
+	allowIntersection   map[string][]string
+}
+
+// crsRuleIndex 返回本生成轮的 CRS 规则索引（上下文缺失时回退全局惰性取值）。
+func (ctx *securityPolicyContext) crsRuleIndex() func() *CRSRuleIndex {
+	if ctx == nil || ctx.crsIndexOnce == nil {
+		return lazyCRSRuleIndex()
+	}
+	return ctx.crsIndexOnce
+}
+
+// allowIntersectionCached 返回 allow 策略集的交集（按签名缓存，命中零计算）。
+func (ctx *securityPolicyContext) allowIntersectionCached(signature string, compute func() []string) []string {
+	if ctx == nil || signature == "" {
+		return compute()
+	}
+	ctx.allowIntersectionMu.Lock()
+	if cached, ok := ctx.allowIntersection[signature]; ok {
+		ctx.allowIntersectionMu.Unlock()
+		return cached
+	}
+	ctx.allowIntersectionMu.Unlock()
+	result := compute()
+	ctx.allowIntersectionMu.Lock()
+	if ctx.allowIntersection == nil {
+		ctx.allowIntersection = make(map[string][]string)
+	}
+	ctx.allowIntersection[signature] = result
+	ctx.allowIntersectionMu.Unlock()
+	return result
 }
 
 // crsPoolFingerprintCached 返回本渲染批次的 CRS 池指纹（首次调用时求值并
@@ -1384,6 +1424,13 @@ func (ctx *securityPolicyContext) crsPoolFingerprintCached() string {
 // policy_id ASC 全量取出，策略按 id 批量查询并过滤 enabled，逐规则按 ASC
 // 顺序收集启用策略（禁用绑定仅占位，不产生元素）。
 func loadSecurityPolicyContext(store caddyConfigStore) (*securityPolicyContext, error) {
+	// CRS 树交换窗口互斥：窗口内 rules 树可能整体缺失（RemoveAll 后、rename
+	// 前）或只拷入一部分（copyDir 回退中断）。前者会让「缺库降级」路径成功
+	// 发布一份无安全链的配置，后者探测通过但只匹配到部分 CRS 文件（WAF 静默
+	// 弱化）——两种都必须失败，而不是发布降级/弱化配置。
+	if crsTreeSwapInFlightNow() {
+		return nil, errCRSTreeSwapInFlight
+	}
 	ctx := &securityPolicyContext{
 		policyByRule:      make(map[string][]*models.SecurityPolicy),
 		blockPageByID:     make(map[int]string),
@@ -1392,6 +1439,7 @@ func loadSecurityPolicyContext(store caddyConfigStore) (*securityPolicyContext, 
 		store:             store,
 		scopedListCache:   make(scopedCRSListCache),
 		securityLibsOK:    SecurityLibrariesAvailable(),
+		crsIndexOnce:      lazyCRSRuleIndex(),
 	}
 	bindingRows, err := store.Query(`SELECT rule_caddy_id, policy_id FROM security_policy_bindings ORDER BY rule_caddy_id, policy_id ASC`)
 	if err != nil {
@@ -4310,7 +4358,7 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 	if securityLibsOK && rule.Protocol == "http" && len(policies) >= 1 {
 		// 单行护栏错误（48KiB 超限）向上传播——保存侧经 CLI 校验/事务门控回滚。
 		// rule.CaddyID：u-* 投影 scope 编入规则身份。
-		precheckHandler, err := buildIPPrecheckHandler(policies, stage1BlockStatus(ctx, rule), rule.CaddyID)
+		precheckHandler, err := buildIPPrecheckHandler(policies, stage1BlockStatus(ctx, rule), rule.CaddyID, ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -4401,7 +4449,7 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 			// 本策略信任 IP 由预检统一记录(事件去重),他策略信任 IP 照常拦截
 			// (「信任仅豁免所属策略」边界);单策略保持平原形态(预检虽同构存在,
 			// 但策略层自身信任 DetectionOnly 已正确处理,无跨策略信任边界)。
-			wafHandler, err := buildWafHandlerWithPolicy(rule.CaddyID, policy, policyStore, needFingerprint(), len(policies) > 1, blockStatusForPolicy(ctx, rule, policy), effectiveRequestBodyMaxSizeMB, detectionTrust, scopedCache)
+			wafHandler, err := buildWafHandlerWithIndex(rule.CaddyID, policy, policyStore, needFingerprint(), len(policies) > 1, blockStatusForPolicy(ctx, rule, policy), effectiveRequestBodyMaxSizeMB, detectionTrust, ctx.crsRuleIndex(), scopedCache)
 			if err != nil {
 				return nil, err
 			}

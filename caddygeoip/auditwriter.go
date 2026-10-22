@@ -47,6 +47,8 @@ package caddygeoip
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"reflect"
 	"sort"
@@ -1169,6 +1171,36 @@ var auditWriterStatsInterval = 3 * time.Second
 // auditWriterStatsPath 返回目标路径对应的侧车计数文件路径。
 func auditWriterStatsPath(target string) string { return target + auditWriterStatsSuffix }
 
+// auditWriterStatsFailureSuffix 是侧车写盘失败标记（紧跟侧车计数文件）。
+// 跨进程协议第三段：计数侧车写不进去时（磁盘满/目录只读），计数变化无法
+// 落盘——根服务看到的是旧值或文件缺失（首写即失败），按「缺失=正常」会假绿。
+// 失败标记让写侧故障跨进程可见；成功写盘即删除标记。根服务按
+// securityEventsAuditWriterStatsFailureSuffix 同值读取（跨 module 两处同步）。
+const auditWriterStatsFailureSuffix = ".failed"
+
+// auditWriterStatsFailurePath 返回侧车写盘失败标记路径。
+func auditWriterStatsFailurePath(target string) string {
+	return auditWriterStatsPath(target) + auditWriterStatsFailureSuffix
+}
+
+// markWriterStatsFailure 尽力写入失败标记（磁盘满时同样可能失败：此时只剩
+// 进程日志，根侧按「侧车缺失」处理，不虚构成功）。内容携带时间与原因，供
+// 排障直接读取。
+func (p *auditPipeline) markWriterStatsFailure(now time.Time, cause error) {
+	path := auditWriterStatsFailurePath(p.target)
+	body := fmt.Sprintf("writer-stats sidecar write failed at %s: %v\n", now.UTC().Format(time.RFC3339), cause)
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		auditIOLogf("audit writer: writer-stats failure marker write failed for %s: %v", p.target, err)
+	}
+}
+
+// clearWriterStatsFailure 删除失败标记（侧车计数恢复可写）。
+func (p *auditPipeline) clearWriterStatsFailure() {
+	if err := os.Remove(auditWriterStatsFailurePath(p.target)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		auditIOLogf("audit writer: writer-stats failure marker removal failed for %s: %v", p.target, err)
+	}
+}
+
 // auditIOLogf 审计落盘错误日志缝（测试注入；缺省 caddy.Log）。
 var auditIOLogf = func(format string, args ...any) {
 	caddy.Log().Named("auditwriter").Sugar().Errorf(format, args...)
@@ -1471,16 +1503,20 @@ func (p *auditPipeline) writeWriterStatsIfDue(now time.Time) {
 	if err := os.WriteFile(tmp, body, 0o644); err != nil {
 		// 尽力而为但可观测：恢复脏标记下个 drain 节拍重试（否则计数不再
 		// 变化时永不重试，侧车永久缺失），并按分钟节流留痕一次。
+		// 失败标记让「侧车写不进去」跨进程可见（根侧不再按缺失=正常假绿）。
 		p.statsDirty.Store(true)
+		p.markWriterStatsFailure(now, err)
 		p.logStatsWriteFailureLocked(now, err)
 		return
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		p.statsDirty.Store(true)
+		p.markWriterStatsFailure(now, err)
 		p.logStatsWriteFailureLocked(now, err)
 		return
 	}
+	p.clearWriterStatsFailure()
 	p.lastStatsWrite = now
 }
 

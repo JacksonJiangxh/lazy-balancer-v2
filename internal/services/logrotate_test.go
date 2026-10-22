@@ -252,9 +252,10 @@ func TestTaskLogsHousekeeping_waitsForCertJobWriteLock(t *testing.T) {
 	}
 }
 
-// tasks 根目录的保留期删除也必须与 appendTaskLogLine
-// 共用路径锁，并在锁内重读 ModTime；写入刚刷新的文件不得按扫描前旧状态删除。
-func TestTaskLogsHousekeeping_waitsForTaskLogWriteLock(t *testing.T) {
+// 日志尺寸阈值读取必须在路径写锁之外完成（缓存未命中会读库，最坏占满
+// busy_timeout）——写入方阻塞在尺寸求值时不持路径锁，保留期清理不得被它
+// 阻塞；清理在锁内重读 ModTime，写入方随后新建/追加的文件保持 fresh 行。
+func TestTaskLogsHousekeeping_runsWhileSizeEvalInFlight(t *testing.T) {
 	base := t.TempDir()
 	logFile := filepath.Join(base, "app.log")
 	tasksDir := filepath.Join(base, "tasks")
@@ -288,33 +289,25 @@ func TestTaskLogsHousekeeping_waitsForTaskLogWriteLock(t *testing.T) {
 		defer close(writerDone)
 		taskengine.TeeTaskLog("lock-root", "2026/01/02 03:04:05", "INFO", "test", "fresh")
 	}()
-	<-entered // writer 已持路径锁并阻塞在尺寸求值，清理不得越过该锁。
+	<-entered // writer 正在尺寸求值（未持路径锁）。
 
 	cleaned := make(chan TaskLogHousekeepingResult, 1)
 	go func() { cleaned <- taskLogsHousekeeping(logFile) }()
 	select {
 	case res := <-cleaned:
+		if len(res.Deleted) == 0 {
+			close(release)
+			<-writerDone
+			t.Fatalf("清理应能删除陈旧文件（尺寸求值不持路径锁）: %+v", res)
+		}
+	case <-time.After(2 * time.Second):
 		close(release)
 		<-writerDone
-		t.Fatalf("清理未等待 tasks 根日志写锁: %+v", res)
-	case <-time.After(200 * time.Millisecond):
-	}
-	if _, err := os.Stat(path); err != nil {
-		close(release)
-		<-writerDone
-		t.Fatalf("持锁期间文件被删除: %v", err)
+		t.Fatal("尺寸求值阻塞了保留期清理（阈值求值必须在路径写锁之外）")
 	}
 
 	close(release)
 	<-writerDone
-	select {
-	case res := <-cleaned:
-		if len(res.Deleted) != 0 {
-			t.Fatalf("写入刷新后的文件不得按旧 ModTime 删除: %+v", res)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("解锁后清理未完成")
-	}
 	data, err := os.ReadFile(path)
 	if err != nil || !strings.Contains(string(data), "fresh") {
 		t.Fatalf("写入后的活动日志必须保留, err=%v body=%q", err, data)

@@ -251,11 +251,18 @@ func (h *Handlers) beginConfigImportWithPrelock(ctx context.Context, prelock fun
 	recovery := importQueueRecovery{manager: services.GetCAQueueManager()}
 	if recovery.manager != nil {
 		recovery.wasActive = recovery.manager.IsActive()
+		// 屏障先于排空建立（粘性 hold）：排空完成后常驻 cert-issuance 的
+		// 有界重拉/角色对账仍可能经 StartACME 重开队列——hold 期间 Start/
+		// Resume 只登记意图，导入结束由 recovery.finish 统一兑现。
+		recovery.hold = true
+		services.BeginConfigImportHold()
 		// 排空结果必须被消费——未完全排空（30s 超时仍有执行中任务）
 		// 不得继续导入。
 		if !recovery.manager.PauseAndDrain() {
-			// 先恢复队列再释放会话锁——否则第二个导入可在锁窗口内
-			// 看到「队列 inactive」并在第一个导入 Resume 后与之并发。
+			// 先解除 hold 再恢复队列/释放会话锁——否则第二个导入可在锁窗口
+			// 内看到「队列 inactive」并在第一个导入 Resume 后与之并发。
+			recovery.hold = false
+			services.EndConfigImportHold()
 			if recovery.wasActive {
 				recovery.manager.Resume()
 			}
@@ -342,6 +349,14 @@ func (session *configImportSession) abort(importErr error) error {
 			// RestoreRuntimeToCommittedInLock 也会把已提交字节写回 LKG。
 			certErr := services.RestoreCertFiles(session.runtime.certFiles)
 			restoreErr := session.h.recoverCommittedViewAfterCommitFailure(session.tx)
+			if restoreErr != nil {
+				// 恢复已提交视图失败=运行配置可能停留在导入候选（传输失败
+				// 且 Caddy 已应用/恢复 /load 再失败），而 DB 已回滚。LKG 由
+				// RestoreRuntimeToCommittedInLock 钉回已提交字节，但横幅事实
+				// 源此前为空——刷新页面后分叉完全不可见。与规则域 apply 失败
+				// 同口径持久化失败横幅。
+				session.h.recordCaddyApplyResult(fmt.Errorf("导入失败后恢复已提交运行配置失败: %w", restoreErr))
+			}
 			importErr = errors.Join(importErr, certErr, restoreErr)
 			session.finished = true
 			return finishImportFailure(session.tx, &session.recovery, importErr)

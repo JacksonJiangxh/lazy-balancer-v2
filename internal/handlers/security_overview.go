@@ -204,7 +204,7 @@ func loadRuleStageStats(metricsDB *sql.DB, ruleCaddyID string, now time.Time) (r
 	}
 	rows.Close()
 
-	preAvg, preCnt, wafAvg, wafCnt, terr := queryRuleStageTimings(ruleCaddyID)
+	preAvg, preCnt, wafAvg, wafCnt, terr := queryRuleStageTimings(metricsDB, ruleCaddyID)
 	if terr != nil {
 		services.Logf("warn", "stage-stats timing query failed for %s: %v", ruleCaddyID, terr)
 	} else {
@@ -228,7 +228,10 @@ func loadRuleStageStats(metricsDB *sql.DB, ruleCaddyID string, now time.Time) (r
 // SUM 在空窗口上返回 SQL NULL——计数列必须 COALESCE，否则正常空窗口
 // 会被扫描失败误报成「查询故障」（安静规则每次轮询刷一条 warn）。
 // AVG 在空窗口本就是 NULL，扫进 sql.NullFloat64 后归零。
-func queryRuleStageTimings(ruleCaddyID string) (preAvg float64, preCnt int, wafAvg float64, wafCnt int, err error) {
+// 句柄必须由调用方传入（与分桶查询同源）：此前用包级 db.MetricsDB，缓存键
+// 却含入参句柄——换库/测试注入时会出现「分桶来自 A、耗时来自 B」，且错误内容
+// 以 A 为键缓存 30s（缓存键与数据源不对称）。
+func queryRuleStageTimings(metricsDB *sql.DB, ruleCaddyID string) (preAvg float64, preCnt int, wafAvg float64, wafCnt int, err error) {
 	stageTimingSQL := fmt.Sprintf(`SELECT
 		AVG(CASE WHEN precheck_us > 0 THEN precheck_us END),
 		COALESCE(SUM(CASE WHEN precheck_us > 0 THEN 1 ELSE 0 END),0),
@@ -237,7 +240,7 @@ func queryRuleStageTimings(ruleCaddyID string) (preAvg float64, preCnt int, wafA
 		FROM security_events
 		WHERE rule_caddy_id=? AND event_time >= datetime('now','-1 day')`, services.Stage1PrecheckSegmentSQL, services.Stage1PrecheckSegmentSQL)
 	var preAverage, wafAverage sql.NullFloat64
-	if err = db.MetricsDB.QueryRow(stageTimingSQL, ruleCaddyID).Scan(&preAverage, &preCnt, &wafAverage, &wafCnt); err != nil {
+	if err = metricsDB.QueryRow(stageTimingSQL, ruleCaddyID).Scan(&preAverage, &preCnt, &wafAverage, &wafCnt); err != nil {
 		return 0, 0, 0, 0, err
 	}
 	if preAverage.Valid {

@@ -9,15 +9,21 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/taskengine"
 )
 
-var taskEngine *taskengine.Engine
+// taskEnginePtr 全局引擎代际。启动/关停与后台 goroutine（角色对账、集群
+// 翻转、证书唤醒、autoban 等）并发访问——裸指针在 StopTaskEngine 置 nil
+// 与读者之间构成数据竞争，改用原子指针（读者要么拿到旧代，要么拿到 nil）。
+var taskEnginePtr atomic.Pointer[taskengine.Engine]
 
 // configLoadRerun 系统配置载入手动重载钩子（main 注入：DB 渲染→强制应用）。
 // operator 透传：手动重载归因操作者，启动 BootSync 传空。
@@ -41,6 +47,41 @@ func SetCertIssuanceLifecycleHooks(start, stop func()) {
 	certIssuanceLifecycleStart, certIssuanceLifecycleStop = start, stop
 }
 
+// certIssuanceStartDeferred 导入窗口内被延迟的证书生命周期启动意图：常驻
+// cert-issuance 的 Run 体（异常退出有界重拉/角色对账 SetRole(true)）在导入
+// 期间启动会把已排空的 CA 队列重新打开（StartACME→queue.Start→恢复部署
+// 重试）并与导入事务并发写库。屏障期只记意图，导入结束补启动；若该代 Run
+// 已退出，stop 包装清除意图（不得为无主 Run 拉起服务）。
+var certIssuanceStartDeferred atomic.Bool
+
+// startCertIssuanceLifecycle 证书签发常驻 Run 的生命周期启动（导入屏障门）。
+func startCertIssuanceLifecycle() {
+	if configImportHoldActive() {
+		certIssuanceStartDeferred.Store(true)
+		return
+	}
+	if certIssuanceLifecycleStart != nil {
+		certIssuanceLifecycleStart()
+	}
+}
+
+// stopCertIssuanceLifecycle 生命周期停止：同时作废延迟启动意图（该代 Run
+// 已退出）。
+func stopCertIssuanceLifecycle() {
+	certIssuanceStartDeferred.Store(false)
+	if certIssuanceLifecycleStop != nil {
+		certIssuanceLifecycleStop()
+	}
+}
+
+// resumeDeferredCertIssuanceLifecycle 导入屏障解除后补启动被延迟的证书生命
+// 周期（仅当延迟意图仍有效——Run 已退出时 stop 已清位）。
+func resumeDeferredCertIssuanceLifecycle() {
+	if certIssuanceStartDeferred.CompareAndSwap(true, false) && certIssuanceLifecycleStart != nil {
+		certIssuanceLifecycleStart()
+	}
+}
+
 // daemonLifecycleRun 常驻生命周期包装：start→阻塞 ctx→stop（nil 挂钩=测试
 // 环境空载体回退）。stop 恒执行（deferred）：不仅正常停止/角色翻转，start
 // 半启动后 panic 也必须清理（runGuarded 会判定 daemon 已死——已启动的 ACME
@@ -61,11 +102,11 @@ func daemonLifecycleRun(rc taskengine.RunContext, start, stop func()) error {
 var certJobsActiveFn = certJobsActive
 
 // TaskEngine 返回全局引擎实例（未初始化返回 nil——测试环境）。
-func TaskEngine() *taskengine.Engine { return taskEngine }
+func TaskEngine() *taskengine.Engine { return taskEnginePtr.Load() }
 
 // SetTaskEngineForTest 测试替换全局引擎；生产装配只能走 InitTaskEngine。
 // 用于需要独立描述符集合的 API 行为测试，禁止用于绕过 Register 校验。
-func SetTaskEngineForTest(te *taskengine.Engine) { taskEngine = te }
+func SetTaskEngineForTest(te *taskengine.Engine) { taskEnginePtr.Store(te) }
 
 // reconcileTaskEngineRole 把引擎角色对齐到 DB 单源角色。
 //
@@ -142,7 +183,8 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	// 以暂停 tick 形态建引擎——BootSync（startup:config-load）
 	// 完成前面板装配期的周期/定时任务不得抢跑（配置未加载即执行首轮）；下方
 	// RunBootSyncTasks 之后 ResumeScheduling 恢复调度。
-	taskEngine = taskengine.NewEngine(taskengine.Options{StartPaused: true})
+	te := taskengine.NewEngine(taskengine.Options{StartPaused: true})
+	taskEnginePtr.Store(te)
 	// 角色种子（v2.0 角色门前置）：按 DB 角色初始化——从节点不瞬启
 	// master-only daemon（否则 boot 行噪音：启动→SetRole 停止）。
 	// 修复：曾在此前多建一个引擎（种子落在被弃实例上失效+泄漏）。
@@ -158,17 +200,17 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	}
 	if roleErr != nil {
 		Logf("warn", "任务引擎角色种子读取失败（已重试一次），按从节点启动（fail-closed）: %v", roleErr)
-		taskEngine.SetRole(false)
+		te.SetRole(false)
 	} else {
-		taskEngine.SetRole(roleMaster)
+		te.SetRole(roleMaster)
 	}
-	_ = taskEngine.RecoverOrphans()
+	_ = te.RecoverOrphans()
 
 	// ============ 循环（10）============
 
 	// 看门狗：60s 一致性检查（漂移/恢复+小时级心跳——一致轮不逐轮记录）
 	watchdogAdminURLValue = watchdogAdminURL
-	mustRegisterTask(taskEngine, taskengine.Descriptor{
+	mustRegisterTask(te, taskengine.Descriptor{
 		ID:          "config-watchdog",
 		Family:      "system",
 		Name:        "配置漂移看门狗",
@@ -187,7 +229,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 
 	// 运行日志清理：每日
 	logFile := runtimeLogFile
-	mustRegisterTask(taskEngine, taskengine.Descriptor{
+	mustRegisterTask(te, taskengine.Descriptor{
 		ID:          "log-cleanup",
 		Family:      "system",
 		Name:        "日志清理与轮转",
@@ -210,7 +252,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		},
 	})
 
-	mustRegisterTask(taskEngine, taskengine.Descriptor{
+	mustRegisterTask(te, taskengine.Descriptor{
 		ID:          "audit-retention",
 		Family:      "system",
 		Name:        "审计日志保留清理",
@@ -232,7 +274,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		},
 	})
 
-	mustRegisterTask(taskEngine, taskengine.Descriptor{
+	mustRegisterTask(te, taskengine.Descriptor{
 		ID:          "security-events-retention",
 		Family:      "system",
 		Name:        "安全事件保留清理",
@@ -255,7 +297,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		},
 	})
 
-	mustRegisterTask(taskEngine, taskengine.Descriptor{
+	mustRegisterTask(te, taskengine.Descriptor{
 		ID:          "metrics-orphan-cleanup",
 		Family:      "system",
 		Name:        "孤儿规则指标清理",
@@ -277,7 +319,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		},
 	})
 
-	mustRegisterTask(taskEngine, taskengine.Descriptor{
+	mustRegisterTask(te, taskengine.Descriptor{
 		ID: "crawlerbot-update", Family: "security", Name: "爬虫地址更新",
 		Description: "定时更新 Google/OpenAI/Bing/360 官方爬虫 IP 段（security_crawler_sources 独立源表）→ security_ip_lists 系统名单原子快照 + wafiplist .fast 预编译加速；主节点执行，从节点经集群快照同步",
 		Category:    "安全防护",
@@ -296,7 +338,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		},
 	})
 
-	mustRegisterTask(taskEngine, taskengine.Descriptor{
+	mustRegisterTask(te, taskengine.Descriptor{
 		ID: "cert-renewal-scan", Family: "certificates", Name: "证书续期扫描",
 		Description: "扫描全部证书配置的到期时间，临期证书自动入队续签；入队时唤醒 CA 等待补扫",
 		Category:    "证书", Kind: taskengine.KindPeriodic, RunsOn: taskengine.RoleMasterOnly,
@@ -304,7 +346,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Run: func(rc taskengine.RunContext) error {
 			// 长跑期间 StopTaskEngine 可能把全局置 nil；闭包内固定句柄，
 			// 收尾调用不会 nil 解引用。
-			te := taskEngine
+			te := TaskEngine()
 			result := CertRenewalScanOnce()
 			// 入队即唤醒 CA 等待补扫（默认调度关闭）。走 RearmLoop
 			// 有活唤醒——仅在确有在途任务时越过「已停止」态，不再无条件
@@ -316,7 +358,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		},
 	})
 
-	mustRegisterTask(taskEngine, taskengine.Descriptor{
+	mustRegisterTask(te, taskengine.Descriptor{
 		ID: "cert-reconcile", Family: "certificates", Name: "证书状态对账",
 		Description: "核对证书文件与数据库状态一致性，修复中断任务残留的中间态",
 		Category:    "证书", Kind: taskengine.KindPeriodic, RunsOn: taskengine.RoleMasterOnly,
@@ -324,7 +366,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Run:        func(rc taskengine.RunContext) error { return CertReconcileOnce() },
 	})
 
-	mustRegisterTask(taskEngine, taskengine.Descriptor{
+	mustRegisterTask(te, taskengine.Descriptor{
 		ID: "cert-manual-poll", Family: "certificates", Name: "手动证书到期巡检",
 		Description: "每 10 分钟检查手动上传证书的过期/临期并按日去重告警",
 		Category:    "证书", Kind: taskengine.KindPeriodic, RunsOn: taskengine.RoleMasterOnly,
@@ -333,13 +375,13 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Run: func(rc taskengine.RunContext) error { return CertManualCheckOnce() },
 	})
 
-	mustRegisterTask(taskEngine, taskengine.Descriptor{
+	mustRegisterTask(te, taskengine.Descriptor{
 		ID: "cert-waiting-ca", Family: "certificates", Name: "CA 等待补扫",
 		Description: "证书任务在途时的兜底补扫：CA 冷却到期重排、滞留 queued 重入队、断链部署重试重建。默认调度关闭——续期扫描入队时自动开启，全部终态自动停止",
 		Category:    "证书", Kind: taskengine.KindPeriodic, RunsOn: taskengine.RoleMasterOnly,
 		IntervalFn: func() time.Duration { return 30 * time.Second },
 		Run: func(rc taskengine.RunContext) error {
-			te := taskEngine
+			te := TaskEngine()
 			if !certJobsActiveFn() {
 				// 全部终态——自动关闭调度（回到默认关闭态）。
 				// StopLoop 后复检——首查（T0）到停调度
@@ -379,7 +421,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	// ============ 常驻（3）============
 
 	// 安全事件摄取：自管理 2s 尾读循环（引擎仅管生命周期）
-	mustRegisterTask(taskEngine, taskengine.Descriptor{
+	mustRegisterTask(te, taskengine.Descriptor{
 		ID:          securityEventsIngestionTaskID,
 		Family:      "system",
 		Name:        "安全事件采集",
@@ -393,7 +435,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	// 队列+证书 worker+active 指针随调度开关/角色启停；幂等守卫吸收角色链
 	// 双调用）。RunsOn=MasterOnly：从节点禁签发——daemon 不在从节点启动
 	// （promote 经 SetRole 自动拉起），状态显示实态（从节点=空闲）。
-	mustRegisterTask(taskEngine, taskengine.Descriptor{
+	mustRegisterTask(te, taskengine.Descriptor{
 		ID:          "cert-issuance",
 		Family:      "certificates",
 		Name:        "证书签发",
@@ -403,8 +445,9 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		RunsOn:      taskengine.RoleMasterOnly,
 		Run: func(rc taskengine.RunContext) error {
 			// B 完全标准化：真实生命周期挂钩（StartACME/StopACME 语义——队列+
-			// 证书 worker+active 指针；幂等守卫吸收角色链双调用）
-			return daemonLifecycleRun(rc, certIssuanceLifecycleStart, certIssuanceLifecycleStop)
+			// 证书 worker+active 指针；幂等守卫吸收角色链双调用）。启动经导入
+			// 屏障门（导入期间延迟，结束后补启动）。
+			return daemonLifecycleRun(rc, startCertIssuanceLifecycle, stopCertIssuanceLifecycle)
 		},
 	})
 
@@ -418,7 +461,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	// RunsOn=RoleAny + RestartOnRoleFlip：两角色同启停语义（调度开关/引擎
 	// 生命周期一致）；角色翻转换代重启使 Run 分支与角色同步切换；boot/
 	// 停止/成功/失败行与 tasks/cluster-sync.log 两角色共写（各节点本地文件）。
-	mustRegisterTask(taskEngine, taskengine.Descriptor{
+	mustRegisterTask(te, taskengine.Descriptor{
 		ID:                "cluster-sync",
 		Family:            "cluster",
 		Name:              "集群同步",
@@ -432,7 +475,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 
 	// ============ 定时（5）============
 
-	mustRegisterTask(taskEngine, taskengine.Descriptor{
+	mustRegisterTask(te, taskengine.Descriptor{
 		ID: "threat", Family: "security", Name: "威胁情报库更新",
 		Description: "每日从 USTC/FireHOL/ET 三源下载恶意 IP 名单，聚合去重后写入威胁库文件并同步从节点——引用名单的安全策略据此拦截",
 		Category:    "安全防护", Kind: taskengine.KindScheduled, RunsOn: taskengine.RoleMasterOnly, Cancelable: true,
@@ -475,7 +518,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		},
 	})
 
-	mustRegisterTask(taskEngine, taskengine.Descriptor{
+	mustRegisterTask(te, taskengine.Descriptor{
 		ID: "crs", Family: "security", Name: "CRS 规则库更新",
 		Description: "检查并更新 OWASP CoreRuleSet 规则集到最新版本（保留用户 overrides），供 WAF 拦截模式消费",
 		Category:    "安全防护", Kind: taskengine.KindScheduled, RunsOn: taskengine.RoleMasterOnly, Cancelable: true,
@@ -543,7 +586,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		},
 	})
 
-	mustRegisterTask(taskEngine, taskengine.Descriptor{
+	mustRegisterTask(te, taskengine.Descriptor{
 		ID: "ip2region", Family: "security", Name: "IP2Region 地理库更新",
 		Description: "更新 IP 地理位置离线库（xdb），供 GeoIP 地域拦截与归属地展示使用",
 		Category:    "安全防护", Kind: taskengine.KindScheduled, RunsOn: taskengine.RoleMasterOnly, Cancelable: true,
@@ -604,7 +647,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		},
 	})
 
-	mustRegisterTask(taskEngine, taskengine.Descriptor{
+	mustRegisterTask(te, taskengine.Descriptor{
 		ID: "autoban", Family: "security", Name: "自动封禁",
 		Description: "按固定窗口统计 WAF 安全事件（口径可配：拦截/检测/全部），同一 IP 计数达阈值即写入「自动封禁名单」并在到期后自动解封；默认观察模式仅记录建议不封禁。计数数据源=安全事件采集提交点（仅主节点）",
 		Category:    "安全防护", Kind: taskengine.KindPeriodic, RunsOn: taskengine.RoleMasterOnly,
@@ -618,7 +661,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		},
 	})
 
-	mustRegisterTask(taskEngine, taskengine.Descriptor{
+	mustRegisterTask(te, taskengine.Descriptor{
 		ID: "auto-backup", Family: "backup", Name: "自动备份",
 		Description: "按排程把全量配置打包为 lbbak 落盘 backup 目录（含 CRS/IP2Region/威胁库数据文件），保留份数自动清理",
 		Category:    "备份", Kind: taskengine.KindScheduled, RunsOn: taskengine.RoleMasterOnly,
@@ -648,7 +691,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 
 	// ============ 触发（1）============
 
-	mustRegisterTask(taskEngine, taskengine.Descriptor{
+	mustRegisterTask(te, taskengine.Descriptor{
 		ID:          "startup:config-load",
 		Family:      "startup",
 		Name:        "系统配置载入",
@@ -697,7 +740,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		if enabled, found := taskLoopPrefs[id]; found && !enabled {
 			continue
 		}
-		taskEngine.StartLoop(id)
+		te.StartLoop(id)
 	}
 	// 首槽武装先落默认源/版本行，随后的业务开关同步才能读到全新库的
 	// 默认启用态（否则 ErrNoRows 被 fail-closed 误译为关闭并 StopLoop）。
@@ -705,17 +748,17 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	// 套用用户显式启停偏好——覆盖默认启动清单（停止态不复活；
 	// 用户主动开启的默认关闭任务恢复调度）；业务驱动任务跳过。
 	// 复用上方已读取的偏好快照，不再二次查表。
-	applyTaskLoopPrefs(taskEngine, taskLoopPrefs)
+	applyTaskLoopPrefs(te, taskLoopPrefs)
 	// 业务驱动任务启动均按业务实态对齐（唯一清单见 businessTaskDrivers）。
 	SyncBusinessTaskDrivers()
 	// BootSync 任务同步执行（startup:config-load——面板监听前完成，
 	// 替代 main.go 直调+legacy startupPhase 记录旁路）
-	taskEngine.RunBootSyncTasks()
+	te.RunBootSyncTasks()
 	// BootSync 完成后解除 tick 暂停——此前 ticker 在
 	// NewEngine 即起跑，周期/定时任务可在配置载入前执行首轮。
-	taskEngine.ResumeScheduling()
-	startRoleReconciler(taskEngine)
-	return taskEngine
+	te.ResumeScheduling()
+	startRoleReconciler(te)
+	return te
 }
 
 // startRoleReconciler 把引擎角色对账从用户可停止的 config-watchdog 中解耦
@@ -723,22 +766,50 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 // 每次 InitTaskEngine 启动一个并绑定该代引擎；全局换代或本代停止后退出。
 var roleReconcilerInterval = 60 * time.Second
 
+// roleReconcilerState 当前代对账 goroutine 的退出信号（StopTaskEngine 关停
+// 等待用；引擎代际绑定，快速重建时只登记最新一代）。
+var roleReconcilerState struct {
+	sync.Mutex
+	engine *taskengine.Engine
+	done   chan struct{}
+}
+
 func startRoleReconciler(te *taskengine.Engine) <-chan struct{} {
 	done := make(chan struct{})
+	roleReconcilerState.Lock()
+	roleReconcilerState.engine = te
+	roleReconcilerState.done = done
+	roleReconcilerState.Unlock()
 	go func() {
 		defer close(done)
 		ticker := time.NewTicker(roleReconcilerInterval)
 		defer ticker.Stop()
-		for range ticker.C {
-			// 不能每 tick 重读全局后继续运行——StopTaskEngine
-			// 置 nil 后快速 Init 会让旧 goroutine 误认新引擎而永久泄漏。
-			if TaskEngine() != te || te.IsStopped() {
+		for {
+			select {
+			case <-te.Done():
+				// 本代引擎停止完成：立即退出（不再等下一个对账周期）。
 				return
+			case <-ticker.C:
+				// 不能每 tick 重读全局后继续运行——StopTaskEngine
+				// 置 nil 后快速 Init 会让旧 goroutine 误认新引擎而永久泄漏。
+				if TaskEngine() != te || te.IsStopped() {
+					return
+				}
+				reconcileTaskEngineRoleFor(te)
 			}
-			reconcileTaskEngineRoleFor(te)
 		}
 	}()
 	return done
+}
+
+// roleReconcilerDoneFor 返回绑定到指定引擎代际的对账退出信号（无则 nil）。
+func roleReconcilerDoneFor(te *taskengine.Engine) <-chan struct{} {
+	roleReconcilerState.Lock()
+	defer roleReconcilerState.Unlock()
+	if roleReconcilerState.engine != te {
+		return nil
+	}
+	return roleReconcilerState.done
 }
 
 // businessTaskDriver 业务开关与引擎调度同步的唯一任务清单。
@@ -816,11 +887,21 @@ func clusterSyncDaemonRun(rc taskengine.RunContext) error {
 	return daemonLifecycleRun(rc, syncLifecycleStart, syncLifecycleStop)
 }
 
-// StopTaskEngine 进程退出收尾。
+// StopTaskEngine 进程退出收尾：先原子摘除全局代际（后台读取方立即看到
+// nil，不再触达正在 drain 的实例），再停引擎并等待角色对账 goroutine 退出
+// （绑定本代的 done 信号；超时仅告警——关停等待不得被后台 DB 读无限拖住）。
 func StopTaskEngine() {
-	if taskEngine != nil {
-		taskEngine.Stop()
-		taskEngine = nil
+	te := taskEnginePtr.Swap(nil)
+	if te == nil {
+		return
+	}
+	te.Stop()
+	if done := roleReconcilerDoneFor(te); done != nil {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			log.Printf("WARNING: services: 任务引擎角色对账未在关停等待期内退出（后台 goroutine 随进程回收）")
+		}
 	}
 }
 
@@ -830,6 +911,13 @@ func StopTaskEngine() {
 // 恢复。已有槽的行、开关关闭的行一律不动；不重启引擎、不动运行中 Run。
 func RearmSecurityLibrarySlots() {
 	armSecurityLibraryFirstSlots()
+	// 业务侧重排槽后清空引擎槽消费水位（显式复位入口）：导入包可能重写
+	// next_update，旧 schedDoneSlot/失败退避会继续压住新预约。
+	if te := TaskEngine(); te != nil {
+		for _, id := range []string{"threat", "crs", "ip2region", "crawlerbot-update"} {
+			te.ResetScheduleProgress(id)
+		}
+	}
 }
 
 // armSecurityLibraryFirstSlots 四个规则库首槽武装

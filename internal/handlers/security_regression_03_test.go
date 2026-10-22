@@ -238,7 +238,7 @@ func (c routedFakeConn) QueryContext(_ context.Context, query string, _ []driver
 // fakeQueryRows 是注入用的假行集：依次返回 values 中的行，之后（可选）先空转
 // failAfter 次再返回 err（模拟迭代中途失败，只有 rows.Err() 能发现）。
 
-// fakeDB returns a *sql.DB backed by routedFakeConnector and restores db.DB on cleanup.
+// fakeDB 用 routedFakeConnector 构造假库，并在 cleanup 时关闭。
 func fakeDB(t *testing.T, rowsByKind map[string]driver.Rows) {
 	t.Helper()
 	fake := sql.OpenDB(routedFakeConnector{rowsByKind: rowsByKind})

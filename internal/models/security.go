@@ -133,6 +133,10 @@ type SecurityPolicy struct {
 	// 渲染发射端跳过该策略并记 ERROR+审计——宁缺勿假（绝不以空条目集静默收窄
 	// ACL 保护面）。不参与 JSON 序列化。
 	IPRefMissing bool `json:"-"`
+	// IPWhitelistRefsNonEmpty 是摘要/列表路径的轻量判定：引用的 IP 名单中是否
+	// 有含条目的名单（只查条数，不装载条目内容）。渲染路径恒 false——那里
+	// MergedWhitelist 已携带真实合并集，判定优先走合并集。不参与 JSON 序列化。
+	IPWhitelistRefsNonEmpty bool `json:"-"`
 	// PolicyType：策略类型（单职化分组元数据，见 InferPolicyType 注释）；''
 	// 为待推断存量态（读侧各入口/backfill 归一，不得长期滞留）。
 	PolicyType string `json:"policy_type"`

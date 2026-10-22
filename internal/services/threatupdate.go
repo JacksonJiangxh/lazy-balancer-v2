@@ -190,7 +190,8 @@ func (m *ThreatUpdateManager) StartUpdate(trigger string, rc *taskengine.RunCont
 		defer close(done)
 		defer runCancel()
 		// 自建 goroutine 不被引擎 runGuarded 覆盖——未捕获 panic=整个
-		// admin 进程退出（与 ip2region/CRS 族同形护栏）。
+		// admin 进程退出（与 ip2region/CRS 族同形护栏）。正常路径由
+		// runWithContext 内部 recover 先行落定 failed 终态，此处仅兜底。
 		defer func() {
 			if r := recover(); r != nil {
 				Logf("error", "threat update: run panicked: %v\n%s", r, debug.Stack())
@@ -338,6 +339,20 @@ func (m *ThreatUpdateManager) runWithContext(runCtx context.Context, trigger str
 			RecordAuditLog(operator, "取消", "威胁情报库", detail, "")
 		default:
 			RecordAuditLog(operator, "更新", "威胁情报库", detail, "")
+		}
+	}()
+	// 函数内 recover：本 defer 注册在上方审计 defer 之后，恢复先于审计执行
+	// ——panic 轮先落定 failed 终态，审计再读取（此前 panic 时
+	// lastTaskOutcome 仍是上一轮的值，首轮为空串 → 记成「更新成功」，与引擎
+	// runGuarded 的 task_runs failed 形成双口径，且该轮无失败审计）。
+	// 外层 goroutine 的 recover 退化为兜底（defer 自身 panic 等形态）。
+	defer func() {
+		if r := recover(); r != nil {
+			Logf("error", "threat update: run panicked: %v\n%s", r, debug.Stack())
+			m.mu.Lock()
+			m.lastFinishedAt = time.Now().UTC().Format(crsTimeLayout)
+			m.lastTaskOutcome = "failed"
+			m.mu.Unlock()
 		}
 	}()
 	// 本轮四个状态字段在角色门之前初始化——旧实现 skipped
@@ -595,7 +610,7 @@ func (m *ThreatUpdateManager) updateOneSource(ctx context.Context, source threat
 	var rawHash string
 	healed := false
 	if !threatIplistMissing(source.name) && threatFastUnusable(source.name) {
-		if e, _, ok := healThreatFastFromText(source.name); ok {
+		if e, ok := healThreatFastFromText(source.name); ok {
 			// heal 的文本 sha256 不是上游原始字节哈希：留空使慢路径不写
 			// raw_hash，保留上次真实下载哈希。
 			entries, rawHash, healed = e, "", true
@@ -975,16 +990,17 @@ func threatFilesUnusable(source string) bool {
 }
 
 // healThreatFastFromText 从现有.iplist 文本重建.fast（不依赖
-// 重新下载）。返回条目与原始文本哈希，供后续快速路径判定；失败返回 false。
+// 重新下载）。返回条目；失败返回 false。不产出 raw_hash——本地文本哈希不是
+// 上游原始字节哈希，写回会让快路径永久误判（唯一调用点只取条目）。
 // 可解析率门（与下载侧 threatMinParseRatio 同源阈值）：文本大面积损坏时
 // 拒绝修复——否则「文本损坏+.fast 损坏」双故障下垃圾行入列/聚合归零后
 // 照常标 success（威胁名单静默归零）。合法行判定与下载侧同一解析器
 // （wafiplist.ParseIPEntry），非法行不入列。
-func healThreatFastFromText(source string) ([]string, string, bool) {
+func healThreatFastFromText(source string) ([]string, bool) {
 	iplistPath := filepath.Join(wafDir, fmt.Sprintf("threat-%s.iplist", source))
 	data, err := os.ReadFile(iplistPath)
 	if err != nil {
-		return nil, "", false
+		return nil, false
 	}
 	entries := make([]string, 0, 1024)
 	total := 0
@@ -998,23 +1014,22 @@ func healThreatFastFromText(source string) ([]string, string, bool) {
 	})
 	if total == 0 {
 		Logf("warn", "威胁情报库: 源 %s .iplist 为空/仅注释，拒绝以空集重建 .fast（保留上次快照）", source)
-		return nil, "", false
+		return nil, false
 	}
 	if float64(len(entries))/float64(total) < threatMinParseRatio {
 		Logf("warn", "威胁情报库: 源 %s .iplist 可解析行比例 %d/%d 低于 50%%——文本疑似损坏，拒绝重建 .fast（保留上次快照，不静默归零）", source, len(entries), total)
 		AppendThreatUpdateLog("WARN", "failed", fmt.Sprintf("源 %s .iplist 文本疑似损坏（可解析 %d/%d，低于 50%%），拒绝从文本重建 .fast", source, len(entries), total))
-		return nil, "", false
+		return nil, false
 	}
 	wafFileMu.Lock()
 	err = CompileFromIplistFile(iplistPath)
 	wafFileMu.Unlock()
 	if err != nil {
 		Logf("warn", "威胁情报库: 源 %s .fast 从文本重建失败: %v", source, err)
-		return nil, "", false
+		return nil, false
 	}
-	sum := fmt.Sprintf("%x", sha256.Sum256(data))
 	AppendThreatUpdateLog("INFO", "healed", fmt.Sprintf("源 %s .fast 缺失/损坏，已从现有文本重建（未重新下载）", source))
-	return entries, sum, true
+	return entries, true
 }
 
 // osLink 是测试 seam（镜像 crsinstall.go 的 osRename）：注入不支持硬链接

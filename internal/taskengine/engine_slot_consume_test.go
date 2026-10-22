@@ -331,9 +331,9 @@ func TestEngine_PeriodicRoleGateSkipsClosureEval(t *testing.T) {
 func TestEngine_TaskLogDirCircuitBreaker(t *testing.T) {
 	buf := captureEngineLog(t)
 
-	oldProbe := taskLogDirProbeInterval
-	taskLogDirProbeInterval = 20 * time.Millisecond
-	t.Cleanup(func() { taskLogDirProbeInterval = oldProbe })
+	oldProbe := taskLogDirProbeInterval.Load()
+	taskLogDirProbeInterval.Store(int64(20 * time.Millisecond))
+	t.Cleanup(func() { taskLogDirProbeInterval.Store(oldProbe) })
 
 	blocker := filepath.Join(t.TempDir(), "blocker")
 	if err := os.WriteFile(blocker, []byte("x"), 0644); err != nil {
@@ -380,5 +380,320 @@ func TestEngine_TerminalStatusMapsRunCancelledSentinel(t *testing.T) {
 	}
 	if got := terminalStatus(context.Background(), errors.New("x")); got != "failed" {
 		t.Fatalf("普通错误=%q, want failed", got)
+	}
+}
+
+// scheduleStateOf 读取 Scheduled 注册项的槽缓存/消费水位/退避状态（测试用）。
+func scheduleStateOf(t *testing.T, e *Engine, id string) (slot, done, retry time.Time, streak int) {
+	t.Helper()
+	e.mu.RLock()
+	r := e.regs[id]
+	e.mu.RUnlock()
+	if r == nil {
+		t.Fatalf("任务 %s 未注册", id)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.nextScheduledTime, r.schedDoneSlot, r.schedRetryAfter, r.schedFailStreak
+}
+
+// Given Scheduled 未来槽（+700ms）+ 手动触发在途轮 + 用户取消手动轮。
+// When 取消落定后 tick 继续运转。
+// Then 未来槽不被手动轮取消消费——到期后仍按预约自动投递（旧形态把未来槽
+// 写入 schedDoneSlot，水位永久压住该槽，自动更新静默停摆）。
+func TestEngine_ManualCancelKeepsFutureScheduledSlot(t *testing.T) {
+	e := newTestEngine(t)
+	futureSlot := time.Now().Add(700 * time.Millisecond)
+	firstStarted := make(chan struct{})
+	secondStarted := make(chan struct{})
+	var runs atomic.Int32
+	if err := e.Register(Descriptor{ID: "t-manual-cancel", Family: "t", Name: "手动取消未来槽", Kind: KindScheduled,
+		RunsOn: RoleMasterOnly, Cancelable: true,
+		NextSlotFn: func() time.Time { return futureSlot },
+		Run: func(rc RunContext) error {
+			if runs.Add(1) == 1 {
+				close(firstStarted)
+				<-rc.Ctx.Done()
+				return rc.Ctx.Err()
+			}
+			close(secondStarted)
+			return nil
+		}}); err != nil {
+		t.Fatal(err)
+	}
+	e.SetRole(true)
+	e.StartLoop("t-manual-cancel")
+
+	go func() { _ = e.Trigger("t-manual-cancel", "manual", "") }()
+	select {
+	case <-firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("手动触发轮未启动")
+	}
+	if !e.Cancel("t-manual-cancel") {
+		t.Fatal("在途手动轮 Cancel 应返回 true")
+	}
+	select {
+	case <-secondStarted:
+	case <-time.After(3 * time.Second):
+		_, done, _, _ := scheduleStateOf(t, e, "t-manual-cancel")
+		t.Fatalf("未来槽被手动轮取消消费（schedDoneSlot=%v），到期后未再投递", done)
+	}
+}
+
+// Given Scheduled 已到期槽的自动轮在途 + CancelHook 返回 false（取消未生效）。
+// When 调用 Cancel。
+// Then 返回 false 且槽不被消费——失败轮仍可按退避兜底重投（旧形态先消费
+// 槽再问 hook，取消失败也付出「本槽不再重投」的代价）。
+func TestEngine_CancelHookRejectionKeepsDueSlot(t *testing.T) {
+	e := newTestEngine(t)
+	pastSlot := time.Now().Add(-time.Minute)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	if err := e.Register(Descriptor{ID: "t-hook-reject", Family: "t", Name: "hook 拒绝不消费", Kind: KindScheduled,
+		RunsOn: RoleMasterOnly, Cancelable: true,
+		NextSlotFn: func() time.Time { return pastSlot },
+		CancelHook: func() bool { return false },
+		Run: func(rc RunContext) error {
+			close(started)
+			<-release
+			return nil
+		}}); err != nil {
+		t.Fatal(err)
+	}
+	e.SetRole(true)
+	e.StartLoop("t-hook-reject")
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("自动轮未启动")
+	}
+	if e.Cancel("t-hook-reject") {
+		t.Fatal("CancelHook 返回 false 时 Cancel 必须返回 false")
+	}
+	if _, done, _, _ := scheduleStateOf(t, e, "t-hook-reject"); !done.IsZero() {
+		t.Fatalf("取消未生效却消费了槽（schedDoneSlot=%v）", done)
+	}
+	close(release)
+}
+
+// Given Scheduled 未来槽（+1h）+ 手动触发轮注入失败。
+// When 执行落定 failed。
+// Then 不进退避、不写「排程槽未推进…重投」失实告警（未来槽本来不会被 tick
+// 重投；旧形态消耗 streak/5 分钟告警地板并推迟投递）。
+func TestEngine_ManualFailureOnFutureSlotSkipsBackoff(t *testing.T) {
+	e := newTestEngine(t)
+	buf := captureEngineLog(t)
+	futureSlot := time.Now().Add(time.Hour)
+	if err := e.Register(Descriptor{ID: "t-future-fail", Family: "t", Name: "未来槽失败", Kind: KindScheduled,
+		RunsOn:     RoleMasterOnly,
+		NextSlotFn: func() time.Time { return futureSlot },
+		Run:        func(RunContext) error { return errors.New("boom") }}); err != nil {
+		t.Fatal(err)
+	}
+	e.SetRole(true)
+	e.StartLoop("t-future-fail")
+	if err := e.Trigger("t-future-fail", "manual", ""); err == nil {
+		t.Fatal("注入失败的任务应返回错误")
+	}
+	waitForEngine(t, "失败终态", 2*time.Second, func() bool {
+		lr := e.LatestRun("t-future-fail")
+		return lr != nil && lr.Status == "failed"
+	})
+	_, _, retry, streak := scheduleStateOf(t, e, "t-future-fail")
+	if !retry.IsZero() || streak != 0 {
+		t.Fatalf("未来槽失败进入退避（retry=%v streak=%d）", retry, streak)
+	}
+	if strings.Contains(buf.String(), "排程槽未推进") {
+		t.Fatalf("未来槽失败不得写重投告警:\n%s", buf.String())
+	}
+}
+
+// Given RoleAny 周期任务已跑完一轮（节拍已推进）。
+// When 真实角色翻转（demote→promote，flipped=true）。
+// Then 节拍不被置零——RoleAny 不受角色门约束，翻转不得让每日任务多跑一轮。
+func TestEngine_RoleFlipKeepsRoleAnyPeriodicCadence(t *testing.T) {
+	e := newTestEngineWithOptions(t, Options{TickInterval: time.Hour})
+	var runs atomic.Int32
+	if err := e.Register(Descriptor{ID: "t-any-periodic", Family: "t", Name: "RoleAny 周期", Kind: KindPeriodic,
+		RunsOn:     RoleAny,
+		IntervalFn: func() time.Duration { return time.Hour },
+		Run:        func(RunContext) error { runs.Add(1); return nil }}); err != nil {
+		t.Fatal(err)
+	}
+	e.StartLoop("t-any-periodic")
+	e.tick()
+	waitForEngine(t, "首轮完成", 2*time.Second, func() bool { return runs.Load() == 1 })
+	e.SetRole(false)
+	e.SetRole(true)
+	e.tick()
+	time.Sleep(50 * time.Millisecond)
+	if got := runs.Load(); got != 1 {
+		t.Fatalf("角色翻转重置了 RoleAny 节拍（多跑 %d 轮）", got-1)
+	}
+}
+
+// Given 零槽 Scheduled（全局开但所有源关）。
+// When 连续 tick（未到重评地板）。
+// Then 只有首 tick + 地板到点后求值——零槽不得每 tick 读库（旧形态 ≈3 SELECT/s/任务）。
+func TestEngine_ZeroSlotEvalHonorsFloor(t *testing.T) {
+	e := newTestEngineWithOptions(t, Options{TickInterval: time.Hour})
+	shrinkSlotEvalFloor(t, 150*time.Millisecond)
+	var evals atomic.Int32
+	if err := e.Register(Descriptor{ID: "t-zero-slot", Family: "t", Name: "零槽降频", Kind: KindScheduled,
+		RunsOn:     RoleAny,
+		NextSlotFn: func() time.Time { evals.Add(1); return time.Time{} },
+		Run:        func(RunContext) error { return nil }}); err != nil {
+		t.Fatal(err)
+	}
+	e.StartLoop("t-zero-slot")
+	e.tick()
+	if got := evals.Load(); got != 1 {
+		t.Fatalf("首 tick 求值 %d 次, want 1", got)
+	}
+	e.tick()
+	if got := evals.Load(); got != 1 {
+		t.Fatalf("地板内零槽求值 %d 次, want 1（不得每 tick 读库）", got)
+	}
+	time.Sleep(200 * time.Millisecond)
+	e.tick()
+	if got := evals.Load(); got != 2 {
+		t.Fatalf("地板到点后求值累计 %d 次, want 2", got)
+	}
+}
+
+// Given 日志目录存在但不可写（0555：MkdirAll 返回 nil，写入链才暴露）。
+// When 连续写入超过阈值。
+// Then 与前两次失败 WARNING 后进入熔断（一次 ERROR），后续行静默丢弃；
+// 目录恢复后经探测补 INFO 并正常落盘（旧形态逐行 open WARNING 淹没运行日志）。
+func TestEngine_TaskLogUnwritableDirCircuitBreaker(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root 不受目录权限限制，无法构造不可写目录")
+	}
+	buf := captureEngineLog(t)
+	oldProbe := taskLogDirProbeInterval.Load()
+	taskLogDirProbeInterval.Store(int64(20 * time.Millisecond))
+	t.Cleanup(func() { taskLogDirProbeInterval.Store(oldProbe) })
+	SetTaskLogSizeBytesFn(func() int64 { return 1 << 20 })
+	t.Cleanup(func() { SetTaskLogSizeBytesFn(nil) })
+
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	oldDir := LogDir()
+	SetLogDir(dir)
+	t.Cleanup(func() { SetLogDir(oldDir) })
+
+	for range 6 {
+		taskLogAppend("t-fuse-ro", "[start] 只读目录行")
+	}
+	if n := strings.Count(buf.String(), "进入熔断"); n != 1 {
+		t.Fatalf("熔断 ERROR 行数=%d, want 1:\n%s", n, buf.String())
+	}
+	if n := strings.Count(buf.String(), "open task log"); n != taskLogWriteFailureThreshold-1 {
+		t.Fatalf("阈值内 open WARNING 行数=%d, want %d（持续失败不得逐行刷）:\n%s",
+			n, taskLogWriteFailureThreshold-1, buf.String())
+	}
+
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(30 * time.Millisecond)
+	taskLogAppend("t-fuse-ro", "[done] 恢复行")
+	if n := strings.Count(buf.String(), "恢复可写"); n != 1 {
+		t.Fatalf("恢复 INFO 行数=%d, want 1:\n%s", n, buf.String())
+	}
+	body, err := os.ReadFile(TaskLogPath("t-fuse-ro"))
+	if err != nil {
+		t.Fatalf("恢复后任务日志应落盘: %v", err)
+	}
+	if !strings.Contains(string(body), "恢复行") {
+		t.Fatalf("恢复后写入行缺失: %q", body)
+	}
+}
+
+// Given 日志尺寸阈值函数可能读库（缓存未命中，最坏占满 busy_timeout）。
+// When appendTaskLogLine 写入一行。
+// Then 阈值求值发生在「按路径日志锁」之外——持路径锁读库会串行阻塞全部
+// 任务日志写入。
+func TestEngine_TaskLogSizeThresholdReadOutsidePathLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lock-order.log")
+	var lockedDuringSize atomic.Bool
+	SetTaskLogSizeBytesFn(func() int64 {
+		lock := lockTaskLogPath(path)
+		if lock.TryLock() {
+			lock.Unlock()
+		} else {
+			lockedDuringSize.Store(true)
+		}
+		return 1 << 20
+	})
+	t.Cleanup(func() { SetTaskLogSizeBytesFn(nil) })
+
+	appendTaskLogLine(path, "line")
+	if lockedDuringSize.Load() {
+		t.Fatal("尺寸阈值在持有路径锁时求值（读库会阻塞全部任务日志写入）")
+	}
+}
+
+// Given 聚合查询连续失败（/system/tasks 5s 轮询）。
+// When 失败态不变。
+// Then 只在失败态翻转时返回打印级别——故障持续期静默，恢复补一条。
+func TestTaskOverviewFailureLogThrottling(t *testing.T) {
+	const key = "unit-test-overview"
+	reset := func() {
+		taskOverviewState.Lock()
+		delete(taskOverviewState.failed, key)
+		taskOverviewState.Unlock()
+	}
+	reset()
+	t.Cleanup(reset)
+	if got := noteTaskOverviewFailure(key, true); got != "WARNING" {
+		t.Fatalf("首次失败=%q, want WARNING", got)
+	}
+	if got := noteTaskOverviewFailure(key, true); got != "" {
+		t.Fatalf("持续失败=%q, want 空（不重复打印）", got)
+	}
+	if got := noteTaskOverviewFailure(key, false); got != "INFO" {
+		t.Fatalf("恢复=%q, want INFO", got)
+	}
+	if got := noteTaskOverviewFailure(key, false); got != "" {
+		t.Fatalf("持续健康=%q, want 空", got)
+	}
+	if got := noteTaskOverviewFailure(key, true); got != "WARNING" {
+		t.Fatalf("再次失败=%q, want WARNING", got)
+	}
+}
+
+// Given Scheduled 任务残留旧槽水位/失败退避（停摆后用户重开调度）。
+// When StartLoop 关→开。
+// Then 槽消费水位/退避/求值节拍被显式复位（旧水位不得压住新预约）。
+func TestEngine_StartLoopResetsScheduleProgress(t *testing.T) {
+	e := newTestEngineWithOptions(t, Options{TickInterval: time.Hour})
+	future := time.Now().Add(time.Hour)
+	if err := e.Register(Descriptor{ID: "t-reset", Family: "t", Name: "重开复位", Kind: KindScheduled,
+		RunsOn: RoleAny, NextSlotFn: func() time.Time { return future },
+		Run: func(RunContext) error { return nil }}); err != nil {
+		t.Fatal(err)
+	}
+	e.StartLoop("t-reset")
+	e.mu.RLock()
+	r := e.regs["t-reset"]
+	e.mu.RUnlock()
+	r.mu.Lock()
+	r.nextScheduledTime = future
+	r.schedDoneSlot = future
+	r.schedFailStreak = 3
+	r.schedRetryAfter = time.Now().Add(time.Minute)
+	r.schedSlotEvalAt = time.Now()
+	r.mu.Unlock()
+
+	e.StopLoop("t-reset")
+	e.StartLoop("t-reset")
+	slot, done, retry, streak := scheduleStateOf(t, e, "t-reset")
+	if !slot.IsZero() || !done.IsZero() || !retry.IsZero() || streak != 0 {
+		t.Fatalf("关→开未复位排程进度: slot=%v done=%v retry=%v streak=%d", slot, done, retry, streak)
 	}
 }

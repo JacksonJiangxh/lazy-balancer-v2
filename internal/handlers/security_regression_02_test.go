@@ -102,7 +102,8 @@ func TestGetSecurityOverview_aggregateIterationFailureReturns500(t *testing.T) {
 }
 
 // securityRowsErrConnector：按语句路由的假库——让批量绑定/拆分迁移的前置
-// 查询成功返回既定行，仅 security_policy_bindings 迭代「语句成功、迭代即
+// 查询成功返回既定行，仅 security_policy_bindings 的迭代「语句成功、迭代即
+// 报错」，用于钉住「迭代失败必须显式 500、不得以零绑定继续」。
 type securityRowsErrConnector struct{}
 
 func (securityRowsErrConnector) Connect(context.Context) (driver.Conn, error) {
@@ -212,8 +213,11 @@ func TestBatchBindSecurityPolicies_existingIterationFailureReturns500(t *testing
 	if recorder.Code != http.StatusInternalServerError {
 		t.Fatalf("status=%d body=%s, want 500", recorder.Code, recorder.Body.String())
 	}
-	if !strings.Contains(recorder.Body.String(), "注入的策略绑定迭代失败") {
-		t.Fatalf("body=%s, want injected iteration error surfaced", recorder.Body.String())
+	// 500 文案按安全域口径泛化（存储层错误只进服务端日志，不外泄表名/SQL
+	// 片段）：本用例的判据是「迭代失败必须 500、不得以部分绑定 200 放行」，
+	// 错误原文由 serverErrMsg 落日志。
+	if strings.Contains(recorder.Body.String(), "注入的策略绑定迭代失败") {
+		t.Fatalf("body=%s, 不得向调用方回传存储层错误原文", recorder.Body.String())
 	}
 }
 
@@ -235,7 +239,10 @@ func TestSplitSecurityPolicy_ruleIterationFailureReturns500(t *testing.T) {
 	if recorder.Code != http.StatusInternalServerError {
 		t.Fatalf("status=%d body=%s, want 500", recorder.Code, recorder.Body.String())
 	}
-	if !strings.Contains(recorder.Body.String(), "注入的策略绑定迭代失败") {
-		t.Fatalf("body=%s, want injected iteration error surfaced", recorder.Body.String())
+	// 500 文案按安全域口径泛化（存储层错误只进服务端日志，不外泄表名/SQL
+	// 片段）：本用例的判据是「迭代失败必须 500、不得以部分绑定 200 放行」，
+	// 错误原文由 serverErrMsg 落日志。
+	if strings.Contains(recorder.Body.String(), "注入的策略绑定迭代失败") {
+		t.Fatalf("body=%s, 不得向调用方回传存储层错误原文", recorder.Body.String())
 	}
 }

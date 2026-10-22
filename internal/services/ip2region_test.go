@@ -534,7 +534,6 @@ func Test_InitIP2Region_fallsBackToDistWhenLiveUnreadable(t *testing.T) {
 
 // 结构自检门：合法 xdb 通过；截断/指针越界拒绝（装载路径的前置门，
 // 坏文件不得进入绑定库的无边界切片）。
-// REDISABLED
 func TestCheckIP2RegionXDBStructure(t *testing.T) {
 	dir := t.TempDir()
 	valid := filepath.Join(dir, "valid.xdb")
