@@ -31,7 +31,11 @@ export interface VisibilityIntervalsOptions {
   onHidden?: () => void
   /** 恢复可见：间隔重启（含 immediate 补 tick）后调用——游标补偿/恢复渲染 */
   onVisible?: () => void
-  /** 测试注入；缺省惰性取全局 document/window（无 document 退化为纯间隔组） */
+  /**
+   * 测试注入；缺省惰性取全局 document/window。无 document 时只退化为「无监听」
+   * （间隔仍由注入或缺省的 window 驱动）；无 window 时（node/SSR）不启动任何
+   * 间隔——tick 不会执行，仅登记 document 监听（若注入）。
+   */
   doc?: VisibilityDocumentHost
   win?: VisibilityWindowHost
 }

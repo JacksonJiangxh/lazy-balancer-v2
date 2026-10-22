@@ -2,7 +2,10 @@
 // auth store 的 currentPage 初值共用。禁止另起字面量清单（双源漂移会让深链
 // 静默回落 dashboard）。
 
-export const PAGE_IDS = [
+import { SETTINGS_TAB_IDS } from './settingsPages.ts'
+
+// 非设置页的页面键（设置分页由 SETTINGS_TAB_IDS 派生，见下）。
+const CORE_PAGE_IDS = [
   'dashboard',
   'rules',
   'security-policies',
@@ -14,12 +17,13 @@ export const PAGE_IDS = [
   'caddy',
   'users',
   'audit-log',
-  'settings-basic',
-  'settings-cluster',
-  'settings-certificates',
-  'settings-apikeys',
-  'settings-tasks',
 ] as const
+
+// 设置分页键由单源派生：新增/改名分页只改 utils/settingsPages 一处，
+// PAGE_IDS 与 App.vue 的条件分支同步跟随（曾三处枚举，漏 App.vue 会静默落空页）。
+const SETTINGS_PAGE_IDS = SETTINGS_TAB_IDS.map((tab) => `settings-${tab}` as const)
+
+export const PAGE_IDS = [...CORE_PAGE_IDS, ...SETTINGS_PAGE_IDS] as const
 
 export type PageId = (typeof PAGE_IDS)[number]
 

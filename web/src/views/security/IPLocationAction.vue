@@ -399,7 +399,6 @@ interface RowView {
   trustDetectionLabel: string
   trustDead: boolean
   canAddTrust: boolean
-  canRemoveTrust: boolean
   canClearDeadTrust: boolean
   inLegacy: boolean
   tagType: 'danger' | 'success' | 'info' | 'warning'
@@ -480,7 +479,6 @@ const rowView = (policy: PolicyRow): RowView => {
     trustDetectionLabel: policy.trust_detection === true ? '保留检测记录（事件动作=检测）' : '直通上游（不产生安全事件）',
     trustDead: false,
     canAddTrust: false,
-    canRemoveTrust: false,
     canClearDeadTrust: false,
     inLegacy: parseIPList(policy.ip_blacklist).includes(trimmedIp.value),
     tagType: 'info',
@@ -504,7 +502,6 @@ const rowView = (policy: PolicyRow): RowView => {
   const isStage0OrMixed = policyTypeOf(policy) === 'stage0' || policyTypeOf(policy) === 'mixed'
   view.canAddTrust = isStage0OrMixed && !view.inTrust
     && !ipTrustedAnywhere.value
-  view.canRemoveTrust = view.inTrust && view.trustEnabled && view.inTrustInlineExact
   view.trustDead = view.inTrust && !view.trustEnabled
   view.canClearDeadTrust = view.trustDead && view.inTrustInlineExact
   // 信任引用命中（全类型行）：信任 refs 中包含此 IP 的非系统列表 → 可移除。
@@ -869,9 +866,6 @@ const rowActions = (row: RowView): RowAction[] => {
   }
   if (granularTrustRemove) for (const m of row.removableTrustRefLists) {
     acts.push({ key: `unt-${m.id}`, label: `从「${m.name}」移除信任`, type: 'success', run: () => { void removeFromSideRef(m, trimmedIp.value) } })
-  }
-  if (granularTrustRemove && row.canRemoveTrust) {
-    acts.push({ key: 'unt-in', label: '从内联信任移除', type: 'success', loading: isBusy(pid, 'untrust'), run: () => { void removeTrust(row.policy) } })
   }
   if (trustAllowed && row.canClearDeadTrust) {
     acts.push({ key: 'dead', label: '清除条目', type: 'success', tip: '该 IP 的信任条目存在但信任名单已关闭，可一键清除', loading: isBusy(pid, 'untrust'), run: () => { void removeTrust(row.policy) } })

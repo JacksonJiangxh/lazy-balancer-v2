@@ -14,8 +14,7 @@ import type {
   SystemMetrics,
   UpdateCurrentUserInput,
 } from '@/types'
-import { isCurrentPasswordRejection } from '@/utils/profileUpdate'
-import { isMfaCredentialRejection } from '@/utils/mfaErrors'
+import { classifyAuthFailure, createMfaGraceTracker, createMfaStepUp } from '@/utils/apiFailure'
 
 declare module 'axios' {
   interface AxiosRequestConfig {
@@ -43,37 +42,16 @@ interface RequestClient {
   delete<T = APIResponse<unknown>>(url: string, config?: AxiosRequestConfig): Promise<T>
 }
 
-// v2.1.8 MFA step-up 弹码：返回验证码或 null（取消）。
-// 并发 428 共享在途弹码 Promise（同码同结果），finally 清空供下一轮
-// step-up 重新弹窗；下方 verify-step 刷新同样只发一次。
-let mfaPending: Promise<string | null> | null = null
-// 在途 verify-step 刷新——同码重放会被后端 MFAVerifyTOTPCode 的
-// mfa_last_timestep 记录拒绝并计失败，并发等待者必须共享同一次刷新。
-let mfaStepUpRefresh: Promise<void> | null = null
-// MFA 宽限窗提示节流（60 秒一次）
-let lastMfaGraceNoticeAt = 0
-// 兜底 toast 的句柄——页面级反馈（mfaAwareSuccess）渲染同文案时关闭它，
-// 否则用户会同时看到「免验证」兜底条与「免验证+保存成功」业务条两条重复提示。
-let lastMfaGraceNotice: { close: () => void } | null = null
-
-// 最近一次宽限窗放行时间戳——showSaveResult 读取（导出 getter），
-// 距今 <3s 视为「本次保存刚经过宽限窗」，业务 toast 追加（MFA 已验证）。
-// 区分两种来源——grace（用户不知情，业务提示需说明）与 justNow
-//（弹码后重试，用户刚验证过，业务提示不加缀）。
-let mfaGraceLastAt = 0
-let mfaVerifiedJustNowAt = 0
-const wasRecentMfaGrace = (): boolean =>
-  Date.now() - mfaGraceLastAt < 3_000 && Date.now() - mfaVerifiedJustNowAt > 3_000
+// MFA step-up 与宽限窗提示的编排状态机抽到 utils/apiFailure（可在 node 下行为
+// 测试）：mfaStepUp = 弹码 + verify-step 刷新单飞；mfaGrace = 60s 节流、兜底条
+// 去重与「刚弹码验证」抑制。
+const mfaGrace = createMfaGraceTracker()
 
 // （用户裁决）：写操作成功提示的统一 MFA 装饰——宽限窗内（用户不知情）
 // 前缀「MFA 在验证窗口期，本次操作免验证，」；弹码后重试（用户刚验证）不加缀。
 // 所有写事件的成功提示都应经此助手发出。
 export const mfaAwareSuccess = (message: string): void => {
-  if (wasRecentMfaGrace()) {
-    // 同文案的兜底条已存在时关闭——最终只留这一条（兜底条的职责是覆盖无页面
-    // 反馈的静默请求；有页面反馈时它即冗余）。
-    lastMfaGraceNotice?.close()
-    lastMfaGraceNotice = null
+  if (mfaGrace.consumeGraceForSuccess(Date.now())) {
     ElMessage.success(`MFA 在验证窗口期，本次操作免验证，${message}`)
     return
   }
@@ -92,19 +70,10 @@ export const validateMfaCodeInput = (raw: string): boolean => {
 
 const validateTotpCodeInput = (raw: string): boolean => /^\d{6}$/.test(normalizeMfaCodeInput(raw))
 
-const promptMfaCode = (): Promise<string | null> => {
-  // 弹窗已在途时直接共享同一 Promise——并发 428 不再连环弹窗/被误判取消。
-  if (mfaPending) return mfaPending
-  // 新一轮弹码意味着新验证码：作废旧刷新句柄，确认后的等待者各自重试原请求。
-  mfaStepUpRefresh = null
-  mfaPending = new Promise<string | null>((resolve) => {
-    // resolve 前同步清空 mfaPending——.finally 反应排在 .then 内 resolve 之后的
-    // 微任务，「已解析未清空」窗口里新到的 428 会共享到已消耗的验证码 Promise，
-    // 进而发起第二次同码 verify-step（后端按 mfa_last_timestep 拒重放并计失败）。
-    const settle = (value: string | null): void => {
-      mfaPending = null
-      resolve(value)
-    }
+// 428 step-up 的弹窗实现。单飞/清空时序由 utils/apiFailure.createMfaStepUp 承担
+// （并发 428 共享同一 Promise；验证码消费后立刻作废，杜绝同码重放）。
+const showMfaPrompt = (): Promise<string | null> =>
+  new Promise<string | null>((resolve) => {
     // el-input-otp 自定义内容（替换原生 prompt 的普通 input）：值在 confirm 时从
     // otpCode 读取；填满 6 位自动触发 confirm（finish → handlers.confirm）。
     // message 函数在 MessageBox 渲染上下文中执行，otpCode 变更会驱动重渲染。
@@ -141,13 +110,13 @@ const promptMfaCode = (): Promise<string | null> => {
         done()
       },
     })
-      .then(() => settle(normalizeMfaCodeInput(otpCode.value)))
-      .catch(() => settle(null))
+      .then(() => resolve(normalizeMfaCodeInput(otpCode.value)))
+      .catch(() => resolve(null))
     // OTP 自动聚焦：MessageBox 的 autofocus 默认落在确认按钮，nextTick 后夺回给 OTP
     void nextTick(() => otpRef.value?.focus())
   })
-  return mfaPending
-}
+
+const mfaStepUp = createMfaStepUp(showMfaPrompt)
 
 let sessionExpiredDialogOpen = false
 // 用户指令（会话过期全站止损）：首个 401 的「会话失效」弹窗出现后、用户点击
@@ -215,17 +184,13 @@ service.interceptors.response.use(
     // 「（MFA 已验证）」；silent 请求（无页面级反馈）弹独立 info 兜底（60s 节流）。
     const mfaVerifiedAgo = response.headers?.['x-mfa-verified-seconds-ago']
     if (mfaVerifiedAgo !== undefined) {
-      mfaGraceLastAt = Date.now()
-      // 弹码验证后的自动重试不再发「免验证」兜底——用户刚输完码（与十五次
-      // 页面级反馈同口径）；且新 toast 发出前关闭上一条，避免连发重复。
-      if (response.config?.silent && Date.now() - mfaVerifiedJustNowAt > 3_000) {
-        const now = Date.now()
-        if (now - lastMfaGraceNoticeAt > 60_000) {
-          lastMfaGraceNoticeAt = now
-          lastMfaGraceNotice?.close()
-          lastMfaGraceNotice = ElMessage.info('MFA 在验证窗口期，本次操作免验证')
-        }
-      }
+      // 宽限窗放行记账：silent 请求（无页面级反馈）发一条 60s 节流的 info 兜底；
+      // 弹码后的自动重试不发（用户刚输完码），同文案兜底条去重由跟踪器负责。
+      mfaGrace.onGraceResponse(
+        !!response.config?.silent,
+        Date.now(),
+        () => ElMessage.info('MFA 在验证窗口期，本次操作免验证'),
+      )
     }
     if (res.code !== undefined && res.code !== 0 && res.code !== 200) {
       if (!response.config.silent) {
@@ -270,69 +235,64 @@ service.interceptors.response.use(
     }
     const message = backendMsg || fallback || '网络错误'
     const isLoginRequest = error.config?.url?.includes('/auth/login') || error.config?.url?.includes('/auth/ticket-login')
-    if (status === 401) {
-      // D-新2：MFA 自助端点的 401 是「凭证错误」（持有效 JWT 输错密码/验证码），
-      // 不是会话失效——直接传播后端文案，不得弹「会话失效」并强制登出。
-      // 补正：管理员重置端点 /users/:id/mfa/reset 同样以 401 返回「验证码错误」，
-      // 需同口径放行（Users.vue 的 catch 展示后端文案供重试），否则误杀会话。
-      // 只有后端明确的「当前密码错误」才豁免会话失效；同端点的
-      // token 过期/未登录 401 仍必须进入下方重新登录流程。
-      // MFA 端点同样收窄到后端文案白名单（验证码/挑战错误）——
-      // 428→verify-step 窗口内的会话过期 401 必须弹「会话失效」并重登。
-      const isSelfProfileCurrentPasswordError = isCurrentPasswordRejection(
-        error.config?.method,
-        error.config?.url,
-        status,
-        message,
-      )
-      if (isMfaCredentialRejection(error.config?.url, status, message) || isSelfProfileCurrentPasswordError) {
-        return Promise.reject(new ApiRequestError(message, status))
+    const kind = classifyAuthFailure({
+      status,
+      dataCode: error.response?.data?.code,
+      method: error.config?.method,
+      url: error.config?.url,
+      message,
+      isLoginRequest,
+      hasConfig: !!error.config,
+      mfaRetried: !!error.config?._mfaRetried,
+    })
+    // D-新2：MFA 自助端点的 401 是「凭证错误」（持有效 JWT 输错密码/验证码），
+    // 不是会话失效——直接传播后端文案，不得弹「会话失效」并强制登出。
+    // 补正：管理员重置端点 /users/:id/mfa/reset 同样以 401 返回「验证码错误」，
+    // 需同口径放行（Users.vue 的 catch 展示后端文案供重试），否则误杀会话。
+    // 只有后端明确的「当前密码错误」才豁免会话失效；同端点的 token 过期/未登录
+    // 401 仍必须进入下方重新登录流程（分类判据见 utils/apiFailure）。
+    if (kind === 'credential-rejection') {
+      return Promise.reject(new ApiRequestError(message, status))
+    }
+    if (kind === 'session-expired') {
+      const { useAuthStore } = await import('@/stores/auth')
+      const authStore = useAuthStore()
+      if (authStore.intentionalLogout || !authStore.token || !localStorage.getItem('token')) {
+        return Promise.reject(new Error(message))
       }
-      if (!isLoginRequest) {
-        const { useAuthStore } = await import('@/stores/auth')
-        const authStore = useAuthStore()
-        if (authStore.intentionalLogout || !authStore.token || !localStorage.getItem('token')) {
-          return Promise.reject(new Error(message))
-        }
-        if (!sessionExpiredDialogOpen) {
-          sessionExpiredDialogOpen = true
-          // 用户指令（会话过期全站止损）：置位后请求拦截器拒绝后续所有出站请求，
-          // 阻断弹窗等待期间轮询器的 401 刷屏；随确认后的 reload 一并消亡。
-          sessionExpiredDetected = true
-          // D-新1：confirm 的取消分支与确定行为完全相同，「取消」形同虚设且误导
-          // ——改单按钮 alert（会话已死，任何请求都会 401，刷新是唯一合理结局）。
-          ElMessageBox.alert(backendMsg || '登录已过期，请重新登录', '会话失效', {
-            confirmButtonText: '重新登录',
-            type: 'warning',
-          }).finally(() => {
-            localStorage.removeItem('token')
-            window.location.reload()
-          })
-        }
+      if (!sessionExpiredDialogOpen) {
+        sessionExpiredDialogOpen = true
+        // 用户指令（会话过期全站止损）：置位后请求拦截器拒绝后续所有出站请求，
+        // 阻断弹窗等待期间轮询器的 401 刷屏；随确认后的 reload 一并消亡。
+        sessionExpiredDetected = true
+        // D-新1：confirm 的取消分支与确定行为完全相同，「取消」形同虚设且误导
+        // ——改单按钮 alert（会话已死，任何请求都会 401，刷新是唯一合理结局）。
+        ElMessageBox.alert(backendMsg || '登录已过期，请重新登录', '会话失效', {
+          confirmButtonText: '重新登录',
+          type: 'warning',
+        }).finally(() => {
+          localStorage.removeItem('token')
+          window.location.reload()
+        })
       }
-    } else if (status === 428 && error.response?.data?.code === 428 && error.config && !error.config._mfaRetried) {
+    } else if (kind === 'step-up') {
       // v2.1.8 MFA step-up：写操作（或票据签发）需 60 秒内的 MFA 验证——
       // 全局弹码验证 → 新 JWT → 原请求自动重试一次。全站生效，页面零改动。
       try {
         const { useAuthStore } = await import('@/stores/auth')
         const authStore = useAuthStore()
-        const code = await promptMfaCode()
+        const code = await mfaStepUp.prompt()
         if (code) {
           // 并发 428 共享同一次 verify-step（同码重放会被后端 mfa_last_timestep
           // 拒绝并计入登录后验码限流——每用户 60 秒内失败 5 次后 verify-step
           // 返回 429「验证码尝试过于频繁，请稍后再试」，此处按普通错误透传后端
           // 文案、不重试原请求；仅限流不锁定，等待窗口滑动即可再试），
           // 所有等待者用刷新后的 token 各自重试原请求。
-          if (!mfaStepUpRefresh) {
-            mfaStepUpRefresh = authStore.refreshMfaStep(code).finally(() => {
-              mfaStepUpRefresh = null
-            })
-          }
-          await mfaStepUpRefresh
+          await mfaStepUp.ensureRefresh(code, (confirmationCode) => authStore.refreshMfaStep(confirmationCode))
           // （用户裁决）：验证成功不再独立 toast——用户刚输完码知道
           // 验证成功，反馈并入重试后的业务提示（宽限头会照常发出，但
-          // wasRecentMfaGrace 因 justNow 标记而不加缀）。
-          mfaVerifiedJustNowAt = Date.now()
+          // consumeGraceForSuccess 因 justNow 标记而不加缀）。
+          mfaGrace.markVerifiedJustNow(Date.now())
           error.config._mfaRetried = true
           return service.request(error.config)
         }

@@ -181,13 +181,19 @@ func TestMCPToolsListForNonAdminKeyHidesAdminGroupTools(t *testing.T) {
 	for _, tool := range payload.Result.Tools {
 		visible[tool.Name] = true
 	}
-	for _, hidden := range []string{"get_caddy_config", "preview_config", "validate_import", "update_user", "create_user"} {
+	// admin 组路由与 business 组未豁免只读白名单的写路由对非管理员恒 403，
+	// tools/list 必须同口径隐藏；business 组只读查询与读探测 POST 保留。
+	// preview_config/validate_import 虽为只读探测语义，但注册在 admin 组
+	// （adminOnly 对非管理员一律 403），故仍不可见。
+	for _, hidden := range []string{"get_caddy_config", "preview_config", "validate_import", "update_user", "create_user", "create_rule", "update_rule", "retry_cert_job", "inspect_admin_tls"} {
 		if visible[hidden] {
-			t.Errorf("non-admin tools/list exposes admin-only tool %s", hidden)
+			t.Errorf("non-admin tools/list exposes tool %s（调用恒 403）", hidden)
 		}
 	}
-	if !visible["list_rules"] || !visible["create_rule"] {
-		t.Fatalf("non-admin tools/list must keep business-group tools: %v", visible)
+	for _, callable := range []string{"list_rules", "get_config", "parse_certificate"} {
+		if !visible[callable] {
+			t.Errorf("non-admin tools/list hides callable tool %s: %v", callable, visible)
+		}
 	}
 }
 

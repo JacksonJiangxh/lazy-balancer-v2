@@ -2,6 +2,13 @@
 // 库值唯一真相：写侧/迁移负责落库默认值，展示层只解释「0=自动」这类显式语义。
 
 /**
+ * 证书自动重签天数默认值：与后端 db.DefaultCertRenewalDays 同源（跨栈钉见
+ * configValues.spec）。`/config` 未下发或下发 ≤0 时前端按此展示——CertJobs 的
+ * 「自动重签时间」列直接由它推导，两侧漂移会让整列日期偏移 N 天。
+ */
+export const DEFAULT_CERT_RENEWAL_DAYS = 30
+
+/**
  * 安全事件保留天数展示值：0=自动（后端内置默认 90 天，见 db.DefaultSecurityEventsRetentionDays），
  * 其余正数原样展示。此前 BasicSettings 内联 `d > 0 ? d : 90` 属第二份实现。
  */
@@ -17,6 +24,17 @@ export function displaySecurityEventsRetentionDays(value: number | null | undefi
  */
 export function displaySecurityEventsRowCap(value: number | null | undefined): number {
   return value !== null && value !== undefined && value > 0 ? value : 1_000_000
+}
+
+/**
+ * 威胁大屏视觉模式展示值：库值仅 'globe' 有效，其余（含缺失/未知）按 'map'
+ * 展示。原三处各自 `=== 'globe' ? 'globe' : 'map'`（设置父模型、基础设置
+ * 响应式回填、大屏 /config 读取）属第二/三份实现。
+ */
+export type ThreatScreenMode = 'map' | 'globe'
+
+export function displayThreatScreenMode(value: string | null | undefined): ThreatScreenMode {
+  return value === 'globe' ? 'globe' : 'map'
 }
 
 /**

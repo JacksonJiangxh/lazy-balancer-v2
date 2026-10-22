@@ -407,7 +407,7 @@ func TestAPIDocRoutes_documentationContracts(t *testing.T) {
 	// read_only 是「对只读 Key 可用」的能力语义，与
 	// method==GET 不等价——描述必须点名 export_config 例外与读探测 POST，
 	// 并逐工具钉死分类（弱子串断言曾把相反语义钉住）。
-	for _, fragment := range []string{"read_only", "只读 API Key", "export_config"} {
+	for _, fragment := range []string{"read_only", "只读 API Key", "export_config", "get_caddy_config"} {
 		if !strings.Contains(tools, fragment) {
 			t.Errorf("GET /mcp/tools description lacks %q: %q", fragment, tools)
 		}
@@ -427,7 +427,9 @@ func TestAPIDocRoutes_documentationContracts(t *testing.T) {
 		t.Fatal("ListToolSpecs returned no tools")
 	}
 	for _, spec := range specs {
-		wantReadOnly := spec.Method == http.MethodGet && spec.Name != "export_config"
+		// export_config 与 get_caddy_config 的 handler 首行拒绝只读 Key（403），
+		// 不计入「只读可用」——read_only 是能力语义，不是 HTTP 方法语义。
+		wantReadOnly := spec.Method == http.MethodGet && spec.Name != "export_config" && spec.Name != "get_caddy_config"
 		if readOnlyProbes[spec.Name] {
 			wantReadOnly = true
 		}
@@ -435,8 +437,10 @@ func TestAPIDocRoutes_documentationContracts(t *testing.T) {
 			t.Errorf("tool %s (%s) read_only=%v, want %v（只读 Key 可用性语义）", spec.Name, spec.Method, spec.ReadOnly, wantReadOnly)
 		}
 	}
-	if config := specsReadOnly(specs, "export_config"); config != false {
-		t.Errorf("export_config read_only=%v, want false（只读 Key 不可见）", config)
+	for _, hidden := range []string{"export_config", "get_caddy_config"} {
+		if specsReadOnly(specs, hidden) {
+			t.Errorf("%s read_only=true, want false（只读 Key 调用恒 403）", hidden)
+		}
 	}
 	for name := range readOnlyProbes {
 		if !specsReadOnly(specs, name) {
@@ -1465,4 +1469,176 @@ func TestDeprecatedFields_omittedFromAPIResponses(t *testing.T) {
 			t.Errorf("GlobalConfig 零值仍下发遗留键 %s: %s", key, configJSON)
 		}
 	}
+}
+
+// 403 生成门：business/admin 两组写路由对非管理员/从节点恒 403
+// （readOnlyGuard），敏感导出 GET 同样；错误表必须登记 403（此前 6 条漏登，
+// 同类端点有的登记有的不登记）。名单判据与 middleware 同源：
+// services.IsReadOnlyWriteRoute 豁免只读语义写路由。
+func TestAPIDocRoutes_nonAdminWriteEndpointsDocument403(t *testing.T) {
+	writeMethods := map[string]bool{http.MethodPost: true, http.MethodPut: true, http.MethodPatch: true, http.MethodDelete: true}
+	// 与写操作同敏感级的导出 GET（handler/guard 对非管理员或只读 Key 拒绝）。
+	sensitiveExportGets := map[string]bool{
+		"GET /config/export":            true,
+		"GET /auto-backup/:id/download": true,
+		"GET /caddy/config":             true,
+	}
+	// 非管理员合法可达的写路由：认证自助（MFA/登出/个人资料/本人密钥）。
+	// 公开与机器接口由 security 判据排除（无 JWT 角色语义）。
+	selfService := map[string]bool{
+		"POST /auth/logout":             true,
+		"POST /auth/mfa/setup":          true,
+		"POST /auth/mfa/activate":       true,
+		"POST /auth/mfa/disable":        true,
+		"POST /auth/mfa/recovery-codes": true,
+		"POST /auth/mfa/verify-step":    true,
+		"PATCH /users/me":               true,
+		"POST /users/me/api-keys":       true,
+		"PATCH /users/me/api-keys/:id":  true,
+		"DELETE /users/me/api-keys/:id": true,
+	}
+	checked := 0
+	for _, route := range apiDocRoutes {
+		key := route.Method + " " + route.Path
+		if !writeMethods[route.Method] && !sensitiveExportGets[key] {
+			continue
+		}
+		if apiDocContractFor(route).security != "" || selfService[key] {
+			continue
+		}
+		if services.IsReadOnlyWriteRoute(route.Method, "/api/v1"+route.Path) {
+			continue
+		}
+		checked++
+		if !containsRouteError(route.Errors, "403") {
+			t.Errorf("%s errors=%v, want 403（非管理员/从节点恒 403）", key, route.Errors)
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no write routes checked——403 生成门比对形态失效")
+	}
+}
+
+// 策略列表过滤能力必须进契约：enabled 三态与 rule_caddy_id（IP 归属地弹窗）
+// 是真实 query 参数，漏登记时生成 SDK/脚本发现不了。
+func TestAPIDocRoutes_securityPoliciesDocumentFilterQueries(t *testing.T) {
+	contract, ok := apiDocContracts["GET /security/policies"]
+	if !ok {
+		t.Fatal("apiDocContracts missing GET /security/policies")
+	}
+	names := map[string]bool{}
+	for _, parameter := range contract.queryParameters {
+		names[parameter.name] = true
+	}
+	for _, want := range []string{"enabled", "rule_caddy_id"} {
+		if !names[want] {
+			t.Errorf("GET /security/policies queryParameters=%v, want %q", names, want)
+		}
+	}
+	if description := routesEntry(t, "GET /security/policies").Description; !strings.Contains(description, "enabled") || !strings.Contains(description, "rule_caddy_id") {
+		t.Errorf("GET /security/policies description 未说明过滤参数: %q", description)
+	}
+
+	var document struct {
+		Paths map[string]map[string]struct {
+			Parameters []struct {
+				Name string `yaml:"name"`
+				In   string `yaml:"in"`
+			} `yaml:"parameters"`
+		} `yaml:"paths"`
+	}
+	if err := yaml.Unmarshal([]byte(buildOpenAPIYAML()), &document); err != nil {
+		t.Fatalf("parse generated OpenAPI YAML: %v", err)
+	}
+	got := map[string]bool{}
+	for _, parameter := range document.Paths["/security/policies"]["get"].Parameters {
+		if parameter.In == "query" {
+			got[parameter.Name] = true
+		}
+	}
+	for _, want := range []string{"enabled", "rule_caddy_id"} {
+		if !got[want] {
+			t.Errorf("OpenAPI GET /security/policies 缺 query 参数 %q（现有 %v）", want, got)
+		}
+	}
+}
+
+// 分页语义单一口径（非整数 400 / 越界钳到上限）必须与实现同文；深翻页显式
+// 拒绝是审计日志端点的独立策略，同样必须写明。
+func TestAPIDocRoutes_paginationSemanticsDocumented(t *testing.T) {
+	for _, key := range []string{"GET /security/events", "GET /certificates/jobs", "GET /audit-logs"} {
+		description := routesEntry(t, key).Description
+		if !strings.Contains(description, "钳") {
+			t.Errorf("%s description 未说明越界钳位语义: %q", key, description)
+		}
+		if !strings.Contains(description, "400") {
+			t.Errorf("%s description 未说明非法分页参数 400: %q", key, description)
+		}
+	}
+	if description := routesEntry(t, "GET /audit-logs").Description; !strings.Contains(description, "page>500") {
+		t.Errorf("GET /audit-logs description 未说明深翻页 400 策略: %q", description)
+	}
+}
+
+// 同码多形态不得丢弃后续语义：PUT /users/:id/status 的 400 同时是
+// invalid_request 与 cannot_disable_self，生成规格必须合并两条描述。
+func TestBuildOpenAPIYAML_mergesSameStatusErrorSemantics(t *testing.T) {
+	var document struct {
+		Paths map[string]map[string]struct {
+			Responses map[string]struct {
+				Description string `yaml:"description"`
+			} `yaml:"responses"`
+		} `yaml:"paths"`
+	}
+	if err := yaml.Unmarshal([]byte(buildOpenAPIYAML()), &document); err != nil {
+		t.Fatalf("parse generated OpenAPI YAML: %v", err)
+	}
+	description := document.Paths["/users/{id}/status"]["put"].Responses["400"].Description
+	if !strings.Contains(description, "invalid_request") || !strings.Contains(description, "cannot_disable_self") {
+		t.Errorf("PUT /users/:id/status 400 description=%q, want 合并 invalid_request 与 cannot_disable_self", description)
+	}
+}
+
+// docDataArray 取示例信封 data 数组的首元素（数组载荷端点）。
+func docDataArray(t *testing.T, key string) map[string]any {
+	t.Helper()
+	route := routesEntry(t, key)
+	var envelope struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(route.Response), &envelope); err != nil {
+		t.Fatalf("%s 文档示例必须是 data 数组 JSON: %v", key, err)
+	}
+	if len(envelope.Data) == 0 {
+		t.Fatalf("%s 文档示例 data 数组为空", key)
+	}
+	return envelope.Data[0]
+}
+
+// 决策相关响应键必须出现在文档示例（扩面：users/cluster nodes/策略族/规则库/
+// 系统信息）——消费者（含 MCP Agent 生成的脚本）据此发现 MFA 状态、爬虫豁免、
+// 缺库降级等能力面。
+func TestAPIDocs_decisionKeyExamplesMatchImplementation(t *testing.T) {
+	assertStructKeysDocumented(t, "GET /users", mapKeysOf(docDataArray(t, "GET /users")), models.UserResponse{})
+
+	node := docDataArray(t, "GET /cluster/nodes")
+	assertStructKeysDocumented(t, "GET /cluster/nodes", mapKeysOf(node), models.ClusterNodeView{})
+	health, ok := node["health"].(map[string]any)
+	if !ok {
+		t.Fatalf("GET /cluster/nodes 示例缺 health 对象: %v", node)
+	}
+	assertStructKeysDocumented(t, "GET /cluster/nodes health", mapKeysOf(health), models.ClusterHealth{})
+
+	assertStructKeysDocumented(t, "GET /security/policies", mapKeysOf(docDataArray(t, "GET /security/policies")), models.SecurityPolicySummary{})
+
+	detail := docResponseExample(t, "GET /security/policies/:id")
+	policy, ok := detail["policy"].(map[string]any)
+	if !ok {
+		t.Fatalf("GET /security/policies/:id 示例缺 policy 对象: %v", detail)
+	}
+	assertStructKeysDocumented(t, "GET /security/policies/:id policy", mapKeysOf(policy), securityPolicyDetail{})
+
+	assertStructKeysDocumented(t, "GET /security/crs", mapKeysOf(docResponseExample(t, "GET /security/crs")), models.CRSInfo{})
+	assertStructKeysDocumented(t, "GET /security/ip2region", mapKeysOf(docResponseExample(t, "GET /security/ip2region")), models.IP2RegionInfo{})
+	assertStructKeysDocumented(t, "GET /system/info", mapKeysOf(docResponseExample(t, "GET /system/info")), models.SystemInfo{})
 }

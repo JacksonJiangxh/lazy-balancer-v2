@@ -13,6 +13,9 @@
     <el-alert v-else-if="enabled" type="success" :closable="false" class="mb12"
       :title="`OIDC 已启用（${displayName || 'OIDC'}）——登录页默认展示认证服务入口，本地账号可折叠进入。`" />
 
+    <!-- 只读（从节点/非管理员）时整表单禁用：footer 按钮禁用是双保险而非唯一面，
+         与 FreeCertificates/BasicSettings 的整表单 :disabled 口径一致 -->
+    <el-form :disabled="isReadOnly">
     <!-- ① 服务地址 -->
     <div class="oidc-step">
       <div class="oidc-step-badge">1</div>
@@ -94,14 +97,15 @@
         <div class="cred-row">
           <div class="cred-row__label">用户组</div>
           <div class="cred-row__field">
-            <el-input v-model="form.allowedGroups" placeholder="ops, sre（逗号分隔；留空=不限制）" clearable />
-            <div class="form-tip-line">仅这些 IdP 用户组的成员可登录（组名大小写敏感）</div>
+            <el-input v-model="form.allowedGroups" placeholder="ops, Domain Admins（逗号分隔；留空=不限制）" clearable />
+            <div class="form-tip-line">仅这些 IdP 用户组的成员可登录（组名大小写敏感；组名可含空格，仅按逗号/分号/换行分隔）</div>
           </div>
         </div>
       </div>
       <div class="form-tip-line">两项都填写时须同时满足；IdP 未返回 email/groups 声明时直接拒登（fail-visible），不会静默放行</div>
       </div>
     </div>
+    </el-form>
 
     <el-alert v-if="lastTest" :type="lastTest.ok ? 'success' : 'error'" :closable="false" class="mt8"
       :title="lastTest.ok
@@ -127,6 +131,7 @@ import DialogHeader from '@/components/DialogHeader.vue'
 import { request, ApiRequestError } from '@/utils/api'
 import { copyText } from '@/utils/copy'
 import { useAuthStore } from '@/stores/auth'
+import { formatAllowList, parseDomainAllowList, parseGroupAllowList } from '@/utils/oidcAllowList'
 import { createOidcProbeGuard, isOidcProbeFresh, oidcProbeKey } from '@/utils/oidcProbe'
 import type { OidcProbeToken, OidcProbeValues } from '@/utils/oidcProbe'
 
@@ -147,10 +152,8 @@ const form = reactive({
   allowedGroups: '',
 })
 
-// 白名单文本 ↔ 数组：输入侧同一分隔符集，输出恒为 trim 后的非空条目。
-const parseAllowList = (raw: string): string[] =>
-  raw.split(/[\s,;，、]+/).map((item) => item.trim()).filter(Boolean)
-const allowListToText = (values?: string[]): string => (values ?? []).join(', ')
+// 白名单文本 ↔ 数组：解析/格式化单源 utils/oidcAllowList（域条目含空白当分隔，
+// 用户组名保留内部空格——两侧口径有意不同，见该模块头注释）。
 const enabled = ref(false)
 const displayName = ref('')
 const hasFetchedConfig = ref(false)
@@ -228,8 +231,8 @@ const load = async () => {
       form.issuer = res.data.issuer || ''
       form.clientId = res.data.client_id || ''
       form.displayName = res.data.display_name || ''
-      form.allowedEmailDomains = allowListToText(res.data.allowed_email_domains)
-      form.allowedGroups = allowListToText(res.data.allowed_groups)
+      form.allowedEmailDomains = formatAllowList(res.data.allowed_email_domains)
+      form.allowedGroups = formatAllowList(res.data.allowed_groups)
       hasFetchedConfig.value = !!res.data.issuer
       form.clientSecret = ''
       // load 开始已推进探测世代；响应回填的字段 watcher 会再次失效旧快照。
@@ -352,8 +355,8 @@ const save = async () => {
       enabled: true,
       display_name: form.displayName,
       // 整表保存始终携带白名单（[]=清除）；缺省键语义仅用于局部 PUT（启用/暂停/删除）。
-      allowed_email_domains: parseAllowList(form.allowedEmailDomains),
-      allowed_groups: parseAllowList(form.allowedGroups),
+      allowed_email_domains: parseDomainAllowList(form.allowedEmailDomains),
+      allowed_groups: parseGroupAllowList(form.allowedGroups),
     }
     if (form.clientSecret) payload.client_secret = form.clientSecret
     await request.put('/settings/oidc', payload)

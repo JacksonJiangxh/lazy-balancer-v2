@@ -83,8 +83,11 @@ test('立即备份轮询在组件卸载后终止且不再弹结果', () => {
   const run = section(page, 'const runAutoBackupNow', '// 备份大小')
   assert.match(run, /while \(!disposed && autoBackupVisible\.value && Date\.now\(\) < deadline\)/)
   assert.match(run, /if \(disposed\) break/)
-  const afterLoop = section(run, 'if (disposed) return', 'if (completed?.status')
-  assert.match(afterLoop, /if \(disposed\) return/)
+  // 循环后的二次复查必须是**顺序**门：切片起点即断言标记属按构造恒真。
+  const guardAt = run.lastIndexOf('if (disposed) return')
+  const branchAt = run.indexOf("if (completed?.status === 'success')")
+  assert.ok(guardAt >= 0, '循环后必须二次复查 disposed')
+  assert.ok(branchAt > guardAt, '二次复查必须出现在结果提示分支之前（否则卸载后仍会弹 toast）')
 })
 
 // 取消到 0 个分类时，预览摘要/冲突必须与按钮同门：revalidateImport 早退会让

@@ -55,6 +55,16 @@ const base = (over: Partial<PolicyPayloadInput> = {}): PolicyPayloadInput => ({
   ...over,
 })
 
+test('Create 与 Update 请求结构字段集一致（同一载荷双路径消费）', () => {
+  // 前端 buildPolicyPayload 同时服务创建与编辑；后端两份结构字段集漂移
+  // （如只在 Update 增字段）时，创建路径会静默丢弃该字段。
+  const go = repoSource('internal/models/security.go')
+  const createRequest = section(go, 'type CreateSecurityPolicyRequest struct', '\n}\n')
+  const createTags = [...createRequest.matchAll(/json:"([a-z_]+)"/g)].map((match) => match[1])
+  assert.ok(createTags.length >= 28, `Create 字段解析不足: ${createTags.length}`)
+  assert.deepEqual([...createTags].sort(), [...GO_FIELD_TAGS].sort(), 'Create 与 Update 字段集漂移')
+})
+
 test('载荷字段集与后端 UpdateSecurityPolicyRequest 逐项对表', () => {
   assert.ok(GO_FIELD_TAGS.length >= 28, `后端字段解析不足: ${GO_FIELD_TAGS.length}`)
   const payloadKeys = Object.keys(buildPolicyPayload(base()))

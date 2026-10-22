@@ -462,7 +462,9 @@
             <template v-if="wizardForm.tls_source === 'acme_dns'">
               <el-form-item label="DNS 配置">
                 <el-select v-model="wizardForm.acme_config_id" placeholder="选择 DNS 提供商配置" style="width: 100%;">
-                  <el-option v-for="cfg in certConfigs" :key="cfg.id" :label="cfg.name" :value="cfg.id" />
+                  <!-- 口径与下方 CA 下拉同源：启用项 ∪ 当前值（已禁用仅回显、置 disabled
+                       不可新选；后端写侧要求 enabled=1，选禁用项保存必 400） -->
+                  <el-option v-for="cfg in wizardCertConfigOptions" :key="cfg.id" :label="referencedOptionLabel(cfg)" :value="cfg.id" :disabled="!cfg.enabled" />
                 </el-select>
                 <div v-if="certConfigsLoadError" class="form-tip-line port-warning">DNS 提供商配置加载失败（下拉为空≠未配置）——请经页面顶部横幅重试后再编辑</div>
                 <div v-else class="form-tip-line">请先在「系统设置 / 免费证书」中添加 DNS 提供商配置</div>
@@ -472,7 +474,7 @@
                   <el-option label="系统默认" :value="0" />
                   <!-- 选项=启用 ∪ 当前值（已禁用项仅回显、置 disabled 不可新选；
                        口径单源 utils/caProviderOptions） -->
-                  <el-option v-for="p in wizardCAProviderOptions" :key="p.id" :label="caProviderOptionLabel(p)" :value="p.id" :disabled="!p.enabled" />
+                  <el-option v-for="p in wizardCAProviderOptions" :key="p.id" :label="referencedOptionLabel(p)" :value="p.id" :disabled="!p.enabled" />
                 </el-select>
                 <div class="form-tip-line">选择自动签发证书使用的 CA 提供商，留空或「系统默认」将跟随全局默认设置</div>
               </el-form-item>
@@ -1257,7 +1259,7 @@ import PathRulesEditor from '@/components/rules/PathRulesEditor.vue'
 import ProxyTimeoutFields from '@/components/rules/ProxyTimeoutFields.vue'
 import { isValidHostName, validatePathRules, RULE_NUMERIC_LIMITS } from '@/utils/ruleValidation'
 import { getStrategyLabel, strategyCardsForProtocol, strategyValuesForProtocol } from '@/utils/strategyLabels'
-import { selectableCAProviders, caProviderOptionLabel } from '@/utils/caProviderOptions'
+import { selectableReferencedOptions, referencedOptionLabel } from '@/utils/caProviderOptions'
 import { popperViewportSafe } from '@/utils/popper'
 import { hostPortKey } from '@/utils/upstreamKeys'
 import { MAX_UPSTREAM_ROWS, normalizeWeights, payloadWeight, redistributeWeight, weightPercent } from '@/utils/upstreamWeights'
@@ -1804,9 +1806,11 @@ const upstreamTouched = ref<boolean[]>([])
 let nextTemporaryPathRuleId = -1
 const certConfigs = ref<CertificateConfig[]>([])
 const caProviders = ref<CAProvider[]>([])
-// 启用项 ∪ 当前选中项（存量规则指向已禁用 CA 时回显「名称（已禁用）」灰态选项，
-// 不再显示裸数字 id——原口径会让用户以为未设置而实际仍引用旧 CA）
-const wizardCAProviderOptions = computed(() => selectableCAProviders(caProviders.value, Number(wizardForm.ca_provider_id || 0)))
+// 启用项 ∪ 当前选中项（存量规则指向已禁用项时回显「名称（已禁用）」灰态选项，
+// 不再显示裸数字 id——原口径会让用户以为未设置而实际仍引用旧值）。CA 与 DNS
+// 配置两个同类下拉共用同一 helper（utils/caProviderOptions）。
+const wizardCAProviderOptions = computed(() => selectableReferencedOptions(caProviders.value, Number(wizardForm.ca_provider_id || 0)))
+const wizardCertConfigOptions = computed(() => selectableReferencedOptions(certConfigs.value, Number(wizardForm.acme_config_id || 0)))
 const healthStatus = ref<Record<string, { healthy: number; unhealthy: number; degraded: number; unknown: number; na: number; total: number; upstreams: Record<string, { healthy: boolean; unknown: boolean; dynamic?: boolean; degraded?: boolean; num_requests?: number; fails?: number }> }>>({})
 // Config viewing
 const configDialogVisible = ref(false)
@@ -2253,7 +2257,11 @@ watch(() => wizardForm.enable_active_health_check, (newVal) => {
   }
 })
 
-const adminPorts = [8000, 2019]
+// 默认部署的管理端口（面板 :8000 / Caddy admin :2019）——仅作前端即时提示。
+// 真实判据在服务端（validateRuleListenPortForSave 校验本进程面板端口 +
+// caddy_admin_url 端口 + 2019）：自定义部署（如面板 8443、admin 不落 2019）时
+// 这里可能漏拦/误拦，保存结果以服务端 400 为准（下方提示文案已声明）。
+const DEFAULT_DEPLOYMENT_ADMIN_PORTS: readonly number[] = [8000, 2019]
 const httpReservedPorts = [80, 443]
 
 const showTlsStep = computed(() => wizardForm.protocol === 'http' && wizardForm.enable_tls)
@@ -2297,7 +2305,7 @@ const portWarning = computed(() => {
   
   if (wizardForm.protocol === 'http') {
     // HTTP rules cannot use admin ports and cannot share a port with any TCP rule.
-    if (adminPorts.includes(wizardForm.listen_port)) {
+    if (DEFAULT_DEPLOYMENT_ADMIN_PORTS.includes(wizardForm.listen_port)) {
       return `端口 ${wizardForm.listen_port} 为管理端口，不可使用`
     }
     if (tcpPorts.includes(wizardForm.listen_port)) {
@@ -2308,7 +2316,7 @@ const portWarning = computed(() => {
     if (httpReservedPorts.includes(wizardForm.listen_port)) {
       return `端口 ${wizardForm.listen_port} 为 HTTP/Web 端口，TCP 规则不可使用`
     }
-    if (adminPorts.includes(wizardForm.listen_port)) {
+    if (DEFAULT_DEPLOYMENT_ADMIN_PORTS.includes(wizardForm.listen_port)) {
       return `端口 ${wizardForm.listen_port} 为管理端口，不可使用`
     }
     if (httpPorts.includes(wizardForm.listen_port) || tcpPorts.includes(wizardForm.listen_port)) {
@@ -2760,6 +2768,9 @@ const addUpstream = () => {
   const upstream = defaultUpstream(wizardForm.protocol === 'tcp' ? 'tcp' : 'http')
   upstream.weight = 0
   wizardForm.upstreams.push(upstream)
+  // touched 与行数组等长（removeUpstream 已同步 splice）：新增行按「未触达」补齐，
+  // 否则进入过上游步（touched 全 true）后新增行读 touched[i]=undefined → 空 host 不显红框。
+  while (upstreamTouched.value.length < wizardForm.upstreams.length) upstreamTouched.value.push(false)
   redistributeWeight(wizardForm.upstreams, wizardForm.upstreams.length - 1)
 }
 
@@ -3927,11 +3938,6 @@ onUnmounted(() => {
   width: 100% !important;
 }
 
-/* Override el-popover inner content */
-:deep(.el-popover__content) {
-  padding: 12px !important;
-}
-
 .upstream-item {
   display: flex !important;
   flex-direction: row !important;
@@ -3965,11 +3971,6 @@ onUnmounted(() => {
 .upstream-na {
   font-size: 11px;
   color: var(--el-text-color-secondary);
-}
-
-/* Fix cell padding issue */
-.el-popover.el-popper {
-  padding: 12px;
 }
 
 .tooltip-title {

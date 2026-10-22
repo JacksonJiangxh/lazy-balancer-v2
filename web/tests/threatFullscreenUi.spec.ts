@@ -78,10 +78,12 @@ test('正常光流空洞标记贯通到错误状态', () => {
   assert.match(flowTask, /flowError\.value = data\.gap === true/)
 })
 
-test('采集租约申请与续租失败复用光流错误横幅', () => {
+test('采集租约申请/续租失败独立横幅（不与光流失败混报）', () => {
   const page = source('src/views/security/ThreatScreen.vue')
   const acquire = member(page, 'function acquireCollector(): void')
   assert.ok(acquire.includes('.then(() => { collectorError.value = false })'))
   assert.ok(acquire.includes('.catch(() => { collectorError.value = true })'))
-  assert.ok(page.includes('v-if="flowError || attackFlowError || collectorError"'))
+  // 光流失败与采集租约失败是两个排障方向：横幅文案必须分离
+  assert.ok(page.includes('v-if="flowError || attackFlowError"'))
+  assert.match(page, /v-if="collectorError"[\s\S]{0,120}采集续租失败/)
 })

@@ -28,7 +28,8 @@ curl -s http://localhost:8000/api/v1/mcp \
 | Key 类型 | 可用工具 |
 |---|---|
 | 管理员 Key（读写） | 全部工具（以 `tools/list` 为准） |
-| 只读 Key（read_only） | GET 查询工具（export_config 除外——导出含用户/密钥哈希，与写操作同级隐藏）+ 3 个读探测 POST 工具（parse_certificate / validate_import / preview_config；证书配置测试含真实 DNS 写入、CA 提供商测试在 ZeroSSL 缺 EAB 时会写入 CA 凭据，均已移出只读豁免） |
+| 只读 Key（read_only） | GET 查询工具（export_config 与 get_caddy_config 除外——前者导出含用户/密钥哈希、后者原始 Caddy 配置可能含内联私钥，二者对只读 Key 一律 403，列表亦不展示）+ 3 个读探测 POST 工具（parse_certificate / validate_import / preview_config；证书配置测试含真实 DNS 写入、CA 提供商测试在 ZeroSSL 缺 EAB 时会写入 CA 凭据，均已移出只读豁免） |
+| 非管理员用户 Key | 仅查询类工具与上述读探测 POST；负载规则/证书配置/证书签发/集群与系统管理等写工具对该 Key 一律 403，`tools/list` 不会列出这些工具 |
 | IP 白名单 Key | 请求来源 IP 必须命中白名单（MCP 内部转发不受影响） |
 
 ## 工具分组（节选）

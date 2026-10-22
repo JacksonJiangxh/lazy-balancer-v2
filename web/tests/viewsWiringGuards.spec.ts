@@ -88,7 +88,16 @@ test('更新者名称四处复用收敛为 utils/updaterName 单源', () => {
     'src/views/security/SecurityBlockPages.vue',
     'src/views/security/SecurityPolicies.vue',
   ]) {
-    assert.ok(source(file).includes("from '@/utils/updaterName'"), `${file} 必须消费单源`)
+    const text = source(file)
+    assert.ok(text.includes("from '@/utils/updaterName'"), `${file} 必须消费单源`)
+    // 钉调用点（而非 import）：删掉调用只留 import 仍须失败
+    assert.match(
+      text,
+      /const getUpdaterName = \(userId\?: number\) => updaterName\(users\.value, userId\)/,
+      `${file} 更新者显示名必须经 utils/updaterName 求值`,
+    )
+    // 不得回退到内联「display_name || username」第二实现
+    assert.doesNotMatch(text, /const getUpdaterName = [^\n]*display_name/, `${file} 不得内联更新者兜底逻辑`)
   }
 })
 
@@ -100,7 +109,8 @@ test('日志尾轮询五处收敛为 useLogTailPolling', () => {
     'src/views/settings/BasicSettings.vue',
     'src/views/settings/CaddyGlobalSettings.vue',
   ]) {
-    assert.match(source(file), /useLogTailPolling/, `${file} 必须消费共享 composable`)
+    // 钉实际调用形态（`useLogTailPolling({`），仅在注释提及不算消费
+    assert.match(source(file), /useLogTailPolling\(\{/, `${file} 必须调用共享 composable`)
   }
   // TaskMonitor 原缺 hidden 暂停——收敛后由 composable 统一保证
   assert.match(source('src/composables/useLogTailPolling.ts'), /document\.hidden/)
@@ -482,10 +492,34 @@ test('设置页：分页初值即由页键派生，且仅消费方分页拉 /con
   assert.doesNotMatch(onMounted, /syncActiveTabFromPage\(\)\s*\n\s*fetchSettings\(\)/, '不得再无条件整取 /config')
 })
 
+test('usePollingErrorState 全部消费点同口径接线（退避门 + 立即重试重置）', () => {
+  // 4 个消费页共 5 个状态：任一页漏接 canRun 会在契约违约时继续每秒打后端；
+  // 漏接 resetBackoff 会让横幅「重试」按钮无效（退避仍在）。
+  const sites: Array<[string, string]> = [
+    ['src/views/Rules.vue', 'healthPollingError'],
+    ['src/views/Rules.vue', 'certPollingError'],
+    ['src/views/settings/CertJobs.vue', 'jobsPollingError'],
+    ['src/views/settings/ClusterSettings.vue', 'clusterPollingError'],
+    ['src/views/settings/TaskMonitor.vue', 'pollingError'],
+  ]
+  const cache = new Map<string, string>()
+  for (const [path, state] of sites) {
+    const text = cache.get(path) ?? source(path)
+    cache.set(path, text)
+    assert.match(text, new RegExp(`const ${state} = usePollingErrorState\\(\\)`), `${path} 缺 ${state} 实例`)
+    assert.match(text, new RegExp(`if \\(!${state}\\.canRun\\(\\)\\) return`), `${path} 轮询闭包缺 canRun 退避门`)
+    assert.match(text, new RegExp(`${state}\\.resetBackoff\\(\\)`), `${path} 「立即重试」未重置退避`)
+  }
+})
+
 test('用户页：OIDC 状态请求与消费面同门（非管理员不发 403 请求）', () => {
   const page = source('src/views/Users.vue')
-  const mounted = section(page, 'onMounted(', '})')
-  assert.match(mounted, /if \(authStore\.user\?\.role === 'admin'\) void fetchOIDCStatus\(\)/)
+  // 角色以 store 为响应式通道（immediate）：fetchUser 瞬时失败时角色先为
+  // undefined，一次性 onMounted 判定会永久错过补回窗口。
+  const gate = section(page, 'watch(() => authStore.user?.role,', 'onMounted(')
+  assert.match(gate, /if \(role === 'admin'\) void fetchOIDCStatus\(\)/)
+  assert.match(gate, /immediate: true/)
+  assert.doesNotMatch(section(page, 'onMounted(', '})'), /fetchOIDCStatus/, 'onMounted 不得无条件拉取（非管理员必 403）')
 })
 
 test('集群同步三分类标签单源（父级确认文案与子级开关行同表）', () => {
@@ -525,12 +559,18 @@ test('安全事件：tooltip 死条件删除，crawler 族展示词单源，旧 
 
 test('OIDC 设置卡：访问白名单字段（email 域 / 用户组）读回显与整表保存', () => {
   const page = source('src/views/settings/OIDCSettings.vue')
+  // 解析器已抽到 utils/oidcAllowList（域/组分隔口径不同，行为由 oidcAllowList.spec
+  // 覆盖）：SFC 只做接线，不得再内联第二份正则。
+  assert.match(page, /from '@\/utils\/oidcAllowList'/)
+  assert.match(page, /parseDomainAllowList/)
+  assert.match(page, /parseGroupAllowList/)
+  assert.doesNotMatch(page, /raw\.split\(\/\[\\s,;，、\]\+\//, '不得回退到 SFC 内联分隔正则')
   const load = section(page, 'const load = async', 'let probeInFlight')
-  assert.match(load, /form\.allowedEmailDomains = allowListToText\(res\.data\.allowed_email_domains\)/)
-  assert.match(load, /form\.allowedGroups = allowListToText\(res\.data\.allowed_groups\)/)
+  assert.match(load, /form\.allowedEmailDomains = formatAllowList\(res\.data\.allowed_email_domains\)/)
+  assert.match(load, /form\.allowedGroups = formatAllowList\(res\.data\.allowed_groups\)/)
   const save = section(page, 'const save = async', '\nconst ')
-  assert.match(save, /allowed_email_domains: parseAllowList\(form\.allowedEmailDomains\)/)
-  assert.match(save, /allowed_groups: parseAllowList\(form\.allowedGroups\)/)
+  assert.match(save, /allowed_email_domains: parseDomainAllowList\(form\.allowedEmailDomains\)/)
+  assert.match(save, /allowed_groups: parseGroupAllowList\(form\.allowedGroups\)/)
   // 局部 PUT（启用/暂停/删除）不得携带键——契约：缺省=不动、[]=清除
   const toggle = section(page, 'const toggleEnabled', '\nconst ')
   assert.match(toggle, /request\.put\('\/settings\/oidc', \{ enabled: on \}\)/)

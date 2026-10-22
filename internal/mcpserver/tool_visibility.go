@@ -14,8 +14,9 @@ import (
 )
 
 // apiKeyVisibility 是 tools/list 过滤所需的 Key 属主属性。
-// role 与 readOnly 由同一次解析返回——admin 组路由对非管理员恒 403，
-// 可见性必须同口径隐藏（此前只过滤只读 Key，非管理员属主的写工具全部可见）。
+// role 与 readOnly 由同一次解析返回——「非管理员恒 403」路由（admin 组全部
+// 路由 + business 组未豁免只读白名单的写路由）的可见性必须同口径隐藏
+// （此前只过滤只读 Key，非管理员属主的写工具全部可见）。
 type apiKeyVisibility struct {
 	readOnly bool
 	admin    bool
@@ -26,19 +27,24 @@ type apiKeyVisibility struct {
 
 type visibilityResolver func(apiKey string) (apiKeyVisibility, error)
 
-// adminOnlyRoutePaths 是 admin 组路由集合（"METHOD /api/v1/path"，Gin :param
-// 形态），由 middleware.SetupRouter 注册期注入（adminOnly 守卫与集合同一处
-// 产生，新增 admin 路由自动同步，无需第二份清单）。未注入时（mcpserver 单测/
-// 独立使用）不做角色过滤，等价旧行为。
-var adminOnlyRoutePaths atomic.Pointer[map[string]struct{}]
+// nonAdminForbiddenRoutePaths 是「非管理员恒 403」的 REST 路由集合
+// （"METHOD /api/v1/path"，Gin :param 形态），由 middleware.SetupRouter 注册期
+// 注入，与守卫同源派生：
+//   - admin 组全部路由（adminOnly 先于其余守卫）；
+//   - business 组写方法路由中不受只读白名单豁免者（readOnlyGuard 对非管理员
+//     恒 403，services.IsReadOnlyWriteRoute 与守卫同一事实源）。
+//
+// 未注入时（mcpserver 单测/独立使用）不做角色过滤，等价旧行为。
+var nonAdminForbiddenRoutePaths atomic.Pointer[map[string]struct{}]
 
-// SetAdminOnlyRoutes 注入 admin 组路由集合（装配期一次，拷贝隔离防调用方后续改动）。
-func SetAdminOnlyRoutes(routes map[string]struct{}) {
+// SetNonAdminForbiddenRoutes 注入「非管理员恒 403」路由集合（装配期一次，
+// 拷贝隔离防调用方后续改动）。
+func SetNonAdminForbiddenRoutes(routes map[string]struct{}) {
 	copied := make(map[string]struct{}, len(routes))
 	for key := range routes {
 		copied[key] = struct{}{}
 	}
-	adminOnlyRoutePaths.Store(&copied)
+	nonAdminForbiddenRoutePaths.Store(&copied)
 }
 
 // toolSpecsByName 是工具名 → 规格的索引（可见性过滤按名称回查能力）。
@@ -50,9 +56,10 @@ var toolSpecsByName = func() map[string]toolSpec {
 	return result
 }()
 
-// isAdminOnlyTool 报告工具指向的 REST 路由是否在 admin 组（非管理员恒 403）。
-func isAdminOnlyTool(spec toolSpec) bool {
-	routes := adminOnlyRoutePaths.Load()
+// isForbiddenForNonAdminTool 报告工具指向的 REST 路由是否对非管理员恒 403
+// （admin 组路由，或 business 组未豁免只读白名单的写路由）。
+func isForbiddenForNonAdminTool(spec toolSpec) bool {
+	routes := nonAdminForbiddenRoutePaths.Load()
 	if routes == nil || len(*routes) == 0 {
 		return false
 	}
@@ -73,12 +80,18 @@ var ReadOnlyProbeTools = map[string]struct{}{
 	"preview_config":    {},
 }
 
-// readOnlyHiddenTools 是「GET 但对只读 Key 不可见」的工具（export_config
-// 走 apiKeyReadOnlyGuard 403，只读 Key 不可见，避免呈现必然 403 的工具）。
+// readOnlyHiddenTools 是「GET 但对只读 Key 不可见」的工具。两个成员都在 handler
+// 首行显式拒绝只读 API Key（403），登记在此避免呈现必然 403 的工具：
+//   - export_config：导出含用户/密钥哈希，apiKeyReadOnlyGuard 拒绝；
+//   - get_caddy_config：GetCaddyConfig 首行对「非管理员或只读 API Key」返回
+//     403（原始运行配置可能含内联私钥）。
+//
 // 与 ReadOnlyProbeTools 同为 ListToolSpecs.read_only 元数据与
-// serveWithToolVisibility 可见性过滤的单一事实源（原仅局部于
-// filterReadOnlyTools，public 元数据与可见性过滤各自维护易漂移）。
-var readOnlyHiddenTools = map[string]struct{}{"export_config": {}}
+// serveWithToolVisibility 可见性过滤的单一事实源。
+var readOnlyHiddenTools = map[string]struct{}{
+	"export_config":    {},
+	"get_caddy_config": {},
+}
 
 // isReadOnlyTool 报告工具对只读 API Key 是否「只读可用」——GET 且非隐藏工具，
 // 或读探测 POST 白名单（ReadOnlyProbeTools）。ListToolSpecs.read_only 元数据与
@@ -131,7 +144,7 @@ func serveWithToolVisibility(writer http.ResponseWriter, request *http.Request, 
 	} else {
 		filtered, err = filterTools(recorder.body.Bytes(), func(name string) bool {
 			spec, ok := toolSpecsByName[name]
-			if !ok || isAdminOnlyTool(spec) {
+			if !ok || isForbiddenForNonAdminTool(spec) {
 				return false
 			}
 			return !visibility.readOnly || isReadOnlyTool(spec)

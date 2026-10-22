@@ -3846,11 +3846,12 @@ func geoIPCountriesEmpty(raw string) bool {
 	return len(entries) == 0
 }
 
-// parseStrictPaginationParam 严格解析分页参数（事件列表与 CRS 列表共用）：
-// 缺省或数值 <1 时沿用默认值（既有契约）；给出但非整数时按同端点时间参数的
-// 400 口径拒绝——此前 fmt.Sscanf 静默回落，调用方拼写错误完全无信号。超上限
-// 钳到 cap（防 *pageSize 溢出为负致 SQLite OFFSET 报错）。
-func parseStrictPaginationParam(c *gin.Context, name string, def, cap int) (int, bool) {
+// parsePaginationParam 是分页列表的统一解析口径（安全事件/CRS 列表、审计日志、
+// 证书任务共用）：缺省或数值 <1 时沿用默认值；给出但非整数时 400（静默回落
+// 会让调用方拼写错误完全无信号）；超上限钳到上限（防 *pageSize 溢出为负致
+// SQLite OFFSET 报错，也让「page_size 传大」有可预期结果而非退回默认值）。
+// 深翻页另有显式拒绝的端点（审计日志 page 超阈值 400），属该端点自身策略。
+func parsePaginationParam(c *gin.Context, name string, def, cap int) (int, bool) {
 	raw := strings.TrimSpace(c.Query(name))
 	if raw == "" {
 		return def, true
@@ -3874,11 +3875,11 @@ func (h *Handlers) ListSecurityEvents(c *gin.Context) {
 	// 深翻页单请求扫近千万行（秒级 CPU/IO，任意登录用户可触发且无端点级
 	// 限流）。1000 页 × 100 条 = 覆盖最近 10 万事件，足够「跳末页」交互；
 	// 更深的历史翻查走筛选/导出语义而非深 OFFSET。
-	page, ok := parseStrictPaginationParam(c, "page", 1, 1000)
+	page, ok := parsePaginationParam(c, "page", 1, 1000)
 	if !ok {
 		return
 	}
-	pageSize, ok := parseStrictPaginationParam(c, "page_size", 20, 100)
+	pageSize, ok := parsePaginationParam(c, "page_size", 20, 100)
 	if !ok {
 		return
 	}
@@ -5598,12 +5599,12 @@ func (h *Handlers) ListCRSRules(c *gin.Context) {
 	search := strings.ToLower(c.DefaultQuery("search", ""))
 	// 分页参数与事件列表共用严格解析（非整数 400）：旧实现丢弃 fmt.Sscanf
 	// 错误静默回落第 1 页/50 条，同面板两类列表对错误输入行为不一致。
-	page, ok := parseStrictPaginationParam(c, "page", 1, 100000)
+	page, ok := parsePaginationParam(c, "page", 1, 100000)
 	if !ok {
 		return
 	}
 	// 上限收紧 100→50（与默认页大小/前端单页渲染边界一致）；低于 1 回默认。
-	pageSize, ok := parseStrictPaginationParam(c, "page_size", 50, 50)
+	pageSize, ok := parsePaginationParam(c, "page_size", 50, 50)
 	if !ok {
 		return
 	}

@@ -458,3 +458,107 @@ func TestExportConfigToolDocumentsAlwaysGuidance(t *testing.T) {
 	}
 	t.Fatal("export_config tool not registered")
 }
+
+// 工具层两份契约（toolUsage 文案 vs input_schema）必须同口径：mixed 策略
+// 显式提交与跨阶段推断都被后端 400 拒绝，usage 不得宣称可显式提交。
+func TestToolUsagePolicyTypeMatchesRejection(t *testing.T) {
+	for name, usage := range toolUsage {
+		if strings.Contains(usage, "显式 mixed 须") {
+			t.Errorf("tool %s usage 仍宣称显式 mixed 可提交: %q", name, usage)
+		}
+	}
+	usage := toolUsage["create_security_policy"]
+	if !strings.Contains(usage, "mixed") || !strings.Contains(usage, "拒绝") || !strings.Contains(usage, "400") {
+		t.Errorf("create_security_policy usage 须说明 mixed 显式提交/跨阶段推断被 400 拒绝: %q", usage)
+	}
+	if strings.Contains(toolUsage["update_security_policy"], "显式 mixed 须") {
+		t.Errorf("update_security_policy usage 仍宣称显式 mixed 可提交")
+	}
+}
+
+// 策略 schema 与请求 struct 字段对称：白名单同样可引用 IP 名单
+// （models.Create/UpdateSecurityPolicyRequest 两字段对称存在）。
+func TestSecurityPolicySchemaDeclaresWhitelistRefs(t *testing.T) {
+	var shape struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+	}
+	for name, schema := range map[string]string{
+		"create": createSecurityPolicySchema,
+		"update": updateSecurityPolicySchema,
+	} {
+		if err := json.Unmarshal([]byte(schema), &shape); err != nil {
+			t.Fatalf("policy schema (%s) invalid JSON: %v", name, err)
+		}
+		for _, field := range []string{"ip_acl_list_refs", "ip_whitelist_refs"} {
+			if _, ok := shape.Properties[field]; !ok {
+				t.Errorf("policy schema (%s) lacks property %q", name, field)
+			}
+		}
+	}
+}
+
+// usage 文案不得宣称实现不存在的能力（静默失效型契约漂移）：
+// 目录 URL 不可经 update_ca_provider 修改；限流统计无时段维度。
+func TestToolUsageMatchesImplementationCapabilities(t *testing.T) {
+	caUsage := toolUsage["update_ca_provider"]
+	if strings.Contains(caUsage, "目录 URL/") || strings.HasPrefix(caUsage, "更新 CA 提供商配置（目录 URL") {
+		t.Errorf("update_ca_provider usage 宣称可改目录 URL: %q", caUsage)
+	}
+	if !strings.Contains(caUsage, "不可") && !strings.Contains(caUsage, "不在本工具契约内") {
+		t.Errorf("update_ca_provider usage 须明示目录 URL 不可修改: %q", caUsage)
+	}
+	rateUsage := toolUsage["get_rate_limit_blocks"]
+	if strings.Contains(rateUsage, "时段聚合") || strings.Contains(rateUsage, "按规则/时段") {
+		t.Errorf("get_rate_limit_blocks usage 宣称时段聚合（实现按 host 累计）: %q", rateUsage)
+	}
+	if !strings.Contains(rateUsage, "重载") {
+		t.Errorf("get_rate_limit_blocks usage 须说明重载累计口径: %q", rateUsage)
+	}
+}
+
+// 超大响应指引的「可分页性」必须从 schema 推导：声明 page/page_size 的工具
+// 才可用分页指引，仅声明过滤维度的工具（queryArgs 非空）不得落进该分支。
+func TestSchemaDeclaresPaginationFollowsSchema(t *testing.T) {
+	byName := make(map[string]toolSpec, len(tools))
+	for _, spec := range tools {
+		byName[spec.name] = spec
+	}
+	for _, name := range []string{"list_security_events", "list_audit_logs", "list_cert_jobs", "list_crs_rules"} {
+		if !schemaDeclaresPagination(byName[name]) {
+			t.Errorf("%s schema 声明了 page/page_size，判据却为 false", name)
+		}
+	}
+	for _, name := range []string{"get_metrics_history", "get_rule_metrics_history", "get_caddy_logs", "list_rules"} {
+		if schemaDeclaresPagination(byName[name]) {
+			t.Errorf("%s 无分页参数，判据却为 true", name)
+		}
+	}
+}
+
+// 超大响应指引分流以「schema 是否声明 page/page_size」为准：仅声明过滤维度
+// （queryArgs 非空）的工具不得落进「改用分页」（无可传参数）。
+func TestOversizedResponseMessageFollowsPaginationCapability(t *testing.T) {
+	filterOnly := toolSpec{
+		name:      "synthetic_filter_only",
+		method:    http.MethodGet,
+		queryArgs: []string{"filter"},
+		schema:    `{"type":"object","properties":{"filter":{"type":"string"}}}`,
+	}
+	message := oversizedResponseMessage(filterOnly)
+	if strings.Contains(message, "请改用分页或专用导出工具") || !strings.Contains(message, "无分页参数") {
+		t.Errorf("filter-only 工具 message=%q, want 无分页参数指引", message)
+	}
+	paginated := toolSpec{
+		name:      "synthetic_paginated",
+		method:    http.MethodGet,
+		queryArgs: []string{"page", "page_size"},
+		schema:    `{"type":"object","properties":{"page":{"type":"integer"},"page_size":{"type":"integer"}}}`,
+	}
+	if message := oversizedResponseMessage(paginated); !strings.Contains(message, "请改用分页或专用导出工具") {
+		t.Errorf("分页工具 message=%q, want 通用分页指引", message)
+	}
+	hinted := toolSpec{name: "get_caddy_logs", method: http.MethodGet, queryArgs: []string{"type"}, schema: caddyLogsSchema}
+	if message := oversizedResponseMessage(hinted); !strings.Contains(message, "get_rule_logs") {
+		t.Errorf("hint 工具 message=%q, want 专用指引", message)
+	}
+}

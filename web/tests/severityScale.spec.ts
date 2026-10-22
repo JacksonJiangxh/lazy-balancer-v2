@@ -26,14 +26,15 @@ test('事件列表评分着色引用同一阈值（不得回流 15/5 双口径�
   assert.doesNotMatch(column, /anomaly_score >= 5"/, '列表旧阈值不得回流')
 })
 
-test('大屏定级引用同一阈值（0 分行回退保留存量语义）', () => {
+test('大屏定级消费同一分档函数（0 分行回退保留存量语义）', () => {
   const screen = source('src/views/security/ThreatScreen.vue')
   const sevOf = section(screen, 'function sevOf(', '\nfunction sevLabel')
   const sevCode = stripComments(sevOf)
-  assert.match(sevCode, /score >= ANOMALY_SCORE_HIGH/)
-  assert.match(sevCode, /score >= ANOMALY_SCORE_MID/)
+  // 分级本体=单源函数；检测模式降级由消费方叠加（高→中、中→低）
+  assert.match(sevCode, /anomalySeverity\(score\)/)
   assert.doesNotMatch(sevCode, /score >= 12/)
   assert.doesNotMatch(sevCode, /score >= 6/)
+  assert.doesNotMatch(sevCode, /ANOMALY_SCORE_HIGH|ANOMALY_SCORE_MID/)
   // 481-484 是 HTTP 阻断状态码，不是 rule_triggered 值——死分支已删除
   assert.doesNotMatch(sevCode, /\^48\[123\]\$/)
   // 8 与 8xxxxx 保留为存量 0 分行粗粒度回退（注释注明仅存量）

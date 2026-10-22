@@ -178,18 +178,17 @@ import { ArrowDown, ArrowUp, Delete, Plus } from '@element-plus/icons-vue'
 import FieldHelpIcon from '@/components/common/FieldHelpIcon.vue'
 import type { PathRule, PathRuleUpstream } from '@/types'
 import { MAX_UPSTREAM_ROWS, normalizeWeights, redistributeWeight } from '@/utils/upstreamWeights'
-import { STATIC_RESPONSE_STATUSES, STATIC_RESPONSE_STATUS_REASONS, canonicalPathKey, pathDuplicateKey } from '@/utils/ruleValidation'
+import { STATIC_RESPONSE_STATUSES, STATIC_RESPONSE_STATUS_REASONS, canonicalPathKey, pathDuplicateKey, pathRuleError, upstreamPathRuleError } from '@/utils/ruleValidation'
 
 const pathRules = defineModel<PathRule[]>({ required: true })
 
 const rowError = (index: number): string => {
   const rule = pathRules.value[index]
   if (!rule) return ''
-  // M32：与后端/validatePathRules 同口径——前缀校验用原始串（后端 HasPrefix 在
-  // TrimSpace 之前），查重与跨类型遮蔽互查用 canonicalPathKey 归一。
-  if (rule.path !== '' && !rule.path.startsWith('/')) return '必须以 / 开头'
-  if (/[*?{}]/.test(rule.path)) return '不能包含 * ? { } 通配字符'
-  if (rule.path.trim() === '') return ''
+  // 字段级判据与整组校验单源（utils/ruleValidation.pathRuleError）：清空路径
+  // 立即在行内标红，不再等到点保存才被整组拒绝（晚失败）。
+  const fieldError = pathRuleError(rule)
+  if (fieldError) return fieldError
   const canonical = canonicalPathKey(rule.match_type, rule.path)
   const duplicateKey = pathDuplicateKey(rule.match_type, rule.path)
   // 同类型查重按后端口径（exact 不剥尾 /，/a 与 /a/ 是两条独立
@@ -286,13 +285,12 @@ const normalizeOrder = (): void => {
 }
 
 // 上游路径改写：与后端 validateRuleFeatures 同口径——非空须以 / 开头且
-// 不含空格 ? #（query/fragment 不允许）；空串=原样转发。返回空串即无错误。
+// 不含空格 ? #（query/fragment 不允许）；空串=原样转发。判据单源在
+// utils/ruleValidation.upstreamPathRuleError。返回空串即无错误。
 const upstreamError = (index: number): string => {
   const rule = pathRules.value[index]
-  if (!rule || !rule.upstream_path) return ''
-  if (!rule.upstream_path.startsWith('/')) return '必须以 / 开头'
-  if (/[\s?#]/.test(rule.upstream_path)) return '不能包含空格 ? # 字符'
-  return ''
+  if (!rule) return ''
+  return upstreamPathRuleError(rule.upstream_path ?? '') ?? ''
 }
 
 const addRule = (): void => {

@@ -67,7 +67,7 @@ const toggleTaskSchema = `{"type":"object","required":["id","enabled"],"properti
 
 // securityPolicyFieldsSchema 与 models.CreateSecurityPolicyRequest /
 // UpdateSecurityPolicyRequest 字段集同名（创建必填 name，更新全可选）。
-const securityPolicyFieldsSchema = `"name":{"type":"string","description":"策略名称"},"description":{"type":"string"},"mode":{"type":"string","enum":["off","detection","blocking","custom_only"],"description":"off=全关/detection=检测仅记录/blocking=拦截/custom_only=仅自定义规则"},"policy_type":{"type":"string","enum":["stage0","stage1","stage2","stage3"],"description":"缺省按内容自动推断；显式 mixed 拒绝（混合策略为存量兼容形态，请按阶段类型分别创建）；跨阶段内容推断为 mixed 同样 400"},"anomaly_threshold":{"type":"integer","description":"CRS 异常分阈值"},"trust_detection":{"type":"boolean","description":"仅 stage0 信任策略消费：false=直通上游零事件，true=保留检测记录"},"ip_acl_enabled":{"type":"boolean","description":"IP 访问控制开关"},"ip_acl_mode":{"type":"string","enum":["allow","deny"],"description":"IP 访问控制模式（缺省归一 deny）"},"ip_acl_list":{"type":"string","description":"内联 CIDR 数组 JSON 文本"},"ip_acl_list_refs":{"type":"string","description":"引用的 IP 地址列表 id 数组 JSON 文本"},"ip_whitelist_enabled":{"type":"boolean"},"ip_whitelist":{"type":"string","description":"IP 白名单（JSON 数组文本）"},"ip_blacklist":{"type":"string","description":"IP 黑名单（JSON 数组文本）"},"rate_limit_enabled":{"type":"boolean"},"rate_limit_rps":{"type":"integer","description":"限流请求速率（次/秒）"},"rate_limit_burst":{"type":"integer","description":"限流突发容量"},"geoip_mode":{"type":"string","description":"地域拦截模式（off=关闭）"},"geoip_countries":{"type":"string","description":"地域名单（JSON 数组文本）"},"geoip_crawler_exempt":{"type":"boolean","description":"地域拦截对已知爬虫豁免"},"geoip_crawler_engines":{"type":"string","description":"参与豁免的爬虫引擎（JSON 数组文本）"},"crs_rule_groups":{"type":"string","description":"启用的 CRS 规则组（JSON 数组文本）"},"crs_excluded_rules":{"type":"string","description":"排除的 CRS 规则 ID（JSON 数组文本）"},"custom_rules":{"type":"string","description":"自定义规则 ID 数组 JSON 文本"},"block_page_id":{"type":"integer","description":"拦截页面 ID（0=默认页）"},"block_status_code":{"type":"integer","description":"拦截状态码（0=默认 403）"},"waf_check_response":{"type":"boolean","description":"WAF 检查响应体"},"log_request_body":{"type":"boolean","description":"记录请求体（审计体积换取证）"},"enabled":{"type":"boolean"}`
+const securityPolicyFieldsSchema = `"name":{"type":"string","description":"策略名称"},"description":{"type":"string"},"mode":{"type":"string","enum":["off","detection","blocking","custom_only"],"description":"off=全关/detection=检测仅记录/blocking=拦截/custom_only=仅自定义规则"},"policy_type":{"type":"string","enum":["stage0","stage1","stage2","stage3"],"description":"缺省按内容自动推断；显式 mixed 拒绝（混合策略为存量兼容形态，请按阶段类型分别创建）；跨阶段内容推断为 mixed 同样 400"},"anomaly_threshold":{"type":"integer","description":"CRS 异常分阈值"},"trust_detection":{"type":"boolean","description":"仅 stage0 信任策略消费：false=直通上游零事件，true=保留检测记录"},"ip_acl_enabled":{"type":"boolean","description":"IP 访问控制开关"},"ip_acl_mode":{"type":"string","enum":["allow","deny"],"description":"IP 访问控制模式（缺省归一 deny）"},"ip_acl_list":{"type":"string","description":"内联 CIDR 数组 JSON 文本"},"ip_acl_list_refs":{"type":"string","description":"引用的 IP 地址列表 id 数组 JSON 文本"},"ip_whitelist_enabled":{"type":"boolean"},"ip_whitelist":{"type":"string","description":"IP 白名单（JSON 数组文本）"},"ip_whitelist_refs":{"type":"string","description":"引用的 IP 地址列表 id 数组 JSON 文本（白名单与内联 ip_whitelist 取并集）"},"ip_blacklist":{"type":"string","description":"IP 黑名单（JSON 数组文本）"},"rate_limit_enabled":{"type":"boolean"},"rate_limit_rps":{"type":"integer","description":"限流请求速率（次/秒）"},"rate_limit_burst":{"type":"integer","description":"限流突发容量"},"geoip_mode":{"type":"string","description":"地域拦截模式（off=关闭）"},"geoip_countries":{"type":"string","description":"地域名单（JSON 数组文本）"},"geoip_crawler_exempt":{"type":"boolean","description":"地域拦截对已知爬虫豁免"},"geoip_crawler_engines":{"type":"string","description":"参与豁免的爬虫引擎（JSON 数组文本）"},"crs_rule_groups":{"type":"string","description":"启用的 CRS 规则组（JSON 数组文本）"},"crs_excluded_rules":{"type":"string","description":"排除的 CRS 规则 ID（JSON 数组文本）"},"custom_rules":{"type":"string","description":"自定义规则 ID 数组 JSON 文本"},"block_page_id":{"type":"integer","description":"拦截页面 ID（0=默认页）"},"block_status_code":{"type":"integer","description":"拦截状态码（0=默认 403）"},"waf_check_response":{"type":"boolean","description":"WAF 检查响应体"},"log_request_body":{"type":"boolean","description":"记录请求体（审计体积换取证）"},"enabled":{"type":"boolean"}`
 
 var createSecurityPolicySchema = `{"type":"object","required":["name"],"properties":{` + securityPolicyFieldsSchema + `},"additionalProperties":true}`
 var updateSecurityPolicySchema = `{"type":"object","required":["id"],"properties":{"id":{"type":"integer","description":"策略 ID"},` + securityPolicyFieldsSchema + `},"additionalProperties":true}`
@@ -276,12 +276,46 @@ const InternalAuthHeader = "X-Lazy-Balancer-Internal-MCP-Auth"
 // 指引。通用「改用分页或专用导出工具」对它们是死路：既没有分页参数，也没有
 // 可直接换用的导出工具——必须给该工具真能走通的路径。
 //   - export_config：lbbak 二进制包，MCP 通道本就不支持二进制下载；
-//   - get_caddy_config：Caddy 完整 JSON，单条规则片段有 get_rule_caddy_config。
+//   - get_caddy_config：Caddy 完整 JSON，单条规则片段有 get_rule_caddy_config；
+//   - get_metrics_history / get_rule_metrics_history：可选 queryArgs 只收窄维度
+//     （rule_id/interval/range），没有 page/page_size，收敛范围靠选窗与单规则过滤；
+//   - get_caddy_logs：可选 queryArgs 只有 type，尾部日志超限只能换专用读通道。
 //
 // 新增此类工具时必须在此登记，否则会退回不可执行的通用文案。
 var noPaginationToolHints = map[string]string{
-	"export_config":    "配置过大：MCP 通道响应上限 4 MiB，请由管理员经管理面板或 REST /config/export 下载备份",
-	"get_caddy_config": "Caddy 完整配置超过 MCP 通道 4 MiB 上限：请在管理面板查看/导出，或改用 get_rule_caddy_config 按规则逐个查询",
+	"export_config":            "配置过大：MCP 通道响应上限 4 MiB，请由管理员经管理面板或 REST /config/export 下载备份",
+	"get_caddy_config":         "Caddy 完整配置超过 MCP 通道 4 MiB 上限：请在管理面板查看/导出，或改用 get_rule_caddy_config 按规则逐个查询",
+	"get_metrics_history":      "历史指标超过 MCP 通道 4 MiB 上限：本工具无分页参数——请传 rule_id 收窄到单条规则（或改用 get_rule_metrics_history 的 range 选窗），或经管理面板查看趋势",
+	"get_rule_metrics_history": "规则历史指标超过 MCP 通道 4 MiB 上限：本工具无分页参数——请缩短 range（1h/6h）后重试，或经管理面板查看趋势",
+	"get_caddy_logs":           "Caddy 日志超过 MCP 通道 4 MiB 上限：本工具无分页参数——请改用 get_rule_logs 按规则查看（尾读最近 1000 行），或经管理面板查看完整日志",
+}
+
+// schemaDeclaresPagination 报告工具的 input_schema 是否声明 page/page_size。
+// 超大响应指引按「真实分页能力」判定——queryArgs 非空不代表有分页
+// （get_caddy_logs 只有 type、get_metrics_history 只有 rule_id/interval）。
+func schemaDeclaresPagination(spec toolSpec) bool {
+	var shape struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+	}
+	if json.Unmarshal([]byte(spec.schema), &shape) != nil {
+		return false
+	}
+	_, hasPage := shape.Properties["page"]
+	_, hasPageSize := shape.Properties["page_size"]
+	return hasPage || hasPageSize
+}
+
+// oversizedResponseMessage 选择超大响应的处置指引：专用 hint 优先；其余只读工具
+// 按「schema 是否声明 page/page_size」分流——无分页能力的整份返回工具给单条查询/
+// 管理面板路径（「改用分页」对它们是死路），有分页的维持通用分页指引。
+func oversizedResponseMessage(spec toolSpec) string {
+	if hint, ok := noPaginationToolHints[spec.name]; ok {
+		return hint
+	}
+	if spec.method == http.MethodGet && !schemaDeclaresPagination(spec) {
+		return "内部 API 响应超过 4 MiB 上限；本工具无分页参数——请改用对应的单条查询工具（get_* 系列）缩小范围，或经管理面板查看/导出"
+	}
+	return "内部 API 响应超过 4 MiB 上限，请改用分页或专用导出工具"
 }
 
 // 历史 MCP 工具调用经本机回环转发到内部 REST（源地址恒为
@@ -309,8 +343,8 @@ func ClientIPFromContext(ctx context.Context) string {
 const serverInstructions = `Lazy Balancer V2 负载均衡管理接口。认证：X-API-Key 头或 Authorization: Bearer lb_sk_...，Key 需开启 MCP 功能。
 
 权限范围：
-- 只读 Key（read_only）可调用 GET 查询类工具（export_config 除外——导出含用户/密钥哈希，与写操作同级隐藏）及 3 个读探测 POST 工具（parse_certificate/validate_import/preview_config）；其余写工具（POST/PUT/DELETE）需非只读 Key
-- 写操作需要管理员权限（API Key 所属用户角色为 admin），非管理员 Key 调用写工具返回 403；tools/list 已按「read_only 轴 + admin 轴」双轴过滤——未列出的工具不是不存在，而是当前 Key 不可见/不可调用
+- 只读 Key（read_only）可调用 GET 查询类工具（export_config 与 get_caddy_config 除外——导出含用户/密钥哈希、原始 Caddy 配置可能含内联私钥，二者与写操作同级隐藏）及 3 个读探测 POST 工具（parse_certificate/validate_import/preview_config）；其余写工具（POST/PUT/DELETE）需非只读 Key
+- 写操作需要管理员权限（API Key 所属用户角色为 admin），非管理员 Key 调用写工具返回 403；tools/list 已按「read_only 轴 + admin 轴」双轴过滤——admin 轴覆盖 admin 组路由与 business 组写路由（只读探测 POST 除外），未列出的工具不是不存在，而是当前 Key 不可见/不可调用
 - 从节点上仅 /cluster/ 前缀端点可过只读门，非从节点语义的集群操作由业务层拒绝（403/400），其余变更类写工具一律 403（预览/解析/只读查询类 POST 除外）——集群运维在目标节点本身调用，不要发往主节点；所有写操作校验后即时生效（失败自动回滚），无需手动 reload
 - 配置 IP 白名单的 Key 还需来源 IP 命中白名单（白名单约束该 Key 的全部 REST 与 MCP 调用；MCP 内部转发不受白名单影响）
 
@@ -569,21 +603,9 @@ func forward(ctx context.Context, client *http.Client, baseURL, internalAuthSecr
 		return nil, fmt.Errorf("读取内部 API 响应: %w", err)
 	}
 	if len(responseBody) > maxResponseSize {
-		// 通用「分页/专用导出工具」指引只对能分页或已有专用读工具的工具成立。
-		// 无分页能力、也无替代读通道的整份导出类工具必须先给可执行指引——
-		// 对它们是死路：
-		//   - export_config：备份是 lbbak 二进制包，MCP 通道不支持二进制；
-		//   - get_caddy_config：返回 Caddy 完整 JSON，无分页参数，逐规则片段
-		//     要改用 get_rule_caddy_config。
-		message := "内部 API 响应超过 4 MiB 上限，请改用分页或专用导出工具"
-		if hint, ok := noPaginationToolHints[spec.name]; ok {
-			message = hint
-		} else if spec.method == http.MethodGet && len(spec.queryArgs) == 0 {
-			// 整份返回的只读工具没有分页参数，通用「改用分页」指引对它们
-			// 是死路——给真能走通的路径（单条查询收敛范围/管理面板）。
-			message = "内部 API 响应超过 4 MiB 上限；本工具无分页参数——请改用对应的单条查询工具（get_* 系列）缩小范围，或经管理面板查看/导出"
-		}
-		result := mcp.NewToolResultText(message)
+		// 指引选择单源在 oversizedResponseMessage（专用 hint 优先，其余按
+		// 「schema 是否声明 page/page_size」分流）。
+		result := mcp.NewToolResultText(oversizedResponseMessage(spec))
 		result.IsError = true
 		return result, nil
 	}

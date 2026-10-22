@@ -145,8 +145,11 @@ test('D 共享条目缓存：缺失才拉、并发去重、失败可重试、inv
   calls.length = 0
   await ensureSharedEntries([1, 2, 9], loader)
   assert.deepEqual(calls, [9])
-  // 写回与失效通知（缓存写入口已模块内化，测试直写缓存对象验证读取侧）
-  sharedEntriesCache[3] = ['10.0.0.3']
+  // 写回与失效通知：走生产写入口 ensureSharedEntries 再断言缓存（此前测试直接
+  // 写 sharedEntriesCache 再读同一对象，属自写自断言）
+  calls.length = 0
+  await ensureSharedEntries([3], loader)
+  assert.deepEqual(calls, [3])
   assert.deepEqual(sharedEntriesCache[3], ['10.0.0.3'])
   invalidateSharedEntriesCache()
   calls.length = 0
@@ -219,11 +222,15 @@ test('名单条目上限/备注长度与后端 securityiplists.go 同源（跨�
   // 上限此前在 SFC 硬编码两处（校验 + 文案），后端单一常量 ipListMaxEntries；
   // 备注长度后端按 rune 计（len([]rune(...)) > 100），前端按 code point 计。
   const go = repoSource('internal/handlers/securityiplists.go')
-  assert.ok(go.includes('ipListMaxEntries           = 2000'), '后端条目上限常量漂移')
+  // gofmt 对齐重排会让固定空格数假红——用 \s* 匹配
+  assert.match(go, /\bipListMaxEntries\s*=\s*2000\b/, '后端条目上限常量漂移')
   assert.ok(go.includes('len([]rune('), '备注长度后端必须按 rune 计数（与前端 code point 一致）')
   assert.equal(IP_LIST_MAX_ENTRIES, 2000)
   assert.equal(ipListRemarkMaxLength, 100)
-  // SFC 不得再出现字面量 2000（双源会漂移）
+  // SFC 不得再硬编码条目上限字面量（双源会漂移）：收窄到常量引用与两个具体形态，
+  // 避免「全页任何合法 2000（超时/注释/示例）」假红。
   const rules = source('src/views/security/SecurityRules.vue')
-  assert.doesNotMatch(rules, /\b2000\b/, 'SecurityRules 不得再硬编码 2000（统一走 IP_LIST_MAX_ENTRIES）')
+  assert.match(rules, /IP_LIST_MAX_ENTRIES/, 'SecurityRules 必须引用单源常量')
+  assert.doesNotMatch(rules, /=\s*2000\b/, 'SecurityRules 不得再硬编码 2000（统一走 IP_LIST_MAX_ENTRIES）')
+  assert.doesNotMatch(rules, /:max="2000"/, '控件上限不得写死 2000')
 })

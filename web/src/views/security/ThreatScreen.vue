@@ -59,7 +59,8 @@
           <button type="button" class="btn error-retry" @click="mountEngine">重试</button>
         </div>
         <div v-if="trafficError" class="error-banner traffic-error">流量采集不可用（Caddy admin 不可达），曲线已保留上一帧</div>
-        <div v-if="flowError || attackFlowError || collectorError" class="error-banner site-unset">光流数据加载失败，正在重试…</div>
+        <div v-if="flowError || attackFlowError" class="error-banner site-unset">光流数据加载失败，正在重试…</div>
+        <div v-if="collectorError" class="error-banner site-unset">大屏流量采集续租失败（Caddy 侧逐请求计数已中断），正在重试…</div>
         <div v-if="!siteConfigured" class="error-banner site-unset">未配置站点坐标，本站信标与攻击弹道已隐藏</div>
       </div>
     </div>
@@ -126,7 +127,7 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/></svg>
           <span class="btn-text">复位视角</span>
         </button>
-        <button type="button" class="btn" :aria-pressed="paused" :title="paused ? '继续' : '暂停'" @click="togglePause">
+        <button type="button" class="btn" :aria-pressed="paused" :title="paused ? '继续（恢复轮询与服务端流量采集）' : '暂停（同时停止服务端流量采集）'" @click="togglePause">
           <svg v-if="!paused" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>
           <svg v-else viewBox="0 0 24 24" fill="currentColor"><path d="M7 4.5v15l12-7.5Z"/></svg>
           <span class="btn-text">{{ paused ? '继续' : '暂停' }}</span>
@@ -293,7 +294,8 @@ import { createVisibilityIntervals } from '@/composables/useVisibilityIntervals'
 import { useCountUp } from '@/composables/useCountUp'
 import { formatDate } from '@/utils/date'
 import { trafficDelta, formatRecentRate, hourlyBucketLabel, type TrafficBaseline } from '@/utils/threatScreenMetrics'
-import { ANOMALY_SCORE_HIGH, ANOMALY_SCORE_MID } from '@/utils/severityScale'
+import { anomalySeverity } from '@/utils/severityScale'
+import { displayThreatScreenMode } from '@/utils/configValues'
 import { flowTimestamp, normalizeTrafficSampleN, reconstructObservedRate, stepAdaptiveSample, nextFlowCursor, planFlowEvents, FLOW_REALTIME_MAX_AGE_MS } from '@/utils/threatFlowRules'
 import type { ThreatScene, ThreatSceneOptions } from '@/utils/threatScene'
 
@@ -321,7 +323,6 @@ interface ThreatScreenStats {
   attack_type_share: { name: string; value: number }[]
   recent_rate: number
   window_start?: string
-  rollup_coverage_from?: string
   raw_coverage_from?: string
   backfill_incomplete?: boolean
   rollup_stale?: boolean
@@ -337,8 +338,6 @@ interface FeedEvent {
   action: string
   rule_name: string
   attack_type: string
-  event_type?: string
-  duration_us?: number
   rule_triggered?: string
   /** 后端 trigger_type（阶段/触发类型的权威映射，security_threat_screen.go 下发）。 */
   trigger_type?: string
@@ -628,10 +627,11 @@ function sevOf(ev: FeedEvent): Sev {
   const score = ev.anomaly_score ?? 0
   const down = (base: Sev): Sev => (ev.action !== 'blocked' && base === 'high' ? 'mid' : base)
   if (score > 0) {
-    // 检测模式整体降一级（高→中）：高门槛以上为中危，其余低危。
-    // 分档阈值单源 utils/severityScale（与事件列表评分着色同口径）。
-    if (ev.action !== 'blocked') return score >= ANOMALY_SCORE_HIGH ? 'mid' : 'low'
-    return score >= ANOMALY_SCORE_HIGH ? 'high' : score >= ANOMALY_SCORE_MID ? 'mid' : 'low'
+    // 分级本体单源 utils/severityScale（与事件列表评分着色同一函数）；检测模式
+    // 整体降一级（高→中、中→低）只在此处叠加。
+    const base = anomalySeverity(score)
+    if (ev.action === 'blocked') return base
+    return base === 'high' ? 'mid' : 'low'
   }
   const rt = ev.rule_triggered ?? ''
   // 481-484 是渲染器发射的 HTTP 阻断状态码（caddy_multi_policy/caddy 测试），
@@ -748,7 +748,7 @@ const siteConfigured = ref(false)
 async function loadServerCentroid(): Promise<void> {
   try {
     const res = await request.get<APIResponse<{ server_map_lat?: number; server_map_lon?: number; threat_screen_mode?: string; threat_traffic_sample_n?: number }>>('/config?_ts=' + Date.now(), { silent: true })
-    screenMode.value = res.data?.threat_screen_mode === 'globe' ? 'globe' : 'map'
+    screenMode.value = displayThreatScreenMode(res.data?.threat_screen_mode)
     const rawSample = res.data?.threat_traffic_sample_n ?? -1
     flowSampleN.value = normalizeTrafficSampleN(rawSample)
     // 自适应从全量起步，由事件流速率升/降档；关闭=0；全量=1。
@@ -999,6 +999,9 @@ function togglePause(): void {
     statsTask.pause()
     trafficTask.pause()
     flowTask.pause()
+    // 暂停=停服务端采集：心跳仍在（时钟要转），租约立即释放，Caddy 不再逐请求
+    // 计数——否则「暂停」只冻结画面，服务端开销照旧。
+    releaseCollector()
   } else {
     // 暂停期间可能积累大量安全事件；恢复时重新取基线，避免一次性扫描/回放。
     toastCursor = 0
@@ -1013,6 +1016,7 @@ function togglePause(): void {
     statsTask.resume()
     trafficTask.resume()
     flowTask.resume()
+    acquireCollector()
   }
   applyMapPause()
 }
@@ -1050,7 +1054,8 @@ const COLLECTOR_TTL_MS = 30000
 const COLLECTOR_HEARTBEAT_MS = 10000
 
 function acquireCollector(): void {
-  if (disposed) return
+  // 暂停期间不续租（心跳照常触发但直接返回）：租约由 togglePause/onHidden 释放。
+  if (disposed || paused.value) return
   request.post(
     '/security/overview/threat-screen/collector',
     { lease_id: collectorLeaseId, ttl_ms: COLLECTOR_TTL_MS, sample_n: activeSampleN.value }, // -1 自适应由 activeSampleN 决定

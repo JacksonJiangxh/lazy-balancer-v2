@@ -4,8 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -314,19 +314,21 @@ func (h *Handlers) GetAuditLogs(c *gin.Context) {
 		}})
 		return
 	}
-	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-	if page < 1 {
-		page = 1
+	// 分页参数统一解析（与安全事件/证书任务同口径）：非整数 400；<1 回默认；
+	// page_size 超上限钳到 100（此前静默回默认 20——传 500 只拿到 20 条且无
+	// 任何信号）。page 超阈值仍显式 400（深 OFFSET 退化，见下）。
+	page, ok := parsePaginationParam(c, "page", 1, math.MaxInt)
+	if !ok {
+		return
 	}
-	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
-	if pageSize < 1 || pageSize > 100 {
-		pageSize = 20
+	pageSize, ok := parsePaginationParam(c, "page_size", 20, 100)
+	if !ok {
+		return
 	}
 	// 深翻页折中：页码分页保留（可跳页、有总页数），但超过阈值显式 400 并给出
 	// 筛选指引——OFFSET 深页在大审计库上是秒级全表扫描，静默 clamp 会让用户
 	// 以为「翻到了第 501 页」却拿到错位结果。该 400 同时是 *pageSize 溢出的
-	// 唯一防线（page ≤500 × page_size ≤100 → offset 恒安全），因此不再需要
-	// 额外 clamp（旧 clamp 位于本门之后，永远不可达）。
+	// 唯一防线（page ≤500 × page_size ≤100 → offset 恒安全）。
 	if page > auditLogDeepPageLimit {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf(
 			"结果过多（超过 %d 页），请使用时间范围/用户/动作筛选缩小范围", auditLogDeepPageLimit)})

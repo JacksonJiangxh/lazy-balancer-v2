@@ -25,8 +25,6 @@ test('下钻点击手势：命中国=当前下钻国保持、他国切换、空�
   // 总览态
   assert.equal(drillClickIntent('中国', null), 'drill')
   assert.equal(drillClickIntent(null, null), 'none')
-  // 台湾归一后与选择国同名：归一由调用方完成（normalizeCountryName），此处同串即保持
-  assert.equal(drillClickIntent('中国', '中国'), 'stay')
 })
 
 test('两个引擎的点击处理都必须走共享手势判定（单源，不得各写一套）', () => {

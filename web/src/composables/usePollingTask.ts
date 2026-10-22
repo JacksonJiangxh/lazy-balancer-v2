@@ -18,6 +18,7 @@ export interface PollingTask {
   readonly stop: () => void
   readonly pause: () => void
   readonly resume: () => void
+  /** 诊断/测试用：生产代码零消费（pollingSignal 用例验证中止终态）。 */
   readonly isDisposed: () => boolean
 }
 

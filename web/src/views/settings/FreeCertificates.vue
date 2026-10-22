@@ -38,7 +38,7 @@
           <el-select v-model="global.default_ca_provider_id" style="width: 240px;" placeholder="请选择 CA 提供商">
             <!-- 选项=启用 ∪ 当前值（已禁用项仅回显、置 disabled 不可新选——
                  原口径下存量指向已禁用 CA 时显示裸数字 id 但校验照过，自相矛盾） -->
-            <el-option v-for="p in defaultCAProviderOptions" :key="p.id" :label="caProviderOptionLabel(p)" :value="p.id" :disabled="!p.enabled" />
+            <el-option v-for="p in defaultCAProviderOptions" :key="p.id" :label="referencedOptionLabel(p)" :value="p.id" :disabled="!p.enabled" />
           </el-select>
           <span class="form-tip-inline">系统默认使用的证书签发机构</span>
         </el-form-item>
@@ -253,7 +253,7 @@ import { Check, Connection, Document, OfficeBuilding, Plus, Postcard, Setting } 
 import CertJobs from './CertJobs.vue'
 import DialogHeader from '@/components/DialogHeader.vue'
 import { credentialFieldVisible, credentialOptionLabel, defaultCredentialsFor, type CredentialFieldMeta } from '@/utils/dnsProviderFields'
-import { selectableCAProviders, caProviderOptionLabel } from '@/utils/caProviderOptions'
+import { selectableReferencedOptions, referencedOptionLabel } from '@/utils/caProviderOptions'
 import type { APIResponse } from '@/types'
 
 // 字段可见性/选项文案由后端元数据驱动（visible_when/option_labels），
@@ -371,7 +371,7 @@ const caCreds = reactive<CAProviderCredentials>({
   eab_hmac_key: '',
 })
 
-const defaultCAProviderOptions = computed(() => selectableCAProviders(caProviders.value, global.value.default_ca_provider_id))
+const defaultCAProviderOptions = computed(() => selectableReferencedOptions(caProviders.value, global.value.default_ca_provider_id))
 
 const selectedProvider = computed(() => providers.value.find(p => p.code === form.value.dns_provider))
 const authMode = computed(() => form.value.dns_credentials['auth_mode'] || '')
@@ -480,9 +480,23 @@ const closeCADialog = (): void => {
   if (!savingCA.value) caDialogVisible.value = false
 }
 
+// CA 提供商凭证能力（后端 caproviders.go 的两种 provider）：letsencrypt
+// 不接受凭证（非空即 400）、zerossl 用 EAB。新增/导入出未知 provider 时
+// 返回 null 由保存侧报错，绝不静默写 '{}' 清空凭证。
+const caProviderCredentialsPayload = (provider: string): string | null => {
+  if (provider === 'zerossl') return stringifyCACredentials(caCreds)
+  if (provider === 'letsencrypt') return '{}'
+  return null
+}
+
 const saveCAProvider = async () => {
   // 写动作函数级守卫（弹框打开期间角色/节点模式可能变化）
   if (isReadOnly.value || savingCA.value) return
+  const credentials = caProviderCredentialsPayload(caForm.provider)
+  if (credentials === null) {
+    ElMessage.error(`未知的 CA 提供商「${caForm.provider}」——无法生成凭证载荷，请刷新页面后重试`)
+    return
+  }
 
   savingCA.value = true
   try {
@@ -493,9 +507,7 @@ const saveCAProvider = async () => {
       enabled: caForm.enabled,
       max_concurrent: caForm.max_concurrent,
       min_interval_ms: caForm.min_interval_ms,
-      credentials: caForm.provider === 'zerossl'
-        ? stringifyCACredentials(caCreds)
-        : '{}',
+      credentials,
     }
     const provider = editingCAProvider.value
     if (!provider) return
@@ -528,6 +540,14 @@ const testCAProvider = async (p: CAProvider) => {
 
 const openConfigDialog = (config?: CertConfig) => {
   if (savingConfig.value) return
+  // 依赖未就绪不得进表单：/dns-providers 失败或为空时凭证字段无法派生，
+  // 用户填完点保存只会拿到 400（等同让用户白填一屏）。
+  if (providersError.value || providers.value.length === 0) {
+    ElMessage.warning(providersError.value
+      ? 'DNS 提供商列表加载失败，请刷新页面或稍后重试'
+      : '暂无可用的 DNS 提供商，无法新建配置')
+    return
+  }
   if (config) {
     editingId.value = config.id || null
     const rawCreds = config.dns_credentials || {}

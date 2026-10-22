@@ -12,7 +12,9 @@
 export interface SessionSingleFlight {
   readonly ensure: (session: number) => Promise<void>
   readonly loadedSession: () => number | null
+  /** 诊断/测试用：生产代码零消费（用于验证「新会话已登记」的单飞语义）。 */
   readonly requestedSession: () => number | null
+  /** 诊断/测试用：生产代码零消费（加载态由 onLoadingChange 提供给 UI）。 */
   readonly isInflight: () => boolean
 }
 

@@ -18,7 +18,7 @@
       <SecurityBlockPages v-else-if="currentPage === 'security-block-pages'" />
       <SecurityOverview v-else-if="currentPage === 'security-overview'" />
       <SecurityEvents v-else-if="currentPage === 'security-events'" />
-      <Settings v-else-if="currentPage === 'settings-basic' || currentPage === 'settings-cluster' || currentPage === 'settings-certificates' || currentPage === 'settings-apikeys' || currentPage === 'settings-tasks'" />
+      <Settings v-else-if="settingsTabOfPage(currentPage) !== null" />
       <CaddyConfig v-else-if="currentPage === 'caddy'" />
       <Users v-else-if="currentPage === 'users'" />
       <AuditLog v-else-if="currentPage === 'audit-log'" />
@@ -31,6 +31,7 @@ import { ref, onMounted, computed, defineAsyncComponent } from 'vue'
 import type { AsyncComponentLoader } from 'vue'
 import { useAuthStore } from '@/stores/auth'
 import { isPageId } from '@/utils/pageIds'
+import { settingsTabOfPage } from '@/utils/settingsPages'
 import { ApiRequestError, isTokenExpired } from '@/utils/api'
 import { ElMessage } from 'element-plus'
 import zhCn from 'element-plus/es/locale/lang/zh-cn'

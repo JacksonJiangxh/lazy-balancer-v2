@@ -4,6 +4,7 @@ import type { APIResponse, ClusterNodeMode, CurrentUser, GlobalConfigData } from
 import { isTokenExpired, request, ApiRequestError } from '@/utils/api'
 import { ElMessage } from 'element-plus'
 import { isPageId, type PageId } from '@/utils/pageIds'
+import { DEFAULT_CERT_RENEWAL_DAYS } from '@/utils/configValues'
 
 const queryPage = new URLSearchParams(location.search).get('page')
 const queryPageValid: PageId | null = queryPage && isPageId(queryPage) ? queryPage : null
@@ -38,8 +39,9 @@ export const useAuthStore = defineStore('auth', () => {
   const nodeMode = ref<ClusterNodeMode | null>(null)
   const timezone = ref<string>('Asia/Shanghai')
   // cert_renewal_days 并入 /config 消费面（CertJobs 曾挂载整取单键）；
-  // ≤0（含 0）时按 30 展示，与后端口径对齐
-  const certRenewalDays = ref(30)
+  // ≤0（含 0）时按 DEFAULT_CERT_RENEWAL_DAYS 展示，与后端口径对齐
+  // （默认值单源在 utils/configValues，跨栈钉住 db.DefaultCertRenewalDays）。
+  const certRenewalDays = ref(DEFAULT_CERT_RENEWAL_DAYS)
   // 与 cert_renewal_days 同源：mfa_write_guard 随 /config 投影（Users 页曾为此
   // 单独挂载整取 GET /config 单键，与 15s 轮询的 /config 请求重复）。
   // 首值 false = 守卫关闭的保守形态（读取失败/未就绪时对话框维持验码形态）。
@@ -175,8 +177,8 @@ export const useAuthStore = defineStore('auth', () => {
       if (res.data) {
         nodeMode.value = res.data.is_master ? 'master' : 'slave'
         if (res.data.timezone) timezone.value = res.data.timezone
-        const renewalDays = res.data.cert_renewal_days ?? 30
-        certRenewalDays.value = renewalDays > 0 ? renewalDays : 30
+        const renewalDays = res.data.cert_renewal_days ?? DEFAULT_CERT_RENEWAL_DAYS
+        certRenewalDays.value = renewalDays > 0 ? renewalDays : DEFAULT_CERT_RENEWAL_DAYS
         mfaWriteGuard.value = res.data.mfa_write_guard === true
         scheduleConfigRetry()
       } else {

@@ -852,6 +852,19 @@ let fetchAllDataPromise: Promise<void> | null = null
 let isFetchingRuleHealth = false
 let rulesVersion = 0
 
+// 慢车道（15s，与规则页健康列同口径）：/rules 是全量规则 + upstreams hydrate，
+// /config/health 依赖它派生列——原随 5s 主轮询每轮拉取（3 倍频）。门户首页
+// 常驻且可多标签页叠加，这两项是无采样意义的重复负载；采样曲线类端点
+// （realtime/connections/metrics）仍 5s。
+const SLOW_LANE_INTERVAL_MS = 15000
+let lastSlowLaneAt = 0
+const slowLaneDue = (): boolean => {
+  const now = Date.now()
+  if (now - lastSlowLaneAt < SLOW_LANE_INTERVAL_MS) return false
+  lastSlowLaneAt = now
+  return true
+}
+
 const fetchAllData = (roundSignal?: AbortSignal): Promise<void> => {
   if (disposed) return Promise.resolve()
   if (fetchAllDataPromise) return fetchAllDataPromise
@@ -861,6 +874,7 @@ const fetchAllData = (roundSignal?: AbortSignal): Promise<void> => {
   // 轮询轮次传入本轮 signal（pause/stop 可取消在途请求）；手动刷新（Caddy
   // 操作后的补偿刷新）无轮次可用，回落页级永久 signal（随卸载终止）。
   const config = { signal: roundSignal ?? dashboardPolling.signal, silent: true }
+  const slowLane = slowLaneDue()
   fetchAllDataPromise = Promise.allSettled([
     request.get('/system/info', config).then((res) => {
       if (disposed) return
@@ -922,7 +936,7 @@ const fetchAllData = (roundSignal?: AbortSignal): Promise<void> => {
       // rulesUnavailable 由 /rules 自己的 then/catch 管理，避免双 setter 竞态。
       ruleMetricsUnavailable.value = buildRuleMetricsUnavailable(rules.value, undefined, false)
     }),
-    request.get('/rules', config).then(async (res) => {
+    slowLane ? request.get('/rules', config).then(async (res) => {
       if (disposed) return
       if (!res.data) {
         rulesUnavailable.value = true
@@ -941,7 +955,7 @@ const fetchAllData = (roundSignal?: AbortSignal): Promise<void> => {
       const version = ++rulesVersion
       const currentRules = rules.value
        await fetchRuleHealth(currentRules, version, roundSignal)
-     }).catch(() => { if (!disposed) rulesUnavailable.value = true }),
+     }).catch(() => { if (!disposed) rulesUnavailable.value = true }) : Promise.resolve(),
     request.get('/metrics/connections', config).then((res) => {
       if (disposed) return
       if (!res.data) {

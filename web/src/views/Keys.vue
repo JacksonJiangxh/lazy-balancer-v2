@@ -87,7 +87,7 @@
               size="small"
               :type="key.is_enabled ? 'warning' : 'success'"
               :loading="togglePendingId === key.id"
-              :disabled="nodeWriteBlocked || deletingIds.has(key.id)"
+              :disabled="nodeWriteBlocked || (togglePendingId !== null && togglePendingId !== key.id) || deletingIds.has(key.id)"
               @click="toggleKey(key)"
             >
               <el-icon><SwitchButton v-if="key.is_enabled" /><VideoPlay v-else /></el-icon>

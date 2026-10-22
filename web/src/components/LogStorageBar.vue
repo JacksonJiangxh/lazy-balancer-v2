@@ -59,16 +59,19 @@ const isEmpty = computed(() => {
 
 // 条数口径形态（安全事件：进度=条数/上限，2026-09-14 用户裁定）——即使行数
 // 读取失败也保持该形态（进度置 0 且文案标注不可用），不得滑到字节口径。
+// rows_unavailable 是后端的显式披露（行数读取失败）：即使响应里仍带着上一次
+// 的行数（后端改为「保留旧值 + flag」时），也必须按不可用呈现，不能把陈旧
+// 计数当有效值展示。
 const rowsMode = computed(() => !!info.value?.limit_rows)
-const rowsUnavailable = computed(() => rowsMode.value && info.value?.rows == null)
+const rowsUnavailable = computed(() => rowsMode.value && (info.value?.rows_unavailable === true || info.value?.rows == null))
 
 const percentage = computed(() => {
   const i = info.value
   if (!i) return 0
   // 条数上限(安全事件:进度=条数/上限,2026-09-14 用户裁定)
   if (i.limit_rows) {
-    if (i.rows == null) return 0
-    return Math.min(100, Math.round((i.rows / i.limit_rows) * 100))
+    if (rowsUnavailable.value) return 0
+    return Math.min(100, Math.round(((i.rows ?? 0) / i.limit_rows) * 100))
   }
   if (i.limit_bytes) return Math.min(100, Math.round((i.size_bytes / i.limit_bytes) * 100))
   return 0
@@ -80,9 +83,9 @@ const sizeText = computed(() => {
   const i = info.value
   if (!i) return ''
   if (i.limit_rows) {
-    const base = i.rows == null
+    const base = rowsUnavailable.value
       ? `计数暂不可用 / ${i.limit_rows.toLocaleString()} 条`
-      : `${i.rows.toLocaleString()} / ${i.limit_rows.toLocaleString()} 条`
+      : `${(i.rows ?? 0).toLocaleString()} / ${i.limit_rows.toLocaleString()} 条`
     const parts = [base]
     if (i.size_bytes > 0) parts.push(`日志 ${humanSize(i.size_bytes)}`)
     if (i.db_bytes) parts.push(`库 ${humanSize(i.db_bytes)}`)

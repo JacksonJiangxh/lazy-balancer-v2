@@ -181,10 +181,12 @@ export function arcEndpoints(
 }
 
 /** 归属地文本 → 光流起点（中国精确到省质心，其余国家质心，未知走兜底点）。
- *  地图/地球两引擎共用，避免省/国家查找与回退规则双实现漂移。 */
+ *  地图/地球两引擎共用，避免省/国家查找与回退规则双实现漂移。
+ *  国家名先经 normalizeCountryName（台湾→中国），与热力/正常光流口径一致。 */
 export function arcOriginForLocation(ipLocation: string): Centroid {
-  const { country, province } = parseIpLocation(ipLocation)
-  if (!country) return FALLBACK_CENTROID
+  const { country: rawCountry, province } = parseIpLocation(ipLocation)
+  if (!rawCountry) return FALLBACK_CENTROID
+  const country = normalizeCountryName(rawCountry)
   if (country === '中国' && province) {
     const pv = CHINA_PROVINCES.find((x) => x.short === province || x.name === province)
     if (pv) return [pv.centroid[0], pv.centroid[1]]

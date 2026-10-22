@@ -1299,3 +1299,40 @@ func TestDeleteCertJob_keepsManualCertFiles(t *testing.T) {
 		t.Fatalf("手动证书文件被任务删除误删: %v", err)
 	}
 }
+
+// 分页语义统一（与审计日志/安全事件同口径）：非整数 400；越界钳到上限
+// （旧行为越界 400）。
+func TestListCertJobs_paginationSemanticsUnified(t *testing.T) {
+	handler := newBackupTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/jobs", handler.ListCertJobs)
+	get := func(query string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/jobs?"+query, nil))
+		return recorder
+	}
+
+	recorder := get("page=1&page_size=500")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("page_size=500 status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
+	}
+	var payload struct {
+		Data struct {
+			PageSize int `json:"page_size"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload.Data.PageSize != 200 {
+		t.Errorf("page_size=500 → %d, want clamp to cap 200", payload.Data.PageSize)
+	}
+
+	if rec := get("page=abc"); rec.Code != http.StatusBadRequest {
+		t.Errorf("page=abc status=%d, want 400", rec.Code)
+	}
+	if rec := get("page_size=abc"); rec.Code != http.StatusBadRequest {
+		t.Errorf("page_size=abc status=%d, want 400", rec.Code)
+	}
+}

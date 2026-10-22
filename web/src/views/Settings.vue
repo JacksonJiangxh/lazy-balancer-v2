@@ -55,7 +55,7 @@ import { ref, onMounted, computed, watch } from 'vue'
 import { request } from '@/utils/api'
 import { DEFAULT_ACCESS_LOG_FORMAT } from '@/utils/caddyDefaults'
 import { normalizeTrafficSampleN } from '@/utils/threatFlowRules'
-import { displaySecurityEventsRowCap } from '@/utils/configValues'
+import { displaySecurityEventsRetentionDays, displaySecurityEventsRowCap, displayThreatScreenMode } from '@/utils/configValues'
 import { SETTINGS_TAB_DESCS, SETTINGS_TAB_TITLES, settingsTabOfPage, type SettingsTabId } from '@/utils/settingsPages'
 import { useAuthStore } from '@/stores/auth'
 import { Setting } from '@element-plus/icons-vue'
@@ -162,10 +162,14 @@ const applyBasicKeys = (data: ConfigPayload) => {
   // 大屏本站坐标/视觉模式/安全事件保留/行数上限/流量采样均归基础卡所有。
   settings.value.server_map_lat = data.server_map_lat ?? 0
   settings.value.server_map_lon = data.server_map_lon ?? 0
-  settings.value.threat_screen_mode = data.threat_screen_mode === 'globe' ? 'globe' : 'map'
-  settings.value.security_events_retention_days = data.security_events_retention_days && data.security_events_retention_days > 0 ? data.security_events_retention_days : 90
+  settings.value.threat_screen_mode = displayThreatScreenMode(data.threat_screen_mode)
+  settings.value.security_events_retention_days = displaySecurityEventsRetentionDays(data.security_events_retention_days)
   settings.value.threat_traffic_sample_n = normalizeTrafficSampleN(data.threat_traffic_sample_n)
   settings.value.security_events_row_cap = displaySecurityEventsRowCap(data.security_events_row_cap)
+  // GitHub 下载代理与令牌状态随整包回填（基础设置卡不再自拉第二份 /config）：
+  // 空值留给卡片的展示兜底（未配置→默认代理），令牌状态按未配置展示。
+  settings.value.github_proxy_url = data.github_proxy_url ?? ''
+  settings.value.has_github_token = data.has_github_token ?? false
 }
 
 const applyCaddyKeys = (data: ConfigPayload) => {

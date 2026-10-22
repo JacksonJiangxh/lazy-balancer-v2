@@ -7,7 +7,9 @@ test('当前密码错误在页面本地 toast，拦截器复用精确分类', ()
   const layout = source('src/components/layout/AppLayout.vue')
   assert.match(layout, /isCurrentPasswordRejection\('patch', '\/users\/me', error\.status, error\.message\)/)
   assert.match(layout, /authStore\.showToast\('error', error\.message\)/)
-  assert.match(source('src/utils/api.ts'), /isCurrentPasswordRejection\(/)
+  assert.match(source('src/utils/api.ts'), /classifyAuthFailure\(/)
+  // 401 分类判据单源在 utils/apiFailure（拦截器只做处置分派）
+  assert.match(source('src/utils/apiFailure.ts'), /isCurrentPasswordRejection\(/)
 })
 
 test('只有已启用信任命中才抑制新增信任', () => {

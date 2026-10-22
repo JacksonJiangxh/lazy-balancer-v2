@@ -15,6 +15,9 @@ type ToolSpec struct {
 	// 探测 POST 白名单（见 isReadOnlyTool）。修正：此前恒为
 	// method==HTTP GET，与真实只读能力集漂移（读语义探测 POST 误标 false、
 	// export_config 误标 true——外部契约变更，发布时向 MCP 使用者披露）。
+	// 隐藏 GET 集（readOnlyHiddenTools）当前两项：export_config（导出含用户/密钥
+	// 哈希）与 get_caddy_config（原始 Caddy 配置可能含内联私钥）——handler 首行
+	// 对只读 Key 恒 403，故 read_only=false 且不出现在其 tools/list。
 	// test_certificate_config 移出探测集（写 DNS TXT），
 	// 当前探测集 3 项（parse_certificate/validate_import/preview_config，
 	// 单一事实源 ReadOnlyProbeTools）。
@@ -87,10 +90,10 @@ var toolUsage = map[string]string{
 	"get_ip2region_regions":        "获取可选的区域列表（中国省份+海外）",
 	"get_ip2region_update_status":  "查看 IP2Region 正在进行的更新进度",
 	"get_ip2region_update_logs":    "查看 IP2Region 最近一次更新的详细日志",
-	"get_rate_limit_blocks":        "查看限流拦截统计（按规则/时段聚合）",
+	"get_rate_limit_blocks":        "查看限流拦截统计（按 host 汇总 429 计数，含上游自返 429；自最近一次 Caddy 配置重载以来累计，重载或进程重启归零，无时段维度）",
 	"get_rule_stage_stats":         "查看单规则三阶段安全统计（IP 访问控制+地域拦截 / WAF 近 24h 拦截数，限流自最近重载累计）",
-	"create_security_policy":       "创建安全策略：配置 WAF 模式/异常阈值/CRS 规则组/IP ACL/GeoIP 区域控制/限流/拦截页面；custom_rules 为 JSON 数组字符串；policy_type 取值 stage0/1/2/3/mixed（缺省按内容自动推断，显式 mixed 须确含多阶段字段）；trust_detection 仅 stage0 信任策略消费（其余阶段写入无效）",
-	"update_security_policy":       "更新策略任意字段（如调整 WAF 模式、增减区域、修改阈值）；policy_type 缺省=按内容重推断；trust_detection 仅 stage0 策略消费",
+	"create_security_policy":       "创建安全策略：配置 WAF 模式/异常阈值/CRS 规则组/IP ACL/GeoIP 区域控制/限流/拦截页面；custom_rules 为 JSON 数组字符串；policy_type 取值 stage0/1/2/3（缺省按内容自动推断；显式提交 mixed 会被 400 拒绝，跨阶段内容推断为 mixed 同样 400，请按阶段类型分别创建）；trust_detection 仅 stage0 信任策略消费（其余阶段写入无效）",
+	"update_security_policy":       "更新策略任意字段（如调整 WAF 模式、增减区域、修改阈值）；policy_type 缺省=按内容重推断（显式 mixed 拒绝——存量混合策略请用 POST /security/policies/:id/split 拆分迁移）；trust_detection 仅 stage0 策略消费",
 	"delete_security_policy":       "删除策略（绑定关系自动解除）",
 	"bind_security_policy":         "将策略绑定到规则（rule_caddy_id）；规则可绑定多条安全策略（按 policy_id ASC 顺序评估，最多 8 条；超限时请使用 set_rule_security_policies 整体替换）",
 	"unbind_security_policy":       "解除策略与规则的绑定（仅解除该策略，同规则的其他策略绑定保留）",
@@ -141,7 +144,7 @@ var toolUsage = map[string]string{
 	"list_dns_providers":           "列出支持的 DNS 提供商类型",
 	"list_ca_providers":            "列出全部 CA 提供商（Let's Encrypt/ZeroSSL/自定义）",
 	"get_ca_provider":              "获取指定 CA 提供商详情（含 EAB 凭证）",
-	"update_ca_provider":           "更新 CA 提供商配置（目录 URL/EAB 凭证/限流）",
+	"update_ca_provider":           "更新 CA 提供商配置（名称/Provider/EAB 凭证/并发与限流/启用开关）；目录 URL 不在本工具契约内（请求字段无 directory_url，传入会被忽略）",
 	"test_ca_provider":             "测试 CA 提供商连接是否正常",
 	"get_cert_job":                 "获取指定证书签发任务的详细状态",
 	"get_cert_job_logs":            "查看指定证书任务的签发/续签日志",

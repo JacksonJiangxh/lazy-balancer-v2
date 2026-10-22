@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -52,7 +51,7 @@ var cancelCertJob = func(id int) {
 // 写侧改保留数时读侧漏同步）。Caddy 日志族保留数仍由 logRotatedBackups 服务。
 var certJobLogMaxRotatedBackups = services.CertJobLogMaxRotatedFiles()
 
-const maxCertJobPage int64 = 1_000_000
+const maxCertJobPage = 1_000_000
 
 func certJobOperationLock(id int) *sync.Mutex {
 	index := id % len(certJobOperationLocks)
@@ -124,20 +123,17 @@ func (j *certJobListItem) scanFrom(scanner certJobScanner, now time.Time, expiry
 
 func (h *Handlers) ListCertJobs(c *gin.Context) {
 	ruleID := c.Query("rule_id")
-	page, err := strconv.ParseInt(c.DefaultQuery("page", "1"), 10, 64)
-	if err != nil || page < 1 || page > maxCertJobPage {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("page 必须为 1-%d 之间的整数", maxCertJobPage)})
+	// 分页参数统一解析（与安全事件/审计日志同口径）：非整数 400；<1 回默认；
+	// 超上限钳到上限（此前越界 400，与同面板其余列表不一致）。
+	pageValue, ok := parsePaginationParam(c, "page", 1, maxCertJobPage)
+	if !ok {
 		return
 	}
-	pageSize, err := strconv.Atoi(c.DefaultQuery("page_size", "50"))
-	if err != nil || pageSize < 1 || pageSize > 200 {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "page_size 必须在 1-200 之间"})
+	pageSize, ok := parsePaginationParam(c, "page_size", 50, 200)
+	if !ok {
 		return
 	}
-	if page-1 > math.MaxInt64/int64(pageSize) {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "page 超出可查询范围"})
-		return
-	}
+	page := int64(pageValue)
 	offset := (page - 1) * int64(pageSize)
 	whereClause := ""
 	var filterArgs []interface{}

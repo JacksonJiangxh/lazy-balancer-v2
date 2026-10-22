@@ -610,20 +610,21 @@ const customConditions = computed<Array<{ target: string; operator: string; patt
   return (customRule.value?.conditions ?? []).filter((c) => !!c && typeof c.target === 'string')
 })
 // 补会话序号守卫(同 crsDialogSeq 范式)+try/catch——
-// 快速关开弹框时在途响应晚到不再覆盖当前;加载失败不再误标「规则已删除」
-const customRuleSeq = ref(0)
+// 快速关开弹框时在途响应晚到不再覆盖当前;加载失败不再误标「规则已删除」。
+// 纯计数器无响应式消费，用普通变量（与同文件 loadSeq/crsDialogSeq 一致）。
+let customRuleSeq = 0
 const customRuleLoadError = ref(false)
 const loadCustomRule = async (): Promise<void> => {
   customRule.value = null
   customRuleLoadError.value = false
   if (!Number.isFinite(customDbId.value)) return
-  const seq = ++customRuleSeq.value
+  const seq = ++customRuleSeq
   try {
     const res = await request.get<APIResponse<CustomRule[]>>('/security/custom-rules', { silent: true })
-    if (seq !== customRuleSeq.value) return
+    if (seq !== customRuleSeq) return
     customRule.value = (res.data || []).find((r) => r.id === customDbId.value) ?? null
   } catch {
-    if (seq !== customRuleSeq.value) return
+    if (seq !== customRuleSeq) return
     customRuleLoadError.value = true
   }
 }

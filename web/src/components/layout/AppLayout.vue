@@ -23,75 +23,75 @@
       >
         <el-menu-item index="dashboard" @click="goPage('dashboard')">
           <el-icon><DataAnalysis /></el-icon>
-          <template #title>仪表盘</template>
+          <template #title>{{ NAV_LABELS.dashboard }}</template>
         </el-menu-item>
         <el-menu-item index="rules" @click="goPage('rules')">
           <el-icon><List /></el-icon>
-          <template #title>负载均衡</template>
+          <template #title>{{ NAV_LABELS.rules }}</template>
         </el-menu-item>
         <el-sub-menu index="security">
           <template #title>
             <el-icon><Lock /></el-icon>
-            <span>安全防护</span>
+            <span>{{ SECURITY_PARENT }}</span>
           </template>
           <el-menu-item index="security-overview" @click="goPage('security-overview')">
             <el-icon><DataAnalysis /></el-icon>
-            <template #title>安全总览</template>
+            <template #title>{{ NAV_LABELS['security-overview'] }}</template>
           </el-menu-item>
           <el-menu-item index="security-policies" @click="goPage('security-policies')">
             <el-icon><Lock /></el-icon>
-            <template #title>安全策略</template>
+            <template #title>{{ NAV_LABELS['security-policies'] }}</template>
           </el-menu-item>
           <el-menu-item index="security-rules" @click="goPage('security-rules')">
             <el-icon><Notebook /></el-icon>
-            <template #title>规则集</template>
+            <template #title>{{ NAV_LABELS['security-rules'] }}</template>
           </el-menu-item>
           <el-menu-item index="security-block-pages" @click="goPage('security-block-pages')">
             <el-icon><Document /></el-icon>
-            <template #title>拦截页面</template>
+            <template #title>{{ NAV_LABELS['security-block-pages'] }}</template>
           </el-menu-item>
           <el-menu-item index="security-events" @click="goPage('security-events')">
             <el-icon><Warning /></el-icon>
-            <template #title>事件日志</template>
+            <template #title>{{ NAV_LABELS['security-events'] }}</template>
           </el-menu-item>
         </el-sub-menu>
         <el-menu-item index="caddy" @click="goPage('caddy')">
           <el-icon><Cpu /></el-icon>
-          <template #title>配置预览</template>
+          <template #title>{{ NAV_LABELS.caddy }}</template>
         </el-menu-item>
         <el-sub-menu index="settings">
           <template #title>
             <el-icon><Setting /></el-icon>
-            <span>系统设置</span>
+            <span>{{ SETTINGS_BREADCRUMB_PARENT }}</span>
           </template>
           <el-menu-item index="settings-basic" @click="goPage('settings-basic')">
             <el-icon><Setting /></el-icon>
-            <template #title>基础设置</template>
+            <template #title>{{ NAV_LABELS['settings-basic'] }}</template>
           </el-menu-item>
           <el-menu-item index="settings-cluster" @click="goPage('settings-cluster')">
             <el-icon><Connection /></el-icon>
-            <template #title>集群管理</template>
+            <template #title>{{ NAV_LABELS['settings-cluster'] }}</template>
           </el-menu-item>
           <el-menu-item index="settings-certificates" @click="goPage('settings-certificates')">
             <el-icon><Lock /></el-icon>
-            <template #title>免费证书</template>
+            <template #title>{{ NAV_LABELS['settings-certificates'] }}</template>
           </el-menu-item>
           <el-menu-item index="settings-apikeys" @click="goPage('settings-apikeys')">
             <el-icon><Key /></el-icon>
-            <template #title>API 密钥</template>
+            <template #title>{{ NAV_LABELS['settings-apikeys'] }}</template>
           </el-menu-item>
           <el-menu-item index="settings-tasks" @click="goPage('settings-tasks')">
             <el-icon><Timer /></el-icon>
-            <template #title>任务监控</template>
+            <template #title>{{ NAV_LABELS['settings-tasks'] }}</template>
           </el-menu-item>
           <el-menu-item index="users" @click="goPage('users')">
             <el-icon><User /></el-icon>
-            <template #title>用户认证</template>
+            <template #title>{{ NAV_LABELS.users }}</template>
           </el-menu-item>
         </el-sub-menu>
         <el-menu-item index="audit-log" @click="goPage('audit-log')">
           <el-icon><Document /></el-icon>
-          <template #title>操作日志</template>
+          <template #title>{{ NAV_LABELS['audit-log'] }}</template>
         </el-menu-item>
       </el-menu>
 
@@ -261,23 +261,37 @@ const hasCustomDisplayName = computed(() => {
   return displayName !== '' && displayName !== authStore.user?.username
 })
 
+// 侧栏文案与顶栏面包屑唯一事实源：键→label（parent=面包屑前缀分组）。
+// 此前侧栏 menu 与 pageTitle 各持一份页面名字面量，改名必漏一侧（菜单与
+// 面包屑不一致）；现在模板与面包屑都从本表取值，settings 段继续复用
+// utils/settingsPages 的标题单源。
+const SECURITY_PARENT = '安全防护'
+const NAV_ITEMS: ReadonlyArray<{ id: string; label: string; parent?: string }> = [
+  { id: 'dashboard', label: '仪表盘' },
+  { id: 'rules', label: '负载均衡' },
+  { id: 'security-overview', label: '安全总览', parent: SECURITY_PARENT },
+  { id: 'security-policies', label: '安全策略', parent: SECURITY_PARENT },
+  { id: 'security-rules', label: '规则集', parent: SECURITY_PARENT },
+  { id: 'security-block-pages', label: '拦截页面', parent: SECURITY_PARENT },
+  { id: 'security-events', label: '事件日志', parent: SECURITY_PARENT },
+  { id: 'caddy', label: '配置预览' },
+  { id: 'users', label: '用户认证', parent: SETTINGS_BREADCRUMB_PARENT },
+  { id: 'audit-log', label: '操作日志' },
+]
+
 // 系统设置五个分页标题与 Settings.vue 页头同源（utils/settingsPages）——原两处
 // 各持一份同构映射，改名必然漏改其一。
 const settingsPageTitles: Record<string, string> = Object.fromEntries(
   SETTINGS_TAB_IDS.map((tab) => [`settings-${tab}`, `${SETTINGS_BREADCRUMB_PARENT} / ${SETTINGS_TAB_TITLES[tab]}`]),
 )
 
+const NAV_LABELS: Record<string, string> = {
+  ...Object.fromEntries(NAV_ITEMS.map((item) => [item.id, item.label])),
+  ...Object.fromEntries(SETTINGS_TAB_IDS.map((tab) => [`settings-${tab}`, SETTINGS_TAB_TITLES[tab]])),
+}
+
 const pageTitle: Record<string, string> = {
-  dashboard: '仪表盘',
-  rules: '负载均衡',
-  caddy: '配置预览',
-  users: '系统设置 / 用户认证',
-  'audit-log': '操作日志',
-  'security-overview': '安全防护 / 安全总览',
-  'security-events': '安全防护 / 事件日志',
-  'security-policies': '安全防护 / 安全策略',
-  'security-rules': '安全防护 / 规则集',
-  'security-block-pages': '安全防护 / 拦截页面',
+  ...Object.fromEntries(NAV_ITEMS.map((item) => [item.id, item.parent ? `${item.parent} / ${item.label}` : item.label])),
   ...settingsPageTitles,
 }
 

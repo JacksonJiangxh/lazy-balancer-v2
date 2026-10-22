@@ -77,21 +77,52 @@ test('D 数值控件边界引用共享常量（写侧门单源）', () => {
   assert.equal(RULE_NUMERIC_LIMITS.healthCheckTimeoutMin, 1)
   assert.equal(RULE_NUMERIC_LIMITS.tcpTryIntervalMax, 60000, '后端重试间隔上界 60000（原控件 10000）')
   assert.equal(RULE_NUMERIC_LIMITS.maxConnectionsMin, 0)
-  assert.match(page, /health_check_interval" :min="RULE_NUMERIC_LIMITS\.healthCheckIntervalMin"/)
-  assert.match(page, /max_connections" :min="RULE_NUMERIC_LIMITS\.maxConnectionsMin"/)
-  assert.match(page, /tcp_try_interval" :min="[^"]*" :max="RULE_NUMERIC_LIMITS\.tcpTryIntervalMax"/)
-  // 与写侧无上限对齐：不得再写死这些上限（否则合法库值被 spinner 静默夹回）
-  assert.doesNotMatch(page, /:max="30"[^>]*health_check_timeout/, '超时无后端上限')
-  assert.doesNotMatch(page, /health_check_timeout" :min="1" :max="30"/)
-  assert.doesNotMatch(page, /health_check_interval" :min="5"/)
-  assert.doesNotMatch(page, /tcp_try_interval"[^>]*:max="10000"/)
-  assert.doesNotMatch(page, /max_connections"[^>]*:max="100000"/)
+  // 按 el-input-number 开标签取属性集判定：不依赖属性书写顺序。此前三条否定
+  // 断言把 `:max="30"` 写在字段名之前，而模板恒为「字段名在前」——真回归（重新
+  // 加 :max）时空转（死断言）。标签提取必须跳过引号内的 `>`（`:min="a > b ? …"`
+  // 形态），否则会在属性值中途截断。
+  const inputTags = [...page.matchAll(/<el-input-number\b(?:[^>"']|"[^"]*"|'[^']*')*>/g)].map((m) => m[0])
+  const wizardTags = (field: string): string[] => {
+    const matcher = new RegExp(`\\.${field}"`)
+    return inputTags.filter((tag) => matcher.test(tag))
+  }
+
+  const timeoutTags = wizardTags('health_check_timeout')
+  assert.equal(timeoutTags.length, 2, '超时输入框应有两处（HTTP 主动检查与 TCP 探测）')
+  for (const tag of timeoutTags) {
+    assert.match(tag, /:min="RULE_NUMERIC_LIMITS\.healthCheckTimeoutMin"/)
+    // 与写侧无上限对齐：不得写死上限（否则合法库值被 spinner 静默夹回）
+    assert.doesNotMatch(tag, /:max=/, '超时无后端上限')
+  }
+
+  const intervalTags = wizardTags('health_check_interval')
+  assert.ok(intervalTags.length > 0)
+  for (const tag of intervalTags) {
+    assert.match(tag, /:min="RULE_NUMERIC_LIMITS\.healthCheckIntervalMin"/)
+    assert.doesNotMatch(tag, /:min="5"/, '间隔下限不得写死 5')
+  }
+
+  const maxConnTags = wizardTags('max_connections')
+  assert.ok(maxConnTags.length > 0)
+  for (const tag of maxConnTags) {
+    assert.match(tag, /:min="RULE_NUMERIC_LIMITS\.maxConnectionsMin"/)
+    assert.doesNotMatch(tag, /:max=/, '最大连接无后端上限')
+  }
+
+  const tcpTryTags = wizardTags('tcp_try_interval')
+  assert.ok(tcpTryTags.length > 0)
+  for (const tag of tcpTryTags) {
+    assert.match(tag, /:max="RULE_NUMERIC_LIMITS\.tcpTryIntervalMax"/)
+    assert.doesNotMatch(tag, /:max="10000"/, '重试间隔上界不得写死 10000')
+  }
 })
 
 test('E CA 选择器选项包含当前值（已禁用回显不可新选）', () => {
-  assert.match(page, /const wizardCAProviderOptions = computed\(\(\) => selectableCAProviders\(/)
+  // 选项构造函数与标签函数单源在 utils/caProviderOptions（selectableReferencedOptions /
+  // referencedOptionLabel）：视图只做取值，不得内联过滤。
+  assert.match(page, /const wizardCAProviderOptions = computed\(\(\) => selectableReferencedOptions\(/)
   assert.match(page, /v-for="p in wizardCAProviderOptions"/)
-  assert.match(page, /:label="caProviderOptionLabel\(p\)"/)
+  assert.match(page, /:label="referencedOptionLabel\(p\)"/)
   assert.match(page, /:disabled="!p\.enabled"/)
   assert.doesNotMatch(page, /enabledCAProviders/, '裸 enabled 过滤会让已禁用引用显示成裸 id')
 })

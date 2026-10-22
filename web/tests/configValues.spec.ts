@@ -8,7 +8,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { displaySecurityEventsRetentionDays, displaySecurityEventsRowCap, securityEventsWritePayload } from '../src/utils/configValues.ts'
+import { DEFAULT_CERT_RENEWAL_DAYS, displaySecurityEventsRetentionDays, displaySecurityEventsRowCap, securityEventsWritePayload } from '../src/utils/configValues.ts'
 import { section, source, repoSource } from './_helpers.ts'
 
 test('行数上限：1..999 等合法小值原样展示，不被夹到 1000/1,000,000', () => {
@@ -81,11 +81,26 @@ test('展示默认值与后端 db.go 常量同源（跨栈钉）', () => {
   // 前端展示归一的 90 天 / 1,000,000 行必须等于后端内置默认——任一侧调整
   // 另一侧不同步时，UI 会把「自动」显示成错误默认值并被用户当真。
   const go = repoSource('internal/db/db.go')
-  assert.ok(go.includes('DefaultSecurityEventsRetentionDays = 90'), '保留天数默认漂移')
-  assert.ok(go.includes('DefaultSecurityEventsRowCap        = 1000000'), '行数上限默认漂移')
+  assert.match(go, /\bDefaultSecurityEventsRetentionDays\s*=\s*90\b/, '保留天数默认漂移')
+  // 常量块内新增更长标识符会触发 gofmt 对齐重排——固定空格数属脆性断言
+  assert.match(go, /\bDefaultSecurityEventsRowCap\s*=\s*1000000\b/, '行数上限默认漂移')
   assert.equal(displaySecurityEventsRetentionDays(0), 90)
   assert.equal(displaySecurityEventsRetentionDays(3650), 3650)
   assert.equal(displaySecurityEventsRowCap(0), 1_000_000)
+})
+
+test('证书自动重签天数默认值与后端 db.go 同源（跨栈钉）', () => {
+  // 前端兜底曾两处硬编码 30：后端默认调整后 CertJobs「自动重签时间」整列偏移，
+  // 且无测试拦截。默认值单源在 configValues，auth store 只引用。
+  const go = repoSource('internal/db/db.go')
+  assert.match(go, /\bDefaultCertRenewalDays\s*=\s*30\b/, '后端证书重签天数默认值漂移')
+  assert.equal(DEFAULT_CERT_RENEWAL_DAYS, 30, '前端默认值必须等于默认常量')
+  const auth = source('src/stores/auth.ts')
+  assert.match(auth, /certRenewalDays = ref\(DEFAULT_CERT_RENEWAL_DAYS\)/, 'store 初值必须取单源常量')
+  assert.match(auth, /cert_renewal_days \?\? DEFAULT_CERT_RENEWAL_DAYS/, '/config 缺省必须取单源常量')
+  assert.match(auth, /renewalDays > 0 \? renewalDays : DEFAULT_CERT_RENEWAL_DAYS/, '≤0 兜底必须取单源常量')
+  assert.doesNotMatch(auth, /cert_renewal_days \?\? 30/, '不得回退到硬编码 30')
+  assert.doesNotMatch(auth, /: 30\b/, '不得回退到硬编码 30')
 })
 
 test('保留天数展示：0/缺省落 90，正值原样（不再 SFC 内联第二实现）', () => {

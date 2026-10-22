@@ -27,18 +27,32 @@ test('参数键常量与消费侧解析一致', () => {
   assert.equal(DEEP_LINK_PARAMS.securityRulesTab, 'tab')
 })
 
-test('五个交接入口改用 pageUrl，视图内不再出现 /?page= 字面量', () => {
-  const views = [
-    'src/views/security/SecurityEvents.vue',
-    'src/views/security/SecurityPolicies.vue',
-    'src/views/security/SecurityOverview.vue',
+test('深链交接入口：7 个 window.open 调用点全部走 pageUrl，视图内无 /?page= 字面量', () => {
+  // 调用点名册（逐个正向断言）：仅断言「无字面量」时，整行 window.open 被删
+  // （入口消失）仍全绿。pageUrl 生产调用点共 7 处。
+  const callSites: Array<{ path: string; expected: number }> = [
+    { path: 'src/views/security/SecurityEvents.vue', expected: 3 },
+    { path: 'src/views/security/SecurityOverview.vue', expected: 1 },
+    { path: 'src/views/security/SecurityPolicies.vue', expected: 3 },
   ]
-  for (const path of views) {
+  for (const { path, expected } of callSites) {
     const text = source(path)
     assert.match(text, /from '@\/utils\/deepLink'/, `${path} 未接入深链单源`)
     assert.doesNotMatch(text, /window\.open\('\/\?page=/, `${path} 仍有字面量深链`)
     assert.doesNotMatch(text, /window\.open\(`\/\?page=/, `${path} 仍有字面量深链`)
+    const calls = text.match(/window\.open\(pageUrl\(/g) ?? []
+    assert.equal(calls.length, expected, `${path} 的 pageUrl 交接入口数量变化（少=入口消失，多=新增入口需同步名册）`)
   }
+  // 目标页键逐项正向钉（入口指向错误页面同样算回归）
+  const events = source('src/views/security/SecurityEvents.vue')
+  assert.match(events, /window\.open\(pageUrl\('rules', \{ \[DEEP_LINK_PARAMS\.ruleSearch\]: row\.rule_caddy_id \}\)/)
+  assert.match(events, /window\.open\(pageUrl\('security-policies', \{ \[DEEP_LINK_PARAMS\.policyId\]: row\.policy_id \}\)/)
+  assert.match(events, /window\.open\(pageUrl\('security-policies', \{ \[DEEP_LINK_PARAMS\.policySearch\]: row\.policy_name \}\)/)
+  assert.match(source('src/views/security/SecurityOverview.vue'), /window\.open\(pageUrl\('security-events'\)/)
+  const policies = source('src/views/security/SecurityPolicies.vue')
+  assert.match(policies, /window\.open\(pageUrl\('security-rules', \{ \[DEEP_LINK_PARAMS\.securityRulesTab\]: 'custom' \}\)/)
+  assert.match(policies, /window\.open\(pageUrl\('security-block-pages'\)/)
+  assert.match(policies, /window\.open\(pageUrl\('rules', \{ \[DEEP_LINK_PARAMS\.ruleSearch\]: caddyId \}\)/)
   // 消费侧参数名同样走常量
   assert.match(source('src/views/Rules.vue'), /get\(DEEP_LINK_PARAMS\.ruleSearch\)/)
   assert.match(source('src/views/security/SecurityRules.vue'), /get\(DEEP_LINK_PARAMS\.securityRulesTab\)/)

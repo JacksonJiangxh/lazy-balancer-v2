@@ -17,7 +17,29 @@ export interface IngestionHealth {
   writer_degraded?: boolean
   writer_last_failure_at?: string
   writer_stats_unavailable?: boolean
+  // 摄取侧「畸形区跳过」：跳过即该段审计数据对应事件永久丢失，窗口内发生
+  // 跳过时后端置 healthy=false（与写侧失败同一位）。
+  skipped_bytes?: number
+  skipped_regions?: number
+  last_skip_at?: string
   data_loss?: boolean
+}
+
+/** 字节数人类可读（跳过量级从几 KB 到 GB，原始字节数不可读）。 */
+function humanBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`
+}
+
+/** 丢失量归因分项（写侧丢弃/写盘错误/畸形区跳过各自有则列出）。 */
+function lostParts(status: IngestionHealth): string[] {
+  const parts: string[] = []
+  if ((status.writer_dropped ?? 0) > 0) parts.push(`丢弃 ${status.writer_dropped} 条`)
+  if ((status.writer_io_errors ?? 0) > 0) parts.push(`写盘错误 ${status.writer_io_errors} 次`)
+  if ((status.skipped_regions ?? 0) > 0) parts.push(`跳过畸形区 ${status.skipped_regions} 处（${humanBytes(status.skipped_bytes ?? 0)}）`)
+  return parts
 }
 
 /** 统一提示文案（空串 = 不提示）：判据与文案同源，三处视图只调这一个函数。 */
@@ -39,9 +61,20 @@ export function ingestionWarningMessage(status?: IngestionHealth | null): string
     return `审计日志写侧失败：累计丢弃 ${status.writer_dropped ?? 0} 条、写盘错误 ${status.writer_io_errors ?? 0} 次，安全事件可能缺失；请检查审计日志目录的磁盘空间与写权限。`
   }
   if (status.observed === true && status.healthy === false) {
-    const detail = status.last_error ? `：${status.last_error}` : ''
-    return `安全事件采集连续失败 ${status.consecutive_failures ?? 0} 次${detail}，事件数据可能滞后；请检查任务日志与审计日志目录。`
+    const failures = status.consecutive_failures ?? 0
+    if (failures > 0) {
+      const detail = status.last_error ? `：${status.last_error}` : ''
+      return `安全事件采集连续失败 ${failures} 次${detail}，事件数据可能滞后；请检查任务日志与审计日志目录。`
+    }
+    if ((status.skipped_regions ?? 0) > 0) {
+      const lastSkip = status.last_skip_at ? `，最近 ${status.last_skip_at}` : ''
+      return `安全事件采集跳过了 ${status.skipped_regions} 处畸形区（累计 ${humanBytes(status.skipped_bytes ?? 0)}${lastSkip}）：该段审计数据对应的事件已永久丢失；请检查审计日志是否被截断或存在并发写入异常。`
+    }
+    // 后端健康位为 false 但前端已知归因均不成立：不虚构「连续失败 0 次」。
+    return '安全事件采集健康位异常（后端未提供进一步归因，可能为任务未运行或采集停摆）；请检查任务日志与审计日志目录。'
   }
-  // data_loss 单独成立（当前已恢复但曾丢失）：与「正在失败」文案区分。
-  return `此前曾发生安全事件丢失（累计丢弃 ${status.writer_dropped ?? 0} 条、写盘错误 ${status.writer_io_errors ?? 0} 次，当前已恢复）：对应时间窗内的事件可能缺失。`
+  // data_loss 单独成立（当前已恢复但曾丢失）：与「正在失败」文案区分，
+  // 丢失来源逐项归因（写侧与畸形区跳过都会永久丢事件）。
+  const parts = lostParts(status)
+  return `此前曾发生安全事件丢失（累计${parts.join('、') || '计数不可用'}，当前已恢复）：对应时间窗内的事件可能缺失。`
 }

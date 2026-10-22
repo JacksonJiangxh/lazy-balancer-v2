@@ -87,6 +87,8 @@
           <div v-if="authStore.user?.role === 'admin'" class="oidc-entry-inline">
             <el-tag v-if="oidcEnabled" type="success" size="small" effect="light">OIDC 已启用</el-tag>
             <el-tag v-else-if="oidcConfigured" type="info" size="small" effect="plain">OIDC 已配置</el-tag>
+            <el-tag v-if="oidcStatusError" type="info" size="small" effect="plain">OIDC 状态读取失败</el-tag>
+            <el-button v-if="oidcStatusError" size="small" text @click="fetchOIDCStatus()">重试</el-button>
             <el-button size="small" text type="primary" :disabled="isReadOnly" @click="oidcOpen = true">{{ oidcConfigured ? 'OIDC 设置' : '配置 OIDC' }}</el-button>
           </div>
         </div>
@@ -288,9 +290,9 @@
 
 <script setup lang="ts">
 import OIDCSettings from '@/views/settings/OIDCSettings.vue'
-import { computed, nextTick, reactive, ref, onMounted } from 'vue'
+import { computed, nextTick, reactive, ref, watch, onMounted } from 'vue'
 import { useAuthStore } from '@/stores/auth'
-import { request, mfaAwareSuccess, normalizeMfaCodeInput, validateMfaCodeInput } from '@/utils/api'
+import { request, ApiRequestError, mfaAwareSuccess, normalizeMfaCodeInput, validateMfaCodeInput } from '@/utils/api'
 import { formatDate } from '@/utils/date'
 import { copyText } from '@/utils/copy'
 import { ElMessageBox, ElMessage } from 'element-plus'
@@ -303,6 +305,8 @@ import type { APIResponse, UserListItem } from '@/types'
 const oidcOpen = ref(false)
 const oidcEnabled = ref(false)
 const oidcConfigured = ref(false)
+// 状态读取失败（403 之外）：标签区提供重试入口，不再静默留白。
+const oidcStatusError = ref(false)
 const onOIDCStatus = (st: { enabled: boolean; configured: boolean }) => {
   oidcEnabled.value = st.enabled
   oidcConfigured.value = st.configured
@@ -315,8 +319,11 @@ const fetchOIDCStatus = async () => {
     const res = await request.get<{ data?: { enabled?: boolean; issuer?: string; has_secret?: boolean } }>('/settings/oidc', { silent: true })
     oidcEnabled.value = !!res.data?.enabled
     oidcConfigured.value = !!(res.data?.issuer || res.data?.has_secret)
-  } catch {
-    // 静默降级:非管理员/从节点 403 不弹 toast,标签维持隐藏(入口本身按角色收口)
+    oidcStatusError.value = false
+  } catch (error: unknown) {
+    // 403=角色权限面（非管理员/从节点），属预期而非故障——静默；网络/5xx 等
+    // 真实失败显性化并在标签区给重试入口（silent 下无全局 toast，不留白）。
+    oidcStatusError.value = !(error instanceof ApiRequestError && error.status === 403)
   }
 }
 
@@ -748,11 +755,16 @@ const copyMfaRecovery = async (): Promise<void> => {
   else ElMessage.warning('复制失败，请手动选择复制')
 }
 
+// /settings/oidc 挂在 admin 组（非管理员必 403）且 OIDC 入口仅管理员渲染——
+// 请求与消费面同门。以 store 角色为响应式通道（immediate）：fetchUser 瞬时
+// 失败时角色先为 undefined、由 store 15s 重试补回，一次性 onMounted 判定会
+// 永久错过该窗口（标签不出现、按钮误显「配置 OIDC」）。
+watch(() => authStore.user?.role, (role) => {
+  if (role === 'admin') void fetchOIDCStatus()
+}, { immediate: true })
+
 onMounted(() => {
   fetchUsers()
-  // /settings/oidc 挂在 admin 组（非管理员必 403）且 OIDC 入口仅管理员渲染——
-  // 请求与消费面同门，非管理员不再白跑一条 403（审计噪音 + 无意义往返）。
-  if (authStore.user?.role === 'admin') void fetchOIDCStatus()
 })
 </script>
 

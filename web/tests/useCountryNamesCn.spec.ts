@@ -8,6 +8,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { registerModuleHooks } from './_helpers.ts'
+import { STUB_API } from './_stubs.ts'
 
 interface GetCall {
   url: string
@@ -20,13 +21,7 @@ type Harness = {
 const g = globalThis as unknown as Harness
 g.__gets = []
 
-const stubApi = `data:text/javascript,${encodeURIComponent(`
-export const request = {
-  get: (url, config) => { globalThis.__gets.push({ url, config }); return globalThis.__get(url, config) },
-}
-export const mfaAwareSuccess = () => {}
-`)}`
-registerModuleHooks({ '@/utils/api': stubApi })
+registerModuleHooks({ '@/utils/api': STUB_API })
 const { useCountryNamesCn, countryLabel } = await import('../src/composables/useCountryNamesCn.ts')
 
 const tick = async (): Promise<void> => {

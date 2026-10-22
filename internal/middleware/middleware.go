@@ -751,11 +751,11 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 			}
 			// admin 组路由集合注入 MCP 工具可见性——非管理员属主的 Key
 			// 不应在 tools/list 看到恒 403 的工具（get_caddy_config / preview_config /
-			// validate_import 等）。清单即上面的注册记录，无第二份手工维护。
-			mcpserver.SetAdminOnlyRoutes(admin.recorded)
+			// validate_import 等）。business 组写路由同门，合并后一次注入（见下方
+			// business 组注册完成处）。清单即注册记录，无第二份手工维护。
 
 			// User + Admin
-			business := v1.Group("")
+			business := recordingRouterGroup{RouterGroup: v1.Group(""), recorded: make(map[string]struct{})}
 			// business 组次序对称 ——readOnlyGuard
 			// 先于 mfaStepUpGuard：非管理员打管理写端点直见 403 角色真因（旧次序
 			// step-up 在前，验码重试后才见 403，与 admin 组已修的误导链同型）。
@@ -905,6 +905,24 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 				business.GET("/audit-logs", h.GetAuditLogs)
 				business.GET("/audit-logs/options", h.GetAuditLogOptions)
 			}
+
+			// 「非管理员恒 403」路由集合注入 MCP 工具可见性——两份集合都来自
+			// 守卫同源的注册记录：admin 组全部路由（adminOnly），加 business
+			// 组写方法中既不受只读白名单豁免、也不属自助路径者
+			// （readOnlyGuard 只对这部分返回 403）。非管理员属主的 Key 在
+			// tools/list 只会看到真能调用的工具。
+			nonAdminForbidden := make(map[string]struct{}, len(admin.recorded)+len(business.recorded))
+			for route := range admin.recorded {
+				nonAdminForbidden[route] = struct{}{}
+			}
+			for route := range business.recorded {
+				method, path, _ := strings.Cut(route, " ")
+				if !writeMethods[method] || services.IsReadOnlyWriteRoute(method, path) || isSelfServicePath(path) {
+					continue
+				}
+				nonAdminForbidden[route] = struct{}{}
+			}
+			mcpserver.SetNonAdminForbiddenRoutes(nonAdminForbidden)
 		}
 	}
 

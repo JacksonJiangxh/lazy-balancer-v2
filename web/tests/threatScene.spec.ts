@@ -108,11 +108,29 @@ test('④下钻口径：统一倍率=9、主环取景中心为 bbox 中心、南
     const c = WORLD_COUNTRIES.find((x) => x.name === name)
     assert.ok(c, `worldBorders 缺 ${name}`)
     const b = principalBounds(c.polys)
-    const clon0 = (b.minLon + b.maxLon) / 2
-    const clon = clon0 > 180 ? clon0 - 360 : clon0
-    const clat = (b.minLat + b.maxLat) / 2
-    assert.ok(clon >= -180 && clon <= 180, `${name} 取景中心经度越界 ${clon}`)
-    assert.ok(clat >= b.minLat - 1e-9 && clat <= b.maxLat + 1e-9, `${name} 取景中心纬度 ${clat} 不在 bbox 内`)
+    // 独立算出每环 bbox 做对表：principalBounds 必须选「面积最大的环」（本土），
+    // 纬度边界与之逐值相等（纬度不参与 ±180 unwrap）。此前的「中心落在 bbox
+    // 内」是代数恒真，不构成任何拦截。
+    const ringBoxes = c.polys.flatMap((poly) => poly.map((ring) => {
+      let minLon = 180
+      let maxLon = -180
+      let minLat = 90
+      let maxLat = -90
+      for (let i = 0; i + 1 < ring.length; i += 2) {
+        const lon = ring[i]
+        const lat = ring[i + 1]
+        if (lon < minLon) minLon = lon
+        if (lon > maxLon) maxLon = lon
+        if (lat < minLat) minLat = lat
+        if (lat > maxLat) maxLat = lat
+      }
+      return { minLat, maxLat, area: (maxLon - minLon) * (maxLat - minLat) }
+    }))
+    const largest = ringBoxes.reduce((a, x) => (x.area > a.area ? x : a))
+    assert.equal(b.minLat, largest.minLat, `${name} 取景 bbox 纬度南界不是最大环`)
+    assert.equal(b.maxLat, largest.maxLat, `${name} 取景 bbox 纬度北界不是最大环`)
+    // ±180 unwrap 契约：经度跨度必须收敛（海外属地跨日界线时不得报全宽）
+    assert.ok(b.maxLon - b.minLon <= 180, `${name} 取景 bbox 经度跨度 ${b.maxLon - b.minLon} 超过 180（unwrap 失效）`)
   }
   // 南界：投影域裁到 -55（南极洲无业务流量）——世界高与相机纵向钳制同源。
   // 总览 zoom 下可视高 ≥ 世界高 → 相机恒居中；下钻倍率下越界拖动被钳在

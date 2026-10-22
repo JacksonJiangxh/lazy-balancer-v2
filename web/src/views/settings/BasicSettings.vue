@@ -498,7 +498,7 @@ import { restartServiceWithFeedback } from '@/utils/restart'
 import { formatDate } from '@/utils/date'
 import { normalizeTrafficSampleN } from '@/utils/threatFlowRules'
 import { shouldToastQuietPollError } from '@/utils/pollErrorToast'
-import { displaySecurityEventsRetentionDays, displaySecurityEventsRowCap, securityEventsWritePayload } from '@/utils/configValues'
+import { displaySecurityEventsRetentionDays, displaySecurityEventsRowCap, displayThreatScreenMode, securityEventsWritePayload } from '@/utils/configValues'
 import { CHINA_SITE_CHOICES, COUNTRY_SITE_CHOICES, coordsForSiteLocation, nearestSiteLocation } from '@/utils/siteLocation'
 import { BACKUP_SECTIONS, normalizeBackupSectionKeys } from '@/utils/backupSections'
 import { MFA_SCOPE_GROUPS } from '@/utils/mfaScopeGroups'
@@ -1246,7 +1246,10 @@ const emit = defineEmits<{
 // 读取失败不得把默认值当可写值：原 getter 未加载时回退
 // 默认代理、保存 payload 恒带该键——一次 /config 抖动 + 任一保存 = 把用户已选
 // 的 AxisNow 静默改回默认。现以 githubProxyLoaded 门控编辑与提交。
-const githubProxyLoaded = ref(false)
+// 加载态复用父级整包 /config（Settings.vue applyBasicKeys 已合并
+// github_proxy_url / has_github_token）：卡片不再自拉第二份 /config，也不需
+// 独立 seq 竞态守卫（父级已有 settingsRequestSeq 单一通道）。
+const githubProxyLoaded = computed(() => props.configLoaded)
 const githubProxyUrl = computed<string>({
   get: () => {
     if (!githubProxyLoaded.value) return ''
@@ -1257,27 +1260,6 @@ const githubProxyUrl = computed<string>({
   },
 })
 
-// 父级 Settings.vue 的 applyBasicKeys 仅合并其已知键，此键由本卡片自行拉取回填
-// （同 loadAdminTls 先例），保证整页刷新后已保存的非默认代理不回落为默认值
-// 补 seq 守卫(原无——慢响应晚到覆盖用户刚保存的新值)
-// 代理 URL 与令牌状态原为两次 GET /config 各取一键——合并单次读取；
-// 失败兜底语义不变（代理回落默认值、令牌按未配置展示），保存语义均不受影响
-let githubStateSeq = 0
-const loadGithubRemoteState = async (): Promise<void> => {
-  const seq = ++githubStateSeq
-  try {
-    const res = await request.get<{ data?: { github_proxy_url?: string; has_github_token?: boolean } }>('/config')
-    if (seq !== githubStateSeq) return // 竞态守卫
-    settings.value.github_proxy_url = res.data?.github_proxy_url || DEFAULT_GITHUB_PROXY_URL
-    settings.value.has_github_token = res.data?.has_github_token ?? false
-    githubProxyLoaded.value = true
-  } catch {
-    // 拉取失败：代理保持未加载（选择器禁用、保存省略该键），令牌按未配置展示；
-    // 不回退默认值冒充库值。
-    githubProxyLoaded.value = false
-  }
-}
-loadGithubRemoteState()
 // GitHub 令牌三态：省略=保持、显式空串（清除钮）=撤销、非空=覆盖；has_github_token 仅显隐占位
 const githubTokenInput = ref('')
 // 清除标记（用户裁定三态语义：nil=保持/空串=清除/非空=覆盖）
@@ -1330,7 +1312,7 @@ const seRowCap = ref(1_000_000)
 const seRetentionDaysDirty = ref(false)
 const seRowCapDirty = ref(false)
 const trafficSampleN = ref(-1)
-watch(() => settings.value.threat_screen_mode, (v) => { threatScreenMode.value = v === 'globe' ? 'globe' : 'map' }, { immediate: true })
+watch(() => settings.value.threat_screen_mode, (v) => { threatScreenMode.value = displayThreatScreenMode(v) }, { immediate: true })
 watch(() => [settings.value.security_events_retention_days, settings.value.security_events_row_cap] as const, ([d, c]) => {
   seRetentionDays.value = displaySecurityEventsRetentionDays(d)
   // 1..999 等小值是后端合法配置（行帽），原样展示；仅 0=自动按默认显示。

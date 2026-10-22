@@ -7,7 +7,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { section, source } from './_helpers.ts'
+import { member, section, source } from './_helpers.ts'
 
 test('/admin-tls 响应类型声明 cert_info_error', () => {
   const api = source('src/utils/api.ts')
@@ -36,9 +36,15 @@ test('设置页消费 cert_info_error 并渲染错误条', () => {
 test('日志统计条消费 rows_unavailable：保持条数口径并标注不可用', () => {
   const bar = source('src/components/LogStorageBar.vue')
   assert.match(bar, /rows_unavailable\?: boolean/, '响应字段类型必须声明')
-  assert.match(bar, /const rowsUnavailable = computed/, '必须显式判定不可用态')
+  // 出现判定必须真正消费该 flag：后端改为「保留上次行数 + flag=true」时，陈旧
+  // 行数不得被当有效值（仅用 rows == null 推导会让 flag 成为死字段）。
+  const rowsUnavailable = member(bar, 'const rowsUnavailable = computed')
+  assert.match(rowsUnavailable, /rows_unavailable === true/, 'rows_unavailable 必须驱动不可用判定')
+  assert.match(rowsUnavailable, /rows == null/, '行数缺席同样按不可用呈现')
+  assert.doesNotMatch(rowsUnavailable, /rows != null/, '不得反转为「有行数即可用」')
   const sizeText = section(bar, 'const sizeText = computed(', '\n})\n')
   assert.match(sizeText, /计数暂不可用 \/ /, '行数缺席时保持条数口径文案')
+  assert.match(sizeText, /rowsUnavailable\.value/, '文案必须取统一不可用判定（flag 与 null 同口径）')
   assert.doesNotMatch(
     section(bar, 'const sizeText = computed(', '\n})\n'),
     /if \(i\.limit_rows && i\.rows != null\)/,

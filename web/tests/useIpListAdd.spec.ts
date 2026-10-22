@@ -11,6 +11,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { registerModuleHooks } from './_helpers.ts'
+import { STUB_API, STUB_ELEMENT, STUB_SAVE_RESULT } from './_stubs.ts'
 
 interface RecordedCall {
   fn: string
@@ -28,33 +29,10 @@ type Harness = {
 const g = globalThis as unknown as Harness
 g.__calls = []
 
-const dataModule = (code: string): string => `data:text/javascript,${encodeURIComponent(code)}`
-const stubElement = dataModule(`
-export const ElMessage = Object.assign(
-  (arg) => globalThis.__calls.push({ fn: 'ElMessage', arg }),
-  {
-    info: (arg) => globalThis.__calls.push({ fn: 'ElMessage.info', arg }),
-    error: (arg) => globalThis.__calls.push({ fn: 'ElMessage.error', arg }),
-    success: (arg) => globalThis.__calls.push({ fn: 'ElMessage.success', arg }),
-  },
-)
-export const ElMessageBox = { confirm: (...args) => globalThis.__confirm(...args) }
-`)
-const stubApi = dataModule(`
-export const request = {
-  get: (...args) => globalThis.__get(...args),
-  post: (...args) => globalThis.__post(...args),
-  put: (...args) => globalThis.__put(...args),
-}
-export const mfaAwareSuccess = (message) => globalThis.__calls.push({ fn: 'mfaAwareSuccess', arg: message })
-`)
-const stubSaveResult = dataModule(`
-export const showSaveResult = (...args) => globalThis.__calls.push({ fn: 'showSaveResult', args })
-`)
 registerModuleHooks({
-  'element-plus': stubElement,
-  '@/utils/api': stubApi,
-  '@/utils/saveResult': stubSaveResult,
+  'element-plus': STUB_ELEMENT,
+  '@/utils/api': STUB_API,
+  '@/utils/saveResult': STUB_SAVE_RESULT,
 })
 const { useIpListAdd } = await import('../src/composables/useIpListAdd.ts')
 

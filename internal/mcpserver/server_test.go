@@ -162,9 +162,9 @@ func TestToolsListHidesWriteTools_forReadOnlyAPIKey(t *testing.T) {
 	// 断言成立的前提是 admin 组路由集合未注入。该集合是包级装配态，另一测试
 	// （SetupRouter 路径）会写入且不复位——必须在本用例内隔离，否则断言随
 	// 执行顺序变化（-shuffle 下同包/外部测试先后不定）。
-	previous := adminOnlyRoutePaths.Load()
-	SetAdminOnlyRoutes(nil)
-	t.Cleanup(func() { adminOnlyRoutePaths.Store(previous) })
+	previous := nonAdminForbiddenRoutePaths.Load()
+	SetNonAdminForbiddenRoutes(nil)
+	t.Cleanup(func() { nonAdminForbiddenRoutePaths.Store(previous) })
 	resolver := func(apiKey string) (apiKeyVisibility, error) {
 		return apiKeyVisibility{readOnly: apiKey == "lb_sk_read-only"}, nil
 	}
@@ -1033,18 +1033,29 @@ func requestToolNames(t *testing.T, handler http.Handler, apiKey string) map[str
 	return names
 }
 
-// admin 组路由对非管理员恒 403（adminOnly 先于其它守卫），tools/list
-// 必须同口径隐藏——否则非管理员属主的 Key 反复试错恒 403 工具。管理员全权
-// Key 不受影响（get_caddy_config 等按文档仅管理员可用）。
-func TestToolsListHidesAdminOnlyToolsForNonAdminKey(t *testing.T) {
-	// Given：admin 组路由集合（生产由 middleware.SetupRouter 注入，此处按同形态）
-	previous := adminOnlyRoutePaths.Load()
-	t.Cleanup(func() { adminOnlyRoutePaths.Store(previous) })
-	SetAdminOnlyRoutes(map[string]struct{}{
+// 「非管理员恒 403」路由（admin 组全部 + business 组未豁免只读白名单的写路由）
+// 必须从非管理员 tools/list 中隐藏——否则属主反复试错恒 403 工具。管理员全权
+// Key 不受影响；business 组的只读探测 POST（preview_config/validate_import/
+// parse_certificate）在 REST 白名单内，非管理员可用，必须保留。
+func TestToolsListHidesForbiddenToolsForNonAdminKey(t *testing.T) {
+	// Given：与 middleware.SetupRouter 同源形态的集合（生产由注册记录派生）
+	previous := nonAdminForbiddenRoutePaths.Load()
+	t.Cleanup(func() { nonAdminForbiddenRoutePaths.Store(previous) })
+	SetNonAdminForbiddenRoutes(map[string]struct{}{
+		// admin 组（全部方法）——只读探测 POST 也在该组（adminOnly 对非管理员 403）
 		"GET /api/v1/caddy/config":            {},
 		"POST /api/v1/config/preview":         {},
 		"POST /api/v1/config/import/validate": {},
 		"PUT /api/v1/users/:id":               {},
+		"POST /api/v1/users":                  {},
+		// business 组写路由（readOnlyGuard 对非管理员 403）
+		"POST /api/v1/rules":                       {},
+		"PUT /api/v1/rules/:caddy_id":              {},
+		"DELETE /api/v1/rules/:caddy_id":           {},
+		"POST /api/v1/rules/:caddy_id/enable":      {},
+		"POST /api/v1/certificates/jobs/:id/retry": {},
+		"DELETE /api/v1/certificates/jobs/:id":     {},
+		"POST /api/v1/admin-tls/inspect":           {},
 	})
 
 	// When：非管理员全权 Key
@@ -1052,14 +1063,22 @@ func TestToolsListHidesAdminOnlyToolsForNonAdminKey(t *testing.T) {
 		func(string) (apiKeyVisibility, error) { return apiKeyVisibility{}, nil })
 	names := requestToolNames(t, nonAdmin, "lb_sk_non-admin")
 
-	// Then：admin 组工具不可见，business 组工具照常
-	for _, hidden := range []string{"get_caddy_config", "preview_config", "validate_import", "update_user"} {
+	// Then：恒 403 工具不可见
+	for _, hidden := range []string{
+		"get_caddy_config", "preview_config", "validate_import",
+		"update_user", "create_user",
+		"create_rule", "update_rule", "delete_rule", "enable_rule",
+		"retry_cert_job", "delete_cert_job", "inspect_admin_tls",
+	} {
 		if names[hidden] {
-			t.Errorf("non-admin tools/list exposes admin-only tool %s (调用恒 403)", hidden)
+			t.Errorf("non-admin tools/list exposes tool %s (调用恒 403)", hidden)
 		}
 	}
-	if !names["list_rules"] || !names["get_config"] {
-		t.Fatalf("non-admin tools/list must keep business-group tools: %v", names)
+	// business 组只读查询与读探测 POST（parse_certificate 在白名单内）保留
+	for _, visible := range []string{"list_rules", "get_config", "parse_certificate"} {
+		if !names[visible] {
+			t.Errorf("non-admin tools/list hides callable tool %s", visible)
+		}
 	}
 
 	// When：管理员全权 Key
@@ -1068,9 +1087,42 @@ func TestToolsListHidesAdminOnlyToolsForNonAdminKey(t *testing.T) {
 	adminNames := requestToolNames(t, admin, "lb_sk_admin")
 
 	// Then：管理员全量可见
-	for _, visible := range []string{"get_caddy_config", "preview_config", "validate_import", "update_user"} {
+	for _, visible := range []string{"get_caddy_config", "update_user", "create_rule", "retry_cert_job", "inspect_admin_tls"} {
 		if !adminNames[visible] {
-			t.Errorf("admin tools/list hides admin tool %s", visible)
+			t.Errorf("admin tools/list hides tool %s", visible)
+		}
+	}
+}
+
+// 只读 Key 的 tools/list 不得呈现「handler 对只读 Key 恒 403」的 GET 工具——
+// get_caddy_config 与 export_config 同格（原始运行配置/备份含敏感材料，handler
+// 首行拒绝只读 Key）。read_only 元数据同步为 false，避免「列表可见即只读可用」
+// 的语义失真。
+func TestToolsListHidesReadOnlyForbiddenGets(t *testing.T) {
+	previous := nonAdminForbiddenRoutePaths.Load()
+	t.Cleanup(func() { nonAdminForbiddenRoutePaths.Store(previous) })
+	SetNonAdminForbiddenRoutes(nil)
+
+	// admin 属主的只读 Key（read_only）——export_config/get_caddy_config 都必须消失
+	adminReadOnly := newWithVisibilityResolver("http://127.0.0.1/api/v1", http.DefaultClient, "",
+		func(string) (apiKeyVisibility, error) { return apiKeyVisibility{admin: true, readOnly: true}, nil })
+	names := requestToolNames(t, adminReadOnly, "lb_sk_admin-read-only")
+	for _, hidden := range []string{"export_config", "get_caddy_config"} {
+		if names[hidden] {
+			t.Errorf("read-only key tools/list exposes always-403 tool %s", hidden)
+		}
+	}
+	if !names["list_rules"] || !names["parse_certificate"] {
+		t.Fatalf("read-only key tools/list must keep read tools: %v", names)
+	}
+
+	// 元数据同源：两个工具不得标 read_only
+	for _, spec := range ListToolSpecs() {
+		if spec.Name != "export_config" && spec.Name != "get_caddy_config" {
+			continue
+		}
+		if spec.ReadOnly {
+			t.Errorf("%s read_only=%v, want false（只读 Key 调用恒 403）", spec.Name, spec.ReadOnly)
 		}
 	}
 }
@@ -1215,7 +1267,8 @@ func TestForward_callLayerErrorsReturnIsErrorResults(t *testing.T) {
 
 // 无分页参数的整份返回 GET 工具（list_rules/list_ip_lists/get_config 等）超限时
 // 通用「改用分页」指引是死路——必须给单条查询/管理面板的可执行路径；
-// 有分页参数的工具维持通用分页指引。
+// 有分页参数的工具维持通用分页指引。判据= schema 是否声明 page/page_size，
+// 不是 queryArgs 是否为空：get_metrics_history/get_caddy_logs 有过滤维度但无分页。
 func TestOversizedResponseMessageGuidesNonPaginatedGetTools(t *testing.T) {
 	rest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write(bytes.Repeat([]byte("x"), maxResponseSize+1))
@@ -1230,5 +1283,20 @@ func TestOversizedResponseMessageGuidesNonPaginatedGetTools(t *testing.T) {
 	paginated := callTool(t, handler, "list_security_events", `{}`)
 	if !strings.Contains(paginated, "请改用分页或专用导出工具") {
 		t.Fatalf("list_security_events result=%s, want 通用分页指引保留", paginated)
+	}
+	// 有 queryArgs 但无分页参数的三个工具：必须给各自可执行路径，不得退回
+	// 「改用分页」（对它们无可传参数，是死路）。
+	for tool, want := range map[string]string{
+		"get_metrics_history":      "rule_id",
+		"get_rule_metrics_history": "range",
+		"get_caddy_logs":           "get_rule_logs",
+	} {
+		result := callTool(t, handler, tool, `{"caddy_id":"lb_x"}`)
+		if strings.Contains(result, "请改用分页或专用导出工具") {
+			t.Errorf("%s result=%s, want 专用指引而非通用分页文案", tool, result)
+		}
+		if !strings.Contains(result, want) {
+			t.Errorf("%s result=%s, want 含可执行收敛路径 %q", tool, result, want)
+		}
 	}
 }

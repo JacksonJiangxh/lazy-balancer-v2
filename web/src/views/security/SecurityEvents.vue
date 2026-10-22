@@ -394,7 +394,7 @@ import { formatDurationUs, triggerStageFamily } from '@/utils/securityStages'
 import { TRIGGERED_CATEGORIES, serializeTriggeredFilter, CRAWLER_FAMILY_LABEL } from '@/utils/triggeredFilter'
 import { ANOMALY_SCORE_HIGH, ANOMALY_SCORE_MID } from '@/utils/severityScale'
 import { DEEP_LINK_PARAMS, pageUrl } from '@/utils/deepLink'
-import { isAutobanIneffective } from '@/utils/autobanStatus'
+import { isAutobanIneffective, suggestionBand, type SuggestionBand } from '@/utils/autobanStatus'
 import IPLocationAction from '@/views/security/IPLocationAction.vue'
 import { formatDate } from '@/utils/date'
 import { ingestionWarningMessage, type IngestionHealth } from '@/utils/ingestionHealth'
@@ -457,21 +457,22 @@ const autobanConfigTooltip = computed(() => {
 const autobanScopeText = computed(() => AUTOBAN_SCOPES.find((s) => s.value === autobanStatus.value.scope)?.label ?? autobanStatus.value.scope)
 const autobanDurationText = computed(() => AUTOBAN_DURATIONS.find((d) => d.value === autobanStatus.value.duration)?.label ?? autobanStatus.value.duration)
 
-// 命中次数色深（命中越多越深）：≥4×阈值深红加粗、≥2×阈值正红、其余浅红。
-const suggestionCountStyle = (count: number): string => {
-  const t = autobanStatus.value.threshold || 1
-  if (count >= t * 4) return 'color:#991b1b;font-weight:700'
-  if (count >= t * 2) return 'color:#dc2626;font-weight:600'
-  return 'color:#ef4444'
+// 命中次数色深（命中越多越深）：档位判据单源 utils/autobanStatus 的 suggestionBand，
+// 此处只做「档位 → 样式/颜色」映射。
+const SUGGESTION_COUNT_STYLE: Record<SuggestionBand, string> = {
+  high: 'color:#991b1b;font-weight:700',
+  mid: 'color:#dc2626;font-weight:600',
+  low: 'color:#ef4444',
 }
+const SUGGESTION_PROGRESS_COLOR: Record<SuggestionBand, string> = {
+  high: '#991b1b',
+  mid: '#dc2626',
+  low: '#ef4444',
+}
+const suggestionCountStyle = (count: number): string => SUGGESTION_COUNT_STYLE[suggestionBand(count, autobanStatus.value.threshold)]
 
 // 阈值倍数进度条配色（与命中次数色深同档）
-const suggestionProgressColor = (count: number): string => {
-  const t = autobanStatus.value.threshold || 1
-  if (count >= t * 4) return '#991b1b'
-  if (count >= t * 2) return '#dc2626'
-  return '#ef4444'
-}
+const suggestionProgressColor = (count: number): string => SUGGESTION_PROGRESS_COLOR[suggestionBand(count, autobanStatus.value.threshold)]
 
 // 建议窗口首末（同一统计窗口内通常同日）：同日展示「时刻 ~ 时刻」，
 // 跨日展示完整起止；任一端缺失按 '—'。

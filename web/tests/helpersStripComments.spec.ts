@@ -6,7 +6,23 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { stripComments } from './_helpers.ts'
+import { member, section, stripComments } from './_helpers.ts'
+
+test('section：缺 start / 缺 end / 顺序倒置一律抛错（边界不得空转）', () => {
+  assert.throws(() => section('abc', 'x', 'c'), /missing start marker/)
+  assert.throws(() => section('abc', 'a', 'x'), /missing end marker/)
+  // end 只出现在 start 之前：不得返回倒置切片，必须抛错
+  assert.throws(() => section('ba', 'a', 'b'), /missing end marker/)
+  assert.equal(section('abc', 'a', 'c'), 'ab')
+})
+
+test('member：缺 marker / 无函数体 / 括号不平衡一律抛错', () => {
+  assert.throws(() => member('const a = 1\n', 'const b'), /missing member/)
+  assert.throws(() => member('const a = 1\n', 'const a'), /member has no body/)
+  // 花括号未闭合：若 helper 改成「容错返回剩余文本」，数百条文本钉会同时空转，
+  // 必须硬失败。
+  assert.throws(() => member('function f() {\n  if (x) {\n', 'function f'), /unbalanced braces/)
+})
 
 test('行注释与块注释被剥离，字符串字面量保留', () => {
   const src = "const a = 1 // trailing\n/* block */ const b = '// not comment'\nconst c = `/* tpl */`"

@@ -15,7 +15,7 @@
     <el-row :gutter="20" class="tm-kpis">
       <el-col :xs="12" :md="6">
         <el-card class="tm-kpi">
-          <div class="tm-kpi-num">{{ tasks.length }}</div>
+          <div class="tm-kpi-num">{{ taskFamilyCount }}</div>
           <div class="tm-kpi-label">任务族</div>
         </el-card>
       </el-col>
@@ -506,6 +506,11 @@ const fetchCertQueue = async (signal?: AbortSignal) => {
 }
 
 // ===== 概览统计 =====
+// 任务族只数引擎族：cert-job 动态行是逐张证书的签发工作项（上限 100），
+// 计入会让计数随签发记录在 ~30 → ~130 之间漂移（同排 24h 计数已排除它们）。
+const taskFamilyCount = computed(() => tasks.value.filter(t => !isCertJobRow(t.id)).length)
+// 运行中=当前在途工作项：cert-job 的 queued/pending/waiting_ca 也是在途工作
+// （后端将非终态一律映射 running），与引擎族同列可比，故不排除。
 const runningCount = computed(() => tasks.value.filter(t => t.status === 'running').length)
 // 24h KPI 只聚合引擎族执行行——cert-job 行的 runs_24h/fail_24h 语义是
 // 「工作项终态事件」（每行 ≤1），与引擎族「执行轮次」混加会把两种口径

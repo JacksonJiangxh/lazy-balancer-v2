@@ -18,7 +18,7 @@
           :registration-request="registrationRequest"
           :registration-succeeded="registrationSucceeded"
           :read-only="isReadOnlyProp"
-          :interval-saving="intervalSaving"
+          :interval-saving="clusterSettingsSaving"
           @register="registerAsSlave"
           @promote="promoteToMaster"
           @update-interval="updateSyncInterval"
@@ -32,7 +32,7 @@
           :nodes="nodes"
           :loading="nodesLoading"
           :token-loading="tokenLoading"
-          :settings-loading="settingsLoading"
+          :settings-loading="clusterSettingsSaving"
           :pending-node-id="pendingNodeId"
           :login-node-id="loginNodeId"
           :read-only="isReadOnlyProp || status?.node_mode === 'slave'"
@@ -54,7 +54,7 @@
       :nodes="nodes"
       :loading="nodesLoading"
       :token-loading="tokenLoading"
-      :settings-loading="settingsLoading"
+      :settings-loading="clusterSettingsSaving"
       :pending-node-id="pendingNodeId"
       :login-node-id="loginNodeId"
       :read-only="isReadOnlyProp"
@@ -222,10 +222,11 @@ const initialLoading = ref(true)
 const nodesLoading = ref(false)
 const modeLoading = ref(false)
 const tokenLoading = ref(false)
-const settingsLoading = ref(false)
+// 同步设置写通道单飞：开关（updateSyncField）与间隔（updateSyncInterval）都写
+// PUT /cluster/settings——共用一个 saving 态，二者在途时互斥且 loading 同源。
+const clusterSettingsSaving = ref(false)
 const syncing = ref(false)
 const promoting = ref(false)
-const intervalSaving = ref(false)
 const pendingNodeId = ref<number | null>(null)
 const loginNodeId = ref<number | null>(null)
 const nodeConfigDialogVisible = ref(false)
@@ -527,13 +528,13 @@ const updateSyncField = async (field: string, value: boolean): Promise<void> => 
   if (isReadOnlyProp.value) return
   // 占位先于确认（双击开关不再叠加确认框/重复 PUT）；取消路径回读状态
   // 复位开关显示。
-  if (settingsLoading.value) {
+  if (clusterSettingsSaving.value) {
     ElMessage.warning('同步设置正在保存，请稍候')
     return
   }
   const label = syncSwitchLabels[field] ?? field
   const action = value ? '开启' : '关闭'
-  settingsLoading.value = true
+  clusterSettingsSaving.value = true
   try {
     const confirmed = await confirmAction(
       `确定要${action}「${label}」的集群同步吗？${value ? '开启后主节点该类变更将同步到所有从节点。' : '关闭后从节点将保留本地数据，不再接收主节点该类变更。'}`,
@@ -551,13 +552,18 @@ const updateSyncField = async (field: string, value: boolean): Promise<void> => 
     console.error('Failed to update sync field:', error)
     await fetchStatus().catch((refreshError: unknown) => console.error('Failed to refresh cluster status:', refreshError))
   } finally {
-    settingsLoading.value = false
+    clusterSettingsSaving.value = false
   }
 }
 
 const updateSyncInterval = async (value: number): Promise<void> => {
   if (isReadOnlyProp.value) return
-  intervalSaving.value = true
+  // 与开关保存共用同一写通道门（并发落库会互相覆盖 sync_interval/开关字段）
+  if (clusterSettingsSaving.value) {
+    ElMessage.warning('同步设置正在保存，请稍候')
+    return
+  }
+  clusterSettingsSaving.value = true
   try {
     await request.put<ActionResponse>('/cluster/settings', { sync_interval: value })
     mfaAwareSuccess('同步间隔已更新')
@@ -566,7 +572,7 @@ const updateSyncInterval = async (value: number): Promise<void> => {
     // 全局拦截器已弹 toast，这里仅记录避免 unhandled rejection
     console.error('Failed to update sync interval:', error)
   } finally {
-    intervalSaving.value = false
+    clusterSettingsSaving.value = false
   }
 }
 

@@ -102,6 +102,33 @@ export const STATIC_RESPONSE_STATUS_REASONS: Readonly<Record<number, string>> = 
 const STATIC_RESPONSE_STATUS_SET: Readonly<Record<number, true>> = Object.fromEntries(
   STATIC_RESPONSE_STATUSES.map((code) => [code, true]),
 )
+/**
+ * 上游路径改写单条判定（与后端 validateRuleFeatures 同口径）：空串=原样转发；
+ * 非空须以 / 开头且不含空格 ? #（query/fragment 不允许）。路径编辑器与整组
+ * 校验共用，避免两处口径漂移。
+ */
+export const upstreamPathRuleError = (upstreamPath: string): string | null => {
+  if (!upstreamPath) return null
+  if (!upstreamPath.startsWith('/')) return '必须以 / 开头'
+  if (/[\s?#]/.test(upstreamPath)) return '不能包含空格 ? # 字符'
+  return null
+}
+
+/**
+ * 单条路径规则的**字段级**错误（不含行号，也不含整组判定——重复/遮蔽由
+ * validatePathRules 负责）。组级校验与行内红框共用此函数：两套实现曾漂移到
+ * 「组级拒空串、行级放行空串」，用户清空路径后行内无红框、点保存才整组被拒。
+ * 文案不带行号，调用方按需加「第 N 条路径：」前缀（组级）或原样展示（行内）。
+ */
+export const pathRuleError = (rule: PathRuleInput): string | null => {
+  // 与后端同口径：前缀校验用原始串（后端 HasPrefix 在 TrimSpace 之前）
+  if (!rule.path.startsWith('/')) return '必须以 / 开头'
+  if (/[*?{}]/.test(rule.path)) return '不能包含 * ? { } 通配字符'
+  const upstreamError = upstreamPathRuleError(rule.upstream_path ?? '')
+  if (upstreamError) return `上游路径${upstreamError}`
+  return null
+}
+
 export const validatePathRules = (rules: readonly PathRuleInput[]): string | null => {
   const seen = new Map<string, number>()
   // 同后端：prefix 与 exact 在同一路径上并存时，路由按 SortOrder 首条终结
@@ -110,14 +137,9 @@ export const validatePathRules = (rules: readonly PathRuleInput[]): string | nul
   const seenExactNorms = new Map<string, number>()
   for (const [index, rule] of rules.entries()) {
     const rowNumber = index + 1
-    // 与后端同口径：前缀校验用原始串（后端 HasPrefix 在 TrimSpace 之前）
-    if (!rule.path.startsWith('/')) return `第 ${rowNumber} 条路径必须以 / 开头`
-    if (/[*?{}]/.test(rule.path)) return `第 ${rowNumber} 条路径不能包含 * ? { } 通配字符`
-    // 上游路径 改写：非空须以 / 开头且不含空格 ? #（query/fragment 不允许），与后端校验同口径
-    if (rule.upstream_path) {
-      if (!rule.upstream_path.startsWith('/')) return `第 ${rowNumber} 条路径的上游路径 必须以 / 开头`
-      if (/[\s?#]/.test(rule.upstream_path)) return `第 ${rowNumber} 条路径的上游路径 不能包含空格 ? # 字符`
-    }
+    // 字段级错误优先于组级（重复/遮蔽）——与行内红框同一判据、同一文案。
+    const fieldError = pathRuleError(rule)
+    if (fieldError) return `第 ${rowNumber} 条路径：${fieldError}`
     const canonical = canonicalPathKey(rule.match_type, rule.path)
     const duplicateKey = pathDuplicateKey(rule.match_type, rule.path)
     const seenAt = seen.get(duplicateKey)

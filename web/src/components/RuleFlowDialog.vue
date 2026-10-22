@@ -488,6 +488,9 @@ const typedStageByKey = (key: string): StageGroup | undefined => typedStagePanel
 const stageZeroSubtitle = computed(() => {
   if (!stageZero.value) return ''
   const states = stageZero.value.groups.map((g) => props.policies.find((p) => p.id === g.key)?.trust_detection === true)
+  // 空数组时 every(Boolean) 恒真会误报「保留检测记录」：阶段 0 已启用但未绑定
+  // 任何名单/策略时，副标题按「未启用」呈现（不暗示存在检测保留语义）。
+  if (states.length === 0) return '未启用'
   if (states.every(Boolean)) return '保留检测记录'
   if (states.every((v) => !v)) return '直通上游'
   return '直通 + 保留检测'
@@ -507,6 +510,27 @@ const groupHasDetails = (group: StagePolicyGroup): boolean => {
     || (d.crsGroups?.length ?? 0) > 0
 }
 
+// CRS 文件清单全量分页：接口 page_size 上限 50（后端 clamp），超页宽时组名
+// 映射会静默回退裸组码（明细里看到「942」而非分类名）。循环取全量；40 页
+// 防御性上限（2000 文件）防后端 total 异常时无限翻页。
+const CRS_RULE_PAGE_SIZE = 50
+const CRS_RULE_MAX_PAGES = 40
+const fetchAllCrsRuleFiles = async (): Promise<CrsRuleFileOption[]> => {
+  const all: CrsRuleFileOption[] = []
+  for (let page = 1; page <= CRS_RULE_MAX_PAGES; page++) {
+    const res = await request.get<APIResponse<{ rules: CrsRuleFileOption[]; total?: number }>>(
+      `/security/crs/rules?page_size=${CRS_RULE_PAGE_SIZE}&page=${page}`,
+      { silent: true },
+    )
+    const rules = res.data?.rules ?? []
+    all.push(...rules)
+    const total = res.data?.total
+    if (rules.length < CRS_RULE_PAGE_SIZE) break
+    if (typeof total === 'number' && all.length >= total) break
+  }
+  return all
+}
+
 const ensureDetails = async (): Promise<void> => {
   if (detailsAttached.value || detailLoading.value) return
   const seq = ++detailsSeq
@@ -519,8 +543,8 @@ const ensureDetails = async (): Promise<void> => {
         ? request.get<APIResponse<SecurityStagePolicyDetail[]>>(`/security/rules/${encodeURIComponent(caddyId)}/policy`, { silent: true })
         : Promise.resolve<APIResponse<SecurityStagePolicyDetail[]>>({ code: 0, data: [] }),
       request.get<APIResponse<SecurityStageCustomRule[]>>('/security/custom-rules', { silent: true }),
-      // 50=CRS 文件数假设(当前远小于 50;超页宽时组名映射静默回退裸组码)
-      request.get<APIResponse<{ rules: CrsRuleFileOption[] }>>('/security/crs/rules?page_size=50', { silent: true }),
+      // 全量分页取回（组名映射不再因超页宽静默降级为裸组码）
+      fetchAllCrsRuleFiles(),
     ])
     // 续体落地前校验会话序号：弹框已切换（onDialogOpen ++）或更新一次拉取已发起
     // 时丢弃过期结果，避免旧会话数据附着或抢置 detailsAttached
@@ -531,7 +555,7 @@ const ensureDetails = async (): Promise<void> => {
     } else failedSources.push('策略明细')
     if (customRes.status === 'fulfilled') customRules.value = customRes.value.data ?? []
     else failedSources.push('自定义规则')
-    if (crsRes.status === 'fulfilled') crsFiles.value = crsRes.value.data?.rules ?? []
+    if (crsRes.status === 'fulfilled') crsFiles.value = crsRes.value
     else failedSources.push('CRS 规则组')
     // 引用名单条目：仅信任名单引用需条目值（阶段 0 明细逐条展示）；
     // ACL 明细为列表级汇总（名称+entry_count），不拉条目

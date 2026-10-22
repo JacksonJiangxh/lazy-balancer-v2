@@ -91,6 +91,10 @@
           </div>
           <div class="form-tip-line">仅这些网段发来的请求头会被采信；未配对网段时所有头一律被忽略（最小 /8 与 /29）。{{ trustedPresetRangesDoc }}</div>
         </el-form-item>
+        <div v-if="ipListsLoadError" class="info-note-bar">
+          <span class="info-note-desc">IP 地址列表加载失败：「引用地址列表」下拉为空≠未配置，下方「合计 N 条」也未计入已引用列表的条目</span>
+          <el-button size="small" type="primary" plain :loading="ipListsLoading" @click="fetchIpLists">重新加载</el-button>
+        </div>
         <el-form-item label="引用地址列表">
           <el-select
             v-model="trustedRangeRefs"
@@ -348,14 +352,22 @@ const applyTrustedPreset = (label: string): void => {
 // —— 引用地址列表选项（与策略侧引用选择器同数据源；仅非内置名单） ——
 interface TrustedIpListOption { id: number; name: string; entry_count: number; system?: boolean }
 const ipLists = ref<TrustedIpListOption[]>([])
+// 辅助端点失败必须显性化且可重试（与 Rules 页辅助数据横幅同口径）：下拉变空
+// 不等于未配置，且已引用列表的条目数会按 0 汇总——静默会让用户误判引用丢失。
+const ipListsLoadError = ref(false)
+const ipListsLoading = ref(false)
 const customIpLists = computed(() => ipLists.value.filter((l) => !l.system))
 const fetchIpLists = async (): Promise<void> => {
+  ipListsLoading.value = true
   try {
     const res = await request.get<APIResponse<TrustedIpListOption[]>>('/security/ip-lists', { silent: true })
     ipLists.value = res.data || []
+    ipListsLoadError.value = false
   } catch {
-    // 静默失败：选择器退化为空列表，空警告按内联口径显示
     ipLists.value = []
+    ipListsLoadError.value = true
+  } finally {
+    ipListsLoading.value = false
   }
 }
 onMounted(() => { void fetchIpLists() })

@@ -130,10 +130,12 @@
             <div v-for="rule in migrateBoundRules" :key="rule.caddy_id" class="migrate-preview-rule">
               <span class="migrate-preview-rule-name">{{ rule.name }}</span>
               <span class="migrate-preview-rule-meta">{{ rule.domain || '-' }}:{{ rule.listen_port }}</span>
+              <el-tag v-if="migrateStage2SkipRisk.some((r) => r.caddy_id === rule.caddy_id)" size="small" type="warning" effect="plain">将跳过（已有 stage2）</el-tag>
             </div>
           </template>
           <div v-else class="migrate-preview-empty">当前无规则绑定本策略</div>
         </div>
+        <div v-if="migrateStage2SkipRisk.length > 0" class="info-note-bar"><span class="info-note-desc">限流唯一风险：{{ migrateStage2SkipRisk.map((r) => r.name).join('、') }} 已绑定其他限流策略——拆分将产出阶段 2 子策略，这些规则会跳过重映射（每条规则最多一条限流策略），保持原绑定</span></div>
         <div v-if="migrateCapRisk.length > 0" class="info-note-bar"><span class="info-note-desc">上限风险：{{ migrateCapRisk.map((r) => r.name).join('、') }} 迁移后将超过每条规则 {{ MAX_POLICIES_PER_RULE }} 条绑定上限——这些规则保持原绑定并进入跳过清单</span></div>
         <div class="info-note-bar"><span class="info-note-desc">全部规则重映射成功后原策略将被删除；存在被跳过的规则时原策略保留（因仍在使用）</span></div>
       </div>
@@ -677,13 +679,13 @@
                     <div
                       v-for="hint in row.infoHints"
                       :key="hint"
-                      class="info-note-bar bound-rule-note"
+                      class="info-note-bar"
                     ><span class="info-note-desc">{{ hint }}</span></div>
                     <!-- 行内编辑该规则的阶段拦截页覆盖（规则级 4 字段收口到策略侧）：历史
-                         用户裁定 A 改为向导内延迟生效——改选只暂存，随向导「保存」收尾逐规则
-                         PUT /rules/:id（提交时携带基础现值：UpdateRule 对空 protocol 400；
-                         upstreams 省略=保留）。旧语义「变更即 PUT」已废弃：会绕过向导保存、
-                         不进配置预览、文案误导。 -->
+                         用户裁定 A 改为向导内延迟生效——改选只暂存，随向导「保存」收尾按
+                         4 字段分组调 POST /rules/batch-block-pages（单事务一次渲染；单次
+                         rule_ids ≤500 分片；skipped 规则保持待重试）。旧语义「变更即 PUT」
+                         已废弃：会绕过向导保存、不进配置预览、文案误导。 -->
                     <div v-if="!isReadOnly && editableOverrideStages.length > 0" class="stage-override-editors">
                       <div v-for="stage in editableOverrideStages" :key="stage" class="stage-override-line">
                         <span class="stage-override-label">阶段 {{ stage }} 拦截页覆盖</span>
@@ -705,11 +707,8 @@
                           @update:model-value="onStageOverrideChange(row.caddyId, stage, 'status', Number($event))"
                         >
                           <el-option :value="0" label="默认（403）" />
-                          <el-option :value="400" label="400" />
-                          <el-option :value="401" label="401" />
-                          <el-option :value="403" label="403" />
-                          <el-option :value="404" label="404" />
-                          <el-option :value="503" label="503" />
+                          <!-- 与策略表单返回状态码同集单源（securityStages.STAGE_BLOCK_STATUS_OPTIONS） -->
+                          <el-option v-for="opt in STAGE_BLOCK_STATUS_OPTIONS" :key="opt.value" :value="opt.value" :label="opt.label" />
                         </el-select>
                         <el-tag
                           v-if="overrideEditOf(row.caddyId)[stage === 1 ? 'stage1_id' : 'stage3_id'] > 0"
@@ -801,7 +800,7 @@
               <div v-if="stage.enabled && stage.footnote" class="preview-stage-footnote">{{ stage.footnote }}</div>
             </div>
           </div>
-          <el-divider content-position="left" class="compact-divider">已关联规则的阶段页覆盖</el-divider>
+          <el-divider content-position="left" class="acl-divider">已关联规则的阶段页覆盖</el-divider>
           <!-- 逐规则清单改为摘要口径（规则多时撑高/撑破弹框）；逐规则覆盖状态
                与编辑入口在「关联规则」步骤（含行内阶段页覆盖编辑器与「已覆盖/待保存」标记） -->
           <div v-if="boundRules.length === 0" class="form-tip-line">尚未关联规则——保存后在「关联规则」步骤绑定，或在规则行点「安全」绑定</div>
@@ -921,7 +920,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, computed, watch } from 'vue'
+import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
 import { Plus, Lock, InfoFilled, Connection, Odometer, Link, Check, ArrowLeft, ArrowRight, ArrowDown, Search, WarningFilled, Document, Loading } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { CascaderOption, CascaderProps, CascaderValue, LazyLoad } from 'element-plus'
@@ -938,7 +937,7 @@ import type { CrsExcludedRow, CrsRuleOptionView } from '@/composables/useCrsRule
 import type { APIResponse, UserListItem } from '@/types'
 import SecurityBindingEditor from '@/components/SecurityBindingEditor.vue'
 import DialogHeader from '@/components/DialogHeader.vue'
-import { POLICY_TYPE_LABELS, POLICY_TYPE_SHORT_LABELS, STAGE_BLOCK_STATUS_OPTIONS, blockPageMissing, buildStageModel, chunkForBulk, entriesIntersect, formatAclModeDetail, hasGeoIPControl, hasIPACLControl, hasTrustEntries, inferPolicyType, mergeIpEntryCount, mergeIpEntryValues, normalizeStringEntries, parseIPList, parseRefIds, parseUnknownIds, IP_LIST_CATEGORIES, MAX_POLICIES_PER_RULE, SECURITY_BULK_LIMITS, resolveBlockPageAttribution, type BlockPageAttribution, type BlockPageStage } from '@/utils/securityStages'
+import { POLICY_TYPE_LABELS, POLICY_TYPE_SHORT_LABELS, STAGE_BLOCK_STATUS_OPTIONS, blockPageMissing, buildStageModel, chunkForBulk, entriesIntersect, ensureSharedEntries, formatAclModeDetail, hasGeoIPControl, hasIPACLControl, hasStage3Features, hasTrustEntries, inferPolicyType, mergeIpEntryCount, mergeIpEntryValues, parseCrsFilename, parseIPList, parseRefIds, parseUnknownIds, parseUnknownStrings, sharedEntriesCache, subscribeSharedEntriesCache, IP_LIST_CATEGORIES, MAX_POLICIES_PER_RULE, SECURITY_BULK_LIMITS, resolveBlockPageAttribution, type BlockPageAttribution, type BlockPageStage } from '@/utils/securityStages'
 import type { RuleStageModel, SecurityPolicyType, SecurityStagePolicy } from '@/utils/securityStages'
 import { updaterName } from '@/utils/updaterName'
 import { DEEP_LINK_PARAMS, pageUrl } from '@/utils/deepLink'
@@ -1090,9 +1089,10 @@ watch([activeTypeTab, policySearch], () => { policyPage.value = 1 })
 const { pagedItems: pagedPolicies } = useClampedPagination(filteredPolicies, policyPage, policyPageSize)
 
 // 三阶段启用 chips 谓词：阶段 1=IP 访问控制||地域拦截、阶段 2=限流、
-// 阶段 3=后端口径（has_waf=CRS 生效 ∪ custom_only ∪ 自定义规则数>0；
-// has_custom_rules 带 off 门且不含 custom_only 空规则形，不再直接消费）
-const stage3ChipOn = (row: PolicySummary): boolean => row.has_waf || row.mode === 'custom_only' || row.custom_rules_count > 0
+// 阶段 3=与后端 models.PolicyTypeFeatures 的 G3 逐字对齐（mode 三态 ∪ custom_rules
+// 引用非空，见 utils/securityStages.hasStage3Features）。摘要的 custom_rules_count
+// 只数启用规则——「mode=off 且引用规则全部禁用」的边界在此口径下仍可能少标。
+const stage3ChipOn = (row: PolicySummary): boolean => hasStage3Features(row.mode, row.custom_rules_count)
 
 
 // ── 阶段页覆盖：投影条与预览步自历史起只出摘要（「将应用于 N 条已关联规则」），
@@ -1153,7 +1153,8 @@ const policySummaryLine = (row: PolicySummary): string => {
 }
 
 // ── 关联规则行内阶段页编辑（规则级 4 字段收口到策略侧；历史起向导内延迟生效：
-// 改选暂存 → 向导保存收尾逐规则 PUT /rules/:id，失败逐条列出并保持对话框打开） ──
+// 改选暂存 → 向导保存收尾 POST /rules/batch-block-pages（单事务一次渲染、按
+// 4 字段分组、单次 rule_ids ≤500 分片；被跳过的规则记原因并保持待重试） ──
 interface StageOverrideEdit { stage1_id: number; stage1_status: number; stage3_id: number; stage3_status: number }
 const stageOverrideEdits = ref<Record<string, StageOverrideEdit>>({})
 const stageOverrideSaving = ref<Record<string, boolean>>({})
@@ -1206,7 +1207,7 @@ const onStageOverrideChange = (caddyId: string, stage: 1 | 3, field: 'id' | 'sta
     stageOverrideSkipped.value = nextSkipped
   }
   // 历史（用户裁定 A）：只暂存，不再即时 PUT——规则级覆盖随向导「保存」
-  // 统一提交（handleSave 收尾逐规则 PUT），与向导其余步骤的延迟语义一致。
+  // 统一提交（handleSave 收尾走批量端点 batch-block-pages），与向导其余步骤的延迟语义一致。
 }
 
 // ── 混合策略一键更新迁移（用户裁定）：预演（子策略/重映射/上限风险）→ POST split → 汇总 ──
@@ -1243,6 +1244,20 @@ const migrateBoundRules = computed(() => (migratePolicy.value ? policyBoundRules
 const migrateCapRisk = computed(() =>
   migrateBoundRules.value.filter((rule) =>
     (securityBindings.value[rule.caddy_id] || []).length - 1 + migrateChildTypes.value.length > MAX_POLICIES_PER_RULE))
+
+// 限流唯一门风险：拆分产出 stage2 子策略时，规则现存的其他绑定若已含 stage2
+// → 后端逐条 skipped（每条规则最多一条限流策略；与 SplitSecurityPolicy 的
+// otherStage2 门同口径）。摘要缺该策略类型时回退 binding 的 rate_limit_enabled。
+const migrateStage2SkipRisk = computed(() => {
+  const policyId = migratePolicy.value?.id
+  if (policyId === undefined || !migrateChildTypes.value.includes('stage2')) return []
+  const boundIsOtherStage2 = (b: BindingInfo): boolean => {
+    const type = policies.value.find((p) => p.id === b.policy_id)?.policy_type
+    return type ? type === 'stage2' : b.rate_limit_enabled
+  }
+  return migrateBoundRules.value.filter((rule) =>
+    (securityBindings.value[rule.caddy_id] || []).some((b) => b.policy_id !== policyId && boundIsOtherStage2(b)))
+})
 
 const openMigrateDialog = (row: PolicySummary): void => {
   if (isReadOnly.value) return
@@ -1430,9 +1445,9 @@ const ipWhitelistEnabled = ref(false)
 // 为 JSON 数组文本（ip_acl_list_refs / ip_whitelist_refs）；生效口径 = 内联 ∪ 引用条目。
 const ipACLListRefs = ref<number[]>([])
 const ipWhitelistRefs = ref<number[]>([])
-// 引用列表缓存：对话框打开与页面加载时刷新，供引用选择器 / 合计条数 / 冲突比较共用
+// 引用列表载荷：页面加载/向导打开时刷新，供引用选择器 / 合计条数 / 冲突比较共用。
 // v2.3.2 弹框性能重构后续：列表载荷不再内联 entries（大名单 460KB/行）——
-// 条目值按需经 GET /security/ip-lists/:id 拉取并缓存于 ipListDetails；
+// 条目值按需经 GET /security/ip-lists/:id 拉取，落跨组件共享缓存（见下）；
 // 仅需条数的口径（列表页摘要/向导 hint）一律走 entry_count，不背条目。
 interface IPListRefOption { id: number; name: string; entry_count: number; system?: boolean; entries?: Array<{ value: string; remark: string }> }
 const ipLists = ref<IPListRefOption[]>([])
@@ -1440,22 +1455,23 @@ const ipLists = ref<IPListRefOption[]>([])
 // 分两组展示（el-option-group 自带分隔线+组标题）
 const builtinIpLists = computed(() => ipLists.value.filter((l) => l.system))
 const customIpLists = computed(() => ipLists.value.filter((l) => !l.system))
-// 引用列表条目值缓存（按 id）：向导冲突比较/合并口径的唯一值来源，
-// 打开向导时对「本策略 + 同列策略」引用到的名单按需补齐
-const ipListDetails = ref<Record<number, Array<{ value: string; remark: string }>>>({})
-// 按需补齐引用名单条目（缺失才请求；openSeq 过期丢弃，同 fetchIpLists 口径）
-const ensureIpListDetails = async (ids: number[], seq?: number): Promise<void> => {
-  const missing = [...new Set(ids)].filter((id) => id > 0 && !(id in ipListDetails.value))
-  if (missing.length === 0) return
-  const results = await Promise.allSettled(
-    missing.map((id) => request.get<APIResponse<{ id: number; entries?: Array<{ value: string; remark: string }> }>>(`/security/ip-lists/${id}`)),
-  )
-  if (seq !== undefined && seq !== policyDialogOpenSeq) return
-  const next = { ...ipListDetails.value }
-  results.forEach((r, i) => {
-    if (r.status === 'fulfilled') next[missing[i]] = r.value.data?.entries || []
+// 引用名单条目：复用 utils/securityStages 的跨组件共享缓存（代际守卫 + 在途
+// 去重，IPLocationAction / TriggerDetailDialog 同源）。模块缓存是普通对象，
+// 视图侧以本地镜像 + 订阅保持响应式；写动作经 invalidate 清空后镜像即时刷新。
+const ipListEntries = ref<Record<number, string[]>>({ ...sharedEntriesCache })
+const unregisterIpListEntries = subscribeSharedEntriesCache(() => {
+  ipListEntries.value = { ...sharedEntriesCache }
+})
+onUnmounted(unregisterIpListEntries)
+
+// 按需补齐引用名单条目（只对未缓存 id 发请求；代际守卫保证写动作后在途响应
+// 不会把失效前的旧条目回填）。
+const ensureIpListEntries = async (ids: number[]): Promise<void> => {
+  await ensureSharedEntries(ids, async (id) => {
+    const res = await request.get<APIResponse<{ id: number; entries?: Array<{ value: string }> }>>(`/security/ip-lists/${id}`)
+    return (res.data?.entries || []).map((e) => e.value.trim()).filter((v) => v !== '')
   })
-  ipListDetails.value = next
+  ipListEntries.value = { ...sharedEntriesCache }
 }
 
 const fetchIpLists = async (seq?: number): Promise<void> => {
@@ -1469,9 +1485,9 @@ const fetchIpLists = async (seq?: number): Promise<void> => {
 }
 // 合并内联 + 引用列表条目（按精确字符串去重，与 v1 匹配口径一致）；缓存中缺失的
 // 引用列表跳过（防御性回退为仅内联）。内核统一在 utils/securityStages
-// mergeIpEntryValues，本处仅适配 ipListDetails 数据源成形。
+// mergeIpEntryValues，本处仅适配共享条目缓存数据源成形。
 const mergeIpEntries = (inline: string[], refs: number[]): string[] =>
-  mergeIpEntryValues(inline, refs.map((id) => (ipListDetails.value[id] ?? []).map((e) => e.value)))
+  mergeIpEntryValues(inline, refs.map((id) => ipListEntries.value[id] ?? []))
 // 条数-only 合并口径（列表页摘要用，不拉条目值）：内联去重数 + Σ引用名单
 // entry_count。与 mergeIpEntries 的去重合计可能略有出入（内联与引用重叠时），
 // 仅作列表页一行摘要展示；精确合计以向导内（条目已加载）为准。
@@ -1559,10 +1575,16 @@ watch([currentStep, ipACLList, ipWhitelist, ipACLListRefs, ipWhitelistRefs], ([s
     ipBlacklistSelf.value.length > 0 || ipACLListRefs.value.length > 0 || ipWhitelistRefs.value.length > 0
   if (!hasContent) return
   const ids = [...ipACLListRefs.value, ...ipWhitelistRefs.value]
+  // 只补本策略 + 共绑 peer 的引用名单（原实现汇总全部策略——含 stage2/3 与
+  // 被禁用策略，会把内置威胁大库（单源数百 KB × 若干）整批下载）。无共绑时
+  // 冲突警告的「若绑定同一规则」兜底路径按 inline 口径降级（引用条目缺失时
+  // mergeIpEntries 跳过该 id），不再为此全量预取。
+  const coIds = coBoundPeerIds.value
   for (const p of policies.value) {
+    if (!coIds.has(p.id)) continue
     ids.push(...parseRefIds(p.ip_acl_list_refs), ...parseRefIds(p.ip_whitelist_refs))
   }
-  void ensureIpListDetails(ids, policyDialogOpenSeq)
+  void ensureIpListEntries(ids)
 })
 
 // 新建类型纵向列表选项（任务 C：与 el-form-item 同构的独立 radio 列表）
@@ -1722,17 +1744,16 @@ const normalizeCrsGroups = (values: string[]): string[] => {
   const codes = values.map((value) => {
     if (/^\d{2}$/.test(value)) return value
     if (/^\d{6}$/.test(value)) return isInfraRuleId(value) ? '' : value
-    const match = /^(?:REQUEST|RESPONSE)-9(\d{2})-/i.exec(value)
-    return match?.[1] ?? ''
+    return parseCrsFilename(value)?.code ?? ''
   }).filter((code) => code !== '' && !CRS_INFRA_GROUP_CODES.includes(code))
   return [...new Set(codes)]
 }
 
-// crsOptionCode 从 CRS 文件名提取两位组代码（REQUEST-942-*.conf → "942"）——
-// 与 normalizeCrsGroups 同源，用于排除规则选项的解析化显示。
+// crsOptionCode 从 CRS 文件名提取展示组码（REQUEST-942-*.conf → "942"）——
+// 解析单源 utils/securityStages.parseCrsFilename；非 CRS 文件名原样返回。
 const crsOptionCode = (filename: string): string => {
-  const match = /^(?:REQUEST|RESPONSE)-9(\d{2})-/i.exec(filename)
-  return match ? `9${match[1]}` : filename
+  const info = parseCrsFilename(filename)
+  return info ? `9${info.code}` : filename
 }
 
 // crsOptionPhase（用户反馈）：CRS 规则文件分请求/响应两个阶段——REQUEST-*
@@ -1740,7 +1761,7 @@ const crsOptionCode = (filename: string): string => {
 // 必须区分阶段，否则「942 · SQL 注入」与「955 · Webshell」无法看出分别作用
 // 于请求还是响应。命名取 CRS 官方 phase 术语的最简中文：请求 / 响应
 //（REQUEST 规则查的不只是请求体，叫「请求体」不准确）。
-const crsOptionPhase = (filename: string): string => (/^RESPONSE-/i.test(filename) ? '响应' : '请求')
+const crsOptionPhase = (filename: string): string => parseCrsFilename(filename)?.phase ?? '请求'
 
 // 规则组/排除目标级联的已知值全集（两位组号 ∪ 索引规则 ID）——命中即无需 ghost 兜底
 const crsKnownTargetValues = computed<Set<string>>(() =>
@@ -1753,7 +1774,7 @@ interface CrsGhostOption { value: string; label: string; title: string }
 const crsGhostOptionFor = (value: string): CrsGhostOption | null => {
   const v = value.trim()
   if (v === '' || crsKnownTargetValues.value.has(v)) return null
-  if (/^(?:REQUEST|RESPONSE)-/i.test(v)) {
+  if (parseCrsFilename(v)) {
     const fileRule = crsRuleOptions.value.find((r) => r.filename === v)
     const label = fileRule
       ? `文件 · ${crsOptionPhase(v)} · ${crsOptionCode(v)} · ${fileRule.category}`
@@ -1805,7 +1826,8 @@ const isEvalGroupExclusionTarget = (target: string): boolean => {
   if (t === '') return false
   if (/^\d{2}$/.test(t)) return t === '49' || t === '59'
   if (/^\d{6}$/.test(t)) return t.startsWith('949') || t.startsWith('959')
-  if (/^(?:REQUEST|RESPONSE)-9(?:49|59)-/i.test(t)) return true
+  const fileInfo = parseCrsFilename(t)
+  if (fileInfo && (fileInfo.code === '49' || fileInfo.code === '59')) return true
   const rangeMatch = /^(\d{6})\s*[-:]\s*(\d{6})$/.exec(t)
   if (rangeMatch) {
     const lo = Number(rangeMatch[1])
@@ -1822,8 +1844,8 @@ const blockingEvalExclusionAlert = computed(
 const crsGroupOptions = computed(() => {
   const seen = new Map<string, string>()
   for (const rule of crsRuleOptions.value) {
-    const match = /^(?:REQUEST|RESPONSE)-9(\d{2})-/i.exec(rule.filename)
-    const code = match?.[1]
+    const info = parseCrsFilename(rule.filename)
+    const code = info?.code
     // 系统基础组（01/49/59）不提供选择——后端强制加载；99 通用误报豁免非检测
     // 组（全部规则时自动包含），同样不提供选项（v2.3.x 用户裁定）
     if (!code || seen.has(code) || CRS_INFRA_GROUP_CODES.includes(code) || CRS_HIDDEN_GROUP_CODES.includes(code)) continue
@@ -1838,8 +1860,8 @@ const crsGroupOptions = computed(() => {
 const crsExclusionGroupOptions = computed(() => {
   const seen = new Map<string, string>()
   for (const rule of crsRuleOptions.value) {
-    const match = /^(?:REQUEST|RESPONSE)-9(\d{2})-/i.exec(rule.filename)
-    const code = match?.[1]
+    const info = parseCrsFilename(rule.filename)
+    const code = info?.code
     if (!code || seen.has(code) || code === '01' || CRS_HIDDEN_GROUP_CODES.includes(code)) continue
     seen.set(code, `${crsOptionPhase(rule.filename)} · 9${code} · ${rule.category}`)
   }
@@ -1869,8 +1891,8 @@ interface CrsCascaderOption extends CascaderOption {
   fullLabel?: string
 }
 
-// 从 CRS 文件名提取两位组号（REQUEST-942-*.conf → "42"）——与 normalizeCrsGroups 同源
-const crsGroupCodeOfFile = (file: string): string => /^(?:REQUEST|RESPONSE)-9(\d{2})-/i.exec(file)?.[1] ?? ''
+// 从 CRS 文件名提取两位组号（REQUEST-942-*.conf → "42"）——解析单源 parseCrsFilename
+const crsGroupCodeOfFile = (file: string): string => parseCrsFilename(file)?.code ?? ''
 
 const crsCascaderLazyLoad = (side: CrsCascaderSide): LazyLoad => (node, resolve) => {
   // 一级：组节点（常渲染可浏览，剔除口径按侧）
@@ -2045,7 +2067,7 @@ const exclusionTargetLabel = (target: string): string => {
   if (/^\d{2}$/.test(target)) return crsGroupOptions.value.find((o) => o.value === target)?.label ?? `规则组 ${target}`
   const entry = crsIndexById.value.get(target)
   if (entry) return `${target} — ${crsRuleLabelView(entry).label}`
-  if (/^(?:REQUEST|RESPONSE)-/i.test(target)) return `文件 · ${crsOptionPhase(target)} · ${crsOptionCode(target)}`
+  if (parseCrsFilename(target)) return `文件 · ${crsOptionPhase(target)} · ${crsOptionCode(target)}`
   return target
 }
 
@@ -2261,12 +2283,6 @@ watch(currentStep, (step) => {
   if (step === WIZARD_STEP.BINDINGS && dialogVisible.value) void ensureBindingDetails(boundRules.value)
 })
 
-const parseUnknownStringList = (raw: unknown): string[] => {
-  if (Array.isArray(raw)) return normalizeStringEntries(raw)
-  if (typeof raw === 'string') return parseIPList(raw)
-  return []
-}
-
 // IP 名单归一化（去空白、去重）统一走 mergeIpEntryValues(values, [])。
 // v1 仅做精确字符串匹配——10.0.0.0/8 与 10.0.0.1 之类的 CIDR 包含关系不在本期范围
 //（跨策略冲突检测用）。
@@ -2391,7 +2407,7 @@ const buildConflictChain = (caddyId: string): ConflictPolicyView[] => {
         mode: p.mode,
         ipAclEnabled: p.ip_acl_enabled,
         ipAclMode: p.ip_acl_mode,
-        crsGroups: normalizeCrsGroups(parseUnknownStringList(p.crs_rule_groups)),
+        crsGroups: normalizeCrsGroups(parseUnknownStrings(p.crs_rule_groups)),
         customRefs: parseCustomRuleRefs(p.custom_rules),
         ipAllowEntries: sides.allow,
         ipDenyEntries: sides.deny,
@@ -2536,7 +2552,7 @@ const peerPolicyViews = computed<PeerPolicyView[]>(() =>
         p.ip_whitelist_enabled !== false,
       )
       // 预建 Set——实时警告随输入逐字符重算，不得每次对万级名单做 includes。
-      return { id: p.id, name: p.name, mode: p.mode, crsGroups: normalizeCrsGroups(parseUnknownStringList(p.crs_rule_groups)), allowEntries: sides.allow, denyEntries: sides.deny, allowSet: new Set(sides.allow), denySet: new Set(sides.deny) }
+      return { id: p.id, name: p.name, mode: p.mode, crsGroups: normalizeCrsGroups(parseUnknownStrings(p.crs_rule_groups)), allowEntries: sides.allow, denyEntries: sides.deny, allowSet: new Set(sides.allow), denySet: new Set(sides.deny) }
     }),
 )
 
@@ -2602,7 +2618,7 @@ const wafStepCrsAlert = computed<string>(() => {
 const entrySourceSuffix = (entry: string, inline: string[], refs: number[]): string => {
   if (inline.includes(entry)) return ''
   const names = refs
-    .filter((id) => (ipListDetails.value[id] || []).some((e) => e.value.trim() === entry))
+    .filter((id) => (ipListEntries.value[id] || []).some((e) => e.trim() === entry))
     .map((id) => `「${ipLists.value.find((l) => l.id === id)?.name ?? `#${id}`}」`)
   return names.length > 0 ? `（来自引用列表${names.join('、')}）` : ''
 }
@@ -2905,10 +2921,9 @@ async function openDialog(row?: PolicySummary) {
   // 详情 GET 在途期间用户再点"新建策略"或另一行"编辑"，首个返回会覆盖
   // editingId/表单，把保存语义错位成 PUT 到错误策略。
   const openSeq = ++policyDialogOpenSeq
-  // 本向导私有的引用名单条目缓存只按会话使用——每次打开清空，避免
-  // 在「规则集 → IP 地址列表」编辑条目后重开向导仍读旧条目（合并合计/来源标注
-  // 与列表新鲜 entry_count 自相矛盾，直至整页刷新）。
-  ipListDetails.value = {}
+  // 引用名单条目不再按会话清空：取数走跨组件共享缓存（IP 地址列表的写入口
+  // 已统一调用 invalidateSharedEntriesCache 使条目失效重拉），此处清空只会
+  // 让向导重复下载同一批大名单。
   // 混合策略（兼容旧版）：「编辑」改为只读查看弹框——零可编辑字段，唯一操作=更新迁移
   if (row && policyTypeOf(row) === 'mixed') {
     await openViewDialog(row, openSeq)
@@ -2939,7 +2954,11 @@ async function openDialog(row?: PolicySummary) {
         geoip_enabled: false,
         geoip_mode: d.geoip_mode || 'deny',
         geoip_crawler_exempt: d.geoip_crawler_exempt === true,
-        geoip_crawler_engines: parseIPList(d.geoip_crawler_engines || '').length > 0 ? parseIPList(d.geoip_crawler_engines) : ['googlebot', 'bingbot', 'baiduspider'],
+        // 字段缺失 → 默认三引擎；显式 "[]" 原样保留（后端空集语义=全部引擎）——
+        // 用兜底改写成三项会让「全部」在任意一次保存后被静默收窄。
+        geoip_crawler_engines: d.geoip_crawler_engines === undefined || d.geoip_crawler_engines === ''
+          ? ['googlebot', 'bingbot', 'baiduspider']
+          : parseIPList(d.geoip_crawler_engines),
         waf_check_response: d.waf_check_response ?? false,
         log_request_body: d.log_request_body ?? false,
         trust_detection: d.trust_detection === true,
@@ -3010,8 +3029,6 @@ const resetWizard = () => {
   editingPolicyType.value = null
   rulePickerVisible.value = false
   ruleBoundPolicies.value = {}
-  // 引用名单条目缓存随会话复位清空（与 openDialog 同口径）。
-  ipListDetails.value = {}
   // 阶段页覆盖编辑暂存须随向导复位清空——否则编辑策略 A
   // 暂存的覆盖会跨会话泄漏到绑定同规则的策略 B（保存写入 A 的暂存值）。
   stageOverrideEdits.value = {}
@@ -3175,7 +3192,7 @@ const handleSave = async () => {
       return
     }
     // 历史（用户裁定 A：向导内延迟生效）：本次会话暂存的规则级阶段拦截页覆盖
-    // 在策略落库后逐规则 PUT（lb_rules 上的独立资源，无法与策略保存同一事务）；
+    // 在策略落库后调批量端点（lb_rules 上的独立资源，无法与策略保存同一事务）；
     // 任一失败即列出规则名并保持对话框打开以便重试（与绑定同步失败同款处理）。
     const pendingOverrides = pendingOverrideRules.value
     // 成功提示只弹一条（见下方 showSaveResult 合并调用）——先记下真正写入的条数
@@ -3484,6 +3501,8 @@ onMounted(async () => {
 
 .rule-binding-preview { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 2px 0 4px 24px; }
 .rule-binding-landing { font-size: 12px; color: #6b7280; }
+/* 阶段 0 绑定提示用成功色（信任先于拦截判定，与「排第 N 位」灰字区分） */
+.rule-binding-landing--trust { color: var(--el-color-success); }
 .rule-binding-limit { font-size: 12px; color: #e6a23c; }
 
 .rule-picker-search { margin-bottom: 12px; }

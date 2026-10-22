@@ -1,8 +1,9 @@
 // 证书任务表「按容器宽收敛」：固定列宽会把表格撑出卡片容器产生水平滚动条
 // （实测 1366/1280/1024 视口均有滚动）。收敛口径 = 容器不足时按优先级隐藏
 // 低价值列，并把被隐藏列的信息并入相邻单元格（规则 ID→域名副行、冷却→重试
-// tooltip）。收敛下限 = 不可让位列合计 619px；更窄时表格内部被 .cert-jobs-wrap
-// 的 overflow:hidden 裁断——卡片/页面级不出现横向滚动，表格内部允许裁切。
+// tooltip）。收敛下限 = 不可让位列合计 619px：容器 ≥619px 由 .cert-jobs-wrap
+// 的 overflow:hidden 兜底（卡片/页面级不出现横向滚动）；<619px 切
+// .cert-jobs-wrap--scroll 的 overflow-x:auto——可滚动优先，操作列保持可达。
 //
 // 运行：cd web && npm test
 
@@ -56,9 +57,9 @@ test('贪心让位：容器不足时按优先级隐藏，且隐藏后合计不�
     if (hidden.length < 5) {
       assert.ok(total <= width, `${width}px 可见列合计 ${total} 仍超出容器`)
     } else {
-      // 让位耗尽后仍可能超宽：不可让位列合计 619px > 600px 容器——此时表格
-      // 内部溢出由 .cert-jobs-wrap 的 overflow:hidden 裁断（见下方用例），
-      // 该超宽是显式口径而非断言豁免。
+      // 让位耗尽后仍可能超宽：不可让位列合计 619px > 600px 容器——此时由消费方
+      // 切 .cert-jobs-wrap--scroll 横向滚动（见下方用例），该超宽是显式口径而
+      // 非断言豁免。
       assert.ok(total > width, `${width}px 让位耗尽后合计 ${total} 应仍超宽（下限 619px）`)
       assert.equal(total, CERT_JOB_COLUMNS_MIN_WIDTH)
     }

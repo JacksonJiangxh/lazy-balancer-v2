@@ -369,4 +369,6 @@ export interface GlobalConfigData {
   default_ca_provider_id: number
   dns_provider: string
   github_proxy_url?: string
+  // GitHub 访问令牌是否已配置（后端只回传布尔，不回传令牌本体）：隐显占位用
+  has_github_token?: boolean
 }

@@ -124,6 +124,21 @@ export interface StagePolicyDetails {
 
 export interface CrsRuleFileOption { filename: string; category: string }
 
+/**
+ * CRS 规则文件名 → 阶段与两位组码（如 REQUEST-942-… / RESPONSE-955-…）。
+ * 存储契约用两位组码（'42'），展示用 '9' 前缀（'942'）；文件名不符合
+ * REQUEST|RESPONSE + '-9<dd>-' 形态时返回 null，由调用方决定回退。
+ * 文件名解析（组码/相位）在全仓只此一份——向导选项、级联叶、ghost 标签、
+ * 阶段明细标签共用，避免外部命名契约变更时多点漏改。
+ */
+export interface CrsFilenameInfo { readonly phase: '请求' | '响应'; readonly code: string }
+
+export const parseCrsFilename = (filename: string): CrsFilenameInfo | null => {
+  const match = /^(REQUEST|RESPONSE)-9(\d{2})-/i.exec(filename)
+  if (!match) return null
+  return { phase: match[1].toUpperCase() === 'RESPONSE' ? '响应' : '请求', code: match[2] }
+}
+
 // GET /security/rules/:caddy_id/policy 直接序列化 models.SecurityPolicy——json.RawMessage
 // 字段以原生 JSON（id 数组/组码数组）出现，按 unknown 接收再解析
 export interface SecurityStagePolicyDetail {
@@ -384,6 +399,15 @@ export const hasGeoIPControl = (p: {
   }
   return p.has_geoip === true
 }
+
+/**
+ * 阶段 3 · WAF 谓词——与后端 models.PolicyTypeFeatures 的 G3 逐字对齐：
+ * mode ∈ {blocking, detection, custom_only} ∪ custom_rules 引用非空（不看
+ * mode=off、不看规则启用态）。customRuleRefs 必须是「引用条目数」；
+ * 摘要接口的 custom_rules_count 只数启用规则，仅在该边界形态下略窄。
+ */
+export const hasStage3Features = (mode: string, customRuleRefs: number): boolean =>
+  mode === 'blocking' || mode === 'detection' || mode === 'custom_only' || customRuleRefs > 0
 
 // 阶段 0 · 信任名单行：条目数（空=未配置，任务 G 口径）+ 直通/保留检测模式
 const buildStage0Rows = (policy: SecurityStagePolicy | undefined, ipLists: readonly SecurityStageIPList[]): StageRow[] => {
@@ -666,19 +690,12 @@ const mergeIpEntryDetails = (
 // CRS 组码 → 「请求 · 942 · SQL 注入」式标签（与安全策略页组名表同口径，由规则文件列表推导；
 // 列表未加载/组已消失时回退裸组码，不阻断明细区）
 const crsGroupLabel = (groupCode: string, crsFiles: readonly CrsRuleFileOption[]): string => {
-  // 组码直插 new RegExp——畸形存量组码（含正则元字符）可致构造/匹配抛错
-  // 崩溃抽屉。先 /^\d{2}$/ 门禁，门内形态走 RegExp；非门禁形态退化为裸字符串拼接
-  // 匹配（等价 includes 定位），不构造 RegExp，找不到照旧回退裸组码。
-  let file: CrsRuleFileOption | undefined
-  if (/^\d{2}$/.test(groupCode)) {
-    file = crsFiles.find((r) => new RegExp(`^(?:REQUEST|RESPONSE)-9${groupCode}-`, 'i').test(r.filename))
-  } else {
-    const token = `-9${groupCode}-`.toUpperCase()
-    file = crsFiles.find((r) => r.filename.toUpperCase().includes(token))
-  }
+  // 组码逐字比较（原实现把组码拼进 RegExp，畸形存量组码含元字符会抛错崩溃抽屉；
+  // 解析走 parseCrsFilename，不再构造正则）
+  const file = crsFiles.find((r) => parseCrsFilename(r.filename)?.code === groupCode)
   if (!file) return groupCode
-  const phase = /^RESPONSE-/i.test(file.filename) ? '响应' : '请求'
-  return `${phase} · 9${groupCode} · ${file.category}`
+  const info = parseCrsFilename(file.filename)
+  return `${info?.phase ?? '请求'} · 9${groupCode} · ${file.category}`
 }
 
 // 限流口径文案（与后端 buildRateLimitHandler 双 zone 语义一致）：
@@ -703,7 +720,9 @@ export const parseUnknownIds = (raw: unknown): number[] => {
   }).filter((n) => Number.isInteger(n) && n > 0)
 }
 
-const parseUnknownStrings = (raw: unknown): string[] => {
+// 字符串数组字段的宽松解析（原生数组 / JSON 文本两形态）：RawMessage 字段按
+// unknown 接收后统一走本入口；空项与非字符串丢弃，坏 JSON 回退空数组。
+export const parseUnknownStrings = (raw: unknown): string[] => {
   if (Array.isArray(raw)) return normalizeStringEntries(raw)
   if (typeof raw === 'string') return parseIPList(raw)
   return []

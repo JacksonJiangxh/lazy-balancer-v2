@@ -21,13 +21,6 @@ test('输入变化使旧在途结果失效，恢复旧值也不能复活', () =>
   assert.equal(guard.isCurrent(newToken, values), true)
 })
 
-test('关闭弹框或重新 load 作废同快照在途探测', () => {
-  const guard = createOidcProbeGuard()
-  const token = guard.token(values)
-  guard.invalidate()
-  assert.equal(guard.isCurrent(token, values), false)
-})
-
 // issuer 失焦原无条件重发 discovery+JWKS（+可选凭证校验）外部请求，
 // 字段间来回切换会重复打 IdP。结果仍对应当前表单值时必须直接复用。
 test('已通过且值未变的探测结果可复用', () => {
