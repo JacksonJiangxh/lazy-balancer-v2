@@ -607,3 +607,114 @@ func TestCreateAPIKey_missingUserContextRejected(t *testing.T) {
 		t.Fatalf("orphan keys=%d, want 0（不得写入 created_by=0 的孤儿 Key）", orphanKeys)
 	}
 }
+
+// 自助更新入口缺认证上下文必须 401（与创建/删除同形）——不得退化成
+// created_by=0 查询后的 404「不存在」。
+func TestUpdateCurrentUserAPIKeyStatus_missingAuthContextIs401(t *testing.T) {
+	setupAPIKeyTestDB(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.PUT("/api-keys/:id", (&Handlers{}).UpdateCurrentUserAPIKeyStatus)
+
+	req := httptest.NewRequest(http.MethodPut, "/api-keys/10", strings.NewReader(`{"is_enabled":false}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s, want 401（认证上下文缺失）", rec.Code, rec.Body.String())
+	}
+	var enabled int
+	if err := db.DB.QueryRow("SELECT is_enabled FROM api_keys WHERE id=10").Scan(&enabled); err != nil {
+		t.Fatal(err)
+	}
+	if enabled != 1 {
+		t.Fatalf("is_enabled=%d, want 1（缺上下文不得更新任何行）", enabled)
+	}
+}
+
+// 审计 delta 的「变更后条数」必须用归一化后的白名单（与库内落值同源）：
+// 提交重复 CIDR 时不得显示 2 条而库内只有 1 条。
+func TestUpdateAPIKeyStatus_auditUsesNormalizedWhitelistCount(t *testing.T) {
+	setupAPIKeyTestDB(t)
+	if _, err := db.AuditDB.Exec(`CREATE TABLE audit_log (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		username VARCHAR(50), action VARCHAR(50), resource VARCHAR(50),
+		detail TEXT, ip_address VARCHAR(50), created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatalf("create audit table: %v", err)
+	}
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.PUT("/api-keys/:id", func(c *gin.Context) {
+		c.Set("user_id", 1)
+		c.Set("username", "alice")
+		c.Set("auth_type", "jwt")
+		c.Set("role", "user")
+		(&Handlers{}).UpdateCurrentUserAPIKeyStatus(c)
+	})
+
+	req := httptest.NewRequest(http.MethodPut, "/api-keys/10", strings.NewReader(`{"mcp_ip_whitelist":["1.2.3.4","1.2.3.4"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+
+	var detail string
+	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='更新' AND resource='API密钥' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
+		t.Fatalf("read audit detail: %v", err)
+	}
+	if !strings.Contains(detail, "MCP 白名单：0 条→1 条") {
+		t.Fatalf("audit detail=%q, want 归一化后的「0 条→1 条」", detail)
+	}
+	if strings.Contains(detail, "→2 条") {
+		t.Fatalf("audit detail=%q 使用了请求原值条数（重复 CIDR 虚报）", detail)
+	}
+}
+
+// 已启用 MCP 的 Key 变更白名单属特权变更：与「收回只读/开启 MCP」同口径走
+// MFA step-up 判定（守卫开启 + 操作者启用 MFA 且无近期验码 → 428）。
+func TestUpdateAPIKeyStatus_whitelistChangeOnMCPKeyRequiresStepUp(t *testing.T) {
+	setupAPIKeyTestDB(t)
+	if _, err := db.DB.Exec(`ALTER TABLE users ADD COLUMN mfa_enabled INTEGER DEFAULT 0`); err != nil {
+		t.Fatalf("add mfa column: %v", err)
+	}
+	if _, err := db.DB.Exec(`UPDATE users SET mfa_enabled=1 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, mfa_write_guard INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO global_config (id, mfa_write_guard) VALUES (1, 1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`UPDATE api_keys SET mcp_enabled=1, mcp_ip_whitelist='["10.0.0.1/32"]' WHERE id=10`); err != nil {
+		t.Fatal(err)
+	}
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.PUT("/api-keys/:id", func(c *gin.Context) {
+		c.Set("user_id", 1)
+		c.Set("username", "alice")
+		c.Set("auth_type", "jwt")
+		c.Set("role", "user")
+		(&Handlers{}).UpdateCurrentUserAPIKeyStatus(c)
+	})
+
+	req := httptest.NewRequest(http.MethodPut, "/api-keys/10", strings.NewReader(`{"mcp_ip_whitelist":["10.0.0.2/32"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusPreconditionRequired {
+		t.Fatalf("status=%d body=%s, want 428（MCP 白名单放宽属特权变更）", rec.Code, rec.Body.String())
+	}
+	var whitelist string
+	if err := db.DB.QueryRow("SELECT COALESCE(mcp_ip_whitelist,'') FROM api_keys WHERE id=10").Scan(&whitelist); err != nil {
+		t.Fatal(err)
+	}
+	if whitelist != `["10.0.0.1/32"]` {
+		t.Fatalf("whitelist=%q，未通过 step-up 不得落库", whitelist)
+	}
+}

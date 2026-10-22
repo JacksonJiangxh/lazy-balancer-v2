@@ -177,3 +177,123 @@ func TestRotateAuditLog_promotesStagedArchiveAfterShift(t *testing.T) {
 		t.Fatalf("活文件必须已截断: size=%v err=%v", info, err)
 	}
 }
+
+// 归档代检查的 stat 只允许把 NotExist 视为「该代不存在」：权限/IO 错误下
+// 归档可能仍存在，继续 shift/promote 会覆盖仍有效的 .1（丢一代审计证据）。
+// 用自指符号链接注入 ELOOP（stat 失败但不是缺失）。
+func TestRotateAuditLog_statErrorAbortsBeforeOverwritingArchives(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	oldLogPath, oldSizeBytes := auditLogPath, auditLogSizeBytes
+	auditLogPath = logPath
+	auditLogSizeBytes = func() int64 { return 1 }
+	t.Cleanup(func() { auditLogPath, auditLogSizeBytes = oldLogPath, oldSizeBytes })
+	resetPendingDeltaCorruptStreakForTest()
+	if err := os.WriteFile(logPath, []byte("live-content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath+".1", []byte("archive-one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 自指符号链接：os.Stat 返回 ELOOP（非 NotExist）。
+	if err := os.Symlink(logPath+".3", logPath+".3"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := rotateAuditLogIfNeeded()
+	if err == nil {
+		t.Fatal("stat 非 NotExist 错误必须中止本轮并返回错误")
+	}
+	got, rerr := os.ReadFile(logPath + ".1")
+	if rerr != nil || string(got) != "archive-one" {
+		t.Fatalf(".1=%q err=%v，stat 异常时不得覆盖仍在的归档", got, rerr)
+	}
+	if _, serr := os.Stat(logPath + ".1.new"); !os.IsNotExist(serr) {
+		t.Fatalf("中止必须清理暂存归档 .1.new，stat err=%v", serr)
+	}
+}
+
+// .1 未能让位时中止：.2 为非空目录使 .1→.2 的 rename 失败（上级链 .2/.3/.4/.5
+// 同样被占住，逐级 shift 全部失败），本轮必须中止且保留 .1 与 .2 现场。
+func TestRotateAuditLog_shiftFailureForFirstGenerationAbortsAndKeepsArchives(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	oldLogPath, oldSizeBytes := auditLogPath, auditLogSizeBytes
+	auditLogPath = logPath
+	auditLogSizeBytes = func() int64 { return 1 }
+	t.Cleanup(func() { auditLogPath, auditLogSizeBytes = oldLogPath, oldSizeBytes })
+	resetPendingDeltaCorruptStreakForTest()
+	if err := os.WriteFile(logPath, []byte("live-content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath+".1", []byte("archive-one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, gen := range []string{".2", ".3", ".4", ".5"} {
+		p := logPath + gen
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(p, "keep"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	_, err := rotateAuditLogIfNeeded()
+	if err == nil {
+		t.Fatal(".1 未能让位必须中止本轮并返回错误")
+	}
+	got, rerr := os.ReadFile(logPath + ".1")
+	if rerr != nil || string(got) != "archive-one" {
+		t.Fatalf(".1=%q err=%v，中止后必须保留上一代归档", got, rerr)
+	}
+	if st, serr := os.Stat(logPath + ".2"); serr != nil || !st.IsDir() {
+		t.Fatalf(".2 现场必须保留, stat=%v err=%v", st, serr)
+	}
+	if _, serr := os.Stat(logPath + ".1.new"); !os.IsNotExist(serr) {
+		t.Fatalf("中止必须清理暂存归档 .1.new，stat err=%v", serr)
+	}
+}
+
+// 损坏的待补采标记在连续 N 轮不可解析后隔离为 .corrupt-<ts> 并继续轮转——
+// 单轮仍 fail-closed 保留现场，否则 audit.log 永久不轮转（无界增长）。
+func TestRotateAuditLog_corruptPendingMarkerQuarantinedAfterThreshold(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	oldLogPath, oldSizeBytes := auditLogPath, auditLogSizeBytes
+	auditLogPath = logPath
+	auditLogSizeBytes = func() int64 { return 1 }
+	t.Cleanup(func() { auditLogPath, auditLogSizeBytes = oldLogPath, oldSizeBytes })
+	resetPendingDeltaCorruptStreakForTest()
+	t.Cleanup(resetPendingDeltaCorruptStreakForTest)
+
+	if err := os.WriteFile(logPath, []byte("live-content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	marker := securityEventsPendingDeltaPath()
+	if err := os.WriteFile(marker, []byte(`{"path": "broken`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for round := 1; round < pendingDeltaCorruptQuarantineRounds; round++ {
+		if _, err := rotateAuditLogIfNeeded(); err == nil {
+			t.Fatalf("第 %d 轮损坏标记必须 fail-closed 中止", round)
+		}
+		if _, err := os.Stat(marker); err != nil {
+			t.Fatalf("第 %d 轮不得提前隔离标记: %v", round, err)
+		}
+	}
+	// 第 N 轮：标记被隔离，轮转继续推进（后续偏移写入可能因测试环境目录
+	// 只读失败——隔离动作本身必须已发生，归档必须已生成）。
+	_, err := rotateAuditLogIfNeeded()
+	if _, serr := os.Stat(marker); !os.IsNotExist(serr) {
+		t.Fatalf("连续 %d 轮损坏后标记必须已隔离, stat err=%v (rotate err=%v)", pendingDeltaCorruptQuarantineRounds, serr, err)
+	}
+	quarantined, _ := filepath.Glob(marker + ".corrupt-*")
+	if len(quarantined) != 1 {
+		t.Fatalf("隔离文件=%v, want 恰一个 .corrupt-<ts>", quarantined)
+	}
+	if _, serr := os.Stat(logPath + ".1"); serr != nil {
+		t.Fatalf("隔离后轮转必须继续（.1 归档应存在）: %v (rotate err=%v)", serr, err)
+	}
+}

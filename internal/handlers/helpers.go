@@ -49,17 +49,28 @@ var staticSystemInfo = struct {
 	caddyVersion: loadCaddyVersion(),
 }
 
+// systemSampleNegativeTTL 外部命令失败的短负缓存窗口：df/netstat 挂起时，
+// 每个轮询周期都重跑命令并等满超时（singleflight 只合并并发、不合并串行
+// 轮询），读路径持续高延迟。失败短缓存到期即重试，与指标端点负缓存同型。
+var systemSampleNegativeTTL = 2 * time.Second
+
 var diskUsageCache struct {
 	sync.Mutex
 	total     uint64
 	used      uint64
 	expiresAt time.Time
+	// 失败负缓存（窗口内直接返回同一错误，不再起子进程）。
+	negativeUntil time.Time
+	negativeErr   error
 }
 
 var connectionStatsCache struct {
 	sync.Mutex
 	stats     models.ConnectionStats
 	expiresAt time.Time
+	// 失败负缓存（同 diskUsageCache）。
+	negativeUntil time.Time
+	negativeErr   error
 }
 
 type CertificateInfo struct {
@@ -269,8 +280,15 @@ func dialOutboundIP() (string, bool) {
 	return localAddr.IP.String(), true
 }
 
+// getOutboundIP 返回本机出口 IP；探测失败（无默认路由/受限网络）返回空串并
+// 留痕——不得把回环地址当机器地址展示（排障窗口会把人引向错误方向）。
 func getOutboundIP() string {
-	ip, _ := dialOutboundIP()
+	ip, ok := dialOutboundIP()
+	if !ok {
+		services.LogConfigReadFailure("system-outbound-ip", errors.New("出口 IP 探测失败（无默认路由/受限网络），ip_address 置空"))
+		return ""
+	}
+	services.LogConfigReadRecovered("system-outbound-ip")
 	return ip
 }
 
@@ -311,8 +329,11 @@ func loadOSInfo() string {
 func getOSInfo() string { return staticSystemInfo.osInfo }
 
 func loadCommandOutput(name string, args ...string) string {
-	cmd := exec.Command(name, args...)
-	output, err := cmd.Output()
+	// 与运行期 df/netstat 同口径：包初始化路径同样不得无界阻塞（外部二进制
+	// 损坏/ PATH 指向阻塞脚本时，启动会在日志/端口就绪前挂死）。
+	ctx, cancel := context.WithTimeout(context.Background(), systemMetricsCommandTimeout)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, name, args...).Output()
 	if err != nil {
 		return "unknown"
 	}
@@ -336,25 +357,51 @@ func getNetworkIPs() map[string]string {
 		if err != nil {
 			continue
 		}
-		for _, addr := range addrs {
-			var ip net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
-			}
-			if ip != nil && ip.To4() != nil {
-				ips[iface.Name] = ip.String()
-			}
+		// IPv4 优先（页面展示口径不变）；接口只有 IPv6（IPv6-only 主机/容器）
+		// 时回落到全局单播 IPv6——否则该主机网络地址列表恒空。link-local
+		// (fe80::/10) 不可路由，不展示。
+		if ip := preferredInterfaceIP(addrs); ip != nil {
+			ips[iface.Name] = ip.String()
 		}
 	}
 	return ips
 }
 
+// preferredInterfaceIP 从接口地址中选出展示用地址：IPv4 优先；无 IPv4 时取
+// 第一个非 link-local/未指定的 IPv6（IPv6-only 主机不再显示为空）。
+func preferredInterfaceIP(addrs []net.Addr) net.IP {
+	var ipv4, ipv6 net.IP
+	for _, addr := range addrs {
+		var ip net.IP
+		switch v := addr.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		}
+		if ip == nil {
+			continue
+		}
+		if v4 := ip.To4(); v4 != nil {
+			if ipv4 == nil {
+				ipv4 = v4
+			}
+			continue
+		}
+		if ipv6 == nil && !ip.IsLinkLocalUnicast() && !ip.IsUnspecified() {
+			ipv6 = ip
+		}
+	}
+	if ipv4 != nil {
+		return ipv4
+	}
+	return ipv6
+}
+
 func loadCaddyVersion() string {
-	cmd := exec.Command("caddy", "version")
-	output, err := cmd.Output()
+	ctx, cancel := context.WithTimeout(context.Background(), systemMetricsCommandTimeout)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, "caddy", "version").Output()
 	if err != nil {
 		return "unknown"
 	}
@@ -454,6 +501,11 @@ func getCachedDiskUsage(now time.Time) (uint64, uint64, error) {
 		diskUsageCache.Unlock()
 		return total, used, nil
 	}
+	if now.Before(diskUsageCache.negativeUntil) {
+		err := diskUsageCache.negativeErr
+		diskUsageCache.Unlock()
+		return 0, 0, err
+	}
 	diskUsageCache.Unlock()
 	// 外部命令在锁外执行（旧实现持锁 Output()：df 卡顿时连命中缓存的请求都
 	// 被串行阻塞），并发 miss 经 single-flight 合并。
@@ -464,20 +516,26 @@ func getCachedDiskUsage(now time.Time) (uint64, uint64, error) {
 			diskUsageCache.Unlock()
 			return [2]uint64{total, used}, nil
 		}
+		if time.Now().Before(diskUsageCache.negativeUntil) {
+			err := diskUsageCache.negativeErr
+			diskUsageCache.Unlock()
+			return [2]uint64{}, err
+		}
 		diskUsageCache.Unlock()
 		ctx, cancel := context.WithTimeout(context.Background(), systemMetricsCommandTimeout)
 		defer cancel()
 		dfOutput, err := systemMetricsDFCommand(ctx).Output()
 		if err != nil {
-			return [2]uint64{}, fmt.Errorf("读取系统磁盘指标失败: %w", err)
+			return [2]uint64{}, storeDiskUsageFailure(fmt.Errorf("读取系统磁盘指标失败: %w", err))
 		}
 		total, used, ok := parseDFOutput(string(dfOutput))
 		if !ok {
-			return [2]uint64{}, fmt.Errorf("解析系统磁盘指标失败")
+			return [2]uint64{}, storeDiskUsageFailure(fmt.Errorf("解析系统磁盘指标失败"))
 		}
 		diskUsageCache.Lock()
 		diskUsageCache.total, diskUsageCache.used = total, used
 		diskUsageCache.expiresAt = time.Now().Add(systemSampleTTL)
+		diskUsageCache.negativeUntil, diskUsageCache.negativeErr = time.Time{}, nil
 		diskUsageCache.Unlock()
 		return [2]uint64{total, used}, nil
 	})
@@ -486,6 +544,16 @@ func getCachedDiskUsage(now time.Time) (uint64, uint64, error) {
 	}
 	values, _ := value.([2]uint64)
 	return values[0], values[1], nil
+}
+
+// storeDiskUsageFailure 写入失败短负缓存并原样返回错误（singleflight 的
+// 等待者也必须拿到同一错误）。
+func storeDiskUsageFailure(err error) error {
+	diskUsageCache.Lock()
+	diskUsageCache.negativeUntil = time.Now().Add(systemSampleNegativeTTL)
+	diskUsageCache.negativeErr = err
+	diskUsageCache.Unlock()
+	return err
 }
 
 func parseMemInfo(input string) (uint64, uint64, error) {
@@ -561,6 +629,7 @@ var lastNetStats struct {
 	mu       sync.Mutex
 	bytesIn  uint64
 	bytesOut uint64
+	iface    string // 基线所属默认路由接口：接口切换后新旧计数器不可比
 	time     time.Time
 	rateIn   int64
 	rateOut  int64
@@ -581,7 +650,7 @@ func getRealtimeTraffic() (models.RealtimeTraffic, error) {
 		return models.RealtimeTraffic{}, err
 	}
 
-	totalBytesIn, totalBytesOut, err := parseNetDevTotals(string(netStat))
+	totalBytesIn, totalBytesOut, iface, err := parseNetDevTotals(string(netStat))
 	if err != nil {
 		return models.RealtimeTraffic{}, err
 	}
@@ -590,8 +659,15 @@ func getRealtimeTraffic() (models.RealtimeTraffic, error) {
 
 	if !lastNetStats.time.IsZero() {
 		elapsed := now.Sub(lastNetStats.time).Seconds()
+		// 默认路由切换（多网卡/容器重建/策略路由变更）后新接口的累计计数器
+		// 与旧基线不可比：直接差分会把「新接口历史总流量」当成本轮速率（数量级
+		// 假峰值）。接口身份变化即重建基线（本轮速率 0）。
+		ifaceChanged := lastNetStats.iface != "" && iface != "" && iface != lastNetStats.iface
 		countersRolledBack := totalBytesIn < lastNetStats.bytesIn || totalBytesOut < lastNetStats.bytesOut
-		if elapsed > 0 && !countersRolledBack {
+		if ifaceChanged {
+			services.Logf("info", "实时流量基线重建：默认路由接口 %s → %s（新旧计数器不可比，本轮速率归零）", lastNetStats.iface, iface)
+		}
+		if elapsed > 0 && !countersRolledBack && !ifaceChanged {
 			rateIn = int64(float64(totalBytesIn-lastNetStats.bytesIn) / elapsed)
 			rateOut = int64(float64(totalBytesOut-lastNetStats.bytesOut) / elapsed)
 			if rateIn < 0 {
@@ -605,6 +681,7 @@ func getRealtimeTraffic() (models.RealtimeTraffic, error) {
 
 	lastNetStats.bytesIn = totalBytesIn
 	lastNetStats.bytesOut = totalBytesOut
+	lastNetStats.iface = iface
 	lastNetStats.time = now
 	lastNetStats.rateIn = rateIn
 	lastNetStats.rateOut = rateOut
@@ -616,10 +693,43 @@ func getRealtimeTraffic() (models.RealtimeTraffic, error) {
 	}, nil
 }
 
-func parseNetDevTotals(input string) (uint64, uint64, error) {
+// primeSystemSamplers 在包初始化时建立 CPU/实时流量基线：首个采集不再把
+// 「尚无基线」静默显示为 0%（进程重启后首屏尤其明显——用户无法区分真的空闲
+// 与仍在建基线）。基线读取失败（非 Linux/无 /proc）时保持未初始化，由首个
+// 请求按原路径建基线。
+func primeSystemSamplers() {
+	now := time.Now()
+	if stat, err := systemMetricsReadFile("/proc/stat"); err == nil {
+		if snapshot, ok := parseCPUSnapshot(string(stat)); ok {
+			lastCPUStats.mu.Lock()
+			lastCPUStats.snapshot = snapshot
+			lastCPUStats.sampledAt = now
+			lastCPUStats.hasValue = true
+			lastCPUStats.mu.Unlock()
+		}
+	}
+	if netStat, err := systemMetricsReadFile("/proc/net/dev"); err == nil {
+		if bytesIn, bytesOut, iface, err := parseNetDevTotals(string(netStat)); err == nil {
+			lastNetStats.mu.Lock()
+			lastNetStats.bytesIn, lastNetStats.bytesOut, lastNetStats.iface = bytesIn, bytesOut, iface
+			lastNetStats.time = now
+			lastNetStats.hasValue = true
+			lastNetStats.mu.Unlock()
+		}
+	}
+}
+
+func init() {
+	primeSystemSamplers()
+}
+
+// parseNetDevTotals 返回默认路由出口接口的累计收发字节与接口名（接口名供读侧
+// 判定「基线是否仍属同一接口」；无默认路由的多物理接口聚合形态返回空串——无
+// 单一身份可比）。
+func parseNetDevTotals(input string) (uint64, uint64, string, error) {
 	route, err := systemMetricsReadFile("/proc/net/route")
 	if err != nil {
-		return 0, 0, fmt.Errorf("读取默认路由失败: %w", err)
+		return 0, 0, "", fmt.Errorf("读取默认路由失败: %w", err)
 	}
 	if defaultInterface, err := parseDefaultRouteInterface(string(route)); err == nil {
 		for _, line := range strings.Split(input, "\n") {
@@ -629,19 +739,19 @@ func parseNetDevTotals(input string) (uint64, uint64, error) {
 			}
 			fields := strings.Fields(counters)
 			if len(fields) < 16 {
-				return 0, 0, fmt.Errorf("解析网卡 %s 流量失败: 计数器字段不足", strings.TrimSpace(name))
+				return 0, 0, "", fmt.Errorf("解析网卡 %s 流量失败: 计数器字段不足", strings.TrimSpace(name))
 			}
 			bytesIn, err := strconv.ParseUint(fields[0], 10, 64)
 			if err != nil {
-				return 0, 0, fmt.Errorf("解析网卡 %s 接收流量失败: %w", strings.TrimSpace(name), err)
+				return 0, 0, "", fmt.Errorf("解析网卡 %s 接收流量失败: %w", strings.TrimSpace(name), err)
 			}
 			bytesOut, err := strconv.ParseUint(fields[8], 10, 64)
 			if err != nil {
-				return 0, 0, fmt.Errorf("解析网卡 %s 发送流量失败: %w", strings.TrimSpace(name), err)
+				return 0, 0, "", fmt.Errorf("解析网卡 %s 发送流量失败: %w", strings.TrimSpace(name), err)
 			}
-			return bytesIn, bytesOut, nil
+			return bytesIn, bytesOut, defaultInterface, nil
 		}
-		return 0, 0, fmt.Errorf("默认路由接口 %s 不存在于 /proc/net/dev", defaultInterface)
+		return 0, 0, "", fmt.Errorf("默认路由接口 %s 不存在于 /proc/net/dev", defaultInterface)
 	}
 	// 无默认路由（如容器 netns 只有子网路由）：统计物理类接口，排除 lo 与
 	// 会重复计数的虚拟叠加层（veth/docker 网桥/br-*）
@@ -670,9 +780,9 @@ func parseNetDevTotals(input string) (uint64, uint64, error) {
 		matched = true
 	}
 	if !matched {
-		return 0, 0, fmt.Errorf("无法确定默认路由出口接口且无可用物理网卡")
+		return 0, 0, "", fmt.Errorf("无法确定默认路由出口接口且无可用物理网卡")
 	}
-	return totalIn, totalOut, nil
+	return totalIn, totalOut, "", nil
 }
 
 func parseDefaultRouteInterface(input string) (string, error) {
@@ -751,6 +861,11 @@ func getConnectionStats() (models.ConnectionStats, error) {
 		connectionStatsCache.Unlock()
 		return stats, nil
 	}
+	if now.Before(connectionStatsCache.negativeUntil) {
+		err := connectionStatsCache.negativeErr
+		connectionStatsCache.Unlock()
+		return models.ConnectionStats{}, err
+	}
 	connectionStatsCache.Unlock()
 	// 外部命令在锁外执行且带超时、并发合并（旧实现持锁无超时执行
 	// netstat：宿主网络栈卡住时所有并发请求串行挂起）。
@@ -761,17 +876,28 @@ func getConnectionStats() (models.ConnectionStats, error) {
 			connectionStatsCache.Unlock()
 			return stats, nil
 		}
+		if time.Now().Before(connectionStatsCache.negativeUntil) {
+			err := connectionStatsCache.negativeErr
+			connectionStatsCache.Unlock()
+			return models.ConnectionStats{}, err
+		}
 		connectionStatsCache.Unlock()
 		ctx, cancel := context.WithTimeout(context.Background(), systemMetricsCommandTimeout)
 		defer cancel()
 		output, err := netstatCommand(ctx).Output()
 		if err != nil {
-			return models.ConnectionStats{}, fmt.Errorf("execute netstat -tan: %w", err)
+			failure := fmt.Errorf("execute netstat -tan: %w", err)
+			connectionStatsCache.Lock()
+			connectionStatsCache.negativeUntil = time.Now().Add(systemSampleNegativeTTL)
+			connectionStatsCache.negativeErr = failure
+			connectionStatsCache.Unlock()
+			return models.ConnectionStats{}, failure
 		}
 		stats := parseConnectionStats(string(output))
 		connectionStatsCache.Lock()
 		connectionStatsCache.stats = stats
 		connectionStatsCache.expiresAt = time.Now().Add(systemSampleTTL)
+		connectionStatsCache.negativeUntil, connectionStatsCache.negativeErr = time.Time{}, nil
 		connectionStatsCache.Unlock()
 		return stats, nil
 	})

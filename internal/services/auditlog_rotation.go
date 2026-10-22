@@ -28,6 +28,51 @@ var (
 	auditFailureLogClock = time.Now
 )
 
+// errPendingDeltaMarkerCorrupt 标记内容损坏（半写/非法 JSON/缺路径）——
+// 与瞬时读取错误分判：损坏标记无法通过重试自愈，连续多轮不可解析时必须
+// 隔离后重建，否则 audit.log 永久不轮转（无界增长）。
+var errPendingDeltaMarkerCorrupt = errors.New("pending delta marker corrupt")
+
+// pendingDeltaCorruptQuarantineRounds 连续损坏轮次达到该值后隔离标记。
+// 单轮仍保留现场（fail-closed，供诊断/人工恢复），持续不可解析才自愈。
+const pendingDeltaCorruptQuarantineRounds = 3
+
+var pendingDeltaCorruptStreak = struct {
+	sync.Mutex
+	count int
+}{}
+
+// notePendingDeltaCorruptRound 记一轮损坏并返回连续轮次。
+func notePendingDeltaCorruptRound() int {
+	pendingDeltaCorruptStreak.Lock()
+	defer pendingDeltaCorruptStreak.Unlock()
+	pendingDeltaCorruptStreak.count++
+	return pendingDeltaCorruptStreak.count
+}
+
+// resetPendingDeltaCorruptStreak 清零连续损坏轮次（标记可读或遇到非损坏类
+// 读取错误时调用——只有连续损坏才触发隔离）。
+func resetPendingDeltaCorruptStreak() {
+	pendingDeltaCorruptStreak.Lock()
+	pendingDeltaCorruptStreak.count = 0
+	pendingDeltaCorruptStreak.Unlock()
+}
+
+// resetPendingDeltaCorruptStreakForTest 测试隔离连续损坏状态（仅测试）。
+func resetPendingDeltaCorruptStreakForTest() { resetPendingDeltaCorruptStreak() }
+
+// quarantineCorruptPendingDelta 把无法解析的标记重命名为
+// `.corrupt-<unix>` 保留现场并解除轮转阻塞（下轮无标记即正常轮转）。
+func quarantineCorruptPendingDelta(path string) error {
+	target := fmt.Sprintf("%s.corrupt-%d", path, time.Now().UTC().Unix())
+	if err := os.Rename(path, target); err != nil {
+		return err
+	}
+	throttledAuditFailureLogf("audit log rotation: pending delta marker quarantined after %d corrupt rounds: %s → %s",
+		pendingDeltaCorruptQuarantineRounds, path, target)
+	return nil
+}
+
 // auditFailureLogWindow 是同一消息的放行窗口（60s，确立口径）。
 const auditFailureLogWindow = 60 * time.Second
 
@@ -131,9 +176,25 @@ func rotateAuditLogIfNeeded() (total int, rotErr error) {
 	if pendingErr != nil {
 		// 标记是否存在及其补采责任未知时不得 shift/覆盖任何归档；保留现场，
 		// 下轮读恢复后先重试补采。与其他轮转 I/O 错误同走 fail-closed。
-		return total, fmt.Errorf("read pending delta marker: %w", pendingErr)
+		// 损坏标记（半写/非法 JSON）无法靠重试自愈：连续 N 轮不可解析后隔离
+		// 为 .corrupt-<ts> 并继续轮转——否则 audit.log 永久不轮转。
+		if errors.Is(pendingErr, errPendingDeltaMarkerCorrupt) {
+			if notePendingDeltaCorruptRound() >= pendingDeltaCorruptQuarantineRounds {
+				if qerr := quarantineCorruptPendingDelta(securityEventsPendingDeltaPath()); qerr != nil {
+					return total, fmt.Errorf("quarantine corrupt pending delta marker: %w", qerr)
+				}
+				resetPendingDeltaCorruptStreak()
+			} else {
+				return total, fmt.Errorf("read pending delta marker: %w", pendingErr)
+			}
+		} else {
+			resetPendingDeltaCorruptStreak()
+			return total, fmt.Errorf("read pending delta marker: %w", pendingErr)
+		}
+	} else {
+		resetPendingDeltaCorruptStreak()
 	}
-	if pending != nil {
+	if pendingErr == nil && pending != nil {
 		if _, err := os.Stat(pending.Path); os.IsNotExist(err) {
 			// warn 走 60s 限流（throttledAuditFailureLogf）——标记删除
 			// 失败（只读目录等）时标记留在盘上，2s tick 反复进入本分支，裸 warn
@@ -186,7 +247,7 @@ func rotateAuditLogIfNeeded() (total int, rotErr error) {
 	for i := 4; i >= 1; i-- {
 		old := filepath.Join(dir, fmt.Sprintf("%s.%d", base, i))
 		newer := filepath.Join(dir, fmt.Sprintf("%s.%d", base, i+1))
-		if _, err := os.Stat(old); err == nil {
+		if _, statErr := os.Stat(old); statErr == nil {
 			if rerr := os.Rename(old, newer); rerr != nil {
 				throttledAuditFailureLogf("audit log rotation: shift %s → %s failed: %v", old, newer, rerr)
 				if i == 1 {
@@ -197,6 +258,13 @@ func rotateAuditLogIfNeeded() (total int, rotErr error) {
 				}
 				noteErr(fmt.Errorf("shift %s → %s: %w", old, newer, rerr))
 			}
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			// 只有 NotExist 才能视为「该代不存在」。权限/IO 等 stat 失败下
+			// 归档可能仍存在——继续 shift/promote 会覆盖仍有效的 .1（静默
+			// 丢失一代审计证据），本轮中止并保留现场。
+			_ = os.Remove(staging)
+			throttledAuditFailureLogf("audit log rotation: stat %s failed (rotation aborted): %v", old, statErr)
+			return total, fmt.Errorf("stat %s (rotation aborted): %w", old, statErr)
 		}
 	}
 	// 提升暂存归档为 .1——新归档在此刻才对外可见；失败清理暂存且不截断活文件。
@@ -435,7 +503,7 @@ func securityEventsReadPendingDelta() (*securityEventsPendingDelta, error) {
 	var p securityEventsPendingDelta
 	if err := json.Unmarshal(data, &p); err != nil || p.Path == "" {
 		throttledAuditFailureLogf("audit log rotation: pending delta marker corrupt (rotation deferred, marker kept): %s", path)
-		return nil, fmt.Errorf("pending delta marker corrupt: %s", path)
+		return nil, fmt.Errorf("%w: %s", errPendingDeltaMarkerCorrupt, path)
 	}
 	return &p, nil
 }

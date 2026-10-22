@@ -186,7 +186,10 @@ func oidcAccessAllowed(cfg OIDCConfig, email string, groups []string) (bool, str
 		}
 		matched := false
 		for _, d := range cfg.AllowedEmailDomains {
-			if domain == d {
+			// 读侧再规范化（写侧 normalizeOIDCAllowedDomains 已 trim+小写）：
+			// 带外写入/旧值（未小写、带空格）时逐字比较会永远不匹配 →
+			// 全员拒登。比较两侧同口径，成本可忽略。
+			if domain == strings.ToLower(strings.TrimSpace(d)) {
 				matched = true
 				break
 			}

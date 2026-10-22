@@ -154,6 +154,11 @@ func ValidateLocationName(name string) error {
 }
 
 func ConfigureLocation(name string) (*time.Location, error) {
+	// 单源校验：time.LoadLocation("") 合法返回 UTC，放行会让第二写入口静默
+	// 把全站切 UTC。读刷新/写侧/启动均已预校验，此处是防御纵深的单点收敛。
+	if err := ValidateLocationName(name); err != nil {
+		return nil, err
+	}
 	loc, err := time.LoadLocation(name)
 	if err != nil {
 		return nil, err
@@ -342,7 +347,17 @@ func hasASCIIPrefixFold(value []byte, prefix string) bool {
 func ApplyLogLevel() {
 	level := "info"
 	if db.DB != nil {
-		_ = db.DB.QueryRow("SELECT COALESCE(log_level,'info') FROM global_config WHERE id=1").Scan(&level)
+		if err := db.DB.QueryRow("SELECT COALESCE(log_level,'info') FROM global_config WHERE id=1").Scan(&level); err != nil {
+			// 读失败不得静默降级：warn/error 配置失效会放大日志量，与「配置
+			// 读失败必须留痕」同族。状态转换口径（首报 warn + 恢复 info）避免
+			// 每次装配刷屏。
+			if lvl := logStateTransition("log-level-refresh", true); lvl != "" {
+				Logf(lvl, "读取日志级别配置失败，按 info 应用: %v", err)
+			}
+			level = "info"
+		} else if lvl := logStateTransition("log-level-refresh", false); lvl != "" {
+			Logf(lvl, "读取日志级别配置已恢复")
+		}
 	}
 	if err := ConfigureLogLevel(level); err != nil {
 		Logf("error", "apply application log level: %v", err)

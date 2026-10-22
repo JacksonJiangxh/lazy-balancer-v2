@@ -31,8 +31,11 @@ import (
 // 无共享锁，lbbak 导入与三库更新器交错会产生混合/残缺 rules 树（部分防护静默
 // 失效 fail-open）、撕裂 .iplist（缺条目名单静默残缺）与 xdb 元数据瞬时错位；
 // 读侧不入锁则打出半新半旧 bundle（manifest sha256 自洽不可检）。
-// 锁只包文件相位（staging 先行、网络下载与 Caddy 重载在锁外——锁内取
-// CaddyOpLock 会与导入路径 CaddyOpLock→wafFileMu 的持锁序构成 AB-BA）。
+// 锁只包文件相位（staging 先行、网络下载与 Caddy 重载在锁外）。全局锁序：
+// 导入=排空→wafFileMu→CaddyOpLock（handlers 侧 prelock 先取 WafFileLock，
+// beginConfigImportWithPrelock 排空后才取 caddyOpMu）；禁止 CaddyOpLock→
+// wafFileMu 的嵌套——反向嵌套即 AB-BA 死锁（任何已持 CaddyOpLock 的渲染/
+// 重载路径都不得再取本锁）。
 var wafFileMu sync.Mutex
 
 // WafFileLock 返回 WAF 数据文件读写互斥锁（跨包消费：handlers 侧 lbbak 导入
@@ -502,7 +505,8 @@ func scanThreatFastFiles() map[string]string {
 // 威胁 .fast，与写者（CRS 树交换/威胁 .iplist 写编译/xdb 安装/lbbak 导入
 // 直写）交错会打出半新半旧 bundle：lbbak manifest 的 sha256 按内存字节计算
 // 自洽仍通过，还原后 WAF 静默降级。读取全程在 wafFileMu 互斥段内（与写侧
-// 文件相位串行）；锁内不取 CaddyOpLock（写侧同口径，防 AB-BA）。
+// 文件相位串行）；锁内不取 CaddyOpLock（写侧重载在锁外同口径；且一旦反向
+// 嵌套 CaddyOpLock→wafFileMu 即与导入锁序构成 AB-BA）。
 // 引用指纹不变时直接复用已物化 bundle（见 wafFileBundleCache）。
 func BuildWafFileBundle() *WafFileBundle {
 	wafFileMu.Lock()

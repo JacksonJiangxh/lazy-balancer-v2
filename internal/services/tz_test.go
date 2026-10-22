@@ -319,3 +319,65 @@ func TestRefreshLocation_rejectsBlankTimezone(t *testing.T) {
 		t.Fatalf("时区被静默切走: %q, want Asia/Shanghai", got)
 	}
 }
+
+// ConfigureLocation 是第二写入口：空串必须显式拒绝（time.LoadLocation("")
+// 合法返回 UTC——放行会静默把全站展示/审计窗口切 UTC）。
+func TestConfigureLocation_rejectsBlankName(t *testing.T) {
+	oldLoc := CurrentLocation()
+	t.Cleanup(func() { currentLocation.Store(oldLoc) })
+	for _, name := range []string{"", "   "} {
+		if _, err := ConfigureLocation(name); err == nil {
+			t.Fatalf("ConfigureLocation(%q) 必须拒绝空/空白时区", name)
+		}
+	}
+	if got := CurrentLocation(); got != oldLoc {
+		t.Fatalf("拒绝后不得改动当前时区: %v → %v", oldLoc, got)
+	}
+}
+
+// 日志级别读失败必须留痕（状态转换口径：首报一次、恢复补一条），不得静默
+// 降级到 info。
+func TestApplyLogLevel_logsReadFailureOnceAndRecovers(t *testing.T) {
+	oldLoc := CurrentLocation()
+	StopTimezoneRefresh()
+	t.Cleanup(func() {
+		currentLocation.Store(oldLoc)
+		StartTimezoneRefresh(context.Background())
+		_ = ConfigureLogLevel("info")
+	})
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
+	if err := db.Initialize(t.TempDir()); err != nil {
+		t.Fatalf("initialize database: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+	})
+	metricsStateMu.Lock()
+	metricsStateFailed = map[string]bool{}
+	metricsStateMu.Unlock()
+	t.Cleanup(func() {
+		metricsStateMu.Lock()
+		delete(metricsStateFailed, "log-level-refresh")
+		metricsStateMu.Unlock()
+	})
+
+	if _, err := db.DB.Exec("ALTER TABLE global_config RENAME TO global_config_bak"); err != nil {
+		t.Fatalf("inject read failure: %v", err)
+	}
+	out := captureLogf(t)
+	ApplyLogLevel()
+	ApplyLogLevel()
+	if got := strings.Count(out.String(), "读取日志级别配置失败"); got != 1 {
+		t.Fatalf("连续读失败留痕次数=%d, want 1（状态转换去重）: %q", got, out.String())
+	}
+
+	if _, err := db.DB.Exec("ALTER TABLE global_config_bak RENAME TO global_config"); err != nil {
+		t.Fatalf("restore table: %v", err)
+	}
+	out.Reset()
+	ApplyLogLevel()
+	if !strings.Contains(out.String(), "读取日志级别配置已恢复") {
+		t.Fatalf("恢复后必须补一条恢复留痕: %q", out.String())
+	}
+}

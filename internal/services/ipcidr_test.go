@@ -83,3 +83,22 @@ func TestNormalizeCIDRs_RejectsMalformedMappedPrefixes(t *testing.T) {
 		})
 	}
 }
+
+// 重复条目去重：库内条数必须与审计 delta 的「N 条」同源（重复 CIDR 无匹配
+// 语义差异，保留重复会让「提交 2 个相同地址 → 审计 2 条 / 库内 2 条」与
+// 用户直觉不符，也放大列表噪声）。
+func TestNormalizeCIDRs_dedupesEquivalentEntries(t *testing.T) {
+	got, err := NormalizeCIDRs([]string{"1.2.3.4", "1.2.3.4/32", " 1.2.3.4 ", "10.0.0.0/8"})
+	if err != nil {
+		t.Fatalf("NormalizeCIDRs: %v", err)
+	}
+	want := []string{"1.2.3.4/32", "10.0.0.0/8"}
+	if len(got) != len(want) {
+		t.Fatalf("NormalizeCIDRs()=%v, want %v（重复条目去重）", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("NormalizeCIDRs()=%v, want %v（顺序保持）", got, want)
+		}
+	}
+}

@@ -187,6 +187,18 @@ func MFAVerifyAttemptLimited(userID int, now time.Time) bool {
 	return len(mfaPruneVerifyAttemptsLocked(userID, now)) >= mfaVerifyAttemptLimit
 }
 
+// mfaVerifyAttemptsSweepThreshold 触发全表清扫的条目数阈值。条目有界于
+// 「窗口内失败过的用户数」，但删除/一次性用户会残留到窗口过期；阈值触发
+// 的整表裁剪把所有窗口外条目一并移除（每用户裁剪只在被访问时发生）。
+const mfaVerifyAttemptsSweepThreshold = 64
+
+// mfaSweepVerifyAttemptsLocked 整表裁剪窗口外条目（调用方须持锁）。
+func mfaSweepVerifyAttemptsLocked(now time.Time) {
+	for userID := range mfaVerifyAttempts.failures {
+		mfaPruneVerifyAttemptsLocked(userID, now)
+	}
+}
+
 // MFARecordVerifyAttemptFailure 记一次登录后验码失败（仅真验证码错误时调用；
 // 基础设施故障与业务态哨兵不计入）。
 func MFARecordVerifyAttemptFailure(userID int, now time.Time) {
@@ -194,6 +206,9 @@ func MFARecordVerifyAttemptFailure(userID int, now time.Time) {
 	defer mfaVerifyAttempts.Unlock()
 	kept := mfaPruneVerifyAttemptsLocked(userID, now)
 	mfaVerifyAttempts.failures[userID] = append(kept, now)
+	if len(mfaVerifyAttempts.failures) > mfaVerifyAttemptsSweepThreshold {
+		mfaSweepVerifyAttemptsLocked(now)
+	}
 }
 
 // MFAClearVerifyAttempts 验码成功后清零该用户的限流计数（正常用户不被

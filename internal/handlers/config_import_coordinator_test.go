@@ -59,7 +59,7 @@ func TestBeginConfigImport_serializesConcurrentSessions(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	first, err := h.beginConfigImport(context.Background())
+	first, err := h.beginConfigImport(context.Background(), "导入")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestBeginConfigImport_serializesConcurrentSessions(t *testing.T) {
 	t.Cleanup(func() { configImportBeginAttemptHook = oldAttemptHook })
 	secondDone := make(chan result, 1)
 	go func() {
-		session, err := h.beginConfigImport(context.Background())
+		session, err := h.beginConfigImport(context.Background(), "导入")
 		secondDone <- result{session: session, err: err}
 	}()
 	// 第二个会话已确证在首个 close 前到达会话锁入口；无需猜测 100ms 是否
@@ -166,7 +166,7 @@ func TestBeginConfigImport_taskDrainTimeoutAbortsBeforeTransaction(t *testing.T)
 		t.Fatal("阻塞任务未进入")
 	}
 
-	session, err := h.beginConfigImport(context.Background())
+	session, err := h.beginConfigImport(context.Background(), "导入")
 	close(release)
 	select {
 	case <-done:
@@ -213,7 +213,7 @@ func TestBeginConfigImport_preservesStoppedCAQueue(t *testing.T) {
 	}
 
 	// When：执行导入 begin/close（含 PauseAndDrain 与恢复收尾）。
-	session, err := h.beginConfigImport(context.Background())
+	session, err := h.beginConfigImport(context.Background(), "导入")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,7 +301,7 @@ func TestConfigImportAbort_restoresCommittedLKGWhenRuntimeRestoreFails(t *testin
 	}
 	lkgPath := filepath.Join(t.TempDir(), "last-good.json")
 	h.caddyService.SetLastGoodPath(lkgPath)
-	session, err := h.beginConfigImport(context.Background())
+	session, err := h.beginConfigImport(context.Background(), "导入")
 	if err != nil {
 		t.Fatal(err)
 	}

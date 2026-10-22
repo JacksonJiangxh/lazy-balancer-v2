@@ -94,14 +94,16 @@ var emptyBrandingTemplate = func() string {
 
 // MaterializeBranding 把 branding_json 镜像值写回其事实源文件，并立即
 // 注入 landing 文案。空内容按集群同步既有语义收敛为全空模板。
-func MaterializeBranding(dataDir, content string) error {
+// 返回值 changed 报告是否实际写入（内容一致时为 false 且零 mtime 扰动）——
+// 调用方据此区分「写了」与「没写」，避免内容未变仍落一条品牌同步审计。
+func MaterializeBranding(dataDir, content string) (changed bool, err error) {
 	if dataDir == "" {
-		return fmt.Errorf("品牌配置目录为空")
+		return false, fmt.Errorf("品牌配置目录为空")
 	}
 	if content != "" {
 		var object map[string]json.RawMessage
 		if err := json.Unmarshal([]byte(content), &object); err != nil || object == nil {
-			return fmt.Errorf("品牌配置不是有效 JSON 对象")
+			return false, fmt.Errorf("品牌配置不是有效 JSON 对象")
 		}
 	}
 	if content == "" {
@@ -110,7 +112,7 @@ func MaterializeBranding(dataDir, content string) error {
 	path := filepath.Join(dataDir, "branding.json")
 	if existing, err := os.ReadFile(path); err == nil && string(existing) == content {
 		injectLandingFromBranding(content)
-		return nil
+		return false, nil
 	}
 	mode := os.FileMode(0o644)
 	if info, statErr := os.Stat(path); statErr == nil {
@@ -120,10 +122,10 @@ func MaterializeBranding(dataDir, content string) error {
 	// rename → 父目录 fsync）：本函数曾逐项复刻同包 writeFileAtomicSynced，
 	// 掉电一致性修复必须改两处、遗漏即品牌文件与备份/完整性文件耐久性分裂。
 	if err := writeFileAtomicSynced(path, []byte(content), mode); err != nil {
-		return fmt.Errorf("原子写入品牌配置文件: %w", err)
+		return false, fmt.Errorf("原子写入品牌配置文件: %w", err)
 	}
 	injectLandingFromBranding(content)
-	return nil
+	return true, nil
 }
 
 // applySnapshotBranding 在 global_config 节应用后(事务已提交、Caddy 重载前)
@@ -139,12 +141,19 @@ func applySnapshotBranding(dataDir, content string) error {
 		return nil
 	}
 	reset := content == ""
-	if err := MaterializeBranding(dataDir, content); err != nil {
+	changed, err := MaterializeBranding(dataDir, content)
+	if err != nil {
 		Logf("error", "同步品牌配置落盘失败: %v", err)
 		// 失败审计由调用方（applySnapshotBrandingChecked）经 SyncService 的
 		// 失败节流写入：品牌落盘失败会在 304 补偿重拉/标记重试
 		// 下每轮重达此处，未节流的操作审计会按退避轮次洪泛。
 		return err
+	}
+	if !changed {
+		// 内容一致（branding_json 未变）：控制面未发生品牌变更，不得写
+		// 「已同步生效/已重置为默认」审计——否则 users/basic_settings 节任意
+		// 变更都会在从端产生误导性品牌审计。
+		return nil
 	}
 	if reset {
 		RecordAuditLog("system", "同步", "集群同步", "品牌配置已重置为默认（主节点无品牌文件）", "")
@@ -182,7 +191,7 @@ func ReconcileBrandingFileDB(database *sql.DB, dataDir string) (bool, error) {
 	if actual, err := os.ReadFile(path); err == nil && string(actual) == expected {
 		return false, nil
 	}
-	if err := MaterializeBranding(dataDir, content); err != nil {
+	if _, err := MaterializeBranding(dataDir, content); err != nil {
 		return false, err
 	}
 	return true, nil

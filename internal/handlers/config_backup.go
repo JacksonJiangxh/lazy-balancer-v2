@@ -642,14 +642,17 @@ func validateV2BackupBooleanTypes(backup configBackup) error {
 // 读取 lb_rules.created_at、证书任务读取 cert_jobs.created_at、主节点集群
 // 快照读取 path_rules.created_at 全线 500，且无 UI 自愈路径）。NULL 不在此门
 // 范围：写入侧 restoreTable 按 backupTableNullDefaults 归一为可解析 epoch。
+// 可空时间列（users.last_login、api_keys.last_used/expires_at、cert_jobs.expires_at）
+// 同在大门内：NULL 合法（导入后按 sql.NullTime/JSONNullTime 消费），非 NULL 的
+// 不可解析文本在列表/登录扫描时同样 500——门覆盖面必须等于声明面。
 var backupTimeColumns = map[string][]string{
 	"lb_rules":            {"created_at", "updated_at"},
 	"path_rules":          {"created_at", "updated_at"},
-	"users":               {"created_at"},
-	"api_keys":            {"created_at"},
+	"users":               {"created_at", "last_login"},
+	"api_keys":            {"created_at", "last_used", "expires_at"},
 	"ca_providers":        {"created_at", "updated_at"},
 	"certificate_configs": {"created_at", "updated_at"},
-	"cert_jobs":           {"created_at", "updated_at"},
+	"cert_jobs":           {"created_at", "updated_at", "expires_at"},
 	// nodes.created_at 同族——垃圾文本落库后节点列表时间扫描失败；
 	// 其余 nodes 时间列（last_seen/last_sync_at）由 sanitizeNodeRowsForRestore
 	// 在更上游删除，不进门。
@@ -678,11 +681,14 @@ func backupTimeValueParseable(value any) bool {
 	case time.Time:
 		return true // 程序化构造的行（v1 转换）可能已是 time.Time
 	case string:
-		trimmed := strings.TrimSpace(v)
-		if trimmed == "" {
+		// 逐字（不 TrimSpace）校验：驱动 parseTime 只对 time.String 分支 trim，
+		// 常规布局直接 time.Parse——" 2026-01-01 00:00:00" 这类首尾空白串若在
+		// 校验期被宽松放行，落库后每次扫描都报错且无 UI 自愈路径。此处不得
+		// 改写值（会与已验摘要脱钩），只拒绝。
+		if v == "" {
 			return false
 		}
-		trimmed = strings.TrimSuffix(trimmed, "Z")
+		trimmed := strings.TrimSuffix(v, "Z")
 		for _, layout := range backupTimeFormats {
 			if _, err := time.Parse(layout, trimmed); err == nil {
 				return true
@@ -3652,7 +3658,7 @@ func revalidateImportLiveDependencies(ctx context.Context, tx *sql.Tx, backup *c
 	}
 	// 1) 受信代理引用名单：refs 与名单表按「导入后视图」配对复核（含
 	// 「名单表被替换且 refs 保持 live」组合——live refs 按备份名单 id 集重验）。
-	if err := revalidateImportTrustedProxyRefs(ctx, tx, backup, sectionTables); err != nil {
+	if err := revalidateImportTrustedProxyRefs(ctx, tx, backup); err != nil {
 		return err
 	}
 	if backup.Config == nil {
@@ -3715,7 +3721,7 @@ func revalidateImportLiveDependencies(ctx context.Context, tx *sql.Tx, backup *c
 //   - 两侧均携带：初检 validateV2BackupTrustedProxyConfig 已按备份行确定性
 //     解析（无 live 依赖），锁内不重复；
 //   - 两侧均缺席：导入不改变该配对，无需复核。
-func revalidateImportTrustedProxyRefs(ctx context.Context, tx *sql.Tx, backup *configBackup, sectionTables map[string]bool) error {
+func revalidateImportTrustedProxyRefs(ctx context.Context, tx *sql.Tx, backup *configBackup) error {
 	refsCarried := false
 	var refsRaw any
 	if backup.Config != nil {
@@ -3723,7 +3729,11 @@ func revalidateImportTrustedProxyRefs(ctx context.Context, tx *sql.Tx, backup *c
 			refsCarried, refsRaw = true, raw
 		}
 	}
-	listsCarried := sectionTables["security_ip_lists"]
+	// 「名单表携带」的判据必须是备份实际携带的表（backup.Tables），不是
+	// sections 分类选中集合——迟到表 era（预 v2.2.1 全量备份/手造精确表集）
+	// 里 sections 缺省=全选，但表并未随包携带；按分类判定会把 live refs 与
+	// 空备份 id 集比对，误拒本应放行的导入（初检正是按表携带放行的）。
+	_, listsCarried := backup.Tables["security_ip_lists"]
 	switch {
 	case !listsCarried && refsCarried:
 		refsText, ok := refsRaw.(string)
@@ -4736,6 +4746,12 @@ func (h *Handlers) ExportConfigBackup(c *gin.Context) {
 	if !h.requireMaster(c) {
 		return
 	}
+	// 导入窗口门：security 分类导出会取 WafFileLock，而导入从 prelock 到 close
+	// 全程持有该锁——不接门就会在导入期间阻塞至导入结束（排空 30s 上限 + 提交
+	// 渲染/load），客户端易超时截断下载。与同族写者一致 409 fast-fail。
+	if rejectWriteDuringImport(c, "导出配置备份") {
+		return
+	}
 	qs := c.Query("sections")
 	sel := parseSectionsParam(qs)
 	if qs == "" {
@@ -5217,14 +5233,13 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 			return services.WafFileLock().Unlock
 		}
 	}
-	session, err := h.beginConfigImportWithPrelock(ctx, prelock)
+	session, err := h.beginConfigImportWithPrelock(ctx, prelock, action)
 	if err != nil {
 		respondImportBeginError(c, err)
 		return
 	}
 	defer session.close()
-	// 失败文案/审计的动作前缀跟随本次调用语义（导入/还原）。
-	session.action = action
+	// 失败文案/审计的动作前缀由 begin 时传入的 action 单源携带（导入/还原）。
 	tx := session.tx
 	// 初检可能读取 live certificate_configs/ca_providers；从读到
 	// 取得 caddyOpMu 的窗口内 DeleteCertificateConfig 可删除被引用行。此处已在
@@ -5413,7 +5428,10 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	// cert_jobs 孤儿清理同型）。
 	if rulesReplaced {
 		for _, table := range []string{"upstreams", "path_rules"} {
-			if _, err := tx.ExecContext(ctx, "DELETE FROM "+table+" WHERE rule_id NOT IN (SELECT caddy_id FROM lb_rules)"); err != nil {
+			// NOT EXISTS 而非 NOT IN：子查询出现 NULL 时 NOT IN 恒为 NULL
+			// （整条清理静默失效），NOT EXISTS 无此陷阱。
+			pruneSQL := "DELETE FROM " + table + " WHERE NOT EXISTS (SELECT 1 FROM lb_rules WHERE lb_rules.caddy_id = " + table + ".rule_id)"
+			if _, err := tx.ExecContext(ctx, pruneSQL); err != nil {
 				err = session.abort(err)
 				recordAudit(c, action+"失败", "配置备份", "清理孤立 "+table+" 失败: "+err.Error())
 				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: action + "失败，已回滚: " + err.Error()})
@@ -5429,8 +5447,8 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	_, policiesReplaced := backup.Tables["security_policies"]
 	if rulesReplaced || policiesReplaced {
 		result, err := tx.ExecContext(ctx, `DELETE FROM security_policy_bindings
-			WHERE rule_caddy_id NOT IN (SELECT caddy_id FROM lb_rules)
-			   OR policy_id NOT IN (SELECT id FROM security_policies)`)
+			WHERE NOT EXISTS (SELECT 1 FROM lb_rules WHERE lb_rules.caddy_id = security_policy_bindings.rule_caddy_id)
+			   OR NOT EXISTS (SELECT 1 FROM security_policies WHERE security_policies.id = security_policy_bindings.policy_id)`)
 		if err != nil {
 			err = session.abort(err)
 			recordAudit(c, action+"失败", "配置备份", "清理悬挂安全策略绑定失败: "+err.Error())
@@ -5549,7 +5567,7 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	// 与失效任务（users-only 等分类导入对 live 数据零触碰）。
 	session.replaceRuleArtifacts = rulesReplaced || certJobsReplaced
 	if rulesReplaced || certJobsReplaced {
-		if _, err := tx.ExecContext(ctx, "DELETE FROM cert_jobs WHERE rule_id NOT IN (SELECT caddy_id FROM lb_rules)"); err != nil {
+		if _, err := tx.ExecContext(ctx, "DELETE FROM cert_jobs WHERE NOT EXISTS (SELECT 1 FROM lb_rules WHERE lb_rules.caddy_id = cert_jobs.rule_id)"); err != nil {
 			err = session.abort(err)
 			recordAudit(c, action+"失败", "配置备份", "清理孤儿证书任务失败: "+err.Error())
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "清理孤儿证书任务失败，已回滚: " + err.Error()})
@@ -5781,7 +5799,7 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	brandingWarning := ""
 	if backup.Config != nil {
 		if raw, carried := backup.Config["branding_json"]; carried {
-			if err := services.MaterializeBranding(h.cfg.DataDir, backupString(raw)); err != nil {
+			if _, err := services.MaterializeBranding(h.cfg.DataDir, backupString(raw)); err != nil {
 				brandingWarning = "品牌配置文件还原失败: " + err.Error()
 				recordAudit(c, action+"警告", "配置备份", brandingWarning)
 				// 文件仍是唯一事实源：立即把 DB 镜像回本地文件，避免留下分叉。

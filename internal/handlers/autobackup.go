@@ -118,6 +118,17 @@ func autoBackupDayHigh(frequency string) int {
 	return 28
 }
 
+// normalizeAutoBackupDay 把读到的 auto_backup_day 收敛到合法域（越界回退 DB
+// 默认 1）。读侧两处内联钳制收敛到此单源，与调度侧
+// services.normalizeAutoBackupDay 同口径（跨包不能共用：services 不可 import
+// handlers）。
+func normalizeAutoBackupDay(frequency string, day int) int {
+	if day < 1 || day > autoBackupDayHigh(frequency) {
+		return autoBackupDayDefault
+	}
+	return day
+}
+
 // loadAutoBackupKeepSetting 读取保留份数。返回 (keep, known)：
 //   - known=false 表示配置读取失败（库故障/表缺失）——调用方必须**跳过本轮
 //     裁剪**而不是按默认值删文件。此前读失败回退 7 并照常裁剪：用户配置 30
@@ -366,6 +377,16 @@ func (h *Handlers) RunAutoBackupOnce(ctx context.Context, trigger, operator stri
 	if trigger == "manual" {
 		triggerLabel = "手动"
 	}
+	// 入口 fail-fast：BackupDir 为空或相对路径时，后续任何文件操作都会落在
+	// 进程 CWD（failed 行裁剪按 DB 行文件名 + dir 相对解析执行 os.Remove）。
+	// 生产配置由 config.Load 保证绝对路径，此处防配置缺失/测试构造形态。
+	if strings.TrimSpace(dir) == "" || !filepath.IsAbs(dir) {
+		reason := fmt.Errorf("备份目录未配置或不是绝对路径: %q", dir)
+		services.Logf("warn", "%s失败：%v", action, reason)
+		services.RecordAuditLog(operator, "备份失败", "配置备份", services.FormatAuditDetail(
+			"触发："+triggerLabel, "备份目录无效", services.AuditResultPart("failed")), "")
+		return autoBackupRowView{}, reason
+	}
 	// 目录权限 0700——备份含私钥与凭证明文（文件由
 	// services.WriteAutoBackupFileSynced 以 0600 原子写），目录本身不得放宽到
 	// 组/其他可读。MkdirAll 的 0700 只对新目录生效，对已存在目录（旧版本创建/
@@ -540,10 +561,7 @@ func (h *Handlers) AutoBackupSettings(c *gin.Context) {
 	// day 读侧按 frequency 钳制——与写侧校验同口径
 	//（UpdateAutoBackupSettings dayHigh：weekly 1-7、daily/monthly 1-28）。
 	// 越界存量值回退 1（DB 默认），与 keep 回退同格；合法值原样返回。
-	dayHigh := autoBackupDayHigh(freq)
-	if day < 1 || day > dayHigh {
-		day = autoBackupDayDefault
-	}
+	day = normalizeAutoBackupDay(freq, day)
 	// 读侧与执行侧（loadAutoBackupSectionsSetting）同一语义——
 	// NULL/空串=全量，展开为全部分类键；损坏 JSON/[]/未知分类显式 500，
 	// 不再静默呈现空数组（调度侧这些形态本来就每轮失败）。复用本查询已

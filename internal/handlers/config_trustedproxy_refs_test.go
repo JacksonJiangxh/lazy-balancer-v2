@@ -301,15 +301,41 @@ func TestRevalidateImportTrustedProxyRefs_listsCarriedRejectsBuiltinRef(t *testi
 		t.Fatal(err)
 	}
 	defer tx.Rollback()
-	carried := map[string]bool{"security_ip_lists": true}
-
 	// refs 指向备份行中的 system=1 行 → 拒绝
-	if err := revalidateImportTrustedProxyRefs(t.Context(), tx, backup, carried); err == nil || !strings.Contains(err.Error(), "内置") {
+	if err := revalidateImportTrustedProxyRefs(t.Context(), tx, backup); err == nil || !strings.Contains(err.Error(), "内置") {
 		t.Fatalf("refs 指内置名单必须拒绝: %v", err)
 	}
 	// 同 id 非内置行 → 放行
 	backup.Tables["security_ip_lists"][0]["system"] = 0
-	if err := revalidateImportTrustedProxyRefs(t.Context(), tx, backup, carried); err != nil {
+	if err := revalidateImportTrustedProxyRefs(t.Context(), tx, backup); err != nil {
 		t.Fatalf("非内置名单 refs 必须放行: %v", err)
+	}
+}
+
+// 锁内复核的「名单表携带」判据取备份实际携带的表（backup.Tables），不是
+// sections 分类选中集合：迟到表 era 的 backups（sections 缺省=全选但表未随包）
+// 中 live refs 非空时，按分类判定会把 live refs 与空备份 id 集比对而误拒。
+func TestRevalidateImportTrustedProxyRefs_absentListsTableDoesNotRejectLiveRefs(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	if _, err := db.DB.Exec(`INSERT OR IGNORE INTO global_config (id) VALUES (1)`); err != nil {
+		t.Fatal(err)
+	}
+	listID := seedIPListRow(t, "live-only", `[{"value":"198.51.100.0/24","remark":""}]`)
+	if _, err := db.DB.Exec(`UPDATE global_config SET trusted_proxy_range_refs=? WHERE id=1`, fmt.Sprintf("[%d]", listID)); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.DB.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+
+	// Given：备份未携带名单表（迟到表 era），也未携带 refs 键。
+	backup := &configBackup{Tables: map[string][]map[string]any{
+		"lb_rules": {{"caddy_id": "lb_1", "domain": "a.example", "listen_port": 80}},
+	}}
+	// Then：两侧均不改变该配对 → 不得因 live refs 非空而拒绝。
+	if err := revalidateImportTrustedProxyRefs(t.Context(), tx, backup); err != nil {
+		t.Fatalf("名单表未随包携带时不得复核 live refs: %v", err)
 	}
 }

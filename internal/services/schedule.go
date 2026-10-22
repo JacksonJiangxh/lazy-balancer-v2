@@ -82,13 +82,16 @@ func RearmScheduleSlotsAfterTimezoneChange() {
 	}
 	now := time.Now().UTC()
 	for _, table := range []string{"security_crs_version", "security_ip2region_version"} {
-		var autoUpdate int
 		var nextUpdate string
-		if err := db.DB.QueryRow(`SELECT COALESCE(auto_update,1), COALESCE(next_update,'') FROM `+table+` WHERE id=1`).Scan(&autoUpdate, &nextUpdate); err != nil {
+		if err := db.DB.QueryRow(`SELECT COALESCE(next_update,'') FROM ` + table + ` WHERE id=1`).Scan(&nextUpdate); err != nil {
 			Logf("warn", "时区变更重排：读取 %s 排程失败: %v", table, err)
 			continue
 		}
-		if autoUpdate != 1 || nextUpdate == "" {
+		// auto_update 关闭时也重排：该列是「下次更新」展示槽的唯一来源
+		// （GetCRSInfo/GetIP2RegionInfo 直读），与 setVersionTableSchedule
+		// 「关闭时也重排 next_update，调度器仍受开关门控」同口径——否则切换
+		// 时区后前端换算出的展示时刻仍按旧偏移。
+		if nextUpdate == "" {
 			continue
 		}
 		if slot := parseUTCSlot(nextUpdate); slot.IsZero() || !slot.After(now) {

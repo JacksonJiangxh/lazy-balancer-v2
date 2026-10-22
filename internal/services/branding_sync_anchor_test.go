@@ -17,7 +17,7 @@ func TestBrandingEmptyTemplate_matchesHandlerBytes(t *testing.T) {
 	if err := handlers.EnsureBrandingFile(handlerDir); err != nil {
 		t.Fatalf("create handler template: %v", err)
 	}
-	if err := services.MaterializeBranding(serviceDir, ""); err != nil {
+	if _, err := services.MaterializeBranding(serviceDir, ""); err != nil {
 		t.Fatalf("materialize service template: %v", err)
 	}
 	want, err := os.ReadFile(filepath.Join(handlerDir, "branding.json"))

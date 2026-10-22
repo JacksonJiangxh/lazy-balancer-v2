@@ -100,8 +100,10 @@ func unregisterClusterService(service *ClusterService) {
 		clusterServices[service.db] = remaining
 	}
 	clusterServicesMu.Unlock()
+	// 句柄已由调用方显式注销：探活计数一并丢弃（避免全局表残留已 Close 句柄键）。
+	resetClusterHandleStrikes(service.db)
 	// 同族句柄回收：三节哈希缓存以库句柄为键，注销即释放（防全局缓存强引用
-	// 已关闭句柄；未走注销的死条目由重建路径的 clusterDBHandleAlive 兜底剔除）。
+	// 已关闭句柄；未走注销的死条目由重建路径的 probeClusterDBHandle 兜底剔除）。
 	forgetClusterSectionHashCache(service.db)
 	// 快照缓存（clusterSnapshotCaches）同样以库句柄为键且持有完整快照
 	//（canonical bytes/证书/规则）：注销不释放会把已 Close 的句柄与其快照
@@ -109,14 +111,71 @@ func unregisterClusterService(service *ClusterService) {
 	clusterSnapshotCaches.Delete(service.db)
 }
 
-// clusterDBHandleAlive 报告句柄是否仍可 Ping（的兜底回收：库已
-// Close 而未见显式 unregister 时，查询路径顺手剔除死条目，防止全局表在
-// 测试/重建场景无限累积）。查询路径仅在主节点巡检与 Promote/BecomeSlave
-// 触发，Ping 成本可忽略。
-func clusterDBHandleAlive(database *sql.DB) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+// clusterHandleProbeTimeout 限制单次句柄探活 Ping 的等待。生产 1s；变量供
+// 测试注入短超时（超时形态的用例不必真等 1s）。
+var clusterHandleProbeTimeout = time.Second
+
+// clusterHandleUnverifiedStrikes 是「不可判定」探活连续达到判定死亡的次数。
+// 单次超时只保留登记项，连续该次数仍不可判定才按死句柄剔除。取 5：探活只在
+// 主节点巡检（默认 60s）与 Promote/BecomeSlave 触发，5 次≈数分钟的持续不可用；
+// 真正的句柄死亡（库已 Close）由确定性分支立即剔除，不经计数。
+const clusterHandleUnverifiedStrikes = 5
+
+// clusterHandleState 句柄探活三态。
+type clusterHandleState int
+
+const (
+	// clusterHandleAlive：Ping 成功。
+	clusterHandleAlive clusterHandleState = iota
+	// clusterHandleClosed：确定不可用（库已 Close/连接已丢）。
+	clusterHandleClosed
+	// clusterHandleUnverified：1s 内未取得连接（长写事务/磁盘停顿/GC 停顿）
+	// 或驱动瞬时错误——不可等价于「句柄永久死亡」，保留登记项。
+	clusterHandleUnverified
+)
+
+// clusterHandleStrikes 记录同一句柄连续不可判定的探活次数（键=库句柄，
+// 与两张注册表同维度：句柄死活在两个消费面之间是同一事实）。
+var (
+	clusterHandleStrikesMu sync.Mutex
+	clusterHandleStrikes   = map[*sql.DB]int{}
+)
+
+func resetClusterHandleStrikes(database *sql.DB) {
+	clusterHandleStrikesMu.Lock()
+	delete(clusterHandleStrikes, database)
+	clusterHandleStrikesMu.Unlock()
+}
+
+// probeClusterDBHandle 报告句柄可用性三态（兜底回收：库已 Close 而未见显式
+// unregister 时，查询路径顺手剔除死条目，防止全局表在测试/重建场景无限累积）。
+// 查询路径仅在主节点巡检与 Promote/BecomeSlave 触发，Ping 成本可忽略。
+//
+// 保守判死：只有确定性关闭（sql.ErrConnDone / "database is closed"）与连续
+// clusterHandleUnverifiedStrikes 次不可判定才返回 clusterHandleClosed。原实现
+// 把 1s Ping 超时等价死亡，长写事务/GC 停顿时会误删登记项——Promote/BecomeSlave
+// 的排干面随之清空（在途 Pull 不排干）且 pin 清理重试链断裂。
+func probeClusterDBHandle(database *sql.DB) clusterHandleState {
+	ctx, cancel := context.WithTimeout(context.Background(), clusterHandleProbeTimeout)
 	defer cancel()
-	return database.PingContext(ctx) == nil
+	err := database.PingContext(ctx)
+	if err == nil {
+		resetClusterHandleStrikes(database)
+		return clusterHandleAlive
+	}
+	if errors.Is(err, sql.ErrConnDone) || strings.Contains(err.Error(), "database is closed") {
+		return clusterHandleClosed
+	}
+	clusterHandleStrikesMu.Lock()
+	clusterHandleStrikes[database]++
+	strikes := clusterHandleStrikes[database]
+	clusterHandleStrikesMu.Unlock()
+	if strikes >= clusterHandleUnverifiedStrikes {
+		return clusterHandleClosed
+	}
+	Logf("warn", "集群：数据库句柄探活未成功（第 %d/%d 次，保留登记项待下轮重试）: %v",
+		strikes, clusterHandleUnverifiedStrikes, err)
+	return clusterHandleUnverified
 }
 
 func clusterServicesFor(database *sql.DB) []*ClusterService {
@@ -140,10 +199,13 @@ func clusterServicesFor(database *sql.DB) []*ClusterService {
 		return nil
 	}
 	clusterServicesMu.Unlock()
-	if !clusterDBHandleAlive(database) {
+	// 只在确定性关闭时剔除；探活超时/瞬时错误保留登记项（见 probeClusterDBHandle），
+	// 否则 Promote/BecomeSlave 的排干面与 pin 清理重试链会在一次停顿后静默断裂。
+	if probeClusterDBHandle(database) == clusterHandleClosed {
 		clusterServicesMu.Lock()
 		delete(clusterServices, database)
 		clusterServicesMu.Unlock()
+		resetClusterHandleStrikes(database)
 		return nil
 	}
 	return services

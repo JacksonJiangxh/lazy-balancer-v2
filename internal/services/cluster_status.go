@@ -367,7 +367,7 @@ func (s *ClusterService) Nodes(ctx context.Context, now time.Time) ([]models.Clu
 // 内读版本），不得用调用方先前读到的版本作键（版本 V 的键挂 V+1 的内容会让
 // 写窗口内完成的从节点被误报滞后）。
 // 句柄回收：服务注销时删除该句柄条目；未见显式注销（库已 Close）的死条目在
-// 每次重建时经 clusterDBHandleAlive 兜底剔除（同 clusterServices 注册表模式）。
+// 每次重建时经 probeClusterDBHandle 兜底剔除（同 clusterServices 注册表模式）。
 type clusterSectionHashCacheEntry struct {
 	version int
 	hashes  map[string]string
@@ -398,7 +398,8 @@ func forgetClusterSectionHashCache(database *sql.DB) {
 }
 
 // pruneDeadClusterSectionHashCacheEntries 剔除句柄已 Close 的条目（未见显式
-// 注销时的兜底回收）。Ping 在锁外执行，避免持锁阻塞其他轮询。
+// 注销时的兜底回收）。Ping 在锁外执行，避免持锁阻塞其他轮询。探活超时不等价
+// 死亡（同 probeClusterDBHandle 的保守判死口径）——保留条目待下轮重试。
 func pruneDeadClusterSectionHashCacheEntries() {
 	clusterSectionHashCacheMu.Lock()
 	handles := make([]*sql.DB, 0, len(clusterSectionHashCache))
@@ -407,12 +408,13 @@ func pruneDeadClusterSectionHashCacheEntries() {
 	}
 	clusterSectionHashCacheMu.Unlock()
 	for _, handle := range handles {
-		if clusterDBHandleAlive(handle) {
+		if probeClusterDBHandle(handle) != clusterHandleClosed {
 			continue
 		}
 		clusterSectionHashCacheMu.Lock()
 		delete(clusterSectionHashCache, handle)
 		clusterSectionHashCacheMu.Unlock()
+		resetClusterHandleStrikes(handle)
 	}
 }
 

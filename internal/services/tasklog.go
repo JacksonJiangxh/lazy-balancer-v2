@@ -59,9 +59,17 @@ func getTaskLogSizeBytes() int64 {
 	return taskLogSizeCache.get(func() (int64, error) {
 		var sizeMB int
 		if err := db.DB.QueryRow("SELECT COALESCE(task_log_size_mb, 10) FROM global_config WHERE id = 1").Scan(&sizeMB); err != nil {
-			Logf("warn", "读取任务日志大小配置失败,按 10MB 降级: %v", err)
+			// 状态转换口径（首报 warn + 恢复 info）与审计侧同源：本读取经
+			// SetTaskLogSizeBytesFn 在每次任务日志写入前求值，主库持续故障时
+			// 裸 warn 会按写入行数洪泛并与全项目去重口径漂移。
+			if lvl := logStateTransition("task-log-size-refresh", true); lvl != "" {
+				Logf(lvl, "读取任务日志大小配置失败,按 10MB 降级: %v", err)
+			}
 			// 失败不缓存：回退值只对本轮生效，下一轮重试。
 			return 0, err
+		}
+		if lvl := logStateTransition("task-log-size-refresh", false); lvl != "" {
+			Logf(lvl, "读取任务日志大小配置已恢复")
 		}
 		if sizeMB <= 0 {
 			sizeMB = 10

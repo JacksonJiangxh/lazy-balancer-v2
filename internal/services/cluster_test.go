@@ -1694,3 +1694,75 @@ func TestApproveNode_expiryUsesInjectedNow(t *testing.T) {
 		t.Fatalf("datetime(registration_secret_expires_at) 解析失败（值 %v）——认证门会静默拒绝注册密钥", expiresAt)
 	}
 }
+
+// approved 分支的 confirm 失败必须在下一轮重试，且连续达到上限后真正终止注册
+// 循环。此前在同一条 UPDATE 里先清 registration_secret：confirm 失败后下轮
+// pollRegistration 因 secret=="" 早退，confirm 永不重试、计数至多 1，
+// 「连续 5 次失败停止注册并提示人工介入」在 confirm 轴上不可达。
+func TestSyncService_pollRegistration_retriesConfirmAndStopsAfterConsecutiveFailures(t *testing.T) {
+	_, database := newClusterTestService(t)
+	var confirmHits int
+	master := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodPost && request.URL.Path == "/api/v1/cluster/registration/confirm" {
+			confirmHits++
+			response.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if request.Header.Get("X-Registration-Secret") != "temporary-secret" {
+			response.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{"code":0,"data":{"status":"approved","cluster_token":"lb_cluster_approved"}}`))
+	}))
+	defer master.Close()
+	if _, err := database.Exec("UPDATE global_config SET is_master=0, master_url=?, registration_id=7, registration_secret='temporary-secret', cluster_token='', registration_confirm_failures=0 WHERE id=1", master.URL); err != nil {
+		t.Fatalf("seed pending registration: %v", err)
+	}
+	syncService := NewSyncService(database, &config.Config{}, NewCaddyService(master.URL))
+
+	// 首轮：令牌落库、confirm 失败、注册密钥必须保留（下一轮可重试）。
+	syncService.pollRegistration(context.Background())
+	var secret string
+	var failures int
+	if err := database.QueryRow("SELECT registration_secret, COALESCE(registration_confirm_failures,0) FROM global_config WHERE id=1").Scan(&secret, &failures); err != nil {
+		t.Fatalf("read registration state: %v", err)
+	}
+	if secret != "temporary-secret" {
+		t.Fatalf("confirm 失败后 registration_secret=%q, want 保留（否则 confirm 永不重试）", secret)
+	}
+	if failures != 1 {
+		t.Fatalf("registration_confirm_failures=%d, want 1", failures)
+	}
+
+	// 第二轮：仍会重新查询状态并发起 confirm（重试可达）。
+	syncService.pollRegistration(context.Background())
+	if confirmHits != 2 {
+		t.Fatalf("confirm attempts=%d after two polls, want 2（confirm 轴重试不可达）", confirmHits)
+	}
+
+	// 补足到上限：第 5 次失败触发终止轨道（清注册态并落终止文案）。
+	for range registrationConfirmMaxFailures - 2 {
+		syncService.pollRegistration(context.Background())
+	}
+	if confirmHits != registrationConfirmMaxFailures {
+		t.Fatalf("confirm attempts=%d, want %d", confirmHits, registrationConfirmMaxFailures)
+	}
+	var registrationID sql.NullInt64
+	var secretAfter, clusterToken, lastSyncError string
+	if err := database.QueryRow("SELECT registration_id, COALESCE(registration_secret,''), COALESCE(cluster_token,''), COALESCE(last_sync_error,'') FROM global_config WHERE id=1").Scan(&registrationID, &secretAfter, &clusterToken, &lastSyncError); err != nil {
+		t.Fatalf("read terminal state: %v", err)
+	}
+	if secretAfter != "" || registrationID.Valid || clusterToken != "" {
+		t.Fatalf("终止轨道未清注册态: secret=%q registration_id=%v token=%q", secretAfter, registrationID, clusterToken)
+	}
+	if !strings.Contains(lastSyncError, "连续失败") {
+		t.Fatalf("last_sync_error=%q, want 携带连续失败终止文案", lastSyncError)
+	}
+
+	// 注册循环已退出：后续轮询不再发 confirm。
+	syncService.pollRegistration(context.Background())
+	if confirmHits != registrationConfirmMaxFailures {
+		t.Fatalf("终止后仍在重试 confirm: attempts=%d", confirmHits)
+	}
+}

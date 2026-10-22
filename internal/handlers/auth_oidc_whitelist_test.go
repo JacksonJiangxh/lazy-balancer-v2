@@ -156,3 +156,16 @@ func TestOIDCSettings_whitelistValidationAndEcho(t *testing.T) {
 		t.Fatalf("empty array must clear whitelist: %s", rec.Body.String())
 	}
 }
+
+// 域名单读侧再规范化：带外写入/旧值（未小写、带空格）不得让白名单恒不匹配
+// （fail-visible 方向安全但全员拒登属可用性自伤）。
+func TestOIDCAccessAllowed_normalizesDomainListAtRead(t *testing.T) {
+	cfg := OIDCConfig{AllowedEmailDomains: []string{" Example.COM ", "corp.example.org"}}
+	ok, reason := oidcAccessAllowed(cfg, "user@example.com", nil)
+	if !ok {
+		t.Fatalf("allowed=%v reason=%q, want 命中（读侧 trim+小写）", ok, reason)
+	}
+	if ok, _ := oidcAccessAllowed(cfg, "user@evil.example", nil); ok {
+		t.Fatal("未命中域不得放行")
+	}
+}

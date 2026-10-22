@@ -269,13 +269,14 @@ func computeSectionSkips(ctx context.Context, dbh *sql.DB, snapshot models.Clust
 	if dbh == nil {
 		return sk
 	}
+	// 系统数据恒同步（2026-09-11 裁定）：在本函数边界显式归一一次，防未来新增
+	// 调用方传入 Users=false 静默跳过 users 节（唯一生产调用方 applySnapshot 也
+	// 已强制 true；readSyncSwitches 恒返回 true——三处是同一不变量的门，不是
+	// 各自独立的判定）。此前该归一行写在逐节循环内，形似「首次遇到 users 才强制」，
+	// 易被误读为此处是唯一强制点。
+	switches.Users = true
 	applied := readAppliedSectionHashes(ctx, dbh)
 	for _, sec := range syncSections {
-		if sec.Key == "users" {
-			// 系统数据恒同步(2026-09-11 裁定):纵使快照携带旧主节点的
-			// MasterSyncSwitches.Users=false 也强制应用(防旧快照绕过)。
-			switches.Users = true
-		}
 		if !switches.sectionEnabled(sec.Key) {
 			sk.disabled[sec.Key] = true
 			continue
@@ -300,12 +301,42 @@ func driftGuardContains(key string) bool {
 	return false
 }
 
-func logSectionSyncOutcome(sk *sectionSkips, version int) {
+// sectionOutcome 节级三态：应用 / 哈希一致跳过 / 开关关闭跳过。
+// drifted 节（记录哈希一致但本地数据与记录不符）归入应用——强制重放。
+type sectionOutcome int
+
+const (
+	sectionOutcomeApplied sectionOutcome = iota
+	sectionOutcomeUnchanged
+	sectionOutcomeDisabled
+)
+
+// sectionOutcomes 是节级三态判定的唯一实现：逐节审计行
+// （logSectionSyncOutcome）与同步汇总行（sectionOutcomeNames）都只在此结果上
+// 做文案映射，新增第四态/调整判定优先级时只改本函数（两份判定曾各自维护，
+// 漏改一处即审计行与汇总行互相矛盾）。
+func sectionOutcomes(sk *sectionSkips) map[string]sectionOutcome {
+	outcomes := make(map[string]sectionOutcome, len(syncSections))
 	for _, sec := range syncSections {
 		switch {
-		case sk.disabled[sec.Key]:
+		case sk != nil && sk.disabled[sec.Key]:
+			outcomes[sec.Key] = sectionOutcomeDisabled
+		case sk != nil && sk.unchanged[sec.Key]:
+			outcomes[sec.Key] = sectionOutcomeUnchanged
+		default:
+			outcomes[sec.Key] = sectionOutcomeApplied
+		}
+	}
+	return outcomes
+}
+
+func logSectionSyncOutcome(sk *sectionSkips, version int) {
+	outcomes := sectionOutcomes(sk)
+	for _, sec := range syncSections {
+		switch outcomes[sec.Key] {
+		case sectionOutcomeDisabled:
 			RecordAuditLog("system", "同步跳过", "集群同步", FormatAuditDetail(formatSectionAction("开关关闭", sec.Key), fmt.Sprintf("版本：%d", version)), "")
-		case sk.unchanged[sec.Key]:
+		case sectionOutcomeUnchanged:
 			RecordAuditLog("system", "同步跳过", "集群同步", FormatAuditDetail(formatSectionAction("哈希一致", sec.Key), fmt.Sprintf("版本：%d", version)), "")
 		default:
 			RecordAuditLog("system", "同步应用", "集群同步", FormatAuditDetail(formatSectionAction("内容已更新", sec.Key), fmt.Sprintf("版本：%d", version)), "")
@@ -316,11 +347,12 @@ func logSectionSyncOutcome(sk *sectionSkips, version int) {
 // sectionOutcomeNames 节级三态命名（2026-10-03 用户裁定：同步汇总审计
 // 反映实际应用面——内容清单与「哈希一致跳过」自相矛盾）。
 func sectionOutcomeNames(sk *sectionSkips) (applied, hashSkipped, disSkipped []string) {
+	outcomes := sectionOutcomes(sk)
 	for _, sec := range syncSections {
-		switch {
-		case sk.disabled[sec.Key]:
+		switch outcomes[sec.Key] {
+		case sectionOutcomeDisabled:
 			disSkipped = append(disSkipped, sec.NewLabel)
-		case sk.unchanged[sec.Key]:
+		case sectionOutcomeUnchanged:
 			hashSkipped = append(hashSkipped, sec.NewLabel)
 		default:
 			applied = append(applied, sec.NewLabel)

@@ -25,6 +25,12 @@ import (
 )
 
 // API Key 安全属性不能由旧读取端静默降级为宽权限默认值。
+//
+// 版本义务：CurrentSnapshotSchema 只描述信封/字段形态，是读者门的唯一依据
+// （MinReaderVersion=本值，旧从节点据此拒绝新信封）。新增/删除任何参与同步的
+// 列或字段时必须同步评估是否 bump：不 bump 时，滚动升级窗口内旧从节点按自己的
+// INSERT 列清单落库，新列静默取 schema 默认值且无门可拒（单版本内的列清单
+// 完整性由 cluster_snapshot/apply 的列清单钉测覆盖，跨版本只能靠 bump）。
 const CurrentSnapshotSchema = 3
 
 type clusterSnapshotCache struct {
@@ -115,6 +121,9 @@ func (s *ClusterService) Snapshot(ctx context.Context, sinceVersion int, clientF
 	// 变更流向从节点;内容不变零扰动。快照缓存随版本失效自然重建。
 	// 显式传本服务 s.db（不再依赖全局 db.DB），内容未变时
 	// 函数内先读短路，纯 304 轮不再向主库写。
+	// 本调用先于 cachedSnapshot 的角色门（is_master）——角色安全由
+	// RefreshBrandingMirrorDB 自身的 `WHERE … is_master=1` 谓词承担（降级窗口内
+	// 恒 0 行），不得在函数内去除该谓词，也不得把本调用改成无条件写。
 	if s.dataDir != "" {
 		if changed, err := RefreshBrandingMirrorDB(s.db, s.dataDir); err != nil {
 			Logf("warn", "刷新品牌配置镜像失败: %v", err)

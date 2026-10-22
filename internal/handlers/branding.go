@@ -270,7 +270,7 @@ func EnsureBrandingFile(dataDir string) error {
 	path := filepath.Join(dataDir, "branding.json")
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		if err := services.MaterializeBranding(dataDir, ""); err != nil {
+		if _, err := services.MaterializeBranding(dataDir, ""); err != nil {
 			return fmt.Errorf("写入品牌配置模板: %w", err)
 		}
 		return nil
@@ -297,7 +297,7 @@ func EnsureBrandingFile(dataDir string) error {
 	if err != nil {
 		return fmt.Errorf("序列化补齐后的品牌配置: %w", err)
 	}
-	if err := services.MaterializeBranding(dataDir, string(out)); err != nil {
+	if _, err := services.MaterializeBranding(dataDir, string(out)); err != nil {
 		return fmt.Errorf("写入补齐后的品牌配置: %w", err)
 	}
 	return nil

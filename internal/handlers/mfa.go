@@ -49,6 +49,10 @@ func (h *Handlers) MFAVerifyLogin(c *gin.Context) {
 		// DB 故障与无效挑战分判——基础设施错误 500，
 		// 不再伪装成 401（挑战无效不泄露具体原因的口径仅适用于 ErrNoRows）。
 		if !errors.Is(err, sql.ErrNoRows) {
+			// 基础设施故障必须可观测：本端点 AuditPolicyExplicit，中间件不补
+			// 审计——此前三处 500 分支零留痕，与 Login 的同型 internal_error
+			// 口径不一致。
+			services.RecordAuditLog("", "认证拒绝", "用户认证", services.FormatAuditDetail("MFA", "挑战查询失败"), c.ClientIP())
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "数据库错误"})
 			return
 		}
@@ -80,11 +84,13 @@ func (h *Handlers) MFAVerifyLogin(c *gin.Context) {
 			rejectMFAChallengeLogin(c)
 			return
 		}
+		services.RecordAuditLog(user.Username, "认证拒绝", "用户认证", services.FormatAuditDetail("MFA", "锁定状态读取失败"), c.ClientIP())
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "数据库错误"})
 		return
 	}
 	locked, lockErr := loginLockedNow(loginLockedUntil)
 	if lockErr != nil {
+		services.RecordAuditLog(user.Username, "认证拒绝", "用户认证", services.FormatAuditDetail("MFA", "锁定开关读取失败"), c.ClientIP())
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "数据库错误"})
 		return
 	}
@@ -236,7 +242,7 @@ func (h *Handlers) MFASetup(c *gin.Context) {
 	if rejectOIDCUserMFAOperation(c, 0) {
 		return
 	}
-	if !guardAuthJSONBody(c) {
+	if !guardConfiguredJSONBody(c) {
 		return
 	}
 	userID := int(contextUserID(c))
@@ -301,7 +307,7 @@ func (h *Handlers) MFAActivate(c *gin.Context) {
 	if rejectOIDCUserMFAOperation(c, 0) {
 		return
 	}
-	if !guardAuthJSONBody(c) {
+	if !guardConfiguredJSONBody(c) {
 		return
 	}
 	userID := int(contextUserID(c))
@@ -357,7 +363,7 @@ func (h *Handlers) MFADisable(c *gin.Context) {
 	if rejectOIDCUserMFAOperation(c, 0) {
 		return
 	}
-	if !guardAuthJSONBody(c) {
+	if !guardConfiguredJSONBody(c) {
 		return
 	}
 	userID := int(contextUserID(c))
@@ -405,7 +411,7 @@ func (h *Handlers) MFARecoveryCodes(c *gin.Context) {
 	if rejectOIDCUserMFAOperation(c, 0) {
 		return
 	}
-	if !guardAuthJSONBody(c) {
+	if !guardConfiguredJSONBody(c) {
 		return
 	}
 	userID := int(contextUserID(c))
@@ -434,7 +440,7 @@ func (h *Handlers) MFARecoveryCodes(c *gin.Context) {
 
 // MFAVerifyStep POST /auth/mfa/ — 验证码 → 新 JWT（mfa_ts 刷新）。
 func (h *Handlers) MFAVerifyStep(c *gin.Context) {
-	if !guardAuthJSONBody(c) {
+	if !guardConfiguredJSONBody(c) {
 		return
 	}
 	userID := int(contextUserID(c))
@@ -634,7 +640,7 @@ func (h *Handlers) MFAResetByAdmin(c *gin.Context) {
 	if rejectOIDCUserMFAOperation(c, id) {
 		return
 	}
-	if !guardAuthJSONBody(c) {
+	if !guardConfiguredJSONBody(c) {
 		return
 	}
 	operatorID := int(contextUserID(c))

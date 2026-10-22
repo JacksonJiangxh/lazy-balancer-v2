@@ -206,7 +206,7 @@ func (h *Handlers) ClusterServiceControl(c *gin.Context) {
 	}
 	if err := h.clusterService.ValidateServiceControlTicket(c.Request.Context(), req.Ticket, req.Action, time.Now()); err != nil {
 		if errors.Is(err, services.ErrInvalidServiceControlTicket) {
-			recordClusterServiceControlAudit(c, req.Action, "失败：票据校验未通过")
+			recordClusterServiceControlAudit(c, req.Action, "失败：票据校验未通过（"+serviceControlTicketFailureReason(err)+"）")
 			clusterError(c, http.StatusUnauthorized, "服务控制票据无效或已过期", err)
 			return
 		}
@@ -235,6 +235,22 @@ func (h *Handlers) ClusterServiceControl(c *gin.Context) {
 	// 实际执行细节(原仅记「成功」,消息只回传主节点不落从节点审计)
 	recordClusterServiceControlAuditBy(c, req.Action, "成功："+message, req.Operator)
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: message})
+}
+
+// serviceControlTicketFailureReason 把票据校验的细分哨兵翻成审计可读原因：
+// 运维据此区分「票据已使用（重放，无需重新注册）」与「签名错误（节点集群
+// 凭证不一致，需重新注册）」等不同补救路径。
+func serviceControlTicketFailureReason(err error) string {
+	switch {
+	case errors.Is(err, services.ErrServiceControlSignature):
+		return "签名错误"
+	case errors.Is(err, services.ErrServiceControlExpired):
+		return "已过期"
+	case errors.Is(err, services.ErrServiceControlReplay):
+		return "已使用"
+	default:
+		return "无效"
+	}
 }
 
 // executeClusterCaddyAction 与本机 /caddy/start|stop|restart handler 同一锁序

@@ -58,3 +58,65 @@ func TestSetupAdmin_slaveNodeGate(t *testing.T) {
 		t.Fatalf("slave setup must not create user: count=%d err=%v", count, err)
 	}
 }
+
+// 角色读取失败（DB 瞬断/脏行）在公开初始化端点必须 fail-closed 500——不得落回
+// 「主节点语义」放行初始化建号（与 readOnlyGuard/clusterVersionMiddleware 同口径）。
+func TestSetupEndpoints_failClosedOnRoleReadError(t *testing.T) {
+	setupAuthTestDB(t)
+	if _, err := db.DB.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, is_master TEXT); INSERT INTO global_config VALUES (1,'corrupt')`); err != nil {
+		t.Fatalf("create global config: %v", err)
+	}
+	gin.SetMode(gin.TestMode)
+	h := &Handlers{cfg: &config.Config{JWTSecret: "test-secret"}}
+	router := gin.New()
+	router.GET("/auth/setup", h.GetSetupStatus)
+	router.POST("/auth/setup", h.SetupAdmin)
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/auth/setup", nil))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("GetSetupStatus status=%d body=%s, want 500（角色读失败 fail-closed）", rec.Code, rec.Body.String())
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/auth/setup", strings.NewReader(`{"username":"root","password":"Secret123!"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("SetupAdmin status=%d body=%s, want 500（角色读失败 fail-closed）", rec.Code, rec.Body.String())
+	}
+	var count int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("角色读失败不得建号: count=%d err=%v", count, err)
+	}
+}
+
+// 鉴权层与 handler 之间用户被并发删除：GET/PATCH /users/me 返回 401（与 jwtAuth
+// 同文案），不得折叠为 500 诱导客户端重试。
+func TestCurrentUserEndpoints_deletedUserReturns401(t *testing.T) {
+	setupAuthTestDB(t)
+	gin.SetMode(gin.TestMode)
+	h := &Handlers{}
+	router := gin.New()
+	inject := func(c *gin.Context) {
+		c.Set("user_id", 999) // 行不存在（模拟并发删除窗口）
+		c.Set("username", "ghost")
+		c.Set("auth_type", "jwt")
+	}
+	router.GET("/users/me", inject, h.GetCurrentUser)
+	router.PATCH("/users/me", inject, h.UpdateCurrentUser)
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/users/me", nil))
+	if rec.Code != http.StatusUnauthorized || !strings.Contains(rec.Body.String(), "用户不存在或已禁用") {
+		t.Fatalf("GET status=%d body=%s, want 401 用户不存在或已禁用", rec.Code, rec.Body.String())
+	}
+
+	req := httptest.NewRequest(http.MethodPatch, "/users/me", strings.NewReader(`{"display_name":"newname"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized || !strings.Contains(rec.Body.String(), "用户不存在或已禁用") {
+		t.Fatalf("PATCH status=%d body=%s, want 401 用户不存在或已禁用", rec.Code, rec.Body.String())
+	}
+}

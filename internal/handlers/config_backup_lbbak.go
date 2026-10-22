@@ -142,7 +142,8 @@ func buildLbbakPayloadWithThreatIplists(backupJSON []byte, bundle *services.WafF
 	var buf bytes.Buffer
 	gzw := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gzw)
-	// 固定顺序:manifest 首位便于流式校验
+	// 固定顺序:manifest 首位——产物字节确定性（同内容同序列），便于对账/
+	// 复现；解析侧 parseLbbak 先读全部条目再逐条校验，并非流式校验。
 	for _, name := range []string{lbbakEntryManifest, lbbakEntryConfig, lbbakEntryCRS, lbbakEntryXdb} {
 		data, exists := entries[name]
 		if !exists {

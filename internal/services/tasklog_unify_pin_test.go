@@ -206,3 +206,42 @@ func TestGetTaskLogSizeBytes_readFailureNotCached(t *testing.T) {
 		t.Fatalf("读库恢复后阈值=%d, want 20MB（失败的 10MB 回退值被缓存钉死整窗口）", got)
 	}
 }
+
+// 任务日志尺寸读失败必须按状态转换去重：该求值在每次任务日志写入前发生，
+// 主库持续故障时裸 warn 会按写入行数洪泛（与审计日志尺寸侧口径漂移）。
+func TestGetTaskLogSizeBytes_readFailureLoggedOnceAndRecovers(t *testing.T) {
+	initServicesDB(t)
+	t.Cleanup(InvalidateTaskLogSizeCache)
+	metricsStateMu.Lock()
+	metricsStateFailed = map[string]bool{}
+	metricsStateMu.Unlock()
+	t.Cleanup(func() {
+		metricsStateMu.Lock()
+		delete(metricsStateFailed, "task-log-size-refresh")
+		metricsStateMu.Unlock()
+	})
+	InvalidateTaskLogSizeCache()
+
+	if _, err := db.DB.Exec(`ALTER TABLE global_config RENAME TO global_config_tasklog_size_bak`); err != nil {
+		t.Fatal(err)
+	}
+	out := captureLogf(t)
+	if got := getTaskLogSizeBytes(); got != 10<<20 {
+		t.Fatalf("读库失败降级=%d, want 10MB", got)
+	}
+	if got := getTaskLogSizeBytes(); got != 10<<20 {
+		t.Fatalf("读库失败降级=%d, want 10MB", got)
+	}
+	if n := strings.Count(out.String(), "读取任务日志大小配置失败"); n != 1 {
+		t.Fatalf("连续读失败留痕次数=%d, want 1（状态转换去重）: %q", n, out.String())
+	}
+
+	if _, err := db.DB.Exec(`ALTER TABLE global_config_tasklog_size_bak RENAME TO global_config`); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	_ = getTaskLogSizeBytes()
+	if !strings.Contains(out.String(), "读取任务日志大小配置已恢复") {
+		t.Fatalf("恢复后必须补一条恢复留痕: %q", out.String())
+	}
+}

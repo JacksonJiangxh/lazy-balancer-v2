@@ -181,7 +181,7 @@ func TestMaterializeBranding_atomicReplaceDoesNotMutateExistingInode(t *testing.
 		t.Fatal(err)
 	}
 	newContent := `{"app_name":"new","landing_text":"new"}`
-	if err := MaterializeBranding(dataDir, newContent); err != nil {
+	if _, err := MaterializeBranding(dataDir, newContent); err != nil {
 		t.Fatal(err)
 	}
 	gotOld, err := os.ReadFile(oldLink)
@@ -510,5 +510,62 @@ func TestRefreshBrandingMirrorDB_zeroWriteWhenUnchanged(t *testing.T) {
 	}
 	if globalMirrored != content {
 		t.Fatalf("explicit handle mirror leaked into global DB: %q", globalMirrored)
+	}
+}
+
+// MaterializeBranding 必须回报是否实际写入——调用方据此区分「写了」与
+// 「没写」，内容一致时零 mtime 扰动且 changed=false。
+func TestMaterializeBranding_reportsChanged(t *testing.T) {
+	dir := t.TempDir()
+	content := `{"app_name":"gw"}`
+	changed, err := MaterializeBranding(dir, content)
+	if err != nil {
+		t.Fatalf("first materialize: %v", err)
+	}
+	if !changed {
+		t.Fatal("首次物化必须报告 changed=true")
+	}
+	changed, err = MaterializeBranding(dir, content)
+	if err != nil {
+		t.Fatalf("second materialize: %v", err)
+	}
+	if changed {
+		t.Fatal("内容一致必须报告 changed=false（零重写）")
+	}
+}
+
+// 品牌同步审计只针对真实变更：users/basic_settings 节任意变更（branding_json
+// 未变）不得在从端产生「品牌配置已同步生效」的误导审计。
+func TestApplySnapshotBranding_auditsOnlyWhenContentChanges(t *testing.T) {
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
+	if err := db.Initialize(t.TempDir()); err != nil {
+		t.Fatalf("initialize test database: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+	})
+	defer SetDefaultLandingBody(DefaultLandingText)
+
+	dir := t.TempDir()
+	content := `{"app_name":"gw"}`
+	countAudits := func() int {
+		var n int
+		if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='同步' AND detail LIKE '%品牌配置已同步生效%'`).Scan(&n); err != nil {
+			t.Fatalf("query audit: %v", err)
+		}
+		return n
+	}
+	if err := applySnapshotBranding(dir, content); err != nil {
+		t.Fatalf("apply content: %v", err)
+	}
+	if got := countAudits(); got != 1 {
+		t.Fatalf("首次同步审计条数=%d, want 1", got)
+	}
+	if err := applySnapshotBranding(dir, content); err != nil {
+		t.Fatalf("re-apply unchanged content: %v", err)
+	}
+	if got := countAudits(); got != 1 {
+		t.Fatalf("内容未变时审计条数=%d, want 1（不得重复写品牌同步审计）", got)
 	}
 }

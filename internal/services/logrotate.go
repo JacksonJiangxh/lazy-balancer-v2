@@ -261,6 +261,12 @@ func (r RuntimeCleanupResult) Err() error {
 	if r.TaskLogs.RemoveFailed > 0 {
 		errs = append(errs, fmt.Errorf("任务日志删除失败 %d 个", r.TaskLogs.RemoveFailed))
 	}
+	if r.TaskLogs.ScanError != "" {
+		errs = append(errs, fmt.Errorf("任务日志目录读取失败: %s", r.TaskLogs.ScanError))
+	}
+	if r.TaskLogs.InfoFailed > 0 {
+		errs = append(errs, fmt.Errorf("任务日志元数据读取失败 %d 个", r.TaskLogs.InfoFailed))
+	}
 	if r.WafAuditError != "" {
 		errs = append(errs, fmt.Errorf("waf-audit 兜底轮转失败: %s", r.WafAuditError))
 	}
@@ -274,6 +280,14 @@ type TaskLogHousekeepingResult struct {
 	// 忽略——失败文件既不出现在 Deleted 也不进任何结果字段，摘要看起来
 	// 只是「没有过期文件」。
 	RemoveFailed int
+	// ScanError 任务日志目录读取失败原因（首个；空=正常）。os.ErrNotExist
+	// 视为正常空目录（首次运行/尚未创建）。此前读取失败直接 continue，
+	// 任务日志称「超期删除 0 个」且任务恒 success——目录不可读与「无过期
+	// 文件」不可区分，与应用日志侧 AppCleanupError 口径对齐。
+	ScanError string
+	// InfoFailed 文件元数据读取失败数（无法判定是否过期，本轮未删除）。
+	// 此前同形静默跳过，失败数与正常「未过期」不可区分。
+	InfoFailed int
 }
 
 // Summary 一行明细摘要（列表超 5 个收敛为「等 N 个」；空=「无」）。
@@ -288,8 +302,19 @@ func (r TaskLogHousekeepingResult) Summary() string {
 		return strings.Join(names, "、")
 	}
 	summary := fmt.Sprintf("任务日志：超期删除 %d 个[%s]（尺寸滚动由写入侧统一执行）", len(r.Deleted), list(r.Deleted))
+	var failures []string
 	if r.RemoveFailed > 0 {
-		summary = fmt.Sprintf("任务日志：超期删除 %d 个[%s]、删除失败 %d 个（尺寸滚动由写入侧统一执行）", len(r.Deleted), list(r.Deleted), r.RemoveFailed)
+		failures = append(failures, fmt.Sprintf("删除失败 %d 个", r.RemoveFailed))
+	}
+	if r.InfoFailed > 0 {
+		failures = append(failures, fmt.Sprintf("元数据读取失败 %d 个", r.InfoFailed))
+	}
+	if r.ScanError != "" {
+		failures = append(failures, "目录读取失败"+r.ScanError)
+	}
+	if len(failures) > 0 {
+		summary = fmt.Sprintf("任务日志：超期删除 %d 个[%s]、%s（尺寸滚动由写入侧统一执行）",
+			len(r.Deleted), list(r.Deleted), strings.Join(failures, "、"))
 	}
 	return summary
 }
@@ -363,7 +388,24 @@ func logCleanupRound(logFile string) (RuntimeCleanupResult, string) {
 	// main.go 已有 error 留痕）时不得让 log-cleanup 静默零动作——任务监控恒绿
 	// 却没有任何留痕，排障时看不出「清理为什么没跑」。
 	if logFile == "" {
-		return RuntimeCleanupResult{}, "日志清理未启用：运行日志文件未打开（应用日志副本清理与 waf-audit 兜底跳过）"
+		// 运行日志 writer 打开失败与 waf-audit 兜底互相独立（不同目录、不同
+		// 驱动）——不得因前者跳过后者：daemon 停机时审计文件无界增长正是本
+		// 兜底的存在理由。应用日志副本与任务日志仍无从扫描（需要运行日志
+		// 目录），保持显式「跳过」措辞。
+		res := RuntimeCleanupResult{}
+		wafActions, wafErr := wafAuditHousekeeping()
+		res.WafAudit = wafActions
+		if wafErr != nil {
+			res.WafAuditError = wafErr.Error()
+		}
+		line := "日志清理未启用：运行日志文件未打开（应用日志副本清理与任务日志清理跳过）"
+		if len(res.WafAudit) > 0 {
+			line += "；waf-audit 兜底：" + strings.Join(res.WafAudit, "、")
+		}
+		if wafErr != nil {
+			return res, "日志清理未完成：" + line + "；错误：" + wafErr.Error()
+		}
+		return res, line
 	}
 	res := RuntimeLogCleanupOnce(logFile)
 	if err := res.Err(); err != nil {
@@ -482,6 +524,15 @@ func taskLogsHousekeepingWithRetention(logFile string, months int, monthsErr err
 	for _, d := range dirs {
 		entries, err := os.ReadDir(d)
 		if err != nil {
+			// 目录不存在＝尚未产生任务日志（首次运行/未启用），正常空目录；
+			// 其余读失败（权限/挂载/IO）必须进结果错误面，否则任务日志称
+			// 「超期删除 0 个」而任务恒 success。
+			if !errors.Is(err, os.ErrNotExist) {
+				Logf("warn", "任务日志清理：读取目录 %s 失败: %v", d, err)
+				if result.ScanError == "" {
+					result.ScanError = fmt.Sprintf("%s: %v", d, err)
+				}
+			}
 			continue
 		}
 		for _, e := range entries {
@@ -490,6 +541,7 @@ func taskLogsHousekeepingWithRetention(logFile string, months int, monthsErr err
 			}
 			info, err := e.Info()
 			if err != nil {
+				result.InfoFailed++
 				continue
 			}
 			all = append(all, fileInfo{path: filepath.Join(d, e.Name()), dir: d, name: e.Name(), info: info})

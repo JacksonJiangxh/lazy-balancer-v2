@@ -91,7 +91,11 @@ var metricsDashboardState struct {
 var (
 	caddyMetricsSnapshotTTL         = 5 * time.Second
 	caddyMetricsSnapshotNegativeTTL = 2 * time.Second
-	caddyMetricsSnapshotGroup       singleflight.Group
+	// caddyMetricsFetchTimeout 是共享抓取的自身上限。抓取脱离首个请求的取消
+	// 信号（single-flight 的结果同时交给所有等待者，单个客户端断开不得让其余
+	// 健康连接收到伪造的上游失败），因此必须有独立超时兜底。
+	caddyMetricsFetchTimeout  = 15 * time.Second
+	caddyMetricsSnapshotGroup singleflight.Group
 )
 
 type caddyMetricsSnapshot struct {
@@ -138,13 +142,17 @@ func storeCaddyMetricsSnapshot(url string, body []byte, err error, now time.Time
 }
 
 // loadCaddyMetricsSnapshot 返回 Caddy 指标端点原文：TTL 内共享、并发合并。
-// 抓取用首个请求的 context（请求取消可中止真实抓取），取消/超时错误不写
-// 负缓存——否则一次客户端断开会让同窗内其余请求拿到伪造的上游失败。
+// 抓取脱离首个请求的取消信号（context.WithoutCancel + 自有超时）——结果同时
+// 交给所有等待者，leader 客户端断开不得让其余健康连接收到伪造的上游失败；
+// 自身超时/取消错误不写负缓存（下一次健康请求立刻重抓），避免把一次瞬时
+// 超时固化成同窗内的上游失败。
 //
 // cacheFailure 控制失败是否也短缓存：面板已有自己的负缓存窗口（其重试节奏
 // 是产品语义的一部分，不能被更长的上游负缓存悄悄收窄），故面板传 false——
-// 成功快照仍共享，失败每次都重新抓取。其余指标端点传 true（避免失败窗口内
-// 多客户端反复击穿 Caddy）。
+// 成功快照仍共享，失败每次都重新抓取。该策略在入口缓存检查与 single-flight
+// 闭包内复核**两处**都生效：否则其他端点（true）刚写入的失败条目会让面板的
+// 「重新抓取」在闭包内被静默吞掉。其余指标端点传 true（避免失败窗口内多客户端
+// 反复击穿 Caddy）。
 func loadCaddyMetricsSnapshot(ctx context.Context, url string, cacheFailure bool) ([]byte, error) {
 	if body, err, ok := readCaddyMetricsSnapshot(url, time.Now()); ok && (err == nil || cacheFailure) {
 		return body, err
@@ -155,14 +163,16 @@ func loadCaddyMetricsSnapshot(ctx context.Context, url string, cacheFailure bool
 	}
 	value, _, _ := caddyMetricsSnapshotGroup.Do(url, func() (any, error) {
 		now := time.Now()
-		if body, err, ok := readCaddyMetricsSnapshot(url, now); ok {
+		if body, err, ok := readCaddyMetricsSnapshot(url, now); ok && (err == nil || cacheFailure) {
 			return snapshotResult{body: body, err: err}, nil
 		}
-		body, err := metricsDashboardFetch(ctx, url)
+		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), caddyMetricsFetchTimeout)
+		defer cancel()
+		body, err := metricsDashboardFetch(fetchCtx, url)
 		switch {
 		case err == nil:
 			storeCaddyMetricsSnapshot(url, body, nil, now)
-		case cacheFailure && ctx.Err() == nil:
+		case cacheFailure && fetchCtx.Err() == nil:
 			storeCaddyMetricsSnapshot(url, nil, err, now)
 		}
 		return snapshotResult{body: body, err: err}, nil
@@ -258,6 +268,7 @@ func (h *Handlers) buildMetricsDashboard(ctx context.Context) metricsDashboardOu
 		SELECT caddy_id, COALESCE(domain,''), listen_port, COALESCE(protocol,''), COALESCE(enable_tls,0), IIF(enabled IN ('1',1),1,0)
 		FROM lb_rules ORDER BY caddy_id`)
 	if err != nil {
+		services.Logf("warn", "指标面板读取规则配置失败（查询 lb_rules）: %v", err)
 		return metricsDashboardOutcome{status: http.StatusInternalServerError, message: "读取规则指标配置失败"}
 	}
 	defer ruleRows.Close()
@@ -265,11 +276,13 @@ func (h *Handlers) buildMetricsDashboard(ctx context.Context) metricsDashboardOu
 	for ruleRows.Next() {
 		var rule dashboardRule
 		if err := ruleRows.Scan(&rule.id, &rule.domain, &rule.listenPort, &rule.protocol, &rule.enableTLS, &rule.enabled); err != nil {
+			services.Logf("warn", "指标面板读取规则配置失败（扫描 lb_rules 行）: %v", err)
 			return metricsDashboardOutcome{status: http.StatusInternalServerError, message: "读取规则指标配置失败"}
 		}
 		rules = append(rules, rule)
 	}
 	if err := ruleRows.Err(); err != nil {
+		services.Logf("warn", "指标面板读取规则配置失败（迭代 lb_rules 行）: %v", err)
 		return metricsDashboardOutcome{status: http.StatusInternalServerError, message: "读取规则指标配置失败"}
 	}
 
@@ -277,6 +290,7 @@ func (h *Handlers) buildMetricsDashboard(ctx context.Context) metricsDashboardOu
 		SELECT rule_id, COALESCE(host,''), COALESCE(port,0), COALESCE(enabled,0)
 		FROM upstreams u WHERE `+services.UpstreamEnabledSQLPredicate)
 	if err != nil {
+		services.Logf("warn", "指标面板读取规则上游失败（查询 upstreams）: %v", err)
 		return metricsDashboardOutcome{status: http.StatusInternalServerError, message: "读取规则上游失败"}
 	}
 	defer upstreamRows.Close()
@@ -284,11 +298,13 @@ func (h *Handlers) buildMetricsDashboard(ctx context.Context) metricsDashboardOu
 	for upstreamRows.Next() {
 		var upstream models.Upstream
 		if err := upstreamRows.Scan(&upstream.RuleID, &upstream.Host, &upstream.Port, &upstream.Enabled); err != nil {
+			services.Logf("warn", "指标面板读取规则上游失败（扫描 upstreams 行）: %v", err)
 			return metricsDashboardOutcome{status: http.StatusInternalServerError, message: "读取规则上游失败"}
 		}
 		upstreamsByRule[upstream.RuleID] = append(upstreamsByRule[upstream.RuleID], upstream)
 	}
 	if err := upstreamRows.Err(); err != nil {
+		services.Logf("warn", "指标面板读取规则上游失败（迭代 upstreams 行）: %v", err)
 		return metricsDashboardOutcome{status: http.StatusInternalServerError, message: "读取规则上游失败"}
 	}
 

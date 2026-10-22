@@ -8,29 +8,39 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// geoip 透传序列剔除抽成纯函数后按四形态钉字节输出——
-// 此前只有 TotalRequests==20 一条断言，分隔符偏差（尾部空行/末行被删/全行
-// 被删/无换行）不会被发现。
-func TestFilterGeoipPassSeries_shapes(t *testing.T) {
-	geo := `caddy_http_requests_total{handler="http.handlers.geoip2region",host="example.com"} 20`
+// geoip 透传序列在单趟聚合的行分派前整行跳过（全局族与规则族同时生效）。
+// 逐字节分隔符语义由「按 \n 切分后丢弃命中行」天然保持，无需另行重组副本；
+// 本用例钉四形态：普通行 + 透传行混排、透传行位于末行（无尾随换行）、
+// 全局族与规则族同句柄。
+func TestAggregatePrometheusText_skipsGeoipPassSeries(t *testing.T) {
 	keep := `caddy_http_requests_total{handler="reverse_proxy",host="example.com"} 20`
+	geo := `caddy_http_requests_total{handler="http.handlers.geoip2region",host="example.com"} 20`
+	ruleKeep := `lazybalancer_requests_total{handler="reverse_proxy",rule="lb_geo"} 7`
+	ruleGeo := `lazybalancer_requests_total{handler="http.handlers.geoip2region",rule="lb_geo"} 7`
 
 	cases := []struct {
 		name  string
 		input string
-		want  string
 	}{
-		{"no trailing newline", keep + "\n" + geo + "\n" + keep, keep + "\n" + keep},
-		{"trailing newline", keep + "\n" + geo + "\n" + keep + "\n", keep + "\n" + keep + "\n"},
-		{"deleted last line", keep + "\n" + geo, keep},
-		{"all lines deleted", geo + "\n" + geo, ""},
-		{"single line no newline", geo, ""},
-		{"no match passthrough", keep + "\n" + keep + "\n", keep + "\n" + keep + "\n"},
+		{"mixed lines", keep + "\n" + geo + "\n" + ruleKeep + "\n" + ruleGeo},
+		{"geoip last line no newline", keep + "\n" + ruleKeep + "\n" + geo},
+		{"trailing newline", keep + "\n" + geo + "\n" + ruleKeep + "\n" + ruleGeo + "\n"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := filterGeoipPassSeries(tc.input); got != tc.want {
-				t.Fatalf("filter(%q)=%q, want %q", tc.input, got, tc.want)
+			res := aggregatePrometheusText(tc.input, prometheusScanGlobal|prometheusScanRules)
+			if res.globalErr != nil {
+				t.Fatalf("global parse error: %v", res.globalErr)
+			}
+			if res.rulesErr != nil {
+				t.Fatalf("rules parse error: %v", res.rulesErr)
+			}
+			if res.global.requestsTotal != 20 {
+				t.Fatalf("global requests=%d, want 20（geoip 透传序列必须跳过）", res.global.requestsTotal)
+			}
+			agg := res.rules["lb_geo"]
+			if agg == nil || agg.requests != 7 {
+				t.Fatalf("rule aggregate=%+v, want requests=7（geoip 透传序列必须跳过）", agg)
 			}
 		})
 	}

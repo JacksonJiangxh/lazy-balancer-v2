@@ -84,10 +84,15 @@ func (m *MetricsService) Start() {
 // 直接跳过（慢清理形态下的单飞防御）。清理自身按批让出写锁
 // （CleanupMetricsHistory 的 5000/批 + 10ms），采集不再等待整轮清理完成。
 func (m *MetricsService) startHistoryCleanup() {
+	// WaitGroup.Add 必须先于计数置位：Stop/Start 的 Wait 可与本函数并发，
+	// 若 CAS 成功后才 Add，Wait 可在「已置位、尚未 Add」的窗口观察到 0 计数
+	// 而提前返回，清理 goroutine 随后才启动并访问即将关闭的库。CAS 失败时
+	// 归还计数，维持单飞语义。
+	m.cleanupWG.Add(1)
 	if !m.cleanupRunning.CompareAndSwap(false, true) {
+		m.cleanupWG.Done()
 		return
 	}
-	m.cleanupWG.Add(1)
 	go func() {
 		defer m.cleanupWG.Done()
 		defer m.cleanupRunning.Store(false)
@@ -178,38 +183,9 @@ const (
 )
 
 // geoipPassSeriesMarker geoip 透传路由（buildGeoipPassRoute）的 Prometheus
-// 序列片段——该路由无 reverse_proxy，其序列不含任何上游语义。
+// 序列片段——该路由无 reverse_proxy，其序列不含任何上游语义。单趟聚合在
+// 行分派前跳过命中该片段的整行（全局族与规则族同时生效）。
 const geoipPassSeriesMarker = `handler="http.handlers.geoip2region"`
-
-// filterGeoipPassSeries 剔除 geoip 透传路由注入的序列行。
-// geoip 规则的请求先过独立透传路由再过主/路径路由，两条路由各自注入 metrics
-// 同一请求的请求数/状态码/字节量在全局与全部翻倍。
-// Builder 逐行条件写入单副本（曾 Split+Join——行切片
-// ~24B/行 + 16MB 拼接副本，与「拷贝只做一次」口径矛盾）。分隔符仅在保留行
-// 之间落盘：输出与「按 \n 切分后丢弃命中行、再用 \n 连接」逐字节等价，
-// 含尾部空行（"a\n" → 保留行的切分为 ["a",""]）与被删末行两形态。
-func filterGeoipPassSeries(text string) string {
-	var b strings.Builder
-	b.Grow(len(text))
-	wrote := false
-	start := 0
-	for i := 0; i <= len(text); i++ {
-		if i < len(text) && text[i] != '\n' {
-			continue
-		}
-		line := text[start:i]
-		start = i + 1
-		if strings.Contains(line, geoipPassSeriesMarker) {
-			continue
-		}
-		if wrote {
-			b.WriteByte('\n')
-		}
-		b.WriteString(line)
-		wrote = true
-	}
-	return b.String()
-}
 
 func (m *MetricsService) collect() {
 	// 三项 DB 派生指标先于 /metrics 采集刷新——Caddy 未就绪或
@@ -265,13 +241,9 @@ func (m *MetricsService) collect() {
 	// string 拷贝只做一次——parse 与 store 共用同一
 	// text，此前两次 string(body) 最坏双拷贝 32MB（16MB body ×2）。
 	text := string(body)
-	// geoip 规则的请求先过独立透传路由（首处理器 http.handlers.geoip2region，
-	// buildGeoipPassRoute）再过主/路径路由，两条路由各自注入 metrics——同一
-	// 请求的请求数/状态码/字节量在全局与 per-host 全部翻倍。透传路由无
-	// reverse_proxy，其序列不含任何上游语义，整条剔除即恢复真实计数。
-	if strings.Contains(text, geoipPassSeriesMarker) {
-		text = filterGeoipPassSeries(text)
-	}
+	// geoip 透传序列在单趟聚合内逐行剔除（aggregatePrometheusText 的行分派
+	// 前跳过 geoipPassSeriesMarker）——不再先重组一份过滤全文（16MB 上限下
+	// 省去每周期一次全量副本）。
 	// 单趟聚合：全局样本与规则级样本共用一次全文遍历（旧实现全局 6 趟 +
 	// 规则 4 趟全文正则，且同一 text 喂两条解析链）。两族错误语义独立——规则级
 	// 畸形只丢 per-rule 行，不影响全局样本与 overview。
@@ -447,6 +419,14 @@ func aggregatePrometheusText(text string, mode prometheusScanMode) prometheusSca
 	}
 
 	for line := range strings.SplitSeq(text, "\n") {
+		// geoip 规则的请求先过独立透传路由（首处理器 http.handlers.geoip2region，
+		// buildGeoipPassRoute）再过主/路径路由，两条路由各自注入 metrics——同一
+		// 请求的请求数/状态码/字节量在全局与 per-host 全部翻倍。透传路由无
+		// reverse_proxy，其序列不含任何上游语义，整行跳过即恢复真实计数；
+		// 全局族与规则族在同一分派前生效（单趟、零额外副本）。
+		if strings.Contains(line, geoipPassSeriesMarker) {
+			continue
+		}
 		switch {
 		// --- 全局指标族 ---
 		case strings.HasPrefix(line, "caddy_http_requests_total{"):

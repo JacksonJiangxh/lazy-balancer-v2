@@ -18,6 +18,12 @@ import (
 	"lazy-balancer-v2/internal/netutil"
 )
 
+// 服务控制票据错误哨兵。前两个是调用方面向外部的分类依据：
+// ErrInvalidServiceControlTicket 决定从节点端点 401 与主节点「从节点拒绝」中继
+// 文案；ErrInvalidServiceAction 决定 400。后三个由 ValidateServiceControlTicket
+// errors.Join 在通用哨兵上附细因——生产消费方=从节点端点的审计原因
+// （serviceControlTicketFailureReason），供运维区分「票据重放（无需重注册）」与
+// 「签名错误（节点凭证不一致）」；同时是测试契约（errors.Is 逐因断言）。
 var (
 	ErrInvalidServiceAction        = errors.New("不支持的服务控制动作")
 	ErrInvalidServiceControlTicket = errors.New("服务控制票据无效或已过期")

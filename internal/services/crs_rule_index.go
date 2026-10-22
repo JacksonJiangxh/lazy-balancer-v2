@@ -460,8 +460,9 @@ func buildCRSRuleIndex() *CRSRuleIndex {
 // CaddyOpLock，更新触发必然在交换完成后以正确代重新生成并最后应用；②窗口内
 // 并发生成若选中已被移除的文件，coraza 加载失败→/load 被拒，运行配置保持
 // 上一代（不发布半代）；③交换完成后引用键（目录条目数/尺寸/最大 mtime）必然
-// 变化，窗口内缓存的空索引不会被后续渲染复用。禁止让渲染持 wafFileMu：导入
-// 路径持锁序为 CaddyOpLock→wafFileMu，反向嵌套即 AB-BA 死锁。
+// 变化，窗口内缓存的空索引不会被后续渲染复用。禁止让渲染持 wafFileMu：渲染/重载
+// 在 CaddyOpLock 临界区内，而全局锁序为导入=排空→wafFileMu→CaddyOpLock——
+// 持 CaddyOpLock 再取 wafFileMu 即反向嵌套 = AB-BA 死锁。
 func GetCRSRuleIndex() *CRSRuleIndex {
 	key := crsRuleIndexCacheKey(crsRuleIndexVersion())
 	crsRuleIndexMu.Lock()

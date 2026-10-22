@@ -596,3 +596,82 @@ func TestTaskLogsHousekeeping_countsDeletionFailures(t *testing.T) {
 		t.Fatalf("摘要必须披露删除失败数: %q", summary)
 	}
 }
+
+// 任务日志目录不可读必须进结果错误面（与应用日志侧 AppCleanupError 同口径）：
+// 目录缺失是正常空目录（首次运行），ENOTDIR/权限等真实读失败不得静默成
+// 「超期删除 0 个」+ 任务 success。
+func TestTaskLogsHousekeeping_scanFailureEntersErrorSurface(t *testing.T) {
+	base := t.TempDir()
+	logFile := filepath.Join(base, "app.log")
+	// tasks 路径被普通文件占据 → os.ReadDir 返回 ENOTDIR（非 NotExist）。
+	if err := os.WriteFile(filepath.Join(base, "tasks"), []byte("not a dir"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res := taskLogsHousekeepingWithRetention(logFile, 3, nil)
+	if res.ScanError == "" {
+		t.Fatalf("目录读取失败必须记录 ScanError: %+v", res)
+	}
+	if !strings.Contains(res.ScanError, "tasks") {
+		t.Fatalf("ScanError=%q 必须含失败目录路径", res.ScanError)
+	}
+	agg := RuntimeCleanupResult{TaskLogs: res}
+	if err := agg.Err(); err == nil || !strings.Contains(err.Error(), "任务日志目录读取失败") {
+		t.Fatalf("Err()=%v，目录读取失败必须聚合进错误面", err)
+	}
+	if summary := res.Summary(); !strings.Contains(summary, "目录读取失败") {
+		t.Fatalf("摘要必须披露目录读取失败: %q", summary)
+	}
+}
+
+// 目录不存在＝尚未产生任务日志，属正常空目录，不得计为扫描失败。
+func TestTaskLogsHousekeeping_missingDirIsNotScanFailure(t *testing.T) {
+	base := t.TempDir()
+	res := taskLogsHousekeepingWithRetention(filepath.Join(base, "app.log"), 3, nil)
+	if res.ScanError != "" {
+		t.Fatalf("缺失目录不得计为扫描失败: %+v", res)
+	}
+	if res.InfoFailed != 0 {
+		t.Fatalf("InfoFailed=%d, want 0", res.InfoFailed)
+	}
+}
+
+// 运行日志 writer 打开失败时 waf-audit 兜底仍须执行（不同目录、独立失败面）：
+// 旧实现因 logFile=="" 直接跳过兜底，daemon 停机场景下 audit.log 无界增长。
+func TestLogCleanupRound_emptyLogFileStillRunsWafFallback(t *testing.T) {
+	oldDB, oldM, oldA := db.DB, db.MetricsDB, db.AuditDB
+	if err := db.Initialize(t.TempDir()); err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close(); db.DB, db.MetricsDB, db.AuditDB = oldDB, oldM, oldA })
+
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	offsetPath := filepath.Join(dir, "security_events.offset")
+	oldLogPath, oldOffsetPath, oldSizeBytes := auditLogPath, securityEventsOffsetPath, auditLogSizeBytes
+	auditLogPath, securityEventsOffsetPath = logPath, offsetPath
+	auditLogSizeBytes = func() int64 { return 1024 }
+	resetSecurityEventsPollState(t)
+	t.Cleanup(func() {
+		auditLogPath, securityEventsOffsetPath, auditLogSizeBytes = oldLogPath, oldOffsetPath, oldSizeBytes
+	})
+	if err := os.WriteFile(logPath, bytes.Repeat([]byte("x"), 2048), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res, line := logCleanupRound("")
+
+	if !strings.HasPrefix(line, "日志清理未启用") {
+		t.Fatalf("logFile 为空时摘要=%q, want 「日志清理未启用…」", line)
+	}
+	if len(res.WafAudit) == 0 {
+		t.Fatalf("logFile 为空时仍须执行 waf-audit 兜底: %+v", res)
+	}
+	st, err := os.Stat(logPath)
+	if err != nil || st.Size() != 0 {
+		t.Fatalf("兜底后 audit.log size=%v err=%v，应已轮转截断为 0", st, err)
+	}
+	if !strings.Contains(line, "waf-audit 兜底") {
+		t.Fatalf("摘要必须包含兜底动作: %q", line)
+	}
+}

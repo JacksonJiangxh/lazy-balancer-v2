@@ -6,8 +6,10 @@ package handlers
 // （60 秒 5 次失败 → 429，成功清零，不锁定）。
 
 import (
+	"database/sql"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +17,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/services"
 )
 
 // mfaSelfServiceRouterWithAge 同 mfaSelfServiceRouter，但守卫标记年龄可注入
@@ -182,5 +185,191 @@ func TestMFAVerifyStep_rateLimitPrecedesVerification(t *testing.T) {
 	}
 	if events == 0 {
 		t.Fatal("限流拒绝未留审计（429 拒绝是可观测面）")
+	}
+}
+
+// installMFAAuditTestDB 安装审计库与最小 audit_log 表（MFA 登录步故障分支
+// 留痕断言用）。
+func installMFAAuditTestDB(t *testing.T) {
+	t.Helper()
+	old := db.AuditDB
+	auditDB, err := sql.Open("sqlite", t.TempDir()+"/audit.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := auditDB.Exec(`CREATE TABLE audit_log (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		username VARCHAR(50), action VARCHAR(50), resource VARCHAR(50),
+		detail TEXT, ip_address VARCHAR(50), created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatal(err)
+	}
+	db.AuditDB = auditDB
+	t.Cleanup(func() {
+		db.AuditDB = old
+		_ = auditDB.Close()
+	})
+}
+
+// 登录后验码的 5/60s 限流门覆盖全部四个入口：重绑确认（MFASetup）与管理员
+// 重置（MFAResetByAdmin）的 429 分支与 verify-step/disable 同口径，且不触碰
+// login_* 锁定列。
+func TestMFASetup_rebindRateLimitedReturns429(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	seedMfaResetUsers(t, true)
+	setMfaWriteGuard(t, true)
+	router := mfaSelfServiceRouterWithAge(h, -1) // 无窄窗年龄键 → 不免验，落到限流门
+
+	for i := 0; i < mfaRateLimitFailures; i++ {
+		services.MFARecordVerifyAttemptFailure(1, time.Now())
+	}
+	rec := postMfaSelfService(router, "/auth/mfa/setup", `{}`)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("重绑确认限流: status=%d body=%s, want 429", rec.Code, rec.Body.String())
+	}
+	var attempts int
+	var locked sql.NullString
+	if err := db.DB.QueryRow("SELECT COALESCE(login_failed_attempts,0), login_locked_until FROM users WHERE id=1").Scan(&attempts, &locked); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 0 || locked.Valid {
+		t.Fatalf("login_failed_attempts=%d locked=%v, want 0/NULL（限流不锁定）", attempts, locked)
+	}
+}
+
+// mfaRateLimitFailures 与 services.mfaVerifyAttemptLimit 同值（跨包不可见；
+// 播种次数需达到上限以触发 429）。
+const mfaRateLimitFailures = 5
+
+func TestMFAResetByAdmin_rateLimitedReturns429(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	seedMfaResetUsers(t, true)
+	setMfaWriteGuard(t, false) // 守卫关 → 第一层验码执行 → 限流门生效
+	router := mfaResetRouter(h, "jwt")
+
+	for i := 0; i < mfaRateLimitFailures; i++ {
+		services.MFARecordVerifyAttemptFailure(1, time.Now())
+	}
+	rec := postMfaReset(router, `{}`)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("管理员重置限流: status=%d body=%s, want 429", rec.Code, rec.Body.String())
+	}
+	var targetMfa int
+	if err := db.DB.QueryRow("SELECT COALESCE(mfa_enabled,0) FROM users WHERE id=2").Scan(&targetMfa); err != nil {
+		t.Fatal(err)
+	}
+	if targetMfa != 1 {
+		t.Fatalf("target mfa_enabled=%d, want 1（限流不得重置目标用户）", targetMfa)
+	}
+}
+
+// 15s 窄窗边界：≤15s 免本层验码、16s 回落验码（严格边界钉测）。
+func TestMfaDestructiveStepUpWindow_boundary(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, tc := range []struct {
+		secs int64
+		want bool
+	}{{15, true}, {16, false}} {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Set("mfa_stepup_verified", true)
+		c.Set("mfa_stepup_seconds_ago", tc.secs)
+		if got := mfaStepUpVerifiedForDestructiveOp(c); got != tc.want {
+			t.Fatalf("seconds_ago=%d exempt=%v, want %v", tc.secs, got, tc.want)
+		}
+	}
+}
+
+// MFAVerifyLogin 的基础设施故障分支必须留痕（与 Login 同型 internal_error
+// 口径）：挑战查询失败。
+func TestMFAVerifyLogin_challengeQueryFailureIsAudited(t *testing.T) {
+	setupAuthTestDB(t)
+	installMFAAuditTestDB(t)
+	if _, err := db.DB.Exec("DROP TABLE mfa_challenges"); err != nil {
+		t.Fatal(err)
+	}
+	h := &Handlers{}
+	router := gin.New()
+	router.POST("/auth/mfa/verify", h.MFAVerifyLogin)
+
+	req := httptest.NewRequest(http.MethodPost, "/auth/mfa/verify", strings.NewReader(`{"mfa_token":"tok","code":"123456"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s, want 500", rec.Code, rec.Body.String())
+	}
+	var detail string
+	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='认证拒绝' AND resource='用户认证' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
+		t.Fatalf("read audit: %v", err)
+	}
+	if !strings.Contains(detail, "挑战查询失败") {
+		t.Fatalf("audit detail=%q, want 挑战查询失败留痕", detail)
+	}
+}
+
+// 锁定开关读取失败分支（global_config 不可读）同样必须留痕。
+func TestMFAVerifyLogin_lockSwitchReadFailureIsAudited(t *testing.T) {
+	setupAuthTestDB(t)
+	installMFAAuditTestDB(t)
+	if _, err := db.DB.Exec("INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (1,'operator','x','admin',1)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec("INSERT INTO mfa_challenges (token,user_id,expires_at,password_version) VALUES ('tok',1,datetime('now','+5 minutes'),0)"); err != nil {
+		t.Fatal(err)
+	}
+	h := &Handlers{}
+	router := gin.New()
+	router.POST("/auth/mfa/verify", h.MFAVerifyLogin)
+
+	req := httptest.NewRequest(http.MethodPost, "/auth/mfa/verify", strings.NewReader(`{"mfa_token":"tok","code":"123456"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s, want 500（锁定开关读失败 fail-closed）", rec.Code, rec.Body.String())
+	}
+	var detail string
+	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='认证拒绝' AND resource='用户认证' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
+		t.Fatalf("read audit: %v", err)
+	}
+	if !strings.Contains(detail, "锁定开关读取失败") {
+		t.Fatalf("audit detail=%q, want 锁定开关读取失败留痕", detail)
+	}
+}
+
+// 认证后的 MFA 写端点遵循「请求体大小」配置项（此前固定 64KiB，配置对
+// 这些端点静默失效）。100KB 请求体在 1MB 配置下必须放行到业务层。
+func TestMFASetup_usesConfiguredBodyLimit(t *testing.T) {
+	setupAuthTestDB(t)
+	if _, err := db.DB.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, request_body_max_size_mb INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO global_config (id, request_body_max_size_mb) VALUES (1, 1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec("INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (1,'operator','x','admin',1)"); err != nil {
+		t.Fatal(err)
+	}
+	h := &Handlers{}
+	router := gin.New()
+	router.POST("/auth/mfa/setup", func(c *gin.Context) {
+		c.Set("user_id", 1)
+		c.Set("username", "operator")
+		c.Set("auth_type", "jwt")
+		h.MFASetup(c)
+	})
+
+	body := `{"pad":"` + strings.Repeat("a", 100<<10) + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/auth/mfa/setup", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusRequestEntityTooLarge {
+		t.Fatalf("100KB 请求体在 1MB 配置下被 413 拒绝（仍使用固定 64KiB 上限）: %s", rec.Body.String())
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200（配置上限内的合法请求体）", rec.Code, rec.Body.String())
 	}
 }

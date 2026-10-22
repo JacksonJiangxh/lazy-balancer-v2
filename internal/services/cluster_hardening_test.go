@@ -246,3 +246,88 @@ func TestPromote_stoppedClusterSyncLeavesInspectionAudit(t *testing.T) {
 		t.Fatal("升主审计缺少「cluster-sync 停止→主端巡检未启用」提示行")
 	}
 }
+
+// 探活超时不得等价于「句柄永久死亡」：长写事务/磁盘停顿/GC 停顿会让 1s
+// PingContext 超时，此前直接删登记项 → Promote/BecomeSlave 的 syncDrainersFor
+// 返回空（在途 Pull 不排干）且 clusterServicesFor 空（pin 清理重试链断裂）。
+// 连续达到上限仍按死句柄剔除（防全局表在库重建场景无限累积）。
+func TestClusterHandleProbe_timeoutKeepsRegistrationsUntilConsecutiveStrikes(t *testing.T) {
+	_, database := newClusterTestService(t)
+	// 把连接池压到 1 并占住唯一连接：PingContext 只能等到 ctx 超时。
+	database.SetMaxOpenConns(1)
+	held, err := database.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("hold sole connection: %v", err)
+	}
+	defer held.Close()
+	oldTimeout := clusterHandleProbeTimeout
+	clusterHandleProbeTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { clusterHandleProbeTimeout = oldTimeout })
+
+	sync := NewSyncService(database, nil, nil)
+	t.Cleanup(func() {
+		unregisterSyncDrainer(sync)
+		resetClusterHandleStrikes(database)
+	})
+
+	if state := probeClusterDBHandle(database); state != clusterHandleUnverified {
+		t.Fatalf("probe state=%v, want clusterHandleUnverified（超时不是确定性关闭）", state)
+	}
+	// 每次断言前复位计数，避免探活次数在断言之间串味。
+	resetClusterHandleStrikes(database)
+	if got := clusterServicesFor(database); len(got) == 0 {
+		t.Fatal("单次探活超时剔除了 clusterServices 登记项（排干/pin 重试链会静默断裂）")
+	}
+	resetClusterHandleStrikes(database)
+	if got := syncDrainersFor(database); len(got) == 0 {
+		t.Fatal("单次探活超时剔除了 syncDrainers 登记项（升主不排干在途 Pull）")
+	}
+	// 连续不可判定达到上限 → 按死句柄剔除（含探活计数复位）。
+	for range clusterHandleUnverifiedStrikes - 1 {
+		_ = clusterServicesFor(database)
+	}
+	if got := clusterServicesFor(database); len(got) != 0 {
+		t.Fatalf("连续 %d 次探活失败后登记项仍在: %v", clusterHandleUnverifiedStrikes, got)
+	}
+	if _, ok := clusterHandleStrikes[database]; ok {
+		t.Fatal("剔除后探活计数未复位（全局表残留已关闭句柄键）")
+	}
+}
+
+// 确定性关闭（库已 Close）仍必须立即剔除——兜底回收语义不变。
+func TestClusterHandleProbe_closedHandlePrunedImmediately(t *testing.T) {
+	_, database := newClusterTestService(t)
+	sync := NewSyncService(database, nil, nil)
+	t.Cleanup(func() { unregisterSyncDrainer(sync) })
+	if err := database.Close(); err != nil {
+		t.Fatalf("close database: %v", err)
+	}
+	if state := probeClusterDBHandle(database); state != clusterHandleClosed {
+		t.Fatalf("closed probe state=%v, want clusterHandleClosed", state)
+	}
+	if got := clusterServicesFor(database); len(got) != 0 {
+		t.Fatalf("已 Close 句柄登记项未被剔除: %v", got)
+	}
+	if got := syncDrainersFor(database); len(got) != 0 {
+		t.Fatalf("已 Close 句柄排干登记项未被剔除: %v", got)
+	}
+}
+
+// JSON 文本列的序列化失败必须返回 error（fail-visible），不得静默落 NULL
+// 让读路径 COALESCE 兜底把形态错误掩盖成「空列表」。
+func TestSnapshotJSONText_reportsMarshalFailure(t *testing.T) {
+	if _, err := snapshotJSONText("geoip_countries", make(chan int)); err == nil {
+		t.Fatal("不可序列化值必须返回 error（静默 NULL = geoip 静默削弱）")
+	} else if !strings.Contains(err.Error(), "geoip_countries") {
+		t.Fatalf("错误信息必须点名列: %v", err)
+	}
+	if got, err := snapshotJSONText("geoip_countries", `["CN"]`); err != nil || got != `["CN"]` {
+		t.Fatalf("JSON 字符串直通失败: got=%v err=%v", got, err)
+	}
+	if got, err := snapshotJSONText("ip_acl_list", nil); err != nil || got != nil {
+		t.Fatalf("nil 必须保持 NULL: got=%v err=%v", got, err)
+	}
+	if got, err := snapshotJSONText("ip_acl_list", []interface{}{"1.2.3.4"}); err != nil || got != `["1.2.3.4"]` {
+		t.Fatalf("非字符串值须二次编码: got=%v err=%v", got, err)
+	}
+}

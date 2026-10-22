@@ -24,10 +24,12 @@ func resetDiskUsageCacheForTest(t *testing.T) {
 	t.Helper()
 	diskUsageCache.Lock()
 	diskUsageCache.total, diskUsageCache.used, diskUsageCache.expiresAt = 0, 0, time.Time{}
+	diskUsageCache.negativeUntil, diskUsageCache.negativeErr = time.Time{}, nil
 	diskUsageCache.Unlock()
 	t.Cleanup(func() {
 		diskUsageCache.Lock()
 		diskUsageCache.total, diskUsageCache.used, diskUsageCache.expiresAt = 0, 0, time.Time{}
+		diskUsageCache.negativeUntil, diskUsageCache.negativeErr = time.Time{}, nil
 		diskUsageCache.Unlock()
 	})
 }
@@ -37,11 +39,13 @@ func resetConnectionStatsCacheForTest(t *testing.T) {
 	connectionStatsCache.Lock()
 	connectionStatsCache.stats = models.ConnectionStats{}
 	connectionStatsCache.expiresAt = time.Time{}
+	connectionStatsCache.negativeUntil, connectionStatsCache.negativeErr = time.Time{}, nil
 	connectionStatsCache.Unlock()
 	t.Cleanup(func() {
 		connectionStatsCache.Lock()
 		connectionStatsCache.stats = models.ConnectionStats{}
 		connectionStatsCache.expiresAt = time.Time{}
+		connectionStatsCache.negativeUntil, connectionStatsCache.negativeErr = time.Time{}, nil
 		connectionStatsCache.Unlock()
 	})
 }

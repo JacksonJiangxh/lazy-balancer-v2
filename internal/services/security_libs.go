@@ -57,9 +57,10 @@ func securityLibrariesMissingDesc() string {
 var errCRSTreeSwapInFlight = errors.New("CRS 规则树正在更新（树交换中），本轮配置生成已中止；请稍后重试")
 
 // crsTreeSwapInFlight 标记树交换窗口（swapCRSTreeFromStaging 的
-// RemoveAll→moveTree→setup 落盘段）。渲染侧不持 wafFileMu（导入/更新路径的
-// 锁序 CaddyOpLock→wafFileMu 不可反转），故以代际标记代替加锁：窗口内
-// 生成直接失败，窗口结束后由调用方重试。
+// RemoveAll→moveTree→setup 落盘段）。渲染侧不持 wafFileMu——渲染/重载在
+// CaddyOpLock 临界区内，而全局锁序为导入=排空→wafFileMu→CaddyOpLock，
+// 持 CaddyOpLock 再取 wafFileMu 即反向嵌套（AB-BA），故以代际标记代替加锁：
+// 窗口内生成直接失败，窗口结束后由调用方重试。
 var crsTreeSwapInFlight atomic.Bool
 
 // crsTreeSwapInFlightNow 报告是否处于 CRS 树交换窗口（生成期互斥探针）。

@@ -6,10 +6,14 @@ package handlers
 // （否则一次断开会让同窗内其余请求拿到伪造的上游失败）。
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -72,7 +76,7 @@ func TestMetricsEndpoints_shareOneScrapeSnapshotAcrossConsumers(t *testing.T) {
 	}
 }
 
-func TestLoadCaddyMetricsSnapshot_negativeCacheAndCancelNotCached(t *testing.T) {
+func TestLoadCaddyMetricsSnapshot_negativeCacheAndSelfTimeoutNotCached(t *testing.T) {
 	resetCaddyMetricsSnapshotCacheForTest()
 	t.Cleanup(resetCaddyMetricsSnapshotCacheForTest)
 	oldNeg := caddyMetricsSnapshotNegativeTTL
@@ -96,25 +100,46 @@ func TestLoadCaddyMetricsSnapshot_negativeCacheAndCancelNotCached(t *testing.T) 
 		t.Fatalf("负缓存窗口内抓取 %d 次, want 1", got)
 	}
 
-	// Given：客户端已取消的请求触发的抓取失败。
+	// Given：leader 客户端已取消（单请求 ctx 已被 cancel）。
 	resetCaddyMetricsSnapshotCacheForTest()
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
+	var liveCtx atomic.Bool
 	overrideDashboardFetch(t, func(ctx context.Context, _ string) ([]byte, error) {
 		calls.Add(1)
-		return nil, ctx.Err()
-	})
-	if _, err := loadCaddyMetricsSnapshot(canceled, "http://snap.invalid/metrics", true); err == nil {
-		t.Fatal("取消请求必须返回 error")
-	}
-	// Then：取消不写负缓存——下一次健康请求立刻重新抓取。
-	overrideDashboardFetch(t, func(context.Context, string) ([]byte, error) {
-		calls.Add(1)
+		liveCtx.Store(ctx.Err() == nil)
 		return []byte("ok 1\n"), nil
 	})
-	body, err := loadCaddyMetricsSnapshot(context.Background(), "http://snap.invalid/metrics", true)
+	body, err := loadCaddyMetricsSnapshot(canceled, "http://snap.invalid/metrics", true)
+	// Then：共享抓取脱离请求取消信号（否则同批等待者会收到伪造的上游失败）。
 	if err != nil || string(body) != "ok 1\n" {
-		t.Fatalf("取消后健康请求 body=%q err=%v, want 立即重新抓取成功", string(body), err)
+		t.Fatalf("取消请求 body=%q err=%v, want 抓取仍成功（脱钩取消信号）", string(body), err)
+	}
+	if !liveCtx.Load() {
+		t.Fatal("抓取收到的 context 已被 leader 取消, want context.WithoutCancel 存活")
+	}
+
+	// Given：抓取自身超时（自有超时上限触发）。
+	resetCaddyMetricsSnapshotCacheForTest()
+	oldTimeout := caddyMetricsFetchTimeout
+	caddyMetricsFetchTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { caddyMetricsFetchTimeout = oldTimeout })
+	overrideDashboardFetch(t, func(ctx context.Context, _ string) ([]byte, error) {
+		calls.Add(1)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	if _, err := loadCaddyMetricsSnapshot(context.Background(), "http://snap.invalid/metrics", true); err == nil {
+		t.Fatal("自身超时抓取必须返回 error")
+	}
+	// Then：超时不写负缓存——下一次健康请求立刻重新抓取（不被瞬时超时毒化）。
+	overrideDashboardFetch(t, func(context.Context, string) ([]byte, error) {
+		calls.Add(1)
+		return []byte("ok 2\n"), nil
+	})
+	body, err = loadCaddyMetricsSnapshot(context.Background(), "http://snap.invalid/metrics", true)
+	if err != nil || string(body) != "ok 2\n" {
+		t.Fatalf("超时后健康请求 body=%q err=%v, want 立即重新抓取成功", string(body), err)
 	}
 }
 
@@ -140,5 +165,145 @@ func TestGetRuleMetrics_unknownRuleUsesFamilyNotFoundShape(t *testing.T) {
 	// 与规则历史/证书任务同族口径（中文且不把「规则已删」当服务故障）。
 	if payload.Code != 404 || payload.Message != "规则不存在" {
 		t.Fatalf("payload=%+v, want 404/规则不存在（dbQueryNotFound 单源）", payload)
+	}
+}
+
+func TestLoadCaddyMetricsSnapshot_callerPolicyControlsFailureReuse(t *testing.T) {
+	// 面板传 cacheFailure=false 的契约：其他端点写入的失败负缓存不得让面板
+	// 「每次都重新抓取」被静默吞掉（策略在 single-flight 闭包内同样生效）。
+	resetCaddyMetricsSnapshotCacheForTest()
+	t.Cleanup(resetCaddyMetricsSnapshotCacheForTest)
+
+	const url = "http://snap.invalid/policy-metrics"
+	var calls atomic.Int32
+	overrideDashboardFetch(t, func(context.Context, string) ([]byte, error) {
+		calls.Add(1)
+		return nil, errors.New("upstream down")
+	})
+	if _, err := loadCaddyMetricsSnapshot(context.Background(), url, true); err == nil {
+		t.Fatal("抓取失败必须返回 error")
+	}
+	// 同策略（true）命中负缓存：不再抓取。
+	if _, err := loadCaddyMetricsSnapshot(context.Background(), url, true); err == nil {
+		t.Fatal("负缓存命中仍须返回失败")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("cacheFailure=true 负缓存窗口内抓取 %d 次, want 1", got)
+	}
+	// 面板策略（false）必须绕过该失败条目并重新抓取。
+	overrideDashboardFetch(t, func(context.Context, string) ([]byte, error) {
+		calls.Add(1)
+		return []byte("ok 1\n"), nil
+	})
+	body, err := loadCaddyMetricsSnapshot(context.Background(), url, false)
+	if err != nil || string(body) != "ok 1\n" {
+		t.Fatalf("面板策略 body=%q err=%v, want 重新抓取成功", string(body), err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("面板策略下抓取累计=%d, want 2（闭包内不得复用失败条目）", got)
+	}
+}
+
+func TestLoadCaddyMetricsSnapshot_canceledLeaderDoesNotFailWaiters(t *testing.T) {
+	// 并发消费面共用一个 single-flight：leader 客户端断开不得把 ctx 错误交给
+	// 其余健康请求（否则一次断开瞬断同批所有指标请求）。
+	resetCaddyMetricsSnapshotCacheForTest()
+	t.Cleanup(resetCaddyMetricsSnapshotCacheForTest)
+
+	const url = "http://snap.invalid/waiter-metrics"
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	overrideDashboardFetch(t, func(ctx context.Context, _ string) ([]byte, error) {
+		once.Do(func() { close(started) })
+		<-release
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return []byte("ok-waiter 1\n"), nil
+	})
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderDone := make(chan struct{})
+	go func() {
+		defer close(leaderDone)
+		// leader 结果本身不参与断言：请求已取消，其调用方通常也已离开。
+		_, _ = loadCaddyMetricsSnapshot(leaderCtx, url, true)
+	}()
+	<-started
+
+	type result struct {
+		body []byte
+		err  error
+	}
+	waiterDone := make(chan result, 1)
+	go func() {
+		body, err := loadCaddyMetricsSnapshot(context.Background(), url, true)
+		waiterDone <- result{body: body, err: err}
+	}()
+	// 等 waiter 加入 single-flight 后取消 leader，再放行抓取。
+	time.Sleep(20 * time.Millisecond)
+	cancelLeader()
+	close(release)
+
+	select {
+	case got := <-waiterDone:
+		if got.err != nil || string(got.body) != "ok-waiter 1\n" {
+			t.Fatalf("waiter body=%q err=%v, want leader 取消后仍成功", string(got.body), got.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter 未在超时内返回")
+	}
+	<-leaderDone
+}
+
+func TestFetchCaddyMetrics_rejectsOver16MB(t *testing.T) {
+	// 16MB 上限（limit+1 探测读取）：超限显式报错，避免指标基数膨胀时无界分配。
+	payload := make([]byte, 16<<20+1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(payload)
+	}))
+	t.Cleanup(server.Close)
+
+	if _, err := fetchCaddyMetrics(context.Background(), server.URL); err == nil {
+		t.Fatal("超过 16MB 的指标响应必须报错")
+	} else if !strings.Contains(err.Error(), "16MB") {
+		t.Fatalf("err=%v, want 提及 16MB 上限", err)
+	}
+
+	// 恰好上限（16MB 整）不报错——上限是「大于」而非「大于等于」。
+	exact := make([]byte, 16<<20)
+	serverExact := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(exact)
+	}))
+	t.Cleanup(serverExact.Close)
+	if body, err := fetchCaddyMetrics(context.Background(), serverExact.URL); err != nil || len(body) != 16<<20 {
+		t.Fatalf("16MB 整响应 body=%d err=%v, want 通过", len(body), err)
+	}
+}
+
+func TestGetMetricsDashboard_dbReadFailureIsLogged(t *testing.T) {
+	// 面板 DB 读失败必须在日志留痕（此前只有响应文案，锁冲突/表损坏不可区分）。
+	newMetricsTestDatabase(t)
+	if _, err := db.DB.Exec(`DROP TABLE lb_rules`); err != nil {
+		t.Fatal(err)
+	}
+	resetMetricsDashboardCacheForTest()
+	t.Cleanup(resetMetricsDashboardCacheForTest)
+	overrideDashboardFetch(t, func(context.Context, string) ([]byte, error) {
+		return []byte("caddy_http_requests_total 1\n"), nil
+	})
+
+	var logBuf bytes.Buffer
+	origOut := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(origOut) })
+
+	h := &Handlers{cfg: &config.Config{CaddyMetricsURL: "http://127.0.0.1:9/metrics"}}
+	if code := requestDashboard(t, h); code != http.StatusInternalServerError {
+		t.Fatalf("DB 读失败状态码=%d, want 500", code)
+	}
+	if !strings.Contains(logBuf.String(), "指标面板读取规则配置失败") {
+		t.Fatalf("日志未留痕 DB 读失败, log=%q", logBuf.String())
 	}
 }

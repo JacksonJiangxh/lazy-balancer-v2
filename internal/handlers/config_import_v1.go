@@ -703,6 +703,9 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: prepErr.Error()}})
 			return
 		}
+		// 版本/源表 update_status 归一与导入同序同文案：导入门把词表外值收敛为
+		// idle 并告警，预览此前跳过该步，导致同一备份的 warnings 双路径不同。
+		skipWarnings = append(skipWarnings, normalizeImportedVersionUpdateStatuses(backup.Tables)...)
 		// 行级门在 sections 过滤与软跳过之后（与导入同序）。
 		if err := validateV2BackupRows(backup); err != nil {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
@@ -947,7 +950,7 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 	body = bytes.TrimPrefix(body, []byte("\xef\xbb\xbf"))
 	// lbbak(tar.gz)是 V2 形态:提前给出正确端点指引,避免落入 JSON 解析
 	// 「不是有效的 JSON」困惑(安全面本就必拒,仅提示质量)。
-	if len(body) > 2 && body[0] == 0x1f && body[1] == 0x8b {
+	if isLbbakBytes(body) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "V1 导入仅支持旧版 JSON 备份；lbbak 备份请使用 /api/v1/config/import"})
 		return
 	}
@@ -977,7 +980,7 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 	}
 	disabledConflicts := disableConvertedRuleConflicts(validRules)
 	ctx := c.Request.Context()
-	session, err := h.beginConfigImport(ctx)
+	session, err := h.beginConfigImport(ctx, "导入")
 	if err != nil {
 		respondImportBeginError(c, err)
 		return

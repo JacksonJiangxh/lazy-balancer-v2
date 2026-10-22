@@ -129,16 +129,17 @@ func TestMetricsHandlers_useDedicatedCaddyMetricsURL(t *testing.T) {
 	}
 }
 
-func TestGetCaddyMetrics_propagates_request_cancellation(t *testing.T) {
-	// Given
+func TestGetCaddyMetrics_clientCancellationDoesNotAbortSharedScrape(t *testing.T) {
+	// 共享抓取脱离首个请求的取消信号：single-flight 的结果同时交给所有等待
+	// 者，leader 客户端断开不得中止抓取（否则同批健康连接收到伪造的上游失败）。
+	resetCaddyMetricsSnapshotCacheForTest()
+	t.Cleanup(resetCaddyMetricsSnapshotCacheForTest)
 	requestStarted := make(chan struct{})
 	release := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		close(requestStarted)
-		select {
-		case <-r.Context().Done():
-		case <-release:
-		}
+		<-release
+		_, _ = w.Write([]byte("caddy_http_requests_total 1\n"))
 	}))
 	defer server.Close()
 	h := &Handlers{cfg: &config.Config{CaddyAdminURL: server.URL, CaddyMetricsURL: server.URL + "/metrics"}}
@@ -147,22 +148,33 @@ func TestGetCaddyMetrics_propagates_request_cancellation(t *testing.T) {
 	router.GET("/metrics", h.GetCaddyMetrics)
 	ctx, cancel := context.WithCancel(context.Background())
 	request := httptest.NewRequest(http.MethodGet, "/metrics", nil).WithContext(ctx)
-	done := make(chan struct{})
+	done := make(chan int, 1)
 
 	// When
 	go func() {
-		router.ServeHTTP(httptest.NewRecorder(), request)
-		close(done)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, request)
+		done <- rec.Code
 	}()
 	<-requestStarted
 	cancel()
 
-	// Then
+	// Then：取消后抓取仍在跑（本 handler 不得随客户端断开收工）。
 	select {
-	case <-done:
-	case <-time.After(time.Second):
+	case code := <-done:
 		close(release)
-		t.Fatal("metrics request did not stop after client cancellation")
+		t.Fatalf("status=%d, want 挂起（客户端取消不得中止共享抓取）", code)
+	case <-time.After(200 * time.Millisecond):
+	}
+	// 上游完成后 handler 正常收尾（响应丢弃即可）。
+	close(release)
+	select {
+	case code := <-done:
+		if code != http.StatusOK {
+			t.Fatalf("status=%d, want 200（抓取完成后的正常结果）", code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("抓取完成后请求未返回")
 	}
 }
 

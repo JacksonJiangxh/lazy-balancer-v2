@@ -19,8 +19,9 @@ import (
 type logStatsResponseRows struct {
 	Data struct {
 		Logs []struct {
-			Key  string `json:"key"`
-			Rows *int64 `json:"rows"`
+			Key             string `json:"key"`
+			Rows            *int64 `json:"rows"`
+			RowsUnavailable bool   `json:"rows_unavailable"`
 		} `json:"logs"`
 	} `json:"data"`
 }
@@ -60,6 +61,18 @@ func auditRowCountFromLogStats(t *testing.T, response logStatsResponseRows) *int
 	return nil
 }
 
+// auditRowFromLogStats 返回 audit 行的完整字段（行数 + 不可用披露位）。
+func auditRowFromLogStats(t *testing.T, response logStatsResponseRows) (rows *int64, unavailable bool) {
+	t.Helper()
+	for i := range response.Data.Logs {
+		if response.Data.Logs[i].Key == "audit" {
+			return response.Data.Logs[i].Rows, response.Data.Logs[i].RowsUnavailable
+		}
+	}
+	t.Fatalf("响应缺少 audit 行: %+v", response.Data.Logs)
+	return nil, false
+}
+
 func seedAuditRows(t *testing.T, count int) {
 	t.Helper()
 	for i := range count {
@@ -86,8 +99,14 @@ func TestGetLogStats_auditRowCountCachedAndFailureNotCached(t *testing.T) {
 	failed := fetchLogStats(t, h.GetLogStats, "?keys=audit")
 
 	// Then 行数字段缺席（不再以「0 行」冒充空表），且留痕一次。
-	if rows := auditRowCountFromLogStats(t, failed); rows != nil {
+	rows, unavailable := auditRowFromLogStats(t, failed)
+	if rows != nil {
 		t.Fatalf("COUNT 失败时 rows=%d, want 缺席", *rows)
+	}
+	// 字段语义：行数读取失败必须置位（与 security_events 行同口径），否则
+	// 「计数暂不可用」与「0 行」在消费方不可区分。
+	if !unavailable {
+		t.Fatal("COUNT 失败时 rows_unavailable=false, want true")
 	}
 	if !strings.Contains(logs.String(), "logstats-audit-count") || !strings.Contains(logs.String(), "失败") {
 		t.Fatalf("COUNT 失败未留痕: %s", logs.String())
@@ -99,9 +118,13 @@ func TestGetLogStats_auditRowCountCachedAndFailureNotCached(t *testing.T) {
 	}
 	recovered := fetchLogStats(t, h.GetLogStats, "?keys=audit")
 
-	// Then 得到真实行数，并补一条恢复留痕。
-	if rows := auditRowCountFromLogStats(t, recovered); rows == nil || *rows != 2 {
+	// Then 得到真实行数（不可用位复位），并补一条恢复留痕。
+	rows, unavailable = auditRowFromLogStats(t, recovered)
+	if rows == nil || *rows != 2 {
 		t.Fatalf("恢复后 rows=%s, want 2", formatRowCount(rows))
+	}
+	if unavailable {
+		t.Fatal("恢复后 rows_unavailable 仍为 true, want false")
 	}
 	if !strings.Contains(logs.String(), "已恢复") {
 		t.Fatalf("恢复未留痕: %s", logs.String())

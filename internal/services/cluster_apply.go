@@ -293,7 +293,8 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 		// BuildWafFileBundle 读相位（内锁）串行，杜绝同步落盘与导入/更新交错
 		// 打出混合 rules 树/撕裂 xdb。ApplyWafFileBundle 本体不可内锁（lbbak
 		// 已持锁调用，内锁=双锁死锁）。锁序：本点不持 CaddyOpLock（重载段在
-		// 下方 :253 才取），wafFileMu 叶操作，无 AB-BA。
+		// 其后单独取），wafFileMu→CaddyOpLock 与导入锁序同向；禁止反向嵌套
+		// （持 CaddyOpLock 再取 wafFileMu 即 AB-BA）。
 		var aerr error
 		if ferr == nil {
 			WafFileLock().Lock()
@@ -421,10 +422,6 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 		Logf("info", "集群同步：渲染输入无变化，跳过 Caddy 重载")
 	}
 	clusterSnapshotCaches.Delete(s.db)
-	caddySync := "未开启"
-	if snapshot.CaddyConfig != nil {
-		caddySync = "已同步"
-	}
 	// 重启判定必须用严格读取变体——宽容版
 	// LoadAdminTLSConfig 读失败回退 {selfsigned, disabled}，运行态为 upload 证书
 	// 时一次瞬时读失败会被误判「配置变化」触发进程重启（重启抖动），反向则可能
@@ -458,7 +455,9 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	if !mustReload {
 		summaryParts = append(summaryParts, "Caddy 重载：跳过（渲染输入无变化）")
 	}
-	summaryParts = append(summaryParts, fmt.Sprintf("Caddy 全局配置：%s", caddySync))
+	// 不再输出「Caddy 全局配置：已同步」——该段恒真（v3 快照的 CaddyConfig
+	// 恒非 nil）且已被节级三态覆盖：全局配置并入 users（系统数据）节，节实际
+	// 应用/跳过面见上列（2026-10-03「汇总行反映节级实际应用面」裁定）。
 	RecordAuditLog("system", "同步", "集群同步", FormatAuditDetail(summaryParts...), "")
 	return nil
 }
@@ -963,6 +962,17 @@ func InferSnapshotPolicyType(p map[string]interface{}) interface{} {
 	})
 }
 
+// applySecurityTables 把主节点安全表忠实复制到从节点。
+//
+// 已知且有意保留的覆盖边界（记入审计台账，非缺陷）：策略表的
+// crs_rule_groups / crs_excluded_rules / geoip_countries 只作 JSON 文本透传，
+// 本函数不做语义校验。主节点写侧（handlers 的保存/导入入口，含
+// ValidateGeoIPCountries）已拦非法形状；可达的漏网面仅「带外直改主库 / 旧备份
+// 绕过写侧校验」。渲染期若遇畸形 JSON：crs_rule_groups 按空集合降级=放行全量
+// 规则组（安全方向），geoip_countries 按空集合降级=不渲染地域规则（deny 模式
+// 会被静默削弱）——渲染侧对该形态有 60s 限流 warn。取舍是「忠实复制 + 可用性
+// 优先」；如需加固，应在下发侧（validateSnapshotACMEState 家族）加只告警不阻断
+// 的形状检查，而不是让从节点拒绝主机快照。
 func applySecurityTables(ctx context.Context, tx *sql.Tx, snapshot models.ClusterSnapshot) error {
 	// 与规则/用户等表一致的全量替换语义：空载荷意味着主节点已清空，从节点必须
 	// 同步删除，不能因载荷为空而提前返回。
@@ -998,8 +1008,12 @@ func applySecurityTables(ctx context.Context, tx *sql.Tx, snapshot models.Cluste
 			}
 		}
 		for _, l := range ipLists {
+			entries, cerr := snapshotJSONText("security_ip_lists.entries", l["entries"])
+			if cerr != nil {
+				return fmt.Errorf("写入 security_ip_list（id=%v）失败: %w", l["id"], cerr)
+			}
 			if _, err := tx.ExecContext(ctx, `INSERT INTO security_ip_lists (id,name,description,category,entries,created_by,created_at,updated_by,updated_at,system) VALUES (?,?,?,?,?,?,?,?,?,?)`,
-				l["id"], l["name"], l["description"], l["category"], snapshotJSONText(l["entries"]), l["created_by"], l["created_at"], l["updated_by"], l["updated_at"], l["system"]); err != nil {
+				l["id"], l["name"], l["description"], l["category"], entries, l["created_by"], l["created_at"], l["updated_by"], l["updated_at"], l["system"]); err != nil {
 				return fmt.Errorf("写入 security_ip_list: %w", err)
 			}
 		}
@@ -1122,15 +1136,26 @@ func applySecurityTables(ctx context.Context, tx *sql.Tx, snapshot models.Cluste
 		if p["geoip_crawler_engines"] == nil {
 			p["geoip_crawler_engines"] = "[]"
 		}
+		// JSON 文本列逐列序列化，任一失败即中止本条策略（fail-visible）：静默
+		// 落 NULL 会让读路径的 COALESCE 兜底掩盖形态错误——例如
+		// geoip_countries 变 NULL 时渲染按「无地域规则」降级（deny 模式静默削弱）。
+		policyJSON := make(map[string]interface{}, len(snapshotPolicyJSONColumns))
+		for _, column := range snapshotPolicyJSONColumns {
+			text, cerr := snapshotJSONText(column, p[column])
+			if cerr != nil {
+				return fmt.Errorf("写入 security_policy（id=%v）失败: %w", p["id"], cerr)
+			}
+			policyJSON[column] = text
+		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO security_policies (id,name,description,mode,anomaly_threshold,ip_acl_mode,ip_acl_list,ip_acl_enabled,ip_whitelist,ip_whitelist_enabled,ip_blacklist,rate_limit_enabled,rate_limit_rps,rate_limit_burst,crs_rule_groups,crs_excluded_rules,custom_rules,block_page_id,block_status_code,enabled,updated_by,created_at,updated_at,geoip_countries,geoip_mode,geoip_crawler_exempt,geoip_crawler_engines,waf_check_response,log_request_body,ip_acl_list_refs,ip_whitelist_refs,policy_type,trust_detection) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			p["id"], p["name"], p["description"], p["mode"], p["anomaly_threshold"],
-			p["ip_acl_mode"], snapshotJSONText(p["ip_acl_list"]), p["ip_acl_enabled"],
-			snapshotJSONText(p["ip_whitelist"]), policyWhitelistEnabled(p), snapshotJSONText(p["ip_blacklist"]),
+			p["ip_acl_mode"], policyJSON["ip_acl_list"], p["ip_acl_enabled"],
+			policyJSON["ip_whitelist"], policyWhitelistEnabled(p), policyJSON["ip_blacklist"],
 			p["rate_limit_enabled"], p["rate_limit_rps"], p["rate_limit_burst"],
-			snapshotJSONText(p["crs_rule_groups"]), snapshotJSONText(p["crs_excluded_rules"]), snapshotJSONText(p["custom_rules"]),
+			policyJSON["crs_rule_groups"], policyJSON["crs_excluded_rules"], policyJSON["custom_rules"],
 			p["block_page_id"], p["block_status_code"], p["enabled"], p["updated_by"], p["created_at"], p["updated_at"],
-			snapshotJSONText(p["geoip_countries"]), p["geoip_mode"], p["geoip_crawler_exempt"], snapshotJSONText(p["geoip_crawler_engines"]), p["waf_check_response"], p["log_request_body"],
-			snapshotJSONText(p["ip_acl_list_refs"]), snapshotJSONText(p["ip_whitelist_refs"]), InferSnapshotPolicyType(p), snapshotTrustDetection(p)); err != nil {
+			policyJSON["geoip_countries"], p["geoip_mode"], p["geoip_crawler_exempt"], policyJSON["geoip_crawler_engines"], p["waf_check_response"], p["log_request_body"],
+			policyJSON["ip_acl_list_refs"], policyJSON["ip_whitelist_refs"], InferSnapshotPolicyType(p), snapshotTrustDetection(p)); err != nil {
 			return fmt.Errorf("写入 security_policy: %w", err)
 		}
 	}
@@ -1154,20 +1179,38 @@ func applySecurityTables(ctx context.Context, tx *sql.Tx, snapshot models.Cluste
 	return nil
 }
 
+// snapshotPolicyJSONColumns 是 security_policies 的 JSON 文本列（值经
+// dumpTableAsJSON 已为 JSON 字符串，落库前仍需按列序列化并在失败时中止）。
+var snapshotPolicyJSONColumns = []string{
+	"ip_acl_list",
+	"ip_whitelist",
+	"ip_blacklist",
+	"crs_rule_groups",
+	"crs_excluded_rules",
+	"custom_rules",
+	"geoip_countries",
+	"geoip_crawler_engines",
+	"ip_acl_list_refs",
+	"ip_whitelist_refs",
+}
+
 // snapshotJSONText 写入快照中的 JSON 文本列。dumpTableAsJSON 已把该列作为
 // JSON 字符串携带，直接透传，避免二次编码成带引号的字面量。
-func snapshotJSONText(value interface{}) interface{} {
+// 序列化失败返回 error（fail-visible）：此前返回 nil 让该列静默落 NULL，读路径
+// COALESCE 兜底会把形态错误掩盖成「空列表」——geoip_countries 变空即 deny 模式
+// 静默削弱、crs_rule_groups 变空即放行全量规则组，均不可接受。
+func snapshotJSONText(column string, value interface{}) (interface{}, error) {
 	switch v := value.(type) {
 	case nil:
-		return nil
+		return nil, nil
 	case string:
-		return v
+		return v, nil
 	default:
 		encoded, err := json.Marshal(v)
 		if err != nil {
-			return nil
+			return nil, fmt.Errorf("列 %s 的值（%T）无法序列化为 JSON: %w", column, value, err)
 		}
-		return string(encoded)
+		return string(encoded), nil
 	}
 }
 
@@ -1715,9 +1758,18 @@ func nullableString(value string) any {
 
 // snapshotNullableDatetime 快照可空时间列的 any 入口（dumpTableAsJSON 行值
 // 为 JSON any）：空串/nil → NULL，与版本行 nullableString 调用同口径。
+// 快照时间列恒为 JSON 字符串（dumpTableAsJSON 产出口径）；非字符串形态属载荷
+// 异常——按 NULL 落库并留一条 warn（不静默吞掉形态漂移）。
 func snapshotNullableDatetime(value interface{}) any {
-	s, _ := snapshotJSONText(value).(string)
-	return nullableString(s)
+	switch v := value.(type) {
+	case nil:
+		return nil
+	case string:
+		return nullableString(v)
+	default:
+		Logf("warn", "快照时间列值类型异常（%T），按 NULL 落库: %v", value, value)
+		return nil
+	}
 }
 
 // nullableTimeFlat（2026-10-11 时间戳格式统一；收口全部写点）

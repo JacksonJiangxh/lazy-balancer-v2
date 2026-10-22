@@ -45,31 +45,71 @@ type LogStorageInfo struct {
 	ConfigSource    string `json:"config_source"`
 }
 
-// dirBytes 返回 path 的活跃文件大小与轮转副本合计。两类轮转家族都统计
-// 自研.1..9 shift 后缀;时间戳后缀家族——运行日志
-// <path>.(logrotate.go)与 Caddy/timberjack 的 <name>-<ts>-size.log
-// isTimberjackRotationCopy 判定文件名是否为 timberjack 轮转副本
-// (<stem>-<ts>-size.log / .gz,ts 首字符为数字)。与 timestampedRotationStatsWithEntries
-// 的 timberjack 分支同口径,聚合枚举时跳过这些副本
-// ——它们已由 base 文件的 timestampedRotationStatsWithEntries 计入 rotated,
-// 再计入 active 即双计。
-func isTimberjackRotationCopy(name string) bool {
-	suffix := ""
-	if strings.HasSuffix(name, "-size.log.gz") {
-		suffix = "-size.log.gz"
-	} else if strings.HasSuffix(name, "-size.log") {
-		suffix = "-size.log"
-	} else {
-		return false
-	}
-	trimmed := name[:len(name)-len(suffix)]
-	idx := strings.LastIndex(trimmed, "-")
-	if idx < 0 || idx+1 >= len(trimmed) {
-		return false
-	}
-	return trimmed[idx+1] >= '0' && trimmed[idx+1] <= '9'
+// rotationCopyKind 轮转副本的形态分类（四族语法单源）。此前 dirBytes 时间戳
+// 族、聚合基名预筛、副本归基、虚拟基名各写一份解析——新增一种形态只改了三处
+// 就会让同一响应内的口径分叉（双重后缀 .gz 副本漏归即由此产生）。
+type rotationCopyKind int
+
+const (
+	rotationCopyNone rotationCopyKind = iota
+	// rotationCopyShift：<base>.1..9（自研 shift 后缀，可带 .gz）
+	rotationCopyShift
+	// rotationCopyTimestamp：<base>.YYYYMMDD-HHMMSS（运行日志族 16 字符时间戳，可带 .gz）
+	rotationCopyTimestamp
+	// rotationCopyTimberjack：<stem>-YYYYMMDD-HHMMSS-size.log[.gz]
+	rotationCopyTimberjack
+	// rotationCopyWholeGzip：<base>.gz（整文件 gzip 归档）
+	rotationCopyWholeGzip
+)
+
+type rotationCopyName struct {
+	kind rotationCopyKind
+	base string // 归并基名（timberjack 族为 <stem>.log）
+	stem string // timberjack 族的 stem（去扩展名）；其余形态为空
 }
 
+// classifyRotationCopyName 仅按文件名形态解析轮转副本（与目录内容无关）。
+// 先剥 .gz 再按族判定：双重后缀副本（<base>.<ts>.gz /
+// <stem>-<ts>-size.log.gz）必须归到剥掉时间戳后的基名——否则会派生出一个
+// 「副本名本身当基名」的非规范条目，按固定基名取值的消费方取不到。
+func classifyRotationCopyName(name string) rotationCopyName {
+	core := strings.TrimSuffix(name, ".gz")
+	// 移位后缀：<base>.1..9（core 的最后一个点后须全数字）。
+	if dot := strings.LastIndexByte(core, '.'); dot > 0 && dot < len(core)-1 && isDigits(core[dot+1:]) {
+		if n, err := strconv.Atoi(core[dot+1:]); err == nil && n >= 1 && n <= 9 {
+			return rotationCopyName{kind: rotationCopyShift, base: core[:dot]}
+		}
+	}
+	// 运行日志族时间戳：.<8 位日期>-<6 位时刻>（16 字符）。
+	if len(core) > 17 {
+		rest := core[len(core)-16:]
+		if rest[0] == '.' && isDigits(rest[1:9]) && rest[9] == '-' && isDigits(rest[10:]) {
+			return rotationCopyName{kind: rotationCopyTimestamp, base: core[:len(core)-16]}
+		}
+	}
+	// timberjack：<stem>-<ts>-size.log；ts 首字符为数字（区分 caddy 与兄弟
+	// 文件 caddy-tls——后者的 stem 含 '-tls'，故逐 '-' 位置试探）。
+	if strings.HasSuffix(core, "-size.log") {
+		trimmed := core[:len(core)-len("-size.log")]
+		for i := range trimmed {
+			if trimmed[i] != '-' || i+1 >= len(trimmed) {
+				continue
+			}
+			if trimmed[i+1] < '0' || trimmed[i+1] > '9' {
+				continue
+			}
+			return rotationCopyName{kind: rotationCopyTimberjack, base: trimmed[:i] + ".log", stem: trimmed[:i]}
+		}
+	}
+	if core != name {
+		return rotationCopyName{kind: rotationCopyWholeGzip, base: core}
+	}
+	return rotationCopyName{}
+}
+
+// dirBytes 返回 path 的活跃文件大小与轮转副本合计：自研 .1..9 shift 后缀
+// （Stat 探测）与时间戳/timberjack/整文件 .gz 家族（目录枚举，复用同一分类器
+// classifyRotationCopyName）。
 func dirBytes(path string) (int64, int64, int) {
 	return dirBytesWithEntries(path, nil)
 }
@@ -96,12 +136,10 @@ func dirBytesWithEntries(path string, entries []os.DirEntry) (int64, int64, int)
 
 func timestampedRotationStatsWithEntries(path string, entries []os.DirEntry) (int64, int) {
 	dir := filepath.Dir(path)
-	// 根因:运行日志 path=/app/logs/lazy-balancer.log,
-	// TrimSuffix 去 .log 后 base=lazy-balancer,而轮转副本实际是
-	// lazy-balancer.log. → rest=.log.2026... 不匹配 16 字符判定。
-	// 修复:不去扩展名,base 含.log → rest=. 恰 16 字符。
-	// timberjack 族(caddy/rules)的副本 <base去ext>-<ts>-size.log 需去 ext,
-	// 故两种 base 各算一次:扩展 base 匹配运行日志族,去 ext base 匹配 timberjack。
+	// 基名含扩展名（运行日志 path=/app/logs/lazy-balancer.log，副本是
+	// lazy-balancer.log.<ts>）；timberjack 族（caddy/rules）的副本
+	// <stem>-<ts>-size.log 按去扩展名的 stem 归并。两族共用同一分类器，
+	// 形态语法只在 classifyRotationCopyName 一处维护。
 	base := filepath.Base(path)
 	stem := strings.TrimSuffix(base, filepath.Ext(base))
 	if entries == nil {
@@ -117,49 +155,22 @@ func timestampedRotationStatsWithEntries(path string, entries []os.DirEntry) (in
 		if e.IsDir() {
 			continue
 		}
-		name := e.Name()
-		// 整文件 gzip 归档 <base>.gz（如
-		// certjob-lb_x.log.gz）同属该文件的轮转副本——按规则/证书收窄路径
-		// (dirBytes) 此前漏计，与聚合路径展示分叉。
-		if name == base+".gz" {
-			if info, err := e.Info(); err == nil {
-				total += info.Size()
-				cnt++
-			}
+		shape := classifyRotationCopyName(e.Name())
+		// 移位副本 .1..9 由 dirBytesWithEntries 的 Stat 循环计入——此处再计
+		// 即双计（该族不在本枚举职责内）。
+		if shape.kind == rotationCopyNone || shape.kind == rotationCopyShift {
 			continue
 		}
-		// 运行日志族(base 含.log):rest =.(16 字符)；
-		// gzip 压缩副本..gz 同族计入
-		// （此前漏计，与聚合路径分叉）。
-		if strings.HasPrefix(name, base) {
-			rest := name[len(base):]
-			core := strings.TrimSuffix(rest, ".gz")
-			if len(core) == 16 && core[0] == '.' && isDigits(core[1:9]) && core[9] == '-' && isDigits(core[10:]) {
-				if info, err := e.Info(); err == nil {
-					total += info.Size()
-					cnt++
-				}
-				continue
-			}
+		matched := shape.base != "" && shape.base == base
+		if !matched && shape.kind == rotationCopyTimberjack {
+			matched = shape.stem != "" && shape.stem == stem
 		}
-		// timberjack 族(stem 去 .log):caddy-<ts>-size.log 不以 caddy.log 开头,
-		// 须独立按 stem 前缀匹配。stem='caddy' 的前缀会把
-		// 兄弟文件 caddy-tls-<ts>-size.log 也吞入(聚合双计)——加 stem 边界校验:
-		// stem 后紧跟的 '-<ts>' 段必须以数字开头(timberjack 时间戳以数字开头,
-		// 兄弟文件名如 caddy-tls 的 '-tls' 以字母开头)。
-		if strings.HasPrefix(name, stem) {
-			rest2 := name[len(stem):]
-			if strings.HasPrefix(rest2, "-") && (strings.HasSuffix(rest2, "-size.log") || strings.HasSuffix(rest2, "-size.log.gz")) {
-				// stem 后 '-' 到下一 '-' 之间(或到 '-size' 之间)必须全数字
-				// timberjack 时间戳含 T/-/. 非全数字——只需首字符为数字
-				// (区分 own 'caddy-2026...' 与 brother 'caddy-tls-...')
-				if len(rest2) > 1 && rest2[1] >= '0' && rest2[1] <= '9' {
-					if info, err := e.Info(); err == nil {
-						total += info.Size()
-						cnt++ // timberjack 族份数同计(原漏)
-					}
-				}
-			}
+		if !matched {
+			continue
+		}
+		if info, err := e.Info(); err == nil {
+			total += info.Size()
+			cnt++
 		}
 	}
 	return total, cnt
@@ -262,114 +273,52 @@ func aggregateDirStats(dir string, match func(name string) bool) map[string]dirS
 // isRotationCopyShape 按文件名形态判定轮转副本（与基名集合无关，供基名
 // 预筛避免「副本被当成 base」的循环依赖）。
 func isRotationCopyShape(name string) bool {
-	if isTimberjackRotationCopy(name) || strings.HasSuffix(name, ".gz") {
-		return true
-	}
-	// .1..9 移位副本
-	if dot := strings.LastIndexByte(name, '.'); dot > 0 && isDigits(name[dot+1:]) {
-		if n, err := strconv.Atoi(name[dot+1:]); err == nil && n >= 1 && n <= 9 {
-			return true
-		}
-	}
-	// 运行日志族 base.（rest 恰 16 字符）
-	if len(name) > 17 {
-		rest := name[len(name)-16:]
-		if rest[0] == '.' && isDigits(rest[1:9]) && rest[9] == '-' && isDigits(rest[10:]) {
-			return true
-		}
-	}
-	return false
+	return classifyRotationCopyName(name).kind != rotationCopyNone
 }
 
-// rotationCopyBaseOf 把轮转副本归到所属 base（与 dirBytes/timestampedRotationStatsWithEntries
-// 同口径：移位后缀、运行日志时间戳后缀、timberjack 时间戳后缀三族）。
+// rotationCopyBaseOf 把轮转副本归到所属 base（四族语法取自
+// classifyRotationCopyName 单源；成员判定以目录实际基名集合为准）。
 func rotationCopyBaseOf(name string, bases map[string]struct{}, stemToBase map[string]string) (string, bool) {
-	// 整文件 gzip 归档 <base>.gz 归到 base——与
-	// dirBytes/timestampedRotationStatsWithEntries 的分支同口径。
-	// 此前只对齐了运行日志族与 timberjack 族，整文件归档落入下方通用 .gz
-	// 独立键（消费侧按固定基名取值 → 该文件字节从聚合行消失）。
+	// 整文件 gzip 归档 <base>.gz 优先按字面基名归并（<base>.gz 与
+	// <base>.1.gz 同时存在时前者语义是 base 的整文件归档）。此前只对齐了
+	// 运行日志族与 timberjack 族，整文件归档落入通用 .gz 独立键（消费侧按
+	// 固定基名取值 → 该文件字节从聚合行消失）。
 	if base := strings.TrimSuffix(name, ".gz"); base != name {
 		if _, ok := bases[base]; ok {
 			return base, true
 		}
 	}
-	if dot := strings.LastIndexByte(name, '.'); dot > 0 && isDigits(name[dot+1:]) {
-		if n, err := strconv.Atoi(name[dot+1:]); err == nil && n >= 1 && n <= 9 {
-			if base := name[:dot]; base != "" {
-				if _, ok := bases[base]; ok {
-					return base, true
-				}
+	shape := classifyRotationCopyName(name)
+	switch shape.kind {
+	case rotationCopyShift, rotationCopyTimestamp, rotationCopyWholeGzip:
+		if shape.base != "" {
+			if _, ok := bases[shape.base]; ok {
+				return shape.base, true
 			}
 		}
-	}
-	// 运行日志族 base.[.gz]（rest 恰 16 字符；
-	// 审计：gzip 压缩副本同族归并，此前落入通用 .gz 独立键与 dirBytes 分叉）
-	core := strings.TrimSuffix(name, ".gz")
-	if len(core) > 17 {
-		rest := core[len(core)-16:]
-		if rest[0] == '.' && isDigits(rest[1:9]) && rest[9] == '-' && isDigits(rest[10:]) {
-			if base := core[:len(core)-16]; base != "" {
-				if _, ok := bases[base]; ok {
-					return base, true
-				}
-			}
-		}
-	}
-	for i := range name {
-		if name[i] != '-' {
-			continue
-		}
-		base, ok := stemToBase[name[:i]]
-		if !ok {
-			continue
-		}
-		rest := name[i:]
-		if !strings.HasSuffix(rest, "-size.log") && !strings.HasSuffix(rest, "-size.log.gz") {
-			continue
-		}
-		// stem 后紧跟的 '-<ts>' 段须以数字开头（区分 caddy 与 caddy-tls）
-		if len(rest) > 1 && rest[1] >= '0' && rest[1] <= '9' {
+	case rotationCopyTimberjack:
+		// 按 stem 反查真实基名（基名未必是 <stem>.log，如仅按 stem 注册）。
+		if base, ok := stemToBase[shape.stem]; ok {
 			return base, true
+		}
+		// 整文件 .gz 前缀已处理；无匹配基名时允许按派生基名归并。
+		if shape.base != "" {
+			if _, ok := bases[shape.base]; ok {
+				return shape.base, true
+			}
 		}
 	}
 	return "", false
 }
 
 // rotationCopyBaseName 仅按副本文件名形态派生所属基名（不依赖目录内是否
-// 存在 base）——与 dirBytes/timestampedRotationStatsWithEntries 的三族口径
-// 一致：整文件 .gz 归档、.1..9 移位副本、运行日志族 16 字符时间戳后缀、
-// timberjack <stem>-<ts>-size.log[.gz]。
+// 存在 base）——四族语法取自 classifyRotationCopyName 单源。
 func rotationCopyBaseName(name string) (string, bool) {
-	if base, ok := strings.CutSuffix(name, ".gz"); ok && base != "" {
-		return base, true
+	shape := classifyRotationCopyName(name)
+	if shape.kind == rotationCopyNone || shape.base == "" {
+		return "", false
 	}
-	if dot := strings.LastIndexByte(name, '.'); dot > 0 && isDigits(name[dot+1:]) {
-		if n, err := strconv.Atoi(name[dot+1:]); err == nil && n >= 1 && n <= 9 && dot > 0 {
-			return name[:dot], true
-		}
-	}
-	if len(name) > 17 {
-		rest := name[len(name)-16:]
-		if rest[0] == '.' && isDigits(rest[1:9]) && rest[9] == '-' && isDigits(rest[10:]) {
-			return name[:len(name)-16], true
-		}
-	}
-	for i := range name {
-		if name[i] != '-' {
-			continue
-		}
-		rest := name[i:]
-		if !strings.HasSuffix(rest, "-size.log") && !strings.HasSuffix(rest, "-size.log.gz") {
-			continue
-		}
-		// timberjack 副本的 stem 后紧跟的 '-<ts>' 必须以数字开头（区分
-		// caddy 与兄弟文件 caddy-tls：caddy-tls-<ts>-size.log 的 stem 是
-		// caddy-tls，故逐 '-' 位置试）。
-		if len(rest) > 1 && rest[1] >= '0' && rest[1] <= '9' {
-			return name[:i] + ".log", true
-		}
-	}
-	return "", false
+	return shape.base, true
 }
 
 func globalConfigInt(column string, fallback int64) int64 {
@@ -645,6 +594,10 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		if db.AuditDB != nil {
 			if n, ok := cachedLogTableCount(db.AuditDB, "logstats-audit-count", "SELECT COUNT(*) FROM audit_log"); ok {
 				byKey("audit").Rows = &n
+			} else if info := byKey("audit"); info != nil {
+				// 与 security_events 行同口径：计数失败显式披露，避免消费方把
+				// 「计数暂不可用」与「0 行」混为一谈（字段语义即如此）。
+				info.RowsUnavailable = true
 			}
 		}
 		if st, err := os.Stat(filepath.Join(dataDir, db.AuditDBFilename)); err == nil {

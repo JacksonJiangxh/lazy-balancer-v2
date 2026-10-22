@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
@@ -105,11 +106,18 @@ func recordLoginFailure(userID int) {
 }
 
 // parseLoginLockedUntil 锁定时间解析单源——写侧恒为 UTC「2006-01-02 15:04:05」，
-// 兼容带外写入的 RFC3339 形态（导入/手工修库）。两函数（判定与文案）共用，
-// 不再字符串比较（'T' 与 ' ' 的字典序比较在同日边界会错判且对 RFC3339 形态
-// 恒判已锁定）。
+// 兼容带外写入的 RFC3339/毫秒/带时区偏移形态（导入/手工修库）。两函数
+// （判定与文案）共用，不再字符串比较（'T' 与 ' ' 的字典序比较在同日边界会错判
+// 且对 RFC3339 形态恒判已锁定）。解析失败仍按锁定 fail-closed——但布局覆盖
+// 已知带外形态，避免任何一种落入「解析失败 → 永久锁定」的不可自愈分支。
 func parseLoginLockedUntil(raw string) (time.Time, bool) {
-	for _, layout := range []string{"2006-01-02 15:04:05", time.RFC3339} {
+	for _, layout := range []string{
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05Z07:00",
+		time.RFC3339,
+		time.RFC3339Nano,
+	} {
 		if t, err := time.Parse(layout, raw); err == nil {
 			return t, true
 		}
@@ -399,8 +407,13 @@ func (h *Handlers) GetCurrentUser(c *gin.Context) {
 	`, userIDInt).Scan(&user.ID, &user.Username, &user.Role, &user.DisplayName, &user.IsEnabled, &user.CreatedAt, &user.LastLogin, &mfaEnabled, &authProvider)
 
 	if err != nil {
-		// 基础设施故障与用户不存在不可混同（本查询按主键取行，
-		// ErrNoRows 已在鉴权层拦截）——与同文件其余 DB 失败分支统一「数据库错误」。
+		// 基础设施故障与用户不存在不可混同：鉴权层之后、本查询之前用户被
+		// 并发删除时 ErrNoRows 不是 500——与 jwtAuth 同文案 401，客户端据此
+		// 重新登录而不是重试。
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: "用户不存在或已禁用"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "数据库错误"})
 		return
 	}
@@ -527,6 +540,10 @@ func (h *Handlers) UpdateCurrentUser(c *gin.Context) {
 		}
 		var currentHash string
 		if err := db.DB.QueryRow("SELECT password_hash FROM users WHERE id=?", userIDInt).Scan(&currentHash); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				c.JSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: "用户不存在或已禁用"})
+				return
+			}
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取用户失败"})
 			return
 		}
@@ -561,6 +578,10 @@ func (h *Handlers) UpdateCurrentUser(c *gin.Context) {
 
 	var oldDisplayName string
 	if err := tx.QueryRowContext(c.Request.Context(), "SELECT COALESCE(display_name,'') FROM users WHERE id = ?", userIDInt).Scan(&oldDisplayName); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: "用户不存在或已禁用"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取用户失败"})
 		return
 	}
@@ -623,6 +644,12 @@ func (h *Handlers) UpdateCurrentUser(c *gin.Context) {
 	user.AuthProvider = authProvider
 
 	if err != nil {
+		// 鉴权层与本事务之间用户被并发删除：ErrNoRows=401（与 jwtAuth 同
+		// 文案），不得折叠为 500 诱导客户端重试。
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: "用户不存在或已禁用"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取用户失败"})
 		return
 	}
@@ -641,10 +668,31 @@ func (h *Handlers) UpdateCurrentUser(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: response})
 }
 
+// setupRoleAllowsInit 初始化端点（公开无 JWT）的角色判定：从节点返回 false，
+// 主节点返回 true。真实读失败 fail-closed（由调用方 500）——与 readOnlyGuard/
+// clusterVersionMiddleware 同口径；仅「global_config 缺行」（老库/未迁移形态，
+// 与 RoleOf 内部 COALESCE(is_master,1) 的历史语义一致）按主节点处理，不得把
+// 未迁移库当成瞬态故障。
+func setupRoleAllowsInit(ctx context.Context) (bool, error) {
+	isMaster, err := services.RoleOf(ctx, db.DB)
+	if err == nil {
+		return isMaster, nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return true, nil
+	}
+	return false, err
+}
+
 func (h *Handlers) GetSetupStatus(c *gin.Context) {
 	// 从节点无初始化语义——users 由主端同步,同步未收敛的瞬态空表
-	// 不得引导建号(建号会被同步覆盖)。查询失败按主节点语义放行(老库形态)。
-	if isMaster, err := services.RoleOf(c.Request.Context(), db.DB); err == nil && !isMaster {
+	// 不得引导建号(建号会被同步覆盖)。角色读失败 fail-closed 500。
+	master, roleErr := setupRoleAllowsInit(c.Request.Context())
+	if roleErr != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取节点角色失败"})
+		return
+	}
+	if !master {
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"needs_setup": false}})
 		return
 	}
@@ -657,8 +705,14 @@ func (h *Handlers) GetSetupStatus(c *gin.Context) {
 }
 
 func (h *Handlers) SetupAdmin(c *gin.Context) {
-	// 从节点禁止初始化建号(公开路由无 JWT,is_master 读 global_config)。
-	if isMaster, err := services.RoleOf(c.Request.Context(), db.DB); err == nil && !isMaster {
+	// 从节点禁止初始化建号(公开路由无 JWT,is_master 读 global_config)；
+	// 角色读失败 fail-closed 500（不得落回主节点语义放行建号）。
+	master, roleErr := setupRoleAllowsInit(c.Request.Context())
+	if roleErr != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取节点角色失败"})
+		return
+	}
+	if !master {
 		c.JSON(http.StatusForbidden, models.APIResponse{Code: 403, Message: "从节点不支持初始化，请在主节点完成初始化"})
 		return
 	}

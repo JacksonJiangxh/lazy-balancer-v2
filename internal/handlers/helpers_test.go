@@ -58,7 +58,7 @@ func TestParseNetDevTotals_sums_default_route_interface_only(t *testing.T) {
  wlan0: 5000 1 0 0 0 0 0 0 6000 1 0 0 0 0 0 0
    br-app: 7000 1 0 0 0 0 0 0 8000 1 0 0 0 0 0 0`
 
-	bytesIn, bytesOut, err := parseNetDevTotals(fixture)
+	bytesIn, bytesOut, _, err := parseNetDevTotals(fixture)
 	if err != nil {
 		t.Fatalf("parse net dev fixture: %v", err)
 	}
@@ -86,7 +86,7 @@ func TestParseNetDevTotals_falls_back_to_physical_interfaces_when_no_default_rou
    br-abc: 7000 1 0 0 0 0 0 0 8000 1 0 0 0 0 0 0`
 
 	// When
-	bytesIn, bytesOut, err := parseNetDevTotals(fixture)
+	bytesIn, bytesOut, _, err := parseNetDevTotals(fixture)
 
 	// Then：只统计 eth0，虚拟叠加层不重复计入
 	if err != nil {

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
@@ -572,5 +573,27 @@ func TestCallClusterServiceControl_rejectsOversizedSlaveResponse(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "读取上限") {
 		t.Fatalf("err=%v, want 含「读取上限」的显式超限错误（不得以 JSON 解析失败掩盖）", err)
+	}
+}
+
+// 票据校验失败的细分哨兵必须能翻成审计可读原因：运维据此区分「票据已使用
+// （重放）」与「签名错误（节点集群凭证不一致，需重新注册）」等不同补救路径。
+func TestServiceControlTicketFailureReason_mapsSentinels(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"签名错误", errors.Join(services.ErrInvalidServiceControlTicket, services.ErrServiceControlSignature), "签名错误"},
+		{"已过期", errors.Join(services.ErrInvalidServiceControlTicket, services.ErrServiceControlExpired), "已过期"},
+		{"已使用", errors.Join(services.ErrInvalidServiceControlTicket, services.ErrServiceControlReplay), "已使用"},
+		{"仅通用无效", services.ErrInvalidServiceControlTicket, "无效"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := serviceControlTicketFailureReason(tc.err); got != tc.want {
+				t.Fatalf("reason=%q, want %q", got, tc.want)
+			}
+		})
 	}
 }

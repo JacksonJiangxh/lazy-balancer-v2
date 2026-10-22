@@ -3,6 +3,7 @@ package services
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -96,7 +97,11 @@ func WatchdogCheckOnce(ctx context.Context) (runErr error) {
 	if ctx != nil && ctx.Err() != nil {
 		return ctx.Err()
 	}
-	isMaster, roleErr := RoleOf(context.Background(), db.DB)
+	roleCtx := ctx
+	if roleCtx == nil {
+		roleCtx = context.Background()
+	}
+	isMaster, roleErr := RoleOf(roleCtx, db.DB)
 	if roleErr != nil {
 		// 看门狗角色读失败留痕：角色读失败=本轮未判定——计入跳过轮簿记（不宣称一致、
 		// 不发假心跳，与下方 !checked 跳轮同口径），留痕并以错误返回，
@@ -306,6 +311,8 @@ func expectedRenderedRules() (map[string]string, error) {
 	// 与 caddy.go 渲染门同源：ACME 候选查询 + SelectCertificate（域匹配/有效期/
 	// 可解析性）。证书候选只服务于 enabled+TLS+acme 规则，无此类规则时零查询。
 	acmeCerts := make(map[string][]CertificateCandidate)
+	// 本轮 ACME 候选证书 Leaf 去重缓存（PEM 内容 → 解析结果）。
+	leafCache := make(map[string]*x509.Certificate)
 	if hasACMEHTTPTLS {
 		certRows, certErr := db.DB.Query(acmeCertCandidatesQuery)
 		if certErr != nil {
@@ -319,9 +326,17 @@ func expectedRenderedRules() (map[string]string, error) {
 				return nil, fmt.Errorf("解析 ACME 证书候选失败: %w", errors.Join(scanErr, closeErr))
 			}
 			// 与渲染装载同口径预解析（certReady 对每条规则只做选择，
-			// 但同一候选集会在多次巡检比较中重复使用）。
+			// 但同一候选集会在多次巡检比较中重复使用）。同一证书挂在多条规则下
+			// （certRows 逐规则返回）时按 PEM 内容在本轮内去重解析——60s 节拍
+			// 的固定 X.509 解析开销随候选数×规则数增长。
 			if candidate.Status != "disabled" {
-				candidate.Leaf = ParseCertificateLeaf(candidate.CertPEM, candidate.KeyPEM)
+				leafKey := candidate.CertPEM + "\x00" + candidate.KeyPEM
+				if leaf, cached := leafCache[leafKey]; cached {
+					candidate.Leaf = leaf
+				} else {
+					candidate.Leaf = ParseCertificateLeaf(candidate.CertPEM, candidate.KeyPEM)
+					leafCache[leafKey] = candidate.Leaf
+				}
 			}
 			acmeCerts[ruleID] = append(acmeCerts[ruleID], candidate)
 		}

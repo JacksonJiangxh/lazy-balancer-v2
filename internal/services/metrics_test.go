@@ -818,3 +818,66 @@ func TestMetricsService_refreshDBOverviewMetrics_dedupesFailureLogs(t *testing.T
 		t.Fatalf("ActiveRules=%d, want 0", got)
 	}
 }
+
+// Stop 必须在在途清理 goroutine 完全退出后才返回：WaitGroup.Add 先于
+// 单飞计数置位，任何 Wait 都不可能观察到 0 计数而提前返回。
+func TestMetricsService_stopWaitsForInFlightCleanup(t *testing.T) {
+	setupMetricsRetentionTest(t)
+	service := NewMetricsService("", 30)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	metricsCleanupHook = func() {
+		close(entered)
+		<-release
+	}
+	t.Cleanup(func() {
+		metricsCleanupHook = nil
+		unblock()
+	})
+
+	service.startHistoryCleanup()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("清理 goroutine 未启动")
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		service.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+		t.Fatal("Stop 在清理 goroutine 仍在途时提前返回（WaitGroup 计数丢失）")
+	case <-time.After(100 * time.Millisecond):
+	}
+	unblock()
+	select {
+	case <-stopped:
+	case <-time.After(3 * time.Second):
+		t.Fatal("清理退出后 Stop 未返回")
+	}
+}
+
+// 单飞计数已被占用（上一轮在途）时，本次触发必须立即归还 Add 的计数——
+// 否则 Wait 会永久阻塞在幽灵计数上。
+func TestMetricsService_startHistoryCleanup_casMissReleasesWaitCount(t *testing.T) {
+	service := NewMetricsService("", 30)
+	service.cleanupRunning.Store(true)
+
+	service.startHistoryCleanup()
+
+	done := make(chan struct{})
+	go func() {
+		service.cleanupWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("CAS 失败后未归还 WaitGroup 计数（Wait 永久阻塞）")
+	}
+}

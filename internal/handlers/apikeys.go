@@ -355,6 +355,13 @@ func updateAPIKeyStatus(c *gin.Context, currentUserOnly bool) {
 		return
 	}
 	userID := int(contextUserID(c))
+	// 自助入口缺少认证上下文时必须拒绝——与删除/创建同形守卫：不得退化成
+	// 按 created_by=0 查询后回答「不存在」的 404（客户端无法区分未认证与
+	// 不存在，三入口契约须一致）。
+	if currentUserOnly && userID <= 0 {
+		c.JSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: "认证上下文缺失"})
+		return
+	}
 	var req models.UpdateAPIKeyRequest
 	if !guardConfiguredJSONBody(c) {
 		return
@@ -376,12 +383,16 @@ func updateAPIKeyStatus(c *gin.Context, currentUserOnly bool) {
 		req.ReadOnly = &readOnly
 	}
 	var whitelistJSON *string
+	// 归一化后的白名单条目数（审计 delta 的「变更后条数」必须与库内落值
+	// 同源：请求原值含重复/未压缩 CIDR，直接计数会虚报）。
+	whitelistCount := 0
 	if req.MCPIPWhitelist != nil {
 		whitelist, err := services.NormalizeCIDRs(*req.MCPIPWhitelist)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "MCP IP 白名单无效: " + err.Error()})
 			return
 		}
+		whitelistCount = len(whitelist)
 		encoded, err := encodeMCPIPWhitelist(whitelist)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "序列化 MCP IP 白名单失败"})
@@ -403,11 +414,21 @@ func updateAPIKeyStatus(c *gin.Context, currentUserOnly bool) {
 	if err := db.DB.QueryRow(query, args...).Scan(&name, &beforeEnabled, &beforeMCPEnabled, &beforeReadOnly, &beforeWhitelist); dbQueryNotFound(c, err, "API 密钥不存在", "updateAPIKeyStatus query key") {
 		return
 	}
-	// 特权变更（收回只读/开启 MCP）与创建侧同构走 MFA step-up 判定——
-	// 开关/状态读失败 fail-closed 500（创建侧同口径），守卫开启且操作者
-	// 启用 MFA 时 428；判定单源 DecideMFAStepUp（与创建侧/路由守卫共用）。
+	// 特权变更（收回只读/开启 MCP/放宽已启用 MCP 的白名单）与创建侧同构
+	// 走 MFA step-up 判定——开关/状态读失败 fail-closed 500（创建侧同口径），
+	// 守卫开启且操作者启用 MFA 时 428；判定单源 DecideMFAStepUp（与创建侧/
+	// 路由守卫共用）。
+	// 白名单变更仅在更新后该 Key 仍启用 MCP 时算特权变更（禁用态的遗留在册
+	// 白名单不产生可达面）；路由级守卫在开启时本已覆盖该请求，此集合是
+	// 「守卫开关读失败」场景下的纵深防御口径。
+	afterMCPEnabled := beforeMCPEnabled == 1
+	if req.MCPEnabled != nil {
+		afterMCPEnabled = *req.MCPEnabled
+	}
+	whitelistChanged := req.MCPIPWhitelist != nil && whitelistJSON != nil && *whitelistJSON != beforeWhitelist
 	privilegeEscalation := (req.ReadOnly != nil && !*req.ReadOnly && beforeReadOnly == 1) ||
-		(req.MCPEnabled != nil && *req.MCPEnabled && beforeMCPEnabled != 1)
+		(req.MCPEnabled != nil && *req.MCPEnabled && beforeMCPEnabled != 1) ||
+		(whitelistChanged && afterMCPEnabled)
 	if privilegeEscalation {
 		decision, derr := DecideMFAStepUp(c, true, services.MFAUserEnabled)
 		if derr != nil {
@@ -481,8 +502,8 @@ func updateAPIKeyStatus(c *gin.Context, currentUserOnly bool) {
 	}
 	if req.MCPIPWhitelist != nil && whitelistJSON != nil {
 		beforeCount := apiKeyWhitelistCount(beforeWhitelist)
-		if beforeCount != len(*req.MCPIPWhitelist) || *whitelistJSON != beforeWhitelist {
-			changes = append(changes, fmt.Sprintf("MCP 白名单：%d 条→%d 条", beforeCount, len(*req.MCPIPWhitelist)))
+		if beforeCount != whitelistCount || *whitelistJSON != beforeWhitelist {
+			changes = append(changes, fmt.Sprintf("MCP 白名单：%d 条→%d 条", beforeCount, whitelistCount))
 		}
 	}
 	if len(changes) > 0 {

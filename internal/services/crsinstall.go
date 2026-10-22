@@ -363,8 +363,9 @@ func (m *CRSUpdateManager) downloadAndInstall(parent context.Context, tag string
 // rules/、落盘新 setup/stock 基线与迁移 overrides。全程持 wafFileMu——与
 // lbbak 导入（untarGzTo 交换同一棵树）、威胁库/ip2region 文件相位串行，杜绝
 // 混合/残缺 rules 树经 waf_files 节传播。失败路径的 restoreBackup（同为树
-// 变更）也在锁内；网络下载与 Caddy 重载不进锁（锁内取 CaddyOpLock 会与
-// 导入路径 CaddyOpLock→wafFileMu 的持锁序构成 AB-BA）。
+// 变更）也在锁内；网络下载与 Caddy 重载不进锁——锁内取 CaddyOpLock 虽与全局锁序
+// （导入=排空→wafFileMu→CaddyOpLock）同向、不构成 AB-BA，但重载耗时会让导入
+// 在该锁上无谓排队；反向嵌套（持 CaddyOpLock 再取 wafFileMu）才是 AB-BA，禁止。
 // security_crs_version 版本行写入收进本段——此前
 // 在锁外（downloadAndInstall 尾段），写相位中段导出侧（BuildWafFileBundle 读
 // 相位持同一锁）可打出「文件新/行旧」偏斜 bundle。单行 UPDATE 毫秒级，与段内

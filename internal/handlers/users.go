@@ -464,6 +464,9 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "删除用户失败"})
 		return
 	}
+	// 用户删除后其登录后验码限流条目（进程内内存态）不再可被访问，顺带清除
+	// 避免条目随一次性用户数量无界驻留（另有阈值清扫兜底）。
+	services.MFAClearVerifyAttempts(id)
 
 	recordAudit(c, "删除", "用户", services.AuditUserPart(id, targetUsername))
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "用户删除成功"})

@@ -202,14 +202,23 @@ func rejectWriteDuringImport(c *gin.Context, action string) bool {
 	return true
 }
 
-func (h *Handlers) beginConfigImport(ctx context.Context) (*configImportSession, error) {
-	return h.beginConfigImportWithPrelock(ctx, nil)
+// action 是本次会话的动作词（「导入」/「还原」）——排空失败等建会话前的审计
+// 也要带正确动作，不能一律记「导入失败」（自动备份还原路径同样走本函数）。
+func (h *Handlers) beginConfigImport(ctx context.Context, action string) (*configImportSession, error) {
+	return h.beginConfigImportWithPrelock(ctx, prelockNone, action)
 }
+
+// prelockNone 显式表达「无预锁」——与「有预锁」区分，避免调用方误传 nil 顺序
+// 参数造成可读性歧义。
+func prelockNone() func() { return nil }
 
 // beginConfigImportWithPrelock 在 Pause/Cancel/Wait 排空完成之后、取
 // caddyOpMu 与开启事务之前调用 prelock（返回释放函数）。配置导入用它把
 // WAF 文件锁放在排空之后：先取锁会让阻塞在 wafFileMu 的更新任务无法被取消。
-func (h *Handlers) beginConfigImportWithPrelock(ctx context.Context, prelock func() func()) (*configImportSession, error) {
+func (h *Handlers) beginConfigImportWithPrelock(ctx context.Context, prelock func() func(), action string) (*configImportSession, error) {
+	if action == "" {
+		action = "导入"
+	}
 	if configImportBeginAttemptHook != nil {
 		configImportBeginAttemptHook()
 	}
@@ -238,7 +247,14 @@ func (h *Handlers) beginConfigImportWithPrelock(ctx context.Context, prelock fun
 		cancel()
 		if !drained {
 			services.Logf("warn", "配置导入：等待在途任务落定超时（%s），已中止导入", importInFlightDrainTimeout)
-			services.RecordAuditLog("system", "导入失败", "配置备份", "在途任务未排空，导入未执行（配置未修改）", "")
+			// 审计词条必须是字面量（词汇门禁校验）：按动作分支各写一次。
+			drainDetail := "在途任务未排空，导入未执行（配置未修改）"
+			if action == "还原" {
+				drainDetail = "在途任务未排空，还原未执行（配置未修改）"
+				services.RecordAuditLog("system", "还原失败", "配置备份", drainDetail, "")
+			} else {
+				services.RecordAuditLog("system", "导入失败", "配置备份", drainDetail, "")
+			}
 			// 与 close 同序：先恢复本代暂停，再允许下一代导入进入。
 			resumeEngine()
 			releaseSession()
@@ -291,7 +307,7 @@ func (h *Handlers) beginConfigImportWithPrelock(ctx context.Context, prelock fun
 		releaseBeforeLock()
 	}
 	h.caddyOpMu.Lock()
-	session := &configImportSession{h: h, ctx: ctx, recovery: recovery, resumeEngine: resumeEngine, releaseBeforeLock: releaseBeforeLock}
+	session := &configImportSession{h: h, ctx: ctx, recovery: recovery, resumeEngine: resumeEngine, releaseBeforeLock: releaseBeforeLock, action: action}
 	ruleIDs, err := currentRuleIDs(ctx)
 	if err != nil {
 		// CA 已暂停：必须在释放会话锁之前恢复既有活动态——否则第二个导入可
@@ -481,7 +497,7 @@ func (session *configImportSession) cleanupDisappearedRuleArtifacts() {
 	// 与 v2 导入事务内的孤儿清理同语句（幂等重复无害）；覆盖 v1 路径与
 	// 理论上的绕过路径。
 	if _, err := db.DB.ExecContext(session.ctx,
-		`DELETE FROM cert_jobs WHERE rule_id NOT IN (SELECT caddy_id FROM lb_rules)`); err != nil {
+		`DELETE FROM cert_jobs WHERE NOT EXISTS (SELECT 1 FROM lb_rules WHERE lb_rules.caddy_id = cert_jobs.rule_id)`); err != nil {
 		services.Logf("error", "导入清理：删除孤儿证书任务失败: %v", err)
 		services.RecordAuditLog("system", "清理失败", "证书任务", fmt.Sprintf("导入后清理孤儿证书任务失败：%v", err), "")
 		return

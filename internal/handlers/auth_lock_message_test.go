@@ -119,3 +119,32 @@ func TestLogin_expiredLockSameDayBoundaryNotLocked(t *testing.T) {
 		t.Fatalf("status=429 body=%s, want 非 429（过期锁值不得判锁定）", recorder.Body.String())
 	}
 }
+
+// 锁定时间解析覆盖全部已知带外形态（毫秒/带时区偏移/RFC3339Nano）——
+// 任何一种解析失败都会让账户落入「解析失败 → 永久锁定」且提示 10 分钟。
+func TestParseLoginLockedUntil_acceptsOffNominalLayouts(t *testing.T) {
+	base := time.Date(2026, 10, 23, 12, 34, 56, 123456789, time.UTC)
+	truncated := base.Truncate(time.Second)
+	cases := []struct {
+		raw  string
+		want time.Time
+	}{
+		{base.Format("2006-01-02 15:04:05"), truncated},
+		{base.Format("2006-01-02 15:04:05.999999999"), base},
+		{base.Format("2006-01-02 15:04:05Z07:00"), truncated},
+		{base.Format(time.RFC3339), truncated},
+		{base.Format(time.RFC3339Nano), base},
+	}
+	for _, tc := range cases {
+		got, ok := parseLoginLockedUntil(tc.raw)
+		if !ok {
+			t.Fatalf("parseLoginLockedUntil(%q) 失败（会落入永久锁定）", tc.raw)
+		}
+		if !got.Equal(tc.want) {
+			t.Fatalf("parseLoginLockedUntil(%q)=%v, want %v", tc.raw, got, tc.want)
+		}
+	}
+	if _, ok := parseLoginLockedUntil("not-a-timestamp"); ok {
+		t.Fatal("非法形态必须返回 !ok（调用方保持 fail-closed）")
+	}
+}

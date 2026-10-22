@@ -515,3 +515,28 @@ func TestMFARestoreChallenge_belowThresholdRestores(t *testing.T) {
 		t.Fatalf("阈值以下的归还必须生效: ok=%v err=%v", ok, err)
 	}
 }
+
+// 登录后验码限流的条目不得随一次性/已删除用户永驻：条目数超过阈值时整表
+// 裁剪窗口外条目（每用户裁剪只在被访问时发生，删除用户不会再有访问）。
+func TestMFARecordVerifyAttemptFailure_sweepsExpiredEntries(t *testing.T) {
+	MFAResetVerifyAttemptsForTest()
+	t.Cleanup(MFAResetVerifyAttemptsForTest)
+	now := time.Now()
+
+	mfaVerifyAttempts.Lock()
+	for i := 1; i <= mfaVerifyAttemptsSweepThreshold; i++ {
+		mfaVerifyAttempts.failures[i] = []time.Time{now.Add(-2 * mfaVerifyAttemptWindow)}
+	}
+	mfaVerifyAttempts.Unlock()
+
+	MFARecordVerifyAttemptFailure(9999, now)
+
+	mfaVerifyAttempts.Lock()
+	defer mfaVerifyAttempts.Unlock()
+	if len(mfaVerifyAttempts.failures) != 1 {
+		t.Fatalf("清扫后条目数=%d, want 1（窗口外条目必须移除）", len(mfaVerifyAttempts.failures))
+	}
+	if _, ok := mfaVerifyAttempts.failures[9999]; !ok {
+		t.Fatal("当前用户的最新失败记录必须保留")
+	}
+}

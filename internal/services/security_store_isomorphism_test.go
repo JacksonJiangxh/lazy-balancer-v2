@@ -278,7 +278,7 @@ func TestLoadSecurityPolicyContext_toleratesAllNullColumns(t *testing.T) {
 // TestSnapshotSecurityPolicies_coalescesNullJSONColumns 锁定集群传播
 // 硬化：主节点 dump（snapshotSecurityPolicies）必须对可空列 COALESCE——否则
 // 主节点一行 NULL 经快照原样透传（dumpTableAsJSON 把 NULL  marshals 成
-// JSON null），从节点 apply 时 snapshotJSONText(nil) 重新落 NULL，脏数据
+// JSON null），从节点 apply 时 snapshotJSONText(列名, nil) 重新落 NULL，脏数据
 // 跨集群复制。键名必须保持裸列名（COALESCE 需 AS 别名），否则从节点
 // apply 按 p["custom_rules"] 取值会读到 nil。
 func TestSnapshotSecurityPolicies_coalescesNullJSONColumns(t *testing.T) {

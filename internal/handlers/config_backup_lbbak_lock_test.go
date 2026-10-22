@@ -526,3 +526,90 @@ func TestLbbakValidate_unregistered_threat_entry_warns(t *testing.T) {
 		t.Fatalf("预览应携带 manifest 未登记条目告警: %s", rec.Body.String())
 	}
 }
+
+// 导入路径的持锁序以实际实现为准：排空 → wafFileMu → CaddyOpLock。
+// Given CaddyOpLock（=caddyOpMu 共享实例）被预持。
+// When 含 WAF 文件相位的 lbbak 导入启动。
+// Then 导入必须先取得 wafFileMu 才阻塞在 CaddyOpLock 上——这是可观测的锁序
+// 判据（若实现先取 CaddyOpLock，此刻 wafFileMu 仍空闲）。反向嵌套
+// （持 CaddyOpLock 再取 wafFileMu）即 AB-BA。
+func TestLbbakImport_acquiresWafLockBeforeCaddyOpLock(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	g := newBackupSectionRouter(h)
+	crsDir, _ := overrideTestWafPaths(t)
+	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (6,'local-admin-lockorder-b','hash','admin',1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(crsDir, "rules"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(crsDir, "VERSION"), []byte("v4.29.0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(crsDir, "rules", "REQUEST-901.conf"), []byte("SecRule a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exportRec := httptest.NewRecorder()
+	g.ServeHTTP(exportRec, httptest.NewRequest(http.MethodGet, "/config/export?sections=rules,waf_files", nil))
+	if exportRec.Code != http.StatusOK {
+		t.Fatalf("export status=%d body=%s", exportRec.Code, exportRec.Body.String())
+	}
+	payload := exportRec.Body.Bytes()
+
+	services.CaddyOpLock.Lock()
+	released := false
+	unlockCaddy := func() {
+		if !released {
+			services.CaddyOpLock.Unlock()
+			released = true
+		}
+	}
+	defer unlockCaddy()
+
+	done := make(chan int, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/config/import?sections=rules,waf_files", bytes.NewReader(payload))
+		req.Header.Set("Content-Type", "application/octet-stream")
+		g.ServeHTTP(rec, req)
+		done <- rec.Code
+	}()
+
+	locker, ok := services.WafFileLock().(interface {
+		TryLock() bool
+		Unlock()
+	})
+	if !ok {
+		unlockCaddy()
+		<-done
+		t.Fatal("WAF lock does not expose TryLock")
+	}
+	wafHeld := false
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if !locker.TryLock() {
+			wafHeld = true
+			break
+		}
+		locker.Unlock()
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !wafHeld {
+		unlockCaddy()
+		select {
+		case <-done:
+		case <-time.After(20 * time.Second):
+		}
+		t.Fatal("CaddyOpLock 被预持期间导入未持有 wafFileMu——持锁序反了（CaddyOpLock→wafFileMu 即 AB-BA）")
+	}
+
+	unlockCaddy()
+	select {
+	case code := <-done:
+		if code != http.StatusOK {
+			t.Fatalf("import status=%d, want 200（锁序正确时导入应正常完成）", code)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("释放 CaddyOpLock 后导入 20s 内未完成")
+	}
+}

@@ -181,3 +181,109 @@ func TestAggregateDirStats_countsTimberjackCopyWithMissingBase(t *testing.T) {
 			active, rotated, count, entry.Active, entry.Rotated, entry.RotCount)
 	}
 }
+
+// 双重后缀 gzip 副本（<base>.<ts>.gz / <stem>-<ts>-size.log.gz）在 base 缺席
+// 时必须归到剥掉时间戳后的规范基名——派生「副本名本身当基名」会让按固定基名
+// 取值的行（caddy 四行/汇总）丢字节，且与 dirBytes 单文件口径分叉。
+func TestAggregateDirStats_countsDoubleSuffixGzipCopiesWithMissingBase(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]int{
+		"caddy.log.20260921-120000.gz":         31,
+		"caddy-20260921-120001-64-size.log.gz": 17,
+		"caddy-tls.log.20260921-120002.gz":     9,
+	}
+	for name, size := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), make([]byte, size), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	stats := aggregateDirStats(dir, caddyLogFamilyMatch)
+	caddy := stats["caddy.log"]
+	if caddy.Rotated != 48 || caddy.RotCount != 2 {
+		t.Fatalf("aggregate caddy.log=%+v, want Rotated=48 RotCount=2（双重后缀 gz 副本须归到期基名）", caddy)
+	}
+	// 不得产生以副本名本身为基名的非规范条目（消费方按固定基名取值 → 丢字节）。
+	for key := range stats {
+		if key != "caddy.log" && key != "caddy-tls.log" {
+			t.Fatalf("聚合出现非规范基名条目 %q（副本名当基名）", key)
+		}
+	}
+
+	// 与单文件 dirBytes 口径一致（同一响应内两行不得分叉）。
+	active, rotated, count := dirBytes(filepath.Join(dir, "caddy.log"))
+	if active != caddy.Active || rotated != caddy.Rotated || count != caddy.RotCount {
+		t.Fatalf("dirBytes=(%d,%d,%d) vs aggregate=(%d,%d,%d), 两套口径分叉",
+			active, rotated, count, caddy.Active, caddy.Rotated, caddy.RotCount)
+	}
+	if tls := stats["caddy-tls.log"]; tls.Rotated != 9 || tls.RotCount != 1 {
+		t.Fatalf("aggregate caddy-tls.log=%+v, want Rotated=9 RotCount=1", tls)
+	}
+}
+
+// 轮转名分类器是四族语法的单源：同一文件名在形态判定、基名派生、成员归并三
+// 条路径上的结论必须一致（族语法漂移正是「只改三处漏一处」的产物）。
+func TestClassifyRotationCopyName_familiesAgreeAcrossConsumers(t *testing.T) {
+	cases := []struct {
+		name string
+		kind rotationCopyKind
+		base string
+	}{
+		{"caddy.log.1", rotationCopyShift, "caddy.log"},
+		{"caddy.log.9", rotationCopyShift, "caddy.log"},
+		{"caddy.log.10", rotationCopyNone, ""}, // 只认 .1..9
+		{"caddy.log.20260921-120000", rotationCopyTimestamp, "caddy.log"},
+		{"caddy.log.20260921-120000.gz", rotationCopyTimestamp, "caddy.log"},
+		{"caddy-20260921-120000-64-size.log", rotationCopyTimberjack, "caddy.log"},
+		{"caddy-20260921-120000-64-size.log.gz", rotationCopyTimberjack, "caddy.log"},
+		{"caddy-tls-20260921-120000-64-size.log", rotationCopyTimberjack, "caddy-tls.log"},
+		{"certjob-lb_x.log.gz", rotationCopyWholeGzip, "certjob-lb_x.log"},
+		{"caddy.log", rotationCopyNone, ""},
+	}
+	for _, tc := range cases {
+		shape := classifyRotationCopyName(tc.name)
+		if shape.kind != tc.kind || shape.base != tc.base {
+			t.Fatalf("%q 分类=%+v, want kind=%d base=%q", tc.name, shape, tc.kind, tc.base)
+		}
+		isCopy := isRotationCopyShape(tc.name)
+		if isCopy != (tc.kind != rotationCopyNone) {
+			t.Fatalf("%q isRotationCopyShape=%v 与分类结果不一致", tc.name, isCopy)
+		}
+		base, ok := rotationCopyBaseName(tc.name)
+		if tc.kind == rotationCopyNone {
+			if ok {
+				t.Fatalf("%q 非副本却派生出基名 %q", tc.name, base)
+			}
+			continue
+		}
+		if !ok || base != tc.base {
+			t.Fatalf("%q 派生基名=%q ok=%v, want %q", tc.name, base, ok, tc.base)
+		}
+		// 目录内存在该基名时，归并结果必须与派生基名一致（单源一致性）。
+		bases := map[string]struct{}{tc.base: {}}
+		stem := tc.base
+		if ext := filepath.Ext(stem); ext != "" {
+			stem = stem[:len(stem)-len(ext)]
+		}
+		merged, ok := rotationCopyBaseOf(tc.name, bases, map[string]string{stem: tc.base})
+		if !ok || merged != tc.base {
+			t.Fatalf("%q 归并基名=%q ok=%v, want %q", tc.name, merged, ok, tc.base)
+		}
+	}
+}
+
+// caddy_id 路径穿越形状在读侧显式 400（不得进入文件路径拼接）。
+func TestGetLogStats_rejectsPathTraversalCaddyID(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	h.cfg.DataDir = t.TempDir()
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/logs/stats", h.GetLogStats)
+	for _, raw := range []string{"..%2Fetc%2Fpasswd", "..%5C..%5Cwin.ini", "..", ".", "lb%2F1"} {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/logs/stats?caddy_id="+raw, nil))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("caddy_id=%s status=%d body=%s, want 400（路径穿越形状）", raw, rec.Code, rec.Body.String())
+		}
+	}
+}

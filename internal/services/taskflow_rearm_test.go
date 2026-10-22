@@ -168,3 +168,55 @@ func TestParseUTCTimeDual_bothLayouts(t *testing.T) {
 		t.Fatal("空串应解析失败")
 	}
 }
+
+// 版本表 auto_update 关闭时仍重排展示槽：next_update 是「下次更新」展示的
+// 唯一来源（GetCRSInfo/GetIP2RegionInfo 直读），与 setVersionTableSchedule
+// 「关闭也重排、调度器仍受开关门控」同口径——切换时区后不得停留在旧偏移。
+func TestRearmScheduleSlotsAfterTimezoneChange_reschedulesDisplaySlotWhenAutoUpdateOff(t *testing.T) {
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
+	if err := db.Initialize(t.TempDir()); err != nil {
+		t.Fatalf("initialize test database: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+	})
+	if _, err := ConfigureLocation("Asia/Shanghai"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = ConfigureLocation("UTC") })
+
+	shanghai, _ := time.LoadLocation("Asia/Shanghai")
+	// 23:59 远离当前时刻，避免用例跨过 04:00 边界时槽变为过期而跳过重排。
+	const scheduleTime = "23:59"
+	futureSh := NextScheduledSlot(time.Now(), allWeek(), scheduleTime, shanghai).UTC().Format(crsTimeLayout)
+	for _, table := range []string{"security_crs_version", "security_ip2region_version"} {
+		if _, err := db.DB.Exec(`INSERT OR REPLACE INTO `+table+` (id, version, auto_update, schedule_days, schedule_time, next_update) VALUES (1,'v',0,?,?,?)`,
+			FormatScheduleDays(allWeek()), scheduleTime, futureSh); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := ConfigureLocation("UTC"); err != nil {
+		t.Fatal(err)
+	}
+	RearmScheduleSlotsAfterTimezoneChange()
+
+	want := parseUTCSlot(NextScheduledSlot(time.Now().UTC(), allWeek(), scheduleTime, time.UTC).UTC().Format(crsTimeLayout))
+	for _, table := range []string{"security_crs_version", "security_ip2region_version"} {
+		var got string
+		if err := db.DB.QueryRow(`SELECT next_update FROM ` + table + ` WHERE id=1`).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if slot := parseUTCSlot(got); !slot.Equal(want) {
+			t.Fatalf("%s next_update=%q（parsed %v）, want %v（auto_update 关闭也要重排展示槽）", table, got, slot, want)
+		}
+		var autoUpdate int
+		if err := db.DB.QueryRow(`SELECT auto_update FROM ` + table + ` WHERE id=1`).Scan(&autoUpdate); err != nil {
+			t.Fatal(err)
+		}
+		if autoUpdate != 0 {
+			t.Fatalf("%s auto_update=%d，重排展示槽不得改动开关", table, autoUpdate)
+		}
+	}
+}

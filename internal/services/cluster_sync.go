@@ -110,7 +110,6 @@ type SyncService struct {
 	caddy                *CaddyService
 	cluster              *ClusterService
 	client               *http.Client
-	transport            *http.Transport
 	transportOnce        sync.Once
 	pinMu                sync.Mutex
 	verifiedPins         map[string]string
@@ -250,7 +249,7 @@ func (s *SyncService) initClusterClient() {
 		if s.cfg != nil {
 			dataDir = s.cfg.DataDir
 		}
-		s.transport = newClusterTOFUTransport(dataDir, s.db, func(pinPath, fingerprint string) {
+		transport := newClusterTOFUTransport(dataDir, s.db, func(pinPath, fingerprint string) {
 			s.pinMu.Lock()
 			s.verifiedPins[pinPath] = fingerprint
 			s.pinMu.Unlock()
@@ -259,7 +258,7 @@ func (s *SyncService) initClusterClient() {
 		if s.client == nil {
 			s.client = &http.Client{Timeout: 30 * time.Second}
 		}
-		s.client.Transport = s.transport
+		s.client.Transport = transport
 		s.client.CheckRedirect = func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		}
@@ -707,12 +706,14 @@ func syncDrainersFor(database *sql.DB) []*SyncService {
 		return nil
 	}
 	syncDrainersMu.Unlock()
-	// 死句柄兜底回收（同 clusterServicesFor）：库已 Close 时条目不再可用，
-	// 查询路径顺手剔除，防止测试/重建场景无限累积。
-	if !clusterDBHandleAlive(database) {
+	// 死句柄兜底回收（同 clusterServicesFor），但只在确定性关闭时剔除：
+	// 1s 探活超时（长写事务/GC 停顿）保留登记项——否则 Promote/BecomeSlave 的
+	// syncDrainersFor 返回空，在途 Pull 不再排干（升主提交后旧从快照继续写库）。
+	if probeClusterDBHandle(database) == clusterHandleClosed {
 		syncDrainersMu.Lock()
 		delete(syncDrainers, database)
 		syncDrainersMu.Unlock()
+		resetClusterHandleStrikes(database)
 		return nil
 	}
 	return services
@@ -1956,7 +1957,11 @@ func (s *SyncService) pollRegistration(ctx context.Context) {
 		// confirm 请求」或「confirm 失败走 bump 轨道」，轨道自愈。令牌在主节点
 		// 审批时刻即有效（Pull 鉴权只查 cluster_token_hash），confirm 仅是冗余
 		// 交付确认（首个签名快照亦会清 secret），前置无安全影响。
-		if _, err := s.db.ExecContext(ctx, "UPDATE global_config SET cluster_token=?, registration_secret='' WHERE id=1", envelope.Data.ClusterToken); err != nil {
+		// registration_secret 必须保留到 confirm 成功：此前在同一条 UPDATE 里清空，
+		// 一旦 confirm 网络/4xx 失败，下轮 pollRegistration 因 secret=="" 早退，
+		// confirm 永不重试且「连续 5 次失败止环」轨道（bumpRegistrationConfirmFailure）
+		// 在 confirm 轴上不可达（计数至多 1）。保留后每 10s 重试一次，5 次即成环。
+		if _, err := s.db.ExecContext(ctx, "UPDATE global_config SET cluster_token=? WHERE id=1", envelope.Data.ClusterToken); err != nil {
 			Logf("error", "保存集群令牌失败（下周期重试状态轮询）: %v", err)
 			return
 		}
@@ -1985,6 +1990,12 @@ func (s *SyncService) pollRegistration(ctx context.Context) {
 			return
 		}
 		s.resetRegistrationConfirmFailure(ctx)
+		// confirm 成功即离开注册循环：主节点已消费 secret，本地保留会让下轮状态
+		// 轮询命中 401 终止轨道。清空失败时留痕（下轮走 401 终止轨道，集群令牌
+		// 仍有效，同步不受影响）。
+		if _, err := s.db.ExecContext(ctx, "UPDATE global_config SET registration_secret='' WHERE id=1"); err != nil {
+			Logf("warn", "集群注册确认成功后清理本地注册密钥失败（下轮状态轮询将走 401 终止轨道）: %v", err)
+		}
 	}
 }
 

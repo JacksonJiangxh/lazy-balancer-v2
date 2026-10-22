@@ -318,26 +318,21 @@ func (h *Handlers) GetAuditLogs(c *gin.Context) {
 	if page < 1 {
 		page = 1
 	}
-	// clamp 上限防 *pageSize 整数溢出为负 → SQLite OFFSET 报错 500
-	// （与 ListSecurityEvents security.go:815 同口径）。
-	// 上限收紧 100000→10000——审计库全量在百万行量级内,10 万页
-	// (200 万行偏移)无命中语义只浪费深翻页扫描。
-	if page > 10000 {
-		page = 10000
-	}
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
 	if pageSize < 1 || pageSize > 100 {
 		pageSize = 20
 	}
 	// 深翻页折中：页码分页保留（可跳页、有总页数），但超过阈值显式 400 并给出
 	// 筛选指引——OFFSET 深页在大审计库上是秒级全表扫描，静默 clamp 会让用户
-	// 以为「翻到了第 501 页」却拿到错位结果。
+	// 以为「翻到了第 501 页」却拿到错位结果。该 400 同时是 *pageSize 溢出的
+	// 唯一防线（page ≤500 × page_size ≤100 → offset 恒安全），因此不再需要
+	// 额外 clamp（旧 clamp 位于本门之后，永远不可达）。
 	if page > auditLogDeepPageLimit {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf(
 			"结果过多（超过 %d 页），请使用时间范围/用户/动作筛选缩小范围", auditLogDeepPageLimit)})
 		return
 	}
-	offset := (page - 1) * pageSize
+	offset := int64(page-1) * int64(pageSize)
 
 	// 列筛选：操作人/操作/对象/IP 模糊匹配，keyword 搜详情，
 	// 时间范围为配置时区的本地时间（created_at 按 UTC 存储，比较前换算）。
