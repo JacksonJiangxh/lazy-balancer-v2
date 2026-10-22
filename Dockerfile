@@ -111,7 +111,14 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # 清单必须覆盖 go list 派生到的全部顶层 Go 目录（cmd/internal/caddygeoip/
 # caddydeps/wafiplist/geoipnames）——scripts/test-all.sh 有机器断言比对
 # Dockerfile 清单与 git 跟踪的顶层 Go 目录，新增顶层 Go 目录必须同步本行。
-COPY cmd/ internal/ caddygeoip/ caddydeps/ wafiplist/ geoipnames/ config/ ./
+COPY go.mod go.sum ./
+COPY cmd/ ./cmd/
+COPY internal/ ./internal/
+COPY caddygeoip/ ./caddygeoip/
+COPY caddydeps/ ./caddydeps/
+COPY wafiplist/ ./wafiplist/
+COPY geoipnames/ ./geoipnames/
+COPY config/ ./config/
 WORKDIR /app/cmd/server
 # 双缓存挂载（模块+编译缓存，lazy-builder GC 48h）：增量编译只重编改动包；
 # 纯本地编译无网络请求，无需重试
