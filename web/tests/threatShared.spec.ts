@@ -9,6 +9,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { heatEntriesEqual, heatCss, DOT_LAND, arcEndpoints, POINTY_TOP_HEX_VERTICES, drillCountryAllowed, arcOriginForLocation, normalizeCountryName, adminShortName, aggregateCountryCounts, hasProvinceStats, drillCommitAllowed } from '../src/utils/threatShared.ts'
+import { FALLBACK_CENTROID } from '../src/utils/countryCentroids.ts'
 
 test('六边形点阵：pointy-top 六顶点且上下尖角', () => {
   assert.equal(POINTY_TOP_HEX_VERTICES.length, 6)
@@ -30,7 +31,12 @@ test('弧线起点：中国精确到省，其他国家走质心，未知走兜�
   const us = arcOriginForLocation('美国')
   assert.ok(Math.abs(us[0] - -97) < 1 && Math.abs(us[1] - 38) < 2)
   const unknown = arcOriginForLocation('不存在国')
-  assert.deepEqual(unknown, arcOriginForLocation(''))
+  // 钉住回退坐标字面值本身——原与 arcOriginForLocation('') 自比较，同一回退分支
+  // 恒等通过；改 FALLBACK_CENTROID 值或改回退实现都必须红。
+  // [160, 15] = countryCentroids.FALLBACK_CENTROID（太平洋「海外」中心点）。
+  assert.deepEqual(unknown, [160, 15])
+  assert.deepEqual(arcOriginForLocation(''), [160, 15])
+  assert.deepEqual(FALLBACK_CENTROID, [160, 15], '回退坐标变更需同步本用例（契约钉）')
 })
 
 test('热力阶梯首色=陆地底色：命中 1 次不得比 0 次更暗', () => {

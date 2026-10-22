@@ -12,7 +12,9 @@ import assert from 'node:assert/strict'
 import { WORLD_COUNTRIES, THREAT_COUNTRIES } from '../src/utils/worldBorders.ts'
 import { ADMIN1_PROVINCES, COUNTRY_ALIAS } from '../src/utils/admin1Provinces.ts'
 import { CHINA_PROVINCES } from '../src/utils/chinaProvinces.ts'
-import { normalizeCountryName } from '../src/utils/threatShared.ts'
+import { normalizeCountryName, trafficOriginForCountry } from '../src/utils/threatShared.ts'
+import { COUNTRY_CENTROIDS } from '../src/utils/countryCentroids.ts'
+import { source } from './_helpers.ts'
 
 test('A 威胁国家表：排除南极洲且其余国家与 worldBorders 一致', () => {
   assert.equal(WORLD_COUNTRIES.length - THREAT_COUNTRIES.length, 1)
@@ -98,5 +100,19 @@ test('C 别名表：10 个历史英文/旧名分组 + 巴勒斯坦双源；台�
   // 每个别名目标都必须是非空省层（防「键存在但数据空」的假通过）
   for (const target of new Set(Object.values(COUNTRY_ALIAS))) {
     assert.ok(hasRows(target), `别名目标 ${target} 省层为空`)
+  }
+})
+
+test('正常流光流起点：台湾/Taiwan 归一后与中国同点，两引擎共用同一查表', () => {
+  assert.deepEqual(trafficOriginForCountry('台湾'), COUNTRY_CENTROIDS['中国'])
+  assert.deepEqual(trafficOriginForCountry('Taiwan'), COUNTRY_CENTROIDS['中国'])
+  assert.deepEqual(trafficOriginForCountry('中国'), COUNTRY_CENTROIDS['中国'])
+  // 未知国家仍走兜底点（不是被归一成中国）
+  assert.notDeepEqual(trafficOriginForCountry('不存在国'), COUNTRY_CENTROIDS['中国'])
+  // 两引擎 setTraffic 都走共享 helper，禁止第三份查表实现
+  for (const path of ['src/utils/threatScene.ts', 'src/utils/threatGlobe.ts']) {
+    const text = source(path)
+    assert.match(text, /trafficOriginForCountry\(item\.key\)/, `${path} setTraffic 未归一`)
+    assert.doesNotMatch(text, /spawnArc\(COUNTRY_CENTROIDS\[item\.key\]/, `${path} 裸查表不得回流`)
   }
 })

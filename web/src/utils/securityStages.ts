@@ -942,27 +942,86 @@ const ipv6ToBigInt = (raw: string): bigint | null => {
 
 // 补正：IPv6 CIDR 按前 N 位比较——此前仅 IPv4，IPv6 CIDR
 // 条目在命中定位/残余信任判定侧恒漏报（取消信任后 CIDR 仍信任却报「已恢复拦截」）。
-const ipInCidr = (ip: string, cidr: string): boolean => {
+type ParsedCidr =
+  | { readonly family: 4; readonly base: number; readonly bits: number }
+  | { readonly family: 6; readonly base: bigint; readonly bits: number }
+
+const parseCidrUncached = (cidr: string): ParsedCidr | null => {
   const idx = cidr.indexOf('/')
-  if (idx < 0) return false
+  if (idx < 0) return null
   const base = cidr.slice(0, idx).trim()
   const bits = Number(cidr.slice(idx + 1).trim())
-  if (!Number.isInteger(bits) || bits < 0) return false
+  if (!Number.isInteger(bits) || bits < 0) return null
   if (base.includes(':')) {
-    if (bits > 128) return false
-    const ipLong = ipv6ToBigInt(ip)
+    if (bits > 128) return null
     const baseLong = ipv6ToBigInt(base)
-    if (ipLong === null || baseLong === null) return false
-    if (bits === 0) return true
-    const shift = BigInt(128 - bits)
-    return (ipLong >> shift) === (baseLong >> shift)
+    if (baseLong === null) return null
+    return { family: 6, base: baseLong, bits }
   }
-  if (bits > 32) return false
-  const ipLong = ipv4ToLong(ip.trim())
+  if (bits > 32) return null
   const baseLong = ipv4ToLong(base)
-  if (ipLong < 0 || baseLong < 0) return false
-  const mask = bits === 0 ? 0 : (~0 << (32 - bits)) >>> 0
-  return (ipLong & mask) === (baseLong & mask)
+  if (baseLong < 0) return null
+  return { family: 4, base: baseLong, bits }
+}
+
+// CIDR 解析缓存：命中判定对同一批名单条目重复执行（事件详情多结论扫描），
+// 逐条目即时重解析 BigInt/正则在数万条内置威胁名单上是主线程卡顿源。
+// cidr 串 → 解析结果是纯函数（不随条目内容失效），缓存只需上限防内存膨胀；
+// invalidateSharedEntriesCache 时一并清空（名单内容换代，保持同生命周期语义）。
+const CIDR_PARSE_CACHE_MAX = 50_000
+const cidrParseCache = new Map<string, ParsedCidr | null>()
+const parseCidr = (cidr: string): ParsedCidr | null => {
+  const cached = cidrParseCache.get(cidr)
+  if (cached !== undefined) return cached
+  const parsed = parseCidrUncached(cidr)
+  if (cidrParseCache.size >= CIDR_PARSE_CACHE_MAX) cidrParseCache.clear()
+  cidrParseCache.set(cidr, parsed)
+  return parsed
+}
+
+const parsedCidrContains = (parsed: ParsedCidr, ip: string): boolean => {
+  if (parsed.family === 4) {
+    const ipLong = ipv4ToLong(ip.trim())
+    if (ipLong < 0) return false
+    const mask = parsed.bits === 0 ? 0 : (~0 << (32 - parsed.bits)) >>> 0
+    return (ipLong & mask) === (parsed.base & mask)
+  }
+  const ipLong = ipv6ToBigInt(ip)
+  if (ipLong === null) return false
+  if (parsed.bits === 0) return true
+  const shift = BigInt(128 - parsed.bits)
+  return (ipLong >> shift) === (parsed.base >> shift)
+}
+
+const ipInCidr = (ip: string, cidr: string): boolean => {
+  const parsed = parseCidr(cidr)
+  return parsed !== null && parsedCidrContains(parsed, ip)
+}
+
+/**
+ * 预解析 IP 的批量命中判定器：同一 IP 对 N 条名单条目判定时，IP 侧只解析一次
+ * （CIDR 侧走 parseCidr 缓存）。事件详情弹框的多结论扫描必须走此入口——
+ * 逐条 entryMatchesIp 会把 IP 解析重复 N 次。
+ */
+export const createIpMatcher = (ip: string): ((entry: string) => boolean) => {
+  const trimmed = ip.trim()
+  const v4 = ipv4ToLong(trimmed)
+  const v6 = v4 < 0 ? ipv6ToBigInt(trimmed) : null
+  return (entry) => {
+    if (entry === trimmed) return true
+    if (!entry.includes('/')) return false
+    const parsed = parseCidr(entry)
+    if (parsed === null) return false
+    if (parsed.family === 4) {
+      if (v4 < 0) return false
+      const mask = parsed.bits === 0 ? 0 : (~0 << (32 - parsed.bits)) >>> 0
+      return (v4 & mask) === (parsed.base & mask)
+    }
+    if (v6 === null) return false
+    if (parsed.bits === 0) return true
+    const shift = BigInt(128 - parsed.bits)
+    return (v6 >> shift) === (parsed.base >> shift)
+  }
 }
 
 /** 条目匹配：精确 IP 或 CIDR 包含（IPv4/IPv6 双栈，CIDR 仅作用于同族） */
@@ -991,8 +1050,10 @@ export const subscribeSharedEntriesCache = (fn: EntriesCacheListener): (() => vo
 }
 const inflightEntries = new Map<number, { generation: number; promise: Promise<void> }>()
 
-/** 写入单名单条目并通知订阅者（加载完成/IP 处置后回写共用）。 */
-export function writeSharedEntries(id: number, values: string[]): void {
+/** 写入单名单条目并通知订阅者（加载完成/IP 处置后回写共用）。
+ *  模块内私有——缓存写只允许经 loadSharedEntry / invalidate 路径，
+ *  外泄第二写入口会绕开代际守卫（零外部消费即去 export）。 */
+function writeSharedEntries(id: number, values: string[]): void {
   sharedEntriesCache[id] = values
   notifyEntriesCache()
 }
@@ -1056,6 +1117,7 @@ export async function ensureSharedEntries(ids: Iterable<number>, loader: (id: nu
 export const invalidateSharedEntriesCache = (): void => {
   entriesCacheGeneration++
   for (const k of Object.keys(sharedEntriesCache)) delete sharedEntriesCache[Number(k)]
+  cidrParseCache.clear()
   notifyEntriesCache()
 }
 

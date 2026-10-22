@@ -4,6 +4,9 @@
 // ① 容器更宽时表格必须占满整宽——弹性列声明 min-width，Element Plus 把多余宽度
 //    均分给这些列（固定宽的只有状态/重试/操作）；
 // ② 容器更窄时按优先级隐藏低价值列——min-width 之和超过容器仍会撑出滚动条。
+// 收敛下限：不可让位列（domain/status/validity/attempts/actions）最小合计
+// CERT_JOB_COLUMNS_MIN_WIDTH = 619px；容器更窄时表格内部溢出由 .cert-jobs-wrap
+// 的 overflow:hidden 裁断（卡片/页面级不出现横向滚动，表格内部可能裁切）。
 //
 // 下方 WIDTHS 即「每列最小宽度」，既用于 ② 的让位判据，也是 ① 的弹性基线。
 // 纯函数便于单测：给定容器宽度返回应显示的列集合。
@@ -67,6 +70,11 @@ export const certJobColumnsWidth = (columns: Iterable<CertJobColumnId>): number 
 }
 
 export const CERT_JOB_COLUMNS_TOTAL_WIDTH = certJobColumnsWidth(CERT_JOB_COLUMNS)
+
+/** 不可让位列的最小合计宽（px）——让位耗尽后的下限；低于此宽表格内部被裁切。 */
+export const CERT_JOB_COLUMNS_MIN_WIDTH = certJobColumnsWidth(
+  CERT_JOB_COLUMNS.filter((id) => !CERT_JOB_COLUMN_HIDE_ORDER.includes(id)),
+)
 
 /**
  * 贪心选择：从全列出发，按隐藏优先级逐列让位，直到合计宽度不超过容器宽，

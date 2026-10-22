@@ -180,6 +180,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
 import { request, mfaAwareSuccess } from '@/utils/api'
 import { copyText } from '@/utils/copy'
+import { CLUSTER_SYNC_SWITCHES } from '@/utils/clusterSyncSwitches'
 import { formatDate } from '@/utils/date'
 import type {
   APIResponse,
@@ -516,11 +517,11 @@ const copyRegisterToken = async (): Promise<void> => {
   }
 }
 
-const syncSwitchLabels: Record<string, string> = {
-  sync_users: '系统数据',
-  sync_rules: '负载均衡规则',
-  sync_security: '安全防护',
-}
+// 三分类标签单源 utils/clusterSyncSwitches（与 ClusterMasterPanel 开关行同源，
+// 原父子各持一份字面量，改名/新增必漏一侧致确认文案与实际开关不符）。
+const syncSwitchLabels: Record<string, string> = Object.fromEntries(
+  CLUSTER_SYNC_SWITCHES.map((item) => [item.key, item.label]),
+)
 
 const updateSyncField = async (field: string, value: boolean): Promise<void> => {
   if (isReadOnlyProp.value) return
@@ -765,7 +766,7 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
-.equal-height-row :deep(.el-card) { height: 100%; }
+/* el-card 高度由全局 .equal-height-row（main.css）供给，此处不重复声明 */
 .equal-height-row :deep(.el-card__body) { height: 100%; box-sizing: border-box; }
 .cluster-settings { display: flex; flex-direction: column; gap: 20px; }
 .polling-error-alert { align-self: stretch; }

@@ -750,7 +750,9 @@ const copyMfaRecovery = async (): Promise<void> => {
 
 onMounted(() => {
   fetchUsers()
-  void fetchOIDCStatus()
+  // /settings/oidc 挂在 admin 组（非管理员必 403）且 OIDC 入口仅管理员渲染——
+  // 请求与消费面同门，非管理员不再白跑一条 403（审计噪音 + 无意义往返）。
+  if (authStore.user?.role === 'admin') void fetchOIDCStatus()
 })
 </script>
 

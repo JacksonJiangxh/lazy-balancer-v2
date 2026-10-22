@@ -88,11 +88,20 @@ export const pathDuplicateKey = (matchType: 'prefix' | 'exact', raw: string): st
   `${matchType}:${matchType === 'prefix' ? canonicalPathKey('prefix', raw) : raw.trim()}`
 
 
-// 直接返回的常用状态码白名单（与后端 validStaticResponseStatuses 同源）
-const STATIC_RESPONSE_STATUSES: Readonly<Record<number, true>> = {
-  200: true, 201: true, 204: true, 400: true, 401: true,
-  403: true, 404: true, 410: true, 500: true, 502: true, 503: true,
+// 直接返回的常用状态码白名单（与后端 validStaticResponseStatuses 同源）。
+// 数组形态 + 标准全称单源自此导出——编辑器下拉（PathRulesEditor）只 import，
+// 禁止在组件侧再抄一份（曾双源：下拉可选但保存被拒）。
+export const STATIC_RESPONSE_STATUSES: readonly number[] = [200, 201, 204, 400, 401, 403, 404, 410, 500, 502, 503]
+
+export const STATIC_RESPONSE_STATUS_REASONS: Readonly<Record<number, string>> = {
+  200: 'OK', 201: 'Created', 204: 'No Content',
+  400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found', 410: 'Gone',
+  500: 'Internal Server Error', 502: 'Bad Gateway', 503: 'Service Unavailable',
 }
+
+const STATIC_RESPONSE_STATUS_SET: Readonly<Record<number, true>> = Object.fromEntries(
+  STATIC_RESPONSE_STATUSES.map((code) => [code, true]),
+)
 export const validatePathRules = (rules: readonly PathRuleInput[]): string | null => {
   const seen = new Map<string, number>()
   // 同后端：prefix 与 exact 在同一路径上并存时，路由按 SortOrder 首条终结
@@ -128,7 +137,7 @@ export const validatePathRules = (rules: readonly PathRuleInput[]): string | nul
     const responseMode = rule.response_mode === 'forward' ? '' : (rule.response_mode ?? '')
     if (responseMode === 'static') {
       const status = rule.response_status || 200
-      if (!STATIC_RESPONSE_STATUSES[status]) return `第 ${rowNumber} 条路径：直接返回的状态码 ${status} 不在常用集合`
+      if (!STATIC_RESPONSE_STATUS_SET[status]) return `第 ${rowNumber} 条路径：直接返回的状态码 ${status} 不在常用集合`
       if ([...rule.response_body ?? ''].length > 64) return `第 ${rowNumber} 条路径：响应内容不能超过 64 个字符`
       const ct = rule.response_content_type ?? ''
       if (ct !== '' && ct !== 'text/plain' && ct !== 'application/json' && ct !== 'text/html') return `第 ${rowNumber} 条路径：响应格式仅支持纯文本/JSON/HTML`
@@ -186,3 +195,17 @@ export const validatePathRules = (rules: readonly PathRuleInput[]): string | nul
   }
   return null
 }
+
+// ── 数值边界单源（表单控件 ↔ 后端写侧门）──
+// 控件边界此前各自写死且与写侧门漂移（间隔 min 5 vs 后端 ≥1、超时 max 30 vs
+// 后端无上限、重试间隔 max 10000 vs 后端 60000、最大连接 max 100000 vs 后端
+// 无上限）——API/MCP/导入写入的合法值在向导中被 spinner 静默夹回 UI 边界。
+// 后端口径：internal/handlers/handlers.go（间隔/超时 ≥1，无上限）、
+// rule_features.go（重试窗口/间隔 [-1|0, 60000]）、max_connections ≥0 无上限。
+// el-input-number 只在交互（spinner/输入失焦）时夹紧，库值超界回显不被改写。
+export const RULE_NUMERIC_LIMITS = {
+  healthCheckIntervalMin: 1,
+  healthCheckTimeoutMin: 1,
+  tcpTryIntervalMax: 60000,
+  maxConnectionsMin: 0,
+} as const

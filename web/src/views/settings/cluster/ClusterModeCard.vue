@@ -13,7 +13,7 @@
       <!-- 原生表单行（2026-10-11 用户裁定：对齐统一走 el-form-item，弃自管标签行；
            Firefox label-for 控制台告警为 EP 上游已知形态，非用户可见） -->
       <el-form-item label="节点模式">
-        <el-radio-group v-model="selectedMode" :disabled="loading || readOnly" aria-label="节点模式" @change="handleModeChange">
+        <el-radio-group v-model="selectedMode" :disabled="loading || readOnly || !status" aria-label="节点模式" @change="handleModeChange">
           <el-radio value="master">主节点</el-radio>
           <el-radio value="slave">从节点</el-radio>
         </el-radio-group>
@@ -128,7 +128,10 @@ const rules: FormRules<RegistrationForm> = {
 
 const usesPlainHttp = computed(() => form.master_url.trim().toLowerCase().startsWith('http://'))
 const isSlave = computed(() => props.status?.node_mode === 'slave')
-const intervalDisabled = computed(() => props.readOnly || props.intervalSaving || isSlave.value)
+// status 未就绪（首拉在途/契约失败）时写控件 fail-closed：否则
+// syncInterval 初值 60 ≠ status?.sync_interval(undefined) 恒真，保存按钮可点
+// 会以前端默认值覆盖真实配置（与 BasicSettings 的 configLoaded 门同口径）。
+const intervalDisabled = computed(() => props.readOnly || props.intervalSaving || isSlave.value || !props.status)
 
 watch(
   () => props.status,
@@ -177,7 +180,7 @@ watch(registrationOpen, (open) => {
 })
 
 const handleModeChange = (value: string | number | boolean): void => {
-  if (props.readOnly || props.loading) return
+  if (props.readOnly || props.loading || !props.status) return
   if (value === 'slave') {
     registrationOriginMode = props.status?.node_mode ?? null
     registrationOpen.value = true
@@ -195,7 +198,7 @@ const closeRegistration = (): void => {
 }
 
 const saveSyncInterval = (): void => {
-  if (props.readOnly) return
+  if (props.readOnly || !props.status) return
   emit('update-interval', syncInterval.value)
 }
 

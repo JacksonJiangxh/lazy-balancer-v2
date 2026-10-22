@@ -95,7 +95,7 @@
             <span class="rule-field-label">状态码</span>
             <!-- 标准全称显示（2026-10-10 用户裁定）：值仍为数字状态码 -->
             <el-select v-model="rule.response_status" size="small" style="width: 210px;" aria-label="状态码">
-              <el-option v-for="code in STATIC_STATUSES" :key="code" :label="`${code} ${STATUS_REASONS[code]}`" :value="code" />
+              <el-option v-for="code in STATIC_RESPONSE_STATUSES" :key="code" :label="`${code} ${STATIC_RESPONSE_STATUS_REASONS[code]}`" :value="code" />
             </el-select>
           </label>
           <label class="rule-field">
@@ -147,7 +147,7 @@
                 <el-option value="https" label="HTTPS" />
               </el-select>
             </label>
-            <label class="upstream-field upstream-address-field">
+            <label class="upstream-field">
               <span class="mobile-field-label">地址</span>
               <el-input v-model="upstream.address" size="small" :aria-label="`路径规则 ${index + 1} 自定义上游 ${upstreamIndex + 1} 地址`" placeholder="IP 或域名" />
             </label>
@@ -178,7 +178,7 @@ import { ArrowDown, ArrowUp, Delete, Plus } from '@element-plus/icons-vue'
 import FieldHelpIcon from '@/components/common/FieldHelpIcon.vue'
 import type { PathRule, PathRuleUpstream } from '@/types'
 import { MAX_UPSTREAM_ROWS, normalizeWeights, redistributeWeight } from '@/utils/upstreamWeights'
-import { canonicalPathKey, pathDuplicateKey } from '@/utils/ruleValidation'
+import { STATIC_RESPONSE_STATUSES, STATIC_RESPONSE_STATUS_REASONS, canonicalPathKey, pathDuplicateKey } from '@/utils/ruleValidation'
 
 const pathRules = defineModel<PathRule[]>({ required: true })
 
@@ -239,16 +239,7 @@ const rowShadowWarning = (index: number): string => {
   return `被前序前缀规则 ${priorIndex + 1}（${prior?.path.trim() ?? ''}）遮蔽，不会生效`
 }
 
-// 直接返回/301 跳转（2026-10-10 用户裁定）：常用状态码白名单（与后端
-// validStaticResponseStatuses / ruleValidation.ts 同源）
-const STATIC_STATUSES: readonly number[] = [200, 201, 204, 400, 401, 403, 404, 410, 500, 502, 503]
 
-// STATUS_REASONS 状态码标准全称（下拉显示用；值仍为数字状态码）
-const STATUS_REASONS: Readonly<Record<number, string>> = {
-  200: 'OK', 201: 'Created', 204: 'No Content',
-  400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found', 410: 'Gone',
-  500: 'Internal Server Error', 502: 'Bad Gateway', 503: 'Service Unavailable',
-}
 
 // isForwardMode 转发判定：''（API 形态）与 'forward'（UI 哨兵——el-select 空串
 // 选项不显示标签）同为转发；提交时归一为 ''。

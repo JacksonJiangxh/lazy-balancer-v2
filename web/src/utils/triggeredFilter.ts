@@ -10,7 +10,14 @@
 
 // 触发阶段筛选为固定预置八类（用户裁定：固定预置值，不接受任意值）。
 // 限流（429）无 sec_events 数据源，不再作为筛选项/分类。
-export const TRIGGERED_CATEGORIES = ['爬虫Bot', '地域拦截', 'IP 访问控制', '信任名单', '威胁情报库', '请求体异常', 'WAF·CRS', 'WAF·自定义'] as const
+
+// crawler 族展示词单源：后端 family 键/trigger_type 权威词为「爬虫Bot」
+//（internal/handlers/security_threat_screen.go triggerTypeForRule）。
+// 筛选类别与事件列表「触发阶段」列同词——原阶段列渲染「爬虫校验」，
+// 同页筛选/触发类型列显示「爬虫Bot」，用户需自行判断两词同族。
+export const CRAWLER_FAMILY_LABEL = '爬虫Bot'
+
+export const TRIGGERED_CATEGORIES = [CRAWLER_FAMILY_LABEL, '地域拦截', 'IP 访问控制', '信任名单', '威胁情报库', '请求体异常', 'WAF·CRS', 'WAF·自定义'] as const
 export type TriggeredCategory = typeof TRIGGERED_CATEGORIES[number]
 
 // 每类对应的 ruleTriggeredFamilyPrefixes 映射键（值=后端 family 键，与新

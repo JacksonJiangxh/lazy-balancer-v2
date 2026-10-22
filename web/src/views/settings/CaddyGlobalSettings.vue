@@ -102,7 +102,7 @@
           >
             <el-option v-for="l in customIpLists" :key="l.id" :label="`${l.name}（${l.entry_count} 条）`" :value="l.id" />
           </el-select>
-          <div class="form-tip-line">引用「规则集 → IP 地址列表」中的可复用列表，条目与上方内联网段合并生效（合计 {{ trustedRangesTotalCount }} 条，上限 2000）</div>
+          <div class="form-tip-line">引用「规则集 → IP 地址列表」中的可复用列表，条目与上方内联网段合并生效（合计 {{ trustedRangesTotalCount }} 条，上限 {{ IP_LIST_MAX_ENTRIES }}）</div>
         </el-form-item>
         <el-form-item label="请求头">
           <el-select
@@ -238,6 +238,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { RefreshRight, Setting, Tickets, View } from '@element-plus/icons-vue'
 import { useAuthStore } from '@/stores/auth'
 import { useLogTailPolling } from '@/composables/useLogTailPolling'
+import { IP_LIST_MAX_ENTRIES } from '@/utils/ipListSaveGuard'
 import { ansiToHtml } from '@/utils/ansi'
 import { request, mfaAwareSuccess } from '@/utils/api'
 import { CDN_PRESETS, DEFAULT_ACCESS_LOG_FORMAT } from '@/utils/caddyDefaults'

@@ -932,7 +932,7 @@ import { isValidCidr } from '@/utils/ruleValidation'
 import { popperViewportSafe } from '@/utils/popper'
 import { formatDate } from '@/utils/date'
 import { useAuthStore } from '@/stores/auth'
-import { useCrsRuleIndex, crsRuleLabelView, parseCrsExcludedRules, CRS_EXCLUDED_MAX_ROWS } from '@/composables/useCrsRuleIndex'
+import { useCrsRuleIndex, issueCrsIndexSession, crsRuleLabelView, parseCrsExcludedRules, CRS_EXCLUDED_MAX_ROWS } from '@/composables/useCrsRuleIndex'
 import { useClampedPagination } from '@/composables/useClampedPagination'
 import type { CrsExcludedRow, CrsRuleOptionView } from '@/composables/useCrsRuleIndex'
 import type { APIResponse, UserListItem } from '@/types'
@@ -941,6 +941,7 @@ import DialogHeader from '@/components/DialogHeader.vue'
 import { POLICY_TYPE_LABELS, POLICY_TYPE_SHORT_LABELS, STAGE_BLOCK_STATUS_OPTIONS, blockPageMissing, buildStageModel, chunkForBulk, entriesIntersect, formatAclModeDetail, hasGeoIPControl, hasIPACLControl, hasTrustEntries, inferPolicyType, mergeIpEntryCount, mergeIpEntryValues, normalizeStringEntries, parseIPList, parseRefIds, parseUnknownIds, IP_LIST_CATEGORIES, MAX_POLICIES_PER_RULE, SECURITY_BULK_LIMITS, resolveBlockPageAttribution, type BlockPageAttribution, type BlockPageStage } from '@/utils/securityStages'
 import type { RuleStageModel, SecurityPolicyType, SecurityStagePolicy } from '@/utils/securityStages'
 import { updaterName } from '@/utils/updaterName'
+import { DEEP_LINK_PARAMS, pageUrl } from '@/utils/deepLink'
 import { buildPolicyPayload, crawlerExemptionNeedsEngines } from '@/utils/policyPayload'
 
 interface PolicyDetail { id: number; name: string; description: string; mode: string; anomaly_threshold: number; ip_acl_mode: string; ip_acl_list: string; ip_acl_enabled: boolean; ip_whitelist: string; ip_whitelist_enabled?: boolean; ip_blacklist?: string; ip_acl_list_refs?: string; ip_whitelist_refs?: string; rate_limit_enabled: boolean; rate_limit_rps: number; rate_limit_burst: number; crs_rule_groups: string; crs_excluded_rules: string; custom_rules: string; block_page_id: number; block_status_code: number; enabled: boolean; updated_at: string; geoip_mode?: string; geoip_countries?: string; geoip_crawler_exempt?: boolean; geoip_crawler_engines?: string; waf_check_response?: boolean; log_request_body?: boolean; trust_detection?: boolean }
@@ -1497,13 +1498,17 @@ const boundRules = ref<string[]>([])
 
 // 绑定集/规则快照变化时回填编辑态（在飞行中的行跳过，避免覆盖用户刚选的值）。
 // 位置约束：immediate watch 在 setup 期即执行，必须晚于 boundRules/allRules 声明（TDZ）
+//
+// 稀疏持有（不再物化 seed）：只保留用户已暂存的编辑——读路径 overrideEditOf
+// 已做 `?? seed` 回退。原实现把库值 seed 物化进 edits，而物化时 allRules 可能
+// 仍是上一次快照（openDialog 先落地 bindings、/rules 异步后至）；新快照到达后
+// 旧库值被钉成「待保存」假标记，点击保存会把旧覆盖值写回服务器，静默回退
+// 他处会话/API 的变更。
 watch([boundRules, allRules], () => {
   const next: Record<string, StageOverrideEdit> = {}
   for (const cid of boundRules.value) {
-    // 历史（用户裁定 A：向导内延迟生效）：已暂存的选择优先保留——旧语义下
-    // 每次改选即时 PUT，allRules 刷新即等于库值故重置无害；延迟语义下重置会
-    // 静默丢弃用户尚未保存的选择（allRules 有轮询刷新）。
-    next[cid] = stageOverrideEdits.value[cid] ?? stageOverrideSeed(cid)
+    const existing = stageOverrideEdits.value[cid]
+    if (existing) next[cid] = existing
   }
   stageOverrideEdits.value = next
 }, { immediate: true })
@@ -2977,7 +2982,7 @@ async function openDialog(row?: PolicySummary) {
   void fetchIpLists(openSeq)
   // CRS 规则索引同口径：每次对话框打开取一次（同会话内步骤切换复用缓存），
   // 供规则组/排除目标的单条规则选项与预览明细共用（openSeq 过期守卫见 useCrsRuleIndex）
-  void ensureCrsRuleIndex(openSeq)
+  void ensureCrsRuleIndex(issueCrsIndexSession())
   // 共绑判定依赖 securityBindings（页面挂载时加载的快照）——对话框打开时轻量
   // 刷新一次，外部变更（他端会话/API）的绑定关系才能进入冲突告警口径；
   // 同样按 openSeq 丢弃过期返回
@@ -3284,11 +3289,11 @@ function handleDelete(row: PolicySummary) {
     .finally(() => { deletingPolicyId.value = null })
 }
 
-const goToCustomRulesPage = () => { window.open('/?page=security-rules&tab=custom', '_blank') }
-const goToBlockPagesPage = () => { window.open('/?page=security-block-pages', '_blank') }
+const goToCustomRulesPage = () => { window.open(pageUrl('security-rules', { [DEEP_LINK_PARAMS.securityRulesTab]: 'custom' }), '_blank') }
+const goToBlockPagesPage = () => { window.open(pageUrl('security-block-pages'), '_blank') }
 const openRuleInNewTab = (caddyId: string): void => {
   // 交接改走 URL query（rs 参数），Rules.vue onMounted 消费后清除。
-  window.open(`/?page=rules&rs=${encodeURIComponent(caddyId)}`, '_blank')
+  window.open(pageUrl('rules', { [DEEP_LINK_PARAMS.ruleSearch]: caddyId }), '_blank')
 }
 
 // 地域树加载失败显性化——不再静默清空（保留已加载/已选值可见可
@@ -3314,10 +3319,10 @@ onMounted(async () => {
   // 安全事件页「查看策略」交接改走 URL query（sp=策略 ID / sp-search=名称
   // 关键词），消费后 replaceState 清除——localStorage 通道在多标签/隐私模式下错乱。
   const query = new URLSearchParams(window.location.search)
-  const search = query.get('sp-search')
+  const search = query.get(DEEP_LINK_PARAMS.policySearch)
   if (search) policySearch.value = search
-  const focusId = Number(query.get('sp') || 0)
-  if (search || query.has('sp')) window.history.replaceState(null, '', window.location.pathname)
+  const focusId = Number(query.get(DEEP_LINK_PARAMS.policyId) || 0)
+  if (search || query.has(DEEP_LINK_PARAMS.policyId)) window.history.replaceState(null, '', window.location.pathname)
   const loaded = await fetchData()
   if (search && loaded) {
     const query = search.trim().toLowerCase()

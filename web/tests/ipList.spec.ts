@@ -8,8 +8,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { canSaveIpList, needsEmptyListConfirm } from '../src/utils/ipListSaveGuard.ts'
-import { formatIpListEntryLine, parseIpListEntryLine } from '../src/utils/ipListCsv.ts'
+import { IP_LIST_MAX_ENTRIES, canSaveIpList, needsEmptyListConfirm } from '../src/utils/ipListSaveGuard.ts'
+import { formatIpListEntryLine, ipListRemarkMaxLength, parseIpListEntryLine } from '../src/utils/ipListCsv.ts'
 // 注入本测试自己的正则会让「IPv6 CIDR」被文档化成
 // 非法值，与生产注入的 isValidCidr（SecurityRules.vue CSV 导入）语义相反。
 import { isValidCidr } from '../src/utils/ruleValidation.ts'
@@ -18,9 +18,8 @@ import {
   invalidateSharedEntriesCache,
   parseIPList,
   sharedEntriesCache,
-  writeSharedEntries,
 } from '../src/utils/securityStages.ts'
-import { member, source } from './_helpers.ts'
+import { member, repoSource, source } from './_helpers.ts'
 
 test('IP 快捷处置：信任命中只全扫一次，GeoIP 区域只解析一次', () => {
   const src = source('src/views/security/IPLocationAction.vue')
@@ -146,8 +145,8 @@ test('D 共享条目缓存：缺失才拉、并发去重、失败可重试、inv
   calls.length = 0
   await ensureSharedEntries([1, 2, 9], loader)
   assert.deepEqual(calls, [9])
-  // 写回与失效通知
-  writeSharedEntries(3, ['10.0.0.3'])
+  // 写回与失效通知（缓存写入口已模块内化，测试直写缓存对象验证读取侧）
+  sharedEntriesCache[3] = ['10.0.0.3']
   assert.deepEqual(sharedEntriesCache[3], ['10.0.0.3'])
   invalidateSharedEntriesCache()
   calls.length = 0
@@ -214,4 +213,17 @@ test('D2 代际守卫：失效前发起的在途 loader 落地不得回填缓存
   await ensureSharedEntries([7], async () => ['10.0.0.7-new'])
   assert.deepEqual(sharedEntriesCache[7], ['10.0.0.7-new'])
   invalidateSharedEntriesCache()
+})
+
+test('名单条目上限/备注长度与后端 securityiplists.go 同源（跨栈钉）', () => {
+  // 上限此前在 SFC 硬编码两处（校验 + 文案），后端单一常量 ipListMaxEntries；
+  // 备注长度后端按 rune 计（len([]rune(...)) > 100），前端按 code point 计。
+  const go = repoSource('internal/handlers/securityiplists.go')
+  assert.ok(go.includes('ipListMaxEntries           = 2000'), '后端条目上限常量漂移')
+  assert.ok(go.includes('len([]rune('), '备注长度后端必须按 rune 计数（与前端 code point 一致）')
+  assert.equal(IP_LIST_MAX_ENTRIES, 2000)
+  assert.equal(ipListRemarkMaxLength, 100)
+  // SFC 不得再出现字面量 2000（双源会漂移）
+  const rules = source('src/views/security/SecurityRules.vue')
+  assert.doesNotMatch(rules, /\b2000\b/, 'SecurityRules 不得再硬编码 2000（统一走 IP_LIST_MAX_ENTRIES）')
 })

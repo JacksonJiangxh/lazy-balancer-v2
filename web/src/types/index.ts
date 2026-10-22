@@ -158,6 +158,64 @@ export interface CertJobsPage<TJob> {
   readonly page_size: number
 }
 
+// ── 证书任务视图类型唯一事实源 ──
+// 后端 certJobListItem 投影（internal/handlers/certjobs.go，列表/详情同源）。
+// 此前 CertJobs（全字段）/Rules（精简）/TaskMonitor（横幅行）三处各持一份
+// 局部声明，后端增/改字段时漏改处 TS 不报错、运行期静默降级。
+// 视图按需 Pick 子集（Rules 侧即 Pick<CertJobListItem, ...>）。
+
+/** 证书任务状态机（后端 db.certJobStatuses 全集）；
+ *  utils/certJobStatus 的标签/色调表按 Record<CertJobStatus, …> 编译期穷尽消费。 */
+export type CertJobStatus =
+  | 'queued'
+  | 'pending'
+  | 'processing'
+  | 'creating_account'
+  | 'creating_order'
+  | 'order_created'
+  | 'waiting_order_ready'
+  | 'order_ready'
+  | 'cleanup_dns'
+  | 'cleanup_warning'
+  | 'presenting_dns'
+  | 'waiting_propagation'
+  | 'dns_propagated'
+  | 'accepting_challenge'
+  | 'waiting_order_valid'
+  | 'order_valid'
+  | 'validating'
+  | 'validated'
+  | 'finalizing'
+  | 'finalized'
+  | 'downloading'
+  | 'downloaded'
+  | 'issued'
+  | 'failed'
+  | 'waiting_ca'
+  | 'disabled'
+
+export type CertJobCertificateStatus = 'expired' | 'expiring' | 'unknown' | 'valid'
+
+export interface CertJobListItem {
+  id: number
+  rule_id: string
+  domain: string
+  ca_provider_id?: number
+  ca_provider_name?: string
+  status: CertJobStatus
+  message: string
+  issuer?: string
+  days_remaining: number
+  certificate_status: CertJobCertificateStatus
+  renewal_attempts?: number
+  ca_available_after?: string | null
+  last_error_code?: string
+  expires_at?: string | null
+  created_at?: string
+  updated_at?: string | null
+  retry_cooldown_seconds: number | null
+}
+
 export type ClusterNodeMode = 'master' | 'slave'
 
 export type ClusterNodeStatus = 'pending' | 'online' | 'offline'
@@ -254,7 +312,8 @@ export interface ClusterSyncResult {
 /**
  * GET /config 响应（前端消费字段子集，单一事实源）
  * 与后端 models.GlobalConfig 的 json 契约逐字段对齐；集群专属字段
- * （is_master/master_url/sync_interval 等）与敏感字段（dns_credentials）不在此面。
+ * （is_master/master_url/sync_interval 等）与敏感字段（dns_credentials）不在此面——
+ * is_master 的 /config 消费投影见 stores/auth.ts 的 ConfigProjection。
  */
 export interface GlobalConfigData {
   log_level: string

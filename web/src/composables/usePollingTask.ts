@@ -70,8 +70,15 @@ export const usePollingTask = (
         if (inFlight === drainPromise) inFlight = null
       })
       inFlight = drainPromise
+      return inFlight
     }
-    return inFlight
+    // drain 末次 while 判空返回与 .finally 清 inFlight 之间存在微任务窗口：
+    // 此刻 run() 置位 pending 却已无 drain 消费，「立即刷新」要等到下个定时器
+    // tick。链到在途 drain 之后补跑——每轮只前进一步（pending 被 drain 消费后
+    // 即停），不会递归爆栈。
+    return inFlight.then(async () => {
+      if (pending) await run()
+    })
   }
 
   // 后台标签页暂停定时轮询（手动 run() 不受影响）；回到可见时恢复定时器并立即刷新补齐数据。

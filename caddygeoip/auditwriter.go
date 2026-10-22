@@ -860,6 +860,9 @@ const auditSnapshotDroppedHeadersKey = "_lb_dropped_headers"
 // snapshotAuditHeaders 深拷贝请求/响应头并施加 64KiB 序列化上限（有界口径与
 // part C/E 一致）：先剥离客户端伪造的丢弃计数键，再按序列化体积降序丢条目
 // 直至落入上限，丢弃数写入合成键（摄取落库侧会把该计数并入自身裁剪计数）。
+// 尺寸估算用 jsonStringEscapedLen 精确计数（与 json.Marshal 逐字节一致，
+// 零分配字节扫描）——请求路径不再为每个 header key/value 付出一次
+// json.Marshal 的编码与分配。
 func snapshotAuditHeaders(hs map[string][]string) map[string][]string {
 	if hs == nil {
 		return nil
@@ -877,12 +880,18 @@ func snapshotAuditHeaders(hs map[string][]string) map[string][]string {
 		}
 		vv := append([]string(nil), v...)
 		out[k] = vv
-		kb, kerr := json.Marshal(k)
-		vb, verr := json.Marshal(vv)
-		if kerr != nil || verr != nil {
-			continue
+		// "key":["v1","v2"] 的精确序列化字节数 + 冒号/逗号分隔。
+		size := jsonStringEscapedLen(k) + 3 // "key":
+		if len(vv) == 0 {
+			size += 2 // []
+		} else {
+			size += 2 // 两侧 []
+			for _, s := range vv {
+				size += jsonStringEscapedLen(s) + 2 // "v"
+			}
+			size += len(vv) - 1 // 值间逗号
 		}
-		size := len(kb) + len(vb) + 2 // "key":value + 冒号/逗号分隔
+		size++ // 条目间逗号
 		keys = append(keys, keySize{key: k, size: size})
 		total += size
 	}
@@ -911,6 +920,41 @@ func snapshotAuditHeaders(hs map[string][]string) map[string][]string {
 	}
 	out[auditSnapshotDroppedHeadersKey] = []string{strconv.Itoa(dropped)}
 	return out
+}
+
+// jsonStringEscapedLen 返回 s 经 encoding/json 字符串编码后的精确字节数
+// （不含两侧引号），与 json.Marshal 的转义规则逐一对齐：引号/反斜杠与
+// \b\f\n\r\t 双字节短转义，其余控制字符与 HTML 安全字符 <>& 按 \u00XX
+// 六字节，U+2028/U+2029 按 \u202X 六字节，非法 UTF-8 字节替换为
+// U+FFFD（3 字节）。等值性由随机串对拍测试钉住；纯字节扫描零分配。
+func jsonStringEscapedLen(s string) int {
+	n := 0
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c < utf8.RuneSelf {
+			i++
+			switch {
+			case c == '"' || c == '\\' || c == '\b' || c == '\f' || c == '\n' || c == '\r' || c == '\t':
+				n += 2
+			case c == '<' || c == '>' || c == '&' || c < 0x20:
+				n += 6
+			default:
+				n++
+			}
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		i += size
+		switch {
+		case r == utf8.RuneError && size == 1:
+			n += 3 // 非法 UTF-8 字节 → 替换为 U+FFFD
+		case r == '\u2028' || r == '\u2029':
+			n += 6
+		default:
+			n += size
+		}
+	}
+	return n
 }
 
 // snapshotAuditLog 把 live AuditLog 拷贝为自持快照。接口 nil 检查穿透 typed-nil
@@ -1086,6 +1130,11 @@ type auditPipeline struct {
 	// queueBytes 是队列驻留字节估算（enqueue 占额、drain 消费扣减、丢弃
 	// 回滚）——auditQueueByteBudget 的记账源。
 	queueBytes atomic.Int64
+	// pending 是「已准入但尚未处理完」的条目计数：enqueue 准入时递增、
+	// drain 处理完递减。准入先于入队/等待，因此 pending==0 蕴含「队列为空
+	// 且无在途处理」——收尾刷盘（flushQuiesced）据此判定已入队行全部落盘，
+	// 不存在「已出队未计数」的判定窗口。
+	pending atomic.Int64
 	// ioErrors 是落盘/格式化错误累计计数（写盘/刷盘/重开/格式化/关闭）：
 	// 与 dropped 一起由 drain 低频写入侧车文件，供根服务健康位消费。
 	ioErrors atomic.Uint64
@@ -1304,39 +1353,42 @@ func estimateAuditSnapshotBytes(s *auditSnapshot) int64 {
 
 // enqueue 有界入队：空位直接入队；队列满时最多等待 auditEnqueueTimeout，
 // 超时丢弃该条、累计 dropped 并按分钟节流告警——请求路径不再被 drain 沉陷
-// 无限期拖住。queue 创建后只读且永不关闭（进程级单例，见
+// 无限期拖住。所有路径均为 best-effort（入队或计数丢弃），无失败返回值。
+// queue 创建后只读且永不关闭（进程级单例，见
 // acquireAuditPipeline），因此发送无需锁、也不存在竞态。
 //
 // 字节预算（auditQueueByteBudget/auditItemMaxBytes）先于容量等待判定：
 // 占额成功才进入入队/等待，超预算或超单条上限立即丢弃——恒压下在途
 // 等待者同样持有快照，字节占额把「队列+等待中」的总驻留一并约束。
 // 占额先加后验（超预算回滚），并发瞬时过冲有界于同窗口入队者×单条上限。
-func (p *auditPipeline) enqueue(item lbAuditItem) error {
+func (p *auditPipeline) enqueue(item lbAuditItem) {
 	size := estimateAuditSnapshotBytes(item.snap)
 	if size > auditItemMaxBytes {
 		p.reportDropped("item exceeds per-item size cap")
-		return nil
+		return
 	}
 	item.bytes = size
 	if p.queueBytes.Add(size) > auditQueueByteBudget {
 		p.queueBytes.Add(-size)
 		p.reportDropped("byte budget exceeded")
-		return nil
+		return
 	}
+	// 准入即计（先于实际入队）：收尾刷盘以 pending==0 判定排空，
+	// 计数先于投递使判定不含「已准入未入队」的漏窗。
+	p.pending.Add(1)
 	select {
 	case p.queue <- item:
-		return nil
+		return
 	default:
 	}
 	timer := time.NewTimer(auditEnqueueTimeout)
 	defer timer.Stop()
 	select {
 	case p.queue <- item:
-		return nil
 	case <-timer.C:
+		p.pending.Add(-1)
 		p.queueBytes.Add(-size)
 		p.reportDropped("queue full")
-		return nil
 	}
 }
 
@@ -1379,6 +1431,7 @@ func (p *auditPipeline) drain() {
 			}
 			p.queueBytes.Add(-item.bytes)
 			p.processSafely(item)
+			p.pending.Add(-1)
 		case <-ticker.C:
 			p.flushPendingSafely()
 			p.writeWriterStatsIfDue(time.Now())
@@ -1507,8 +1560,30 @@ func (p *auditPipeline) flush() {
 	p.ioMu.Unlock()
 }
 
+// auditShutdownDrainWait 收尾刷盘等待 drain 排空的上限：已入队未处理的行
+// 给有界窗口完成处理（格式化含计时等待 auditTimingWaitLimit），超时仍刷
+// 已落 bufio 的部分——尾部完整性是 best-effort，但进程退出/reload 不再
+// 无条件丢失全部在队行。
+const auditShutdownDrainWait = 3 * time.Second
+
+// flushQuiesced 限时等待「已准入条目全部处理完」后刷盘（pending==0 蕴含
+// 队列空 + 无在途处理）。drain 是恒活的进程级单例消费者，等待有界
+// （auditShutdownDrainWait）：reload 期每个实例的 Cleanup 只有首个遇到
+// 非空队列的调用付出等待，其后均为已排空快进。
+func (p *auditPipeline) flushQuiesced() {
+	deadline := time.Now().Add(auditShutdownDrainWait)
+	for time.Now().Before(deadline) {
+		if p.pending.Load() == 0 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	p.flush()
+}
+
 // FlushAuditPipelines 冲刷全部存活管线；Caddy 模块 Cleanup（reload/优雅停机）
-// 调用，弥补上游从不调用 AuditLogWriter.Close 导致的尾部丢失。
+// 调用，弥补上游从不调用 AuditLogWriter.Close 导致的尾部丢失——先限时等
+// drain 排空已入队行（auditShutdownDrainWait），再刷 bufio。
 // 只刷盘不关闭：管线是进程级单例，fd/drain 的生命周期与进程一致。
 func FlushAuditPipelines() {
 	auditPipelinesMu.Lock()
@@ -1518,7 +1593,7 @@ func FlushAuditPipelines() {
 	}
 	auditPipelinesMu.Unlock()
 	for _, p := range pipelines {
-		p.flush()
+		p.flushQuiesced()
 	}
 }
 
@@ -1572,15 +1647,19 @@ func (w *lbAuditWriter) Write(al plugintypes.AuditLog) error {
 	if al.Transaction() != nil && al.Transaction().HasRequest() {
 		tid = securityTimingIDFromHeaders(al.Transaction().Request().Headers())
 	}
-	return w.pipeline.enqueue(lbAuditItem{snap: snapshotAuditLog(al), formatter: w.formatter, tid: tid})
+	// 入队全路径 best-effort（入队或计数丢弃），error 恒 nil——返回值仅
+	// 满足 plugintypes.AuditLogWriter 接口签名。
+	w.pipeline.enqueue(lbAuditItem{snap: snapshotAuditLog(al), formatter: w.formatter, tid: tid})
+	return nil
 }
 
 // Close 满足 plugintypes.AuditLogWriter 接口（coraza v3.8.1 实际从不调用它）。
 // 只刷盘、不拆管线：管线是进程级单例，拆除会让写侧失去恒活的 drain（见
-// acquireAuditPipeline）；真被上游调用时此处的语义是「尽力把已入队行刷出」。
+// acquireAuditPipeline）；真被上游调用时此处的语义是「限时等 drain 排空后
+// 尽力把已入队行刷出」。
 func (w *lbAuditWriter) Close() error {
 	if w.pipeline != nil {
-		w.pipeline.flush()
+		w.pipeline.flushQuiesced()
 	}
 	return nil
 }

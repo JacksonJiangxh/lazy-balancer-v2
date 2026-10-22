@@ -107,14 +107,15 @@ func TestReadFastFile_rejectsTrailingGarbageAndUnknownFlags(t *testing.T) {
 		t.Fatal("尾部多余字节必须拒绝（长度不精确=格式误读）")
 	}
 
-	// 未知 flags 位（header[12:16]）
+	// 未知 flags 位（header[12:16]）：bit0 是已定义的 crc32c 校验和位，
+	// 其余位未定义——置 bit1（值 2）必须拒绝（未知特性位不得静默忽略）。
 	mutated := append([]byte{}, raw...)
-	mutated[15] = 1
+	mutated[15] = 2
 	if err := os.WriteFile(badPath, mutated, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := ReadFastFile(badPath); err == nil {
-		t.Fatal("非零 flags 必须拒绝（未知特性位不得静默忽略）")
+		t.Fatal("未定义 flags 位必须拒绝（未知特性位不得静默忽略）")
 	}
 }
 

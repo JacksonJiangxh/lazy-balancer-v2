@@ -288,6 +288,7 @@ import { request } from '@/utils/api'
 import { useAuthStore } from '@/stores/auth'
 import IPLocationAction from '@/views/security/IPLocationAction.vue'
 import { formatDate } from '@/utils/date'
+import { pageUrl } from '@/utils/deepLink'
 import { libraryStatusLabel, libraryStatusTagType, summarizeLibrarySources, type LibrarySourceRow } from '@/utils/securityLibraries'
 import '@/utils/echarts' // 统一注册（副作用，全站单点）
 import VChart from 'vue-echarts'
@@ -389,7 +390,7 @@ const fetchBlockedEvents = async () => {
   }
 }
 
-const goToEvents = () => { window.open('/?page=security-events', '_blank') }
+const goToEvents = () => { window.open(pageUrl('security-events'), '_blank') }
 
 const rateLimitBlocks = ref<RateLimitBlocks>({ total: 0, hosts: [] })
 const rateLimitError = ref(false)

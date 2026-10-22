@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -317,5 +319,84 @@ func TestLoadAndResolvePrefixes_contract(t *testing.T) {
 	}
 	if _, err := LoadPrefixesFresh(path); err == nil {
 		t.Fatal("fresh 路径坏行必须报错（构建期 fail-closed）")
+	}
+}
+
+// fakeFileStat 实现 os.FileInfo（读后复核谓词的单测替身）。
+type fakeFileStat struct {
+	size int64
+	mod  time.Time
+}
+
+func (f fakeFileStat) Name() string       { return "iplist" }
+func (f fakeFileStat) Size() int64        { return f.size }
+func (f fakeFileStat) Mode() os.FileMode  { return 0o644 }
+func (f fakeFileStat) ModTime() time.Time { return f.mod }
+func (f fakeFileStat) IsDir() bool        { return false }
+func (f fakeFileStat) Sys() any           { return nil }
+
+// 读后复核必须覆盖同尺寸原位改写：size 不变而 mtime 变化同样是「读取期间
+// 被改写」——只比 size 会把混合字节当完整代际缓存（半新半旧的拒绝面）。
+func TestIPListGenerationChanged_detectsSameSizeRewrite(t *testing.T) {
+	base := time.Unix(1_700_000_000, 0)
+	before := fakeFileStat{size: 100, mod: base}
+	if ipListGenerationChanged(before, fakeFileStat{size: 100, mod: base}, nil) {
+		t.Fatal("同形态不得判为改写")
+	}
+	if !ipListGenerationChanged(before, fakeFileStat{size: 100, mod: base.Add(time.Millisecond)}, nil) {
+		t.Fatal("同尺寸 mtime 变化必须判为改写")
+	}
+	if !ipListGenerationChanged(before, fakeFileStat{size: 101, mod: base}, nil) {
+		t.Fatal("size 变化必须判为改写")
+	}
+	if !ipListGenerationChanged(before, nil, os.ErrNotExist) {
+		t.Fatal("读后 stat 失败必须判为改写")
+	}
+}
+
+// 锁表不得随历史路径永驻：最后一个使用者释放后条目退役——否则 u-*/p<id>-*
+// 投影按规则身份命名，删除规则后锁表随历史规则数量单调增长。
+func TestIPListLoadLocks_retiredAfterRelease(t *testing.T) {
+	const path = "/app/waf/locks-retire-probe.iplist"
+	unlock := lockIPListLoad(path)
+	if _, ok := ipListLoadLocks.Load(path); !ok {
+		unlock()
+		t.Fatal("持锁期间锁表必须有条目")
+	}
+	unlock()
+	if _, ok := ipListLoadLocks.Load(path); ok {
+		t.Fatal("最后一个使用者释放后锁表条目必须退役")
+	}
+	// 退役后复取用仍正常工作并再次回收（串行化契约不变）。
+	unlock = lockIPListLoad(path)
+	unlock()
+	if _, ok := ipListLoadLocks.Load(path); ok {
+		t.Fatal("退役后复取用仍须回收")
+	}
+}
+
+// 取用/退役并发不得产生双锁（两把锁并发解析同一文件）——互斥区内同时在
+// 场者必须恒为 1。
+func TestIPListLoadLocks_concurrentAcquireRelease(t *testing.T) {
+	const path = "/app/waf/locks-concurrent-probe.iplist"
+	var inside atomic.Int64
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 200 {
+				unlock := lockIPListLoad(path)
+				if n := inside.Add(1); n != 1 {
+					t.Errorf("互斥区内同时 %d 个持有者（双锁并发解析）", n)
+				}
+				inside.Add(-1)
+				unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if _, ok := ipListLoadLocks.Load(path); ok {
+		t.Fatal("并发取用/释放后锁表必须清空")
 	}
 }

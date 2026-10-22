@@ -29,13 +29,6 @@ func TestSnapshotGenerationGuard(t *testing.T) {
 		}
 	}
 
-	if !SameSnapshotGeneration(SnapshotGeneration{base, 10, time.Time{}}, SnapshotGeneration{base, 10, base}) {
-		t.Error("同 mtime+size 必须判同代际（CommittedAt 不参与代际）")
-	}
-	if SameSnapshotGeneration(SnapshotGeneration{base, 10, time.Time{}}, SnapshotGeneration{base, 11, time.Time{}}) {
-		t.Error("size 不同不得判同代际")
-	}
-
 	// 失败降级守卫：成功快照在失败读取开始之后落定 → 不得被降级；
 	// 失败读取开始之后没有新成功（CommittedAt 更早/零值）→ 允许覆盖。
 	if !StaleFailureDowngrade(SnapshotGeneration{base, 10, base.Add(time.Second)}, base) {

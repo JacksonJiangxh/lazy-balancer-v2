@@ -98,6 +98,13 @@ const promptMfaCode = (): Promise<string | null> => {
   // 新一轮弹码意味着新验证码：作废旧刷新句柄，确认后的等待者各自重试原请求。
   mfaStepUpRefresh = null
   mfaPending = new Promise<string | null>((resolve) => {
+    // resolve 前同步清空 mfaPending——.finally 反应排在 .then 内 resolve 之后的
+    // 微任务，「已解析未清空」窗口里新到的 428 会共享到已消耗的验证码 Promise，
+    // 进而发起第二次同码 verify-step（后端按 mfa_last_timestep 拒重放并计失败）。
+    const settle = (value: string | null): void => {
+      mfaPending = null
+      resolve(value)
+    }
     // el-input-otp 自定义内容（替换原生 prompt 的普通 input）：值在 confirm 时从
     // otpCode 读取；填满 6 位自动触发 confirm（finish → handlers.confirm）。
     // message 函数在 MessageBox 渲染上下文中执行，otpCode 变更会驱动重渲染。
@@ -134,9 +141,8 @@ const promptMfaCode = (): Promise<string | null> => {
         done()
       },
     })
-      .then(() => resolve(normalizeMfaCodeInput(otpCode.value)))
-      .catch(() => resolve(null))
-      .finally(() => { mfaPending = null })
+      .then(() => settle(normalizeMfaCodeInput(otpCode.value)))
+      .catch(() => settle(null))
     // OTP 自动聚焦：MessageBox 的 autofocus 默认落在确认按钮，nextTick 后夺回给 OTP
     void nextTick(() => otpRef.value?.focus())
   })
@@ -227,6 +233,12 @@ service.interceptors.response.use(
       }
       // 业务码失败与 HTTP 失败统一错误类型：调用方按
       // instanceof ApiRequestError 判别（如 409/业务码分支）时不再漏判。
+      //
+      // 契约（跨栈，前端据此分类）：业务码失败分支携带的是 **HTTP status**，
+      // 因此后端必须保证「code≠0 时 HTTP 状态与业务码同值」（当前 apikeys/
+      // cluster_ticket/错误分支均如此）。未来若新增「HTTP 200 + code≠0」端点，
+      // 按 status===409 分类的调用方（如 useLibUpdateDialog）将静默绕过分类与
+      // 重试逻辑——此契约由 tests/apiErrorContract.spec.ts 钉住现状。
       return Promise.reject(new ApiRequestError(res.message || '请求失败', response.status))
     }
     return res

@@ -39,14 +39,38 @@ import (
 // AllowedPathPrefix 是算子参数的目录白名单（防目录穿越）。测试可改。
 var AllowedPathPrefix = "/app/waf/"
 
-// ipListLoadLocks 按路径串行化解析；条目数受投影文件数量约束（有界）。
-var ipListLoadLocks sync.Map // path -> *sync.Mutex
+// ipListLoadLocks 按路径串行化解析。条目在最后一个使用者释放后立即退役
+// （引用计数归零删除）——u-*/p<id>-* 投影按规则身份命名，删除规则后旧路径
+// 不再使用；永驻 sync.Map 会让锁表随历史规则/名单数量单调增长。
+var ipListLoadLocks sync.Map // path -> *ipListLoadLock
+
+// ipListLocksMu 保护锁表「取用（refs++）↔ 退役（refs==0 删除）」的原子性：
+// 只有在本互斥下才能确认无人在途，否则会出现「退役后新取用者拿到孤儿锁 +
+// 第三位取用者新建第二把锁」的双锁并发解析。锁表操作只在节流窗口过期后的
+// 冷路径上发生，不进入热路径。
+var ipListLocksMu sync.Mutex
+
+type ipListLoadLock struct {
+	mu   sync.Mutex
+	refs int
+}
 
 func lockIPListLoad(path string) func() {
-	value, _ := ipListLoadLocks.LoadOrStore(path, &sync.Mutex{})
-	mu := value.(*sync.Mutex)
-	mu.Lock()
-	return mu.Unlock
+	ipListLocksMu.Lock()
+	value, _ := ipListLoadLocks.LoadOrStore(path, &ipListLoadLock{})
+	l := value.(*ipListLoadLock)
+	l.refs++
+	ipListLocksMu.Unlock()
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		ipListLocksMu.Lock()
+		l.refs--
+		if l.refs == 0 {
+			ipListLoadLocks.CompareAndDelete(path, l)
+		}
+		ipListLocksMu.Unlock()
+	}
 }
 
 // MaxFileBytes / MaxEntries 是加载侧体积与条目的硬上限（防异常文件拖垮
@@ -263,6 +287,11 @@ func ResolvePrefixesNormalized(path string) ([]netip.Prefix, error) {
 // 变化重建。严格解析——任何不可解析行报错（不静默跳过，防名单被削弱）。
 // 失败时缓存存在则 fail-stale 返回旧集合（fresh=true 的构建期除外：
 // 构建期永远 fail-closed）。
+//
+// 已知边界：代际只认 (mtime,size) 形态。带外同形态重写（rsync -a /
+// touch -r 恢复原 mtime 且 size 不变）不会触发重建——旧集合继续生效直到
+// 下一次真实变化，安全方向偏保守（旧拒绝面不清空）。需要强制失效时用
+// EvictIPListCache：缓存条目删除后下一次解析必重建。
 func loadIPListFile(path string, fresh bool) (state *ipListFileState, err error) {
 	info, err := statIPListFile(path)
 	if err != nil {
@@ -361,6 +390,16 @@ func EvictIPListCache(paths ...string) int {
 	return evicted
 }
 
+// ipListGenerationChanged 判定同一 inode 的读前/读后 stat 形态是否变化
+// （size 或 mtime 任一变化，或读后 stat 失败）——同尺寸原位改写 size 不变，
+// 只有 mtime 能揭示「读取期间被改写」。
+func ipListGenerationChanged(before os.FileInfo, after os.FileInfo, statErr error) bool {
+	if statErr != nil || after == nil {
+		return true
+	}
+	return after.Size() != before.Size() || !after.ModTime().Equal(before.ModTime())
+}
+
 // parseIPListFile 读盘+严格解析+防御性归并（写入侧已聚合，加载侧再跑一次
 // 保证「排序+去重+不相交」检索不变式——二分正确性依赖不相交）。逐条目
 // **只解析一次**（此前「逐行校验解析 → AggregatePrefixes 再解析」
@@ -391,9 +430,11 @@ func parseIPListFile(path string) (*ipListFileState, error) {
 	if _, err := io.ReadFull(fd, raw); err != nil {
 		return nil, fmt.Errorf("IP 名单读取失败 %q: %w", path, err)
 	}
-	// 读后复核同一 inode：若被原位追加/截断（非 tmp+rename 的写入方式），
-	// 读到的只是某一瞬间的前缀，不能当作完整代际——本次放弃，下次复查重建。
-	if after, statErr := fd.Stat(); statErr != nil || after.Size() != info.Size() {
+	// 读后复核同一 inode：若被原位追加/截断/同尺寸原位改写（非 tmp+rename
+	// 的写入方式），读到的只是某一瞬间的前缀或混合字节，不能当作完整代际
+	// ——本次放弃，下次复查重建。只比 size 不够：同尺寸原位改写 size 不变，
+	// 必须同时复核 mtime。
+	if after, statErr := fd.Stat(); ipListGenerationChanged(info, after, statErr) {
 		return nil, fmt.Errorf("IP 名单 %q 在读取期间被改写，本次加载放弃", path)
 	}
 	// 容量预估：平均每条约 12 字节，封顶 MaxEntries+1（超限在追加处拦截）。

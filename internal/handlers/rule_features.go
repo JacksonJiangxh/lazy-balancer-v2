@@ -605,8 +605,10 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 			if upstream.Port < 1 || upstream.Port > 65535 {
 				return fmt.Errorf("第 %d 条路径规则的第 %d 个上游端口必须在 1-65535 之间", index+1, upstreamIndex+1)
 			}
-			if upstream.Weight < 0 {
-				return fmt.Errorf("第 %d 条路径规则的第 %d 个上游权重不能为负数", index+1, upstreamIndex+1)
+			// 与主池（handlers.go weight<1 响亮拒绝，0→1 静默归一已裁定废除）
+			// 同口径：0 虽被渲染层归一为 1，保存侧不得让 0 落库。
+			if upstream.Weight < 1 {
+				return fmt.Errorf("第 %d 条路径规则的第 %d 个上游权重必须为不小于 1 的整数", index+1, upstreamIndex+1)
 			}
 			if upstream.Protocol != "" && upstream.Protocol != "http" && upstream.Protocol != "https" {
 				return fmt.Errorf("第 %d 条路径规则的第 %d 个上游协议只能是 http 或 https", index+1, upstreamIndex+1)

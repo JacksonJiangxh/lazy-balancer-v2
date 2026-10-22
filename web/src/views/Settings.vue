@@ -68,7 +68,11 @@ import TaskMonitor from './settings/TaskMonitor.vue'
 
 const authStore = useAuthStore()
 
-const activeTab = ref<SettingsTabId>('basic')
+// 初值即按当前页键派生（setup 期 authStore 已就绪）——原恒 'basic' 等
+// onMounted 才纠正，从侧栏进 cluster/certificates/tasks/apikeys 时首帧错挂
+// BasicSettings+CaddyGlobalSettings（闪烁 + 发出 /system/info、/config、
+// /admin-tls、/security/ip-lists 等请求后随即卸载）。
+const activeTab = ref<SettingsTabId>(settingsTabOfPage(authStore.currentPage) ?? 'basic')
 
 // /config 契约单一事实源迁至 types/index.ts（GlobalConfigData）——
 // 两块设置卡各持互斥子集，这里按卡片分组做派生别名，不再复制字段清单。
@@ -256,11 +260,17 @@ const syncActiveTabFromPage = () => {
   activeTab.value = settingsTabOfPage(authStore.currentPage) ?? 'basic'
 }
 
-watch(() => authStore.currentPage, syncActiveTabFromPage)
+// 仅消费 settings/global 的分页才拉整包 /config（apikeys/tasks/cluster 不接
+// props，白拉 60+ 字段整包后丢弃）；切回 basic/certificates 且未加载时补拉。
+const tabConsumesConfig = (tab: SettingsTabId): boolean => tab === 'basic' || tab === 'certificates'
+
+watch(() => authStore.currentPage, () => {
+  syncActiveTabFromPage()
+  if (tabConsumesConfig(activeTab.value) && !configLoaded.value) void fetchSettings()
+})
 
 onMounted(() => {
-  syncActiveTabFromPage()
-  fetchSettings()
+  if (tabConsumesConfig(activeTab.value)) void fetchSettings()
 })
 </script>
 

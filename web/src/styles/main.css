@@ -152,7 +152,7 @@ body {
 .equal-height-row > .el-col > .el-card > .el-card__body { flex: 1 1 auto; }
 
 
-/* 设置卡内表单基础样式（各设置页共用；label 右对齐 120px 列） */
+/* 设置卡内表单基础样式（各设置页共用；仅垂直留白——label 宽度由消费方 label-width prop 给） */
 .settings-form { padding: 4px 0; }
 
 

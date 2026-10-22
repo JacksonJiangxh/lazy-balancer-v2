@@ -807,7 +807,9 @@ const fmtDuration = (ms?: number) => {
 .card-header { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
 .tm-category-filter { width: 150px; }
 .card-title { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; color: #111827; }
-.title-icon { font-size: 16px; color: #3b82f6; }
+/* 卡片/横幅标题图标 16px——不得写裸 .title-icon（会压小全局 20px 页头图标，
+   与 page-desc 缩进错位，同类事故见 SecurityOverview）；限定到本页容器内。 */
+.card-title .title-icon, .tm-cq-banner-title .title-icon { font-size: 16px; color: #3b82f6; }
 
 /* KPI 四卡 */
 .tm-kpis { margin-bottom: 0; }

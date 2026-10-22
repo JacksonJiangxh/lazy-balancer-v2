@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -419,6 +420,57 @@ func TestVerifyCrawlerIPRange_v4MappedAndZoneNormalized(t *testing.T) {
 	if verifyCrawlerIPRangeFromList("2408:4000::1%eth0", "so360spider") {
 		t.Fatal("带 zone 地址必须 fail-closed")
 	}
+}
+
+// 快照体积门与坏条目可见性：超限文件按不可用 fail-closed（不得整体读入
+// 内存）；坏 CIDR 逐条跳过但整体快照仍可用（不把单条损坏放大成整份豁免
+// 失效），坏条目数经日志计数告警。
+func TestCrawlerIPRangeSnapshot_sizeGateAndBadCIDRs(t *testing.T) {
+	oldFile := crawlerIPListFile
+	t.Cleanup(func() { crawlerIPListFile = oldFile })
+
+	t.Run("超限文件按不可用处理", func(t *testing.T) {
+		crawlerIPListFile = filepath.Join(t.TempDir(), "crawler-ip-lists.json")
+		resetCrawlerIPRangeCacheForTest()
+		t.Cleanup(resetCrawlerIPRangeCacheForTest)
+		// 合法 JSON 头部 + 填充到上限之上：若体积门缺失会被整体读入并解析，
+		// 本断言改为 fail-closed 空快照。
+		pad := strings.Repeat(" ", crawlerIPListMaxBytes)
+		payload := `{"so360spider":["42.236.8.0/21"]}` + pad
+		if err := os.WriteFile(crawlerIPListFile, []byte(payload), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		snap := loadCrawlerIPRangeSnapshot()
+		if snap.ok {
+			t.Fatal("超限快照必须按不可用处理（fail-closed）")
+		}
+		if len(snap.prefixes) != 0 {
+			t.Fatalf("超限文件不得产出豁免段: %v", snap.prefixes)
+		}
+		if verifyCrawlerIPRangeFromList("42.236.8.1", "so360spider") {
+			t.Fatal("超限快照下必须 fail-closed（段内地址也不得豁免）")
+		}
+	})
+
+	t.Run("坏CIDR跳过且快照仍可用", func(t *testing.T) {
+		crawlerIPListFile = filepath.Join(t.TempDir(), "crawler-ip-lists.json")
+		resetCrawlerIPRangeCacheForTest()
+		t.Cleanup(resetCrawlerIPRangeCacheForTest)
+		payload := `{"so360spider":["42.236.8.0/21","not-a-cidr","42.236.9.0/33"]}`
+		if err := os.WriteFile(crawlerIPListFile, []byte(payload), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		snap := loadCrawlerIPRangeSnapshot()
+		if !snap.ok {
+			t.Fatal("坏条目不得让整份快照降级为不可用")
+		}
+		if got := len(snap.prefixes["so360spider"]); got != 1 {
+			t.Fatalf("有效段=%d, want 1（坏条目逐条跳过）", got)
+		}
+		if !verifyCrawlerIPRangeFromList("42.236.8.1", "so360spider") {
+			t.Fatal("有效段必须仍可命中")
+		}
+	})
 }
 
 // 并发加载代际守卫——慢读者读到 rename 前的旧 inode，不得在新

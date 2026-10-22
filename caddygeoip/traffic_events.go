@@ -82,9 +82,10 @@ func trafficEventSnapshotWithGap(since uint64, limit int) ([]trafficEvent, uint6
 	defer trafficEventsMu.Unlock()
 	out := make([]trafficEvent, 0, limit)
 	// gap：消费者游标 before 最老保留序号 ⇒ 中间的记录已被环形缓冲覆盖。
-	// since=0（首屏）不算空洞——它本就只取最新窗口。
+	// since=0（首屏）不算空洞——它本就只取最新窗口。比较用减法而非
+	// since+1：since==MaxUint64 时 +1 回绕为 0 会误判出无意义的空洞。
 	var gapSkipped uint64
-	if since > 0 && len(trafficEvents) > 0 && since+1 < trafficEvents[0].Seq {
+	if since > 0 && len(trafficEvents) > 0 && since < trafficEvents[0].Seq && trafficEvents[0].Seq-since > 1 {
 		gapSkipped = trafficEvents[0].Seq - since - 1
 	}
 	// since=0 首次拉取只返回最近 limit 条，避免重放整个环形缓冲。

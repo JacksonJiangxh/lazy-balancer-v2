@@ -8,8 +8,8 @@ package caddygeoip
 //     请求到达时序列化当前快照（无常驻写者/无激活信号；页面异常关闭零残留）。
 //   - QPS 保险丝：单秒请求计数超过 fuseQPSPerSecond 时进入 1/N 抽样（N=8，
 //     每 N 个请求计 1 次×N 还原），翻秒且上一秒计数低于阈值 1/4 时回落 N=1。
-//     误差口径披露：抽样期估计量=真值±N/2（整秒口径无偏），瞬时分布有量化
-//     误差——大屏光流为密度示意，可接受。
+//     误差口径披露：抽样期估计量=真值±N（相位偏移 <N 的 floor 量化截断，
+//     整秒累计口径无偏）——大屏光流为密度示意，可接受。
 //   - 国名口径：计数/事件桶键经 geoipnames.NormalizeCountry 归一（xdb 中文
 //     异体如「美国」折叠为英文规范名；「中国」保留）——app 聚合端点按翻译
 //     后中文名重建 map（覆盖语义），异体分键会被丢计数；
@@ -137,6 +137,10 @@ func normalizeTrafficCountryKey(country string) string {
 	return geoipnames.NormalizeCountry(country)
 }
 
+// trafficNowUnix 秒级时钟测试缝——trafficRecord 的翻秒/保险丝判定经本函数
+// 取秒，测试冻结墙钟可消除「循环跨秒导致秒计数重累计」的假红。
+var trafficNowUnix = func() int64 { return time.Now().Unix() }
+
 // trafficRecord 记一次请求（country 非国家值=未解析/私网保留段——跳过；
 // 抽样期按 1/N 计数并 ×N 还原）。
 func trafficRecord(country string, attack bool) {
@@ -150,7 +154,7 @@ func trafficRecord(country string, attack bool) {
 	// 惰性翻秒 + 保险丝状态机（全量→1/8 抽样→全量，滞回防抖动）。
 	// 翻秒与自增是单个 CAS（打包秒戳+计数），并发 Add 不会被
 	// 随后清零的上一秒计数吞掉。
-	hits, prevHits, rolled := trafficBumpSecond(uint64(time.Now().Unix()))
+	hits, prevHits, rolled := trafficBumpSecond(uint64(trafficNowUnix()))
 	if rolled && prevHits < fuseFallbackPerSecond {
 		trafficSampleN.Store(1)
 	}
@@ -214,8 +218,9 @@ func trafficSnapshotJSON() []byte {
 // 处理（非法 UTF-8 替换为 U+FFFD，控制字节按 \u 转义）——单次快照至多
 // trafficCountryLimit 个键，序列化开销可忽略。
 func appendJSONString(dst []byte, s string) []byte {
-	quoted, err := json.Marshal(s)
-	if err != nil || len(quoted) < 2 {
+	// json.Marshal 对 string 类型恒不返回 error，只保留长度防御。
+	quoted, _ := json.Marshal(s)
+	if len(quoted) < 2 {
 		return dst
 	}
 	return append(dst, quoted[1:len(quoted)-1]...)

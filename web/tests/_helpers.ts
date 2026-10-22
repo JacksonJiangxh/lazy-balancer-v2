@@ -4,17 +4,35 @@
 // 检查都是硬失败。
 //
 // 非 spec 文件（不以 .spec.ts 结尾），node --test tests/*.spec.ts 不会把它当用例。
+//
+// 导入风格约束（隐性 → 显式）：被 node --test 直接 import 的 src 模块链必须
+// 使用相对路径 + .ts 扩展名（如 './x.ts'）——node 直跑 TS 无打包器别名/扩展名
+// 解析（tsconfig allowImportingTsExtensions 仅为类型层面放行）；仅经打包器
+// 消费的模块保持无扩展名风格。
 
 import { readFileSync } from 'node:fs'
 import { registerHooks } from 'node:module'
 
 const webRoot = new URL('../', import.meta.url)
 
+// 源码读取缓存：同一文件（SecurityPolicies.vue / Rules.vue 等）被跨 spec 反复
+// 读取数十次；测试只读源文件、无「读取前/后对比」用法，缓存安全。若未来出现
+// 「写文件后重读」的用例，须绕开本 helper。
+const sourceCache = new Map<string, string>()
+const readCached = (url: URL): string => {
+  const key = url.href
+  const hit = sourceCache.get(key)
+  if (hit !== undefined) return hit
+  const text = readFileSync(url, 'utf8')
+  sourceCache.set(key, text)
+  return text
+}
+
 /** 读取相对 `web/` 的源文件（如 `'src/views/Rules.vue'`）。 */
-export const source = (relative: string): string => readFileSync(new URL(relative, webRoot), 'utf8')
+export const source = (relative: string): string => readCached(new URL(relative, webRoot))
 
 /** 读取相对仓库根的源文件（跨栈对表读 Go 声明用，如 `'internal/db/db.go'`）。 */
-export const repoSource = (relative: string): string => readFileSync(new URL(`../${relative}`, webRoot), 'utf8')
+export const repoSource = (relative: string): string => readCached(new URL(`../${relative}`, webRoot))
 
 /**
  * 从 startMarker 切到其后的 endMarker（endMarker 必须在 startMarker 之后）。
@@ -29,13 +47,32 @@ export const section = (text: string, startMarker: string, endMarker: string): s
 }
 
 /**
- * 去掉注释（`//`、`/* *\/`、Vue 模板 `<!-- -->`），保留字符串字面量。
+ * 去掉注释（`//`、`/* *\/`、Vue 模板 `<!-- -->`），保留字符串字面量与正则字面量。
  * 死代码扫描必须先剥注释：注释里提到退役符号不构成生产消费，否则维护者被迫
  * 改写历史说明或放宽正则。
+ *
+ * 正则字面量（`/…/`）必须识别——否则 `/\/\//` 之后的真实引用会被当行注释吞掉
+ * （假绿），正则里的 `/*` 会吞掉大段代码（假红）。判定规则（词法启发）：
+ * `/` 前一非空白字符是标识符/数字/`)`/`]` 时按除法处理，否则进入正则态；
+ * 正则态内遇未转义 `/` 或换行退出（字符类 `[...]` 内的 `/` 不退出）。
  */
 export const stripComments = (text: string): string => {
   let out = ''
   let i = 0
+  // 前一输出字符（跳过空白）+ 当前累积的标识符词——正则/除法歧义判定用：
+  // `/` 前是标识符/数字/`)`/`]` 通常按除法，但标识符为关键字
+  //（return/typeof/case 等不能作操作数）时仍按正则。
+  let prevSignificant = ''
+  let prevWord = ''
+  const REGEX_PRECEDING_KEYWORDS: Record<string, true> = {
+    return: true, typeof: true, case: true, in: true, of: true, new: true,
+    delete: true, void: true, instanceof: true, yield: true, await: true, else: true, do: true,
+  }
+  const regexAllowedAfter = (): boolean => {
+    if (prevSignificant === '') return true
+    if (/[\w]/.test(prevSignificant)) return REGEX_PRECEDING_KEYWORDS[prevWord] === true
+    return !/[)\]]/.test(prevSignificant)
+  }
   while (i < text.length) {
     const ch = text[i]
     const next = text[i + 1]
@@ -69,9 +106,43 @@ export const stripComments = (text: string): string => {
         i++
         if (c === quote) break
       }
+      prevSignificant = quote
+      prevWord = ''
+      continue
+    }
+    if (ch === '/' && regexAllowedAfter()) {
+      // 正则字面量：原样保留到未转义的结束 `/`（字符类内的 / 不算结束）
+      out += ch
+      i++
+      let inClass = false
+      while (i < text.length) {
+        const c = text[i]
+        out += c
+        i++
+        if (c === '\\' && i < text.length) {
+          out += text[i]
+          i++
+          continue
+        }
+        if (c === '[') inClass = true
+        else if (c === ']') inClass = false
+        else if (c === '/' && !inClass) break
+        else if (c === '\n') break
+      }
+      prevSignificant = '/'
+      prevWord = ''
       continue
     }
     out += ch
+    if (/\s/.test(ch)) {
+      // 空白不改词/字符状态
+    } else if (/[\w]/.test(ch)) {
+      prevWord = /[\w]/.test(prevSignificant) ? prevWord + ch : ch
+      prevSignificant = ch
+    } else {
+      prevSignificant = ch
+      prevWord = ''
+    }
     i++
   }
   return out

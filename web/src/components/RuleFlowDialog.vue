@@ -134,6 +134,7 @@
               </div>
               <el-collapse-transition>
                 <div v-if="expandedPolicyKey === `0:${group.key}`" class="flow-policy-details">
+                  <div v-if="detailFailedSources.includes('引用名单条目')" class="flow-detail-line">引用名单条目加载失败，以下明细可能不完整（可收起重开重试）</div>
                   <template v-if="group.details?.trustEntries">
                     <div class="flow-detail-block-title">信任名单（{{ group.details.trustEntries.length }} 条{{ group.details.trustEntries.length > 200 ? '，仅显示前 200 条' : '' }}）</div>
                     <div v-for="entry in group.details.trustEntries.slice(0, 200)" :key="`trust:${entry.value}`" class="flow-detail-entry">
@@ -238,6 +239,7 @@
                         </template>
                       </template>
                       <div v-else class="flow-detail-line">该阶段此策略无更多明细</div>
+                      <div v-if="detailFailedSources.length > 0" class="flow-detail-line">部分明细加载失败（{{ detailFailedSources.join('、') }}），可收起重开重试</div>
                     </div>
                   </el-collapse-transition>
                 </div>
@@ -436,6 +438,8 @@ const activeNode = ref('access')
 // ── 明细懒加载（决策 C：现有只读端点前端拼装）——阶段面板首次选中时拉取三源并附着 ──
 const detailLoading = ref(false)
 const detailsAttached = ref(false)
+// 每源失败位：部分失败不得被读成「该策略确无明细」——面板内显式降级说明。
+const detailFailedSources = ref<string[]>([])
 const fullPolicies = ref<Map<number, SecurityStagePolicyDetail>>(new Map())
 // 引用名单条目按需缓存（2026-09-24：列表载荷不再内联 entries——大名单
 // 460KB/行；明细展开时按引用 id 拉 GET /security/ip-lists/:id）
@@ -506,6 +510,7 @@ const groupHasDetails = (group: StagePolicyGroup): boolean => {
 const ensureDetails = async (): Promise<void> => {
   if (detailsAttached.value || detailLoading.value) return
   const seq = ++detailsSeq
+  detailFailedSources.value = []
   detailLoading.value = true
   try {
     const caddyId = props.target?.caddyId
@@ -520,11 +525,14 @@ const ensureDetails = async (): Promise<void> => {
     // 续体落地前校验会话序号：弹框已切换（onDialogOpen ++）或更新一次拉取已发起
     // 时丢弃过期结果，避免旧会话数据附着或抢置 detailsAttached
     if (seq !== detailsSeq) return
+    const failedSources: string[] = []
     if (policyRes.status === 'fulfilled') {
       fullPolicies.value = new Map((policyRes.value.data ?? []).map((p) => [p.id, p]))
-    }
+    } else failedSources.push('策略明细')
     if (customRes.status === 'fulfilled') customRules.value = customRes.value.data ?? []
+    else failedSources.push('自定义规则')
     if (crsRes.status === 'fulfilled') crsFiles.value = crsRes.value.data?.rules ?? []
+    else failedSources.push('CRS 规则组')
     // 引用名单条目：仅信任名单引用需条目值（阶段 0 明细逐条展示）；
     // ACL 明细为列表级汇总（名称+entry_count），不拉条目
     const refIds = new Set<number>()
@@ -542,10 +550,14 @@ const ensureDetails = async (): Promise<void> => {
       )
       if (seq !== detailsSeq) return
       const cache = new Map(ipListEntryCache.value)
+      let entriesFailed = false
       listRes.forEach((r, i) => {
         if (r.status === 'fulfilled' && r.value.data) cache.set(missing[i], r.value.data.entries ?? [])
+        else if (r.status === 'rejected') entriesFailed = true
       })
       ipListEntryCache.value = cache
+      // 名单条目失败不得静默——阶段 0 信任预览/明细会因此缺条目
+      if (entriesFailed) failedSources.push('引用名单条目')
     }
     // 三端点全部 rejected 时不置 detailsAttached——原无条件置位会把弹框
     // 锁死在「明细按钮缺失且不可重试」且 silent 请求零反馈；保持可重试（下次点击
@@ -554,6 +566,9 @@ const ensureDetails = async (): Promise<void> => {
       ElMessage.warning('明细数据加载失败，可重试')
       return
     }
+    detailFailedSources.value = failedSources
+    // 部分失败：可用数据降级展示但显式提示——否则故障被读成「确无明细」业务结论
+    if (failedSources.length > 0) ElMessage.warning('部分明细加载失败（可收起重开重试）')
     detailsAttached.value = true
   } finally {
     // 失配会话不回落 detailLoading——现行会话（重置区或新一次拉取）自行管理该锁
@@ -703,6 +718,7 @@ const onDialogOpen = (): void => {
   detailsSeq++
   detailLoading.value = false
   detailsAttached.value = false
+  detailFailedSources.value = []
   fullPolicies.value = new Map()
   customRules.value = []
   crsFiles.value = []

@@ -8,6 +8,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { detectionModeExplains, triggerStageFamily, type TriggerStageFamily } from '../src/utils/securityStages.ts'
+import { repoSource, section } from './_helpers.ts'
 
 const cases: ReadonlyArray<readonly [string, TriggerStageFamily]> = [
   // 空 / 请求体异常 / 威胁情报 / 信任
@@ -84,4 +85,32 @@ test('检测模式归因：仅 WAF 族（CRS/自定义含 body 目标）', () =>
   for (const kind of ['acl', 'geo', 'crawler', 'threat', 'trust', 'body', 'other', '']) {
     assert.equal(detectionModeExplains(kind), false, kind)
   }
+})
+
+test('段界与 ID 集合跨栈对表（后端段界/分支调整必须红）', () => {
+  // 段界单一事实源 = services/security.go 段基址常量；attackFamilyClassOf 是
+  // if-链无法纯文本全量对表——钉住段界常量 + 关键形态分支锚（msg 关键词分支
+  // 为 Go 侧表达力超集，人工同步，豁免机械钉）。
+  const svc = repoSource('internal/services/security.go')
+  for (const anchor of [
+    'geoipPrecheckRuleBase     = 800000',
+    'geoipCrawlerRuleBase      = 810000',
+    'geoipCrawlerSpoofRuleBase = 850000',
+  ]) {
+    assert.ok(svc.includes(anchor), `段界常量漂移：${anchor}`)
+  }
+  const handler = repoSource('internal/handlers/security.go')
+  const fn = section(handler, 'func attackFamilyClassOf(', '\n}')
+  for (const anchor of [
+    'len(ruleTriggered) == 5',
+    "ruleTriggered[0] >= '1' && ruleTriggered[0] <= '7'",
+    'len(ruleTriggered) >= 7',
+    'ruleTriggered == "11"',
+    'ruleTriggered == "14"',
+    'ruleTriggered == "3" || ruleTriggered == "12"',
+    'ruleTriggered == "2" || ruleTriggered == "4" || ruleTriggered == "5" || ruleTriggered == "7"',
+  ]) {
+    assert.ok(fn.includes(anchor), `attackFamilyClassOf 分支锚漂移：${anchor}`)
+  }
+  // 「8」前端归 ipAcl vs 后端归 GeoIP——有意设计例外（见上方用例注释），不钉。
 })

@@ -424,7 +424,7 @@
               </div>
             </div>
             <input ref="importEntriesInput" type="file" accept=".txt,.csv" class="entries-import-input" @change="onImportEntriesFileChange" />
-            <div class="form-tip-line">每条支持单 IP 或 CIDR（如 10.0.0.1、2001:db8::/32）；每个列表最多 2000 条，全站列表总数上限 200 个，格式错误的行以红色标出；导入支持 .txt/.csv（每行一条：IP/CIDR + 可选备注，逗号或空白分隔）</div>
+            <div class="form-tip-line">每条支持单 IP 或 CIDR（如 10.0.0.1、2001:db8::/32）；每个列表最多 {{ IP_LIST_MAX_ENTRIES }} 条，全站列表总数上限 200 个，格式错误的行以红色标出；导入支持 .txt/.csv（每行一条：IP/CIDR + 可选备注，逗号或空白分隔）</div>
           </div>
         </el-form-item>
       </el-form>
@@ -638,6 +638,7 @@ import { formatDate, parseDbTimeMs } from '@/utils/date'
 import { IP_LIST_CATEGORIES, invalidateSharedEntriesCache } from '@/utils/securityStages'
 import { crsRuleCountLabel, libraryHealthTag, librarySourceHealthTag, libraryStatusLabel, libraryStatusTagType, summarizeLibrarySources } from '@/utils/securityLibraries'
 import { updaterName } from '@/utils/updaterName'
+import { DEEP_LINK_PARAMS } from '@/utils/deepLink'
 import SyntaxHighlight from '@/components/SyntaxHighlight.vue'
 import RuleLibScheduleEditor from '@/components/RuleLibScheduleEditor.vue'
 import DialogHeader from '@/components/DialogHeader.vue'
@@ -645,7 +646,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { request, mfaAwareSuccess, formatBytes } from '@/utils/api'
 import { showSaveResult } from '@/utils/saveResult'
 import { isValidCidr } from '@/utils/ruleValidation'
-import { canSaveIpList, needsEmptyListConfirm } from '@/utils/ipListSaveGuard'
+import { IP_LIST_MAX_ENTRIES, canSaveIpList, needsEmptyListConfirm } from '@/utils/ipListSaveGuard'
 import { formatIpListEntryLine, ipListRemarkMaxLength, parseIpListEntryLine } from '@/utils/ipListCsv'
 import { popperViewportSafe } from '@/utils/popper'
 import { useAuthStore } from '@/stores/auth'
@@ -1184,7 +1185,7 @@ const saveIpList = async () => {
   }
   // 允许空列表保存（用户裁定）：后端 validateIPListShape 不要求非空；
   // allow 模式策略引用的清空由后端守卫 409 拦截（fail-open 防护）
-  if (entries.length > 2000) { ElMessage.warning('每个列表最多 2000 条条目'); return }
+  if (entries.length > IP_LIST_MAX_ENTRIES) { ElMessage.warning(`每个列表最多 ${IP_LIST_MAX_ENTRIES} 条条目`); return }
   // 已有名单 + 0 条：全量 PUT 会清空——必须二次确认且文案明示
   if (needsEmptyListConfirm(editingIpListId.value, entries.length)) {
     try {
@@ -1740,11 +1741,11 @@ onMounted(() => {
   // 先例)——视图切换走 authStore.currentPage 而非 hash 路由,replaceState 仅留
   // pathname 不破坏页面基座;仅当 URL 实际携带 tab 参数时才剥离。
   const query = new URLSearchParams(location.search)
-  const urlTab = query.get('tab')
+  const urlTab = query.get(DEEP_LINK_PARAMS.securityRulesTab)
   if (urlTab && ['rules', 'custom', 'ip-lists'].includes(urlTab)) {
     activeTab.value = urlTab
   }
-  if (query.has('tab')) window.history.replaceState(null, '', window.location.pathname)
+  if (query.has(DEEP_LINK_PARAMS.securityRulesTab)) window.history.replaceState(null, '', window.location.pathname)
   fetchCRS(); fetchIP2RegionInfo(); fetchRules(); fetchCustomRules(); fetchUsers(); fetchIpLists(); fetchThreatLib(); fetchCrawlerLib()
 })
 

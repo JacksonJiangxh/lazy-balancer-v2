@@ -1,49 +1,55 @@
 import { escapeHtml } from '@/utils/escape'
 
+// 颜色表为纯常量——日志可达 256KB 且在 computed 里渲染，提升为模块级避免每次调用重建。
+const fgColors: Record<number, string> = {
+  30: '#000000',
+  31: '#ef4444',
+  32: '#22c55e',
+  33: '#eab308',
+  34: '#3b82f6',
+  35: '#a855f7',
+  36: '#06b6d4',
+  37: '#e5e7eb',
+  90: '#4b5563',
+  91: '#f87171',
+  92: '#4ade80',
+  93: '#facc15',
+  94: '#60a5fa',
+  95: '#c084fc',
+  96: '#22d3ee',
+  97: '#ffffff',
+}
+
+const bgColors: Record<number, string> = {
+  40: '#000000',
+  41: '#ef4444',
+  42: '#22c55e',
+  43: '#eab308',
+  44: '#3b82f6',
+  45: '#a855f7',
+  46: '#06b6d4',
+  47: '#374151',
+  100: '#1f2937',
+  101: '#7f1d1d',
+  102: '#14532d',
+  103: '#713f12',
+  104: '#1e3a8a',
+  105: '#581c87',
+  106: '#164e63',
+  107: '#9ca3af',
+}
+
+const ansiBaseColors = [
+  '#000000', '#800000', '#008000', '#808000', '#000080', '#800080', '#008080', '#c0c0c0',
+  '#808080', '#ff0000', '#00ff00', '#ffff00', '#0000ff', '#ff00ff', '#00ffff', '#ffffff',
+]
+
 /**
  * Convert ANSI escape sequences in a string to HTML.
  * Handles common SGR codes (reset, text styles, and basic/indexed/RGB colors).
  * Newlines are preserved by the caller via CSS (white-space: pre-wrap).
  */
 export function ansiToHtml(text: string): string {
-  const fgColors: Record<number, string> = {
-    30: '#000000',
-    31: '#ef4444',
-    32: '#22c55e',
-    33: '#eab308',
-    34: '#3b82f6',
-    35: '#a855f7',
-    36: '#06b6d4',
-    37: '#e5e7eb',
-    90: '#4b5563',
-    91: '#f87171',
-    92: '#4ade80',
-    93: '#facc15',
-    94: '#60a5fa',
-    95: '#c084fc',
-    96: '#22d3ee',
-    97: '#ffffff',
-  }
-
-  const bgColors: Record<number, string> = {
-    40: '#000000',
-    41: '#ef4444',
-    42: '#22c55e',
-    43: '#eab308',
-    44: '#3b82f6',
-    45: '#a855f7',
-    46: '#06b6d4',
-    47: '#374151',
-    100: '#1f2937',
-    101: '#7f1d1d',
-    102: '#14532d',
-    103: '#713f12',
-    104: '#1e3a8a',
-    105: '#581c87',
-    106: '#164e63',
-    107: '#9ca3af',
-  }
-
   const escaped = escapeHtml(text)
   let open = false
   let bold = false
@@ -53,11 +59,7 @@ export function ansiToHtml(text: string): string {
   let background = ''
 
   const ansiColor = (index: number): string => {
-    const base = [
-      '#000000', '#800000', '#008000', '#808000', '#000080', '#800080', '#008080', '#c0c0c0',
-      '#808080', '#ff0000', '#00ff00', '#ffff00', '#0000ff', '#ff00ff', '#00ffff', '#ffffff',
-    ]
-    if (index < 16) return base[index] ?? ''
+    if (index < 16) return ansiBaseColors[index] ?? ''
     if (index < 232) {
       const value = index - 16
       const levels = [0, 95, 135, 175, 215, 255]

@@ -449,11 +449,9 @@ onUnmounted(() => {
   /* 垂直留白由全局 .error-banner（main.css）供给（去双份）*/
 }
 /* 与站内 polling-error-alert 统一模式（Rules/CertJobs/ClusterSettings）同构：
-   图标+标题 flex（文案左、动作右）+ 12px meta 次行 */
-.config-drift-banner .polling-error-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; line-height: 1.5; }
+   图标+标题 flex（文案左、动作右）+ 12px meta 次行——flex/字号/行高全部由全局
+   .polling-error-title / .error-banner .error-banner-meta（main.css）供给，此处不重复声明。 */
 .config-drift-banner .drift-text { font-weight: 500; }
-/* 2026-09-25 用户反馈：两行行间距过宽——meta 贴合主行 */
-.config-drift-banner .polling-error-meta { font-size: 12px; margin-top: 0; line-height: 1.5; }
 
 .layout-aside {
   background: #ffffff;

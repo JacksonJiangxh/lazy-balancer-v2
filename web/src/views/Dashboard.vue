@@ -46,19 +46,21 @@
               <div class="card-title">
                 <el-icon class="title-icon caddy-icon"><Cpu /></el-icon>
                 <span>Caddy 服务状态</span>
-                <el-tooltip v-if="caddyApplyError" placement="bottom" :content="caddyApplyError">
+                <el-tooltip v-if="caddyApplyError && !caddyStatusUnavailable" placement="bottom" :content="caddyApplyError">
                   <el-tag type="danger" size="small" effect="plain" style="margin-left: 8px">配置应用失败</el-tag>
                 </el-tooltip>
                 <!-- 审计项：后台数据类重载（证书部署/CRS/IP库/威胁库/自动封禁）失败
                      独立横幅——库已更新但运行配置未收敛，与写路径「保存失败」区分。 -->
-                <el-tooltip v-if="caddyBackgroundApplyError" placement="bottom" :content="caddyBackgroundApplyError" :popper-style="{ maxWidth: '420px' }">
+                <el-tooltip v-if="caddyBackgroundApplyError && !caddyStatusUnavailable" placement="bottom" :content="caddyBackgroundApplyError" :popper-style="{ maxWidth: '420px' }">
                   <el-tag type="warning" size="small" effect="plain" style="margin-left: 8px">后台重载失败</el-tag>
                 </el-tooltip>
               </div>
               <div class="header-actions">
-                <el-tag 
-                  :type="caddyStatus === 'running' ? 'success' : caddyStatus === 'stopped' ? 'danger' : 'info'" 
-                  size="small" 
+                <el-tag v-if="caddyStatusUnavailable" type="info" size="small" effect="plain">状态采集失败</el-tag>
+                <el-tag
+                  v-else
+                  :type="caddyStatus === 'running' ? 'success' : caddyStatus === 'stopped' ? 'danger' : 'info'"
+                  size="small"
                   effect="plain"
                   :class="['status-tag', caddyStatusClass]"
                 >
@@ -76,11 +78,11 @@
                 <el-tooltip v-else-if="nodeModeRole === 'unknown'" placement="bottom" content="节点角色尚未确认（配置拉取中或失败），暂不判定配置一致性" :popper-style="{ maxWidth: '360px' }">
                   <el-tag type="info" size="small" effect="plain">角色未知</el-tag>
                 </el-tooltip>
-                <el-tag v-else-if="configConsistent === 'true'" type="success" size="small" effect="plain">配置正常</el-tag>
-                <el-tooltip v-else-if="configConsistent === 'false'" placement="bottom" :content="configDrift" :popper-style="{ maxWidth: '360px' }">
+                <el-tag v-else-if="configConsistent === 'true' && !caddyStatusUnavailable" type="success" size="small" effect="plain">配置正常</el-tag>
+                <el-tooltip v-else-if="configConsistent === 'false' && !caddyStatusUnavailable" placement="bottom" :content="configDrift" :popper-style="{ maxWidth: '360px' }">
                   <el-tag type="danger" size="small" effect="plain">配置异常</el-tag>
                 </el-tooltip>
-                <div v-if="authStore.readOnlyReason === null" class="caddy-actions">
+                <div v-if="authStore.readOnlyReason === null && !caddyStatusUnavailable" class="caddy-actions">
                   <el-button v-if="caddyStatus === 'running'" type="warning" size="small" @click="controlCaddy('restart')" :loading="caddyLoading">
                     重启
                   </el-button>
@@ -484,6 +486,10 @@ const systemInfoUnavailable = ref(false)
 const systemMetrics = ref<SystemMetrics | null>(null)
 const caddyMetrics = ref<CaddyMetrics | null>(null)
 const caddyStatus = ref('unknown')
+// /caddy/status 失败显性标记（与 systemInfoUnavailable 等 8 项同构）——
+// 缺它时状态标签/配置一致性/应用失败横幅全部静默陈旧（「运行中/配置正常」
+// 可能是上一轮残值，而真实 Caddy 已停或配置已漂移）。
+const caddyStatusUnavailable = ref(false)
 const caddyApplyError = ref('')
 const caddyBackgroundApplyError = ref('')
 const caddyPid = ref('0')
@@ -939,8 +945,11 @@ const fetchAllData = (roundSignal?: AbortSignal): Promise<void> => {
         caddyPid.value = res.data.pid || '0'
         configConsistent.value = res.data.config_consistent || ''
         configDrift.value = res.data.config_drift || ''
+        caddyStatusUnavailable.value = false
+      } else {
+        caddyStatusUnavailable.value = true
       }
-    }),
+    }).catch(() => { if (!disposed) caddyStatusUnavailable.value = true }),
   ]).then(() => undefined).finally(() => {
     if (!disposed) initialLoading.value = false
     fetchAllDataPromise = null

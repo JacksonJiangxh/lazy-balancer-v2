@@ -23,6 +23,20 @@ test('验码/挑战错误 → 豁免会话失效（只传播文案供重试）',
   assert.equal(isMfaCredentialRejection('/users/3/mfa/reset', 401, '验证码错误'), true)
 })
 
+test('401 豁免白名单与后端 mfa.go 文案逐字对齐（跨栈钉）', () => {
+  // 前端按后端中文字面量分类——后端润色文案（改字/加标点）会静默改变分类：
+  // 真会话过期被当验码错误不弹重登，或反之误杀会话。逐字钉住 Go 侧出处。
+  const go = repoSource('internal/handlers/mfa.go')
+  for (const msg of [
+    '验证码错误',
+    '验证码错误次数过多，绑定已作废，请重新开始绑定',
+    'MFA 挑战无效或已过期，请重新登录',
+    'MFA 挑战已被使用，请重新登录',
+  ]) {
+    assert.ok(go.includes(`Message: "${msg}"`), `mfa.go 不再产生 401 文案「${msg}」——前端白名单失配`)
+  }
+})
+
 test('同端点的会话过期 401 不得被豁免（428→verify-step 窗口）', () => {
   assert.equal(isMfaCredentialRejection('/auth/mfa/verify-step', 401, SESSION_EXPIRED), false)
   assert.equal(isMfaCredentialRejection('/auth/mfa/status', 401, SESSION_EXPIRED), false)

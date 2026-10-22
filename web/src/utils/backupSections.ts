@@ -10,11 +10,6 @@ export const BACKUP_SECTIONS = [
   { key: 'cluster', label: '节点拓扑' },
 ] as const
 
-export interface BackupSection {
-  key: string
-  label: string
-}
-
 /** legacy 分类键别名：升级前的 global_config/waf_files 读出即归一。 */
 export const LEGACY_SECTION_ALIASES: Record<string, string> = { global_config: 'users', waf_files: 'security' }
 

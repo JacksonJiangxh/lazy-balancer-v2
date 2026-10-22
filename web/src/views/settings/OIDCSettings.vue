@@ -9,7 +9,7 @@
     <!-- 读取失败显性化（此前静默呈现上一轮残留状态或空白表单）-->
     <el-alert v-if="loadFailed" type="error" :closable="false" show-icon class="mb12"
       title="OIDC 配置读取失败——当前按「未配置」展示，读取成功前无法保存；请关闭弹框后重试" />
-    <div v-else-if="!configured" class="info-note-bar"><span class="info-note-desc">通过企业认证服务（OIDC）登录——配置仅 3 项，端点自动发现；本地账号登录始终保留。</span></div>
+    <div v-else-if="!configured" class="info-note-bar"><span class="info-note-desc">通过企业认证服务（OIDC）登录——必需配置 3 项，端点自动发现；访问白名单可选；本地账号登录始终保留。</span></div>
     <el-alert v-else-if="enabled" type="success" :closable="false" class="mb12"
       :title="`OIDC 已启用（${displayName || 'OIDC'}）——登录页默认展示认证服务入口，本地账号可折叠进入。`" />
 
@@ -77,6 +77,32 @@
       </div>
     </div>
 
+    <!-- ④ 访问白名单（选填）——开启 OIDC 即对 IdP 全体可认证用户开放面板只读
+         （含证书私钥，已裁定设计），白名单是面板侧唯一收口。 -->
+    <div class="oidc-step">
+      <div class="oidc-step-badge">4</div>
+      <div class="oidc-step-body">
+      <div class="step-title">访问白名单（选填）</div>
+      <div class="cred-form">
+        <div class="cred-row">
+          <div class="cred-row__label">邮箱域</div>
+          <div class="cred-row__field">
+            <el-input v-model="form.allowedEmailDomains" placeholder="example.com, corp.example.org（逗号分隔；留空=不限制）" clearable />
+            <div class="form-tip-line">仅这些邮箱域的用户可登录（写入侧自动去空白、转小写并去重）</div>
+          </div>
+        </div>
+        <div class="cred-row">
+          <div class="cred-row__label">用户组</div>
+          <div class="cred-row__field">
+            <el-input v-model="form.allowedGroups" placeholder="ops, sre（逗号分隔；留空=不限制）" clearable />
+            <div class="form-tip-line">仅这些 IdP 用户组的成员可登录（组名大小写敏感）</div>
+          </div>
+        </div>
+      </div>
+      <div class="form-tip-line">两项都填写时须同时满足；IdP 未返回 email/groups 声明时直接拒登（fail-visible），不会静默放行</div>
+      </div>
+    </div>
+
     <el-alert v-if="lastTest" :type="lastTest.ok ? 'success' : 'error'" :closable="false" class="mt8"
       :title="lastTest.ok
           ? `连接正常：${lastTest.providerName ?? ''}${lastTest.credentialsChecked ? '（凭证校验通过）' : ''}`
@@ -110,7 +136,21 @@ const isReadOnly = computed(() => authStore.readOnlyReason !== null)
 const props = defineProps<{ modelValue: boolean }>()
 const emit = defineEmits<{ (e: 'update:modelValue', v: boolean): void; (e: 'status', st: { enabled: boolean; configured: boolean }): void }>()
 
-const form = reactive({ issuer: '', clientId: '', clientSecret: '', displayName: '' })
+const form = reactive({
+  issuer: '',
+  clientId: '',
+  clientSecret: '',
+  displayName: '',
+  // 访问白名单以「逗号/空格/换行分隔文本」编辑，保存时解析为数组——
+  // 契约：PUT 携带数组（[]=清除），缺省键=不动（toggleEnabled/remove 不携带）。
+  allowedEmailDomains: '',
+  allowedGroups: '',
+})
+
+// 白名单文本 ↔ 数组：输入侧同一分隔符集，输出恒为 trim 后的非空条目。
+const parseAllowList = (raw: string): string[] =>
+  raw.split(/[\s,;，、]+/).map((item) => item.trim()).filter(Boolean)
+const allowListToText = (values?: string[]): string => (values ?? []).join(', ')
 const enabled = ref(false)
 const displayName = ref('')
 const hasFetchedConfig = ref(false)
@@ -180,7 +220,7 @@ const load = async () => {
   loadFailed.value = false
   try {
     // silent——非管理员打开入口时 403 不弹全局 toast(入口按角色收口)
-    const res = await request.get<{ data?: { enabled?: boolean; issuer?: string; client_id?: string; display_name?: string; has_secret?: boolean } }>('/settings/oidc', { silent: true })
+    const res = await request.get<{ data?: { enabled?: boolean; issuer?: string; client_id?: string; display_name?: string; has_secret?: boolean; allowed_email_domains?: string[]; allowed_groups?: string[] } }>('/settings/oidc', { silent: true })
     if (res.data) {
       enabled.value = !!res.data.enabled
       displayName.value = res.data.display_name || ''
@@ -188,6 +228,8 @@ const load = async () => {
       form.issuer = res.data.issuer || ''
       form.clientId = res.data.client_id || ''
       form.displayName = res.data.display_name || ''
+      form.allowedEmailDomains = allowListToText(res.data.allowed_email_domains)
+      form.allowedGroups = allowListToText(res.data.allowed_groups)
       hasFetchedConfig.value = !!res.data.issuer
       form.clientSecret = ''
       // load 开始已推进探测世代；响应回填的字段 watcher 会再次失效旧快照。
@@ -201,6 +243,8 @@ const load = async () => {
     form.clientId = ''
     form.displayName = ''
     form.clientSecret = ''
+    form.allowedEmailDomains = ''
+    form.allowedGroups = ''
     hasFetchedConfig.value = false
     lastTest.value = null
     loadFailed.value = true
@@ -302,7 +346,15 @@ const save = async () => {
   }
   saving.value = true
   try {
-    const payload: Record<string, unknown> = { issuer: form.issuer, client_id: form.clientId, enabled: true, display_name: form.displayName }
+    const payload: Record<string, unknown> = {
+      issuer: form.issuer,
+      client_id: form.clientId,
+      enabled: true,
+      display_name: form.displayName,
+      // 整表保存始终携带白名单（[]=清除）；缺省键语义仅用于局部 PUT（启用/暂停/删除）。
+      allowed_email_domains: parseAllowList(form.allowedEmailDomains),
+      allowed_groups: parseAllowList(form.allowedGroups),
+    }
     if (form.clientSecret) payload.client_secret = form.clientSecret
     await request.put('/settings/oidc', payload)
     await load()
@@ -337,6 +389,7 @@ const remove = async () => {
   } catch { /* 拦截器已提示 */ return }
   ElMessage.success('已删除')
   form.issuer = ''; form.clientId = ''; form.clientSecret = ''; form.displayName = ''
+  form.allowedEmailDomains = ''; form.allowedGroups = ''
   probe.checked = false; probe.ok = false; lastTest.value = null
   hasFetchedConfig.value = false
   await load()

@@ -1,30 +1,10 @@
-export type CertJobStatus =
-  | 'queued'
-  | 'pending'
-  | 'processing'
-  | 'creating_account'
-  | 'creating_order'
-  | 'order_created'
-  | 'waiting_order_ready'
-  | 'order_ready'
-  | 'cleanup_dns'
-  | 'cleanup_warning'
-  | 'presenting_dns'
-  | 'waiting_propagation'
-  | 'dns_propagated'
-  | 'accepting_challenge'
-  | 'waiting_order_valid'
-  | 'order_valid'
-  | 'validating'
-  | 'validated'
-  | 'finalizing'
-  | 'finalized'
-  | 'downloading'
-  | 'downloaded'
-  | 'issued'
-  | 'failed'
-  | 'waiting_ca'
-  | 'disabled'
+// 相对路径 + .ts 扩展名：本模块被 node --test 直接加载（无打包器别名解析）。
+import { parseDbDateMs } from './timeZoneFormat.ts'
+
+// 状态联合类型的唯一事实源在 types/index.ts（证书任务视图类型族同源处）；
+// 此处 re-export 保持既有 `@/utils/certJobStatus` 导入面不变。
+import type { CertJobStatus } from '../types/index.ts'
+export type { CertJobStatus }
 
 /**
  * 状态 → 中文标签全表。`satisfies Record<CertJobStatus, string>` 是**编译期穷尽性**
@@ -123,7 +103,9 @@ export const certJobRetryReady = (
 ): boolean => {
   if (cooldownSeconds === null) return false
   if (cooldownSeconds <= 0 || !updatedAtValue) return true
-  const updatedAt = new Date(updatedAtValue).getTime()
-  if (Number.isNaN(updatedAt)) return true
+  // 经 parseDbDateMs 的 +Z 规范化——裸 new Date 对空格分隔墙钟串在 Safari 返回 NaN，
+  // 冷却判定会恒 true（fail-open 提前允许重试）。
+  const updatedAt = parseDbDateMs(updatedAtValue)
+  if (updatedAt === null) return true
   return nowMs - updatedAt >= cooldownSeconds * 1000
 }

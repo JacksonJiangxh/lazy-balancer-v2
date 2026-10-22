@@ -223,11 +223,13 @@
         <el-table-column prop="method" label="方法" width="90" align="center" />
         <el-table-column prop="uri" label="URI" min-width="140" show-overflow-tooltip />
         <!-- （用户需求）：异常评分列——CRS 评分制下每事件携带的累计
-             anomaly_score（后端已返回，此前未展示）；按分数着色便于快速识别高威胁。 -->
+             anomaly_score（后端已返回，此前未展示）；按分数着色便于快速识别高威胁。
+             分档与大屏定级同源（utils/severityScale：≥12 高 / ≥6 中）——
+             原列表 ≥15/≥5 与大屏 ≥12/≥6 双口径，同分不同色结论打架。 -->
         <el-table-column label="评分" width="80" align="center">
           <template #default="{ row }">
-            <el-tag v-if="row.anomaly_score >= 15" type="danger" size="small" effect="plain">{{ row.anomaly_score }}</el-tag>
-            <el-tag v-else-if="row.anomaly_score >= 5" type="warning" size="small" effect="plain">{{ row.anomaly_score }}</el-tag>
+            <el-tag v-if="row.anomaly_score >= ANOMALY_SCORE_HIGH" type="danger" size="small" effect="plain">{{ row.anomaly_score }}</el-tag>
+            <el-tag v-else-if="row.anomaly_score >= ANOMALY_SCORE_MID" type="warning" size="small" effect="plain">{{ row.anomaly_score }}</el-tag>
             <el-tag v-else-if="row.anomaly_score > 0" type="info" size="small" effect="plain">{{ row.anomaly_score }}</el-tag>
             <span v-else>—</span>
           </template>
@@ -389,7 +391,9 @@ import { useAuthStore } from '@/stores/auth'
 import LogStorageBar from '@/components/LogStorageBar.vue'
 import TriggerDetailDialog from '@/components/events/TriggerDetailDialog.vue'
 import { formatDurationUs, triggerStageFamily } from '@/utils/securityStages'
-import { TRIGGERED_CATEGORIES, serializeTriggeredFilter } from '@/utils/triggeredFilter'
+import { TRIGGERED_CATEGORIES, serializeTriggeredFilter, CRAWLER_FAMILY_LABEL } from '@/utils/triggeredFilter'
+import { ANOMALY_SCORE_HIGH, ANOMALY_SCORE_MID } from '@/utils/severityScale'
+import { DEEP_LINK_PARAMS, pageUrl } from '@/utils/deepLink'
 import { isAutobanIneffective } from '@/utils/autobanStatus'
 import IPLocationAction from '@/views/security/IPLocationAction.vue'
 import { formatDate } from '@/utils/date'
@@ -627,7 +631,8 @@ const ctxWafFamily = computed(() => {
 // ipAcl/geoip/threat 同归「IP 访问控制」（阶段 1 合并口径），wafCrs/wafCustom
 // 同归「WAF」；trust/body/other 同名直通。
 // crawler 独立成类（后端 v2.3.8 将已验证爬虫/伪装从地域段拆出）——
-// 阶段列显示「爬虫校验」而非笼统归入 IP 访问控制；仍是阶段 1 预检事件，
+// 阶段列展示词与筛选类别/触发类型列同源（crawler 族统一为后端权威词
+// CRAWLER_FAMILY_LABEL「爬虫Bot」——原此处渲染「爬虫校验」，同页三称谓并存）。
 // 点击进入同一触发详情弹框。
 const stageCategory = (row: SecurityEvent): 'trust' | 'acl' | 'crawler' | 'waf' | 'body' | 'other' => {
   const t = row.rule_triggered
@@ -642,19 +647,24 @@ const stageCategory = (row: SecurityEvent): 'trust' | 'acl' | 'crawler' | 'waf' 
   }
 }
 const stageLabel = (row: SecurityEvent): string => {
+  // 存量 id '8' 中和文案（勿改分类——triggerStageFamily 对 8 归 ipAcl 是已钉住
+  // 的历史共享 id 口径例外）：后端 trigger_type 显示「地域拦截」，阶段列沿用
+  // IP 访问控制会自相矛盾；现代引擎地域事件已发 800xxx，仅存量/带外数据可达。
+  if (row.rule_triggered === '8') return '地域拦截（旧 id）'
   switch (stageCategory(row)) {
     case 'trust': return '信任名单'
-    case 'crawler': return '爬虫校验'
+    case 'crawler': return CRAWLER_FAMILY_LABEL
     case 'acl': return 'IP 访问控制'
     case 'waf': return 'WAF'
     case 'body': return '请求体异常'
     default: return row.rule_triggered || '—'
   }
 }
-const showTriggeredMsg = (row: SecurityEvent): boolean => {
-  const t = row.rule_triggered
-  return !!t && t !== '2' && t !== '3' && t !== '4' && t !== '5' && !/^949/.test(t) && !!row.rule_msg
-}
+// tooltip 分支仅在模板 else 分支可达（trust/acl/crawler/waf 已由前两个 el-link
+// 分支截走）——原再排除 2/3/4/5/^949 是永不命中的死条件，误导读者以为 ACL/
+// 信任行会走 tooltip。
+const showTriggeredMsg = (row: SecurityEvent): boolean =>
+  !!row.rule_triggered && !!row.rule_msg
 
 // —— 触发详情弹框（统一入口）：全部触发类型共用 TriggerDetailDialog ——
 const triggerDetailVisible = ref(false)
@@ -825,14 +835,14 @@ const resetFilters = () => {
 
 const handleSizeChange = () => { page.value = 1; fetchEvents() }
 
-const goToRule = (row: SecurityEvent) => { window.open(`/?page=rules&rs=${encodeURIComponent(row.rule_caddy_id)}`, '_blank') }
+const goToRule = (row: SecurityEvent) => { window.open(pageUrl('rules', { [DEEP_LINK_PARAMS.ruleSearch]: row.rule_caddy_id }), '_blank') }
 const goToPolicy = (row: SecurityEvent) => {
   // 交接改走 URL query（sp / sp-search 参数，同 goToRule 的 rs 形态），
   // SecurityPolicies.vue onMounted 消费后 replaceState 清除。
   if (row.policy_id > 0) {
-    window.open(`/?page=security-policies&sp=${row.policy_id}`, '_blank')
+    window.open(pageUrl('security-policies', { [DEEP_LINK_PARAMS.policyId]: row.policy_id }), '_blank')
   } else if (row.policy_name) {
-    window.open(`/?page=security-policies&sp-search=${encodeURIComponent(row.policy_name)}`, '_blank')
+    window.open(pageUrl('security-policies', { [DEEP_LINK_PARAMS.policySearch]: row.policy_name }), '_blank')
   }
 }
 

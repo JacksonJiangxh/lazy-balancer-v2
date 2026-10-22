@@ -498,7 +498,7 @@ import { restartServiceWithFeedback } from '@/utils/restart'
 import { formatDate } from '@/utils/date'
 import { normalizeTrafficSampleN } from '@/utils/threatFlowRules'
 import { shouldToastQuietPollError } from '@/utils/pollErrorToast'
-import { displaySecurityEventsRowCap, securityEventsWritePayload } from '@/utils/configValues'
+import { displaySecurityEventsRetentionDays, displaySecurityEventsRowCap, securityEventsWritePayload } from '@/utils/configValues'
 import { CHINA_SITE_CHOICES, COUNTRY_SITE_CHOICES, coordsForSiteLocation, nearestSiteLocation } from '@/utils/siteLocation'
 import { BACKUP_SECTIONS, normalizeBackupSectionKeys } from '@/utils/backupSections'
 import { MFA_SCOPE_GROUPS } from '@/utils/mfaScopeGroups'
@@ -1332,7 +1332,7 @@ const seRowCapDirty = ref(false)
 const trafficSampleN = ref(-1)
 watch(() => settings.value.threat_screen_mode, (v) => { threatScreenMode.value = v === 'globe' ? 'globe' : 'map' }, { immediate: true })
 watch(() => [settings.value.security_events_retention_days, settings.value.security_events_row_cap] as const, ([d, c]) => {
-  seRetentionDays.value = d && d > 0 ? d : 90
+  seRetentionDays.value = displaySecurityEventsRetentionDays(d)
   // 1..999 等小值是后端合法配置（行帽），原样展示；仅 0=自动按默认显示。
   seRowCap.value = displaySecurityEventsRowCap(c)
 }, { immediate: true })

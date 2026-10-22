@@ -40,7 +40,8 @@ test('mfa_write_guard 随 /config 投影单源：Users 页不再单独整取 GET
   const fetchStart = authSrc.indexOf('async function fetchConfig')
   const fetchEnd = authSrc.indexOf('interface LoginResult', fetchStart)
   const fetchBody = authSrc.slice(fetchStart, fetchEnd)
-  assert.match(fetchBody, /mfa_write_guard\?: boolean/, '/config 契约声明该键')
+  // /config 投影复用 GlobalConfigData 声明（Pick），mfa_write_guard 键由该接口提供
+  assert.match(authSrc, /Pick<GlobalConfigData, 'timezone' \| 'cert_renewal_days' \| 'mfa_write_guard'>/, '/config 投影必须 Pick GlobalConfigData（单一事实源）')
   assert.match(fetchBody, /mfaWriteGuard\.value = res\.data\.mfa_write_guard === true/)
   assert.match(authSrc, /const mfaWriteGuard = ref\(false\)/, '首值 false = 守卫关闭的保守形态')
   assert.match(authSrc, /^\s+mfaWriteGuard,$/m, 'store 对外暴露 ref')

@@ -1,3 +1,10 @@
+/**
+ * 每个 IP 名单的条目上限（与后端 internal/handlers/securityiplists.go
+ * `ipListMaxEntries = 2000` 同源）。SFC 内曾有 2000 双份硬编码（校验一处、
+ * 文案一处），收敛于此；跨栈对表见 ipList.spec.ts。
+ */
+export const IP_LIST_MAX_ENTRIES = 2000
+
 // IP 名单保存守卫：弹框以「空 entries 起步 → 详情
 // GET 回填」加载。详情在途或失败时保存按钮若可点，会把空数组全量 PUT——直接
 // 清空该名单（PUT 语义=全量替换）。守卫在此集中供模板/脚本同源消费。

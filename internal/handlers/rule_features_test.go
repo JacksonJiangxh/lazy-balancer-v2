@@ -75,7 +75,19 @@ func TestRuleFeatures_rejects_invalid_path_rule_inputs(t *testing.T) {
 				Path:      "/health",
 				Upstreams: []models.PathRuleUpstream{{Address: "127.0.0.1", Port: 9090, Weight: -1}},
 			}}},
-			wantError: "权重不能为负数",
+			wantError: "权重必须为不小于 1",
+		},
+		{
+			// 与主池 handlers.go（weight<1 响亮拒绝，0→1 静默归一已裁定废除）
+			// 同口径：0 渲染层虽归一为 1，但保存侧不得让 0 落库（「权重 0=停用」
+			// 直觉落空；API/备份导入/集群快照路径均可带 0）。
+			name: "zero custom upstream weight",
+			input: ruleFeatureInput{Protocol: "http", CustomRoutesEnabled: true, PathRules: []models.PathRule{{
+				MatchType: "prefix",
+				Path:      "/health",
+				Upstreams: []models.PathRuleUpstream{{Address: "127.0.0.1", Port: 9090, Weight: 0}},
+			}}},
+			wantError: "权重必须为不小于 1",
 		},
 	}
 

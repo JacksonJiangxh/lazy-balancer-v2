@@ -199,6 +199,14 @@ export function normalizeCountryName(name: string): string {
   return name === 'Taiwan' || name === '台湾' ? '中国' : name
 }
 
+/** 正常流光流的国家 → 弧线起点：先归一（台湾→中国，见 normalizeCountryName）
+ *  再查质心表，未知走兜底点。地图/地球两引擎 setTraffic 共用——原各自
+ *  `COUNTRY_CENTROIDS[key] ?? FALLBACK` 且未归一（「台湾」落太平洋兜底点，
+ *  与热力「计数并入中国」口径不一致）。 */
+export function trafficOriginForCountry(name: string): Centroid {
+  return COUNTRY_CENTROIDS[normalizeCountryName(name)] ?? FALLBACK_CENTROID
+}
+
 /**
  * 该下钻国家是否有省级统计源：后端 `threatLocationParts` 只对中国
  * 从归属地串取省，`china_provinces` 也只聚合中国省——海外下钻的省板是纯几何，

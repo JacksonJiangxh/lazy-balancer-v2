@@ -52,6 +52,19 @@
       </template>
     </el-alert>
 
+    <el-alert v-if="auxDataLoadFailed" type="error" :closable="false" show-icon class="polling-error-alert error-banner">
+      <template #title>
+        <div class="polling-error-title">
+          <span>辅助数据加载失败（{{ [
+            usersLoadError ? '更新者列表（更新者列将显示「-」）' : '',
+            certConfigsLoadError ? 'DNS 提供商配置（ACME 规则编辑无法选择 DNS 配置）' : '',
+            caProvidersLoadError ? 'CA 提供商（选择器仅剩「系统默认」）' : '',
+          ].filter(Boolean).join('；') }}）</span>
+          <el-button link type="danger" :loading="loading" @click="retryAuxData">立即重试</el-button>
+        </div>
+      </template>
+    </el-alert>
+
     <el-alert v-if="securityBindingsError" type="warning" :closable="false" show-icon class="polling-error-alert">
       <template #title>
         <div class="polling-error-title">
@@ -451,12 +464,15 @@
                 <el-select v-model="wizardForm.acme_config_id" placeholder="选择 DNS 提供商配置" style="width: 100%;">
                   <el-option v-for="cfg in certConfigs" :key="cfg.id" :label="cfg.name" :value="cfg.id" />
                 </el-select>
-                <div class="form-tip-line">请先在「系统设置 / 免费证书」中添加 DNS 提供商配置</div>
+                <div v-if="certConfigsLoadError" class="form-tip-line port-warning">DNS 提供商配置加载失败（下拉为空≠未配置）——请经页面顶部横幅重试后再编辑</div>
+                <div v-else class="form-tip-line">请先在「系统设置 / 免费证书」中添加 DNS 提供商配置</div>
               </el-form-item>
               <el-form-item label="CA 提供商">
                 <el-select v-model="wizardForm.ca_provider_id" placeholder="系统默认" clearable style="width: 100%">
                   <el-option label="系统默认" :value="0" />
-                  <el-option v-for="p in enabledCAProviders" :key="p.id" :label="p.name" :value="p.id" />
+                  <!-- 选项=启用 ∪ 当前值（已禁用项仅回显、置 disabled 不可新选；
+                       口径单源 utils/caProviderOptions） -->
+                  <el-option v-for="p in wizardCAProviderOptions" :key="p.id" :label="caProviderOptionLabel(p)" :value="p.id" :disabled="!p.enabled" />
                 </el-select>
                 <div class="form-tip-line">选择自动签发证书使用的 CA 提供商，留空或「系统默认」将跟随全局默认设置</div>
               </el-form-item>
@@ -589,7 +605,7 @@
                 </template>
                 <template #default="{ row }">
                   <el-tooltip placement="top" :disabled="!wizardForm.dynamic_dns" :content="`动态上游模式下${wizardForm.protocol === 'tcp' ? '最大连接' : '最大请求数'}不生效`">
-                    <el-input-number v-model="row.max_connections" :min="0" :max="100000" size="small" controls-position="right" class="upstream-input-small" :disabled="wizardForm.dynamic_dns" />
+                    <el-input-number v-model="row.max_connections" :min="RULE_NUMERIC_LIMITS.maxConnectionsMin" size="small" controls-position="right" class="upstream-input-small" :disabled="wizardForm.dynamic_dns" />
                   </el-tooltip>
                 </template>
               </el-table-column>
@@ -673,7 +689,7 @@
 
 
             <el-form-item label="检查间隔">
-              <el-input-number v-model="wizardForm.health_check_interval" :min="5" :max="300" controls-position="right" style="width: 120px;" />
+              <el-input-number v-model="wizardForm.health_check_interval" :min="RULE_NUMERIC_LIMITS.healthCheckIntervalMin" controls-position="right" style="width: 120px;" />
               <span class="form-tip-inline">秒，主动探测间隔；被动失败记忆窗口为其 3 倍</span>
             </el-form-item>
 
@@ -697,7 +713,7 @@
 
               <template v-if="wizardForm.enable_active_health_check">
                 <el-form-item label="主动探测超时">
-                  <el-input-number v-model="wizardForm.health_check_timeout" :min="1" :max="30" controls-position="right" style="width: 120px;" />
+                  <el-input-number v-model="wizardForm.health_check_timeout" :min="RULE_NUMERIC_LIMITS.healthCheckTimeoutMin" controls-position="right" style="width: 120px;" />
                   <span class="form-tip-inline">秒，仅主动探测单次超时；被动熔断不使用该值</span>
                 </el-form-item>
                 <el-form-item label="检查路径">
@@ -725,7 +741,7 @@
 
               <template v-if="wizardForm.enable_active_health_check">
                 <el-form-item label="主动探测超时">
-                  <el-input-number v-model="wizardForm.health_check_timeout" :min="1" :max="30" controls-position="right" style="width: 120px;" />
+                  <el-input-number v-model="wizardForm.health_check_timeout" :min="RULE_NUMERIC_LIMITS.healthCheckTimeoutMin" controls-position="right" style="width: 120px;" />
                   <span class="form-tip-inline">秒，仅主动探测单次超时；被动熔断不使用该值</span>
                 </el-form-item>
                 <el-form-item label="检查端口">
@@ -830,7 +846,7 @@
               </el-form-item>
 
               <el-form-item label="重试间隔">
-                <el-input-number v-model="wizardForm.tcp_try_interval" :min="(wizardForm.tcp_try_duration || 0) > 0 ? 1 : 0" :max="10000" controls-position="right" style="width: 120px;" :disabled="ntlmOn || (wizardForm.tcp_try_duration || 0) <= 0" />
+                <el-input-number v-model="wizardForm.tcp_try_interval" :min="(wizardForm.tcp_try_duration || 0) > 0 ? 1 : 0" :max="RULE_NUMERIC_LIMITS.tcpTryIntervalMax" controls-position="right" style="width: 120px;" :disabled="ntlmOn || (wizardForm.tcp_try_duration || 0) <= 0" />
                 <span class="form-tip-inline"><TakeoverBadge v-if="ntlmOn" />{{ ntlmOn ? '重试已禁用，间隔不生效' : ((wizardForm.tcp_try_duration || 0) <= 0 ? '窗口未启用时间隔不生效' : '毫秒，每次重试间隔；窗口启用时必须 ≥1') }}</span>
               </el-form-item>
 
@@ -1207,6 +1223,7 @@ import axios from 'axios'
 import { ansiToHtml } from '@/utils/ansi'
 import { useLogTailPolling } from '@/composables/useLogTailPolling'
 import { updaterName } from '@/utils/updaterName'
+import { DEEP_LINK_PARAMS } from '@/utils/deepLink'
 import { formatDate, parseDbTimeMs } from '@/utils/date'
 import LogStorageBar from '@/components/LogStorageBar.vue'
 import RuleFlowDialog from '@/components/RuleFlowDialog.vue'
@@ -1222,6 +1239,7 @@ import type {
 } from '@/utils/securityStages'
 import type {
   APIResponse,
+  CertJobListItem,
   CreateRuleRequest,
   PathRule,
   ProxyTimeoutConfig,
@@ -1237,8 +1255,9 @@ import type {
 import SyntaxHighlight from '@/components/SyntaxHighlight.vue'
 import PathRulesEditor from '@/components/rules/PathRulesEditor.vue'
 import ProxyTimeoutFields from '@/components/rules/ProxyTimeoutFields.vue'
-import { isValidHostName, validatePathRules } from '@/utils/ruleValidation'
-import { getStrategyLabel } from '@/utils/strategyLabels'
+import { isValidHostName, validatePathRules, RULE_NUMERIC_LIMITS } from '@/utils/ruleValidation'
+import { getStrategyLabel, strategyCardsForProtocol, strategyValuesForProtocol } from '@/utils/strategyLabels'
+import { selectableCAProviders, caProviderOptionLabel } from '@/utils/caProviderOptions'
 import { popperViewportSafe } from '@/utils/popper'
 import { hostPortKey } from '@/utils/upstreamKeys'
 import { MAX_UPSTREAM_ROWS, normalizeWeights, payloadWeight, redistributeWeight, weightPercent } from '@/utils/upstreamWeights'
@@ -1415,15 +1434,9 @@ interface CertInfo {
   error?: string
 }
 
-interface CertJob {
-  id: number
-  rule_id: string
-  domain: string
-  status: CertJobStatus
-  message: string
-  expires_at?: string | null
-  ca_available_after?: string | null
-}
+// 证书任务精简视图：types/index.ts CertJobListItem（后端 certJobListItem 投影
+// 单源）的 Pick 子集——后端字段增改时只动一处。
+type CertJob = Pick<CertJobListItem, 'id' | 'rule_id' | 'domain' | 'status' | 'message' | 'expires_at' | 'ca_available_after'>
 
 class CertInfoRefreshError extends Error {
   readonly name = 'CertInfoRefreshError'
@@ -1790,7 +1803,9 @@ const upstreamTouched = ref<boolean[]>([])
 let nextTemporaryPathRuleId = -1
 const certConfigs = ref<CertificateConfig[]>([])
 const caProviders = ref<CAProvider[]>([])
-const enabledCAProviders = computed(() => caProviders.value.filter(p => p.enabled))
+// 启用项 ∪ 当前选中项（存量规则指向已禁用 CA 时回显「名称（已禁用）」灰态选项，
+// 不再显示裸数字 id——原口径会让用户以为未设置而实际仍引用旧 CA）
+const wizardCAProviderOptions = computed(() => selectableCAProviders(caProviders.value, Number(wizardForm.ca_provider_id || 0)))
 const healthStatus = ref<Record<string, { healthy: number; unhealthy: number; degraded: number; unknown: number; na: number; total: number; upstreams: Record<string, { healthy: boolean; unknown: boolean; dynamic?: boolean; degraded?: boolean; num_requests?: number; fails?: number }> }>>({})
 // Config viewing
 const configDialogVisible = ref(false)
@@ -1810,9 +1825,9 @@ let ruleLogRequestSeq = 0
 const ruleLogHtml = computed(() => ansiToHtml(ruleLogContent.value || '暂无日志'))
 const ruleConfig = ref<RuleConfigView | null>(null)
 
-// 结构性简化（D 域 2(e)）：四方 host 门的核心谓词单源化——红框/常驻警告/
-// 步进门三条腿此前手工维护同一条件（消息腿落后一轮正是该维护风险
-// 的实证），现共用一个谓词；提交过滤（host+port 载荷身份）概念不同、不参与。
+// 结构性简化（D 域 2(e)）：host 门谓词单源化——红框/常驻警告/步进门/提交门
+// 四腿共用同一谓词（提交门先全量置 touched 再判定，与步进门口径一致）；
+// 载荷过滤（host+port 身份）概念不同、不参与。
 const upstreamRowNeedsHost = (u: UpstreamInput, i: number): boolean =>
   !u.host && u.enabled !== false && upstreamTouched.value[i]
 
@@ -2305,12 +2320,23 @@ const portWarning = computed(() => {
 // 策略文案映射提取至 utils/strategyLabels（Dashboard 共用，
 // 死键 header 已删）。
 
+// 三个辅助端点（更新者列/ACME DNS 配置/CA 提供商）失败必须显性化——
+// 原仅 console.error：「更新者」列全列回落「-」与「无更新者」不可区分、
+// ACME 规则编辑时 DNS 配置下拉空白（用户被「请选择 DNS 提供商配置」拦住却
+// 无法判断是未配置还是加载失败）、CA 选择器只剩「系统默认」。
+const usersLoadError = ref(false)
+const certConfigsLoadError = ref(false)
+const caProvidersLoadError = ref(false)
+const auxDataLoadFailed = computed(() => usersLoadError.value || certConfigsLoadError.value || caProvidersLoadError.value)
+
 const fetchUsers = async () => {
   try {
   const res = await request.get<APIResponse<UserListItem[]>>('/users')
     users.value = res.data || []
+    usersLoadError.value = false
   } catch (e) {
     console.error('Failed to fetch users:', e)
+    usersLoadError.value = true
   }
 }
 
@@ -2318,8 +2344,10 @@ const fetchCertConfigs = async () => {
   try {
     const res = await request.get<APIResponse<CertificateConfig[]>>('/certificate-configs')
     certConfigs.value = res.data || []
+    certConfigsLoadError.value = false
   } catch (e) {
     console.error('Failed to fetch cert configs:', e)
+    certConfigsLoadError.value = true
   }
 }
 
@@ -2327,9 +2355,17 @@ const fetchCAProviders = async () => {
   try {
     const res = await request.get<APIResponse<CAProvider[]>>('/ca-providers')
     caProviders.value = res.data || []
+    caProvidersLoadError.value = false
   } catch (e) {
     console.error('Failed to load CA providers:', e)
+    caProvidersLoadError.value = true
   }
+}
+
+const retryAuxData = () => {
+  if (usersLoadError.value) void fetchUsers()
+  if (certConfigsLoadError.value) void fetchCertConfigs()
+  if (caProvidersLoadError.value) void fetchCAProviders()
 }
 
 const validateCertificate = async () => {
@@ -2758,17 +2794,11 @@ const updateRuleProxyTimeout = (field: keyof ProxyTimeoutConfig, value: number):
 // 关闭/切 TCP=恢复默认（原值不保留记忆）。被接管控件呈灰态 + 「NTLM 接管」徽标 ──
 const ntlmOn = computed(() => wizardForm.protocol === 'http' && wizardForm.ntlm_compatible === 1)
 
-const strategyCardOptions = computed(() => {
-  const cards = [
-    { value: 'weighted_round_robin', title: '轮询', desc: '按上游权重比例分配，权重相同即为普通轮询' },
-    { value: 'least_conn', title: '最少连接', desc: '优先分配给连接数最少的服务器' },
-    { value: 'ip_hash', title: 'IP 哈希', desc: '按客户端 IP 固定分配' },
-  ]
-  if (wizardForm.protocol === 'http') {
-    cards.push({ value: 'cookie', title: 'Cookie 粘滞', desc: '通过 Cookie 实现精确会话粘滞' })
-  }
-  return cards
-})
+// 卡片集与提交白名单（allowedStrategies）同源——utils/strategyLabels 的
+// STRATEGY_CARD_OPTIONS 与后端 validateStrategyForProtocol 白名单逐协议对齐
+//（含 random/first；cookie 仅 HTTP）。曾各自维护：白名单放行的 random/first
+// 在向导内无卡片高亮，点任意卡片即静默改写策略。
+const strategyCardOptions = computed(() => strategyCardsForProtocol(wizardForm.protocol))
 
 const selectStrategy = (strategy: string): void => {
   if (ntlmOn.value) return // NTLM 接管：策略锁定 cookie，其余卡片置灰不可选
@@ -2991,6 +3021,16 @@ const submitWizard = async () => {
     saving.value = false
     return
   }
+  // 启用上游 host 必填门（与步进门同谓词镜像——编辑态可点步标题跳步绕过
+  // nextStep 的 UPSTREAMS 分支；缺此门时空 host 行被载荷过滤静默剔除，
+  // 保存「成功」但规则少了上游）。touched 全置与步进门口径对齐，
+  // 同时让红框标出待补行。
+  upstreamTouched.value = wizardForm.upstreams.map(() => true)
+  if (wizardForm.upstreams.some((u, i) => upstreamRowNeedsHost(u, i))) {
+    ElMessage.warning('请填写所有已启用上游服务器的主机地址')
+    saving.value = false
+    return
+  }
   if (wizardForm.protocol === 'http' && wizardForm.custom_routes_enabled) {
     const pathRuleError = validatePathRules(wizardForm.path_rules)
     if (pathRuleError) {
@@ -3058,7 +3098,6 @@ const submitWizard = async () => {
   // 逐上游回源域名（2026-10-10）：与后端 validateRulePayloadBeforeSave 同口径——
   // 纯主机名不带端口（端口已有独立配置列）、仅 HTTP 静态上游可用
   // 正则双份收敛为共享 isValidHostName（标签首尾 alnum、63/253 与后端对齐）
-  const isValidOriginDomain = isValidHostName
   for (const [index, upstream] of wizardForm.upstreams.entries()) {
     const origin = (upstream.origin_domain || '').trim()
     if (origin === '') continue
@@ -3072,7 +3111,7 @@ const submitWizard = async () => {
       saving.value = false
       return
     }
-    if (!isValidOriginDomain(origin)) {
+    if (!isValidHostName(origin)) {
       ElMessage.warning(`上游 #${index + 1}：回源域名 "${origin}" 无效（仅支持主机名，不带端口）`)
       saving.value = false
       return
@@ -3085,9 +3124,7 @@ const submitWizard = async () => {
     saving.value = false
     return
   }
-  const allowedStrategies = wizardForm.protocol === 'tcp'
-    ? ['weighted_round_robin', 'ip_hash', 'least_conn', 'random', 'first']
-    : ['weighted_round_robin', 'ip_hash', 'least_conn', 'random', 'first', 'cookie']
+  const allowedStrategies = strategyValuesForProtocol(wizardForm.protocol)
   if (!allowedStrategies.includes(wizardForm.strategy)) {
     ElMessage.warning(`${wizardForm.protocol.toUpperCase()} 规则包含协议族不匹配的负载策略`)
     saving.value = false
@@ -3833,7 +3870,7 @@ watch(
 onMounted(() => {
   // 安全事件/策略页的「查看规则」交接改走 URL query（rs 参数），
   // 消费后 replaceState 清除——localStorage 通道在多标签/隐私模式下错乱。
-  const rs = new URLSearchParams(window.location.search).get('rs')
+  const rs = new URLSearchParams(window.location.search).get(DEEP_LINK_PARAMS.ruleSearch)
   if (rs) {
     searchQuery.value = rs
     window.history.replaceState(null, '', window.location.pathname)

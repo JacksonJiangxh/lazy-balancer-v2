@@ -36,7 +36,9 @@
         </el-form-item>
         <el-form-item label="CA 提供商" required>
           <el-select v-model="global.default_ca_provider_id" style="width: 240px;" placeholder="请选择 CA 提供商">
-            <el-option v-for="p in enabledCAProviders" :key="p.id" :label="p.name" :value="p.id" />
+            <!-- 选项=启用 ∪ 当前值（已禁用项仅回显、置 disabled 不可新选——
+                 原口径下存量指向已禁用 CA 时显示裸数字 id 但校验照过，自相矛盾） -->
+            <el-option v-for="p in defaultCAProviderOptions" :key="p.id" :label="caProviderOptionLabel(p)" :value="p.id" :disabled="!p.enabled" />
           </el-select>
           <span class="form-tip-inline">系统默认使用的证书签发机构</span>
         </el-form-item>
@@ -251,6 +253,7 @@ import { Check, Connection, Document, OfficeBuilding, Plus, Postcard, Setting } 
 import CertJobs from './CertJobs.vue'
 import DialogHeader from '@/components/DialogHeader.vue'
 import { credentialFieldVisible, credentialOptionLabel, defaultCredentialsFor, type CredentialFieldMeta } from '@/utils/dnsProviderFields'
+import { selectableCAProviders, caProviderOptionLabel } from '@/utils/caProviderOptions'
 import type { APIResponse } from '@/types'
 
 // 字段可见性/选项文案由后端元数据驱动（visible_when/option_labels），
@@ -354,8 +357,8 @@ const editingCAProvider = ref<CAProvider | null>(null)
 // 表单副本不再携带 credentials——凭证经 caCreds（EAB 键对）单独编辑，
 // 保存载荷按 provider 计算；原 `credentials: '{}'` 全文件零读取，误导读者以为
 // 表单凭证来源。（CAProvider.credentials 仍用于列表行解析，保留。）
-const caForm = reactive<Omit<CAProvider, 'credentials'>>({
-  id: 0,
+// id 同属死字段（Object.assign 不含、保存走 editingCAProvider.id）——一并剔除。
+const caForm = reactive<Omit<CAProvider, 'credentials' | 'id'>>({
   name: '',
   provider: 'zerossl',
   directory_url: '',
@@ -368,7 +371,7 @@ const caCreds = reactive<CAProviderCredentials>({
   eab_hmac_key: '',
 })
 
-const enabledCAProviders = computed(() => caProviders.value.filter(p => p.enabled))
+const defaultCAProviderOptions = computed(() => selectableCAProviders(caProviders.value, global.value.default_ca_provider_id))
 
 const selectedProvider = computed(() => providers.value.find(p => p.code === form.value.dns_provider))
 const authMode = computed(() => form.value.dns_credentials['auth_mode'] || '')

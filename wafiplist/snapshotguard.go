@@ -24,11 +24,6 @@ type SnapshotGeneration struct {
 	CommittedAt time.Time
 }
 
-// SameSnapshotGeneration 判定两份快照是否同代际（同内容，可直接复用）。
-func SameSnapshotGeneration(a, b SnapshotGeneration) bool {
-	return a.ModTime.Equal(b.ModTime) && a.Size == b.Size
-}
-
 // StaleSnapshotGeneration 判定 candidate 的内容代际是否比 current 旧：
 // current 的 mtime 更晚，或 mtime 相同但 current 更大（rename 换代 + 同秒
 // 截断场景下的保守判定）。成立时 candidate 是并发慢读者读到的旧内容，必须

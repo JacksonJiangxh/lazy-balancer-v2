@@ -4,7 +4,6 @@
       <el-input-number
         :model-value="value[field.key]"
         :min="field.min"
-        :max="86400"
         :placeholder="inheritLabel"
         :disabled="disabled || fieldOverrides?.[field.key]?.disabled === true"
         controls-position="right"
@@ -51,6 +50,10 @@ type TimeoutField = {
   readonly desc: string
   readonly suggest?: number
 }
+
+// 上限口径：后端 rule_features.go 仅校验「不能为负」与 flush_interval >= -1，无上限——
+// 长连接/流式（SSE/LLM 长响应、WebSocket 代理）合法需要 >24h。前端不设 max，
+// 避免把控件夹回 86400 造成带外/导入的更大值被静默改值。
 
 const fields: readonly TimeoutField[] = [
   { key: 'proxy_dial_timeout', label: '连接超时', min: 0, desc: '建立到上游 TCP 连接', suggest: 10 },

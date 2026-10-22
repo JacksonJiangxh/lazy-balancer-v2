@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import type { APIResponse, ClusterNodeMode, CurrentUser } from '@/types'
+import type { APIResponse, ClusterNodeMode, CurrentUser, GlobalConfigData } from '@/types'
 import { isTokenExpired, request, ApiRequestError } from '@/utils/api'
 import { ElMessage } from 'element-plus'
 import { isPageId, type PageId } from '@/utils/pageIds'
@@ -162,11 +162,16 @@ export const useAuthStore = defineStore('auth', () => {
     }, 15_000)
   }
 
+  // /config 投影 = GlobalConfigData 消费字段子集 + 集群专属 is_master。
+  type ConfigProjection = { readonly is_master: boolean } & Partial<Pick<GlobalConfigData, 'timezone' | 'cert_renewal_days' | 'mfa_write_guard'>>
+
   async function fetchConfig(silent = false) {
     if (!token.value || configFetchInFlight) return
     configFetchInFlight = true
     try {
-      const res = await request.get<APIResponse<{ readonly is_master: boolean; readonly timezone?: string; readonly cert_renewal_days?: number; readonly mfa_write_guard?: boolean }>>('/config', { silent })
+      // 投影复用 GlobalConfigData 声明（该接口为 GET /config 响应单一事实源）；
+      // is_master 是集群专属字段、不在 GlobalConfigData 面内，store 侧并集补充。
+      const res = await request.get<APIResponse<ConfigProjection>>('/config', { silent })
       if (res.data) {
         nodeMode.value = res.data.is_master ? 'master' : 'slave'
         if (res.data.timezone) timezone.value = res.data.timezone

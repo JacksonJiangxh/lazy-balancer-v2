@@ -2,6 +2,8 @@ package caddygeoip
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -28,6 +30,30 @@ func findTestXdb() string {
 		}
 	}
 	return ""
+}
+
+// testdataXdbSHA256 是仓库测试夹具 testdata/ip2region_v4.xdb 的内容指纹钉：
+// 该夹具是地域树/规范化/发射测试的唯一数据源，被替换或与生产库代次分叉时
+// 测试会在与生产不同的数据上保持绿色（少量 IP 断言只能部分兜底）——改动
+// 夹具必须显式更新本钉。
+//
+// 来源口径：夹具是**仓库独立代次**，不是 Dockerfile 下载物。生产镜像钉
+// ip2region v3.17.0 的 ip2region_v4.xdb（sha256 6307a969…，中国段城市列
+// 为拼音的 45 条与本仓 CityPinyinFixes 表一一对应）；本夹具的中国段 ASCII
+// 城市列与 v3.18.0 同形（只有「台湾省|Taichung County」一条，见
+// CityPinyinFixes 的 Taichung County 条目说明），二者内容不同属设计现状。
+const testdataXdbSHA256 = "95e00400137b517ef97ad0f3c808ff8ca397575d8669bec1b7f32948ff13a7f6"
+
+func TestTestdataXDB_fingerprintPinned(t *testing.T) {
+	path := filepath.Join("testdata", "ip2region_v4.xdb")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("仓库测试夹具必须随仓提供（不得用 skip 掩盖缺失）: %v", err)
+	}
+	sum := sha256.Sum256(data)
+	if got := hex.EncodeToString(sum[:]); got != testdataXdbSHA256 {
+		t.Fatalf("testdata/ip2region_v4.xdb sha256=%s, want %s（夹具变更须显式更新指纹与来源说明）", got, testdataXdbSHA256)
+	}
 }
 
 func TestCaddyModule_registers_as_http_handlers_geoip2region(t *testing.T) {
@@ -88,7 +114,8 @@ func TestProvision_missing_xdb_disables_lookups_and_passes_through(t *testing.T)
 	if !nextCalled {
 		t.Fatal("next handler was not called")
 	}
-	// geoip.country_code 死发射已删除（fields[4]=ISP 列语义错位），
+	// geoip.country_code 死发射已删除：v4 xdb 行是 国家|省|市|ISP|国家代码
+	// （fields[3]=ISP，fields[4]=国家代码），该变量无任何消费方（纯死发射），
 	// 任何路径都不得再产出该变量。
 	if _, ok := repl.GetString("geoip.country_code"); ok {
 		t.Fatal("geoip.country_code must not be published (dead emission removed)")
@@ -361,9 +388,10 @@ func TestGeoipLocFor_trimsChinaCountryColumn(t *testing.T) {
 	}
 }
 
-// 发射侧国家列 TrimSpace——变量/头/统计桶与 geoipLocFor 同口径。
-// 空白异形行（" 中国"）修复前出现 Loc=广东省 但 country_name=" 中国" 的
-// 自相矛盾取值。
+// 发射侧国家列 TrimSpace + 异体归一——变量/头与 geoipLocFor、统计桶同口径
+// （中文异体「美国」折叠为规范名；「中国」保留；Reserved/0/空归空串）。
+// 修复前变量/头发射原始列：同一 xdb 行 Loc=United States 而
+// country_name=美国，按 Country 头/变量的匹配对异体段恒不命中。
 func TestParseGeoIPRegion_trimsCountryForEmission(t *testing.T) {
 	cases := []struct {
 		region      string
@@ -374,7 +402,8 @@ func TestParseGeoIPRegion_trimsCountryForEmission(t *testing.T) {
 		{" 中国|广东省|深圳市|0|ISP", "中国", "广东省/深圳市"},
 		{"\t中国 |广东省|0|0|ISP", "中国", "广东省"},
 		{"United States|0|0|0|ISP", "United States", "United States"},
-		{" 美国|0|0|0|ISP", "美国", "United States"},
+		{" 美国|0|0|0|ISP", "United States", "United States"},
+		{"Reserved|Reserved|Reserved|0|0", "", "海外"},
 	}
 	for _, tc := range cases {
 		got, ok := parseGeoIPRegion(tc.region)
@@ -396,9 +425,11 @@ func TestParseGeoIPRegion_trimsCountryForEmission(t *testing.T) {
 // TestParseGeoIPRegion_noCityWithoutProvince：随包三份
 // xdb（caddygeoip/testdata、data/、data-slave/，各 553,954+ 段全量扫描）中
 // 「国家=中国 + 省列无效 + 城市列有效」的行数为 0——省列无效的 13 种 region
-// 串（如「中国|0|0|阿里|CN」）城市列同为 0/空。因此不会发射树侧不可表达的
-// 「/城市」Loc 值：省无效行 Loc 为空（省/城市规则均不命中，与树不变式一致），
-// 台湾城市误置省列的行由 ProvinceForEmit 归一为台湾省，仍落「省/城市」形态。
+// 串（如「中国|0|0|阿里|CN」）城市列同为 0/空。但 xdb 可在线更新，
+// parseGeoIPRegion 另有代码级守卫（省列归一为空 ⇒ 城市置空），新库即使
+// 引入该形态也不会发射树侧不可表达的「/城市」Loc 值：省无效行 Loc 为空
+// （省/城市规则均不命中，与树不变式一致），台湾城市误置省列的行由
+// ProvinceForEmit 归一为台湾省，仍落「省/城市」形态。
 func TestParseGeoIPRegion_noCityWithoutProvince(t *testing.T) {
 	cases := []struct {
 		region   string
@@ -412,6 +443,10 @@ func TestParseGeoIPRegion_noCityWithoutProvince(t *testing.T) {
 		{"中国|0|0|中国移动|CN", "", "", ""},
 		// 台湾城市误置省列：省列归一为台湾省（树侧同样挂到台湾省下）。
 		{"中国|台中市|0|0|CN", "台湾省", "台中市", "台湾省/台中市"},
+		// 假设形态（现有库 0 行，在线更新引入时的守卫对象）：省无效但城市
+		// 有效——城市必须随省一起置空，不得发射「/城市」死值。
+		{"中国|0|杭州市|阿里|CN", "", "", ""},
+		{"中国||深圳市|0|CN", "", "", ""},
 	}
 	for _, tc := range cases {
 		got, ok := parseGeoIPRegion(tc.region)

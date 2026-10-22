@@ -42,28 +42,33 @@ var TaiwanCities = map[string]bool{
 	"桃园市": true, "云林县": true, "苗栗县": true,
 }
 
-// CityPinyinFixes xdb 部分段的城市列为拼音/英文形态（v3.17.0 实测 45 条，
-// 如 Guangzhou Shi/Shanghai/Taipei City）——映射为规范中文名；不在此表的
-// ASCII 城市由选项树侧过滤（宁缺勿乱，无法可靠音译）、发射侧原样通过
-// （恒不命中，与不可识别省同语义）。自此发射侧同步映射——
+// CityPinyinFixes xdb 部分段的城市列为拼音/英文形态（v3.17.0 生产库
+// 全段扫描实测 45 条 + 仓库测试夹具 1 条 Taichung County，如
+// Guangzhou Shi/Shanghai/Taipei City）——映射为现行行政区划规范中文名；
+// 不在此表的 ASCII 城市由选项树侧过滤（宁缺勿乱，无法可靠音译）、发射侧
+// 原样通过（恒不命中，与不可识别省同语义）。自此发射侧同步映射——
 // 城市级 CEL 规则对拼音段可命中。
+// 译名以现行行政区划为准（v3.17.0 段属列逐条核对）：邯山区（邯郸市，非
+// 不存在的「含山区」）、临邑县（德州市，临沂为地级市无「临沂县」）、虢镇
+// （宝鸡市陈仓区虢镇街道，「郭镇」是他处地名）、丰原区/台中市（2010 年
+// 台中县市合并，丰原市/台中县已成历史名）。
 // 只读：禁止修改（全局单份）。
 var CityPinyinFixes = map[string]string{
 	"Wulumuqi": "乌鲁木齐市", "Shanghai": "上海市", "Beijing": "北京市",
-	"Fengyuan": "丰原市", "Taipei City": "台北市", "Taichung County": "台中县", "Zhongli District": "中坜区",
+	"Fengyuan": "丰原区", "Taipei City": "台北市", "Taichung County": "台中市", "Zhongli District": "中坜区",
 	"Changchun Shi": "长春市", "Chengdu Shi": "成都市", "Tianjin": "天津市",
 	"Fuyang Shi": "阜阳市", "Hefei Shi": "合肥市", "Heze Shi": "菏泽市",
-	"Jining Shi": "济宁市", "Linyi Xian": "临沂县", "Weifang Shi": "潍坊市",
+	"Jining Shi": "济宁市", "Linyi Xian": "临邑县", "Weifang Shi": "潍坊市",
 	"Dongguan Shi": "东莞市", "Foshan Shi": "佛山市", "Guangzhou Shi": "广州市",
 	"Maoming Shi": "茂名市", "Shenzhen": "深圳市", "Zhuhai Shi": "珠海市",
 	"Nanning Shi": "南宁市", "Nanjing Shi": "南京市", "Nantong Shi": "南通市",
 	"Tongshan": "铜山区", "Yancheng Shi": "盐城市", "Ganzhou Shi": "赣州市",
-	"Baoding Shi": "保定市", "Hanshan Qu": "含山区", "Langfang Shi": "廊坊市",
+	"Baoding Shi": "保定市", "Hanshan Qu": "邯山区", "Langfang Shi": "廊坊市",
 	"Shijiazhuang Shi": "石家庄市", "Nanyang Shi": "南阳市", "Zhengzhou Shi": "郑州市",
 	"Zhoukou Shi": "周口市", "Zhumadian Shi": "驻马店市", "Ningbo Shi": "宁波市",
 	"Wuhan Shi": "武汉市", "Xiangyang": "襄阳市", "Changsha Shi": "长沙市",
 	"Hengyang Xian": "衡阳县", "Shenyang Shi": "沈阳市", "Chongqing": "重庆市",
-	"Guozhen": "郭镇", "Xi'an Shi": "西安市", "Kowloon": "九龙",
+	"Guozhen": "虢镇", "Xi'an Shi": "西安市", "Kowloon": "九龙",
 }
 
 // AutonomousPrefectures（用户反馈：「大理/怒江/凉山缺市字」——

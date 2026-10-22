@@ -8,9 +8,10 @@
     </template>
     <div class="polling-error-meta">{{ jobsPollingErrorDescription }}</div>
   </el-alert>
-  <!-- 宽度观测容器：容器变窄时按优先级隐藏低价值列（见 utils/certJobColumns），
-       任何宽度都不出现水平滚动条。 -->
-  <div ref="tableWrapRef" class="cert-jobs-wrap">
+  <!-- 宽度观测容器：容器变窄时按优先级隐藏低价值列（见 utils/certJobColumns）。
+       收敛下限 619px（不可让位列合计）；更窄时切 overflow-x:auto——「日志/重签」
+       操作列可达性优先于无滚动条目标（overflow:hidden 会把操作列硬裁到不可见）。 -->
+  <div ref="tableWrapRef" class="cert-jobs-wrap" :class="{ 'cert-jobs-wrap--scroll': tableBelowMinWidth }">
   <el-table
     v-if="loading || jobs.length > 0"
     :data="jobs"
@@ -141,35 +142,19 @@ import { request, mfaAwareSuccess } from '@/utils/api'
 import { useLogTailPolling } from '@/composables/useLogTailPolling'
 import LogStorageBar from '@/components/LogStorageBar.vue'
 import { formatDate, formatDateShort } from '@/utils/date'
-import { pickVisibleCertJobColumns } from '@/utils/certJobColumns'
+import { CERT_JOB_COLUMNS_MIN_WIDTH, pickVisibleCertJobColumns } from '@/utils/certJobColumns'
 import { escapeHtml } from '@/utils/escape'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
-import type { APIResponse, CertJobsPage } from '@/types'
+import type { APIResponse, CertJobsPage, CertJobListItem } from '@/types'
 import { certJobStatusLabel, certJobStatusTone, certJobRetryReady } from '@/utils/certJobStatus'
 import type { CertJobStatus } from '@/utils/certJobStatus'
 import { usePollingTask } from '@/composables/usePollingTask'
 import { usePollingErrorState } from '@/composables/usePollingErrorState'
 
-interface CertJob {
-  id: number
-  rule_id: string
-  domain: string
-  status: CertJobStatus
-  message: string
-  expires_at?: string | null
-  updated_at?: string | null
-  retry_cooldown_seconds: number | null
-  issuer?: string
-  days_remaining: number
-  certificate_status: CertificateStatus
-  ca_provider_name?: string
-  renewal_attempts?: number
-  ca_available_after?: string | null
-  last_error_code?: string
-}
-
-type CertificateStatus = 'expired' | 'expiring' | 'unknown' | 'valid'
+// 视图类型收敛 types/index.ts 的 CertJobListItem（后端 certJobListItem 投影单源）。
+type CertJob = CertJobListItem
+type CertificateStatus = CertJobListItem['certificate_status']
 
 const authStore = useAuthStore()
 const isReadOnly = computed(() => authStore.readOnlyReason !== null)
@@ -182,6 +167,9 @@ let disposed = false
 const tableWrapRef = ref<HTMLDivElement | null>(null)
 const tableWrapWidth = ref(Number.POSITIVE_INFINITY)
 const visibleColumns = computed(() => pickVisibleCertJobColumns(tableWrapWidth.value))
+// 最小集（619px）之下表格必然溢出：overflow:hidden 会把「操作」列裁到不可达，
+// 切横向滚动兜底（可达性优先）。
+const tableBelowMinWidth = computed(() => tableWrapWidth.value < CERT_JOB_COLUMNS_MIN_WIDTH)
 let tableWrapObserver: ResizeObserver | null = null
 
 const coolingHint = (row: CertJob): string => {
@@ -251,7 +239,10 @@ const retryDisabledReason = (row: CertJob): string => {
   if (isReadOnly.value) return authStore.readOnlyMessage
   if (row.status === 'disabled') return '已禁用的任务无法重签'
   if (canRetry(row)) return ''
-  return `当前状态需等待 ${Math.ceil((row.retry_cooldown_seconds ?? 0) / 60)} 分钟后重签`
+  // 冷却秒数为 null 时「等待 0 分钟」是自相矛盾的文案——不可重试且无冷却
+  // 信息（契约漂移形态）给无行动指引的中性文案。
+  if (row.retry_cooldown_seconds === null || row.retry_cooldown_seconds === undefined) return '当前状态暂不可重签'
+  return `当前状态需等待 ${Math.ceil(row.retry_cooldown_seconds / 60)} 分钟后重签`
 }
 
 // 自动重签时间 = 证书到期前 certRenewalDays 天；返回 ISO 原值，列内紧凑格式
@@ -447,8 +438,12 @@ onUnmounted(() => {
   color: #ef4444;
 }
 .cert-jobs-wrap {
-  /* 表格自身按列宽自适应；容器裁掉任何溢出，杜绝页面级/卡片级横向滚动 */
+  /* 表格自身按列宽自适应；宽于最小集时容器裁掉任何溢出，杜绝页面级/卡片级横向滚动 */
   overflow: hidden;
+}
+.cert-jobs-wrap--scroll {
+  /* 窄于最小集（619px）：列让位已耗尽，恢复横向滚动保住操作列可达 */
+  overflow-x: auto;
 }
 .cert-jobs-table {
   width: 100%;

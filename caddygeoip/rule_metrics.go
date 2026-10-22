@@ -30,6 +30,15 @@ type RuleMetricsHandler struct {
 	statusTotal      *prometheus.CounterVec
 	bytesTotal       *prometheus.CounterVec
 	requestsInFlight *prometheus.GaugeVec
+
+	// 预解析标签句柄（Provision 期一次性 WithLabelValues）：Rule 是渲染期
+	// 静态值，每请求 6 次 vec map 查找（读锁+哈希）是纯浪费——热路径只对
+	// 句柄 Inc/Add。nil 表示指标未注册（降级 no-op，与 nil vec 守卫同语义）。
+	reqCounter    prometheus.Counter
+	inFlight      prometheus.Gauge
+	bytesIn       prometheus.Counter
+	bytesOut      prometheus.Counter
+	statusByClass map[string]prometheus.Counter
 }
 
 func init() {
@@ -66,6 +75,16 @@ func (h *RuleMetricsHandler) Provision(ctx caddy.Context) error {
 		Namespace: "lazybalancer", Name: "requests_in_flight",
 		Help: "In-flight requests per load balancer rule.",
 	}, []string{"rule"}))
+	// 预解析本实例的全部标签句柄——同一 vec 重复 Provision（注册复用路径）
+	// 重建句柄指向同一下层序列，安全。
+	h.reqCounter = h.requestsTotal.WithLabelValues(h.Rule)
+	h.inFlight = h.requestsInFlight.WithLabelValues(h.Rule)
+	h.bytesIn = h.bytesTotal.WithLabelValues(h.Rule, "in")
+	h.bytesOut = h.bytesTotal.WithLabelValues(h.Rule, "out")
+	h.statusByClass = make(map[string]prometheus.Counter, len(statusClasses))
+	for _, class := range statusClasses {
+		h.statusByClass[class] = h.statusTotal.WithLabelValues(h.Rule, class)
+	}
 	return nil
 }
 
@@ -76,6 +95,10 @@ func isHandlerError(err error) bool {
 	var herr caddyhttp.HandlerError
 	return errors.As(err, &herr)
 }
+
+// statusClasses 状态类全集——statusClass 的每个返回值都必须在此列出
+// （Provision 按本表预解析句柄，ServeHTTP 查表命中）。
+var statusClasses = []string{"2xx", "3xx", "4xx", "5xx", "other"}
 
 // statusClass 归类状态码到 2xx/3xx/4xx/5xx(其他归 "other")。
 func statusClass(status int) string {
@@ -97,9 +120,9 @@ func statusClass(status int) string {
 // 读最终 status(含 coraza 中断的 HandlerError.StatusCode)与响应大小;
 // 请求大小用 Caddy 同款的近似估算(头+体)。nil metrics 守卫(注册失败降级)。
 func (h *RuleMetricsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	if h.requestsInFlight != nil {
-		h.requestsInFlight.WithLabelValues(h.Rule).Inc()
-		defer h.requestsInFlight.WithLabelValues(h.Rule).Dec()
+	if h.inFlight != nil {
+		h.inFlight.Inc()
+		defer h.inFlight.Dec()
 	}
 
 	statusCode := 200
@@ -116,21 +139,21 @@ func (h *RuleMetricsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, n
 		}
 	}
 
-	if h.requestsTotal != nil {
-		h.requestsTotal.WithLabelValues(h.Rule).Inc()
+	if h.reqCounter != nil {
+		h.reqCounter.Inc()
 	}
 	// 非 HandlerError 错误不计状态类(与 Caddy 自身
 	// instrumentation 同口径 metrics.go:368-373——错误只计 requestErrors,不计
 	// 2xx 状态类);HandlerError 携 statusCode 照常归类。
-	if h.statusTotal != nil && (err == nil || isHandlerError(err)) {
-		h.statusTotal.WithLabelValues(h.Rule, statusClass(statusCode)).Inc()
+	if h.statusByClass != nil && (err == nil || isHandlerError(err)) {
+		h.statusByClass[statusClass(statusCode)].Inc()
 	}
 	// 非 HandlerError 错误不计字节(与 Caddy 自身
 	// instrumentation 同口径——错误路径不观测 size);HandlerError 携 statusCode
 	// 照常计（状态类与字节口径对齐）。
-	if h.bytesTotal != nil && (err == nil || isHandlerError(err)) {
-		h.bytesTotal.WithLabelValues(h.Rule, "in").Add(float64(computeApproximateRequestSize(r)))
-		h.bytesTotal.WithLabelValues(h.Rule, "out").Add(float64(wrec.Size()))
+	if h.bytesIn != nil && (err == nil || isHandlerError(err)) {
+		h.bytesIn.Add(float64(computeApproximateRequestSize(r)))
+		h.bytesOut.Add(float64(wrec.Size()))
 	}
 	return err
 }

@@ -26,7 +26,7 @@ func TestCreateRule_pathUpstreamAddressTrimmedOnWrite(t *testing.T) {
 	body := `{"name":"path-trim","protocol":"http","domain":"pathtrim.test","listen_port":18840,"custom_routes_enabled":true,` +
 		`"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,` +
 		`"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}],` +
-		`"path_rules":[{"path":"/a","match_type":"prefix","upstreams":[{"address":" up.test ","port":9001}]}]}`
+		`"path_rules":[{"path":"/a","match_type":"prefix","upstreams":[{"address":" up.test ","port":9001,"weight":1}]}]}`
 	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()

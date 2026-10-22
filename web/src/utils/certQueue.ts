@@ -24,8 +24,8 @@ export const certQueueIsBusy = (q: Pick<CertQueueCounts, 'queued' | 'running' | 
 /** 存活任务总数 > 0（status_counts 聚合值，与首页行数解耦）。 */
 export const certQueueHasLive = (q: Pick<CertQueueCounts, 'total'>): boolean => q.total > 0
 
-/** 已列出的 chip 数（最多 4 个；首页存活行不足时按实际行数）。 */
-export const certQueueShownCount = (q: Pick<CertQueueCounts, 'jobs'>): number =>
+/** 已列出的 chip 数（最多 4 个；首页存活行不足时按实际行数）。模块内 helper。 */
+const certQueueShownCount = (q: Pick<CertQueueCounts, 'jobs'>): number =>
   Math.min(CERT_QUEUE_VISIBLE_JOBS, q.jobs.length)
 
 /** 「+N」折叠数 = 存活总数 − 已列出数。此前恒用 `total - 4`，行数不足时偏大。 */

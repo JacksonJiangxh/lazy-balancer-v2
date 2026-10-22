@@ -152,8 +152,8 @@ import { ArrowRight } from '@element-plus/icons-vue'
 import SyntaxHighlight from '@/components/SyntaxHighlight.vue'
 import { request } from '@/utils/api'
 import { formatDate } from '@/utils/date'
-import { parseIPList, parseRefIds, entryMatchesIp, triggerStageFamily, sharedEntriesCache, subscribeSharedEntriesCache, ensureSharedEntries, formatDurationUs, eventDetailRefIds, detectionModeExplains, isTrustExemptionCandidate } from '@/utils/securityStages'
-import { useCrsRuleIndex } from '@/composables/useCrsRuleIndex'
+import { parseIPList, parseRefIds, createIpMatcher, triggerStageFamily, sharedEntriesCache, subscribeSharedEntriesCache, ensureSharedEntries, formatDurationUs, eventDetailRefIds, detectionModeExplains, isTrustExemptionCandidate } from '@/utils/securityStages'
+import { issueCrsIndexSession, useCrsRuleIndex } from '@/composables/useCrsRuleIndex'
 import { useCountryNamesCn, countryLabel } from '@/composables/useCountryNamesCn'
 import type { APIResponse } from '@/types'
 
@@ -237,18 +237,7 @@ const formatTriggerTime = (v: string): string => formatDate(v)
 // 组合语义说明：logged 事件的「为什么不拦」——检测模式策略 或
 // 信任保留检测（含跨策略豁免：预检 DetectionOnly 为事务级全局，命中策略与
 // 豁免信任策略可以是两条不同策略——「黑名单命中但被另一策略的信任放行为检测」）。
-const exemptingTrustPolicy = computed<string | null>(() => {
-  if (!props.row || props.row.action === 'blocked') return null
-  const ip = props.row.client_ip.trim()
-  // 策略详情端点不过滤 enabled——属主策略可能事后被禁用，禁用策略不
-  // 渲染、不可能放行，不得参与豁免归因（判定单源 isTrustExemptionCandidate）。
-  for (const p of [policy.value, ...enabledPolicies.value].filter((x): x is PolicyRow => !!x && isTrustExemptionCandidate(x))) {
-    if (parseIPList(p.ip_whitelist).some((e) => entryMatchesIp(e, ip))) return p.name
-    const refs = parseRefIds(p.ip_whitelist_refs)
-    if (refs.some((id) => (entriesCache.value[id] ?? []).some((e) => entryMatchesIp(e, ip)))) return p.name
-  }
-  return null
-})
+const exemptingTrustPolicy = computed<string | null>(() => ipHitScan.value.exemptingPolicy)
 const detectionNote = computed<string>(() => {
   if (!props.row || props.row.action === 'blocked') return ''
   if (kind.value === 'trust') return ''
@@ -531,15 +520,54 @@ const wafSummary = computed(() => {
 // 全部命中列表（补漏1）：自定义 + 内置威胁名单（只读展示名单名，
 // 原实现只对自定义列表出「命中列表」行、内置名单仅泛化 tip——同一 IP 同时
 // 命中 测试列表+中科大恶意IP名单 时内置侧不可见）。
-const allHitLists = computed(() => {
+// 单次扫描产出全部命中结论（FE 性能收敛）：此前 allHitLists/inlineAclHit/
+// trustHitListsText/trustHitNote/memberSystemTip/exemptingTrustPolicy 各自整表
+// 扫描且每个 CIDR 条目即时重解析。此处 IP 预解析一次（createIpMatcher）、
+// 每个名单只判定一次（hitById 记忆化），六个消费方共享同一次遍历。
+// CIDR 感知匹配是历史用户验收口径——威胁库条目为 CIDR（如 45.148.10.0/24），
+// 精确串匹配漏报导致「未定位到命中的地址列表」误显。
+const ipHitScan = computed(() => {
   const p = policy.value
-  if (!p) return []
-  const refs = parseRefIds(p.ip_acl_list_refs)
   const ip = props.row?.client_ip.trim() ?? ''
-  // 历史用户验收：CIDR 感知匹配——威胁库条目为 CIDR（如 45.148.10.0/24），
-  // 精确串匹配漏报导致「未定位到命中的地址列表」误显
-  return lists.value.filter((l) => refs.includes(l.id) && (entriesCache.value[l.id] ?? []).some((e) => entryMatchesIp(e, ip)))
+  const empty = {
+    aclHit: [] as Array<{ id: number; name: string; system?: number | boolean }>,
+    trustHit: [] as Array<{ id: number; name: string; system?: number | boolean }>,
+    inlineAcl: false,
+    ownerTrust: false,
+    sysAclHit: false,
+    exemptingPolicy: null as string | null,
+  }
+  if (!p || !ip) return empty
+  const matcher = createIpMatcher(ip)
+  const hitById = new Map<number, boolean>()
+  const listHit = (id: number): boolean => {
+    const cached = hitById.get(id)
+    if (cached !== undefined) return cached
+    const hit = (entriesCache.value[id] ?? []).some(matcher)
+    hitById.set(id, hit)
+    return hit
+  }
+  const aclRefs = parseRefIds(p.ip_acl_list_refs)
+  const trustRefs = parseRefIds(p.ip_whitelist_refs)
+  const aclHit = lists.value.filter((l) => aclRefs.includes(l.id) && listHit(l.id))
+  const trustHit = lists.value.filter((l) => trustRefs.includes(l.id) && listHit(l.id))
+  const inlineAcl = parseIPList(p.ip_acl_list).some(matcher)
+  // 信任已关闭时条目不生效（trustDead 同口径）
+  const ownerTrust = p.ip_whitelist_enabled === false
+    ? false
+    : parseIPList(p.ip_whitelist).some(matcher) || trustRefs.some((id) => listHit(id))
+  // 跨策略信任豁免归因：策略详情端点不过滤 enabled——属主策略可能事后被禁用，
+  // 禁用策略不渲染、不可能放行，不得参与豁免归因（判定单源 isTrustExemptionCandidate）。
+  let exemptingPolicy: string | null = null
+  if (props.row && props.row.action !== 'blocked') {
+    for (const candidate of [p, ...enabledPolicies.value].filter((x): x is PolicyRow => !!x && isTrustExemptionCandidate(x))) {
+      if (parseIPList(candidate.ip_whitelist).some(matcher)) { exemptingPolicy = candidate.name; break }
+      if (parseRefIds(candidate.ip_whitelist_refs).some((id) => listHit(id))) { exemptingPolicy = candidate.name; break }
+    }
+  }
+  return { aclHit, trustHit, inlineAcl, ownerTrust, sysAclHit: aclHit.some((l) => l.system), exemptingPolicy }
 })
+const allHitLists = computed(() => ipHitScan.value.aclHit)
 // 白名单外拒绝形态（补漏2）：id:5/7 = allow 交集外——IP 不在任何名单
 // 中，「命中列表」恒空是正确语义，须显式说明而非「未定位到」。
 const isAllowOutside = computed(() => {
@@ -547,38 +575,15 @@ const isAllowOutside = computed(() => {
   return kind.value === 'acl' && (n === 5 || n === 7)
 })
 
-const inlineAclHit = computed(() => {
-  const p = policy.value
-  // CIDR 感知（内联名单位 CIDR 条目命中实际 IP）
-  return !!p && parseIPList(p.ip_acl_list).some((e) => entryMatchesIp(e, props.row?.client_ip.trim() ?? ''))
-})
-const trustHitListsText = computed(() => {
-  const p = policy.value
-  if (!p) return ''
-  const ip = props.row?.client_ip.trim() ?? ''
-  const refs = parseRefIds(p.ip_whitelist_refs)
-  const hit = lists.value
-    .filter((l) => refs.includes(l.id) && (entriesCache.value[l.id] ?? []).some((e) => entryMatchesIp(e, ip)))
-    .map((l) => l.name)
-  return hit.join('、')
-})
+const inlineAclHit = computed(() => ipHitScan.value.inlineAcl)
+const trustHitListsText = computed(() => ipHitScan.value.trustHit.map((l) => l.name).join('、'))
 const trustHitNote = computed(() => {
-  const p = policy.value
-  if (!p || kind.value === 'trust') return ''
-  const ip = props.row?.client_ip.trim() ?? ''
-  const refs = parseRefIds(p.ip_whitelist_refs)
-  if (p.ip_whitelist_enabled === false) return '' // 信任已关闭时条目不生效（trustDead 同口径）
-  const trusted = parseIPList(p.ip_whitelist).some((e) => entryMatchesIp(e, ip))
-    || refs.some((id) => (entriesCache.value[id] ?? []).some((e) => entryMatchesIp(e, ip)))
-  return trusted ? '该 IP 在策略信任名单中（DetectionOnly：全评估不拦但全记录）' : ''
+  if (!policy.value || kind.value === 'trust') return ''
+  return ipHitScan.value.ownerTrust ? '该 IP 在策略信任名单中（DetectionOnly：全评估不拦但全记录）' : ''
 })
-const memberSystemTip = computed(() => {
-  const p = policy.value
-  if (!p) return ''
-  const ip = props.row?.client_ip.trim() ?? ''
-  const sysRefs = lists.value.filter((l) => l.system && parseRefIds(p.ip_acl_list_refs).includes(l.id) && (entriesCache.value[l.id] ?? []).some((e) => entryMatchesIp(e, ip)))
-  return sysRefs.length > 0 ? '内置威胁名单为只读来源；误报可将该 IP 加入信任名单豁免。' : ''
-})
+const memberSystemTip = computed(() =>
+  policy.value && ipHitScan.value.sysAclHit ? '内置威胁名单为只读来源；误报可将该 IP 加入信任名单豁免。' : ''
+)
 
 // —— WAF · 自定义规则明细 ——
 interface CustomRule {
@@ -673,7 +678,7 @@ watch(() => props.modelValue, (v) => {
   if (!v) return
   void loadAll()
   if (kind.value === 'waf-crs') {
-    const seq = ++crsDialogSeq
+    const seq = (crsDialogSeq = issueCrsIndexSession())
     crsSnippet.value = ''
     crsSnippetLoading.value = false
     crsSnippetExpanded.value = false

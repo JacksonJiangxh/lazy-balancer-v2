@@ -1,6 +1,7 @@
 package caddygeoip
 
 import (
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -68,6 +69,32 @@ func TestTrafficEventSnapshot_cursorAheadOfGenerationResets(t *testing.T) {
 	// 追平形态（since == 已分配最大 seq）不得复位，否则正常空窗会被反复重放。
 	if _, caught := trafficEventSnapshot(1, 10); caught != 1 {
 		t.Fatalf("caught-up next=%d, want 1 (must not reset)", caught)
+	}
+}
+
+// since 取 MaxUint64 时 since+1 回绕为 0：gap 判定若用 +1 比较会把
+// 「无空洞」误判成 gapSkipped=firstSeq 的无意义值。用减法比较后回绕安全；
+// 代际复位（next=0）语义不受影响。
+func TestTrafficEventSnapshot_maxCursorNoGapWrap(t *testing.T) {
+	resetTrafficState(t)
+	resetTrafficEvents()
+	trafficEventSeq.Store(0)
+	trafficCollectorEnabled.Store(false)
+	if err := acquireTrafficLease("maxcursor-test", time.Minute, 1); err != nil {
+		t.Fatal(err)
+	}
+	defer releaseTrafficLease("maxcursor-test")
+	trafficEventRecord("中国", "广东省") // 新一代际的 seq=1
+
+	events, next, gapSkipped := trafficEventSnapshotWithGap(math.MaxUint64, 10)
+	if gapSkipped != 0 {
+		t.Fatalf("gapSkipped=%d, want 0（since=MaxUint64 回绕不得误判空洞）", gapSkipped)
+	}
+	if next != 0 {
+		t.Fatalf("next=%d, want 0（超代际游标仍复位）", next)
+	}
+	if len(events) != 0 {
+		t.Fatalf("events=%+v, want empty", events)
 	}
 }
 

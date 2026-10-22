@@ -294,23 +294,25 @@ func (h *GeoIPHandler) setGeoIPPlaceholders(r *http.Request) {
 // geoIPRegionFields 是 xdb region 行的发射侧投影：变量、X-LB-GeoIP-* 头与
 // 流量统计桶全部消费同一份归一值，避免多路径各自取原始列造成口径漂移。
 type geoIPRegionFields struct {
-	Country  string // xdb 国家列（TrimSpace 归一）
+	Country  string // xdb 国家列（TrimSpace + 异体归一，与 Loc/统计桶同口径）
 	Region   string // xdb 原始 region 串（region 变量/头沿用）
 	Province string // 省列规范化值
-	City     string // 城市列规范化值
+	City     string // 城市列规范化值（省列为空时恒为空——树不变式）
 	Loc      string // 地域规则匹配键
 }
 
 // parseGeoIPRegion 把 xdb region 行解析为发射字段。
-// 国家列统一 TrimSpace——前变量/头发射原始列，而 geoipLocFor 与
-// geoipnames.NormalizeCountry 都 TrimSpace：空白异形行（" 中国"）会出现
-// Loc=广东省 但 country_name=" 中国" 的自相矛盾取值，统计桶也建成脏键。
+// 国家列统一 TrimSpace + NormalizeCountry 异体归一（复用统计桶入口的
+// normalizeTrafficCountryKey：「中国」保留、中文异体「美国」折叠为规范名、
+// 空/0/Reserved 归空串）——前变量/头发射原始列，而 geoipLocFor 与统计桶走
+// 归一值：同一 xdb 行会出现 Loc=United States 但 country_name=美国 的
+// 口径分裂，按 Country 头/变量的匹配对中文异体段恒不命中。
 func parseGeoIPRegion(region string) (geoIPRegionFields, bool) {
 	fields := strings.Split(region, "|")
 	if len(fields) < 5 {
 		return geoIPRegionFields{}, false
 	}
-	out := geoIPRegionFields{Country: strings.TrimSpace(fields[0]), Region: region}
+	out := geoIPRegionFields{Country: normalizeTrafficCountryKey(fields[0]), Region: region}
 	// 上方 len(fields)>=5 已保证,原两处 len>=3 守卫
 	// 恒真,直接执行块内逻辑。
 	if raw := fields[1]; raw != "" && raw != "0" {
@@ -331,6 +333,13 @@ func parseGeoIPRegion(region string) (geoIPRegionFields, bool) {
 		out.City = rawProv
 	} else if c := strings.TrimSpace(fields[2]); c != "" && c != "0" {
 		out.City = normalizeCity(c)
+	}
+	// 代码级不变量（树不变式）：省列归一为空时城市一律置空——不得发射
+	// 树侧不可表达的「/城市」Loc 或孤立城市变量。当前三份随包 xdb 全段扫描
+	// 该形态为 0 行，但 xdb 可在线更新，守卫把「新库引入脏形态」从静默
+	// 脏值变为显性丢弃。
+	if out.Province == "" {
+		out.City = ""
 	}
 	// geoipLocFor 承载三态判定。
 	out.Loc = geoipLocFor(fields[0], out.Province, out.City)

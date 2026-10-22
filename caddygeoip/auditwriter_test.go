@@ -3,6 +3,7 @@ package caddygeoip
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -101,10 +102,78 @@ func (f cannedFormatter) Format(plugintypes.AuditLog) ([]byte, error) { return f
 
 func (cannedFormatter) MIME() string { return "application/json" }
 
-// 审计写插件（lbfile）测试：入队/刷盘/轮转重开兼容/阻塞零丢/timing 注入。
+// gatedFormatter 阻塞在 Format 内直到 release 关闭——模拟「已入队、drain
+// 在途处理中」的收尾窗口。
+type gatedFormatter struct {
+	entered chan struct{}
+	release chan struct{}
+	body    []byte
+}
+
+func (f *gatedFormatter) Format(plugintypes.AuditLog) ([]byte, error) {
+	close(f.entered)
+	<-f.release
+	return f.body, nil
+}
+
+func (*gatedFormatter) MIME() string { return "application/json" }
+
+// 收尾刷盘必须先等 drain 排空（队列空+无在途处理）再刷 bufio——否则进程
+// 退出/reload 的 Cleanup 会把已入队未处理的审计行整批丢掉（旧实现只刷
+// bufio，在队行全损）。
+func TestAuditPipeline_flushWaitsForQueuedItems(t *testing.T) {
+	useTestAuditPipeline(t)
+	target := filepath.Join(t.TempDir(), "audit.log")
+	w := &lbAuditWriter{}
+	if err := w.Init(plugintypesConfigFor(t, target)); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	fmtr := &gatedFormatter{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+		body:    []byte(`{"gated":"ZZZ777"}`),
+	}
+	// 失败路径同样必须放行 drain（否则测试收尾会等一个永不返回的处理）。
+	var releaseOnce sync.Once
+	releaseGate := func() { releaseOnce.Do(func() { close(fmtr.release) }) }
+	t.Cleanup(releaseGate)
+	w.pipeline.enqueue(lbAuditItem{snap: &auditSnapshot{}, formatter: fmtr})
+	select {
+	case <-fmtr.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("drain 未进入在途处理")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		FlushAuditPipelines()
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("drain 在途时收尾刷盘必须等待（已入队行不得丢弃）")
+	case <-time.After(100 * time.Millisecond):
+	}
+	releaseGate()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("drain 完成后收尾刷盘未返回")
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !strings.Contains(string(data), "ZZZ777") {
+		t.Fatalf("收尾后审计行必须已落盘: %q", data)
+	}
+}
+
+// 审计写插件（lbfile）测试：入队/刷盘/轮转重开兼容/有界背压/timing 注入。
 // 写侧契约：决策→计时（请求路径，纯评估口径）→终态标记；审计
-// Write 只格式化+入队（阻塞式有界队列，零丢弃）；专职 drain goroutine 等待
-// per-tx 计时终态后注入 lb_timing 顶层字段并 bufio 批量刷盘。
+// Write 只格式化+入队（有界队列：字节预算+容量等待，超限丢弃并计数）；
+// 专职 drain goroutine 等待 per-tx 计时终态后注入 lb_timing 顶层字段并
+// bufio 批量刷盘。
 
 // useTestAuditPipeline 把默认管线参数收窄到测试量级并隔离全局注册表。
 // 清理顺序（t.Cleanup LIFO）：先注册「恢复全局参数」，后注册「收尾全部
@@ -1552,6 +1621,38 @@ func TestAuditTimingRegistry_preRetentionExpires(t *testing.T) {
 	auditTimingMu.Unlock()
 	if retained != 0 {
 		t.Fatalf("retained pre entries=%d, want 0（保留期到期必须回收）", retained)
+	}
+}
+
+// jsonStringEscapedLen 与 json.Marshal 逐字节等值钉：控制字符/HTML 安全
+// 字符/短转义/多字节 UTF-8/非法 UTF-8 全形态随机对拍——估算若与真实编码
+// 分叉，64KiB 上限口径会静默失真（超限漏丢或误丢）。
+func TestJSONStringEscapedLen_matchesEncodingJSON(t *testing.T) {
+	rng := rand.New(rand.NewPCG(20261022, 90))
+	alphabet := []rune("ab AZ09\"\\<>&=\b\f\n\r\t\x00\x1f\x7f中文字符é\u2028\u2029\ufffd")
+	check := func(s string) {
+		t.Helper()
+		quoted, err := json.Marshal(s)
+		if err != nil {
+			t.Fatalf("json.Marshal(%q): %v", s, err)
+		}
+		if got, want := jsonStringEscapedLen(s), len(quoted)-2; got != want {
+			t.Fatalf("jsonStringEscapedLen(%q)=%d, want %d（与 json.Marshal 等值）", s, got, want)
+		}
+	}
+	check("")
+	for range 2000 {
+		n := rng.IntN(24)
+		buf := make([]byte, 0, n*3)
+		for range n {
+			switch rng.IntN(8) {
+			case 0: // 非法 UTF-8 裸字节
+				buf = append(buf, byte(0x80+rng.IntN(0x80)))
+			default:
+				buf = append(buf, string(alphabet[rng.IntN(len(alphabet))])...)
+			}
+		}
+		check(string(buf))
 	}
 }
 

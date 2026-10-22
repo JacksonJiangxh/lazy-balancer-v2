@@ -1,7 +1,8 @@
 // 证书任务表「按容器宽收敛」：固定列宽会把表格撑出卡片容器产生水平滚动条
 // （实测 1366/1280/1024 视口均有滚动）。收敛口径 = 容器不足时按优先级隐藏
 // 低价值列，并把被隐藏列的信息并入相邻单元格（规则 ID→域名副行、冷却→重试
-// tooltip），任何宽度都不出现水平滚动条。
+// tooltip）。收敛下限 = 不可让位列合计 619px；更窄时表格内部被 .cert-jobs-wrap
+// 的 overflow:hidden 裁断——卡片/页面级不出现横向滚动，表格内部允许裁切。
 //
 // 运行：cd web && npm test
 
@@ -11,6 +12,7 @@ import assert from 'node:assert/strict'
 import { member, section, source } from './_helpers.ts'
 import {
   CERT_JOB_COLUMNS,
+  CERT_JOB_COLUMNS_MIN_WIDTH,
   CERT_JOB_COLUMNS_TOTAL_WIDTH,
   CERT_JOB_COLUMN_WIDTHS,
   certJobColumnsWidth,
@@ -20,7 +22,7 @@ import {
 const page = source('src/views/settings/CertJobs.vue')
 const tableBody = section(page, 'class="cert-jobs-table"', '</el-table>')
 
-test('全列宽度单源与组件声明一致（1100px）', () => {
+test('全列宽度单源与组件声明一致（1209px）', () => {
   assert.equal(CERT_JOB_COLUMNS_TOTAL_WIDTH, 1209)
   assert.equal(CERT_JOB_COLUMNS.length, 10)
   for (const id of CERT_JOB_COLUMNS) {
@@ -54,6 +56,12 @@ test('贪心让位：容器不足时按优先级隐藏，且隐藏后合计不�
     const total = certJobColumnsWidth(visible)
     if (hidden.length < 5) {
       assert.ok(total <= width, `${width}px 可见列合计 ${total} 仍超出容器`)
+    } else {
+      // 让位耗尽后仍可能超宽：不可让位列合计 619px > 600px 容器——此时表格
+      // 内部溢出由 .cert-jobs-wrap 的 overflow:hidden 裁断（见下方用例），
+      // 该超宽是显式口径而非断言豁免。
+      assert.ok(total > width, `${width}px 让位耗尽后合计 ${total} 应仍超宽（下限 619px）`)
+      assert.equal(total, CERT_JOB_COLUMNS_MIN_WIDTH)
     }
   }
 })
@@ -87,8 +95,12 @@ test('隐藏列信息不丢失：规则 ID 并入域名副行、冷却并入重�
 })
 
 test('容器 overflow 裁断，杜绝卡片/页面级横向滚动', () => {
-  const wrap = member(page, "const coolingHint")
-  assert.ok(wrap.length >= 0)
   const style = section(page, '<style scoped>', '</style>')
   assert.match(style, /\.cert-jobs-wrap\s*\{[^}]*overflow:\s*hidden/)
+})
+
+test('冷却提示文案形态：waiting_ca 且带冷却时间时返回「冷却：…」', () => {
+  const wrap = member(page, 'const coolingHint')
+  assert.match(wrap, /冷却：/, '冷却提示并入重试 tooltip 的文案形态')
+  assert.match(wrap, /row\.status !== 'waiting_ca'/, '非 waiting_ca 不得显示冷却提示')
 })

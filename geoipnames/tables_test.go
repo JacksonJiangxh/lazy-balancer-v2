@@ -7,8 +7,10 @@ import "testing"
 // 映射（防键值漂移）。条目数基线取自收敛前镜像测试的核验值
 // （22/13/45/31，两侧逐条人工比对一致）；自此 ProvinceAliases
 // 剔除 11 条恒等别名（key==value 死条目，未命中即原样返回不影响输出），
-// 基线 22→11，并加零恒等钉防回潮。补 Taichung County→台中县，
-// CityPinyinFixes 基线 45→46，服务层以仓库 xdb 全段扫描同步验收。
+// 基线 22→11，并加零恒等钉防回潮。补 Taichung County→台中市（仓库夹具
+// 独有段），CityPinyinFixes 基线 45→46，服务层以仓库 xdb 全段扫描同步
+// 验收。映射值钉现行行政区划：邯山区（非含山区）、临邑县（非临沂县）、
+// 虢镇（非郭镇）、丰原区/台中市（2010 年台中县市合并后名）。
 func TestGeoipNamesTables_pinnedCountsAndSpotMappings(t *testing.T) {
 	// Given/When/Then：条目数钉
 	counts := []struct {
@@ -55,8 +57,20 @@ func TestGeoipNamesTables_pinnedCountsAndSpotMappings(t *testing.T) {
 	if got := CityPinyinFixes["Wulumuqi"]; got != "乌鲁木齐市" {
 		t.Errorf("CityPinyinFixes[Wulumuqi]=%q; want 乌鲁木齐市", got)
 	}
-	if got := CityPinyinFixes["Taichung County"]; got != "台中县" {
-		t.Errorf("CityPinyinFixes[Taichung County]=%q; want 台中县", got)
+	if got := CityPinyinFixes["Taichung County"]; got != "台中市" {
+		t.Errorf("CityPinyinFixes[Taichung County]=%q; want 台中市（2010 年县市合并）", got)
+	}
+	// And：现行行政区划纠错钉（v3.17.0 生产库段属列逐条核对：
+	// 河北省邯山区/山东省临邑县/陕西省虢镇/台湾省丰原区）
+	for key, want := range map[string]string{
+		"Hanshan Qu": "邯山区",
+		"Linyi Xian": "临邑县",
+		"Guozhen":    "虢镇",
+		"Fengyuan":   "丰原区",
+	} {
+		if got := CityPinyinFixes[key]; got != want {
+			t.Errorf("CityPinyinFixes[%s]=%q; want %s", key, got, want)
+		}
 	}
 	if got := AutonomousPrefectures["大理"]; got != "大理白族自治州" {
 		t.Errorf("AutonomousPrefectures[大理]=%q; want 大理白族自治州（不可盲加市字）", got)

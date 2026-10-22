@@ -25,6 +25,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/caddyserver/caddy/v2"
+
 	"lazy-balancer-v2/geoipnames"
 )
 
@@ -285,6 +287,18 @@ var (
 
 const crawlerIPListReloadInterval = 10 * time.Minute
 
+// crawlerIPListMaxBytes 快照文件体积硬上限（4MiB，与 wafiplist 名单文件加载
+// 器的 MaxFileBytes/MaxFastFileBytes 同口径）：正常形态为 360 引擎的官方段
+// 列表（实测远小于 1MiB），超限文件按「快照不可用」fail-closed 处理——
+// 异常/损坏文件不得整体读入内存放大驻留。
+const crawlerIPListMaxBytes = 4 << 20
+
+// crawlerSnapshotLogf 快照加载异常告警（体积门/坏条目）。日志而非静默：
+// 豁免段静默缩水会让真爬虫被判伪装、产生误报事件，必须可观测。
+func crawlerSnapshotLogf(format string, args ...any) {
+	caddy.Log().Named("geoip2region.crawler").Sugar().Warnf(format, args...)
+}
+
 // crawlerIPListRetryInterval 是失败/坏快照的重试间隔：Caddy 可能先于根服务
 // 生成快照文件做首次爬虫校验（首启/冷装窗口）。旧实现把失败也缓存满 10min，
 // 360 引擎豁免会 fail-closed 最长 10 分钟（伪装判定）；10s 既避免每次判定
@@ -318,20 +332,34 @@ func loadCrawlerIPRangeSnapshot() *crawlerIPRangeSnapshot {
 		// stat 与读取针对同一已打开 inode：rename 换文件后旧 fd 读到的仍是
 		// 旧代际内容，st 因此如实标识所读内容（不能读后按路径再 stat）。
 		if st, statErr := file.Stat(); statErr == nil {
-			data, readErr := io.ReadAll(file)
-			if readErr == nil {
+			if st.Size() > crawlerIPListMaxBytes {
+				// 体积门（与 wafiplist.MaxFileBytes/MaxFastFileBytes 同口径）：
+				// 异常/损坏文件不得整体读入内存；fail-closed 消费空快照。
+				crawlerSnapshotLogf("crawler ip list snapshot %s exceeds %d bytes (size %d); treating as unavailable",
+					next.filePath, crawlerIPListMaxBytes, st.Size())
+			} else if data, readErr := io.ReadAll(file); readErr == nil {
 				var all map[string][]string
 				if err := json.Unmarshal(data, &all); err == nil {
 					next.ok = true
 					next.modTime, next.size = st.ModTime(), st.Size()
+					badCIDRs := 0
 					for engine, cidrs := range all {
 						prefixes := make([]netip.Prefix, 0, len(cidrs))
 						for _, cidr := range cidrs {
 							if p, err := netip.ParsePrefix(cidr); err == nil {
 								prefixes = append(prefixes, p)
+							} else {
+								badCIDRs++
 							}
 						}
 						next.prefixes[engine] = prefixes
+					}
+					// 坏条目不 fail-closed 整份（单条损坏不应放大成「全部爬虫
+					// 判伪装」的误报面），但必须可见：豁免段静默缩水是安全侧
+					// 误报的直接来源。
+					if badCIDRs > 0 {
+						crawlerSnapshotLogf("crawler ip list snapshot %s has %d unparsable CIDR entries; snapshot still cached (fail-open on those entries, engines affected may over-report)",
+							next.filePath, badCIDRs)
 					}
 				}
 			}

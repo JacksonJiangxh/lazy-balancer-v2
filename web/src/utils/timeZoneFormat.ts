@@ -21,13 +21,12 @@ export const formatDateParts = (d: Date, formatter: Intl.DateTimeFormat, withTim
   return `${date} ${get('hour')}:${get('minute')}:${get('second')}`
 }
 
-// 紧凑时间（MM-DD HH:mm）：多列表格里时间列按此压缩，段取值仍来自同一 formatter
-// （withTime 形态，h23 口径），不另造第二套时区来源。
-export const formatCompactDateParts = (d: Date, formatter: Intl.DateTimeFormat): string => {
-  const parts = formatter.formatToParts(d)
-  const get = (type: string): string => parts.find((p) => p.type === type)?.value ?? ''
-  return `${get('month')}-${get('day')} ${get('hour')}:${get('minute')}`
+// DB 墙钟串（"YYYY-MM-DD HH:mm:ss"，UTC 存储）→ epoch ms。
+// 空格分隔格式在 Safari 裸 new Date 返回 NaN——统一替换为显式 UTC ISO 再解析；
+// 解析失败返回 null，调用方自行兜底。date.ts 的 parseDateValue 同此规范化（本模块
+// 零依赖，供无法加载 auth store 链的模块/测试共用）。
+export const parseDbDateMs = (value: string): number | null => {
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?$/.test(value) ? value.replace(' ', 'T') + 'Z' : value
+  const ms = new Date(normalized).getTime()
+  return Number.isNaN(ms) ? null : ms
 }
-
-export const formatDateInTz = (d: Date, timeZone: string, withTime = true): string =>
-  formatDateParts(d, createTzFormatter(timeZone, withTime), withTime)

@@ -1,14 +1,14 @@
 // 证书签发任务表列布局：设置页卡片容器内曾出现水平滚动条（原 12 列合计 1660px）。
 // 收敛口径：消息列并入状态标签 tooltip、过期时间与剩余天数合并单列、时间列改配置时区
-// 紧凑格式、全部定宽且不再用 min-width 撑宽。
+// 完整时间戳、全部定宽且不再用 min-width 撑宽。
 //
 // 运行：cd web && npm test
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { member, section, source } from './_helpers.ts'
-import { createTzFormatter, formatCompactDateParts } from '../src/utils/timeZoneFormat.ts'
+import { section, source } from './_helpers.ts'
+import { CERT_JOB_COLUMNS_MIN_WIDTH, CERT_JOB_COLUMNS_TOTAL_WIDTH } from '../src/utils/certJobColumns.ts'
 
 const page = source('src/views/settings/CertJobs.vue')
 
@@ -72,7 +72,7 @@ test('列宽基线 1209px：弹性列 min-width 占满整宽，固定列 width',
     assert.doesNotMatch(tag, /min-width="/, `固定列「${label}」不应弹性伸展`)
   }
   const total = tags.reduce((sum, tag) => sum + Number(tag.match(/(?:min-)?width="(\d+)"/)?.[1] ?? 0), 0)
-  assert.equal(total, 1209, `列宽基线合计应为 1136px，实际 ${total}px`)
+  assert.equal(total, CERT_JOB_COLUMNS_TOTAL_WIDTH, `列宽基线合计应为 ${CERT_JOB_COLUMNS_TOTAL_WIDTH}px，实际 ${total}px`)
   assert.match(tableBody, /:fit="true"/)
 })
 
@@ -100,15 +100,13 @@ test('时间列显示完整时间戳 YYYY-MM-DD HH:mm:ss（配置时区）', () 
     assert.doesNotMatch(body, /toLocaleString|toLocaleDateString|toLocaleTimeString/, `列「${label}」不得绕过配置时区`)
   }
   assert.doesNotMatch(page, /new Date\(\)\.toLocale/)
-
-  const dateUtils = source('src/utils/date.ts')
-  const compact = member(dateUtils, 'export const formatDateCompact')
-  assert.match(compact, /tzFormatter\(true\)/, 'formatDateCompact 必须经配置时区格式化器')
-  assert.doesNotMatch(compact, /toLocale/)
 })
 
-test('紧凑格式 MM-DD HH:mm 时区感知（午夜保持 h23）', () => {
-  const formatter = createTzFormatter('Asia/Shanghai', true)
-  assert.equal(formatCompactDateParts(new Date('2026-01-01T16:00:00Z'), formatter), '01-02 00:00')
-  assert.equal(formatCompactDateParts(new Date('2026-10-22T01:05:00Z'), formatter), '10-22 09:05')
+test('容器窄于最小集时切横向滚动：操作列不得被 overflow:hidden 裁到不可达', () => {
+  // 最小集 = 域名 210 + 状态 84 + 有效期 155 + 重试 80 + 操作 90
+  assert.equal(CERT_JOB_COLUMNS_MIN_WIDTH, 619)
+  assert.match(page, /const tableBelowMinWidth = computed\(\(\) => tableWrapWidth\.value < CERT_JOB_COLUMNS_MIN_WIDTH\)/)
+  assert.match(page, /:class="\{ 'cert-jobs-wrap--scroll': tableBelowMinWidth \}"/)
+  const style = page.slice(page.indexOf('.cert-jobs-wrap {'))
+  assert.match(style, /\.cert-jobs-wrap--scroll \{\s*\/\*[^*]*\*\/\s*overflow-x: auto;/, '窄容器必须恢复横向滚动')
 })

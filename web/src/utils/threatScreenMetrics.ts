@@ -86,8 +86,8 @@ export function formatRecentRate(raw: number): string {
 
 /**
  * 趋势桶 tooltip：后端槽标签已是最终展示形态（≤24h 为真实 HH:MM，>24h 为
- * MM-DD），不再补 `:00`。窗口参数保留以兼容调用方；非法/缺失标签回退空串。
+ * MM-DD），不再补 `:00`。非法/缺失标签回退空串。
  */
-export function hourlyBucketLabel(name: string, _hours: number): string {
+export function hourlyBucketLabel(name: string): string {
   return typeof name === 'string' ? name : ''
 }

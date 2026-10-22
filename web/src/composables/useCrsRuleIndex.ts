@@ -111,7 +111,7 @@ export interface CrsRuleOptionView {
 
 /**
  * CRS 规则索引组合 hook（约 832 条规则，含 id/msg/file/category）：
- * - ensureForDialog(openSeq)：策略对话框每次打开取一次索引，同一 openSeq 内复用缓存
+ * - ensureForDialog(openSeq)：策略对话框每次打开取一次索引（会话号经 issueCrsIndexSession 全局发放），同一会话内复用缓存
  *   （步骤间切换不重复请求）；复用 openDialog 的会话序列号守卫模式——对话框快速
  *   关闭重开后，旧会话的在途响应不得覆盖新会话数据（与 fetchIpLists(seq) 同源）。
  * 失败语义：HTTP 错误已由全局拦截器 toast，这里退化为空列表（loaded 保持 false，
@@ -175,8 +175,16 @@ const indexLoader = createSessionSingleFlight<CrsRuleIndexEntry[]>({
   onLoadingChange: (value) => { loading.value = value },
 })
 
+// 会话序号全局发放：原各消费方用组件局部递增序号（TriggerDetailDialog
+// crsDialogSeq、SecurityPolicies openSeq），序号空间重叠会造成跨组件错位——
+// B 首次打开可能命中 A 的会话号而跳过刷新；交错时大序号被小序号覆盖，新会话
+// 响应被判过期丢弃并多发一次全量索引请求。统一由本模块发放保证全局单调递增。
+let nextCrsIndexSession = 0
+export const issueCrsIndexSession = (): number => ++nextCrsIndexSession
+
 export const useCrsRuleIndex = () => {
-  /** 对话框会话内取一次索引：同一 openSeq 已加载时直接复用；在途请求不重复发起；
+  /** 对话框会话内取一次索引：会话号必须来自 issueCrsIndexSession()（全局唯一）；
+   *  同一会话已加载时直接复用；在途请求不重复发起；
    *  上次失败（loadedSeq 未落、请求已 settled）允许同会话重试 */
   const ensureForDialog = (openSeq: number): Promise<void> => indexLoader.ensure(openSeq)
 

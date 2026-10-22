@@ -183,9 +183,15 @@ func TestTrafficRecord_countryCapacity(t *testing.T) {
 }
 
 func TestTrafficRecord_samplingFuse(t *testing.T) {
-	// Given: 单秒请求计数越过保险丝 → 进入 1/8 抽样，计数 ×8 还原
+	// Given: 单秒请求计数越过保险丝 → 进入 1/8 抽样，计数 ×8 还原。
+	// 冻结墙钟：4010 次记录若在真实时钟下跨秒，秒计数会从头累计、
+	// 永远触不到越线点（慢 CI 秒边界假红）。
 	resetTrafficState(t)
-	for i := 0; i < fuseQPSPerSecond+10; i++ {
+	const frozenSecond = 1_700_000_000
+	oldNow := trafficNowUnix
+	trafficNowUnix = func() int64 { return frozenSecond }
+	t.Cleanup(func() { trafficNowUnix = oldNow })
+	for range fuseQPSPerSecond + 10 {
 		trafficRecord("德国", true)
 	}
 	if n := trafficSampleN.Load(); n != fuseSampleN {
@@ -200,7 +206,7 @@ func TestTrafficRecord_samplingFuse(t *testing.T) {
 	}
 
 	// 回落：显式模拟翻秒且上一秒计数 < fuseFallbackPerSecond → N=1（全量）
-	trafficSecondState.Store((uint64(time.Now().Unix()-1) << 32) | 500)
+	trafficSecondState.Store((uint64(frozenSecond-1) << 32) | 500)
 	trafficRecord("德国", true)
 	if n := trafficSampleN.Load(); n != 1 {
 		t.Fatalf("sample_n=%d, want 1（翻秒低计数回落全量）", n)

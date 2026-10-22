@@ -3,10 +3,13 @@ package wafiplist
 import (
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
+	"time"
 )
 
 // fastFileMagic 是 .fast 二进制格式的魔数（Lazy Balancer Fast v1）。
@@ -14,6 +17,15 @@ const fastFileMagic = "LBF1"
 
 // fastFileHeaderSize 是 .fast 文件头固定长度。
 const fastFileHeaderSize = 16
+
+// fastFileChecksumFlag 是 header flags 的「尾部带 crc32c 校验和」位。
+// 格式演进规则：该位置 1 表示文件末尾追加 4 字节 big-endian crc32c
+// （Castagnoli，覆盖 header+条目区）；flags==0 是早期无校验形态，读侧兼容
+// 接受（跨版本回滚期旧产物仍可加载）；其余未知位一律拒绝。写侧总是置位。
+const fastFileChecksumFlag = 1 << 0
+
+// fastFileCRCTable 是 crc32c（Castagnoli）查表（包级共享，只读）。
+var fastFileCRCTable = crc32.MakeTable(crc32.Castagnoli)
 
 // MaxFastFileBytes 是 ReadFastFile 读取前的体积硬上限（历史
 // 审计）：.fast 是跨进程输入（节点回传/从节点回退），不能只依赖写侧自律——
@@ -32,8 +44,10 @@ type FastFileState struct {
 
 // WriteFastFile 将前缀集序列化为 .fast 二进制格式并原子写入。
 // 输入应已聚合为不相交集合；为守住二分查询契约，本函数在**内部副本**上
-// 防御性掩码主机位并排序——调用方切片的内容与顺序都不被改写。本函数不
-// 聚合/不去重；嵌套/同址形态由 ReadFastFile 拒绝。
+// 防御性掩码主机位并排序，并在写入前断言「升序 + 互不相交」——嵌套/同址
+// 输入返回 error 而非写出「写成功、读必失败」的产物（ReadFastFile 对同形态
+// 一律拒绝；跨进程回退侧会拿到不可用名单）。本函数不聚合/不去重。
+// 调用方切片的内容与顺序都不被改写。
 //
 // 族校验：v4 切片只接受纯 IPv4 前缀，v6 切片只接受纯 IPv6 前缀
 // （4in6 映射形态须先 Unmap 归 v4）。族错配返回 error 而不是 panic/静默腐化
@@ -44,7 +58,8 @@ type FastFileState struct {
 //
 // 原子写用独占临时名（CreateTemp）：固定 path+".tmp" 在并发/多调用
 // 方下互相覆盖（rename ENOENT 或旧代际覆盖新代际）。本函数自身不持锁，
-// 生产调用方仍须持 wafFileMu 串行化代际。
+// 生产调用方仍须持 wafFileMu 串行化代际。写入前顺带回收本文件超龄的
+// 崩溃残留临时文件（sweepStaleFastTemps）。
 func WriteFastFile(path string, v4, v6 []netip.Prefix) error {
 	for _, p := range v4 {
 		if !p.IsValid() || !p.Addr().Is4() {
@@ -68,16 +83,25 @@ func WriteFastFile(path string, v4, v6 []netip.Prefix) error {
 	}
 	sort.Slice(mv4, func(i, j int) bool { return mv4[i].Addr().Compare(mv4[j].Addr()) < 0 })
 	sort.Slice(mv6, func(i, j int) bool { return mv6[i].Addr().Compare(mv6[j].Addr()) < 0 })
+	// 读侧不变量在写侧自证：排序后若某前缀包含更晚前缀，必包含其直接后继
+	// （地址介于两者之间的条目只能是这个后继）——相邻 O(n) 断言即可覆盖
+	// 全部嵌套/同址形态。
+	if err := assertDisjointPrefixes("v4", mv4); err != nil {
+		return err
+	}
+	if err := assertDisjointPrefixes("v6", mv6); err != nil {
+		return err
+	}
 
-	// 计算总大小
-	size := fastFileHeaderSize + len(mv4)*5 + len(mv6)*17
+	// 计算总大小（header + 条目 + 4 字节 crc32c 尾部）
+	size := fastFileHeaderSize + len(mv4)*5 + len(mv6)*17 + 4
 	buf := make([]byte, size)
 
 	// Header
 	copy(buf[0:4], fastFileMagic)
 	binary.BigEndian.PutUint32(buf[4:8], uint32(len(mv4)))
 	binary.BigEndian.PutUint32(buf[8:12], uint32(len(mv6)))
-	binary.BigEndian.PutUint32(buf[12:16], 0) // flags reserved
+	binary.BigEndian.PutUint32(buf[12:16], fastFileChecksumFlag)
 
 	// v4 entries: [4B addr][1B bits]
 	offset := fastFileHeaderSize
@@ -96,10 +120,15 @@ func WriteFastFile(path string, v4, v6 []netip.Prefix) error {
 		offset += 17
 	}
 
+	// 尾部 crc32c（覆盖 header+条目区）：格式内校验使「位翻转但仍满足
+	// 掩码/升序/不相交」的静默漏拦/误拦可验证——.fast 是跨进程输入。
+	binary.BigEndian.PutUint32(buf[offset:offset+4], crc32.Checksum(buf[:offset], fastFileCRCTable))
+
 	// 原子写（与 @ipListFast 投影同模式）：独占临时名 + rename。
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return fmt.Errorf("fastfile mkdir: %w", err)
 	}
+	sweepStaleFastTemps(filepath.Dir(path), filepath.Base(path))
 	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
 	if err != nil {
 		return fmt.Errorf("fastfile tmp create: %w", err)
@@ -164,14 +193,28 @@ func ReadFastFile(path string) (*FastFileState, error) {
 	v4Count := binary.BigEndian.Uint32(data[4:8])
 	v6Count := binary.BigEndian.Uint32(data[8:12])
 	// 未知 flags 位不得静默忽略（格式演进必须显式：未来的特性位
-	// 若被当 0 解析，会按错误的条目布局读数据）。
-	if flags := binary.BigEndian.Uint32(data[12:16]); flags != 0 {
+	// 若被当 0 解析，会按错误的条目布局读数据）。已知位：bit0=尾部 crc32c。
+	flags := binary.BigEndian.Uint32(data[12:16])
+	if flags & ^uint32(fastFileChecksumFlag) != 0 {
 		return nil, fmt.Errorf("fastfile: unknown flags %#x", flags)
 	}
+	hasChecksum := flags&fastFileChecksumFlag != 0
 
 	expectedSize := fastFileHeaderSize + int(v4Count)*5 + int(v6Count)*17
+	if hasChecksum {
+		expectedSize += 4
+	}
 	if len(data) != expectedSize {
 		return nil, fmt.Errorf("fastfile: size mismatch (have %d, want %d)", len(data), expectedSize)
+	}
+	// 内容完整性：位翻转若仍满足 magic/count/bits/掩码/升序/不相交不变量
+	// （如某段地址高位跳变但不越邻），旧读侧会静默接受并改变实际拦截集合。
+	// flags==0 的早期产物无校验和，按旧行为接受（跨版本回滚兼容）。
+	if hasChecksum {
+		want := binary.BigEndian.Uint32(data[len(data)-4:])
+		if got := crc32.Checksum(data[:len(data)-4], fastFileCRCTable); got != want {
+			return nil, fmt.Errorf("fastfile: checksum mismatch (have %08x, want %08x)", got, want)
+		}
 	}
 
 	state := &FastFileState{
@@ -247,4 +290,46 @@ func ReadFastFile(path string) (*FastFileState, error) {
 // FastPath 返回 .iplist 源文件对应的 .fast 编译文件路径。
 func FastPath(iplistPath string) string {
 	return iplistPath + ".fast"
+}
+
+// assertDisjointPrefixes 断言已排序前缀集「地址不降序且互不包含」——与
+// ReadFastFile 的加载不变量同口径（二分查询正确性依赖不相交）。
+func assertDisjointPrefixes(family string, sorted []netip.Prefix) error {
+	for i := 1; i < len(sorted); i++ {
+		if sorted[i-1].Contains(sorted[i].Addr()) {
+			return fmt.Errorf("fastfile: %s entries not disjoint at %d (%s contains %s)", family, i, sorted[i-1], sorted[i])
+		}
+	}
+	return nil
+}
+
+// fastFileTempMaxAge 是 .fast 临时残留的回收门槛：CreateTemp 与 rename 之间
+// 崩溃/掉电会留下 <base>.<rand>.tmp；waf 目录没有 IP 名单目录的 tmp GC 分支，
+// 长期运行实例会随历史名单积累。门槛远大于任何一次写入耗时，在役临时文件
+// 不会被误删。
+const fastFileTempMaxAge = time.Hour
+
+// sweepStaleFastTemps 回收本文件名前缀的超龄临时残留（仅本 base，避免误删
+// 并发写入其他名单的临时文件；os.ReadDir 失败静默——回收是尽力而为，
+// 不得影响写入主流程）。
+func sweepStaleFastTemps(dir, base string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	deadline := time.Now().Add(-fastFileTempMaxAge)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasPrefix(name, base+".") || !strings.HasSuffix(name, ".tmp") {
+			continue
+		}
+		info, ierr := e.Info()
+		if ierr != nil || info.ModTime().After(deadline) {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, name))
+	}
 }

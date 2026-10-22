@@ -13,7 +13,6 @@ import {
   certQueueHasLive,
   certQueueIsBusy,
   certQueueMoreCount,
-  certQueueShownCount,
 } from '../src/utils/certQueue.ts'
 import { credentialFieldVisible, credentialOptionLabel, defaultCredentialsFor } from '../src/utils/dnsProviderFields.ts'
 
@@ -278,8 +277,6 @@ test('证书队列非空判据 = 排队 + 进行中 + 等 CA（任何一项 > 0 
   // 正文空态与「+N」不再依赖首页可见行
   assert.equal(certQueueHasLive({ total: 3 }), true)
   assert.equal(certQueueHasLive({ total: 0 }), false)
-  assert.equal(certQueueShownCount({ jobs: [] }), 0)
-  assert.equal(certQueueShownCount({ jobs: [{ id: 1 }, { id: 2 }] }), 2)
   assert.equal(CERT_QUEUE_VISIBLE_JOBS, 4)
   const base = { queued: 0, running: 5, waiting: 0 }
   assert.equal(certQueueMoreCount({ ...base, total: 10, jobs: [{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }, { id: 5 }] }), 6)
@@ -391,11 +388,12 @@ test('各写函数入口自带只读/在途守卫（纵深防御）', () => {
   assert.match(section(oidc, 'const remove = async', '\nconst '), /if \(isReadOnly\.value \|\| saving\.value \|\| loadFailed\.value\) return/)
 })
 
-test('CA 表单不再持有零读取的 credentials 副本', () => {
+test('CA 表单不再持有零读取的 credentials / id 副本', () => {
   const page = source('src/views/settings/FreeCertificates.vue')
   const block = section(page, 'const caForm = reactive', 'const caCreds = reactive')
   assert.doesNotMatch(block, /credentials: '\{\}'/, 'caForm 初始值不得再含零读取的 credentials')
-  assert.match(page, /reactive<Omit<CAProvider, 'credentials'>>/)
+  assert.doesNotMatch(block, /\bid: 0,/, 'caForm 初始值不得再含零读取的 id（保存走 editingCAProvider.id）')
+  assert.match(page, /reactive<Omit<CAProvider, 'credentials' \| 'id'>>/)
 })
 
 test('DNS 凭证字段可见性按 visible_when 求值，无元数据时恒显示', () => {
@@ -443,4 +441,102 @@ test('OIDC GET 失败清空为未配置态并禁止保存（不得回填上一�
   }
   assert.match(page, /v-if="loadFailed" type="error"/)
   assert.match(section(page, 'const save = async', '\nconst '), /if \(loadFailed\.value\)/)
+})
+
+// ── 本批视图接线守卫（数据就绪门 / 请求门 / 单源）──
+
+test('集群模式卡：status 未就绪时写控件 fail-closed（默认值不得覆盖真实配置）', () => {
+  const card = source('src/views/settings/cluster/ClusterModeCard.vue')
+  assert.match(
+    card,
+    /const intervalDisabled = computed\(\(\) => props\.readOnly \|\| props\.intervalSaving \|\| isSlave\.value \|\| !props\.status\)/,
+    '缺 status 门时 syncInterval(60) !== undefined 恒真，保存按钮可点',
+  )
+  assert.match(section(card, 'const saveSyncInterval', '\n}'), /if \(props\.readOnly \|\| !props\.status\) return/)
+  assert.match(section(card, 'const handleModeChange', '\n}'), /if \(props\.readOnly \|\| props\.loading \|\| !props\.status\) return/)
+  assert.match(card, /:disabled="loading \|\| readOnly \|\| !status"/)
+})
+
+test('仪表盘：/caddy/status 失败置采集失败并阻断陈旧状态呈现', () => {
+  const page = source('src/views/Dashboard.vue')
+  assert.match(page, /const caddyStatusUnavailable = ref\(false\)/)
+  const requestBlock = section(page, "request.get('/caddy/status'", ']).then(')
+  assert.match(requestBlock, /caddyStatusUnavailable\.value = false/)
+  assert.match(
+    requestBlock,
+    /\}\)\.catch\(\(\) => \{ if \(!disposed\) caddyStatusUnavailable\.value = true \}\)/,
+    '缺 catch 时状态标签/一致性静默陈旧',
+  )
+  assert.match(page, /v-if="caddyStatusUnavailable" type="info"[^>]*>状态采集失败/)
+  assert.match(page, /v-if="caddyApplyError && !caddyStatusUnavailable"/)
+  assert.match(page, /v-if="caddyBackgroundApplyError && !caddyStatusUnavailable"/)
+  assert.match(page, /configConsistent === 'true' && !caddyStatusUnavailable/)
+})
+
+test('设置页：分页初值即由页键派生，且仅消费方分页拉 /config', () => {
+  const page = source('src/views/Settings.vue')
+  assert.match(page, /const activeTab = ref<SettingsTabId>\(settingsTabOfPage\(authStore\.currentPage\) \?\? 'basic'\)/)
+  assert.match(page, /const tabConsumesConfig = \(tab: SettingsTabId\): boolean => tab === 'basic' \|\| tab === 'certificates'/)
+  assert.match(page, /if \(tabConsumesConfig\(activeTab\.value\) && !configLoaded\.value\) void fetchSettings\(\)/, '切回 basic/certificates 须补拉')
+  const onMounted = section(page, 'onMounted(', '</script>')
+  assert.match(onMounted, /if \(tabConsumesConfig\(activeTab\.value\)\) void fetchSettings\(\)/)
+  assert.doesNotMatch(onMounted, /syncActiveTabFromPage\(\)\s*\n\s*fetchSettings\(\)/, '不得再无条件整取 /config')
+})
+
+test('用户页：OIDC 状态请求与消费面同门（非管理员不发 403 请求）', () => {
+  const page = source('src/views/Users.vue')
+  const mounted = section(page, 'onMounted(', '})')
+  assert.match(mounted, /if \(authStore\.user\?\.role === 'admin'\) void fetchOIDCStatus\(\)/)
+})
+
+test('集群同步三分类标签单源（父级确认文案与子级开关行同表）', () => {
+  const master = source('src/views/settings/cluster/ClusterMasterPanel.vue')
+  const settings = source('src/views/settings/ClusterSettings.vue')
+  assert.match(master, /import \{ CLUSTER_SYNC_SWITCHES \} from '@\/utils\/clusterSyncSwitches'/)
+  assert.match(master, /const syncSwitchItems = CLUSTER_SYNC_SWITCHES/)
+  assert.match(settings, /import \{ CLUSTER_SYNC_SWITCHES \} from '@\/utils\/clusterSyncSwitches'/)
+  assert.match(settings, /CLUSTER_SYNC_SWITCHES\.map\(\(item\) => \[item\.key, item\.label\]\)/)
+  for (const [name, text] of [['子级', master], ['父级', settings]] as const) {
+    assert.doesNotMatch(text, /sync_users: '系统数据'|sync_rules: '负载均衡规则'|sync_security: '安全防护'/, `${name}仍有第二份字面量`)
+  }
+})
+
+test('策略向导：阶段覆盖编辑态稀疏持有（不得物化库值 seed）', () => {
+  const page = source('src/views/security/SecurityPolicies.vue')
+  const watcher = section(page, 'watch([boundRules, allRules], () => {', '}, { immediate: true })')
+  assert.match(watcher, /const existing = stageOverrideEdits\.value\[cid\]/)
+  assert.match(watcher, /if \(existing\) next\[cid\] = existing/)
+  assert.doesNotMatch(
+    watcher,
+    /\?\? stageOverrideSeed\(cid\)/,
+    '物化 seed 会在 /rules 新快照到达后把旧库值钉成待保存覆盖，保存时静默回退他处变更',
+  )
+})
+
+test('安全事件：tooltip 死条件删除，crawler 族展示词单源，旧 id 8 中和文案', () => {
+  const page = source('src/views/security/SecurityEvents.vue')
+  const show = section(page, 'const showTriggeredMsg', '\n\n')
+  assert.match(show, /!!row\.rule_triggered && !!row\.rule_msg/)
+  assert.doesNotMatch(show, /!== '2'|!== '3'|!== '4'|!== '5'|\^949/, '这些排除项永不命中（前两个 el-link 分支已截走）')
+  assert.match(page, /case 'crawler': return CRAWLER_FAMILY_LABEL/)
+  assert.match(page, /if \(row\.rule_triggered === '8'\) return '地域拦截（旧 id）'/)
+  // 分类例外保持不变（triggerStageFamily 对 8 归 ipAcl）
+  assert.match(page, /switch \(triggerStageFamily\(t\)\)/)
+})
+
+test('OIDC 设置卡：访问白名单字段（email 域 / 用户组）读回显与整表保存', () => {
+  const page = source('src/views/settings/OIDCSettings.vue')
+  const load = section(page, 'const load = async', 'let probeInFlight')
+  assert.match(load, /form\.allowedEmailDomains = allowListToText\(res\.data\.allowed_email_domains\)/)
+  assert.match(load, /form\.allowedGroups = allowListToText\(res\.data\.allowed_groups\)/)
+  const save = section(page, 'const save = async', '\nconst ')
+  assert.match(save, /allowed_email_domains: parseAllowList\(form\.allowedEmailDomains\)/)
+  assert.match(save, /allowed_groups: parseAllowList\(form\.allowedGroups\)/)
+  // 局部 PUT（启用/暂停/删除）不得携带键——契约：缺省=不动、[]=清除
+  const toggle = section(page, 'const toggleEnabled', '\nconst ')
+  assert.match(toggle, /request\.put\('\/settings\/oidc', \{ enabled: on \}\)/)
+  assert.doesNotMatch(toggle, /allowed_/)
+  // 表单区可见（步骤 4）
+  assert.match(page, /v-model="form\.allowedEmailDomains"/)
+  assert.match(page, /v-model="form\.allowedGroups"/)
 })

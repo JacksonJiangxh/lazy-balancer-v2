@@ -1,12 +1,37 @@
 package wafiplist
 
 import (
+	"encoding/binary"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+// buildFastFileRaw 构造早期形态（flags=0，无尾部校验和）.fast 原始字节：
+// 测读侧不变量校验时绕开写侧同一断言——用 WriteFastFile 造嵌套夹具会被
+// 写侧拒绝，两侧互相掩蔽。
+func buildFastFileRaw(t *testing.T, v4, v6 []netip.Prefix) []byte {
+	t.Helper()
+	data := make([]byte, 0, fastFileHeaderSize+len(v4)*5+len(v6)*17)
+	data = append(data, []byte(fastFileMagic)...)
+	data = binary.BigEndian.AppendUint32(data, uint32(len(v4)))
+	data = binary.BigEndian.AppendUint32(data, uint32(len(v6)))
+	data = binary.BigEndian.AppendUint32(data, 0) // flags=0：早期无校验形态
+	for _, p := range v4 {
+		addr := p.Addr().As4()
+		data = append(data, addr[:]...)
+		data = append(data, byte(p.Bits()))
+	}
+	for _, p := range v6 {
+		addr := p.Addr().As16()
+		data = append(data, addr[:]...)
+		data = append(data, byte(p.Bits()))
+	}
+	return data
+}
 
 // Step 1 TDD: .fast 二进制格式读写往返
 func TestFastFile_WriteReadRoundtrip(t *testing.T) {
@@ -145,40 +170,38 @@ func TestFastFile_UnorderedRejected(t *testing.T) {
 // 腐化形态）。须响亮拒绝。
 func TestFastFile_NestedPrefixesRejected(t *testing.T) {
 	dir := t.TempDir()
-	// 宽段 10.0.0.0/16 + 其中段 10.0.1.0/24（升序合法、嵌套违例）
-	v4 := []netip.Prefix{
+	// 宽段 10.0.0.0/16 + 其中段 10.0.1.0/24（升序合法、嵌套违例）。
+	// 用原始字节构造：写侧现在自带同一断言，用 WriteFastFile 造夹具会先被拒。
+	nestedPath := filepath.Join(dir, "nested-v4.fast")
+	if err := os.WriteFile(nestedPath, buildFastFileRaw(t, []netip.Prefix{
 		netip.MustParsePrefix("10.0.0.0/16"),
 		netip.MustParsePrefix("10.0.1.0/24"),
-	}
-	nestedPath := filepath.Join(dir, "nested-v4.fast")
-	if err := WriteFastFile(nestedPath, v4, nil); err != nil {
-		t.Fatalf("WriteFastFile: %v", err)
+	}, nil), 0644); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := ReadFastFile(nestedPath); err == nil {
 		t.Fatal("nested v4 prefixes (wide + contained sub) must be rejected（二分假阴性）")
 	}
 
 	// 同址不同 bits：10.0.0.0/16 + 10.0.0.0/24（Compare==0 非降序、包含）
-	sameAddr := []netip.Prefix{
+	sameAddrPath := filepath.Join(dir, "same-addr-v4.fast")
+	if err := os.WriteFile(sameAddrPath, buildFastFileRaw(t, []netip.Prefix{
 		netip.MustParsePrefix("10.0.0.0/16"),
 		netip.MustParsePrefix("10.0.0.0/24"),
-	}
-	sameAddrPath := filepath.Join(dir, "same-addr-v4.fast")
-	if err := WriteFastFile(sameAddrPath, sameAddr, nil); err != nil {
-		t.Fatalf("WriteFastFile: %v", err)
+	}, nil), 0644); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := ReadFastFile(sameAddrPath); err == nil {
 		t.Fatal("same-address different-bits v4 prefixes must be rejected（二分假阴性）")
 	}
 
 	// v6 同口径：2001:db8::/32 + 2001:db8:1::/48
-	v6 := []netip.Prefix{
+	v6Path := filepath.Join(dir, "nested-v6.fast")
+	if err := os.WriteFile(v6Path, buildFastFileRaw(t, nil, []netip.Prefix{
 		netip.MustParsePrefix("2001:db8::/32"),
 		netip.MustParsePrefix("2001:db8:1::/48"),
-	}
-	v6Path := filepath.Join(dir, "nested-v6.fast")
-	if err := WriteFastFile(v6Path, nil, v6); err != nil {
-		t.Fatalf("WriteFastFile: %v", err)
+	}), 0644); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := ReadFastFile(v6Path); err == nil {
 		t.Fatal("nested v6 prefixes must be rejected（二分假阴性）")
@@ -195,6 +218,139 @@ func TestFastFile_NestedPrefixesRejected(t *testing.T) {
 	}
 	if _, err := ReadFastFile(adjacentPath); err != nil {
 		t.Fatalf("adjacent disjoint prefixes must load, got: %v", err)
+	}
+}
+
+// 崩溃残留回收：.fast 原子写在 CreateTemp 与 rename 之间掉电/崩溃会留下
+// <base>.<rand>.tmp，waf 目录没有 IP 名单目录的 tmp GC 分支——写入前顺带
+// 回收本文件超龄残留（在役临时文件年轻，不受影响；其他名单的残留不归
+// 本次清理，避免并发写入方互相误删）。
+func TestWriteFastFile_sweepsStaleTempFiles(t *testing.T) {
+	dir := t.TempDir()
+	base := "threat-x.iplist.fast"
+	stale := filepath.Join(dir, base+".123456.tmp")
+	young := filepath.Join(dir, base+".654321.tmp")
+	other := filepath.Join(dir, "other.iplist.fast.999.tmp")
+	for _, p := range []string{stale, young, other} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-2 * fastFileTempMaxAge)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(other, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteFastFile(filepath.Join(dir, base), []netip.Prefix{netip.MustParsePrefix("10.0.0.0/24")}, nil); err != nil {
+		t.Fatalf("WriteFastFile: %v", err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatal("本文件的超龄临时残留必须回收")
+	}
+	if _, err := os.Stat(young); err != nil {
+		t.Fatalf("未超龄（可能在役）的临时文件不得删除: %v", err)
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Fatalf("其他名单的残留不归本次清理: %v", err)
+	}
+}
+
+// 写侧自证读侧不变量：未聚合输入（嵌套/同址不同 bits/重复条目）必须返回
+// error 并且不落盘——否则产物「写成功、读必失败」，节点回退侧拿到不可用
+// 名单（策略被跳过或回退文本）。
+func TestWriteFastFile_rejectsUnaggregatedInput(t *testing.T) {
+	dir := t.TempDir()
+	cases := []struct {
+		name string
+		v4   []netip.Prefix
+		v6   []netip.Prefix
+	}{
+		{"嵌套v4", []netip.Prefix{
+			netip.MustParsePrefix("10.0.0.0/16"),
+			netip.MustParsePrefix("10.0.1.0/24"),
+		}, nil},
+		{"同址不同bits", []netip.Prefix{
+			netip.MustParsePrefix("10.0.0.0/16"),
+			netip.MustParsePrefix("10.0.0.0/24"),
+		}, nil},
+		{"重复同前缀", []netip.Prefix{
+			netip.MustParsePrefix("10.0.0.0/24"),
+			netip.MustParsePrefix("10.0.0.0/24"),
+		}, nil},
+		{"嵌套v6", nil, []netip.Prefix{
+			netip.MustParsePrefix("2001:db8::/32"),
+			netip.MustParsePrefix("2001:db8:1::/48"),
+		}},
+	}
+	for _, tc := range cases {
+		path := filepath.Join(dir, tc.name+".fast")
+		if err := WriteFastFile(path, tc.v4, tc.v6); err == nil {
+			t.Fatalf("%s: 未聚合输入必须被写侧拒绝（读侧会拒绝该产物）", tc.name)
+		}
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("%s: 拒绝时不得落盘", tc.name)
+		}
+	}
+}
+
+// 内容完整性：写侧产物带 crc32c 尾部；位翻转若仍满足 magic/count/bits/
+// 掩码/升序/不相交不变量（如某段地址高位跳变但不越邻）必须被校验和拒绝，
+// 否则从节点回退路径会静默改变实际拦截集合。flags==0 的早期无校验产物
+// 仍可加载（跨版本回滚兼容）；除校验和位外的未知 flags 位仍拒绝。
+func TestFastFile_ChecksumDetectsSilentCorruption(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "crc.fast")
+	if err := WriteFastFile(path, []netip.Prefix{
+		netip.MustParsePrefix("10.0.0.0/24"),
+		netip.MustParsePrefix("203.0.113.0/24"),
+	}, nil); err != nil {
+		t.Fatalf("WriteFastFile: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if flags := binary.BigEndian.Uint32(data[12:16]); flags&fastFileChecksumFlag == 0 {
+		t.Fatal("写侧必须置 crc32c 校验和位")
+	}
+
+	// 篡改第二条地址首字节 203→201：仍掩码（/24）、仍升序、仍不相交——
+	// 三条结构不变量全部通过，只有校验和能发现。
+	tampered := append([]byte(nil), data...)
+	tampered[fastFileHeaderSize+5] = 201
+	if err := os.WriteFile(path, tampered, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadFastFile(path); err == nil {
+		t.Fatal("仍满足结构不变量的位翻转必须被校验和拒绝（静默漏拦/误拦）")
+	}
+
+	// 兼容：flags 清零 + 去掉尾部 4 字节 = 早期无校验形态，照常加载。
+	legacy := append([]byte(nil), data[:len(data)-4]...)
+	binary.BigEndian.PutUint32(legacy[12:16], 0)
+	legacyPath := filepath.Join(dir, "legacy.fast")
+	if err := os.WriteFile(legacyPath, legacy, 0644); err != nil {
+		t.Fatal(err)
+	}
+	state, err := ReadFastFile(legacyPath)
+	if err != nil {
+		t.Fatalf("早期无校验产物必须仍可加载（回滚兼容）: %v", err)
+	}
+	if len(state.V4) != 2 {
+		t.Fatalf("legacy V4 entries=%d, want 2", len(state.V4))
+	}
+
+	// 除校验和位外的未知位仍拒绝（格式演进必须显式）。
+	bad := append([]byte(nil), legacy...)
+	binary.BigEndian.PutUint32(bad[12:16], 2)
+	badPath := filepath.Join(dir, "badflags.fast")
+	if err := os.WriteFile(badPath, bad, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadFastFile(badPath); err == nil {
+		t.Fatal("未知 flags 位必须拒绝")
 	}
 }
 

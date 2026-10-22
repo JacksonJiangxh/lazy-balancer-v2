@@ -293,6 +293,7 @@ import { createVisibilityIntervals } from '@/composables/useVisibilityIntervals'
 import { useCountUp } from '@/composables/useCountUp'
 import { formatDate } from '@/utils/date'
 import { trafficDelta, formatRecentRate, hourlyBucketLabel, type TrafficBaseline } from '@/utils/threatScreenMetrics'
+import { ANOMALY_SCORE_HIGH, ANOMALY_SCORE_MID } from '@/utils/severityScale'
 import { flowTimestamp, normalizeTrafficSampleN, reconstructObservedRate, stepAdaptiveSample, nextFlowCursor, planFlowEvents, FLOW_REALTIME_MAX_AGE_MS } from '@/utils/threatFlowRules'
 import type { ThreatScene, ThreatSceneOptions } from '@/utils/threatScene'
 
@@ -488,7 +489,7 @@ const histPoints = computed((): string => {
     .join(' ')
 })
 const histFillPoints = computed((): string => (histPoints.value ? `0,40 ${histPoints.value} 100,40` : ''))
-const hourlyTooltip = (name: string): string => hourlyBucketLabel(name, windowHours.value)
+const hourlyTooltip = (name: string): string => hourlyBucketLabel(name)
 const histAxis = computed((): string[] => {
   const slots = hourlyHist.value
   if (slots.length === 0) return []
@@ -627,12 +628,16 @@ function sevOf(ev: FeedEvent): Sev {
   const score = ev.anomaly_score ?? 0
   const down = (base: Sev): Sev => (ev.action !== 'blocked' && base === 'high' ? 'mid' : base)
   if (score > 0) {
-    // 检测模式整体降一级（高→中）：12 分以上为中危，其余低危
-    if (ev.action !== 'blocked') return score >= 12 ? 'mid' : 'low'
-    return score >= 12 ? 'high' : score >= 6 ? 'mid' : 'low'
+    // 检测模式整体降一级（高→中）：高门槛以上为中危，其余低危。
+    // 分档阈值单源 utils/severityScale（与事件列表评分着色同口径）。
+    if (ev.action !== 'blocked') return score >= ANOMALY_SCORE_HIGH ? 'mid' : 'low'
+    return score >= ANOMALY_SCORE_HIGH ? 'high' : score >= ANOMALY_SCORE_MID ? 'mid' : 'low'
   }
   const rt = ev.rule_triggered ?? ''
-  if (rt === '2' || rt === '3' || rt === '12' || rt === '14' || /^48[123]$/.test(rt)) return down('high')
+  // 481-484 是渲染器发射的 HTTP 阻断状态码（caddy_multi_policy/caddy 测试），
+  // 不是 rule_triggered 值——原 /^48[123]$/ 分支永不命中，已删。
+  if (rt === '2' || rt === '3' || rt === '12' || rt === '14') return down('high')
+  // '8' 与 8xxxxx 仅存量 0 分行可达（现代引擎一律带评分，走上方评分分支）。
   if (rt === '429' || rt === '8' || /^8\d{5}$/.test(rt)) return down('mid')
   return ev.action === 'blocked' ? 'mid' : 'low'
 }

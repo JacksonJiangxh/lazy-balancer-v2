@@ -13,6 +13,7 @@ import {
   TRIGGERED_FAMILY_SEGMENTS,
   serializeTriggeredFilter,
 } from '../src/utils/triggeredFilter.ts'
+import { repoSource, section } from './_helpers.ts'
 
 test('空选 = 不过滤（不发 rule_triggered）', () => {
   assert.equal(serializeTriggeredFilter([]), null)
@@ -54,5 +55,31 @@ test('每个类别的族段非空且与后端 family 键同名（除已登记的
     const segments = TRIGGERED_FAMILY_SEGMENTS[category]
     assert.ok(segments.length > 0, `${category} 必须有族段`)
     for (const segment of segments) assert.ok(segment.trim() !== '', `${category} 段不得为空`)
+  }
+})
+
+test('族段跨栈对表：前端段必须是后端 ruleTriggeredFamilyPrefixes 键或特判段（机械钉）', () => {
+  // 后端遇未知段落到消息回退分支（rule_triggered LIKE ? OR rule_msg LIKE ?）——
+  // 段名打错一字筛选即从「该族全部事件」退化为「消息含该串的事件」，纯前端
+  // 断言无法发现；必须读 Go 源对表。
+  const go = repoSource('internal/handlers/security.go')
+  const block = section(go, 'var ruleTriggeredFamilyPrefixes = map[string][]string{', '\n}')
+  const backendKeys = new Set([...block.matchAll(/"([^"]+)":\s*\{/g)].map((m) => m[1]))
+  assert.ok(backendKeys.size >= 8, `后端 family 键解析异常（仅 ${backendKeys.size} 个）`)
+  // 「WAF·CRS」为复合 GLOB 特判段（ruleTriggeredFilterSQL 内单独匹配，不在前缀表）
+  assert.ok(go.includes('if input == "WAF 规则（CRS）" || input == "WAF·CRS"'), 'WAF·CRS 特判段缺失')
+  const frontendSegments = [...new Set(Object.values(TRIGGERED_FAMILY_SEGMENTS).flat())]
+  for (const segment of frontendSegments) {
+    assert.ok(
+      backendKeys.has(segment) || segment === 'WAF·CRS',
+      `前端族段「${segment}」在后端 family 键中不存在——筛选会退化为消息关键词匹配`,
+    )
+  }
+  // 反向：后端删除前端依赖的键也必须红（八类除 WAF·CRS 外每个键都在表中）
+  for (const category of TRIGGERED_CATEGORIES) {
+    if (category === 'WAF·CRS') continue
+    for (const segment of TRIGGERED_FAMILY_SEGMENTS[category]) {
+      assert.ok(backendKeys.has(segment), `后端缺「${segment}」键（前端「${category}」类别依赖）`)
+    }
   }
 })
