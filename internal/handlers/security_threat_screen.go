@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"runtime"
@@ -42,6 +43,77 @@ const threatActiveSourceWindow = 10 * time.Minute
 
 // topThreatEntries 计数 map → 前 n 条（值降序；同值按名称升序——确定性输出，
 // 大屏 30s 轮询重渲染名次不抖动）。
+// describeThreatRuleName 把「命中规则」维度的原始 SecRule id 翻译为可读标签。
+// 大屏直接展示本标签：事件里的 rule_triggered 是 coraza SecRule id，裸数字
+// 对用户无意义（阶段 1 预检为合成 id、CRS 为 9xxxxx、自定义规则为 DB id+10000、
+// 限流固定 429）。解析失败时回退「可读类别 + 原始 id」，绝不静默丢 id——
+// 排障需要 id 才能对回规则文件。
+func describeThreatRuleName(key string) string {
+	if key == "" {
+		return ""
+	}
+	n, err := strconv.Atoi(key)
+	if err != nil {
+		// 非数字（历史事件回退的是负载规则名）原样展示。
+		return key
+	}
+	switch n {
+	case 2:
+		return "IP 访问控制拦截（#2）"
+	case 3, 12:
+		return "信任名单检测（#" + key + "）"
+	case 4:
+		return "IP 黑名单（#4）"
+	case 5, 14:
+		return "威胁情报库（#" + key + "）"
+	case 7:
+		return "IP 白名单拒绝（#7）"
+	case 8:
+		return "地域拦截（#8）"
+	case 429:
+		return "限流触发（#429）"
+	}
+	// 阶段 1 预检段（段界单一事实源在 services/security.go）：
+	// GeoIP 800000+policyID、爬虫豁免 810000+policyID*slots+idx、爬虫伪装 850000+policyID。
+	switch {
+	case n > 800000 && n < 810000:
+		return fmt.Sprintf("地域拦截（策略 #%d）", n-800000)
+	case n >= 810000 && n < 850000:
+		return "爬虫校验（#" + key + "）"
+	case n >= 850000 && n < 900000:
+		return "爬虫伪装拦截（#" + key + "）"
+	case n >= 900000 && n <= 999999:
+		if idx := services.GetCRSRuleIndex(); idx != nil {
+			if entry := idx.Find(key); entry != nil && strings.TrimSpace(entry.Msg) != "" {
+				return fmt.Sprintf("%s（#%s）", strings.TrimSpace(entry.Msg), key)
+			}
+		}
+		return "CRS 规则（#" + key + "）"
+	case n > 10000 && n < 800000:
+		// 自定义规则 emit id = DB id + 10000（emit 侧对 DB id ≥790000 有守卫）。
+		if db.DB != nil {
+			var name string
+			if err := db.DB.QueryRow(`SELECT name FROM security_custom_rules WHERE id=?`, n-10000).Scan(&name); err == nil {
+				if trimmed := strings.TrimSpace(name); trimmed != "" {
+					return fmt.Sprintf("%s（#%s）", trimmed, key)
+				}
+			}
+		}
+		return "自定义规则（#" + key + "）"
+	}
+	return key
+}
+
+// labeledThreatRuleCounts 把规则 id 维度计数换成可读标签维度（同标签合并计数），
+// 供大屏 Top 榜直接展示。
+func labeledThreatRuleCounts(counts map[string]int) map[string]int {
+	labeled := make(map[string]int, len(counts))
+	for key, value := range counts {
+		labeled[describeThreatRuleName(key)] += value
+	}
+	return labeled
+}
+
 func topThreatEntries(counts map[string]int, n int) []models.SecurityAttackType {
 	entries := make([]models.SecurityAttackType, 0, len(counts))
 	for name, value := range counts {
@@ -1426,7 +1498,7 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 		"china_provinces":      chinaProvinces,
 		"top_countries":        topThreatEntries(countries, 3),
 		"top_attack_types":     topThreatEntries(familyCounts, 3),
-		"top_rules":            topThreatEntries(ruleCounts, 3),
+		"top_rules":            topThreatEntries(labeledThreatRuleCounts(ruleCounts), 3),
 		"top_targets":          topTargets,
 		"hourly_hist":          hourly,
 		"attack_type_share":    topThreatEntries(familyCounts, len(familyCounts)),

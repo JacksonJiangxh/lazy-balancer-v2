@@ -669,15 +669,15 @@ func TestGetSecurityThreatScreen_contentCards(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Then: top_rules——rule_name 优先、空名回退 rule_triggered，保留地址排除
+	// Then: top_rules——维度取 rule_triggered（可读标签渲染），保留地址排除
 	if len(payload.Data.TopRules) != 2 {
-		t.Fatalf("top_rules=%+v, want 2 项（SQL注入检测 ×3 + 回退规则 2）", payload.Data.TopRules)
+		t.Fatalf("top_rules=%+v, want 2 项（CRS 规则 ×3 + IP 访问控制 ×1）", payload.Data.TopRules)
 	}
-	if payload.Data.TopRules[0].Name != "942100" || payload.Data.TopRules[0].Value != 3 {
-		t.Errorf("top_rules[0]=%+v, want {942100 3}（触发规则 ID 维度）", payload.Data.TopRules[0])
+	if payload.Data.TopRules[0].Name != "CRS 规则（#942100）" || payload.Data.TopRules[0].Value != 3 {
+		t.Errorf("top_rules[0]=%+v, want {CRS 规则（#942100） 3}（索引缺失时回退可读标签）", payload.Data.TopRules[0])
 	}
-	if payload.Data.TopRules[1].Name != "2" || payload.Data.TopRules[1].Value != 1 {
-		t.Errorf("top_rules[1]=%+v, want {2 1}（触发规则 ID）", payload.Data.TopRules[1])
+	if payload.Data.TopRules[1].Name != "IP 访问控制拦截（#2）" || payload.Data.TopRules[1].Value != 1 {
+		t.Errorf("top_rules[1]=%+v, want {IP 访问控制拦截（#2） 1}", payload.Data.TopRules[1])
 	}
 
 	// hourly_hist：恒 24 槽（hour 0-23 升序），命中槽计数、空槽零填；
