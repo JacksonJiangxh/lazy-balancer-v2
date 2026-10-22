@@ -18,8 +18,10 @@ ui/
 .gitignore
 .dockerignore
 # 前端依赖与源码不参与镜像构建：Dockerfile 只消费预构建的 web/dist
-# （final 阶段 COPY web/dist /app/ui）。排除后前端改动不再 bust backend 阶段的
-# COPY . . 与 Go 编译层缓存。注意 web/dist 必须留在上下文内——Docker 的排除
+# （final 阶段 COPY web/dist /app/ui）。backend 阶段的显式 COPY 清单不含 web/，
+# 故前端源码改动不影响 Go 编译层；但**重新构建的 web/dist 内容变化**仍会让
+# final 阶段的 COPY web/dist 层失效（构建缓存按内容摘要判定）——这是发版必然
+# 开销，不是本文件能消除的。注意 web/dist 必须留在上下文内——Docker 的排除
 # 模式按上下文根相对匹配，下方 dist/ 只匹配根目录 dist，不会波及 web/dist。
 web/node_modules/
 web/src/

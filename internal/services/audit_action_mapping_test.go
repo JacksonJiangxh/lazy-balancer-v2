@@ -1,15 +1,15 @@
 package services
 
-// 审计动作 → 前端标签颜色映射契约：actionTagType 的颜色白名单
-// 长期靠人肉与后端词条 diff 维护，已连续三轮审计（漏 9、漏 7、漏 2）
-// 发现漏映射。本测试把契约固化为 CI 卡口：
+// 审计动作 → 前端标签颜色映射契约：色调表曾长期靠人肉与后端词条 diff
+// 维护，反复出现漏映射。本测试把契约固化为 CI 卡口：
 //  1. 用与 audit_vocabulary_test.go 相同的 AST 扫描提取后端全部可落库动作词条
 //     （RecordAuditLog/recordAudit/recordSystemAudit 字面量 + FormatAuditAction
 //     返回字面量 + 动态 allowlist 词条的取值解析）；
-//  2. 解析 web/src/views/AuditLog.vue 的 actionTagType 三段 if 白名单；
-//  3. 断言每个后端动作都有前端映射（任意颜色），且语义分类契约成立：
+//  2. 解析前端单源 web/src/utils/auditActionTone.ts——视图只 import 该模块，
+//     色调由「例外表 → danger/warning/success 关键词派生 → info 兜底」决定；
+//  3. 断言每个后端动作都能被该单源判定为非 info 色调，且语义分类契约成立：
 //     以「失败」结尾的动作与 {配置漂移, 应用失败, 部署失败, 认证拒绝, 提升失败}
-//     必须落在 danger 行。新增未映射/误分类动作此测试直接红。
+//     必须判定为 danger。新增未覆盖/误分类动作此测试直接红。
 
 import (
 	"fmt"
@@ -202,108 +202,138 @@ func backendAuditActions(t *testing.T) map[string]string {
 }
 
 var (
-	auditTagColorLineRe  = regexp.MustCompile(`return '(success|warning|danger|info)'`)
-	auditTagActionLineRe = regexp.MustCompile(`action === '([^']+)'`)
-	// 表驱动形态条目行
+	// 例外表条目行：'动作': '色调',
 	auditTagTableEntryRe = regexp.MustCompile(`'([^']+)':\s*'(success|warning|danger|info)',`)
+	// 关键词词表行：const DANGER_WORDS = ['失败', '拒绝'] as const
+	auditTagWordListRe = regexp.MustCompile(`(?m)^const (DANGER|WARNING|SUCCESS)_WORDS\s*=\s*\[([^\]]*)\]`)
+	auditTagWordRe     = regexp.MustCompile(`'([^']+)'`)
 )
 
-// frontendAuditTagMapping 解析 AuditLog.vue 的 actionTagType：支持两种形态——
-// 旧 if 链与新表驱动( 后 ACTION_TAG_TABLE),返回 动作→颜色。
-// frontendAuditTagMapping 旧注释：逐行匹配
-// `action === '...' || ... return '<color>'` 形态的白名单 if 行，返回 动作 → 颜色。
-func frontendAuditTagMapping(t *testing.T) map[string]string {
+// frontendAuditToneSource 是审计动作色调的单一事实源：视图（AuditLog.vue）只
+// import 该模块的 actionTagType，映射不再写在视图里。
+const frontendAuditToneSource = "auditActionTone.ts"
+
+// frontendAuditTone 复刻单源的分类顺序：例外表 → danger 关键词 → warning →
+// success → info（兜底并告警一次）。解析基线漂移（缺例外表/缺词表/例外表出现
+// info 值）直接失败，避免契约测试在单源重构后假绿。
+type frontendAuditTone struct {
+	exceptions map[string]string
+	danger     []string
+	warning    []string
+	success    []string
+}
+
+func loadFrontendAuditTone(t *testing.T) *frontendAuditTone {
 	t.Helper()
-	path := filepath.Join("..", "..", "web", "src", "views", "AuditLog.vue")
+	path := filepath.Join("..", "..", "web", "src", "utils", frontendAuditToneSource)
 	data, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("read AuditLog.vue: %v", err)
+		t.Fatalf("read %s: %v", frontendAuditToneSource, err)
 	}
-	mapping := map[string]string{}
-	colors := map[string]bool{}
+	tone := &frontendAuditTone{exceptions: map[string]string{}}
 	for _, rawLine := range strings.Split(string(data), "\n") {
-		// 行内 `//` 之后的部分不参与匹配——文档化白名单历史的注释行
-		// 会注册幽灵映射（真条目被删时漏映射检查假绿/幽灵颜色误触 danger 契约）。
-		// actionTagType 白名单行为简单比较、不含 URL 类字符串，朴素截断无假阴性。
+		// 行内 `//` 之后的部分不参与匹配——例外表旁的注释会注册幽灵映射
+		//（真条目被删时漏映射检查假绿/幽灵颜色误触 danger 契约）。
 		line := rawLine
 		if idx := strings.Index(line, "//"); idx >= 0 {
 			line = line[:idx]
 		}
-		if tm := auditTagTableEntryRe.FindStringSubmatch(line); tm != nil {
-			if _, dup := mapping[tm[1]]; !dup {
-				colors[tm[2]] = true
-			}
-			mapping[tm[1]] = tm[2]
+		match := auditTagTableEntryRe.FindStringSubmatch(line)
+		if match == nil {
 			continue
 		}
-		colorMatch := auditTagColorLineRe.FindStringSubmatch(line)
-		if colorMatch == nil || !strings.Contains(line, "action ===") {
-			continue
+		if previous, dup := tone.exceptions[match[1]]; dup && previous != match[2] {
+			t.Errorf("例外表动作 %q 被映射到多个色调（%s / %s）", match[1], previous, match[2])
 		}
-		color := colorMatch[1]
-		colors[color] = true
-		for _, m := range auditTagActionLineRe.FindAllStringSubmatch(line, -1) {
-			if _, exists := mapping[m[1]]; exists {
-				t.Errorf("前端动作 %q 被映射到多个颜色（含 %s）——白名单重复", m[1], color)
-				continue
-			}
-			mapping[m[1]] = color
+		tone.exceptions[match[1]] = match[2]
+	}
+	for _, spec := range auditTagWordListRe.FindAllStringSubmatch(string(data), -1) {
+		words := make([]string, 0, 4)
+		for _, word := range auditTagWordRe.FindAllStringSubmatch(spec[2], -1) {
+			words = append(words, word[1])
+		}
+		if len(words) == 0 {
+			t.Fatalf("%s 解析漂移：%s_WORDS 词表为空", frontendAuditToneSource, spec[1])
+		}
+		switch spec[1] {
+		case "DANGER":
+			tone.danger = words
+		case "WARNING":
+			tone.warning = words
+		case "SUCCESS":
+			tone.success = words
 		}
 	}
-	for _, want := range []string{"success", "warning", "danger"} {
-		if !colors[want] {
-			t.Fatalf("actionTagType 解析漂移：未找到 %s 行——actionTagType 结构已改变，请同步更新本测试的解析", want)
+	if len(tone.exceptions) < 40 {
+		t.Fatalf("%s 解析漂移：例外表仅解析到 %d 条（期望 ≥40）——结构已改变，请同步更新本测试的解析", frontendAuditToneSource, len(tone.exceptions))
+	}
+	if len(tone.danger) == 0 || len(tone.warning) == 0 || len(tone.success) == 0 {
+		t.Fatalf("%s 解析漂移：关键词词表缺失（danger=%d warning=%d success=%d）", frontendAuditToneSource, len(tone.danger), len(tone.warning), len(tone.success))
+	}
+	// info 是兜底+告警分支，不是可登记的分类：例外表出现 info 会把「未识别」
+	// 粉饰成「已分类」，本测试的漏覆盖检查随即失效。
+	for action, color := range tone.exceptions {
+		if color == "info" {
+			t.Fatalf("例外表不得把动作 %q 显式映射为 info（info 是兜底+告警分支）", action)
 		}
 	}
-	if len(mapping) < 50 {
-		t.Fatalf("actionTagType 解析漂移：仅提取到 %d 个动作映射（期望 ≥50）——actionTagType 结构已改变，请同步更新本测试的解析", len(mapping))
+	return tone
+}
+
+// classify 按单源的判定顺序返回色调；未命中返回 info（与模块兜底一致）。
+func (f *frontendAuditTone) classify(action string) string {
+	if color, ok := f.exceptions[action]; ok {
+		return color
 	}
-	return mapping
+	for _, word := range f.danger {
+		if strings.Contains(action, word) {
+			return "danger"
+		}
+	}
+	for _, word := range f.warning {
+		if strings.Contains(action, word) {
+			return "warning"
+		}
+	}
+	for _, word := range f.success {
+		if strings.Contains(action, word) {
+			return "success"
+		}
+	}
+	return "info"
 }
 
 func TestAuditActionMapping_backendActionsAllMapped(t *testing.T) {
 	backend := backendAuditActions(t)
-	frontend := frontendAuditTagMapping(t)
+	tone := loadFrontendAuditTone(t)
 	var missing []string
 	for action, evidence := range backend {
-		if _, ok := frontend[action]; !ok {
+		if tone.classify(action) == "info" {
 			missing = append(missing, action+"（首见 "+evidence+"）")
 		}
 	}
 	if len(missing) > 0 {
 		slices.Sort(missing)
-		t.Fatalf("后端动作未在 AuditLog.vue actionTagType 映射（落库后渲染为兜底 info 灰标）：\n%s", strings.Join(missing, "\n"))
-	}
-	// info 是「无 action ===」的兜底行，任何后端动作被显式写进 info 行
-	// （如 `if (action === 'X') return 'info'`）都能通过上面的映射检查而隐藏
-	// 分类错误。此处强制 info 行词条数为零——当前 info 行本就无词条，零成本绊线。
-	var infoMapped []string
-	for action, evidence := range backend {
-		if frontend[action] == "info" {
-			infoMapped = append(infoMapped, action+"（首见 "+evidence+"）")
-		}
-	}
-	if len(infoMapped) > 0 {
-		slices.Sort(infoMapped)
-		t.Fatalf("后端动作不得显式映射到 info 兜底色（info 行应保持零词条）：\n%s", strings.Join(infoMapped, "\n"))
+		t.Fatalf("后端动作既不在例外表、也不含任何色调关键词——落库后渲染为兜底 info 灰标并告警（web/src/utils/%s）：\n%s",
+			frontendAuditToneSource, strings.Join(missing, "\n"))
 	}
 }
 
 func TestAuditActionMapping_dangerClassificationContract(t *testing.T) {
 	backend := backendAuditActions(t)
-	frontend := frontendAuditTagMapping(t)
+	tone := loadFrontendAuditTone(t)
 	var violations []string
 	for action, evidence := range backend {
 		if !strings.HasSuffix(action, "失败") && !auditMappingDangerContract[action] {
 			continue
 		}
-		if color, ok := frontend[action]; ok && color != "danger" {
-			violations = append(violations, action+"（首见 "+evidence+"，前端映射为 "+color+"）")
+		if color := tone.classify(action); color != "danger" {
+			violations = append(violations, action+"（首见 "+evidence+"，前端派生为 "+color+"）")
 		}
 	}
 	if len(violations) > 0 {
 		slices.Sort(violations)
-		t.Fatalf("危险语义动作必须映射到 danger 行（失败后缀或 {配置漂移, 应用失败, 部署失败, 认证拒绝, 提升失败} 契约）：\n%s", strings.Join(violations, "\n"))
+		t.Fatalf("危险语义动作必须判定为 danger（失败后缀或 {配置漂移, 应用失败, 部署失败, 认证拒绝, 提升失败} 契约）：\n%s", strings.Join(violations, "\n"))
 	}
 }
 

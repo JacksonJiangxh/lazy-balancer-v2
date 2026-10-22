@@ -9,10 +9,18 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6
 WORKDIR /app
 
+# GOTOOLCHAIN=auto（本阶段有意保留）：xcaddy 在临时主模块里按 Caddy 声明的
+# go 指令构建，Caddy 升级到更高 Go 要求时由工具链自动拉取；backend 阶段则收紧
+# 为 local（见该阶段 ENV）——镜像内的 Go 二进制只由基础镜像声明的工具链产出。
 ENV GOTOOLCHAIN=auto
-# xcaddy 阶段只需四个本地目录（--with 引用），窄化 COPY 面——COPY . . 会让
+# 代理 ARG 在三个构建阶段各自显式声明（默认空值，行为不变）：Docker 会把
+# --build-arg HTTP(S)_PROXY 隐式注入 RUN 环境，但那是不写进本文件的隐式契约；
+# 显式声明使「受限网络下哪一阶段走代理」由本文件负责，而非依赖外部记忆。
+ARG HTTP_PROXY=""
+ARG HTTPS_PROXY=""
+# xcaddy 阶段只需四个本地目录（--with 引用），窄化 COPY 面——整目录复制会让
 # 任何前端/文档变更 bust 该层并重跑 xcaddy build（缓存挂载兜底仍需分钟级增量
-# 编译）。backend 阶段保留全量 COPY（Go 编译需全源码）。geoipnames 是零依赖
+# 编译）。backend 阶段同样用显式清单（见该阶段注释）。geoipnames 是零依赖
 # 共享表库——
 # --with 在此兼作 replace 载体（插件模块内 replace 对 xcaddy 临时主模块无效，
 # 与 wafiplist 同模式双保险）。
@@ -69,6 +77,15 @@ WORKDIR /app
 # 其不可达时 go mod download 无回退直接失败）：阿里云 404/410 时依次回落
 # goproxy.cn、直连；校验不符类瞬态错误由下方 3 次重试兜底。
 ENV GOPROXY=https://mirrors.aliyun.com/goproxy/,https://goproxy.cn,direct
+# GOTOOLCHAIN=local：镜像内的 Go 二进制只由基础镜像声明的工具链产出。auto 会在
+# 模块 go 指令高于本地工具链时构建期下载新工具链——同一 Dockerfile 在不同时间
+# 可能得到不同编译器产物，且下载失败与依赖拉取失败的错误形态混淆。工具链不足
+# 时应由构建显性失败，同步 bump 基础镜像。
+ENV GOTOOLCHAIN=local
+# 代理 ARG 显式声明（与 xcaddy-builder、final 阶段同名同默认值）：本阶段的
+# go mod download 在受限网络下同样需要代理。
+ARG HTTP_PROXY=""
+ARG HTTPS_PROXY=""
 # wafiplist/geoipnames 叶模块经根 go.mod replace ./wafiplist ./geoipnames 引用
 # ——go mod download 解析 replace 需要被替换模块的 go.mod/go.sum 在场
 # （geoipnames 零依赖无 go.sum）。
@@ -89,7 +106,12 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     sleep 10; \
   done; \
   [ "$dl" -eq 1 ] || { echo ">>> go mod download 3 次全部失败" >&2; exit 1; }
-COPY . .
+# 显式 COPY 清单（不用 `COPY . .`）：构建上下文含 web/、docs/、scripts/ 等非 Go
+# 内容，整目录复制会让任意一处非 Go 变更 bust 本层与随后的 Go 编译层。
+# 清单必须覆盖 go list 派生到的全部顶层 Go 目录（cmd/internal/caddygeoip/
+# caddydeps/wafiplist/geoipnames）——scripts/test-all.sh 有机器断言比对
+# Dockerfile 清单与 git 跟踪的顶层 Go 目录，新增顶层 Go 目录必须同步本行。
+COPY cmd/ internal/ caddygeoip/ caddydeps/ wafiplist/ geoipnames/ config/ ./
 WORKDIR /app/cmd/server
 # 双缓存挂载（模块+编译缓存，lazy-builder GC 48h）：增量编译只重编改动包；
 # 纯本地编译无网络请求，无需重试
@@ -126,13 +148,15 @@ ENV APP_VERSION=${VERSION}
 RUN apk add --no-cache ca-certificates sqlite tzdata openssl=3.5.9-r0 zlib=1.3.2-r1
 WORKDIR /app
 
-COPY --from=xcaddy-builder /app/caddy /usr/local/bin/caddy
-COPY --from=backend /app/cmd/server/lazy-balancer /usr/local/bin/lazy-balancer
-COPY web/dist /app/ui
-# Apache-2.0 §4(a)：随分发（镜像）提供许可证副本。
-COPY LICENSE /app/LICENSE
-
-RUN mkdir -p /app/data /app/config /app/logs /app/certs /app/waf/crs /app/waf/audit
+# —— 层序：慢变 + 外网层前移 ——
+# CRS/xdb 下载只依赖紧随其后的钉版版本号与校验和，与后端二进制、web/dist
+# 无关。若放在 COPY 二进制之后，任何一次代码或前端改动都会令该层缓存失效，
+# 每次发版重走 apk add curl + 双源下载 + sha256 校验 + apk del，等于把发版
+# 成功率绑到 ghfast.top / github.com / raw.githubusercontent.com 的可用性上。
+RUN mkdir -p /app/data /app/logs /app/certs /app/waf/crs /app/waf/audit
+# /app/config 不在此创建——下方 `COPY --from=backend /app/config /app/config`
+# 会自建目标目录。/app/waf/audit 与 internal/services/crsseed.go 的运行期重建
+# 成双份创建属历史兼容（老挂载回滚时目录骨架已在），crsseed 侧幂等补齐。
 
 # Download OWASP CRS rules (dual-source, aligned with the xdb seed below:
 # ghfast.top proxy first, fall back to direct GitHub — their reachability
@@ -188,17 +212,29 @@ RUN crs_version=v4.28.0; \
 # 数据文件移入 geoipnames 包并随包嵌入二进制（同一份字节
 # 同时是镜像资产与 services 的离线回退），此处 COPY 必须指向嵌入路径。
 COPY geoipnames/crawler-ip-lists.seed.json /app/waf.dist/crawler-ip-lists.seed.json
-# 容器以 root 运行（无 USER/降权，与常见 Caddy 镜像同态）；如需非 root，需
-# 同时给 80/443 加 CAP_NET_BIND_SERVICE 并预置 bind 挂载属主。
+
+# 以下各层只随各自产物变化：CRS/xdb 层已在上方固化，不受影响。
+COPY --from=xcaddy-builder /app/caddy /usr/local/bin/caddy
+COPY --from=backend /app/cmd/server/lazy-balancer /usr/local/bin/lazy-balancer
+COPY web/dist /app/ui
+# Apache-2.0 §4(a)：随分发（镜像）提供许可证副本。
+COPY LICENSE /app/LICENSE
 
 COPY --from=backend /app/config /app/config
+
+# 容器以 root 运行（无 USER/降权，与常见 Caddy 镜像同态）；如需非 root，需
+# 同时给 80/443 加 CAP_NET_BIND_SERVICE 并预置 bind 挂载属主。
 
 COPY docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # 443/udp = HTTP/3（QUIC）——Caddy 默认启用，EXPOSE 需一并声明。
+# 探针顺序 HTTPS 先行，与 docker-compose.yml 的共享锚点同序：面板 HTTPS 开启
+# 是常态，明文先行会先吃一次 302 再失败；反向在明文模式下只多一次握手失败即
+# 回落，成本对称而常态更快收敛。镜像内无 curl（构建期临时安装后 apk del），
+# busybox wget 的 --no-check-certificate 经实证可完成自签 TLS 探测。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
-  CMD wget -q -O /dev/null http://127.0.0.1:8000/health || wget -q --no-check-certificate -O /dev/null https://127.0.0.1:8000/health || exit 1
+  CMD wget -q --no-check-certificate -O /dev/null https://127.0.0.1:8000/health || wget -q -O /dev/null http://127.0.0.1:8000/health || exit 1
 
 EXPOSE 80 443 443/udp 8000
 

@@ -88,8 +88,8 @@ func ipListRefsNonEmpty(raw string) bool {
 	return len(parseIPListRefs(raw)) > 0
 }
 
-// logMalformedInlineIPList 渲染期内联 IP 名单 JSON 畸形留痕（第 83
-// 轮审计，限流）。写侧/导入侧已拒非 JSON，仅带外改库/旧库残留可达；旧实现
+// logMalformedInlineIPList 渲染期内联 IP 名单 JSON 畸形留痕（带限流）。
+// 写侧/导入侧已拒非 JSON，仅带外改库/旧库残留可达；旧实现
 // 静默按空集处理——deny ACL / 黑名单方向即 fail-open 且零告警。
 func logMalformedInlineIPList(policyID int, field string, err error) {
 	msg := fmt.Sprintf("渲染: 策略 #%d 内联 IP 名单 %s 解析失败（该列按空集处理）: %v", policyID, field, err)

@@ -44,7 +44,7 @@ docker run -d --name lazy-balancer \
   v55448330/lazy-balancer-v2:latest
 ```
 
-> 镜像标签:`latest` 指向最近一次**稳定版**;测试版只以版本号标签发布(形如 `:v2.x.y`),需要尝鲜或复现问题时请显式指定版本号。
+> 镜像标签:`latest` 指向最近一次**稳定版**(无通道后缀);测试版标签带 `-beta` 后缀(形如 `:v2.3.8-beta`),需要尝鲜或复现问题时请显式指定该标签。
 
 挂载说明:`/app/data` 数据库与配置(必选)、`/app/certs` 证书与私钥(必选)、`/app/backup` 自动备份落盘目录(必选——不挂载则容器重建后备份文件丢失)、`/app/logs` 日志(推荐)、`/app/waf` 规则库与 GeoIP(推荐)。
 
@@ -56,14 +56,17 @@ docker run -d --name lazy-balancer \
 <summary>Docker Compose / 构建源码</summary>
 
 ```bash
-# Docker Compose（Linux；主节点为 host 网络）
+# 1) 前端产物（镜像构建的必选前置：Dockerfile 只 COPY 预构建的 web/dist；
+#    仅运行官方镜像可跳过本步）。需要 Node.js ≥ 22.18：`npm test` 用
+#    node --test 直跑 .ts，依赖该版本起的默认 type stripping；见
+#    web/package.json 的 engines 字段
+cd web && npm install && npm run build && cd ..
+
+# 2) Docker Compose（Linux；主节点为 host 网络）
 docker compose up -d
 
-# 从源码构建（前端需 Node.js ≥ 22.18：`npm test` 用 node --test 直跑 .ts，
-# 依赖该版本起的默认 type stripping；见 web/package.json 的 engines 字段）
-cd web && npm install && npm run build && cd ..
-# VERSION=正式版本号（面板展示口径）；镜像 tag 可带 -beta 通道后缀——两者
-# 刻意不同，判定口径「tag 去掉通道后缀 == APP_VERSION」
+# 3) 或直接构建并推送镜像：VERSION=正式版本号（面板展示口径）；镜像 tag 可带
+#    -beta 通道后缀——两者刻意不同，判定口径「tag 去掉通道后缀 == APP_VERSION」
 docker buildx build --platform linux/amd64,linux/arm64 \
   --build-arg VERSION=v2.3.8 \
   --provenance=false --sbom=false \

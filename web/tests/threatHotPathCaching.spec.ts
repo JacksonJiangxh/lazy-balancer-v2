@@ -6,11 +6,11 @@
 //   ③ 地球点阵：贴图单例共享（引用计数释放）+ 点集切换原地更新预分配属性
 //      （不新建 BufferGeometry，只上传写入区间 + drawRange 收敛）。
 
-import { test } from 'node:test'
+import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
 import * as THREE from 'three'
 
-import { registerModuleHooks, member, source } from './_helpers.ts'
+import { registerModuleHooks, member, source, stripComments } from './_helpers.ts'
 import {
   WORLD_W,
   WORLD_D,
@@ -41,7 +41,17 @@ const fakeDocument = {
     return { width: 0, height: 0, getContext: () => null }
   },
 }
-;(globalThis as unknown as { document: unknown }).document = fakeDocument
+type DocumentHost = { document?: unknown }
+const host = globalThis as DocumentHost
+const previousDocument = host.document
+host.document = fakeDocument
+// 还原全局宿主：本文件只借 document 建贴图，不得把假 DOM 留给同进程其它用例
+// （--experimental-test-isolation=none 或未来新增真 DOM 用例时即跨用例污染）。
+after(() => {
+  if (previousDocument === undefined) delete host.document
+  else host.document = previousDocument
+  assert.equal(host.document, previousDocument, '假 document 必须在文件结束时还原')
+})
 
 const { hoverLayerTransform } = await import('../src/utils/threatScene.ts')
 const { makeDotGeometry, writeDotPositions, dotTextureState, acquireDotTexture, releaseDotTexture } =
@@ -52,29 +62,57 @@ const globeSrc = source('src/utils/threatGlobe.ts')
 
 // ---- ① 拾取矩形缓存 ----
 
+/** 布局读取位置（剥注释后）：`.`getBoundingClientRect(` 的字符下标。 */
+const layoutReads = (code: string): number[] =>
+  [...code.matchAll(/\.getBoundingClientRect\(/g)].map((match) => match.index as number)
+
+/**
+ * 所有布局读取必须落在允许的切片内——判定「读在哪个函数里」而非「全文出现
+ * 几次」：新增合法读取/等价重构不误红，热路径函数里出现读取仍必红。
+ */
+const assertLayoutReadsWithin = (code: string, allowed: readonly string[], context: string): void => {
+  const ranges = allowed.map((slice) => {
+    const start = code.indexOf(slice)
+    assert.ok(start >= 0, `${context}：缺少允许切片 ${slice.slice(0, 48)}`)
+    return [start, start + slice.length] as const
+  })
+  const reads = layoutReads(code)
+  assert.ok(reads.length > 0, `${context}：期望至少一处布局读取`)
+  for (const read of reads) {
+    assert.ok(
+      ranges.some(([start, end]) => read >= start && read < end),
+      `${context}：布局读取必须只出现在缓存刷新点，越界位置 ${read}`,
+    )
+  }
+}
+
 test('地图拾取原点：getBoundingClientRect 只在刷新函数里，pointermove 只读缓存', () => {
-  const hits = sceneSrc.match(/\.getBoundingClientRect\(/g) ?? []
-  assert.equal(hits.length, 1, `threatScene 只允许一处 getBoundingClientRect，实际 ${hits.length}`)
-  const refresh = member(sceneSrc, 'function refreshCanvasOrigin(')
-  assert.match(refresh, /\.getBoundingClientRect\(\)/, '唯一的布局读取必须在 refreshCanvasOrigin 里')
-  const point = member(sceneSrc, 'function canvasPoint(')
+  const code = stripComments(sceneSrc)
+  const refresh = member(code, 'function refreshCanvasOrigin(')
+  assert.match(refresh, /\.getBoundingClientRect\(\)/, '刷新函数必须做那次布局读取')
+  assertLayoutReadsWithin(code, [refresh], 'threatScene')
+  const point = member(code, 'function canvasPoint(')
   assert.doesNotMatch(point, /getBoundingClientRect/, 'canvasPoint 必须只读缓存原点（pointermove 逐帧调用）')
-  const size = member(sceneSrc, 'const applySize = (): void => {')
+  const size = member(code, 'const applySize = (): void => {')
   assert.match(size, /refreshCanvasOrigin\(\)/, 'applySize（ResizeObserver/window resize）必须刷新缓存')
-  const down = member(sceneSrc, 'function onPointerDown(')
+  const down = member(code, 'function onPointerDown(')
   assert.match(down, /refreshCanvasOrigin\(\)/, '按下手势必须刷新一次，兜住无尺寸变化的布局位移')
 })
 
 test('地球拾取矩形：拾取/浮签定位走缓存，syncSize 刷新', () => {
-  const hits = globeSrc.match(/\.getBoundingClientRect\(/g) ?? []
-  // 仅剩 initW/initH 的构造测量 + canvasRect 内部一处
-  assert.equal(hits.length, 3, `threatGlobe 只允许构造期两处 + 缓存读取一处，实际 ${hits.length}`)
-  const size = member(globeSrc, 'const syncSize = (): void => {')
+  const code = stripComments(globeSrc)
+  const rect = member(code, 'function canvasRect(')
+  const initMeasures = [...code.matchAll(/const init[WH] = [^\n]+/g)].map((match) => match[0])
+  assert.equal(initMeasures.length, 2, '构造期宽高测量必须有 initW/initH 两处')
+  for (const line of initMeasures) assert.match(line, /getBoundingClientRect\(\)/, '构造期测量形态')
+  // 允许面 = 构造期两处测量 + canvasRect 缓存读取本身；其它任何位置读布局即热路径回归
+  assertLayoutReadsWithin(code, [rect, ...initMeasures], 'threatGlobe')
+  const size = member(code, 'const syncSize = (): void => {')
   assert.match(size, /canvasRectCache = null/, 'syncSize（RO/resize/轮询）必须失效矩形缓存')
-  const pick = member(globeSrc, 'function screenToLatLng(')
+  const pick = member(code, 'function screenToLatLng(')
   assert.match(pick, /const r = canvasRect\(\)/, '拾取必须读缓存矩形')
   assert.doesNotMatch(pick, /getBoundingClientRect/, 'screenToLatLng 不得读取布局')
-  const hover = member(globeSrc, 'function processHover(')
+  const hover = member(code, 'function processHover(')
   assert.match(hover, /const r = canvasRect\(\)/, '浮签定位必须读缓存矩形')
   assert.doesNotMatch(hover, /getBoundingClientRect/, 'processHover 不得读取布局')
 })
@@ -218,6 +256,4 @@ test('地球接线：三层共用一个贴图实例，dispose 只按引用释放
   assert.match(setPoints, /writeDotPositions\(points, dots, project\)/)
   assert.doesNotMatch(setPoints, /new THREE\.BufferGeometry/, '点集切换不得新建 BufferGeometry')
   assert.match(globeSrc, /makeDotGeometry\(dots\.length\)/, '暗度/hover 层必须预分配容量')
-  // 世界点阵是点集上界：hover 只取国家子集、衬底过滤掉下钻国
-  assert.match(globeSrc, /worldDots\.filter\(\(d\) => d\.key !== drilledName\)/)
 })

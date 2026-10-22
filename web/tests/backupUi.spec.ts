@@ -31,6 +31,16 @@ test('新文件入口先清旧内容，超大拒绝不可回用旧备份', () =>
   assert.doesNotMatch(body, /48MB|48 \* 1024/)
 })
 
+test('导入大小上限与后端 maxConfigImportBytes 同源', () => {
+  const go = repoSource('internal/handlers/config_import_v1.go')
+  const declared = /var maxConfigImportBytes int64 = (\d+) << (\d+)/.exec(go)
+  assert.ok(declared, '后端导入上限常量未解析')
+  const goBytes = Number(declared[1]) * 2 ** Number(declared[2])
+  const pageBytes = /const IMPORT_MAX_BYTES = (\d+) \* 1024 \* 1024/.exec(page)
+  assert.ok(pageBytes, '前端导入上限常量未解析')
+  assert.equal(Number(pageBytes[1]) * 1024 * 1024, goBytes, '前后端导入上限漂移会让超限文件在错误的一侧被拦')
+})
+
 test('lbbak 以 Blob 直传，不复制成第二个 ArrayBuffer', () => {
   const body = section(page, 'const handleImportFile', 'const postImportValidation')
   assert.match(body, /importFileContent\.value = file\.slice\(bomLen\)/)

@@ -529,7 +529,7 @@ func waitForServerStop(server *http.Server, signals serverStopSignals) error {
 	case err := <-signals.serverErrors:
 		return err
 	}
-	// +：无论由 quit 还是 restart 触发，都在进入关停流程前统一停
+	// 无论由 quit 还是 restart 触发，都在进入关停流程前统一停
 	// 信号通道（先于 "Shutting down..." 与 ≤10s 的 HTTP Shutdown 窗口）。
 	// 此前仅 quit 分支停通道：restart 分支的关停窗口内第二个信号会被通道
 	// 缓冲，随后被 run() 返回后的 defer signal.Stop 冲刷丢弃，无法触发默认
@@ -553,10 +553,11 @@ func waitForServerStop(server *http.Server, signals serverStopSignals) error {
 			services.Logf("error", "HTTP server forced close failed: %v", closeErr)
 		}
 	}
-	// 进程退出前给 Caddy 排水窗口——此前 PID1 退出后
-	// 容器 teardown 直接 SIGKILL 残存进程（含监督器与 Caddy），每次升级/重启
-	// 硬断全部在途代理连接。POST /stop 让 Caddy 优雅关停；	// admin 不可达（已停/独立部署）静默略过。restart 路径同理（进程退出由
-	// 容器编排重建，Caddy 排水后由新容器监督器重拉）。
+	// 进程退出前给 Caddy 排水窗口——此前 PID1 退出后容器 teardown 直接
+	// SIGKILL 残存进程（含监督器与 Caddy），每次升级/重启硬断全部在途代理
+	// 连接。POST /stop 让 Caddy 优雅关停；admin 不可达（已停/独立部署）静默
+	// 略过。restart 路径同理（进程退出由容器编排重建，Caddy 排水后由新容器
+	// 监督器重拉）。
 	drainCaddy(signals.caddyAdminURL, budget.segment(caddyDrainSegmentMax))
 	return nil
 }

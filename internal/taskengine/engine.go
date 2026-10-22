@@ -239,10 +239,19 @@ const daemonAbnormalResetAfter = time.Minute
 // schedSlotEvalLead=到期前导窗（窗内每 tick 求值，保证到点即投）；
 // schedSlotEvalFloor=槽远期/已消费时的重评地板周期（收敛用户重排/带外
 // 改库造成的陈旧缓存——生效延迟上界即本周期）。
+//
+// schedSlotEvalFloor 用原子值承载（纳秒）：测试用「缩短地板」把分钟级周期拉进
+// 时间尺度内，并在 cleanup 里写回原值——cleanup 与仍存活的 tick goroutine
+// 并发（引擎停止的 cleanup 与地板恢复的 cleanup 之间没有先后保证），普通
+// time.Duration 会让 -race 报数据竞争。读侧只多一次原子载入。
 var (
 	schedSlotEvalLead  = 30 * time.Second
-	schedSlotEvalFloor = time.Minute
+	schedSlotEvalFloor atomic.Int64
 )
+
+func init() {
+	schedSlotEvalFloor.Store(int64(time.Minute))
+}
 
 func NewEngine(opts Options) *Engine {
 	if opts.TickInterval <= 0 {
@@ -1640,7 +1649,7 @@ func (e *Engine) tick() {
 			//     陈旧缓存（生效延迟上界=地板周期；排程保存路径本身即重排
 			//     next_update，地板内自然收敛）。
 			consumed := !prevSlot.IsZero() && !prevSlot.After(doneSlot)
-			floorDue := now.Sub(r.schedSlotEvalAt) >= schedSlotEvalFloor
+			floorDue := now.Sub(r.schedSlotEvalAt) >= time.Duration(schedSlotEvalFloor.Load())
 			needEval := prevSlot.IsZero() || floorDue ||
 				(!consumed && !now.Before(prevSlot.Add(-schedSlotEvalLead)))
 			if needEval {

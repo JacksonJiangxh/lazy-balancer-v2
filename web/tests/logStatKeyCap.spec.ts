@@ -1,43 +1,80 @@
-// 规则日志统计的键上限判定必须是 O(1)：原实现在每次遇到新键时用
-// Object.keys(map).length 数整表（500 键上限下全量摄入要重复数数百次）。
-// 现实现为每个统计桶维护 keyCounts 计数。SFC 内私有实现无法在 node 下求值，
-// 沿用本仓「源码钉」形态（限段 + 边界）。
+// 规则日志统计的键上限容器：上限判定必须是 O(1)（原实现每次遇到新键都用
+// Object.keys(map).length 数整表），满表后计数回落「其他」而非丢弃。
 //
-// 运行：cd web && npm test
+// 判定方式为行为求值：直接调用 utils/logStatCap 的纯函数构造满表/敌意键形态，
+// 不断言「函数文本里出现某常量」——等价重构（Map/动态桶）不应变红。
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { section, source } from './_helpers.ts'
+import {
+  MAX_LOG_STAT_KEYS,
+  OTHER_LOG_STAT_KEY,
+  createLogStatBuckets,
+  incrementCappedStat,
+} from '../src/utils/logStatCap.ts'
+import { source } from './_helpers.ts'
 
-const rules = source('src/views/Rules.vue')
+const keyOf = (i: number): string => `10.0.${Math.floor(i / 256)}.${i % 256}`
 
-test('统计键上限 O(1)：计数随新增键自增，不再数整表', () => {
-  assert.match(rules, /keyCounts: \{ ip: 0, ua: 0, uri: 0 \}/, '统计桶自带键数计数')
-
-  const increment = section(rules, 'const incrementCappedStat = (', '\n}\n')
-  assert.match(increment, /if \(buckets\.keyCounts\[bucket\] < MAX_LOG_STAT_KEYS - 1\)/)
-  assert.match(increment, /buckets\.keyCounts\[bucket\] \+= 1/, '新增键时同步计数')
-  assert.doesNotMatch(increment, /Object\.keys\(/, '不得再数整表')
-
-  const consume = section(rules, 'const consumeLogLine = (', '\n}\n')
-  assert.match(consume, /incrementCappedStat\(maps, 'ip', ip\)/)
-  assert.match(consume, /incrementCappedStat\(maps, 'uri', uri\)/)
-  assert.match(consume, /incrementCappedStat\(maps, 'ua', g\)/)
+test('容量内：新键落库并计数，既有键只自增不重复计数', () => {
+  const buckets = createLogStatBuckets()
+  incrementCappedStat(buckets, 'ip', '1.1.1.1')
+  incrementCappedStat(buckets, 'ip', '1.1.1.1')
+  assert.equal(buckets.ip['1.1.1.1'], 2)
+  assert.equal(buckets.keyCounts.ip, 1, '既有键不得重复占用容量')
+  incrementCappedStat(buckets, 'ip', '2.2.2.2')
+  assert.equal(buckets.keyCounts.ip, 2)
+  // 三个桶容量独立
+  assert.equal(buckets.keyCounts.ua, 0)
+  assert.equal(buckets.keyCounts.uri, 0)
+  incrementCappedStat(buckets, 'ua', 'Chrome 120')
+  assert.deepEqual([buckets.keyCounts.ip, buckets.keyCounts.ua], [2, 1])
 })
 
-// 敌意键形态：统计键来自请求日志（攻击者可控）。原型链键 `__proto__` 在普通对象
-// 上赋值会命中 Object.prototype 的 setter——键静默不落库，但 keyCounts 已自增
-// （计数侵蚀：容量被幽灵键吃满），且永远不会归入「其他」。`constructor`/
-// `toString` 同样只能靠 own-property 守卫侥幸正确，容器本身必须是原型安全的
-// （Object.create(null) 或 Map）才不依赖守卫细节。
-test('统计键：原型链敌意键不得侵蚀计数，满表回落「其他」', () => {
-  const createBuckets = section(rules, 'const createLogStatBuckets = (', '\n})')
-  const increment = section(rules, 'const incrementCappedStat = (', '\n}\n')
-  assert.match(
-    createBuckets,
-    /Object\.create\(null\)|new Map/,
-    '统计桶必须使用无原型容器，否则 __proto__/constructor/toString 会被原型链吞掉或依赖守卫细节',
-  )
-  assert.match(increment, /OTHER_LOG_STAT_KEY/, '满表必须回落「其他」，不得丢弃计数')
+test('满表回落「其他」：键集合不再增长，计数不丢弃', () => {
+  const buckets = createLogStatBuckets()
+  const distinct = MAX_LOG_STAT_KEYS - 1
+  for (let i = 0; i < distinct; i++) incrementCappedStat(buckets, 'ip', keyOf(i))
+  assert.equal(Object.keys(buckets.ip).length, distinct)
+  assert.equal(buckets.keyCounts.ip, distinct)
+
+  // 满表后的新键全部归入「其他」，且键集合保持在 MAX 个（自有键 + 其他）
+  incrementCappedStat(buckets, 'ip', '203.0.113.9')
+  incrementCappedStat(buckets, 'ip', '203.0.113.10')
+  assert.equal(buckets.ip[OTHER_LOG_STAT_KEY], 2)
+  assert.equal(Object.keys(buckets.ip).length, MAX_LOG_STAT_KEYS)
+  assert.equal(buckets.keyCounts.ip, distinct, '回落不得继续占用容量')
+  assert.equal(buckets.ip['203.0.113.9'], undefined, '满表后的新键不再单独落库')
+
+  // 已落库键在满表后仍精确自增（不被并入其他）
+  incrementCappedStat(buckets, 'ip', keyOf(0))
+  assert.equal(buckets.ip[keyOf(0)], 2)
+  assert.equal(buckets.ip[OTHER_LOG_STAT_KEY], 2)
+
+  // 「其他」自身是普通键：再次出现只自增，不得被当成新键
+  incrementCappedStat(buckets, 'ip', OTHER_LOG_STAT_KEY)
+  assert.equal(buckets.ip[OTHER_LOG_STAT_KEY], 3)
+})
+
+test('原型链敌意键不得侵蚀计数（容器原型安全）', () => {
+  const buckets = createLogStatBuckets()
+  for (const key of ['__proto__', 'constructor', 'toString', 'hasOwnProperty']) {
+    incrementCappedStat(buckets, 'uri', key)
+  }
+  assert.equal(buckets.keyCounts.uri, 4, '敌意键必须作为普通自有键占用容量')
+  for (const key of ['__proto__', 'constructor', 'toString', 'hasOwnProperty']) {
+    assert.equal((buckets.uri as Record<string, number>)[key], 1)
+    incrementCappedStat(buckets, 'uri', key)
+    assert.equal((buckets.uri as Record<string, number>)[key], 2)
+  }
+  assert.equal(Object.getPrototypeOf(buckets.uri), null, '统计桶必须无原型')
+  assert.equal(Object.keys(buckets.uri).length, 4)
+})
+
+test('规则日志视图消费单源容器（不得回流本地实现）', () => {
+  const rules = source('src/views/Rules.vue')
+  assert.match(rules, /from '@\/utils\/logStatCap'/)
+  assert.doesNotMatch(rules, /const incrementCappedStat = /, '本地实现必须退役')
+  assert.doesNotMatch(rules, /keyCounts: \{ ip: 0, ua: 0, uri: 0 \}/, '本地桶构造必须退役')
 })

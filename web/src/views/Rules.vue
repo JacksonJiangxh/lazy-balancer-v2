@@ -1263,6 +1263,7 @@ import { hostPortKey } from '@/utils/upstreamKeys'
 import { MAX_UPSTREAM_ROWS, normalizeWeights, payloadWeight, redistributeWeight, weightPercent } from '@/utils/upstreamWeights'
 import { projectRuleFlowPath } from '@/utils/ruleFlow'
 import { clampPassiveHealthCheckTimeout, copyRuleHostHeader, dnsServerAfterToggle, newRuleWizardStageOverrides, stageBlockPageOverrides } from '@/utils/ruleWizard'
+import { createLogStatBuckets, incrementCappedStat, type LogStatBuckets } from '@/utils/logStatCap'
 import { certJobStatusLabel } from '@/utils/certJobStatus'
 import type { CertJobStatus } from '@/utils/certJobStatus'
 import { usePollingTask } from '@/composables/usePollingTask'
@@ -3527,33 +3528,11 @@ const ruleLogStats = ref<RuleLogStats | null>(null)
 const ruleLogStatsLoading = ref(false)
 const ruleLogStatsError = ref('')
 const logStatsOffset = ref(0)
-// 统计桶：keyCounts 记各映射当前键数，使上限判定为 O(1)——Object.keys(map).length
-// 在每次新增键时都要遍历整表（500 键上限下全量摄入会重复分配数百次）。
-interface LogStatBuckets {
-  ip: Record<string, number>
-  ua: Record<string, number>
-  uri: Record<string, number>
-  total: number
-  keyCounts: Record<'ip' | 'ua' | 'uri', number>
-}
 interface LogStatMaps extends LogStatBuckets {
   startedAt: string
 }
-const createLogStatBuckets = (): LogStatBuckets => ({
-  // 原型安全容器：统计键来自请求日志（攻击者可控）。普通对象上写入 __proto__
-  // 会命中原型 setter——键静默不落、keyCounts 已自增（幽灵键吃满容量），
-  // constructor/toString 只能靠 own-property 守卫侥幸正确；无原型容器让任意
-  // 字符串都是普通自有键，不依赖守卫细节。
-  ip: Object.create(null) as Record<string, number>,
-  ua: Object.create(null) as Record<string, number>,
-  uri: Object.create(null) as Record<string, number>,
-  total: 0,
-  keyCounts: { ip: 0, ua: 0, uri: 0 },
-})
 const logStatsMaps = ref<LogStatMaps | null>(null)
 const logStatsInFlight = ref(false)
-const MAX_LOG_STAT_KEYS = 500
-const OTHER_LOG_STAT_KEY = '其他'
 const LOG_STAT_CHUNK_SIZE = 200
 
 const generalizeUA = (ua: string): string => {
@@ -3629,20 +3608,6 @@ const consumeLogLinesChunked = async (
     }
   }
   return isCurrent()
-}
-
-const incrementCappedStat = (buckets: LogStatBuckets, bucket: 'ip' | 'ua' | 'uri', key: string): void => {
-  const map = buckets[bucket]
-  if (Object.prototype.hasOwnProperty.call(map, key)) {
-    map[key] += 1
-    return
-  }
-  if (buckets.keyCounts[bucket] < MAX_LOG_STAT_KEYS - 1) {
-    map[key] = 1
-    buckets.keyCounts[bucket] += 1
-    return
-  }
-  map[OTHER_LOG_STAT_KEY] = (map[OTHER_LOG_STAT_KEY] || 0) + 1
 }
 
 const topN = (m: Record<string, number>, n: number) =>

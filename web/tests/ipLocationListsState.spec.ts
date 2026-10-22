@@ -12,13 +12,20 @@ import { section, source } from './_helpers.ts'
 
 const page = source('src/views/security/IPLocationAction.vue')
 
-test('名单加载失败不得静默：catch 置 listsError，成功分支按缺失条目重算', () => {
+test('名单加载失败不得静默：catch 置 listsError 并清空名单，成功分支按缺失条目重算', () => {
   assert.match(page, /const listsError = ref\(false\)/)
 
   const loadIpLists = section(page, 'const loadIpLists = async', '\n}\n')
   assert.match(loadIpLists, /listsError\.value = \[\.\.\.refIds\]\.some\(\(id\) => !\(id in sharedEntriesCache\)\)/,
     'ensureSharedEntries 单名单失败保持未缓存——引用条目缺失同属加载失败')
-  assert.match(loadIpLists, /ipLists\.value = \[\]\s*\n\s*listsError\.value = true/, '名单接口失败必须同时置错误态')
+  // 失败分支：清空本次名单 → 置错误态（顺序按语句位置判定，不耦合空行/缩进）
+  const catchAt = loadIpLists.indexOf('} catch {')
+  assert.ok(catchAt >= 0, 'loadIpLists 必须有 catch 分支')
+  const failure = loadIpLists.slice(catchAt)
+  const cleared = failure.indexOf('ipLists.value = []')
+  const flagged = failure.indexOf('listsError.value = true', cleared + 1)
+  assert.ok(cleared > 0, '名单接口失败必须清空本次名单')
+  assert.ok(flagged > cleared, '名单接口失败必须置错误态（清空之后）')
 })
 
 test('失败态有横幅与重试入口，处置动作在失败态禁用', () => {

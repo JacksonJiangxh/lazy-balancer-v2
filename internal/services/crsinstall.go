@@ -306,7 +306,7 @@ func (m *CRSUpdateManager) downloadAndInstall(parent context.Context, tag string
 	// 版本行必须先于 reloader 更新（已随上方交换段落库）——
 	// crsPoolFingerprint 以版本行为池键输入，先重载则指纹仍为旧值、coraza 池
 	// 命中旧实例，磁盘新规则要等下一次生成才生效（无限期静默陈旧）。
-	// 审计 V-问题-1（第五轮）：先写后失败的版本行回滚——不回滚则
+	// 先写后失败的版本行回滚——不回滚则
 	// currentCRSVersion() 已为新 tag，下轮自动更新短路「已是最新」、失败被掩盖
 	// 且永不重试（直到重启）。旧 tag 由交换段锁内读出（prevTag）。
 	WriteCRSUpdateLog("INFO", string(CRSStatusReloading), "应用新规则并重载 Caddy")
@@ -316,9 +316,8 @@ func (m *CRSUpdateManager) downloadAndInstall(parent context.Context, tag string
 		if err != nil {
 			WriteCRSUpdateLog("ERROR", string(CRSStatusReloading), fmt.Sprintf("重载失败: %v", err))
 			// 回滚必须同代（树 + live VERSION + DB 版本行）——旧实现
-			// restoreBackup 取锁后立即释放，标记/版本行在锁外写（第 83
-			// 轮审计：持锁读者可见「旧树+新标记」；并发导入可在窗口内被本轮
-			// 标记覆盖）。
+			// restoreBackup 取锁后立即释放，标记/版本行在锁外写（持锁读者可见
+			// 「旧树+新标记」；并发导入可在窗口内被本轮标记覆盖）。
 			m.rollbackAfterReloadFailure(prevTag)
 			return &crsReloadError{cause: fmt.Errorf("重载 Caddy: %w", err)}
 		}

@@ -130,16 +130,7 @@ test('历史统计失败置错误态并给重试，空态文案不再代表失�
   assert.match(dialog, /图表为空不代表该时间范围没有流量/)
 })
 
-// ============ 节点角色三态 ============
-
-test('节点模式未知不再展示「主节点」', () => {
-  assert.match(dashboard, /const nodeModeRole = computed<'master' \| 'slave' \| 'unknown'>/)
-  assert.match(dashboard, /return 'unknown'/)
-  assert.match(dashboard, /'节点角色未知'/)
-  assert.match(dashboard, /const nodeModeTagType = computed/)
-  assert.match(dashboard, /:type="nodeModeTagType"/)
-  assert.doesNotMatch(dashboard, /isSlave \? 'warning' : 'success'/)
-})
+// ============ 节点角色三态的派生/渲染由 dashboardNodeRole.spec 唯一承担 ============
 
 // ============ 未知状态兑现灰底样式 ============
 

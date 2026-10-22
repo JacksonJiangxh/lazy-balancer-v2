@@ -1071,7 +1071,7 @@ func TestRuleRelationBatchQueriesChunkLargeRuleSets(t *testing.T) {
 	}
 }
 
-// LB-09：主动健康检查未启用时其专属字段（path/host/port）渲染零消费——
+// 主动健康检查未启用时其专属字段（path/host/port）渲染零消费——
 // 保存侧归一清零并返回被清字段名（审计披露）；启用时零触碰。
 func TestNormalizeInactiveHealthCheckFields(t *testing.T) {
 	path, host, port := "/health", "probe.example.test", 8081

@@ -102,6 +102,12 @@ export interface SystemMetrics {
   disk_used: number
   disk_total: number
   disk_percent: number
+  /**
+   * 分项降级披露：本次采集失败的分项（memory/disk/cpu）。
+   * 存在项在卡片内显示「采集失败」而非 0——后端对失败项返回零值，展示层不得
+   * 把「没采到」呈现成「用量为 0」。全部失败时后端返回 500（无本字段）。
+   */
+  degraded?: string[]
 }
 
 export interface CaddyMetrics {

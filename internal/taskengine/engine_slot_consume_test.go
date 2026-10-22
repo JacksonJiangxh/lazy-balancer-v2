@@ -20,12 +20,13 @@ import (
 	"time"
 )
 
-// 缩短槽重评地板（默认 1min 在测试时间尺度外）——包级单测串行执行。
+// 缩短槽重评地板（默认 1min 在测试时间尺度外）——包级单测串行执行；地板是
+// 原子值（tick 读 vs 本 cleanup 写回并发，见 engine.go 的声明注释）。
 func shrinkSlotEvalFloor(t *testing.T, d time.Duration) {
 	t.Helper()
-	old := schedSlotEvalFloor
-	schedSlotEvalFloor = d
-	t.Cleanup(func() { schedSlotEvalFloor = old })
+	old := schedSlotEvalFloor.Load()
+	schedSlotEvalFloor.Store(int64(d))
+	t.Cleanup(func() { schedSlotEvalFloor.Store(old) })
 }
 
 // Given Scheduled 任务成功落定但业务未推进槽（槽仍是过期旧值）。

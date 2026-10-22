@@ -89,9 +89,9 @@ func TestRulePayload_rejectsMixedPathRuleUpstreamPool(t *testing.T) {
 	}
 }
 
-// 混布门收敛三链——存量混布行（69 轮修复前落库/
-// 直改 DB）不得经启用/复制静默投入运行，启动聚合校验须点名告警。保存门与
-// v2 导入链已拦新数据（上方两测试）；此前启用链/聚合校验/复制链零检查。
+// 混布门收敛三链——存量混布行（直改 DB 或更早版本落库）不得经启用/复制
+// 静默投入运行，启动聚合校验须点名告警。保存门与 v2 导入链已拦新数据
+//（上方两测试）；启用链/聚合校验/复制链此前零检查。
 
 func seedMixedStoredRule(t *testing.T, id string, enabled bool) {
 	t.Helper()

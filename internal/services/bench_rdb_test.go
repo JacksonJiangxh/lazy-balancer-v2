@@ -50,8 +50,10 @@ func TestRDBCompile_200kAggregates(t *testing.T) {
 	if len(state.V4) != 1 || state.V4[0].String() != "10.0.0.0/8" || len(state.V6) != 0 {
 		t.Fatalf("聚合结果 v4=%v v6=%v, want [10.0.0.0/8] 且无 v6", state.V4, state.V6)
 	}
-	wantSize := int64(16 + len(state.V4)*5 + len(state.V6)*17)
+	// .fast 尾部带 4 字节 crc32c 校验和（wafiplist fastformat 的 checksum
+	// flag 形态，覆盖 header+条目区），大小公式必须含该尾部。
+	wantSize := int64(16 + len(state.V4)*5 + len(state.V6)*17 + 4)
 	if fi.Size() != wantSize {
-		t.Fatalf(".fast 大小=%d, want %d（16B 头 + 5B/v4 + 17B/v6）", fi.Size(), wantSize)
+		t.Fatalf(".fast 大小=%d, want %d（16B 头 + 5B/v4 + 17B/v6 + 4B crc32c）", fi.Size(), wantSize)
 	}
 }

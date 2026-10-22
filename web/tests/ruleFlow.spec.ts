@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { projectRuleFlowPath } from '../src/utils/ruleFlow.ts'
 import { stage1FootnoteText, stageSubLabel } from '../src/utils/securityStages.ts'
 import type { PathRule } from '../src/types/rules.ts'
+import { repoSource } from './_helpers.ts'
 
 const base: PathRule = {
   match_type: 'prefix', path: '/api', upstream_path: '', sort_order: 0, upstreams: null,
@@ -52,6 +53,33 @@ test('阶段 1 文案：副标题与脚注含爬虫校验，脚注含遗留黑�
   for (const [token, position] of order) assert.ok(position >= 0, `脚注缺少环节：${token}`)
   const positions = order.map(([, position]) => position)
   assert.deepEqual(positions, [...positions].sort((a, b) => a - b), '阶段 1 链序与渲染发射顺序不一致')
+
+  // 跨栈机械钉：脚注的环节顺序必须等于渲染器的实际发射顺序。锚点取
+  // buildIPPrecheckDirectives 内的规则动作/消息（id:3 信任 → id:2 黑名单 →
+  // id:4 遗留黑名单 → 白名单外拒绝 id:7 → 爬虫校验 → GeoIP 地域链）。Go
+  // 单侧改序而脚注未同步、或脚注改序而发射未变，都会在此变红。
+  const goBlock = repoSource('internal/services/security.go')
+  const precheck = goBlock.slice(
+    goBlock.indexOf('func buildIPPrecheckDirectives('),
+    goBlock.indexOf('\nfunc ', goBlock.indexOf('func buildIPPrecheckDirectives(') + 1),
+  )
+  assert.ok(precheck.length > 0, '未找到 buildIPPrecheckDirectives')
+  const anchors: Record<string, RegExp> = {
+    信任: /id:3,phase:1,pass,nolog,ctl:ruleEngine=DetectionOnly/,
+    黑名单: /msg:'IP 黑名单拒绝'/,
+    遗留黑名单: /msg:'IP 黑名单'(?!拒)/,
+    白名单外拒绝: /msg:'IP 白名单拒绝'/,
+    爬虫校验: /X-LB-Crawler-Verified/,
+    地域拦截: /msg:'GeoIP 区域拦截'/,
+  }
+  const emission = order.map(([token]) => {
+    const hit = anchors[token]
+    assert.ok(hit, `缺少环节锚点：${token}`)
+    const at = precheck.search(hit)
+    assert.ok(at >= 0, `渲染器未发射环节：${token}`)
+    return at
+  })
+  assert.deepEqual(emission, [...emission].sort((a, b) => a - b), '脚注环节顺序与渲染器发射顺序不一致')
 })
 
 test('阶段 1 脚注：绑定保留检测信任策略时追加降级说明', () => {

@@ -10,31 +10,61 @@ import assert from 'node:assert/strict'
 import {
   validateUsername,
   validatePassword,
+  USERNAME_MIN_LENGTH,
+  USERNAME_MAX_LENGTH,
+  USERNAME_POLICY_RE,
+  PASSWORD_MIN_LENGTH,
+  PASSWORD_MAX_LENGTH,
   USERNAME_POLICY_MESSAGE,
   USERNAME_LENGTH_MESSAGE,
   PASSWORD_LENGTH_MESSAGE,
   PASSWORD_CHARSET_MESSAGE,
 } from '../src/utils/credentials.ts'
-import { section, source } from './_helpers.ts'
+import { repoSource, section, source } from './_helpers.ts'
 
-test('A 用户名字符集：小写字母开头 + 小写字母/数字，长度 3-50', () => {
+// 跨栈权威源：用户名/密码策略在后端是字面量（auth.go 的密码常量 + 用户名正则、
+// models.go 的 CreateUserRequest 长度标签）。下方行为断言的长度/字符集边界全部
+// 由 Go 源派生——前端手抄表与后端单侧漂移即红，不再依赖人工核对。
+const authGo = repoSource('internal/handlers/auth.go')
+const GO_PASSWORD_MIN = Number(/minPasswordLength = (\d+)/.exec(authGo)?.[1])
+const GO_PASSWORD_MAX = Number(/maxPasswordLength = (\d+)/.exec(authGo)?.[1])
+const GO_USERNAME_PATTERN = /usernamePolicyRe = regexp\.MustCompile\(`([^`]+)`\)/.exec(authGo)?.[1] ?? ''
+const createUserGo = section(repoSource('internal/models/models.go'), 'type CreateUserRequest struct', '\n}')
+const GO_USERNAME_BINDING = /binding:"required,min=(\d+),max=(\d+)"/.exec(createUserGo)
+const GO_USERNAME_MIN = Number(GO_USERNAME_BINDING?.[1])
+const GO_USERNAME_MAX = Number(GO_USERNAME_BINDING?.[2])
+
+test('策略常量与后端声明逐项对表（任一侧变更必红）', () => {
+  assert.ok(GO_PASSWORD_MIN > 0 && GO_PASSWORD_MAX > GO_PASSWORD_MIN, 'auth.go 密码长度常量未解析')
+  assert.ok(GO_USERNAME_PATTERN && GO_USERNAME_MIN > 0, 'auth.go/models.go 用户名策略未解析')
+  assert.equal(PASSWORD_MIN_LENGTH, GO_PASSWORD_MIN)
+  assert.equal(PASSWORD_MAX_LENGTH, GO_PASSWORD_MAX)
+  assert.equal(USERNAME_MIN_LENGTH, GO_USERNAME_MIN)
+  assert.equal(USERNAME_MAX_LENGTH, GO_USERNAME_MAX)
+  assert.equal(USERNAME_POLICY_RE.source, GO_USERNAME_PATTERN, '用户名字符集正则必须与后端同源同形')
+})
+
+test('A 用户名字符集：小写字母开头 + 小写字母/数字，长度由 Go binding 派生', () => {
   assert.equal(validateUsername(''), null, '空值由调用方按入口语义拦截')
   assert.equal(validateUsername('admin'), null)
   assert.equal(validateUsername('user01'), null)
-  assert.equal(validateUsername('Admin'), USERNAME_POLICY_MESSAGE, '大写必须拒绝（后端 ^[a-z][a-z0-9]*$）')
+  assert.equal(validateUsername('Admin'), USERNAME_POLICY_MESSAGE, '大写必须拒绝（后端正则不含 A-Z）')
   assert.equal(validateUsername('1user'), USERNAME_POLICY_MESSAGE)
   assert.equal(validateUsername('user_name'), USERNAME_POLICY_MESSAGE)
   assert.equal(validateUsername('用户名abc'), USERNAME_POLICY_MESSAGE, '含汉字必须拒绝')
-  assert.equal(validateUsername('ab'), USERNAME_LENGTH_MESSAGE)
-  assert.equal(validateUsername('a'.repeat(51)), USERNAME_LENGTH_MESSAGE)
+  assert.equal(validateUsername('a'.repeat(GO_USERNAME_MIN - 1)), USERNAME_LENGTH_MESSAGE)
+  assert.equal(validateUsername('a'.repeat(GO_USERNAME_MAX)), null, '后端 binding 上界内必须放行')
+  assert.equal(validateUsername('a'.repeat(GO_USERNAME_MAX + 1)), USERNAME_LENGTH_MESSAGE)
 })
 
-test('A 密码字符集：8-24 位可打印 ASCII；汉字/控制符前置拒绝', () => {
+test('A 密码字符集：Go 常量派生的长度区间 + 可打印 ASCII；汉字/控制符前置拒绝', () => {
   assert.equal(validatePassword(''), null, '留空=不修改')
   assert.equal(validatePassword('Abc12345'), null)
   assert.equal(validatePassword('!@#$%^&*Aa1'), null)
-  assert.equal(validatePassword('Abc1234'), PASSWORD_LENGTH_MESSAGE)
-  assert.equal(validatePassword('A'.repeat(25)), PASSWORD_LENGTH_MESSAGE)
+  assert.equal(validatePassword('A'.repeat(GO_PASSWORD_MIN - 1)), PASSWORD_LENGTH_MESSAGE)
+  assert.equal(validatePassword('A'.repeat(GO_PASSWORD_MIN)), null, '下界本身必须接受')
+  assert.equal(validatePassword('A'.repeat(GO_PASSWORD_MAX)), null, '上界本身必须接受')
+  assert.equal(validatePassword('A'.repeat(GO_PASSWORD_MAX + 1)), PASSWORD_LENGTH_MESSAGE)
   assert.equal(validatePassword('密码12345678'), PASSWORD_CHARSET_MESSAGE)
   assert.equal(validatePassword('Abc12345\t'), PASSWORD_CHARSET_MESSAGE)
   assert.equal(validatePassword('Ａbc12345'), PASSWORD_CHARSET_MESSAGE, '全角字母同样属于非 ASCII')

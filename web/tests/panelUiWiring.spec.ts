@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { member, section, source } from './_helpers.ts'
+import { member, section, source, stripComments } from './_helpers.ts'
 
 test('当前密码错误在页面本地 toast，拦截器复用精确分类', () => {
   const layout = source('src/components/layout/AppLayout.vue')
@@ -217,9 +217,13 @@ test('自动封禁口径文案不再自缩为「WAF 事件」', () => {
 test('IP 快捷弹框全流程使用 trim 后的地址（无裸 props.ip 消费）', () => {
   const text = source('src/views/security/IPLocationAction.vue')
   assert.match(text, /const trimmedIp = computed\(\(\) => props\.ip\.trim\(\)\)/)
-  // 只剩 computed 自身的 props.ip 读取 + 注释
-  const bare = text.match(/props\.ip(?!\.trim)/g) ?? []
-  assert.equal(bare.length, 1, `只允许 computed 定义处读取 props.ip，实际 ${bare.length}`)
+  // 裸 props.ip 的鉴别力要求「消费点」而非「出现次数」：剥注释后除归一化
+  // 读取（props.ip.trim()）外不得再有任何读取——新增合法读取/注释不再误红。
+  assert.doesNotMatch(
+    stripComments(text),
+    /props\.ip(?!\.trim\()/,
+    '地址只允许经 trimmedIp 归一后消费，禁止直接读 props.ip',
+  )
   // 移除/legacy 判定路径都用归一值
   assert.match(text, /inLegacy: parseIPList\(policy\.ip_blacklist\)\.includes\(trimmedIp\.value\)/)
   assert.match(text, /if \(!list\.includes\(trimmedIp\.value\)\)/)

@@ -4,9 +4,12 @@
 # 在临时 git 夹具仓里逐形态验证守卫的命中面与误报边界：
 #   • 命中面：未跟踪文件、受控文件、各扩展名（Go/TS/MD/SH/YML/SQL/go.mod/
 #     Dockerfile/docker-entrypoint.sh/.dockerignore/Caddyfile）、下划线/小写/
-#     连写形态、跨行拆字、审计产物文件名、.gitignore 双向校验；
+#     连写形态、审计产物文件名、.gitignore 双向校验、轮次引用的各书写形态
+#     （裸轮次＋审计动作、斜杠并列、中文数字归属、注释头截断残骸、跨行拆字含
+#     续行注释前缀）；
 #   • 误报面：百分位、版本串、十六进制摘要/哈希算法名、协议与产品 token、
-#     合法测试函数名、中文“轮播/轮询”等。
+#     容量边界常量、合法测试函数名、中文“轮播/轮询”、循环轮次表述（心跳/共识/
+#     降频/区间/并列打点）。
 #
 # 本文件按设计被守卫的内容扫描豁免（其内容即被测样本），豁免面在
 # scripts/check-no-audit-artifacts.sh 中显式限定为这一个路径。
@@ -230,7 +233,58 @@ mkdir_in docs/notes.md
 printf '沿革：第 83\n轮引入该行为。\n' >"$tmp_root/docs/notes.md"
 assert_bad "cross-line 第 N 轮" "docs/notes.md"
 
-# 9) .gitignore 双向校验：少一行 / 多一行都失败
+# 9) 裸轮次 + 审计动作（无「第」）
+reset_fixture
+mkdir_in internal/handlers/stored_rule_gate.go
+cat >"$tmp_root/internal/handlers/stored_rule_gate.go" <<'EOF'
+package handlers
+
+// 保存门拦新载荷，此门兜直改 DB/69 轮修复前落库的存量。
+func noop() {}
+EOF
+assert_bad "bare N 轮 + audit verb" "internal/handlers/stored_rule_gate.go"
+
+# 10) 斜杠并列轮次
+reset_fixture
+mkdir_in internal/services/version_triggers_test.go
+cat >"$tmp_root/internal/services/version_triggers_test.go" <<'EOF'
+package services
+
+// 簿记列不 bump 集群版本（第 25/26 轮审计）——语义列真实变化才 bump。
+func TestBookkeepingDoesNotBump(t *testing.T) {}
+EOF
+assert_bad "slash-parallel 第 N/N 轮" "internal/services/version_triggers_test.go"
+
+# 11) 跨行拆字 + 续行注释前缀
+reset_fixture
+mkdir_in internal/services/update_round_test.go
+printf '// 中止口径镜像另一侧（第\n// 66 轮漏收敛本侧）——须落 skipped 终态。\n' \
+  >"$tmp_root/internal/services/update_round_test.go"
+assert_bad "cross-line with comment prefix" "internal/services/update_round_test.go"
+
+# 12) 注释头截断残骸：裸轮次收尾于全角标点
+reset_fixture
+mkdir_in cmd/notes.go
+cat >"$tmp_root/cmd/notes.go" <<'EOF'
+package main
+
+// 71 轮）：中置空格同族——畸形 Host 不得反射。
+func noop() {}
+EOF
+assert_bad "comment-head round residue" "cmd/notes.go"
+
+# 13) 中文数字轮次 + 审计归属
+reset_fixture
+mkdir_in internal/services/deny_attribution.go
+cat >"$tmp_root/internal/services/deny_attribution.go" <<'EOF'
+package services
+
+// 审计 （第五轮）：deny 归因应含 refs 合并集。
+func noop() {}
+EOF
+assert_bad "audit + chinese-numeral round" "internal/services/deny_attribution.go"
+
+# 14) .gitignore 双向校验：少一行 / 多一行都失败
 reset_fixture
 grep -v '^\*\*/r\[0-9\]\*_test\.go$' "$tmp_root/.gitignore" >"$tmp_root/.gitignore.tmp"
 mv "$tmp_root/.gitignore.tmp" "$tmp_root/.gitignore"
@@ -278,7 +332,7 @@ package x
 
 // HTTP/3 与 QUIC、TLS 1.3、IPV6 监听、PID1 进程、X509 证书链、ED25519 密钥、
 // HS256 签名、UTF-8 编码、DNS-01 质询、AES-256-GCM、X-LB-GeoIP-Country-Code、
-// REQUEST-942 规则、LBF1 文件魔数、SHA256 摘要。
+// REQUEST-942 规则、LBF1 文件魔数、SHA256 摘要；容量边界 MAX-1 与 MIN-1。
 func noop() {}
 EOF
 assert_good "protocol and product tokens"
@@ -303,6 +357,33 @@ cat >"$tmp_root/docs/ui.md" <<'EOF'
 首页轮播与后端轮询相互独立；第 1 轮播位与第 3 轮询间隔都在设置页可调。
 EOF
 assert_good "carousel and polling wording"
+
+# 7) 循环轮次表述（心跳/共识/降频/并列打点/区间）不误判
+reset_fixture
+mkdir_in internal/services/loop_rounds.go
+cat >"$tmp_root/internal/services/loop_rounds.go" <<'EOF'
+package services
+
+// 心跳：小时级一条（60 轮×60s）；连续 2 轮共识即放行；失败 5 轮后降频为
+// 每 10 轮一次；有界循环（最多 3 轮）补采尾部；第 0/6 轮打点。
+// 第 61-119 轮静默；单次保存最多 3 轮 → 3R；9 轮内应只在第 0/6 轮打点。
+func noop() {}
+EOF
+assert_good "loop round wording"
+
+# 8) 注释头以循环轮次开头也不误判
+reset_fixture
+mkdir_in internal/services/loop_head_test.go
+cat >"$tmp_root/internal/services/loop_head_test.go" <<'EOF'
+package services
+
+// 3 轮渲染 → 3R）。批次级一次求值后透传。
+func TestLoopHeadComment(t *testing.T) {
+	// When 从节点连打两轮心跳窗口（120 轮）
+	_ = 0
+}
+EOF
+assert_good "loop round wording at comment head"
 
 # ===========================================================================
 echo "selftest: $pass passed, $fail failed"

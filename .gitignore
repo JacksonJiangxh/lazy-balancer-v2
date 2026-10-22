@@ -22,7 +22,9 @@ backup*/
 # Test UI (staging)
 test-ui/
 
-# Pre-built UI (rebuilt during docker build)
+# 镜像内前端路径（Dockerfile: COPY web/dist /app/ui），非仓库产物——本地若出现
+# 同名目录只是无意义副本。前端产物由宿主预构建（cd web && npm run build），
+# 镜像构建期**不**产出 ui/。
 ui/
 
 # Node modules (installed during docker build)

@@ -372,7 +372,7 @@ func matchingCertificatePair(t *testing.T, domains ...string) (string, string) {
 	return string(certPEM), string(keyPEM)
 }
 
-// +(第 23/24 轮审计):物化查询多行规则——同 updated_at 秒级并列时
+// 物化查询多行规则——同 updated_at 秒级并列时
 // 按 id DESC 取最新行,且域名适用性过滤(任务域≠规则当前域的行不物化)。
 func TestMaterializeAllCertsFromDB_selectsLatestApplicableRow(t *testing.T) {
 	_, database := newClusterTestService(t)

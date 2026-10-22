@@ -137,8 +137,8 @@ func trustedProxyInlineCount(req *models.UpdateConfigRequest) (int, error) {
 	return len(entries), nil
 }
 
-// idChunk 是一个 id 分片及其预构造的 IN 子句占位符与参数（第 73
-// 轮：受信代理两处 500 分片样板单源——仅共享分片构造，不合并查询/校验语义）。
+// idChunk 是一个 id 分片及其预构造的 IN 子句占位符与参数（受信代理两处 500
+// 分片样板单源——仅共享分片构造，不合并查询/校验语义）。
 type idChunk struct {
 	placeholders string
 	args         []any

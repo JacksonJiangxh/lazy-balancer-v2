@@ -194,41 +194,55 @@
           </template>
           <el-skeleton v-if="initialLoading" :rows="2" animated />
           <div v-else-if="systemMetricsUnavailable" class="collection-state">采集失败</div>
-          <el-row v-else-if="systemMetrics" :gutter="32">
-            <el-col :span="8">
-              <div class="resource-item">
-                <div class="resource-header">
-                  <span class="resource-label">CPU 使用率</span>
-                  <span class="resource-value text-blue">{{ systemMetrics.cpu_percent.toFixed(1) }}%</span>
+          <template v-else-if="systemMetrics">
+            <div v-if="degradedSystemParts.size" class="info-note-bar">
+              <span class="info-note-desc">部分指标采集失败：{{ degradedSystemLabels.join('、') }}</span>
+              <span>（仅展示其余可用指标；该项数值不代表真实用量）</span>
+            </div>
+            <el-row :gutter="32">
+              <el-col :span="8">
+                <div class="resource-item">
+                  <div class="resource-header">
+                    <span class="resource-label">CPU 使用率</span>
+                    <span class="resource-value text-blue">
+                      {{ degradedSystemParts.has('cpu') ? '采集失败' : `${systemMetrics.cpu_percent.toFixed(1)}%` }}
+                    </span>
+                  </div>
+                  <el-progress v-if="!degradedSystemParts.has('cpu')" :percentage="Math.min(systemMetrics.cpu_percent, 100)" :stroke-width="6" color="#3b82f6" :show-text="false" />
                 </div>
-                <el-progress :percentage="Math.min(systemMetrics.cpu_percent, 100)" :stroke-width="6" color="#3b82f6" :show-text="false" />
-              </div>
-            </el-col>
-            <el-col :span="8">
-              <div class="resource-item">
-                <div class="resource-header">
-                  <span class="resource-label">内存使用</span>
-                  <span class="resource-value text-purple">
-                    {{ formatBytes(systemMetrics.memory_used) }}
-                    <span class="resource-total">/ {{ formatBytes(systemMetrics.memory_total) }}</span>
-                  </span>
+              </el-col>
+              <el-col :span="8">
+                <div class="resource-item">
+                  <div class="resource-header">
+                    <span class="resource-label">内存使用</span>
+                    <span class="resource-value text-purple">
+                      <template v-if="degradedSystemParts.has('memory')">采集失败</template>
+                      <template v-else>
+                        {{ formatBytes(systemMetrics.memory_used) }}
+                        <span class="resource-total">/ {{ formatBytes(systemMetrics.memory_total) }}</span>
+                      </template>
+                    </span>
+                  </div>
+                  <el-progress v-if="!degradedSystemParts.has('memory')" :percentage="Math.min(systemMetrics.memory_percent, 100)" :stroke-width="6" color="#8b5cf6" :show-text="false" />
                 </div>
-                <el-progress :percentage="Math.min(systemMetrics.memory_percent, 100)" :stroke-width="6" color="#8b5cf6" :show-text="false" />
-              </div>
-            </el-col>
-            <el-col :span="8">
-              <div class="resource-item">
-                <div class="resource-header">
-                  <span class="resource-label">磁盘使用</span>
-                  <span class="resource-value text-cyan">
-                    {{ formatBytes(systemMetrics.disk_used) }}
-                    <span class="resource-total">/ {{ formatBytes(systemMetrics.disk_total) }}</span>
-                  </span>
+              </el-col>
+              <el-col :span="8">
+                <div class="resource-item">
+                  <div class="resource-header">
+                    <span class="resource-label">磁盘使用</span>
+                    <span class="resource-value text-cyan">
+                      <template v-if="degradedSystemParts.has('disk')">采集失败</template>
+                      <template v-else>
+                        {{ formatBytes(systemMetrics.disk_used) }}
+                        <span class="resource-total">/ {{ formatBytes(systemMetrics.disk_total) }}</span>
+                      </template>
+                    </span>
+                  </div>
+                  <el-progress v-if="!degradedSystemParts.has('disk')" :percentage="Math.min(systemMetrics.disk_percent, 100)" :stroke-width="6" color="#06b6d4" :show-text="false" />
                 </div>
-                <el-progress :percentage="Math.min(systemMetrics.disk_percent, 100)" :stroke-width="6" color="#06b6d4" :show-text="false" />
-              </div>
-            </el-col>
-          </el-row>
+              </el-col>
+            </el-row>
+          </template>
           <div v-else class="collection-state">-</div>
         </el-card>
       </el-col>
@@ -464,6 +478,7 @@ import type { APIResponse, SystemInfo, SystemMetrics, CaddyMetrics, Rule, RuleMe
 import { usePollingTask } from '@/composables/usePollingTask'
 import { httpStatusColors } from '@/utils/chartTheme'
 import { buildRuleMetricsUnavailable, ruleMetricCellTitle } from '@/utils/dashboardMetrics'
+import { degradedMetricLabels, degradedMetricParts } from '@/utils/systemMetrics'
 
 
 const authStore = useAuthStore()
@@ -509,6 +524,10 @@ const ruleHealthUnavailable = ref(false)
 const hostMetrics = ref<HostMetrics[] | null>(null)
 const overview = ref<MetricsOverview | null>(null)
 const systemMetricsUnavailable = ref(false)
+// 分项降级（后端 degraded 契约）：失败分项显示「采集失败」而非零值——
+// CPU 单点故障时内存/磁盘仍照常展示，只有失败项标注不可用。
+const degradedSystemParts = computed(() => degradedMetricParts(systemMetrics.value?.degraded))
+const degradedSystemLabels = computed(() => degradedMetricLabels(systemMetrics.value?.degraded))
 // 「已落地」与「可用」分离：/rules 可能先于 /metrics/dashboard 落地，
 // 此时不能把「指标尚未到达」当成「采集失败」——首轮逐规则列会全部闪「采集失败」。
 // landed 只在 dashboard 响应成功/失败后置位；未落地前一律视为「无结论」。

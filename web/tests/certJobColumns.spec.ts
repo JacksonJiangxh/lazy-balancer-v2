@@ -13,7 +13,6 @@ import { member, section, source } from './_helpers.ts'
 import {
   CERT_JOB_COLUMNS,
   CERT_JOB_COLUMNS_MIN_WIDTH,
-  CERT_JOB_COLUMNS_TOTAL_WIDTH,
   CERT_JOB_COLUMN_WIDTHS,
   certJobColumnsWidth,
   pickVisibleCertJobColumns,
@@ -22,15 +21,15 @@ import {
 const page = source('src/views/settings/CertJobs.vue')
 const tableBody = section(page, 'class="cert-jobs-table"', '</el-table>')
 
-test('全列宽度单源与组件声明一致（1209px）', () => {
-  assert.equal(CERT_JOB_COLUMNS_TOTAL_WIDTH, 1209)
-  assert.equal(CERT_JOB_COLUMNS.length, 10)
+test('模板列宽必须取自单源表（列数与总宽基线由表布局用例承担）', () => {
   for (const id of CERT_JOB_COLUMNS) {
     const width = CERT_JOB_COLUMN_WIDTHS[id]
     assert.ok(width > 0, `${id} 缺少正宽度`)
   }
-  // 组件模板里每个宽度都必须能在常量表找到（防两处漂移）
-  const declared = [...tableBody.matchAll(/width="(\d+)"/g)].map((m) => Number(m[1]))
+  // 组件模板里每个宽度都必须能在常量表找到（防两处漂移）；列数/1209 总宽
+  // 由 certJobsTableLayout（按 label 的映射更严）唯一承担，不在此重复。
+  const declared = [...tableBody.matchAll(/(?:min-)?width="(\d+)"/g)].map((m) => Number(m[1]))
+  assert.ok(declared.length > 0)
   for (const w of declared) {
     assert.ok(Object.values(CERT_JOB_COLUMN_WIDTHS).includes(w), `组件宽度 ${w} 不在单源表内`)
   }

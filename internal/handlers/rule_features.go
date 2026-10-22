@@ -1451,10 +1451,9 @@ func validateEnabledStoredRuleConfigs(ctx context.Context) error {
 			services.Logf("warn", "端口 %d 存在 TLS 与明文规则混布（明文：%v；TLS：%v）——该端口监听器将整体切换为 TLS，明文规则流量将握手失败，请调整规则端口", port, mix[0], mix[1])
 		}
 	}
-	// 存量启用行启用上游池混布点名告警（镜像
-	// portTLSMix 形态，不阻断启动——阻断会让节点起不来；启用方向已被
-	// validateStoredRuleConfig 400 拦截，此门兜直改 DB/69 轮修复前落库的
-	// 存量，提示管理员修正）。
+	// 存量启用行启用上游池混布点名告警（镜像 portTLSMix 形态，不阻断启动——
+	// 阻断会让节点起不来；新写入方向已被 validateStoredRuleConfig 400 拦截，
+	// 此门兜「直改 DB 或更早版本落库」的存量，提示管理员修正）。
 	for _, rule := range rules {
 		if !rule.Enabled || rule.Protocol != "http" {
 			continue

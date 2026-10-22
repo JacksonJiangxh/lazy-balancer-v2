@@ -863,7 +863,7 @@ func securityEventsPolicyContainsRuleWithExclusions(policy *models.SecurityPolic
 		if !policy.IPACLEnabled {
 			return false
 		}
-		// 审计 （第五轮）：deny 归因应含 refs 合并集（inline ∪ ip_acl_list_refs），
+		// deny 归因应含 refs 合并集（inline ∪ ip_acl_list_refs），
 		// 否则 refs-only deny 策略无法认领自己的 id:2 事件。
 		aclList := policy.MergedACLList
 		if len(aclList) == 0 {
@@ -890,10 +890,9 @@ func securityEventsPolicyContainsRuleWithExclusions(policy *models.SecurityPolic
 		// 历史威胁情报库共享 id:14：由带 ACL 引用/内联名单的 IP 控制策略认领。
 		return policy.IPACLEnabled && (len(policy.MergedACLList) > 0 || ipListRefsNonEmpty(policy.IPACLListRefs))
 	case n >= 900000 && n < 1000000:
-		// 审计 （第五轮）+ （第六轮回归修复）：v2.2.2 混合选择——
-		// crs_rule_groups 可含六位 CRS ID 正选；六位 ID 触发的 CRS 事件应先按
-		// 六位正选归因，未命中时回落既有组号归因（空组=全部 CRS）。
-		// 第五轮的本分支在组号分支（:371）之前且直接 return false，使后者成为
+		// v2.2.2 混合选择——crs_rule_groups 可含六位 CRS ID 正选；六位 ID 触发的
+		// CRS 事件应先按六位正选归因，未命中时回落既有组号归因（空组=全部 CRS）。
+		// 早期实现把本分支放在组号分支（:371）之前且直接 return false，使后者成为
 		// 死代码——用两位组号（常规配置）的策略其 CRS 事件归因失效。
 		// mode=off 不发射任何 CRS（engine 分支不成立或零 Include），
 		// 不得认领 CRS 事件（与 GeoIP 分支的 off 门同口径）。2026-09-09 四态化:
@@ -2508,7 +2507,7 @@ func runIngestionLoop(ctx context.Context) error {
 // 天然携带自身耗时。
 
 // securityEventsStageDurationEmbedded 按规则归属与事件动作从审计行内嵌
-// lb_timing 字段选分段耗时（µs）。分段二态契约（第 75/76 轮，与写侧
+// lb_timing 字段选分段耗时（µs）。分段二态契约（与写侧
 // caddygeoip 分段选键/锚点交接配对）：
 //
 //	pre_us=预检决策耗时(放行=timing_pre 收点记;预检拦=blocked_counter 代记);

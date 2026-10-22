@@ -3402,8 +3402,8 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 	// 点名源规则；此处原有一次同条件/同文案的重复调用（永不
 	// 产生新结果，且重复查库），删除。
 
-	// 源行启用上游池混布同检——保存门只拦新建/更新
-	// 载荷，复制是对存量混布行（69 轮修复前落库/直改 DB）的旁路放大通道。
+	// 源行启用上游池混布同检——保存门只拦新建/更新载荷，复制是对存量混布行
+	// （直改 DB 或更早版本落库）的旁路放大通道。
 	if err := mixedUpstreamPoolError(rule); err != nil {
 		fail(http.StatusBadRequest, "源规则配置不合法："+err.Error())
 		return

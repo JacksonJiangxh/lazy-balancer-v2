@@ -71,8 +71,7 @@ test('规则向导关闭即清空私钥/证书明文', () => {
   assert.match(body, /wizardForm\.tls_key = ''/)
 })
 
-test('库健康标签加载三态（未加载不得显示「正常」）', () => {
-  assert.match(source('src/utils/securityLibraries.ts'), /loaded === false/)
+test('库健康标签的加载态由视图接线（三态语义由 securityLibraries 行为用例承担）', () => {
   const page = source('src/views/security/SecurityRules.vue')
   assert.match(page, /loaded: crsInfoLoaded\.value/)
   assert.match(page, /loaded: ip2regionInfoLoaded\.value/)

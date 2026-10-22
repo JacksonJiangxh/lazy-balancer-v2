@@ -174,11 +174,10 @@ func redirectHTTP(reader *bufio.Reader, connection net.Conn) {
 		}
 		if strings.HasPrefix(strings.ToLower(line), "host:") {
 			host = strings.TrimSpace(line[len("host:"):])
-			// Host 行内裸 CR 等控制字符不得反射进 Location
-			// TrimSpace 只去首尾，中置 CR 曾原样进响应头）；
-			// 71 轮）：中置空格（0x20）同族——TrimSpace 同样剔不掉，畸形 Host
-			// 不得反射。含控制字符/空格（<=0x20 或 0x7f）即视为无效 Host，
-			// 回退本地地址。
+			// Host 行内裸 CR 等控制字符不得反射进 Location：TrimSpace 只去首尾，
+			// 中置 CR 曾原样进响应头。中置空格（0x20）同族——TrimSpace 同样剔
+			// 不掉，畸形 Host 不得反射。含控制字符/空格（<=0x20 或 0x7f）即视为
+			// 无效 Host，回退本地地址。
 			if strings.ContainsFunc(host, func(r rune) bool { return r <= 0x20 || r == 0x7f }) {
 				host = ""
 			}

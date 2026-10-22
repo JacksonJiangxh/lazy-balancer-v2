@@ -13,6 +13,25 @@ cd "$(dirname "$0")/.."
 ./scripts/check-no-audit-artifacts.sh
 ./scripts/tests/guard-selftest.sh
 
+# 启动链工件语法：docker-entrypoint.sh 是每次部署的唯一入口（语法错误 = 面板
+# 不可用，且只在容器启动时暴露，此前无任何门禁触碰它）；scripts/ 全部按 bash
+# 解析。sh -n / bash -n 只做语法不执行，零成本纯增益。
+echo "== shell syntax (entrypoint + scripts) =="
+sh -n docker-entrypoint.sh
+while IFS= read -r script; do
+  bash -n "$script"
+done < <(git ls-files 'scripts/*.sh')
+
+# 出厂引导 Caddyfile 的引擎级校验：内容与 entrypoint heredoc 的同构性由
+# cmd/server 的钉测试机械比对（下方 go test 覆盖）；此处校验引擎是否接受。
+# caddy 不可用时显式 SKIP（不静默通过），结构比对仍在跑。
+echo "== bootstrap Caddyfile engine validation =="
+if command -v caddy >/dev/null 2>&1; then
+  caddy validate --config config/Caddyfile --adapter caddyfile
+else
+  echo "SKIP: caddy 不可用——结构同构由 cmd/server/bootstrap_caddyfile_test.go 覆盖，引擎校验未执行"
+fi
+
 # 基线（评审点）：与 git ls-files 派生结果不一致即失败。
 baseline_modules=(
   "."
@@ -31,7 +50,9 @@ done < <(
     | sort -u
 )
 
-if [[ "${modules[*]}" != "${baseline_modules[*]}" ]]; then
+# 两侧各自排序后比较：模块清单顺序不承载语义（新增字典序在前的模块不应被
+# 报成 drift），集合不同才是真 drift。
+if [[ "$(printf '%s\n' "${modules[@]}" | LC_ALL=C sort)" != "$(printf '%s\n' "${baseline_modules[@]}" | LC_ALL=C sort)" ]]; then
   echo "module list drift: git-derived=[${modules[*]}] baseline=[${baseline_modules[*]}]" >&2
   echo "add/remove the module in baseline_modules (and gofmt targets) explicitly" >&2
   exit 1
@@ -55,13 +76,40 @@ if [[ "$discovered_modules" != "$git_modules" ]]; then
   exit 1
 fi
 
+# Dockerfile 后端阶段用显式 COPY 清单（避免 web/docs/scripts 等非 Go 变更 bust
+# Go 编译层）——清单漏项只会在镜像构建时才暴露（go build 缺包），故在此比对：
+# git 跟踪的顶层 Go 目录必须全部在清单内。
+backend_copy_line="$(grep -E '^COPY [a-z].*\./$' Dockerfile | grep -F 'internal/' | head -1)"
+if [[ -z "$backend_copy_line" ]]; then
+  echo "Dockerfile: 未找到 backend 阶段的显式 COPY 清单（形如 COPY cmd/ internal/ ... ./）" >&2
+  exit 1
+fi
+copy_dirs=()
+for token in ${backend_copy_line#COPY }; do
+  [[ "$token" == "./" ]] && continue
+  copy_dirs+=("${token%/}")
+done
+top_go_dirs="$(git ls-files '*.go' | awk -F/ 'NF>1{print $1}' | LC_ALL=C sort -u)"
+missing_dirs=""
+while IFS= read -r dir; do
+  [[ -z "$dir" ]] && continue
+  printf '%s\n' "${copy_dirs[@]}" | grep -qxF "$dir" || missing_dirs+="$dir "
+done <<<"$top_go_dirs"
+if [[ -n "$missing_dirs" ]]; then
+  echo "Dockerfile backend COPY 清单缺少顶层 Go 目录：$missing_dirs" >&2
+  echo "清单=[${copy_dirs[*]}] 顶层 Go 目录=[${top_go_dirs//$'\n'/ }]" >&2
+  exit 1
+fi
+
 for module in "${modules[@]}"; do
   echo "== go vet ./... ($module) =="
   (cd "$module" && go vet ./...)
 done
 
-# gofmt 目标由模块清单派生：根模块的 Go 包目录取自 git 跟踪的 .go 文件（排除嵌套
-# 模块前缀），嵌套模块直接扫模块目录本身。新增嵌套模块自动入列——不再维护
+# gofmt 目标由模块清单派生：根模块的 Go 包目录取自 git 跟踪 + 未跟踪（未被
+# .gitignore 忽略）的 .go 文件（排除嵌套模块前缀），嵌套模块直接扫模块目录本身。
+# 含未跟踪文件是刻意的——「先写新文件 → 跑门禁 → 再 git add」是常见顺序，
+# 只看受控文件会让格式门在该顺序下给假绿。新增嵌套模块自动入列——不再维护
 # 硬编码目录清单（漏列模块会让格式检查静默失效）。
 nested_re=""
 for module in "${modules[@]}"; do
@@ -72,9 +120,9 @@ done
 gofmt_targets=()
 root_targets=()
 if [[ -n "$nested_re" ]]; then
-  go_files="$(git ls-files '*.go' | grep -Ev "^(${nested_re})/" || true)"
+  go_files="$(git ls-files --cached --others --exclude-standard '*.go' | grep -Ev "^(${nested_re})/" || true)"
 else
-  go_files="$(git ls-files '*.go')"
+  go_files="$(git ls-files --cached --others --exclude-standard '*.go')"
 fi
 if [[ -n "$go_files" ]]; then
   while IFS= read -r dir; do
@@ -111,6 +159,17 @@ for module in "${modules[@]}"; do
   echo "== go test ./... -count=1 ($module) =="
   (cd "$module" && go test ./... -count=1)
 done
+
+# 镜像构建等价性冒烟：镜像内是 CGO_ENABLED=0 GOOS=linux 交叉编译，与本地
+# go test 的构建参数不同（平台/cgo 相关代码路径不进测试面）。产物写 /dev/null，
+# 不落盘。
+echo "== image-build equivalence (GOOS=linux CGO_ENABLED=0 go build) =="
+CGO_ENABLED=0 GOOS=linux go build -o /dev/null ./cmd/server
+
+# 竞态门：并发核心（任务引擎 + 进程内 Caddy 协作/监督器探测）此前只在本地
+# 手工跑 -race。全量 -race 会把门禁时长成倍拉长，故只覆盖并发密集入口。
+echo "== go test -race (concurrency cores) =="
+go test -race -count=1 ./internal/taskengine ./cmd/...
 
 echo "== frontend tests/typecheck/build =="
 # vue-tsc 看不到模板编译期错误，发布契约要求真实 vite build

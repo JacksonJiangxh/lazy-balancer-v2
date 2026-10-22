@@ -41,7 +41,7 @@ func TestClusterVersionTriggers_bumpWhenCertificateStatusTransitionsToIssued(t *
 	}
 }
 
-// +(第 25/26 轮审计):cert_jobs UPDATE 触发器簿记抖动守卫——
+// cert_jobs UPDATE 触发器簿记抖动守卫——
 // 签发/续期阶段写(message/attempts/updated_at 等簿记列)不 bump 集群版本;
 // 语义列(rule_id/domain/cert_pem/key_pem/expires_at/ca_provider_id——
 // 起 status 移出,仅 disabled 例外)值真实变化才 bump。

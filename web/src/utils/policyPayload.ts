@@ -4,7 +4,7 @@
 // 字段语义（阶段外字段裁剪、引用列表随开关释放、stage0 信任恒启用、空名单保留）
 // 都是后端契约，抽成纯函数后由 policyPayload.spec.ts 行为钉住。
 //
-// 契约要点（与 internal/handlers/security.go UpdateSecurityPolicyRequest 对齐）：
+// 契约要点（与 internal/models/security.go UpdateSecurityPolicyRequest 对齐）：
 //  - 显式 policy_type 提交后服务端把阶段外字段归一为零值；mixed 不显式提交
 //  （兼容组仅存量可编辑，省略=后端按内容推断）。
 //  - ip_acl_list_refs / ip_whitelist_refs 随开关释放（'[]'）——开关关闭时引用列表

@@ -262,11 +262,10 @@ test('⑦地图/地球引擎修复契约', () => {
   assert.doesNotMatch(mapSrc, /sawServerConfig/, 'setServer 不得只接受首次配置')
   assert.match(mapSrc, /server = \[centroid\[0\], centroid\[1\]\]/)
   // 两引擎的省级 hover 都必须按数据能力边界标注，不得把「无省级
-  // 数据源」渲染成「该省 0 次攻击」。
-  for (const src of [mapSrc, globeSrc]) {
-    assert.match(src, /hasProvinceStats\(/, '省级统计边界必须走共享判定')
-    assert.match(src, /无省级统计/, '海外下钻浮签必须显式标注无省级统计')
-  }
+  // 数据源」渲染成「该省 0 次攻击」——地图侧在此钉住，地球侧由
+  // threatGlobe.spec（同断言归属地）承担，避免同一文本钉两处。
+  assert.match(mapSrc, /hasProvinceStats\(/, '省级统计边界必须走共享判定')
+  assert.match(mapSrc, /无省级统计/, '海外下钻浮签必须显式标注无省级统计')
 })
 
 // ---- 数据级：省板包含断言（消费运行时导出的真实数据） ----

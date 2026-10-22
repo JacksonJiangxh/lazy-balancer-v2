@@ -1055,8 +1055,8 @@ func TestIP2RegionUpdate_recordsReloadFailureAudit(t *testing.T) {
 	}
 }
 
-// demote 竞态从节点中止口径镜像 CRS（第
-// 66 轮漏收敛本侧）——起点角色复查中止须落 skipped 终态并审计「更新跳过」，
+// demote 竞态从节点中止口径镜像 CRS——起点角色复查中止须落 skipped 终态并
+// 审计「更新跳过」，
 // 不得记「更新失败」（从节点中止是正常语义，非故障）。
 func TestIP2RegionUpdateRun_slaveAbortsSkipSemantics(t *testing.T) {
 	m := newTestIP2RegionManager(t)

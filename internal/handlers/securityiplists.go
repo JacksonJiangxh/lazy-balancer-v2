@@ -1019,7 +1019,8 @@ func (h *Handlers) DeleteIPList(c *gin.Context) {
 	// 受信代理引用面守卫（2026-10-12，参照 crs_excluded 引用面守卫）：
 	// 被 trusted_proxy_range_refs 引用的名单删除会使受信网段渲染静默缺
 	// 条目（保存侧存在性门只拦新写入，不追存量悬空）——同事务内检查，
-	// 解除引用（Caddy 全局设置）后方可删除。查询/解析失败 	// 按被引用处理（宁可拒绝删除，不放行悬空引用）。
+	// 解除引用（Caddy 全局设置）后方可删除。查询/解析失败一律按被引用处理
+	// （宁可拒绝删除，不放行悬空引用）。
 	var trustedRefs string
 	if err := tx.QueryRowContext(c.Request.Context(), `SELECT COALESCE(trusted_proxy_range_refs,'[]') FROM global_config WHERE id=1`).Scan(&trustedRefs); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "校验受信代理引用失败"})

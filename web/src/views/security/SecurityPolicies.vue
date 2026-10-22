@@ -2005,7 +2005,7 @@ const serializedExcludedRules = computed<CrsExcludedRow[]>(() => {
     const key = `${target}\u0000${row.scope}\u0000${row.ips.join(',')}\u0000${row.listRefs.join(',')}`
     if (seen.has(key)) continue
     seen.add(key)
-    // 审计 （第五轮）：序列化按 scope 剥离非当前作用域的残留——
+    // 序列化按 scope 剥离非当前作用域的残留——
       // 带外数据（scope=all 但 ips 非空）会 400 卡保存。
       out.push({ target, scope: row.scope,
         ips: row.scope === 'ip' ? [...row.ips] : [],
@@ -2755,7 +2755,7 @@ const boundRuleRows = computed<BoundRuleRow[]>(() => boundRules.value.map((caddy
     listenPort: rule?.listen_port ?? 0,
     chain,
     blockPageNotes: blockPageNotes(caddyId, chain),
-    // 审计 （第六轮）：性能提示应按实际生效的处理链计——禁用策略不产生处理链，
+    // 性能提示应按实际生效的处理链计——禁用策略不产生处理链，
     // 计入会虚高（提示"超过 3 条可能影响性能"在不达 3 条时误报）。
     mergedCount: enabledEntries.length,
     showPerfTip: enabledEntries.length > PERF_POLICY_THRESHOLD,

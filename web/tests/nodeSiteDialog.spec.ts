@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 
 import { initialNodeSiteForm, nearestSiteLocation, nodeSiteCoordsChanged } from '../src/utils/siteLocation.ts'
 import { validateClusterUrl } from '../src/utils/clusterUrl.ts'
-import { section, source } from './_helpers.ts'
+import { repoSource, section, source } from './_helpers.ts'
 
 // 问题：继承主节点默认坐标的节点（site_inherited=true，列表接口返回的
 // server_map_lat/lon 是主节点坐标副本），弹框初值必须还原为 0,0 + 空选择——
@@ -35,6 +35,19 @@ test('无变更保存判定为 no-op（直接关闭，不发 PUT 不 bump）', (
 // ——主节点地址只校验 scheme，带凭证/query 的地址到提交时才被后端拒绝（晚失败）。
 // 本条把共享校验器逐条对表后端规则，并钉住两个弹框的单源接线。
 test('主节点地址与访问地址共用校验器（后端 ValidateClusterAccessURL 同规则）', () => {
+  // 规则集机械对表：「后端仍拒绝这五类输入」是前端文案/行为的依据；Go 侧
+  // 删改任一条件（而前端继续拒绝）即红。Go 未来新增条件无法机械推断前端
+  // 等价实现，须人工同步并加到这里。
+  const go = section(repoSource('internal/models/cluster.go'), 'func ValidateClusterAccessURL(', '\n}\n')
+  for (const condition of [
+    'parsed.Scheme != "http" && parsed.Scheme != "https"',
+    'parsed.Host == ""',
+    'parsed.User != nil',
+    'parsed.RawQuery != ""',
+    'parsed.Fragment != ""',
+  ]) {
+    assert.ok(go.includes(condition), `后端校验条件与前端对表项缺失：${condition}`)
+  }
   const url = (value: string, label = '访问地址') => validateClusterUrl(value, { label })
   assert.equal(url(''), null, '访问地址允许留空（回退注册地址）')
   assert.equal(validateClusterUrl('', { label: '主节点地址', emptyMessage: '请输入主节点地址' }), '请输入主节点地址')

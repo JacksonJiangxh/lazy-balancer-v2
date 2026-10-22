@@ -132,7 +132,7 @@ interface PolicyRow {
   ip_whitelist: string
   ip_whitelist_refs?: string
   ip_blacklist: string
-  // 审计 （第六轮）：信任三态开关——加入名单前须提示「当前关闭=零生效」
+  // 信任三态开关——加入名单前须提示「当前关闭=零生效」
   ip_whitelist_enabled?: boolean
   // 分组路由字段：policy_type 由列表/详情接口携带；'' 为存量待推断态。
   // 摘要标志仅列表摘要携带（详情接口无）——refreshRow 以合并方式保留

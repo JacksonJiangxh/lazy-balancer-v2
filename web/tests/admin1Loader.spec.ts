@@ -1,6 +1,7 @@
 // 省界表按需加载的状态机：首次请求缓存 in-flight、成功落缓存、失败降级为 null
-// 且不缓存失败（下次下钻可重试）。模块级 state 决定用例顺序：生命周期在前，
-// 缓存命中在后（node:test 同文件顶层用例串行执行）。
+// 且不缓存失败（下次下钻可重试）。模块级 state 在两条用例间共享，因此每条用例
+// 都自带前置（失败用例先断言未加载；缓存命中用例自行 seed 并以 import 次数基线
+// 判定）——单用例过滤/重排不产生假红或假绿。
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -48,8 +49,13 @@ test('加载失败降级为 null 且不缓存：并发重试共享同一 in-flig
 })
 
 test('已加载后既有缓存命中不再 import', async () => {
-  const loaded = loadedAdmin1Tables()
-  assert.ok(loaded)
+  // 自带 seed：本用例不消费前一条用例留下的缓存——`--test-only`/单用例过滤
+  // 或文件内重排下同样成立（否则先跑此条即假红）。替身模块按「首次失败、
+  // 重试成功」建模，故 seed 允许两次尝试（失败不缓存本身就是本文件的契约）。
+  let loaded = loadedAdmin1Tables() ?? await loadAdmin1Tables()
+  if (!loaded) loaded = await loadAdmin1Tables()
+  assert.ok(loaded, '缓存命中前必须能读到已加载表（未加载时先 seed）')
+  const resolutionsBefore = resolutions
   assert.equal(await loadAdmin1Tables(), loaded)
-  assert.equal(resolutions, 2, '缓存命中不得重新 import（首屏零下载的承诺）')
+  assert.equal(resolutions, resolutionsBefore, '缓存命中不得重新 import（首屏零下载的承诺）')
 })

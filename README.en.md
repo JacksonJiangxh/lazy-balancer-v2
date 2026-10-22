@@ -44,7 +44,7 @@ docker run -d --name lazy-balancer \
   v55448330/lazy-balancer-v2:latest
 ```
 
-> Image tags: `latest` points at the most recent **stable** release; pre-releases are published only under version tags (e.g. `:v2.x.y`). Pin the version tag explicitly when you need a pre-release or a reproducible install.
+> Image tags: `latest` points at the most recent **stable** release (no channel suffix); pre-release tags carry a `-beta` suffix (e.g. `:v2.3.8-beta`). Pin that exact tag when you need a pre-release or a reproducible install.
 
 Mounts: `/app/data` database and config (required), `/app/certs` certificates and private keys (required), `/app/backup` auto-backup output directory (required — without it, backup files are lost when the container is recreated), `/app/logs` logs (recommended), `/app/waf` rule sets and GeoIP (recommended).
 
@@ -56,15 +56,19 @@ Open `http://localhost:8000` for the admin panel. First visit opens an initializ
 <summary>Docker Compose / Build from Source</summary>
 
 ```bash
-# Docker Compose (Linux; the primary node uses host networking)
+# 1) Frontend artifacts (required before an image build: the Dockerfile only
+#    copies the pre-built web/dist; skip when running the official image).
+#    Frontend needs Node.js >= 22.18: `npm test` runs .ts files directly via
+#    node --test, which relies on default type stripping since that version;
+#    see the engines field in web/package.json
+cd web && npm install && npm run build && cd ..
+
+# 2) Docker Compose (Linux; the primary node uses host networking)
 docker compose up -d
 
-# Build from source (frontend needs Node.js >= 22.18: `npm test` runs .ts files
-# directly via node --test, which relies on default type stripping since that
-# version; see the engines field in web/package.json)
-cd web && npm install && npm run build && cd ..
-# VERSION is the formal version (what the panel displays); the image tag may carry
-# a -beta channel suffix - they differ on purpose: tag minus suffix == APP_VERSION
+# 3) Or build and push the image directly: VERSION is the formal version (what
+#    the panel displays); the image tag may carry a -beta channel suffix - they
+#    differ on purpose: tag minus suffix == APP_VERSION
 docker buildx build --platform linux/amd64,linux/arm64 \
   --build-arg VERSION=v2.3.8 \
   --provenance=false --sbom=false \

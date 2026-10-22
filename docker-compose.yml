@@ -15,6 +15,9 @@ x-common-healthcheck: &common-healthcheck
   # 探针须模式无关：面板 HTTPS 可开关（开启时明文 HTTP 得 302），admin_tls 关闭时
   # 又只有明文可用；镜像内无 curl（仅构建期临时安装后 apk del），busybox wget
   # 的 --no-check-certificate 经实证可完成自签 TLS 探测。
+  # 顺序与镜像 HEALTHCHECK 一致：HTTPS 先行（HTTPS 常态下一击命中，明文模式下
+  # 仅多一次握手失败即回落）；两处顺序必须同向，否则「镜像直跑」与 compose 跑的
+  # 首探行为不同，排障时无法对照。
   test: ["CMD-SHELL", "wget -q --no-check-certificate -O /dev/null https://127.0.0.1:8000/health || wget -q -O /dev/null http://127.0.0.1:8000/health"]
   interval: 30s
   timeout: 5s
@@ -67,11 +70,18 @@ services:
     ulimits: *common-ulimits
 
   # 从节点测试实例：bridge 网络，仅将容器 8000 映射到宿主机 8001，避免与主节点(host 网络)端口冲突
-  # 主节点地址注册时填写: http://host.docker.internal:8000
+  # 注册主节点地址时填 http://host.docker.internal:8000——下方 extra_hosts 把该主机名
+  # 解析到宿主网关，Linux 宿主（本文件唯一支持的平台）同样可达，不再依赖 Docker
+  # Desktop 的默认注入。Docker < 20.10 不认 host-gateway 时，改填宿主 LAN 地址，
+  # 例如 http://192.168.1.10:8000（host 网络下主节点直接监听宿主端口）。
   lazy-balancer-slave:
     image: v55448330/lazy-balancer-v2:v2.3.8
     logging: *common-logging
     container_name: lazy-balancer-slave
+    # 宿主网关别名：bridge 网络内解析 host.docker.internal 到宿主，Linux 宿主
+    # 需要它（Docker Desktop 才默认提供），注册主节点地址依赖该主机名。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "8001:8000"
     volumes:

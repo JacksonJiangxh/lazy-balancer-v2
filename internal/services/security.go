@@ -532,7 +532,7 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 		// emitCRSRuleGroupSelection/emitScopedCRSExclusions）各自直调 GetCRSRuleIndex
 		// 会各付一次缓存键计算（ReadDir+全量 stat），全量生成时数百次纯浪费。
 		chainIndex := lazyCRSRuleIndex()
-		// 审计 V-问题-1（第五轮）：SecRuleRemoveById（配置期删除）与
+		// SecRuleRemoveById（配置期删除）与
 		// ctl:ruleRemoveById（运行时跳过）需要**相反**的发射顺序——
 		//   配置期：必须在 Include 之后（coraza 单遍解析，DeleteByID 只删已注册规则，
 		//           放在 Include 前是空集 no-op——emitCRSRuleGroupSelection 的补删
