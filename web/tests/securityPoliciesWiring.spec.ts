@@ -18,9 +18,10 @@ test('G3 谓词：mode 三态 ∪ 自定义规则引用非空（与后端 Policy
   assert.equal(hasStage3Features('off', 0), false)
 })
 
-test('阶段 3 chip 消费 G3 单源谓词', () => {
+test('阶段 3 chip 消费 G3 单源谓词（引用数口径，含禁用规则）', () => {
   const chip = section(page, 'const stage3ChipOn', '\n\n')
-  assert.match(chip, /hasStage3Features\(row\.mode, row\.custom_rules_count\)/)
+  assert.match(chip, /hasStage3Features\(row\.mode, row\.custom_rules_ref_count/, '判定必须用引用数（与后端 G3 逐字对齐）')
+  assert.match(chip, /custom_rules_ref_count \?\? row\.custom_rules_count/, '旧后端缺摘要字段时回退启用计数')
   const code = stripComments(chip)
   assert.doesNotMatch(code, /row\.has_waf/)
 })

@@ -855,6 +855,55 @@ func TestListSecurityPolicies_customRulesCountExcludesDisabled(t *testing.T) {
 	}
 }
 
+// 阶段 3 判定口径：摘要必须同时给出「引用条目数」（含禁用）——前端 chips 与
+// 后端 PolicyTypeFeatures.G3 逐字对齐的唯一依据。只给启用计数时，
+// 「mode=off 且引用规则全部禁用」的边界策略在预演里少一条子策略。
+func TestListSecurityPolicies_customRulesRefCountIncludesDisabled(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newSecurityRouter(t)
+	emittable := `[{"target":"uri","operator":"regex","pattern":"^/ref$"}]`
+	res, err := db.DB.Exec(`INSERT INTO security_custom_rules (name, conditions, action, score, enabled) VALUES ('禁用规则', ?, 'block', 5, 0)`, emittable)
+	if err != nil {
+		t.Fatalf("seed disabled rule: %v", err)
+	}
+	id, _ := res.LastInsertId()
+	if _, err := db.DB.Exec(`INSERT INTO security_policies (name, mode, custom_rules, enabled) VALUES ('仅引用禁用规则', 'off', ?, 1)`,
+		fmt.Sprintf("[%d]", id)); err != nil {
+		t.Fatalf("seed policy: %v", err)
+	}
+
+	recorder := getRequest(t, router, "/security/policies")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("list status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var resp struct {
+		Code int `json:"code"`
+		Data []struct {
+			Mode                string `json:"mode"`
+			CustomRulesCount    int    `json:"custom_rules_count"`
+			CustomRulesRefCount int    `json:"custom_rules_ref_count"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse list response: %v", err)
+	}
+	if len(resp.Data) != 1 {
+		t.Fatalf("list len = %d, want 1: %s", len(resp.Data), recorder.Body.String())
+	}
+	row := resp.Data[0]
+	if row.CustomRulesCount != 0 {
+		t.Fatalf("custom_rules_count = %d, want 0（禁用规则不计入生效口径）: %s", row.CustomRulesCount, recorder.Body.String())
+	}
+	if row.CustomRulesRefCount != 1 {
+		t.Fatalf("custom_rules_ref_count = %d, want 1（引用非空必须披露，含禁用条目）: %s", row.CustomRulesRefCount, recorder.Body.String())
+	}
+	// 与后端 G3 同一门：mode=off + 引用非空 → 阶段 3 成立。
+	policy := &models.SecurityPolicy{Mode: row.Mode, CustomRules: []byte(fmt.Sprintf("[%d]", id))}
+	if !models.PolicyTypeFeatures(policy).G3 {
+		t.Fatalf("G3 必须为真（引用非空），摘要 ref_count=%d", row.CustomRulesRefCount)
+	}
+}
+
 func TestUpdateSecurityPolicy_anomalyThresholdZeroNormalizesToFive(t *testing.T) {
 	// Given 创建侧以默认阈值 5 落库的策略（创建请求不带 anomaly_threshold 时
 	// CreateSecurityPolicy 的 max1(..., 5) 归一为 5）

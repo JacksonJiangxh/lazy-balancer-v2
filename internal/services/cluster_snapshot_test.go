@@ -537,7 +537,7 @@ func TestSnapshotCertificates_mirrorsOnlyEnabledRules(t *testing.T) {
 		t.Fatalf("enabled rule certificate missing: %#v", seen)
 	}
 	if seen["lb_disabled"] {
-		t.Fatal("disabled rule certificate must not be mirrored (历史问题-10 contract)")
+		t.Fatal("disabled rule certificate must not be mirrored (mirror contract)")
 	}
 }
 

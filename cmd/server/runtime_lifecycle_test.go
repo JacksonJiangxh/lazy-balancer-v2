@@ -132,7 +132,7 @@ func TestRuntimeLifecycle_StopACME_clearsActiveCertificateService(t *testing.T) 
 	buf.Reset()
 	services.CertManualCheckOnce()
 	if strings.Contains(buf.String(), "TLS Certificate Check") {
-		t.Fatalf("active certificate service survived StopACME (历史问题-9/历史问题-1), log=%q", buf.String())
+		t.Fatalf("active certificate service survived StopACME: cert-manual-poll would keep driving a stopped service, log=%q", buf.String())
 	}
 }
 

@@ -137,6 +137,6 @@ func TestClusterVersionTriggers_certJobsReenableFromDisabledBumps(t *testing.T) 
 
 	// Then: 必须 bump(从端需要感知恢复)
 	if got := clusterVersion(t, database); got != 1 {
-		t.Fatalf("version after reenable from disabled=%d, want 1 (bidirectional disabled exception, 历史问题-1)", got)
+		t.Fatalf("version after reenable from disabled=%d, want 1 (re-enable must bump version)", got)
 	}
 }

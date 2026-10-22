@@ -1,6 +1,7 @@
 package services
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -123,5 +124,69 @@ func TestSecurityEventsPollOnce_auditWriterFailuresDegradeHealth(t *testing.T) {
 	status = SecurityEventsIngestionHealthSnapshot()
 	if status.WriterDropped != 3 {
 		t.Fatalf("counter reset must not lose accumulated failures: %+v", status)
+	}
+}
+
+// 异常自愈退避期（LoopOn=true、Run 不在）不得被打成 stopped：引擎按 1s/5s/30s
+// 有界重拉，每次短暂重拉都瞬时把三面健康位判「采集已停止」并触发 autoban
+// feed_degraded，属自愈噪音。判据单源 securityEventsIngestionTaskState：
+// 只有循环真停（用户停止/自愈预算用尽）才降级。
+func TestSecurityEventsIngestionHealth_backoffRestartIsNotStopped(t *testing.T) {
+	previous := TaskEngine()
+	// 退避拉长到 1h：测试期间稳定停在「调度开、Run 不在」窗口。
+	te := taskengine.NewEngine(taskengine.Options{
+		TickInterval:        time.Hour,
+		DaemonRestartDelays: []time.Duration{time.Hour},
+	})
+	SetTaskEngineForTest(te)
+	t.Cleanup(func() {
+		te.StopWithTimeout(time.Second)
+		SetTaskEngineForTest(previous)
+		SecurityEventsSetIngestionHealthForTest(SecurityEventsIngestionStatus{})
+	})
+	if err := te.Register(taskengine.Descriptor{
+		ID: "security-events-ingestion", Family: "system", Name: "安全事件采集",
+		Kind: taskengine.KindDaemon,
+		Run:  func(rc taskengine.RunContext) error { return errors.New("simulated daemon fault") },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	SecurityEventsSetIngestionHealthForTest(SecurityEventsIngestionStatus{Observed: true, Healthy: true})
+
+	te.StartLoop("security-events-ingestion")
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		meta, ok := te.Lookup("security-events-ingestion")
+		if ok && !meta.Running && meta.LoopOn && !meta.RestartExhausted {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("daemon 未进入退避重拉窗口: %+v", meta)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	status := SecurityEventsIngestionHealthSnapshot()
+	if status.TaskState != "restarting" {
+		t.Fatalf("退避窗口 task_state=%q, want restarting", status.TaskState)
+	}
+	if status.TaskRunning {
+		t.Fatalf("退避窗口 task_running 必须为 false: %+v", status)
+	}
+	if !status.Healthy {
+		t.Fatalf("退避重拉窗口不得降级健康位（自愈通道仍在）: %+v", status)
+	}
+	if degraded, reason := AutobanFeedHealth(); degraded {
+		t.Fatalf("退避窗口不得触发 autoban 数据源降级: %s", reason)
+	}
+
+	// 反向：真停（用户停止调度）仍必须降级，避免修复引入「停环仍显示健康」。
+	te.StopLoop("security-events-ingestion")
+	status = SecurityEventsIngestionHealthSnapshot()
+	if status.TaskState != "stopped" || status.Healthy {
+		t.Fatalf("调度停止后必须判 stopped 且非健康: %+v", status)
+	}
+	if degraded, reason := AutobanFeedHealth(); !degraded {
+		t.Fatalf("调度停止后 autoban 喂入源必须降级（reason=%q）", reason)
 	}
 }

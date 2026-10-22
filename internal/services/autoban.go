@@ -316,6 +316,8 @@ var autobanFeedDegradedWarned bool
 // 判据（持久停摆才降级）：LoopOn=false 是用户显式停止与「异常自愈预算用尽后
 // 停环」的共同终态（引擎 restartExhausted 同时置 LoopOn=false）；瞬时态
 // （LoopOn=true 而 Run 正处于 1s/5s/30s 重拉退避）不报——自愈通道仍在。
+// 判据单源=securityEventsIngestionTaskState（健康位复用同一函数，禁止在此
+// 另写一份 Running/LoopOn 组合）。
 // 引擎未装配/任务未注册=不判定（测试与装配早期，避免误报）。
 //
 // 调度态之外叠加摄取健康位：摄取循环对 tick 失败只记账不退出（LoopOn 恒
@@ -323,18 +325,13 @@ var autobanFeedDegradedWarned bool
 // 一切正常——单看调度态是「健康位分裂」型静默失效。摄取健康快照已含
 // 写侧降级折算；stalled 停等瞬态不入失败计数，不会误报。
 func AutobanFeedHealth() (degraded bool, reason string) {
-	te := TaskEngine()
-	if te == nil {
-		return false, ""
-	}
-	m, ok := te.Lookup(AutobanFeedTaskID)
-	if !ok {
-		return false, ""
-	}
+	task := securityEventsIngestionTaskState()
 	switch {
-	case m.RestartExhausted:
+	case task.State == "unknown":
+		return false, ""
+	case task.RestartExhausted:
 		return true, "安全事件采集任务异常自愈预算已用尽并停止调度，自动封禁计数不再更新"
-	case !m.LoopOn:
+	case task.State == "stopped":
 		return true, "安全事件采集任务调度已停止，自动封禁计数不再更新"
 	}
 	if st := SecurityEventsIngestionHealthSnapshot(); st.Observed && !st.Healthy {

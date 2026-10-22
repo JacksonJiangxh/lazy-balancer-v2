@@ -1,4 +1,7 @@
-FROM golang:1.26.9-alpine@sha256:3082400e369fa24d5fc60bca20edab3f6d604e0c5a690ec66b295eff4dd87ade AS xcaddy-builder
+# 编译阶段固定在构建机架构执行（--platform=$BUILDPLATFORM）：buildx 多架构构建
+# 不会为目标架构起 QEMU 跑 Go 工具链（跨架构编译慢数倍）。产物架构由下方
+# GOOS/GOARCH 显式指定；CGO_ENABLED=0 使交叉编译无需目标架构的 C 工具链。
+FROM --platform=$BUILDPLATFORM golang:1.26.9-alpine@sha256:3082400e369fa24d5fc60bca20edab3f6d604e0c5a690ec66b295eff4dd87ade AS xcaddy-builder
 RUN apk add --no-cache git
 # GOPROXY 逗号多级回退：阿里云 404/410 时依次回落 goproxy.cn、直连；
 # 校验不符类瞬态错误由下方 xcaddy build 的重试循环兜底
@@ -13,11 +16,15 @@ WORKDIR /app
 # go 指令构建，Caddy 升级到更高 Go 要求时由工具链自动拉取；backend 阶段则收紧
 # 为 local（见该阶段 ENV）——镜像内的 Go 二进制只由基础镜像声明的工具链产出。
 ENV GOTOOLCHAIN=auto
-# 代理 ARG 在三个构建阶段各自显式声明（默认空值，行为不变）：Docker 会把
-# --build-arg HTTP(S)_PROXY 隐式注入 RUN 环境，但那是不写进本文件的隐式契约；
-# 显式声明使「受限网络下哪一阶段走代理」由本文件负责，而非依赖外部记忆。
-ARG HTTP_PROXY=""
-ARG HTTPS_PROXY=""
+# 代理不在此声明：Docker 预定义 HTTP_PROXY/HTTPS_PROXY 等构建参数，经
+# --build-arg 传入后自动注入每条 RUN 的环境，无需 ARG 声明（声明了却不引用
+# 等于把代理值写进该声明之后各层的缓存键，同一份代码在不同网络环境下无法复用
+# 已有层）。三条 golang/alpine 阶段同此口径。
+#
+# 交叉编译目标：buildx 预定义参数；无 buildx 时 TARGETARCH 为空，回落构建机
+# 架构（本阶段已固定在 BUILDPLATFORM 上执行，必须显式指定产物平台）。
+ARG TARGETOS=linux
+ARG TARGETARCH
 # xcaddy 阶段只需四个本地目录（--with 引用），窄化 COPY 面——整目录复制会让
 # 任何前端/文档变更 bust 该层并重跑 xcaddy build（缓存挂载兜底仍需分钟级增量
 # 编译）。backend 阶段同样用显式清单（见该阶段注释）。geoipnames 是零依赖
@@ -35,6 +42,7 @@ COPY geoipnames/ geoipnames/
 # set -e 下 if 条件中的失败不触发退出，由 built 标志统一判定后显式 exit 1
 RUN --mount=type=cache,target=/go/pkg/mod \
   --mount=type=cache,target=/root/.cache/go-build \
+  export CGO_ENABLED=0 GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH:-$(go env GOARCH)}"; \
   set -e; \
   built=0; \
   for attempt in 1 2 3; do \
@@ -70,8 +78,12 @@ RUN go version -m /app/caddy | tee /tmp/caddy-mods.txt && \
     awk -F'\t' 'function ge(v, f,  a, b, av, bv, i) { split(substr(v, 2), a, "."); split(substr(f, 2), b, "."); for (i = 1; i <= 3; i++) { av = a[i] + 0; bv = b[i] + 0; if (av > bv) return 1; if (av < bv) return 0 } return 1 } { for (i = 1; i < NF; i++) { if ($i == "google.golang.org/grpc") ok1 = ge($(i+1), "v1.83.2"); else if ($i == "go.opentelemetry.io/otel") ok2 = ge($(i+1), "v1.45.0"); else if ($i == "golang.org/x/net") ok3 = ge($(i+1), "v0.58.0"); else if ($i == "golang.org/x/crypto") ok4 = ge($(i+1), "v0.56.0"); else if ($i == "cel.dev/cel-go") ok5 = ge($(i+1), "v0.32.0"); else if ($i == "github.com/corazawaf/coraza/v3") ok6 = (ge($(i+1), "v3.8.1") && !ge($(i+1), "v3.9.0")) } } END { exit (ok1 && ok2 && ok3 && ok4 && ok5 && ok6) ? 0 : 1 }' /tmp/caddy-mods.txt
 
 # Build Go backend
-FROM golang:1.26.9-alpine@sha256:3082400e369fa24d5fc60bca20edab3f6d604e0c5a690ec66b295eff4dd87ade AS backend
+# 与 xcaddy-builder 阶段同理：编译在构建机架构执行，产物平台由 GOOS/GOARCH 指定。
+FROM --platform=$BUILDPLATFORM golang:1.26.9-alpine@sha256:3082400e369fa24d5fc60bca20edab3f6d604e0c5a690ec66b295eff4dd87ade AS backend
 WORKDIR /app
+# 交叉编译目标（buildx 预定义参数；无 buildx 时 TARGETARCH 为空则回落构建机架构）
+ARG TARGETOS=linux
+ARG TARGETARCH
 # GOPROXY 逗号多级回退——与 xcaddy-builder 阶段对称
 #（阶段间 ENV 不继承，backend 此前用官方默认 proxy.golang.org，构建网络对
 # 其不可达时 go mod download 无回退直接失败）：阿里云 404/410 时依次回落
@@ -82,10 +94,6 @@ ENV GOPROXY=https://mirrors.aliyun.com/goproxy/,https://goproxy.cn,direct
 # 可能得到不同编译器产物，且下载失败与依赖拉取失败的错误形态混淆。工具链不足
 # 时应由构建显性失败，同步 bump 基础镜像。
 ENV GOTOOLCHAIN=local
-# 代理 ARG 显式声明（与 xcaddy-builder、final 阶段同名同默认值）：本阶段的
-# go mod download 在受限网络下同样需要代理。
-ARG HTTP_PROXY=""
-ARG HTTPS_PROXY=""
 # wafiplist/geoipnames 叶模块经根 go.mod replace ./wafiplist ./geoipnames 引用
 # ——go mod download 解析 replace 需要被替换模块的 go.mod/go.sum 在场
 # （geoipnames 零依赖无 go.sum）。
@@ -108,10 +116,11 @@ RUN --mount=type=cache,target=/go/pkg/mod \
   [ "$dl" -eq 1 ] || { echo ">>> go mod download 3 次全部失败" >&2; exit 1; }
 # 显式 COPY 清单（不用 `COPY . .`）：构建上下文含 web/、docs/、scripts/ 等非 Go
 # 内容，整目录复制会让任意一处非 Go 变更 bust 本层与随后的 Go 编译层。
+# go.mod/go.sum 已在上方下载层复制（本阶段内，同在清单范围），此处不再重复。
 # 清单必须覆盖 go list 派生到的全部顶层 Go 目录（cmd/internal/caddygeoip/
-# caddydeps/wafiplist/geoipnames）——scripts/test-all.sh 有机器断言比对
-# Dockerfile 清单与 git 跟踪的顶层 Go 目录，新增顶层 Go 目录必须同步本行。
-COPY go.mod go.sum ./
+# caddydeps/wafiplist/geoipnames）——scripts/check-dockerfile-copy-manifest.sh
+# 按 backend 阶段切块比对清单与 git 跟踪的顶层 Go 目录，新增顶层 Go 目录必须
+# 同步本行。
 COPY cmd/ ./cmd/
 COPY internal/ ./internal/
 COPY caddygeoip/ ./caddygeoip/
@@ -121,10 +130,14 @@ COPY geoipnames/ ./geoipnames/
 COPY config/ ./config/
 WORKDIR /app/cmd/server
 # 双缓存挂载（模块+编译缓存，lazy-builder GC 48h）：增量编译只重编改动包；
-# 纯本地编译无网络请求，无需重试
+# 纯本地编译无网络请求，无需重试。
+# 产物平台显式取自 TARGETOS/TARGETARCH（本阶段跑在 BUILDPLATFORM 上）：
+# -trimpath 去掉构建机绝对路径（可复现构建，panic 栈只留模块相对路径）；
+# -ldflags="-s -w" 去符号表与 DWARF（版本号走运行时 APP_VERSION，不经 ldflags）。
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=linux go build -o lazy-balancer
+    CGO_ENABLED=0 GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH:-$(go env GOARCH)}" \
+    go build -trimpath -ldflags="-s -w" -o lazy-balancer
 
 # Final image
 FROM alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
@@ -140,10 +153,9 @@ FROM alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4c
 # 发布时的判定口径是「tag 去掉通道后缀 == APP_VERSION」。改此约定需同时改
 # README 两版示例、docker-compose.yml、branding/config 回退与发布检查单。
 ARG VERSION=v2.3.8
-# 构建机网络受限时经 --build-arg HTTP(S)_PROXY 透传给 RUN 下载步骤
-# （CRS/ip2region 钉版下载）；未传参时为空值，行为不变（官方惯例形态）。
-ARG HTTP_PROXY=""
-ARG HTTPS_PROXY=""
+# 构建机网络受限时经 --build-arg HTTP(S)_PROXY 透传给本阶段下载步骤
+# （CRS/ip2region 钉版下载）：Docker 预定义代理参数传入后自动注入 RUN 环境，
+# 无需 ARG 声明；未传参时为空值，行为不变。
 ENV APP_VERSION=${VERSION}
 # 安全修复：显式钉版 openssl=3.5.9-r0（CVE 修复版）——openssl 经 curl 的
 # libssl3/libcrypto3 依赖隐式装入，钉版保证镜像可复现且不携带旧版；
@@ -240,6 +252,8 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 # 是常态，明文先行会先吃一次 302 再失败；反向在明文模式下只多一次握手失败即
 # 回落，成本对称而常态更快收敛。镜像内无 curl（构建期临时安装后 apk del），
 # busybox wget 的 --no-check-certificate 经实证可完成自签 TLS 探测。
+# 探针端口固定 8000：容器内 entrypoint 不透传 -config，config.go 的 port 只对
+# 裸机自定义启动生效；若未来支持容器内改端口，探针须改为读环境变量。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
   CMD wget -q --no-check-certificate -O /dev/null https://127.0.0.1:8000/health || wget -q -O /dev/null http://127.0.0.1:8000/health || exit 1
 

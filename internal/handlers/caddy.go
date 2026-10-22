@@ -579,8 +579,9 @@ func validateUpdateConfigRequest(req *models.UpdateConfigRequest) error {
 	if err := validateServerMapCoordinates(req.ServerMapLat, req.ServerMapLon); err != nil {
 		return err
 	}
-	// 威胁大屏模式（v2.3.8）：枚举白名单，非法值 400（fail-visible）
-	if req.ThreatScreenMode != nil && *req.ThreatScreenMode != "map" && *req.ThreatScreenMode != "globe" {
+	// 威胁大屏模式（v2.3.8）：枚举白名单，非法值 400（fail-visible）。
+	// 枚举与从端 apply 归一、快照装载归一共用 models 单源。
+	if req.ThreatScreenMode != nil && !models.IsValidThreatScreenMode(*req.ThreatScreenMode) {
 		return errors.New("威胁大屏模式仅支持 map 或 globe")
 	}
 	// 大屏逐请求流量采样：仅 -1=自适应（内部从全量起步，按事件速率在 1/4/8

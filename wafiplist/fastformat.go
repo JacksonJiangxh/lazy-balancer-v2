@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -34,6 +35,14 @@ var fastFileCRCTable = crc32.MakeTable(crc32.Castagnoli)
 // 64MiB 约容纳千万级条目，远超威胁库下载侧 200000 条上限，正常产物远不可及。
 // var 形态供测试收窄。
 var MaxFastFileBytes int64 = 64 << 20
+
+// MaxFastEntries 是读侧条目数（v4Count+v6Count）硬上限。体积门挡不住
+// 「条目数 × 内存放大」：最小 v4 条目 5 字节，64MiB 文件可承载约 1342 万条，
+// 展开为 netip.Prefix（每条约 32 字节）即约 410MiB，叠加 data 与消费方
+// []string 展开可达 GiB 量级。百万条已远超威胁库下载侧 200000 条上限，与
+// 文本名单 MaxEntries 同值口径（纵深防御的第二道，第一道是体积）。var 形态
+// 供测试收窄。
+var MaxFastEntries = 1_000_000
 
 // FastFileState 是从 .fast 二进制文件加载的内存态（排序不相交前缀集）。
 // 生产消费方=services 侧从节点回退（securityiplists.go ReadFastFile）。
@@ -172,17 +181,32 @@ func WriteFastFile(path string, v4, v6 []netip.Prefix) error {
 
 // ReadFastFile 读取 .fast 二进制文件并展开为内存前缀集。
 // 加载成本 O(n) 纯内存拷贝——无文本解析、无排序（20 万条 ~0.2ms）。
+//
+// 读侧与文本名单（iplistfast.go parseIPListFile）同口径的三道门：
+//  1. 前置体积门（fd.Stat）：超限文件不进入内存；
+//  2. 定长读：容量=stat 尺寸，不按内容放大——stat 与读取之间的窗口内
+//     路径可被 tmp+rename 换成任意大小文件，只按 stat 判限不构成硬上限；
+//  3. 读后复核同一 inode（size,mtime）：原位追加/截断/同尺寸改写会读到
+//     半代内容，本次放弃而非把混合字节当合法名单。
 func ReadFastFile(path string) (*FastFileState, error) {
-	// 读取前 Stat 体积门——超限文件不进入内存（防 OOM），
-	// 读取后的 header/expectedSize 一致性校验保留作第二道。
-	if info, err := os.Stat(path); err != nil {
+	fd, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("fastfile open: %w", err)
+	}
+	defer fd.Close()
+	info, err := fd.Stat()
+	if err != nil {
 		return nil, fmt.Errorf("fastfile stat: %w", err)
-	} else if info.Size() > MaxFastFileBytes {
+	}
+	if info.Size() > MaxFastFileBytes {
 		return nil, fmt.Errorf("fastfile: size %d exceeds cap %d", info.Size(), MaxFastFileBytes)
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
+	data := make([]byte, info.Size())
+	if _, err := io.ReadFull(fd, data); err != nil {
 		return nil, fmt.Errorf("fastfile read: %w", err)
+	}
+	if after, statErr := fd.Stat(); ipListGenerationChanged(info, after, statErr) {
+		return nil, fmt.Errorf("fastfile: %q rewritten during read", path)
 	}
 	if len(data) < fastFileHeaderSize {
 		return nil, fmt.Errorf("fastfile: too short (%d bytes)", len(data))
@@ -192,6 +216,11 @@ func ReadFastFile(path string) (*FastFileState, error) {
 	}
 	v4Count := binary.BigEndian.Uint32(data[4:8])
 	v6Count := binary.BigEndian.Uint32(data[8:12])
+	// 条目上限先于任何按计数分配的 make：header 计数是跨进程输入，
+	// 体积门内的小文件同样可以声明巨大计数。
+	if total := int64(v4Count) + int64(v6Count); total > int64(MaxFastEntries) {
+		return nil, fmt.Errorf("fastfile: entry count %d exceeds cap %d", total, MaxFastEntries)
+	}
 	// 未知 flags 位不得静默忽略（格式演进必须显式：未来的特性位
 	// 若被当 0 解析，会按错误的条目布局读数据）。已知位：bit0=尾部 crc32c。
 	flags := binary.BigEndian.Uint32(data[12:16])

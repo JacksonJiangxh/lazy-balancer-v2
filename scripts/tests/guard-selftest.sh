@@ -3,13 +3,15 @@
 #
 # 在临时 git 夹具仓里逐形态验证守卫的命中面与误报边界：
 #   • 命中面：未跟踪文件、受控文件、各扩展名（Go/TS/MD/SH/YML/SQL/go.mod/
-#     Dockerfile/docker-entrypoint.sh/.dockerignore/Caddyfile）、下划线/小写/
+#     Dockerfile/docker-entrypoint.sh/.dockerignore/Caddyfile）、扩展名大小写、
+#     含 NUL 字节的文本文件（报错而非整文件跳过）、下划线/小写/
 #     连写形态、审计产物文件名、.gitignore 双向校验、轮次引用的各书写形态
 #     （裸轮次＋审计动作、斜杠并列、中文数字归属、注释头截断残骸、跨行拆字含
 #     续行注释前缀）；
 #   • 误报面：百分位、版本串、十六进制摘要/哈希算法名、协议与产品 token、
 #     容量边界常量、合法测试函数名、中文“轮播/轮询”、循环轮次表述（心跳/共识/
-#     降频/区间/并列打点）。
+#     降频/区间/并列打点）、IPv6-only 等网络口径、日志轮转文件名骨架、
+#     Windows-1252/Chrome-120 等产品词。
 #
 # 本文件按设计被守卫的内容扫描豁免（其内容即被测样本），豁免面在
 # scripts/check-no-audit-artifacts.sh 中显式限定为这一个路径。
@@ -284,6 +286,33 @@ func noop() {}
 EOF
 assert_bad "audit + chinese-numeral round" "internal/services/deny_attribution.go"
 
+# 13b) 扩展名大小写：.MD / .Go 与 .md / .go 同等入扫描面
+reset_fixture
+mkdir_in docs/NOTES.MD
+cat >"$tmp_root/docs/NOTES.MD" <<'EOF'
+版本号硬编码点之一（FE-8）
+EOF
+git -C "$tmp_root" add -f docs/NOTES.MD
+assert_bad "uppercase extension scanned" "NOTES.MD"
+
+reset_fixture
+mkdir_in internal/x/CONV.GO
+cat >"$tmp_root/internal/x/CONV.GO" <<'EOF'
+package x
+
+// 版本号硬编码点之一（FE-8）
+func noop() {}
+EOF
+git -C "$tmp_root" add -f internal/x/CONV.GO
+assert_bad "uppercase .GO scanned" "CONV.GO"
+
+# 13c) 含 NUL 的文本扩展名文件不得整文件跳过（跳过即逃逸面）——直接红
+reset_fixture
+mkdir_in docs/payload.md
+printf '正常首行\n\x00\n版本号硬编码点之一（FE-8）\n' >"$tmp_root/docs/payload.md"
+git -C "$tmp_root" add -f docs/payload.md
+assert_bad "NUL-containing text file is not skipped" "NUL"
+
 # 14) .gitignore 双向校验：少一行 / 多一行都失败
 reset_fixture
 grep -v '^\*\*/r\[0-9\]\*_test\.go$' "$tmp_root/.gitignore" >"$tmp_root/.gitignore.tmp"
@@ -386,5 +415,26 @@ EOF
 assert_good "loop round wording at comment head"
 
 # ===========================================================================
+# 9) 网络口径与日志文件名骨架（IPv6-only、YYYYMMDD-HHMMSS）不误判
+reset_fixture
+mkdir_in internal/handlers/ip_family.go
+cat >"$tmp_root/internal/handlers/ip_family.go" <<'EOF'
+package handlers
+
+// IPv4 优先（页面展示口径不变）；接口只有 IPv6（IPv6-only 主机/容器）。
+// 第一个非 link-local/未指定的 IPv6（IPv6-only 主机不再显示为空）。
+// rotationCopyTimberjack：<stem>-YYYYMMDD-HHMMSS-size.log[.gz]
+func noop() {}
+EOF
+assert_good "IPv6-only and log filename skeleton"
+
+# 10) 产品词 + 版本号形态（Windows-1252 / Chrome-120）不误判
+reset_fixture
+mkdir_in docs/charset.md
+cat >"$tmp_root/docs/charset.md" <<'EOF'
+Charset Windows-1252 与 UA 片段 Chrome-120 均按字节处理，不做转码。
+EOF
+assert_good "Windows-1252 and Chrome-120"
+
 echo "selftest: $pass passed, $fail failed"
 [[ $fail -eq 0 ]]

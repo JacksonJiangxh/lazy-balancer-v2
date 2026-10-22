@@ -308,6 +308,7 @@ func threatRollupDimAggregateQuery(database *sql.DB, sinceMinute string, bucketS
 		metrics:      database,
 		sinceMinute:  sinceMinute,
 		bucketLayout: threatRollupBucketLayout(bucketStarts),
+		coverage:     coverage,
 	}
 	now := time.Now()
 	if cacheable {

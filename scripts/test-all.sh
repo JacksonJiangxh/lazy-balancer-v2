@@ -18,9 +18,11 @@ cd "$(dirname "$0")/.."
 # 解析。sh -n / bash -n 只做语法不执行，零成本纯增益。
 echo "== shell syntax (entrypoint + scripts) =="
 sh -n docker-entrypoint.sh
+# 未跟踪的脚本同样入面：「先写脚本 → 跑门禁 → 再 git add」是常见顺序，
+# 只看受控文件会让新脚本的语法错误在提交后才暴露（与 gofmt 门同口径）。
 while IFS= read -r script; do
   bash -n "$script"
-done < <(git ls-files 'scripts/*.sh')
+done < <(git ls-files --cached --others --exclude-standard 'scripts/*.sh')
 
 # 出厂引导 Caddyfile 的引擎级校验：内容与 entrypoint heredoc 的同构性由
 # cmd/server 的钉测试机械比对（下方 go test 覆盖）；此处校验引擎是否接受。
@@ -30,6 +32,16 @@ if command -v caddy >/dev/null 2>&1; then
   caddy validate --config config/Caddyfile --adapter caddyfile
 else
   echo "SKIP: caddy 不可用——结构同构由 cmd/server/bootstrap_caddyfile_test.go 覆盖，引擎校验未执行"
+fi
+
+# 部署工件静态校验：compose 的锚点引用/键名拼错只在 compose up 时暴露
+# （logging/ulimits/healthcheck 走 YAML 锚点，extra_hosts 等键名同理）。
+# docker 或 compose 子命令不可用时显式 SKIP（不静默通过）。
+echo "== compose config validation =="
+if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+  docker compose config --quiet
+else
+  echo "SKIP: docker/compose 不可用——compose 锚点与键名未校验"
 fi
 
 # 基线（评审点）：与 git ls-files 派生结果不一致即失败。
@@ -79,41 +91,12 @@ fi
 # Dockerfile 后端阶段用显式 COPY 清单（避免 web/docs/scripts 等非 Go 变更 bust
 # Go 编译层）——清单漏项只会在镜像构建时才暴露（go build 缺包），故在此比对：
 # git 跟踪的顶层 Go 目录必须全部在清单内。
-# 解析所有 COPY 源（多行逐目录形态与单行多源形态都支持）；用 backend 阶段
-# 标志（任一源含 internal/）界定范围，末位 token 是目标路径不计入源。
-copy_dirs=()
-while IFS= read -r line; do
-  read -r -a toks <<< "${line#COPY }"
-  (( ${#toks[@]} < 2 )) && continue
-  for ((i=0; i<${#toks[@]}-1; i++)); do
-    tok="${toks[i]%/}"
-    [[ -z "$tok" || "$tok" == "." ]] && continue
-    copy_dirs+=("$tok")
-  done
-done < <(grep -E '^COPY ' Dockerfile | grep -v '^COPY --from' || true)
-if (( ${#copy_dirs[@]} == 0 )); then
-  echo "Dockerfile: 未找到 backend 阶段的显式 COPY 清单（形如 COPY internal/ ./internal/）" >&2
-  exit 1
-fi
-# go.mod/go.sum 必须在清单内：目录源复制的是「内容」，漏掉模块文件会让
-# 镜像内 go build 直接报 no Go files / no required module（本地构建发现不了）。
-for required in go.mod go.sum; do
-  printf '%s\n' "${copy_dirs[@]}" | grep -qxF "$required" || {
-    echo "Dockerfile backend COPY 清单缺少 $required" >&2
-    exit 1
-  }
-done
-top_go_dirs="$(git ls-files '*.go' | awk -F/ 'NF>1{print $1}' | LC_ALL=C sort -u)"
-missing_dirs=""
-while IFS= read -r dir; do
-  [[ -z "$dir" ]] && continue
-  printf '%s\n' "${copy_dirs[@]}" | grep -qxF "$dir" || missing_dirs+="$dir "
-done <<<"$top_go_dirs"
-if [[ -n "$missing_dirs" ]]; then
-  echo "Dockerfile backend COPY 清单缺少顶层 Go 目录：$missing_dirs" >&2
-  echo "清单=[${copy_dirs[*]}] 顶层 Go 目录=[${top_go_dirs//$'\n'/ }]" >&2
-  exit 1
-fi
+# 门禁本体按 `^FROM ... AS <stage>` 切块，只断言 backend 阶段：xcaddy-builder
+# 阶段也 COPY 同名模块目录（--with 载体），整文件汇总会掩盖 backend 侧的漏项。
+# 自检在临时夹具仓里验证该边界（删 backend 的 wafiplist/geoipnames 必红）。
+echo "== Dockerfile backend COPY manifest =="
+./scripts/check-dockerfile-copy-manifest.sh
+./scripts/tests/dockerfile-copy-gate-selftest.sh
 
 for module in "${modules[@]}"; do
   echo "== go vet ./... ($module) =="
@@ -175,10 +158,20 @@ for module in "${modules[@]}"; do
 done
 
 # 镜像构建等价性冒烟：镜像内是 CGO_ENABLED=0 GOOS=linux 交叉编译，与本地
-# go test 的构建参数不同（平台/cgo 相关代码路径不进测试面）。产物写 /dev/null，
-# 不落盘。
+# go test 的构建参数不同（平台/cgo 相关代码路径不进测试面）。四个嵌套模块由
+# xcaddy 在镜像内以同一组参数编译插件，其 linux-only 编译错误（构建标签/
+# syscall/cgo 分支）此前只在发版构建暴露——按模块清单逐个交叉编译。
+# 根模块是 main 包，产物丢 /dev/null；嵌套模块用 go install 配临时 GOBIN，
+# 不落仓库（库模块本不产二进制，未来出现 main 包也不会污染工作树）。
 echo "== image-build equivalence (GOOS=linux CGO_ENABLED=0 go build) =="
-CGO_ENABLED=0 GOOS=linux go build -o /dev/null ./cmd/server
+cross_bin="$(mktemp -d "${TMPDIR:-/tmp}/lb-crossbuild.XXXXXX")"
+for module in "${modules[@]}"; do
+  case "$module" in
+    .) CGO_ENABLED=0 GOOS=linux go build -o /dev/null ./cmd/server ;;
+    *) (cd "$module" && GOBIN="$cross_bin" CGO_ENABLED=0 GOOS=linux go install ./...) ;;
+  esac
+done
+rm -rf "$cross_bin"
 
 # 竞态门：并发核心（任务引擎 + 进程内 Caddy 协作/监督器探测）此前只在本地
 # 手工跑 -race。全量 -race 会把门禁时长成倍拉长，故只覆盖并发密集入口。

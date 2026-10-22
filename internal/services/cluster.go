@@ -584,6 +584,80 @@ func BumpClusterVersion(ctx context.Context, executor clusterVersionExecutor) er
 	return nil
 }
 
+// clearAppliedSections 清理旧拓扑的已应用节记账（幂等）。executor 是拓扑事务
+// （翻转路径：与角色更新同成同败）或库句柄（对账路径：库角色已是目标值，
+// 补做）。残留的节哈希会让下一轮同步把旧集群的跳过依据当成当前状态。
+func clearAppliedSections(ctx context.Context, executor clusterVersionExecutor) error {
+	if _, err := executor.ExecContext(ctx, `DELETE FROM cluster_applied_sections`); err != nil {
+		return fmt.Errorf("清理已应用节记账: %w", err)
+	}
+	return nil
+}
+
+// resetAppliedWAFFileState 复位 WAF 文件态记账（幂等）。翻转路径在拓扑
+// UPDATE 的同一语句内完成（保持集群版本单次 bump），本函数供对账路径复用。
+func resetAppliedWAFFileState(ctx context.Context, executor clusterVersionExecutor) error {
+	if _, err := executor.ExecContext(ctx, `UPDATE global_config SET applied_waf_ref_hash='', applied_waf_ref_version=0 WHERE id=1`); err != nil {
+		return fmt.Errorf("复位 WAF 文件态记账: %w", err)
+	}
+	return nil
+}
+
+// clearAppliedTopologyState 是「旧拓扑记账 + WAF 文件态」的组合清理，
+// 供角色对账路径使用（翻转路径见上：WAF 复位在拓扑 UPDATE 语句内）。
+func clearAppliedTopologyState(ctx context.Context, executor clusterVersionExecutor) error {
+	if err := clearAppliedSections(ctx, executor); err != nil {
+		return err
+	}
+	return resetAppliedWAFFileState(ctx, executor)
+}
+
+// applyRoleSideEffects 是角色翻转「数据/状态半边」的进程内单源（Promote/
+// BecomeSlave/reconcileTaskEngineRole 三处共用）。
+// 对账器只翻引擎半边会把旧角色时代的缓存/分区上报/漂移态带入新角色，后续
+// 再升主时旧快照会被当作权威下发（Promote 注释登记过同一风险）。
+// 调用方须持 roleMu，且必须在 SetRole 之前调用——ResetConfigDrift 先于
+// 角色翻转，在途看门狗轮才不会按新角色误报一次「配置漂移」（与 BecomeSlave
+// 既有顺序一致）。DB 半边由调用方在事务内先行完成（clearAppliedTopologyState），
+// 保持「记账清理与角色落库同成同败」。
+func (s *ClusterService) applyRoleSideEffects() {
+	if s != nil {
+		// 缓存键只有 version/ownership/开关，不含角色——降级期间在途的
+		// master-only Run 可写过库且 is_master=0 不 bump 版本。
+		clusterSnapshotCaches.Delete(s.db)
+		// 旧角色时代的分区上报缓存不再有权威来源。
+		s.clearAllSectionReports()
+	}
+	ResetConfigDrift()
+}
+
+// rebuildCrawlerSnapshotAfterPromote 升主后以本地 DB 重建爬虫运行快照——
+// 从节点期间的快照可能陈旧/缺失（此前仅主节点写该文件），升主后本节点
+// 将成为插件文件的生产者。失败仅留痕（下轮更新/重启收敛）。
+// Promote 与角色对账（DB=主/引擎=从）共用。
+func rebuildCrawlerSnapshotAfterPromote() {
+	if err := RebuildCrawlerIPListSnapshot(); err != nil {
+		Logf("warn", "升主后爬虫运行快照重建失败（插件按旧快照运行至下次更新）: %v", err)
+	}
+}
+
+// restoreClusterSyncSchedulingAfterDemote 切从后恢复拉取调度（须在
+// SetRole(false) 之后调用：先 SetRole 让 daemon 换代为拉取分支，再确保
+// 调度开启且偏好持久化——偏好表若仍保留主节点期间的 0，下次重启会再次
+// 停同步）。BecomeSlave 与角色对账（DB=从/引擎=主）共用。
+func restoreClusterSyncSchedulingAfterDemote() {
+	te := TaskEngine()
+	if te == nil {
+		return
+	}
+	// SetRole 只按角色启停 daemon，不覆盖主节点期间被用户停止的
+	// loopEnabled——切从是本机拓扑变更，不同步即为静默脱管。
+	te.StartLoop("cluster-sync")
+	if err := RecordTaskLoopPref("cluster-sync", true); err != nil {
+		Logf("warn", "切成从节点后持久化 cluster-sync 调度偏好失败（当前进程已恢复）: %v", err)
+	}
+}
+
 func (s *ClusterService) Promote(ctx context.Context) error {
 	s.roleMu.Lock()
 	defer s.roleMu.Unlock()
@@ -689,24 +763,19 @@ func (s *ClusterService) Promote(ctx context.Context) error {
 	if updated != 1 {
 		return fmt.Errorf("重置主节点状态: 影响 %d 行", updated)
 	}
-	// 已应用节哈希与 WAF 文件态只属于旧拓扑；与角色更新同事务清空，
-	// 后续再次切从时首轮按新主节点重建，不沿用旧集群的跳过/漂移依据。
-	if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_applied_sections`); err != nil {
-		return fmt.Errorf("清理主节点已应用节记账: %w", err)
+	// 已应用节哈希只属于旧拓扑；与角色更新同事务清空，后续再次切从时首轮
+	// 按新主节点重建，不沿用旧集群的跳过依据（WAF 文件态已在上一语句复位——
+	// 同一语句保持集群版本单次 bump）。
+	if err := clearAppliedSections(ctx, tx); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("提交提升事务: %w", err)
 	}
 	promoted = true
-	// 降级期间残留的主节点时代分区缓存不得沿用到再次升主。
-	s.clearAllSectionReports()
-	ResetConfigDrift()
-	// 升主后以本地 DB 重建爬虫运行快照——从节点期间的快照可能
-	// 陈旧/缺失（此前仅主节点 Prime/更新任务写该文件），升主后本节点将成为
-	// 插件文件的生产者。失败仅留痕（下轮更新/重启收敛）。
-	if err := RebuildCrawlerIPListSnapshot(); err != nil {
-		Logf("warn", "Promote: 爬虫运行快照重建失败（插件按旧快照运行至下次更新）: %v", err)
-	}
+	// 角色生效面的进程内失效半边（与 BecomeSlave/对账器共用同一入口）。
+	s.applyRoleSideEffects()
+	rebuildCrawlerSnapshotAfterPromote()
 
 	if registrationID > 0 {
 		RecordAuditLog("system", "提升完成", "集群节点", FormatAuditDetail(fmt.Sprintf("注册编号：%d", registrationID), "本节点已脱离集群并提升为主节点", AuditResultPart("success")), "")

@@ -124,7 +124,7 @@ func TestTaskTriggerSelfRecordsAudit_familySplit(t *testing.T) {
 	// Given 6 个自记族（任务体 defer/执行器/载入审计，operator 经 RunContext 归人）
 	for _, id := range []string{"threat", "crs", "ip2region", "crawlerbot-update", "auto-backup", "startup:config-load"} {
 		if !TaskTriggerSelfRecordsAudit(id) {
-			t.Fatalf("自记族 %s 应报告 true（handler 复记会双审计，违反 历史问题-2 单记裁定）", id)
+			t.Fatalf("自记族 %s 应报告 true（handler 复记会双审计，违反单记口径）", id)
 		}
 	}
 	// When/Then 10 个非自记族报告 false（handler 显式补记「触发/任务监控」）

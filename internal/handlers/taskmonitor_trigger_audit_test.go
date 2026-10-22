@@ -73,7 +73,7 @@ func TestTriggerSystemTask_selfRecordingTriggerSkipsHandlerAudit(t *testing.T) {
 	// 异步审计落库窗口后再断言零复记（自记族恒零 handler 审计）。
 	time.Sleep(200 * time.Millisecond)
 	if n := countTriggerAudit(t); n != 0 {
-		t.Fatalf("自记族 auto-backup 的 handler 复记会产生双审计（历史问题-2 单记裁定）, got %d 行", n)
+		t.Fatalf("自记族 auto-backup 的 handler 复记会产生双审计（单记口径）, got %d 行", n)
 	}
 }
 

@@ -117,10 +117,10 @@ func (s *ClusterService) BecomeSlave(ctx context.Context, masterURL string, regi
 	if updated != 1 {
 		return fmt.Errorf("保存从节点注册状态: 影响 %d 行", updated)
 	}
-	// 与 Promote 对称：旧拓扑的节哈希/WAF 文件态不得成为新主节点的
-	// 跳过或漂移判定依据；清理与角色落库必须同成同败。
-	if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_applied_sections`); err != nil {
-		return fmt.Errorf("清理从节点已应用节记账: %w", err)
+	// 与 Promote 对称：旧拓扑的节哈希不得成为新主节点的跳过判定依据；清理与
+	// 角色落库必须同成同败（WAF 文件态已在上一语句复位，保持版本单次 bump）。
+	if err := clearAppliedSections(ctx, tx); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("提交从节点拓扑事务: %w", err)
@@ -133,12 +133,12 @@ func (s *ClusterService) BecomeSlave(ctx context.Context, masterURL string, regi
 			drainer.reopenPullAdmission()
 		}
 	}
-	// 角色翻转显式失效快照缓存。缓存键只有 version/ownership/开关，
-	// 降级瞬间在途的 master-only Run 可越过角色检查写库且 is_master=0 不 bump
-	// 版本——若此后未发生任何 apply 就再次升主，旧缓存会被当作权威下发。
-	clusterSnapshotCaches.Delete(s.db)
-	// 角色翻转后主节点期间的分区上报缓存不再有权威来源。
-	s.clearAllSectionReports()
+	// 角色翻转的进程内失效半边（与 Promote/角色对账共用同一入口）：
+	// 快照缓存、分区上报缓存、看门狗漂移态。
+	// 看门狗漂移状态必须先于 SetRole 复位——放末尾会在 SetRole(false)
+	// 与复位之间打开窗口，在途看门狗轮次按从节点角色对旧主节点的漂移状态
+	// 误报一次「配置漂移」。升主路径（cluster.go Promote）已是先复位后换角色。
+	s.applyRoleSideEffects()
 	// 角色翻转由引擎 SetRole 唯一驱动：master-only 任务统一停调，cluster-sync
 	// 经 RestartOnRoleFlip 换代为从节点分支；无管理器/旧调度器旁路。
 	// 已知有界缺口（登记，勿再上报）：拓扑事务 Commit（is_master=0）到下方
@@ -148,23 +148,13 @@ func (s *ClusterService) BecomeSlave(ctx context.Context, masterURL string, regi
 	// checkCertificateIssuanceRole 二次复核兜住主路径；②长跑任务族由
 	// updateRunWriteGate（taskrun.go）在写 task_runs 前复核；③其余
 	// master-only 写族全部携带 masterRoleConditionSQL，降级后恒 0 行。
-	// 看门狗漂移状态必须先于 SetRole 复位——放末尾会在 SetRole(false)
-	// 与复位之间打开窗口，在途看门狗轮次按从节点角色对旧主节点的漂移状态
-	// 误报一次「配置漂移」。升主路径（cluster.go Promote）已是先复位后换角色。
-	ResetConfigDrift()
 	if te := TaskEngine(); te != nil {
 		te.SetRole(false)
-		// SetRole 只按角色启停 daemon，
-		// 不会覆盖主节点期间被用户停止的 loopEnabled——切从是本机拓扑变更
-		// （等价基线的 StartSync 直调），不同步即为静默脱管，必须显式恢复调度。
-		te.StartLoop("cluster-sync")
-		// 偏好表若仍保留主节点期间的 cluster-sync=0，下次重启会再次
-		// 停同步。切从是显式拓扑变更——持久偏好同步恢复（写失败仅告警，
-		// 当前进程已启动）。
-		if err := RecordTaskLoopPref("cluster-sync", true); err != nil {
-			Logf("warn", "切成从节点后持久化 cluster-sync 调度偏好失败（当前进程已恢复）: %v", err)
-		}
 	}
+	// SetRole 只按角色启停 daemon，不会覆盖主节点期间被用户停止的
+	// loopEnabled——切从是本机拓扑变更（等价基线的 StartSync 直调），不同步
+	// 即为静默脱管；持久偏好同步恢复（偏好表残留 0 会让下次重启停同步）。
+	restoreClusterSyncSchedulingAfterDemote()
 	// 拉取准入已在上方拓扑提交后重开（defer 兜底失败路径）；此处不再重复。
 	if len(drainers) > 0 {
 		// (b)：换主后内存 TOFU pin 缓存与磁盘生命周期对齐——磁盘侧由

@@ -3453,9 +3453,7 @@ func validateV2BackupRuntimeSettings(config map[string]any, tables map[string][]
 		}
 	}
 	if raw, exists := config["threat_screen_mode"]; exists && raw != nil {
-		switch mode := backupString(raw); mode {
-		case "map", "globe":
-		default:
+		if mode := backupString(raw); !models.IsValidThreatScreenMode(mode) {
 			return fmt.Errorf("备份的威胁大屏模式仅支持 map 或 globe，实际 %q", mode)
 		}
 	}

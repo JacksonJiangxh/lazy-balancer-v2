@@ -14,6 +14,9 @@
 #   3) 跨行拆字：“第”与“轮”之间被换行拆开书写同样命中（编号拆成两行不可绕过），
 #      续行带注释前缀（“第”换行后接“// N 轮”）是同一形态的变体，一并命中。
 #
+# 扫描面口径：扩展名与文件名匹配不区分大小写（.MD/.Go 与 .md/.go 同等入面）；
+# 入面文件若含 NUL 字节（二进制形态）直接判错——整文件跳过等于留一条逃逸通道。
+#
 # 误报收窄：白名单只锚定“审计编号形态”，不按裸数字判罚。百分位 P50/P95/P99、
 # 版本串 v2.3.x、sha256/十六进制摘要、HTTP/3、TLS 1.3、PID1、X509、ED25519、
 # HS256、LBF1 文件魔数等产品 token 不触发（见内嵌扫描器的 SHIELD 与纯十六进制
@@ -116,7 +119,7 @@ content_exempt="^$(printf '%s' "${content_exempt_paths[0]}" | sed 's/[.]/\\./g')
 scan_targets="$(printf '%s\n' "$controlled" \
   | grep -v -E "$skip_re" \
   | grep -v -E "$content_exempt" \
-  | grep -E '\.(go|ts|vue|js|css|md|markdown|txt|sh|yml|yaml|sql|mod)$|(^|/)(Dockerfile[^/]*|docker-entrypoint\.sh|\.dockerignore|Caddyfile)$' \
+  | grep -Ei '\.(go|ts|vue|js|css|md|markdown|txt|sh|yml|yaml|sql|mod)$|(^|/)(Dockerfile[^/]*|docker-entrypoint\.sh|\.dockerignore|Caddyfile)$' \
   | while IFS= read -r f; do [[ -f "$f" ]] && printf '%s\n' "$f"; done || true)"
 
 if [[ -n "$scan_targets" ]]; then
@@ -147,7 +150,7 @@ my $shield = join '|',
   q{AES-?[0-9]{3}(-GCM)?}, q{BASE64}, q{MD5},
   q{P[0-9]{2}(-P?[0-9]{2})?},            # P50/P95/P99 与 P50-P99 百分位
   q{v[0-9]+\.[0-9]+(?:\.[0-9x*]+)*(?:-[A-Za-z0-9.]+)?},  # 版本串 v2.3.x / v2.3.8-beta
-  q{A-Za-z0-9}, q{YYYY-MM-DD}, q{NOT-NULL}, q{NULL-[a-z]+},
+  q{YYYY-MM-DD}, q{NOT-NULL}, q{NULL-[a-z]+},
   q{BY-DESIGN}, q{TOP-LEVEL}, q{HTTP-only}, q{TCP-only}, q{HTTP-date},
   q{TLS-enabled}, q{TLS-only}, q{VERSION-only}, q{JSON-[A-Za-z]*},
   q{IP-control}, q{IP-level}, q{ACME-issued}, q{UPSERT-overwritten},
@@ -155,6 +158,8 @@ my $shield = join '|',
   q{Apache-[0-9.]+}, q{CVE-[0-9]+(?:-[0-9]+)*}, q{RFC-?[0-9]+}, q{ISO-[0-9]+},
   q{HTTP-[0-9.]+}, q{TLS-[0-9.]+},
   q{CRS-active}, q{LBF1}, q{PID1}, q{DNS-01},
+  q{IPv[46]-(?:only|first|mapped|compatible)},  # IPv6-only 等网络口径
+  q{YYYYMMDD(?:-HHMMSS)?},                      # 日志轮转文件名骨架
   q{MAX-[0-9]+}, q{MIN-[0-9]+},      # 容量边界常量（MAX-1 个自有键），非编号
   q{[A-F0-9]{16,}};                      # 长十六进制摘要（逐段哈希/指纹）
 
@@ -163,7 +168,7 @@ my $shield = join '|',
 #   (b) 纯大写字母前缀 + 两段以上短横线分段（前缀-序数-序号）。
 my $fam = q{[A-Z][A-Za-z]{0,7}[0-9][0-9A-Za-z]*(-[0-9A-Za-z]+)+}
         . q{|[A-Z]{2,8}(-[0-9A-Za-z]+){2,}}
-        . q{|\b[A-Z][A-Za-z]{1,7}-[A-Z]{0,2}[0-9]{1,3}\b};
+        . q{|\b[A-Z][A-Z0-9]{1,7}-[A-Z]{0,2}[0-9]{1,3}\b};
 
 # —— 中文词条的 UTF-8 字节形态 ——
 # 输入以 :raw 打开、不经 use utf8 解码（保持对任意字节形态的抗性），故中文字面
@@ -250,7 +255,14 @@ while (my $f = <$lf>) {
   local $/;
   my $text = <$fh>;
   close $fh;
-  next if $text =~ /\x00/;               # 二进制文件跳过
+  # 含 NUL 的文件落在文本扩展名扫描面里不是正常源文件形态——整文件跳过等于留
+  # 一条逃逸通道（把编号藏进带 NUL 的文件即可绕过）。此处按不可审查报错
+  # （fail-closed），由人判断该文件去留，而不是静默放行。
+  if ($text =~ /\x00/) {
+    print "$f: contains NUL byte (binary form, not scannable as text)\n";
+    $hits++;
+    next;
+  }
   my $is_doc = ($f =~ /\.(?:md|markdown|txt)$/i);
 
   $text =~ s/(?:$shield)//g;

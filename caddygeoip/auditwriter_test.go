@@ -191,6 +191,9 @@ func useTestAuditPipeline(t *testing.T) {
 	auditTimingWaitLimit = 200 * time.Millisecond
 	auditTimingPollStep = time.Millisecond
 	auditTimingEntryTTLNs.Store(int64(50 * time.Millisecond))
+	// 冲刷合并状态是进程级：上一个用例的冲刷时刻会让本用例的
+	// FlushAuditPipelines 落进窗口被快进，必须复位。
+	auditLastFlushNano.Store(0)
 	auditTimingMu.Lock()
 	resetAuditTimingRegistryLockedForTest()
 	auditTimingMu.Unlock()
@@ -1055,10 +1058,20 @@ func TestAuditPipeline_enqueueDropsWhenFullBeyondTimeout(t *testing.T) {
 	p.enqueue(lbAuditItem{snap: &auditSnapshot{}, formatter: cannedFormatter{body: []byte(`{"b":2}`)}})
 
 	// 第 3 条入队：有界等待后丢弃（不得无限阻塞请求路径）
+	pendingBefore := p.pending.Load()
+	bytesBefore := p.queueBytes.Load()
 	start := time.Now()
 	p.enqueue(lbAuditItem{snap: &auditSnapshot{}, formatter: cannedFormatter{body: []byte(`{"c":3}`)}})
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("enqueue blocked %v on full queue; must be bounded by auditEnqueueTimeout", elapsed)
+	}
+	// 丢弃路径必须回滚准入时预扣的 pending/queueBytes——漏回滚会让
+	// flushQuiesced 的 pending==0 判据恒不成立（每次收尾都等满 3s）。
+	if got := p.pending.Load(); got != pendingBefore {
+		t.Fatalf("pending=%d after timeout drop, want %d（准入预扣未回滚）", got, pendingBefore)
+	}
+	if got := p.queueBytes.Load(); got != bytesBefore {
+		t.Fatalf("queueBytes=%d after timeout drop, want %d（字节占额未回滚）", got, bytesBefore)
 	}
 	if got := p.dropped.Load(); got != 1 {
 		t.Fatalf("dropped count=%d, want 1", got)
@@ -1836,5 +1849,80 @@ func TestWriteWriterStatsIfDue_failureKeepsDirtyAndLogs(t *testing.T) {
 	}
 	if !strings.Contains(string(data), `"dropped":2`) {
 		t.Fatalf("sidecar=%s, want dropped=2", data)
+	}
+}
+
+// 冲刷合并窗口：窗口内重复领取直接快进，窗口外重新领取——一次 reload 的
+// N 个规则实例不再各等满 3s。
+func TestAuditFlushCoalescing_claimWindow(t *testing.T) {
+	oldWindow := auditFlushCoalesceWindow
+	auditFlushCoalesceWindow = 20 * time.Millisecond
+	t.Cleanup(func() {
+		auditFlushCoalesceWindow = oldWindow
+		auditLastFlushNano.Store(0)
+	})
+	auditLastFlushNano.Store(0)
+
+	if !claimAuditFlush(time.Now()) {
+		t.Fatal("首次领取必须成功")
+	}
+	if claimAuditFlush(time.Now()) {
+		t.Fatal("窗口内重复领取必须快进")
+	}
+	time.Sleep(30 * time.Millisecond)
+	if !claimAuditFlush(time.Now()) {
+		t.Fatal("窗口过后必须可再次领取")
+	}
+}
+
+// 一次 reload 里每个规则实例各调一次 Cleanup：首个付出排空等待，其余必须
+// 立即返回（收尾成本不得随规则数线性叠加）。
+func TestSecurityBlockedCounter_cleanupCoalescedAcrossInstances(t *testing.T) {
+	useTestAuditPipeline(t)
+	target := filepath.Join(t.TempDir(), "audit.log")
+	w := &lbAuditWriter{}
+	if err := w.Init(plugintypesConfigFor(t, target)); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	fmtr := &gatedFormatter{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+		body:    []byte(`{"coalesced":"YES"}`),
+	}
+	var releaseOnce sync.Once
+	releaseGate := func() { releaseOnce.Do(func() { close(fmtr.release) }) }
+	t.Cleanup(releaseGate)
+	w.pipeline.enqueue(lbAuditItem{snap: &auditSnapshot{}, formatter: fmtr})
+	select {
+	case <-fmtr.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("drain 未进入在途处理")
+	}
+
+	firstDone := make(chan struct{})
+	go func() {
+		_ = (&SecurityBlockedCounter{}).Cleanup()
+		close(firstDone)
+	}()
+	select {
+	case <-firstDone:
+		t.Fatal("首个 Cleanup 在 drain 在途时必须等待排空")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// 同一次 reload 的下一个规则实例：合并窗口内直接返回，不得再等 3s。
+	start := time.Now()
+	if err := (&SecurityBlockedCounter{}).Cleanup(); err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("后续 Cleanup 等待 %v；同代际重复冲刷必须快进", elapsed)
+	}
+
+	releaseGate()
+	select {
+	case <-firstDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("首个 Cleanup 未在排空后返回")
 	}
 }

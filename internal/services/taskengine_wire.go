@@ -150,7 +150,33 @@ func reconcileTaskEngineRoleFor(te *taskengine.Engine) {
 	}
 	Logf("warn", "任务引擎角色与数据库不一致（数据库主节点=%v，引擎主节点=%v），按数据库修正",
 		roleMaster, te.IsMaster())
+	// 只翻引擎半边（旧实现仅 SetRole）会把旧角色时代的快照缓存/分区上报/
+	// 看门狗漂移态带入新角色：DB=从/引擎=主 修正后不清缓存，后续再升主会
+	// 沿用降级期缓存（Promote 注释登记过同一风险）；漂移态不复位则新角色的
+	// 首轮看门狗按旧基线误报。数据/状态半边与 Promote/BecomeSlave 共用单源
+	// （applyRoleSideEffects + clearAppliedTopologyState）。
+	for _, instance := range instances {
+		instance.applyRoleSideEffects()
+	}
+	if len(instances) == 0 {
+		// 未登记 ClusterService（测试/嵌入形态）：快照缓存以库句柄为键直接
+		// 失效；分区上报缓存无实例可清（该形态不存在上报面），漂移态仍须
+		// 同源复位。
+		clusterSnapshotCaches.Delete(database)
+		ResetConfigDrift()
+	}
+	// 旧拓扑的节记账/WAF 文件态复位：翻转路径在事务内完成，对账路径库角色
+	// 已是目标值，此处幂等补做（失败留痕；下一次升主/切从会重做同一清理）。
+	if err := clearAppliedTopologyState(context.Background(), database); err != nil {
+		Logf("warn", "任务引擎角色对账：旧拓扑记账清理失败（下一次角色翻转会重做）: %v", err)
+	}
 	te.SetRole(roleMaster)
+	// 方向性收尾与翻转路径同源：升主重建爬虫快照；切从恢复拉取调度。
+	if roleMaster {
+		rebuildCrawlerSnapshotAfterPromote()
+		return
+	}
+	restoreClusterSyncSchedulingAfterDemote()
 }
 
 // mustRegisterTask 装配期统一注册入口：描述符非法属于静态装配错误，

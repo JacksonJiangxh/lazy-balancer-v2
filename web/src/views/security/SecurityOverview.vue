@@ -49,7 +49,7 @@
                   <div class="stat-box__value">{{ overview.today_blocked }}</div>
                   <div class="stat-box__label">
                     今日拦截
-                    <el-tooltip :content="overview.includes_reserved ? '总量含私网/保留地址事件（内网扫描、文档测试段等也会计入，与大屏排除口径不同）' : '与大屏同口径（分钟汇总）：不含私网/保留地址事件，当前未满一分钟的事件下一分钟计入'" placement="top">
+                    <el-tooltip :content="overview.includes_reserved ? '总量含私网/保留地址事件（内网扫描、文档测试段等也会计入，与大屏排除口径不同）' : '与大屏同口径（分钟汇总）：不含私网/保留地址事件，含当前分钟截至最近一次汇总的事件（滞后约 1 分钟）'" placement="top">
                       <el-icon class="stat-box__tip"><InfoFilled /></el-icon>
                     </el-tooltip>
                   </div>
@@ -63,7 +63,7 @@
                   <div class="stat-box__value">{{ overview.today_detected }}</div>
                   <div class="stat-box__label">
                     今日检测
-                    <el-tooltip :content="overview.includes_reserved ? '总量含私网/保留地址事件（内网扫描、文档测试段等也会计入，与大屏排除口径不同）' : '与大屏同口径（分钟汇总）：不含私网/保留地址事件，当前未满一分钟的事件下一分钟计入'" placement="top">
+                    <el-tooltip :content="overview.includes_reserved ? '总量含私网/保留地址事件（内网扫描、文档测试段等也会计入，与大屏排除口径不同）' : '与大屏同口径（分钟汇总）：不含私网/保留地址事件，含当前分钟截至最近一次汇总的事件（滞后约 1 分钟）'" placement="top">
                       <el-icon class="stat-box__tip"><InfoFilled /></el-icon>
                     </el-tooltip>
                   </div>

@@ -44,8 +44,21 @@ func PolicyTypeFeatures(p *SecurityPolicy) PolicyFeatureSet {
 		jsonListNonEmpty(string(p.IPBlacklist)) ||
 		(p.GeoIPMode != "" && p.GeoIPMode != "off" && jsonListNonEmpty(string(p.GeoIPCountries)))
 	fs.G2 = p.RateLimitEnabled && p.RateLimitRPS > 0
-	fs.G3 = p.Mode == "blocking" || p.Mode == "detection" || p.Mode == "custom_only" || jsonListNonEmpty(string(p.CustomRules))
+	fs.G3 = p.Mode == "blocking" || p.Mode == "detection" || p.Mode == "custom_only" || CustomRulesRefCount(p.CustomRules) > 0
 	return fs
+}
+
+// CustomRulesRefCount 返回策略的自定义规则引用条目数（不看启用态与发射
+// 缺陷）。它只服务「阶段 3 是否成立」的判定——与 PolicyTypeFeatures 的 G3
+// 「custom_rules 引用非空」同一个门；摘要的 custom_rules_count 数的是
+// 启用且可发射的规则（发射侧口径），前端阶段 3 判定用它会在「mode=off 且
+// 引用规则全部禁用」的边界形态少标一条子策略。
+func CustomRulesRefCount(raw json.RawMessage) int {
+	var entries []json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &entries); err != nil {
+		return 0
+	}
+	return len(entries)
 }
 
 // InferPolicyType 按内容特征推断策略类型——backfill、写侧缺省提交、旧快照/
@@ -174,9 +187,13 @@ type SecurityPolicySummary struct {
 	CRSStaleSelections bool `json:"crs_stale_selections"`
 	// 追加（多策略绑定根因 1）：ruleProtections 的 GeoIP/自定义
 	// 规则行此前永远没有数据（接口只给 has_ip_control/has_rate_limit）。
-	HasGeoIP            bool   `json:"has_geoip"`
-	HasCustomRules      bool   `json:"has_custom_rules"`
-	CustomRulesCount    int    `json:"custom_rules_count"`
+	HasGeoIP         bool `json:"has_geoip"`
+	HasCustomRules   bool `json:"has_custom_rules"`
+	CustomRulesCount int  `json:"custom_rules_count"`
+	// CustomRulesRefCount 是自定义规则引用条目数（含禁用/不可发射条目）——
+	// 阶段 3 判定与后端 PolicyTypeFeatures.G3 逐字对齐的消费口径；
+	// CustomRulesCount（启用且可发射）只用于展示「实际生效 N 条」。
+	CustomRulesRefCount int    `json:"custom_rules_ref_count"`
 	UpdatedBy           int    `json:"updated_by"`
 	UpdatedAt           string `json:"updated_at"`
 	GeoIPCountries      string `json:"geoip_countries"`

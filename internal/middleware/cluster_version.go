@@ -84,6 +84,9 @@ var globalConfigSyncedColumns = []string{
 	// 补列：此前仅靠「同语句 UPDATE 含其他 OF 列」偶然触发 bump，仅写这三列
 	// 的端点会滞留主节点。
 	"security_events_retention_days", "security_events_row_cap", "threat_traffic_sample_n",
+	// 大屏视觉模式同组：从节点写入口被只读门拒绝，配置只能由主节点经快照
+	// 下发——漏列时主端改它不 bump 版本，从端经 304 门永久滞留旧视觉。
+	"threat_screen_mode",
 }
 
 func installClusterVersionTriggers(database *sql.DB) error {

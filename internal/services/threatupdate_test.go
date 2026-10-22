@@ -667,7 +667,7 @@ func TestThreatUpdate_listExistenceQueryErrorNotFastPathSuccess(t *testing.T) {
 	// 后失败回传引擎：源失败必须返回错误（旧契约
 	// 断言返回 nil 已随迁）；行级 failed 落库仍是本测试真契约。
 	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err == nil {
-		t.Fatal("run2: 源写库失败必须返回错误（历史问题-01 失败回传契约）")
+		t.Fatal("run2: 源写库失败必须返回错误（失败回传契约）")
 	}
 
 	// Then：不得标 success 快速返回——完整路径写库失败落 failed

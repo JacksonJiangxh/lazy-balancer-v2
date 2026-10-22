@@ -222,6 +222,20 @@ type UpdateCAProviderRequest struct {
 	Enabled       *bool   `json:"enabled"`
 }
 
+// 威胁大屏中央视觉模式封闭枚举（列 global_config.threat_screen_mode）。
+// 三处消费同一列表：写侧校验（handlers/caddy.go 400 白名单）、从端快照
+// apply 归一（services/cluster_apply.go 非法值回默认）、读侧渲染。
+// 默认值单源 db.DefaultThreatScreenMode（= ThreatScreenModeMap）。
+const (
+	ThreatScreenModeMap   = "map"
+	ThreatScreenModeGlobe = "globe"
+)
+
+// IsValidThreatScreenMode 报告模式值是否属于封闭枚举。
+func IsValidThreatScreenMode(mode string) bool {
+	return mode == ThreatScreenModeMap || mode == ThreatScreenModeGlobe
+}
+
 // GlobalConfig represents global configuration
 type GlobalConfig struct {
 	ID          int    `json:"id"`
@@ -273,7 +287,9 @@ type GlobalConfig struct {
 	ServerMapLat float64 `json:"server_map_lat"`
 	ServerMapLon float64 `json:"server_map_lon"`
 	// ThreatScreenMode 威胁大屏中央视觉模式（v2.3.8）：map=360°地图+雷达扫掠 /
-	// globe=旋转地球+垂直扫描。node-local 列，缺省 map。
+	// globe=旋转地球+垂直扫描。缺省 db.DefaultThreatScreenMode。该列随集群
+	// 快照（ClusterBasicSettings）同步：从节点写入口被只读门拒绝，配置只能
+	// 由主节点下发。枚举校验单源见 IsValidThreatScreenMode。
 	ThreatScreenMode string `json:"threat_screen_mode"`
 	// ThreatTrafficSampleN 大屏逐请求光流采样：-1=自适应（内部从 1/1 起步，
 	// 按事件速率在 1/4/8 档与滞回切换）、0=关闭。全量档已退役（自适应低流量

@@ -159,7 +159,7 @@ func TestServeHTTP_sets_geoip_placeholders_for_known_ip(t *testing.T) {
 		t.Fatalf("serve: %v", err)
 	}
 	if _, ok := vars["geoip.country_code"]; ok {
-		t.Fatal("geoip.country_code must not be published (dead emission removed, 历史问题-6)")
+		t.Fatal("geoip.country_code must not be published (dead emission removed)")
 	}
 	if name, _ := vars["geoip.country_name"].(string); name == "" {
 		t.Fatal("geoip.country_name var is empty for a known IP")

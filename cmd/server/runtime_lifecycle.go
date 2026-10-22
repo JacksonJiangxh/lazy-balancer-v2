@@ -116,6 +116,9 @@ func (l *runtimeLifecycle) StopSync() {
 	l.syncService.Stop()
 }
 
+// Shutdown 是测试缝：用固定预算（acmeStopSegmentMax）调用 ShutdownWithTimeout，
+// 让测试不必自行构造关停预算。生产退出路径（main.go 的关停链）一律走
+// ShutdownWithTimeout(剩余预算)，本方法在生产代码中无调用点。
 func (l *runtimeLifecycle) Shutdown() { l.ShutdownWithTimeout(acmeStopSegmentMax) }
 
 // ShutdownWithTimeout 与 Shutdown 同语义，ACME 收尾等待由调用方给的关停预算

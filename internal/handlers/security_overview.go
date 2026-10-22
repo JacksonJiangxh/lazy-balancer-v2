@@ -296,8 +296,13 @@ func resetSecurityOverviewAggCacheForTest() {
 // 分钟，直算会静默少计且面板照常渲染）。rollup 覆盖水位未回推到今日
 // 起点（启动回填中）或固化陈旧（warmer 停转）时回退原始表直算。
 // fromRollup 披露口径分叉：rollup 固化时排除私网/保留地址（大屏口径），
-// 原始表回退含私网（旧口径）。rollup 只固化完整分钟——当前未满分钟
-// 不计入（与大屏 recent_rate 同口径，滞后 ≤1 分钟，轮询下下轮即补上）。
+// 原始表回退含私网（旧口径）。
+// 时间口径（勿再按「部分分钟」重报）：warmer 每轮恒固化 currentMinute 的
+// 部分分钟，本查询因此包含「当前分钟截至最近一次固化」的事件（滞后 ≤60s，
+// 随轮询增量变化）；事件列表/总览/大屏三面同一口径。recent_rate 例外——
+// 它用固定 5 分钟除数，必须只取完整分钟（上界排除当前分钟），否则速率随
+// 秒数漂移。UI 文案按「含当前分钟（截至最近固化）」描述，不要再声称
+// 「当前未满分钟不计入」。
 func securityOverviewTodayCounts(database *sql.DB, todayStart time.Time, now time.Time) (blocked, detected int, fromRollup bool, err error) {
 	todayStartUTC := todayStart.UTC()
 	lastComplete := now.UTC().Add(-time.Minute).Truncate(time.Minute)

@@ -70,3 +70,101 @@ func TestReconcileTaskEngineRole_noopWhenAligned(t *testing.T) {
 		t.Fatal("读取失败时对账不得翻转引擎角色")
 	}
 }
+
+// seedDriftAndTopologyState 准备「旧角色时代」的全部数据/状态半边，供
+// 对账回归断言：分区上报缓存、快照缓存、看门狗漂移态、旧拓扑节记账/WAF
+// 文件态。
+func seedDriftAndTopologyState(t *testing.T) {
+	t.Helper()
+	database := db.DB
+	if _, err := database.Exec(`INSERT INTO cluster_applied_sections (section, hash, applied_version) VALUES ('users','deadbeef',3)
+		ON CONFLICT(section) DO UPDATE SET hash=excluded.hash, applied_version=excluded.applied_version`); err != nil {
+		t.Fatalf("seed applied sections: %v", err)
+	}
+	if _, err := database.Exec(`UPDATE global_config SET applied_waf_ref_hash='cafebabe', applied_waf_ref_version=9 WHERE id=1`); err != nil {
+		t.Fatalf("seed waf ref: %v", err)
+	}
+	clusterSnapshotCaches.Store(database, &clusterSnapshotCache{})
+	t.Cleanup(func() { clusterSnapshotCaches.Delete(database) })
+	configDriftMu.Lock()
+	configDriftStatus = ConfigDriftStatus{Consistent: false, Missing: []string{"r-stale"}}
+	configDriftMu.Unlock()
+}
+
+func assertRoleSideEffectsApplied(t *testing.T) {
+	t.Helper()
+	database := db.DB
+	if _, ok := clusterSnapshotCaches.Load(database); ok {
+		t.Fatal("角色对账必须失效快照缓存（否则降级期内容会在再次升主时被当作权威下发）")
+	}
+	if drift := CurrentConfigDrift(); !drift.Consistent || len(drift.Missing) != 0 {
+		t.Fatalf("角色对账必须复位看门狗漂移态: %+v", drift)
+	}
+	var sections int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM cluster_applied_sections`).Scan(&sections); err != nil {
+		t.Fatalf("read applied sections: %v", err)
+	}
+	if sections != 0 {
+		t.Fatalf("角色对账必须清理旧拓扑节记账, 残留 %d 行", sections)
+	}
+	var hash string
+	var version int
+	if err := database.QueryRow(`SELECT applied_waf_ref_hash, applied_waf_ref_version FROM global_config WHERE id=1`).Scan(&hash, &version); err != nil {
+		t.Fatalf("read waf ref: %v", err)
+	}
+	if hash != "" || version != 0 {
+		t.Fatalf("角色对账必须复位 WAF 文件态记账, got %q/%d", hash, version)
+	}
+}
+
+// 降级方向（DB=从、引擎=主）：对账必须做 BecomeSlave 的配套半边，并恢复
+// 从端拉取调度（主节点期间曾被用户停掉的 cluster-sync 不得延续到从端）。
+func TestReconcileTaskEngineRole_demoteAppliesSideEffects(t *testing.T) {
+	te := newWireTestEngine(t)
+	if !te.IsMaster() {
+		t.Fatal("fixture precondition: DB default is master")
+	}
+	seedDriftAndTopologyState(t)
+	if _, err := db.DB.Exec(`INSERT INTO task_loop_prefs (task_id, enabled) VALUES ('cluster-sync',0)
+		ON CONFLICT(task_id) DO UPDATE SET enabled=0`); err != nil {
+		t.Fatalf("seed loop pref: %v", err)
+	}
+	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
+		t.Fatalf("seed slave db state: %v", err)
+	}
+
+	reconcileTaskEngineRole()
+
+	if te.IsMaster() {
+		t.Fatal("DB=从时引擎必须降级")
+	}
+	assertRoleSideEffectsApplied(t)
+	var enabled int
+	if err := db.DB.QueryRow(`SELECT enabled FROM task_loop_prefs WHERE task_id='cluster-sync'`).Scan(&enabled); err != nil {
+		t.Fatalf("read loop pref: %v", err)
+	}
+	if enabled != 1 {
+		t.Fatalf("切从后 cluster-sync 持久偏好必须恢复为启用, got %d", enabled)
+	}
+	if meta, ok := te.Lookup("cluster-sync"); !ok || !meta.LoopOn {
+		t.Fatalf("切从后 cluster-sync 调度必须开启: %+v", meta)
+	}
+}
+
+// 升主方向（DB=主、引擎=从）：对账必须做 Promote 的配套半边（缓存/漂移/
+// 旧拓扑记账复位 + 爬虫运行快照重建），否则半程翻转会把降级期状态带入主节点。
+func TestReconcileTaskEngineRole_promoteAppliesSideEffects(t *testing.T) {
+	te := newWireTestEngine(t)
+	te.SetRole(false) // 播种失败终态
+	oldCrawlerFile := crawlerIPListFile
+	crawlerIPListFile = t.TempDir() + "/crawler-ip-lists.json"
+	t.Cleanup(func() { crawlerIPListFile = oldCrawlerFile })
+	seedDriftAndTopologyState(t)
+
+	reconcileTaskEngineRole()
+
+	if !te.IsMaster() {
+		t.Fatal("对账后引擎角色必须回到 DB 的主节点角色")
+	}
+	assertRoleSideEffectsApplied(t)
+}

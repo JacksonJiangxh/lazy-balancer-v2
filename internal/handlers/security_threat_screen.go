@@ -1429,6 +1429,11 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 		}
 	}
 	sinceMinute := now.UTC().Add(-time.Duration(hours) * time.Hour).Truncate(time.Minute).Format("2006-01-02 15:04")
+	// 时间口径（勿再按「部分分钟」重报）：窗口总量/分桶/top 目标含当前分钟
+	// 已固化的部分分钟（warmer 每轮恒固化 currentMinute，滞后 ≤60s）；只有
+	// recent_rate 用「完整分钟」上界（固定 5 分钟除数，混入部分分钟会随秒数
+	// 漂移）。两者的差异是有意设计，面板文案按「含当前分钟（截至最近固化）」
+	// 描述。
 	bucketStarts, hourly := threatHourlyBuckets(hours, now, loc)
 	// 单次 SQL 侧聚合产出同屏全部维度（总量/拦截/国家/省/攻击族/规则/按槽
 	// 分钟总量），30s 进程内缓存。旧实现逐行拉「分钟×维度基数」（30 天可达

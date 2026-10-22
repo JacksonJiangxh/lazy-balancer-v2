@@ -2114,8 +2114,10 @@ type SecurityEventsIngestionStatus struct {
 	LastError           string `json:"last_error,omitempty"`
 	LastErrorAt         string `json:"last_error_at,omitempty"`
 	LastSuccessAt       string `json:"last_success_at,omitempty"`
-	// TaskState/TaskRunning 是 taskengine 视角的采集任务实态（running/stopped/
-	// unknown）：任务停用/未运行时事件不再增长，健康位不得继续显示 healthy。
+	// TaskState/TaskRunning 是 taskengine 视角的采集任务实态（running/
+	// restarting/stopped/unknown，判据单源见 securityEventsIngestionTaskState）：
+	// 任务停用/未运行时事件不再增长，健康位不得继续显示 healthy；restarting
+	// 是异常退出后的有界退避重拉窗口（LoopOn 仍 true），自愈通道仍在，不降级。
 	TaskState   string `json:"task_state"`
 	TaskRunning bool   `json:"task_running"`
 	// Writer* 是审计写侧（caddygeoip 插件）失败/丢弃计数——经插件侧车文件
@@ -2186,21 +2188,48 @@ func SecurityEventsIngestionHealthSnapshot() SecurityEventsIngestionStatus {
 // 任务注册与健康位判据共用）。
 const securityEventsIngestionTaskID = "security-events-ingestion"
 
+// securityEventsIngestionTaskHealthState 采集任务实态（健康位与自动封禁
+// 喂入侧共享的唯一判据）：
+//   - running：daemon Run 存活；
+//   - restarting：调度仍开（LoopOn=true）但 Run 不在——异常退出后的有界退避
+//     重拉窗口（1s/5s/30s 级）。自愈通道仍在，不得按「已停止」降级，否则每次
+//     短暂重拉都会瞬时把三面健康位打成不健康并触发 autoban feed_degraded；
+//   - stopped：调度关闭（用户停止）或异常自愈预算用尽（引擎同时置
+//     RestartExhausted 与 LoopOn=false）；
+//   - unknown：引擎未装配/任务未注册（测试/嵌入形态），不参与判定。
+type securityEventsIngestionTaskHealthState struct {
+	State            string
+	Running          bool
+	RestartExhausted bool
+}
+
 // securityEventsIngestionTaskState 返回采集任务实态。未装配引擎/未注册
 // （测试/嵌入形态）返回 unknown——不参与健康位降级判定。
-func securityEventsIngestionTaskState() (string, bool) {
+func securityEventsIngestionTaskState() securityEventsIngestionTaskHealthState {
 	te := TaskEngine()
 	if te == nil {
-		return "unknown", false
+		return securityEventsIngestionTaskHealthState{State: "unknown"}
 	}
 	meta, ok := te.Lookup(securityEventsIngestionTaskID)
 	if !ok {
-		return "unknown", false
+		return securityEventsIngestionTaskHealthState{State: "unknown"}
 	}
-	if meta.Running {
-		return "running", true
+	state := securityEventsIngestionTaskHealthState{
+		Running:          meta.Running,
+		RestartExhausted: meta.RestartExhausted,
 	}
-	return "stopped", false
+	// LoopOn 优先：停止调度是权威事实——取消后 in-flight Run 尚在退出
+	// （running 仍真实为 true）时也不得判 running，否则「用户刚停掉」的窗口
+	// 内健康位仍显示采集正常。
+	switch {
+	case !meta.LoopOn:
+		state.State = "stopped"
+	case meta.Running:
+		state.State = "running"
+	default:
+		state.State = "restarting"
+	}
+	return state
 }
 
 // 审计写侧失败可见性（插件 → 面板）契约：
@@ -2211,6 +2240,11 @@ func securityEventsIngestionTaskState() (string, bool) {
 //   - 失败窗口（securityEventsWriterFailureWindow）内累计失败达阈值即降级采集
 //     健康位（与任务停/连续失败同一位），并由 ingestion daemon 在状态变化时写
 //     一条任务日志业务行（仅状态变化，低频）。
+//   - written_at 判据边界（已裁定，勿按「停更」重报）：写侧只在计数变化时
+//     重写侧车（无失败＝不写盘），故 written_at 陈旧是正常形态而非故障信号；
+//     读侧只用它做代际判定（早于本进程启动的整份忽略并复位基线），不得据其
+//     年龄判「写侧停摆/侧车停更」——按年龄降级会在无失败期间长期误报。写侧
+//     drain 真停摆没有独立存活信号可观测（要判必须先在生产侧落固定心跳）。
 const (
 	securityEventsAuditWriterStatsSuffix = ".writer-stats.json"
 	// securityEventsAuditWriterStatsFailureSuffix 是插件侧车写盘失败标记后缀
@@ -2237,6 +2271,14 @@ func securityEventsAuditWriterStatsFailurePath() string {
 // 以来实际观测到的失败量，window* 是「窗口内失败量」（阈值判据）。
 // sidecar* 是侧车文件自身的可用性：读取/解析连续失败达阈值即「写侧计数
 // 不可用」——磁盘满/目录只读正是侧车要覆盖的故障形态，双向失效不得静默。
+// securityEventsProcessStart 是本进程（面板服务）启动时刻，用于判定侧车
+// 计数的代际：计数文件跨容器重启存活，written_at 早于本时刻说明写它的是
+// 上一代进程——那批累计值与本进程无关，整份忽略并复位基线。否则重启后
+// 首个 tick 会把历史失败当成本进程新失败（degraded 15 分钟 + data_loss +
+// 一条「审计日志写侧失败」任务日志的误报），且新进程无失败时侧车永不重写，
+// 误报长期存在。var 供测试注入。
+var securityEventsProcessStart = time.Now()
+
 var securityEventsWriterHealth struct {
 	mu              sync.Mutex
 	baselineDropped uint64
@@ -2291,14 +2333,30 @@ func securityEventsObserveAuditWriterStats() {
 		return
 	}
 	var payload struct {
-		Dropped  uint64 `json:"dropped"`
-		IOErrors uint64 `json:"io_errors"`
+		Dropped   uint64 `json:"dropped"`
+		IOErrors  uint64 `json:"io_errors"`
+		WrittenAt string `json:"written_at"`
 	}
 	if err := json.Unmarshal(data, &payload); err != nil {
 		securityEventsWriterHealth.mu.Lock()
 		securityEventsWriterHealth.sidecarReadFailures++
 		securityEventsWriterHealth.mu.Unlock()
 		return
+	}
+	// 代际判定：读取成功但书写时刻早于本进程启动 = 上一代进程的累计值。
+	// 整份忽略并复位基线——本轮既不累计 delta，也不误报失败；下一轮读到
+	// 本代进程写过的新计数时按 baseline=0 正常累计（计数本身也是从 0 起的）。
+	// written_at 缺失/不可解析（更早版本的插件产物）时退回基线差量逻辑。
+	if written, perr := time.Parse(time.RFC3339, payload.WrittenAt); perr == nil {
+		if written.Before(securityEventsProcessStart) {
+			securityEventsWriterHealth.mu.Lock()
+			securityEventsWriterHealth.baselineDropped = 0
+			securityEventsWriterHealth.baselineIO = 0
+			securityEventsWriterHealth.sidecarReadFailures = 0
+			securityEventsWriterHealth.sidecarLastOK = time.Now()
+			securityEventsWriterHealth.mu.Unlock()
+			return
+		}
 	}
 	delta := func(current uint64, baseline *uint64) uint64 {
 		if current < *baseline {
@@ -2403,14 +2461,16 @@ func securityEventsWriterHealthSnapshot() (dropped, ioErrors uint64, degraded, s
 // ①任务已停（调度关闭/未运行）→ 未采集，非 healthy；②审计写侧窗口内失败
 // 累计达阈值 → 落盘不可靠，非 healthy。两者都只置降级，不虚构成功。
 func securityEventsOverlayIngestionHealth(status SecurityEventsIngestionStatus) SecurityEventsIngestionStatus {
-	if state, running := securityEventsIngestionTaskState(); state != "unknown" {
-		status.TaskState, status.TaskRunning = state, running
-		if state == "stopped" {
+	if task := securityEventsIngestionTaskState(); task.State != "unknown" {
+		status.TaskState, status.TaskRunning = task.State, task.Running
+		// 仅真实停止（调度关闭/自愈预算用尽）降级；退避重拉窗口
+		// （restarting）自愈通道仍在，不能瞬时打成不健康。
+		if task.State == "stopped" {
 			status.Observed = true
 			status.Healthy = false
 		}
 	} else {
-		// 字段契约 running/stopped/unknown 是闭合三态：引擎未装配/任务未注册
+		// 字段契约 running/restarting/stopped/unknown：引擎未装配/任务未注册
 		// （测试/嵌入形态）必须显式落 unknown，空串会让按 unknown 分支消费的
 		// 调用方失效。
 		status.TaskState, status.TaskRunning = "unknown", false

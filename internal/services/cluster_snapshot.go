@@ -628,15 +628,24 @@ func (s *ClusterService) loadSnapshotGlobalSettings(ctx context.Context, store s
 	snapshot.BasicSettings.CrawlerScheduleTime = &crawlerTime
 	// v2.3.8：安全事件保留与大屏采样随 users 节同步（从节点/升主后口径一致）。
 	var seDays, seCap, trafficSample int
+	var screenMode string
 	if err := store.QueryRowContext(ctx, `SELECT COALESCE(security_events_retention_days,?),
-		COALESCE(security_events_row_cap,?), COALESCE(threat_traffic_sample_n,?)
+		COALESCE(security_events_row_cap,?), COALESCE(threat_traffic_sample_n,?),
+		COALESCE(threat_screen_mode,?)
 		FROM global_config WHERE id=1`,
-		db.DefaultSecurityEventsRetentionDays, db.DefaultSecurityEventsRowCap, db.DefaultThreatTrafficSampleN).Scan(&seDays, &seCap, &trafficSample); err != nil {
+		db.DefaultSecurityEventsRetentionDays, db.DefaultSecurityEventsRowCap, db.DefaultThreatTrafficSampleN, db.DefaultThreatScreenMode).Scan(&seDays, &seCap, &trafficSample, &screenMode); err != nil {
 		return fmt.Errorf("读取安全事件保留/流量采样设置: %w", err)
 	}
 	snapshot.BasicSettings.SecurityEventsRetentionDays = &seDays
 	snapshot.BasicSettings.SecurityEventsRowCap = &seCap
 	snapshot.BasicSettings.ThreatTrafficSampleN = &trafficSample
+	// 主端装载侧同口径归一（与 sync_interval 同理由）：从端 apply 会把非法
+	// 枚举归为默认后落库并重算节哈希；主端若按脏值算哈希，两边恒不等，
+	// 每次版本递增都重放 users 节。
+	if !models.IsValidThreatScreenMode(screenMode) {
+		screenMode = db.DefaultThreatScreenMode
+	}
+	snapshot.BasicSettings.ThreatScreenMode = &screenMode
 
 	// 自动封禁六项配置随 users 节同步（镜像
 	// 指针装载+COALESCE 兜底恒携带，升主即按主端配置生效）。局部名 abn* 与上方

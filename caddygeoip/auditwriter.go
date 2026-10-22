@@ -110,15 +110,16 @@ var (
 	// auditTimingWaitLimit drain 对「条目在场但未终态」分段的限时等待：正常形态
 	// （blocked_counter 是链最外层收点，紧随 coraza 中间件 defer）等待 <1ms；
 	// 上限仅兜底异常形态（计时写点缺失），超时按已到场分段注入。未知 tid
-	// （注册表无条目）不进本等待——auditTimingWait 首轮查表未命中即返
-	// 单 drain goroutine 逐行满等=无背压阀下的 drain 沉陷）。
+	// （注册表无条目）不进本等待——auditTimingWait 首轮查表未命中即返回；
+	// 若对未知 tid 也等待，单 drain goroutine 会逐行满等，就是无背压阀下的
+	// drain 沉陷。
 	auditTimingWaitLimit = 2 * time.Second
 	auditTimingPollStep  = 200 * time.Microsecond
 	// auditTimingEntryTTLNs 注册表条目存活上限（纳秒）：条目由周期性清扫回收
 	// （消费不删——同一请求可产多条审计行[预检+策略引擎]，共享同一注册表条目）。
 	// 以 atomic.Int64 纳秒存储而非普通 time.Duration：常驻 sweeper goroutine
-	// 读、测试收窄参数写，普通变量在 `go test -race` 下构成数据竞争
-	// 零值为 0（立即全部过期），默认值在 init 中置入。
+	// 读、测试收窄参数写，普通变量在 `go test -race` 下构成数据竞争。零值为 0
+	// （立即全部过期），默认值在 init 中置入。
 	auditTimingEntryTTLNs atomic.Int64
 	// auditTimingMaxEntries 注册表条目硬上限：计时 ID
 	// 形态校验之外的第二道内存 DoS 防线——任何新键生产路径（含未来写点）都不
@@ -1602,10 +1603,38 @@ func (p *auditPipeline) flush() {
 // 无条件丢失全部在队行。
 const auditShutdownDrainWait = 3 * time.Second
 
+// auditFlushCoalesceWindow 是 FlushAuditPipelines 的合并窗口：一次 Caddy
+// reload/优雅停机会让**每个规则**的 SecurityBlockedCounter 各调一次 Cleanup
+// （实例数 = 规则数）。持续审计流量下 pending 很难为 0，每个实例都等满
+// auditShutdownDrainWait，收尾成本即「规则数 × 3s」（管理面 /load 卡顿）。
+// 窗口内的重复调用直接跳过——首个调用已把同一批管线排空，其后的等待纯属
+// 叠加；窗口远小于两次 reload 的间隔，且 500ms 周期刷盘兜底尾部行。var 供
+// 测试收窄。
+var auditFlushCoalesceWindow = auditShutdownDrainWait
+
+// auditLastFlushNano 是最近一次领到冲刷资格的时刻（UnixNano；0=从未冲刷）。
+// CAS 领取保证并发 Cleanup 只有一个走等待路径。
+var auditLastFlushNano atomic.Int64
+
+// claimAuditFlush 在合并窗口内领取一次冲刷资格；窗口内返回 false（本次
+// Cleanup 直接快进）。无锁 CAS：并发调用者同刻到达时只有一个成功。
+func claimAuditFlush(now time.Time) bool {
+	n := now.UnixNano()
+	for {
+		last := auditLastFlushNano.Load()
+		if last != 0 && n-last < int64(auditFlushCoalesceWindow) {
+			return false
+		}
+		if auditLastFlushNano.CompareAndSwap(last, n) {
+			return true
+		}
+	}
+}
+
 // flushQuiesced 限时等待「已准入条目全部处理完」后刷盘（pending==0 蕴含
 // 队列空 + 无在途处理）。drain 是恒活的进程级单例消费者，等待有界
-// （auditShutdownDrainWait）：reload 期每个实例的 Cleanup 只有首个遇到
-// 非空队列的调用付出等待，其后均为已排空快进。
+// （auditShutdownDrainWait）。同一代际的重复等待由 FlushAuditPipelines 的
+// 合并窗口消除（见 claimAuditFlush）。
 func (p *auditPipeline) flushQuiesced() {
 	deadline := time.Now().Add(auditShutdownDrainWait)
 	for time.Now().Before(deadline) {
@@ -1621,7 +1650,14 @@ func (p *auditPipeline) flushQuiesced() {
 // 调用，弥补上游从不调用 AuditLogWriter.Close 导致的尾部丢失——先限时等
 // drain 排空已入队行（auditShutdownDrainWait），再刷 bufio。
 // 只刷盘不关闭：管线是进程级单例，fd/drain 的生命周期与进程一致。
+//
+// 合并窗口（claimAuditFlush）：一次 reload 会按规则数调用 N 次本函数，
+// 只有窗口内首个调用付出排空等待，其余直接返回——收尾成本与实例数解耦，
+// 不再是「规则数 × 3s」。
 func FlushAuditPipelines() {
+	if !claimAuditFlush(time.Now()) {
+		return
+	}
 	auditPipelinesMu.Lock()
 	pipelines := make([]*auditPipeline, 0, len(auditPipelines))
 	for _, p := range auditPipelines {

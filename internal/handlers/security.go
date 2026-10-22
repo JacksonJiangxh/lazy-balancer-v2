@@ -842,10 +842,12 @@ func (h *Handlers) ListSecurityPolicies(c *gin.Context) {
 			CRSRuleGroups:      p.CRSRuleGroups,
 			CRSStaleSelections: services.CRSStaleGroupSelections(p.CRSRuleGroups, crsIndex),
 			CustomRulesCount:   customRulesCount,
-			UpdatedBy:          p.UpdatedBy,
-			UpdatedAt:          p.UpdatedAt,
-			GeoIPCountries:     rawJSONString(p.GeoIPCountries),
-			GeoIPMode:          p.GeoIPMode,
+			// 阶段 3 判定口径（引用非空，含禁用条目）——前端与 G3 逐字对齐。
+			CustomRulesRefCount: models.CustomRulesRefCount(p.CustomRules),
+			UpdatedBy:           p.UpdatedBy,
+			UpdatedAt:           p.UpdatedAt,
+			GeoIPCountries:      rawJSONString(p.GeoIPCountries),
+			GeoIPMode:           p.GeoIPMode,
 			// 摘要必须携带爬虫豁免两列——列表编辑入口按摘要渲染
 			// 回写时若缺席会把豁免静默关闭（详情 DTO 同修）。
 			GeoIPCrawlerExempt:  p.GeoIPCrawlerExempt,

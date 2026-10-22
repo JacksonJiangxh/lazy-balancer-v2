@@ -181,7 +181,9 @@ func (h *SecurityBlockedCounter) ServeHTTP(w http.ResponseWriter, r *http.Reques
 }
 
 // Cleanup 在 Caddy reload/优雅停机时冲刷审计管线（上游 coraza 不调用
-// AuditLogWriter.Close）。
+// AuditLogWriter.Close）。每个规则一个实例，一次 reload 会调用 N 次；
+// FlushAuditPipelines 内部按合并窗口去重，只有首个调用付出排空等待——
+// 收尾成本与规则数解耦。
 func (h *SecurityBlockedCounter) Cleanup() error {
 	FlushAuditPipelines()
 	return nil

@@ -1705,6 +1705,17 @@ func updateSnapshotSettings(ctx context.Context, tx *sql.Tx, snapshot models.Clu
 		settingClauses = append(settingClauses, "threat_traffic_sample_n=?")
 		settingArgs = append(settingArgs, sample)
 	}
+	// 大屏视觉模式：枚举白名单与写侧同源（models.IsValidThreatScreenMode）；
+	// 非法值归默认而非落脏值——渲染/读侧直读库值，脏枚举会让大屏回退分支
+	// 与配置面自相矛盾。nil=旧主端缺席，跳过写入保留从端本地值。
+	if settings.ThreatScreenMode != nil {
+		mode := *settings.ThreatScreenMode
+		if !models.IsValidThreatScreenMode(mode) {
+			mode = db.DefaultThreatScreenMode
+		}
+		settingClauses = append(settingClauses, "threat_screen_mode=?")
+		settingArgs = append(settingArgs, mode)
+	}
 	if settings.AutobanEnabled != nil {
 		settingClauses = append(settingClauses, "autoban_enabled=?")
 		settingArgs = append(settingArgs, *settings.AutobanEnabled)

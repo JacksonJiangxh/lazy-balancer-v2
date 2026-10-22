@@ -139,3 +139,128 @@ func TestWriterStatsHealth_writeFailureMarkerBecomesUnavailable(t *testing.T) {
 		t.Fatalf("marker cleared: unavailable=%v healthy=%v, want available+healthy", status.WriterStatsUnavailable, status.Healthy)
 	}
 }
+
+// 侧车计数文件跨容器重启存活：早于本进程启动的 written_at 属于上一代进程，
+// 必须整份忽略并复位基线。否则只要历史上出现过一次丢弃，重启后首个 tick
+// 就把旧累计值当「本进程新失败」——degraded 15 分钟 + data_loss + 一条
+// 「审计日志写侧失败」任务日志的误报；且新进程无失败时侧车永不重写，误报
+// 长期存在。
+func TestWriterStatsHealth_staleGenerationIgnored(t *testing.T) {
+	dir := t.TempDir()
+	oldPath := auditLogPath
+	auditLogPath = filepath.Join(dir, "audit.log")
+	t.Cleanup(func() { auditLogPath = oldPath })
+	SecurityEventsSetIngestionHealthForTest(SecurityEventsIngestionStatus{Observed: true, Healthy: true})
+	t.Cleanup(func() {
+		SecurityEventsSetIngestionHealthForTest(SecurityEventsIngestionStatus{})
+	})
+
+	oldStart := securityEventsProcessStart
+	securityEventsProcessStart = time.Now()
+	t.Cleanup(func() { securityEventsProcessStart = oldStart })
+	securityEventsWriterHealth.mu.Lock()
+	securityEventsWriterHealth.baselineDropped = 0
+	securityEventsWriterHealth.baselineIO = 0
+	securityEventsWriterHealth.droppedTotal = 0
+	securityEventsWriterHealth.ioTotal = 0
+	securityEventsWriterHealth.windowStart = time.Time{}
+	securityEventsWriterHealth.windowFailures = 0
+	securityEventsWriterHealth.lastFailureAt = time.Time{}
+	securityEventsWriterHealth.sidecarReadFailures = 0
+	securityEventsWriterHealth.mu.Unlock()
+
+	// 旧代际侧车：written_at 早于本进程启动，计数非零。
+	stale := `{"dropped":7,"io_errors":3,"written_at":"` +
+		securityEventsProcessStart.Add(-time.Hour).UTC().Format(time.RFC3339) + `"}`
+	if err := os.WriteFile(securityEventsAuditWriterStatsPath(), []byte(stale), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for range securityEventsWriterFailureThreshold + 1 {
+		securityEventsObserveAuditWriterStats()
+	}
+	securityEventsWriterHealth.mu.Lock()
+	dropped, ioErrors, windowFailures := securityEventsWriterHealth.droppedTotal,
+		securityEventsWriterHealth.ioTotal, securityEventsWriterHealth.windowFailures
+	securityEventsWriterHealth.mu.Unlock()
+	if dropped != 0 || ioErrors != 0 || windowFailures != 0 {
+		t.Fatalf("旧代际侧车必须整份忽略：dropped=%d io=%d windowFailures=%d", dropped, ioErrors, windowFailures)
+	}
+	status := SecurityEventsIngestionHealthSnapshot()
+	if status.WriterDegraded || status.WriterDropped != 0 || status.WriterIOErrors != 0 {
+		t.Fatalf("旧代际侧车不得判降级：degraded=%v dropped=%d io=%d",
+			status.WriterDegraded, status.WriterDropped, status.WriterIOErrors)
+	}
+
+	// 本代际侧车（written_at 晚于进程启动）照常累计增量。
+	fresh := `{"dropped":7,"io_errors":3,"written_at":"` +
+		time.Now().UTC().Add(time.Second).Format(time.RFC3339) + `"}`
+	if err := os.WriteFile(securityEventsAuditWriterStatsPath(), []byte(fresh), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	securityEventsObserveAuditWriterStats()
+	securityEventsWriterHealth.mu.Lock()
+	dropped, ioErrors = securityEventsWriterHealth.droppedTotal, securityEventsWriterHealth.ioTotal
+	securityEventsWriterHealth.mu.Unlock()
+	if dropped != 7 || ioErrors != 3 {
+		t.Fatalf("本代际侧车必须累计：dropped=%d io=%d, want 7/3", dropped, ioErrors)
+	}
+
+	// 缺失 written_at 的旧版本产物退回基线差量口径（兼容形态，不得静默忽略）。
+	legacy := `{"dropped":9,"io_errors":4}`
+	if err := os.WriteFile(securityEventsAuditWriterStatsPath(), []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	securityEventsObserveAuditWriterStats()
+	securityEventsWriterHealth.mu.Lock()
+	dropped = securityEventsWriterHealth.droppedTotal
+	securityEventsWriterHealth.mu.Unlock()
+	if dropped != 9 {
+		t.Fatalf("无 written_at 的旧产物应按差量累计到 9，got %d", dropped)
+	}
+}
+
+// 判据边界：written_at 只用于代际判定，**不得**按年龄判「写侧停摆/侧车停更」。
+// 插件只在计数变化时重写侧车（无失败＝不写盘），陈旧 written_at 是无失败时的
+// 正常形态；按年龄降级会在健康期长期误报（写侧真停摆无独立存活信号可观测）。
+// 本用例把进程启动时间前移，使「1h 前的 written_at」属于本代际——任何按年龄
+// 判停更的实现都会在此红。
+func TestWriterStatsHealth_oldWrittenAtInCurrentGenerationIsNotStale(t *testing.T) {
+	dir := t.TempDir()
+	oldPath := auditLogPath
+	auditLogPath = filepath.Join(dir, "audit.log")
+	t.Cleanup(func() { auditLogPath = oldPath })
+	SecurityEventsSetIngestionHealthForTest(SecurityEventsIngestionStatus{Observed: true, Healthy: true})
+	t.Cleanup(func() {
+		SecurityEventsSetIngestionHealthForTest(SecurityEventsIngestionStatus{})
+	})
+
+	oldStart := securityEventsProcessStart
+	securityEventsProcessStart = time.Now().Add(-48 * time.Hour)
+	t.Cleanup(func() { securityEventsProcessStart = oldStart })
+	securityEventsWriterHealth.mu.Lock()
+	securityEventsWriterHealth.baselineDropped = 0
+	securityEventsWriterHealth.baselineIO = 0
+	securityEventsWriterHealth.droppedTotal = 0
+	securityEventsWriterHealth.ioTotal = 0
+	securityEventsWriterHealth.windowStart = time.Time{}
+	securityEventsWriterHealth.windowFailures = 0
+	securityEventsWriterHealth.lastFailureAt = time.Time{}
+	securityEventsWriterHealth.sidecarReadFailures = 0
+	securityEventsWriterHealth.sidecarWriteFailureHits = 0
+	securityEventsWriterHealth.mu.Unlock()
+
+	// 本代际（晚于进程启动）但已 1h 未重写的侧车：无失败计数。
+	stale := `{"dropped":0,"io_errors":0,"written_at":"` +
+		time.Now().UTC().Add(-time.Hour).Format(time.RFC3339) + `"}`
+	if err := os.WriteFile(securityEventsAuditWriterStatsPath(), []byte(stale), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for range securityEventsWriterFailureThreshold + 1 {
+		securityEventsObserveAuditWriterStats()
+	}
+	status := SecurityEventsIngestionHealthSnapshot()
+	if status.WriterDegraded || status.WriterStatsUnavailable || !status.Healthy {
+		t.Fatalf("陈旧但属本代际的 written_at 不得判停更/降级: degraded=%v unavailable=%v healthy=%v",
+			status.WriterDegraded, status.WriterStatsUnavailable, status.Healthy)
+	}
+}

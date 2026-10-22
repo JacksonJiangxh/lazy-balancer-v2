@@ -472,3 +472,58 @@ func TestFastFile_4in6InV6SectionRejected(t *testing.T) {
 		t.Fatalf("pure v6 entries must load, got: %v", err)
 	}
 }
+
+// 条目数上限是读侧第二道门（体积门挡不住「小文件 × 巨大 header 计数」）：
+// header 计数直接决定 make([]netip.Prefix, …) 的规模，若只信任计数，
+// 64MiB 文件可声明 1300 万条并展开成数百 MiB 前缀集。
+func TestFastFile_ReadEntryCap(t *testing.T) {
+	dir := t.TempDir()
+	old := MaxFastEntries
+	MaxFastEntries = 3
+	t.Cleanup(func() { MaxFastEntries = old })
+
+	// 小型 + 巨量计数：体积远低于上限，必须在分配前被条目门拒绝。
+	hugePath := filepath.Join(dir, "huge-count.fast")
+	data := make([]byte, 0, fastFileHeaderSize)
+	data = append(data, []byte(fastFileMagic)...)
+	data = append(data, 0xff, 0xff, 0xff, 0xf0) // v4_count ≈ 43 亿
+	data = append(data, 0, 0, 0, 0)             // v6_count=0
+	data = append(data, 0, 0, 0, 0)             // flags=0
+	if err := os.WriteFile(hugePath, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadFastFile(hugePath); err == nil || !strings.Contains(err.Error(), "entry count") {
+		t.Fatalf("huge header count must be rejected by the entry cap, got: %v", err)
+	}
+
+	// v4+v6 合计口径：单族各半仍超限同样拒绝（上限不是逐族各一份）。
+	mixedPath := filepath.Join(dir, "mixed-count.fast")
+	data = data[:0]
+	data = append(data, []byte(fastFileMagic)...)
+	data = append(data, 0, 0, 0, 2) // v4_count=2
+	data = append(data, 0, 0, 0, 2) // v6_count=2
+	data = append(data, 0, 0, 0, 0) // flags=0
+	if err := os.WriteFile(mixedPath, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadFastFile(mixedPath); err == nil || !strings.Contains(err.Error(), "entry count") {
+		t.Fatalf("v4+v6 combined count above cap must be rejected, got: %v", err)
+	}
+
+	// 反例：恰好等于上限的产物照常加载（条目门不得误伤正常产物）。
+	okPath := filepath.Join(dir, "within-cap.fast")
+	if err := WriteFastFile(okPath, []netip.Prefix{
+		netip.MustParsePrefix("10.0.0.0/8"),
+		netip.MustParsePrefix("11.0.0.0/8"),
+		netip.MustParsePrefix("12.0.0.0/8"),
+	}, nil); err != nil {
+		t.Fatalf("WriteFastFile: %v", err)
+	}
+	state, err := ReadFastFile(okPath)
+	if err != nil {
+		t.Fatalf("entry count at cap must load, got: %v", err)
+	}
+	if len(state.V4) != 3 {
+		t.Fatalf("loaded v4 entries=%d, want 3", len(state.V4))
+	}
+}
