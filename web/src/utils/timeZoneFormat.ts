@@ -21,5 +21,13 @@ export const formatDateParts = (d: Date, formatter: Intl.DateTimeFormat, withTim
   return `${date} ${get('hour')}:${get('minute')}:${get('second')}`
 }
 
+// 紧凑时间（MM-DD HH:mm）：多列表格里时间列按此压缩，段取值仍来自同一 formatter
+// （withTime 形态，h23 口径），不另造第二套时区来源。
+export const formatCompactDateParts = (d: Date, formatter: Intl.DateTimeFormat): string => {
+  const parts = formatter.formatToParts(d)
+  const get = (type: string): string => parts.find((p) => p.type === type)?.value ?? ''
+  return `${get('month')}-${get('day')} ${get('hour')}:${get('minute')}`
+}
+
 export const formatDateInTz = (d: Date, timeZone: string, withTime = true): string =>
   formatDateParts(d, createTzFormatter(timeZone, withTime), withTime)

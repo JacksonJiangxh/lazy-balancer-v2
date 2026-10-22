@@ -1,7 +1,7 @@
 import { useAuthStore } from '@/stores/auth'
 // 与后端 COALESCE 默认一致的兜底时区与格式化器单源：抽到无依赖
 // 模块供 node 行为测试直测 h23 口径；本文件保留缓存/回退策略。
-import { DEFAULT_TZ, createTzFormatter, formatDateParts } from '@/utils/timeZoneFormat'
+import { DEFAULT_TZ, createTzFormatter, formatCompactDateParts, formatDateParts } from '@/utils/timeZoneFormat'
 
 let warnedInvalidTz = false
 
@@ -79,6 +79,15 @@ export const formatDate = (date: unknown): string => {
 export const formatDateShort = (date: unknown): string => {
   const d = parseDateValue(date)
   if (d) return formatInConfigTz(d, false)
+  if (typeof date === 'string' && date) return date
+  return ''
+}
+
+// 紧凑时间（MM-DD HH:mm）——多列表格的时间列压缩列宽专用；段取值复用
+// 受保护 tzFormatter(true)，与本文件其余格式化出口同一配置时区来源。
+export const formatDateCompact = (date: unknown): string => {
+  const d = parseDateValue(date)
+  if (d) return formatCompactDateParts(d, tzFormatter(true))
   if (typeof date === 'string' && date) return date
   return ''
 }

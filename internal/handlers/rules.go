@@ -2851,6 +2851,9 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 					return
 				}
 				resumedValidJob = true
+				// 与 /enable 的恢复留痕同通道、同 stage；后缀点名入口，
+				// 让用户区分「更新规则时重新启用」与显式启用操作。
+				services.WriteCertJobLogByRule(caddyID, "INFO", "resumed", "规则已启用，证书任务已恢复（更新规则时重新启用）")
 			}
 		}
 		needJob := domainChanged || caProviderChanged || !services.IsACMECertIssued(caddyID, domain) ||
@@ -3994,8 +3997,12 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 				failCertEnqueue("创建证书任务失败", err)
 				return
 			}
+			// 与禁用侧同通道留痕（对照 [WARN] cancelled）：入队成功后才写，
+			// 用户可在 certjob-<rule>.log 看到任务何时重新排队。
+			services.WriteCertJobLogByRule(caddyID, "INFO", "queued", "规则已启用，已创建证书任务")
 			recordAudit(c, "创建", "证书任务", fmt.Sprintf("启用规则 %s，创建证书任务 (%s)", caddyID, domain))
 		case EnableCertJobKeep:
+			services.WriteCertJobLogByRule(caddyID, "INFO", "kept", "规则已启用，证书仍有效，保持现有任务")
 			recordAudit(c, "启用", "证书任务", fmt.Sprintf("启用规则 %s，证书有效（过期前%d天续签），保持现有证书", caddyID, renewalDays))
 		case EnableCertJobResume:
 			if enableCertJobResumePreUpdateHook != nil {
@@ -4028,6 +4035,8 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 				failEnable("恢复证书任务后重载 Caddy 配置失败: " + reapplyErr.Error())
 				return
 			}
+			// 恢复成功（DB + 重渲染均已完成）后留痕，补偿分支不写。
+			services.WriteCertJobLogByRule(caddyID, "INFO", "resumed", "规则已启用，证书任务已恢复")
 			recordAudit(c, "启用", "证书任务", fmt.Sprintf("启用规则 %s，证书仍有效，恢复使用现有证书", caddyID))
 		case EnableCertJobRenew:
 			if queueManager == nil {

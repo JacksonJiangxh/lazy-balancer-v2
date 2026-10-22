@@ -17,64 +17,60 @@
     class="cert-jobs-table"
     :fit="true"
   >
-    <el-table-column prop="rule_id" label="规则 ID" min-width="110" show-overflow-tooltip />
-    <el-table-column prop="domain" label="域名" min-width="180" show-overflow-tooltip />
-    <el-table-column prop="status" label="状态" width="90" align="center">
+    <el-table-column prop="rule_id" label="规则 ID" width="96" show-overflow-tooltip />
+    <el-table-column prop="domain" label="域名" width="170" show-overflow-tooltip />
+    <el-table-column prop="status" label="状态" width="84" align="center">
       <template #default="{ row }">
-        <el-tag :type="statusType(row.status)" size="small">{{ certJobStatusLabel(row.status) }}</el-tag>
+        <!-- message 不再单列：hover 状态标签看失败原因/在途说明（空则不挂空 tooltip） -->
+        <el-tooltip :disabled="!row.message" :content="row.message">
+          <span><el-tag :type="statusType(row.status)" size="small">{{ certJobStatusLabel(row.status) }}</el-tag></span>
+        </el-tooltip>
       </template>
     </el-table-column>
-    <el-table-column label="颁发者" width="110" show-overflow-tooltip>
+    <el-table-column label="颁发者" width="96" show-overflow-tooltip>
       <template #default="{ row }">
         <span :class="row.issuer ? 'cell-text' : 'cell-empty'">{{ row.issuer || '-' }}</span>
       </template>
     </el-table-column>
-    <el-table-column label="过期时间" width="180">
+    <el-table-column label="证书有效期" width="170">
       <template #default="{ row }">
-        <span v-if="row.status === 'issued' && row.expires_at" class="cell-text">{{ formatDate(row.expires_at) || '-' }}</span>
+        <!-- 过期时间与剩余天数合并一列：列内只留日期，精确时间（配置时区）进 tooltip。
+             过期证书不渲染裸负数——色弱/黑白场景下「-1 天」无文字语义。 -->
+        <el-tooltip v-if="row.status === 'issued' && row.expires_at" :content="formatDate(row.expires_at)">
+          <span :class="['cert-days', certificateStatus(row)]">{{ formatDateShort(row.expires_at) }} · {{ certificateStatus(row) === 'expired' ? `已过期 ${Math.abs(row.days_remaining)} 天` : `剩 ${row.days_remaining} 天` }}</span>
+        </el-tooltip>
         <span v-else class="cell-empty">-</span>
       </template>
     </el-table-column>
-    <el-table-column label="更新时间" width="180">
+    <el-table-column label="自动重签时间" width="110">
       <template #default="{ row }">
-        <span class="cell-text">{{ formatDate(row.updated_at) || '-' }}</span>
-      </template>
-    </el-table-column>
-    <el-table-column label="自动重签时间" width="180">
-      <template #default="{ row }">
-        <span v-if="row.status === 'issued' && row.expires_at" class="cell-text">{{ renewalInfo(row).renewalDate || '-' }}</span>
+        <el-tooltip v-if="row.status === 'issued' && renewalAt(row)" :content="formatDate(renewalAt(row))">
+          <span class="cell-text">{{ formatDateCompact(renewalAt(row)) }}</span>
+        </el-tooltip>
         <span v-else class="cell-empty">-</span>
       </template>
     </el-table-column>
-    <el-table-column label="重试次数" width="80" align="center">
+    <el-table-column label="更新时间" width="110">
+      <template #default="{ row }">
+        <el-tooltip v-if="formatDate(row.updated_at)" :content="formatDate(row.updated_at)">
+          <span class="cell-text">{{ formatDateCompact(row.updated_at) }}</span>
+        </el-tooltip>
+        <span v-else class="cell-empty">-</span>
+      </template>
+    </el-table-column>
+    <el-table-column label="重试次数" width="64" align="center">
       <template #default="{ row }">
         <span v-if="row.renewal_attempts && row.renewal_attempts > 0" class="cell-text">{{ row.renewal_attempts }}</span>
         <span v-else class="cell-empty">-</span>
       </template>
     </el-table-column>
-    <el-table-column label="冷却时间" min-width="140" show-overflow-tooltip>
+    <el-table-column label="冷却时间" width="104" show-overflow-tooltip>
       <template #default="{ row }">
         <span v-if="row.status === 'waiting_ca' && row.ca_available_after" class="cell-text">{{ formatCoolingTime(row.ca_available_after) }}</span>
         <span v-else class="cell-empty">-</span>
       </template>
     </el-table-column>
-    <!-- 审计项：任务 message（失败原因/在途阶段说明/从节点材料化提示）此前只在
-         详情或日志可见；主表直接展示，截断部分可 hover 查看全文。 -->
-    <el-table-column label="消息" min-width="200" show-overflow-tooltip>
-      <template #default="{ row }">
-        <span :class="row.message ? 'cell-text' : 'cell-empty'">{{ row.message || '-' }}</span>
-      </template>
-    </el-table-column>
-    <el-table-column label="剩余天数" width="90">
-      <template #default="{ row }">
-        <!-- 过期证书不渲染裸负数——色弱/黑白场景下「-1 天」无文字语义-->
-        <span v-if="row.status === 'issued' && row.expires_at" :class="['cert-days', certificateStatus(row)]">
-          {{ certificateStatus(row) === 'expired' ? `已过期 ${Math.abs(row.days_remaining)} 天` : `${row.days_remaining} 天` }}
-        </span>
-        <span v-else class="cell-empty">-</span>
-      </template>
-    </el-table-column>
-    <el-table-column label="操作" width="120" align="center">
+    <el-table-column label="操作" width="96" align="center">
       <template #default="{ row }">
         <el-button link type="primary" size="small" @click="viewLogs(row)">日志</el-button>
         <el-tooltip :disabled="!retryDisabledReason(row)" :content="retryDisabledReason(row)">
@@ -132,7 +128,7 @@ import { Timer } from '@element-plus/icons-vue'
 import { request, mfaAwareSuccess } from '@/utils/api'
 import { useLogTailPolling } from '@/composables/useLogTailPolling'
 import LogStorageBar from '@/components/LogStorageBar.vue'
-import { formatDate } from '@/utils/date'
+import { formatDate, formatDateCompact, formatDateShort } from '@/utils/date'
 import { escapeHtml } from '@/utils/escape'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
@@ -233,12 +229,13 @@ const retryDisabledReason = (row: CertJob): string => {
   return `当前状态需等待 ${Math.ceil((row.retry_cooldown_seconds ?? 0) / 60)} 分钟后重签`
 }
 
-const renewalInfo = (row: CertJob): { renewalDate?: string } => {
-  if (!row.expires_at) return {}
+// 自动重签时间 = 证书到期前 certRenewalDays 天；返回 ISO 原值，列内紧凑格式
+// 与 tooltip 完整格式各自取用，不在 helper 里预先格式化（避免双口径）。
+const renewalAt = (row: CertJob): string => {
+  if (!row.expires_at) return ''
   const expiry = new Date(row.expires_at)
-  if (isNaN(expiry.getTime())) return {}
-  const renewal = new Date(expiry.getTime() - certRenewalDays.value * 24 * 60 * 60 * 1000)
-  return { renewalDate: formatDate(renewal.toISOString()) }
+  if (isNaN(expiry.getTime())) return ''
+  return new Date(expiry.getTime() - certRenewalDays.value * 24 * 60 * 60 * 1000).toISOString()
 }
 
 const certificateStatus = (row: CertJob): CertificateStatus => row.certificate_status
