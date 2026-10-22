@@ -358,14 +358,22 @@ func (s *Store) quarantinePath() string {
 func (s *Store) save(current state) error {
 	if len(current.Records) > 0 {
 		now := time.Now()
+		retired := 0
 		kept := current.Records[:0]
 		for _, record := range current.Records {
 			if record.Stale(now) && now.Sub(record.CreatedAt) > OwnershipRetention {
+				retired++
 				continue
 			}
 			kept = append(kept, record)
 		}
 		current.Records = kept
+		if retired > 0 {
+			// 条目消失属于可观测事件：单行、只报条数与保留期（不打印 FQDN/记录
+			// ID——账本落盘已是明文，运行日志不再额外扩散用户数据）。
+			logf("info", "DNS ownership: 退役 %d 条超过 %d 天保留期的账本条目（仅本地文件，未触碰远端 DNS）",
+				retired, int(OwnershipRetention.Hours()/24))
+		}
 	}
 	data, err := json.Marshal(current)
 	if err != nil {
