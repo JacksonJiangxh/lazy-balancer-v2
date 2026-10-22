@@ -110,11 +110,8 @@ func parseTLSCertificate(certPEM, keyPEM string) (*CertificateInfo, error) {
 		domain = x509Cert.DNSNames[0]
 	}
 
-	// Extract issuer
-	issuer := x509Cert.Issuer.CommonName
-	if issuer == "" && len(x509Cert.Issuer.Organization) > 0 {
-		issuer = x509Cert.Issuer.Organization[0]
-	}
+	// Extract issuer（与证书卡/任务列表共用同一显示口径）
+	issuer := services.CertificateIssuerDisplay(x509Cert)
 
 	info.Valid = true
 	info.Domain = domain

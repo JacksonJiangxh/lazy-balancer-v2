@@ -621,6 +621,36 @@ func validateUpdateConfigRequest(req *models.UpdateConfigRequest) error {
 	return nil
 }
 
+// resolveAccessLogFormatGate 是保存与预览共用的 access_log_json ×
+// access_log_format 跨字段门与存量归一（此前只写在 UpdateConfig 内，preview
+// 可对保存必 400 的载荷给出「可变更」清单，且看不到「保存会顺手清空格式」）：
+//   - 生效值 json=true → 无门，返回 cleared=false；
+//   - json=false 且请求显式携带非空格式 → 错误（不静默丢弃用户输入）；
+//   - json=false 且（请求或存量）存有格式 → 把 req.AccessLogFormat 置空串并
+//     返回 cleared=true（保存侧据此清空列；预览侧 plan 因此展示该清空）。
+func resolveAccessLogFormatGate(req *models.UpdateConfigRequest, old configSnapshot) (bool, error) {
+	effectiveAccessLogJSON := old.AccessLogJSON
+	if req.AccessLogJSON != nil {
+		effectiveAccessLogJSON = *req.AccessLogJSON
+	}
+	if effectiveAccessLogJSON {
+		return false, nil
+	}
+	if req.AccessLogFormat != nil && strings.TrimSpace(*req.AccessLogFormat) != "" {
+		return false, errors.New("访问日志 JSON 输出已关闭，自定义字段映射不生效：请先开启 JSON 输出，或清空访问日志格式")
+	}
+	storedFormat := old.AccessLogFormat
+	if req.AccessLogFormat != nil {
+		storedFormat = *req.AccessLogFormat
+	}
+	if storedFormat == "" {
+		return false, nil
+	}
+	emptyFormat := ""
+	req.AccessLogFormat = &emptyFormat
+	return true, nil
+}
+
 func (h *Handlers) PreviewConfigUpdate(c *gin.Context) {
 	var req models.UpdateConfigRequest
 	if !guardConfiguredJSONBody(c) {
@@ -634,14 +664,19 @@ func (h *Handlers) PreviewConfigUpdate(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
-	// 与 UpdateConfig 同门：preview 200 后 PUT 不应因存量规则聚合校验变 400
-	if err := validateEnabledStoredRuleConfigs(c.Request.Context()); err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
-		return
-	}
 	old, err := loadConfigSnapshot()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取当前配置失败"})
+		return
+	}
+	// 与保存同一跨字段门与归一（含存量格式清空的预告）。
+	if _, err := resolveAccessLogFormatGate(&req, old); err != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
+		return
+	}
+	// 与 UpdateConfig 同门：preview 200 后 PUT 不应因存量规则聚合校验变 400
+	if err := validateEnabledStoredRuleConfigs(c.Request.Context()); err != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
 	plan := planConfigChanges(req, old)
@@ -717,28 +752,12 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 		return
 	}
 	// access_log_json=false 时 access_log_format 不生效（渲染层
-	// buildAccessLogEncoder 仅在 json=true 时消费自定义映射）。同一请求显式
-	// 携带非空格式 → 400（不静默丢弃用户输入）；json 关闭后的存量残留格式 →
-	// 归一清空并在响应披露（配置变更审计的 access_log_format 字段变更同时留痕）。
-	formatCleared := false
-	effectiveAccessLogJSON := old.AccessLogJSON
-	if req.AccessLogJSON != nil {
-		effectiveAccessLogJSON = *req.AccessLogJSON
-	}
-	if !effectiveAccessLogJSON {
-		if req.AccessLogFormat != nil && strings.TrimSpace(*req.AccessLogFormat) != "" {
-			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "访问日志 JSON 输出已关闭，自定义字段映射不生效：请先开启 JSON 输出，或清空访问日志格式"})
-			return
-		}
-		storedFormat := old.AccessLogFormat
-		if req.AccessLogFormat != nil {
-			storedFormat = *req.AccessLogFormat
-		}
-		if storedFormat != "" {
-			emptyFormat := ""
-			req.AccessLogFormat = &emptyFormat
-			formatCleared = true
-		}
+	// buildAccessLogEncoder 仅在 json=true 时消费自定义映射）——跨字段门与
+	// 存量归一单源见 resolveAccessLogFormatGate（保存/预览共用）。
+	formatCleared, gateErr := resolveAccessLogFormatGate(&req, old)
+	if gateErr != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: gateErr.Error()})
+		return
 	}
 	plan := planConfigChanges(req, old)
 	if !plan.Changed {
@@ -1352,8 +1371,8 @@ func (h *Handlers) PutCaddyConfig(c *gin.Context) {
 		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
 		err = errors.Join(err, restoreErr)
 		h.recordCaddyApplyResult(err)
-		recordAudit(c, "更新失败", "Caddy配置", services.FormatAuditDetail("提交 Caddy 配置失败", err.Error(), services.AuditResultPart("failure")))
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交 Caddy 配置失败: " + err.Error()})
+		recordAudit(c, "更新失败", "Caddy配置", services.FormatAuditDetail(commitUncertainLabel, err.Error(), services.AuditResultPart("failure")))
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + ": " + err.Error()})
 		return
 	}
 	committed = true

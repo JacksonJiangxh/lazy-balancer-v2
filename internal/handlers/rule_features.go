@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode"
@@ -1430,6 +1431,41 @@ func validateEnabledStoredRuleConfigs(ctx context.Context) error {
 		if len(names) > 1 {
 			problems = append(problems, &configValidationError{message: fmt.Sprintf("端口 %d 存在多条启用的 TCP 规则（%s）——L4 监听同端口只能由一条规则占用，请保留一条或调整端口", port, strings.Join(names, "、"))})
 		}
+	}
+	// 同端口同归一化域名的多条启用 HTTP 规则点名（与 TCP 同端口同格=硬错）：
+	// 保存/启用路径由 enabledRuleDomainConflict 拦截，但直改 DB/历史脏库可绕过
+	//（导入链另由 disableV2RuleConflicts 冲突矩阵置禁用）。渲染层同 server 内
+	// 两条 host matcher + terminal 路由时，按 rowid 先出现者吃掉全部流量，后者
+	// 成为永不命中的死规则且面板仍显示「已启用」——必须点名而非静默。
+	type httpDomainSlot struct {
+		port   int
+		domain string
+	}
+	domainOwners := make(map[httpDomainSlot][]string)
+	for _, rule := range rules {
+		if rule.Protocol != "http" || !rule.Enabled {
+			continue
+		}
+		for _, domain := range normalizedRuleDomains(rule.Domain) {
+			slot := httpDomainSlot{port: rule.ListenPort, domain: domain}
+			domainOwners[slot] = append(domainOwners[slot], fmt.Sprintf("%s（%s）", rule.Name, rule.CaddyID))
+		}
+	}
+	conflicted := make([]httpDomainSlot, 0)
+	for slot, owners := range domainOwners {
+		if len(owners) > 1 {
+			conflicted = append(conflicted, slot)
+		}
+	}
+	// map 遍历序不确定会让错误文本/启动日志在两次运行间漂移。
+	sort.Slice(conflicted, func(i, j int) bool {
+		if conflicted[i].port != conflicted[j].port {
+			return conflicted[i].port < conflicted[j].port
+		}
+		return conflicted[i].domain < conflicted[j].domain
+	})
+	for _, slot := range conflicted {
+		problems = append(problems, &configValidationError{message: fmt.Sprintf("端口 %d 的域名 %s 被多条启用的 HTTP 规则占用（%s）——同一监听端口内只有首条规则会收到流量，其余为永不命中的死规则，请保留一条或调整端口/域名", slot.port, slot.domain, strings.Join(domainOwners[slot], "、"))})
 	}
 	// 存量同端口 TLS/明文混布点名告警(不阻断启动——存量形态可能是
 	// 混布前已落库的历史数据,阻断会让节点起不来;点名提示管理员修正)。

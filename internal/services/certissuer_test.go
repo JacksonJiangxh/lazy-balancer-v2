@@ -1440,3 +1440,67 @@ func TestCertIssuer_Issue_zerosslRegistersAccountOnce(t *testing.T) {
 		t.Fatalf("ACME /account POSTs=%d, want 1（预检注册后签发复用同 client，不重复注册）", got)
 	}
 }
+
+// issued 形态的材料读失败：任务已部署完成，不在 deploymentFailed 的 from 集合
+// ——旧实现走该链只会 CAS 失败并留下「部署失败状态回写失败」噪音，日志还谎称
+// 「转部署重试」。必须保持 issued（不重签、不改状态）并如实说明接管通道。
+func TestCertIssuer_Issue_fastPathMaterialReadFailure_issuedStaysIssued(t *testing.T) {
+	jobID, ruleID := seedCertificateJob(t, "issued")
+	useTemporaryCertDir(t)
+	taskengine.SetLogDir(t.TempDir())
+	t.Cleanup(func() { taskengine.SetLogDir("") })
+	issuer := NewCertIssuer(func() error { return nil })
+	retried := make(chan struct{}, 1)
+	issuer.deploymentRetry = func(int, issuedCertificate, time.Duration) { retried <- struct{}{} }
+	oldReader := readFastPathIssuedMaterial
+	readFastPathIssuedMaterial = func(context.Context, int) (string, string, error) {
+		return "", "", errors.New("injected material read failure")
+	}
+	t.Cleanup(func() { readFastPathIssuedMaterial = oldReader })
+
+	err := issuer.Issue(context.Background(), jobID, ruleID, "example.com", models.CAProvider{ID: 1})
+
+	var deploymentErr *certificateDeploymentError
+	if !errors.As(err, &deploymentErr) {
+		t.Fatalf("issue error=%v, want certificateDeploymentError（不得回落全签）", err)
+	}
+	select {
+	case <-retried:
+		t.Fatal("issued 形态不得登记部署重试（deploymentFailed 的 from 集合不含 issued）")
+	case <-time.After(50 * time.Millisecond):
+	}
+	var status string
+	var attempts int
+	var after sql.NullString
+	if err := db.DB.QueryRow("SELECT status, COALESCE(deployment_attempts,0), deployment_available_after FROM cert_jobs WHERE id=?", jobID).
+		Scan(&status, &attempts, &after); err != nil {
+		t.Fatalf("read job: %v", err)
+	}
+	if status != "issued" || attempts != 0 || after.Valid {
+		t.Fatalf("status=%q attempts=%d window=%v, want issued/0/空（保持已部署终态）", status, attempts, after.Valid)
+	}
+	logData, readErr := os.ReadFile(taskengine.TaskLogPath(fmt.Sprintf("certjob-%d", jobID)))
+	if readErr == nil && !strings.Contains(string(logData), "保持 issued") {
+		t.Fatalf("任务日志未如实说明接管通道: %q", string(logData))
+	}
+}
+
+// 手动证书未来生效：保持 valid 枚举（前端无 not_yet_valid 分支），但必须在
+// Error 字段显性说明——否则卡片显示 valid + 很大的剩余天数，而客户端在
+// NotBefore 前拒绝该证书。
+func TestFormatRuleCertInfo_notYetValidReportsNote(t *testing.T) {
+	now := time.Now()
+	certPEM, _ := certificatePairForDomains(t, now.Add(48*time.Hour), now.Add(90*24*time.Hour), "future.example.test")
+	info := FormatRuleCertInfo(certPEM, "manual", "future.example.test", "", 30, now)
+	if info.Status != "valid" {
+		t.Fatalf("status=%q, want valid（枚举不扩展，避免前端契约变更）", info.Status)
+	}
+	if !strings.Contains(info.Error, "尚未生效") {
+		t.Fatalf("error=%q, want 尚未生效说明", info.Error)
+	}
+	// 对照：已生效证书不得带该提示。
+	pastPEM, _ := certificatePairForDomains(t, now.Add(-time.Hour), now.Add(90*24*time.Hour), "active.example.test")
+	if info := FormatRuleCertInfo(pastPEM, "manual", "active.example.test", "", 30, now); info.Error != "" {
+		t.Fatalf("已生效证书 error=%q, want 空", info.Error)
+	}
+}

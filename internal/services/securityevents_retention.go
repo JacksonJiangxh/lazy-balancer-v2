@@ -108,6 +108,11 @@ func securityEventsRetentionSettings() (days, max int) {
 	return policy.Days, policy.Max
 }
 
+// 保留策略是安全事件历史的**唯一有意**删除路径：事件存放在 metrics 库
+// （不是可丢弃遥测——同库 metrics_history 可再生，事件历史不可再生），库损坏
+// 隔离重建属意外丢失，由 db 层显式披露并留痕（db.reportMetricsQuarantine）。
+// 天数与行帽双口径同时生效：先按年龄删，再按行帽裁剪最旧行。
+//
 // securityEventsRetentionCleanup deletes events older than the configured
 // retention window, then trims the oldest rows while the table still holds
 // more rows than the configured maximum. The DB handle is captured locally so

@@ -169,3 +169,47 @@ func TestMigrateTCPRuleDeadFields_clearsHTTPOnlyProxyRoutesAndStrategy(t *testin
 		t.Fatalf("http control path_rules=%d, want 1 (must be untouched)", httpPathRules)
 	}
 }
+
+// TCP 行的证书材料本身是死值触发列：enable_tls=0 AND tls_source='manual'
+// AND tls_cert<>” 既不满足其余谓词、也让传输归一（以 EnableTLS 为门）跳过，
+// 私钥正文因此可长期随备份/快照放大。迁移必须选中并清零该形态。
+func TestMigrateTCPRuleDeadFields_clearsCertMaterialWhenTLSDisabled(t *testing.T) {
+	database := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	if _, err := database.Exec("INSERT OR IGNORE INTO global_config (id, caddy_config) VALUES (1,'{}')"); err != nil {
+		t.Fatalf("seed global config: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id, name, protocol, domain, listen_port, enable_tls, tls_source, tls_cert, tls_key, compress_types, strategy)
+		VALUES ('lb_tcp_cert_only', 'tcp-cert-only', 'tcp', '', 9444, 0, 'manual', 'CERT-PEM', 'KEY-PEM', '', 'weighted_round_robin')`); err != nil {
+		t.Fatalf("seed tcp rule with cert material: %v", err)
+	}
+
+	var staleBefore int
+	if err := database.QueryRow(tcpDeadFieldsProbeSQL).Scan(&staleBefore); err != nil {
+		t.Fatalf("probe before migration: %v", err)
+	}
+	if staleBefore != 1 {
+		t.Fatalf("probe before migration=%d, want 1（证书材料列必须是触发列）", staleBefore)
+	}
+
+	if err := migrateTCPRuleDeadFields(); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	var cert, key string
+	if err := database.QueryRow(`SELECT COALESCE(tls_cert,''), COALESCE(tls_key,'') FROM lb_rules WHERE caddy_id='lb_tcp_cert_only'`).Scan(&cert, &key); err != nil {
+		t.Fatalf("read migrated rule: %v", err)
+	}
+	if cert != "" || key != "" {
+		t.Fatalf("TCP 证书材料未清零: cert=%q key=%q", cert, key)
+	}
+	var staleAfter int
+	if err := database.QueryRow(tcpDeadFieldsProbeSQL).Scan(&staleAfter); err != nil {
+		t.Fatalf("probe after migration: %v", err)
+	}
+	if staleAfter != 0 {
+		t.Fatalf("probe after migration=%d, want 0", staleAfter)
+	}
+}

@@ -43,6 +43,13 @@ var antiFallbackScanTargets = map[string][]string{
 		"buildBlockPageAttributionRoute",
 		"buildBlockPageErrorRoute",
 		"buildStaticResponseHandler",
+		// 生产读路径（规则 TLS 就绪/策略投影）与发射面（日志 encoder、受信代理
+		// 字段）——读面与运行态必须同判据，零值兜底同样不得写死。
+		"GenerateRuleServerContext",
+		"buildAccessLogEncoder",
+		"accessLogEncoderFields",
+		"trustedProxyServerFields",
+		"expandTrustedProxyRanges",
 	},
 	"security.go": {
 		"BuildCorazaDirectives",

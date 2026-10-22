@@ -2129,7 +2129,9 @@ func TestCAQueue_loadCAProvider_deleted_explicit_id_still_falls_back(t *testing.
 	if err := database.QueryRow(`SELECT id FROM ca_providers WHERE enabled=1 ORDER BY id LIMIT 1`).Scan(&firstEnabled); err != nil {
 		t.Fatalf("read enabled provider: %v", err)
 	}
-	seedRuleWithCAProvider(t, "lb_deleted_ca", "deleted-ca.example.test", 0)
+	// 规则显式选择了一个已不存在于 ca_providers 的 ID（历史/导入残留）——
+	// 「跟随默认」（0）不适用：0 语义是每次按当前默认解析，不做回退固化。
+	seedRuleWithCAProvider(t, "lb_deleted_ca", "deleted-ca.example.test", 4242)
 	jobID := seedQueuedCertJob(t, "lb_deleted_ca", "deleted-ca.example.test", 9999)
 	manager := &CAQueueManager{
 		queues:       make(map[int]*caQueue),
@@ -2319,5 +2321,43 @@ func TestCAQueueManager_StartDeferredDuringImportHold(t *testing.T) {
 	EndConfigImportHold()
 	if !manager.IsActive() {
 		t.Fatal("导入屏障解除后未兑现延迟的启动意图（证书签发永久停摆）")
+	}
+}
+
+// 材料在身的部署生命周期任务（downloaded/cleanup_*）不得被 failJob 打成终态：
+// 终态会把新证书从全部自动恢复通道摘除（部署补扫只收 downloaded/cleanup_*、
+// 续期扫描看新证不在窗口、对账只重建 issued/downloaded）→ 材料搁浅且规则无
+// TLS。与执行超时/生命周期取消同口径：保持可部署态并立即重排部署。
+func TestFailJob_materialBearingDeploymentJobStaysDeployable(t *testing.T) {
+	_, database := newClusterTestService(t)
+	if _, err := database.Exec(`INSERT INTO cert_jobs (id,rule_id,domain,status,cert_pem,key_pem) VALUES
+		(81,'lb_fail_material','fail-material.example.test','downloaded','CERT','KEY'),
+		(82,'lb_fail_material','requeue.example.test','queued','OLD-CERT','OLD-KEY')`); err != nil {
+		t.Fatalf("seed jobs: %v", err)
+	}
+
+	failJob(81, "部署回调 CAS 冲突")
+	failJob(82, "重签请求失败")
+
+	var status, message string
+	var window sql.NullString
+	if err := database.QueryRow("SELECT status, COALESCE(message,''), deployment_available_after FROM cert_jobs WHERE id=81").Scan(&status, &message, &window); err != nil {
+		t.Fatal(err)
+	}
+	if status != "downloaded" {
+		t.Fatalf("status=%q, want downloaded（材料在身不得终态化）", status)
+	}
+	if !window.Valid {
+		t.Fatal("部署窗口未推进（30s 补扫无法接管）")
+	}
+	if !strings.Contains(message, "等待重新部署") {
+		t.Fatalf("message=%q, want 说明材料已落库/等待重新部署", message)
+	}
+	// 对照：queued（显式重签请求）材料是上轮残留，失败必须是真实失败。
+	if err := database.QueryRow("SELECT status FROM cert_jobs WHERE id=82").Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "failed" {
+		t.Fatalf("queued job status=%q, want failed（重签失败不得被降级为部署重试）", status)
 	}
 }

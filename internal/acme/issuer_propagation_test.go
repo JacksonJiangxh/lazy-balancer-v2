@@ -2,6 +2,7 @@ package acme
 
 import (
 	"context"
+	"net"
 	"strings"
 	"sync"
 	"testing"
@@ -332,5 +333,37 @@ func TestIssuer_waitForDNS_rediscoveryCapped(t *testing.T) {
 	defer mu.Unlock()
 	if resolveCalls != 1+maxAuthRediscoveries {
 		t.Fatalf("resolve calls=%d, want %d（首次发现 + %d 次重发现上限）", resolveCalls, 1+maxAuthRediscoveries, maxAuthRediscoveries)
+	}
+}
+
+// 共识门只统计「命中台数」——解析器清单必须比 MinHits 有可达余量，否则境内
+// 可达解析器不足时（境外解析器被墙/被投毒的常见网络）共识永不成立，
+// 「权威全 miss、递归已传播」场景退化为烧满 5min 预算超时。
+func TestPropagationResolverListSustainsConsensus(t *testing.T) {
+	if len(propagationRecursiveResolvers) < propagationConsensusMinHits+2 {
+		t.Fatalf("解析器清单 %d 台对 MinHits=%d 无余量：任一解析器不可达即令共识不可达",
+			len(propagationRecursiveResolvers), propagationConsensusMinHits)
+	}
+	seen := make(map[string]struct{}, len(propagationRecursiveResolvers))
+	for _, resolver := range propagationRecursiveResolvers {
+		if _, err := net.ResolveUDPAddr("udp", resolver); err != nil {
+			t.Fatalf("解析器 %q 非法: %v", resolver, err)
+		}
+		if _, duplicated := seen[resolver]; duplicated {
+			t.Fatalf("解析器 %q 重复：去重后清单台数被高估", resolver)
+		}
+		seen[resolver] = struct{}{}
+	}
+	// 境内可达解析器（前五台）必须自身足以满足共识门：中国大陆网络下
+	// 境外解析器常不可达，此处按地址段显式钉死可达集合。
+	domestic := []string{"223.5.5.5:53", "119.29.29.29:53", "114.114.114.114:53", "180.76.76.76:53", "1.2.4.8:53"}
+	present := 0
+	for _, resolver := range domestic {
+		if _, ok := seen[resolver]; ok {
+			present++
+		}
+	}
+	if present < propagationConsensusMinHits {
+		t.Fatalf("境内可达解析器仅 %d 台 (< MinHits=%d)：共识门在最需要的网络里失效", present, propagationConsensusMinHits)
 	}
 }

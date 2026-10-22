@@ -2727,3 +2727,87 @@ func TestRequeueCertJobsSnapshot_uses_live_state_for_preserved_rows(t *testing.T
 		t.Fatalf("deployment_available_after=%v, want 非空（部署补扫接管）", availableAfter)
 	}
 }
+
+// 规则态纳入恢复 epoch：DisableRule 在补偿快照之后把任务置 disabled（并关闭规则），
+// 后台补偿恢复若只看「行是否有新材料」会把该行回滚成快照状态（queued/waiting_ca），
+// 让已禁用规则的任务重新可被周期扫描入队。规则已退出启用 ACME + 当前行 disabled
+// 必须视为快照后的真实成果保留。
+func TestCertJobsSnapshot_restore_preservesDisabledRowWhenRuleLeftACME(t *testing.T) {
+	_, database := newClusterTestService(t)
+	const ruleID = "lb_snapshot_disable"
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source) VALUES (?, 'snapshot-disable', 'disable.example.com', 'http', 8443, 1, 1, 'acme_dns')`, ruleID); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+	result, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,message) VALUES (?, 'disable.example.com', 'queued', '排队中')`, ruleID)
+	if err != nil {
+		t.Fatalf("seed job: %v", err)
+	}
+	jobID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("read job id: %v", err)
+	}
+	snapshot, err := SnapshotCertJobsForRule(ruleID)
+	if err != nil {
+		t.Fatalf("snapshot jobs: %v", err)
+	}
+
+	// 快照之后：DisableRule 关闭规则并把任务置 disabled（无新材料）。
+	if _, err := database.Exec(`UPDATE lb_rules SET enabled=0 WHERE caddy_id=?`, ruleID); err != nil {
+		t.Fatalf("disable rule: %v", err)
+	}
+	if _, err := database.Exec(`UPDATE cert_jobs SET status='disabled', message='规则已禁用' WHERE id=?`, jobID); err != nil {
+		t.Fatalf("disable job: %v", err)
+	}
+
+	if err := RestoreCertJobsForRule(snapshot); err != nil {
+		t.Fatalf("restore jobs: %v", err)
+	}
+
+	var status string
+	if err := db.DB.QueryRow("SELECT status FROM cert_jobs WHERE id=?", jobID).Scan(&status); err != nil {
+		t.Fatalf("read restored job: %v", err)
+	}
+	if status != "disabled" {
+		t.Fatalf("status=%q, want disabled（规则已退出启用 ACME，禁用终态不得被回滚）", status)
+	}
+	// 对照：规则仍启用 ACME 时同一形态必须照旧回滚（无材料的 UPSERT 覆写是
+	// 恢复要修的形态，不得因本条守卫放行）。
+	if _, err := database.Exec(`UPDATE lb_rules SET enabled=1 WHERE caddy_id=?`, ruleID); err != nil {
+		t.Fatalf("re-enable rule: %v", err)
+	}
+	if err := RestoreCertJobsForRule(snapshot); err != nil {
+		t.Fatalf("restore jobs (acme active): %v", err)
+	}
+	if err := db.DB.QueryRow("SELECT status FROM cert_jobs WHERE id=?", jobID).Scan(&status); err != nil {
+		t.Fatalf("read restored job: %v", err)
+	}
+	if status != "queued" {
+		t.Fatalf("status=%q, want queued（规则仍启用 ACME 时必须恢复快照态）", status)
+	}
+}
+
+// 全量暂停的在途回调等待必须共享一个截止时间：逐项各自 cancelWaitTimeout 会让
+// N 个挂起回调的最坏等待变成 N×timeout，配置导入的 PauseAndDrain（取
+// caddyOpMu 之前）在该窗口内无界。三个永不退出的回调 + 80ms 截止：总耗时
+// 必须落在「单倍截止 + 余量」内，而不是三倍。
+func TestCertificateService_pauseDeploymentRetries_sharesSingleDeadline(t *testing.T) {
+	service := NewCertificateService()
+	service.cancelWaitTimeout = 80 * time.Millisecond
+	service.deploymentTimers = make(map[int]*deploymentTimer)
+	service.deploymentCallbacks = make(map[int]map[*deploymentTimer]struct{})
+	for jobID := 1; jobID <= 3; jobID++ {
+		callback := &deploymentTimer{done: make(chan struct{}), cancel: func() {}}
+		service.deploymentCallbacks[jobID] = map[*deploymentTimer]struct{}{callback: {}}
+	}
+
+	start := time.Now()
+	service.pauseDeploymentRetries()
+	elapsed := time.Since(start)
+
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("暂停耗时 %v，want 单倍截止(~80ms)+余量（逐项等待会让 3 个回调叠加到 240ms）", elapsed)
+	}
+	if !service.timersPaused {
+		t.Fatal("暂停后 timersPaused 必须为 true")
+	}
+}

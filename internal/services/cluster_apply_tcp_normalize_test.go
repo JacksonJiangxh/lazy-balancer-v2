@@ -65,3 +65,20 @@ func TestInsertSnapshotRules_tcpZeroesHTTPOnlyFieldFamily(t *testing.T) {
 			hostHeader, healthCheckPath, enableCompress, compressTypes, bodyMax, keepalive, tokensHid)
 	}
 }
+
+// TCP 行即使 enable_tls=0 也可携带证书/私钥材料（保存族无条件清零、迁移 SQL
+// 以证书列触发）：传输归一必须以「材料存在」入选，否则该形态在主端导出/从端
+// 落库/备份导入三面分叉，私钥正文随快照放大。
+func TestNormalizeRuleForTransport_tcpClearsCertMaterialWithoutEnableTLS(t *testing.T) {
+	rule := models.LbRule{
+		CaddyID: "lb_tcpnorm_cert", Name: "tcpnorm-cert", Protocol: "tcp", ListenPort: 9001,
+		Strategy: "weighted_round_robin", Enabled: true,
+		EnableTLS: false, TLSCert: "CERT-PEM", TLSKey: "KEY-PEM",
+	}
+
+	normalizeRuleForTransport(&rule)
+
+	if rule.EnableTLS || rule.TLSCert != "" || rule.TLSKey != "" {
+		t.Fatalf("TCP 证书材料未清零: enable_tls=%v cert=%q key=%q", rule.EnableTLS, rule.TLSCert, rule.TLSKey)
+	}
+}

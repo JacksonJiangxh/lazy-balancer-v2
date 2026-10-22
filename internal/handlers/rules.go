@@ -1530,11 +1530,10 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		// 仍把已提交字节写回 LKG（restoreImportRuntime 只用运行时快照，恢复
 		// /load 失败会让 LKG 滞留未提交内容）。
 		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
-		// 新规则证书文件可能已在事务内渲染时物化——已提交视图不引用该规则，
-		// 不回退即为惰性孤儿。
-		if certErr := services.RemoveCertFiles(caddyID); certErr != nil {
-			restoreErr = errors.Join(restoreErr, certErr)
-		}
+		// 新规则证书文件可能已在事务内渲染时物化。Commit 返回错误无法区分
+		// 「未提交」与「已提交但确认丢失」（commitUncertainLabel）——清理按
+		// 已提交视图的存在性判定（见 helper 注释）。
+		restoreErr = errors.Join(restoreErr, cleanupUncommittedRuleCertsAfterCommitFailure(caddyID))
 		services.Logf("error", "CreateRule transaction commit error: %v", err)
 		// 提交后失败审计：Explicit 审计策略下提交后失败必须留痕（与
 		// respondRuleApplyError / EnableRule failEnableWithStatus 同口径）。
@@ -3546,7 +3545,10 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 	}
 
 	if err := tx.Commit(); err != nil {
-		fail(http.StatusInternalServerError, "提交复制事务失败: "+err.Error())
+		// 提交结果不可判定：不得断言「未生效」（会诱导操作者重试并产生重复
+		// 副本），文案与审计统一走 commitUncertainLabel（与其余规则端点同源）。
+		services.Logf("error", "DuplicateRule transaction commit failed for caddy_id=%s (new=%s): %v", caddyID, newCaddyID, err)
+		fail(http.StatusInternalServerError, commitUncertainLabel+"："+err.Error())
 		return
 	}
 	committed = true
@@ -3961,6 +3963,13 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 	isACME := ruleProtocol == "http" && enableTLS && tlsSource == "acme_dns" && ruleDomain != ""
 	var certJobsSnapshot services.CertJobsSnapshot
 	if isACME {
+		// 启用路径补 ACME 域名形状校验：v2 导入对禁用行不做该校验（启用行才校验），
+		// 非法域名集（如 "a.com,b.com,c.com"）会随导入落库；启用时若不在这里拦下，
+		// 入队阶段才以 certEnqueue 的默认映射冒 500。与创建/更新/预校验同口径 400。
+		if err := services.ValidateACMEDomains(ruleDomain); err != nil {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
+			return
+		}
 		certJobsSnapshot, err = services.SnapshotCertJobsForRule(caddyID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "备份证书任务失败: " + err.Error()})
@@ -4020,6 +4029,12 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 		//  +：commit 失败统一走已提交视图恢复
 		//（回滚事务 + 重渲染 /load + 回退 LKG/投影/证书物化）。
 		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
+		services.Logf("error", "EnableRule transaction commit failed for caddy_id=%s: %v", caddyID, err)
+		// 提交后失败审计：Explicit 审计策略下中间件不兜底，提交结果不确定
+		// （磁盘满/IO/确认丢失）这一最需追溯的场景必须留痕——与创建/更新/
+		// 删除/禁用四端点逐字同口径。
+		recordAudit(c, "启用失败", "负载规则", services.FormatAuditDetail(
+			services.AuditRulePart(caddyID), commitUncertainLabel+"："+errors.Join(err, restoreErr).Error(), services.AuditResultPart("failure")))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + "：" + errors.Join(err, restoreErr).Error()})
 		return
 	}
@@ -4283,6 +4298,25 @@ func ruleExistsByCaddyID(caddyID string) (bool, error) {
 	return count > 0, nil
 }
 
+// cleanupUncommittedRuleCertsAfterCommitFailure 在 CreateRule 的 Commit 结果
+// 不确定时清理新规则的证书文件。判据是「已提交视图是否引用该规则」：
+// Commit 返回错误无法区分未提交与已提交但确认丢失——若提交实际生效，恢复链
+// 刚按已提交视图重新物化的 cert/key 正是 /load 已下发的材料，删除会让 DB 与
+// 运行配置指向不存在的文件（下一次重载/重启校验失败、该域名 TLS 中断，且无
+// 自动收敛路径）。只有规则确实不存在时才删，孤儿形态由证书目录 GC 兜底。
+// 存在性查询失败同样不删（误删切证书的代价远高于惰性孤儿）。
+func cleanupUncommittedRuleCertsAfterCommitFailure(caddyID string) error {
+	exists, err := ruleExistsByCaddyID(caddyID)
+	if err != nil {
+		services.Logf("error", "CreateRule commit 失败后无法判定规则 %s 是否已提交（跳过证书文件清理，残留由 GC 兜底）: %v", caddyID, err)
+		return nil
+	}
+	if exists {
+		return nil
+	}
+	return services.RemoveCertFiles(caddyID)
+}
+
 // abortIfRuleDeleted 复核 UpdateRule 主动放锁窗口结束后规则是否仍存在。
 // 域名迁移/证书任务取消路径会临时放开 caddyOpMu，
 // 窗口内并发的 DeleteRule 可以完整提交；若本请求随后继续，任何失败分支的
@@ -4473,6 +4507,7 @@ func (h *Handlers) DisableRule(c *gin.Context) {
 		//  +：commit 失败统一走已提交视图恢复
 		//（回滚事务 + 重渲染 /load + 回退 LKG/投影/证书物化）。
 		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
+		services.Logf("error", "DisableRule transaction commit failed for caddy_id=%s: %v", caddyID, err)
 		// 提交后失败审计：提交失败留痕（Explicit 审计策略）。
 		recordAudit(c, "禁用失败", "负载规则", services.FormatAuditDetail(
 			services.AuditRulePart(caddyID), commitUncertainLabel+"："+errors.Join(err, restoreErr).Error(), services.AuditResultPart("failure")))

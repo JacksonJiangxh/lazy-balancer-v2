@@ -552,13 +552,14 @@ func (s *CaddyService) ApplyLastKnownGood() error {
 // ApplyConfigFromTx 仍是最终门控，校验器故障不得阻断全部写入。
 var ErrCLIValidatorUnavailable = errors.New("caddy CLI validator unavailable")
 
-// ErrCLIValidationSkipped 标记「校验器未装配」（EnableCLIValidation 未被调用 /
-// 测试未注入）——候选配置从未经过 Caddy 级预检。审计项：此前 cliValidate==nil
-// 时直接返回 nil，被上层当作「已校验」（生产不可达、测试可达，但语义错误：
-// 一旦装配路径回归，未经校验的候选会走「CLI 已通过 + 应用失败可退化提交」
-// 分支）。本哨兵包装 ErrCLIValidatorUnavailable，既有 errors.Is 判定保持
-// 「不可用→放行但记录未校验」语义，消费方可额外区分「未启用」与「故障」。
-var ErrCLIValidationSkipped = fmt.Errorf("%w: validator not enabled (EnableCLIValidation not called)", ErrCLIValidatorUnavailable)
+// cliValidatorNotEnabledError 标记「校验器未装配」（EnableCLIValidation 未被
+// 调用 / 测试未注入）——候选配置从未经过 Caddy 级预检。与真正故障同属
+// ErrCLIValidatorUnavailable（调用方按统一「不可用→记录后放行」处理），
+// 消息保留具体原因供日志排障；不再暴露独立哨兵——其「可区分」契约没有任何
+// 消费方（文案/日志/审计两条路径完全相同），层级只会误导读者以为存在分支。
+func cliValidatorNotEnabledError() error {
+	return fmt.Errorf("%w: validator not enabled (EnableCLIValidation not called)", ErrCLIValidatorUnavailable)
+}
 
 // caddyCLIValidateTimeout 是 CLI 校验子进程的超时。var 而非 const：测试需注入
 // 毫秒级超时驱动「超时=校验器不可用」分支（sleep 60s 的测试不可接受）。
@@ -679,7 +680,7 @@ func (s *CaddyService) ValidateTxRenderViaCLI(tx *sql.Tx, rulesWrittenInTx bool)
 	s.mu.Unlock()
 	if validator == nil {
 		Logf("warn", "caddy CLI 校验器未装配：本次写入未经 Caddy 级预检（事务内应用仍为最终门控）")
-		return ErrCLIValidationSkipped
+		return cliValidatorNotEnabledError()
 	}
 	// 渲染会写 IP 名单投影；CLI 拒绝时必须自回滚，不能依赖每个调用方
 	//成功路径保留新投影供随后的 ApplyConfigFromTx 使用。
@@ -723,7 +724,7 @@ func (s *CaddyService) ValidateJSONViaCLI(data []byte) error {
 	s.mu.Unlock()
 	if validator == nil {
 		Logf("warn", "caddy CLI 校验器未装配：本份原始配置未经 Caddy 级预检")
-		return ErrCLIValidationSkipped
+		return cliValidatorNotEnabledError()
 	}
 	if err := validator(data); err != nil {
 		if errors.Is(err, ErrCLIValidatorUnavailable) {
@@ -1321,10 +1322,11 @@ func ExtractMetricLabel(metricName string, label string) string {
 }
 
 // GenerateCaddyConfig generates Caddy configuration from database
+// 渲染链全程只读（Query/QueryRow）；写接口不属于本契约——曾有的 Exec 零调用点，
+// 保留只会误导读者以为渲染会写库，并迫使未来替身实现不需要的写方法。
 type caddyConfigStore interface {
 	Query(string, ...any) (*sql.Rows, error)
 	QueryRow(string, ...any) *sql.Row
-	Exec(string, ...any) (sql.Result, error)
 }
 
 // securityPolicyContext 是生成期批量预载的安全策略状态：每个规则绑定的全部
@@ -1821,13 +1823,13 @@ func mergeTrustedProxyServerFields(servers map[string]interface{}, store caddyCo
 // 非 acme 规则的历史 PEM 都会在每次全量生成时载入内存，而后置消费方
 // （resolveACMECert 仅按 allRules 中 acme_dns 规则查表、SelectCertificate
 // 跳过 disabled）根本不会使用这些行——过滤前移只减 IO/内存，不改变候选集语义。
-const acmeCertCandidatesQuery = `
+// var（非 const）：谓词由 CertJobMaterialPredicateSQL（带 alias 的函数）单源
+// 生成——本查询在包初始化时求值一次。
+var acmeCertCandidatesQuery = `
 	SELECT rule_id, id, domain, status, cert_pem, key_pem,
 	       COALESCE(julianday(COALESCE(updated_at, created_at)), 0)
 	FROM cert_jobs
-	WHERE cert_pem IS NOT NULL AND cert_pem <> ''
-	  AND key_pem IS NOT NULL AND key_pem <> ''
-	  AND status != 'disabled'
+	WHERE ` + CertJobMaterialPredicateSQL("") + `
 	  AND rule_id IN (SELECT caddy_id FROM lb_rules WHERE enabled = 1 AND enable_tls = 1 AND tls_source = 'acme_dns')
 	ORDER BY updated_at DESC, id DESC
 `
@@ -2281,6 +2283,11 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 
 	httpServersByPort := make(map[int][]ruleWithUpstreams)
 	tcpServersByPort := make(map[int][]ruleWithUpstreams)
+	// 发布集与按端口分组在同一遍历内收集（allRules/rowid 序）——此前在
+	// logger_names 构建处再由 httpServersByPort（map 遍历）重建：多一次全量
+	// 拷贝，且顺序来源依赖 map。消费面（按端口分组 + map 键）当前不依赖
+	// 跨端口序，但顺序确定化是不变量，避免未来消费方引入「随 map 序漂移」。
+	publishedHTTPRules := make([]ruleWithUpstreams, 0, len(allRules))
 
 	for _, ru := range allRules {
 		r := ru.rule
@@ -2324,6 +2331,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 
 		if r.Protocol == "http" {
 			httpServersByPort[r.ListenPort] = append(httpServersByPort[r.ListenPort], ru)
+			publishedHTTPRules = append(publishedHTTPRules, ru)
 		} else {
 			tcpServersByPort[r.ListenPort] = append(tcpServersByPort[r.ListenPort], ru)
 		}
@@ -2790,10 +2798,8 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 	// TLS 证书未就绪整条跳过）才建 logger 与 logs 条目。未发布规则没有任何
 	// 路由，为其注册 logger_names 只会得到永不命中的日志器与 logs map 项
 	// （日志写盘面虚增、配置噪声）；规则恢复发布时下一次渲染自然恢复条目。
-	publishedHTTPRules := make([]ruleWithUpstreams, 0, len(allRules))
-	for _, rules := range httpServersByPort {
-		publishedHTTPRules = append(publishedHTTPRules, rules...)
-	}
+	// 发布集（publishedHTTPRules）已在主循环内按 allRules 顺序收集——
+	// 不再由 httpServersByPort（map 遍历）重建，见其声明处注释。
 	loggerNamesByPort := map[int]map[string]interface{}{}
 	for _, ru := range publishedHTTPRules {
 		r := ru.rule
@@ -2996,7 +3002,9 @@ func buildCaddyLogging(level string, sizeMB int) map[string]interface{} {
 				"level":   level,
 				"writer":  fileWriter("/app/logs/caddy.log"),
 				"encoder": consoleEncoder,
-				"exclude": []string{"http", "tls", "http.log.access"},
+				// exclude 是命名空间前缀匹配："http" 已覆盖 http.log.access
+				// （重复项只增加配置字节噪声）。
+				"exclude": []string{"http", "tls"},
 			},
 			"caddy_tls": map[string]interface{}{
 				"level":   level,
@@ -3575,9 +3583,8 @@ func GenerateSingleRuleCaddyConfig(rule SingleRuleConfig) map[string]interface{}
 
 		// 单规则形态仅服务 TCP/HTTP 预检（rule_features.go precheckRuleConfig
 		// 不填 EnableTLS/TLSHTTPRedirect）——HTTP→HTTPS 跳转路由由全量渲染的
-		// redirectRoutes 统一生成，此处不插跳转分支（历史死分支已删除：其
-		// automatic_https 仅对非 80/443 发射，与全量分支「全部 {disable:true}」
-		// 口径分叉，启用即静默行为分叉）。
+		// redirectRoutes 统一生成，此处不插跳转分支。automatic_https 与全量
+		// 渲染同判据（恒 disable，见下方发射点）。
 		routeValues := make([]interface{}, len(routes))
 		for i, r := range routes {
 			routeValues[i] = r
@@ -3604,10 +3611,12 @@ func GenerateSingleRuleCaddyConfig(rule SingleRuleConfig) map[string]interface{}
 			}
 		}
 
-		if rule.ListenPort != 443 && rule.ListenPort != 80 {
-			server["automatic_https"] = map[string]interface{}{
-				"disable": true,
-			}
+		// 与全量渲染同判据：引擎 auto-HTTPS 一律关闭（证书签发/续期由
+		// cert_jobs 全权管理，跳转由 redirectRoutes 管理）。此前仅对非 80/443
+		// 端口发射 disable，是第二套约定——一旦该函数被用于真实应用（或补上
+		// EnableTLS 回填），443 服务器会重新打开引擎 ACME，与项目证书链分叉。
+		server["automatic_https"] = map[string]interface{}{
+			"disable": true,
 		}
 
 		servers[serverName] = server

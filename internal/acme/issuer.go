@@ -143,11 +143,21 @@ func (i *Issuer) Issue(ctx context.Context, domains []string) (certPEM, keyPEM s
 		}
 
 		zone := zoneFromDomain(domain)
-		log("cleanup_dns", fmt.Sprintf("清理可能残留的 TXT 记录 %s", tokenFQDN))
-		// 按本次挑战值定向清理：同名记录中属于并发签发（不同值）的记录
-		// 必须保留，只清掉本值残留与陈旧遗留
-		if err := dnsprovider.CleanUpChallenge(ctx, i.Provider, zone, tokenFQDN, keyAuth); err != nil {
-			log("cleanup_warning", fmt.Sprintf("清理旧 TXT 记录失败 %s: %v", tokenFQDN, err))
+		// 在途登记必须先于预清理：CA 复用 pending 授权时两条订单会拿到同一
+		// token → 同一 keyAuth（Let's Encrypt reuseValidAuthz 长期开启），按值
+		// 清理无法从记录本身区分两条在途签发。登记返回 first=false 表示另一次
+		// 签发仍持有同名同值记录——此时预清理会删掉对方仍在等待验证的 TXT，
+		// 必须跳过；最后由最后结束的签发统一回收（同值记录删一次即全清）。
+		claim, firstClaim := dnsprovider.ClaimChallengeValue(zone, tokenFQDN, keyAuth)
+		if firstClaim {
+			log("cleanup_dns", fmt.Sprintf("清理可能残留的 TXT 记录 %s", tokenFQDN))
+			// 按本次挑战值定向清理：同名记录中属于并发签发（不同值）的记录
+			// 必须保留，只清掉本值残留与陈旧遗留
+			if err := dnsprovider.CleanUpChallenge(ctx, i.Provider, zone, tokenFQDN, keyAuth); err != nil {
+				log("cleanup_warning", fmt.Sprintf("清理旧 TXT 记录失败 %s: %v", tokenFQDN, err))
+			}
+		} else {
+			log("cleanup_dns", fmt.Sprintf("同名同值的并发签发仍在进行，跳过预清理 %s（由最后结束的签发统一回收）", tokenFQDN))
 		}
 
 		log("presenting_dns", fmt.Sprintf("写入 TXT 记录 %s, 值: %s", tokenFQDN, keyAuth))
@@ -160,6 +170,7 @@ func (i *Issuer) Issue(ctx context.Context, domains []string) (certPEM, keyPEM s
 			Domain:    domain,
 			TokenFQDN: tokenFQDN,
 			Value:     keyAuth,
+			claim:     claim,
 		})
 		if err := i.Provider.Present(ctx, zone, tokenFQDN, keyAuth, 600); err != nil {
 			return "", "", fmt.Errorf("present dns for %s: %w", domain, err)
@@ -302,8 +313,19 @@ func (i *Issuer) finalizeOrder(ctx context.Context, finalizeURL string, csr []by
 }
 
 // Cleanup removes DNS TXT records for all previously presented challenges.
+//
+// 每个挑战的注销先于按值清理：Release 返回 false 表示仍有其他在途签发持有同名
+// 同值记录（CA 复用授权 → 同一 keyAuth），本次清理必须跳过——删掉的是对方仍在
+// 等待验证的 TXT；最后结束的那次签发在 Release 时拿回判定权，一次回收全部同值
+// 记录。未登记注销的 ChallengeInfo（测试/外部构造）按无并发处理。
 func (i *Issuer) Cleanup(ctx context.Context, challenges []ChallengeInfo) {
 	for _, ci := range challenges {
+		if ci.claim != nil && !ci.claim.Release() {
+			if i.Logger != nil {
+				i.Logger.Log("cleanup_dns", fmt.Sprintf("同名同值的并发签发仍在进行，跳过清理 %s（由最后结束的签发统一回收）", ci.TokenFQDN))
+			}
+			continue
+		}
 		if err := dnsprovider.CleanUpChallenge(ctx, i.Provider, zoneFromDomain(ci.Domain), ci.TokenFQDN, ci.Value); err != nil {
 			if i.Logger != nil {
 				i.Logger.Log("cleanup_warning", fmt.Sprintf("清理 DNS 记录失败 %s: %v", ci.TokenFQDN, err))
@@ -347,6 +369,9 @@ type ChallengeInfo struct {
 	// was presented with; cleanup removes only records of that value so
 	// concurrent issuances for the same domain cannot delete each other.
 	Value string
+	// claim 是本次挑战值的进程内在途登记（Issuer.Cleanup 注销后才允许按值
+	// 清理）。未登记（零值）时按无并发处理，保持对外结构的可构造性。
+	claim *dnsprovider.ChallengeClaim
 }
 
 // zoneFromDomain extracts the DNS zone (registered domain) from a domain name.
@@ -687,11 +712,23 @@ var (
 	resolveAuthoritativeNSFn = resolveAuthoritativeNS
 	// propagationRecursiveResolvers 公共递归清单（中国友好解析器在前）——
 	// 单源：waitForDNS 共识统计与 checkRecursiveDNS 共用。
+	//
+	// 清单必须让「中国大陆可达的解析器 ≥ MinHits(3)」成立：8.8.8.8/1.1.1.1 在中国
+	// 大陆常不可达或被投毒，而共识门只看命中台数——清单不足时「权威全 miss、
+	// 递归已传播」（CNAME 委托/NS 变更/集群分裂）在最需要该机制的网络上恒超时，
+	// 白烧一次 CA 配额。前五台为境内可达解析器（223.5.5.5/119.29.29.29/
+	// 114.114.114.114/180.76.76.76/1.2.4.8），后三台为境外补充（9.9.9.9/8.8.8.8/
+	// 1.1.1.1）——任一网络下只要境内三台可达即满足共识门，境外掉线不再把上限
+	// 压到 2。
 	propagationRecursiveResolvers = []string{
-		"223.5.5.5:53",    // Alibaba AliDNS
-		"119.29.29.29:53", // Tencent DNSPod
-		"8.8.8.8:53",      // Google Public DNS
-		"1.1.1.1:53",      // Cloudflare
+		"223.5.5.5:53",       // Alibaba AliDNS
+		"119.29.29.29:53",    // Tencent DNSPod
+		"114.114.114.114:53", // 114DNS（境内）
+		"180.76.76.76:53",    // Baidu DNS（境内）
+		"1.2.4.8:53",         // CNNIC sDNS（境内）
+		"9.9.9.9:53",         // Quad9（境外）
+		"8.8.8.8:53",         // Google Public DNS（境外）
+		"1.1.1.1:53",         // Cloudflare（境外）
 	}
 	// propagationPollInterval 探测轮询间隔（生产 3s）。
 	propagationPollInterval = 3 * time.Second

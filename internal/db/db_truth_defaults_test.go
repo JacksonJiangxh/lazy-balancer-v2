@@ -569,14 +569,18 @@ func TestRunMigrationsBackfillsEmptyTimezone(t *testing.T) {
 // （health_check_timeout 旧默认 5、request_body 兜底失效的事故形态）。
 // 机械门：交集列在 fresh 库取 pragma_table_info，再用登记 dtype 在探针表
 // ALTER 补列取 pragma，逐字段比对。有意分叉列登记白名单并携理由。
+// allowedNewColumnDivergence 是「fresh DDL 与 newColumns 双通道有意分叉」的
+// 白名单（键 → 理由），供 shape 相等门登记例外。当前为空（无已知有意分叉：
+// ALTER 不支持的非常量 DEFAULT 列本就不在交集内）；登记即生效，无需改判定
+// 逻辑——删掉分支留待「真正出现分叉」再写会让门失去现成的登记点。
+var allowedNewColumnDivergence = map[string]string{}
+
 func TestNewColumnsDualRegistered_matchFreshColumnShape(t *testing.T) {
 	database := openMigrationTestDB(t)
 	if err := createTables(); err != nil {
 		t.Fatalf("create tables: %v", err)
 	}
-	// 有意双通道分叉白名单（键 → 理由）。ALTER ADD COLUMN 不支持非常量
-	// DEFAULT（如 (datetime('now'))），时间戳默认值列双通道天然分叉。
-	allowedDivergence := map[string]string{}
+	// 有意双通道分叉白名单见 allowedNewColumnDivergence（包级 var + 理由）。
 	if _, err := database.Exec(`CREATE TABLE shape_probe (id INTEGER)`); err != nil {
 		t.Fatalf("create shape probe: %v", err)
 	}
@@ -601,7 +605,7 @@ func TestNewColumnsDualRegistered_matchFreshColumnShape(t *testing.T) {
 		}
 		dualRegistered++
 		if _, err := database.Exec(`ALTER TABLE shape_probe ADD COLUMN ` + column + ` ` + newColumnsRegistry[key]); err != nil {
-			if reason, ok := allowedDivergence[key]; ok {
+			if reason, ok := allowedNewColumnDivergence[key]; ok {
 				t.Logf("%s: ALTER 不支持登记形状（白名单：%s）：%v", key, reason, err)
 				continue
 			}
@@ -624,7 +628,7 @@ func TestNewColumnsDualRegistered_matchFreshColumnShape(t *testing.T) {
 		if !diverged {
 			continue
 		}
-		if reason, ok := allowedDivergence[key]; ok {
+		if reason, ok := allowedNewColumnDivergence[key]; ok {
 			t.Logf("%s: 白名单分叉（%s）：fresh={%s,%d,%v} alter={%s,%d,%v}", key, reason, freshType, freshNotNull, freshDefault, alterType, alterNotNull, alterDefault)
 			continue
 		}

@@ -385,7 +385,7 @@ func (p *Provider) apiCall(ctx context.Context, method string, params url.Values
 	// 整读既无诊断增量又可能把响应体读进内存。
 	if resp.StatusCode >= http.StatusBadRequest {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, httpErrorBodyLimit))
-		return fmt.Errorf("%s failed: HTTP %d: %s", method, resp.StatusCode, sanitizeHTTPErrorBody(string(body)))
+		return fmt.Errorf("%s failed: HTTP %d: %s", method, resp.StatusCode, sanitizeHTTPErrorBody(string(body), p.loginToken))
 	}
 	if result != nil {
 		if err := json.NewDecoder(resp.Body).Decode(result); err != nil {
@@ -399,20 +399,66 @@ func (p *Provider) apiCall(ctx context.Context, method string, params url.Values
 	return nil
 }
 
-// loginTokenEchoPattern 匹配中间网关/WAF 拦截页可能回声的 POST 表单凭据
-// （login_token=<id>,<key>）。错误体取样会经 failJob 落 cert_jobs 文案与
-// 任务日志（全体登录用户可读），凭据回声必须脱敏后才允许进入错误链。
-var loginTokenEchoPattern = regexp.MustCompile(`login_token=[^&\s"']+`)
+// credentialEchoPattern 匹配中间网关/WAF 拦截页可能回声的凭据形态：表单
+// （login_token=<id>,<key>）、URL 查询式与 JSON 键值（"login_token": "…"）。
+// 形态正则只是兜底——真正的保证来自按已知凭据明文的定向替换（见
+// sanitizeHTTPErrorBody），形态不匹配时宁可整段丢弃。
+var credentialEchoPattern = regexp.MustCompile(`(?i)(login_token\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s&;"'}\]]+)`)
 
-// sanitizeHTTPErrorBody 脱敏 HTTP 错误响应体取样：login_token 参数值替换为
-// ***；替换后仍残留 login_token= 形态（非 & 分隔等异常编码）时整段丢弃
-// （fail-closed），只保留长度指纹——凭据不进日志优先于排障原文。
-func sanitizeHTTPErrorBody(body string) string {
-	redacted := loginTokenEchoPattern.ReplaceAllString(body, "login_token=***")
-	if strings.Contains(redacted, "login_token=") && !strings.Contains(redacted, "login_token=***") {
+// credentialEchoSecretMinLen 是凭据分段参与定向替换的最小长度：login_token
+// 为 "id,key" 形态，任一分段被单独回声都等价于泄露，但过短的分段（如短 ID）
+// 在任意文案里全局替换会伤及排障上下文，故只纳充分长的分段。
+const credentialEchoSecretMinLen = 8
+
+// credentialEchoSecrets 展开一段凭据的全部已知明文形态：完整值 + 各分段
+// （逗号/空白分隔），排除过短分段。返回顺序保持「长值在前」，定向替换先命中
+// 完整值再兜分段，避免同一片段被重复替换成多重掩码。
+func credentialEchoSecrets(secret string) []string {
+	secret = strings.TrimSpace(secret)
+	if secret == "" {
+		return nil
+	}
+	secrets := []string{secret}
+	for _, part := range strings.FieldsFunc(secret, func(r rune) bool {
+		return r == ',' || r == '\t' || r == '\n' || r == ' ' || r == ';'
+	}) {
+		part = strings.TrimSpace(part)
+		if len(part) >= credentialEchoSecretMinLen && part != secret {
+			secrets = append(secrets, part)
+		}
+	}
+	return secrets
+}
+
+// sanitizeHTTPErrorBody 脱敏错误文案：先按已知凭据明文（variadic secrets）做
+// 定向替换，再用形态正则兜底，与回声的编码形态无关。两者都没覆盖到的残余
+// 凭据痕迹（login_token 字样存在但无掩码）或已知明文残留一律整段丢弃
+// （fail-closed，只保留长度指纹）——凭据不进日志优先于排障原文。
+func sanitizeHTTPErrorBody(body string, secrets ...string) string {
+	redacted := body
+	for _, secret := range secrets {
+		for _, known := range credentialEchoSecrets(secret) {
+			redacted = strings.ReplaceAll(redacted, known, "***")
+		}
+	}
+	redacted = credentialEchoPattern.ReplaceAllString(redacted, "${1}***")
+	for _, secret := range secrets {
+		for _, known := range credentialEchoSecrets(secret) {
+			if strings.Contains(redacted, known) {
+				return fmt.Sprintf("[response body withheld: %d bytes]", len(body))
+			}
+		}
+	}
+	if strings.Contains(strings.ToLower(redacted), "login_token") && !strings.Contains(redacted, "***") {
 		return fmt.Sprintf("[response body withheld: %d bytes]", len(body))
 	}
 	return strings.TrimSpace(redacted)
+}
+
+// sanitizeMessage 让业务层 status.message（厂商/中间网关可能回声凭据）与
+// HTTP 错误体共用同一脱敏口径：所有拼进错误链的外部文本都必须经过本包装。
+func (p *Provider) sanitizeMessage(message string) string {
+	return sanitizeHTTPErrorBody(message, p.loginToken)
 }
 
 // flexNumber 接受 DNSPod 数字字段的历史两种形态（JSON 数字与带引号字符串）。
@@ -509,7 +555,7 @@ func (p *Provider) getDomainID(ctx context.Context, zone string) (string, error)
 			return "", err
 		}
 		if result.Status.Code.String() != "1" {
-			return "", fmt.Errorf("Domain.List failed: %s", result.Status.Message)
+			return "", fmt.Errorf("Domain.List failed: %s", p.sanitizeMessage(result.Status.Message))
 		}
 		for _, d := range result.Domains {
 			if d.Name == zone {
@@ -550,7 +596,7 @@ func (p *Provider) createRecord(ctx context.Context, domainID, subDomain, value 
 		return "", err
 	}
 	if result.Status.Code.String() != "1" {
-		err := fmt.Errorf("Record.Create failed: %s", result.Status.Message)
+		err := fmt.Errorf("Record.Create failed: %s", p.sanitizeMessage(result.Status.Message))
 		if isDomainGoneStatus(result.Status.Code.String(), result.Status.Message) {
 			// 标记「域名不存在」类错误，供 Present 作废缓存重试。
 			err = errors.Join(err, errStaleDomainID)
@@ -581,7 +627,7 @@ func (p *Provider) deleteRecord(ctx context.Context, domainID, recordID string) 
 		// 记录ID错误（记录已不存在）：按删除成功处理，保证清理幂等
 		return nil
 	}
-	err := fmt.Errorf("Record.Remove failed: %s", result.Status.Message)
+	err := fmt.Errorf("Record.Remove failed: %s", p.sanitizeMessage(result.Status.Message))
 	if isDomainGoneStatus(result.Status.Code.String(), result.Status.Message) {
 		// 与 createRecord 同判据标记「域名不存在」类
 		// 错误，供 cleanUp 作废缓存重试（Present 侧自愈的删除侧对偶）。

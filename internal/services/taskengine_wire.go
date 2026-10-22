@@ -413,8 +413,9 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 				}
 				return nil
 			}
-			CertWaitingCATickOnce()
-			return nil
+			// 三路扫描的读失败上抛（task_runs 失败终态）——此前恒 return nil，
+			// 持续性读故障下证书自动恢复停摆而任务监控全绿。
+			return CertWaitingCATickOnce()
 		},
 	})
 

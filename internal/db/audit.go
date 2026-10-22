@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,6 +23,10 @@ func InitializeAuditDB(dataDir string) error {
 	if err := prepareSQLiteDatabase(path); err != nil {
 		return fmt.Errorf("failed to secure audit database: %w", err)
 	}
+	// 池尺寸有意与 metrics 不统一：metrics 要求 MaxIdle==MaxOpen（安静期
+	// last-close 会触发 checkpoint + 删 -wal 风暴，见 openAndPingMetricsDB）；
+	// 审计库写更稀疏且库文件小得多，last-close 的单次 checkpoint 成本可忽略，
+	// 允许收缩到 2 条空闲连接把句柄还给系统。主库 10/5 的余量服务面板并发读。
 	auditDB, err := openSQLiteDB(path, sqlitePoolConfig{maxOpen: 5, maxIdle: 2, connMaxLifetime: 30 * time.Minute})
 	if err != nil {
 		return fmt.Errorf("failed to open audit database: %w", err)
@@ -131,6 +136,14 @@ const auditMigrationStateTable = `CREATE TABLE IF NOT EXISTS audit_migration_sta
 	name TEXT PRIMARY KEY,
 	fingerprint TEXT NOT NULL
 )`
+
+// auditLegacyConflictMarkerName 是「主库旧审计表与审计库处于已知冲突态」的
+// 状态标记名：指纹（行数/MIN/MAX/SUM(id)）命中即跳过重复跨库复制与全表校验，
+// 冲突解除（主表被人工删除）时自动清除。
+const auditLegacyConflictMarkerName = "legacy_audit_conflict_fingerprint"
+
+// auditLegacyConflictSkips 观测：已知冲突态指纹命中而跳过重复迁移的启动次数。
+var auditLegacyConflictSkips atomic.Int64
 
 // auditVocabularyFingerprint 是归一表内容指纹（条目与两侧字段逐字节参与）。
 func auditVocabularyFingerprint() string {
@@ -302,6 +315,54 @@ func flushSystemAuditLogs() {
 	}
 }
 
+// legacyAuditTableFingerprint 是主库旧审计表的廉价内容指纹（行数/MIN/MAX/
+// SUM(id)）：仅判定「是否还是上次核对的同一批数据」，不复用于正确性判定。
+func legacyAuditTableFingerprint(ctx context.Context, conn *sql.Conn) (string, error) {
+	var rows, minID, maxID, sumID int64
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(MIN(id),0), COALESCE(MAX(id),0), COALESCE(SUM(id),0) FROM main.audit_log`).Scan(&rows, &minID, &maxID, &sumID); err != nil {
+		return "", fmt.Errorf("failed to fingerprint legacy audit table: %w", err)
+	}
+	return fmt.Sprintf("rows=%d;min=%d;max=%d;sum=%d", rows, minID, maxID, sumID), nil
+}
+
+// auditMigrationStateValue 读审计库迁移状态标记（表/行缺失或读失败均返回空，
+// 调用方按「无标记」处理——标记只影响性能，不影响正确性）。
+func auditMigrationStateValue(name string) string {
+	if AuditDB == nil {
+		return ""
+	}
+	var stored string
+	if err := AuditDB.QueryRow(`SELECT fingerprint FROM audit_migration_state WHERE name=?`, name).Scan(&stored); err != nil {
+		return ""
+	}
+	return stored
+}
+
+// writeAuditMigrationState 幂等写迁移状态标记（审计库未就绪时跳过并留痕）。
+func writeAuditMigrationState(name, fingerprint string) {
+	if AuditDB == nil {
+		return
+	}
+	if _, err := AuditDB.Exec(auditMigrationStateTable); err != nil {
+		log.Printf("audit migration state unavailable (%v); marker %s not persisted", err, name)
+		return
+	}
+	if _, err := AuditDB.Exec(`INSERT INTO audit_migration_state (name, fingerprint) VALUES (?, ?)
+		ON CONFLICT(name) DO UPDATE SET fingerprint=excluded.fingerprint`, name, fingerprint); err != nil {
+		log.Printf("audit migration state write failed (%s): %v", name, err)
+	}
+}
+
+// clearAuditMigrationState 删除迁移状态标记；仅在标记存在时删除（收敛库零写）。
+func clearAuditMigrationState(name string) {
+	if AuditDB == nil || auditMigrationStateValue(name) == "" {
+		return
+	}
+	if _, err := AuditDB.Exec(`DELETE FROM audit_migration_state WHERE name=?`, name); err != nil {
+		log.Printf("audit migration state clear failed (%s): %v", name, err)
+	}
+}
+
 func migrateLegacyAuditLogs(mainDB *sql.DB, auditPath string) error {
 	if mainDB == nil {
 		return nil
@@ -318,6 +379,22 @@ func migrateLegacyAuditLogs(mainDB *sql.DB, auditPath string) error {
 		return err
 	}
 	if tableCount == 0 {
+		// 迁移已完成/冲突已解除（主表已被人工删除）：清除已知冲突态标记，
+		// 后续启动零写。
+		clearAuditMigrationState(auditLegacyConflictMarkerName)
+		return nil
+	}
+	// 已知冲突态（主库旧表与审计库来自不同时点/节点，仅人工恢复旧主库副本
+	// 可达）持久化：人工处理前不再每启动重跑「ATTACH + INSERT OR IGNORE 全表
+	// 复制 + 两次全表 mismatch 校验」——历史库可达数十万行。指纹只作跳过判据
+	//（廉价 COUNT/MIN/MAX/SUM(id)），正确性仍由首次核对与人工核对承担。
+	fingerprint, err := legacyAuditTableFingerprint(ctx, conn)
+	if err != nil {
+		return err
+	}
+	if stored := auditMigrationStateValue(auditLegacyConflictMarkerName); stored != "" && stored == fingerprint {
+		auditLegacyConflictSkips.Add(1)
+		log.Printf("WARN: 主库旧审计表与审计库仍处于已知冲突态（%s），跳过重复复制与校验并保留主库 audit_log 表；人工核对完成后删除该表即可完成迁移", fingerprint)
 		return nil
 	}
 	if _, err := conn.ExecContext(ctx, "ATTACH DATABASE ? AS audit_migration", auditPath); err != nil {
@@ -370,8 +447,11 @@ func migrateLegacyAuditLogs(mainDB *sql.DB, auditPath string) error {
 		detail := fmt.Sprintf("启动迁移：旧审计表与审计库存在 %d 行冲突，已跳过迁移并保留主库 audit_log 表（冲突行需人工核对；确认后可手动删除主库 audit_log 表完成迁移）", mismatch)
 		log.Print("WARN: " + detail)
 		recordSystemAudit("启动迁移", "操作日志", detail)
+		writeAuditMigrationState(auditLegacyConflictMarkerName, fingerprint)
 		return nil
 	}
+	// 无冲突：清除可能存在的旧冲突标记后删除旧表（收敛库零写）。
+	clearAuditMigrationState(auditLegacyConflictMarkerName)
 	if _, err := mainDB.Exec("DROP TABLE audit_log"); err != nil {
 		return fmt.Errorf("failed to remove legacy audit table: %w", err)
 	}

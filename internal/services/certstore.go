@@ -478,7 +478,7 @@ func MaterializeAllCertsFromDB() {
 	// 可能重建旧域证书。取每 rule_id 最新行且校验域名适用。
 	rows2, err := db.DB.Query(`SELECT j.rule_id, j.cert_pem, j.key_pem, COALESCE(j.domain,''), COALESCE(r.domain,'') FROM cert_jobs j
 		JOIN lb_rules r ON r.caddy_id=j.rule_id
-		WHERE j.status IN ('downloaded','issued') AND COALESCE(j.cert_pem,'')!='' AND COALESCE(j.key_pem,'')!=''
+		WHERE ` + CertJobMaterialPredicateSQL("j") + `
 		  AND r.enabled=1 AND r.enable_tls=1 AND r.tls_source='acme_dns'
 		ORDER BY j.rule_id, j.updated_at DESC, j.id DESC`)
 	if err != nil {

@@ -278,12 +278,49 @@ func TestTaskEngineWire_certTasksPropagateRunFailures(t *testing.T) {
 		t.Fatalf("drop cert_jobs: %v", err)
 	}
 
-	// Then：两个周期任务的 Run 都必须返回 error
+	// Then：周期任务的 Run 都必须返回 error
 	if err := te.Trigger("cert-reconcile", "manual", ""); err == nil {
 		t.Fatal("cert-reconcile Run 未上抛对账读失败（任务监控会显示 success）")
 	}
 	if err := te.Trigger("cert-renewal-scan", "manual", ""); err == nil {
 		t.Fatal("cert-renewal-scan Run 未上抛扫描失败（任务监控会显示 success）")
+	}
+	// 30s 补扫承担 waiting_ca 冷却重排 / 滞留 queued 重入队 / 断链部署重试的
+	// 唯一属主：三路读失败同样必须上抛（此前 Run 恒 return nil）。
+	if err := te.Trigger("cert-waiting-ca", "manual", ""); err == nil {
+		t.Fatal("cert-waiting-ca Run 未上抛补扫读失败（任务监控会显示 success）")
+	}
+}
+
+// 30s 补扫三路扫描的读失败必须上抛并留失败摘要行——持续性读故障（schema 漂移/
+// 长期 SQLITE_BUSY）下证书自动恢复会完全停摆，而任务监控此前全绿。
+func TestCertWaitingCATickOnce_propagates_scan_read_failures(t *testing.T) {
+	useCertSweepTickTestEnv(t)
+	resetCertificateServiceForTest(t)
+	SetActiveCertificateService(NewCertificateService())
+	// Given：存在非终态任务（越过「无活跳过」门）+ cert_jobs 读故障
+	seedOrphanCertJob(t, "lb_waiting_scan", "waiting-scan.example.test", "waiting_ca")
+	if _, err := db.DB.Exec(`DROP TABLE cert_jobs`); err != nil {
+		t.Fatalf("drop cert_jobs: %v", err)
+	}
+
+	// When
+	err := CertWaitingCATickOnce()
+
+	// Then 1：读失败上抛（Run 返回 error → task_runs 失败终态）
+	if err == nil {
+		t.Fatal("CertWaitingCATickOnce err=nil, want 补扫读故障上抛（fail-visible）")
+	}
+	// Then 2：失败轮任务日志必须写失败摘要（不得谎报「补扫完成」）
+	data, readErr := os.ReadFile(taskengine.TaskLogPath("cert-waiting-ca"))
+	if readErr != nil {
+		t.Fatalf("read task log: %v", readErr)
+	}
+	if !strings.Contains(string(data), "补扫失败") {
+		t.Fatalf("失败轮摘要缺失「补扫失败」: %q", string(data))
+	}
+	if strings.Contains(string(data), "补扫完成") {
+		t.Fatalf("失败轮摘要谎报完成: %q", string(data))
 	}
 }
 

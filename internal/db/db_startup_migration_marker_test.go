@@ -5,6 +5,15 @@ package db
 //   - TCP 死字段清零（此前每次启动无条件开写事务）→ 计数探测门；
 //   - TCP 协议绑定/失效 DNS/TLS-only https → 探测门（命中才开写事务）。
 // 二次启动（等价重启）必须零写事务、零整表扫描，且数据终态不变。
+//
+// 计数口径边界（本门只断言「探测门 + 写事务骨架」这两族）：
+//   - 覆盖：startupMigrationWriteStatements（execMigrationWriteIfNeeded 登记的
+//     零命中可判定的 DML）与 startupMigrationWriteTx（withWriteTx / 各探测门后
+//     打开的迁移事务）。
+//   - 未覆盖：createTables 的 DDL 整包（CREATE TABLE/INDEX IF NOT EXISTS、1 号
+//     拦截页种子）与散落的 DROP ... IF EXISTS / CREATE INDEX IF NOT EXISTS——
+//     schema 收敛 DDL 无法探测，每启动各取一次主库写锁（WAL 下不写帧）。该族
+//     不在「零写」口号范围内，不得据本门断言其为零写。
 
 import (
 	"testing"

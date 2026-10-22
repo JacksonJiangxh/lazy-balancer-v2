@@ -211,3 +211,55 @@ func TestProvider_StringRedactsCredential(t *testing.T) {
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) { return f(request) }
+
+// 凭据脱敏必须与回声的编码形态无关：已知明文定向替换覆盖 JSON 键值、无分隔
+// 文案等任意形态；形态正则只是兜底。错误文案经 failJob 落 cert_jobs（全体
+// 登录用户可读），任一形态漏脱敏即凭据泄露。
+func TestSanitizeHTTPErrorBody_knownPlaintextCoversAnyShape(t *testing.T) {
+	const secret = "12345,s3cr3tkeyvalue"
+	cases := map[string]string{
+		"JSON 键值":    `{"status":{"code":"6","message":"域名ID错误","login_token":"12345,s3cr3tkeyvalue"}}`,
+		"JSON 数字 ID": `{"login_token": 12345, "message":"rejected"}`,
+		"无分隔文案":      `credential 12345,s3cr3tkeyvalue rejected by upstream`,
+		"仅令牌分段":      `echo: token s3cr3tkeyvalue not allowed`,
+		"查询式冒号":      `login_token: 12345,s3cr3tkeyvalue`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := sanitizeHTTPErrorBody(body, secret)
+			if strings.Contains(got, "s3cr3tkeyvalue") {
+				t.Fatalf("凭据明文进入错误文案: %q", got)
+			}
+			// JSON 数字 ID 形态不含已知明文，形态正则必须兜住。
+			if name == "JSON 数字 ID" && strings.Contains(got, "12345") {
+				t.Fatalf("login_token 形态未脱敏: %q", got)
+			}
+		})
+	}
+}
+
+// 业务层 status.message（厂商/网关回声）与 HTTP 错误体必须共用同一脱敏口径：
+// 三处 status.message 拼接点全部经 Provider.sanitizeMessage。
+func TestProvider_businessMessageRedacted(t *testing.T) {
+	const secret = "12345,s3cr3tkeyvalue"
+	provider := New(secret)
+	provider.client.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body: io.NopCloser(strings.NewReader(
+				`{"status":{"code":"6","message":"域名ID错误 login_token=` + secret + `"}}`)),
+			Request: request,
+		}, nil
+	})
+	_, err := provider.createRecord(t.Context(), "9", "_acme-challenge", "value", 600)
+	if err == nil {
+		t.Fatal("业务码非 1 必须返回错误")
+	}
+	if strings.Contains(err.Error(), "s3cr3tkeyvalue") {
+		t.Fatalf("业务层 message 凭据未脱敏: %v", err)
+	}
+	if !strings.Contains(err.Error(), "***") {
+		t.Fatalf("错误文案缺少脱敏标记: %v", err)
+	}
+}

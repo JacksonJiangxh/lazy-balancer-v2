@@ -289,13 +289,14 @@ func TestRuleCommitFailureBranchesRestoreCommittedView(t *testing.T) {
 		start := searchFrom + index
 		searchFrom = start + len(needle)
 		// 分支体内（900 字节窗口，含中文注释）必须含已提交视图统一恢复；
-		// DuplicateRule 不应用 Caddy 配置（副本默认禁用），无副作用，按专属文案豁免。
+		// DuplicateRule 不应用 Caddy 配置（副本默认禁用），无副作用，按专属
+		// 日志文案豁免。
 		windowEnd := start + 900
 		if windowEnd > len(source) {
 			windowEnd = len(source)
 		}
 		window := source[start:windowEnd]
-		if strings.Contains(window, "提交复制事务失败") {
+		if strings.Contains(window, "DuplicateRule transaction commit failed") {
 			continue
 		}
 		branches++

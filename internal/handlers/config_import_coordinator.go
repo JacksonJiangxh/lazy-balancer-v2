@@ -189,9 +189,11 @@ func rejectNodeWriteDuringImport(c *gin.Context) bool {
 
 // rejectWriteDuringImport 导入窗口内通用写端点快筛。
 // 证书配置表（certificate_configs）与 CA 提供商表（ca_providers）都在导入全量
-// 替代表清单内；这两个端点既不取 caddyOpMu 也不走本门——排空结束、导入事务
-// 尚未开启的窗口内提交会被导入静默覆盖（数据丢失），事务开启后提交则阻塞至
-// busy_timeout(30s) 后 500。与节点写族同口径 409。
+// 替代表清单内：排空结束、导入事务尚未开启的窗口内提交会被导入静默覆盖
+// （数据丢失），事务开启后提交则阻塞至 busy_timeout(30s) 后 500。与节点写族
+// 同口径 409。证书配置 Create/Update/Delete 与 CA 提供商写端点全族均走本门；
+// Update/Delete 虽取 caddyOpMu，但锁只保证串行不提供 fast-fail——排队到导入
+// 提交后按陈旧 id 落库同样会改写导入结果，故门必须在取锁之前。
 func rejectWriteDuringImport(c *gin.Context, action string) bool {
 	if !configImportBusy() {
 		return false
@@ -507,11 +509,15 @@ func (session *configImportSession) cleanupDisappearedRuleArtifacts() {
 
 // cleanupRulesWithoutUsableCertMaterial 清理「仍存在但已无任何可用证书材料」
 // 规则的 ACME 证书/私钥文件：手动证书材料在库（tls_source=manual 且
-// cert/key 非空）或有域名适用的 issued/downloaded 任务材料时跳过。返回实际
-// 执行了文件清理的规则数（幂等 best-effort，单规则失败仅告警留痕）。
+// cert/key 非空）或有域名适用的任务材料时跳过。返回实际执行了文件清理的规则数
+// （幂等 best-effort，单规则失败仅告警留痕）。
+//
+// 查询面固定为两条（规则集 + 材料行集）并在内存中配对：原实现逐规则 2 次查询
+// （域名 + 任务材料）是 N+1，千级规则导入在持 caddyOpMu 的提交窗口里放大 2N 次
+// DB 往返，把配置写/重载全部阻塞在该窗口。
 func cleanupRulesWithoutUsableCertMaterial(ctx context.Context) int {
 	rows, err := db.DB.QueryContext(ctx,
-		`SELECT caddy_id, COALESCE(tls_source,''), COALESCE(tls_cert,''), COALESCE(tls_key,'') FROM lb_rules`)
+		`SELECT caddy_id, COALESCE(tls_source,''), COALESCE(tls_cert,''), COALESCE(tls_key,''), COALESCE(domain,'') FROM lb_rules`)
 	if err != nil {
 		services.Logf("error", "导入清理：读取规则证书形态失败（跳过材料清理）: %v", err)
 		services.RecordAuditLog("system", "清理失败", "证书产物", fmt.Sprintf("导入后清理无材料规则证书文件失败（读取规则集）：%v", err), "")
@@ -520,13 +526,14 @@ func cleanupRulesWithoutUsableCertMaterial(ctx context.Context) int {
 	type ruleCertShape struct {
 		id        string
 		tlsSource string
+		domain    string
 		hasManual bool
 	}
 	var rules []ruleCertShape
 	for rows.Next() {
 		var rule ruleCertShape
 		var tlsCert, tlsKey string
-		if err := rows.Scan(&rule.id, &rule.tlsSource, &tlsCert, &tlsKey); err != nil {
+		if err := rows.Scan(&rule.id, &rule.tlsSource, &tlsCert, &tlsKey, &rule.domain); err != nil {
 			services.Logf("error", "导入清理：读取规则行失败: %v", err)
 			continue
 		}
@@ -538,38 +545,49 @@ func cleanupRulesWithoutUsableCertMaterial(ctx context.Context) int {
 	}
 	rows.Close()
 
+	// 一次取全部「持有可用材料」的任务行（谓词单源：非 disabled + PEM 非空，
+	// 与渲染候选/启动物化/文件对账同语义）。
+	materialByRule := make(map[string][]string)
+	materialRows, err := db.DB.QueryContext(ctx, `SELECT rule_id, COALESCE(domain,'') FROM cert_jobs
+		WHERE `+services.CertJobMaterialPredicateSQL(""))
+	if err != nil {
+		// 判定面不可读时不得按「无材料」清理（会误删仍在服务的证书文件）。
+		services.Logf("error", "导入清理：查询任务材料失败（跳过材料清理）: %v", err)
+		services.RecordAuditLog("system", "清理失败", "证书产物", fmt.Sprintf("导入后清理无材料规则证书文件失败（读取任务材料集）：%v", err), "")
+		return 0
+	}
+	for materialRows.Next() {
+		var ruleID, jobDomain string
+		if err := materialRows.Scan(&ruleID, &jobDomain); err != nil {
+			continue
+		}
+		materialByRule[ruleID] = append(materialByRule[ruleID], jobDomain)
+	}
+	if err := materialRows.Err(); err != nil {
+		services.Logf("error", "导入清理：遍历任务材料失败（跳过材料清理）: %v", err)
+		materialRows.Close()
+		services.RecordAuditLog("system", "清理失败", "证书产物", fmt.Sprintf("导入后清理无材料规则证书文件失败（遍历任务材料集）：%v", err), "")
+		return 0
+	}
+	materialRows.Close()
+
 	cleaned := 0
 	for _, rule := range rules {
 		if rule.hasManual {
 			continue
 		}
-		var domain string
-		if err := db.DB.QueryRowContext(ctx, `SELECT COALESCE(domain,'') FROM lb_rules WHERE caddy_id=?`, rule.id).Scan(&domain); err != nil {
-			services.Logf("error", "导入清理：读取规则 %s 域名失败（跳过该规则）: %v", rule.id, err)
-			continue
-		}
 		// 域名适用性复核（旧域残留行不算可用材料）——与 certJobRuleApplicable
 		// 同语义：两侧均须可规范化且规范形式全等。
 		usable := 0
-		jobRows, err := db.DB.QueryContext(ctx, `SELECT COALESCE(domain,'') FROM cert_jobs
-			WHERE rule_id=? AND status IN ('issued','downloaded')
-			  AND COALESCE(cert_pem,'')<>'' AND COALESCE(key_pem,'')<>''`, rule.id)
-		if err != nil {
-			services.Logf("error", "导入清理：查询规则 %s 任务材料失败（跳过该规则）: %v", rule.id, err)
-			continue
-		}
-		for jobRows.Next() {
-			var jobDomain string
-			if err := jobRows.Scan(&jobDomain); err != nil {
-				continue
-			}
-			jobCanonical, jobErr := services.CanonicalACMEDomains(jobDomain)
-			ruleCanonical, ruleErr := services.CanonicalACMEDomains(domain)
-			if jobErr == nil && ruleErr == nil && jobCanonical == ruleCanonical {
-				usable++
+		ruleCanonical, ruleErr := services.CanonicalACMEDomains(rule.domain)
+		if ruleErr == nil {
+			for _, jobDomain := range materialByRule[rule.id] {
+				if jobCanonical, jobErr := services.CanonicalACMEDomains(jobDomain); jobErr == nil && jobCanonical == ruleCanonical {
+					usable++
+					break
+				}
 			}
 		}
-		jobRows.Close()
 		if usable > 0 {
 			continue
 		}

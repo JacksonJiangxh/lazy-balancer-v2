@@ -1338,6 +1338,13 @@ func securityEventsWriteGeneration(path, generation string) error {
 // （损坏自愈=新库文件=新代际）后，旧 offset/inode 状态属于已丢弃的旧库，必须
 // 按「新库」语义归零从头摄取——否则新库永久跳过文件中段之前的事件。
 //
+// 库定性（Ruling）：安全事件历史存放在 metrics 库（security_events /
+// security_event_rollup / security_event_target_rollup），它**不是**可丢弃
+// 遥测——同库的 metrics_history 可再生，安全事件历史不可再生。db 层的损坏
+// 隔离重建因此必须显式披露「指标历史与安全事件历史一并丢弃」（进程日志 +
+// 系统审计留痕，见 db.reportMetricsQuarantine）；唯一有意的删除路径是保留
+// 策略清理（securityevents_retention.go：天数 + 行帽双口径）。
+//
 // 语义取舍（Ruling）：新库没有旧库的任何记录，无法知道哪些行「已入旧库」；
 // 从头摄取是唯一不丢事件的策略。同一库内的重复摄取由 transaction_id 唯一
 // 索引（INSERT OR IGNORE）幂等吸收，且重建后旧库文件已隔离，不存在向同一

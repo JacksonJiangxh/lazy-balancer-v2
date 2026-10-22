@@ -9,14 +9,17 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// 证书配置与 CA 提供商两个写端点在导入窗口内必须
-// 409 fast-fail——此前既不取 caddyOpMu 也不走导入门，排空结束后、导入事务
-// 开启前提交的写入会被全量替换静默覆盖。
+// 证书配置与 CA 提供商写端点全族在导入窗口内必须 409 fast-fail：排空结束后、
+// 导入事务开启前提交的写入会被全量替换静默覆盖；事务开启后提交则排队至
+// 导入提交再按陈旧 id 改写导入结果。证书配置的 Update/Delete 虽取 caddyOpMu，
+// 也不因此获得 fast-fail——门必须在取锁之前。
 func TestCertificateWrites409DuringImport(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.POST("/certificates/configs", h.CreateCertificateConfig)
+	router.PUT("/certificate-configs/:id", h.UpdateCertificateConfig)
+	router.DELETE("/certificate-configs/:id", h.DeleteCertificateConfig)
 	router.PUT("/ca-providers/:id", h.UpdateCAProvider)
 
 	configImportBeginMu.Lock()
@@ -24,6 +27,8 @@ func TestCertificateWrites409DuringImport(t *testing.T) {
 
 	calls := []struct{ method, path, body string }{
 		{"POST", "/certificates/configs", `{"name":"dns","dns_provider":"dnspod","dns_credentials":{"id":"1","token":"t"},"enabled":true}`},
+		{"PUT", "/certificate-configs/1", `{"name":"dns-updated","enabled":true}`},
+		{"DELETE", "/certificate-configs/1", ""},
 		{"PUT", "/ca-providers/1", `{"enabled":false}`},
 	}
 	for _, call := range calls {

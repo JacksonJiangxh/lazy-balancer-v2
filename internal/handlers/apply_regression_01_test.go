@@ -265,7 +265,9 @@ func TestCommitFailureRecoveryFamilyUsesUnifiedRecovery(t *testing.T) {
 	if got := strings.Count(read("caddy.go"), "h.recoverCommittedViewAfterCommitFailure(tx)"); got < 2 {
 		t.Fatalf("caddy.go commit 失败分支使用统一恢复 %d 处, want >=2（UpdateConfig/PutCaddyConfig）", got)
 	}
-	// 必须清理该规则物化文件（已提交视图不引用它=惰性孤儿）。
+	// 必须清理该规则物化文件，但判据是「已提交视图是否引用该规则」：Commit
+	// 返回错误无法区分未提交与已提交但确认丢失，无条件删除会切断提交实际生效
+	// 时的运行证书。分支内不得再出现无条件 RemoveCertFiles。
 	rulesSrc := read("rules.go")
 	branch := rulesSrc
 	if idx := strings.Index(rulesSrc, "CreateRule transaction commit error"); idx >= 0 {
@@ -275,8 +277,11 @@ func TestCommitFailureRecoveryFamilyUsesUnifiedRecovery(t *testing.T) {
 		}
 		branch = rulesSrc[start:idx]
 	}
-	if !strings.Contains(branch, "services.RemoveCertFiles(caddyID)") {
-		t.Fatal("CreateRule commit 失败分支缺少 RemoveCertFiles（渲染物化的新规则证书文件滞留）")
+	if !strings.Contains(branch, "cleanupUncommittedRuleCertsAfterCommitFailure(caddyID)") {
+		t.Fatal("CreateRule commit 失败分支缺少按已提交视图判定的证书清理（渲染物化的新规则证书文件滞留）")
+	}
+	if strings.Contains(branch, "services.RemoveCertFiles(caddyID)") {
+		t.Fatal("CreateRule commit 失败分支不得无条件删除证书文件（提交可能已生效）")
 	}
 }
 

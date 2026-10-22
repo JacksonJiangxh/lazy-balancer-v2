@@ -395,11 +395,20 @@ func (s *CertIssuer) Issue(ctx context.Context, jobID int, ruleID, domains strin
 		existingCert, existingKey, materialErr := readFastPathIssuedMaterial(ctx, jobID)
 		if materialErr != nil && !errors.Is(materialErr, sql.ErrNoRows) {
 			// 读失败（瞬时 DB 故障）不得静默回落完整签发：静默会白烧一张新 CA
-			// 订单，而库里材料可能完好。按部署重试语义收敛——材料读不到就不写
-			// 材料列（deploymentFailed 仅在 material.certPEM 非空时覆盖面），
-			// 任务保持部署生命周期 + 退避窗口，补扫/重启接管重读。
+			// 订单，而库里材料可能完好。两条接管通道按当前状态分流：
+			//   - downloaded/cleanup_*：按部署重试语义收敛（deploymentFailed 的
+			//     from 集合），任务保持部署生命周期 + 退避窗口，补扫/重启接管重读。
+			//   - issued：已部署完成，不在 deploymentFailed 的 from 集合——走该链
+			//     必然 CAS 失败且留下「部署失败状态回写失败」噪音，日志还谎称
+			//     「转部署重试」。保持 issued（不重签、不改状态），如实说明由
+			//     文件对账/续期扫描接管，返回部署类错误让队列不改写状态。
 			// 行不存在（ErrNoRows）维持既有回落语义（外层首查已存在性，此处
 			// 只覆盖并发删除窗口）。
+			if jobStatus == "issued" {
+				Logf("warn", "证书任务 %d：已签发任务的材料读取失败，保持 issued 不重签（由文件对账/续期扫描接管）: %v", jobID, materialErr)
+				WriteCertJobLog(jobID, "WARN", "issued_material_read_failed", "读取已签发证书材料失败（保持 issued，由文件对账接管）: "+materialErr.Error())
+				return &certificateDeploymentError{err: fmt.Errorf("read issued certificate material: %w", materialErr)}
+			}
 			Logf("warn", "证书任务 %d：快速路径读取已签发材料失败，转部署重试（不重签）: %v", jobID, materialErr)
 			material := issuedCertificate{ruleID: ruleID, providerID: jobProviderID, deploymentAttempt: deploymentAttempt}
 			return s.deploymentFailed(jobID, material, "读取已签发证书材料失败: "+materialErr.Error(), fmt.Errorf("read issued certificate material: %w", materialErr))
@@ -1047,19 +1056,17 @@ func isValidACMEIssuerDomain(d string) bool {
 
 // parseCertNotAfter extracts the NotAfter time from a PEM certificate chain.
 func parseCertNotAfter(certPEM string) (time.Time, error) {
-	block, _ := pem.Decode([]byte(certPEM))
-	if block == nil {
-		return time.Time{}, fmt.Errorf("invalid certificate PEM")
-	}
-	cert, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("parse certificate: %w", err)
-	}
-	return cert.NotAfter, nil
+	return parseCertTime(certPEM, func(cert *x509.Certificate) time.Time { return cert.NotAfter })
 }
 
 // parseCertNotBefore extracts the NotBefore time from a PEM certificate chain.
 func parseCertNotBefore(certPEM string) (time.Time, error) {
+	return parseCertTime(certPEM, func(cert *x509.Certificate) time.Time { return cert.NotBefore })
+}
+
+// parseCertTime 是两条取时入口的单源实现（此前 NotBefore/NotAfter 两份逐字
+// 相同的解码逻辑，任一侧改动会漂移）。
+func parseCertTime(certPEM string, pick func(*x509.Certificate) time.Time) (time.Time, error) {
 	block, _ := pem.Decode([]byte(certPEM))
 	if block == nil {
 		return time.Time{}, fmt.Errorf("invalid certificate PEM")
@@ -1068,7 +1075,7 @@ func parseCertNotBefore(certPEM string) (time.Time, error) {
 	if err != nil {
 		return time.Time{}, fmt.Errorf("parse certificate: %w", err)
 	}
-	return cert.NotBefore, nil
+	return pick(cert), nil
 }
 
 // auditFastPathReload 修正：fast-path 重载审计带 job/rule 归因（对齐主路径粒度）。

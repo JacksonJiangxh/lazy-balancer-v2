@@ -131,7 +131,8 @@ func TestLoad_warnsOnUnsupportedConfigFileKeys(t *testing.T) {
 }
 
 // caddy_admin_url 与渲染产物 admin 监听（127.0.0.1:2019）不一致时启动期
-// 必须 WARN（首次 /load 后该端点失联）；一致/缺省/畸形（由连接方报错）不告警。
+// 必须 WARN（首次 /load 后该端点失联）；回环等价类（localhost/127.0.0.1/::1 +
+// 2019，含出厂默认值）与畸形 URL（由连接方报错）不告警。
 func TestLoad_warnsOnMismatchedCaddyAdminURL(t *testing.T) {
 	t.Setenv("JWT_SECRET", "test-secret")
 
@@ -144,21 +145,37 @@ func TestLoad_warnsOnMismatchedCaddyAdminURL(t *testing.T) {
 		return configPath
 	}
 
-	// 不一致 → WARN。
 	var logBuf bytes.Buffer
 	origOut := log.Writer()
 	log.SetOutput(&logBuf)
 	defer log.SetOutput(origOut)
-	Load(writeConfig(t, `"http://127.0.0.1:2020"`))
-	if !strings.Contains(logBuf.String(), "caddy_admin_url") || !strings.Contains(logBuf.String(), "127.0.0.1:2019") {
-		t.Fatalf("非 2019 的 caddy_admin_url 必须 WARN, log=%q", logBuf.String())
+
+	loadAndLog := func(t *testing.T, path string) string {
+		t.Helper()
+		logBuf.Reset()
+		Load(path)
+		return logBuf.String()
 	}
 
-	// 一致（含 scheme 默认端口形态之外的显式 2019）→ 零告警。
-	logBuf.Reset()
-	Load(writeConfig(t, `"http://127.0.0.1:2019"`))
-	if strings.Contains(logBuf.String(), "caddy_admin_url") {
-		t.Fatalf("一致的 caddy_admin_url 不应告警, log=%q", logBuf.String())
+	// 不一致 → WARN（端口不同与主机非回环两种形态）。
+	for _, adminURL := range []string{`"http://127.0.0.1:2020"`, `"http://localhost:2020"`, `"http://0.0.0.0:2019"`} {
+		logs := loadAndLog(t, writeConfig(t, adminURL))
+		if !strings.Contains(logs, "caddy_admin_url") || !strings.Contains(logs, "127.0.0.1:2019") {
+			t.Fatalf("caddy_admin_url=%s 必须 WARN, log=%q", adminURL, logs)
+		}
+	}
+
+	// 回环等价类 + 2019 → 零告警（出厂默认值 localhost:2019 不得误报）。
+	for _, adminURL := range []string{`"http://127.0.0.1:2019"`, `"http://localhost:2019"`, `"http://[::1]:2019"`} {
+		logs := loadAndLog(t, writeConfig(t, adminURL))
+		if strings.Contains(logs, "caddy_admin_url") {
+			t.Fatalf("回环等价的 caddy_admin_url=%s 不应告警, log=%q", adminURL, logs)
+		}
+	}
+
+	// 缺省路径（无配置文件，沿用内置默认 http://localhost:2019）→ 零告警。
+	if logs := loadAndLog(t, ""); strings.Contains(logs, "caddy_admin_url") {
+		t.Fatalf("缺省 caddy_admin_url 不应告警, log=%q", logs)
 	}
 }
 

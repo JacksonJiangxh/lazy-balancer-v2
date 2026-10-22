@@ -145,11 +145,10 @@ func (h *Handlers) ListCertJobs(c *gin.Context) {
 		whereClause = " WHERE j.rule_id = ?"
 		filterArgs = append(filterArgs, ruleID)
 	}
+	// total 与 status_counts 由同一分组语句派生（total=各状态之和）：两次独立
+	// 查询在并发入队时会让「横幅显示 queued>0 而列表为空」这类瞬时不一致进入
+	// UI。仍非快照隔离（分组语句与分页语句是两条），但同一响应内自洽。
 	var total int64
-	if err := db.DB.QueryRow("SELECT COUNT(*) FROM cert_jobs j"+whereClause, filterArgs...).Scan(&total); err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "统计证书任务失败"})
-		return
-	}
 	statusCounts := map[string]int64{}
 	statusRows, err := db.DB.Query("SELECT j.status, COUNT(*) FROM cert_jobs j"+whereClause+" GROUP BY j.status", filterArgs...)
 	if err != nil {
@@ -165,6 +164,7 @@ func (h *Handlers) ListCertJobs(c *gin.Context) {
 			return
 		}
 		statusCounts[status] = count
+		total += count
 	}
 	if err := statusRows.Err(); err != nil {
 		statusRows.Close()
@@ -267,6 +267,39 @@ func (h *Handlers) GetCurrentCertJobs(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: result})
 }
 
+// cleanupOrphanedCertMaterialAfterJobDelete 在任务行删除后回收该规则的物化证书/
+// 私钥文件：判定口径与渲染候选同源（services.CertJobMaterialPredicateSQL，非
+// disabled + PEM 非空），规则仍持有手工证书材料时同样保留。调用方 MUST 持
+// caddyOpMu（与规则写/渲染物化互斥）。失败只告警不否决已完成的删除——文件残留
+// 属卫生问题（下次签发覆盖或规则删除清理），不得把成功的行删除变成 500。
+func cleanupOrphanedCertMaterialAfterJobDelete(ruleID string) {
+	if ruleID == "" {
+		return
+	}
+	var tlsSource, tlsCert, tlsKey string
+	err := db.DB.QueryRow("SELECT COALESCE(tls_source,''), COALESCE(tls_cert,''), COALESCE(tls_key,'') FROM lb_rules WHERE caddy_id=?", ruleID).
+		Scan(&tlsSource, &tlsCert, &tlsKey)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		services.Logf("warn", "DeleteCertJob 读取规则 %s 证书形态失败（跳过文件清理）: %v", ruleID, err)
+		return
+	}
+	if err == nil && tlsSource == "manual" && strings.TrimSpace(tlsCert) != "" && strings.TrimSpace(tlsKey) != "" {
+		// 手动证书材料在库（同样会物化到 certs/），不得按「无任务材料」误删。
+		return
+	}
+	var remaining int
+	if err := db.DB.QueryRow("SELECT COUNT(1) FROM cert_jobs WHERE rule_id=? AND "+services.CertJobMaterialPredicateSQL(""), ruleID).Scan(&remaining); err != nil {
+		services.Logf("warn", "DeleteCertJob 检查规则 %s 剩余证书材料失败（跳过文件清理）: %v", ruleID, err)
+		return
+	}
+	if remaining > 0 {
+		return
+	}
+	if err := services.RemoveCertFiles(ruleID); err != nil {
+		services.Logf("warn", "DeleteCertJob 清理规则 %s 的物化证书文件失败: %v", ruleID, err)
+	}
+}
+
 func certificateIssuer(certPEM string) string {
 	block, _ := pem.Decode([]byte(certPEM))
 	if block == nil {
@@ -276,10 +309,9 @@ func certificateIssuer(certPEM string) string {
 	if err != nil {
 		return ""
 	}
-	if len(cert.Issuer.Organization) > 0 && cert.Issuer.Organization[0] != "" {
-		return cert.Issuer.Organization[0]
-	}
-	return cert.Issuer.CommonName
+	// 与规则证书卡/手动证书校验共用同一显示口径（此前只取 Organization，
+	// 同证书在任务列表与证书卡显示不同文案）。
+	return services.CertificateIssuerDisplay(cert)
 }
 
 // certIssuerCache 按证书 PEM 首块缓存 issuer 解析结果——pem.Decode+
@@ -713,6 +745,12 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 	// 取消等待期间仍持有：等待期间同任务 Retry/重复 Delete 保持互斥；失败
 	// 恢复点按锁序（先 caddyOpMu 后 operationLock）释放并按规范顺序重取。
 	result, err = db.DB.Exec("DELETE FROM cert_jobs WHERE id = ?", id)
+	if err == nil {
+		// 删除成功后物化文件可能成为孤儿（含私钥）：规则已无任何仍持有可用材料
+		// 的任务行时一并回收。判定与删除同处 caddyOpMu 临界区——与 EnableRule
+		// 的建任务/渲染物化互斥，避免「判定无材料 → 并发启用重建任务 → 文件被删」。
+		cleanupOrphanedCertMaterialAfterJobDelete(ruleID)
+	}
 	h.caddyOpMu.Unlock()
 	cancelCertJob(id)
 	if err != nil {

@@ -68,7 +68,11 @@ func normalizeRuleForTransport(rule *models.LbRule) {
 		rule.TCPTryInterval = db.DefaultTCPTryInterval
 	}
 	if rule.Protocol == "tcp" {
-		if rule.EnableTLS {
+		// TLS 材料的存在性同样入选（不只 enable_tls=1）：TCP+enable_tls=0 的
+		// 存量行可携带私钥 PEM（保存族无条件清零、迁移 SQL 以证书列触发），
+		// 传输归一若只看 EnableTLS 会让该形态在主端导出/从端落库/备份导入三面
+		// 之间分叉，并让私钥正文随快照/备份放大。
+		if rule.EnableTLS || rule.TLSCert != "" || rule.TLSKey != "" {
 			rule.EnableTLS = false
 			rule.TLSCert, rule.TLSKey = "", ""
 		}

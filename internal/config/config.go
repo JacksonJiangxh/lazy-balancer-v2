@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 )
 
 const defaultLogFile = "/app/logs/lazy-balancer.log"
@@ -255,11 +257,29 @@ func Load(path string) *Config {
 	// Caddy admin 即迁到该地址。caddy_admin_url 只是「首次 /load 之前」的引导
 	// 端点——指向其他地址时面板配置的端点在首次 /load 后失联（需人工恢复），
 	// 启动期必须可见而非届时静默断联。
-	if listen, ok := adminURLListen(cfg.CaddyAdminURL); ok && listen != "127.0.0.1:2019" {
+	if listen, ok := adminURLListen(cfg.CaddyAdminURL); ok && !adminListenEquivalentToRender(listen) {
 		log.Printf("config: caddy_admin_url=%q 的监听地址与渲染产物 admin 监听 127.0.0.1:2019 不一致——首次成功 /load 后 Caddy admin 将迁到 127.0.0.1:2019，本配置端点随即失联；请改为 http://127.0.0.1:2019 或移除该配置项", cfg.CaddyAdminURL)
 	}
 
 	return cfg
+}
+
+// adminListenEquivalentToRender 判定 caddy_admin_url 的监听地址是否等价于
+// 渲染产物的 admin 监听 127.0.0.1:2019。回环主机名属同一等价类：默认配置即
+// http://localhost:2019，未规范化直接字符串比较会把出厂默认值误报为「端点与
+// 渲染不一致」的严重配置错误（每次启动一条自相矛盾告警，且提示移除一个并非
+// 配置项的东西）。localhost 解析到 ::1 失败后由 Go 连接器回落到 127.0.0.1，
+// admin 仍可拨通。
+func adminListenEquivalentToRender(listen string) bool {
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil || port != "2019" {
+		return false
+	}
+	switch strings.ToLower(host) {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	return false
 }
 
 // adminURLListen 解析 caddy_admin_url 的 host:port（失败时 ok=false——畸形 URL
@@ -282,7 +302,9 @@ func adminURLListen(rawURL string) (string, bool) {
 			return "", false
 		}
 	}
-	return host + ":" + port, true
+	// JoinHostPort 而非字符串拼接：IPv6 回环（::1）必须成 [::1]:2019 才能
+	// 被 SplitHostPort 还原，否则等价类判定永远 miss。
+	return net.JoinHostPort(host, port), true
 }
 
 func getEnv(key, defaultValue string) string {

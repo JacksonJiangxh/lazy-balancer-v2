@@ -24,10 +24,9 @@ var (
 	ErrJobTransitionConflict = errors.New("certificate job status transition conflict")
 	// allJobStatuses 派生自 db.CertJobStatuses()（单源：cert_jobs 的
 	// CHECK 枚举与 DDL 由同一列表生成；services 依赖 db，反向不可行）。
-	allJobStatuses            = db.CertJobStatuses()
-	jobStatusesExceptDisabled = withoutJobStatuses("disabled")
-	nonTerminalJobStatuses    = withoutJobStatuses("issued", "failed", "disabled")
-	jobLifecycleByStatus      = map[string]string{
+	allJobStatuses         = db.CertJobStatuses()
+	nonTerminalJobStatuses = withoutJobStatuses("issued", "failed", "disabled")
+	jobLifecycleByStatus   = map[string]string{
 		"queued":              JobLifecycleQueued,
 		"pending":             JobLifecycleActive,
 		"processing":          JobLifecycleActive,

@@ -1230,3 +1230,72 @@ func TestRetryCertJob_waitingCACoolingRequiresForce(t *testing.T) {
 		t.Fatalf("audit detail=%q, want 手动越过冷却 + 预算重置留痕", auditDetail)
 	}
 }
+
+// 删除任务行后，规则若已无任何仍持有可用材料的任务行，物化的证书/私钥文件
+// 即为孤儿（私钥残留磁盘）——必须随删除回收；同规则其他域名的材料行仍在时
+// 不得误删。
+func TestDeleteCertJob_removesOrphanedCertFilesOnlyWhenNoMaterialRemains(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	certDir := t.TempDir()
+	t.Cleanup(services.SetCertDirForTest(certDir))
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled,enable_tls,tls_source)
+		VALUES ('lb_orphan_files','orphan','http','orphan.example.test',8080,0,1,'acme_dns');
+		INSERT INTO cert_jobs (id,rule_id,domain,status,cert_pem,key_pem) VALUES
+			(1,'lb_orphan_files','orphan.example.test','failed','CERT-A','KEY-A'),
+			(2,'lb_orphan_files','www.orphan.example.test','issued','CERT-B','KEY-B')`); err != nil {
+		t.Fatalf("seed rule and jobs: %v", err)
+	}
+	if err := services.WriteCertFiles("lb_orphan_files", "CERT-B", "KEY-B"); err != nil {
+		t.Fatalf("write cert files: %v", err)
+	}
+	router := gin.New()
+	router.DELETE("/jobs/:id", h.DeleteCertJob)
+
+	// 删除第一条行后仍有另一材料行 → 文件必须保留（该域名证书仍被渲染消费）。
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/jobs/1", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("delete job 1 status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(certDir, "lb_orphan_files.crt")); err != nil {
+		t.Fatalf("仍有材料行时证书文件被误删: %v", err)
+	}
+
+	// 删除最后一行后无任何可用材料 → 物化文件（含私钥）必须回收。
+	response = httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/jobs/2", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("delete job 2 status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	for _, suffix := range []string{".crt", ".key"} {
+		if _, err := os.Stat(filepath.Join(certDir, "lb_orphan_files"+suffix)); err == nil {
+			t.Fatalf("无可用材料后 %s 未回收（私钥残留磁盘）", suffix)
+		}
+	}
+}
+
+// 手动证书材料在库（同样物化到 certs/）的规则：删除其任务行不得清掉手工
+// 证书文件——「无任务材料」不等于「无可用材料」。
+func TestDeleteCertJob_keepsManualCertFiles(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	certDir := t.TempDir()
+	t.Cleanup(services.SetCertDirForTest(certDir))
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled,enable_tls,tls_source,tls_cert,tls_key)
+		VALUES ('lb_manual_files','manual','http','manual.example.test',8080,1,1,'manual','MANUAL-CERT','MANUAL-KEY');
+		INSERT INTO cert_jobs (id,rule_id,domain,status) VALUES (1,'lb_manual_files','manual.example.test','disabled')`); err != nil {
+		t.Fatalf("seed manual rule and job: %v", err)
+	}
+	if err := services.WriteCertFiles("lb_manual_files", "MANUAL-CERT", "MANUAL-KEY"); err != nil {
+		t.Fatalf("write cert files: %v", err)
+	}
+	router := gin.New()
+	router.DELETE("/jobs/:id", h.DeleteCertJob)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/jobs/1", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("delete status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(certDir, "lb_manual_files.crt")); err != nil {
+		t.Fatalf("手动证书文件被任务删除误删: %v", err)
+	}
+}

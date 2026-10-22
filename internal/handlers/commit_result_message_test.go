@@ -71,15 +71,18 @@ func TestFinishTxApply_commitFailureReportsUncertainOutcome(t *testing.T) {
 }
 
 func TestCommitFailureWordingHasSingleSource(t *testing.T) {
-	// 事务收尾家族（finishTxApply 与 IP 名单热路径）共用同一常量，禁止各写文案。
-	for _, file := range []string{"handlers.go", "securityiplists.go"} {
+	// 事务收尾家族（finishTxApply、IP 名单热路径、规则五端点、DuplicateRule、
+	// Caddy 配置逃生口）共用同一常量，禁止各写文案。
+	for _, file := range []string{"handlers.go", "securityiplists.go", "rules.go", "caddy.go"} {
 		raw, err := os.ReadFile(file)
 		if err != nil {
 			t.Fatalf("read %s: %v", file, err)
 		}
 		source := string(raw)
-		if strings.Contains(source, `"提交事务失败"`) {
-			t.Errorf("%s 仍存在「提交事务失败」文案（提交错误结果不可判定，须用 commitUncertainLabel）", file)
+		for _, forbidden := range []string{`"提交事务失败"`, `"提交复制事务失败"`, `"提交 Caddy 配置失败"`} {
+			if strings.Contains(source, forbidden) {
+				t.Errorf("%s 仍存在 %s（提交错误结果不可判定，须用 commitUncertainLabel）", file, forbidden)
+			}
 		}
 		if got := strings.Count(source, "commitUncertainLabel"); got < 2 {
 			t.Errorf("%s 使用 commitUncertainLabel %d 处, want >=2（响应与审计共用单源）", file, got)

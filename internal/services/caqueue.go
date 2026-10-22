@@ -584,17 +584,22 @@ func (m *CAQueueManager) resumeIgnoringHold() {
 // 在途签发置回 'queued'（requeueCanceledJob），恢复后这些行不会自行回到调度器，
 // 只能靠重启或快照替换；Resume 时补一次显式重入队（EnqueueIfActive 幂等）。
 func (m *CAQueueManager) requeueLifecycleStrandedJobs() {
-	m.requeueStrandedJobs(`j.status='queued' OR j.status LIKE 'creating\_%' ESCAPE '\'`,
-		"节点生命周期切换后恢复排队", "CA queue resume")
+	if _, err := m.requeueStrandedJobs(`j.status='queued' OR j.status LIKE 'creating\_%' ESCAPE '\'`,
+		"节点生命周期切换后恢复排队", "CA queue resume"); err != nil {
+		// Resume 无 task_runs 承载失败态：读失败必须至少留 error 级痕迹，
+		// 否则恢复窗口内的扫描失败完全静默（下次 Resume/30s 补扫重试）。
+		Logf("error", "CA queue resume: stranded job requeue failed: %v", err)
+	}
 }
 
 // requeueStrandedQueuedJobs 是周期巡检入口：滞行执行退出后任务停在
 // 'queued' 而队列中无此任务，Resume 之外的周期巡检原先均不覆盖纯 'queued'，任务
 // 会滞停至下次角色翻转/重启。CertificateService 的 30s waitingCA ticker 顺带调用
 // 本函数，把滞停窗口收敛到 30s。只扫 'queued'：'waiting_ca' 有独立冷却语义，由
-// requeueWaitingCAJobs 负责，此处不碰。返回本轮实际重入队的任务数
-// （供 30s 补扫节拍的动作计数摘要）。
-func (m *CAQueueManager) requeueStrandedQueuedJobs() int {
+// requeueWaitingCAJobs 负责，此处不碰。返回（本轮实际重入队的任务数, error）
+// ——动作计数供 30s 补扫摘要，读失败上抛使补扫轮记失败终态（此前读失败只打
+// 应用日志，任务监控全绿而滞留任务永不重入队）。
+func (m *CAQueueManager) requeueStrandedQueuedJobs() (int, error) {
 	return m.requeueStrandedJobs(`j.status='queued'`, "周期巡检发现队列外滞留，重新排队", "CA queue periodic scan")
 }
 
@@ -602,9 +607,9 @@ func (m *CAQueueManager) requeueStrandedQueuedJobs() int {
 // 扫描任务，逐个经 IsJobActive（在途/滞行任务防双执行）与
 // certJobRuleApplicable（孤儿交周期 sweep 禁用）守卫后，以归一化转换 +
 // EnqueueIfActive 重排队。返回本轮实际重入队的任务数。
-func (m *CAQueueManager) requeueStrandedJobs(whereClause, message, logPrefix string) (requeued int) {
+func (m *CAQueueManager) requeueStrandedJobs(whereClause, message, logPrefix string) (requeued int, err error) {
 	if db.DB == nil {
-		return 0
+		return 0, nil
 	}
 	rows, err := db.DB.Query(`
 		SELECT j.id, COALESCE(j.rule_id,''), COALESCE(j.domain,''), j.status, COALESCE(j.ca_provider_id,0),
@@ -615,7 +620,7 @@ func (m *CAQueueManager) requeueStrandedJobs(whereClause, message, logPrefix str
 		WHERE ` + whereClause)
 	if err != nil {
 		Logf("error", "%s: stranded job scan failed: %v", logPrefix, err)
-		return
+		return 0, fmt.Errorf("扫描滞留证书任务: %w", err)
 	}
 	type strandedJob struct {
 		id, providerID int
@@ -625,27 +630,34 @@ func (m *CAQueueManager) requeueStrandedJobs(whereClause, message, logPrefix str
 		ruleBound      bool
 	}
 	var jobs []strandedJob
+	scanFailures := 0
 	for rows.Next() {
 		var job strandedJob
 		if err := rows.Scan(&job.id, &job.ruleID, &job.domain, &job.status, &job.providerID, &job.ruleDomain, &job.ruleBound); err != nil {
 			// Scan 失败留痕（曾静默 continue——列类型
 			// 漂移等系统性失败每次巡检零处理且零信号）。
 			Logf("warn", "%s: stranded job scan row failed, skipped: %v", logPrefix, err)
+			scanFailures++
 			continue
 		}
 		jobs = append(jobs, job)
 	}
+	defer func() {
+		if scanFailures > 0 {
+			err = errors.Join(err, fmt.Errorf("滞留证书任务扫描有 %d 行读取失败（结果不可信）", scanFailures))
+		}
+	}()
 	// 迭代错误检查（曾只查 Close——迭代中途出错会把部分任务集
 	// 当全量处理；放弃本轮，下一轮 30s 巡检重试全量）。
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
 		Logf("error", "%s: stranded job iteration failed: %v", logPrefix, err)
-		return
+		return requeued, fmt.Errorf("遍历滞留证书任务: %w", err)
 	}
 	// 先关闭读迭代器再写库：SQLite 连接池上行迭代未结束时写入会触发 SQLITE_BUSY。
 	if err := rows.Close(); err != nil {
 		Logf("error", "%s: close rows failed: %v", logPrefix, err)
-		return
+		return requeued, fmt.Errorf("关闭滞留证书任务结果集: %w", err)
 	}
 	for _, job := range jobs {
 		if m.IsJobActive(job.id) {
@@ -677,7 +689,7 @@ func (m *CAQueueManager) requeueStrandedJobs(whereClause, message, logPrefix str
 			requeued++
 		}
 	}
-	return requeued
+	return requeued, nil
 }
 
 // HasRunningJobForRule 报告该规则当前是否有 worker 正在执行证书任务。
@@ -931,8 +943,40 @@ func certJobDeploymentOnly(jobID int) bool {
 // 都不得上抛重试，否则租约永久不释放。
 var errCAQueueInactive = errors.New("certificate queue manager is inactive")
 
+// ruleFollowsDefaultCAProvider 报告规则当前是否「跟随默认 CA」（lb_rules.
+// ca_provider_id=0）。规则行缺失（并发删除）按 false 处理——没有可对齐的选择，
+// 保持调用方传入 id 的既有语义；读失败同样保守返回 false 并留 warn（不猜测）。
+func ruleFollowsDefaultCAProvider(ruleID string) bool {
+	if db.DB == nil || ruleID == "" {
+		return false
+	}
+	var ruleCA int
+	if err := db.DB.QueryRow("SELECT COALESCE(ca_provider_id,0) FROM lb_rules WHERE caddy_id=?", ruleID).Scan(&ruleCA); err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			Logf("warn", "CA queue: 读取规则 %s 的 CA 提供商选择失败，按任务行传入口径解析: %v", ruleID, err)
+		}
+		return false
+	}
+	return ruleCA == 0
+}
+
 func (m *CAQueueManager) enqueueLocked(providerID int, jobID int, ruleID, domains string) error {
 	provider, err := loadCAProvider(providerID)
+	// 「跟随默认 CA」语义收敛：规则选择为 0 时，任务行固化的旧默认 id 只是
+	// 「当时的偏好」——它仍可用时保持固化（续期稳定性，不因默认切换改写在途
+	// 任务）；一旦不可用（被禁用/删除），必须回落到**当前默认**而不是命中
+	// 「显式选择但已禁用」硬错误（自动续签链终止而 UI 仍显示「跟随默认」）。
+	// 回落成功即把任务行归一到 0：后续入队按当前默认解析，固化快照不再复活。
+	if err != nil && providerID != 0 && ruleFollowsDefaultCAProvider(ruleID) {
+		Logf("warn", "CA queue: 跟随默认规则的固化 provider %d 不可用（%v），按当前默认重新解析 job=%d", providerID, err, jobID)
+		providerID = 0
+		provider, err = loadCAProvider(providerID)
+		if err == nil {
+			if _, updateErr := db.DB.Exec("UPDATE cert_jobs SET ca_provider_id=0 WHERE id=? AND ca_provider_id<>0", jobID); updateErr != nil {
+				Logf("error", "CA queue: failed to normalize follow-default provider for job %d: %v", jobID, updateErr)
+			}
+		}
+	}
 	if err != nil {
 		// 只差部署的任务（部署生命周期 + 材料已落库）不依赖 CA provider
 		// ——部署重试链 retryCertificateDeployment 直接读库材料写文件 + reload。
@@ -949,9 +993,10 @@ func (m *CAQueueManager) enqueueLocked(providerID int, jobID int, ruleID, domain
 	}
 	Logf("info", "CA queue Enqueue job=%d providerID=%d resolved=%s (%s)", jobID, providerID, provider.Name, provider.Provider)
 
-	// Persist the resolved provider ID so renewals use the same provider unless
-	// the admin intentionally changes the default and triggers a new job.
-	if providerID != provider.ID {
+	// 只固化「显式选择」的解析结果：跟随默认（providerID=0）不得落库——落库会把
+	// 当时默认的快照变成任务身份，后续默认切换/禁用不再作用于该任务（语义分叉，
+	// 见函数入口的归一）。显式 id 的已删除回退仍按历史延续固化。
+	if providerID != 0 && providerID != provider.ID {
 		if _, err := db.DB.Exec("UPDATE cert_jobs SET ca_provider_id=? WHERE id=?", provider.ID, jobID); err != nil {
 			Logf("error", "CA queue: failed to update resolved provider for job %d: %v", jobID, err)
 		}
@@ -1360,23 +1405,11 @@ func (q *caQueue) handleExecutionCancellation(execution queueExecution) {
 // 保持可部署态并立即重排部署（30s 补扫/Resume 同口径接管）；无材料的失败维持
 // failJob 语义。
 func handleExecutionTimeout(jobID int) {
-	var status, certPEM, keyPEM string
-	if err := db.DB.QueryRow("SELECT status, COALESCE(cert_pem,''), COALESCE(key_pem,'') FROM cert_jobs WHERE id=?", jobID).Scan(&status, &certPEM, &keyPEM); err == nil {
-		if certPEM != "" && keyPEM != "" && JobLifecycle(status) == JobLifecycleDownloaded {
-			const message = "执行超时：证书材料已落库，等待重新部署"
-			// updated_at 与部署窗口同写：重试冷却门（certJobRetryBlocked）以
-			// updated_at 为计时基准，只推窗口不推 updated_at 会让本轮重排对
-			// 冷却门不可见（同口径见 handlers/certjobs.go 的部署重排写点）。
-			if _, err := db.DB.Exec("UPDATE cert_jobs SET deployment_available_after=datetime('now'), message=?, updated_at=datetime('now') WHERE id=? AND status=?", message, jobID, status); err != nil {
-				Logf("error", "CA queue: failed to defer deployment retry for timed-out job %d: %v", jobID, err)
-			}
-			// 与 deploymentFailed/failJob 同族：非终态收敛必须落 certjob-*.log
-			// 业务行，否则排障时磁盘日志只有签发阶段、超时重排无痕迹。
-			WriteCertJobLog(jobID, "WARN", "execution_timeout", message)
-			return
-		}
+	const message = "执行超时：证书材料已落库，等待重新部署"
+	if deferDeploymentForMaterialBearingJob(jobID, "execution_timeout", message) {
+		return
 	}
-	failJob(jobID, "证书签发执行超时")
+	failJobTransition(jobID, nonTerminalJobStatuses, "证书签发执行超时")
 }
 
 func (q *caQueue) stop() {
@@ -1428,8 +1461,7 @@ func requeueCanceledJob(jobID int) {
 			return
 		}
 	}
-	// from 集合收紧为 nonTerminalJobStatuses
-	// （原 jobStatusesExceptDisabled 含终态 issued/failed）。可达性证据=本文件
+	// from 集合收紧为 nonTerminalJobStatuses（不含终态 issued/failed）。可达性证据=本文件
 	// 的并发部署回调形态：在途执行已把行推进到 'downloaded' 后被生命周期取消
 	//（q.ctx 取消）与并发部署回调（30s 补扫/部署 timer）交错——回调 CAS 胜者
 	// 已提交 'issued'（或在途执行在 failJob 落 'failed' 后 ctx 才被取消），
@@ -1616,8 +1648,44 @@ func failJobTransition(jobID int, fromSet []string, message string) {
 }
 
 // failJob 把任务标记为 failed（来源=任意非终态状态）。
+//
+// 材料在身的部署生命周期任务（downloaded/cleanup_dns/cleanup_warning）例外：
+// 终态 failed 会把新证书从全部自动恢复通道摘除（续期扫描看新证不在窗口、
+// 首发重试要求 expires_at IS NULL、部署补扫只收 downloaded/cleanup_*、启动恢复
+// 跳过终态、对账只重建 issued/downloaded）→ 材料搁浅且规则无 TLS。与执行超时/
+// 生命周期取消同口径：保持可部署态并把部署窗口推到 now，由 30s 补扫接管。
+// 代价=失败路径多一次单行读（失败本就是低频路径）。
 func failJob(jobID int, message string) {
+	if deferDeploymentForMaterialBearingJob(jobID, "deployment_deferred", "签发失败："+message+"（证书材料已落库，等待重新部署）") {
+		return
+	}
 	failJobTransition(jobID, nonTerminalJobStatuses, message)
+}
+
+// deferDeploymentForMaterialBearingJob 在任务持有证书材料且处于部署生命周期时
+// 把「终态失败」降级为「保持可部署态 + 立即重排部署」。返回 true 表示已按部署
+// 重试语义处理，调用方不得再写 failed。读失败/状态不符返回 false（维持既有
+// failJob 语义，不因一次读故障把行留在非终态）。
+func deferDeploymentForMaterialBearingJob(jobID int, logCode, message string) bool {
+	var status, certPEM, keyPEM string
+	if err := db.DB.QueryRow("SELECT status, COALESCE(cert_pem,''), COALESCE(key_pem,'') FROM cert_jobs WHERE id=?", jobID).
+		Scan(&status, &certPEM, &keyPEM); err != nil {
+		return false
+	}
+	if strings.TrimSpace(certPEM) == "" || strings.TrimSpace(keyPEM) == "" || JobLifecycle(status) != JobLifecycleDownloaded {
+		return false
+	}
+	message = truncateJobMessage(message)
+	// updated_at 与部署窗口同写：重试冷却门（certJobRetryBlocked）以
+	// updated_at 为计时基准，只推窗口不推 updated_at 会让本轮重排对冷却门不可见
+	// （同口径见 handlers/certjobs.go 的部署重排写点）。
+	if _, err := db.DB.Exec("UPDATE cert_jobs SET deployment_available_after=datetime('now'), message=?, updated_at=datetime('now') WHERE id=? AND status=?", message, jobID, status); err != nil {
+		Logf("error", "CA queue: failed to defer deployment retry for job %d: %v", jobID, err)
+		return false
+	}
+	// 与 deploymentFailed/failJob 同族：非终态收敛必须落 certjob-*.log 业务行。
+	WriteCertJobLog(jobID, "WARN", logCode, message)
+	return true
 }
 
 // currentRenewalAttempts 读取任务当前续签失败次数（读取失败按 0 处理，

@@ -207,6 +207,12 @@ func formatCertificateConfigReferences(references []certificateConfigRuleRef, re
 }
 
 func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
+	// 导入窗口内写入会被全量替换静默覆盖（本表在导入全量替代表清单内）。
+	// 门必须早于 caddyOpMu：导入事务全程持有该锁，排队等待后再按陈旧 id 落库
+	// 等价于「导入完成后被旧请求改写导入结果」。
+	if rejectWriteDuringImport(c, "保存证书配置（配置导入进行中）") {
+		return
+	}
 
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil || id <= 0 {
@@ -407,6 +413,11 @@ func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 var deleteCertificateConfigPreDeleteHook func()
 
 func (h *Handlers) DeleteCertificateConfig(c *gin.Context) {
+	// 与 UpdateCertificateConfig 同门：导入窗口内删除会作用到导入后的同 id
+	// 行（或阻塞至 busy_timeout 后 500），必须 409 fast-fail。
+	if rejectWriteDuringImport(c, "删除证书配置（配置导入进行中）") {
+		return
+	}
 
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil || id <= 0 {
@@ -584,10 +595,19 @@ func (h *Handlers) TestCertificateConfig(c *gin.Context) {
 // MAX(id) 子查询在该唯一索引下恒等于本行（同一键不可能有更小的 id），
 // 属恒等冗余，直读行即可。
 func (h *Handlers) ListCertificates(c *gin.Context) {
-	rows, err := db.DB.Query(`
+	// 可选 rule_id 过滤（附加参数，默认行为不变）：全表扫描 + 临时排序在大规模
+	// 部署下是每请求一次 O(N)，而 UI/MCP 的常见消费面是「按规则查证书」。
+	query := `
 		SELECT j.id, j.rule_id, j.domain, j.status, COALESCE(j.message,''), COALESCE(j.expires_at,''), COALESCE(j.updated_at,'')
-		FROM cert_jobs j
-		ORDER BY j.domain, j.rule_id`)
+		FROM cert_jobs j`
+	var args []any
+	if ruleID := strings.TrimSpace(c.Query("rule_id")); ruleID != "" {
+		query += ` WHERE j.rule_id = ?`
+		args = append(args, ruleID)
+	}
+	// ORDER BY 与唯一索引 (rule_id, domain) 的最左前缀对齐，避免临时排序 B-tree。
+	query += ` ORDER BY j.rule_id, j.domain`
+	rows, err := db.DB.Query(query, args...)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "查询证书任务失败"})
 		return

@@ -76,6 +76,9 @@ const ACTION_TONE_EXCEPTIONS: Record<string, AuditActionTone> = {
   '同步应用': 'warning',
   // 容量收敛：名单触顶挤出/丢弃的告警性系统动作（warning——不是错误，但需关注）。
   '容量收敛': 'warning',
+  // 库自愈：指标库损坏后自动隔离重建（恢复成功，但指标与安全事件历史一并
+  // 丢弃、需人工取证）——按告警性事件呈现，不按 success 绿标淡化数据丢失。
+  '库自愈': 'warning',
   // ── success（无关键词可派生）──
   '创建': 'success',
   '启用': 'success',

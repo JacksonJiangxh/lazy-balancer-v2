@@ -13,6 +13,30 @@ import (
 	"lazy-balancer-v2/internal/models"
 )
 
+// CertificateIssuerDisplay 返回证书签发者的统一显示文案：「Org (CN)」，
+// Organization/CommonName 单侧存在时退回该侧，均缺失返回空串（调用方决定
+// 占位符，如证书卡用 "-"）。此前三处各自实现——任务列表只取 Organization、
+// 规则证书卡取 "Org (CN)"、手动证书校验取 CN 优先——同一证书在 UI 不同位置
+// 显示不同文案。
+func CertificateIssuerDisplay(cert *x509.Certificate) string {
+	if cert == nil {
+		return ""
+	}
+	org := ""
+	if len(cert.Issuer.Organization) > 0 {
+		org = cert.Issuer.Organization[0]
+	}
+	cn := cert.Issuer.CommonName
+	switch {
+	case org != "" && cn != "":
+		return fmt.Sprintf("%s (%s)", org, cn)
+	case org != "":
+		return org
+	default:
+		return cn
+	}
+}
+
 func SelectRuleCertificate(candidates []CertificateCandidate, ruleDomains string, now time.Time) (string, bool) {
 	selection, selected := SelectCertificate(candidates, ruleDomains, now)
 	if selected {
@@ -202,24 +226,27 @@ func formatRuleCertInfo(certPEM string, cert *x509.Certificate, source, ruleDoma
 		info.Domains = strings.Join(parsedDomains, ", ")
 	}
 
-	// Issuer：Organization 优先，CommonName 兜底
-	issuer := cert.Issuer.CommonName
-	if len(cert.Issuer.Organization) > 0 && cert.Issuer.Organization[0] != "" {
-		issuer = cert.Issuer.Organization[0]
-		if cert.Issuer.CommonName != "" {
-			issuer = fmt.Sprintf("%s (%s)", issuer, cert.Issuer.CommonName)
-		}
-	}
-	info.Issuer = issuer
+	// Issuer：单源显示口径（任务列表/规则证书卡/手动证书校验三处共用）
+	info.Issuer = CertificateIssuerDisplay(cert)
 	if info.Issuer == "" {
 		info.Issuer = "-"
 	}
 
+	// 时间字段契约：UTC 墙钟（"2006-01-02 15:04:05"，无时区标识）。消费方
+	// MUST 按 UTC 解释后转配置时区（web/src/utils/date.ts 的 formatDate）；
+	// 原样展示会在非 UTC 时区差一个偏移。
 	const timeFmt = "2006-01-02 15:04:05"
 	info.NotBefore = cert.NotBefore.Format(timeFmt)
 	info.NotAfter = cert.NotAfter.Format(timeFmt)
 	info.DaysRemaining = CertDaysRemaining(cert.NotAfter, now)
 	info.Status = CertificateExpiryStatus(cert.NotAfter, now, expiryDays)
+	// 未来生效（NotBefore > now）：状态枚举保持 valid（前端无 not_yet_valid
+	// 分支），用 Error 字段显性说明——此前手动证书卡片显示 valid + 很大的剩余
+	// 天数，而客户端在 NotBefore 前会拒绝该证书（与 /certificates/parse 的
+	// warning 口径相反）。ACME 路径由 ExpiredACMECertInfoFallback 单列处理。
+	if now.Before(cert.NotBefore) {
+		info.Error = fmt.Sprintf("证书尚未生效（生效时间 %s）", cert.NotBefore.In(CurrentLocation()).Format("2006-01-02 15:04:05"))
+	}
 
 	return info
 }

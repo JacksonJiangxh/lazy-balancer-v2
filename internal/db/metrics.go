@@ -105,6 +105,17 @@ func quarantineCorruptSQLiteFile(path string) (string, error) {
 	return quarantined, nil
 }
 
+// reportMetricsQuarantine 记录隔离重建的完整后果：进程日志 + 系统审计
+// （审计库就绪后落 audit_log，审计页可见）。metrics 库同库承载
+// security_events 与 threat 大屏 rollup，隔离会丢弃安全事件历史——必须显式
+// 告知丢弃范围与隔离文件位置，不能只留一行 "metrics history reset"。
+func reportMetricsQuarantine(cause, quarantinePath string) {
+	detail := fmt.Sprintf("问题: metrics 库损坏（%s）；已隔离为 %s 并重建——指标历史与安全事件历史（security_events / security_event_rollup / security_event_target_rollup）一并丢弃，需从隔离文件人工取证",
+		cause, filepath.Base(quarantinePath))
+	log.Print(detail)
+	recordSystemAudit("库自愈", "指标库", detail)
+}
+
 const MetricsDBFilename = "lazy-balancer-metrics.db"
 
 func InitializeMetricsDB(dataDir string) (err error) {
@@ -119,15 +130,24 @@ func InitializeMetricsDB(dataDir string) (err error) {
 		return fmt.Errorf("failed to secure metrics database: %w", err)
 	}
 	// 损坏自愈（生产事故：宿主丢写致页 1 清零 → Ping NOTADB → 启动崩循环
-	// 27 分钟无自愈）。metrics 库是可丢弃遥测：两段防线——①头部魔数检查
-	// （零页 1 形态）；②Ping 报损坏类错误（not a database / malformed，
-	// 覆盖魔数完好但页 1 内容损坏的形态）时隔离重试一次。瞬态错误（锁/
-	// IO）与重试后再失败均响亮失败。主库/审计库承载不可再生数据，不走
-	// 此路径。
+	// 27 分钟无自愈）。
+	//
+	// 本库**不是**「可丢弃遥测」：同库承载两类数据——①metrics_history（指标
+	// 历史，纯遥测，可再生）；②security_events / security_event_rollup /
+	// security_event_target_rollup（安全事件历史：攻击取证、触发详情、大屏
+	// 预聚合，不可再生，由 security_events_retention_days / _row_cap 独立保留
+	// 策略治理，见 services.securityEventsRetentionPolicy）。隔离重建意味着安全
+	// 事件历史一并丢弃，必须显式披露（进程日志 + 系统审计留痕），不得只写
+	// 「metrics history reset」。隔离文件保留最新 3 份供人工取证。
+	//
+	// 两段防线——①头部魔数检查（零页 1 形态）；②Ping 报损坏类错误（not a
+	// database / malformed，覆盖魔数完好但页 1 内容损坏的形态）时隔离重试
+	// 一次。瞬态错误（锁/IO）与重试后再失败均响亮失败。主库/审计库承载不可
+	// 再生数据，不走此路径。
 	if quarantined, qerr := quarantineCorruptSQLiteFile(dbPath); qerr != nil {
 		return fmt.Errorf("failed to inspect metrics database file: %w", qerr)
 	} else if quarantined != "" {
-		log.Printf("问题: metrics database file corrupted (bad SQLite header); quarantined as %s and recreated — metrics history reset", filepath.Base(quarantined))
+		reportMetricsQuarantine("bad SQLite header", quarantined)
 	}
 
 	db, err := openAndPingMetricsDB(dbPath)
@@ -139,7 +159,7 @@ func InitializeMetricsDB(dataDir string) (err error) {
 		if qerr != nil {
 			return errors.Join(err, qerr)
 		}
-		log.Printf("问题: metrics database failed integrity check on open (%v); quarantined as %s and recreated — metrics history reset", err, filepath.Base(quarantined))
+		reportMetricsQuarantine(fmt.Sprintf("integrity check failed on open: %v", err), quarantined)
 		db, err = openAndPingMetricsDB(dbPath)
 		if err != nil {
 			return err

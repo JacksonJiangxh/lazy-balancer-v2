@@ -110,21 +110,37 @@ func TestUpdateConfig_accessLogFormatIgnoredWhenJSONDisabled(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.PUT("/config", h.UpdateConfig)
-	put := func(body string) *httptest.ResponseRecorder {
-		request := httptest.NewRequest(http.MethodPut, "/config", strings.NewReader(body))
+	router.POST("/config/preview", h.PreviewConfigUpdate)
+	send := func(method, path, body string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(method, path, strings.NewReader(body))
 		request.Header.Set("Content-Type", "application/json")
 		response := httptest.NewRecorder()
 		router.ServeHTTP(response, request)
 		return response
 	}
+	put := func(body string) *httptest.ResponseRecorder { return send(http.MethodPut, "/config", body) }
+	preview := func(body string) *httptest.ResponseRecorder { return send(http.MethodPost, "/config/preview", body) }
 	if _, err := db.DB.Exec(`UPDATE global_config SET access_log_json=1, access_log_format='request>host -> h' WHERE id=1`); err != nil {
 		t.Fatalf("seed format: %v", err)
 	}
 
-	// 显式携带非空格式 + json=false → 400 点名不生效。
-	rejected := put(`{"access_log_json":false,"access_log_format":"request>host -> h"}`)
-	if rejected.Code != http.StatusBadRequest || !strings.Contains(rejected.Body.String(), "不生效") {
-		t.Fatalf("json=false + 非空格式必须 400 点名，status=%d body=%s", rejected.Code, rejected.Body.String())
+	// 显式携带非空格式 + json=false → 400 点名不生效（保存与预览同门）。
+	for name, response := range map[string]*httptest.ResponseRecorder{
+		"save":    put(`{"access_log_json":false,"access_log_format":"request>host -> h"}`),
+		"preview": preview(`{"access_log_json":false,"access_log_format":"request>host -> h"}`),
+	} {
+		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "不生效") {
+			t.Fatalf("%s：json=false + 非空格式必须 400 点名，status=%d body=%s", name, response.Code, response.Body.String())
+		}
+	}
+
+	// 预览仅关闭 json（不携带格式）→ 200 且变更清单预告「日志格式模板」清空。
+	previewed := preview(`{"access_log_json":false}`)
+	if previewed.Code != http.StatusOK {
+		t.Fatalf("preview status=%d body=%s, want 200", previewed.Code, previewed.Body.String())
+	}
+	if !strings.Contains(previewed.Body.String(), "日志格式模板") {
+		t.Fatalf("预览必须预告存量格式将被清空，body=%s", previewed.Body.String())
 	}
 
 	// 仅关闭 json（不携带格式）→ 归一清空存量格式并披露。
