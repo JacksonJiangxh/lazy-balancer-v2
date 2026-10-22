@@ -47,7 +47,7 @@ type countingSyncWorker struct {
 func (w *countingSyncWorker) Start() { w.starts.Add(1) }
 func (w *countingSyncWorker) Stop()  { w.stops.Add(1) }
 
-// 历史问题-2：Shutdown 后 StartSync 必须成为 no-op——进程退出与 taskengine
+// Shutdown 后 StartSync 必须成为 no-op——进程退出与 taskengine
 // daemon 换代并发时，已 teardown 的同步循环不得被重新拉起。
 func TestRuntimeLifecycle_ShutdownGatesLaterStarts(t *testing.T) {
 	worker := &countingSyncWorker{}
@@ -89,7 +89,7 @@ func TestRuntimeLifecycle_StopACME_waitsForWorkerExit(t *testing.T) {
 	}
 }
 
-// 历史问题-9/历史问题-1（历史）：StopACME 必须与 StartACME 的注入对称，
+// StopACME 必须与 StartACME 的注入对称，
 // 清除 services 侧 active 指针——否则 demote/停机后任务引擎证书单轮体
 // （cert-manual-poll 等）继续驱动已停服务（重复到期日志/无角色门补扫）。
 // 可观察口径：注入生效时 CertManualCheckOnce 真实消费服务（到期汇总日志），
@@ -98,7 +98,7 @@ func TestRuntimeLifecycle_StopACME_clearsActiveCertificateService(t *testing.T) 
 	// Given：临时库 + 一张已过期手动证书，注入真实证书服务
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	t.Cleanup(func() {
-		// 历史问题（历史）：仅复位指针会泄漏本测试打开的三个 *sql.DB——
+		// 仅复位指针会泄漏本测试打开的三个 *sql.DB——
 		// 先关闭再恢复外层句柄。
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB

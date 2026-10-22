@@ -14,7 +14,7 @@ import (
 )
 
 func (h *Handlers) SetClusterMode(c *gin.Context) {
-	// 历史问题（历史问题，历史修复 守卫族收敛）：导入事务全量替换 global_config，
+	// 导入事务全量替换 global_config，
 	// 窗口内切换角色会在远端留下无法本地回滚的注册（BecomeSlave 之后被导入
 	// 覆盖 → 远端孤儿注册 + 本地仍为主节点）。必须先于任何网络副作用 fast-fail。
 	if rejectNodeWriteDuringImport(c) {
@@ -52,7 +52,7 @@ func (h *Handlers) SetClusterMode(c *gin.Context) {
 	if name == "" {
 		name = h.cfg.NodeName
 	}
-	// 历史问题-05：与主节点落库侧同一归一（去空白/控制字符/截断 100 rune），
+	// 与主节点落库侧同一归一（去空白/控制字符/截断 100 rune），
 	// 避免主节点拒绝或把脏名字写入集群。
 	name = models.NormalizeClusterNodeName(name)
 	if name == "" {
@@ -87,7 +87,7 @@ func (h *Handlers) SetClusterMode(c *gin.Context) {
 		})
 		return
 	}
-	// 历史问题：令牌撤销/schema 不匹配会把同步循环置为 Halted 终态，而角色翻转
+	// 令牌撤销/schema 不匹配会把同步循环置为 Halted 终态，而角色翻转
 	// 由引擎 SetRole 唯一驱动（cluster-sync daemon 换代重启；BecomeSlave 侧仅
 	// SetRole + 恢复调度开关，不再有旧 StartSync 生命周期旁路）——Start() 对
 	// Halted 态是 no-op（cluster_sync.go startLocked 门控），重新注册后循环永不
@@ -107,7 +107,7 @@ func (h *Handlers) SetClusterMode(c *gin.Context) {
 // requestProtocol 返回本节点自述访问协议，注册时上报主节点（用于拼接该
 // 节点的访问地址与面板展示）。X-Forwarded-Proto 无条件采信——自述协议，
 // 可信度以部署边界为界：伪造该头的可达前提是已通过认证的 admin 管理面，
-// 污染面仅限自家节点的注册地址。历史修复（历史）：保守维持
+// 污染面仅限自家节点的注册地址。保守维持
 // 现状，不加受信门。
 func requestProtocol(c *gin.Context) string {
 	if c.Request.TLS != nil || strings.EqualFold(c.GetHeader("X-Forwarded-Proto"), "https") {
@@ -117,12 +117,12 @@ func requestProtocol(c *gin.Context) string {
 }
 
 func (h *Handlers) PromoteClusterNode(c *gin.Context) {
-	// 历史问题（历史）：导入窗口写 global_config 会被全量替换覆盖——
+	// 导入窗口写 global_config 会被全量替换覆盖——
 	// 与节点写端点同族 fast-fail（先于任何状态读取/生效）。
 	if rejectNodeWriteDuringImport(c) {
 		return
 	}
-	// 历史问题(历史):syncService 缺失判定前置——此前 Promote 已生效才报
+	// syncService 缺失判定前置——此前 Promote 已生效才报
 	// 503,调用方见到失败但角色已提升,重试撞 ErrAlreadyMaster。
 	if h.syncService == nil {
 		clusterError(c, http.StatusServiceUnavailable, "同步服务未初始化", nil)
@@ -137,10 +137,10 @@ func (h *Handlers) PromoteClusterNode(c *gin.Context) {
 		clusterError(c, status, "提升为主节点失败: "+err.Error(), err)
 		return
 	}
-	// 历史问题：提升成功后清空内存 TOFU pin 缓存——Promote 的 cleanupClusterPin
+	// 提升成功后清空内存 TOFU pin 缓存——Promote 的 cleanupClusterPin
 	// 只删 pin 文件，内存 verifiedPins 残留旧主节点指纹会让记录与钉扎状态错位
-	//（历史修复① 后 do() 不再以内存指纹回写，此处清空保持内存/磁盘 TOFU 生命周期
-	// 对齐）。与 历史问题 的 Resume() 同点位：角色切换的完整收尾。
+	//不再以内存指纹回写，此处清空保持内存/磁盘 TOFU 生命周期
+	// 对齐）。与 Resume() 同点位：角色切换的完整收尾。
 	h.syncService.ForgetClusterPins()
 	// 生命周期由任务引擎统一驱动（Promote → SetRole → daemon hook/角色门），
 	// handler 不再直调管理器或旧调度器。
@@ -149,7 +149,7 @@ func (h *Handlers) PromoteClusterNode(c *gin.Context) {
 }
 
 func (h *Handlers) UpdateClusterSettings(c *gin.Context) {
-	// 历史问题（历史）：同步开关与间隔写 global_config，导入窗口内的写入
+	// 同步开关与间隔写 global_config，导入窗口内的写入
 	// 会被全量替换覆盖（静默丢失）——与节点写端点同族 fast-fail。
 	if rejectNodeWriteDuringImport(c) {
 		return
@@ -161,11 +161,11 @@ func (h *Handlers) UpdateClusterSettings(c *gin.Context) {
 		return
 	}
 	if err := h.clusterService.UpdateSettings(c.Request.Context(), req); err != nil {
-		// 历史问题:分判——角色/权限语义(403)/客户端参数(400)/其余 DB 与
+		// 分判——角色/权限语义(403)/客户端参数(400)/其余 DB 与
 		// 内部故障(500,此前误 403 误导排障)。
 		status := http.StatusInternalServerError
 		msg := "更新集群设置失败"
-		// 历史问题:UpdateSettings 不产出 ErrAlreadyMaster(仅 Promote 产出,
+		// UpdateSettings 不产出 ErrAlreadyMaster(仅 Promote 产出,
 		// Promote 路径 :93 映射保留),原 case 为死分支已删除。
 		switch {
 		case errors.Is(err, services.ErrInvalidSyncInterval) || errors.Is(err, services.ErrSyncUsersLocked):
@@ -180,7 +180,7 @@ func (h *Handlers) UpdateClusterSettings(c *gin.Context) {
 		clusterError(c, status, msg, err)
 		return
 	}
-	// 历史问题（历史）：空 body = 幂等空保存，parts 为空时审计详情曾落空串
+	// 空 body = 幂等空保存，parts 为空时审计详情曾落空串
 	// （无法区分「无修改」与记录缺陷）——复用同域既有「无修改」文案
 	// （caproviders/certificates 同口径）。
 	detail := clusterSettingsChangeDetail(req)
@@ -192,7 +192,7 @@ func (h *Handlers) UpdateClusterSettings(c *gin.Context) {
 }
 
 // switchToSlaveAuditDetail 构建切换从节点的审计详情;出口 IP 探测失败
-// (历史问题-5)时追加点名,坏地址对运维可见。
+// 时追加点名,坏地址对运维可见。
 func switchToSlaveAuditDetail(masterURL string, outboundIPOK bool) string {
 	parts := []string{"主节点 → 从节点", masterURL, "等待审批"}
 	if !outboundIPOK {
@@ -203,7 +203,7 @@ func switchToSlaveAuditDetail(masterURL string, outboundIPOK bool) string {
 
 func clusterSettingsChangeDetail(req models.ClusterSettingsRequest) string {
 	labels := map[string]string{
-		// 历史修复(历史观察项转正):sync_rules 标签与集群设置卡/新版 hover
+		// sync_rules 标签与集群设置卡/新版 hover
 		// 统一为「负载均衡规则」(备份分类标签「负载规则」不在此口径)。
 		"sync_users": "系统数据", "sync_rules": "负载均衡规则",
 		"sync_security": "安全防护",

@@ -7,7 +7,7 @@ import (
 	"lazy-balancer-v2/internal/mcpserver"
 )
 
-// TestMCPToolSpecs_cover_registeredGinRoutes MCP 工具↔路由对照绊线（历史问题）：
+// TestMCPToolSpecs_cover_registeredGinRoutes MCP 工具↔路由对照绊线
 // 每个工具的 (method, path) 必须命中 SetupRouter 注册的真实路由——工具指向已
 // 改名/删除的路由只会在 Agent 调用时 404，编译期与既有测试均不可见（OpenAPI
 // 侧有同款绊线，MCP 侧此前为空白）。{param} 形态经 ginPathToOpenAPI 反向
@@ -32,7 +32,7 @@ func TestMCPToolSpecs_cover_registeredGinRoutes(t *testing.T) {
 	}
 }
 
-// mcpUncoveredRoutes：注册但无 MCP 工具覆盖的路由的显式豁免清单（历史问题，
+// mcpUncoveredRoutes：注册但无 MCP 工具覆盖的路由的显式豁免清单
 // 2026-09 审计）。此前 parity 绊线只验「工具→路由」单向，新 REST 路由落地时
 // 无机制迫使决策者考虑 MCP 暴露——本清单 + 双向断言补上：新增无工具路由必须
 // 在此登记豁免理由（或补工具）；清单项不再注册时测试同样报错，防清单腐化。
@@ -47,7 +47,7 @@ var mcpUncoveredRoutes = map[string]string{
 	"POST /api/v1/security/overview/threat-screen/collector":   "大屏流量采集租约申请/续租：浏览器生命周期内部动作，Agent 无 UI 会话场景且不应远程控制采集开关",
 	"GET /api/v1/security/overview/threat-screen/events":       "大屏逐请求正常流量增量事件流：前端光流可视化专用，Agent 无消费场景",
 	"DELETE /api/v1/security/overview/threat-screen/collector": "大屏流量采集租约释放：浏览器生命周期内部动作，Agent 无 UI 会话场景",
-	// —— IP 快捷弹框处置（历史新增：前端弹框专用；Agent 侧 get_ip_list →
+	// —— IP 快捷弹框处置（新增：前端弹框专用；Agent 侧 get_ip_list →
 	//    update_ip_list 全量写回可达成移除，专用工具冗余）——
 	"POST /api/v1/security/ip-lists/:id/remove-ip": "IP 快捷弹框移除处置端点：从地址列表移除单条 IP；Agent 可用 get_ip_list+update_ip_list 组合等价完成",
 	// —— 认证 / 会话 / MFA（JWT 会话专属；MCP 仅 API Key，无用户会话概念）——
@@ -122,7 +122,7 @@ var mcpUncoveredRoutes = map[string]string{
 	"PUT /api/v1/security/threat-lib/auto-update": "威胁库自动更新总闸（低频管理面板操作）",
 	"PUT /api/v1/security/threat-lib/:id/flags":   "威胁库逐源更新开关（低频管理面板操作）",
 	"POST /api/v1/security/threat-lib/update":     "手动更新威胁库（低频管理面板操作；与 CRS/IP2Region 更新端点同族未覆盖）",
-	// —— 自动封禁（历史问题）：面板状态卡/配置弹框专用面 ——
+	// 自动封禁：面板状态卡/配置弹框专用面 ——
 	"GET /api/v1/security/autoban":             "自动封禁六项配置读（面板配置弹框数据源）",
 	"PUT /api/v1/security/autoban":             "自动封禁配置写（低频管理面板操作；保存联动调度启停）",
 	"GET /api/v1/security/autoban/status":      "自动封禁运行态/今日封禁/观察建议聚合（面板状态卡轮询数据源）",

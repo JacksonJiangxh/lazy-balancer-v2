@@ -15,7 +15,7 @@ type AccessLogFormatParse struct {
 	Invalid []int
 }
 
-// ParseAccessLogFormat access_log_format DSL 单源解析器（历史问题）——
+// ParseAccessLogFormat access_log_format DSL 单源解析器——
 // 渲染层（buildAccessLogEncoder）、写侧校验（validateAccessLogFormat）与
 // 归一（normalizeAccessLogRedaction）此前各写一份行拆分，口径漂移且非法行
 // 被静默跳过。口径：空行忽略（合法）；其余行必须满足 `路径 -> 动作` 且

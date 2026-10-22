@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// 历史修复：更新失败后 /security/{crs,ip2region}/update/status 的 version
+// 更新失败后 /security/{crs,ip2region}/update/status 的 version
 // 必须是「已安装版本」，不是本次尝试安装的 tag。修复前 run 在安装前就把
 // state.version 写成远端 tag，fail 分支不复位——失败/取消后接口报未安装的版本。
 

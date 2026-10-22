@@ -13,10 +13,10 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// 历史修复（历史，用户裁定）：规则脱离 ACME（证书源改手动 / 禁用 TLS）时，
+// （用户裁定）：规则脱离 ACME（证书源改手动 / 禁用 TLS）时，
 // 该规则关联的证书签发任务必须**直接删除**（全部状态，含 failed/issued），
 // 不再残留失败行于任务列表。此前 acme→manual 仅翻转非终态行（failed 有意
-// 排除——历史问题-01），失败任务永久残留且「重签」按钮误导（实际 409）；
+// 排除），失败任务永久残留且「重签」按钮误导（实际 409）；
 // 禁用 TLS 路径则完全无 cert_jobs 处理。
 
 func countRuleCertJobs(t *testing.T, caddyID string) int {
@@ -32,34 +32,34 @@ func countRuleCertJobs(t *testing.T, caddyID string) int {
 // 未实现时 failed 行残留（RED）。
 func TestUpdateRule_acmeToManual_deletesAllCertJobsIncludingFailed(t *testing.T) {
 	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
-	harness := newUpdateAuditRuleHandlers(t, "lb_r10_manual", 0, false)
-	failedID := seedACMEManualSwitchFixture(t, "lb_r10_manual", "r10.example.test", "failed")
+	harness := newUpdateAuditRuleHandlers(t, "lb_manual_switch", 0, false)
+	failedID := seedACMEManualSwitchFixture(t, "lb_manual_switch", "manual.example.test", "failed")
 	// 补一条 issued 形态（切换后证书不再被规则引用，任务行一并退役）；
 	// cert_jobs UNIQUE(rule_id,domain)——用第二域名形态。
-	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,ca_provider_id) SELECT ?,'www.r10.example.test','issued',ca_provider_id FROM cert_jobs WHERE id=?`,
-		"lb_r10_manual", failedID); err != nil {
+	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,ca_provider_id) SELECT ?,'www.manual.example.test','issued',ca_provider_id FROM cert_jobs WHERE id=?`,
+		"lb_manual_switch", failedID); err != nil {
 		t.Fatalf("seed issued job: %v", err)
 	}
 	services.ResetCAQueueManagerForTest()
 	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
 	services.GetCAQueueManager().Start()
 	t.Cleanup(services.ResetCAQueueManagerForTest)
-	certPEM, keyPEM, err := generateTestCert("r10.example.test", time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+	certPEM, keyPEM, err := generateTestCert("manual.example.test", time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
 	if err != nil {
 		t.Fatalf("generate test cert: %v", err)
 	}
 
-	response := putUpdateRule(t, harness, "lb_r10_manual", fmt.Sprintf(
+	response := putUpdateRule(t, harness, "lb_manual_switch", fmt.Sprintf(
 		`{"name":"after","enable_tls":true,"tls_source":"manual","tls_cert":%q,"tls_key":%q}`, certPEM, keyPEM))
 
 	if response.Code != http.StatusOK {
 		t.Fatalf("switch status=%d body=%s, want 200", response.Code, response.Body.String())
 	}
-	if n := countRuleCertJobs(t, "lb_r10_manual"); n != 0 {
+	if n := countRuleCertJobs(t, "lb_manual_switch"); n != 0 {
 		t.Fatalf("cert jobs remaining=%d, want 0（脱离 ACME 必须删除全部关联任务，含 failed/issued）", n)
 	}
 	var tlsSource string
-	if err := db.DB.QueryRow("SELECT tls_source FROM lb_rules WHERE caddy_id='lb_r10_manual'").Scan(&tlsSource); err != nil || tlsSource != "manual" {
+	if err := db.DB.QueryRow("SELECT tls_source FROM lb_rules WHERE caddy_id='lb_manual_switch'").Scan(&tlsSource); err != nil || tlsSource != "manual" {
 		t.Fatalf("rule tls_source=%q err=%v, want manual", tlsSource, err)
 	}
 }
@@ -129,7 +129,7 @@ func TestUpdateRule_tlsUnchanged_keepsCertJobs(t *testing.T) {
 	}
 }
 
-// 孤儿自愈（历史用户裁定）：规则**早已**是手动证书（v2.3.5 时代转换语义
+// 孤儿自愈（用户裁定）：规则**早已**是手动证书（v2.3.5 时代转换语义
 // 遗留的残留行），重存（manual→manual，无转换事件）同样按终态删除孤儿行。
 // 实现与钉测同批落盘（终态判定超集自然覆盖）——基线钉豁免 RED。
 func TestUpdateRule_manualResave_healsOrphanCertJobs(t *testing.T) {

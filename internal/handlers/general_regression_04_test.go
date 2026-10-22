@@ -12,7 +12,7 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// 历史修复：域名迁移事务开启失败时的旧域任务退役语句被提取为可单测的
+// 域名迁移事务开启失败时的旧域任务退役语句被提取为可单测的
 // retireCertJobsForDomain。导入备份可携带非规范 domain 行（大小写/空白/顺序
 // 变体，config_backup 只校验 status 不归一 domain），退役必须与 certjobs.go
 // 同型按去空白小写归一（lower+replace）与 canonical/reversed 双形式匹配，
@@ -101,7 +101,7 @@ func TestRetireCertJobsForDomain(t *testing.T) {
 	})
 }
 
-// 历史修复：域名迁移前必须先取消在途旧域签发——否则 worker 可能在迁移把行改写为
+// 域名迁移前必须先取消在途旧域签发——否则 worker 可能在迁移把行改写为
 // 新域后仍完成签发，confirmCertificateDeployment 见到 job.domain==rule.domain
 // （同为新域）便放行，把旧域证书部署到新域（瞬时 TLS 名称不匹配）。测试直接
 // 观测取消回调触发时任务行仍是旧域（取消先于迁移 UPDATE）。

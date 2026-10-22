@@ -39,7 +39,7 @@
         <el-table-column label="版本" width="120">
           <template #default="{ row }"><span class="lib-version">{{ row.version }}</span></template>
         </el-table-column>
-        <!-- 历史修复：本列对 CRS/威胁/爬虫是条目数，对 IP 地理库是库文件大小——
+        <!-- 本列对 CRS/威胁/爬虫是条目数，对 IP 地理库是库文件大小——
              列名必须两义都覆盖，否则字节数会被读成条目数 -->
         <el-table-column label="数量 / 大小" width="120" align="right">
           <template #default="{ row }"><span class="lib-count">{{ row.count }}</span></template>
@@ -53,7 +53,7 @@
         </el-table-column>
         <el-table-column label="自动更新" width="90" align="center">
           <template #default="{ row }">
-            <!-- 历史修复：库状态读取失败/首次响应未落地时开关态不可信——显示「—」并禁用，
+            <!-- 库状态读取失败/首次响应未落地时开关态不可信——显示「—」并禁用，
                  不得按本地默认 true 冒充「已开启」 -->
             <span v-if="!row.autoUpdateKnown" class="text-secondary" title="库状态未知（读取失败），开关态不可信">—</span>
             <el-switch v-else :model-value="row.autoUpdate" :disabled="isReadOnly || isSlaveNode" @change="(v: boolean) => toggleLibAutoUpdate(row, v)" />
@@ -141,7 +141,7 @@
             </el-table-column>
             <el-table-column label="动作" width="80" align="center">
               <template #default="{ row }">
-                <!-- 历史修复：三态映射与编辑器（拦截/仅记录/放行计分）语义对齐——
+                <!-- 三态映射与编辑器（拦截/仅记录/放行计分）语义对齐——
                      pass 会累加异常分参与 949 评分拦截，与 log（仅记录）不可混示 -->
                 <el-tag :type="customActionView(row.action).type" size="small" effect="light">{{ customActionView(row.action).label }}</el-tag>
               </template>
@@ -352,7 +352,7 @@
         <el-button size="small" type="primary" plain @click="reloadIpListDetail">重新加载</el-button>
       </div>
       <el-form :model="ipListForm" label-width="80px" label-position="right" :disabled="ipListDialogReadOnly" v-loading="loadingIpListDetail">
-        <!-- 历史问题：自动封禁预置名单名称/分类/描述为内置字段（后端 400 守卫同口径），
+        <!-- 自动封禁预置名单名称/分类/描述为内置字段（后端 400 守卫同口径），
              前端直接禁用灰态——禁止修改的字段不可输入，而非提交后报 400 -->
         <div v-if="editingIpListPreset" class="form-tip-line">内置名单字段不可修改，仅条目可编辑（手动封禁 / 删除条目）</div>
         <el-form-item label="名称" required>
@@ -386,7 +386,7 @@
                   <el-input v-else v-model="row.remark" placeholder="可选备注" size="small" maxlength="100" />
                 </template>
               </el-table-column>
-              <!-- 历史问题：自动封禁名单条目展示加入时间/剩余（到期时间由剩余列表达；删除条目即解封） -->
+              <!-- 自动封禁名单条目展示加入时间/剩余（到期时间由剩余列表达；删除条目即解封）-->
               <template v-if="editingIpListPreset">
                 <el-table-column label="加入时间" width="140" align="center">
                   <template #default="{ row }">{{ formatDate(row.created_at) || '—' }}</template>
@@ -675,7 +675,7 @@ const fetchThreatLib = async () => {
     threatLibError.value = false
     threatLibLoaded.value = true
   } catch {
-    // 只读拉取失败：不打断页面，但健康标签必须显性为「加载失败」（历史问题）
+    // 只读拉取失败：不打断页面，但健康标签必须显性为「加载失败」
     threatLibError.value = true
     threatLibLoaded.value = true
   }
@@ -734,7 +734,7 @@ interface LibRow {
   count: string
   status: string
   autoUpdate: boolean
-  // 历史修复：读取失败/首次响应未落地时 autoUpdate 是本地默认值而非库值——
+  // 读取失败/首次响应未落地时 autoUpdate 是本地默认值而非库值——
   // 开关必须显示「未知」并禁用，不得冒充「已开启」。
   autoUpdateKnown: boolean
   lastChecked: string
@@ -745,11 +745,11 @@ const libRows = computed<LibRow[]>(() => {
   const rows: LibRow[] = [
     {
       key: 'crs', icon: Lock, iconClass: 'lib-icon--crs', name: 'CRS 规则库', sub: 'OWASP Core Rule Set',
-      // 读取失败时版本/条目显示 —（行保留，不冒充默认值；历史问题）
+      // 读取失败时版本/条目显示 —（行保留，不冒充默认值）
       version: crsInfoError.value ? '—' : crsInfo.value.available === false ? '未安装' : (crsInfo.value.version || '—'),  // 缺失态文案与 IP 库统一「未安装」（2026-09-24 用户裁定）
       // 库容量=GET /security/crs 的 rule_count（服务端全量）；分页 total 只反映
-      // 当前搜索条件下的结果集，二者不可共用（历史问题）。
-      // 历史修复：rule_count 是 SecRule 指令条数（后端 countSecRules 只数 SecRule 行），
+      // 当前搜索条件下的结果集，二者不可共用。
+      // rule_count 是 SecRule 指令条数（后端 countSecRules 只数 SecRule 行），
       // 不是文件数——文案必须是「条规则」（单源 crsRuleCountLabel，有行为测试）。
       count: crsInfoError.value ? '—' : crsRuleCountLabel(crsInfo.value.rule_count),
       autoUpdateKnown: !crsInfoError.value && crsInfoLoaded.value,
@@ -761,7 +761,7 @@ const libRows = computed<LibRow[]>(() => {
     {
       key: 'ip2region', icon: Location, iconClass: 'lib-icon--ip', name: 'IP 地理库', sub: 'IP 地理归属数据库',
       version: ip2regionInfoError.value ? '—' : ip2regionInfo.value.available === false ? '未安装' : ip2regionVersionLabel.value,
-      // 历史修复：db_size 是库文件字节数——必须带单位（B/KB/MB）呈现，不得让
+      // db_size 是库文件字节数——必须带单位（B/KB/MB）呈现，不得让
       // 用户把字节数读成条目数（条目口径见「数量/大小」列名的「大小」段）。
       count: !ip2regionInfoError.value && ip2regionInfo.value.db_size && ip2regionInfo.value.version && ip2regionInfo.value.version !== 'unknown' ? formatSize(ip2regionInfo.value.db_size) : '—',
       autoUpdateKnown: !ip2regionInfoError.value && ip2regionInfoLoaded.value,
@@ -771,7 +771,7 @@ const libRows = computed<LibRow[]>(() => {
       nextUpdate: formatDate(ip2regionInfo.value.next_update) || '—',
     },
   ]
-  // 威胁情报库与爬虫地址库共用「多源聚合成一行」单源（历史问题）：
+  // 威胁情报库与爬虫地址库共用「多源聚合成一行」单源
   // 与安全总览同一实现（utils/securityLibraries），空源/无版本为 never（未更新），
   // 不再折叠为 idle「已最新」。
   const summarize = (srcs: ThreatSource[]) => summarizeLibrarySources(srcs, formatDate)
@@ -816,10 +816,10 @@ const libRows = computed<LibRow[]>(() => {
 // 正常 success；缺库（后端渲染层已停用全部安全规则，见
 // SecurityLibrariesAvailable）时模板追加红色警示后缀。
 const libHealthTags = computed(() => [
-  // 历史问题：健康标签单源（utils/securityLibraries）——IP 库未安装时
+  // 健康标签单源（utils/securityLibraries）——IP 库未安装时
   // 显示「未安装」警示，不再与版本列「未安装」/状态列「已最新」互相矛盾。
   libraryHealthTag('CRS 规则库', {
-    // 历史修复：首次响应未落地不得冒充「正常」——loaded 三态
+    // 首次响应未落地不得冒充「正常」——loaded 三态
     loaded: crsInfoLoaded.value,
     loadError: crsInfoError.value,
     available: crsInfo.value.available,
@@ -889,7 +889,7 @@ const openLibDialog = (row: LibRow) => {
 }
 
 
-// —— 威胁库更新弹框（useLibUpdateDialog 统一范式，历史问题；状态/日志拉取失败静默，与原实现一致）——
+// 威胁库更新弹框（useLibUpdateDialog 统一范式，；状态/日志拉取失败静默，与原实现一致）——
 const threatUpdateLogRef = ref<HTMLDivElement | null>(null)
 const threatDialog = useLibUpdateDialog<ThreatUpdateInfo>({
   apiPrefix: '/security/threat-lib',
@@ -933,7 +933,7 @@ const {
 interface CRSRuleFile { filename: string; category: string; size: number; updated_at: string }
 interface CustomRuleCondition { target: string; operator: string; pattern: string }
 interface CustomRule { id: number; name: string; description: string; conditions: CustomRuleCondition[]; action: string; score: number; enabled: boolean; updated_at: string; updated_by: number }
-// 历史问题：自动封禁名单条目携带加入时间/到期时间（UTC 墙钟串，formatDate 消费）
+// 自动封禁名单条目携带加入时间/到期时间（UTC 墙钟串，formatDate 消费）
 interface IPListEntry { value: string; remark: string; created_at?: string; expires_at?: string }
 interface IPListRefPolicy { id: number; name: string }
 interface IPListRow { id: number; name: string; description: string; category: string; entries: IPListEntry[]; entry_count: number; ref_count: number; ref_policies: IPListRefPolicy[]; trusted_proxy_referenced?: boolean; trusted_proxy_scope?: string; created_by: number; created_at: string; updated_by: number; updated_at: string; system: boolean; preset_autoban?: boolean }
@@ -946,19 +946,19 @@ const isSlaveNode = computed(() => authStore.isSlaveNode)
 const isReadOnly = computed(() => authStore.readOnlyReason !== null)
 
 const users = ref<UserListItem[]>([])
-// 更新者显示名走 utils/updaterName 单源（历史修复 四份同构收敛）
+// 更新者显示名走 utils/updaterName 单源
 const getUpdaterName = (userId?: number) => updaterName(users.value, userId)
 
 const crsInfo = ref({ version: '', auto_update: true, updated_at: '', last_checked: '', next_update: '', update_status: '', message: '', available: true, rule_count: 0, schedule_days: [1, 2, 3, 4, 5, 6, 7] as number[], schedule_time: '04:00' })
 
 const ip2regionInfo = ref({ version: '', db_size: 0, auto_update: true, updated_at: '', last_checked: '', next_update: '', update_status: '', message: '', available: true, schedule_days: [1, 2, 3, 4, 5, 6, 7] as number[], schedule_time: '04:00' })
-// 读取失败标记（历史问题）：读取失败≠库缺失，更≠正常——标签与表格行都要显性
+// 读取失败标记：读取失败≠库缺失，更≠正常——标签与表格行都要显性
 // 表达「加载失败」，不能用默认值（available:true/空源列表）冒充正常态。
 const crsInfoError = ref(false)
 const ip2regionInfoError = ref(false)
 const threatLibError = ref(false)
 const crawlerLibError = ref(false)
-// 历史修复：加载三态——首次响应落地（成功或失败）前健康标签显示「加载中」，
+// 加载三态——首次响应落地（成功或失败）前健康标签显示「加载中」，
 // 初值 available:true/空源列表不得冒充「正常」。
 const crsInfoLoaded = ref(false)
 const ip2regionInfoLoaded = ref(false)
@@ -987,11 +987,11 @@ const currentFilename = ref('')
 const currentContent = ref('')
 
 const customRules = ref<CustomRule[]>([])
-// 历史问题：列表加载失败显性化（原空 catch，失败与「暂无自定义规则」不可区分）
+// 列表加载失败显性化（原空 catch，失败与「暂无自定义规则」不可区分）
 const customRulesError = ref(false)
 const customPage = ref(1)
 const customPageSize = ref(10)
-// 分页夹紧+切片：useClampedPagination 单一范式（历史）——删除末页
+// 分页夹紧+切片：useClampedPagination 单一范式——删除末页
 // 末条后自动回夹，不再空页。
 const { pagedItems: customRulesPaged } = useClampedPagination(customRules, customPage, customPageSize)
 const loadingCustom = ref(false)
@@ -1000,7 +1000,7 @@ const editingRuleId = ref<number | null>(null)
 const savingRule = ref(false)
 const ruleForm = ref({ name: '', description: '', conditions: [] as CustomRuleCondition[], action: 'block', score: 5, enabled: true })
 
-// 自定义规则动作三态视图（历史修复）：block=拦截 / log=仅记录 / pass=放行计分，
+// 自定义规则动作三态视图：block=拦截 / log=仅记录 / pass=放行计分，
 // 与编辑器 radio 及后端发射语义（pass 累加异常分、log 不累分）一一对应；
 // 未知动作兜底原样展示（info），不与任何已知语义混淆。
 const CUSTOM_ACTION_VIEWS: Record<string, { label: string; type: 'danger' | 'info' | 'warning' }> = {
@@ -1024,14 +1024,14 @@ const ipListsFiltered = computed(() => {
   if (!query) return ipLists.value
   return ipLists.value.filter((l) => l.name.toLowerCase().includes(query) || (l.category || '').toLowerCase().includes(query))
 })
-// IP 地址列表同款（历史）：删除末页末条后自动回夹——此前仅搜索有
+// IP 地址列表同款：删除末页末条后自动回夹——此前仅搜索有
 // 复位 watch，删除路径无收敛，越界 slice 返回空数组呈空白表格。
 const { pagedItems: ipListsPaged } = useClampedPagination(ipListsFiltered, ipListPage, ipListPageSize)
 // 搜索收窄后高页码会落在空页，回到第 1 页
 watch(ipListSearch, () => { ipListPage.value = 1 })
 const ipListDialogVisible = ref(false)
 // 内置名单（威胁情报库 system=1）弹框恒只读（管理员同）——内容只读查看/导出。
-// 历史问题 例外：自动封禁预置名单条目可改（手动封禁/删除条目——删除即解封，
+// 例外：自动封禁预置名单条目可改（手动封禁/删除条目——删除即解封，
 // 2026-10-15 用户裁定：无抑制窗口，IP 重新达标会被再次封禁）。
 const editingIpListPreset = ref(false)
 const ipListDialogReadOnly = computed(() => isReadOnly.value || (editingIpListSystem.value && !editingIpListPreset.value))
@@ -1054,7 +1054,7 @@ const retryIpLists = (): void => { void fetchIpLists() }
 
 const editingIpListSystem = ref(false)
 const loadingIpListDetail = ref(false)
-// 详情加载失败：entries 为空且保存可用 → 全量 PUT 会清空名单（历史问题）
+// 详情加载失败：entries 为空且保存可用 → 全量 PUT 会清空名单
 const ipListDetailFailed = ref(false)
 const ipListDetailRowId = ref<number | null>(null)
 const ipListEntryPage = ref(1)
@@ -1070,7 +1070,7 @@ const addIpListEntry = (): void => {
   ipListEntryPage.value = Math.ceil(ipListForm.value.entries.length / ipListEntryPageSize)
 }
 
-// 历史修复：删除末页末条后页码越界会落在空页（空白表格）——splice 后回夹最大页
+// 删除末页末条后页码越界会落在空页（空白表格）——splice 后回夹最大页
 
 //（同 useClampedPagination 的 maxPage 夹紧口径，entries 切片另有共享数组注释见上）
 const removeIpListEntry = (index: number): void => {
@@ -1079,7 +1079,7 @@ const removeIpListEntry = (index: number): void => {
   if (ipListEntryPage.value > maxPage) ipListEntryPage.value = maxPage
 }
 
-// —— 历史问题：自动封禁名单弹框的到期展示 ——
+// 自动封禁名单弹框的到期展示 ——
 
 // 到期判定/剩余时长以浏览器本地解析（parseDbTimeMs 已做 UTC +Z 规范化）与
 // Date.now 对比——展示层近似（分钟粒度），封禁真值以后端投影过滤为准。
@@ -1097,7 +1097,7 @@ const autobanEntryRemaining = (expiresAt: string): string => {
   return `${Math.floor(hours / 24)} 天 ${hours % 24} 时`
 }
 
-// 历史问题：乱序响应守卫（镜像同文件 openRuleContent 的 ruleContentSeq 范式）——
+// 乱序响应守卫（镜像同文件 openRuleContent 的 ruleContentSeq 范式）——
 // 快速关开/切换名单时在途详情响应晚到，不再覆盖当前弹框（含「新建」空表单被
 // 旧名单条目覆盖的形态）
 let ipListDetailSeq = 0
@@ -1124,18 +1124,18 @@ const openIpListDialog = async (row?: IPListRow) => {
   ipListDialogVisible.value = true
   loadingIpListDetail.value = true
   try {
-    // 历史修复：全局拦截器已 toast——本请求 silent，失败提示只用本地那条带
+    // 全局拦截器已 toast——本请求 silent，失败提示只用本地那条带
     // 「已禁用保存」动作信息的文案（否则同一次失败弹两条 error）。
     const res = await request.get<APIResponse<IPListRow>>(`/security/ip-lists/${row.id}`, { silent: true })
     if (requestSeq !== ipListDetailSeq) return
     if (res.data && ipListDialogVisible.value) {
-      // 历史问题：自动封禁名单条目保留 created_at/expires_at（保存随全量写回，
+      // 自动封禁名单条目保留 created_at/expires_at（保存随全量写回，
       // 任务 merge 的到期语义与弹框到期列依赖这两字段）
       ipListForm.value.entries = (res.data.entries || []).map((e) => ({ value: e.value, remark: e.remark, created_at: e.created_at, expires_at: e.expires_at }))
     }
   } catch {
     if (requestSeq !== ipListDetailSeq) return
-    // 失败态显性化并禁用保存（历史问题）：空 entries 下保存=全量清空名单
+    // 失败态显性化并禁用保存：空 entries 下保存=全量清空名单
     ipListDetailFailed.value = true
     ElMessage.error('加载列表条目失败，已禁用保存；请重新加载')
   } finally {
@@ -1150,7 +1150,7 @@ const reloadIpListDetail = async (): Promise<void> => {
   const requestSeq = ++ipListDetailSeq
   loadingIpListDetail.value = true
   try {
-    // 历史修复：同 openIpListDialog——silent + 本地文案，避免双 toast。
+    // 同 openIpListDialog——silent + 本地文案，避免双 toast。
     const res = await request.get<APIResponse<IPListRow>>(`/security/ip-lists/${id}`, { silent: true })
     if (requestSeq !== ipListDetailSeq) return
     ipListForm.value.entries = (res.data?.entries || []).map((e) => ({ value: e.value, remark: e.remark, created_at: e.created_at, expires_at: e.expires_at }))
@@ -1182,10 +1182,10 @@ const saveIpList = async () => {
       : '存在未填写条目值的行，请补全或删除空行')
     return
   }
-  // 允许空列表保存（历史用户裁定）：后端 validateIPListShape 不要求非空；
-  // allow 模式策略引用的清空由后端 历史修复 守卫 409 拦截（fail-open 防护）
+  // 允许空列表保存（用户裁定）：后端 validateIPListShape 不要求非空；
+  // allow 模式策略引用的清空由后端守卫 409 拦截（fail-open 防护）
   if (entries.length > 2000) { ElMessage.warning('每个列表最多 2000 条条目'); return }
-  // 已有名单 + 0 条：全量 PUT 会清空——必须二次确认且文案明示（历史问题）
+  // 已有名单 + 0 条：全量 PUT 会清空——必须二次确认且文案明示
   if (needsEmptyListConfirm(editingIpListId.value, entries.length)) {
     try {
       await ElMessageBox.confirm(`将清空列表「${name}」的全部条目（保存后不可恢复），确定继续？`, '清空确认', { type: 'warning', confirmButtonText: '清空并保存' })
@@ -1202,7 +1202,7 @@ const saveIpList = async () => {
     const res = editingIpListId.value
       ? await request.put(`/security/ip-lists/${editingIpListId.value}`, body)
       : await request.post('/security/ip-lists', body)
-    // 历史问题-03：名单直编是共享条目缓存的另一写入口（此前仅 IPLocationAction
+    // 名单直编是共享条目缓存的另一写入口（此前仅 IPLocationAction
     // 失效缓存）——不失效时策略向导/处置弹层会继续读旧条目。
     invalidateSharedEntriesCache()
     showSaveResult(res, '保存成功'); ipListDialogVisible.value = false; fetchIpLists()
@@ -1214,7 +1214,7 @@ const saveIpList = async () => {
 
 const deletingIpListId = ref<number | null>(null)
 const deleteIpList = (row: IPListRow) => {
-  // 重入守卫（历史问题-01，同 SecurityPolicies deletingPolicyId 范式）：快速双击
+  // 重入守卫（同 SecurityPolicies deletingPolicyId 范式）：快速双击
   // 不再叠加双确认框→双 DELETE 误报
   if (deletingIpListId.value !== null) return
   deletingIpListId.value = row.id
@@ -1222,7 +1222,7 @@ const deleteIpList = (row: IPListRow) => {
     .then(async () => {
       // 被策略引用时后端返回 409（含引用策略名的 message 由全局拦截器 toast）
       const del = await request.delete(`/security/ip-lists/${row.id}`)
-      // 删除同样使条目缓存失效（历史问题-03）。
+      // 删除同样使条目缓存失效。
       invalidateSharedEntriesCache()
       showSaveResult(del, '已删除'); fetchIpLists()
     }).catch(() => { /* 用户取消:不动列表;HTTP 失败已由全局拦截器 toast */ })
@@ -1237,7 +1237,7 @@ const triggerImportEntries = (): void => {
 }
 
 // 行格式：第一列 IP/CIDR，第二列备注（可空）；支持 CSV 双引号字段与 `""`
-// 反转义（与导出单源：utils/ipListCsv，历史问题 往返一致）
+// 反转义（与导出单源：utils/ipListCsv，往返一致）
 const parseEntryLine = (line: string): { value: string; remark: string } | { error: 'remark_too_long' } | null =>
   parseIpListEntryLine(line, isValidCidr)
 
@@ -1325,7 +1325,7 @@ const patternPlaceholder = (cond: CustomRuleCondition): string => {
   return PATTERN_PLACEHOLDERS[cond.target] ?? '匹配值'
 }
 
-// 历史修复 快捷预设：标签为用户友好文案，value 为真实 UA 中的准确片段
+// 快捷预设：标签为用户友好文案，value 为真实 UA 中的准确片段
 // （@contains 大小写敏感，value 必须与线上 UA 实际大小写一致才能命中）
 const UA_PRESET_GROUPS: ReadonlyArray<{ label: string; values: ReadonlyArray<{ label: string; value: string }> }> = [
   { label: '攻击工具', values: [
@@ -1374,7 +1374,7 @@ const regexTestStrings = ref<Record<number, string>>({})
 const uaCollapsed = ref<Record<number, boolean>>({})
 const regexCollapsed = ref<Record<number, boolean>>({})
 
-// 历史问题：三个按条件下标索引的会话态必须在每次打开弹框时清空——原实现跨
+// 三个按条件下标索引的会话态必须在每次打开弹框时清空——原实现跨
 // 规则复用，先编辑规则 A 输入测试串再打开规则 B，同下标条件会显示 A 的测试串
 // 与「匹配/不匹配」结果，误导正则调试。
 const resetRuleDialogSession = (): void => {
@@ -1407,13 +1407,13 @@ const isValidRegex = (pattern: string): boolean => {
 }
 
 function buildJSRegex(pattern: string): { re: RegExp | null; valid: boolean } {
-	// 历史问题① + 历史问题(历史):合法性以后端 RE2(coraza)为准。
+	// +:合法性以后端 RE2(coraza)为准。
 	// RE2 支持:组合内联 flag(?im)/中置 flag(a(?i)b)/flag 组((?i:...))/
 	// 命名组((?P<name>))/flag 取反((?-i));不支持 lookaround/反向引用。
 	if (/\(\?<?[=!]/.test(pattern) || /\\[1-9]/.test(pattern) || /\\k</.test(pattern)) {
 		return { re: null, valid: false }
 	}
-	// 历史问题(历史):lead 捕获含取反 '-'——白名单 {i,m,s,U,-} 真正
+	// lead 捕获含取反 '-'——白名单 {i,m,s,U,-} 真正
 	// 生效(此前捕获组不含 '-',取反形态连 lead 都匹配不上)。
 	const lead = pattern.match(/^\(\?([-a-zA-Z]+)\)/)
 	if (lead && !/^(?:[imsU]+(?:-[imsU]+)?|-[imsU]+)$/.test(lead[1])) {
@@ -1422,7 +1422,7 @@ function buildJSRegex(pattern: string): { re: RegExp | null; valid: boolean } {
 	let src = pattern
 	let flags = ''
 	if (lead) {
-		// 历史问题+历史问题(历史):RE2 取反语义——'-' 后的 flag 关闭、前缀
+		// +:RE2 取反语义——'-' 后的 flag 关闭、前缀
 		// 开启;JS 无原生取反,预览近似:'-' 前的正向 flag 照收(!negated
 		// 守卫),'-' 后的跳过(不重置累积——(?i-s) 保留 i、丢弃 s,比全清
 		// 更接近 RE2);纯取反((?-i))不加任何 flag(全默认)。
@@ -1434,9 +1434,9 @@ function buildJSRegex(pattern: string): { re: RegExp | null; valid: boolean } {
 		src = src.slice(lead[0].length)
 	}
 	src = src.replace(/\(\?P</g, '(?<')
-	// 历史问题:中置内联 flag((?i)a(?m)b)——JS 不识别,剥离后重试(RE2 合法)。
+	// 中置内联 flag((?i)a(?m)b)——JS 不识别,剥离后重试(RE2 合法)。
 	const midFlagStripped = src.replace(/\(\?(?:[imsU]+(?:-[imsU]+)?|-[imsU]+)\)(?=[^)]|$)/g, '')
-	// 历史问题:flag 组((?i:...))——JS 不识别,替换为普通分组后再试;真语法错误
+	// flag 组((?i:...))——JS 不识别,替换为普通分组后再试;真语法错误
 	// (未闭合括号等)在三段试编译全失败后判 invalid,不再被兜底掩盖。
 	const flagGroupsOpened = src.replace(/\(\?[-imsU]+:/g, '(')
 	const candidates = [src, midFlagStripped, flagGroupsOpened]
@@ -1457,7 +1457,7 @@ const fetchCRS = async () => {
     crsInfoError.value = false
     crsInfoLoaded.value = true
   } catch {
-    // 读取失败：标签/行状态显性化（历史问题），不沿用默认值伪装正常
+    // 读取失败：标签/行状态显性化，不沿用默认值伪装正常
     crsInfoError.value = true
     crsInfoLoaded.value = true
   }
@@ -1474,7 +1474,7 @@ const removeCondition = (idx: number) => {
     else if (n > idx) next[n - 1] = prev[n]
   }
   regexTestStrings.value = next
-  // 历史问题：折叠态键同步重排（同 regexTestStrings 口径，否则删除后整体错位）
+  // 折叠态键同步重排（同 regexTestStrings 口径，否则删除后整体错位）
   for (const src of [uaCollapsed, regexCollapsed]) {
     const p = src.value
     const n2: Record<number, boolean> = {}
@@ -1488,10 +1488,10 @@ const removeCondition = (idx: number) => {
 }
 // 搜索提交先回到第 1 页:高页码叠加收窄后的结果集会落在空页上
 const searchRules = () => { page.value = 1; fetchRules() }
-// 历史问题-33：CRS 标签服务端分页 size-change 不复位 page——高页码叠加放大 pageSize
+// CRS 标签服务端分页 size-change 不复位 page——高页码叠加放大 pageSize
 // 会请求越界 offset(空表停留在空页);对齐本文件自定义规则/IP 列表「size-change 回第 1 页」口径
 const onRulesSizeChange = () => { page.value = 1; fetchRules() }
-// 乱序响应守卫（历史问题）：翻页/搜索快速切换时，慢响应晚到不得覆盖当前页
+// 乱序响应守卫：翻页/搜索快速切换时，慢响应晚到不得覆盖当前页
 let rulesRequestSeq = 0
 const rulesLoadError = ref(false)
 const fetchRules = async () => {
@@ -1507,7 +1507,7 @@ const fetchRules = async () => {
     rulesLoadError.value = false
   } catch {
     // 失败保留上一页数据（全局拦截器已 toast）；首拉失败时显式横幅，
-    // 不得把失败渲染成「暂无规则文件」（历史问题-1）。
+    // 不得把失败渲染成「暂无规则文件」。
     if (rules.value.length === 0) rulesLoadError.value = true
   } finally {
     if (requestSeq === rulesRequestSeq) loadingRules.value = false
@@ -1527,7 +1527,7 @@ const retryCustomRules = (): void => {
   void fetchCustomRules()
   if (usersError.value) void fetchUsers()
 }
-// 历史问题：用户名册失败只影响「更新者」列（显示 '-'），不冒充规则数据空态——
+// 用户名册失败只影响「更新者」列（显示 '-'），不冒充规则数据空态——
 // 与自定义规则错误共用横幅但文案区分。
 const usersError = ref(false)
 const fetchUsers = async () => {
@@ -1629,7 +1629,7 @@ const saveCrawlerSchedule = async ({ days, time }: { days: number[]; time: strin
   } catch { /* 全局拦截器已 toast */ } finally { savingCrawlerSchedule.value = false }
 }
 
-// —— CRS 规则库更新弹框（useLibUpdateDialog 统一范式，历史问题）——
+// CRS 规则库更新弹框（useLibUpdateDialog 统一范式）——
 const updateLogRef = ref<HTMLDivElement | null>(null)
 const crsDialog = useLibUpdateDialog<CRSUpdateInfo>({
   apiPrefix: '/security/crs',
@@ -1652,7 +1652,7 @@ const {
   confirmUpdate,
 } = crsDialog
 
-// —— IP2Region 库更新弹框（useLibUpdateDialog 统一范式，历史问题）——
+// IP2Region 库更新弹框（useLibUpdateDialog 统一范式）——
 const ip2regionUpdateLogRef = ref<HTMLDivElement | null>(null)
 const ip2regionDialog = useLibUpdateDialog<IP2RegionUpdateInfo>({
   apiPrefix: '/security/ip2region',
@@ -1680,7 +1680,7 @@ const openRuleDialog = (row?: CustomRule) => {
   editingRuleId.value = row?.id ?? null
   if (row) {
     // 存量空条件规则：自动补一条空条件行，让用户可见地修正而非卡在无法保存的死角
-    // 历史修复：逐条深拷贝——浅拷贝数组会让弹框 v-model 直接改写
+    // 逐条深拷贝——浅拷贝数组会让弹框 v-model 直接改写
     // 列表行对象（取消/保存失败后表格展示未落库的修改态）。
     const conditions = row.conditions.length ? row.conditions.map((c) => ({ ...c })) : [{ target: 'uri', operator: 'contains', pattern: '' }]
     ruleForm.value = { name: row.name, description: row.description, conditions, action: row.action, score: row.score, enabled: row.enabled }
@@ -1717,7 +1717,7 @@ const saveCustomRule = async () => {
 
 const deletingCustomRuleId = ref<number | null>(null)
 const deleteCustomRule = (row: CustomRule) => {
-  // 重入守卫（历史问题-01，同 SecurityPolicies deletingPolicyId 范式）：快速双击
+  // 重入守卫（同 SecurityPolicies deletingPolicyId 范式）：快速双击
   // 不再叠加双确认框→双 DELETE 误报
   if (deletingCustomRuleId.value !== null) return
   deletingCustomRuleId.value = row.id
@@ -1732,11 +1732,11 @@ const deleteCustomRule = (row: CustomRule) => {
     .finally(() => { deletingCustomRuleId.value = null })
 }
 
-// WAF 文件大小：formatBytes 单一事实源（历史）
+// WAF 文件大小：formatBytes 单一事实源
 const formatSize = (b: number) => formatBytes(b)
 
 onMounted(() => {
-  // 历史修复(历史):消费 ?tab= 后剥离(与 历史修复 sp 口径一致,SecurityPolicies.vue
+  // 消费?tab= 后剥离(与 sp 口径一致,SecurityPolicies.vue
   // 先例)——视图切换走 authStore.currentPage 而非 hash 路由,replaceState 仅留
   // pathname 不破坏页面基座;仅当 URL 实际携带 tab 参数时才剥离。
   const query = new URLSearchParams(location.search)
@@ -1752,14 +1752,14 @@ onUnmounted(() => {
   // 作废在途响应并暂停轮询（轮询终态清理由 usePollingTask 内置 onUnmounted 兜底）
   crsDialog.dispose()
   ip2regionDialog.dispose()
-  threatDialog.dispose() // 历史问题（历史）：与两兄弟对齐（曾缺席）
+  threatDialog.dispose() // 与两兄弟对齐（曾缺席）
   crawlerDialog.dispose()
 })
 </script>
 
 <style scoped>
 .count-tip { font-size: 12px; vertical-align: -1px; margin-left: 2px; color: var(--text-secondary); cursor: help; }
-/* 历史问题(历史,历史问题):全局表格居中规则(main.css inline-flex
+/* 全局表格居中规则(main.css inline-flex
    nowrap+overflow hidden)把条件列多标签裁剪成单行——3/4 条件不可见。
    条件列挂专用 class-name（rule-cond-cell），样式下沉到非 scoped 块只命中
    该列，不再用页级 :deep 覆盖全页含标签单元格。 */

@@ -7,8 +7,8 @@ import (
 )
 
 // 收敛到既有 helper GetCertExpiryThreshold（certinfo.go）——读取失败告警由内联
-// warn 级统一为 error 级（与 cert_renewal_days 读取族 历史修复 口径一致）。
-func TestU7_P5_2_checkManualCertExpiration_expiryReadFailureLogsAtErrorLevel(t *testing.T) {
+// warn 级统一为 error 级（与 cert_renewal_days 读取族口径一致）。
+func TestCheckManualCertExpiration_ExpiryReadFailureLogsAtErrorLevel(t *testing.T) {
 	// Given a broken global_config read（表被改名，读取必失败）
 	_, database := newClusterTestService(t)
 	if _, err := database.Exec("ALTER TABLE global_config RENAME TO global_config_u752_bak"); err != nil {
@@ -37,9 +37,9 @@ func TestU7_P5_2_checkManualCertExpiration_expiryReadFailureLogsAtErrorLevel(t *
 	}
 }
 
-// 一条 error 告警（历史修复 家族口径，历史修复 钉的 helper 侧镜像）；0/负值回退 30
-// （2026-09-07 历史修复：UI 输入 min=1，0/负值仅 API 直写/导入可达，按 30 天兜底）。
-func TestU7_P5_2_GetCertRenewalDays_contract(t *testing.T) {
+// 一条 error 告警（家族口径，钉的 helper 侧镜像）；0/负值回退 30
+// （2026-09-07：UI 输入 min=1，0/负值仅 API 直写/导入可达，按 30 天兜底）。
+func TestGetCertRenewalDays_contract(t *testing.T) {
 	_, database := newClusterTestService(t)
 
 	if _, err := database.Exec("UPDATE global_config SET cert_renewal_days=7 WHERE id=1"); err != nil {

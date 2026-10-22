@@ -53,7 +53,7 @@ type syncFailure struct {
 }
 
 // syncApplyGuard 是 Pull 在 admission 前复核通过的角色/凭据快照；applySnapshot
-// 在事务内二次复核同一三元组（历史问题，历史）：即使 Promote 在「复核通过 →
+// 在事务内二次复核同一三元组：即使 Promote 在「复核通过 →
 // 事务开启」之间翻转角色，旧拉取也不得把从节点数据写回已升主的库。
 type syncApplyGuard struct {
 	MasterURL string
@@ -78,13 +78,13 @@ const (
 var errClusterPinMismatch = errors.New("主节点 TLS 证书指纹不匹配")
 
 // ErrClusterPinMismatch 导出 errClusterPinMismatch，供 handler 侧识别服务控制
-// 调用的指纹不匹配失败并返回可行动文案（历史问题：主→从服务控制的 TOFU 钉扎）。
+// 调用的指纹不匹配失败并返回可行动文案（主→从服务控制的 TOFU 钉扎）。
 var ErrClusterPinMismatch = errClusterPinMismatch
 
 // errSyncPullStopped 是 beginPull 在停机竞态（Stop 期间）下的哨兵错误：该路径
 // 不得落库覆盖 apply_ok_reload_failed 标记（见 recordSyncError），错误本身仍
 // 返回给调用方（含手动 Pull 的 API 响应）。
-// ErrSlaveReadOnly 从节点尝试修改设置时的哨兵错误（历史修复:替代字符串匹配，
+// ErrSlaveReadOnly 从节点尝试修改设置时的哨兵错误（替代字符串匹配，
 // 改文案不再静默破坏 403 判定）。
 var ErrSlaveReadOnly = errors.New("从节点不能修改集群设置")
 
@@ -97,7 +97,7 @@ var errSyncTokenRevoked = errors.New("集群令牌已被主节点撤销，请重
 
 // errSyncMasterNoPull 表示主节点被调用 Pull：主节点没有同步对象，该错误
 // 只返回调用方（手动同步 API），不得经 recordSyncError 落库污染
-// last_sync_error（节点页面会持续显示且无自动清除路径，历史修复）。
+// last_sync_error（节点页面会持续显示且无自动清除路径）。
 var errSyncMasterNoPull = errors.New("主节点不能从其他节点同步")
 
 func (err *SnapshotSchemaTooNewError) Error() string {
@@ -129,8 +129,8 @@ type SyncService struct {
 	pullWG               sync.WaitGroup
 	reportAuditMu        sync.Mutex
 	lastReportFailureMsg string
-	// syncAuditMu/lastSyncFailureKey 是同步失败操作审计的节流状态（历史问题-01，
-	// 历史问题）：同一失败内容（动作+类别+明细）只写一条操作审计，
+	// syncAuditMu/lastSyncFailureKey 是同步失败操作审计的节流状态
+	// 同一失败内容（动作+类别+明细）只写一条操作审计，
 	// 内容变化或同步恢复成功后再失败时重记——与 Report 的
 	// lastReportFailureMsg 同口径。主节点持续返回签名无效/schema 不匹配/应用
 	// 失败时 run 按 1s→30s 退避无限重试，此前每轮 1 条操作审计（默认 60s
@@ -147,24 +147,24 @@ type SyncService struct {
 	beforeApplyWrite       func()
 	beforeRecordSyncStatus func()
 	// applyGuard 记录本次拉取在 admission 前复核通过的角色/凭据快照：
-	// applySnapshot 在事务内二次复核（历史问题），覆盖「复核通过 → 事务开启」
+	// applySnapshot 在事务内二次复核，覆盖「复核通过 → 事务开启」
 	// 之间角色被 Promote 翻转的窗口。零值=直接调用 applySnapshot 的测试路径，
 	// 跳过复核（生产唯一调用方 Pull 恒填充）。
 	applyGuard syncApplyGuard
 	// wafRepullFailures 记录 WAF 文件兜底重拉的连续未收敛轮数（内存态，
 	// atomic.Int32：常规读写发生在 Pull 的 pullMu 临界区内；startLocked/Stop
 	// 的清零复位不持 pullMu，与 Halted 态手动 Pull 的临界区无共同互斥锁，
-	// 故全部访问经原子操作避免数据竞争（历史问题））。连续未收敛达到
+	// 故全部访问经原子操作避免数据竞争）。连续未收敛达到
 	// wafRepullMaxFailures 轮后：把「安全数据持续同步失败」上表面到
 	// last_sync_error（节点页面可见），并把兜底重拉降频为每 wafRepullEvery
 	// 轮一次；收敛后清零恢复正常。
 	wafRepullFailures atomic.Int32
-	// reloadRepullFailures（历史问题）：重载失败 marker 触发的补偿
+	// reloadRepullFailures：重载失败 marker 触发的补偿
 	// 全量重拉的连续失败计数——与 wafRepullFailures 同款节流（5 轮后降频为
 	// 每 10 轮），防止 Caddy /load 持续故障时每同步周期全量重拉+全表重写+
 	// 强制重载+2 条审计记录的次生负载（间隔下限实为 10s，非 60s）。
 	reloadRepullFailures atomic.Int32
-	// wakePending 记录「已请求唤醒但尚未进入等待」的事件（历史问题-03）。
+	// wakePending 记录「已请求唤醒但尚未进入等待」的事件。
 	// 仅靠 close+replacement 的 wakeCh 只能唤醒此刻已 select 在该通道上的
 	// 等待者：Wake 若落在 run 的 Pull/Report 收尾期间（下次 waitDelay 尚未
 	// 抓取通道），close 的旧通道随后被替换，唤醒被丢弃 → 最长延迟一个
@@ -193,7 +193,7 @@ func (s *SyncService) do(req *http.Request) (*http.Response, error) {
 		return nil, errors.New("集群主节点地址必须使用 HTTP 或 HTTPS")
 	}
 	s.initClusterClient()
-	// 历史修复①：内存已验证指纹仅在 pin 文件「存在」时复核防篡改（存在+不一致 =
+	// 内存已验证指纹仅在 pin 文件「存在」时复核防篡改（存在+不一致 =
 	// 发送令牌前拒绝，errClusterPinMismatch）；文件缺失（forget-pins 端点/手工
 	// 清理）不回写重建——旧逻辑 verifyOrStoreClusterPin 会把删除动作立即用内存
 	// 指纹撤销、TOFU 失去重钉入口，改为交由 transport 握手按当前证书重新钉扎
@@ -221,7 +221,7 @@ func (s *SyncService) do(req *http.Request) (*http.Response, error) {
 // (凭证不出原主机;TOFU transport 对自签证书自动钉扎);跨主机重定向一律
 // 不跟随(凭证外泄防护,见 doesNotFollowHTTPRedirect 契约测试)。
 func (s *SyncService) doWithTLSUpgradeRedirect(req *http.Request) (*http.Response, error) {
-	// 历史问题 合并:委托导出函数(原两份近乎逐字重复的实现——方法版与
+	// 合并:委托导出函数(原两份近乎逐字重复的实现——方法版与
 	// cluster_control.go 函数版;合并后单一事实源,行为取方法版的合成空响应
 	// 语义——函数版原实现有「已 Close 的 body 返回调用方」缺陷)
 	return DoWithSameHostTLSUpgradeRedirect(s.client, req)
@@ -493,7 +493,7 @@ func (s *SyncService) Resume() {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 	if syncLifecycleState(s.state.Load()) != syncStateHalted {
-		// 历史问题-1：健康的从节点重新注册时循环仍在旧 interval 的 sleep 中；
+		// 健康的从节点重新注册时循环仍在旧 interval 的 sleep 中；
 		// Resume 对非 Halted 态原本是 no-op，最长要等 sync_interval 才重读
 		// 新 master_url/token。唤醒当前等待，让下一轮立即用新状态拉取。
 		s.Wake()
@@ -516,7 +516,7 @@ func (s *SyncService) Wake() {
 	if s.wakeCh == nil {
 		s.wakeCh = make(chan struct{})
 	}
-	// 历史问题-03：同时置 pending——唤醒可能发生在 run 已离开等待、仍在
+	// 同时置 pending——唤醒可能发生在 run 已离开等待、仍在
 	// Pull/Report 的窗口，此时 close 旧通道后下一次等待拿到的是新通道，
 	// 单靠通道会丢失本次唤醒。
 	s.wakePending = true
@@ -532,7 +532,7 @@ func (s *SyncService) defaultWaitDelay(ctx context.Context, delay time.Duration)
 	if s.wakeCh == nil {
 		s.wakeCh = make(chan struct{})
 	}
-	// 历史问题-03：先消费「等待前已到达」的唤醒（与 Wake 同锁，二者之间不存在
+	// 先消费「等待前已到达」的唤醒（与 Wake 同锁，二者之间不存在
 	// 丢失窗口），再走通道等待。
 	if s.wakePending {
 		s.wakePending = false
@@ -566,7 +566,7 @@ func (s *SyncService) startLocked(resume bool) {
 	s.pullAdmissionMu.Lock()
 	s.pullsStopped = false
 	s.pullAdmissionMu.Unlock()
-	// 新一轮循环从读态开始，启动前遗留的 pending 唤醒已无意义（历史问题-03）。
+	// 新一轮循环从读态开始，启动前遗留的 pending 唤醒已无意义。
 	s.wakeMu.Lock()
 	s.wakePending = false
 	s.wakeMu.Unlock()
@@ -579,7 +579,7 @@ func (s *SyncService) startLocked(resume bool) {
 	done := make(chan struct{})
 	s.done = done
 	// 角色切换/重启复用同一实例：清零 WAF 兜底重拉连续未收敛计数，
-	// 避免陈旧计数让新会话首次漂移重拉被降频延迟（历史问题）。
+	// 避免陈旧计数让新会话首次漂移重拉被降频延迟。
 	s.wafRepullFailures.Store(0)
 	s.reloadRepullFailures.Store(0)
 	s.state.Store(uint32(syncStateRunning))
@@ -626,7 +626,7 @@ func (s *SyncService) Stop() {
 		<-done
 	}
 	s.pullWG.Wait()
-	// 防御性清零：与 startLocked 配对，确保 Stop 后实例处于干净状态（历史问题）。
+	// 防御性清零：与 startLocked 配对，确保 Stop 后实例处于干净状态。
 	s.wafRepullFailures.Store(0)
 	s.reloadRepullFailures.Store(0)
 	s.resetSyncFailureAuditThrottle()
@@ -636,9 +636,9 @@ func (s *SyncService) Stop() {
 }
 
 // syncDrainers 按数据库句柄登记同步服务实例，供 ClusterService.Promote 在
-// 角色翻转前显式排干在途拉取（历史问题）。用 *sql.DB 作键隔离测试实例
+// 角色翻转前显式排干在途拉取。用 *sql.DB 作键隔离测试实例
 // （每个夹具独立库），避免全局单例被跨测试覆盖。
-// 历史问题-06（历史）：按库保留全部实例（与 clusterServices 对称）——
+// 按库保留全部实例（与 clusterServices 对称）——
 // 原「后注册覆盖」在测试或同库重建服务时只排干最后一个实例，其余在途 apply
 // 不受 drain 保护；同时提供 unregister 与死句柄回收，避免全局表无限累积。
 var (
@@ -661,7 +661,7 @@ func registerSyncDrainer(service *SyncService) {
 	syncDrainersMu.Unlock()
 }
 
-// unregisterSyncDrainer 移除单个实例（历史问题-06）：测试 teardown 与显式释放
+// unregisterSyncDrainer 移除单个实例：测试 teardown 与显式释放
 // 路径调用，避免全局表强引用已 Close 的 *sql.DB。
 func unregisterSyncDrainer(service *SyncService) {
 	if service == nil || service.db == nil {
@@ -728,7 +728,7 @@ func (s *SyncService) reopenPullAdmission() {
 // DrainPulls 停止拉取准入并把在途 Pull 等到落定（含已通过 admission 的
 // apply 临界区）。Promote 在提交主节点态之前调用：engine.StopLoop 只取消
 // daemon ctx、daemon 的 Stop 在另一 goroutine 异步执行，不显式排干则旧拉取
-// 可能在升主提交后继续把从节点数据写回库（历史问题/历史修复）。
+// 可能在升主提交后继续把从节点数据写回库。
 // ctx 到期返回其错误（调用方中止提升，不做半程角色翻转）。
 func (s *SyncService) DrainPulls(ctx context.Context) error {
 	s.pullAdmissionMu.Lock()
@@ -767,7 +767,7 @@ func (s *SyncService) RegisterWithMaster(ctx context.Context, masterURL string, 
 		return models.ClusterRegistration{}, fmt.Errorf("连接主节点失败: %w", err)
 	}
 	defer resp.Body.Close()
-	// 历史问题-1(历史修复):未跟随的 3xx(跨主机/反代重定向)在读 body 前拦截——
+	// 未跟随的 3xx(跨主机/反代重定向)在读 body 前拦截——
 	// 同主机 https 升级已由 doWithTLSUpgradeRedirect 重放,残留 3xx 的空 body
 	// 落进 JSON 解析只会报「unexpected end of JSON input」;给与 Pull 3xx
 	// 分支同款的可行动指引。
@@ -778,7 +778,7 @@ func (s *SyncService) RegisterWithMaster(ctx context.Context, masterURL string, 
 		Message string                     `json:"message"`
 		Data    models.ClusterRegistration `json:"data"`
 	}
-	// 历史问题(历史):+1 探针(历史问题 口径)——裸 LimitReader 静默截断
+	// +1 探针——裸 LimitReader 静默截断
 	// 使超限响应被误诊为解析失败;先显式判定超限再解码。
 	regBody, rerr := io.ReadAll(io.LimitReader(resp.Body, maxRegistrationResponseBytes+1))
 	if rerr != nil {
@@ -793,7 +793,7 @@ func (s *SyncService) RegisterWithMaster(ctx context.Context, masterURL string, 
 	if resp.StatusCode >= http.StatusBadRequest {
 		return models.ClusterRegistration{}, errors.New(envelope.Message)
 	}
-	// 历史问题（历史）：200 但载荷畸形（缺注册编号/注册密钥）不得静默
+	// 200 但载荷畸形（缺注册编号/注册密钥）不得静默
 	// 落库——残缺注册信息会让后续 confirm/同步链路以零值凭据空转，显式报错。
 	registration := envelope.Data
 	if registration.RegistrationID <= 0 || registration.RegistrationSecret == "" {
@@ -807,12 +807,12 @@ func (s *SyncService) RegisterWithMaster(ctx context.Context, masterURL string, 
 // 占用（同链路 waf-files 端点为 64MB，仅承载规则包）。超限即解析失败。
 var maxSnapshotResponseBytes int64 = 256 << 20
 
-// maxRegistrationResponseBytes 注册/注册状态轮询响应体上限（历史问题）：与快照
+// maxRegistrationResponseBytes 注册/注册状态轮询响应体上限：与快照
 // 拉取同威胁模型（主节点是该链路唯一对端），这两类响应实际仅数百字节。
 var maxRegistrationResponseBytes int64 = 1 << 20
 
 // decodeSnapshotEnvelope 解码 Pull 快照响应，响应体经 maxSnapshotResponseBytes
-// 限流。多读 1 字节显式探测超限（历史问题）：LimitReader 静默截断会让超限与
+// 限流。多读 1 字节显式探测超限：LimitReader 静默截断会让超限与
 // 网络截断共用「unexpected EOF」，运维无法区分主节点异常膨胀与链路故障。
 func decodeSnapshotEnvelope(body io.Reader) (models.ClusterSnapshot, error) {
 	raw, err := io.ReadAll(io.LimitReader(body, maxSnapshotResponseBytes+1))
@@ -845,7 +845,7 @@ func syncRoundSuccessLines(prevFailed bool, res SyncResult) []string {
 	return lines
 }
 
-// syncFailureAuditDue 判定本轮同步失败是否应写操作审计（历史问题-01）：
+// syncFailureAuditDue 判定本轮同步失败是否应写操作
 // 同一失败内容（动作+类别+明细）只放行一次，内容变化或同步恢复后清空，
 // 再次失败重新放行——与 Report 的 lastReportFailureMsg 同口径。
 // 字段级状态见 SyncService.lastSyncFailureKey。失败日志与 last_sync_error
@@ -945,11 +945,11 @@ func (s *SyncService) Pull(ctx context.Context) (result SyncResult, err error) {
 			var lastSyncErr string
 			if err := s.db.QueryRowContext(ctx, "SELECT COALESCE(last_sync_error,'') FROM global_config WHERE id=1").Scan(&lastSyncErr); err == nil {
 				if msg, _ := decodeSyncError(lastSyncErr); syncPostCommitMarkerPrefix(msg) != "" {
-					// 历史问题：补偿重拉节流（与 WAF 兜底重拉同款）——
+					// 补偿重拉节流（与 WAF 兜底重拉同款）——
 					// 持续失败 5 轮后降频为每 10 轮一次，避免后置副作用持续
 					// 故障时每周期全量重拉打主从负载；last_sync_error 中的
 					// marker 保持可见（节点页面），恢复后首轮重拉成功即自愈。
-					// 历史问题：品牌落盘失败（apply_ok_branding_failed）与重载
+					// 品牌落盘失败（apply_ok_branding_failed）与重载
 					// 失败共用本补偿通道与退避计数器。
 					failures := s.reloadRepullFailures.Add(1)
 					if failures == wafRepullMaxFailures {
@@ -973,7 +973,7 @@ func (s *SyncService) Pull(ctx context.Context) (result SyncResult, err error) {
 				sinceVersion, sinceFingerprint = 0, ""
 				continue
 			}
-			// 历史问题：品牌文件态自愈。304 稳态下 applySnapshot 不运行，品牌
+			// 品牌文件态自愈。304 稳态下 applySnapshot 不运行，品牌
 			// 文件没有物化通道——文件被删除/损坏会永久停留默认品牌（进程重启时
 			// EnsureBrandingFile 也只会写全空模板）。按 global_config.branding_json
 			// 镜像重写文件，零 Caddy 重载；失败用状态转换日志限噪。
@@ -990,16 +990,16 @@ func (s *SyncService) Pull(ctx context.Context) (result SyncResult, err error) {
 					RecordAuditLog("system", "同步自愈", "集群同步", FormatAuditDetail("品牌配置文件缺失或损坏", "已按主节点品牌镜像重建（零 Caddy 重载）"), "")
 				}
 			}
-			// WAF 文件兜底（历史问题）：apply 期 fetchWafFiles/ApplyWafFileBundle
+			// WAF 文件兜底：apply 期 fetchWafFiles/ApplyWafFileBundle
 			// 失败仅记日志不向上传播（cluster_apply.go），记录哈希已提交而本地
 			// 文件未收敛；三节 drift 检测不含 waf_files（文件态节），必须在此
 			// 显式比对，否则从节点安全数据随主节点配置静默永久分叉。兜底重拉
-			// 带连续失败计数（历史问题）：持续失败时上表面到 last_sync_error 并把
+			// 带连续失败计数：持续失败时上表面到 last_sync_error 并把
 			// 重拉降频，避免每 60s 无限循环打主从负载。
 			if s.trackWafRepullConvergence(ctx) {
 				failures := s.wafRepullFailures.Add(1)
 				if failures == wafRepullMaxFailures {
-					Logf("error", "安全数据持续同步失败（已连续 %d 轮未收敛；若主节点本就无该组件数据则属预期形态，从节点残留文件不会被同步删除——历史问题），兜底全量重拉降频为每 %d 轮一次", wafRepullMaxFailures, wafRepullEvery)
+					Logf("error", "安全数据持续同步失败（已连续 %d 轮未收敛；若主节点本就无该组件数据则属预期形态，从节点残留文件不会被同步删除，属预期形态），兜底全量重拉降频为每 %d 轮一次", wafRepullMaxFailures, wafRepullEvery)
 				}
 				if s.wafRepullDue() {
 					wafRepullAttempted = true
@@ -1018,7 +1018,7 @@ func (s *SyncService) Pull(ctx context.Context) (result SyncResult, err error) {
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotModified {
 		// 304=主节点确认本地版本与指纹一致：同步链路健康，清空失败去重状态
-		// （历史问题-01——恢复后再次失败必须重新记录）。
+		// （恢复后再次失败必须重新记录）。
 		s.resetSyncFailureAuditThrottle()
 		return SyncResult{AppliedVersion: appliedVersion}, nil
 	}
@@ -1031,7 +1031,7 @@ func (s *SyncService) Pull(ctx context.Context) (result SyncResult, err error) {
 	if resp.StatusCode >= http.StatusBadRequest {
 		// body 截断至 200B 并回退到合法 UTF-8 边界：错误消息经 last_sync_error
 		// 落库（512B 有界设计）并随 Report 上报主节点，超长 body 会击穿有界
-		// 并随 60s 周期持续膨胀主节点库（历史问题）。复用 pollRegistration 的
+		// 并随 60s 周期持续膨胀主节点库。复用 pollRegistration 的
 		// 既有截断模式（本文件 :1111-1113）。
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
 		body = truncateValidUTF8Tail(body)
@@ -1060,18 +1060,18 @@ func (s *SyncService) Pull(ctx context.Context) (result SyncResult, err error) {
 	if isMaster || currentMasterURL != masterURL || currentToken != token {
 		return SyncResult{}, newSyncFailure(models.SyncErrorCodeValidationFailed, errSyncApplyRoleChanged)
 	}
-	// 历史问题：记录复核通过的守卫三元组，applySnapshot 在事务内二次复核。
+	// 记录复核通过的守卫三元组，applySnapshot 在事务内二次复核。
 	s.applyGuard = syncApplyGuard{MasterURL: currentMasterURL, Token: currentToken}
 	verifiedSnapshot, err := verifiedSnapshotIntegrity(snapshot, token, appliedVersion)
 	if err != nil {
-		// 历史问题-01：同一失败内容不按重试轮重复写操作审计。
+		// 同一失败内容不按重试轮重复写操作审计。
 		detail := FormatAuditDetail(fmt.Sprintf("版本：%d", snapshot.Version), err.Error())
 		if s.syncFailureAuditDue("同步失败", "集群同步", detail) {
 			RecordAuditLog("system", "同步失败", "集群同步", detail, "")
 		}
 		// last_sync_error 落库由下方 Pull defer 统一覆盖（err != nil 时执行，
 		// 主节点节点列表经 Report 通道可见真实失败原因）：此处不再显式写，
-		// 避免同一错误单周期重复 UPDATE（历史问题 收敛单写）。
+		// 避免同一错误单周期重复 UPDATE。
 		return SyncResult{}, err
 	}
 	snapshot = verifiedSnapshot
@@ -1084,21 +1084,21 @@ func (s *SyncService) Pull(ctx context.Context) (result SyncResult, err error) {
 	s.pullAdmissionMu.Unlock()
 	if pullsStopped {
 		s.pullApplyMu.Unlock()
-		// 历史问题（历史两路独立确认，提交信息曾声称已修但从未落盘——
+		// （两路独立确认，提交信息曾声称已修但从未落盘——
 		// 第 3 次同类失误）：复用 errSyncPullStopped 哨兵包装——errors.Is(pullErr,
 		// errSyncPullStopped) 依赖哨兵识别停机而非普通 validation 失败；此前以
 		// ValidationFailed 落库会覆盖 apply_ok_reload_failed 标记（标记必须跨停机
 		// 存活才能触发 304 补偿重拉）。
 		return SyncResult{}, newSyncFailure(models.SyncErrorCodeValidationFailed, errSyncPullStopped)
 	}
-	// 测试缝：admission 已通过、进入 apply 之前的阻塞点（历史问题 Promote 排干
+	// 测试缝：admission 已通过、进入 apply 之前的阻塞点（Promote 排干
 	// 语义用例——此处无事务在手，Promote 若不排干会先返回）。
 	if s.beforeApplyWrite != nil {
 		s.beforeApplyWrite()
 	}
 	if err := s.applySnapshot(ctx, snapshot); err != nil {
 		s.pullApplyMu.Unlock()
-		// 历史问题-01：同内容失败（含补偿重拉轮）只留一条操作审计。
+		// 同内容失败（含补偿重拉轮）只留一条操作审计。
 		detail := FormatAuditDetail(fmt.Sprintf("版本：%d", snapshot.Version), err.Error())
 		if s.syncFailureAuditDue("同步失败", "集群同步", detail) {
 			RecordAuditLog("system", "同步失败", "集群同步", detail, "")
@@ -1107,7 +1107,7 @@ func (s *SyncService) Pull(ctx context.Context) (result SyncResult, err error) {
 	}
 	s.pullApplyMu.Unlock()
 	// 本轮应用成功=同步恢复：清空失败去重状态，下一次失败重新记录
-	// （历史问题-01，与 Report 成功分支同语义）。
+	// （与 Report 成功分支同语义）。
 	s.resetSyncFailureAuditThrottle()
 	// 每次成功应用后核对 WAF 文件态：已收敛则清零连续失败计数，恢复正常的
 	// 兜底重拉频率与 last_sync_error 语义。
@@ -1159,7 +1159,7 @@ const wafRepullMaxFailures = 5
 // wafRepullEvery 是持续失败期兜底重拉的降频周期（以同步轮为单位）。
 const wafRepullEvery = 10
 
-// backoffDue（历史修复）判定连续失败计数下本轮是否应执行重拉：
+// backoffDue判定连续失败计数下本轮是否应执行重拉
 // 未达 wafRepullMaxFailures 时恒执行；达到后降频为每 wafRepullEvery 轮一次。
 // WAF 兜底重拉（wafRepullDue）与 304 补偿重拉两处降频共用本单源判定。
 func backoffDue(failures int32) bool {
@@ -1178,13 +1178,13 @@ func (s *SyncService) wafRepullPersistentlyFailed() bool {
 }
 
 // wafRepullFailureMessagePrefix 是「安全数据持续同步失败」上表面文案的前缀：
-// 计数清零时必须同时剥离该文案（历史问题），否则运营方手工修复文件后错误永驻。
+// 计数清零时必须同时剥离该文案，否则运营方手工修复文件后错误永驻。
 const wafRepullFailureMessagePrefix = "安全数据持续同步失败"
 
 // trackWafRepullConvergence 核对 WAF 文件态是否已收敛（本地文件 == 已应用
 // 文件态记账），返回 drifted。未漂移时清零连续失败计数并清空 last_sync_error
 // 中的 WAF 专项文案——304 分支（运营方手工修复文件后主节点无变更）与 apply
-// 成功路径共用本单源（历史问题/历史修复）。仅 Pull 的
+// 成功路径共用本单源。仅 Pull 的
 // pullMu 临界区内调用。
 func (s *SyncService) trackWafRepullConvergence(ctx context.Context) bool {
 	if s.wafFilesDrifted(ctx) {
@@ -1219,7 +1219,7 @@ func (s *SyncService) clearWafRepullFailureMessage(ctx context.Context) {
 	s.persistSyncError(ctx, "", "")
 }
 
-// trackReloadRepullConvergence（历史问题）：快照成功应用且重载成功
+// trackReloadRepullConvergence：快照成功应用且重载成功
 // （marker 被清除）时清零补偿重拉计数。
 func (s *SyncService) trackReloadRepullConvergence(ctx context.Context) {
 	var lastSyncErr string
@@ -1233,7 +1233,7 @@ func (s *SyncService) trackReloadRepullConvergence(ctx context.Context) {
 
 // persistWafRepullFailure 把「安全数据持续同步失败（已连续 N 轮未收敛）」上表面到
 // last_sync_error（节点页面可见）。计数器兼作退避时钟，N 的语义是「自首次检测到
-// 漂移起的同步轮数」而非真实重拉次数（历史问题）。经 combineOrReplaceSyncError 复用
+// 漂移起的同步轮数」而非真实重拉次数。经 combineOrReplaceSyncError 复用
 // apply_ok_reload_failed 标记保护语义：TransportError 属可恢复类，标记存在
 // 时组合保留，不破坏 304 补偿通道。
 func (s *SyncService) persistWafRepullFailure(ctx context.Context) {
@@ -1274,14 +1274,19 @@ func (s *SyncService) wafFilesDrifted(ctx context.Context) bool {
 		return false
 	}
 	switches, err := readSyncSwitches(ctx, s.db)
-	if err != nil || !switches.Security {
+	if err != nil {
+		// 与 driftedSections 的「重建失败，跳过漂移检测」同族：静默返回 false
+		// 会把 WAF 文件态检测无声关闭，本地文件与主端永久分叉而无任何信号。
+		Logf("warn", "读取同步开关失败，跳过 WAF 文件漂移检测: %v", err)
+		return false
+	}
+	if !switches.Security {
 		return false
 	}
 	appliedHash := readAppliedWafRefHash(s.db)
 	if appliedHash == "" || appliedHash == wafFilesNullRefHash {
 		// 主节点无任何 WAF 文件(记账=nullRef 基准):无文件态可比对,
-		// 全量重拉也无法收敛本地残留,必须豁免(否则 404 重拉死循环——
-		// 历史问题)。
+		// 全量重拉也无法收敛本地残留,必须豁免(否则 404 重拉死循环)。
 		return false
 	}
 	localRef := BuildWafFileRef()
@@ -1297,13 +1302,17 @@ func (s *SyncService) wafFilesDrifted(ctx context.Context) bool {
 }
 
 // readAppliedWafRefHash 读取文件态记账哈希(方案A 列,替代旧 waf_files
-// 记账行);空串=从未记录。
+// 记账行);空串=从未记录。读失败必须留痕：静默按「从未记录」处理会让检测
+// 无声跳过（同 driftedSections 的读失败 warn 家族）。
 func readAppliedWafRefHash(dbh *sql.DB) string {
 	if dbh == nil {
 		return ""
 	}
 	var hash sql.NullString
 	if err := dbh.QueryRow(`SELECT applied_waf_ref_hash FROM global_config WHERE id=1`).Scan(&hash); err != nil || !hash.Valid {
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			Logf("warn", "读取文件态记账哈希失败，WAF 文件漂移检测按未记录处理: %v", err)
+		}
 		return ""
 	}
 	return strings.TrimSpace(hash.String)
@@ -1382,11 +1391,11 @@ const syncReloadFailureMarkerPrefix = "apply_ok_reload_failed"
 
 // syncBrandingFailureMarkerPrefix 标记「快照已提交但品牌配置文件未落盘」：
 // 与 apply_ok_reload_failed 同族——304 分支识别后全量重拉，让 apply 在下一轮
-// 重试品牌落盘；成功路径（事务内 last_sync_error=”）自动清除（历史问题）。
+// 重试品牌落盘；成功路径（事务内 last_sync_error=”）自动清除。
 const syncBrandingFailureMarkerPrefix = "apply_ok_branding_failed"
 
 // MarkStartupFallbackPending 在启动 last-good 回退成功后写入与 applySnapshot
-// 同语义的 apply_ok_reload_failed 补偿标记（裁定 2026-09-07 历史修复）：Pull 的 304
+// 同语义的 apply_ok_reload_failed 补偿标记（裁定 2026-09-07）：Pull 的 304
 // 分支识别该标记后全量重拉，使从节点在主节点无变更时也能收敛到 DB 最新渲染，
 // 消除「同步正常 + 运行旧配置」的静默窗口。主节点写入无害（从不 Pull，标记
 // 由下次成功 apply 的 recordCaddyApplyResult(nil) 清除语义覆盖，此处仅从节点
@@ -1404,7 +1413,7 @@ func MarkStartupFallbackPending(ctx context.Context, database *sql.DB) error {
 
 // MarkStartupFallbackFailed 在「启动渲染被拒且 last-known-good 回退也失败」的
 // 双失败路径写入与 applySnapshot 同语义的 apply_ok_reload_failed 补偿标记
-// （历史问题-02，历史）：此时运行配置与数据库处于未知分叉态，而 Pull 的
+// 此时运行配置与数据库处于未知分叉态，而 Pull 的
 // 304 分支只认该标记——无标记则自愈失明（「同步正常+运行未知旧配置」静默存活
 // 到下次真实变更或重启）；标记触发下轮全量重拉补偿。与 MarkStartupFallbackPending
 // 同约束：仅从节点调用方使用；db 为 nil 时静默跳过（启动极早期）。
@@ -1428,7 +1437,7 @@ const (
 )
 
 // syncPostCommitMarkerPrefixes 是「快照事务已提交但后置副作用失败」的可重试
-// 标记族（历史问题 起含品牌落盘）：两者都要求 304 分支全量重拉补偿，且都
+// 标记族：两者都要求 304 分支全量重拉补偿，且都
 // 必须跨停机/跨周期存活到下一次成功。
 var syncPostCommitMarkerPrefixes = []string{syncReloadFailureMarkerPrefix, syncBrandingFailureMarkerPrefix}
 
@@ -1443,7 +1452,7 @@ func syncPostCommitMarkerPrefix(message string) string {
 }
 
 // syncMarkerPresent 报告 last_sync_error 是否携带指定后置副作用标记。
-// 历史问题（cluster 审计 历史问题 同证）：读侧用 WithoutCancel——Stop 的
+// （cluster 审计同证）：读侧用 WithoutCancel——Stop 的
 // cancel 在 apply 提交与 defer 检查之间到达时，可取消 ctx 会读失败 → 成功清除
 // defer 误判「标记不存在」→ 跳过清除 → 标记存活（正确语义）；但若标记刚被
 // persistSyncError（WithoutCancel）写入，可取消读也会失败 → 误删刚写的标记。
@@ -1463,7 +1472,7 @@ func (s *SyncService) syncReloadFailureMarkerPresent(ctx context.Context) bool {
 }
 
 // syncBrandingFailureMarkerPresent 报告 last_sync_error 当前是否携带品牌落盘
-// 失败标记（历史问题）。
+// 失败标记。
 func (s *SyncService) syncBrandingFailureMarkerPresent(ctx context.Context) bool {
 	return s.syncMarkerPresent(ctx, syncBrandingFailureMarkerPrefix)
 }
@@ -1497,7 +1506,7 @@ func (s *SyncService) recordSyncError(ctx context.Context, pullErr, reportErr er
 			return
 		}
 		// 主节点手动调用 Pull 不落库：主节点无同步对象，错误只返回 API
-		// 调用方；落库会让节点页面持续显示一个无自愈路径的假错误（历史修复）。
+		// 调用方；落库会让节点页面持续显示一个无自愈路径的假错误。
 		if errors.Is(pullErr, errSyncMasterNoPull) {
 			return
 		}
@@ -1530,14 +1539,14 @@ func (s *SyncService) recordSyncError(ctx context.Context, pullErr, reportErr er
 // 组合保留 apply_ok_reload_failed 标记，终止类错误直接覆盖；空消息直接跳过
 // （成功路径的清空由调用方另行处理）。
 // recordSyncError、run 循环 loadState 失败路径与 pollRegistration 共用，确保
-// 所有可恢复类错误走同一标记保护语义（历史问题 收敛直写调用点）。
+// 所有可恢复类错误走同一标记保护语义。
 func (s *SyncService) combineOrReplaceSyncError(ctx context.Context, message string, code models.SyncErrorCode) {
 	if message == "" {
 		return
 	}
 	if syncErrorPreservesReloadMarker(code) {
 		var stored string
-		// 历史修复-新2:读侧 WithoutCancel(与 :1043 syncReloadFailureMarkerPresent
+		// 新2:读侧 WithoutCancel(与:1043 syncReloadFailureMarkerPresent
 		// 同口径)——可取消读在 Stop cancel 落窗时失败,误跳过组合使标记被覆盖。
 		if err := s.db.QueryRowContext(context.WithoutCancel(ctx), "SELECT COALESCE(last_sync_error,'') FROM global_config WHERE id=1").Scan(&stored); err == nil {
 			// 自愈类错误不得覆盖重载失败标记：标记是全量重拉补偿的唯一触发器，
@@ -1554,14 +1563,14 @@ func (s *SyncService) combineOrReplaceSyncError(ctx context.Context, message str
 // syncErrorPreservesReloadMarker 判定错误是否属于「自愈类」：标记存活期间期望
 // 自动重试的错误必须保留重载失败标记——传输故障/主节点指纹不匹配/主节点侧暂时
 // 性版本或形态问题（主节点旧 schema、快照签名无效，主节点升级后自动恢复 304），
-// 以及应用失败（ApplyFailed，2026-09-05 集群审计 历史问题）：补偿重拉窗口内的应用
+// 以及应用失败（ApplyFailed，2026-09-05 集群审计）：补偿重拉窗口内的应用
 // 瞬时失败（SQLITE_BUSY/磁盘写失败等回滚路径）发生时 applied_version 与指纹
 // 已与主节点对齐，标记是 304 全量重拉补偿的唯一残留触发器，覆盖后下周期 304
 // 无标记即返回 no-change，DB=新版本而 Caddy=旧运行配置的分叉将静默存活到下次
 // 真实变更；应用失败经 combineSyncErrorWithMarker 组合（首个失败原因+计数），
 // 补偿重拉成功后照常清除。需人工介入或语义已定的错误（schema 过新需本节点
 // 升级、令牌撤销、校验失败）仍允许覆盖。审计 旧注释「终止类让 run 循环
-// halt 等待人工介入」的依据在 历史修复 后不再成立——SchemaTooOld/SignatureInvalid
+// halt 等待人工介入」的依据在后不再成立——SchemaTooOld/SignatureInvalid
 // 降级重试不 halt，覆盖标记将丢失 304 全量重拉补偿。
 func syncErrorPreservesReloadMarker(code models.SyncErrorCode) bool {
 	return code == models.SyncErrorCodeTransportError || code == models.SyncErrorCodePinMismatch ||
@@ -1612,13 +1621,13 @@ func verifiedSnapshotIntegrity(snapshot models.ClusterSnapshot, clusterToken str
 	if snapshot.Signature == "" {
 		return models.ClusterSnapshot{}, newSyncFailure(models.SyncErrorCodeSignatureInvalid, errors.New("快照缺少签名：主节点版本过旧，请先升级主节点"))
 	}
-	// 历史问题 v2 形态旧主节点快照（有签名、无 canonical_payload）此前
+	// v2 形态旧主节点快照（有签名、无 canonical_payload）此前
 	// 落入 verifySnapshotSignature 的空载荷拒绝，误报「签名校验失败」且提示语不
-	// 指明升级动作。刻意保持非终止（可重试）而非恢复 历史修复 的 halted 终止：
-	// ① 该形态无法在本节点验签（v2 扁平签名路径已于 历史修复 移除），终止化会让
+	// 指明升级动作。刻意保持非终止（可重试）而非恢复 halted 终止
+	// ① 该形态无法在本节点验签（v2 扁平签名路径已于移除），终止化会让
 	// 任何能注入同步流量的攻击者用伪造 schema<3 载荷把从节点永久停摆；② 非终止
-	// 重试在主节点升级到 v3 后自动恢复，运维代价更低。原 历史问题 分支因验签前置
-	// 不可达（历史修复 收紧误伤），已移除。
+	// 重试在主节点升级到 v3 后自动恢复，运维代价更低。原分支因验签前置
+	// 不可达，已移除。
 	if snapshot.SchemaVersion < CurrentSnapshotSchema && len(snapshot.CanonicalPayload) == 0 {
 		return models.ClusterSnapshot{}, newSyncFailure(models.SyncErrorCodeSignatureInvalid, errors.New("主节点为旧版本（schema v2 快照形态，缺少 canonical_payload）：请先升级主节点，从节点将在主节点升级后自动恢复同步"))
 	}
@@ -1748,7 +1757,7 @@ func (s *SyncService) run(ctx context.Context) {
 			Logf("error", "cluster sync state read failed; retrying: %v", err)
 			// 瞬时 DB 读错（SQLITE_BUSY 等）属可恢复类：直接覆盖会抹掉
 			// apply_ok_reload_failed 标记（304 全量重拉补偿的唯一触发器），
-			// 改走共享组合保留逻辑（历史问题）。
+			// 改走共享组合保留逻辑。
 			s.combineOrReplaceSyncError(ctx, message, models.SyncErrorCodeTransportError)
 			if !waitDelay(ctx, retryDelay) {
 				return
@@ -1768,7 +1777,7 @@ func (s *SyncService) run(ctx context.Context) {
 		if token == "" {
 			s.pollRegistration(ctx)
 		} else {
-			// 304「配置无变化」是稳态事件，不留审计（曾按周期刷屏，历史修复 移除）；
+			// 304「配置无变化」是稳态事件，不留审计（曾按周期刷屏，移除）；
 			// 有意义的状态跃迁（漂移自愈、失败）仍在各自路径留痕。
 			pullRes, pullErr := s.Pull(ctx)
 			var schemaTooNew *SnapshotSchemaTooNewError
@@ -1791,7 +1800,7 @@ func (s *SyncService) run(ctx context.Context) {
 			// 标记（Pull defer 为此保留它）；周期末的空错误清空会让 304 分支的
 			// 标记检测同周期失效，自愈补偿永远不触发。与 Pull defer 同口径跳过。
 			// pullErr 非空时 Pull 内部 defer 已按错误分类落库（含快照完整性失败，
-			// 历史问题 收敛单写），周期末不再重复写；reportErr 仅在 pullErr 为空时
+			// 收敛单写），周期末不再重复写；reportErr 仅在 pullErr 为空时
 			// 参与落库，此处跳过无信息损失。
 			if pullErr == nil {
 				if reportErr != nil || !s.syncPostCommitFailureMarkerPresent(ctx) {
@@ -1806,7 +1815,7 @@ func (s *SyncService) run(ctx context.Context) {
 				prevRoundFailed = true
 				pullFailed = pullErr != nil
 				if pullErr == nil {
-					// 历史问题-01：上报侧故障与主链路退避解耦——拉取已恢复即复位
+					// 上报侧故障与主链路退避解耦——拉取已恢复即复位
 					// 快速重试起点，否则历史拉取失败累积的 retryDelay 会被后续
 					// 上报故障"继承"，下次真实拉取故障从 30s 才起跳。
 					retryDelay = time.Second
@@ -1825,14 +1834,14 @@ func (s *SyncService) run(ctx context.Context) {
 				prevRoundFailed = false
 			}
 		}
-		// 存量脏数据兜底（历史问题 + 历史问题）：<10s 归 60s，>86400s 归 24h，
+		// 存量脏数据兜底：<10s 归 60s，>86400s 归 24h，
 		// 与 Status/节点离线阈值/快照入站同一实现，避免展示、运行与在线判定分叉。
 		interval = normalizeSyncInterval(interval)
 		delay := time.Duration(interval) * time.Second
 		if token == "" {
 			delay = 10 * time.Second
 		} else if pullFailed {
-			// 历史问题-01：仅主链路（拉取）失败才启用 1s→30s 快速退避；上报失败
+			// 仅主链路（拉取）失败才启用 1s→30s 快速退避；上报失败
 			// 时拉取仍健康（304），加速轮询不能修复上报，反而把用户可见的
 			// 「同步间隔」压到 30s 以内（interval=86400 时达 2880×）并放大已
 			// 故障主节点负载。退避同时以配置间隔为上限（min(retryDelay,
@@ -1857,7 +1866,7 @@ func (s *SyncService) run(ctx context.Context) {
 func (s *SyncService) pollRegistration(ctx context.Context) {
 	var masterURL, secret string
 	var registrationID int
-	// 历史问题 DB 读取失败与「未处于注册态」（字段为空）拆分——前者静默返回
+	// DB 读取失败与「未处于注册态」（字段为空）拆分——前者静默返回
 	// 会在持续性本地 DB 故障期间零留痕（状态面与日志均无信号）；行为不变
 	//（下周期照常重试），仅补日志。
 	if err := s.db.QueryRowContext(ctx, "SELECT COALESCE(master_url,''), COALESCE(registration_id,0), COALESCE(registration_secret,'') FROM global_config WHERE id=1").Scan(&masterURL, &registrationID, &secret); err != nil {
@@ -1884,7 +1893,7 @@ func (s *SyncService) pollRegistration(ctx context.Context) {
 	if resp.StatusCode >= http.StatusBadRequest {
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone {
 			message := "注册已被主节点拒绝或移除，请重新注册或提升为主节点"
-			// 历史问题 状态轮询的 401/404/410 复用 confirm 路径的 5 连败终止设计
+			// 状态轮询的 401/404/410 复用 confirm 路径的 5 连败终止设计
 			// （bumpRegistrationConfirmFailure）——此前该分支每 10s 无限重试：每周期
 			// 一条「注册失败」审计日志（~8640 条/天噪音）且永不退出注册循环；
 			// 达到上限后落终止文案并清 registration_*（退出循环），运维提示与
@@ -1903,10 +1912,10 @@ func (s *SyncService) pollRegistration(ctx context.Context) {
 	var envelope struct {
 		Data models.ClusterRegistrationStatus `json:"data"`
 	}
-	// 历史问题 decode 失败（主节点 200 但 body 非 envelope——反代错误页/网关维护
+	// decode 失败（主节点 200 但 body 非 envelope——反代错误页/网关维护
 	// 页等）此前静默 return，节点零留痕轮询、表面状态不变；仅记日志不改状态机
 	// 行为（下周期照常重试，≥400 与 rejected 分支已有各自可观测动作）。
-	// 历史问题(历史):+1 探针(历史问题 口径)——裸 LimitReader 静默截断
+	// +1 探针——裸 LimitReader 静默截断
 	// 使超限响应被误诊为解析失败;先显式判定超限再解码。
 	regBody, rerr := io.ReadAll(io.LimitReader(resp.Body, maxRegistrationResponseBytes+1))
 	if rerr != nil {
@@ -1922,8 +1931,8 @@ func (s *SyncService) pollRegistration(ctx context.Context) {
 		return
 	}
 	if envelope.Data.Status == "rejected" {
-		// 历史问题 200 "rejected" 出现于「registrationAuth 通过后、RegistrationStatus
-		// 事务 SELECT 前节点行被删」的交错窗口（单发瞬态，下一轮即 401 走 历史修复
+		// 200 "rejected" 出现于「registrationAuth 通过后、RegistrationStatus
+		// 事务 SELECT 前节点行被删」的交错窗口（单发瞬态，下一轮即 401 走
 		// 终止轨道）。显式处理消除该轮的无痕迹轮询并给出准确文案（否则 401 轨道
 		// 的文案会误报为「HTTP 401 被拒绝」）。
 		s.bumpRegistrationConfirmFailure(ctx, "", "主节点已拒绝该注册（节点记录不存在）")
@@ -1931,7 +1940,7 @@ func (s *SyncService) pollRegistration(ctx context.Context) {
 		return
 	}
 	if envelope.Data.Status == "approved" && envelope.Data.ClusterToken != "" {
-		// 历史问题 令牌落库先于 confirm——主节点 confirm 成功即消费
+		// 令牌落库先于 confirm——主节点 confirm 成功即消费
 		// registration_secret（cluster_snapshot.go ConfirmRegistration 置 NULL），
 		// 若本地令牌 UPDATE 在 confirm 之后瞬时失败（SQLITE_BUSY/进程退出），
 		// 下周期以已消费的 secret 轮询 → 401 五连败 → 以「被拒绝/移除」的
@@ -1955,10 +1964,10 @@ func (s *SyncService) pollRegistration(ctx context.Context) {
 		}
 		defer confirmed.Body.Close()
 		// 历史 移除 404/405 fallback 兼容（v2.0.9+ 主节点均支持 confirm 端点）。
-		// 历史问题: 任何 4xx/5xx 不再静默重试。累计失败达到上限后停止注册循环，
+		// 任何 4xx/5xx 不再静默重试。累计失败达到上限后停止注册循环，
 		// 持久化错误并提示用户人工处理（在 UI 重新注册或提升为主节点）。
 		if confirmed.StatusCode >= http.StatusBadRequest {
-			// 历史问题: 与 历史问题 模式一致——200B 截断 + UTF-8 边界回退，
+			// 与模式一致——200B 截断 + UTF-8 边界回退，
 			// 确保 confirm 失败原因落入 last_sync_error 后不超过 512B 有界设计。
 			body, _ := io.ReadAll(io.LimitReader(confirmed.Body, 200))
 			body = truncateValidUTF8Tail(body)
@@ -1971,9 +1980,9 @@ func (s *SyncService) pollRegistration(ctx context.Context) {
 	}
 }
 
-// ForgetClusterPins 清空内存 TOFU pin 缓存（历史修复）。提升为主节点时
+// ForgetClusterPins 清空内存 TOFU pin 缓存。提升为主节点时
 // cleanupClusterPin 已删除 pin 文件，内存 map 残留旧主节点指纹会使记录与
-// 钉扎状态错位（历史修复① 删除 do() 回写后内存指纹不再自动落盘，此处清空保持
+// 钉扎状态错位 回写后内存指纹不再自动落盘，此处清空保持
 // 内存/磁盘两侧 TOFU 生命周期对齐，新拓扑重新 TOFU）。
 func (s *SyncService) ForgetClusterPins() {
 	s.pinMu.Lock()
@@ -1981,7 +1990,7 @@ func (s *SyncService) ForgetClusterPins() {
 	s.pinMu.Unlock()
 }
 
-// ForgetNodePinCache 删除内存 TOFU pin 缓存中该地址的条目（若存在，历史问题）：
+// ForgetNodePinCache 删除内存 TOFU pin 缓存中该地址的条目（若存在）
 // 服务控制客户端自身不持有内存缓存（onVerified=nil、每次握手直读 pin 文件），
 // 此处清理仅覆盖本节点曾作为从节点时代残留的内存态，保持内存/磁盘一致。
 func (s *SyncService) ForgetNodePinCache(host string) {
@@ -1994,7 +2003,7 @@ func (s *SyncService) ForgetNodePinCache(host string) {
 	s.pinMu.Unlock()
 }
 
-// ForgetPins 清空内存 TOFU pin 缓存并删除磁盘全部 pin 文件（历史修复② forget-pins
+// ForgetPins 清空内存 TOFU pin 缓存并删除磁盘全部 pin 文件（forget-pins
 // 端点）：主节点更换管理面板证书后从节点同步持续 PinMismatch，运维确认新证书
 // 合法后调用本方法放弃全部旧指纹，下一同步 tick 按新证书重新 TOFU 钉扎。
 // 返回删除的 pin 文件数。目录不存在视为已清空（无 pin 可忘）。
@@ -2043,7 +2052,7 @@ func (s *SyncService) bumpRegistrationConfirmFailure(ctx context.Context, cluste
 	if failures >= registrationConfirmMaxFailures {
 		message := fmt.Sprintf("集群注册确认连续失败 %d 次（最后一次：%s）。已停止自动重试，请在“集群管理”页面重新注册，或使用“提升为主节点”脱离集群",
 			failures, reason)
-		// 经 combineOrReplaceSyncError 落库（历史问题）：ValidationFailed 属终止类，
+		// 经 combineOrReplaceSyncError 落库：ValidationFailed 属终止类，
 		// helper 直接覆盖，与直写语义等价；闭合「所有写点经 helper」不变式。
 		s.combineOrReplaceSyncError(ctx, message, models.SyncErrorCodeValidationFailed)
 		RecordAuditLog("system", "注册失败", "集群节点", message, "")
@@ -2064,7 +2073,7 @@ func (s *SyncService) resetRegistrationConfirmFailure(ctx context.Context) {
 	_, _ = s.db.ExecContext(ctx, "UPDATE global_config SET registration_confirm_failures=0 WHERE id=1")
 }
 
-// clusterSyncFailureSummary 拼接同步轮失败的业务摘要行（历史修复，历史修复）。
+// clusterSyncFailureSummary 拼接同步轮失败的业务摘要行。
 // 最常见的拉取类失败下 reportErr 为 nil——原格式字符串恒用「%v / %v」，
 // 任务日志与任务监控页会出现字面量「/ <nil>」。按实际失败侧分别点名单侧。
 func clusterSyncFailureSummary(pullErr, reportErr error) string {

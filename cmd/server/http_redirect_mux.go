@@ -73,7 +73,7 @@ func (m *httpRedirectMux) dispatch() {
 	for {
 		connection, err := m.Listener.Accept()
 		if err != nil {
-			// 历史修复（历史登记）：net.Error.Temporary() 自 Go 1.18 起弃用，
+			// net.Error.Temporary() 自 Go 1.18 起弃用，
 			// 但本判据行为已由 http_redirect_mux_test.go 钉死（Temporary()=true 且
 			// Timeout()=false 类 accept 瞬时失败的退避实证）——保留弃用 API 换取
 			// 行为稳定，不经判据改写发散；未来 accept 语义有明确替代再迁移。
@@ -97,7 +97,7 @@ func (m *httpRedirectMux) dispatch() {
 		case m.slots <- struct{}{}:
 			go m.sniff(connection)
 		default:
-			// 历史问题-1：嗅探槽耗尽不得拒绝所有新连接——原实现直接 Close，
+			// 嗅探槽耗尽不得拒绝所有新连接——原实现直接 Close，
 			// 攻击者维持 128 条不发首字节的连接（128/5s≈26 conn/s）即可让
 			// 管理面板的全部新连接（含 TLS）在 sniff 前被静默断开。
 			// 交 TLS 接受路径兜底：管理面板保持可用；纯 HTTP 客户端在握手
@@ -174,8 +174,8 @@ func redirectHTTP(reader *bufio.Reader, connection net.Conn) {
 		}
 		if strings.HasPrefix(strings.ToLower(line), "host:") {
 			host = strings.TrimSpace(line[len("host:"):])
-			// Host 行内裸 CR 等控制字符不得反射进 Location（历史问题：
-			// TrimSpace 只去首尾，中置 CR 曾原样进响应头）；历史修复（第
+			// Host 行内裸 CR 等控制字符不得反射进 Location
+			// TrimSpace 只去首尾，中置 CR 曾原样进响应头）；
 			// 71 轮）：中置空格（0x20）同族——TrimSpace 同样剔不掉，畸形 Host
 			// 不得反射。含控制字符/空格（<=0x20 或 0x7f）即视为无效 Host，
 			// 回退本地地址。
@@ -185,7 +185,7 @@ func redirectHTTP(reader *bufio.Reader, connection net.Conn) {
 		}
 	}
 	if host == "" {
-		// 历史问题-6：无 Host（HTTP/1.0 或畸形头）时不得把监听地址反射进 Location
+		// 无 Host（HTTP/1.0 或畸形头）时不得把监听地址反射进 Location
 		//（net.Listen("tcp", ":port") 下是 https://0.0.0.0:port/，客户端无法
 		// 使用）。按 HTTP 语义返回 400 并关闭——也不反射原始畸形 Host。
 		_, _ = connection.Write([]byte("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n"))

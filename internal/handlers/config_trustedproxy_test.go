@@ -80,7 +80,7 @@ func TestUpdateConfig_trustedProxy_rejectsOverwideRanges(t *testing.T) {
 		{"v4 /0", `["0.0.0.0/0"]`},
 		{"v6 /28", `["2001:db8::/28"]`},
 		{"v6 /0", `["::/0"]`},
-		// 历史问题（历史）：/8 恰好等于下限但覆盖整个 IPv4 空间——
+		// /8 恰好等于下限但覆盖整个 IPv4 空间——
 		// 「信任全体 IPv4」形态必须拒绝；v4-mapped /96 同义（Is6 含 mapped，
 		// 内嵌全零 v4 = 全体 IPv4）。
 		{"v4 全空间 /8", `["0.0.0.0/8"]`},

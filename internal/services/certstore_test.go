@@ -372,7 +372,7 @@ func matchingCertificatePair(t *testing.T, domains ...string) (string, string) {
 	return string(certPEM), string(keyPEM)
 }
 
-// 历史问题+历史问题(第 23/24 轮审计):物化查询多行规则——同 updated_at 秒级并列时
+// +(第 23/24 轮审计):物化查询多行规则——同 updated_at 秒级并列时
 // 按 id DESC 取最新行,且域名适用性过滤(任务域≠规则当前域的行不物化)。
 func TestMaterializeAllCertsFromDB_selectsLatestApplicableRow(t *testing.T) {
 	_, database := newClusterTestService(t)
@@ -410,9 +410,9 @@ func TestMaterializeAllCertsFromDB_selectsLatestApplicableRow(t *testing.T) {
 	}
 }
 
-// ---- 历史（历史问题）----
+// ---- 回归钉 ----
 
-// 历史问题（历史修复 同族）：启动物化必须「先判适用性、后标记 seen」——最新行是
+// 启动物化必须「先判适用性、后标记 seen」——最新行是
 // 旧域（不适用）时不得短路较旧的适用行，否则整条规则不物化。
 func TestMaterializeAllCertsFromDB_latest_inapplicable_row_does_not_shadow_older_applicable(t *testing.T) {
 	_, database := newClusterTestService(t)
@@ -445,7 +445,7 @@ func TestMaterializeAllCertsFromDB_latest_inapplicable_row_does_not_shadow_older
 	}
 }
 
-// 历史问题：零写（内容与权限已一致）不得计入「恢复」审计/任务日志——否则每次
+// 零写（内容与权限已一致）不得计入「恢复」审计/任务日志——否则每次
 // 启动都报「恢复 N 个」，真实恢复事件被稀释。
 func TestMaterializeAllCertsFromDB_counts_only_actual_writes(t *testing.T) {
 	_, database := newClusterTestService(t)

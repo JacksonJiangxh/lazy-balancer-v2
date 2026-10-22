@@ -9,7 +9,7 @@ import (
 
 func TestValidateGeoIPCountries_rejectsUnknownProvinceWhenCacheLoaded(t *testing.T) {
 	// Given：ip2region 省份缓存已加载但 live searcher 未加载（缓存文件存在、
-	// live xdb 不存在——历史问题 的 xdb 损坏/带外替换形态）
+	// live xdb 不存在——xdb 损坏/带外替换形态）
 	dir := t.TempDir()
 	live := filepath.Join(dir, "ip2region.xdb")
 	withIP2RegionPaths(t, live, filepath.Join(dir, "missing-dist.xdb"))
@@ -19,7 +19,7 @@ func TestValidateGeoIPCountries_rejectsUnknownProvinceWhenCacheLoaded(t *testing
 	}
 	t.Cleanup(func() { os.Remove(cachePath) })
 
-	// When/Then（历史问题）：live 未加载时校验判据以 live 为准——缓存里的
+	// When/Then：live 未加载时校验判据以 live 为准——缓存里的
 	// 省份（广东）与未知省份（火星）都按 fail-closed「未加载」拒绝。旧语义
 	// 用缓存判 loaded 会放行已知省份，而发射端占位变量从未设置（CEL 恒假）
 	// → deny 地域拦截静默零强制。
@@ -29,7 +29,7 @@ func TestValidateGeoIPCountries_rejectsUnknownProvinceWhenCacheLoaded(t *testing
 	if err := ValidateGeoIPCountries(`["广东"]`, "deny"); err == nil || !strings.Contains(err.Error(), "未加载") {
 		t.Fatalf("cache-known province with dead live searcher must ALSO be rejected (emission cannot match), got %v", err)
 	}
-	// 历史问题（用户裁决覆盖 历史问题 海外放行）：海外拦截同样依赖 live
+	// （用户裁决覆盖海外放行）：海外拦截同样依赖 live
 	// searcher 设置占位变量，缺库时 CEL 恒假零强制——未加载时一并拒绝。
 	if err := ValidateGeoIPCountries(`["海外"]`, "deny"); err == nil || !strings.Contains(err.Error(), "未加载") {
 		t.Fatalf("海外 with dead live searcher must be rejected with 未加载, got %v", err)
@@ -52,7 +52,7 @@ func TestValidateGeoIPCountries_rejectsUnknownProvinceWhenNothingLoaded(t *testi
 		t.Fatalf("unknown province without loaded database must be rejected with 未加载, got %v", err)
 	}
 	// And："海外" 是唯一可判定归属的条目，放行；空条目仍拒绝
-	// 历史问题（用户裁决覆盖 历史问题 海外放行）：海外拦截同样依赖 live
+	// （用户裁决覆盖海外放行）：海外拦截同样依赖 live
 	// searcher 设置占位变量，缺库时 CEL 恒假零强制——未加载时一并拒绝。
 	if err := ValidateGeoIPCountries(`["海外"]`, "deny"); err == nil || !strings.Contains(err.Error(), "未加载") {
 		t.Fatalf("海外 without loaded database must be rejected with 未加载, got %v", err)

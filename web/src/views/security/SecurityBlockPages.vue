@@ -151,9 +151,9 @@ const pageSize = ref(10)
 const saving = ref(false)
 const users = ref<UserListItem[]>([])
 const pages = ref<BlockPage[]>([])
-// 历史问题：拦截页加载失败不得显示「暂无拦截页面」（与真实空列表不可区分）
+// 拦截页加载失败不得显示「暂无拦截页面」（与真实空列表不可区分）
 const loadError = ref(false)
-// 分页夹紧+切片：useClampedPagination 单一范式（历史问题，取代 computed
+// 分页夹紧+切片：useClampedPagination 单一范式（取代 computed
 // 内副作用赋值反模式）
 const { pagedItems: pagedPages } = useClampedPagination(pages, page, pageSize)
 const dialogVisible = ref(false)
@@ -165,7 +165,7 @@ const currentPage = ref<BlockPage | null>(null)
 
 const dialogTitle = computed(() => {
   if (!editingId.value) return '新建拦截页面'
-  // 历史问题：只读用户打开非默认页也应显示「查看」（此前编辑态误导）。
+  // 只读用户打开非默认页也应显示「查看」（此前编辑态误导）。
   return currentPage.value?.is_default || currentPage.value?.is_builtin || isReadOnly.value ? '查看拦截页面' : '编辑拦截页面'
 })
 
@@ -202,7 +202,7 @@ const contentTypeTagType = (ct?: string): 'primary' | 'success' | 'warning' | 'i
 const fetchData = async () => {
   loading.value = true
   try {
-    // 历史问题：用户列表失败不得连带丢弃已成功的拦截页——Promise.all 下
+    // 用户列表失败不得连带丢弃已成功的拦截页——Promise.all 下
     // 任一 reject 即整页空态「暂无拦截页面」，与真实数据状态不符。
     const [pagesRes, usersRes] = await Promise.allSettled([
       request.get<APIResponse<BlockPage[]>>('/security/block-pages'),
@@ -222,7 +222,7 @@ const fetchData = async () => {
   } finally { loading.value = false }
 }
 
-// 更新者显示名走 utils/updaterName 单源（历史修复 四份同构收敛）
+// 更新者显示名走 utils/updaterName 单源
 const getUpdaterName = (userId?: number) => updaterName(users.value, userId)
 
 const openDialog = (row?: BlockPage) => {
@@ -248,7 +248,7 @@ const handleSave = async () => {
   } catch { /* 具体错误已由全局 axios 拦截器统一展示 */ } finally { saving.value = false }
 }
 
-// 历史修复：删除重入守卫（双击叠两个确认框 → 两次 DELETE，第二次 404 误报失败）——
+// 删除重入守卫（双击叠两个确认框 → 两次 DELETE，第二次 404 误报失败）——
 // 与 SecurityPolicies.deletingPolicyId 同款范式。
 const deletingId = ref<number | null>(null)
 const handleDelete = (row: BlockPage) => {
@@ -261,7 +261,7 @@ const handleDelete = (row: BlockPage) => {
 }
 
 const previewPage = (row: BlockPage) => {
-  // 非 HTML 类型按源码展示（历史问题）——srcdoc 恒按 text/html 解析，
+  // 非 HTML 类型按源码展示——srcdoc 恒按 text/html 解析，
   // JSON/XML/纯文本直接塞入会被吞标签/压成无格式文本流，与真实响应不一致
   const content = row.content || ''
   const isHtml = !row.content_type || row.content_type.startsWith('text/html')

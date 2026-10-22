@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
@@ -21,7 +22,7 @@ import (
 
 func resetConfigWatchdogForTest(t *testing.T) {
 	t.Helper()
-	// 历史问题：复位含心跳窗口/跳过计数与首报留痕标志（原漏 configDriftSkipped
+	// 复位含心跳窗口/跳过计数与首报留痕标志（原漏 configDriftSkipped
 	// 与两枚 warn 标志——跨用例残留会让「失败首报」断言失真）。
 	reset := func() {
 		configDriftMu.Lock()
@@ -97,7 +98,7 @@ func TestConfigWatchdog_recoversWhenRoutesReturn(t *testing.T) {
 	}
 }
 
-// 历史问题-2（历史）：从节点 WatchdogCheckOnce 整轮短路——看门狗是主节点
+// 从节点 WatchdogCheckOnce 整轮短路——看门狗是主节点
 // 专属检测，从节点零心跳簿记、零任务日志（此前从节点每轮空跑：cleanRounds 累积
 // 并逐小时发「配置一致」假心跳，升主前从未真实检查）。循环保持存活，升主后自动
 // 恢复真实检查。
@@ -115,7 +116,7 @@ func TestConfigWatchdog_slaveSkipsWholeRound(t *testing.T) {
 	t.Cleanup(func() { watchdogAdminURLValue = "" })
 	// When 从节点连打两轮心跳窗口（120 轮）
 	for range 2 * configWatchdogHeartbeatRounds {
-		WatchdogCheckOnce()
+		WatchdogCheckOnce(context.Background())
 	}
 
 	// Then 零任务日志（无假心跳）+ 心跳计数零累积 + 零漂移态（整轮短路）
@@ -136,15 +137,15 @@ func TestConfigWatchdog_slaveSkipsWholeRound(t *testing.T) {
 	if _, err := database.Exec("UPDATE global_config SET is_master=1 WHERE id=1"); err != nil {
 		t.Fatal(err)
 	}
-	WatchdogCheckOnce()
-	WatchdogCheckOnce()
+	WatchdogCheckOnce(context.Background())
+	WatchdogCheckOnce(context.Background())
 	if drift := CurrentConfigDrift(); drift.Consistent {
 		t.Fatal("升主后应恢复真实检查（两轮不一致置漂移态）")
 	}
 }
 
 func TestConfigWatchdog_subRoutesBelongToParentRule(t *testing.T) {
-	// Given：运行配置含子路由 @id（lb_x_redirect / lb_x_path_0）——历史修复 误报场景
+	// Given：运行配置含子路由 @id（lb_x_redirect / lb_x_path_0）——误报场景
 	_, database := newClusterTestService(t)
 	seedGenerationRule(t, database, "lb_watchdog_sub", false)
 	resetConfigWatchdogForTest(t)
@@ -209,9 +210,9 @@ func seedTCPWatchdogRule(t *testing.T, database *sql.DB, ruleID string, listenPo
 	}
 }
 
-// 历史问题 日志收敛（2026-10-03 裁定，历史问题「日志只记真实执行」延伸到常驻循环任务）：
+// 日志收敛（2026-10-03 裁定，「日志只记真实执行」延伸到常驻循环任务）
 // 一致轮不再逐轮写「配置一致」，收敛为每 60 轮（60s×60≈1h）一条心跳；漂移/
-// 恢复事件留痕不变。设计变更披露：历史问题 SPEC 的「每轮一行结论」对一致轮不再
+// 恢复事件留痕不变。设计变更披露： SPEC 的「每轮一行结论」对一致轮不再
 // 成立（task_logf_pin_test.go 的接线钉已同步迁移到心跳形态）。
 func TestConfigWatchdog_heartbeatGatesConsistentRounds(t *testing.T) {
 	newClusterTestService(t)
@@ -228,7 +229,7 @@ func TestConfigWatchdog_heartbeatGatesConsistentRounds(t *testing.T) {
 		return strings.Count(string(data), "配置一致")
 	}
 
-	// Given：可达的 Caddy（空配置）+ 空规则库 → 真实检查且一致（历史问题 起
+	// Given：可达的 Caddy（空配置）+ 空规则库 → 真实检查且一致（自此
 	// 跳过轮不计入干净轮，心跳必须由真实检查轮驱动）。
 	oldURL := watchdogAdminURLValue
 	server := fakeCaddyWithRoutes(t, emptyCaddyConfig)
@@ -236,15 +237,15 @@ func TestConfigWatchdog_heartbeatGatesConsistentRounds(t *testing.T) {
 	t.Cleanup(func() { watchdogAdminURLValue = oldURL })
 
 	// When：连续两轮一致。Then：零结论行（原每轮一行）。
-	WatchdogCheckOnce()
-	WatchdogCheckOnce()
+	WatchdogCheckOnce(context.Background())
+	WatchdogCheckOnce(context.Background())
 	if got := heartbeats(); got != 0 {
 		t.Fatalf("一致轮结论行=%d, want 0（已收敛为心跳）", got)
 	}
 
 	// When：第 3-60 轮。Then：历史恰发一条心跳，无漂移行。
 	for i := 3; i <= 60; i++ {
-		WatchdogCheckOnce()
+		WatchdogCheckOnce(context.Background())
 	}
 	log := readTaskLog(t, "config-watchdog")
 	if got := strings.Count(log, "配置一致（心跳，近 60 轮无漂移）"); got != 1 {
@@ -256,12 +257,12 @@ func TestConfigWatchdog_heartbeatGatesConsistentRounds(t *testing.T) {
 
 	// 心跳周期重复：61-119 轮静默，历史第二条。
 	for i := 61; i <= 119; i++ {
-		WatchdogCheckOnce()
+		WatchdogCheckOnce(context.Background())
 	}
 	if got := heartbeats(); got != 1 {
 		t.Fatalf("第 61-119 轮心跳应仍为 1 条, got %d", got)
 	}
-	WatchdogCheckOnce()
+	WatchdogCheckOnce(context.Background())
 	if got := heartbeats(); got != 2 {
 		t.Fatalf("历史应有第二条心跳, got %d", got)
 	}
@@ -275,11 +276,11 @@ func TestConfigWatchdog_heartbeatRetainsSkippedCountAcrossCleanWindow(t *testing
 	oldURL := watchdogAdminURLValue
 	t.Cleanup(func() { watchdogAdminURLValue = oldURL })
 	watchdogAdminURLValue = "http://127.0.0.1:1"
-	WatchdogCheckOnce()
+	WatchdogCheckOnce(context.Background())
 	server := fakeCaddyWithRoutes(t, emptyCaddyConfig)
 	watchdogAdminURLValue = server.URL
 	for range configWatchdogHeartbeatRounds {
-		WatchdogCheckOnce()
+		WatchdogCheckOnce(context.Background())
 	}
 
 	// Then the public since-last-check counter is zero, while the heartbeat's
@@ -307,8 +308,8 @@ func TestConfigWatchdog_heartbeatWindowResetsOnDrift(t *testing.T) {
 	t.Cleanup(func() { watchdogAdminURLValue = oldURL })
 
 	// 两轮漂移：历史置漂移态，逐轮漂移行照旧；一致轮零行。
-	WatchdogCheckOnce()
-	WatchdogCheckOnce()
+	WatchdogCheckOnce(context.Background())
+	WatchdogCheckOnce(context.Background())
 	log := readTaskLog(t, "config-watchdog")
 	if got := strings.Count(log, "配置漂移"); got != 1 {
 		t.Fatalf("漂移行=%d, want 1（防抖首轮静默，置漂移轮起逐轮留痕）: %q", got, log)
@@ -320,20 +321,20 @@ func TestConfigWatchdog_heartbeatWindowResetsOnDrift(t *testing.T) {
 	// 恢复：恢复轮起重新计数——历史仍静默，历史发一条心跳。
 	full := fakeCaddyWithRoutes(t, `{"apps":{"http":{"servers":{"http_8080":{"listen":[":8080"],"routes":[{"@id":"lb_hb_drift","handle":[{"handler":"reverse_proxy"}]}]}}}}}`)
 	watchdogAdminURLValue = full.URL
-	WatchdogCheckOnce() // 恢复轮（窗口 1/60）
+	WatchdogCheckOnce(context.Background()) // 恢复轮（窗口 1/60）
 	for i := 2; i <= 59; i++ {
-		WatchdogCheckOnce()
+		WatchdogCheckOnce(context.Background())
 	}
 	if got := strings.Count(readTaskLog(t, "config-watchdog"), "配置一致"); got != 0 {
 		t.Fatalf("恢复后历史仍应静默, got %d 条心跳", got)
 	}
-	WatchdogCheckOnce()
+	WatchdogCheckOnce(context.Background())
 	if got := strings.Count(readTaskLog(t, "config-watchdog"), "配置一致"); got != 1 {
 		t.Fatalf("恢复后历史应发一条心跳, got %d", got)
 	}
 }
 
-// 历史问题：整轮跳过（Caddy 不可达）不构成「一致」证据——连续 120 轮跳过零
+// 整轮跳过（Caddy 不可达）不构成「一致」证据——连续 120 轮跳过零
 // 「配置一致」心跳，干净轮零累积，跳过轮单独计数（原实现把跳过轮计入干净轮
 // 并发假心跳）。
 func TestConfigWatchdog_skippedRoundsDoNotEmitHeartbeat(t *testing.T) {
@@ -345,7 +346,7 @@ func TestConfigWatchdog_skippedRoundsDoNotEmitHeartbeat(t *testing.T) {
 	t.Cleanup(func() { watchdogAdminURLValue = oldURL })
 
 	for range 2 * configWatchdogHeartbeatRounds {
-		WatchdogCheckOnce()
+		WatchdogCheckOnce(context.Background())
 	}
 
 	if data, err := os.ReadFile(taskengine.TaskLogPath("config-watchdog")); err == nil && strings.Contains(string(data), "配置一致") {
@@ -386,7 +387,7 @@ func TestConfigWatchdog_debounceRoundDoesNotCountOrHeartbeat(t *testing.T) {
 	watchdogAdminURLValue = fakeCaddyWithRoutes(t, emptyCaddyConfig).URL
 
 	// When：第 60 个检查周期（防抖轮）
-	WatchdogCheckOnce()
+	WatchdogCheckOnce(context.Background())
 
 	// Then：不写心跳，干净轮不增
 	if data, err := os.ReadFile(taskengine.TaskLogPath("config-watchdog")); err == nil && strings.Contains(string(data), "配置一致") {
@@ -403,7 +404,7 @@ func TestConfigWatchdog_debounceRoundDoesNotCountOrHeartbeat(t *testing.T) {
 	}
 
 	// 回归形状：确认漂移后恢复（第二轮不一致 → 状态翻 false，干净轮归零）
-	WatchdogCheckOnce()
+	WatchdogCheckOnce(context.Background())
 	if drift := CurrentConfigDrift(); drift.Consistent {
 		t.Fatalf("第二轮不一致应置漂移态: %+v", drift)
 	}
@@ -422,8 +423,8 @@ func TestConfigWatchdog_successfulCheckResetsSkippedRounds(t *testing.T) {
 	oldURL := watchdogAdminURLValue
 	t.Cleanup(func() { watchdogAdminURLValue = oldURL })
 	watchdogAdminURLValue = "http://127.0.0.1:1"
-	WatchdogCheckOnce()
-	WatchdogCheckOnce()
+	WatchdogCheckOnce(context.Background())
+	WatchdogCheckOnce(context.Background())
 	if drift := CurrentConfigDrift(); drift.SkippedRounds != 2 {
 		t.Fatalf("setup skipped rounds=%d, want 2", drift.SkippedRounds)
 	}
@@ -431,7 +432,7 @@ func TestConfigWatchdog_successfulCheckResetsSkippedRounds(t *testing.T) {
 	watchdogAdminURLValue = server.URL
 
 	// When a real check succeeds.
-	WatchdogCheckOnce()
+	WatchdogCheckOnce(context.Background())
 
 	// Then the counter defined as "since the last real check" returns to zero,
 	// while the successful round still advances the clean-round window.
@@ -447,13 +448,13 @@ func TestConfigWatchdog_successfulCheckResetsSkippedRounds(t *testing.T) {
 
 	// And a later skipped round is counted from this new real-check boundary.
 	watchdogAdminURLValue = "http://127.0.0.1:1"
-	WatchdogCheckOnce()
+	WatchdogCheckOnce(context.Background())
 	if drift := CurrentConfigDrift(); drift.SkippedRounds != 1 {
 		t.Fatalf("skipped rounds after new failure=%d, want 1", drift.SkippedRounds)
 	}
 }
 
-// 历史问题：畸形运行配置形状不得 panic，且合法路由照常提取。
+// 畸形运行配置形状不得 panic，且合法路由照常提取。
 func TestRunningRuleRouteIDs_toleratesMalformedShapes(t *testing.T) {
 	server := fakeCaddyWithRoutes(t, `{"apps":{"http":{"servers":{"s":{"routes":["str",{"@id":"lb_x"},{"@id":123},null]}},"other":"not-a-map"},"layer4":"bad"}}`)
 
@@ -473,7 +474,7 @@ func TestRunningRuleRouteIDs_toleratesMalformedShapes(t *testing.T) {
 	}
 }
 
-// 历史问题：同一集合的漂移 diff 结果顺序稳定（map 遍历随机不得驱动展示抖动）。
+// 同一集合的漂移 diff 结果顺序稳定（map 遍历随机不得驱动展示抖动）。
 func TestConfigDriftDiffOrderIsStable(t *testing.T) {
 	expected := map[string]string{}
 	running := map[string]bool{}
@@ -522,7 +523,7 @@ func (s *syncLogBuffer) String() string {
 	return s.b.String()
 }
 
-// 历史问题：审计库被外部写锁占住（RecordAuditLog 阻塞）时，看门狗不得持
+// 审计库被外部写锁占住（RecordAuditLog 阻塞）时，看门狗不得持
 // configDriftMu 等 I/O——读者 CurrentConfigDrift 必须立即可返回。
 func TestUpdateConfigDrift_releasesLockBeforeAuditIO(t *testing.T) {
 	newClusterTestService(t)
@@ -628,7 +629,7 @@ func TestConfigWatchdog_uncheckedRoundFailsTaskRun(t *testing.T) {
 	}
 }
 
-// 历史修复 反向形状：真实完成的检查轮仍返回 nil（不得把「一致」误报为失败）。
+// 反向形状：真实完成的检查轮仍返回 nil（不得把「一致」误报为失败）。
 func TestConfigWatchdog_checkedRoundSucceeds(t *testing.T) {
 	newTaskLogDir(t)
 	resetConfigWatchdogForTest(t)

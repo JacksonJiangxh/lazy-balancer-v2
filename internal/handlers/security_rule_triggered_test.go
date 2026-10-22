@@ -7,7 +7,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// ruleTriggeredMultiFilterSQL 的逗号多值契约（历史修复 场景）：
+// ruleTriggeredMultiFilterSQL 的逗号多值契约
 // 单值与 ruleTriggeredFilterSQL 逐字节一致（向后兼容）；
 // 多值逐段复用单段解析后 OR 连接；任一段只能走消息关键词路径时整串回退单输入。
 func TestRuleTriggeredMultiFilterSQL_singleValueByteIdentical(t *testing.T) {
@@ -27,7 +27,7 @@ func TestRuleTriggeredMultiFilterSQL_singleValueByteIdentical(t *testing.T) {
 func TestRuleTriggeredMultiFilterSQL_multiFamilyOR(t *testing.T) {
 	var args []any
 	got := ruleTriggeredMultiFilterSQL("地域拦截,自定义规则", &args)
-	// 历史修复(2026-09-10):单数字族(8)改精确匹配后 LIKE 片段为 0——地域拦截
+	// (2026-09-10):单数字族(8)改精确匹配后 LIKE 片段为 0——地域拦截
 	// 现为 rule_triggered = '8'。自定义规则族 1 个复合 GLOB 段保持。
 	if n := strings.Count(got, "rule_triggered = ?"); n != 1 {
 		t.Errorf("multi family: exact fragments=%d, want 1: %q", n, got)
@@ -76,7 +76,7 @@ func TestRuleTriggeredMultiFilterSQL_partialFamilyPrefix(t *testing.T) {
 		}
 		return false
 	}
-	// 历史问题：3 字符前缀族锚定 6 位（949___/959___）——不再交叉命中
+	// 3 字符前缀族锚定 6 位（949___/959___）——不再交叉命中
 	// 5 位自定义发射 id（94900-94999 等）。
 	if !hasArg("949___") || !hasArg("959___") {
 		t.Errorf("partial family prefix must put 949___/959___ into args: %v", args)
@@ -86,7 +86,7 @@ func TestRuleTriggeredMultiFilterSQL_partialFamilyPrefix(t *testing.T) {
 	}
 }
 
-// 历史修复（2026-09-05 安全核心域审计裁定修复）：「自定义规则」筛选 family 必须与
+// （2026-09-05 安全核心域审计裁定修复）：「自定义规则」筛选 family 必须与
 // categorizeAttack 总览口径一致——5 位任意数字 ID（emit=crID+10000）与 ≥7 位
 // 以 1 开头的合成 ID（1000000+）归本族；6 位 1xxxxx（CRS 保留段余数、无发射
 // 源，总览判「其他」）不得被 LIKE 前缀误并入。以真实 SQLite 判定生成的条件
@@ -139,7 +139,7 @@ func TestRuleTriggeredFilterSQL_customRuleFamilyMatchesCategorizeAttackScope(t *
 	}
 }
 
-// 阶段化模型（历史问题 收敛）：地域拦截 = [800000,810000)，爬虫
+// 阶段化模型：地域拦截 = [800000,810000)，爬虫
 // = [810000,900000)。两者以互斥 6 位 GLOB 表达，且均不得落入「WAF 规则
 // （CRS）」family（CRS 规则 ID 恒 9xxxxx）。
 func TestRuleTriggeredFilterSQL_geoipPrecheckSegmentFamily(t *testing.T) {
@@ -215,7 +215,7 @@ func TestRuleTriggeredFilterSQL_geoipPrecheckSegmentFamily(t *testing.T) {
 	}
 }
 
-// 历史问题：3 字符前缀族（920/921/949/959）筛选不得交叉命中 5 位自定义
+// 3 字符前缀族（920/921/949/959）筛选不得交叉命中 5 位自定义
 // 规则发射 id（crID≥82000 时发射 92000-99999）——categorizeAttack len==5 先行
 // 归「自定义规则」，筛选族与分类口径对齐：LIKE 追加三个下划线锚定总长 6 位。
 func TestRuleTriggeredFilter_3CharPrefixAnchorsSixDigits(t *testing.T) {
@@ -245,9 +245,9 @@ func TestRuleTriggeredFilter_3CharPrefixAnchorsSixDigits(t *testing.T) {
 	}
 }
 
-// ---- 历史问题 ----
+// ---- 回归钉 ----
 
-// 历史问题：前端事件页多选筛选值为「WAF·CRS」（SecurityEvents.vue），旧结构化
+// 前端事件页多选筛选值为「WAF·CRS」（SecurityEvents.vue），旧结构化
 // 判定只认显示标签「WAF 规则（CRS）」——多值任一段不可结构化即整串回退字面量
 // LIKE，而 rule_triggered 只存规则 ID，查询恒空（正向）/排除失效（反向）。
 func TestRuleTriggeredMultiFilterSQL_compactWAFCRSLabel(t *testing.T) {
@@ -269,7 +269,7 @@ func TestRuleTriggeredMultiFilterSQL_compactWAFCRSLabel(t *testing.T) {
 	}
 }
 
-// 历史问题：「WAF·」「WAF·自」等部分输入（allow-create 可输入）不得生成空 OR
+// 「WAF·」「WAF·自」等部分输入（allow-create 可输入）不得生成空 OR
 // 条件 "()"（拼入 AND () 令 SQLite 语法错误 → 事件列表 500）。
 func TestRuleTriggeredFilterSQL_partialWAFPrefixNeverEmpty(t *testing.T) {
 	for _, input := range []string{"WAF·", "WAF·自", "WAF·C"} {
@@ -290,7 +290,7 @@ func TestRuleTriggeredFilterSQL_partialWAFPrefixNeverEmpty(t *testing.T) {
 	}
 }
 
-// 历史问题：尾随/连续逗号产生的空段必须忽略并按剩余有效段结构化，不得因空段
+// 尾随/连续逗号产生的空段必须忽略并按剩余有效段结构化，不得因空段
 // 回退字面量 LIKE（静默错结果）。
 func TestRuleTriggeredMultiFilterSQL_ignoresEmptySegments(t *testing.T) {
 	for _, input := range []string{"IP 访问控制,", "IP 访问控制,,WAF·CRS", ",IP 访问控制"} {

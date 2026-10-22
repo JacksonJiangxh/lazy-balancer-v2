@@ -1,16 +1,16 @@
 package services
 
-//   - 历史修复：Run 体业务门 StopLoop 前复查 AutobanEnabled——「首读 false 后、
+//   Run 体业务门 StopLoop 前复查 AutobanEnabled——「首读 false 后、
 //     停环前」与 PUT enabled=1 + StartLoop 交错时不得误杀新调度（终态
 //     loopOn=true）。
-//   - 历史修复（Ruling=自停）：消费侧护栏校验失败即停调度——持续性无效配置每轮
+//   （Ruling=自停）：消费侧护栏校验失败即停调度——持续性无效配置每轮
 //     空转（1440 failed 行/天）无边际价值，与业务门同构（留痕+StopLoop）；
 //     恢复路径=PUT 保存有效配置（校验过即 StartLoop）/重启回填收敛。
-//   - 历史修复：名单条数与渲染生效面同口径——已到期未清理条目
+//   名单条数与渲染生效面同口径——已到期未清理条目
 //     （expires_at 可解析且 <= now）不计入；畸形 expires_at 保留不误删。
 //     （banned_today 已改为审计事件计数——2026-10-15 用户裁定，见
 //     autoban_test.go TestAutobanBannedToday。）
-//   - 历史修复：AutobanIsMaster 导出（/status is_master 数据源，与调度门同源）。
+//   AutobanIsMaster 导出（/status is_master 数据源，与调度门同源）。
 
 import (
 	"testing"
@@ -31,7 +31,7 @@ func installAutobanEngineFixture(t *testing.T) *taskengine.Engine {
 	return te
 }
 
-// TestAutobanRunGate_recheckPreservesConcurrentlyEnabledLoop（历史修复）：Given 手动
+// TestAutobanRunGate_recheckPreservesConcurrentlyEnabledLoop：Given 手动
 // 触发的 Run 在未启用态进入业务门（首读 false），首读之后、停环之前 PUT
 // enabled=1 + StartLoop 已并发发生（缝内注入，镜像 UpdateAutobanConfig 保存
 // 联动启停两步）。When Run 体到停环判定点。Then 复查读 true → 不停环、本轮按
@@ -75,7 +75,7 @@ func TestAutobanRunGate_stopsLoopWhenStillDisabledAfterRecheck(t *testing.T) {
 	}
 }
 
-// TestAutobanRunCycle_invalidConfigStopsLoop（历史修复，Ruling=自停）：Given 带外
+// TestAutobanRunCycle_invalidConfigStopsLoop：Given 带外
 // 污染（threshold=0）+调度开。When Run 体护栏校验失败。Then 拒绝执行之外必须
 // 停调度（LoopOn=false）——持续性无效配置每轮空转（约 1440 failed 行/天）无
 // 边际价值；留痕=错误返回+failed 行，恢复路径=保存有效配置（校验过即
@@ -93,7 +93,7 @@ func TestAutobanRunCycle_invalidConfigStopsLoop(t *testing.T) {
 		t.Fatal("无效配置必须拒绝执行")
 	}
 	if m, _ := te.Lookup(AutobanTaskID); m.LoopOn {
-		t.Fatal("护栏校验失败必须停调度（自停——持续空转无边际价值，AB-3 Ruling）")
+		t.Fatal("护栏校验失败必须停调度（自停——持续空转无边际价值）")
 	}
 }
 
@@ -112,7 +112,7 @@ func TestAutobanRunCycle_validConfigKeepsLoopOn(t *testing.T) {
 	}
 }
 
-// TestAutobanStatusCounters_matchRenderActiveCaliber（历史修复）：Given 名单含
+// TestAutobanStatusCounters_matchRenderActiveCaliber：Given 名单含
 // 自动条目三条（一条生效、一条已到期未清理、一条畸形 expires_at）+ 手动条目。
 // When 计算生效条目视图。Then 已到期未清理条目不计入（与渲染投影层
 // loadIPListEntriesVia 同口径）；畸形 expires_at 保留不误删；AutobanListEntries
@@ -145,7 +145,7 @@ func TestAutobanStatusCounters_matchRenderActiveCaliber(t *testing.T) {
 	}
 }
 
-// TestAutobanIsMaster_exportsSchedulerRole（历史修复）：导出包装与调度门同源
+// TestAutobanIsMaster_exportsSchedulerRole：导出包装与调度门同源
 // （引擎角色缝）——生产装配下默认 true，从端/缝覆写为 false。
 func TestAutobanIsMaster_exportsSchedulerRole(t *testing.T) {
 	installAutobanFixture(t, "2026-10-14 10:00:00")

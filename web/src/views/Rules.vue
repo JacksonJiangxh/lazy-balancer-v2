@@ -200,7 +200,7 @@
                 </div>
                 <div class="cert-row">
                   <span class="cert-label">剩余天数</span>
-                  <!-- 历史问题：过期证书不渲染裸负数（「-1 天」易误读为已过期一整天） -->
+                  <!-- 过期证书不渲染裸负数（「-1 天」易误读为已过期一整天）-->
                   <span :class="['cert-days', certInfoMap[row.caddy_id]?.status]">
                     {{ certInfoMap[row.caddy_id]?.status === 'expired'
                       ? `已过期 ${Math.abs(certInfoMap[row.caddy_id]?.days_remaining ?? 0)} 天`
@@ -508,7 +508,7 @@
               <span class="form-tip-inline">将 HTTP 请求自动重定向到 HTTPS</span>
             </el-form-item>
           </el-form>
-          <!-- 原「请先在基本配置中启用 HTTPS」说明框已删除（历史）：
+          <!-- 原「请先在基本配置中启用 HTTPS」说明框已删除：
                showTlsStep=protocol http && enable_tls 时本步才渲染，而该框 v-if 要
                !enable_tls——恒不可达的死模板。 -->
         </div>
@@ -1257,7 +1257,7 @@ interface RuleForm extends Omit<CreateRuleRequest, 'dns_family' | 'upstreams' | 
   ca_provider_id?: number
   compress_types: string[]
   enabled: boolean
-  // 历史问题：编辑手动证书规则时 GetRule 回传的「私钥已隐藏」标记
+  // 编辑手动证书规则时 GetRule 回传的「私钥已隐藏」标记
   tlsKeySet: boolean
 }
 
@@ -1446,7 +1446,7 @@ const blockPages = ref<SecurityStageBlockPage[]>([])
 const rulesLoadError = ref(false)
 const securityBindingsError = ref(false)
 // 绑定数据未就绪时禁止打开编辑器：组件预选空集 + 全量替换语义会把
-// 「加载失败/未完成」保存成「解除全部绑定」（历史问题-1）。
+// 「加载失败/未完成」保存成「解除全部绑定」。
 const securityBindingsLoading = ref(true)
 const fetchSecurityBindings = async () => {
   securityBindingsLoading.value = true
@@ -1463,7 +1463,7 @@ const fetchSecurityBindings = async () => {
     if (blockPagesRes.data) blockPages.value = blockPagesRes.data
     securityBindingsError.value = false
   } catch {
-    // 历史问题：四端点任一失败时保持的数据为空，锁图标会渲染成「未绑定」、
+    // 四端点任一失败时保持的数据为空，锁图标会渲染成「未绑定」、
     // 流程投影全灰——整体静默等于把加载失败伪装成真实安全状态。改为显性横幅
     // （模板带「重新加载」），全局拦截器仍会 toast 一次具体错误。
     securityBindingsError.value = true
@@ -1483,7 +1483,7 @@ const setLockPopover = (caddyId: string, el: unknown): void => {
 }
 
 // 历史（用户反馈）：表格 hover 弹框（锁摘要/TLS/健康）在靠底或靠顶行会被视口裁切
-// popperViewportSafe 已提取至 utils/popper 共享（历史问题/5 家族：四处弹框统一
+// popperViewportSafe 已提取至 utils/popper 共享（/5 家族：四处弹框统一
 // 视口安全回退——flip 多向回退含水平 + preventOverflow padding 8）。
 // 弹框内容超高时由 .rule-lock-popper 的 max-height + overflow-y 内部滚动承接。
 const openFlowFromLock = (rule: Rule): void => {
@@ -1513,11 +1513,11 @@ const filteredRules = computed(() => {
 })
 
 
-// 历史修复：墙钟串统一经 parseDbTimeMs 的 +Z 规范化——裸 new Date 在 Safari 对
+// 墙钟串统一经 parseDbTimeMs 的 +Z 规范化——裸 new Date 在 Safari 对
 // 空格分隔格式返回 NaN，曾致排序比较恒 0 退化。
 const ruleUpdatedAtMs = (rule: Rule): number => parseDbTimeMs(rule.updated_at) ?? 0
 
-// 分页夹紧+切片：useClampedPagination 单一范式（历史）
+// 分页夹紧+切片：useClampedPagination 单一范式
 const { pagedItems: pagedRules } = useClampedPagination(filteredRules, currentPage, pageSize)
 
 watch(searchQuery, () => {
@@ -1525,7 +1525,7 @@ watch(searchQuery, () => {
 })
 
 // 每条规则的四阶段分组投影缓存（规则/绑定/策略/名单/拦截页任一变化即整体重算）。
-// 历史问题：只投影当前页可见规则（原实现对全部规则重算，绑定/策略/名单任一
+// 只投影当前页可见规则（原实现对全部规则重算，绑定/策略/名单任一
 // 变化即 O(R×阶段数) 全量重建）。流程弹框的目标行恒来自表格行；非可见行经
 // ruleStageModel 的兜底分支即时构建。
 const ruleStageModelMap = computed<Map<string, RuleStageModel>>(() => {
@@ -1546,7 +1546,7 @@ const ruleStageModelMap = computed<Map<string, RuleStageModel>>(() => {
 
 const users = ref<UserListItem[]>([])
 const certInfoMap = ref<Record<string, CertInfo | null>>({})
-// 历史问题：证书详情加载失败显性化——原实现仅 console，TLS 列回落「未签发/手动」
+// 证书详情加载失败显性化——原实现仅 console，TLS 列回落「未签发/手动」
 // 且页面无任何提示（与同页证书任务轮询的错误横幅不一致）。
 const certInfoError = ref(false)
 const certJobMap = ref<Record<string, CertJob>>({})
@@ -1556,7 +1556,7 @@ const certInfoGenerations = new Map<string, number>()
 let certInfoGeneration = 0
 let rulesRequestSeq = 0
 
-// 更新者显示名走 utils/updaterName 单源（历史修复 四份同构收敛）
+// 更新者显示名走 utils/updaterName 单源
 const getUpdaterName = (userId?: number) => updaterName(users.value, userId)
 
 const fetchRules = async () => {
@@ -1638,7 +1638,7 @@ const fetchCertInfo = async (caddyIds?: readonly string[]): Promise<boolean> => 
   }
 }
 
-// 历史问题：证书详情重试入口（横幅按钮）——重试全量 TLS 规则详情。
+// 证书详情重试入口（横幅按钮）——重试全量 TLS 规则详情。
 const retryCertInfo = (): void => {
   void fetchCertInfo()
 }
@@ -1678,7 +1678,7 @@ const fetchCertJobs = async (roundSignal?: AbortSignal): Promise<void> => {
   if (refreshed) refreshRuleIds.forEach((ruleId) => pendingCertInfoRefresh.delete(ruleId))
 }
 
-// 历史问题（用户裁定，对齐后端 HasRunningJobForRule）：waiting_ca（CA 限流冷却）不算
+// （用户裁定，对齐后端 HasRunningJobForRule）：waiting_ca（CA 限流冷却）不算
 // 活动态——不阻塞规则启停与删除；downloaded（部署退避窗）仍按活动态保留。
 const isCertJobActive = (status?: CertJobStatus) => {
   if (!status) return false
@@ -1695,7 +1695,7 @@ const isCertJobEditLocked = (status?: CertJobStatus) => {
 const certJobStatusOf = (row: Rule): CertJobStatus | undefined =>
   certJobMap.value[row.caddy_id]?.status
 
-// 历史问题：原「证书申请中…」文案在 waiting_ca（可达数小时）期间误导，
+// 原「证书申请中…」文案在 waiting_ca（可达数小时）期间误导，
 // 冷却期改提示「不阻塞启停/删除、编辑仍锁定」。
 const certJobLockTooltip = (row: Rule, activeText: string): string => {
   if (isReadOnly.value) return authStore.readOnlyMessage
@@ -1723,11 +1723,11 @@ const canDeleteRule = (row: Rule) => {
 
 const tlsTagType = (row: Rule) => {
   const cert = certInfoMap.value[row.caddy_id]
-  // 历史问题：详情加载失败且无缓存 → danger（不得回落为「未签发/手动」正常态）
+  // 详情加载失败且无缓存 → danger（不得回落为「未签发/手动」正常态）
   if (certInfoError.value && cert === undefined) return 'danger'
   const jobStatus = certJobMap.value[row.caddy_id]?.status
   // 重新签发进行中（含切换 CA）优先呈现活动态——在役证书 valid 不再抢先显示
-  //「已签发」（历史用户报告：签发任务执行中标签无变化）。
+  //「已签发」（用户报告：签发任务执行中标签无变化）。
   if (row.tls_source === 'acme_dns' && jobStatus && (isCertJobActive(jobStatus) || jobStatus === 'waiting_ca')) return 'warning'
   if (cert?.status === 'expired') return 'danger'
   if (cert?.status === 'expiring') return 'warning'
@@ -1773,7 +1773,7 @@ const isCopyMode = ref(false)
 // 复制源规则（openCopyWizard 带入）——POST /rules 不携带策略绑定，副本创建后
 // 经 PUT /security/rules/:id/policies 从源快照复制（submitWizard 复制分支消费）
 const copySourceRuleId = ref<string | null>(null)
-// 历史修复：复制走 POST /rules 重建，Create 无 nil=保留语义——规则级回源 Host
+// 复制走 POST /rules 重建，Create 无 nil=保留语义——规则级回源 Host
 // 必须显式随载荷携带，否则副本静默丢失 Host 覆盖（编辑路径不受影响）。
 const copySourceHostHeader = ref('')
 const WIZARD_STEP = {
@@ -1801,7 +1801,7 @@ const ruleLogDialogVisible = ref(false)
 const ruleLogRuleName = ref('')
 const ruleLogCaddyId = ref('')
 const ruleLogContent = ref('')
-// ruleLogLoading 由 ruleLogTail.loading 承载（历史修复 收敛，声明在日志轮询段）
+// ruleLogLoading 由 ruleLogTail.loading 承载
 const ruleLogAutoRefresh = ref(true)
 const ruleLogContainerRef = ref<HTMLElement | null>(null)
 let ruleLogPollTimer: ReturnType<typeof setInterval> | null = null
@@ -1810,8 +1810,8 @@ let ruleLogRequestSeq = 0
 const ruleLogHtml = computed(() => ansiToHtml(ruleLogContent.value || '暂无日志'))
 const ruleConfig = ref<RuleConfigView | null>(null)
 
-// 历史问题 结构性简化（D 域 2(e)）：四方 host 门的核心谓词单源化——红框/常驻警告/
-// 步进门三条腿此前手工维护同一条件（历史问题 的消息腿落后一轮正是该维护风险
+// 结构性简化（D 域 2(e)）：四方 host 门的核心谓词单源化——红框/常驻警告/
+// 步进门三条腿此前手工维护同一条件（消息腿落后一轮正是该维护风险
 // 的实证），现共用一个谓词；提交过滤（host+port 载荷身份）概念不同、不参与。
 const upstreamRowNeedsHost = (u: UpstreamInput, i: number): boolean =>
   !u.host && u.enabled !== false && upstreamTouched.value[i]
@@ -1822,7 +1822,7 @@ const upstreamHostWarning = computed(() =>
 // 混合回源域名 + 主动健康检查警告谓词（2026-10-10 用户裁定）：HTTP 规则 +
 // 主动检查开启 + 未设统一健康检查域名 + 任一启用上游配置了回源域名。
 // 已设健康检查域名=用户已做统一探测旁路，不再警告。
-// 历史修复（历史）：谓词从「≥2 去重值」放宽到「任一启用上游配了回源域名」——
+// 谓词从「≥2 去重值」放宽到「任一启用上游配了回源域名」——
 // 单值形态（仅一个回源域名+主动检查+健康检查域名空）同样分裂：代理流量
 // Host=回源域名、探测 Host=上游地址/后端域名，无警告会静默误摘后端。
 const mixedOriginActiveCheckWarn = computed(() => {
@@ -1849,7 +1849,7 @@ const getHealthTagType = (status: HealthSummary) => {
   if (status.unhealthy + status.degraded > 0) return 'warning'
   if (status.unknown === status.total) return 'info'
   if (status.unknown > 0) return 'warning'
-  // 历史问题:动态 DNS 上游结构性 N/A(引擎按解析 IP 跟踪,域名级不可观测)
+  // 动态 DNS 上游结构性 N/A(引擎按解析 IP 跟踪,域名级不可观测)
   if (status.na === status.total) return 'info'
   return 'success'
 }
@@ -1863,7 +1863,7 @@ const getHealthLabel = (status: HealthSummary) => {
   return '正常'
 }
 
-// 历史修复：hostPortKey 提取至 utils/upstreamKeys（Dashboard 共用）。
+// hostPortKey 提取至 utils/upstreamKeys（Dashboard 共用）。
 
 interface UpstreamHealthView {
   healthy: boolean
@@ -1903,7 +1903,7 @@ const fetchHealthStatus = async (roundSignal?: AbortSignal) => {
     const res = await request.get<APIResponse<UpstreamHealthResponse>>('/config/health', { signal: roundSignal ?? healthPolling.signal, silent: true })
     if (disposed) return
     const healthData = res.data || {}
-    // 历史问题：扁平索引（host:port → detail）一次构建——原 probeUpstream 对每个
+    // 扁平索引（host:port → detail）一次构建——原 probeUpstream 对每个
     // 上游再遍历全部 server 映射（O(R×S×U) → O(S+U)）。首见优先（与原扫描顺序等价）。
     const healthDetailIndex = new Map<string, { healthy: boolean; unknown: boolean; dynamic?: boolean; degraded?: boolean; num_requests?: number; fails?: number }>()
     for (const serverHealth of Object.values(healthData)) {
@@ -1922,7 +1922,7 @@ const fetchHealthStatus = async (roundSignal?: AbortSignal) => {
         let unknown = 0
         let na = 0
         const upstreamStatus: Record<string, { healthy: boolean; unknown: boolean; dynamic?: boolean; degraded?: boolean; num_requests?: number; fails?: number }> = {}
-        // 历史问题-3:TCP 被动健康(未开主动探测)为结构性 N/A——caddy-l4 无
+        // TCP 被动健康(未开主动探测)为结构性 N/A——caddy-l4 无
         // admin 端点,被动熔断不产指标(gauge 仅主动检查写),与动态 DNS 同口径。
         const tcpPassive = rule.protocol === 'tcp' && !rule.enable_active_health_check
         const probeUpstream = (upstreamKey: string) => {
@@ -2017,7 +2017,7 @@ const certInfo = reactive({
 })
 let certValidationSeq = 0
 let certValidationSessionSeq = 0
-// 手动 TLS 详情加载失败（历史）：列表行不含证书正文（rule_features
+// 手动 TLS 详情加载失败：列表行不含证书正文（rule_features
 // 直取时省略），详情 GET 失败若仅 console，表单会以空证书快照静默继续——保存
 // 后把既有证书覆盖为空。失败即阻断 TLS 步/保存，并提供重试。
 const tlsDetailError = ref(false)
@@ -2043,7 +2043,7 @@ async function retryTlsDetail(): Promise<void> {
     }
     wizardForm.tls_cert = resp.data.tls_cert || ''
     wizardForm.tls_key = resp.data.tls_key || ''
-    // 历史问题：掩码私钥标记——已配置且回显空串时允许沿用原值
+    // 掩码私钥标记——已配置且回显空串时允许沿用原值
     wizardForm.tlsKeySet = resp.data.tls_key_set === true
     tlsDetailError.value = false
     ElMessage.success('证书详情已重新加载')
@@ -2127,7 +2127,7 @@ watch(() => wizardForm.path_rules, (pathRules) => {
 }, { deep: true })
 
 let hydratingWizard = false
-// 历史问题：向导打开序列号——丢弃编辑/复制在途 GET 的过期返回，防止覆盖新建表单。
+// 向导打开序列号——丢弃编辑/复制在途 GET 的过期返回，防止覆盖新建表单。
 let wizardOpenSeq = 0
 // TLS/端口提示去重：3 秒内最多一条，连续拨动不堆叠 toast。
 let lastTlsHintAt = 0
@@ -2140,14 +2140,14 @@ const showTlsHint = (message: string) => {
 // 用户是否显式/已提交过监听端口：置位后停止 80↔443/8080 的自动联动，避免静默改回默认端口。
 // 编辑态打开即置位（DB 中的 listen_port 就是用户已提交的显式配置）；联动仅保留 create/复制流的默认便捷。
 const userExplicitPort = ref(false)
-// http→tcp 迁移前的 HTTP 态快照：回转 http 时判断「是否实际改过端口 / 是否被强制关闭过 TLS」（历史修复）。
+// http→tcp 迁移前的 HTTP 态快照：回转 http 时判断「是否实际改过端口 / 是否被强制关闭过 TLS」。
 let preTcpSnapshot: { listenPort: number; enableTls: boolean } | null = null
 
 // Watch for enable_tls toggle to adjust default listen port
-// 历史问题（历史，用户裁定）：启用 TLS 时端口直接默认 443（不仅是提示）——
+// （用户裁定）：启用 TLS 时端口直接默认 443（不仅是提示）——
 // 编辑态与创建态统一，开启分支必须先于 userExplicitPort 短路（2026-10-13
 // 生产实证：短路前置导致编辑态拨 TLS 永不改端口）。用户随后手动改端口即置
-// userExplicitPort，关闭方向的自动回 80 仍受其约束（既有 历史问题 语义）。
+// userExplicitPort，关闭方向的自动回 80 仍受其约束（既有语义）。
 watch(() => wizardForm.enable_tls, (newVal, oldVal) => {
   if (hydratingWizard) return
   if (wizardForm.protocol !== 'http') return
@@ -2196,7 +2196,7 @@ watch(() => wizardForm.protocol, (newVal, oldVal) => {
     wizardForm.health_check_host = ''
     wizardForm.path_rules = []
     wizardForm.upstreams.forEach(u => {
-      // 历史修复（历史）：回源域名是 HTTP-only 语义——切换即弃置，
+      // 回源域名是 HTTP-only 语义——切换即弃置，
       // 否则隐藏残留字段被后端「回源域名仅 HTTP 规则支持」门恒拒，卡死保存
       u.origin_domain = ''
       if (u.protocol === 'http') u.protocol = 'tcp'
@@ -2204,7 +2204,7 @@ watch(() => wizardForm.protocol, (newVal, oldVal) => {
     })
   } else if (newVal === 'http' && oldVal === 'tcp') {
     // 回转判断基于快照而非 userExplicitPort：编辑态（userExplicitPort=true）进 TCP 同样被
-    // 无条件迁移 80/443→8080，回转不还原会保存即静默改写 DB 端口（历史修复）
+    // 无条件迁移 80/443→8080，回转不还原会保存即静默改写 DB 端口
     const portChanged =
       wizardForm.listen_port === 8080 &&
       (preTcpSnapshot?.listenPort === 80 || preTcpSnapshot?.listenPort === 443)
@@ -2228,7 +2228,7 @@ watch(() => wizardForm.enable_dns_server, (newVal) => {
 }, { flush: 'sync' })
 
 // Watch for enable_active_health_check toggle to set default path.
-// 历史问题：TCP 探测端口保持用户值——0=按各上游自身端口探测（后端仅在 >0
+// TCP 探测端口保持用户值——0=按各上游自身端口探测（后端仅在 >0
 // 时发射 active.port）；自动填首上游端口会静默改变多端口上游的探测语义。
 watch(() => wizardForm.enable_active_health_check, (newVal) => {
   if (!newVal) return
@@ -2302,7 +2302,7 @@ const portWarning = computed(() => {
   return ''
 })
 
-// 历史修复：策略文案映射提取至 utils/strategyLabels（Dashboard 共用，
+// 策略文案映射提取至 utils/strategyLabels（Dashboard 共用，
 // 死键 header 已删）。
 
 const fetchUsers = async () => {
@@ -2359,8 +2359,8 @@ const validateCertificate = async () => {
   }
 
   // Validate private key format
-  // 历史修复：旧哨兵串 $$PRIVATEKEY_* 全仓零产生方（后端现行掩码=tls_key 空+
-  // tls_key_set，历史问题），真实 PEM 曾被误判「私钥格式无效」致 /certificates/parse
+  // 旧哨兵串 $$PRIVATEKEY_* 全仓零产生方（后端现行掩码=tls_key 空+
+  // tls_key_set），真实 PEM 曾被误判「私钥格式无效」致 /certificates/parse
   // 永不发起——改认真实 PEM 头（RSA/EC/PKCS#8/OPENSSH/ENCRYPTED 等
   // * PRIVATE KEY 形态）；本门仅 advisory，终裁仍由后端 parseTLSCertificate
   // （tls.X509KeyPair）判定。
@@ -2445,7 +2445,7 @@ const wizardFormFromRule = (fullRule: Rule): Partial<RuleForm> => ({
   upstream_keepalive_timeout: fullRule.upstream_keepalive_timeout || 0,
   server_tokens_hidden: fullRule.server_tokens_hidden || 0,
   // 阶段拦截页覆盖：复制/编辑均保留（后端 DuplicateRule 同口径）；键集与
-  // 新建/重置路径共用 stageBlockPageOverrides（历史修复）。
+  // 新建/重置路径共用 stageBlockPageOverrides。
   ...stageBlockPageOverrides(fullRule),
   // NTLM 接管态原样回填；编辑/复制均保留实际接管字段。
   ntlm_compatible: fullRule.ntlm_compatible === 1 ? 1 : 0,
@@ -2556,7 +2556,7 @@ const pasteFromFile = async (type: 'cert' | 'key') => {
 
 const openWizard = async (rule?: Rule) => {
   if (isReadOnly.value || saving.value) return
-  // 历史问题：向导打开序列号（同 viewConfig 的 configRequestSeq 模式）——
+  // 向导打开序列号（同 viewConfig 的 configRequestSeq 模式）——
   // 编辑/复制手动 TLS 规则时在途 GET 期间用户再点「新建」，首个返回会覆盖
   // 新建表单并把保存语义从 create 翻成 PUT。过期返回直接丢弃。
   const openSeq = ++wizardOpenSeq
@@ -2566,7 +2566,7 @@ const openWizard = async (rule?: Rule) => {
   certValidationSessionSeq++
   certValidationSeq++
   resetCertInfo()
-  wizardForm.tlsKeySet = false // 掩码态随向导重置（历史）
+  wizardForm.tlsKeySet = false // 掩码态随向导重置
   tlsDetailError.value = false
   upstreamTouched.value = []
   isCopyMode.value = false
@@ -2579,7 +2579,7 @@ const openWizard = async (rule?: Rule) => {
     if (rule.enable_tls && rule.tls_source === 'manual') {
       try {
         const resp = await request.get<APIResponse<Rule>>(`/rules/${rule.caddy_id}`)
-        // 历史问题：过期返回直接 return，且不得在此复位 hydratingWizard——复位归属
+        // 过期返回直接 return，且不得在此复位 hydratingWizard——复位归属
         // 最新一次打开调用的生命周期（新建/无 GET 编辑同步复位；带 GET 的编辑/复制
         // 由自身新鲜请求走到函数尾部复位）。此处代为复位会拆掉在途新调用的
         // hydration 守卫，sync watch 会在半水合表单上误触发端口迁移。
@@ -2588,9 +2588,9 @@ const openWizard = async (rule?: Rule) => {
           fullRule = resp.data
         }
     } catch (error: unknown) {
-      // 历史问题：与 try 路径同款 seq 守卫——过期请求的失败分支同样不得触碰
+      // 与 try 路径同款 seq 守卫——过期请求的失败分支同样不得触碰
       // 在途表单（否则「新建」被过期 fullRule 覆盖，保存语义翻转为 PUT 更新既有规则）。
-      // 历史问题：过期分支同样不复位 hydratingWizard（归属最新调用的生命周期）。
+      // 过期分支同样不复位 hydratingWizard（归属最新调用的生命周期）。
       if (openSeq !== wizardOpenSeq) return
       console.warn('[openWizard] Failed to fetch cert data for', rule.caddy_id, error)
       markTlsDetailFailed(rule.caddy_id)
@@ -2630,7 +2630,7 @@ const openWizard = async (rule?: Rule) => {
       ca_provider_id: 0,
       tls_cert: '',
       tls_key: '',
-      tlsKeySet: false, // 私钥掩码态随表单重置（历史问题：stale true 曾致新建/复制误显「已配置」）
+      tlsKeySet: false, // 私钥掩码态随表单重置（stale true 曾致新建/复制误显「已配置」）
       tls_http_redirect: false,
       enable_compress: false,
       compress_types: ['gzip'],
@@ -2651,7 +2651,7 @@ const openWizard = async (rule?: Rule) => {
       proxy_stream_timeout: 0,
       proxy_flush_interval: 0, // 此前重置族缺失：NTLM 开启后 flush=-1 为可达态，防 stale 泄漏进新建表单
       proxy_stream_close_delay: 0,
-      // 历史修复：「新建规则」必须清掉上一条规则（编辑/复制水合而来）的阶段
+      // 「新建规则」必须清掉上一条规则（编辑/复制水合而来）的阶段
       // 拦截页覆盖——否则新规则静默继承旧规则的 stage1/stage3 页面与状态码。
       ...newRuleWizardStageOverrides(),
     })
@@ -2667,8 +2667,8 @@ const resetWizard = () => {
   certValidationSessionSeq++
   certValidationSeq++
   resetCertInfo()
-  wizardForm.tlsKeySet = false // 掩码态随向导重置（历史）
-  // 历史修复：关闭向导即清空私钥/证书明文（对齐 MFA secret 关闭即清先例）——
+  wizardForm.tlsKeySet = false // 掩码态随向导重置
+  // 关闭向导即清空私钥/证书明文（对齐 MFA secret 关闭即清先例）——
   // 两次打开之间不留明文于响应式状态/DevTools。
   wizardForm.tls_cert = ''
   wizardForm.tls_key = ''
@@ -2677,7 +2677,7 @@ const resetWizard = () => {
   isCopyMode.value = false
   copySourceRuleId.value = null
   copySourceHostHeader.value = ''
-  // 历史修复：关闭向导同样清态——resetWizard 是下次「新建」之前的最后一道
+  // 关闭向导同样清态——resetWizard 是下次「新建」之前的最后一道
   // 兜底（openWizard 新建分支已同源清零，两处共用 newRuleWizardStageOverrides）。
   Object.assign(wizardForm, newRuleWizardStageOverrides())
   wizardForm.enable_dns_server = false
@@ -2734,7 +2734,7 @@ const customRoutesPreview = (): string => {
 }
 
 const removeUpstream = (index: number) => {
-  upstreamTouched.value.splice(index, 1) // 历史问题-2:touched 数组同步重排(防行索引漂移)
+  upstreamTouched.value.splice(index, 1) // touched 数组同步重排(防行索引漂移)
   wizardForm.upstreams.splice(index, 1)
   const lastEnabled = wizardForm.upstreams.findIndex(u => u.enabled)
   if (lastEnabled >= 0) {
@@ -2873,7 +2873,7 @@ const nextStep = (): void => {
       ElMessage.warning('请选择 DNS 提供商配置')
       return
     }
-    // 历史问题：掩码私钥（tlsKeySet=true）且未粘贴新私钥时允许通过——后端保留原值
+    // 掩码私钥（tlsKeySet=true）且未粘贴新私钥时允许通过——后端保留原值
     if (wizardForm.tls_source === 'manual' && (!wizardForm.tls_cert.trim() || (!wizardForm.tls_key.trim() && !wizardForm.tlsKeySet))) {
       ElMessage.warning(wizardForm.tls_cert.trim() ? '请上传证书和私钥（或粘贴新私钥以更换）' : '请上传证书和私钥')
       return
@@ -2883,7 +2883,7 @@ const nextStep = (): void => {
   }
   if (currentStep.value === WIZARD_STEP.UPSTREAMS) {
     upstreamTouched.value = wizardForm.upstreams.map(() => true)
-    // 历史问题：host 门与提交口径对齐（只检查启用行；此处 touched 已全置 true，
+    // host 门与提交口径对齐（只检查启用行；此处 touched 已全置 true，
     // 故与红框/警告共用同一谓词）。提交侧 validUpstreams 按 host+port 过滤空行，
     // 启用性由下方「至少一个启用上游」检查兜底。
     if (wizardForm.upstreams.some((u, i) => upstreamRowNeedsHost(u, i))) {
@@ -2944,7 +2944,7 @@ const submitWizard = async () => {
     saving.value = false
     return
   }
-  // 历史问题：step 标题可点击跳步绕过步进校验——提交前镜像 BASIC 步
+  // step 标题可点击跳步绕过步进校验——提交前镜像 BASIC 步
   // 的 domain/端口前置（后端 400 兜底仍在，但报错晚且不带定位）。
   if (wizardForm.protocol === 'http' && !wizardForm.domain) {
     ElMessage.warning('HTTP 协议必须填写域名')
@@ -2961,9 +2961,9 @@ const submitWizard = async () => {
     saving.value = false
     return
   }
-  // 历史问题：TLS 步校验镜像（跳步绕过 nextStep 时提交前兜底）
+  // TLS 步校验镜像（跳步绕过 nextStep 时提交前兜底）
   if (wizardForm.enable_tls && wizardForm.protocol === 'http') {
-    // 历史问题：ACME 引用门同镜像——后端 validateRuleACMEReferences 在
+    // ACME 引用门同镜像——后端 validateRuleACMEReferences 在
     // enable_tls+acme_dns 且 acme_config_id=0 时返回 400；不在此前置拦截时
     // 从 TLS 步直接跳预览保存才报错，晚且无定位。
     if (wizardForm.tls_source === 'acme_dns' && !wizardForm.acme_config_id) {
@@ -2971,8 +2971,8 @@ const submitWizard = async () => {
       saving.value = false
       return
     }
-    // 历史问题-1:补 tlsKeySet 豁免(与 nextStep TLS 步同款条件——掩码私钥未粘贴
-    // 新私钥时允许通过,历史问题 契约:空 key+tlsKeySet=保留原私钥)
+    // 补 tlsKeySet 豁免(与 nextStep TLS 步同款条件——掩码私钥未粘贴
+    // 新私钥时允许通过, 契约:空 key+tlsKeySet=保留原私钥)
     if (!wizardForm.tls_cert?.trim() || (!wizardForm.tls_key?.trim() && !wizardForm.tlsKeySet)) {
       if (wizardForm.tls_source === 'manual') {
         ElMessage.warning('TLS 手动模式须上传证书与私钥')
@@ -3019,7 +3019,7 @@ const submitWizard = async () => {
     saving.value = false
     return
   }
-  // 历史修复：被动模式不展示超时输入（历史问题），但校验与提交载荷
+  // 被动模式不展示超时输入，但校验与提交载荷
   // 不区分主动/被动——存量数据 timeout >= interval 时会被下面 历史 校验拦下，
   // 而输入框不可见=无处修改。保存前在被动模式把越界值钳到合法区间并显性提示
   // （后端不变式保留；主动模式仍走原校验与提示）。
@@ -3030,8 +3030,8 @@ const submitWizard = async () => {
       wizardForm.health_check_timeout = clampedTimeout.timeout
     }
   }
-  // 历史问题 / 历史修复：health_check_timeout >= health_check_interval 校验——
-  // 与后端 validateRuleFeatures（历史）同口径，不区分主动/被动场景。
+  // health_check_timeout >= health_check_interval 校验——
+  // 与后端 validateRuleFeatures同口径，不区分主动/被动场景。
   if (wizardForm.health_check_interval > 0
       && wizardForm.health_check_timeout > 0
       && wizardForm.health_check_timeout >= wizardForm.health_check_interval) {
@@ -3045,7 +3045,7 @@ const submitWizard = async () => {
     saving.value = false
     return
   }
-  // 混布门（历史修复，与后端同口径）：HTTP 规则启用上游 http/https 混布
+  // 混布门：HTTP 规则启用上游 http/https 混布
   // 会在 Caddy 池级 TLS 传输下使 http 上游静默全灭——保存前拦截
   if (wizardForm.protocol === 'http') {
     const enabledProtos = new Set(wizardForm.upstreams.filter(u => u.enabled !== false).map(u => u.protocol || 'http'))
@@ -3057,7 +3057,7 @@ const submitWizard = async () => {
   }
   // 逐上游回源域名（2026-10-10）：与后端 validateRulePayloadBeforeSave 同口径——
   // 纯主机名不带端口（端口已有独立配置列）、仅 HTTP 静态上游可用
-  // 历史修复（历史）：正则双份收敛为共享 isValidHostName（标签首尾 alnum、63/253 与后端对齐）
+  // 正则双份收敛为共享 isValidHostName（标签首尾 alnum、63/253 与后端对齐）
   const isValidOriginDomain = isValidHostName
   for (const [index, upstream] of wizardForm.upstreams.entries()) {
     const origin = (upstream.origin_domain || '').trim()
@@ -3149,7 +3149,7 @@ const submitWizard = async () => {
   try {
     const validUpstreams = wizardForm.upstreams.filter(u => u.host && u.port).map(u => ({
       ...u,
-      // 历史修复：禁用行草稿权重为 0（变异契约），载荷边界经 payloadWeight
+      // 禁用行草稿权重为 0（变异契约），载荷边界经 payloadWeight
       // 送 1（后端 weight<1 已响亮 400，0→1 静默归一废除）。
       weight: payloadWeight(u),
       dynamic_dns: wizardForm.dynamic_dns,
@@ -3160,7 +3160,7 @@ const submitWizard = async () => {
 
     const data: UpdateRuleRequest = {
       name: wizardForm.name,
-      // 历史修复：复制重建规则时必须显式携带源规则级回源 Host（省略=落空串）；
+      // 复制重建规则时必须显式携带源规则级回源 Host（省略=落空串）；
       // 编辑/新建不带该键——Update 的 nil=保留语义不需要，新建本就无覆盖。
       ...(isCopyMode.value ? { host_header: copySourceHostHeader.value } : {}),
       description: wizardForm.description,
@@ -3317,10 +3317,10 @@ const openFlowDialog = (rule: Rule): void => {
       enabled: u.enabled !== false,
     })),
     // 路由分发节点数据源：与健康浮层 healthPathRules 同门（仅 custom_routes_enabled）。
-    // 历史问题：静态返回 / 301 跳转的路径规则也投影（此前按「有上游」过滤，
+    // 静态返回 / 301 跳转的路径规则也投影（此前按「有上游」过滤，
     // 与预览「全部 path_rules 计数」口径分叉，且这两类路由在唯一呈现处完全不可见）；
     // PathRuleUpstream 无 enabled 概念，列出即生效
-    // 历史问题-02：upstreams=null 原样保留，流程弹框据此显示「跟随主路由上游」。
+    // upstreams=null 原样保留，流程弹框据此显示「跟随主路由上游」。
     pathRules: healthPathRules(rule).map(projectRuleFlowPath),
     health: health ? { healthy: health.healthy, unhealthy: health.unhealthy, degraded: health.degraded, unknown: health.unknown, na: health.na, total: health.total } : undefined,
     upstreamHealth,
@@ -3369,7 +3369,7 @@ const toggleRule = async (rule: Rule) => {
 const deletingRuleId = ref<string | null>(null)
 const deleteRule = async (rule: Rule) => {
   if (isReadOnly.value) return
-  // 重入守卫（历史问题-01，同 SecurityPolicies deletingPolicyId 范式）：快速双击
+  // 重入守卫（同 SecurityPolicies deletingPolicyId 范式）：快速双击
   // 不再叠加双确认框→双 DELETE 误报
   if (deletingRuleId.value !== null) return
   deletingRuleId.value = rule.caddy_id
@@ -3399,7 +3399,7 @@ const duplicateRule = async (rule: Rule) => {
 
 const openCopyWizard = async (rule: Rule) => {
   if (saving.value) return
-  // 历史问题：同 openWizard 的序列号守卫——复制在途 GET 过期返回丢弃。
+  // 同 openWizard 的序列号守卫——复制在途 GET 过期返回丢弃。
   const openSeq = ++wizardOpenSeq
   hydratingWizard = true
   preTcpSnapshot = null
@@ -3407,7 +3407,7 @@ const openCopyWizard = async (rule: Rule) => {
   certValidationSessionSeq++
   certValidationSeq++
   resetCertInfo()
-  wizardForm.tlsKeySet = false // 掩码态随向导重置（历史）
+  wizardForm.tlsKeySet = false // 掩码态随向导重置
   tlsDetailError.value = false
   upstreamTouched.value = []
   isCopyMode.value = true
@@ -3416,11 +3416,11 @@ const openCopyWizard = async (rule: Rule) => {
   if (rule.enable_tls && rule.tls_source === 'manual') {
     try {
       const resp = await request.get<APIResponse<Rule>>(`/rules/${rule.caddy_id}`)
-      // 历史问题：同 openWizard——过期返回不复位 hydratingWizard（归属最新调用生命周期）。
+      // 同 openWizard——过期返回不复位 hydratingWizard（归属最新调用生命周期）。
       if (openSeq !== wizardOpenSeq) return
       if (resp.code === 0 && resp.data) fullRule = resp.data
     } catch (error: unknown) {
-      // 历史问题：与 try 路径同款 seq 守卫（详见 openWizard catch 处注释）。
+      // 与 try 路径同款 seq 守卫（详见 openWizard catch 处注释）。
       if (openSeq !== wizardOpenSeq) return
       // 不允许静默回退列表快照（证书记载缺失 → 保存会写空证书）
       console.warn('[openCopyWizard] Failed to fetch cert data for', rule.caddy_id, error)
@@ -3660,7 +3660,7 @@ const startLogStats = async () => {
   const targetId = ruleLogCaddyId.value
   if (!targetId) return
   const requestSeq = ++ruleLogRequestSeq
-  // 历史问题：统计起始时间走 formatDate（配置时区口径），与页面其他时间戳一致，
+  // 统计起始时间走 formatDate（配置时区口径），与页面其他时间戳一致，
   // 不再用浏览器本地时区的 toLocaleString（started_at 为直接渲染的预格式化文本）
   const maps: LogStatMaps = { ...createLogStatBuckets(), startedAt: formatDate(new Date().toISOString()) }
   logStatsMaps.value = maps
@@ -3715,7 +3715,7 @@ const onRuleLogDialogOpened = () => {
 
 const onRuleLogDialogClosed = () => {
   ruleLogRequestSeq++
-  // 历史修复：关闭即停本地 5s 定时器——原实现只停 tail，定时器继续空转
+  // 关闭即停本地 5s 定时器——原实现只停 tail，定时器继续空转
   //（refreshRuleLogs 被 isActive/空 caddyId 挡掉，仍每 5s 白跑分发链）。
   stopRuleLogPolling()
   ruleLogTail.stop()
@@ -3729,7 +3729,7 @@ const onRuleLogDialogClosed = () => {
   logStatsInFlight.value = false
 }
 
-// 历史修复：日志尾轮询收敛 useLogTailPolling 单源（取数/写回/滚底/单飞/会话
+// 日志尾轮询收敛 useLogTailPolling 单源（取数/写回/滚底/单飞/会话
 // 序号守卫）；定时器保留在本地——log/stats 双 tab 分支由 refreshRuleLogs 分发。
 const ruleLogTail = useLogTailPolling({
   interval: 5000,
@@ -3777,11 +3777,11 @@ watch(ruleLogAutoRefresh, (val) => {
   else stopRuleLogPolling()
 })
 
-// 历史问题：健康轮询错误态（复用 usePollingErrorState，与证书任务轮询同口径）——
+// 健康轮询错误态（复用 usePollingErrorState，与证书任务轮询同口径）——
 // 原实现仅 console，/config/health 失败时健康列回落「-」且无任何提示。
 const healthPollingError = usePollingErrorState()
 const healthPolling = usePollingTask(async (task) => {
-  // 历史修复：接入退避门（与 certJobsPolling 同口径）——横幅「自动重试已退避」
+  // 接入退避门（与 certJobsPolling 同口径）——横幅「自动重试已退避」
   // 与实际轮询一致；fetchHealthStatus 内部捕获并 recordError 不抛出，
   // 原轮询错误回调永不可达（死代码已删除）。
   if (!healthPollingError.canRun()) return
@@ -3831,7 +3831,7 @@ watch(
 )
 
 onMounted(() => {
-  // 历史修复：安全事件/策略页的「查看规则」交接改走 URL query（rs 参数），
+  // 安全事件/策略页的「查看规则」交接改走 URL query（rs 参数），
   // 消费后 replaceState 清除——localStorage 通道在多标签/隐私模式下错乱。
   const rs = new URLSearchParams(window.location.search).get('rs')
   if (rs) {
@@ -3865,7 +3865,7 @@ onUnmounted(() => {
 .search-input { width: 280px; }
 /* .rules-pagination 已收敛 styles/main.css（四处逐字重复单源化） */
 .polling-error-alert { margin-bottom: 16px; }
-/* .polling-error-title/.polling-error-meta 已收敛 main.css（历史修复） */
+/* .polling-error-title/.polling-error-meta 已收敛 main.css*/
 /* .mode-row 自管标签行族已全量退役（2026-10-11 用户裁定：对齐统一走原生
  * el-form-item）——.mode-row-label/.mode-row-content/.required-mark 死 CSS 一并删除 */
 /* .page-header/.header-left/.page-title/.title-icon/.page-desc 与
@@ -3896,7 +3896,7 @@ onUnmounted(() => {
 
 /* 页内其余表格（日志统计等）单元格 padding——主规则表由更特异的
    .rules-table :deep(.el-table .cell)（0 6px）覆盖，两套密度为有意分层
-   （主表 12 列宽收敛 vs 次表宽松，历史 B3 历史问题 裁定保留并注明） */
+   （主表 12 列宽收敛 vs 次表宽松，历史 B3 裁定保留并注明）*/
 :deep(.el-table .cell) {
   padding: 0 10px;
 }

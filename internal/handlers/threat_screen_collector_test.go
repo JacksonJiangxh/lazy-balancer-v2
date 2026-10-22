@@ -56,9 +56,19 @@ func TestControlThreatScreenCollector_proxiesLease(t *testing.T) {
 	if got := services.ThreatScreenAttackFlowSampleN(); got != 0 {
 		t.Fatalf("attack flow sample_n=%d after release, want 0", got)
 	}
+
+	req = httptest.NewRequest(http.MethodPost, "/security/overview/threat-screen/collector", strings.NewReader(`{"lease_id":"tab-default","ttl_ms":30000}`))
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("default sample_n status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := services.ThreatScreenAttackFlowSampleN(); got != 0 {
+		t.Fatalf("omitted sample_n produced local sample_n=%d, want 0", got)
+	}
 }
 
-// 历史修复：代理层把 lease_id 传入本地攻击光流租约表——单租约释放不误杀
+// 代理层把 lease_id 传入本地攻击光流租约表——单租约释放不误杀
 // 其他租约（旧码 DELETE 全局置 0）；有效档位=存活租约 min（最密）。
 func TestControlThreatScreenCollector_releaseKeepsSurvivingLeases(t *testing.T) {
 	services.ResetThreatScreenAttackFlowForTest()
@@ -108,7 +118,7 @@ func TestControlThreatScreenCollector_releaseKeepsSurvivingLeases(t *testing.T) 
 	}
 }
 
-// 历史修复：admin 请求失败（503）时本地租约不得已变更——先转发成功再落本地。
+// admin 请求失败（503）时本地租约不得已变更——先转发成功再落本地。
 func TestControlThreatScreenCollector_adminFailureKeepsLocalLeases(t *testing.T) {
 	services.ResetThreatScreenAttackFlowForTest()
 	t.Cleanup(services.ResetThreatScreenAttackFlowForTest)

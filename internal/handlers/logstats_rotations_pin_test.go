@@ -1,11 +1,11 @@
 package handlers
 
-// 历史问题（历史）基线钉：timestampedRotationStats/dirBytes 的轮转家族形状判定
+// 基线钉：timestampedRotationStats/dirBytes 的轮转家族形状判定
 // 当前实现正确，本测试钉住四形状防回归（基线钉，非 RED——报告注明）。
-// （历史问题-1 改靶：原靶 timestampedRotations/mustSecond 生产死代码已删，
+// （改靶：原靶 timestampedRotations/mustSecond 生产死代码已删，
 // 四形状断言经 dirBytes 不变。）
-// 文件名形状按 logstats.go 实读实现构造（历史修复 验证源直取）：
-//   - 运行日志族：<base>.历史修复（rest 恰 16 字符：. + 8 数字 + - + 6 数字）
+// 文件名形状按 logstats.go 实读实现构造
+//   运行日志族：<base>.（rest 恰 16 字符：. + 8 数字 + - + 6 数字）
 //   - timberjack 族：<stem>-<ts>-size.log[.gz]（ts 首字符为数字）
 //   - 兄弟文件（caddy-tls-*/caddy-proxy-*）在 stem=caddy 下首段字母开头，不误计
 //   - 非数字时间戳形态两侧家族均排除
@@ -91,7 +91,7 @@ func TestTimestampedRotationStats_familyShapes(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：gzip 压缩的运行日志族轮转副本（<base>.历史修复.gz）
+// gzip 压缩的运行日志族轮转副本（<base>..gz）
 // 此前两套实现分叉——聚合路径（aggregateDirStats）归入独立的 .gz 键、
 // dirBytes/timestampedRotationStats 完全漏计。统一为「归并到所属 base 的 rotated」。
 func TestGzippedRuntimeRotation_mergesIntoBaseBothPaths(t *testing.T) {
@@ -127,7 +127,7 @@ func TestGzippedRuntimeRotation_mergesIntoBaseBothPaths(t *testing.T) {
 	}
 }
 
-// 历史修复：整文件 gzip 归档 <base>.gz 属于该文件的轮转副本——两套分类器
+// 整文件 gzip 归档 <base>.gz 属于该文件的轮转副本——两套分类器
 // 同输入必须等价，且聚合键不得多出独立 ".gz" 条目（消费侧按固定基名取值，
 // 独立键无人读取 → 字节从展示中消失）。
 func TestAggregateDirStats_wholeFileGzipArchiveJoinsBase(t *testing.T) {

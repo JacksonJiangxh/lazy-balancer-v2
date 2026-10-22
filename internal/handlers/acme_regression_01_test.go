@@ -65,7 +65,7 @@ func TestRetryCertJob_downloadedJobReschedulesDeployment(t *testing.T) {
 	}
 }
 
-// Given：downloaded 任务但证书材料缺失（历史脏行/材料未落库）。
+// Given：downloaded 任务但证书材料缺失（脏行/材料未落库）。
 // When：手动重试。
 // Then：无快速路径可走——维持原语义转 queued 重新签发。
 func TestRetryCertJob_downloadedJobWithoutMaterialStillRequeues(t *testing.T) {

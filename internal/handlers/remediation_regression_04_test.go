@@ -358,7 +358,7 @@ func TestConflictDisableBeforeRowValidation(t *testing.T) {
 	}
 }
 
-// ---------- 历史修复 / 05 / 07（备份枚举与形状） ----------
+// / 05 / 07（备份枚举与形状） ----------
 
 func TestBackupBooleanEnumsCoverCrawlerAndThreat(t *testing.T) {
 	if !isBackupBooleanColumn("security_crawler_sources", "update_enabled") {
@@ -399,7 +399,7 @@ func TestWafRefBookkeepingProtected(t *testing.T) {
 	}
 }
 
-// ---------- 历史修复（TCP 规则不物化证书） ----------
+// （TCP 规则不物化证书） ----------
 
 func TestCollectImportCertificatesSkipsTCP(t *testing.T) {
 	certPEM, keyPEM, err := generateTestCert("tcp.example.com", time.Now(), time.Now().Add(24*time.Hour))
@@ -421,7 +421,7 @@ func TestCollectImportCertificatesSkipsTCP(t *testing.T) {
 	}
 }
 
-// ---------- 历史修复（威胁文件与源表收敛） ----------
+// （威胁文件与源表收敛） ----------
 
 func TestReconcileThreatFiles(t *testing.T) {
 	wafDir := t.TempDir()
@@ -460,7 +460,7 @@ func TestReconcileThreatFiles(t *testing.T) {
 	}
 }
 
-// ---------- 历史修复（手动备份 202 原子受理） ----------
+// （手动备份 202 原子受理） ----------
 
 func TestRunAutoBackupNowRejectsPausedBefore202(t *testing.T) {
 	h := newAutoBackupTestHandlers(t)

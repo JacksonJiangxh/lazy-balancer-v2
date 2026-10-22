@@ -1,6 +1,6 @@
 package handlers
 
-// 历史问题-1（历史 审计）：LOG_FILE 空串时 GetAppLogs 必须经 logPaths 与
+// LOG_FILE 空串时 GetAppLogs 必须经 logPaths 与
 // GetLogStats 同口径兜底到默认运行日志路径，而不是读空串路径返回恒空内容
 // （面板空白与 logstats 统计矛盾）。默认路径为包级 var（wafAuditLogFile
 // 同模式的测试注入缝）。

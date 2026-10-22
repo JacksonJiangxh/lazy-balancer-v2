@@ -34,16 +34,16 @@ func TestClusterVersionTriggers_bumpWhenCertificateStatusTransitionsToIssued(t *
 		t.Fatalf("transition pending status to issued: %v", err)
 	}
 
-	// Then: 历史问题(历史)——status 移出语义列,纯状态迁移不再 bump;
+	// Then：status 移出语义列,纯状态迁移不再 bump;
 	// 材料 bump 由 INSERT 触发器(种子 INSERT 已含 cert_pem/key_pem)负责
 	if got := clusterVersion(t, database); got != 0 {
 		t.Fatalf("version after pending to issued=%d, want 0 (status-only, 历史问题)", got)
 	}
 }
 
-// 历史问题+历史问题(第 25/26 轮审计):cert_jobs UPDATE 触发器簿记抖动守卫——
+// +(第 25/26 轮审计):cert_jobs UPDATE 触发器簿记抖动守卫——
 // 签发/续期阶段写(message/attempts/updated_at 等簿记列)不 bump 集群版本;
-// 语义列(rule_id/domain/cert_pem/key_pem/expires_at/ca_provider_id——历史问题
+// 语义列(rule_id/domain/cert_pem/key_pem/expires_at/ca_provider_id——
 // 起 status 移出,仅 disabled 例外)值真实变化才 bump。
 func TestClusterVersionTriggers_certJobsBookkeepingDoesNotBump(t *testing.T) {
 	// Given: 有效证书任务(成员条件满足)
@@ -69,7 +69,7 @@ func TestClusterVersionTriggers_certJobsBookkeepingDoesNotBump(t *testing.T) {
 		t.Fatalf("version after bookkeeping write=%d, want 0 (bookkeeping must not bump)", got)
 	}
 
-	// When: 语义列写(expires_at 推进=续期材料变化,历史问题 后 status 不再是语义列)
+	// When: 语义列写(expires_at 推进=续期材料变化, 后 status 不再是语义列)
 	if _, err := database.Exec("UPDATE cert_jobs SET expires_at=datetime('now','+90 days') WHERE rule_id='book_rule'"); err != nil {
 		t.Fatalf("semantic write: %v", err)
 	}
@@ -80,7 +80,7 @@ func TestClusterVersionTriggers_certJobsBookkeepingDoesNotBump(t *testing.T) {
 	}
 }
 
-// 历史问题(历史):status 移出语义列——续期/签发中间态迁移不 bump
+// status 移出语义列——续期/签发中间态迁移不 bump
 // (成员条件恒真时阶段写是纯簿记);材料变化(cert_pem/expires_at)才 bump。
 func TestClusterVersionTriggers_certJobsStatusTransitionDoesNotBump(t *testing.T) {
 	database := newClusterVersionTestDB(t)
@@ -115,7 +115,7 @@ func TestClusterVersionTriggers_certJobsStatusTransitionDoesNotBump(t *testing.T
 	}
 }
 
-// 历史问题-1(历史):disabled 例外单向——恢复方向(disabled→成员态)
+// disabled 例外单向——恢复方向(disabled→成员态)
 // 不 bump 会导致从端定格「规则启用+证书缺席」。必须双向。
 func TestClusterVersionTriggers_certJobsReenableFromDisabledBumps(t *testing.T) {
 	database := newClusterVersionTestDB(t)

@@ -18,11 +18,11 @@ import (
 	"github.com/pquerna/otp/totp"
 )
 
-// 现行语义（2026-09 用户二次裁定，66b35ce0 移除 历史问题 端点硬门后）：登录后的
+// 现行语义（2026-09 用户二次裁定，66b35ce0 移除端点硬门后）：登录后的
 // MFA 验证失败（verify-step 及全部登录后验码入口）只提示 401、不计数不锁定
 // ——全系统唯一锁定在登录阶段（密码+验证码同计 5 次/10 分钟，受「登录失败
 // 锁定」开关控制）。仍生效的硬闸仅剩登录阶段两处：单挑战连续失败 10 次作废
-// 挑战（历史问题）、pending 绑定连续失败 5 次作废待激活密钥（历史问题）。
+// 挑战、pending 绑定连续失败 5 次作废待激活密钥。
 
 // seedMfaVerifyStepUser 种 id=1 且已启用 MFA 的操作者，返回其 TOTP secret。
 func seedMfaVerifyStepUser(t *testing.T) string {
@@ -104,7 +104,7 @@ func TestMFAVerifyStep_rejectsRecoveryCode(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：step-up 验码通过后的用户重读，DB 错误此前与
+// step-up 验码通过后的用户重读，DB 错误此前与
 // 「用户不存在/禁用」同报 401 用户不可用——DB 故障被降级成认证拒绝。
 // 拆分：读失败 500；行缺失/禁用保持 401。
 func TestMFAVerifyStep_userReloadFailureReturns500(t *testing.T) {
@@ -124,7 +124,29 @@ func TestMFAVerifyStep_userReloadFailureReturns500(t *testing.T) {
 	}
 }
 
-// 历史修复：verify-step 重读用户必须带 auth_provider（此前 SELECT 漏列 →
+// ErrMFANotEnabled 业务态分支（并发禁用/重置后验码）必须留痕「MFA 未启用」——
+// 与登录步（MFAVerifyLogin）同口径；此前该分支零审计，安全可观测面缺失。
+func TestMFAVerifyStep_notEnabledWritesAudit(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	if _, err := db.DB.Exec("INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (1,'operator','x','admin',1)"); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	router := mfaVerifyStepRouter(h, "jwt")
+
+	rec := postMfaVerifyStep(router, `{"code":"123456"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s, want 400（MFA 未启用业务态）", rec.Code, rec.Body.String())
+	}
+	var events int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='认证拒绝' AND detail LIKE '%MFA 未启用%'`).Scan(&events); err != nil {
+		t.Fatalf("query audit: %v", err)
+	}
+	if events != 1 {
+		t.Fatalf("not-enabled rejection audit events=%d, want 1（与登录步同口径留痕）", events)
+	}
+}
+
+// verify-step 重读用户必须带 auth_provider（此前 SELECT 漏列 →
 // 所有 step-up 响应 auth_provider=""，存量 OIDC 行丢 auth_method 声明）。
 func TestMFAVerifyStep_preservesAuthProvider(t *testing.T) {
 	h := newBackupTestHandlers(t)

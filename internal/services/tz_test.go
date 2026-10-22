@@ -53,7 +53,7 @@ func TestTimezoneRefresh_stops_and_waits_when_context_is_canceled(t *testing.T) 
 	cancel()
 
 	// Then: <-done 返回即证明循环已停止且等待闭合（阻塞则测试超时失败；
-	// 历史修复：原 <-done 之后的 select-default 分支恒不可达，已删）。
+	// 原 <-done 之后的 select-default 分支恒不可达，已删）。
 	<-done
 
 	t.Cleanup(func() { StartTimezoneRefresh(context.Background()) })
@@ -148,7 +148,7 @@ func TestApplicationLogWriterFiltersRawStandardLogsAtConfiguredThreshold(t *test
 	t.Cleanup(func() { _ = ConfigureLogLevel("info") })
 }
 
-// 历史修复（历史）：DB 初始化完成点即时刷新时区——init 期 worker 首查时
+// DB 初始化完成点即时刷新时区——init 期 worker 首查时
 // DB 未就绪恒空转，配置时区此前最长要等 30s ticker 才生效（FixedZone+8 占位
 // 窗口）。ApplyLogLevel 是 main 在 db.Initialize 完成后的首个 services 装配点
 // （亦为集群导入 users 节后的调用点），在此追加一次即时 refreshLocation。
@@ -180,7 +180,7 @@ func TestApplyLogLevel_refreshesTimezoneImmediately(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：applicationLogWriter 透传 sink 的真实返回值——短写
+// applicationLogWriter 透传 sink 的真实返回值——短写
 // 返回 len(p) 偏离 io.Writer 契约（装饰器不得替 sink 谎报写入量）。
 func TestApplicationLogWriter_writeReturnsSinkWrittenCount(t *testing.T) {
 	oldLevel := CurrentLogLevel()
@@ -248,7 +248,7 @@ func (s *shortWriteSink) Write(p []byte) (int, error) {
 	return s.n, nil
 }
 
-// 历史问题（历史）：多行 payload（Logf 消息内嵌换行）必须逐行按级别过滤
+// 多行 payload（Logf 消息内嵌换行）必须逐行按级别过滤
 // 后重组——只看首行会让 warn/error 档整体放行后续低级别行（级别过滤被绕过）。
 func TestApplicationLogWriter_filtersEachLineOfMultilinePayload(t *testing.T) {
 	oldLevel := CurrentLogLevel()

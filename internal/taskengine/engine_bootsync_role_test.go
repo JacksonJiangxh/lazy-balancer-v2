@@ -1,6 +1,6 @@
 package taskengine
 
-// 历史修复（历史）：BootSync 执行面角色契约钉。
+// BootSync 执行面角色契约钉。
 //
 // ①注册期响亮拒绝 BootSync∧RunsOn≠RoleAny（与 Daemon∧EnabledFn 同风格）——
 //   BootSync 是引擎装配尾部的同步启动触发，非角色调度面；声明主/从限定会在

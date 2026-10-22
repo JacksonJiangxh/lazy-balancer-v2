@@ -1,6 +1,6 @@
 package handlers
 
-// 历史问题-1(历史):GeoIP off→非 off 翻转门——存量读取与可用性
+// GeoIP off→非 off 翻转门——存量读取与可用性
 // 校验不得只挂在「请求携带 geoip_countries」上;只发 geoip_mode 的翻转、
 // 条目未变仅翻 mode 的翻转,都必须过缺库 fail-closed 门。
 

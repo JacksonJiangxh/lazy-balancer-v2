@@ -1,4 +1,4 @@
-// 日志尾部轮询单源（历史修复 收敛）：Rules（规则日志）/CertJobs/TaskMonitor/
+// 日志尾部轮询单源：Rules（规则日志）/CertJobs/TaskMonitor/
 // BasicSettings（运行日志）/CaddyGlobalSettings（Caddy 日志）原各持一份同构
 // setInterval 实现，且已漂移（TaskMonitor/CaddyGlobalSettings 缺后台标签页暂停、
 // 序号守卫口径不一）。本 composable 统一：
@@ -10,7 +10,7 @@
 // 取数与各页私有守卫（目标行切换/弹框可见/tab 分支）留在调用方 fetch/isActive
 // 闭包内；fetch 返回 null 表示本轮不写回。
 // 不注册 onUnmounted——四处调用方均有明确的弹框关闭/卸载收尾点（stop 由调用方
-// 触发），避免 composable 与 Vue 生命周期耦合（历史修复 同口径）。
+// 触发），避免 composable 与 Vue 生命周期耦合。
 import { nextTick, ref, type Ref } from 'vue'
 
 interface LogTailPollingOptions {

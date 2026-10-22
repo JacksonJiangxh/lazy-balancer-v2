@@ -6,7 +6,7 @@ import (
 
 // 自定义路由「直接返回/301 跳转」渲染（2026-10-10 用户裁定，全原生
 // http.handlers.static_response）：response_mode='' 转发现状零漂移；
-// static=status_code+body+历史修复；redirect=301+Location。
+// static=status_code+body+；redirect=301+Location。
 
 // generateHTTPRouteObjects 需要完整规则形态；此处聚焦路径路由渲染分支。
 // 通过最小规则（无安全策略、无 TLS）构造，pathRules 自定义路由开启。
@@ -29,7 +29,7 @@ func findPathRoute(routes []map[string]interface{}, suffix string) map[string]in
 	return nil
 }
 
-// staticResponseOf 取路由链中的 static_response handler（历史修复 后链形为
+// staticResponseOf 取路由链中的 static_response handler（后链形为
 // [lb_rule_metrics, static_response]——扫描而非按下标）。
 func staticResponseOf(t *testing.T, route map[string]interface{}) map[string]interface{} {
 	t.Helper()
@@ -78,7 +78,7 @@ func TestPathRuleRoute_forwardModeUnchanged(t *testing.T) {
 
 // Given: static 模式路径规则（自定义状态码+文本+JSON 格式）
 // When: 生成路由
-// Then: 不经 reverse_proxy/改写/安全链；链 = lb_rule_metrics(历史修复 计数) +
+// Then: 不经 reverse_proxy/改写/安全链；链 = lb_rule_metrics +
 // static_response
 func TestPathRuleRoute_staticModeEmitsStaticResponse(t *testing.T) {
 	rule := SingleRuleConfig{HealthCheckInterval: 10, HealthCheckTimeout: 2, HealthCheckUnhealthyThreshold: 3, HealthCheckHealthyThreshold: 2, GlobalRequestBodyMaxSizeMB: 128, CaddyID: "lb_prresp", Protocol: "http", ListenPort: 8080, Domain: "prresp.example.test",
@@ -108,7 +108,7 @@ func TestPathRuleRoute_staticModeEmitsStaticResponse(t *testing.T) {
 	if !ok || len(ct) != 1 || ct[0] != "application/json" {
 		t.Fatalf("Content-Type=%#v, want [application/json]", headers["Content-Type"])
 	}
-	// 历史修复：链 = lb_rule_metrics + static_response（计数 handler 链首）。
+	// 链 = lb_rule_metrics + static_response（计数 handler 链首）。
 	handle := route["handle"].([]interface{})
 	if len(handle) != 2 {
 		t.Fatalf("static route must be [lb_rule_metrics, static_response], got %d handlers", len(handle))
@@ -168,7 +168,7 @@ func TestPathRuleRoute_staticModeDefaults(t *testing.T) {
 	}
 }
 
-// 历史修复（历史问题）：直返/301 路径路由必须携带 lb_rule_metrics 纯计数
+// 直返/301 路径路由必须携带 lb_rule_metrics 纯计数
 // handler——修复前整条路由仅 static_response，规则全量流量指标漏计该类路径
 // 流量（指标页 requests_total 失真）。链形：[lb_rule_metrics, static_response]
 // （计数包装响应写出，与主链同格；不经安全链/reverse_proxy 裁定不变）。

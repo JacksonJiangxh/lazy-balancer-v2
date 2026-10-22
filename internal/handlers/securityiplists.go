@@ -52,7 +52,7 @@ func loadSystemListIDs() (map[string]int, error) {
 
 // parseIPListRefsIDs 宽松解析 refs JSON 为 id 列表：畸形/空 → nil（重启用悬空
 // 引用门读取存量值用；存量列恒为写入侧校验过的合法形态，畸形仅见于带外改库）。
-// parseIPListRefsIDs 与 services.parseIPListRefs 为镜像实现（历史问题
+// parseIPListRefsIDs 与 services.parseIPListRefs 为镜像实现
 // 裁定保留双份并声明）：本侧服务载荷校验路径不去重（保原始序列语义），
 // services 侧投影路径去重保序——语义有意分叉，勿单方面合并。
 func parseIPListRefsIDs(raw string) []int64 {
@@ -133,7 +133,7 @@ func loadIPListEntriesForAllow(q ipListQueryer, ids []int64) (map[int64][]string
 }
 
 // allowEffectiveListNonEmpty 判定 allow 模式的生效集合是否非空：内联条目 ∪
-// 全部引用名单的**实际条目**并集（不要求每个引用名单非空）。历史问题：旧写侧
+// 全部引用名单的**实际条目**并集（不要求每个引用名单非空）。旧写侧
 // 门只看引用个数，引用一个空名单即落库「启用 allow + 空生效集」——发射端
 // len>0 门静默跳过 ACL，实际效果是放行全部。查询失败返回错误，
 // 调用方按 500 处理（不得按空集合或非空猜测）。
@@ -166,7 +166,7 @@ func allowEffectiveListNonEmpty(q ipListQueryer, inlineRaw, refsRaw string) (boo
 }
 
 // allowEmptyingBlockedByPolicies 判定「把 listID 清空为 replacement」是否会让
-// 任一 allow 策略的生效集合变为空（历史问题 的删除侧门）。偏严语义：检查全部
+// 任一 allow 策略的生效集合变为空。偏严语义：检查全部
 // 启用 allow 策略（含 disabled 策略——与 Create/Update 对禁用策略同样设门的
 // 口径一致）。查询失败返回错误（调用方 500，fail-closed）。
 func allowEmptyingBlockedByPolicies(q ipListQueryer, listID int64, replacement []string) (bool, error) {
@@ -271,7 +271,7 @@ func parseIPListRefsPayload(field string, val *string) ([]int64, error) {
 		unique = append(unique, id)
 	}
 	if len(unique) > 64 {
-		// 历史问题-3:refs 无上限会让渲染端逐条展开 ACL 条目,单策略即可
+		// refs 无上限会让渲染端逐条展开 ACL 条目,单策略即可
 		// 撑爆配置体积——封顶 64(去重后计数)。
 		return nil, fmt.Errorf("%s 引用的 IP 列表数量不能超过 64", field)
 	}
@@ -300,7 +300,7 @@ func validateIPListRefsExistence(q policyQueryRower, aclIDs, wlIDs []int64) (str
 		seen[id] = struct{}{}
 		unique = append(unique, id)
 	}
-	// 历史问题:32766 绑定变量上限分块(fail-closed,整体 500)。
+	// 32766 绑定变量上限分块(fail-closed,整体 500)。
 	const chunkLimit = 500
 	found := make(map[int64]struct{}, len(unique))
 	for start := 0; start < len(unique); start += chunkLimit {
@@ -345,7 +345,7 @@ func validateIPListRefsExistence(q policyQueryRower, aclIDs, wlIDs []int64) (str
 	return "", nil
 }
 
-// builtinIPListLabel 内置名单的用户可读类别（历史修复：按名单名分流——
+// builtinIPListLabel 内置名单的用户可读类别（按名单名分流——
 // 自动封禁预置名单不是威胁情报名单，提示语不得误称）。
 func builtinIPListLabel(name string) string {
 	if name == services.AutobanPresetListName {
@@ -445,7 +445,7 @@ func normalizeIPListEntriesJSON(raw string) string {
 }
 
 // validateIPListShape 校验列表载荷并返回解析后的条目：名称非空 ≤50、描述 ≤200、
-// 分类 ≤32、条目数 ≤2000（历史修复修正：2026-10-14 用户裁定上限已 500→2000）、
+// 分类 ≤32、条目数 ≤2000（修正：2026-10-14 用户裁定上限已 500→2000）、
 // value 过 validIPOrCIDR、remark ≤100。
 func validateIPListShape(name, description, category, entriesJSON string) ([]models.IPListEntry, error) {
 	if err := validateIPListMetadataShape(name, description, category); err != nil {
@@ -489,10 +489,10 @@ type ipListRow struct {
 	UpdatedAt   string            `json:"updated_at"`
 	// System=内置只读名单（威胁情报库三源，v2.3.2 名单化）——前端据此只读化。
 	System bool `json:"system"`
-	// PresetAutoban=预置「自动封禁名单」（历史问题）：system=1 但条目可改/禁删
+	// PresetAutoban=预置「自动封禁名单」：system=1 但条目可改/禁删
 	// ——前端据此渲染编辑形态与到期列（与威胁名单只读形态区分）。
 	PresetAutoban bool `json:"preset_autoban"`
-	// TrustedProxyReferenced 名单被 Caddy 全局「受信代理网段」引用（历史问题）：
+	// TrustedProxyReferenced 名单被 Caddy 全局「受信代理网段」引用
 	// 引用视图纳入受信代理面——旧实现展示 0 引用但删除 409。不伪造 policy id。
 	TrustedProxyReferenced bool `json:"trusted_proxy_referenced"`
 	// TrustedProxyScope 受信代理引用范围的可读说明（空=未引用）。
@@ -516,7 +516,7 @@ func loadIPListRefPolicies() (map[int64][]ipListRefPolicy, error) {
 			return nil, err
 		}
 		seenList := make(map[int64]struct{})
-		// 审计 历史问题：引用计数补排除条目 listRefs 面（409 守卫已覆盖此面，仅补展示口径，
+		// 引用计数补排除条目 listRefs 面（409 守卫已覆盖此面，仅补展示口径，
 		// 消除「显示 0 引用可删、点删得 409」的观测缺口）。
 		for _, raw := range []string{aclRefs, wlRefs} {
 			for _, listID := range parseIPListRefsIDs(raw) {
@@ -527,7 +527,7 @@ func loadIPListRefPolicies() (map[int64][]ipListRefPolicy, error) {
 				refs[listID] = append(refs[listID], ipListRefPolicy{ID: policyID, Name: policyName})
 			}
 		}
-		// 审计 历史问题：补排除条目 listRefs 面（409 守卫已覆盖，仅补展示口径）。
+		// 补排除条目 listRefs 面（409 守卫已覆盖，仅补展示口径）。
 		for _, listID := range crsExcludedListRefs(crsExcluded) {
 			if _, dup := seenList[listID]; dup {
 				continue
@@ -543,7 +543,7 @@ func loadIPListRefPolicies() (map[int64][]ipListRefPolicy, error) {
 }
 
 func (h *Handlers) ListIPLists(c *gin.Context) {
-	// entry_count 走 SQL 侧 json_array_length（历史 历史问题）——不再全量
+	// entry_count 走 SQL 侧 json_array_length——不再全量
 	// 读+逐行解析 entries 仅为计数（万条名单 ≈460KB/行 的 CPU/内存开销归零）；
 	// 畸形 JSON 同样报错 500（json_array_length 解析失败→rows.Err），口径不变。
 	// RDB 文件化：system=1 行 entries=''（空串非 NULL，COALESCE 不替换），
@@ -563,13 +563,13 @@ func (h *Handlers) ListIPLists(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
 	}
-	// 历史问题：受信代理引用面（global_config.trusted_proxy_range_refs）——与
+	// 受信代理引用面（global_config.trusted_proxy_range_refs）——与
 	// DeleteIPList 的 409 守卫同源，消除「展示 0 引用却删不掉」的观测缺口。
 	trustedProxyRefs := map[int64]bool{}
 	{
 		var raw string
 		if qerr := db.DB.QueryRow(`SELECT COALESCE(trusted_proxy_range_refs,'[]') FROM global_config WHERE id=1`).Scan(&raw); qerr != nil {
-			// 历史问题：与删除守卫同口径 fail-closed——查询失败时不得把引用面
+			// 与删除守卫同口径 fail-closed——查询失败时不得把引用面
 			// 展示为空（页面「无引用可删」与删除 409/500 自相矛盾）；显式
 			// 500 让运维区分「真无引用」与「观测失败」。
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取受信代理引用失败"})
@@ -583,7 +583,7 @@ func (h *Handlers) ListIPLists(c *gin.Context) {
 	threatCounts := map[string]int{}
 	trows, terr := db.DB.Query(`SELECT name, COALESCE(entry_count,0) FROM security_threat_sources`)
 	if terr != nil {
-		// 历史问题-4：辅助查询失败记日志（曾静默条数 0——与同域「失败不假绿」纪律冲突）
+		// 辅助查询失败记日志（曾静默条数 0——与同域「失败不假绿」纪律冲突）
 		services.Logf("warn", "威胁库条数查询失败（系统名单条数将显示为 0）: %v", terr)
 	}
 	if terr == nil {
@@ -598,7 +598,7 @@ func (h *Handlers) ListIPLists(c *gin.Context) {
 				threatCounts[listName] = cnt
 			}
 		}
-		// 历史修复（历史）：迭代失败与查询失败同待遇（历史问题-4 降级语义——
+		// 迭代失败与查询失败同待遇（降级语义——
 		// 记 warn，已收行数保留，系统名单条数可能少计/显示 0）。
 		if err := trows.Err(); err != nil {
 			services.Logf("warn", "威胁库条数查询迭代失败（系统名单条数可能不完整）: %v", err)
@@ -614,7 +614,7 @@ func (h *Handlers) ListIPLists(c *gin.Context) {
 		}
 		// v2.3.2 弹框性能重构：列表载荷不再内联 entries（大名单 1.4 万条
 		// 会背 ~460KB/行）；弹框经 GET /security/ip-lists/:id 按需拉取。
-		// 历史问题：自动封禁预置名单（system=1 但条目在 DB）不适用威胁库条数
+		// 自动封禁预置名单（system=1 但条目在 DB）不适用威胁库条数
 		// 覆写——threatCounts 无该名会得到 0 假空；条数取 json_array_length 真值。
 		if row.System && row.Name != services.AutobanPresetListName {
 			// 仅威胁库条数由 threat_sources 覆写；其他系统名单（爬虫地址库/
@@ -666,7 +666,7 @@ func (h *Handlers) GetIPList(c *gin.Context) {
 		return
 	}
 	entriesJSON = normalizeIPListEntriesJSON(entriesJSON)
-	// 历史问题：预置自动封禁名单（system=1 但条目在 DB）走自定义分支——威胁文件
+	// 预置自动封禁名单（system=1 但条目在 DB）走自定义分支——威胁文件
 	// 读取对该名恒失败（未映射威胁源）会让弹框 500。
 	row.PresetAutoban = row.System && row.Name == services.AutobanPresetListName
 	if row.System && !row.PresetAutoban && services.IsThreatSystemListName(row.Name) {
@@ -731,7 +731,7 @@ func (h *Handlers) CreateIPList(c *gin.Context) {
 		// 不允许与内置名单重名——选择器分组依赖名字区分归属）
 		var sysDupName string
 		if err := tx.QueryRowContext(c.Request.Context(), "SELECT name FROM security_ip_lists WHERE LOWER(name)=LOWER(?) AND system=1", req.Name).Scan(&sysDupName); err == nil && sysDupName != "" {
-			// 历史修复（历史）：保留名提示按命中的内置名单名分流。
+			// 保留名提示按命中的内置名单名分流。
 			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: fmt.Sprintf("该名称为%s保留，请换一个名称", builtinIPListLabel(sysDupName))})
 			return
 		}
@@ -795,9 +795,12 @@ func (h *Handlers) UpdateIPList(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
 	}
-	oldEntriesJSON := entriesJSON // 条目变化判定基准（归一前快照，热路径资格用）
+	// 条目变化判定基准=归一后快照：存量 entries='' 行归一为 '[]' 后纯元数据
+	// 更新（改描述/分类）不得被误判为条目变化而触发热路径重渲染（与
+	// TestUpdateIPList_metadataOnlySkipsHotPath 的「元数据-only 零发射面」契约一致）。
+	oldEntriesJSON := normalizeIPListEntriesJSON(entriesJSON)
 	// 内置只读名单（威胁情报库，system=1）：内容只读，由更新任务独占维护。
-	// 历史问题 例外：自动封禁预置名单条目可改（手动追加/删除条目经弹框），但名称/
+	// 例外：自动封禁预置名单条目可改（手动追加/删除条目经弹框），但名称/
 	// 分类/描述三字段锁定（2026-10-14 用户裁定）——自动封禁任务按名单名定位
 	// 预置行，改名即失联；分类/描述是预置行身份的一部分，同样禁改。
 	autobanPreset := system != 0 && name == services.AutobanPresetListName
@@ -835,14 +838,14 @@ func (h *Handlers) UpdateIPList(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
-	// 历史修复(历史):条目清空 + 本列表被 allow 模式策略引用 → 该策略
+	// 条目清空 + 本列表被 allow 模式策略引用 → 该策略
 	// 生效名单变空 → 发射端 fail-open(「其余一律拒绝」实际全放行)且 UI
-	// 仍宣称 IP 控制已启用。历史问题：判据必须与 RemoveIPListEntry 同源——
+	// 仍宣称 IP 控制已启用。判据必须与 RemoveIPListEntry 同源——
 	// 走 allowEmptyingBlockedByPolicies 的「并集是否为空」语义（策略内联或
 	// 其他引用名单仍有条目时清空本列表不会放行全部请求），此前按「是否被
 	// 引用」一律 409 的偏严口径给出的文案在并集非空时是假的。
-	// 历史修复（历史）：判据用**过滤到期后**的有效集合——与 remove-ip
-	// 路径（历史问题）同源。导入/带外名单可含 expires_at，保存一组仅已到期
+	// 判据用**过滤到期后**的有效集合——与 remove-ip
+	// 路径同源。导入/带外名单可含 expires_at，保存一组仅已到期
 	// 条目时原始 len>0 会绕过本门，而渲染侧（AutobanActiveEntries）生效集
 	// 为空 = allow 策略放行全部。
 	if req.Entries != nil {
@@ -855,8 +858,8 @@ func (h *Handlers) UpdateIPList(c *gin.Context) {
 		if len(activeValues) == 0 {
 			blocked, berr := allowEmptyingBlockedByPolicies(tx, listID, activeValues)
 			if berr != nil {
-				// 历史问题(历史):守卫查询失败 fail-closed——静默放行
-				// 「清空被 allow 引用的列表」正是 历史修复 要防的发射端 fail-open 形态。
+				// 守卫查询失败 fail-closed——静默放行
+				// 「清空被 allow 引用的列表」正是要防的发射端 fail-open 形态。
 				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "校验 IP 列表引用失败: " + berr.Error()})
 				return
 			}
@@ -873,11 +876,11 @@ func (h *Handlers) UpdateIPList(c *gin.Context) {
 		return
 	}
 	if dup > 0 {
-		// 改名撞内置名单同 Create 口径给专属提示（历史修复问题：
+		// 改名撞内置名单同 Create 口径给专属提示（问题
 		// 同一裁定语义在更新路径此前退化为通用提示）。
 		var sysDupName string
 		if err := tx.QueryRowContext(c.Request.Context(), "SELECT name FROM security_ip_lists WHERE LOWER(name)=LOWER(?) AND system=1", name).Scan(&sysDupName); err == nil && sysDupName != "" {
-			// 历史修复（历史）：保留名提示按命中的内置名单名分流。
+			// 保留名提示按命中的内置名单名分流。
 			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: fmt.Sprintf("该名称为%s保留，请换一个名称", builtinIPListLabel(sysDupName))})
 			return
 		}
@@ -893,7 +896,7 @@ func (h *Handlers) UpdateIPList(c *gin.Context) {
 	if !rowsAffectedOrRespond(c, result, "IP 地址列表不存在") {
 		return
 	}
-	// 历史修复 同族收敛：预置名单差集全量保存中被移除的条目即解封
+	// 同族收敛：预置名单差集全量保存中被移除的条目即解封
 	//（删除语义=解封起点，手动/自动条目同口径）——old−new 差集逐 IP 清零
 	// 计数桶（services.AutobanForgetIPs 单一入口，与 remove-ip 端点同族），
 	// 否则窗口内旧计数让 autoban 下一轮零新流量重封、解封被 ≤1 tick 撤销。
@@ -933,7 +936,15 @@ func (h *Handlers) DeleteIPList(c *gin.Context) {
 	defer h.caddyOpMu.Unlock()
 
 	id := c.Param("id")
-	// 引用检查与删除同事务（镜像 DeleteSecurityBlockPage 的 历史问题 口径）：
+	// 非规范 ID 门与家族同序（UpdateIPList/AddIPToList/RemoveIPFromList 先
+	// 400 再读列）——先用原始路由段做 system/name 读取会被 SQLite 数值亲和
+	// 命中（"5.0"→行 5），错误码文案与家族分叉。
+	listID, idOK := parsePositiveNumericID(id)
+	if !idOK {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的列表 ID"})
+		return
+	}
+	// 引用检查与删除同事务（镜像 DeleteSecurityBlockPage 的口径）
 	// 检查通过后、DELETE 之前并发的策略更新不得插入新引用。
 	tx, err := db.DB.BeginTx(c.Request.Context(), nil)
 	if err != nil {
@@ -954,7 +965,7 @@ func (h *Handlers) DeleteIPList(c *gin.Context) {
 		return
 	}
 	if system != 0 {
-		// 历史问题：预置「自动封禁名单」禁删（自动封禁任务按名定位+策略引用目标），
+		// 预置「自动封禁名单」禁删（自动封禁任务按名定位+策略引用目标），
 		// 与威胁名单只读门文案区分——放行路径=移除对应条目。
 		if listName == services.AutobanPresetListName {
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "自动封禁名单为预置名单，不可删除（如需放行请移除对应条目）"})
@@ -963,14 +974,9 @@ func (h *Handlers) DeleteIPList(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "内置名单只读，由威胁情报库更新任务维护"})
 		return
 	}
-	listID, err := strconv.ParseInt(id, 10, 64)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的列表 id"})
-		return
-	}
-	// 历史问题（历史）：仅 enabled=1 策略的引用阻止删除，与
+	// 仅 enabled=1 策略的引用阻止删除，与
 	// DeleteSecurityCustomRule/DeleteSecurityBlockPage 同口径——禁用策略的
-	// 悬空引用由 历史修复 重启用门兜底（重启用按有效形态过
+	// 悬空引用由重启用门兜底（重启用按有效形态过
 	// validateIPListRefsExistence，禁用期间被删的列表不得静默激活）。
 	rows, err := tx.QueryContext(c.Request.Context(), "SELECT id, COALESCE(ip_acl_list_refs,'[]'), COALESCE(ip_whitelist_refs,'[]'), COALESCE(crs_excluded_rules,'[]') FROM security_policies WHERE enabled=1")
 	if err != nil {
@@ -1026,7 +1032,7 @@ func (h *Handlers) DeleteIPList(c *gin.Context) {
 		}
 	}
 	// 快照条目数须在 DELETE 前取（名称已在前置门 listName 取得；同事务无写点）
-	// 历史修复（历史）：快照读/解析失败降级为「条目数未知」并留 warn——
+	// 快照读/解析失败降级为「条目数未知」并留 warn——
 	// 此前 `_ =` 双吞错会把 DB 瞬时故障记成「0 条」，删除审计与实际删除量不符。
 	var delEntries string
 	delEntriesKnown := true
@@ -1097,7 +1103,7 @@ func (h *Handlers) AddIPToList(c *gin.Context) {
 		return
 	}
 	if system != 0 {
-		// 历史问题 例外：自动封禁预置名单允许手动追加（手动封禁条目，任务 merge
+		// 例外：自动封禁预置名单允许手动追加（手动封禁条目，任务 merge
 		// 永不挤出）；威胁情报名单保持只读。
 		if listName != services.AutobanPresetListName {
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "内置名单只读，由威胁情报库更新任务维护"})
@@ -1116,7 +1122,7 @@ func (h *Handlers) AddIPToList(c *gin.Context) {
 	if system != 0 {
 		newEntryRemark = services.AutobanManualUnbanRemark
 	}
-	// 历史问题（历史）：同值判重必须区分「生效中」与「已到期未清理」——
+	// 同值判重必须区分「生效中」与「已到期未清理」——
 	// 自动封禁关闭时过期条目永不清理，旧实现命中即 added:false，手动封禁成为
 	// 静默 no-op（渲染生效集仍为空）。到期条目原位覆盖为手动条目（清空
 	// expires_at），生效条目保持幂等返回。
@@ -1138,7 +1144,10 @@ func (h *Handlers) AddIPToList(c *gin.Context) {
 		break
 	}
 	if added {
-		if len(entries) >= ipListMaxEntries {
+		// 上限按生效条目计（与读取/渲染口径 AutobanActiveEntries 同源）——
+		// 自动封禁关闭期间滞留的已到期条目不占名额（清理只在启用收尾/任务
+		// merge 时发生，按原始长度计会把生效远未达上限的手动封禁 400 挡下）。
+		if len(services.AutobanActiveEntries(entries)) >= ipListMaxEntries {
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("条目数量不能超过 %d 条", ipListMaxEntries)})
 			return
 		}
@@ -1154,7 +1163,7 @@ func (h *Handlers) AddIPToList(c *gin.Context) {
 		return
 	}
 
-	// 历史问题：覆盖已到期条目的动作在审计/提示中显式区分（不是「新增」）。
+	// 覆盖已到期条目的动作在审计/提示中显式区分（不是「新增」）。
 	actionLabel := "新增"
 	if !added {
 		actionLabel = "覆盖已到期条目"
@@ -1176,7 +1185,7 @@ func (h *Handlers) AddIPToList(c *gin.Context) {
 }
 
 // RemoveIPFromList POST /security/ip-lists/:id/remove-ip 从地址列表移除单条 IP
-// （历史弹框重构配套端点，用户裁定：加入/移除统一走地址列表，内置威胁
+// （弹框重构配套端点，用户裁定：加入/移除统一走地址列表，内置威胁
 // 名单只读）。与追加幂等对称：值不在名单时 200 {removed:false}（重复移除
 // 无害）；成功移除 200 {removed:true}。移除/追加经 finishTxApply 同链触发
 // 引用策略重载。
@@ -1194,7 +1203,7 @@ func (h *Handlers) RemoveIPFromList(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求参数无效"})
 		return
 	}
-	// 历史问题：家族 3 写路径统一持锁（同文件 Create/Update/Delete/Add 均持，
+	// 名单写路径统一持锁（同文件 Create/Update/Delete/Add 均持，
 	// 唯本端点历史新增时漂移漏锁——apply 与持锁写并发交错可丢配置更新）
 	h.caddyOpMu.Lock()
 	defer h.caddyOpMu.Unlock()
@@ -1219,7 +1228,7 @@ func (h *Handlers) RemoveIPFromList(c *gin.Context) {
 		return
 	}
 	if system != 0 {
-		// 历史问题 例外：自动封禁预置名单允许条目管理（删除条目即解封——
+		// 例外：自动封禁预置名单允许条目管理（删除条目即解封——
 		// 2026-10-15 用户裁定：无抑制窗口，IP 重新达标会被再次封禁）；
 		// 威胁情报名单保持只读。
 		if listName != services.AutobanPresetListName {
@@ -1236,7 +1245,7 @@ func (h *Handlers) RemoveIPFromList(c *gin.Context) {
 	kept := make([]models.IPListEntry, 0, len(entries))
 	removed := false
 	for _, entry := range entries {
-		// 历史问题：按 value 移除**所有**精确同值条目（旧实现 !removed 门只删
+		// 按 value 移除**所有**精确同值条目（旧实现!removed 门只删
 		// 第一条，重复行残留需多次操作；前端已有重复行入口，端点侧收敛）。
 		if entry.Value == req.Value {
 			removed = true
@@ -1252,9 +1261,9 @@ func (h *Handlers) RemoveIPFromList(c *gin.Context) {
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"removed": false}})
 		return
 	}
-	// 历史问题：删后形态若使任一启用 allow 策略的生效集合为空，
+	// 删后形态若使任一启用 allow 策略的生效集合为空，
 	// 拒绝移除（409）；只有策略 inline 或其他引用名单仍有条目时才允许清空。
-	// 历史问题（历史）：判据必须用**过滤到期后**的有效集合——导入/带外
+	// 判据必须用**过滤到期后**的有效集合——导入/带外
 	// 名单可含 expires_at，移除最后一个未到期条目后仅剩过期条目，原始 len>0
 	// 会绕过守卫；渲染侧（AutobanActiveEntries）的生效集合已为空。
 	listID, idErr := strconv.ParseInt(id, 10, 64)
@@ -1288,7 +1297,7 @@ func (h *Handlers) RemoveIPFromList(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
 		return
 	}
-	// 历史修复（用户裁定「删除即解封」语义闭环）：预置名单移除条目
+	// （用户裁定「删除即解封」语义闭环）：预置名单移除条目
 	// 即解封——同步清零该 IP 计数桶（经 services.AutobanForgetIPs 单一入口，
 	// 与差集保存路径同族收敛）。不清桶则窗口内旧计数让 autoban 下一轮在零
 	// 新流量下立即重封，解封被 ≤1 tick 撤销。清桶先于提交无回滚副作用：事务
@@ -1325,11 +1334,11 @@ func commitIPListTx(tx *sql.Tx) error {
 
 // tryIPListHotPathApply 名单-only 变更的投影热路径（2026-10-15 用户裁定）。
 // 资格 = 条目实际变化 ∧ 被启用策略引用 ∧ 被受信代理/CRS 排除引用面覆盖
-// （引用面判定单源 IPListsReferencedByEnabledPolicy，历史修复 补全
+// （引用面判定单源 IPListsReferencedByEnabledPolicy，补全
 // trusted_proxy_range_refs 与 crs_excluded_rules scope=ip/list 的 ListRefs；
 // tp.txt 经 http.ip_sources.lb_file ≤1s stat 热感知）。
 // 资格内以事务视图渲染重写投影文件（原子 tmp+rename）并按三态收敛
-// （IPListProjectionOutcome，历史修复）：
+// （IPListProjectionOutcome）
 //   - Converged：提交+业务审计+热路径说明（零 /load，@ipListFast 匹配器
 //     ≤1s stat 热感知；不落「重载」审计——审计真实性）；
 //   - NeedForce：本轮渲染物化了证书文件而 JSON 字节一致——强制重载收敛
@@ -1361,17 +1370,17 @@ func (h *Handlers) tryIPListHotPathApply(c *gin.Context, tx *sql.Tx, id string, 
 		return false
 	}
 	if hot == services.ProjectionNeedForce {
-		// 历史修复（历史）：本轮渲染经 MaterializeCertPairs 物化了证书文件
+		// 本轮渲染经 MaterializeCertPairs 物化了证书文件
 		// 而配置 JSON 字节一致——零 /load 收尾会把新证书留在磁盘、旧证书留在
-		// Caddy 内存（历史修复 失守）。走强制重载收敛：ApplyConfigFromTxCertAwareForce
-		// 以同一事务视图渲染+强制 /load（历史修复: must-revalidate 击穿
+		// Caddy 内存。走强制重载收敛：ApplyConfigFromTxCertAwareForce
+		// 以同一事务视图渲染+强制 /load（must-revalidate 击穿
 		// errSameConfig），收尾分支镜像 finishTxApply 三分支（拒绝回滚/系统
 		// 失败退化提交/成功提交），重载审计照常落「重载」行（审计真实性：
 		// 本次确有真实重载）。
 		applyErr := h.caddyService.ApplyConfigFromTxCertAwareForce(tx)
 		if applyErr != nil {
 			if services.IsConfigRejected(applyErr) {
-				// 历史修复（历史）：强制被拒=tx 回滚——refresh 渲染已按
+				// 强制被拒=tx 回滚——refresh 渲染已按
 				// 未提交条目重写投影，磁盘回退到已提交态（证书物化内容本即已提交
 				// PEM，物化无需撤销；见 RollbackIPListProjectionsToCommittedInLock 披露）。
 				h.caddyService.RollbackIPListProjectionsToCommittedInLock()
@@ -1379,7 +1388,7 @@ func (h *Handlers) tryIPListHotPathApply(c *gin.Context, tx *sql.Tx, id string, 
 				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Caddy 配置校验未通过，" + f.Resource + "未保存: " + applyErr.Error()})
 				return true
 			}
-			// 传输/系统失败 → 家族 2 退化语义：提交 + 业务审计 + 重载失败审计
+			// 传输/系统失败 → 退化语义（与 finishTxApply 同口径）：提交 + 业务审计 + 重载失败审计
 			// + caddy_apply_error 标记 + 200 带告警（与 finishTxApply 同口径）。
 			if err := commitIPListTx(tx); err != nil {
 				restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
@@ -1419,11 +1428,13 @@ func (h *Handlers) tryIPListHotPathApply(c *gin.Context, tx *sql.Tx, id string, 
 	}
 	// 热路径收尾：镜像 finishTxApply 成功分支，但零 /load（无重载审计）。
 	if err := commitIPListTx(tx); err != nil {
-		// 先回滚释放 SQLite 写锁，再从已提交 DB 视图重写投影；本分支
-		// 没有 /load 副作用，保持零重载恢复语义。
-		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
-			err = errors.Join(err, rbErr)
-		}
+		// 提交失败后 database/sql 已把 Tx 标记为 done、不再调用 driver.Rollback：
+		// SQLite 的 deferred 约束/IO 类失败会让底层事务保持活动（写锁滞留，
+		// 刚归还的池连接仍可见未提交数据）。统一走 rollbackLeakedTx 补发
+		// ROLLBACK，再从已提交 DB 视图重写投影；本分支没有 /load 副作用，
+		// 保持零重载恢复语义。不得自造 tx.Rollback 分支——那会吞掉 ErrTxDone
+		// 且泄漏事务无人释放。
+		rollbackLeakedTx()
 		h.caddyService.RollbackIPListProjectionsToCommittedInLock()
 		recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail("提交事务失败", err.Error(), services.AuditResultPart("failure")))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交事务失败: " + err.Error()})
@@ -1453,7 +1464,7 @@ func (h *Handlers) ExportIPList(c *gin.Context) {
 	// TestExportIPList_filenameUsesListRowID）。
 	var name, entriesJSON string
 	var system int
-	// 历史修复（历史）：文件名恒为「名单 ID」形态——此前以 name 非空作
+	// 文件名恒为「名单 ID」形态——此前以 name 非空作
 	// 条件却仍用 id 组名，死分支误导（阅读者以为名称参与文件名）。取库内行 ID
 	// 而非路由段，避免非规范路由段（"5.0"）导出成 ip-list-0.txt。
 	var listID int64
@@ -1474,7 +1485,7 @@ func (h *Handlers) ExportIPList(c *gin.Context) {
 		// 是文件化前遗留内容，不得优先导出。文件缺失按空导出。
 		vals, ferr := services.ReadThreatIplistForUI(name)
 		if ferr != nil {
-			// 历史问题（历史）：只有「文件不存在」按空导出；读取/解析
+			// 只有「文件不存在」按空导出；读取/解析
 			// 故障必须显式 500——否则调用方拿到 200 空文件无法区分「名单为空」，
 			// 与同域读端点（GetIPList）的失败口径一致。
 			services.Logf("error", "导出威胁名单 %q 读取失败: %v", name, ferr)

@@ -18,7 +18,7 @@ import (
 	"lazy-balancer-v2/internal/dnsprovider/ownership"
 )
 
-// logf 是包级日志接缝（历史问题-3，镜像 ownership/acme 同型接缝）：运维告警
+// logf 是包级日志接缝（镜像 ownership/acme 同型接缝）：运维告警
 // 进入统一日志级别/格式链，而不是裸 log.Printf 另走一条链路。main 启动
 // 早期经 SetLogf 装配；零值回退标准库。
 var logf = func(level, format string, args ...any) { log.Printf(format, args...) }
@@ -69,7 +69,7 @@ func New(secretID, secretKey string) (*Provider, error) {
 	credential := common.NewCredential(secretID, secretKey)
 	prof := profile.NewClientProfile()
 	prof.HttpProfile.Endpoint = "dnspod.tencentcloudapi.com"
-	// 覆盖整个重试包络（3 次尝试 + 每次至多 30s 退避/历史修复 等待计入
+	// 覆盖整个重试包络（3 次尝试 + 每次至多 30s 退避/ 等待计入
 	// 同一请求的 http.Client.Timeout，SDK 默认 60s 会在包络内掐断）
 	prof.HttpProfile.ReqTimeout = 90
 	client, err := dnspod.NewClient(credential, "", prof)
@@ -92,7 +92,7 @@ func New(secretID, secretKey string) (*Provider, error) {
 
 // Present creates a distinct _acme-challenge TXT record (no upsert): a repeated
 // Present for the same name adds another record, and cleanup removes records by
-// ownership record ID / value (历史修复，历史).
+// ownership record ID / value.
 func (p *Provider) Present(ctx context.Context, zone, tokenFQDN, value string, ttl int) error {
 	zone = strings.TrimSuffix(zone, ".")
 	subDomain := strings.TrimSuffix(tokenFQDN, ".")
@@ -107,7 +107,7 @@ func (p *Provider) Present(ctx context.Context, zone, tokenFQDN, value string, t
 		if err := p.ownership.Add(record); err != nil {
 			rollbackErr := p.deleteRecord(ctx, zone, recordID)
 			if rollbackErr != nil {
-				// 历史修复（历史）：ownership.Add 失败且回滚删除亦失败——TXT 已落
+				// ownership.Add 失败且回滚删除亦失败——TXT 已落
 				// DNS，而 ownership 无条目可追踪。告警留痕 + 回填内存兜底表：
 				// cleanUp 的 ownership 分支会排空兜底表并重试删除，避免永久残留。
 				logf("warn", "tencent: 所有权写入失败且回滚删除失败，TXT %s (recordID=%d) 可能残留: %v", tokenFQDN, recordID, rollbackErr)
@@ -139,7 +139,7 @@ func (p *Provider) CleanUpValue(ctx context.Context, zone, tokenFQDN, value stri
 
 // cleanUp 是 CleanUp/CleanUpValue 的共享实现（按值定向删除+陈旧条目清理）。
 //
-// 历史修复（历史登记）：本函数与 internal/dnsprovider/dnspod/dnspod.go 的
+// 本函数与 internal/dnsprovider/dnspod/dnspod.go 的
 // cleanUp 是同构双实现（有意保留——两者底层 SDK/记录 ID 类型不同）。任一侧
 // 修改删除/留痕/兜底排空逻辑时，MUST 同步另一侧并保持语义一致。
 func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, byValue bool) error {
@@ -180,15 +180,15 @@ func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, b
 	deleteOne := func(recordID uint64, value string) error {
 		if err := p.deleteRecord(ctx, zone, recordID); err != nil {
 			if ctx.Err() != nil {
-				// 保留原始 provider 错误（历史问题：整体覆写会丢失具体
+				// 保留原始 provider 错误（整体覆写会丢失具体
 				// API 失败原因，诊断信息归零）；与 dnspod 侧口径对齐。
 				err = errors.Join(err, ctx.Err())
 			}
 			if p.ownership == nil {
-				// 历史问题：failed 的唯一消费点是下方 ownership==nil 的 owned
+				// failed 的唯一消费点是下方 ownership==nil 的 owned
 				// 回填；ownership 模式下失败条目由 ownership 留存（删除失败
 				// 不 Remove），不再写入死存储。
-				// 历史问题（历史）：回填必须保留 challenge value——后续按值
+				// 回填必须保留 challenge value——后续按值
 				// 清理（CleanUpValue）以 entry.value 过滤，空值条目永不被选中重试。
 				failed = append(failed, ownedRecord{recordID: recordID, value: value})
 			}
@@ -217,7 +217,7 @@ func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, b
 				cleanupErr = errors.Join(cleanupErr, parseFailure, p.ownership.Remove(record))
 				continue
 			}
-			// 历史修复 independence: a record whose deletion failed keeps
+			// independence: a record whose deletion failed keeps
 			// its ownership entry (the DNS record may still exist), but an
 			// earlier miss must not skip Remove for records that WERE
 			// deleted — that orphans them until self-heal.
@@ -226,7 +226,7 @@ func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, b
 			}
 			cleanupErr = errors.Join(cleanupErr, p.ownership.Remove(record))
 		}
-		// 历史修复 兜底排空（历史）：Present 在「ownership.Add 失败 + 回滚删除
+		// 兜底排空：Present 在「ownership.Add 失败 + 回滚删除
 		// 失败」时把 recordID 回填进内存兜底表（store 无条目可追踪）。此处重试
 		// 删除这些兜底条目——成功即清除，失败回填供下次重试（幂等）。store 模式
 		// 下 p.owned 仅承载该兜底回填，正常路径为空，排空不影响既有语义。
@@ -295,7 +295,7 @@ func (p *Provider) createRecord(ctx context.Context, zone, subDomain, value stri
 	resp, err := p.client.CreateRecordWithContext(ctx, req)
 	if err != nil {
 		if ctx.Err() != nil {
-			// 历史修复（历史）：对齐 deleteOne 口径（历史问题）——以
+			// 对齐 deleteOne 口径——以
 			// ctx.Err() 整体覆写会丢失具体 API 失败原因（诊断信息归零），
 			// errors.Join 保留两者。
 			err = errors.Join(err, ctx.Err())

@@ -1,4 +1,4 @@
-// ——Element Plus 弹框（el-popover / el-tooltip）视口安全 popper 选项（历史修复 家族共享）——
+// Element Plus 弹框（el-popover / el-tooltip）视口安全 popper 选项——
 // EP 未显式开启 Popper 的 flip（placement 固定则不回退）且无 preventOverflow。
 // 统一补：flip 多向回退 + preventOverflow（视口内留 8px 余量）。
 // 历史追加（用户反馈：靠底行仍越界）：回退候选必须含水平方向——摘要弹框可达

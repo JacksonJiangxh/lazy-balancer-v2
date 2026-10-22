@@ -64,7 +64,7 @@ func TestConfigBackup_lbbakRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	xdbPath := filepath.Join(t.TempDir(), "ip2region.xdb")
-	// 历史问题（历史）：导入落盘前校验 xdb 可装载——夹具必须是真实可装载
+	// 导入落盘前校验 xdb 可装载——夹具必须是真实可装载
 	// 的 ip2region 库（此前 4096 字节 0xAB 垃圾被当合法文件断言 200）。
 	xdbBytes, err := os.ReadFile(filepath.Join("..", "..", "caddygeoip", "testdata", "ip2region_v4.xdb"))
 	if err != nil {

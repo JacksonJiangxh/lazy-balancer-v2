@@ -46,7 +46,9 @@ func (s *ClusterService) IssueServiceControlTicket(ctx context.Context, nodeID i
 	if err := s.db.QueryRowContext(ctx, `SELECT name,ip_address,port,COALESCE(protocol,'http'),COALESCE(access_url,''),COALESCE(cluster_token_hash,''),is_approved FROM nodes WHERE id=? AND `+masterRoleConditionSQL, nodeID).
 		Scan(&name, &ipAddress, &port, &protocol, &accessURL, &keyHash, &approved); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return models.ClusterServiceControlIssue{}, ErrNodeNotFound
+			// 0 行先复核角色：降级竞态（handler 角色门通过后 is_master 翻转）
+			// 统一 403 语义，不得落成「节点不存在」404。
+			return models.ClusterServiceControlIssue{}, s.masterScopeMissError(ctx, ErrNodeNotFound)
 		}
 		return models.ClusterServiceControlIssue{}, fmt.Errorf("读取服务控制目标节点: %w", err)
 	}
@@ -74,7 +76,7 @@ func (s *ClusterService) IssueServiceControlTicket(ctx context.Context, nodeID i
 }
 
 // signServiceControlTicket 保留包装（服务控制票据的调用面命名），实现与
-// 登录票据共用 signClusterTicket（历史问题-04：签发单源）。
+// 登录票据共用 signClusterTicket。
 func signServiceControlTicket(claims models.ClusterServiceControlClaims, key []byte) (string, error) {
 	ticket, err := signClusterTicket(claims, key)
 	if err != nil {
@@ -87,7 +89,7 @@ func signServiceControlTicket(claims models.ClusterServiceControlClaims, key []b
 // 发起过服务控制），供调用方以幂等语义处理。
 var ErrNoClusterPin = errors.New("该节点没有已钉扎的证书指纹")
 
-// ForgetNodePin 删除主节点侧针对单个从节点的服务控制 TOFU 指纹钉（历史问题，与
+// ForgetNodePin 删除主节点侧针对单个从节点的服务控制 TOFU 指纹钉（与
 // 从节点侧 forget-pins 端点对称）：从节点更换管理面板证书后主节点对其服务控制
 // 持续 PinMismatch，本方法按 IssueServiceControlTicket 同一口径（access_url
 // 优先，回退 protocol://ip:port）推导地址并定位 cluster_ca_pins 下的 pin 文件，
@@ -98,7 +100,7 @@ func (s *ClusterService) ForgetNodePin(ctx context.Context, nodeID int) (string,
 	if err := s.db.QueryRowContext(ctx, `SELECT ip_address,port,COALESCE(protocol,'http'),COALESCE(access_url,'') FROM nodes WHERE id=? AND `+masterRoleConditionSQL, nodeID).
 		Scan(&ipAddress, &port, &protocol, &accessURL); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			// 历史问题：SQL 级角色条件（同族 TOCTOU 唯一漏点）——0 行时复核
+			// SQL 级角色条件（同族 TOCTOU 唯一漏点）——0 行时复核
 			// 角色：降级窗口返回 403 哨兵，而不是继续删除主节点目录下的 pin。
 			return "", s.nodeWriteMissError(ctx)
 		}
@@ -189,7 +191,7 @@ func NewClusterControlHTTPClient(dataDir string, database *sql.DB) *http.Client 
 // CheckRedirect=ErrUseLastResponse 会让调用方拿到空 body 走 JSON 解析且无自愈
 // 路径（2026-09-18 实测）。仅当 Location 与原请求**同主机名**且升级为 https
 // 时按原方法重放一次（凭证不出原主机）；跨主机重定向一律不跟随（凭证外泄
-// 防护）。历史问题（历史）消费方：脱离通知（cluster.go
+// 防护）。消费方：脱离通知（cluster.go
 // notifyMasterDetach）与服务控制调用（handlers callClusterServiceControl）。
 // 客户端必须设置 CheckRedirect=ErrUseLastResponse，否则 301/302/307/308 被标准库先行
 // 跟随（POST 可能被改写为 GET）而本函数永远看不到升级信号。
@@ -223,7 +225,7 @@ func DoWithSameHostTLSUpgradeRedirect(client *http.Client, req *http.Request) (*
 		}
 		retry.Body = body
 	} else if req.Body != nil {
-		// 历史问题:无 GetBody 的带体请求不可重放(body 已被首次请求消费,
+		// 无 GetBody 的带体请求不可重放(body 已被首次请求消费,
 		// 重放会发送空/残缺载荷)——原实现返回已 Close 的 resp(调用方读 body
 		// 报错),合并后取 cluster_sync 方法版语义:返回合成空壳 301 响应。
 		return &http.Response{

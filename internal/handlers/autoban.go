@@ -1,6 +1,6 @@
 package handlers
 
-// 自动封禁（历史问题）端面：配置读写（六项+校验；保存联动调度启停）、
+// 自动封禁端面：配置读写（六项+校验；保存联动调度启停）、
 // 运行状态（状态卡数据源：运行态/今日封禁/名单条数/引用状态/观察建议）。
 // 预置名单的条目管理例外（删 400/条目可改）在 securityiplists.go。
 // 「立即执行」端点已废除（2026-10-14 裁定：调度唯一前提=业务启用）。
@@ -28,6 +28,11 @@ func (h *Handlers) GetAutobanConfig(c *gin.Context) {
 // 任务列表手动开调度未启用时由 Run 体业务门拦停）。配置只影响本节点调度与
 // 计数——主节点门（从节点写会被快照覆盖，与 UpdateThreatAutoUpdate 同口径）。
 func (h *Handlers) UpdateAutobanConfig(c *gin.Context) {
+	// 自动封禁用例配置写 global_config，导入全量替换——窗口内提交会被静默
+	// 覆盖（用户以为已改配置）或撞写锁 500，与同族写端点同口径 409。
+	if rejectWriteDuringImport(c, "修改自动封禁配置（配置导入进行中）") {
+		return
+	}
 	if !guardConfiguredJSONBody(c) {
 		return
 	}
@@ -72,8 +77,8 @@ func autobanScopeText(scope string) string {
 // 可读）。running/last_run 取任务引擎实态；list_referenced=启用中的安全策略
 // （ip_acl_list_refs ∪ ip_whitelist_refs，JSON 精确解析）是否引用预置名单——
 // 未引用时前端黄条提示「名单未生效」；suggestions=上一轮观察建议（dry-run）。
-// is_master/role=调度面节点角色（历史修复：从端卡片按角色门控写按钮，
-// 引擎未装配时保守判从）；list_entries 与渲染生效面同口径（历史修复：剔除已到期
+// is_master/role=调度面节点角色（从端卡片按角色门控写按钮，
+// 引擎未装配时保守判从）；list_entries 与渲染生效面同口径（剔除已到期
 // 未清理条目）。
 func (h *Handlers) GetAutobanStatus(c *gin.Context) {
 	cfg := services.GetAutobanConfig()
@@ -100,7 +105,7 @@ func (h *Handlers) GetAutobanStatus(c *gin.Context) {
 		"banned_today":    services.AutobanBannedToday(),
 		"list_entries":    len(services.AutobanActiveEntries(entries)),
 		"list_referenced": h.autobanListReferenced(preset),
-		// 历史问题-02：黄条真正需要的是「封禁是否生效」——名单被 deny + IP 访问
+		// 黄条真正需要的是「封禁是否生效」——名单被 deny + IP 访问
 		// 控制启用的策略引用且名单非空才生效；list_referenced 复用热路径资格门
 		// 的四面引用集（含白名单/受信代理/CRS 排除），不能区分「引用」与「拦截
 		// 生效」，曾抑制唯一的不生效告警。
@@ -123,7 +128,7 @@ func (h *Handlers) GetAutobanStatus(c *gin.Context) {
 			resp["last_status"] = last.Status
 		}
 	}
-	// 历史问题-02（历史）：喂入源（安全事件采集）健康——数据源停摆时自动封禁
+	// 喂入源（安全事件采集）健康——数据源停摆时自动封禁
 	// 静默失效（计数恒 0、轮次仍 success）。状态卡据此显示降级原因，不自动
 	// 拉起用户显式停止的任务。
 	feedDegraded, feedReason := services.AutobanFeedHealth()
@@ -134,7 +139,7 @@ func (h *Handlers) GetAutobanStatus(c *gin.Context) {
 
 // autobanPresetListState 是一次请求内预置名单的单一读取结果：id 缺失/查询
 // 故障（err 非空）与条目快照一并传入两个黄条判据，避免同一状态端点三次
-// 查同一行（历史问题）。err/id 丢失时两判据均 fail-closed=true。
+// 查同一行。err/id 丢失时两判据均 fail-closed=true。
 type autobanPresetListState struct {
 	id      int64
 	entries []models.IPListEntry
@@ -142,8 +147,8 @@ type autobanPresetListState struct {
 }
 
 // autobanListReferenced 启用中的策略是否引用预置名单（黄条判据）。引用面判定
-// 单源 services.IPListsReferencedByEnabledPolicy（历史修复，历史：原第二份
-// 窄引用实现只查 ip_acl_list_refs/ip_whitelist_refs，与热路径资格门 历史修复
+// 单源 services.IPListsReferencedByEnabledPolicy（原第二份
+// 窄引用实现只查 ip_acl_list_refs/ip_whitelist_refs，与热路径资格门
 // 补全后的四面口径分叉——仅被受信代理网段/CRS 排除 scope=ip/list ListRefs
 // 引用的名单会被黄条误报「名单未生效」；错误日志沿用单源通用前缀「IP 名单
 // 写路径」）。查询失败 fail-closed（按已引用处理——不弹黄条，避免误报「未
@@ -155,10 +160,10 @@ func (h *Handlers) autobanListReferenced(preset autobanPresetListState) bool {
 	return services.IPListsReferencedByEnabledPolicy([]int{int(preset.id)})
 }
 
-// autobanBanEffective 封禁是否真正生效（历史问题-02 黄条判据）：预置名单存在且
+// autobanBanEffective 封禁是否真正生效：预置名单存在且
 // 含未到期条目，并被至少一个「启用 + IP 访问控制启用 + deny 模式」的策略在
 // ip_acl_list_refs 中引用，且该策略已绑定到「启用 + 至少一个启用上游」的
-// HTTP 规则（历史问题，历史：渲染层对零启用上游的规则整条跳过——见
+// HTTP 规则（渲染层对零启用上游的规则整条跳过——见
 // services/caddy.go 全量渲染的 enabledUpstreamCount 门——此前判据只看到规则
 // 启用，名单实际不拦截却抑制黄条）。白名单/受信代理/CRS 排除引用不构成拦截
 // 生效。
@@ -184,7 +189,7 @@ func (h *Handlers) autobanBanEffective(preset autobanPresetListState) bool {
 		              JOIN lb_rules r ON r.caddy_id=b.rule_caddy_id
 		              WHERE b.policy_id=p.id AND r.protocol='http' AND COALESCE(r.enabled,0)=1
 		                AND EXISTS (SELECT 1 FROM upstreams u
-		                            WHERE u.rule_id=r.caddy_id AND IIF(u.enabled IN ('1',1),1,0)=1))`,
+		                            WHERE u.rule_id=r.caddy_id AND `+services.UpstreamEnabledSQLPredicate+`))`,
 		preset.id).Scan(&count); err != nil {
 		return true
 	}

@@ -58,7 +58,7 @@ func (fullJSONFormatter) MIME() string { return "application/json" }
 // 路径」：若 Write 仍在请求路径同步格式化，ProcessLogging 将无法在超时内返回。
 // 经 plugins.RegisterAuditLogFormatter 装入被测 WAF 的 SecAuditLogFormat（同
 // lbfence 模式）——只有挂进 coraza 真实写路径，栅栏与调用计数才有意义
-// （历史问题：挂在手工创建、WAF 从不使用的 writer 上时栅栏失效）。
+// （挂在手工创建、WAF 从不使用的 writer 上时栅栏失效）。
 // calls 计数钉「栅栏确在写路径」——formatter 未被调用即布线失效，确定性红。
 type blockingFormatter struct {
 	release chan struct{}
@@ -73,7 +73,7 @@ func (f *blockingFormatter) Format(al plugintypes.AuditLog) ([]byte, error) {
 
 func (*blockingFormatter) MIME() string { return "application/json" }
 
-// lbfenceFormatter 历史修复（历史）测试同步栅栏：Format 阻塞至 release 关闭，
+// lbfenceFormatter 测试同步栅栏：Format 阻塞至 release 关闭，
 // 放行后按 json.Marshal 直出（信封与内置 JSON 格式化器一致，见 auditSnapshot
 // 注释）。经 plugins.RegisterAuditLogFormatter 注册为专用格式名 lbfence、由
 // 被测指令 SecAuditLogFormat lbfence 装入 coraza 写路径——drain 侧 process
@@ -102,7 +102,7 @@ func (f cannedFormatter) Format(plugintypes.AuditLog) ([]byte, error) { return f
 func (cannedFormatter) MIME() string { return "application/json" }
 
 // 审计写插件（lbfile）测试：入队/刷盘/轮转重开兼容/阻塞零丢/timing 注入。
-// 写侧契约（历史）：决策→计时（请求路径，纯评估口径）→终态标记；审计
+// 写侧契约：决策→计时（请求路径，纯评估口径）→终态标记；审计
 // Write 只格式化+入队（阻塞式有界队列，零丢弃）；专职 drain goroutine 等待
 // per-tx 计时终态后注入 lb_timing 顶层字段并 bufio 批量刷盘。
 
@@ -194,10 +194,10 @@ func TestAuditWriter_registeredAndInjectsLateTiming(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "audit.log")
 
-	// 历史修复（历史）同步栅栏：drain 侧 Format 点阻塞至主 goroutine 完成
+	// 同步栅栏：drain 侧 Format 点阻塞至主 goroutine 完成
 	// 「迟到分段 record+close」后放行——生产时序（Write 入队严格早于计时写点，
 	// coraza defer ProcessLogging 契约）原样保持，drain 查表被定序在写点之后，
-	// 断言不再依赖调度序。已知取舍窗口（与 auditTimingWait 的 历史修复 注释同源，
+	// 断言不再依赖调度序。已知取舍窗口（与 auditTimingWait 的注释同源，
 	// 此处钉明）：生产中 drain 抢先完成格式化并首轮查表的极小竞态窗内的行不
 	// 注入 lb_timing（耗时属增强信息，展示层报「—」，可接受）；本钉测锚定的
 	// 契约是「行到 drain 时终态已置位 → 必注入」，栅栏使该契约确定性成立。
@@ -319,7 +319,7 @@ func TestAuditWriter_noTimingHeaderOmitsField(t *testing.T) {
 	tx.ProcessLogging()
 
 	line := waitAuditLine(t, logPath)
-	// 历史修复 零轮询钉替代挂钟阈值——无计时头行 id 为空，auditTimingWait
+	// 零轮询钉替代挂钟阈值——无计时头行 id 为空，auditTimingWait
 	// 短路返回，drain 全程零轮询（旧轮询实现此处恒 >0）。
 	if n := auditTimingPollCountForTest.Load(); n != 0 {
 		t.Fatalf("no timing header must skip wait entirely: drain polled %d times", n)
@@ -336,7 +336,7 @@ func TestAuditWriter_noTimingHeaderOmitsField(t *testing.T) {
 // When: 事务入队（ProcessLogging）→ drain 侧处理
 // Then: 行落盘且 drain 全程零轮询（旧行为轮询满上限 200ms/步 1ms 恒约 200 次，
 //
-//	零轮询钉对其必红），且不注入 lb_timing——历史修复 钉：未知 tid 不阻塞单
+//	零轮询钉对其必红），且不注入 lb_timing——钉：未知 tid 不阻塞单
 //	drain goroutine（积压行批量到场时逐行满等=无背压阀下的 drain 沉陷，
 //	请求路径被入队阻塞拖住）
 func TestAuditPipeline_unknownTidDoesNotBlockDrain(t *testing.T) {
@@ -361,11 +361,11 @@ func TestAuditPipeline_unknownTidDoesNotBlockDrain(t *testing.T) {
 	auditTimingPollCountForTest.Store(0)
 	driveProbeTx(t, waf, orphanTID)
 	line := waitAuditLine(t, logPath)
-	// 历史修复 零轮询钉替代挂钟阈值——行落盘时 drain 的等待已完成，
+	// 零轮询钉替代挂钟阈值——行落盘时 drain 的等待已完成，
 	// 未知 tid 首轮查表未命中即返（零轮询）；旧行为轮询满 200ms 上限
 	// （poll step 1ms → 恒约 200 次），本断言对旧实现必红。
 	if n := auditTimingPollCountForTest.Load(); n != 0 {
-		t.Fatalf("unknown tid must not block drain (AUD-1): drain polled %d times, want 0", n)
+		t.Fatalf("unknown tid must not block drain : drain polled %d times, want 0", n)
 	}
 	if strings.Contains(line, "lb_timing") {
 		t.Fatalf("unknown tid must inject nothing: %s", line)
@@ -437,7 +437,7 @@ func TestAuditWriter_snapshotSurvivesTxCycle(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "audit.log")
 
-	// 历史问题：栅栏 formatter 必须经注册名装入被测 WAF 的
+	// 栅栏 formatter 必须经注册名装入被测 WAF 的
 	// SecAuditLogFormat（lbfence 同模式）——旧实现把它挂在手工创建、WAF
 	// 从不使用的 writer 上（WAF 自建 lbfile writer 用 JSON 格式化器），
 	// 栅栏永不触发，「ProcessLogging 未被格式化阻塞」恒真、计时注入依赖
@@ -560,7 +560,7 @@ func TestAuditWriter_snapshotSurvivesTxCycle(t *testing.T) {
 		t.Fatalf("lb_timing.end_us = %v; want 77", doc.LbTiming.End)
 	}
 	// 栅栏确实挂在 WAF 写路径（drain 侧格式化恰好一次）：0=布线失效
-	// （历史问题 旧形态，上述阻塞/计时断言全部形同虚设）。
+	// （旧形态，上述阻塞/计时断言全部形同虚设）。
 	if n := fmtr.calls.Load(); n != 1 {
 		t.Fatalf("fence formatter invocations = %d; want exactly 1 on the WAF write path", n)
 	}
@@ -590,7 +590,7 @@ func TestSnapshotAuditBody_capAndBoundaries(t *testing.T) {
 		{name: "small body unchanged", body: "payload=hit", wantLen: len("payload=hit")},
 		{name: "exact limit unchanged", body: strings.Repeat("x", auditBodyMaxBytes), wantLen: auditBodyMaxBytes},
 		// 目标形状：超限文本 = 前缀 64KiB + 显式截断标记（写侧与读侧上限相等，
-		// 读侧无法凭长度判断截断——历史问题 契约，标记 15 字节超出上限部分）。
+		// 读侧无法凭长度判断截断——契约，标记 15 字节超出上限部分）。
 		{name: "over limit truncated", body: strings.Repeat("x", auditBodyMaxBytes+1), wantLen: auditBodyMaxBytes + len("\n...[TRUNCATED]"), truncated: true, marker: true},
 		// 畸形形状：前缀含非法 UTF-8 时不追加标记（会破坏读侧 base64 判定），
 		// 只保留 64KiB 前缀。
@@ -668,7 +668,7 @@ func TestAuditWriter_requestBodyCapAndTruncationMarker(t *testing.T) {
 	if !ok {
 		t.Fatalf("snapshot request type = %T", al.Transaction().Request())
 	}
-	// 契约（历史问题）：快照体 = 原始前缀 64KiB + 显式标记 \n...[TRUNCATED]。
+	// 契约：快照体 = 原始前缀 64KiB + 显式标记 \n...[TRUNCATED]。
 	wantPrefix := body[:auditBodyMaxBytes]
 	if got := sr.Body(); got != wantPrefix+"\n...[TRUNCATED]" {
 		t.Fatalf("snapshot body must be the %d-byte prefix plus truncation marker (len=%d)", auditBodyMaxBytes, len(got))
@@ -696,7 +696,7 @@ func TestAuditWriter_requestBodyCapAndTruncationMarker(t *testing.T) {
 	}
 }
 
-// 历史问题：审计响应体快照与请求体同上限（64KiB 前缀 + 显式截断标记 +
+// 审计响应体快照与请求体同上限（64KiB 前缀 + 显式截断标记 +
 // body_truncated 标记位，JSON 契约对称）。check-response 策略形态
 // （SecResponseBodyAccess On + SecAuditLogParts 恒含 E）下 coraza 默认
 // SecResponseBodyLimit=512KiB，无快照侧硬限时单条审计行可携带约 512KiB
@@ -800,7 +800,7 @@ func TestAuditWriter_responseBodyCapAndTruncationMarker(t *testing.T) {
 	}
 }
 
-// 历史问题：审计快照的 Args() 提升源必须是「冻结」接口值（同动态类型
+// 审计快照的 Args() 提升源必须是「冻结」接口值（同动态类型
 // typed-nil），不得引用 coraza 事务活对象——drain 侧格式化恒晚于 tx.Close，
 // 活引用在事务回池复用后会读到下一请求的参数。冻结后 Args() 返回空集合。
 func TestAuditSnapshotRequest_argsFrozen(t *testing.T) {
@@ -1131,10 +1131,10 @@ func TestAuditTimingRegistry_recordWaitClose(t *testing.T) {
 	useTestAuditPipeline(t)
 	const id = "0123456789abcdef"
 
-	// 历史修复（历史）：未知 tid（注册表无条目）首轮即返空快照——不轮询到超时
+	// 未知 tid（注册表无条目）首轮即返空快照——不轮询到超时
 	// （旧行为本断言必红：轮询走满超时）。条目稍后创建也不追加等待（预检拦行
 	// 的微秒级建条窗口由 drain 侧格式化先行吸收，见 auditTimingWait 注释）。
-	// 历史修复 零轮询钉替代挂钟阈值（CI 负载抖动下挂钟断言会假红）。
+	// 零轮询钉替代挂钟阈值（CI 负载抖动下挂钟断言会假红）。
 	auditTimingPollCountForTest.Store(0)
 	snap := auditTimingWait(id, 30*time.Millisecond)
 	if n := auditTimingPollCountForTest.Load(); n != 0 {
@@ -1228,7 +1228,7 @@ func TestAuditTimingRegistry_sweepClosesWaitedEntry(t *testing.T) {
 	}
 }
 
-// 历史问题：清扫成本必须随「过期条目数」增长，而不是注册表规模——旧实现
+// 清扫成本必须随「过期条目数」增长，而不是注册表规模——旧实现
 // 每 64 次建条全表 map 扫描（O(n)，n≈TTL×RPS ⇒ CPU 随 RPS² 增长）。
 func TestAuditTimingRegistry_sweepCostIsIncremental(t *testing.T) {
 	useTestAuditPipeline(t)
@@ -1257,7 +1257,7 @@ func TestAuditTimingRegistry_sweepCostIsIncremental(t *testing.T) {
 	}
 }
 
-// 历史问题：close 不再建条（未知 tid 的 drain 首轮即返，close 建条只占 TTL
+// close 不再建条（未知 tid 的 drain 首轮即返，close 建条只占 TTL
 // 条目）；已有条目照常置终态。
 func TestAuditTimingClose_requiresExistingEntry(t *testing.T) {
 	useTestAuditPipeline(t)
@@ -1397,7 +1397,7 @@ func TestAcquireAuditPipeline_processSingleton(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：注册表条目硬上限——无 counter 路由时代理层校验
+// 注册表条目硬上限——无 counter 路由时代理层校验
 // 之外的纵深（任何新 key 生产路径都不得让注册表无界增长）。满时拒绝新键，
 // 既有键的分段写入不受影响。
 func TestAuditTimingRegistry_entryCap(t *testing.T) {
@@ -1431,7 +1431,7 @@ func TestAuditTimingRegistry_entryCap(t *testing.T) {
 	}
 }
 
-// 历史问题：周期清扫——旧实现清扫仅由建条驱动（停流后过期条目永久驻留）。
+// 周期清扫——旧实现清扫仅由建条驱动（停流后过期条目永久驻留）。
 // 后台 sweeper 按周期弹出 TTL 过期条目，零建条流量下注册表也必须收敛。
 func TestAuditTimingRegistry_periodicSweep(t *testing.T) {
 	useTestTimingRegistry(t)
@@ -1553,4 +1553,51 @@ func TestAuditTimingRegistry_preRetentionExpires(t *testing.T) {
 	if retained != 0 {
 		t.Fatalf("retained pre entries=%d, want 0（保留期到期必须回收）", retained)
 	}
+}
+
+// 快照 headers 有界口径（与 part C/E 同 64KiB 上限）：伪造的客户端丢弃计数
+// 键在首个受信触点剥离；超限按序列化体积降序丢条目并以合成键记数。
+func TestSnapshotAuditHeaders_boundedWithMarker(t *testing.T) {
+	t.Run("上限内深拷贝且剥离伪造标记", func(t *testing.T) {
+		src := map[string][]string{
+			"Host":                {"a.example.com"},
+			"_lb_dropped_headers": {"999"},
+		}
+		got := snapshotAuditHeaders(src)
+		if _, ok := got[auditSnapshotDroppedHeadersKey]; ok {
+			t.Fatalf("客户端伪造的丢弃计数键必须剥离: %v", got)
+		}
+		if len(got) != 1 || got["Host"][0] != "a.example.com" {
+			t.Fatalf("真实头必须保留: %v", got)
+		}
+		src["Host"][0] = "mutated"
+		if got["Host"][0] != "a.example.com" {
+			t.Fatal("快照必须深拷贝（源改动不得穿透）")
+		}
+	})
+
+	t.Run("超限丢最大条目并记数", func(t *testing.T) {
+		src := map[string][]string{
+			"Host":       {"a.example.com"},
+			"User-Agent": {"probe"},
+			"X-Big":      {strings.Repeat("B", auditHeadersMaxBytes)},
+		}
+		got := snapshotAuditHeaders(src)
+		raw, err := json.Marshal(got)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(raw) > auditHeadersMaxBytes {
+			t.Fatalf("快照 headers 序列化 %d 字节，超过 %d 上限", len(raw), auditHeadersMaxBytes)
+		}
+		if _, ok := got["X-Big"]; ok {
+			t.Fatal("最大条目必须首先丢弃")
+		}
+		if got["Host"][0] != "a.example.com" || got["User-Agent"][0] != "probe" {
+			t.Fatalf("小条目必须保留: %v", got)
+		}
+		if values := got[auditSnapshotDroppedHeadersKey]; len(values) != 1 || values[0] != "1" {
+			t.Fatalf("丢弃计数键=%v, want [\"1\"]", got[auditSnapshotDroppedHeadersKey])
+		}
+	})
 }

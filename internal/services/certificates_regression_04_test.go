@@ -13,11 +13,11 @@ import (
 func TestCertificateRenewalDays_logsWarningOnReadFailure(t *testing.T) {
 	// Given a broken global_config read（表被改名，读取必失败）
 	_, database := newClusterTestService(t)
-	if _, err := database.Exec("ALTER TABLE global_config RENAME TO global_config_round42_bak"); err != nil {
+	if _, err := database.Exec("ALTER TABLE global_config RENAME TO global_config_broken_bak"); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if _, err := database.Exec("ALTER TABLE global_config_round42_bak RENAME TO global_config"); err != nil {
+		if _, err := database.Exec("ALTER TABLE global_config_broken_bak RENAME TO global_config"); err != nil {
 			t.Errorf("restore global_config: %v", err)
 		}
 	})

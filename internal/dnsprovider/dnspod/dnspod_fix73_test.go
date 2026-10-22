@@ -35,7 +35,7 @@ func (transport *toggleRemoveFailTransport) RoundTrip(request *http.Request) (*h
 	return transport.dnsPodRecordTransport.RoundTrip(request)
 }
 
-// 历史修复（历史）：ownership.Add 失败且回滚删除亦失败时，TXT 已落 DNS 而
+// ownership.Add 失败且回滚删除亦失败时，TXT 已落 DNS 而
 // store 无条目可追踪。修复=告警留痕 + 回填内存兜底表；后续 cleanUp 的
 // ownership 分支排空兜底表并重试删除（否则该记录永久残留）。
 func TestProvider_Present_ownershipAddAndRollbackFailureRefillsFallback(t *testing.T) {
@@ -48,7 +48,7 @@ func TestProvider_Present_ownershipAddAndRollbackFailureRefillsFallback(t *testi
 		t.Fatalf("create persistent provider: %v", err)
 	}
 	provider.client.Transport = transport
-	// 历史问题-3：告警必须经包级 logf 接缝（统一日志级别/格式链），不得裸 log.Printf。
+	// 告警必须经包级 logf 接缝（统一日志级别/格式链），不得裸 log.Printf。
 	var captured strings.Builder
 	oldLogf := logf
 	logf = func(level, format string, args ...any) {

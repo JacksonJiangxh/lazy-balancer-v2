@@ -6,14 +6,69 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+type caddyAdminRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn caddyAdminRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
+}
+
+type caddyAdminTrackedBody struct {
+	io.Reader
+	closeCalls int
+}
+
+func (body *caddyAdminTrackedBody) Close() error {
+	body.closeCalls++
+	return nil
+}
+
+func TestCaddyAdminGet_redirectErrorClosesBodyAndCancelsRequest(t *testing.T) {
+	oldClient := caddyAdminHTTPClient
+	body := &caddyAdminTrackedBody{Reader: strings.NewReader("redirect")}
+	var requestCtx context.Context
+	caddyAdminHTTPClient = &http.Client{
+		Transport: caddyAdminRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+			requestCtx = request.Context()
+			return &http.Response{
+				StatusCode: http.StatusFound,
+				Header:     http.Header{"Location": []string{"http://redirect.invalid/next"}},
+				Body:       body,
+				Request:    request,
+			}, nil
+		}),
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return errors.New("redirect rejected")
+		},
+	}
+	t.Cleanup(func() { caddyAdminHTTPClient = oldClient })
+
+	response, err := caddyAdminGet(context.Background(), "http://admin.invalid", "/config/", time.Hour)
+	if err == nil || response == nil {
+		t.Fatalf("redirect result response=%v err=%v, want non-nil response and error", response, err)
+	}
+	if body.closeCalls == 0 {
+		t.Fatal("redirect error response body was not closed")
+	}
+	if requestCtx == nil {
+		t.Fatal("round trip did not capture request context")
+	}
+	select {
+	case <-requestCtx.Done():
+	default:
+		t.Fatal("redirect error left the per-request timeout context active")
+	}
+}
 
 func TestCaddyAdminGet_sharesTransportAcrossCalls(t *testing.T) {
 	var mu sync.Mutex

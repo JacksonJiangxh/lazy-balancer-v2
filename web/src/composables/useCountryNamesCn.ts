@@ -3,12 +3,12 @@ import { request } from '@/utils/api'
 import { createLazyLoader } from '@/utils/lazyOnce'
 import type { APIResponse } from '@/types'
 
-// country_names_cn 展示层单源消费（历史修复，历史）：海外国家英文名 → 中文简称
+// country_names_cn 展示层单源消费：海外国家英文名 → 中文简称
 // 映射由后端 geoipnames.CountryNamesCN 单源下发（regions API 并行字段，模块级
 // 缓存一次拉取）——前端零复制表，展示层翻译（geoip_countries 提交值/匹配键零
 // 改动）；未命中（未来新增国名）、旧后端、请求失败一律回退英文原名。
 const zhNames = ref<Record<string, string>>({})
-// 单飞 + 失败可重试（历史问题）：原 `requested=true` 置在请求前，
+// 单飞 + 失败可重试：原 `requested=true` 置在请求前，
 // 一次失败即整会话闩死为英文标签；现失败不置加载态，下一次调用自然重试。
 const namesLoader = createLazyLoader(async () => {
   const res = await request.get<APIResponse<{ country_names_cn?: Record<string, string> }>>('/security/ip2region/regions', { silent: true })

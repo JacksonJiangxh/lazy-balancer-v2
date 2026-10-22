@@ -20,10 +20,10 @@ import (
 
 // GetSecurityRateLimitBlocks 返回各站点被限流（HTTP 429）拦截的累计次数，数据
 // 来自 Caddy admin /metrics。注意口径：仅按 code=429 过滤、含上游自返 429；
-// 计数自最近一次 Caddy 配置重载以来累计（历史问题-1 历史实证：/load
+// 计数自最近一次 Caddy 配置重载以来累计（实证：/load
 // 重建 metrics registry 即归零；进程重启同），非进程启动口径（前端按"累计拦截"标注）。
 // 抓取失败返回 500：降级为空列表会让「Caddy 指标不可达」与「暂无限流拦截」
-// 不可区分，面板错误态需可达（历史问题 三-4）。
+// 不可区分，面板错误态需可达。
 func (h *Handlers) GetSecurityRateLimitBlocks(c *gin.Context) {
 	blocks, err := services.ScrapeRateLimitBlocks(h.cfg.CaddyMetricsURL)
 	if err != nil {
@@ -53,7 +53,7 @@ func (h *Handlers) GetSecurityRateLimitBlocks(c *gin.Context) {
 // 暂无限流拦截必须可区分，前端 chip 显示「暂无计数」）。
 func (h *Handlers) GetRuleStageStats(c *gin.Context) {
 	if db.MetricsDB == nil {
-		// MetricsDB 未装配：与成功路径同键的零统计而非 panic（历史）。
+		// MetricsDB 未装配：与成功路径同键的零统计而非 panic。
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{
 			"stage1_blocked_24h":      0,
 			"stage3_blocked_24h":      0,
@@ -86,7 +86,7 @@ func (h *Handlers) GetRuleStageStats(c *gin.Context) {
 		n, convErr := strconv.Atoi(triggered)
 		switch {
 		case triggered == "429":
-			// 历史问题：限流拦截（429）由 ratelimit_blocks_reload（/metrics
+			// 限流拦截（429）由 ratelimit_blocks_reload（/metrics
 			// 429 计数）单独供给阶段 2 chip；此前落入 else 分支被计入
 			// stage3_blocked_24h，导致同一拦截同时出现在阶段 2 与阶段 3。
 			continue
@@ -189,7 +189,7 @@ func queryRuleStageTimings(ruleCaddyID string) (preAvg float64, preCnt int, wafA
 	return preAvg, preCnt, wafAvg, wafCnt, nil
 }
 
-// 历史问题-11（历史）：安全总览的近 7 天聚合（趋势/Top10 IP/攻击族）此前
+// 安全总览的近 7 天聚合（趋势/Top10 IP/攻击族）此前
 // 每请求执行 4 条无缓存的大范围扫描（趋势、Top IP、Top IP 攻击族、攻击类型），
 // 100/s 攻击态 7 天可达数千万行时每 30s 轮询多趟全窗口聚合。改为 30s 进程内
 // 缓存（键含指标库句柄/日界/时区偏移——换库/跨日/改时区即失效；失败不缓存）。
@@ -245,6 +245,9 @@ type securityOverviewResponse struct {
 	RawCoverageFrom    string `json:"raw_coverage_from"`
 	BackfillIncomplete bool   `json:"backfill_incomplete"`
 	IncludesReserved   bool   `json:"includes_reserved"`
+	// Ingestion 与事件列表同源（services 快照）：总览/事件页必须看到同一
+	// 采集健康位（任务已停/连续失败/审计写侧降级），不得各自推断。
+	Ingestion services.SecurityEventsIngestionStatus `json:"ingestion"`
 }
 
 // loadSecurityOverviewAggregates 计算（或命中缓存）近 7 天聚合。错误不缓存、
@@ -375,7 +378,7 @@ func loadSecurityOverviewAggregates(metricsDB *sql.DB, today time.Time, todaySta
 	for name, value := range stageCounts {
 		attackTypesStage = append(attackTypesStage, models.SecurityAttackType{Name: name, Value: value})
 	}
-	// 历史问题：值相等时按名称升序 tiebreak（map 迭代序随机，防轮询抖动）。
+	// 值相等时按名称升序 tiebreak（map 迭代序随机，防轮询抖动）。
 	sort.Slice(attackTypesStage, func(i, j int) bool {
 		if attackTypesStage[i].Value != attackTypesStage[j].Value {
 			return attackTypesStage[i].Value > attackTypesStage[j].Value

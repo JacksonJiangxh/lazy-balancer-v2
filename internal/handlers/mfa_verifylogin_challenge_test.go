@@ -1,6 +1,6 @@
 package handlers
 
-// 历史问题（历史）：MFAVerifyLogin 必须先消费挑战、后验码。
+// MFAVerifyLogin 必须先消费挑战、后验码。
 // 旧顺序（先 MFAVerifyCode 后 MFAConsumeChallenge）下「挑战已被使用」401
 // 发生在验码之后——恢复码「提交即消费」，挑战作废场景（并发登录/过期窗口）
 // 白烧一枚恢复码却换不到登录。新契约：
@@ -189,7 +189,7 @@ func TestMFAVerifyLogin_resetFailureIsLoggedWithoutRevokingJWT(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：挑战查询的 DB 故障（非 ErrNoRows）不得与「无效
+// 挑战查询的 DB 故障（非 ErrNoRows）不得与「无效
 // 挑战」混同 401——基础设施错误必须显式 500，无效挑战（ErrNoRows）仍 401
 // 且不泄露具体原因。
 func TestMFAVerifyLogin_dbFailureReturns500Not401(t *testing.T) {
@@ -211,7 +211,7 @@ func TestMFAVerifyLogin_dbFailureReturns500Not401(t *testing.T) {
 	}
 }
 
-// 历史修复-历史问题：消费挑战的 DB 故障不得折叠成 401「已消费」；挑战保持未消费，
+// 消费挑战的 DB 故障不得折叠成 401「已消费」；挑战保持未消费，
 // 并留下服务故障审计，客户端可重试。
 func TestMFAVerifyLogin_consumeDBFailureReturns500AndKeepsChallenge(t *testing.T) {
 	seedMFAChallengeLoginFixture(t, "consume-db-err", 0)

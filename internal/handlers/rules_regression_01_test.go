@@ -17,10 +17,10 @@ import (
 )
 
 //   在途守卫前置到 cert_jobs 删除之前——仅拦「执行中/CA 往返在途」状态
-//   （非终态减去 queued/pending 未起动行）；queued/pending 维持 历史修复
+//   （非终态减去 queued/pending 未起动行）；queued/pending 维持
 //   「删除+提交后取消+200」语义。
 //   谓词统一为 NOT IN ('failed','disabled')——失败终态行保留失败史实。
-// - 历史修复：weight<1 保存侧响亮拒绝（Create/Update 同门，含禁用上游行），
+// weight<1 保存侧响亮拒绝（Create/Update 同门，含禁用上游行），
 
 // seedCertJobWithStatus 在给定规则下补一条指定状态/域名的 cert_jobs 行
 // （cert_jobs UNIQUE(rule_id,domain)，同行多条任务须用不同域名）。
@@ -89,7 +89,7 @@ func TestUpdateRule_orphanACME_waitingCAJobConflict409(t *testing.T) {
 	}
 }
 
-// 回归形状（历史修复 不反转）：pending（未起动，可复活形态）维持 200+删除。
+// 回归形状：pending（未起动，可复活形态）维持 200+删除。
 // queued 形态由既有 TestUpdateRule_acmeToManual_convergesNonTerminalCertJobs 钉住。
 func TestUpdateRule_orphanACME_pendingJobStillConverges200(t *testing.T) {
 	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
@@ -175,7 +175,7 @@ func TestDisableRule_certJobPredicateKeepsFailed(t *testing.T) {
 	}
 }
 
-// ── 历史修复：weight<1 保存侧响亮拒绝 ───────────────────────────────────────────
+// ──：weight<1 保存侧响亮拒绝 ───────────────────────────────────────────
 
 func postCreateRule(t *testing.T, handler *Handlers, body map[string]any) *httptest.ResponseRecorder {
 	t.Helper()

@@ -34,11 +34,11 @@ var (
 
 // enableCertJobResumePreUpdateHook 是测试专用钩子：在 EnableRule 的
 // EnableCertJobResume 分支 UPDATE 之前触发，用于模拟 SELECT 与 UPDATE 之间
-// 任务行被并发删除（历史修复 RowsAffected 校验的回归测试）。
+// 任务行被并发删除（RowsAffected 校验的回归测试）。
 var enableCertJobResumePreUpdateHook func(jobID int)
 
 func (h *Handlers) ListRules(c *gin.Context) {
-	// 历史问题：lb_rules.id 为可空遗留列（生产形态恒 NULL，cluster_apply 才显式
+	// lb_rules.id 为可空遗留列（生产形态恒 NULL，cluster_apply 才显式
 	// 带值），ORDER BY id 语义退化；rowid 显式化——行为与现状等价（NULL 排序
 	// 实践上即 rowid 序）。
 	rows, err := db.DB.Query(`SELECT ` + lbRuleListColumns + ` FROM lb_rules ORDER BY rowid`)
@@ -47,7 +47,7 @@ func (h *Handlers) ListRules(c *gin.Context) {
 		return
 	}
 	rules, err := scanLbRules(rows)
-	// 历史问题: rows.Close 错误也要记录，与 services 层 errors.Join 风格一致。
+	// rows.Close 错误也要记录，与 services 层 errors.Join 风格一致。
 	if closeErr := rows.Close(); closeErr != nil {
 		services.Logf("error", "ListRules rows close error: %v", closeErr)
 	}
@@ -72,7 +72,7 @@ func (h *Handlers) GetRule(c *gin.Context) {
 		return
 	}
 	rules, err := scanLbRules(rows)
-	// 历史问题: 同 ListRules。
+	// 同 ListRules。
 	if closeErr := rows.Close(); closeErr != nil {
 		services.Logf("error", "GetRule rows close error for caddy_id=%s: %v", caddyID, closeErr)
 	}
@@ -91,7 +91,7 @@ func (h *Handlers) GetRule(c *gin.Context) {
 		return
 	}
 	rule := rules[0]
-	// 历史问题（历史）：手动证书私钥与导出备份同敏感级——仅管理员 JWT
+	// 手动证书私钥与导出备份同敏感级——仅管理员 JWT
 	// 与管理员读写 Key 可回读；只读 Key/非管理员掩码为空串并置 TLSKeySet，
 	// 供编辑表单区分「未配置」与「已隐藏」（UpdateRule 空值=保留原私钥）。
 	if rule.TLSKey != "" && !canReadRuleTLSPrivateKey(c) {
@@ -131,10 +131,6 @@ func maskRuleCaddyPrivateKeys(value interface{}) {
 		for _, child := range typed {
 			maskRuleCaddyPrivateKeys(child)
 		}
-	case []map[string]interface{}:
-		for _, child := range typed {
-			maskRuleCaddyPrivateKeys(child)
-		}
 	}
 }
 
@@ -167,7 +163,7 @@ func (h *Handlers) GetRuleCaddyConfig(c *gin.Context) {
 		return
 	}
 
-	// 历史修复 同族（历史）：该 enabled 上游 COUNT 仅用于 debug 日志，
+	// 同族：该 enabled 上游 COUNT 仅用于 debug 日志，
 	// 每次请求额外执行一次查询——删除（排障价值不抵每请求成本）。
 	services.Logf("debug", "GetRuleCaddyConfig: caddyID=%s, port=%d, enabled=%v",
 		r.CaddyID, r.ListenPort, r.Enabled)
@@ -191,7 +187,7 @@ func (h *Handlers) GetRuleCaddyConfig(c *gin.Context) {
 	// 主路由对象，配置查看对话框拿到的 JSON 缺路径路由。
 	runtimeConfig, err := h.caddyService.GetConfig()
 	if err != nil {
-		// 历史问题：admin 不可达/超时 ≠「规则未应用」——此前两者都归一为
+		// admin 不可达/超时 ≠「规则未应用」——此前两者都归一为
 		// config_not_exists，排障被误导。返回 502，让 UI 的失败分支如实展示
 		// 「获取配置失败」（后者只表示该规则无运行路由）。
 		services.Logf("error", "GetRuleCaddyConfig: failed to get config from Caddy for caddy_id=%s: %v", r.CaddyID, err)
@@ -208,7 +204,7 @@ func (h *Handlers) GetRuleCaddyConfig(c *gin.Context) {
 	}
 
 	// Build the surrounding server/TLS context so the dialog shows certificates
-	// and policies. 历史问题: 定向构建仅含本规则端口 server 的上下文，
+	// and policies.: 定向构建仅含本规则端口 server 的上下文，
 	// 不再为单条规则触发整库查询+证书快照读取的全量重渲染。
 	fullConfig := services.GenerateRuleServerContext(r.CaddyID, r.ListenPort, r.Protocol, r.Domain)
 	if previewErr, exists := fullConfig["error"]; exists && previewErr != nil {
@@ -258,7 +254,7 @@ func buildRuleCaddyContext(fullConfig map[string]interface{}, caddyID string, do
 		return result
 	}
 
-	// 历史修复（历史）：同一 @id 若出现在多个 server（外部写入/历史漂移，
+	// 同一 @id 若出现在多个 server（外部写入/历史漂移，
 	// 本仓另有漂移检测守卫但仍属可能形态），旧实现只在 routes 循环内 break，
 	// 外层继续遍历并用后遍历者覆盖 result["server"]——map 序遍历不确定，
 	// 配置查看框的 server_context 随机漂移，误导排障。改为按 server 名排序
@@ -384,7 +380,7 @@ func buildRuleCaddyContext(fullConfig map[string]interface{}, caddyID string, do
 		}
 	}
 
-	// 历史问题：此处曾有 tls.automation.policies 的域名作用域扫描——生产
+	// 此处曾有 tls.automation.policies 的域名作用域扫描——生产
 	// 渲染（GenerateRuleServerContext / 全量生成）从不产出 tls.automation
 	// （注释明确「no Caddy ACME automation」，证书由应用层任务管理），该字段
 	// 恒为 []，测试为自造输入假绿。删除死代码，配置查看框不再展示不存在的
@@ -504,7 +500,7 @@ func scopedTLSConnectionPolicies(raw interface{}, caddyID string, domain string)
 }
 
 // normalizedRuleDomains 将逗号分隔域名转为规范化集合（小写+punycode）。
-// 历史问题: CanonicalDomains 失败（手造脏数据）时回退小写拆分保留，
+// CanonicalDomains 失败（手造脏数据）时回退小写拆分保留，
 // 与渲染侧 normalizedDomainSet（caddy.go）同口径——此前失败返回 nil 会把
 // 域名整体丢弃，导致遮蔽检查静默通过（两侧不对称且是问题方向）。
 func normalizedRuleDomains(value string) []string {
@@ -535,17 +531,17 @@ func canonicalACMEDomainForJobLookup(domain string) string {
 // reversedACMEDomainForm 返回双域名集合的逆序形式；cert_jobs.domain 按排序规范
 // 形式存储，而导入备份可携带用户输入顺序的非规范行——与 certjobs.go 规则侧
 // joined+reversed 双形式匹配同型。
-// 历史修复（历史）：单源收敛至 services.ReversedCertJobDomain（与
+// 单源收敛至 services.ReversedCertJobDomain（与
 // certjobs.reversedCertJobDomain 同实现，两侧委托）。
 func reversedACMEDomainForm(domain string) string {
 	return services.ReversedCertJobDomain(domain)
 }
 
 // retireCertJobsForDomain 将规则下旧域证书任务退役为 disabled 终态（保留 PEM 作
-// 历史）。导入备份可携带非规范 domain 行（大小写/空白/顺序变体），按去空白小写
+// 导入备份可携带非规范 domain 行（大小写/空白/顺序变体），按去空白小写
 // 归一（lower+replace）与 canonical/reversed 双形式匹配，避免变体行逃逸退役
-// （历史修复）；零行命中为无害无操作。
-// 历史问题:stage 参数化失败阶段(事务开启/迁移 UPDATE/commit),退役 message
+// 零行命中为无害无操作。
+// stage 参数化失败阶段(事务开启/迁移 UPDATE/commit),退役 message
 // 随实际失败阶段落库,运维可从任务行直接看出哪一步失败。
 func retireCertJobsForDomain(database *sql.DB, ruleID, canonicalDomain, reversedDomain, stage string) error {
 	_, err := database.Exec(
@@ -574,7 +570,7 @@ func validateRuleListenPort(protocol string, port int) error {
 // 仅硬编码 8000/2019，部署自定义端口（config 文件 port / caddy_admin_url）时
 // 规则可抢占面板端口导致管理面失联。导入链（config_backup/config_import_v1）
 // 经 validateV2BackupRules/validateConvertedV1Rules 的可选 portGate 传入本函数，
-// 与保存链同口径（历史问题）。
+// 与保存链同口径。
 func (h *Handlers) validateRuleListenPortForSave(protocol string, port int) error {
 	if err := validateRuleListenPort(protocol, port); err != nil {
 		return err
@@ -603,7 +599,7 @@ func (h *Handlers) caddyAdminListenPort() int {
 	return 2019
 }
 
-// enabledRuleDomainConflict 同域名同端口冲突检查（历史修复，历史：删除
+// enabledRuleDomainConflict 同域名同端口冲突检查（删除
 // 原 ruleDomainConflict 空包装，Create/Update/Enable 三处直用本函数）。
 // 仅统计启用中的规则：禁用规则不占用域名，创建/更新时不应被其阻塞；启用时
 // 由 EnableRule 侧同一函数二次把关，避免两条禁用规则同时启用产生冲突。
@@ -628,10 +624,10 @@ func queryRedirectShadowConflict(domain string, listenPort int, enableTLS, tlsHT
 	var err error
 	switch {
 	case listenPort == 80:
-		// 历史问题: 排除对方 80 端口自环跳转规则（listen_port=80 + TLS + 跳转本身
+		// 排除对方 80 端口自环跳转规则（listen_port=80 + TLS + 跳转本身
 		// 生成自环 Location、属非法存量，不应作为占用方拦截新建 80 规则）。
-		// 历史问题(历史):镜像 2026-09 复审裁定 2(跳转分支同款 EXISTS)
-		// ——全部上游被禁用的规则不产生 host 路由与跳转(caddy.go 历史修复),
+		// 镜像 2026-09 复审裁定 2(跳转分支同款 EXISTS)
+		// 全部上游被禁用的规则不产生 host 路由与跳转(caddy.go ),
 		// 不作为占用方;此前裁定只落了单侧,该形态下 80 规则被纯误拦 400。
 		rows, err = db.DB.Query(`SELECT caddy_id, name, COALESCE(domain,'') FROM lb_rules WHERE protocol='http' AND enabled=1 AND enable_tls=1 AND tls_http_redirect=1 AND listen_port != 80 AND caddy_id != ? AND EXISTS (SELECT 1 FROM upstreams u WHERE u.rule_id=lb_rules.caddy_id AND u.enabled=1)`, excludeCaddyID)
 	case enableTLS && tlsHTTPRedirect:
@@ -692,19 +688,19 @@ func queryRuleDomainConflict(domain string, listenPort int, excludeCaddyID, extr
 	return false, nil
 }
 
-// respondRuleApplyError 规则×5 apply 错误统一映射（裁定 2026-09-07 历史修复）：
+// respondRuleApplyError 规则×5 apply 错误统一映射（裁定 2026-09-07）
 // 配置拒绝（CLI/admin 4xx/生成失败）→ 400「Caddy 配置应用失败，规则未<动词>: …」；
 // ErrUnvalidatedApply/传输失败 → 500 同文案。恢复失败并入消息（不改状态码分类）。
-// 历史修复（历史）：五个调用方的 applyErr 分支均伴随 tx 回滚——applyFromTxNote
+// 五个调用方的 applyErr 分支均伴随 tx 回滚——applyFromTxNote
 // 的 CLI 预检/事务内应用两轮渲染已按未提交内容重写投影文件（规则×绑定策略的
-// u-*/p<id> 投影），磁盘同步回退到已提交态（零 /load；单一收敛点=历史修复 同族
+// u-*/p<id> 投影），磁盘同步回退到已提交态（零 /load；单一收敛点= 同族
 // 收敛，禁止单点补丁）。
 func (h *Handlers) respondRuleApplyError(c *gin.Context, applyErr, restoreErr error, verb string) {
 	h.caddyService.RollbackIPListProjectionsToCommittedInLock()
 	if restoreErr != nil {
 		applyErr = errors.Join(applyErr, restoreErr)
 	}
-	// 历史问题：规则五端点均为 Explicit 审计策略（中间件对 Explicit 整体
+	// 规则五端点均为 Explicit 审计策略（中间件对 Explicit 整体
 	// 跳过）——此前 apply 失败只写 HTTP 响应，操作审计完全缺席。与配置域
 	// finishTxApply（拒绝/未校验分支）及安全域同口径：失败必须留痕。
 	// 审计词条用字面量（词汇表门禁禁止动态 action；动词集合固定为五值）。
@@ -720,8 +716,6 @@ func (h *Handlers) respondRuleApplyError(c *gin.Context, applyErr, restoreErr er
 		recordAudit(c, "启用失败", "负载规则", failureDetail)
 	case "禁用":
 		recordAudit(c, "禁用失败", "负载规则", failureDetail)
-	default:
-		recordAudit(c, "应用失败", "负载规则", failureDetail)
 	}
 	if services.IsConfigRejected(applyErr) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Caddy 配置应用失败，规则未" + verb + ": " + applyErr.Error()})
@@ -757,7 +751,7 @@ type tcpDeadFields struct {
 	BlockPageStage1Status    *int
 	BlockPageStage3ID        *int
 	BlockPageStage3Status    *int
-	// 历史问题：访问日志渲染仅对 HTTP 生成 logger_names（caddy.go 按
+	// 访问日志渲染仅对 HTTP 生成 logger_names（caddy.go 按
 	// r.Protocol=="http" 门控），TCP 行的 log_enabled 是死配置——UI 已对
 	// TCP 隐藏开关，API/导入仍可写入，随导出/快照放大。
 	LogEnabled *bool
@@ -780,7 +774,7 @@ type tcpDeadFields struct {
 	Strategy *string
 }
 
-// tcpDeadFieldReset 是 TCP 规则归一的单一事实源（历史问题，2026-10-18）：
+// tcpDeadFieldReset 是 TCP 规则归一的单一事实源
 // TCP 渲染不消费下列 HTTP 专属字段（buildTCPServer/buildTCPProxyRoute
 // 实证），携带即弃置——与协议切换归零同格，防止死配置随快照/导出/复制
 // 放大。三入口各自用适配器把字段接进本清单，新增字段只改这一处。
@@ -826,12 +820,12 @@ func tcpDeadFieldReset(protocol string, fields tcpDeadFields) {
 
 // createRuleTCPDeadFields 接 CreateRule 的值字段；NTLMCompatible 留空——
 // TCP 创建携带 NTLM 必须经 validateRuleFeatures 显式 400（2026-10-12 定稿）。
-// HealthCheckHost 亦留空（历史问题）：HTTP-only 字段由保存门
+// HealthCheckHost 亦留空：HTTP-only 字段由保存门
 // validateRulePayloadBeforeSave 显式 400（既有行为，与 NTLM 同格的「显式
 // 携带即拒」），仅存量/复制/传输路径沉默归一。
 // TCP 自愈族：代理超时族/自定义路由/动态上游/策略(cookie) 同样留空——
-// Create 的请求值全部显式、无存量可愈，显式携带继续由 validateRuleFeatures
-// TCP 分支 400 点名；同协议编辑/复制路径（update/stored 适配器）才需自愈。
+// Create 的代理超时负值先在调用点归一 0，其余显式死配置继续由
+// validateRuleFeatures TCP 分支 400 点名；同协议编辑/复制路径才需全量自愈。
 func createRuleTCPDeadFields(req *models.CreateRuleRequest) tcpDeadFields {
 	return tcpDeadFields{
 		EnableTLS:                &req.EnableTLS,
@@ -1057,7 +1051,7 @@ func duplicateRulePayloadRequest(rule models.LbRule) models.CreateRuleRequest {
 	return req
 }
 
-// validateDuplicateRulePayload 是复制路径的字段层校验（历史问题）：源行的
+// validateDuplicateRulePayload 是复制路径的字段层校验：源行的
 // 上游 host/端口/权重/查重/健康检查与请求体大小等坏形态必须 400 点名源
 // 规则，不得原样放大到副本。
 func (h *Handlers) validateDuplicateRulePayload(rule models.LbRule) error {
@@ -1081,11 +1075,11 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		return
 	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxCreateRuleBodyBytes)
-	// 历史修复: io.ReadAll(c.Request.Body) 在 ShouldBindJSON 之后调用永远读到空。
+	// io.ReadAll(c.Request.Body) 在 ShouldBindJSON 之后调用永远读到空。
 	// 改为先读原始 body 再放回，确保错误日志能记录到导致解析失败的实际请求内容。
 	rawBody, readErr := io.ReadAll(c.Request.Body)
 	c.Request.Body = io.NopCloser(bytes.NewReader(rawBody))
-	// 历史问题(历史):MaxBytesReader 截断(chunked/未知 ContentLength 时快路径
+	// MaxBytesReader 截断(chunked/未知 ContentLength 时快路径
 	// 不触发)映射 413,与 PutCaddyConfig/导入路径同口径——预读会吞掉
 	// MaxBytesError 让 bind 落在「unexpected EOF」的 400 上,须在预读处判。
 	if isRequestBodyTooLarge(readErr) {
@@ -1093,7 +1087,7 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		return
 	}
 	var req models.CreateRuleRequest
-	// ShouldBindBodyWith（缓存请求体）供 历史修复 的 weight 省略探针二次解码。
+	// ShouldBindBodyWith（缓存请求体）供 weight 省略探针二次解码。
 	if err := c.ShouldBindBodyWith(&req, binding.JSON); err != nil {
 		if isRequestBodyTooLarge(err) {
 			c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: "请求体过大"})
@@ -1109,7 +1103,7 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		return
 	}
 
-	// 历史修复 省略 weight 的上游行落默认 1（显式 0 由写侧校验 400）。
+	// 省略 weight 的上游行落默认 1（显式 0 由写侧校验 400）。
 	applyOmittedUpstreamWeightDefaults(c, req.Upstreams)
 
 	// 与 UpdateRule/DeleteRule 同一锁序：先 caddyOpMu 后 DB，冲突检查与写入串行化
@@ -1145,22 +1139,31 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		return
 	}
 
-	// 历史问题 CreateRule 补 历史修复 归一（历史问题 五层入口漏掉的第 5 个）——
+	// CreateRule 补归一——
 	// TCP 规则不终结入站 TLS，保留 enable_tls=1 落库成死形态行（tcp+acme 组合
 	// 还会产生永不消费证书的僵尸续签任务）。与 UpdateRule 归一分支同语义。
-	// 历史修复（历史）：归一前移至全部 TLS 相关校验（来源白名单/手动证书
+	// 归一前移至全部 TLS 相关校验（来源白名单/手动证书
 	// 材料/ACME 域名形状）之前——归一后 EnableTLS=false，校验自然跳过；此前
 	// TCP+enable_tls:true+空/bogus tls_source 创建恒 400 而同形态更新放行 200。
-	// 历史修复（历史）+ 历史问题（历史）：HTTP 专属死配置字段（含
+	// +：HTTP 专属死配置字段（含
 	// tls_http_redirect/domain/upstream_force_http1）经同一 tcpDeadFieldReset
 	// 清单弃置——TCP 渲染零消费（buildTCPServer/buildTCPProxyRoute grep 实证），
 	// 携带即归一 0，不随快照/导出/复制放大。NTLM 兼容是清单的唯一例外：
 	// TCP 创建携带 ntlm_compatible=1 由保存门（validateRuleFeatures）显式 400
 	// 拒绝，不做静默弃置（2026-10-12 定稿），故 create 适配器不提供该字段。
 	if req.Protocol == "tcp" {
+		for _, value := range []*int{
+			&req.ProxyDialTimeout, &req.ProxyResponseHeaderTimeout,
+			&req.ProxyReadTimeout, &req.ProxyWriteTimeout,
+			&req.ProxyStreamTimeout, &req.ProxyFlushInterval, &req.ProxyStreamCloseDelay,
+		} {
+			if *value < 0 {
+				*value = 0
+			}
+		}
 		tcpDeadFieldReset(req.Protocol, createRuleTCPDeadFields(&req))
 	} else if req.Protocol == "http" {
-		// 历史问题：HTTP 渲染不消费 TCP-only 字段，创建时显式弃置。
+		// HTTP 渲染不消费 TCP-only 字段，创建时显式弃置。
 		req.TCPProxyProtocol = false
 		req.TCPHealthCheckPort = 0
 	}
@@ -1185,12 +1188,12 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 	}
 
 	// TCP 渲染零消费 DnsFamily；协议切换路径会清空该列。仅 HTTP 新规则补
-	// 默认，避免同一 TCP 终态出现 ipv4/'' 两种形态（历史）。
+	// 默认，避免同一 TCP 终态出现 ipv4/'' 两种形态。
 	if req.Protocol == "http" && req.DnsFamily == "" {
 		req.DnsFamily = "ipv4"
 	}
 
-	// 历史修复：创建即禁用（enabled 显式 false）跳过冲突门——禁用规则不渲染、
+	// 创建即禁用（enabled 显式 false）跳过冲突门——禁用规则不渲染、
 	// 零冲突（UI 复制向导按预览「禁用」态创建副本，旧码被下方域名/端口门恒
 	// 400）；启用方向由 EnableRule 既有二次门把守（与 DuplicateRule 无门、
 	// UpdateRule 启用方向检查同构）。enabled=true/缺省的创建行为完全不变。
@@ -1240,12 +1243,12 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 	// 库值唯一真相（批 1+2）：健康检查 interval/timeout 为类型①值型列——
 	// 0→10/2 的写侧静默归一废除（0 由 validateRulePayloadBeforeSave 的 <1
 	// 边界 400；前端表单初值=默认，清空提交被拦）。
-	// 历史问题：手动证书模式不消费 acme_config_id（签发/渲染均按 tls_source
+	// 手动证书模式不消费 acme_config_id（签发/渲染均按 tls_source
 	// 分流）——清理跨模式死引用，避免随导出/快照放大不可达配置。
 	if req.TLSSource == "manual" {
 		req.ACMEConfigID = 0
 	}
-	// 历史修复（历史）：生效来源非 manual 时一律弃置证书材料——API/MCP/导入
+	// 生效来源非 manual 时一律弃置证书材料——API/MCP/导入
 	// 给 acme 行携带 tls_cert/tls_key 时私钥正文会随导出/备份/快照放大（渲染
 	// 按 tls_source 分流零消费）。与 UpdateRule 的对称清理同口径。
 	if req.TLSSource != "manual" {
@@ -1290,14 +1293,14 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		return
 	}
 	// 后端字段层校验（三层校验第 2 层；Caddy 层由 applyFromTxNote 的 CLI 预检
-	// + 事务内应用承担，裁定 2026-09-06 ④'）。历史修复（历史）：本门同时
+	// + 事务内应用承担，裁定 2026-09-06 ④'）。本门同时
 	// 承担 tls_source 白名单与请求体上限——Create/Update 入口的同款本地检查
 	// 已删除（单源，杜绝两处文案/边界漂移）。
 	if err := h.validateRulePayloadBeforeSave(req); err != nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
-	// 历史问题:同端口 TLS/明文混布拦截(创建方向)。历史修复：创建即禁用
+	// 同端口 TLS/明文混布拦截(创建方向)。创建即禁用
 	// 同样跳过——禁用规则不进入监听器渲染，启用方向由 EnableRule 同函数把守。
 	if req.Protocol == "http" && !creatingDisabled {
 		if err := checkPortTLSMix("", req.ListenPort, req.EnableTLS); err != nil {
@@ -1348,14 +1351,14 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		}
 	}()
 
-	// enabled 指针化落库——缺省=创建即启用（历史行为），显式 false=禁用
+	// enabled 指针化落库——缺省=创建即启用（行为），显式 false=禁用
 	//（UI 复制向导按预览「禁用」态创建副本）。
 	enabledVal := 1
 	if req.Enabled != nil && !*req.Enabled {
 		enabledVal = 0
 	}
 
-	// 历史问题：INSERT 列清单与值投影走唯一事实源（services.LbRuleInsertSQL/
+	// INSERT 列清单与值投影走唯一事实源（services.LbRuleInsertSQL/
 	// LbRuleInsertArgs）——新建排除 id/created_at/updated_by（主键自增分配、
 	// created_at 走 schema 默认、updated_by 留 NULL 待首次更新），列形态与
 	// 复制/集群镜像/快照导出同源自此结构性保证。
@@ -1394,7 +1397,7 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 	}
 
 	for _, u := range req.Upstreams {
-		// 历史修复 weight<1 已由 validateRulePayloadBeforeSave 响亮拒绝
+		// weight<1 已由 validateRulePayloadBeforeSave 响亮拒绝
 		//（0→1 静默归一废除），此处不再兜底归一。
 		if u.Protocol == "" {
 			if req.Protocol == "tcp" {
@@ -1403,7 +1406,7 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 				u.Protocol = "http"
 			}
 		}
-		// 历史问题：非协议族的上游 protocol（如 HTTP 规则携带 tls，此前
+		// 非协议族的上游 protocol（如 HTTP 规则携带 tls，此前
 		// 静默当 http 处理，与 TCP 行为不对称）已在 validateRulePayloadBeforeSave
 		// 显式 400 拒绝——此处 INSERT 只写归一后的合法值。
 		_, err = tx.Exec(`INSERT INTO upstreams (rule_id, host, port, weight, dynamic_dns, enabled, protocol, max_connections, origin_domain)
@@ -1430,13 +1433,13 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		return
 	}
 	if err := tx.Commit(); err != nil {
-		//  + 历史问题：commit 失败与 finishTxApply/UpdateConfig
+		//  +：commit 失败与 finishTxApply/UpdateConfig
 		// 同收口——统一恢复回滚事务、按已提交视图重渲染并 /load，双失败时
 		// 仍把已提交字节写回 LKG（restoreImportRuntime 只用运行时快照，恢复
 		// /load 失败会让 LKG 滞留未提交内容）。
 		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
 		// 新规则证书文件可能已在事务内渲染时物化——已提交视图不引用该规则，
-		// 不回退即为惰性孤儿（历史问题）。
+		// 不回退即为惰性孤儿。
 		if certErr := services.RemoveCertFiles(caddyID); certErr != nil {
 			restoreErr = errors.Join(restoreErr, certErr)
 		}
@@ -1460,7 +1463,7 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 		cleanupCommitted := false
 		defer func() {
 			if !cleanupCommitted {
-				// 历史修复 附带（历史）：ErrTxDone 判定统一 errors.Is（与
+				// 附带：ErrTxDone 判定统一 errors.Is（与
 				// 本文件其余五处回滚守卫同格，裸 != 不穿透包装）。
 				if rollbackErr := cleanupTx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
 					services.Logf("error", "CreateRule compensation rollback failed for caddy_id=%s: %v", caddyID, rollbackErr)
@@ -1517,7 +1520,7 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 			}
 			recordAudit(c, "创建失败", "负载规则", services.FormatAuditDetail(
 				services.AuditRulePart(caddyID), detail, services.AuditResultPart("failure")))
-			// 历史问题-05：证书签发任务未运行（队列 paused/inactive）与手工签发
+			// 证书签发任务未运行（队列 paused/inactive）与手工签发
 			// 同口径 409，不再折成 500 误报内部故障。
 			status, message := certEnqueueErrorResponse("创建证书任务失败", err)
 			c.JSON(status, models.APIResponse{Code: status, Message: message})
@@ -1536,9 +1539,9 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 	c.JSON(http.StatusCreated, models.APIResponse{Code: 0, Message: "规则已创建", Data: gin.H{"caddy_id": caddyID}})
 }
 
-// certEnqueueErrorResponse 证书任务入队失败的状态/文案单源（历史问题-05）：
+// certEnqueueErrorResponse 证书任务入队失败的状态/文案单源
 // 证书签发任务未运行（队列 paused/inactive）→ 409 点名可操作原因，与手工
-// 签发端点同口径；历史修复（历史）：规则当前态守卫拒绝（服务层
+// 签发端点同口径；规则当前态守卫拒绝（服务层
 // ErrCertRuleStateConflict——并发禁用/改域/删除，services/certificates.go
 // 明确要求 handler 409、不得折成 500）同样映射 409；其余内部失败维持 500。
 func certEnqueueErrorResponse(prefix string, err error) (int, string) {
@@ -1551,10 +1554,10 @@ func certEnqueueErrorResponse(prefix string, err error) (int, string) {
 	return http.StatusInternalServerError, prefix + ": " + err.Error()
 }
 
-// retireOldDomainCertJobOrAudit 历史修复（历史）：UpdateRule 域名迁移
+// retireOldDomainCertJobOrAudit：UpdateRule 域名迁移
 // 三失败分支（事务开启/UPDATE/commit 失败）的「退役旧域任务 + 退役失败补
 // 审计」块逐字三份——收敛为单一 helper，三处只差退役原因/日志相位/审计
-// 前缀文案，行为零变化。历史问题：退役失败即旧域任务保持原状（'issued'+PEM
+// 前缀文案，行为零变化。退役失败即旧域任务保持原状（'issued'+PEM
 // 行永驻，与 pre-v2 行为等效，fail-safe 但静默），补审计让运维可见。
 func retireOldDomainCertJobOrAudit(c *gin.Context, caddyID string, existingRule models.LbRule, reason, logPhase, auditPrefix string) {
 	oldCanonical := canonicalACMEDomainForJobLookup(existingRule.Domain)
@@ -1571,7 +1574,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 
 	caddyID := c.Param("caddy_id")
 
-	// 历史问题: 与 CreateRule（历史 问题）同口径的请求体上限——UpdateRule
+	// 与 CreateRule同口径的请求体上限——UpdateRule
 	// 同样携带 tls_cert/tls_key 与 upstreams 数组，缺此门时认证客户端可用超大 body
 	// OOM 单进程服务（gin + Caddy 编排 + 证书队列同进程）。
 	const maxUpdateRuleBodyBytes int64 = 1 << 20 // 1MB
@@ -1581,9 +1584,9 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxUpdateRuleBodyBytes)
 	var req models.UpdateRuleRequest
-	// ShouldBindBodyWith（缓存请求体）供 历史修复 的 weight 省略探针二次解码。
+	// ShouldBindBodyWith（缓存请求体）供 weight 省略探针二次解码。
 	if err := c.ShouldBindBodyWith(&req, binding.JSON); err != nil {
-		// 历史问题(历史):MaxBytesReader 超限(chunked/未知长度)映射 413,
+		// MaxBytesReader 超限(chunked/未知长度)映射 413,
 		// 与 CreateRule/PutCaddyConfig/导入路径口径一致。
 		if isRequestBodyTooLarge(err) {
 			c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: "请求体过大"})
@@ -1593,7 +1596,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的请求: " + err.Error()})
 		return
 	}
-	// 历史修复 省略 weight 的上游行落默认 1（显式 0 由写侧校验 400）；
+	// 省略 weight 的上游行落默认 1（显式 0 由写侧校验 400）；
 	// upstreams 整体省略时 len=0 探针 no-op，合并区保留存量。
 	applyOmittedUpstreamWeightDefaults(c, req.Upstreams)
 	requestedProtocol := req.Protocol
@@ -1632,7 +1635,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		COALESCE(custom_routes_enabled,0),
 		COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
 		COALESCE(host_header,''), COALESCE(health_check_host,''), COALESCE(enable_compress,0), COALESCE(compress_types,'gzip'),
-		IIF(enabled IN ('1',1),1,0), COALESCE(log_enabled,0), name, description
+		IIF(enabled IN ('1',1),1,0), COALESCE(log_enabled,0), name, COALESCE(description,'')
 	FROM lb_rules WHERE caddy_id = ?`, caddyID).Scan(
 		&existingRule.Protocol, &existingRule.Domain, &existingRule.ListenPort, &existingRule.Strategy,
 		&existingRule.TLSCert, &existingRule.TLSKey, &existingRule.TLSSource, &existingRule.ACMEConfigID,
@@ -1648,7 +1651,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		&existingRule.HostHeader, &existingRule.HealthCheckHost, &existingRule.EnableCompress, &existingRule.CompressTypes,
 		&existingRule.Enabled, &existingRule.LogEnabled, &existingRule.Name, &existingRule.Description)
 	if err != nil {
-		// 历史问题:分判 ErrNoRows 与真实 DB 故障(同 EnableRule 口径)——
+		// 分判 ErrNoRows 与真实 DB 故障(同 EnableRule 口径)——
 		// 此前任意 DB 错误误报 404「规则不存在」误导排障。
 		if dbQueryNotFound(c, err, "规则不存在", "读取规则") {
 			return
@@ -1664,7 +1667,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	}
 
 	// Capture old upstreams for potential DB rollback.
-	// 历史问题: 存量 upstreams.enabled 无 NOT NULL，NULL 行裸 scan 进 bool 会 500；
+	// 存量 upstreams.enabled 无 NOT NULL，NULL 行裸 scan 进 bool 会 500；
 	// IIF 与生成侧（services/caddy.go）同口径：NULL 视同禁用，回写/回滚保持同一有效状态。
 	var oldUpstreams []models.Upstream
 	oldUpstreamRows, err := db.DB.Query("SELECT host, port, COALESCE(weight,1), COALESCE(dynamic_dns,0), IIF(enabled IN ('1',1),1,0), COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(origin_domain,'') FROM upstreams WHERE rule_id = ?", caddyID)
@@ -1721,14 +1724,14 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	if req.ACMEConfigID == 0 {
 		req.ACMEConfigID = existingRule.ACMEConfigID
 	}
-	// 历史问题：手动证书模式同格清理残留 ACME 配置引用（存量导入/旧版本
+	// 手动证书模式同格清理残留 ACME 配置引用（存量导入/旧版本
 	// 行可携带 acme_config_id 而 tls_source=manual；渲染/签发零消费）。必须在
 	// validateRulePayloadBeforeSave 之前——否则残留引用指向已删除配置时，
 	// 编辑会被不存在的 ACME 引用门 400 卡死，清理永远不可达。
 	if req.TLSSource == "manual" {
 		req.ACMEConfigID = 0
 	}
-	// 历史问题（写侧）：nil=保留现值先合并，validateRulePayloadBeforeSave
+	// （写侧）：nil=保留现值先合并，validateRulePayloadBeforeSave
 	// 才能对合并后的生效值做存在性校验（与上方 acme_config_id 同口径）。
 	if req.CAProviderID == nil {
 		req.CAProviderID = &existingRule.CAProviderID
@@ -1752,9 +1755,9 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	if req.HealthCheckHealthyThreshold == nil {
 		req.HealthCheckHealthyThreshold = &existingRule.HealthCheckHealthyThreshold
 	}
-	// 历史修复（历史修复 口径）：nil=沿用存量，显式 0=真实零值（0=不重试/默认间隔/
+	// nil=沿用存量，显式 0=真实零值（0=不重试/默认间隔/
 	// 跟随上游端口均有消费语义，此前非指针合并使显式清零永不可达）。
-	// 历史问题（历史）：合并前先记录请求是否显式提供——显式越界必须 400
+	// 合并前先记录请求是否显式提供——显式越界必须 400
 	// （交 validateRuleFeatures 上界门，错误点名字段），只有存量/导入/直改
 	// DB 的越界值允许随编辑自愈。
 	tcpTryDurationProvided := req.TCPTryDuration != nil
@@ -1768,10 +1771,10 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	if req.TCPTryInterval == nil {
 		req.TCPTryInterval = &existingRule.TCPTryInterval
 	}
-	// 历史修复（历史）：重试窗口上界自愈——仅存量/导入/直改 DB 行携带
+	// 重试窗口上界自愈——仅存量/导入/直改 DB 行携带
 	// >60000 的越界值随任意编辑归零（0=默认窗口），避免命中新增上界门 400
-	// 死端（与 历史修复 负值自愈同格；http 侧 td=-1 是 NTLM 接管态合法哨兵，
-	// 不在本门，TCP 侧负值由下方 TCP 块按 历史修复 归零）。
+	// 死端（与负值自愈同格；http 侧 td=-1 是 NTLM 接管态合法哨兵，
+	// 不在本门，TCP 侧负值由下方 TCP 块按归零）。
 	if !tcpTryDurationProvided && *req.TCPTryDuration > 60000 {
 		upperZero := 0
 		req.TCPTryDuration = &upperZero
@@ -1779,7 +1782,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	if !tcpTryIntervalProvided && *req.TCPTryInterval > 60000 {
 		upperZero := 0
 		req.TCPTryInterval = &upperZero
-		// 历史问题：interval 是 duration>0 时的渲染必填值（caddy.go 两处
+		// interval 是 duration>0 时的渲染必填值（caddy.go 两处
 		// 渲染门：td>0 && ti<=0 直接生成失败）——interval 越界归零后
 		// duration 不得残留正值，否则保存成功但配置生成必败（自相矛盾）。
 		if *req.TCPTryDuration > 0 {
@@ -1864,7 +1867,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 			if req.Strategy == "cookie" {
 				req.Strategy = "weighted_round_robin"
 			}
-			// 历史问题：HTTP 专属死配置字段统一由下方最终协议 tcp 块的
+			// HTTP 专属死配置字段统一由下方最终协议 tcp 块的
 			// tcpDeadFieldReset 清单处置（这里只保留协议形态切换自身需要的
 			// 归一：路径规则/代理超时/DNS——它们由 validateRuleFeatures 对
 			// tcp 显式拒绝，不属静默弃置清单）。
@@ -1878,7 +1881,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 			req.ProxyStreamTimeout = &zero
 			req.ProxyFlushInterval = &zero
 			req.ProxyStreamCloseDelay = &zero
-			// 历史问题:DNS 动态上游是 HTTP 语义,切换即清零(dynamic_dns 残留
+			// DNS 动态上游是 HTTP 语义,切换即清零(dynamic_dns 残留
 			// 会让 validateRuleFeatures 恒拒协议切换,且永不消费的脏配置随
 			// 快照/导出放大)。
 			req.DynamicDNS = &disabled
@@ -1892,7 +1895,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 			req.TCPProxyProtocol = &disabled
 			req.TCPTryDuration = &zero
 			req.TCPTryInterval = &zero
-			// 历史问题(历史):回切 http 恢复 dns_family 默认(与 CreateRule
+			// 回切 http 恢复 dns_family 默认(与 CreateRule
 			// :758-760 同口径)——切 TCP 已清零(:1337),存量 '' 直接落库会让
 			// DB 终态与创建态分叉(读路径 COALESCE 兜底,快照/导出携带脏空值)。
 			if req.DnsFamily == "" {
@@ -1900,11 +1903,11 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 			}
 		}
 	}
-	// 历史问题: 最终协议为 tcp 时一律归一 TLS 字段（与上方切换到 TCP 的分支同
+	// 最终协议为 tcp 时一律归一 TLS 字段（与上方切换到 TCP 的分支同
 	// 语义）——存量 v1 导入可能携带 enable_tls=1 + 空 manual 证书的死形态（渲染
 	// 忽略，但下方非协议门控的手动证书检查会让该规则任何编辑恒 400，UI 又对 TCP
 	// 隐藏 TLS 开关而无自救路径）；协议未变的 tcp 编辑在此顺带自愈。
-	// 历史问题（历史）：HTTP 专属死配置字段族（host_header/health_check_path/
+	// HTTP 专属死配置字段族（host_header/health_check_path/
 	// enable_compress/compress_types/request_body_max_size_mb/
 	// upstream_keepalive_timeout/server_tokens_hidden/ntlm_compatible/
 	// upstream_force_http1/tls_http_redirect/domain/TLS 族/阶段页）统一经
@@ -1926,7 +1929,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		if req.BlockPageStage3Status == nil {
 			req.BlockPageStage3Status = &tcpZero
 		}
-		// 历史问题：log_enabled 仅 HTTP 渲染消费（logger_names 按协议门控）——
+		// log_enabled 仅 HTTP 渲染消费（logger_names 按协议门控）——
 		// 指针合并会把存量 1 带进 TCP 终态，显式补 false 指针使同协议编辑也自愈。
 		if req.LogEnabled == nil {
 			tcpLogOff := false
@@ -1957,12 +1960,12 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 			req.PathRules = &emptyPathRules
 		}
 		tcpDeadFieldReset(req.Protocol, updateRuleTCPDeadFields(&req))
-		// 历史修复（历史）：重试窗口是 http/tcp 共用字段（方案 C），http 侧
+		// 重试窗口是 http/tcp 共用字段（方案 C），http 侧
 		// -1=NTLM 接管态合法；指针合并（nil=沿用存量）会把存量 -1 带进 TCP
 		// 值域门（rule_features.go TCP 分支拒负值）——切换与同协议编辑双路径
 		// 均命中 400 死端，错误指向用户从未提交的字段。负值一律自愈归零
 		// （TCP 语义：0 与 -1 均为零窗口=不重试；5s 默认窗口仅属 HTTP）；
-		// 非负值尊重 历史修复 指针合并契约（nil=沿用存量/
+		// 非负值尊重指针合并契约（nil=沿用存量/
 		// 显式值=尊重输入，rules_lb_fixes_test 钉测）——不可无条件归零。
 		if req.TCPTryDuration != nil && *req.TCPTryDuration < 0 {
 			req.TCPTryDuration = &tcpZero
@@ -1971,7 +1974,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 			req.TCPTryInterval = &tcpZero
 		}
 	} else if req.Protocol == "http" {
-		// 历史问题：HTTP 渲染不消费 TCP-only 字段；同协议编辑也显式清零，
+		// HTTP 渲染不消费 TCP-only 字段；同协议编辑也显式清零，
 		// 防止历史 TCP→HTTP 残留随快照/导出放大。
 		zero, disabled := 0, false
 		req.TCPHealthCheckPort = &zero
@@ -1995,7 +1998,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 				return
 			}
 		}
-		// 历史问题: existingRule.Domain 可能为导入态非规范化值
+		// existingRule.Domain 可能为导入态非规范化值
 		//（"Example.COM"），与规范化后的 req.Domain 比较会误判变更，比较前先做同样规范化。
 		existingDomain := existingRule.Domain
 		if existingDomain != "" {
@@ -2003,11 +2006,11 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 				existingDomain = canonical
 			}
 		}
-		// 历史问题: 域名冲突检查同样加变更门控——仅当域名/监听端口/启用态相对存量
+		// 域名冲突检查同样加变更门控——仅当域名/监听端口/启用态相对存量
 		// 变化时才执行（enabledRuleDomainConflict 只统计 enabled=1 的规则）。导入遗留的
 		// 「一启用一禁用同域名」组合中，禁用方仅改名等无关更新不再被 400 卡死；
 		// 启用态变化仍走检查（启用时二次把关，与 enabledRuleDomainConflict 口径一致）。
-		// 历史问题: 启用态门控收敛为仅启用方向（*req.Enabled && !existingRule.Enabled）——
+		// 启用态门控收敛为仅启用方向（*req.Enabled &&!existingRule.Enabled）——
 		// 禁用方向不渲染、无冲突可言，存量冲突组合（同域名同端口双启用）的禁用操作
 		// 不应被 400 误拦（DisableRule 端点本就不查，口径对齐）。
 		if req.Domain != existingDomain || req.ListenPort != existingRule.ListenPort || (*req.Enabled && !existingRule.Enabled) {
@@ -2022,18 +2025,18 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 				return
 			}
 		}
-		// 历史问题: 仅当域名/监听端口/EnableTLS/TLSHTTPRedirect/Enabled 任一相对存量变化时
+		// 仅当域名/监听端口/EnableTLS/TLSHTTPRedirect/Enabled 任一相对存量变化时
 		// 执行遮蔽检查（fallback 已把 req 字段填成现值，直接与 existingRule 比较）——
 		// 存量冲突组合（导入态 80 规则 + 跳转规则并存）下仅改名称/健康检查不应被 400 阻塞。
-		// 历史问题: Enabled 变化也触发——与 EnableRule 端点同口径，禁用规则经 UpdateRule
+		// Enabled 变化也触发——与 EnableRule 端点同口径，禁用规则经 UpdateRule
 		// 启用时同样拦截会遮蔽 80 直听规则的跳转组合（shadowRelevantChanged 不含 enabled
 		// 时仅提交 {"enabled":true} 会绕过遮蔽检查）。
-		// 历史问题: 启用态门控收敛为仅启用方向——禁用方不渲染，遮蔽检查无意义；
+		// 启用态门控收敛为仅启用方向——禁用方不渲染，遮蔽检查无意义；
 		// 存量冲突组合（80 直听启用 + 443 TLS+跳转启用同域名）的禁用操作不应被 400 误拦。
-		// 历史问题: 门控再加启用状态前置——仅当「新状态启用 或 原状态启用」时才可能产生
+		// 门控再加启用状态前置——仅当「新状态启用 或 原状态启用」时才可能产生
 		// 运行时影响。禁用中规则（双方均 disabled）不会被渲染，此时改 TLS/跳转/端口/域名
 		// 仍被 400 拦截会阻塞「先改好禁用方配置再启用」的正常流程（启用方向仍会二次把关）。
-		// 历史问题: 注意放宽的仅是下方遮蔽检查；上方同域名+同端口冲突门控对禁用规则
+		// 注意放宽的仅是下方遮蔽检查；上方同域名+同端口冲突门控对禁用规则
 		// 仍然 400——该组合永远无法启用（EnableRule 端点同样拦截），编辑期拦截只是
 		// 提前报错，属有意保守，勿误读为「禁用规则可随意改域名」。
 		shadowRelevantChanged := req.Domain != existingDomain ||
@@ -2060,16 +2063,16 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	}
 
 	// Load existing upstreams if not provided in request
-	// 历史问题(历史):nil 判定区分「省略」与「显式空数组」——len==0 会把显式
+	// nil 判定区分「省略」与「显式空数组」——len==0 会把显式
 	// [] 归并进保留存量。显式 []=非合法形态:下游 validateRulePayloadBeforeSave
-	// 「至少需要一个上游服务器」(handlers.go)400 拒绝、存量不变(历史问题 注释纠正:
+	// 「至少需要一个上游服务器」(handlers.go)400 拒绝、存量不变( 注释纠正
 	// 此处曾误称「显式 []=清空,零上游为合法形态」——实际清空路径被 400 拒绝,
-	// 历史问题 裁定)。updateRuleFeatures 按调用契约直接消费合并后的 req.Upstreams
-	// （历史修复，历史删死分支后不再按 nil 判空）。
+	// 裁定)。updateRuleFeatures 按调用契约直接消费合并后的 req.Upstreams
+	// （删死分支后不再按 nil 判空）。
 	if req.Upstreams == nil {
 		req.Upstreams = oldUpstreams
 	}
-	// 历史问题：同协议 TCP 编辑也必须弃置上游回源域名（HTTP-only
+	// 同协议 TCP 编辑也必须弃置上游回源域名（HTTP-only
 	// 语义）——此前只在 protocolChanged 分支清理，存量残留会在下方
 	// validateRulePayloadBeforeSave 命中「回源域名仅 HTTP」400，UI 对 TCP
 	// 隐藏该字段，用户无自救路径。协议切换分支的同类清理保留（幂等）。
@@ -2082,7 +2085,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		for index := range req.Upstreams {
 			switch req.Protocol {
 			case "tcp":
-				// 历史修复（历史）：回源域名是 HTTP-only 语义——切换即弃置
+				// 回源域名是 HTTP-only 语义——切换即弃置
 				//（与 host_header/health_check_host 归零同格），否则隐藏残留字段
 				// 被「回源域名仅 HTTP 规则支持」门恒拒，卡死保存。
 				req.Upstreams[index].OriginDomain = ""
@@ -2122,7 +2125,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
-	// 历史问题:同端口 TLS/明文混布拦截(更新方向)——nil=保留现值,合并后判定。
+	// 同端口 TLS/明文混布拦截(更新方向)——nil=保留现值,合并后判定。
 	if req.Protocol == "http" {
 		effTLS := existingRule.EnableTLS
 		if req.EnableTLS != nil {
@@ -2139,7 +2142,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	if (*req.EnableTLS || req.TLSCert != "" || req.TLSKey != "") && req.TLSSource == "manual" {
 		tlsCert := req.TLSCert
 		tlsKey := req.TLSKey
-		// 历史问题-1（用户裁定）:从 acme_dns 切换到 manual 时必须提供新的证书
+		// （用户裁定）:从 acme_dns 切换到 manual 时必须提供新的证书
 		// 和私钥——不允许静默沿用 ACME 签发的旧证书（用户以为换了新证书，
 		// 实际在用旧证书）；仅同为 manual 且未修改证书时允许 DB 回退。
 		if existingRule.TLSSource == "acme_dns" {
@@ -2174,7 +2177,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		}
 	}
 
-	// 历史问题：端口类 400 前移至快照/validate 之前（与 CreateRule 的
+	// 端口类 400 前移至快照/validate 之前（与 CreateRule 的
 	// validateRuleListenPortForSave/validatePortFromDB 前置顺序对齐）
 	// ——TCP 候选 server 名含端口，validate 经 /load 真实加载会把同端口启用中规则 B
 	// 的 server 替换为候选（跨规则流量顶替），此前端口冲突在 validate 之后才拒绝且
@@ -2188,7 +2191,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		return
 	}
 
-	// 历史修复（历史）：PUT enabled=false 与 /disable 同语义，同样在副作用
+	// PUT enabled=false 与 /disable 同语义，同样在副作用
 	// 之前做「执行中签发」快路径 409——此前 UpdateRule 直接进入有界取消等待
 	// （最长数分钟）并返回 200，/disable 同场景秒回 409，任务史与行为分叉。
 	// 仅拦「执行中」（HasRunningJobForRule）；queued/pending 维持既有语义。
@@ -2210,8 +2213,8 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		return
 	}
 
-	// 历史问题-1: acme→manual 切换时清理 ACME 关联——acme_config_id 清零(渲染层
-	// 不再引用 ACME 配置)。在途/排队任务的收敛分两步(历史问题-01，镜像 DisableRule
+	// acme→manual 切换时清理 ACME 关联——acme_config_id 清零(渲染层
+	// 不再引用 ACME 配置)。在途/排队任务的收敛分两步（镜像 DisableRule
 	// 正确序):事务内先把非终态 cert_jobs 翻转为终态(见下方 tx 内翻转——否则主
 	// UPDATE 的 NOT EXISTS 守卫恒 409、queued/waiting_ca 行被 30s 补扫复活重签)，
 	// 事务提交后再取消队列在途签发(见 committed 之后的 cancelRuleJobs——提交前
@@ -2220,15 +2223,15 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	if switchingFromACME {
 		req.ACMEConfigID = 0
 	}
-	// 历史修复（历史）：生效证书来源非 manual 时不保留任何证书材料——
+	// 生效证书来源非 manual 时不保留任何证书材料——
 	// manual→acme_dns 此前保留 tls_cert/tls_key（渲染按 tls_source 分流零消费，
-	// 但私钥正文长期留在 lb_rules 并随导出/备份/集群快照放大）。与 历史问题-1
+	// 但私钥正文长期留在 lb_rules 并随导出/备份/集群快照放大）。与
 	// 「acme→manual 必须重新上传」对称清理。
 	clearingTLSMaterial := req.TLSSource != "manual"
 	if clearingTLSMaterial {
 		req.TLSCert, req.TLSKey = "", ""
 	}
-	// 历史修复（历史）：生效来源非 acme_dns 时 ca_provider_id 归零（与
+	// 生效来源非 acme_dns 时 ca_provider_id 归零（与
 	// CreateRule 非 ACME 分支同口径）。此前仅 switchingFromACME / tcp 归零，
 	// manual→manual 编辑把存量残留值原样写回；而 ResolveCAProviderID 对非 0
 	// 直接返回（不校验存在性），残留死引用会随导出放大并在签发期才暴露。
@@ -2317,7 +2320,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	args = append(args, req.TLSSource)
 	query += "acme_config_id = ?, "
 	args = append(args, req.ACMEConfigID)
-	// 历史修复（历史）：ca_provider_id 恒随更新写入——前方合并区已保证
+	// ca_provider_id 恒随更新写入——前方合并区已保证
 	// req.CAProviderID 非 nil（nil=沿用存量），原 if 条件恒真。
 	query += "ca_provider_id = ?, "
 	args = append(args, *req.CAProviderID)
@@ -2337,7 +2340,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		query += "block_page_stage3_status = ?, "
 		args = append(args, *req.BlockPageStage3Status)
 	}
-	// 历史问题：空值=保留存量的语义只适用于 HTTP（手动证书留空=沿用）；
+	// 空值=保留存量的语义只适用于 HTTP（手动证书留空=沿用）；
 	// TCP 行经上方 tcpDeadFieldReset 已把 TLSCert/TLSKey 置空，但同协议编辑
 	// 时两条件此前皆假 → DELETE 列不写，死证书/私钥材料永久滞留并随导出/
 	// 快照放大。TCP 恒写（值为归一后的空串）。
@@ -2360,7 +2363,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	query += "log_enabled = ?, "
 	args = append(args, *req.LogEnabled)
 
-	// 历史修复：原此处的 SingleRuleConfig 死构造（建成后无任何消费）已删。
+	// 原此处的 SingleRuleConfig 死构造（建成后无任何消费）已删。
 	// domain 保留：下方 ACME 任务域名迁移/查找以其为键。
 	domain := req.Domain
 
@@ -2401,7 +2404,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		}
 	}()
 
-	// 孤儿自愈（历史用户裁定，取代 历史问题-01 的转换事件判定）：规则保存后
+	// 孤儿自愈（用户裁定，取代 的转换事件判定）：规则保存后
 	// 终态不使用 ACME 自动签发（证书源手动 / 禁用 TLS）即删除其全部 cert_jobs
 	//（含 failed/issued 历史残留）——v2.3.5 时代 acme→manual 翻转语义遗留的
 	// 失败行，用户重存规则（manual→manual，无转换事件）也一并收敛，幂等。
@@ -2413,11 +2416,11 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	var switchedCertJobs int64
 	delReason := ""
 	if orphanACME {
-		// 历史问题（收窄裁定 2026-10-19，不反转历史修复）：409 在途守卫
+		// （收窄裁定 2026-10-19，不反转）：409 在途守卫
 		// 前置到删除之前——此前先 DELETE 致下方 UPDATE 的 NOT EXISTS 守卫在
 		// 本路径恒失效，CA 往返在途的规则可被改成 manual/关 TLS（队列取消是
 		// 提交后 best-effort）。仅拦「执行中」状态集（executingACMEJobStatuses
-		// =非终态减 queued/pending 未起动行）；queued/pending 维持 历史修复
+		// =非终态减 queued/pending 未起动行）；queued/pending 维持
 		// 「删除+提交后取消+200」语义，保留持续失败域名的切换逃生口。
 		executingStatuses := executingACMEJobStatuses()
 		if len(executingStatuses) > 0 {
@@ -2459,8 +2462,8 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	}
 
 	// PUT enabled=false 与 /disable 同语义：ACME 任务置 disabled 并取消在途，
-	// 否则任务视图仍显示 issued（历史问题-01）。谓词经
-	// disableCertJobsForRuleTx 单源（历史问题，failed 终态行保留失败史实）。
+	// 否则任务视图仍显示 issued。谓词经
+	// disableCertJobsForRuleTx 单源（failed 终态行保留失败史实）。
 	// 单源判据：上方 updatingToDisabled 已含 !orphanACME 的全部条件（启用中 +
 	// 请求禁用 + 终态仍为 acme_dns + TLS 开启），此处复用避免两处谓词漂移。
 	disabledByUpdate := updatingToDisabled
@@ -2495,21 +2498,22 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	services.Logf("debug", "UpdateRule executed for caddy_id=%s: rows_affected=%d", caddyID, rowsAffected)
 	if rowsAffected == 0 {
 		tx.Rollback()
-		// 历史问题：409 早退（非终态证书任务在途）。裁定 ④' 后保存路径无预校验
+		// 409 早退（非终态证书任务在途）。裁定 ④' 后保存路径无预校验
 		// 探针，此处早退零运行时扰动，无需恢复。
 		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "证书申请中，请等待完成或失败后再修改规则"})
 		return
 	}
-	// 历史修复（历史）：此处曾有 protocolChanged&&tcp 的二次
+	// 此处曾有 protocolChanged&&tcp 的二次
 	// `DELETE FROM cert_jobs WHERE rule_id=?`——恒 0 行 协议切到 tcp 时
 	// req.EnableTLS 已置 false，上方 orphanACME（!EnableTLS||TLSSource!="acme_dns"）
 	// 的删除已先行命中同一 rule_id（cert_jobs 按 rule_id 唯一），且 409 早退
 	// 保证无在途非终态行。文件清理段（下方 RemoveCertFiles）保留。
 
-	// 历史问题：HTTP→TCP 协议切换同事务解除安全策略绑定——TCP 渲染链
+	// HTTP→TCP 协议切换同事务解除安全策略绑定——TCP 渲染链
 	// （buildTCPProxyRoute）不加载策略，绑定残留会在策略页 rule_count/绑定视图
 	// 中显示为生效而运行态零防护；绑定写接口又拒绝 TCP，用户无法在面板内自救。
-	// 同协议编辑保留绑定（对照行为由 audit85_l7_test 钉住）。
+	// 同协议编辑保留绑定（对照行为由 general_regression_02_test.go 的
+	// TestProtocolSwitchToTCPDropsSecurityBindings 钉住）。
 	var droppedBindings int64
 	if protocolChanged && req.Protocol == "tcp" {
 		result, err := tx.Exec("DELETE FROM security_policy_bindings WHERE rule_caddy_id = ?", caddyID)
@@ -2522,11 +2526,11 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		droppedBindings, _ = result.RowsAffected()
 	}
 
-	// 历史问题：归一（weight/protocol/tls 校验）前置后走增量收敛——同内容编辑
+	// 归一（weight/protocol/tls 校验）前置后走增量收敛——同内容编辑
 	// 不再 DELETE+INSERT 重建全部上游行（id 保留、不触发上游表行级同步触发器）。
 	for i := range req.Upstreams {
 		u := &req.Upstreams[i]
-		// 历史修复 weight<1 已由 validateRulePayloadBeforeSave 响亮拒绝
+		// weight<1 已由 validateRulePayloadBeforeSave 响亮拒绝
 		//（0→1 静默归一废除），此处不再兜底归一。
 		if u.Protocol == "" {
 			if req.Protocol == "tcp" {
@@ -2566,7 +2570,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		return
 	}
 	if err := tx.Commit(); err != nil {
-		//  + 历史问题：commit 失败统一走已提交视图恢复
+		//  +：commit 失败统一走已提交视图恢复
 		//（回滚事务 + 重渲染 /load + 回退 LKG/投影/证书物化）。
 		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
 		services.Logf("error", "UpdateRule transaction commit failed for caddy_id=%s: %v", caddyID, err)
@@ -2582,7 +2586,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 	// upstreams + path_rules）。下方放锁窗口内他人 UpdateRule 可完整提交；
 	// 基线用于窗口后判定「补偿是否仍只回退本请求」，指纹读取失败时降级为
 	// 不判定（仍走既有 delete 复核与恢复链）。
-	postCommitFingerprint, fingerprintErr := ruleMutationFingerprint(caddyID)
+	postCommitFingerprint, fingerprintErr := ruleMutationFingerprint(c.Request.Context(), caddyID)
 	if fingerprintErr != nil {
 		services.Logf("error", "UpdateRule: 记录规则并发基线失败 for caddy_id=%s: %v", caddyID, fingerprintErr)
 	}
@@ -2591,7 +2595,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		recordAudit(c, "更新", "安全策略", fmt.Sprintf("规则 %s 切换为 TCP，已解除 %d 条安全策略绑定（TCP 不参与策略渲染）", caddyID, droppedBindings))
 	}
 
-	// 历史问题-01/规则脱离 ACME（改手动/禁用 TLS）第二步——提交成功后留痕
+	// /规则脱离 ACME（改手动/禁用 TLS）第二步——提交成功后留痕
 	// 并取消队列在途签发（DisableRule 同序：先收敛任务行后取消）。有界等待；
 	// 失败仅告警继续——规则切换本身已提交，任务行已删除，队列残留由取消的
 	// best-effort 收敛。
@@ -2632,12 +2636,12 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		}
 	}
 
-	// 历史问题-2(历史):门控放宽到「ACME+http+domain 变化」——迁移
+	// 门控放宽到「ACME+http+domain 变化」——迁移
 	// 逻辑与启用态无关;此前 *req.Enabled 门控使禁用态改域绕过迁移,旧域
 	// disabled 任务行永驻,再启用时按新域查不到任务另建新行,破坏「一规则
 	// 一任务」不变量(块内 needJob 判定仍按启用语义执行)。
 	if *req.EnableTLS && req.TLSSource == "acme_dns" && req.Protocol == "http" && domain != "" {
-		// 历史修复 同族（历史）：合并区已保证 req.CAProviderID 非 nil，
+		// 同族：合并区已保证 req.CAProviderID 非 nil，
 		// 原 if 判空恒真，直接解引用。
 		caProviderID := *req.CAProviderID
 		resolvedCAProviderID, resolveErr := services.ResolveCAProviderID(caProviderID)
@@ -2656,7 +2660,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		}
 		caProviderID = resolvedCAProviderID
 		domainChanged := canonicalACMEDomainForJobLookup(domain) != canonicalACMEDomainForJobLookup(existingRule.Domain)
-		// 历史问题 不变量：补偿快照必须先于任何它可能需要撤销的变更。
+		// 不变量：补偿快照必须先于任何它可能需要撤销的变更。
 		// 下面的域名迁移会就地抹除已签发任务的 PEM；快照若在其后执行，
 		// restoreACMEState 恢复出的任务将永久丢失 PEM（TLS 静默中断且
 		// 无自动恢复路径）。快照失败时迁移尚未执行，只需回滚规则与运行时。
@@ -2681,7 +2685,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		// and maintains the "one rule = one cert job" invariant.
 		if domainChanged {
 			newCanonical := canonicalACMEDomainForJobLookup(domain)
-			// 历史问题 迁移前取消在途旧域签发。否则 worker 可能在迁移把行改写为新域
+			// 迁移前取消在途旧域签发。否则 worker 可能在迁移把行改写为新域
 			// 之后仍完成签发，confirmCertificateDeployment 见到 job.domain==rule.domain
 			// （同为新域）便放行，把旧域证书部署到新域（瞬时 TLS 名称不匹配，重签后
 			// 自愈）。CancelJob 等待在途执行退出（30s 上限）；被取消的 worker 走
@@ -2691,7 +2695,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 			if scanErr := db.DB.QueryRow(`SELECT id FROM cert_jobs WHERE rule_id=? ORDER BY id DESC LIMIT 1`, caddyID).Scan(&inFlightJobID); scanErr == nil && inFlightJobID > 0 {
 				// 取消等待在途签发退出；worker 部署尾段需要同一 CaddyOpLock。
 				// 持锁等待会形成 30–60s 等待环并阻塞全部配置写（历史
-				// 历史问题-1，与 DeleteRule/DisableRule/DeleteCertJob 同构）：
+				// 与 DeleteRule/DisableRule/DeleteCertJob 同构）
 				// 先释放全局锁，有界取消后再取回，迁移事务仍在锁内。
 				h.caddyOpMu.Unlock()
 				cancelCertJob(inFlightJobID)
@@ -2713,11 +2717,11 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 			}
 			certTx, txErr := db.DB.Begin()
 			if txErr != nil {
-				// 历史问题：迁移事务开启失败不能静默吞掉——任务仍持旧域，后续会为
+				// 迁移事务开启失败不能静默吞掉——任务仍持旧域，后续会为
 				// 新域另建任务，破坏「一规则一任务」。规则主更新已提交且用户请求
 				// 本身有效，此时回滚规则是错误语义；记录错误并继续：新任务按
 				// 既有 needJob 路径创建。
-				// 历史问题：旧域残留任务不会被孤儿清扫收敛（sweepOrphanedCertJobs
+				// 旧域残留任务不会被孤儿清扫收敛（sweepOrphanedCertJobs
 				// 跳过终态，'issued'+PEM 行将永驻），须在此显式退役旧域任务。
 				// 退役与迁移成功路径同为终态（disabled/failed 均使 sweep 不再触碰），
 				// 但语义不同：成功路径把行改写为新域、抹除 PEM、置 'failed' 等待重签；
@@ -2731,7 +2735,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 					`SELECT id FROM cert_jobs WHERE rule_id=? ORDER BY id DESC LIMIT 1`,
 					caddyID).Scan(&existingJobID)
 				migrationRolledBack := false
-				// 历史修复（历史）：真实查询错误（busy/IO，非 ErrNoRows）不得当作
+				// 真实查询错误（busy/IO，非 ErrNoRows）不得当作
 				// 「无任务」继续空提交——迁移未生效，旧域 issued+PEM 行永驻（sweep
 				// 跳过终态），needJob 又为新域另建行，破坏「一规则一任务」且无留痕。
 				// 与下方 UPDATE 失败/commit 失败分支同语义：回滚 + 退役旧域任务。
@@ -2747,7 +2751,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 					if _, err := certTx.Exec(
 						`UPDATE cert_jobs SET domain=?, status='failed', message='域名已更新，等待重新签发', cert_pem='', key_pem='', expires_at=NULL, renewal_attempts=0, ca_available_after=NULL, last_error_code=NULL, updated_at=datetime('now') WHERE id=?`,
 						newCanonical, existingJobID); err != nil {
-						// 历史问题 迁移 UPDATE 失败与事务开启失败（历史问题 分支）
+						// 迁移 UPDATE 失败与事务开启失败
 						// 同后果——旧域任务未迁移，稍后 needJob 路径会为新域另建任务，
 						// 旧域 'issued'+PEM 行永驻且「一规则一任务」被破坏。回滚本事务
 						// （其内无其他有效写），并与开启失败分支同语义退役旧域任务。
@@ -2770,9 +2774,9 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 				}
 				if !migrationRolledBack {
 					if err := certTx.Commit(); err != nil {
-						// 审计 历史问题：commit 失败与开启/更新失败同后果——迁移未生效，
+						// commit 失败与开启/更新失败同后果——迁移未生效，
 						// 旧域任务持原域永驻（sweep 跳过终态），稍后 needJob 为新域
-						// 另建任务破坏「一规则一任务」。与 历史问题 分支同语义退役。
+						// 另建任务破坏「一规则一任务」。与分支同语义退役。
 						services.Logf("error", "UpdateRule: cert job domain migration commit failed for caddy_id=%s: %v", caddyID, err)
 						retireOldDomainCertJobOrAudit(c, caddyID, existingRule, "域名迁移 commit 失败", "migration commit failure", "域名迁移提交失败后旧域任务退役失败")
 					}
@@ -2810,7 +2814,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		}
 		resumedValidJob := false
 		if wasReEnabled && jobErr == nil {
-			// 历史问题（历史）：续期天数读取单源（services.GetCertRenewalDays）——
+			// 续期天数读取单源（services.GetCertRenewalDays）——
 			// 原内联 COALESCE(cert_renewal_days,30) 与读侧零兜底口径分裂。
 			renewalDays := services.GetCertRenewalDays()
 			var expiryPtr *time.Time
@@ -2819,7 +2823,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 				expiryPtr = &expiry
 			}
 			if !domainChanged && !caProviderChanged && ResolveEnableCertJobAction(true, jobStatus, expiryPtr, time.Now(), renewalDays) == EnableCertJobResume {
-				// 审计 历史修复（历史修复 同型守卫）：行被并发删除时 UPDATE 命中 0 行
+				// 行被并发删除时 UPDATE 命中 0 行
 				// 不报错——必须校验 RowsAffected，否则幻影 resume 抑制 needJob，
 				// 续签链静默断裂且被 200 掩盖（与 EnableRule 出口同口径）。
 				resumeResult, err := db.DB.Exec("UPDATE cert_jobs SET status='issued',message='证书有效，已恢复使用',renewal_attempts=0,ca_available_after=NULL,last_error_code=NULL,updated_at=datetime('now') WHERE id=?", jobID)
@@ -2834,8 +2838,8 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 					c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "恢复证书任务失败: " + errors.Join(err, restoreErr).Error()})
 					return
 				}
-				// 历史修复（第二出口）：Resume 后已应用配置同样缺 TLS——补一次重渲染
-				// 重应用；失败走既有 restoreACMEState 补偿。历史问题 改走
+				// （第二出口）：Resume 后已应用配置同样缺 TLS——补一次重渲染
+				// 重应用；失败走既有 restoreACMEState 补偿。改走
 				// 强制变体（证书文件已在事务外落盘，JSON 相同会被短路）并接线
 				// recordCaddyApplyResult（失败必须进 caddy_apply_error，UI 可见）；
 				// 本函数已持有 caddyOpMu，不可改用 applyCaddyConfigE（重入死锁）。
@@ -2852,7 +2856,7 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 		needJob := domainChanged || caProviderChanged || !services.IsACMECertIssued(caddyID, domain) ||
 			((wasReEnabled || tlsSourceChangedToACME) && !services.HasCertJob(caddyID, domain))
 		needJob = needJob && !resumedValidJob
-		// 历史问题-2:外层门放宽后,块内恢复「禁用不签发」语义——
+		// 外层门放宽后,块内恢复「禁用不签发」语义——
 		// 禁用态改域仅做任务迁移,不排队新签发。
 		needJob = needJob && *req.Enabled
 		if needJob {
@@ -2952,10 +2956,10 @@ func (h *Handlers) DeleteRule(c *gin.Context) {
 	if queueManager != nil {
 		// No DB transaction is held while waiting, so worker rollback/reload paths can exit.
 		blockToken = queueManager.BlockJobsForRule(caddyID)
-		// 历史问题 发现1：租约释放收口到登记于 drain 之前的唯一 defer——drain 前/中
+		// 发现1：租约释放收口到登记于 drain 之前的唯一 defer——drain 前/中
 		// panic（gin Recovery 只恢复 HTTP 栈、不清理 blockedRules）也能走到这里。
 		// 补偿一旦启动成功即接管租约（完成时自行释放），abort 路径不得提前释放，
-		// 否则补偿的 enqueueCompensation 见租约缺失而永久退避（历史问题 注释描述的
+		// 否则补偿的 enqueueCompensation 见租约缺失而永久退避（注释描述的
 		// panic 窗口由此真正闭合）。UnblockJobsForRule 幂等：token 未注册均为无操作。
 		defer func() {
 			if compensationStarted || deleteCompleted {
@@ -2969,7 +2973,7 @@ func (h *Handlers) DeleteRule(c *gin.Context) {
 				RuleID: caddyID, Token: blockToken, Snapshot: certJobsSnapshot,
 			}); err != nil {
 				services.Logf("error", "问题: DeleteRule failed to start certificate rollback compensation for caddy_id=%s: %v", caddyID, err)
-				// 历史问题 同上——补偿未能接管租约时立即释放，不留孤儿屏障。
+				// 同上——补偿未能接管租约时立即释放，不留孤儿屏障。
 				queueManager.UnblockJobsForRule(caddyID, blockToken)
 				return
 			}
@@ -2989,7 +2993,7 @@ func (h *Handlers) DeleteRule(c *gin.Context) {
 				Drain: func(ctx context.Context) error { return drainRuleJobs(ctx, queueManager, caddyID) },
 			}); err != nil {
 				services.Logf("error", "问题: DeleteRule failed to start certificate compensation for caddy_id=%s: %v", caddyID, err)
-				// 历史问题 补偿启动失败即无人持有该 token（典型为降级竞态：Stop 清空
+				// 补偿启动失败即无人持有该 token（典型为降级竞态：Stop 清空
 				// blockedRules 后 block 才创建），必须当场释放租约，否则节点重新提升后
 				// 该规则证书任务被屏障永久拦截、静默停发直到下一次 Stop。对运行中的
 				// manager 同样幂等安全。
@@ -3015,7 +3019,7 @@ func (h *Handlers) DeleteRule(c *gin.Context) {
 	committed := false
 	defer func() {
 		if !committed {
-			if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) { // LBH-A-U4 附带（历史）：统一 errors.Is
+			if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) { // 附带：统一 errors.Is
 				services.Logf("error", "DeleteRule transaction rollback failed for caddy_id=%s: %v", caddyID, rollbackErr)
 			}
 		}
@@ -3027,7 +3031,7 @@ func (h *Handlers) DeleteRule(c *gin.Context) {
 		return
 	}
 	// 删除规则时一并清理安全策略绑定，避免遗留孤儿绑定导致该规则 caddy_id
-	// 被新规则复用时错误继承旧策略（历史修复）。
+	// 被新规则复用时错误继承旧策略。
 	if _, err := tx.Exec("DELETE FROM security_policy_bindings WHERE rule_caddy_id = ?", caddyID); err != nil {
 		services.Logf("error", "DeleteRule security_policy_bindings delete error for caddy_id=%s: %v", caddyID, err)
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "删除安全策略绑定失败"})
@@ -3086,7 +3090,7 @@ func (h *Handlers) DeleteRule(c *gin.Context) {
 		return
 	}
 	if err := tx.Commit(); err != nil {
-		//  + 历史问题：commit 失败统一走已提交视图恢复
+		//  +：commit 失败统一走已提交视图恢复
 		//（回滚事务 + 重渲染 /load + 回退 LKG/投影/证书物化）。
 		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
 		services.Logf("error", "DeleteRule transaction commit failed for caddy_id=%s: %v", caddyID, err)
@@ -3111,7 +3115,7 @@ func (h *Handlers) DeleteRule(c *gin.Context) {
 
 	if db.MetricsDB != nil {
 		if _, err := db.MetricsDB.Exec("DELETE FROM metrics_history WHERE rule_id = ?", caddyID); err != nil {
-			// 历史修复（历史裁定）：清理失败不阻断删除（规则已提交），
+			// （裁定）：清理失败不阻断删除（规则已提交），
 			// 但必须显性化——操作审计留痕 + 周期任务 metrics-orphan-cleanup
 			// 按「已删除规则」谓词有界收敛重试（残留行 7 天保留期另兜底）。
 			services.Logf("error", "DeleteRule metrics_history delete error for caddy_id=%s: %v", caddyID, err)
@@ -3137,41 +3141,46 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 	caddyID := c.Param("caddy_id")
 	h.caddyOpMu.Lock()
 	defer h.caddyOpMu.Unlock()
+	fail := func(status int, message string) {
+		recordAudit(c, "复制失败", "负载规则", services.FormatAuditDetail(
+			services.AuditRulePart(caddyID), message, services.AuditResultPart("failure")))
+		c.JSON(status, models.APIResponse{Code: status, Message: message})
+	}
 
 	rows, err := db.DB.Query(`SELECT `+lbRuleColumns+` FROM lb_rules WHERE caddy_id = ?`, caddyID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取规则失败"})
+		fail(http.StatusInternalServerError, "读取规则失败")
 		return
 	}
 	rules, err := scanLbRules(rows)
-	// 历史问题: 同 ListRules。
+	// 同 ListRules。
 	if closeErr := rows.Close(); closeErr != nil {
 		services.Logf("error", "DuplicateRule rows close error for caddy_id=%s: %v", caddyID, closeErr)
 	}
 	if err != nil {
 		services.Logf("error", "DuplicateRule scan error for caddy_id=%s: %v", caddyID, err)
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取规则失败"})
+		fail(http.StatusInternalServerError, "读取规则失败")
 		return
 	}
 	if len(rules) == 0 {
-		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "规则不存在"})
+		fail(http.StatusNotFound, "规则不存在")
 		return
 	}
-	// 历史问题：复制前补挂载关联数据——scanLbRules 不带 Upstreams/PathRules，
+	// 复制前补挂载关联数据——scanLbRules 不带 Upstreams/PathRules，
 	// EnabledUpstreamCount 恒 0 会让 validateRuleFeatures 的动态 DNS 多上游
 	// 预检（DynamicDNS && count>1）在复制路径永不触发。
-	// 历史问题：不再对 rule.Domain 规范化——落库域名已由 Create/Update 与启动迁移规范化。
+	// 不再对 rule.Domain 规范化——落库域名已由 Create/Update 与启动迁移规范化。
 	if err := hydrateRuleRelations(c.Request.Context(), rules); err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取规则关联数据失败"})
+		fail(http.StatusInternalServerError, "读取规则关联数据失败")
 		return
 	}
 	rule := rules[0]
 
-	// 历史修复（历史）：重试窗口上界自愈——源行携带 >60000 越界值
+	// 重试窗口上界自愈——源行携带 >60000 越界值
 	//（API/MCP/导入/直改 DB 落库的历史值）时，副本不得原样放大并命中新增
-	// 上界门 400 死端（与 历史修复 负值自愈同格；http/tcp 上界同值）。负值
+	// 上界门 400 死端（与负值自愈同格；http/tcp 上界同值）。负值
 	// 由下方 TCP 块按协议处理（http td=-1 是 NTLM 接管态合法哨兵）。
-	// 历史问题（历史）：interval 越界归零时 duration 同步归零——td>0+ti=0
+	// interval 越界归零时 duration 同步归零——td>0+ti=0
 	// 是渲染必填门的自相矛盾形态（保存成功但配置生成必败）。
 	if rule.TCPTryInterval > 60000 {
 		rule.TCPTryInterval = 0
@@ -3183,7 +3192,7 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 		rule.TCPTryDuration = 0
 	}
 
-	// 审计 历史问题 + 历史修复 + 历史问题：tcp-TLS / HTTP 专属死配置字段族归一
+	// 审计 + +：tcp-TLS / HTTP 专属死配置字段族归一
 	// 与 CreateRule/UpdateRule 共用同一 tcpDeadFieldReset 清单——源行遗留
 	// enable_tls=1/tls_source=acme_dns、tls_http_redirect、domain、
 	// upstream_force_http1 等死形态时，副本会原样携带（tcp 不终结入站 TLS、
@@ -3194,7 +3203,7 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 		// 进入保存门（TCP 分支对 len(PathRules)>0 显式 400）或复制到副本——
 		// hydrateRuleRelations 不按开关过滤，须在此显式清空。
 		rule.PathRules = []models.PathRule{}
-		// 历史修复 同族（历史修复 收敛）：负值重试窗口不喂进复制校验（td/ti 原样
+		// 同族：负值重试窗口不喂进复制校验（td/ti 原样
 		// 传入会让直改 DB 残留的 tcp 源行复制即 400 死端），也不放大到副本——
 		// 与 UpdateRule 最终协议 tcp 块负值自愈同格；非负窗口是合法 tcp 配置，
 		// 原样复制（http 源行 td=-1 是 NTLM 接管态，协议原样复制、不受此门）。
@@ -3205,19 +3214,19 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 			rule.TCPTryInterval = 0
 		}
 	} else if rule.Protocol == "http" {
-		// 历史问题：HTTP 方向反向归一——Create/Update 已清零 TCP-only
+		// HTTP 方向反向归一——Create/Update 已清零 TCP-only
 		// 字段（tcp_health_check_port/tcp_proxy_protocol），复制路径此前只处理
 		// TCP 源行，HTTP 源行的残留值被原样放大到副本。tcp_try_* 是 http/tcp
 		// 共用字段，不在此列。
 		rule.TCPProxyProtocol = false
 		rule.TCPHealthCheckPort = 0
 	}
-	// 历史问题：手动 TLS 源的残留 acme_config_id 不被消费——副本不放大该
+	// 手动 TLS 源的残留 acme_config_id 不被消费——副本不放大该
 	// 跨模式死引用（与 Create/Update/导入同口径；两协议同判）。
 	if rule.TLSSource == "manual" {
 		rule.ACMEConfigID = 0
 	}
-	// 历史修复（历史）：副本同样按生效来源清理跨模式残留——
+	// 副本同样按生效来源清理跨模式残留——
 	// 非 manual 不复制证书材料；非 acme_dns 不复制 CA 提供商引用。
 	if rule.TLSSource != "manual" {
 		rule.TLSCert, rule.TLSKey = "", ""
@@ -3226,11 +3235,11 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 		rule.CAProviderID = 0
 	}
 
-	// 历史问题（历史）：复制前把源行投影为共享保存输入并执行字段层校验
+	// 复制前把源行投影为共享保存输入并执行字段层校验
 	// （host/端口/权重/查重/健康检查/请求体大小）——坏上游/坏值不得原样
 	// 放大到副本，400 点名源规则。
 	if err := h.validateDuplicateRulePayload(rule); err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("源规则 %s（%s）：%s", rule.Name, caddyID, err.Error())})
+		fail(http.StatusBadRequest, fmt.Sprintf("源规则 %s（%s）：%s", rule.Name, caddyID, err.Error()))
 		return
 	}
 
@@ -3238,27 +3247,27 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 
 	newCaddyID, err := services.GenerateCaddyID()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "生成规则 ID 失败"})
+		fail(http.StatusInternalServerError, "生成规则 ID 失败")
 		return
 	}
 
 	nowTime := time.Now().UTC()
 	tx, err := db.DB.BeginTx(c.Request.Context(), nil)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "开启复制事务失败"})
+		fail(http.StatusInternalServerError, "开启复制事务失败")
 		return
 	}
 	committed := false
 	defer func() {
 		if !committed {
-			// 历史修复: 与 CreateRule/UpdateRule/DeleteRule 模式一致，回滚错误需记录。
+			// 与 CreateRule/UpdateRule/DeleteRule 模式一致，回滚错误需记录。
 			if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
 				services.Logf("error", "DuplicateRule transaction rollback failed: %v", rollbackErr)
 			}
 		}
 	}()
 
-	// 历史 历史修复: DuplicateRule 必须经过与 CreateRule 一致的校验。
+	// DuplicateRule 必须经过与 CreateRule 一致的校验。
 	enabledUpstreamCount := 0
 	upstreamHosts := make([]string, 0, len(rule.Upstreams))
 	for _, u := range rule.Upstreams {
@@ -3271,7 +3280,7 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 		Protocol: rule.Protocol, Strategy: rule.Strategy, DynamicDNS: rule.DynamicDNS,
 		EnableDnsServer: rule.EnableDnsServer, DnsServer: rule.DnsServer,
 		EnabledUpstreamCount: enabledUpstreamCount,
-		// 历史修复(历史):补 5 字段——历史修复 80 自环门与 历史修复 地址族门在复制
+		// 补 5 字段——80 自环门与地址族门在复制
 		// 路径此前因零值恒不触发(注释自述「与 CreateRule 一致」未兑现)。
 		ListenPort: rule.ListenPort, EnableTLS: rule.EnableTLS, TLSHTTPRedirect: rule.TLSHTTPRedirect,
 		EnabledUpstreamHosts: upstreamHosts, DnsFamily: rule.DnsFamily,
@@ -3285,29 +3294,29 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 		NTLMCompatible:           rule.NTLMCompatible,
 		UpstreamForceHTTP1:       rule.UpstreamForceHTTP1,
 		UpstreamKeepaliveTimeout: rule.UpstreamKeepaliveTimeout,
-		// 历史问题:TCP 三字段随负值门接入——复制路径与 CreateRule/UpdateRule 同校验
-		// (历史 历史修复 契约),不留绕行口。
+		// TCP 三字段随负值门接入——复制路径与 CreateRule/UpdateRule 同校验
+		// 不留绕行口。
 		TCPHealthCheckPort: rule.TCPHealthCheckPort,
 		TCPTryDuration:     rule.TCPTryDuration,
 		TCPTryInterval:     rule.TCPTryInterval,
 	}); err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "源规则配置不合法：" + err.Error()})
+		fail(http.StatusBadRequest, "源规则配置不合法："+err.Error())
 		return
 	}
 
-	// 历史问题 发现5 的 ACME 引用校验已由上方 validateDuplicateRulePayload →
+	// 发现5 的 ACME 引用校验已由上方 validateDuplicateRulePayload →
 	// validateRulePayloadBeforeSave（共享 validateRuleACMEReferences）覆盖并
-	// 点名源规则；：此处原有一次同条件/同文案的重复调用（永不
+	// 点名源规则；此处原有一次同条件/同文案的重复调用（永不
 	// 产生新结果，且重复查库），删除。
 
-	// 历史修复（历史）：源行启用上游池混布同检——保存门只拦新建/更新
+	// 源行启用上游池混布同检——保存门只拦新建/更新
 	// 载荷，复制是对存量混布行（69 轮修复前落库/直改 DB）的旁路放大通道。
 	if err := mixedUpstreamPoolError(rule); err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "源规则配置不合法：" + err.Error()})
+		fail(http.StatusBadRequest, "源规则配置不合法："+err.Error())
 		return
 	}
 
-	// 历史问题：INSERT 列清单与值投影走唯一事实源（services.LbRuleInsertSQL/
+	// INSERT 列清单与值投影走唯一事实源（services.LbRuleInsertSQL/
 	// LbRuleInsertArgs）——复制排除 id（AUTOINCREMENT 分配新主键），审计四列
 	// 按复制语义覆写（created_by/updated_by=操作者，created_at/updated_at=现在）。
 	duplicate := rule
@@ -3316,7 +3325,7 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 	// 规则文本长度上限：副本名累积后缀截断到上限内（源名可能已含后缀或接近上限）。
 	duplicate.Name = ruleDuplicateName(rule.Name)
 	if err := validateRuleTextLengths(duplicate.Name, rule.Description); err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("源规则 %s（%s）：%s", rule.Name, caddyID, err.Error())})
+		fail(http.StatusBadRequest, fmt.Sprintf("源规则 %s（%s）：%s", rule.Name, caddyID, err.Error()))
 		return
 	}
 	duplicate.Enabled = false
@@ -3327,20 +3336,20 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 	duplicateColumns := services.LbRuleInsertColumns("id")
 	if _, err := tx.Exec(services.LbRuleInsertSQL(duplicateColumns), services.LbRuleInsertArgs(&duplicate, duplicateColumns)...); err != nil {
 		services.Logf("error", "Failed to duplicate rule %s: %v", caddyID, err)
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "复制规则失败，已回滚: " + err.Error()})
+		fail(http.StatusInternalServerError, "复制规则失败，已回滚: "+err.Error())
 		return
 	}
 
-	// 历史问题: 同 UpdateRule——NULL enabled 行须 IIF 归一化（NULL 视同禁用），
+	// 同 UpdateRule——NULL enabled 行须 IIF 归一化（NULL 视同禁用），
 	// 复制出的新行显式落 0，避免裸 scan 500 与复制后意外启用。
-	// 历史问题（历史）：dynamic_dns 同列同病——legacy NULL 行裸 scan
+	// dynamic_dns 同列同病——legacy NULL 行裸 scan
 	// NULL→bool 报错恒 500，按 0 归一（遗留死列，渲染只读规则级值）。
 	upstreamRows, err := tx.Query(`
 		SELECT host, port, COALESCE(weight,1), COALESCE(dynamic_dns,0), IIF(enabled IN ('1',1),1,0), COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(origin_domain,'')
 		FROM upstreams WHERE rule_id = ?
 	`, caddyID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取上游失败，已回滚: " + err.Error()})
+		fail(http.StatusInternalServerError, "读取上游失败，已回滚: "+err.Error())
 		return
 	}
 	for upstreamRows.Next() {
@@ -3356,7 +3365,7 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 		}
 		if err := upstreamRows.Scan(&u.Host, &u.Port, &u.Weight, &u.DynamicDNS, &u.Enabled, &u.Protocol, &u.MaxConnections, &u.OriginDomain); err != nil {
 			upstreamRows.Close()
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "扫描上游失败，已回滚: " + err.Error()})
+			fail(http.StatusInternalServerError, "扫描上游失败，已回滚: "+err.Error())
 			return
 		}
 		if _, err := tx.Exec(`
@@ -3364,7 +3373,7 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`, newCaddyID, u.Host, u.Port, u.Weight, false /* dynamic_dns 废弃列：复制时归 0 */, u.Enabled, u.Protocol, u.MaxConnections, u.OriginDomain); err != nil {
 			upstreamRows.Close()
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "复制上游失败，已回滚: " + err.Error()})
+			fail(http.StatusInternalServerError, "复制上游失败，已回滚: "+err.Error())
 			return
 		}
 	}
@@ -3372,11 +3381,11 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 		if closeErr := upstreamRows.Close(); closeErr != nil {
 			services.Logf("error", "DuplicateRule failed to close upstream cursor for caddy_id=%s: %v", caddyID, closeErr)
 		}
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "遍历上游失败，已回滚: " + err.Error()})
+		fail(http.StatusInternalServerError, "遍历上游失败，已回滚: "+err.Error())
 		return
 	}
 	if err := upstreamRows.Close(); err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "关闭上游游标失败，已回滚: " + err.Error()})
+		fail(http.StatusInternalServerError, "关闭上游游标失败，已回滚: "+err.Error())
 		return
 	}
 
@@ -3385,7 +3394,7 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 		INSERT INTO path_rules (rule_id, sort_order, match_type, path, upstream_path, upstreams_json, response_mode, response_status, response_body, response_content_type, redirect_to, created_at, updated_at)
 		SELECT ?, sort_order, match_type, path, upstream_path, upstreams_json, response_mode, response_status, response_body, response_content_type, redirect_to, datetime('now'), datetime('now') FROM path_rules WHERE rule_id = ?
 		`, newCaddyID, caddyID); err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "复制路径规则失败，已回滚: " + err.Error()})
+			fail(http.StatusInternalServerError, "复制路径规则失败，已回滚: "+err.Error())
 			return
 		}
 	}
@@ -3393,25 +3402,25 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 	// 2026-09-20 用户裁定（样式批第 4 项）：副本携带安全策略绑定——不携带
 	// 会在「启用副本」时形成零防护静默缺口。同事务 INSERT SELECT（与上游/
 	// 路径规则复制同口径），成功消息明示携带数量。
-	// 历史问题：TCP 副本不复制绑定——TCP 渲染链零消费策略，复制只会把
+	// TCP 副本不复制绑定——TCP 渲染链零消费策略，复制只会把
 	// 存量惰性绑定放大到副本（复制路径与协议切换/导入同口径不自造惰性绑定）。
 	if rule.Protocol != "tcp" {
 		if _, err := tx.Exec(`
 			INSERT INTO security_policy_bindings (rule_caddy_id, policy_id)
 			SELECT ?, policy_id FROM security_policy_bindings WHERE rule_caddy_id = ?
 		`, newCaddyID, caddyID); err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "复制策略绑定失败，已回滚: " + err.Error()})
+			fail(http.StatusInternalServerError, "复制策略绑定失败，已回滚: "+err.Error())
 			return
 		}
 	}
 	var copiedBindings int
 	if err := tx.QueryRow(`SELECT COUNT(*) FROM security_policy_bindings WHERE rule_caddy_id = ?`, newCaddyID).Scan(&copiedBindings); err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取副本绑定失败，已回滚: " + err.Error()})
+		fail(http.StatusInternalServerError, "读取副本绑定失败，已回滚: "+err.Error())
 		return
 	}
 
 	if err := tx.Commit(); err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交复制事务失败: " + err.Error()})
+		fail(http.StatusInternalServerError, "提交复制事务失败: "+err.Error())
 		return
 	}
 	committed = true
@@ -3426,7 +3435,7 @@ func (h *Handlers) DuplicateRule(c *gin.Context) {
 
 // storedUpstream 是 upstreams 的现有行投影（仅收敛判定所需列；表无时间戳列，
 // 身份保留 = id 不重建 ⇒ 不触发行级同步触发器）。needsNormalize：存量行在
-// COALESCE/IIF 归一读覆盖的列上为 NULL（legacy 可空 schema 残留）——历史问题
+// COALESCE/IIF 归一读覆盖的列上为 NULL（legacy 可空 schema 残留）——
 // 契约要求保存后不再存在 NULL 行，此类行即使内容等价也必须原地 UPDATE 归一。
 type storedUpstream struct {
 	id             int
@@ -3442,7 +3451,7 @@ type storedUpstream struct {
 }
 
 // replaceUpstreamsTx 以「保留不变行」的方式收敛给定规则的上游集合（历史
-// 历史问题，镜像 replacePathRulesTx 三入口语义）。修复前 UpdateRule 恒 DELETE
+// 镜像 replacePathRulesTx 三入口语义）。修复前 UpdateRule 恒 DELETE
 // 全删 + INSERT：任何规则编辑（含纯改名）都重建全部上游行（id 递增），且恒
 // 触发行级同步触发器（upstreams 在集群版本矩阵内）→ 每次 UpdateRule 多一轮
 // 从端同步。现语义：
@@ -3499,7 +3508,7 @@ func replaceUpstreamsTx(ctx context.Context, tx *sql.Tx, ruleID string, upstream
 			continue
 		}
 		// ② 内容完全一致且无 NULL 残留 → 原样保留（零写入 ⇒ 不触发同步触发器）；
-		// needsNormalize 行落入 ③ 原地 UPDATE 归一（历史问题：保存后无 NULL 行）。
+		// needsNormalize 行落入 ③ 原地 UPDATE 归一。
 		if index := matchStoredUpstream(existing, consumed, incoming, true); index >= 0 {
 			consumed[index] = true
 			continue
@@ -3574,7 +3583,7 @@ func updateUpstreamTx(ctx context.Context, tx *sql.Tx, row, incoming storedUpstr
 // 一次 finishTxApply（单渲染）。非 http（tcp）规则跳过不 UPDATE——阶段页
 // 仅 http 渲染消费（与 batch-bind 同口径）。响应
 // {bound:n, unchanged:n, skipped:[{rule_id,reason}]}——bound=RowsAffected>0
-// 的真实变更数，unchanged=已在目标态的同值命中数（历史问题）。
+// 的真实变更数，unchanged=已在目标态的同值命中数。
 func (h *Handlers) BatchRuleBlockPages(c *gin.Context) {
 	var req struct {
 		RuleIDs               []string `json:"rule_ids"`
@@ -3594,7 +3603,7 @@ func (h *Handlers) BatchRuleBlockPages(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "rule_ids 不能为空"})
 		return
 	}
-	// 历史问题（历史）：trim+去重保序——重复 id 只处理一次（修复前逐个
+	// trim+去重保序——重复 id 只处理一次（修复前逐个
 	// UPDATE 并放大计数）；全空白视为空清单。
 	dedupedRuleIDs := make([]string, 0, len(req.RuleIDs))
 	seenRuleIDs := make(map[string]struct{}, len(req.RuleIDs))
@@ -3614,7 +3623,7 @@ func (h *Handlers) BatchRuleBlockPages(c *gin.Context) {
 		return
 	}
 	req.RuleIDs = dedupedRuleIDs
-	// 历史问题：规则条数上限——逐规则 UPDATE 在单事务/单锁内执行，
+	// 规则条数上限——逐规则 UPDATE 在单事务/单锁内执行，
 	// 请求体只受全局 128MB 上限约束，认证管理员可长时间占用 caddyOpMu。
 	const maxBatchRuleBlockPages = 500
 	if len(req.RuleIDs) > maxBatchRuleBlockPages {
@@ -3622,7 +3631,7 @@ func (h *Handlers) BatchRuleBlockPages(c *gin.Context) {
 		return
 	}
 	// 请求体读取/绑定已完成后再取全局写锁：慢速上传不得阻塞全部配置写
-	//（历史问题-03，与 handlers/caddy.go 的锁序契约一致）。
+	//（与 handlers/caddy.go 的锁序契约一致）。
 	h.caddyOpMu.Lock()
 	defer h.caddyOpMu.Unlock()
 	if err := validateStageBlockPageRef(req.BlockPageStage1ID, req.BlockPageStage1Status, "阶段 1（IP 访问控制/地域拦截）"); err != nil {
@@ -3656,7 +3665,7 @@ func (h *Handlers) BatchRuleBlockPages(c *gin.Context) {
 	bound := 0
 	unchanged := 0
 	skipped := make([]skippedRule, 0)
-	// 历史问题：一次 IN 预取协议，替代逐规则 SELECT（2N → N+1 次 SQL）。
+	// 一次 IN 预取协议，替代逐规则 SELECT（2N → N+1 次 SQL）。
 	placeholders := make([]string, len(req.RuleIDs))
 	prefetchArgs := make([]any, len(req.RuleIDs))
 	for i, ruleID := range req.RuleIDs {
@@ -3688,7 +3697,7 @@ func (h *Handlers) BatchRuleBlockPages(c *gin.Context) {
 		return
 	}
 	for _, ruleCaddyID := range req.RuleIDs {
-		// 历史问题:阶段页 4 列仅 http 渲染消费——非 http(tcp)先查后跳过不 UPDATE
+		// 阶段页 4 列仅 http 渲染消费——非 http(tcp)先查后跳过不 UPDATE
 		// (与 batch-bind 的 TCP 跳过同文案同口径),仅不存在记「规则不存在」。
 		ruleProtocol, exists := protocolByRule[ruleCaddyID]
 		if !exists {
@@ -3699,9 +3708,9 @@ func (h *Handlers) BatchRuleBlockPages(c *gin.Context) {
 			skipped = append(skipped, skippedRule{ruleCaddyID, "TCP 规则不经过安全链"})
 			continue
 		}
-		// 历史问题-13：同值守卫——四列已在目标态的行不匹配（IS NOT 空安全比较），
+		// 同值守卫——四列已在目标态的行不匹配（IS NOT 空安全比较），
 		// 同值批量零写入 ⇒ 不触发 lb_rules 行级同步触发器（阶段页四列在 OF 清单
-		// 内）；历史问题：bound 按 RowsAffected>0 计（真实变更），affected=0 即
+		// 内）；bound 按 RowsAffected>0 计（真实变更），affected=0 即
 		// 「已在目标态」计入 unchanged（不再把零写入算作成功/误判「规则不存在」）。
 		result, err := tx.ExecContext(c.Request.Context(), `UPDATE lb_rules SET block_page_stage1_id=?, block_page_stage1_status=?, block_page_stage3_id=?, block_page_stage3_status=?
 			WHERE caddy_id=? AND (block_page_stage1_id IS NOT ? OR block_page_stage1_status IS NOT ? OR block_page_stage3_id IS NOT ? OR block_page_stage3_status IS NOT ?)`,
@@ -3752,7 +3761,7 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取规则失败"})
 		return
 	}
-	// 历史问题：补偿需要恢复启用 UPDATE 改写前的原始域名/操作者——
+	// 补偿需要恢复启用 UPDATE 改写前的原始域名/操作者——
 	// ruleDomain 随后被规范化，原值必须单独留存。
 	originalDomain := ruleDomain
 	if ruleProtocol == "http" && ruleDomain != "" {
@@ -3775,13 +3784,13 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "预校验规则配置失败: " + err.Error()})
 		return
 	}
-	// 2026-09-07 裁定 历史修复：启用路径与保存路径同口径（叠加本进程真实管理口的
-	// 历史修复 层——包级校验只覆盖默认口 8000/2019）。
+	// 2026-09-07 裁定：启用路径与保存路径同口径（叠加本进程真实管理口的
+	// 层——包级校验只覆盖默认口 8000/2019）。
 	if err := h.validateRuleListenPortForSave(ruleProtocol, rulePort); err != nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "端口冲突，无法启用: " + err.Error()})
 		return
 	}
-	// 历史问题:同端口 TLS/明文混布拦截(启用方向)。
+	// 同端口 TLS/明文混布拦截(启用方向)。
 	if ruleProtocol == "http" {
 		if err := checkPortTLSMix(caddyID, rulePort, enableTLS); err != nil {
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "端口冲突，无法启用: " + err.Error()})
@@ -3818,7 +3827,7 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 			return
 		}
 	}
-	// 历史问题 协议门控——tcp 规则不终结 TLS，证书任务对 tcp 规则只会产生
+	// 协议门控——tcp 规则不终结 TLS，证书任务对 tcp 规则只会产生
 	// 永不消费的僵尸签发/续签（certJobRuleApplicable 仅查域名）。
 	isACME := ruleProtocol == "http" && enableTLS && tlsSource == "acme_dns" && ruleDomain != ""
 	var certJobsSnapshot services.CertJobsSnapshot
@@ -3848,6 +3857,19 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 		}
 	}()
 	userIDInt := contextUserID(c)
+	// 与编辑/复制同哲学：启用前在同事务内清除存量 TCP 死字段，
+	// 配置应用失败时归一与启用状态一并回滚。
+	if ruleProtocol == "tcp" {
+		if _, err := tx.ExecContext(c.Request.Context(), tcpRuleDeadFieldsResetForRuleSQL, caddyID); err != nil {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "启用规则失败"})
+			return
+		}
+		if _, err := tx.ExecContext(c.Request.Context(), `DELETE FROM path_rules WHERE rule_id = ?`, caddyID); err != nil {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "启用规则失败"})
+			return
+		}
+		ruleDomain = ""
+	}
 	if _, err := tx.Exec("UPDATE lb_rules SET enabled = 1, domain = ?, updated_at = datetime('now'), updated_by = ? WHERE caddy_id = ?", ruleDomain, userIDInt, caddyID); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "启用规则失败"})
 		return
@@ -3859,7 +3881,7 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 		return
 	}
 	if err := tx.Commit(); err != nil {
-		//  + 历史问题：commit 失败统一走已提交视图恢复
+		//  +：commit 失败统一走已提交视图恢复
 		//（回滚事务 + 重渲染 /load + 回退 LKG/投影/证书物化）。
 		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "提交规则启用失败: " + errors.Join(err, restoreErr).Error()})
@@ -3877,7 +3899,7 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 		if isACME {
 			caddyErr = h.restoreImportRuntime(runtimeSnapshot)
 		}
-		// 历史问题：补偿必须恢复启用 UPDATE 改写过的全部列——此前只恢复
+		// 补偿必须恢复启用 UPDATE 改写过的全部列——此前只恢复
 		// enabled，updated_at/updated_by 指向未生效的启用尝试，规范化域名也
 		// 被留在行上。
 		if _, dbErr = db.DB.Exec("UPDATE lb_rules SET enabled = ?, domain = ?, updated_by = ?, updated_at = COALESCE(NULLIF(?, ''), datetime('now')) WHERE caddy_id = ?",
@@ -3890,7 +3912,7 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 		return errors.Join(caddyErr, dbErr, jobsErr)
 	}
 	failEnableWithStatus := func(message string, status int) {
-		// 历史问题：启用端点为 Explicit 审计策略，中间件不兜底；此前
+		// 启用端点为 Explicit 审计策略，中间件不兜底；此前
 		// 提交后的失败（CA 解析/任务读取/Resume 0 行等）只回滚无操作审计，
 		// 运维无法追溯谁在何时启用了哪条规则以及失败原因。
 		if restoreErr := restoreEnabledState(); restoreErr != nil {
@@ -3905,7 +3927,7 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 		c.JSON(status, models.APIResponse{Code: status, Message: message})
 	}
 	failEnable := func(message string) { failEnableWithStatus(message, http.StatusInternalServerError) }
-	// 历史问题-05：入队失败按错误种类定状态（证书签发任务未运行 → 409）。
+	// 入队失败按错误种类定状态（证书签发任务未运行 → 409）。
 	failCertEnqueue := func(prefix string, enqueueErr error) {
 		status, message := certEnqueueErrorResponse(prefix, enqueueErr)
 		failEnableWithStatus(message, status)
@@ -3940,8 +3962,8 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 			failEnable("读取证书任务失败")
 			return
 		}
-		// 历史问题（历史）：续期天数读取单源（services.GetCertRenewalDays）——
-		// 无效值降级与 error 级留痕统一由 helper 承担（历史修复 的 <=0 兜底语义
+		// 续期天数读取单源（services.GetCertRenewalDays）——
+		// 无效值降级与 error 级留痕统一由 helper 承担（<=0 兜底语义
 		// 保持：helper 对 <=0 返回默认 30 并留痕）。
 		renewalDays := services.GetCertRenewalDays()
 		var expiryPtr *time.Time
@@ -3979,7 +4001,7 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 			if enableCertJobResumePreUpdateHook != nil {
 				enableCertJobResumePreUpdateHook(jobID)
 			}
-			// 历史问题 UPDATE 无状态 CAS，任何未来在上方 SELECT 与此处之间
+			// UPDATE 无状态 CAS，任何未来在上方 SELECT 与此处之间
 			// 删除行的路径都会 0 行命中，「启用成功但任务行不存在、续签链断」
 			// 被审计文案掩盖——核对 RowsAffected==1，否则按失败补偿。
 			resumeResult, err := db.DB.Exec("UPDATE cert_jobs SET status='issued', message='证书有效，已恢复使用', renewal_attempts=0, ca_available_after=NULL, last_error_code=NULL, updated_at=datetime('now') WHERE id=?", jobID)
@@ -3992,12 +4014,12 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 				failEnable("恢复证书任务失败：任务行不存在或已被并发变更")
 				return
 			}
-			// 历史问题 Resume 把 'disabled'→'issued' 发生在 ApplyConfigFromTx 之后——
+			// Resume 把 'disabled'→'issued' 发生在 ApplyConfigFromTx 之后——
 			// 渲染时双层过滤（caddy.go SQL status!='disabled' + certselector 跳过 disabled）
 			// 使已应用配置缺 TLS/301/证书文件，且 needJob 被 Resume 抑制不再触发任何
 			// re-apply，看门狗只查路由存在性——静默失配无上界。此处已提交视图=规则启用
 			// +job issued，立即重渲染重应用使 TLS 恢复；失败走既有 failEnable 补偿
-			//（enabled=0 + certJobsSnapshot 恢复 + 运行时快照恢复）。历史问题
+			//（enabled=0 + certJobsSnapshot 恢复 + 运行时快照恢复）。
 			// 强制变体 + recordCaddyApplyResult（已持 caddyOpMu，不可用
 			// applyCaddyConfigE——重入死锁）。
 			reapplyErr := h.caddyService.GenerateAndApplyConfigForceInLock() // 已持锁——InLock 变体防重入死锁
@@ -4039,9 +4061,9 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "规则已启用"})
 }
 
-// upstreamWeightPresenceProbe 区分「省略 weight」与「显式 0」（历史修复）：
+// upstreamWeightPresenceProbe 区分「省略 weight」与「显式 0」
 // typed 绑定把省略解码为 0，与显式 0 不可分——省略须落默认 1（与导入侧
-// 缺键→schema DEFAULT 1 同口径，config_backup.go 历史修复 门），显式 0/负值
+// 缺键→schema DEFAULT 1 同口径，config_backup.go 门），显式 0/负值
 // 留给 validateRuleUpstreams 响亮 400。
 type upstreamWeightPresenceProbe struct {
 	Upstreams []struct {
@@ -4071,9 +4093,9 @@ func applyOmittedUpstreamWeightDefaults(c *gin.Context, upstreams []models.Upstr
 }
 
 // executingACMEJobStatuses 派生「执行中/CA 往返在途」cert_jobs 状态集
-// （历史问题 收窄裁定 2026-10-19）：规范枚举（db.CertJobStatuses 单源）减去
+// （收窄裁定 2026-10-19）：规范枚举（db.CertJobStatuses 单源）减去
 // 终态（issued/failed/disabled）与未起动行（queued/pending）——未起动行
-// 维持历史修复「删除+取消+200」语义，在途行才在 orphanACME 删除前 409。
+// 维持「删除+取消+200」语义，在途行才在 orphanACME 删除前 409。
 // 逐调用计算：枚举极小（26 项），UpdateRule 非热路径，避免包级缓存漂移。
 func executingACMEJobStatuses() []string {
 	excluded := map[string]bool{"queued": true, "pending": true, "issued": true, "failed": true, "disabled": true}
@@ -4087,10 +4109,10 @@ func executingACMEJobStatuses() []string {
 }
 
 // disableCertJobsForRuleTx 是「规则禁用/停用」暂停证书任务的单源写点
-// （历史问题）：UpdateRule（PUT enabled=false 同语义入口）与 DisableRule
+// UpdateRule（PUT enabled=false 同语义入口）与 DisableRule
 // 原两份手写 UPDATE 谓词漂移——前者 status<>'disabled' 会把 failed 终态行
 // 改写为 disabled 抹掉失败史实；统一为 NOT IN ('failed','disabled')，与
-// config_backup.go pauseCertJobsForImportDisabledRule（历史问题 导入冲突
+// config_backup.go pauseCertJobsForImportDisabledRule（导入冲突
 // 暂停）谓词逐字一致。返回受影响行数；审计/日志由调用方负责。
 func disableCertJobsForRuleTx(tx *sql.Tx, caddyID string) (int64, error) {
 	result, err := tx.Exec(`UPDATE cert_jobs SET status='disabled', message='规则已禁用，任务已暂停', updated_at=datetime('now') WHERE rule_id=? AND status NOT IN ('failed','disabled')`, caddyID)
@@ -4104,7 +4126,7 @@ func disableCertJobsForRuleTx(tx *sql.Tx, caddyID string) (int64, error) {
 	return rowsAffected, nil
 }
 
-// ruleExistsByCaddyID 报告规则行是否仍存在（历史修复 的放锁窗口复核用）。
+// ruleExistsByCaddyID 报告规则行是否仍存在。
 func ruleExistsByCaddyID(caddyID string) (bool, error) {
 	var count int
 	if err := db.DB.QueryRow("SELECT COUNT(1) FROM lb_rules WHERE caddy_id = ?", caddyID).Scan(&count); err != nil {
@@ -4148,8 +4170,7 @@ var (
 // upstreams + path_rules 三面的完整投影。map 序列化由 encoding/json 按键名
 // 排序；关系行按 id 排序。用于判定主动放锁窗口内是否有人提交了对同一规则的
 // 修改（本请求提交后的指纹为基线）。
-func ruleMutationFingerprint(caddyID string) (string, error) {
-	ctx := context.Background()
+func ruleMutationFingerprint(ctx context.Context, caddyID string) (string, error) {
 	ruleRow, err := dumpRowByKey(ctx, "lb_rules", "caddy_id", caddyID)
 	if err != nil {
 		return "", err
@@ -4193,7 +4214,7 @@ func ruleMutationFingerprint(caddyID string) (string, error) {
 // 指纹读取失败时不判定（返回 false，维持既有恢复链语义）。
 // 返回 true 表示已写出错误响应，调用方必须立即 return。
 func abortIfRuleConcurrentlyModified(c *gin.Context, caddyID, baseline string) bool {
-	current, err := ruleMutationFingerprint(caddyID)
+	current, err := ruleMutationFingerprint(c.Request.Context(), caddyID)
 	if err != nil {
 		services.Logf("error", "UpdateRule: 复核规则并发修改失败 for caddy_id=%s: %v", caddyID, err)
 		return false
@@ -4262,7 +4283,7 @@ func (h *Handlers) DisableRule(c *gin.Context) {
 	}
 	var disabledJobs int64
 	if enableTLS && tlsSource == "acme_dns" && domain != "" {
-		// 谓词经 disableCertJobsForRuleTx 单源（历史问题）——与 UpdateRule
+		// 谓词经 disableCertJobsForRuleTx 单源——与 UpdateRule
 		// 禁用入口/config_backup 导入冲突暂停同口径，failed 终态行保留。
 		var derr error
 		disabledJobs, derr = disableCertJobsForRuleTx(tx, caddyID)
@@ -4278,7 +4299,7 @@ func (h *Handlers) DisableRule(c *gin.Context) {
 		return
 	}
 	if err := tx.Commit(); err != nil {
-		//  + 历史问题：commit 失败统一走已提交视图恢复
+		//  +：commit 失败统一走已提交视图恢复
 		//（回滚事务 + 重渲染 /load + 回退 LKG/投影/证书物化）。
 		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
 		// 提交后失败审计：提交失败留痕（Explicit 审计策略）。

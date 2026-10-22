@@ -13,8 +13,8 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 历史修复 新发现1 公共夹具：备份内一条启用 TLS 的 http 规则行，tls_source 由用例注入。
-func r54BackupTLSRule(tlsSource any) map[string]any {
+// 公共夹具：备份内一条启用 TLS 的 http 规则行，tls_source 由用例注入。
+func backupTLSRuleShared(tlsSource any) map[string]any {
 	return map[string]any{
 		"caddy_id": "lb_bak_tls", "name": "bak-tls", "protocol": "http",
 		"domain": "bak-tls.example.test", "listen_port": 8472,
@@ -23,11 +23,11 @@ func r54BackupTLSRule(tlsSource any) map[string]any {
 	}
 }
 
-// 历史修复 新发现1：v2 备份校验必须对 enabled+http+enable_tls 行的 tls_source 做白名单
+// v2 备份校验必须对 enabled+http+enable_tls 行的 tls_source 做白名单
 // （manual/acme_dns）——空串/垃圾值（如 'https'）此前两个分支都不命中、整包放行，
 // 导入后渲染侧 availableCerts 仅认 manual/acme_dns，该规则无证书 → TLS 端口明文服务。
 // 保存侧（rules.go）与启用侧（rule_features.go:697-699）均 400 此形态，导入不得更宽。
-// 历史修复：TLS 形态校验迁至 validateV2BackupTLSShape（冲突置禁用之后执行）。
+// TLS 形态校验迁至 validateV2BackupTLSShape（冲突置禁用之后执行）。
 func TestValidateV2BackupTLSShape_rejects_unknown_tls_source(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -45,7 +45,7 @@ func TestValidateV2BackupTLSShape_rejects_unknown_tls_source(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			newBackupTestHandlers(t)
-			rule := r54BackupTLSRule(tt.tlsSource)
+			rule := backupTLSRuleShared(tt.tlsSource)
 			if !tt.injectKey {
 				delete(rule, "tls_source")
 			}
@@ -66,24 +66,24 @@ func TestValidateV2BackupTLSShape_rejects_unknown_tls_source(t *testing.T) {
 	}
 }
 
-// 历史修复 新发现1 对照组：禁用行 tls_source 为垃圾值不阻断导入（不参与渲染），
-// 与 历史修复 矩阵「禁用的 acme_dns 坏行不阻断导入」同口径。
-// 历史修复：TLS 形态校验迁至 validateV2BackupTLSShape（冲突置禁用之后执行）。
+// 对照组：禁用行 tls_source 为垃圾值不阻断导入（不参与渲染），
+// 与矩阵「禁用的 acme_dns 坏行不阻断导入」同口径。
+// TLS 形态校验迁至 validateV2BackupTLSShape（冲突置禁用之后执行）。
 func TestValidateV2BackupTLSShape_allows_disabled_rule_with_unknown_tls_source(t *testing.T) {
 	newBackupTestHandlers(t)
-	rule := r54BackupTLSRule("")
+	rule := backupTLSRuleShared("")
 	rule["enabled"] = 0
 	if err := validateV2BackupTLSShape(map[string][]map[string]any{"lb_rules": {rule}}); err != nil {
 		t.Fatalf("validateV2BackupTLSShape unexpected error: %v", err)
 	}
 }
 
-// 历史修复 新发现1（acme_dns 合法值仍走原有校验）：合法 acme_dns 行不因白名单误伤。
-// 历史修复：TLS 形态校验迁至 validateV2BackupTLSShape（冲突置禁用之后执行）。
+// （acme_dns 合法值仍走原有校验）：合法 acme_dns 行不因白名单误伤。
+// TLS 形态校验迁至 validateV2BackupTLSShape（冲突置禁用之后执行）。
 func TestValidateV2BackupTLSShape_allows_valid_acme_dns_row(t *testing.T) {
 	newBackupTestHandlers(t)
 	tables := map[string][]map[string]any{
-		"lb_rules":            {r53BackupACMERule(7)},
+		"lb_rules":            {backupACMERuleShared(7)},
 		"certificate_configs": {{"id": 7, "name": "dns", "enabled": 1}},
 		"cert_jobs":           {{"rule_id": "lb_bak_acme", "domain": "bak-acme.example.test", "status": "queued"}},
 	}
@@ -95,20 +95,20 @@ func TestValidateV2BackupTLSShape_allows_valid_acme_dns_row(t *testing.T) {
 	}
 }
 
-// 历史修复 新发现3 公共夹具：合法引用 + 可注入任务行的备份表。
-func r54ACMEJobTables(jobDomain, jobStatus string) map[string][]map[string]any {
+// 公共夹具：合法引用 + 可注入任务行的备份表。
+func acmeJobTablesShared(jobDomain, jobStatus string) map[string][]map[string]any {
 	jobs := []map[string]any{}
 	if jobStatus != "" {
 		jobs = append(jobs, map[string]any{"rule_id": "lb_bak_acme", "domain": jobDomain, "status": jobStatus})
 	}
 	return map[string][]map[string]any{
-		"lb_rules":            {r53BackupACMERule(7)},
+		"lb_rules":            {backupACMERuleShared(7)},
 		"certificate_configs": {{"id": 7, "name": "dns", "enabled": 1}},
 		"cert_jobs":           jobs,
 	}
 }
 
-// 历史修复 新发现3：cert_jobs 不变量必须校验 job.domain 与规则域名一致（canonical 或
+// cert_jobs 不变量必须校验 job.domain 与规则域名一致（canonical 或
 // reversed 双形式）——错域残留行此前只凭存在性放行，导入后续签扫描按
 // rule_id+domain 精确匹配永不命中，续签断链与「无任务行」同果。
 func TestValidateV2BackupCertJobs_domain_matching(t *testing.T) {
@@ -118,32 +118,32 @@ func TestValidateV2BackupCertJobs_domain_matching(t *testing.T) {
 		wantErrText string
 	}{
 		{
-			name:        "缺少任务行被拒绝（历史修复 迁入）",
-			tables:      r54ACMEJobTables("", ""),
+			name:        "缺少任务行被拒绝（迁入）",
+			tables:      acmeJobTablesShared("", ""),
 			wantErrText: "缺少证书签发任务",
 		},
 		{
-			name:        "任务行全部 disabled 被拒绝（历史修复 迁入）",
-			tables:      r54ACMEJobTables("bak-acme.example.test", "disabled"),
+			name:        "任务行全部 disabled 被拒绝（迁入）",
+			tables:      acmeJobTablesShared("bak-acme.example.test", "disabled"),
 			wantErrText: "缺少证书签发任务",
 		},
 		{
 			name:        "错域任务行被拒绝",
-			tables:      r54ACMEJobTables("other.example.test", "queued"),
+			tables:      acmeJobTablesShared("other.example.test", "queued"),
 			wantErrText: "域名",
 		},
 		{
 			name:   "规范域名任务行放行",
-			tables: r54ACMEJobTables("bak-acme.example.test", "queued"),
+			tables: acmeJobTablesShared("bak-acme.example.test", "queued"),
 		},
 		{
 			name:   "大小写/空白变体任务行放行（与续签扫描 lower+replace 口径一致）",
-			tables: r54ACMEJobTables("BAK-ACME.example.test ", "queued"),
+			tables: acmeJobTablesShared("BAK-ACME.example.test ", "queued"),
 		},
 		{
 			name: "错域行 + 匹配行并存被拒绝",
 			tables: func() map[string][]map[string]any {
-				tables := r54ACMEJobTables("other.example.test", "queued")
+				tables := acmeJobTablesShared("other.example.test", "queued")
 				tables["cert_jobs"] = append(tables["cert_jobs"], map[string]any{"rule_id": "lb_bak_acme", "domain": "bak-acme.example.test", "status": "issued", "cert_pem": "CERT", "key_pem": "KEY"})
 				return tables
 			}(),
@@ -170,12 +170,12 @@ func TestValidateV2BackupCertJobs_domain_matching(t *testing.T) {
 	}
 }
 
-// 历史修复 新发现3（双形式）：规则域名为用户输入顺序、任务行存排序规范形式（或反之）
+// （双形式）：规则域名为用户输入顺序、任务行存排序规范形式（或反之）
 // 时，canonical/reversed 双形式匹配必须放行——与 certjobs.go 规则侧
 // joined+reversed 双形式匹配同型。
 func TestValidateV2BackupCertJobs_accepts_reversed_dual_domain(t *testing.T) {
 	newBackupTestHandlers(t)
-	rule := r53BackupACMERule(7)
+	rule := backupACMERuleShared(7)
 	rule["domain"] = "www.bak-acme.example.test,bak-acme.example.test"
 	tables := map[string][]map[string]any{
 		"lb_rules":            {rule},
@@ -188,17 +188,17 @@ func TestValidateV2BackupCertJobs_accepts_reversed_dual_domain(t *testing.T) {
 	}
 }
 
-// 历史修复 新发现2：将被 disableV2RuleConflicts 自动置禁用的冲突规则不参与运行态
+// 将被 disableV2RuleConflicts 自动置禁用的冲突规则不参与运行态
 // 不变量——冲突集内规则导入后处于禁用态，「带入运行态」前提不成立，缺任务行
 // 不得整包 400。
 func TestValidateV2BackupCertJobs_skips_conflict_disabled_rules(t *testing.T) {
 	newBackupTestHandlers(t)
-	ruleA := r53BackupACMERule(7)
+	ruleA := backupACMERuleShared(7)
 	ruleA["caddy_id"] = "lb_bak_conflict_a"
 	ruleA["name"] = "bak-conflict-a"
 	ruleA["domain"] = "bak-conflict.example.test"
 	ruleA["listen_port"] = 8473
-	ruleB := r53BackupACMERule(7)
+	ruleB := backupACMERuleShared(7)
 	ruleB["caddy_id"] = "lb_bak_conflict_b"
 	ruleB["name"] = "bak-conflict-b"
 	ruleB["domain"] = "bak-conflict.example.test"
@@ -217,7 +217,7 @@ func TestValidateV2BackupCertJobs_skips_conflict_disabled_rules(t *testing.T) {
 	}
 }
 
-// 历史修复 新发现2（handler 级）：冲突将被自动置禁用的启用 acme_dns 规则即使无
+// （handler 级）：冲突将被自动置禁用的启用 acme_dns 规则即使无
 // cert_jobs 行，导入也必须成功且规则落库为禁用——此前不变量先于冲突置禁用
 // 执行，整包 400 过严拒绝可自愈备份。
 func TestImportConfigBackup_conflict_disabled_acme_rule_without_cert_job(t *testing.T) {
@@ -226,12 +226,12 @@ func TestImportConfigBackup_conflict_disabled_acme_rule_without_cert_job(t *test
 	if _, err := db.DB.Exec("INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (1,'current-admin','hash','admin',1)"); err != nil {
 		t.Fatalf("seed current admin: %v", err)
 	}
-	ruleA := r53BackupACMERule(7)
+	ruleA := backupACMERuleShared(7)
 	ruleA["caddy_id"] = "lb_bak_conflict_a"
 	ruleA["name"] = "bak-conflict-a"
 	ruleA["domain"] = "bak-conflict.example.test"
 	ruleA["listen_port"] = 8473
-	ruleB := r53BackupACMERule(7)
+	ruleB := backupACMERuleShared(7)
 	ruleB["caddy_id"] = "lb_bak_conflict_b"
 	ruleB["name"] = "bak-conflict-b"
 	ruleB["domain"] = "bak-conflict.example.test"
@@ -265,17 +265,17 @@ func TestImportConfigBackup_conflict_disabled_acme_rule_without_cert_job(t *test
 	}
 }
 
-// 历史修复 新发现2（预览路径）：ValidateConfigImport 必须与 ImportConfigBackup 同序——
+// （预览路径）：ValidateConfigImport 必须与 ImportConfigBackup 同序——
 // 冲突置禁用后的规则不参与任务不变量，预览显示可导入且携带 disabled_conflicts。
 func TestValidateConfigImport_conflict_disabled_acme_rule_without_cert_job(t *testing.T) {
 	// Given
 	h := newBackupTestHandlers(t)
-	ruleA := r53BackupACMERule(7)
+	ruleA := backupACMERuleShared(7)
 	ruleA["caddy_id"] = "lb_bak_conflict_a"
 	ruleA["name"] = "bak-conflict-a"
 	ruleA["domain"] = "bak-conflict.example.test"
 	ruleA["listen_port"] = 8473
-	ruleB := r53BackupACMERule(7)
+	ruleB := backupACMERuleShared(7)
 	ruleB["caddy_id"] = "lb_bak_conflict_b"
 	ruleB["name"] = "bak-conflict-b"
 	ruleB["domain"] = "bak-conflict.example.test"
@@ -304,7 +304,7 @@ func TestValidateConfigImport_conflict_disabled_acme_rule_without_cert_job(t *te
 	}
 }
 
-// 历史修复 新发现4：聚合校验错误映射——纯 configValidationError 聚合保持 400 且
+// 聚合校验错误映射——纯 configValidationError 聚合保持 400 且
 // 展示全部规则问题；混入普通错误（DB 故障等）时必须映射 500 通用文案并
 // 不外泄底层错误文本，避免客户端把服务端故障误判为配置问题。
 func TestWriteConfigValidationFailure_status_mapping(t *testing.T) {

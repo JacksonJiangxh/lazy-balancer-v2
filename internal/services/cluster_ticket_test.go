@@ -114,7 +114,7 @@ func TestClusterLoginTicketDatabaseFailureDoesNotConsumeTicket(t *testing.T) {
 }
 
 func TestGenerateLoginTicketRejectsStaleApprovedNode(t *testing.T) {
-	// 历史修复 票据门：nodes.status 只在注册/上报时写入、从不回写 'offline'，
+	// 票据门：nodes.status 只在注册/上报时写入、从不回写 'offline'，
 	// 陈旧 status='online' 不得再放行签发——已停止上报（last_seen 超过
 	// 2×sync_interval）的从节点按 ComputeNodeStatus 动态判定拒绝；恢复
 	// 上报后放行（判定依据 last_seen 而非陈旧列）。
@@ -125,7 +125,7 @@ func TestGenerateLoginTicketRejectsStaleApprovedNode(t *testing.T) {
 		t.Fatal(err)
 	}
 	claims := models.ClusterLoginTicketClaims{UserID: 3, Username: "alice", NodeID: 9}
-	// 历史问题：已批准但长期未上报=离线，返回 ErrNodeOffline（handler 409，
+	// 已批准但长期未上报=离线，返回 ErrNodeOffline（handler 409，
 	// 可行动文案）；未批准/无 keyHash 仍为 ErrNodeNotFound（404）。
 	if _, err := service.GenerateLoginTicket(context.Background(), claims, now); !errors.Is(err, ErrNodeOffline) {
 		t.Fatalf("stale node error=%v, want ErrNodeOffline", err)

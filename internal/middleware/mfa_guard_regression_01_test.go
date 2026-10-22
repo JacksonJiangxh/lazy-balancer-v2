@@ -14,7 +14,7 @@ import (
 	jwt "github.com/golang-jwt/jwt/v5"
 )
 
-// 历史修复 回归绊线：mfaStepUpGuard 的 428 行为——此前 auth_type 从未被 jwtAuth
+// 回归绊线：mfaStepUpGuard 的 428 行为——此前 auth_type 从未被 jwtAuth
 // 设置 + GetString 读 float64 user_id 双缺陷使守卫整体死代码（单测全绿掩盖）。
 // 本测试让真实 JWT 穿过完整认证链。
 func TestMFAStepUpGuard_endToEnd(t *testing.T) {
@@ -60,7 +60,7 @@ func TestMFAStepUpGuard_endToEnd(t *testing.T) {
 		router.ServeHTTP(rec, req)
 		return rec.Code
 	}
-	// 历史修复 十六次：/config/preview 已是只读语义 POST（被豁免），写探针改用 PUT /config。
+	// /config/preview 已是只读语义 POST（被豁免），写探针改用 PUT /config。
 	put := func(path, token string) int {
 		req := httptest.NewRequest(http.MethodPut, path, nil)
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -92,7 +92,7 @@ func TestMFAStepUpGuard_endToEnd(t *testing.T) {
 		t.Fatalf("fresh mfa_ts must pass, got %d", code)
 	}
 
-	// Case 5（历史修复 十六次）：只读语义 POST（readOnlyWriteRoutes：批量证书状态
+	// Case 5：只读语义 POST（readOnlyWriteRoutes：批量证书状态
 	// 查询/测试/预览）即使 mfa_ts 过期也不弹码——用户打开规则列表页不该被要求验证。
 	if code := post("/api/v1/rules/cert-info", tokenOld); code == http.StatusPreconditionRequired {
 		t.Fatal("read-semantics POST (cert-info) must be exempt from step-up（打开列表页不弹码）")

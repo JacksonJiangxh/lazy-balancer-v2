@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// 历史问题（历史·漂移横幅事故）：启动「0 规则应用」守卫的探测面——
+// 启动「0 规则应用」守卫的探测面——
 // 运行配置含规则路由时，空库实例不得在启动时把空配置 /load 进该 Caddy。
 
 func TestRunningConfigHasRuleRoutes(t *testing.T) {

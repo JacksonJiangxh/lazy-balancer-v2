@@ -5,7 +5,7 @@ import type { APIResponse } from '@/types'
 import { usePollingTask } from '@/composables/usePollingTask'
 
 /**
- * 规则库更新弹框单一范式（历史问题，收敛 SecurityRules 三处近逐字重复的
+ * 规则库更新弹框单一范式（收敛 SecurityRules 三处近逐字重复的
  * CRS / IP2Region / 威胁情报库更新弹框逻辑）：可见性 + 状态/日志双拉取 +
  * 触发更新（409=任务已在跑，吞并后直接轮询进度）+ 2s 轮询 + 日志滚底。
  *
@@ -45,10 +45,10 @@ export function useLibUpdateDialog<TInfo>(options: UseLibUpdateDialogOptions<TIn
 
   const updating = computed(() => options.isRunning(status.value))
 
-  // 历史问题④:手写 setInterval → usePollingTask(后台标签页暂停/自动清理)。
-  // 历史问题:弹框会话级暂停(非终态)——stop 会永久 disposed,重开弹框即失效;
+  // 手写 setInterval → usePollingTask(后台标签页暂停/自动清理)。
+  // 弹框会话级暂停(非终态)——stop 会永久 disposed,重开弹框即失效;
   // 组件卸载的终态清理由 usePollingTask 内置 onUnmounted 兜底。
-  // 历史问题（409 重复轮询）：onOpened / confirmUpdate 都是先 await refreshStatus()
+  // （409 重复轮询）：onOpened / confirmUpdate 都是先 await refreshStatus()
   // 再起轮询——若 startPolling 走 resume()（start + 立即 run），同一轮 status+logs
   // 会被立刻重复请求一次（409=任务已在跑路径每次点击都翻倍）。start() 只挂 2s
   // 定时器，下一轮交给定时器；刚拉过的状态不重复拉。
@@ -127,7 +127,7 @@ export function useLibUpdateDialog<TInfo>(options: UseLibUpdateDialogOptions<TIn
     if (!visible.value) return
     await refreshStatus()
     if (!visible.value) return
-    // 历史问题：refreshStatus 在终态时已 stopPolling + onSuccess——若本次状态已是
+    // refreshStatus 在终态时已 stopPolling + onSuccess——若本次状态已是
     // 终态成功（409 且任务刚好完成 / 任务瞬时完成），无条件 startPolling 会让 2s
     // 后的下一轮再判终态、onSuccess 二次执行（重复 fetchCRS/fetchRules 等）。
     // 与 onOpened 同口径：仅「任务仍在运行」或「状态未取到」（status=null，

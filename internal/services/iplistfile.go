@@ -12,7 +12,7 @@ import (
 	"lazy-balancer-v2/wafiplist"
 )
 
-// init 装配 wafiplist 的 fail-stale 观测钩子（历史问题，历史）：运行期
+// init 装配 wafiplist 的 fail-stale 观测钩子：运行期
 // 名单文件被删/写坏、重建失败而回退旧集合时，按路径节流（wafiplist.
 // StaleServeLogInterval，默认 1 分钟）写 WARN。wafiplist 的默认钩子只写
 // stderr（Caddy 进程内的形态）；本进程覆盖为面板日志，级别过滤与落盘一致。
@@ -35,7 +35,7 @@ var IPListDataDir = "/app/waf/ip-lists"
 // 播种/更新写出数据卷之外、SecurityLibraryStatus 恒 false（安全链静默
 // 不渲染）。派生覆盖 CRSRuleIndexDir（索引读侧）与 crsDirectivesDir
 // （渲染读侧），保证写读同源。算子白名单前缀同步对齐。
-// 历史问题-08：派生面同时含 Coraza 审计日志（<parent>/logs/waf-audit/audit.log）
+// 派生面同时含 Coraza 审计日志（<parent>/logs/waf-audit/audit.log）
 // 与摄取 offset（<data_dir>/security_events.offset）——此前两者硬编码 /app，
 // 非容器/自定义挂载部署会写到只读或错误的路径。
 func ConfigureWafDirs(dataDir string) {
@@ -60,7 +60,7 @@ func ConfigureWafDirs(dataDir string) {
 	// 爬虫运行快照（root 写、插件读的交换文件）同属数据卷
 	// 派生面——默认 /app/data/crawler-ip-lists.json 与容器形态逐字节一致。
 	crawlerIPListFile = filepath.Join(dataDir, "crawler-ip-lists.json")
-	// 历史问题-08（历史）：Coraza 审计日志与摄取 offset 同属「随 data_dir
+	// Coraza 审计日志与摄取 offset 同属「随 data_dir
 	// 落数据卷/日志根」的路径域，必须与上列路径同批派生——此前硬编码 /app：
 	// 自定义 data_dir 的非容器部署会继续读写 /app（常不可写）→ 摄取持续失败、
 	// WAF 审计写入失败。日志根取数据目录同级的 logs/（与容器
@@ -92,7 +92,7 @@ func EnsureIPListDir() error {
 // 内容变化同路径原子换内容（配置字节不变，@ipListFast 匹配器 ≤1s stat 热感
 // 知——名单写路径零 /load 收敛的机制基础）。写失败返回 error——经渲染错误
 // 链路上报（保存侧事务回滚，fail-closed）。成功投影的路径计入本轮渲染引用
-// 集（GC 差集口径）。GC 不在此触发（历史 历史问题）：渲染中途按上一
+// 集（GC 差集口径）。GC 不在此触发：渲染中途按上一
 // 轮陈旧引用集差集会误删在役文件——统一由整轮渲染 apply 成功后触发
 // （maybeGCStaleIPListFiles，引用集落齐再差集；全部阈值为 time.Since 时长
 // 比较，无挂钟排程、与时区配置无关）。
@@ -141,7 +141,7 @@ func writeIPListFile(scope string, merged []string) (string, error) {
 	if err := EnsureIPListDir(); err != nil {
 		return "", err
 	}
-	// 唯一临时名（历史问题）：并发渲染同一 scope 命中同一正式路径时，
+	// 唯一临时名：并发渲染同一 scope 命中同一正式路径时，
 	// CreateTemp 使每次写入独占临时文件，rename 串行原子生效。失败路径清理
 	// 临时文件。
 	tmp, err := os.CreateTemp(IPListDataDir, scope+"-*.tmp")
@@ -154,7 +154,7 @@ func writeIPListFile(scope string, merged []string) (string, error) {
 		_ = os.Remove(tmpName)
 		return "", fmt.Errorf("写入 IP 名单文件失败 %s: %w", name, err)
 	}
-	// 历史问题：tmp+rename 缺 fsync 时掉电/内核崩溃可留下 0 字节投影文件——
+	// tmp+rename 缺 fsync 时掉电/内核崩溃可留下 0 字节投影文件——
 	// wafiplist 对空文件按「永不命中」接受，deny/blacklist 语义即静默 fail-open。
 	// 与 certstore 的原子写同口径：临时文件落盘 + 父目录 fsync 后 rename 生效。
 	if err := tmp.Sync(); err != nil {
@@ -179,7 +179,7 @@ func writeIPListFile(scope string, merged []string) (string, error) {
 // IPListProjectionSnapshot 是渲染前投影目录的字节快照（仅 .txt 投影文件）。
 type IPListProjectionSnapshot map[string][]byte
 
-// SnapshotIPListProjections 供 CLI 预检失败时自回滚（历史问题-5）。
+// SnapshotIPListProjections 供 CLI 预检失败时自回滚。
 func SnapshotIPListProjections() IPListProjectionSnapshot {
 	snapshot := IPListProjectionSnapshot{}
 	entries, err := os.ReadDir(IPListDataDir)
@@ -217,7 +217,7 @@ func RestoreIPListProjections(snapshot IPListProjectionSnapshot) {
 	}
 }
 
-// ---------- 历史问题：@ipListFast 投影文件 + 运行期缓存 GC ----------
+// @ipListFast 投影文件 + 运行期缓存 GC ----------
 
 // ipListFileMaxAge 是 GC 删除未引用文件的超龄门槛（24h）：避开 Caddy 重载
 // 窗口——新配置刚投影/换名的文件即使暂未进入引用集也不删。
@@ -227,19 +227,18 @@ const ipListFileMaxAge = 24 * time.Hour
 const ipListGCInterval = time.Hour
 
 // ipListProjectedFileName 匹配投影文件命名——差集清理只碰该形态，目录内其他
-// 文件（运维投放/误放）一律不动。分支（2026-10-15 热路径改造；历史
-// 历史修复 收口）：
+// 文件（运维投放/误放）一律不动。分支（2026-10-15 热路径改造收口）：
 //   - 新稳定命名 <scope>.txt：p[0-9]+-(acl|trust|bl|crsxc-…)（策略身份；
-//     crsxc-<12位hex>=CRS 作用域排除匹配集投影（历史修复 组合键哈希），
+//     crsxc-<12位hex>=CRS 作用域排除匹配集投影，
 //     crsxc-<纯数字>=历史首发序号形态（已被哈希取代，存量由 24h GC 过渡
 //     回收））、tp（受信代理全局单份）、u-<kind>-<ruleCaddyID>（历史
-//     历史修复：预检/引擎层 u-* 投影 scope 编入规则身份，如 u-deny-lb_2r8dosptk1
-//     ——字符类收 `_`，并收大写与 `.`（历史修复：v2 导入可携带大写/
+//     预检/引擎层 u-* 投影 scope 编入规则身份，如 u-deny-lb_2r8dosptk1
+//     字符类收 `_`，并收大写与 `.`（v2 导入可携带大写/
 //     含点 rule id，旧字符类使这类孤儿永不回收；白名单仍不含路径分隔符，
 //     纯单段文件名，无路径逃逸面）；升级前旧全局名 u-deny.txt 等同字符类
 //     天然覆盖，由 24h GC 过渡回收）；精确白名单，用户手放文件不碰；
 //   - 旧内容寻址 <已知 scope>-sha256[:12].txt——迁移过渡分支：改造前落盘的
-//     旧哈希文件由既有 24h GC 自然回收（不写迁移）。历史问题：后缀只允许
+//     旧哈希文件由既有 24h GC 自然回收（不写迁移）。后缀只允许
 //     挂在上述已知 scope 形态之后——原 `|.+-[0-9a-f]{12}` 会把运维投放的
 //     backup-deadbeef1234.txt 一律当作自身投影删除，且「旧文件清尽后自行
 //     失效」的注释不成立（分支恒命中任意前缀）。旧文件清尽后该分支对已知
@@ -248,9 +247,9 @@ var ipListProjectedFileName = regexp.MustCompile(`^(u-[A-Za-z0-9][A-Za-z0-9._-]*
 
 // ipListTempFileName 匹配 writeIPListFile 的临时文件名形态
 // （CreateTemp(IPListDataDir, scope+"-*.tmp")：<投影 scope>-<随机数字>.tmp）。
-// 历史问题（历史）：GC 只委托删除本模块拥有的临时文件——目录内的无关
+// GC 只委托删除本模块拥有的临时文件——目录内的无关
 // .tmp（运维投放的 ops-notes.tmp 等）一律不动；24h 超龄门槛仍保护在役写入
-// （在役 tmp 恒新鲜）。scope 白名单与 ipListProjectedFileName 同源（历史问题
+// （在役 tmp 恒新鲜）。scope 白名单与 ipListProjectedFileName 同源
 // 同款收口：旧哈希后缀只挂已知 scope，不吞任意前缀）。
 var ipListTempFileName = regexp.MustCompile(`^(u-[A-Za-z0-9][A-Za-z0-9._-]*|p[0-9]+-(acl|trust|bl|crsxc-([0-9]+|[0-9a-f]{12}))|tp)(-[0-9a-f]{12})?-[0-9]+\.tmp$`)
 
@@ -283,7 +282,7 @@ func forgetIPListRenderRefForTest(path string) {
 // maybeGCStaleIPListFiles 整轮渲染 apply 成功后的节流 GC 入口（间隔
 // ipListGCInterval）——此刻本轮渲染的全部在役名单引用已落齐，差集决策安全。
 //
-// 历史问题（触发面披露）：唯一调用点在成功 /load 之后；2026-10-15 起的名单
+// （触发面披露）：唯一调用点在成功 /load 之后；2026-10-15 起的名单
 // 热路径刻意零 /load，因此长期仅热路径收敛的系统里，孤儿投影（通常由策略/
 // 规则删除产生，删除走全量链会触发本 GC）的回收会被推迟到下一次真实重载。
 // 有界非泄漏（文件不增长、不参与渲染），接受该披露而不为零/load 路径新增
@@ -301,7 +300,7 @@ func maybeGCStaleIPListFiles() {
 // 缓存（fail-stale 不得把已删文件的集合无限期留在内存）。删除失败仅 warn
 // ——孤儿文件不阻断渲染链路。返回删除数。
 //
-// 历史修复（历史，前提披露）：差集决策的前提是「渲染引用集=本进程在役投影
+// 差集决策的前提是「渲染引用集=本进程在役投影
 // 全集，且**无旧版本进程并发写者**」——滚动升级窗口内若新旧双实例并跑同一
 // 数据卷，旧实例持有旧引用集，可能继续引用/重写本进程已判孤儿的文件，24h
 // 超龄门槛是对该窗口的缓冲突界（正确部署形态=串行替换，不双跑）。
@@ -336,10 +335,10 @@ func gcStaleIPListFiles(now time.Time, maxAge time.Duration) (removed int) {
 		}
 		deleted = append(deleted, full)
 	}
-	// 历史问题：顺带清理超龄崩溃残留的投影临时文件（CreateTemp 半截
+	// 顺带清理超龄崩溃残留的投影临时文件（CreateTemp 半截
 	// .tmp 无引用语义，超龄即可删；在役写入的 .tmp 恒新鲜，不受影响）。
 	for _, entry := range entries {
-		// 历史问题：名字形态门——只回收本模块 CreateTemp 产出的临时文件，
+		// 名字形态门——只回收本模块 CreateTemp 产出的临时文件，
 		// 无关 .tmp 不碰（旧实现仅按后缀匹配，会删除目录内任意超龄 .tmp）。
 		if entry.IsDir() || !ipListTempFileName.MatchString(entry.Name()) {
 			continue
@@ -357,7 +356,7 @@ func gcStaleIPListFiles(now time.Time, maxAge time.Duration) (removed int) {
 		wafiplist.EvictIPListCache(deleted...)
 		Logf("info", "IP 名单 GC: 清理 %d 个超龄未引用名单文件", len(deleted))
 	}
-	// 历史问题（历史）：顺带 prune 引用集中早于 maxAge 的条目——文件已删
+	// 顺带 prune 引用集中早于 maxAge 的条目——文件已删
 	// 或长期未再渲染的 lastRef 记录只增不删会无限驻留；再次渲染时
 	// noteIPListRenderRef 会重建条目，prune 无正确性代价。
 	ipListRenderRefs.Lock()

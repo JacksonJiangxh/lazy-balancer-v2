@@ -71,8 +71,8 @@ func (h *Handlers) GetThreatLib(c *gin.Context) {
 		sources = append(sources, s)
 		totalEntries += s.EntryCount
 	}
-	// 历史修复（历史问题·家族漏收敛）：迭代错误（rows.Err）不得以
-	// 「部分/空列表 + 200」返回——与 历史问题 在总览/事件列表建立的
+	// 迭代错误（rows.Err）不得以
+	// 「部分/空列表 + 200」返回——与在总览/事件列表建立的
 	// 「残缺列表不得以 200」口径对齐（Scan 失败分支同响应形）。
 	if err := rows.Err(); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取威胁情报库失败: " + err.Error()})
@@ -112,7 +112,7 @@ func (h *Handlers) UpdateThreatAutoUpdate(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求无效"})
 		return
 	}
-	// 历史问题-7：与 UpdateCRSAutoUpdate 同口径主节点门（历史问题）——从节点
+	// 与 UpdateCRSAutoUpdate 同口径主节点门——从节点
 	// 状态行在集群同步段内，本地写会被下次快照覆盖。
 	if !requireMasterNode(c) {
 		return
@@ -160,14 +160,14 @@ func (h *Handlers) UpdateThreatSourceFlags(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无可更新字段"})
 		return
 	}
-	// 历史问题-7：与 UpdateCRSAutoUpdate 同口径主节点门（历史问题）。
+	// 与 UpdateCRSAutoUpdate 同口径主节点门。
 	if !requireMasterNode(c) {
 		return
 	}
 	var name string
 	var wasEnabled int
 	if err := db.DB.QueryRow(`SELECT name, COALESCE(update_enabled,0) FROM security_threat_sources WHERE id=?`, id).Scan(&name, &wasEnabled); err != nil {
-		// 历史问题：DB 故障不得误报 404——缺行=404，其余=500（与
+		// DB 故障不得误报 404——缺行=404，其余=500（与
 		// security_overview 的 ErrNoRows→404 同族契约）。
 		if errors.Is(err, sql.ErrNoRows) {
 			c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "威胁库源不存在"})
@@ -210,7 +210,7 @@ func (h *Handlers) StartThreatLibUpdate(c *gin.Context) {
 	if !requireMasterNode(c) {
 		return
 	}
-	// V2（历史用户裁定）：手动触发统一经任务引擎（同 StartCRSUpdate）。
+	// V2（用户裁定）：手动触发统一经任务引擎（同 StartCRSUpdate）。
 	te := services.TaskEngine()
 	if te == nil {
 		respondTaskEngineUnavailable(c)
@@ -221,7 +221,7 @@ func (h *Handlers) StartThreatLibUpdate(c *gin.Context) {
 		return
 	}
 	op := auditOperator(c)
-	// 历史问题：响应前同步预占位，拒绝时不得伪报 running。
+	// 响应前同步预占位，拒绝时不得伪报 running。
 	if err := services.TriggerTaskAsync(te, "threat", services.TriggerAuditContext{
 		Operator: op, Family: "威胁情报库", Name: "威胁情报库更新",
 	}); err != nil {

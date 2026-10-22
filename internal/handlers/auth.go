@@ -22,10 +22,10 @@ import (
 )
 
 // maxAuthJSONBodyBytes 公开 auth 端点（login/setup/ticket-login）的 JSON 请求体
-// 上限（历史问题）。这三条路由无认证，前置 loginRateLimit 只限次数不限体积；
+// 上限。这三条路由无认证，前置 loginRateLimit 只限次数不限体积；
 // encoding/json 在 binding max= 约束生效前就把整个字符串物化进堆——单个超大
 // password 字段即 O(n) 分配，ReadTimeout=30s 下单请求载荷可达带宽×30s，足以
-// OOM 单进程应用并连带容器内 Caddy 子进程（与 历史问题 问题/历史问题 认证
+// OOM 单进程应用并连带容器内 Caddy 子进程（与问题/ 认证
 // 后同款模式的公开端点补齐）。合法登录/setup/ticket body 恒 <2KB，64KB 为
 // 不变量边界而非可调参数，故不做配置项。
 const maxAuthJSONBodyBytes int64 = 64 << 10
@@ -42,7 +42,7 @@ func guardAuthJSONBody(c *gin.Context) bool {
 	return true
 }
 
-// loginDummyBcryptHash 用户不存在路径的等时占位哈希（历史修复）：ErrNoRows 直接
+// loginDummyBcryptHash 用户不存在路径的等时占位哈希：ErrNoRows 直接
 // 401 会以 ~bcrypt 耗时差区分用户名存在性（时序侧信道）。init 生成一次，
 // DefaultCost 与生产真实哈希同档；对不存在的用户也跑一次注定失败的比较。
 var loginDummyBcryptHash []byte
@@ -51,7 +51,7 @@ func init() {
 	loginDummyBcryptHash, _ = bcrypt.GenerateFromPassword([]byte("lazy-balancer timing-equalizer dummy"), bcrypt.DefaultCost)
 }
 
-// loginCompareHash 返回登录密码比较用的 bcrypt 哈希(历史修复):OIDC JIT
+// loginCompareHash 返回登录密码比较用的 bcrypt 哈希:OIDC JIT
 // 用户 password_hash 为空(auth_oidc.go:476 置空),空哈希使
 // bcrypt.CompareHashAndPassword 走格式错误快路径(µs 级),时序差会暴露
 // 「该用户名存在但无本地密码」——改用 loginDummyBcryptHash 等时占位,与
@@ -65,7 +65,7 @@ func loginCompareHash(passwordHash string) []byte {
 
 // 登录失败锁定阈值/冷却（2026-09 用户裁定：登录阶段密码与 MFA 验证失败同计
 // 一个账户级计数，受基础设置「登录失败锁定」开关 mfa_lockout_enabled 控制——
-// 开关关闭则只计数不锁定；历史修复 初版的「常开」语义据此调整为开关语义）。
+// 开关关闭则只计数不锁定；初版的「常开」语义据此调整为开关语义）。
 const (
 	loginLockMaxAttempts = 5
 	loginLockCooldown    = 10 * time.Minute
@@ -73,21 +73,21 @@ const (
 
 // loginLockoutEnabled 读「登录失败锁定」开关（与 services.MFALockoutEnabled
 // 同一配置项；handler 侧就近封装避免跨包零散查询）。
-// 历史修复：错误向上传播——锁定门不得因配置读取失败静默降级为关闭。
+// 错误向上传播——锁定门不得因配置读取失败静默降级为关闭。
 func loginLockoutEnabled() (bool, error) {
 	return services.MFALockoutEnabled()
 }
 
 // recordLoginFailure 登录阶段失败（密码或 MFA 验证码）的单条条件 UPDATE 原子
 // 递增——开关开启且 ≥5 同语句置锁并清零（避免锁满后再计延长冷却）；开关关闭
-// 仅累加计数不置锁（与 mfaRecordFailure 的开关语义同型）。历史修复（历史
+// 仅累加计数不置锁（与 mfaRecordFailure 的开关语义同型）。（历史
 // 裁定·有意设计）：关闭期累计的计数不清零，重新开启后立即参与判定——失败
 // 计数是事实，关闭期清零反而给免费重置窗口。
 func recordLoginFailure(userID int) {
 	now := time.Now()
 	enabled, err := loginLockoutEnabled()
 	if err != nil {
-		// 历史修复：开关读不到时按「开启」处理（fail-closed）——失败计数与
+		// 开关读不到时按「开启」处理（fail-closed）——失败计数与
 		// 锁定门不得因基础设施故障静默消失；故障本身留运行日志。
 		services.Logf("error", "读取登录失败锁定开关失败（按开启处理）: %v", err)
 		enabled = true
@@ -105,7 +105,7 @@ func recordLoginFailure(userID int) {
 }
 
 // loginLockedNow 账户当前是否处于登录锁定（开关关闭视为未锁）。
-// 历史修复：开关读取失败返回错误，由调用方 fail-closed（500），不得把
+// 开关读取失败返回错误，由调用方 fail-closed（500），不得把
 // 「读不到」当作「未锁定」放行。
 func loginLockedNow(lockedUntil sql.NullString) (bool, error) {
 	enabled, err := loginLockoutEnabled()
@@ -116,7 +116,7 @@ func loginLockedNow(lockedUntil sql.NullString) (bool, error) {
 }
 
 // loginLockRemainingMinutes 剩余锁定时长（分钟，向上取整，下限 1）——锁定
-// 文案据此派生（历史问题-19③）：硬编码「10 分钟」与 loginLockCooldown 漂移，
+// 文案据此派生：硬编码「10 分钟」与 loginLockCooldown 漂移，
 // 且锁定中途重试时剩余时长本就更短。解析失败/无值兜底为冷却全长。
 func loginLockRemainingMinutes(lockedUntil sql.NullString, now time.Time) int {
 	fallback := int(loginLockCooldown / time.Minute)
@@ -153,7 +153,7 @@ func (h *Handlers) Login(c *gin.Context) {
 		req.Username).Scan(&user.ID, &user.Username, &passwordHash, &user.Role, &user.DisplayName, &user.IsEnabled, &user.CreatedAt, &user.LastLogin, &passwordVersion, &loginLockedUntil, &user.AuthProvider)
 
 	if err == sql.ErrNoRows {
-		// 历史修复：对不存在的用户名也执行一次注定失败的 bcrypt 比较（结果刻意
+		// 对不存在的用户名也执行一次注定失败的 bcrypt 比较（结果刻意
 		// 丢弃，只取等时副作用），消除与「密码错误」路径的时序差后返回同形 401。
 		_ = bcrypt.CompareHashAndPassword(loginDummyBcryptHash, []byte(req.Password))
 		services.RecordAuditLog(req.Username, "登录失败", "用户认证", services.AuditResultPart("invalid_credentials"), c.ClientIP())
@@ -170,7 +170,7 @@ func (h *Handlers) Login(c *gin.Context) {
 	// 锁定账户的密码正误（防枚举）。
 	locked, lockErr := loginLockedNow(loginLockedUntil)
 	if lockErr != nil {
-		// 历史修复：开关读取失败 fail-closed——不进入认证流程。
+		// 开关读取失败 fail-closed——不进入认证流程。
 		services.RecordAuditLog(req.Username, "登录失败", "用户认证", services.AuditResultPart("internal_error"), c.ClientIP())
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "数据库错误"})
 		return
@@ -182,7 +182,7 @@ func (h *Handlers) Login(c *gin.Context) {
 		return
 	}
 
-	// 历史问题(历史修复 评审):空哈希(OIDC JIT 用户)等时比较只取耗时
+	// 空哈希(OIDC JIT 用户)等时比较只取耗时
 	// 副作用,结果必须恒败——dummy 明文是源码公开常量,比较通过不得成为
 	// 认证依据(auth_oidc.go:476 的设计不变量「OIDC 用户密码登录天然不可
 	// 用」由本分支显式承载,不再依赖 bcrypt 对空哈希的格式错误行为)。
@@ -204,7 +204,7 @@ func (h *Handlers) Login(c *gin.Context) {
 
 	// v2.1.8 MFA 两步登录：密码通过且用户已启用 MFA → 签发 5 分钟单次挑战，
 	// 不发 JWT；前端携 mfa_token 调 /auth/mfa/verify。
-	// 历史问题：MFA 是主认证控制（非纵深层），判定 DB 错误必须 fail-closed——
+	// MFA 是主认证控制（非纵深层），判定 DB 错误必须 fail-closed——
 	// 此前 err != nil 落穿 respondLogin 直接发 JWT，构成二因子静默绕过。
 	var mfaEnabled bool
 	if err := db.DB.QueryRow("SELECT COALESCE(mfa_enabled,0) FROM users WHERE id=?", user.ID).Scan(&mfaEnabled); err != nil {
@@ -215,7 +215,7 @@ func (h *Handlers) Login(c *gin.Context) {
 	if mfaEnabled {
 		// 密码正确但账户启用 MFA 时不在密码步清零计数——完整登录以 MFA 验证
 		// 成功为准（否则「输对密码→连错 4 次验证码→重登清零」可无限绕过锁定）；
-		// 未启用 MFA 则密码即完整登录，清零计数（历史问题：注释随分支归位）。
+		// 未启用 MFA 则密码即完整登录，清零计数。
 		mfaToken, ierr := services.MFAIssueChallenge(user.ID)
 		if ierr != nil {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "签发 MFA 挑战失败"})
@@ -234,13 +234,13 @@ func (h *Handlers) Login(c *gin.Context) {
 }
 
 func (h *Handlers) respondLogin(c *gin.Context, user models.User, passwordVersion int64) {
-	// 历史问题 D-新6：last_login 更新与「登录成功」审计仅登录路径——step-up
+	// D-新6：last_login 更新与「登录成功」审计仅登录路径——step-up
 	// （verify-step）复用本函数时不再记假登录/刷新 last_login。
 	h.respondLoginWithMFA(c, user, passwordVersion, 0, true)
 }
 
 // loginExpireMinutes 读取 global_config.jwt_expire_minutes 并钳制到合法区间
-// （≤0 或 >1440 或查询失败一律回退 20）。历史修复（历史）：本函数与
+// （≤0 或 >1440 或查询失败一律回退 20）。本函数与
 // auth_oidc.go issueOIDCJWT 原先逐字同形双实现——抽单源后密码登录与 OIDC
 // 签发的令牌有效期口径恒一致（行为零变化）。
 func loginExpireMinutes() int {
@@ -253,7 +253,7 @@ func loginExpireMinutes() int {
 
 // respondLoginWithMFA 携带 mfa_ts 声明签发（0=未验证/不写入——非 MFA 用户登录、
 // MFA 首次签发在 verify 成功时传 now；票据登录暂传 0）。isLogin=false 时跳过
-// 登录审计与 last_login 更新（verify-step 的 step-up 场景，历史问题 D-新6）。
+// 登录审计与 last_login 更新（verify-step 的 step-up 场景， D-新6）。
 func (h *Handlers) respondLoginWithMFA(c *gin.Context, user models.User, passwordVersion int64, mfaTs int64, isLogin bool) {
 	if isLogin {
 		lastLogin := time.Now().UTC()
@@ -265,14 +265,14 @@ func (h *Handlers) respondLoginWithMFA(c *gin.Context, user models.User, passwor
 		user.LastLogin = sql.NullTime{Time: lastLogin, Valid: true}
 	}
 
-	// node_mode 仅用于登录响应体的展示字段（历史问题：JWT claim 已删除——
+	// node_mode 仅用于登录响应体的展示字段（JWT claim 已删除——
 	// jwtAuth 不消费，客户端声明无意义；响应体 NodeMode 保留）。
 	nodeMode := "master"
 	if isMaster, err := services.RoleOf(c.Request.Context(), db.DB); err == nil && !isMaster {
 		nodeMode = "slave"
 	}
 
-	// 历史修复：钳制逻辑抽单源 loginExpireMinutes（与 OIDC 签发共用）。
+	// 钳制逻辑抽单源 loginExpireMinutes（与 OIDC 签发共用）。
 	expireMinutes := loginExpireMinutes()
 	expireDuration := time.Duration(expireMinutes) * time.Minute
 	now := time.Now()
@@ -312,15 +312,15 @@ func (h *Handlers) respondLoginWithMFA(c *gin.Context, user models.User, passwor
 		services.RecordAuditLog(user.Username, "登录成功", "用户认证", services.FormatAuditDetail(services.AuditUserPart(user.ID, user.Username), services.AuditResultPart("success")), c.ClientIP())
 	}
 
-	// 历史问题 十次：登录/step-up 响应必须携带 mfa_enabled——此前所有登录路径的
+	// 登录/step-up 响应必须携带 mfa_enabled——此前所有登录路径的
 	// user.mfa_enabled 恒 false，导致前端「登录从节点需先启用 MFA」预检对自己
-	// 已启用的用户误报。历史修复：标志经 NewUserResponse 签名单源填充（遗漏即
+	// 已启用的用户误报。标志经 NewUserResponse 签名单源填充（遗漏即
 	// 编译失败）。与登录密码步的 mfa_enabled 判定查询为两处独立查询（历史
-	// 历史修复 裁定保留：step-up/登录共用本函数，透传会增加 MFA 关键流签名
+	// 裁定保留：step-up/登录共用本函数，透传会增加 MFA 关键流签名
 	// 复杂度，代价仅一次索引点查）。
 	var mfaEnabled int
 	if err := db.DB.QueryRow("SELECT COALESCE(mfa_enabled,0) FROM users WHERE id=?", user.ID).Scan(&mfaEnabled); err != nil {
-		// 历史问题（历史）：查询失败此前静默保持 false——响应语义不变
+		// 查询失败此前静默保持 false——响应语义不变
 		//（该字段为展示性预检），但错误必须留痕便于诊断。
 		services.Logf("error", "login response mfa_enabled lookup: %v", err)
 	}
@@ -334,7 +334,7 @@ func (h *Handlers) respondLoginWithMFA(c *gin.Context, user models.User, passwor
 }
 
 func (h *Handlers) Logout(c *gin.Context) {
-	// 历史修复：API Key 认证无会话令牌概念（jwtAuth 只为 JWT 写
+	// API Key 认证无会话令牌概念（jwtAuth 只为 JWT 写
 	// token_revocation_hash/token_expires_at）——旧代码 API Key 登出恒落 500
 	// 分支。对齐仓内 DELETE 幂等契约（重复调用 404——见 apidocs
 	// operationDescription 的删除类约定），按「无会话令牌可吊销」返回 404。
@@ -366,7 +366,7 @@ func (h *Handlers) GetCurrentUser(c *gin.Context) {
 		return
 	}
 
-	// 历史问题-2:复用 contextUserID。
+	// 复用 contextUserID。
 	userIDInt := int(contextUserID(c))
 
 	var user models.User
@@ -378,7 +378,7 @@ func (h *Handlers) GetCurrentUser(c *gin.Context) {
 	`, userIDInt).Scan(&user.ID, &user.Username, &user.Role, &user.DisplayName, &user.IsEnabled, &user.CreatedAt, &user.LastLogin, &mfaEnabled, &authProvider)
 
 	if err != nil {
-		// 历史问题：基础设施故障与用户不存在不可混同（本查询按主键取行，
+		// 基础设施故障与用户不存在不可混同（本查询按主键取行，
 		// ErrNoRows 已在鉴权层拦截）——与同文件其余 DB 失败分支统一「数据库错误」。
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "数据库错误"})
 		return
@@ -394,23 +394,23 @@ type UpdateCurrentUserRequest struct {
 	DisplayName *string `json:"display_name" binding:"omitempty,max=50"`
 	// bcrypt 的字节上限 72——x/crypto v0.55+ 超出即返回 ErrPasswordTooLong
 	// (密码策略:8-24 可打印 ASCII,四类字符)
-	// 历史修复 同族（历史修复，历史）：binding 只拦空，长度/复杂度交
+	// 同族：binding 只拦空，长度/复杂度交
 	// validatePasswordPolicy 友好文案（CurrentPassword 例外见下）。
 	Password string `json:"password" binding:"omitempty"`
-	// 历史修复（用户已批准契约，2026-09 裁定保留——登录后唯一密码确认例外）：提交新
+	// （用户已批准契约，2026-09 裁定保留——登录后唯一密码确认例外）：提交新
 	// 密码时必须携带当前密码过共享确认门——此前仅凭会话即可改密，劫持会话可直接
 	// 置换密码把原主锁在门外。仅改昵称不要求。
-	// 历史修复：当前密码不套用新密码策略 8-24——登录不做策略校验（存量密码可能
+	// 当前密码不套用新密码策略 8-24——登录不做策略校验（存量密码可能
 	// 来自旧策略），25-72 字符的存量密码必须仍能自助更换；这里只保留 bcrypt
 	// 物理上限 72（>72 字节比较必败，400 文案与 401 无行为差异）。
 	CurrentPassword string `json:"current_password" binding:"omitempty,max=72"`
 }
 
-// 密码策略（2026-09-28 用户裁定，历史问题-1）：8-24 个可打印 ASCII 字符，
+// 密码策略（2026-09-28 用户裁定）：8-24 个可打印 ASCII 字符，
 // 仅限数字、大小写字母、特殊字符(可打印 ASCII)——不强制四类全含，
 // 不允许汉字或其他非 ASCII 字符。仅适用于设置/修改/重置——登录不做策略校验
 // （存量密码可能在旧策略下设置）。注：bcrypt 字节上限 72（v0.55 起 >72 返回
-// ErrPasswordTooLong）——策略 24 字符 ASCII 上限远低于该界（历史修复：删
+// ErrPasswordTooLong）——策略 24 字符 ASCII 上限远低于该界（删
 // 陈旧常量名引用）。
 const (
 	minPasswordLength = 8
@@ -424,7 +424,7 @@ func validatePasswordPolicy(password string) error {
 	if password == "" {
 		return nil // 空密码=不修改(UpdateCurrentUser/UpdateUser 的 omitempty 场景;
 		// CreateUser/ResetUserPassword 由 binding required 拦截空值——
-		// 历史问题-5 修复：ResetUserPassword 曾误用 omitempty 致空密码可落库)
+		// 修复：ResetUserPassword 曾误用 omitempty 致空密码可落库)
 	}
 	if len(password) < minPasswordLength {
 		return fmt.Errorf("密码长度不能少于 %d 位", minPasswordLength)
@@ -442,7 +442,7 @@ func validatePasswordPolicy(password string) error {
 
 // validateUsernamePolicy 用户名策略（2026-09-28 用户裁定）：仅允许小写英文
 // 开头，字符只允许小写字母或小写字母+数字——不允许大写、汉字、特殊字符、
-// 下划线、连字符。长度 3-50 由 binding 层覆盖。历史修复（历史裁定·双向
+// 下划线、连字符。长度 3-50 由 binding 层覆盖。（裁定·双向
 // 声明）：本策略仅约束本地创建/改名；OIDC JIT 开户有意豁免（IdP 源属性，
 // 强行归一会破坏身份链——见 auth_oidc.go 开户分支同名声明）。
 var usernamePolicyRe = regexp.MustCompile(`^[a-z][a-z0-9]*$`)
@@ -456,7 +456,7 @@ func validateUsernamePolicy(username string) error {
 
 func (h *Handlers) UpdateCurrentUser(c *gin.Context) {
 	// users 在导入全量替代表清单内：窗口内写入会被静默覆盖或阻塞至
-	// busy_timeout——与节点写族同口径 409 fast-fail（历史修复），先于解析 body。
+	// busy_timeout——与节点写族同口径 409 fast-fail，先于解析 body。
 	if rejectWriteDuringImport(c, "执行用户写操作") {
 		return
 	}
@@ -466,7 +466,7 @@ func (h *Handlers) UpdateCurrentUser(c *gin.Context) {
 		return
 	}
 
-	// 历史问题-2:复用 contextUserID。
+	// 复用 contextUserID。
 	userIDInt := int(contextUserID(c))
 
 	var req UpdateCurrentUserRequest
@@ -478,8 +478,11 @@ func (h *Handlers) UpdateCurrentUser(c *gin.Context) {
 		return
 	}
 	// 2026-09-18 用户裁定:OIDC 用户的显示名/密码源自 IdP——本地不可改,
-	// 要改请去认证服务修改(自助路径)。
-	if req.DisplayName != nil || req.Password != "" {
+	// 要改请去认证服务修改(自助路径)。门控按「值实际变化」判定（与
+	// UpdateUser 同构）：非空密码恒视为改密尝试（门前置，保持 OIDC 400
+	// 先于当前密码校验）；display_name 与库中同值属无变更的局部更新，
+	// 在事务内读到旧值后再判（见下方 displayNameChanged）。
+	if req.Password != "" {
 		oidcUser, err := isOIDCUser(c.Request.Context(), userIDInt)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取用户身份失败"})
@@ -541,16 +544,31 @@ func (h *Handlers) UpdateCurrentUser(c *gin.Context) {
 		return
 	}
 
+	// OIDC 门的 display_name 侧（值变化判定，见上方注释）：同值提交属无
+	// 变更局部更新放行；改值才拦。与下方 UPDATE 分支同一谓词。
+	displayNameChanged := req.DisplayName != nil && *req.DisplayName != oldDisplayName
+	if displayNameChanged {
+		oidcUser, err := isOIDCUser(c.Request.Context(), userIDInt)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取用户身份失败"})
+			return
+		}
+		if oidcUser {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "OIDC 用户的显示名与密码由认证服务管理，请前往 OIDC 服务修改"})
+			return
+		}
+	}
+
 	changed := []string{}
 	sets := make([]string, 0, 3)
 	args := make([]any, 0, 3)
-	if req.DisplayName != nil && *req.DisplayName != oldDisplayName {
+	if displayNameChanged {
 		sets = append(sets, "display_name = ?")
 		args = append(args, *req.DisplayName)
 		changed = append(changed, "昵称")
 	}
 	if passwordHash != "" {
-		// 历史修复：复用 passwordResetColumns——自助改密与管理员重置同语义，
+		// 复用 passwordResetColumns——自助改密与管理员重置同语义，
 		// 清空登录失败计数与锁定（否则锁定中的会话改密后仍被旧锁 429）。
 		sets = append(sets, passwordResetColumns()...)
 		args = append(args, passwordHash)
@@ -564,7 +582,7 @@ func (h *Handlers) UpdateCurrentUser(c *gin.Context) {
 		}
 	}
 	if passwordHash != "" {
-		// 历史修复：改密在同一事务内吊销在册 MFA 挑战（版本绑定是主防线，
+		// 改密在同一事务内吊销在册 MFA 挑战（版本绑定是主防线，
 		// 这里保证旧挑战不会以任何路径残留）。
 		if err := revokeMFAChallenges(tx, userIDInt); err != nil {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新用户失败"})
@@ -574,7 +592,7 @@ func (h *Handlers) UpdateCurrentUser(c *gin.Context) {
 
 	var user models.User
 	var authProvider string
-	// 历史问题（历史）：响应回填 mfa_enabled（与 GET /users/me、登录响应
+	// 响应回填 mfa_enabled（与 GET /users/me、登录响应
 	// 同口径）——此前 PATCH /users/me 恒返回 false，MFA 已启用用户被误导。
 	var mfaEnabled int
 	err = tx.QueryRowContext(c.Request.Context(), `
@@ -603,7 +621,7 @@ func (h *Handlers) UpdateCurrentUser(c *gin.Context) {
 }
 
 func (h *Handlers) GetSetupStatus(c *gin.Context) {
-	// 历史问题:从节点无初始化语义——users 由主端同步,同步未收敛的瞬态空表
+	// 从节点无初始化语义——users 由主端同步,同步未收敛的瞬态空表
 	// 不得引导建号(建号会被同步覆盖)。查询失败按主节点语义放行(老库形态)。
 	if isMaster, err := services.RoleOf(c.Request.Context(), db.DB); err == nil && !isMaster {
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"needs_setup": false}})
@@ -618,7 +636,7 @@ func (h *Handlers) GetSetupStatus(c *gin.Context) {
 }
 
 func (h *Handlers) SetupAdmin(c *gin.Context) {
-	// 历史问题:从节点禁止初始化建号(公开路由无 JWT,is_master 读 global_config)。
+	// 从节点禁止初始化建号(公开路由无 JWT,is_master 读 global_config)。
 	if isMaster, err := services.RoleOf(c.Request.Context(), db.DB); err == nil && !isMaster {
 		c.JSON(http.StatusForbidden, models.APIResponse{Code: 403, Message: "从节点不支持初始化，请在主节点完成初始化"})
 		return

@@ -176,7 +176,7 @@ func TestParseIPListFile_parsesEachEntryOnce(t *testing.T) {
 	}
 }
 
-// 历史修复 回归：解析原语与字符串入口语义逐点等价（含主机位掩码形态）。
+// 回归：解析原语与字符串入口语义逐点等价（含主机位掩码形态）。
 func TestAggregateParsedPrefixes_equivalentToAggregatePrefixes(t *testing.T) {
 	entries := []string{
 		"10.0.0.0/25", "10.0.0.128/25", // 兄弟归并
@@ -205,7 +205,7 @@ func TestAggregateParsedPrefixes_equivalentToAggregatePrefixes(t *testing.T) {
 	}
 }
 
-// 历史修复 同族：AggregateIPEntries 也不得双重解析（非法条目原样透传）。
+// 同族：AggregateIPEntries 也不得双重解析（非法条目原样透传）。
 func TestAggregateIPEntries_parsesEachEntryOnce(t *testing.T) {
 	entries := []string{"10.0.0.1", "10.0.0.7", "garbage"}
 	before := parseEntryCallsForTest.Load()

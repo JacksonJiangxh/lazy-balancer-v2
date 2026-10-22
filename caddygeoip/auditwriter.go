@@ -1,6 +1,6 @@
 package caddygeoip
 
-// 审计写插件（历史，架构改进：耗时侧车文件退役 → 审计行内嵌 timing）。
+// 审计写插件（架构改进：耗时侧车文件退役 → 审计行内嵌 timing）。
 //
 // coraza 以 `SecAuditLogType lbfile` 选用本插件（security.go 渲染层发射）。
 // 与退役的 serial 直写相比的两个职责：
@@ -49,6 +49,7 @@ import (
 	"encoding/json"
 	"os"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -67,7 +68,7 @@ import (
 const auditWriterName = "lbfile"
 
 // auditBodyMaxBytes 限制审计 part C（请求体）与 part E（响应体）在快照/队列/
-// 格式化链中保留的原始体字节数（历史问题：两侧同一硬上限——coraza 默认
+// 格式化链中保留的原始体字节数（两侧同一硬上限——coraza 默认
 // SecResponseBodyLimit=512KiB，响应侧不设限会让 2048 深队列放大到 ~1GiB）。
 // 截断只影响审计展示，不影响 WAF 已完成的规则评估。
 const auditBodyMaxBytes = 64 * 1024
@@ -98,22 +99,22 @@ var (
 	// auditTimingWaitLimit drain 对「条目在场但未终态」分段的限时等待：正常形态
 	// （blocked_counter 是链最外层收点，紧随 coraza 中间件 defer）等待 <1ms；
 	// 上限仅兜底异常形态（计时写点缺失），超时按已到场分段注入。未知 tid
-	// （注册表无条目）不进本等待——auditTimingWait 首轮查表未命中即返（历史修复，
-	// 历史：单 drain goroutine 逐行满等=无背压阀下的 drain 沉陷）。
+	// （注册表无条目）不进本等待——auditTimingWait 首轮查表未命中即返
+	// 单 drain goroutine 逐行满等=无背压阀下的 drain 沉陷）。
 	auditTimingWaitLimit = 2 * time.Second
 	auditTimingPollStep  = 200 * time.Microsecond
 	// auditTimingEntryTTLNs 注册表条目存活上限（纳秒）：条目由周期性清扫回收
 	// （消费不删——同一请求可产多条审计行[预检+策略引擎]，共享同一注册表条目）。
 	// 以 atomic.Int64 纳秒存储而非普通 time.Duration：常驻 sweeper goroutine
 	// 读、测试收窄参数写，普通变量在 `go test -race` 下构成数据竞争
-	// （历史问题）。零值为 0（立即全部过期），默认值在 init 中置入。
+	// 零值为 0（立即全部过期），默认值在 init 中置入。
 	auditTimingEntryTTLNs atomic.Int64
-	// auditTimingMaxEntries 注册表条目硬上限（历史问题，历史）：计时 ID
+	// auditTimingMaxEntries 注册表条目硬上限：计时 ID
 	// 形态校验之外的第二道内存 DoS 防线——任何新键生产路径（含未来写点）都不
 	// 得让注册表无界增长。100k 条目 ≈ 30s TTL × ~3.3k RPS 的合法上限，内存
 	// 约 15MB；满时拒绝新键（该请求不计耗时，静默降级），既有键照常写入。
 	auditTimingMaxEntries = 100_000
-	// auditTimingSweepIntervalNs 周期清扫间隔（纳秒，历史问题）：旧实现清扫仅
+	// auditTimingSweepIntervalNs 周期清扫间隔（纳秒）：旧实现清扫仅
 	// 由建条驱动（每 64 次建条一次），停流后过期条目永久驻留；后台 sweeper 按
 	// 本周期兜底回收，零流量下注册表同样收敛。atomic 存储原因同上。
 	auditTimingSweepIntervalNs atomic.Int64
@@ -184,7 +185,7 @@ var (
 	auditTimingMu      sync.Mutex
 	auditTimingEntries = map[string]*auditTimingEntry{}
 	// auditTimingOrder 是建条顺序的 FIFO：清扫只从队首弹出 TTL 已过期条目，
-	// 摊销 O(过期数)。历史问题：旧实现每 64 次建条全表扫描（O(n)，n≈TTL×RPS），
+	// 摊销 O(过期数)。旧实现每 64 次建条全表扫描（O(n)，n≈TTL×RPS），
 	// 每次请求摊销 O(n/64) 次 map 迭代且持全局锁 ⇒ CPU 随 RPS² 增长。
 	// 不变量：队列内 created 单调不减（time.Now 的单调读数），且每条目只
 	// 入队一次（id 为进程内唯一随机值，不会重建）。
@@ -198,13 +199,13 @@ var (
 	// 条目/无计时头行必须零轮询立即返回——替代挂钟阈值断言，消除 CI 负载
 	// 抖动假红）。仅 auditTimingWait 轮询步 incr，成本可忽略。
 	auditTimingPollCountForTest atomic.Int64
-	// auditTimingSweepVisitsForTest 清扫检查的队列元素数（历史问题 钉：清扫
+	// auditTimingSweepVisitsForTest 清扫检查的队列元素数（钉：清扫
 	// 成本必须随「过期条目数」而非注册表规模增长）。
 	auditTimingSweepVisitsForTest atomic.Int64
 )
 
 // auditTimingRecord 写入一个分段计时（µs）。id 为空（计时 ID 生成失败的降级
-// 形态）或形态非法（历史问题 纵深：非 16-hex 不得建条——头值客户端可控）
+// 形态）或形态非法（纵深：非 16-hex 不得建条——头值客户端可控）
 // 静默忽略——耗时是增强信息，不产生请求路径错误。
 // 条目硬上限：注册表满时拒绝新键（该请求不计耗时），既有键照常更新。
 func auditTimingRecord(id, segment string, us int64) {
@@ -229,7 +230,7 @@ func auditTimingRecord(id, segment string, us int64) {
 		auditTimingSweepIfDueLocked(now)
 	}
 	auditTimingMu.Unlock()
-	// 历史问题：首个条目创建时启动周期 sweeper（进程级单例，注册表本身即
+	// 首个条目创建时启动周期 sweeper（进程级单例，注册表本身即
 	// 包级生命周期）——停流后过期条目也由周期清扫回收，不再仅依赖建条驱动。
 	startAuditTimingSweeperForTest()
 	e.mu.Lock()
@@ -272,7 +273,7 @@ func startAuditTimingSweeperForTest() {
 
 // auditTimingClose 标记该请求的全部分段已写完（终态）。由链最外层收点
 // （blocked_counter post-next）调用——此刻整个安全链已返回，不会再有分段写点。
-// 条目不存在时直接返回（历史问题）：drain 对未知 tid 首轮即返，
+// 条目不存在时直接返回：drain 对未知 tid 首轮即返，
 // close 建条没有收益——它只会给「零分段写点」的请求额外占一个 TTL 条目。
 func auditTimingClose(id string) {
 	if id == "" {
@@ -385,7 +386,7 @@ func auditRetainedPreExpireLocked(now time.Time) {
 // 缺段省略）。id 为空（无 timing 头的审计行）或首轮查表无条目（未知 tid）立即
 // 返回空快照。
 //
-// 历史修复（历史）：未知 tid 首轮即返，不轮询到超时。drain 在**另一个
+// 未知 tid 首轮即返，不轮询到超时。drain 在**另一个
 // goroutine**里先格式化（整行 json.Marshal）再查表，与请求 goroutine 内
 // 「Write（coraza defer ProcessLogging）→ blocked_counter 收点写终态」之间
 // 没有因果序保证，只剩一个微秒级竞态窗（drain 抢先完成格式化并发起查表时，
@@ -626,7 +627,7 @@ func (t *auditSnapshotTransaction) IsInterrupted() bool {
 // OCSF/自定义格式化器消费（本项目固定 JSON 渲染，JSON 输出经下方标签字段与内置
 // 格式化器一致：args 恒 {} 空对象）。
 //
-// 历史问题：嵌入值不是事务活对象，而是 frozenArgsRequest(req) 返回的同动态类型
+// 嵌入值不是事务活对象，而是 frozenArgsRequest(req) 返回的同动态类型
 // typed-nil 指针——只保留 Args() 的接口契约，不引用事务变量集合。旧实现嵌入 live
 // 请求，注释声称「tx.Close 后为空读」与 coraza 实现不符（ConcatKeyed 持有事务
 // argsGet/argsPost 的长期引用，tx 回池复用后 Args() 会读到下一请求的参数，而
@@ -716,7 +717,7 @@ func (f auditSnapshotFile) Size() int64 { return f.Size_ }
 func (f auditSnapshotFile) Mime() string { return f.Mime_ }
 
 // auditSnapshotResponse 实现 plugintypes.AuditLogTransactionResponse。
-// BodyTruncated_ 与请求侧同标记位（历史问题，JSON 契约对称 omitempty）。
+// BodyTruncated_ 与请求侧同标记位（JSON 契约对称 omitempty）。
 type auditSnapshotResponse struct {
 	Protocol_      string              `json:"protocol"`
 	Status_        int                 `json:"status"`
@@ -815,7 +816,7 @@ var (
 	_ plugintypes.AuditLogTransactionProducer     = (*auditSnapshotProducer)(nil)
 )
 
-// snapshotAuditBody 对审计体（part C 请求体 / part E 响应体，历史问题 同
+// snapshotAuditBody 对审计体（part C 请求体 / part E 响应体，同
 // 上限同语义）做字节级硬截断。超长前缀必须 Clone：直接切片会让快照继续持有
 // 原始大 string 的整个 backing array，失去内存上限意义。
 func snapshotAuditBody(body string) (string, bool) {
@@ -824,7 +825,7 @@ func snapshotAuditBody(body string) (string, bool) {
 	}
 	cut := auditBodyMaxBytes
 	// 写侧与读侧上限相等，读侧无法凭长度判断截断；文本在写侧显式追加
-	// 标记，避免 UI 把半截 body 当完整内容（历史）。二进制不
+	// 标记，避免 UI 把半截 body 当完整内容。二进制不
 	// 追加（会破坏 base64 判定）。
 	for cut > 0 && !utf8.RuneStart(body[cut]) {
 		cut--
@@ -834,6 +835,73 @@ func snapshotAuditBody(body string) (string, bool) {
 		return prefix + "\n...[TRUNCATED]", true
 	}
 	return prefix, true
+}
+
+// auditHeadersMaxBytes 快照 headers（请求/响应）序列化字节硬上限（与 part
+// C/E 的 64KiB 同口径）：Caddy 默认 MaxHeaderBytes≈1MB，整表深拷贝不设限
+// 会让 2048 深队列与 2s 入队等待期的在途快照在洪峰下被单条大头放大数百倍。
+// 截断只影响审计展示，不影响 WAF 已完成的规则评估。
+const auditHeadersMaxBytes = 64 * 1024
+
+// auditSnapshotDroppedHeadersKey 与摄取落库侧（services 的 64KB 落库裁剪）
+// 同一合成键：面板按信息行渲染该键。插件是客户端头的首个受信触点——伪造的
+// 同名客户端头在此一律剥离，此后管线内出现的该键均为写侧真实丢弃计数。
+const auditSnapshotDroppedHeadersKey = "_lb_dropped_headers"
+
+// snapshotAuditHeaders 深拷贝请求/响应头并施加 64KiB 序列化上限（有界口径与
+// part C/E 一致）：先剥离客户端伪造的丢弃计数键，再按序列化体积降序丢条目
+// 直至落入上限，丢弃数写入合成键（摄取落库侧会把该计数并入自身裁剪计数）。
+func snapshotAuditHeaders(hs map[string][]string) map[string][]string {
+	if hs == nil {
+		return nil
+	}
+	out := make(map[string][]string, len(hs))
+	type keySize struct {
+		key  string
+		size int
+	}
+	keys := make([]keySize, 0, len(hs))
+	total := 2 // 外层 {}
+	for k, v := range hs {
+		if strings.EqualFold(k, auditSnapshotDroppedHeadersKey) {
+			continue // 客户端伪造的丢弃计数键一律剥离（写侧保留键）
+		}
+		vv := append([]string(nil), v...)
+		out[k] = vv
+		kb, kerr := json.Marshal(k)
+		vb, verr := json.Marshal(vv)
+		if kerr != nil || verr != nil {
+			continue
+		}
+		size := len(kb) + len(vb) + 2 // "key":value + 冒号/逗号分隔
+		keys = append(keys, keySize{key: k, size: size})
+		total += size
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	if total <= auditHeadersMaxBytes {
+		return out
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].size != keys[j].size {
+			return keys[i].size > keys[j].size
+		}
+		return keys[i].key < keys[j].key
+	})
+	// 丢弃标记键的精确形态开销（dropped 位数按 6 位上限预留）。
+	markerOverhead := len(`"_lb_dropped_headers":["000000"]`) + 1
+	dropped := 0
+	for _, ks := range keys {
+		if total+markerOverhead <= auditHeadersMaxBytes {
+			break
+		}
+		delete(out, ks.key)
+		total -= ks.size
+		dropped++
+	}
+	out[auditSnapshotDroppedHeadersKey] = []string{strconv.Itoa(dropped)}
+	return out
 }
 
 // snapshotAuditLog 把 live AuditLog 拷贝为自持快照。接口 nil 检查穿透 typed-nil
@@ -874,10 +942,7 @@ func snapshotTransaction(tx plugintypes.AuditLogTransaction) *auditSnapshotTrans
 			ArgsStub:       struct{}{},
 		}
 		if hs := req.Headers(); hs != nil {
-			r.Headers_ = make(map[string][]string, len(hs))
-			for k, v := range hs {
-				r.Headers_[k] = append([]string(nil), v...)
-			}
+			r.Headers_ = snapshotAuditHeaders(hs)
 		}
 		for _, f := range req.Files() {
 			r.Files_ = append(r.Files_, auditSnapshotFile{Name_: f.Name(), Size_: f.Size(), Mime_: f.Mime()})
@@ -886,7 +951,7 @@ func snapshotTransaction(tx plugintypes.AuditLogTransaction) *auditSnapshotTrans
 		t.Request_ = r
 	}
 	if resp := tx.Response(); !isNilInterface(resp) {
-		// 历史问题：响应体与请求体同硬上限（coraza 默认
+		// 响应体与请求体同硬上限（coraza 默认
 		// SecResponseBodyLimit=512KiB——不截断则快照/队列/落盘全链放大）。
 		respBody, respTruncated := snapshotAuditBody(resp.Body())
 		q := &auditSnapshotResponse{
@@ -896,10 +961,7 @@ func snapshotTransaction(tx plugintypes.AuditLogTransaction) *auditSnapshotTrans
 			BodyTruncated_: respTruncated,
 		}
 		if hs := resp.Headers(); hs != nil {
-			q.Headers_ = make(map[string][]string, len(hs))
-			for k, v := range hs {
-				q.Headers_[k] = append([]string(nil), v...)
-			}
+			q.Headers_ = snapshotAuditHeaders(hs)
 		}
 		t.Response_ = q
 	}
@@ -1009,6 +1071,9 @@ type auditPipeline struct {
 	bw   *bufio.Writer
 	// dropped 是入队超时丢弃的审计行累计计数（进程级管线全生命周期）。
 	dropped atomic.Uint64
+	// ioErrors 是落盘/格式化错误累计计数（写盘/刷盘/重开/格式化/关闭）：
+	// 与 dropped 一起由 drain 低频写入侧车文件，供根服务健康位消费。
+	ioErrors atomic.Uint64
 	// dropLogMu 保护丢弃告警节流状态（请求路径并发入队可见）。
 	dropLogMu    sync.Mutex
 	lastDropLog  time.Time
@@ -1017,7 +1082,24 @@ type auditPipeline struct {
 	ioErrMu      sync.Mutex
 	lastIOErrLog time.Time
 	ioErrCount   int
+	// statsDirty 标记累计计数自上次写盘后是否变化；statsMu 保护写盘节流
+	// 状态（仅 drain goroutine 触碰，无需与请求路径互斥——计数是原子读）。
+	statsDirty     atomic.Bool
+	statsMu        sync.Mutex
+	lastStatsWrite time.Time
 }
+
+// auditWriterStatsSuffix 是写侧失败计数侧车文件名后缀（紧跟审计日志目标路径）。
+// 契约另一端：根服务 internal/services 的 securityEventsAuditWriterStatsPath
+// （跨 Go module 无共享包，两处后缀/字段名必须同步；两侧各有钉测）。
+const auditWriterStatsSuffix = ".writer-stats.json"
+
+// auditWriterStatsInterval 是侧车计数写盘的最小间隔（drain 侧低频写；
+// 失败洪峰不放大磁盘 IO，请求路径零参与）。var 供测试收窄。
+var auditWriterStatsInterval = 3 * time.Second
+
+// auditWriterStatsPath 返回目标路径对应的侧车计数文件路径。
+func auditWriterStatsPath(target string) string { return target + auditWriterStatsSuffix }
 
 // auditIOLogf 审计落盘错误日志缝（测试注入；缺省 caddy.Log）。
 var auditIOLogf = func(format string, args ...any) {
@@ -1029,13 +1111,16 @@ var auditDropLogf = func(format string, args ...any) {
 	caddy.Log().Named("auditwriter").Sugar().Warnf(format, args...)
 }
 
-// reportIOError 记录落盘 IO 错误（历史问题）：首次立即记录，其后每分钟至多
+// reportIOError 记录落盘 IO 错误：首次立即记录，其后每分钟至多
 // 一条（携带被抑制计数），保证「静默丢行」不可能。错误不再只是被丢弃的
 // error 返回值——drain 侧旧实现 `_, _ = p.bw.Write(...)` 完全不可观测。
 func (p *auditPipeline) reportIOError(op string, err error) {
 	if err == nil {
 		return
 	}
+	// 累计计数（面板健康位消费）先于节流告警：告警被抑制也绝不丢计数。
+	p.ioErrors.Add(1)
+	p.statsDirty.Store(true)
 	p.ioErrMu.Lock()
 	now := time.Now()
 	p.ioErrCount++
@@ -1070,7 +1155,7 @@ func (p *auditPipeline) reopenLocked() {
 	p.bw = bufio.NewWriterSize(fd, 64*1024)
 }
 
-// appendLine 写入一行并处理错误（历史问题）：粘性写错误先记录、再重建 fd，
+// appendLine 写入一行并处理错误：粘性写错误先记录、再重建 fd，
 // 后续行继续落盘；调用方持 ioMu。
 func (p *auditPipeline) appendLine(body []byte) {
 	if p.bw == nil {
@@ -1094,7 +1179,7 @@ func (p *auditPipeline) appendLine(body []byte) {
 	}
 }
 
-// flushLocked 刷盘并处理错误（历史问题）。调用方持 ioMu。
+// flushLocked 刷盘并处理错误。调用方持 ioMu。
 func (p *auditPipeline) flushLocked() {
 	if p.bw == nil {
 		return
@@ -1180,6 +1265,7 @@ func (p *auditPipeline) enqueue(item lbAuditItem) error {
 // 携带被抑制计数与累计总数）——丢弃必须是可观测事件。
 func (p *auditPipeline) reportDropped() {
 	total := p.dropped.Add(1)
+	p.statsDirty.Store(true)
 	p.dropLogMu.Lock()
 	now := time.Now()
 	p.dropLogCount++
@@ -1214,8 +1300,48 @@ func (p *auditPipeline) drain() {
 			p.processSafely(item)
 		case <-ticker.C:
 			p.flushPendingSafely()
+			p.writeWriterStatsIfDue(time.Now())
 		}
 	}
+}
+
+// writeWriterStatsIfDue 把累计失败/丢弃计数写入侧车文件（低频节流；仅计数
+// 变化时写）。drain goroutine 独享调用，请求路径零参与：失败洪峰不会放大
+// 磁盘 IO，读侧（根服务摄取 tick）也不碰热路径。
+func (p *auditPipeline) writeWriterStatsIfDue(now time.Time) {
+	if !p.statsDirty.Load() {
+		return
+	}
+	p.statsMu.Lock()
+	defer p.statsMu.Unlock()
+	if !p.lastStatsWrite.IsZero() && now.Sub(p.lastStatsWrite) < auditWriterStatsInterval {
+		return
+	}
+	// 先清脏标记再读计数：读到计数后到达的新失败会重新置脏，不丢更新。
+	p.statsDirty.Store(false)
+	payload := struct {
+		Dropped   uint64 `json:"dropped"`
+		IOErrors  uint64 `json:"io_errors"`
+		WrittenAt string `json:"written_at"`
+	}{
+		Dropped:   p.dropped.Load(),
+		IOErrors:  p.ioErrors.Load(),
+		WrittenAt: now.UTC().Format(time.RFC3339),
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	path := auditWriterStatsPath(p.target)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, body, 0o644); err != nil {
+		return // 尽力而为：计数仍在内存，下次变化/重试再写
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return
+	}
+	p.lastStatsWrite = now
 }
 
 // processSafely 隔离单条审计行处理的 panic（formatter/快照实现异常）：
@@ -1285,7 +1411,7 @@ func (p *auditPipeline) flush() {
 }
 
 // FlushAuditPipelines 冲刷全部存活管线；Caddy 模块 Cleanup（reload/优雅停机）
-// 调用，弥补上游从不调用 AuditLogWriter.Close 导致的尾部丢失（历史）。
+// 调用，弥补上游从不调用 AuditLogWriter.Close 导致的尾部丢失。
 // 只刷盘不关闭：管线是进程级单例，fd/drain 的生命周期与进程一致。
 func FlushAuditPipelines() {
 	auditPipelinesMu.Lock()

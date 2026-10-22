@@ -1,6 +1,6 @@
 // 威胁大屏光流视觉单源：2D 地图 / 3D 地球 / Vue 图例共用。
 // 颜色、线宽、聚合阈值、聚合标签、飞行时长、缓动与到站脉冲参数只在这里定义，
-// 避免两引擎漂移（历史问题：easeOutCubic/涟漪/浮签字色/地域键四组曾各写一份）。
+// 避免两引擎漂移（easeOutCubic/涟漪/浮签字色/地域键四组曾各写一份）。
 
 export const FLOW_NORMAL_COLOR = '#38bdf8'
 export const FLOW_ATTACK_COLOR = '#e25454'
@@ -11,7 +11,7 @@ export const FLOW_AGGREGATE_THRESHOLD = 3
 /** 单次飞行时长（毫秒）；2D 地图换算为秒，3D 地球直接用作 dash 周期。 */
 export const FLOW_FLIGHT_MS = 950
 
-/** 悬停浮签字色（两引擎同源；历史问题：地图 #e2e8f0 / 地球 #e2ecff 漂移）。 */
+/** 悬停浮签字色（两引擎同源；地图 #e2e8f0 / 地球 #e2ecff 漂移）。*/
 export const FLOW_HOVER_TIP_COLOR = '#e2ecff'
 
 /** 光流线宽档位：采样后 1-3 逐条细、4-8 合并中粗、>8 合并最粗。 */

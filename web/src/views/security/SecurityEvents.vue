@@ -8,12 +8,12 @@
         </h2>
         <p class="page-desc">查看安全拦截与检测事件记录</p>
       </div>
-      <!-- 历史修复：刷新联动自动封禁状态卡——建议列表/今日封禁/名单数不再
+      <!-- 刷新联动自动封禁状态卡——建议列表/今日封禁/名单数不再
            停留在进入页面时的快照 -->
       <el-button :icon="Refresh" @click="refreshPage">刷新</el-button>
     </div>
 
-    <!-- 自动封禁状态卡（历史问题）：状态/口径/窗口/阈值/时长/今日封禁/名单数；
+    <!-- 自动封禁状态卡：状态/口径/窗口/阈值/时长/今日封禁/名单数；
          配置入口=点击卡片主体（2026-10-14 裁定：废除「配置」按钮），按钮区仅留
          启用/禁用 toggle（直接切换业务开关并联动调度；「立即执行」废除——任务只能
          由「启用后按配置调度执行」） -->
@@ -42,7 +42,7 @@
               <el-tag :type="autobanStatus.enabled ? (autobanStatus.dry_run ? 'warning' : 'success') : 'info'" size="small" effect="plain">
                 {{ autobanStatus.enabled ? (autobanStatus.dry_run ? '观察模式' : '运行中') : '未启用' }}
               </el-tag>
-              <!-- 历史修复：调度仅主节点执行——从端徽章标示+写按钮禁用 -->
+              <!-- 调度仅主节点执行——从端徽章标示+写按钮禁用-->
               <el-tag v-if="!autobanStatus.is_master" type="info" size="small" effect="plain">仅主节点调度</el-tag>
             </div>
             <div class="autoban-stats">
@@ -68,7 +68,7 @@
           <el-button v-else size="small" type="success" plain :disabled="!autobanWritable" @click="openAutobanConfigForEnable">启用</el-button>
         </div>
       </div>
-      <!-- 未生效黄条（历史问题-02）：判据=ban_effective（名单非空且被启用+deny 的策略引用），
+      <!-- 未生效黄条：判据=ban_effective（名单非空且被启用+deny 的策略引用），
            不再用 list_referenced（四面引用集会把「仅被白名单/受信代理引用」误当生效） -->
       <div v-if="autobanIneffective" class="info-note-bar autoban-warn-bar">
         <span class="info-note-desc">「自动封禁名单」尚未生效——名单为空，或尚未被启用中的 IP 访问控制（deny）策略引用；请到「安全规则 → IP 地址列表」将该名单引用到 IP 访问控制（deny）策略</span>
@@ -108,8 +108,8 @@
     </el-card>
 
     <el-card>
-      <div v-if="ingestionStatus.observed && !ingestionStatus.healthy" class="info-note-bar autoban-warn-bar">
-        <span class="info-note-desc">安全事件采集连续失败 {{ ingestionStatus.consecutive_failures }} 次{{ ingestionStatus.last_error ? `：${ingestionStatus.last_error}` : '' }}，事件数据可能滞后；请检查任务日志与审计日志目录。</span>
+      <div v-if="ingestionWarning" class="info-note-bar autoban-warn-bar">
+        <span class="info-note-desc">{{ ingestionWarning }}</span>
       </div>
       <div class="table-toolbar">
         <el-date-picker
@@ -122,13 +122,13 @@
           format="YYYY-MM-DD HH:mm:ss"
           value-format="YYYY-MM-DD HH:mm:ss"
           :default-time="[new Date(2000, 0, 1, 0, 0, 0), new Date(2000, 0, 1, 23, 59, 59)]"
-          class="filter-date-range"
+          class="events-filter-date-range"
         />
         <el-select v-model="filters.action" placeholder="动作" clearable style="width: 90px">
           <el-option label="拦截" value="blocked" />
           <el-option label="检测" value="logged" />
         </el-select>
-        <!-- 历史问题 十九次（用户需求）：规则 ID 筛选替换为三列（负载规则/触发规则/策略）
+        <!-- （用户需求）：规则 ID 筛选替换为三列（负载规则/触发规则/策略）
              服务端筛选（rule_name/rule_triggered/policy_name LIKE）。 -->
         <el-input v-model="filters.rule_name" placeholder="负载规则" clearable style="width: 100px" @keyup.enter="applyFilters" />
         <!-- 触发规则筛选：多选 + 头部全选（勾的就是看的，统一正向心智）。
@@ -213,7 +213,7 @@
             <span v-else>—</span>
           </template>
         </el-table-column>
-        <!-- 用户裁定(历史):内容上限 ~190-200px(IPv4 126+gap+归属地 72),定宽 200 不再挤占方法/URI -->
+        <!-- 用户裁定:内容上限 ~190-200px(IPv4 126+gap+归属地 72),定宽 200 不再挤占方法/URI-->
         <el-table-column label="客户端 IP" width="200">
           <template #default="{ row }">
             <IPLocationAction :ip="row.client_ip" :location="row.ip_location" :rule-caddy-id="row.rule_caddy_id" />
@@ -222,7 +222,7 @@
         <!-- OPTIONS 为最长方法名(7 字符),90 定宽 -->
         <el-table-column prop="method" label="方法" width="90" align="center" />
         <el-table-column prop="uri" label="URI" min-width="140" show-overflow-tooltip />
-        <!-- 历史问题（用户需求）：异常评分列——CRS 评分制下每事件携带的累计
+        <!-- （用户需求）：异常评分列——CRS 评分制下每事件携带的累计
              anomaly_score（后端已返回，此前未展示）；按分数着色便于快速识别高威胁。 -->
         <el-table-column label="评分" width="80" align="center">
           <template #default="{ row }">
@@ -253,14 +253,14 @@
       </div>
     </el-card>
 
-    <!-- 触发详情弹框（历史统一）：全部触发类型共用同一风格与交互；
+    <!-- 触发详情弹框（统一）：全部触发类型共用同一风格与交互；
          信息优先展示，IP 处置动作收敛到 IP 快捷弹框（列表中点击 IP） -->
     <TriggerDetailDialog v-model="triggerDetailVisible" :row="triggerDetailRow" />
 
-    <!-- 自动封禁配置弹框（历史问题）：六项配置+口径/窗口变更重置提示 -->
+    <!-- 自动封禁配置弹框：六项配置+口径/窗口变更重置提示-->
     <el-dialog v-model="autobanDialogVisible" width="min(600px, 94vw)" top="8vh" append-to-body class="dialog-body-inset">
       <template #header>
-        <!-- 历史修复：喂入门只排除「已验证爬虫豁免」事件，ACL/GeoIP/威胁情报事件
+        <!-- 喂入门只排除「已验证爬虫豁免」事件，ACL/GeoIP/威胁情报事件
              同样计数——文案不得自缩为「WAF 事件」，否则用户按「只有 WAF 命中才
              计数」校准阈值会过早封禁 -->
         <DialogHeader :icon="Lock" title="自动封禁配置" subtitle="安全事件（IP 访问控制/地域/WAF/威胁情报，已验证爬虫豁免除外）固定窗口计数达到阈值即写入「自动封禁名单」（调度开启时到期自动解封）" />
@@ -300,7 +300,8 @@
     <!-- 请求上下文详情：策略开启「记录请求体」后，命中规则事件携带的请求头/请求体。
          请求头为 map[string][]string JSON 文本（多值以 ", " 连接；Cookie/Authorization/
          Set-Cookie/Proxy-Authorization 值默认掩码，逐行眼睛图标点击显示）；合成键
-         _lb_dropped_headers 渲染为信息行而非头行。请求体按契约前缀解析：base64-truncated: →
+         _lb_dropped_headers（采集 64KB）与 _lb_list_dropped_headers（列表 16KB）渲染为
+         信息行而非头行。请求体按契约前缀解析：base64-truncated: →
          base64: → 明文；明文尾部 \n...[TRUNCATED] 标记转为截断横幅；atob 解码失败
          展示原始内容 + 错误说明。宽度/顶距与 crs-event-dialog 一致。 -->
     <el-dialog v-model="ctxDialogVisible" width="min(760px, 94vw)" top="5vh" append-to-body class="ctx-event-dialog dialog-body-inset">
@@ -332,8 +333,9 @@
           <div class="info-note-bar ctx-banner"><span class="info-note-desc">请求头记录解析失败，以下为原始内容</span></div>
           <pre class="ctx-body-pre">{{ ctxEvent.request_headers }}</pre>
         </template>
-        <template v-else-if="ctxHeadersParsed.rows.length > 0 || ctxHeadersParsed.dropped > 0">
+        <template v-else-if="ctxHeadersParsed.rows.length > 0 || ctxHeadersParsed.dropped > 0 || ctxHeadersParsed.listDropped > 0">
           <div v-if="ctxHeadersParsed.dropped > 0" class="ctx-info-line">已隐藏 {{ ctxHeadersParsed.dropped }} 个头（请求头超出 64KB 采集上限）</div>
+          <div v-if="ctxHeadersParsed.listDropped > 0" class="ctx-info-line">已隐藏 {{ ctxHeadersParsed.listDropped }} 个头（请求头超出列表 16KB 展示上限）</div>
           <el-table v-if="ctxHeadersParsed.rows.length > 0" :data="ctxHeadersParsed.rows" size="small" :max-height="260" :header-cell-style="{ background: '#f9fafb' }">
             <el-table-column prop="name" label="名称" width="200" show-overflow-tooltip />
             <el-table-column label="值" min-width="380">
@@ -391,24 +393,25 @@ import { TRIGGERED_CATEGORIES, serializeTriggeredFilter } from '@/utils/triggere
 import { isAutobanIneffective } from '@/utils/autobanStatus'
 import IPLocationAction from '@/views/security/IPLocationAction.vue'
 import { formatDate } from '@/utils/date'
+import { ingestionWarningMessage, type IngestionHealth } from '@/utils/ingestionHealth'
 import type { APIResponse } from '@/types'
 
 interface SecurityEvent { id: number; event_time: string; rule_caddy_id: string; rule_name: string; policy_id: number; policy_name: string; client_ip: string; ip_location: string; method: string; uri: string; event_type: string; rule_triggered: string; rule_msg: string; trigger_type?: string; action: string; anomaly_score: number; duration_us: number; precheck_us: number; request_headers: string; request_body: string }
 
-// —— 自动封禁（历史问题）：状态卡/配置弹框 ——
+// 自动封禁：状态卡/配置弹框 ——
 
 interface AutobanSuggestion { ip: string; count: number; ip_location?: string; window_start?: string; last_seen?: string }
 interface AutobanStatus {
   enabled: boolean; dry_run: boolean; threshold: number; window_minutes: number
   duration: string; scope: string; banned_today: number; list_entries: number
-  // 历史问题-02：黄条判据 = 封禁是否真正生效（名单非空 ∧ 被启用+IP ACL 启用+deny 的
+  // 黄条判据 = 封禁是否真正生效（名单非空 ∧ 被启用+IP ACL 启用+deny 的
   // 策略在 ip_acl_list_refs 引用）。后端 list_referenced 为热路径资格门的四面
   // 引用集（含白名单/受信代理/CRS 排除），不能区分「引用」与「拦截生效」——
-  // 纯后端内部字段，本卡不声明不消费（历史修复 死字段移除）。
+  // 纯后端内部字段，本卡不声明不消费。
   ban_effective: boolean
   suggestions: AutobanSuggestion[]
   // 后端另有 running/last_run/last_status/role/tracked_ips（API 契约保留）——
-  // 本卡零消费，不再声明（历史问题：声明即暗示已渲染）。
+  // 本卡零消费，不再声明。
   is_master: boolean
 }
 const AUTOBAN_DURATIONS = [
@@ -424,12 +427,12 @@ const AUTOBAN_SCOPES = [
 const autobanStatus = ref<AutobanStatus>({
   enabled: false, dry_run: true, threshold: 100, window_minutes: 5, duration: '1h', scope: 'all',
   banned_today: 0, list_entries: 0, ban_effective: true, suggestions: [],
-  // 默认 false：成功响应前不得假定主节点可写（历史问题 失败关闭）
+  // 默认 false：成功响应前不得假定主节点可写
   is_master: false,
 })
 const autobanStatusLoading = ref(false)
 const autobanToggling = ref(false)
-// 状态读取失败（历史问题）：错误态不得按「确定状态」展示——写入口一律禁用
+// 状态读取失败：错误态不得按「确定状态」展示——写入口一律禁用
 const autobanStatusError = ref(false)
 // 黄条判据单源（utils/autobanStatus，行为钉测）：仅 enabled ∧ ban_effective===false
 const autobanIneffective = computed(() => isAutobanIneffective(autobanStatus.value))
@@ -483,7 +486,7 @@ const fetchAutobanStatus = async (): Promise<void> => {
     if (res.data) autobanStatus.value = res.data
     autobanStatusError.value = false
   } catch {
-    // 显性错误态（历史问题）：不再退化为「未启用」默认值并放行写按钮
+    // 显性错误态：不再退化为「未启用」默认值并放行写按钮
     autobanStatusError.value = true
   }
   finally { autobanStatusLoading.value = false }
@@ -505,6 +508,8 @@ const openAutobanConfig = (): void => {
   autobanDialogVisible.value = true
 }
 const saveAutobanConfig = async (): Promise<void> => {
+  // 函数级纵深守卫（与 openAutobanConfig 同构）：按钮 :disabled 仅呈现层
+  if (!autobanWritable.value) return
   if (autobanForm.value.threshold < 1 || autobanForm.value.threshold > 10000) {
     ElMessage.warning('阈值须在 1-10000 之间'); return
   }
@@ -576,8 +581,9 @@ const openAutobanConfigForEnable = (): void => {
 }
 
 const toggleAutobanEnabled = async (): Promise<void> => {
-  // 守卫：仅在已启用状态执行禁用（此前条件写反致禁用按钮无效——用户报告修复）
-  if (autobanToggling.value || !autobanStatus.value.enabled) return
+  // 守卫：仅在已启用状态执行禁用（此前条件写反致禁用按钮无效——用户报告修复）；
+  // autobanWritable 函数级纵深门（与 openAutobanConfig/saveAutobanConfig 同构）
+  if (autobanToggling.value || !autobanStatus.value.enabled || !autobanWritable.value) return
   try {
     await ElMessageBox.confirm(
       '确认禁用自动封禁？任务调度将停止，禁用时会立即清除已到期的封禁条目并即时生效；未到期条目保留至到期自动失效。',
@@ -601,13 +607,13 @@ const toggleAutobanEnabled = async (): Promise<void> => {
   finally { autobanToggling.value = false }
 }
 
-// 触发阶段分类（历史追加需求，用户裁定）：IP ACL 族=黑白名单/信任/地域/
+// 触发阶段分类（追加需求，用户裁定）：IP ACL 族=黑白名单/信任/地域/
 // 威胁库预检，统一展示「IP 访问控制」；WAF 含 CRS 与自定义两源；请求体异常独立。
-// 历史修复（历史）：原 isIpAclFamily 谓词与 stageCategory 口径重叠（且被其包含
+// 原 isIpAclFamily 谓词与 stageCategory 口径重叠（且被其包含
 // ——链接门 `isIpAclFamily || stageCategory==='trust'` 等价于 stageCategory ∈
 // {acl,trust}），删除谓词，统一走 stageCategory 单一事实源。
 
-// 历史修复 ②：ctx 弹框耗时展示按族判定——仅 WAF 族（wafCrs/wafCustom/
+// ctx 弹框耗时展示按族判定——仅 WAF 族（wafCrs/wafCustom/
 // body）经 WAF 段独立测量用加和式（duration_us=WAF 段，拦截/记录两形态同为
 // 纯段口径）；预检族 duration_us≡precheck_us 单值展示（预检决策耗时，拦截与
 // 放行同口径——历史起预检拦在决策后、403 写出前记录，不再混入链首全程）。
@@ -616,11 +622,11 @@ const ctxWafFamily = computed(() => {
   return ['wafCrs', 'wafCustom', 'body'].includes(triggerStageFamily(t))
 })
 
-// 历史修复：stageCategory 改由共享 triggerStageFamily 投影（securityStages 唯一
-// 实现，原 历史问题 双实现并存欠账）——本视图五桶 = 细粒度族的合并投影：
+// stageCategory 改由共享 triggerStageFamily 投影（securityStages 唯一
+// 实现，原双实现并存欠账）——本视图五桶 = 细粒度族的合并投影
 // ipAcl/geoip/threat 同归「IP 访问控制」（阶段 1 合并口径），wafCrs/wafCustom
 // 同归「WAF」；trust/body/other 同名直通。
-// 历史问题：crawler 独立成类（后端 v2.3.8 将已验证爬虫/伪装从地域段拆出）——
+// crawler 独立成类（后端 v2.3.8 将已验证爬虫/伪装从地域段拆出）——
 // 阶段列显示「爬虫校验」而非笼统归入 IP 访问控制；仍是阶段 1 预检事件，
 // 点击进入同一触发详情弹框。
 const stageCategory = (row: SecurityEvent): 'trust' | 'acl' | 'crawler' | 'waf' | 'body' | 'other' => {
@@ -650,7 +656,7 @@ const showTriggeredMsg = (row: SecurityEvent): boolean => {
   return !!t && t !== '2' && t !== '3' && t !== '4' && t !== '5' && !/^949/.test(t) && !!row.rule_msg
 }
 
-// —— 触发详情弹框（历史统一入口）：全部触发类型共用 TriggerDetailDialog ——
+// —— 触发详情弹框（统一入口）：全部触发类型共用 TriggerDetailDialog ——
 const triggerDetailVisible = ref(false)
 const triggerDetailRow = ref<SecurityEvent | null>(null)
 const openTriggerDetail = (row: SecurityEvent): void => {
@@ -661,8 +667,9 @@ const openTriggerDetail = (row: SecurityEvent): void => {
 
 const loading = ref(false)
 const events = ref<SecurityEvent[]>([])
-interface IngestionStatus { observed: boolean; healthy: boolean; consecutive_failures: number; last_error?: string; last_error_at?: string; last_success_at?: string }
-const ingestionStatus = ref<IngestionStatus>({ observed: false, healthy: false, consecutive_failures: 0 })
+const ingestionStatus = ref<IngestionHealth>({ observed: false, healthy: false, consecutive_failures: 0 })
+// 采集健康位提示（任务已停/连续失败/审计写侧降级）——判据与文案与总览/大屏同源。
+const ingestionWarning = computed(() => ingestionWarningMessage(ingestionStatus.value))
 
 // —— 请求上下文详情弹框（策略「记录请求体」开启后事件携带 request_headers/request_body）——
 const ctxDialogVisible = ref(false)
@@ -693,19 +700,21 @@ const CTX_B64_TRUNCATED_PREFIX = 'base64-truncated:'
 const CTX_B64_PREFIX = 'base64:'
 
 interface CtxHeaderRow { name: string; value: string; sensitive: boolean }
-interface CtxHeadersParsed { rows: CtxHeaderRow[]; dropped: number; failed: boolean }
+interface CtxHeadersParsed { rows: CtxHeaderRow[]; dropped: number; listDropped: number; failed: boolean }
 
 // 请求头解析："" → 空态；JSON.parse try/catch 防御（失败展示原始内容 + 错误说明）；
-// 合成键 _lb_dropped_headers 是写侧保留键（客户端同名头已在摄取侧剥离），
-// 提取为信息行（N = 因 64KB 上限被丢弃的头数），不作为头行渲染；多值头以 ", " 连接
+// 合成键 _lb_dropped_headers（采集 64KB 裁剪）与 _lb_list_dropped_headers（列表 16KB
+// 裁剪）是写侧保留键（客户端同名头已在摄取侧剥离），分别提取为信息行、不作为头行
+// 渲染；多值头以 ", " 连接
 const ctxHeadersParsed = computed<CtxHeadersParsed>(() => {
   const raw = ctxEvent.value?.request_headers ?? ''
-  if (raw === '') return { rows: [], dropped: 0, failed: false }
+  if (raw === '') return { rows: [], dropped: 0, listDropped: 0, failed: false }
   try {
     const parsed: unknown = JSON.parse(raw)
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return { rows: [], dropped: 0, failed: true }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return { rows: [], dropped: 0, listDropped: 0, failed: true }
     const rows: CtxHeaderRow[] = []
     let dropped = 0
+    let listDropped = 0
     for (const [name, values] of Object.entries(parsed as Record<string, unknown>)) {
       const list = Array.isArray(values) ? values.map((v) => String(v)) : [String(values)]
       if (name === '_lb_dropped_headers') {
@@ -713,11 +722,16 @@ const ctxHeadersParsed = computed<CtxHeadersParsed>(() => {
         if (Number.isFinite(n) && n > 0) dropped = n
         continue
       }
+      if (name === '_lb_list_dropped_headers') {
+        const n = Number(list[0] ?? 0)
+        if (Number.isFinite(n) && n > 0) listDropped = n
+        continue
+      }
       rows.push({ name, value: list.join(', '), sensitive: CTX_SENSITIVE_HEADERS.has(name.toLowerCase()) })
     }
-    return { rows, dropped, failed: false }
+    return { rows, dropped, listDropped, failed: false }
   } catch {
-    return { rows: [], dropped: 0, failed: true }
+    return { rows: [], dropped: 0, listDropped: 0, failed: true }
   }
 })
 
@@ -774,8 +788,8 @@ const pageSize = ref(20)
 const total = ref(0)
 const logStorageRefreshKey = ref(0)
 
-// 触发阶段筛选为固定预置八类（历史用户裁定：固定预置值，不接受任意值）。
-// 令牌 → 后端族段映射与序列化单源在 utils/triggeredFilter（历史修复：
+// 触发阶段筛选为固定预置八类（用户裁定：固定预置值，不接受任意值）。
+// 令牌 → 后端族段映射与序列化单源在 utils/triggeredFilter
 // 原实现内联在本文件、无行为测试）。
 const filters = ref({ action: '', ip: '', uri: '', rule_name: '', rule_triggered: [...TRIGGERED_CATEGORIES] as string[], policy_name: '', timeRange: null as [string, string] | null })
 
@@ -796,7 +810,7 @@ const applyFilters = () => {
   const range = filters.value.timeRange
   if (range?.[0] && range?.[1] && range[0] > range[1]) {
     ElMessage.warning('开始时间不能晚于结束时间')
-    // 历史问题：只清 end 保留已填的 start（原清空整个区间丢两侧输入）
+    // 只清 end 保留已填的 start（原清空整个区间丢两侧输入）
     filters.value.timeRange = [range[0], '']
   }
   page.value = 1
@@ -813,7 +827,7 @@ const handleSizeChange = () => { page.value = 1; fetchEvents() }
 
 const goToRule = (row: SecurityEvent) => { window.open(`/?page=rules&rs=${encodeURIComponent(row.rule_caddy_id)}`, '_blank') }
 const goToPolicy = (row: SecurityEvent) => {
-  // 历史修复：交接改走 URL query（sp / sp-search 参数，同 goToRule 的 rs 形态），
+  // 交接改走 URL query（sp / sp-search 参数，同 goToRule 的 rs 形态），
   // SecurityPolicies.vue onMounted 消费后 replaceState 清除。
   if (row.policy_id > 0) {
     window.open(`/?page=security-policies&sp=${row.policy_id}`, '_blank')
@@ -840,14 +854,14 @@ const fetchEvents = async () => {
     if (filters.value.uri) p.set('uri', filters.value.uri)
     if (filters.value.timeRange?.[0]) p.set('start_time', filters.value.timeRange[0])
     if (filters.value.timeRange?.[1]) p.set('end_time', filters.value.timeRange[1])
-    const res = await request.get<APIResponse<{ events: SecurityEvent[]; total: number; ingestion?: IngestionStatus }>>(`/security/events?${p}`)
+    const res = await request.get<APIResponse<{ events: SecurityEvent[]; total: number; ingestion?: IngestionHealth }>>(`/security/events?${p}`)
     if (requestSeq !== fetchEventsSeq) return
     events.value = res.data?.events || []
     total.value = res.data?.total || 0
     if (res.data?.ingestion) ingestionStatus.value = res.data.ingestion
     logStorageRefreshKey.value++
   } catch {
-    // 历史问题：瞬态失败保留末次成功数据（对齐 AuditLog 口径）——此前清空列表
+    // 瞬态失败保留末次成功数据（对齐 AuditLog 口径）——此前清空列表
     // 却保留陈旧 total，空态文案「暂无安全事件」在排障窗口内误导为「无攻击」。
     // 全局拦截器已弹失败 toast。
   } finally {
@@ -859,7 +873,7 @@ onMounted(() => {
   fetchAutobanStatus()
 })
 
-// 历史修复：页面刷新同时拉自动封禁状态（调度在后台持续运行，dry-run 建议
+// 页面刷新同时拉自动封禁状态（调度在后台持续运行，dry-run 建议
 // 列表/banned_today/list_entries 不作长期快照）。
 const refreshPage = (): void => {
   void fetchEvents()
@@ -868,7 +882,7 @@ const refreshPage = (): void => {
 </script>
 
 <style scoped>
-/* —— 自动封禁状态卡（历史问题）—— */
+/* 自动封禁状态卡——*/
 .autoban-card { margin-bottom: 16px; }
 .autoban-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 /* 卡片主体=配置入口（2026-10-14 裁定）：标题/参数区可点，hover 灰底+pointer 反馈；
@@ -922,14 +936,14 @@ const refreshPage = (): void => {
 </style>
 
 <style>
-.filter-date-range.el-date-editor {
+.events-filter-date-range.el-date-editor {
   --el-date-editor-width: 320px;
   width: 320px;
   flex: 0 0 auto;
 }
 
 /* 请求上下文弹框：正文区自适应限高（top=5vh + 头/脚 ≈ 110px），内容多时整体不超视口
-   （FE-D1：.crs-event-dialog 左半选择器删除——CRS 事件弹框已迁入 TriggerDetailDialog） */
+   （.crs-event-dialog 左半选择器删除——CRS 事件弹框已迁入 TriggerDetailDialog） */
 .ctx-event-dialog .el-dialog__body { max-height: calc(90vh - 130px); overflow-y: auto; }
 /* 请求上下文弹框正文 20px 水平留白走全局 .dialog-body-inset（2026-09-25 用户裁定；
    append-to-body teleport 场景 scoped :deep 不可靠，故类挂弹框、规则在 main.css） */

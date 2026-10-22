@@ -131,7 +131,7 @@ func TestRDBStrictRender_threatFilePresentRendersNormally(t *testing.T) {
 	if mainRoute == nil && len(routes) == 0 {
 		t.Fatal("路由必须正常生成")
 	}
-	// 历史问题（历史）：原断言只证明「不是空路由」，未钉住文件在场时
+	// 原断言只证明「不是空路由」，未钉住文件在场时
 	// 的实际契约——引用策略必须以 @ipListFast 文件投影参与预检，且投影内容=
 	// .iplist 条目聚合（ACL 保护面不得静默收窄）。
 	wafs := wafHandlers(t, mainRoute)

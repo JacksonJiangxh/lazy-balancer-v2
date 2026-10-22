@@ -34,7 +34,7 @@ func TestRateLimitBucketEviction_protectsLoginScope(t *testing.T) {
 	}
 }
 
-// 历史修复：匿名端点（oidc-callback / service-control / 机器 scope 的 |ip 桶）
+// 匿名端点（oidc-callback / service-control / 机器 scope 的 |ip 桶）
 // 每个源 IP 仅凭公开请求即可建桶，攻击者可把 1024 容量填成「全非凭证桶」。
 // 此时旧实现回退全表 LRU，最旧的 login/register 桶（10/min 与 30/min 的
 // 爆破/审计放大窗口）被淘汰 → 限流窗口被重置且可循环推满。淘汰次序必须

@@ -31,7 +31,7 @@ func SetCrawlerIPListFileForTest(path string) func() {
 
 // crawlerBuiltinSnapshot 新实例内置首版（单一事实源见
 // geoipnames.BuiltinCrawlerIPLists：官方源快照随 geoipnames 包嵌入，镜像内
-// /app/waf.dist 的同名文件由 Dockerfile 从同一路径 COPY）。历史修复（历史）
+// /app/waf.dist 的同名文件由 Dockerfile 从同一路径 COPY）。
 // 删除了此处的第二份手写副本——它曾与镜像种子分叉（gptbot 3 条 vs 18 条，
 // 且含官方已不发布的 20.191.0.0/16 超网）。消费点仅剩「收缩门基线」
 // （crawler_update.go 的 crawlerSnapshotShrinkGuard），运行期名单恒以 DB 为
@@ -99,7 +99,7 @@ func (m *CrawlerUpdateManager) Prime() error {
 	if err := migrateCrawlerIPListNames(); err != nil {
 		return err
 	}
-	// 历史问题-05：启动期把内置源的 canonical url/format 刷新到存量行（用户开关/
+	// 启动期把内置源的 canonical url/format 刷新到存量行（用户开关/
 	// 状态/排程保持不变），修复「URL/格式修正只对新库生效」的升级盲区。
 	if err := refreshCrawlerSources(); err != nil {
 		return err
@@ -138,9 +138,21 @@ func upsertCrawlerIPList(engineID string, entries []string) error {
 
 // upsertCrawlerIPListChanged 名单行原子快照：内容变化才更新（entries JSON、
 // updated_at、entry_count）；失败/空集不写（保留上次快照）。
-// 返回 changed=DB/快照内容真实变化（调用方据此决定投影收敛，历史问题）。
+// 返回 changed=DB/快照内容真实变化（调用方据此决定投影收敛）。
 // 同步推送插件内存态（模块边界友好：caddygeoip 独立模块不能 import 根 DB）。
 func upsertCrawlerIPListChanged(engineID string, entries []string) (bool, error) {
+	if len(entries) == 0 {
+		return false, errors.New("空 IP 段列表（解析无产出）")
+	}
+	if err := crawlerIPListMigrate(); err != nil {
+		return false, err
+	}
+	return upsertCrawlerIPListChangedInner(engineID, entries)
+}
+
+// upsertCrawlerIPListChangedInner upsert 主体（名单名迁移已由调用方完成——
+// RunUpdate 单轮提升一次；独立调用方走 upsertCrawlerIPListChanged 带迁移形态）。
+func upsertCrawlerIPListChangedInner(engineID string, entries []string) (bool, error) {
 	if len(entries) == 0 {
 		return false, errors.New("空 IP 段列表（解析无产出）")
 	}
@@ -152,9 +164,6 @@ func upsertCrawlerIPListChanged(engineID string, entries []string) (bool, error)
 	if err != nil {
 		return false, err
 	}
-	if err := migrateCrawlerIPListNames(); err != nil {
-		return false, err
-	}
 	name := CrawlerIPListName(engineID)
 	var existing string
 	scanErr := db.DB.QueryRow(`SELECT COALESCE(entries,'') FROM security_ip_lists WHERE name=? AND system=1`, name).Scan(&existing)
@@ -162,10 +171,10 @@ func upsertCrawlerIPListChanged(engineID string, entries []string) (bool, error)
 		return false, scanErr
 	}
 	if scanErr == nil && crawlerEntriesUnchanged(existing, entries) {
-		// 历史修复（历史）：判定改为内容（多重集）比较而非顺序敏感
+		// 判定改为内容（多重集）比较而非顺序敏感
 		// 字节比较——源站同集合换序曾每轮误判 changed=true（写放大+「更新成功」
 		// 噪声）。DB 展示顺序保持不变（未变化不重写）。
-		// 未变化仍须校验**快照内容**（历史问题）：不能只看文件存在/DB 值——
+		// 未变化仍须校验**快照内容**：不能只看文件存在/DB 值——
 		// 文件缺失/坏 JSON/陈旧内容（首轮快照写失败、升级遗留）都要从 DB/entries
 		// 重建；writeCrawlerIPListSnapshot 从 DB 全量重建并覆盖本引擎，其他引擎
 		// 分片保留。

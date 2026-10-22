@@ -16,7 +16,7 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// 历史修复(历史问题):CreateRule 对禁用规则(enabled=false)不应创建
+// CreateRule 对禁用规则(enabled=false)不应创建
 // ACME 签发任务——复制向导硬编码 enabled:false,每次复制白烧 1 次 LE 配额。
 // UpdateRule 已有此门（needJob 与 *req.Enabled 合取，函数内「禁用不签发」段），
 // CreateRule 缺失(系统不变量:禁用⇒不签发)。
@@ -69,7 +69,7 @@ func TestCreateRule_disabledRuleDoesNotQueueCertJob(t *testing.T) {
 	}
 }
 
-// 历史问题：创建 ACME 规则的正向链路（生成 cert_jobs）此前无钉测——
+// 创建 ACME 规则的正向链路（生成 cert_jobs）此前无钉测——
 // 仅覆盖禁用规则 count==0 的负向与补偿 500。此用例锁住「启用 + ACME 引用
 // 有效 → 创建后确有证书任务行」。
 func TestCreateRule_enabledACMECreatesCertJob(t *testing.T) {
@@ -121,7 +121,7 @@ func TestCreateRule_enabledACMECreatesCertJob(t *testing.T) {
 	}
 }
 
-// 历史修复：证书入队失败映射——规则态冲突（并发禁用/改域/删除）必须 409 且
+// 证书入队失败映射——规则态冲突（并发禁用/改域/删除）必须 409 且
 // 可操作，不得折成 500「内部故障」。
 func TestCertEnqueueErrorResponse_mapsRuleStateConflictTo409(t *testing.T) {
 	status, message := certEnqueueErrorResponse("创建证书任务失败", services.ErrCertRuleStateConflict)
@@ -142,7 +142,7 @@ func TestCertEnqueueErrorResponse_mapsRuleStateConflictTo409(t *testing.T) {
 	}
 }
 
-// 历史修复：规则数据导致的生成失败是「可自行修正」的配置问题 → 400，不是 500。
+// 规则数据导致的生成失败是「可自行修正」的配置问题 → 400，不是 500。
 // 形态：全局 request_body_max_size_mb 被带外写成 0，启用规则时渲染必败。
 func TestEnableRule_generationFailureMapsTo400(t *testing.T) {
 	h := newRuleFeatureTestHandlers(t)

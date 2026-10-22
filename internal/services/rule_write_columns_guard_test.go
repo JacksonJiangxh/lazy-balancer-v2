@@ -1,9 +1,9 @@
 package services
 
-// 历史问题（历史）结构守卫：生产代码中「INSERT INTO lb_rules (」
+// 结构守卫：生产代码中「INSERT INTO lb_rules (」
 // 手写字面量唯一豁免=config_import_v1.go（v1 遗留转换器，窄清单语义已裁定
 // 维持）；其余站点必须经 LbRuleInsertSQL 单源生成——新增列漏改某一处即
-// 「保存成功但与快照/副本不同形」（历史问题 缺陷形态）。
+// 「保存成功但与快照/副本不同形」。
 
 import (
 	"go/ast"
@@ -18,7 +18,7 @@ import (
 )
 
 // handwrittenRuleInsertPattern 匹配「手写 lb_rules INSERT」的归一化形态。
-// 历史问题（历史）：原判定 strings.Contains(query, "INSERT INTO lb_rules (")
+// 原判定 strings.Contains(query, "INSERT INTO lb_rules (")
 // 是字面量、单空格、必须同串——`INSERT INTO lb_rules\n(…`、`INSERT OR REPLACE INTO
 // lb_rules`、`INSERT INTO "lb_rules"` 全部静默绕过单源门。匹配前统一做空白折叠
 // （strings.Fields 重连）与双引号剥离，再按大小写不敏感模式判定。
@@ -87,7 +87,7 @@ func TestLbRuleInsertStatements_useSingleSource(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：守卫判定必须先归一化再匹配——换行、多空格、带引号
+// 守卫判定必须先归一化再匹配——换行、多空格、带引号
 // 表名、INSERT OR REPLACE/IGNORE 任一形态都不得逃逸（原字面量 Contains 对上述
 // 形态静默漏检，新增手写 INSERT 只要换行即可绕过单源门）。
 func TestHandwrittenRuleInsertMatcher_normalizesFormattingVariants(t *testing.T) {

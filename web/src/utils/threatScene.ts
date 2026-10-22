@@ -48,7 +48,7 @@ const ZOOM_SECONDS = 0.6
 const RIPPLE_POOL = 12
 // 静态层离屏位图宽度上限（物理像素）。总览 zoom 随视口宽度增长（width×2/360），
 // 4K 屏可达 ~14，叠加 DPR 2 后宽度 >1 万物理像素（≈160MB）——超过上限时
-// 按上限分配、由 blit 放大（极端屏轻微软化，换取内存有界；历史问题
+// 按上限分配、由 blit 放大（极端屏轻微软化，换取内存有界；
 // 明确要求把 dpr 计入本判定）。
 const MAX_STATIC_WIDTH = 4096
 // 绝对热力标尺（log10(命中)/3 → 0..1），砖红三档，首段向底色插值
@@ -121,7 +121,7 @@ function pointInPolys(lon: number, lat: number, polys: number[][][]): boolean {
 /** 世界坐标点阵路径（x=lon+180, y=latToY(lat)，半径按世界单位）→ 屏幕的
  *  仿射变换 + 经度裁剪窗。
  *
- *  历史修复（悬停高亮每帧重建 Path2D）：路径按国家/省在世界坐标缓存一次，
+ * （悬停高亮每帧重建 Path2D）：路径按国家/省在世界坐标缓存一次，
  *  绘制只做 setTransform；相机平移/缩放不再触发路径重建。
  *  三份世界拷贝（±360°×zoom）覆盖环绕显示；裁剪窗宽=360°×zoom、居中于相机
  *  经度，保证每个点只在「最近副本」上出现一次（与旧逐点 wrapDeg 定位等价，
@@ -401,7 +401,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
   let staticDirty = true
 
   function rebuildStaticLayer(): void {
-    // DPR 计入离屏分配（历史问题）：原按 CSS 像素分配、blit 时放回 CSS
+    // DPR 计入离屏分配：原按 CSS 像素分配、blit 时放回 CSS
     // 尺寸 → Retina 下静态层被 2× 下采样（点阵发虚/边缘糊）。现按
     // zoom×dpr 分配并以同倍率变换绘制，blit 目标仍是 CSS 尺寸（1:1 物理像素）。
     const scale = Math.min(cam.zoom * dpr, MAX_STATIC_WIDTH / WORLD_W)
@@ -659,7 +659,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
     event.preventDefault()
   }
 
-  // 历史修复：指针移出画布即清悬停态+浮签（对齐地球引擎 pointerleave 清理）——
+  // 指针移出画布即清悬停态+浮签（对齐地球引擎 pointerleave 清理）——
   // 原实现移入右侧 HUD/底部图区后最后国家的提示框与提亮长期残留。
   function onPointerLeave(): void {
     hoverName = null
@@ -692,7 +692,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
     drillDirty = true
   }
 
-  // ---- 省界数据按需加载（历史问题） ----
+  // 省界数据按需加载 ----
   // admin1Provinces 是 1.9MB 静态表——顶栏首屏不需要它（仅下钻时消费）。
   // 共享加载器动态 import：Vite 切出独立 chunk，总览首屏零下载；加载失败按
   // 「无省层」降级（不白屏、不进下钻），并经 onProvinceLoadError 让视图 toast。
@@ -725,7 +725,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
   }
 
   let drillSeq = 0
-  // 历史问题：销毁标记——省界 chunk 在途时退出大屏，续体不得再操作已卸载视图
+  // 销毁标记——省界 chunk 在途时退出大屏，续体不得再操作已卸载视图
   let disposed = false
 
   async function drillToCountry(country: string): Promise<void> {
@@ -783,7 +783,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
     const fromX = cam.camX
     const toX = fromX + wrapDeg(camX - fromX)
     // 暂停态无动画帧驱动（rafId=0）：直接落点并补绘一帧，否则「复位视角/返回
-    // 世界/下钻」在暂停中静默无反应（历史问题）。
+    // 世界/下钻」在暂停中静默无反应。
     if (paused) {
       applyCamTarget(toX, camY, zoom)
       renderOnce()
@@ -1039,7 +1039,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
     }
   }
 
-  /** 单帧合成（tick 与暂停补绘共用，历史问题）：静态层 + hover +
+  /** 单帧合成（tick 与暂停补绘共用）：静态层 + hover +
    *  下钻省层 + 全部动态层（弧线/涟漪/信标/扫掠/浮签）。暂停帧传 delta=0：
    *  画面元素在位但动画不推进——原 renderOnce 只画静态层+浮签，暂停后弧线/
    *  信标/扫掠整层消失。 */
@@ -1114,7 +1114,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
           if (pointInPolys(geo.lon, geo.lat, pv.polys)) {
             hoverName = pv.name
             const short = shortName(pv.name)
-            // 历史修复：省级统计只覆盖中国（后端 threatLocationParts 仅对中国
+            // 省级统计只覆盖中国（后端 threatLocationParts 仅对中国
             // 取省）；海外下钻不得把「无数据源」渲染成「该省 0 次攻击」。
             hoverTip.textContent = hasProvinceStats(drillLayerCountry)
               ? `${short} ${provinceCounts.get(short) ?? provinceCounts.get(pv.name) ?? 0}`
@@ -1202,7 +1202,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
     // 否则每次回调都全量重绘静态层（用户实测地图刚打开卡顿）。
     if (sizeChanged || cam.zoom !== prevZoom) staticDirty = true
     // 暂停态无 tick 驱动：尺寸变化后必须补绘一帧，否则画布是新尺寸的空白
-    // （历史问题）。
+    // （尺寸/相机变化后暂停态仍需主动渲染）。
     if (paused) renderOnce()
   }
   const resizeObserver = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(applySize) : null
@@ -1229,7 +1229,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
       startLoop()
     },
     setCountries(entries: CountryHeat[]): void {
-      // 30s 轮询同数据不得触发整幅静态层重建（历史问题）：长度+逐键
+      // 30s 轮询同数据不得触发整幅静态层重建：长度+逐键
       // 浅比较，无变化直接返回（原恒 staticDirty=true → 每轮全量栅格化）。
       const nextCounts = aggregateCountryCounts(entries)
       if (heatEntriesEqual(countryCounts, [...nextCounts].map(([name, count]) => ({ name, count })))) return
@@ -1299,7 +1299,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
       }
     },
     dispose(): void {
-      // 历史问题：作废在途下钻（drillToCountry 的 await 后继体检查 disposed）
+      // 作废在途下钻（drillToCountry 的 await 后继体检查 disposed）
       disposed = true
       drillSeq += 1
       cancelAnimationFrame(rafId)

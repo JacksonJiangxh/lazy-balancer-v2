@@ -133,7 +133,7 @@ func TestCreateUser_passwordLengthBoundaries(t *testing.T) {
 	}
 }
 
-// 历史修复（收口 UpdateUser）：25 位密码的边界交 validatePasswordPolicy，
+// （收口 UpdateUser）：25 位密码的边界交 validatePasswordPolicy，
 // 修复前走绑定层 max=24 泛化 400「请求格式错误」，拿不到友好文案。
 func TestUpdateUser_passwordLengthRejectedByPolicyWithFriendlyMessage(t *testing.T) {
 	h := newBackupTestHandlers(t)

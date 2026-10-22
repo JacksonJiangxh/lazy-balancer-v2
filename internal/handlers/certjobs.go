@@ -25,16 +25,16 @@ import (
 var certJobOperationLocks [64]sync.Mutex
 
 // retryCertJobPreEnqueueHook 是测试专用钩子：在 SELECT 状态之后、EnqueueIfActive
-// 内 UPDATE 之前触发，用于模拟 worker 侧并发状态流转（历史问题 发现4 回归测试）。
+// 内 UPDATE 之前触发，用于模拟 worker 侧并发状态流转。
 var retryCertJobPreEnqueueHook func(jobID int)
 
 // deleteCertJobPreDisableHook 是测试专用钩子：在 DeleteCertJob 的状态 SELECT/守卫
-// 之后、disabled 翻转 UPDATE 之前触发，用于模拟 worker 侧并发状态流转（历史问题
+// 之后、disabled 翻转 UPDATE 之前触发，用于模拟 worker 侧并发状态流转
 // 回归测试）。
 var deleteCertJobPreDisableHook func(jobID int)
 
 // deleteCertJobPreRestoreHook 是测试专用钩子：DELETE 失败后、状态恢复 UPDATE
-// 之前触发，用于模拟「行在删除窗口内被并发移离 disabled」（历史问题 回归测试）。
+// 之前触发，用于模拟「行在删除窗口内被并发移离 disabled」。
 var deleteCertJobPreRestoreHook func(jobID int)
 
 // certJobLogPathForRule 解析规则的任务日志路径（测试缝：镜像 cancelCertJob 的
@@ -111,14 +111,14 @@ func (h *Handlers) ListCertJobs(c *gin.Context) {
 		return
 	}
 	statusRows.Close()
-	// 历史修复（历史）：字面量 30 → db.DefaultCertExpiryDays 绑定参数（caddy.go
-	// 历史修复 形态，库值唯一真相单源）。
+	// 字面量 30 → db.DefaultCertExpiryDays 绑定参数（caddy.go
+	// 形态，库值唯一真相单源）。
 	// 审计项：过期判定阈值改用 services.GetCertExpiryThreshold 单源边界面——
 	// 本处曾裸读 COALESCE 且不做 1-365 边界校验，库值越界（带外直写/旧快照）
 	// 会让列表「即将过期」标记与续签扫描口径分叉；单源 helper 越界时显性留痕
 	// 并降级治理默认。
 	expiryDays := services.GetCertExpiryThreshold()
-	// 历史问题(历史):cert_pem 只取首证书块——certificateIssuer 仅
+	// cert_pem 只取首证书块——certificateIssuer 仅
 	// 解析首块,全链(LE ~6KB)全量传输纯属浪费;INSTR 定位首个 END 边界,
 	// 空串/单块形态 SUBSTR 原样返回(与全量读取行为一致)。
 	query := `SELECT j.id, j.rule_id, j.domain, j.status, COALESCE(j.message,'') AS message,
@@ -175,7 +175,7 @@ func (h *Handlers) ListCertJobs(c *gin.Context) {
 		j.Issuer = certificateIssuer(certPEM)
 		j.CertificateStatus = "unknown"
 		if j.ExpiresAt.Valid {
-			// 历史：剩余天数收敛 CertDaysRemaining 单源；历史问题（历史）：
+			// 剩余天数收敛 CertDaysRemaining 单源；
 			// 状态判定收敛 CertificateExpiryStatus（天粒度——原 `<= days*24h`
 			// 纳秒口径与 certinfo 截断天数在阈值 +1m 处结论分叉）。
 			j.DaysRemaining = services.CertDaysRemaining(j.ExpiresAt.Time, now)
@@ -278,7 +278,7 @@ func (h *Handlers) RetryCertJob(c *gin.Context) {
 // TriggerSystemTask 的 cert-job 行触发分支共用——用户裁定 cert-job 行视为
 // 触发任务（可自动调度即可手动调度，证书可重签发）。
 func (h *Handlers) retryCertJobByID(c *gin.Context, id int) {
-	// 历史问题-01（历史）：导入窗口门与任务监控 toggle/control 同源。
+	// 导入窗口门与任务监控 toggle/control 同源。
 	// 导入会话持 db.DB 写事务直至 commit，且 CA 队列已 PauseAndDrain——此处的
 	// UPDATE（部署窗推进/重入队）要么阻塞在 SQLite 写锁上到 busy_timeout 后
 	// 500，要么提交后落到已被全量替换的 cert_jobs 行上，绕过导入的暂停/排空
@@ -304,10 +304,11 @@ func (h *Handlers) retryCertJobByID(c *gin.Context, id int) {
 		return
 	}
 
-	// 历史问题（历史）：downloaded + 材料在库的任务停在部署窗口——转 queued
-	// 会丢弃已签发证书并触发整轮重签（同 requeueCanceledJob / DeleteCertJob
-	// 恢复 / requeueCertJobsSnapshot 的取向）。改为把部署窗口推到 now 并立即
-	// 重排部署重试；仅「无材料」的 downloaded（历史脏行）才回落重新签发。
+	// 部署生命周期（downloaded/cleanup_dns/cleanup_warning）+ 材料在库的任务
+	// 停在部署窗口——转 queued 会丢弃已签发证书并触发整轮重签（同
+	// requeueCanceledJob / DeleteCertJob 恢复 / requeueCertJobsSnapshot 的取向）。
+	// 改为把部署窗口推到 now 并立即重排部署重试；仅「无材料」的此类任务
+	// （脏行）才回落重新签发。
 	if rescheduled, err := rescheduleDownloadedCertJobDeployment(id, ruleID, domain); err != nil {
 		if errors.Is(err, services.ErrCertificateDeploymentRetryBusy) {
 			c.JSON(http.StatusConflict, models.APIResponse{Code: http.StatusConflict, Message: "上一次部署回调仍在退出中，已登记自动部署，稍后自动执行"})
@@ -315,7 +316,7 @@ func (h *Handlers) retryCertJobByID(c *gin.Context, id int) {
 		}
 		if errors.Is(err, services.ErrCertificateQueueInactive) {
 			status, message := certEnqueueErrorResponse("部署重试未触发", err)
-			// 历史问题（历史）：失败响应必须点明 DB 真实状态——部署窗口已
+			// 失败响应必须点明 DB 真实状态——部署窗口已
 			// 推进到 now，服务恢复后补扫会自动部署（不是「什么都没发生」）。
 			message += "；已登记自动部署，恢复后自动执行"
 			c.JSON(status, models.APIResponse{Code: status, Message: message})
@@ -338,7 +339,7 @@ func (h *Handlers) retryCertJobByID(c *gin.Context, id int) {
 	}
 	// cert_jobs.domain 按排序后的规范形式存储，而 lb_rules.domain 保留用户输入顺序，
 	// 规则侧用 joined+reversed 双形式匹配（ACME 域名至多根域+www 两个）。
-	reversedDomain := reversedCertJobDomain(domain) // 历史修复-新4:复用同文件 helper
+	reversedDomain := reversedCertJobDomain(domain) // 新4:复用同文件 helper
 	if retryCertJobPreEnqueueHook != nil {
 		retryCertJobPreEnqueueHook(id)
 	}
@@ -362,18 +363,18 @@ func (h *Handlers) retryCertJobByID(c *gin.Context, id int) {
 	}
 	if !changed {
 		// SELECT(:254) 与 UPDATE 之间状态可能被 worker 流转（如 failed→creating_account），
-		// 导致 0 行影响；此时归因是并发竞争而非规则禁用，重读当前状态区分文案（历史问题 发现4）。
+		// 导致 0 行影响；此时归因是并发竞争而非规则禁用，重读当前状态区分文案。
 		var currentStatus string
 		scanErr := db.DB.QueryRow("SELECT status FROM cert_jobs WHERE id=?", id).Scan(&currentStatus)
 		if errors.Is(scanErr, sql.ErrNoRows) {
-			// 历史问题：行被并发删除（DeleteRule/DeleteCertJob）时归因 404 而非 500
-			// （对齐 DeleteCertJob 历史问题 的三分归因）。
+			// 行被并发删除（DeleteRule/DeleteCertJob）时归因 404 而非 500
+			// （对齐 DeleteCertJob 三分归因）。
 			c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "Job not found"})
 			return
 		}
 		if scanErr != nil {
 			// 重读失败属瞬时 DB 错误（SQLITE_BUSY 等），归因为规则禁用会误导用户，
-			// 显式区分 500（历史问题）。
+			// 显式区分 500。
 			services.Logf("error", "RetryCertJob reread job %d status failed: %v", id, scanErr)
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取任务状态失败"})
 			return
@@ -382,7 +383,7 @@ func (h *Handlers) retryCertJobByID(c *gin.Context, id int) {
 			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "任务状态已变更，请刷新后重试"})
 			return
 		}
-		// 历史问题：EnqueueIfActive 的在途命中（历史问题 发现2）同样走 !changed 且重读
+		// EnqueueIfActive 的在途命中同样走!changed 且重读
 		// 状态未变，需优先归因"任务正在队列中"，避免误导为规则禁用/配置变更。
 		if qm.IsJobActive(id) {
 			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "任务正在签发队列中，请勿重复操作"})
@@ -391,25 +392,35 @@ func (h *Handlers) retryCertJobByID(c *gin.Context, id int) {
 		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "任务关联规则已禁用、证书配置已变更或队列已暂停"})
 		return
 	}
-	// 历史问题-05：手动重试入队成功=有在途证书工作——唤醒 cert-waiting-ca
+	// 手动重试入队成功=有在途证书工作——唤醒 cert-waiting-ca
 	// （默认调度关闭，waiting_ca 冷却重排/滞留重入队的唯一属主；此前重试
 	// 绕过单点唤醒，任务滞留至 cert-reconcile 周期至多 6h）。
-	// 历史问题：入队成功即真实工作，唤醒入口不重查活跃态（队列可能已快速失败）。
+	// 入队成功即真实工作，唤醒入口不重查活跃态（队列可能已快速失败）。
 	services.WakeCertWaitingCAForEnqueuedJob()
 	recordAudit(c, "重试", "证书任务", services.FormatAuditDetail(services.AuditJobPart(id), services.AuditRulePart(ruleID), domain, fmt.Sprintf("原状态：%s", status), services.AuditResultPart("queued")))
 
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "Retry triggered"})
 }
 
-// rescheduleDownloadedCertJobDeployment 处理 downloaded 任务的「部署重排」快速
-// 路径：仅当任务仍为 downloaded、证书材料在库且关联规则仍处自动签发状态时，
-// 把部署窗口推到 now 并触发证书服务补扫（取消挂起的退避 timer → 立即部署）。
-// 返回 false 表示不适用（无材料/状态已变/规则失效），调用方回落重新入队语义。
+// rescheduleDownloadedCertJobDeployment 处理「证书材料已落库、只差部署」任务的
+// 部署重排快速路径：任务处于部署生命周期（JobLifecycle=downloaded，即
+// downloaded/cleanup_dns/cleanup_warning，与 requeueCanceledJob、启动恢复
+// requeueNonTerminalCertJobs 同口径）、证书材料在库且关联规则仍处自动签发
+// 状态时，把部署窗口推到 now 并触发证书服务补扫（取消挂起的退避 timer →
+// 立即部署）。返回 false 表示不适用（无材料/状态已变/规则失效），调用方
+// 回落重新入队语义。
+//
+// 在途 worker 语义：RequeueCanceledJob/cleanup_* 行的签发 worker 已结束（材料
+// 已落库），真正的并发面是部署回调。scheduleDeploymentRetry 对同 jobID 串行化
+// ——先取消挂起 timer、再对在途回调做有界等待，超时返回
+// ErrCertificateDeploymentRetryBusy（调用方 409，窗口已推送由补扫接管）。
+// 因此这里不需要额外的在途守卫：cleanup_* 与 downloaded 共用同一部署调度器，
+// 状态集放宽不放宽并发面（DeployLock + 终态 CAS 仍是最后防线）。
 func rescheduleDownloadedCertJobDeployment(id int, ruleID, domain string) (bool, error) {
 	reversedDomain := reversedCertJobDomain(domain)
 	result, err := db.DB.Exec(`UPDATE cert_jobs
 		SET deployment_available_after=datetime('now'), message='手动重试：等待恢复部署', updated_at=datetime('now')
-		WHERE id=? AND status='downloaded'
+		WHERE id=? AND status IN ('downloaded','cleanup_dns','cleanup_warning')
 		  AND COALESCE(cert_pem,'') <> '' AND COALESCE(key_pem,'') <> ''
 		  AND EXISTS (
 			SELECT 1 FROM lb_rules
@@ -428,11 +439,11 @@ func rescheduleDownloadedCertJobDeployment(id int, ruleID, domain string) (bool,
 	// deployment_available_after=now 仍可供服务恢复后的补扫接管；但只有实际
 	// 登记了立即 timer 才允许上层报告「已触发」，停止/忙状态必须返回 409。
 	if err := services.RetryCertificateDeploymentNow(id, ruleID); err != nil {
-		// 历史问题（历史）：立即 timer 登记失败时上方 UPDATE 已把消息写成
+		// 立即 timer 登记失败时上方 UPDATE 已把消息写成
 		// 「手动重试：等待恢复部署」，与 409/500 响应矛盾（报文说失败、DB 说
 		// 已重排）。窗口推进保留（启动恢复/周期补扫会接手，可用性收益不变），
 		// 文案改为如实描述自动接管；响应侧同步点明「已登记自动部署」。
-		if _, updateErr := db.DB.Exec(`UPDATE cert_jobs SET message=?, updated_at=datetime('now') WHERE id=? AND status='downloaded'`, "手动重试未触发，等待自动部署", id); updateErr != nil {
+		if _, updateErr := db.DB.Exec(`UPDATE cert_jobs SET message=?, updated_at=datetime('now') WHERE id=? AND status IN ('downloaded','cleanup_dns','cleanup_warning')`, "手动重试未触发，等待自动部署", id); updateErr != nil {
 			return true, errors.Join(err, updateErr)
 		}
 		return true, err
@@ -462,10 +473,10 @@ func certJobRetryCooldown(status string) (time.Duration, bool) {
 func certJobRetryBlocked(status string, updatedAt, createdAt sql.NullTime, now time.Time) (bool, int, string) {
 	cooldown, retryable := certJobRetryCooldown(status)
 	if !retryable {
-		// 历史问题（历史）：永久条件不得用 429（SDK/前端会按限流退避轮询）。
+		// 永久条件不得用 429（SDK/前端会按限流退避轮询）。
 		return true, http.StatusConflict, "已退役的证书任务不能重试"
 	}
-	// 历史问题（历史）：cert_jobs.updated_at 在 DDL 中可空（历史行/带外插入可
+	// cert_jobs.updated_at 在 DDL 中可空（行/带外插入可
 	// 为 NULL），此前 NULL 直接放行冷却门（fail-open）——连点可连续绕过 15/5
 	// 分钟冷却、放大 CA 配额消耗。回退 created_at 计算；两列都缺失时 fail-
 	// closed（视为刚更新，按冷却拒绝），避免不可归因的即时重试。
@@ -480,10 +491,10 @@ func certJobRetryBlocked(status string, updatedAt, createdAt sql.NullTime, now t
 		return true, http.StatusTooManyRequests, "失败后请等待 5 分钟再重试"
 	}
 	message := "任务正在执行中，请稍后重试"
-	// 历史修复（历史）：downloaded 态签发已完成（证书在库），停在部署
-	// 退避窗口——复用在途文案会误导用户以为签发流程卡住，单列部署口径。
-	// 历史问题（历史）：冷却到期后再点重试 = 立即重排部署（不重签）。
-	if status == "downloaded" {
+	// 部署生命周期（downloaded/cleanup_dns/cleanup_warning）签发已完成（证书在库），
+	// 停在部署退避窗口——复用在途文案会误导用户以为签发流程卡住，单列部署口径。
+	// 冷却到期后再点重试 = 立即重排部署（不重签）。
+	if services.JobLifecycle(status) == services.JobLifecycleDownloaded {
 		message = "证书已下载完成，正在等待部署生效；稍后可重试以立即重新部署（不会重新签发）"
 	}
 	return true, http.StatusTooManyRequests, message
@@ -491,7 +502,7 @@ func certJobRetryBlocked(status string, updatedAt, createdAt sql.NullTime, now t
 
 // reversedCertJobDomain 交换双域名任务的域名顺序：cert_jobs.domain 存排序
 // 规范形式，lb_rules.domain 保留用户输入顺序，匹配需同时覆盖两种排列。
-// 历史修复（历史）：单源收敛至 services.ReversedCertJobDomain（与
+// 单源收敛至 services.ReversedCertJobDomain（与
 // rules.reversedACMEDomainForm 同实现，两侧委托）。
 func reversedCertJobDomain(domain string) string {
 	return services.ReversedCertJobDomain(domain)
@@ -520,30 +531,30 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Invalid job ID"})
 		return
 	}
-	// 历史问题 C-发现3 TOCTOU：历史修复 守卫读规则 enabled 状态后、删除前，EnableRule
+	// C-发现3 TOCTOU：守卫读规则 enabled 状态后、删除前，EnableRule
 	// （持 caddyOpMu）可完成启用并恢复任务，守卫放行被竞态绕过。caddyOpMu
-	// 覆盖 查询→守卫→disabled 翻转→删除 全程（取消已移出，CERT 历史问题 见下），
+	// 覆盖 查询→守卫→disabled 翻转→删除 全程（取消已移出，CERT 见下），
 	// 与 EnableRule 互斥：
 	// 删除先完成则 EnableRule 查不到任务行，走 EnableCertJobCreate 重建
 	// （续签链不断）；EnableRule 先完成则守卫读到 enabled=1 返回 409。
-	// 不变量（历史问题 修正）：'disabled' 对 worker 是终态——所有 worker 侧
+	// 不变量：'disabled' 对 worker 是终态——所有 worker 侧
 	// transitionJob 的 from 列表均排除 'disabled'，翻转后不会被周期路径复活。
 	// caqueue.EnqueueIfActive 的调用方并非全部持锁：RetryCertJob 持
 	// certJobOperationLock；本函数失败恢复、规则写路径与手工签发
-	// （IssueCertificate，历史问题 起定向/批量两分支全程持 caddyOpMu）持
+	// （IssueCertificate，自此定向/批量两分支全程持 caddyOpMu）持
 	// caddyOpMu；四个周期路径（requeueStrandedJobs/requeueWaitingCAJobs/
 	// requeueNonTerminalCertJobs/renewExpiringCertificates）无锁调用——其
 	// UPDATE 均按旧状态 CAS 或 from 列表排除 'disabled'，与翻转交错时命中
 	// 0 行（先于翻转→翻转 CAS 失败；翻转后→0 行；删除后→行不存在），
 	// 语义自洽。
-	// CERT 历史问题（历史）：caddyOpMu 覆盖 查询→守卫→disabled 翻转
-	// →删除 全程（历史问题 C-发现3 TOCTOU 不变量保持——与 EnableRule 互斥域不变，
+	// CERT：caddyOpMu 覆盖 查询→守卫→disabled 翻转
+	// →删除 全程（C-发现3 TOCTOU 不变量保持——与 EnableRule 互斥域不变，
 	// 翻转与 DELETE 仍同一临界区）；在途取消等待（qm.CancelJob ≤30s）移出
 	// 临界区（见下方取消点注释），本函数改手动配对解锁。
 	h.caddyOpMu.Lock()
 	operationLock := certJobOperationLock(id)
 	operationLock.Lock()
-	// 历史问题（历史）：per-job 锁改为手动配对——失败恢复分支必须在不持有
+	// per-job 锁改为手动配对——失败恢复分支必须在不持有
 	// operationLock 的前提下重取 caddyOpMu（锁序铁律：先 caddyOpMu 后
 	// operationLock，见恢复点注释），defer 只能通过本闭包释放。
 	operationLockHeld := true
@@ -561,13 +572,13 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 		dbQueryNotFound(c, err, "Job not found", "DeleteCertJob query job")
 		return
 	}
-	// 历史问题 + 历史问题 + 历史问题-02：规则仍在自动签发状态时，删除任何未退役
+	// + +：规则仍在自动签发状态时，删除任何未退役
 	// 任务都会让纯周期路径失去续签/签发入口（CreateOrRequeueCertJob 仅由规则
 	// 写路径调用），因此 issued/downloaded、等待态、在途执行态与 cleanup_* 全部
 	// 409 显式拒绝；运维可先禁用规则或切换证书来源后再删除。disabled 为退役
 	// 终态，删除即清理。中断卡死尝试应使用重试/禁用规则流程，而不是删除唯一
 	// 任务行。
-	// 已知竞态（历史问题）：DeleteRule drain 超时后的后台补偿（不持
+	// 已知竞态：DeleteRule drain 超时后的后台补偿（不持
 	// caddyOpMu）在退避窗口内按规则快照 DELETE+INSERT 恢复 cert_jobs，
 	// 可能复活窗口内被本函数删除的行——恢复是保守选择（复活行来自规则自身
 	// 快照时代，续签链保持完整；退避有界，窗口过后可再次删除）。
@@ -603,7 +614,7 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 		return
 	}
 	if rowsAffected != 1 {
-		// 历史问题：SELECT/守卫与 disabled 翻转之间 worker 可能推进状态（历史修复 放行
+		// SELECT/守卫与 disabled 翻转之间 worker 可能推进状态（放行
 		// 的在途态），CAS 命中 0 行属并发竞争而非服务器故障——重读区分归因（对齐
 		// RetryCertJob 的 409+重读模式）：行仍在 → 409 刷新重试；行已消失 → 404
 		// （与本函数 DELETE 后 0 行的缺失语义一致）；重读失败（瞬时 DB 错误）→ 500。
@@ -624,26 +635,26 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "任务状态已变更，请刷新后重试"})
 		return
 	}
-	// CERT 历史问题（历史）：取消移出全局 CaddyOpLock 临界区——原顺序
+	// CERT：取消移出全局 CaddyOpLock 临界区——原顺序
 	// 翻转→取消→删除使取消的在途等待（qm.CancelJob ≤30s）让全局 Caddy 写
 	// 路径排队（与 rules.go:2027 域名迁移同型等待环）。临界区=守卫→翻转→
-	// DELETE（历史问题 C-发现3 不变量保持：翻转与 DELETE 同一临界区与 EnableRule
+	// DELETE（C-发现3 不变量保持：翻转与 DELETE 同一临界区与 EnableRule
 	// 互斥）；顺序对调（删除→取消）依据：worker 全部状态迁移按旧态 CAS 且
 	// from 列表排除 'disabled'，删除窗内在途执行不可能复活/改写行；取消先于
 	// 失败恢复路径（CancelJob 会清 pending 并取消部署重试——先恢复后取消会把
 	// 恢复重入队的条目清掉，恢复语义要求先取消）。per-job operationLock 在
 	// 取消等待期间仍持有：等待期间同任务 Retry/重复 Delete 保持互斥；失败
-	// 恢复点按 历史问题 锁序（先 caddyOpMu 后 operationLock）释放并按规范顺序重取。
+	// 恢复点按锁序（先 caddyOpMu 后 operationLock）释放并按规范顺序重取。
 	result, err = db.DB.Exec("DELETE FROM cert_jobs WHERE id = ?", id)
 	h.caddyOpMu.Unlock()
 	cancelCertJob(id)
 	if err != nil {
 		deleteErr := err
 		// 失败恢复重取 caddyOpMu：恢复写与 EnableRule 的 EnableCertJobCreate
-		//（无 CAS 写，历史问题）互斥需持锁；重取窗口内 EnableRule 可见 disabled
+		//（无 CAS 写）互斥需持锁；重取窗口内 EnableRule 可见 disabled
 		// 行并 Resume——恢复 CAS（status='disabled'）0 行命中→「恢复已跳过」
 		// 并入 deleteErr（500 如实呈现，删除本就失败；行存活+启用=一致终态）。
-		// 历史问题（历史）：锁序铁律=先 caddyOpMu 后 operationLock（与入口
+		// 锁序铁律=先 caddyOpMu 后 operationLock（与入口
 		// 同序）。此处若在持 operationLock 时反向取 caddyOpMu，与同 id 连点/同桶
 		// （id%64）并发删除构成 AB-BA：对方先取到 caddyOpMu 后在桶锁排队 → 双向
 		// 互等，且 caddyOpMu 被永久占用（规则/配置写、Caddy 启停、证书部署
@@ -658,13 +669,14 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 		if deleteCertJobPreRestoreHook != nil {
 			deleteCertJobPreRestoreHook(id)
 		}
-		if status == "downloaded" && certPEM != "" && keyPEM != "" {
-			// 历史问题（对齐 caqueue requeueCanceledJob 的 历史问题 口径）：持有证书
-			// 材料的 downloaded 任务停在部署窗口——转 'queued' 会丢弃已签发证书
-			// 并触发整轮重签（Issue 快速路径只认 issued/downloaded）。原地恢复
-			// 'downloaded' 并把重试窗口推到 now，Resume 的
-			// rescanDroppedDeploymentRetries 会统一重新调度部署。
-			// 历史问题（历史）：恢复带 status='disabled' 守卫——行在删除窗口
+		if services.JobLifecycle(status) == services.JobLifecycleDownloaded && certPEM != "" && keyPEM != "" {
+			// 与 caqueue requeueCanceledJob 同口径：部署生命周期
+			// （downloaded/cleanup_dns/cleanup_warning）+ 证书材料的任务停在部署
+			// 窗口——转 'queued' 会丢弃已签发证书并触发整轮重签（Issue 快速路径
+			// 只认 issued/downloaded）。原地恢复 'downloaded' 并把重试窗口推到
+			// now，Resume 的 rescanDroppedDeploymentRetries 会统一重新调度部署
+			//（cleanup_* 归一为 downloaded 与补偿重排队同一取向）。
+			// 恢复带 status='disabled' 守卫——行在删除窗口
 			// 内被并发移离 disabled 时不得覆写其新状态；命中 0 行并入 deleteErr。
 			if res, restoreErr := db.DB.Exec("UPDATE cert_jobs SET status='downloaded', deployment_available_after=datetime('now'), message='删除失败，等待恢复部署', updated_at=datetime('now') WHERE id=? AND status='disabled'", id); restoreErr != nil {
 				deleteErr = errors.Join(deleteErr, restoreErr)
@@ -672,7 +684,7 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 				deleteErr = errors.Join(deleteErr, fmt.Errorf("任务 %d 已被并发移离 disabled，恢复已跳过", id))
 			}
 		} else if status == "issued" || status == "failed" {
-			// 历史问题：同上方守卫口径。
+			// 同上方守卫口径。
 			if res, restoreErr := db.DB.Exec("UPDATE cert_jobs SET status=?, updated_at=datetime('now') WHERE id=? AND status='disabled'", status, id); restoreErr != nil {
 				deleteErr = errors.Join(deleteErr, restoreErr)
 			} else if n, _ := res.RowsAffected(); n == 0 {
@@ -681,7 +693,7 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 		} else if status == "disabled" {
 			// disabled 是唯一「删除不受规则启用门守卫」的终态；删除失败时
 			// 行必须保持 disabled（原本已退役），不得改写成 failed 制造幽灵
-			// 失败行并触发额外签发（历史）。
+			// 失败行并触发额外签发。
 		} else {
 			qm := services.GetCAQueueManager()
 			var restoreErr error
@@ -705,15 +717,22 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 				if restoreErr == nil {
 					restoreErr = errors.New("job was not restored to active queue")
 				}
-				if _, failErr := db.DB.Exec("UPDATE cert_jobs SET status='failed', message='删除失败且恢复队列失败', updated_at=datetime('now') WHERE id=?", id); failErr != nil {
+				// 与上方三分支同构：回退写同样带 status='disabled' 守卫——行在
+				// 删除窗口内被并发移离 disabled（worker/恢复路径接管）时不得覆写
+				// 其新状态；命中 0 行并入 deleteErr 留痕（500 如实呈现恢复已跳过）。
+				if res, failErr := db.DB.Exec("UPDATE cert_jobs SET status='failed', message='删除失败且恢复队列失败', updated_at=datetime('now') WHERE id=? AND status='disabled'", id); failErr != nil {
 					restoreErr = errors.Join(restoreErr, failErr)
+				} else if n, rowsErr := res.RowsAffected(); rowsErr != nil {
+					restoreErr = errors.Join(restoreErr, rowsErr)
+				} else if n == 0 {
+					restoreErr = errors.Join(restoreErr, fmt.Errorf("任务 %d 已被并发移离 disabled，failed 回退已跳过", id))
 				}
 				deleteErr = errors.Join(deleteErr, restoreErr)
 			} else {
-				// 历史问题-05：删除失败恢复重入队成功=有在途证书工作——唤醒
+				// 删除失败恢复重入队成功=有在途证书工作——唤醒
 				// cert-waiting-ca（与 RetryCertJob/CreateOrRequeueCertJobWithChange
 				// 同族收敛：全部入队成功路径必须唤醒唯一属主）。
-				// 历史问题：恢复重入队成功即真实工作，唤醒不重查活跃态。
+				// 恢复重入队成功即真实工作，唤醒不重查活跃态。
 				services.WakeCertWaitingCAForEnqueuedJob()
 			}
 		}
@@ -763,7 +782,7 @@ func (h *Handlers) GetCertJobLogs(c *gin.Context) {
 	}
 
 	logPath := certJobLogPathForRule(ruleID)
-	// 历史问题（2026-09-05 证书域审计裁定）：按旧→新拼接全部轮转备份再加当前文件
+	// （2026-09-05 证书域审计裁定）：按旧→新拼接全部轮转备份再加当前文件
 	//（.5 最旧 → .1 最新，对齐写侧 maxRotatedFiles=5），每文件保留 128KB/500 行
 	// 截断；缺失的备份序号按空跳过。
 	content := prependTaskLogRotations(logPath, readCertJobLogFile(logPath), certJobLogMaxRotatedBackups)

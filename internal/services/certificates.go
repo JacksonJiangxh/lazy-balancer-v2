@@ -15,6 +15,7 @@ import (
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
+	"lazy-balancer-v2/internal/taskengine"
 )
 
 type CertificateService struct {
@@ -30,7 +31,7 @@ type CertificateService struct {
 	timersPaused        bool
 	stopping            bool
 	retryDeployment     func(context.Context, int) error
-	// started 标记 Start() 已进入（历史问题）：done 只由 Start 的 defer 关闭，
+	// started 标记 Start() 已进入：done 只由 Start 的 defer 关闭，
 	// 未启动即 Stop 会永久阻塞。生产唯一调用方保证先 Start，但契约不应依赖
 	// 调用顺序；未启动时 Stop 直接返回（cancel 已生效，后续 Start 立即退出）。
 	started atomic.Bool
@@ -162,7 +163,7 @@ func SnapshotCertJobsForRule(ruleID string) (CertJobsSnapshot, error) {
 }
 
 // canonicalDatetime 把快照中的 DATETIME 列值绑定为与规范写路径一致的墙钟
-// 字符串（历史问题）：直接绑 sql.NullTime 会让 modernc 驱动按默认布局落库为
+// 字符串：直接绑 sql.NullTime 会让 modernc 驱动按默认布局落库为
 // `2006-01-02 15:04:05+00:00`，而 rescan（rescanDroppedDeploymentRetries）
 // 的 time.Parse("2006-01-02 15:04:05") 是该格式唯一解析点——失败即丢一个
 // 部署退避窗口（自愈：下次失败会以规范格式重写，但 attempts 可能额外 +1）。
@@ -183,7 +184,7 @@ func RestoreCertJobsForRule(snapshot CertJobsSnapshot) error {
 func restoreCertJobsForRule(ctx context.Context, snapshot CertJobsSnapshot) error {
 	// 恢复是「整规则回滚 cert_jobs」，必须与同规则的部署/文件回滚事务
 	// 互斥——DeployLock 是证书部署链（certissuer 快速路径 confirmCertificateDeployment
-	// / deployIssuedCertificate + 失败时的文件回滚）的 历史修复 串行锁。不取锁时，
+	// / deployIssuedCertificate + 失败时的文件回滚）的串行锁。不取锁时，
 	// 补偿窗口内刚完成的部署提交（含 WriteCertFiles+reload+状态落库）会被旧快照
 	// 覆盖，磁盘/Caddy 与 DB 分叉。
 	// 统一锁序：CaddyOpLock → DeployLock → DB 事务。本函数
@@ -202,7 +203,7 @@ func restoreCertJobsForRule(ctx context.Context, snapshot CertJobsSnapshot) erro
 		return fmt.Errorf("begin certificate job restore: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	// 时代校验（历史修复 不变量）：快照后规则可能被并发删除（重试 DeleteRule、
+	// 时代校验：快照后规则可能被并发删除（重试 DeleteRule、
 	// 配置导入整树替换）或以同 caddy_id 重建为新域名。规则不存在时 DELETE+INSERT
 	// 只会写入幽灵行（cert_jobs 对 lb_rules 无外键）；域名与快照最新任务不一致时
 	// DELETE+INSERT 会摧毁新化身的任务状态。两种情形都没有可恢复对象，按补偿完成
@@ -219,7 +220,7 @@ func restoreCertJobsForRule(ctx context.Context, snapshot CertJobsSnapshot) erro
 	if !certJobsSnapshotEraMatchesRule(snapshot, ruleDomain) {
 		return nil
 	}
-	// 已知竞态（历史修复）：DeleteRule drain 超时启动的后台补偿不持
+	// 已知竞态：DeleteRule drain 超时启动的后台补偿不持
 	// caddyOpMu，其分钟级退避窗口内用户可能对同一规则 DeleteCertJob
 	// 成功——下方恢复无法区分「用户显式删除」与「DeleteRule
 	// 事务删除」，会把刚删的快照行复活。评估过按「快照后显式删除」收窄
@@ -395,7 +396,7 @@ func requeueCertJobsSnapshot(ctx context.Context, snapshot CertJobsSnapshot, man
 	if err := db.DB.QueryRowContext(ctx, `SELECT domain,IIF(enabled IN ('1',1),1,0),enable_tls,COALESCE(tls_source,'manual') FROM lb_rules WHERE caddy_id=?`, snapshot.ruleID).
 		Scan(&ruleDomain, &enabled, &enableTLS, &tlsSource); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			// 规则已被并发删除（历史修复）：没有可补偿对象，按成功收尾——
+			// 规则已被并发删除：没有可补偿对象，按成功收尾——
 			// 返回错误会把补偿拖入永久退避循环且租约永不释放。
 			return nil
 		}
@@ -406,7 +407,7 @@ func requeueCertJobsSnapshot(ctx context.Context, snapshot CertJobsSnapshot, man
 	}
 	canonicalRule, err := CanonicalACMEDomains(ruleDomain)
 	if err != nil {
-		// 历史问题 非法 ACME 域（导入可产生——导入校验不验 ACME 域合法性）的
+		// 非法 ACME 域（导入可产生——导入校验不验 ACME 域合法性）的
 		// 规则本就无法重排队（createOrRequeue 同样拒绝非法域），返回错误会把
 		// 补偿拖入永久退避循环且租约永不释放——与 ErrNoRows/禁用分支同为放弃语义。
 		Logf("warn", "证书任务补偿重排队放弃：规则 %s 域名不可规范化: %v", snapshot.ruleID, err)
@@ -426,14 +427,14 @@ func requeueCertJobsSnapshot(ctx context.Context, snapshot CertJobsSnapshot, man
 		// 材料在身且处于部署生命周期（downloaded/cleanup_dns/cleanup_warning，
 		// 即 JobLifecycleDownloaded 全集，与启动恢复 requeueNonTerminalCertJobs 的
 		// lifecycle==Downloaded && hasCertMaterial 同口径）的快照任务走 Issue 快速
-		// 路径重部署——转 'queued' 会丢弃已签发证书并触发整轮重签（历史问题 只认
-		// 'downloaded'；历史问题 放宽到部署生命周期全集：cleanup_* 任务材料同样
+		// 路径重部署——转 'queued' 会丢弃已签发证书并触发整轮重签（只认
+		// 'downloaded'；放宽到部署生命周期全集：cleanup_* 任务材料同样
 		// 已落库、只差部署）。'downloaded' 保持原状态直接入队（与 requeueCanceledJob
 		// 同口径）；cleanup_* 先归一化为 'downloaded'——Issue 快速路径只认
 		// issued/downloaded。'queued'+材料不在例外内（显式重签请求全量重签
 		// BY-DESIGN，材料是上轮残留）。
 		//
-		// 历史修复 联动：入队决策读当前行而不是快照——restore 的行级 epoch 守卫会
+		// 联动：入队决策读当前行而不是快照——restore 的行级 epoch 守卫会
 		// 保留快照之后的真实成果（行已推进为 downloaded/issued 并携带新材料），
 		// 若仍按快照状态判定，刚签发完成的任务会被当作在途任务转 'queued' 触发
 		// 整轮重签，白烧 CA 配额并丢弃有效证书。只有被 restore 保留的行与快照
@@ -482,7 +483,7 @@ func requeueCertJobsSnapshot(ctx context.Context, snapshot CertJobsSnapshot, man
 			// 所有重签发入队路径落库态均为 'queued'（queuedJobStillExists 复核依赖此不变量）：
 			// 快照保留快照时刻的在途状态（waiting_ca/creating_*/validating 等），不归一化
 			// 直接入队会在 provider 失效 drain 时被复核跳过（status≠'queued'），任务滞留
-			// 队列外直到重启（历史修复）。入队前归一化转换，与 requeueStrandedJobs /
+			// 队列外直到重启。入队前归一化转换，与 requeueStrandedJobs /
 			// requeueWaitingCAJobs / 启动恢复同型；waiting_ca 冷却扫描等并发路径已接管
 			// 该行时 CAS 冲突，按既有语义跳过入队由接管方负责。材料例外见上：仅部署
 			// 生命周期（JobLifecycleDownloaded）+ 材料在身的任务转 'downloaded'。
@@ -515,7 +516,7 @@ func requeueCertJobsSnapshot(ctx context.Context, snapshot CertJobsSnapshot, man
 					Logf("warn", "证书任务补偿重排队延后：CA Provider 不可用，任务 %d 保持 downloaded 待部署补扫（不标记 failed）", job.id)
 					continue
 				}
-				// 历史问题：provider 不可用是已定局的业务失败——enqueueLocked 内
+				// provider 不可用是已定局的业务失败——enqueueLocked 内
 				// failJob 已把任务置 failed 并写 job-status/审计。上抛会让补偿退避
 				// 循环永久重试（每轮 restore 复活 failed 行再重新失败）且规则租约
 				// 永不释放（该规则证书操作持续 409）。按「该任务已定局」跳过并
@@ -571,13 +572,13 @@ func NewCertificateService() *CertificateService {
 	return service
 }
 
-// waitDoneOrTimeout 有界等待部署定时器/回调退出（历史问题；历史修复
+// waitDoneOrTimeout 有界等待部署定时器/回调退出
 // 收敛 cancelDeploymentRetry/pauseDeploymentRetries 的内联同构等待）：回调链条最终
 // 调到非 context-aware 的 caddyReloader，挂起时裸等会拖死调用方（签发
 // goroutine/取消/暂停/Resume/启动恢复）。超时后放弃等待继续调用方流程——
 // 重排侧等于放弃本轮调度：deployment_available_after 已落库，后续补扫/重启可再
 // 拾起；DeployLock 按规则串行 + 终态 CAS 保证滞留回调即便最终退出也不会并发部署。
-// 历史修复（历史）：timeout<=0 回退 30s；调用点统一传 s.cancelWaitTimeout
+// timeout<=0 回退 30s；调用点统一传 s.cancelWaitTimeout
 // （测试缝，同模式同口径）。jobID=0 表示无单任务上下文（全量暂停路径）。
 func waitDoneOrTimeout(done <-chan struct{}, timeout time.Duration, jobID int, what string) {
 	if timeout <= 0 {
@@ -598,11 +599,14 @@ func waitDoneOrTimeout(done <-chan struct{}, timeout time.Duration, jobID int, w
 // 补充重载）。复用部署重试定时器族的生命周期（服务停止/暂停即不登记、
 // 服务 ctx 取消即不执行），但不占用 deploymentTimers——该 map 承载「同
 // jobID 唯一部署」不变量，一次性重载与部署重试互不取消、互不替换。
+// 服务停止/暂停期跳过登记的边界：不在恢复时补登（一次性定时器无持久化）。
+// 收敛路径=重启时的配置物化/重载、下一次任意配置写触发的重载、服务运行后
+// 新登记的延迟重载定时器——部署「补扫」不重渲染配置，不是收敛路径。
 func (s *CertificateService) scheduleDelayedReload(jobID int, ruleID string, delay time.Duration) {
 	s.timerMu.Lock()
 	if s.stopping || s.timersPaused {
 		s.timerMu.Unlock()
-		Logf("warn", "证书任务 %d（规则 %s）：部署定时器已停止/暂停，生效后重载跳过（证书文件已部署，补扫/重启后收敛）", jobID, ruleID)
+		Logf("warn", "证书任务 %d（规则 %s）：部署定时器已停止/暂停，生效后重载跳过登记（证书文件已随部署生效；收敛路径=重启物化/下一次配置写触发的重载）", jobID, ruleID)
 		return
 	}
 	ctx := s.ctx
@@ -649,14 +653,14 @@ func (s *CertificateService) scheduleDeploymentRetry(jobID int, ruleID string, d
 			if stopped {
 				close(previous.done)
 			} else {
-				// 历史问题：与 cancelDeploymentRetries 同口径的有界等待——
+				// 与 cancelDeploymentRetries 同口径的有界等待——
 				// 回调链条最终调到非 context-aware 的 caddyReloader，挂起
 				// 时裸等会拖死调用方（签发 goroutine/Resume/启动恢复）。
 				waitDoneOrTimeout(previous.done, s.cancelWaitTimeout, jobID, "pending timer")
 			}
 			continue
 		}
-		// 历史问题(a)：pending timer 之外还必须对在途回调去重——回调启动即自摘
+		// pending timer 之外还必须对在途回调去重——回调启动即自摘
 		// （下方 AfterFunc 内 delete），只查 deploymentTimers 必然放行第二个并发
 		// 回调：Caddy reload 挂起超暂停等待上限（30s）后 Resume/Unblock 补扫会对
 		// 同 jobID 再建 timer，与仍在跑的旧回调并发部署同一证书，终态 CAS 败者
@@ -674,7 +678,7 @@ func (s *CertificateService) scheduleDeploymentRetry(jobID int, ruleID string, d
 			for _, callback := range running {
 				waitDoneOrTimeout(callback.done, s.cancelWaitTimeout, jobID, "在途部署回调")
 			}
-			// 历史问题-03：waitDoneOrTimeout 超时后的契约是「放弃本轮调度」。原实现
+			// waitDoneOrTimeout 超时后的契约是「放弃本轮调度」。原实现
 			// 无条件 continue，仍在 map 中的同一回调会让循环每 cancelWaitTimeout
 			// 重复一轮且永不建 timer。回调仍在=本轮放弃：deployment_available_after
 			// 已落库，30s 补扫/Resume 会再次拾起；DeployLock 与终态 CAS 保证滞留
@@ -748,8 +752,8 @@ func (s *CertificateService) cancelDeploymentRetry(jobID int) {
 	s.timerMu.Unlock()
 	// 在途部署回调退出等待必须有界：回调链条最终调到非 context-aware 的
 	// caddyReloader，Caddy admin 请求异常挂起时取消流程会被永久挂起；与
-	// CAQueueManager.CancelJob 的 30s 上限同模式（历史问题 发现3）。
-	// 历史修复（历史）：内联等待收敛到 waitDoneOrTimeout。
+	// CAQueueManager.CancelJob 的 30s 上限同模式。
+	// 内联等待收敛到 waitDoneOrTimeout。
 	if pendingDone != nil {
 		waitDoneOrTimeout(pendingDone, s.cancelWaitTimeout, jobID, "待定部署定时器")
 	}
@@ -813,8 +817,8 @@ func (s *CertificateService) pauseDeploymentRetries() {
 		}
 	}
 	s.timerMu.Unlock()
-	// 在途回调退出等待必须有界（与 cancelDeploymentRetry 同模式，历史修复；
-	// 历史修复收敛到 waitDoneOrTimeout）：回调链条调到非
+	// 在途回调退出等待必须有界（与 cancelDeploymentRetry 同模式，；
+	// 收敛到 waitDoneOrTimeout）：回调链条调到非
 	// context-aware 的 caddyReloader，Caddy admin 请求异常挂起时配置导入/
 	// 进程 Stop 会被永久挂起。全量暂停无单任务上下文（jobID=0）。
 	for _, done := range waitFor {
@@ -835,7 +839,7 @@ func (s *CertificateService) resumeDeploymentRetries() {
 
 // rescanDroppedDeploymentRetries 重新调度暂停期间被丢弃、或部署失败状态回写
 // 失败而未登记 timer 的部署重试：`downloaded` 需已有 available_after；`cleanup_*`
-// 的失败写回可能连窗口列都没更新，仍须由周期补扫拾起（历史问题-07）。
+// 的失败写回可能连窗口列都没更新，仍须由周期补扫拾起。
 func (s *CertificateService) rescanDroppedDeploymentRetries() {
 	if db.DB == nil {
 		return
@@ -884,7 +888,7 @@ func (s *CertificateService) rescanDroppedDeploymentRetries() {
 		if !job.hasCertMaterial || !certJobRuleApplicable(job.applicable, job.ruleDomain, job.jobDomain) {
 			continue
 		}
-		// 历史问题(历史):周期化(30s ticker)后必须跳过已持活跃
+		// 周期化(30s ticker)后必须跳过已持活跃
 		// timer/在途回调的任务——否则每 30s 取消重建会把退避窗口无限推后
 		// (timer 永不到期,重试链名存实亡)。原调用面(resume/unblock)暂停
 		// 期 timer 已清空,此守卫对其零影响。
@@ -901,7 +905,7 @@ func (s *CertificateService) rescanDroppedDeploymentRetries() {
 				delay = remaining
 			}
 		} else {
-			// 历史修复（历史问题 改 Logf）：格式漂移（直改库/未来写入变更）时 fallback
+			// 格式漂移（直改库/未来写入变更）时 fallback
 			// 为立即重试（自愈：失败会重建窗口），但不可无痕——分级 warn 在
 			// warn/error 级别下仍进文件日志。
 			Logf("warn", "证书任务 %d：deployment_available_after=%q 无法解析，按立即重试处理", job.id, job.availableAfter)
@@ -941,16 +945,16 @@ func SetActiveCertificateService(svc *CertificateService) {
 
 // lastCertServiceMissing 证书服务缺失状态门（三个证书 tick 任务共享——全局
 // 单例服务指针）：false→true 转换记一次跳过行，缺失持续期静默，true→false
-// 转换记一次恢复行（历史问题 收敛：空转轮逐轮刷行改状态变化行）。
+// 转换记一次恢复行（收敛：空转轮逐轮刷行改状态变化行）。
 var lastCertServiceMissing atomic.Bool
 
 // certRenewalRoleRecheckHook 续期扫描逐任务角色复核前的测试屏障（生产恒
-// nil，历史问题-03）：用于在「候选已快照、尚未入队」的窗口内翻转节点角色，
+// nil）：用于在「候选已快照、尚未入队」的窗口内翻转节点角色，
 // 钉住 demote 竞争形态（Run 体不消费 ctx，入口角色检查只做一次）。
 var certRenewalRoleRecheckHook func()
 
-// withActiveCertServiceTick 引擎单轮 tick 的活动证书服务执行体（历史问题-11）：
-// 服务未运行时跳过执行，轮次本身照常按 success 记账。历史问题 收敛（2026-10-03
+// withActiveCertServiceTick 引擎单轮 tick 的活动证书服务执行体
+// 服务未运行时跳过执行，轮次本身照常按 success 记账。收敛（2026-10-03
 // 裁定）：跳过说明收敛为状态变化行——lastCertServiceMissing false→true 转换
 // 记一次跳过行，缺失持续期静默，恢复（true→false）记一次恢复行；三个证书
 // tick 任务共享同一状态门（全局单例服务指针）。
@@ -984,7 +988,7 @@ func CertRenewalScanOnce() error {
 // CertManualCheckOnce 手动证书到期检查。
 // 巡检读失败必须上抛（Run 返回 error → task_runs 失败终态），
 // 服务缺失跳过仍是 nil（跳过不是失败）——对齐 cert-renewal-scan/
-// cert-reconcile 同族口径（历史问题-15）。
+// cert-reconcile 同族口径。
 func CertManualCheckOnce() error {
 	var checkErr error
 	withActiveCertServiceTick("cert-manual-poll", "check", func(s *CertificateService) { checkErr = s.checkManualCertExpiration() })
@@ -1030,7 +1034,7 @@ func CertWaitingCATickOnce() {
 func CertReconcileOnce() error {
 	rebuilt, reconcileErr := reconcileMissingCertFiles(db.DB)
 	swept := sweepOrphanedCertJobs(context.Background())
-	// 历史问题-01 兜底：6h 对账同时补建「启用 ACME 但无任务行」的规则——覆盖
+	// 兜底：6h 对账同时补建「启用 ACME 但无任务行」的规则——覆盖
 	// 提升窗口之外的行丢失（快照整树替换后残留的中间态）。
 	created, backfillErr := BackfillMissingACMECertJobs(context.Background(), GetCAQueueManager())
 	if backfillErr != nil {
@@ -1132,7 +1136,7 @@ func (s *CertificateService) requeueWaitingCAJobs() {
 // the process last exited. Jobs whose rule or CA provider no longer exist are
 // marked as failed.
 func (s *CertificateService) recoverCertJobs(ctx context.Context) {
-	// 历史问题-01：先补建缺失任务行（提升/启动时从端快照只带已签发材料，未签发
+	// 先补建缺失任务行（提升/启动时从端快照只带已签发材料，未签发
 	// 规则的 cert_jobs 行在主从切换后不存在），再恢复既有非终态任务。
 	if created, err := BackfillMissingACMECertJobs(ctx, GetCAQueueManager()); err != nil {
 		Logf("error", "补建缺失证书任务失败: %v", err)
@@ -1152,7 +1156,7 @@ func (s *CertificateService) recoverCertJobs(ctx context.Context) {
 // 摘要不再谎报「对账完成」）；单行 Scan 失败仍跳过（该行不可信，其余行可继续收敛），
 // 但迭代错误表明结果集不完整，按失败处理。
 func reconcileMissingCertFiles(dbh *sql.DB) (int, error) {
-	// 历史问题(历史):多行规则必须按 certJobRuleApplicable 同语义过滤——
+	// 多行规则必须按 certJobRuleApplicable 同语义过滤——
 	// 否则灾备重建内容取决于扫描顺序,可能重建旧域证书且无自愈。
 	rows, err := dbh.Query(`SELECT j.rule_id, j.domain, COALESCE(j.cert_pem,''), COALESCE(j.key_pem,''), COALESCE(r.domain,'') AS rule_domain
 		FROM cert_jobs j
@@ -1175,11 +1179,11 @@ func reconcileMissingCertFiles(dbh *sql.DB) (int, error) {
 			continue
 		}
 		// 同 rule_id 多行只取首个**适用**行（ORDER BY updated_at DESC）。
-		// 先 seen 后适用性会让最新旧域行短路较旧的适用行（历史）。
+		// 先 seen 后适用性会让最新旧域行短路较旧的适用行。
 		if seenRules[ruleID] {
 			continue
 		}
-		// 历史问题:域名适用性校验——任务签发域名与规则当前域名不一致时重建
+		// 域名适用性校验——任务签发域名与规则当前域名不一致时重建
 		// 会写入不匹配证书。
 		if !certJobRuleApplicable(true, ruleDomain, domain) {
 			continue
@@ -1261,7 +1265,7 @@ func requeueNonTerminalCertJobs(ctx context.Context, deploymentRetry func(int, i
 	if err := rows.Close(); err != nil {
 		return fmt.Errorf("close non-terminal certificate jobs: %w", err)
 	}
-	// 历史修复 告警 + 历史修复 非正回退语义收敛于 GetCertRenewalDays（历史问题-2）。
+	// 告警 + 非正回退语义收敛于 GetCertRenewalDays。
 	renewalDays := GetCertRenewalDays()
 	now := time.Now()
 	selectedByRule := make(map[string]CertificateSelection)
@@ -1282,7 +1286,7 @@ func requeueNonTerminalCertJobs(ctx context.Context, deploymentRetry func(int, i
 		}
 		if !job.applicable {
 			if err := transitionJob(db.DB, job.id, nonTerminalJobStatuses, "disabled", map[string]any{"message": "关联规则已不再使用当前 ACME 证书任务"}); err != nil {
-				// 历史修复：CAS 冲突=快照后并发写入方已接管该任务（如 worker 恰在
+				// CAS 冲突=快照后并发写入方已接管该任务（如 worker 恰在
 				// 恢复窗口内迁移状态）——跳过该任务继续恢复其余任务，不得中止
 				// 整个循环（creating_*/downloading 无周期巡检救援，中止即滞留到
 				// 下次重启）；与 sweepOrphanedCertJobs/requeueWaitingCAJobs 同型。
@@ -1295,7 +1299,7 @@ func requeueNonTerminalCertJobs(ctx context.Context, deploymentRetry func(int, i
 			continue
 		}
 		lifecycle := JobLifecycle(job.status)
-		// 历史修复（历史）：'queued' 是用户显式触发的重签请求（RetryCertJob
+		// 'queued' 是用户显式触发的重签请求（RetryCertJob
 		// 全量重签语义，旧 cert_pem/key_pem 保留在行上）——"检测到已有有效证书"
 		// 恢复优化只适用于在途任务（active/waiting_ca），不得把显式重签请求
 		// 静默转为 issued，否则请求跨重启消失。queued 任务落到下方重新排队。
@@ -1316,7 +1320,7 @@ func requeueNonTerminalCertJobs(ctx context.Context, deploymentRetry func(int, i
 				canonicalRule, ruleErr := CanonicalACMEDomains(job.ruleDomain)
 				if selectedErr == nil && ruleErr == nil && canonicalSelected == canonicalRule && selection.Certificate.NotAfter.After(now.Add(time.Duration(renewalDays)*24*time.Hour)) {
 					if err := transitionJob(db.DB, job.id, nonTerminalJobStatuses, "issued", map[string]any{"message": "检测到已有有效证书，跳过恢复签发"}); err != nil {
-						// 历史修复：CAS 冲突同样跳过继续（同上 disable 站点语义）。
+						// CAS 冲突同样跳过继续（同上 disable 站点语义）。
 						if errors.Is(err, ErrJobTransitionConflict) {
 							continue
 						}
@@ -1342,7 +1346,7 @@ func requeueNonTerminalCertJobs(ctx context.Context, deploymentRetry func(int, i
 		if qm == nil {
 			return fmt.Errorf("CA queue manager not initialized")
 		}
-		// 历史问题 复用 历史问题 EnqueueIfActive 在途守卫（与 Resume/周期巡检/waiting_ca
+		// 复用 EnqueueIfActive 在途守卫（与 Resume/周期巡检/waiting_ca
 		// 路径同型）——备份导入 finish 链等场景下滞行执行（retiredQueues zombie）
 		// 仍持有同 jobID 时，直接 transition+Enqueue 会造成双执行，且 zombie 晚退的
 		// requeueCanceledJob 会把新执行状态打回 'queued'。命中在途任务时跳过
@@ -1433,7 +1437,7 @@ func sweepOrphanedCertJobs(ctx context.Context) int {
 			Logf("error", "cert sweep: disable orphaned certificate job %d failed: %v", job.id, err)
 			continue
 		}
-		// 历史问题-02：swept 只计实际收敛的行——消费方 CertReconcileOnce 的
+		// swept 只计实际收敛的行——消费方 CertReconcileOnce 的
 		// 「孤儿清理 %d 个」任务日志行直接取该值，恒 0 即对账失真。
 		swept++
 		RecordAuditLog("system", "禁用", "证书任务", FormatAuditDetail(AuditJobPart(job.id), AuditRulePart(job.ruleID), AuditSourcePart("runtime_sweep")), "")
@@ -1454,7 +1458,7 @@ func (s *CertificateService) Stop() {
 	certificateServiceMu.Unlock()
 	s.pauseDeploymentRetries()
 	s.cancel()
-	// 历史问题：done 仅由 Start 的 defer 关闭——Start 未执行的 Stop 不得裸
+	// done 仅由 Start 的 defer 关闭——Start 未执行的 Stop 不得裸
 	// 等待（原实现永久阻塞）。cancel 已生效，若随后 Start 被调用会立即退出。
 	if !s.started.Load() {
 		return
@@ -1464,12 +1468,12 @@ func (s *CertificateService) Stop() {
 
 // ErrCertificateQueueInactive 标记「证书签发任务未运行（队列未激活/已暂停）」
 // 导致的入队拒绝。这是运维态而非内部故障：与手工签发的 409 口径一致
-// （历史问题-05），handler 必须映射 409/503 并点明「证书签发任务已停止」，不得
+// handler 必须映射 409/503 并点明「证书签发任务已停止」，不得
 // 折成 500 让规则保存看起来像内部错误。
 var ErrCertificateQueueInactive = errors.New("证书签发任务未运行")
 
 // ErrCertRuleStateConflict 标记 upsert 时规则当前态守卫拒绝：规则已删除、
-// 被禁用、非 ACME 或域名已变更（历史问题，历史问题-01）。属并发冲突语义——
+// 被禁用、非 ACME 或域名已变更。属并发冲突语义——
 // 调用方必须如实呈现（handler 409），不得伪装成 changed=false 的「状态不
 // 支持重排」或折成 500 内部错误。
 var ErrCertRuleStateConflict = errors.New("规则状态已变更或不再支持 ACME 签发")
@@ -1477,7 +1481,7 @@ var ErrCertRuleStateConflict = errors.New("规则状态已变更或不再支持 
 // upsertQueuedCertJob 持久化「排队签发」任务行（原 EnqueueIfActive transition
 // 闭包单源）。返回任务 id 与是否发生状态迁移。
 //
-// 历史问题（历史问题-01）规则当前态守卫：INSERT 与冲突 UPDATE 都要求 lb_rules
+// 规则当前态守卫：INSERT 与冲突 UPDATE 都要求 lb_rules
 // 当前行仍是「启用 ACME 且规范化域名匹配」（对照 Retry 路径
 // handlers/certjobs.go 的 EXISTS 同口径）——手工签发读规则与 upsert 之间的
 // 改域迁移/删除曾可对旧域发起 CA 签发或留下孤儿任务行。手工签发入口持
@@ -1597,17 +1601,17 @@ func CreateOrRequeueCertJobWithChange(ruleID, domains string, caProviderID int, 
 		}
 		return 0, false, fmt.Errorf("CA queue is paused")
 	}
-	// 历史问题-1：任务入队即唤醒 cert-waiting-ca（默认调度关闭；全部终态由 Run
-	// 体自停）。历史问题-05 勘误：本处不再是「全部创建路径的单点」——规则写路径
+	// 任务入队即唤醒 cert-waiting-ca（默认调度关闭；全部终态由 Run
+	// 体自停）。 勘误：本处不再是「全部创建路径的单点」——规则写路径
 	// （EnableRule 的 Create/Retry/Renew）经此收敛；手动重试与删除失败恢复
 	// 直调 EnqueueIfActive，唤醒点在 handlers/certjobs.go 同批落地。
-	// 历史问题：入队成功即真实工作，唤醒不重查活跃态（避免瞬时失败漏唤醒）。
+	// 入队成功即真实工作，唤醒不重查活跃态（避免瞬时失败漏唤醒）。
 	WakeCertWaitingCAForEnqueuedJob()
 	return jobID, true, nil
 }
 
 // BackfillMissingACMECertJobs 为「启用且启用 ACME 的规则」补建缺失的
-// cert_jobs 行（历史问题-01）。
+// cert_jobs 行。
 //
 // 主从快照只携带已签发证书材料（cluster_snapshot.go 的 certs 组选），从端
 // apply 清空 cert_jobs 后仅回插材料行且统一为 issued；提升时凡「从未签发成功/
@@ -1721,8 +1725,8 @@ func HasCertJob(ruleID, domains string) bool {
 func (s *CertificateService) renewExpiringCertificates() error {
 	qm := GetCAQueueManager()
 
-	// 历史修复-新2(历史):COALESCE 口径对齐全域(NULL 视为主节点,历史问题)+
-	// 失败留痕(对照 历史修复,此前静默跳过整个过期检查)。
+	// 新2:COALESCE 口径对齐全域(NULL 视为主节点）+
+	// 失败留痕(对照,此前静默跳过整个过期检查)。
 	isMaster, err := RoleOf(context.Background(), db.DB)
 	if err != nil {
 		Logf("error", "cert expiration loop: failed to read cluster role, skipping this cycle: %v", err)
@@ -1732,7 +1736,10 @@ func (s *CertificateService) renewExpiringCertificates() error {
 		return fmt.Errorf("读取节点角色: %w", err)
 	}
 	if !isMaster {
-		return nil
+		// 降级终态统一为 skipped 哨兵（与 crs/threat 同构）：从节点中止非故障，
+		// 但 return nil 会把「未执行」记成 success（任务监控假健康）。
+		TaskLogf("cert-renewal-scan", "skipped", "节点为从节点，本轮续期扫描未执行（从节点不签发）")
+		return taskengine.ErrTaskSkipped
 	}
 
 	// CheckExpiration locks s.mu internally; the loop below only touches the
@@ -1741,7 +1748,7 @@ func (s *CertificateService) renewExpiringCertificates() error {
 	jobs, skippedExpiring, scanErr := s.CheckExpiration()
 	firstIssuance, skippedFirstIssuance, firstErr := s.checkFailedFirstIssuance(maxAttempts)
 	if scanErr != nil || firstErr != nil {
-		// 历史问题（历史问题-02）候选查询/遍历失败时结果集不可信，
+		// 候选查询/遍历失败时结果集不可信，
 		// 摘要行必须如实报「扫描失败」并终止本轮（错误细节已入应用日志），
 		// 下一周期重试——此前吞成「无临期证书」会让任务监控呈现假健康。
 		detail := scanErr
@@ -1771,7 +1778,7 @@ func (s *CertificateService) renewExpiringCertificates() error {
 			capped++
 		}
 	}
-	// 历史修复（历史）：已达上限任务每轮仍被选出（历史修复 warn 形态，
+	// 已达上限任务每轮仍被选出（warn 形态，
 	// 自动重试不可达），摘要须分档标注——否则「待重试」口径失真。全部未达
 	// 上限时保持原文案（不追加空括注）。
 	if capped > 0 {
@@ -1783,7 +1790,7 @@ func (s *CertificateService) renewExpiringCertificates() error {
 	for idxRenewalJob, j := range jobs {
 		if j.RenewalAttempts >= maxAttempts {
 			if j.Status == "waiting_ca" {
-				// 历史问题：终态迁移与 caqueue.markJobWaitingCA 的上限分支同字段集
+				// 终态迁移与 caqueue.markJobWaitingCA 的上限分支同字段集
 				// ——清 ca_available_after/last_error_code，避免 failed 行残留冷却
 				// 时间与 429 错误码（UI/导出看到与终态矛盾的残留字段）。
 				if err := transitionJob(db.DB, j.ID, []string{"waiting_ca"}, "failed", map[string]any{
@@ -1796,7 +1803,7 @@ func (s *CertificateService) renewExpiringCertificates() error {
 					RecordAuditLog("system", "签发失败", "证书任务", FormatAuditDetail(AuditJobPart(j.ID), AuditRulePart(j.RuleID), AuditResultPart("max_attempts")), "")
 				}
 			} else {
-				// 历史修复（历史）：issued/failed 任务无终局转换可做——此前
+				// issued/failed 任务无终局转换可做——此前
 				// 零状态变化/零日志/零审计，每 6h 被重复选出并入摘要后静默
 				// continue。留 warn 痕使「仅手动重试可达」对操作者可见（幂等：
 				// 6h 一条，重置 renewal_attempts 才会再进自动重试）。
@@ -1810,7 +1817,7 @@ func (s *CertificateService) renewExpiringCertificates() error {
 			TaskLogf("cert-renewal-scan", "scan", "续期中止：CA 队列未初始化，剩余 %d 个任务本轮未入队", len(jobs)-idxRenewalJob)
 			return errors.New("CA 队列未初始化")
 		}
-		// 历史问题-03（历史）：入口只做一次角色检查，而本 Run 体不消费
+		// 入口只做一次角色检查，而本 Run 体不消费
 		// rc.Ctx（SetRole 取消对它是 no-op）——demote 落在最长 6h 扫描/多任务
 		// 候选窗口内时，循环会在队列停止前继续入队，已入队的签发要跑完 ACME 才
 		// 被 certissuer 的角色检查拦下（白烧 CA 配额）。入队前用与入口同一
@@ -1827,7 +1834,9 @@ func (s *CertificateService) renewExpiringCertificates() error {
 		}
 		if !masterNow {
 			TaskLogf("cert-renewal-scan", "scan", "续期中止：扫描期间节点已切换为从节点，剩余 %d 个任务本轮未入队（从节点不签发）", len(jobs)-idxRenewalJob)
-			return nil
+			// 降级终态=skipped 哨兵（与入口复核同口径）——return nil 会把
+			// 中止轮记成 success。
+			return taskengine.ErrTaskSkipped
 		}
 		message := "等待排队续期"
 		action := "续签排队"
@@ -1849,7 +1858,7 @@ func (s *CertificateService) renewExpiringCertificates() error {
 			continue
 		}
 		if !changed {
-			// 历史问题-04：摘要行已宣告「检测到 N 个临期/待重试任务」，但 !changed
+			// 摘要行已宣告「检测到 N 个临期/待重试任务」，但!changed
 			// 有三条出口——在途守卫（良性）、队列暂停（导入 PauseAndDrain/
 			// 生命周期停止）、规则删除屏障。后两者此前完全静默：任务本轮没
 			// 入队也无任何痕迹，最多推迟一个 6h 扫描周期。在途仍保持静默。
@@ -1870,8 +1879,8 @@ func (s *CertificateService) checkManualCertExpiration() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// 历史修复 all manual certificates into memory, then close cursor before parsing
-	// 历史问题-06：与其余全部扫描/渲染口径对齐（enabled=1）——禁用规则的证书
+	// all manual certificates into memory, then close cursor before parsing
+	// 与其余全部扫描/渲染口径对齐（enabled=1）——禁用规则的证书
 	// 不进入任何 TLS 连接策略，此前漏筛 enabled 会每天对禁用规则产出
 	// 问题「证书已过期」并每 10 分钟计数一次，稀释真实告警。
 	rows, err := db.DB.Query(`
@@ -1882,7 +1891,7 @@ func (s *CertificateService) checkManualCertExpiration() error {
 	`)
 	if err != nil {
 		Logf("error", "Failed to query TLS certificates for expiration check: %v", err)
-		// 历史问题-15：读失败上抛（对齐 cert-renewal-scan/cert-reconcile）——失败轮
+		// 读失败上抛（对齐 cert-renewal-scan/cert-reconcile）——失败轮
 		// 结果不可信，任务日志留失败行 + 返回 error（task_runs 失败终态）；
 		// 此前仅应用日志 + return，任务监控呈现假健康。
 		TaskLogf("cert-manual-poll", "check", "巡检失败：手动证书查询出错（%v），本轮未执行到期检查，下一周期重试", err)
@@ -1898,16 +1907,16 @@ func (s *CertificateService) checkManualCertExpiration() error {
 	for rows.Next() {
 		var c certInfo
 		if err := rows.Scan(&c.caddyID, &c.name, &c.domain, &c.certPEM); err != nil {
-			// 历史 历史修复: 静默 continue 会让证书过期检查遗漏，必须记录告警。
+			// 静默 continue 会让证书过期检查遗漏，必须记录告警。
 			Logf("warn", "Warning: scan failed during expiration check, skipping row: %v", err)
 			continue
 		}
 		certs = append(certs, c)
 	}
-	// 历史 历史修复: 显式检查 rows.Err 和 rows.Close 错误，避免迭代期间错误被吞没。
+	// 显式检查 rows.Err 和 rows.Close 错误，避免迭代期间错误被吞没。
 	if err := rows.Err(); err != nil {
 		Logf("warn", "cert expiration check: iteration error: %v", err)
-		// 历史问题-15：迭代失败结果集不可信——失败行 + 上抛（同查询失败口径）。
+		// 迭代失败结果集不可信——失败行 + 上抛（同查询失败口径）。
 		TaskLogf("cert-manual-poll", "check", "巡检失败：手动证书遍历出错（%v），本轮结果不可信，下一周期重试", err)
 		_ = rows.Close()
 		return fmt.Errorf("遍历手动证书: %w", err)
@@ -1919,8 +1928,8 @@ func (s *CertificateService) checkManualCertExpiration() error {
 	now := time.Now()
 	var expiredCount, expiringSoonCount, parseFailCount int
 
-	// 历史问题（读取失败不静默）+ 历史修复（非正回退）收敛于既有 helper；
-	// 历史问题-2：告警级别随 helper 统一为 error（原内联 warn 级漂移）。
+	// （读取失败不静默）+ （非正回退）收敛于既有 helper；
+	// 告警级别随 helper 统一为 error（原内联 warn 级漂移）。
 	warnDays := GetCertExpiryThreshold()
 	for _, c := range certs {
 		block, _ := pem.Decode([]byte(c.certPEM))
@@ -1938,7 +1947,7 @@ func (s *CertificateService) checkManualCertExpiration() error {
 		}
 
 		daysUntilExpiry := CertDaysRemaining(cert.NotAfter, now)
-		// 历史问题（历史）：到期状态判定收敛 CertificateExpiryStatus 单源
+		// 到期状态判定收敛 CertificateExpiryStatus 单源
 		// （天粒度；过期优先于临期）——与 certinfo 列表/任务列表同结论。
 		switch CertificateExpiryStatus(cert.NotAfter, now, warnDays) {
 		case "expired":
@@ -1958,7 +1967,7 @@ func (s *CertificateService) checkManualCertExpiration() error {
 		}
 	}
 
-	// 历史问题-15③：解析失败行计数进摘要（对照续期扫描 skippedNote 口径）——
+	// ③：解析失败行计数进摘要（对照续期扫描 skippedNote 口径）——
 	// 此前仅应用日志 warn，任务日志零痕迹，损坏证书长期无人察觉。
 	skippedNote := ""
 	if parseFailCount > 0 {
@@ -1966,9 +1975,9 @@ func (s *CertificateService) checkManualCertExpiration() error {
 	}
 	if expiredCount > 0 || expiringSoonCount > 0 {
 		Logf("info", "TLS Certificate Check: %d expired, %d expiring within %d days", expiredCount, expiringSoonCount, warnDays)
-		// SPEC §6.5：业务结论镜像到任务日志。历史问题 收敛：
+		// SPEC §6.5：业务结论镜像到任务日志。收敛
 		// 仅异常轮（过期或临期>0）记行，全正常轮零日志（原「无过期无临期」
-		// 摘要行删除——历史问题「日志只记真实执行」延伸）。
+		// 摘要行删除——「日志只记真实执行」延伸）。
 		TaskLogf("cert-manual-poll", "check", "手动证书到期检查：%d 张已过期、%d 张临期（阈值 %d 天）%s", expiredCount, expiringSoonCount, warnDays, skippedNote)
 	} else if parseFailCount > 0 {
 		// 纯解析失败轮同属异常轮（证书到期状态未判读），必须留一行而非静默。
@@ -1977,13 +1986,13 @@ func (s *CertificateService) checkManualCertExpiration() error {
 	return nil
 }
 
-// scanRenewalCandidates 历史修复（历史）：CheckExpiration 与
+// scanRenewalCandidates：CheckExpiration 与
 // checkFailedFirstIssuance 的同构行扫描体收敛单份——规范域名比对（规则/任务
 // 域名不一致跳过该行）+ 已有证书判读（选中证书域名匹配且有效期晚于续期窗口则
-// 跳过）+ 行收集。warnPrefix 仅区分 Scan 失败告警的来源扫描（历史修复
+// 跳过）+ 行收集。warnPrefix 仅区分 Scan 失败告警的来源扫描
 // 「不静默」口径，同 checkManualCertExpiration）。
 //
-// 历史问题（历史问题-02）逐行 Scan 失败计数返回（scanSkipped），
+// 逐行 Scan 失败计数返回（scanSkipped），
 // 迭代级 rows.Err() 显式上抛——此前两者都只进应用日志甚至完全静默，巡检
 // 摘要把失败轮伪装成「无候选」。
 func scanRenewalCandidates(rows *sql.Rows, days int, warnPrefix string) (jobs []models.CertJob, scanSkipped int, err error) {
@@ -2026,7 +2035,7 @@ func scanRenewalCandidates(rows *sql.Rows, days int, warnPrefix string) (jobs []
 		}
 		jobs = append(jobs, j)
 	}
-	// 历史问题：迭代级错误（连接中断/结果集截断）此前被完全吞掉——显式
+	// 迭代级错误（连接中断/结果集截断）此前被完全吞掉——显式
 	// 上抛让巡检按「扫描失败」终止本轮而非按截断结果集续期。
 	if err := rows.Err(); err != nil {
 		return jobs, scanSkipped, fmt.Errorf("%s: iterate rows: %w", warnPrefix, err)
@@ -2038,10 +2047,10 @@ func (s *CertificateService) CheckExpiration() ([]models.CertJob, int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// 历史修复 告警 + 历史修复 非正回退语义收敛于 GetCertRenewalDays（历史问题-2）。
+	// 告警 + 非正回退语义收敛于 GetCertRenewalDays。
 	days := GetCertRenewalDays()
 
-	// 历史问题-01：历史/导入的 issued + NULL expires_at 也必须进入候选扫描。
+	// 历史/导入的 issued + NULL expires_at 也必须进入候选扫描。
 	// scanRenewalCandidates 会按 PEM 的真实 NotAfter 跳过仍在窗口外的证书；
 	// 临期或材料缺失的行则进入续期，不再因 NULL 永久失联。
 	rows, err := db.DB.Query(`
@@ -2059,7 +2068,7 @@ func (s *CertificateService) CheckExpiration() ([]models.CertJob, int, error) {
 		ORDER BY j.expires_at ASC
 	`, days)
 	if err != nil {
-		// 历史问题：查询失败显式上抛（此前 return nil 被巡检当成「无候选」
+		// 查询失败显式上抛（此前 return nil 被巡检当成「无候选」
 		// 并写假成功摘要）。
 		Logf("error", "Failed to query expiring certificates: %v", err)
 		return nil, 0, fmt.Errorf("query expiring certificates: %w", err)
@@ -2074,12 +2083,12 @@ const firstIssuanceRetryCooldownMinutes = 30
 // checkFailedFirstIssuance 返回首次签发失败（expires_at IS NULL，从未签发成功）、
 // 已过冷却期且未达最大重试次数的证书任务，供续期巡检自动重试。规则筛选与
 // 已有证书判读逻辑与 CheckExpiration 保持一致。
-// 历史问题：查询/遍历失败显式上抛（同 CheckExpiration），不得吞成「无候选」。
+// 查询/遍历失败显式上抛（同 CheckExpiration），不得吞成「无候选」。
 func (s *CertificateService) checkFailedFirstIssuance(maxAttempts int) ([]models.CertJob, int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// 历史修复 告警 + 历史修复 非正回退语义收敛于 GetCertRenewalDays（历史问题-2）。
+	// 告警 + 非正回退语义收敛于 GetCertRenewalDays。
 	days := GetCertRenewalDays()
 
 	rows, err := db.DB.Query(`
@@ -2116,7 +2125,7 @@ func selectStoredRuleCertificate(ctx context.Context, ruleID, ruleDomains string
 		if err := rows.Scan(&candidate.ID, &candidate.Domain, &candidate.Status, &candidate.CertPEM, &candidate.KeyPEM, &candidate.UpdatedAt); err != nil {
 			return CertificateSelection{}, false, err
 		}
-		// 历史问题（历史修复 同族）：候选装载统一预解析 Leaf，选择走快路径。
+		// 候选装载统一预解析 Leaf，选择走快路径。
 		if candidate.Status != "disabled" {
 			candidate.Leaf = ParseCertificateLeaf(candidate.CertPEM, candidate.KeyPEM)
 		}

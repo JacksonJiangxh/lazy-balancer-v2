@@ -44,7 +44,7 @@ const props = defineProps<{ logKey: string; caddyId?: string; refreshKey?: numbe
 
 const info = ref<LogStorageInfo | null>(null)
 
-// 历史问题-10：复用 api.ts 的 formatBytes（站内字节格式化单一事实源，原私有
+// 复用 api.ts 的 formatBytes（站内字节格式化单一事实源，原私有
 // humanSize 与 Dashboard 精度不一致）
 const humanSize = formatBytes
 
@@ -105,7 +105,7 @@ let loadStatsSeq = 0
 const loadStats = async (): Promise<void> => {
   const seq = ++loadStatsSeq
   try {
-    // 历史修复：服务端按 key 收窄（只统计所看那一行）；缺省全量会为每个弹框
+    // 服务端按 key 收窄（只统计所看那一行）；缺省全量会为每个弹框
     // 做全部 DB 计数与目录统计。
     const params: Record<string, string> = { key: props.logKey }
     if (props.caddyId) params.caddy_id = props.caddyId
@@ -122,7 +122,7 @@ watch(() => props.refreshKey, () => { void loadStats() }, { immediate: true })
 <style scoped>
 /* min-width:0——作为 flex 项必须可缩到内容宽度以下,内层 .note 的
    省略号(text-overflow)才会生效;否则长保留文案把右侧分页/按钮挤出容器
-   (历史用户实证:事件日志页点第 5 页后分页器溢出卡片右缘 ~30-195px)。
+   (用户实证:事件日志页点第 5 页后分页器溢出卡片右缘 ~30-195px)。
    全部五处父级(事件日志/操作日志/规则日志弹窗/规则集更新弹窗/证书任务弹窗)
    共用同一 flex+margin-right:auto 模式,组件级一处修复全覆盖。 */
 .log-storage-bar { font-size: 12px; color: #6b7280; min-width: 0; }

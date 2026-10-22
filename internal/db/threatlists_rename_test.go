@@ -97,7 +97,7 @@ func TestThreatSystemListRename_renamesUserConflictAndTakesCanonicalName(t *test
 	if err := migrateThreatSystemListNames(); err != nil {
 		t.Fatalf("二次执行: %v", err)
 	}
-	// And 历史问题：用户名单被改名留痕（聚合一行，含 ids）。
+	// And：用户名单被改名留痕（聚合一行，含 ids）。
 	entries := drainSystemAuditBuffer()
 	if len(entries) != 1 || entries[0].resource != "IP 名单" || !strings.Contains(entries[0].detail, "已改名用户名单 1 条") {
 		t.Fatalf("冲突改名审计=%+v, want 一行用户名单改名记录", entries)
@@ -207,7 +207,7 @@ func TestThreatSystemLists_professionalNames(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：注册表只读出口——返回副本，任一消费方 append/改
+// 注册表只读出口——返回副本，任一消费方 append/改
 // 元素不得污染全局（播种、备份配额校验、详情计数、快照链路共用）。
 func TestThreatSystemLists_returnsIsolatedClone(t *testing.T) {
 	original := ThreatSystemLists()

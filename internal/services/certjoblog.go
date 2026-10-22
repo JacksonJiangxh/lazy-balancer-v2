@@ -16,15 +16,15 @@ import (
 	"lazy-balancer-v2/internal/taskengine"
 )
 
-// 历史修复（历史后裁定）：证书任务日志并入任务日志体系——挂靠
+// 证书任务日志并入任务日志体系——挂靠
 // {任务日志目录}/certjobs/（与 tasks/*.log 同根：大小上限共用
 // task_log_size_mb、保留清理由 log-cleanup housekeeping 统一扫描）。
-// 历史问题-03≡历史问题-02：目录**惰性求值**——taskengine.LogDir() 注入恒晚于包
+// 目录**惰性求值**——taskengine.LogDir() 注入恒晚于包
 // 初始化，曾以包级 IIFE 固化致生产恒回退 /app/logs 根（脱离 housekeeping
 // 清理面）。LogDir 未注入（测试环境）回退 /app/logs。
 const legacyCertJobLogRoot = "/app/logs"
 
-// certJobLogMigrated 旧目录一次性迁移门（历史问题-03）：SetLogDir 后首次
+// certJobLogMigrated 旧目录一次性迁移门：SetLogDir 后首次
 // 使用时把固化期写入旧根的 certjob-*.log（含轮转代 .1-.5/.gz）搬入新目录。
 // atomic 而非 sync.Once：测试可复位重放（Once 值拷贝触发 vet noCopy）。
 var certJobLogMigrated atomic.Bool
@@ -44,7 +44,7 @@ func CertJobLogDir() string {
 }
 
 // migrateLegacyCertJobLogs 一次性迁移：源=任务日志目录的父目录（容器内即
-// /app/logs——tasks 的宿主根，历史修复 与固化期 certjob-* 的实际落点）。
+// /app/logs——tasks 的宿主根，与固化期 certjob-* 的实际落点）。
 // 扫描/搬移失败记日志继续（旧文件残留无害——读侧已切新目录，
 // 清理面按新目录扫描）；目标同名文件已存在视为新数据，跳过不覆盖。
 func migrateLegacyCertJobLogs(legacyRoot, target string) {
@@ -82,8 +82,8 @@ func migrateLegacyCertJobLogs(legacyRoot, target string) {
 
 const maxRotatedFiles = 5
 
-// CertJobLogMaxRotatedFiles 导出证书任务日志写侧的保留份数契约（历史修复，
-// 历史）：handlers 的 logRotatedBackups 与展示层必须与写侧同源——此前
+// CertJobLogMaxRotatedFiles 导出证书任务日志写侧的保留份数契约
+// handlers 的 logRotatedBackups 与展示层必须与写侧同源——此前
 // 靠测试读取本文件源码文本（`const maxRotatedFiles = 5`）钉住，改注释/加类型
 // 声明即误红，且第三个 writer 出现时漏验。导出 getter 让契约以数值断言。
 func CertJobLogMaxRotatedFiles() int { return maxRotatedFiles }
@@ -99,13 +99,13 @@ type CertJobFileLogger struct {
 	ruleID string
 }
 
-// certJobLogWriteLocks 按 ruleID 串行化写与轮转（历史问题，2026-09-05 证书域审计
+// certJobLogWriteLocks 按 ruleID 串行化写与轮转（2026-09-05 证书域审计
 // 裁定）：每次写日志都新建实例（Issue 的 jobLogger / WriteCertJobLog*），实例级
 // 锁防不了跨实例并发轮转的 check-then-rename 交错——两个实例同时越过大小阈值
 // 时，后者的 os.Rename(path, path+".1") 会覆盖前者刚轮转出的 .1，丢一整代
 // 历史。键空间以 ruleID 为界（规则量级），无需回收。
 //
-// 键口径 = certJobLogFileComponent(ruleID)（历史问题 + 历史修复）：housekeeping
+// 键口径 = certJobLogFileComponent(ruleID)：housekeeping
 // 从文件名反解 ruleID，只能拿到已编码的主体；若写侧用原始值取锁，写与清理会持
 // 不同互斥量，轮转/删除交错可覆盖 .1 代或删除未过期代。旧实现用剔除非法字符的
 // 主体（sanitizePathComponent），不可逆致 `lb.dot` 与 `lbdot` 共文件共锁。
@@ -128,7 +128,7 @@ func CertJobLogPath(ruleID string) string {
 }
 
 // certJobLogFileComponent 证书任务日志文件名主体：与规则访问日志同构的可逆编码
-// （encodeFileComponent，历史修复）。字母表内 ID 原样保留（既有文件命名零变化）；
+// （encodeFileComponent）。字母表内 ID 原样保留（既有文件命名零变化）；
 // 带点等存量 ID 编码为 "%"+hex，使 `lb.dot`/`lbdot` 落不同文件与不同写锁
 // （旧剔除实现让二者共文件：签发日志跨规则混写、保留期清理互相删除）。
 // 反解见 logrotate.certJobLogRuleIDFromName（旧文件名仍可解析）。
@@ -137,7 +137,7 @@ func certJobLogFileComponent(ruleID string) string {
 }
 
 func (l *CertJobFileLogger) write(level, stage, message string) {
-	// 历史问题：跨实例按 ruleID 串行化（见 certJobLogWriteLocks 注释）。
+	// 跨实例按 ruleID 串行化（见 certJobLogWriteLocks 注释）。
 	unlock := lockCertJobLog(l.ruleID)
 	unlock.Lock()
 	defer unlock.Unlock()
@@ -147,7 +147,7 @@ func (l *CertJobFileLogger) write(level, stage, message string) {
 	timestamp := time.Now().In(CurrentLocation()).Format("2006/01/02 15:04:05")
 	line := fmt.Sprintf("%s [%s] %s - %s\n", timestamp, level, stage, message)
 
-	// 历史问题-1（历史）：轮转判定计入待写入行——size+len(line) 超阈即在写入
+	// 轮转判定计入待写入行——size+len(line) 超阈即在写入
 	// 前轮转，磁盘上活动文件恒 ≤ 上限。尺寸滚动唯一负责方为本写入侧（5 代移位），
 	// log-cleanup 仅负责保留期清理，不再参与尺寸轮转。
 	if _, err := taskengine.RotateTaskLogBeforeWrite(path, int64(len(line)), maxRotatedFiles); err != nil {
@@ -167,7 +167,7 @@ func (l *CertJobFileLogger) write(level, stage, message string) {
 	writeCertJobLogLine(f, path, line)
 }
 
-// writeCertJobLogLine 写一行并关闭，写/关闭错误经 Logf 留痕（历史问题：磁盘配额
+// writeCertJobLogLine 写一行并关闭，写/关闭错误经 Logf 留痕（磁盘配额
 // 耗尽/只读降级时 OpenFile 可成功而后续写入失败，此前两类错误被静默吞没，
 // 日志与 cert_jobs 状态分叉且无告警）。不改变签发结果。
 func writeCertJobLogLine(dst io.WriteCloser, path, line string) {
@@ -204,7 +204,7 @@ func WriteCertJobLogByRule(ruleID, level, stage, message string) {
 }
 
 func RemoveCertJobLogFiles(ruleID string) error {
-	// Cert-新1(历史):持写锁——写路径 历史问题 串行化写与轮转,但删除路径
+	// Cert-新1:持写锁——写路径串行化写与轮转,但删除路径
 	// 此前无锁:删除时在途签发 goroutine 尾部日志重建孤儿文件(certjob-<rule>.log)。
 	// 文件名主体已改为可逆编码；旧实现剔除非法字符产出的历史文件
 	// （如 `lb.dot` → certjob-lbdot.log）与新文件名不同，此处不顺手删除——

@@ -513,7 +513,7 @@ func queryBindingRows(t *testing.T, database *sql.DB, ruleCaddyID string) []int 
 	return ids
 }
 
-// 历史修复: A primary node with MULTIPLE binding rows for one rule
+// A primary node with MULTIPLE binding rows for one rule
 // (e.g. rule R bound to policies 1, 3, 5) snapshots to a slave; after apply,
 // the slave's security_policy_bindings contains exactly those rows (no dedup
 // to one row, no loss, order-preserving by policy_id).
@@ -579,7 +579,7 @@ func TestClusterSnapshot_multiRowBindingsPreserved(t *testing.T) {
 	}
 }
 
-// 历史修复 (dangling): A binding whose policy was deleted on primary is
+// (dangling): A binding whose policy was deleted on primary is
 // carried verbatim through snapshot→apply. The runtime (GetSecurityPoliciesForRule)
 // silently skips it via scanSecurityPolicyByID. Pin this pre-v2.2.0 behavior.
 func TestClusterSnapshot_danglingBindingPreserved(t *testing.T) {
@@ -671,11 +671,11 @@ func orderByNameSet(query string, names ...string) bool {
 }
 
 func TestClusterSnapshot_securityBindingsFullyOrdered(t *testing.T) {
-	// 历史修复 回归：v2.2.0 多策略后同一 rule_caddy_id 最多 8 行绑定（历史修复：
+	// 回归：v2.2.0 多策略后同一 rule_caddy_id 最多 8 行绑定
 	// 上限 2026-09-21 已 5→8，注释滞同步）。ORDER BY 只给 rule_caddy_id 时行间
 	// 顺序在 SQL 层无定义（靠复合主键覆盖索引碰巧稳定，属查询计划偶然），而
 	// 快照指纹/缓存键要求字节级确定性。
-	// 历史问题：旧断言钉 SQL 文本后缀（ORDER BY rule_caddy_id, policy_id），
+	// 旧断言钉 SQL 文本后缀（ORDER BY rule_caddy_id, policy_id），
 	// 对等价改写（ORDER BY 1,2 / 子查询 / CTE）过敏且不证明行为——改为行为钉：
 	// 同一绑定集合按两种相反的物理插入顺序落库，快照字节必须一致。
 	cluster, database := newClusterTestService(t)
@@ -751,7 +751,7 @@ func TestApplySnapshot_normalizesPolicyValueColumns(t *testing.T) {
 	}
 }
 
-// 历史修复：旧主端（v2.3.0-）快照不携带 security_ip_lists 键时，
+// 旧主端（v2.3.0-）快照不携带 security_ip_lists 键时，
 // 从端不得清空本地名单——与威胁源/爬虫源「缺席=保留本地」nil 门同口径。
 // 携带空数组 [] = 显式清空；携带正常载荷 = 全量替换。
 func TestClusterApplySnapshot_securityIPListsAbsentPreservesLocal(t *testing.T) {

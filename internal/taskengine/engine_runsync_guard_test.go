@@ -1,6 +1,6 @@
 package taskengine
 
-// 历史问题-4（历史）：RunSync 与 Trigger 守卫不对称——Trigger 拒绝 KindDaemon
+// RunSync 与 Trigger 守卫不对称——Trigger 拒绝 KindDaemon
 // 手动触发（engine.go「常驻任务不支持手动触发（启停即可）」），RunSync 无同型
 // 守卫，常驻任务被 handler 直调可绕过 startDaemon 生命周期与常驻循环双跑。
 // B 批裁定语义：常驻任务仅引擎调度（StartLoop/StopLoop 启停即可）。
@@ -34,13 +34,13 @@ func TestRunSync_rejectsDaemonKind(t *testing.T) {
 // Given RunsOn=RoleMasterOnly 描述符 + 引擎为从节点角色。
 // When RunSync 直调。
 // Then 返回「该操作仅允许在主节点执行」（与 Trigger 同型口径），Run 体未执行。
-// 历史修复（历史）：角色门双机制收敛——Descriptor.MasterOnly bool 删除，
+// 角色门双机制收敛——Descriptor.MasterOnly bool 删除，
 // 守卫统一走 roleAllows(RunsOn)（与调度面 tick 同函数）。
 func TestRunSync_masterOnlyRejectedOnSlave(t *testing.T) {
 	e := newTestEngine(t)
 	var runs atomic.Int32
 	e.Register(Descriptor{ID: "t-rsm", Family: "t", Name: "主仅M", Kind: KindScheduled, RunsOn: RoleMasterOnly,
-		// 历史修复（历史）配套：Scheduled 注册必须带 NextSlotFn（远期槽——
+		// 配套：Scheduled 注册必须带 NextSlotFn（远期槽——
 		// tick 不触发，本测试只验 RunSync 角色门）。
 		NextSlotFn: func() time.Time { return time.Now().Add(time.Hour) },
 		Run:        func(rc RunContext) error { runs.Add(1); return nil }})
@@ -57,7 +57,7 @@ func TestRunSync_masterOnlyRejectedOnSlave(t *testing.T) {
 
 // Given RunsOn=RoleMasterOnly 描述符 + 引擎为从节点角色。
 // When Trigger 手动触发。
-// Then 同样被角色门拒绝（Trigger 守卫 :338 与 RunSync 同型——历史修复 收敛前
+// Then 同样被角色门拒绝（Trigger 守卫:338 与 RunSync 同型——收敛前
 // 该守卫只认 MasterOnly bool，cert 族/auto-backup 仅声明 RunsOn 者可绕过）。
 func TestTrigger_masterOnlyRejectedOnSlave(t *testing.T) {
 	e := newTestEngine(t)

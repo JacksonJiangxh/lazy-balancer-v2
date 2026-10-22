@@ -1,4 +1,4 @@
-// 历史问题：全站 nodeMode 必须随 /config 成功响应持续刷新，而非只在登录、
+// 全站 nodeMode 必须随 /config 成功响应持续刷新，而非只在登录、
 // 失败重试或集群设置页更新。运行：cd web && node --test tests/authRole.spec.ts
 
 import { test } from 'node:test'
@@ -25,6 +25,15 @@ test('成功拉取配置后排下一轮全站角色刷新', () => {
   assert.match(fetchBody, /\} else \{\s*scheduleConfigRetry\(\)/)
   assert.match(fetchBody, /!\(e instanceof ApiRequestError && e\.status === 401\)\) scheduleConfigRetry\(\)/)
   assert.match(authSrc, /function localLogout[\s\S]*?clearConfigRetryTimer\(\)/)
+})
+
+test('配置补查在途门：fetchConfig 一轮在飞时新触发直接跳过', () => {
+  const fetchStart = authSrc.indexOf('async function fetchConfig')
+  const fetchEnd = authSrc.indexOf('interface LoginResult', fetchStart)
+  const fetchBody = authSrc.slice(fetchStart, fetchEnd)
+  assert.match(fetchBody, /\|\| configFetchInFlight\) return/, 'visibilitychange 补查与 15s 轮询可能同时点火，须在途门防双发')
+  assert.match(fetchBody, /configFetchInFlight = true/)
+  assert.match(fetchBody, /finally \{\s*configFetchInFlight = false\s*\}/, '在途标记必须 finally 复位（含失败路径）')
 })
 
 test('mfa_write_guard 随 /config 投影单源：Users 页不再单独整取 GET /config', () => {

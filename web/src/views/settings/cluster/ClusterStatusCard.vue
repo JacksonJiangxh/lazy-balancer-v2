@@ -35,7 +35,7 @@
           <span class="mono-value">{{ status.master_url || '-' }}</span>
         </el-descriptions-item>
         <el-descriptions-item label="最近同步">{{ formatDate(status.last_sync_at) || '-' }}</el-descriptions-item>
-        <!-- 历史问题-09：明文链路常驻提示（注册时刻的一次性审计之外，稳态也要可见） -->
+        <!-- 明文链路常驻提示（注册时刻的一次性审计之外，稳态也要可见）-->
         <el-descriptions-item v-if="status.transport_insecure" label="链路加密" :span="3">
           <span class="error-text">明文 HTTP：证书私钥、ACME/DNS 凭据与集群令牌将以明文传输，且没有证书指纹校验；建议改用 HTTPS</span>
         </el-descriptions-item>
@@ -44,7 +44,7 @@
         </el-descriptions-item>
       </template>
     </el-descriptions>
-    <!-- 历史问题：拉取失败且无数据时改「加载失败」，与父级错误横幅口径一致。 -->
+    <!-- 拉取失败且无数据时改「加载失败」，与父级错误横幅口径一致。-->
     <el-empty v-else :description="error ? '加载失败' : '暂无节点状态'" :image-size="60" />
   </el-card>
 </template>
@@ -59,11 +59,11 @@ import type { ClusterStatus } from '@/types'
 const props = defineProps<{
   readonly status: ClusterStatus | null
   readonly loading: boolean
-  /** 历史问题：父级轮询错误态——无数据时的空态文案据此切「加载失败」。 */
+  /**：父级轮询错误态——无数据时的空态文案据此切「加载失败」。*/
   readonly error?: boolean
 }>()
 
-// apply_ok_reload_failed 机内标记的展示翻译已收敛至 utils/syncErrorDisplay.ts（历史修复 单一实现）。
+// apply_ok_reload_failed 机内标记的展示翻译已收敛至 utils/syncErrorDisplay.ts。
 const syncErrorDisplay = computed<string>(() => formatSyncErrorDisplay(props.status))
 </script>
 

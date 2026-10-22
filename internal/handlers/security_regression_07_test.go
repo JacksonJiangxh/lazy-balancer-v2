@@ -8,10 +8,10 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// TestBindRuleToPolicy_ruleCheckDBErrorReturns500 验证 历史修复-B：规则存在性
+// TestBindRuleToPolicy_ruleCheckDBErrorReturns500 验证 -B：规则存在性
 // COUNT 查询的 DB 故障（此处以表重命名模拟「no such table」瞬时故障）必须返回
 // 500 而非 400「规则不存在」——合并 err||count 的旧实现会把可重试故障误报为
-// 客户端错误，与 历史修复 修复的策略校验口径一致。
+// 客户端错误，与修复的策略校验口径一致。
 func TestBindRuleToPolicy_ruleCheckDBErrorReturns500(t *testing.T) {
 	// Given 一个存在的策略与一张被重命名的 lb_rules 表（COUNT 查询必然报错）
 	setupSecurityPolicyTestDB(t)

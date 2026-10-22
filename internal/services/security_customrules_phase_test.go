@@ -8,7 +8,7 @@ import (
 )
 
 // body 条件必须整条链发射 phase:2：REQUEST_BODY 仅在 phase:2 可读，phase:1 的
-// body 规则永远不匹配（历史修复）。
+// body 规则永远不匹配。
 func TestEmitCustomRules_bodyConditionEmitsPhase2(t *testing.T) {
 	var sb strings.Builder
 	emitCustomRules(&sb, []models.CustomRule{
@@ -64,7 +64,7 @@ func TestEmitCustomRules_mixedChainSharesPhase2(t *testing.T) {
 }
 
 // 旧版单目标内嵌形状此前发射时缺失相位，必须与 conditions 形状同一套相位选择
-// （历史修复）：uri → phase:1，body → phase:2。
+// uri → phase:1，body → phase:2。
 func TestEmitCustomRules_legacySingleTargetCarriesPhase(t *testing.T) {
 	var sb strings.Builder
 	emitCustomRules(&sb, []models.CustomRule{

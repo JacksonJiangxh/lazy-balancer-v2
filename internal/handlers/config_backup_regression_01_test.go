@@ -1,11 +1,11 @@
 package handlers
 
-//   - 历史修复：受信代理导入门按「备份是否携带 security_ip_lists 表」分流
-//     ——携带时 refs 存在性仅按备份行集合解析（历史修复 全量替换先例：备份行才是
+//   受信代理导入门按「备份是否携带 security_ip_lists 表」分流
+//     携带时 refs 存在性仅按备份行集合解析（全量替换先例：备份行才是
 //     导入后的真实数据），指向库内但不在备份内的 id 导入后必然悬空 → 400；
 //     未携带时照旧走库（迟到表 era 备份/「缺席=保留本地」语义不变）。
-//   - 历史修复：/security/autoban/status 响应补 is_master/role（从端卡片角色门
-//     数据源）；历史修复：list_entries 与渲染生效面同口径（剔除已到期未清理）。
+//   /security/autoban/status 响应补 is_master/role（从端卡片角色门
+//     数据源）；list_entries 与渲染生效面同口径（剔除已到期未清理）。
 
 import (
 	"encoding/json"
@@ -18,12 +18,12 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// r75bBackupJSONWithoutIPListsTable 构造不含 security_ip_lists 键的 Version=2
-// 备份 JSON（迟到表 era 形态——历史修复 夹具恒按 configBackupTables 补全表集，
+// noIPListsBackupJSON 构造不含 security_ip_lists 键的 Version=2
+// 备份 JSON（迟到表 era 形态——夹具恒按 configBackupTables 补全表集，
 // 「表未携带」形态须自组表集），users 恒含一个启用管理员（过管理员门）。
-func r75bBackupJSONWithoutIPListsTable(t *testing.T, cfg map[string]any) string {
+func noIPListsBackupJSON(t *testing.T, cfg map[string]any) string {
 	t.Helper()
-	tables := round44FullBackupTablesMinus("security_ip_lists")
+	tables := fullBackupTablesMinusShared("security_ip_lists")
 	backup := configBackup{
 		Meta:   configBackupMeta{App: "lazy-balancer-v2", Version: 2, ExportedAt: "2026-08-21T00:00:00Z"},
 		Config: cfg,
@@ -37,25 +37,25 @@ func r75bBackupJSONWithoutIPListsTable(t *testing.T, cfg map[string]any) string 
 	return string(data)
 }
 
-// TestImportConfigBackup_trustedProxyRefsResolvedAgainstBackupRowsOnly（历史修复）：
+// TestImportConfigBackup_trustedProxyRefsResolvedAgainstBackupRowsOnly
 // 备份携带名单表时，refs 存在性仅按备份行集合解析——指向库内存量（导入后被
 // 全量替换掉）的 id 必须 400 拒绝，不得借「备份∪库」通道放行为导入后悬空引用。
 func TestImportConfigBackup_trustedProxyRefsResolvedAgainstBackupRowsOnly(t *testing.T) {
 	h := newBackupTestHandlers(t)
-	r55SeedCurrentAdmin(t)
+	seedCurrentAdminShared(t)
 	// 库内存量名单 #7（不在备份内）；备份携带名单表（仅 #1）。
 	if _, err := db.DB.Exec(`INSERT INTO security_ip_lists (id, name, entries) VALUES (7, 'db-only-list', '[]')`); err != nil {
 		t.Fatal(err)
 	}
 
 	t.Run("携表备份 refs 指向库内不在备份内必须 400", func(t *testing.T) {
-		backup := r55BackupJSONWithConfig(t, map[string][]map[string]any{
+		backup := configBackupJSON(t, map[string][]map[string]any{
 			"security_ip_lists": {{"id": 1, "name": "backup-list", "entries": `[{"value":"203.0.113.0/24","remark":""}]`}},
 		}, map[string]any{
 			"trusted_proxy_ranges":     `["198.51.100.0/24"]`,
 			"trusted_proxy_range_refs": "[7]",
 		})
-		response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
+		response := postImportShared(t, h.ImportConfigBackup, "/config/import", backup)
 		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "不存在") {
 			t.Fatalf("status=%d body=%s, want 400 不存在（名单表随备份全量替换，库内 #7 导入后必然悬空）", response.Code, response.Body.String())
 		}
@@ -69,13 +69,13 @@ func TestImportConfigBackup_trustedProxyRefsResolvedAgainstBackupRowsOnly(t *tes
 	})
 
 	t.Run("携表备份 refs 指向备份内名单照常放行", func(t *testing.T) {
-		backup := r55BackupJSONWithConfig(t, map[string][]map[string]any{
+		backup := configBackupJSON(t, map[string][]map[string]any{
 			"security_ip_lists": {{"id": 1, "name": "backup-list", "entries": `[{"value":"203.0.113.0/24","remark":""}]`}},
 		}, map[string]any{
 			"trusted_proxy_ranges":     `["198.51.100.0/24"]`,
 			"trusted_proxy_range_refs": "[1]",
 		})
-		response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
+		response := postImportShared(t, h.ImportConfigBackup, "/config/import", backup)
 		if response.Code != http.StatusOK {
 			t.Fatalf("status=%d body=%s, want 200（备份内名单可解析，跨节点还原不误拒）", response.Code, response.Body.String())
 		}
@@ -86,20 +86,20 @@ func TestImportConfigBackup_trustedProxyRefsResolvedAgainstBackupRowsOnly(t *tes
 		if _, err := db.DB.Exec(`INSERT INTO security_ip_lists (id, name, entries) VALUES (7, 'db-only-list', '[]')`); err != nil {
 			t.Fatal(err)
 		}
-		// 表集不含 security_ip_lists（迟到表 era 形态——历史修复 夹具恒补全表集，
+		// 表集不含 security_ip_lists（迟到表 era 形态——夹具恒补全表集，
 		// 表缺失须自组表集构造）。
-		backup := r75bBackupJSONWithoutIPListsTable(t, map[string]any{
+		backup := noIPListsBackupJSON(t, map[string]any{
 			"trusted_proxy_ranges":     `["198.51.100.0/24"]`,
 			"trusted_proxy_range_refs": "[7]",
 		})
-		response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
+		response := postImportShared(t, h.ImportConfigBackup, "/config/import", backup)
 		if response.Code != http.StatusOK {
 			t.Fatalf("status=%d body=%s, want 200（表未携带=导入后名单表保持本地，库内 #7 仍存在）", response.Code, response.Body.String())
 		}
 	})
 }
 
-// TestGetAutobanStatus_roleFieldsAndActiveCaliber（历史修复）：status 响应
+// TestGetAutobanStatus_roleFieldsAndActiveCaliber：status 响应
 // 补 is_master/role（引擎未装配时保守判从——不提供会在从端 403 的写入口）；
 // list_entries 剔除已到期未清理条目（与渲染生效面同口径）。
 func TestGetAutobanStatus_roleFieldsAndActiveCaliber(t *testing.T) {
@@ -126,7 +126,7 @@ func TestGetAutobanStatus_roleFieldsAndActiveCaliber(t *testing.T) {
 		t.Fatalf("decode: %v body=%s", err, w.Body.String())
 	}
 	data := payload.Data
-	// 历史修复：角色位在场且自洽（绝对值由 services 层缝钉测锁定——handlers
+	// 角色位在场且自洽（绝对值由 services 层缝钉测锁定——handlers
 	// 全量跑位时其它用例会装配全局引擎，环境角色不可在此断言）。
 	rawMaster, ok := data["is_master"]
 	if !ok {
@@ -143,7 +143,7 @@ func TestGetAutobanStatus_roleFieldsAndActiveCaliber(t *testing.T) {
 	if role, _ := data["role"].(string); role != wantRole {
 		t.Fatalf("role=%v 与 is_master=%v 不自洽, want %q", data["role"], isMaster, wantRole)
 	}
-	// 历史修复：list_entries=2（生效条目；已到期未清理的 203.0.113.2 不计入）。
+	// list_entries=2（生效条目；已到期未清理的 203.0.113.2 不计入）。
 	if n, _ := data["list_entries"].(float64); n != 2 {
 		t.Fatalf("list_entries=%v, want 2（已到期未清理条目不计入——与渲染生效面同口径）", data["list_entries"])
 	}

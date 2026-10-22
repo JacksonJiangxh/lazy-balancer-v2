@@ -186,6 +186,46 @@ func TestUserAndAPIKeyWrites409DuringImport(t *testing.T) {
 	}
 }
 
+// 导入窗口写门同族覆盖：MFA 五个写端点操作的 users 表 MFA 列同样在导入全量
+// 替换清单内——窗口内写入会被静默覆盖（用户以为 MFA 已启用实被回滚）或阻塞至
+// busy_timeout。与 users/apikeys 写端点同口径 409 fast-fail，且门须先于
+// 参数解析与身份判定（MFAResetByAdmin 带路径参数也不例外）。
+func TestMFAWrites409DuringImport(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/auth/mfa/setup", h.MFASetup)
+	router.POST("/auth/mfa/activate", h.MFAActivate)
+	router.POST("/auth/mfa/disable", h.MFADisable)
+	router.POST("/auth/mfa/recovery-codes", h.MFARecoveryCodes)
+	router.POST("/users/:id/mfa/reset", h.MFAResetByAdmin)
+
+	// 模拟导入会话持锁（configImportBusy 的探测对象）。
+	configImportBeginMu.Lock()
+	defer configImportBeginMu.Unlock()
+
+	calls := []struct{ method, path, body string }{
+		{"POST", "/auth/mfa/setup", `{}`},
+		{"POST", "/auth/mfa/activate", `{"code":"123456"}`},
+		{"POST", "/auth/mfa/disable", `{"code":"123456"}`},
+		{"POST", "/auth/mfa/recovery-codes", `{}`},
+		{"POST", "/users/2/mfa/reset", `{}`},
+	}
+	for _, call := range calls {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(call.method, call.path, strings.NewReader(call.body))
+		req.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("%s %s status=%d body=%s, want 409（导入窗口内 MFA 写端点必须 fast-fail）",
+				call.method, call.path, rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "配置导入进行中") {
+			t.Fatalf("%s %s body=%s, want 配置导入进行中 文案", call.method, call.path, rec.Body.String())
+		}
+	}
+}
+
 // 对照：导入窗口外用户写端点照常处理（409 门不得做成恒拒）。
 func TestUserWritesAllowedOutsideImportWindow(t *testing.T) {
 	h := newBackupTestHandlers(t)

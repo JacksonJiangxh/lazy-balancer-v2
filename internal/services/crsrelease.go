@@ -14,7 +14,7 @@ import (
 )
 
 // validateCRSStaging ensures an extracted CRS release tree is complete enough
-// to swap into place: the setup template plus an intact rules tree. 历史问题：
+// to swap into place: the setup template plus an intact rules tree.
 // 探针文件（crsRulesProbeFile）是 backup restore / seed / snapshot 消费门共用
 // 的完整性契约，安装期必须同步把关——否则未来 CRS 重组 rules/ 的发布会装出
 // 退化树，之后每次启动都触发清空重播循环。
@@ -122,7 +122,7 @@ func parseGitHubLatestTag(body []byte) (string, error) {
 	if payload.TagName == "" {
 		return "", errors.New("GitHub 响应缺少 tag_name")
 	}
-	// 历史问题-4（历史）：与 HTML 回退路径同口径校验 tag 形状（控制字符/换行
+	// 与 HTML 回退路径同口径校验 tag 形状（控制字符/换行
 	// 会进入版本行、日志与审计，并参与 raw.githubusercontent URL 拼接）。
 	if err := validateReleaseTag(payload.TagName); err != nil {
 		return "", err
@@ -130,7 +130,7 @@ func parseGitHubLatestTag(body []byte) (string, error) {
 	return payload.TagName, nil
 }
 
-// crsExtractMaxBytes 是解压总字节上限（防 gzip 炸弹耗尽数据卷，历史问题）：
+// crsExtractMaxBytes 是解压总字节上限（防 gzip 炸弹耗尽数据卷）
 // tar 头声明的 hdr.Size 即解压后写入的确切字节数，跨条目累计超限即中止。
 const crsExtractMaxBytes = 500 << 20
 
@@ -160,7 +160,7 @@ func extractCRSTarball(tarballPath, destDir string) error {
 		}
 		// 先减后比：totalBytes 恒 ≤ crsExtractMaxBytes（每个被接受条目维持该
 		// 不变量），减法不下溢；加法在 hdr.Size 接近 2^63-1（GNU base-256）时
-		// int64 溢出为负，会绕过上限（历史问题 发现1，镜像 waffiles_sync.go 口径）。
+		// int64 溢出为负，会绕过上限（发现1，镜像 waffiles_sync.go 口径）。
 		if hdr.Size < 0 || hdr.Size > crsExtractMaxBytes-totalBytes {
 			return fmt.Errorf("tarball 解压超过大小上限（%d MB）", crsExtractMaxBytes>>20)
 		}

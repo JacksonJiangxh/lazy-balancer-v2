@@ -99,7 +99,7 @@ func TestCertTasksStatus_businessActivityDoesNotOverrideStoppedExecution(t *test
 	}
 }
 
-// 历史问题-03：常驻任务自愈预算用尽后 loop_on=false（与用户主动停止同形），
+// 常驻任务自愈预算用尽后 loop_on=false（与用户主动停止同形），
 // 修复前状态列回落 idle——采集/签发永久停摆与「用户主动停止」不可区分。
 // 引擎以 RestartExhausted 标记暴露真实停摆来源，监控必须呈现 failed。
 func TestCollectEngineFamilies_daemonRestartExhaustedShowsFailed(t *testing.T) {
@@ -117,17 +117,17 @@ func TestCollectEngineFamilies_daemonRestartExhaustedShowsFailed(t *testing.T) {
 	})
 	t.Cleanup(e.Stop)
 	if err := e.Register(taskengine.Descriptor{
-		ID: "audit83-exhaust", Family: "test", Name: "自愈用尽探针",
+		ID: "self-heal-exhaust", Family: "test", Name: "自愈用尽探针",
 		Kind: taskengine.KindDaemon, RunsOn: taskengine.RoleAny,
 		Run: func(taskengine.RunContext) error { return errors.New("boom") },
 	}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
-	e.StartLoop("audit83-exhaust")
+	e.StartLoop("self-heal-exhaust")
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		meta, ok := e.Lookup("audit83-exhaust")
+		meta, ok := e.Lookup("self-heal-exhaust")
 		if ok && meta.RestartExhausted {
 			if meta.LoopOn {
 				t.Fatal("自愈用尽后 loop_on 必须为 false（与日志「已停止调度」一致）")
@@ -142,7 +142,7 @@ func TestCollectEngineFamilies_daemonRestartExhaustedShowsFailed(t *testing.T) {
 
 	rows := collectEngineFamilies(e)
 	for _, row := range rows {
-		if row.ID != "audit83-exhaust" {
+		if row.ID != "self-heal-exhaust" {
 			continue
 		}
 		if row.Status != TaskStatusFailed {
@@ -153,5 +153,5 @@ func TestCollectEngineFamilies_daemonRestartExhaustedShowsFailed(t *testing.T) {
 		}
 		return
 	}
-	t.Fatal("任务视图缺少 audit83-exhaust 行")
+	t.Fatal("任务视图缺少 self-heal-exhaust 行")
 }

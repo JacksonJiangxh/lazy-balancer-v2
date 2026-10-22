@@ -7,7 +7,7 @@ import (
 	"lazy-balancer-v2/internal/config"
 )
 
-// 历史修复：Halted 终态的状态机语义锁定——Start() 对 Halted 是 no-op（缺口本
+// Halted 终态的状态机语义锁定——Start() 对 Halted 是 no-op（缺口本
 // 体），Resume() 是唯一出口。SetClusterMode 重新注册路径在 BecomeSlave 后补调
 // Resume（handlers/cluster_mode.go）依赖此语义：令牌撤销/schema 不匹配 halt 后，
 // 重新注册必须能拉起新循环进入注册轮询，否则从节点静默永久脱同步。
@@ -21,7 +21,7 @@ func TestSyncService_halted_startNoOp_resumeRestarts(t *testing.T) {
 	svc.state.Store(uint32(syncStateHalted))
 
 	// Start()（BecomeSlave→StartSync→Start 路径）对 Halted 必须 no-op——
-	// 这是 历史修复 缺口的前提行为，锁定防止语义漂移
+	// 这是缺口的前提行为，锁定防止语义漂移
 	svc.Start()
 	if got := syncLifecycleState(svc.state.Load()); got != syncStateHalted {
 		t.Fatalf("Start() on Halted must be no-op, state=%v", got)

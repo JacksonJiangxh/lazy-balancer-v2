@@ -118,7 +118,7 @@ test('地球聚合标签与到站脉冲跟地图同色', () => {
   assert.match(globeSrc, /ripple\.age \/ FLOW_RIPPLE_SECONDS/, '涟漪寿命必须走 threatTheme 单源（1.8s）')
 })
 
-test('缓动/涟漪/浮签字色四组跨引擎重复实现收敛到 threatTheme（历史问题-7）', () => {
+test('缓动/涟漪/浮签字色四组跨引擎重复实现收敛到 threatTheme', () => {
   const theme = source('src/utils/threatTheme.ts')
   // 单源定义在本文件，两引擎只导入
   assert.match(theme, /export function easeOutCubic\(/)

@@ -203,7 +203,7 @@
       </el-form>
       <template #footer>
         <el-button :disabled="saving" @click="closeProfile">取消</el-button>
-        <!-- 历史问题：OIDC 用户全部字段只读（显示名/密码源自 IdP），保存必败（后端 400）——直接隐藏保存钮 -->
+        <!-- OIDC 用户全部字段只读（显示名/密码源自 IdP），保存必败（后端 400）——直接隐藏保存钮-->
         <el-button v-if="!isOIDCUser" type="primary" :loading="saving" :disabled="isReadOnly || saving" @click="saveProfile">保存</el-button>
       </template>
     </el-dialog>
@@ -235,7 +235,7 @@ const saving = ref(false)
 const loggingOut = ref(false)
 
 const currentPage = computed(() => authStore.currentPage)
-// 历史问题：unknown（用户信息尚未拉取成功）窗口期 fail-closed，与 slave 同口径锁定
+// unknown（用户信息尚未拉取成功）窗口期 fail-closed，与 slave 同口径锁定
 // 自助资料编辑；非管理员的自我显示名/改密是自助能力而非管理员操作，不随此收紧
 //（后端恢复后仍按自身身份正确鉴权）。
 const isOIDCUser = computed(() => authStore.user?.auth_provider === 'oidc')
@@ -272,7 +272,7 @@ const profileForm = ref({
   password: '',
   // 2026-09-19 用户裁定：密码修改需二次确认
   passwordConfirm: '',
-  // 历史修复：提交新密码时的当前密码确认（后端密码确认门，不改密码时不需要）
+  // 提交新密码时的当前密码确认（后端密码确认门，不改密码时不需要）
   currentPassword: '',
 })
 
@@ -325,7 +325,7 @@ const saveProfile = async () => {
     authStore.showToast('warning', passwordError)
     return
   }
-  // 历史修复：提交新密码必须携带当前密码（后端密码确认门），不改密码时不需要。
+  // 提交新密码必须携带当前密码（后端密码确认门），不改密码时不需要。
   if (profileForm.value.password && !profileForm.value.currentPassword) {
     authStore.showToast('warning', '请输入当前密码')
     return
@@ -386,7 +386,7 @@ const fetchDriftStatus = async () => {
 const handleRestartForDrift = async () => {
   if (restarting.value) return
   restarting.value = true
-  // 历史问题：确认/重启/就绪轮询流程单源（utils/restart），与设置页同一实现
+  // 确认/重启/就绪轮询流程单源（utils/restart），与设置页同一实现
   const result = await restartServiceWithFeedback({
     confirmMessage: '将重启服务以重新应用全部规则配置，期间服务短暂不可用。确认重启？',
     confirmTitle: '重启服务恢复',
@@ -397,7 +397,7 @@ const handleRestartForDrift = async () => {
   if (result !== 'reloaded') restarting.value = false
 }
 
-// 历史修复 / 历史问题：漂移轮询接可见性间隔单源（与 usePollingTask/
+// 漂移轮询接可见性间隔单源（与 usePollingTask/
 // useLogTailPolling 同范式）——hidden 停表、恢复可见立即补查；原手写
 // setInterval+document.hidden 只跳过轮次，返回页后横幅最长 60s 陈旧。
 // immediate:true = 挂载即首查（替代原显式 fetchDriftStatus 调用）。
@@ -421,7 +421,7 @@ onUnmounted(() => {
 
 .config-drift-banner {
   border-radius: 0;
-  /* 垂直留白由全局 .error-banner（main.css）供给（历史去双份） */
+  /* 垂直留白由全局 .error-banner（main.css）供给（去双份）*/
 }
 /* 与站内 polling-error-alert 统一模式（Rules/CertJobs/ClusterSettings）同构：
    图标+标题 flex（文案左、动作右）+ 12px meta 次行 */

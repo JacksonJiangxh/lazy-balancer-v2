@@ -8,7 +8,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// TestUpdateSecurityPolicy_partialEnableRejectsDanglingReferences 验证 历史修复：
+// TestUpdateSecurityPolicy_partialEnableRejectsDanglingReferences 验证
 // 仅含 {enabled:true} 的部分更新（REST 文档明示「只提交需要修改的字段」）不得
 // 让禁用期间被删除的自定义规则/拦截页引用随重启用静默激活——此前 deref 零值
 // 使引用校验整体短路，悬空引用激活后发射端仅 warn 跳过（WAF 规则静默丢失、

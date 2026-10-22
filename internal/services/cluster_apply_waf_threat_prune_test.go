@@ -1,8 +1,8 @@
 package services
 
-// 历史修复 收口（SecurityEngine 域移交）：从端安全数据同步必须删除主端已移除的
+// 收口（SecurityEngine 域移交）：从端安全数据同步必须删除主端已移除的
 // 威胁源本地残留文件——否则 wafFilesRefDiffers/wafFilesDrifted 恒判漂移，
-// 每轮全量重拉却永不删除（历史问题 同条目的半项）。
+// 每轮全量重拉却永不删除。
 
 import (
 	"context"

@@ -17,7 +17,7 @@ import (
 	"time"
 )
 
-// nodeHealthWarn 是节点列表 health_json 解析失败的限频状态（历史问题-08）：
+// nodeHealthWarn 是节点列表 health_json 解析失败的限频状态
 // Nodes() 每次节点列表请求都会碰到同一坏行，前端轮询（秒级/十秒级）下同一条
 // warn 会持续刷屏。与同包 snapshotRowIsolation / throttled*Logf 家族同口径：
 // 同一 nodeID 在窗口内只告警一次，插入时顺带回收过期键（节点 ID 有界）。
@@ -45,15 +45,15 @@ func warnNodeHealthParseThrottled(nodeID int, cause error, now time.Time) {
 	Logf("warn", "解析节点 %d 健康状态失败: %v", nodeID, cause)
 }
 
-// RoleOf 读取节点角色（主节点=true）的单源实现（历史问题-07）。COALESCE(is_master,1)
+// RoleOf 读取节点角色（主节点=true）的单源实现。COALESCE(is_master,1)
 // 与 readonly 写闸（readonly.go）及 cluster_version 触发器口径一致：历史库 NULL
-// 视为主节点。历史问题 迁移（db.go）已回填存量 NULL，稳态不可达，
-// 此处为纵深防御一致性（2026-09-06 集群审计 历史问题 / 历史修复 复核结论）——此前裸
+// 视为主节点。迁移（db.go）已回填存量 NULL，稳态不可达，
+// 此处为纵深防御一致性（2026-09-06 集群审计 复核结论）——此前裸
 // SELECT 对 NULL Scan 失败会使 requireMaster/Promote 走 500，
 // 同一脏数据在两守卫处语义相反。
 //
 // 读失败语义由调用方决定（fail-open 主节点 / 500 / 跳过本轮）：本函数只做
-// 单源读取，不做策略；新调用点禁止再内联 SQL（历史：25 处重复实现已
+// 单源读取，不做策略；新调用点禁止再内联 SQL（25 处重复实现已
 // 出现失败语义分叉，本批先收敛 cluster 相关点，residual 见修复报告）。
 func RoleOf(ctx context.Context, database *sql.DB) (bool, error) {
 	if database == nil {
@@ -80,11 +80,11 @@ func (s *ClusterService) BecomeSlave(ctx context.Context, masterURL string, regi
 	}
 	// 换主与升主同样需要排干旧拓扑已准入的拉取：否则旧主快照的提交后
 	// 阶段可能越过新凭据落库点，继续物化旧配置/触发旧 Caddy 重载。
-	// 历史问题-06：同库全部实例逐个排干（只处理最后注册的一个会漏掉在途 apply）。
+	// 同库全部实例逐个排干（只处理最后注册的一个会漏掉在途 apply）。
 	drainers := syncDrainersFor(s.db)
 	if len(drainers) > 0 {
 		for _, drainer := range drainers {
-			// 历史问题-01：排干成功后所有返回路径都必须恢复拉取准入。原实现只在
+			// 排干成功后所有返回路径都必须恢复拉取准入。原实现只在
 			// 成功尾部重开——下方 UPDATE 失败（SQLITE_BUSY/磁盘满）时准入永久
 			// 关闭；而「已是从节点换主」不触发引擎换代（SetRole(false) flipped=
 			// false），旧 daemon 不会重新 Start，后续每轮 Pull 在 beginPull 即
@@ -98,7 +98,7 @@ func (s *ClusterService) BecomeSlave(ctx context.Context, masterURL string, regi
 			}
 		}
 	}
-	// 历史问题：last_sync 与 applied_version 同语义
+	// last_sync 与 applied_version 同语义
 	// ——旧集群的同步时间对新集群无意义，同一 UPDATE 里置 NULL，状态卡不残留
 	// 旧集群时间（Status() 仅对 Valid 值格式化）。
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -133,25 +133,25 @@ func (s *ClusterService) BecomeSlave(ctx context.Context, masterURL string, regi
 			drainer.reopenPullAdmission()
 		}
 	}
-	// 历史问题-06：角色翻转显式失效快照缓存。缓存键只有 version/ownership/开关，
+	// 角色翻转显式失效快照缓存。缓存键只有 version/ownership/开关，
 	// 降级瞬间在途的 master-only Run 可越过角色检查写库且 is_master=0 不 bump
 	// 版本——若此后未发生任何 apply 就再次升主，旧缓存会被当作权威下发。
 	clusterSnapshotCaches.Delete(s.db)
-	// 历史问题-05：角色翻转后主节点期间的分区上报缓存不再有权威来源。
+	// 角色翻转后主节点期间的分区上报缓存不再有权威来源。
 	s.clearAllSectionReports()
 	// 角色翻转由引擎 SetRole 唯一驱动：master-only 任务统一停调，cluster-sync
 	// 经 RestartOnRoleFlip 换代为从节点分支；无管理器/旧调度器旁路。
-	// LINK-4：看门狗漂移状态必须先于 SetRole 复位——放末尾会在 SetRole(false)
+	// 看门狗漂移状态必须先于 SetRole 复位——放末尾会在 SetRole(false)
 	// 与复位之间打开窗口，在途看门狗轮次按从节点角色对旧主节点的漂移状态
 	// 误报一次「配置漂移」。升主路径（cluster.go Promote）已是先复位后换角色。
 	ResetConfigDrift()
 	if te := TaskEngine(); te != nil {
 		te.SetRole(false)
-		// 历史问题：SetRole 只按角色启停 daemon，
+		// SetRole 只按角色启停 daemon，
 		// 不会覆盖主节点期间被用户停止的 loopEnabled——切从是本机拓扑变更
 		// （等价基线的 StartSync 直调），不同步即为静默脱管，必须显式恢复调度。
 		te.StartLoop("cluster-sync")
-		// 历史问题：偏好表若仍保留主节点期间的 cluster-sync=0，下次重启会再次
+		// 偏好表若仍保留主节点期间的 cluster-sync=0，下次重启会再次
 		// 停同步。切从是显式拓扑变更——持久偏好同步恢复（写失败仅告警，
 		// 当前进程已启动）。
 		if err := RecordTaskLoopPref("cluster-sync", true); err != nil {
@@ -160,7 +160,7 @@ func (s *ClusterService) BecomeSlave(ctx context.Context, masterURL string, regi
 	}
 	// 拉取准入已在上方拓扑提交后重开（defer 兜底失败路径）；此处不再重复。
 	if len(drainers) > 0 {
-		// 历史问题-05(b)：换主后内存 TOFU pin 缓存与磁盘生命周期对齐——磁盘侧由
+		// (b)：换主后内存 TOFU pin 缓存与磁盘生命周期对齐——磁盘侧由
 		// detachFromMaster 删除旧主 pin，内存 verifiedPins 若不清空会残留旧主
 		// 指纹（与 Promote handler 的 ForgetClusterPins 收尾对称）。同主重注册
 		// 也一并清空：下次请求按 pin 文件重钉，行为等价且无落盘副作用。
@@ -173,7 +173,10 @@ func (s *ClusterService) BecomeSlave(ctx context.Context, masterURL string, regi
 	if previousToken != "" && strings.TrimRight(previousMasterURL, "/") != strings.TrimRight(masterURL, "/") {
 		s.detachFromMaster(ctx, previousMasterURL, previousToken)
 	}
-	ResetConfigDrift()
+	// 漂移态复位由上方 SetRole 前的 ResetConfigDrift 唯一承担（必须先于
+	// 角色翻转闭合窗口）——尾部不得重复调用：SetRole 后在途看门狗轮已取消
+	// （ctx 传播+WatchdogCheckOnce 消费 rc.Ctx），重复复位会把「降级后真实
+	// 重建的漂移态」误清。
 	return nil
 }
 
@@ -186,7 +189,7 @@ func (s *ClusterService) UpdateSettings(ctx context.Context, req models.ClusterS
 		return ErrSlaveReadOnly
 	}
 	// sync_interval 无下限校验会让从节点 run 循环 waitDelay(0) 进入零间隔
-	// Pull 风暴（主节点被持续高压请求打满）；上限 86400 防误填（历史问题 发现1）。
+	// Pull 风暴（主节点被持续高压请求打满）；上限 86400 防误填。
 	if req.SyncInterval != nil && (*req.SyncInterval < minSyncIntervalSeconds || *req.SyncInterval > maxSyncIntervalSeconds) {
 		return ErrInvalidSyncInterval
 	}
@@ -212,8 +215,8 @@ func (s *ClusterService) UpdateSettings(ctx context.Context, req models.ClusterS
 		}
 	}
 	// 系统数据恒同步(2026-09-11 裁定):users/api_keys/ACME 等确保系统基本
-	// 运行的数据不可禁用同步(证书任务行与文件随负载规则开关,历史修复)。
-	// 历史问题:哨兵错误使 handler 映射 400(客户端错误,与间隔校验同型)。
+	// 运行的数据不可禁用同步(证书任务行与文件随负载规则开关）。
+	// 哨兵错误使 handler 映射 400(客户端错误,与间隔校验同型)。
 	if req.SyncUsers != nil && !*req.SyncUsers {
 		return ErrSyncUsersLocked
 	}
@@ -253,21 +256,28 @@ func (s *ClusterService) Status(ctx context.Context) (models.ClusterStatus, erro
 	var clusterToken string
 	var lastSync sql.NullTime
 	var storedSyncError string
-	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(is_master,1), COALESCE(cluster_version,0), COALESCE(master_url,''), COALESCE(sync_interval,60), COALESCE(sync_users,1), COALESCE(sync_rules,1), COALESCE(sync_security,1), COALESCE(cluster_token,''), COALESCE(applied_version,0), last_sync, COALESCE(last_sync_error,'') FROM global_config WHERE id=1`).Scan(
-		&isMaster, &status.ClusterVersion, &status.MasterURL, &status.SyncInterval, &status.SyncUsers, &status.SyncRules, &status.SyncSecurity, &clusterToken, &status.AppliedVersion, &lastSync, &storedSyncError)
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(is_master,1), COALESCE(cluster_version,0), COALESCE(master_url,''), COALESCE(sync_interval,60), COALESCE(cluster_token,''), COALESCE(applied_version,0), last_sync, COALESCE(last_sync_error,'') FROM global_config WHERE id=1`).Scan(
+		&isMaster, &status.ClusterVersion, &status.MasterURL, &status.SyncInterval, &clusterToken, &status.AppliedVersion, &lastSync, &storedSyncError)
 	if err != nil {
 		return models.ClusterStatus{}, fmt.Errorf("读取集群状态: %w", err)
 	}
-	// 历史问题-1(历史)/历史问题-1(历史幻影修复修正——clamp 曾被误插
+	// 同步开关与运行时同源（readSyncSwitches）：sync_users 恒同步（存量 0 值
+	// 按 1 读取），直读列会把禁用态展示成「系统数据不同步」，与同步行为相悖。
+	switches, err := readSyncSwitches(ctx, s.db)
+	if err != nil {
+		return models.ClusterStatus{}, fmt.Errorf("读取同步开关: %w", err)
+	}
+	status.SyncUsers, status.SyncRules, status.SyncSecurity = switches.Users, switches.Rules, switches.Security
+	// (幻影修复修正——clamp 曾被误插
 	// 在上方 return 之后不可达,go vet unreachable 实证):展示口径与运行时 clamp
 	// 对齐(cluster_sync.go 的 run 循环 interval clamp,<10 → 60)——存量脏值
-	// (0/负/1-9s)不再原样展示与运行时分叉。(历史问题:原注释的固定行号已漂移,
+	// (0/负/1-9s)不再原样展示与运行时分叉。（原注释的固定行号已漂移,
 	// 改为符号化定位。)
 	status.SyncInterval = normalizeSyncInterval(status.SyncInterval)
 	status.LastSyncError, status.SyncErrorCode = decodeSyncError(storedSyncError)
 	status.NodeMode = "slave"
 	status.ClusterActive = clusterToken != ""
-	// 历史问题-09：链路明文常驻标志——注册时刻只告警一次，之后面板无从得知当前
+	// 链路明文常驻标志——注册时刻只告警一次，之后面板无从得知当前
 	// 上行为明文（快照承载证书私钥/CA 与 DNS 凭据、服务控制票据为 Bearer，且
 	// HTTP 下 TOFU 指纹防护完全不生效）。前端据 transport_insecure 常驻提示。
 	if !isMaster && status.MasterURL != "" {
@@ -321,7 +331,7 @@ func (s *ClusterService) Nodes(ctx context.Context, now time.Time) ([]models.Clu
 		// 单节点 health_json 损坏只降级该节点（Health=nil），不拖垮整个节点列表
 		health, decodeErr := DecodeClusterHealth(healthJSON)
 		if decodeErr != nil {
-			// 历史问题-08：同一坏行按 nodeID 限频告警（节点页轮询不再刷屏）。
+			// 同一坏行按 nodeID 限频告警（节点页轮询不再刷屏）。
 			warnNodeHealthParseThrottled(node.ID, decodeErr, now)
 		} else {
 			node.Health = health
@@ -337,7 +347,7 @@ func (s *ClusterService) Nodes(ctx context.Context, now time.Time) ([]models.Clu
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	attachSectionSync(ctx, s, nodes, currentVersion)
+	attachSectionSync(ctx, s, nodes)
 	return nodes, nil
 }
 
@@ -346,6 +356,11 @@ func (s *ClusterService) Nodes(ctx context.Context, now time.Time) ([]models.Clu
 // 使用等任意 bump）都会推进版本并让本缓存失效；同版本内的节点列表轮询
 // （默认 60s 或更高频）零重算（driftGuardSectionHashes 要跑只读事务装载
 // 三节全部输入 + 三次 JSON 序列化 + SHA-256）。
+// 条目版本恒等于其内容所属的读取快照（driftGuardSectionHashes 同一只读事务
+// 内读版本），不得用调用方先前读到的版本作键（版本 V 的键挂 V+1 的内容会让
+// 写窗口内完成的从节点被误报滞后）。
+// 句柄回收：服务注销时删除该句柄条目；未见显式注销（库已 Close）的死条目在
+// 每次重建时经 clusterDBHandleAlive 兜底剔除（同 clusterServices 注册表模式）。
 type clusterSectionHashCacheEntry struct {
 	version int
 	hashes  map[string]string
@@ -365,37 +380,75 @@ func resetClusterSectionHashCacheForTest() {
 	clusterSectionHashCacheMu.Unlock()
 }
 
-// masterSectionHashes 返回主节点三节哈希（version=当前 cluster_version）。
+// forgetClusterSectionHashCache 回收单个库句柄的缓存条目（服务注销钩子）。
+func forgetClusterSectionHashCache(database *sql.DB) {
+	if database == nil {
+		return
+	}
+	clusterSectionHashCacheMu.Lock()
+	delete(clusterSectionHashCache, database)
+	clusterSectionHashCacheMu.Unlock()
+}
+
+// pruneDeadClusterSectionHashCacheEntries 剔除句柄已 Close 的条目（未见显式
+// 注销时的兜底回收）。Ping 在锁外执行，避免持锁阻塞其他轮询。
+func pruneDeadClusterSectionHashCacheEntries() {
+	clusterSectionHashCacheMu.Lock()
+	handles := make([]*sql.DB, 0, len(clusterSectionHashCache))
+	for handle := range clusterSectionHashCache {
+		handles = append(handles, handle)
+	}
+	clusterSectionHashCacheMu.Unlock()
+	for _, handle := range handles {
+		if clusterDBHandleAlive(handle) {
+			continue
+		}
+		clusterSectionHashCacheMu.Lock()
+		delete(clusterSectionHashCache, handle)
+		clusterSectionHashCacheMu.Unlock()
+	}
+}
+
+// masterSectionHashes 返回主节点三节哈希及其内容所属的 cluster_version。
 // 命中返回缓存（只读，调用方不得修改）；失败不缓存、错误上抛由调用方降级。
-func (s *ClusterService) masterSectionHashes(ctx context.Context, version int) (map[string]string, error) {
+// 版本与哈希内容同一次读取：缓存条目与返回的 version 都取自重建事务内的
+// cluster_version，调用方无需（也不得）传入自己先前读到的版本。
+func (s *ClusterService) masterSectionHashes(ctx context.Context) (int, map[string]string, error) {
+	// 缓存探针版本（命中即返回）；未命中时以重建事务内的版本为准。
+	var probeVersion int
+	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(cluster_version,0) FROM global_config WHERE id=1`).Scan(&probeVersion); err != nil {
+		return 0, nil, fmt.Errorf("读取集群版本: %w", err)
+	}
 	clusterSectionHashCacheMu.Lock()
 	entry, ok := clusterSectionHashCache[s.db]
 	clusterSectionHashCacheMu.Unlock()
-	if ok && entry.version == version {
-		return entry.hashes, nil
+	if ok && entry.version == probeVersion {
+		return entry.version, entry.hashes, nil
 	}
-	hashes, err := s.driftGuardSectionHashes(ctx)
+	version, hashes, err := s.driftGuardSectionHashesWithVersion(ctx)
 	if err != nil {
-		return nil, err
+		return 0, nil, err
 	}
 	clusterSectionHashBuilds.Add(1)
+	pruneDeadClusterSectionHashCacheEntries()
 	clusterSectionHashCacheMu.Lock()
-	// 多库进程（测试/多实例）下按句柄各留一条；条目数等于库句柄数，量级极小。
+	// 多库进程（测试/多实例）下按句柄各留一条；死句柄已由上方剔除，
+	// 仍超过上限时整体清空兜底（条目数等于活跃库句柄数，量级极小）。
 	if len(clusterSectionHashCache) > 16 {
 		clusterSectionHashCache = map[*sql.DB]clusterSectionHashCacheEntry{}
 	}
 	clusterSectionHashCache[s.db] = clusterSectionHashCacheEntry{version: version, hashes: hashes}
 	clusterSectionHashCacheMu.Unlock()
-	return hashes, nil
+	return version, hashes, nil
 }
 
 // attachSectionSync 为已上报分区哈希的节点聚合 per-section 同步状态：主节点
 // 自身节哈希与同步开关过滤每次请求只计算一次；任一依赖读取失败时整体降级
 // （所有节点 SectionSync 保持 nil，等同旧版本从节点占位），绝不把错误上抛
 // 拖垮节点列表，也绝不展示可能失真的「全部滞后」。
-// clusterVersion 由调用方（Nodes）在同一请求内读取，作为主节点哈希缓存的
-// 失效键——与快照缓存同一版本口径。
-func attachSectionSync(ctx context.Context, s *ClusterService, nodes []models.ClusterNodeView, clusterVersion int) {
+// clusterVersion 由 masterSectionHashes 在重建事务内读取——本函数不再接收
+// 调用方先前读到的版本（版本与哈希内容必须同一次读取）。
+func attachSectionSync(ctx context.Context, s *ClusterService, nodes []models.ClusterNodeView) {
 	reports := s.snapshotSectionReports()
 	hasReport := false
 	for i := range nodes {
@@ -420,7 +473,7 @@ func attachSectionSync(ctx context.Context, s *ClusterService, nodes []models.Cl
 	// ComputeSnapshotSectionHashes 共用同一 sectionPayloadFor 口径（有奇偶
 	// 不变式钉测），只装载三节输入——并按 cluster_version 缓存，同版本轮询
 	// 零重算。
-	masterHashes, err := s.masterSectionHashes(ctx, clusterVersion)
+	_, masterHashes, err := s.masterSectionHashes(ctx)
 	if err != nil {
 		Logf("warn", "计算主节点分区哈希失败（分区同步状态降级省略）: %v", err)
 		return
@@ -504,11 +557,11 @@ func (s *ClusterService) clearAllSectionReports() {
 	clear(s.sectionReports)
 }
 
-// ClearNodeSectionReports（历史问题/历史修复，历史修复主审授权扩展）：
+// ClearNodeSectionReports（主审授权扩展）
 // 拓扑整体恢复（备份导入）删除节点时，按库遍历登记的全部 ClusterService
 // 实例清除该节点的分区上报缓存（与 clusterServicesFor 同模式——缓存是实例
 // 本地状态，需逐实例清理）。仅用于「节点已被删除」的清理；仍存在的节点
-// 不得调用（其上报记录保持有效，历史修复 裁定）。缓存本为内存态：进程重启或
+// 不得调用（其上报记录保持有效，裁定）。缓存本为内存态：进程重启或
 // 节点下次上报（≤60s）可自愈，本函数消除的是「备份行复用已删节点 id 时
 // 旧上报错挂到新节点」的窗口。
 func ClearNodeSectionReports(database *sql.DB, nodeID int) {
@@ -519,7 +572,7 @@ func ClearNodeSectionReports(database *sql.DB, nodeID int) {
 
 func (s *ClusterService) ReportNode(ctx context.Context, nodeID int, report models.ClusterReport, now time.Time) error {
 	health := report.Health
-	// 历史问题-2:last_sync_error 落库前与从端写侧同口径截断(512B + UTF-8
+	// last_sync_error 落库前与从端写侧同口径截断(512B + UTF-8
 	// 边界回退)——64KB 错误串不再撑大 nodes 行与 health_json。
 	if len(report.LastSyncError) > 512 {
 		report.LastSyncError = string(truncateValidUTF8Tail([]byte(report.LastSyncError[:512])))
@@ -540,14 +593,14 @@ func (s *ClusterService) ReportNode(ctx context.Context, nodeID int, report mode
 		return fmt.Errorf("读取节点上报结果: %w", err)
 	}
 	if rows != 1 {
-		// 历史问题：降级窗口内的上报按 403 语义拒绝，而不是误报 404。
+		// 降级窗口内的上报按 403 语义拒绝，而不是误报 404。
 		return s.nodeWriteMissError(ctx)
 	}
 	s.storeSectionReport(nodeID, report.SectionHashes)
 	return nil
 }
 
-// resolveNodeAccessURL 推导节点访问地址的单源实现（历史问题）：显式
+// resolveNodeAccessURL 推导节点访问地址的单源实现：显式
 // access_url 优先，否则 protocol://ip:port；protocol 非 https 一律归一为 http
 // （原四处逐字重复，口径漂移风险）。
 func resolveNodeAccessURL(ipAddress string, port int, protocol, accessURL string) string {
@@ -575,7 +628,7 @@ func nodePinPathFromAccessURL(database *sql.DB, accessURL string) (pinPath, host
 }
 
 func (s *ClusterService) DeleteNode(ctx context.Context, nodeID int) error {
-	// 历史问题-05（历史）：nodes 不在 cluster_version 触发器清单——拓扑
+	// nodes 不在 cluster_version 触发器清单——拓扑
 	// 变更（注册/改坐标）历来在同事务显式 BumpClusterVersion，删除节点此前漏
 	// bump：快照缓存（键含 cluster_version）会继续携带被删节点的站点项，直到
 	// 下一次无关 bump（消费方仅该节点自身，功能影响≈0，但同族约定不得不对称
@@ -585,7 +638,7 @@ func (s *ClusterService) DeleteNode(ctx context.Context, nodeID int) error {
 		return fmt.Errorf("开启删除节点事务: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	// 历史问题(历史):删行前取访问地址——删行后 pin 成孤儿且无 API
+	// 删行前取访问地址——删行后 pin 成孤儿且无 API
 	// 清除通道,同 host:port 复用时服务控制 fail-closed PinMismatch 只能手工
 	// 删盘。地址解析与 ForgetNodePin 同口径(access_url 优先)。
 	var ipAddress, protocol, accessURL string
@@ -598,7 +651,7 @@ func (s *ClusterService) DeleteNode(ctx context.Context, nodeID int) error {
 	}
 	rows, err := result.RowsAffected()
 	if err != nil || rows != 1 {
-		// 历史问题：降级窗口内的删除按 403 语义拒绝（节点仍在），而非 404。
+		// 降级窗口内的删除按 403 语义拒绝（节点仍在），而非 404。
 		// 复核角色用独立连接（nodeWriteMissError），必须先退出写事务。
 		_ = tx.Rollback()
 		return s.nodeWriteMissError(ctx)

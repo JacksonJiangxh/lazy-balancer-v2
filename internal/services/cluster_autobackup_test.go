@@ -9,13 +9,13 @@ import (
 	"lazy-balancer-v2/internal/models"
 )
 
-// 历史问题(历史):demote 必须停自动备份调度——与 CRS/IP2Region 的角色
+// demote 必须停自动备份调度——与 CRS/IP2Region 的角色
 // 门同点位对称，否则降级后从节点本地产出备份文件。
 // v2.0：promote/demote 与自动备份的调度耦合已消除——引擎 Scheduled +
 // RunsOn=MasterOnly 角色门接管（Promote/BecomeSlave 直接调用 TaskEngine().SetRole；
 // 角色门行为由 engine_test 钉死），不再有独立调度器生命周期可测。
 
-// 历史问题(历史)快照面:自动备份六设置列(不含 last_run 节点本地
+// 快照面:自动备份六设置列(不含 last_run 节点本地
 // 运行态)随 users 节同步——主端装载恒携带(非 nil 指针),线格式六键齐全。
 func TestLoadSnapshotGlobalSettings_carriesAutoBackupSettings(t *testing.T) {
 	service, database := newClusterTestService(t)
@@ -49,7 +49,7 @@ func TestLoadSnapshotGlobalSettings_carriesAutoBackupSettings(t *testing.T) {
 	}
 }
 
-// 历史问题 apply 面:快照携带六列时从端落库(新主端→新从端收敛);
+// apply 面:快照携带六列时从端落库(新主端→新从端收敛);
 // last_run 为节点本地运行态,任何快照形态都不得覆盖。
 func TestUpdateSnapshotSettings_autoBackupSettingsAppliedWhenPresent(t *testing.T) {
 	_, database := newClusterTestService(t)
@@ -94,7 +94,7 @@ func TestUpdateSnapshotSettings_autoBackupSettingsAppliedWhenPresent(t *testing.
 	}
 }
 
-// 历史问题 偏斜面(镜像 branding_json d55a675 缺席语义):旧主端快照缺该组
+// 偏斜面(镜像 branding_json d55a675 缺席语义):旧主端快照缺该组
 // 字段(全 nil 指针)时,从端 apply 必须跳过写入、保留本地设置——不得把
 // 从端本地值清成零值。
 func TestUpdateSnapshotSettings_autoBackupSettingsAbsentPreservesLocal(t *testing.T) {

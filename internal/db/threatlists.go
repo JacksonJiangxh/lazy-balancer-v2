@@ -42,7 +42,7 @@ type ThreatSystemList struct {
 }
 
 // threatSystemLists 是内置威胁名单种子的唯一可变载体（私有）。
-// 历史问题（历史）：此前导出 `ThreatSystemLists` 是可变包级切片，任一
+// 此前导出 `ThreatSystemLists` 是可变包级切片，任一
 // 消费方 append/改元素会污染播种、备份配额校验、详情计数与快照链路；同文件
 // certJobStatuses 的先例是「私有 + 返回副本」。现统一走 ThreatSystemLists()
 // 取副本；跨包测试需要「未来源」形态时用 SetThreatSystemListsForTest 注入
@@ -76,7 +76,7 @@ var threatSystemListLegacyNames = map[string]string{
 
 // migrateThreatSystemListNames 存量 system=1 内置名单按旧名改名为新名（保 id——
 // 策略 refs 按 id 引用）。幂等；种子 INSERT 按新名查重，旧名行不改名会双重存在。
-// 历史修复（历史）识别同名冲突；历史起新名被占用（如用户手工建的
+// 识别同名冲突；历史起新名被占用（如用户手工建的
 // 同名 system=0 名单）时，把冲突用户行改名为「规范名（用户 <id>）」（保 id/
 // 数据），再让 system 行接管规范名。避免同名双行导致选择器歧义，且旧 system
 // 名单不会因跳过改名而永久失更。
@@ -115,7 +115,7 @@ func migrateThreatSystemListNames() error {
 			}
 			// 新名被用户名单占用时不能跳过：旧 system 名单会永久失更。
 			// 把占用的用户行改名为带 id 的唯一名称（保 id/数据），再让
-			// system 行接管规范名（历史问题-1）。
+			// system 行接管规范名。
 			rows, rerr := DB.Query(`SELECT id FROM security_ip_lists WHERE name=? AND system=0`, sl.Name)
 			if rerr != nil {
 				return fmt.Errorf("query conflicting threat system list rows: %w", rerr)
@@ -142,7 +142,7 @@ func migrateThreatSystemListNames() error {
 			}
 			log.Printf("WARN: 内置威胁名单新名 %q 被用户名单占用，已改名用户行（ids=%v）后接管规范名", sl.Name, ids)
 			if len(ids) > 0 {
-				// 历史问题（历史）：用户名单被改名属于用户可见数据改写，
+				// 用户名单被改名属于用户可见数据改写，
 				// 聚合留痕（此前仅进程 stdout）。
 				renamedUserLists += len(ids)
 				detail := fmt.Sprintf("启动迁移：内置威胁名单新名 %q 被占用，已改名用户名单 %d 条（ids=%v，保 id/数据）", sl.Name, len(ids), ids)

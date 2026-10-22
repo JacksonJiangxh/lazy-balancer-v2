@@ -8,7 +8,7 @@ import (
 	"lazy-balancer-v2/internal/dnsprovider"
 )
 
-// recordingDNSProvider 记录 provider 调用收到的 zone/FQDN（历史问题：输入域用于
+// recordingDNSProvider 记录 provider 调用收到的 zone/FQDN（输入域用于
 // challenge FQDN，可注册根域用于 provider 调用）。
 type recordingDNSProvider struct {
 	presentZone  string
@@ -31,7 +31,7 @@ func (p *recordingDNSProvider) CleanUp(_ context.Context, zone, tokenFQDN string
 	return nil
 }
 
-// 历史问题：DNSPod 凭证校验不得把用户输入整体当 zone——www 子域必须解析到可注册
+// DNSPod 凭证校验不得把用户输入整体当 zone——www 子域必须解析到可注册
 // 根域（PSL），challenge FQDN 仍基于完整输入域，否则账户只管理 example.com 时
 // 校验误报「domain not found」。
 func TestDNSPod_Validate_usesRegisteredZoneForProviderCalls(t *testing.T) {
@@ -63,7 +63,7 @@ func TestDNSPod_Validate_usesRegisteredZoneForProviderCalls(t *testing.T) {
 
 			provider := &DNSPod{}
 			credentials := map[string]string{"auth_mode": "dnspod", "app_id": "123", "app_token": "abc"}
-			if err := provider.Validate(credentials, tt.input); err != nil {
+			if err := provider.Validate(context.Background(), credentials, tt.input); err != nil {
 				t.Fatalf("validate %q: %v", tt.input, err)
 			}
 			if fake.presentZone != tt.wantZone {
@@ -85,7 +85,7 @@ func TestDNSPod_Validate_rejects_whitespace_test_domain(t *testing.T) {
 	credentials := map[string]string{"auth_mode": "dnspod", "app_id": "123", "app_token": "abc"}
 
 	// When
-	err := provider.Validate(credentials, "   ")
+	err := provider.Validate(context.Background(), credentials, "   ")
 
 	// Then
 	if err == nil || !strings.Contains(err.Error(), "测试域名不能为空") {
@@ -93,7 +93,7 @@ func TestDNSPod_Validate_rejects_whitespace_test_domain(t *testing.T) {
 	}
 }
 
-// 凭证字段的可见性/选项文案元数据（历史修复）：前端表单由 visible_when/
+// 凭证字段的可见性/选项文案元数据：前端表单由 visible_when/
 // option_labels 驱动（不再按 dnspod 两种认证模式硬编码字段名）。本测试钉住
 // DNSPod 的元数据形态，并反向校验每个 visible_when 条件键都是同 provider 声明的
 // select 字段（引用错键会让字段永远不显示）。

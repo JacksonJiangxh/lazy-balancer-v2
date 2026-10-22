@@ -412,14 +412,14 @@ func TestSplitSecurityPolicy_nonMixedRejected(t *testing.T) {
 	}
 }
 
-// 限流策略唯一门（历史问题）：mixed 存量形态可合法与 stage2 并存绑定（[mixed,
+// 限流策略唯一门：mixed 存量形态可合法与 stage2 并存绑定（[mixed,
 // stage2]——BindRuleToPolicy 唯一门不追溯存量），拆分产出 stage2 子策略后
 // 若直接重映射会出现单规则双限流——冲突规则必须进 skipped 保留原绑定
 // （与 >5 上限同口径），无冲突规则照常重映射，原策略因 skipped 保留。
 func TestSplitSecurityPolicy_skipsRuleWithExistingStage2(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := splitRouter(t)
-	// Given：mixed 仅限流特征（历史修复）——拆分产出单个 stage2 子策略；
+	// Given：mixed 仅限流特征——拆分产出单个 stage2 子策略；
 	// 两条规则已并存绑定 [mixed, stage2]，一条规则仅绑 mixed
 	res, err := db.DB.Exec(`INSERT INTO security_policies (name,mode,rate_limit_enabled,rate_limit_rps,rate_limit_burst,policy_type,enabled)
 		VALUES ('legacy-rl','off',1,100,50,'mixed',1)`)

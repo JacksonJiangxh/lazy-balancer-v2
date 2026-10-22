@@ -14,7 +14,7 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// 历史问题-01：UpdateRule acme→manual 切换必须在事务内先把非终态 cert_jobs 收敛为
+// UpdateRule acme→manual 切换必须在事务内先把非终态 cert_jobs 收敛为
 // 终态（镜像 DisableRule 的 'disabled' 终态）再执行主 UPDATE，并在提交后再取消
 // 队列在途签发。此前切换只做 cancelRuleJobs（零 DB 状态写）：主 UPDATE 的
 // NOT EXISTS 非终态守卫恒 409（用户无法完成切换的死锁），queued/waiting_ca 行
@@ -63,7 +63,7 @@ func putUpdateRule(t *testing.T, h interface{}, caddyID, body string) *httptest.
 }
 
 // 主形状：acme→manual 切换携带 queued 任务——必须 200，任务行**直接删除**
-// （历史修复用户裁定：脱离 ACME 即删任务，取代 历史问题-01 的「翻终态
+// （用户裁定：脱离 ACME 即删任务，取代 的「翻终态
 // disabled」——30s 补扫对象已不存在），acme_config_id 清零。
 func TestUpdateRule_acmeToManual_convergesNonTerminalCertJobs(t *testing.T) {
 	// Given
@@ -79,7 +79,7 @@ func TestUpdateRule_acmeToManual_convergesNonTerminalCertJobs(t *testing.T) {
 		t.Fatalf("generate test cert: %v", err)
 	}
 
-	// When：切换到手动证书（历史问题-1：必须提供新证书材料）
+	// When：切换到手动证书
 	response := putUpdateRule(t, harness, "lb_sw_manual", fmt.Sprintf(
 		`{"name":"after","enable_tls":true,"tls_source":"manual","tls_cert":%q,"tls_key":%q}`, certPEM, keyPEM))
 

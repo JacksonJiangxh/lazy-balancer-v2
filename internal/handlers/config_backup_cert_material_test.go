@@ -6,7 +6,7 @@ import (
 )
 
 // 启用 ACME 规则可在导入中携带 issued + 未来到期 + 空 PEM 的任务；渲染侧
-// 无证书即不发射 TLS 策略，EnableRule 又走 Keep 不补签（历史问题-01）。
+// 无证书即不发射 TLS 策略，EnableRule 又走 Keep 不补签。
 func TestValidateV2BackupCertJobs_rejectsIssuedWithoutMaterial(t *testing.T) {
 	tables := map[string][]map[string]any{
 		"lb_rules": {{

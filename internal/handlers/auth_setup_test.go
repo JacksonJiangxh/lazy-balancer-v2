@@ -44,8 +44,8 @@ func setupAuthTestDB(t *testing.T) *sql.DB {
 		password_version INTEGER NOT NULL DEFAULT 0,
 		auth_provider TEXT NOT NULL DEFAULT 'local',
 		mfa_enabled BOOLEAN DEFAULT 0,
-		-- 历史修复 登录锁定列（与生产迁移后形状一致）。api_keys 表为认证链路相关查询
-		-- 的建表依赖保留——历史修复 改密吊销 Key 语义已删（2026-09 裁定）：改密不再
+		-- 登录锁定列（与生产迁移后形状一致）。api_keys 表为认证链路相关查询
+		-- 的建表依赖保留——改密吊销 Key 语义已删（2026-09 裁定）：改密不再
 		-- 产生任何 api_keys DELETE，API Key 无密码门、改密不吊销。
 		login_failed_attempts INTEGER NOT NULL DEFAULT 0,
 		login_locked_until TEXT

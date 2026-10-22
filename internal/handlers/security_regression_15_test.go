@@ -1,7 +1,7 @@
 package handlers
 
-// allow: SIZE_OK — 历史修复 security-domain handler regression tests (历史修复 page clamp,
-// 历史修复 binding rule existence).
+// allow: SIZE_OK — security-domain handler regression tests ( page clamp,
+// binding rule existence).
 
 import (
 	"bytes"
@@ -21,7 +21,7 @@ import (
 )
 
 // TestListSecurityEvents_hugePageDoesNot500 验证超大 page 参数被 clamp，
-// (page-1)*pageSize 不再整数溢出为负 OFFSET（历史修复）。
+// (page-1)*pageSize 不再整数溢出为负 OFFSET。
 func TestListSecurityEvents_hugePageDoesNot500(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newSecurityR26Router(t)
@@ -55,7 +55,7 @@ func TestListSecurityEvents_hugePageDoesNot500(t *testing.T) {
 }
 
 // TestListCRSRules_hugePageDoesNot500 验证超大 page 参数被 clamp，
-// allRules[start:end] 不再越界 panic（历史修复）。
+// allRules[start:end] 不再越界 panic。
 func TestListCRSRules_hugePageDoesNot500(t *testing.T) {
 	oldDir := crsRulesDir
 	dir := t.TempDir()
@@ -92,7 +92,7 @@ func TestListCRSRules_hugePageDoesNot500(t *testing.T) {
 	}
 }
 
-// TestBindRuleToPolicy_rejectsMissingRule 验证绑定前校验规则真实存在（历史修复）。
+// TestBindRuleToPolicy_rejectsMissingRule 验证绑定前校验规则真实存在。
 func TestBindRuleToPolicy_rejectsMissingRule(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newSecurityRouter(t)
@@ -115,7 +115,7 @@ func TestBindRuleToPolicy_rejectsMissingRule(t *testing.T) {
 }
 
 // TestBindRuleToPolicy_concurrentRuleDeleteLeavesNoDanglingBinding 验证存在性
-// 检查与写入同事务（历史修复 D TOCTOU）：绑定与规则删除并发时，任何交错都不会留下
+// 检查与写入同事务：绑定与规则删除并发时，任何交错都不会留下
 // 悬挂绑定（check 通过后、INSERT 前规则被删的窗口已关闭）。绑定/删除两端
 // 各自使用事务，_txlock=immediate 使写事务在 BEGIN 处串行，断言确定无竞争。
 func TestBindRuleToPolicy_concurrentRuleDeleteLeavesNoDanglingBinding(t *testing.T) {

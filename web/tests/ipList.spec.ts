@@ -1,4 +1,4 @@
-// IP 名单弹框守卫与 CSV 往返验收（历史问题）：
+// IP 名单弹框守卫与 CSV 往返验收
 //   A. 详情在途/失败时保存必须禁用（否则空 entries 全量 PUT 清空名单）
 //   B. 已有名单 + 空条目需二次确认；新建空名单不弹
 //   C. 导出→导入逐字相等，二次往返不累积漂移（备注含逗号/引号/换行）
@@ -10,7 +10,7 @@ import assert from 'node:assert/strict'
 
 import { canSaveIpList, needsEmptyListConfirm } from '../src/utils/ipListSaveGuard.ts'
 import { formatIpListEntryLine, parseIpListEntryLine } from '../src/utils/ipListCsv.ts'
-// 历史修复：注入本测试自己的 历史修复 正则会让「IPv6 CIDR」被文档化成
+// 注入本测试自己的正则会让「IPv6 CIDR」被文档化成
 // 非法值，与生产注入的 isValidCidr（SecurityRules.vue CSV 导入）语义相反。
 import { isValidCidr } from '../src/utils/ruleValidation.ts'
 import {
@@ -22,7 +22,7 @@ import {
 } from '../src/utils/securityStages.ts'
 import { member, source } from './_helpers.ts'
 
-test('IP 快捷处置：信任命中只全扫一次，GeoIP 区域只解析一次（历史问题）', () => {
+test('IP 快捷处置：信任命中只全扫一次，GeoIP 区域只解析一次', () => {
   const src = source('src/views/security/IPLocationAction.vue')
   assert.match(src, /const trustHitSummary = computed/, '信任命中与豁免策略应共享一次计算')
   assert.doesNotMatch(src, /const td[01]Owner = policies\.value\.find/, '逐行不得再全策略扫描')
@@ -30,7 +30,7 @@ test('IP 快捷处置：信任命中只全扫一次，GeoIP 区域只解析一�
   assert.match(src, /const regions = parseIPList\(policy\.geoip_countries\)/)
 })
 
-test('规则流程只拉本规则阶段 0 策略的信任引用（历史问题）', () => {
+test('规则流程只拉本规则阶段 0 策略的信任引用', () => {
   const src = source('src/components/RuleFlowDialog.vue')
   assert.match(src, /boundTrustPolicyIds/)
   assert.match(src, /if \(!boundTrustPolicyIds\.has\(pol\.id\)\) continue/)
@@ -72,12 +72,12 @@ test('C3 旧格式（无引号、逗号/空白分隔）保持兼容', () => {
   assert.deepEqual(parseIpListEntryLine('10.0.0.1,普通备注', isValidCidr), { value: '10.0.0.1', remark: '普通备注' })
   assert.deepEqual(parseIpListEntryLine('10.0.0.1 普通备注', isValidCidr), { value: '10.0.0.1', remark: '普通备注' })
   assert.deepEqual(parseIpListEntryLine('10.0.0.1', isValidCidr), { value: '10.0.0.1', remark: '' })
-  // 历史修复：IPv6 CIDR 是生产校验器的合法输入（isValidCidr 走 isValidIpv6，
-  // prefix≤128）——原测试用 历史修复 替身把它断言成非法值（假前提）。
+  // IPv6 CIDR 是生产校验器的合法输入（isValidCidr 走 isValidIpv6，
+  // prefix≤128）——原测试用替身把它断言成非法值（假前提）。
   assert.deepEqual(parseIpListEntryLine('2001:db8::/32', isValidCidr), { value: '2001:db8::/32', remark: '' })
 })
 
-test('C9 IPv6 导入往返与非法形态（历史修复）', () => {
+test('C9 IPv6 导入往返与非法形态', () => {
   // 生产注入的真实校验器语义：合法 IPv6 CIDR/单地址可导入并逐字往返
   for (const value of ['2001:db8::/32', '2001:db8::1', 'fe80::/10', '::1']) {
     assert.equal(isValidCidr(value), true, `${value} 应为合法值`)
@@ -102,14 +102,14 @@ test('C5 引号包裹的 IP 字段（外部 CSV 工具产物）可解析', () =>
   assert.deepEqual(parseIpListEntryLine('"10.0.0.2","备注"', isValidCidr), { value: '10.0.0.2', remark: '备注' })
 })
 
-test('C6 多行备注导出归一为空格——导入端按行切分，往返不丢备注（历史问题-11）', () => {
+test('C6 多行备注导出归一为空格——导入端按行切分，往返不丢备注', () => {
   const line = formatIpListEntryLine('10.0.0.1', '第一行\r\n第二行')
   assert.equal(line, '10.0.0.1,第一行 第二行')
   const parsed = parseIpListEntryLine(line, isValidCidr)
   assert.deepEqual(parsed, { value: '10.0.0.1', remark: '第一行 第二行' })
 })
 
-test('C7 备注超过 100 字拒绝导入（带行号报错，不静默截断），边界恰 100 字放行（历史问题-15 治理升级）', () => {
+test('C7 备注超过 100 字拒绝导入（带行号报错，不静默截断），边界恰 100 字放行', () => {
   // 恰 100 个 code point（全代理对）仍合法——上限口径不变
   const atLimit = parseIpListEntryLine(`10.0.0.1,${'😀'.repeat(100)}`, isValidCidr)
   assert.deepEqual(atLimit, { value: '10.0.0.1', remark: '😀'.repeat(100) })
@@ -123,7 +123,7 @@ test('C7 备注超过 100 字拒绝导入（带行号报错，不静默截断）
   assert.match(importFlow, /第 \$\{[^}]+\} 行/, '拒绝信息必须携带文件行号')
 })
 
-test('C8 JSON 字符串数组统一 trim 并丢弃空项（历史问题-17）', () => {
+test('C8 JSON 字符串数组统一 trim 并丢弃空项', () => {
   assert.deepEqual(parseIPList('[" 1.1.1.1 ","","  ",2,"10.0.0.0/8"]'), ['1.1.1.1', '10.0.0.0/8'])
   const crsSource = source('src/composables/useCrsRuleIndex.ts')
   assert.match(crsSource, /normalizeStringEntries\(rec\.ips\)/, 'CRS 排除规则数组必须复用同一 trim 归一')
@@ -156,7 +156,7 @@ test('D 共享条目缓存：缺失才拉、并发去重、失败可重试、inv
   invalidateSharedEntriesCache()
 })
 
-test('D3 代际竞态：失效后复用方必须按新代际补取，await 返回即已缓存（历史问题-02）', async () => {
+test('D3 代际竞态：失效后复用方必须按新代际补取，await 返回即已缓存', async () => {
   invalidateSharedEntriesCache()
   let release: () => void = () => {}
   const gate = new Promise<void>((resolve) => { release = resolve })
@@ -197,7 +197,7 @@ test('D4 失败语义不变：失败不补取、不留缓存（下次调用重�
   invalidateSharedEntriesCache()
 })
 
-test('D2 代际守卫：失效前发起的在途 loader 落地不得回填缓存（历史问题-03）', async () => {
+test('D2 代际守卫：失效前发起的在途 loader 落地不得回填缓存', async () => {
   invalidateSharedEntriesCache()
   let release: () => void = () => {}
   const gate = new Promise<void>((resolve) => { release = resolve })

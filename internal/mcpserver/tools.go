@@ -12,10 +12,10 @@ type ToolSpec struct {
 	Method      string `json:"method"`
 	Path        string `json:"path"`
 	// ReadOnly 表示该工具对只读 API Key「只读可用」——GET 且非隐藏工具，或读
-	// 探测 POST 白名单（见 isReadOnlyTool）。历史问题 修正：此前恒为
+	// 探测 POST 白名单（见 isReadOnlyTool）。修正：此前恒为
 	// method==HTTP GET，与真实只读能力集漂移（读语义探测 POST 误标 false、
 	// export_config 误标 true——外部契约变更，发布时向 MCP 使用者披露）。
-	// 历史问题（历史）：test_certificate_config 移出探测集（写 DNS TXT），
+	// test_certificate_config 移出探测集（写 DNS TXT），
 	// 当前探测集 3 项（parse_certificate/validate_import/preview_config，
 	// 单一事实源 ReadOnlyProbeTools）。
 	ReadOnly    bool            `json:"read_only"`
@@ -72,7 +72,7 @@ var toolUsage = map[string]string{
 	"get_security_overview":        "安全总览：今日拦截/检测计数、攻击类型 TOP10、源 IP TOP10、事件趋势",
 	"list_security_policies":       "列出全部安全策略及其 WAF/CRS/IP ACL/GeoIP/限流配置",
 	"get_security_policy":          "获取指定策略完整配置（含自定义规则和绑定关系）",
-	"list_security_events":         "分页查询安全事件（WAF 拦截/IP ACL 拒绝），支持 page/page_size/action/ip/rule_caddy_id/rule_name/policy_name/rule_triggered/uri/start_time/end_time",
+	"list_security_events":         "分页查询安全事件（WAF 拦截/IP ACL 拒绝），支持 page/page_size/action/ip/rule_caddy_id/rule_name/policy_name/rule_triggered/rule_triggered_exclude/uri/start_time/end_time",
 	"list_security_bindings":       "查看策略-规则绑定映射（规则可绑定多条安全策略），了解哪些规则启用了安全防护",
 	"get_rule_security_policy":     "查看指定规则绑定的安全策略列表（数组，按 policy_id ASC 有序；仅含 enabled=1 的策略）",
 	"list_custom_rules":            "列出全部自定义安全规则（多条件链式匹配）",

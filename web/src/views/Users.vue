@@ -206,7 +206,7 @@
 
     <OIDCSettings v-model="oidcOpen" @status="onOIDCStatus" />
 
-    <!-- 历史问题 三次调整（用户裁决）：MFA 绑定向导从基础设置卡片迁到用户管理——
+    <!-- 调整（用户裁决）：MFA 绑定向导从基础设置卡片迁到用户管理——
          点「启用 MFA」发起绑定：扫码 → 输码 → 恢复码。 -->
     <el-dialog v-model="mfaBinding.visible" class="dialog-body-inset" width="min(520px, 92vw)" :close-on-click-modal="false" @closed="mfaBindingClosed">
       <template #header>
@@ -323,9 +323,9 @@ const fetchOIDCStatus = async () => {
 const authStore = useAuthStore()
 const isReadOnly = computed(() => authStore.readOnlyReason !== null)
 const users = ref<UserListItem[]>([])
-// 历史问题：列表加载失败与真实空列表不可区分 → 显性错误态 + 重试
+// 列表加载失败与真实空列表不可区分 → 显性错误态 + 重试
 const loadError = ref(false)
-// 历史修复 同口径：mfa_write_guard 读 authStore.fetchConfig 消费面（曾挂载单取
+// 同口径：mfa_write_guard 读 authStore.fetchConfig 消费面（曾挂载单取
 // GET /config 只为一个键，与 /config 的 15s 刷新重复；store ref 响应式，
 // 挂载早于 fetchConfig 完成也会随后收敛）。首值 false = 守卫关闭的保守形态。
 const mfaWriteGuard = computed(() => authStore.mfaWriteGuard)
@@ -338,7 +338,7 @@ const submittingUserId = ref<number | null>(null)
 const operatingUserIds = ref(new Set<number>())
 const currentPage = ref(1)
 const pageSize = ref(10)
-// 历史修复（复用优先）：分页切片 + 页越界夹紧收敛到 useClampedPagination 单源——
+// （复用优先）：分页切片 + 页越界夹紧收敛到 useClampedPagination 单源——
 // 原实现手写 slice 并在 fetchUsers 内手工夹紧 maxPage（与 Rules/BlockPages/
 // Policies 的共享范式并存两份）。
 const { pagedItems: paginatedUsers } = useClampedPagination(users, currentPage, pageSize)
@@ -373,7 +373,7 @@ const fetchUsers = async () => {
     if (requestSeq === usersRequestSeq) {
       users.value = res.data || []
       loadError.value = false
-      // 页越界夹紧归 useClampedPagination（历史修复）——不再手工重算 maxPage。
+      // 页越界夹紧归 useClampedPagination——不再手工重算 maxPage。
     }
   } catch (error: unknown) {
     // Error toast is already shown by the global axios interceptor; swallow here
@@ -385,17 +385,22 @@ const fetchUsers = async () => {
 
 const handleSubmit = async () => {
   if (isReadOnly.value || submitting.value) return
-  // 历史问题：用户名前置校验（对齐后端 CreateUser/UpdateUser 的 min=3,max=50、
-  // 字符集 ^[a-z][a-z0-9]*$ 与 Login.vue setup 口径）——创建必填；编辑态用户名
-  // 只读，非空时同口径兜底。不合法前置拦截，不发请求。
+  // 用户名前置校验（对齐后端 CreateUser/UpdateUser 的 min=3,max=50、
+  // 字符集 ^[a-z][a-z0-9]*$ 与 Login.vue setup 口径）——创建必填；编辑态按
+  // 后端 usernameChanged 口径（users.go：仅实际改名才过策略，OIDC 行由 IdP
+  // 管理整体豁免）——OIDC 用户名可含 . / _ / 大写，无条件校验会把 OIDC
+  // 用户的角色编辑永久拦死。
   if (!editingUser.value && !form.value.username) {
     ElMessage.warning('请输入用户名')
     return
   }
-  const usernameError = validateUsername(form.value.username)
-  if (usernameError) {
-    ElMessage.warning(usernameError)
-    return
+  const usernameChanged = editingUser.value !== null && form.value.username !== editingUser.value.username
+  if (!editingUser.value || (usernameChanged && !editingIsOIDC.value)) {
+    const usernameError = validateUsername(form.value.username)
+    if (usernameError) {
+      ElMessage.warning(usernameError)
+      return
+    }
   }
   if (!editingUser.value && !form.value.password) {
     ElMessage.warning('请输入密码')
@@ -424,7 +429,7 @@ const handleSubmit = async () => {
         display_name: oidcTarget ? undefined : form.value.display_name,
         password: oidcTarget ? undefined : (form.value.password || undefined),
       })
-      // admin 编辑本人行且提交了密码：同 历史修复，干净登出替代死 token 误报。
+      // admin 编辑本人行且提交了密码：同，干净登出替代死 token 误报。
       if (editingSelf && form.value.password) {
         authStore.showToast('success', '密码已修改，请重新登录')
         await authStore.logout()
@@ -432,7 +437,7 @@ const handleSubmit = async () => {
       }
       mfaAwareSuccess('更新成功')
     } else {
-      // 历史修复(历史):创建用户显式白名单字段上行——form 含 password_confirm
+      // 创建用户显式白名单字段上行——form 含 password_confirm
       // 仅前端二次确认用,不随请求提交。
       await request.post('/users', {
         username: form.value.username,
@@ -457,12 +462,12 @@ const handleSubmit = async () => {
 const nodeModeSlave = computed(() => authStore.isSlaveNode)
 
 const editUser = (user: UserListItem) => {
-  // 2026-09-19 用户裁定（覆盖 历史问题 六次）：非管理员只读范围含用户认证页——
+  // 2026-09-19 用户裁定（覆盖六次）：非管理员只读范围含用户认证页——
   // 不允许编辑任何行（含本人），修改密码/个人资料只走右上角个人资料弹框；
   // 编辑表单（含其密码字段=重置语义，不验当前密码）为管理员专属，统一走
   // admin PUT 端点。
   if (isReadOnly.value || submitting.value) return
-  // 复审 历史问题 回归修复：编辑必须置 editingUser，否则 handleSubmit 走 POST 误建用户
+  // 复审回归修复：编辑必须置 editingUser，否则 handleSubmit 走 POST 误建用户
   editingUser.value = user
   form.value = {
     username: user.username,
@@ -503,7 +508,7 @@ const handleToggleStatus = async (id: number, isEnabled: boolean) => {
     try {
       await ElMessageBox.confirm('确定要禁用这个用户吗？禁用后该用户将无法登录。', '警告', { type: 'warning' })
     } catch {
-      // 历史问题：取消确认时回滚乐观开关——el-switch 已先行翻转 row.is_enabled，
+      // 取消确认时回滚乐观开关——el-switch 已先行翻转 row.is_enabled，
       // 不回滚则 UI 显示「已禁用」而服务端仍启用，直到下次 fetchUsers 才自愈。
       const row = users.value.find(u => u.id === id)
       if (row) row.is_enabled = !isEnabled
@@ -594,7 +599,7 @@ const resetPassword = async (id: number) => {
       await request.post(`/users/${id}/reset-password`, { new_password: newPassword })
       if (isSelf) {
         // 管理员重置本人密码:重置端点递增 pwd_ver 吊销自身会话——干净登出
-        // (对齐 AppLayout.saveProfile / 历史修复),避免死 token 误报会话失效
+        // (对齐 AppLayout.saveProfile / ),避免死 token 误报会话失效
         authStore.showToast('success', '密码已重置，请重新登录')
         await authStore.logout()
         return
@@ -602,7 +607,7 @@ const resetPassword = async (id: number) => {
       mfaAwareSuccess('密码重置成功')
     }
   } catch (e) {
-    // 历史修复：lbOpen 取消/关闭以 {ok:false} **resolve**（不走 reject），上面已
+    // lbOpen 取消/关闭以 {ok:false} **resolve**（不走 reject），上面已
     // `if (!r.ok) return` 处理——此处不存在 'cancel'/'close' 字符串拒绝（那些是
     // ElMessageBox 时代残留）。请求本身不带 silent，失败已由全局拦截器 toast，
     // 此处仅记录；仅对无法归因到拦截器的意外拒绝（非 Error 值）兜底提示。
@@ -615,7 +620,7 @@ const resetPassword = async (id: number) => {
   }
 }
 
-// 历史问题 三次调整（用户裁决）：重置需确认 + 操作者 MFA 校验（自己启用过 MFA 则
+// 调整（用户裁决）：重置需确认 + 操作者 MFA 校验（自己启用过 MFA 则
 // 弹码验证——后端同门校验）；admin 或本人可重置。
 const resetMfa = async (row: UserListItem): Promise<void> => {
   if (isReadOnly.value || submitting.value || submittingUserId.value === row.id || operatingUserIds.value.has(row.id) || switchingIds.value.has(row.id)) return
@@ -626,7 +631,7 @@ const resetMfa = async (row: UserListItem): Promise<void> => {
     let code = ''
     if (operatorMfa) {
       if (mfaWriteGuard.value) {
-        // 历史问题：守卫开启时后端第一层已豁免（守卫完成验码），对话框退化为纯确认——
+        // 守卫开启时后端第一层已豁免（守卫完成验码），对话框退化为纯确认——
         // 保留后果说明与确认/取消，不再索取当前时间片验证码（索取也无码可用：
         // 同片刚被守卫/登录消费，重放保护必拒）。
         const r = await lbOpen({
@@ -662,7 +667,7 @@ const resetMfa = async (row: UserListItem): Promise<void> => {
     await fetchUsers()
   } catch (error: unknown) {
     if (error === 'cancel' || error === 'close') return
-    // 历史修复：api.ts 全局 428 重试流已 toast 并打标——此处跳过二次弹窗；
+    // api.ts 全局 428 重试流已 toast 并打标——此处跳过二次弹窗；
     // 未打标的（如锁定开关关闭时端点自身的 401「验证码错误」）仍在此展示。
     if ((error as { mfaSurfaced?: boolean }).mfaSurfaced) {
       console.error('MFA reset failed:', error)
@@ -689,13 +694,13 @@ const mfaBinding = ref({
 const mfaBindingClosed = () => {
   mfaBinding.value.step = 0
   mfaBinding.value.code = ''
-  // 历史问题：secret 一并清空——TOTP 种子不再滞留于关闭后的响应式状态。
+  // secret 一并清空——TOTP 种子不再滞留于关闭后的响应式状态。
   mfaBinding.value.secret = ''
   mfaBinding.value.recoveryCodes = []
 }
 
 const openMfaBinding = async (row: UserListItem): Promise<void> => {
-  // 历史修复：与 resetMfa/resetPassword 同款函数级纵深守卫（按钮已禁用；此处防
+  // 与 resetMfa/resetPassword 同款函数级纵深守卫（按钮已禁用；此处防
   // 后续调用方绕过）。是否向非管理员放行自助绑定属产品裁定（见 fix 报告）。
   if (isReadOnly.value || mfaBinding.value.loading) return
   try {
@@ -717,7 +722,7 @@ const openMfaBinding = async (row: UserListItem): Promise<void> => {
 }
 
 const activateMfa = async (): Promise<void> => {
-  // 历史修复：按钮已按 6 位禁用（原实现在不足 6 位时静默 no-op，用户以为页面卡住）；
+  // 按钮已按 6 位禁用（原实现在不足 6 位时静默 no-op，用户以为页面卡住）；
   // 函数内保留短路作为纵深兜底（脚本/键盘直触路径）。
   if (isReadOnly.value || mfaBinding.value.code.length !== 6 || mfaBinding.value.loading) return
   mfaBinding.value.loading = true
@@ -736,7 +741,7 @@ const activateMfa = async (): Promise<void> => {
 }
 
 const copyMfaRecovery = async (): Promise<void> => {
-  // 历史问题：走统一 copyText（clipboard API + textarea 降级）——面板默认
+  // 走统一 copyText（clipboard API + textarea 降级）——面板默认
   // HTTP 部署属非安全上下文，navigator.clipboard 不可用，原实现在该场景恒失败。
   const ok = await copyText(mfaBinding.value.recoveryCodes.join('\n'))
   if (ok) ElMessage.success('恢复代码已复制')

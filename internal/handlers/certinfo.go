@@ -14,7 +14,7 @@ import (
 )
 
 // GetRuleCertInfo returns parsed certificate information for a single rule.
-// 历史问题：服务层读取故障必须回 500（fail-visible）；规则不存在/未启用 TLS
+// 服务层读取故障必须回 500（fail-visible）；规则不存在/未启用 TLS
 // 保持 200 + data:null（既有契约，前端据此显示「无证书信息」）。
 func (h *Handlers) GetRuleCertInfo(c *gin.Context) {
 	caddyID := c.Param("caddy_id")
@@ -53,7 +53,7 @@ func (h *Handlers) GetRulesCertInfo(c *gin.Context) {
 	for index, id := range req.CaddyIDs {
 		args[index] = id
 	}
-	// 历史修复（历史）：阈值经 GetCertExpiryThreshold 单源读取（services/certinfo.go
+	// 阈值经 GetCertExpiryThreshold 单源读取（services/certinfo.go
 	// 基准口径：global_config 缺行/读故障 error 留痕后降级治理默认），替换原子
 	// 查询里以字面量 30 兜底 cert_expiry_days 的 COALESCE 标量子查询——该形态
 	// 对「缺行」无效（标量子查询零行恒 NULL，Scan 进 int 失败→整批 500），与
@@ -109,7 +109,7 @@ func (h *Handlers) GetRulesCertInfo(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "批量读取签发证书失败"})
 			return
 		}
-		// 历史问题：装载阶段预解析一次，选择与过期回退共用同一 Leaf。
+		// 装载阶段预解析一次，选择与过期回退共用同一 Leaf。
 		if candidate.Status != "disabled" {
 			candidate.Leaf = services.ParseCertificateLeaf(candidate.CertPEM, candidate.KeyPEM)
 		}
@@ -131,7 +131,7 @@ func (h *Handlers) GetRulesCertInfo(c *gin.Context) {
 		if rule.source == "acme_dns" {
 			var selected bool
 			certPEM, selected = services.SelectRuleCertificate(candidates[id], rule.domains, now)
-			// 历史修复:历史修复 同型回退——候选全过期时按 expired 呈现,
+			// 同型回退——候选全过期时按 expired 呈现,
 			// 与单规则端点同口径(此前批量恒报「尚未签发或不存在」)。
 			if !selected {
 				if info := services.ExpiredACMECertInfoFallback(candidates[id], id, rule.domains, rule.expiryDays, now); info != nil {

@@ -25,7 +25,7 @@ func TestRegistrationStatus_DemotionDoesNotDeliverUnpersistedToken(t *testing.T)
 	if err != nil {
 		t.Fatalf("register node: %v", err)
 	}
-	if err := service.ApproveNode(context.Background(), registration.RegistrationID); err != nil {
+	if err := service.ApproveNode(context.Background(), registration.RegistrationID, time.Now()); err != nil {
 		t.Fatalf("approve node: %v", err)
 	}
 

@@ -1,4 +1,4 @@
-// 后端批量端点上限镜像与冲突检测求交（历史问题-06/历史问题-09）：
+// 后端批量端点上限镜像与冲突检测求交
 //   A. chunkForBulk 按上限切分、顺序保持、空输入不产生请求
 //   B. entriesIntersect 复用 Set 语义且与 filter/includes 结果一致（去重、保序）
 //
@@ -14,7 +14,7 @@ import {
   entriesIntersect,
 } from '../src/utils/securityStages.ts'
 import { CADDY_APPLY_FAILED_MARKER, mergeBulkResults } from '../src/utils/bulkApplyResult.ts'
-import { repoSource } from './_helpers.ts'
+import { repoSource, source } from './_helpers.ts'
 
 test('A1 分片：按上限切分且保持原顺序（策略绑定 100 / 批量拦截页 500）', () => {
   const bindings = Array.from({ length: 250 }, (_, i) => `lb_${i}`)
@@ -51,7 +51,7 @@ test('B2 求交：无重叠返回空数组，不误报冲突', () => {
   assert.deepEqual(entriesIntersect([], new Set(['2.2.2.2'])), [])
 })
 
-// —— 分片响应汇总（历史问题）——
+// 分片响应汇总——
 // 退化 200（DB 已提交、Caddy 应用失败）必须常驻警告：原实现把每片响应赋给
 // 同一变量，只有末片进入 showSaveResult，早先分片的失败提示被覆盖丢失。
 const DEGRADED = `绑定已提交；但${CADDY_APPLY_FAILED_MARKER}：重载中断`
@@ -87,4 +87,28 @@ test('D1 绑定上限单源：与后端 maxBindingsPerRule 同值', () => {
   const declared = /^const maxBindingsPerRule = (\d+)$/m.exec(go)
   assert.ok(declared, '后端缺 maxBindingsPerRule 常量声明')
   assert.equal(MAX_POLICIES_PER_RULE, Number(declared[1]), '前端 MAX_POLICIES_PER_RULE 与后端上限漂移')
+})
+
+// D2：分片上限同样跨栈对表——前端按 SECURITY_BULK_LIMITS 切片，切片大于后端
+// 上限时整批 400 且重试同败；小于后端上限则浪费往返。三常量（批量绑定 /
+// 单策略批量绑定 / 批量拦截页）逐一对表。
+test('D2 分片上限单源：与后端批量端点三常量同值', () => {
+  const security = repoSource('internal/handlers/security.go')
+  const batchBind = /^const maxBatchBindRules = (\d+)$/m.exec(security)
+  const bulkBindings = /const maxBulkBindings = (\d+)/.exec(security)
+  assert.ok(batchBind && bulkBindings, '后端缺批量绑定上限常量声明')
+  assert.equal(SECURITY_BULK_LIMITS.policyBindings, Number(bulkBindings[1]), 'policyBindings 与 maxBulkBindings 漂移')
+  assert.equal(SECURITY_BULK_LIMITS.policyBindings, Number(batchBind[1]), 'policyBindings 与 maxBatchBindRules 漂移')
+  const rules = repoSource('internal/handlers/rules.go')
+  const blockPages = /const maxBatchRuleBlockPages = (\d+)/.exec(rules)
+  assert.ok(blockPages, '后端缺批量拦截页上限常量声明')
+  assert.equal(SECURITY_BULK_LIMITS.ruleBlockPages, Number(blockPages[1]), 'ruleBlockPages 与 maxBatchRuleBlockPages 漂移')
+})
+
+// 退化后缀判定单源：名单直接动作（useTrustAssociation 三侧快捷处置）与批量
+// 合并共用同一标记常量——字面量复制会在文案调整时静默失配（后缀不再常驻）。
+test('退化后缀判定单源：名单直接动作不复制字面量', () => {
+  const composable = source('src/composables/useTrustAssociation.ts')
+  assert.match(composable, /import \{ CADDY_APPLY_FAILED_MARKER \} from '@\/utils\/bulkApplyResult'/)
+  assert.doesNotMatch(composable, /['"]Caddy 配置应用失败['"]/, '不得复制退化后缀字面量')
 })

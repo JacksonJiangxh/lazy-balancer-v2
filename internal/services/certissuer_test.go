@@ -22,6 +22,7 @@ import (
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
+	"lazy-balancer-v2/internal/taskengine"
 
 	xacme "golang.org/x/crypto/acme"
 )
@@ -69,7 +70,7 @@ func TestCertIssuer_deployIssuedCertificate_keeps_nonterminal_state_when_reload_
 	jobID, ruleID := seedCertificateJob(t, "downloaded")
 	useTemporaryCertDir(t)
 	issuer := NewCertIssuer(func() error { return errors.New("reload failed") })
-	// 历史问题 起再调度为异步（go deploymentRetry）——断言必须经 channel 等待
+	// 自此再调度为异步（go deploymentRetry）——断言必须经 channel 等待
 	// 回调到达，裸读计数器既是顺序竞态也是数据竞态（全量并发下偶发 flake）。
 	retried := make(chan struct{}, 1)
 	issuer.deploymentRetry = func(gotJobID int, got issuedCertificate, _ time.Duration) {
@@ -214,7 +215,7 @@ func TestCertIssuer_deployIssuedCertificate_restores_files_when_job_disabled_bef
 }
 
 func TestCertIssuer_deployIssuedCertificate_skips_rollback_when_cas_loser_files_match_winner(t *testing.T) {
-	// 历史问题(b)：并发部署回调（在途回调 × Resume/Unblock 补扫重试）部署同
+	// 并发部署回调（在途回调 × Resume/Unblock 补扫重试）部署同
 	// jobID 同一份证书时，双方 WriteCertFiles 内容相同，终态 CAS 先到者提交
 	// issued、后到者进冲突分支——其部署前快照可能早于胜者写入（旧证书），无
 	// 条件恢复会把磁盘回退到旧证书，而 DB='issued'+新 PEM、Caddy 服务新证书，
@@ -266,7 +267,7 @@ func TestCertIssuer_deployIssuedCertificate_skips_rollback_when_cas_loser_files_
 }
 
 func TestCertIssuer_deployIssuedCertificate_restores_when_disk_differs_from_own_material(t *testing.T) {
-	// 历史问题(b) 对照：终态 CAS 冲突但磁盘内容与本回调部署的证书不同（并发
+	// 对照：终态 CAS 冲突但磁盘内容与本回调部署的证书不同（并发
 	// 新化身写入了另一份证书）时，快照恢复语义必须保持不变——回滚到本回调
 	// 部署前快照并重新重载。
 	// Given
@@ -373,7 +374,7 @@ func TestCertIssuer_Issue_fast_path_returns_reload_error_and_keeps_downloaded(t 
 		t.Fatalf("seed rule CA provider: %v", err)
 	}
 	issuer := NewCertIssuer(func() error { return errors.New("reload failed") })
-	// 历史问题 起再调度异步——channel 等待替代裸计数器（消顺序/数据竞态）。
+	// 自此再调度异步——channel 等待替代裸计数器（消顺序/数据竞态）。
 	retried := make(chan struct{}, 1)
 	issuer.deploymentRetry = func(int, issuedCertificate, time.Duration) { retried <- struct{}{} }
 
@@ -477,7 +478,7 @@ func TestCertIssuer_Issue_fast_path_skips_redeploy_when_deployed_cert_matches(t 
 	if _, err := db.DB.Exec("UPDATE cert_jobs SET cert_pem=?, key_pem='persisted-key', ca_provider_id=? WHERE id=?", certPEM, providerID, jobID); err != nil {
 		t.Fatalf("seed downloaded certificate material: %v", err)
 	}
-	// 历史问题（历史）：快速路径同时比对私钥文件——部署态必须 cert+key 双文件
+	// 快速路径同时比对私钥文件——部署态必须 cert+key 双文件
 	// 都与任务材料一致才算「无需重新部署」。
 	certPath, keyPath := CertFilePaths(ruleID)
 	if err := os.WriteFile(certPath, []byte(certPEM), 0644); err != nil {
@@ -721,8 +722,8 @@ func TestCertIssuer_deploymentFailed_backs_off_then_slowRetriesAtMaxAttempts(t *
 	// Given
 	jobID, ruleID := seedCertificateJob(t, "downloaded")
 	issuer := NewCertIssuer(nil)
-	// 历史问题：deploymentFailed 的再调度是异步 go deploymentRetry（历史问题），
-	// 回调内裸写切片与 历史问题 已修的两处同型竞态——channel 收集 + 有界等待。
+	// deploymentFailed 的再调度是异步 go deploymentRetry，
+	// 回调内裸写切片与已修的两处同型竞态——channel 收集 + 有界等待。
 	type retryCall struct {
 		material issuedCertificate
 		delay    time.Duration
@@ -738,7 +739,7 @@ func TestCertIssuer_deploymentFailed_backs_off_then_slowRetriesAtMaxAttempts(t *
 	}
 
 	// Then：每次失败都再调度——前 9 次按 1s→256s 退避，第 10 次封顶后转
-	// 30 分钟慢速重试（历史问题-02：不落 failed，材料保留、磁盘恢复后自动收敛）。
+	// 30 分钟慢速重试（不落 failed，材料保留、磁盘恢复后自动收敛）。
 	wantDelays := []time.Duration{
 		time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second,
 		32 * time.Second, 64 * time.Second, 128 * time.Second, 256 * time.Second,
@@ -879,7 +880,7 @@ func TestRetryCertificateDeployment_accepts_cleanup_dns_status(t *testing.T) {
 
 func TestRetryCertificateDeployment_cleanup_dns_job_slowRetriesAtMaxAttempts(t *testing.T) {
 	// Given：长时间停留在 cleanup_dns 的任务，部署反复失败——封顶后保留可部署态
-	// （历史问题-02：落 failed 会把材料/磁盘分叉变成无自动通道的搁浅）
+	// （落 failed 会把材料/磁盘分叉变成无自动通道的搁浅）
 	jobID, _ := seedCertificateJob(t, "cleanup_dns")
 	useTemporaryCertDir(t)
 	const providerID = 999
@@ -920,9 +921,71 @@ func installCertJobVersionTrigger(t *testing.T) {
 	}
 }
 
-func TestCertificateDeploymentBackoff_caps_at_five_minutes(t *testing.T) {
-	if got := certificateDeploymentBackoff(20); got != 5*time.Minute {
-		t.Fatalf("deployment backoff=%v, want 5m", got)
+func TestCertIssuer_Issue_fastPathMaterialReadFailure_defersDeployment(t *testing.T) {
+	// 快速路径读材料失败（瞬时 DB 故障）不得静默回落完整签发——那会白烧一张
+	// 新 CA 订单，而库里材料可能完好。必须走部署重试语义：任务保持部署
+	// 生命周期 + 退避窗口 + 登记重试，且不重写材料列。
+	// Given
+	jobID, ruleID := seedCertificateJob(t, "downloaded")
+	useTemporaryCertDir(t)
+	taskengine.SetLogDir(t.TempDir())
+	t.Cleanup(func() { taskengine.SetLogDir("") })
+	issuer := NewCertIssuer(func() error { return nil })
+	retried := make(chan struct{}, 1)
+	issuer.deploymentRetry = func(int, issuedCertificate, time.Duration) { retried <- struct{}{} }
+	oldReader := readFastPathIssuedMaterial
+	readFastPathIssuedMaterial = func(context.Context, int) (string, string, error) {
+		return "", "", errors.New("injected material read failure")
+	}
+	t.Cleanup(func() { readFastPathIssuedMaterial = oldReader })
+
+	// When
+	err := issuer.Issue(context.Background(), jobID, ruleID, "example.com", models.CAProvider{ID: 1})
+
+	// Then：部署重试错误族（不是 CA 签发失败），任务未被推进到签发态
+	var deploymentErr *certificateDeploymentError
+	if !errors.As(err, &deploymentErr) {
+		t.Fatalf("issue error=%v, want certificateDeploymentError（读失败须走部署重试而非全签）", err)
+	}
+	select {
+	case <-retried:
+	case <-time.After(5 * time.Second):
+		t.Fatal("读失败后未登记部署重试")
+	}
+	var status string
+	var attempts int
+	var after sql.NullString
+	if err := db.DB.QueryRow("SELECT status, COALESCE(deployment_attempts,0), deployment_available_after FROM cert_jobs WHERE id=?", jobID).
+		Scan(&status, &attempts, &after); err != nil {
+		t.Fatalf("read job: %v", err)
+	}
+	if status != "downloaded" {
+		t.Fatalf("status=%q, want downloaded（不得回落 creating_account 全签）", status)
+	}
+	if attempts != 1 || !after.Valid {
+		t.Fatalf("deployment_attempts=%d window=%v, want 1 + 非空窗口", attempts, after.Valid)
+	}
+}
+
+func TestCertificateDeploymentBackoff_ladderUpperBound(t *testing.T) {
+	// 真实阶梯 = 1s×2^(attempt-1)，由循环守卫在跨过 5min 处停止加倍：
+	// attempt 10 起为 512s（上界），attempt≥maxCertificateDeploymentAttempts
+	// 时调用方改用 30min 慢速重试，阶梯值不再生效。
+	cases := []struct {
+		attempt int
+		want    time.Duration
+	}{
+		{1, time.Second},
+		{2, 2 * time.Second},
+		{3, 4 * time.Second},
+		{9, 256 * time.Second},
+		{10, 512 * time.Second},
+		{20, 512 * time.Second},
+	}
+	for _, tc := range cases {
+		if got := certificateDeploymentBackoff(tc.attempt); got != tc.want {
+			t.Fatalf("certificateDeploymentBackoff(%d)=%v, want %v", tc.attempt, got, tc.want)
+		}
 	}
 }
 
@@ -1007,7 +1070,7 @@ func TestCertIssuer_deployIssuedCertificate_serializes_rollback_by_rule(t *testi
 	}
 }
 
-// 历史修复：字符串回退不得把裸 "429" 子串当限流证据——acme/issuer.go:105
+// 字符串回退不得把裸 "429" 子串当限流证据——acme/issuer.go:105
 // 把域名嵌进错误文本（"present dns for %s: ..."），429.example.com 这类域名
 // 会被误分类为 CA 限流（waiting_ca 冷却 1-3h 而非 failJob 30min 重试）。
 // 真实 CA 429 由结构化 *acme.Error StatusCode==429 分支覆盖。
@@ -1040,7 +1103,7 @@ func TestDetectRateLimit_string_fallback_ignores_bare_429_substring(t *testing.T
 	}
 }
 
-// 历史问题(历史):CA 429 历史修复 提示分支封顶 3h。
+// CA 429 提示分支封顶 3h。
 func TestComputeBackoff_retryAfterClampedTo3h(t *testing.T) {
 	if got := computeBackoff(1, 24*time.Hour); got != 3*time.Hour {
 		t.Fatalf("computeBackoff(1, 24h)=%v, want 3h (clamped)", got)
@@ -1056,7 +1119,7 @@ func TestComputeBackoff_retryAfterClampedTo3h(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：注释承诺剥「句点或逗号」而 TrimRight 只剥句点
+// 注释承诺剥「句点或逗号」而 TrimRight 只剥句点
 // ——逗号结尾的 "retry after 3600s," 此前落入解析失败被整段丢弃。
 func TestExtractRetryAfterFromError_stripsTrailingCommaAndPeriod(t *testing.T) {
 	if d := extractRetryAfterFromError("rate limited, retry after 3600s,"); d != 3600*time.Second {
@@ -1067,7 +1130,7 @@ func TestExtractRetryAfterFromError_stripsTrailingCommaAndPeriod(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：部署失败必须在 certjob-*.log 留一条 ERROR 业务行（attempt+
+// 部署失败必须在 certjob-*.log 留一条 ERROR 业务行（attempt+
 // 原因）——此前部署链 grep WriteCertJobLog 零命中，磁盘日志只剩签发阶段，
 // 排障需反查 DB；重载/写文件/CAS 冲突等附带失败补 WARN 行，不改变签发结果。
 func TestDeploymentFailed_writesCertJobLogWithAttemptAndReason(t *testing.T) {
@@ -1097,7 +1160,7 @@ func TestDeploymentFailed_writesCertJobLogWithAttemptAndReason(t *testing.T) {
 	}
 }
 
-// 历史问题-02 封顶形态：第 10 次部署失败保留可部署态（慢速重试），日志行
+// 封顶形态：第 10 次部署失败保留可部署态（慢速重试），日志行
 // 同样带 attempt=10/10 与慢速重试说明。
 func TestDeploymentFailed_entersSlowRetryAtMaxAttempts(t *testing.T) {
 	useCertJobLogTestEnv(t, 1<<20)
@@ -1132,7 +1195,7 @@ func TestDeploymentFailed_entersSlowRetryAtMaxAttempts(t *testing.T) {
 	}
 }
 
-// 历史问题：状态回写失败（CAS 冲突/DB 故障）不得静默——补 WARN 行留痕，返回值仍
+// 状态回写失败（CAS 冲突/DB 故障）不得静默——补 WARN 行留痕，返回值仍
 // 是部署失败（签发结果不变）。
 func TestDeploymentFailed_warnsWhenStatusWritebackFails(t *testing.T) {
 	useCertJobLogTestEnv(t, 1<<20)
@@ -1292,7 +1355,7 @@ func TestHandleQueueExecutionError_roleInterruptionDoesNotConsumeRenewalAttempts
 	}
 }
 
-// ---- 历史（历史问题）----
+// ---- 回归钉 ----
 
 func TestParseRetryAfter_non_positive_seconds_zeroes(t *testing.T) {
 	for _, header := range []string{"-5", "0"} {
@@ -1316,7 +1379,7 @@ func TestExtractRetryAfterFromError_parses_go_time_string(t *testing.T) {
 	}
 }
 
-// 历史问题：ZeroSSL 签发链每次签发不得重复注册 ACME 账户——预检
+// ZeroSSL 签发链每次签发不得重复注册 ACME 账户——预检
 // （testCAProvider）已完成 RegisterAccount 的 client 必须被签发复用，
 // Issuer 跳过重复注册。钉：/account POST 恰好 1 次（旧实现=2 次）。
 func TestCertIssuer_Issue_zerosslRegistersAccountOnce(t *testing.T) {

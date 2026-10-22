@@ -57,7 +57,7 @@ func TestCreateRuleToolForwardsBodyAndAPIKey(t *testing.T) {
 }
 
 func TestIssueCertificateSchemaRequiresExplicitAllOrCaddyID(t *testing.T) {
-	// Given：历史问题 确认门——空 body（全量重签）不再放行，批量必须显式
+	// Given：确认门——空 body（全量重签）不再放行，批量必须显式
 	// {"all":true}（enum 锁死 true，防 all:false 静默变成空批量）；定向
 	// 签发仍走 caddy_id（domain 可选）。
 	var schema struct {
@@ -157,7 +157,13 @@ func TestUpdateConfigSchemaCurrentWritableFields(t *testing.T) {
 }
 
 func TestToolsListHidesWriteTools_forReadOnlyAPIKey(t *testing.T) {
-	// Given
+	// Given：只读可见数按 isReadOnlyTool 的全量口径推导（含 admin 组 GET 工具），
+	// 断言成立的前提是 admin 组路由集合未注入。该集合是包级装配态，另一测试
+	// （SetupRouter 路径）会写入且不复位——必须在本用例内隔离，否则断言随
+	// 执行顺序变化（-shuffle 下同包/外部测试先后不定）。
+	previous := adminOnlyRoutePaths.Load()
+	SetAdminOnlyRoutes(nil)
+	t.Cleanup(func() { adminOnlyRoutePaths.Store(previous) })
 	resolver := func(apiKey string) (apiKeyVisibility, error) {
 		return apiKeyVisibility{readOnly: apiKey == "lb_sk_read-only"}, nil
 	}
@@ -186,7 +192,7 @@ func TestToolsListHidesWriteTools_forReadOnlyAPIKey(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("parse tools/list response: %v", err)
 	}
-	// 历史问题（历史）：只读可见数按 isReadOnlyTool 动态计算（此前硬编码
+	// 只读可见数按 isReadOnlyTool 动态计算（此前硬编码
 	// 64，每新增 GET 工具都要手工改并只报数字）。只读筛选口径 = GET 且非
 	// 隐藏工具 + 读探测 POST 白名单（与 ListToolSpecs.read_only 同源）。
 	wantReadOnly := 0
@@ -207,7 +213,7 @@ func TestToolsListHidesWriteTools_forReadOnlyAPIKey(t *testing.T) {
 			dashboardVisible = true
 		}
 		// ApiMcp-新1:读探测 POST 工具对只读 Key 合法可见(单一事实源
-		// ReadOnlyProbeTools，历史问题 收敛；历史问题 与 历史问题 后 3 项)
+		// ReadOnlyProbeTools，收敛； 后 3 项)
 		for _, spec := range tools {
 			if spec.name == tool.Name && spec.method != http.MethodGet {
 				if _, probe := ReadOnlyProbeTools[tool.Name]; !probe {
@@ -432,7 +438,7 @@ func TestRedirectedPOSTPreservesMethodAndBody(t *testing.T) {
 	}
 }
 
-// 历史问题-1：面板 TLS 嗅探层对明文请求实际返回 302（cmd/server
+// 面板 TLS 嗅探层对明文请求实际返回 302（cmd/server
 // http_redirect_mux.go），转发重放集合必须含 302——否则面板启用 HTTPS 后
 // 全部 tools/call 收到 302 空 body 走 {} 错误。本测试钉「302 同样按原方法/
 // 原请求体重放一次」。
@@ -777,7 +783,7 @@ func TestAddIPToListToolForwardsValue(t *testing.T) {
 
 func TestGetIPListToolForwardsID(t *testing.T) {
 	// Given：v2.3.2 名单瘦身后 list_ip_lists 仅含 entry_count，读条目唯一通道
-	// 是 GET /security/ip-lists/:id——历史问题（历史）补 get_ip_list 工具
+	// 是 GET /security/ip-lists/:id——补 get_ip_list 工具
 	// 覆盖该端点（GET 只读，id 进路径）。
 	var receivedMethod, receivedPath string
 	rest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -914,9 +920,9 @@ func TestGetCRSRuleIndexToolForwardsReadOnly(t *testing.T) {
 	}
 }
 
-// 历史问题(历史修复):v2.3.0 起 /config/export 恒返回 lbbak 二进制(tar.gz,
+// v2.3.0 起 /config/export 恒返回 lbbak 二进制(tar.gz,
 // application/gzip)——forward 把响应体喂 NewToolResultText 会把 gzip 字节
-// 静默损坏成不可读文本。非 JSON 历史修复 必须以 IsError 文本指引改走
+// 静默损坏成不可读文本。非 JSON 必须以 IsError 文本指引改走
 // 面板/REST,不得让二进制字节进文本结果。
 func TestExportConfigToolRejectsNonJSONContentType(t *testing.T) {
 	// Given:内部 API 对 export_config 返回非 JSON(如 lbbak application/gzip)
@@ -996,7 +1002,7 @@ func resolveAPIKeyReadOnly(apiKey string) (bool, error) {
 	return visibility.readOnly, err
 }
 
-// requestToolNames 发起 tools/list 并返回工具名集合（历史修复 可见性测试共用）。
+// requestToolNames 发起 tools/list 并返回工具名集合。
 func requestToolNames(t *testing.T, handler http.Handler, apiKey string) map[string]bool {
 	t.Helper()
 	body := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`

@@ -14,7 +14,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 历史修复：warmer 已接管时，宽窗口（7d）请求仍须按持久 coverage 补做 24h
+// warmer 已接管时，宽窗口（7d）请求仍须按持久 coverage 补做 24h
 // 之外的旧侧分钟——旧实现 warmer 恒固化 24h 且请求路径完全跳过固化，7d
 // 窗口的旧侧原始事件永久不进 rollup。
 func TestThreatRollup_wideWindowBackfillsUnderWarmer(t *testing.T) {
@@ -47,7 +47,7 @@ func TestThreatRollup_wideWindowBackfillsUnderWarmer(t *testing.T) {
 	t.Fatalf("total_events=%d, want >=1（7d 请求须补做 24h 之外的旧侧分钟）", payload.Data.TotalEvents)
 }
 
-// 历史修复：warmer 首轮未完成（此处以已取消 ctx 模拟）时不得把「已启动」当作
+// warmer 首轮未完成（此处以已取消 ctx 模拟）时不得把「已启动」当作
 // 「已有覆盖」——请求路径须沿用懒固化，且响应披露 rollup 就绪/最近成功时间。
 func TestThreatRollup_unreadyWarmerFallsBackToLazyFixation(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
@@ -65,8 +65,7 @@ func TestThreatRollup_unreadyWarmerFallsBackToLazyFixation(t *testing.T) {
 	if payload.Data.TotalEvents != 1 {
 		t.Fatalf("total_events=%d, want 1（首轮未完成时请求路径须懒固化）", payload.Data.TotalEvents)
 	}
-	// 审计项：rollup_ready 字段已删除——「本次请求已成功固化」由
-	// rollup_last_success 非空断言（下方）承担。
+	// 最近成功固化时刻由 rollup_last_success 非空断言（下方）承担。
 	if payload.Data.RollupLastOK == "" {
 		t.Fatalf("rollup_last_success 为空：须披露最近成功固化时间")
 	}
@@ -75,7 +74,7 @@ func TestThreatRollup_unreadyWarmerFallsBackToLazyFixation(t *testing.T) {
 	}
 }
 
-// 历史修复：就绪状态陈旧（warmer 持续失败/停摆）时请求路径必须同步固化，
+// 就绪状态陈旧（warmer 持续失败/停摆）时请求路径必须同步固化，
 // 不得把旧值伪装成最新 200。
 func TestThreatRollup_staleReadinessTriggersRequestFixation(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
@@ -100,7 +99,7 @@ func TestThreatRollup_staleReadinessTriggersRequestFixation(t *testing.T) {
 	}
 }
 
-// 历史修复：归属地库代际变化时按空覆盖重固窗口（库恢复后历史空归属地自愈）。
+// 归属地库代际变化时按空覆盖重固窗口（库恢复后历史空归属地自愈）。
 func TestThreatRollup_geoipGenerationChangeRefixesWindow(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	t.Cleanup(resetThreatRollupWarmerForTest)
@@ -164,7 +163,7 @@ func TestThreatRollup_trailingRepairBackfillsLateMinute(t *testing.T) {
 	}
 }
 
-// 历史修复：top_targets 必须来自分钟 rollup——原始事件被保留策略裁掉后，
+// top_targets 必须来自分钟 rollup——原始事件被保留策略裁掉后，
 // 与 total/国家等卡片仍同窗口。
 func TestThreatTopTargets_servedFromRollupAfterRawDeletion(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
@@ -195,7 +194,7 @@ func TestThreatTopTargets_servedFromRollupAfterRawDeletion(t *testing.T) {
 	}
 }
 
-// 历史修复：top_targets 必须与其他维度同口径排除保留/私网地址。
+// top_targets 必须与其他维度同口径排除保留/私网地址。
 func TestThreatTopTargets_excludesReservedSourceIPs(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	t.Cleanup(resetThreatRollupWarmerForTest)
@@ -212,7 +211,7 @@ func TestThreatTopTargets_excludesReservedSourceIPs(t *testing.T) {
 	}
 }
 
-// 历史修复：已删除规则不得挤掉现存真实目标——须先排除幽灵规则再取前 3。
+// 已删除规则不得挤掉现存真实目标——须先排除幽灵规则再取前 3。
 func TestThreatTopTargets_ghostRulesDoNotCrowdOutExisting(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	t.Cleanup(resetThreatRollupWarmerForTest)
@@ -237,7 +236,7 @@ func TestThreatTopTargets_ghostRulesDoNotCrowdOutExisting(t *testing.T) {
 	}
 }
 
-// 历史修复：限流族是 429 精确 ID——旧实现按 3 字符前缀 + 三个下划线拼成
+// 限流族是 429 精确 ID——旧实现按 3 字符前缀 + 三个下划线拼成
 // LIKE '429___'，永不命中。
 func TestRuleTriggeredFilterSQL_rateLimitFamilyExact(t *testing.T) {
 	var args []any
@@ -259,7 +258,7 @@ func TestRuleTriggeredFilterSQL_rateLimitFamilyExact(t *testing.T) {
 	}
 }
 
-// 历史修复：显式类型归一清空 refs 后，存在性校验必须使用归一后的 ID 集。
+// 显式类型归一清空 refs 后，存在性校验必须使用归一后的 ID 集。
 func TestUpdateSecurityPolicy_typeSwitchSkipsStaleRefValidation(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newSecurityRouter(t)
@@ -299,7 +298,7 @@ func TestUpdateSecurityPolicy_typeSwitchSkipsStaleRefValidation(t *testing.T) {
 	}
 }
 
-// 历史修复：爬虫豁免未进入阶段外字段归一——类型往返后不得静默复活。
+// 爬虫豁免未进入阶段外字段归一——类型往返后不得静默复活。
 func TestUpdateSecurityPolicy_crawlerExemptClearedOnStageSwitch(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newSecurityRouter(t)
@@ -332,7 +331,7 @@ func TestUpdateSecurityPolicy_crawlerExemptClearedOnStageSwitch(t *testing.T) {
 	}
 }
 
-// 历史修复：自动更新开关必须是指针语义——缺字段/null 不得静默关闭更新。
+// 自动更新开关必须是指针语义——缺字段/null 不得静默关闭更新。
 func TestAutoUpdateSwitches_requireExplicitValue(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	gin.SetMode(gin.TestMode)

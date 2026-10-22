@@ -23,7 +23,7 @@ func init() {
 // 全部策略评估,此处读值即纯安全链耗时;信任直通(passthrough)时安全链
 // 整体跳过,本处理器在 subroute 内不执行,无计时(无事件,无关联缺口)。
 //
-// 稳定设计:零失败模式;读请求头+写进程内计时注册表（历史侧车退役——
+// 稳定设计:零失败模式;读请求头+写进程内计时注册表（侧车退役——
 // 经审计写插件注入审计行 lb_timing.end_us）,任何失败静默降级(该事件耗时
 // 报「—」);next 原样透传,链语义与无插件时一致。
 type SecurityTimingEnd struct{}
@@ -38,7 +38,7 @@ func (SecurityTimingEnd) CaddyModule() caddy.ModuleInfo {
 
 // ServeHTTP 计算 logged 事件耗时（注册表分段键 end，自预检完成锚点起算=
 // WAF 段值）写入进程内计时注册表，原样透传下游（reverse_proxy）。计时读头
-// 逻辑收敛于 recordSecurityTiming（历史修复，security_timing.go）。
+// 逻辑收敛于 recordSecurityTiming（security_timing.go）。
 //
 // 终态标记不在此处：blocked_counter 是链最外层收点，其 post-next 统一置
 // 注册表终态（auditTimingClose，auditwriter.go）——本收点之后已无安全链段。
@@ -49,7 +49,7 @@ func (h *SecurityTimingEnd) ServeHTTP(w http.ResponseWriter, r *http.Request, ne
 
 // Interface guards(编译期契约,零运行时成本)。计时写入目标是进程内注册表
 // （auditTimingRecord，auditwriter.go）——无 fd、无后台管线生命周期，本
-// handler 不再持有 Provision/Cleanup（历史侧车退役）。
+// handler 不再持有 Provision/Cleanup（侧车退役）。
 var (
 	_ caddyhttp.MiddlewareHandler = (*SecurityTimingEnd)(nil)
 )

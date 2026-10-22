@@ -294,7 +294,7 @@ func TestIssueCertificate_records_each_rule_and_batch_failure(t *testing.T) {
 		})
 	}
 	response := httptest.NewRecorder()
-	// 历史问题（2026-09-06 裁定）：批量路径需显式 {"all":true} 确认
+	// （2026-09-06 裁定）：批量路径需显式 {"all":true} 确认
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/certificates/issue", strings.NewReader(`{"all":true}`)))
 	if response.Code != http.StatusInternalServerError {
 		t.Fatalf("all-task failure status=%d body=%s, want 500", response.Code, response.Body.String())
@@ -305,7 +305,7 @@ func TestIssueCertificate_records_each_rule_and_batch_failure(t *testing.T) {
 		t.Fatalf("force batch query failure: %v", err)
 	}
 	response = httptest.NewRecorder()
-	// 历史问题（2026-09-06 裁定）：批量路径需显式 {"all":true} 确认
+	// （2026-09-06 裁定）：批量路径需显式 {"all":true} 确认
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/certificates/issue", strings.NewReader(`{"all":true}`)))
 	if response.Code != http.StatusInternalServerError {
 		t.Fatalf("batch query status=%d body=%s, want 500", response.Code, response.Body.String())
@@ -393,7 +393,7 @@ func TestIssueCertificate_batch_preserves_running_jobs(t *testing.T) {
 			('lb_batch_download','download','http','download.example',9443,1,1,'acme_dns');
 		INSERT INTO cert_jobs (rule_id,domain,status,message,updated_at) VALUES
 			('lb_batch_order','order.example','creating_order','active message',datetime('now')),
-			-- 历史修复：批量路径已套用冷却门，已部署任务须回拨越过 2 分钟守卫才重排队。
+			-- 批量路径已套用冷却门，已部署任务须回拨越过 2 分钟守卫才重排队。
 			('lb_batch_download','download.example','downloaded','active message',datetime('now','-10 minutes'));
 	`); err != nil {
 		t.Fatalf("seed running jobs: %v", err)
@@ -402,11 +402,11 @@ func TestIssueCertificate_batch_preserves_running_jobs(t *testing.T) {
 	router.POST("/certificates/issue", h.IssueCertificate)
 	response := httptest.NewRecorder()
 
-	// 历史问题（2026-09-06 裁定）：批量路径需显式 {"all":true} 确认
+	// （2026-09-06 裁定）：批量路径需显式 {"all":true} 确认
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/certificates/issue", strings.NewReader(`{"all":true}`)))
 
 	// 执行中的任务（creating_order）保持不变；已部署任务（downloaded）按
-	// 历史修复 重新排队——再次触发签发对已部署证书必须生效，不得静默空转。
+	// 重新排队——再次触发签发对已部署证书必须生效，不得静默空转。
 	if response.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
 	}
@@ -450,7 +450,7 @@ func assertLatestCertificateAudit(t *testing.T, wantScope, wantResult string) {
 }
 
 func TestMaskedDNSCredentialsRoundtrip(t *testing.T) {
-	// 历史问题：非 admin GET 到掩码 → 原样回传保存 → 按「未提交」处理；
+	// 非 admin GET 到掩码 → 原样回传保存 → 按「未提交」处理；
 	// 真实新值正常提交；显式清空语义保留。
 	if !isMaskedDNSCredentials(map[string]string{"id": "***", "token": "***"}) {
 		t.Fatal("all-sentinel map must be detected as masked")
@@ -470,7 +470,7 @@ func TestMaskedDNSCredentialsRoundtrip(t *testing.T) {
 	}
 }
 
-// 历史问题（2026-09-05 证书域审计裁定）：删除 DNS 提供商配置前必须检查
+// （2026-09-05 证书域审计裁定）：删除 DNS 提供商配置前必须检查
 // lb_rules.acme_config_id 引用（全部规则，不限 enabled）——被引用时 409 并列出
 // 引用规则，避免删除后下一次续签/首签静默失败（"未选择可用的 DNS 提供商"）。
 func TestDeleteCertificateConfig_blocked_when_referenced_by_rules(t *testing.T) {
@@ -546,7 +546,7 @@ func latestDNSConfigTestAudit(t *testing.T) (string, string) {
 	return action, detail
 }
 
-// 历史问题（2026-09-05 证书域审计裁定）：无 id 的保存前凭证测试（前端 saveConfig
+// （2026-09-05 证书域审计裁定）：无 id 的保存前凭证测试（前端 saveConfig
 // 先调 /certificate-configs/test）此前审计 detail 落「配置 0」——改为语义化来源
 // 标注「来源：保存前测试」；有 id 路径保留「配置 N」。
 func TestCertificateConfigPreSaveTest_audit_marks_source_instead_of_config_zero(t *testing.T) {
@@ -613,7 +613,7 @@ func TestCertificateConfigPreSaveTest_audit_marks_source_instead_of_config_zero(
 	})
 }
 
-// 历史问题（2026-09-05 证书域审计裁定）：批量签发须显式确认——请求体必填其一：
+// （2026-09-05 证书域审计裁定）：批量签发须显式确认——请求体必填其一
 // caddy_id（单规则定向）或 {"all":true}（全量重签，含已签发任务，消耗 CA 配额）；
 // 空 body / {} 不再隐式触发全量重签；两者同传以 caddy_id 为准。
 func TestIssueCertificate_bulk_requires_explicit_all_confirmation(t *testing.T) {
@@ -690,7 +690,7 @@ func TestIssueCertificate_bulk_requires_explicit_all_confirmation(t *testing.T) 
 	})
 }
 
-// 历史问题(历史修复):DNS 凭证最小可见性从「属主非 admin」扩为「属主非 admin 或
+// DNS 凭证最小可见性从「属主非 admin」扩为「属主非 admin 或
 // Key 只读」——admin 的只读 API Key(机器身份)不得经列表端点读明文凭证;
 // admin JWT 路径不受影响(2026-09-05 用户裁定的 CA 凭证明文口径不在本端点)。
 func TestListCertificateConfigs_masksCredentials_forReadOnlyAPIKey(t *testing.T) {
@@ -752,7 +752,7 @@ func TestListCertificateConfigs_masksCredentials_forReadOnlyAPIKey(t *testing.T)
 	})
 }
 
-// （历史修复，历史：自 apikeys_current_test.go 迁回——本族为证书配置端点
+// （自 apikeys_current_test.go 迁回——本族为证书配置端点
 // NULL 凭据主题，此前仅因共用 newBackupTestHandlers 夹具寄居于 API Key 文件。）
 func TestCertificateConfigEndpointsHandleNullDNSCredentials(t *testing.T) {
 	h := newBackupTestHandlers(t)

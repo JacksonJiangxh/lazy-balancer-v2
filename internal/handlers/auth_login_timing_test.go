@@ -16,7 +16,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 历史修复：Login 的 ErrNoRows 分支不跑 bcrypt 即返 401，与「用户存在
+// Login 的 ErrNoRows 分支不跑 bcrypt 即返 401，与「用户存在
 // 但密码错」路径存在 ~bcrypt 量级（数十毫秒）的时序差 → 用户名枚举侧信道。
 // 修复：不存在用户也对包级固定 dummy 哈希（init 生成一次，DefaultCost 与真实
 // 哈希同档）跑一次注定失败的比较后再返回同形 401。
@@ -60,7 +60,7 @@ func TestLogin_unknownUserAndWrongPassword_returnIdentical401(t *testing.T) {
 	}
 }
 
-// 历史修复（用户已批准契约）：登录账户级锁定——5 次密码失败锁 10 分钟（429），锁定
+// （用户已批准契约）：登录账户级锁定——5 次密码失败锁 10 分钟（429），锁定
 // 期间即使密码正确同样 429（且先跑一次真实 bcrypt 等时占位，不泄露锁定账户的
 // 密码正误）；置锁同语句清零计数（锁满不再累计）。
 func TestLogin_locksAccountAfterFiveFailures(t *testing.T) {
@@ -113,7 +113,7 @@ func TestLogin_locksAccountAfterFiveFailures(t *testing.T) {
 	}
 }
 
-// 历史修复：成功登录清零失败计数——4 次失败后正确登录不触发锁定，计数归零。
+// 成功登录清零失败计数——4 次失败后正确登录不触发锁定，计数归零。
 func TestLogin_successClearsLockoutCounter(t *testing.T) {
 	// Given 4 次失败（再错一次即锁定）
 	database := setupAuthTestDB(t)
@@ -280,7 +280,7 @@ func TestLogin_lockoutDisabledBySwitch(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：未认证登录请求的 username/password 此前无长度上限
+// 未认证登录请求的 username/password 此前无长度上限
 // （guardAuthJSONBody 只限 64KiB 整体）——失败登录把 ~64KiB 用户名原文写入
 // audit_log，分布式绕开 10/min/IP 限流即可放大审计库。登录侧补齐与
 // users 列宽（50）/bcrypt 上限（72）对齐的 binding max，超限在写库/审计前拒绝。

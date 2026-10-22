@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// 历史修复（历史）：面板页面与 API 响应缺 X-Content-Type-Options/
+// 面板页面与 API 响应缺 X-Content-Type-Options/
 // X-Frame-Options——点击劫持表面。基线钉：全局中间件恒施加 nosniff+DENY。
 
 func TestSetupRouter_setsSecurityHeadersOnAllResponses(t *testing.T) {
@@ -29,8 +29,8 @@ func TestSetupRouter_setsSecurityHeadersOnAllResponses(t *testing.T) {
 	}
 }
 
-// 历史修复（历史问题）：/ui 挂载壳 index.html 与根路径缓存策略对齐——此前
-// 仅 GET / 显式 no-cache，/ui 壳由 http.FileServer 直出只有 历史修复
+// /ui 挂载壳 index.html 与根路径缓存策略对齐——此前
+// 仅 GET / 显式 no-cache，/ui 壳由 http.FileServer 直出只有
 // （浏览器启发式缓存 10% 规则：升级后旧壳引用已删哈希资产 → 白屏）。
 func TestSetupRouter_uiShellIndexNoCacheHeader(t *testing.T) {
 	// Given 完整路由（测试 StaticDir 为空目录：/ui 壳响应码非 200，但缓存头

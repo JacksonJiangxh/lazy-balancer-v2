@@ -1,6 +1,6 @@
 package handlers
 
-// 历史问题(历史):同端口 TLS/明文混布拦截——Caddy 监听器按端口二选一,
+// 同端口 TLS/明文混布拦截——Caddy 监听器按端口二选一,
 // 混布会把整个端口监听器切为 TLS,明文规则流量全部握手失败。创建/更新/
 // 启用三入口按 enable_tls 意图拦截(不看证书存在性,ACME 延迟翻转一并覆盖)。
 
@@ -105,7 +105,7 @@ func TestRulePortTLSMix_rejected(t *testing.T) {
 	}
 }
 
-// 历史问题(历史问题):checkPortTLSMix 的 enable_tls 裸布尔比较与全仓
+// checkPortTLSMix 的 enable_tls 裸布尔比较与全仓
 // IIF(enable_tls IN ('1',1),1,0) 归一口径不一——NULL 行（远古存量/直改 DB）
 // 在裸比较下漏检。修复后 NULL 归一为明文（0）参与混布判定。
 func TestRulePortTLSMix_null_enable_tls_row_normalized_as_plaintext(t *testing.T) {
@@ -145,7 +145,7 @@ func TestRulePortTLSMix_null_enable_tls_row_normalized_as_plaintext(t *testing.T
 	}
 }
 
-// 历史问题：补 Update 方向——文件头声明覆盖 create/update/enable 三入口，
+// 补 Update 方向——文件头声明覆盖 create/update/enable 三入口，
 // 实际只测了 create×2 + enable；更新开启 TLS 命中同端口混布门无钉测。
 func TestRulePortTLSMix_rejectedOnUpdate(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)

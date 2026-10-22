@@ -319,7 +319,7 @@ func TestGetSecurityThreatScreen_metricsScrapeFailureDegrades(t *testing.T) {
 }
 
 func TestGetSecurityThreatScreen_metricsDBNilReturnsZeroShape(t *testing.T) {
-	// Given: MetricsDB 未装配（历史问题 家族口径）
+	// Given: MetricsDB 未装配
 	setupSecurityPolicyTestDB(t)
 	saved := db.MetricsDB
 	db.MetricsDB = nil
@@ -344,10 +344,14 @@ func TestGetSecurityThreatScreen_metricsDBNilReturnsZeroShape(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &raw); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"rollup_ready", "rollup_stale", "rollup_last_success", "rollup_coverage_from", "backfill_incomplete", "logged_events", "ratelimit_available", "top_rules", "top_targets", "hourly_hist", "attack_type_share", "recent_rate"} {
+	for _, key := range []string{"rollup_stale", "rollup_last_success", "rollup_coverage_from", "backfill_incomplete", "logged_events", "ratelimit_available", "top_rules", "top_targets", "hourly_hist", "attack_type_share", "recent_rate"} {
 		if _, ok := raw.Data[key]; !ok {
 			t.Fatalf("zero response missing key %q: %s", key, recorder.Body.String())
 		}
+	}
+	retiredRollupKey := "rollup" + "_ready"
+	if _, ok := raw.Data[retiredRollupKey]; ok {
+		t.Fatalf("zero response must not contain retired readiness key: %s", recorder.Body.String())
 	}
 }
 
@@ -613,7 +617,7 @@ func TestGetSecurityEventFeed_defaultsAndNewEventsAfterCursor(t *testing.T) {
 }
 
 func TestGetSecurityEventFeed_metricsDBNilReturnsEmptyList(t *testing.T) {
-	// Given: MetricsDB 未装配（历史问题 家族口径，键形状与成功路径一致）
+	// Given: MetricsDB 未装配（家族口径，键形状与成功路径一致）
 	setupSecurityPolicyTestDB(t)
 	saved := db.MetricsDB
 	db.MetricsDB = nil
@@ -847,7 +851,7 @@ func TestAttackFamily_sixDigitCustomIDs(t *testing.T) {
 	}
 }
 
-// 历史修复（源码文本断言退役）：rollup 固化必须按归一后的规则名表达式分组——
+// （源码文本断言退役）：rollup 固化必须按归一后的规则名表达式分组——
 // 可观察契约：同 IP 同规则 ID 但 rule_name 不同（跨规则改名快照）必须落成两条
 // rollup 行；若分组退化为 select 列序号/子集，聚合会把不同规则名并成一行。
 func TestThreatFixMinute_groupsByRuleIdentityColumns(t *testing.T) {
@@ -890,7 +894,7 @@ func TestThreatFixMinute_groupsByRuleIdentityColumns(t *testing.T) {
 	}
 }
 
-// ---- 历史 A 域：历史修复 ----
+// 历史 A 域： ----
 
 func installThreatClock(t *testing.T, now time.Time) {
 	t.Helper()
@@ -1395,7 +1399,7 @@ func TestGetSecurityThreatScreen_topTargetsQueryFailureReturns500(t *testing.T) 
 func TestStartThreatRollupWarmer_takesOverFixation(t *testing.T) {
 	// Given: 窗口内 1 条事件；warmer 以已取消 ctx 启动（立即退出不执行固化，
 	// 但启动标志置位）；幂等二次启动不 panic。
-	// 历史问题：启动标志 ≠ 已有可用覆盖——首轮从未成功时请求路径必须
+	// 启动标志 ≠ 已有可用覆盖——首轮从未成功时请求路径必须
 	// 沿用懒固化（不得返回全零「无攻击」大屏）。
 	setupSecurityPolicyTestDB(t)
 	t.Cleanup(resetThreatRollupWarmerForTest)
@@ -1561,11 +1565,26 @@ func TestGetSecurityThreatScreen_hourlyHistUsesWindowStart(t *testing.T) {
 	}
 
 	loc := services.CurrentLocation()
-	_, offset := base.In(loc).Zone()
-	dayStarts, _ := threatHourlyBuckets(24*7, base, offset)
-	wantDayStart := base.UTC().Add(time.Duration(offset) * time.Second).Add(-24 * 7 * time.Hour)
+	dayStarts, _ := threatHourlyBuckets(24*7, base, loc)
+	wantDayStart := base.In(loc).Add(-24 * 7 * time.Hour)
 	if len(dayStarts) != 7 || !dayStarts[0].Equal(wantDayStart) {
 		t.Fatalf("7d 首槽起点=%v, want %v（真实窗口起点）", dayStarts[0], wantDayStart)
+	}
+}
+
+func TestThreatBucketStep_windowBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		hours int
+		want  time.Duration
+	}{
+		{hours: 1, want: time.Hour},
+		{hours: 24, want: time.Hour},
+		{hours: 25, want: 24 * time.Hour},
+		{hours: 168, want: 24 * time.Hour},
+	} {
+		if got := threatBucketStep(tc.hours); got != tc.want {
+			t.Fatalf("hours=%d bucket step=%v, want %v", tc.hours, got, tc.want)
+		}
 	}
 }
 
@@ -1577,7 +1596,7 @@ func TestGetSecurityThreatScreen_hourlyHistDayBuckets(t *testing.T) {
 	// 日桶标签会整体错位一天（本地 00:xx 窗口可稳定复现）。
 	now := time.Now()
 	installThreatClock(t, now)
-	// 73h 前原始事件保证原始表覆盖到 72h 窗口起点之前（否则按 历史问题-01
+	// 73h 前原始事件保证原始表覆盖到 72h 窗口起点之前（否则按
 	// 口径应披露“窗口前段不可重建”，不能断言回填完成）。
 	seedThreatScreenEvent(t, now.UTC().Add(-73*time.Hour).Truncate(time.Second).Format("2006-01-02 15:04:05"), "93.184.216.6", "942100", "SQL Injection", "blocked")
 	seedThreatScreenEvent(t, now.UTC().Add(-30*time.Hour).Truncate(time.Second).Format("2006-01-02 15:04:05"), "93.184.216.7", "942100", "SQL Injection", "blocked")
@@ -1605,8 +1624,7 @@ func TestGetSecurityThreatScreen_hourlyHistDayBuckets(t *testing.T) {
 		t.Fatalf("hourly_hist=%d 槽, want 3（ceil(72/24) 日桶）", len(hist))
 	}
 	loc := services.CurrentLocation()
-	_, offset := now.In(loc).Zone()
-	bucketStarts, _ := threatHourlyBuckets(72, now, offset)
+	bucketStarts, _ := threatHourlyBuckets(72, now, loc)
 	for i, slot := range hist {
 		want := bucketStarts[i].AddDate(0, 0, 1).Format("01-02")
 		if slot.Name != want {
@@ -1623,17 +1641,9 @@ func TestGetSecurityThreatScreen_hourlyHistDayBuckets(t *testing.T) {
 		t.Fatalf("hourly 总计=%d, want 2", total)
 	}
 	// 72h 日桶是滚动 24h 窗口（起点 now-72h），不是自然日；按事件在窗口内
-	// 的偏移映射到桶，避免跨午夜/自然日假设造成的假失败。
+	// 的槽界真实时刻定位到桶，避免跨午夜/自然日假设造成的假失败。
 	bucketFor := func(at time.Time) string {
-		shifted := at.UTC().Add(time.Duration(offset) * time.Second)
-		idx := int(shifted.Sub(bucketStarts[0]) / (24 * time.Hour))
-		if idx < 0 {
-			idx = 0
-		}
-		if idx >= len(hist) {
-			idx = len(hist) - 1
-		}
-		return hist[idx].Name
+		return hist[threatBucketIndex(at, bucketStarts)].Name
 	}
 	day30 := bucketFor(now.Add(-30 * time.Hour))
 	day2 := bucketFor(now.Add(-2 * time.Hour))
@@ -1654,7 +1664,7 @@ func TestGetSecurityThreatScreen_hourlyHistDayBuckets(t *testing.T) {
 	}
 }
 
-// 历史问题-1（历史）：停机/升级积压事件若落在 rollup 已覆盖分钟（warmer 首轮
+// 停机/升级积压事件若落在 rollup 已覆盖分钟（warmer 首轮
 // 先于摄取首 pass 推进水位），超过 repair 窗口后原实现再无重固入口 → 大屏
 // 永久少计。ThreatRollupRewindTo（摄取提交钩子）把覆盖水位回退到插入分钟前，
 // 下一次固化重算该段。
@@ -1984,5 +1994,66 @@ func TestGetSecurityThreatScreen_disclosesMinuteGranularityWindow(t *testing.T) 
 	}
 	if !strings.HasPrefix(payload.Data.WindowStart, payload.Data.WindowStartMinute) {
 		t.Fatalf("window_start=%q 必须与 window_start_minute=%q 同边界（分钟截断）", payload.Data.WindowStart, payload.Data.WindowStartMinute)
+	}
+}
+
+// 直方图落桶逐槽本地边界（与总览趋势日桶 DST 修复同口径）：窗口跨 DST
+// 切换点时，切换前的事件必须按切换前偏移落桶——单一「当前偏移」平移会把
+// 该事件错配 1h 到相邻柱。
+func TestGetSecurityThreatScreen_hourlyHistDSTTransitionBuckets(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	if _, err := services.ConfigureLocation("America/New_York"); err != nil {
+		t.Fatalf("configure DST location: %v", err)
+	}
+	t.Cleanup(func() { _, _ = services.ConfigureLocation("Asia/Shanghai") })
+	loc, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 2026-11-02 12:00 EST（秋切次日，当前偏移 -5）；72h 日桶窗口覆盖
+	// 2026-11-01 02:00 EDT→EST 回退点。逐日边界：bucket0=[10-31 12:00 EDT,
+	// 11-01 12:00 EST)=25 真实小时；单一 -5 偏移的日界恒为 17:00 UTC。
+	now := time.Date(2026, 11, 2, 12, 0, 0, 0, loc)
+	installThreatClock(t, now)
+	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
+	// 事件 2026-11-01 17:30 UTC=12:30 EST：逐日边界落含回退点的 25h 槽（<18:00 UTC），
+	// 单偏移日界（恒 17:00 UTC）则按 24h 整除落下一槽。
+	seedThreatScreenEvent(t, "2026-11-01 17:30:00", "93.184.216.7", "942100", "SQL Injection", "blocked")
+
+	var payload threatScreenPayload
+	for i := 0; i < 6; i++ {
+		recorder := getRequest(t, router, "/security/overview/threat-screen?hours=72")
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if payload.Data.TotalEvents != 1 {
+		t.Fatalf("total_events=%d, want 1", payload.Data.TotalEvents)
+	}
+	bucketStarts, _ := threatHourlyBuckets(72, now, loc)
+	eventAt := time.Date(2026, 11, 1, 17, 30, 0, 0, time.UTC)
+	wantIdx := threatBucketIndex(eventAt, bucketStarts)
+	// bucket1=[10-31 13:00 EDT, 11-01 13:00 EST) 是含回退点的 25h 日历槽；
+	// 事件 11-01 17:30 UTC 在其内（<11-01 18:00 UTC）；单偏移 24h 整除落 bucket2。
+	if wantIdx != 1 {
+		t.Fatalf("夹具期望槽=%d, want 1（bucket1 为含回退点的 25h 日历槽）", wantIdx)
+	}
+	// 夹具鉴别力：旧「单一当前偏移」公式（shiftedNow 伪 UTC 开窗 + 事件加 -5h、
+	// 24h 整除）落槽 2——本测试对旧实现必红。
+	oldWindowStart := now.UTC().Add(-5 * time.Hour).Add(-72 * time.Hour)
+	if oldIdx := int(eventAt.Add(-5*time.Hour).Sub(oldWindowStart) / (24 * time.Hour)); oldIdx == wantIdx {
+		t.Fatalf("夹具无法区分新旧落桶口径（oldIdx=%d）", oldIdx)
+	}
+	for i, slot := range payload.Data.HourlyHist {
+		want := 0
+		if i == wantIdx {
+			want = 1
+		}
+		if slot.Value != want {
+			t.Fatalf("hist[%d](%s)=%d, want %d——回退点前事件必须按切换前 EDT(-4) 落桶，单一当前偏移（-5）会错配相邻柱", i, slot.Name, slot.Value, want)
+		}
 	}
 }

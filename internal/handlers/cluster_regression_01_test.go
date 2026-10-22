@@ -19,7 +19,7 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// 历史修复：重复 ip:port 注册命中已批准节点时必须点名被覆盖的节点（响应 + 审计），
+// 重复 ip:port 注册命中已批准节点时必须点名被覆盖的节点（响应 + 审计），
 // 首次注册保持无覆盖语义。
 func TestRegisterClusterNode_duplicateApprovedNodeNamesOverwrittenNode(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -57,7 +57,7 @@ func TestRegisterClusterNode_duplicateApprovedNodeNamesOverwrittenNode(t *testin
 	if err := json.Unmarshal(first.Body.Bytes(), &firstPayload); err != nil {
 		t.Fatalf("decode first response: %v", err)
 	}
-	if err := h.clusterService.ApproveNode(context.Background(), firstPayload.Data.RegistrationID); err != nil {
+	if err := h.clusterService.ApproveNode(context.Background(), firstPayload.Data.RegistrationID, time.Now()); err != nil {
 		t.Fatalf("approve node: %v", err)
 	}
 	if _, err := db.DB.Exec("UPDATE nodes SET name='original-name' WHERE id=?", firstPayload.Data.RegistrationID); err != nil {
@@ -81,7 +81,7 @@ func TestRegisterClusterNode_duplicateApprovedNodeNamesOverwrittenNode(t *testin
 	}
 }
 
-// 历史修复：已批准但从未上报/已离线 → 409 可行动文案；未批准 → 404。
+// 已批准但从未上报/已离线 → 409 可行动文案；未批准 → 404。
 func TestGenerateClusterLoginTicket_offlineNodeReturns409(t *testing.T) {
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	if err := db.Initialize(t.TempDir()); err != nil {

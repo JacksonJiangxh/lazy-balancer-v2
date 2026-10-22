@@ -16,7 +16,7 @@ import (
 	"github.com/pquerna/otp/totp"
 )
 
-// 历史问题：管理员重置 MFA 的双层验证死锁——重置端点自带验码（handlers/mfa.go 第一层）
+// 管理员重置 MFA 的双层验证死锁——重置端点自带验码（handlers/mfa.go 第一层）
 // 与 mfaStepUpGuard（第二层）在同一 TOTP 时间片内互斥：守卫验码（verify-step）消费
 // 时间片后，第一层重放保护必然拒绝同片码 → 401 → 踢出登录 → 连续失败触发 10 分钟
 // 锁定。用户裁决语义：守卫开 → 直接使用守卫验码（第一层豁免，含登录 60 秒内场景）；
@@ -53,14 +53,14 @@ func seedMfaResetUsers(t *testing.T, operatorMfa bool) (operatorSecret string) {
 	return operatorSecret
 }
 
-// authType 模拟中间件设置的认证类型（历史问题 补正：第一层豁免只对被 mfaStepUpGuard
+// authType 模拟中间件设置的认证类型（补正：第一层豁免只对被 mfaStepUpGuard
 // 真正验过码的 jwt 路径生效；api_key/MCP 机器身份由场景 5 覆盖）。
 func mfaResetRouter(h *Handlers, authType string) *gin.Engine {
 	return mfaResetRouterWithGuard(h, authType, false)
 }
 
 // mfaResetRouterWithGuard 模拟守卫态:guardMarker=true 时前置注入
-// mfa_stepup_verified(历史问题:生产由 mfaStepUpGuard 开启态放行路径置)。
+// mfa_stepup_verified（生产由 mfaStepUpGuard 开启态放行路径置)。
 func mfaResetRouterWithGuard(h *Handlers, authType string, guardMarker bool) *gin.Engine {
 	router := gin.New()
 	router.POST("/users/:id/mfa/reset", func(c *gin.Context) {
@@ -184,7 +184,7 @@ func TestMFAResetByAdmin_operatorWithoutMfa_noCodeRequired(t *testing.T) {
 // 场景 5（审计 问题-3，用户裁决）：mfaStepUpGuard 按设计豁免
 // auth_type != "jwt" 的机器身份（API Key/MCP）——守卫对这类请求从不验码，
 // 故「守卫已验码」的豁免理由不成立，第一层必须照常要求操作者 TOTP 码；
-// 历史问题 二次防劫持语义对机器身份同样保持。豁免仅适用于守卫真正验过码的
+// 防劫持语义对机器身份同样保持。豁免仅适用于守卫真正验过码的
 // JWT 路径（场景 1/4）。
 func TestMFAResetByAdmin_guardOn_apiKeyStillRequiresCode(t *testing.T) {
 	// Given 守卫开 + 操作者启用 MFA + 请求为 api_key 机器身份

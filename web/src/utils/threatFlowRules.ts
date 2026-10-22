@@ -1,17 +1,6 @@
 // 威胁大屏光流/弹框聚合单源（纯函数，node:test 可覆盖）。
 // 口径：攻击类型不区分，只按地域；中国精确到省；同一地区同一秒为一桶。
 import { FLOW_AGGREGATE_THRESHOLD, type FlowArcTier } from './threatTheme.ts'
-import { parseIpLocation } from './ipLocationParts.ts'
-
-export interface FlowGroup<T> {
-  /** 聚合地域 key（中国精确到省，其余国家） */
-  region: string
-  /** 秒级时间桶（Unix 秒） */
-  bucket: number
-  /** region|bucket，供 Map 去重 */
-  key: string
-  items: T[]
-}
 
 /** DB datetime 无时区时按 UTC 解析（与 utils/date.ts 同口径）。 */
 export function flowTimestamp(value: string): number {
@@ -21,28 +10,9 @@ export function flowTimestamp(value: string): number {
   return Number.isFinite(t) ? t : NaN
 }
 
-/** 增量批次动效（流光/弹框）的实时性上限（历史问题-03）：入库延迟/轮转回填会把
+/** 增量批次动效（流光/弹框）的实时性上限：入库延迟/轮转回填会把
  *  数小时前的事件塞进增量批次，直接绘制会表现为「正在发生」。列表仍按窗口展示。 */
 export const FLOW_REALTIME_MAX_AGE_MS = 5 * 60_000
-
-/** 攻击只按地域聚合；中国精确到省（地图/地球同一口径）。 */
-export function flowRegionKey(ipLocation: string | undefined): string {
-  if (!ipLocation) return '未知'
-  // 与弧线起点共用同一拆分规则（历史问题：两处各自 split('·')，分隔/段数
-  // 变化时「键里的省」与「端点用的省」会漂移）。
-  const { country, province } = parseIpLocation(ipLocation)
-  if (!country) return '未知'
-  if (country === '中国' && province) return `${country}·${province}`
-  return country
-}
-
-export function flowBucket(ts: number, now = Date.now()): number {
-  return Number.isFinite(ts) ? Math.floor(ts / 1000) : Math.floor(now / 1000)
-}
-
-export function flowBucketKey(region: string, bucket: number): string {
-  return `${region}|${bucket}`
-}
 
 /**
  * 后端采样契约：-1=自适应、0=关闭逐请求光流。全量档已退役（自适应本身从
@@ -59,7 +29,7 @@ export function nextFlowCursor(previous: number, data: { enabled?: boolean; next
   return typeof data.next_seq === 'number' ? data.next_seq : previous
 }
 
-/** 自适应档位取值集合（1/4/8）曾是零消费导出常量，历史修复 移除；
+/** 自适应档位取值集合（1/4/8）曾是零消费导出常量，移除；
  *  档位语义由 nextAdaptiveSampleN/stepAdaptiveSample 承载。 */
 
 /**
@@ -115,7 +85,7 @@ export interface AdaptiveSampleOutcome extends AdaptiveSampleState {
  * 自适应采样单步状态机：连续 2 次采样**同向**且距上次换档 ≥4s 才换档。
  * 同向=两次采样算出的目标档位一致（`pendingTarget`）；目标改变（含高→低反转）
  * 时确认计数从 1 重新累计——只按次数累加会把「突发一次+骤停一次」误判为
- * 连续确认（历史修复）。目标与当前一致时清空确认计数（但保留上次换档时刻——
+ * 连续确认。目标与当前一致时清空确认计数（但保留上次换档时刻——
  * 回摆同样受 4s 门约束）。
  */
 export function stepAdaptiveSample(state: AdaptiveSampleState, observedRate: number, now: number): AdaptiveSampleOutcome {
@@ -131,32 +101,6 @@ export function stepAdaptiveSample(state: AdaptiveSampleState, observedRate: num
     return { active: target, stable: 0, pendingTarget: 0, lastSwitch: now, changed: true }
   }
   return { active: state.active, stable, pendingTarget: target, lastSwitch: state.lastSwitch, changed: false }
-}
-
-/** 正常流事件的最小形状（caddygeoip 事件流）：at 为 Unix 毫秒。 */
-export interface NormalFlowLike {
-  country?: string
-  province?: string
-  at?: number
-}
-
-/** 正常流与攻击流共用分组：地区键 + 秒桶，跨秒绝不合并。 */
-export function groupNormalFlowEvents<T extends NormalFlowLike>(
-  events: readonly T[],
-  now = Date.now(),
-): FlowGroup<T>[] {
-  const groups = new Map<string, FlowGroup<T>>()
-  for (const event of events) {
-    if (!event.country) continue
-    const region = flowRegionKey(event.province ? `${event.country}·${event.province}` : event.country)
-    const at = typeof event.at === 'number' && Number.isFinite(event.at) && event.at > 0 ? event.at : now
-    const bucket = flowBucket(at, now)
-    const key = flowBucketKey(region, bucket)
-    const group = groups.get(key)
-    if (group) group.items.push(event)
-    else groups.set(key, { region, bucket, key, items: [event] })
-  }
-  return [...groups.values()]
 }
 
 /** 单轮最多新增光流数；正常流与攻击流共用同一预算。 */

@@ -124,3 +124,37 @@ func TestCertIssuer_deployIssuedCertificate_quietWhenNotBeforePast(t *testing.T)
 		t.Fatalf("not-before audit rows=%d, want 0（已生效证书不得误报）", n)
 	}
 }
+
+// 延迟重载回调钉测：登记 → 到时 → 自取 CaddyOpLock → 调 reloader。
+// reloader 为 InLock 语义（InitCAQueueManager 契约），回调在部署临界区外
+// 触发，未取锁的重载会与部署/配置写并发。
+func TestScheduleDelayedReload_firesReloadUnderCaddyOpLock(t *testing.T) {
+	oldManager := caQueueManager
+	probe := make(chan bool, 1)
+	caQueueManager = &CAQueueManager{
+		queues:       make(map[int]*caQueue),
+		blockedRules: make(map[string]map[RuleBlockToken]struct{}),
+		reloader: func() error {
+			held := !CaddyOpLock.TryLock()
+			if !held {
+				CaddyOpLock.Unlock()
+			}
+			probe <- held
+			return nil
+		},
+	}
+	t.Cleanup(func() { caQueueManager = oldManager })
+
+	service := NewCertificateService()
+	t.Cleanup(service.Stop)
+	service.scheduleDelayedReload(123, "lb_delayed_reload", 10*time.Millisecond)
+
+	select {
+	case held := <-probe:
+		if !held {
+			t.Fatal("延迟重载调用 reloader 时未持 CaddyOpLock（InLock 契约破裂）")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("延迟重载回调未在到期后触发")
+	}
+}

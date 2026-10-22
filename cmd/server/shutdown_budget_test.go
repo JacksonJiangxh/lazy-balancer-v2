@@ -22,7 +22,7 @@ import (
 )
 
 // composeStopGracePeriod 直读 docker-compose.yml 的 stop_grace_period（单一
-// 数据源——历史问题：此前测试硬编码 30s 常量与 compose 双写易漂移）。取全部
+// 数据源——此前测试硬编码 30s 常量与 compose 双写易漂移）。取全部
 // 服务的最小值（任一服务 grace 收紧都必须反映到预算校验）。
 func composeStopGracePeriod(t *testing.T) time.Duration {
 	t.Helper()

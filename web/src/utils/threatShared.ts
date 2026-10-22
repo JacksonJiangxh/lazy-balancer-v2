@@ -1,4 +1,4 @@
-// 威胁大屏共享视觉/几何单源（v2.3.8 审计 历史问题 收口）：地图/地球两引擎共用，
+// 威胁大屏共享视觉/几何单源（v2.3.8 审计收口）：地图/地球两引擎共用，
 // 杜绝热力阶梯与点内判定算法双实现漂移（此前靠人工复制保持一致）。
 import { CHINA_PROVINCES } from './chinaProvinces.ts'
 import { COUNTRY_CENTROIDS, FALLBACK_CENTROID, type Centroid } from './countryCentroids.ts'
@@ -58,14 +58,14 @@ export function heatCss(count: number): string {
 /** 经纬度是否落在任一扁平多边形组内（ray-casting；两引擎 hover/点击共用）。 */
 export function pointInPolys(lon: number, lat: number, polys: number[][][]): boolean {
   for (const poly of polys) {
+    let inside = false
     for (const ring of poly) {
-      let inside = false
       for (let i = 0, j = ring.length - 2; i < ring.length; j = i, i += 2) {
         const xi = ring[i], yi = ring[i + 1], xj = ring[j], yj = ring[j + 1]
         if (yi > lat !== yj > lat && lon < ((xj - xi) * (lat - yi)) / (yj - yi) + xi) inside = !inside
       }
-      if (inside) return true
     }
+    if (inside) return true
   }
   return false
 }
@@ -113,7 +113,7 @@ export interface ProvinceGridDot {
 
 /**
  * 下钻省点阵：错列经纬网格 × 省多边形命中（首个命中省取色键=行政短名）。
- * 省级 bbox 预筛（历史修复，与 threatScene 省级预筛同构）：34 省 × 全网格
+ * 省级 bbox 预筛（与 threatScene 省级预筛同构）：34 省 × 全网格
  * 直接 pointInPolys 在宽幅国家首次下钻产生明显长任务；先按省 bbox 排除绝
  * 大多数省份，再对候选做射线判定。bbox 是命中判定的保守超集，预筛不改变
  * 产出点集。
@@ -152,7 +152,7 @@ export function provinceDotGrid(
 }
 
 /**
- * 热力数据指纹比较（历史问题 纯函数层）：引擎 setCountries/setProvinces
+ * 热力数据指纹比较：引擎 setCountries/setProvinces
  * 每 30s 轮询重放同一份计数——长度 + 逐键计数浅比较，无变化时调用方跳过
  * 静态层重建（原恒置脏位 → 每轮全量栅格化整幅离屏画布）。
  * 重复键视为变化（Map 语义下后者覆盖，指纹不可当相等）。
@@ -169,7 +169,7 @@ export function heatEntriesEqual(prev: ReadonlyMap<string, number>, next: readon
 }
 
 /**
- * 地球弧线端点（历史问题 纯函数接缝）：起点=归属地质心，终点=本站。
+ * 地球弧线端点：起点=归属地质心，终点=本站。
  * 本站坐标是可变状态（配置到达后 setServer），弧线对象必须按当前值快照——
  * 抽成纯函数后可由 node:test 断言「终点随 server 更新」，防止退回构造期常量。
  */
@@ -181,8 +181,7 @@ export function arcEndpoints(
 }
 
 /** 归属地文本 → 光流起点（中国精确到省质心，其余国家质心，未知走兜底点）。
- *  地图/地球两引擎共用，避免省/国家查找与回退规则双实现漂移
- *  （历史问题-5）。 */
+ *  地图/地球两引擎共用，避免省/国家查找与回退规则双实现漂移。 */
 export function arcOriginForLocation(ipLocation: string): Centroid {
   const { country, province } = parseIpLocation(ipLocation)
   if (!country) return FALLBACK_CENTROID
@@ -201,7 +200,7 @@ export function normalizeCountryName(name: string): string {
 }
 
 /**
- * 该下钻国家是否有省级统计源（历史修复）：后端 `threatLocationParts` 只对中国
+ * 该下钻国家是否有省级统计源：后端 `threatLocationParts` 只对中国
  * 从归属地串取省，`china_provinces` 也只聚合中国省——海外下钻的省板是纯几何，
  * UI 必须显示「无省级统计」而不是 0，避免把缺失当成「该省 0 次攻击」。
  */
@@ -210,7 +209,7 @@ export function hasProvinceStats(country: string): boolean {
 }
 
 /**
- * 异步下钻续体的提交判定（历史修复）：`seq` 已被返回/复位/销毁递增，或引擎已
+ * 异步下钻续体的提交判定：`seq` 已被返回/复位/销毁递增，或引擎已
  * 销毁 → 丢弃加载结果。地图/地球共用，防止一侧补了作废逻辑另一侧漏（原地球
  * 的 zoomOut/resetView 不递增 drillSeq，迟到的 chunk 会把用户刚做的复位覆盖）。
  */

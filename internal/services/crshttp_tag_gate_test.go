@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// 历史问题-4：GitHub release tag 的两条获取路径（API 的 tag_name / HTML
+// GitHub release tag 的两条获取路径（API 的 tag_name / HTML
 // 跳转的 /releases/tag/<tag>）此前均无字符集与长度校验——HTML 回退路径虽被正则
 // `([^"'/]+)` 间接限制，API 路径可携带控制字符/换行（写入版本行、日志与审计，
 // 并参与 raw.githubusercontent URL 拼接）。统一在两条解析漏斗处校验白名单。

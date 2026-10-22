@@ -71,7 +71,7 @@ func TestCertJobsActive_nilDBSkipsWithoutMaskingQueryErrors(t *testing.T) {
 	}
 }
 
-// 历史问题-02：sweepOrphanedCertJobs 返回值必须等于实际收敛的孤儿任务数——
+// sweepOrphanedCertJobs 返回值必须等于实际收敛的孤儿任务数——
 // CertReconcileOnce 的「孤儿清理 %d 个」任务日志行直接消费该值，swept 恒 0
 // 使对账轮永远上报「清理 0 个」。
 func TestSweepOrphanedCertJobs_countsDisabledOrphans(t *testing.T) {
@@ -108,10 +108,10 @@ func TestSweepOrphanedCertJobs_countsDisabledOrphans(t *testing.T) {
 	}
 }
 
-// 历史问题-11 + 历史问题 收敛（2026-10-03 裁定）：证书服务缺失行收敛为状态变化——
+// + 收敛（2026-10-03 裁定）：证书服务缺失行收敛为状态变化——
 // nil 持续期仅 false→true 转换记一次跳过行，持续缺失静默，恢复（true→false）
 // 记一次恢复行；三个证书 tick 任务共享同一状态门（全局单例服务指针）。
-// 设计变更披露：原 历史问题-11「每轮一行跳过说明」按新裁定收敛，非弱化。
+// 设计变更披露：原 「每轮一行跳过说明」按新裁定收敛，非弱化。
 func TestCertTicks_skipAndRecoveryLinesTransitionOnce(t *testing.T) {
 	useCertSweepTickTestEnv(t)
 
@@ -153,7 +153,7 @@ func TestCertTicks_skipAndRecoveryLinesTransitionOnce(t *testing.T) {
 	}
 }
 
-// 历史问题-11（cert-waiting-ca 形态）+ 历史问题 收敛：门控放行（有非终态任务）但服务
+// （cert-waiting-ca 形态）+ 收敛：门控放行（有非终态任务）但服务
 // 未运行时记一次跳过行（状态门新文案）；门控拦截（全部终态）时保持静默
 // （2026-09-29 裁定的零扫描门控不得被空转日志破坏）。
 func TestCertWaitingCATickOnce_skipLineGatedOnActiveJobs(t *testing.T) {
@@ -284,7 +284,7 @@ func TestTaskEngineWire_certTasksPropagateRunFailures(t *testing.T) {
 	}
 }
 
-// 历史问题-15：手动证书到期巡检读失败必须上抛（此前仅应用日志 Logf+return，
+// 手动证书到期巡检读失败必须上抛（此前仅应用日志 Logf+return，
 // Run 恒 nil，task_runs 落 success——任务监控呈现假健康）。对齐
 // cert-renewal-scan/cert-reconcile 同族口径。
 func TestCertManualCheckOnce_propagates_query_failure(t *testing.T) {
@@ -313,7 +313,7 @@ func TestCertManualCheckOnce_propagates_query_failure(t *testing.T) {
 	}
 }
 
-// 历史问题-15 接线钉：cert-manual-poll 的 Run 必须上抛 Once 的失败——
+// 接线钉：cert-manual-poll 的 Run 必须上抛 Once 的失败——
 // task_runs 终态与任务监控依赖该返回值（此前 Run 恒 return nil）。
 func TestTaskEngineWire_certManualPollPropagatesRunFailure(t *testing.T) {
 	te := newWireTestEngine(t)

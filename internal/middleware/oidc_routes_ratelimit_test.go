@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// 历史问题-1：/auth/oidc/login 是未认证公开跳转端点（state 表写入+可能的
+// /auth/oidc/login 是未认证公开跳转端点（state 表写入+可能的
 // discovery 回源），与 /auth/login 同威胁模型——必须共用同一 IP 限流桶
 // （10 次/分钟），否则可被线速打 state 表与 IdP 发现请求。
 func TestSetupRouter_oidcLoginRouteRateLimited(t *testing.T) {

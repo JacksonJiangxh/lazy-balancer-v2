@@ -21,7 +21,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// 历史修复
+// 回归钉
 // ---------------------------------------------------------------------------
 
 func TestSnapshot_buildIsolatesCorruptedJSONRows(t *testing.T) {
@@ -38,9 +38,9 @@ func TestSnapshot_buildIsolatesCorruptedJSONRows(t *testing.T) {
 	mustExec(`INSERT INTO security_custom_rules (id,name,conditions) VALUES (1,'bad-rule','{not-json')`)
 	mustExec(`INSERT INTO security_custom_rules (id,name,conditions) VALUES (2,'healthy-rule','[]')`)
 	// 自定义路由：11=坏行（upstreams_json 畸形），12=健康行
-	mustExec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled) VALUES ('lb_r78','r78','http','r78.example',80,1)`)
-	mustExec(`INSERT INTO path_rules (id,rule_id,sort_order,match_type,path,upstreams_json) VALUES (11,'lb_r78',0,'prefix','/bad','{not-json')`)
-	mustExec(`INSERT INTO path_rules (id,rule_id,sort_order,match_type,path,upstreams_json) VALUES (12,'lb_r78',1,'prefix','/ok','[]')`)
+	mustExec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled) VALUES ('lb_snapshot_probe','snapshot-probe','http','snapshot.example',80,1)`)
+	mustExec(`INSERT INTO path_rules (id,rule_id,sort_order,match_type,path,upstreams_json) VALUES (11,'lb_snapshot_probe',0,'prefix','/bad','{not-json')`)
+	mustExec(`INSERT INTO path_rules (id,rule_id,sort_order,match_type,path,upstreams_json) VALUES (12,'lb_snapshot_probe',1,'prefix','/ok','[]')`)
 	// API Key：21=坏行（MCP 白名单畸形），22=健康行
 	mustExec(`INSERT INTO api_keys (id,name,key_hash,key_prefix,created_by,mcp_enabled,mcp_ip_whitelist) VALUES (21,'bad-key','h1','lb_bad',1,1,'{not-json')`)
 	mustExec(`INSERT INTO api_keys (id,name,key_hash,key_prefix,created_by,mcp_enabled,mcp_ip_whitelist) VALUES (22,'healthy-key','h2','lb_ok',1,1,'["10.0.0.0/8"]')`)
@@ -66,7 +66,7 @@ func TestSnapshot_buildIsolatesCorruptedJSONRows(t *testing.T) {
 	}
 	var pathIDs []int
 	for _, rule := range snapshot.Rules {
-		if rule.CaddyID != "lb_r78" {
+		if rule.CaddyID != "lb_snapshot_probe" {
 			continue
 		}
 		for _, pathRule := range rule.PathRules {
@@ -136,7 +136,7 @@ func TestSnapshotRowIsolationThrottle_evictsExpiredEntriesAndKeepsThrottle(t *te
 }
 
 // ---------------------------------------------------------------------------
-// 历史修复
+// 回归钉
 // ---------------------------------------------------------------------------
 
 func TestSyncService_Pull_304_clears_waf_repull_state_after_manual_convergence(t *testing.T) {
@@ -176,7 +176,7 @@ func TestSyncService_Pull_304_clears_waf_repull_state_after_manual_convergence(t
 }
 
 // ---------------------------------------------------------------------------
-// 历史修复
+// 回归钉
 // ---------------------------------------------------------------------------
 
 func TestSyncService_applySnapshot_brandingFailureMarksRetryAndClearsOnSuccess(t *testing.T) {
@@ -432,7 +432,7 @@ func TestClusterService_BecomeSlave_detachesOnlyPreviousDifferentMaster(t *testi
 }
 
 // ---------------------------------------------------------------------------
-// 历史修复
+// 回归钉
 // ---------------------------------------------------------------------------
 
 func TestClusterService_Promote_drainsPostAdmissionApply(t *testing.T) {
@@ -535,7 +535,7 @@ func TestSyncService_applySnapshot_rechecksRoleInsideTransaction(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 历史修复
+// 回归钉
 // ---------------------------------------------------------------------------
 
 func TestClusterService_BecomeSlave_startsStoppedClusterSyncLoop(t *testing.T) {
@@ -570,7 +570,7 @@ func TestClusterService_BecomeSlave_startsStoppedClusterSyncLoop(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 历史修复
+// 回归钉
 // ---------------------------------------------------------------------------
 
 func TestClusterService_RegisterNode_reportsOverwrittenApprovedNode(t *testing.T) {
@@ -591,7 +591,7 @@ func TestClusterService_RegisterNode_reportsOverwrittenApprovedNode(t *testing.T
 	if first.OverwrittenNodeID != 0 {
 		t.Fatalf("first registration overwritten_node_id=%d, want 0", first.OverwrittenNodeID)
 	}
-	if err := service.ApproveNode(context.Background(), first.RegistrationID); err != nil {
+	if err := service.ApproveNode(context.Background(), first.RegistrationID, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := database.Exec("UPDATE nodes SET name='original-name' WHERE id=?", first.RegistrationID); err != nil {
@@ -615,7 +615,7 @@ func TestClusterService_RegisterNode_reportsOverwrittenApprovedNode(t *testing.T
 }
 
 // ---------------------------------------------------------------------------
-// 历史修复
+// 回归钉
 // ---------------------------------------------------------------------------
 
 func TestClusterService_GenerateLoginTicket_distinguishesOfflineFromMissing(t *testing.T) {
@@ -651,7 +651,7 @@ func TestClusterService_GenerateLoginTicket_distinguishesOfflineFromMissing(t *t
 }
 
 // ---------------------------------------------------------------------------
-// 历史修复
+// 回归钉
 // ---------------------------------------------------------------------------
 
 func TestClusterService_BecomeSlave_resetsLastSync(t *testing.T) {

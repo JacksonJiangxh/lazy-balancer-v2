@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -360,7 +361,7 @@ func TestCategorizeAttack_familyMapping(t *testing.T) {
 		{"protocol attack", "921110", "HTTP Request Smuggling", "协议攻击"},
 		{"scanner", "913100", "Scanner Detected", "扫描探测"},
 		{"blocking evaluation", "949110", "Inbound Anomaly Score Exceeded", "请求阻断评估"},
-		// 历史问题-02（历史）：已装 CRS v4 组的具体分类（waf/crs/rules/
+		// 已装 CRS v4 组的具体分类（waf/crs/rules/
 		// 目录实证规则 ID）——此前落兜底「其他」。
 		{"multipart attack", "922110", "Multipart Attack", "Multipart 攻击"},
 		{"response java leak", "952011", "Java Exception", "响应 Java 泄露"},
@@ -373,7 +374,7 @@ func TestCategorizeAttack_familyMapping(t *testing.T) {
 		{"ip whitelist via msg", "", "命中 IP 白名单", "IP 访问控制"},
 		{"ip acl via msg", "", "触发 IP 访问控制", "IP 访问控制"},
 		{"ip acl via id 2", "2", "", "IP 访问控制"},
-		// 历史问题：id:3/12 对齐 family 表/stage 桶归「信任名单」（发射
+		// id:3/12 对齐 family 表/stage 桶归「信任名单」（发射
 		// 为 pass,nolog 永不产事件——防御性归族，三侧同口径）
 		{"trust precheck id 3", "3", "", "信任名单"},
 		{"trust precheck id 12", "12", "", "信任名单"},
@@ -387,7 +388,7 @@ func TestCategorizeAttack_familyMapping(t *testing.T) {
 		{"crawler segment upper bound", "899999", "", "爬虫Bot"},
 		{"empty input", "", "", "其他"},
 		{"custom rule six-digit id", "123456", "something else", "自定义规则"},
-		// 历史修复（历史）收敛前语义钉：未列名 3 位前缀的 9xxxxx（CRS 保留段
+		// 收敛前语义钉：未列名 3 位前缀的 9xxxxx（CRS 保留段
 		// 余数）在概览视图走 fall-through——msg 命中 IP 黑白名单门仍归 IP 访问
 		// 控制，裸形态归「其他」（阶段视图则整段归 WAF，两视图有意分叉）。
 		{"unlisted crs id with acl msg", "960100", "命中 IP 黑名单", "IP 访问控制"},
@@ -479,12 +480,12 @@ func TestGetSecurityOverview_fallsBackToBundledCRSVersion(t *testing.T) {
 	}
 }
 
-// 历史修复（2026-09-05 安全核心域审计 · 批准修复）：CRS 版本行查询失败必须显式报错。
+// （2026-09-05 安全核心域审计 · 批准修复）：CRS 版本行查询失败必须显式报错。
 // Given：库已初始化但 security_crs_version 表缺失（单表异常窗口——主库整体
 // 故障时 ActivePolicies 会同挂触发 500，本测试钉住仅该表异常的静默窗口）。
 // When：请求 /security/overview。
 // Then：500「安全总览查询失败」——此前 err 被静默吞掉（err == nil 才应用），
-// 违反本函数 历史问题 自述标准，面板静默回落捆绑版本 +「idle」与真实态不可区分。
+// 违反本函数自述标准，面板静默回落捆绑版本 +「idle」与真实态不可区分。
 // 无行（ErrNoRows）是全新安装的合法状态，200 回落契约由 fallsBackToBundled
 // CRSVersion 钉住，不属故障。
 func TestGetSecurityOverview_crsVersionQueryFailureReturns500(t *testing.T) {
@@ -893,7 +894,7 @@ func TestLoadSecurityOverviewAggregates_doesNotCacheFailures(t *testing.T) {
 	}
 }
 
-// 历史修复(2026-09-10 审计):①family 筛选单数字前缀无长度约束,自定义 5 位 ID
+// (2026-09-10 审计):①family 筛选单数字前缀无长度约束,自定义 5 位 ID
 // (24567 等)交叉命中 IP/地域族;②id:11(请求体解析失败守卫)三侧分类缺标签。
 func TestRuleTriggeredFilterSQL_singleDigitFamiliesUseExactMatch(t *testing.T) {
 	var args []any
@@ -907,7 +908,7 @@ func TestRuleTriggeredFilterSQL_singleDigitFamiliesUseExactMatch(t *testing.T) {
 		}
 	}
 	// 自定义规则族不得命中 IP 族条件：其条件由长度约束的 GLOB 承载（非 LIKE
-	// 前缀），且不追加查询参数（历史修复：原 _ = customSQL 为假断言）。
+	// 前缀），且不追加查询参数（原 _ = customSQL 为假断言）。
 	var customArgs []any
 	customSQL := ruleTriggeredFilterSQL("自定义规则", &customArgs)
 	if strings.Contains(customSQL, "LIKE") {
@@ -934,8 +935,8 @@ func TestCategorizeAttack_bodyProcessorErrorAndNoCrossFamily(t *testing.T) {
 	}
 }
 
-// 历史问题-05（历史）：MetricsDB 未装配的兜底返回必须与成功路径同形状——
-// 键为 events（历史问题 引入防 panic 时误用 list 键，前端按 events 解析
+// MetricsDB 未装配的兜底返回必须与成功路径同形状——
+// 键为 events（引入防 panic 时误用 list 键，前端按 events 解析
 // 拿到 undefined 空列表）。
 func TestListSecurityEvents_nilMetricsDBFallbackUsesEventsKey(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
@@ -963,7 +964,7 @@ func TestListSecurityEvents_nilMetricsDBFallbackUsesEventsKey(t *testing.T) {
 	}
 }
 
-// ---- 历史问题 ----
+// ---- 回归钉 ----
 
 func TestListSecurityEvents_triggerTypePopulated(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
@@ -1168,7 +1169,7 @@ func TestListSecurityEvents_disclosesIngestionHealth(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：列表投影在 SQL 侧只取「截断上限 +1 字符」探针，Go 侧
+// 列表投影在 SQL 侧只取「截断上限 +1 字符」探针，Go 侧
 // 仍追加同一截断标记——响应形态不变，但 DB→进程传输不再是大字段全量
 // （100 行 × 64KB/字段）。SUBSTR 按字符计，多字节值不得被切断成非法 UTF-8。
 func TestListSecurityEvents_largeFieldsCappedWithMarker(t *testing.T) {
@@ -1266,5 +1267,211 @@ func TestSecurityOverviewSevenDayStartUTC_dstCorrect(t *testing.T) {
 	}
 	if naive := todayStart.UTC().Add(-6 * 24 * time.Hour).Format("2006-01-02 15:04:05"); got == naive {
 		t.Fatalf("覆盖判定仍用单一 UTC 平移（%q）", naive)
+	}
+}
+
+// 事件列表错误形态统一：计数失败与主查询失败同文案（泛化「安全事件查询失败」，
+// 不向登录用户泄露存储层错误文本）；MetricsDB 未装配的降级响应回显请求的分页
+// 值（此前硬编码 page=1/page_size=20，前端/Agent 对分页字段假设失真）。
+func TestListSecurityEvents_errorShapeUnified(t *testing.T) {
+	t.Run("主查询失败泛化文案", func(t *testing.T) {
+		setupSecurityPolicyTestDB(t)
+		router := newSecurityEventsRouter(t)
+		// 计数可查、主查询必败：以缺列同名表替换（COUNT(*) 不触列）。
+		if _, err := db.MetricsDB.Exec(`ALTER TABLE security_events RENAME TO security_events_full`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.MetricsDB.Exec(`CREATE TABLE security_events (id INTEGER)`); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_, _ = db.MetricsDB.Exec(`DROP TABLE security_events`)
+			_, _ = db.MetricsDB.Exec(`ALTER TABLE security_events_full RENAME TO security_events`)
+		})
+
+		recorder := getRequest(t, router, "/security/events")
+		if recorder.Code != http.StatusInternalServerError {
+			t.Fatalf("status=%d body=%s, want 500", recorder.Code, recorder.Body.String())
+		}
+		body := recorder.Body.String()
+		if !strings.Contains(body, "安全事件查询失败") {
+			t.Fatalf("body=%s, want 泛化文案「安全事件查询失败」", body)
+		}
+		if strings.Contains(body, "no such column") || strings.Contains(body, "SQL logic error") {
+			t.Fatalf("body=%s, 不得向登录用户泄露存储层错误文本", body)
+		}
+	})
+
+	t.Run("降级响应回显请求分页值", func(t *testing.T) {
+		setupSecurityPolicyTestDB(t)
+		router := newSecurityEventsRouter(t)
+		orig := db.MetricsDB
+		db.MetricsDB = nil
+		t.Cleanup(func() { db.MetricsDB = orig })
+
+		recorder := getRequest(t, router, "/security/events?page=3&page_size=7")
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
+		}
+		var payload struct {
+			Data struct {
+				Page     int `json:"page"`
+				PageSize int `json:"page_size"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.Data.Page != 3 || payload.Data.PageSize != 7 {
+			t.Fatalf("降级响应分页=(%d,%d), want (3,7)（回显请求值）", payload.Data.Page, payload.Data.PageSize)
+		}
+	})
+}
+
+// 列表 16KB 裁剪与采集 64KB 裁剪的丢弃计数键分离：采集计数键原样保留，
+// 列表裁剪计入独立键（前端按来源分文案——并入同一键会把 16KB 列表裁剪
+// 误标为「超出 64KB 采集上限」）。
+func TestTruncateEventListHeaders_listDropsUseSeparateKey(t *testing.T) {
+	headers := map[string][]string{
+		securityEventDroppedHeadersKey: {"2"}, // 采集侧已丢弃 2 条
+		"Host":                         {"a.example.com"},
+	}
+	// 大量长键名短值头：键名开销本身超 16KB（值裁剪救不回），强制走丢条目路径。
+	for i := range 2000 {
+		headers["X-Trace-Header-"+strings.Repeat("k", 40)+"-"+time.Duration(i).String()] = []string{"v"}
+	}
+	raw, err := json.Marshal(headers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) <= securityEventListFieldCap {
+		t.Fatalf("夹具必须超过列表上限: %d", len(raw))
+	}
+	got := truncateEventListHeaders(string(raw))
+	if len(got) > securityEventListFieldCap {
+		t.Fatalf("截断后 len=%d 超过列表上限 %d", len(got), securityEventListFieldCap)
+	}
+	var roundTrip map[string][]string
+	if err := json.Unmarshal([]byte(got), &roundTrip); err != nil {
+		t.Fatalf("列表截断必须保持合法 JSON: %v", err)
+	}
+	if values := roundTrip[securityEventDroppedHeadersKey]; len(values) != 1 || values[0] != "2" {
+		t.Fatalf("采集 64KB 计数键必须原样保留（不并入）: %v", roundTrip)
+	}
+	if values := roundTrip[securityEventListDroppedHeadersKey]; len(values) != 1 || values[0] == "" || values[0] == "0" {
+		t.Fatalf("列表 16KB 裁剪必须计入独立键: %v", roundTrip)
+	}
+}
+
+// 结构化头截断的按条目预算分支：单个头值超限但键名开销可容纳时，必须裁剪
+// 值（rune 边界 + 省略号）并保持 JSON 可解析——直接字节截断会产出半截 JSON，
+// 前端解析失败后整块退化为原文，头表/多值/敏感掩码全部失效。
+func TestTruncateEventListHeaders_structuredValueTrimKeepsJSON(t *testing.T) {
+	headers := map[string][]string{
+		"Host":   {"a.example.com"},
+		"X-Long": {strings.Repeat("v", 20*1024)},
+	}
+	raw, err := json.Marshal(headers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) <= securityEventListFieldCap {
+		t.Fatalf("夹具必须超过列表上限: %d", len(raw))
+	}
+
+	got := truncateEventListHeaders(string(raw))
+
+	if len(got) > securityEventListFieldCap {
+		t.Fatalf("截断后 len=%d 超过列表上限 %d", len(got), securityEventListFieldCap)
+	}
+	var roundTrip map[string][]string
+	if err := json.Unmarshal([]byte(got), &roundTrip); err != nil {
+		t.Fatalf("按条目裁剪必须保持合法 JSON: %v", err)
+	}
+	if values := roundTrip["Host"]; len(values) != 1 || values[0] != "a.example.com" {
+		t.Fatalf("短头必须原样保留: %v", roundTrip["Host"])
+	}
+	longValues := roundTrip["X-Long"]
+	if len(longValues) != 1 {
+		t.Fatalf("超限头必须保留值条目: %v", longValues)
+	}
+	if len(longValues[0]) >= 20*1024 || !strings.HasSuffix(longValues[0], "…") {
+		t.Fatalf("超限头值必须裁剪并追加省略号（len=%d）", len(longValues[0]))
+	}
+	if _, dropped := roundTrip[securityEventListDroppedHeadersKey]; dropped {
+		t.Fatalf("值裁剪不应丢弃条目（不应出现列表丢弃计数键）: %v", roundTrip)
+	}
+}
+
+// 结构化头截断的总量分支：多条目（含单键多值形态）合计超限时，逐条目等额
+// 预算裁剪后仍必须保持全键集与合法 JSON，且不得字节截断为非 JSON 原文。
+func TestTruncateEventListHeaders_structuredTotalOverCapKeepsAllKeys(t *testing.T) {
+	headers := map[string][]string{
+		"X-Multi": make([]string, 0, 100),
+	}
+	for range 100 {
+		headers["X-Multi"] = append(headers["X-Multi"], strings.Repeat("m", 500))
+	}
+	for i := range 30 {
+		headers["X-Entry-"+time.Duration(i).String()] = []string{strings.Repeat("e", 800)}
+	}
+	raw, err := json.Marshal(headers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) <= securityEventListFieldCap {
+		t.Fatalf("夹具必须超过列表上限: %d", len(raw))
+	}
+
+	got := truncateEventListHeaders(string(raw))
+
+	if len(got) > securityEventListFieldCap {
+		t.Fatalf("截断后 len=%d 超过列表上限 %d", len(got), securityEventListFieldCap)
+	}
+	var roundTrip map[string][]string
+	if err := json.Unmarshal([]byte(got), &roundTrip); err != nil {
+		t.Fatalf("总量裁剪必须保持合法 JSON: %v", err)
+	}
+	if len(roundTrip) != len(headers) {
+		t.Fatalf("键集必须全部保留（got %d, want %d）", len(roundTrip), len(headers))
+	}
+	for key, values := range roundTrip {
+		if len(values) != len(headers[key]) {
+			t.Fatalf("头 %s 值条目数变化: %d → %d", key, len(headers[key]), len(values))
+		}
+		for _, value := range values {
+			if len(value) > len(headers[key][0]) {
+				t.Fatalf("头 %s 的值被放大: %d 字节", key, len(value))
+			}
+		}
+	}
+	if got := roundTrip["X-Multi"]; len(got) == 0 || !strings.HasSuffix(got[0], "…") {
+		t.Fatalf("多值头必须逐值裁剪并追加省略号: len=%d", len(got))
+	}
+}
+
+// 结构化请求体截断的 base64 分支：载荷必须按 4 字符对齐切分并统一改写为
+// base64-truncated: 前缀——否则前端 atob 抛错，正文整块退化为原文。
+func TestTruncateEventListBody_base64PayloadAlignment(t *testing.T) {
+	for _, input := range []string{
+		"base64:" + strings.Repeat("A", 20*1024),
+		"base64-truncated:" + strings.Repeat("A", 20*1024),
+	} {
+		got := truncateEventListBody(input)
+
+		if len(got) > securityEventListFieldCap {
+			t.Fatalf("截断后 len=%d 超过列表上限 %d", len(got), securityEventListFieldCap)
+		}
+		const prefix = "base64-truncated:"
+		if !strings.HasPrefix(got, prefix) {
+			t.Fatalf("base64 载荷截断后必须统一前缀 %q: %.24q", prefix, got)
+		}
+		payload := strings.TrimPrefix(got, prefix)
+		if len(payload)%4 != 0 {
+			t.Fatalf("base64 载荷必须 4 字符对齐（len=%d）", len(payload))
+		}
+		if _, err := base64.StdEncoding.DecodeString(payload); err != nil {
+			t.Fatalf("截断后的 base64 载荷必须可解码: %v", err)
+		}
 	}
 }

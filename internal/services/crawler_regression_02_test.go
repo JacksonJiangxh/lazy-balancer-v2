@@ -19,7 +19,7 @@ import (
 
 // so360spider 官方五段全覆盖的最小合法集合（每段至少 1/8 地址空间，
 // 与官方页发布粒度一致：官方 /21 摘要段内官方页只公布两个 /24）。
-var crawlerAudit86FullCoverage = []string{
+var crawlerFullCoverage = []string{
 	"42.236.10.0/24", "42.236.17.0/24", "42.236.101.0/24",
 	"180.153.236.0/24", "180.163.220.0/24",
 }
@@ -35,11 +35,11 @@ func TestValidateCrawlerEntriesSanity_supernetRejected(t *testing.T) {
 
 func TestValidateCrawlerEntriesSanity_subsetAndCoverage(t *testing.T) {
 	// 目标形状：每条 ⊆ 官方段且五段全覆盖 → 放行。
-	got, err := validateCrawlerEntriesSanity("so360spider", append([]string(nil), crawlerAudit86FullCoverage...))
+	got, err := validateCrawlerEntriesSanity("so360spider", append([]string(nil), crawlerFullCoverage...))
 	if err != nil {
 		t.Fatalf("全覆盖子集必须放行: %v", err)
 	}
-	if len(got) != len(crawlerAudit86FullCoverage) {
+	if len(got) != len(crawlerFullCoverage) {
 		t.Fatalf("filtered=%v, want 全部保留", got)
 	}
 
@@ -53,7 +53,7 @@ func TestValidateCrawlerEntriesSanity_subsetAndCoverage(t *testing.T) {
 		t.Fatal("与官方段无关的解析结果必须拒绝")
 	}
 	// 混合形状：无关条目滤除、官方子集保留但缺段 → 覆盖门拒绝。
-	mixed := append([]string{"203.0.113.0/24"}, crawlerAudit86FullCoverage[:4]...)
+	mixed := append([]string{"203.0.113.0/24"}, crawlerFullCoverage[:4]...)
 	if _, err := validateCrawlerEntriesSanity("so360spider", mixed); err == nil {
 		t.Fatal("缺一段官方覆盖的名单必须拒绝")
 	}
@@ -65,7 +65,7 @@ func TestValidateCrawlerEntriesSanity_jsonSourceAlsoGated(t *testing.T) {
 	if _, err := validateCrawlerEntriesSanity("so360spider", []string{"42.236.8.0/20"}); err == nil {
 		t.Fatal("JSON 源的超网条目同样必须拒绝")
 	}
-	if _, err := validateCrawlerEntriesSanity("so360spider", append([]string(nil), crawlerAudit86FullCoverage...)); err != nil {
+	if _, err := validateCrawlerEntriesSanity("so360spider", append([]string(nil), crawlerFullCoverage...)); err != nil {
 		t.Fatalf("JSON 源的合法子集必须放行: %v", err)
 	}
 }
@@ -76,10 +76,10 @@ func TestCrawlerSnapshotShrinkGuard(t *testing.T) {
 	_, database := newClusterTestService(t)
 
 	// 无 DB 行 → 基线=内置首版（so360spider 5 条）：2 条（<5/2）拒绝，3 条放行。
-	if err := crawlerSnapshotShrinkGuard("so360spider", 2); err == nil {
+	if err := crawlerSnapshotShrinkGuard("so360spider", 2, nil); err == nil {
 		t.Fatal("较内置基线收缩过半必须拒绝")
 	}
-	if err := crawlerSnapshotShrinkGuard("so360spider", 3); err != nil {
+	if err := crawlerSnapshotShrinkGuard("so360spider", 3, nil); err != nil {
 		t.Fatalf("收缩未过半必须放行: %v", err)
 	}
 
@@ -99,15 +99,15 @@ func TestCrawlerSnapshotShrinkGuard(t *testing.T) {
 		VALUES (?, '', '搜索引擎爬虫', ?, 1, datetime('now'), datetime('now'))`, CrawlerIPListName("so360spider"), sb.String()); err != nil {
 		t.Fatalf("seed crawler list: %v", err)
 	}
-	if err := crawlerSnapshotShrinkGuard("so360spider", 4); err == nil {
+	if err := crawlerSnapshotShrinkGuard("so360spider", 4, nil); err == nil {
 		t.Fatal("较 DB 快照收缩过半必须拒绝")
 	}
-	if err := crawlerSnapshotShrinkGuard("so360spider", 5); err != nil {
+	if err := crawlerSnapshotShrinkGuard("so360spider", 5, nil); err != nil {
 		t.Fatalf("恰好半数必须放行: %v", err)
 	}
 
 	// 未知引擎（无内置基线、无 DB 行）→ 无对照口径，放行。
-	if err := crawlerSnapshotShrinkGuard("unknown-engine", 1); err != nil {
+	if err := crawlerSnapshotShrinkGuard("unknown-engine", 1, nil); err != nil {
 		t.Fatalf("无基线引擎不得误拦: %v", err)
 	}
 }
@@ -128,12 +128,12 @@ func TestValidateCrawlerEntriesSanity_singleIPCannotCoverPrefix(t *testing.T) {
 	}
 
 	// 官方页真实形状（/21 摘要段内一个 /24 = 恰好 1/8）+ 其余四段全覆盖 → 放行。
-	if _, err := validateCrawlerEntriesSanity("so360spider", append([]string(nil), crawlerAudit86FullCoverage...)); err != nil {
+	if _, err := validateCrawlerEntriesSanity("so360spider", append([]string(nil), crawlerFullCoverage...)); err != nil {
 		t.Fatalf("每段 ≥1/8 地址空间（官方页粒度）必须放行: %v", err)
 	}
 
 	// 低于 1/8：/21 内只给 /25（1/128）→ 拒绝：部分名单不得整体替换。
-	below := append([]string(nil), crawlerAudit86FullCoverage...)
+	below := append([]string(nil), crawlerFullCoverage...)
 	below[0] = "42.236.10.0/25"
 	if _, err := validateCrawlerEntriesSanity("so360spider", below); err == nil {
 		t.Fatal("官方 /21 的 1/128 地址覆盖不得通过覆盖门（部分名单）")
@@ -141,22 +141,22 @@ func TestValidateCrawlerEntriesSanity_singleIPCannotCoverPrefix(t *testing.T) {
 
 	// 并集口径：两条 /24 = /21 的 1/4 → 放行；两条 /28 = 1/128 → 拒绝
 	// （按并集地址空间累计，不是单条判定）。
-	unionPass := append([]string{"42.236.8.0/24", "42.236.9.0/24"}, crawlerAudit86FullCoverage[1:]...)
+	unionPass := append([]string{"42.236.8.0/24", "42.236.9.0/24"}, crawlerFullCoverage[1:]...)
 	if _, err := validateCrawlerEntriesSanity("so360spider", unionPass); err != nil {
 		t.Fatalf("并集覆盖 /21 的 1/4 必须放行: %v", err)
 	}
-	unionFail := append([]string{"42.236.8.0/28", "42.236.8.16/28"}, crawlerAudit86FullCoverage[1:]...)
+	unionFail := append([]string{"42.236.8.0/28", "42.236.8.16/28"}, crawlerFullCoverage[1:]...)
 	if _, err := validateCrawlerEntriesSanity("so360spider", unionFail); err == nil {
 		t.Fatal("并集仅覆盖 /21 的 1/128 必须拒绝")
 	}
 
 	// 阈值含等号：/24 官方段内单条 /27（=1/8）放行，/28（=1/16）拒绝。
-	atThreshold := append([]string(nil), crawlerAudit86FullCoverage...)
+	atThreshold := append([]string(nil), crawlerFullCoverage...)
 	atThreshold[1] = "42.236.17.0/27"
 	if _, err := validateCrawlerEntriesSanity("so360spider", atThreshold); err != nil {
 		t.Fatalf("恰好 1/8 覆盖必须放行: %v", err)
 	}
-	underThreshold := append([]string(nil), crawlerAudit86FullCoverage...)
+	underThreshold := append([]string(nil), crawlerFullCoverage...)
 	underThreshold[1] = "42.236.17.0/28"
 	if _, err := validateCrawlerEntriesSanity("so360spider", underThreshold); err == nil {
 		t.Fatal("/24 官方段内仅 /28（1/16）必须拒绝")
@@ -175,17 +175,17 @@ func TestCrawlerSnapshotGrowthGuard(t *testing.T) {
 	}
 
 	// 相对门：内置基线 googlebot=170 条 → 341 条（>2×）拒绝，340 条放行。
-	if err := crawlerSnapshotGrowthGuard("googlebot", 341); err == nil {
+	if err := crawlerSnapshotGrowthGuard("googlebot", 341, nil); err == nil {
 		t.Fatal("较内置基线膨胀一倍以上必须拒绝")
 	}
-	if err := crawlerSnapshotGrowthGuard("googlebot", 340); err != nil {
+	if err := crawlerSnapshotGrowthGuard("googlebot", 340, nil); err != nil {
 		t.Fatalf("膨胀未超一倍必须放行: %v", err)
 	}
 	// 绝对门：无对照基线的引擎同样受 2000 条上限约束。
-	if err := crawlerSnapshotGrowthGuard("unknown-engine", CrawlerIPListEntryCap+1); err == nil {
+	if err := crawlerSnapshotGrowthGuard("unknown-engine", CrawlerIPListEntryCap+1, nil); err == nil {
 		t.Fatal("超过 2000 条绝对上限必须拒绝（无基线不是豁免理由）")
 	}
-	if err := crawlerSnapshotGrowthGuard("unknown-engine", CrawlerIPListEntryCap); err != nil {
+	if err := crawlerSnapshotGrowthGuard("unknown-engine", CrawlerIPListEntryCap, nil); err != nil {
 		t.Fatalf("恰好 2000 条必须放行: %v", err)
 	}
 
@@ -208,18 +208,18 @@ func TestCrawlerSnapshotGrowthGuard(t *testing.T) {
 		VALUES (?, '', '搜索引擎爬虫', ?, 1, datetime('now'), datetime('now'))`, CrawlerIPListName("googlebot"), sb.String()); err != nil {
 		t.Fatalf("seed crawler list: %v", err)
 	}
-	if err := crawlerSnapshotGrowthGuard("googlebot", CrawlerIPListEntryCap+1); err == nil {
+	if err := crawlerSnapshotGrowthGuard("googlebot", CrawlerIPListEntryCap+1, nil); err == nil {
 		t.Fatal("DB 基线 1000 条时 2001 条必须拒绝（绝对上限）")
 	}
-	if err := crawlerSnapshotGrowthGuard("googlebot", CrawlerIPListEntryCap); err != nil {
+	if err := crawlerSnapshotGrowthGuard("googlebot", CrawlerIPListEntryCap, nil); err != nil {
 		t.Fatalf("DB 基线 1000 条时 2000 条（恰 2×）必须放行: %v", err)
 	}
-	if err := crawlerSnapshotGrowthGuard("googlebot", 1001); err != nil {
+	if err := crawlerSnapshotGrowthGuard("googlebot", 1001, nil); err != nil {
 		t.Fatalf("未超 2× 基线必须放行: %v", err)
 	}
 }
 
-// 历史修复 集成：源返回 2001 条（> 产品 2000 条上限）时整源失败并保留上次
+// 集成：源返回 2001 条（> 产品 2000 条上限）时整源失败并保留上次
 // 快照——旧实现照单全收，豁免名单被一次性放大到源可返回的最大规模。
 func TestCrawlerRunUpdate_inflatedSourceKeepsPreviousSnapshot(t *testing.T) {
 	_, database := newClusterTestService(t)

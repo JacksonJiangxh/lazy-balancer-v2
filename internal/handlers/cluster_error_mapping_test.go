@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -13,7 +14,7 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// 历史问题：服务层 ErrNotMasterNode → 403 必须与 requireMaster 门同源携带
+// 服务层 ErrNotMasterNode → 403 必须与 requireMaster 门同源携带
 // X-LB-Error-Code: master_required——从端 Pull 的错误分类依赖该头
 // （cluster_sync.go），服务层降级竞态 403 此前不设头造成错误形状分叉。
 func TestClusterNodeAction_forbiddenCarriesMasterRequiredErrorCode(t *testing.T) {
@@ -52,7 +53,7 @@ func TestClusterNodeAction_forbiddenCarriesMasterRequiredErrorCode(t *testing.T)
 	}
 }
 
-// 历史问题（同族收敛）：requireMaster 门路径本身已带头——钉住从节点直连
+// （同族收敛）：requireMaster 门路径本身已带头——钉住从节点直连
 // 节点写端点的 403 形状，防回归。
 func TestUpdateClusterNodeSiteCoordinates_slaveGateCarriesErrorCode(t *testing.T) {
 	router := newClusterNodeSiteRouter(t)
@@ -66,7 +67,7 @@ func TestUpdateClusterNodeSiteCoordinates_slaveGateCarriesErrorCode(t *testing.T
 	}
 }
 
-// 哨兵同源的真实核对（历史问题，历史）：原用例断言
+// 哨兵同源的真实核对：原用例断言
 // errors.Is(sentinel, sentinel) 恒真——零实现耦合，给「防未来误用
 // errors.New 平行实现」的注释承诺提供不了任何保护。改为驱动服务层真实
 // 拒绝：从节点上的节点写操作必须返回同一个 ErrNotMasterNode 哨兵，且该
@@ -79,7 +80,7 @@ func TestClusterNodeAction_forbiddenMappingUsesSentinel(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 服务层真实拒绝：SQL 级角色条件命中 0 行 → 复核角色 → ErrNotMasterNode。
-	serviceErr := h.clusterService.ApproveNode(context.Background(), 1)
+	serviceErr := h.clusterService.ApproveNode(context.Background(), 1, time.Now())
 	if !errors.Is(serviceErr, services.ErrNotMasterNode) {
 		t.Fatalf("服务层错误=%v, want services.ErrNotMasterNode（不得使用平行哨兵）", serviceErr)
 	}

@@ -1,6 +1,6 @@
 package services
 
-// 自动封禁（历史问题）核心行为钉：固定桶计数器（重置语义/上限保护）、摄取
+// 自动封禁核心行为钉：固定桶计数器（重置语义/上限保护）、摄取
 // 提交点喂入门（主节点+启用+口径+WAF 事件）、名单 merge（清到期/保留手动/
 // 已在名单过滤/超限挤最早到期）、重载节流（<60s 暂存合并）、EnabledFn
 // fail-closed、配置校验与口径/窗口变更重置、投影层过期条目过滤。
@@ -616,7 +616,7 @@ func TestAutobanMerge_evictsEarliestExpiringAutobanEntries(t *testing.T) {
 	})
 }
 
-// ---- 容量挤出清桶（历史修复：挤出=解封同语义，否则挤出→下轮重封轮转） ----
+// 容量挤出清桶（挤出=解封同语义，否则挤出→下轮重封轮转） ----
 
 // Given 满容量名单（自动条目）+ 新达标候选触发挤出。
 // When autobanMergeEntries 完成容量收敛。
@@ -745,10 +745,10 @@ func TestAutobanRunCycle_capacityConvergenceListsEvictedIdentities(t *testing.T)
 	}
 }
 
-// ---- 重载节流（历史修复 持锁契约 + 历史修复 三态） ----
+// 重载节流 ----
 
 // Given 重载回调与节流时钟；生产调用方在 CaddyOpLock 临界区内请求重载
-// （历史修复：merge+重载同一临界区，注入回调为 InLock 变体）。
+// （merge+重载同一临界区，注入回调为 InLock 变体）。
 // When 首次请求/节流窗口内再请求/窗口过后 flush。
 // Then 立即重载→暂存→合并执行；三态返回与暂存标记一致。
 func TestAutobanReloadThrottle(t *testing.T) {
@@ -789,7 +789,7 @@ func TestAutobanReloadThrottle(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：重载失败必须留系统审计（来源=自动封禁名单，system 归因）
+// 重载失败必须留系统审计（来源=自动封禁名单，system 归因）
 // +置暂存再武装——下一轮 flush 强制重试；重试成功后补落成功审计。
 func TestAutobanReload_failureAuditsAndRearms(t *testing.T) {
 	f := installAutobanFixture(t, "2026-10-14 10:00:00")
@@ -835,7 +835,7 @@ func TestAutobanReload_failureAuditsAndRearms(t *testing.T) {
 	}
 }
 
-// 历史修复：摘要尾注三态——已重载/暂存/失败；无名单变化为空（不得恒称「已触发」）。
+// 摘要尾注三态——已重载/暂存/失败；无名单变化为空（不得恒称「已触发」）。
 func TestAutobanReloadNote_triState(t *testing.T) {
 	if got := reloadNote(false, autobanReloadApplied); got != "" {
 		t.Fatalf("无变化尾注=%q, want 空", got)
@@ -952,7 +952,7 @@ func TestAutobanObserveBatch_commitPointFeed(t *testing.T) {
 
 // ---- 计数器修剪：未跨阈值的过期桶不产生候选 ----
 
-// 历史修复（历史）回归形状：过期且未跨阈值的桶照常修剪、不产生候选；已跨阈值
+// 回归形状：过期且未跨阈值的桶照常修剪、不产生候选；已跨阈值
 // 的过期桶必须产生候选（正向钉在 TestAutobanRunCycle_expiredBucketStillBans）。
 func TestAutobanCandidates_pruneStaleBuckets(t *testing.T) {
 	f := installAutobanFixture(t, "2026-10-14 10:00:00")
@@ -971,7 +971,7 @@ func TestAutobanCandidates_pruneStaleBuckets(t *testing.T) {
 	}
 }
 
-// ---- 解封清桶（历史修复 同族收敛） ----
+// 解封清桶 ----
 
 // Given 删除 IP 与对照 IP 均达阈值并入名单（真实计数路径）；随后删除 IP 经
 // handlers remove-ip/预置名单差集保存两路径共用的清桶入口解封，对照 IP 仅从
@@ -1445,7 +1445,7 @@ func TestAutobanCandidates_aggregateExpiryLog(t *testing.T) {
 	}
 }
 
-// ---- 历史修复（历史）：merge 读改写+重载与名单写路径同一 CaddyOpLock 临界区 ----
+// merge 读改写+重载与名单写路径同一 CaddyOpLock 临界区 ----
 
 // Given 正式模式、候选达标；CaddyOpLock 被并发「名单写路径」临界区预持
 // （handlers AddIPToList/UpdateIPList 同型：持 CaddyOpLock → 读条目 → 追加 →
@@ -1471,7 +1471,7 @@ func TestAutobanRunCycle_mergeSerializesWithListWriterUnderCaddyOpLock(t *testin
 	select {
 	case err := <-cycleDone:
 		CaddyOpLock.Unlock()
-		t.Fatalf("merge 未与名单写路径互斥（提前完成 err=%v）——AU-1 丢更新窗口", err)
+		t.Fatalf("merge 未与名单写路径互斥（提前完成 err=%v）——丢更新窗口", err)
 	case <-time.After(300 * time.Millisecond):
 	}
 
@@ -1507,13 +1507,13 @@ func TestAutobanRunCycle_mergeSerializesWithListWriterUnderCaddyOpLock(t *testin
 	}
 }
 
-// ---- 历史修复（历史）：批入口一次读配置，scope+window 下传单事件路径 ----
+// 批入口一次读配置，scope+window 下传单事件路径 ----
 
 // Given 库配置窗口=1 分钟。
 // When autobanObserveEventScoped 显式接收下传的 scope/window。
 // Then 窗口内累计、越过下传窗口重置（若回退内层逐事件读库或写死兜底，
 // 2 分钟处仍是同窗口累计，断言即失败）；窗口无效（<=0）跳过计数、无写死
-// 5 分钟兜底（历史修复-③ 同函数落地）。
+// 5 分钟兜底。
 func TestAutobanObserveBatch_scopeAndWindowPassedDown(t *testing.T) {
 	f := installAutobanFixture(t, "2026-10-14 10:00:00")
 	setAutobanConfigRaw(t, true, 100, 1, "1h", "all", true)
@@ -1546,10 +1546,10 @@ func TestAutobanObserveBatch_scopeAndWindowPassedDown(t *testing.T) {
 	}
 }
 
-// ---- 历史修复（历史）：禁用路径收尾——到期清理一次+暂存重载强制收敛 ----
+// 禁用路径收尾——到期清理一次+暂存重载强制收敛 ----
 
 // Given 名单含已到期自动条目/未到期自动条目/手动条目，且存在节流暂存的重载
-// （禁用后无循环 flush 点——历史修复 核心）。
+// （禁用后无循环 flush 点——核心）。
 // When AutobanDisableFlush()（PUT 禁用路径在 StopLoop 前调用）。
 // Then 已到期自动条目立即清除+落「自动解封」审计；暂存重载绕过节流强制执行；
 // 未到期/手动条目保留；暂存标记清除。
@@ -1631,7 +1631,7 @@ func TestAutobanDisableFlush_mergeFailureIsVisible(t *testing.T) {
 	}
 }
 
-// ---- 历史 A 域：历史修复（历史问题）----
+// 历史 A 域：----
 
 func TestAutobanFormalMerge_beyondSuggestionCap(t *testing.T) {
 	installAutobanFixture(t, "2026-10-14 10:00:00")
@@ -1697,7 +1697,7 @@ func TestAutobanFormalMerge_beyondSuggestionCap(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：window(60m) > duration(10m) 时，条目到期解封不得被同一
+// window(60m) > duration(10m) 时，条目到期解封不得被同一
 // 计数桶在 merge 内立即重封——旧实现每轮「清到期 → 从仍跨阈值的桶重封」，
 // 实际封禁被延长到约 window+duration，并产生成对的自动解封/自动封禁审计。
 func TestAutobanMerge_expiredEntryNotRebannedSameRound(t *testing.T) {
@@ -1767,7 +1767,7 @@ func TestAutobanMerge_expiredEntryNotRebannedSameRound(t *testing.T) {
 }
 
 // installFeedHealthTestEngine 装配只含喂入源 daemon 的引擎（StartPaused：默认
-// 调度关闭 = 用户显式停止 / 自愈预算用尽后的共同终态形状）。历史问题-02。
+// 调度关闭 = 用户显式停止 / 自愈预算用尽后的共同终态形状）。。
 func installFeedHealthTestEngine(t *testing.T) *taskengine.Engine {
 	t.Helper()
 	te := taskengine.NewEngine(taskengine.Options{StartPaused: true})
@@ -1788,7 +1788,7 @@ func installFeedHealthTestEngine(t *testing.T) *taskengine.Engine {
 	return te
 }
 
-// 历史问题-02（历史）：计数唯一喂入源（安全事件采集）停摆时必须判降级；
+// 计数唯一喂入源（安全事件采集）停摆时必须判降级；
 // LoopOn=false 是用户显式停止与「自愈用尽后停环」的共同终态，恢复调度即不降级。
 func TestAutobanFeedHealth_reportsStoppedIngestion(t *testing.T) {
 	installAutobanFixture(t, "2026-10-14 10:00:00")
@@ -1815,7 +1815,7 @@ func TestAutobanFeedHealth_reportsStoppedIngestion(t *testing.T) {
 	}
 }
 
-// 历史问题-02：喂入源停摆时 RunAutobanCycle 仍正常收尾（只做可见性），但必须留
+// 喂入源停摆时 RunAutobanCycle 仍正常收尾（只做可见性），但必须留
 // WARN 转换行 + 每轮摘要停摆注记；恢复后记一次恢复行且摘要不再带注记。
 func TestRunAutobanCycle_surfacesFeedDegraded(t *testing.T) {
 	installAutobanFixture(t, "2026-10-14 10:00:00")
@@ -1859,9 +1859,9 @@ func TestRunAutobanCycle_surfacesFeedDegraded(t *testing.T) {
 	}
 }
 
-// —— 禁用收尾不清到期计数桶（历史修复，历史） ——
+// 禁用收尾不清到期计数桶 ——
 
-// 禁用收尾的到期解封必须同步清计数桶（与 Run 轮 历史问题 同语义）：否则窗口内
+// 禁用收尾的到期解封必须同步清计数桶（与 Run 轮同语义）：否则窗口内
 // 重新启用且零新流量时旧计数仍 ≥ 阈值，下一轮立即重封刚解封的 IP。
 // 未到期条目的桶不得清（仅到期解封同步清桶）。
 func TestAutobanDisableFlush_forgetsExpiredCounters(t *testing.T) {

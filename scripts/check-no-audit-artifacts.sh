@@ -1,51 +1,255 @@
 #!/usr/bin/env bash
-# 公网仓库守卫：审计过程记录与轮次测试不得入库。
-# 历史文件已迁移到私有审计仓。本脚本由 CI（test-all）与发布链调用。
+# 公网仓库守卫：审计过程记录、轮次测试与审计编号不得入库。
+# 历史审计产物在私有审计仓；本脚本由 scripts/test-all.sh 与发布链调用。
+#
+# 三条独立通道，任一命中即失败：
+#   1) 路径：审计报告目录与轮次测试文件名（Go/TS）——受控文件与未跟踪文件同扫，
+#      仅跳过 .gitignore 已忽略者与构建/运行产物目录；
+#   2) 内容：注释行与测试声明行里的审计编号/轮次元数据——覆盖 Go/TS/Vue/JS/CSS/
+#      Markdown/Shell/YAML/SQL/go.mod/Dockerfile/docker-entrypoint.sh/
+#      .dockerignore/Caddyfile；
+#   3) 跨行拆字：“第”与“轮”之间被换行拆开书写同样命中（编号拆成两行不可绕过）。
+#
+# 误报收窄：白名单只锚定“审计编号形态”，不按裸数字判罚。百分位 P50/P95/P99、
+# 版本串 v2.3.x、sha256/十六进制摘要、HTTP/3、TLS 1.3、PID1、X509、ED25519、
+# HS256、LBF1 文件魔数等产品 token 不触发（见内嵌扫描器的 SHIELD 与纯十六进制
+# 令牌过滤）。
+#
+# 用法：bash scripts/check-no-audit-artifacts.sh [--self-test]
 set -euo pipefail
-cd "$(dirname "$0")/.."
+
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+
+if [[ "${1:-}" == "--self-test" ]]; then
+  exec bash "$script_dir/tests/guard-selftest.sh"
+fi
+
+cd "$script_dir/.."
 
 # fail-closed：必须在 git 检出内运行——非 git 上下文无法枚举受控文件，拒绝静默通过。
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "ERROR: 必须在 git 检出内运行本守卫（git rev-parse 失败，拒绝静默通过）" >&2
   exit 1
 fi
-if ! tracked=$(git ls-files); then
+if ! controlled=$(git ls-files --cached --others --exclude-standard); then
   echo "ERROR: git ls-files 失败——必须在 git 检出内运行本守卫" >&2
   exit 1
 fi
 
-# 文件名分支：轮次测试文件 + 审计报告/记录文件（含 .md 形态）。
-patterns='(^|/)docs/audit/|(^|/)(audit[0-9]+|audit_round[0-9]+|r[0-9]+|round[0-9]+)[^/]*(_test\.(go|ts)|\.spec\.ts)$|(^|/)[^/]*_(audit[0-9]+|r[0-9]+|round[0-9]+)[^/]*(_test\.(go|ts)|\.spec\.ts)$|(^|/)[^/]*_(r|round)[0-9]+[^/]*(_test\.(go|ts)|\.spec\.ts)$|(^|/)[^/]*(audit|round|审计)[-_]?[0-9]+[^/]*\.(md|markdown|txt)$'
-bad=$(printf '%s\n' "$tracked" | grep -E "$patterns" || true)
-if [[ -n "$bad" ]]; then
-  echo "ERROR: 审计记录/轮次测试不得提交到公网仓库：" >&2
-  echo "$bad" >&2
+# 构建产物/运行数据/本地工具目录一律不入扫描面（.gitignore 已覆盖大部分，
+# 这里再显式声明一次：守卫不依赖 .gitignore 的完整性来避免扫描噪声）。
+skip_re='^(\.git/|(.*/)?node_modules/|(.*/)?dist/|ui/|(.*/)?backup[^/]*/|(.*/)?data[^/]*/|(.*/)?logs[^/]*/|(.*/)?certs[^/]*/|(.*/)?waf[^/]*/|test-ui/|test-data/|(\.(omp|agent|superpowers|omo|sisyphus|opencode|worktrees|playwright-mcp))/)'
+
+# ---------------------------------------------------------------------------
+# 审计产物路径模式——单一事实源。
+# 每条 = “<.gitignore 行><TAB><检测正则>”。.gitignore 的审计排除块必须与第一列
+# 逐行一致（双向校验：多一行、少一行、改一行都失败），检测正则取第二列并集。
+# 新增形态时两列同时加。
+# ---------------------------------------------------------------------------
+audit_path_rules=(
+  $'docs/audit/\t^docs/audit/'
+  $'**/audit[0-9]*_test.go\t(^|/)audit[0-9]+[^/]*_test\\.go$'
+  $'**/*_audit[0-9]*_test.go\t(^|/)[^/]+_audit[0-9]+[^/]*_test\\.go$'
+  $'**/audit_round[0-9]*_test.go\t(^|/)audit_round[0-9]+[^/]*_test\\.go$'
+  $'**/r[0-9]*_test.go\t(^|/)r[0-9]+[^/]*_test\\.go$'
+  $'**/round[0-9]*_test.go\t(^|/)round[0-9]+[^/]*_test\\.go$'
+  $'**/*_r[0-9]*_test.go\t(^|/)[^/]+_r[0-9]+[^/]*_test\\.go$'
+  $'**/*_round[0-9]*_test.go\t(^|/)[^/]+_round[0-9]+[^/]*_test\\.go$'
+  $'**/*audit[0-9]*\t(^|/)[^/]*audit[0-9][^/]*'
+  $'**/*round[0-9]*\t(^|/)[^/]*round[0-9][^/]*'
+  $'**/*audit[0-9]*/\t(^|/)[^/]*audit[0-9][^/]*'
+  $'**/*round[0-9]*/\t(^|/)[^/]*round[0-9][^/]*'
+)
+
+path_regex=""
+ignore_expected=""
+for rule in "${audit_path_rules[@]}"; do
+  ignore_expected+="${rule%%$'\t'*}"$'\n'
+  re="${rule#*$'\t'}"
+  path_regex+="${path_regex:+|}(${re})"
+done
+
+# —— .gitignore 与模式表双向一致 ——
+begin_marker='# >>> audit-artifact patterns'
+end_marker='# <<< audit-artifact patterns'
+if ! grep -qxF "$begin_marker" .gitignore || ! grep -qxF "$end_marker" .gitignore; then
+  echo "ERROR: .gitignore 缺少审计排除块标记（${begin_marker} / ${end_marker}）" >&2
+  exit 1
+fi
+if [[ "$(grep -cxF "$begin_marker" .gitignore)" != "1" || "$(grep -cxF "$end_marker" .gitignore)" != "1" ]]; then
+  echo "ERROR: .gitignore 审计排除块标记重复" >&2
   exit 1
 fi
 
-# 内容分支：只扫注释行（含 Vue <!-- --> 与 SQL 内嵌 -- 注释）与测试函数/用例名行；
-# 测试夹具字符串（域名/UA/IP/时间戳文件名等数据）不扫。
-#
-# 审计编号家族通式（历史出现过的全部形态）：
-#   (a) 字母+数字+短横线段：CI87-09 / LB42-3 / W87-01 / D1-S3 / L06-01 / B43-3-3 / U13-05
-#   (b) 多短横线段：SSA-87-01 / FE40-D1-5 / SVC-80-D1-01 / LBH-B-U1 / H-B1-06
-# 合法产品 token 天然不满足（a）——其首段无数字（UTF-8/SHA-256/REQUEST-942/X-LB-*/DNS-01
-# 等先经 shield 剥离后再匹配，双保险）。
-shield='X-[A-Za-z][A-Za-z0-9-]*|REQUEST-[0-9A-Z-]*|RESPONSE-[0-9A-Z-]*|UTF-8|SHA-256|HMAC-SHA256|DNS-01|A-Za-z0-9|YYYY-MM-DD|NOT-NULL|NULL-[a-z]+|BY-DESIGN|TOP-LEVEL|HTTP-only|TCP-only|HTTP-date|TLS-enabled|TLS-only|VERSION-only|JSON-[A-Za-z]*|IP-control|IP-level|ACME-issued|UPSERT-overwritten|AB-BA|WEB-VIEWS-CORE|P-256|UTC-4|MM-DD|DOM-TOM|CRS-active|P[0-9]{2}(-P?[0-9]{2})?'
-family='[A-Z][A-Za-z]{0,7}[0-9][0-9A-Za-z]*(-[0-9A-Za-z]+)+|[A-Z]{2,8}(-[0-9A-Za-z]+){2,}'
-legacy='第 ?[0-9]+(\.[0-9]+)? ?轮|(^|[^A-Za-z])(Round ?[0-9]+|R[0-9]{2}|A[0-9]{2}|Audit[0-9]+|SYS[0-9]+|SEC[0-9]+|HP[0-9]+|CL[0-9]+)([^A-Za-z0-9]|$)|审计 [0-9]{2}|审计 [A-Z][0-9]|二十(一|二|三|四|五|六|七|八|九)?次|[A-Za-z][A-Za-z0-9]*-?历史(问题|修复)|历史(问题|修复) [A-Z][0-9]'
-lines='^[[:space:]]*(//|\*|/\*|<!--|--)|^[[:space:]]*func Test|^[[:space:]]*(test|it|describe)\('
-set +e
-content=$(git grep -nE "$lines" -- '*.go' '*.ts' '*.vue' '*.js' '*.css' | sed -E "s/($shield)//g" | grep -E "($family|$legacy)")
-rc=$?
-set -e
-if [[ $rc -gt 1 ]]; then
-  echo "ERROR: git grep 失败（exit=$rc）——必须在 git 检出内运行本守卫" >&2
+actual_ignore="$(awk -v b="$begin_marker" -v e="$end_marker" '$0==b{f=1;next} $0==e{f=0} f' .gitignore | sed '/^[[:space:]]*$/d')"
+expected_ignore="$(printf '%s' "$ignore_expected" | sed '/^[[:space:]]*$/d')"
+if [[ "$(printf '%s\n' "$actual_ignore" | LC_ALL=C sort -u)" != "$(printf '%s\n' "$expected_ignore" | LC_ALL=C sort -u)" ]]; then
+  echo "ERROR: .gitignore 审计排除块与本脚本模式表不一致（两侧模式集必须一一对应）：" >&2
+  diff <(printf '%s\n' "$expected_ignore" | LC_ALL=C sort -u) \
+       <(printf '%s\n' "$actual_ignore" | LC_ALL=C sort -u) | sed 's/^/  /' >&2 || true
   exit 1
 fi
-if [[ -n "$content" ]]; then
-  echo "ERROR: 审计编号/轮次元数据不得提交到公网仓库：" >&2
-  echo "$content" >&2
+
+# —— 通道 1：路径 ——
+bad_paths="$(printf '%s\n' "$controlled" | grep -v -E "$skip_re" | grep -E "$path_regex" || true)"
+if [[ -n "$bad_paths" ]]; then
+  echo "ERROR: 审计记录/轮次测试不得提交到公网仓库：" >&2
+  echo "$bad_paths" >&2
   exit 1
 fi
+
+# —— 通道 2/3：内容与跨行拆字（内嵌扫描器）——
+# 扫描面：受控 + 未跟踪（已按 .gitignore 与 skip_re 过滤）。
+# 内容扫描豁免：仅限自检脚本（其内容即被测样本）。豁免面必须是显式单条——
+# 数组长度断言防止它悄悄长成漏检通道。
+content_exempt_paths=(scripts/tests/guard-selftest.sh)
+if [[ ${#content_exempt_paths[@]} -ne 1 ]]; then
+  echo "ERROR: 内容扫描豁免面必须恰好一条，实际：${content_exempt_paths[*]}" >&2
+  exit 1
+fi
+content_exempt="^$(printf '%s' "${content_exempt_paths[0]}" | sed 's/[.]/\\./g')$"
+
+scan_targets="$(printf '%s\n' "$controlled" \
+  | grep -v -E "$skip_re" \
+  | grep -v -E "$content_exempt" \
+  | grep -E '\.(go|ts|vue|js|css|md|markdown|txt|sh|yml|yaml|sql|mod)$|(^|/)(Dockerfile[^/]*|docker-entrypoint\.sh|\.dockerignore|Caddyfile)$' \
+  | while IFS= read -r f; do [[ -f "$f" ]] && printf '%s\n' "$f"; done || true)"
+
+if [[ -n "$scan_targets" ]]; then
+  # 内容/跨行扫描器用 perl 实现（跨行拆字需要整文件匹配；BSD grep 无 -P/-z
+  # 等价能力）。缺 perl 时 fail-closed——不允许退化成只做行级扫描而静默通过。
+  if ! command -v perl >/dev/null 2>&1; then
+    echo "ERROR: 需要 perl 才能运行内容扫描（缺少 perl，拒绝静默通过）" >&2
+    exit 1
+  fi
+  scan_prog="$(mktemp "${TMPDIR:-/tmp}/audit-guard-scan.XXXXXX.pl")"
+  list_file="$(mktemp "${TMPDIR:-/tmp}/audit-guard-files.XXXXXX")"
+  trap 'rm -f "$scan_prog" "$list_file"' EXIT
+
+  cat >"$scan_prog" <<'PERL'
+use strict;
+use warnings;
+
+# SHIELD：产品 token 先剥离，再匹配审计编号形态。剥离而非排除整行——同一行里
+# 既有产品 token 又有审计编号时仍须命中。
+my $shield = join '|',
+  q{X-[A-Za-z][A-Za-z0-9-]*},            # X-LB-* 自定义头
+  q{REQUEST-[0-9A-Z-]*}, q{RESPONSE-[0-9A-Z-]*},
+  q{HTTP/[0-9.]+}, q{HTTP[0-9]},         # HTTP/3、HTTP2
+  q{TLS[ ]?v?[0-9]+(\.[0-9]+)?}, q{QUIC[ ]?v?[0-9.]+},
+  q{IPV[46]}, q{UTF-?8}, q{SHA-?[0-9]{3}}, q{HMAC-SHA256},
+  q{(?:HS|RS|ES|PS|EdDSA)[0-9]{3}},      # JWT/PKI 算法名
+  q{ED25519}, q{X25519}, q{X509}, q{P-256}, q{P256},
+  q{AES-?[0-9]{3}(-GCM)?}, q{BASE64}, q{MD5},
+  q{P[0-9]{2}(-P?[0-9]{2})?},            # P50/P95/P99 与 P50-P99 百分位
+  q{v[0-9]+\.[0-9]+(?:\.[0-9x*]+)*(?:-[A-Za-z0-9.]+)?},  # 版本串 v2.3.x / v2.3.8-beta
+  q{A-Za-z0-9}, q{YYYY-MM-DD}, q{NOT-NULL}, q{NULL-[a-z]+},
+  q{BY-DESIGN}, q{TOP-LEVEL}, q{HTTP-only}, q{TCP-only}, q{HTTP-date},
+  q{TLS-enabled}, q{TLS-only}, q{VERSION-only}, q{JSON-[A-Za-z]*},
+  q{IP-control}, q{IP-level}, q{ACME-issued}, q{UPSERT-overwritten},
+  q{AB-BA}, q{WEB-VIEWS-CORE}, q{UTC-[0-9]+}, q{MM-DD}, q{DOM-TOM},
+  q{Apache-[0-9.]+}, q{CVE-[0-9]+(?:-[0-9]+)*}, q{RFC-?[0-9]+}, q{ISO-[0-9]+},
+  q{HTTP-[0-9.]+}, q{TLS-[0-9.]+},
+  q{CRS-active}, q{LBF1}, q{PID1}, q{DNS-01},
+  q{[A-F0-9]{16,}};                      # 长十六进制摘要（逐段哈希/指纹）
+
+# 审计编号家族（历史出现过的全部形态）：
+#   (a) 字母+数字开头，后接一段或多段短横线分段（序数-序号，或前缀-序数-序号）；
+#   (b) 纯大写字母前缀 + 两段以上短横线分段（前缀-序数-序号）。
+my $fam = q{[A-Z][A-Za-z]{0,7}[0-9][0-9A-Za-z]*(-[0-9A-Za-z]+)+}
+        . q{|[A-Z]{2,8}(-[0-9A-Za-z]+){2,}}
+        . q{|\b[A-Z][A-Za-z]{1,7}-[A-Z]{0,2}[0-9]{1,3}\b};
+
+# 轮次/编号的其它书写形态：中文轮次、审计序数、round/audit 前缀、R 两位数、
+# A 两位数、SYS/SEC/HP/CL 前缀，以及编号紧邻“裁定”的审计结论引用。
+my $legacy = join '|',
+  '\xe7\xac\xac[ \t]*[0-9]+(?:\.[0-9]+)?[ \t]*\xe8\xbd\xae(?![\xe6\x92\xad\xe8\xaf\xa2])',
+  '\xe5\xae\xa1\xe8\xae\xa1[ \t]*[0-9]{2,3}(?![0-9])',
+  '(?i:\b(?:round|audit))[-_]?[0-9]{1,3}\b',
+  '\b[Rr][0-9]{2}[a-z]?\b',
+  '\bA[0-9]{2}[A-Za-z]?\b',
+  '\b(?:SYS|SEC|HP|CL)[-_]?[0-9]{1,3}\b',
+  '[A-Z][A-Za-z]{0,4}[0-9]{1,3}[A-Za-z]?[ \t]*\xe8\xa3\x81\xe5\xae\x9a';
+
+# 连写形态（无短横线）：1-5 位大写字母 + 2-3 位数字 + 1-2 位大写字母收尾。
+my $concat = q{\b[A-Z]{1,5}[0-9]{2,3}[A-Z]{1,2}\b};
+
+# 下划线/小驼峰测试名形态：测试前缀 + 编号段 + 下划线接业务描述。
+my $tname = q{\bTest[A-Za-z]{0,3}[0-9]+(?:_[0-9A-Za-z]+)+};
+
+# 跨行拆字：“第”与“轮”被换行隔开的书写无法用行扫描发现，整文件再扫一遍。
+my $cross = join '|',
+  '\xe7\xac\xac[ \t]*\r?\n[ \t]*[0-9]+(?:\.[0-9]+)?[ \t]*\r?\n?[ \t]*\xe8\xbd\xae(?![\xe6\x92\xad\xe8\xaf\xa2])',
+  '\xe7\xac\xac[ \t]*[0-9]+(?:\.[0-9]+)?[ \t]*\r?\n[ \t]*\xe8\xbd\xae(?![\xe6\x92\xad\xe8\xaf\xa2])';
+
+my $comment_re = qr{^[ \t]*(?://|///|\*|/\*|<!--|--|#|;)};
+my $decl_re    = qr{^[ \t]*(?:func (?:Test|Benchmark|Fuzz)|describe\(|test\(|it\(|t\.Run\()};
+
+my $hits = 0;
+sub report {
+  my ($file, $line, $text) = @_;
+  my $where = $line ? "$file:$line" : "$file:cross-line";
+  $text =~ s/\s+$//;
+  print "$where: $text\n";
+  $hits++;
+}
+
+my $list = shift or die "usage: scan <file-list>\n";
+open(my $lf, '<', $list) or die "cannot read file list: $!\n";
+while (my $f = <$lf>) {
+  chomp $f;
+  next if $f eq '';
+  open(my $fh, '<:raw', $f) or do { warn "cannot read $f: $!\n"; $hits++; next };
+  local $/;
+  my $text = <$fh>;
+  close $fh;
+  next if $text =~ /\x00/;               # 二进制文件跳过
+  my $is_doc = ($f =~ /\.(?:md|markdown|txt)$/i);
+
+  $text =~ s/(?:$shield)//g;
+
+  my @lines = split /\n/, $text, -1;
+  for my $i (0 .. $#lines) {
+    my $l = $lines[$i];
+    next unless $is_doc || $l =~ $comment_re || $l =~ $decl_re;
+    my $hit = ($l =~ /$fam/ || $l =~ /$legacy/ || $l =~ /$tname/);
+    if (!$hit && $l =~ /$concat/) {
+      # 纯十六进制字母数字连写不是编号；出现十六进制之外的字母才是编号形态。
+      my @toks = ($l =~ /($concat)/g);
+      $hit = grep { !/^[0-9A-F]+$/ } @toks;
+    }
+    report($f, $i + 1, $l) if $hit;
+  }
+
+  while ($text =~ /$cross/g) {
+    my $snip = substr($text, $-[0], $+[0] - $-[0]);
+    $snip =~ s/\s+/ /g;
+    report($f, 0, $snip);
+  }
+}
+close $lf;
+exit($hits ? 1 : 0);
+PERL
+
+  printf '%s\n' "$scan_targets" >"$list_file"
+
+  set +e
+  scan_out="$(perl "$scan_prog" "$list_file")"
+  scan_rc=$?
+  set -e
+  case "$scan_rc" in
+    0) ;;
+    1)
+      echo "ERROR: 审计编号/轮次元数据不得提交到公网仓库：" >&2
+      echo "$scan_out" >&2
+      exit 1
+      ;;
+    *)
+      echo "ERROR: 内容扫描器异常退出（rc=${scan_rc}）——拒绝静默通过" >&2
+      echo "$scan_out" >&2
+      exit 1
+      ;;
+  esac
+fi
+
 echo "no audit artifacts tracked"

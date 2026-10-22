@@ -92,7 +92,7 @@ func writeTestXDB(t *testing.T, path string, segments []xdbSegment) {
 }
 
 // withIP2RegionPaths points the singleton at the given files and resets the
-// loaded searcher afterwards so tests stay isolated under -shuffle. 历史问题
+// loaded searcher afterwards so tests stay isolated under -shuffle.
 // 起 ValidateGeoIPCountries 以 live searcher 为判据——进入时也必须清空遗留
 // searcher，否则前序测试加载的真实 xdb 会让本测试的 live 判定意外为 loaded。
 func withIP2RegionPaths(t *testing.T, live, dist string) {
@@ -340,12 +340,26 @@ func resetRegionTreeMemoForTest(t *testing.T) {
 	})
 }
 
-// 历史修复(历史):条目数应从 header StartIndexPtr/EndIndexPtr 直读
+// resetProvincesMemoForTest 省份列表记忆化清零（与 resetRegionTreeMemoForTest
+// 同构——切换 live 路径/searcher 的用例必须复位，隔离前序测试残留）。
+func resetProvincesMemoForTest(t *testing.T) {
+	t.Helper()
+	provincesMemoMu.Lock()
+	provincesMemo, provincesMemoKey = nil, ""
+	provincesMemoMu.Unlock()
+	t.Cleanup(func() {
+		provincesMemoMu.Lock()
+		provincesMemo, provincesMemoKey = nil, ""
+		provincesMemoMu.Unlock()
+	})
+}
+
+// 条目数应从 header StartIndexPtr/EndIndexPtr 直读
 // (xdb v2 官方边界,2 次 ReadAt),不再扫 65536 格 vector 推导(每次调用
 // 65536 次 8B ReadAt,BufferCache 已全内存纯浪费;且 vector 端点语义含
 // 末条结尾,推导 off-by-one)。
 func TestGetIP2RegionEntryCount_readsHeaderBounds(t *testing.T) {
-	// Given: 构造最小 xdb——header(start=1000,end=1000+14*(历史问题))+vector 全零
+	// Given: 构造最小 xdb——header(start=1000,end=1000+14*)+vector 全零
 	const n = 100
 	dir := t.TempDir()
 	path := filepath.Join(dir, "ip2region.xdb")
@@ -371,7 +385,7 @@ func TestGetIP2RegionEntryCount_readsHeaderBounds(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：writeRegionTreeCache 落盘失败此前静默吞错且仍写
+// writeRegionTreeCache 落盘失败此前静默吞错且仍写
 // INFO「已重建」成功行（日志谎报）。修复后失败写 WARN「重建落盘失败」且
 // 无 INFO 成功行；writeProvincesCache 错误沿返回值上抛给调用点留痕。
 func TestWriteRegionTreeCache_writeFailureLogsWarn(t *testing.T) {
@@ -414,5 +428,66 @@ func TestWriteRegionTreeCache_writeFailureLogsWarn(t *testing.T) {
 	}
 	if strings.Contains(appLog.String(), "地域树缓存已重建") {
 		t.Fatalf("落盘失败不得写成功行（谎报）: %s", appLog.String())
+	}
+}
+
+// 省份列表记忆化（与 regionTreeMemo 同构）：336 次采样搜索持
+// ip2regionSearchMu 全局锁——校验端/缓存重建在同一份 xdb 上的重复调用
+// 必须命中 stat 键记忆化（path|size|mtime），xdb 替换（stat 变化）后重扫。
+func TestGetIP2RegionProvinces_memoizesByStatKey(t *testing.T) {
+	// Given：fixture xdb（采样点 101.1.1.1 命中中国段）装入 live searcher
+	dir := t.TempDir()
+	live := filepath.Join(dir, "ip2region.xdb")
+	writeTestXDB(t, live, []xdbSegment{
+		{startIP: 0x65000100, endIP: 0x650001FF, region: "中国|浙江省|杭州市|0|CN"},
+	})
+	withIP2RegionPaths(t, live, filepath.Join(dir, "missing-dist.xdb"))
+	resetProvincesMemoForTest(t)
+	searcher, err := openIP2RegionSearcher(live)
+	if err != nil {
+		t.Fatalf("open fixture searcher: %v", err)
+	}
+	ip2regionMu.Lock()
+	ip2regionSearcher = searcher
+	ip2regionMu.Unlock()
+
+	// When：同一份 xdb 上连续两次调用
+	base := ip2regionProvinceScans.Load()
+	first := GetIP2RegionProvinces()
+	second := GetIP2RegionProvinces()
+
+	// Then：第二次命中记忆化（零重扫），内容同值
+	if scans := ip2regionProvinceScans.Load() - base; scans != 1 {
+		t.Fatalf("两次调用全量采样 %d 次, want 1（稳态必须命中 stat 键记忆化）", scans)
+	}
+	if strings.Join(first, ",") != strings.Join(second, ",") {
+		t.Fatalf("记忆化结果漂移: %v vs %v", first, second)
+	}
+	found := false
+	for _, p := range first {
+		if strings.HasPrefix(p, "浙江") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("fixture 采样点未产出浙江（规范化形态）: %v", first)
+	}
+
+	// When：带外替换可见性——stat 键变化（mtime 前拨 2s）后再次调用
+	fi, err := os.Stat(live)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(live, fi.ModTime().Add(-2*time.Second), fi.ModTime().Add(-2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	third := GetIP2RegionProvinces()
+
+	// Then：stat 键变化触发重扫（记忆化不失效=陈旧省份列表永续）
+	if scans := ip2regionProvinceScans.Load() - base; scans != 2 {
+		t.Fatalf("stat 变化后采样累计 %d 次, want 2（键变化必须重扫）", scans)
+	}
+	if strings.Join(first, ",") != strings.Join(third, ",") {
+		t.Fatalf("同内容重扫结果应一致: %v vs %v", first, third)
 	}
 }

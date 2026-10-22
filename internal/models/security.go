@@ -17,7 +17,7 @@ const (
 
 // PolicyFeatureSet 策略内容的阶段特征组：G0=信任名单（启用且内联/引用非空），
 // G1=IP ACL（启用且内联/引用非空）/黑名单非空/GeoIP 生效，G2=限流（启用且
-// rps>0），历史修复=WAF（mode∈blocking/detection/custom_only 或自定义规则引用非空）。
+// rps>0），=WAF（mode∈blocking/detection/custom_only 或自定义规则引用非空）。
 // 推断（InferPolicyType）与拆分迁移（split 按组生成子策略）共用同一份分组
 // 判定，禁止第二份实现。阶段 0（2026-09-20 用户裁定）：信任名单独立成策略
 // 类型——默认直通上游（trust_detection=0，不过后续任何流程），保留检测记录
@@ -49,7 +49,7 @@ func PolicyTypeFeatures(p *SecurityPolicy) PolicyFeatureSet {
 }
 
 // InferPolicyType 按内容特征推断策略类型——backfill、写侧缺省提交、旧快照/
-// 旧备份导入的共同单一事实源。恰好一组→对应类型（历史修复→stage0），多组→mixed，
+// 旧备份导入的共同单一事实源。恰好一组→对应类型，多组→mixed，
 // 零组→stage3（WAF 是安全策略默认心智，空策略归此）。
 func InferPolicyType(p *SecurityPolicy) string {
 	fs := PolicyTypeFeatures(p)
@@ -86,23 +86,34 @@ type SecurityPolicy struct {
 	IPWhitelistEnabled bool            `json:"ip_whitelist_enabled"`
 	// CustomRulesCache/CustomRulesCached：生成期自定义规则解析缓存（内部字段，
 	// 不序列化）——批量路径对去重策略解析一次，防 (规则×策略) 对重复查询。
-	CustomRulesCache  []CustomRule    `json:"-"`
-	CustomRulesCached bool            `json:"-"`
-	IPBlacklist       json.RawMessage `json:"ip_blacklist"`
-	RateLimitEnabled  bool            `json:"rate_limit_enabled"`
-	RateLimitRPS      int             `json:"rate_limit_rps"`
-	RateLimitBurst    int             `json:"rate_limit_burst"`
-	CRSRuleGroups     json.RawMessage `json:"crs_rule_groups"`
-	CRSExcludedRules  json.RawMessage `json:"crs_excluded_rules"`
-	CustomRules       json.RawMessage `json:"custom_rules"`
-	BlockPageID       int             `json:"block_page_id"`
-	BlockStatusCode   int             `json:"block_status_code"`
-	Enabled           bool            `json:"enabled"`
-	UpdatedBy         int             `json:"updated_by"`
-	CreatedAt         string          `json:"created_at"`
-	UpdatedAt         string          `json:"updated_at"`
-	GeoIPCountries    json.RawMessage `json:"geoip_countries"`
-	GeoIPMode         string          `json:"geoip_mode"`
+	CustomRulesCache  []CustomRule `json:"-"`
+	CustomRulesCached bool         `json:"-"`
+	// 事件归因 contains 判定的解析缓存（内部字段，不序列化，与
+	// CustomRulesCache 同构）：crs_rule_groups/custom_rules 原始 JSON 在策略
+	// 首次判定时解析一次，同 tick 内「事件×候选策略」循环复用，不再逐事件
+	// 重复 Unmarshal。CRSRuleGroupsOK/CustomRuleIDsOK=false 表示原始 JSON
+	// 畸形（判定按不认领）。
+	CRSRuleGroupsSet    map[string]struct{} `json:"-"`
+	CRSRuleGroupsParsed bool                `json:"-"`
+	CRSRuleGroupsOK     bool                `json:"-"`
+	CustomRuleEmitIDs   map[int]struct{}    `json:"-"`
+	CustomRuleIDsParsed bool                `json:"-"`
+	CustomRuleIDsOK     bool                `json:"-"`
+	IPBlacklist         json.RawMessage     `json:"ip_blacklist"`
+	RateLimitEnabled    bool                `json:"rate_limit_enabled"`
+	RateLimitRPS        int                 `json:"rate_limit_rps"`
+	RateLimitBurst      int                 `json:"rate_limit_burst"`
+	CRSRuleGroups       json.RawMessage     `json:"crs_rule_groups"`
+	CRSExcludedRules    json.RawMessage     `json:"crs_excluded_rules"`
+	CustomRules         json.RawMessage     `json:"custom_rules"`
+	BlockPageID         int                 `json:"block_page_id"`
+	BlockStatusCode     int                 `json:"block_status_code"`
+	Enabled             bool                `json:"enabled"`
+	UpdatedBy           int                 `json:"updated_by"`
+	CreatedAt           string              `json:"created_at"`
+	UpdatedAt           string              `json:"updated_at"`
+	GeoIPCountries      json.RawMessage     `json:"geoip_countries"`
+	GeoIPMode           string              `json:"geoip_mode"`
 	// v2.3.8 爬虫豁免：地域拦截豁免已验证搜索引擎/AI 爬虫（方案 B：UA+PTR
 	// 双跳，360=官方 IP 段）。Engines=豁免引擎 ID 数组（geoipnames 注册表）。
 	GeoIPCrawlerExempt  bool            `json:"geoip_crawler_exempt"`
@@ -150,10 +161,10 @@ type SecurityPolicySummary struct {
 	RateLimitRPS       int    `json:"rate_limit_rps"`
 	RateLimitBurst     int    `json:"rate_limit_burst"`
 	CRSExcludedCount   int    `json:"crs_excluded_count"`
-	// 历史修复：摘要携带 CRS 规则组原始 JSON——前端向导跨策略重复告警直接消费摘要，
+	// 摘要携带 CRS 规则组原始 JSON——前端向导跨策略重复告警直接消费摘要，
 	// 不再对每条启用策略 N+1 拉取详情。
 	CRSRuleGroups json.RawMessage `json:"crs_rule_groups"`
-	// 历史问题追加（多策略绑定 历史修复 根因 1）：ruleProtections 的 GeoIP/自定义
+	// 追加（多策略绑定根因 1）：ruleProtections 的 GeoIP/自定义
 	// 规则行此前永远没有数据（接口只给 has_ip_control/has_rate_limit）。
 	HasGeoIP            bool   `json:"has_geoip"`
 	HasCustomRules      bool   `json:"has_custom_rules"`
@@ -257,8 +268,8 @@ type SecurityEventFeedItem struct {
 	Action     string `json:"action"`
 	RuleName   string `json:"rule_name"`
 	AttackType string `json:"attack_type"`
-	// v2.3.8 大屏攻击弹框：阶段（event_type）/处理耗时（μs→ms）/异常分
-	//（危险等级真实数据源：≥12 高危、6-11 中危、<6 低危）
+	// v2.3.8 大屏攻击弹框：event_type 保留原始事件类别，阶段权威=trigger_type；
+	// 处理耗时（μs→ms）/异常分（危险等级真实数据源：≥12 高危、6-11 中危、<6 低危）
 	EventType    string `json:"event_type"`
 	DurationUs   int64  `json:"duration_us"`
 	AnomalyScore int    `json:"anomaly_score"`
@@ -291,7 +302,7 @@ type SecurityEvent struct {
 	// 「预检+WAF」完整分解;预检事件与 DurationUs 同值。
 	PrecheckUs int64 `json:"precheck_us"`
 	// RequestHeaders：事件请求的完整头（JSON 文本，64KB 截断——2026-09-28 用户
-	// 裁定由 8KB 上调，见 securityEventsHeadersCap；本注释历史 历史修复 项纠偏）——
+	// 裁定由 8KB 上调，见 securityEventsHeadersCap；本注释 项纠偏）——
 	// 摄入恒落库；
 	// RequestBody：仅策略开 log_request_body 后有值（64KB 截断，非 UTF-8 转
 	// base64 并带标记前缀）。敏感头掩码是前端展示层姿态，库内为原文。
@@ -332,7 +343,7 @@ type SecurityTopIP struct {
 	Detected   int    `json:"detected"`
 	LastTime   string `json:"last_time"`
 	AttackType string `json:"attack_type"`
-	// AttackTypeStage 是该 IP 的阶段化攻击类型(历史问题:后端 stageCategorizeAttack
+	// AttackTypeStage 是该 IP 的阶段化攻击类型（后端 stageCategorizeAttack
 	// 单源产出,消除前端 familyToStage 硬编码映射——后端新增 family 时不再静默
 	// 落「其他」)。
 	AttackTypeStage string `json:"attack_type_stage"`
@@ -351,7 +362,7 @@ type CRSInfo struct {
 	UpdatedAt     string `json:"updated_at"`
 	NextUpdate    string `json:"next_update"`
 	RuleCount     int    `json:"rule_count"`
-	// IsLatest 三态(历史修复,历史):nil=未知(冷启动未取到 latest/解析失败),
+	// IsLatest 三态:nil=未知(冷启动未取到 latest/解析失败),
 	// false=有更新, true=已是最新——此前未知态默认 true 属新鲜度信任 fail-open。
 	IsLatest     *bool  `json:"is_latest,omitempty"`
 	UpdateStatus string `json:"update_status"`
@@ -413,7 +424,7 @@ type SecurityCustomRule struct {
 	UpdatedAt   string                `json:"updated_at"`
 }
 
-// CreateCustomRuleRequest 自定义规则创建请求（历史修复）：enabled 用
+// CreateCustomRuleRequest 自定义规则创建请求：enabled 用
 // 指针——JSON 省略即按「启用」落库（与 CreateSecurityPolicy 的 enabled 默认
 // true 同口径）。此前直接绑定 SecurityCustomRule 的 bool，MCP 无约束 body
 // （server.go create_custom_rule）省略 enabled 会创建一条静默禁用的 WAF 规则，
@@ -427,7 +438,7 @@ type CreateCustomRuleRequest struct {
 	Enabled     *bool                 `json:"enabled"`
 }
 
-// UpdateCustomRuleRequest 自定义规则更新请求（历史问题）：全字段指针——省略即
+// UpdateCustomRuleRequest 自定义规则更新请求：全字段指针——省略即
 // 保持现值。此前直接绑定 SecurityCustomRule（bool/值类型），省略 enabled 的
 // 部分更新（MCP 无约束 body 的现实路径）会把零值 false 直写落库，静默禁用
 // 规则且审计无痕迹；与 UpdateSecurityPolicyRequest 同口径。
@@ -445,7 +456,7 @@ type SecurityBlockPage struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
 	Content     string `json:"content"`
-	// ContentType 拦截响应的 历史修复（2026-09-25 用户裁定可配置）；
+	// ContentType 拦截响应的内容类型，可配置（2026-09-25 用户裁定）；
 	// 白名单见 BlockPageContentTypes，空值按 DefaultBlockPageContentType 归一。
 	ContentType string `json:"content_type"`
 	IsDefault   bool   `json:"is_default"`
@@ -459,10 +470,10 @@ type SecurityBlockPage struct {
 	RuleRefCount int `json:"rule_ref_count"`
 }
 
-// DefaultBlockPageContentType 拦截页默认 历史修复（内置三页同此）。
+// DefaultBlockPageContentType 拦截页默认 （内置三页同此）。
 const DefaultBlockPageContentType = "text/html; charset=utf-8"
 
-// BlockPageContentTypes 可选 历史修复 白名单（含编码；创建/更新写侧校验）。
+// BlockPageContentTypes 可选白名单（含编码；创建/更新写侧校验）。
 var BlockPageContentTypes = []string{
 	DefaultBlockPageContentType,
 	"application/json; charset=utf-8",
@@ -485,7 +496,7 @@ func ValidBlockPageContentType(contentType string) bool {
 
 // IPListEntry 是 IP 地址列表的单个条目：value 必须是合法的 IP 或 CIDR
 // （netip.ParsePrefix / netip.ParseAddr 双形态），remark 为自由备注。
-// created_at/expires_at（历史问题 自动封禁，UTC 墙钟串）可选：expires_at 非空且
+// created_at/expires_at可选：expires_at 非空且
 // 已到期时投影层（loadIPListEntriesVia）不再下发该条目（到期即自动解封）；
 // 手动条目两者留空。
 type IPListEntry struct {

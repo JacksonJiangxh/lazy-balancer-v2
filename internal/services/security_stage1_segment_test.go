@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// 历史问题 一致性钉：Stage1PrecheckSegmentSQL / Stage1PrecheckIDSQLList 与
+// 一致性钉：Stage1PrecheckSegmentSQL / Stage1PrecheckIDSQLList 与
 // Go 谓词 IsStage1PrecheckID 三处同源——固定族、GeoIP 段任一处漏改即在此失败。
 func TestStage1PrecheckSegmentSQL_matchesGoPredicate(t *testing.T) {
 	// 1) Go 谓词固定族 {2,4,7,8,14} 必须逐项在 SQL 清单中（带引号形态），
@@ -48,6 +48,35 @@ func TestStage1PrecheckSegmentSQL_matchesGoPredicate(t *testing.T) {
 	for _, id := range []int{geoipPrecheckRuleBase - 1, geoipPrecheckRuleBase + 100000} {
 		if IsStage1PrecheckID(id) {
 			t.Fatalf("IsStage1PrecheckID(%d)=true，超出 GeoIP 段界", id)
+		}
+	}
+}
+
+// 三集合对账：事件分段耗时选值谓词 securityEventsIsPrecheckRule 必须与
+// IsStage1PrecheckID/Stage1PrecheckIDSQLList 同集合——第三处字面量漏改
+// （新增/删除预检 id 时）即在此失败。
+func TestStage1PrecheckSegmentSQL_eventDurationPredicateReconciled(t *testing.T) {
+	// SQL 清单 8 项（含防御性 3/5/12）逐一对事件口径为 true。
+	for _, id := range []int{2, 3, 4, 5, 7, 8, 12, 14} {
+		if !securityEventsIsPrecheckRule(strconv.Itoa(id)) {
+			t.Fatalf("securityEventsIsPrecheckRule(%d)=false，与 SQL 清单分叉", id)
+		}
+	}
+	// 近邻非成员不得混入。
+	for _, id := range []int{0, 1, 6, 9, 10, 11, 13, 15, 100} {
+		if securityEventsIsPrecheckRule(strconv.Itoa(id)) {
+			t.Fatalf("securityEventsIsPrecheckRule(%d)=true，越出预检族", id)
+		}
+	}
+	// GeoIP 段：段内 true、段界外 false（与段谓词 LIKE '8%' 同口径）。
+	for _, id := range []int{geoipPrecheckRuleBase, geoipPrecheckRuleBase + 12345, geoipPrecheckRuleLimit - 1} {
+		if !securityEventsIsPrecheckRule(strconv.Itoa(id)) {
+			t.Fatalf("securityEventsIsPrecheckRule(%d)=false，GeoIP 段失守", id)
+		}
+	}
+	for _, id := range []int{geoipPrecheckRuleBase - 1, geoipPrecheckRuleLimit} {
+		if securityEventsIsPrecheckRule(strconv.Itoa(id)) {
+			t.Fatalf("securityEventsIsPrecheckRule(%d)=true，超出 GeoIP 段界", id)
 		}
 	}
 }

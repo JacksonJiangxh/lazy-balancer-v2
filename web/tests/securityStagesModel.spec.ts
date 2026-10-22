@@ -1,7 +1,7 @@
-// 阶段投影与 CIDR 匹配行为验收（历史修复）：
-//   历史问题-08 阶段 2 拦截页失效必须显性（回落默认 429），不得静默省略
-//   历史问题-09 ACL 内容门口径（与后端摘要 has_ip_control 分层，禁止统一）
-//   历史问题-03 IPv6 CIDR 命中（命中定位 / 残余信任判定）
+// 阶段投影与 CIDR 匹配行为验收
+//   阶段 2 拦截页失效必须显性（回落默认 429），不得静默省略
+//   ACL 内容门口径（与后端摘要 has_ip_control 分层，禁止统一）
+//   IPv6 CIDR 命中（命中定位 / 残余信任判定）
 //
 // 运行：cd web && npm test
 
@@ -56,7 +56,7 @@ const stageRows = (
   stageIndex: 0 | 1 | 2 | 3,
 ): Array<{ label: string; detail: string }> => buildStageModel([binding], [policy], [], blockPages).stages[stageIndex].groups[0]?.rows ?? []
 
-test('历史问题-08 阶段 2：拦截页已删/内容空时显性给出失效回落（不再静默省略该行）', () => {
+test('阶段 2：拦截页已删/内容空时显性给出失效回落（不再静默省略该行）', () => {
   const policy = policyOf({ has_rate_limit: true, block_page_id: 0 })
   // 页已删：binding/策略仍指向 #9，但页面列表里没有它
   const deleted = stageRows(bindingOf({ block_page_id: 9 }), policy, [], 2)
@@ -81,7 +81,7 @@ test('历史问题-08 阶段 2：拦截页已删/内容空时显性给出失效�
   assert.equal(unset.some((row) => row.label === '拦截页（策略页）'), false)
 })
 
-test('历史问题-09 ACL 内容门：启用但名单空不记账为阶段 1 能力（摘要展示另走 has_ip_control）', () => {
+test('ACL 内容门：启用但名单空不记账为阶段 1 能力（摘要展示另走 has_ip_control）', () => {
   // 启用 ∧ 空名单：内容门 false（无 ACL 渲染产物）；摘要标志虽为 true 也不得用于阶段出组
   const enabledEmpty = policyOf({ has_ip_control: true, ip_acl_enabled: true, ip_acl_list: '[]', ip_acl_list_refs: '[]', ip_blacklist: '[]' })
   assert.equal(hasIPACLControl(enabledEmpty), false)
@@ -99,7 +99,7 @@ test('历史问题-09 ACL 内容门：启用但名单空不记账为阶段 1 能
   assert.equal(hasIPACLControl({ has_ip_control: false }), false)
 })
 
-test('历史问题-03 IPv6 CIDR：前缀位匹配生效且只作用于同族', () => {
+test('IPv6 CIDR：前缀位匹配生效且只作用于同族', () => {
   // v6 /32
   assert.equal(entryMatchesIp('2001:db8::/32', '2001:db8:1234::1'), true)
   assert.equal(entryMatchesIp('2001:db8::/32', '2001:db9::1'), false)
@@ -126,7 +126,7 @@ test('历史问题-03 IPv6 CIDR：前缀位匹配生效且只作用于同族', (
   assert.equal(entryMatchesIp('2001:db8::1', '2001:db8::1'), true)
 })
 
-// —— IP 快捷处置动作的模式门控（历史问题）——
+// IP 快捷处置动作的模式门控——
 // ip_acl_list_refs 是黑/白共用字段：名单本身无黑白属性，语义由 ip_acl_mode
 // 决定（渲染只对 allow/deny 发射拒绝规则；绕过=免检测、空模式不发射）。
 // 同一字段上同时给「拦截」「放行」两个动作会在模式生效后反转用户意图。
@@ -145,7 +145,7 @@ test('ACL 加入动作：任何模式都不得同时提供拦截与放行', () =
   }
 })
 
-// —— 事件详情预取名单集合（历史问题）——
+// 事件详情预取名单集合——
 // 详情弹框只消费「属主策略 ACL refs（命中列表/内联判定）+ 全部信任 refs
 // （跨策略信任豁免）」；他策略 ACL 名单零消费，并入会在他策略引用大名单
 // （内置威胁名单可达上万条）时全量下载。

@@ -63,7 +63,7 @@ func TestSecurityBlockedCounter_ServeHTTP(t *testing.T) {
 	}
 }
 
-// 历史问题-01：无 geoip handler 的链上，客户端伪造国名头不得进入流量统计；
+// 无 geoip handler 的链上，客户端伪造国名头不得进入流量统计；
 // 有 geoip handler 时也只能采用其写入的服务端变量，不能被同名请求头覆盖。
 func TestSecurityBlockedCounter_trafficCountryTrustsServerVar(t *testing.T) {
 	cases := []struct {
@@ -126,7 +126,7 @@ func TestSecurityBlockedCounter_panicFinalizesTimingAndTraffic(t *testing.T) {
 		_ = h.ServeHTTP(httptest.NewRecorder(), req, next)
 	}()
 
-	// panic 向外传播的同时，审计计时不得留下「等待中」的条目（历史问题：无
+	// panic 向外传播的同时，审计计时不得留下「等待中」的条目（无
 	// 分段写点时 close 不建条；drain 首轮查表即返，不为该行等满超时），流量
 	// 也不能静默丢失。
 	id := req.Header.Get(securityTimingHeader)
@@ -152,7 +152,7 @@ func TestSecurityBlockedCounter_panicFinalizesTimingAndTraffic(t *testing.T) {
 // （决策后、403 写出前的纯预检评估），不得写 end（防同 ID 双段）；
 // 形状②WAF/限流段拦：起始头已被 timing_pre 重写为分段锚点 → 写 end
 // （链首至此全链，读侧 end-pre 得 WAF 段），不得写 pre。
-// 历史：断言目标从侧车文件行改为进程内注册表快照；post-next 终态标记
+// 断言目标从侧车文件行改为进程内注册表快照；post-next 终态标记
 // （auditTimingClose）一并钉住——审计写插件 drain 依赖该标记停止等待。
 func TestSecurityBlockedCounter_timingSegmentSelection(t *testing.T) {
 	const id = "0123456789abcdef"
@@ -215,8 +215,8 @@ func TestSecurityBlockedCounter_timingSegmentSelection(t *testing.T) {
 	}
 
 	// 非拦截形态（logged 放行）：本 handler 之外无任何分段写点（无 timing_pre/
-	// timing_end）——历史问题 起 close 不再建条，因此不产生注册表条目；
-	// 审计 drain 对未知 tid 首轮即返（历史修复），同样不等待。
+	// timing_end）——自此 close 不再建条，因此不产生注册表条目；
+	// 审计 drain 对未知 tid 首轮即返，同样不等待。
 	t.Run("logged passthrough without segment writes leaves no entry", func(t *testing.T) {
 		useTestTimingRegistry(t)
 		h := &SecurityBlockedCounter{Rule: "lb_seg_rule"}
@@ -247,7 +247,7 @@ func TestSecurityBlockedCounter_timingSegmentSelection(t *testing.T) {
 	})
 }
 
-// 历史问题(历史审计):Provision/registerOrExisting 护栏——7723d76d registry
+// Provision/registerOrExisting 护栏——7723d76d registry
 // 事故(指标恒 0)的回归测试。
 func TestRegisterOrExisting(t *testing.T) {
 	reg := prometheus.NewRegistry()

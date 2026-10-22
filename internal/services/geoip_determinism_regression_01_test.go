@@ -1,14 +1,14 @@
 package services
 
 //
-//   - 历史修复：geoipLocOperator「海外」展开集此前直接遍历 exactSet map——迭代序
+//   geoipLocOperator「海外」展开集此前直接遍历 exactSet map——迭代序
 //     非确定，同 DB 视图两次渲染产出不同算子字节 → errSameConfig 同字节短路
 //     门失效（每次写路径真重载+预检池键漂移）。钉测：同输入多次编译逐字节
 //     相同 + 展开段按字典序。
-//   - 历史修复：混选「海外+国名」时展开集与显式国名条目去重，不产生重复
+//   混选「海外+国名」时展开集与显式国名条目去重，不产生重复
 //     alternative（重复条目无害但构成渲染非单源形态，且干扰字节比对）。
-//   - 历史修复：geoip_countries 畸形 JSON 渲染按无地域规则处理（不 fail-visible，
-//     推演披露见 历史修复 段），但必须 WARN 留痕——静默丢弃使「UI 宣称
+//   geoip_countries 畸形 JSON 渲染按无地域规则处理（不 fail-visible，
+//     推演披露见段），但必须 WARN 留痕——静默丢弃使「UI 宣称
 //     地域拦截在用、实际零强制」不可见。
 //
 // 渲染确定性（同 DB 视图两次渲染逐字节相同）在
@@ -48,7 +48,7 @@ func TestGeoipLocOperator_expansionDeterministicAndDeduped(t *testing.T) {
 
 // TestRenderDeterminism_geoipViewByteIdentical：同 DB 视图（同一策略行+同一
 // 地域树缓存）两次 BuildCorazaDirectives 渲染必须逐字节相同——geoipLocOperator
-// 展开集定序后的全链路确定性钉（历史修复 验收项）。
+// 展开集定序后的全链路确定性钉。
 func TestRenderDeterminism_geoipViewByteIdentical(t *testing.T) {
 	stubSecurityLibsAvailable(t)
 	_, database := newClusterTestService(t)
@@ -66,7 +66,7 @@ func TestRenderDeterminism_geoipViewByteIdentical(t *testing.T) {
 		"Iceland", "Norway", "Chile", "Egypt", "India", "Kenya",
 	}
 	treeJSON, err := json.Marshal(map[string]interface{}{
-		"revision":  "r74-test",
+		"revision":  "fixture",
 		"provinces": []string{"广东省", "海外"},
 		"cities":    map[string][]string{"广东省": {"深圳市"}},
 		"countries": countries,
@@ -82,7 +82,7 @@ func TestRenderDeterminism_geoipViewByteIdentical(t *testing.T) {
 		t.Fatalf("write tree cache: %v", err)
 	}
 
-	// 历史修复 验收钉在 buildIPPrecheckDirectives（geoipLocOperator 的发射落点——
+	// 验收钉在 buildIPPrecheckDirectives（geoipLocOperator 的发射落点——
 	// 阶段 1 预检引擎段）：同 DB 视图两次渲染逐字节相同。
 	first, err := buildIPPrecheckDirectives([]*models.SecurityPolicy{policy}, 403, "lb_test")
 	if err != nil {
@@ -102,9 +102,9 @@ func TestRenderDeterminism_geoipViewByteIdentical(t *testing.T) {
 	}
 }
 
-// TestGeoipCountries_malformedJSONLogsWarn（历史修复）：畸形 JSON 不再静默——
+// TestGeoipCountries_malformedJSONLogsWarn：畸形 JSON 不再静默——
 // WARN 留痕（按无地域规则渲染不 fail-visible，推演披露：单策略脏 TEXT 列
-// 不得阻断整份配置生成，与 历史修复 裁定同向）。
+// 不得阻断整份配置生成，与裁定同向）。
 func TestGeoipCountries_malformedJSONLogsWarn(t *testing.T) {
 	var logBuf bytes.Buffer
 	oldLog := log.Writer()

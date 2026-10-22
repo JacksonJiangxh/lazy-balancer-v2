@@ -35,7 +35,7 @@ func CanonicalCrawlerSource(name string) (url, format string, ok bool) {
 }
 
 // ensureCrawlerSources 幂等种子（display_name 区分于威胁源；不更新威胁源行）。
-// 只保证内置行存在——运行期不覆盖既有 url/format（历史问题-05 的 canonical 刷新
+// 只保证内置行存在——运行期不覆盖既有 url/format（的 canonical 刷新
 // 在启动路径 refreshCrawlerSources 中执行；更新任务每轮调用本函数只为补建
 // 缺失行，不得改写既有配置）。
 func ensureCrawlerSources() error {
@@ -49,7 +49,7 @@ func ensureCrawlerSources() error {
 }
 
 // refreshCrawlerSources 启动期按 name 刷新内置源的 canonical url/format
-// （历史问题-05 历史）：URL/解析格式修正必须到达存量部署，否则旧实例
+// URL/解析格式修正必须到达存量部署，否则旧实例
 // 继续每日产出错误名单。用户只能改 update_enabled，状态/排程/开关列保持原值。
 func refreshCrawlerSources() error {
 	for _, src := range crawlerBotSources {
@@ -81,7 +81,7 @@ func CrawlerIPListName(engineID string) string {
 func crawlerDisplayName(engineID string) string { return CrawlerIPListName(engineID) }
 
 // CrawlerSystemListNames 内置爬虫名单名全集（security_ip_lists system=1 的
-// 合法来源之一）。历史问题（历史）：备份导入的 system 名单白名单
+// 合法来源之一）。备份导入的 system 名单白名单
 // 与配额口径共用本注册表——新增内置源只改 crawlerBotSources 一处。
 func CrawlerSystemListNames() []string {
 	names := make([]string, 0, len(crawlerBotSources))

@@ -35,7 +35,7 @@ func l7ServerRoutesJSON(t *testing.T, server map[string]interface{}) string {
 	return string(body)
 }
 
-func TestP1_2_tlsRuleWithoutCertIsNotPublished(t *testing.T) {
+func TestTLSRuleWithoutCertIsNotPublished(t *testing.T) {
 	useTemporaryCertDir(t)
 	_, database := newClusterTestService(t)
 
@@ -75,7 +75,7 @@ func TestP1_2_tlsRuleWithoutCertIsNotPublished(t *testing.T) {
 	}
 }
 
-func TestP1_2_readyTLSSiblingUnaffectedByPendingRule(t *testing.T) {
+func TestReadyTLSSiblingUnaffectedByPendingRule(t *testing.T) {
 	useTemporaryCertDir(t)
 	_, database := newClusterTestService(t)
 

@@ -35,7 +35,7 @@ func TestCleanupExpiredRegistrationSecretsClearsDeliveredSecretAfterWindow(t *te
 	}
 }
 
-// 历史问题（历史）：Close 关闭三句柄后必须清空包级句柄与 currentDB——
+// Close 关闭三句柄后必须清空包级句柄与 currentDB——
 // 残留的已关闭 *sql.DB 会让后续 GetDB() 返回不可用句柄且在测试间泄漏；
 // 重复 Close 必须幂等（nil 句柄跳过）。
 func TestClose_clearsHandlesAndIsIdempotent(t *testing.T) {
@@ -76,7 +76,7 @@ func TestFlushAPIKeyLastUsedBatchesDirtyKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	SetDB(database)
-	// 历史问题（历史）：currentDB 是包级全局，测试结束必须复位，否则后续
+	// currentDB 是包级全局，测试结束必须复位，否则后续
 	// 测试的 GetDB()/flush 会落到本测试的已关闭临时库。
 	oldCurrent := GetDB()
 	t.Cleanup(func() { SetDB(oldCurrent) })

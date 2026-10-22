@@ -2,9 +2,9 @@ package geoipnames
 
 import "strings"
 
-// 省/市列规范化的单一实现（历史问题，历史）。此前 internal/services 与
+// 省/市列规范化的单一实现。此前 internal/services 与
 // caddygeoip 各持一份手工镜像函数（normalizeIP2Province/normalizeProvince、
-// normalizeIP2City/normalizeCity），语义分叉靠调用点补偿——正是 历史修复 单源
+// normalizeIP2City/normalizeCity），语义分叉靠调用点补偿——正是单源
 // 要消灭的「双端漂移 → 城市级规则静默恒不命中」形态，只是从表挪到了函数。
 //
 // 本文件收敛表驱动 core，两端只保留**显式声明的策略差异**：
@@ -41,7 +41,7 @@ func canonicalCity(trimmed string) (name string, known bool) {
 	if fixed, ok := CityPinyinFixes[trimmed]; ok {
 		return fixed, true
 	}
-	// 历史问题：少数民族自治州简称 → 全称。
+	// 少数民族自治州简称 → 全称。
 	if full, ok := AutonomousPrefectures[trimmed]; ok {
 		return full, true
 	}

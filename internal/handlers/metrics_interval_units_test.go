@@ -12,10 +12,10 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 历史修复 发现 ①（2026-10-03 用户裁定核实后全修）：m 单位漏乘 60——30m
+// 发现 ①（2026-10-03 用户裁定核实后全修）：m 单位漏乘 60——30m
 // 窗口被算成 30s，桶宽钳位 1s，升序 LIMIT 720 保留最旧桶，静默丢弃最近数据。
-// 历史修复（历史）：双手写解析收敛为 parseMetricsInterval 单源，本测试改靶
-// 并扩为 modifier/seconds 双输出一致性钉（历史问题 分桶粒度=窗口秒数/720 必须
+// 双手写解析收敛为 parseMetricsInterval 单源，本测试改靶
+// 并扩为 modifier/seconds 双输出一致性钉（分桶粒度=窗口秒数/720 必须
 // 对应 SQL modifier，单源后编译期保证）。
 
 func TestParseMetricsInterval_modifierSecondsAgreement(t *testing.T) {
@@ -36,7 +36,7 @@ func TestParseMetricsInterval_modifierSecondsAgreement(t *testing.T) {
 		{"garbage", "-1 hours", 3600},
 		{"10x", "-1 hours", 3600},
 		{" 6H ", "-6 hours", 21600}, // 大小写/空白归一
-		// 历史问题：非正值（Atoi 可解析的负数与 0）回退默认窗口——不得拼出
+		// 非正值（Atoi 可解析的负数与 0）回退默认窗口——不得拼出
 		// 非法/零长 modifier 或负桶宽。
 		{"-5h", "-1 hours", 3600},
 		{"-1d", "-1 hours", 3600},

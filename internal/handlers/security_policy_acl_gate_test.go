@@ -9,9 +9,9 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 显式单职策略的阶段外 ACL 启用门（历史问题 后端半边）：显式 stage0/2/3 策略的
+// 显式单职策略的阶段外 ACL 启用门：显式 stage0/2/3 策略的
 // ACL 已被 normalizeOutOfStageFields 归一归零，PUT 缺省类型提交
-// {ip_acl_enabled:true} 绕过归一，更新后 历史修复 与原阶段特征并存→重推断把类型
+// {ip_acl_enabled:true} 绕过归一，更新后与原阶段特征并存→重推断把类型
 // 改写 mixed（类型与内容漂移）。删除前守卫拒绝；stage1 是 ACL 所属阶段
 // （归一保留 ACL 字段），启用属正常编辑不拦；mixed/空串存量兼容态不拦。
 func TestUpdateSecurityPolicy_rejectsACLEnableOnTypedPolicy(t *testing.T) {
@@ -84,6 +84,34 @@ func TestUpdateSecurityPolicy_rejectsACLEnableOnTypedPolicy(t *testing.T) {
 		}
 		if ptype != "stage1" || aclEnabled != 1 || aclList != `["203.0.113.0/24"]` {
 			t.Fatalf("final policy_type=%q acl=%d list=%s, want stage1/1/list", ptype, aclEnabled, aclList)
+		}
+	})
+
+	t.Run("显式切换 stage1 同时启用 ACL 放行", func(t *testing.T) {
+		// Given：显式 stage2 限流策略
+		setupSecurityPolicyTestDB(t)
+		router := newSecurityRouter(t)
+		id := createTestPolicy(t, router, map[string]any{"name": "rl-to-acl", "policy_type": "stage2", "rate_limit_enabled": true, "rate_limit_rps": 100, "rate_limit_burst": 50})
+
+		// When：PUT 显式 policy_type=stage1 + ACL 启用三件套（一步类型切换——
+		// 阶段外字段由归零矩阵落零，不产生 mixed 漂移）
+		body := map[string]any{"policy_type": "stage1"}
+		for k, v := range aclEnable {
+			body[k] = v
+		}
+		rec := putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), body)
+
+		// Then：200，终态 stage1、限流落零、ACL 生效
+		if rec.Code != http.StatusOK {
+			t.Fatalf("PUT status=%d body=%s, want 200（显式 stage1 切换+启用 ACL 不得误拒）", rec.Code, rec.Body.String())
+		}
+		var ptype string
+		var aclEnabled, rlEnabled int
+		if err := db.DB.QueryRow(`SELECT COALESCE(policy_type,''), COALESCE(ip_acl_enabled,0), COALESCE(rate_limit_enabled,0) FROM security_policies WHERE id=?`, id).Scan(&ptype, &aclEnabled, &rlEnabled); err != nil {
+			t.Fatal(err)
+		}
+		if ptype != "stage1" || aclEnabled != 1 || rlEnabled != 0 {
+			t.Fatalf("final=(%s,acl=%d,rl=%d), want (stage1,1,0)", ptype, aclEnabled, rlEnabled)
 		}
 	})
 

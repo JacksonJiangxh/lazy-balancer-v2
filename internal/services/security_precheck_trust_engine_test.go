@@ -1,9 +1,9 @@
 package services
 
-// 历史问题-15：预检层「信任名单 DetectionOnly 全局豁免」此前只有字符串顺序钉
+// 预检层「信任名单 DetectionOnly 全局豁免」此前只有字符串顺序钉
 // （geoip_caddy_test.go:189-194）与编译钉（enginegate）——「只记录不拦」是运行级
 // 语义（phase:1 的 ctl:ruleEngine=DetectionOnly 必须对同相位的后续 GeoIP deny 链
-// 生效），字符串/编译测试看不出来。本测试用真实 coraza 事务（历史修复：引擎行为实证）
+// 生效），字符串/编译测试看不出来。本测试用真实 coraza 事务
 // 钉住三条：①信任 IP 经 id:12 后海外 GeoIP deny 不拦（放行）；②非信任海外 IP 被
 // deny 中断；③非信任境内 IP 不命中（形状回归）。
 

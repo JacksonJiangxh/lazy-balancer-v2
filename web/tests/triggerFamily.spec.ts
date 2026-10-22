@@ -1,4 +1,4 @@
-// 触发 id → 阶段族映射（历史问题）行为验收：逐项对照后端 v2.3.8 权威分类
+// 触发 id → 阶段族映射行为验收：逐项对照后端 v2.3.8 权威分类
 //   internal/handlers/security.go attackFamilyClassOf（ID 形态）
 //   internal/handlers/security_threat_screen.go triggerTypeForRule（数值段）
 //
@@ -44,7 +44,7 @@ const cases: ReadonlyArray<readonly [string, TriggerStageFamily]> = [
   ['850000', 'crawler'],
   ['899999', 'crawler'],
   // IP 访问控制
-  // 历史修复（有意设计登记）：'8' 与后端 attackFamilyClassOf（8→GeoIP）不同——历史问题
+  // （有意设计登记）：'8' 与后端 attackFamilyClassOf（8→GeoIP）不同——
   // 历史共享 id，现代引擎地域事件改发 800xxx，本例外无现实影响且被刻意钉住。
   ['2', 'ipAcl'],
   ['4', 'ipAcl'],
@@ -75,7 +75,7 @@ test('首尾空白归一（事件字段可能带导入残留空白）', () => {
   assert.equal(triggerStageFamily(' 850123 '), 'crawler')
 })
 
-// 「所属策略为检测模式：命中只记录」的文案归因门（历史问题）：DetectionOnly
+// 「所属策略为检测模式：命中只记录」的文案归因门：DetectionOnly
 // （id:6）在 ACL/黑名单/自定义规则之后、CRS 与请求体规则之前发射——只有 WAF 族
 // 的 logged 可由检测模式解释；阶段 1 族的 logged 成因是信任保留检测（id:3/12），
 // 归因「检测模式」会掩盖真正的豁免策略。

@@ -10,7 +10,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 历史修复：EnableCertJobResume 的 UPDATE 无状态 CAS 守卫——SELECT（规则启用
+// EnableCertJobResume 的 UPDATE 无状态 CAS 守卫——SELECT（规则启用
 // 时的任务查询）与 UPDATE 之间任务行被删除时 0 行命中，「启用成功但任务行不
 // 存在、续签链断」会被审计文案「证书仍有效，恢复使用现有证书」掩盖。必须核对
 // RowsAffected==1，否则 failEnable 恢复规则与任务快照。
@@ -24,7 +24,7 @@ func TestEnableRule_fails_when_resume_target_row_disappears(t *testing.T) {
 	if err := db.DB.QueryRow("SELECT default_ca_provider_id FROM global_config WHERE id=1").Scan(&providerID); err != nil {
 		t.Fatalf("read default provider: %v", err)
 	}
-	dnsResult, err := db.DB.Exec(`INSERT INTO certificate_configs (name,dns_provider,dns_credentials,enabled) VALUES ('r54-dns','dnspod','{"token":"x"}',1)`)
+	dnsResult, err := db.DB.Exec(`INSERT INTO certificate_configs (name,dns_provider,dns_credentials,enabled) VALUES ('dns-cert','dnspod','{"token":"x"}',1)`)
 	if err != nil {
 		t.Fatalf("seed dns config: %v", err)
 	}

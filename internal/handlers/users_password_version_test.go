@@ -19,7 +19,7 @@ func TestPasswordUpdatesIncrementPasswordVersion(t *testing.T) {
 		serve  func(*Handlers, *gin.Context)
 	}{
 		{
-			// 历史修复（契约）：本人改密须携带 current_password 过共享密码确认门。
+			// （契约）：本人改密须携带 current_password 过共享密码确认门。
 			name: "current user", method: http.MethodPatch, path: "/users/me", body: `{"password":"second-password","current_password":"first-password"}`,
 			serve: func(h *Handlers, c *gin.Context) { c.Set("user_id", 1); h.UpdateCurrentUser(c) },
 		},
@@ -39,7 +39,7 @@ func TestPasswordUpdatesIncrementPasswordVersion(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			database := setupAuthTestDB(t)
-			// 历史修复：current_password 需真实 bcrypt 哈希比对（占位 'hash' 过不了确认门）。
+			// current_password 需真实 bcrypt 哈希比对（占位 'hash' 过不了确认门）。
 			hash, err := bcrypt.GenerateFromPassword([]byte("first-password"), bcrypt.MinCost)
 			if err != nil {
 				t.Fatalf("hash password: %v", err)

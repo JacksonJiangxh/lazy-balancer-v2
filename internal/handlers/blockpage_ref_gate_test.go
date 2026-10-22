@@ -9,10 +9,10 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 规则级阶段拦截页引用门（历史问题）：lb_rules.block_page_stage1_id /
+// 规则级阶段拦截页引用门：lb_rules.block_page_stage1_id /
 // block_page_stage3_id 指向的页面被 DeleteSecurityBlockPage 静默删除后，
 // 该规则的阶段 1/3 拦截页回落「跟随策略」或 Caddy 默认页——删除前必须
-// 409 拒绝并要求先解除规则级引用（与启用策略引用门同事务；历史修复：本门更严——
+// 409 拒绝并要求先解除规则级引用（与启用策略引用门同事务；本门更严——
 // 含禁用规则，防重启用悬空引用）。
 func TestDeleteSecurityBlockPage_rejectsWhenRuleStagePageReferences(t *testing.T) {
 	cases := []struct {

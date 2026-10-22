@@ -6,11 +6,7 @@ import {
   ADAPTIVE_SAMPLE_CONFIRM_SAMPLES,
   ADAPTIVE_SAMPLE_MIN_SWITCH_INTERVAL_MS,
   FLOW_MAX_ARCS_PER_FLUSH,
-  flowBucket,
-  flowBucketKey,
-  flowRegionKey,
   flowTimestamp,
-  groupNormalFlowEvents,
   nextAdaptiveSampleN,
   nextFlowCursor,
   planFlowArcs,
@@ -85,7 +81,7 @@ test('自适应切换：档位与目标一致时清空确认计数但保留上�
   assert.deepEqual(third, { active: 4, stable: 0, pendingTarget: 0, lastSwitch: 34_000, changed: true })
 })
 
-test('自适应切换：方向反转不累计（突发+骤停不得直接跳档，历史修复）', () => {
+test('自适应切换：方向反转不累计（突发+骤停不得直接跳档）', () => {
   // 高流量一次 → 目标 8；随后骤停一次 → 目标 1。旧实现只按次数累加，
   // 在 4s 门已过时会把这两次相反采样当作「连续 2 次同向」直接切到 1/1。
   let outcome = stepAdaptiveSample({ active: 4, stable: 0, lastSwitch: 0 }, 900, 10_000)
@@ -112,19 +108,11 @@ test('速率还原：events.length × 服务端 sample_n，sample_n 缺失时回
   assert.equal(reconstructObservedRate(0, 0, 0), 0)
 })
 
-test('地域 key：中国精确到省，其他国家/未知归一', () => {
-  assert.equal(flowRegionKey('中国·广东省·深圳市'), '中国·广东省')
-  assert.equal(flowRegionKey('美国·California'), '美国')
-  assert.equal(flowRegionKey(''), '未知')
-})
-
-test('时间解析：无时区 DB 时间按 UTC；同一秒归同桶', () => {
+test('时间解析：无时区 DB 时间按 UTC', () => {
   assert.equal(flowTimestamp('2026-10-18 00:00:00'), Date.parse('2026-10-18T00:00:00Z'))
-  assert.equal(flowBucket(flowTimestamp('2026-10-18T00:00:00Z')), 1792281600)
-  assert.equal(flowBucketKey('中国·广东省', 1792281600), '中国·广东省|1792281600')
 })
 
-test('历史问题-5：采集租约重置后游标回零，正常递增与缺失值保持', () => {
+test('采集租约重置后游标回零，正常递增与缺失值保持', () => {
   assert.equal(nextFlowCursor(500, { enabled: true, next_seq: 4 }), 0)
   assert.equal(nextFlowCursor(500, { enabled: false, next_seq: 501 }), 0)
   assert.equal(nextFlowCursor(500, { enabled: true, next_seq: 501 }), 501)
@@ -139,20 +127,6 @@ test('正常/攻击共用显式线宽：thin 1.2、coarse 2.8、dense 4.2', () =
   assert.equal(flowArcTierWidth('dense'), 4.2)
   assert.ok(flowArcTierWidth('thin') < flowArcTierWidth('coarse'))
   assert.ok(flowArcTierWidth('coarse') < flowArcTierWidth('dense'))
-})
-
-test('正常流按地区+秒桶分组：跨秒不合并，中国精确到省', () => {
-  const at = 1792281600000
-  const groups = groupNormalFlowEvents([
-    { country: '中国', province: '广东省', at },
-    { country: '中国', province: '广东省', at },
-    { country: '中国', province: '广东省', at: at + 1000 },
-    { country: '美国', at },
-  ])
-  assert.equal(groups.length, 3)
-  const gd = groups.find((g) => g.key === '中国·广东省|1792281600')
-  assert.ok(gd)
-  assert.equal(gd.items.length, 2)
 })
 
 test('正常/攻击共用出弧计划：1-3 逐条细、4-8 合并中粗、>8 合并最粗，单轮预算一致', () => {

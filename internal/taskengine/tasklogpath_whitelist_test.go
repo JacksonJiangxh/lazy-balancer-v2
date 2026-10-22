@@ -1,6 +1,6 @@
 package taskengine
 
-// 历史问题：TaskLogPath 净化从黑名单（剔除 '/'、'\\'）改白名单——只保留
+// TaskLogPath 净化从黑名单（剔除 '/'、'\\'）改白名单——只保留
 // 注册任务 ID 全字母表 [A-Za-z0-9_.:-]，与 handlers sanitizeRuleID 白名单同族
 // 口径（单一净化范式，畸形 ID 不再产出黑名单遗漏字符的文件名）。注册 ID 全集
 // （taskengine_wire.go 18 个）仅用小写+数字+'-'+'.'+一个 ':'（
@@ -38,7 +38,7 @@ func TestTaskLogPath_whitelistAlphabet(t *testing.T) {
 	}
 
 	// 全非法字符 ID：净化后为空——不得拼出共享的 <dir>/.log（与未初始化
-	// 同语义返回空串，历史六维度 历史问题 观察项）。
+	// 同语义返回空串，历史六维度观察项）。
 	if got := TaskLogPath(`///???###`); got != "" {
 		t.Fatalf("全非法 ID TaskLogPath=%q, want 空串（不得产出共享 <dir>/.log）", got)
 	}

@@ -69,7 +69,7 @@ func TestGetGitHubProxyURL_missingRowFallsBackToDefault(t *testing.T) {
 }
 
 func TestGetGitHubProxyURL_outOfBandValueFallsBackToDefault(t *testing.T) {
-	// Given 带外写入的白名单外取值（历史值 ghfast.top 或任意 URL）
+	// Given 带外写入的白名单外取值（值 ghfast.top 或任意 URL）
 	setupGitHubProxyDB(t, "http://evil.example.com/")
 
 	// When

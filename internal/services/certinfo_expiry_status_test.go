@@ -1,6 +1,6 @@
 package services
 
-// 历史问题（历史）：证书到期状态判定单源。修复前 certinfo 列表用截断天数
+// 证书到期状态判定单源。修复前 certinfo 列表用截断天数
 // `<=`、任务列表（handlers/certjobs.go）用完整时长 `<= days*24h`——同一证书
 // 在 30 天阈值 + 1 分钟处两处结论分叉（列表 expiring / 任务 valid）。
 // 本族钉住 CertificateExpiryStatus 的天粒度单源，并逐消费点核对一致。

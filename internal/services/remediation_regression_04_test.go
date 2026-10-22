@@ -1,11 +1,10 @@
 package services
 
-//   - 历史修复：caddyPayload 按 __lazy_balancer_ 前缀整体剔除内部键——降级标记
+//   caddyPayload 按 __lazy_balancer_ 前缀整体剔除内部键——降级标记
 //     （degradation）/生成错误（generation_error）/证书快照（cert_files_snapshot）
 //     及未来新增内部键一律不得进 Caddy 载荷（真 Caddy StrictUnmarshalJSON 拒
-//     未知顶层字段，内部键漏网会让降级配置被 400 硬拒，历史修复 可用性优先被反转）。
-//     未知顶层键 400 的真拒绝形态钉在 r74_degradation_test.go 的测试桩里。
-//   - 历史修复：autobanCandidates 先评估后修剪——窗口到期但桶内计数已跨阈值的 IP
+//     未知顶层字段，内部键漏网会让降级配置被 400 硬拒，可用性优先被反转）。
+//   autobanCandidates 先评估后修剪——窗口到期但桶内计数已跨阈值的 IP
 //     必须并入候选执行封禁并留审计（旧行为先修剪后评估，桶尾跨阈值 IP 永不
 //     封禁，threshold 日志宣称达标却无处置）。
 
@@ -50,7 +49,7 @@ func TestCaddyPayload_stripsAllInternalKeys(t *testing.T) {
 	}
 }
 
-// TestAutobanRunCycle_expiredBucketStillBans（历史修复）：feed 跨阈值后未再触发新
+// TestAutobanRunCycle_expiredBucketStillBans：feed 跨阈值后未再触发新
 // 事件，跨过一个调度 tick（窗口到期）再跑一轮——桶尾跨阈值形态必须照样封禁
 // 并落「自动封禁」审计（旧行为先修剪后评估会把整桶丢弃，永不封禁）。
 func TestAutobanRunCycle_expiredBucketStillBans(t *testing.T) {
@@ -70,7 +69,7 @@ func TestAutobanRunCycle_expiredBucketStillBans(t *testing.T) {
 	}
 	entries := presetEntries(t)
 	if len(entries) != 1 || entries[0].Value != "203.0.113.9" {
-		t.Fatalf("窗口到期但已跨阈值的 IP 必须落名单（AB-1 先评估后修剪），得到 %+v", entries)
+		t.Fatalf("窗口到期但已跨阈值的 IP 必须落名单（先评估后修剪），得到 %+v", entries)
 	}
 	var n int
 	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE username='system' AND action='自动封禁' AND detail LIKE '%203.0.113.9%'`).Scan(&n); err != nil {

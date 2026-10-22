@@ -57,7 +57,7 @@ func StartTimezoneRefresh(ctx context.Context) <-chan struct{} {
 	timezoneRefresh.done = done
 	go func() {
 		defer close(done)
-		// 历史问题：30s tick 下持久失败逐轮同消息（最坏 2880 行/天）——改状态
+		// 30s tick 下持久失败逐轮同消息（最坏 2880 行/天）——改状态
 		// 转换口径（ok→fail 一次 warn、持续静默、fail→ok 一次 info），与
 		// metrics 采集族共用 logStateTransition。
 		refresh := func() {
@@ -123,7 +123,7 @@ func refreshLocation() error {
 		return nil
 	}
 	var tz string
-	if err := database.QueryRow("SELECT COALESCE(timezone,'Asia/Shanghai') FROM global_config WHERE id=1").Scan(&tz); err != nil {
+	if err := database.QueryRow("SELECT COALESCE(timezone,?) FROM global_config WHERE id=1", db.DefaultTimezone).Scan(&tz); err != nil {
 		return fmt.Errorf("read configured timezone: %w", err)
 	}
 	if _, err := ConfigureLocation(tz); err != nil {
@@ -134,8 +134,8 @@ func refreshLocation() error {
 
 // ValidateLocationName 校验时区名是否可作为 global_config.timezone 落库。
 // 空串必须显式拒绝：time.LoadLocation("") 是 Go 的合法特殊值（返回 UTC），
-// 放行后读侧 COALESCE(timezone,'Asia/Shanghai') 只兜 NULL 不兜空串，全站
-// 展示/审计窗口会静默切 UTC。写侧（设置保存/备份导入）与启动归一三处同口径。
+// 放行后读侧 COALESCE(timezone,?) 绑定 db.DefaultTimezone 只兜 NULL 不兜空串，
+// 全站展示/审计窗口会静默切 UTC。写侧（设置保存/备份导入）与启动归一三处同口径。
 func ValidateLocationName(name string) error {
 	if strings.TrimSpace(name) == "" {
 		return errors.New("时区不能为空")
@@ -228,10 +228,10 @@ func Logf(level, format string, args ...any) {
 	}
 }
 
-// applicationLogWriter 按 "WARNING:"/"ERROR:" 行首前缀做级别过滤（历史修复，
+// applicationLogWriter 按 "WARNING:"/"ERROR:" 行首前缀做级别过滤
 // 历史·声明）——隐式依赖 main.go log.SetFlags(0)：标准 log 的时间戳/
 // 文件名前缀会顶掉级别前缀使过滤全数落空。两侧契约互指（见 main.go 同名注释）。
-// 历史问题：多行 payload（Logf 消息内嵌换行）逐行判定后重组——只看首行会把
+// 多行 payload（Logf 消息内嵌换行）逐行判定后重组——只看首行会把
 // 后续低级别行一并放行（warn/error 档过滤被绕过）。
 type applicationLogWriter struct {
 	w io.Writer
@@ -258,7 +258,7 @@ func (writer *applicationLogWriter) Write(p []byte) (int, error) {
 		}
 		return writer.w.Write(p)
 	}
-	// 历史问题（历史）：多行 payload（Logf 消息内嵌换行）必须逐行判定并
+	// 多行 payload（Logf 消息内嵌换行）必须逐行判定并
 	// 重组——只看首行会让 warn/error 档把后续 info 级行整体放行（级别过滤失效）。
 	lines := bytes.Split(body, []byte("\n"))
 	kept := make([][]byte, 0, len(lines))
@@ -290,7 +290,7 @@ func (writer *applicationLogWriter) Write(p []byte) (int, error) {
 }
 
 // lineAllowedAtThreshold 报告单行日志是否达到配置阈值（行首级别前缀判定）。
-// 调用方不得把多行 payload 直接交给本函数——只看首行会让整体放行（历史问题）。
+// 调用方不得把多行 payload 直接交给本函数——只看首行会让整体放行。
 func lineAllowedAtThreshold(line []byte, threshold int32) bool {
 	line = trimLeadingASCIIWhitespace(line)
 	if threshold >= logLevelError {
@@ -328,7 +328,7 @@ func hasASCIIPrefixFold(value []byte, prefix string) bool {
 }
 
 // ApplyLogLevel 读取全局日志级别并应用。main 在 db.Initialize 完成后立即调用，
-// 集群配置导入（users 节）后亦调用——历史修复（历史）：此装配点同时执行
+// 集群配置导入（users 节）后亦调用——此装配点同时执行
 // 一次即时 refreshLocation。init 期启动的刷新 worker 首查时 DB 未就绪恒空转，
 // 配置时区（尤其 DST 时区）此前最长要等 30s ticker 才生效，期间日志时间戳落在
 // FixedZone+8 占位时区；装配点即时刷新消除该窗口，导入新时区亦即时生效。

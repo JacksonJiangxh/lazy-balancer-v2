@@ -96,7 +96,7 @@ func TestIP2RegionUpdateRun_success(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(filepath.Dir(ip2regionLivePath), ".staging")); !os.IsNotExist(err) {
 		t.Fatal(".staging should be cleaned up")
 	}
-	// 历史问题 1.2：成功后 .bak 须清理，不残留陈旧备份
+	// 1.2：成功后.bak 须清理，不残留陈旧备份
 	if _, err := os.Stat(ip2regionLivePath + ".bak"); !os.IsNotExist(err) {
 		t.Fatal("live xdb .bak should be cleaned after success")
 	}
@@ -112,7 +112,7 @@ func TestIP2RegionUpdateRun_skipWhenSameVersion(t *testing.T) {
 	reloads := 0
 	m.reloader = func() error { reloads++; return nil }
 
-	// 历史修复（历史问题 钉测缺口）：预置 stale sidecar（崩溃遗留形态）——
+	// 预置 stale sidecar（崩溃遗留形态）——
 	// skip 路径的 rewriteVersionIfMissingOrStale 须把它校正为当前 tag，
 	// 否则 stale tag 无限期不愈。
 	sidecar := ip2regionLivePath + ".version"
@@ -137,7 +137,7 @@ func TestIP2RegionUpdateRun_skipWhenSameVersion(t *testing.T) {
 	if message != "已是最新版本" {
 		t.Fatalf("message=%q, want 已是最新版本", message)
 	}
-	// 历史修复：stale sidecar 已被校正为 fetchLatestTag 同值
+	// stale sidecar 已被校正为 fetchLatestTag 同值
 	raw, err := os.ReadFile(sidecar)
 	if err != nil {
 		t.Fatalf("sidecar missing after skip-path refresh: %v", err)
@@ -214,9 +214,9 @@ func TestIP2RegionUpdateRun_invalidDownloadFails(t *testing.T) {
 
 func TestIP2RegionUpdateRun_reloadFailureRollsBackXDB(t *testing.T) {
 	// Given 一个已安装的旧 xdb 与一个必然失败一次的 reloader（镜像 CRS fail() 的
-	// restoreBackup+重试路径，历史问题 1.2）：reloader 失败时磁盘不得停留在新库、DB
+	// restoreBackup+重试路径， 1.2）：reloader 失败时磁盘不得停留在新库、DB
 	// 记录旧版本+failed 的不一致状态。旧 live 用合法 xdb 使还原后的内存热换成
-	// 功、走主路径（历史问题 起热换失败不再升级、仅记 warn，由另外两个
+	// 功、走主路径（自此热换失败不再升级、仅记 warn，由另外两个
 	// KeepsBaseline 用例覆盖）。
 	m := newTestIP2RegionManager(t)
 	seedIP2RegionVersionRow(t, "v3.0.0", true)
@@ -258,10 +258,10 @@ func TestIP2RegionUpdateRun_reloadFailureRollsBackXDB(t *testing.T) {
 }
 
 func TestIP2RegionUpdateRun_staleBakNotConsumedByRollback(t *testing.T) {
-	// Given 跨运行崩溃窗口残留的陈旧 .bak（历史问题）：上一运行在 rename 成功后、
+	// Given 跨运行崩溃窗口残留的陈旧.bak：上一运行在 rename 成功后、
 	// reloader 前崩溃，.bak 是旧 xdb 唯一副本。本运行 live 原本缺失（不创建新
 	// 备份，bakCreated=false），reloader 失败时 rollbackXDB 不得消费该陈旧副本。
-	// 历史问题 起 bakCreated==false 且 dist 缺失时走 fail-open：磁盘/内存已是新库，
+	// 自此 bakCreated==false 且 dist 缺失时走 fail-open：磁盘/内存已是新库，
 	// DB 按成功落库保持三方一致；陈旧 .bak 仍原样保留。
 	m := newTestIP2RegionManager(t)
 	seedIP2RegionVersionRow(t, "v3.0.0", true)
@@ -279,7 +279,7 @@ func TestIP2RegionUpdateRun_staleBakNotConsumedByRollback(t *testing.T) {
 	m.run("manual", nil)
 
 	// Then 陈旧 .bak 原样保留（未被回滚消费），live 不被还原到陈旧副本；
-	// 无基线可用时按 fail-open 记 success+新 tag（历史问题）
+	// 无基线可用时按 fail-open 记 success+新 tag
 	data, err := os.ReadFile(ip2regionLivePath + ".bak")
 	if err != nil || string(data) != staleBak {
 		t.Fatalf("stale .bak should be preserved untouched: %q, %v", data, err)
@@ -305,7 +305,7 @@ func TestIP2RegionUpdateRun_staleBakNotConsumedByRollback(t *testing.T) {
 
 func TestIP2RegionUpdateRun_reloadFailureFallsBackToDistOnFreshInstall(t *testing.T) {
 	// Given 全新部署：live xdb 不存在（无旧库可备份，bakCreated=false），dist
-	// 基线存在。reloader 必然失败一次——历史问题 修复前 rollbackXDB 静默跳过，
+	// 基线存在。reloader 必然失败一次——修复前 rollbackXDB 静默跳过，
 	// 磁盘/内存是新库、DB 记 failed+旧版本（unknown），三方长期不一致。
 	m := newTestIP2RegionManager(t)
 	seedIP2RegionVersionRow(t, "unknown", true)
@@ -363,7 +363,7 @@ func TestIP2RegionUpdateRun_reloadFailureFallsBackToDistOnFreshInstall(t *testin
 
 func TestIP2RegionUpdateRun_reloadFailureFailOpenWhenNoBaseline(t *testing.T) {
 	// Given 全新部署且 dist 也缺失（newTestIP2RegionManager 默认 dist 指向不
-	// 存在路径）：无任何「更新前基线」可回退，历史问题 fail-open——磁盘/内存已
+	// 存在路径）：无任何「更新前基线」可回退， fail-open——磁盘/内存已
 	// 是新库，DB 按成功落库保持三方一致。
 	m := newTestIP2RegionManager(t)
 	seedIP2RegionVersionRow(t, "unknown", true)
@@ -396,7 +396,7 @@ func TestIP2RegionUpdateRun_reloadFailureFailOpenWhenNoBaseline(t *testing.T) {
 }
 
 func TestIP2RegionUpdateRun_installReloadFailureGoesToRollback(t *testing.T) {
-	// Given 历史问题：安装 rename 成功但内存热换失败（seam 注入首次调用失败）——
+	// Given：安装 rename 成功但内存热换失败（seam 注入首次调用失败）——
 	// 磁盘已是新库而内存 searcher 仍是旧库，必须视同 reloader 失败进入同一回滚
 	// 路径：rollbackXDB 还原磁盘+内存，DB 记 failed+旧版本，三方一致；旧实现吞掉
 	// Reload 返回值，直接按 failed 落库会留下「磁盘新、内存旧、DB failed+旧」。
@@ -454,8 +454,8 @@ func TestIP2RegionUpdateRun_installReloadFailureGoesToRollback(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：restored 分支 reloader 调用补 nil 守卫（镜像本函数
-// 历史问题-3 两处与 CRS 侧口径）——包内直构（测试/未来重构）注入 nil reloader
+// restored 分支 reloader 调用补 nil 守卫（镜像本函数
+// 两处与 CRS 侧口径）——包内直构（测试/未来重构）注入 nil reloader
 // 时，回滚还原后的对称重载此前会 panic。nil 语义与 CRS 一致：不尝试重载、
 // 不记审计，回滚落库路径照常。
 func TestIP2RegionUpdateRun_rollbackReloadSkippedWhenReloaderNil(t *testing.T) {
@@ -502,7 +502,7 @@ func TestIP2RegionUpdateRun_rollbackReloadSkippedWhenReloaderNil(t *testing.T) {
 }
 
 func TestIP2RegionUpdateRun_rollbackRenameSuccessReloadFailKeepsBaseline(t *testing.T) {
-	// Given 历史问题：rename 级磁盘还原成功（live=更新前基线 v2，.bak 被消费）
+	// Given：rename 级磁盘还原成功（live=更新前基线 v2，.bak 被消费）
 	// 后内存热换失败——不得升级到 copy/dist：rename 已消费 .bak，copy 级必然
 	// 失败、dist 必然执行，镜像捆绑的 v1 会覆盖已正确还原的基线，造成
 	// 磁盘(dist v1)≠DB(failed+v2) 分叉且基线不可恢复。热换失败仅记 warn，
@@ -580,7 +580,7 @@ func TestIP2RegionUpdateRun_rollbackRenameSuccessReloadFailKeepsBaseline(t *test
 }
 
 func TestIP2RegionUpdateRun_rollbackCopySuccessReloadFailKeepsBaseline(t *testing.T) {
-	// Given 历史问题：rename 级被注入失败、copy 级磁盘还原成功（live=更新前
+	// Given：rename 级被注入失败、copy 级磁盘还原成功（live=更新前
 	// 基线）后内存热换失败——同样不得升级到 dist 回退覆盖正确基线（旧实现
 	// 会让 live=dist 镜像旧版，磁盘≠DB 分叉且基线虽在盘上但 live 已被污染）。
 	// 热换失败仅记 warn，按 restored=true 返回。
@@ -664,11 +664,11 @@ func TestIP2RegionUpdateRun_rollbackCopySuccessReloadFailKeepsBaseline(t *testin
 }
 
 func TestIP2RegionUpdateRun_rollbackDistCopySuccessReloadFailKeepsBaseline(t *testing.T) {
-	// Given 历史问题（与 历史问题 同口径的 dist 级情形）：安装热换失败（seam
+	// Given （与同口径的 dist 级情形）：安装热换失败（seam
 	// 恒失败），且 .bak 在回滚前丢失（seam 首次调用时删除，模拟极端故障窗
-	// 口）——历史问题 起 .bak 级磁盘还原成功后热换失败不再升级，故只有 .bak
+	// 口）——自此.bak 级磁盘还原成功后热换失败不再升级，故只有.bak
 	// 缺失才能到达 dist 级。dist copy 成功后磁盘已是 dist 基线（发行版捆绑
-	// 旧版），热换失败不得再走 error→fail-open：历史问题 fail-open 前提「磁盘已
+	// 旧版），热换失败不得再走 error→fail-open： fail-open 前提「磁盘已
 	// 是新库」在 dist copy 成功后不成立，旧实现会记 success+新 tag，造成
 	// 磁盘(dist 旧版)≠DB(新 tag) 的永久分叉。修复后与 rename/copy 级同口
 	// 径：warn + restored=true，由 run() 记 failed+旧版本。
@@ -735,13 +735,13 @@ func TestIP2RegionUpdateRun_rollbackDistCopySuccessReloadFailKeepsBaseline(t *te
 }
 
 func TestIP2RegionUpdateRun_rollbackRenameFailureFallsBackToCopy(t *testing.T) {
-	// Given 历史问题 升级链第一环：.bak→live 的 rename 失败（权限/IO），但 .bak
+	// Given 升级链第一环：.bak→live 的 rename 失败（权限/IO），但.bak
 	// 本身完好——rollbackXDB 不得直接返回 error（旧实现会重演「磁盘/内存新库、
 	// DB 记 failed+旧版本」三方分叉），应升级为 copyFile 还原。用 osRename seam
 	// 只对 .bak 源注入失败，copyFile 内部的原子 rename 不受影响。
 	m := newTestIP2RegionManager(t)
 	seedIP2RegionVersionRow(t, "v3.0.0", true)
-	// 旧 live 用合法 xdb 使 copy 还原后的内存热换成功、走主路径（历史问题 起
+	// 旧 live 用合法 xdb 使 copy 还原后的内存热换成功、走主路径（自此
 	// 热换失败不再升级，由 rollbackCopySuccessReloadFailKeepsBaseline 覆盖）。
 	writeTestXDB(t, ip2regionLivePath, testSegments)
 	oldBytes, err := os.ReadFile(ip2regionLivePath)
@@ -793,7 +793,7 @@ func TestIP2RegionUpdateRun_rollbackRenameFailureFallsBackToCopy(t *testing.T) {
 }
 
 func TestIP2RegionUpdateRun_rollbackAllBaselinesFailOpenRejected(t *testing.T) {
-	// Given 历史问题 升级链全部失败：reloader 首次失败时将 live 替换为目录，
+	// Given 升级链全部失败：reloader 首次失败时将 live 替换为目录，
 	// 此后 rename（file→dir，EISDIR）与 copyFile（tmp→dir 同样 EISDIR）均失
 	// 败，dist 回退的 copyFile 亦失败——rollbackXDB 返回 error，调用方必须改走
 	// fail-open（磁盘/内存已是新库，DB 记 success+新 tag 跟随实际状态），不得
@@ -833,7 +833,7 @@ func TestIP2RegionUpdateRun_rollbackAllBaselinesFailOpenRejected(t *testing.T) {
 	// When 安装成功但 reloader 持续失败、且全部回滚基线均失败
 	m.run("manual", nil)
 
-	// Then 历史问题：回滚全败时 live 是目录（非新工件普通文件）→ fail-open
+	// Then：回滚全败时 live 是目录（非新工件普通文件）→ fail-open
 	// **被拒绝**，DB 记 failed+旧版本（不得把未验证字节认成已生效）。
 	version, status, message, _, _, _, _ := ip2RegionVersionRow(t)
 	if status != "failed" {
@@ -921,8 +921,8 @@ func countIP2RegionFailedAudits(t *testing.T) int {
 	return n
 }
 
-// 历史问题-2（2026-09-29 裁定口径）：操作审计由 run() 的 defer 每轮单记——
-// fail() 本体零审计（曾内联「仅首败审计」历史问题，与 defer 双记已撤）。
+// （2026-09-29 裁定口径）：操作审计由 run() 的 defer 每轮单记——
+// fail() 本体零审计（曾内联「仅首败审计」，与 defer 双记已撤）。
 func TestIP2RegionUpdateFail_auditRecordedByRunDeferPerRun(t *testing.T) {
 	m := newTestIP2RegionManager(t)
 	seedIP2RegionVersionRow(t, "v3.0.0", true)
@@ -933,7 +933,7 @@ func TestIP2RegionUpdateFail_auditRecordedByRunDeferPerRun(t *testing.T) {
 		t.Fatalf("fail() 直调应零审计, got %d", got)
 	}
 
-	// 历史修复（历史）：镜像 CRS 版补 run() 级断言——经 run() 的失败轮
+	// 镜像 CRS 版补 run() 级断言——经 run() 的失败轮
 	// 每轮恰 1 条（defer 单记）。
 	m.fetchLatestTag = func(context.Context) (string, error) { return "", errors.New("查询失败") }
 	m.run("auto", nil)
@@ -947,7 +947,7 @@ func TestIP2RegionUpdateFail_counterUpdateFailureDoesNotReaudit(t *testing.T) {
 	seedIP2RegionVersionRow(t, "v3.0.0", true)
 	// 模拟第 1 次失败已落库（计数=1、已审计）；随后计数 UPDATE 持续失败（RAISE
 	// ABORT 触发器）：审计判定必须用「预读计数+1」=2，不得回退到旧计数 1 导致
-	// 第 2 次失败重复写审计（历史问题）。
+	// 第 2 次失败重复写审计。
 	if _, err := db.DB.Exec("UPDATE security_ip2region_version SET consecutive_failures=1 WHERE id=1"); err != nil {
 		t.Fatal(err)
 	}
@@ -965,7 +965,7 @@ func TestIP2RegionUpdateFail_counterUpdateFailureDoesNotReaudit(t *testing.T) {
 }
 
 func TestWriteIP2RegionUpdateLog_rotatesBeforeWriteAtSize(t *testing.T) {
-	// 历史问题：旧用例名声称「尺寸轮转」但只断言行数（未覆盖写前尺寸
+	// 旧用例名声称「尺寸轮转」但只断言行数（未覆盖写前尺寸
 	// 滚动）——此处按真实阈值驱动：预置接近阈值的历史内容，写入一行必须
 	// 先滚动到 .1，活动文件只含新行。随后放宽阈值再验证 tee 单点（每行只
 	// 写一次）。
@@ -1003,7 +1003,7 @@ func TestWriteIP2RegionUpdateLog_rotatesBeforeWriteAtSize(t *testing.T) {
 		t.Fatalf("活动文件缺少滚动后的新行: %q", active)
 	}
 
-	// tee 单点（历史问题-3）：放宽阈值后 100 行写入应恰 100 行
+	// tee 单点：放宽阈值后 100 行写入应恰 100 行
 	taskengine.SetTaskLogSizeBytesFn(func() int64 { return 1 << 20 })
 	for range 100 {
 		WriteIP2RegionUpdateLog("INFO", "tee", "y")
@@ -1054,7 +1054,7 @@ func TestIP2RegionUpdate_recordsReloadFailureAudit(t *testing.T) {
 	}
 }
 
-// 历史问题-01（历史）：demote 竞态从节点中止口径镜像 CRS（历史问题-05，第
+// demote 竞态从节点中止口径镜像 CRS（第
 // 66 轮漏收敛本侧）——起点角色复查中止须落 skipped 终态并审计「更新跳过」，
 // 不得记「更新失败」（从节点中止是正常语义，非故障）。
 func TestIP2RegionUpdateRun_slaveAbortsSkipSemantics(t *testing.T) {
@@ -1138,7 +1138,7 @@ func TestIP2RegionFailOpenPrecondition_rejectsMissingLive(t *testing.T) {
 	}
 }
 
-// 历史问题：陈旧 .bak 只在本运行创建时才可清理（成功路径）。
+// 陈旧.bak 只在本运行创建时才可清理（成功路径）。
 func TestIP2RegionUpdateRun_freshInstallKeepsStaleBakOnSuccess(t *testing.T) {
 	// Given 全新部署（live 缺失→本轮不建备份）+ 跨运行残留 .bak
 	m := newTestIP2RegionManager(t)
@@ -1171,7 +1171,7 @@ func TestIP2RegionUpdateRun_freshInstallKeepsStaleBakOnSuccess(t *testing.T) {
 	}
 }
 
-// 历史问题：安装 rename 失败路径同样不得清理非本运行的 .bak。
+// 安装 rename 失败路径同样不得清理非本运行的.bak。
 func TestIP2RegionUpdateRun_freshInstallKeepsStaleBakOnRenameFailure(t *testing.T) {
 	// Given 同上，但安装 rename 失败（安装未发生）
 	m := newTestIP2RegionManager(t)

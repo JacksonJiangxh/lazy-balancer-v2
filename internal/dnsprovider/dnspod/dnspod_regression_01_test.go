@@ -54,7 +54,7 @@ func (transport *staleDomainIDTransport) RoundTrip(request *http.Request) (*http
 }
 
 // seedDomainIDCache 以裸 zone→id 形式给出条目，内部按 provider 的
-// login_token 换算为账户隔离键（历史修复）后写入。
+// login_token 换算为账户隔离键后写入。
 
 // domain_id 缓存可能是陈旧值（域名移出账户/删除后重建，新 ID 与缓存不符）——
 // 须作废该 zone 缓存并重解析一次再重试一次，而非直接把错误抛给签发链。
@@ -90,7 +90,7 @@ func TestProvider_Present_retriesWithFreshDomainIDOnStaleCache(t *testing.T) {
 	}
 }
 
-// 历史修复 回归形状一：域名真正移出账户（Domain.List 查无）时，作废缓存后
+// 回归形状一：域名真正移出账户（Domain.List 查无）时，作废缓存后
 // 重解析失败直接返回错误——不得循环重试。
 func TestProvider_Present_staleCacheRetryStopsWhenDomainGone(t *testing.T) {
 	// Given a stale cache and an account that no longer holds the zone
@@ -133,7 +133,7 @@ func (transport *domainGoneTransport) RoundTrip(request *http.Request) (*http.Re
 	return transport.inner.RoundTrip(request)
 }
 
-// 历史修复 回归形状二：非「域名不存在」类错误（如权限/限流）不作废缓存、不重试。
+// 回归形状二：非「域名不存在」类错误（如权限/限流）不作废缓存、不重试。
 func TestProvider_Present_doesNotRetryOnUnrelatedCreateError(t *testing.T) {
 	// Given a cached id and an API that fails Record.Create with a non-domain error
 	seedDomainIDCache(t, "id,token", map[string]string{"example.com": "cached-7"})

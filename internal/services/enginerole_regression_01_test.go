@@ -23,14 +23,14 @@ import (
 func registerRoleProbeTask(t *testing.T, te *taskengine.Engine) func() error {
 	t.Helper()
 	if err := te.Register(taskengine.Descriptor{
-		ID: "r76-role-probe", Family: "test", Name: "角色探针",
+		ID: "role-probe", Family: "test", Name: "角色探针",
 		Category: "系统", Kind: taskengine.KindOneshot,
 		RunsOn: taskengine.RoleMasterOnly,
 		Run:    func(rc taskengine.RunContext) error { return nil },
 	}); err != nil {
 		t.Fatalf("register probe: %v", err)
 	}
-	return func() error { return te.Trigger("r76-role-probe", "manual", "test") }
+	return func() error { return te.Trigger("role-probe", "manual", "test") }
 }
 
 func TestBecomeSlave_flipsEngineRoleWithManagersNil(t *testing.T) {
@@ -107,7 +107,7 @@ func TestPromote_lifecycleStartsOnlyThroughEngine(t *testing.T) {
 	}
 
 	// Then：StartACME 只能由 cert-issuance daemon 调一次，不得再有直调旁路。
-	// 历史修复：固定 Sleep(100ms) 换成条件等待 + 短窗稳定性断言（高负载下
+	// 固定 Sleep(100ms) 换成条件等待 + 短窗稳定性断言（高负载下
 	// 固定窗口既可能提前（flaky 假绿）也可能空等）。
 	waitForCond(t, 2*time.Second, func() bool { return probe.acmeStarts.Load() == 1 })
 	assertCounterStable(t, &probe.acmeStarts, 1, 100*time.Millisecond)
@@ -130,7 +130,7 @@ func TestBecomeSlave_lifecycleStartsOnlyThroughEngine(t *testing.T) {
 		t.Fatalf("become slave: %v", err)
 	}
 
-	// Then：StartSync 只能由 cluster-sync daemon 的新代调用一次（历史修复：
+	// Then：StartSync 只能由 cluster-sync daemon 的新代调用一次
 	// 条件等待替代固定 Sleep，再短窗确认无迟到的第二次直调）。
 	waitForCond(t, 2*time.Second, func() bool { return probe.syncStarts.Load() == 1 })
 	assertCounterStable(t, &probe.syncStarts, 1, 100*time.Millisecond)

@@ -92,7 +92,7 @@ test('复制向导从源规则取值，仅复制分支把 host_header 编入载�
 // ============ 关闭规则日志弹框即停定时器 ============
 
 test('onRuleLogDialogClosed 停本地轮询定时器（不再 5s 空转）', () => {
-  const closed = section(rules, 'const onRuleLogDialogClosed = () => {', '// 历史修复：日志尾轮询收敛')
+  const closed = section(rules, 'const onRuleLogDialogClosed = () => {', '// 日志尾轮询收敛')
   assert.match(closed, /stopRuleLogPolling\(\)/)
   assert.match(closed, /ruleLogTail\.stop\(\)/)
 })
@@ -170,6 +170,20 @@ test('部分下拉（partial）与整体失败都有可见提示与重试', () =
   const selects = auditLog.slice(auditLog.indexOf('<div class="filter-bar">'), auditLog.indexOf('<el-table'))
   assert.equal((selects.match(/optionsIncomplete \?/g) ?? []).length, 3, '三个下拉的 placeholder 都要显性化')
   assert.match(auditLog, /@click="fetchOptions"/)
+})
+
+// 日期范围筛选的非 scoped 全局类必须按页前缀命名：两页曾共用
+// .filter-date-range 但宽度不同（360/320），非 scoped 块互相覆盖，渲染结果
+// 取决于导航顺序。Ruling：按页前缀改名（宽度不一，不上提 main.css 统一）。
+test('日期范围筛选全局类按页前缀命名（同名全局类冲突清零）', () => {
+  const events = source('src/views/security/SecurityEvents.vue')
+  assert.match(auditLog, /class="audit-filter-date-range"/)
+  assert.match(auditLog, /\.audit-filter-date-range\.el-date-editor/)
+  assert.match(events, /class="events-filter-date-range"/)
+  assert.match(events, /\.events-filter-date-range\.el-date-editor/)
+  for (const [name, text] of [['AuditLog', auditLog], ['SecurityEvents', events]] as const) {
+    assert.doesNotMatch(text, /class="filter-date-range"|\.filter-date-range\./, `${name} 不得再使用无前缀全局类`)
+  }
 })
 
 // ============ 配置预览按角色收口 ============

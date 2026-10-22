@@ -8,7 +8,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 历史问题 同族回归：v1/v2 导入共用的 normalizeRuleRowsForTransport 与启动
+// 同族回归：v1/v2 导入共用的 normalizeRuleRowsForTransport 与启动
 // 迁移必须同口径——strftime 无法解析的带 T 垃圾值保持原样，不得被静默写成
 // NULL（NULL 随后会让快照裸列 time.Time 扫描整包失败）。
 func TestNormalizeRuleRowsForTransport_preservesMalformedTimestamps(t *testing.T) {

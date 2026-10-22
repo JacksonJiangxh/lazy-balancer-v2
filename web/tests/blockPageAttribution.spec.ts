@@ -1,4 +1,4 @@
-// 拦截页归因行为验收（历史修复）：逐条对照后端渲染事实
+// 拦截页归因行为验收：逐条对照后端渲染事实
 //   internal/services/caddy.go —— buildBlockPageErrorRoute（阶段 1 预检合并 403 兜底）、
 //   buildRateLimitErrorRoute（阶段 2 恒 429）、blockStatusForPolicy（阶段 3 逐策略
 //   合成码 483+，规则级 stage3 覆盖 → 恒 482）、阶段 1/3 规则级覆盖路由（481/482）。

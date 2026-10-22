@@ -8,7 +8,7 @@ import (
 	"lazy-balancer-v2/internal/models"
 )
 
-// 历史修复: 从节点侧防御——历史修复 主节点（或被扩散的快照）可能携带 ≥2 个
+// 从节点侧防御——主节点（或被扩散的快照）可能携带 ≥2 个
 // is_default=1 的拦截页，applySecurityBlockPages 必须在写入后降级多余默认页，
 // 仅保留 MIN(id)，避免死行在从节点扩散。
 func TestApplySnapshot_demotesExtraDefaultBlockPages(t *testing.T) {

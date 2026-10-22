@@ -11,7 +11,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 历史修复: 历史修复 备份可携带 ≥2 个 is_default=1 的拦截页。导入后仅 MIN(id)
+// 备份可携带 ≥2 个 is_default=1 的拦截页。导入后仅 MIN(id)
 // 保留默认，其余降级为非默认，避免产生不可编辑/删除的死行及 branding 覆盖误伤。
 func TestImportConfigBackup_demotesExtraDefaultBlockPages(t *testing.T) {
 	// Given
@@ -67,7 +67,7 @@ func TestImportConfigBackup_demotesExtraDefaultBlockPages(t *testing.T) {
 	}
 }
 
-// 历史修复: 备份未携带任何拦截页时，重播种必须在导入事务内随提交生效，
+// 备份未携带任何拦截页时，重播种必须在导入事务内随提交生效，
 // 提交后系统存在 id=1 的默认页（拦截响应不退化）。
 func TestImportConfigBackup_reseedsDefaultBlockPageWhenBackupHasNone(t *testing.T) {
 	// Given
@@ -98,7 +98,7 @@ func TestImportConfigBackup_reseedsDefaultBlockPageWhenBackupHasNone(t *testing.
 	}
 }
 
-// 历史修复（事务性反例）: 导入在提交前被拒绝（无启用管理员），重播种不得脱离
+// （事务性反例）: 导入在提交前被拒绝（无启用管理员），重播种不得脱离
 // 事务单独落库——security_block_pages 保持导入前状态（种子行 id=1 仍在）。
 func TestImportConfigBackup_reseedRollsBackWithFailedImport(t *testing.T) {
 	// Given

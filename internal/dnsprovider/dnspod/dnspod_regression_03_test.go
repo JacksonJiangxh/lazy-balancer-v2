@@ -14,7 +14,7 @@ import (
 	"testing"
 )
 
-// staleCreateRemoveTransport 模拟 Present 阶段缓存陈旧的完整流程（历史修复）：
+// staleCreateRemoveTransport 模拟 Present 阶段缓存陈旧的完整流程
 // Domain.List 恒返回 currentID；Record.Create/Record.Remove 对其他
 // domain_id 报「域名ID错误」（code 6），对 currentID 正常创建/删除。
 // 记录每次 Create/Remove 的 domain_id 与 Remove 的 {domain_id, record_id}。
@@ -70,7 +70,7 @@ func (transport *staleCreateRemoveTransport) RoundTrip(request *http.Request) (*
 	}, nil
 }
 
-// domainID=freshID（与 cleanUp deleteOne 历史修复 回写对称）——否则 ownership
+// domainID=freshID（与 cleanUp deleteOne 回写对称）——否则 ownership
 // 模式下 Add 失败的回滚删除打向陈旧 ID（对陈旧 ID 报域名不存在类错误，
 // 回滚必败 → TXT 泄漏），FreshID 打才可能真正删掉刚创建的记录。
 func TestProvider_Present_staleRetryRollsBackWithFreshDomainID(t *testing.T) {
@@ -105,7 +105,7 @@ func TestProvider_Present_staleRetryRollsBackWithFreshDomainID(t *testing.T) {
 	}
 }
 
-// 历史修复 内存模式形状：陈旧 ID 自愈重试成功后 owned 键必须以 freshID 构键——
+// 内存模式形状：陈旧 ID 自愈重试成功后 owned 键必须以 freshID 构键——
 // 否则后续 CleanUp 以（重解析后的）freshID 构键查不到条目，静默零删除返回
 // nil，TXT 残留而验证成功。
 func TestProvider_Present_staleRetryKeysOwnedWithFreshDomainID(t *testing.T) {

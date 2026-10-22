@@ -13,18 +13,18 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 历史修复(用户 2026-09-19 裁定按建议修):
-// 历史问题 CreateRule/UpdateRule 对 chunked/未知长度超限 body 不映射 413(落 400),
+// (用户 2026-09-19 裁定按建议修)
+// CreateRule/UpdateRule 对 chunked/未知长度超限 body 不映射 413(落 400),
 // 与 PutCaddyConfig/导入路径(config_backup.go)口径不一。
-// 历史问题 UpdateRule 显式空 upstreams 数组曾被 len==0 归并进「保留存量」;改为
+// UpdateRule 显式空 upstreams 数组曾被 len==0 归并进「保留存量」;改为
 // nil 判定区分「省略」与「显式 []」——显式 [] 经 validateRulePayloadBeforeSave
-// 「至少需要一个上游服务器」400 拒绝（历史问题纠正：零上游非合法形态，
+// 「至少需要一个上游服务器」400 拒绝（纠正：零上游非合法形态，
 // 本文件早期头注释「显式 []=清空（零上游为合法形态）」与现行语义相反，已更正；
 // 引用一律用函数名，不写行号——行号漂移曾致三处误导）。
-// 历史问题 DuplicateRule 的 TCP 死形态归一漏清 CAProviderID,与 CreateRule/UpdateRule
+// DuplicateRule 的 TCP 死形态归一漏清 CAProviderID,与 CreateRule/UpdateRule
 // 两入口不对称——源行遗留 tcp+ca_provider_id≠0 死形态会放大到副本。
 
-// 历史问题①:CreateRule 对 chunked(无 ContentLength)超限 body 期望 413。
+// CreateRule 对 chunked(无 ContentLength)超限 body 期望 413。
 func TestCreateRule_chunkedOversizeBodyReturns413(t *testing.T) {
 	// Given
 	handler, _, _ := newAuditRuleHandlers(t, 0)
@@ -44,7 +44,7 @@ func TestCreateRule_chunkedOversizeBodyReturns413(t *testing.T) {
 	}
 }
 
-// 历史问题②:UpdateRule 对 chunked 超限 body 期望 413。
+// UpdateRule 对 chunked 超限 body 期望 413。
 func TestUpdateRule_chunkedOversizeBodyReturns413(t *testing.T) {
 	// Given
 	handler, _, _ := newAuditRuleHandlers(t, 0)
@@ -65,7 +65,7 @@ func TestUpdateRule_chunkedOversizeBodyReturns413(t *testing.T) {
 	}
 }
 
-// 历史问题:UpdateRule 显式 "upstreams":[] 期望显式拒绝(400 点名上游),
+// UpdateRule 显式 "upstreams":[] 期望显式拒绝(400 点名上游),
 // 且存量上游保持不变——修复前 len==0 归并「保留存量」在校验前发生,
 // 显式清空被静默吞掉(200+旧上游),校验/落库分叉。
 func TestUpdateRule_explicitEmptyUpstreamsRejected(t *testing.T) {
@@ -92,7 +92,7 @@ func TestUpdateRule_explicitEmptyUpstreamsRejected(t *testing.T) {
 	}
 }
 
-// 历史问题:DuplicateRule 对遗留 tcp+ca_provider_id≠0 死形态源行,副本应归一
+// DuplicateRule 对遗留 tcp+ca_provider_id≠0 死形态源行,副本应归一
 // ca_provider_id=0(与 CreateRule/UpdateRule 的 TCP 归一同口径)。
 func TestDuplicateRule_clearsCAProviderIDForTCP(t *testing.T) {
 	// Given
@@ -166,7 +166,7 @@ func TestDuplicateRule_copiesSecurityPolicyBindings(t *testing.T) {
 	}
 }
 
-// 历史修复：跨模式残留清理——生效来源非 manual 不保留证书材料；
+// 跨模式残留清理——生效来源非 manual 不保留证书材料；
 // 非 acme_dns 的 ca_provider_id 归零（manual→manual 编辑同样自愈）。
 func TestUpdateRule_clearsCrossSourceTLSResidue(t *testing.T) {
 	t.Run("manual-to-acme-drops-certificate-material", func(t *testing.T) {

@@ -19,7 +19,7 @@ func resetAuditFailureThrottleForTest() {
 	auditFailureLogMu.Unlock()
 }
 
-// 历史修复：负 ID 必须在发射侧整条跳过——cr.ID=-9990 发射 id:10（撞 body
+// 负 ID 必须在发射侧整条跳过——cr.ID=-9990 发射 id:10（撞 body
 // processor），cr.ID<=-10000 产出负 SecRule id，二者均使 coraza 拒绝整份配置。
 func TestEmitCustomRules_skipsNegativeIDs(t *testing.T) {
 	for _, id := range []int{-1, -9990, -10000, -20000} {
@@ -51,7 +51,7 @@ func TestEmitCustomRules_skipsNegativeIDs(t *testing.T) {
 	}
 }
 
-// 历史修复：行 Scan 失败（行存在但内容不可解析）不得被计入「N 个不存在」。
+// 行 Scan 失败（行存在但内容不可解析）不得被计入「N 个不存在」。
 func TestResolvePolicyCustomRules_scanFailureNotReportedAsDangling(t *testing.T) {
 	_, database := newClusterTestService(t)
 	// SQLite INTEGER 亲和列可存文本：score='not-a-number' 令 Scan→int 失败。
@@ -82,7 +82,7 @@ func TestResolvePolicyCustomRules_scanFailureNotReportedAsDangling(t *testing.T)
 	}
 }
 
-// 历史修复：策略内联 IP 名单 JSON 畸形时渲染路径不得静默降级——至少限流
+// 策略内联 IP 名单 JSON 畸形时渲染路径不得静默降级——至少限流
 // WARN 留痕（deny ACL / 黑名单方向静默空集即 fail-open）。
 func TestMergedACLList_warnsOnMalformedInlineJSON(t *testing.T) {
 	resetAuditFailureThrottleForTest()

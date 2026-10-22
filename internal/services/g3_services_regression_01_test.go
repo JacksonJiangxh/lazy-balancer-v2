@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// 历史修复(历史修复):轮转同秒碰撞后缀原为 UnixNano()%1000 随机数——同秒第二次轮转
+// 轮转同秒碰撞后缀原为 UnixNano()%1000 随机数——同秒第二次轮转
 // 若撞上既有副本名,os.Rename 静默覆盖(吞掉上一份轮转日志)。修复为循环递增
 // -2/-3/...(与 autobackup 同秒序号 -2..-201 同模式)直至文件名不存在。
 // 确定性 RED 构造:预建基准名 path.T 与全部 1000 个可能的 nano 后缀
@@ -88,7 +88,7 @@ func TestRotateLocked_neverOverwritesSameSecondCopies(t *testing.T) {
 	}
 }
 
-// 历史修复 回归形状:无碰撞时仍轮转为 path.T 基准名(单后缀形态不变)。
+// 回归形状:无碰撞时仍轮转为 path.T 基准名(单后缀形态不变)。
 func TestRotateLocked_plainRotationKeepsTimestampSuffix(t *testing.T) {
 	// Given 无任何既有副本
 	dir := t.TempDir()

@@ -41,7 +41,7 @@ func deleteRequest(t *testing.T, router *gin.Engine, path string) *httptest.Resp
 	return recorder
 }
 
-func r55Post(t *testing.T, handler gin.HandlerFunc, path, body string) *httptest.ResponseRecorder {
+func postImportShared(t *testing.T, handler gin.HandlerFunc, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
@@ -53,7 +53,7 @@ func r55Post(t *testing.T, handler gin.HandlerFunc, path, body string) *httptest
 	return response
 }
 
-func r55SeedCurrentAdmin(t *testing.T) {
+func seedCurrentAdminShared(t *testing.T) {
 	t.Helper()
 	if _, err := db.DB.Exec("INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (1,'current-admin','hash','admin',1)"); err != nil {
 		t.Fatalf("seed current admin: %v", err)
@@ -73,7 +73,7 @@ func checksumBackupPayload(t *testing.T, tables map[string][]map[string]any, con
 	return hex.EncodeToString(sum[:])
 }
 
-func r41PostValidate(t *testing.T, h *Handlers, body string) importValidateResponse {
+func postValidateString(t *testing.T, h *Handlers, body string) importValidateResponse {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
@@ -91,16 +91,16 @@ func r41PostValidate(t *testing.T, h *Handlers, body string) importValidateRespo
 	return envelope.Data
 }
 
-func r78ValidateRouter(h *Handlers) *gin.Engine {
+func validateRouterShared(h *Handlers) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	g := gin.New()
 	g.POST("/config/validate", h.ValidateConfigImport)
 	return g
 }
 
-func r78PostValidate(t *testing.T, h *Handlers, body []byte) importValidateResponse {
+func postValidateBytes(t *testing.T, h *Handlers, body []byte) importValidateResponse {
 	t.Helper()
-	g := r78ValidateRouter(h)
+	g := validateRouterShared(h)
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/config/validate", strings.NewReader(string(body)))
 	req.Header.Set("Content-Type", "application/octet-stream")
@@ -114,9 +114,9 @@ func r78PostValidate(t *testing.T, h *Handlers, body []byte) importValidateRespo
 	return envelope.Data
 }
 
-func r78ValidateResponse(t *testing.T, h *Handlers, body string) importValidateResponse {
+func validateResponseShared(t *testing.T, h *Handlers, body string) importValidateResponse {
 	t.Helper()
-	return r78PostValidate(t, h, []byte(body))
+	return postValidateBytes(t, h, []byte(body))
 }
 
 func marshalJSONForTest(t *testing.T, v any) string {
@@ -181,7 +181,7 @@ func newAuditLogRouter(t *testing.T) (*gin.Engine, *Handlers) {
 
 func seedR52CertificateConfig(t *testing.T) int64 {
 	t.Helper()
-	result, err := db.DB.Exec(`INSERT INTO certificate_configs (name,dns_provider,dns_credentials,enabled) VALUES ('r52-dns','dnspod','{"token":"x"}',1)`)
+	result, err := db.DB.Exec(`INSERT INTO certificate_configs (name,dns_provider,dns_credentials,enabled) VALUES ('dns-cert','dnspod','{"token":"x"}',1)`)
 	if err != nil {
 		t.Fatalf("seed certificate config: %v", err)
 	}
@@ -231,7 +231,7 @@ func getThreatScreenR79(t *testing.T, router *gin.Engine, path string) threatScr
 	return payload
 }
 
-func r78Import(h *Handlers, t *testing.T, body string) *httptest.ResponseRecorder {
+func importBackupShared(h *Handlers, t *testing.T, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	g := gin.New()

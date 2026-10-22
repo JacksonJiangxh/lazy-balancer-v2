@@ -19,7 +19,7 @@ import (
 // 调用点，其余动态传参视为违规（强制新调用点用字面量，保持可扫描）。
 
 // auditVocabDynamicAllowlist 是已人工核清的动态词条调用点，粒度为
-// 「相对 internal/ 的路径 + 参数下标 + 外层函数名」（历史问题 C-发现2：文件级
+// 「相对 internal/ 的路径 + 参数下标 + 外层函数名」（C-发现2：文件级
 // 白名单会放行同文件内新增函数的动态传参，收紧到函数级后新增函数即违规）：
 //   - handlers/audit.go recordAudit 与 middleware auditMiddleware 是
 //     recordAudit/RecordAuditLog 的透传封装；
@@ -36,11 +36,11 @@ import (
 //     续签排队/重试排队；
 //   - handlers/handlers.go finishTxApply 的动作/对象取自 txApplyFinish 的字面量
 //     字段（16 个调用点：动作 创建/更新/删除/写入+失败，对象 自定义规则/
-//     拦截页面/安全策略/IP 地址列表，均 ≤ 上限；2026-09-06 裁定 ①② 家族 3
-//     统一收尾）；
+//     拦截页面/安全策略/IP 地址列表，均 ≤ 上限；2026-09-06 裁定 ①②
+//     事务内应用门控统一收尾）；
 //   - services/downloadintegrity.go recordDownloadIntegrityAudits 的动作/对象变量由调用方
 //     传入字面量（动作 校验阻断/下载校验、对象 CRS规则库/IP数据库/完整性记录，
-//     均纳入扫描；历史问题 锁外落库改造后审计写点收敛到该 flush 函数）；
+//     均纳入扫描；锁外落库改造后审计写点收敛到该 flush 函数）；
 var auditVocabDynamicAllowlist = map[string]map[int][]string{
 	"handlers/audit.go":                {1: {"recordAudit"}, 2: {"recordAudit"}},
 	"middleware/middleware.go":         {1: {"auditMiddleware"}, 2: {"auditMiddleware"}},
@@ -71,7 +71,7 @@ var auditVocabDynamicAllowlist = map[string]map[int][]string{
 
 // auditVocabCallSpecs 给出各审计写入口的 动作/对象 参数下标。
 // recordAuthenticationSecurityAudit 是 middleware.go:38 对 services.RecordAuditLog
-// 的函数变量别名（历史问题：不登记则该调用点整点不被扫描，「认证拒绝」不进
+// 的函数变量别名（不登记则该调用点整点不被扫描，「认证拒绝」不进
 // 后端动作集，danger 契约条目虚设）。
 var auditVocabCallSpecs = map[string][2]int{
 	"RecordAuditLog":                    {1, 2},
@@ -107,8 +107,8 @@ func TestAuditVocabulary_wordLimits(t *testing.T) {
 			violations = append(violations, file+":"+strconv.Itoa(line)+" "+kind+" "+strconv.Quote(value)+" 超上限（"+strconv.Itoa(n)+" 词 > "+strconv.Itoa(limit)+"）")
 		}
 	}
-	// 历史修复 ④（历史）：字面量 (action, resource) 对命中归一表旧侧的
-	// 成对判定已随 历史问题 移入 internal/db（谓词不再导出）：
+	// 字面量 (action, resource) 对命中归一表旧侧的
+	// 成对判定已随移入 internal/db（谓词不再导出）
 	// audit_vocabulary_migration_test.go 的 TestAuditWritePointsUseCanonicalVocabulary。
 	err = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {

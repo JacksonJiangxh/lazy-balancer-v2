@@ -9,13 +9,13 @@ import (
 	"testing"
 )
 
-// 历史修复（v2.2.0 多策略 · in-tx WAF 自定义规则读取）：
+// （v2.2.0 多策略 · in-tx WAF 自定义规则读取）
 // BuildCorazaDirectives → resolvePolicyCustomRules 必须与
 // loadSecurityPolicyContext 走同一 caddyConfigStore——v2 导入事务在 tx 内
 // delete+重插 security_custom_rules 后渲染，若自定义规则读已提交 db.DB，
 // 新导入规则会从发射的 coraza 指令中静默丢失（WAF 削弱），直到下次全量重生成。
 //
-// 历史修复（v2.2.0 多策略 · 批量预载与单查路径同构）：
+// （v2.2.0 多策略 · 批量预载与单查路径同构）
 // loadSecurityPolicyContext 的批量 SELECT 必须与 scanSecurityPolicyByID
 // 的单查 SELECT 字段级一致——geoip_countries / geoip_mode /
 // waf_check_response 三列在 schema 上可空（无 NOT NULL），带外编辑或
@@ -24,7 +24,7 @@ import (
 // 仍能成功。
 
 // seedCustomRuleInTx 在事务内插入一条 enabled 自定义规则并返回其 id；
-// 该规则在事务外的已提交 db.DB 视角中不存在——正是 历史修复 复现所需。
+// 该规则在事务外的已提交 db.DB 视角中不存在——正是复现所需。
 func seedCustomRuleInTx(t *testing.T, tx *sql.Tx, name string) int {
 	t.Helper()
 	conditions := `[{"target":"uri","operator":"contains","pattern":"/tx-only"}]`
@@ -41,7 +41,7 @@ func seedCustomRuleInTx(t *testing.T, tx *sql.Tx, name string) int {
 }
 
 // TestGenerateCaddyConfigFromStore_readsUncommittedCustomRuleThroughTx 锁定
-// 历史修复 修复：在 tx 内播种自定义规则+绑定策略+绑定规则，从 tx 渲染时
+// 修复：在 tx 内播种自定义规则+绑定策略+绑定规则，从 tx 渲染时
 // 发射的 WAF 指令必须包含该规则的 id 与 msg——修复前
 // resolvePolicyCustomRules 走全局 db.DB 看不到未提交行，规则静默丢失。
 func TestGenerateCaddyConfigFromStore_readsUncommittedCustomRuleThroughTx(t *testing.T) {
@@ -94,14 +94,14 @@ func TestGenerateCaddyConfigFromStore_readsUncommittedCustomRuleThroughTx(t *tes
 	}
 	wantID := fmt.Sprintf("id:%d", ruleID+10000)
 	if !strings.Contains(directives, wantID) {
-		t.Fatalf("事务内生成必须发射自定义规则 id %s（A-I1：规则仅存在于 tx）:\n%s", wantID, directives)
+		t.Fatalf("事务内生成必须发射自定义规则 id %s（规则仅存在于 tx）:\n%s", wantID, directives)
 	}
 	if !strings.Contains(directives, "tx-only-rule") {
 		t.Fatalf("事务内生成必须携带自定义规则名 tx-only-rule:\n%s", directives)
 	}
 }
 
-// TestLoadSecurityPolicyContext_toleratesNullGeoIPColumns 锁定 历史修复 修复：
+// TestLoadSecurityPolicyContext_toleratesNullGeoIPColumns 锁定修复
 // 显式插入 geoip_countries=NULL 的策略行，批量预载必须成功并返回该策略
 // （与 scanSecurityPolicyByID 单查路径同构，COALESCE 归一化）；
 // 修复前批量 scan 直接报错 → 整配置生成失败（旧配置已保留）。
@@ -129,7 +129,7 @@ func TestLoadSecurityPolicyContext_toleratesNullGeoIPColumns(t *testing.T) {
 
 	// Then：不得 scan 失败；策略按 id 可见且字段归一化到 COALESCE 默认值
 	if err != nil {
-		t.Fatalf("loadSecurityPolicyContext 不得因 NULL 列报错（A-I2）: %v", err)
+		t.Fatalf("loadSecurityPolicyContext 不得因 NULL 列报错: %v", err)
 	}
 	policies := ctx.policyByRule["lb_null_geoip"]
 	if len(policies) != 1 {
@@ -150,7 +150,7 @@ func TestLoadSecurityPolicyContext_toleratesNullGeoIPColumns(t *testing.T) {
 	}
 }
 
-// TestLoadSecurityPolicyContext_toleratesNullCoreColumns 锁定 历史修复 硬化扩展：
+// TestLoadSecurityPolicyContext_toleratesNullCoreColumns 锁定硬化扩展
 // 除 geoip 三列外，fresh-install schema 下其余扫描列同样可空（仅 name/PK
 // NOT NULL）——带外编辑、restoreTable 透传 JSON null、集群快照继承均可产生
 // NULL。批量预载必须对全部可空列 COALESCE 归一化（与单查路径表达式级同构），
@@ -178,7 +178,7 @@ func TestLoadSecurityPolicyContext_toleratesNullCoreColumns(t *testing.T) {
 
 	// Then：不得 scan 失败；字段归一化到 COALESCE 默认值
 	if err != nil {
-		t.Fatalf("loadSecurityPolicyContext 不得因 NULL 核心列报错（A-I2 硬化）: %v", err)
+		t.Fatalf("loadSecurityPolicyContext 不得因 NULL 核心列报错（硬化）: %v", err)
 	}
 	policies := ctx.policyByRule["lb_null_core"]
 	if len(policies) != 1 {
@@ -199,7 +199,7 @@ func TestLoadSecurityPolicyContext_toleratesNullCoreColumns(t *testing.T) {
 	}
 }
 
-// TestLoadSecurityPolicyContext_toleratesAllNullColumns 锁定 历史问题 缺口：
+// TestLoadSecurityPolicyContext_toleratesAllNullColumns 锁定缺口
 // toleratesNullGeoIPColumns / toleratesNullCoreColumns 只覆盖 7 列——对批量
 // SELECT 中其余任一可空列的定向 PARTIAL 回退（如 created_at / description /
 // rate_limit_rps）当前全部测试不感知。本测试把 security_policies 的全部
@@ -245,7 +245,7 @@ func TestLoadSecurityPolicyContext_toleratesAllNullColumns(t *testing.T) {
 	// When：批量预载（与 generateCaddyConfigFromStore 同通道）
 	ctx, err := loadSecurityPolicyContext(database)
 
-	// Then：不得 scan 失败（历史问题：任一 COALESCE 缺失即在此暴露）；
+	// Then：不得 scan 失败（任一 COALESCE 缺失即在此暴露）；
 	// 字段归一化到 schema 默认值
 	if err != nil {
 		t.Fatalf("loadSecurityPolicyContext 不得因全 NULL 列报错（历史问题）: %v", err)
@@ -275,7 +275,7 @@ func TestLoadSecurityPolicyContext_toleratesAllNullColumns(t *testing.T) {
 	}
 }
 
-// TestSnapshotSecurityPolicies_coalescesNullJSONColumns 锁定 历史修复 集群传播
+// TestSnapshotSecurityPolicies_coalescesNullJSONColumns 锁定集群传播
 // 硬化：主节点 dump（snapshotSecurityPolicies）必须对可空列 COALESCE——否则
 // 主节点一行 NULL 经快照原样透传（dumpTableAsJSON 把 NULL  marshals 成
 // JSON null），从节点 apply 时 snapshotJSONText(nil) 重新落 NULL，脏数据
@@ -321,11 +321,11 @@ func TestSnapshotSecurityPolicies_coalescesNullJSONColumns(t *testing.T) {
 	}
 }
 
-// TestLoadSecurityPolicyContext_toleratesNullBlockPageContent 锁定 历史修复：
+// TestLoadSecurityPolicyContext_toleratesNullBlockPageContent 锁定
 // security_block_pages.content 列 schema 无 NOT NULL，带外编辑或 restoreTable
 // 透传 JSON null 可产生 NULL 行。批量预载 SELECT 若不做 COALESCE 归一空串，
 // 一行 NULL content 即 scan 失败 → 整配置生成报错（旧配置保留，形成自锁）。
-// 修复后归一为空串，与 schema DEFAULT 空串语义一致（历史修复：三处右双
+// 修复后归一为空串，与 schema DEFAULT 空串语义一致（三处右双
 // 弯引号排版事故修正——gofmt 1.27 doc 注释排版会把空串双单引号字面量转回
 // 弯引号，故用「空串」文字表述承载）。
 func TestLoadSecurityPolicyContext_toleratesNullBlockPageContent(t *testing.T) {
@@ -351,7 +351,7 @@ func TestLoadSecurityPolicyContext_toleratesNullBlockPageContent(t *testing.T) {
 	// When：批量预载（与 generateCaddyConfigFromStore 同通道）
 	ctx, err := loadSecurityPolicyContext(database)
 
-	// Then：不得 scan 失败（历史修复：COALESCE 缺失即在此暴露）；
+	// Then：不得 scan 失败（COALESCE 缺失即在此暴露）；
 	// 拦截页内容归一化为 ''
 	if err != nil {
 		t.Fatalf("loadSecurityPolicyContext 不得因 NULL content 报错（历史问题）: %v", err)

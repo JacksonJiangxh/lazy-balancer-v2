@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// 历史问题 兼容补丁：「海外」条目的语义展开——存量「禁止海外」规则在发射端改造
+// 兼容补丁：「海外」条目的语义展开——存量「禁止海外」规则在发射端改造
 // （已解析海外行发国名）后，「海外」条目必须展开为「哨兵 ∪ 树 Countries 全集」，
 // 否则已解析海外流量漏放（deny）/误拒（allow）。语义=「任何海外值」。
 func TestGeoipLocOperator_overseasEntryExpandsToAllCountries(t *testing.T) {

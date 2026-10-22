@@ -18,8 +18,8 @@
           <span class="bind-stage-title">{{ section.title }}</span>
           <span class="bind-stage-head-meta">
             <span class="bind-stage-count">已选 {{ section.selection.value.length }} 条</span>
-            <!-- 存量多限流绑定（历史问题 裁定：运行兼容 + 保存即引导清理）：单选控件
-                 仅展示首条，徽标使显示与 ruleModeTotal 计数口径一致（历史问题-37） -->
+            <!-- 存量多限流绑定（裁定：运行兼容 + 保存即引导清理）：单选控件
+                 仅展示首条，徽标使显示与 ruleModeTotal 计数口径一致-->
             <el-tag
               v-if="section.single && section.selection.value.length > 1"
               type="warning"
@@ -268,7 +268,7 @@ const pickerPagedRules = computed(() => {
   return pickerFilteredRules.value.slice(start, start + PICKER_PAGE_SIZE)
 })
 
-// 历史修复（历史修复 同族，对照 SecurityPolicies 同名选择器先例）：搜索收窄后高页码
+// （同族，对照 SecurityPolicies 同名选择器先例）：搜索收窄后高页码
 // 会落在空页，回到第 1 页
 watch(pickerSearch, () => {
   pickerPage.value = 1
@@ -375,7 +375,7 @@ const submit = async (): Promise<void> => {
     try {
       // mixed 不携带提交：后端按提交集全量替换绑定（携带 mixed 会被拒绝，不含
       // mixed 的提交会静默剥离）；存在已绑 mixed 时保存按钮已禁用，不会走到这里。
-      // 响应经 showSaveResult 统一呈现（历史问题）：退化 200（DB 已提交
+      // 响应经 showSaveResult 统一呈现：退化 200（DB 已提交
       // 但 Caddy 应用失败）带 message 后缀时必须常驻警告，原实现丢弃返回值。
       const res = await request.put<APIResponse>(`/security/rules/${encodeURIComponent(rule.caddy_id)}/policies`, {
         policy_ids: [...bindStage0.value, ...bindStage1.value, ...bindStage2.value, ...bindStage3.value],
@@ -392,7 +392,7 @@ const submit = async (): Promise<void> => {
     return
   }
 
-  // 策略模式：全量重置该策略的绑定集——策略侧批量端点一次提交（历史：
+  // 策略模式：全量重置该策略的绑定集——策略侧批量端点一次提交（
   // 原逐规则 PUT 规则侧全量端点，每条独立全链渲染，N 规则=N×~500ms；bulk
   // 单事务只增删本策略绑定行、不触碰兄弟绑定，语义与原循环一致，单渲染）。
   const pid = props.policyId
@@ -415,9 +415,9 @@ const submit = async (): Promise<void> => {
   }
   saving.value = true
   try {
-    // 历史问题-06：bulk 端点单次 bind+unbind 合计 ≤100——按方向分片提交（每片 ≤100
+    // bulk 端点单次 bind+unbind 合计 ≤100——按方向分片提交（每片 ≤100
     // 天然满足合计上限）；端点幂等，部分失败后重试安全。
-    // 历史问题：逐片响应必须汇总后再呈现——原实现只保留末片，早先分片的退化
+    // 逐片响应必须汇总后再呈现——原实现只保留末片，早先分片的退化
     // 200（DB 已提交但 Caddy 应用失败）被覆盖，常驻警告丢失。
     const responses: Array<APIResponse<unknown> | undefined> = []
     for (const ids of chunkForBulk(toBind, SECURITY_BULK_LIMITS.policyBindings)) {
@@ -430,7 +430,7 @@ const submit = async (): Promise<void> => {
     emit('update:modelValue', false)
     emit('saved')
   } catch (error: unknown) {
-    // 与规则侧对齐（历史问题）：原无 catch → 请求失败产生 unhandled
+    // 与规则侧对齐：原无 catch → 请求失败产生 unhandled
     // rejection（全局拦截器已 toast，这里仅记录并保持弹框可重试）
     console.error('save policy bindings failed', error)
   } finally {

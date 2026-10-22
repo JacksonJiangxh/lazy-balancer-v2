@@ -16,10 +16,10 @@ import (
 )
 
 // GetAuditLogOptions 返回筛选下拉的可选值：操作人/操作取自审计库去重
-// auditOptionsCache(历史问题):options 三条 GROUP BY 的进程内缓存(60s)——
+// auditOptionsCache:options 三条 GROUP BY 的进程内缓存(60s)——
 // 下拉选项对实时性不敏感,深审计库每次筛选面板打开都做三趟全表 GROUP BY
 // 是无谓放大;写侧不失效(60s 窗口内新动作延迟出现,可接受口径)。
-// 历史问题:读写并发加 sync.Mutex(与 helpers.go diskUsageCache 同型)——
+// 读写并发加 sync.Mutex(与 helpers.go diskUsageCache 同型)——
 // 此前读缓存/写缓存无锁,并发筛选面板打开可交错出撕裂读。
 var auditOptionsCache struct {
 	sync.Mutex
@@ -47,7 +47,7 @@ func (h *Handlers) GetAuditLogOptions(c *gin.Context) {
 		Value string `json:"value"`
 		Count int64  `json:"count"`
 	}
-	// 历史问题（历史）：锁只保护缓存读写（double-check，与 brandingStore 慢
+	// 锁只保护缓存读写（double-check，与 brandingStore 慢
 	// 路径同型）——此前持锁执行三条全表 GROUP BY，深审计库/IO 抖动时全部
 	// 筛选面板请求（含命中缓存路径）被串行阻塞。缓存 miss 时释放锁再查询，
 	// 并发 miss 各自查询后写回（同内容，最后写入者胜，无撕裂读）。
@@ -67,7 +67,7 @@ func (h *Handlers) GetAuditLogOptions(c *gin.Context) {
 			ORDER BY cnt DESC, `+column+`
 			LIMIT ?`, limit)
 		if err != nil {
-			// 历史问题：查询失败曾零日志（恒 200 空/部分下拉，运维无信号）——
+			// 查询失败曾零日志（恒 200 空/部分下拉，运维无信号）——
 			// 首错处 warn 留痕，响应携带 partial 标记。
 			services.Logf("warn", "审计日志下拉选项（%s）查询失败: %v", column, err)
 			return []optionRow{}, err
@@ -78,11 +78,11 @@ func (h *Handlers) GetAuditLogOptions(c *gin.Context) {
 		for rows.Next() {
 			var o optionRow
 			if err := rows.Scan(&o.Value, &o.Count); err != nil {
-				// 历史修复（历史）：单行 Scan 失败须留痕——静默丢行让下拉
+				// 单行 Scan 失败须留痕——静默丢行让下拉
 				// 缺项零信号（主查询 500 口径在此分裂为静默）。
 				services.Logf("warn", "审计日志下拉选项（%s）行扫描失败: %v", column, err)
 				// Scan 失败也是故障轮——此前只 continue，fetchErr 不置位，
-				// 缺项下拉被当作完整结果写进 60s 缓存（同文件 历史问题 门禁的
+				// 缺项下拉被当作完整结果写进 60s 缓存（同文件门禁的
 				// 遗漏分支）。保留首错用于缓存门判定。
 				if scanErr == nil {
 					scanErr = fmt.Errorf("审计日志下拉选项（%s）行扫描失败: %w", column, err)
@@ -91,7 +91,7 @@ func (h *Handlers) GetAuditLogOptions(c *gin.Context) {
 			}
 			out = append(out, o)
 		}
-		// 迭代错误上抛 fetchErr——历史问题 缓存门口径统一（查询失败
+		// 迭代错误上抛 fetchErr——缓存门口径统一（查询失败
 		// 与迭代失败同为故障轮，空/部分结果不得写 60s 缓存）。
 		if err := rows.Err(); err != nil {
 			services.Logf("warn", "审计日志下拉选项（%s）迭代失败: %v", column, err)
@@ -115,9 +115,9 @@ func (h *Handlers) GetAuditLogOptions(c *gin.Context) {
 		"actions":   collect("action", 100),
 		"resources": collect("COALESCE(resource,'')", 50),
 	}
-	// 历史问题:任一 fetchDistinct 出错即跳过本轮缓存写入——空结果是故障形态,
+	// 任一 fetchDistinct 出错即跳过本轮缓存写入——空结果是故障形态,
 	// 缓存它会让一次瞬态错误在 60s 窗口内持续喂空下拉。
-	// 历史问题：故障轮响应携带可选 partial=true（旧字段原样保留，前端/JSON
+	// 故障轮响应携带可选 partial=true（旧字段原样保留，前端/JSON
 	// 消费方兼容），让「部分下拉」与「真空库」可区分。
 	if fetchErr == nil {
 		auditOptionsCache.Lock()
@@ -133,7 +133,7 @@ func (h *Handlers) GetAuditLogOptions(c *gin.Context) {
 // buildAuditLogFilters 组装列筛选 WHERE 子句。时间参数按配置时区解析后
 // 换算为 UTC 与 created_at 比较；日期-only 输入自动补全天/日边界。
 func buildAuditLogFilters(c *gin.Context, loc *time.Location) (string, []interface{}, bool) {
-	// 历史问题:LIKE 值侧转义——用户输入中的 %/_/\ 是字面字符,不转义会被
+	// LIKE 值侧转义——用户输入中的 %/_/\ 是字面字符,不转义会被
 	// 当通配符(搜「100%」命中 100abc);SQL 追加 ESCAPE '\' 声明转义符。
 	like := func(column, value string) (string, interface{}) {
 		escaped := strings.ReplaceAll(value, `\`, `\\`)
@@ -168,7 +168,7 @@ func buildAuditLogFilters(c *gin.Context, loc *time.Location) (string, []interfa
 		conds = append(conds, c1)
 		args = append(args, a1)
 	}
-	// 畸形时间筛选改 400（历史 历史修复，用户裁定）：此前解析失败静默丢弃条件
+	// 畸形时间筛选改 400：此前解析失败静默丢弃条件
 	// 返回全量数据——用户以为在按时间过滤而实际没有。解析统一在此处做，
 	// 失败即 400（aborted=true 让调用方短路）。
 	parseBoundary := func(raw, endOfDay string) (time.Time, bool, bool) {
@@ -189,7 +189,7 @@ func buildAuditLogFilters(c *gin.Context, loc *time.Location) (string, []interfa
 	if startT, ok1, abort1 := parseBoundary(c.Query("start_time"), "00:00:00"); abort1 {
 		return "", nil, true
 	} else if ok1 {
-		// 历史修复(2026-09-10 审计):裸列比较替代 datetime(created_at) 包裹——包裹
+		// (2026-09-10 审计):裸列比较替代 datetime(created_at) 包裹——包裹
 		// 使 idx_audit_log_created 失效全表扫;created_at 为 SQLite 规范 UTC 文本
 		// 与 datetime(?) 输出同格式,直接比较等价且可走索引。
 		conds = append(conds, " AND created_at >= datetime(?)")
@@ -220,8 +220,8 @@ func (h *Handlers) GetAuditLogs(c *gin.Context) {
 		page = 1
 	}
 	// clamp 上限防 *pageSize 整数溢出为负 → SQLite OFFSET 报错 500
-	// （与 ListSecurityEvents security.go:815 同口径，历史问题）。
-	// 历史问题:上限收紧 100000→10000——审计库全量在百万行量级内,10 万页
+	// （与 ListSecurityEvents security.go:815 同口径）。
+	// 上限收紧 100000→10000——审计库全量在百万行量级内,10 万页
 	// (200 万行偏移)无命中语义只浪费深翻页扫描。
 	if page > 10000 {
 		page = 10000
@@ -236,7 +236,7 @@ func (h *Handlers) GetAuditLogs(c *gin.Context) {
 	// 时间范围为配置时区的本地时间（created_at 按 UTC 存储，比较前换算）。
 	loc := time.UTC
 	var tzStr string
-	if err := db.DB.QueryRow("SELECT COALESCE(timezone,'Asia/Shanghai') FROM global_config WHERE id=1").Scan(&tzStr); err != nil {
+	if err := db.DB.QueryRow("SELECT COALESCE(timezone,?) FROM global_config WHERE id=1", db.DefaultTimezone).Scan(&tzStr); err != nil {
 		services.Logf("error", "GetAuditLogs: failed to read configured timezone, using UTC: %v", err)
 	} else if l, lerr := time.LoadLocation(tzStr); lerr == nil {
 		loc = l

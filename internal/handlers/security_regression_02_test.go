@@ -19,7 +19,7 @@ import (
 
 // aggregateFailingConnector 返回一个假 metrics 库：GROUP BY 聚合查询「语句执行
 // 成功、迭代第一步即失败」，标量 COUNT 查询正常返回 0。用于注入聚合循环的
-// rows.Err() 故障（历史修复）。
+// rows.Err() 故障。
 type aggregateFailingConnector struct{}
 
 func (aggregateFailingConnector) Connect(context.Context) (driver.Conn, error) {
@@ -77,8 +77,8 @@ func (r *scalarZeroRows) Next(dest []driver.Value) error {
 }
 
 // TestGetSecurityOverview_aggregateIterationFailureReturns500 验证聚合循环的
-// 迭代错误（rows.Err()）使总览显式返回 500，而不是部分数据 + 200（历史修复，
-// 与 历史修复 在 ListSecurityEvents 建立的标准一致）。
+// 迭代错误（rows.Err()）使总览显式返回 500，而不是部分数据 + 200
+// 与在 ListSecurityEvents 建立的标准一致）。
 func TestGetSecurityOverview_aggregateIterationFailureReturns500(t *testing.T) {
 	// Given a metrics store whose aggregate queries fail mid-iteration
 	setupSecurityPolicyTestDB(t)

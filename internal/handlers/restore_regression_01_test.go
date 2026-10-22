@@ -42,7 +42,7 @@ func newFakeCaddyServer(t *testing.T, rec *fakeCaddyRecorder) *httptest.Server {
 // 对 **ACME 规则** 的 409（证书在途）早退仍零扰动（acmeToAcme 守卫测试覆盖）。
 // 保存 200 且遗留任务行被删除——孤儿自愈优先于 409 守卫（用户裁定：脱离
 // ACME 的规则不得被遗留任务挡住，残留行直接清理）。
-// 历史修复②：测试名/断言对齐现行语义（原名为 restoresRuntimeForTCP，但该
+// 测试名/断言对齐现行语义（原名为 restoresRuntimeForTCP，但该
 // 场景从不回滚运行配置）——保存必须真实触发一次 /load，载荷含新上游。
 func TestUpdateRule_orphanCertJobSelfHealsForTCP(t *testing.T) {
 	h := newBackupTestHandlers(t)

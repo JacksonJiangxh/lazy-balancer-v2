@@ -3,7 +3,7 @@
 // DNSPod and Tencent Cloud providers so a momentary API hiccup does not
 // immediately fail an ACME DNS-01 challenge and burn CA order quota.
 //
-// 历史问题（历史）：创建类请求（DNSPod Record.Create / 腾讯云
+// 创建类请求（DNSPod Record.Create / 腾讯云
 // CreateRecord）对 5xx 不重放——创建响应丢失时重试会在 DNS 侧产生一条
 // 无 ID 幽灵 TXT（清理只按 ownership 记录 ID 删除，幽灵条目永不收敛）；
 // 429 恒定重试（限流响应意味着记录未被创建）。非创建类动作维持重试；
@@ -31,10 +31,10 @@ func Retryable(status int) bool {
 	return status == http.StatusTooManyRequests || status >= 500
 }
 
-// After parses a 历史修复 header value (delay-seconds or HTTP-date) into a
+// After parses a header value (delay-seconds or HTTP-date) into a
 // duration. Unparseable, empty, or past values yield zero.
 //
-// 历史问题（历史）：本函数与 services/certissuer.go 的 parseRetryAfter 是
+// 本函数与 services/certissuer.go 的 parseRetryAfter 是
 // 同语义双实现（包边界所致：本包属 dnsprovider/internal，services 不可导入）。
 // 解析口径（delay-seconds/HTTP-date、不可解析或非正归零）任一侧变更 MUST
 // 同步另一侧并保持语义一致。
@@ -66,7 +66,7 @@ func createRecordAction(request *http.Request) bool {
 }
 
 // Transport wraps a base RoundTripper and retries requests whose response is
-// a transient failure (HTTP 429/5xx). 历史修复 responses and transport
+// a transient failure (HTTP 429/5xx). responses and transport
 // errors are returned as-is; the last response is returned once attempts are
 // exhausted. Request bodies are buffered so retries replay identical bytes
 // (the only request field this wrapper mutates, as the original body is
@@ -108,7 +108,7 @@ func (t *Transport) RoundTrip(request *http.Request) (*http.Response, error) {
 			return response, nil
 		}
 		if response.StatusCode != http.StatusTooManyRequests && createRecordAction(request) {
-			// 历史问题：创建类动作的 5xx 不重放（幽灵 TXT，见包注释）；429 恒定重试。
+			// 创建类动作的 5xx 不重放（幽灵 TXT，见包注释）；429 恒定重试。
 			return response, nil
 		}
 		wait := backoff

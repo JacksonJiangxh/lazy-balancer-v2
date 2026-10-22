@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// 历史问题-01/02/04 + 历史问题-01 修复钉测试。
+// /02/04 + 修复钉测试。
 // 形状来源：生产调用形态=启动/翻转期三连 SetMasterRole→SetRole（每次转发），
 // 既有测试每轮只翻一次与生产不符——本文件按真实形态钉。
 
@@ -54,7 +54,7 @@ func waitNotRunning(t *testing.T, e *Engine, id string, timeout time.Duration) b
 
 // Given RoleAny 常驻已运行 + 三连同角色 SetRole 重申（生产启动/翻转形态）。
 // When 用户 StopLoop。
-// Then daemon 停止且不复活（SetRole 重申不得栽 pendingRestart——历史问题-01①）。
+// Then daemon 停止且不复活（SetRole 重申不得栽 pendingRestart——①）。
 func TestEngine_SetRoleReassertionDoesNotReviveStoppedDaemon(t *testing.T) {
 	e := newTestEngine(t)
 	started := make(chan struct{}, 4)
@@ -85,7 +85,7 @@ func TestEngine_SetRoleReassertionDoesNotReviveStoppedDaemon(t *testing.T) {
 // Given master-only 常驻在主节点运行 + 启动/重申期 SetRole(true) 已栽标
 // （生产形态：main 启动三连 SetMasterRole 全部走允许侧 tryStartDaemon）。
 // When demote（三连 SetRole(false)——生产形态）。
-// Then Run 取消退出后**不得按栽标在从节点复活**（历史问题-01③a）。
+// Then Run 取消退出后**不得按栽标在从节点复活**。
 func TestEngine_DemoteTripleSetRoleDoesNotReviveOnSlave(t *testing.T) {
 	e := newTestEngine(t)
 	started := make(chan struct{}, 4)
@@ -115,7 +115,7 @@ func TestEngine_DemoteTripleSetRoleDoesNotReviveOnSlave(t *testing.T) {
 }
 
 // Given 常驻运行中且已被 SetRole 重申（bug 形态下会栽标）。
-// When Engine.Stop()（进程退出——历史修复 补充的第四触发面）。
+// When Engine.Stop()（进程退出——补充的第四触发面）。
 // Then 不在 teardown 中拉起新代。
 func TestEngine_StopPreventsRestart(t *testing.T) {
 	e := newTestEngine(t)
@@ -139,7 +139,7 @@ func TestEngine_StopPreventsRestart(t *testing.T) {
 
 // Given master-only Periodic（interval 1h）在从节点 StartLoop。
 // When 若干 tick 后 promote（SetRole(true)）。
-// Then 首轮在 promote 后立即执行（历史问题-02：置零分支不可达+tick 在角色门
+// Then 首轮在 promote 后立即执行（置零分支不可达+tick 在角色门
 // 前推进 lastCheck——两处叠加使首轮要等残余间隔）。
 func TestEngine_PeriodicRunsPromptlyAfterPromote(t *testing.T) {
 	e := newTestEngine(t)
@@ -165,7 +165,7 @@ func TestEngine_PeriodicRunsPromptlyAfterPromote(t *testing.T) {
 }
 
 // Given StartLoop→StopLoop→StartLoop（restart 过渡）后立即 StopLoop
-// （历史问题-04：restart 路径的 startDaemon 由退出 goroutine 异步调用——
+// （restart 路径的 startDaemon 由退出 goroutine 异步调用——
 // 占位与 cancel 登记之间的窗口内取消者读到 cancel==nil）。
 // When 重复 20 次。
 // Then 每次 daemon 最终停止（首停信号不得丢失）。
@@ -185,7 +185,7 @@ func TestEngine_StopLoopImmediatelyAfterStartEventuallyStops(t *testing.T) {
 	}
 }
 
-// Given oneshot 任务体 panic（历史问题-01）。
+// Given oneshot 任务体 panic。
 // When Trigger。
 // Then panic 被隔离为 failed 行（不得杀进程）。
 func TestEngine_TaskRunPanicRecordsFailed(t *testing.T) {
@@ -205,9 +205,9 @@ func TestEngine_TaskRunPanicRecordsFailed(t *testing.T) {
 	}
 }
 
-// Given daemon 任务体启动即 panic（历史问题-01）。
+// Given daemon 任务体启动即 panic。
 // When StartLoop。
-// Then 补记 failed 行且退避窗口内不得紧循环（历史问题-04 起异常退出按有界退避
+// Then 补记 failed 行且退避窗口内不得紧循环（起异常退出按有界退避
 // 重拉——默认首档 1s，本断言窗口 200ms 内必须保持未运行；重拉本身由
 // u05_r79_test.go 的缩短退避用例覆盖）。
 func TestEngine_DaemonRunPanicRecordsFailedWithBackoff(t *testing.T) {
@@ -333,7 +333,7 @@ func TestEngine_RoleFlipWithoutFlagNoRestart(t *testing.T) {
 
 // Given master-only Scheduled 任务在途（Run 阻塞于 rc.Ctx.Done）。
 // When demote（SetRole(false)，生产形态）。
-// Then 在途 Run 被中止且终态落 cancelled（历史问题-01：SetRole targets 曾仅
+// Then 在途 Run 被中止且终态落 cancelled（SetRole targets 曾仅
 // Daemon/Periodic——定时族在途 Run 继续跑完，demote 后从节点写面（三库
 // 版本行/名单/规则树）打破只读不变量；取消经 rc.Ctx 传播，Run 体据此落
 // skipped 与起点角色复查对齐）。
@@ -343,7 +343,7 @@ func TestEngine_DemoteCancelsInFlightScheduled(t *testing.T) {
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
 	e.Register(Descriptor{ID: "t-sched", Family: "t", Name: "定时", Kind: KindScheduled, RunsOn: RoleMasterOnly,
-		// 历史修复（历史）配套：Scheduled 注册必须带 NextSlotFn（远期槽——
+		// 配套：Scheduled 注册必须带 NextSlotFn（远期槽——
 		// tick 不触发，本测试经 Trigger 驱动在途形态）。
 		NextSlotFn: func() time.Time { return time.Now().Add(time.Hour) },
 		Run: func(rc RunContext) error {
@@ -428,7 +428,7 @@ func TestEngine_RapidRoleFlipRestartsMasterOnlyDaemon(t *testing.T) {
 
 // Given master-only Periodic 任务在途（Run 阻塞于 rc.Ctx.Done）。
 // When demote（SetRole(false)，生产形态）。
-// Then 在途 Run 被中止且终态落 cancelled（历史修复：Periodic 分支曾仅在
+// Then 在途 Run 被中止且终态落 cancelled（Periodic 分支曾仅在
 // 角色获得时置零节拍，demote 不取消在途 Run——与 Scheduled 分支同型的只读
 // 不变量破坏：从节点写面继续跑完。本测试钉「镜像 Scheduled 取消」）。
 func TestEngine_DemoteCancelsInFlightPeriodic(t *testing.T) {
@@ -437,7 +437,7 @@ func TestEngine_DemoteCancelsInFlightPeriodic(t *testing.T) {
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
 	e.Register(Descriptor{ID: "t-periodic", Family: "t", Name: "周期", Kind: KindPeriodic, RunsOn: RoleMasterOnly,
-		// 历史修复（历史）配套：Periodic 注册必须带 IntervalFn（长间隔——
+		// 配套：Periodic 注册必须带 IntervalFn（长间隔——
 		// tick 不触发，本测试经 Trigger 驱动在途形态）。
 		IntervalFn: func() time.Duration { return time.Hour },
 		Run: func(rc RunContext) error {

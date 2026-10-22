@@ -1,4 +1,4 @@
-// 威胁大屏共享纯函数验收（历史问题 / 历史问题）：
+// 威胁大屏共享纯函数验收
 //   A. 热力数据指纹：相同→true；计数/长度/重复键变化→false
 //   B. 弧线端点：终点恒为当前本站坐标（setServer 后新弧线随新坐标）
 //   C. 危险等级化简：检测模式 12 分边界（原恒等三元 >=6 与 <6 同值）
@@ -10,14 +10,14 @@ import assert from 'node:assert/strict'
 
 import { heatEntriesEqual, heatCss, DOT_LAND, arcEndpoints, POINTY_TOP_HEX_VERTICES, drillCountryAllowed, arcOriginForLocation, normalizeCountryName, adminShortName, aggregateCountryCounts, hasProvinceStats, drillCommitAllowed } from '../src/utils/threatShared.ts'
 
-test('六边形点阵：pointy-top 六顶点且上下尖角（历史问题）', () => {
+test('六边形点阵：pointy-top 六顶点且上下尖角', () => {
   assert.equal(POINTY_TOP_HEX_VERTICES.length, 6)
   assert.deepEqual(POINTY_TOP_HEX_VERTICES[0], [0, -1])
   assert.deepEqual(POINTY_TOP_HEX_VERTICES[3], [0, 1])
   assert.ok(POINTY_TOP_HEX_VERTICES.every(([x, y]) => Math.abs(x) <= Math.sqrt(3) / 2 && Math.abs(y) <= 1))
 })
 
-test('下钻白名单：缺省不限，显式列表只放行列内国家（历史问题）', () => {
+test('下钻白名单：缺省不限，显式列表只放行列内国家', () => {
   assert.equal(drillCountryAllowed(undefined, '美国'), true)
   assert.equal(drillCountryAllowed(['中国'], '中国'), true)
   assert.equal(drillCountryAllowed(['中国'], '美国'), false)
@@ -33,7 +33,7 @@ test('弧线起点：中国精确到省，其他国家走质心，未知走兜�
   assert.deepEqual(unknown, arcOriginForLocation(''))
 })
 
-test('热力阶梯首色=陆地底色：命中 1 次不得比 0 次更暗（历史问题-2）', () => {
+test('热力阶梯首色=陆地底色：命中 1 次不得比 0 次更暗', () => {
   const parse = (css: string): number[] => css.slice(4, -1).split(',').map(Number)
   assert.equal(heatCss(0), DOT_LAND, 'count=0 与未命中点阵同色')
   assert.equal(heatCss(1), DOT_LAND, 'count=1（log10=0）落在阶梯首色=底色，不得比 0 次更暗')
@@ -65,7 +65,7 @@ test('B 弧线端点：终点跟随当前本站坐标（构造期常量即失效
   assert.notEqual(first.endLat, second.endLat)
 })
 
-// 历史修复：台湾归一/短名/计数合并此前零断言——热力、命中、下钻三处都靠它们。
+// 台湾归一/短名/计数合并此前零断言——热力、命中、下钻三处都靠它们。
 // 失效时台湾点阵不与大陆同色、下钻/命中回退 FALLBACK_CENTROID（中太平洋），
 // 且没有任何测试会拦住。
 test('台湾归一：Taiwan/台湾 → 中国，其他国名原样（用户裁定 2026-10-18）', () => {
@@ -102,23 +102,26 @@ test('省短名：34 省后缀逐条剥离，非行政后缀不动（与后端 i
   assert.equal(adminShortName('省'), '省')
 })
 
-test('省级统计边界：仅中国有省级数据源，海外下钻必须显示「无省级统计」（历史修复）', () => {
+test('省级统计边界：仅中国有省级数据源，海外下钻必须显示「无省级统计」', () => {
   assert.equal(hasProvinceStats('中国'), true)
   assert.equal(hasProvinceStats('美国'), false)
   assert.equal(hasProvinceStats(''), false)
 })
 
-test('下钻续体作废：seq 过期或已销毁一律丢弃（双引擎共用判定，历史修复）', () => {
+test('下钻续体作废：seq 过期或已销毁一律丢弃（双引擎共用判定）', () => {
   assert.equal(drillCommitAllowed(3, 3, false), true)
   assert.equal(drillCommitAllowed(2, 3, false), false, '复位/返回递增 seq 后迟到续体必须丢弃')
   assert.equal(drillCommitAllowed(3, 3, true), false, '退出大屏后不得再操作已销毁引擎')
 })
 
-// 历史修复：省点阵 bbox 预筛钉测——预筛只是跳点优化，产出必须与无预筛
+// 省点阵 bbox 预筛钉测——预筛只是跳点优化，产出必须与无预筛
 // 形态逐点一致（宽幅国家下 34 省 × 全网格直接 pointInPolys 是首次下钻长任务，
 // 与 threatScene.ts 省级 bbox 预筛同构）。
 import { provinceDotGrid } from '../src/utils/threatShared.ts'
 import { pointInPolys } from '../src/utils/threatShared.ts'
+import { WORLD_COUNTRIES } from '../src/utils/worldBorders.ts'
+import { ADMIN1_PROVINCES } from '../src/utils/admin1Provinces.ts'
+import { CHINA_PROVINCES } from '../src/utils/chinaProvinces.ts'
 
 function rectPoly(minLon: number, minLat: number, maxLon: number, maxLat: number): number[][][] {
   return [[[minLon, minLat, maxLon, minLat, maxLon, maxLat, minLon, maxLat, minLon, minLat]]]
@@ -173,4 +176,40 @@ test('省点阵 bbox 预筛与无预筛形态产出逐点一致（宽幅/远距/
   const dots = provinceDotGrid([{ name: '广东省', polys: rectPoly(110, 20, 112, 22) }], 1)
   assert.ok(dots.length > 0)
   assert.equal(dots[0].key, '广东')
+})
+
+test('真实国界孔洞：莱索托不计入南非，南非本土仍命中', () => {
+  const southAfrica = WORLD_COUNTRIES.find((country) => country.name === '南非')
+  const lesotho = WORLD_COUNTRIES.find((country) => country.name === '莱索托')
+  assert.ok(southAfrica)
+  assert.ok(lesotho)
+  assert.equal(pointInPolys(28.23, -29.58, southAfrica.polys), false)
+  assert.equal(pointInPolys(28.23, -29.58, lesotho.polys), true)
+  assert.equal(pointInPolys(25.0, -28.0, southAfrica.polys), true)
+})
+
+test('真实省界孔洞：维也纳不计入下奥地利州，州内其他点仍命中', () => {
+  const provinces = ADMIN1_PROVINCES['奥地利']
+  assert.ok(provinces)
+  const lowerAustria = provinces.find((province) => province.name === 'Niederösterreich')
+  const vienna = provinces.find((province) => province.name === 'Wien')
+  assert.ok(lowerAustria)
+  assert.ok(vienna)
+  assert.equal(pointInPolys(16.37, 48.21, lowerAustria.polys), false)
+  assert.equal(pointInPolys(16.37, 48.21, vienna.polys), true)
+  assert.equal(pointInPolys(15.6, 48.4, lowerAustria.polys), true)
+})
+
+test('中国省界回归：北京与天津不被河北孔洞吸收，河北本土仍命中', () => {
+  const beijing = CHINA_PROVINCES.find((province) => province.name === '北京市')
+  const tianjin = CHINA_PROVINCES.find((province) => province.name === '天津市')
+  const hebei = CHINA_PROVINCES.find((province) => province.name === '河北省')
+  assert.ok(beijing)
+  assert.ok(tianjin)
+  assert.ok(hebei)
+  assert.equal(pointInPolys(116.4, 39.9, beijing.polys), true)
+  assert.equal(pointInPolys(116.4, 39.9, hebei.polys), false)
+  assert.equal(pointInPolys(117.35, 39.28, tianjin.polys), true)
+  assert.equal(pointInPolys(117.35, 39.28, hebei.polys), false)
+  assert.equal(pointInPolys(114.5, 38.0, hebei.polys), true)
 })

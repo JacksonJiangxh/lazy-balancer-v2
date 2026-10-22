@@ -13,7 +13,7 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// 历史修复：GetCaddyConfig 与 ApplyConfigOnStartup 的就绪探针硬编码
+// GetCaddyConfig 与 ApplyConfigOnStartup 的就绪探针硬编码
 // http://localhost:2019/config/，忽略 cfg.CaddyAdminURL（GetCaddyStatus 已正确
 // 使用配置值）——自定义 admin 地址的部署下两者探测的是错误端点。两测试以
 // httptest 假 admin 端点断言「确实拨号了配置的 URL」。
@@ -35,7 +35,7 @@ func TestGetCaddyConfig_dialsConfiguredAdminURL(t *testing.T) {
 	t.Cleanup(fake.Close)
 	h := &Handlers{cfg: &config.Config{CaddyAdminURL: fake.URL}}
 	router := gin.New()
-	// 历史问题：原始运行配置读取已收敛为管理员语义（业务组路由 + handler 复核）。
+	// 原始运行配置读取已收敛为管理员语义（业务组路由 + handler 复核）。
 	router.Use(func(c *gin.Context) { c.Set("role", "admin"); c.Next() })
 	router.GET("/config", h.GetCaddyConfig)
 
@@ -52,7 +52,7 @@ func TestGetCaddyConfig_dialsConfiguredAdminURL(t *testing.T) {
 	}
 }
 
-// 历史问题-03：载入审计归因——手动重载（operator 非空）actor=操作者；启动/
+// 载入审计归因——手动重载（operator 非空）actor=操作者；启动/
 // 自愈（空）actor=system。此前恒 system，且「触发源见任务运行历史」在
 // 历史无 operator 列时归因链落空（列同批修复）。
 func TestApplyConfigOnStartup_auditActorFollowsOperator(t *testing.T) {

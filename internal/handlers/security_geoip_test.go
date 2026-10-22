@@ -12,7 +12,7 @@ import (
 // TestCreateSecurityPolicy_geoipColumnsRoundTrip verifies that geoip_countries
 // and geoip_mode are persisted on create and returned by GetSecurityPolicy.
 func TestCreateSecurityPolicy_geoipColumnsRoundTrip(t *testing.T) {
-	// 历史问题：地域条目（含海外）现要求 IP 库已装载——注入 live 省份
+	// 地域条目（含海外）现要求 IP 库已装载——注入 live 省份
 	// 模拟 xdb 在位（生产由 InitIP2Region 装载驱动）。
 	services.SetIP2RegionLiveProvincesForTest([]string{"海外", "广东省", "北京市"})
 	t.Cleanup(func() { services.SetIP2RegionLiveProvincesForTest(nil) })
@@ -52,7 +52,7 @@ func TestCreateSecurityPolicy_geoipColumnsRoundTrip(t *testing.T) {
 }
 
 // TestCreateSecurityPolicy_geoipDefaults：省略 geoip 字段时名单落空、mode 落 off
-// （历史修复 门：非 off + 空名单 = 「宣称启用但零强制」→ 400；缺省未显式
+// （门：非 off + 空名单 = 「宣称启用但零强制」→ 400；缺省未显式
 // 启用地域控制的创建因此归 off，与渲染端「条目非空才发射」等价）。
 // 下方 TestCreateSecurityPolicy_geoipEnabledWithEmptyListRejected 钉住显式形态 400。
 func TestCreateSecurityPolicy_geoipDefaults(t *testing.T) {
@@ -83,7 +83,7 @@ func TestCreateSecurityPolicy_geoipDefaults(t *testing.T) {
 }
 
 // TestCreateSecurityPolicy_geoipEnabledWithEmptyListRejected：显式 deny/allow +
-// 空名单必须 400（历史修复 形态：落库后宣称仅允许所选地域但零发射）。
+// 空名单必须 400（形态：落库后宣称仅允许所选地域但零发射）。
 func TestCreateSecurityPolicy_geoipEnabledWithEmptyListRejected(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newSecurityRouter(t)
@@ -125,7 +125,7 @@ func TestUpdateSecurityPolicy_geoipMode_validatesEnum(t *testing.T) {
 // TestListSecurityPolicies_geoipSummary verifies the summary list exposes the
 // geoip fields.
 func TestListSecurityPolicies_geoipSummary(t *testing.T) {
-	// 历史问题：地域条目（含海外）现要求 IP 库已装载——注入 live 省份
+	// 地域条目（含海外）现要求 IP 库已装载——注入 live 省份
 	// 模拟 xdb 在位（生产由 InitIP2Region 装载驱动）。
 	services.SetIP2RegionLiveProvincesForTest([]string{"海外", "广东省", "北京市"})
 	t.Cleanup(func() { services.SetIP2RegionLiveProvincesForTest(nil) })

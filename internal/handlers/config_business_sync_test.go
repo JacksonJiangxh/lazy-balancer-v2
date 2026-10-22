@@ -26,7 +26,7 @@ func TestImportConfigBackup_realignsBusinessTaskLoops(t *testing.T) {
 	}})
 
 	// When：导入提交成功。
-	response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
+	response := postImportShared(t, h.ImportConfigBackup, "/config/import", backup)
 	if response.Code != http.StatusOK {
 		t.Fatalf("import status=%d body=%s", response.Code, response.Body.String())
 	}

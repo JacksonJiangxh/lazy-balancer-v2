@@ -1,4 +1,4 @@
-// 历史修复(历史):apply_ok_reload_failed 机内标记的展示层翻译——
+// apply_ok_reload_failed 机内标记的展示层翻译——
 // 此前 ClusterSlavePanel/ClusterStatusCard 双份拷贝(后端调整标记格式
 // 须双处同步,漂移风险),收敛为单一实现(空守卫口径取 Card 版)。
 const RELOAD_FAILURE_MARKER_PREFIX = 'apply_ok_reload_failed'

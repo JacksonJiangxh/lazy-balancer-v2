@@ -19,11 +19,11 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// 策略侧批量绑定端点（历史，用户裁定）：POST /security/policies/:id/bindings/bulk
+// 策略侧批量绑定端点（用户裁定）：POST /security/policies/:id/bindings/bulk
 // {"bind":["lb_a"],"unbind":["lb_c"]}——「策略保存/绑定规则弹框（策略模式）」
 // 前端此前逐规则调 bind/unbind 单条端点，每条独立全链渲染+validate+/load
 //（N×~500ms，后端配置锁串行化）。本端点单事务内批量增删**本策略**的绑定行，
-// 不触碰兄弟绑定（历史并发安全语义保持：additive/精确删除），全程恰好
+// 不触碰兄弟绑定（并发安全语义保持：additive/精确删除），全程恰好
 // 一次 finishTxApply（单渲染）。任一规则校验失败=400 整体拒绝且事务回滚。
 
 func newBulkBindingsRouter(t *testing.T) (*gin.Engine, *atomic.Int64) {
@@ -165,7 +165,7 @@ func seedBinding(t *testing.T, caddyID string, policyID int) {
 	}
 }
 
-// 历史修复(a)：bind 侧 maxBindingsPerRule 门——规则现有绑定数（不含本策略）≥8 时
+// bind 侧 maxBindingsPerRule 门——规则现有绑定数（不含本策略）≥8 时
 // 再 bind 新策略 → 400，且不写入、零重载（与单条 bind / batch-bind 端点同源）。
 func TestBulkUpdatePolicyBindings_enforcesRuleBindingLimit(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
@@ -191,7 +191,7 @@ func TestBulkUpdatePolicyBindings_enforcesRuleBindingLimit(t *testing.T) {
 	}
 }
 
-// 历史修复(b)：bind 侧 stage2 唯一门——本策略为 stage2 且该规则已绑其他 stage2 →
+// bind 侧 stage2 唯一门——本策略为 stage2 且该规则已绑其他 stage2 →
 // 400；同规则绑 stage3 策略仍放行（门只针对限流叠加）。
 func TestBulkUpdatePolicyBindings_rejectsSecondStage2Binding(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
@@ -222,7 +222,7 @@ func TestBulkUpdatePolicyBindings_rejectsSecondStage2Binding(t *testing.T) {
 	assertIDSlice(t, queryBoundPolicyIDs(t, "lb_bulk_rl"), []int{10, 12})
 }
 
-// 历史修复：bind/unbind 规则 id 归一（TrimSpace）——带空白 id 按去空白后处理，
+// bind/unbind 规则 id 归一（TrimSpace）——带空白 id 按去空白后处理，
 // 不得因首尾空白被判「规则不存在」。
 func TestBulkUpdatePolicyBindings_trimsRuleIDs(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
@@ -240,7 +240,7 @@ func TestBulkUpdatePolicyBindings_trimsRuleIDs(t *testing.T) {
 	assertIDSlice(t, queryBoundPolicyIDs(t, "lb_bulk_trim"), []int{policy})
 }
 
-// 历史修复（历史）：bulk unbind 精确删除本策略绑定，不触碰兄弟绑定——DELETE 若
+// bulk unbind 精确删除本策略绑定，不触碰兄弟绑定——DELETE 若
 // 漏掉 AND policy_id=? 会被本用例拦住。
 func TestBulkUpdatePolicyBindings_unbindKeepsSiblingBindings(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
@@ -261,7 +261,7 @@ func TestBulkUpdatePolicyBindings_unbindKeepsSiblingBindings(t *testing.T) {
 	assertIDSlice(t, queryBoundPolicyIDs(t, "lb_bulk_sib"), []int{21})
 }
 
-// 历史修复（历史）：同一规则同时出现在 bind 与 unbind → 400（语义冲突，早于写入）。
+// 同一规则同时出现在 bind 与 unbind → 400（语义冲突，早于写入）。
 func TestBulkUpdatePolicyBindings_rejectsBindUnbindConflict(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router, loads := newBulkBindingsRouter(t)
@@ -283,7 +283,7 @@ func TestBulkUpdatePolicyBindings_rejectsBindUnbindConflict(t *testing.T) {
 }
 
 // bindingWriteErrConnector：注入绑定写路径的规则查询故障——策略/绑定前置查询
-// 成功，规则查询即失败（历史修复：DB 错误须映射 500，而非 400 裸串外泄）。
+// 成功，规则查询即失败（DB 错误须映射 500，而非 400 裸串外泄）。
 type bindingWriteErrConnector struct{}
 
 func (bindingWriteErrConnector) Connect(context.Context) (driver.Conn, error) {
@@ -343,7 +343,7 @@ func (r *bindingWriteErrRows) Next(dest []driver.Value) error {
 	return nil
 }
 
-// 历史修复（bulk applyOne）：规则查询 DB 故障 → 500「读取/写入策略绑定失败」，
+// （bulk applyOne）：规则查询 DB 故障 → 500「读取/写入策略绑定失败」，
 // 而非把裸错误串当 400 校验失败外泄。
 func TestBulkUpdatePolicyBindings_dbErrorReturns500(t *testing.T) {
 	orig := db.DB
@@ -365,7 +365,7 @@ func TestBulkUpdatePolicyBindings_dbErrorReturns500(t *testing.T) {
 	}
 }
 
-// 历史修复（setRulePoliciesInTx）：规则查询 DB 故障 → 500「读取/写入策略绑定失败」。
+// （setRulePoliciesInTx）：规则查询 DB 故障 → 500「读取/写入策略绑定失败」。
 func TestSetRuleSecurityPolicies_dbErrorReturns500(t *testing.T) {
 	orig := db.DB
 	db.DB = sql.OpenDB(bindingWriteErrConnector{})
@@ -386,7 +386,7 @@ func TestSetRuleSecurityPolicies_dbErrorReturns500(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：bind+unbind 数量上限必须按归一（TrimSpace+去重）
+// bind+unbind 数量上限必须按归一（TrimSpace+去重）
 // 后的集合判定——101 个重复/空白项归一后仅 1 条规则，旧实现先按原始长度 400。
 func TestBulkUpdatePolicyBindings_sizeLimitAfterNormalization(t *testing.T) {
 	setupSecurityPolicyTestDB(t)

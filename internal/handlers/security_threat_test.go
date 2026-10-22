@@ -350,8 +350,8 @@ func TestThreatLib_autoUpdateMasterSwitch(t *testing.T) {
 	}
 }
 
-// 历史问题-7：威胁库自动更新总开关与逐源开关端点从节点一律 403（与
-// UpdateCRSAutoUpdate 同口径 历史问题——从节点状态行在集群同步段内，
+// 威胁库自动更新总开关与逐源开关端点从节点一律 403（与
+// UpdateCRSAutoUpdate 同口径 ——从节点状态行在集群同步段内，
 // 本地写会被下次快照覆盖），且不得产生任何写。
 func TestThreatLib_slaveGatesRejected403(t *testing.T) {
 	// Given 从节点

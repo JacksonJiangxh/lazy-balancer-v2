@@ -1,5 +1,5 @@
 /**
- * 集群地址校验单源（历史修复，历史）。
+ * 集群地址校验单源。
  *
  * 主节点地址（注册弹框）与节点访问地址（节点配置弹框）在后端共用
  * `models.ValidateClusterAccessURL`：scheme ∈ {http, https}、host 非空、

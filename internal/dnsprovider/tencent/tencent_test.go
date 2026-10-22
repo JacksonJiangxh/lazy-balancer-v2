@@ -183,7 +183,7 @@ func TestProvider_CleanUp_deletes_persisted_record_after_restart(t *testing.T) {
 }
 
 func TestProvider_Present_does_not_replay_create_on_5xx(t *testing.T) {
-	// 历史问题（历史，迁移自 retries_transient_5xx）：CreateRecord 命中
+	// （迁移自 retries_transient_5xx）：CreateRecord 命中
 	// 502 不得重放——创建响应丢失时重试会产生无 ID 幽灵 TXT（ownership 清理
 	// 只按记录 ID 删除），首个 502 原样上抛、单次调用。
 	provider, err := New("secret-id", "secret-key")
@@ -352,7 +352,7 @@ func (transport *slowFlakyTransport) RoundTrip(request *http.Request) (*http.Res
 }
 
 func TestProvider_CleanUp_survives_slow_5xx_sequence(t *testing.T) {
-	// 历史问题 迁移（原 Present 慢 502 序列）：创建类 5xx 不再重放，超时不截断
+	// 迁移（原 Present 慢 502 序列）：创建类 5xx 不再重放，超时不截断
 	// 语义改由非创建动作承载——DeleteRecord 的慢 502,502,200 序列必须在 SDK
 	// 客户端单次请求超时内完成整个重试包络，而非被退避循环截断。
 	provider, err := New("secret-id", "secret-key")
@@ -460,7 +460,7 @@ func TestProvider_CleanUp_removes_ownership_of_independently_deleted_records(t *
 	}
 }
 
-// 历史问题：不可解析的持久化 RecordID 只告警一次并移除，正常兄弟条目不受影响。
+// 不可解析的持久化 RecordID 只告警一次并移除，正常兄弟条目不受影响。
 func TestProvider_CleanUp_malformedPersistedRecordIDRemovedAfterWarning(t *testing.T) {
 	// Given 同一 challenge 下一条不可解析的持久化 ID 与一条正常 ID（真实 ownership 文件）。
 	dataDir := t.TempDir()
@@ -522,7 +522,7 @@ func TestProvider_CleanUp_malformedPersistedRecordIDRemovedAfterWarning(t *testi
 	}
 }
 
-// 历史问题（历史）基线钉：内存模式下删除失败仍回填 owned——failed 存储
+// 基线钉：内存模式下删除失败仍回填 owned——failed 存储
 // 的唯一消费者是 ownership==nil 分支，失败条目门控后该既有形状不得破坏。
 func TestProvider_CleanUp_memoryModeReappendsFailedRecord(t *testing.T) {
 	// Given: memory-mode ownership whose only record fails to delete
@@ -554,7 +554,7 @@ func TestProvider_CleanUp_memoryModeReappendsFailedRecord(t *testing.T) {
 
 // ctxCanceledApiErrorTransport 模拟「请求在途时 ctx 取消、服务端仍返回
 // API 错误包」：阻塞至 request ctx 结束后回 500 + TencentCloudSDKError
-// 错误体（历史修复）。ctx 已取消时 RoundTrip 立即返回，无需额外同步。
+// 错误体。ctx 已取消时 RoundTrip 立即返回，无需额外同步。
 type ctxCanceledApiErrorTransport struct{}
 
 func (transport *ctxCanceledApiErrorTransport) RoundTrip(request *http.Request) (*http.Response, error) {
@@ -567,8 +567,8 @@ func (transport *ctxCanceledApiErrorTransport) RoundTrip(request *http.Request) 
 	}, nil
 }
 
-// 历史修复（历史）：createRecord 失败时 ctx 已取消不得以 ctx.Err()
-// 整体覆写 provider 错误（对齐 deleteOne :142-146 历史问题 口径）——
+// createRecord 失败时 ctx 已取消不得以 ctx.Err()
+// 整体覆写 provider 错误（对齐 deleteOne:142-146 口径）——
 // errors.Join 保留两者：具体 API 失败原因可诊断，取消事实不丢。
 func TestProvider_createRecord_keeps_provider_error_when_context_canceled(t *testing.T) {
 	// Given
@@ -601,7 +601,7 @@ func TestProvider_createRecord_keeps_provider_error_when_context_canceled(t *tes
 	}
 }
 
-// 历史问题（历史）：内存模式失败回填必须保留 challenge value——否则后续
+// 内存模式失败回填必须保留 challenge value——否则后续
 // 按值清理（CleanUpValue）的 entry.value != value 过滤会永久跳过该条目，
 // 「失败回填供后续清理重试」的意图落空。
 func TestProvider_CleanUp_memoryModeFailedValueRetriedByCleanUpValue(t *testing.T) {

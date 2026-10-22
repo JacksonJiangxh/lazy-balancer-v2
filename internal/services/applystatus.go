@@ -82,14 +82,17 @@ func ClearBackgroundApplyFailure(source BackgroundApplySource) {
 }
 
 // BackgroundApplyFailureSnapshot 返回最近一次后台重载失败（无失败为 nil）。
-// 多来源并存时按时间取最新一条；来源名与消息均随状态接口下发。
+// 多来源并存时按时间取最新一条；同秒（At 为秒级墙串）并存时按来源名
+// 字典序取最小者——map 遍历顺序随机，缺 tie-break 会让横幅在同秒多来源
+// 失败下每次调用换源（前端轮询可见抖动，排障指向不稳定）。
 func BackgroundApplyFailureSnapshot() *BackgroundApplyFailure {
 	backgroundApplyStore.mu.Lock()
 	defer backgroundApplyStore.mu.Unlock()
 	var latest *BackgroundApplyFailure
 	for _, failure := range backgroundApplyStore.failures {
 		current := failure
-		if latest == nil || current.At > latest.At {
+		if latest == nil || current.At > latest.At ||
+			(current.At == latest.At && current.Source < latest.Source) {
 			latest = &current
 		}
 	}

@@ -14,7 +14,7 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// 历史问题(历史):生成登录票据的目标节点不存在属客户端寻址错误——与同族
+// 生成登录票据的目标节点不存在属客户端寻址错误——与同族
 // ErrNodeNotFound→404 口径对齐(cluster_registration.go:151-153、
 // cluster_service.go:71-72、cluster_sync.go:135-136),此前误映射 409。
 func TestGenerateClusterLoginTicket_nodeNotFoundReturns404(t *testing.T) {
@@ -47,7 +47,7 @@ func TestGenerateClusterLoginTicket_nodeNotFoundReturns404(t *testing.T) {
 	}
 }
 
-// 用户反馈(历史后):「生成登录票据」审计只写「节点 %d」,与服务控制事件
+// 用户反馈(后):「生成登录票据」审计只写「节点 %d」,与服务控制事件
 // (cluster_service.go 「节点 %d（%s）」)不对称——补节点名,便于定位目标节点。
 func TestGenerateClusterLoginTicket_auditCarriesNodeName(t *testing.T) {
 	// Given:主节点 + OIDC 会话 + 在线已审批节点 7(name=slave-01)

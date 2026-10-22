@@ -1,6 +1,6 @@
 package handlers
 
-// 历史问题：TCP 三字段（tcp_health_check_port/tcp_try_duration/
+// TCP 三字段（tcp_health_check_port/tcp_try_duration/
 // tcp_try_interval）此前无负值校验，渲染侧静默钳制（caddy.go 3503-3522）——
 // 保存前拒绝显式负值。代理超时族的 -1 哨兵（proxy_flush_interval=-1=立即刷新）
 // 仅属 http 侧，TCP 三字段无哨兵语义，负值一律拒。
@@ -65,7 +65,7 @@ func TestValidateRuleFeatures_rejectsNegativeTcpFields(t *testing.T) {
 	}
 }
 
-// 历史问题-1（历史，历史问题）：TCP 规则 enable_dns_server/dns_server 落库恒
+// TCP 规则 enable_dns_server/dns_server 落库恒
 // 无效——渲染路径永不消费且无告警，对照 dynamic_dns 有保存侧 400+渲染告警
 // 双保险，DNS 服务发现两字段保存侧拒绝清单漏列。与 TCP+dynamic_dns 同门：
 // 字段属 HTTP 语义（L4 无 resolver 消费），协议切换零值化已覆盖迁移路径，

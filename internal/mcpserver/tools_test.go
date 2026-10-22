@@ -7,9 +7,9 @@ import (
 	"testing"
 )
 
-// 历史问题（历史）：通用绊线——pathArgs/queryArgs 是转发器实际取值依据，
+// 通用绊线——pathArgs/queryArgs 是转发器实际取值依据，
 // 必须全部出现在该工具的 input_schema.properties 中。
-// 历史问题 三次同类缺陷此前只靠单工具测试兜底。历史修复：删除
+// 同类缺陷此前只靠单工具测试兜底。删除
 // bodySchema 豁免——宽松 body 形态同样必须声明路径参数（此前 8 个「按 id
 // 更新」工具声明 pathArgs 却让 schema 只留 additionalProperties，Agent 只能
 // 凭描述猜 id）。工具统一用 bodySchemaWithID 声明。
@@ -38,7 +38,7 @@ func TestEveryToolSchemaCoversPathAndQueryArgs(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：单/少字段写工具的 schema 必须声明 properties/required
+// 单/少字段写工具的 schema 必须声明 properties/required
 // （保留 additionalProperties 兼容性），否则 Agent 只能凭描述猜字段名，错名
 // 由 REST 侧返回 400。
 func TestSmallWriteToolSchemasDeclareFields(t *testing.T) {
@@ -171,7 +171,7 @@ func TestRuleToolSchemasDeclareNestedItemContracts(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：control_system_task 的 schema enum、handler 接受集
+// control_system_task 的 schema enum、handler 接受集
 // （taskmonitor.go ControlSystemTask：start/stop/restart）与描述必须一致，
 // 并说明与 toggle_system_task 的分工。
 func TestControlSystemTaskSchemaMatchesHandlerActionSet(t *testing.T) {

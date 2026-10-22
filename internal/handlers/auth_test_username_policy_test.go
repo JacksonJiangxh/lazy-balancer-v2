@@ -2,7 +2,7 @@ package handlers
 
 import "testing"
 
-// 历史修复：用户名策略（2026-09-28 用户裁定）：仅允许小写英文开头，
+// 用户名策略（2026-09-28 用户裁定）：仅允许小写英文开头，
 // 字符只允许小写字母或小写字母+数字。
 func TestValidateUsernamePolicy(t *testing.T) {
 	valid := []string{"admin", "root", "user123", "abc", "a1b2c3"}

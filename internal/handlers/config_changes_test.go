@@ -64,7 +64,7 @@ func TestPlanConfigChangesIncludesJWTExpire(t *testing.T) {
 	}
 }
 
-// 历史问题：大屏本站坐标 lat/lon 共用 label——同时变更时变更清单只列一项
+// 大屏本站坐标 lat/lon 共用 label——同时变更时变更清单只列一项
 // （原实现逐字段 add，同一 label 重复出现）。
 func TestPlanConfigChangesDedupesSharedLabel(t *testing.T) {
 	lat, lon := 31.2, 121.5

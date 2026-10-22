@@ -1,7 +1,7 @@
 package services
 
-// 历史问题-2（历史 审计）：看门狗读取 Caddy 运行配置的解码上限须与 caddy.go
-// 家族口径对齐（32MB，历史问题 同源：caddy.go:210/565/780）。原 4MB 上限下
+// 看门狗读取 Caddy 运行配置的解码上限须与 caddy.go
+// 家族口径对齐（32MB，同源：caddy.go:210/565/780）。原 4MB 上限下
 // >4MB 配置解码失败→漂移检测永久静默而 apply 仍工作至 32MB——大部署静默
 // 单点失效。本测试钉：>4MB（<32MB）的运行配置仍可提取规则路由 @id。
 
@@ -35,7 +35,7 @@ func TestRunningRuleRouteIDs_configAbove4MBStillDecoded(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：看门狗读取与 readAdminConfigBody 同源——>32MB 必须
+// 看门狗读取与 readAdminConfigBody 同源——>32MB 必须
 // 返回超限哨兵（而非裸 LimitReader 的解码失败），调用方据此把「超限」与瞬时
 // 读失败分开留痕。
 func TestRunningRuleRouteIDs_oversizeClassified(t *testing.T) {
@@ -67,10 +67,10 @@ func TestRunningRuleRouteIDs_nonOKStatusFails(t *testing.T) {
 	}
 }
 
-// 解析容忍度回归（历史问题 修复的伴随约束）：读取统一到 readAdminConfigBody 后，
+// 解析容忍度回归：读取统一到 readAdminConfigBody 后，
 // 解析必须保持旧实现的容忍面——Decoder 只消费第一个顶层值，尾部多余字节不得把
 // 「运行配置可读」降级为「读取失败」（否则启动守卫/看门狗探针按无正向证据放行，
-// 外来路由告警与 历史问题 守卫静默失效）。
+// 外来路由告警与守卫静默失效）。
 func TestRunningRuleRouteIDs_toleratesTrailingBytesAfterJSONValue(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		// 多一个闭合符：旧 json.Decoder 忽略尾随内容（handlers 侧既有假 admin

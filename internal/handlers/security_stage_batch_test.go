@@ -334,7 +334,7 @@ func TestGetRuleStageStats_bucketsAndRateLimitMapping(t *testing.T) {
 		}
 	}
 	seedEvent("2", "blocked", "datetime('now','-1 hour')")
-	seedEvent("14", "blocked", "datetime('now','-1 hour')") // 威胁情报库并入阶段 1（SEC-B-GAP-U4：生产口径 {2,4,7,8,14}∪800xxx）
+	seedEvent("14", "blocked", "datetime('now','-1 hour')") // 威胁情报库并入阶段 1（生产口径 {2,4,7,8,14}∪800xxx）
 	seedEvent("800123", "blocked", "datetime('now','-2 hours')")
 	seedEvent("800123", "blocked", "datetime('now','-3 hours')")
 	seedEvent("942100", "blocked", "datetime('now','-1 hour')")
@@ -460,7 +460,7 @@ func TestGetRuleStageStats_nilMetricsDBReturnsFullZeroShape(t *testing.T) {
 	}
 }
 
-// 历史修复：stage-stats 对不存在规则此前误归 500（message 借「规则不存在」
+// stage-stats 对不存在规则此前误归 500（message 借「规则不存在」
 // 文案但 code 500）——ErrNoRows 分判 404 not_found；其余 DB 故障保持 500 且
 // message 归位「阶段统计查询失败」。前端 RuleFlowDialog 对非 200 一律
 // stats=null（catch 分支），404 化不改变前端表现。
@@ -522,7 +522,7 @@ func TestGetRuleStageStats_unknownRuleReturns404(t *testing.T) {
 	})
 }
 
-// 历史修复（历史问题）：批量绑定端点的 rule_ids 数量上限。同族端点均有
+// 批量绑定端点的 rule_ids 数量上限。同族端点均有
 // 上限（bindings/bulk=100、batch-block-pages=500），本端点此前无界——超大
 // rule_ids 会在 BEGIN IMMEDIATE + caddyOpMu 内逐规则查询/写入，阻塞全部主库
 // 配置写。判据按 normalizeRuleIDs 归一后集合计数（空白/重复 id 不占额度）。

@@ -41,71 +41,117 @@ type importCoordinatorError struct {
 	phase         importPhase
 	err           error
 	caddyRejected bool
+	// action 是本次操作的动作词（「导入」/「还原」）：失败描述的动作前缀必须
+	// 跟随调用方语义——自动备份还原失败文案曾恒写「导入失败」，与审计动作
+	// 「还原失败」形成双前缀且误导排障。
+	action string
+}
+
+func (err *importCoordinatorError) actionLabel() string {
+	if err.action == "" {
+		return "导入"
+	}
+	return err.action
 }
 
 func (err *importCoordinatorError) Error() string { return importFailureAuditDescription(err) }
 func (err *importCoordinatorError) Unwrap() error { return err.err }
 
+// importFailurePhaseDescription 返回与动作词无关的阶段判定（审计 detail、
+// HTTP 文案共用单源）。空串=未知阶段。
+//
+// 「数据库未变更」的适用边界：除 commit 阶段外的中止都在事务回滚后收尾，
+// 库内容确定未变；commit 阶段的失败结果不可判定（数据库/sql 在 Commit 报错
+// 时无法区分「未提交」与「已提交但确认丢失」），文案必须如实表述为
+// 「提交结果不确定」，不得断言未变更。
+func importFailurePhaseDescription(phase importPhase, caddyRejected bool) string {
+	switch phase {
+	case importPhaseSnapshot:
+		return "运行配置快照失败，数据库未变更"
+	case importPhaseCertificate:
+		return "证书准备失败，数据库未变更"
+	case importPhaseCaddy:
+		if caddyRejected {
+			return "Caddy 验证失败，数据库未变更"
+		}
+		return "Caddy 应用失败，数据库未变更"
+	case importPhaseVersion:
+		return "集群版本更新失败，数据库未变更"
+	case importPhaseCommit:
+		return "数据库提交结果不确定"
+	case importPhaseQueue:
+		return "数据库已提交，证书任务恢复失败"
+	}
+	return ""
+}
+
+// importFailureAuditDescription 返回带动作前缀的失败描述（*importCoordinatorError
+// 的 Error() 与「无动作上下文的调用点」共用；有动作上下文的审计 detail 用
+// importFailureAuditDetail，避免动作词重复）。
 func importFailureAuditDescription(err error) string {
 	var coordinatorErr *importCoordinatorError
 	if !errors.As(err, &coordinatorErr) {
 		return "导入失败：" + err.Error()
 	}
-	var description string
-	switch coordinatorErr.phase {
-	case importPhaseSnapshot:
-		description = "导入失败（运行配置快照失败，数据库未变更）"
-	case importPhaseCertificate:
-		description = "导入失败（证书准备失败，数据库未变更）"
-	case importPhaseCaddy:
-		description = "导入失败（Caddy 应用失败，数据库未变更）"
-		if coordinatorErr.caddyRejected {
-			description = "导入失败（Caddy 验证失败，数据库未变更）"
-		}
-	case importPhaseVersion:
-		description = "导入失败（集群版本更新失败，数据库未变更）"
-	case importPhaseCommit:
-		description = "导入失败（数据库提交失败，数据库未变更）"
-	case importPhaseQueue:
-		description = "导入部分失败（数据库已提交，证书任务恢复失败）"
-	default:
-		description = "导入失败"
+	phase := importFailurePhaseDescription(coordinatorErr.phase, coordinatorErr.caddyRejected)
+	if phase == "" {
+		return coordinatorErr.actionLabel() + "失败：" + coordinatorErr.err.Error()
 	}
-	return description + "：" + coordinatorErr.err.Error()
+	if coordinatorErr.phase == importPhaseQueue {
+		return coordinatorErr.actionLabel() + "部分失败（" + phase + "）：" + coordinatorErr.err.Error()
+	}
+	return coordinatorErr.actionLabel() + "失败（" + phase + "）：" + coordinatorErr.err.Error()
+}
+
+// importFailureAuditDetail 返回审计 detail：auditAction 已携带「导入/还原失败」
+// 前缀，detail 不再重复动作词（消双前缀），只描述阶段与真实错误。
+func importFailureAuditDetail(err error) string {
+	var coordinatorErr *importCoordinatorError
+	if !errors.As(err, &coordinatorErr) {
+		return err.Error()
+	}
+	phase := importFailurePhaseDescription(coordinatorErr.phase, coordinatorErr.caddyRejected)
+	if phase == "" {
+		return coordinatorErr.err.Error()
+	}
+	return phase + "：" + coordinatorErr.err.Error()
 }
 
 type configImportSession struct {
-	h                     *Handlers
-	ctx                   context.Context
-	tx                    *sql.Tx
-	recovery              importQueueRecovery
-	existingRuleIDs       []string
+	h               *Handlers
+	ctx             context.Context
+	tx              *sql.Tx
+	recovery        importQueueRecovery
+	existingRuleIDs []string
+	// action 是本次会话的动作词（「导入」/「还原」，由调用方在建会话后立即
+	// 写入）：commit 阶段错误必须携带该动作，失败文案/审计才不把还原写成导入。
+	action                string
 	runtime               *importRuntimeSnapshot
 	runtimeApplyAttempted bool
 	finished              bool
-	// resumeEngine 恢复任务引擎 tick 派发（历史问题-1，历史）：
+	// resumeEngine 恢复任务引擎 tick 派发
 	// beginConfigImport 期间 PauseScheduling，会话 close 时恢复——不能用作
 	// begin 函数的 defer（该函数在导入体执行前就返回）。
 	resumeEngine func()
 	// releaseBeforeLock 释放排空之后、caddyOpMu/事务之前取得的资源锁
-	// （配置导入的 WAF 文件锁，历史修复）。close 在 caddyOpMu 之后释放，
+	// （配置导入的 WAF 文件锁）。close 在 caddyOpMu 之后释放，
 	// 保持与获取顺序相反的锁序。
 	releaseBeforeLock func()
 }
 
-// errCertQueueDrainIncomplete 证书队列排空未完成（历史问题）：PauseAndDrain
+// errCertQueueDrainIncomplete 证书队列排空未完成：PauseAndDrain
 // 超时后仍有执行中的签发任务——此时开始导入会让证书任务与全量替换并发，
 // 明确拒绝（409）而非沿用「已排干」假设。
 var errCertQueueDrainIncomplete = errors.New("证书任务执行中，请稍后重试")
 var errImportTaskDrainIncomplete = errors.New("在途任务未排空，请稍后重试")
 
-// importInFlightDrainTimeout 导入前排空在途任务的有界等待（历史问题-1，历史
-// 审计）：与证书队列 PauseAndDrain 的 30s 屏障同量级。历史问题 起超时
+// importInFlightDrainTimeout 导入前排空在途任务的有界等待（历史
+// 审计）：与证书队列 PauseAndDrain 的 30s 屏障同量级。自此超时
 // fail-closed 拒绝导入（部分 Run 体不消费取消信号），恢复调度并留失败审计，
 // 不再让旧任务与全量替换并发。
 var importInFlightDrainTimeout = 30 * time.Second
 
-// configImportBeginMu 串行化整个导入会话（历史修复）：
+// configImportBeginMu 串行化整个导入会话
 // Pause/Resume 是单布尔位，若两个导入都先 Pause 再抢 caddyOpMu，先结束者
 // Resume 会让后者在调度已恢复的状态下执行。此锁覆盖 Pause→事务→close，
 // 后到导入在暂停开始前排队。
@@ -117,7 +163,7 @@ var configImportBeginAttemptHook func()
 var configImportBeforePrelockHook func()
 
 // configImportBusy 探测导入会话是否持有全局导入锁（不阻塞）：启停/控制
-// 常驻任务在导入期间必须 409，避免绕过 PauseAndDrain（历史问题-03）。
+// 常驻任务在导入期间必须 409，避免绕过 PauseAndDrain。
 func configImportBusy() bool {
 	if configImportBeginMu.TryLock() {
 		configImportBeginMu.Unlock()
@@ -126,7 +172,7 @@ func configImportBusy() bool {
 	return true
 }
 
-// rejectNodeWriteDuringImport（历史问题，历史）：配置导入窗口内
+// rejectNodeWriteDuringImport：配置导入窗口内
 // 节点写端点（注册/审批/拒绝/删除/改访问地址/改站点坐标/清 pin/节点上报等）
 // 一律 409 fast-fail。导入事务全量替换 nodes 表：窗口内的节点写入要么被
 // 导入覆盖（静默丢失），要么阻塞在 SQLite 写锁上至 busy_timeout（30s）后
@@ -136,11 +182,11 @@ func rejectNodeWriteDuringImport(c *gin.Context) bool {
 	return rejectWriteDuringImport(c, "执行节点写操作")
 }
 
-// rejectWriteDuringImport 导入窗口内通用写端点快筛（历史修复，历史修复）。
+// rejectWriteDuringImport 导入窗口内通用写端点快筛。
 // 证书配置表（certificate_configs）与 CA 提供商表（ca_providers）都在导入全量
 // 替代表清单内；这两个端点既不取 caddyOpMu 也不走本门——排空结束、导入事务
 // 尚未开启的窗口内提交会被导入静默覆盖（数据丢失），事务开启后提交则阻塞至
-// busy_timeout(30s) 后 500。与节点写族同口径 409 历史修复。
+// busy_timeout(30s) 后 500。与节点写族同口径 409。
 func rejectWriteDuringImport(c *gin.Context, action string) bool {
 	if !configImportBusy() {
 		return false
@@ -162,12 +208,12 @@ func (h *Handlers) beginConfigImportWithPrelock(ctx context.Context, prelock fun
 	}
 	configImportBeginMu.Lock()
 	releaseSession := func() { configImportBeginMu.Unlock() }
-	// 历史问题-1（历史）：导入将全量替换业务数据——先暂停 tick
+	// 导入将全量替换业务数据——先暂停 tick
 	// 派发并取消在途 Scheduled/Periodic/Oneshot Run（Daemon 不在范围），再有界
 	// 等待其在途落定，避免其提交落在导入事务之后形成 last-writer-wins。
 	// 此前只发取消信号不等待：不消费 rc.Ctx 的 Run 体会在导入期间继续跑完。
 	//
-	// 顺序铁律（历史 Fix81Inf 复核）：Pause/Cancel/Wait 必须在取 caddyOpMu
+	// 顺序铁律（Fix81Inf 复核）：Pause/Cancel/Wait 必须在取 caddyOpMu
 	// **之前**。autoban 的 RunAutobanCycle 在 services.CaddyOpLock（=caddyOpMu）
 	// 临界区内合并名单；若先持锁再等待，会形成「导入持锁等 Run 退出 ↔ Run 等
 	// 锁」的互等到 30s 超时，且该 Run 仍会在导入提交后写库。Pause/Cancel/Wait
@@ -192,7 +238,7 @@ func (h *Handlers) beginConfigImportWithPrelock(ctx context.Context, prelock fun
 			return nil, errImportTaskDrainIncomplete
 		}
 	}
-	// 历史问题-02（历史）：CA 队列 PauseAndDrain 必须先于 caddyOpMu——在途
+	// CA 队列 PauseAndDrain 必须先于 caddyOpMu——在途
 	// 证书部署需要 CaddyOpLock（部署临界区入口即取锁，
 	// certissuer.go deployIssuedCertificate/快速路径）；旧顺序「先持锁再排空」
 	// 形成自锁：部署 worker 等锁、导入等排空，30s 后必然 409。与上方任务引擎
@@ -200,10 +246,10 @@ func (h *Handlers) beginConfigImportWithPrelock(ctx context.Context, prelock fun
 	recovery := importQueueRecovery{manager: services.GetCAQueueManager()}
 	if recovery.manager != nil {
 		recovery.wasActive = recovery.manager.IsActive()
-		// 历史问题：排空结果必须被消费——未完全排空（30s 超时仍有执行中任务）
+		// 排空结果必须被消费——未完全排空（30s 超时仍有执行中任务）
 		// 不得继续导入。
 		if !recovery.manager.PauseAndDrain() {
-			// 历史问题-02：先恢复队列再释放会话锁——否则第二个导入可在锁窗口内
+			// 先恢复队列再释放会话锁——否则第二个导入可在锁窗口内
 			// 看到「队列 inactive」并在第一个导入 Resume 后与之并发。
 			if recovery.wasActive {
 				recovery.manager.Resume()
@@ -265,7 +311,7 @@ func (session *configImportSession) close() {
 		_ = session.abort(errors.New("导入流程未完成"))
 	}
 	session.h.caddyOpMu.Unlock()
-	// 历史问题-1/历史问题：导入全程（含失败 abort 的恢复动作）结束后
+	// 导入全程（含失败 abort 的恢复动作）结束后
 	// 先恢复 tick，再释放串行会话锁。反向释放会让下一代导入的 Pause 被
 	// 本代 Resume 覆盖，破坏 Pause→事务→close 的串行排空不变量。
 	if session.resumeEngine != nil {
@@ -280,7 +326,7 @@ func (session *configImportSession) abort(importErr error) error {
 	if session.finished {
 		return importErr
 	}
-	// 历史修复（历史）：会话内 CLI 预检/强制应用等渲染已按未提交导入内容
+	// 会话内 CLI 预检/强制应用等渲染已按未提交导入内容
 	// 重写投影文件——abort 必回滚 tx，磁盘同步回退到已提交态（零 /load；
 	// 快照阶段失败等未渲染形态为同字节 no-op）。已持 caddyOpMu（begin 起）。
 	session.h.caddyService.RollbackIPListProjectionsToCommittedInLock()
@@ -306,36 +352,36 @@ func (session *configImportSession) abort(importErr error) error {
 func (session *configImportSession) commit(affectedRuleIDs []string, certificates []importCertificate) error {
 	runtime, err := session.h.snapshotImportRuntime(affectedRuleIDs)
 	if err != nil {
-		return &importCoordinatorError{phase: importPhaseSnapshot, err: session.abort(err)}
+		return &importCoordinatorError{phase: importPhaseSnapshot, err: session.abort(err), action: session.action}
 	}
 	session.runtime = &runtime
 	if err := materializeImportCertificates(certificates); err != nil {
-		return &importCoordinatorError{phase: importPhaseCertificate, err: session.abort(err)}
+		return &importCoordinatorError{phase: importPhaseCertificate, err: session.abort(err), action: session.action}
 	}
-	// 历史问题 v2 导入事务全量重插 cert_jobs（restoreTable 保留原 id），证书
+	// v2 导入事务全量重插 cert_jobs（restoreTable 保留原 id），证书
 	// 候选必须读事务自身——经已提交视图会拿到将被替换的旧行，旧 PEM 覆写导入
 	// 刚落盘的新证书文件。导入期 CA 队列已 PauseAndDrain，无并发证书提交。
-	// 历史问题 导入强制重载——证书已在上方落盘，生成期比对相等，
+	// 导入强制重载——证书已在上方落盘，生成期比对相等，
 	// 非强制会被 errSameConfig 短路（旧证书继续服务）。
 
 	// 2026-09-06 裁定 ④' 边界补齐：导入同样过 Caddy CLI 校验层（校验输入=
 	// 事务视图渲染）。校验器不可用放行——下方 ApplyConfigFromTxCertAwareForce
 	// 仍是门控（全有全无）。
 	if err := session.h.caddyService.ValidateTxRenderViaCLI(session.tx); err != nil && !errors.Is(err, services.ErrCLIValidatorUnavailable) {
-		return &importCoordinatorError{phase: importPhaseCaddy, err: session.abort(err), caddyRejected: services.IsConfigRejected(err)}
+		return &importCoordinatorError{phase: importPhaseCaddy, err: session.abort(err), caddyRejected: services.IsConfigRejected(err), action: session.action}
 	}
 	session.runtimeApplyAttempted = true
 	if err := session.h.caddyService.ApplyConfigFromTxCertAwareForce(session.tx); err != nil {
-		return &importCoordinatorError{phase: importPhaseCaddy, err: session.abort(err), caddyRejected: services.IsConfigRejected(err)}
+		return &importCoordinatorError{phase: importPhaseCaddy, err: session.abort(err), caddyRejected: services.IsConfigRejected(err), action: session.action}
 	}
 	if err := services.BumpClusterVersion(session.ctx, session.tx); err != nil {
-		return &importCoordinatorError{phase: importPhaseVersion, err: session.abort(err)}
+		return &importCoordinatorError{phase: importPhaseVersion, err: session.abort(err), action: session.action}
 	}
 	if err := session.tx.Commit(); err != nil {
-		return &importCoordinatorError{phase: importPhaseCommit, err: session.abort(err)}
+		return &importCoordinatorError{phase: importPhaseCommit, err: session.abort(err), action: session.action}
 	}
 	session.runtime = nil
-	// 历史修复/全量替换导入对消失规则的产物清理。v2/v1 导入均清光
+	// /全量替换导入对消失规则的产物清理。v2/v1 导入均清光
 	// lb_rules 后重插（v1 还换新 caddy_id），但产物轴此前只写不删：消失规则的
 	// 证书文件（含 ACME 私钥）在 /app/certs 无限残留——与 DeleteRule「规则消失
 	// → 密钥删除」的约定矛盾，卷读权限者可恢复管理员以为已删除的密钥；v1 路径
@@ -346,7 +392,7 @@ func (session *configImportSession) commit(affectedRuleIDs []string, certificate
 	session.cleanupDisappearedRuleArtifacts()
 	if err := session.recovery.finish(); err != nil {
 		session.finished = true
-		return &importCoordinatorError{phase: importPhaseQueue, err: err}
+		return &importCoordinatorError{phase: importPhaseQueue, err: err, action: session.action}
 	}
 	session.finished = true
 	return nil
@@ -365,7 +411,7 @@ func importFailureCaddyRejected(err error) bool {
 	return errors.As(err, &coordinatorErr) && coordinatorErr.phase == importPhaseCaddy && coordinatorErr.caddyRejected
 }
 
-// cleanupDisappearedRuleArtifacts 清理本次导入中消失规则的产物（历史修复）：
+// cleanupDisappearedRuleArtifacts 清理本次导入中消失规则的产物
 // 证书文件、孤儿 cert_jobs 行、指标与规则/证书日志。提交成功后调用；失败仅
 // 审计留痕，不否决导入。
 func (session *configImportSession) cleanupDisappearedRuleArtifacts() {
@@ -411,7 +457,7 @@ func (session *configImportSession) cleanupDisappearedRuleArtifacts() {
 		services.RecordAuditLog("system", "清理失败", "证书任务", fmt.Sprintf("导入后清理孤儿证书任务失败：%v", err), "")
 		return
 	}
-	// 历史修复（历史问题）：规则存在但已非 ACME 自动签发态的失效任务行——与
+	// 规则存在但已非 ACME 自动签发态的失效任务行——与
 	// v2 导入事务内同谓词清理；覆盖 v1 路径与理论绕过路径。
 	if _, err := db.DB.ExecContext(session.ctx,
 		`DELETE FROM cert_jobs WHERE rule_id IN (SELECT caddy_id FROM lb_rules WHERE NOT (enable_tls=1 AND tls_source='acme_dns'))`); err != nil {

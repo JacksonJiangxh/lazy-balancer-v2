@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"lazy-balancer-v2/internal/db"
@@ -72,11 +73,35 @@ func updateRunRole() (bool, bool) {
 	return isMaster, true
 }
 
+// errRunRoleUndecidable 角色不可判定（DB 读失败）哨兵——成功写路径复核
+// （updateRunWriteGate）的「不可判定」分支返回值：消费方按失败落定
+// （task_runs/任务监控可见），不得并入「降级」（skipped）或「手动取消」。
+var errRunRoleUndecidable = errors.New("角色读取失败，无法判定本节点是否主节点")
+
+// updateRunWriteGate 成功写路径前的角色+取消复核（与 crsinstall
+// observeCancelAfterSwap 同族三态口径，威胁/爬虫/自动封禁成功写路径共用）：
+// 下载/评估完成到写库/收敛之间存在毫秒级降级窗口——从节点继续写主库打破
+// 只读不变量（现有钉测只覆盖下载期取消，本门补成功路径窗）。语义：
+//   - 角色不可判定（DB 读失败）→ errRunRoleUndecidable：不写不收敛，按失败落定；
+//   - 已知从节点（已降级）→ taskengine.ErrTaskSkipped：不写不收敛（从节点零写）；
+//   - 主节点且 ctx 已取消 → ctx.Err()（手动取消）；nil ctx 视为未取消。
+func updateRunWriteGate(ctx context.Context) error {
+	if isMaster, known := updateRunRole(); !known {
+		return errRunRoleUndecidable
+	} else if !isMaster {
+		return taskengine.ErrTaskSkipped
+	}
+	if ctx != nil {
+		return ctx.Err()
+	}
+	return nil
+}
+
 // taskRunStartedAt 取任务引擎预插行的 started_at（配置时区墙钟）并归一
 // 为 UTC 存储；前端 formatDate 再按配置时区显示，与任务监控展示同一时刻。
 // 直接调用（rc=nil/RunID=0）或行不可读时回退当前 UTC。
 func taskRunStartedAt(rc *taskengine.RunContext) string {
-	// 历史问题：与同族 历史修复 口径一致——nil 库直接回退当前 UTC（不 panic）。
+	// 与同族口径一致——nil 库直接回退当前 UTC（不 panic）。
 	if db.DB == nil {
 		return time.Now().UTC().Format(crsTimeLayout)
 	}

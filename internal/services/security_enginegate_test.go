@@ -1,6 +1,6 @@
 package services
 
-// 历史问题(历史)/ TDD 强化 §11 + 历史修复 引擎编译门禁:
+// / TDD 强化 §11 + 引擎编译门禁
 // 配置生成类修复的验证终点是「引擎接受」——字符串形状断言不构成行为验证
 // (coraza「disruptive 动作仅允许链首段」约束在文本层不可见,坏形状曾随
 // v2.2.11 出厂)。本文件的测试把 BuildCorazaDirectives/buildIPPrecheckDirectives
@@ -34,7 +34,7 @@ import (
 //     security_block_status_test.go 的引擎行为实证覆盖(桩规则+真实事务)。
 //
 // 其余全部逐字送编译——我们自己发射的 SecRule/SecAction/SecMarker 形状
-// 是本门禁的被测对象,零裁剪(历史修复 验证源直取:指令文本来自真实渲染调用)。
+// 是本门禁的被测对象,零裁剪( 验证源直取:指令文本来自真实渲染调用)。
 func compileForEngineGate(t *testing.T, directives string) {
 	t.Helper()
 	var kept []string
@@ -52,7 +52,7 @@ func compileForEngineGate(t *testing.T, directives string) {
 	}
 }
 
-// 历史问题 目标形状:多策略(multiPolicy=true)+信任名单+deny 侧控制——
+// 目标形状:多策略(multiPolicy=true)+信任名单+deny 侧控制——
 // 链式自排除三形状必须被引擎接受(当前 deny 在续段=编译拒绝=RED)。
 func TestEngineGate_multiPolicyChainedShapes(t *testing.T) {
 	trust := json.RawMessage(`["10.0.0.1"]`)
@@ -90,7 +90,7 @@ func TestEngineGate_plainAndPrecheckShapes(t *testing.T) {
 	})
 }
 
-// 历史问题-2（阶段化模型收紧 890000→790000）：自定义规则 DB id ≥790000 经
+// （阶段化模型收紧 890000→790000）：自定义规则 DB id ≥790000 经
 // 发射偏移 +10000 后撞入 GeoIP 预检段（800000-899999，buildIPPrecheckDirectives
 // 逐策略链 id=800000+policyID）——同 id 冲突会使整份 coraza 配置编译失败；
 // ≥890000 仍撞 CRS 保留段（900000+）。发射侧跳过并告警，不产出冲突 id。
@@ -117,7 +117,7 @@ func TestEngineGate_customRuleIDCollisionSkipped(t *testing.T) {
 
 // 阶段化模型（GeoIP 迁入预检）：预检含逐策略 GeoIP 链（链首 deny+skipAfter+
 // chain、X-LB-GeoIP-Loc 续段、信任续段）的新形状必须被 coraza v3.8.1 接受——
-// 「disruptive 动作仅允许链首段」约束只经编译可见（历史修复）。
+// 「disruptive 动作仅允许链首段」约束只经编译可见。
 func TestEngineGate_precheckGeoipChainShapes(t *testing.T) {
 	p1 := &models.SecurityPolicy{
 		ID: 42, Mode: "off", GeoIPMode: "deny", GeoIPCountries: json.RawMessage(`["海外"]`),
@@ -133,8 +133,8 @@ func TestEngineGate_precheckGeoipChainShapes(t *testing.T) {
 	compileForEngineGate(t, directives)
 }
 
-// 历史问题（历史）：引擎门禁覆盖此前未送编译的六个发射形状。每个
-// 用例的断言=真实渲染产物被 coraza v3.8.1 NewWAF 接受（历史修复 天然满足——
+// 引擎门禁覆盖此前未送编译的六个发射形状。每个
+// 用例的断言=真实渲染产物被 coraza v3.8.1 NewWAF 接受（天然满足——
 // 与既有门禁同一 compileForEngineGate 通道）。
 func TestEngineGate_modeAndControlShapes(t *testing.T) {
 	// ① detection 的 id:6 DetectionOnly 切换行
@@ -206,9 +206,9 @@ func TestEngineGate_modeAndControlShapes(t *testing.T) {
 		}
 		compileForEngineGate(t, directives)
 	})
-	// ⑦ 历史问题（历史）GREEN 形状：custom_only+仅 IP 控制（零启用自定义
+	// ⑦ GREEN 形状：custom_only+仅 IP 控制（零启用自定义
 	// 规则）——body processor 规则 id:9/10/11 不再发射，渲染产物仍须被
-	// coraza NewWAF 接受（历史修复：SecRule 发射面变更的验证终点是引擎编译）。
+	// coraza NewWAF 接受（SecRule 发射面变更的验证终点是引擎编译）。
 	t.Run("custom-only-ip-control-no-body-processors", func(t *testing.T) {
 		p := &models.SecurityPolicy{Mode: "custom_only", Enabled: true,
 			IPACLEnabled: true, IPACLMode: "deny", IPACLList: `["10.0.0.0/8"]`}
@@ -223,7 +223,7 @@ func TestEngineGate_modeAndControlShapes(t *testing.T) {
 }
 
 // 拦截页按触发策略归因（合成中断码 481+）：blockStatus>0 的新发射形状必须
-// 被引擎接受（历史修复——status 动作在链首段的合法性、SecRuleUpdateActionById
+// 被引擎接受（status 动作在链首段的合法性、SecRuleUpdateActionById
 // 语法均不能仅靠字符串断言）。CRS 抬码指令的真实生效由
 // security_block_status_test.go 的引擎行为实证覆盖；此处验证渲染产物编译。
 func TestEngineGate_blockStatusSyntheticShapes(t *testing.T) {

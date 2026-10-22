@@ -85,7 +85,7 @@ test('usePollingTask.stop 释放：abort 在途、永久终止后续轮次', asy
   assert.equal(calls, 1, 'stop 后 run 不得再执行任务')
 })
 
-test('usePollingTask：onError 自身抛错被就地吞掉，不中断后续轮次（FI-14）', async () => {
+test('usePollingTask：onError 自身抛错被就地吞掉，不中断后续轮次', async () => {
   const logged: unknown[][] = []
   const originalError = console.error
   console.error = (...args: unknown[]) => { logged.push(args) }

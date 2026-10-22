@@ -32,7 +32,7 @@ func TestSecurityWritePaths_rejectNoncanonicalIDs(t *testing.T) {
 	if _, err := db.DB.Exec(`INSERT INTO security_policies (id,name,mode,enabled) VALUES (5,'policy','off',1)`); err != nil {
 		t.Fatal(err)
 	}
-	// 历史修复（历史）：拆分端点此前缺规范 ID 门——用 mixed 策略做哨兵：
+	// 拆分端点此前缺规范 ID 门——用 mixed 策略做哨兵
 	// 无门时 "6.0" 会被 SQLite 亲和命中并真正进入拆分（生成子策略），有门则
 	// 在查库前 400。
 	if _, err := db.DB.Exec(`INSERT INTO security_policies (id,name,mode,policy_type,enabled) VALUES (6,'mixed-sentinel','blocking','mixed',1)`); err != nil {

@@ -16,11 +16,11 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// round44BackupJSONWithTableSet 构造「表键集合精确可控」的 V2 备份 JSON——
-// 与 completeBackupJSON/r55BackupJSONWithConfig 不同,不补齐 configBackupTables
+// tableSetBackupJSON 构造「表键集合精确可控」的 V2 备份 JSON——
+// 与 completeBackupJSON/configBackupJSON 不同,不补齐 configBackupTables
 // 全键,用于还原历史版本导出形态(迟到表键整体缺席,而非空切片);校验和按
 // v2.1.2+ 新格式覆盖实际 tables+config,与真实导出同构。
-func round44BackupJSONWithTableSet(t *testing.T, tables map[string][]map[string]any) string {
+func tableSetBackupJSON(t *testing.T, tables map[string][]map[string]any) string {
 	t.Helper()
 	cfg := map[string]any{}
 	backup := configBackup{
@@ -36,9 +36,9 @@ func round44BackupJSONWithTableSet(t *testing.T, tables map[string][]map[string]
 	return string(data)
 }
 
-// round44FullBackupTablesMinus 构造全量形态表集(configBackupTables 去掉
+// fullBackupTablesMinusShared 构造全量形态表集(configBackupTables 去掉
 // omit 列出的迟到表),users 恒含一个启用管理员(过管理员门)。
-func round44FullBackupTablesMinus(omit ...string) map[string][]map[string]any {
+func fullBackupTablesMinusShared(omit ...string) map[string][]map[string]any {
 	skip := map[string]bool{}
 	for _, o := range omit {
 		skip[o] = true
@@ -54,7 +54,7 @@ func round44FullBackupTablesMinus(omit ...string) map[string][]map[string]any {
 	return tables
 }
 
-// 历史修复(历史修复):v2.1.2-v2.2.13 时代的合法全量备份(Version=2+新格式校验和)
+// v2.1.2-v2.2.13 时代的合法全量备份(Version=2+新格式校验和)
 // 缺迟到表(security_crs_version/security_ip2region_version 于 v2.1.10
 // (76f616a) 起入导出清单、security_ip_lists 于 v2.2.1(6bf0bf5) 起入导出
 // 清单)不得被必需表门 400 硬拒;缺席表由导入链「缺席=保留本地」语义承接
@@ -71,14 +71,14 @@ func TestImportConfigBackup_acceptsPreLateTableEraFullBackups(t *testing.T) {
 		t.Run(era.name, func(t *testing.T) {
 			// Given 本地已有一条 IP 列表——备份未携带该表,导入后必须保留
 			h := newBackupTestHandlers(t)
-			r55SeedCurrentAdmin(t)
+			seedCurrentAdminShared(t)
 			if _, err := db.DB.Exec("INSERT INTO security_ip_lists (name, entries) VALUES ('local-list', '[\"10.0.0.1\"]')"); err != nil {
 				t.Fatalf("seed security_ip_lists: %v", err)
 			}
-			backup := round44BackupJSONWithTableSet(t, round44FullBackupTablesMinus(era.omit...))
+			backup := tableSetBackupJSON(t, fullBackupTablesMinusShared(era.omit...))
 
 			// When
-			response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
+			response := postImportShared(t, h.ImportConfigBackup, "/config/import", backup)
 
 			// Then
 			if response.Code != http.StatusOK {
@@ -103,17 +103,17 @@ func TestImportConfigBackup_acceptsPreLateTableEraFullBackups(t *testing.T) {
 	}
 }
 
-// 历史修复(历史修复) 预览路径确认:ValidateConfigImport(config_import_v1.go:577)
+// 预览路径确认:ValidateConfigImport(config_import_v1.go:577)
 // 与导入同走 validateV2Backup 必需表门——一处修复双路径生效,预览不得再误报
 // 「备份缺少必需的数据表」。
 func TestValidateConfigImport_acceptsV220EraFullBackup(t *testing.T) {
 	// Given v2.2.0 十四表形态备份(缺 security_ip_lists)
 	h := newBackupTestHandlers(t)
-	r55SeedCurrentAdmin(t)
-	backup := round44BackupJSONWithTableSet(t, round44FullBackupTablesMinus("security_ip_lists"))
+	seedCurrentAdminShared(t)
+	backup := tableSetBackupJSON(t, fullBackupTablesMinusShared("security_ip_lists"))
 
 	// When
-	response := r55Post(t, h.ValidateConfigImport, "/config/validate", backup)
+	response := postImportShared(t, h.ValidateConfigImport, "/config/validate", backup)
 
 	// Then 预览端点校验失败也返回 200+valid=false,须解析 data
 	if response.Code != http.StatusOK {
@@ -133,16 +133,16 @@ func TestValidateConfigImport_acceptsV220EraFullBackup(t *testing.T) {
 	}
 }
 
-// 历史修复 回归形状:全量形态(三族标记齐备)缺非迟到核心表仍必须 400——
+// 回归形状:全量形态(三族标记齐备)缺非迟到核心表仍必须 400——
 // 迟到表容缺不得放宽为「任意表缺席放行」。
 func TestImportConfigBackup_stillRejectsFullBackupMissingCoreTable(t *testing.T) {
 	// Given 全量形态备份缺 upstreams(非迟到核心表)
 	h := newBackupTestHandlers(t)
-	r55SeedCurrentAdmin(t)
-	backup := round44BackupJSONWithTableSet(t, round44FullBackupTablesMinus("upstreams"))
+	seedCurrentAdminShared(t)
+	backup := tableSetBackupJSON(t, fullBackupTablesMinusShared("upstreams"))
 
 	// When
-	response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
+	response := postImportShared(t, h.ImportConfigBackup, "/config/import", backup)
 
 	// Then
 	if response.Code != http.StatusBadRequest {
@@ -151,15 +151,15 @@ func TestImportConfigBackup_stillRejectsFullBackupMissingCoreTable(t *testing.T)
 	if !strings.Contains(response.Body.String(), "备份缺少必需的数据表: upstreams") {
 		t.Fatalf("拒绝必须点名 upstreams,实际: %s", response.Body.String())
 	}
-	r55AssertZeroWrite(t)
+	assertZeroWriteShared(t)
 }
 
-// 历史修复 回归形状:v2.0.10-v2.1.0 八表时代导出(Version=2,无 security_policies)
+// 回归形状:v2.0.10-v2.1.0 八表时代导出(Version=2,无 security_policies)
 // 走 hasSecurity=false 分类分支(已知表>0 即放行),修复不得破坏该既有可导入路径。
 func TestImportConfigBackup_eightTableEraUsesClassificationBranch(t *testing.T) {
 	// Given Version=2 八表形态备份(无安全族表),新格式校验和覆盖实际内容
 	h := newBackupTestHandlers(t)
-	r55SeedCurrentAdmin(t)
+	seedCurrentAdminShared(t)
 	tables := map[string][]map[string]any{
 		"lb_rules":            {},
 		"upstreams":           {},
@@ -170,10 +170,10 @@ func TestImportConfigBackup_eightTableEraUsesClassificationBranch(t *testing.T) 
 		"certificate_configs": {},
 		"cert_jobs":           {},
 	}
-	backup := round44BackupJSONWithTableSet(t, tables)
+	backup := tableSetBackupJSON(t, tables)
 
 	// When
-	response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
+	response := postImportShared(t, h.ImportConfigBackup, "/config/import", backup)
 
 	// Then
 	if response.Code != http.StatusOK {
@@ -181,19 +181,19 @@ func TestImportConfigBackup_eightTableEraUsesClassificationBranch(t *testing.T) 
 	}
 }
 
-// 历史修复(历史修复):导入校验对 ca_providers 行补 provider 白名单门——保存/更新侧
+// 导入校验对 ca_providers 行补 provider 白名单门——保存/更新侧
 // (services/caproviders.go:194)恒拒 letsencrypt/zerossl 之外的 provider,导入
 // 侧不得更宽;违例整包 400 且零写入。
 func TestImportConfigBackup_rejectsUnknownCAProvider(t *testing.T) {
 	// Given 备份携带 provider=evil-ca 的 ca_providers 行
 	h := newBackupTestHandlers(t)
-	r55SeedCurrentAdmin(t)
-	backup := r55BackupJSONWithConfig(t, map[string][]map[string]any{
+	seedCurrentAdminShared(t)
+	backup := configBackupJSON(t, map[string][]map[string]any{
 		"ca_providers": {{"id": 1, "name": "evil", "provider": "evil-ca", "directory_url": "https://evil.example/acme", "credentials": "{}", "enabled": 1}},
 	}, nil)
 
 	// When
-	response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
+	response := postImportShared(t, h.ImportConfigBackup, "/config/import", backup)
 
 	// Then
 	if response.Code != http.StatusBadRequest {
@@ -202,10 +202,10 @@ func TestImportConfigBackup_rejectsUnknownCAProvider(t *testing.T) {
 	if !strings.Contains(response.Body.String(), "evil-ca") {
 		t.Fatalf("拒绝必须点名违例 provider,实际: %s", response.Body.String())
 	}
-	r55AssertZeroWrite(t)
+	assertZeroWriteShared(t)
 }
 
-// 历史修复(历史修复):directory_url 无条件覆写为官方常量(与服务层 :197-201 同
+// directory_url 无条件覆写为官方常量(与服务层:197-201 同
 // 语义)——合法 provider + 恶意目录 URL 的备份导入后,落库 directory_url 必须
 // 是官方常量而非备份原值。
 func TestImportConfigBackup_overwritesDirectoryURLWithOfficialConstant(t *testing.T) {
@@ -220,13 +220,13 @@ func TestImportConfigBackup_overwritesDirectoryURLWithOfficialConstant(t *testin
 		t.Run(tt.provider, func(t *testing.T) {
 			// Given 合法 provider + 恶意 directory_url
 			h := newBackupTestHandlers(t)
-			r55SeedCurrentAdmin(t)
-			backup := r55BackupJSONWithConfig(t, map[string][]map[string]any{
+			seedCurrentAdminShared(t)
+			backup := configBackupJSON(t, map[string][]map[string]any{
 				"ca_providers": {{"id": 1, "name": "ca", "provider": tt.provider, "directory_url": "https://evil.example/acme", "credentials": "{}", "enabled": 1}},
 			}, nil)
 
 			// When
-			response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
+			response := postImportShared(t, h.ImportConfigBackup, "/config/import", backup)
 
 			// Then
 			if response.Code != http.StatusOK {
@@ -243,7 +243,7 @@ func TestImportConfigBackup_overwritesDirectoryURLWithOfficialConstant(t *testin
 	}
 }
 
-// 历史修复：OIDC 空哈希必须用 loginDummyBcryptHash 做等时比较，真实本地哈希
+// OIDC 空哈希必须用 loginDummyBcryptHash 做等时比较，真实本地哈希
 // 则原样保留。直接钉 loginCompareHash 的输入输出，避免以 30ms wall-clock 地板
 // 在重负载 CI 上误报；空哈希端到端恒拒由下方 never_authenticates 用例覆盖。
 func TestLoginCompareHash_emptyUsesDummyAndPreservesRealHash(t *testing.T) {
@@ -256,7 +256,7 @@ func TestLoginCompareHash_emptyUsesDummyAndPreservesRealHash(t *testing.T) {
 	}
 }
 
-// 历史修复(历史修复):GetAppLogs 128KB 尾读窗口起点可能切在多字节 UTF-8 rune 中段
+// GetAppLogs 128KB 尾读窗口起点可能切在多字节 UTF-8 rune 中段
 // ——首行残段带无效字节,JSON 编码后以 U+FFFD 污染输出。修复:起点非零时
 // 前进到下一 '\n' 再开始读(丢弃被截断的首行残段)。
 // 构造:总长度使 startOffset=size-128KB 恰落在「中」(3 字节)的第 2 字节;
@@ -325,7 +325,7 @@ func TestLogin_oidcEmptyPasswordHashNeverAuthenticates(t *testing.T) {
 	}
 
 	// When 以公开 dummy 明文「登录」
-	response := r55Post(t, h.Login, "/auth/login", `{"username":"oidc-dummy","password":"lazy-balancer timing-equalizer dummy"}`)
+	response := postImportShared(t, h.Login, "/auth/login", `{"username":"oidc-dummy","password":"lazy-balancer timing-equalizer dummy"}`)
 
 	// Then 必须 401——公开常量不得成为认证依据
 	if response.Code != http.StatusUnauthorized {
@@ -334,7 +334,7 @@ func TestLogin_oidcEmptyPasswordHashNeverAuthenticates(t *testing.T) {
 }
 
 // 备份导入路径可再引入 block_status_code=429 行(混入限流指标口径)。修复:
-// validateV2BackupSecurityPolicies 对 429 归一为 403(与 历史修复 导入侧
+// validateV2BackupSecurityPolicies 对 429 归一为 403(与导入侧
 // 覆写同格;旧备份不因新白名单硬拒)。
 func TestValidateV2Backup_normalizesBlockStatus429(t *testing.T) {
 	// Given 修复前时代备份携带 block_status_code=429 的策略行

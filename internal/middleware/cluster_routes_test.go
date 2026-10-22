@@ -294,7 +294,7 @@ func TestClusterMachineRateLimit_ignoresHeadersNotUsedByRouteAuth(t *testing.T) 
 
 func TestClusterMachineRateLimit_capacityFullEvictsLRUAndKeepsLimiting(t *testing.T) {
 	// Given：共享桶容量已满；合法节点的机器认证不得被误报为限流。
-	// 历史问题-1：容量满不得 fail-open（不建桶=本分钟对该来源零限流）——
+	// 容量满不得 fail-open（不建桶=本分钟对该来源零限流）——
 	// 改为 LRU 淘汰最久未命中桶后照常预占。
 	database, token := newClusterAuthContractDatabase(t)
 	loginRateBuckets.Lock()

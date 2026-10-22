@@ -6,9 +6,9 @@ import (
 	"testing"
 )
 
-// 自动封禁（历史问题）迁移钉：六项配置列 + 预置名单行。
+// 自动封禁迁移钉：六项配置列 + 预置名单行。
 // fresh DDL 携带全部形状；存量库经 Initialize/runMigrations 幂等补齐
-//（global_config 列走 newColumns 唯一登记通道——历史修复 口径）。
+//（global_config 列走 newColumns 唯一登记通道——口径）。
 
 // autobanColumnsExpected 全部六列的期望默认值（与 newColumns 登记逐字对齐）。
 var autobanColumnsExpected = []struct{ column, dflt string }{

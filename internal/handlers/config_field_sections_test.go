@@ -1,9 +1,9 @@
 package handlers
 
-// 历史问题-1（历史 审计）：ConfigFieldSections 必须覆盖 config_changes.go
+// ConfigFieldSections 必须覆盖 config_changes.go
 // planConfigChanges 全部 add() 字段，否则字段级审计归因落「全局配置」
-// （github_token 曾漏——历史问题 同批字段，历史修复 同族漏点）。
-// 历史问题（历史）：原用例维护一份手抄字段清单——实现新增 add() 字段时
+// （github_token 曾漏——同批字段，同族漏点）。
+// 原用例维护一份手抄字段清单——实现新增 add() 字段时
 // 清单同步漏改即假绿（threat_screen_mode/security_events_retention_days/
 // security_events_row_cap 三字段即此形态漏检）。改为直接扫描源码提取
 // `add("field"` 首参，与 ConfigFieldSections 双向比对（源码为唯一清单）。
@@ -65,7 +65,7 @@ func TestConfigFieldSections_matchConfigChangeSource(t *testing.T) {
 }
 
 func TestConfigFieldSections_recentDriftKeysPinned(t *testing.T) {
-	// 近两轮漂移键显式钉死（历史问题-1 + 历史修复 + 历史问题），防止镜像清单漏列时
+	// 近两轮漂移键显式钉死（+ +），防止镜像清单漏列时
 	// 静默通过。
 	pinned := map[string]string{
 		"github_token":                   "基础设置",

@@ -62,7 +62,7 @@ export const CRS_EXCLUDED_MAX_ROWS = 50
  * - 对象数组 [{target,scope,ips,listRefs}]：字段缺失/形状异常按空值兜底，target 空的行丢弃；
  *   ips 兼容两种形态——逗号分隔字符串（后端 CRSExcludedEntry 契约/落库形态）与数组
  *   （前端内存形态），读侧一律归一为数组；
- * - 旧字符串数组（历史存储：CRS 文件名/纯数字 ID/区间）：归一为 scope:'all' 行，
+ * - 旧字符串数组（存储：CRS 文件名/纯数字 ID/区间）：归一为 scope:'all' 行，
  *   target 原样保留（后端 SecRuleRemoveById 兼容文件名/纯数字/区间三种形态）。
  */
 export const parseCrsExcludedRules = (raw: string | undefined | null): CrsExcludedRow[] => {
@@ -117,7 +117,7 @@ export interface CrsRuleOptionView {
  * 失败语义：HTTP 错误已由全局拦截器 toast，这里退化为空列表（loaded 保持 false，
  * 供消费方区分「索引未就绪」与「规则确实不在索引中」）。
  *
- * 历史问题-35：状态提升为模块级单例——索引纯只读、仅 CRS 库更新时变化，原先每个消费方
+ *：状态提升为模块级单例——索引纯只读、仅 CRS 库更新时变化，原先每个消费方
  * （策略向导/事件快捷排除/规则集页）各自挂载都全量拉取同一份 ~832 条索引
  * （≈100KB+ JSON）。ref 与 seq 计数器提升为模块顶层：会话序列守卫语义不变
  * （在途失配丢弃、失败不落 loadedSeq 允许同会话重试），并发去重改为跨实例生效
@@ -125,7 +125,7 @@ export interface CrsRuleOptionView {
  */
 // 模块级共享状态（单例）：所有 useCrsRuleIndex() 消费方共享同一份索引与加载态
 const rules = ref<CrsRuleIndexEntry[]>([])
-// 历史问题（历史）：rules/version/load 三个返回位全仓零消费（两个消费方仅
+// rules/version/load 三个返回位全仓零消费（两个消费方仅
 // 解构 loading/loaded/byId/options/ensureForDialog）——version ref 随死返回一并
 // 删除（移除后写-only）；rules/loading 等模块级状态保留（byId/options 内部消费）
 const loading = ref(false)
@@ -141,7 +141,7 @@ const byId = computed(() => {
 const options = computed<CrsRuleOptionView[]>(() =>
   rules.value.map((r) => ({ id: r.id, ...crsRuleLabelView(r), file: r.file, category: r.category })))
 
-// 历史问题：会话守卫/单飞状态机抽到 utils/sessionSingleFlight（无依赖工厂，
+// 会话守卫/单飞状态机抽到 utils/sessionSingleFlight（无依赖工厂，
 // 行为测试直测「旧请求后到丢弃 + 新会话链式补取 + 失败可重试」，不再源码正则断言）。
 // 消费方语义与原实现一致：同一 openSeq 复用缓存；跨实例在途去重；失败不落
 // loadedSession 允许同会话重试；旧会话响应丢弃。
@@ -165,7 +165,7 @@ const indexLoader = createSessionSingleFlight<CrsRuleIndexEntry[]>({
   },
   onError: (error) => {
     console.warn('Failed to load CRS rule index:', error)
-    // 历史问题：失败不得清空已加载索引（stale-while-error）——ensureForDialog 每次
+    // 失败不得清空已加载索引（stale-while-error）——ensureForDialog 每次
     // 打开弹框都会新会话重拉（~832 条/100KB+），任一次网络抖动原实现把模块级
     // rules 清空，当前已打开的向导/规则集页下拉与描述列同时变空。保留旧索引供
     // 展示，loaded 复位允许同会话重试（消费方的「规则已移除 vs 索引未加载」文案

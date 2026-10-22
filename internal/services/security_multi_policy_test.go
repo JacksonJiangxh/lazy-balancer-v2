@@ -7,7 +7,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 历史修复（v2.2.0 多策略绑定）：GetSecurityPoliciesForRule 返回规则绑定的
+// （v2.2.0 多策略绑定）：GetSecurityPoliciesForRule 返回规则绑定的
 // 全部 enabled 策略，按 policy_id ASC 有序；disabled 排除；空结果返回 nil
 // （非空切片）；单绑定时与 GetSecurityPolicyForRule 返回同一策略。
 
@@ -128,7 +128,7 @@ func TestGetSecurityPoliciesForRule_SingleBindingMatchesLegacy(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：GetSecurityPoliciesForRule 不得在 rows 未关闭时
+// GetSecurityPoliciesForRule 不得在 rows 未关闭时
 // 嵌套查询（scanSecurityPolicyByID/resolvePolicyIPListRefs）——连接池耗尽即
 // 永久阻塞（无 context 超时）。单连接池（SetMaxOpenConns(1)）下旧实现必然
 // 自锁；修复后先收集 policy_id、关闭 rows、再逐条加载，单连接即可跑通。

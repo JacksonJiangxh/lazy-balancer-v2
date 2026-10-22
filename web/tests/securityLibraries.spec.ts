@@ -1,6 +1,6 @@
-// 规则库展示单源验收（历史问题）：
-//   历史修复 IP 地理库「未安装」不得再显示「已最新/正常」——状态/健康标签显式表达
-//   历史修复 SecurityRules 与 SecurityOverview 的聚合/状态映射单源，空源列表两端同结论
+// 规则库展示单源验收
+//   IP 地理库「未安装」不得再显示「已最新/正常」——状态/健康标签显式表达
+//   SecurityRules 与 SecurityOverview 的聚合/状态映射单源，空源列表两端同结论
 //
 // 运行：cd web && npm test
 
@@ -26,7 +26,7 @@ test('状态词表：未安装/缺失/未更新不再伪装为已最新', () => 
   assert.equal(libraryStatusTagType('missing'), 'danger')
   assert.equal(libraryStatusTagType('failed'), 'danger')
   assert.equal(libraryStatusTagType('success'), 'success')
-  // 历史问题-01 同族：后端持久 cancelled 状态不得在状态列漏成英文原词
+  // 同族：后端持久 cancelled 状态不得在状态列漏成英文原词
   assert.equal(libraryStatusLabel('cancelled'), '已取消')
   assert.equal(libraryStatusTagType('cancelled'), 'info')
 })
@@ -49,7 +49,7 @@ test('多源聚合：状态优先级 更新中>失败>成功>未更新', () => {
 })
 
 test('多源聚合：关闭源（update_enabled=false）→ disabled，不沿用历史失败/排程', () => {
-  // 历史修复②：disabled 分支与 libraryStatusTagType('disabled') 此前无覆盖。
+  // disabled 分支与 libraryStatusTagType('disabled') 此前无覆盖。
   const base = { version: '2026.10.01', update_status: 'failed', entry_count: 3, last_checked: '2026-10-01', next_update: '2026-11-01' }
   const summary = summarizeLibrarySources([{ ...base, update_enabled: false }])
   assert.equal(summary.status, 'disabled', '全部源已关闭时不得沿用关闭前的 failed')
@@ -115,7 +115,7 @@ test('多源库健康标签：未配置源不再显示正常', () => {
   )
 })
 
-test('健康标签加载三态：首次响应落地前显示「加载中」，不得冒充「正常」（历史修复）', () => {
+test('健康标签加载三态：首次响应落地前显示「加载中」，不得冒充「正常」', () => {
   // 首屏窗口：初值 available:true/status:'' 不代表已确认正常
   assert.deepEqual(
     libraryHealthTag('CRS 规则库', { loadError: false, available: true, status: '', loaded: false }),
@@ -136,9 +136,9 @@ test('健康标签加载三态：首次响应落地前显示「加载中」，�
   )
 })
 
-test('单库健康标签：持久 update_status 的失败/进行中/关闭态不得伪装为正常（历史问题-01）', () => {
+test('单库健康标签：持久 update_status 的失败/进行中/关闭态不得伪装为正常', () => {
   // 后端 update_status 可为 failed（更新失败落库）；同卡状态列已据此显示「更新失败」，
-  // 卡头此前一律绿「正常」——自相矛盾（历史问题 同族）。
+  // 卡头此前一律绿「正常」——自相矛盾。
   assert.deepEqual(
     libraryHealthTag('CRS 规则库', { loadError: false, available: true, status: 'failed' }),
     { label: 'CRS 规则库 · 更新失败', type: 'danger' },
@@ -182,7 +182,7 @@ test('CRS 数量列是规则条数，不是文件数', () => {
   assert.equal(crsRuleCountLabel(undefined), '—')
 })
 
-// 规则库「定时更新」保存前校验（历史问题）：时间被清空时必须显式拒绝——原实现
+// 规则库「定时更新」保存前校验：时间被清空时必须显式拒绝——原实现
 // 静默回落 04:00，输入框显示空、落库却是 04:00（可观察行为与输入不一致）。
 test('定时更新校验：空时间拒绝保存，不静默代填 04:00', () => {
   assert.equal(libraryScheduleError([1], null), '请选择时间')

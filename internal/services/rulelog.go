@@ -15,27 +15,22 @@ import (
 var ruleLogDir = "/app/logs/rules"
 
 func RuleLogPath(ruleID string) string {
-	return filepath.Join(ruleLogDir, fmt.Sprintf("%s.log", sanitizeRuleLogName(ruleID)))
+	return filepath.Join(ruleLogDir, fmt.Sprintf("%s.log", RuleLogFileComponent(ruleID)))
 }
 
 // RuleLogFileComponent 是规则访问日志文件名主体的单源（写侧 RuleLogPath 与
-// handlers 读侧共用）。语义见 sanitizeRuleLogName：合法字母表 ID 原样返回，
-// 其它字符按可逆编码转为文件名安全形态。
-func RuleLogFileComponent(ruleID string) string {
-	return sanitizeRuleLogName(ruleID)
-}
-
-// sanitizeRuleLogName 把 ruleID 转为规则日志文件名主体（历史问题）。
+// handlers 读侧共用），内部直接复用可逆编码 encodeFileComponent——此前经
+// sanitizeRuleLogName 的纯透传二层已合并（两层同义委托只增加阅读跳转）。
 // caddy_id 字母表 [A-Za-z0-9_-] 内的 ID 原样保留（既有文件命名零变化）；
-// 含其他字符的 ID 不再剔除字符——剔除不可逆且会让 `lb.dot` 与 `lbdot`
-// 共用同一日志文件（删除/读取互相污染），改为 "%" + hex(utf8)。编码分支
-// 服务于集群快照/存量数据带入的带点 ID：v2 导入路径已由 ValidCertRuleID
-// 历史修复 拒绝字母表外 ID（config_backup.go），故新写入不再产生此类 ID。
-func sanitizeRuleLogName(ruleID string) string {
+// 含其他字符的 ID 不剔除字符——剔除不可逆且会让 `lb.dot` 与 `lbdot` 共用
+// 同一日志文件（删除/读取互相污染），改为 "%" + hex(utf8)。编码分支服务于
+// 集群快照/存量数据带入的带点 ID：v2 导入路径已由 ValidCertRuleID 拒绝
+// 字母表外 ID（config_backup.go），故新写入不再产生此类 ID。
+func RuleLogFileComponent(ruleID string) string {
 	return encodeFileComponent(ruleID)
 }
 
-// fileComponentSafe 报告 value 是否仅含文件名安全字母表 [历史修复_-]
+// fileComponentSafe 报告 value 是否仅含文件名安全字母表 [_-]
 // （= caddy_id 字符集；rulelog 与 certjoblog 共用同一判定与编码）。
 func fileComponentSafe(value string) bool {
 	for _, r := range value {
@@ -109,12 +104,12 @@ func ReadRuleLogFrom(ruleID string, offset int64) (lines []string, next int64) {
 	if len(data) > 0 && data[len(data)-1] != '\n' {
 		// Hold back the unterminated trailing record so it is delivered
 		// complete on the next poll instead of being skipped forever.
-		// 历史修复（历史问题）：bytes.LastIndexByte 免去至多 8MB 窗口的
+		// bytes.LastIndexByte 免去至多 8MB 窗口的
 		// string(data) 整体复制（尾行未终结时每 5s 轮询各命中一次）。
 		if i := bytes.LastIndexByte(data, '\n'); i >= 0 {
 			data = data[:i+1]
 		} else if int64(len(data)) >= maxRead {
-			// 历史修复（历史）：整窗读满（达 maxRead）仍无换行——单条
+			// 整窗读满（达 maxRead）仍无换行——单条
 			// 记录超过读取窗口（>8MB 单行/二进制/损坏日志）。旧式 data=nil 使
 			// next==offset 原地不动，日志流永久卡死。至少前进一个窗口：丢弃
 			// 本窗字节并把 next 推到窗口末，后续轮询从新 offset 继续。
@@ -142,7 +137,7 @@ func ReadRuleLogFrom(ruleID string, offset int64) (lines []string, next int64) {
 // ReadRuleLogTail returns the last maxLines lines of the rule's access log
 // and the file offset at which they begin, reading backwards in blocks so
 // even very large logs cost only a few reads.
-// maxBackwardScan 历史问题-2:向前扫描字节上限——无换行的损坏/二进制文件
+// maxBackwardScan:向前扫描字节上限——无换行的损坏/二进制文件
 // 防止 O(n²) 全量拷贝(100MB 无换行 ≈ 数十 GB 级复制)
 const maxBackwardScan = 4 << 20 // 4MB
 
@@ -159,7 +154,7 @@ func ReadRuleLogTail(ruleID string, maxLines int) (content string, offset int64)
 	}
 	size := info.Size()
 	const blockSize = int64(64 * 1024)
-	// 历史修复（历史问题）：两段式倒扫——此前 `buf = append(chunk, buf...)`
+	// 两段式倒扫——此前 `buf = append(chunk, buf...)`
 	// 每块向前拼接是二次方拷贝（4MB 扫描上限内最坏 ≈130MB 瞬时分配，单次
 	// GetRuleLogs 可反复触发）。第一段只倒序记窗口起点+数换行（单块 scratch
 	// 复用），第二段对定窗单次 ReadAt 读回。行为逐字节不变：cap 判定、
@@ -171,7 +166,7 @@ func ReadRuleLogTail(ruleID string, maxLines int) (content string, offset int64)
 	scanned := int64(0)
 	capped := false
 	for end := size; end > 0 && newlines < maxLines+1; {
-		// maxBackwardScan 接线（历史问题-1，历史问题-2 补完）：无换行/损坏文件
+		// maxBackwardScan 接线：无换行/损坏文件
 		// 不再一路扫到文件头，超限即停并返回部分 tail（一次性 warn 留痕）。
 		if scanned >= maxBackwardScan {
 			capped = true
@@ -194,7 +189,7 @@ func ReadRuleLogTail(ruleID string, maxLines int) (content string, offset int64)
 		}
 		end = start
 	}
-	// 首报留痕+节流（历史问题）：命中上限逐规则只报一次 warn（用户反复打开
+	// 首报留痕+节流：命中上限逐规则只报一次 warn（用户反复打开
 	// 日志弹框不再每读一次刷一行），读到未截断 tail 时补一条恢复 info——
 	// 与排程读失败/日志轮转刷新的 logStateTransition 口径同源。
 	if lvl := logStateTransition("rulelog-tail-cap-"+ruleID, capped); lvl != "" {
@@ -236,7 +231,7 @@ func RemoveRuleLogFiles(ruleID string) {
 	for i := 1; i <= 5; i++ {
 		os.Remove(fmt.Sprintf("%s.%d", base, i))
 	}
-	// 历史修复(2026-09-10 审计):timberjack 时间戳副本(<id>-<ts>-size.log,至多
+	// (2026-09-10 审计):timberjack 时间戳副本(<id>-<ts>-size.log,至多
 	// roll_keep=5 份)此前永久残留——按前缀+后缀清扫。
 	removeTimberjackRotations(base)
 }
@@ -255,7 +250,7 @@ func removeTimberjackRotations(base string) {
 		if !strings.HasPrefix(name, stem+"-") || !strings.HasSuffix(name, "-size.log") {
 			continue
 		}
-		// 历史问题-历史修复（历史）:数字边界守卫(logstats.go 历史问题 同族
+		// 数字边界守卫(logstats.go 同族
 		// 先例)——stem 后 '-<ts>' 段首字符必须为数字(timberjack 时间戳恒以
 		// 数字开头);否则兄弟规则(caddy_id 以本 stem 为前缀,如 lb_abc 与
 		// lb_abc-extra)的轮转副本会被本清扫误删。

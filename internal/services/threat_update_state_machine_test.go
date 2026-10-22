@@ -50,7 +50,7 @@ func TestThreatUpdate_demoteMidRun_doesNotWriteSourceRow(t *testing.T) {
 	}
 }
 
-// 历史修复（错误传播）：成功状态落库失败不得让任务仍报 success。
+// （错误传播）：成功状态落库失败不得让任务仍报 success。
 func TestMarkSourceSuccess_returnsStoreError(t *testing.T) {
 	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatal(err)

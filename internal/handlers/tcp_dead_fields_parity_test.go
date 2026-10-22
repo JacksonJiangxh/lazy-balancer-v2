@@ -1,6 +1,6 @@
 package handlers
 
-// 历史修复（历史问题）：TCP 死值清零 SQL 双实现 parity 钉——启动迁移
+// TCP 死值清零 SQL 双实现 parity 钉——启动迁移
 // db.migrateTCPRuleDeadFields（db.go）与导入归一
 // handlers.normalizeRuleRowsForTransport（config_backup.go:tcpRuleDeadFieldsResetSQL）
 // 持有两份逐字相同的 UPDATE 字面量（11 列 SET + TCP 谓词），跨包无法共享常量，
@@ -43,10 +43,11 @@ func TestTCPRuleDeadFieldsSQL_parityWithStartupMigration(t *testing.T) {
 	if strings.Join(migCols, ",") != strings.Join(localCols, ",") {
 		t.Fatalf("SET 列集合分叉:\n  db.go        = %v\n  config_backup = %v", migCols, localCols)
 	}
-	// TCP 自愈族：七 HTTP 专属 + NTLM + force_http1 + TLS 三列
-	// + 代理超时族七列 + custom_routes_enabled + dynamic_dns + strategy。
-	if len(migCols) != 22 {
-		t.Fatalf("SET 列数=%d, want 22: %v", len(migCols), migCols)
+	// TCP 自愈族：七 HTTP 专属 + NTLM + force_http1 + TLS 来源与材料
+	// + 代理超时族七列 + custom_routes_enabled + dynamic_dns + strategy
+	// + domain/health_check_host/tls_http_redirect + 阶段页四列 + log_enabled。
+	if len(migCols) != 31 {
+		t.Fatalf("SET 列数=%d, want 31: %v", len(migCols), migCols)
 	}
 	if migWhere != localWhere {
 		t.Fatalf("WHERE 谓词分叉:\n  db.go        = %q\n  config_backup = %q", migWhere, localWhere)
@@ -86,6 +87,8 @@ func secondRawLiteralAfter(t *testing.T, body string, offset int, marker string)
 var tcpSQLColumnFallback = map[string]string{
 	"host_header":                   "HostHeader",
 	"health_check_path":             "HealthCheckPath",
+	"health_check_host":             "HealthCheckHost",
+	"domain":                        "Domain",
 	"enable_compress":               "EnableCompress",
 	"compress_types":                "CompressTypes",
 	"request_body_max_size_mb":      "RequestBodyMaxSizeMB",
@@ -104,8 +107,15 @@ var tcpSQLColumnFallback = map[string]string{
 	"dynamic_dns":                   "DynamicDNS",
 	"strategy":                      "Strategy",
 	"enable_tls":                    "EnableTLS",
+	"tls_source":                    "TLSSource",
+	"tls_http_redirect":             "TLSHTTPRedirect",
 	"tls_cert":                      "TLSCert",
 	"tls_key":                       "TLSKey",
+	"block_page_stage1_id":          "BlockPageStage1ID",
+	"block_page_stage1_status":      "BlockPageStage1Status",
+	"block_page_stage3_id":          "BlockPageStage3ID",
+	"block_page_stage3_status":      "BlockPageStage3Status",
+	"log_enabled":                   "LogEnabled",
 }
 
 // TestTCPDeadFieldsSaveFamily_coversSQLColumns 钉住保存族与 SQL 归一的列覆盖
@@ -129,6 +139,10 @@ func TestTCPDeadFieldsSaveFamily_coversSQLColumns(t *testing.T) {
 	if len(tcpSQLColumnFallback) != len(cols) {
 		t.Fatalf("列→字段映射条数=%d, want %d（SQL 扩列未同步映射）", len(tcpSQLColumnFallback), len(cols))
 	}
+	sqlColumns := make(map[string]bool, len(cols))
+	for _, col := range cols {
+		sqlColumns[col] = true
+	}
 	for _, col := range cols {
 		field, ok := tcpSQLColumnFallback[col]
 		if !ok {
@@ -142,6 +156,11 @@ func TestTCPDeadFieldsSaveFamily_coversSQLColumns(t *testing.T) {
 			if !strings.Contains(adapter, field+":") {
 				t.Fatalf("%s 未接线字段 %s（列 %s）——该列在复制/编辑路径不自愈", name, field, col)
 			}
+		}
+	}
+	for col := range tcpSQLColumnFallback {
+		if !sqlColumns[col] {
+			t.Fatalf("保存族列 %q 未纳入 SQL 归一（双向 parity 缺口）", col)
 		}
 	}
 }

@@ -124,7 +124,7 @@ func TestUpdateConfig_trustedProxyRefs_rejectsInvalidListEntry(t *testing.T) {
 	}
 }
 
-// 历史修复（历史问题）：总量门此前只挂在 refs 载荷分支——inline-only 更新
+// 总量门此前只挂在 refs 载荷分支——inline-only 更新
 // 时库中既有引用展开不参与合计，「内联 ≤64 + 存量 refs 展开 1999」可破
 // 2000 上限（非对称）。钉：inline 载荷 + 库中存量 refs 超总量组合 → 400；
 // 未超总量 → 200（回归形状）。
@@ -185,15 +185,15 @@ func TestConfigBackup_trustedProxyRangeRefsRoundTrip(t *testing.T) {
 	if _, err := db.DB.Exec(`INSERT INTO users (id, username, password_hash, role, display_name, is_enabled) VALUES (2, 'backup-admin', 'hash', 'admin', 'Backup Admin', 1) ON CONFLICT(id) DO NOTHING`); err != nil {
 		t.Fatal(err)
 	}
-	// 历史修复：id 3 是内置威胁名单（db 种子）——内置名单引用自本轮起 400
+	// id 3 是内置威胁名单（db 种子）——内置名单引用自本轮起 400
 	// 拒绝（威胁名单条目在 .iplist 文件，DB entries 恒空会让格式/总量门失效），
 	// 本往返用例改用不冲突的自定义 id。
 	if _, err := db.DB.Exec(`UPDATE global_config SET trusted_proxy_range_refs='[903,907]' WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
-	// 历史修复（历史）导入门后语义：refs 存在性按「备份内优先 ∪ 库内」解析
+	// 导入门后语义：refs 存在性按「备份内优先 ∪ 库内」解析
 	//——真实备份的被引用名单随 security_ip_lists 表导出，此处种两行使备份
-	// 自洽（带外直写悬空 refs 的旧形态现在导入 400，见 r74c 门钉测）。
+	// 自洽（带外直写悬空 refs 的旧形态现在导入 400，见悬空 refs 门钉测）。
 	for _, id := range []int64{903, 907} {
 		if _, err := db.DB.Exec(`INSERT OR IGNORE INTO security_ip_lists (id, name, entries) VALUES (?, ?, '[]')`, id, fmt.Sprintf("roundtrip-%d", id)); err != nil {
 			t.Fatal(err)
@@ -241,7 +241,7 @@ func TestConfigBackup_trustedProxyRangeRefsRoundTrip(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：引用展开计数曾按原始 len(entries) 累加，而逐条校验
+// 引用展开计数曾按原始 len(entries) 累加，而逐条校验
 // 与渲染层都跳过空 value 条目——名单含空条目（带外改库/旧数据）时，实际
 // 展开 ≤2000 的合法载荷会被总量门 400 拒绝。钉：两侧（refs 载荷分支与
 // inline-only 存量分支）都只计通过校验的非空条目。
@@ -275,5 +275,41 @@ func TestUpdateConfig_trustedProxyRefs_countsOnlyNonEmptyEntries(t *testing.T) {
 	overBody := fmt.Sprintf(`{"source":"caddy","trusted_proxy_ranges":"[]","trusted_proxy_range_refs":"[%d]"}`, overID)
 	if rec := putConfig(t, router, overBody); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "2000") {
 		t.Fatalf("over-cap 必须 400 且点名 2000 上限, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// 锁内受信代理复核第二分支（名单随备份替换 + refs 保持 live）：live refs
+// 指向备份行中 system=1 内置名单必须拒绝（与写侧「受信代理不能引用内置
+// 地址列表」契约一致——初检只校验内置行名称白名单，允许 id 撞号）。
+func TestRevalidateImportTrustedProxyRefs_listsCarriedRejectsBuiltinRef(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	if _, err := db.DB.Exec(`INSERT OR IGNORE INTO global_config (id) VALUES (1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`UPDATE global_config SET trusted_proxy_range_refs='[901]' WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	backup := &configBackup{
+		Tables: map[string][]map[string]any{
+			"security_ip_lists": {
+				{"id": 901, "name": "办公网", "system": 1},
+			},
+		},
+	}
+	tx, err := db.DB.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	carried := map[string]bool{"security_ip_lists": true}
+
+	// refs 指向备份行中的 system=1 行 → 拒绝
+	if err := revalidateImportTrustedProxyRefs(t.Context(), tx, backup, carried); err == nil || !strings.Contains(err.Error(), "内置") {
+		t.Fatalf("refs 指内置名单必须拒绝: %v", err)
+	}
+	// 同 id 非内置行 → 放行
+	backup.Tables["security_ip_lists"][0]["system"] = 0
+	if err := revalidateImportTrustedProxyRefs(t.Context(), tx, backup, carried); err != nil {
+		t.Fatalf("非内置名单 refs 必须放行: %v", err)
 	}
 }

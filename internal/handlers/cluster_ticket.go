@@ -20,7 +20,7 @@ func (h *Handlers) GenerateClusterLoginTicket(c *gin.Context) {
 	// v2.1.8 决策4：集群「登录从节点」需当前 admin 已启用 MFA——未启用直接引导
 	// 先去安全设置绑定；写验证开关开启时还要求 10 分钟内验证过（428 → 前端
 	// 全局 step-up 弹窗验码后自动重试），票据本身即含 MFA 事实。
-	// 历史问题：DB 读错误必须 fail-closed（无法证明已启用=拒绝），此前
+	// DB 读错误必须 fail-closed（无法证明已启用=拒绝），此前
 	// err != nil 时条件不成立直接放行发票。
 	// v2.3.0 用户裁定:OIDC 用户与本地 MFA 体系完全解耦(IdP 侧已验证二因子),
 	// 两道 MFA 门仅对本地用户生效——OIDC 会话直接放行发票。
@@ -35,7 +35,7 @@ func (h *Handlers) GenerateClusterLoginTicket(c *gin.Context) {
 			return
 		}
 	}
-	// 历史问题 三次（用户裁决）：登录从节点每次点击都要求 MFA 验证——不再复用登录后
+	// （用户裁决）：登录从节点每次点击都要求 MFA 验证——不再复用登录后
 	// 的 10 分钟写操作宽限窗（用户实测窗口内直接跳转登录成功，与「点击登录时
 	// 需要验证」的决策语义不符）。保留 60 秒宽限仅供 428 → 前端弹码 →
 	// verify-step → 自动重试这一次链路闭环（重试发生在验证后的数秒内）。
@@ -65,13 +65,13 @@ func (h *Handlers) GenerateClusterLoginTicket(c *gin.Context) {
 			message = err.Error()
 		}
 		if errors.Is(err, services.ErrNodeNotFound) {
-			// 历史问题(历史):节点不存在属客户端寻址错误,与同族端点
+			// 节点不存在属客户端寻址错误,与同族端点
 			// (cluster_registration.go:151、cluster_service.go:71、
 			// cluster_sync.go:135)的 ErrNodeNotFound→404 口径对齐。
 			status = http.StatusNotFound
 		}
 		if errors.Is(err, services.ErrNodeOffline) {
-			// 历史问题（历史）：已批准但未上报/已离线是「现在不可达」而非
+			// 已批准但未上报/已离线是「现在不可达」而非
 			// 「不存在」——409 + 可行动文案，运营方据此检查从节点进程/网络。
 			status = http.StatusConflict
 			message = "目标从节点尚未上报或已离线，请确认从节点在线后重试"
@@ -79,7 +79,7 @@ func (h *Handlers) GenerateClusterLoginTicket(c *gin.Context) {
 		clusterError(c, status, message, err)
 		return
 	}
-	// 审计带节点名(与服务控制事件同格式「节点 %d（%s）」,历史问题:ID 必留,
+	// 审计带节点名(与服务控制事件同格式「节点 %d（%s）」,:ID 必留,
 	// nodes.name 无 UNIQUE,仅名无法定位行)。
 	recordAudit(c, "生成", "登录票据", services.FormatAuditDetail(fmt.Sprintf("节点 %d（%s）", nodeID, response.NodeName), services.AuditResultPart("success")))
 	c.JSON(http.StatusOK, response)
@@ -116,7 +116,7 @@ func (h *Handlers) TicketLogin(c *gin.Context) {
 		recordTicketLoginFailure(c, claims.Username, reason)
 		message := "登录票据无效或已过期"
 		if status == http.StatusInternalServerError {
-			// 历史问题（历史）：DB/内部故障（审计侧已归因 database_error）
+			// DB/内部故障（审计侧已归因 database_error）
 			// 不得复用凭证文案——否则运维误判为票据问题并反复重取票据。
 			message = "登录票据校验失败，请稍后重试"
 		}

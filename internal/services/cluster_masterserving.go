@@ -106,14 +106,14 @@ func masterSyncServingRound(ctx context.Context, now time.Time, w *masterServing
 	if database == nil {
 		return
 	}
-	// 历史问题-07：提升后 pin 清理失败的重试挂巡检周期。此前唯一重试点是
+	// 提升后 pin 清理失败的重试挂巡检周期。此前唯一重试点是
 	// Snapshot()（从节点 Pull）入口——刚提升、无从节点的主节点永不重试，
 	// 旧主节点 pin 文件与「清理失败」审计长期残留（进程重启连内存态也丢）。
 	for _, service := range clusterServicesFor(database) {
 		service.retryPendingPinCleanup()
 	}
 	var clusterVersion, syncInterval int
-	// 历史问题-01（历史）：离线阈值跟随全局同步间隔——sync_interval 与
+	// 离线阈值跟随全局同步间隔——sync_interval 与
 	// cluster_sync 同口径读 global_config（COALESCE 60 兜底）；nodes.sync_interval
 	// 是写侧（RegisterNode/ReportNode）从不写的死列（schema 默认 60），读它会把
 	// 阈值钉死在 120s 下限，真实 interval>120s 时逐轮误报离线。
@@ -132,7 +132,7 @@ func masterSyncServingRound(ctx context.Context, now time.Time, w *masterServing
 	var nodes []masterServingNode
 	for rows.Next() {
 		var n masterServingNode
-		// 历史问题-02：last_seen 直接扫描为 sql.NullTime——与 Nodes()/票据路径
+		// last_seen 直接扫描为 sql.NullTime——与 Nodes()/票据路径
 		// 同源（驱动按 DATETIME 声明解析），不再维护第二套手写布局表。不可解析
 		// 的脏值不得静默降级为「从未上报」假离线：整轮显性告警并跳过（下一轮
 		// 重试），与 rows.Err 同口径。
@@ -152,7 +152,7 @@ func masterSyncServingRound(ctx context.Context, now time.Time, w *masterServing
 
 	seen := make(map[int64]bool, len(nodes))
 	online, offlineCount, lagging := 0, 0, 0
-	// 每节点阈值与 ComputeNodeStatus/updateOverview 同口径（历史问题-02）——
+	// 每节点阈值与 ComputeNodeStatus/updateOverview 同口径——
 	// max(2×全局 sync_interval, 下限 120s)+脏值 clamp 归一到 nodeOfflineThreshold，
 	// 同一轮全节点同值（全局列）。
 	threshold := nodeOfflineThreshold(syncInterval)
@@ -204,7 +204,7 @@ func masterSyncServingRound(ctx context.Context, now time.Time, w *masterServing
 	}
 
 	// 小时级心跳：全绿才记（异常在挂→静默，异常已 WARN 留痕）。
-	// 历史问题：异常轮必须清零窗口——原实现只按轮数自增/满 60 清零，窗口内
+	// 异常轮必须清零窗口——原实现只按轮数自增/满 60 清零，窗口内
 	// 出现离线/滞后后，恢复仅数轮就可能在「仅数轮全绿」时输出「服务面正常」
 	// 心跳（与 configwatchdog 的漂移清零窗口口径分叉）。
 	if offlineCount > 0 || lagging > 0 {
@@ -216,7 +216,7 @@ func masterSyncServingRound(ctx context.Context, now time.Time, w *masterServing
 		return
 	}
 	w.quietRounds = 0
-	// 历史问题：异常轮已在上方提前返回，此处 offlineCount/lagging 恒为 0——
+	// 异常轮已在上方提前返回，此处 offlineCount/lagging 恒为 0——
 	// 原 switch 的第二个 case 是恒真死分支，按无条件输出收敛。
 	if len(nodes) == 0 {
 		TaskLogf("cluster-sync", "serving", "服务面正常：无从节点注册")
@@ -225,5 +225,5 @@ func masterSyncServingRound(ctx context.Context, now time.Time, w *masterServing
 	TaskLogf("cluster-sync", "serving", "服务面正常：从节点 %d 在线，最新版本 %d", online, clusterVersion)
 }
 
-// （历史问题-02：原手工 parseNodeLastSeen 三布局解析已删除——last_seen 统一由
+// （原手工 parseNodeLastSeen 三布局解析已删除——last_seen 统一由
 // 驱动按 DATETIME 声明解析（sql.NullTime），与 Nodes()/票据路径同源。）

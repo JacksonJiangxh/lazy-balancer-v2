@@ -6,11 +6,13 @@ package handlers
 // 本层零新状态。
 
 import (
+	"database/sql"
 	"errors"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -31,9 +33,9 @@ func (h *Handlers) ListSystemTasks(c *gin.Context) {
 }
 
 // requireMasterNode 主节点门（写操作镜像 StartCRSUpdate 口径）。
-// 历史问题-01：角色查询失败（DB 故障/迁移窗口）≠ 从节点——查询失败响亮 500，
+// 角色查询失败（DB 故障/迁移窗口）≠ 从节点——查询失败响亮 500，
 // 403「仅允许在主节点执行」会把排障方向指向集群角色（与 requireMaster 及
-// requireAutoBackupMaster 的 历史问题-19② 先例同形）。
+// requireAutoBackupMaster 的 ② 先例同形）。
 func requireMasterNode(c *gin.Context) bool {
 	if db.DB == nil {
 		clusterError(c, http.StatusInternalServerError, "节点角色查询失败", nil)
@@ -82,8 +84,8 @@ func respondTaskTriggerAdmissionError(c *gin.Context, err error) {
 }
 
 // respondTaskEngineUnavailable 任务引擎未装配的统一响应。引擎缺失属「服务
-// 暂不可用」而非内部错误——与触发/启停/取消路径的 503 同口径（历史问题 裁定），
-// 全仓单一出口（历史修复：库更新触发端点此前 500，与任务监控 503
+// 暂不可用」而非内部错误——与触发/启停/取消路径的 503 同口径，
+// 全仓单一出口（库更新触发端点此前 500，与任务监控 503
 // 形成家族状态码漂移）。
 func respondTaskEngineUnavailable(c *gin.Context) {
 	c.JSON(http.StatusServiceUnavailable, models.APIResponse{Code: 503, Message: "任务引擎未初始化"})
@@ -109,23 +111,23 @@ func (h *Handlers) TriggerSystemTask(c *gin.Context) {
 	}
 	// 终态：触发全经任务引擎（CanTrigger 语义族——单飞/主节点门/历史统一）
 	if te := services.TaskEngine(); te != nil {
-		if m, ok := te.Lookup(id); ok { // 历史问题-2：单任务元数据（免全量 DescribeAll）
+		if m, ok := te.Lookup(id); ok { // 单任务元数据（免全量 DescribeAll）
 			if !m.CanTrigger {
 				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "该任务不支持手动触发（常驻族启停即可/镜像族）"})
 				return
 			}
-			// v2.0：单飞由引擎 CAS 强制；历史问题（历史）：在跑任务同步 409
+			// v2.0：单飞由引擎 CAS 强制；在跑任务同步 409
 			// （曾异步吞错恒 200+apidocs 409 不可达——双击假成功）
 			if te.IsTaskInFlight(id) {
 				c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "任务运行中，请稍后重试"})
 				return
 			}
-			// 历史问题：触发与审计统一走 services.TriggerTaskAsync（单源）——
+			// 触发与审计统一走 services.TriggerTaskAsync（单源）——
 			// 「触发」审计只在 Trigger 成功后记录（非自记族），并发双击败者
 			// 拿 ErrAlreadyRunning 静默、skipped 终态静默、真失败记补偿审计。
 			// gin.Context 在 handler 返回后池化复用：审计上下文必须在此预取。
 			// 同步预占位：暂停/停止/角色拒绝必须在写响应前返回 409/503，
-			// 不能先 200 再在 goroutine 里吞错（历史问题-01）。
+			// 不能先 200 再在 goroutine 里吞错。
 			actx := triggerAuditContext(c, "任务监控", m.Name)
 			if err := services.TriggerTaskAsync(te, id, actx); err != nil {
 				respondTaskTriggerAdmissionError(c, err)
@@ -137,7 +139,7 @@ func (h *Handlers) TriggerSystemTask(c *gin.Context) {
 		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "任务不存在"})
 		return
 	}
-	// 历史问题：无引擎时统一 503（回退 switch 删除）。
+	// 无引擎时统一 503（回退 switch 删除）。
 	respondTaskEngineUnavailable(c)
 }
 
@@ -178,7 +180,7 @@ func (h *Handlers) ToggleSystemTask(c *gin.Context) {
 			} else {
 				te.StopLoop(id)
 			}
-			// 历史问题：用户显式启停落节点本地偏好（重启后不得按默认清单复活）。
+			// 用户显式启停落节点本地偏好（重启后不得按默认清单复活）。
 			if err := services.RecordTaskLoopPref(id, *req.Enabled); err != nil {
 				services.Logf("warn", "任务调度偏好写入失败（%s）: %v", id, err)
 			}
@@ -194,12 +196,12 @@ func (h *Handlers) ToggleSystemTask(c *gin.Context) {
 		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "任务不存在"})
 		return
 	}
-	// 历史问题：无引擎时统一 503（回退 switch 删除）。
+	// 无引擎时统一 503（回退 switch 删除）。
 	respondTaskEngineUnavailable(c)
 }
 
 // CancelSystemTask 取消运行中任务（admin；仅 Cancelable 声明族）。
-// 历史问题-2：引擎路径经 te.Cancel（Cancelable+CancelHook 元数据路由），
+// 引擎路径经 te.Cancel（Cancelable+CancelHook 元数据路由），
 // 不再硬编码三族清单；无引擎回退（测试环境）直调 manager。
 func (h *Handlers) CancelSystemTask(c *gin.Context) {
 	id := c.Param("id")
@@ -220,12 +222,12 @@ func (h *Handlers) CancelSystemTask(c *gin.Context) {
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已发出取消信号，任务将在当前下载阶段中断"})
 		return
 	}
-	// 历史问题：无引擎时统一 503（回退 switch 删除）。
+	// 无引擎时统一 503（回退 switch 删除）。
 	respondTaskEngineUnavailable(c)
 }
 
 // ControlSystemTask 常驻循环启停（admin；body {"action":"start|stop|restart"}）。
-// 历史修复（历史）：现形态——Controllable = Kind==Daemon（引擎元数据驱动），
+// 现形态——Controllable = Kind==Daemon（引擎元数据驱动），
 // 仅常驻族（security-events-ingestion/cert-issuance/cluster-sync）可控；Periodic
 // 族（cert-waiting-ca 等）启停走 toggle 端点，本端点对其恒 400。v2.0 前
 // 「Continuous 族可控」注释已随四类型标准作废。
@@ -268,7 +270,7 @@ func (h *Handlers) ControlSystemTask(c *gin.Context) {
 		te.StopLoop(id)
 		te.StartLoop(id)
 	}
-	// 历史问题：用户显式启停落节点本地偏好；restart 的终态为运行。
+	// 用户显式启停落节点本地偏好；restart 的终态为运行。
 	if err := services.RecordTaskLoopPref(id, req.Action != "stop"); err != nil {
 		services.Logf("warn", "任务调度偏好写入失败（%s）: %v", id, err)
 	}
@@ -286,9 +288,16 @@ func (h *Handlers) ControlSystemTask(c *gin.Context) {
 }
 
 // GetSystemTaskHistory 任务运行历史（task_runs，时间倒序）。
+// cert-job:<id> 动态行与 logs/trigger 同族：无引擎 task_runs 记录，历史即
+// cert_jobs 行本身（在册签发记录：创建/更新/终态与消息），按 RunRecord 同形
+// 返回，API 消费端不再需要为动态行单独走 /certificates/jobs/:id。
 func (h *Handlers) GetSystemTaskHistory(c *gin.Context) {
 	id := c.Param("id")
 	limit := 50
+	if strings.HasPrefix(id, "cert-job:") {
+		h.certJobRunHistory(c, id)
+		return
+	}
 	if te := services.TaskEngine(); te != nil {
 		if _, ok := te.Lookup(id); !ok {
 			c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "任务不存在"})
@@ -302,6 +311,56 @@ func (h *Handlers) GetSystemTaskHistory(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"runs": []struct{}{}}})
+}
+
+// certJobRunHistory 把 cert_jobs 单行映射为 RunRecord 形状的历史（与面板
+// 前端对 cert-job 行的展示映射同口径：started_at=created_at、
+// finished_at=updated_at、duration=两者差、trigger=queue）。cert_jobs 时间戳
+// 为 UTC（RFC3339），统一转配置时区墙串——与引擎族 started_at 的展示口径一致。
+func (h *Handlers) certJobRunHistory(c *gin.Context, taskID string) {
+	jobID, err := strconv.Atoi(strings.TrimPrefix(taskID, "cert-job:"))
+	if err != nil || jobID <= 0 {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Invalid job ID"})
+		return
+	}
+	var status, message string
+	var createdAt, updatedAt sql.NullString
+	if err := db.DB.QueryRow(`SELECT status, COALESCE(message,''), created_at, updated_at FROM cert_jobs WHERE id=?`, jobID).
+		Scan(&status, &message, &createdAt, &updatedAt); dbQueryNotFound(c, err, "任务不存在", "certJobRunHistory query job") {
+		return
+	}
+	loc := services.CurrentLocation()
+	parseUTC := func(raw sql.NullString) (time.Time, bool) {
+		if !raw.Valid || strings.TrimSpace(raw.String) == "" {
+			return time.Time{}, false
+		}
+		if ts, err := time.Parse(time.RFC3339, raw.String); err == nil {
+			return ts, true
+		}
+		// 存量行可能是墙串形态：按 UTC 解析失败即视为不可用（duration=0、
+		// 时间列留空），不阻断历史响应。
+		return time.Time{}, false
+	}
+	started, startedOK := parseUTC(createdAt)
+	finished, finishedOK := parseUTC(updatedAt)
+	run := taskengine.RunRecord{
+		ID:      int64(jobID),
+		TaskID:  taskID,
+		Family:  "cert-job",
+		Trigger: "queue",
+		Status:  status,
+		Message: message,
+	}
+	if startedOK {
+		run.StartedAt = started.In(loc).Format("2006-01-02 15:04:05")
+	}
+	if finishedOK {
+		run.FinishedAt = finished.In(loc).Format("2006-01-02 15:04:05")
+	}
+	if startedOK && finishedOK && finished.After(started) {
+		run.DurationMs = finished.Sub(started).Milliseconds()
+	}
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"runs": []taskengine.RunRecord{run}}})
 }
 
 // GetSystemTaskStats24hSeries 24h 分小时桶成功/失败序列（全员可见）——
@@ -364,7 +423,7 @@ func (h *Handlers) GetSystemTaskLogs(c *gin.Context) {
 		keep = certJobLogMaxRotatedBackups
 	}
 	content := prependTaskLogRotations(path, string(data), keep)
-	// 历史问题：256KB 是活动文件与轮转副本拼接后的合计预算。必须直接取
+	// 256KB 是活动文件与轮转副本拼接后的合计预算。必须直接取
 	// 拼接串最后 tail 字节，再丢弃首行残段；tailLogWindow 只负责行边界，
 	// 不能把全串当成已定位的尾窗（否则仅丢首行，响应仍可数倍超限）。
 	if len(content) > tail {

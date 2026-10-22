@@ -10,10 +10,10 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 WORKDIR /app
 
 ENV GOTOOLCHAIN=auto
-# INFRA-历史问题（历史）：xcaddy 阶段只需四个本地目录（--with 引用），
-# 窄化 COPY 面——此前 COPY . . 全仓入镜，任何前端/文档变更即 bust 该层并重跑
-# xcaddy build（缓存挂载兜底仍需分钟级增量编译）。backend 阶段保留全量 COPY
-#（Go 编译需全源码）。geoipnames 是零依赖共享表库（PLUG-N3 历史）——
+# xcaddy 阶段只需四个本地目录（--with 引用），窄化 COPY 面——COPY . . 会让
+# 任何前端/文档变更 bust 该层并重跑 xcaddy build（缓存挂载兜底仍需分钟级增量
+# 编译）。backend 阶段保留全量 COPY（Go 编译需全源码）。geoipnames 是零依赖
+# 共享表库——
 # --with 在此兼作 replace 载体（插件模块内 replace 对 xcaddy 临时主模块无效，
 # 与 wafiplist 同模式双保险）。
 COPY caddygeoip/ caddygeoip/
@@ -54,7 +54,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 #  做逐段数值化语义比较，不设上限，依赖升到大版本也不会误报。
 #  ge() 的局部变量必须以多余形参声明，否则会覆盖主循环的 i 导致漏检；
 #  且 awk 程序必须保持单行——多行函数体会破坏 RUN 指令解析）
-#  唯一例外是 github.com/corazawaf/coraza/v3（PL历史问题）：安全拦截计数/计时
+#  唯一例外是 github.com/corazawaf/coraza/v3：安全拦截计数/计时
 #  分段归属依赖 coraza tx.ID 长度=16，MVS 抬升次版本可能静默改变该假设，故按
 #  [v3.8.1, v3.9) 区间断言（ge(v,"v3.8.1") && !ge(v,"v3.9.0")）——此处刻意设
 #  上限，升级需同步复核 blocked_counter.go 的 len(ID)==16 判定与本断言。
@@ -64,14 +64,14 @@ RUN go version -m /app/caddy | tee /tmp/caddy-mods.txt && \
 # Build Go backend
 FROM golang:1.26.9-alpine@sha256:3082400e369fa24d5fc60bca20edab3f6d604e0c5a690ec66b295eff4dd87ade AS backend
 WORKDIR /app
-# U8b-2（历史）：GOPROXY 逗号多级回退——与 xcaddy-builder 阶段对称
+# GOPROXY 逗号多级回退——与 xcaddy-builder 阶段对称
 #（阶段间 ENV 不继承，backend 此前用官方默认 proxy.golang.org，构建网络对
 # 其不可达时 go mod download 无回退直接失败）：阿里云 404/410 时依次回落
 # goproxy.cn、直连；校验不符类瞬态错误由下方 3 次重试兜底。
 ENV GOPROXY=https://mirrors.aliyun.com/goproxy/,https://goproxy.cn,direct
 # wafiplist/geoipnames 叶模块经根 go.mod replace ./wafiplist ./geoipnames 引用
-# （geoipnames 自 PLUG-N3 历史）——go mod download 解析 replace 需要被替换
-# 模块的 go.mod/go.sum 在场（geoipnames 零依赖无 go.sum）。
+# ——go mod download 解析 replace 需要被替换模块的 go.mod/go.sum 在场
+# （geoipnames 零依赖无 go.sum）。
 COPY wafiplist/go.mod wafiplist/go.sum ./wafiplist/
 COPY geoipnames/go.mod ./geoipnames/
 COPY go.mod go.sum ./
@@ -99,17 +99,17 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 # Final image
 FROM alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
-# FE-8/INFRA-4（历史登记）：版本号硬编码点之一。全仓八处=README 两版 docker
-# build 示例段、docker-compose.yml 两处 image tag + 一处 build.args.VERSION、
-# web/src/utils/branding.ts appVersion 回退值、本文件 ARG VERSION、
-# internal/config/config.go APP_VERSION 回退、buildx --build-arg（发布时必须
-# 显式传）。发版检查单以 lazy-balancer-release 技能步骤 2 为唯一清单。
+# 版本号硬编码点：本文件 ARG VERSION、docker-compose.yml 两处 image tag 与
+# build.args.VERSION、README 两版 docker build 示例（--build-arg VERSION 与
+# 镜像 tag）、web/src/utils/branding.ts 的 appVersion 回退值；发布时另需
+# buildx --build-arg 显式传参。以上各处须同步递增（config.go 的 APP_VERSION
+# 未注入时显示 unknown，不参与硬编码）。
 #
-# PD-01（历史）双轨口径（v2.3.6-beta 起有意设计，非分叉）：`VERSION`
+# 双轨口径（有意设计，非分叉）：`VERSION`
 # 恒为**正式版本号**（如 v2.3.8，面板/`/api/v1/branding` 展示口径）；镜像
 # 正式版 tag 与 VERSION 相同；beta 通道才给 tag 加 `-beta` 后缀。二者刻意不同，
 # 发布时的判定口径是「tag 去掉通道后缀 == APP_VERSION」。改此约定需同时改
-# README 两版示例、docker-compose.yml、branding/config 回退与发布技能。
+# README 两版示例、docker-compose.yml、branding/config 回退与发布检查单。
 ARG VERSION=v2.3.8
 # 构建机网络受限时经 --build-arg HTTP(S)_PROXY 透传给 RUN 下载步骤
 # （CRS/ip2region 钉版下载）；未传参时为空值，行为不变（官方惯例形态）。
@@ -119,10 +119,10 @@ ENV APP_VERSION=${VERSION}
 # 安全修复：显式钉版 openssl=3.5.9-r0（CVE 修复版）——openssl 经 curl 的
 # libssl3/libcrypto3 依赖隐式装入，钉版保证镜像可复现且不携带旧版；
 # 升级源超出此版本时构建会失败提示，届时同步更新钉版值。
-# INFRA-71-3（历史）：移除 shadow——全仓（entrypoint/Dockerfile RUN 链/
-# docs/compose）无 useradd/usermod/groupadd 等调用，镜像内无消费方。
-# zlib 钉版 1.3.2-r1（2026-10-12 用户裁定）：alpine 3.24.2 基础镜像快照携带 r0，
-# r1 为上游安全修复——沿 openssl 钉版先例显式升级（sqlite 依赖隐式装入 zlib）。
+# 不装 shadow——全仓（entrypoint/Dockerfile RUN 链/docs/compose）无
+# useradd/usermod/groupadd 等调用，镜像内无消费方。
+# zlib 钉版 1.3.2-r1：alpine 3.24.2 基础镜像快照携带 r0，r1 为上游安全修复——
+# 沿 openssl 钉版先例显式升级（sqlite 依赖隐式装入 zlib）。
 RUN apk add --no-cache ca-certificates sqlite tzdata openssl=3.5.9-r0 zlib=1.3.2-r1
 WORKDIR /app
 
@@ -139,18 +139,18 @@ RUN mkdir -p /app/data /app/config /app/logs /app/certs /app/waf/crs /app/waf/au
 # from the build network complements each other. Proxy does not support git
 # protocol, so use the archive tarball instead of git clone). VERSION marker
 # lets startup reconciliation tell the bundled version from user-updated ones.
-# PD-02（历史）：CRS 版本与校验和收敛为本 RUN 内的一对变量（单一事实源）。
+# CRS 版本与校验和收敛为本 RUN 内的一对变量（单一事实源）。
 # 此前是 `ARG CRS_VERSION` + 写死校验和——`--build-arg CRS_VERSION=` 覆盖版本后
 # 校验必然失败，属「可覆盖但覆盖即坏」的假参数；版本与校验和必须成对修改，
 # 相邻书写让升级时漏改其中一行立刻显性失败。ip2region xdb 的钉版同理。
-# INFRA-R1（历史）：两段逐字相同的 apk-curl 三次重试循环合并为单个 RUN——
+# 两段逐字相同的 apk-curl 三次重试循环合并为单个 RUN——
 # 一次装 curl → CRS 下载/校验/解包 → waf.dist 快照 → xdb 下载/校验 → 一次
 # apk del curl；少两层、少一次装删、重试逻辑单份。
 # apk add 包 3 次重试：Alpine CDN 偶发 zstd 解压 I/O error（下载块损坏类
 # 瞬态错误），重试重新拉包即可消化；CRS/xdb 双源下载同样包 3 次重试——
 # 受限网络下双源同时瞬时失败不应直接终止构建（与同 RUN 内 apk 及构建期
 # go mod download/xcaddy 的重试口径对齐，失败仍显性报错、行为不弱化）。
-# PD-02：校验和（sha256sum -c）在重试环**内**——镜像源返回 200 但内容是
+# 校验和（sha256sum -c）在重试环**内**——镜像源返回 200 但内容是
 # 损坏包/HTML 错误页时同样重试，否则「瞬态污染」这一被重试覆盖的形态会在
 # 环外立即终止构建；3 次仍失败照常 exit 1，可复现性不减。
 RUN crs_version=v4.28.0; \
@@ -185,18 +185,18 @@ RUN crs_version=v4.28.0; \
     apk del curl
 
 # 爬虫地址库内置首版：离线新实例由 PrimeCrawlerIPLists 读取并落库/生成 .fast。
-# PD-04（历史）：数据文件移入 geoipnames 包并随包嵌入二进制（同一份字节
+# 数据文件移入 geoipnames 包并随包嵌入二进制（同一份字节
 # 同时是镜像资产与 services 的离线回退），此处 COPY 必须指向嵌入路径。
 COPY geoipnames/crawler-ip-lists.seed.json /app/waf.dist/crawler-ip-lists.seed.json
 # 容器以 root 运行（无 USER/降权，与常见 Caddy 镜像同态）；如需非 root，需
-# 同时给 80/443 加 CAP_NET_BIND_SERVICE 并预置 bind 挂载属主（历史 历史问题-29）
+# 同时给 80/443 加 CAP_NET_BIND_SERVICE 并预置 bind 挂载属主。
 
 COPY --from=backend /app/config /app/config
 
 COPY docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-# 443/udp = HTTP/3（QUIC）——Caddy 默认启用，EXPOSE 补全声明（INFRA-历史问题）。
+# 443/udp = HTTP/3（QUIC）——Caddy 默认启用，EXPOSE 需一并声明。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
   CMD wget -q -O /dev/null http://127.0.0.1:8000/health || wget -q --no-check-certificate -O /dev/null https://127.0.0.1:8000/health || exit 1
 

@@ -54,7 +54,7 @@ func TestNodeBookkeepingWrites_RejectAfterDemotion(t *testing.T) {
 		t.Fatalf("demote: %v", err)
 	}
 
-	if err := service.ApproveNode(context.Background(), 1); !errors.Is(err, ErrNotMasterNode) {
+	if err := service.ApproveNode(context.Background(), 1, time.Now()); !errors.Is(err, ErrNotMasterNode) {
 		t.Fatalf("ApproveNode err=%v, want ErrNotMasterNode", err)
 	}
 	reportErr := service.ReportNode(context.Background(), 1, models.ClusterReport{AppliedVersion: 1}, now)
@@ -87,7 +87,7 @@ func TestNodeBookkeepingWrites_RejectAfterDemotion(t *testing.T) {
 	if _, err := database.Exec(`UPDATE global_config SET is_master=1 WHERE id=1`); err != nil {
 		t.Fatalf("promote: %v", err)
 	}
-	if err := service.ApproveNode(context.Background(), 1); err != nil {
+	if err := service.ApproveNode(context.Background(), 1, time.Now()); err != nil {
 		t.Fatalf("主节点态审批应成功: %v", err)
 	}
 }

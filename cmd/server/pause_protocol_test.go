@@ -22,7 +22,7 @@ func TestCaddyPausePathMatchesEntrypoint(t *testing.T) {
 	}
 }
 
-// 历史问题-4：测试注释声明「main / handlers / entrypoint 三方同值」，但此前只
+// 测试注释声明「main / handlers / entrypoint 三方同值」，但此前只
 // 校验两方——internal/handlers/caddy.go 的 caddyPauseFile 单侧漂移不会被
 // 拦截（该不变量已发生过路径同步事故）。此处用 AST 读取 handlers 包常量值，
 // 保持第三方机械校验（handlers 不得反向依赖 main，故不能共享常量）。

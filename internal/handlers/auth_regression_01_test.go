@@ -1,14 +1,14 @@
 package handlers
 
-//   历史修复 自助改密 current_password 不再被新密码策略 max=24 提前拦截；
-//   历史修复 MFA 挑战绑定签发时 password_version，改密吊销在册挑战；
-//   历史修复 自助改密复用 passwordResetColumns（清失败计数与锁定）；
-//   历史修复 锁定开关读取失败 fail-closed（500，不消费挑战）；
-//   历史修复 MFA 验证存储错误不按「验证码错误」计数；
-//   历史修复 OIDC 重复登录刷新 IdP 侧显示名；
-//   历史修复 OIDC state 封顶改为原子预留（并发不越界）；
-//   历史修复 JIT 用户名并发竞态有限重试（不同 subject 同名不失败）；
-//   历史修复 OIDC 配置测试区分空 body 与畸形 body。
+//   自助改密 current_password 不再被新密码策略 max=24 提前拦截；
+//   MFA 挑战绑定签发时 password_version，改密吊销在册挑战；
+//   自助改密复用 passwordResetColumns（清失败计数与锁定）；
+//   锁定开关读取失败 fail-closed（500，不消费挑战）；
+//   MFA 验证存储错误不按「验证码错误」计数；
+//   OIDC 重复登录刷新 IdP 侧显示名；
+//   OIDC state 封顶改为原子预留（并发不越界）；
+//   JIT 用户名并发竞态有限重试（不同 subject 同名不失败）；
+//   OIDC 配置测试区分空 body 与畸形 body。
 
 import (
 	"context"
@@ -32,10 +32,10 @@ import (
 )
 
 // ensureMFATestSchema 给 setupAuthTestDB 的最小 users 表补 MFA 列与挑战表
-// （挑战表列形状与 migrations 后的生产形态一致，含 历史修复 的 password_version）。
+// （挑战表列形状与 migrations 后的生产形态一致，含 password_version）。
 // 单源：此前四个测试
 // 文件各自内联一份 DDL（auth_setup/auth_login_provider/auth_regression/
-// mfa_verifylogin_challenge），列集合漂移（如 历史修复 的 password_version）时
+// mfa_verifylogin_challenge），列集合漂移（如 password_version）时
 // 四处不同步 → 单文件测试假绿/假红。重复调用安全（duplicate column 容忍、
 // 挑战表 IF NOT EXISTS）。
 func ensureMFATestSchema(t *testing.T, database *sql.DB) {
@@ -224,7 +224,7 @@ func TestPasswordUpdateRevokesMFALoginChallenges(t *testing.T) {
 	}
 }
 
-// 锁定开关读取失败必须 历史修复（500 且不消费挑战），
+// 锁定开关读取失败必须 （500 且不消费挑战），
 // 不得静默按「未锁定 + 开关关闭」放行。
 func TestMFAVerifyLogin_lockoutConfigReadFailureFailsClosed(t *testing.T) {
 	secret, _ := seedMFAChallengeLoginFixture(t, "cfg-fail-tok", 0)

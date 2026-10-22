@@ -181,7 +181,7 @@ func TestBuildOpenAPIYAML_documents_operation_specific_contracts(t *testing.T) {
 	if _, exists := adminTLS.RequestBody.Content["multipart/form-data"]; !exists {
 		t.Fatal("admin TLS update request is not multipart/form-data")
 	}
-	// 历史问题（2026-09-06 裁定）：批量全量重签须显式 {"all":true} 确认，请求体不再可省略
+	// （2026-09-06 裁定）：批量全量重签须显式 {"all":true} 确认，请求体不再可省略
 	issue := document.Paths["/certificates/issue"]["post"]
 	if !issue.RequestBody.Required {
 		t.Fatal("certificate issue request body must be required")
@@ -271,7 +271,7 @@ func TestBuildOpenAPIYAML_wraps_business_examples_and_documents_exceptions(t *te
 			Description string `yaml:"description"`
 			Responses   map[string]struct {
 				Content map[string]struct {
-					// 历史问题(历史修复):/auth/oidc/login|callback 等跳转端点经
+					// /auth/oidc/login|callback 等跳转端点经
 					// rawResponse 暴露裸字符串示例(302 形态),示例不再恒为
 					// 对象——本测试只对 /config 的对象形状断言。
 					Example any `yaml:"example"`
@@ -347,7 +347,7 @@ func TestAPIDocRoutes_document_validation_and_error_statuses(t *testing.T) {
 	}
 }
 
-// 历史问题(历史文档漂移转正)绊线:
+// 绊线
 // export 去不可达 413(GET 无请求体);download 补 428(mfaStepUpGuard GET 特例,
 // middleware.go:886-887);import 响应登记 data.summary/disabled_conflicts/warnings
 // (warnings 为软跳过/会话吊销/ACME 悬挂等警告的唯一机器可读出口);promote 描述
@@ -400,7 +400,7 @@ func TestAPIDocRoutes_documentationContracts(t *testing.T) {
 		t.Errorf("POST /cluster/promote description lacks auto-backup scheduler startup: %q", promote)
 	}
 	tools := routes["GET /mcp/tools"].Description
-	// 历史问题（历史）：read_only 是「对只读 Key 可用」的能力语义，与
+	// read_only 是「对只读 Key 可用」的能力语义，与
 	// method==GET 不等价——描述必须点名 export_config 例外与读探测 POST，
 	// 并逐工具钉死分类（弱子串断言曾把相反语义钉住）。
 	for _, fragment := range []string{"read_only", "只读 API Key", "export_config"} {
@@ -414,9 +414,9 @@ func TestAPIDocRoutes_documentationContracts(t *testing.T) {
 	readOnlyProbes := map[string]bool{
 		"parse_certificate": true, "validate_import": true, "preview_config": true,
 	}
-	// 历史问题（历史）：test_certificate_config 会写 DNS TXT 验证记录，
+	// test_certificate_config 会写 DNS TXT 验证记录，
 	// 已移出只读探测集——对只读 Key 不可见（工具保留给管理员）。
-	// 历史问题（历史）：test_ca_provider 同理移出（ZeroSSL 缺 EAB 时
+	// test_ca_provider 同理移出（ZeroSSL 缺 EAB 时
 	// 会真实写 ca_providers.credentials）。
 	specs := mcpserver.ListToolSpecs()
 	if len(specs) == 0 {
@@ -450,7 +450,7 @@ func specsReadOnly(specs []mcpserver.ToolSpec, name string) bool {
 	return false
 }
 
-// 历史问题（历史）：非 JSON 响应示例（二进制/TXT）必须登记 rawResponse 与
+// 非 JSON 响应示例（二进制/TXT）必须登记 rawResponse 与
 // 显式媒体类型——此前两个下载端点默认 application/json 且被 documentedResponse
 // 包成 {"code":0,...,"data":非 JSON}，OpenAPI 消费方按 JSON 解析必失败。
 func TestAPIDocs_nonJSONResponsesDeclareExplicitMediaType(t *testing.T) {
@@ -532,7 +532,7 @@ func mediaTypeKeys(media map[string]struct {
 	return keys
 }
 
-// 历史问题（历史）：媒体类型与示例形态须自洽——ops-playbook 声明
+// 媒体类型与示例形态须自洽——ops-playbook 声明
 // text/markdown 却给 JSON 示例；/admin-tls 与 /admin-tls/inspect 只登记
 // multipart，遗漏 MCP 通道唯一的 application/json 变体。
 func TestBuildOpenAPIYAML_documentsMarkdownAndAdminTLSContentVariants(t *testing.T) {
@@ -680,7 +680,7 @@ func containsRouteError(errors []string, status string) bool {
 	return false
 }
 
-// 历史问题(历史修复)+历史问题(历史修复)+历史修复(历史修复):OIDC 公开契约登记、lbbak 导出形态、
+// ++:OIDC 公开契约登记、lbbak 导出形态、
 // validate 128MB 上限与 settings/oidc 重试契约的文档漂移绊线。
 func TestBuildOpenAPIYAML_documents_oidc_public_lbbak_and_retry_contracts(t *testing.T) {
 	// Given
@@ -705,7 +705,7 @@ func TestBuildOpenAPIYAML_documents_oidc_public_lbbak_and_retry_contracts(t *tes
 		t.Fatalf("parse generated OpenAPI YAML: %v", err)
 	}
 
-	// 历史修复:三条公开 OIDC 路由(登录页探测/授权跳转/回调)不得误标 bearerAuth。
+	// 三条公开 OIDC 路由(登录页探测/授权跳转/回调)不得误标 bearerAuth。
 	for _, operation := range []struct {
 		path   string
 		method string
@@ -716,7 +716,7 @@ func TestBuildOpenAPIYAML_documents_oidc_public_lbbak_and_retry_contracts(t *tes
 		}
 	}
 
-	// 历史修复①③:导出恒为 lbbak tar.gz(application/gzip),sections query 可选分类;
+	// ③:导出恒为 lbbak tar.gz(application/gzip),sections query 可选分类;
 	// 描述不得再宣称「下载 JSON 备份文件」。
 	export := document.Paths["/config/export"]["get"]
 	if _, exists := export.Responses["200"].Content["application/gzip"]; !exists {
@@ -735,7 +735,7 @@ func TestBuildOpenAPIYAML_documents_oidc_public_lbbak_and_retry_contracts(t *tes
 		t.Errorf("C2: /config/export description=%q, want lbbak tar.gz form", export.Description)
 	}
 
-	// 历史修复②:validate 上限与错误码按 128MB 实现口径(maxConfigImportBytes=128<<20)。
+	// validate 上限与错误码按 128MB 实现口径(maxConfigImportBytes=128<<20)。
 	validate := routesEntry(t, "POST /config/import/validate")
 	if !strings.Contains(validate.Description, "128MB") || !containsRouteError(validate.Errors, "413") {
 		t.Errorf("C2: validate description=%q errors=%v, want 128MB limit text and 413 error", validate.Description, validate.Errors)
@@ -745,13 +745,13 @@ func TestBuildOpenAPIYAML_documents_oidc_public_lbbak_and_retry_contracts(t *tes
 			t.Errorf("C2: validate error %q retains stale 16 MiB limit", routeError)
 		}
 	}
-	// 历史修复③:import 端点描述须覆盖二进制 lbbak 形态(tar.gz 而非仅 JSON)。
+	// import 端点描述须覆盖二进制 lbbak 形态(tar.gz 而非仅 JSON)。
 	imp := routesEntry(t, "POST /config/import")
 	if !strings.Contains(imp.Description, "lbbak") {
 		t.Errorf("C2: /config/import description=%q, want binary lbbak form documented", imp.Description)
 	}
 
-	// 历史修复:settings/oidc 三键重试契约(PUT/DELETE 幂等可重试,POST test 读探测可重试)。
+	// settings/oidc 三键重试契约(PUT/DELETE 幂等可重试,POST test 读探测可重试)。
 	for _, operation := range []struct {
 		path   string
 		method string
@@ -771,7 +771,7 @@ func TestBuildOpenAPIYAML_documents_oidc_public_lbbak_and_retry_contracts(t *tes
 			t.Errorf("C7: %s %s description=%q lacks retry contract", operation.method, operation.path, description)
 		}
 	}
-	// 历史修复:回调错误表补 404 oidc_disabled/502 discovery;PUT 示例补 display_name。
+	// 回调错误表补 404 oidc_disabled/502 discovery;PUT 示例补 display_name。
 	callback := routesEntry(t, "GET /auth/oidc/callback")
 	if !containsRouteError(callback.Errors, "404") || !containsRouteError(callback.Errors, "502") {
 		t.Errorf("C7: callback errors=%v, want 404 oidc_disabled and 502 discovery", callback.Errors)
@@ -793,7 +793,7 @@ func routesEntry(t *testing.T, key string) apiDocRoute {
 	return apiDocRoute{}
 }
 
-// 历史修复（历史）：任务 ID 是 "threat"/"cert-job:5" 等字符串——OpenAPI
+// 任务 ID 是 "threat"/"cert-job:5" 等字符串——OpenAPI
 // 对 /system/tasks/{id} 族六个端点的路径参数必须保留 type: string（与其余
 // 数字 :id 路由的 integer 判定分流）；MCP 侧同参数一直正确标 string，两侧
 // 此前自相矛盾。
@@ -840,7 +840,7 @@ func TestBuildOpenAPIYAML_tasksPathParametersStayString(t *testing.T) {
 	}
 }
 
-// 历史问题-4（历史）：威胁大屏文档响应示例键集必须与实现一致——
+// 威胁大屏文档响应示例键集必须与实现一致——
 // rollup 改造（top_rules/attack_type_share/recent_rate/rollup_* 披露）后文档滞后。
 // 钉测直接调用真实 handler 取响应键集，与 apiDocRoutes 示例双向比对。
 func TestAPIDocs_threatScreenExampleKeysMatchImplementation(t *testing.T) {
@@ -881,8 +881,8 @@ func TestAPIDocs_threatScreenExampleKeysMatchImplementation(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：OpenAPI 总述的敏感材料可见性必须与实现同口径——
-// TLS 私钥（rules.go 历史问题）与 DNS 凭证（certificates.go 历史问题）对非管理员
+// OpenAPI 总述的敏感材料可见性必须与实现同口径——
+// TLS 私钥（rules.go）与 DNS 凭证（certificates.go）对非管理员
 // 与只读 API Key 一律掩码，总述不得再声称「对所有已登录用户可读」。
 func TestBuildOpenAPIYAML_descriptionMatchesCredentialMasking(t *testing.T) {
 	openAPI := buildOpenAPIYAML()
@@ -905,7 +905,7 @@ func TestBuildOpenAPIYAML_descriptionMatchesCredentialMasking(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：GET /certificates/jobs 的文档示例曾写成裸数组，
+// GET /certificates/jobs 的文档示例曾写成裸数组，
 // documentedResponse 会把它包成 data:[...]，与实现的 data.list/total/page/
 // page_size/status_counts 对象分叉——按文档生成 SDK/脚本的消费方解析必失败。
 // 钉测直接调用真实 handler 取 data 顶层键集，与 apiDocRoutes 示例双向比对。

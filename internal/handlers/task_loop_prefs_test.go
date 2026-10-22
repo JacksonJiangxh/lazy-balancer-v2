@@ -1,6 +1,6 @@
 package handlers
 
-// 历史问题（历史）：任务监控 Toggle/Control 成功改变调度后写入节点本地
+// 任务监控 Toggle/Control 成功改变调度后写入节点本地
 // 偏好；业务驱动与触发类任务不得写偏好。
 
 import (

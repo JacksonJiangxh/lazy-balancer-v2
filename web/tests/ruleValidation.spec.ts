@@ -1,6 +1,6 @@
-// 路径规则校验与后端 rule_features.go 同口径验收（历史修复）：
-//   历史问题-06 自定义上游池：主机形态 / host:port 去重 / http-https 混布
-//   历史问题-07 同类型查重按后端键（exact 不剥尾 /），跨类型遮蔽仍归一键
+// 路径规则校验与后端 rule_features.go 同口径验收
+//   自定义上游池：主机形态 / host:port 去重 / http-https 混布
+//   同类型查重按后端键（exact 不剥尾 /），跨类型遮蔽仍归一键
 //
 // 运行：cd web && npm test
 
@@ -36,7 +36,7 @@ const upstream = (overrides: Partial<Upstream> = {}): Upstream => ({
   ...overrides,
 })
 
-test('历史问题-07 同类型查重：exact /a 与 /a/ 是两条独立 matcher（后端接受）', () => {
+test('同类型查重：exact /a 与 /a/ 是两条独立 matcher（后端接受）', () => {
   assert.equal(pathDuplicateKey('exact', '/a'), 'exact:/a')
   assert.equal(pathDuplicateKey('exact', '/a/'), 'exact:/a/')
   assert.notEqual(pathDuplicateKey('exact', '/a'), pathDuplicateKey('exact', '/a/'))
@@ -59,7 +59,7 @@ test('历史问题-07 同类型查重：exact /a 与 /a/ 是两条独立 matcher
   )
 })
 
-test('历史问题-06 上游池：非法主机在行内被拒绝（不再放行到后端 400）', () => {
+test('上游池：非法主机在行内被拒绝（不再放行到后端 400）', () => {
   const invalid = ['bad_host!', '-leading.example.com', 'trailing-.example.com', 'a..b', 'exa mple.com']
   for (const address of invalid) {
     assert.match(
@@ -74,7 +74,7 @@ test('历史问题-06 上游池：非法主机在行内被拒绝（不再放行�
   }
 })
 
-test('历史问题-06 上游池：host:port 去重（大小写不敏感、IPv6 方括号键）', () => {
+test('上游池：host:port 去重（大小写不敏感、IPv6 方括号键）', () => {
   assert.match(
     String(validatePathRules([rule({ upstreams: [upstream(), upstream()] })])),
     /重复/,
@@ -88,7 +88,7 @@ test('历史问题-06 上游池：host:port 去重（大小写不敏感、IPv6 �
   assert.equal(validatePathRules([rule({ upstreams: [upstream({ port: 8080 }), upstream({ port: 8081 })] })]), null)
 })
 
-test('历史问题-06 上游池：http/https 混布拒绝（同池 TLS 传输下 http 上游静默全灭）', () => {
+test('上游池：http/https 混布拒绝（同池 TLS 传输下 http 上游静默全灭）', () => {
   assert.match(
     String(validatePathRules([rule({ upstreams: [upstream({ protocol: 'http' }), upstream({ protocol: 'https', port: 8081 })] })])),
     /混布/,

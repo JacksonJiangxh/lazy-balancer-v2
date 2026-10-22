@@ -14,7 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// 历史修复：部分载荷省略 listen_port 时不得把存量端口改写成 443。
+// 部分载荷省略 listen_port 时不得把存量端口改写成 443。
 // API/MCP 的 update_rule 明确允许只提交部分字段；此前 UpdateRule 在读到存量
 // 之前就把省略的端口填成 443，导致 8443/8080 规则被静默迁移。
 func TestUpdateRule_partialPayloadKeepsExistingListenPort(t *testing.T) {
@@ -53,7 +53,7 @@ func TestUpdateRule_partialPayloadKeepsExistingListenPort(t *testing.T) {
 	}
 }
 
-// 历史修复1 对照：显式提交的端口仍然生效（默认值只兜底缺省，不吞显式值）。
+// 对照：显式提交的端口仍然生效（默认值只兜底缺省，不吞显式值）。
 func TestUpdateRule_explicitListenPortStillApplied(t *testing.T) {
 	harness := newUpdateAuditRuleHandlers(t, "lb_port_explicit", 0, false)
 	restoreCertDir := services.SetCertDirForTest(t.TempDir())
@@ -81,7 +81,7 @@ func TestUpdateRule_explicitListenPortStillApplied(t *testing.T) {
 	}
 }
 
-// 历史修复：UpdateRule 主动放锁窗口后必须复核规则行仍存在——
+// UpdateRule 主动放锁窗口后必须复核规则行仍存在——
 // 已删除规则不得被更新失败补偿按快照复活。
 func TestAbortIfRuleDeleted_rejectsDeletedRule(t *testing.T) {
 	newUpdateAuditRuleHandlers(t, "lb_gone", 0, false)
@@ -112,7 +112,7 @@ func TestAbortIfRuleDeleted_rejectsDeletedRule(t *testing.T) {
 	}
 }
 
-// 历史修复2 对照：规则仍存在时守卫放行。
+// 对照：规则仍存在时守卫放行。
 func TestAbortIfRuleDeleted_allowsExistingRule(t *testing.T) {
 	newUpdateAuditRuleHandlers(t, "lb_alive", 0, false)
 	seedAuditRule(t, "lb_alive", "alive", "alive.example.test", 8080, true, "manual", false)

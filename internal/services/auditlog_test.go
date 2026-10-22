@@ -32,9 +32,9 @@ func TestGetConfigSourceSection(t *testing.T) {
 	}
 }
 
-// （历史问题 过度修复审查 REMOVE：TestFormatAuditActionDirectConfigReload 已删除——
+// （过度修复审查 REMOVE：TestFormatAuditActionDirectConfigReload 已删除——
 // 其断言被 TestAuditGenericRoutesExactlyOnce 的 /config/reload 子测试完全吸收
-//（B/D 双域独立确认零覆盖）；历史问题 决策文档化于 auditlog.go FormatAuditAction
+//（B/D 双域独立确认零覆盖）；决策文档化于 auditlog.go FormatAuditAction
 // 注释与 genericRouteRegistry。）
 
 func TestRecordAuditLogWritesToIndependentDatabase(t *testing.T) {
@@ -73,7 +73,7 @@ func TestRecordAuditLogWritesToIndependentDatabase(t *testing.T) {
 }
 
 func TestFormatAuditActionAuthAndNodeRegistration(t *testing.T) {
-	// 历史问题：原断言 /nodes/register 映射——该路由实际注册为 /cluster/register，
+	// 原断言 /nodes/register 映射——该路由实际注册为 /cluster/register，
 	// 映射从未可达（死映射）；/auth/login 为 Explicit（handler 记录 登录成功/失败）。
 	// 两者现均须为空。
 	action, resource, _ := FormatAuditAction("POST", "/api/v1/auth/login")
@@ -87,7 +87,7 @@ func TestFormatAuditActionAuthAndNodeRegistration(t *testing.T) {
 }
 
 func TestGetAuditLogSizeBytes_cachesThresholdWithinTTL(t *testing.T) {
-	// 历史修复：2s 轮转 tick 此前在日志非空时每轮都查主库取阈值。
+	// 2s 轮转 tick 此前在日志非空时每轮都查主库取阈值。
 	// getAuditLogSizeBytes 现带 60s TTL 缓存：窗口内配置变更不观察（有界
 	// 陈旧），过期后重查；读失败不入缓存（回退值不钉死整个窗口）。
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
@@ -136,7 +136,7 @@ func TestAuditUserPart(t *testing.T) {
 	}
 }
 
-// 历史修复（历史问题）：「审计保留月数」读取失败三态分裂统一——
+// 「审计保留月数」读取失败三态分裂统一——
 // CleanupAuditLogs 读取失败（含 global_config 行缺失 ErrNoRows）回退默认
 // 3 月继续清理 + warn 留痕（曾静默 return 0：audit-retention 任务每 24h
 // 报「清理 0 条」而 audit_log 永久不清，三消费点中最坏分支）。

@@ -23,7 +23,7 @@ func generateTestCAChain(t *testing.T, dnsNames []string) (certPEM, keyPEM strin
 	}
 	caTemplate := x509.Certificate{
 		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: "历史问题 Test CA"},
+		Subject:               pkix.Name{CommonName: "Rollback Test CA"},
 		NotBefore:             now.Add(-time.Hour),
 		NotAfter:              now.Add(365 * 24 * time.Hour),
 		IsCA:                  true,
@@ -75,7 +75,7 @@ func injectTestRoots(t *testing.T, roots *x509.CertPool) {
 	t.Cleanup(func() { tlsCertSystemRoots = old })
 }
 
-// 历史修复:自签单张——系统根不认可(unknown authority)→链不完整警告。
+// 自签单张——系统根不认可(unknown authority)→链不完整警告。
 func TestTlsCertificateWarnings_selfSignedSingleWarnsIncompleteChain(t *testing.T) {
 	// Given
 	certPEM, keyPEM, err := generateTestCert("self.example.test", time.Now().Add(-time.Hour), time.Now().Add(365*24*time.Hour))
@@ -93,7 +93,7 @@ func TestTlsCertificateWarnings_selfSignedSingleWarnsIncompleteChain(t *testing.
 	}
 }
 
-// 历史修复:链可信但证书不覆盖规则域名→域名不匹配警告(不阻断)。
+// 链可信但证书不覆盖规则域名→域名不匹配警告(不阻断)。
 func TestTlsCertificateWarnings_domainMismatchWarns(t *testing.T) {
 	// Given
 	certPEM, keyPEM, roots := generateTestCAChain(t, []string{"cert.example.test"})
@@ -112,7 +112,7 @@ func TestTlsCertificateWarnings_domainMismatchWarns(t *testing.T) {
 	}
 }
 
-// 历史修复:链可信且域名覆盖(精确与通配)→无警告返回 nil。
+// 链可信且域名覆盖(精确与通配)→无警告返回 nil。
 func TestTlsCertificateWarnings_validChainAndCoveredDomainReturnsNil(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -142,7 +142,7 @@ func TestTlsCertificateWarnings_validChainAndCoveredDomainReturnsNil(t *testing.
 	}
 }
 
-// 历史修复:通配符语义边界——*.example.test 不覆盖裸域与二级以上子域。
+// 通配符语义边界——*.example.test 不覆盖裸域与二级以上子域。
 func TestTlsCertificateWarnings_wildcardBoundary(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -170,7 +170,7 @@ func TestTlsCertificateWarnings_wildcardBoundary(t *testing.T) {
 	}
 }
 
-// 历史修复:无法解析的证书材料由 validateTLSCertificate 硬校验负责,
+// 无法解析的证书材料由 validateTLSCertificate 硬校验负责,
 // 警告侧防御性返回 nil(不重复报错)。
 func TestTlsCertificateWarnings_invalidMaterialReturnsNil(t *testing.T) {
 	// When

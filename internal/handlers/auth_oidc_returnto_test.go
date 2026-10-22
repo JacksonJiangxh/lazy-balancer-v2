@@ -2,7 +2,7 @@ package handlers
 
 import "testing"
 
-// 历史问题-23：OIDC return_to 此前仅要求以 "/" 开头——协议相对值 `//evil.com`
+// OIDC return_to 此前仅要求以 "/" 开头——协议相对值 `//evil.com`
 // 可绕过后端校验并写入 OIDC state；最终拦截点只剩前端页面键白名单
 // （web/src/App.vue isPageId），开放重定向防护成为跨层单点依赖。
 // 修复后在漏斗处直接拒绝 "//" 前缀（含 "/\" 变体），前端白名单退化为第二道防线。

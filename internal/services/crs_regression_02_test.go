@@ -9,7 +9,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// TestSeedCRSRules_degenerateSnapshotFallsBackToDist 验证 历史修复(a)：快照源
+// TestSeedCRSRules_degenerateSnapshotFallsBackToDist 验证：快照源
 // 本身退化（persistCRSSnapshotFrom 崩溃窗口：RemoveAll 中途，VERSION 尚存 +
 // rules 部分残留、探针缺失）时不得作种——播成退化 live 后下次启动探针
 // 再清再播同源，形成跨重启循环。应回退 dist 并保留快照现场供诊断。
@@ -41,7 +41,7 @@ func TestSeedCRSRules_degenerateSnapshotFallsBackToDist(t *testing.T) {
 	if got := readCRSVersionMarker(liveDir); got != CRSBundledVersion {
 		t.Fatalf("live marker=%q, want bundled %q", got, CRSBundledVersion)
 	}
-	// 历史修复：回退播种成功后快照被重建为健康树（不再永久留退化现场）——
+	// 回退播种成功后快照被重建为健康树（不再永久留退化现场）——
 	// 快照 rules 携带探针、版本标记落 bundled（用户更新内容确已丢失，版本
 	// 记录由对账 CorrectDB 分支校正并留审计）。
 	if got := readCRSVersionMarker(snapshotDir); got != CRSBundledVersion {
@@ -57,7 +57,7 @@ func TestSeedCRSRules_degenerateSnapshotFallsBackToDist(t *testing.T) {
 }
 
 // TestSeedCRSRules_degenerateSnapshotLeftInPlace_whenLiveTreeAlsoUnhealthy
-// 验证 历史修复 的边界：dist 源自身退化（缺探针）时播种出的 live 树也不
+// 验证 边界：dist 源自身退化（缺探针）时播种出的 live 树也不
 // 健康，此时不得用不健康树回写快照——保留退化快照现场供诊断。
 func TestSeedCRSRules_degenerateSnapshotLeftInPlace_whenLiveTreeAlsoUnhealthy(t *testing.T) {
 	// Given 退化快照 + 退化的 dist（有 .conf 但缺探针）
@@ -86,11 +86,11 @@ func TestSeedCRSRules_degenerateSnapshotLeftInPlace_whenLiveTreeAlsoUnhealthy(t 
 	}
 }
 
-// TestSeedCRSRules_degenerateSnapshotNoCrossRestartLoop 验证 历史修复 的循环
+// TestSeedCRSRules_degenerateSnapshotNoCrossRestartLoop 验证 循环
 // 闭合：同一退化快照下模拟两次启动，第二次必须是 no-op（live 完好即早退），
 // 不得出现「live 退化 → 清空 → 从同一退化快照重播 → 仍退化」。
 func TestSeedCRSRules_degenerateSnapshotNoCrossRestartLoop(t *testing.T) {
-	// Given 退化快照与完好的 dist（同 历史修复 布景）
+	// Given 退化快照与完好的 dist（同布景）
 	root := t.TempDir()
 	liveDir := filepath.Join(root, "waf", "crs")
 	snapshotDir := filepath.Join(root, "data", "crs")
@@ -120,7 +120,7 @@ func TestSeedCRSRules_degenerateSnapshotNoCrossRestartLoop(t *testing.T) {
 	}
 }
 
-// TestRestoreCRSFromSnapshot_degenerateSnapshotRefused 验证 历史修复(b)：
+// TestRestoreCRSFromSnapshot_degenerateSnapshotRefused 验证
 // 对账恢复在装入前对快照执行同一完整性探针——退化快照拒绝恢复（报错并
 // 保留 live 现场），不得把弱化树装成权威树。
 func TestRestoreCRSFromSnapshot_degenerateSnapshotRefused(t *testing.T) {
@@ -148,7 +148,7 @@ func TestRestoreCRSFromSnapshot_degenerateSnapshotRefused(t *testing.T) {
 	}
 }
 
-// TestReconcileCRSState_degenerateSnapshotNotAuthoritative 验证 历史修复(c)：
+// TestReconcileCRSState_degenerateSnapshotNotAuthoritative 验证
 // liveV=="" 且探针不匹配时，旧逻辑拿快照覆盖 live
 // （crsReconcileRestoreSnapshot）——快照自身退化时该分支把退化树当权威。
 // 修复后退化快照按「无快照」处理：拒绝覆盖 live，仅记录。
@@ -175,7 +175,7 @@ func TestReconcileCRSState_degenerateSnapshotNotAuthoritative(t *testing.T) {
 	}
 }
 
-// TestReconcileCRSState_degenerateSnapshotHealedFromHealthyLive 验证 历史修复
+// TestReconcileCRSState_degenerateSnapshotHealedFromHealthyLive 验证
 // 发现2(a)：live 树完好且版本标记可确定时，对账用 live 树重建退化快照——
 // 用户更新版本得以保留，而不是等下次成功更新才自愈。
 func TestReconcileCRSState_degenerateSnapshotHealedFromHealthyLive(t *testing.T) {
@@ -209,7 +209,7 @@ func TestReconcileCRSState_degenerateSnapshotHealedFromHealthyLive(t *testing.T)
 	}
 }
 
-// TestReconcileCRSState_correctDBLeavesAuditTrail 验证 历史修复(b)：
+// TestReconcileCRSState_correctDBLeavesAuditTrail 验证
 // CorrectDB 分支把版本记录改写为磁盘实际版本时，用户更新成果被废弃必须留
 // 审计痕迹（action=恢复，resource=CRS规则库，detail 含新旧版本）。
 func TestReconcileCRSState_correctDBLeavesAuditTrail(t *testing.T) {
@@ -274,9 +274,9 @@ func TestReconcileCRSState_correctDBLeavesAuditTrail(t *testing.T) {
 	}
 }
 
-// TestValidateCRSStaging_missingProbeRejected 验证 历史修复：探针文件
+// TestValidateCRSStaging_missingProbeRejected 验证：探针文件
 // 「每个 CRS 发布必然携带」从假设变成安装期契约——缺探针的发布包（未来
-// CRS 重组 rules/）在安装时即被拒绝，而不是装出退化树后触发 历史修复 循环。
+// CRS 重组 rules/）在安装时即被拒绝，而不是装出退化树后触发循环。
 func TestValidateCRSStaging_missingProbeRejected(t *testing.T) {
 	// Given staging 有 setup 模板与 ≥1 个 .conf，但缺发布不变探针文件
 	dir := t.TempDir()

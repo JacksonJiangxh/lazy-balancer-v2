@@ -60,7 +60,7 @@ func TestOpenAPIDocumentation_covers_registeredGinAPIRoutes(t *testing.T) {
 	}
 }
 
-// 历史问题-1：/openapi.yaml 与 /docs 此前置于公开块（匿名 200），
+// /openapi.yaml 与 /docs 此前置于公开块（匿名 200），
 // 完整 API 目录（路径/载荷示例/错误码）可被未认证方枚举。本测试钉住新契约：
 // 规格匿名 401、携带已认证 token 200；/docs 仅 HTML 壳（本体内 Swagger 以
 // localStorage.token 注入 Authorization 头取规格）。

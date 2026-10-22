@@ -82,7 +82,7 @@ func TestCreateSecurityBlockPage_rejectsDefaultPage(t *testing.T) {
 		"is_default": true,
 	})
 
-	// Then 请求被 400 拒绝（历史问题：第二个默认页不可编辑/不可删除，会产生死行），
+	// Then 请求被 400 拒绝（第二个默认页不可编辑/不可删除，会产生死行），
 	// 且默认页仍只有种子行
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("create default block page status=%d, want 400: %s", recorder.Code, recorder.Body.String())

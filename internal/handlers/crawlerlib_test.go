@@ -254,3 +254,56 @@ func TestLoadSystemListIDs_readsBuiltinNameMapping(t *testing.T) {
 		t.Fatalf("list id for %q=%d, want %d (full map=%v)", wantName, got[wantName], wantID, got)
 	}
 }
+
+// 爬虫源开关状态机与威胁库同口径：已启用且 failed 重复提交 enable 保留
+// 失败态/文案/计数（不得只清文案留下 failed+空失败文案）；关闭清
+// consecutive_failures；关闭→启用归一为 idle/”/0。
+func TestUpdateCrawlerLibFlags_enableStateMachineNormalized(t *testing.T) {
+	router := newCrawlerTestRouter(t)
+	seedCrawlerSource(t, 7, "statebot", 10)
+	put := func(enabled bool) {
+		body := `{"update_enabled":false}`
+		if enabled {
+			body = `{"update_enabled":true}`
+		}
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPut, "/security/crawler-lib/7/flags", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("enabled=%t status=%d body=%s", enabled, rec.Code, rec.Body.String())
+		}
+	}
+	state := func() (string, string, int) {
+		var status, message string
+		var failures int
+		if err := db.DB.QueryRow(`SELECT COALESCE(update_status,''), COALESCE(message,''), COALESCE(consecutive_failures,0) FROM security_crawler_sources WHERE id=7`).Scan(&status, &message, &failures); err != nil {
+			t.Fatal(err)
+		}
+		return status, message, failures
+	}
+
+	// 已启用 + failed：重复提交 enable 保留失败态/文案/计数（同威胁库口径）
+	if _, err := db.DB.Exec(`UPDATE security_crawler_sources SET update_enabled=1, update_status='failed', message='boom', consecutive_failures=3 WHERE id=7`); err != nil {
+		t.Fatal(err)
+	}
+	put(true)
+	if status, message, failures := state(); status != "failed" || message != "boom" || failures != 3 {
+		t.Fatalf("already-enabled state=(%s,%q,%d), want (failed,boom,3)（不得只清文案留 failed）", status, message, failures)
+	}
+
+	// 关闭：清失败计数（与威胁库同口径）
+	put(false)
+	if status, message, failures := state(); status != "idle" || message != "已关闭自动更新" || failures != 0 {
+		t.Fatalf("disabled state=(%s,%q,%d), want (idle,已关闭自动更新,0)", status, message, failures)
+	}
+
+	// 关闭 → 启用：归一 idle/''/0
+	if _, err := db.DB.Exec(`UPDATE security_crawler_sources SET update_status='failed', message='old', consecutive_failures=2 WHERE id=7`); err != nil {
+		t.Fatal(err)
+	}
+	put(true)
+	if status, message, failures := state(); status != "idle" || message != "" || failures != 0 {
+		t.Fatalf("re-enabled state=(%s,%q,%d), want (idle,\"\",0)", status, message, failures)
+	}
+}

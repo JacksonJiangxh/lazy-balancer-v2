@@ -13,7 +13,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// TestBindDeleteRace_serializableIsolationBlocksConcurrentDelete 串行模拟 历史修复
+// TestBindDeleteRace_serializableIsolationBlocksConcurrentDelete 串行模拟
 // 交错：绑定事务的存在性 COUNT 之后、INSERT 之前，并发的策略删除不得提交。
 // 可序列化隔离（BEGIN IMMEDIATE）下 COUNT 即持写锁，删除只能等绑定事务结束后执行。
 func TestBindDeleteRace_serializableIsolationBlocksConcurrentDelete(t *testing.T) {
@@ -58,7 +58,7 @@ func TestBindDeleteRace_serializableIsolationBlocksConcurrentDelete(t *testing.T
 	}()
 
 	// Then the concurrent delete is blocked by the write lock: it cannot complete
-	// between bind's COUNT and INSERT（回归：历史修复 写窗口）
+	// between bind's COUNT and INSERT（回归：写窗口）
 	select {
 	case res := <-delDone:
 		t.Fatalf("并发删除在 bind 事务持锁期间完成: %v（回归：历史修复写窗口）", res.err)
@@ -101,7 +101,7 @@ func TestBindDeleteRace_serializableIsolationBlocksConcurrentDelete(t *testing.T
 }
 
 // failingMetricsConnector 返回一个每次查询都失败的 *sql.DB，用于注入
-// metrics 库故障（历史修复）。
+// metrics 库故障。
 type failingMetricsConnector struct{}
 
 func (failingMetricsConnector) Connect(context.Context) (driver.Conn, error) {
@@ -127,7 +127,7 @@ func (failingMetricsConn) Begin() (driver.Tx, error) {
 }
 
 // TestGetSecurityOverview_metricsDBErrorReturns500 验证 metrics 库查询失败时
-// 安全总览显式返回 500，而不是静默给出全零「无攻击」面板（历史修复）。
+// 安全总览显式返回 500，而不是静默给出全零「无攻击」面板。
 func TestGetSecurityOverview_metricsDBErrorReturns500(t *testing.T) {
 	// Given a working security DB but a failing metrics store
 	setupSecurityPolicyTestDB(t)
@@ -151,7 +151,7 @@ func TestGetSecurityOverview_metricsDBErrorReturns500(t *testing.T) {
 }
 
 // TestListSecurityEvents_scanErrorReturns500 验证行 Scan 失败时事件列表显式
-// 返回 500，而不是把部分零值的事件行当作真实事件返回（历史修复）。
+// 返回 500，而不是把部分零值的事件行当作真实事件返回。
 func TestListSecurityEvents_scanErrorReturns500(t *testing.T) {
 	// Given a metrics row whose anomaly_score cannot scan into int
 	// （SQLite 动态类型下向 INTEGER 列写入了文本）

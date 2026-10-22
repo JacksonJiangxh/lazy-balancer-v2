@@ -1,11 +1,13 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -37,7 +39,7 @@ func overrideWafPathsForServicesTest(t *testing.T) (crsDir, xdbPath string) {
 	return crsDir, xdbPath
 }
 
-// 历史修复：driver.Rows.Next 的非 EOF 错误只能经 rows.Err 观测。
+// driver.Rows.Next 的非 EOF 错误只能经 rows.Err 观测。
 // 已应用哈希读到部分结果时必须回退全量重放，不得把截断视图当完整记录。
 func TestReadAppliedSectionHashes_iterationErrorDropsPartialView(t *testing.T) {
 	fake := sql.OpenDB(&fakeIterErrConnector{failNeedle: "FROM cluster_applied_sections"})
@@ -124,7 +126,7 @@ func TestComputeSectionSkips_allOnFirstSyncAppliesEverything(t *testing.T) {
 }
 
 // 三分类合并(2026-09-19 用户裁定):同步节收敛为 users/rules/security 三节
-// (全局配置并入系统数据、规则库并入安全防护);历史问题(历史):rules 节标签
+// (全局配置并入系统数据、规则库并入安全防护);:rules 节标签
 // 与集群设置卡/主面板开关行统一为「负载均衡规则」(备份分类标签不在此口径)。
 // ComputeSnapshotSectionHashes 只产出 3 键。
 func TestSyncSections_threeCategoryMerge(t *testing.T) {
@@ -217,7 +219,7 @@ func TestDriftGuardSectionHashes_usersIncludesGlobalSettings(t *testing.T) {
 // 三分类合并·方案A(2026-09-19 裁定):文件态记账落 global_config 专用列
 // (applied_waf_ref_hash/applied_waf_ref_version,哈希域=纯 ref 含版本标签),
 // cluster_applied_sections 严格 3 行与 syncSections 同构——wafFilesDrifted
-// 的 304 兜底重拉与 历史问题 标签自愈依赖该记录;随安全防护开关写入/冻结。
+// 的 304 兜底重拉与标签自愈依赖该记录;随安全防护开关写入/冻结。
 func TestRecordAppliedSectionHashes_wafFilesBookkeepingFollowsSecuritySwitch(t *testing.T) {
 	_, database := newClusterTestService(t)
 	snapshot := models.ClusterSnapshot{Version: 9, WafFiles: &models.ClusterWafFilesRef{CRSSha256: "abc", CRSVersion: "v9"}}
@@ -281,6 +283,70 @@ func TestWafFilesDrifted_securitySwitchOffReturnsFalse(t *testing.T) {
 	_ = localHash
 }
 
+// 开关读取失败必须留痕（与 driftedSections 的「重建失败，跳过漂移检测」同族）：
+// 静默返回 false 会让 WAF 文件态检测被无声关闭，本地文件与主端永久分叉无信号。
+func TestWafFilesDrifted_warnsOnSwitchReadFailure(t *testing.T) {
+	_, database := newClusterTestService(t)
+	service := NewSyncService(database, &config.Config{}, nil)
+	if err := database.Close(); err != nil {
+		t.Fatalf("close database: %v", err)
+	}
+	var logs bytes.Buffer
+	originalWriter := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(originalWriter) })
+
+	if service.wafFilesDrifted(context.Background()) {
+		t.Fatal("读失败时必须按未漂移处理（不得误触发全量重拉）")
+	}
+	if !strings.Contains(logs.String(), "读取同步开关失败") {
+		t.Fatalf("logs=%q, want 含「读取同步开关失败」告警", logs.String())
+	}
+}
+
+// 文件态记账哈希读取失败必须留痕：读失败此前被当成「从未记录」，检测静默跳过。
+func TestWafFilesDrifted_warnsOnBookkeepingHashReadFailure(t *testing.T) {
+	_, database := newClusterTestService(t)
+	service := NewSyncService(database, &config.Config{}, nil)
+	if _, err := database.Exec(`ALTER TABLE global_config RENAME COLUMN applied_waf_ref_hash TO applied_waf_ref_hash_unavailable`); err != nil {
+		t.Fatalf("hide bookkeeping column: %v", err)
+	}
+	var logs bytes.Buffer
+	originalWriter := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(originalWriter) })
+
+	if service.wafFilesDrifted(context.Background()) {
+		t.Fatal("记账哈希不可读时必须按未漂移处理")
+	}
+	if !strings.Contains(logs.String(), "读取文件态记账哈希失败") {
+		t.Fatalf("logs=%q, want 含「读取文件态记账哈希失败」告警", logs.String())
+	}
+}
+
+// 集群状态展示的同步开关必须与运行时同一读取口径（readSyncSwitches）：
+// sync_users 恒同步（存量 0 值按 1 读取），Status() 直读列会把禁用态展示成
+// 「系统数据不同步」，与实际同步行为相悖。
+func TestStatus_syncSwitchesUseSingleSourceRead(t *testing.T) {
+	service, database := newClusterTestService(t)
+	if _, err := database.Exec(`UPDATE global_config SET sync_users=0, sync_rules=0, sync_security=1 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	status, err := service.Status(context.Background())
+	if err != nil {
+		t.Fatalf("read cluster status: %v", err)
+	}
+	if !status.SyncUsers {
+		t.Fatal("Status().SyncUsers=false——系统数据恒同步，必须与 readSyncSwitches 同口径为 true")
+	}
+	if status.SyncRules {
+		t.Fatal("Status().SyncRules=true, want 存量 0 值按关闭展示")
+	}
+	if !status.SyncSecurity {
+		t.Fatal("Status().SyncSecurity=false, want 1")
+	}
+}
+
 // seedAppliedWafRefHash 直写文件态记账列(方案A:global_config 专用列,
 // 替代旧 waf_files 记账行的测试播种)。
 func seedAppliedWafRefHash(t *testing.T, dbh *sql.DB, hash string) {
@@ -313,7 +379,7 @@ func TestRecordAppliedSectionHashes_persistsAndUpdates(t *testing.T) {
 	}
 }
 
-// oldBuildSecuritySectionHash 复现 历史问题 COALESCE 加固前旧构建的 security 节哈希：
+// oldBuildSecuritySectionHash 复现 COALESCE 加固前旧构建的 security 节哈希
 // 裸列直出（NULL 序列化为 null 字面量），构造混合版本场景的旧口径参照。
 // 列清单取自加固前 snapshotSecurityPolicies 的原始 SELECT（git 63e05fa5^）。
 func oldBuildSecuritySectionHash(t *testing.T, service *ClusterService, database *sql.DB) string {
@@ -352,7 +418,7 @@ func oldBuildSecuritySectionHash(t *testing.T, service *ClusterService, database
 }
 
 func TestRecordAppliedSectionHashes_driftedSectionStoresLocalRebuiltHash(t *testing.T) {
-	// Given：历史修复问题 混合版本循环场景——新构建从节点（COALESCE 口径）对旧构建
+	// Given：问题 混合版本循环场景——新构建从节点（COALESCE 口径）对旧构建
 	// 主节点（裸列口径）。本地 security_policies 在 COALESCE 列上含 NULL。
 	service, database := newClusterTestService(t)
 	ctx := context.Background()
@@ -409,15 +475,15 @@ func TestRecordAppliedSectionHashes_sameBuildDriftedChoiceImmaterial(t *testing.
 	}
 }
 
-// 历史问题 处置证据：从节点 apply 期归一化（历史问题 双默认页降级）造成
+// 处置证据：从节点 apply 期归一化造成
 // 本地重建哈希与主节点快照哈希持久分歧时，同步周期必须收敛到稳态 304——
 // 首轮 changed 路径落快照侧哈希 h → 下一 304 周期漂移判定触发一次补偿全量
-// 重拉 → 漂移重放后 历史修复问题 drifted 分支落本地重建哈希 lh → 此后
+// 重拉 → 漂移重放后问题 drifted 分支落本地重建哈希 lh → 此后
 // local==applied 不再触发漂移。锁定「无每周期 ping-pong」不变式；残余成本
 // （每个主节点版本递增一次补偿周期）见上方裁定，接受为已知边界。
 func TestSectionSyncCycle_normalizationDivergenceConvergesAfterOneDriftCycle(t *testing.T) {
-	// Given：历史问题 形态主节点快照——security 节携带两个 is_default=1 拦截页；
-	// 从节点 apply 后 历史问题 降级仅保留 MIN(id)，本地重建哈希与快照侧持久分歧。
+	// Given：形态主节点快照——security 节携带两个 is_default=1 拦截页；
+	// 从节点 apply 后降级仅保留 MIN(id)，本地重建哈希与快照侧持久分歧。
 	service, database := newClusterTestService(t)
 	ctx := context.Background()
 	for _, page := range []struct {
@@ -453,7 +519,7 @@ func TestSectionSyncCycle_normalizationDivergenceConvergesAfterOneDriftCycle(t *
 	master.Version = 5
 	master.SectionHashes = ComputeSnapshotSectionHashes(&master)
 	snapshotHash := master.SectionHashes["security"]
-	// 从节点落库 + 历史问题 降级（cluster_apply.go applySecurityBlockPages 同语句）：
+	// 从节点落库 + 降级（cluster_apply.go applySecurityBlockPages 同语句）
 	if _, err := database.Exec(`UPDATE security_block_pages SET is_default=0 WHERE is_default=1 AND id != (SELECT MIN(id) FROM security_block_pages WHERE is_default=1)`); err != nil {
 		t.Fatal(err)
 	}

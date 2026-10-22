@@ -40,7 +40,7 @@ type configSnapshot struct {
 	JWTExpireMinutes           int
 	GitHubProxyURL             string
 	GitHubToken                string
-	// 历史问题 D-新3：v2.1.8 两个 MFA 全局开关——预览变更清单与字段级审计需要
+	// D-新3：v2.1.8 两个 MFA 全局开关——预览变更清单与字段级审计需要
 	//（此前缺位：安全开关可无确认直存且变更零审计留痕）。
 	MFAWriteGuard     bool
 	MFALockoutEnabled bool
@@ -77,7 +77,7 @@ func loadConfigSnapshot() (configSnapshot, error) {
 	err := db.DB.QueryRow(`SELECT COALESCE(acme_email,''), COALESCE(dns_provider,'dnspod'), COALESCE(dns_credentials,''),
 		COALESCE(cert_expiry_days,?), COALESCE(cert_renewal_days,?), COALESCE(cert_renewal_attempts,?),
 		COALESCE(default_ca_provider_id,0), COALESCE(log_level,'info'),
-		COALESCE(timezone,'Asia/Shanghai'),
+		COALESCE(timezone,?),
 		COALESCE(caddy_log_level,'info'), caddy_log_size_mb, request_body_max_size_mb,
 		http_read_timeout, http_write_timeout, http_idle_timeout,
 		COALESCE(upstream_keepalive_timeout,0),
@@ -92,7 +92,7 @@ func loadConfigSnapshot() (configSnapshot, error) {
 		COALESCE(mfa_lockout_enabled,0),
 		COALESCE(trusted_proxy_enabled,0), COALESCE(trusted_proxy_ranges,'[]'), COALESCE(trusted_proxy_range_refs,'[]'), COALESCE(trusted_proxy_headers,'[]'), COALESCE(trusted_proxy_strict,1),
 		COALESCE(server_map_lat,0), COALESCE(server_map_lon,0), COALESCE(threat_screen_mode,?), COALESCE(threat_traffic_sample_n,?), COALESCE(security_events_retention_days,?), COALESCE(security_events_row_cap,?)
-		FROM global_config WHERE id=1`, db.DefaultCertExpiryDays, db.DefaultCertRenewalDays, db.DefaultCertRenewalAttempts, db.DefaultThreatScreenMode, db.DefaultThreatTrafficSampleN, db.DefaultSecurityEventsRetentionDays, db.DefaultSecurityEventsRowCap).Scan(
+		FROM global_config WHERE id=1`, db.DefaultCertExpiryDays, db.DefaultCertRenewalDays, db.DefaultCertRenewalAttempts, db.DefaultTimezone, db.DefaultThreatScreenMode, db.DefaultThreatTrafficSampleN, db.DefaultSecurityEventsRetentionDays, db.DefaultSecurityEventsRowCap).Scan(
 		&old.ACMEEmail, &old.DNSProvider, &old.DNSCredentials,
 		&old.CertExpiryDays, &old.CertRenewalDays, &old.CertRenewalAttempts,
 		&old.DefaultCAProviderID, &old.LogLevel,
@@ -122,7 +122,7 @@ func planConfigChanges(req models.UpdateConfigRequest, old configSnapshot) confi
 			return
 		}
 		plan.Changed = true
-		// 历史问题：同 label 的多字段（大屏本站坐标 lat/lon 共用「大屏本站坐标」）
+		// 同 label 的多字段（大屏本站坐标 lat/lon 共用「大屏本站坐标」）
 		// 只列一次——变更清单/审计预览不重复；Changed 真值保持（任一字段变更即 true）。
 		for _, existing := range plan.Changes {
 			if existing == label {
@@ -145,7 +145,7 @@ func planConfigChanges(req models.UpdateConfigRequest, old configSnapshot) confi
 	add("timezone", "时区", req.Timezone != nil && *req.Timezone != old.Timezone)
 	add("github_proxy_url", "GitHub加速代理", req.GitHubProxyURL != nil && *req.GitHubProxyURL != old.GitHubProxyURL)
 	// 令牌变更只记字段名（不落值）——config_changes 预览面无敏感信息；
-	// nil=保持、空串=清除（历史问题，用户裁定：显式空串须计入变更，
+	// nil=保持、空串=清除（用户裁定：显式空串须计入变更，
 	// 否则「空串清除」请求整包落入「配置无变化」短路，撤销永不到达 UPDATE）。
 	add("github_token", "GitHub 令牌", req.GitHubToken != nil && *req.GitHubToken != old.GitHubToken)
 	add("audit_retention_months", "日志保留", req.AuditRetentionMonths != nil && *req.AuditRetentionMonths != old.AuditRetentionMonths)

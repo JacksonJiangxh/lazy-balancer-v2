@@ -9,11 +9,11 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 保留给限流(overviewmetrics.go:83-90 限流卡片按 code=429 计数),WAF 拦截
+// 保留给限流(scrapeRateLimitBlocksUncached 限流卡片按 code=429 计数),WAF 拦截
 // 页 429 会混入限流指标口径。写侧白名单已剔除 429(handlers 侧),存量行经
 // legacySecurityEnumBackfills 既有模式归一(security_block_pages 无
-// status_code 列,429 仅可能存于 security_policies,见 db.go:492-502 与
-// db.go:1234-1236 注释)。
+// status_code 列,429 仅可能存于 security_policies,见 createTables 的
+// security_policies DDL 与 legacySecurityEnumBackfills 注释)。
 func TestNormalizeBackfillsBlockStatus429To403(t *testing.T) {
 	// Given 主节点(fresh 库 is_master 默认 TRUE),一条 429 遗留行 + 一条合法 404 行
 	setupSecurityEnumTestDB(t)

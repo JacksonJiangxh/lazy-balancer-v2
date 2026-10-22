@@ -95,10 +95,10 @@ const emit = defineEmits<{
 const formRef = ref<FormInstance>()
 const inputRef = ref<InputInstance>()
 const form = reactive<NodeConfigForm>({ access_url: '', siteLocationKey: '', lat: 0, lon: 0 })
-// 打开时的坐标基线：保存前对比判定站点坐标是否真实变更（历史修复问题）。
+// 打开时的坐标基线：保存前对比判定站点坐标是否真实变更。
 const baseline = reactive({ lat: 0, lon: 0 })
 
-// 历史修复：与主节点地址共用 utils/clusterUrl（后端 ValidateClusterAccessURL 同规则）
+// 与主节点地址共用 utils/clusterUrl（后端 ValidateClusterAccessURL 同规则）
 const validateAccessUrl = (_rule: unknown, value: string, callback: (error?: Error) => void): void => {
   const error = validateClusterUrl(value, { label: '访问地址' })
   if (error) {
@@ -117,7 +117,7 @@ watch(
   ([visible, node]) => {
     if (!visible || !node) return
     form.access_url = node.access_url
-    // 历史修复问题：继承节点还原为 0,0 + 空选择——列表接口返回的坐标是主节点
+    // 问题：继承节点还原为 0,0 + 空选择——列表接口返回的坐标是主节点
     // 默认值副本，预填会把「打开即保存」变成继承的静默固化。
     const initial = initialNodeSiteForm(node)
     form.lat = initial.lat

@@ -94,7 +94,7 @@ func (h *Handlers) StartCrawlerLibUpdate(c *gin.Context) {
 		return
 	}
 	op := auditOperator(c)
-	// 历史问题：响应前同步预占位；自记族成功零 handler 审计，
+	// 响应前同步预占位；自记族成功零 handler 审计，
 	// ErrAlreadyRunning/ErrTaskSkipped 静默，真失败留补偿审计。
 	if err := services.TriggerTaskAsync(te, services.CrawlerTaskID, services.TriggerAuditContext{
 		Operator: op, Family: "爬虫地址库", Name: "爬虫地址更新",
@@ -188,8 +188,9 @@ func (h *Handlers) UpdateCrawlerLibFlags(c *gin.Context) {
 		return
 	}
 	var name string
-	if err := db.DB.QueryRow(`SELECT name FROM security_crawler_sources WHERE id=?`, id).Scan(&name); err != nil {
-		// 历史问题：与威胁库同款三分支——缺行=404，其余 DB 故障=500
+	var wasEnabled int
+	if err := db.DB.QueryRow(`SELECT name, COALESCE(update_enabled,0) FROM security_crawler_sources WHERE id=?`, id).Scan(&name, &wasEnabled); err != nil {
+		// 与威胁库同款三分支——缺行=404，其余 DB 故障=500
 		// （此前一律 404，可重试故障被误报「爬虫源不存在」）。
 		if errors.Is(err, sql.ErrNoRows) {
 			c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "爬虫源不存在"})
@@ -199,19 +200,28 @@ func (h *Handlers) UpdateCrawlerLibFlags(c *gin.Context) {
 		return
 	}
 	if *body.UpdateEnabled {
-		if _, err := db.DB.Exec(`UPDATE security_crawler_sources SET update_enabled=1, message='', updated_at=datetime('now') WHERE id=?`, id); err != nil {
+		// 与威胁库 UpdateThreatSourceFlags 同口径状态机：仅「由关闭转为启用」
+		// 时清失败态（idle+空文案+计数清零）；已启用源重复提交不改运行态
+		// （此前恒清 message，留下 failed+空失败文案形态）。
+		query := `UPDATE security_crawler_sources SET update_enabled=1, updated_at=datetime('now') WHERE id=?`
+		if wasEnabled == 0 {
+			query = `UPDATE security_crawler_sources SET update_enabled=1, update_status='idle', message='', consecutive_failures=0, updated_at=datetime('now') WHERE id=?`
+		}
+		if _, err := db.DB.Exec(query, id); err != nil {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新失败: " + err.Error()})
 			return
 		}
 	} else {
 		// 关闭即退出更新任务：清掉关闭前的瞬时失败态与排程槽，否则列表/库头
 		// 继续显示「更新失败」，重新启用还会因残留未来槽无法武装首槽。
-		if _, err := db.DB.Exec(`UPDATE security_crawler_sources SET update_enabled=0, update_status='idle', message='已关闭自动更新', next_update=NULL, updated_at=datetime('now') WHERE id=?`, id); err != nil {
+		// consecutive_failures 同步清零（与威胁库同口径，经集群快照在节点间
+		// 复制的失败计数不得跨禁用期陈旧）。
+		if _, err := db.DB.Exec(`UPDATE security_crawler_sources SET update_enabled=0, update_status='idle', message='已关闭自动更新', next_update=NULL, consecutive_failures=0, updated_at=datetime('now') WHERE id=?`, id); err != nil {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新失败: " + err.Error()})
 			return
 		}
 	}
-	// 历史问题：单源启用即武装首槽（威胁库 UpdateThreatSourceFlags 同构）——
+	// 单源启用即武装首槽（威胁库 UpdateThreatSourceFlags 同构）——
 	// 总闸已开且无任何启用源持 next_update 时，仅改开关会让排程槽恒空。
 	if *body.UpdateEnabled {
 		services.ArmCrawlerFirstSlots()

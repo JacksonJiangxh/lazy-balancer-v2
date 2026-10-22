@@ -137,6 +137,42 @@ func TestImportConfigBackup_normalizes_tcp_tls_and_path_rule_timestamps(t *testi
 	}
 }
 
+func TestNormalizeRuleRowsForTransport_clearsRemainingTCPDeadFields(t *testing.T) {
+	newBackupTestHandlers(t)
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules
+		(caddy_id,name,protocol,domain,listen_port,tls_source,tls_http_redirect,health_check_host,
+		 block_page_stage1_id,block_page_stage1_status,block_page_stage3_id,block_page_stage3_status,log_enabled)
+		VALUES ('lb_transport_dead','transport-dead','tcp','dead.example.test',19443,'acme_dns',1,'probe.example.test',7,451,8,503,1)`); err != nil {
+		t.Fatalf("seed TCP dead fields: %v", err)
+	}
+	tx, err := db.DB.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatalf("begin normalization transaction: %v", err)
+	}
+	if _, err := normalizeRuleRowsForTransport(t.Context(), tx); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("normalize rule rows: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit normalization: %v", err)
+	}
+
+	var domain, tlsSource, healthHost string
+	var redirect, stage1ID, stage1Status, stage3ID, stage3Status, logEnabled int
+	if err := db.DB.QueryRow(`SELECT COALESCE(domain,''),COALESCE(tls_source,''),COALESCE(health_check_host,''),
+		COALESCE(tls_http_redirect,0),COALESCE(block_page_stage1_id,0),COALESCE(block_page_stage1_status,0),
+		COALESCE(block_page_stage3_id,0),COALESCE(block_page_stage3_status,0),COALESCE(log_enabled,0)
+		FROM lb_rules WHERE caddy_id='lb_transport_dead'`).Scan(
+		&domain, &tlsSource, &healthHost, &redirect, &stage1ID, &stage1Status, &stage3ID, &stage3Status, &logEnabled); err != nil {
+		t.Fatalf("read normalized TCP rule: %v", err)
+	}
+	if domain != "" || tlsSource != "manual" || healthHost != "" || redirect != 0 ||
+		stage1ID != 0 || stage1Status != 0 || stage3ID != 0 || stage3Status != 0 || logEnabled != 0 {
+		t.Fatalf("TCP dead fields remain: domain=%q tls_source=%q health_host=%q redirect=%d stages=%d/%d/%d/%d log=%d",
+			domain, tlsSource, healthHost, redirect, stage1ID, stage1Status, stage3ID, stage3Status, logEnabled)
+	}
+}
+
 // 新增的 9 个 NOT NULL DEFAULT 列（upstream_path 先例确立的登记惯例未跟进）——
 // 手造/损坏备份这些列为 NULL 时 restoreTable 原样落 NULL 撞列约束，整包 500
 // 回滚。修复=按 schema DEFAULT 逐字补登记（response_status 归一 200）。

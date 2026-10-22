@@ -23,6 +23,47 @@ import (
 	"lazy-balancer-v2/internal/taskengine"
 )
 
+// crawlerBaselineLoader / crawlerIPListMigrate 是测试缝（生产恒指向真实
+// 实现）：单轮基线缓存与迁移提升的调用计数观测点。
+var (
+	crawlerBaselineLoader = loadCrawlerIPListsFromDB
+	crawlerIPListMigrate  = migrateCrawlerIPListNames
+)
+
+// crawlerBaselineSet 单次 RunUpdate 共享的名单基线快照：收缩门/扩张门
+// 各需一份「DB 名单行条数」基线，逐门全量读 = 每源 2 次全表读+JSON 解析。
+// 单轮内基线稳定（upsert 只写本源行，其他源基线不受影响），整轮共享一份；
+// 读取失败记忆化同一错误（与逐次读取的失败口径一致——基线读失败按源失败
+// 处理，方向安全）。
+type crawlerBaselineSet struct {
+	all map[string][]string
+	err error
+}
+
+func loadCrawlerBaselineSet() crawlerBaselineSet {
+	if db.DB == nil {
+		return crawlerBaselineSet{}
+	}
+	all, err := crawlerBaselineLoader()
+	return crawlerBaselineSet{all: all, err: err}
+}
+
+// baseline 与 crawlerSnapshotBaseline 同口径（DB 行优先、无行回退内置首版、
+// 皆无 → known=false），消费预读快照而非现读。
+func (s crawlerBaselineSet) baseline(engineID string) (int, bool, error) {
+	if s.err != nil {
+		return 0, false, s.err
+	}
+	builtin, known := 0, false
+	if entries, ok := crawlerBuiltinSnapshot[engineID]; ok {
+		builtin, known = len(entries), true
+	}
+	if current, ok := s.all[engineID]; ok {
+		return len(current), true, nil
+	}
+	return builtin, known, nil
+}
+
 // CrawlerTaskID 是爬虫地址库更新任务 ID（taskengine 注册、handler 状态/
 // 触发/日志、任务监控共用；字面量只允许存在于本常量与任务注册处）。
 const CrawlerTaskID = "crawlerbot-update"
@@ -31,13 +72,13 @@ const CrawlerTaskID = "crawlerbot-update"
 // 当前无运行态字段，单例仅统一生命周期与调用契约）。
 type CrawlerUpdateManager struct{}
 
-// validateCrawlerEntriesSanity 爬虫名单合理性门（历史问题-02 + 历史问题 收紧）。
+// validateCrawlerEntriesSanity 爬虫名单合理性门。
 // 引擎声明了官方段（geoipnames 单一事实源）时，一切格式（含 JSON——结构化
 // 字段白名单由 parseCrawlerCIDRsForFormat 承担，本门承担段集一致性）：
 //  1. 子集门：每条解析结果必须 ⊆ 某官方段（off.Bits()<=prefix.Bits() 且
-//     包含首地址）——历史问题 前为「交集」判定，0.0.0.0/0、10.0.0.0/8 等
+//     包含首地址）——前为「交集」判定，0.0.0.0/0、10.0.0.0/8 等
 //     覆盖官方段的超网会被放行，写入即对启用爬虫豁免的策略整体 fail-open；
-//  2. 覆盖门：每个官方段至少被保留条目覆盖 1/8 地址空间（历史修复 起为
+//  2. 覆盖门：每个官方段至少被保留条目覆盖 1/8 地址空间（自此为
 //     地址空间覆盖率口径，不再是「任一更具体条目命中」；阈值依据见函数内
 //     360 官方页实测）——截断页/仅一条官方段内 IP 的错误页、以及「每段一个
 //     单 IP」的占位形状都不得整体替换豁免名单（与 crawler_seed_parity_test.go
@@ -166,13 +207,22 @@ func crawlerSnapshotBaseline(engineID string) (count int, known bool, err error)
 	return count, known, nil
 }
 
-// crawlerSnapshotShrinkGuard 条数收缩门（历史问题）：新名单条数较当前快照
+// crawlerSnapshotShrinkGuard 条数收缩门：新名单条数较当前快照
 // 收缩超过一半时拒绝写入、保留上次快照——子集/覆盖门之外的兜底（引擎未
 // 声明官方段时它是唯一闸门）。基线=DB 名单行当前条数，无行回退内置首版
 // （首轮更新也受门），两者皆无则放行（无可对照口径）。基线读取失败按
 // 失败处理（保留上次快照，方向安全）。
-func crawlerSnapshotShrinkGuard(engineID string, newCount int) error {
-	baseline, known, err := crawlerSnapshotBaseline(engineID)
+// set 非 nil=单次 RunUpdate 共享的预读基线（单轮缓存）；nil=现读
+// （测试/独立调用方直调）。
+func crawlerSnapshotShrinkGuard(engineID string, newCount int, set *crawlerBaselineSet) error {
+	var baseline int
+	var known bool
+	var err error
+	if set != nil {
+		baseline, known, err = set.baseline(engineID)
+	} else {
+		baseline, known, err = crawlerSnapshotBaseline(engineID)
+	}
 	if err != nil {
 		return fmt.Errorf("读取爬虫名单基线失败: %w", err)
 	}
@@ -191,7 +241,7 @@ func crawlerSnapshotShrinkGuard(engineID string, newCount int) error {
 // 上限，与 AutobanListEntryCap 同型的跨包契约）。
 const CrawlerIPListEntryCap = 2000
 
-// crawlerSnapshotGrowthGuard 条数扩张门（历史修复，与收缩门对称）：源响应上限
+// crawlerSnapshotGrowthGuard 条数扩张门：源响应上限
 // 16MB，通用 CIDR 提取后可产出数十万条，此前只有收缩门（防塌缩），膨胀会直接
 // 放大 DB 行、crawler-ip-lists.json、插件每 10min 重载的前缀表与渲染期内存，
 // 并绕过产品 2000 条口径。两道门：
@@ -201,11 +251,19 @@ const CrawlerIPListEntryCap = 2000
 //
 // 拒绝时保留上次快照；调用方按源失败留痕（任务日志 ERROR + 源状态 failed +
 // 运行审计「更新失败」），不在此重复记录。
-func crawlerSnapshotGrowthGuard(engineID string, newCount int) error {
+// set 语义同 crawlerSnapshotShrinkGuard（非 nil=单轮共享预读基线）。
+func crawlerSnapshotGrowthGuard(engineID string, newCount int, set *crawlerBaselineSet) error {
 	if newCount > CrawlerIPListEntryCap {
 		return fmt.Errorf("解析条数 %d 超过系统名单上限 %d 条，拒绝写入（保留上次快照）", newCount, CrawlerIPListEntryCap)
 	}
-	baseline, known, err := crawlerSnapshotBaseline(engineID)
+	var baseline int
+	var known bool
+	var err error
+	if set != nil {
+		baseline, known, err = set.baseline(engineID)
+	} else {
+		baseline, known, err = crawlerSnapshotBaseline(engineID)
+	}
 	if err != nil {
 		return fmt.Errorf("读取爬虫名单基线失败: %w", err)
 	}
@@ -258,7 +316,7 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 	}
 	if isMaster, roleErr := RoleOf(context.Background(), db.DB); roleErr != nil {
 		// 角色读取失败（DB 瞬断/脏行）≠从节点——按失败返回（task_runs/任务
-		// 监控可见），不得静默跳过（历史问题：二态复核把 DB 故障当从节点）。
+		// 监控可见），不得静默跳过（二态复核把 DB 故障当从节点）。
 		outcome = "failed"
 		TaskLogfWarn("crawlerbot-update", "failed", "角色读取失败，无法判定本节点是否主节点，已中止爬虫地址更新: %v", roleErr)
 		return fmt.Errorf("角色读取失败: %w", roleErr)
@@ -286,6 +344,15 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 		return nil
 	}
 	TaskLogf("crawlerbot-update", "checking", "开始更新爬虫地址库（%d 个启用源）", len(sources))
+	// 单轮迁移提升+基线缓存：名单名迁移幂等（逐源 upsert 各自重跑=每源
+	// N 次 UPDATE），收缩/扩张门的名单基线逐门全量读（=每源 2 次全表读
+	// +JSON 解析）——单轮内基线稳定（upsert 只写本源行，不影响其他源的
+	// 基线），整轮共享一份预读。upsert 保留自迁移兜底（独立调用方契约不变）。
+	if err := crawlerIPListMigrate(); err != nil {
+		outcome = "failed"
+		return fmt.Errorf("名单名迁移失败: %w", err)
+	}
+	baselines := loadCrawlerBaselineSet()
 	runStarted := taskRunStartedAt(&rc)
 	var firstErr error
 	successCount, failedCount, totalEntries, changedCount := 0, 0, 0, 0
@@ -347,23 +414,23 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 			taskengine.TeeTaskLogTime("crawlerbot-update", "ERROR", "failed", fmt.Sprintf("源 %s 更新失败: %v", src.Name, err))
 			continue
 		}
-		// 历史问题：按源声明格式解析（json 源的非 JSON 响应=错误页 → 失败并
+		// 按源声明格式解析（json 源的非 JSON 响应=错误页 → 失败并
 		// 保留上次快照；词法边界已排除版本号/日期等 IP 同形 token）。
 		entries, perr := parseCrawlerCIDRsForFormat(body, src.Format)
 		if perr == nil {
-			// 历史问题-02（历史）+ 历史问题（历史收紧）：合理性门——
+			// +：合理性门——
 			// 子集（每条 ⊆ 官方段，取代旧交集判定）+ 覆盖（官方段全覆盖），
 			// 一切格式同口径；错误页/超网/截断名单保留上次快照。
 			entries, perr = validateCrawlerEntriesSanity(src.Name, entries)
 		}
 		if perr == nil {
-			// 历史问题：条数收缩门——较当前快照（DB/内置首版）收缩过半拒绝写入。
-			perr = crawlerSnapshotShrinkGuard(src.Name, len(entries))
+			// 条数收缩门——较当前快照（DB/内置首版）收缩过半拒绝写入。
+			perr = crawlerSnapshotShrinkGuard(src.Name, len(entries), &baselines)
 		}
 		if perr == nil {
 			// 条数扩张门——绝对 2000 条上限 + 较当前快照翻倍拒绝
 			// （源响应可达 16MB，无上限会绕过产品口径放大系统名单）。
-			perr = crawlerSnapshotGrowthGuard(src.Name, len(entries))
+			perr = crawlerSnapshotGrowthGuard(src.Name, len(entries), &baselines)
 		}
 		if perr != nil {
 			if firstErr == nil {
@@ -374,7 +441,26 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 			taskengine.TeeTaskLogTime("crawlerbot-update", "ERROR", "failed", fmt.Sprintf("源 %s 更新失败: %v", src.Name, perr))
 			continue
 		}
-		changed, err := upsertCrawlerIPListChanged(src.Name, entries)
+		// 成功写路径前复核（与威胁族同一写门 updateRunWriteGate）：下载/解析
+		// 完成到 upsert 写库之间的降级窗口——循环顶部复核只覆盖源间边界，
+		// 首源/唯一源的写库此前不经过任何复核。
+		if gerr := updateRunWriteGate(ctx); gerr != nil {
+			if errors.Is(gerr, errRunRoleUndecidable) {
+				outcome = "failed"
+				TaskLogfWarn("crawlerbot-update", "failed", "角色读取失败，无法判定本节点是否主节点，源 %s 结果未写库，终止爬虫地址更新", src.Name)
+				return gerr
+			}
+			if errors.Is(gerr, taskengine.ErrTaskSkipped) {
+				outcome = "skipped"
+				TaskLogfWarn("crawlerbot-update", "skipped", "节点已降级为从节点，源 %s 结果未写库（从节点零写，由集群同步收敛）", src.Name)
+				return gerr
+			}
+			outcome = "cancelled"
+			markCrawlerSourceCancelled(src.Name)
+			TaskLogfWarn("crawlerbot-update", "cancelled", "源 %s 更新已手动取消（结果未写库，保留上次快照）", src.Name)
+			return gerr
+		}
+		changed, err := upsertCrawlerIPListChangedInner(src.Name, entries)
 		if err != nil {
 			// 部分提交收敛 部分提交收敛：DB 已更新而快照写失败时 upsert 返回
 			// changed=true + err——DB 与投影/插件快照已分叉，仍须计入收敛面，
@@ -405,16 +491,32 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 	} else {
 		TaskLogf("crawlerbot-update", "success", "爬虫地址更新完成：%d 个源成功，共 %d 条", successCount, totalEntries)
 	}
-	// 历史问题：名单内容变化后的收敛——复用威胁库的单源热路径（投影重写
+	// 名单内容变化后的收敛——复用威胁库的单源热路径（投影重写
 	// 零 /load；未证实收敛回退强制重载）。无变化/全失败不触碰 Caddy。
 	if changedCount > 0 {
+		// 收敛写路径前复核（与 upsert 前门同构）：投影重写/回退重载是主节点
+		// 写面动作，降级/不可判定窗口不得执行（引用方由主节点后续轮收敛）。
+		if gerr := updateRunWriteGate(ctx); gerr != nil {
+			if errors.Is(gerr, errRunRoleUndecidable) {
+				outcome = "failed"
+				TaskLogfWarn("crawlerbot-update", "failed", "角色读取失败，无法判定本节点是否主节点，跳过名单投影收敛（引用方由后续轮次收敛）")
+				return gerr
+			}
+			if errors.Is(gerr, taskengine.ErrTaskSkipped) {
+				outcome = "skipped"
+				TaskLogfWarn("crawlerbot-update", "skipped", "节点已降级为从节点，跳过名单投影收敛（从节点零写，引用方由主节点收敛）")
+				return gerr
+			}
+			outcome = "cancelled"
+			return gerr
+		}
 		convergeIPListProjectionAfterMutation("crawlerbot-update")
 	}
 	return firstErr
 }
 
 // convergeIPListProjectionAfterMutation 内置名单（system=1，可被 ACL/信任面
-// 引用）内容变化后的生效路径（历史问题，复用威胁库单源回调）：
+// 引用）内容变化后的生效路径
 //   - 投影刷新器已注册 → RefreshIPListProjections（毫秒级、零 /load，
 //     @ipListFast 匹配器 ≤1s stat 热感知）；
 //   - 未证实收敛（发射面变化/运行配置不可读/刷新被拒）或回调未注册 →
@@ -452,7 +554,7 @@ func markCrawlerSourceRunning(name, trigger, started string) error {
 	return err
 }
 
-// crawlerSlotAdvanceSQL 爬虫源族排程槽推进门（历史问题-2，历史）：与威胁源族
+// crawlerSlotAdvanceSQL 爬虫源族排程槽推进门：与威胁源族
 // 同一谓词（schedule.go slotAdvanceGateSQL 单源）——仅 auto 触发且现存槽
 // 空/过期才推进。手动触发不动预约、未来槽不回拨（2026-10-11 排程槽生命周期
 // 裁定；crawlerbot 新族此前无条件改写 next_update：手动轮可静默吞掉当天自动

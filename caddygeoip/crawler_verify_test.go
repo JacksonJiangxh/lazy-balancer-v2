@@ -284,7 +284,7 @@ func TestVerifyCrawler_dnsFailureFailClosed(t *testing.T) {
 	}
 }
 
-// ---- 历史问题 ----
+// ---- 回归钉 ----
 
 func resetCrawlerIPRangeCacheForTest() {
 	crawlerFileCacheMu.Lock()
@@ -314,7 +314,7 @@ func TestCrawlerIPRangeList_precompiledAndFailureThrottled(t *testing.T) {
 	if verifyCrawlerIPRangeFromList("66.249.66.1", "googlebot") {
 		t.Fatal("failure must be throttled for the retry interval")
 	}
-	// 历史问题：失败只按短重试间隔节流（旧实现缓存满 10min，冷装窗口 360
+	// 失败只按短重试间隔节流（旧实现缓存满 10min，冷装窗口 360
 	// 豁免 fail-closed 最长 10 分钟）；重试间隔过后重读 → 命中。
 	crawlerFileCacheMu.Lock()
 	crawlerFileCacheSnap.loadedAt = time.Now().Add(-2 * time.Minute)
@@ -359,7 +359,7 @@ func TestVerifyCrawlerIPRange_invalidAddrNoPanic(t *testing.T) {
 	}
 }
 
-// ---- 历史修复：地址归一化（Unmap/zone），方向 fail-closed ----
+// 地址归一化（Unmap/zone），方向 fail-closed ----
 
 // Given: 客户端 IP 为 4in6 映射形态，PTR 属引擎官方域，正向回验返回 v4 规范串
 // When: 双跳验证
@@ -421,7 +421,7 @@ func TestVerifyCrawlerIPRange_v4MappedAndZoneNormalized(t *testing.T) {
 	}
 }
 
-// 历史问题：并发加载代际守卫——慢读者读到 rename 前的旧 inode，不得在新
+// 并发加载代际守卫——慢读者读到 rename 前的旧 inode，不得在新
 // 快照落定后把旧内容写回（否则官方段更新后旧段最多沿用 10 分钟）。
 func TestCrawlerIPRangeSnapshot_staleGenerationDoesNotOverwrite(t *testing.T) {
 	resetCrawlerIPRangeCacheForTest()
@@ -451,7 +451,7 @@ func TestCrawlerIPRangeSnapshot_staleGenerationDoesNotOverwrite(t *testing.T) {
 	}
 }
 
-// 历史问题 反向形状：并发成功快照落定后，较早开始的失败读取不得把它降级成
+// 反向形状：并发成功快照落定后，较早开始的失败读取不得把它降级成
 // 空集（fail-closed 空窗）。TTL 到期后的失败读取（晚于成功落定）照常覆盖。
 func TestCrawlerIPRangeSnapshot_freshSuccessNotDowngradedByOldFailure(t *testing.T) {
 	resetCrawlerIPRangeCacheForTest()
@@ -477,6 +477,41 @@ func TestCrawlerIPRangeSnapshot_freshSuccessNotDowngradedByOldFailure(t *testing
 	}
 	if got := commitCrawlerIPRangeSnapshot(laterFailure); got != laterFailure {
 		t.Fatal("成功快照过期后的失败读取应覆盖为空快照（fail-closed）")
+	}
+}
+
+func TestCrawlerIPRangeSnapshot_pathChangeRejectsInflightRead(t *testing.T) {
+	oldPath := crawlerIPListFilePath()
+	newPath := filepath.Join(t.TempDir(), "new-crawler.json")
+	setCrawlerIPListFilePath(newPath)
+	t.Cleanup(func() {
+		setCrawlerIPListFilePath(oldPath)
+		resetCrawlerIPRangeCacheForTest()
+	})
+
+	inflightOld := &crawlerIPRangeSnapshot{
+		filePath: oldPath,
+		prefixes: map[string][]netip.Prefix{"so360spider": {netip.MustParsePrefix("140.0.0.0/24")}},
+		loadedAt: time.Now(), ok: true, modTime: time.Now(), size: 128,
+	}
+	if got := commitCrawlerIPRangeSnapshot(inflightOld); got.ok {
+		t.Fatal("路径切换后的旧路径在途读必须 fail-closed，不得返回旧成功快照")
+	}
+	crawlerFileCacheMu.Lock()
+	cached := crawlerFileCacheSnap
+	crawlerFileCacheMu.Unlock()
+	if cached != nil {
+		t.Fatalf("旧路径在途读不得写入新路径缓存: %#v", cached)
+	}
+
+	fresh := &crawlerIPRangeSnapshot{
+		filePath: newPath,
+		prefixes: map[string][]netip.Prefix{"so360spider": {netip.MustParsePrefix("42.236.8.0/21")}},
+		loadedAt: time.Now(), ok: true, modTime: time.Now(), size: 128,
+	}
+	commitCrawlerIPRangeSnapshot(fresh)
+	if got := commitCrawlerIPRangeSnapshot(inflightOld); got != fresh {
+		t.Fatal("新路径快照已落定后，旧路径在途读必须保留新快照")
 	}
 }
 

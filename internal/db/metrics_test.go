@@ -46,7 +46,7 @@ func TestCleanupMetricsHistory_deletes_expired_global_and_rule_rows(t *testing.T
 	}
 }
 
-// 历史修复 回归：过期历史清理必须分批执行（默认批 5000 下 12000 行过期数据
+// 回归：过期历史清理必须分批执行（默认批 5000 下 12000 行过期数据
 // 需 3 批），全部清理且保留保鲜行，重跑幂等零删除。
 func TestCleanupMetricsHistory_batchesLargeDeletes(t *testing.T) {
 	// Given
@@ -94,7 +94,7 @@ func TestCleanupMetricsHistory_batchesLargeDeletes(t *testing.T) {
 	}
 }
 
-// 历史修复：用测试钩子收缩批次（30 行 / 批 7 = 5 批 4 次批间停顿，每次至少
+// 用测试钩子收缩批次（30 行 / 批 7 = 5 批 4 次批间停顿，每次至少
 // 10ms）证明清理确实跨批推进——单语句 DELETE 实现不感知批次变量，耗时
 // 趋近 0，据此判红。
 func TestCleanupMetricsHistory_loopsAcrossBatches(t *testing.T) {
@@ -247,7 +247,7 @@ func TestInitMetricsSchema_duplicateTransactionIDsDedupedAndIndexCreated(t *test
 	err = initMetricsSchema(metrics)
 
 	// Then 重复历史行不得拖垮启动；启动期去重（保留每事务最早行）后唯一索引
-	// 照常建立——不再靠跳过索引放行（历史问题：跳过会让 offset 重建/
+	// 照常建立——不再靠跳过索引放行（跳过会让 offset 重建/
 	// 轮转补采把重复事件重新入库并重复喂 autoban/rollup）。
 	if err != nil {
 		t.Fatalf("duplicate transaction IDs must not abort initialization: %v", err)

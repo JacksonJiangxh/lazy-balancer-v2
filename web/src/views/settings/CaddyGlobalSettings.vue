@@ -305,7 +305,7 @@ type CaddyLogsResponse = {
 
 const settings = defineModel<CaddySettingsConfig>('settings', { required: true })
 // 父级 /config 加载完成前禁止保存：表单此刻仍是默认值——与 BasicSettings 同门
-// （历史修复，历史问题-1 同族缺口）。
+// （同族缺口：设置类表单均需此门）。
 const props = defineProps<{ configLoaded: boolean }>()
 const emit = defineEmits<{ (event: 'save'): void }>()
 const authStore = useAuthStore()
@@ -325,7 +325,7 @@ const trustedPresetRangesDoc = computed(() => {
 })
 
 // JSON 数组文本解析统一走 utils/securityStages（parseIPList/parseRefIds 单源，
-// 历史问题-10：原文件内 parseTrustedList/parseTrustedRefIds 与其逐字重复）。
+// 原文件内 parseTrustedList/parseTrustedRefIds 与其逐字重复）。
 
 // settings（外部回填/加载）→ 表单数组
 watch(() => [settings.value.trusted_proxy_ranges, settings.value.trusted_proxy_headers, settings.value.trusted_proxy_range_refs], ([ranges, headers, refs]) => {
@@ -372,7 +372,7 @@ const openSaveListDialog = (): void => {
   saveListDialogVisible.value = true
 }
 const confirmSaveAsList = async (): Promise<void> => {
-  // 历史修复：创建名单是写操作——弹框打开期间角色/节点模式变化时函数级拦截。
+  // 创建名单是写操作——弹框打开期间角色/节点模式变化时函数级拦截。
   if (isReadOnly.value || savingList.value) return
   const name = saveListForm.value.name.trim()
   if (!name) { ElMessage.warning('请输入列表名称'); return }
@@ -420,7 +420,7 @@ const logHtml = computed(() => ansiToHtml(logContent.value))
 const autoRefresh = ref(true)
 const logContainerRef = ref<HTMLElement | null>(null)
 
-// 历史修复：日志尾轮询收敛 useLogTailPolling 单源（补上原缺的后台标签页暂停；
+// 日志尾轮询收敛 useLogTailPolling 单源（补上原缺的后台标签页暂停；
 // tab 切换/关闭的迟到响应守卫由 composable 序号 + fetch 内目标校验双层保证）。
 const logTail = useLogTailPolling({
   interval: 2000,
@@ -443,7 +443,7 @@ const updateProxyTimeout = (field: keyof ProxyTimeoutConfig, value: number): voi
 }
 
 const handleSave = async (): Promise<void> => {
-  // 配置未加载完成时表单为默认值——保存即整体覆盖真实配置（历史修复）
+  // 配置未加载完成时表单为默认值——保存即整体覆盖真实配置
   if (!props.configLoaded) {
     ElMessage.warning('配置尚未加载完成，暂不能保存')
     return
@@ -452,7 +452,7 @@ const handleSave = async (): Promise<void> => {
   saving.value = true
   try {
     // 显式白名单：settings 是与 BasicSettings 共享的同一对象，全量展开会把
-    // 兄弟卡片未保存的编辑（basic 键）连带提交；只发 caddy 键（历史问题）
+    // 兄弟卡片未保存的编辑（basic 键）连带提交；只发 caddy 键
     const payload = {
       ...Object.fromEntries(CADDY_CONFIG_KEYS.map((key) => [key, settings.value[key]] as const)),
       source: 'caddy',
@@ -489,7 +489,7 @@ const handleReloadCaddy = async (): Promise<void> => {
       confirmButtonText: '确认', cancelButtonText: '取消', type: 'warning',
     })
   } catch (error: unknown) {
-    // 历史问题：确认门在任何 reject 形态下都必须中止——原实现对非 cancel/close
+    // 确认门在任何 reject 形态下都必须中止——原实现对非 cancel/close
     // 异常仅 console 后继续执行 /config/reload（与 ClusterSettings.confirmAction
     // / FreeCertificates 的 return 口径不一致）。
     if (error !== 'cancel' && error !== 'close') console.error('Unexpected MessageBox rejection:', error)
@@ -539,7 +539,7 @@ onUnmounted(() => logTail.stop())
 /* 单行描述(2026-09-19 图片报障):只加 nowrap,不做溢出裁切(窄屏容忍伸出) */
 .tip-nowrap { white-space: nowrap; }
 .format-field { width: 100%; min-width: 0; }
-/* 历史问题：tip-inline/tip-block 旧式 el-text 已全量归一全局 form-tip-inline/
+/* tip-inline/tip-block 旧式 el-text 已全量归一全局 form-tip-inline/
    form-tip-line（main.css 唯一事实源，scoped 重复定义删除）；format-tip 仅保留
    链接/行高补充样式 */
 .format-tip { line-height: 1.5; }

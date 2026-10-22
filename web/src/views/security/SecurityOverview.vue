@@ -23,6 +23,11 @@
       class="mb-5 error-banner"
     />
 
+    <!-- 采集健康位（任务已停/连续失败/审计写侧降级）：判据与文案与事件列表/大屏同源 -->
+    <div v-if="ingestionWarning" class="info-note-bar">
+      <span class="info-note-desc">{{ ingestionWarning }}</span>
+    </div>
+
     <el-row :gutter="20" class="mb-5">
       <el-col :xs="24" :md="10">
         <el-card shadow="always" class="overview-card">
@@ -289,6 +294,7 @@ import VChart from 'vue-echarts'
 import type { APIResponse } from '@/types'
 import { securityActionColors } from '@/utils/chartTheme'
 import { normalizeRateLimitBlocks, type RateLimitBlocks } from '@/utils/rateLimitBlocks'
+import { ingestionWarningMessage, type IngestionHealth } from '@/utils/ingestionHealth'
 
 
 interface TrendPoint { date: string; blocked: number; detected: number }
@@ -302,15 +308,17 @@ interface Overview {
   raw_coverage_from?: string; backfill_incomplete?: boolean
   // includes_reserved：后端口径披露——总量含私网/保留地址事件（总量卡片 tooltip）
   includes_reserved?: boolean
+  // ingestion：与事件列表同源的采集健康位（见 utils/ingestionHealth）
+  ingestion?: IngestionHealth
 }
 interface SecurityEvent { id: number; event_time: string; client_ip: string; rule_caddy_id: string; rule_name: string; policy_name: string; ip_location?: string }
 
 const attackByStage = ref(true)
 
-// Top 10 攻击类型列与分布图「按阶段展示」勾选联动（历史微调）：勾选时把
+// Top 10 攻击类型列与分布图「按阶段展示」勾选联动（微调）：勾选时把
 // 具体 family（joinDistinctFamilies 产物）映射到阶段五桶去重展示，取消勾选
 // 恢复具体分类文本——与分布图同口径（后端 stageCategorizeAttack 的 family 版）。
-// 历史问题:阶段视图直接消费后端 attack_type_stage(后端 stageCategorizeAttack
+// 阶段视图直接消费后端 attack_type_stage(后端 stageCategorizeAttack
 // 单源产出)——原前端 familyToStage 硬编码映射已删,后端新增 family 不再静默落「其他」
 const topIpAttackLabel = (row: TopIP): string => {
   if (!attackByStage.value) return row.attack_type || '—'
@@ -319,8 +327,9 @@ const topIpAttackLabel = (row: TopIP): string => {
 const overview = ref<Overview>({ today_blocked: 0, today_detected: 0, active_policies: 0, crs_version: '', trend: [], top_ips: [], attack_types: [], attack_types_stage: [], raw_coverage_from: '', backfill_incomplete: false })
 // 分布图展示模式：勾选=按阶段五桶（默认，与触发阶段口径一致）；取消=具体分类
 // 总览加载失败（如 metrics 库故障导致后端 500）时置位：避免把全零面板
-// 误当「无攻击」，用户目标与 历史问题 的后端显式报错对齐（历史问题）。
+// 误当「无攻击」，用户目标与 后端显式报错对齐。
 const overviewError = ref(false)
+const ingestionWarning = computed(() => ingestionWarningMessage(overview.value.ingestion))
 const trendChartOption = computed(() => {
   const dates = overview.value.trend.map(t => t.date)
   const blocked = overview.value.trend.map(t => t.blocked)
@@ -358,14 +367,14 @@ const fetchData = async () => {
     }
   } catch {
     // 后端 500（如 metrics 库故障）不再静默吞掉：置错误状态展示提示条，
-    // 全零面板不再冒充「无攻击」（历史问题）。
+    // 全零面板不再冒充「无攻击」。
     overviewError.value = true
   }
 }
 
 const blockedEvents = ref<SecurityEvent[]>([])
 // 面板级错误态：请求失败时面板内显示「加载失败」，不再静默降级为「暂无」，
-// 与 overviewError 的 历史问题 口径一致（历史问题）。
+// 与 overviewError 的口径一致。
 const blockedEventsError = ref(false)
 
 const fetchBlockedEvents = async () => {

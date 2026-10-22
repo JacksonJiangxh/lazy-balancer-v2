@@ -24,7 +24,7 @@ import { useId } from 'vue'
 
 withDefaults(defineProps<{ size?: number | string }>(), { size: 40 })
 
-// 历史问题：字面量 id 在多实例页（如登录页+布局）会重复，useId 生成实例唯一 id
+// 字面量 id 在多实例页（如登录页+布局）会重复，useId 生成实例唯一 id
 const gradId = useId()
 </script>
 

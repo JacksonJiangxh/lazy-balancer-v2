@@ -1,6 +1,6 @@
 package handlers
 
-// 历史问题+历史问题:密码登录与 MFA 挑战两步的登录响应必须携带 auth_provider
+// +:密码登录与 MFA 挑战两步的登录响应必须携带 auth_provider
 // ('local'/'oidc')——前端据此隐藏本地显示名/密码编辑;SELECT 漏列使本地
 // 用户得到空串,OIDC 会话的 auth_method 声明也随之丢失。
 

@@ -1,7 +1,7 @@
 package handlers
 
-// 历史修复（历史问题）：UA 改名保护门只认精确路径——祖先改名
-//（request>headers->hdrs 整树带走 历史修复，filterencoder.go:466-471 引擎实证）
+// UA 改名保护门只认精确路径——祖先改名
+//（request>headers->hdrs 整树带走，filterencoder.go:466-471 引擎实证）
 // 绕过校验，UA 统计静默失效。钉三形状：祖先改名/根改名/精确改名全拒。
 // 回归：合法改名（remote_ip→src）与无关改名放行。
 
@@ -43,7 +43,7 @@ func TestValidateAccessLogFormat_rejectsUARenameIncludingAncestors(t *testing.T)
 	}
 }
 
-// 历史问题：非法行（无 ->、空路径、空动作）保存侧必须 400 并点名行号——
+// 非法行（无 ->、空路径、空动作）保存侧必须 400 并点名行号——
 // 旧实现静默跳过，非法行落库后渲染层同样静默跳过，用户以为生效。
 func TestValidateAccessLogFormat_rejectsInvalidLinesWithLineNumber(t *testing.T) {
 	cases := []struct {

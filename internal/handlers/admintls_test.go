@@ -236,7 +236,7 @@ func TestUpdateAdminTLSJSONBody_rejectsMismatchedPairWithoutSaving(t *testing.T)
 	}
 }
 
-// 历史问题 2 MiB MaxBytesReader 上限超限 body 须 413（原恒 400，与规则域
+// 2 MiB MaxBytesReader 上限超限 body 须 413（原恒 400，与规则域
 // 413 口径不一致）。JSON 通道两入口（保存/预检）同门。
 func TestAdminTLSOversizedBodyReturns413(t *testing.T) {
 	// Given：超过 2 MiB 的 JSON 体（cert_file 承载超长 PEM 串）
@@ -267,7 +267,7 @@ func TestAdminTLSOversizedBodyReturns413(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：审计 detail 须显式记录本次是否替换了证书材料——
+// 审计 detail 须显式记录本次是否替换了证书材料——
 // 仅启用/禁用 + 来源无法区分「只开关」与「换证书」。
 func TestUpdateAdminTLS_auditDetailRecordsCertificateReplacement(t *testing.T) {
 	newRouter := func(handler gin.HandlerFunc) *gin.Engine {
@@ -360,7 +360,7 @@ func TestUpdateAdminTLS_auditDetailRecordsCertificateReplacement(t *testing.T) {
 	})
 }
 
-// 历史修复（历史）：upload → selfsigned 切换此前把已上传证书/私钥继续留在
+// upload → selfsigned 切换此前把已上传证书/私钥继续留在
 // global_config（selfsigned 由 ResolveCertificate 自生成，残留 upload 材料无消费者，
 // 且随备份/导入继续传播）。切换后必须清空；upload 模式禁用保留既有钉测已锁。
 func TestUpdateAdminTLS_switchingToSelfsignedClearsUploadedMaterial(t *testing.T) {
@@ -402,7 +402,7 @@ func TestUpdateAdminTLS_switchingToSelfsignedClearsUploadedMaterial(t *testing.T
 	}
 }
 
-// 历史修复（历史）：值未变更时 PUT /admin-tls 此前仍写库并触发进程重启
+// 值未变更时 PUT /admin-tls 此前仍写库并触发进程重启
 // （设置页重复保存=无谓停机）。未变更 → 200「未变更」、不写库、不重启。
 func TestUpdateAdminTLS_unchangedConfigSkipsWriteAndRestart(t *testing.T) {
 	initializeRuleFeatureTestDB(t)
@@ -437,7 +437,7 @@ func TestUpdateAdminTLS_unchangedConfigSkipsWriteAndRestart(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：携带证书材料但生效来源不是 upload 时不得静默丢弃
+// 携带证书材料但生效来源不是 upload 时不得静默丢弃
 // （旧行为可能回「配置未变更」200）——必须 400 点名正确做法且不落库。
 func TestUpdateAdminTLSJSONBody_rejectsUploadPayloadWithoutUploadMode(t *testing.T) {
 	initializeRuleFeatureTestDB(t)
@@ -484,7 +484,7 @@ func TestUpdateAdminTLSJSONBody_rejectsUploadPayloadWithoutUploadMode(t *testing
 	}
 }
 
-// 历史问题：enabled 是安全开关，字符串值必须遵循 true/1/false/0 白名单；
+// enabled 是安全开关，字符串值必须遵循 true/1/false/0 白名单；
 // 非法拼写不得静默按 false 关闭 HTTPS 并触发重启，合法 "0" 保持回归。
 func TestUpdateAdminTLS_enabledValueWhitelist(t *testing.T) {
 	for _, tc := range []struct {
@@ -561,7 +561,7 @@ func TestUpdateAdminTLS_enabledValueWhitelist(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：库内证书损坏/非 PEM（带外改库、旧版本导入）时，读路径
+// 库内证书损坏/非 PEM（带外改库、旧版本导入）时，读路径
 // 此前静默省略 cert_info——UI 只见 enabled=true 无证书信息、运维零信号。
 // 现在必须显式暴露 cert_info_error（fail-visible，与写路径严格校验同口径）。
 func TestGetAdminTLS_corruptStoredCertIsVisible(t *testing.T) {
@@ -599,7 +599,7 @@ func TestGetAdminTLS_corruptStoredCertIsVisible(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：管理面板 HTTPS 保存属高危设置——非法载荷（enabled 白名单）
+// 管理面板 HTTPS 保存属高危设置——非法载荷（enabled 白名单）
 // 与写库失败此前只回 400/500、不写审计，失败尝试不可回溯。沿用既有
 // 「更新失败/基础设置」词条（同 UpdateConfig 失败留痕口径）。
 func TestUpdateAdminTLS_failuresAreAudited(t *testing.T) {
@@ -649,7 +649,7 @@ func TestUpdateAdminTLS_failuresAreAudited(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：413 口径此前只测 JSON 通道——multipart 超 2 MiB 未覆盖，
+// 413 口径此前只测 JSON 通道——multipart 超 2 MiB 未覆盖，
 // 表单解析错误须同样映射 413（respondAdminTLSBodyError 的 *http.MaxBytesError
 // 分支）。两入口（保存/预检）同门。
 func TestAdminTLSOversizedMultipartBodyReturns413(t *testing.T) {
@@ -692,7 +692,7 @@ func TestAdminTLSOversizedMultipartBodyReturns413(t *testing.T) {
 	}
 }
 
-// UpdateAdminTLS 是 历史修复（读 current → 合并四列 →
+// UpdateAdminTLS 是 （读 current → 合并四列 →
 // 整体 UPDATE）。未持 caddyOpMu 时并发保存会以各自基线整体覆盖，前一次变更
 // 静默丢失。本测试钉住「锁被占用时保存必须等待」——修复前请求会立即完成。
 func TestUpdateAdminTLS_serializesReadModifyWriteWithCaddyOpLock(t *testing.T) {

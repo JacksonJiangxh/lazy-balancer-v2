@@ -141,8 +141,8 @@ func TestClusterAuthMiddlewares_mapDatabaseFailuresTo500(t *testing.T) {
 	})
 }
 
-// 历史问题(历史):AuthenticateRegistrationSecret 哈希比对改常量时间
-// (镜像 services/cluster.go RegistrationStatus 的 历史问题 形态)——防御一致性
+// AuthenticateRegistrationSecret 哈希比对改常量时间
+// (镜像 services/cluster.go RegistrationStatus 的形态)——防御一致性
 // 改写,无行为差异。本测试为基线钉(非 RED):钉住改写前后契约不变——
 // 有效注册密钥通过;错误/空密钥、未知节点、过期密钥一律拒绝。
 func TestAuthenticateRegistrationSecret_contract(t *testing.T) {

@@ -46,9 +46,9 @@ func parseAdminTLSCertInfo(certPEM string) (*adminTLSCertInfo, error) {
 	if issuer == "" {
 		issuer = cert.Issuer.String()
 	}
-	// 与 历史问题(services/certinfo.go)同口径向零截断——未过期 23h→0、
+	// 与 (services/certinfo.go)同口径向零截断——未过期 23h→0、
 	// 过期 1天3h→-1;此前未过期 Ceil/已过期 Floor 与规则证书展示相差一天。
-	// 历史：表达式收敛 CertDaysRemaining 单源。
+	// 表达式收敛 CertDaysRemaining 单源。
 	now := time.Now()
 	daysLeft := services.CertDaysRemaining(cert.NotAfter, now)
 	expired := !now.Before(cert.NotAfter)
@@ -84,10 +84,10 @@ var errInvalidCert = errors.New("无效的证书 PEM")
 
 // validateAdminTLSConfigValues 校验启用态管理面板 HTTPS 配置形态：mode 白名单
 // （selfsigned/upload）+ upload 模式证书私钥配对与有效期（与 UpdateAdminTLS
-// 同口径）。历史问题：v2 备份导入写 admin_tls_* 复用本门——坏配置落库会使下次
+// 同口径）。v2 备份导入写 admin_tls_* 复用本门——坏配置落库会使下次
 // 启动 ResolveCertificate 失败即进程退出（崩溃循环）。
 func validateAdminTLSConfigValues(cfg services.AdminTLSConfig) error {
-	// mode 值域门与启用态无关（历史 历史问题）：禁用态也不得落库白名单外值。
+	// mode 值域门与启用态无关：禁用态也不得落库白名单外值。
 	if cfg.Mode != "" && cfg.Mode != "selfsigned" && cfg.Mode != "upload" {
 		return errors.New("无效的证书来源：当前仅支持自签名或上传证书")
 	}
@@ -107,7 +107,7 @@ func validateAdminTLSConfigValues(cfg services.AdminTLSConfig) error {
 
 // validateUploadCertificatePair 校验上传证书对：证书私钥匹配 + 有效期（未生效/
 // 已过期）。validateAdminTLSConfigValues（启用态 upload）与 UpdateAdminTLS
-// （禁用态但本次上传新证书材料）共用同一实现（历史修复 收敛：原两处各自内联
+// （禁用态但本次上传新证书材料）共用同一实现（收敛：原两处各自内联
 // X509KeyPair+validateAdminTLSCertPeriod）。
 func validateUploadCertificatePair(certPEM, keyPEM string, now time.Time) error {
 	if _, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM)); err != nil {
@@ -131,7 +131,7 @@ type adminTLSInput struct {
 	keyValue     string // JSON 通道提交的私钥 PEM
 }
 
-// decodeAdminTLSInput 解析请求入参：历史修复 为 multipart 表单时走原
+// decodeAdminTLSInput 解析请求入参：为 multipart 表单时走原
 // multipart 路径（含 2 MiB 上限与原错误文案）；否则嗅探 body 为 JSON 对象
 // （含显式 application/json）时走 JSON 路径；其余请求回落 multipart 解析，
 // 行为与仅支持表单时一致。
@@ -139,7 +139,7 @@ func decodeAdminTLSInput(c *gin.Context) (*adminTLSInput, error) {
 	if !strings.Contains(c.GetHeader("Content-Type"), "multipart/form-data") {
 		body, err := io.ReadAll(c.Request.Body)
 		if err != nil {
-			// %w 保留 *http.MaxBytesError 链——上层映射 413（历史修复）
+			// %w 保留 *http.MaxBytesError 链——上层映射 413
 			return nil, fmt.Errorf("请求体读取失败: %w", err)
 		}
 		if bytes.HasPrefix(bytes.TrimLeft(body, " \t\r\n"), []byte("{")) {
@@ -217,7 +217,7 @@ func (in *adminTLSInput) certificatePair() (string, string, error) {
 
 // respondAdminTLSBodyError 把入参解析错误映射为响应：*http.MaxBytesError
 // （2 MiB MaxBytesReader 上限）→ 413，其余 → 400。UpdateAdminTLS 与
-// InspectAdminTLSCert 共用（历史问题 原超限 body 恒 400，与规则域 413 口径
+// InspectAdminTLSCert 共用（原超限 body 恒 400，与规则域 413 口径
 // 不一致）。
 func respondAdminTLSBodyError(c *gin.Context, err error) {
 	var maxBytesErr *http.MaxBytesError
@@ -291,7 +291,7 @@ func (h *Handlers) GetAdminTLS(c *gin.Context) {
 	if cfg.Cert != "" {
 		info, err := parseAdminTLSCertInfo(cfg.Cert)
 		if err != nil {
-			// 历史问题（历史）：库内证书损坏/非 PEM（带外改库、旧版本导入）
+			// 库内证书损坏/非 PEM（带外改库、旧版本导入）
 			// 时此前静默省略 cert_info——UI 只见 enabled=true 却无证书信息，
 			// 运维零信号。读路径与写路径口径对齐：显式暴露不可读状态。
 			services.Logf("warn", "管理面板 HTTPS 证书解析失败（库内证书不可读）: %v", err)
@@ -304,7 +304,7 @@ func (h *Handlers) GetAdminTLS(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: resp})
 }
 
-// auditAdminTLSFailure 记录管理面板 HTTPS 保存失败尝试（历史问题，历史）。
+// auditAdminTLSFailure 记录管理面板 HTTPS 保存失败尝试。
 // 词条沿用 UpdateConfig 的「更新失败/基础设置」（既有 danger 词表，不新增
 // 动作名）。detail 不落证书/私钥材料，只落原因。
 func auditAdminTLSFailure(c *gin.Context, reason string) {
@@ -333,13 +333,13 @@ func (h *Handlers) UpdateAdminTLS(c *gin.Context) {
 		}
 	}
 
-	// 本端点是 历史修复（读 current → 合并四列 → 整体
+	// 本端点是 （读 current → 合并四列 → 整体
 	// UPDATE）。同域全局配置写者 UpdateConfig/PutCaddyConfig 均持 caddyOpMu；
 	// 此处不取锁时，UI 与 JSON/MCP 通道并发保存会以各自读到的 current 为基线
 	// 整体覆盖，前一次变更静默丢失，且各自排期一次进程重启。锁只覆盖
 	// 「读当前值 → 校验/探针 → 写库」，restartProcess 在解锁后执行。
 	// 锁序：caddyOpMu → wafFileMu（ResolveCertificate 只碰证书文件），与全仓
-	// 既有顺序一致，无 历史修复。
+	// 既有顺序一致，无。
 	h.caddyOpMu.Lock()
 	locked := true
 	defer func() {
@@ -363,7 +363,7 @@ func (h *Handlers) UpdateAdminTLS(c *gin.Context) {
 	if v := input.modeValue; v != "" {
 		mode = v
 	}
-	// 历史问题（历史）：携带证书材料但生效来源不是 upload 时此前静默
+	// 携带证书材料但生效来源不是 upload 时此前静默
 	// 丢弃材料（甚至回「配置未变更，无需重启」200），与 fail-visible 原则不符。
 	// 现显式 400 点名两种正确做法（补 mode=upload 或移除材料字段）。
 	if input.hasUploadPayload() && mode != "upload" {
@@ -387,13 +387,13 @@ func (h *Handlers) UpdateAdminTLS(c *gin.Context) {
 		cert, key = certPEM, keyPEM
 		uploadedCertificate = true
 	}
-	// 历史修复（历史）：切换到非 upload 来源时清空已上传证书材料——
+	// 切换到非 upload 来源时清空已上传证书材料——
 	// selfsigned 由 ResolveCertificate 自生成，残留 upload 材料无消费者，
 	// 且会随备份/导入继续传播（upload 模式禁用保留既有钉测锁定，不受影响）。
 	if mode != "upload" {
 		cert, key = "", ""
 	}
-	// 历史修复（历史）：值未变更不写库不重启——此前无条件 UPDATE+
+	// 值未变更不写库不重启——此前无条件 UPDATE+
 	// restartProcess，设置页重复保存产生无谓进程重启。未变更即无状态迁移，
 	// 不再重复校验（存量值保存时已过同一校验链）。
 	if enabled == current.Enabled && mode == current.Mode && cert == current.Cert && key == current.Key {
@@ -402,7 +402,7 @@ func (h *Handlers) UpdateAdminTLS(c *gin.Context) {
 	}
 
 	// 形态校验（mode 值域 + 启用态必选来源 + upload 配对/有效期）与 v2 备份
-	// 导入（config_backup.go）共用同一实现（历史修复 收敛：原内联校验与
+	// 导入（config_backup.go）共用同一实现（收敛：原内联校验与
 	// validateAdminTLSConfigValues 双份——改一处漏一处即分叉）。
 	if err := validateAdminTLSConfigValues(services.AdminTLSConfig{Enabled: enabled, Mode: mode, Cert: cert, Key: key}); err != nil {
 		auditAdminTLSFailure(c, "配置校验失败: "+err.Error())
@@ -437,7 +437,7 @@ func (h *Handlers) UpdateAdminTLS(c *gin.Context) {
 		return
 	}
 	if n, rowsErr := res.RowsAffected(); rowsErr != nil || n != 1 {
-		// global_config 行缺失/损坏时不能报成功并重启（历史）。
+		// global_config 行缺失/损坏时不能报成功并重启。
 		reason := "配置行不存在"
 		if rowsErr != nil {
 			reason = "读取更新结果失败: " + rowsErr.Error()
@@ -448,10 +448,10 @@ func (h *Handlers) UpdateAdminTLS(c *gin.Context) {
 	}
 
 	modePart := ""
-	if mode != "" { // 禁用路径未提交 mode——空值段不拼（历史）
+	if mode != "" { // 禁用路径未提交 mode——空值段不拼
 		modePart = "证书来源：" + mode
 	}
-	// 历史问题（历史）：cert/key 可能被本次上传替换，此前审计只记启用态+
+	// cert/key 可能被本次上传替换，此前审计只记启用态+
 	// 来源——「只开关未换证书」与「换证书」在审计里不可区分。显式留痕（不落
 	// 证书本体）。
 	certPart := "证书：未更换"
@@ -465,7 +465,7 @@ func (h *Handlers) UpdateAdminTLS(c *gin.Context) {
 		services.AuditResultPart("success"),
 	))
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已保存，服务正在重启以应用 HTTPS 配置"})
-	// 历史修复：改走统一重启触发器（restartProcess，见 system.go）——与集群同步的
+	// 改走统一重启触发器（restartProcess，见 system.go）——与集群同步的
 	// Admin TLS 热切换同一优雅停机信号；测试环境回退 exitProcess。
 	// 先解锁再重启：重启期间不得让并发的配置写请求阻塞在 caddyOpMu 上。
 	h.caddyOpMu.Unlock()

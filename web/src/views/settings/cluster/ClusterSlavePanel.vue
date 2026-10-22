@@ -9,7 +9,7 @@
       </div>
     </template>
 
-    <!-- 历史问题：注册终止（confirm 连败/轮询被拒清空 cluster_token）时 last_sync_error
+    <!-- 注册终止（confirm 连败/轮询被拒清空 cluster_token）时 last_sync_error
          携带终止文案，优先渲染错误/终止态——registration_id 已清，「等待主节点审批」
          的自动激活不会发生，不能再按无错误时的分支误导用户。 -->
     <el-alert
@@ -35,7 +35,7 @@
       <el-button type="primary" :loading="syncing" :disabled="readOnly || !status.cluster_active || promoting" @click="$emit('sync')">
         <el-icon><Refresh /></el-icon>立即同步
       </el-button>
-      <!-- 历史问题：PinMismatch 补救——主节点更换管理面板证书后同步持续指纹不匹配，
+      <!-- PinMismatch 补救——主节点更换管理面板证书后同步持续指纹不匹配，
            「重新注册」复用同一 TOFU transport 无法自救；清空本节点 TOFU 指纹钉
            （POST /cluster/forget-pins）后，下一同步周期按主节点当前证书重新钉扎。 -->
       <el-button v-if="status.sync_error_code === 'pin_mismatch'" type="danger" plain :loading="forgettingPins" :disabled="readOnly || forgettingPins" @click="$emit('forget-pins')">
@@ -70,7 +70,7 @@ defineEmits<{
   (event: 'forget-pins'): void
 }>()
 
-// apply_ok_reload_failed 机内标记的展示翻译已收敛至 utils/syncErrorDisplay.ts（历史修复 单一实现）。
+// apply_ok_reload_failed 机内标记的展示翻译已收敛至 utils/syncErrorDisplay.ts。
 const syncErrorDisplay = computed<string>(() => formatSyncErrorDisplay(props.status))
 </script>
 

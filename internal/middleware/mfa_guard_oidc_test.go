@@ -1,6 +1,6 @@
 package middleware
 
-// 历史问题(历史):mfaStepUpGuard 对 OIDC 会话(auth_method=oidc)必须在
+// mfaStepUpGuard 对 OIDC 会话(auth_method=oidc)必须在
 // MFA 状态查询前显式短路——当前实现依赖「OIDC 行 mfa_enabled 恒 0」的跨文件
 // 不变量,任何把 mfa_enabled 写上 OIDC 行的新路径都会让 OIDC 用户落入本地
 // step-up 428 链(verify-step 因 mfa_secret='' 必败→写操作全锁)。

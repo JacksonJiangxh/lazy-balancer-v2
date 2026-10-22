@@ -12,7 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// 历史修复（2026-09-05 审计裁定）：global_config.metrics_public/metrics_origins 死列
+// （2026-09-05 审计裁定）：global_config.metrics_public/metrics_origins 死列
 // 删除后的备份兼容契约——①携带这两键的历史备份导入无错（恢复侧按现存列过滤，
 // 未知键静默跳过，其余配置正常落库）；②新导出的备份不再携带两键。
 func TestImportConfigBackup_toleratesDeadMetricsConfigKeys(t *testing.T) {
@@ -89,7 +89,7 @@ func TestImportConfigBackup_toleratesDeadMetricsConfigKeys(t *testing.T) {
 	}
 }
 
-// 历史修复-新2(历史):历史修复-新3 钉住——备份携带字面量 "null" 白名单导入后
+// 新2:-新3 钉住——备份携带字面量 "null" 白名单导入后
 // 归一为 ”(中间件把非空串当白名单配置,null 解析成功但 0 CIDR→全来源 403)。
 func TestImportConfigBackup_normalizesNullWhitelist(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -129,7 +129,7 @@ func TestImportConfigBackup_normalizesNullWhitelist(t *testing.T) {
 	}
 }
 
-// 历史修复-新1(历史):历史修复-新1 钉住——sync_users 入保护键,导出不含、
+// 新1:-新1 钉住——sync_users 入保护键,导出不含、
 // 导入携带 0 值不落库(恒同步不变量的第五强制点)。
 func TestExportImportConfigBackup_syncUsersProtected(t *testing.T) {
 	h := newBackupTestHandlers(t)

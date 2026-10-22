@@ -2,6 +2,7 @@ import { ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { request } from '@/utils/api'
 import { showSaveResult } from '@/utils/saveResult'
+import { CADDY_APPLY_FAILED_MARKER } from '@/utils/bulkApplyResult'
 import { parseRefIds } from '@/utils/securityStages'
 import { useIpListAdd, type IpListOption } from '@/composables/useIpListAdd'
 import type { APIResponse } from '@/types'
@@ -56,7 +57,7 @@ export const useTrustAssociation = (options: {
   const { adding, addIpToList } = useIpListAdd()
   const creating = ref(false)
 
-  /** 同侧全部非系统列表（历史用户验收：多列表绑定时逐列表出按钮，不再只取第一个） */
+  /** 同侧全部非系统列表（用户验收：多列表绑定时逐列表出按钮，不再只取第一个）*/
   const resolveSideLists = (policy: TrustPolicyLike, side: ListSide): IpListOption[] => {
     const refs = parseRefIds(policy[SIDE_CONFIG[side].refField])
     return options.getList()
@@ -74,7 +75,7 @@ export const useTrustAssociation = (options: {
   /** 单击动作：把 IP 加入策略指定侧的列表（自动解析/创建目标列表并关联） */
   const ensureListAndJoin = async (policy: TrustPolicyLike, ip: string, side: ListSide): Promise<void> => {
     const cfg = SIDE_CONFIG[side]
-    // 历史修复：单数 resolveSideList 已删（唯一内部消费点内联为 plural 首项）
+    // 单数 resolveSideList 已删（唯一内部消费点内联为 plural 首项）
     const existing = resolveSideLists(policy, side)[0] ?? null
     if (existing) {
       const opt: IpListOption = { id: existing.id, name: existing.name, entry_count: 0 }
@@ -88,7 +89,7 @@ export const useTrustAssociation = (options: {
     const lead = parseRefIds(policy[cfg.refField]).length === 0
       ? `策略「${policy.name}」尚未关联${cfg.verb}用地址列表`
       : `策略「${policy.name}」同侧仅关联系统内置名单（快捷处置不直接操作系统名单）`
-    // 历史修复：确认框弹出前即占位——双击不再叠两个确认框/重复创建
+    // 确认框弹出前即占位——双击不再叠两个确认框/重复创建
     // （原 creating 在 confirm 之后才置位）。
     if (creating.value) return
     creating.value = true
@@ -102,7 +103,7 @@ export const useTrustAssociation = (options: {
       } catch {
         return
       }
-      // 历史问题：同侧已有同名未引用列表（历史创建后解绑）时复用而非
+      // 同侧已有同名未引用列表时复用而非
       // 重复创建——按名称在现有列表中查找（category 无关，仅看名字精确相等）。
       const wantName = `${policy.name}${cfg.suffix}`
       const sameName = options.getList().find((l) => l.name === wantName && !l.system)
@@ -114,7 +115,7 @@ export const useTrustAssociation = (options: {
           entries: '[]',
         })
         // 中间跳退化 200+后缀（Caddy 应用失败但 DB 已提交）也须可见——有后缀才弹
-        if (created.message?.includes('Caddy 配置应用失败')) showSaveResult(created, '')
+        if (created.message?.includes(CADDY_APPLY_FAILED_MARKER)) showSaveResult(created, '')
         newId = created.data?.id
       }
       if (!newId) {
@@ -125,7 +126,7 @@ export const useTrustAssociation = (options: {
       if (!refs.includes(newId)) {
         const assocRes = await request.put(`/security/policies/${policy.id}`, { [cfg.refField]: JSON.stringify([...refs, newId]) })
         // 同上：关联中间跳的退化后缀不可静默
-        if (assocRes.message?.includes('Caddy 配置应用失败')) showSaveResult(assocRes, '')
+        if (assocRes.message?.includes(CADDY_APPLY_FAILED_MARKER)) showSaveResult(assocRes, '')
       }
       const added = await request.post<APIResponse<{ added: boolean }>>(`/security/ip-lists/${newId}/ips`, { value: ip })
       showSaveResult(added as unknown as { message?: string }, `已${sameName ? '关联既有' : '创建'}「${policy.name}${cfg.suffix}」并加入 ${ip}`)
@@ -140,7 +141,7 @@ export const useTrustAssociation = (options: {
 
   /** 从引用列表移除 IP（关联保留） */
   const removeFromSideRef = async (list: TrustListRef, ip: string): Promise<void> => {
-    // 历史修复：确认框弹出前即占位（双击重入锁）
+    // 确认框弹出前即占位（双击重入锁）
     if (creating.value) return
     creating.value = true
     try {

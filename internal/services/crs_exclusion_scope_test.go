@@ -72,8 +72,8 @@ func scopedExclusionFixture(t *testing.T) {
 }
 
 // crsxcProjectionFiles 提取渲染产物中全部 CRS 作用域排除投影（@ipListFast
-// 算子路径→文件内容）。历史修复 后 scope 名=组合键哈希（p<id>-crsxc-<12hex>），
-// 测试不再钉实现文件名（历史修复 改行为断言：以名→内容的映射断言身份不变量）。
+// 算子路径→文件内容）。后 scope 名=组合键哈希（p<id>-crsxc-<12hex>），
+// 测试不再钉实现文件名（改行为断言：以名→内容的映射断言身份不变量）。
 func crsxcProjectionFiles(t *testing.T, directives string) map[string]string {
 	t.Helper()
 	out := make(map[string]string)
@@ -101,7 +101,7 @@ func crsxcProjectionFiles(t *testing.T, directives string) map[string]string {
 }
 
 // seedInfraCRSFiles 提供基础设施三件套（901/949/959）与 crsDirectivesDir——
-// 历史修复 存在性门仅在文件在场时发射强制 Include，fixture 缺文件会让门把
+// 存在性门仅在文件在场时发射强制 Include，fixture 缺文件会让门把
 // Include 全部跳过、断言集体失真。
 func seedInfraCRSFiles(t *testing.T) {
 	t.Helper()
@@ -191,7 +191,7 @@ func TestBuildCorazaDirectives_scopedExclusionExpandsGroupPerID(t *testing.T) {
 	}
 	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	// 组 42 在夹具索引中含 942100、942550 两条 → 逐 ID ctl，id 2000001 起顺序
-	// 唯一。匹配集经投影 @ipListFast（历史修复，内联 @ipMatch 形态退役
+	// 唯一。匹配集经投影 @ipListFast（内联 @ipMatch 形态退役
 	// ——大名单撞 48KiB 护栏）；匹配内容断言在投影文件（readRenderedIPList）。
 	want := []string{
 		`"id:2000001,phase:1,pass,nolog,ctl:ruleRemoveById=942100"` + "\n",
@@ -237,7 +237,7 @@ func TestBuildCorazaDirectives_scopedExclusionMergesIPsAndListDedup(t *testing.T
 	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	// 条目 1：ips ∪ 列表条目合并去重保序 → 2.2.2.2,1.1.1.1,3.3.3.0/24；
 	// 条目 2：同一列表重复引用去重一次。两组合键不同（ips 字面不同）→ 两份
-	// 投影（历史修复：scope=组合键哈希，内容断言以名→内容映射承载，不再钉
+	// 投影（scope=组合键哈希，内容断言以名→内容映射承载，不再钉
 	// 实现文件名）。
 	files := crsxcProjectionFiles(t, directives)
 	if len(files) != 2 {
@@ -376,7 +376,7 @@ func TestBuildCorazaDirectives_hybridRuleGroupsStaleIDSkipped(t *testing.T) {
 		if !strings.HasPrefix(line, "Include /app/waf/crs/rules/") {
 			continue
 		}
-		// 历史修复：基础设施组（901 初始化/949 评估）强制包含与选组内容无关，放行；
+		// 基础设施组（901 初始化/949 评估）强制包含与选组内容无关，放行；
 		// 陈旧 ID 不得携带任何攻击组文件进场。
 		if strings.Contains(line, "REQUEST-901-INITIALIZATION.conf") || strings.Contains(line, "REQUEST-949-BLOCKING-EVALUATION.conf") {
 			continue
@@ -385,7 +385,7 @@ func TestBuildCorazaDirectives_hybridRuleGroupsStaleIDSkipped(t *testing.T) {
 	}
 }
 
-// 历史修复：选组策略的基础设施组强制包含——未选 01/49/59 时 901 先于被选组、949 殿后
+// 选组策略的基础设施组强制包含——未选 01/49/59 时 901 先于被选组、949 殿后
 // （响应检查开再加 959）；已选时不重复 Include（重复注册同规则 ID 会编译失败）；
 // glob 路径（空选组）不受影响（由 emptyGroups 等价语义测试锁定）。
 func TestBuildCorazaDirectives_infraGroupsForceIncluded(t *testing.T) {
@@ -409,7 +409,7 @@ func TestBuildCorazaDirectives_infraGroupsForceIncluded(t *testing.T) {
 		t.Fatalf("959 must not be included without WAFCheckResponse:\n%s", directives)
 	}
 
-	// 响应检查开启 → 959 殿后；已选 01/49/59 组号（历史修复 读取面剥离——写入面
+	// 响应检查开启 → 959 殿后；已选 01/49/59 组号（读取面剥离——写入面
 	// 剥离生效前的存量/带外数据）→ 基础设施组号不再按数组原位发射 glob，
 	// 改由强制 Include 按正确次序（901 最前、949/959 殿后）补齐，各恰一次。
 	policy.WAFCheckResponse = true
@@ -434,7 +434,7 @@ func TestBuildCorazaDirectives_infraGroupsForceIncluded(t *testing.T) {
 	if !(idx901 < idx942 && idx942 < idx949 && idx949 < idx959) {
 		t.Fatalf("include order must stay 901 → selected groups → 949 → 959:\n%s", directives)
 	}
-	// 6 位基础设施 ID（历史修复 同口径剥离）→ 剥离后由强制 Include 补齐，949 仍恰一次
+	// 6 位基础设施 ID→ 剥离后由强制 Include 补齐，949 仍恰一次
 	policy.CRSRuleGroups = json.RawMessage(`["42","949110"]`)
 	directives = mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
 	if got := strings.Count(directives, "Include /app/waf/crs/rules/REQUEST-949-BLOCKING-EVALUATION.conf"); got != 1 {
@@ -442,7 +442,7 @@ func TestBuildCorazaDirectives_infraGroupsForceIncluded(t *testing.T) {
 	}
 }
 
-// TestBuildCorazaDirectives_legacyInfraGroupOrderPreserved（历史修复）：存量/带外
+// TestBuildCorazaDirectives_legacyInfraGroupOrderPreserved：存量/带外
 // crs_rule_groups=["42","01"]（写入面剥离生效前落库）——组号 01 不再按数组原位
 // 发射 REQUEST-901-*.conf glob（会排在 942 之后、破坏 901 最前的强制序），而是
 // 剥离后由强制 Include 补齐：901 仍最前、949/959 仍殿后。
@@ -528,7 +528,7 @@ func TestCRSExcludedEntry_IPsDualShapeRoundTrip(t *testing.T) {
 	}
 }
 
-// 历史问题：响应检查开启时强制发射 SecResponseBodyMimeType（coraza 零值=空集=
+// 响应检查开启时强制发射 SecResponseBodyMimeType（coraza 零值=空集=
 // 响应体永不进规则），关闭时不得出现（避免无谓的响应体缓冲）。
 func TestBuildCorazaDirectives_responseBodyMimeTypeEmitted(t *testing.T) {
 	scopedExclusionFixture(t)
@@ -542,7 +542,7 @@ func TestBuildCorazaDirectives_responseBodyMimeTypeEmitted(t *testing.T) {
 	}
 }
 
-// 历史修复 存量兜底：命中 901 初始化组的存量排除（组号/ID/文件名/跨界区间/作用域形态）
+// 存量兜底：命中 901 初始化组的存量排除（组号/ID/文件名/跨界区间/作用域形态）
 // 在发射面一律跳过——否则它们会在强制 Include 之后把初始化规则重新删除。
 func TestBuildCorazaDirectives_storedInitExclusionsSkipped(t *testing.T) {
 	scopedExclusionFixture(t)
@@ -585,7 +585,7 @@ func TestBuildCorazaDirectives_storedInitExclusionsSkipped(t *testing.T) {
 	}
 }
 
-// 历史修复 存在性门（CRS 更新风险排查）：基础设施文件缺失时强制 Include 必须跳过
+// 存在性门（CRS 更新风险排查）：基础设施文件缺失时强制 Include 必须跳过
 // （coraza 对缺失精确路径 Include 是致命错误，配置加载失败=全站停摆）。
 func TestBuildCorazaDirectives_infraIncludeGuardedByExistence(t *testing.T) {
 	scopedExclusionFixture(t)
@@ -616,7 +616,7 @@ func TestBuildCorazaDirectives_infraIncludeGuardedByExistence(t *testing.T) {
 	}
 }
 
-// 历史修复（历史，行为钉测取代 历史修复 实现文件名钉）：crsxc scope=组合键哈希
+// （行为钉测取代实现文件名钉）：crsxc scope=组合键哈希
 // （ips 字面+排序后 listRefs 的 sha256[:12]）——身份不变量：
 //
 //	①条目重排不改名（位置无关——旧「组合首次出现序」下重排使旧名承载他条目
@@ -679,11 +679,11 @@ func TestCRSXCScope_hashNamingIsContentIdentity(t *testing.T) {
 	// ③ listRefs 顺序无关：[a,b] 与 [b,a] 同键同名（名单须真实存在——引用
 	// 悬空时合并集为空被跳过发射）。
 	_, database := newClusterTestService(t)
-	resL1, err := database.Exec(`INSERT INTO security_ip_lists (name, entries) VALUES ('r77l1', '[{"value":"1.1.1.1","remark":""}]')`)
+	resL1, err := database.Exec(`INSERT INTO security_ip_lists (name, entries) VALUES ('legacy-list-1', '[{"value":"1.1.1.1","remark":""}]')`)
 	if err != nil {
 		t.Fatalf("seed list 1: %v", err)
 	}
-	resL2, err := database.Exec(`INSERT INTO security_ip_lists (name, entries) VALUES ('r77l2', '[{"value":"3.3.3.3","remark":""}]')`)
+	resL2, err := database.Exec(`INSERT INTO security_ip_lists (name, entries) VALUES ('legacy-list-2', '[{"value":"3.3.3.3","remark":""}]')`)
 	if err != nil {
 		t.Fatalf("seed list 2: %v", err)
 	}

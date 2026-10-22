@@ -22,7 +22,7 @@ import (
 )
 
 func TestCaddyLifecycleHandlers_wait_for_rule_operation_lock(t *testing.T) {
-	// 历史问题：测试隔离——注入临时 pause/pid 路径与失败命令桩，避免
+	// 测试隔离——注入临时 pause/pid 路径与失败命令桩，避免
 	// 写真实 /tmp/lazy-balancer-caddy-paused 或执行真实 caddy run/stop。
 	// 命令桩恒失败，锁释放后的 handler 快速返回，不会走到 nil caddyService。
 	oldPause, oldPidFile := caddyPauseFile, caddySupervisorPidFile
@@ -296,7 +296,7 @@ func TestStopCaddy_returns_500_when_stop_command_fails(t *testing.T) {
 func TestValidateConfig_validates_submitted_config(t *testing.T) {
 	// 2026-09-06 裁定 ④' 收口：本端点改走 caddy CLI 真 validate-only——校验
 	// 零运行时扰动（与 apidocs「不触发 Caddy」承诺对齐）；CLI 不可用回退
-	// 历史问题-c 的 load+回弹口径。
+	// c 的 load+回弹口径。
 	newBackupTestHandlers(t)
 	requests := 0
 	fakeCaddy := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
@@ -367,7 +367,7 @@ func TestValidateConfig_validates_submitted_config(t *testing.T) {
 		t.Fatalf("CLI 校验路径不应触碰 admin（requests=%d, want 0）", requests)
 	}
 
-	// And：CLI 不可用回退——valid 用例回到 历史问题-c 的 load+回弹（2 次 /load）。
+	// And：CLI 不可用回退——valid 用例回到 -c 的 load+回弹（2 次 /load）。
 	h.caddyService.SetCLIValidatorForTest(func(rendered []byte) error {
 		return services.ErrCLIValidatorUnavailable
 	})
@@ -397,7 +397,7 @@ func TestGetUpstreamHealth_returnsBadGatewayWithoutLeakingCollectorError(t *test
 	}
 }
 
-// 历史问题: PutCaddyConfig 对 chunked/未知 ContentLength 的超大请求体（绕过预检、
+// PutCaddyConfig 对 chunked/未知 ContentLength 的超大请求体（绕过预检、
 // 经 MaxBytesReader 拦截）须映射 413，与导入路径口径一致，而非统一 400。
 func TestPutCaddyConfig_oversized_unknown_length_body_returns_413(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -417,7 +417,7 @@ func TestPutCaddyConfig_oversized_unknown_length_body_returns_413(t *testing.T) 
 	}
 }
 
-// 历史问题: 键集合一致性——planConfigChanges 中归属「Caddy配置」分组的 add() 键
+// 键集合一致性——planConfigChanges 中归属「Caddy配置」分组的 add() 键
 // 必须与 UpdateConfig PUT SQL 实际更新的同分组列集合相等（防止变更提示与实际写入漂移）。
 func TestCaddySectionKeys_matchUpdateSQL(t *testing.T) {
 	changesSrc, err := os.ReadFile("config_changes.go")
@@ -466,7 +466,7 @@ func TestCaddySectionKeys_matchUpdateSQL(t *testing.T) {
 	}
 }
 
-// 历史修复（历史发现）：手动重载失败必须留痕（操作者归因 + 错误详情）——
+// 手动重载失败必须留痕（操作者归因 + 错误详情）——
 // 此前仅成功路径写「重载」审计，失败只有 recordCaddyApplyResult 的系统级
 // 「应用失败」，无法追溯"谁触发的手动重载、为何失败"。
 func TestReloadCaddy_records_failure_audit_with_error_detail(t *testing.T) {
@@ -496,7 +496,7 @@ func TestReloadCaddy_records_failure_audit_with_error_detail(t *testing.T) {
 		t.Fatalf("status=%d body=%s, want 500", response.Code, response.Body.String())
 	}
 	var detail string
-	// 历史修复（历史）：failure 结果码补中文映射后渲染为「结果：失败」（此前
+	// failure 结果码补中文映射后渲染为「结果：失败」（此前
 	// 未映射原样输出英文 "failure"），断言随渲染口径同步。
 	if err := db.AuditDB.QueryRow("SELECT COALESCE(detail,'') FROM audit_log WHERE action='重载失败' AND detail LIKE '%结果：失败%'").Scan(&detail); err != nil {
 		t.Fatalf("reload failure audit row missing: %v", err)
@@ -506,8 +506,8 @@ func TestReloadCaddy_records_failure_audit_with_error_detail(t *testing.T) {
 	}
 }
 
-// 裁定 2026-09-07 历史修复：撤 UpdateConfig 的 pre-tx /load 探针（与 ④'「探针已撤除」
-// 对齐；SQL 失败分支不再有已交换的运行配置需回弹=历史修复 根因消解）。
+// 裁定 2026-09-07：撤 UpdateConfig 的 pre-tx /load 探针（与 ④'「探针已撤除」
+// 对齐；SQL 失败分支不再有已交换的运行配置需回弹= 根因消解）。
 func TestUpdateConfig_appliesExactlyOnce(t *testing.T) {
 	newBackupTestHandlers(t)
 	var loads int
@@ -536,13 +536,13 @@ func TestUpdateConfig_appliesExactlyOnce(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：监督器在场（pid 标记）但 admin 等待超时——不得落
+// 监督器在场（pid 标记）但 admin 等待超时——不得落
 // 直启回退。修复前超时后直启 caddy：与活监督器双启抢 127.0.0.1:2019/监听端口，
 // 败者触发监督器崩溃重拉 churn（败者=监督器实例时无限循环+就绪探针被幸存实例
 // 应答→reapply_last_good churn；败者=直启实例时假 500）。修复后返回明确错误，
 // 留给监督器继续拉起。
 func TestStartCaddy_supervisorTimeoutDoesNotDirectSpawn(t *testing.T) {
-	// Given：监督器标记在场（pid 存活——历史问题 起在场判定含 pid 校验，
+	// Given：监督器标记在场（pid 存活——自此在场判定含 pid 校验，
 	// 伪 /proc 种活 pid）+ admin 死端口不就绪 + 调小委托等待
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "supervisor.pid")
@@ -582,9 +582,9 @@ func TestStartCaddy_supervisorTimeoutDoesNotDirectSpawn(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：监督器 pid 标记在场但 pid 已死（监督器被杀/容器
+// 监督器 pid 标记在场但 pid 已死（监督器被杀/容器
 // 异常重启残留）——陈旧标记不得让 startCaddy 走委托路径空等超时后报错；
-// 应落直启（与标记不在场同语义）。历史修复（历史）：直启路径不再删除
+// 应落直启（与标记不在场同语义）。直启路径不再删除
 // 陈旧标记——标记留存无害（supervisorAlive 按 pid 存活判定消化），而误删
 // 监督器并发首写的在位标记会永久失标（直启与监督器拉起双启抢口）。
 func TestStartCaddy_staleSupervisorMarkerFallsBackToDirectSpawn(t *testing.T) {
@@ -619,7 +619,7 @@ func TestStartCaddy_staleSupervisorMarkerFallsBackToDirectSpawn(t *testing.T) {
 	// When
 	err := startCaddy(fakeAdmin.URL)
 
-	// Then：直启成功 + 陈旧标记留存但不再劫持后续判定（历史修复：直启路径不删
+	// Then：直启成功 + 陈旧标记留存但不再劫持后续判定（直启路径不删
 	// 标记；死 pid 由 supervisorAlive 的存活校验消化，下次 startCaddy 仍直启）
 	if err != nil {
 		t.Fatalf("陈旧监督器标记应走直启: %v", err)
@@ -637,7 +637,7 @@ func TestStartCaddy_staleSupervisorMarkerFallsBackToDirectSpawn(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：supervisorAlive 不排僵尸态——监督器 kill -9 后
+// supervisorAlive 不排僵尸态——监督器 kill -9 后
 // 父进程（PID1 app，Go 不回收非 exec 子进程）未回收期间僵尸滞留 /proc
 // （目录在场、状态字节 Z）。修复前只验目录在场 → 恒判活 → startCaddy 恒
 // 委托空等 5s 超时报错，直启兜底永不可达。修复后读 /proc/<pid>/stat 状态
@@ -717,7 +717,7 @@ func TestUpdateConfig_samplingContractOnlyAdaptiveOffFull(t *testing.T) {
 	}
 }
 
-// 历史问题-6（历史）：预览与保存共用同一组校验——保存必 400 的载荷
+// 预览与保存共用同一组校验——保存必 400 的载荷
 // 不得在预览给出「可变更」清单。
 func TestPreviewConfigUpdate_matchesSaveSideValidation(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -763,7 +763,7 @@ func TestPreviewConfigUpdate_matchesSaveSideValidation(t *testing.T) {
 	}
 }
 
-// 历史问题-2（历史）：apply 失败且回弹也失败时，除响应/审计外必须持久化
+// apply 失败且回弹也失败时，除响应/审计外必须持久化
 // caddy_apply_error 横幅（重启后真实失败仍可见）。
 func TestUpdateConfig_rollbackFailurePersistsApplyBanner(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
@@ -802,7 +802,7 @@ func TestUpdateConfig_rollbackFailurePersistsApplyBanner(t *testing.T) {
 	}
 }
 
-// 历史问题-5（历史裁定）：安全事件保留两列 0=自动语义废除，写侧 1..max。
+// 安全事件保留两列 0=自动语义废除，写侧 1..max。
 func TestUpdateConfig_rejectsZeroRetentionValues(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	gin.SetMode(gin.TestMode)

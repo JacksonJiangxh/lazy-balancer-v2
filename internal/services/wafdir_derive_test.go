@@ -50,7 +50,7 @@ func TestConfigureWafDirs_propagatesThreatWafDir(t *testing.T) {
 	}
 }
 
-// 历史问题：ConfigureWafDirs 必须是全部 WAF 路径的单点派生真源——此前
+// ConfigureWafDirs 必须是全部 WAF 路径的单点派生真源——此前
 // CRS 活树/快照/dist、xdb 与指令目录各自硬编码 /app，data_dir ≠ /app/data
 // 时写侧散落到数据卷之外、读侧（索引/渲染）仍读 /app，安全链静默不渲染。
 func TestConfigureWafDirs_derivesAllWafPaths(t *testing.T) {
@@ -76,7 +76,7 @@ func TestConfigureWafDirs_derivesAllWafPaths(t *testing.T) {
 		{"crawlerDistSeedFile", crawlerDistSeedFile, filepath.Join(wantDist, "crawler-ip-lists.seed.json")},
 		// 爬虫运行快照同属数据卷派生面（root 服务写、插件读）。
 		{"crawlerIPListFile", crawlerIPListFile, filepath.Join(dataDir, "crawler-ip-lists.json")},
-		// 历史问题-08：审计日志与摄取 offset 同属派生面（此前硬编码 /app）。
+		// 审计日志与摄取 offset 同属派生面（此前硬编码 /app）。
 		{"auditLogPath", auditLogPath, filepath.Join(parent, "logs", "waf-audit", "audit.log")},
 		{"securityEventsOffsetPath", securityEventsOffsetPath, filepath.Join(dataDir, "security_events.offset")},
 	}
@@ -98,7 +98,7 @@ func TestConfigureWafDirs_containerDefaultKeepsAppPaths(t *testing.T) {
 		t.Fatalf("容器默认路径被改写: crs=%q snapshot=%q dist=%q xdb=%q/%q index=%q",
 			crsLiveDir, crsSnapshotDir, crsDistDir, ip2regionLivePath, ip2regionDistPath, CRSRuleIndexDir)
 	}
-	// 历史问题-08：容器默认形态保持既有审计日志/offset 路径逐字节一致。
+	// 容器默认形态保持既有审计日志/offset 路径逐字节一致。
 	if auditLogPath != "/app/logs/waf-audit/audit.log" || securityEventsOffsetPath != "/app/data/security_events.offset" {
 		t.Fatalf("容器默认审计路径被改写: audit=%q offset=%q", auditLogPath, securityEventsOffsetPath)
 	}

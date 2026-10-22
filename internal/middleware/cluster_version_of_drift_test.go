@@ -1,8 +1,8 @@
 package middleware
 
-// 历史问题-3：global_config 集群版本触发器 OF 清单的单源漂移护栏。
+// global_config 集群版本触发器 OF 清单的单源漂移护栏。
 // 漏列故障形态：新增「仅写漏列」的端点/直改 SQL 时不 bump cluster_version，
-// 稳态变更经 304 门滞留主节点（历史修复 autoban 六列、历史问题 自动备份组均曾因
+// 稳态变更经 304 门滞留主节点（autoban 六列、自动备份组均曾因
 // 同类遗漏修过）。故用两条机器断言钉住：①ClusterBasicSettings（同步快照
 // 契约）的每个 JSON 字段必须命中清单；②每个补列都能独立触发 bump。
 

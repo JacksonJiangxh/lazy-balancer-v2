@@ -1,6 +1,6 @@
 package mcpserver
 
-// 历史问题-1 修复钉：MCP 只读探测集（ReadOnlyProbeTools）↔ REST 只读白名单
+// 修复钉：MCP 只读探测集（ReadOnlyProbeTools）↔ REST 只读白名单
 // （auditpolicy.readOnlyWriteRoutes）机械互检。此前钉测试仅单向防过曝
 // （非 GET 工具可见 ⇒ 必在探测集），缺两个反向：
 // ① 探测集每项须真实对应 REST 只读路由（陈旧/错拼项 → 工具可见但恒 403）；
@@ -11,7 +11,7 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// ginPath 生产实现在 tool_visibility.go（历史修复 起可见性按
+// ginPath 生产实现在 tool_visibility.go（自此可见性按
 // "METHOD /api/v1"+ginPath(spec.path) 匹配 admin 路由集合）；外部测试包经
 // export_test.go 的 GinPathForTest 共享。
 

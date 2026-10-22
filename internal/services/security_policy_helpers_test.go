@@ -1,6 +1,6 @@
 package services
 
-// 历史问题（历史）：GetSecurityPolicyForRule 的 ORDER BY policy_id DESC
+// GetSecurityPolicyForRule 的 ORDER BY policy_id DESC
 // 口径是 v2.2.0 前的单策略语义（与多策略「首绑定=最小 id」相反），生产面零
 // 调用（生成路径走 loadSecurityPolicyContext / GetSecurityPoliciesForRule），
 // 从 services/security.go 退役为本测试专用 helper——SQL 原样保留，既有调用方

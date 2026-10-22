@@ -8,7 +8,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { PAGE_IDS } from '../src/utils/pageIds.ts'
-import { section, source } from './_helpers.ts'
+import { section, source, member } from './_helpers.ts'
 
 test('大屏全屏分支不进 AppLayout（侧栏顶栏不得渲染）', () => {
   const app = source('src/App.vue')
@@ -62,4 +62,26 @@ test('威胁大屏死选择器清理与「被攻击目标」空态文案', () =>
   assert.doesNotMatch(page, /\.scanline/)
   assert.doesNotMatch(page, /\.viewport-grid/)
   assert.match(page, /<div v-else class="empty">暂无目标数据<\/div>/)
+})
+
+test('统计响应窗口与当前窗口不一致时丢弃', () => {
+  const page = source('src/views/security/ThreatScreen.vue')
+  const statsTask = section(page, 'const statsTask = usePollingTask', '// ============ 逐请求正常流量事件流')
+  assert.match(statsTask, /if \(res\.data\.hours !== windowHours\.value\) return/)
+})
+
+test('正常光流空洞标记贯通到错误状态', () => {
+  const page = source('src/views/security/ThreatScreen.vue')
+  const flowTask = section(page, 'const flowTask = usePollingTask', '// ============ 引擎装载')
+  assert.match(flowTask, /gap\?: boolean/)
+  assert.match(flowTask, /gap_skipped\?: number/)
+  assert.match(flowTask, /flowError\.value = data\.gap === true/)
+})
+
+test('采集租约申请与续租失败复用光流错误横幅', () => {
+  const page = source('src/views/security/ThreatScreen.vue')
+  const acquire = member(page, 'function acquireCollector(): void')
+  assert.ok(acquire.includes('.then(() => { collectorError.value = false })'))
+  assert.ok(acquire.includes('.catch(() => { collectorError.value = true })'))
+  assert.ok(page.includes('v-if="flowError || attackFlowError || collectorError"'))
 })

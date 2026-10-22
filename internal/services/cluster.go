@@ -24,16 +24,16 @@ var (
 	ErrInvalidRegisterToken = errors.New("注册令牌无效或已过期")
 	ErrNodeNotFound         = errors.New("节点不存在")
 	ErrInvalidClusterAuth   = errors.New("集群凭证无效")
-	// ErrNodeNotPending(历史问题-3):审批/拒绝动作命中非 pending 状态的节点
+	// ErrNodeNotPending:审批/拒绝动作命中非 pending 状态的节点
 	// (重复审批/已处理)——handler 侧映射 409。
 	ErrNodeNotPending = errors.New("节点不在待审批状态")
 	ErrAlreadyMaster  = errors.New("当前节点已是主节点")
-	// ErrNotMasterNode（历史问题）：请求已通过 handler 角色门，但在节点簿记
+	// ErrNotMasterNode：请求已通过 handler 角色门，但在节点簿记
 	// 写语句执行前角色已降级（TOCTOU）。handler 应映射 403，与 requireMaster
 	// 同文案。
 	ErrNotMasterNode       = errors.New("该操作仅允许在主节点执行")
 	ErrInvalidSyncInterval = errors.New("同步间隔需在 10-86400 秒之间")
-	// ErrSyncUsersLocked 系统数据恒同步不可禁用(历史问题:handler 映射 400)。
+	// ErrSyncUsersLocked 系统数据恒同步不可禁用。
 	ErrSyncUsersLocked = errors.New("系统数据为恒同步项（含用户/密钥/ACME），不允许禁用；证书随负载规则开关")
 )
 
@@ -62,7 +62,7 @@ func NewClusterService(database *sql.DB, dataDir string) *ClusterService {
 
 // clusterServices 按数据库句柄登记集群服务实例（与 syncDrainers 同模式），
 // 供主节点巡检周期（masterSyncServingRound，无 ClusterService 接收者的自由
-// 函数）触达提升后 pin 清理重试（历史问题-07）。用 *sql.DB 作键隔离测试实例；
+// 函数）触达提升后 pin 清理重试。用 *sql.DB 作键隔离测试实例；
 // 同一库可能登记多个实例（NewSyncService 内部也构造一个 ClusterService），
 // 而 pending pin 状态是实例本地的——因此按库保留全部实例、逐个重试，
 // 不依赖构造顺序决定谁是「当前」实例。
@@ -80,7 +80,7 @@ func registerClusterService(service *ClusterService) {
 	clusterServicesMu.Unlock()
 }
 
-// unregisterClusterService 移除单个实例（历史问题-06）：全局表以 *sql.DB 为键
+// unregisterClusterService 移除单个实例：全局表以 *sql.DB 为键
 // 且此前永不移除条目——测试/运行期重建 DB 时全局表强引用已 Close 的句柄，
 // 内存与其关联的 service 无法回收。测试 teardown 与显式释放路径调用本函数。
 func unregisterClusterService(service *ClusterService) {
@@ -100,9 +100,12 @@ func unregisterClusterService(service *ClusterService) {
 		clusterServices[service.db] = remaining
 	}
 	clusterServicesMu.Unlock()
+	// 同族句柄回收：三节哈希缓存以库句柄为键，注销即释放（防全局缓存强引用
+	// 已关闭句柄；未走注销的死条目由重建路径的 clusterDBHandleAlive 兜底剔除）。
+	forgetClusterSectionHashCache(service.db)
 }
 
-// clusterDBHandleAlive 报告句柄是否仍可 Ping（历史问题-06 的兜底回收：库已
+// clusterDBHandleAlive 报告句柄是否仍可 Ping（的兜底回收：库已
 // Close 而未见显式 unregister 时，查询路径顺手剔除死条目，防止全局表在
 // 测试/重建场景无限累积）。查询路径仅在主节点巡检与 Promote/BecomeSlave
 // 触发，Ping 成本可忽略。
@@ -149,7 +152,7 @@ func tokenHash(token string) string {
 	return hex.EncodeToString(hash[:])
 }
 
-// masterRoleConditionSQL 是节点簿记写语句的 SQL 级角色条件（历史问题）：
+// masterRoleConditionSQL 是节点簿记写语句的 SQL 级角色条件
 // handler 的 requireMaster 与本次写之间没有共享锁，BecomeSlave 可在窗口内
 // 提交 is_master=0——带该条件的写语句在降级后恒 0 行，消除「降级后仍审批/
 // 上报/改访问地址」的 TOCTOU 类别。
@@ -179,9 +182,16 @@ func permanentClusterToken(registrationSecret string) string {
 }
 
 func (s *ClusterService) GenerateRegisterToken(ctx context.Context, createdBy int, now time.Time) (string, time.Time, error) {
-	// 历史修复 令牌卫生：生成新令牌前作废所有未使用令牌（一次性语义——重新生成即让旧令牌
+	// 令牌卫生：生成新令牌前作废所有未使用令牌（一次性语义——重新生成即让旧令牌
 	// 失效），并顺带删除已过期记录（GC），避免令牌表无限增长、旧令牌残留可复用。
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM cluster_register_tokens WHERE (used_at IS NULL OR expires_at < ?) AND `+masterRoleConditionSQL, now.UTC()); err != nil {
+	// 作废与生成必须在同一事务：分两语句时 INSERT 失败会留下「旧令牌已删、新令牌
+	// 未落库」的空窗；并发两次生成也会交错各自作废，留下两枚有效令牌。
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("开始注册令牌事务: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM cluster_register_tokens WHERE (used_at IS NULL OR expires_at < ?) AND `+masterRoleConditionSQL, now.UTC()); err != nil {
 		return "", time.Time{}, fmt.Errorf("清理旧注册令牌: %w", err)
 	}
 	token, err := randomHex(32)
@@ -189,7 +199,7 @@ func (s *ClusterService) GenerateRegisterToken(ctx context.Context, createdBy in
 		return "", time.Time{}, err
 	}
 	expiresAt := now.UTC().Add(30 * time.Minute)
-	result, err := s.db.ExecContext(ctx, `INSERT INTO cluster_register_tokens (token_hash, expires_at, created_by, created_at) SELECT ?, ?, ?, ? WHERE `+masterRoleConditionSQL,
+	result, err := tx.ExecContext(ctx, `INSERT INTO cluster_register_tokens (token_hash, expires_at, created_by, created_at) SELECT ?, ?, ?, ? WHERE `+masterRoleConditionSQL,
 		tokenHash(token), expiresAt, createdBy, now.UTC())
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("保存注册令牌: %w", err)
@@ -199,7 +209,21 @@ func (s *ClusterService) GenerateRegisterToken(ctx context.Context, createdBy in
 		return "", time.Time{}, fmt.Errorf("读取注册令牌保存结果: %w", err)
 	}
 	if inserted != 1 {
-		return "", time.Time{}, s.masterScopeMissError(ctx, fmt.Errorf("保存注册令牌: 影响 %d 行", inserted))
+		// 事务内复核角色（同事务视图，回滚不会翻转已提交的降级）：降级窗口
+		// 统一 ErrNotMasterNode(403)；主节点下的 0 行是内部错误。
+		var masterNow bool
+		roleErr := tx.QueryRowContext(ctx, "SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&masterNow)
+		_ = tx.Rollback()
+		if roleErr != nil {
+			return "", time.Time{}, fmt.Errorf("复核节点角色: %w", roleErr)
+		}
+		if !masterNow {
+			return "", time.Time{}, ErrNotMasterNode
+		}
+		return "", time.Time{}, fmt.Errorf("保存注册令牌: 影响 %d 行", inserted)
+	}
+	if err := tx.Commit(); err != nil {
+		return "", time.Time{}, fmt.Errorf("提交注册令牌事务: %w", err)
 	}
 	return token, expiresAt, nil
 }
@@ -208,13 +232,13 @@ func (s *ClusterService) RegisterNode(ctx context.Context, req models.ClusterReg
 	if err := models.ValidateClusterAccessURL(req.AccessURL); err != nil {
 		return models.ClusterRegistration{}, err
 	}
-	// 历史问题-05：落库侧名字归一是最后一道闸（binding max=100 只覆盖 HTTP
+	// 落库侧名字归一是最后一道闸（binding max=100 只覆盖 HTTP
 	// 入口；服务层直调/旧客户端仍可传入超长或带控制字符的名字）。
 	req.Name = models.NormalizeClusterNodeName(req.Name)
 	if req.Name == "" {
 		return models.ClusterRegistration{}, models.ErrInvalidClusterNodeName
 	}
-	// 历史问题-06：自述 access_url 只在主机即注册来源 IP 时落库。该值随后被用作
+	// 自述 access_url 只在主机即注册来源 IP 时落库。该值随后被用作
 	// 服务控制/登录票据（Bearer 能力凭证）的投递地址——未校验时持有注册令牌
 	// 的一方可把票据引向任意第三方主机。不一致时按「未携带」处理：既有行的
 	// 管理员配置值由 COALESCE(NULLIF(?,''),access_url) 保留，新行留空回退
@@ -237,7 +261,7 @@ func (s *ClusterService) RegisterNode(ctx context.Context, req models.ClusterReg
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// 历史问题：事务内角色复核（SQL 级）。降级已提交则拒绝注册/覆盖，避免
+	// 事务内角色复核（SQL 级）。降级已提交则拒绝注册/覆盖，避免
 	// 旧主节点在降级窗口继续写入节点簿记。
 	var masterNow bool
 	if err := tx.QueryRowContext(ctx, "SELECT COALESCE(is_master,1) FROM global_config WHERE id=1").Scan(&masterNow); err != nil {
@@ -267,7 +291,7 @@ func (s *ClusterService) RegisterNode(ctx context.Context, req models.ClusterReg
 	err = tx.QueryRowContext(ctx, "SELECT id FROM nodes WHERE ip_address=? AND port=?", req.IPAddress, req.Port).Scan(&nodeID)
 	switch {
 	case err == nil:
-		// 历史问题：命中既有行=upsert（保留重复注册/
+		// 命中既有行=upsert（保留重复注册/
 		// 重试的兼容路径），但若该行已批准，重置审批与令牌等于静默覆盖一个在运
 		// 节点——响应与审计必须点名被覆盖节点。协议不新增 replace 参数：旧从节点
 		// 重试注册不携带该标志，强制 409 会让滚动升级期重试永久失败。
@@ -280,7 +304,7 @@ func (s *ClusterService) RegisterNode(ctx context.Context, req models.ClusterReg
 			overwrittenNodeID = nodeID
 			overwrittenNodeName = existingName
 		}
-		// 历史问题(历史):access_url 是管理员配置态——重新注册不携带
+		// access_url 是管理员配置态——重新注册不携带
 		// (cluster_mode.go:49-51 恒空)时保留存量,不静默清空。
 		_, err = tx.ExecContext(ctx, `UPDATE nodes SET name=?, protocol=?, access_url=COALESCE(NULLIF(?,''),access_url), status='pending', is_approved=0, registration_secret=?, registration_secret_expires_at=NULL, cluster_token_hash=NULL, cluster_token_delivered=0, reported_version=0, health_json=NULL, last_seen=NULL WHERE id=?`, req.Name, req.Protocol, accessURL, tokenHash(secret), nodeID)
 	case errors.Is(err, sql.ErrNoRows):
@@ -300,7 +324,7 @@ func (s *ClusterService) RegisterNode(ctx context.Context, req models.ClusterReg
 	if err != nil {
 		return models.ClusterRegistration{}, fmt.Errorf("更新待审批节点: %w", err)
 	}
-	// 历史问题：nodes 不在 cluster_version 触发器清单（middleware/cluster_version.go
+	// nodes 不在 cluster_version 触发器清单（middleware/cluster_version.go
 	// 依赖显式 bump）——注册/覆盖改变节点拓扑后必须同事务 bump，否则快照缓存键
 	// 不变，新节点的 node_sites 缺项，继承坐标静默不生效直至下一次无关 bump。
 	if err := BumpClusterVersion(ctx, tx); err != nil {
@@ -309,7 +333,7 @@ func (s *ClusterService) RegisterNode(ctx context.Context, req models.ClusterReg
 	if err := tx.Commit(); err != nil {
 		return models.ClusterRegistration{}, fmt.Errorf("提交节点注册: %w", err)
 	}
-	// 历史问题-05：同 IP:port 行被覆盖后旧分区哈希不再属于本次注册。
+	// 同 IP:port 行被覆盖后旧分区哈希不再属于本次注册。
 	s.clearSectionReport(nodeID)
 	return models.ClusterRegistration{RegistrationID: nodeID, RegistrationSecret: secret, OverwrittenNodeID: overwrittenNodeID, OverwrittenNodeName: overwrittenNodeName, AccessURLIgnored: accessURLIgnored}, nil
 }
@@ -320,7 +344,7 @@ func (s *ClusterService) UpdateNodeSiteCoordinates(ctx context.Context, nodeID i
 		return fmt.Errorf("开启节点站点坐标事务: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	// 历史问题：无变更保存=no-op——现值相同则不写库不 bump（「打开弹框原样
+	// 无变更保存=no-op——现值相同则不写库不 bump（「打开弹框原样
 	// 保存」不得放大为全集群快照重放；继承节点 0,0 原样保存保持继承不固化）。
 	var currentLat, currentLon float64
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(server_map_lat,0), COALESCE(server_map_lon,0) FROM nodes WHERE id=? AND `+masterRoleConditionSQL, nodeID).Scan(&currentLat, &currentLon); err != nil {
@@ -371,8 +395,11 @@ func (s *ClusterService) UpdateNodeAccessURL(ctx context.Context, nodeID int, ac
 	return nil
 }
 
-func (s *ClusterService) ApproveNode(ctx context.Context, nodeID int) error {
-	result, err := s.db.ExecContext(ctx, `UPDATE nodes SET is_approved=1, status='online', registration_secret_expires_at=datetime('now','+24 hours'), cluster_token_hash=NULL, cluster_token_delivered=0 WHERE id=? AND status='pending' AND COALESCE(registration_secret,'')<>'' AND `+masterRoleConditionSQL, nodeID)
+func (s *ClusterService) ApproveNode(ctx context.Context, nodeID int, now time.Time) error {
+	// 注册密钥 24h 到期窗口用注入 now（同域 RegistrationStatus/票据族惯例）：
+	// 真实时钟会让到期边界无法确定性测试。
+	result, err := s.db.ExecContext(ctx, `UPDATE nodes SET is_approved=1, status='online', registration_secret_expires_at=?, cluster_token_hash=NULL, cluster_token_delivered=0 WHERE id=? AND status='pending' AND COALESCE(registration_secret,'')<>'' AND `+masterRoleConditionSQL,
+		now.UTC().Add(24*time.Hour), nodeID)
 	if err != nil {
 		return fmt.Errorf("批准节点: %w", err)
 	}
@@ -381,7 +408,7 @@ func (s *ClusterService) ApproveNode(ctx context.Context, nodeID int) error {
 		return fmt.Errorf("读取审批结果: %w", err)
 	}
 	if updated != 1 {
-		// 历史问题：先区分「已降级」（403 语义）与节点状态/存在性问题。
+		// 先区分「已降级」（403 语义）与节点状态/存在性问题。
 		isMaster, roleErr := RoleOf(ctx, s.db)
 		if roleErr != nil {
 			return fmt.Errorf("复核节点角色: %w", roleErr)
@@ -389,7 +416,7 @@ func (s *ClusterService) ApproveNode(ctx context.Context, nodeID int) error {
 		if !isMaster {
 			return ErrNotMasterNode
 		}
-		// 历史问题-3:0 行命中分判——节点存在但非 pending(重复审批/已拒绝)
+		// 0 行命中分判——节点存在但非 pending(重复审批/已拒绝)
 		// 返回 409 语义错误;不存在维持 404。
 		var status string
 		var secret sql.NullString
@@ -404,7 +431,7 @@ func (s *ClusterService) ApproveNode(ctx context.Context, nodeID int) error {
 	return nil
 }
 
-// RegistrationStatus 的 now 参数注入同域惯例(历史问题:原为唯一用真实时钟
+// RegistrationStatus 的 now 参数注入同域惯例（原为唯一用真实时钟
 // 的集群方法,24h 到期边界无法确定性测试)。
 func (s *ClusterService) RegistrationStatus(ctx context.Context, nodeID int, secret string, now time.Time) (models.ClusterRegistrationStatus, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -421,7 +448,7 @@ func (s *ClusterService) RegistrationStatus(ctx context.Context, nodeID int, sec
 		}
 		return models.ClusterRegistrationStatus{}, fmt.Errorf("读取注册状态: %w", err)
 	}
-	// 历史问题(历史):哈希比对改常量时间——与 HMAC 链路的 hmac.Equal 同口径。
+	// 哈希比对改常量时间——与 HMAC 链路的 hmac.Equal 同口径。
 	if storedSecretHash == "" || subtle.ConstantTimeCompare([]byte(storedSecretHash), []byte(tokenHash(secret))) != 1 || (secretExpiresAt.Valid && !secretExpiresAt.Time.After(now)) {
 		return models.ClusterRegistrationStatus{}, ErrInvalidClusterAuth
 	}
@@ -460,12 +487,23 @@ type clusterVersionExecutor interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }
 
+// NodeName 读取节点名（审计展示用），走本服务的库句柄——调用方不得另用
+// 全局库句柄回查（句柄不一致时会把审计对象错标到另一库的同 ID 节点）。
+// 节点不存在时返回空串与错误，由调用方回退「节点 #<id>」格式。
+func (s *ClusterService) NodeName(ctx context.Context, nodeID int) (string, error) {
+	var name string
+	if err := s.db.QueryRowContext(ctx, "SELECT COALESCE(name,'') FROM nodes WHERE id=?", nodeID).Scan(&name); err != nil {
+		return "", fmt.Errorf("读取节点名: %w", err)
+	}
+	return name, nil
+}
+
 func BumpClusterVersion(ctx context.Context, executor clusterVersionExecutor) error {
 	result, err := executor.ExecContext(ctx, "UPDATE global_config SET cluster_version=COALESCE(cluster_version,0)+1 WHERE id=1")
 	if err != nil {
 		return fmt.Errorf("递增集群版本: %w", err)
 	}
-	// 历史问题：global_config 行缺失/异常时 Exec 返回 0 行且 nil error，集群
+	// global_config 行缺失/异常时 Exec 返回 0 行且 nil error，集群
 	// 版本不递增，从节点可能继续 304 不拉新内容——按 fail-visible 报错。
 	updated, err := result.RowsAffected()
 	if err != nil {
@@ -487,7 +525,7 @@ func (s *ClusterService) Promote(ctx context.Context) error {
 	if isMaster {
 		return ErrAlreadyMaster
 	}
-	// 历史问题-06：角色翻转显式失效快照缓存（幂等零成本）。缓存键只有
+	// 角色翻转显式失效快照缓存（幂等零成本）。缓存键只有
 	// version/ownership/开关，降级期间在途的 master-only Run 可写过库且
 	// is_master=0 不 bump 版本——若从降级到再升主之间没有发生 apply，旧缓存
 	// 内容会被当作权威重新对外提供。放在角色检查之后，成功/失败路径都覆盖。
@@ -512,14 +550,14 @@ func (s *ClusterService) Promote(ctx context.Context) error {
 			te.StartLoop("cluster-sync")
 		}
 	}()
-	// 历史问题：engine.StopLoop 只取消 daemon ctx，
+	// engine.StopLoop 只取消 daemon ctx，
 	// daemon 的 Stop 在另一 goroutine 异步执行——不显式排干则在途拉取（含已
 	// 通过 admission 的 apply）可能在升主提交后继续把从节点数据写回库。
 	// 排干失败（ctx 到期）即中止提升，不做半程角色翻转。
-	// 历史问题-06：同库可能登记多个同步服务实例（测试/重建），逐个排干——
+	// 同库可能登记多个同步服务实例（测试/重建），逐个排干——
 	// 只排干最后注册的一个会让其余实例的在途 apply 越过升主提交点。
 	if drainers := syncDrainersFor(s.db); len(drainers) > 0 {
-		// 历史问题：排干失败的返回路径同样必须重开准入（defer 必须先于
+		// 排干失败的返回路径同样必须重开准入（defer 必须先于
 		// DrainPulls 注册）。DrainPulls 自身已置 pullsStopped=true，原实现只在
 		// 成功后注册 defer：失败路径若 cluster-sync 已停（用户关闭）或
 		// TaskEngine()==nil，准入永久关闭——从节点「立即同步」被 beginPull 拒绝
@@ -530,7 +568,7 @@ func (s *ClusterService) Promote(ctx context.Context) error {
 				return fmt.Errorf("等待在途同步拉取结束: %w", err)
 			}
 		}
-		// 历史问题-02：排干成功后的任意返回路径都必须重开准入。成功升主后再降级
+		// 排干成功后的任意返回路径都必须重开准入。成功升主后再降级
 		// 也有 BecomeSlave 的显式重开，此处兜底保持不变量。
 	}
 	var registrationID int
@@ -547,7 +585,7 @@ func (s *ClusterService) Promote(ctx context.Context) error {
 	}
 	pendingCompensations := promotePendingCompensations(storedSyncError)
 	var oldToken string
-	// 历史问题（历史）：旧令牌仅用于提升成功后的脱离通知，
+	// 旧令牌仅用于提升成功后的脱离通知，
 	// 读取失败不阻断提升，但须留痕——与上下文显式错误处理对齐，不再静默吞错。
 	if err := s.db.QueryRowContext(ctx, "SELECT COALESCE(cluster_token,'') FROM global_config WHERE id=1").Scan(&oldToken); err != nil {
 		Logf("info", "Promote: 读取旧集群令牌失败，提升后的旧主节点脱离通知将跳过: %v", err)
@@ -561,16 +599,16 @@ func (s *ClusterService) Promote(ctx context.Context) error {
 	// 与 BecomeSlave 的反向清理对称：提升时同步清空从节点的同步残留
 	//（applied_version/sync_fingerprint/last_sync_error/注册确认失败计数），
 	// 避免新主节点带着旧集群的同步指纹与错误状态运行。
-	// 历史问题（历史裁定·设计声明）：nodes 表（含各从节点
+	// nodes 表（含各从节点
 	// cluster_token_hash）跨角色切换刻意保留——Promote/BecomeSlave 均只重置
 	// global_config，从不清空 nodes。拓扑连续性语义：脱离通知
 	// （notifyMasterDetach）只是 best-effort，旧主节点令牌撤销依赖其成功；
 	// 本节点降级后再提升时，旧 nodes 行即刻恢复权威，旧从节点持有的令牌
 	// 仍然有效，经手工 Resume/重新注册即可复活上报与同步——这是有意设计
 	// （主库清零后可凭从库副本恢复集群拓扑），不是令牌泄漏缺口。
-	// 历史问题-05(a)：last_sync 与 applied_version 同语义——旧集群的同步时间对
+	// (a)：last_sync 与 applied_version 同语义——旧集群的同步时间对
 	// 新主节点无意义；此前漏置 NULL 让 Status() 继续格式化旧集群时间（与
-	// BecomeSlave 的 历史问题 对称缺失）。
+	// BecomeSlave 的对称缺失）。
 	result, err := tx.ExecContext(ctx, `UPDATE global_config SET is_master=1, master_url='', cluster_token='', registration_id=0, registration_secret='', applied_version=0, sync_fingerprint='', last_sync_error='', registration_confirm_failures=0, last_sync=NULL, applied_waf_ref_hash='', applied_waf_ref_version=0 WHERE id=1`)
 	if err != nil {
 		return fmt.Errorf("重置主节点状态: %w", err)
@@ -591,10 +629,10 @@ func (s *ClusterService) Promote(ctx context.Context) error {
 		return fmt.Errorf("提交提升事务: %w", err)
 	}
 	promoted = true
-	// 历史问题-05：降级期间残留的主节点时代分区缓存不得沿用到再次升主。
+	// 降级期间残留的主节点时代分区缓存不得沿用到再次升主。
 	s.clearAllSectionReports()
 	ResetConfigDrift()
-	// 历史问题：升主后以本地 DB 重建爬虫运行快照——从节点期间的快照可能
+	// 升主后以本地 DB 重建爬虫运行快照——从节点期间的快照可能
 	// 陈旧/缺失（此前仅主节点 Prime/更新任务写该文件），升主后本节点将成为
 	// 插件文件的生产者。失败仅留痕（下轮更新/重启收敛）。
 	if err := RebuildCrawlerIPListSnapshot(); err != nil {
@@ -625,7 +663,7 @@ func (s *ClusterService) Promote(ctx context.Context) error {
 	SyncBusinessTaskDrivers()
 	// Promote 后补重装首槽：从节点期间规则库更新任务由角色门停跑，版本行
 	// 可能残留「auto_update 开、next_update 空」形态——与引擎装配同源武装
-	// （历史问题 通道），否则空槽只能靠重启恢复，升主节点静默停更。
+	// 否则空槽只能靠重启恢复，升主节点静默停更。
 	RearmSecurityLibrarySlots()
 	s.detachFromMaster(ctx, masterURL, oldToken)
 	return nil
@@ -663,7 +701,7 @@ func (s *ClusterService) detachFromMaster(ctx context.Context, masterURL, oldTok
 		Logf("info", "parse old cluster master URL after promotion: %v", err)
 		RecordAuditLog("system", "清理失败", "证书指纹", FormatAuditDetail("旧主节点地址无效", err.Error()), "")
 		// 地址损坏时无法定位旧主节点 pin 文件——磁盘残留为已知边界
-		// （历史修复 如实化）：残留仅在该 host:port 将来重新注册
+		// 残留仅在该 host:port 将来重新注册
 		// 为从节点时引发一次 PinMismatch，forget-pins 可恢复。
 		return
 	}
@@ -695,7 +733,7 @@ func (s *ClusterService) cleanupClusterPin(pinPath, auditURL string) {
 	defer s.pinCleanupMu.Unlock()
 	if err := os.Remove(pinPath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			// 历史问题(历史):pin 文件本就不存在(HTTP 注册从节点提升
+			// pin 文件本就不存在(HTTP 注册从节点提升
 			// 恒现——从未写过 pin)记「清理成功」审计是假阳性,跳过;
 			// pending 状态仍清空(无遗留需重试)。
 			s.pendingPinPath = ""
@@ -747,11 +785,11 @@ func normalizeSyncInterval(interval int) int {
 // 避免阈值在两处各自硬编码导致口径漂移。
 const nodeOfflineMultiplier = 2
 
-// nodeOfflineThreshold 节点离线阈值的统一口径（历史问题-02，历史）：
+// nodeOfflineThreshold 节点离线阈值的统一口径
 // max(nodeOfflineMultiplier×sync_interval, masterSyncOfflineThreshold 下限)。
-// 存量脏值（历史问题 前残留的 0/负数或 1-9s）按 60s 计，与从节点 run loop
+// 存量脏值（前残留的 0/负数或 1-9s）按 60s 计，与从节点 run loop
 // （cluster_sync.go）的 clamp 值一致：从节点实际以 60s 周期上报，若按原始脏值
-// （或 10s）计算阈值，会把两次上报之间的正常从节点误判为离线（历史问题）。
+// （或 10s）计算阈值，会把两次上报之间的正常从节点误判为离线。
 // ComputeNodeStatus（节点列表/登录票据）、updateOverview（总览在线数）与
 // masterSyncServingRound（巡检）共用本函数——此前巡检侧 max(2×global,120s) 而
 // UI 侧仅 2×clamp(sync_interval)，sync_interval∈[10,59] 时两口径分叉
@@ -790,7 +828,7 @@ func ComputeNodeStatus(approved bool, lastSeen time.Time, syncInterval int, now 
 	if !approved {
 		return "pending"
 	}
-	// 阈值口径集中在 nodeOfflineThreshold（历史问题-02）：脏值 clamp 与 120s 下限
+	// 阈值口径集中在 nodeOfflineThreshold：脏值 clamp 与 120s 下限
 	// 与巡检/总览同函数，UI 不再各自维护一套。
 	if lastSeen.IsZero() || now.Sub(lastSeen) > nodeOfflineThreshold(syncInterval) {
 		return "offline"
@@ -829,7 +867,7 @@ func notifyMasterDetach(ctx context.Context, masterURL, token, expectedPin strin
 	req.Header.Set("X-Cluster-Token", token)
 	client := &http.Client{Timeout: 3 * time.Second, Transport: newClusterDetachTransport(expectedPin)}
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	// 历史问题（历史）：旧主节点启用管理 HTTPS 后明文端口 301——按集群
+	// 旧主节点启用管理 HTTPS 后明文端口 301——按集群
 	// 同步同一契约对同主机 https Location 重放一次，否则脱离通知永远到不了。
 	resp, err := DoWithSameHostTLSUpgradeRedirect(client, req)
 	if err != nil {

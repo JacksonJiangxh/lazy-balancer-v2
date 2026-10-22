@@ -2,8 +2,8 @@ package handlers
 
 //         cluster_sync.go/cluster_status.go 节点写端点）
 //         cluster_status.go 加导出薄包装 ClearNodeSectionReports）
-//   历史修复   无令牌哈希节点恢复成 pending（不保留 approved 死行）
-//   历史修复   导入侧 upstream weight<1 响亮拒绝（不静默归一）
+//   无令牌哈希节点恢复成 pending（不保留 approved 死行）
+//   导入侧 upstream weight<1 响亮拒绝（不静默归一）
 
 import (
 	"context"
@@ -49,8 +49,8 @@ func a86SeedLiveAdmin(t *testing.T) {
 func a86ImportClusterRows(t *testing.T, h *Handlers, rows []map[string]any) *httptest.ResponseRecorder {
 	t.Helper()
 	a86SeedLiveAdmin(t)
-	body := r78BackupJSON(t, map[string][]map[string]any{"nodes": rows}, nil, []string{"cluster"})
-	return r78Import(h, t, body)
+	body := legacyBackupJSON(t, map[string][]map[string]any{"nodes": rows}, nil, []string{"cluster"})
+	return importBackupShared(h, t, body)
 }
 
 func TestNodesImportRowGate_rejectsMalformed(t *testing.T) {
@@ -118,8 +118,8 @@ func TestNodesImportRowGate_absentNodesKeepsLocal(t *testing.T) {
 	if _, err := db.DB.Exec(`INSERT INTO nodes (id,name,ip_address,port,is_approved,cluster_token_hash) VALUES (9,'keep','10.0.0.9',8000,1,'hash-keep')`); err != nil {
 		t.Fatal(err)
 	}
-	body := r78BackupJSON(t, nil, nil, []string{"users"})
-	rec := r78Import(h, t, body)
+	body := legacyBackupJSON(t, nil, nil, []string{"users"})
+	rec := importBackupShared(h, t, body)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -129,7 +129,7 @@ func TestNodesImportRowGate_absentNodesKeepsLocal(t *testing.T) {
 	}
 }
 
-// ── 历史修复：无哈希节点恢复成 pending ──
+// ──：无哈希节点恢复成 pending ──
 
 func TestNodeWithoutTokenHashRestoredAsPending(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -168,17 +168,17 @@ func TestNodeWithoutTokenHashRestoredAsPending(t *testing.T) {
 
 func TestAutoBackupSectionsVersionProtected(t *testing.T) {
 	h := newBackupTestHandlers(t)
-	// 三个节点本地迁移标记同族（历史修复 收敛）：备份携带非法形态导入跳过、
+	// 三个节点本地迁移标记同族：备份携带非法形态导入跳过、
 	// 本地标记不被覆盖、整型重扫不炸（启动迁移 Scan int 同形态）。
 	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_sections_version=1, threat_traffic_sample_unified_migrated=1, security_events_retention_migrated=1 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
-	body := r78BackupJSON(t, nil, map[string]any{
+	body := legacyBackupJSON(t, nil, map[string]any{
 		"auto_backup_sections_version":           "x",
 		"threat_traffic_sample_unified_migrated": "y",
 		"security_events_retention_migrated":     "z",
 	}, nil)
-	rec := r78Import(h, t, body)
+	rec := importBackupShared(h, t, body)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s, want 200（保护键跳过非法值而非落库）", rec.Code, rec.Body.String())
 	}
@@ -233,7 +233,7 @@ func TestImportCountsIncludeNodes(t *testing.T) {
 	}
 }
 
-// 结构性守卫（历史修复 建议）：configBackupTables 每张表必须在汇总标签清单
+// 结构性守卫：configBackupTables 每张表必须在汇总标签清单
 // 或显式豁免清单中，防新增表再次漏计数。
 func TestImportCountsDetailCoversAllBackupTables(t *testing.T) {
 	exempt := map[string]bool{
@@ -286,24 +286,24 @@ func TestApiDocsBackupSectionsMatchSingleSource(t *testing.T) {
 func TestImportAccessLogFormatGate(t *testing.T) {
 	t.Run("删除受保护字段被拒绝", func(t *testing.T) {
 		h := newBackupTestHandlers(t)
-		body := r78BackupJSON(t, nil, map[string]any{"access_log_format": "request>remote_ip -> delete"}, nil)
-		rec := r78Import(h, t, body)
+		body := legacyBackupJSON(t, nil, map[string]any{"access_log_format": "request>remote_ip -> delete"}, nil)
+		rec := importBackupShared(h, t, body)
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("status=%d body=%s, want 400", rec.Code, rec.Body.String())
 		}
 	})
 	t.Run("非字符串被拒绝", func(t *testing.T) {
 		h := newBackupTestHandlers(t)
-		body := r78BackupJSON(t, nil, map[string]any{"access_log_format": 42}, nil)
-		rec := r78Import(h, t, body)
+		body := legacyBackupJSON(t, nil, map[string]any{"access_log_format": 42}, nil)
+		rec := importBackupShared(h, t, body)
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("status=%d body=%s, want 400", rec.Code, rec.Body.String())
 		}
 	})
 	t.Run("合法格式导入并归一脱敏行", func(t *testing.T) {
 		h := newBackupTestHandlers(t)
-		body := r78BackupJSON(t, nil, map[string]any{"access_log_format": "request>remote_ip -> src"}, nil)
-		rec := r78Import(h, t, body)
+		body := legacyBackupJSON(t, nil, map[string]any{"access_log_format": "request>remote_ip -> src"}, nil)
+		rec := importBackupShared(h, t, body)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 		}
@@ -317,14 +317,14 @@ func TestImportAccessLogFormatGate(t *testing.T) {
 	})
 	t.Run("预览同门", func(t *testing.T) {
 		h := newBackupTestHandlers(t)
-		resp := r78ValidateResponse(t, h, r78BackupJSON(t, nil, map[string]any{"access_log_format": "request>remote_ip -> delete"}, nil))
+		resp := validateResponseShared(t, h, legacyBackupJSON(t, nil, map[string]any{"access_log_format": "request>remote_ip -> delete"}, nil))
 		if resp.Valid {
 			t.Fatalf("preview valid=true, want false（删除受保护字段）")
 		}
 	})
 }
 
-// ── 历史修复：导入侧 weight<1 拒绝 ──
+// ──：导入侧 weight<1 拒绝 ──
 
 func TestImportRejectsUpstreamWeightBelowOne(t *testing.T) {
 	rule := map[string]any{"caddy_id": "lb_w", "name": "w", "protocol": "http", "domain": "w.example.test", "listen_port": 18080, "enabled": 1}
@@ -348,11 +348,11 @@ func TestImportRejectsUpstreamWeightBelowOne(t *testing.T) {
 			if tc.weight != nil {
 				upstream["weight"] = tc.weight
 			}
-			body := r78BackupJSON(t, map[string][]map[string]any{
+			body := legacyBackupJSON(t, map[string][]map[string]any{
 				"lb_rules":  {rule},
 				"upstreams": {upstream},
 			}, nil, []string{"rules"})
-			rec := r78Import(h, t, body)
+			rec := importBackupShared(h, t, body)
 			if rec.Code != tc.want {
 				t.Fatalf("status=%d body=%s, want %d", rec.Code, rec.Body.String(), tc.want)
 			}
@@ -373,13 +373,13 @@ func TestConflictDisabledRulePausesCertJobs(t *testing.T) {
 	jobOf := func(ruleID, domain, status string) map[string]any {
 		return map[string]any{"rule_id": ruleID, "domain": domain, "status": status, "ca_provider_id": 0}
 	}
-	body := r78BackupJSON(t, map[string][]map[string]any{
+	body := legacyBackupJSON(t, map[string][]map[string]any{
 		"lb_rules":            {conflictA, conflictB, winner},
 		"upstreams":           {upstreamOf("lb_conflict_a", 9001), upstreamOf("lb_conflict_b", 9002), upstreamOf("lb_winner", 9003)},
 		"cert_jobs":           {jobOf("lb_conflict_a", "dup.example.test", "queued"), jobOf("lb_conflict_b", "dup.example.test", "queued"), jobOf("lb_winner", "winner.example.test", "queued")},
 		"certificate_configs": {dnsConfig},
 	}, map[string]any{"acme_email": "acme@example.test"}, nil)
-	rec := r78Import(h, t, body)
+	rec := importBackupShared(h, t, body)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -593,7 +593,7 @@ func TestV1ImportQueueFailureStillConverges(t *testing.T) {
 
 var errRequeueInjected = errors.New("requeue injected failure")
 
-// 历史问题：UpdateClusterNodeAccessURL 门控必须前置——导入窗口/从节点的
+// UpdateClusterNodeAccessURL 门控必须前置——导入窗口/从节点的
 // 请求体再畸形也先得 409/403 门控语义，不得先撞 JSON 解析 400（门控失真）。
 func TestUpdateClusterNodeAccessURL_importGatePrecedesBodyParse(t *testing.T) {
 	h := newBackupTestHandlers(t)

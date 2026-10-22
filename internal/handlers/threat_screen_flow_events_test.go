@@ -23,7 +23,7 @@ func TestGetThreatScreenFlowEvents_envelopesAndTranslatesCountries(t *testing.T)
 			t.Errorf("admin query=%q, want since=7&limit=1000", r.URL.RawQuery)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"enabled":true,"events":[{"seq":7,"country":"United States","at":1792351849814},{"seq":8,"country":"中国","province":"广东省","at":1792351849815}],"next_seq":8,"sample_n":1}`))
+		_, _ = w.Write([]byte(`{"enabled":true,"events":[{"seq":7,"country":"United States","at":1792351849814},{"seq":8,"country":"中国","province":"广东省","at":1792351849815}],"next_seq":8,"sample_n":1,"gap":true,"gap_skipped":3}`))
 	}))
 	defer admin.Close()
 
@@ -39,7 +39,7 @@ func TestGetThreatScreenFlowEvents_envelopesAndTranslatesCountries(t *testing.T)
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	for _, want := range []string{`"code":0`, `"data":{`, `"enabled":true`, `"country":"美国"`, `"country":"中国"`, `"province":"广东省"`, `"next_seq":8`, `"sample_n":1`} {
+	for _, want := range []string{`"code":0`, `"data":{`, `"enabled":true`, `"country":"美国"`, `"country":"中国"`, `"province":"广东省"`, `"next_seq":8`, `"sample_n":1`, `"gap":true`, `"gap_skipped":3`} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("body=%s, want %s", body, want)
 		}

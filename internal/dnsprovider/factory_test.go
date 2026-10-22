@@ -65,7 +65,7 @@ func TestNewProviderFromCredentials_explicit_mode_still_wins(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：空 mode 无法推断时的错误文案必须可诊断分流——两类凭证
+// 空 mode 无法推断时的错误文案必须可诊断分流——两类凭证
 // 并存=歧义（需显式 mode 消歧），全缺/不完整=缺失（需补齐凭证）。原实现两者
 // 同落 default 的「unsupported dns provider mode: 」（mode 为空），排障无法区分。
 func TestNewProviderFromCredentials_emptyModeErrorDistinguishesAmbiguityFromMissing(t *testing.T) {
@@ -93,7 +93,7 @@ func TestNewProviderFromCredentials_emptyModeErrorDistinguishesAmbiguityFromMiss
 	}
 }
 
-// 历史问题（历史）：UI 形态（auth_mode + app_id/app_token 等）是唯一真相——
+// UI 形态（auth_mode + app_id/app_token 等）是唯一真相——
 // 游离的消费层 mode 字段不得压过它。否则「保存前凭证测试」（UI 形态）与
 // 真实签发（mode 优先）会使用两套不同凭据，验证结论不覆盖实际链路。
 func TestNewProviderFromCredentials_authModeOverridesStrayMode(t *testing.T) {
@@ -110,7 +110,7 @@ func TestNewProviderFromCredentials_authModeOverridesStrayMode(t *testing.T) {
 	}
 }
 
-// 历史问题：UI 形态的 app_id/app_token 必须覆盖陈旧 api_token（掩码合并后
+// UI 形态的 app_id/app_token 必须覆盖陈旧 api_token（掩码合并后
 // 两形态并存的短暂状态），保证校验与签发使用同一组凭据。
 func TestNewProviderFromCredentials_uiFieldsOverrideStaleAPIToken(t *testing.T) {
 	provider, err := NewProviderFromCredentials(`{"auth_mode":"dnspod","api_token":"old,old","app_id":"123","app_token":"abc"}`)

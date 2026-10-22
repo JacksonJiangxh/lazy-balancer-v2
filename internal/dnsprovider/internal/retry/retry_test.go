@@ -41,7 +41,7 @@ func (t *countingTransport) RoundTrip(request *http.Request) (*http.Response, er
 	}, nil
 }
 
-// retryAfterTransport decorates responses from next with a 历史修复 header.
+// retryAfterTransport decorates responses from next with a header.
 type retryAfterTransport struct {
 	next http.RoundTripper
 }
@@ -71,7 +71,7 @@ func newRequestPath(t *testing.T, url, body string) *http.Request {
 
 func TestTransport_retries_transient_5xx_then_succeeds(t *testing.T) {
 	// Given: first two attempts of a non-create action return 500/502, third 200
-	// （历史问题 起 5xx 重试仅限非创建类动作；创建类见下方专项测试）
+	// （自此 5xx 重试仅限非创建类动作；创建类见下方专项测试）
 	base := &countingTransport{statuses: []int{http.StatusInternalServerError, http.StatusBadGateway}}
 	transport := &Transport{Base: base, InitialBackoff: time.Millisecond}
 
@@ -91,7 +91,7 @@ func TestTransport_retries_transient_5xx_then_succeeds(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：创建类请求（DNSPod Record.Create / 腾讯云
+// 创建类请求（DNSPod Record.Create / 腾讯云
 // CreateRecord）对 5xx 不重放——创建响应丢失时重试会在 DNS 侧产生无 ID
 // 幽灵 TXT（清理只按 ownership 记录 ID 删除，幽灵条目永不收敛）。
 func TestTransport_createRecord_5xx_is_not_replayed(t *testing.T) {
@@ -131,7 +131,7 @@ func TestTransport_createRecord_5xx_is_not_replayed(t *testing.T) {
 	}
 }
 
-// 历史问题：创建类请求遇 429 恒定重试——限流响应意味着记录未被创建，
+// 创建类请求遇 429 恒定重试——限流响应意味着记录未被创建，
 // 重放无幽灵条目风险。
 func TestTransport_createRecord_429_is_still_retried(t *testing.T) {
 	// Given：先 429 后 200
@@ -154,7 +154,7 @@ func TestTransport_createRecord_429_is_still_retried(t *testing.T) {
 	}
 }
 
-// 历史问题：非创建类动作（Record.List/Remove 等）5xx 维持现状重试。
+// 非创建类动作（Record.List/Remove 等）5xx 维持现状重试。
 func TestTransport_nonCreateAction_5xx_is_still_retried(t *testing.T) {
 	// Given：Record.List 先 503 后 200
 	base := &countingTransport{statuses: []int{http.StatusServiceUnavailable}}
@@ -237,7 +237,7 @@ func TestTransport_does_not_retry_client_errors(t *testing.T) {
 }
 
 func TestTransport_caps_wait_at_max_backoff(t *testing.T) {
-	// Given: 429 with a huge 历史修复; MaxBackoff clamps the wait
+	// Given: 429 with a huge; MaxBackoff clamps the wait
 	base := &countingTransport{statuses: []int{http.StatusTooManyRequests}}
 	transport := &Transport{Base: &retryAfterTransport{next: base}, InitialBackoff: time.Millisecond, MaxBackoff: 5 * time.Millisecond}
 

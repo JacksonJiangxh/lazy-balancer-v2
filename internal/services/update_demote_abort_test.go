@@ -1,6 +1,6 @@
 package services
 
-// 历史问题-01（历史）：demote 在途 Scheduled 中止——三库 Run 体的
+// demote 在途 Scheduled 中止——三库 Run 体的
 // runCtx 曾是独立 context.Background（crsupdate/ip2regionupdate/threatupdate），
 // 引擎 SetRole 对 Scheduled 在途的取消（rc.Ctx）传不进去，demote 后任务跑完、
 // 从节点写版本行/名单/规则树，打破只读不变量。修复：runCtx 派生自 rc.Ctx
@@ -213,7 +213,7 @@ func TestThreatRunUpdate_demoteOnLastSourceAbortsAsSkipped(t *testing.T) {
 	}
 }
 
-// 历史问题：手动取消必须立即打断任务内重试，且 manager/DB/审计与
+// 手动取消必须立即打断任务内重试，且 manager/DB/审计与
 // task_runs 同为 cancelled；不得重试后落 failed + 「更新失败」。
 func TestWireLibraryUpdates_manualCancelAlignsTerminalAndAudit(t *testing.T) {
 	tests := []struct {
@@ -422,7 +422,7 @@ func TestCrawlerRunUpdate_manualCancelDoesNotFailSourceOrAudit(t *testing.T) {
 	}
 }
 
-// 复核 历史问题：取消发生在安装循环入口前（op 从未执行）时，runWithInTaskRetry
+// 复核：取消发生在安装循环入口前（op 从未执行）时，runWithInTaskRetry
 // 返回 ctx 错误但 installErr 仍 nil；不得据此写 success/推进版本。
 func TestUpdateInstallEntryCancellationDoesNotWriteSuccess(t *testing.T) {
 	t.Run("crs", func(t *testing.T) {
@@ -490,7 +490,7 @@ func TestUpdateInstallEntryCancellationDoesNotWriteSuccess(t *testing.T) {
 	})
 }
 
-// 历史问题（历史）：取消发生在树交换之后（重载阶段）时，交换段已把
+// 取消发生在树交换之后（重载阶段）时，交换段已把
 // security_crs_version.version 与 live VERSION 落为新 tag——旧 cancel 路径只
 // 还原文件树（restoreBackup）不回滚版本行/标记，留下「旧树+新版本号」并被
 // 下轮 tag==current「已是最新」短路永久固化（ReconcileCRSState 因 liveV==dbV
@@ -559,7 +559,7 @@ func TestCRSUpdateRun_cancelDuringReloadRollsBackVersionRowAndMarker(t *testing.
 // liveV==dbV 也不修复——版本行没回滚，liveV 反而是旧的，对账会把 live 标
 // 记成新版本的假象固化）。修复=三态门 updateRunRole：!known（角色
 // 不可判定）按主节点口径执行同代回滚（主节点避免固化；真从节点多回滚一次
-// 由集群同步自愈）；known && !master（真降级）保持 历史问题-01 不回滚语义。
+// 由集群同步自愈）；known &&!master（真降级）保持 不回滚语义。
 //
 // 角色读失败形态：is_master 写入非布尔文本使 RoleOf 的 Scan 失败（DB 连接
 // 本身健康——回滚与 cancel 的版本行写入仍可用）。

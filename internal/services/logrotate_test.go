@@ -75,7 +75,7 @@ func TestRotatingFileWriter_Write_reopensAfterCloseFailure(t *testing.T) {
 	}
 }
 
-// 历史问题-1(历史):LogFileEnabled 恒 true 的用户裁定意图在裸二进制
+// LogFileEnabled 恒 true 的用户裁定意图在裸二进制
 // 部署落空——open() 不建父目录,/app/logs 不存在时恒回退 stdout。必须 MkdirAll。
 func TestNewRotatingFileWriter_createsParentDirs(t *testing.T) {
 	// Given: 不存在的嵌套父目录(模拟裸二进制无 /app/logs)
@@ -158,11 +158,11 @@ func TestTaskLogsHousekeeping_reportsDetails(t *testing.T) {
 	}
 }
 
-// 历史问题-01（历史）：security-events-ingestion daemon 停机时
+// security-events-ingestion daemon 停机时
 // audit.log 无守护无界增长（写侧在 Caddy 进程内持续追加，轮转仅由 daemon
 // 2s tick 驱动）——log-cleanup 任务体补 waf-audit 超阈兜底：audit.log 走
 // SecurityEventsPollOnce 全套安全链（daemon 在场时等价一次普通 tick）。
-// （历史：侧车退役，耗时随审计行内嵌流转。）
+// （侧车退役，耗时随审计行内嵌流转。）
 func TestRuntimeLogCleanupOnce_wafAuditFallbackWhenIngestionStopped(t *testing.T) {
 	oldDB, oldM, oldA := db.DB, db.MetricsDB, db.AuditDB
 	if err := db.Initialize(t.TempDir()); err != nil {
@@ -200,7 +200,7 @@ func TestRuntimeLogCleanupOnce_wafAuditFallbackWhenIngestionStopped(t *testing.T
 	}
 }
 
-// 历史问题：保留期清理删除证书任务日志须与写入侧共用 ruleID 写锁——
+// 保留期清理删除证书任务日志须与写入侧共用 ruleID 写锁——
 // 在途写入持锁期间清理必须等待（原实现无锁 os.Remove，与写侧
 // 「stat→轮转移位→append」交错可吞掉刚移位的新一代）。
 func TestTaskLogsHousekeeping_waitsForCertJobWriteLock(t *testing.T) {
@@ -251,7 +251,7 @@ func TestTaskLogsHousekeeping_waitsForCertJobWriteLock(t *testing.T) {
 	}
 }
 
-// 历史问题：tasks 根目录的保留期删除也必须与 appendTaskLogLine
+// tasks 根目录的保留期删除也必须与 appendTaskLogLine
 // 共用路径锁，并在锁内重读 ModTime；写入刚刷新的文件不得按扫描前旧状态删除。
 func TestTaskLogsHousekeeping_waitsForTaskLogWriteLock(t *testing.T) {
 	base := t.TempDir()
@@ -320,7 +320,7 @@ func TestTaskLogsHousekeeping_waitsForTaskLogWriteLock(t *testing.T) {
 	}
 }
 
-// —— 运行日志清理口径（历史修复，历史）——
+// 运行日志清理口径——
 
 // writeStaleAppLogCopy 在 dir 下写入一份超保留期的 app.log.* 副本。
 func writeStaleAppLogCopy(t *testing.T, dir, name string) {
@@ -335,7 +335,7 @@ func writeStaleAppLogCopy(t *testing.T, dir, name string) {
 	}
 }
 
-// 历史修复：log-cleanup 摘要行的「保留 N 月」必须来自单源 auditRetentionMonths
+// log-cleanup 摘要行的「保留 N 月」必须来自单源 auditRetentionMonths
 // （经 RuntimeCleanupResult.RetentionMonths 回填），不得在 wire/摘要层另行查库
 // 复算——同值两实现会在默认值/钳位逻辑变更时分裂（用户看到的保留期≠实际口径）。
 func TestRuntimeLogCleanupOnce_reportsRetentionMonthsSingleSource(t *testing.T) {
@@ -364,7 +364,7 @@ func TestRuntimeLogCleanupOnce_reportsRetentionMonthsSingleSource(t *testing.T) 
 	}
 }
 
-// 历史修复（回归形状）：保留月数配置越界（<1）时单源回退默认 3 月——摘要行与
+// （回归形状）：保留月数配置越界（<1）时单源回退默认 3 月——摘要行与
 // 删除口径必须同回退（此前两处各自实现，一侧漏改即分裂）。
 func TestRuntimeLogCleanupOnce_outOfRangeRetentionFallsBackToDefault(t *testing.T) {
 	initServicesDB(t)
@@ -383,7 +383,7 @@ func TestRuntimeLogCleanupOnce_outOfRangeRetentionFallsBackToDefault(t *testing.
 	}
 }
 
-// 历史修复②：库未初始化时不得整体跳过应用日志副本清理（此前 db 为 nil 直接
+// 库未初始化时不得整体跳过应用日志副本清理（此前 db 为 nil 直接
 // return，AppRemoved=0 静默跳过——与「清理不得静默跳过」口径相反）。
 func TestRuntimeLogCleanupOnce_nilDBStillCleansAppCopies(t *testing.T) {
 	oldDB, oldMetrics, oldAudit := db.DB, db.MetricsDB, db.AuditDB
@@ -408,7 +408,7 @@ func TestRuntimeLogCleanupOnce_nilDBStillCleansAppCopies(t *testing.T) {
 	}
 }
 
-// 历史修复③：运行日志文件未打开（runtimeLogFile 为空）时摘要行必须是显式
+// 运行日志文件未打开（runtimeLogFile 为空）时摘要行必须是显式
 // 「未启用」形态，而非静默零动作。
 func TestLogCleanupSummaryLine_disabledShape(t *testing.T) {
 	got := logCleanupSummaryLine("")

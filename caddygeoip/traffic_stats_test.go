@@ -59,7 +59,7 @@ func TestTrafficRecord_attackNormalBuckets(t *testing.T) {
 	}
 }
 
-// 历史问题：统计桶键与发射侧/校验侧同口径 TrimSpace——空白异形国名不得
+// 统计桶键与发射侧/校验侧同口径 TrimSpace——空白异形国名不得
 // 建出与正式国名并存的脏桶（前端会显示两个「中国」）。
 func TestTrafficRecord_trimsCountryKey(t *testing.T) {
 	resetTrafficState(t)
@@ -80,7 +80,7 @@ func TestTrafficRecord_trimsCountryKey(t *testing.T) {
 	}
 }
 
-// 历史问题：xdb 私网/保留段行的国家列为 "0"/"Reserved"，不是国家值——计数桶
+// xdb 私网/保留段行的国家列为 "0"/"Reserved"，不是国家值——计数桶
 // 与事件流都不得为其建键（聚合端点已过滤 ""/"0"/"Reserved"，两端口径统一）。
 func TestTrafficRecord_rejectsNonCountryKeys(t *testing.T) {
 	resetTrafficState(t)
@@ -112,7 +112,7 @@ func TestTrafficRecord_rejectsNonCountryKeys(t *testing.T) {
 	}
 }
 
-// 历史问题：xdb 中文异体国名（「美国」）与英文规范名必须归一到同一桶——
+// xdb 中文异体国名（「美国」）与英文规范名必须归一到同一桶——
 // 分键各自计数时，app 聚合端点按翻译后中文名重建 map（后写覆盖先写）会丢掉
 // 其中一桶的 attack/normal 计数。归一经 geoipnames.NormalizeCountry，与发射
 // 侧 geoipLocFor 同表同函数；「中国」保留不折叠。
@@ -207,7 +207,7 @@ func TestTrafficRecord_samplingFuse(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：翻秒丢计回归——秒戳与计数是打包原子态，跨秒瞬间的
+// 翻秒丢计回归——秒戳与计数是打包原子态，跨秒瞬间的
 // 并发计数不得被随后清零的上一秒计数吞掉。
 func TestTrafficRecord_noLostHitsAcrossSecondRollover(t *testing.T) {
 	resetTrafficState(t)
@@ -291,7 +291,7 @@ func TestTrafficSnapshotJSON_shape(t *testing.T) {
 }
 
 func TestTrafficAdminRoute_registerOnceAndServe(t *testing.T) {
-	// 历史问题（历史）：trafficRouteRegistered/trafficSeq 是零生产读写的
+	// trafficRouteRegistered/trafficSeq 是零生产读写的
 	// 死变量（去重语义由 Caddy admin 模块生命周期保证），已删除。此处改钉
 	// Routes() 的**形状契约**：恰一条 /lb/traffic-stats 路由——返回 0 条或
 	// 2 条都必须失败。

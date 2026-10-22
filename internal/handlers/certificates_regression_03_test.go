@@ -1,6 +1,6 @@
 package handlers
 
-// 历史修复（签发未入队不得伪装成功）。
+// （签发未入队不得伪装成功）。
 
 import (
 	"encoding/json"
@@ -28,7 +28,7 @@ func TestListCertJobs_statusUsesSharedDayGranularity(t *testing.T) {
 		t.Fatalf("seed threshold: %v", err)
 	}
 	// 基准取 UTC 并按 UTC 格式化：SQLite datetime 文本经 connection 解析为 UTC，
-	// 与 历史修复 截断口径测试同基准（本地格式化会引入 8 小时偏移）。
+	// 与截断口径测试同基准（本地格式化会引入 8 小时偏移）。
 	now := time.Now().UTC()
 	cases := []struct {
 		name       string
@@ -43,7 +43,7 @@ func TestListCertJobs_statusUsesSharedDayGranularity(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			expires := now.Add(tc.offset)
-			if _, err := db.DB.Exec(`INSERT OR REPLACE INTO cert_jobs (id,rule_id,domain,status,expires_at) VALUES (9201,'lb_r78_status','r78.test','issued',?)`,
+			if _, err := db.DB.Exec(`INSERT OR REPLACE INTO cert_jobs (id,rule_id,domain,status,expires_at) VALUES (9201,'lb_status_probe','probe.test','issued',?)`,
 				expires.Format("2006-01-02 15:04:05")); err != nil {
 				t.Fatalf("seed job: %v", err)
 			}
@@ -53,7 +53,7 @@ func TestListCertJobs_statusUsesSharedDayGranularity(t *testing.T) {
 				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
 			}
 			body := recorder.Body.String()
-			idx := strings.Index(body, `"rule_id":"lb_r78_status"`)
+			idx := strings.Index(body, `"rule_id":"lb_status_probe"`)
 			if idx < 0 {
 				t.Fatalf("seeded job missing from response")
 			}
@@ -70,10 +70,10 @@ func TestListCertJobs_statusUsesSharedDayGranularity(t *testing.T) {
 // 进入校验并被拒（非 200）——引用检查与删除对规则写路径原子。
 func TestDeleteCertificateConfig_holds_caddyOpMuAcrossReferenceCheckAndDelete(t *testing.T) {
 	h := newRuleFeatureTestHandlers(t)
-	if _, err := db.DB.Exec(`INSERT INTO certificate_configs (id,name,dns_provider,dns_credentials,enabled) VALUES (1,'r78','dnspod','{}',1)`); err != nil {
+	if _, err := db.DB.Exec(`INSERT INTO certificate_configs (id,name,dns_provider,dns_credentials,enabled) VALUES (1,'probe','dnspod','{}',1)`); err != nil {
 		t.Fatalf("seed config: %v", err)
 	}
-	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,description,protocol,domain,listen_port,strategy,enabled,enable_tls,tls_source,acme_config_id) VALUES ('lb_r78_delete','r78','','http','r78.example.test',8080,'weighted_round_robin',1,0,'manual',0)`); err != nil {
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,description,protocol,domain,listen_port,strategy,enabled,enable_tls,tls_source,acme_config_id) VALUES ('lb_delete_probe','probe','','http','probe.example.test',8080,'weighted_round_robin',1,0,'manual',0)`); err != nil {
 		t.Fatalf("seed rule: %v", err)
 	}
 	gin.SetMode(gin.TestMode)
@@ -93,8 +93,8 @@ func TestDeleteCertificateConfig_holds_caddyOpMuAcrossReferenceCheckAndDelete(t 
 			t.Error("删除路径在引用查询→DELETE 窗口未持 caddyOpMu")
 		}
 		go func() {
-			body := `{"name":"r78","protocol":"http","domain":"r78.example.test","listen_port":8080,"enable_tls":true,"tls_source":"acme_dns","acme_config_id":1}`
-			request := httptest.NewRequest(http.MethodPut, "/rules/lb_r78_delete", strings.NewReader(body))
+			body := `{"name":"probe","protocol":"http","domain":"probe.example.test","listen_port":8080,"enable_tls":true,"tls_source":"acme_dns","acme_config_id":1}`
+			request := httptest.NewRequest(http.MethodPut, "/rules/lb_delete_probe", strings.NewReader(body))
 			request.Header.Set("Content-Type", "application/json")
 			recorder := httptest.NewRecorder()
 			router.ServeHTTP(recorder, request)
@@ -132,7 +132,7 @@ func TestDeleteCertificateConfig_holds_caddyOpMuAcrossReferenceCheckAndDelete(t 
 	}
 }
 
-// 历史修复：证书清单按 (rule_id,domain) 聚合；同域不同规则不得折叠，
+// 证书清单按 (rule_id,domain) 聚合；同域不同规则不得折叠，
 // 较新的 disabled 行不得遮蔽另一规则已签发证书。
 func TestListCertificates_groupsByRuleAndDomain(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -189,7 +189,7 @@ func TestUpdateCertificateConfig_disableReferenceGuard(t *testing.T) {
 		{name: "enabled ACME reference", ruleEnabled: 1, enableTLS: 1, seedRule: true, wantStatus: http.StatusConflict, wantEnabled: true},
 		{name: "disabled rule reference", ruleEnabled: 0, enableTLS: 1, seedRule: true, wantStatus: http.StatusOK, wantEnabled: false},
 		// TLS 关闭的引用规则不消费 ACME 证书（签发/续期只服务 enable_tls=1）——
-		// 禁用守卫点名它属误报，必须放行（历史问题）。
+		// 禁用守卫点名它属误报，必须放行。
 		{name: "TLS-off enabled rule reference", ruleEnabled: 1, enableTLS: 0, seedRule: true, wantStatus: http.StatusOK, wantEnabled: false},
 		{name: "unreferenced", wantStatus: http.StatusOK, wantEnabled: false},
 	} {
@@ -347,7 +347,7 @@ func TestUpdateCertificateConfig_emptyFieldWithMaskNotSwallowed(t *testing.T) {
 	}
 }
 
-// —— 历史修复：签发未入队不得回 200「已创建 0 个任务」 ——
+// 签发未入队不得回 200「已创建 0 个任务」 ——
 
 func seedIssueRule(t *testing.T, caddyID, domain string) {
 	t.Helper()
@@ -372,13 +372,13 @@ func initIssueQueue(t *testing.T) *services.CAQueueManager {
 func TestIssueCertificate_pausedQueueReturns409(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	qm := initIssueQueue(t)
-	seedIssueRule(t, "lb_r78_paused", "r78-paused.example")
+	seedIssueRule(t, "lb_paused_probe", "paused.example")
 	qm.PauseAndDrain()
 	router := gin.New()
 	router.POST("/certificates/issue", h.IssueCertificate)
 
 	response := httptest.NewRecorder()
-	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/certificates/issue", strings.NewReader(`{"caddy_id":"lb_r78_paused"}`)))
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/certificates/issue", strings.NewReader(`{"caddy_id":"lb_paused_probe"}`)))
 
 	if response.Code != http.StatusConflict {
 		t.Fatalf("status=%d body=%s, want 409", response.Code, response.Body.String())
@@ -386,7 +386,7 @@ func TestIssueCertificate_pausedQueueReturns409(t *testing.T) {
 	if !strings.Contains(response.Body.String(), "暂停") {
 		t.Fatalf("body=%s, want 点名「队列已暂停」", response.Body.String())
 	}
-	assertLatestCertificateAudit(t, "规则：lb_r78_paused", "已跳过")
+	assertLatestCertificateAudit(t, "规则：lb_paused_probe", "已跳过")
 }
 
 // Given 规则处于删除/迁移屏障（blockedRules）。
@@ -395,14 +395,14 @@ func TestIssueCertificate_pausedQueueReturns409(t *testing.T) {
 func TestIssueCertificate_blockedRuleReturns409(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	qm := initIssueQueue(t)
-	seedIssueRule(t, "lb_r78_blocked", "r78-blocked.example")
-	token := qm.BlockJobsForRule("lb_r78_blocked")
-	t.Cleanup(func() { qm.UnblockJobsForRule("lb_r78_blocked", token) })
+	seedIssueRule(t, "lb_blocked_probe", "blocked.example")
+	token := qm.BlockJobsForRule("lb_blocked_probe")
+	t.Cleanup(func() { qm.UnblockJobsForRule("lb_blocked_probe", token) })
 	router := gin.New()
 	router.POST("/certificates/issue", h.IssueCertificate)
 
 	response := httptest.NewRecorder()
-	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/certificates/issue", strings.NewReader(`{"caddy_id":"lb_r78_blocked"}`)))
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/certificates/issue", strings.NewReader(`{"caddy_id":"lb_blocked_probe"}`)))
 
 	if response.Code != http.StatusConflict {
 		t.Fatalf("status=%d body=%s, want 409", response.Code, response.Body.String())
@@ -410,7 +410,7 @@ func TestIssueCertificate_blockedRuleReturns409(t *testing.T) {
 	if !strings.Contains(response.Body.String(), "屏障") {
 		t.Fatalf("body=%s, want 点名规则屏障原因", response.Body.String())
 	}
-	assertLatestCertificateAudit(t, "规则：lb_r78_blocked", "已跳过")
+	assertLatestCertificateAudit(t, "规则：lb_blocked_probe", "已跳过")
 }
 
 // Given 既有任务仍在本队列在途执行（qm.IsJobActive），状态 creating_order 已超
@@ -420,9 +420,9 @@ func TestIssueCertificate_blockedRuleReturns409(t *testing.T) {
 func TestIssueCertificate_inFlightJobReturns200WithZeroQueued(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	qm := initIssueQueue(t)
-	seedIssueRule(t, "lb_r78_inflight", "r78-inflight.example")
+	seedIssueRule(t, "lb_inflight_probe", "inflight.example")
 	result, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,message,updated_at)
-		VALUES ('lb_r78_inflight','r78-inflight.example','creating_order','active',datetime('now','-10 minutes'))`)
+		VALUES ('lb_inflight_probe','inflight.example','creating_order','active',datetime('now','-10 minutes'))`)
 	if err != nil {
 		t.Fatalf("seed job: %v", err)
 	}
@@ -430,12 +430,12 @@ func TestIssueCertificate_inFlightJobReturns200WithZeroQueued(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	qm.MarkJobRunningForTest("lb_r78_inflight", int(jobID))
+	qm.MarkJobRunningForTest("lb_inflight_probe", int(jobID))
 	router := gin.New()
 	router.POST("/certificates/issue", h.IssueCertificate)
 
 	response := httptest.NewRecorder()
-	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/certificates/issue", strings.NewReader(`{"caddy_id":"lb_r78_inflight"}`)))
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/certificates/issue", strings.NewReader(`{"caddy_id":"lb_inflight_probe"}`)))
 
 	if response.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s, want 200（在途保留）", response.Code, response.Body.String())
@@ -446,7 +446,7 @@ func TestIssueCertificate_inFlightJobReturns200WithZeroQueued(t *testing.T) {
 	if !strings.Contains(response.Body.String(), "执行中") {
 		t.Fatalf("body=%s, want 在途文案", response.Body.String())
 	}
-	assertLatestCertificateAudit(t, "规则：lb_r78_inflight", "已跳过")
+	assertLatestCertificateAudit(t, "规则：lb_inflight_probe", "已跳过")
 }
 
 // Given 批量签发全部目标都在途（无冷却、无失败）。

@@ -20,7 +20,7 @@ import (
 
 const apiBase = "https://dnsapi.cn/"
 
-// logf 是包级日志接缝（历史问题-3，镜像 ownership/acme 同型接缝）：运维告警
+// logf 是包级日志接缝（镜像 ownership/acme 同型接缝）：运维告警
 // 进入统一日志级别/格式链，而不是裸 log.Printf 另走一条链路。main 启动
 // 早期经 SetLogf 装配；零值回退标准库。
 var logf = func(level, format string, args ...any) { log.Printf(format, args...) }
@@ -74,7 +74,7 @@ func New(loginToken string) *Provider {
 	return &Provider{
 		LoginToken: loginToken,
 		client: &http.Client{
-			// 覆盖整个重试包络（3 次尝试 + 每次至多 30s 退避/历史修复
+			// 覆盖整个重试包络（3 次尝试 + 每次至多 30s 退避/
 			// 等待计入同一 RoundTrip），不能把退火循环中途掐断
 			Timeout: 90 * time.Second,
 			// 429/5xx 重试在传输层统一处理，瞬时 API 故障不再直接打挂挑战
@@ -89,7 +89,7 @@ func New(loginToken string) *Provider {
 
 // Present creates a distinct _acme-challenge TXT record (no upsert): a repeated
 // Present for the same name adds another record, and cleanup removes records by
-// ownership record ID / value (历史修复，历史).
+// ownership record ID / value.
 func (p *Provider) Present(ctx context.Context, zone, tokenFQDN, value string, ttl int) error {
 	zone = strings.TrimSuffix(zone, ".")
 	subDomain := strings.TrimSuffix(tokenFQDN, ".")
@@ -101,7 +101,7 @@ func (p *Provider) Present(ctx context.Context, zone, tokenFQDN, value string, t
 	}
 	recordID, err := p.createRecord(ctx, domainID, subDomain, value, ttl)
 	if errors.Is(err, errStaleDomainID) {
-		// 历史修复（历史）：缓存的 zone→domain_id 可能陈旧（域名被移出
+		// 缓存的 zone→domain_id 可能陈旧（域名被移出
 		// 账户/删除后重建，新 ID 与缓存不符），Record.Create 报「域名不存在」类
 		// 错误——作废该 zone 缓存重解析一次并重试一次；重解析或重试失败按最新
 		// 错误返回，不循环（域名真正移出时重解析即失败，见
@@ -113,8 +113,8 @@ func (p *Provider) Present(ctx context.Context, zone, tokenFQDN, value string, t
 		}
 		recordID, err = p.createRecord(ctx, freshID, subDomain, value, ttl)
 		if err == nil {
-			// 历史修复（历史）：自愈重试成功后回写 domainID=freshID（与
-			// cleanUp deleteOne 的 历史问题 回写对称）——否则 ownership 回滚删除
+			// 自愈重试成功后回写 domainID=freshID（与
+			// cleanUp deleteOne 的回写对称）——否则 ownership 回滚删除
 			// 与内存 owned 键仍打向陈旧 ID（删除必败/TXT 泄漏、CleanUp 键
 			// 不匹配静默零删除残留）。
 			domainID = freshID
@@ -128,7 +128,7 @@ func (p *Provider) Present(ctx context.Context, zone, tokenFQDN, value string, t
 		if err := p.ownership.Add(record); err != nil {
 			rollbackErr := p.deleteRecord(ctx, domainID, recordID)
 			if rollbackErr != nil {
-				// 历史修复（历史）：ownership.Add 失败且回滚删除亦失败——TXT 已落
+				// ownership.Add 失败且回滚删除亦失败——TXT 已落
 				// DNS，而 ownership 无条目可追踪（「删除失败不 Remove」的前提不
 				// 成立）。告警留痕 + 回填内存兜底表：cleanUp 的 ownership 分支会
 				// 排空兜底表并重试删除，避免该记录永久残留（无追踪窗口收口）。
@@ -161,10 +161,10 @@ func (p *Provider) CleanUpValue(ctx context.Context, zone, tokenFQDN, value stri
 
 // cleanUp 是 CleanUp/CleanUpValue 的共享实现（按值定向删除+陈旧条目清理）。
 //
-// 历史修复（历史登记）：本函数与 internal/dnsprovider/tencent/tencent.go 的
+// 本函数与 internal/dnsprovider/tencent/tencent.go 的
 // cleanUp 是同构双实现（有意保留——两者底层 SDK/记录 ID 类型不同，抽象共享
 // 收益低于耦合成本）。任一侧修改删除/自愈/兜底排空逻辑时，MUST 同步另一侧
-// 并保持语义一致（domain-id 自愈、ownership 条目留存、历史修复 兜底排空）。
+// 并保持语义一致（domain-id 自愈、ownership 条目留存、兜底排空）。
 func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, byValue bool) error {
 	zone = strings.TrimSuffix(zone, ".")
 	subDomain := strings.TrimSuffix(tokenFQDN, ".")
@@ -207,7 +207,7 @@ func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, b
 	deleteOne := func(recordID, value string) error {
 		err := p.deleteRecord(ctx, domainID, recordID)
 		if errors.Is(err, errStaleDomainID) {
-			// 历史问题（历史）：cleanUp 侧的 历史修复 同族自愈——缓存的
+			// cleanUp 侧的同族自愈——缓存的
 			// zone→domain_id 陈旧（域名移出账户/删除重建）时删除对旧 ID 报
 			// 「域名不存在」类错误。作废缓存重解析一次并重试一次；重解析
 			// 或重试失败照旧记 failed，不循环。
@@ -216,7 +216,7 @@ func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, b
 			if resolveErr != nil {
 				err = errors.Join(err, resolveErr)
 			} else {
-				// 历史修复（历史）：自愈换新 domain_id 后 bookkeeping 键
+				// 自愈换新 domain_id 后 bookkeeping 键
 				// 随之换代——残留旧键条目（kept 未选中之值/failed 回填）同步迁移
 				// 新键。否则后续 cleanUp/Present 按新键查找，旧键条目永不可达，
 				// 「failed 回填供后续清理重试」失效（仅内存模式；ownership 存储
@@ -236,16 +236,16 @@ func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, b
 		}
 		if err != nil {
 			if ctx.Err() != nil {
-				// 历史修复（历史证书域双实现同步）：与 tencent deleteOne 同口径
+				// 与 tencent deleteOne 同口径
 				//——ctx 取消/超时并入错误链，保留原始 provider 错误（整体覆写
 				// 会丢失具体 API 失败原因，诊断信息归零）。
 				err = errors.Join(err, ctx.Err())
 			}
 			if p.ownership == nil {
-				// 历史问题：failed 的唯一消费点是下方 ownership==nil 的 owned
+				// failed 的唯一消费点是下方 ownership==nil 的 owned
 				// 回填；ownership 模式下失败条目由 ownership 留存（删除失败
 				// 不 Remove），不再写入死存储。
-				// 历史问题（历史）：回填必须保留 challenge value——后续按值
+				// 回填必须保留 challenge value——后续按值
 				// 清理（CleanUpValue）以 entry.value 过滤，空值条目永不被选中重试。
 				failed = append(failed, ownedRecord{recordID: recordID, value: value})
 			}
@@ -265,7 +265,7 @@ func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, b
 				cleanupErr = errors.Join(cleanupErr, p.ownership.Remove(record))
 				continue
 			}
-			// 历史修复 independence: a record whose deletion failed keeps
+			// independence: a record whose deletion failed keeps
 			// its ownership entry (the DNS record may still exist), but an
 			// earlier miss must not skip Remove for records that WERE
 			// deleted — that orphans them until self-heal.
@@ -274,7 +274,7 @@ func (p *Provider) cleanUp(ctx context.Context, zone, tokenFQDN, value string, b
 			}
 			cleanupErr = errors.Join(cleanupErr, p.ownership.Remove(record))
 		}
-		// 历史修复 兜底排空（历史）：Present 在「ownership.Add 失败 + 回滚删除
+		// 兜底排空：Present 在「ownership.Add 失败 + 回滚删除
 		// 失败」时把 recordID 回填进内存兜底表（store 无条目可追踪）。此处重试
 		// 删除这些兜底条目——成功即清除，失败回填供下次重试（幂等）。store 模式
 		// 下 p.owned 仅承载该兜底回填，正常路径为空，排空不影响既有语义。
@@ -343,7 +343,7 @@ func (p *Provider) apiCall(ctx context.Context, method string, params url.Values
 	}
 	if result != nil {
 		if err := json.NewDecoder(resp.Body).Decode(result); err != nil {
-			// 历史修复（历史）：网关返回 HTML/空体（502/503）时原文案
+			// 网关返回 HTML/空体（502/503）时原文案
 			// 「decode response: invalid character '<'…」丢失状态码与动作名，
 			// 排障只能翻 network 日志。429/5xx 已由 retry.Transport 吸收，
 			// 这里是最终失败形态——状态码与方法名必须自明。
@@ -361,7 +361,7 @@ func (n *flexNumber) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// Int64 尽力解析；缺失/不可解析时返回 0（历史 历史问题 注释如实化：
+// Int64 尽力解析；缺失/不可解析时返回 0（注释如实化
 // 调用处的翻页终止实际由 len(domains)==0 独立兜底，total=0 永不命中
 // total>0 分支——0 值语义是「不参与判定」而非「未知总量」）。
 func (n flexNumber) Int64() int64 {
@@ -373,7 +373,7 @@ func (n flexNumber) Int64() int64 {
 }
 
 // errStaleDomainID 标记 Record.Create/Record.Remove 返回的「域名不存在/ID 失效」
-// 类错误（历史修复/历史问题）：缓存的 zone→domain_id 因域名移出账户/删除重建而
+// 类错误：缓存的 zone→domain_id 因域名移出账户/删除重建而
 // 陈旧时由 Present 与 cleanUp 捕获，作废缓存重解析后重试一次。
 var errStaleDomainID = errors.New("dnspod: 域名 ID 已失效")
 
@@ -389,8 +389,8 @@ func isDomainGoneStatus(code, message string) bool {
 		strings.Contains(message, "域名 ID 错误")
 }
 
-// invalidateDomainIDCache 作废本账户单个 zone 的缓存映射（历史修复；
-// 历史问题 起键含账户摘要，只能作废本账户的条目）。
+// invalidateDomainIDCache 作废本账户单个 zone 的缓存映射
+// 自此键含账户摘要，只能作废本账户的条目）。
 func (p *Provider) invalidateDomainIDCache(zone string) {
 	domainIDCacheMu.Lock()
 	delete(domainIDCache, p.domainIDCacheKey(zone))
@@ -400,7 +400,7 @@ func (p *Provider) invalidateDomainIDCache(zone string) {
 // domainIDCache:账户+zone→domain_id 进程内缓存——签发/续签的每次
 // Present/CleanUp 都要解析 zone 的 domain_id,分页遍历 Domain.List 在多
 // 域名/多任务并发下重复全额扫描;zone→id 映射在账户内稳定,命中即省。
-// 历史问题（历史）：键必须含账户（login_token 的 sha256 前 8 位十六
+// 键必须含账户（login_token 的 sha256 前 8 位十六
 // 进制）——同进程可配置多条 DNS 凭证（多账户），裸 zone 键会让账户 B 首调
 // 即命中账户 A 缓存的 domain_id；token 不落明文键（缓存转储/调试可读）。
 var (
@@ -517,8 +517,8 @@ func (p *Provider) deleteRecord(ctx context.Context, domainID, recordID string) 
 	}
 	err := fmt.Errorf("Record.Remove failed: %s", result.Status.Message)
 	if isDomainGoneStatus(result.Status.Code.String(), result.Status.Message) {
-		// 历史问题（历史）：与 createRecord 同判据标记「域名不存在」类
-		// 错误，供 cleanUp 作废缓存重试（历史修复 Present 侧自愈的删除侧对偶）。
+		// 与 createRecord 同判据标记「域名不存在」类
+		// 错误，供 cleanUp 作废缓存重试（Present 侧自愈的删除侧对偶）。
 		err = errors.Join(err, errStaleDomainID)
 	}
 	return err

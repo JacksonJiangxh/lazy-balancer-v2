@@ -62,10 +62,10 @@ func restoreDirtyAPIKeys(ids []int) {
 }
 
 // CleanupExpiredRevokedJTI 删除已过期的吊销 JWT 记录（每小时清理 tick 的
-// 单一实现）。历史修复：导出供测试驱动真实 SQL——此前测试自写
-// 一条等价 DELETE，清理语句/时间格式回归（历史问题 的 T/空格分隔陷阱）不会
+// 单一实现）。导出供测试驱动真实 SQL——此前测试自写
+// 一条等价 DELETE，清理语句/时间格式回归不会
 // 被任何测试发现。
-// 历史问题：写入侧为 RFC3339 T 分隔（models.RevokedTokenTimeFormat），
+// 写入侧为 RFC3339 T 分隔（models.RevokedTokenTimeFormat），
 // datetime('now') 产出空格分隔——TEXT 逐字符比较下当日过期行永不满足
 // <=（'T' > ' '），延迟约 24h 才清理。strftime 对齐写入格式。
 func CleanupExpiredRevokedJTI(database *sql.DB) error {

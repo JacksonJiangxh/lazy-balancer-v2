@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// 历史修复（历史）：逐上游回源域名（origin_domain）集群同步面钉测试——
+// 逐上游回源域名（origin_domain）集群同步面钉测试——
 // snapshotAllUpstreams SELECT 与 insertSnapshotRules 的 upstreams INSERT 必须
 // 同构携带该列，缺一即从节点静默丢回源域名（同步面分叉）。钉住「快照导出 →
 // 清空 → 重放」全链路 origin_domain 逐值守恒（含空值零值守恒）。
@@ -82,7 +82,7 @@ func TestClusterSnapshot_originDomainRoundTrip(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：健康检查域名（health_check_host）集群同步面钉测试——
+// 健康检查域名（health_check_host）集群同步面钉测试——
 // snapshotRules SELECT 与 insertSnapshotRules 的 lb_rules INSERT 必须同构携带
 // 该列，缺一即从节点静默丢健康检查域名。钉住「导出 → 清空 → 重放」逐值守恒。
 func TestClusterSnapshot_healthCheckHostRoundTrip(t *testing.T) {
@@ -138,7 +138,7 @@ func TestClusterSnapshot_healthCheckHostRoundTrip(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：path_rules 静态响应/301 跳转五列（response_mode/
+// path_rules 静态响应/301 跳转五列（response_mode/
 // response_status/response_body/response_content_type/redirect_to）集群同步面
 // 钉测试——snapshotAllPathRules SELECT 与 insertSnapshotPathRules INSERT 必须
 // 同构携带，缺一即从节点静默丢静态响应配置。钉住「导出 → 清空 → 重放」
@@ -229,5 +229,51 @@ func TestClusterSnapshot_pathRulesResponseColumnsRoundTrip(t *testing.T) {
 	redirectApplied, ok := applied["/old"]
 	if !ok || redirectApplied.mode != "redirect" || redirectApplied.redirectTo != "https://example.test/landing" {
 		t.Fatalf("applied redirect path rule=%+v (present=%v), want mode=redirect redirect_to=https://example.test/landing", redirectApplied, ok)
+	}
+}
+
+// upstreams.dynamic_dns 是废弃列（渲染只读规则级 DynamicDNS，写侧恒 0）：
+// 主端导出若直读存量 1 值，快照 canonical 与从端落库（恒 0）不同形——rules 节
+// 哈希每次主端 bump 恒不等，每版本一轮全量重拉。导出与从端重建共用同一上游
+// 归一，钉住「导出 → 清空 → 重放」后主从 rules 节哈希同值。
+func TestClusterSnapshot_upstreamDynamicDNSExportParity(t *testing.T) {
+	cluster, database := newClusterTestService(t)
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,strategy,enabled)
+		VALUES ('lb_ddns','ddns','http','ddns.example.test',8080,'weighted_round_robin',1)`); err != nil {
+		t.Fatal(err)
+	}
+	// 存量脏行：历史写入过 upstreams.dynamic_dns=1（该列已废弃，写侧恒 0）。
+	if _, err := database.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,dynamic_dns,enabled)
+		VALUES ('lb_ddns','10.0.0.9',9000,1,1,1)`); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot, _, err := cluster.Snapshot(context.Background(), 0, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Rules) != 1 || len(snapshot.Rules[0].Upstreams) != 1 {
+		t.Fatalf("snapshot rules=%#v, want one rule with one upstream", snapshot.Rules)
+	}
+	if snapshot.Rules[0].Upstreams[0].DynamicDNS {
+		t.Fatal("快照导出携带 upstreams.dynamic_dns=true——与写侧恒 0 不同形")
+	}
+
+	// 从端语义：清空后按快照重放（upstreams 落库恒 0），本地重建 rules 节哈希。
+	if _, err := database.Exec("DELETE FROM upstreams"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec("DELETE FROM lb_rules"); err != nil {
+		t.Fatal(err)
+	}
+	if err := replaceSnapshotDB(context.Background(), database, snapshot); err != nil {
+		t.Fatalf("apply snapshot: %v", err)
+	}
+	local, err := cluster.driftGuardSectionHashes(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if local["rules"] != snapshot.SectionHashes["rules"] {
+		t.Fatalf("rules 节哈希主从不同值：主端 %s / 从端重建 %s", snapshot.SectionHashes["rules"], local["rules"])
 	}
 }

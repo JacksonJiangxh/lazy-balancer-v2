@@ -18,7 +18,6 @@ func newAttackFlowBatchItems(n int, start time.Time) []threatScreenAttackFlowIte
 			clientIP:      "198.51.100." + string(rune('1'+i%9)),
 			action:        "blocked",
 			ruleTriggered: "942100",
-			ruleMsg:       "SQL Injection",
 		}
 	}
 	return items

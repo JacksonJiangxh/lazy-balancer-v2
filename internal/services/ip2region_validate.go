@@ -3,7 +3,7 @@ package services
 import "fmt"
 
 // ResetIP2RegionSearcherForTest 清空全局 ip2region searcher（仅测试使用）。
-// 历史问题 的导入落盘实测会经 Reload 装载真实 xdb——测试结束后必须复位，
+// 导入落盘实测会经 Reload 装载真实 xdb——测试结束后必须复位，
 // 否则「未装载 GeoIP」形态的用例（GeoIP 空结果/保留地址口径）会串扰。
 // 生产代码禁止调用。
 func ResetIP2RegionSearcherForTest() {
@@ -12,7 +12,7 @@ func ResetIP2RegionSearcherForTest() {
 	ip2regionMu.Unlock()
 }
 
-// ValidateIP2RegionFile 验证一份 xdb 文件能否被 ip2region 装载（历史问题）。
+// ValidateIP2RegionFile 验证一份 xdb 文件能否被 ip2region 装载。
 //
 // 备份导入（lbbak）在落盘前必须用与运行时同一条打开路径（
 // openIP2RegionSearcher，BufferCache 全量读入）验证文件：此前导入链只校验

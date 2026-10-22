@@ -16,7 +16,7 @@ import (
 	"lazy-balancer-v2/internal/models"
 )
 
-// 2026-09-05 集群审计 历史问题：补偿重拉窗口内的应用瞬时失败（ApplyFailed）不得覆盖
+// 2026-09-05 集群：补偿重拉窗口内的应用瞬时失败（ApplyFailed）不得覆盖
 // apply_ok_reload_failed 标记——该场景下 applied_version/指纹已与主节点对齐，标记是
 // 304 全量重拉补偿的唯一残留触发器；覆盖后下周期 304 无标记，DB=新版本而 Caddy=
 // 旧运行配置的分叉静默存活到下次真实变更。应用失败与传输错误同属「标记存活期间
@@ -147,9 +147,9 @@ func TestSyncService_applySnapshot_preservesLocalLoginLockoutState(t *testing.T)
 	}
 }
 
-// 2026-09-06 历史问题（历史修复 复核结论）：IsMaster 对历史 NULL 行的口径必须与
+// 2026-09-06：IsMaster 对历史 NULL 行的口径必须与
 // readonly 写闸（COALESCE(is_master,1) fail-open）一致——NULL 视为主节点。
-// 历史问题 迁移（db.go）已回填存量 NULL 使稳态不可达，此处为纵深防御一致性。
+// 迁移（db.go）已回填存量 NULL 使稳态不可达，此处为纵深防御一致性。
 func TestClusterService_IsMaster_nullIsMasterFailsOpenAsMaster(t *testing.T) {
 	// Given：历史脏数据 is_master=NULL
 	_, database := newClusterTestService(t)
@@ -170,13 +170,13 @@ func TestClusterService_IsMaster_nullIsMasterFailsOpenAsMaster(t *testing.T) {
 	}
 }
 
-// 2026-09-06 历史问题：主节点侧按节点的 TOFU 指纹钉重置——按
+// 2026-09-06：主节点侧按节点的 TOFU 指纹钉重置——按
 // IssueServiceControlTicket 同一口径（access_url 优先，回退 protocol://ip:port）
 // 定位 pin 文件，只删除目标节点的钉，不影响其他节点与无关主机。
 func TestClusterService_ForgetNodePin_removesOnlyTargetNodePin(t *testing.T) {
 	// Given：两个从节点各有一个 pin 文件，另有本节点作为从节点时代的旧主节点钉
 	cluster, database := newClusterTestService(t)
-	// 历史问题 UNIQUE(ip,port) 后两节点须不同 ip:port(原夹具同址仅 access_url
+	// UNIQUE(ip,port) 后两节点须不同 ip:port(原夹具同址仅 access_url
 	// 不同——物理矛盾形态,一个端口一种协议)。
 	seed := `INSERT INTO nodes (id,name,ip_address,port,protocol,access_url,is_approved) VALUES (?,?,?,?,?,?,1)`
 	if _, err := database.Exec(seed, 21, "slave-a", "172.18.0.2", 8000, "http", "https://node-a.example:8443"); err != nil {
@@ -232,13 +232,13 @@ func TestClusterService_ForgetNodePin_removesOnlyTargetNodePin(t *testing.T) {
 	}
 }
 
-// 2026-09-06 历史修复 连带：集群快照的 health_check_timeout NULL 回退口径必须与
+// 2026-09-06 连带：集群快照的 health_check_timeout NULL 回退口径必须与
 // 渲染/写侧（rule_features/caddy.go、UpdateRule 存量读取，已统一为 2）一致——
 // 快照仍导 5 会让主节点实际行为（2）与下发值（5）分叉，且从节点回放后把 5
 // 物化为非 NULL 值，永久固化错误口径。
 func TestSnapshot_rulesInvalidHealthColumns_normalizedByTransportGate(t *testing.T) {
 	// 库值唯一真相批 1+2：健康检查族为 NOT NULL 值型列（fresh DDL），NULL 行
-	// 结构上不可达（原 历史修复 NULL→2 导出回退随之退役）；带外 0 脏行由传输归一
+	// 结构上不可达（原 NULL→2 导出回退随之退役）；带外 0 脏行由传输归一
 	// 门 normalizeRuleForTransport 在导出侧归治理默认——三面（导出/落库/导入）
 	// 同构，渲染层零兜底。
 	cluster, database := newClusterTestService(t)
@@ -276,7 +276,7 @@ func loginLockTimestamp(offset time.Duration) string {
 	return time.Now().UTC().Add(offset).Format("2006-01-02 15:04:05")
 }
 
-// 历史修复 修订：主节点活跃登录锁经快照独立顶层载荷 locked_users 下发——只带
+// 修订：主节点活跃登录锁经快照独立顶层载荷 locked_users 下发——只带
 // 未来时间的活跃锁（与 loginLockedNow 同口径的字符串比较），自然过期后条目
 // 自动消失；不进 users 节列/节哈希（避免每次登录失败触发全量重放与漂移循环）。
 func TestSnapshot_lockedUsers_carriesActiveLocksOnly(t *testing.T) {
@@ -310,7 +310,7 @@ func TestSnapshot_lockedUsers_carriesActiveLocksOnly(t *testing.T) {
 	}
 }
 
-// 历史修复 修订：从端应用 locked_users——空锁延长、更早本地锁延长、更晚本地锁
+// 修订：从端应用 locked_users——空锁延长、更早本地锁延长、更晚本地锁
 // 不缩短、login_failed_attempts 不被触碰、载荷中的陌生用户名安全落空。
 func TestSyncService_applySnapshot_lockedUsersExtendButNeverShorten(t *testing.T) {
 	// Given：本地（从节点）三个用户——a 无锁、b 本地锁更早、c 本地锁更晚
@@ -344,7 +344,7 @@ func TestSyncService_applySnapshot_lockedUsersExtendButNeverShorten(t *testing.T
 	defer caddyServer.Close()
 	syncService := NewSyncService(database, &config.Config{CaddyAdminURL: caddyServer.URL}, NewCaddyService(caddyServer.URL))
 
-	// When：应用快照（users 节重放 + 历史修复 本地记账回写后应用 locked_users）
+	// When：应用快照（users 节重放 + 本地记账回写后应用 locked_users）
 	if err := syncService.applySnapshot(context.Background(), incoming); err != nil {
 		t.Fatal(err)
 	}
@@ -387,7 +387,7 @@ func TestSyncService_applySnapshot_lockedUsersExtendButNeverShorten(t *testing.T
 	assertLock("a", laterLock, 1)
 }
 
-// 历史修复 修订：旧主端形态（载荷缺失/nil）必须 no-op——不得清从节点本地锁与计数。
+// 修订：旧主端形态（载荷缺失/nil）必须 no-op——不得清从节点本地锁与计数。
 func TestSyncService_applySnapshot_nilLockedUsersPayloadIsNoOp(t *testing.T) {
 	// Given：本地用户带活跃锁与失败计数；快照不带 locked_users（模拟旧主端）
 	cluster, database := newClusterTestService(t)
@@ -422,7 +422,7 @@ func TestSyncService_applySnapshot_nilLockedUsersPayloadIsNoOp(t *testing.T) {
 	}
 }
 
-// 历史修复-新2(历史):历史修复-新1 核心语义钉住——快照旧 mfa_last_timestep
+// 新2:-新1 核心语义钉住——快照旧 mfa_last_timestep
 // 不得重开从节点重放防护窗(本地>快照取本地);主节点更新(快照>本地)覆盖。
 func TestSyncService_applySnapshot_preservesLocalTOTPTimestep(t *testing.T) {
 	_, database := newClusterTestService(t)
@@ -450,7 +450,7 @@ func TestSyncService_applySnapshot_preservesLocalTOTPTimestep(t *testing.T) {
 
 	// 主节点更新（手造快照 1200 > 本地 900）→ MAX 取 1200。注意生产 canonical
 	// 会把 mfa_last_timestep 清零（sanitizeUsersForHash），该分支仅为手造/旧版
-	// 载荷的纵深防御，不是可达的生产路径（历史修复 注释如实化）。
+	// 载荷的纵深防御，不是可达的生产路径。
 	snapshot2 := models.ClusterSnapshot{
 		Version: 3,
 		Users:   []models.ClusterUser{{ID: 1, Username: "u", PasswordHash: "h", Role: "admin", IsEnabled: true, MFALastTimestep: 1200}},

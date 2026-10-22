@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// 历史问题-1:重新注册健康的从节点时，Resume/Wake 必须打断当前 interval 等待。
+// 重新注册健康的从节点时，Resume/Wake 必须打断当前 interval 等待。
 func TestSyncService_WakeInterruptsDefaultWait(t *testing.T) {
 	s := &SyncService{}
 	started := make(chan struct{})

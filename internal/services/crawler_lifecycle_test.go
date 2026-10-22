@@ -23,7 +23,7 @@ func TestRunCrawlerBotUpdate_taskLifecycleLogsAndTimestamps(t *testing.T) {
 	defer func() { crawlerIPListFile = oldFile }()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		// 源声明 format=json（官方源同形）：响应必须是合法 JSON——
-		// 历史问题 起 json 源的非 JSON 响应按错误页失败（保留上次快照）。
+		// 自此 json 源的非 JSON 响应按错误页失败（保留上次快照）。
 		_, _ = w.Write([]byte(`{"prefixes":[{"ipv4Prefix":"66.249.66.0/24"},{"ipv4Prefix":"66.249.67.0/24"}]}`))
 	}))
 	defer ts.Close()
@@ -34,7 +34,7 @@ func TestRunCrawlerBotUpdate_taskLifecycleLogsAndTimestamps(t *testing.T) {
 		UPDATE security_crawler_sources SET update_enabled=1,url=? WHERE name='googlebot'`, ts.URL); err != nil {
 		t.Fatal(err)
 	}
-	// 历史修复（历史）：内置首版已与官方快照对齐（googlebot 170 条），收缩门
+	// 内置首版已与官方快照对齐（googlebot 170 条），收缩门
 	// 基线在「DB 无行」时取内置条数——2 条的合成响应会被判截断。生产形态恒有
 	// DB 行（首轮由 Prime 落库），此处按同一形态预置当前快照 2 条，使基线走
 	// DB 分支（本用例的断言对象是任务生命周期日志与时间，不是收缩门）。
@@ -131,7 +131,7 @@ func TestRunCrawlerBotUpdate_downloadFailureMarksFailedAndLogs(t *testing.T) {
 	}
 }
 
-// —— RunUpdate 取消/降级分支（历史修复，历史） ——
+// RunUpdate 取消/降级分支 ——
 
 // 下载在途取消：源行落 cancelled、保留上次快照（排程槽与版本不动）。
 func TestCrawlerRunUpdate_cancelMarksSourceCancelled(t *testing.T) {

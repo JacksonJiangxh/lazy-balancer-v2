@@ -72,7 +72,7 @@ watch(() => [props.days, props.time] as const, ([days, time], prev) => {
 })
 
 const emitSave = () => {
-  // 历史问题：时间被清空时不得静默回落 04:00（原 `editTime.value || '04:00'`
+  // 时间被清空时不得静默回落 04:00（原 `editTime.value || '04:00'`
   // 让输入框显示空、落库却是 04:00）；校验单源 utils/securityLibraries。
   const time = editTime.value
   const error = libraryScheduleError(editDays.value, time)

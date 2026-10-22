@@ -75,7 +75,7 @@ test('Dashboard 所有落地路径统一重建逐规则失败映射', () => {
     assert.match(assignment[1], /^buildRuleMetricsUnavailable\(/, `绕过 helper 的落地路径: ${assignment[0]}`)
   }
   assert.doesNotMatch(text, /if \(!caddyMetricsUnavailable\.value\) \{\s*ruleMetricsUnavailable/)
-  // 「已落地」与「可用」分离（历史问题-3）：dashboard 未到达前不得判定采集失败；
+  // 「已落地」与「可用」分离：dashboard 未到达前不得判定采集失败；
   // 成功与失败两条落地路径都要置 landed，/rules 重建必须同时看 landed+可用。
   assert.equal([...text.matchAll(/dashboardMetricsLanded\.value = true/g)].length, 2, 'dashboard 成功/失败两条路径都必须置「已落地」')
   assert.match(text, /dashboardMetricsLanded\.value && !caddyMetricsUnavailable\.value/,
@@ -119,6 +119,12 @@ test('自动封禁卡片主体与函数入口统一受只读和节点门控', ()
   const open = section(text, 'const openAutobanConfig', 'const saveAutobanConfig')
   assert.match(open, /if \(!autobanWritable\.value\) return/)
   assert.match(text, /自动封禁状态加载中，暂不可配置/)
+  // 函数级纵深守卫：按钮 :disabled 只是呈现层，保存/禁用直切必须各自带
+  // writable 门（与 openAutobanConfig 同构）——键盘/控制台直接调用不得绕过。
+  const save = section(text, 'const saveAutobanConfig', 'const AUTOBAN_ENABLE_CONFIRM_HTML')
+  assert.match(save, /if \(!autobanWritable\.value\) return/, '保存必须带函数级 autobanWritable 守卫')
+  const toggle = section(text, 'const toggleAutobanEnabled', '// 触发阶段分类')
+  assert.match(toggle, /!autobanWritable\.value/, '禁用直切必须带函数级 autobanWritable 守卫')
 })
 
 test('默认上游分支不得显示无启用上游', () => {
@@ -281,6 +287,11 @@ test('BasicSettings 两处 radio 行回归 el-form-item（自管标签行族已�
   assert.doesNotMatch(text, /^\.form-radio-row/m, '自管标签行样式必须退役')
   assert.match(text, /<el-form-item label="证书来源">/)
   assert.match(text, /<el-form-item label="频率">/)
+})
+
+test('BasicSettings 不再局部重复定义全局 .settings-form（main.css 单源）', () => {
+  const text = source('src/views/settings/BasicSettings.vue')
+  assert.doesNotMatch(text, /\.settings-form \{/, 'main.css 已有同名规则，局部重定义必须退役')
 })
 
 test('SecurityBindingEditor 先声明 props/emits 再派生 computed', () => {

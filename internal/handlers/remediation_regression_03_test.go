@@ -18,7 +18,7 @@ func TestSplitSecurityPolicy_stage2ChildInheritsBlockPage(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := splitRouter(t)
 
-	// Given：内置页种子 + mixed 策略（仅 历史修复 信任条目 + 历史修复 限流特征）配拦截页
+	// Given：内置页种子 + mixed 策略（仅信任条目 + 限流特征）配拦截页
 	pageRes, err := db.DB.Exec(`INSERT INTO security_block_pages (name, content, content_type, is_default) VALUES ('拆分测试页', '<p>x</p>', 'text/html; charset=utf-8', 0)`)
 	if err != nil {
 		t.Fatal(err)

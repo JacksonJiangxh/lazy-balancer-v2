@@ -2,9 +2,11 @@ package services
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"lazy-balancer-v2/internal/db"
 	"log"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -13,7 +15,157 @@ import (
 	"time"
 
 	"lazy-balancer-v2/internal/models"
+	"lazy-balancer-v2/internal/taskengine"
 )
+
+// installCAQueueTestFixture 初始化临时库 + 任务日志目录（CA 队列用例只依赖
+// 这两项）。本文件此前借用 autoban 域的夹具，连带劫持 autoban 时钟/角色缝并
+// 重置其全局状态——跨域耦合让本域用例随无关域改动漂移。
+func installCAQueueTestFixture(t *testing.T) {
+	t.Helper()
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
+	if err := db.Initialize(t.TempDir()); err != nil {
+		t.Fatalf("initialize test database: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+	})
+	taskengine.SetLogDir(t.TempDir())
+	t.Cleanup(func() { taskengine.SetLogDir("") })
+}
+
+// 生命周期取消的重入队把部署生命周期全集（downloaded/cleanup_dns/
+// cleanup_warning，含 cleanup_* 与材料在身）保留在原状态并推部署窗口：
+// 打回 queued 会丢弃已签发证书并触发整轮重签（烧 CA 配额）。
+func TestRequeueCanceledJobKeepsDeploymentLifecycleWithMaterial(t *testing.T) {
+	installCAQueueTestFixture(t)
+	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,message,cert_pem,key_pem) VALUES
+		('lb_cleanup_dns','cleanup.example.com','cleanup_dns','清理 DNS 记录','CERT','KEY'),
+		('lb_cleanup_warning','cleanupwarn.example.com','cleanup_warning','清理告警','CERT','KEY'),
+		('lb_cleanup_nomaterial','cleanupnomaterial.example.com','cleanup_dns','清理 DNS 记录',NULL,NULL),
+		('lb_downloaded','downloaded.example.com','downloaded','部署退避中','CERT','KEY')`); err != nil {
+		t.Fatalf("seed cert jobs: %v", err)
+	}
+	ids := map[string]int{}
+	rows, err := db.DB.Query(`SELECT rule_id, id FROM cert_jobs`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var ruleID string
+		var id int
+		if err := rows.Scan(&ruleID, &id); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		ids[ruleID] = id
+	}
+	rows.Close()
+
+	// When
+	for _, ruleID := range []string{"lb_cleanup_dns", "lb_cleanup_warning", "lb_cleanup_nomaterial", "lb_downloaded"} {
+		requeueCanceledJob(ids[ruleID])
+	}
+
+	// Then：材料在身的部署生命周期任务保持原状态 + 窗口推到 now
+	for ruleID, wantStatus := range map[string]string{
+		"lb_cleanup_dns":     "cleanup_dns",
+		"lb_cleanup_warning": "cleanup_warning",
+		"lb_downloaded":      "downloaded",
+	} {
+		var status, message string
+		var after sql.NullString
+		if err := db.DB.QueryRow(`SELECT status, COALESCE(message,''), deployment_available_after FROM cert_jobs WHERE id=?`, ids[ruleID]).
+			Scan(&status, &message, &after); err != nil {
+			t.Fatalf("read %s: %v", ruleID, err)
+		}
+		if status != wantStatus {
+			t.Fatalf("%s status=%q, want %q（部署生命周期任务不得被打回 queued 重签）", ruleID, status, wantStatus)
+		}
+		if !after.Valid || !strings.Contains(message, "等待恢复部署") {
+			t.Fatalf("%s 部署窗口未推进: after=%v message=%q", ruleID, after.Valid, message)
+		}
+	}
+	// 无材料的 cleanup_* 是历史脏行：回落重新签发
+	var status string
+	if err := db.DB.QueryRow(`SELECT status FROM cert_jobs WHERE id=?`, ids["lb_cleanup_nomaterial"]).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("无材料 cleanup_dns status=%q, want queued（回落重新签发）", status)
+	}
+}
+
+// 两处部署窗口写（执行超时重排 / 生命周期取消重排）必须同口径推进
+// updated_at：重试冷却门（certJobRetryBlocked）以 updated_at 为计时基准，
+// 只推 deployment_available_after 而不推 updated_at 会让冷却门读到陈旧基准，
+// 本轮重排对其不可见（可被连点绕过 + 行序失真）。
+func TestDeploymentWindowWritesAdvanceUpdatedAt(t *testing.T) {
+	installCAQueueTestFixture(t)
+	const staleUpdatedAt = "2020-01-01 00:00:00"
+	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,cert_pem,key_pem,updated_at) VALUES
+		('lb_timeout','timeout.example.com','downloaded','CERT','KEY',?),
+		('lb_cancel','cancel.example.com','cleanup_dns','CERT','KEY',?)`, staleUpdatedAt, staleUpdatedAt); err != nil {
+		t.Fatalf("seed cert jobs: %v", err)
+	}
+	ids := map[string]int{}
+	rows, err := db.DB.Query(`SELECT rule_id, id FROM cert_jobs`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var ruleID string
+		var id int
+		if err := rows.Scan(&ruleID, &id); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		ids[ruleID] = id
+	}
+	rows.Close()
+
+	// When
+	handleExecutionTimeout(ids["lb_timeout"])
+	requeueCanceledJob(ids["lb_cancel"])
+
+	// Then：冷却门读值（updated_at）随写推进
+	for ruleID, id := range ids {
+		var updatedAt, after sql.NullString
+		if err := db.DB.QueryRow(`SELECT updated_at, deployment_available_after FROM cert_jobs WHERE id=?`, id).Scan(&updatedAt, &after); err != nil {
+			t.Fatalf("read %s: %v", ruleID, err)
+		}
+		if !updatedAt.Valid || updatedAt.String <= staleUpdatedAt {
+			t.Fatalf("%s updated_at=%q, want 推进到当前时刻（冷却门基准）", ruleID, updatedAt.String)
+		}
+		if !after.Valid {
+			t.Fatalf("%s deployment_available_after 未推进", ruleID)
+		}
+	}
+}
+
+// 执行超时且材料在身的任务走部署重试语义时，必须落 certjob-*.log 业务行
+// （与 deploymentFailed/failJob 同族）——否则磁盘日志只剩签发阶段，
+// 「超时后转重排」在排障视角完全无痕。
+func TestHandleExecutionTimeout_materialBranchWritesCertJobLog(t *testing.T) {
+	installCAQueueTestFixture(t)
+	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,cert_pem,key_pem) VALUES
+		('lb_timeoutlog','timeoutlog.example.com','downloaded','CERT','KEY')`); err != nil {
+		t.Fatalf("seed cert job: %v", err)
+	}
+
+	// When
+	handleExecutionTimeout(1)
+
+	// Then
+	raw, err := os.ReadFile(CertJobLogPath("lb_timeoutlog"))
+	if err != nil {
+		t.Fatalf("read cert job log: %v", err)
+	}
+	if !strings.Contains(string(raw), "执行超时：证书材料已落库，等待重新部署") {
+		t.Fatalf("certjob 日志缺少超时重排业务行:\n%s", raw)
+	}
+}
 
 func TestCAQueueManager_CancelJob_removes_pending_job(t *testing.T) {
 	// Given
@@ -516,7 +668,7 @@ func TestCAQueueManager_PauseAndDrain_cancels_pending_and_waits_for_running(t *t
 	manager := &CAQueueManager{queues: map[int]*caQueue{1: queue}, active: true}
 
 	// When
-	// 历史问题（历史）：执行体响应取消正常退出 → 必须报告完全排空（true）。
+	// 执行体响应取消正常退出 → 必须报告完全排空（true）。
 	if drained := manager.PauseAndDrain(); !drained {
 		t.Fatal("PauseAndDrain drained=false, want true（执行体已响应取消退出）")
 	}
@@ -863,9 +1015,9 @@ func TestCAQueue_execute_requeues_job_when_lifecycle_is_canceled(t *testing.T) {
 	}
 }
 
-// 历史问题：PauseAndDrain 会把在途签发置回 'queued'（requeueCanceledJob），
+// PauseAndDrain 会把在途签发置回 'queued'（requeueCanceledJob），
 // Resume 必须把这些滞留任务显式重入队，否则只能等到进程重启或快照替换。
-// 历史问题：issuer 不响应 ctx 取消超过 caQueueDrainTimeout 时，PauseAndDrain 有界等待
+// issuer 不响应 ctx 取消超过 caQueueDrainTimeout 时，PauseAndDrain 有界等待
 // 返回后滞行执行仍在旧队列中运行；Resume 的 stranded 扫描必须经 retiredQueues 识别
 // 该在途 job，不得重复入队造成同 jobID 双执行；滞行执行退出后任务可正常重入队。
 func TestCAQueueManager_PauseAndDrain_timeout_straggler_not_double_executed(t *testing.T) {
@@ -908,7 +1060,7 @@ func TestCAQueueManager_PauseAndDrain_timeout_straggler_not_double_executed(t *t
 	manager := &CAQueueManager{queues: map[int]*caQueue{7: queue}, active: true}
 
 	// When：PauseAndDrain 超时返回（滞行执行未退出），随后 Resume
-	// 历史问题（历史）：滞行执行不响应取消 → 必须报告未完全排空（false），
+	// 滞行执行不响应取消 → 必须报告未完全排空（false），
 	// 调用方（配置导入）据此拒绝在证书任务仍在执行时继续。
 	if drained := manager.PauseAndDrain(); drained {
 		t.Fatal("PauseAndDrain drained=true, want false（issuer 未响应取消，滞行仍在执行）")
@@ -1011,7 +1163,7 @@ func TestCAQueueManager_Resume_requeuesLifecycleStrandedJobs(t *testing.T) {
 	manager.Stop()
 }
 
-// 历史问题 发现1：滞行执行退出后任务停在 'queued' 且无队列持有，Resume 之外的周期
+// 发现1：滞行执行退出后任务停在 'queued' 且无队列持有，Resume 之外的周期
 // 巡检原先不覆盖纯 'queued'；requeueStrandedQueuedJobs 必须把适用滞留任务重新
 // 入队（滞停窗口收敛到 30s），且只动 'queued'——'waiting_ca' 冷却任务与孤儿
 // 任务均不得触碰。
@@ -1079,7 +1231,7 @@ func TestCAQueueManager_requeueStrandedQueuedJobs_reenqueues_queued_only(t *test
 	manager.Stop()
 }
 
-// 历史问题 发现2：EnqueueIfActive 必须先查 IsJobActive——滞行悬挂（retiredQueues 中
+// 发现2：EnqueueIfActive 必须先查 IsJobActive——滞行悬挂（retiredQueues 中
 // 的在途执行）期间手动重试/规则重建不得再次入队造成同 jobID 双执行；命中时返回
 // changed=false（与 blocked 同语义走 !changed 分支），transition 不得执行。
 func TestCAQueueManager_EnqueueIfActive_skips_when_job_still_active(t *testing.T) {
@@ -1118,7 +1270,7 @@ func TestCAQueueManager_EnqueueIfActive_skips_when_job_still_active(t *testing.T
 	}
 }
 
-// 历史问题：enqueueCompensation 必须先查 IsJobActive——补偿退避循环在角色翻转
+// enqueueCompensation 必须先查 IsJobActive——补偿退避循环在角色翻转
 // 退役旧队列后重跑时，drain 只扫 m.queues 看不到退役队列中的滞行执行，不经守卫
 // 会二次入队同 jobID → 双执行。命中时跳过（返回 nil，不视为补偿失败）、不新建
 // 队列、不写 DB。
@@ -1163,7 +1315,7 @@ func TestCAQueueManager_enqueueCompensation_skips_when_job_still_active(t *testi
 	}
 }
 
-// 历史问题 补偿循环必须在规则被并发删除后终止并释放租约。drain 成功后规则已
+// 补偿循环必须在规则被并发删除后终止并释放租约。drain 成功后规则已
 // 不存在（管理员重试 DeleteRule 或配置导入整树替换）时，没有可恢复对象——
 // restore 不得写入幽灵 cert_jobs 行（无外键），requeue 的规则 SELECT 命中
 // ErrNoRows 必须按成功语义收尾，否则补偿进入永久退避循环且 blockedRules 租约
@@ -1240,7 +1392,7 @@ func TestCAQueueManager_StartRuleDeletionCompensation_exits_when_rule_deleted_mi
 	}
 }
 
-// 历史问题 Stop 弃置补偿（角色翻转/进程停止）后必须回收全部 blockedRules
+// Stop 弃置补偿（角色翻转/进程停止）后必须回收全部 blockedRules
 // 租约——补偿 goroutine 已退出，其租约再无释放者；残留租约会让复用同
 // caddy_id 的新规则被 EnqueueIfActive 永久拦截（证书静默停发）。
 func TestCAQueueManager_Stop_releases_abandoned_rule_block_leases(t *testing.T) {
@@ -1265,7 +1417,7 @@ func TestCAQueueManager_Stop_releases_abandoned_rule_block_leases(t *testing.T) 
 	}
 }
 
-// 历史修复（历史问题 发现3 回归）：退役条目 age-out 摘除不得遗忘在途 jobID——摘除后
+// 退役条目 age-out 摘除不得遗忘在途 jobID——摘除后
 // IsJobActive 必须继续返回 true（zombieJobs 迁移），直到滞行执行经 executionDone
 // 信号退出；无 executionDone 的 jobID 永久保留保护（罕见，宁可永久保护不放双执行）。
 func TestCAQueueManager_IsJobActive_agedOutRetiredEntry_migratesZombieProtection(t *testing.T) {
@@ -1332,7 +1484,7 @@ func TestCAQueue_prepareExecution_scales_budget_with_domain_count(t *testing.T) 
 	execution, ok := queue.prepareExecutionLocked(context.Background())
 	queue.mu.Unlock()
 
-	// Then：预算按 40min 基础（caExecutionTimeout）+ 每增加一个域名 15min 缩放（历史修复）
+	// Then：预算按 40min 基础（caExecutionTimeout）+ 每增加一个域名 15min 缩放
 	if !ok {
 		t.Fatal("pending job was not prepared")
 	}
@@ -1372,7 +1524,7 @@ func TestCAQueue_prepareExecution_budget_capped_at_max(t *testing.T) {
 }
 
 func TestCaExecutionTimeoutFor_counts_domains(t *testing.T) {
-	// Given/When/Then（历史修复：每域增量 10min→15min——单域内部分段
+	// Given/When/Then（每域增量 10min→15min——单域内部分段
 	// 最坏 ≈17min（传播 5m+递归 2m/域+验证 10m），15min 贴合最坏段和）
 	testCases := []struct {
 		domains string
@@ -1700,7 +1852,7 @@ func TestCAQueue_tick_dispatches_with_refreshed_provider(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：requeueStrandedJobs 迭代健壮性——Scan 失败补
+// requeueStrandedJobs 迭代健壮性——Scan 失败补
 // warn 留痕（曾静默 continue 零信号），循环后补 rows.Err() 检查（曾迭代
 // 中途出错时部分任务集被当全量处理）。
 func TestCAQueue_requeueStrandedJobsLogsScanFailure(t *testing.T) {
@@ -1725,7 +1877,7 @@ func TestCAQueue_requeueStrandedJobsLogsScanFailure(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：provider 配置提交后必须发布失效事件——缓存闸门（性能
+// provider 配置提交后必须发布失效事件——缓存闸门（性能
 // 优化）此前先于 loadCAProvider 判定，max_concurrent/min_interval 修改在积压窗口
 // 内不生效（缓存=1+running=1 时抬到 3 仍不派发；间隔下调同理）。版本号脏标记
 // 让队列在下一 tick 先按新值复核。
@@ -1821,12 +1973,12 @@ func TestCAQueue_tick_appliesProviderConfigUpdateWhileQueued(t *testing.T) {
 	})
 }
 
-// 历史问题-04（历史核实成立）：生命周期取消的重入队 from 集合此前含终态
+// 生命周期取消的重入队 from 集合此前含终态
 // issued/failed——并发部署回调的终态落定可被无条件拉回 queued（issued→整轮
 // 重签烧配额 / failed→终态复活）。终态必须不被改写；downloaded 保持部署语义；
 // 中间态照常重排。
 func TestRequeueCanceledJobDoesNotResurrectTerminalStates(t *testing.T) {
-	installAutobanFixture(t, "2026-10-14 10:00:00") // 通用临时库 + 任务日志目录
+	installCAQueueTestFixture(t) // 通用临时库 + 任务日志目录
 	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,message,cert_pem,key_pem) VALUES
 		('lb_issued','issued.example.com','issued','签发成功','CERT','KEY'),
 		('lb_failed','failed.example.com','failed','CA 签发失败: boom',NULL,NULL),
@@ -1878,7 +2030,7 @@ func TestRequeueCanceledJobDoesNotResurrectTerminalStates(t *testing.T) {
 	}
 }
 
-// ---- 历史（历史问题）----
+// ---- 回归钉 ----
 
 // seedRuleWithCAProvider 落一条启用中的 ACME 规则并固定其 CA 提供商。
 func seedRuleWithCAProvider(t *testing.T, ruleID, domain string, providerID int) {
@@ -1902,9 +2054,9 @@ func seedQueuedCertJob(t *testing.T, ruleID, domain string, providerID int) int6
 	return id
 }
 
-// 历史问题（历史）：显式选择的 CA 提供商「存在但已禁用」时不得静默改派到其它
+// 显式选择的 CA 提供商「存在但已禁用」时不得静默改派到其它
 // 启用提供商（改派会消耗另一 CA 配额并持久化改写 cert_jobs.ca_provider_id），
-// 必须以可见失败落定任务；已删除 ID 仍保留回退（历史任务延续）。
+// 必须以可见失败落定任务；已删除 ID 仍保留回退（任务延续）。
 func TestCAQueue_loadCAProvider_disabled_explicit_id_fails_instead_of_silent_switch(t *testing.T) {
 	// Given：两个启用提供商，其中一个被禁用（守卫只拦截启用中规则引用，
 	// 禁用规则/历史任务仍可能持有该 ID）。
@@ -2009,7 +2161,7 @@ func TestCAQueue_loadCAProvider_deleted_explicit_id_still_falls_back(t *testing.
 	manager.Stop()
 }
 
-// 历史问题：CancelJob 必须与按规则取消同口径覆盖退役队列与僵尸任务
+// CancelJob 必须与按规则取消同口径覆盖退役队列与僵尸任务
 // ——此前只扫 m.queues，退役/僵尸形态仅靠 ctx 已取消「碰巧安全」。
 func TestCancelJob_waits_for_retired_and_zombie_executions(t *testing.T) {
 	newClusterTestService(t)
@@ -2084,7 +2236,7 @@ func TestCAQueueManager_PauseAndDrain_secondCallSeesPriorRetiredStragglers(t *te
 	// When：第二次调用（本次没有新队列可停）
 	drained := manager.PauseAndDrain()
 
-	// Then：旧退役队列仍有在途 active → 必须 历史修复
+	// Then：旧退役队列仍有在途 active → 必须
 	if drained {
 		t.Fatal("PauseAndDrain drained=true, want false（既有退役队列仍有在途执行）")
 	}
@@ -2101,7 +2253,7 @@ func TestCAQueueManager_PauseAndDrain_secondCallSeesPriorRetiredStragglers(t *te
 	}
 }
 
-// 历史修复 畸形形态：zombieJobs 非空（退役队列已 历史修复 但 jobID 仍受保护）
+// 畸形形态：zombieJobs 非空（退役队列已但 jobID 仍受保护）
 // 同样视为未排空。
 func TestCAQueueManager_PauseAndDrain_zombieJobsBlockDrain(t *testing.T) {
 	manager := &CAQueueManager{

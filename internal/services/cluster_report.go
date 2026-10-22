@@ -29,7 +29,7 @@ func (s *SyncService) Report(ctx context.Context) error {
 	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(master_url,''), COALESCE(cluster_token,''), COALESCE(applied_version,0), last_sync, COALESCE(last_sync_error,'') FROM global_config WHERE id=1`).Scan(&masterURL, &token, &appliedVersion, &lastSync, &storedSyncError); err != nil {
 		return fmt.Errorf("读取上报状态: %w", err)
 	}
-	lastSyncError, syncErrorCode := decodeSyncError(storedSyncError)
+	lastSyncError, reportSyncErrorCode := decodeSyncError(storedSyncError)
 	lastSyncAt := ""
 	if lastSync.Valid {
 		lastSyncAt = lastSync.Time.UTC().Format(time.RFC3339)
@@ -40,13 +40,13 @@ func (s *SyncService) Report(ctx context.Context) error {
 	}
 	// 到期口径跟随 cert_expiry_days 配置（与规则页「即将过期」状态一致）；
 	// JSON 字段名 certs_expiring_30d 为历史名，保留以兼容旧版主节点解析。
-	// 历史修复（历史）：字面量 30 → db.DefaultCertExpiryDays 绑定参数（caddy.go
-	// 历史修复 形态，库值唯一真相单源）；读失败/非法值回退口径原样（warn 留痕）。
+	// 字面量 30 → db.DefaultCertExpiryDays 绑定参数（caddy.go
+	// 形态，库值唯一真相单源）；读失败/非法值回退口径原样（warn 留痕）。
 	expiryDays := db.DefaultCertExpiryDays
 	if err := s.db.QueryRowContext(ctx, "SELECT COALESCE(cert_expiry_days,?) FROM global_config WHERE id=1", db.DefaultCertExpiryDays).Scan(&expiryDays); err != nil || expiryDays <= 0 || expiryDays > 365 {
-		// 读失败/非法值回退治理默认时留痕（历史修复 家族扫描唯一漏点，
+		// 读失败/非法值回退治理默认时留痕（家族扫描唯一漏点，
 		// 同族 certissuer/certificates/certinfo/certjobs 均已带留痕）。
-		// 历史问题-09：Report 每同步周期都会读该列——列持续非法（带外直写）时
+		// Report 每同步周期都会读该列——列持续非法（带外直写）时
 		// 按状态转换「失败/恢复各记一次」，不再每 60s 一条 warn。
 		if level := logStateTransition("cluster-report-cert-expiry", true); level != "" {
 			Logf(level, "集群报告: 读取证书到期口径失败，回退 %d 天", db.DefaultCertExpiryDays)
@@ -58,13 +58,13 @@ func (s *SyncService) Report(ctx context.Context) error {
 	// expiryDays 经 Scan 已是纯整数（非法/非数字值回退 30），strconv.Itoa 只产生
 	// 数字修饰符；SQLite datetime 修饰符无法参数化，格式化必须保证纯数字。
 	expiryModifier := strconv.Itoa(expiryDays)
-	// 历史问题：状态集必须覆盖部署生命周期——cleanup_dns/cleanup_warning
+	// 状态集必须覆盖部署生命周期——cleanup_dns/cleanup_warning
 	//（JobLifecycle=Downloaded）材料已落库、待部署，此前漏计会与规则页/任务
 	// 页的到期口径分叉（deploymentLifecycleJobStatuses 见 certissuer.go）。
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cert_jobs WHERE status IN ('issued','failed',`+deploymentLifecycleJobStatusSQL+`) AND expires_at IS NOT NULL AND datetime(expires_at)<=datetime('now','+`+expiryModifier+` days')`).Scan(&expiringCount); err != nil {
 		return fmt.Errorf("统计即将到期证书: %w", err)
 	}
-	// 历史问题：构造契约允许 caddy=nil（测试/独立运维路径）；nil 下按
+	// 构造契约允许 caddy=nil（测试/独立运维路径）；nil 下按
 	// 「不可判定 → degraded，CaddyOK=false」上报，而不是解引用 panic。
 	var caddyErr error
 	if s.caddy == nil {
@@ -81,7 +81,7 @@ func (s *SyncService) Report(ctx context.Context) error {
 		ServiceStatus:  serviceStatus,
 		LastSyncAt:     lastSyncAt,
 		LastSyncError:  lastSyncError,
-		SyncErrorCode:  syncErrorCode,
+		SyncErrorCode:  reportSyncErrorCode,
 		// 分区哈希取 cluster_applied_sections 的已应用记录（apply 路径
 		// recordAppliedSectionHashes 维护，含漂移重放后的本地重建口径）：
 		// 代表本地当前已落库内容，无需为上报重建全量快照。从未同步过的节点
@@ -92,13 +92,13 @@ func (s *SyncService) Report(ctx context.Context) error {
 			RulesCount:       rulesCount,
 			CertsExpiring30d: expiringCount,
 			UptimeSec:        int64(time.Since(clusterProcessStartedAt).Seconds()),
-			SyncErrorCode:    syncErrorCode,
+			SyncErrorCode:    reportSyncErrorCode,
 		},
 	}
 	// v2.3.0(2026-09-18 用户裁定):规则库版本随上报上送——主节点集群管理
 	// 节点列表状态列 hover 可见从节点 CRS/IP2Region 版本(从节点跟随主节点
 	// 同步,无需登录从节点查看)。
-	// 历史问题-2(历史修复):上报为每同步周期的热路径,只消费两个版本串——改走轻量
+	// 上报为每同步周期的热路径,只消费两个版本串——改走轻量
 	// 版本读取(两个小文件),不再经 BuildWafFileRef 的 tarGzDirSum 全树哈希
 	// 与 xdb sha256(那是快照/漂移检测的口径,上报无需)。
 	report.Health.CRSVersion, report.Health.IP2RegionTag = reportWafFileVersions()
@@ -126,7 +126,7 @@ func (s *SyncService) Report(ctx context.Context) error {
 		return fmt.Errorf("上报主节点失败: %w", err)
 	}
 	defer resp.Body.Close()
-	// 历史问题-1(历史修复):同主机 http→https 升级已被 doWithTLSUpgradeRedirect 按
+	// 同主机 http→https 升级已被 doWithTLSUpgradeRedirect 按
 	// 原方法重放,残留 3xx(跨主机/反代重定向)说明主节点地址形态需
 	// 人工修正——此前落进「非 4xx 即成功」被静默吞掉;给与 Pull 3xx 分支同款
 	// 可行动指引,经 reportErr→recordSyncError 通道落库(last_sync_error

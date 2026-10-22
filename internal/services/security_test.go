@@ -12,7 +12,7 @@ import (
 	"lazy-balancer-v2/internal/models"
 )
 
-// 裁定 2026-09-07 历史修复：多策略 IP 预检——① 信任名单并入 allow 放行集（信任
+// 裁定 2026-09-07：多策略 IP 预检——① 信任名单并入 allow 放行集（信任
 // 优先，与单策略语义一致）；② 交集改为 CIDR 感知（网络包含关系取更具体方）。
 func TestIntersectIPLists_cidrAware(t *testing.T) {
 	tests := []struct {
@@ -66,7 +66,7 @@ func TestIntersectIPLists_cidrAware(t *testing.T) {
 }
 
 func TestBuildIPPrecheck_trustListInclusion(t *testing.T) {
-	// Given：历史问题 allow=[1.2.3.4] trust=[5.6.7.8]；历史问题 deny=[9.9.9.9]
+	// Given： allow=[1.2.3.4] trust=[5.6.7.8]； deny=[9.9.9.9]
 	p1 := &models.SecurityPolicy{IPACLEnabled: true, IPACLMode: "allow", IPACLList: `["1.2.3.4"]`, IPWhitelistEnabled: true, IPWhitelist: json.RawMessage(`["5.6.7.8"]`)}
 	p2 := &models.SecurityPolicy{IPACLEnabled: true, IPACLMode: "deny", IPACLList: `["9.9.9.9"]`}
 	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{p1, p2}, 0, "lb_test"))
@@ -90,10 +90,10 @@ func TestBuildIPPrecheck_trustListInclusion(t *testing.T) {
 	}
 }
 
-// 2026-09-08 审计 SF3：历史修复 门控关闭路径——IPWhitelistEnabled=false 的信任
+// 2026-09-08 审计 SF3：门控关闭路径——IPWhitelistEnabled=false 的信任
 // 名单不得并入多策略预检（与 BuildCorazaDirectives 信任三态口径一致）。
 func TestBuildIPPrecheck_trustDisabledNotIncluded(t *testing.T) {
-	// Given：历史问题 allow=[1.2.3.4] trust=[5.6.7.8] 但信任开关关闭；历史问题 deny=[9.9.9.9]
+	// Given： allow=[1.2.3.4] trust=[5.6.7.8] 但信任开关关闭； deny=[9.9.9.9]
 	p1 := &models.SecurityPolicy{IPACLEnabled: true, IPACLMode: "allow", IPACLList: `["1.2.3.4"]`, IPWhitelistEnabled: false, IPWhitelist: json.RawMessage(`["5.6.7.8"]`)}
 	p2 := &models.SecurityPolicy{IPACLEnabled: true, IPACLMode: "deny", IPACLList: `["9.9.9.9"]`}
 	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{p1, p2}, 0, "lb_test"))
@@ -109,9 +109,9 @@ func TestBuildIPPrecheck_trustDisabledNotIncluded(t *testing.T) {
 }
 
 // 2026-09-08 审计 SF1：同基址不同掩码的方向独立性。
-// 历史修复（历史）：语义钉迁移到生产唯一实现 cidrIntersectParsed（经
+// 语义钉迁移到生产唯一实现 cidrIntersectParsed（经
 // parseEntryCached 构造条目，镜像 intersectIPLists 调用形态）——旧
-// cidrIntersectEntry 自 历史问题 预解析缓存改造后生产零调用，已删除。
+// cidrIntersectEntry 自预解析缓存改造后生产零调用，已删除。
 func TestCidrIntersectParsed_directionIndependent(t *testing.T) {
 	// 同基址，/8 比 /16 宽——无论参数顺序，都应返回 /16（更窄）
 	cache := map[string]*parsedEntry{}
@@ -122,10 +122,10 @@ func TestCidrIntersectParsed_directionIndependent(t *testing.T) {
 	}
 }
 
-// TestBuildCorazaDirectives_BodyAccessTruthTable(历史修复 首例,历史问题):
+// TestBuildCorazaDirectives_BodyAccessTruthTable
 // 机械枚举 body 门控读取的全部变量交叉积——mode(4)×自定义规则态(3:
 // 无规则/停放启用/发射启用)×IP 控制(2)。期望:On ⟺ crsActive ‖
-// (customActive && hasCustomRules)。历史:历史修复 引擎不可消费条件→历史修复 停放
+// (customActive && hasCustomRules)。历史: 引擎不可消费条件→ 停放
 // 规则反向回归——每轮只测目标格,bug 在未测格;本表为构造性全形状。
 func TestBuildCorazaDirectives_BodyAccessTruthTable(t *testing.T) {
 	rulesJSON := func(enabled bool) json.RawMessage {
@@ -144,7 +144,7 @@ func TestBuildCorazaDirectives_BodyAccessTruthTable(t *testing.T) {
 		// crsActive(blocking/detection):恒 On(CRS phase:2 消费)
 		{"blocking", "none", false, true},
 		// parked 格仅对 off 有实义(非 off 模式 parked/emitted 同输入等价类,
-		// 历史问题 去重)。
+		// 故该格去重)。
 		{"blocking", "emitted-enabled", false, true},
 		{"blocking", "none", true, true},
 		{"detection", "none", false, true},
@@ -154,9 +154,9 @@ func TestBuildCorazaDirectives_BodyAccessTruthTable(t *testing.T) {
 		{"custom_only", "emitted-enabled", true, true},
 		{"custom_only", "none", false, false}, // 空策略→default return ""
 		{"custom_only", "none", true, false},  // 仅 IP 控制:phase:1,无 body 消费者
-		// off:IP/GeoIP 仅 phase:1,停放规则不发射→Off(历史问题 回归格)
+		// off:IP/GeoIP 仅 phase:1,停放规则不发射→Off
 		{"off", "none", true, false},
-		{"off", "parked-enabled", true, false}, // ← 历史修复 反向回归格:此前误 On
+		{"off", "parked-enabled", true, false}, // ← 反向回归格:此前误 On
 		{"off", "parked-enabled", false, false},
 	}
 	for _, tc := range cases {
@@ -193,12 +193,12 @@ func TestBuildCorazaDirectives_BodyAccessTruthTable(t *testing.T) {
 	}
 }
 
-// TestBuildCorazaDirectives_customOnlyIPControlSkipsBodyProcessors（历史问题，
-// 历史）：custom_only+仅 IP 控制（零启用自定义规则）形状下
+// TestBuildCorazaDirectives_customOnlyIPControlSkipsBodyProcessors
+// custom_only+仅 IP 控制（零启用自定义规则）形状下
 // SecRequestBodyAccess 恒 Off（BodyAccessTruthTable 该格已钉），body
 // processor 激活规则 id:9/10/11 无任何消费者——不得发射（死指令）。
 // 对照格：custom_only+启用自定义规则时 id:9/10/11 必须在场（body 条件规则
-// 依赖解析，历史修复）。
+// 依赖解析）。
 func TestBuildCorazaDirectives_customOnlyIPControlSkipsBodyProcessors(t *testing.T) {
 	// Given：custom_only + 仅 IP 控制（无自定义规则）
 	ipOnly := &models.SecurityPolicy{Mode: "custom_only", Enabled: true,
@@ -235,7 +235,7 @@ func boolStr(b bool) string {
 	return "off"
 }
 
-// 历史问题(历史,历史问题):多策略(预检存在)时策略层 id:2/4 改链式自排除
+// 多策略(预检存在)时策略层 id:2/4 改链式自排除
 // 本策略信任集——本策略信任 IP 由预检统一记录(去重保持),他策略信任 IP 不在
 // 本策略信任集照常拦截(「信任仅豁免所属策略」裁定边界恢复)。
 func TestBuildCorazaDirectives_multiPolicyDenySelfTrustExclusion(t *testing.T) {
@@ -312,7 +312,7 @@ func TestBuildCorazaDirectives_multiPolicyAllowSelfTrustExclusion(t *testing.T) 
 	}
 }
 
-// 历史问题（历史）：a==b 字面捷径不得免检——两条 allow 名单含同一坏
+// a==b 字面捷径不得免检——两条 allow 名单含同一坏
 // 条目（集群同步/带外改库可注入，保存面校验不覆盖存量行）时，交集被坏条目
 // 顶成非空，恒拒规则（id:7 @rx .*）不发射、改发含坏行投影 → @ipListFast
 // 构建期 fail-closed 整份渲染失败。与聚合面「不可解析不参与匹配」同口径：
@@ -373,7 +373,7 @@ func TestCountEnabledCustomRulesBatch_matchesSingles(t *testing.T) {
 	}
 }
 
-// —— 畸形爬虫引擎列静默等价「全部引擎」（历史修复，历史） ——
+// 畸形爬虫引擎列静默等价「全部引擎」 ——
 
 // 畸形非空 engines 保留「全部引擎」向后兼容语义但必须 WARN 留痕（否则豁免面
 // 被静默放大且零告警）；空集（""/空白/"[]"）不是畸形、不告警；合法形态只命中

@@ -1,8 +1,8 @@
 package handlers
 
-// 历史问题(历史,历史问题):MFA 自助写端点(禁用/重绑确认)在 mfa_write_guard
+// MFA 自助写端点(禁用/重绑确认)在 mfa_write_guard
 // 开启时的 428 流程结构性必 401——守卫/verify-step 已消费 TOTP 时间片,前端
-// 自动重试带同码,handler 无条件再验 → 同片重放拒绝。历史问题(MFAResetByAdmin)
+// 自动重试带同码,handler 无条件再验 → 同片重放拒绝。(MFAResetByAdmin)
 // 已裁定同形为 bug 并以 mfa_stepup_verified 标记修复,本测试钉住自助两端点
 // 的同款标记优先行为(机器身份无标记→本层验码保持)。
 
@@ -44,7 +44,7 @@ func postMfaSelfService(router *gin.Engine, path, body string) *httptest.Respons
 	return rec
 }
 
-// 场景 1(历史问题 主形):守卫验码放行后(标记在),禁用不带码必须成功——
+// 场景 1:守卫验码放行后(标记在),禁用不带码必须成功——
 // 修复前:401 验证码错误(同片互斥)。
 func TestMFADisable_guardMarker_skipsCodeCheck(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -86,7 +86,7 @@ func TestMFADisable_noMarker_stillRequiresCode(t *testing.T) {
 	}
 }
 
-// 场景 3(历史问题 同形同 handler):重绑确认(MFASetup 的 mfaEnabled 分支)
+// 场景 3:重绑确认(MFASetup 的 mfaEnabled 分支)
 // 在标记路径不验码——返回新密钥候选(200),修复前 401。
 func TestMFASetup_rebindGuardMarker_skipsCodeCheck(t *testing.T) {
 	h := newBackupTestHandlers(t)

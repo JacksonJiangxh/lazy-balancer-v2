@@ -22,7 +22,7 @@ var runtimeLogSizeRefresh struct {
 	done   chan struct{}
 }
 
-// init 只落兜底阈值（100MB）。worker 不再随包初始化自启（历史问题：
+// init 只落兜底阈值（100MB）。worker 不再随包初始化自启
 // init 先于 main 的 db.Initialize，首次 refresh 必撞 nil 库空转，启动后
 // 最长 30s 按兜底 100MB 滚动）——首次刷新由 main 在 db.Initialize 后
 // 显式 StartLogRotate 触发，首读即真实库值。
@@ -30,12 +30,27 @@ func init() {
 	runtimeLogSizeMB.Store(100)
 }
 
-func StartLogRotate(ctx context.Context) <-chan struct{} {
+// logRotateRestartWaitMax 是 StartLogRotate 重启路径等待旧 worker 退出的预算
+// （与关停路径 StopLogRotateWithin 的 1s 段预算同量级）。旧 worker 卡在 DB
+// busy_timeout 时不得无界挂起刷新链启动——超时放弃等待并 warn，残留 goroutine
+// 由下一次 Stop/进程退出收尾（与 StopLogRotateWithin 的可重启语义一致）。
+const logRotateRestartWaitMax = 1 * time.Second
+
+// StartLogRotate 启动运行日志尺寸刷新 worker（幂等：重复调用先停旧 worker）。
+// 不返回 done 通道：唯一生产调用方（main 启动链）与测试都不消费——关停同步
+// 语义由 StopLogRotateWithin 承担，返回一个无人读取的通道只会诱导误用。
+func StartLogRotate(ctx context.Context) {
 	runtimeLogSizeRefresh.Lock()
 	defer runtimeLogSizeRefresh.Unlock()
 	if runtimeLogSizeRefresh.cancel != nil {
 		runtimeLogSizeRefresh.cancel()
-		<-runtimeLogSizeRefresh.done
+		// 重启路径同样有界（与 StopLogRotateWithin 同语义）：旧 worker 卡在
+		// DB busy_timeout 时不再无界挂起启动；超时放弃等待并 warn。
+		select {
+		case <-runtimeLogSizeRefresh.done:
+		case <-time.After(logRotateRestartWaitMax):
+			Logf("warn", "logrotate refresh worker 未在重启预算 %s 内退出，放弃等待旧实例（启动新实例继续）", logRotateRestartWaitMax)
+		}
 	}
 	workerCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
@@ -50,7 +65,7 @@ func StartLogRotate(ctx context.Context) <-chan struct{} {
 			}
 			var mb int
 			if err := database.QueryRow("SELECT COALESCE(runtime_log_size_mb,100) FROM global_config WHERE id=1").Scan(&mb); err != nil {
-				// 历史问题：持久失败（如迁移窗口缺列）不再每 30s 一行 info。
+				// 持久失败（如迁移窗口缺列）不再每 30s 一行 info。
 				if logStateTransition("runtime-log-size-refresh", true) != "" {
 					Logf("warn", "refresh runtime log size: %v", err)
 				}
@@ -75,7 +90,6 @@ func StartLogRotate(ctx context.Context) <-chan struct{} {
 			}
 		}
 	}()
-	return done
 }
 
 func StopLogRotate() {
@@ -112,7 +126,7 @@ func StopLogRotateWithin(within time.Duration) bool {
 // RotatingFileWriter writes to a log file and rotates it once it exceeds the
 // size limit. Rotated files are suffixed with a timestamp and are subject to
 // retention cleanup (log-cleanup 任务体的 RuntimeLogCleanupOnce——旧启动器
-// StartRuntimeLogCleanup 已随 历史修复 任务引擎化退役).
+// StartRuntimeLogCleanup 已随任务引擎化退役).
 type RotatingFileWriter struct {
 	path string
 	mu   sync.Mutex
@@ -129,7 +143,7 @@ func NewRotatingFileWriter(path string) (*RotatingFileWriter, error) {
 }
 
 func (w *RotatingFileWriter) open() error {
-	// 历史问题-1(历史):LogFileEnabled 恒 true 后裸二进制部署
+	// LogFileEnabled 恒 true 后裸二进制部署
 	// /app/logs 不存在——open 必须建父目录,否则恒回退 stdout 轮转失效。
 	if err := os.MkdirAll(filepath.Dir(w.path), 0o755); err != nil {
 		return fmt.Errorf("create log dir: %w", err)
@@ -173,7 +187,7 @@ func (w *RotatingFileWriter) rotateLocked() error {
 	}
 	stamp := time.Now().Format("20060102-150405")
 	rotated := fmt.Sprintf("%s.%s", w.path, stamp)
-	// 历史修复(历史问题):同秒多次轮转的碰撞后缀原为 UnixNano()%1000
+	// 同秒多次轮转的碰撞后缀原为 UnixNano()%1000
 	// 随机数——撞上既有副本名时 os.Rename 静默覆盖,吞掉上一份轮转日志。
 	// 改循环递增 -2/-3/...(与 autobackup 同秒序号 -2..-201 同模式)直至文件名
 	// 不存在,确定性避让;stat 出非「不存在」错误时按可选用(与原 lenient
@@ -206,7 +220,7 @@ func (w *RotatingFileWriter) Close() error {
 type RuntimeCleanupResult struct {
 	AppRemoved int // 应用日志过期副本删除数（app.log.*）
 	// AppCleanupError 应用日志副本清理的目录读取失败原因（空=正常）。
-	// 历史修复：目录不可读时曾静默返回 AppRemoved=0——任务日志称「删除 0 个」，
+	// 目录不可读时曾静默返回 AppRemoved=0——任务日志称「删除 0 个」，
 	// 与「无过期副本」不可区分；失败原因必须随摘要行与任务日志可见。
 	AppCleanupError string
 	// RetentionMonths 本轮生效的保留月数（单一来源 auditRetentionMonths 回填，
@@ -237,11 +251,11 @@ func (r TaskLogHousekeepingResult) Summary() string {
 }
 
 // RuntimeLogCleanupOnce 单轮清理：应用日志过期副本删除 + 任务日志统一
-// 清理轮转（taskLogsHousekeeping）。由任务引擎 log-cleanup 族驱动（历史修复 起
+// 清理轮转（taskLogsHousekeeping）。由任务引擎 log-cleanup 族驱动（自此
 // 无独立启动器）。
 func RuntimeLogCleanupOnce(logFile string) RuntimeCleanupResult {
 	result := RuntimeCleanupResult{TaskLogs: taskLogsHousekeeping(logFile), WafAudit: wafAuditHousekeeping()}
-	// 历史修复②（历史）：库未初始化不再整体跳过——保留期单源
+	// 库未初始化不再整体跳过——保留期单源
 	// auditRetentionMonths 自带 nil 库回退默认 3 月；此前 `months := 3` 后
 	// 直接 return 使应用日志副本清理被静默跳过（AppRemoved=0），与「清理不得
 	// 静默跳过」口径相反。死初值一并删除（唯一使用点必被 auditRetentionMonths
@@ -283,7 +297,7 @@ func RuntimeLogCleanupOnce(logFile string) RuntimeCleanupResult {
 // logCleanupSummaryLine log-cleanup 任务单轮摘要行（从 wire 描述符闭包抽出，
 // 便于对「摘要行口径 = 实际清理口径」直接钉测）。
 func logCleanupSummaryLine(logFile string) string {
-	// 历史修复③（历史）：旋转写入器打开失败（runtimeLogFile 为空，
+	// 旋转写入器打开失败（runtimeLogFile 为空，
 	// main.go 已有 error 留痕）时不得让 log-cleanup 静默零动作——任务监控恒绿
 	// 却没有任何留痕，排障时看不出「清理为什么没跑」。
 	if logFile == "" {
@@ -294,11 +308,11 @@ func logCleanupSummaryLine(logFile string) string {
 	// 同源），不再在本层复算。
 	appPart := fmt.Sprintf("应用日志副本删除 %d 个（保留 %d 月，无过期为 0）", res.AppRemoved, res.RetentionMonths)
 	if res.AppCleanupError != "" {
-		// 历史修复：目录不可读不得呈现为「删除 0 个」——任务日志必须留痕失败原因。
+		// 目录不可读不得呈现为「删除 0 个」——任务日志必须留痕失败原因。
 		appPart = fmt.Sprintf("应用日志副本未清理（保留 %d 月）：读取目录失败 %s", res.RetentionMonths, res.AppCleanupError)
 	}
 	summary := "日志清理完成：" + appPart + "；" + res.TaskLogs.Summary()
-	// 历史问题-01（历史）：daemon 停机时的 waf-audit 兜底动作如实进
+	// daemon 停机时的 waf-audit 兜底动作如实进
 	// 任务日志（2026-10-01 用户裁定：清理了哪个文件必须可见）；无动作时不加
 	// 尾段，日志行形态不变。
 	if len(res.WafAudit) > 0 {
@@ -307,7 +321,7 @@ func logCleanupSummaryLine(logFile string) string {
 	return summary
 }
 
-// wafAuditHousekeeping waf-audit 目录超阈兜底（历史问题-01，历史）——
+// wafAuditHousekeeping waf-audit 目录超阈兜底——
 // audit.log 轮转的正常驱动面是 security-events-ingestion daemon 的 2s tick
 // （SecurityEventsPollOnce）；daemon 停机（任务被禁用/取消）时文件无守护
 // 无界增长——写侧（Coraza 审计流，经 caddygeoip 审计写插件异步批量落盘）
@@ -318,7 +332,7 @@ func logCleanupSummaryLine(logFile string) string {
 //     摄取+pending-delta+copytruncate 全套安全链——绝不无补采截断；daemon
 //     在场时文件本不会积到阈值，触发即等价一次普通 tick，无竞争）。
 //
-// （历史：耗时侧车退役——耗时随审计行内嵌流转，
+// （耗时侧车退役——耗时随审计行内嵌流转，
 // 本目录仅剩 audit.log 家族文件，无需独立截断兜底。）
 //
 // 返回动作明细（log-cleanup 任务日志与运行日志双写——清理了哪个文件必须
@@ -345,7 +359,7 @@ func wafAuditHousekeeping() []string {
 // 返回清理明细（哪个文件被删/轮转——用户可见）。
 func taskLogsHousekeeping(logFile string) TaskLogHousekeepingResult {
 	result := TaskLogHousekeepingResult{}
-	// 历史修复：tasks 根 + certjobs 子目录统一扫描（证书任务日志并入任务日志体系）
+	// tasks 根 + certjobs 子目录统一扫描（证书任务日志并入任务日志体系）
 	dir := filepath.Join(filepath.Dir(logFile), "tasks")
 	certDir := filepath.Join(dir, "certjobs")
 	dirs := []string{dir}
@@ -378,7 +392,7 @@ func taskLogsHousekeeping(logFile string) TaskLogHousekeepingResult {
 	if len(all) == 0 {
 		return result
 	}
-	// 历史修复（历史）：统一经 auditRetentionMonths（读取失败回退默认
+	// 统一经 auditRetentionMonths（读取失败回退默认
 	// 3 月 + warn 留痕；nil DB 时静默默认——与既有形态一致）。
 	months := auditRetentionMonths()
 	cutoff := time.Now().AddDate(0, -months, 0)
@@ -389,8 +403,8 @@ func taskLogsHousekeeping(logFile string) TaskLogHousekeepingResult {
 			continue
 		}
 		if f.dir == certDir {
-			// 历史问题：certjobs 子目录的证书任务日志与写入侧共用 ruleID 粒度写锁
-			// （历史问题，certjoblog.go lockCertJobLog）——删除必须在同一把锁内重新
+			// certjobs 子目录的证书任务日志与写入侧共用 ruleID 粒度写锁
+			// （certjoblog.go lockCertJobLog）——删除必须在同一把锁内重新
 			// stat 再 remove。锁外拿到的 FileInfo 可能已被写侧的
 			// 「stat→轮转移位→append」改写：移位后该名字指向新一代文件，无锁
 			// 删除会吞掉未过期的一代（写侧并发下丢行）。

@@ -1,6 +1,6 @@
 package db
 
-// 历史问题（历史）：TCP 死值清零 / stale DNS 清理与 cluster_version
+// TCP 死值清零 / stale DNS 清理与 cluster_version
 // bump 必须同事务——此前清零先提交、bump 失败后下次启动 WHERE 不再命中，
 // bump 永不发生（主从 canonical 长期分叉）；stale DNS 侧此前完全不 bump。
 

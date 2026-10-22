@@ -1,5 +1,5 @@
 /**
- * DNS 提供商凭证字段的展示口径（历史修复，历史）。
+ * DNS 提供商凭证字段的展示口径。
  *
  * 字段可见性与选项文案此前在前端按 dnspod 的两种认证模式硬编码
  * （`auth_mode/secret_id/secret_key/app_id/app_token` 逐个判断），而后端新增

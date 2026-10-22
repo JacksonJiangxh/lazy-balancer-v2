@@ -13,7 +13,7 @@ import (
 	"lazy-balancer-v2/internal/models"
 )
 
-// 历史修复：主节点 5xx 响应体（此前 ≤4096B）嵌入错误消息会击穿 历史修复 的 512B
+// 主节点 5xx 响应体（此前 ≤4096B）嵌入错误消息会击穿 512B
 // 有界设计，并经 Report 随 60s 周期持续膨胀主节点库。修复后 body 截断至
 // 200B 并回退到合法 UTF-8 边界，last_sync_error 必须始终 < 512B 且无乱码。
 func TestSyncService_run_fiveHundredHugeBody_lastSyncErrorBounded(t *testing.T) {
@@ -67,7 +67,7 @@ func TestSyncService_run_fiveHundredHugeBody_lastSyncErrorBounded(t *testing.T) 
 	}
 }
 
-// 历史修复：bumpRegistrationConfirmFailure 的终止类写点改经 combineOrReplaceSyncError
+// bumpRegistrationConfirmFailure 的终止类写点改经 combineOrReplaceSyncError
 // 落库（语义与直写等价：ValidationFailed 属终止类，helper 直接覆盖重载失败标记），
 // 闭合「所有写点经 helper」不变式。达到上限后停止自动重试并清理注册状态。
 func TestSyncService_bumpRegistrationConfirmFailure_terminalWriteViaHelper(t *testing.T) {

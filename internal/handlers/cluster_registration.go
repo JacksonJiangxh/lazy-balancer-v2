@@ -16,11 +16,11 @@ import (
 )
 
 // registerRequestMaxBytes 限制注册请求体大小：注册端点为公开机器接口
-// （无 JWT/API Key 认证），超大体可撑爆审计库（历史问题）。
+// （无 JWT/API Key 认证），超大体可撑爆审计库。
 const registerRequestMaxBytes = 16 << 10
 
 // registerAuditField 限制写入审计详情的节点字段：截断至 128B（回退合法 UTF-8
-// 边界）并去除控制字符，防未认证请求注入超长内容或伪造日志换行（历史问题）。
+// 边界）并去除控制字符，防未认证请求注入超长内容或伪造日志换行。
 func registerAuditField(s string) string {
 	s = strings.Map(func(r rune) rune {
 		if r < 0x20 || r == 0x7f {
@@ -56,7 +56,7 @@ func (h *Handlers) GenerateClusterRegisterToken(c *gin.Context) {
 }
 
 func (h *Handlers) RegisterClusterNode(c *gin.Context) {
-	// 历史问题：导入窗口 fast-fail（全量替换 nodes，窗口写入会被覆盖或阻塞）。
+	// 导入窗口 fast-fail（全量替换 nodes，窗口写入会被覆盖或阻塞）。
 	if rejectNodeWriteDuringImport(c) {
 		return
 	}
@@ -72,19 +72,19 @@ func (h *Handlers) RegisterClusterNode(c *gin.Context) {
 	registration, err := h.clusterService.RegisterNode(c.Request.Context(), req, time.Now())
 	if err != nil {
 		if errors.Is(err, services.ErrInvalidRegisterToken) {
-			// 无效令牌路径不携带攻击者输入，详情与响应均用通用文案（历史问题）
+			// 无效令牌路径不携带攻击者输入，详情与响应均用通用文案
 			services.RecordAuditLog("system", "注册失败", "集群节点", "注册令牌无效", c.ClientIP())
 			clusterError(c, http.StatusUnauthorized, "注册令牌无效或已过期", err)
 			return
 		}
 		if errors.Is(err, services.ErrNotMasterNode) {
-			// 历史问题：SQL 级角色条件命中 0 行（降级竞态）→ 403，与
+			// SQL 级角色条件命中 0 行（降级竞态）→ 403，与
 			// requireMaster 同文案同头形状，不折叠成 500。
 			clusterMasterForbidden(c, err)
 			return
 		}
 		if errors.Is(err, models.ErrInvalidClusterNodeName) {
-			// 历史问题-05：归一后为空的节点名属客户端可修正输入，映射 400。
+			// 归一后为空的节点名属客户端可修正输入，映射 400。
 			services.RecordAuditLog("system", "注册失败", "集群节点", services.FormatAuditDetail(registerAuditField(req.Name), registerAuditField(req.IPAddress), err.Error()), c.ClientIP())
 			clusterError(c, http.StatusBadRequest, err.Error(), err)
 			return
@@ -93,7 +93,7 @@ func (h *Handlers) RegisterClusterNode(c *gin.Context) {
 		clusterError(c, http.StatusInternalServerError, "节点注册失败", err)
 		return
 	}
-	// 历史问题：重复 ip:port 命中已批准节点时，upsert 会重置审批与令牌——响应与
+	// 重复 ip:port 命中已批准节点时，upsert 会重置审批与令牌——响应与
 	// 审计点名被覆盖节点，避免运营方把覆盖误认为新节点加入。
 	message := "注册成功，等待主节点审批"
 	auditParts := []string{fmt.Sprintf("节点 %d", registration.RegistrationID), registerAuditField(req.Name), registerAuditField(req.IPAddress), "等待审批"}
@@ -102,7 +102,7 @@ func (h *Handlers) RegisterClusterNode(c *gin.Context) {
 		auditParts = append(auditParts, overwritten)
 		message = "注册成功，" + overwritten + "，等待主节点审批"
 	}
-	// 历史问题-06：自述访问地址与来源 IP 不一致时已忽略（不落库），此处显性
+	// 自述访问地址与来源 IP 不一致时已忽略（不落库），此处显性
 	// 告知——该值决定能力票据投递地址，只能由管理员显式配置。
 	if registration.AccessURLIgnored {
 		auditParts = append(auditParts, "自述访问地址与来源 IP 不一致，已忽略")
@@ -113,14 +113,14 @@ func (h *Handlers) RegisterClusterNode(c *gin.Context) {
 }
 
 func (h *Handlers) GetClusterRegistrationStatus(c *gin.Context) {
-	// 参数校验先于角色门：非法 ID 恒 400（历史修复 ID 校验口径），不因节点角色变化。
+	// 参数校验先于角色门：非法 ID 恒 400，不因节点角色变化。
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil || id <= 0 {
 		clusterError(c, http.StatusBadRequest, "注册编号无效", err)
 		return
 	}
-	// 历史问题-04：同族机器端点（register/confirm/snapshot/waf-files/report）均有
-	// 主节点门，仅本端点缺失——降级后的主节点按 历史问题 保留 nodes 行，残留
+	// 同族机器端点（register/confirm/snapshot/waf-files/report）均有
+	// 主节点门，仅本端点缺失——降级后的主节点按保留 nodes 行，残留
 	// 注册行仍可被应答 approved 并重发集群令牌。权限面不扩大（令牌由 secret
 	// 确定性派生），但角色门必须一致收敛。
 	if !h.requireMaster(c) {
@@ -132,7 +132,7 @@ func (h *Handlers) GetClusterRegistrationStatus(c *gin.Context) {
 			clusterMasterForbidden(c, err)
 			return
 		}
-		// 历史问题:仅凭证类哨兵 401——DB 故障误映射 401 会驱使从节点走
+		// 仅凭证类哨兵 401——DB 故障误映射 401 会驱使从节点走
 		// 五连败轨道耗尽注册配额。
 		if errors.Is(err, services.ErrNodeNotFound) || errors.Is(err, services.ErrInvalidClusterAuth) {
 			clusterError(c, http.StatusUnauthorized, "注册凭证无效", err)
@@ -156,7 +156,7 @@ func (h *Handlers) ConfirmClusterRegistration(c *gin.Context) {
 			clusterMasterForbidden(c, err)
 			return
 		}
-		// 历史问题:同 RegistrationStatus 分判。
+		// 同 RegistrationStatus 分判。
 		if errors.Is(err, services.ErrInvalidClusterAuth) || errors.Is(err, services.ErrNodeNotFound) || errors.Is(err, services.ErrInvalidRegisterToken) {
 			clusterError(c, http.StatusUnauthorized, "确认集群注册失败", err)
 			return
@@ -168,7 +168,7 @@ func (h *Handlers) ConfirmClusterRegistration(c *gin.Context) {
 }
 
 func (h *Handlers) ApproveClusterNode(c *gin.Context) {
-	h.clusterNodeAction(c, "审批", func(id int) error { return h.clusterService.ApproveNode(c.Request.Context(), id) })
+	h.clusterNodeAction(c, "审批", func(id int) error { return h.clusterService.ApproveNode(c.Request.Context(), id, time.Now()) })
 }
 
 func (h *Handlers) RejectClusterNode(c *gin.Context) {
@@ -206,7 +206,7 @@ func (h *Handlers) UpdateClusterNodeSiteCoordinates(c *gin.Context) {
 		return
 	}
 	if err := h.clusterService.UpdateNodeSiteCoordinates(c.Request.Context(), id, *req.ServerMapLat, *req.ServerMapLon); err != nil {
-		// 历史问题：服务层降级竞态 403 与 requireMaster 门同源带头。
+		// 服务层降级竞态 403 与 requireMaster 门同源带头。
 		if errors.Is(err, services.ErrNotMasterNode) {
 			clusterMasterForbidden(c, err)
 			return
@@ -229,7 +229,7 @@ func (h *Handlers) UpdateClusterNodeSiteCoordinates(c *gin.Context) {
 }
 
 func (h *Handlers) UpdateClusterNodeAccessURL(c *gin.Context) {
-	// 门控前置（历史问题）：导入窗口 409 / 主节点 403 必须先于请求体解析——
+	// 门控前置：导入窗口 409 / 主节点 403 必须先于请求体解析——
 	// 先 bind 会让窗口内/从端请求拿到 400 解析错误而非真实门控语义。两道门
 	// 幂等无副作用，clusterNodeAction 内重复执行安全。
 	if rejectNodeWriteDuringImport(c) {
@@ -250,7 +250,7 @@ func (h *Handlers) UpdateClusterNodeAccessURL(c *gin.Context) {
 }
 
 func (h *Handlers) clusterNodeAction(c *gin.Context, action string, operation func(int) error) {
-	// 历史问题：审批/拒绝/删除共用的写端点收口——导入窗口 409 fast-fail。
+	// 审批/拒绝/删除共用的写端点收口——导入窗口 409 fast-fail。
 	if rejectNodeWriteDuringImport(c) {
 		return
 	}
@@ -263,7 +263,7 @@ func (h *Handlers) clusterNodeAction(c *gin.Context, action string, operation fu
 		return
 	}
 	if err := operation(id); err != nil {
-		// 历史问题：服务层降级竞态 403 与 requireMaster 门同源带头。
+		// 服务层降级竞态 403 与 requireMaster 门同源带头。
 		if errors.Is(err, services.ErrNotMasterNode) {
 			clusterMasterForbidden(c, err)
 			return
@@ -273,7 +273,7 @@ func (h *Handlers) clusterNodeAction(c *gin.Context, action string, operation fu
 			status = http.StatusNotFound
 		}
 		if errors.Is(err, services.ErrNodeNotPending) {
-			// 历史问题-3:重复审批/已处理节点 409,与「不存在」404 分判。
+			// 重复审批/已处理节点 409,与「不存在」404 分判。
 			status = http.StatusConflict
 		}
 		// 非法访问地址是客户端可修正的输入问题，

@@ -57,7 +57,7 @@ func (idx *CRSRuleIndex) Has(ruleID string) bool {
 }
 
 // Find 返回 ruleID 的索引条目（id 升序线性扫描）；不存在返回 nil。
-// Find 线性扫描返回首个同 id 条目（切片升序即最低 id）。历史修复
+// Find 线性扫描返回首个同 id 条目（切片升序即最低 id）。
 // 评估过集合化：需把 ids 集合值改为切片下标，收益在每条目 µs 级——裁定保留
 // 现实现（调用点为配置构建/预览路径，非请求热路径），注释声明为有意取舍。
 func (idx *CRSRuleIndex) Find(ruleID string) *CRSRuleIndexEntry {
@@ -362,7 +362,7 @@ var (
 	crsRuleIndexKey   string
 )
 
-// crsRuleIndexVersion 读取 security_crs_version 行值（历史问题：收敛到
+// crsRuleIndexVersion 读取 security_crs_version 行值（收敛到
 // readCurrentCRSVersion 单一真源——此前这里与更新判定各有一套「空串 vs
 // bundled」口径）。索引读取的容错口径保留：库不可用/读失败回落空串（索引
 // 仍可用，仅版本展示为空）；行缺失/空值按首装口径回落 bundled，与更新判定
@@ -462,7 +462,7 @@ func GetCRSRuleIndex() *CRSRuleIndex {
 	return index
 }
 
-// lazyCRSRuleIndex（历史修复）返回链级惰性索引取值闭包：单次配置生成内
+// lazyCRSRuleIndex返回链级惰性索引取值闭包：单次配置生成内
 // BuildCorazaDirectives 的三个消费点（crsCoveredInfraGroupCodes /
 // emitCRSRuleGroupSelection / emitScopedCRSExclusions）各自直调 GetCRSRuleIndex
 // 会各付一次缓存键计算（ReadDir + 全量 stat + DB 查询），200 规则全量生成时

@@ -1,6 +1,6 @@
 package handlers
 
-// 历史修复(历史问题/4、历史问题、历史问题、历史问题、历史问题)的行为规格:
+// (/4）的行为规格
 // OIDC 令牌 pwd_ver、state 容量上限、discovery 负缓存、JIT 空白用户名兜底、
 // OIDC 用户 username 不可改、初始管理员不可降级、回调失败 302 回前端。
 
@@ -51,7 +51,7 @@ func oidcLoginAndGetClaims(t *testing.T, router *gin.Engine) jwt.MapClaims {
 	return parsed.Claims.(jwt.MapClaims)
 }
 
-// 历史问题:OIDC JWT 必须携带 pwd_ver 且随 DB password_version 变化——否则任何
+// OIDC JWT 必须携带 pwd_ver 且随 DB password_version 变化——否则任何
 // 配置导入(password_version+1)后 OIDC 会话永久 401 死循环(jwtAuth 对缺
 // pwd_ver 且 DB 版本≠0 的令牌恒拒)。
 func TestOIDCCallback_token_carries_pwd_ver(t *testing.T) {
@@ -101,7 +101,7 @@ func TestOIDCLogin_state_entries_capped(t *testing.T) {
 			t.Fatalf("login %d should pass under cap, got %d", i+1, rec.Code)
 		}
 	}
-	// When:第三次 login(在册已达上限)→ 302 登录页错误位(历史问题-2:
+	// When:第三次 login(在册已达上限)→ 302 登录页错误位
 	// 浏览器导航形态,失败不渲染 429 JSON)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/auth/oidc/login", nil))
@@ -109,7 +109,7 @@ func TestOIDCLogin_state_entries_capped(t *testing.T) {
 		t.Fatalf("login beyond state cap must 302 to login error page, got %d body=%s", rec.Code, rec.Body.String())
 	}
 
-	// 历史问题 复审形状:在册条目全部过期后,新 login 不得被 429 短路——过期清理
+	// 复审形状:在册条目全部过期后,新 login 不得被 429 短路——过期清理
 	// 先于封顶判定执行(否则死条目把 OIDC 登录永久锁死直至重启)。
 	oidcStates.Range(func(k, v any) bool {
 		if e, ok := v.(oidcStateEntry); ok {
@@ -124,7 +124,7 @@ func TestOIDCLogin_state_entries_capped(t *testing.T) {
 	}
 }
 
-// 历史问题:discovery 失败须短 TTL 负缓存——IdP 故障时不重复回源放大。
+// discovery 失败须短 TTL 负缓存——IdP 故障时不重复回源放大。
 func TestOIDCProvider_failure_negative_cache(t *testing.T) {
 	var hits int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -146,7 +146,7 @@ func TestOIDCProvider_failure_negative_cache(t *testing.T) {
 	}
 }
 
-// 历史问题:preferred_username 纯空白经 TrimSpace 后必须走兜底链,不得产出空用户名行。
+// preferred_username 纯空白经 TrimSpace 后必须走兜底链,不得产出空用户名行。
 func TestOIDCCallback_jit_blank_username_falls_back(t *testing.T) {
 	idp := newMockIdP(t)
 	idp.usePref = true
@@ -165,7 +165,7 @@ func TestOIDCCallback_jit_blank_username_falls_back(t *testing.T) {
 	}
 }
 
-// 历史问题:OIDC 用户的 username 同为 IdP 源属性——与显示名/密码同一裁定口径,
+// OIDC 用户的 username 同为 IdP 源属性——与显示名/密码同一裁定口径,
 // 管理员不可改。
 func TestUpdateUser_rejects_oidc_username_change(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -179,7 +179,7 @@ func TestUpdateUser_rejects_oidc_username_change(t *testing.T) {
 	}
 }
 
-// 历史问题:初始管理员 id=1 不可被降级(与不可删除/禁用同语义——break-glass
+// 初始管理员 id=1 不可被降级(与不可删除/禁用同语义——break-glass
 // 能力不可移除);普通管理员间降级不受影响。
 func TestUpdateUser_setup_admin_cannot_be_demoted(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -197,7 +197,7 @@ func TestUpdateUser_setup_admin_cannot_be_demoted(t *testing.T) {
 	}
 }
 
-// 历史问题:回调失败必须 302 回前端错误页(浏览器导航形态),不得渲染裸 JSON。
+// 回调失败必须 302 回前端错误页(浏览器导航形态),不得渲染裸 JSON。
 func TestOIDCCallback_failure_redirects_to_frontend(t *testing.T) {
 	idp := newMockIdP(t)
 	router, _ := setupOIDCTest(t, idp)
@@ -226,7 +226,7 @@ func TestOIDCCallback_failure_redirects_to_frontend(t *testing.T) {
 	}
 }
 
-// 历史问题 补充:负缓存不钉死——invalidate 后上游恢复即成功。
+// 补充:负缓存不钉死——invalidate 后上游恢复即成功。
 func TestOIDCProvider_invalidate_clears_failure(t *testing.T) {
 	var srvURL string
 	var fail atomic.Bool
@@ -252,9 +252,9 @@ func TestOIDCProvider_invalidate_clears_failure(t *testing.T) {
 	}
 }
 
-// 历史问题-2:login 是浏览器整页导航(登录页按钮/链接触发)——失败形态(未启用/
+// login 是浏览器整页导航(登录页按钮/链接触发)——失败形态(未启用/
 // state 封顶/discovery 失败/随机源失败)一律 302 回前端登录页错误位
-// (oidc_error 经 URL fragment 携带),与回调 历史问题 同型,不渲染裸 JSON。
+// (oidc_error 经 URL fragment 携带),与回调同型,不渲染裸 JSON。
 func TestOIDCLogin_failure_redirects_to_login_page(t *testing.T) {
 	assertLoginErrorRedirect := func(rec *httptest.ResponseRecorder) {
 		t.Helper()
@@ -306,7 +306,7 @@ func TestOIDCLogin_failure_redirects_to_login_page(t *testing.T) {
 	assertLoginErrorRedirect(rec)
 }
 
-// 历史问题-4:回调 error 参数仅回显 OAuth2 标准错误码——非白名单/超长值一律
+// 回调 error 参数仅回显 OAuth2 标准错误码——非白名单/超长值一律
 // 吞掉(防外部可控文本经登录页当系统提示渲染的社工注入面)。
 func TestOIDCCallback_error_param_sanitized(t *testing.T) {
 	idp := newMockIdP(t)
@@ -347,7 +347,7 @@ func TestOIDCCallback_error_param_sanitized(t *testing.T) {
 	}
 }
 
-// 历史问题-3:JIT 用户名截断必须 rune 安全——byte 截断会把中文/emoji 切成无效
+// JIT 用户名截断必须 rune 安全——byte 截断会把中文/emoji 切成无效
 // UTF-8 落库(前端展示乱码),且冲突去重后缀的长度预算须按 rune 计数。
 func TestOIDCCallback_jit_username_rune_safe_truncation(t *testing.T) {
 	shape := func(pref string, seedCollision string) string {
@@ -404,7 +404,7 @@ func TestOIDCCallback_jit_username_rune_safe_truncation(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：未认证访问者可见的错误位不得回显服务端原始错误——
+// 未认证访问者可见的错误位不得回显服务端原始错误——
 // OIDCLogin 的 discovery 失败此前直接 fail(err.Error())，把 IdP 地址/网络
 // 错误文本写进 #/login?oidc_error=；与回调 error 参数白名单清洗口径相悖。
 // 失败文案归一为固定短句，原始错误仅落日志。
@@ -439,7 +439,7 @@ func TestOIDCLogin_failureMessageDoesNotLeakProviderDetail(t *testing.T) {
 	}
 }
 
-// 历史问题 同族（历史修复）：回调侧 provider 构建/令牌交换/id_token 校验失败同样
+// 同族：回调侧 provider 构建/令牌交换/id_token 校验失败同样
 // 不得把原始错误回显给未认证浏览器。
 func TestOIDCCallback_failureMessageDoesNotLeakProviderDetail(t *testing.T) {
 	idp := newMockIdP(t)
@@ -475,7 +475,7 @@ func TestOIDCCallback_failureMessageDoesNotLeakProviderDetail(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：sanitizeOIDCErrorParam 此前无直接测试——表驱动钉住
+// sanitizeOIDCErrorParam 此前无直接测试——表驱动钉住
 // 白名单/超长/伪造值三形状（回调端到端形态另有
 // TestOIDCCallback_error_param_sanitized）。
 func TestSanitizeOIDCErrorParam_shapes(t *testing.T) {

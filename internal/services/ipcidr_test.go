@@ -44,7 +44,7 @@ func TestNormalizeCIDRs_MappedAndCanonicalForms(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			// Given one real net.历史修复 input shape.
+			// Given one real net. input shape.
 			// When normalizing the whitelist entry.
 			got, err := NormalizeCIDRs([]string{tc.input})
 			if err != nil {

@@ -39,7 +39,7 @@ func newImportRollbackHarness(t *testing.T) importRollbackHarness {
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
-		// 历史问题：直换包级句柄必须同步复位 currentDB（历史修复 契约，
+		// 直换包级句柄必须同步复位 currentDB（契约，
 		// 与 newBackupTestHandlers 同型）——否则 GetDB() 返回 nil/后台循环
 		// 持有已关闭测试库，跨用例污染。
 		db.SetDB(oldDB)
@@ -279,7 +279,7 @@ func TestImportV1Config_removes_orphaned_path_rules(t *testing.T) {
 }
 
 func TestImportV1Config_clears_security_policy_bindings(t *testing.T) {
-	// Given：历史修复——绑定表对 rule_caddy_id 无外键级联，v1 覆盖导入后
+	// Given：绑定表对 rule_caddy_id 无外键级联，v1 覆盖导入后
 	// 不得残留指向已删除规则的悬挂绑定。
 	h := newBackupTestHandlers(t)
 	gin.SetMode(gin.TestMode)
@@ -608,7 +608,7 @@ func stringMustMarshal(t *testing.T, value string) string {
 	return string(data)
 }
 
-// ── 历史问题（历史）：预览 has_waf_files 必须纳入威胁库名单条目
+// ──：预览 has_waf_files 必须纳入威胁库名单条目
 // ——RDB 文件化后存在「仅威胁 .iplist、无 CRS/xdb」的合法 lbbak，此前预览提示
 // 「不含规则库文件」而实际会落盘名单文件（文案与真实能力不符）。 ──
 
@@ -621,7 +621,7 @@ func a3CanonicalThreatURL(t *testing.T, source string) string {
 	return seed.URL
 }
 
-func Test87_P3_12_previewHasWafFilesIncludesThreatOnlyLbbak(t *testing.T) {
+func TestPreviewHasWafFilesIncludesThreatOnlyLbbak(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	overrideTestWafPaths(t)
 	restore := services.OverrideThreatWafDirForTest(t.TempDir())

@@ -11,7 +11,7 @@ import (
 // ConfigFieldSections 配置字段 → 面板卡片段落映射（字段级审计归因用）。
 // 新增 add() 字段（handlers/config_changes.go planConfigChanges）必须同步本表，
 // 否则审计归因落「全局配置」；覆盖清点钉在 handlers/config_field_sections_test.go
-// （历史问题-1：历史修复 同族漏点收敛，曾漏 github_token）。
+// （同族漏点收敛，曾漏 github_token）。
 var ConfigFieldSections = map[string]string{
 	"acme_email":             "ACME配置",
 	"cert_expiry_days":       "ACME配置",
@@ -55,15 +55,15 @@ var ConfigFieldSections = map[string]string{
 	"jwt_expire_minutes":     "基础设置",
 	"timezone":               "基础设置",
 	"github_proxy_url":       "基础设置",
-	// 历史修复(2026-09-10 审计):历史问题 增补的两个安全开关漏同步 section 映射,审计
+	// (2026-09-10 审计): 增补的两个安全开关漏同步 section 映射,审计
 	// 归因曾落「全局配置」(实际在基础设置卡片)。
-	// 历史问题-1(2026-09-29 审计):同族漏点收敛——github_token 同批入表,审计归因
+	// (2026-09-29 审计):同族漏点收敛——github_token 同批入表,审计归因
 	// 曾落「全局配置」;全字段覆盖清点钉在 handlers/config_field_sections_test.go。
 	"mfa_write_guard":     "基础设置",
 	"mfa_lockout_enabled": "基础设置",
 	"github_token":        "基础设置",
 
-	// 历史问题（历史）：威胁大屏视觉模式与安全事件保留（显式天/行帽）三字段
+	// 威胁大屏视觉模式与安全事件保留（显式天/行帽）三字段
 	// 漏同步 section 映射——字段级审计归因曾落「全局配置」（实际在基础设置卡片）。
 	// 覆盖清点钉已改为源码扫描（handlers/config_field_sections_test.go 提取
 	// planConfigChanges 的 add() 首参，与下表双向比对）。
@@ -148,11 +148,11 @@ func AppendAPIKeyAuditDetail(detail string, keyID int, keyName string) string {
 }
 
 // auditRetentionMonths 读取审计保留月数（audit_retention_months，默认 3）。
-// 历史修复（历史）：三消费点（CleanupAuditLogs/RuntimeLogCleanupOnce/
+// 三消费点（CleanupAuditLogs/RuntimeLogCleanupOnce/
 // taskLogsHousekeeping）统一口径——读取失败（含 global_config 行缺失的
 // ErrNoRows）回退默认 3 月 + warn 留痕（曾静默跳过/静默默认三态分裂）；
 // 值越界（<1）同回退默认（写侧 1-12 校验+启动钳位兜底，正常不可达）。
-// 历史修复（历史）：log-cleanup 摘要行不再自行查库复算月数，改为复用
+// log-cleanup 摘要行不再自行查库复算月数，改为复用
 // RuntimeLogCleanupOnce 回填的 RuntimeCleanupResult.RetentionMonths——仍在
 // 上述三消费点内，未新增第四份口径。
 func auditRetentionMonths() int {
@@ -205,12 +205,12 @@ func CleanupAuditLogs() (int, error) {
 	return total, nil
 }
 
-// FormatAuditAction 中间件侧通用审计的动作映射。历史问题：仅保留 5 条 Generic
+// FormatAuditAction 中间件侧通用审计的动作映射。仅保留 5 条 Generic
 // 路由（auditpolicy.go 分类）中由中间件记录的 3 条 caddy/start|stop|restart——
 // 其余全部 Explicit 路由的 handler 自行显式记录且被 HasExplicitAuditEvent 前置
 // 短路，本函数对它们的映射运行时不可达（死代码，含映射不存在路由 /nodes/register
 // 的历史遗留）；死映射的最大风险是「Explicit 清单漂移漏掉某路由时中间件恢复
-// 映射记录 → 与 handler 显式记录叠加成双条」（历史问题 缺陷形态），故全部删除。
+// 映射记录 → 与 handler 显式记录叠加成双条」，故全部删除。
 // 新增路由的审计分工：handler 显式记录 → 入 auditRoutePolicies 为 Explicit；
 // 由中间件记录 → 入 Generic 并在本函数补映射 + TestAuditGenericRoutesExactlyOnce
 // 登记表同步。契约绊线见 TestAuditExplicitRoutesMappingEmpty / TestAuditPolicyListsEqual。
@@ -219,11 +219,11 @@ func FormatAuditAction(method, path string) (action, resource, detail string) {
 	detail = p
 
 	switch {
-	// 历史问题：/api/v1/config 为 Explicit（handler 记录，HasExplicitAuditEvent
+	// /api/v1/config 为 Explicit（handler 记录，HasExplicitAuditEvent
 	// 前置短路）；/config/reload 为 Generic 且由 handler（ReloadCaddy）显式记录，
 	// 中间件经本函数的空映射跳过（不记录）——两者均无需映射 case，走兜底空返回。
 	// 注意勿为 reload 补映射：Generic + handler 记录 + 非空映射 = 单次动作双条
-	//（历史问题 缺陷形态，TestAuditGenericRoutesExactlyOnce 钉住）。
+	//（缺陷形态，TestAuditGenericRoutesExactlyOnce 钉住）。
 
 	case strings.Contains(p, "/caddy/start"):
 		return "启动", "Caddy服务", p

@@ -45,7 +45,7 @@ func TestIsSynchronizedWrite_classifies_only_snapshot_content_mutations(t *testi
 		{"POST", "/api/v1/config/import", true},
 		{"POST", "/api/v1/config/import/v1", true},
 		{"POST", "/api/v1/config/import/validate", false},
-		// 历史问题(历史评审):还原经 importConfigBackupCore 重写 lb_rules/
+		// 还原经 importConfigBackupCore 重写 lb_rules/
 		// upstreams 等全部同步表,必须与 /config/import 同口径 fail-closed;
 		// run/delete 仅写 auto_backups 本地簿记表(非同步表),不放行。
 		{"POST", "/api/v1/auto-backup/:id/restore", true},
@@ -59,7 +59,7 @@ func TestIsSynchronizedWrite_classifies_only_snapshot_content_mutations(t *testi
 		{"POST", "/api/v1/certificates/parse", false},
 		{"GET", "/api/v1/certificates/jobs/:id", false},
 		{"PUT", "/api/v1/ca-providers/:id", true},
-		// 历史问题（历史）：test 端点在 ZeroSSL 缺 EAB 时写
+		// test 端点在 ZeroSSL 缺 EAB 时写
 		// ca_providers.credentials（同步表），与 PUT 同口径 fail-closed。
 		{"POST", "/api/v1/ca-providers/:id/test", true},
 		{"POST", "/api/v1/ca-providers/7/test", true},
@@ -88,14 +88,14 @@ func TestIsSynchronizedWrite_classifies_only_snapshot_content_mutations(t *testi
 		// 第二份任务 ID/同步写清单。其他任务操作不据此捕获。
 		{"POST", "/api/v1/system/tasks/:id/trigger", true},
 		{"POST", "/api/v1/system/tasks/:id/toggle", false},
-		// 历史问题-1（历史）：大屏流量采集租约是 Caddy admin 的纯代理
+		// 大屏流量采集租约是 Caddy admin 的纯代理
 		//（内存租约，不写任何同步表）——不得按 security 前缀误分类为
 		// 同步写（触发器降级态会把它误伤成 500）。
 		{"POST", "/api/v1/security/overview/threat-screen/collector", false},
 		{"DELETE", "/api/v1/security/overview/threat-screen/collector", false},
 		{"GET", "/api/v1/security/policies", false},
 		{"GET", "/api/v1/security/custom-rules", false},
-		// 历史修复 登录锁传播（历史问题-3）：密码登录与 MFA 验证步均写
+		// 登录锁传播：密码登录与 MFA 验证步均写
 		// users 同步列（失败置锁 login_locked_until/成功清零解锁），触发器
 		// 不可用时须与 setup/OIDC 开户同口径 fail-closed。
 		{"POST", "/api/v1/auth/login", true},
@@ -112,7 +112,7 @@ func TestIsSynchronizedWrite_classifies_only_snapshot_content_mutations(t *testi
 	}
 }
 
-// 历史修复（历史）：名称如实反映覆盖面——中间件不开启事务（无 BeginTx），
+// 名称如实反映覆盖面——中间件不开启事务（无 BeginTx），
 // 版本递增由 users/lb_rules 等表上的语句级触发器完成；本测试只证明「同步写
 // 单语句即 bump」，不证明多语句 handler 的原子性（见
 // TestClusterVersionMiddleware_statementLevelAtomicityWithoutExplicitTx）。
@@ -158,7 +158,7 @@ func TestClusterVersionMiddleware_bumps_on_synchronized_statement(t *testing.T) 
 	}
 }
 
-// 历史修复（历史）：回滚来自 SQLite 触发器 ABORT 的**语句级**原子性——
+// 回滚来自 SQLite 触发器 ABORT 的**语句级**原子性——
 // 不是中间件事务。多语句 handler 若不显式事务，前序语句会保留提交。
 func TestClusterVersionMiddleware_statement_rolls_back_when_version_bump_fails(t *testing.T) {
 	// Given
@@ -261,7 +261,7 @@ func TestClusterVersionMiddleware_statementLevelAtomicityWithoutExplicitTx(t *te
 	}
 }
 
-// 历史修复 触发器安装失败时中间件必须按 {code,message} APIResponse 契约返回
+// 触发器安装失败时中间件必须按 {code,message} APIResponse 契约返回
 // 500（此前是英文 gin.H{"error":...}，脱离 API 契约且未中文化）。
 func TestClusterVersionMiddleware_rejects_with_api_response_when_trigger_install_fails(t *testing.T) {
 	// Given：触发器安装失败（已关闭的连接让首次 Exec 报错）
@@ -823,8 +823,8 @@ func TestClusterVersionTriggers_bumpForTimestampOnlyUpdates(t *testing.T) {
 		if _, err := database.Exec(`UPDATE cert_jobs SET updated_at=datetime('now') WHERE rule_id='stamp_cert'`); err != nil {
 			t.Fatalf("update job timestamp: %v", err)
 		}
-		// 历史问题(历史):updated_at 是簿记列——单列更新不再 bump
-		// (历史修复 旧语义已改:簿记抖动不再触发全集群重放)
+		// updated_at 是簿记列——单列更新不再 bump
+		// ( 旧语义已改:簿记抖动不再触发全集群重放)
 		if got := clusterVersion(t, database); got != 0 {
 			t.Fatalf("version after member cert updated_at=%d, want 0 (bookkeeping column, 历史问题)", got)
 		}
@@ -910,7 +910,7 @@ func clusterVersion(t *testing.T, database *sql.DB) int {
 	return version
 }
 
-// CL-新1(历史):security_crs_version/security_ip2region_version 的
+// CL-新1:security_crs_version/security_ip2region_version 的
 // last_checked 列是读路径指标(页面浏览即写),必须从触发器 OF 列表排除——
 // 否则 CRS 页面浏览触发 cluster_version+1 → 快照 304 门失效 → 全量下发 +
 // 各从节点强制 Caddy 重载。
@@ -953,7 +953,7 @@ func TestClusterVersionTrigger_lastCheckedExcluded(t *testing.T) {
 	}
 }
 
-// 历史问题-01（历史）：三规则库排程列入集群同步——版本表 schedule_days/
+// 三规则库排程列入集群同步——版本表 schedule_days/
 // schedule_time 与 global_config 威胁库三列（threat_auto_update/threat_schedule_days/
 // threat_schedule_time）自身入触发器 OF 列表：排程写入即 bump cluster_version，
 // 从端经 304 失效收敛。（生产排程保存同语句还写 next_update——本测试刻意只写
@@ -1021,10 +1021,10 @@ func TestClusterVersionTrigger_brandingJSONBumps(t *testing.T) {
 	}
 }
 
-// 历史问题-1(历史):登录热路径同值写 login_locked_until(NULL→NULL、
+// 登录热路径同值写 login_locked_until(NULL→NULL、
 // CASE 保值)不得 bump——SQLite OF 触发器按 SET 列出现即触发,此前每次成功
 // 登录/失败尝试都引发全集群快照重放+从节点强制 Caddy 重载;真实置锁/解锁
-// 过渡(历史修复 锁传播)仍须 bump。
+// 过渡仍须 bump。
 func TestClusterVersionTrigger_loginHotPathNoBump(t *testing.T) {
 	database := newClusterVersionTestDB(t)
 	if err := installClusterVersionTriggers(database); err != nil {
@@ -1058,7 +1058,7 @@ func TestClusterVersionTrigger_loginHotPathNoBump(t *testing.T) {
 	}
 }
 
-// 历史问题(历史):自动备份六设置列入 global_config 触发器 OF 列表——
+// 自动备份六设置列入 global_config 触发器 OF 列表——
 // 主端保存设置 bump cluster_version,从端经 304 失效收敛;auto_backup_last_run
 // 为节点本地运行态(调度器每次备份推进),必须排除在 OF 列表外,否则每次备份
 // 引发全集群快照重放。
@@ -1104,7 +1104,7 @@ func TestClusterVersionTrigger_autoBackupSettingsBumpLastRunExcluded(t *testing.
 	}
 }
 
-// 历史问题(历史):lb_rules 触发器 OF 清单补阶段拦截页 4 列——
+// lb_rules 触发器 OF 清单补阶段拦截页 4 列——
 // block_page_stage1_id/status、block_page_stage3_id/status 是同步面列
 // (cluster_snapshot.go dump 与 cluster_apply.go 重放均携带),此前不在 OF
 // 清单:UpdateRule 指针逐列拼装与 BatchRuleBlockPages 单事务 4 列 UPDATE
@@ -1156,7 +1156,7 @@ func TestClusterVersionTrigger_bumpsOnStagePageColumns(t *testing.T) {
 	}
 }
 
-// 历史问题(历史):security_policies 触发器 OF 清单补 policy_type/
+// security_policies 触发器 OF 清单补 policy_type/
 // trust_detection——两列是同步面列(快照 dump/apply 携带,从端渲染消费
 // stage0 直通与 id:3 并集),此前不在 OF 清单:UpdateSecurityPolicy 仅提交
 // 类型或检测开关、或缺省提交触发合并后重推断回写时不 bump,阶段 0 类型与
@@ -1201,7 +1201,7 @@ func TestClusterVersionTrigger_bumpsOnPolicyTypeColumns(t *testing.T) {
 	}
 }
 
-// 历史问题-8：受信代理四列（trusted_proxy_enabled/ranges/headers/strict）入
+// 受信代理四列（trusted_proxy_enabled/ranges/headers/strict）入
 // global_config UPDATE 触发器 OF 列表（防御对齐）——主端保存受信代理设置
 // 须即 bump cluster_version 随快照下发；不在 OF 内则稳态变更永不传播。
 func TestClusterVersionTriggers_bumpForTrustedProxyColumns(t *testing.T) {
@@ -1230,9 +1230,9 @@ func TestClusterVersionTriggers_bumpForTrustedProxyColumns(t *testing.T) {
 }
 
 // Given loginRateBuckets 已满 1024 桶（容量上限）。
-// When clusterRateLimit 命中新 IP（历史问题：曾建桶无检查——分布式攻击可推满
+// When clusterRateLimit 命中新 IP（曾建桶无检查——分布式攻击可推满
 // 共享 map 使登录限流对新源 fail-open）。
-// Then LRU 淘汰最久未命中桶为新 IP 建桶：请求照常记账（历史问题-1 起不再放行
+// Then LRU 淘汰最久未命中桶为新 IP 建桶：请求照常记账（起不再放行
 // 不计数），map 规模保持上限。
 func TestClusterRateLimitRespectsBucketCap(t *testing.T) {
 	now := time.Now()
@@ -1274,7 +1274,7 @@ func TestClusterRateLimitRespectsBucketCap(t *testing.T) {
 	}
 }
 
-// 历史问题-01（历史）：threat 源的 consecutive_failures 是纯运行态失败计数
+// threat 源的 consecutive_failures 是纯运行态失败计数
 // （failSourceRow 每次失败独立 UPDATE +1），必须与 last_checked 同法从 UPDATE
 // OF 触发列排除——否则源持续不可达期间每轮失败写都 bump cluster_version，
 // 快照 304 门失效、全集群重放。
@@ -1315,12 +1315,12 @@ func TestClusterVersionTrigger_threatConsecutiveFailuresExcluded(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：规则面三表新列 OF 钉测试——lb_rules.health_check_host、
+// 规则面三表新列 OF 钉测试——lb_rules.health_check_host、
 // upstreams.origin_domain、path_rules.upstream_path/response_* 均为快照同步面列
 // （主端导出 SELECT 与从端 INSERT 均携带），OF 漏列则单列 UPDATE 不 bump
 // cluster_version → 快照缓存恒命中旧指纹 → 从端 304 循环，该列稳态永不传播
-// （历史问题 MFA 列事故同型）。每步只写目标单列，钉该列自身的 OF 成员资格。
-// 历史修复（历史）：NTLM 两列（lb_rules.ntlm_compatible/
+// 每步只写目标单列，钉该列自身的 OF 成员资格。
+// NTLM 两列（lb_rules.ntlm_compatible/
 // upstream_force_http1，快照同步面列）补入 steps——900 字符单行 OF 清单无
 // 绊线，未来重构丢列会让 NTLM 切换在从节点稳态永不传播（基线钉测试：列
 // 已在 OF 内，钉既有正确行为）。

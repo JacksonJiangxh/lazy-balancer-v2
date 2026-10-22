@@ -17,37 +17,37 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-func audit79SeedAdmin(t *testing.T) {
+func seedAdminShared(t *testing.T) {
 	t.Helper()
 	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (1,'admin','hash','admin',1)`); err != nil {
 		t.Fatalf("seed admin: %v", err)
 	}
 }
 
-func audit79RuleTables() map[string][]map[string]any {
+func ruleTablesShared() map[string][]map[string]any {
 	return map[string][]map[string]any{
 		"lb_rules": {{
-			"caddy_id": "lb_audit79", "name": "audit79", "protocol": "http",
-			"domain": "audit79.example.test", "listen_port": 18080,
+			"caddy_id": "lb_import_probe", "name": "import-probe", "protocol": "http",
+			"domain": "import.example.test", "listen_port": 18080,
 			"strategy": "weighted_round_robin", "enabled": 0,
 			"health_check_interval": 10, "health_check_timeout": 2,
 			"health_check_unhealthy_threshold": 3, "health_check_healthy_threshold": 2,
 			"tcp_try_interval": 250,
 		}},
 		"upstreams": {{
-			"rule_id": "lb_audit79", "host": "127.0.0.1", "port": 9000,
+			"rule_id": "lb_import_probe", "host": "127.0.0.1", "port": 9000,
 			"weight": 1, "enabled": 1, "protocol": "http", "max_connections": 0,
 		}},
 	}
 }
 
-// 历史修复: bindings must be checked against the post-import rule/policy view;
+// bindings must be checked against the post-import rule/policy view;
 // rules-only replacement must not leave bindings attached to deleted rules.
 func TestImportConfigBackup_postImportRuleBindingView(t *testing.T) {
 	t.Run("security-only uses live rules", func(t *testing.T) {
 		// Given a live rule and a security-only backup that binds a restored policy to it.
 		h := newBackupTestHandlers(t)
-		audit79SeedAdmin(t)
+		seedAdminShared(t)
 		if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,strategy,enabled)
 			VALUES ('lb_live','live','http','live.example.test',18081,'weighted_round_robin',0)`); err != nil {
 			t.Fatal(err)
@@ -58,7 +58,7 @@ func TestImportConfigBackup_postImportRuleBindingView(t *testing.T) {
 		}, Config: nil})
 
 		// When previewing and importing the security section.
-		preview := r41PostValidate(t, h, body)
+		preview := postValidateString(t, h, body)
 		response := postBackupImport(t, h, body)
 
 		// Then the live rule completes the post-import view and the binding is restored.
@@ -77,14 +77,14 @@ func TestImportConfigBackup_postImportRuleBindingView(t *testing.T) {
 	t.Run("rules-only prunes dangling live bindings", func(t *testing.T) {
 		// Given live bindings to both a rule being replaced and the incoming rule.
 		h := newBackupTestHandlers(t)
-		audit79SeedAdmin(t)
+		seedAdminShared(t)
 		if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,strategy,enabled)
 			VALUES ('lb_old','old','http','old.example.test',18082,'weighted_round_robin',0);
 			INSERT INTO security_policies (id,name,mode,enabled) VALUES (7,'live-policy','off',1);
 			INSERT INTO security_policy_bindings (rule_caddy_id,policy_id) VALUES ('lb_old',7),('lb_new',7)`); err != nil {
 			t.Fatal(err)
 		}
-		tables := audit79RuleTables()
+		tables := ruleTablesShared()
 		tables["lb_rules"][0]["caddy_id"] = "lb_new"
 		tables["upstreams"][0]["rule_id"] = "lb_new"
 		body := buildBackup(t, backupFixtureOptions{Sections: []string{"rules"}, Tables: tables, Config: nil})
@@ -112,7 +112,7 @@ func TestImportConfigBackup_postImportRuleBindingView(t *testing.T) {
 	})
 }
 
-// 历史修复: an allowed source name must not make a forged download URL or parser
+// an allowed source name must not make a forged download URL or parser
 // format acceptable. Imported rows converge to the built-in source definition.
 func TestValidateImportedSources_restoreCanonicalEndpoints(t *testing.T) {
 	// Given allowed names carrying attacker-controlled endpoint metadata.
@@ -138,7 +138,7 @@ func TestValidateImportedSources_restoreCanonicalEndpoints(t *testing.T) {
 	}
 }
 
-// 历史修复: users-only import must not run security/rule/block-page
+// users-only import must not run security/rule/block-page
 // post-processing against tables that were not selected.
 func TestImportConfigBackup_unselectedSectionsHaveNoPostProcessing(t *testing.T) {
 	// Given live state that each currently unguarded post-processor would rewrite.
@@ -198,7 +198,7 @@ func TestImportConfigBackup_unselectedSectionsHaveNoPostProcessing(t *testing.T)
 	}
 }
 
-// 历史修复: v2 rule rows must pass the same health/retry/header/path/domain
+// v2 rule rows must pass the same health/retry/header/path/domain
 // constraints as the save path after import normalization.
 func TestValidateV2BackupRules_saveSideValueDomain(t *testing.T) {
 	tests := []struct {
@@ -215,7 +215,7 @@ func TestValidateV2BackupRules_saveSideValueDomain(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Given an otherwise valid stored-rule row.
-			tables := audit79RuleTables()
+			tables := ruleTablesShared()
 			tt.mutate(tables["lb_rules"][0])
 
 			// When / Then the import gate rejects the invalid value.
@@ -225,8 +225,37 @@ func TestValidateV2BackupRules_saveSideValueDomain(t *testing.T) {
 		})
 	}
 	// Regression: the unmodified stored-rule shape remains valid.
-	if err := validateV2BackupRules(audit79RuleTables()); err != nil {
+	if err := validateV2BackupRules(ruleTablesShared()); err != nil {
 		t.Fatalf("valid rule regression: %v", err)
+	}
+}
+
+func TestValidateV2BackupRules_enforcesRuleTextLengths(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(map[string]any)
+		wantMsg string
+	}{
+		{name: "name above limit", mutate: func(rule map[string]any) { rule["name"] = strings.Repeat("名", maxRuleNameRunes+1) }, wantMsg: "规则名称过长"},
+		{name: "description above limit", mutate: func(rule map[string]any) { rule["description"] = strings.Repeat("述", maxRuleDescriptionRunes+1) }, wantMsg: "规则描述过长"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tables := ruleTablesShared()
+			tt.mutate(tables["lb_rules"][0])
+			err := validateV2BackupRules(tables)
+			if err == nil || !strings.Contains(err.Error(), "规则 #1") || !strings.Contains(err.Error(), tt.wantMsg) {
+				t.Fatalf("import length error=%v, want rule #1 and %q", err, tt.wantMsg)
+			}
+		})
+	}
+
+	// Exact rune boundaries remain valid and byte length is not the metric.
+	tables := ruleTablesShared()
+	tables["lb_rules"][0]["name"] = strings.Repeat("名", maxRuleNameRunes)
+	tables["lb_rules"][0]["description"] = strings.Repeat("述", maxRuleDescriptionRunes)
+	if err := validateV2BackupRules(tables); err != nil {
+		t.Fatalf("exact rune boundaries rejected: %v", err)
 	}
 }
 
@@ -235,21 +264,21 @@ func TestValidateBackupRuleReferences_saveSideUpstreamValueDomain(t *testing.T) 
 		name      string
 		upstreams []map[string]any
 	}{
-		{name: "empty host", upstreams: []map[string]any{{"rule_id": "lb_audit79", "host": "", "port": 9000, "weight": 1, "enabled": 1}}},
-		{name: "invalid host", upstreams: []map[string]any{{"rule_id": "lb_audit79", "host": "bad host", "port": 9000, "weight": 1, "enabled": 1}}},
-		{name: "zero port", upstreams: []map[string]any{{"rule_id": "lb_audit79", "host": "127.0.0.1", "port": 0, "weight": 1, "enabled": 1}}},
-		{name: "port above range", upstreams: []map[string]any{{"rule_id": "lb_audit79", "host": "127.0.0.1", "port": 65536, "weight": 1, "enabled": 1}}},
-		{name: "negative weight", upstreams: []map[string]any{{"rule_id": "lb_audit79", "host": "127.0.0.1", "port": 9000, "weight": -1, "enabled": 1}}},
-		{name: "negative connections", upstreams: []map[string]any{{"rule_id": "lb_audit79", "host": "127.0.0.1", "port": 9000, "weight": 1, "max_connections": -1, "enabled": 1}}},
+		{name: "empty host", upstreams: []map[string]any{{"rule_id": "lb_import_probe", "host": "", "port": 9000, "weight": 1, "enabled": 1}}},
+		{name: "invalid host", upstreams: []map[string]any{{"rule_id": "lb_import_probe", "host": "bad host", "port": 9000, "weight": 1, "enabled": 1}}},
+		{name: "zero port", upstreams: []map[string]any{{"rule_id": "lb_import_probe", "host": "127.0.0.1", "port": 0, "weight": 1, "enabled": 1}}},
+		{name: "port above range", upstreams: []map[string]any{{"rule_id": "lb_import_probe", "host": "127.0.0.1", "port": 65536, "weight": 1, "enabled": 1}}},
+		{name: "negative weight", upstreams: []map[string]any{{"rule_id": "lb_import_probe", "host": "127.0.0.1", "port": 9000, "weight": -1, "enabled": 1}}},
+		{name: "negative connections", upstreams: []map[string]any{{"rule_id": "lb_import_probe", "host": "127.0.0.1", "port": 9000, "weight": 1, "max_connections": -1, "enabled": 1}}},
 		{name: "duplicate host port", upstreams: []map[string]any{
-			{"rule_id": "lb_audit79", "host": "127.0.0.1", "port": 9000, "weight": 1, "enabled": 1},
-			{"rule_id": "lb_audit79", "host": "127.0.0.1", "port": 9000, "weight": 2, "enabled": 1},
+			{"rule_id": "lb_import_probe", "host": "127.0.0.1", "port": 9000, "weight": 1, "enabled": 1},
+			{"rule_id": "lb_import_probe", "host": "127.0.0.1", "port": 9000, "weight": 2, "enabled": 1},
 		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Given upstream rows owned by a valid rule.
-			tables := audit79RuleTables()
+			tables := ruleTablesShared()
 			tables["upstreams"] = tt.upstreams
 
 			// When / Then save-side upstream validation is not 绕过ed.
@@ -258,7 +287,7 @@ func TestValidateBackupRuleReferences_saveSideUpstreamValueDomain(t *testing.T) 
 			}
 		})
 	}
-	if err := validateBackupRuleReferences(audit79RuleTables()); err != nil {
+	if err := validateBackupRuleReferences(ruleTablesShared()); err != nil {
 		t.Fatalf("valid upstream regression: %v", err)
 	}
 }
@@ -297,7 +326,7 @@ func TestValidateConvertedV1Rules_saveSideValueDomain(t *testing.T) {
 	}
 }
 
-// 历史修复: auto-backup PATCH rows must be validated after merging omitted
+// auto-backup PATCH rows must be validated after merging omitted
 // frequency/day fields from the live configuration.
 func TestImportAutoBackupSettings_validatesMergedLiveSchedule(t *testing.T) {
 	tests := []struct {
@@ -321,8 +350,8 @@ func TestImportAutoBackupSettings_validatesMergedLiveSchedule(t *testing.T) {
 			body := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: nil, Config: tt.cfg, Sections: []string{"users"}, EmptyConfigIfNil: true})
 
 			// When running both preview and import.
-			preview := r78ValidateResponse(t, h, body)
-			response := r78Import(h, t, body)
+			preview := validateResponseShared(t, h, body)
+			response := importBackupShared(h, t, body)
 
 			// Then both make the same decision about the final merged schedule.
 			wantValid := tt.wantStatus == http.StatusOK
@@ -336,7 +365,7 @@ func TestImportAutoBackupSettings_validatesMergedLiveSchedule(t *testing.T) {
 	}
 }
 
-// 历史修复: branding_json is a mirror, not the source of truth. Import must
+// branding_json is a mirror, not the source of truth. Import must
 // materialize the file and re-render dependent branding output.
 func TestImportConfigBackup_materializesBranding(t *testing.T) {
 	tests := []struct {
@@ -362,7 +391,7 @@ func TestImportConfigBackup_materializesBranding(t *testing.T) {
 			body := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: nil, Config: map[string]any{"branding_json": tt.content}, Sections: []string{"users"}, EmptyConfigIfNil: true})
 
 			// When importing the mirrored value and then refreshing the mirror once more.
-			response := r78Import(h, t, body)
+			response := importBackupShared(h, t, body)
 			if response.Code != http.StatusOK {
 				t.Fatalf("import status=%d body=%s, want 200", response.Code, response.Body.String())
 			}
@@ -414,7 +443,7 @@ func TestImportConfigBackup_malformedBrandingWarnsAndKeepsFile(t *testing.T) {
 	body := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: nil, Config: map[string]any{"branding_json": "not-json"}, Sections: []string{"users"}, EmptyConfigIfNil: true})
 
 	// When importing it.
-	response := r78Import(h, t, body)
+	response := importBackupShared(h, t, body)
 
 	// Then the file source and DB mirror stay on the last valid value, visibly warned.
 	if response.Code != http.StatusOK {
@@ -436,13 +465,13 @@ func TestImportConfigBackup_malformedBrandingWarnsAndKeepsFile(t *testing.T) {
 	}
 }
 
-// 历史修复: replacing crawler configuration must immediately rebuild the file
+// replacing crawler configuration must immediately rebuild the file
 // consumed by caddygeoip, rather than waiting for restart or a later download.
 func TestImportConfigBackup_rebuildsCrawlerSnapshot(t *testing.T) {
 	// Given a stale runtime snapshot and a backup carrying a different crawler list.
 	h := newBackupTestHandlers(t)
-	audit79SeedAdmin(t)
-	// 历史问题（历史）：go:linkname 改写 services 未导出变量 →
+	seedAdminShared(t)
+	// go:linkname 改写 services 未导出变量 →
 	// 正式测试缝 services.SetCrawlerIPListFileForTest（返回还原闭包）。
 	snapshotPath := filepath.Join(t.TempDir(), "crawler-ip-lists.json")
 	t.Cleanup(services.SetCrawlerIPListFileForTest(snapshotPath))
@@ -474,7 +503,7 @@ func TestImportConfigBackup_rebuildsCrawlerSnapshot(t *testing.T) {
 	}
 }
 
-// 历史修复: runtime retention fields follow the save-side bounds.
+// runtime retention fields follow the save-side bounds.
 func TestValidateV2BackupRuntimeSettings_securityEventRetentionBounds(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -488,7 +517,7 @@ func TestValidateV2BackupRuntimeSettings_securityEventRetentionBounds(t *testing
 		{name: "negative row cap", key: "security_events_row_cap", value: -1, wantErr: true},
 		{name: "excess row cap", key: "security_events_row_cap", value: 100000001, wantErr: true},
 		{name: "non numeric row cap", key: "security_events_row_cap", value: "abc", wantErr: true},
-		// 历史问题-5（历史裁定）：0=自动旧语义废除，导入按显式默认归一（见下个测试）。
+		// 0=自动旧语义废除，导入按显式默认归一（见下个测试）。
 		{name: "legacy zero retention normalized", key: "security_events_retention_days", value: 0},
 		{name: "maximum retention", key: "security_events_retention_days", value: 3650},
 		{name: "legacy zero row cap normalized", key: "security_events_row_cap", value: 0},
@@ -505,7 +534,7 @@ func TestValidateV2BackupRuntimeSettings_securityEventRetentionBounds(t *testing
 	}
 }
 
-// 历史问题-5（历史裁定）：导入的 0（旧「自动」语义）归一为显式默认
+// 导入的 0（旧「自动」语义）归一为显式默认
 // 90 天 / 1,000,000 行；写侧随后只接受 1..max。
 func TestValidateV2BackupRuntimeSettings_zeroRetentionNormalizedToDefaults(t *testing.T) {
 	config := map[string]any{
@@ -531,7 +560,7 @@ func TestImportConfigBackup_normalizesRequestBodyIntegerShapes(t *testing.T) {
 			body := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: nil, Config: map[string]any{"request_body_max_size_mb": raw}, Sections: []string{"users"}, EmptyConfigIfNil: true})
 
 			// When importing it.
-			response := r78Import(h, t, body)
+			response := importBackupShared(h, t, body)
 
 			// Then the schema default is stored instead of non-integer text/REAL.
 			if response.Code != http.StatusOK {
@@ -549,7 +578,7 @@ func TestImportConfigBackup_normalizesRequestBodyIntegerShapes(t *testing.T) {
 	for _, raw := range []any{"abc", 1.5} {
 		t.Run("rule "+fmt.Sprint(raw), func(t *testing.T) {
 			// Given a non-integer rule-level override.
-			tables := audit79RuleTables()
+			tables := ruleTablesShared()
 			tables["lb_rules"][0]["request_body_max_size_mb"] = raw
 
 			// When / Then import normalization restores the rule-level zero default.
@@ -564,7 +593,7 @@ func TestImportConfigBackup_normalizesRequestBodyIntegerShapes(t *testing.T) {
 	}
 }
 
-// 历史修复: all listed NOT NULL DEFAULT columns normalize explicit JSON null.
+// all listed NOT NULL DEFAULT columns normalize explicit JSON null.
 // path_rules also proves defaults are applied before match-type validation.
 func TestImportConfigBackup_normalizesRemainingNullDefaults(t *testing.T) {
 	t.Run("restore table defaults", func(t *testing.T) {
@@ -619,14 +648,14 @@ func TestImportConfigBackup_normalizesRemainingNullDefaults(t *testing.T) {
 	t.Run("path defaults precede validation", func(t *testing.T) {
 		// Given an import whose path match type and sort order are explicit NULL.
 		h := newBackupTestHandlers(t)
-		audit79SeedAdmin(t)
-		tables := audit79RuleTables()
-		tables["path_rules"] = []map[string]any{{"rule_id": "lb_audit79", "sort_order": nil, "match_type": nil, "path": "/null"}}
+		seedAdminShared(t)
+		tables := ruleTablesShared()
+		tables["path_rules"] = []map[string]any{{"rule_id": "lb_import_probe", "sort_order": nil, "match_type": nil, "path": "/null"}}
 		tables["lb_rules"][0]["custom_routes_enabled"] = 1
 		body := buildBackup(t, backupFixtureOptions{Sections: []string{"rules"}, Tables: tables, Config: nil})
 
 		// When / Then both preview and import use the schema defaults, not a 400/500.
-		if preview := r41PostValidate(t, h, body); !preview.Valid {
+		if preview := postValidateString(t, h, body); !preview.Valid {
 			t.Errorf("preview rejected NULL path defaults: %s", preview.Error)
 		}
 		if response := postBackupImport(t, h, body); response.Code != http.StatusOK {
@@ -635,7 +664,7 @@ func TestImportConfigBackup_normalizesRemainingNullDefaults(t *testing.T) {
 	})
 }
 
-// 历史修复: JSON null is not a JSON object, while empty/object shapes retain
+// JSON null is not a JSON object, while empty/object shapes retain
 // their existing behavior.
 func TestValidateCredentialsJSONObject_rejectsNull(t *testing.T) {
 	// Given / When / Then all object/non-object shapes follow the credential contract.
@@ -651,11 +680,11 @@ func TestValidateCredentialsJSONObject_rejectsNull(t *testing.T) {
 	}
 }
 
-// ── 历史问题（历史）：仅导入「安全防护」分类时，备份携带的
+// ──：仅导入「安全防护」分类时，备份携带的
 // security_policy_bindings 指向 live TCP 规则——TCP 渲染链不消费策略，绑定为
 // 死绑定，必须在插入后清理（策略页不得宣称生效而运行态零防护）。 ──
 
-func Test87_P3_04_securityOnlyImportDropsTCPRuleBindings(t *testing.T) {
+func TestSecurityOnlyImportDropsTCPRuleBindings(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	a3SeedLiveAdmin(t)
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled)

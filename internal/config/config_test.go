@@ -93,7 +93,7 @@ func TestLoad_resolves_log_file_with_default(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：配置文件只解析六个支持键，其余键此前静默忽略——
+// 配置文件只解析六个支持键，其余键此前静默忽略——
 // log_file/node_name/jwt_secret/backup_dir/version 写在文件里既无效也无提示。
 // 未知键必须逐条告警；支持键零告警且照常生效。
 func TestLoad_warnsOnUnsupportedConfigFileKeys(t *testing.T) {
@@ -171,7 +171,7 @@ func TestLoad_warnsOnSupportedConfigFileKeyTypeMismatch(t *testing.T) {
 	}
 }
 
-// 历史问题-5：jwt_secret 路径存在但读取失败（非 ENOENT——瞬时
+// jwt_secret 路径存在但读取失败（非 ENOENT——瞬时
 // IO/ACL 形态，测试用「同名目录」确定性复现）此前静默落入重生成——写入
 // 成功则全部 JWT 失效且零日志。必须 warn 可见（与过短/目录/写失败分支
 // 同一可见性准则）。
@@ -199,7 +199,7 @@ func TestLoadOrCreateJWTSecret_readErrorWarnsBeforeRegenerate(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：jwt_secret 文件存在但内容过短（非空且 <32 字节）时，
+// jwt_secret 文件存在但内容过短（非空且 <32 字节）时，
 // 覆写重生成必须 log warn——对齐同文件端口回退/密钥目录创建失败分支的可见性
 // 准则；此前静默覆写，旧令牌全部失效且零信号。
 func TestLoadOrCreateJWTSecret_shortSecretWarnsAndRegenerates(t *testing.T) {
@@ -284,7 +284,7 @@ func TestLoadOrCreateJWTSecret_validReusedAndEmptyQuiet(t *testing.T) {
 	})
 }
 
-// 历史问题-2：JWT_SECRET 环境变量过短必须告警可见（文件通道强制 ≥32 并再生，
+// JWT_SECRET 环境变量过短必须告警可见（文件通道强制 ≥32 并再生，
 // 环境变量通道此前完全不校验——3 字节 HS256 密钥可离线爆破）。
 func TestLoad_warnsOnShortEnvJWTSecret(t *testing.T) {
 	t.Setenv("JWT_SECRET", "abc")
@@ -302,7 +302,7 @@ func TestLoad_warnsOnShortEnvJWTSecret(t *testing.T) {
 		t.Fatalf("short env secret must warn, got %q", logBuf.String())
 	}
 
-	// 回归形状：≥32 字节的高熵环境变量零告警（历史修复 起仅长度达标不足够）。
+	// 回归形状：≥32 字节的高熵环境变量零告警。
 	strong := "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a3928"
 	t.Setenv("JWT_SECRET", strong)
 	logBuf.Reset()
@@ -314,7 +314,7 @@ func TestLoad_warnsOnShortEnvJWTSecret(t *testing.T) {
 	}
 }
 
-// 历史问题-4：metrics_interval 的 ≤0 与超范围必须告警且结果确定（旧实现 0/负值
+// metrics_interval 的 ≤0 与超范围必须告警且结果确定（旧实现 0/负值
 // 静默回落默认；巨值 float→int 回绕后可能被静默抬成 5s 高频采集）。
 func TestLoad_metricsIntervalBoundsWarn(t *testing.T) {
 	t.Setenv("JWT_SECRET", "test-secret")
@@ -372,7 +372,7 @@ func TestLoad_normalizesRelativeDataDir(t *testing.T) {
 	}
 }
 
-// 历史修复：仅长度检查会让 32 个空格/单字符重复通过——可预测的 HS256 密钥
+// 仅长度检查会让 32 个空格/单字符重复通过——可预测的 HS256 密钥
 // 等价于无签名（JWT/OIDC state 可离线伪造）。低熵形态必须告警可见，且仍
 // 保持「env 是运维显式输入、不自动替换」的既有裁定。
 func TestLoad_warnsOnLowEntropyEnvJWTSecret(t *testing.T) {
@@ -404,7 +404,7 @@ func TestLoad_warnsOnLowEntropyEnvJWTSecret(t *testing.T) {
 	}
 }
 
-// 历史修复：port 必须与 metrics_interval 同口径——先判界再 float→int 转换。
+// port 必须与 metrics_interval 同口径——先判界再 float→int 转换。
 // 1e300/0 直接转换会产生实现相关整数与怪日志；8000.9 仍须留痕截断。
 func TestLoad_portBoundsBeforeConversion(t *testing.T) {
 	cases := []struct {

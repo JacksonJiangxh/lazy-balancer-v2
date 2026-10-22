@@ -1,6 +1,6 @@
 package handlers
 
-// GITHUB_TOKEN 配置面（2026-09-25 用户裁定；历史问题 改三态）：响应面
+// GITHUB_TOKEN 配置面（2026-09-25 用户裁定；改三态）：响应面
 // 永不回显原文（仅 has_github_token 显隐）；PUT 省略=保持、空串=清除、
 // 非空=覆盖。
 
@@ -66,7 +66,7 @@ func TestPutConfig_githubTokenSetClearAndKeep(t *testing.T) {
 		t.Fatalf("token=%q, want ghp_new_token（非空覆盖）", got)
 	}
 
-	// When：显式空串——清除（历史问题，用户裁定三态语义：
+	// When：显式空串——清除（用户裁定三态语义
 	// nil=保持、空串=清除、非空=覆盖；令牌必须有撤销路径，对照 OIDC 整清端点）
 	if r := put(`{"source":"basic","github_token":""}`); r.Code != http.StatusOK {
 		t.Fatalf("空串 status=%d, want 200", r.Code)

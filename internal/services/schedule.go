@@ -26,9 +26,9 @@ const (
 	defaultScheduleTime = "04:00"
 )
 
-// 排程槽推进门共享 SQL 片段（历史问题，历史）：仅 auto 触发且现存
+// 排程槽推进门共享 SQL 片段：仅 auto 触发且现存
 // 槽空/过期才推进——手动触发不动预约、未来槽不回拨。此前同一谓词在
-// CRS/IP2Region/威胁情报三族 8 处内联重复（历史同型漏同步两起），此处收敛
+// CRS/IP2Region/威胁情报三族 8 处内联重复（同型漏同步两起），此处收敛
 // 为单一事实源；参数序恒为「触发来源（?='auto'）、下一槽值（?）」。
 // 分族前缀：版本表族（CRS/IP2Region）在谓词前叠加 auto_update=1 门；
 // 威胁源族无 auto_update 列（启用门走 WHERE update_enabled=1 重排，见
@@ -197,16 +197,16 @@ func logScheduleReadRecovered(key string) {
 }
 
 // LogConfigReadFailure / LogConfigReadRecovered 排程/配置读失败留痕的包外
-// 入口（历史问题：与 logScheduleReadFailure 同一状态机单源）——handlers
+// 入口（与 logScheduleReadFailure 同一状态机单源）——handlers
 // 侧配置直读（如日志统计阈值读取）复用；文案以 key 区分配置项，禁止另造
 // 静默或每轮刷屏的平行实现。
 func LogConfigReadFailure(key string, err error) { logScheduleReadFailure(key, err) }
 func LogConfigReadRecovered(key string)          { logScheduleReadRecovered(key) }
 
-// versionTableNextUpdate 读版本表当前排程槽（空串=未排程）——历史修复 同批，
+// versionTableNextUpdate 读版本表当前排程槽（空串=未排程）——同批，
 // 引擎 NextSlotFn 的 DB 直读数据源（不经管理器实例）。
 func versionTableNextUpdate(table string) string {
-	// 历史修复（历史）：nil 库守卫——NextSlotFn fail-closed（零值槽）。
+	// nil 库守卫——NextSlotFn fail-closed（零值槽）。
 	if db.DB == nil {
 		return ""
 	}
@@ -292,7 +292,7 @@ func earliestEnabledSourceUpdate(sourceTable string) string {
 		return ""
 	}
 	var next string
-	// 历史问题：读失败不得静默归零（引擎按零槽停摆）——接 logScheduleReadFailure
+	// 读失败不得静默归零（引擎按零槽停摆）——接 logScheduleReadFailure
 	// 单源首报留痕，恢复补 info；next=="9999" 是「无启用源排程」正常形态非错误。
 	if err := db.DB.QueryRow(`SELECT MIN(COALESCE(NULLIF(next_update,''), '9999')) FROM ` + sourceTable + ` WHERE update_enabled=1`).Scan(&next); err != nil {
 		logScheduleReadFailure("schedule-earliest-"+sourceTable, err)
@@ -320,7 +320,7 @@ func setVersionTableSchedule(table, seedVersion string, days []int, hhmm string)
 	if err != nil {
 		return err
 	}
-	// 2026-09-25 用户裁定：失败退避撤除——一律重排到新槽（原 历史问题 失败行保留
+	// 2026-09-25 用户裁定：失败退避撤除——一律重排到新槽（原失败行保留
 	// 退避的 IIF 守卫随退避机制一并移除）。
 	next := NextScheduledSlot(time.Now().UTC(), norm, hhmm, CurrentLocation()).UTC().Format(crsTimeLayout)
 	// 两步写事务化，与同文件 setGlobalTaskSchedule
@@ -382,7 +382,7 @@ func setGlobalTaskSchedule(prefix, sourceTable string, days []int, hhmm string) 
 
 // SetThreatSchedule 保存威胁库任务级排程（global_config）并重排全部启用源的
 // next_update（2026-09-25 用户裁定：失败源不再保留退避，一律重排到新槽）。
-// 历史修复（历史）：两步写事务化——跨表双写曾各自独立提交，第二步失败
+// 两步写事务化——跨表双写曾各自独立提交，第二步失败
 // 留「排程已改、槽位照旧」中间态；现失败整体回滚报错。
 func SetThreatSchedule(days []int, hhmm string) error {
 	return setGlobalTaskSchedule("threat", "security_threat_sources", days, hhmm)
@@ -391,4 +391,29 @@ func SetThreatSchedule(days []int, hhmm string) error {
 // SetCrawlerSchedule 保存爬虫地址库独立排程并重排全部启用爬虫源。
 func SetCrawlerSchedule(days []int, hhmm string) error {
 	return setGlobalTaskSchedule("crawler", "security_crawler_sources", days, hhmm)
+}
+
+// versionUpdateStatuses 是版本表/更新源表 update_status 列的合法词表
+// （CRS/IP2Region 版本表与威胁/爬虫源表共用；与各族状态常量同值）。这些列
+// 属于运行态簿记词表，前端状态徽标与轮询判定直读、渲染层零兜底。
+var versionUpdateStatuses = map[string]struct{}{
+	string(CRSStatusIdle):        {},
+	string(CRSStatusChecking):    {},
+	string(CRSStatusDownloading): {},
+	string(CRSStatusInstalling):  {},
+	string(CRSStatusReloading):   {},
+	string(CRSStatusSuccess):     {},
+	string(CRSStatusFailed):      {},
+	string(CRSStatusSkipped):     {},
+	string(CRSStatusCancelled):   {},
+}
+
+// NormalizeVersionUpdateStatus 归一 update_status：词表外值（含空串/未知）
+// → idle。写侧由各族更新器常量产出，本函数服务于导入门（旧备份/带外直写
+// 可携带未定义值）。
+func NormalizeVersionUpdateStatus(status string) string {
+	if _, ok := versionUpdateStatuses[status]; ok {
+		return status
+	}
+	return string(CRSStatusIdle)
 }

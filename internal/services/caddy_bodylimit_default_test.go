@@ -1,11 +1,11 @@
 package services
 
-// 历史修复(历史,用户裁定:配置项页面与 coraza 默认值统一为 128M):
+// （用户裁定:配置项页面与 coraza 默认值统一为 128M)
 // 有效限额两态归一——规则级>0 用规则级;否则全局值（类型①值型列,NOT NULL
 // DEFAULT 128+启动回填,恒有效;渲染层「否则写死 128」兜底已于库值唯一真相
 // 批 1+2 废除,无效库值显性报错）。
 // request_body handler 恒按有效值发射(「0=不限」语义废除);WAF 活跃时
-// SecRequestBodyLimit 恒发射 min(有效值,1GiB)。历史修复:渲染产物送 coraza 编译。
+// SecRequestBodyLimit 恒发射 min(有效值,1GiB)。渲染产物送 coraza 编译。
 
 import (
 	"strings"
@@ -40,14 +40,14 @@ func wafDirectivesOf(t *testing.T, route map[string]interface{}) string {
 	return directives
 }
 
-// 历史修复(历史,用户裁定:配置项页面与 coraza 默认值统一为 128M)曾钉
+// （用户裁定:配置项页面与 coraza 默认值统一为 128M)曾钉
 // 「global=0 → 渲染兜底 128」；库值唯一真相批 1+2（2026-10-14 用户裁定）废除
 // 渲染层写死兜底——request_body_max_size_mb 为类型①值型列（NOT NULL DEFAULT
 // 128+启动回填+写侧 400+导入归一门），库值直读贯通：
 //
 //	global=0（带外脏数据）→ 渲染显性报错；fresh 库默认 128 → 128MiB 恒发射
 //	（「0=不限」语义废除不变）；global=256/规则级 64 覆盖照旧贯通。
-//	历史修复:渲染产物送 coraza 编译。
+//	渲染产物送 coraza 编译。
 func TestRequestBodyLimit_unifiedDefault128(t *testing.T) {
 	stubSecurityLibsAvailable(t) // 缺库降级：安全链渲染断言前先桩库可用
 	_, database := newClusterTestService(t)

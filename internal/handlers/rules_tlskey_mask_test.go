@@ -14,7 +14,7 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// 历史问题（历史）：手动证书私钥与导出备份同敏感级——GET /rules/:caddy_id
+// 手动证书私钥与导出备份同敏感级——GET /rules/:caddy_id
 // 仅管理员 JWT 与管理员读写 Key 可回读 tls_key；只读 Key/非管理员掩码为空串，
 // 并以 tls_key_set 区分「已有隐藏私钥」与「未配置」。
 

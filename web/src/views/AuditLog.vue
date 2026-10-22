@@ -10,7 +10,7 @@
       </div>
     </div>
 
-    <!-- 历史修复：历史问题家族口径——列表失败必须显性化（「暂无操作日志」不得
+    <!-- 家族口径——列表失败必须显性化（「暂无操作日志」不得
          同时代表空库与故障），并给重试入口。 -->
     <el-alert v-if="loadError" type="error" :closable="false" show-icon class="polling-error-alert error-banner">
       <template #title>
@@ -33,7 +33,7 @@
           format="YYYY-MM-DD HH:mm:ss"
           value-format="YYYY-MM-DD HH:mm:ss"
           :default-time="[new Date(2000, 0, 1, 0, 0, 0), new Date(2000, 0, 1, 23, 59, 59)]"
-          class="filter-date-range"
+          class="audit-filter-date-range"
         />
         <el-select v-model="filters.username" :placeholder="optionsIncomplete ? '操作人（选项加载失败）' : '操作人'" clearable filterable style="width: 130px">
           <el-option v-for="o in usernameOptions" :key="o" :label="o" :value="o" />
@@ -50,7 +50,7 @@
           <el-button type="primary" @click="applyFilters">筛选</el-button>
           <el-button @click="resetFilters">重置</el-button>
         </div>
-        <!-- 历史修复：消费后端 partial=true（部分下拉）与整体失败——下拉缺项必须可见，
+        <!-- 消费后端 partial=true（部分下拉）与整体失败——下拉缺项必须可见，
              且不得与「真空库」混淆。 -->
         <el-text v-if="optionsIncomplete" type="warning" size="small">
           筛选选项未完整加载，下拉列表可能缺项
@@ -135,9 +135,9 @@ const filters = ref({
 const usernameOptions = ref<string[]>([])
 const actionOptions = ref<string[]>([])
 const resourceOptions = ref<string[]>([])
-// 历史修复：列表请求失败与「确实没有日志」必须可区分（历史问题家族漏点）。
+// 列表请求失败与「确实没有日志」必须可区分。
 const loadError = ref(false)
-// 历史修复：后端在任一 option 查询失败时下发 partial=true（auditlog.go）——原实现
+// 后端在任一 option 查询失败时下发 partial=true（auditlog.go）——原实现
 // 只映射三列、把「部分下拉」渲染成「下拉为空」。optionsError 覆盖请求整体失败。
 const optionsPartial = ref(false)
 const optionsError = ref(false)
@@ -171,7 +171,7 @@ const resetFilters = () => {
   fetchLogs()
 }
 
-// 历史问题:表驱动(原 60+ 字面量 if 链——后端新增动作词时手改链易漏)
+// 表驱动(原 60+ 字面量 if 链——后端新增动作词时手改链易漏)
 const ACTION_TAG_TABLE: Record<string, string> = {
   '删除': 'danger',
   '检测失败': 'danger',
@@ -189,6 +189,7 @@ const ACTION_TAG_TABLE: Record<string, string> = {
   '写入失败': 'danger',
   '启用失败': 'danger',
   '创建失败': 'danger',
+  '复制失败': 'danger',
   '删除失败': 'danger',
   '禁用失败': 'danger',
   '恢复失败': 'danger',
@@ -276,7 +277,7 @@ const ACTION_TAG_TABLE: Record<string, string> = {
   '配置恢复': 'success',
   '载入': 'success',
   '校验成功': 'success',
-  // 自动封禁（历史问题）：封禁=阻断（danger），到期自动解封=恢复（success）。
+  // 自动封禁：封禁=阻断（danger），到期自动解封=恢复（success）。
   '自动封禁': 'danger',
   '自动解封': 'success',
   // 容量收敛：名单触顶挤出/丢弃的告警性系统动作（warning——不是错误，但需关注）。
@@ -328,7 +329,7 @@ onMounted(() => {
 </style>
 
 <style>
-.filter-date-range.el-date-editor {
+.audit-filter-date-range.el-date-editor {
   --el-date-editor-width: 360px;
   width: 360px;
   flex: 0 0 auto;

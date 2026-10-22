@@ -22,8 +22,7 @@ func newTestEngine(t *testing.T) *Engine {
 	return newTestEngineWithOptions(t, Options{TickInterval: 10 * time.Millisecond})
 }
 
-// newTestEngineWithOptions 与 newTestEngine 同形，允许指定 Options（历史
-// 历史问题-04：常驻重拉退避需在测试内缩短）。
+// newTestEngineWithOptions 与 newTestEngine 同形，允许指定 Options（常驻重拉退避需在测试内缩短）。
 func newTestEngineWithOptions(t *testing.T, opts Options) *Engine {
 	t.Helper()
 	// 与 services 测试同模式：临时目录初始化全套库（含 task_runs 表迁移）
@@ -57,7 +56,7 @@ func TestEngine_SingletonTriggerRejectedWhileRunning(t *testing.T) {
 	release := make(chan struct{})
 	started := make(chan struct{})
 	e.Register(Descriptor{ID: "t-single", Family: "t", Name: "单飞", Kind: KindPeriodic,
-		// 历史修复（历史）配套：Periodic 注册必须带 IntervalFn（本测试经
+		// 配套：Periodic 注册必须带 IntervalFn（本测试经
 		// Trigger 驱动，间隔值不参与断言）。
 		IntervalFn: func() time.Duration { return time.Hour },
 		Run: func(rc RunContext) error {
@@ -347,7 +346,7 @@ func TestEngine_DaemonLifecycle(t *testing.T) {
 // Given Periodic 任务（30ms 间隔）。
 // When 调度运行至 ≥5 轮落行。
 // Then ≥5 行且全部终态 success（无 RFO 静默）。
-// 历史修复：编排同步点用 Run 内部信号，不再以 10ms 墙钟轮询推断
+// 编排同步点用 Run 内部信号，不再以 10ms 墙钟轮询推断
 // 执行进度——契约是「每轮独立执行且每轮落行」，不是固定窗口内的绝对轮数；
 // 3s 截止只在真回归时触发。
 func TestEngine_PeriodicRecordsEveryCycle(t *testing.T) {
@@ -406,7 +405,7 @@ func TestEngine_OneshotOnlyByTrigger(t *testing.T) {
 // EnabledFn 首次调用时暂停在探针点，等写者 goroutine 真实 pending 在引擎
 // 写锁上再放行——若 DescribeAll 持读锁跨 Fn 调用，写者待命会使 EnabledFn 内
 // 的 RLock（IsRunning）永久阻塞（Go RWMutex 写者优先）。同 goroutine 的
-// RLock 嵌套因重入性侦破不了该缺陷形态，故必须跨 goroutine 编排（历史问题-10）。
+// RLock 嵌套因重入性侦破不了该缺陷形态，故必须跨 goroutine 编排。
 // Then 不自锁；元数据含四类型字段。
 func TestEngine_DescribeAllReleasesLockBeforeFnCalls(t *testing.T) {
 	e := newTestEngine(t)
@@ -508,7 +507,7 @@ func TestEngine_TriggerCarriesOperator(t *testing.T) {
 	}
 }
 
-// 历史问题-09 纵深：Trigger 对 KindDaemon 拒绝（常驻族启停即可——handler 门之外
+// 纵深：Trigger 对 KindDaemon 拒绝（常驻族启停即可——handler 门之外
 // 的引擎侧第二道防线；此前 Trigger 可直跑 daemon Run 绕过真实生命周期挂钩）。
 func TestEngine_TriggerRejectsDaemon(t *testing.T) {
 	e := newTestEngine(t)
@@ -524,7 +523,7 @@ func TestEngine_TriggerRejectsDaemon(t *testing.T) {
 	}
 }
 
-// 历史问题-03：task_runs.operator 列——手动触发操作者落历史（RunRecord.Operator），
+// task_runs.operator 列——手动触发操作者落历史（RunRecord.Operator），
 // History SELECT 透出；auto/startup 触发（operator 空）落空串。
 func TestEngine_HistoryCarriesOperator(t *testing.T) {
 	e := newTestEngine(t)
@@ -650,7 +649,7 @@ func TestEngine_DaemonFailureRecordsFailedRow(t *testing.T) {
 
 // Given daemon 任务未运行，N 个并发 StartLoop（HTTP∥SetRole 同型竞态面）。
 // When 全部返回后。
-// Then Run 恰被调用一次（startDaemon CAS——历史问题-4：曾锁外读+无复查=双启动
+// Then Run 恰被调用一次（startDaemon CAS——曾锁外读+无复查=双启动
 // 双 boot 行+cancel 覆写致其一永不可取消）。
 func TestEngine_StartLoopConcurrentSingleDaemonStart(t *testing.T) {
 	e := newTestEngine(t)
@@ -690,7 +689,7 @@ func dbTestCountRuns(t *testing.T, id string, n *int) error {
 
 // Given daemon 运行中。
 // When 背靠背 StopLoop→StartLoop（handlers restart 的精确序列）。
-// Then Run 被第二次调用（历史问题-3：曾 Run goroutine 异步清 running，StartLoop
+// Then Run 被第二次调用（曾 Run goroutine 异步清 running，StartLoop
 // 即查仍 true→跳过=「重启」静默变「停止」）。
 func TestEngine_DaemonRestartBackToBackStartsSecondRun(t *testing.T) {
 	e := newTestEngine(t)
@@ -712,7 +711,7 @@ func TestEngine_DaemonRestartBackToBackStartsSecondRun(t *testing.T) {
 	// 第一代收到取消后自行退出（Run 体不挂死——真实 Run 语义）
 	close(block)
 	// 契约：第二代必须被自动拉起——不需要任何进一步调用
-	// （历史问题-3 回归形态：StartLoop 见 running=true 静默跳过→永久停止）
+	// （回归形态：StartLoop 见 running=true 静默跳过→永久停止）
 	select {
 	case <-starts:
 	case <-time.After(2 * time.Second):
@@ -723,7 +722,7 @@ func TestEngine_DaemonRestartBackToBackStartsSecondRun(t *testing.T) {
 
 // Given Cancelable 任务经 CancelHook 取消（threat/crs/ip2region 三族路径）。
 // When Cancel 成功。
-// Then 终态=cancelled（历史问题：曾 hook 取消后引擎 ctx 不动→落 failed——历史
+// Then 终态=cancelled（曾 hook 取消后引擎 ctx 不动→落 failed——历史
 // 无法区分用户取消与真失败）。
 func TestEngine_CancelHookPathLandsCancelled(t *testing.T) {
 	e := newTestEngine(t)
@@ -733,7 +732,7 @@ func TestEngine_CancelHookPathLandsCancelled(t *testing.T) {
 		CancelHook: func() bool { hookFired <- struct{}{}; return true },
 		Run: func(rc RunContext) error {
 			close(started)
-			<-rc.Ctx.Done() // hook 取消后引擎 ctx 同步取消（历史问题）
+			<-rc.Ctx.Done() // hook 取消后引擎 ctx 同步取消
 			return rc.Ctx.Err()
 		}})
 	go func() { _ = e.Trigger("t-chk", "manual", "") }()
@@ -754,7 +753,7 @@ func TestEngine_CancelHookPathLandsCancelled(t *testing.T) {
 
 // Given BootSync Oneshot 任务注册后。
 // When RunBootSyncTasks（InitTaskEngine 尾部同型调用）。
-// Then Run 同步执行恰一次、task_runs 记 startup 触发行（历史修复：启动执行单轨化
+// Then Run 同步执行恰一次、task_runs 记 startup 触发行（启动执行单轨化
 // ——曾 main.go 直调+legacy startupPhase 记录旁路）。
 func TestEngine_BootSyncTasksRunOnceWithStartupRow(t *testing.T) {
 	e := newTestEngine(t)
@@ -850,7 +849,7 @@ func TestEngine_StatusMirrorRoleGated(t *testing.T) {
 
 // Given Oneshot 任务与独立任务日志目录。
 // When 以 trigger=caddy-restart 同步执行（Caddy 崩溃自愈 watcher 通道）。
-// Then 任务日志必须含 [start] 行（历史问题-04：[start] 打印条件仅放行
+// Then 任务日志必须含 [start] 行（[start] 打印条件仅放行
 // manual/startup——caddy-restart 轮只有 [done]，排障看不到执行起点）。
 func TestEngine_CaddyRestartTriggerWritesStartLine(t *testing.T) {
 	e := newTestEngine(t)
@@ -874,7 +873,7 @@ func TestEngine_CaddyRestartTriggerWritesStartLine(t *testing.T) {
 
 // Given Scheduled 任务的 NextSlotFn 阻塞中（模拟三库排程槽 DB 查询耗时）。
 // When tick 求值 NextSlotFn 期间并发调用 IsRunning（需同一把 r.mu）。
-// Then IsRunning 不得被阻塞（历史问题-05：NextSlotFn 持 r.mu 调用会把 DB 延迟
+// Then IsRunning 不得被阻塞（NextSlotFn 持 r.mu 调用会把 DB 延迟
 // 传导到同任务的 Cancel/IsRunning/StopLoop——须快照后锁外求值再回锁落缓存）。
 func TestEngine_TickEvaluatesNextSlotOutsideRegistrationLock(t *testing.T) {
 	e := newTestEngine(t)
@@ -909,7 +908,7 @@ func TestEngine_TickEvaluatesNextSlotOutsideRegistrationLock(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：RecoverOrphans 补上与同文件其余导出 DB 函数
+// RecoverOrphans 补上与同文件其余导出 DB 函数
 // （History/Stats24h/PurgeTaskRuns 等 7 处）同形的 db.DB nil 防护——曾裸用
 // db.DB.Exec，nil 时进程级 panic。
 func TestEngine_RecoverOrphansNilDBReturnsZero(t *testing.T) {
@@ -926,8 +925,8 @@ func TestEngine_RecoverOrphansNilDBReturnsZero(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：Periodic 的 IntervalFn 与 Scheduled 的 NextSlotFn
-// 同形锁外求值（历史问题-05 同族收敛补全——IntervalFn 未来改 DB 读取形态时，
+// Periodic 的 IntervalFn 与 Scheduled 的 NextSlotFn
+// 同形锁外求值（同族收敛补全——IntervalFn 未来改 DB 读取形态时，
 // 持 r.mu 求值会把延迟传导到同任务的 Cancel/IsRunning/StopLoop）。
 //
 // Given Periodic 任务的 IntervalFn 阻塞中（模拟可配置间隔的 DB 读取耗时）。
@@ -966,7 +965,7 @@ func TestEngine_TickEvaluatesIntervalOutsideRegistrationLock(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：生命周期行时间戳与业务行（TeeTaskLog）统一为
+// 生命周期行时间戳与业务行（TeeTaskLog）统一为
 // 斜杠形态——曾 [start]/[done] 用横杠、业务行用斜杠，同一 tasks/{id}.log
 // 两种时间戳并存。engineNowStr 是 DB datetime 比较口径（SQLite 只认横杠）
 // 不改，日志行单独走斜杠。
@@ -1131,7 +1130,7 @@ func TestEngine_DaemonFailureRecordsErrorMessage(t *testing.T) {
 	}
 }
 
-// 历史问题：truncMsg 截断不得切断多字节 rune（task_runs.message 落库半截
+// truncMsg 截断不得切断多字节 rune（task_runs.message 落库半截
 // UTF-8 是损坏文本，面板展示/导出均受污染）。
 func TestTruncMsg_runeSafe(t *testing.T) {
 	// 构造尾部恰好多字节边界被切断的消息：499 个 ASCII + 3 字节 rune（汉）。

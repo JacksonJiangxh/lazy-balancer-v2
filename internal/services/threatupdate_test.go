@@ -170,7 +170,7 @@ func TestThreatUpdate_sourceFailureKeepsOldListAndContinues(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 历史问题-01（历史）：任一源失败即整体失败——RunUpdate 回传
+	// 任一源失败即整体失败——RunUpdate 回传
 	// ErrThreatUpdateFailed（引擎 task_runs 记 failed）；单源失败仍不中断其余源。
 	if err := GetThreatUpdateManager().RunUpdate("manual", nil); !errors.Is(err, ErrThreatUpdateFailed) {
 		t.Fatalf("second run err=%v, want ErrThreatUpdateFailed", err)
@@ -215,7 +215,7 @@ func TestThreatUpdate_parseGuards(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 历史问题-01（历史）：两源失败（解析守卫拒绝）→ 整体失败回传。
+	// 两源失败（解析守卫拒绝）→ 整体失败回传。
 	if err := GetThreatUpdateManager().RunUpdate("manual", nil); !errors.Is(err, ErrThreatUpdateFailed) {
 		t.Fatalf("run err=%v, want ErrThreatUpdateFailed（两源被守卫拒绝）", err)
 	}
@@ -514,7 +514,7 @@ func TestThreatDueSources_emptyListIsDue(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wafDir, "threat-ustc.iplist"), []byte("203.0.113.1/32\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	// 历史问题：fast 同样必须在场，否则仍视为未装载。历史问题：判据含可读性
+	// fast 同样必须在场，否则仍视为未装载。判据含可读性
 	// 校验——夹具用真实编译产物（伪「LBF1」头在可读性口径下即损坏文件）。
 	if err := CompileFromIplistFile(filepath.Join(wafDir, "threat-ustc.iplist")); err != nil {
 		t.Fatalf("编译 .fast 夹具: %v", err)
@@ -640,7 +640,7 @@ func TestThreatUpdate_contentHashCompare_andReloadAudit(t *testing.T) {
 	}
 }
 
-// 历史问题：原始哈希快速路径中的名单存在性 COUNT 查询失败时，不得按「存在」
+// 原始哈希快速路径中的名单存在性 COUNT 查询失败时，不得按「存在」
 // 走跳过分支标 success——必须记错并继续完整聚合/写库路径（本测试用 DROP
 // TABLE 使 COUNT 与后续写库一并失败，可观察终态=failed 而非 success）。
 func TestThreatUpdate_listExistenceQueryErrorNotFastPathSuccess(t *testing.T) {
@@ -664,7 +664,7 @@ func TestThreatUpdate_listExistenceQueryErrorNotFastPathSuccess(t *testing.T) {
 	}
 
 	// When：同内容 run2 —— 原始哈希一致进入快速路径，COUNT 失败。
-	// 历史问题-01（历史）后失败回传引擎：源失败必须返回错误（旧契约
+	// 后失败回传引擎：源失败必须返回错误（旧契约
 	// 断言返回 nil 已随迁）；行级 failed 落库仍是本测试真契约。
 	if err := GetThreatUpdateManager().RunUpdate("manual", nil); err == nil {
 		t.Fatal("run2: 源写库失败必须返回错误（历史问题-01 失败回传契约）")
@@ -680,7 +680,7 @@ func TestThreatUpdate_listExistenceQueryErrorNotFastPathSuccess(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：策略 refs JSON 解析失败按「可能被引用」处理——与
+// 策略 refs JSON 解析失败按「可能被引用」处理——与
 // 同函数查询失败口径一致（宁可多一次重载，不欠引用方的渲染收敛）。
 func TestThreatListsReferenced_invalidRefsTreatedAsReferenced(t *testing.T) {
 	overrideWafDirForTest(t)
@@ -714,7 +714,7 @@ func TestThreatListsReferenced_parseableRefsMiss(t *testing.T) {
 	}
 }
 
-// 历史问题 自愈标记退役（2026-10-15 热路径架构裁定）：被引用名单变化走投影
+// 自愈标记退役（2026-10-15 热路径架构裁定）：被引用名单变化走投影
 // 热路径（零重载、无失败态）；热路径未证实收敛回退的 /load 失败不再置
 // pending——下一轮内容未变不再强制重载，残留分叉由配置一致性看门狗漂移
 // 横幅 + 下次任意配置变更收敛兜底。
@@ -765,7 +765,7 @@ func TestThreatUpdate_reloadPendingMarkerRetired(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：run() 起点 is_master 复查（历史问题 家族收敛——
+// run() 起点 is_master 复查（家族收敛——
 // crsupdate/ip2regionupdate 均有，威胁库为漏点）：tick 守卫与任务发出之间的
 // demote 竞态窗口内，从节点继续执行会写 security_ip_lists 并触发重载，
 // 打破从节点只读不变量。
@@ -803,7 +803,7 @@ func TestThreatUpdate_runRejectedOnSlave(t *testing.T) {
 	}
 }
 
-// 历史问题-01（历史）：RunUpdate 恒返 nil——源失败仅内部落行，引擎
+// RunUpdate 恒返 nil——源失败仅内部落行，引擎
 // task_runs 把失败轮记成 success（终态失真）。修复：失败终态回传
 // ErrThreatUpdateFailed（「任一源失败即失败」，与 run 内 anyFailed/
 // failSourceRow 口径对齐）；skipped/cancelled 各有终态通道，不算失败。
@@ -828,7 +828,7 @@ func TestThreatRunUpdate_returnsErrorOnSourceFailure(t *testing.T) {
 	}
 }
 
-// 历史问题-01 引擎侧契约钉：经 wire Run 体透传——源失败轮 task_runs 必须落
+// 引擎侧契约钉：经 wire Run 体透传——源失败轮 task_runs 必须落
 // failed（曾恒 success）。Given 一源必败；When 引擎手动触发 threat；
 // Then Trigger 回传 ErrThreatUpdateFailed 且 task_runs 终态 failed。
 func TestWireThreatRun_failureLandsTaskRunsFailed(t *testing.T) {
@@ -848,7 +848,7 @@ func TestWireThreatRun_failureLandsTaskRunsFailed(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：CancelRunning 补 running 门——runCancel 一次运行后
+// CancelRunning 补 running 门——runCancel 一次运行后
 // 不清空，无运行中任务时（running=false）仍返回 true、与注释「无运行中任务
 // 返回 false」不符；对齐 CRS/IP2Region 同形（cancel!=nil && running）。
 func TestThreatCancelRunning_falseWhenIdleAfterRun(t *testing.T) {
@@ -866,7 +866,7 @@ func TestThreatCancelRunning_falseWhenIdleAfterRun(t *testing.T) {
 	}
 }
 
-// 历史问题-⑪（历史主审补漏）：IPListsReferencedByEnabledPolicy（原 threatListsReferencedByEnabledPolicy）的引用查询
+// ⑪：IPListsReferencedByEnabledPolicy（原 threatListsReferencedByEnabledPolicy）的引用查询
 // 迭代失败（rows.Err）须按「被引用」处理（fail-closed）——与查询失败/解析
 // 失败同口径；漏查会跳过名单重载，引用该名单的启用策略渲染不收敛。
 type refsFailingConnector struct{}
@@ -918,9 +918,9 @@ func TestThreatListsReferenced_iterationErrorTreatedAsReferenced(t *testing.T) {
 	}
 }
 
-// 历史修复（历史盲区补钉）：threat 通道 NeedForce→回退 /load 钉测——刷新返回
-// NeedForce（本轮渲染物化了证书文件，历史修复）时必须回退强制重载
-// 收敛（宁可一次重载，不欠引用方渲染收敛，历史问题）；重载失败仅留痕，
+// threat 通道 NeedForce→回退 /load 钉测——刷新返回
+// NeedForce（本轮渲染物化了证书文件）时必须回退强制重载
+// 收敛（宁可一次重载，不欠引用方渲染收敛）；重载失败仅留痕，
 // 不中断任务、不计任务失败。
 func TestThreatUpdate_needForceFallsBackToReload(t *testing.T) {
 	overrideWafDirForTest(t)
@@ -1127,7 +1127,7 @@ func TestUpdateOneSource_healPreservesRawHash(t *testing.T) {
 	}
 }
 
-// —— 变化面判定不再依赖名单 id 查询（历史修复，历史） ——
+// 变化面判定不再依赖名单 id 查询 ——
 
 // 内容变化 → 收敛；内容未变 → 零收敛。钉住 changedIDs→changed bool 重构后的
 // 判定面无行为漂移（旧的逐源 id 查询只被 len() 消费，已删除）。
@@ -1172,7 +1172,7 @@ func TestThreatUpdate_changeDetectionDrivesConvergence(t *testing.T) {
 	}
 }
 
-// —— StartUpdate 返回即 CancelRunning 必真（历史修复同族） ——
+// StartUpdate 返回即 CancelRunning 必真 ——
 
 // 旧实现把 runCancel 登记放在 run goroutine 内：StartUpdate 返回后立刻取消
 // （任务引擎 CancelHook／前端连点）会读到 nil（首次）或上一轮陈旧 cancel，

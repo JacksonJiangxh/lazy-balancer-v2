@@ -49,7 +49,7 @@ func TestTriggerSystemTask_certJobRowRetriesFailedJob(t *testing.T) {
 }
 
 // Given：disabled 证书任务。When：触发。Then：409（退役任务永久不可重试——复用重试门；
-// 历史问题：永久条件不得用 429，SDK/前端会按限流语义退避轮询）。
+// 永久条件不得用 429，SDK/前端会按限流语义退避轮询）。
 func TestTriggerSystemTask_certJobRowDisabledRejected(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	services.ResetCAQueueManagerForTest()

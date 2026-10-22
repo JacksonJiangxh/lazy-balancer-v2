@@ -5,7 +5,7 @@ import { initialNodeSiteForm, nearestSiteLocation, nodeSiteCoordsChanged } from 
 import { validateClusterUrl } from '../src/utils/clusterUrl.ts'
 import { section, source } from './_helpers.ts'
 
-// 历史修复问题：继承主节点默认坐标的节点（site_inherited=true，列表接口返回的
+// 问题：继承主节点默认坐标的节点（site_inherited=true，列表接口返回的
 // server_map_lat/lon 是主节点坐标副本），弹框初值必须还原为 0,0 + 空选择——
 // 不得把继承值预填为可保存值（原样保存会把继承静默固化为显式坐标）。
 test('继承节点表单初值还原为 0,0 + 空选择', () => {
@@ -30,11 +30,11 @@ test('无变更保存判定为 no-op（直接关闭，不发 PUT 不 bump）', (
   assert.equal(nodeSiteCoordsChanged({ lat: 31.23, lon: 121.47 }, { lat: 0, lon: 0 }), true)
 })
 
-// 历史修复：主节点地址与节点访问地址在后端共用 models.ValidateClusterAccessURL
+// 主节点地址与节点访问地址在后端共用 models.ValidateClusterAccessURL
 // （scheme∈{http,https}、host 非空、无 userinfo/query/fragment）。前端曾两份实现
 // ——主节点地址只校验 scheme，带凭证/query 的地址到提交时才被后端拒绝（晚失败）。
 // 本条把共享校验器逐条对表后端规则，并钉住两个弹框的单源接线。
-test('WS-18：主节点地址与访问地址共用校验器（后端 ValidateClusterAccessURL 同规则）', () => {
+test('主节点地址与访问地址共用校验器（后端 ValidateClusterAccessURL 同规则）', () => {
   const url = (value: string, label = '访问地址') => validateClusterUrl(value, { label })
   assert.equal(url(''), null, '访问地址允许留空（回退注册地址）')
   assert.equal(validateClusterUrl('', { label: '主节点地址', emptyMessage: '请输入主节点地址' }), '请输入主节点地址')

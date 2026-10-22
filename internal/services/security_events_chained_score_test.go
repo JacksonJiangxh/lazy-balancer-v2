@@ -7,7 +7,7 @@ import (
 	"lazy-balancer-v2/internal/models"
 )
 
-// 历史修复（历史修复 修复的摄入侧回归）：多条件链式自定义规则把 setvar 迁到链尾，
+// 多条件链式自定义规则把 setvar 迁到链尾，
 // coraza 审计 raw 只含起始条（无 setvar）→ anomaly_score 恒 0 且固定语义分不覆盖
 // 自定义族。摄入侧必须按发射 id 回查 cr.Score 补分。
 

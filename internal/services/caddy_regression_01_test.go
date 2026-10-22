@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// 移除冲突域名，剩余域名仍生成跳转；全部冲突时整条跳过（保持 历史修复 语义）。
+// 移除冲突域名，剩余域名仍生成跳转；全部冲突时整条跳过（保持语义）。
 func TestGenerateCaddyConfig_httpsRedirect_filtersShadowedDomains(t *testing.T) {
 	tests := []struct {
 		name           string

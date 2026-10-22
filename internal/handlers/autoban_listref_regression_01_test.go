@@ -3,7 +3,7 @@ package handlers
 // 仅被受信代理网段引用（trusted_proxy_range_refs ∧ trusted_proxy_enabled=1）
 // 时也算「已引用」（tp.txt 投影消费，名单实际生效中）。修复前的窄引用实现只
 // 查 ip_acl_list_refs/ip_whitelist_refs，此形态误报黄条「名单未生效」；改调
-// services.IPListsReferencedByEnabledPolicy（热路径资格门 历史修复 四面单源）后
+// services.IPListsReferencedByEnabledPolicy（热路径资格门四面单源）后
 // 与生效面同口径。
 
 import (

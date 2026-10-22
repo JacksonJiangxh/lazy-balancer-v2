@@ -14,7 +14,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 历史修复: protocol 无白名单时 "https" 可落库并被渲染为 TCP（域名匹配静默丢失），
+// protocol 无白名单时 "https" 可落库并被渲染为 TCP（域名匹配静默丢失），
 // 而保存校验把 https 当 HTTP 通过——校验与生成发散。Create/Update 必须 400。
 func TestCreateRule_rejects_unknown_protocol(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
@@ -57,9 +57,9 @@ func TestUpdateRule_rejects_unknown_protocol(t *testing.T) {
 	}
 }
 
-// 历史修复（v2 备份）: 启用的手动 TLS 规则证书/私钥为空时导入必须整包拒绝
+// （v2 备份）: 启用的手动 TLS 规则证书/私钥为空时导入必须整包拒绝
 // （镜像 rule_features.go:648-651 保存/启用侧口径）；禁用行或 acme_dns 行放行。
-// 历史修复：TLS 形态校验迁至 validateV2BackupTLSShape（冲突置禁用之后执行）。
+// TLS 形态校验迁至 validateV2BackupTLSShape（冲突置禁用之后执行）。
 func TestValidateV2BackupTLSShape_rejects_enabled_manual_tls_without_cert(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -82,7 +82,7 @@ func TestValidateV2BackupTLSShape_rejects_enabled_manual_tls_without_cert(t *tes
 			rule: map[string]any{"caddy_id": "lb_disabled_nocert", "name": "disabled", "protocol": "http", "domain": "disabled.example.test", "listen_port": 8445, "enabled": 0, "enable_tls": 1, "tls_source": "manual"},
 		},
 		{
-			// 历史修复起启用 acme_dns 行须引用备份内有效配置且携带证书
+			// 自此启用 acme_dns 行须引用备份内有效配置且携带证书
 			// 任务行；本用例的原始意图（无需内联 tls_cert/tls_key）保持不变。
 			name: "启用 acme_dns 无内联证书可导入（证书由 cert_jobs 管理）",
 			rule: map[string]any{"caddy_id": "lb_acme", "name": "acme", "protocol": "http", "domain": "acme.example.test", "listen_port": 8446, "enabled": 1, "enable_tls": 1, "tls_source": "acme_dns", "acme_config_id": 7},
@@ -116,7 +116,7 @@ func TestValidateV2BackupTLSShape_rejects_enabled_manual_tls_without_cert(t *tes
 	}
 }
 
-// 历史修复（v1 备份）: 启用的 SSL 规则证书/私钥为空时按 v1 风格软跳过并警告；
+// （v1 备份）: 启用的 SSL 规则证书/私钥为空时按 v1 风格软跳过并警告；
 // 禁用的 SSL 规则无证书仍导入（不参与渲染，可后续补证书再启用）。
 func TestImportV1Config_skips_enabled_ssl_rule_without_cert(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -157,7 +157,7 @@ func TestImportV1Config_skips_enabled_ssl_rule_without_cert(t *testing.T) {
 	}
 }
 
-// 历史修复: 旧格式（仅 tables）校验和回退仅限无 exported_at 的旧格式标记；
+// 旧格式（仅 tables）校验和回退仅限无 exported_at 的旧格式标记；
 // 新格式文件（带 exported_at）只篡改 Config 区时校验和不匹配必须直接拒绝。
 
 func checksumTablesOnly(t *testing.T, tables map[string][]map[string]any) string {
@@ -242,7 +242,7 @@ func TestValidateV2Backup_legacyChecksumFallback_gatedOnLegacyMarker(t *testing.
 	})
 }
 
-// 历史修复: 走旧格式校验和回退的导入必须记「使用旧格式校验和」审计警告。
+// 走旧格式校验和回退的导入必须记「使用旧格式校验和」审计警告。
 func TestImportConfigBackup_legacyChecksum_recordsAuditWarning(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	gin.SetMode(gin.TestMode)
@@ -266,7 +266,7 @@ func TestImportConfigBackup_legacyChecksum_recordsAuditWarning(t *testing.T) {
 	}
 }
 
-// 历史修复: 单默认页（库存内容）+ 自定义非默认页的备份未发生降级，提升不得
+// 单默认页（库存内容）+ 自定义非默认页的备份未发生降级，提升不得
 // 执行——默认页内容不得被静默改写为自定义页内容。
 func TestImportConfigBackup_doesNotPromoteCustomPageWhenNoDemotion(t *testing.T) {
 	h := newBackupTestHandlers(t)

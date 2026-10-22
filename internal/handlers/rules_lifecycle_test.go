@@ -6,6 +6,8 @@ package handlers
 // 窗口并发修改复核）、提交后失败审计（五端点提交后失败审计）。
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -96,6 +98,33 @@ func assertTCPDeadColumnsHealed(t *testing.T, caddyID string) {
 	}
 }
 
+func TestUpdateRule_toleratesNullStoredDescription(t *testing.T) {
+	handler, _, _ := newAuditRuleHandlers(t, 0)
+	seedAuditRule(t, "lb_null_description", "before", "null-description.example.test", 18011, true, "manual", false)
+	seedAuditUpstream(t, "lb_null_description")
+	if _, err := db.DB.Exec("UPDATE lb_rules SET description=NULL WHERE caddy_id='lb_null_description'"); err != nil {
+		t.Fatalf("seed null description: %v", err)
+	}
+	router := gin.New()
+	router.PUT("/rules/:caddy_id", handler.UpdateRule)
+	request := httptest.NewRequest(http.MethodPut, "/rules/lb_null_description", strings.NewReader(`{"name":"after"}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("update with NULL stored description status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	var name, description string
+	if err := db.DB.QueryRow("SELECT name,COALESCE(description,'') FROM lb_rules WHERE caddy_id='lb_null_description'").Scan(&name, &description); err != nil {
+		t.Fatalf("read updated rule: %v", err)
+	}
+	if name != "after" || description != "" {
+		t.Fatalf("updated rule name=%q description=%q, want after/empty", name, description)
+	}
+}
+
 // TCP 自愈族：同协议 TCP 编辑自愈（存量死值不再让无关编辑恒 400 死端）。
 func TestUpdateRule_tcpSameProtocolEditSelfHealsHTTPOnlyConfig(t *testing.T) {
 	// Given
@@ -161,6 +190,46 @@ func TestCreateRule_tcpExplicitProxyTimeoutStillRejected(t *testing.T) {
 
 	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "代理超时") {
 		t.Fatalf("create tcp with explicit proxy timeout status=%d body=%s, want 400 代理超时", response.Code, response.Body.String())
+	}
+}
+
+func TestCreateRule_tcpNegativeProxyTimeoutsNormalizeToZero(t *testing.T) {
+	handler := newRuleFeatureTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/rules", handler.CreateRule)
+	body := `{"name":"tcp-negative-proxy","protocol":"tcp","listen_port":17044,"enabled":false,
+		"proxy_dial_timeout":-1,"proxy_response_header_timeout":-2,"proxy_read_timeout":-3,
+		"proxy_write_timeout":-4,"proxy_stream_timeout":-5,"proxy_flush_interval":-1,"proxy_stream_close_delay":-7,
+		"health_check_interval":10,"health_check_timeout":2,"health_check_unhealthy_threshold":3,"health_check_healthy_threshold":2,
+		"upstreams":[{"host":"127.0.0.1","port":9000,"enabled":true}]}`
+	request := httptest.NewRequest(http.MethodPost, "/rules", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusCreated {
+		t.Fatalf("create TCP with negative proxy timeouts status=%d body=%s, want 201", response.Code, response.Body.String())
+	}
+	var proxy [7]int
+	if err := db.DB.QueryRow(`SELECT proxy_dial_timeout,proxy_response_header_timeout,proxy_read_timeout,
+		proxy_write_timeout,proxy_stream_timeout,proxy_flush_interval,proxy_stream_close_delay
+		FROM lb_rules WHERE name='tcp-negative-proxy'`).Scan(
+		&proxy[0], &proxy[1], &proxy[2], &proxy[3], &proxy[4], &proxy[5], &proxy[6]); err != nil {
+		t.Fatalf("read created TCP rule: %v", err)
+	}
+	if proxy != [7]int{} {
+		t.Fatalf("created TCP proxy timeouts=%v, want all zero", proxy)
+	}
+}
+
+func TestValidateStoredRuleConfig_normalizesTCPDeadFields(t *testing.T) {
+	newRuleFeatureTestHandlers(t)
+	seedTCPRuleWithDeadHTTPOnlyConfig(t, "lb_tcp_enable_heal", "tcp-enable-heal", 17045)
+
+	if err := validateStoredRuleConfig(t.Context(), "lb_tcp_enable_heal"); err != nil {
+		t.Fatalf("stored TCP dead fields must be normalized before enable validation: %v", err)
 	}
 }
 
@@ -254,7 +323,7 @@ func TestAbortIfRuleConcurrentlyModified_detectsChange(t *testing.T) {
 	initializeRuleFeatureTestDB(t)
 	gin.SetMode(gin.TestMode)
 	seedTCPRuleForZeroMerge(t, "lb_fp", 17051)
-	baseline, err := ruleMutationFingerprint("lb_fp")
+	baseline, err := ruleMutationFingerprint(t.Context(), "lb_fp")
 	if err != nil {
 		t.Fatalf("fingerprint: %v", err)
 	}
@@ -272,6 +341,18 @@ func TestAbortIfRuleConcurrentlyModified_detectsChange(t *testing.T) {
 	}
 	if recorder.Code != http.StatusConflict {
 		t.Fatalf("status=%d, want 409", recorder.Code)
+	}
+}
+
+func TestRuleMutationFingerprint_honorsContextCancellation(t *testing.T) {
+	initializeRuleFeatureTestDB(t)
+	seedTCPRuleForZeroMerge(t, "lb_fp_cancel", 17052)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	_, err := ruleMutationFingerprint(ctx, "lb_fp_cancel")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("fingerprint error=%v, want context.Canceled", err)
 	}
 }
 
@@ -371,6 +452,45 @@ func TestDuplicateRule_rejectsOverlongDescription(t *testing.T) {
 
 	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "规则描述过长") {
 		t.Fatalf("duplicate overlong description status=%d body=%s, want 400 规则描述过长", response.Code, response.Body.String())
+	}
+}
+
+func TestDuplicateRule_auditsFailureResponses(t *testing.T) {
+	tests := []struct {
+		name       string
+		caddyID    string
+		seed       func(*testing.T)
+		wantStatus int
+	}{
+		{name: "missing source", caddyID: "lb_duplicate_missing", seed: func(*testing.T) {}, wantStatus: http.StatusNotFound},
+		{name: "invalid source", caddyID: "lb_duplicate_invalid", seed: func(t *testing.T) {
+			seedTCPRuleForZeroMerge(t, "lb_duplicate_invalid", 17073)
+			if _, err := db.DB.Exec("UPDATE lb_rules SET description=? WHERE caddy_id='lb_duplicate_invalid'", strings.Repeat("述", maxRuleDescriptionRunes+1)); err != nil {
+				t.Fatalf("seed invalid source: %v", err)
+			}
+		}, wantStatus: http.StatusBadRequest},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := newRuleFeatureTestHandlers(t)
+			gin.SetMode(gin.TestMode)
+			tt.seed(t)
+			router := gin.New()
+			router.POST("/rules/:caddy_id/duplicate", handler.DuplicateRule)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/rules/"+tt.caddyID+"/duplicate", nil))
+			if response.Code != tt.wantStatus {
+				t.Fatalf("duplicate status=%d body=%s, want %d", response.Code, response.Body.String(), tt.wantStatus)
+			}
+			var auditCount int
+			if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log
+				WHERE action='复制失败' AND resource='负载规则' AND detail LIKE ?`, "%"+tt.caddyID+"%").Scan(&auditCount); err != nil {
+				t.Fatalf("read duplicate failure audit: %v", err)
+			}
+			if auditCount != 1 {
+				t.Fatalf("duplicate failure audit rows=%d, want 1", auditCount)
+			}
+		})
 	}
 }
 

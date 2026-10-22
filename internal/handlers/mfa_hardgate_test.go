@@ -41,7 +41,7 @@ func mfaSetupTestRouter(h *Handlers) *gin.Engine {
 
 func seedMfaRulingUser(t *testing.T) string {
 	t.Helper()
-	// MFA 列/挑战表统一由 ensureMFATestSchema 单源提供（历史修复；重复调用安全）
+	// MFA 列/挑战表统一由 ensureMFATestSchema 单源提供
 	hash, err := bcrypt.GenerateFromPassword([]byte("irrelevant"), bcrypt.MinCost)
 	if err != nil {
 		t.Fatalf("hash password: %v", err)
@@ -99,7 +99,7 @@ func TestMFAVerifyFailures_NeverCountOrLock(t *testing.T) {
 			t.Fatalf("attempt %d: status=%d, want 401（验码失败只提示，不计数不锁定）", i, code)
 		}
 	}
-	// 历史问题(历史):断言迁移到 login_* 列(生产 schema 已删
+	// 断言迁移到 login_* 列(生产 schema 已删
 	// mfa_failed_attempts/mfa_locked_until 死列)——MFA 验码失败不计数。
 	var loginAttempts int
 	var loginLocked sql.NullString

@@ -13,7 +13,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 历史修复：规则近 24h 无任何事件时，耗时聚合的两个 COUNT 列为 SQL NULL——
+// 规则近 24h 无任何事件时，耗时聚合的两个 COUNT 列为 SQL NULL——
 // 正常空窗口不得被当成查询故障（修复前 Scan 失败 → warn + 全 0）。
 func TestQueryRuleStageTimings_emptyWindowIsNotAnError(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
@@ -31,7 +31,7 @@ func TestQueryRuleStageTimings_emptyWindowIsNotAnError(t *testing.T) {
 	}
 }
 
-// 历史修复1 回归：有事件时计数与均值照常。
+// 回归：有事件时计数与均值照常。
 func TestQueryRuleStageTimings_countsSamples(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time, rule_caddy_id, action, precheck_us, duration_us, rule_triggered) VALUES
@@ -51,7 +51,7 @@ func TestQueryRuleStageTimings_countsSamples(t *testing.T) {
 	}
 }
 
-// 历史修复：分页参数拼写错误必须 400（与同端点时间参数口径一致）；数值越界
+// 分页参数拼写错误必须 400（与同端点时间参数口径一致）；数值越界
 // 仍按既有契约钳制/回落。
 func TestListSecurityEvents_paginationRejectsNonNumeric(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
@@ -122,7 +122,7 @@ func TestListSecurityEvents_masksThirdPartyCredentialHeaders(t *testing.T) {
 	}
 }
 
-// 历史修复：crs_rule_groups / crs_excluded_rules 旧格式单条校验单源——非法字符
+// crs_rule_groups / crs_excluded_rules 旧格式单条校验单源——非法字符
 // 文案一致，且 crs_rule_groups 的「形态优先于首尾空白」报错优先级保持。
 func TestCRSLegacyEntryValidation_singleSourceOrdering(t *testing.T) {
 	groups := `["94 2"]`
@@ -134,7 +134,7 @@ func TestCRSLegacyEntryValidation_singleSourceOrdering(t *testing.T) {
 		t.Fatalf("crs_excluded_rules err=%v, want 非法字符", err)
 	}
 
-	// 形态优先：「942 」先报组号形态，不是首尾空白（历史问题 口径）
+	// 形态优先：「942 」先报组号形态，不是首尾空白
 	spaced := `["942 "]`
 	err := validateAndNormalizeCRSField("crs_rule_groups", &spaced, false)
 	if err == nil || !strings.Contains(err.Error(), "两位数字组号") {
@@ -148,7 +148,7 @@ func TestCRSLegacyEntryValidation_singleSourceOrdering(t *testing.T) {
 	}
 }
 
-// 历史修复：已启用且 failed 的威胁源重复提交 update_enabled=true 不得只清文案
+// 已启用且 failed 的威胁源重复提交 update_enabled=true 不得只清文案
 // 而保留 failed 状态（状态机归一对齐禁用分支）。
 func TestUpdateThreatSourceFlags_enableStateMachineNormalized(t *testing.T) {
 	router := newThreatTestRouter(t)

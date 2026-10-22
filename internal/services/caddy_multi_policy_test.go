@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// 历史修复..05（v2.2.0 多策略绑定 · Caddy 生成路径）：一条 LB 规则可绑定至多
+// ..05（v2.2.0 多策略绑定 · Caddy 生成路径）：一条 LB 规则可绑定至多
 // maxBindingsPerRule=8 条安全策略，评估顺序 = policy_id ASC；每策略的 [rate_limit?, waf?] 处理器组
 // 按序编入规则主路由。geoip pass 路由至多一条（任一启用策略带 geoip 即存在，
 // 为下游 coraza 的 GeoIP SecRule 设置 X-LB-GeoIP-* headers；地域拦截在各自策略的
@@ -133,7 +133,7 @@ func mpCountGeoipPassRoutes(t *testing.T, routes []map[string]interface{}) int {
 	return count
 }
 
-// 历史修复：路由顺序 = geoipPass(≤1) → pathRoutes → main；主路由处理器链按
+// 路由顺序 = geoipPass(≤1) → pathRoutes → main；主路由处理器链按
 // 阶段化执行模型编排——阶段 1 合并预检（IP ACL+GeoIP，单/多策略同构）→ 阶段 2
 // 限流（全部策略 rate_limit 集中）→ 阶段 3 每策略独立 WAF 引擎（policy_id ASC）。
 // 纯 GeoIP 策略（p1 off+geoip）不再贡献策略 waf，GeoIP 链由预检 800000+ 段承接。
@@ -184,7 +184,7 @@ func TestMultiPolicy_RouteComposition_OrderAndHandlerGroups(t *testing.T) {
 		t.Fatalf("routes[2] must be the main route (no path matcher): %#v", routes[2])
 	}
 
-	// 主路由处理器链（阶段化模型）：headers(X-LB-Rule-ID 注入，历史修复) →
+	// 主路由处理器链（阶段化模型）：headers(X-LB-Rule-ID 注入） →
 	// lb_rule_metrics → lb_security_blocked_counter → 阶段 1 预检 waf（p1/p3
 	// GeoIP 链）→ request_body → 阶段 2 rate_limit(p2) → 阶段 3 waf(p2
 	// blocking) → waf(p3 detection，不含 GeoIP) → lb_security_timing_end
@@ -236,7 +236,7 @@ func TestMultiPolicy_RouteComposition_OrderAndHandlerGroups(t *testing.T) {
 	}
 }
 
-// 历史修复：两条策略同时开启限流 → 2 个 rate_limit 处理器，zone 键互不相同且
+// 两条策略同时开启限流 → 2 个 rate_limit 处理器，zone 键互不相同且
 // 嵌入 policy_id（{ruleID}-p{policyID}-sec / -min；burst=0 时 {ruleID}-p{policyID}）。
 func TestMultiPolicy_RateLimitZoneKeys_EmbedPolicyID(t *testing.T) {
 	stubSecurityLibsAvailable(t) // 缺库降级：安全链渲染断言前先桩库可用
@@ -289,7 +289,7 @@ func TestMultiPolicy_RateLimitZoneKeys_EmbedPolicyID(t *testing.T) {
 	assertEqual(t, zoneB["max_events"], 20)
 }
 
-// 历史修复：阶段化执行模型——阶段 2（限流）集中在全部 WAF 引擎（阶段 3）
+// 阶段化执行模型——阶段 2（限流）集中在全部 WAF 引擎（阶段 3）
 // 之前：双策略各开限流时主路由 handle 链中两个 rate_limit 的索引均小于全部
 // 策略 waf 的索引（单/多策略链形状同构：阶段 1 预检 → 阶段 2 限流 → 阶段 3
 // WAF；限流恒 429，被前位 WAF 拦的请求也消耗后位策略配额为已裁定口径）。
@@ -339,7 +339,7 @@ func mapKeys(m map[string]interface{}) []string {
 	return keys
 }
 
-// 历史修复：geoip pass 路由存在 ⟺ 至少一条绑定启用策略带 geoip；多条 geoip
+// geoip pass 路由存在 ⟺ 至少一条绑定启用策略带 geoip；多条 geoip
 // 策略时 pass 路由仍至多一条（地域拦截改走各自策略的 coraza directives）。
 func TestMultiPolicy_GeoipPassRoute_ExistsIffAnyEnabledPolicyHasGeoIP(t *testing.T) {
 	// Given 情形 A：唯一绑定启用策略无 geoip → 无 pass 路由
@@ -383,7 +383,7 @@ func TestMultiPolicy_GeoipPassRoute_ExistsIffAnyEnabledPolicyHasGeoIP(t *testing
 	}
 }
 
-// 历史修复：错误路由 = 每规则 403 兜底（host 限定，首绑定策略页，承接预检
+// 错误路由 = 每规则 403 兜底（host 限定，首绑定策略页，承接预检
 // 合并中断与无页策略中断）+ 每有页策略 1 条合成码归因路由（无 host，渲染
 // 各自拦截页与状态码）+ 限流 429（首绑定策略页，恒 429）。
 func TestMultiPolicy_ErrorRoutes_FirstBoundBlockPageAndUnionMatcher(t *testing.T) {
@@ -459,7 +459,7 @@ func TestMultiPolicy_ErrorRoutes_FirstBoundBlockPageAndUnionMatcher(t *testing.T
 	assertEqual(t, rlHandler["headers"].(map[string]interface{})["Retry-After"], []string{"1"})
 }
 
-// 历史修复：disabled 策略在生成中零贡献（无处理器/路由/错误路由），同规则的
+// disabled 策略在生成中零贡献（无处理器/路由/错误路由），同规则的
 // enabled 兄弟策略照常贡献。
 func TestMultiPolicy_DisabledPolicyContributesNothing(t *testing.T) {
 	stubSecurityLibsAvailable(t) // 缺库降级：安全链渲染断言前先桩库可用
@@ -505,7 +505,7 @@ func TestMultiPolicy_DisabledPolicyContributesNothing(t *testing.T) {
 	}
 }
 
-// 历史修复（多策略 IP ACL 优先 · IP 预检）：多策略绑定时，任一绑定策略的
+// （多策略 IP ACL 优先 · IP 预检）：多策略绑定时，任一绑定策略的
 // deny 侧 IP 控制（deny 模式 ACL / allow 模式 ACL / 遗留黑名单）合并为一个
 // 极简 coraza 预检 WAF，置于处理器链最前（先于全部 rate_limit/waf）——被拒
 // IP 在任何策略的 CRS/自定义规则评估前即中断，不再产生前置策略的检测事件；
@@ -524,7 +524,7 @@ func TestMultiPolicy_IPPrecheckHandlerPrecedesAllSecurityHandlers(t *testing.T) 
 	// When
 	_, mainRoute := mpGenRoutes(t, database, mpGenHTTPRule("lb_gen6", "gen6.example.test"))
 
-	// Then：链首是 X-LB-Rule-ID 注入（历史修复），其次 IP 预检 waf、p1 的 CRS waf、p2 的 ACL waf
+	// Then：链首是 X-LB-Rule-ID 注入，其次 IP 预检 waf、p1 的 CRS waf、p2 的 ACL waf
 	handlers, _ := mainRoute["handle"].([]interface{})
 	if len(handlers) < 4 {
 		t.Fatalf("main chain too short: %#v", handlers)
@@ -532,12 +532,12 @@ func TestMultiPolicy_IPPrecheckHandlerPrecedesAllSecurityHandlers(t *testing.T) 
 	names := handlerNames(t, mainRoute)
 	// 方案 B(2026-09-15):counter 在 headers 之后、precheck 之前——包 precheck
 	// +全部策略 waf(IP 预检的 IP ACL/GeoIP 中断也计入)。
-	// 历史修复:request_body 恒发射,位于 precheck waf 之后、策略 waf 之前。
+	// request_body 恒发射,位于 precheck waf 之后、策略 waf 之前。
 	// (v2.3.3 分段计时:waf(precheck) 之后是 lb_security_timing_pre 收点)
 	if names[0] != "headers" || names[1] != "lb_rule_metrics" || names[2] != "lb_security_blocked_counter" || names[3] != "waf" || names[4] != "lb_security_timing_pre" || names[5] != "request_body" || names[6] != "waf" || names[7] != "waf" {
 		t.Fatalf("main chain=%v, want [headers(X-LB-Rule-ID), lb_security_blocked_counter, waf(precheck), lb_security_timing_pre, request_body, waf, waf, ...]", names)
 	}
-	// 注入头值=规则 caddy id 且覆盖客户端伪造（历史修复 归因信号本身的断言）
+	// 注入头值=规则 caddy id 且覆盖客户端伪造
 	inject := mustMap(t, handlers[0], "X-LB-Rule-ID inject handler")
 	setHeaders := mustMap(t, inject["request"], "inject request")["set"].(map[string]interface{})
 	assertEqual(t, setHeaders["X-LB-Rule-ID"], []string{"lb_gen6"})
@@ -567,7 +567,7 @@ func TestMultiPolicy_IPPrecheckHandlerPrecedesAllSecurityHandlers(t *testing.T) 
 	}
 }
 
-// 历史修复：IP 预检发射门——阶段化模型单/多策略同构：单策略绑定且存在 deny
+// IP 预检发射门——阶段化模型单/多策略同构：单策略绑定且存在 deny
 // 侧 IP 控制时同样发射预检（阶段 1 统一承接；ACL 并集与策略引擎 id:2/4 幂等
 // 重复无害——预检先拦，引擎内不再命中）；无 deny 侧 IP 控制且无 GeoIP 时
 // 主链形状不变（不新增预检 waf）。
@@ -617,7 +617,7 @@ func TestMultiPolicy_IPPrecheckEmissionGate(t *testing.T) {
 	}
 }
 
-// 历史修复：allow 模式白名单并入预检——多条 allow 模式策略取交集，仅交集内
+// allow 模式白名单并入预检——多条 allow 模式策略取交集，仅交集内
 // IP 通过预检；交集为空（互斥名单）时拒绝一切（与逐策略顺序评估等价）。
 func TestMultiPolicy_IPPrecheckAllowModeIntersection(t *testing.T) {
 	stubSecurityLibsAvailable(t) // 缺库降级：安全链渲染断言前先桩库可用
@@ -653,7 +653,7 @@ func TestMultiPolicy_IPPrecheckAllowModeIntersection(t *testing.T) {
 	}
 }
 
-// 历史修复(2026-09-10 审计):规则级压缩(encode)必须位于全部 waf 处理器之外侧
+// (2026-09-10 审计):规则级压缩(encode)必须位于全部 waf 处理器之外侧
 // (链序在 waf 之前)——coraza 响应拦截器包在 coraza handler 外层,encode 若在
 // waf 内侧,响应体规则扫描的是压缩后字节(≥512B 可压缩响应恒不匹配,静默失明)。
 func TestMultiPolicy_EncodeHandlerPrecedesWafForResponseBodyInspection(t *testing.T) {
@@ -686,7 +686,7 @@ func TestMultiPolicy_EncodeHandlerPrecedesWafForResponseBodyInspection(t *testin
 	}
 }
 
-// 历史问题-1/2(历史):coraza 默认 RequestBodyLimit=128MiB,
+// /2:coraza 默认 RequestBodyLimit=128MiB,
 // 用户限额>128MiB 时 WAF 活跃规则 body 在 128MiB 处被拦;413 语义被压平。
 // 修复:按规则有效限额发射 SecRequestBodyLimit(min(用户值,1GiB))。
 func TestMultiPolicy_RequestBodyLimitInWafDirectives(t *testing.T) {
@@ -724,11 +724,11 @@ func TestMultiPolicy_RequestBodyLimitInWafDirectives(t *testing.T) {
 
 // 预检信任 DetectionOnly(2026-09-15 用户裁定):信任最高优先——预检层
 // 信任规则 ctl:ruleEngine=DetectionOnly 先行,deny/黑名单/GeoIP/CRS 全评估
-// 不拦但全记录(取代 历史修复 的「并入 allow 放行集」——并入会使信任 IP 不触发
+// 不拦但全记录(取代 「并入 allow 放行集」——并入会使信任 IP 不触发
 // 规则=无检测事件,与「可见放行」冲突)。
 func TestMultiPolicy_PrecheckTrustDetectionOnly(t *testing.T) {
 	stubSecurityLibsAvailable(t) // 缺库降级：安全链渲染断言前先桩库可用
-	// Given:两策略,历史问题 allow 模式+信任 198.51.100.9,历史问题 deny 模式(198.51.100.9 在 deny 名单)
+	// Given:两策略, allow 模式+信任 198.51.100.9, deny 模式(198.51.100.9 在 deny 名单)
 	_, database := newClusterTestService(t)
 	if _, err := database.Exec(`INSERT INTO security_policies (name, mode, enabled, ip_acl_enabled, ip_acl_mode, ip_acl_list, ip_whitelist_enabled, ip_whitelist) VALUES
 		('p1-allow','blocking',1,1,'allow','["10.0.0.1"]',1,'["198.51.100.9"]'),

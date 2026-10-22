@@ -24,7 +24,7 @@ type Issuer struct {
 	RequireRecursiveDNS bool
 	// AccountPreRegistered 为 true 时跳过 Step 1 注册：调用方已用同一
 	// Client 完成账户注册/复用验证（KID 已缓存于该 client）——重复注册是
-	// 每次签发一次多余的 CA 往返（历史问题 双注册收敛）。KID 缓存为
+	// 每次签发一次多余的 CA 往返。KID 缓存为
 	// client 级，换 client 不得置位。
 	AccountPreRegistered bool
 }
@@ -62,7 +62,7 @@ func (i *Issuer) Issue(ctx context.Context, domains []string) (certPEM, keyPEM s
 		return "", "", fmt.Errorf("authorize order: %w", err)
 	}
 	log("order_created", fmt.Sprintf("订单已创建，共 %d 个授权", len(order.AuthzURLs)))
-	// 历史修复（历史）：订单初始状态必须分流。新建订单正常为 pending；
+	// 订单初始状态必须分流。新建订单正常为 pending；
 	// ready 表示授权已全部 valid（CA 幂等复用），继续走挑战循环是无害的空转；
 	// valid 表示该订单已有证书——其证书绑定的是签发方当时的 CSR 私钥，本次
 	// 新生成的 CSR 私钥与它不匹配，无法复用，必须显式失败而不是把 CA 对
@@ -89,7 +89,7 @@ func (i *Issuer) Issue(ctx context.Context, domains []string) (certPEM, keyPEM s
 	var localChallenges []challengeInfo
 	var presentedChallenges []ChallengeInfo
 	defer func() {
-		// 历史修复（历史）：清理预算按挑战数缩放——Cleanup 串行删除，单条
+		// 清理预算按挑战数缩放——Cleanup 串行删除，单条
 		// 删除链最坏 90s（dnspod http.Client.Timeout / tencent ReqTimeout=90），
 		// 固定 2min 会让 root+www 两域名的第二个 TXT 清理被 ctx 取消
 		//（cleanup_warning + 残留延长）。
@@ -106,7 +106,7 @@ func (i *Issuer) Issue(ctx context.Context, domains []string) (certPEM, keyPEM s
 		}
 
 		domain := auth.Identifier.Value
-		// 历史修复（历史）：RFC 8555 §7.4.1 允许 CA 复用同账号同标识的
+		// RFC 8555 §7.4.1 允许 CA 复用同账号同标识的
 		// 已 valid 授权（Let's Encrypt boulder reuseValidAuthz 长期开启）。
 		// valid 授权无需 TXT/挑战，直接视为已验证；终态（invalid 家族）必须
 		// 立即失败。原实现对两者都无条件 Present（多写一条 TXT 并等满 5min
@@ -147,7 +147,7 @@ func (i *Issuer) Issue(ctx context.Context, domains []string) (certPEM, keyPEM s
 		}
 
 		log("presenting_dns", fmt.Sprintf("写入 TXT 记录 %s, 值: %s", tokenFQDN, keyAuth))
-		// 历史问题（历史）：挑战必须在 Present 之前登记进 deferred 清理集合——
+		// 挑战必须在 Present 之前登记进 deferred 清理集合——
 		// provider 可能在记录已落 DNS 后仍返回错误（ownership.Add 失败且回滚删除
 		// 亦失败的双失败形态），只在成功路径登记会让该临时 TXT 永久残留。
 		// 清理按 value 定向（CleanUpValue 只删本挑战值），对未写入/未成功的挑战
@@ -237,7 +237,7 @@ func (i *Issuer) Issue(ctx context.Context, domains []string) (certPEM, keyPEM s
 
 	// Step 6.5: Wait for the order to become valid after finalization.
 	// finalize 已在 client 缓存证书字节；此后的失败路径（wait-valid/状态非
-	// valid/下载失败）必须显式丢弃缓存条目，不依赖 FIFO 上限兜底（历史问题）。
+	// valid/下载失败）必须显式丢弃缓存条目，不依赖 FIFO 上限兜底。
 	log("waiting_order_valid", "等待订单最终完成")
 	validCtx, validCancel := context.WithTimeout(ctx, 5*time.Minute)
 	validOrder, err := i.Client.WaitOrder(validCtx, order.URI)
@@ -301,7 +301,7 @@ func (i *Issuer) Cleanup(ctx context.Context, challenges []ChallengeInfo) {
 	}
 }
 
-// 清理预算（历史修复，历史）：单条删除链最坏 90s（dnspod
+// 清理预算：单条删除链最坏 90s（dnspod
 // http.Client.Timeout / tencent HttpProfile.ReqTimeout=90s，覆盖重试包络），
 // Cleanup 串行处理全部挑战，故预算须随挑战数线性放大；下限保留原 2min，
 // 上限 8min 保证「CA 队列执行预算 60min + 清理 ≤8min < staleOwnershipAge
@@ -335,7 +335,7 @@ type ChallengeInfo struct {
 }
 
 // zoneFromDomain extracts the DNS zone (registered domain) from a domain name.
-// 历史问题（历史）：解析单源已下沉到 dnsprovider.ResolveZone（PSL），签发链
+// 解析单源已下沉到 dnsprovider.ResolveZone（PSL），签发链
 // 与 DNS 凭证校验链共用同一口径；此处仅保留签发侧的空域兜底。
 func zoneFromDomain(domain string) string {
 	zone, err := dnsprovider.ResolveZone(domain)
@@ -375,8 +375,8 @@ func (i *Issuer) waitForValidation(ctx context.Context, authURL, chalURL string)
 	var tickerIterations int
 	for {
 		if chal, err := i.Client.GetChallenge(ctx, chalURL); err != nil {
-			// 历史问题：CA 限流（429）必须立即上抛——外层 detectRateLimit 据此把
-			// 任务记入 waiting_ca 按 历史修复 退避；吞掉继续轮询会把限流
+			// CA 限流（429）必须立即上抛——外层 detectRateLimit 据此把
+			// 任务记入 waiting_ca 按退避；吞掉继续轮询会把限流
 			// 错误磨成 10 分钟超时，丢失限流语义并持续给 CA 加压。
 			if isACMERRateLimit(err) {
 				return err
@@ -412,7 +412,7 @@ func (i *Issuer) waitForValidation(ctx context.Context, authURL, chalURL string)
 					case errors.As(waitErr, &authorizationErr):
 						authErr = authorizationErr
 					case waitErr != nil:
-						// 历史修复（历史）：非授权错误的轮询失败（429/
+						// 非授权错误的轮询失败（429/
 						// 网络）此前被丢弃——429 的结构化 *acme.Error 因此
 						// 无法传到 detectRateLimit，任务退化为普通失败退避
 						// 而非 waiting_ca。原样保留错误链。
@@ -426,7 +426,7 @@ func (i *Issuer) waitForValidation(ctx context.Context, authURL, chalURL string)
 		if tickerIterations%6 == 0 {
 			log(fmt.Sprintf("仍在等待 CA 验证 (challenge: %s, 授权: %s)", lastChalStatus, lastAuthStatus))
 		}
-		// 历史问题-1（历史）：此前计数恒零——%6 恒真，等待期每轮刷一条进度
+		// 此前计数恒零——%6 恒真，等待期每轮刷一条进度
 		// 日志（ZeroSSL 数分钟窗口即数百行）。按 6 轮节流。
 		tickerIterations++
 		select {
@@ -440,7 +440,7 @@ func (i *Issuer) waitForValidation(ctx context.Context, authURL, chalURL string)
 	}
 }
 
-// isACMERRateLimit 判定错误是否携带 CA 的 429 限流（历史问题）：x/crypto 对 429
+// isACMERRateLimit 判定错误是否携带 CA 的 429 限流：x/crypto 对 429
 // 响应返回 *acme.Error（StatusCode=429，RetryBackoff 返回 0 时库内不重试
 // 直接上抛）。仅结构化 429 命中——瞬时网络错误/5xx 维持「日志+重试」。
 func isACMERRateLimit(err error) bool {
@@ -448,7 +448,7 @@ func isACMERRateLimit(err error) bool {
 	return errors.As(err, &acmeErr) && acmeErr.StatusCode == http.StatusTooManyRequests
 }
 
-// dns01Challenge 返回授权中的 dns-01 挑战（无则 nil）。历史修复（历史）
+// dns01Challenge 返回授权中的 dns-01 挑战（无则 nil）。
 // 抽出供授权状态分流与常规路径共用，避免两处各写一遍遍历。
 func dns01Challenge(auth *acme.Authorization) *acme.Challenge {
 	if auth == nil {
@@ -463,7 +463,7 @@ func dns01Challenge(auth *acme.Authorization) *acme.Challenge {
 }
 
 func terminalAuthorizationError(status string, authorizationErr error, challenge *acme.Challenge) error {
-	// 历史修复（历史）：%w 保留错误链——invalid 分支的 WaitAuthorization
+	// %w 保留错误链——invalid 分支的 WaitAuthorization
 	// 错误可能是 CA 429/网络错误，services/detectRateLimit 依赖
 	// errors.As(*acme.Error) 把任务记入 waiting_ca；%v 会让它退化为字符串
 	// 匹配。文案形态不变（单错误 %v/%w 渲染一致）。
@@ -489,6 +489,11 @@ func terminalAuthorizationError(status string, authorizationErr error, challenge
 func (i *Issuer) waitForDNS(ctx context.Context, fqdn, expected string, timeout time.Duration) error {
 	// propagationRecursiveResolvers 见下方接缝声明。
 	resolvers := propagationRecursiveResolvers
+	// 空清单是装配错误（接缝可被测试/运维注入）——显式报错而非在
+	// resolvers[0] 处 panic：panic 会沿签发 goroutine 上抛终止整个 worker。
+	if len(resolvers) == 0 {
+		return fmt.Errorf("DNS 传播检测缺少递归解析器清单（propagationRecursiveResolvers 为空）")
+	}
 
 	log := func(format string, args ...any) {
 		if i.Logger != nil {
@@ -524,7 +529,7 @@ func (i *Issuer) waitForDNS(ctx context.Context, fqdn, expected string, timeout 
 	consensusRounds := 0
 	firstProbeAt := time.Now()
 	divergenceDiagnosed := false
-	// 历史问题（历史）：逐台命中/失败/未命中行仅在「状态变化」时输出——
+	// 逐台命中/失败/未命中行仅在「状态变化」时输出——
 	// 镜像 waitForValidation 的 lastChalStatus 先例，避免 5min 传播预算内
 	// 每轮逐台刷屏（单轮 4 递归 + N 权威，5min/3s≈100 轮可达数百行）。
 	// 权威与递归各持一份状态表（同一 server 地址在不同角色下语义不同）。
@@ -548,13 +553,13 @@ func (i *Issuer) waitForDNS(ctx context.Context, fqdn, expected string, timeout 
 			return nil
 		}
 
-		// 历史修复（历史，用户裁定）：每轮并行于权威探测公共递归做共识统计。
+		// （用户裁定）：每轮并行于权威探测公共递归做共识统计。
 		// 放行判据二选一：①authReady（上）；②≥MinHits 台递归命中当前期望值
 		// ×连续 MinRounds 轮。权威全 miss 而递归命中的三形态（CNAME 委托/
 		// NS 变更/权威集群分裂）LE 验证均能跟随实际 DNS 状态成功，客户端
-		// 死等权威即恒超时；单台缓存超前（历史修复）由「多台共识×连续两轮」对冲。
+		// 死等权威即恒超时；单台缓存超前由「多台共识×连续两轮」对冲。
 		//
-		// 历史问题（历史）：各台并行探测（每台独立 ctx 超时）——串行时黑洞
+		// 各台并行探测（每台独立 ctx 超时）——串行时黑洞
 		// 解析器（8.8.8.8/1.1.1.1 各 UDP+TCP 两次 8s 超时）把单轮膨胀到
 		// ~32s，5min 预算被磨成 ~10 轮；并行后单轮上界≈单台最坏耗时。
 		// 结果按 resolvers 顺序回填（顺序无关且清单顺序可复现）；日志统一
@@ -595,18 +600,18 @@ func (i *Issuer) waitForDNS(ctx context.Context, fqdn, expected string, timeout 
 			consensusRounds = 0
 		}
 
-		// 兜底限缩（历史修复，历史修复）：仅当**从未发现过权威服务器**
+		// 兜底限缩：仅当**从未发现过权威服务器**
 		// （initialAuthServers 为空——域名没有可用 NS/解析失败）时，单台递归
 		// 命中即放行，此时递归确实是无权威可问时的唯一信号。
 		// 曾经有权威、而本轮全部探针瞬时失败的情形**不**适用该兜底：那是网络
-		// 抖动窗口，放行单台×单轮会绕过 历史修复 的 3 台×2 轮共识（缓存污染/超前
+		// 抖动窗口，放行单台×单轮会绕过 3 台×2 轮共识（缓存污染/超前
 		// 会被当成真传播），CA 验证失败即消耗 Let's Encrypt 5 次/时配额。
 		if len(authServers) == 0 && len(initialAuthServers) == 0 && len(recursiveHits) > 0 {
 			log("DNS 已命中 %s @ %s, 值: %s（域名无可用权威，按递归单台放行）", fqdn, recursiveHits[0], expected)
 			return nil
 		}
 
-		// 历史修复（历史）：权威存活台全 miss 持续超阈值且递归未达共识——显式
+		// 权威存活台全 miss 持续超阈值且递归未达共识——显式
 		// 诊断一次（生产排障 30 秒自明根因，不再盲猜）。
 		if !divergenceDiagnosed && len(authServers) > 0 &&
 			time.Since(firstProbeAt) > propagationDivergenceDiagAfter {
@@ -635,7 +640,7 @@ func (i *Issuer) waitForDNS(ctx context.Context, fqdn, expected string, timeout 
 	}
 }
 
-// orNone 空切片显示占位（历史修复 诊断/超时清单用）。
+// orNone 空切片显示占位。
 func orNone(list []string) string {
 	if len(list) == 0 {
 		return "(无)"
@@ -643,13 +648,13 @@ func orNone(list []string) string {
 	return strings.Join(list, ",")
 }
 
-// 历史修复（历史，用户裁定）：waitForDNS 测试接缝（镜像 recursiveDNS* 先例：
+// （用户裁定）：waitForDNS 测试接缝（镜像 recursiveDNS* 先例
 // var 而非 const，测试按比例缩放预算保持墙钟快速，生产代码不得改写）。
 var (
 	// resolveAuthoritativeNSFn 权威 NS 解析入口（测试替换为固定假权威清单）。
 	resolveAuthoritativeNSFn = resolveAuthoritativeNS
 	// propagationRecursiveResolvers 公共递归清单（中国友好解析器在前）——
-	// 单源：waitForDNS 共识统计与 checkRecursiveDNS 共用（历史问题）。
+	// 单源：waitForDNS 共识统计与 checkRecursiveDNS 共用。
 	propagationRecursiveResolvers = []string{
 		"223.5.5.5:53",    // Alibaba AliDNS
 		"119.29.29.29:53", // Tencent DNSPod
@@ -665,14 +670,14 @@ var (
 	propagationDivergenceDiagAfter = 30 * time.Second
 	// 递归共识放行阈值：≥MinHits 台递归命中当前值 × 连续 MinRounds 轮。
 	// MinHits 下限=3、MinRounds 下限=2 由 TestPropagationConsensusDefaults
-	// 钉死（历史修复：单台/双台缓存超前不得放行，2026-10-13 用户裁定 2→3）。
+	// 钉死（单台/双台缓存超前不得放行，2026-10-13 用户裁定 2→3）。
 	propagationConsensusMinHits   = 3
 	propagationConsensusMinRounds = 2
 )
 
 // recursiveDNSPollInterval / recursiveDNSDeadline 是 checkRecursiveDNS 的
 // 测试接缝（var 而非 const，镜像 finalizeTimeout / caQueueDrainTimeout 先例：
-// 测试按比例缩放预算保持墙钟快速，生产代码不得改写）。历史问题（历史）：
+// 测试按比例缩放预算保持墙钟快速，生产代码不得改写）。
 // 解析器清单不再各自持有字面量——checkRecursiveDNS 与 waitForDNS 共用
 // propagationRecursiveResolvers 单源（原 recursiveDNSResolvers 与
 // propagationRecursiveResolvers 双份同内容字面量，任一处改地址会有漏改）。
@@ -684,7 +689,7 @@ var (
 	// 侧生效，但写入前曾应答 NXDOMAIN 的递归解析器会持续返回否定缓存直到
 	// 各自过期。四个受查解析器错峰刷新（缓存到期时间不同），120s 足以等到
 	// 至少一个刷新放行，同时远小于 waitForDNS 的 5min 权威预算。
-	// 历史问题（历史）：单域分段预算之和 = 注册 30s + 传播 5m + 本段 2m +
+	// 单域分段预算之和 = 注册 30s + 传播 5m + 本段 2m +
 	// 验证 10m + 就绪 3m + finalize 10m + 有效 5m = 35.5m < 外层
 	// caExecutionTimeout（40m，services/caqueue.go）——原注释的
 	// 「5+2+15min < 30min」算式漏计就绪/finalize/有效三段且外层值错误。
@@ -706,7 +711,7 @@ func recursiveDNSCheckError(ctx context.Context, fqdn string) error {
 }
 
 // checkRecursiveDNS 是 RequireRecursiveDNS（ZeroSSL）路径的递归可见性二次确认，
-// 语义**刻意弱于** waitForDNS 的递归共识放行，两者分层不得合并（历史问题，历史）：
+// 语义**刻意弱于** waitForDNS 的递归共识放行，两者分层不得合并
 //
 //   - 判据：任意 1 台公共递归命中即放行（「任一台可见」），无 MinHits×MinRounds
 //     共识门。ZeroSSL 只在 120s 内要求「公共递归已能解析到该 TXT」，单台可见
@@ -717,7 +722,7 @@ func recursiveDNSCheckError(ctx context.Context, fqdn string) error {
 //     authReady（或递归共识已在 waitForDNS 内放行）才会走到这里。
 //
 // 不得把 waitForDNS 的共识结论（哪几台已命中）回传复用为这里的放行依据：
-// 两者解析器集合同源（历史问题 单源），但判定时机/窗口/语义不同，复用会把
+// 两者解析器集合同源，但判定时机/窗口/语义不同，复用会把
 // waitForDNS 的放行时机误当成 ZeroSSL 的确认结果。
 func (i *Issuer) checkRecursiveDNS(ctx context.Context, fqdn, expected string) bool {
 	deadline := time.After(recursiveDNSDeadline)
@@ -730,7 +735,7 @@ func (i *Issuer) checkRecursiveDNS(ctx context.Context, fqdn, expected string) b
 		case <-deadline:
 			return false
 		case <-ticker.C:
-			// 历史问题（历史）：复用 waitForDNS 的并行探测（历史问题）——逐台串行时
+			// 复用 waitForDNS 的并行探测——逐台串行时
 			// 一台黑洞解析器（UDP/TCP 双 8s）会把单轮拖到 ~32s，120s 预算仅剩
 			// ≈3 轮；并行后单轮上界≈单台最坏耗时。结果按输入顺序回填，命中即放行
 			// （语义不变：任意 1 台可见）。
@@ -789,7 +794,7 @@ func (i *Issuer) probeAuthServersLogged(ctx context.Context, servers []string, f
 }
 
 // dnsLogState 记录每个探针目标上一次打印的状态，使逐台命中/失败/未命中行
-// 仅在状态变化时输出（历史问题，镜像 waitForValidation 的 lastChalStatus
+// 仅在状态变化时输出（镜像 waitForValidation 的 lastChalStatus
 // 先例）。零值可用；nil 视为「总是变化」（首次必打）。
 type dnsLogState struct {
 	last map[string]string
@@ -854,7 +859,7 @@ func probeTXT(ctx context.Context, server, fqdn, expected string, recursion bool
 		m.RecursionDesired = recursion
 
 		c := &dns.Client{Net: network}
-		// 历史修复（历史）：单台预算单源——probeDNSParallel 已为每台
+		// 单台预算单源——probeDNSParallel 已为每台
 		// 设置 propagationResolverProbeTimeout 独立 ctx，此处不再叠加第二个
 		// 8s 硬编码（原实现 UDP+TCP 各 8s=16s，与接缝同名不同义：按接缝上调
 		// 单台预算时实际仍被内层 16s 截断）。直接调用方（测试）须自带 deadline。
@@ -877,7 +882,7 @@ func probeTXT(ctx context.Context, server, fqdn, expected string, recursion bool
 			lastErr = fmt.Errorf("dns %s: server %s", dns.RcodeToString[r.Rcode], server)
 			continue
 		}
-		// 历史修复（历史）：TC=1 的「成功」应答其 Answer 段不可信（UDP
+		// TC=1 的「成功」应答其 Answer 段不可信（UDP
 		// 512B 载荷上限内常被截空；同域并存多条 TXT 时权威应答恒截断）——
 		// 按 miss 处理会致 authReady 永假、假阴性烧签发配额。continue 承接
 		// 到下一网络（TCP）重查。
@@ -1080,7 +1085,7 @@ func discoverAuthoritativeNS(ctx context.Context, fqdn, bootstrap string) ([]str
 	// Resolve addresses of each name server.
 	seen := make(map[string]bool)
 	var servers []string
-	// 历史问题（历史）：本机无 IPv6 出口时预筛 AAAA——纯 v6 权威在无 v6 出口
+	// 本机无 IPv6 出口时预筛 AAAA——纯 v6 权威在无 v6 出口
 	// 网络里每台 UDP/TCP 双 8s 白耗，且 AAAA 查询本身也是无用往返。能力探测
 	// 仅查本机路由表（UDP Dial 不发报文），不是网络可用性断言。
 	qtypes := []uint16{dns.TypeA, dns.TypeAAAA}

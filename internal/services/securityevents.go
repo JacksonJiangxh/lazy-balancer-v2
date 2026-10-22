@@ -43,7 +43,7 @@ type securityEventRecord struct {
 	TransactionID string
 	EventTime     string
 	Host          string
-	// AttributionRuleID 是链首注入的 X-LB-Rule-ID 请求头值（历史修复）：规则归因的
+	// AttributionRuleID 是链首注入的 X-LB-Rule-ID 请求头值：规则归因的
 	// 一等信号，优先于 host 反查；注入头缺失/指向已删除规则时回退 host 映射。
 	AttributionRuleID string
 	ClientIP          string
@@ -61,7 +61,7 @@ type securityEventRecord struct {
 	RequestHeaders string
 	RequestBody    string
 	// chainedCustomRule 标记「多条件链式自定义规则」的起始条（审计 raw 以 ,chain
-	// 结尾）——历史修复 把 setvar 迁到链尾后，该形态的 raw 不含评分字面量，
+	// 结尾）——把 setvar 迁到链尾后，该形态的 raw 不含评分字面量，
 	// AnomalyScore 需按发射 id 回查 cr.Score 补齐。
 	chainedCustomRule bool
 }
@@ -181,7 +181,7 @@ func securityEventsChainedCustomRuleScore(ruleTriggered string, policyByID map[i
 // 因此视为解析失败跳过。
 var errSecurityEventsEmptyID = errors.New("transaction has no id")
 
-// errSecurityEventsStalled 标记「残缺文档等待补写」的停等状态（历史问题）：
+// errSecurityEventsStalled 标记「残缺文档等待补写」的停等状态
 // 非故障，但必须以非 nil 错误返回——tick 的 lastPassClean 会因此置假，空闲
 // tick 提前返回被禁用，停等计数才能在文件不再增长时（真·崩溃残片）继续
 // 递增直至触发跳过；告警侧由 60s 同消息限流兜底。
@@ -232,7 +232,7 @@ func securityEventsParseTransaction(raw json.RawMessage) (*securityEventRecord, 
 	// 审计消息不含 coraza 评分段——入库时补固定语义分，全管线统一评分驱动
 	// （事件日志评分列与威胁大屏危险等级同源）：IP 名单/预检=12（高危），
 	// GeoIP/限流=6（中危）；WAF 事件不受影响。
-	// 历史问题：爬虫两族必须先判（否则普通 GeoIP 的 8xxxxx 被当
+	// 爬虫两族必须先判（否则普通 GeoIP 的 8xxxxx 被当
 	// 爬虫豁免得 0 分）；普通 GeoIP（id 8 / 8xxxxx 非爬虫族）的 6 分必须先于
 	// 通用预检 12 分判定；429 不在预检谓词内，保持 6。分支内不重复 2/3 字面量
 	// （securityEventsIsPrecheckRule 已含）。
@@ -314,38 +314,53 @@ const (
 // securityEventsSerializeHeaders 落库事件请求头：JSON 文本，64KB 上限——超限按
 // 值体积从大到小逐条丢弃，并以 _lb_dropped_headers 键记录丢弃条数（始终保持合法 JSON，
 // 前端无需容错解析）。头名/值原文保留，敏感值掩码是展示层姿态。合成键保留给
-// 写侧，客户端同名头在序列化前剥离。
+// 写侧：快照插件（caddygeoip snapshotAuditHeaders）已在客户端头的首个受信
+// 触点剥离伪造同名头、并把自身 64KiB 快照裁剪计数写入该键——此处把既有计数
+// 视为写侧真实丢弃数，与本次落库裁剪计数合并（不剥离、不清零）。
 func securityEventsSerializeHeaders(headers map[string][]string) string {
 	if len(headers) == 0 {
 		return ""
 	}
-	clientMarker := false
-	for key := range headers {
-		if strings.EqualFold(key, securityEventsDroppedHeadersKey) {
-			clientMarker = true
-			break
+	priorDrops := 0
+	if existing, ok := headers[securityEventsDroppedHeadersKey]; ok && len(existing) > 0 {
+		if parsed, err := strconv.Atoi(existing[0]); err == nil && parsed > 0 {
+			priorDrops = parsed
 		}
 	}
-	if clientMarker {
+	if _, ok := headers[securityEventsDroppedHeadersKey]; ok {
 		clean := make(map[string][]string, len(headers))
 		for key, values := range headers {
 			if !strings.EqualFold(key, securityEventsDroppedHeadersKey) {
 				clean[key] = values
 			}
 		}
-		if len(clean) == 0 {
-			return ""
-		}
 		headers = clean
+	}
+	if len(headers) == 0 {
+		if priorDrops > 0 {
+			raw, err := json.Marshal(map[string][]string{securityEventsDroppedHeadersKey: {strconv.Itoa(priorDrops)}})
+			if err == nil {
+				return string(raw)
+			}
+		}
+		return ""
 	}
 	raw, err := json.Marshal(headers)
 	if err != nil {
 		return ""
 	}
 	if len(raw) <= securityEventsHeadersCap {
-		return string(raw)
+		if priorDrops == 0 {
+			return string(raw)
+		}
+		headers[securityEventsDroppedHeadersKey] = []string{strconv.Itoa(priorDrops)}
+		if merged, merr := json.Marshal(headers); merr == nil && len(merged) <= securityEventsHeadersCap {
+			return string(merged)
+		}
+		// 恰贴上限的罕见形态：并入标记后超限——落入下方裁剪路径统一处理。
+		delete(headers, securityEventsDroppedHeadersKey)
 	}
-	// 历史问题-06（历史）：旧实现「删一个键 → 整表 json.Marshal」是
+	// 旧实现「删一个键 → 整表 json.Marshal」是
 	// O(n²)——单请求头总量上限 1MB 时可有数千个短头，一次请求即让摄取单线程
 	// 循环数千次全量编码（审计面 DoS 放大）。改为预计算每个键的序列化字节
 	// （键/值各自 marshal，转义已计入），按体积降序一次扣除到目标以下，正常
@@ -375,33 +390,33 @@ func securityEventsSerializeHeaders(headers map[string][]string) string {
 	// 丢弃标记键的精确形态开销（dropped 位数按 6 位上限预留）。
 	markerOverhead := len(`"_lb_dropped_headers":["000000"]`) + 1
 	estimated := total
-	dropped := 0
+	newDropped := 0
 	for _, ks := range keys {
 		if estimated+markerOverhead <= securityEventsHeadersCap {
 			break
 		}
 		delete(trimmed, ks.key)
 		estimated -= ks.size
-		dropped++
+		newDropped++
 	}
-	if dropped == 0 {
+	if newDropped == 0 && priorDrops == 0 {
 		return string(raw)
 	}
-	trimmed[securityEventsDroppedHeadersKey] = []string{strconv.Itoa(dropped)}
+	trimmed[securityEventsDroppedHeadersKey] = []string{strconv.Itoa(priorDrops + newDropped)}
 	raw, err = json.Marshal(trimmed)
 	if err != nil {
 		return ""
 	}
-	for len(raw) > securityEventsHeadersCap && dropped < len(keys) {
-		batch := (len(keys) - dropped) / 2
+	for len(raw) > securityEventsHeadersCap && newDropped < len(keys) {
+		batch := (len(keys) - newDropped) / 2
 		if batch < 1 {
 			batch = 1
 		}
-		for i := 0; i < batch && dropped < len(keys); i++ {
-			delete(trimmed, keys[dropped].key)
-			dropped++
+		for i := 0; i < batch && newDropped < len(keys); i++ {
+			delete(trimmed, keys[newDropped].key)
+			newDropped++
 		}
-		trimmed[securityEventsDroppedHeadersKey] = []string{strconv.Itoa(dropped)}
+		trimmed[securityEventsDroppedHeadersKey] = []string{strconv.Itoa(priorDrops + newDropped)}
 		raw, err = json.Marshal(trimmed)
 		if err != nil {
 			return ""
@@ -413,7 +428,7 @@ func securityEventsSerializeHeaders(headers map[string][]string) string {
 // securityEventsEncodeBody 落库事件请求体：64KB 上限。UTF-8 文本原样存储，
 // 超限截到符文边界（不劈开多字节字符）并追加 \n...[TRUNCATED]；二进制整体
 // base64 并加 base64: 前缀，超限只编码前 64KB 原始字节、前缀改为
-// 。历史修复 文本若本身以任一保留前缀开头，先加 utf8: 转义，
+// 文本若本身以任一保留前缀开头，先加 utf8: 转义，
 // 消除「明文被展示层误当二进制」的歧义。空体存空串。
 func securityEventsEncodeBody(body string) string {
 	if body == "" {
@@ -519,12 +534,12 @@ func securityEventsLoadMappings() (map[string]securityEventsRuleRef, map[string]
 		return nil, nil, nil, errors.New("security events: database not initialized")
 	}
 	rules := make(map[string]securityEventsRuleRef)
-	// 历史问题-12（历史）：显式 ORDER BY id ASC——同域名多规则（如 http/https
+	// 显式 ORDER BY id ASC——同域名多规则（如 http/https
 	// 双规则）的纯域名键覆盖序此前依赖 SQLite 未定义返回序，注释却宣称「后
 	// 创建规则覆盖(创建序)」。id 升序 + 顺序赋值 = 较高 id（较新创建）最终覆盖；
 	// MapHost 对 host:port 精确键仍优先。
 	// enabled 升序让启用规则最后赋值（覆盖禁用重名规则），再按 id 升序保留
-	// 「较新创建覆盖」的既有口径（历史问题-08）。
+	// 「较新创建覆盖」的既有口径。
 	rows, err := db.DB.Query(`SELECT caddy_id, COALESCE(domain,''), COALESCE(name,''), listen_port FROM lb_rules WHERE protocol='http' AND COALESCE(domain,'') != '' ORDER BY COALESCE(enabled,0) ASC, id ASC`)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("security events: load rules: %w", err)
@@ -575,7 +590,7 @@ func securityEventsLoadMappings() (map[string]securityEventsRuleRef, map[string]
 	}
 
 	// 策略的 mode / custom_rules / crs_rule_groups / ip_blacklist / ip_acl_* 用于
-	// 「rule_triggered 属于哪个策略」判定（mode 供 历史问题 off 门：mode=off 策略
+	// 「rule_triggered 属于哪个策略」判定（mode 供 off 门：mode=off 策略
 	// 不发射 CRS，不得认领 CRS 事件）；仅加载启用策略（disabled 策略不应再
 	// 接收事件归因）。
 	policyByID := make(map[int]*models.SecurityPolicy)
@@ -600,7 +615,7 @@ func securityEventsLoadMappings() (map[string]securityEventsRuleRef, map[string]
 		// 既有 SELECT 未携带，能力层不读库补查（摄入 tick 热路径），在此装载。
 		p.IPWhitelist = json.RawMessage(whitelistJSON)
 		p.IPWhitelistRefs = whitelistRefsJSON
-		// 策略类型 / 保留检测（历史问题-5，历史）：IP 族能力首选层的信任分支须镜像
+		// 策略类型 / 保留检测：IP 族能力首选层的信任分支须镜像
 		// 引擎信任门（security.go:166 `PolicyType != stage0`；预检 id:3 排除 stage0，
 		// 保留检测由 id:12 承载）——不装载则摄入态恒空值，镜像判定失效（stage0 直通
 		// 策略会凭「whitelist 非空」抢认它物理上产不出的 logged IP 族事件）。
@@ -713,6 +728,62 @@ func securityEventsCRSExclusionRemovesRule(set securityEventsPolicyCRSExclusions
 	return false
 }
 
+// securityEventsPolicyCRSGroups 返回策略 crs_rule_groups 的解析缓存
+// （trimmed 条目集 + 解析成功与否），与 policyCustomRulesCached 同构的
+// tick 级预算化——contains 判定按「事件×候选策略」执行，原始 JSON 每策略
+// 只解析一次，不再逐事件重复 Unmarshal。
+func securityEventsPolicyCRSGroups(policy *models.SecurityPolicy) (map[string]struct{}, bool) {
+	if policy.CRSRuleGroupsParsed {
+		return policy.CRSRuleGroupsSet, policy.CRSRuleGroupsOK
+	}
+	policy.CRSRuleGroupsParsed = true
+	var groups []string
+	if err := json.Unmarshal(policy.CRSRuleGroups, &groups); err != nil {
+		return nil, false
+	}
+	set := make(map[string]struct{}, len(groups))
+	for _, g := range groups {
+		set[strings.TrimSpace(g)] = struct{}{}
+	}
+	policy.CRSRuleGroupsSet = set
+	policy.CRSRuleGroupsOK = true
+	return set, true
+}
+
+// securityEventsPolicyCustomEmitIDs 返回策略自定义规则发射 id（DB id+10000）
+// 集合的解析缓存：[]int 形态优先（解析成功即不回退），失败后尝试对象内嵌
+// 形态；双形态均失败按畸形（不认领）。与此前逐事件 Unmarshal 的判定语义
+// 逐项等价。
+func securityEventsPolicyCustomEmitIDs(policy *models.SecurityPolicy) (map[int]struct{}, bool) {
+	if policy.CustomRuleIDsParsed {
+		return policy.CustomRuleEmitIDs, policy.CustomRuleIDsOK
+	}
+	policy.CustomRuleIDsParsed = true
+	var ids []int
+	if err := json.Unmarshal(policy.CustomRules, &ids); err == nil {
+		set := make(map[int]struct{}, len(ids))
+		for _, id := range ids {
+			set[id+10000] = struct{}{}
+		}
+		policy.CustomRuleEmitIDs = set
+		policy.CustomRuleIDsOK = true
+		return set, true
+	}
+	var embedded []struct {
+		ID int `json:"id"`
+	}
+	if err := json.Unmarshal(policy.CustomRules, &embedded); err == nil {
+		set := make(map[int]struct{}, len(embedded))
+		for _, e := range embedded {
+			set[e.ID+10000] = struct{}{}
+		}
+		policy.CustomRuleEmitIDs = set
+		policy.CustomRuleIDsOK = true
+		return set, true
+	}
+	return nil, false
+}
+
 // securityEventsPolicyContainsRule reports whether the given rule id belongs to
 // the policy's active rule set. 自定义规则（10000+，且 <800000）：查 custom_rules
 // JSON（兼容 ID 数组与内嵌对象数组两种形状）。注意 ID 空间：custom_rules JSON
@@ -721,17 +792,17 @@ func securityEventsCRSExclusionRemovesRule(set securityEventsPolicyCRSExclusions
 // （DB id + 10000 == n）。CRS 规则（9xxxxx）：crs_rule_groups 条目为两位数字
 // 代码（如 "42" 对应 942xxx，与 BuildCorazaDirectives 的 `REQUEST-9<code>-*.conf`
 // Include 同款口径）；空数组按发射端语义视为「包含全部 REQUEST-*」，即所有 CRS
-// 规则均属于该策略。IP ACL 拒绝带（历史修复问题）：id 4 = 遗留 ip_blacklist 拒绝，
+// 规则均属于该策略。IP ACL 拒绝带：id 4 = 遗留 ip_blacklist 拒绝，
 // BuildCorazaDirectives 仅对黑名单非空的策略发射；id 2 = IP ACL 列表外拒绝——
 // 发射端对 allow 与 deny 两种模式都发 id 2（security.go「IP 白名单拒绝」/
 // 「IP 黑名单拒绝」）；归属端有意只认 deny 模式策略（allow 模式事件经回退归到
 // 首个启用策略，仅展示层影响——IPACLAllowModeDoesNotOwnDenyEvent 钉住该口径）。
-// 成员精确归因（2026-09-21 生产事故，历史修复 ①「名单命中者优先」）：clientIP 非空
+// 成员精确归因（2026-09-21 生产事故，「名单命中者优先」）：clientIP 非空
 // 且可解析时，id 2/4 在名单非空基础上追加成员判定——名单未命中事件源 IP 的
 // deny/黑名单策略不认领（多 deny 策略绑定下，首绑非属主凭「名单非空」曾误夺
 // 真属主的归属）；名单命中判定内联优先、缺失时回退 IPACLList（mergedACLList
 // 同一读法）。事件源 IP 不在任何名单＝名单在发射后被编辑的漂移形状，contains
-// 让位、由 fallback 能力首选层归属（绝不归零）。clientIP 为空（历史调用形状/
+// 让位、由 fallback 能力首选层归属（绝不归零）。clientIP 为空（调用形状/
 // 记录缺 IP）保持既有「名单非空即认领」口径。
 func securityEventsPolicyContainsRule(policy *models.SecurityPolicy, ruleTriggered, clientIP string) bool {
 	return securityEventsPolicyContainsRuleWithExclusions(policy, ruleTriggered, clientIP, securityEventsPolicyCRSExclusions{})
@@ -749,7 +820,7 @@ func securityEventsPolicyContainsRuleWithExclusions(policy *models.SecurityPolic
 	}
 	switch {
 	case n > geoipPrecheckRuleBase && n < geoipPrecheckRuleLimit:
-		// 阶段 1 预检 8xxxxx 段（历史问题 收敛）：普通 GeoIP
+		// 阶段 1 预检 8xxxxx 段：普通 GeoIP
 		// [800001,810000)、爬虫豁免 [810000,850000)、爬虫伪装 [850000,900000)
 		// 三族互斥，属主由 decodePrecheckRuleID 唯一解码——不再用
 		// policy.ID == n-800000 猜属主（该公式把 crawler id 解成万级策略编号）。
@@ -785,7 +856,7 @@ func securityEventsPolicyContainsRuleWithExclusions(policy *models.SecurityPolic
 		if !policy.IPACLEnabled {
 			return false
 		}
-		// 审计 历史修复（第五轮）：deny 归因应含 refs 合并集（inline ∪ ip_acl_list_refs），
+		// 审计 （第五轮）：deny 归因应含 refs 合并集（inline ∪ ip_acl_list_refs），
 		// 否则 refs-only deny 策略无法认领自己的 id:2 事件。
 		aclList := policy.MergedACLList
 		if len(aclList) == 0 {
@@ -812,12 +883,12 @@ func securityEventsPolicyContainsRuleWithExclusions(policy *models.SecurityPolic
 		// 历史威胁情报库共享 id:14：由带 ACL 引用/内联名单的 IP 控制策略认领。
 		return policy.IPACLEnabled && (len(policy.MergedACLList) > 0 || ipListRefsNonEmpty(policy.IPACLListRefs))
 	case n >= 900000 && n < 1000000:
-		// 审计 历史修复（第五轮）+ 历史修复（第六轮回归修复）：v2.2.2 混合选择——
+		// 审计 （第五轮）+ （第六轮回归修复）：v2.2.2 混合选择——
 		// crs_rule_groups 可含六位 CRS ID 正选；六位 ID 触发的 CRS 事件应先按
 		// 六位正选归因，未命中时回落既有组号归因（空组=全部 CRS）。
 		// 第五轮的本分支在组号分支（:371）之前且直接 return false，使后者成为
 		// 死代码——用两位组号（常规配置）的策略其 CRS 事件归因失效。
-		// 历史问题：mode=off 不发射任何 CRS（engine 分支不成立或零 Include），
+		// mode=off 不发射任何 CRS（engine 分支不成立或零 Include），
 		// 不得认领 CRS 事件（与 GeoIP 分支的 off 门同口径）。2026-09-09 四态化:
 		// custom_only 同样零 CRS Include,口径收紧为「CRS 生效模式」——否则
 		// 同规则多策略绑定时 custom_only 策略会抢走 blocking 策略的 CRS 事件归属。
@@ -829,7 +900,7 @@ func securityEventsPolicyContainsRuleWithExclusions(policy *models.SecurityPolic
 		if securityEventsCRSExclusionRemovesRule(crsExclusions, ruleTriggered, clientIP) {
 			return false
 		}
-		// 历史问题：949 评估规则自 v2.2.3 起对全部启用 WAF 的策略强制包含（历史修复
+		// 949 评估规则自 v2.2.3 起对全部启用 WAF 的策略强制包含
 		// 基础设施去重强制 Include），959 对开启响应检查的策略强制包含——均与
 		// 存储的 crs_rule_groups 无关（写入面已剥离 49/59 组号，组号匹配恒
 		// false），须按各自发射门先行放行。
@@ -839,19 +910,17 @@ func securityEventsPolicyContainsRuleWithExclusions(policy *models.SecurityPolic
 		if strings.HasPrefix(ruleTriggered, "959") {
 			return policy.WAFCheckResponse
 		}
-		var groups []string
-		if err := json.Unmarshal(policy.CRSRuleGroups, &groups); err != nil {
+		groups, groupsOK := securityEventsPolicyCRSGroups(policy)
+		if !groupsOK {
 			return false
 		}
-		for _, g := range groups {
-			if strings.TrimSpace(g) == fmt.Sprintf("%d", n) {
-				return true
-			}
+		if _, hit := groups[strconv.Itoa(n)]; hit {
+			return true
 		}
 		if len(groups) == 0 {
 			return true
 		}
-		// 历史问题（历史）：切片前长度防御——六位是 CRS 规则 ID 的规范
+		// 切片前长度防御——六位是 CRS 规则 ID 的规范
 		// 形态；前导零等畸形串（Atoi 可解析入区间但长度≠6，如 "0942100"）
 		// 的 [1:3] 切片错位（切出 "94" 而非真实组号 21），会误认领存量/带外
 		// 携带对应错位组号的策略。组号不可解码即保守不认领——事件归属由
@@ -859,62 +928,43 @@ func securityEventsPolicyContainsRuleWithExclusions(policy *models.SecurityPolic
 		if len(ruleTriggered) != 6 {
 			return false
 		}
-		code := ruleTriggered[1:3]
-		for _, g := range groups {
-			if strings.TrimSpace(g) == code {
-				return true
-			}
-		}
-		return false
+		_, codeHit := groups[ruleTriggered[1:3]]
+		return codeHit
 	case n >= 10000 && n < geoipPrecheckRuleBase:
-		// 历史修复(2026-09-10 审计):off=全关(四态化)零发射,不得认领自定义规则事件
+		// (2026-09-10 审计):off=全关(四态化)零发射,不得认领自定义规则事件
 		//(与 CRS 分支 blocking/detection 门同口径;custom_only/blocking/detection
 		// 三态的自定义规则发射由 customActive 保证)。
 		if policy.Mode == "off" {
 			return false
 		}
-		var ids []int
-		if err := json.Unmarshal(policy.CustomRules, &ids); err == nil {
-			for _, id := range ids {
-				if id+10000 == n {
-					return true
-				}
-			}
+		emitIDs, idsOK := securityEventsPolicyCustomEmitIDs(policy)
+		if !idsOK {
 			return false
 		}
-		var embedded []struct {
-			ID int `json:"id"`
-		}
-		if err := json.Unmarshal(policy.CustomRules, &embedded); err == nil {
-			for _, e := range embedded {
-				if e.ID+10000 == n {
-					return true
-				}
-			}
-		}
-		return false
+		_, idHit := emitIDs[n]
+		return idHit
 	}
 	return false
 }
 
-// securityEventsFallbackCanProduce(历史问题 + 历史问题-1/2/3
-// 历史误拒修正):fallback 归因的模式/动作可行性门。只核「该策略的当前模式
+// securityEventsFallbackCanProduce(fallback 归因门 + 误拒修正):
+// fallback 归因的模式/动作可行性门。只核「该策略的当前模式
 // 在物理上能否产出此 (动作,规则 id) 事件」,不核名单成员(fallback 的存在理由
 // 正是配置可能已在发射后变更)。门禁表逐格对照发射侧单一事实:
 //
 //	· IP 控制/GeoIP(id:2/4/8)+预检 allow 交集(id:7):与 WAF 模式无关独立
 //	  发射(security.go:179-181 明文「runs independently of the WAF mode」,
 //	  :220-222 emitIPControl||geoipActive → SecRuleEngine On)——off 模式亦可产
-//	  blocked(历史问题-1:初版门「off 零发射」与发射侧设计明文矛盾,误拒);
+//	  blocked（初版门「off 零发射」与发射侧设计明文矛盾,误拒);
 //	· detection 的 id:6 DetectionOnly 切换(security.go:351)发射于 IP 控制/
 //	  自定义规则之后、CRS 之前——phase:1 拦截规则真实阻断(:668 明文保障),
 //	  blocked 可产={2,4,7,8}+自定义;CRS 在切换后评估,DetectionOnly 零中断
-//	  (历史问题-2:初版门 detection+blocked 全量误拒);
+//	  （初版门 detection+blocked 全量误拒);
 //	· custom_only 零 CRS Include(contains :459 同口径)——CRS 事件全拒;
-//	  无 949 评分链,id:11 守卫(phase:2 pass)恒不产 blocked(历史修复 标靶保持);
+//	  无 949 评分链,id:11 守卫(phase:2 pass)恒不产 blocked;
 //	  自定义规则无 id:6 切换任意相位可拦;预检 id:7 与模式无关(:927-935)
-//	  (历史问题-3:初版门允许集漏 7,误拒);
-//	· id:11 发射面(2026-09-21 实证;历史问题收紧):emitBodyProcessorRules
+//	  (初版门允许集漏 7,误拒);
+//	· id:11 发射面(2026-09-21 实证;收紧):emitBodyProcessorRules
 //	  在 blocking/detection 恒发射,custom_only 收紧为存在启用自定义规则才发射
 //	  (security.go :374,零规则+仅 IP 控制形状 body access 恒 Off、发射即死
 //	  指令)——logged 事件三模式物理可能,门放行格与发射面一致(模式粒度,
@@ -978,7 +1028,7 @@ func securityEventsRuleIsIPFamily(ruleTriggered string) bool {
 	if err != nil {
 		return false
 	}
-	return IsStage1PrecheckID(n) // 历史：消费单一事实源（原第三处字面量复写）
+	return IsStage1PrecheckID(n) // 消费单一事实源（原第三处字面量复写）
 }
 
 // securityEventsRuleIsCustomFamily 报告规则 id 是否属于自定义规则族（5 位发射
@@ -1022,21 +1072,21 @@ func securityEventsCustomRulesEventSurface(p *models.SecurityPolicy) bool {
 	return false
 }
 
-// securityEventsIPFamilyEventSurface（2026-09-21 生产事故，历史修复 ②能力维度）：
+// securityEventsIPFamilyEventSurface（2026-09-21 生产事故，能力维度）
 // IP 族事件 fallback 首选层的物理发射面判定，逐 id 对照发射侧单一事实——
 //
 //	· id 8/800xxx（GeoIP）：PolicyHasGeoIP（mode!=off 且名单非空），与发射门
 //	  （buildIPPrecheckDirectives :964/:1043、contains id:8 分支）同源；
 //	· id 2（ACL 拒绝带）：deny 模式且合并名单非空（BuildCorazaDirectives :287
 //	  「IPACLEnabled && len(ipACLList)>0」+ :306 deny 分支；allow 模式发射的
-//	  id:2 归属口径有意不认（历史修复问题，IPACLAllowModeDoesNotOwnDenyEvent 钉）；
+//	  id:2 归属口径有意不认（问题，IPACLAllowModeDoesNotOwnDenyEvent 钉）；
 //	· id 4（遗留黑名单）：黑名单非空（:322 无模式门）；
 //	· id 7（预检 allow 交集）：allow 模式且合并名单非空（buildIPPrecheckDirectives
 //	  仅 allow 参与交集）；
 //	· 信任名单（ip_whitelist）：仅 logged（检测）语义计入 id 2/4/7 能力——信任
 //	  只以 DetectionOnly 降级事务、令 deny 规则以检测动作留痕，自身发射的
 //	  id:3/5/12 为 nolog pass 永不产事件，更不可能产 blocked。**镜像引擎/预检
-//	  信任门（2026-09-21 历史问题-5）**：stage0 + trust_detection=0（直通）
+//	  信任门（2026-09-21）**：stage0 + trust_detection=0（直通）
 //	  的信任 IP 走路由层 subroute 短路（零 coraza 事务）、非信任 IP 全链评估且
 //	  无 DetectionOnly 降级 ⇒ 该策略物理上不产任何 logged IP 族事件，故要求
 //	  `PolicyType != stage0 || TrustDetection`（对齐 security.go:166 引擎门与
@@ -1086,7 +1136,7 @@ func securityEventsIPFamilyEventSurface(p *models.SecurityPolicy, action, ruleTr
 
 // securityEventsIPInList 报告事件源 IP 是否命中名单条目（精确或 CIDR 包含）。
 // 条目解析失败按不命中跳过（与渲染端 @ipMatch 的宽松容忍一致——坏条目在
-// 生成期告警，不在此重复报）。历史修复 归一后比较。
+// 生成期告警，不在此重复报）。归一后比较。
 func securityEventsIPInList(ip string, list []string) bool {
 	addr, err := netip.ParseAddr(ip)
 	if err != nil {
@@ -1116,14 +1166,14 @@ func securityEventsIPInList(ip string, list []string) bool {
 
 // securityEventsAttributePolicy v2.2.0 多策略事件归因：rule_triggered → 查该规则
 // ID 属于哪个策略（custom_rules / CRS 组 / IP ACL 拒绝带匹配，IP 族带事件源 IP
-// 成员精确判定），重叠时取绑定顺序第一条（policy_id ASC 的第一个）——历史问题-04
-// （历史）语义声明：多策略 CRS 重叠时实际执行拦截的引擎实例在 coraza 审计
+// 成员精确判定），重叠时取绑定顺序第一条（policy_id ASC 的第一个）——
+// 语义声明：多策略 CRS 重叠时实际执行拦截的引擎实例在 coraza 审计
 // 日志中不可恢复（各策略引擎对同一 CRS 规则 ID 均可产出中断），首绑定归因是摄
 // 取期约定的最接近发射现实的稳定口径，是记账语义而非 forensic 判定；事件页与
 // 24h 计数消费同一口径。策略均未
 // 显式包含时走 fallback，两层判定：
 //
-//  1. 能力首选层（2026-09-21 生产事故）：模式/动作门（历史问题，
+//  1. 能力首选层（2026-09-21 生产事故）：模式/动作门
 //     securityEventsFallbackCanProduce）+ IP 族物理发射面
 //     （securityEventsIPFamilyEventSurface）——无任何 IP 控制能力的策略不得凭
 //     候选顺序抢先认领 id:2/4/7/8/800xxx 事件；+ 自定义族物理发射面
@@ -1152,7 +1202,7 @@ func securityEventsAttributePolicyWithExclusions(ruleCaddyID, ruleTriggered, act
 		if p == nil {
 			continue
 		}
-		// 历史问题：渲染被跳过（引用名单缺失）的策略不参与成员归因。
+		// 渲染被跳过（引用名单缺失）的策略不参与成员归因。
 		if p.IPRefMissing {
 			continue
 		}
@@ -1162,7 +1212,7 @@ func securityEventsAttributePolicyWithExclusions(ruleCaddyID, ruleTriggered, act
 	}
 	ipFamily := securityEventsRuleIsIPFamily(ruleTriggered)
 	customFam := securityEventsRuleIsCustomFamily(ruleTriggered)
-	// 历史问题：IPRefMissing=该策略因引用名单缺失被渲染跳过——物理上不可能
+	// IPRefMissing=该策略因引用名单缺失被渲染跳过——物理上不可能
 	// 产出本事件，不得凭规则 ID/能力门抢走真实属主。但「发射后配置漂移」的
 	// 既有 fallback 语义保留：已渲染候选全部不匹配时，仍归到未渲染候选
 	// （绝不归零），仅让其退居末位。
@@ -1246,9 +1296,73 @@ func securityEventsReadOffset(path string) (int64, error) {
 
 // securityEventsWriteOffset persists the byte offset atomically (plain integer).
 func securityEventsWriteOffset(path string, offset int64) error {
-	// 历史问题：单源原子落盘（tmp+fsync+父目录 fsync）——0 字节偏移文件会让
+	// 单源原子落盘（tmp+fsync+父目录 fsync）——0 字节偏移文件会让
 	// 尾读从头重放（重复摄取），掉电丢失则可能跳读窗口。
 	return writeFileAtomicSynced(path, []byte(strconv.FormatInt(offset, 10)), 0o644)
+}
+
+// securityEventsGenerationPath 返回摄取 offset 所属 metrics 库代际的标记文件
+// 路径（与 offset 同目录，随 offset 一起生命周期）。
+func securityEventsGenerationPath(offsetPath string) string { return offsetPath + ".generation" }
+
+// securityEventsReadGeneration 读取已记录的库代际；文件缺失（首装/升级首启）
+// 返回空串，与「代际未知」同义。
+func securityEventsReadGeneration(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
+// securityEventsWriteGeneration 原子持久化库代际（与 offset 落盘同源 helper）。
+func securityEventsWriteGeneration(path, generation string) error {
+	return writeFileAtomicSynced(path, []byte(generation), 0o644)
+}
+
+// securityEventsGenerationGuard 把 offset 与 metrics 库代际绑定：库被隔离重建
+// （损坏自愈=新库文件=新代际）后，旧 offset/inode 状态属于已丢弃的旧库，必须
+// 按「新库」语义归零从头摄取——否则新库永久跳过文件中段之前的事件。
+//
+// 语义取舍（Ruling）：新库没有旧库的任何记录，无法知道哪些行「已入旧库」；
+// 从头摄取是唯一不丢事件的策略。同一库内的重复摄取由 transaction_id 唯一
+// 索引（INSERT OR IGNORE）幂等吸收，且重建后旧库文件已隔离，不存在向同一
+// 库重放的问题。首次见到代际（升级首启/新装）只登记代际、保留 offset——存量
+// 库本就持有这些事件，复位会整文件重放。
+func (t *securityEventsTailer) securityEventsGenerationGuard(offset int64) (int64, error) {
+	current := db.MetricsDBGeneration()
+	if current == "" {
+		return offset, nil // 库未装配（测试/嵌入形态）：无代际可判
+	}
+	if !t.generationLoaded {
+		stored, err := securityEventsReadGeneration(t.generationPath)
+		if err != nil {
+			return offset, fmt.Errorf("security events: read generation marker: %w", err)
+		}
+		t.generation = stored
+		t.generationLoaded = true
+	}
+	if t.generation == current {
+		return offset, nil
+	}
+	if t.generation != "" {
+		Logf("warn", "security events ingestion: metrics database generation changed (%s -> %s), resetting offset %d to 0 (fresh metrics library, re-ingesting audit log)", t.generation, current, offset)
+		offset = 0
+		t.lastInfo = nil
+		t.stallOffset, t.stallCount = 0, 0
+		t.failOffset = -1
+		if err := securityEventsWriteOffset(t.offsetPath, 0); err != nil {
+			return offset, fmt.Errorf("security events: persist offset reset for new library generation: %w", err)
+		}
+	}
+	if err := securityEventsWriteGeneration(t.generationPath, current); err != nil {
+		return offset, fmt.Errorf("security events: persist generation marker: %w", err)
+	}
+	t.generation = current
+	return offset, nil
 }
 
 // securityEventsShouldReset reports whether the tailer must restart at offset
@@ -1273,7 +1387,7 @@ const securityEventsDecodeStallLimit = 5
 // securityEventsFindNextDocument scans forward from `from` for the next `{`
 // at column 0, which in the pretty-printed multi-line format marks the start
 // of the next top-level transaction. found=false when none exists yet.
-// the scan buffer is sized min(scanLimit, 历史修复) via f.Stat
+// the scan buffer is sized min(scanLimit） via f.Stat
 // — a small residual tail (post hard-kill) previously allocated the full 4MB
 // window on every 2s tick decode error (~2MB/s sustained churn). The caller's
 // malformed-region decision uses the scanLimit constant, not the buffer size,
@@ -1306,7 +1420,7 @@ func securityEventsFindNextDocument(f *os.File, from int64) (int64, bool, error)
 
 // securityEventsGapAllWhitespace reports whether the byte range [from, to) of
 // f consists solely of JSON whitespace — the harmless document-boundary advance
-// （上一完整文档的行尾换行等）。历史问题：跳过窗口含非空白字节时才可能丢
+// （上一完整文档的行尾换行等）。跳过窗口含非空白字节时才可能丢
 // 数据（进入停等/跳过路径）；纯空白窗口直接推进，与旧语义等价。窗口大于
 // 4KB 按非空白保守处理（真实残缺数据不可能被 4KB 纯空白分隔）。
 func securityEventsGapAllWhitespace(f *os.File, from, to int64) bool {
@@ -1371,7 +1485,7 @@ func securityEventsScanNextDocumentBounded(f *os.File, from, limit int64) (int64
 }
 
 // securityEventsRollupRewriteHook 摄取提交后的 rollup 覆盖水位回退钩子
-// （历史问题-1，历史；由 main.go 装配 handlers.ThreatRollupRewindTo）。
+// （由 main.go 装配 handlers.ThreatRollupRewindTo）。
 // 停机/升级积压或轮转补采的插入事件时间可能落在 rollup 已覆盖的分钟区间
 // ——warmer 在摄取首 pass 之前已推进水位时，超过 threatRollupRepairMinutes
 // 的积压分钟再无重固入口，大屏永久少计。钩子接收本批实际插入的最旧事件
@@ -1398,30 +1512,40 @@ type securityEventsTailer struct {
 	logPath    string
 	offsetPath string
 	lastInfo   os.FileInfo
-	// lastPassClean 标记上一次 pass 是否无错误结束（历史修复 空闲 tick 判定
-	// 用）：失败 pass（历史修复 停摆、DB 错误）的下一 tick 必须重跑——停摆限流告警与
+	// lastPassClean 标记上一次 pass 是否无错误结束（空闲 tick 判定
+	// 用）：失败 pass的下一 tick 必须重跑——停摆限流告警与
 	// DB 重试都依赖 2s 周期持续转动，不得被空闲跳过吞掉。
 	lastPassClean bool
 	// lastIngested 上一 pass 摄取事件数（SecurityEventsPollOnce 消费后清零——
 	// SPEC §6.5 业务摘要行：有事件才写任务日志）。
 	lastIngested int
-	// stallOffset/stallCount 是 历史问题 停等状态：最近一次「残缺文档等待
+	// stallOffset/stallCount 是停等状态：最近一次「残缺文档等待
 	// 补写」的偏移与连续失败次数。键为残缺文档起始偏移（每次 pass 从该处
 	// 重启，稳定）；偏移推进即数据已补全/已跳过，下次失败自然重置。
 	stallOffset int64
 	stallCount  int
-	// failOffset 是本 pass 中 历史修复 停摆（畸形区）的偏移，仅 历史修复 错误路径设置；
-	// -1 表示本次 tick 未触发 历史修复。
+	// failOffset 是本 pass 中停摆（畸形区）的偏移，仅错误路径设置；
+	// 1 表示本次 tick 未触发。
 	failOffset  int64
 	archivePass bool
-	// 历史修复: 历史修复 停摆告警限流——上次 warn 的畸形区偏移与时间，偏移不变时每分钟
+	// 停摆告警限流——上次 warn 的畸形区偏移与时间，偏移不变时每分钟
 	// 最多一条 warn，偏移前进即重置立即告警。
 	lastWarnOffset int64
 	lastWarnTime   time.Time
+	// generation/generationLoaded 是 metrics 库代际绑定状态（见
+	// securityEventsGenerationGuard）：代际变化即丢弃旧 offset/inode 从头摄取。
+	generation       string
+	generationLoaded bool
+	generationPath   string
 }
 
 func securityEventsNewTailer(logPath, offsetPath string) *securityEventsTailer {
-	return &securityEventsTailer{logPath: logPath, offsetPath: offsetPath, failOffset: -1}
+	return &securityEventsTailer{
+		logPath:        logPath,
+		offsetPath:     offsetPath,
+		generationPath: securityEventsGenerationPath(offsetPath),
+		failOffset:     -1,
+	}
 }
 
 // securityEventsTick runs one ingest pass over the audit log.
@@ -1434,7 +1558,7 @@ func (t *securityEventsTailer) securityEventsTick() error {
 		}
 		_ = created.Close()
 		t.lastInfo = nil
-		// 历史问题(历史):文件缺失=路径迁移/首启动——残留 offset
+		// 文件缺失=路径迁移/首启动——残留 offset
 		// 来自旧路径,必须归零;否则新文件快速增长超过旧 offset 后,前缀事件
 		// 被永久跳过(inode 分支 lastInfo=nil 首启动永不生效)。
 		if stale, rerr := securityEventsReadOffset(t.offsetPath); rerr == nil && stale > 0 {
@@ -1451,6 +1575,12 @@ func (t *securityEventsTailer) securityEventsTick() error {
 	offset, err := securityEventsReadOffset(t.offsetPath)
 	if err != nil {
 		return fmt.Errorf("security events: read offset: %w", err)
+	}
+	// 库代际绑定必须先于截断/轮转判定与空闲提前返回：库隔离重建时即使审计
+	// 日志无新增字节（空闲 tick），也必须复位 offset 并触发重摄取。
+	offset, err = t.securityEventsGenerationGuard(offset)
+	if err != nil {
+		return err
 	}
 	// 安全处理耗时：历史侧车退役——耗时随审计行内嵌 lb_timing 字段流转，
 	// 本 tick 无需前置加载任何侧车文件；空闲提前返回的消费面语义不变。
@@ -1496,10 +1626,10 @@ func (t *securityEventsTailer) securityEventsTick() error {
 // database error stops the pass so the next tick retries the same offset; a
 // malformed transaction is logged and skipped without aborting the pass.
 func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int64, rules map[string]securityEventsRuleRef, bindings map[string][]int, policyByID map[int]*models.SecurityPolicy) (int64, error) {
-	// 每个 pass 开始时重置停摆偏移：只有本 pass 实际 历史修复 停摆才会重新赋值，
-	// 避免同偏移的新停摆被上一轮 warn 的限流状态吞掉（历史问题）。
+	// 每个 pass 开始时重置停摆偏移：只有本 pass 实际停摆才会重新赋值，
+	// 避免同偏移的新停摆被上一轮 warn 的限流状态吞掉。
 	t.failOffset = -1
-	// 历史修复：每 pass 一次从 host→ref 派生 caddy_id→ref 索引，供 X-LB-Rule-ID
+	// 每 pass 一次从 host→ref 派生 caddy_id→ref 索引，供 X-LB-Rule-ID
 	// 注入头优先归因（O(规则数) 一次性，避免逐事件反查）。
 	rulesByID := make(map[string]securityEventsRuleRef, len(rules))
 	for _, ref := range rules {
@@ -1510,7 +1640,7 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 	if _, err := f.Seek(offset, io.SeekStart); err != nil {
 		return offset, fmt.Errorf("security events: seek audit log: %w", err)
 	}
-	// 历史问题：半初始化（MetricsDB=nil）时返回显式错误而非 panic；本地句柄
+	// 半初始化（MetricsDB=nil）时返回显式错误而非 panic；本地句柄
 	// 捕获同时避免测试 teardown 并发置 nil 后的 mid-pass 解引用（同
 	// securityevents_retention 的本地捕获口径）。
 	metricsDB := db.MetricsDB
@@ -1535,25 +1665,25 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 	// batchCount 只控「每 500 条尝试提交」的批次节奏；它必须与 pass 级实际
 	// 插入计数分离——旧实现复用一个 count，批次提交清零后 EOF 写出的
 	// lastIngested 只剩余数（1000 条→0、501 条→1），PollOnce 的任务日志条数
-	// 与「本轮摄取 N 条」展示随之失真（历史）。
+	// 与「本轮摄取 N 条」展示随之失真。
 	batchCount := 0
 	// passInsertedTotal 本 pass 实际插入行数（RowsAffected==1 才 +1）：
 	// 同一事务重复行/轮转补采重叠/offset 重放的 INSERT OR IGNORE 忽略行
-	// 不计入（历史问题），与自动封禁喂入口径同源（历史问题）。
+	// 不计入，与自动封禁喂入口径同源。
 	passInsertedTotal := 0
 	// batchInserted 当前未提交事务内实际插入数；仅在 commit 成功后并入
-	// passInsertedTotal。回滚/提交失败的行不得计入任务日志（历史问题-4）。
+	// passInsertedTotal。回滚/提交失败的行不得计入任务日志。
 	batchInserted := 0
-	// 历史问题-08：任何返回路径都回填本 pass 实际插入数——补采（归档/活文件尾部）
+	// 任何返回路径都回填本 pass 实际插入数——补采（归档/活文件尾部）
 	// 的 delta 摄取同样产生 lastIngested，供任务日志「摄取 N 条」消费。
 	defer func() { t.lastIngested = passInsertedTotal }()
-	// 历史问题 自动封禁喂入：本事务批次内成功解析的 WAF 事件随「提交点」喂计数器
+	// 自动封禁喂入：本事务批次内成功解析的 WAF 事件随「提交点」喂计数器
 	// ——commit 成功后才喂（回滚路径不喂，重试不重复计数）；feedBatch 为 nil
 	// 时 autobanObserveBatch 零动作（未启用/从节点等门在函数内收敛）。
 	var autobanBatch []autobanFeedItem
 	// 攻击流光流批次：与日志事务提交点对齐，回滚路径不喂。
 	var attackFlowBatch []threatScreenAttackFlowItem
-	// 历史问题-1：本批实际插入事件的最旧分钟（UTC）——提交成功后通知 rollup
+	// 本批实际插入事件的最旧分钟（UTC）——提交成功后通知 rollup
 	// 回退钩子（积压事件落在已覆盖分钟区间时重固，防止大屏永久少计）。
 	var batchOldestMinute time.Time
 	commit := func() error {
@@ -1595,7 +1725,7 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 				// 仅当扫描窗口之外仍有数据时才判定为畸形区并返回错误，让 tick 走
 				// warn 暴露停摆；已解析文档先提交，偏移照常推进。
 				// 归档 pass（.1 补采 / pending 重试）的文件大小有界且不再增长，
-				// 历史修复 错误会让 pending 标记永不清除、轮转永久停摆，故改为有界
+				// 错误会让 pending 标记永不清除、轮转永久停摆，故改为有界
 				// scan-to-EOF 找下一个 "\n{"：找到则跳过畸形区（一条 error 日志）
 				// 继续摄取其后事件；找不到则记一次 error 日志并结束本 pass（该
 				// 区域不可恢复，但不再阻塞轮转）。
@@ -1654,7 +1784,7 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 				decoder = json.NewDecoder(f)
 				continue
 			}
-			// 历史问题（2026-09-18 实证）：解码失败最常见的形态不是崩溃残片，
+			// （2026-09-18 实证）：解码失败最常见的形态不是崩溃残片，
 			// 而是并发事务审计追加的「写入进行中」字节——对 2s tick 短暂可见、
 			// 随后补全（生产实测审计文件最终全部行合法，但立即跳过仍把窗口内
 			// 8 条事件永久丢弃）。原地等待：提交已解析文档、偏移停在残缺文档
@@ -1723,7 +1853,7 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 				_ = tx.Rollback()
 				return committedOffset, fmt.Errorf("security events: insert event: %w", ierr)
 			}
-			// 历史问题：INSERT OR IGNORE 对重复 transaction_id 静默跳过——必须取
+			// INSERT OR IGNORE 对重复 transaction_id 静默跳过——必须取
 			// RowsAffected 区分「实际插入」与「忽略」，否则轮转补采/offset 重放
 			// 把同一事件重复喂自动封禁计数器（阈值提前达成）。RowsAffected 失败
 			// 属于未知写入结果：回滚本批、偏移不推进，下个 tick 以同一偏移重试
@@ -1752,11 +1882,10 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 						clientIP:      rec.ClientIP,
 						action:        rec.Action,
 						ruleTriggered: rec.RuleTriggered,
-						ruleMsg:       rec.RuleMsg,
 					})
 				}
 				batchInserted++
-				// 历史问题-1：记录本批最旧插入分钟（event_time 恒 UTC 墙钟串；
+				// 记录本批最旧插入分钟（event_time 恒 UTC 墙钟串；
 				// 解析失败跳过——仅影响回退精度，不影响摄取）。
 				if et, terr := time.ParseInLocation("2006-01-02 15:04:05", rec.EventTime, time.UTC); terr == nil {
 					m := et.Truncate(time.Minute)
@@ -1808,7 +1937,7 @@ func securityEventsTransactionID(raw json.RawMessage) string {
 // 后、copytruncate 完成前 Coraza 写入的尾部事件只存在于 audit.log.1，活文件截断
 // 后 tailer 重置偏移不会再读 .1，若不补采这些事件会永久丢失。复用
 // securityEventsProcessPass 的解析与 INSERT OR IGNORE 插入，transaction_id 唯一
-// 索引保证与 tick 已摄取内容幂等。返回实际插入条数（历史问题-08：补采结果须计入
+// 索引保证与 tick 已摄取内容幂等。返回实际插入条数（补采结果须计入
 // ingestion 任务日志「摄取 N 条」，此前被丢弃）。
 func securityEventsIngestRotatedDelta(persistedOffset int64) (int, error) {
 	if db.DB == nil || db.MetricsDB == nil {
@@ -1830,8 +1959,8 @@ func securityEventsIngestRotatedDelta(persistedOffset int64) (int, error) {
 // 唯一索引保证幂等。轮转后的 .1 归档（securityEventsIngestRotatedDelta）与
 // copy 完成后 truncate 前的活文件尾部（rotateAuditLogIfNeeded）共用此路径。
 // archive=true 表示归档补采（.1 / pending 重试）：文件大小有界且不再增长，
-// 畸形区走 scan-to-EOF 恢复而非 历史修复 报错（见 securityEventsProcessPass）。
-// 返回实际插入条数（历史问题-08）。
+// 畸形区走 scan-to-EOF 恢复而非报错（见 securityEventsProcessPass）。
+// 返回实际插入条数。
 func securityEventsIngestDeltaFrom(path string, from int64, archive bool) (int, error) {
 	if db.DB == nil || db.MetricsDB == nil {
 		return 0, nil
@@ -1841,8 +1970,8 @@ func securityEventsIngestDeltaFrom(path string, from int64, archive bool) (int, 
 		return 0, fmt.Errorf("security events: open delta source: %w", err)
 	}
 	defer f.Close()
-	// 补采路径的耗时随审计行内嵌 lb_timing 字段自带（历史侧车退役，
-	// 历史问题-2 的「补采也需加载侧车」前置不再需要）。
+	// 补采路径的耗时随审计行内嵌 lb_timing 字段自带（侧车退役，
+	// 的「补采也需加载侧车」前置不再需要）。
 	rules, bindings, policyByID, err := securityEventsLoadMappings()
 	if err != nil {
 		return 0, err
@@ -1880,7 +2009,7 @@ func ensureAuditLogDir() error {
 	return os.MkdirAll(filepath.Dir(auditLogPath), 0o755)
 }
 
-// EnsureWafAuditDir 是 ensureAuditLogDir 的导出版——历史问题-1（历史）：
+// EnsureWafAuditDir 是 ensureAuditLogDir 的导出版——
 // coraza v3.7.0 NewWAF→serialWriter.Init OpenFile 不建父目录，审计日志目录缺失
 // =Provision 致命=/load 拒收。main.go 必须在首次 ApplyConfigOnStartup 前调用。
 func EnsureWafAuditDir() error {
@@ -1898,7 +2027,8 @@ var securityEventsPollState struct {
 const securityEventsIngestionFailureThreshold = 3
 
 // SecurityEventsIngestionStatus 是采集 daemon 的进程内健康快照（不改变任务
-// 调度状态）：连续非停等 tick 失败达到阈值即健康位为 false，供事件页显性提示。
+// 调度状态）：连续非停等 tick 失败达到阈值、采集任务未运行、或审计写侧累计
+// 失败达阈值时健康位为 false，供事件列表/安全总览/威胁大屏三处同源提示。
 type SecurityEventsIngestionStatus struct {
 	Observed            bool   `json:"observed"`
 	Healthy             bool   `json:"healthy"`
@@ -1906,6 +2036,16 @@ type SecurityEventsIngestionStatus struct {
 	LastError           string `json:"last_error,omitempty"`
 	LastErrorAt         string `json:"last_error_at,omitempty"`
 	LastSuccessAt       string `json:"last_success_at,omitempty"`
+	// TaskState/TaskRunning 是 taskengine 视角的采集任务实态（running/stopped/
+	// unknown）：任务停用/未运行时事件不再增长，健康位不得继续显示 healthy。
+	TaskState   string `json:"task_state"`
+	TaskRunning bool   `json:"task_running"`
+	// Writer* 是审计写侧（caddygeoip 插件）失败/丢弃计数——经插件侧车文件
+	// 跨进程读取，累计自本进程启动（插件重启的计数回落按新基线续累计）。
+	WriterDropped       uint64 `json:"writer_dropped"`
+	WriterIOErrors      uint64 `json:"writer_io_errors"`
+	WriterDegraded      bool   `json:"writer_degraded"`
+	WriterLastFailureAt string `json:"writer_last_failure_at,omitempty"`
 }
 
 var securityEventsIngestionHealth struct {
@@ -1935,19 +2075,166 @@ func securityEventsRecordPollResult(err error) {
 	status.LastErrorAt = now.Format(time.RFC3339)
 }
 
-// SecurityEventsIngestionHealthSnapshot 返回一致的健康快照（事件列表 API 消费）。
+// SecurityEventsIngestionHealthSnapshot 返回一致的健康快照（事件列表/安全
+// 总览/威胁大屏三处 API 同源消费）：tick 记账结果叠加任务实态与审计写侧计数。
 func SecurityEventsIngestionHealthSnapshot() SecurityEventsIngestionStatus {
 	securityEventsIngestionHealth.Lock()
-	defer securityEventsIngestionHealth.Unlock()
-	return securityEventsIngestionHealth.status
+	status := securityEventsIngestionHealth.status
+	securityEventsIngestionHealth.Unlock()
+	return securityEventsOverlayIngestionHealth(status)
+}
+
+// securityEventsIngestionTaskID 是采集任务在 taskengine 的注册 ID（单一源：
+// 任务注册与健康位判据共用）。
+const securityEventsIngestionTaskID = "security-events-ingestion"
+
+// securityEventsIngestionTaskState 返回采集任务实态。未装配引擎/未注册
+// （测试/嵌入形态）返回 unknown——不参与健康位降级判定。
+func securityEventsIngestionTaskState() (string, bool) {
+	te := TaskEngine()
+	if te == nil {
+		return "unknown", false
+	}
+	meta, ok := te.Lookup(securityEventsIngestionTaskID)
+	if !ok {
+		return "unknown", false
+	}
+	if meta.Running {
+		return "running", true
+	}
+	return "stopped", false
+}
+
+// 审计写侧失败可见性（插件 → 面板）契约：
+//   - caddygeoip 的审计落盘管线把累计「队列满丢弃 / 写盘错误」计数（原子）由
+//     drain goroutine 低频写入 <审计日志路径>.writer-stats.json（请求路径零参与）；
+//   - 根服务摄取 tick 每次读取该侧车文件（跨 Go module，无法共享常量——两处
+//     后缀/字段名必须同步），按增量累计成本进程启动以来的计数；
+//   - 失败窗口（securityEventsWriterFailureWindow）内累计失败达阈值即降级采集
+//     健康位（与任务停/连续失败同一位），并由 ingestion daemon 在状态变化时写
+//     一条任务日志业务行（仅状态变化，低频）。
+const (
+	securityEventsAuditWriterStatsSuffix = ".writer-stats.json"
+	securityEventsWriterFailureThreshold = 3
+	securityEventsWriterFailureWindow    = 15 * time.Minute
+)
+
+// securityEventsAuditWriterStatsPath 返回插件侧车计数文件路径（默认与审计日志
+// 同目录）。auditLogPath 是包级变量，测试可注入临时路径。
+func securityEventsAuditWriterStatsPath() string {
+	return auditLogPath + securityEventsAuditWriterStatsSuffix
+}
+
+// securityEventsWriterHealth 是侧车计数的进程内累计状态：baseline 是上一次
+// 观测到的插件计数（插件重启计数回落时按新基线处理），totals 是本进程启动
+// 以来实际观测到的失败量，window* 是「窗口内失败量」（阈值判据）。
+var securityEventsWriterHealth struct {
+	mu              sync.Mutex
+	baselineDropped uint64
+	baselineIO      uint64
+	droppedTotal    uint64
+	ioTotal         uint64
+	windowStart     time.Time
+	windowFailures  uint64
+	lastFailureAt   time.Time
+}
+
+// securityEventsObserveAuditWriterStats 读取插件侧车计数并累计增量。文件缺失
+// （插件未产生失败/未启动）与畸形内容都视为「本轮无信号」，不改变状态。
+func securityEventsObserveAuditWriterStats() {
+	data, err := os.ReadFile(securityEventsAuditWriterStatsPath())
+	if err != nil {
+		return
+	}
+	var payload struct {
+		Dropped  uint64 `json:"dropped"`
+		IOErrors uint64 `json:"io_errors"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return
+	}
+	delta := func(current uint64, baseline *uint64) uint64 {
+		if current < *baseline {
+			*baseline = 0 // 插件进程重启：计数从 0 重新累计
+		}
+		diff := current - *baseline
+		*baseline = current
+		return diff
+	}
+	now := time.Now()
+	securityEventsWriterHealth.mu.Lock()
+	defer securityEventsWriterHealth.mu.Unlock()
+	droppedDelta := delta(payload.Dropped, &securityEventsWriterHealth.baselineDropped)
+	ioDelta := delta(payload.IOErrors, &securityEventsWriterHealth.baselineIO)
+	securityEventsWriterHealth.droppedTotal += droppedDelta
+	securityEventsWriterHealth.ioTotal += ioDelta
+	newFailures := droppedDelta + ioDelta
+	if newFailures == 0 {
+		return
+	}
+	securityEventsWriterHealth.lastFailureAt = now
+	if securityEventsWriterHealth.windowStart.IsZero() || now.Sub(securityEventsWriterHealth.windowStart) >= securityEventsWriterFailureWindow {
+		securityEventsWriterHealth.windowStart = now
+		securityEventsWriterHealth.windowFailures = 0
+	}
+	securityEventsWriterHealth.windowFailures += newFailures
+}
+
+// securityEventsWriterHealthSnapshot 返回累计计数与窗口内是否降级。
+func securityEventsWriterHealthSnapshot() (dropped, ioErrors uint64, degraded bool, lastFailureAt time.Time) {
+	securityEventsWriterHealth.mu.Lock()
+	defer securityEventsWriterHealth.mu.Unlock()
+	dropped, ioErrors = securityEventsWriterHealth.droppedTotal, securityEventsWriterHealth.ioTotal
+	lastFailureAt = securityEventsWriterHealth.lastFailureAt
+	if !securityEventsWriterHealth.windowStart.IsZero() &&
+		time.Since(securityEventsWriterHealth.windowStart) < securityEventsWriterFailureWindow &&
+		securityEventsWriterHealth.windowFailures >= securityEventsWriterFailureThreshold {
+		degraded = true
+	}
+	return dropped, ioErrors, degraded, lastFailureAt
+}
+
+// securityEventsOverlayIngestionHealth 把进程级信号叠加到 tick 记账结果上：
+// ①任务已停（调度关闭/未运行）→ 未采集，非 healthy；②审计写侧窗口内失败
+// 累计达阈值 → 落盘不可靠，非 healthy。两者都只置降级，不虚构成功。
+func securityEventsOverlayIngestionHealth(status SecurityEventsIngestionStatus) SecurityEventsIngestionStatus {
+	if state, running := securityEventsIngestionTaskState(); state != "unknown" {
+		status.TaskState, status.TaskRunning = state, running
+		if state == "stopped" {
+			status.Observed = true
+			status.Healthy = false
+		}
+	}
+	dropped, ioErrors, degraded, lastFailureAt := securityEventsWriterHealthSnapshot()
+	status.WriterDropped, status.WriterIOErrors = dropped, ioErrors
+	status.WriterDegraded = degraded
+	if !lastFailureAt.IsZero() {
+		status.WriterLastFailureAt = lastFailureAt.UTC().Format(time.RFC3339)
+	}
+	if degraded {
+		status.Observed = true
+		status.Healthy = false
+	}
+	return status
 }
 
 // SecurityEventsSetIngestionHealthForTest 直设健康快照（handlers 契约测试用；
 // 生产路径只经 securityEventsRecordPollResult 更新）。
 func SecurityEventsSetIngestionHealthForTest(status SecurityEventsIngestionStatus) {
 	securityEventsIngestionHealth.Lock()
-	defer securityEventsIngestionHealth.Unlock()
 	securityEventsIngestionHealth.status = status
+	securityEventsIngestionHealth.Unlock()
+	// 写侧计数累计状态同步复位：健康位是一个整体（tick 记账 + 任务实态 +
+	// 写侧计数），测试重置健康位时必须一并清空，否则窗口内降级状态跨用例泄漏。
+	securityEventsWriterHealth.mu.Lock()
+	securityEventsWriterHealth.baselineDropped = 0
+	securityEventsWriterHealth.baselineIO = 0
+	securityEventsWriterHealth.droppedTotal = 0
+	securityEventsWriterHealth.ioTotal = 0
+	securityEventsWriterHealth.windowStart = time.Time{}
+	securityEventsWriterHealth.windowFailures = 0
+	securityEventsWriterHealth.lastFailureAt = time.Time{}
+	securityEventsWriterHealth.mu.Unlock()
 }
 
 // SecurityEventsPollOnce 单轮摄取（先采集后轮转——引擎 2s 节拍调用）。
@@ -1956,6 +2243,9 @@ func SecurityEventsSetIngestionHealthForTest(status SecurityEventsIngestionStatu
 func SecurityEventsPollOnce() (int, error) {
 	securityEventsPollState.Lock()
 	defer securityEventsPollState.Unlock()
+	// 审计写侧计数（插件侧车）每轮先观测：即使本轮无新事件，写侧失败也必须
+	// 进入健康位（降级判定与事件吞吐无关）。
+	securityEventsObserveAuditWriterStats()
 	if !securityEventsPollState.inited {
 		securityEventsPollState.tailer = securityEventsNewTailer(auditLogPath, securityEventsOffsetPath)
 		if err := ensureAuditLogDir(); err != nil {
@@ -1970,11 +2260,11 @@ func SecurityEventsPollOnce() (int, error) {
 	}
 	ingested := securityEventsPollState.tailer.lastIngested
 	securityEventsPollState.tailer.lastIngested = 0
-	// 历史问题-08：轮转/补采窗口入库的事件计入同一轮摄取数（此前只报 tailer 计数，
+	// 轮转/补采窗口入库的事件计入同一轮摄取数（此前只报 tailer 计数，
 	// 补采事件永不进任务日志）；失败不阻塞返回（轮转自身已限流告警）。
 	rotated, rotErr := rotateAuditLogIfNeeded()
 	ingested += rotated
-	// 历史问题-23（历史）：轮转失败与采集失败同口径进健康快照——一轮内
+	// 轮转失败与采集失败同口径进健康快照——一轮内
 	// 两类失败只记一次（不双计）；停等（stalled）瞬态不遮蔽轮转失败。
 	healthErr := tickErr
 	if rotErr != nil && (healthErr == nil || errors.Is(healthErr, errSecurityEventsStalled)) {
@@ -1991,6 +2281,7 @@ func runIngestionLoop(ctx context.Context) error {
 	ticker := time.NewTicker(securityEventsPollInterval)
 	defer ticker.Stop()
 	var lastRotateFailureSummaryAt time.Time
+	lastWriterDegraded := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -2000,7 +2291,18 @@ func runIngestionLoop(ctx context.Context) error {
 			if ingested > 0 {
 				TaskLogf("security-events-ingestion", "ingest", "摄取 %d 条安全事件", ingested)
 			}
-			// 历史问题-23（历史）：轮转失败写任务摘要——此前任务日志仅在
+			// 审计写侧失败状态变化才留痕（避免每 2s 重复写同一结论）：达阈值
+			// 降级与恢复各一行，随任务日志导出排障上下文。
+			status := SecurityEventsIngestionHealthSnapshot()
+			if status.WriterDegraded != lastWriterDegraded {
+				if status.WriterDegraded {
+					TaskLogfWarn("security-events-ingestion", "audit-writer", "审计日志写侧失败：窗口内累计丢弃 %d 条、写盘错误 %d 次（累计值），安全事件可能缺失", status.WriterDropped, status.WriterIOErrors)
+				} else {
+					TaskLogf("security-events-ingestion", "audit-writer", "审计日志写侧失败已回落至阈值以下（累计丢弃 %d 条、写盘错误 %d 次）", status.WriterDropped, status.WriterIOErrors)
+				}
+				lastWriterDegraded = status.WriterDegraded
+			}
+			// 轮转失败写任务摘要——此前任务日志仅在
 			// ingested>0 时留痕，轮转持续失败零可见性。2s 节拍下持续失败每
 			// 分钟至多一行（与应用日志 60s 限流同窗口）。
 			if rotErr != nil && time.Since(lastRotateFailureSummaryAt) >= time.Minute {
@@ -2067,17 +2369,18 @@ func timingUsOrNil(v *int64) (int64, bool) {
 
 // securityEventsIsPrecheckRule 判定规则 ID 是否预检段——IP ACL(2/4/5/7)、
 // 信任(3/12)、GeoIP(8)、威胁情报(14)与阶段 1 预检 8xxxxx 段（普通 GeoIP /
-// 爬虫豁免 / 爬虫伪装三族，6 位 8 开头）。与 stageCategorizeAttack 的预检
-// 分支同口径。
+// 爬虫豁免 / 爬虫伪装三族）。与 stageCategorizeAttack 的预检分支同口径；
+// 集合单一事实源=IsStage1PrecheckEventID（与 Stage1PrecheckIDSQLList 同源，
+// 三集合对账由 security_stage1_segment_test.go 钉死）。
 func securityEventsIsPrecheckRule(ruleID string) bool {
-	switch ruleID {
-	case "2", "3", "4", "5", "7", "8", "12", "14":
-		return true
+	n, err := strconv.Atoi(ruleID)
+	if err != nil {
+		return false
 	}
-	return len(ruleID) == 6 && strings.HasPrefix(ruleID, "8")
+	return IsStage1PrecheckEventID(n)
 }
 
-// securityEventsIsGeoIPScoringRule 普通 GeoIP 固定分谓词（历史）：
+// securityEventsIsGeoIPScoringRule 普通 GeoIP 固定分谓词：
 // id 8 或 8xxxxx 段中「能唯一解码且不属爬虫两族」的 id。p=0 边界值（810000/
 // 850000）不属任何合法爬虫族，按普通 GeoIP 计——不得被当爬虫豁免得 0 分。
 func securityEventsIsGeoIPScoringRule(ruleID string) bool {
@@ -2093,7 +2396,7 @@ func securityEventsIsGeoIPScoringRule(ruleID string) bool {
 }
 
 // securityEventsIsCrawlerExemptRule 豁免放行规则 id（810000+policyID*16+引擎序号）。
-// 历史问题：与生成公式同源——decode + 编码回环校验，越界 id（如
+// 与生成公式同源——decode + 编码回环校验，越界 id（如
 // policyID≥2500 溢入伪装段的形态）不得误判为豁免。
 func securityEventsIsCrawlerExemptRule(id string) bool {
 	n, err := strconv.Atoi(id)

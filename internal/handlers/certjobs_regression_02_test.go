@@ -17,7 +17,7 @@ import (
 
 // certJobRereadFailingConnector 返回一个按语句路由的假 db.DB：任务行 SELECT 正常
 // 返回在途态行，CAS UPDATE 命中 0 行（模拟 worker 并发推进状态），重读 SELECT
-// 注入瞬时 DB 故障（同 历史修复 的假连接器模式）。
+// 注入瞬时 DB 故障（同 假连接器模式）。
 type certJobRereadFailingConnector struct{}
 
 func (certJobRereadFailingConnector) Connect(context.Context) (driver.Conn, error) {
@@ -45,7 +45,7 @@ func (certJobRereadFailingConn) Begin() (driver.Tx, error) { return nil, errors.
 func (certJobRereadFailingConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
 	switch {
 	case strings.Contains(query, "rule_id, domain, status"):
-		// 历史修复 起 DeleteCertJob 的首个 SELECT 同时扫 cert_pem/key_pem（6 列）。
+		// 自此 DeleteCertJob 的首个 SELECT 同时扫 cert_pem/key_pem（6 列）。
 		return &fakeQueryRows{values: [][]driver.Value{{"lb_reread_500", "reread.example.test", "validating", int64(1), "", ""}}}, nil
 	case strings.Contains(query, "SELECT status FROM cert_jobs"):
 		return nil, errors.New("注入的重读故障")
@@ -70,7 +70,7 @@ func (certJobZeroRowsResult) LastInsertId() (int64, error) { return 0, nil }
 func (certJobZeroRowsResult) RowsAffected() (int64, error) { return 0, nil }
 
 func TestDeleteCertJob_reread_failure_returns_500(t *testing.T) {
-	// 历史修复：CAS 命中 0 行后的归因重读本身失败（瞬时 DB 故障）是 历史修复
+	// CAS 命中 0 行后的归因重读本身失败（瞬时 DB 故障）是
 	// 新增的第三分支——必须显式 500（读取任务状态失败），不得误报 409/404。
 	// Given
 	h := newBackupTestHandlers(t)
@@ -96,7 +96,7 @@ func TestDeleteCertJob_reread_failure_returns_500(t *testing.T) {
 }
 
 func TestDeleteCertJob_concurrent_status_change_returns_409(t *testing.T) {
-	// 历史修复：在途态任务（历史修复 放行的 escape-hatch 对象）删除时，worker 在
+	// 在途态任务（放行的 escape-hatch 对象）删除时，worker 在
 	// SELECT 与 disabled 翻转之间推进状态（如 validating→validated），CAS
 	// 命中 0 行属并发竞争而非服务器故障——必须重读区分归因并返回 409
 	// 刷新重试文案（对齐 RetryCertJob 模式），不得返回误导性 500。
@@ -136,7 +136,7 @@ func TestDeleteCertJob_concurrent_status_change_returns_409(t *testing.T) {
 }
 
 func TestDeleteCertJob_row_disappearing_before_disable_returns_404(t *testing.T) {
-	// 历史修复：CAS 命中 0 行且重读发现行已不存在（并发删除），按 handler 对
+	// CAS 命中 0 行且重读发现行已不存在（并发删除），按 handler 对
 	// 缺失任务的既有语义返回 404，而非 500「Failed to verify disabled job」。
 	// Given
 	h := newBackupTestHandlers(t)
@@ -206,7 +206,78 @@ func TestDeleteCertJob_restore_skips_when_row_left_disabled(t *testing.T) {
 	}
 }
 
-// 函数 rows.Err() 500 口径及 历史修复「warn 留痕+continue」口径不对称。
+func TestDeleteCertJob_restore_failedFallbackKeepsRowLeftDisabled(t *testing.T) {
+	// 恢复 else 分支（排队/等待态）的 failed 回退必须与另三分支同构带
+	// status='disabled' 守卫：行在删除窗口内被并发移离 disabled（worker 接管）
+	// 时不得覆写其新状态，RowsAffected=0 并入 deleteErr 上抛 500。
+	// Given：queued 任务（无规则，删除放行）+ DELETE 恒失败
+	h := newBackupTestHandlers(t)
+	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id,domain,status) VALUES ('lb_fallback','fallback.example.test','queued')`); err != nil {
+		t.Fatalf("seed job: %v", err)
+	}
+	if _, err := db.DB.Exec(`CREATE TRIGGER certjob_delete_abort_fallback BEFORE DELETE ON cert_jobs BEGIN SELECT RAISE(ABORT, 'injected delete failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = db.DB.Exec("DROP TRIGGER IF EXISTS certjob_delete_abort_fallback") })
+	oldHook := deleteCertJobPreRestoreHook
+	deleteCertJobPreRestoreHook = func(jobID int) {
+		if _, err := db.DB.Exec("UPDATE cert_jobs SET status='issued', updated_at=datetime('now') WHERE id=?", jobID); err != nil {
+			t.Errorf("simulate concurrent worker takeover: %v", err)
+		}
+	}
+	t.Cleanup(func() { deleteCertJobPreRestoreHook = oldHook })
+	router := gin.New()
+	router.DELETE("/jobs/:id", h.DeleteCertJob)
+	response := httptest.NewRecorder()
+
+	// When
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/jobs/1", nil))
+
+	// Then
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s, want 500", response.Code, response.Body.String())
+	}
+	var status string
+	if err := db.DB.QueryRow("SELECT status FROM cert_jobs WHERE id=1").Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "issued" {
+		t.Fatalf("status=%q, want issued（failed 回退不得覆写已移离 disabled 的并发状态）", status)
+	}
+}
+
+func TestDeleteCertJob_restore_failedFallbackMarksFailedWhenStillDisabled(t *testing.T) {
+	// 守卫的正向契约：行仍处 disabled（无并发接管）时，恢复失败回退照常落
+	// failed + 删除仍 500。
+	h := newBackupTestHandlers(t)
+	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id,domain,status) VALUES ('lb_fallback_ok','fallbackok.example.test','waiting_ca')`); err != nil {
+		t.Fatalf("seed job: %v", err)
+	}
+	if _, err := db.DB.Exec(`CREATE TRIGGER certjob_delete_abort_fallback_ok BEFORE DELETE ON cert_jobs BEGIN SELECT RAISE(ABORT, 'injected delete failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = db.DB.Exec("DROP TRIGGER IF EXISTS certjob_delete_abort_fallback_ok") })
+	router := gin.New()
+	router.DELETE("/jobs/:id", h.DeleteCertJob)
+	response := httptest.NewRecorder()
+
+	// When
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/jobs/1", nil))
+
+	// Then
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s, want 500", response.Code, response.Body.String())
+	}
+	var status string
+	if err := db.DB.QueryRow("SELECT status FROM cert_jobs WHERE id=1").Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "failed" {
+		t.Fatalf("status=%q, want failed（恢复失败回退在行仍 disabled 时必须落 failed）", status)
+	}
+}
+
+// 函数 rows.Err() 500 口径及 「warn 留痕+continue」口径不对称。
 // 修复：warn+continue。钉：单行 scan 失败 → warn 留痕 + 不 500 + 其余行照常返回。
 func TestListCertificates_scanFailureWarnsAndKeepsRemainingRows(t *testing.T) {
 	// Given：假驱动首行 id 列类型错误（Scan 必然失败），次行正常

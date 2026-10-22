@@ -9,7 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// 历史问题（bind-error 约定）：MFASetup 重新绑定确认段与 MFAResetByAdmin 的请求体
+// （bind-error 约定）：MFASetup 重新绑定确认段与 MFAResetByAdmin 的请求体
 // `_ = c.ShouldBindJSON(...)` 吞错——畸形 JSON 落入零值字段，报出误导性的
 // 「验证码错误」401 而非 400「请求格式错误」。对齐 Login（auth.go:51-55）约定：
 // 绑定失败即 400。登录后端点无密码确认段（2026-09 用户裁定）。

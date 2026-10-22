@@ -102,7 +102,7 @@ func TestIssuer_Issue_cleans_presented_records_when_later_present_fails(t *testi
 			firstRecordCleanups++
 		}
 	}
-	// 历史问题（历史）：挑战在 Present 前登记——第二个域名的 Present 失败也
+	// 挑战在 Present 前登记——第二个域名的 Present 失败也
 	// 会进 deferred 清理集合（按 value 幂等；provider 不实现 CleanUpValue 时按名
 	// 兜底）。计数=2 次 stale 预清理 + 2 次 deferred 清理。
 	if len(provider.cleaned) != 4 || firstRecordCleanups != 2 {
@@ -157,7 +157,7 @@ func (p *valueAwareProvider) CleanUpValue(_ context.Context, _, _, value string)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	// 按 value 幂等：仅在确有该值记录时记一次删除。挑战会在 Present 前登记进
-	// deferred 清理（历史问题），已由 stale 预清理删掉的值不得重复计数。
+	// deferred 清理，已由 stale 预清理删掉的值不得重复计数。
 	if _, ok := p.records[value]; ok {
 		p.cleanedValues = append(p.cleanedValues, value)
 	}
@@ -238,11 +238,11 @@ func TestIssuer_preCleanup_spares_concurrent_challenge_values(t *testing.T) {
 	}
 }
 
-// probeAuthServers 是单发形态的测试夹具（历史问题：原生产 helper 零调用，已
+// probeAuthServers 是单发形态的测试夹具（原生产 helper 零调用，已
 // 移入测试文件）。probes every authoritative name server once; a miss keeps the
 // server alive for the next round. ready reports whether every server already
 // holds the expected record. 多轮轮询走 probeAuthServersLogged 共享状态表，
-// 仅状态变化时打印（历史问题）。
+// 仅状态变化时打印。
 func (i *Issuer) probeAuthServers(ctx context.Context, servers []string, fqdn, expected string) (alive []string, ready bool, lastFound []string, lastResolver string) {
 	return i.probeAuthServersLogged(ctx, servers, fqdn, expected, &dnsLogState{})
 }
@@ -256,7 +256,7 @@ func startFakeDNSServer(t *testing.T, respond func(query *dns.Msg) *dns.Msg) str
 }
 
 // startFakeDNSServerW 同 startFakeDNSServer，但回调可见 dns.ResponseWriter
-// （按传输层 udp/tcp 区分应答形态时使用，如 历史修复 的 TC 截断应答）。
+// （按传输层 udp/tcp 区分应答形态时使用，如 TC 截断应答）。
 func startFakeDNSServerW(t *testing.T, respond func(w dns.ResponseWriter, query *dns.Msg) *dns.Msg) string {
 	t.Helper()
 	handler := dns.HandlerFunc(func(w dns.ResponseWriter, query *dns.Msg) {
@@ -298,7 +298,7 @@ func startFakeDNSServerW(t *testing.T, respond func(w dns.ResponseWriter, query 
 	return addr
 }
 
-// 历史修复：SERVFAIL/REFUSED 等 DNS 错误应答不是「无记录」——必须作为错误上报，
+// SERVFAIL/REFUSED 等 DNS 错误应答不是「无记录」——必须作为错误上报，
 // 否则权威服务器循环中该服务器永远留在存活列表，authReady 无法为真，
 // 快速路径卡死直至递归回退超时，造成假阴性杀签发。
 func TestProbeTXT_returns_error_on_dns_error_rcode(t *testing.T) {
@@ -338,7 +338,7 @@ func TestProbeTXT_returns_error_on_dns_error_rcode(t *testing.T) {
 	}
 }
 
-// 历史修复 伴随契约：NOERROR 无应答（NODATA）仍是「未命中」而非错误，权威服务器
+// 伴随契约：NOERROR 无应答（NODATA）仍是「未命中」而非错误，权威服务器
 // 保留在存活列表等待下一轮轮询。
 func TestProbeTXT_nodata_is_miss_not_error(t *testing.T) {
 	// Given
@@ -360,7 +360,7 @@ func TestProbeTXT_nodata_is_miss_not_error(t *testing.T) {
 	}
 }
 
-// 历史修复：NXDOMAIN（Rcode 3）是权威否定应答——「名称不存在」是首发/彻底清理后
+// NXDOMAIN（Rcode 3）是权威否定应答——「名称不存在」是首发/彻底清理后
 // _acme-challenge.<domain> 写入前的正常传播状态，必须与 NODATA 同为「未命中」
 // 而非错误；否则传播窗口内健康权威服务器被移出存活列表，叠加递归负缓存
 // （SOA TTL 300~600s）可致假阴性杀签发。
@@ -384,7 +384,7 @@ func TestProbeTXT_nxdomain_is_miss_not_error(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：UDP 应答 TC=1（截断）时 Answer 段不可信（UDP
+// UDP 应答 TC=1（截断）时 Answer 段不可信（UDP
 // 512B 载荷上限内常被截空）——同域并存 TXT 较多（并发签发+残留）时权威
 // UDP 应答恒截断，若按 miss 处理则 authReady 永假 → 假阴性烧一次签发
 // （LE 5 次/时配额）。必须 continue 承接到 TCP 重查。
@@ -421,7 +421,7 @@ func TestProbeTXT_truncated_udp_falls_back_to_tcp(t *testing.T) {
 	}
 }
 
-// 历史修复：waitForDNS 权威循环必须把返回错误 RCODE 的服务器从存活列表移除
+// waitForDNS 权威循环必须把返回错误 RCODE 的服务器从存活列表移除
 // （与传输失败同口径），仅命中的服务器留在列表；任一服务器失败/未命中则
 // authReady 为假。
 func TestIssuer_probeAuthServers_drops_dns_error_rcode_servers(t *testing.T) {
@@ -473,7 +473,7 @@ func TestIssuer_probeAuthServers_drops_dns_error_rcode_servers(t *testing.T) {
 	}
 }
 
-// 历史修复 伴随契约：返回 NXDOMAIN 的权威服务器是健康的（权威否定应答=记录
+// 伴随契约：返回 NXDOMAIN 的权威服务器是健康的（权威否定应答=记录
 // 尚未写入的正常传播状态），必须保留在存活列表等待下一轮轮询；仅
 // SERVFAIL/REFUSED 等真服务器故障才移除（见上）。
 func TestIssuer_probeAuthServers_keeps_nxdomain_servers_alive(t *testing.T) {
@@ -509,7 +509,7 @@ func TestIssuer_probeAuthServers_keeps_nxdomain_servers_alive(t *testing.T) {
 	}
 }
 
-// 历史修复：RequireRecursiveDNS 的递归确认预算必须覆盖公共递归负缓存
+// RequireRecursiveDNS 的递归确认预算必须覆盖公共递归负缓存
 // （SOA negative TTL 通常 300~600s）的刷新抖动——权威快速路径收敛后记录
 // 已在权威侧生效，但曾在写入前查询过的递归解析器会持续返回否定应答直到
 // 各自缓存过期；预算若只给 30s，首轮会系统性失败烧掉一次尝试。解析器错峰
@@ -581,7 +581,7 @@ func TestIssuer_checkRecursiveDNS_outlasts_negative_cache_churn(t *testing.T) {
 	})
 }
 
-// 历史修复：finalize 提交必须有独立于任务总预算的超时——卡死的 CA 应以
+// finalize 提交必须有独立于任务总预算的超时——卡死的 CA 应以
 // finalize 阶段错误呈现，而不是吃光整个任务预算后报泛化超时。
 func TestIssuer_finalizeOrder_enforces_independent_deadline(t *testing.T) {
 	// Given
@@ -651,7 +651,7 @@ func TestIssuer_finalizeOrder_enforces_independent_deadline(t *testing.T) {
 	}
 }
 
-// presentThenFailProvider 模拟 provider 的「双失败」形态（历史修复）：记录
+// presentThenFailProvider 模拟 provider 的「双失败」形态：记录
 // 已写入 DNS，但 Present 仍返回错误（ownership.Add 失败且回滚删除亦失败）。此时
 // 签发侧若只在 Present 成功后登记 deferred 清理，临时 TXT 会永久残留。
 type presentThenFailProvider struct {
@@ -690,7 +690,7 @@ func (p *presentThenFailProvider) CleanUpValue(_ context.Context, _, _, value st
 	return nil
 }
 
-// 历史问题（历史）：challenge 必须在 Present 调用前登记进 deferred 清理集合。
+// challenge 必须在 Present 调用前登记进 deferred 清理集合。
 // Present 自身失败（且内部回滚删除亦失败）时记录已落 DNS——登记顺序修复前
 // deferred Cleanup 看不到该挑战，临时 TXT 无任何删除尝试。
 func TestIssuer_Issue_cleans_challenge_when_present_itself_fails(t *testing.T) {
@@ -762,8 +762,8 @@ func TestIssuer_Issue_cleans_challenge_when_present_itself_fails(t *testing.T) {
 	}
 }
 
-// 历史（历史修复 域）：ACME 授权/订单状态机、终态授权错误链、
-// 清理预算与验证轮询限流透传的桩与钉测（历史修复）。
+// ACME 授权/订单状态机、终态授权错误链、
+// 清理预算与验证轮询限流透传的桩与钉测。
 
 // stubACME 是可配置的 ACME 端点桩：newOrder / order 轮询 / 授权 / 挑战 /
 // finalize / 证书下载全部走同一 server。finalize 之后订单轮询自动转 valid
@@ -929,7 +929,7 @@ func newIssuerForStub(t *testing.T, stub *stubACME, provider *countingProvider) 
 	return &Issuer{Client: newValidationTestClient(t, stub.server, nil), Provider: provider}
 }
 
-// 历史修复 valid 形状：CA 复用同账号同标识的已 valid 授权（RFC 8555 §7.4.1，
+// valid 形状：CA 复用同账号同标识的已 valid 授权（RFC 8555 §7.4.1，
 // LE reuseValidAuthz 长期开启）时必须跳过 TXT 写入与挑战提交——原实现无条件
 // Present + Accept，会把复用窗口内的重复签发打成持续失败。
 func TestIssuer_Issue_skipsChallengeForReusedValidAuthorization(t *testing.T) {
@@ -957,7 +957,7 @@ func TestIssuer_Issue_skipsChallengeForReusedValidAuthorization(t *testing.T) {
 	}
 }
 
-// 历史修复 invalid 形状：终态授权必须立即 fail-loud（原实现仍 Present + 等满
+// invalid 形状：终态授权必须立即 fail-loud（原实现仍 Present + 等满
 // 5 分钟传播再 Accept，把终态拖成超时/400）。
 func TestIssuer_Issue_failsFastOnTerminalAuthorization(t *testing.T) {
 	for _, status := range []string{"invalid", "deactivated", "expired", "revoked"} {
@@ -990,7 +990,7 @@ func TestIssuer_Issue_failsFastOnTerminalAuthorization(t *testing.T) {
 	}
 }
 
-// 历史修复 ready 形状：订单创建即 ready（授权已全部 valid）时必须零 TXT 写入
+// ready 形状：订单创建即 ready（授权已全部 valid）时必须零 TXT 写入
 // 直达 finalize——回归保护，防止状态分流把 ready 误当 pending。
 func TestIssuer_Issue_completesFromReadyOrder(t *testing.T) {
 	stub := &stubACME{orderOnCreate: "ready", orderOnPoll: "ready", authStatus: "valid"}
@@ -1015,7 +1015,7 @@ func TestIssuer_Issue_completesFromReadyOrder(t *testing.T) {
 	}
 }
 
-// 历史修复 订单 valid 形状：新建订单直接返回 valid 说明该订单的证书绑定的是
+// 订单 valid 形状：新建订单直接返回 valid 说明该订单的证书绑定的是
 // 上一轮 CSR 私钥，本次无法复用——必须显式失败，而不是把 CA 的 finalize 拒绝
 // 磨成泛化错误。
 func TestIssuer_Issue_rejectsAlreadyValidOrder(t *testing.T) {
@@ -1033,7 +1033,7 @@ func TestIssuer_Issue_rejectsAlreadyValidOrder(t *testing.T) {
 	}
 }
 
-// 历史修复：终态授权错误必须用 %w 保留错误链——detectRateLimit 依赖
+// 终态授权错误必须用 %w 保留错误链——detectRateLimit 依赖
 // errors.As(*acme.Error) 把 429 记入 waiting_ca。
 func TestTerminalAuthorizationError_preservesUnderlyingChain(t *testing.T) {
 	rateLimit := &acme.Error{StatusCode: http.StatusTooManyRequests, Detail: "too many certificates"}
@@ -1050,7 +1050,7 @@ func TestTerminalAuthorizationError_preservesUnderlyingChain(t *testing.T) {
 	}
 }
 
-// 历史修复 生产路径：invalid 分支的 WaitAuthorization 轮询 429 必须透传结构
+// 生产路径：invalid 分支的 WaitAuthorization 轮询 429 必须透传结构
 // 化错误（原实现只保留 *AuthorizationError，429 被丢弃 → 普通失败退避）。
 func TestIssuer_waitForValidation_propagatesRateLimitFromInvalidAuthorization(t *testing.T) {
 	var mu sync.Mutex
@@ -1099,7 +1099,7 @@ func TestIssuer_waitForValidation_propagatesRateLimitFromInvalidAuthorization(t 
 	}
 }
 
-// 历史修复：deferred 清理预算必须随挑战数缩放——单条删除链最坏 90s，固定
+// deferred 清理预算必须随挑战数缩放——单条删除链最坏 90s，固定
 // 2min 会让第二个 TXT 的清理被 ctx 取消。判定用 provider 观察到的 ctx 截止时间。
 func TestIssuer_cleanupBudget_scalesWithChallengeCount(t *testing.T) {
 	// 单元口径：预算公式

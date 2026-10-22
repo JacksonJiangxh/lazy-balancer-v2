@@ -1,4 +1,4 @@
-// 操作日志筛选参数单源（历史修复）：从 AuditLog.vue 抽出的纯函数，便于 node
+// 操作日志筛选参数单源：从 AuditLog.vue 抽出的纯函数，便于 node
 // 行为测试（原实现内联在 SFC，只能源码钉空转）。
 //
 // 契约（与 internal/handlers/auditlog.go buildAuditLogFilters 对齐）：

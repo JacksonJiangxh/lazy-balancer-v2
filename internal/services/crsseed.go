@@ -45,7 +45,7 @@ func seedCRSRulesFrom(liveDir, snapshotDir, distDir string) {
 // 持 wafFileMu，和运行期 CRS 树交换保持同一代际边界。
 func seedCRSRulesFromInLock(liveDir, snapshotDir, distDir string) {
 	rulesPath := filepath.Join(liveDir, "rules")
-	// 历史问题：rules 完整时不得直接 return——setup/stock/overrides 可能单独缺失
+	// rules 完整时不得直接 return——setup/stock/overrides 可能单独缺失
 	// （挂载卷只读残影/部分删除），旧实现让这些文件永久缺失而渲染侧 Include
 	// 恒失败。规则树完整则跳过树复制，但仍补种缺失的辅助文件（存在不覆盖）。
 	rulesIntact := false
@@ -53,7 +53,7 @@ func seedCRSRulesFromInLock(liveDir, snapshotDir, distDir string) {
 		if crsRulesTreeIntact(rulesPath) {
 			rulesIntact = true
 		} else {
-			// 历史问题：崩溃窗口（moveTree copyDir 回退直写 live 中途崩溃）留下的
+			// 崩溃窗口（moveTree copyDir 回退直写 live 中途崩溃）留下的
 			// 部分残树——目录存在但探针缺失，按缺失处理：清除后重新播种。ReconcileCRSState
 			// 只按版本标记对账，发现不了这种退化。
 			Logf("info", "crs seed: live rules tree %s is incomplete (missing %s), reseeding", rulesPath, crsRulesProbeFile)
@@ -63,7 +63,7 @@ func seedCRSRulesFromInLock(liveDir, snapshotDir, distDir string) {
 			}
 		}
 	}
-	// waf/custom 已移除（历史修复 裁定）：自定义规则存 DB、内联发射为 coraza
+	// waf/custom 已移除：自定义规则存 DB、内联发射为 coraza
 	// 指令，无任何文件消费方，不再重建该死目录。
 	// 审计日志已迁入 /app/logs/waf-audit(2026-09-14 用户裁定:日志统一 /app/logs);
 	// 旧 /app/waf/audit 仍重建(挂载隐藏骨架+历史文件留存量兼容,回滚安全)。
@@ -81,7 +81,7 @@ func seedCRSRulesFromInLock(liveDir, snapshotDir, distDir string) {
 	snapshotDegenerate := false
 	snapshotRules := filepath.Join(snapshotDir, "rules")
 	if _, err := os.Stat(snapshotRules); err != nil {
-		// 历史问题 新-4：VERSION 标记尚在而 rules 树缺失（persistCRSSnapshotFrom 的
+		// 新-4：VERSION 标记尚在而 rules 树缺失（persistCRSSnapshotFrom 的
 		// RemoveAll 之后崩溃残留）同属退化快照——置退化标记走 heal 重建，不留
 		// 永不自愈的 VERSION-only 残骸。
 		if snapshotVersion != "" {
@@ -90,7 +90,7 @@ func seedCRSRulesFromInLock(liveDir, snapshotDir, distDir string) {
 		}
 		snapshotVersion = "" // a snapshot without a rules tree is unusable
 	} else if !crsRulesTreeIntact(snapshotRules) {
-		// 历史问题：persistCRSSnapshotFrom 崩溃窗口（RemoveAll 中途，VERSION 尚存 +
+		// persistCRSSnapshotFrom 崩溃窗口（RemoveAll 中途，VERSION 尚存 +
 		// rules 部分残留）留下的退化快照不能作种——播成退化 live 后下次启动探针
 		// 再清再播同源，跨重启循环。回退 dist，快照留现场供诊断。
 		Logf("info", "crs seed: snapshot rules tree %s is incomplete (missing %s), falling back to dist", snapshotRules, crsRulesProbeFile)
@@ -118,7 +118,7 @@ func seedCRSRulesFromInLock(liveDir, snapshotDir, distDir string) {
 		}
 	}
 	for _, aux := range []string{"crs-setup.stock.conf", "zz-user-overrides.conf"} {
-		// 历史问题：存在即不覆盖（用户自定义 overrides/基线不得被播种回写）。
+		// 存在即不覆盖（用户自定义 overrides/基线不得被播种回写）。
 		if _, err := os.Stat(filepath.Join(liveDir, aux)); err == nil {
 			continue
 		}
@@ -133,8 +133,8 @@ func seedCRSRulesFromInLock(liveDir, snapshotDir, distDir string) {
 		writeCRSVersionMarker(liveDir, srcVersion)
 		Logf("info", "crs seed: seeded %s from %s", liveDir, src)
 	}
-	// 历史问题 发现2：退化快照回退播种成功后，用新播种的 live 树重建快照，让快照
-	// 自愈而不是永远停留在退化状态直到下次成功更新。历史问题：live 本就完整时
+	// 发现2：退化快照回退播种成功后，用新播种的 live 树重建快照，让快照
+	// 自愈而不是永远停留在退化状态直到下次成功更新。live 本就完整时
 	// 版本取 live 自身标记，不得用 dist 版本给用户更新树错标。
 	if snapshotDegenerate {
 		healVersion := srcVersion
@@ -150,7 +150,7 @@ func seedCRSRulesFromInLock(liveDir, snapshotDir, distDir string) {
 	}
 }
 
-// healDegenerateCRSSnapshotInLock 用健康 live 树重建退化快照（历史问题 发现2）。live 树
+// healDegenerateCRSSnapshotInLock 用健康 live 树重建退化快照。live 树
 // 自身也不健康（如 dist 源退化）或版本不可知时保留留现场语义，不做回写。
 func healDegenerateCRSSnapshotInLock(liveDir, snapshotDir, version string) {
 	if version == "" || !crsRulesTreeIntact(filepath.Join(liveDir, "rules")) {
@@ -259,10 +259,10 @@ func planCRSReconcile(liveV, snapV, dbV, bundledV string, snapshotRulesExist, pr
 
 // restoreCRSFromSnapshot copies the persisted snapshot tree back over the
 // live dir (rules + setup + user override files) and refreshes the marker.
-// 历史问题：装入前先对快照执行与 seed/备份恢复同一棵探针门——退化快照（部分
+// 装入前先对快照执行与 seed/备份恢复同一棵探针门——退化快照（部分
 // rules + 完整 VERSION）拒绝恢复，调用方记录错误并保留 live 现场。
 func restoreCRSFromSnapshot(liveDir, snapshotDir, version string) error {
-	// 历史问题（历史）：本函数已不再是「仅启动」路径（runConfigLoad 闭包可经
+	// 本函数已不再是「仅启动」路径（runConfigLoad 闭包可经
 	// startup:config-load 的 manual/caddy-restart 触发运行期执行）——树交换
 	// 必须与导出/导入文件相位互斥。
 	wafFileMu.Lock()
@@ -295,7 +295,7 @@ func restoreCRSFromSnapshotInLock(liveDir, snapshotDir, version string) error {
 // version row. a slave's CRS files and version row are both
 // governed by cluster sync, local reconciliation would fight it.
 //
-// 历史问题（历史）：原注释「仅在启动时调用」的前提已失效——runConfigLoad
+// 原注释「仅在启动时调用」的前提已失效——runConfigLoad
 // （cmd/server/main.go）同时经 SetConfigLoadRerun 暴露给 startup:config-load
 // 的 manual/caddy-restart 触发。因此任何真正改变磁盘规则文件的成功路径
 // （restore/correct）都必须显式 BumpClusterVersion，否则从节点在下一次无关
@@ -328,14 +328,14 @@ func reconcileCRSStateFromInLock(liveDir, snapshotDir, dbV string) {
 		if crsRulesTreeIntact(snapshotRules) {
 			snapshotRulesExist = true
 		} else {
-			// 历史问题：退化快照不作权威源——probe 不匹配分支会拿快照覆盖 live，
+			// 退化快照不作权威源——probe 不匹配分支会拿快照覆盖 live，
 			// 退化快照会把 live 换成弱化树。按无快照处理并记录，快照留现场。
 			Logf("info", "crs reconcile: snapshot rules tree %s is incomplete (missing %s), not treating it as authoritative", snapshotRules, crsRulesProbeFile)
 			snapV = ""
 			snapshotDegenerate = true
 		}
 	} else {
-		// 历史问题 新-4：VERSION 标记尚在而 rules 树缺失同属退化快照，live 健康时
+		// 新-4：VERSION 标记尚在而 rules 树缺失同属退化快照，live 健康时
 		// 走 heal 重建（与 seed 侧同一判定口径）。
 		if snapV != "" {
 			Logf("info", "crs reconcile: snapshot %s carries a version marker but no rules tree, treating as degenerate", snapshotDir)
@@ -344,7 +344,7 @@ func reconcileCRSStateFromInLock(liveDir, snapshotDir, dbV string) {
 		snapV = ""
 	}
 	liveV := readCRSVersionMarker(liveDir)
-	// 历史问题 发现2：live 树完好且版本标记可确定时，用 live 树重建退化快照——
+	// 发现2：live 树完好且版本标记可确定时，用 live 树重建退化快照——
 	// 用户更新版本在容器重建前即被保留，不必等下次成功更新才自愈。
 	if snapshotDegenerate {
 		healDegenerateCRSSnapshotInLock(liveDir, snapshotDir, liveV)
@@ -362,7 +362,7 @@ func reconcileCRSStateFromInLock(liveDir, snapshotDir, dbV string) {
 			Logf("error", "crs reconcile: 从快照恢复 CRS %s 失败: %v", plan.markerVersion, err)
 			return
 		}
-		// 历史问题：文件态变更不写 security_crs_version 行——必须显式 bump，否则
+		// 文件态变更不写 security_crs_version 行——必须显式 bump，否则
 		// 从节点与按需 bundle 引用在下次无关版本变更前仍指旧规则。
 		if err := BumpClusterVersion(context.Background(), db.DB); err != nil {
 			Logf("error", "crs reconcile: 恢复后递增集群版本失败: %v", err)
@@ -383,7 +383,7 @@ func reconcileCRSStateFromInLock(liveDir, snapshotDir, dbV string) {
 			Logf("error", "crs reconcile: 校正版本记录后递增集群版本失败: %v", err)
 		}
 		Logf("info", "crs reconcile: 版本记录已校正为磁盘实际版本 %s（原记录 %s）", plan.dbVersion, dbV)
-		// 历史问题 发现2：原记录对应的更新成果随规则树丢失被静默废弃，必须留审计痕迹。
+		// 发现2：原记录对应的更新成果随规则树丢失被静默废弃，必须留审计痕迹。
 		RecordAuditLog("system", "恢复", "CRS规则库", FormatAuditDetail(fmt.Sprintf("磁盘规则树与版本记录不一致，版本记录已从 %s 校正为磁盘实际版本 %s（原记录对应的更新成果已废弃）", dbV, plan.dbVersion), AuditResultPart("success")), "")
 	}
 }

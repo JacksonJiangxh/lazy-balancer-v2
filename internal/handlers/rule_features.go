@@ -96,7 +96,7 @@ func createRuleFeatures(req models.CreateRuleRequest) ruleFeatureInput {
 func updateRuleFeatures(req models.UpdateRuleRequest, existing models.LbRule) ruleFeatureInput {
 	enabledUpstreams := 0
 	var enabledHosts []string
-	// 历史修复（历史）：调用契约——唯一调用点 UpdateRule 在调用前已把
+	// 调用契约——唯一调用点 UpdateRule 在调用前已把
 	// req.Upstreams 合并为非 nil（nil=保留存量，赋值为 oldUpstreams），此处
 	// 不再有 existing.Upstreams 回退（LbRule.Upstreams 本就不随 scanLbRules
 	// 填充，回退拿到的恒为空集，属误导性死分支）。
@@ -107,7 +107,7 @@ func updateRuleFeatures(req models.UpdateRuleRequest, existing models.LbRule) ru
 			enabledHosts = append(enabledHosts, u.Host)
 		}
 	}
-	// 历史修复: 对非指针字段（handler 已在调用前完成 merge），直接使用 req 值。
+	// 对非指针字段（handler 已在调用前完成 merge），直接使用 req 值。
 	// 对指针字段，nil 时用 existing 值，非 nil 时解引用。
 	input := ruleFeatureInput{
 		Protocol:                   existing.Protocol,
@@ -190,7 +190,7 @@ func updateRuleFeatures(req models.UpdateRuleRequest, existing models.LbRule) ru
 	if req.ProxyStreamCloseDelay != nil {
 		input.ProxyStreamCloseDelay = *req.ProxyStreamCloseDelay
 	}
-	// 历史问题:TCP 三字段指针字段同口径合并——nil 沿用 existing,非 nil 解引用,
+	// TCP 三字段指针字段同口径合并——nil 沿用 existing,非 nil 解引用,
 	// 使 validateRuleFeatures 的负值门在更新路径看到真实值。
 	if req.TCPHealthCheckPort != nil {
 		input.TCPHealthCheckPort = *req.TCPHealthCheckPort
@@ -220,10 +220,10 @@ func normalizePathRules(pathRules []models.PathRule) []models.PathRule {
 		if normalized[index].MatchType == "" {
 			normalized[index].MatchType = "prefix"
 		}
-		// 历史问题: 存储前 TrimSpace，与校验侧（validateRuleFeatures 277 行先 TrimSpace
+		// 存储前 TrimSpace，与校验侧（validateRuleFeatures 277 行先 TrimSpace
 		// 再归一）及渲染侧 pathMatcherSpecs 对齐，避免空格路径校验误报冲突。
 		normalized[index].Path = strings.TrimSpace(normalized[index].Path)
-		// 历史问题：路径上游地址与主上游同口径归一——校验/查重侧一直用
+		// 路径上游地址与主上游同口径归一——校验/查重侧一直用
 		// TrimSpace 后的值判定，但落库/渲染原样消费 Address；" up.test" 能过
 		// host 门并渲染成 dial:" up.test:9001"（该路径恒 502）。深拷贝上游
 		// 切片后回写 TrimSpace，避免改动调用方共享的底层数组。
@@ -250,7 +250,7 @@ func toPathRuleConfigs(pathRules []models.PathRule) []services.PathRuleConfig {
 			MatchType:    pathRule.MatchType,
 			Path:         pathRule.Path,
 			UpstreamPath: pathRule.UpstreamPath,
-			// 历史问题（历史）：预检渲染回填直返/301 五列——丢失会让预检
+			// 预检渲染回填直返/301 五列——丢失会让预检
 			// 把 static/redirect 路径规则当转发链渲染，与真实渲染分叉。
 			ResponseMode:        pathRule.ResponseMode,
 			ResponseStatus:      pathRule.ResponseStatus,
@@ -275,7 +275,7 @@ func toPathRuleConfigs(pathRules []models.PathRule) []services.PathRuleConfig {
 	return configs
 }
 
-// validateStrategyForProtocol(历史问题 抽享,历史问题 复用):strategy 白名单
+// validateStrategyForProtocol:strategy 白名单
 // 协议感知校验——cookie 仅 HTTP 支持,TCP 规则拒绝;保存门(validateRuleFeatures)
 // 与存量启用门(validateStoredRuleConfig)同口径。空 strategy 走默认不校验。
 func validateStrategyForProtocol(protocol, strategy string) error {
@@ -322,15 +322,15 @@ func ntlmTakeoverShapeError(tryDuration, forceHTTP1, flushInterval, keepaliveTim
 }
 
 func validateRuleFeatures(input ruleFeatureInput) error {
-	// 历史修复: 协议白名单。此前 Create/Update 仅拒绝空协议（rules.go:564），
+	// 协议白名单。此前 Create/Update 仅拒绝空协议（rules.go:564），
 	// "https" 等未知值可经 API/MCP 落库，全量渲染按「非 http 即 TCP」处理
 	// （caddy.go:1276）——域名匹配静默丢失、TLS 字段被忽略。统一在特性校验入口
 	// 拒绝未知协议，Create/Update/复制/导入全链路复用；保存校验 validateRuleConfigGeneration
-	// 亦仅放行 http/tcp（历史问题 对齐），存量 https 行由 db 迁移归一为 http+TLS。
+	// 亦仅放行 http/tcp，存量 https 行由 db 迁移归一为 http+TLS。
 	if input.Protocol != "http" && input.Protocol != "tcp" {
 		return fmt.Errorf("协议仅支持 http 或 tcp")
 	}
-	// 历史问题: strategy 白名单校验，非法值不再透传到 Caddy。
+	// strategy 白名单校验，非法值不再透传到 Caddy。
 	if err := validateStrategyForProtocol(input.Protocol, input.Strategy); err != nil {
 		return err
 	}
@@ -341,7 +341,7 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 	if input.NTLMCompatible != 0 && input.NTLMCompatible != 1 {
 		return fmt.Errorf("ntlm_compatible 必须为 0 或 1")
 	}
-	// 历史问题：upstream_force_http1 与 ntlm_compatible 同为 0/1 开关列，
+	// upstream_force_http1 与 ntlm_compatible 同为 0/1 开关列，
 	// MCP schema 已枚举 0/1 但 REST 无对应门——2/-1 可落库，UI/渲染按
 	// `==1` 静默当关闭，用户意图与运行行为不一致。保存门单源拒绝越界值。
 	if input.UpstreamForceHTTP1 != 0 && input.UpstreamForceHTTP1 != 1 {
@@ -349,14 +349,14 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 	}
 	// 重试窗口值域（方案 C，2026-10-12）：http 规则 tcp_try_duration ∈ [-1,60000]
 	// （-1=显式禁用重试，NTLM 接管态）；tcp 规则 ∈ [0,60000]（下方 TCP 分支拒负值）。
-	// 历史修复（历史）：上界两协议两字段同值 60000——此前 http 侧
+	// 上界两协议两字段同值 60000——此前 http 侧
 	// tcp_try_interval、tcp 侧 duration/interval 均无 >60000 上界，越界值
 	//（999999ms/10^12ms）可经 API/MCP/导入/集群快照落库渲染（L4 proxy
 	// try_duration 溢出，注释宣称值域未兑现）。
 	if input.Protocol == "http" && (input.TCPTryDuration < -1 || input.TCPTryDuration > 60000) {
 		return fmt.Errorf("重试窗口必须在 -1 到 60000 毫秒之间（-1=禁用重试，0=默认 5 秒窗口）")
 	}
-	// 历史问题：http 侧重试间隔补下界——此前只判 >60000，负值可保存后
+	// http 侧重试间隔补下界——此前只判 >60000，负值可保存后
 	// 成为死值（渲染走默认分支）或触发泛化的配置生成失败，用户拿不到字段级
 	// 400。TCP 侧下界在下方 TCP 分支（同值域文案）。
 	if input.Protocol == "http" && (input.TCPTryInterval < 0 || input.TCPTryInterval > 60000) {
@@ -377,11 +377,11 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 			return err
 		}
 	}
-	// 历史问题: 健康检查超时必须小于检查间隔（两者都 > 0 时）。
+	// 健康检查超时必须小于检查间隔（两者都 > 0 时）。
 	if input.HealthCheckInterval > 0 && input.HealthCheckTimeout > 0 && input.HealthCheckTimeout >= input.HealthCheckInterval {
 		return fmt.Errorf("健康检查超时时间（%d 秒）必须小于检查间隔（%d 秒）", input.HealthCheckTimeout, input.HealthCheckInterval)
 	}
-	// 历史问题: compress_types 白名单校验，不支持编码不再静默丢弃。
+	// compress_types 白名单校验，不支持编码不再静默丢弃。
 	if input.EnableCompress && input.CompressTypes != "" {
 		for _, ct := range strings.Split(input.CompressTypes, ",") {
 			ct = strings.TrimSpace(ct)
@@ -393,11 +393,11 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 			}
 		}
 	}
-	// 历史问题: dynamic_dns + 多 upstream 前置校验（原仅在 Caddy 渲染阶段检查，规则已入库）。
+	// dynamic_dns + 多 upstream 前置校验（原仅在 Caddy 渲染阶段检查，规则已入库）。
 	if input.DynamicDNS && input.EnabledUpstreamCount > 1 {
 		return fmt.Errorf("动态上游模式仅允许一个启用的上游服务器，当前有 %d 个", input.EnabledUpstreamCount)
 	}
-	// 历史问题：DynamicDNS + IP 字面量上游的地址族一致性门——Go resolver 对
+	// DynamicDNS + IP 字面量上游的地址族一致性门——Go resolver 对
 	// IP 字面量走快速路径（不查 DNS），Caddy 动态上游的 LookupIP 族过滤会把
 	// 与 dns_family 矛盾的字面量剔除为空集 → 每请求立即 502（加载校验不解析，
 	// 全链路静默）。域名形态上游不检查（其解析结果由 DNS 决定，本门无从判定）；
@@ -415,22 +415,22 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 			}
 		}
 	}
-	// 历史修复: 80 端口 + TLS 跳转自环：跳转目标 https://host:80 与来源同为 80 端口，
+	// 80 端口 + TLS 跳转自环：跳转目标 https://host:80 与来源同为 80 端口，
 	// 请求会被跳回自身监听器形成循环，必须在保存前拒绝。
 	if input.Protocol == "http" && input.ListenPort == 80 && input.EnableTLS && input.TLSHTTPRedirect {
 		return fmt.Errorf("80 端口开启 TLS 跳转无意义（目标与来源相同端口），请改用 443 端口或关闭跳转")
 	}
 	if input.Protocol == "tcp" {
-		// 历史问题：L4 代理无 HTTP Host 头可驱动动态 DNS 解析（Caddy layer4 直拨
-		// IP:port），TCP+dynamic_dns 规则渲染侧被整体跳过（历史问题，仅告警）、
-		// 看门狗亦不标记——保存前不拒绝即静默死规则。与 历史问题（TCP+cookie）同口径。
+		// L4 代理无 HTTP Host 头可驱动动态 DNS 解析（Caddy layer4 直拨
+		// IP:port），TCP+dynamic_dns 规则渲染侧被整体跳过、
+		// 看门狗亦不标记——保存前不拒绝即静默死规则。与 （TCP+cookie）同口径。
 		if input.DynamicDNS {
 			return fmt.Errorf("TCP 规则不支持动态上游（dynamic_dns），请关闭动态 DNS 或改用 HTTP 协议")
 		}
-		// 历史问题-1（历史）：enable_dns_server/dns_server 同为 HTTP 语义
+		// enable_dns_server/dns_server 同为 HTTP 语义
 		// （L4 直拨 IP:port，无 resolver 消费点）——此前拒绝清单漏列，用户可
 		// 在 TCP 规则携带 DNS 配置落库但永不生效且无告警（对照 dynamic_dns
-		// 有本门+渲染告警双保险）。协议切换的零值化（rules.go 历史问题 块）
+		// 有本门+渲染告警双保险）。协议切换的零值化（rules.go 块）
 		// 与存量迁移（db.migrateTCPRuleStaleDNSServer）已清空，显式携带即拒。
 		if input.EnableDnsServer || strings.TrimSpace(input.DnsServer) != "" {
 			return fmt.Errorf("TCP 规则不支持 DNS 服务发现配置（enable_dns_server/dns_server），请关闭或改用 HTTP 协议")
@@ -441,18 +441,18 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 		if input.ProxyDialTimeout > 0 || input.ProxyResponseHeaderTimeout > 0 || input.ProxyReadTimeout > 0 || input.ProxyWriteTimeout > 0 || input.ProxyStreamTimeout > 0 || input.ProxyFlushInterval != 0 || input.ProxyStreamCloseDelay > 0 {
 			return fmt.Errorf("TCP 规则不支持 HTTP 代理超时配置")
 		}
-		// 历史问题:TCP 三字段无哨兵语义——负值仅被渲染侧静默钳制(caddy.go 3503-3522),
+		// TCP 三字段无哨兵语义——负值仅被渲染侧静默钳制(caddy.go 3503-3522),
 		// 保存前拒绝显式负值。proxy_flush_interval 的 -1 哨兵仅属 http 侧,不适用此处。
 		if input.TCPHealthCheckPort < 0 || input.TCPTryDuration < 0 || input.TCPTryInterval < 0 {
 			return fmt.Errorf("TCP 健康检查端口与重试时长/间隔不能为负数")
 		}
-		// 历史修复（历史）：TCP 重试窗口补上界——[0,60000]（与 http 侧
+		// TCP 重试窗口补上界——[0,60000]（与 http 侧
 		// 上界同值），此前仅拒负值，越界值落库渲染溢出。
 		if input.TCPTryDuration > 60000 || input.TCPTryInterval > 60000 {
 			return fmt.Errorf("TCP 重试时长/间隔必须在 0 到 60000 毫秒之间")
 		}
 	}
-	// 历史问题：渲染侧要求「重试窗口 >0 时重试间隔必填」（HTTP
+	// 渲染侧要求「重试窗口 >0 时重试间隔必填」（HTTP
 	// buildHTTPHandleChain 与 TCP buildTCPProxyRoute 两处 <=0 显性报错），
 	// 字段门此前只拒负值/越界——duration>0 + interval=0 可通过保存门后在
 	// 事务渲染阶段失败，用户拿到「Caddy 配置应用失败」泛化 400。此处与渲染门
@@ -464,9 +464,9 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 		return fmt.Errorf("自定义路径规则未启用，不能提交路径规则")
 	}
 	seenPaths := make(map[string]int, len(input.PathRules))
-	// 历史修复: prefix 会渲染为 [路径, 路径/*] 双 matcher，同一路径再配 exact 必被遮蔽
+	// prefix 会渲染为 [路径, 路径/*] 双 matcher，同一路径再配 exact 必被遮蔽
 	// （路由按 SortOrder 排序、首条终结匹配），在保存前整组拒绝。
-	// 历史修复: 查重/查遮蔽必须与渲染侧 pathMatcherSpecs 同源归一（TrimRight 尾 / 与 *），
+	// 查重/查遮蔽必须与渲染侧 pathMatcherSpecs 同源归一（TrimRight 尾 / 与 *），
 	// 否则 "/api" 与 "/api/"（或 "/api//"）原始串不同、渲染 matcher 完全相同，
 	// SortOrder 靠后的一条会成为整条死规则。
 	seenPrefixRoots := make(map[string]int, len(input.PathRules))
@@ -572,16 +572,16 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 		default:
 			return fmt.Errorf("第 %d 条路径规则：response_mode %q 无效（仅支持空=转发/static=直接返回/redirect=301 跳转）", index+1, pathRule.ResponseMode)
 		}
-		// 历史修复: 空数组虽在生成阶段已回退主上游（历史问题，与 nil 同语义），
+		// 空数组虽在生成阶段已回退主上游，
 		// 仍禁止写入上游表占位的空 upstreams_json——保存前拒绝保持数据整洁。
 		if pathRule.Upstreams != nil && len(pathRule.Upstreams) == 0 {
 			return fmt.Errorf("第 %d 条路径规则至少需要配置一个上游", index+1)
 		}
-		// 历史问题:路径规则上游 host:port 去重(主上游 handlers.go hostPortSeen
+		// 路径规则上游 host:port 去重(主上游 handlers.go hostPortSeen
 		// 同口径;JoinHostPort 兼容 IPv6 裸地址形态)——同 host:port 双条目
 		// 权重翻倍,均衡语义静默漂移。
 		pathHostPortSeen := make(map[string]bool)
-		// 历史修复 同族（历史）：路径规则自定义上游池同样拒绝 http/https
+		// 同族：路径规则自定义上游池同样拒绝 http/https
 		// 混布——同一 reverse_proxy 池级 TLS 传输下 http 上游静默全灭。
 		pathPoolProtos := make(map[string]bool, 2)
 		for _, upstream := range pathRule.Upstreams {
@@ -654,7 +654,7 @@ var validStaticResponseStatuses = map[int]bool{
 }
 
 // replacePathRulesTx 以「保留不变行」的方式收敛给定规则的路径规则集合（历史
-// 历史问题-10）。修复前恒 DELETE 全删 + INSERT：任何规则编辑（含纯改名）都会重建全部
+// 修复前恒 DELETE 全删 + INSERT：任何规则编辑（含纯改名）都会重建全部
 // 行（id/created_at/updated_at 重置），且恒触发行级触发器（path_rules 在同步版本
 // 矩阵内）→ 每次 UpdateRule 多一轮从端同步。现语义：
 //   - 内容完全一致（含 sort_order 与上游集合）的存量行 → 零写入，id/时间戳原样保留；
@@ -917,7 +917,7 @@ func contextUserID(c *gin.Context) int64 {
 	return 0
 }
 
-// 历史问题: 列表查询不加载 tls_cert/tls_key 正文，减少大字段 I/O。
+// 列表查询不加载 tls_cert/tls_key 正文，减少大字段 I/O。
 // 由完整投影派生两个空占位，列顺序与 lbRuleColumns 恒一致，scanLbRules 无需修改。
 // 列表投影派生断言：派生依赖「证书列字样必须命中」——字样改名/重排时 strings.Replace
 // 会静默返回原文（列表回读私钥正文且大字段 I/O 回归），故派生函数在命中
@@ -1015,7 +1015,7 @@ func scanLbRules(rows *sql.Rows) ([]models.LbRule, error) {
 	return rules, rows.Err()
 }
 
-// ruleRelationBatchSize 关系批量查询的分块大小（历史修复，历史）：单条
+// ruleRelationBatchSize 关系批量查询的分块大小：单条
 // IN (...) 的占位符数量随规则数线性增长，超过驱动绑定变量上限（旧 SQLite
 // 999）时 ListRules/GetRule/DuplicateRule 直接 500。按 500 分块（与
 // BatchRuleBlockPages 的显式上限同量级），超大规模只增加往返次数。
@@ -1043,7 +1043,7 @@ func loadUpstreamsBatch(ctx context.Context, ruleIDs []string) (map[string][]mod
 			placeholders[i] = "?"
 			args[i] = id
 		}
-		// 历史: 与渲染侧同口径（IIF(enabled IN ('1',1),1,0)，NULL 视禁用）——
+		// 与渲染侧同口径（IIF(enabled IN ('1',1),1,0)，NULL 视禁用）——
 		// 此前 COALESCE(enabled,1) 将遗留 NULL 行视为启用，UI 显示与生成配置分裂。
 		rows, err := db.DB.QueryContext(ctx, `SELECT id, rule_id, host, port, COALESCE(weight,1), COALESCE(dynamic_dns,0), IIF(enabled IN ('1',1),1,0), COALESCE(protocol,'http'), COALESCE(max_connections,0), COALESCE(origin_domain,'')
 			FROM upstreams WHERE rule_id IN (`+strings.Join(placeholders, ",")+`) ORDER BY id`, args...)
@@ -1145,14 +1145,14 @@ type acmeReferenceInput struct {
 
 // validateRuleACMEReferences 校验 enable_tls+acme_dns 规则的 ACME 引用可解析：
 // acme_config_id 非 0 且引用存在且启用（enabled=1）的 certificate_configs 行
-// （历史问题 发现4：与 ca_provider 检查及签发侧 certissuer.go 的 AND enabled=1 口径对齐，
+// （发现4：与 ca_provider 检查及签发侧 certissuer.go 的 AND enabled=1 口径对齐，
 // 引用禁用配置会在签发期查空单任务失败 + TLS 端口明文服务）；ca_provider_id 为
 // 0（系统默认）或引用存在且启用的 ca_providers 行。校验失败返回
 // *configValidationError（调用侧映射 400），查询失败返回普通错误（500）。
 // 全部「把规则投入运行/复制引用」入口（Create/Update 写侧、EnableRule、启动与
 // UpdateConfig 聚合校验、DuplicateRule、v2 备份导入）共用本门或其备份行同口径
 // 变体（config_backup.go acmeImportRefIndex.validate），保证悬挂/禁用引用
-// 无从进入运行态（历史问题 发现1/发现5）。
+// 无从进入运行态。
 func validateRuleACMEReferences(input acmeReferenceInput) error {
 	if !input.EnableTLS || input.TLSSource != "acme_dns" {
 		return nil
@@ -1192,8 +1192,8 @@ func validateStageBlockPageRef(pageID, status int, label string) error {
 }
 
 // validateStageBlockPageRefWith 同 validateStageBlockPageRef，页存在性由调用方
-// 提供（历史）：v2 导入的页集合必须按「备份携带 security_block_pages
-// 则备份行、缺席则 live」解析（与 历史问题 口径一致），不能直连 db.DB。
+// 提供：v2 导入的页集合必须按「备份携带 security_block_pages
+// 则备份行、缺席则 live」解析（与口径一致），不能直连 db.DB。
 func validateStageBlockPageRefWith(pageID, status int, label string, pageExists func(id int) (bool, error)) error {
 	switch status {
 	case 0, 400, 401, 403, 404, 503:
@@ -1203,7 +1203,7 @@ func validateStageBlockPageRefWith(pageID, status int, label string, pageExists 
 	if pageID < 0 {
 		return &configValidationError{message: fmt.Sprintf("%s拦截页 id 不能为负数", label)}
 	}
-	// 历史问题：跨字段门——渲染只在 pageID>0 时发射阶段路由，单独携带
+	// 跨字段门——渲染只在 pageID>0 时发射阶段路由，单独携带
 	// status（page=0）会保存成永不消费的死配置（UI 显示未配置、导出/复制
 	// 放大）。与策略侧零化门同口径：无页即无码。
 	if pageID == 0 && status != 0 {
@@ -1221,12 +1221,12 @@ func validateStageBlockPageRefWith(pageID, status int, label string, pageExists 
 	return nil
 }
 
-// mixedUpstreamPoolError 历史问题（历史）：HTTP 规则启用上游池混布
+// mixedUpstreamPoolError：HTTP 规则启用上游池混布
 // （保存门 handlers.go:615 同款文案/口径）——主池按启用上游统计（IIF 归一，
 // 空协议视同 http），路径池全量统计（PathRuleUpstream 无 enabled 位，与
 // 保存门 rule_features.go 路径池同口径）。启用链（EnableRule 经
 // validateStoredRuleConfig）、启动/UpdateConfig 聚合校验、复制链
-// （DuplicateRule）共用本 helper（历史修复：不落第三份实现）。
+// （DuplicateRule）共用本 helper。
 func mixedUpstreamPoolError(rule models.LbRule) error {
 	if rule.Protocol != "http" {
 		return nil
@@ -1262,18 +1262,19 @@ func mixedUpstreamPoolError(rule models.LbRule) error {
 }
 
 // validateStoredRuleProtocolFields 是单规则启用门与启动/UpdateConfig 聚合门
-// 共用的字段检查：策略/协议白名单、NTLM 形态、TCP dynamic_dns、上游池混布。
-// 两入口必须同源，否则同一坏规则会「启用时报错、重启时静默降级」。
+// 共用的字段检查：先按保存族归一 TCP 死字段，再校验策略/协议白名单、NTLM
+// 形态与上游池混布。两入口必须同源，否则同一坏规则会「启用时报错、重启时静默降级」。
 func validateStoredRuleProtocolFields(rule models.LbRule, includeMixedPool bool) error {
+	if rule.Protocol == "tcp" {
+		tcpDeadFieldReset(rule.Protocol, storedRuleTCPDeadFields(&rule))
+		rule.PathRules = []models.PathRule{}
+	}
 	if err := validateStrategyForProtocol(rule.Protocol, rule.Strategy); err != nil {
 		return &configValidationError{message: err.Error()}
 	}
 	if rule.NTLMCompatible != 0 {
 		if rule.NTLMCompatible != 1 {
 			return &configValidationError{message: "ntlm_compatible 必须为 0 或 1"}
-		}
-		if rule.Protocol == "tcp" {
-			return &configValidationError{message: "TCP 规则不支持 NTLM 兼容模式（仅 HTTP 规则可用）"}
 		}
 		if rule.Strategy != "cookie" {
 			return &configValidationError{message: "NTLM 兼容模式要求负载策略为 Cookie 会话保持"}
@@ -1283,9 +1284,6 @@ func validateStoredRuleProtocolFields(rule models.LbRule, includeMixedPool bool)
 		if err := ntlmTakeoverShapeError(rule.TCPTryDuration, rule.UpstreamForceHTTP1, rule.ProxyFlushInterval, rule.UpstreamKeepaliveTimeout); err != nil {
 			return &configValidationError{message: err.Error()}
 		}
-	}
-	if rule.Protocol == "tcp" && rule.DynamicDNS {
-		return &configValidationError{message: "TCP 规则不支持动态上游（dynamic_dns），请关闭动态 DNS 或改用 HTTP 协议"}
 	}
 	if includeMixedPool {
 		if err := mixedUpstreamPoolError(rule); err != nil {
@@ -1304,14 +1302,14 @@ func validateStoredRuleConfig(ctx context.Context, caddyID string) error {
 		return fmt.Errorf("规则不存在")
 	}
 	rule := rules[0]
-	// 历史修复: 与 validateRuleFeatures 同口径，兜住历史存量/导入的 80 端口 + TLS 跳转自环规则。
+	// 与 validateRuleFeatures 同口径，兜住历史存量/导入的 80 端口 + TLS 跳转自环规则。
 	if rule.Protocol == "http" && rule.ListenPort == 80 && rule.EnableTLS && rule.TLSHTTPRedirect {
 		return &configValidationError{message: "80 端口开启 TLS 跳转无意义（目标与来源相同端口），请改用 443 端口或关闭跳转"}
 	}
 	if rule.Protocol == "http" && rule.EnableTLS && rule.TLSSource != "manual" && rule.TLSSource != "acme_dns" {
 		return &configValidationError{message: "启用 TLS 时必须选择证书来源（manual 或 acme_dns）"}
 	}
-	// 历史问题 发现1：共享 ACME 引用校验（0 值门 + 存在性/enabled=1），与
+	// 发现1：共享 ACME 引用校验（0 值门 + 存在性/enabled=1），与
 	// Create/Update 写侧 400 口径对齐——导入残留的 acme_dns+0 坏规则与悬挂/禁用
 	// 引用均不得经 EnableRule 投入运行（签发必败且明文服务）。
 	if err := validateRuleACMEReferences(acmeReferenceInput{
@@ -1324,7 +1322,7 @@ func validateStoredRuleConfig(ctx context.Context, caddyID string) error {
 		(strings.TrimSpace(rule.TLSCert) == "" || strings.TrimSpace(rule.TLSKey) == "") {
 		return &configValidationError{message: "手动证书模式下必须提供 TLS 证书和私钥"}
 	}
-	// 历史问题：策略白名单、NTLM、TCP dynamic_dns、上游池混布
+	// 策略白名单、NTLM、TCP dynamic_dns、上游池混布
 	// 与启动/UpdateConfig 聚合门共用同一 helper。
 	if err := validateStoredRuleProtocolFields(rule, true); err != nil {
 		return err
@@ -1332,7 +1330,7 @@ func validateStoredRuleConfig(ctx context.Context, caddyID string) error {
 	return validateRuleConfigGeneration(rule)
 }
 
-// 历史问题: 收集全部坏规则错误聚合返回（每条含规则名+caddy_id），
+// 收集全部坏规则错误聚合返回（每条含规则名+caddy_id），
 // 避免首错即 return 导致多条坏规则需重启多次逐一暴露；errors.Join 保持
 // 与 configValidationError 的 errors.As 兼容（UpdateConfig/EnableRule 类型断言路径）。
 func validateEnabledStoredRuleConfigs(ctx context.Context) error {
@@ -1340,7 +1338,7 @@ func validateEnabledStoredRuleConfigs(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	// 历史修复（历史）：全局请求体上限只读一次（此前 precheckRuleConfig 逐
+	// 全局请求体上限只读一次（此前 precheckRuleConfig 逐
 	// 规则点查同值配置 → 启动/UpdateConfig 聚合校验 N 条规则 N 次往返）。
 	globalBody := 0
 	if len(rules) > 0 {
@@ -1354,7 +1352,7 @@ func validateEnabledStoredRuleConfigs(ctx context.Context) error {
 			problems = append(problems, &configValidationError{message: fmt.Sprintf("规则 %s（%s）80 端口开启 TLS 跳转无意义（目标与来源相同端口），请改用 443 端口或关闭跳转", rule.Name, rule.CaddyID)})
 			continue
 		}
-		// 历史问题：与 validateStoredRuleConfig 同口径的 tls_source 白名单——
+		// 与 validateStoredRuleConfig 同口径的 tls_source 白名单——
 		// 存量（白名单上线前落库）/直改 DB 的垃圾 tls_source 启用行必须在启动与
 		// UpdateConfig 聚合校验点名（渲染侧 availableCerts 仅认 manual/acme_dns →
 		// 无 tls_connection_policies → TLS 端口明文服务，disable_certificates 阻自愈）。
@@ -1362,7 +1360,7 @@ func validateEnabledStoredRuleConfigs(ctx context.Context) error {
 			problems = append(problems, &configValidationError{message: fmt.Sprintf("规则 %s（%s）启用 TLS 时必须选择证书来源（manual 或 acme_dns）", rule.Name, rule.CaddyID)})
 			continue
 		}
-		// 历史问题 发现1：启动/UpdateConfig 聚合校验与 EnableRule 同门——ACME 引用
+		// 发现1：启动/UpdateConfig 聚合校验与 EnableRule 同门——ACME 引用
 		// 不可解析（0 值/悬挂/已禁用）的启用规则必须点名，不得静默通过。
 		if err := validateRuleACMEReferences(acmeReferenceInput{
 			EnableTLS: rule.EnableTLS, TLSSource: rule.TLSSource,
@@ -1375,15 +1373,15 @@ func validateEnabledStoredRuleConfigs(ctx context.Context) error {
 				problems = append(problems, fmt.Errorf("规则 %s（%s）ACME 引用校验失败：%w", rule.Name, rule.CaddyID, err))
 			}
 		}
-		// 历史问题：与 validateStoredRuleConfig 单规则门对称的 manual 材料检查——
+		// 与 validateStoredRuleConfig 单规则门对称的 manual 材料检查——
 		// enable_tls=1 + manual + 空证书的启用行会让 TLS 端口明文服务
 		//（availableCerts 要求 cert/key 非空）。保存/导入链均拦截该形态，此门
-		// 兜住存量/直改 DB（与 历史问题 同定位）。
+		// 兜住存量/直改 DB（与同定位）。
 		if rule.Protocol == "http" && rule.EnableTLS && rule.TLSSource == "manual" &&
 			(strings.TrimSpace(rule.TLSCert) == "" || strings.TrimSpace(rule.TLSKey) == "") {
 			problems = append(problems, &configValidationError{message: fmt.Sprintf("规则 %s（%s）手动证书模式缺少证书或私钥，请补齐材料或切换证书来源", rule.Name, rule.CaddyID)})
 		}
-		// 历史问题：与单规则 EnableRule 同源的字段门，避免
+		// 与单规则 EnableRule 同源的字段门，避免
 		// 「启用时报错、启动/UpdateConfig 静默降级」的不对称。
 		if err := validateStoredRuleProtocolFields(rule, false); err != nil {
 			if validationErr, ok := err.(*configValidationError); ok {
@@ -1397,9 +1395,9 @@ func validateEnabledStoredRuleConfigs(ctx context.Context) error {
 			problems = append(problems, fmt.Errorf("规则 %s（%s）配置无效：%w", rule.Name, rule.CaddyID, err))
 		}
 	}
-	// 历史问题②:同端口多启用 TCP 规则点名(兜存量双启用——启用方向第二条由
+	// 同端口多启用 TCP 规则点名(兜存量双启用——启用方向第二条由
 	// validatePortFromDB 拦截,此门兜直改 DB/历史存量;L4 监听同端口只能由
-	// 一条规则占用,后注册者顶替先注册者)。与 历史问题 不同:该形态渲染即
+	// 一条规则占用,后注册者顶替先注册者)。与不同:该形态渲染即
 	// 相互顶替,必须报错而非仅告警。
 	tcpByPort := make(map[int][]string)
 	for _, rule := range rules {
@@ -1413,7 +1411,7 @@ func validateEnabledStoredRuleConfigs(ctx context.Context) error {
 			problems = append(problems, &configValidationError{message: fmt.Sprintf("端口 %d 存在多条启用的 TCP 规则（%s）——L4 监听同端口只能由一条规则占用，请保留一条或调整端口", port, strings.Join(names, "、"))})
 		}
 	}
-	// 历史问题:存量同端口 TLS/明文混布点名告警(不阻断启动——存量形态可能是
+	// 存量同端口 TLS/明文混布点名告警(不阻断启动——存量形态可能是
 	// 混布前已落库的历史数据,阻断会让节点起不来;点名提示管理员修正)。
 	portTLSMix := make(map[int][2][]string)
 	for _, rule := range rules {
@@ -1433,7 +1431,7 @@ func validateEnabledStoredRuleConfigs(ctx context.Context) error {
 			services.Logf("warn", "端口 %d 存在 TLS 与明文规则混布（明文：%v；TLS：%v）——该端口监听器将整体切换为 TLS，明文规则流量将握手失败，请调整规则端口", port, mix[0], mix[1])
 		}
 	}
-	// 历史问题（历史）：存量启用行启用上游池混布点名告警（镜像
+	// 存量启用行启用上游池混布点名告警（镜像
 	// portTLSMix 形态，不阻断启动——阻断会让节点起不来；启用方向已被
 	// validateStoredRuleConfig 400 拦截，此门兜直改 DB/69 轮修复前落库的
 	// 存量，提示管理员修正）。
@@ -1465,7 +1463,7 @@ func loadRulesForConfigValidation(ctx context.Context, suffix string, args ...an
 }
 
 // precheckRuleConfig 构造预校验渲染输入（EnableRule/启动聚合校验共用）。
-// 历史问题（历史）回填本日新特性列：upstreams 携带 OriginDomain、
+// 回填本日新特性列：upstreams 携带 OriginDomain、
 // path_rules 携带 response_* 五列、规则级携带 HostHeader/HealthCheckHost/
 // EnableCompress/CompressTypes——此前预检渲染把直返/301 路径规则当转发链
 // 渲染、不发射回源域名 map 处理器，与真实渲染分叉（错误拦截时机后移）。
@@ -1479,7 +1477,7 @@ func loadRulesForConfigValidation(ctx context.Context, suffix string, args ...an
 // 单规则预检携带（生产渲染由 generateCaddyConfigWithCertSource 从
 // global_config 灌入；预检此前缺位、靠渲染层「兜底 128」幸存——兜底废除后
 // 必须显式携带）。查询失败置 0：渲染层 resolveRuleOverrides 显性报错，预检
-// 随真实渲染同 fail-visible。历史修复（历史）：聚合校验把本函数的结果一次
+// 随真实渲染同 fail-visible。聚合校验把本函数的结果一次
 // 传入（N 条规则不再 N 次点查同值配置）。
 func globalRequestBodyMaxSizeMBForPrecheck() int {
 	globalBody := 0
@@ -1533,29 +1531,29 @@ func validateRuleConfigGeneration(rule models.LbRule) error {
 }
 
 // validateRuleConfigGenerationWithGlobalBody 同上一形态，全局请求体上限由
-// 调用方传入（历史修复：聚合校验一次读取，逐规则复用）。
+// 调用方传入。
 func validateRuleConfigGenerationWithGlobalBody(rule models.LbRule, globalBody int) error {
 	config := services.GenerateSingleRuleCaddyConfig(precheckRuleConfig(rule, globalBody))
 	genErr, hasErr := config["error"].(error)
 	if !hasErr {
 		return nil
 	}
-	// 历史问题: 仅特判零上游——全量渲染路径对零上游规则是跳过而非失败
+	// 仅特判零上游——全量渲染路径对零上游规则是跳过而非失败
 	// （caddy.go 按启用上游数 continue），该特判是有意的，保持与渲染侧一致；
 	// 其余生成错误（含 generateHTTPRouteObjects 的硬错误）一律返回，
-	// 避免 历史修复 聚合与 EnableRule 预校验漏报（此前全被吞掉）。
-	// 历史问题: 精确串比较改哨兵 errors.Is——生成侧两处产出点
+	// 避免聚合与 EnableRule 预校验漏报（此前全被吞掉）。
+	// 精确串比较改哨兵 errors.Is——生成侧两处产出点
 	// （GenerateSingleRuleCaddyConfig 直返 / buildHTTPHandleChain %w 包装）
 	// 统一引用 services.ErrNoEnabledUpstreams，未来加规则上下文包装仍能命中。
 	if errors.Is(genErr, services.ErrNoEnabledUpstreams) {
 		return nil
 	}
-	// 历史问题: 动态 DNS 多上游同样哨兵化（ErrDynamicDNSUpstreamCount），
+	// 动态 DNS 多上游同样哨兵化（ErrDynamicDNSUpstreamCount），
 	// 不再依赖文案 Contains——文案调整即静默漏报。
 	if errors.Is(genErr, services.ErrDynamicDNSUpstreamCount) {
 		return &configValidationError{message: "动态 DNS 模式仅支持一个启用的上游"}
 	}
-	// 历史修复（历史）：其余生成失败同样源于规则数据/库值（预检输入全部来自
+	// 其余生成失败同样源于规则数据/库值（预检输入全部来自
 	// 库行 + 一次全局配置值，生成路径无 DB I/O），按 configValidationError 分类
 	// ——EnableRule 映射 400「可自行修正」而非 500 内部故障，UpdateConfig 的
 	// isPureConfigValidationError 判定同受益；错误文本是渲染层确定性文案，

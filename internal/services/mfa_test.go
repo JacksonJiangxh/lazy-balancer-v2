@@ -2,6 +2,8 @@ package services
 
 import (
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -185,7 +187,7 @@ func TestMFAChallengeLifecycle(t *testing.T) {
 	}
 }
 
-// 历史修复：执行错误必须与「行未更新」分判，调用方才能区分 DB 故障 500
+// 执行错误必须与「行未更新」分判，调用方才能区分 DB 故障 500
 // 与正常挑战失效 401。
 func TestMFAConsumeChallenge_returnsExecutionError(t *testing.T) {
 	mfaTestEnv(t)
@@ -218,7 +220,7 @@ func TestMFAResetForUser(t *testing.T) {
 	if st.Enabled {
 		t.Fatal("reset must disable mfa")
 	}
-	// 历史修复：pending 失败计数随重置一并清零（原死断言 if locked := false 的
+	// pending 失败计数随重置一并清零（原死断言 if locked:= false 的
 	// 替换——锁定本就归重置密码路径，此处钉住 reset 对 MFA 自有状态的覆盖）。
 	var enabled, pendingFails int
 	if err := db.DB.QueryRow("SELECT mfa_enabled, COALESCE(mfa_pending_fails,0) FROM users WHERE id=6").Scan(&enabled, &pendingFails); err != nil {
@@ -247,7 +249,7 @@ func TestMFAWriteGuardEnabled(t *testing.T) {
 	if enabled, err = MFAWriteGuardEnabled(); err != nil || !enabled {
 		t.Fatalf("toggle read: enabled=%v err=%v", enabled, err)
 	}
-	// 历史问题：读取失败必须显式报错，不得静默降级为「开关关闭」（fail-open）。
+	// 读取失败必须显式报错，不得静默降级为「开关关闭」（fail-open）。
 	if _, err := db.DB.Exec("DELETE FROM global_config WHERE id=1"); err != nil {
 		t.Fatal(err)
 	}
@@ -256,7 +258,7 @@ func TestMFAWriteGuardEnabled(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：三个 TOTP 验证器输入容错须一致——MFAVerifyCode/
+// 三个 TOTP 验证器输入容错须一致——MFAVerifyCode/
 // MFAVerifyTOTPCode 均先 TrimSpace，MFAVerifyPending 缺失，绑定向导 activate
 // 步粘贴带空格验证码恒失败。
 func TestMFAVerifyPending_trimsWhitespace(t *testing.T) {
@@ -281,7 +283,7 @@ func TestMFAVerifyPending_trimsWhitespace(t *testing.T) {
 	}
 }
 
-// 历史问题：挑战级失败计数硬闸——第 10 次失败即作废挑战（与全局锁定开关无关），
+// 挑战级失败计数硬闸——第 10 次失败即作废挑战（与全局锁定开关无关），
 // 作废后 MFAConsumeChallenge 恒拒绝。
 func TestMFARecordChallengeFailure_invalidatesAtThreshold(t *testing.T) {
 	mfaTestEnv(t)
@@ -316,7 +318,7 @@ func TestMFARecordChallengeFailure_invalidatesAtThreshold(t *testing.T) {
 	}
 }
 
-// 历史问题：pending 验证失败第 5 次即作废 pending secret（重新 setup 才能再试）。
+// pending 验证失败第 5 次即作废 pending secret（重新 setup 才能再试）。
 func TestMFARecordPendingFailure_invalidatesAtThreshold(t *testing.T) {
 	mfaTestEnv(t)
 	mfaSeedUser(t, 4)
@@ -352,7 +354,7 @@ func TestMFARecordPendingFailure_invalidatesAtThreshold(t *testing.T) {
 	}
 }
 
-// 历史问题：restore 不复活已作废挑战——按 handler 真实顺序（consume→验码失败
+// restore 不复活已作废挑战——按 handler 真实顺序（consume→验码失败
 // →restore→record failure）驱动 10 轮后，第 11 次登录在 consume 门即被拒绝
 // （restore 只在 consume 成功后调用，作废行不经过恢复路径）。
 func TestMFARestoreChallenge_invalidatedChallengeStaysDead(t *testing.T) {
@@ -384,7 +386,7 @@ func TestMFARestoreChallenge_invalidatedChallengeStaysDead(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：MFAGetStatus 对恢复码存储损坏必须显性报错，
+// MFAGetStatus 对恢复码存储损坏必须显性报错，
 // 不得以「剩余 0 个」掩盖（与 mfaConsumeRecoveryCode 的三态口径一致）。
 func TestMFAGetStatus_reportsCorruptedRecoveryCodes(t *testing.T) {
 	mfaTestEnv(t)
@@ -449,6 +451,51 @@ func TestMFARestoreChallenge_doesNotResurrectInvalidatedChallenge(t *testing.T) 
 	}
 	if ok, err := MFAConsumeChallenge(token, 8); ok || err != nil {
 		t.Fatalf("作废挑战不得再被消费: ok=%v err=%v", ok, err)
+	}
+}
+
+// 并发爆破下硬闸的原子性：计数自增与作废判定必须同语句（UPDATE…RETURNING）。
+// 三语句形状（自增→读计数→置作废）在「读计数→置作废」窗口内，并发调用可
+// 越过阈值继续自增（attempts > 阈值）且多个调用方同报 invalidated=true。
+func TestMFARecordChallengeFailure_concurrentInvalidationIsAtomic(t *testing.T) {
+	mfaTestEnv(t)
+	mfaSeedUser(t, 11)
+	const token = "tok-challenge-atomic"
+	if _, err := db.DB.Exec(`INSERT INTO mfa_challenges (token, user_id, expires_at, consumed, attempts)
+		VALUES (?, 11, datetime('now','+10 minutes'), 0, 0)`, token); err != nil {
+		t.Fatal(err)
+	}
+
+	const total = 4 * mfaChallengeFailThreshold
+	var wg sync.WaitGroup
+	var invalidatedCount atomic.Int64
+	start := make(chan struct{})
+	for range total {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if MFARecordChallengeFailure(token) {
+				invalidatedCount.Add(1)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := invalidatedCount.Load(); got != 1 {
+		t.Fatalf("invalidated=true 的调用方数=%d, want 恰 1（作废判定必须原子）", got)
+	}
+	var consumed bool
+	var attempts int
+	if err := db.DB.QueryRow(`SELECT COALESCE(consumed,0), COALESCE(attempts,0) FROM mfa_challenges WHERE token=?`, token).Scan(&consumed, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if !consumed {
+		t.Fatal("达阈值后挑战必须置 consumed=1")
+	}
+	if attempts != mfaChallengeFailThreshold {
+		t.Fatalf("attempts=%d, want 恒等于阈值 %d（作废后不得继续自增）", attempts, mfaChallengeFailThreshold)
 	}
 }
 

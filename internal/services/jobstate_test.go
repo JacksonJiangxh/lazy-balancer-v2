@@ -57,7 +57,7 @@ func TestJobLifecycle_mapsEveryPersistedStatus(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：状态枚举单源（db.CertJobStatuses ← DDL CHECK 生成 +
+// 状态枚举单源（db.CertJobStatuses ← DDL CHECK 生成 +
 // services 状态机派生）。导出 API 返回副本；集合必须与生命周期映射完全一致
 // ——新增状态只改 db 一处即全链生效（映射缺失由本测试的集合对比暴露）。
 func TestAllJobStatuses_matchesLifecycleMapAndReturnsCopy(t *testing.T) {
@@ -106,7 +106,7 @@ func TestJobLifecycle_classifiesUnknownStatusAsFailed(t *testing.T) {
 }
 
 func TestJobLifecycle_helpersUseLogicalLifecycle(t *testing.T) {
-	// 历史问题：JobIsActive 已删（生产死代码）——本测试收敛为仅锁定 JobIsTerminal。
+	// JobIsActive 已删（生产死代码）——本测试收敛为仅锁定 JobIsTerminal。
 	// Given
 	tests := []struct {
 		status   string
@@ -233,12 +233,12 @@ func TestCertJobStatusWrites_useApprovedEntryPoints(t *testing.T) {
 		"db/db.go":             {"createTables": true, "migrateCertJobsStatusConstraint": true},
 		"services/jobstate.go": {"transitionJob": true},
 		// upsertQueuedCertJob：原 CreateOrRequeueCertJobWithChange 内联的
-		// 「排队签发」upsert 闭包（历史问题-01 抽为单源，供补建路径复用）——
+		// 「排队签发」upsert 闭包（抽为单源，供补建路径复用）——
 		// 与原批准点同语义（INSERT..ON CONFLICT 置 queued），不是新绕行写点。
 		"services/certificates.go":  {"restoreCertJobsForRule": true, "CreateOrRequeueCertJobWithChange": true, "upsertQueuedCertJob": true},
 		"services/cluster_apply.go": {"replaceSnapshotTx": true},
 		"handlers/certjobs.go":      {"RetryCertJob": true, "retryCertJobByID": true, "DeleteCertJob": true},
-		// 历史问题：UpdateRule/DisableRule 的禁用暂停谓词收敛为
+		// UpdateRule/DisableRule 的禁用暂停谓词收敛为
 		// disableCertJobsForRuleTx 单源；DisableRule 不再直接持字面量（白名单
 		// 移除保持守卫收紧），UpdateRule 保留（域名迁移/恢复两处自有写点）。
 		"handlers/rules.go": {"UpdateRule": true, "EnableRule": true, "disableCertJobsForRuleTx": true, "retireCertJobsForDomain": true},

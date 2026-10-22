@@ -1,10 +1,10 @@
 package handlers
 
-// 历史修复(簇 A·备份导入管线)行为规格:
-// 历史问题 lbbak 导入分类选择(query sections)、历史问题 password_version 吊销收窄、
-// 历史问题 解压炸弹上限、历史问题 .version 伴生文件保留、历史问题 落盘失败警告、
-// 历史问题 仅全局配置导出拒绝、历史问题 单侧文件-版本表绑定、历史问题 ACME 引用
-// 预检警告、历史问题 NULL 归一 5→2。
+// (簇 A·备份导入管线)行为规格
+// lbbak 导入分类选择(query sections)、 password_version 吊销收窄、
+// 解压炸弹上限、.version 伴生文件保留、落盘失败警告、
+// 仅全局配置导出拒绝、单侧文件-版本表绑定、 ACME 引用
+// 预检警告、 NULL 归一 5→2。
 
 import (
 	"archive/tar"
@@ -65,7 +65,7 @@ func overrideTestWafPaths(t *testing.T) (crsDir, xdbPath string) {
 	return crsDir, xdbPath
 }
 
-// 历史问题:lbbak 导入的 ?sections= 必须生效——未选分类的表与 waf 文件都不得动。
+// lbbak 导入的?sections= 必须生效——未选分类的表与 waf 文件都不得动。
 func TestLbbakImport_sectionsQueryScoped(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	g := newBackupSectionRouter(h)
@@ -106,7 +106,7 @@ func TestLbbakImport_sectionsQueryScoped(t *testing.T) {
 	}
 }
 
-// 历史问题:password_version 吊销收窄为「选中系统数据」——仅规则导入不吊销,
+// password_version 吊销收窄为「选中系统数据」——仅规则导入不吊销,
 // 含系统数据导入吊销且响应携带提示。
 func TestLbbakImport_passwordVersionBumpScoped(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -179,7 +179,7 @@ func craftLbbakRaw(t *testing.T, entries map[string][]byte) []byte {
 	return buf.Bytes()
 }
 
-// 历史问题:parseLbbak 条目数与总解压字节上限。
+// parseLbbak 条目数与总解压字节上限。
 func TestParseLbbak_entryAndTotalCaps(t *testing.T) {
 	// 条目数上限(>64 拒绝)
 	entries := map[string][]byte{}
@@ -201,7 +201,7 @@ func TestParseLbbak_entryAndTotalCaps(t *testing.T) {
 	}
 }
 
-// 历史问题:含 xdb 的 lbbak 导入(字节未变)不得删除 .version 伴生文件——
+// 含 xdb 的 lbbak 导入(字节未变)不得删除.version 伴生文件——
 // 版本 tag 从备份表区传入。
 func TestLbbakImport_preservesXdbVersionSidecar(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -231,7 +231,7 @@ func TestLbbakImport_preservesXdbVersionSidecar(t *testing.T) {
 	}
 }
 
-// 历史问题:规则库文件落盘失败必须进入响应 warnings(不得静默纯成功)。
+// 规则库文件落盘失败必须进入响应 warnings(不得静默纯成功)。
 func TestLbbakImport_wafFileFailureWarns(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	g := newBackupSectionRouter(h)
@@ -251,7 +251,7 @@ func TestLbbakImport_wafFileFailureWarns(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("import should still succeed: %d %s", rec.Code, rec.Body.String())
 	}
-	// 历史问题：坏 xdb 在落盘前即被装载验证拒绝，响应必须同时明示「无法装载」
+	// 坏 xdb 在落盘前即被装载验证拒绝，响应必须同时明示「无法装载」
 	// 与版本记录同批丢弃（文件未落盘 → 记录不得存活）。
 	if !strings.Contains(rec.Body.String(), "无法装载") || !strings.Contains(rec.Body.String(), "版本记录已丢弃") {
 		t.Fatalf("waf file apply failure must surface in response warnings: %s", rec.Body.String())
@@ -260,7 +260,7 @@ func TestLbbakImport_wafFileFailureWarns(t *testing.T) {
 
 // 三分类合并(2026-09-19 用户裁定):legacy 分类键 global_config 是「系统数据」
 // (users)的别名、waf_files 是「安全防护」(security)的别名——旧书签/脚本的
-// ?sections= 导出必须成功且携带对应表族,不再 400(历史问题 死备份哨兵随
+// ?sections= 导出必须成功且携带对应表族,不再 400( 死备份哨兵随
 // 分类合并撤销:users 恒有表,「仅全局配置」形态不可达)。
 func TestExportConfigBackup_legacySectionAliases(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -325,7 +325,7 @@ func TestExportConfigBackup_legacySectionAliases(t *testing.T) {
 
 // 三分类合并勘误(2026-09-19):users 分类备份(系统数据表族+全局配置区)
 // 必须可导入。旧「全量形态」探测器以「含 users 表」判定全量,把分类备份
-// 误判为全量并以「缺少 lb_rules」拒绝——恰好制造 历史问题 要消灭的死备份
+// 误判为全量并以「缺少 lb_rules」拒绝——恰好制造要消灭的死备份
 // 形态(旧五分类模型下 users-only 导出同样中招,新增 users=系统数据含全局
 // 配置后触发面扩大到 global_config 别名导出)。
 func TestImportConfigBackup_usersCategoryBackupImports(t *testing.T) {
@@ -359,7 +359,7 @@ func TestImportConfigBackup_usersCategoryBackupImports(t *testing.T) {
 	}
 }
 
-// 历史问题:单侧 waf 文件缺失时对应版本表跳过并警告(xdb 在、CRS 缺 →
+// 单侧 waf 文件缺失时对应版本表跳过并警告(xdb 在、CRS 缺 →
 // security_crs_version 不被空表覆盖)。
 func TestLbbakImport_singleSideWafBinding(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -390,7 +390,7 @@ func TestLbbakImport_singleSideWafBinding(t *testing.T) {
 	}
 }
 
-// 历史问题:「系统数据」分类导入替换 ACME 配置表时,live 启用规则的悬挂引用
+// 「系统数据」分类导入替换 ACME 配置表时,live 启用规则的悬挂引用
 // 必须以警告显性化(不阻断)。
 func TestImportConfigBackup_warnsDanglingACMEReferences(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -425,7 +425,7 @@ func TestImportConfigBackup_warnsDanglingACMEReferences(t *testing.T) {
 	}
 }
 
-// 历史问题:NULL health_check_timeout 归一为 2(与写侧/渲染/快照通道同口径)。
+// NULL health_check_timeout 归一为 2(与写侧/渲染/快照通道同口径)。
 func TestImportConfigBackup_normalizesNullHealthCheckTimeout(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	g := newBackupSectionRouter(h)
@@ -459,7 +459,7 @@ func TestImportConfigBackup_normalizesNullHealthCheckTimeout(t *testing.T) {
 	}
 }
 
-// 历史问题-02（历史）：导入同时替换 CRS 规则树时，策略的组号/规则 ID
+// 导入同时替换 CRS 规则树时，策略的组号/规则 ID
 // 存在性不得按导入前 live 索引判定（基准不同代）——降级为形状校验并进警告。
 // 对照：纯 JSON 备份（不替换规则树）仍按 live 索引 400。
 func TestValidateImport_crsTreeReplacementSkipsLiveIndexExistence(t *testing.T) {
@@ -472,7 +472,7 @@ func TestValidateImport_crsTreeReplacementSkipsLiveIndexExistence(t *testing.T) 
 
 	// 对照：纯 JSON 备份不携带 CRS 文件 → 按 live 索引（测试环境无规则目录）
 	// 判「规则组不存在」。
-	plain := r78PostValidate(t, h, []byte(backupJSON))
+	plain := postValidateBytes(t, h, []byte(backupJSON))
 	if plain.Valid || !strings.Contains(plain.Error, "规则组不存在于当前 CRS") {
 		t.Fatalf("plain json valid=%v error=%q, want invalid 且点名组号不存在", plain.Valid, plain.Error)
 	}
@@ -484,7 +484,7 @@ func TestValidateImport_crsTreeReplacementSkipsLiveIndexExistence(t *testing.T) 
 	if err != nil {
 		t.Fatalf("buildLbbakPayload: %v", err)
 	}
-	response := r78PostValidate(t, h, payload)
+	response := postValidateBytes(t, h, payload)
 	if !response.Valid {
 		t.Fatalf("lbbak preview valid=false error=%q, want valid (live 索引不参与判定)", response.Error)
 	}

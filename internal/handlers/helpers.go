@@ -60,7 +60,7 @@ type CertificateInfo struct {
 	NotAfter        string `json:"not_after"`
 	DaysUntilExpiry int    `json:"days_until_expiry"`
 	Warning         string `json:"warning,omitempty"`
-	// 历史问题（历史）：原 Error 字段在本包零赋值点（恒空契约噪音），已删除
+	// 原 Error 字段在本包零赋值点（恒空契约噪音），已删除
 	// ——解析失败走 4xx message，前端自备错误通道。
 }
 
@@ -109,7 +109,7 @@ func parseTLSCertificate(certPEM, keyPEM string) (*CertificateInfo, error) {
 	info.Valid = true
 	info.Domain = domain
 	info.Issuer = issuer
-	// 历史修复（历史）：x509 时间为 UTC，直出会比配置时区少一天
+	// x509 时间为 UTC，直出会比配置时区少一天
 	// （如 Asia/Shanghai 凌晨到期的证书显示前一天）——按配置时区渲染，
 	// 与规则证书卡 formatDate 口径对齐。
 	info.NotBefore = x509Cert.NotBefore.In(services.CurrentLocation()).Format("2006-01-02")
@@ -126,7 +126,7 @@ func parseTLSCertificate(certPEM, keyPEM string) (*CertificateInfo, error) {
 		info.Warning = fmt.Sprintf("证书尚未生效 (生效时间: %s)", x509Cert.NotBefore.In(services.CurrentLocation()).Format("2006-01-02"))
 	}
 
-	// 公钥等价比较（历史修复，历史）：原实现按 *rsa.PublicKey/*ecdsa.PublicKey
+	// 公钥等价比较：原实现按 *rsa.PublicKey/*ecdsa.PublicKey
 	// 白名单分型——Ed25519（内部 CA/自签常用，tls.X509KeyPair 与 Caddy 均支持）
 	// 被硬拒 400，面板支持面比引擎更窄。改为 crypto.Signer.Public() + PKIX 字节
 	// 比较（同类型同参数编码恒等，跨类型/不同密钥恒不等），保留「类型不可用」
@@ -155,7 +155,7 @@ func parseTLSCertificate(certPEM, keyPEM string) (*CertificateInfo, error) {
 // (与 systemMetricsReadFile 同款测试隔离约定)。
 var tlsCertSystemRoots = x509.SystemCertPool
 
-// tlsCertificateWarnings(历史修复)对手动 TLS 证书做「不阻断」质量检查:
+// tlsCertificateWarnings对手动 TLS 证书做「不阻断」质量检查
 //  1. 链完整性——系统根 + PEM 内中间证书 x509.Verify,unknown authority 类
 //     失败说明链可能不完整(浏览器/严格客户端将握手失败);
 //  2. 域名覆盖——domain 非空且证书 DNSNames/CN 不覆盖(含通配符语义,
@@ -193,7 +193,7 @@ func tlsCertificateWarnings(certPEM, keyPEM, domain string) []string {
 			}
 		}
 	}
-	// 历史问题（历史）：有效期同样以非阻断警告呈现——过期/未生效的自
+	// 有效期同样以非阻断警告呈现——过期/未生效的自
 	// 手动证书允许先落库后轮换（管理面板 TLS 上传仍硬拒），但保存/导入审计
 	// 与响应 warnings 必须显式可见。此前 parseTLSCertificate 已算出 Warning，
 	// 规则保存路径却丢弃未用。
@@ -218,7 +218,7 @@ func tlsCertificateWarnings(certPEM, keyPEM, domain string) []string {
 
 // tlsCertCoversDomain 判定证书是否覆盖域名:优先标准 SAN 校验(Go 内建通配
 // 语义);仅当证书完全没有 SAN（DNS/IP/Email/URI 均为空）时才回退 CN 精确/
-// 单段通配匹配。历史修复：有 SAN 的现代证书以 SAN 为准（RFC 6125），CN 回退
+// 单段通配匹配。有 SAN 的现代证书以 SAN 为准（RFC 6125），CN 回退
 // 会抑制「SAN 不覆盖但 CN 恰好覆盖」的域名不匹配警告，而客户端仍握手失败。
 // 比较小写化。
 func tlsCertCoversDomain(cert *x509.Certificate, domain string) bool {
@@ -246,7 +246,7 @@ func tlsWildcardMatch(pattern, domain string) bool {
 }
 
 // dialOutboundIP 探测本机出口 IP（UDP dial 不写包，仅借路由决策读本地地址）。
-// 探测失败或地址类型意外（历史修复：原 unchecked type assertion）
+// 探测失败或地址类型意外（原 unchecked type assertion）
 // 回退 127.0.0.1 并返回 ok=false——单源实现，cluster_mode.go（需 ok 位做
 // 审计点名）与本函数（系统信息展示）共用。
 func dialOutboundIP() (string, bool) {
@@ -816,7 +816,7 @@ func (index prometheusMetricsIndex) ruleMetrics(target ruleMetricTarget) gin.H {
 	// 2026-09-15 用户裁定:caddy_id 直接匹配(lb_rule_metrics)——优先;
 	// 域名匹配兜底(未升级插件的形态/过渡期)。
 	if target.ruleID != "" {
-		// 历史问题(历史问题,历史):插件已升级(ruleMetricsByRule 全局非空)
+		// 插件已升级(ruleMetricsByRule 全局非空)
 		// 时本规则缺序列=零流量,返回空而非域名兜底(兜底在同裸域名多端口
 		// 拓扑下跨规则串流量;兜底仅在插件未升级(全局空)时启用)。
 		if len(index.ruleMetricsByRule) > 0 {
@@ -826,7 +826,7 @@ func (index prometheusMetricsIndex) ruleMetrics(target ruleMetricTarget) gin.H {
 			return emptyRuleMetrics() // 本规则零流量(插件已升级,无序列)
 		}
 		// 插件未升级（map 全局为空）：无 rule 级序列可查，落空返回上层兜底
-		// （历史修复：此处曾有「空 map 查找」死分支，已删）。
+		// （此处曾有「空 map 查找」死分支，已删）。
 	}
 	if target.domain == "" {
 		return emptyRuleMetrics()
@@ -849,7 +849,7 @@ func (index prometheusMetricsIndex) ruleMetrics(target ruleMetricTarget) gin.H {
 	return result.ruleMetrics(true)
 }
 
-// tcpRuleMetrics 按上游地址归集 TCP 单规则指标（历史问题 口径声明）：
+// tcpRuleMetrics 按上游地址归集 TCP 单规则指标
 // caddy-l4 v0.1.2 的 L4 指标（caddy_layer4_proxy_connections_total /
 // active_connections / upstream_healthy）标签仅 []string{"upstream"}
 // （模块源码 modules/l4proxy/metrics.go:57-75 实证）——无 server/listener/
@@ -981,7 +981,7 @@ func (index *prometheusMetricsIndex) addSample(sample prometheusSample) {
 
 	if rule := services.ExtractMetricLabel(name, "rule"); rule != "" {
 		if strings.HasPrefix(name, "lazybalancer_security_blocked_total{") {
-			// 历史问题(历史问题,历史):blocked-only 样本不建 ruleMetricsByRule
+			// blocked-only 样本不建 ruleMetricsByRule
 			// 空聚合——否则过渡形态(插件未升级)下 ruleMetrics early return 空,
 			// 架空域名兜底。blocked 仅记 blockedByRule。
 			index.blockedByRule[rule] += int64(value)
@@ -1082,7 +1082,7 @@ func parseHostMetricsFromSamples(samples []prometheusSample) []models.HostMetric
 	return buildPrometheusMetricsIndex(samples).hostMetrics()
 }
 
-// 指标 label 抽取统一走 services.ExtractMetricLabel（LBS/历史修复：
+// 指标 label 抽取统一走 services.ExtractMetricLabel（LBS/
 // 本包原 extractLabel 与 services extractMetricLabel 逐字重复，收敛为跨包单源）。
 
 func parseTCPRuleMetricsFromPrometheus(body string, upstreams []models.Upstream) (gin.H, error) {
@@ -1097,7 +1097,7 @@ func parseTCPRuleMetricsFromSamples(samples []prometheusSample, upstreams []mode
 	return buildPrometheusMetricsIndex(samples).tcpRuleMetrics(upstreams)
 }
 
-// deductBlockedFrom4xx 从 4xx 计数扣除安全拦截并钳制 ≥0(历史审计 历史修复:
+// deductBlockedFrom4xx 从 4xx 计数扣除安全拦截并钳制 ≥0(历史
 // Dashboard 与 GetRuleMetrics 两处逐字复制提为共享函数)。
 func deductBlockedFrom4xx(metrics gin.H, blocked int64) {
 	if s4, ok := metrics["status_4xx"].(int64); ok && blocked > 0 {
@@ -1109,7 +1109,7 @@ func deductBlockedFrom4xx(metrics gin.H, blocked int64) {
 	}
 }
 
-func parseRuleMetricsFromPrometheus(body, domain string, listenPort int, enableTLS bool, ruleCaddyID ...string) (gin.H, error) { // 历史问题:protocol 死参移除
+func parseRuleMetricsFromPrometheus(body, domain string, listenPort int, enableTLS bool, ruleCaddyID ...string) (gin.H, error) { // protocol 死参移除
 	samples, err := parsePrometheusSamples(body)
 	if err != nil {
 		return nil, err
@@ -1120,7 +1120,7 @@ func parseRuleMetricsFromPrometheus(body, domain string, listenPort int, enableT
 		target.ruleID = ruleCaddyID[0]
 	}
 	result := index.ruleMetrics(target)
-	// 历史问题(历史审计):GET /metrics/rule/:caddy_id 与仪表盘同口径——
+	// GET /metrics/rule/:caddy_id 与仪表盘同口径——
 	// 加 blocked 并扣 4xx(钳制 ≥0);ruleCaddyID 为空时(TCP)跳过。
 	if len(ruleCaddyID) > 0 && ruleCaddyID[0] != "" {
 		blocked := index.blockedByRule[ruleCaddyID[0]]
@@ -1130,7 +1130,7 @@ func parseRuleMetricsFromPrometheus(body, domain string, listenPort int, enableT
 	return result, nil
 }
 
-// tailLogWindow 截断尾读日志窗口的首行残段（历史修复 语义，历史修复
+// tailLogWindow 截断尾读日志窗口的首行残段（语义，
 // 抽享——此前同一逻辑在 GetAppLogs/GetCaddyLogs 两份实现，历史只收敛了
 // system.go，caddy.go 漏网）：startOffset 非零时窗口首字节可能落在某行中段
 // （切在多字节 rune 中间时残段带无效字节，JSON 编码后以 U+FFFD 污染输出），
@@ -1240,7 +1240,7 @@ func isValidDomain(domain string) bool {
 			return false
 		}
 		for _, c := range part {
-			// 历史问题-6：删 c=='.'——part 来自 Split(domain, ".") 的产物，恒不含 '.'。
+			// 删 c=='.'——part 来自 Split(domain, ".") 的产物，恒不含 '.'。
 			if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
 				return false
 			}

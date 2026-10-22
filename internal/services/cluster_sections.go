@@ -25,7 +25,7 @@ type syncSection struct {
 
 var syncSections = []syncSection{
 	// 系统数据排第一(2026-09-11 裁定):恒同步不可禁用,含用户/密钥/ACME
-	// 与全局配置(证书任务行与文件随 rules 开关,历史修复)。
+	// 与全局配置(证书任务行与文件随 rules 开关）。
 	{Key: "users", NewLabel: "系统数据"},
 	{Key: "rules", NewLabel: "负载均衡规则"},
 	{Key: "security", NewLabel: "安全防护"},
@@ -76,7 +76,7 @@ func sectionPayloadFor(key string, s *models.ClusterSnapshot) interface{} {
 		// 字段顺序是哈希输入的一部分，主从同构建共享本定义，勿单独调整。
 		// 三分类合并勘误(2026-09-19):WafFiles ref 不进本节哈希——ref 入哈希后,
 		// 文件拉取持续失败的从节点 security 节哈希在「主端 ref 域/本地 ref 域」
-		// 间永久乒乓(每两轮一次无退避全量重拉),击穿 历史问题 兜底重拉降频;文件态
+		// 间永久乒乓(每两轮一次无退避全量重拉),击穿兜底重拉降频;文件态
 		// 漂移由 wafFilesDrifted 专用通道(含退避与标签自愈)独占,版本行与文件
 		// 差量通道随安全防护开关(cluster_apply.go/cluster_sync.go)。
 		return struct {
@@ -111,7 +111,7 @@ func sectionPayloadFor(key string, s *models.ClusterSnapshot) interface{} {
 // 端点写入，不进快照与节哈希）：users 节重放时由 replaceSnapshotTx 读出并在
 // 回插后回写保留，重放不会解锁从节点被锁账户。
 // 注意：mfa_enabled/mfa_secret/mfa_recovery_codes 是主节点权威字段，不清零
-// （其漂移检测配合 历史问题 的触发器补列，保证管理员重置等安全操作正常传播）。
+// （其漂移检测配合 触发器补列，保证管理员重置等安全操作正常传播）。
 func sanitizeUsersForHash(users []models.ClusterUser) []models.ClusterUser {
 	if len(users) == 0 {
 		return users
@@ -139,7 +139,7 @@ func sanitizeAPIKeysForHash(keys []models.ClusterAPIKey) []models.ClusterAPIKey 
 	return out
 }
 
-// SyncSwitches 是节点本地同步开关集(读取见 readSyncSwitches,历史问题:此前注释引用不存在的 LoadSyncSwitches 且口径写错)。
+// SyncSwitches 是节点本地同步开关集(读取见 readSyncSwitches,:此前注释引用不存在的 LoadSyncSwitches 且口径写错)。
 // 三分类合并后仅剩 users(恒 true)/rules/security 三开关。
 type SyncSwitches struct {
 	Users    bool
@@ -162,7 +162,7 @@ func (sw SyncSwitches) sectionEnabled(key string) bool {
 
 // readSyncSwitches reads the node-local sync switches (defaults all-on for
 // missing columns/rows, e.g. pre-migration databases). ctx 由调用方直传
-// （历史修复：不再内部 context.Background()，保持本包 ctx 透传约定
+// （不再内部 context.Background()，保持本包 ctx 透传约定
 // ——快照构建可随调用方取消）。
 func readSyncSwitches(ctx context.Context, dbh interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
@@ -171,7 +171,7 @@ func readSyncSwitches(ctx context.Context, dbh interface {
 	if dbh == nil {
 		return sw, nil
 	}
-	// 历史问题(历史):sync_users 子查询已删——恒同步裁定下 sw.Users
+	// sync_users 子查询已删——恒同步裁定下 sw.Users
 	// 恒 true(读取/赋值成死代码);无 FROM 的子查询标量 SELECT 恒返回 1 行,
 	// ErrNoRows 分支不可达,一并收敛。三分类合并(2026-09-19)后
 	// sync_global_config/sync_waf_files 列已物理删除,读取只剩 rules/security。
@@ -349,9 +349,9 @@ func recordAppliedSectionHashes(dbh *sql.DB, snapshot models.ClusterSnapshot, sk
 		}
 		// 漂移节已被强制重放、本地数据镜像主节点：落本地重建口径哈希作为
 		// 稳定参照（见 applySnapshot 调用点注释）；本地哈希缺失回退快照侧。
-		// 代价如实化（历史问题）：同构建常态下每次漂移会多 1 轮全量重拉才收敛
+		// 代价如实化：同构建常态下每次漂移会多 1 轮全量重拉才收敛
 		//（本轮强制重放+落本地口径，下轮起哈希一致走跳过）——这是有意取舍，
-		// 历史修复问题 的跨构建漂移防护优先于省一轮重拉。
+		// 问题 的跨构建漂移防护优先于省一轮重拉。
 		if sk.wasDrifted(sec.Key) {
 			if lh, lok := localHashes[sec.Key]; lok && lh != "" {
 				h = lh
@@ -366,7 +366,7 @@ func recordAppliedSectionHashes(dbh *sql.DB, snapshot models.ClusterSnapshot, sk
 	// 三分类合并·方案A(2026-09-19 裁定):文件态记账落 global_config 专用列
 	// (applied_waf_ref_hash=纯 ref 哈希含版本标签,applied_waf_ref_version=
 	// 告警去重版本)——cluster_applied_sections 严格 3 行与 syncSections
-	// 同构;wafFilesDrifted 的 304 兜底重拉与 历史问题 标签自愈依赖该记录。
+	// 同构;wafFilesDrifted 的 304 兜底重拉与标签自愈依赖该记录。
 	// 随安全防护开关写入/冻结(节哈希、上报与 hover 均不包含文件态)。
 	if switches.Security {
 		refHash := wafFilesNullRefHash
@@ -385,7 +385,7 @@ func recordAppliedSectionHashes(dbh *sql.DB, snapshot models.ClusterSnapshot, sk
 // whose master references newer CRS/IP2Region files (file state follows the
 // security switch after the 3-category merge).
 func logSyncSwitchGuards(dbh *sql.DB, snapshot models.ClusterSnapshot, sk *sectionSkips, switches SyncSwitches) {
-	// 历史问题：告警对象是「开关关闭导致 WAF 文件滞后」的从节点——开关开启时
+	// 告警对象是「开关关闭导致 WAF 文件滞后」的从节点——开关开启时
 	// applySnapshot 随即拉取文件，无滞后可告。三分类合并后判定挂 security
 	// 开关(waf_files 不再是同步节,sk.disabled 只含 3 节键);dedup 记账走
 	// global_config.applied_waf_ref_version(方案A 列;security 关闭时
@@ -406,7 +406,7 @@ func logSyncSwitchGuards(dbh *sql.DB, snapshot models.ClusterSnapshot, sk *secti
 		return
 	}
 	RecordAuditLog("system", "同步警告", "集群同步", "检测到主节点 CRS/IP2Region 文件已更新（同步开关关闭），本地文件保持不变", "")
-	// 历史问题:告警后只推进去重版本(哈希不动——security 关闭时哈希列不被
+	// 告警后只推进去重版本(哈希不动——security 关闭时哈希列不被
 	// 消费),保证每版本 bump 至多一条告警。
 	if dbh != nil {
 		_, _ = dbh.Exec(`UPDATE global_config SET applied_waf_ref_version=? WHERE id=1`, snapshot.Version)

@@ -59,7 +59,7 @@ func servingLines(log string) []string {
 }
 
 // seedServingNode 种子一个从节点；interval 写 global_config.sync_interval（真实
-// 上报周期，历史问题-01 起巡检阈值随它）——nodes.sync_interval 是写侧从不写的死列
+// 上报周期， 起巡检阈值随它）——nodes.sync_interval 是写侧从不写的死列
 // （schema 默认 60），此前种子它掩盖了阈值钉死 120s 的 bug。
 func seedServingNode(t *testing.T, name, lastSeenUTC string, version, interval int) int64 {
 	t.Helper()
@@ -147,7 +147,7 @@ func TestTaskEngineWire_ClusterSyncRoleFlipGenerations(t *testing.T) {
 		t.Fatal("主节点不应触碰从节点同步挂钩（主分支=巡检）")
 	}
 
-	// demote 必须同时落库（历史问题-1 角色对账按 DB 修正引擎）：仅 SetRole(false)
+	// demote 必须同时落库（角色对账按 DB 修正引擎）：仅 SetRole(false)
 	// 而 DB 仍为主节点时，对账会在测试窗口内把引擎翻回主角色（换代竞态）。
 	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
 		t.Fatal(err)
@@ -175,7 +175,7 @@ func TestTaskEngineWire_ClusterSyncRoleFlipGenerations(t *testing.T) {
 func TestMasterServingRound_offlineWarnsOnce(t *testing.T) {
 	// 合成轮测试用轻量环境（不启动 daemon）——live 引擎的 cluster-sync daemon
 	// 以真实时间巡检，seed 的旧 last_seen 必触发离线 WARN 污染合成轮断言
-	//（历史期实证：RoleFlip 邻接形态下双 WARN/零日志断言被打穿）。
+	//（实证：RoleFlip 邻接形态下双 WARN/零日志断言被打穿）。
 	newServingTestEnv(t)
 	seedServingNode(t, "edge-a", servingBase.Add(-10*time.Minute).UTC().Format("2006-01-02 15:04:05"), 3, 60)
 	w := newServingWatch()
@@ -194,7 +194,7 @@ func TestMasterServingRound_offlineWarnsOnce(t *testing.T) {
 	}
 }
 
-// 历史问题-01（历史）：巡检离线阈值须跟随 global_config.sync_interval
+// 巡检离线阈值须跟随 global_config.sync_interval
 // （与 cluster_sync 同口径）——此前读 nodes.sync_interval 死列（写侧从不写，
 // schema 默认 60），阈值钉死 2×60=120s，interval>120s 部署逐轮误报离线。
 func TestMasterServingRound_offlineThresholdFollowsGlobalSyncInterval(t *testing.T) {
@@ -235,7 +235,7 @@ func TestMasterServingRound_offlineThresholdFollowsGlobalSyncInterval(t *testing
 func TestMasterServingRound_cleanRoundsSilent(t *testing.T) {
 	// 合成轮测试用轻量环境（不启动 daemon）——live 引擎的 cluster-sync daemon
 	// 以真实时间巡检，seed 的旧 last_seen 必触发离线 WARN 污染合成轮断言
-	//（历史期实证：RoleFlip 邻接形态下双 WARN/零日志断言被打穿）。
+	//（实证：RoleFlip 邻接形态下双 WARN/零日志断言被打穿）。
 	newServingTestEnv(t)
 	seedServingNode(t, "edge-a", servingBase.Add(-10*time.Second).UTC().Format("2006-01-02 15:04:05"), 3, 3600)
 	w := newServingWatch()
@@ -361,7 +361,7 @@ func TestTaskEngineWire_CertIssuanceSlaveShowsLocalState(t *testing.T) {
 	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status) VALUES ('r1','a.test','pending')`); err != nil {
 		t.Fatal(err)
 	}
-	// DB 从角色先落库（历史问题-1 对账按 DB 修正引擎，避免等待窗口被翻回主）。
+	// DB 从角色先落库（对账按 DB 修正引擎，避免等待窗口被翻回主）。
 	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}

@@ -155,7 +155,7 @@ func generateTestCert(domain string, notBefore, notAfter time.Time) (certPEM, ke
 		BasicConstraintsValid: true,
 	}
 
-	// 历史修复 the certificate
+	// the certificate
 	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
 	if err != nil {
 		return "", "", err
@@ -225,7 +225,7 @@ func generateECDSACert(domain string, notBefore, notAfter time.Time) (certPEM, k
 	return certPEM, keyPEM, nil
 }
 
-// generateEd25519Cert creates an Ed25519 certificate（历史修复：内部 CA/自签
+// generateEd25519Cert creates an Ed25519 certificate（内部 CA/自签
 // 常用密钥类型，tls.X509KeyPair 与 Caddy 均支持）。
 func generateEd25519Cert(domain string, notBefore, notAfter time.Time) (certPEM, keyPEM string, err error) {
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
@@ -308,7 +308,7 @@ func TestParseTLSCertificate(t *testing.T) {
 			wantErr:     false,
 		},
 		{
-			// 历史修复（历史）：只断言本包自有的错误文案（"invalid certificate
+			// 只断言本包自有的错误文案（"invalid certificate
 			// or key pair"），不钉 Go 标准库 crypto/tls 的措辞——小版本改写错误串
 			// 不得误红，也不得让「配对检测坏了」与「引擎文案变了」混为一谈。
 			name:        "mismatched cert and key",
@@ -322,7 +322,7 @@ func TestParseTLSCertificate(t *testing.T) {
 			wantErr:    false,
 		},
 		{
-			// 历史修复（历史）：Ed25519 手动证书此前被公钥类型白名单硬拒
+			// Ed25519 手动证书此前被公钥类型白名单硬拒
 			// （"unsupported public key type in certificate"）——面板比引擎更窄。
 			name:       "valid Ed25519 certificate",
 			wantValid:  true,

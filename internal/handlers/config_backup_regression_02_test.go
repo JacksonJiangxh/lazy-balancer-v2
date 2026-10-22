@@ -2,18 +2,18 @@ package handlers
 
 //
 // 覆盖：
-//   历史修复 布尔列枚举补 5 项 + PRAGMA/语义列对照钉测
-//   历史修复 导出包体携带 sections，还原按包体分类过滤
-//   历史修复 auto backup 设置组导入门（frequency/HH:MM/day/keep/sections）
-//   历史修复 校验顺序=完整性→sections 过滤→行级门
-//   历史修复 冲突矩阵分桶预计算等价性
-//   历史修复 legacy（v1 仅 tables 校验和）早退改为标志位，后置门照常执行
-//   历史修复/03 lbbak 文件落盘失败/坏 xdb → 版本记录丢弃 + 响应明示
-//   历史修复 commit 后 ApplyLogLevel + admin TLS 重启提示
-//   历史修复 运行期设置门（timezone/坐标/枚举/超时/default_ca）
-//   历史修复 导入 off→on 水位线
-//   历史修复 sections 并集 == configBackupTables
-//   历史修复 cert_renewal_days 导入下界 1
+//   布尔列枚举补 5 项 + PRAGMA/语义列对照钉测
+//   导出包体携带 sections，还原按包体分类过滤
+//   auto backup 设置组导入门（frequency/HH:MM/day/keep/sections）
+//   校验顺序=完整性→sections 过滤→行级门
+//   冲突矩阵分桶预计算等价性
+//   legacy（v1 仅 tables 校验和）早退改为标志位，后置门照常执行
+//   /03 lbbak 文件落盘失败/坏 xdb → 版本记录丢弃 + 响应明示
+//   commit 后 ApplyLogLevel + admin TLS 重启提示
+//   运行期设置门（timezone/坐标/枚举/超时/default_ca）
+//   导入 off→on 水位线
+//   sections 并集 == configBackupTables
+//   cert_renewal_days 导入下界 1
 
 import (
 	"encoding/json"
@@ -30,8 +30,8 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// r78BackupJSON 构造 v2 备份体（可注入 sections），checksum 按 {tables,config}。
-func r78BackupJSON(t *testing.T, tables map[string][]map[string]any, cfg map[string]any, sections []string) string {
+// legacyBackupJSON 构造 v2 备份体（可注入 sections），checksum 按 {tables,config}。
+func legacyBackupJSON(t *testing.T, tables map[string][]map[string]any, cfg map[string]any, sections []string) string {
 	t.Helper()
 	completeTables := map[string][]map[string]any{}
 	for _, table := range configBackupTables {
@@ -58,7 +58,7 @@ func r78BackupJSON(t *testing.T, tables map[string][]map[string]any, cfg map[str
 	return string(data)
 }
 
-// ── 历史修复：布尔列枚举补项 + PRAGMA/语义列对照 ──
+// ──：布尔列枚举补项 + PRAGMA/语义列对照 ──
 
 // 语义 0/1 列（PRAGMA 声明为 INTEGER，无法按 BOOLEAN 类型识别）——新增列须
 // 同步本清单与 backupBooleanTableColumns（本测试即两处漂移的机械拦截点）。
@@ -167,7 +167,7 @@ func TestValidateV2Backup_newlyEnumeratedBooleanColumnsRejectStrings(t *testing.
 			}
 			row[tc.column] = "true"
 			var backup configBackup
-			if err := json.Unmarshal([]byte(r78BackupJSON(t, map[string][]map[string]any{tc.table: {row}}, nil, nil)), &backup); err != nil {
+			if err := json.Unmarshal([]byte(legacyBackupJSON(t, map[string][]map[string]any{tc.table: {row}}, nil, nil)), &backup); err != nil {
 				t.Fatalf("unmarshal: %v", err)
 			}
 			_, err := validateV2Backup(backup)
@@ -178,7 +178,7 @@ func TestValidateV2Backup_newlyEnumeratedBooleanColumnsRejectStrings(t *testing.
 	}
 	t.Run("global_config.auto_backup_enabled", func(t *testing.T) {
 		var backup configBackup
-		if err := json.Unmarshal([]byte(r78BackupJSON(t, nil, map[string]any{"auto_backup_enabled": "true"}, nil)), &backup); err != nil {
+		if err := json.Unmarshal([]byte(legacyBackupJSON(t, nil, map[string]any{"auto_backup_enabled": "true"}, nil)), &backup); err != nil {
 			t.Fatalf("unmarshal: %v", err)
 		}
 		_, err := validateV2Backup(backup)
@@ -188,7 +188,7 @@ func TestValidateV2Backup_newlyEnumeratedBooleanColumnsRejectStrings(t *testing.
 	})
 }
 
-// ── 历史修复：导出包体携带 sections；还原按包体过滤 ──
+// ──：导出包体携带 sections；还原按包体过滤 ──
 
 func TestBuildLbbakExport_writesSectionsAndScopedRestore(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -241,7 +241,7 @@ func TestBuildLbbakExport_writesSectionsAndScopedRestore(t *testing.T) {
 	}
 }
 
-// ── 历史修复：auto backup 设置组导入门 ──
+// ──：auto backup 设置组导入门 ──
 
 func TestImportAutoBackupSettings_gatePreviewAndImport(t *testing.T) {
 	type tc struct {
@@ -266,15 +266,15 @@ func TestImportAutoBackupSettings_gatePreviewAndImport(t *testing.T) {
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
 			h := newBackupTestHandlers(t)
-			body := r78BackupJSON(t, nil, tt.cfg, nil)
-			preview := r78ValidateResponse(t, h, body)
+			body := legacyBackupJSON(t, nil, tt.cfg, nil)
+			preview := validateResponseShared(t, h, body)
 			if preview.Valid != tt.previewOK {
 				t.Fatalf("preview.Valid=%v err=%q, want %v", preview.Valid, preview.Error, tt.previewOK)
 			}
 			if !tt.previewOK && !strings.Contains(preview.Error, tt.errContain) {
 				t.Fatalf("preview error=%q, want contains %q", preview.Error, tt.errContain)
 			}
-			rec := r78Import(h, t, body)
+			rec := importBackupShared(h, t, body)
 			if rec.Code != tt.code {
 				t.Fatalf("import status=%d body=%s, want %d", rec.Code, rec.Body.String(), tt.code)
 			}
@@ -292,7 +292,7 @@ func TestImportAutoBackupSettings_gatePreviewAndImport(t *testing.T) {
 	}
 }
 
-// ── 历史修复：完整性 → sections 过滤 → 行级门 ──
+// ──：完整性 → sections 过滤 → 行级门 ──
 
 func TestBackupValidationOrder_sectionsBeforeRowGates(t *testing.T) {
 	badSecurity := map[string][]map[string]any{
@@ -300,15 +300,15 @@ func TestBackupValidationOrder_sectionsBeforeRowGates(t *testing.T) {
 	}
 	t.Run("未选分类携带畸形布尔：预览/导入放行", func(t *testing.T) {
 		h := newBackupTestHandlers(t)
-		body := r78BackupJSON(t, badSecurity, nil, []string{"rules"})
-		if preview := r78ValidateResponse(t, h, body); !preview.Valid {
+		body := legacyBackupJSON(t, badSecurity, nil, []string{"rules"})
+		if preview := validateResponseShared(t, h, body); !preview.Valid {
 			t.Fatalf("preview.Valid=false err=%q, want true（未选分类行不参与行级门）", preview.Error)
 		}
 		h2 := newBackupTestHandlers(t)
 		if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (9,'local-admin','x','admin',1)`); err != nil {
 			t.Fatal(err)
 		}
-		if rec := r78Import(h2, t, body); rec.Code != http.StatusOK {
+		if rec := importBackupShared(h2, t, body); rec.Code != http.StatusOK {
 			t.Fatalf("import status=%d body=%s, want 200", rec.Code, rec.Body.String())
 		}
 	})
@@ -317,18 +317,18 @@ func TestBackupValidationOrder_sectionsBeforeRowGates(t *testing.T) {
 		badRules := map[string][]map[string]any{
 			"lb_rules": {{"name": "r", "protocol": "http", "domain": "a.com", "listen_port": 80, "ntlm_compatible": "true"}},
 		}
-		body := r78BackupJSON(t, badRules, nil, []string{"rules"})
-		if preview := r78ValidateResponse(t, h, body); preview.Valid {
+		body := legacyBackupJSON(t, badRules, nil, []string{"rules"})
+		if preview := validateResponseShared(t, h, body); preview.Valid {
 			t.Fatal("preview.Valid=true, want false（选中分类的畸形布尔必须拒绝）")
 		}
 		h2 := newBackupTestHandlers(t)
-		if rec := r78Import(h2, t, body); rec.Code != http.StatusBadRequest {
+		if rec := importBackupShared(h2, t, body); rec.Code != http.StatusBadRequest {
 			t.Fatalf("import status=%d body=%s, want 400", rec.Code, rec.Body.String())
 		}
 	})
 	t.Run("checksum 仍对全量计算：篡改未选分类也拒绝", func(t *testing.T) {
 		h := newBackupTestHandlers(t)
-		body := r78BackupJSON(t, badSecurity, nil, []string{"rules"})
+		body := legacyBackupJSON(t, badSecurity, nil, []string{"rules"})
 		var tampered map[string]any
 		if err := json.Unmarshal([]byte(body), &tampered); err != nil {
 			t.Fatal(err)
@@ -336,17 +336,17 @@ func TestBackupValidationOrder_sectionsBeforeRowGates(t *testing.T) {
 		tables := tampered["tables"].(map[string]any)
 		tables["security_ip_lists"] = []any{map[string]any{"name": "tampered", "entries": "[]"}}
 		mutated, _ := json.Marshal(tampered)
-		if preview := r78ValidateResponse(t, h, string(mutated)); preview.Valid || !strings.Contains(preview.Error, "校验和不匹配") {
+		if preview := validateResponseShared(t, h, string(mutated)); preview.Valid || !strings.Contains(preview.Error, "校验和不匹配") {
 			t.Fatalf("preview valid=%v err=%q, want 校验和不匹配", preview.Valid, preview.Error)
 		}
 		h2 := newBackupTestHandlers(t)
-		if rec := r78Import(h2, t, string(mutated)); rec.Code != http.StatusBadRequest {
+		if rec := importBackupShared(h2, t, string(mutated)); rec.Code != http.StatusBadRequest {
 			t.Fatalf("import status=%d body=%s, want 400", rec.Code, rec.Body.String())
 		}
 	})
 }
 
-// ── 历史修复：冲突矩阵分桶预计算等价性 ──
+// ──：冲突矩阵分桶预计算等价性 ──
 
 func TestValidateRuleConflictMatrix_bucketedEquivalence(t *testing.T) {
 	candidates := []ruleConflictCandidate{
@@ -405,9 +405,9 @@ func BenchmarkValidateRuleConflictMatrix_500UniqueDomains(b *testing.B) {
 	}
 }
 
-// ── 历史修复：legacy 仅 tables 校验和路径继续执行后置门 ──
+// ──：legacy 仅 tables 校验和路径继续执行后置门 ──
 
-func r78LegacyBackup(t *testing.T, mutate func(tables map[string][]map[string]any)) string {
+func legacyBackupShared(t *testing.T, mutate func(tables map[string][]map[string]any)) string {
 	t.Helper()
 	tables := map[string][]map[string]any{}
 	for _, table := range configBackupV1Tables {
@@ -444,7 +444,7 @@ func TestValidateV2Backup_legacyStillRunsPostGates(t *testing.T) {
 		return backup
 	}
 	t.Run("合法 legacy 仍通过并标记旧校验和", func(t *testing.T) {
-		usedLegacy, err := validateV2Backup(parse(t, r78LegacyBackup(t, nil)))
+		usedLegacy, err := validateV2Backup(parse(t, legacyBackupShared(t, nil)))
 		if err != nil {
 			t.Fatalf("合法 legacy 备份不得拒绝: %v", err)
 		}
@@ -453,7 +453,7 @@ func TestValidateV2Backup_legacyStillRunsPostGates(t *testing.T) {
 		}
 	})
 	t.Run("白名单外 CA provider 拒绝", func(t *testing.T) {
-		body := r78LegacyBackup(t, func(tables map[string][]map[string]any) {
+		body := legacyBackupShared(t, func(tables map[string][]map[string]any) {
 			tables["ca_providers"] = []map[string]any{{"id": 1, "provider": "evil-ca", "credentials": "{}"}}
 		})
 		if _, err := validateV2Backup(parse(t, body)); err == nil || !strings.Contains(err.Error(), "无效的 CA 提供商") {
@@ -461,7 +461,7 @@ func TestValidateV2Backup_legacyStillRunsPostGates(t *testing.T) {
 		}
 	})
 	t.Run("自定义 directory_url 被官方常量覆写", func(t *testing.T) {
-		body := r78LegacyBackup(t, func(tables map[string][]map[string]any) {
+		body := legacyBackupShared(t, func(tables map[string][]map[string]any) {
 			tables["ca_providers"] = []map[string]any{{"id": 1, "provider": "letsencrypt", "credentials": "{}", "directory_url": "https://evil.example/acme"}}
 		})
 		backup := parse(t, body)
@@ -473,7 +473,7 @@ func TestValidateV2Backup_legacyStillRunsPostGates(t *testing.T) {
 		}
 	})
 	t.Run("非法凭证拒绝", func(t *testing.T) {
-		body := r78LegacyBackup(t, func(tables map[string][]map[string]any) {
+		body := legacyBackupShared(t, func(tables map[string][]map[string]any) {
 			tables["ca_providers"] = []map[string]any{{"id": 1, "provider": "letsencrypt", "credentials": "not-json"}}
 		})
 		if _, err := validateV2Backup(parse(t, body)); err == nil || !strings.Contains(err.Error(), "凭证格式") {
@@ -481,7 +481,7 @@ func TestValidateV2Backup_legacyStillRunsPostGates(t *testing.T) {
 		}
 	})
 	t.Run("非法证书任务状态拒绝", func(t *testing.T) {
-		body := r78LegacyBackup(t, func(tables map[string][]map[string]any) {
+		body := legacyBackupShared(t, func(tables map[string][]map[string]any) {
 			tables["cert_jobs"] = []map[string]any{{"rule_id": "x", "status": "bogus"}}
 		})
 		if _, err := validateV2Backup(parse(t, body)); err == nil || !strings.Contains(err.Error(), "无效的证书任务状态") {
@@ -489,7 +489,7 @@ func TestValidateV2Backup_legacyStillRunsPostGates(t *testing.T) {
 		}
 	})
 	t.Run("字符串布尔拒绝", func(t *testing.T) {
-		body := r78LegacyBackup(t, func(tables map[string][]map[string]any) {
+		body := legacyBackupShared(t, func(tables map[string][]map[string]any) {
 			tables["users"] = []map[string]any{{"id": 1, "username": "legacy-admin", "password_hash": "hash", "role": "admin", "is_enabled": "1"}}
 		})
 		if _, err := validateV2Backup(parse(t, body)); err == nil || !strings.Contains(err.Error(), "is_enabled") {
@@ -497,7 +497,7 @@ func TestValidateV2Backup_legacyStillRunsPostGates(t *testing.T) {
 		}
 	})
 	t.Run("无启用管理员拒绝", func(t *testing.T) {
-		body := r78LegacyBackup(t, func(tables map[string][]map[string]any) {
+		body := legacyBackupShared(t, func(tables map[string][]map[string]any) {
 			tables["users"] = []map[string]any{{"id": 1, "username": "legacy-admin", "password_hash": "hash", "role": "admin", "is_enabled": 0}}
 		})
 		if _, err := validateV2Backup(parse(t, body)); err == nil || !strings.Contains(err.Error(), "管理员") {
@@ -506,7 +506,7 @@ func TestValidateV2Backup_legacyStillRunsPostGates(t *testing.T) {
 	})
 }
 
-// ── 历史修复/03/08：waf 文件失败 → 版本记录丢弃 + 响应明示 ──
+// ── /03/08：waf 文件失败 → 版本记录丢弃 + 响应明示 ──
 
 func TestLbbakImport_badXdbRejectedKeepsLocal(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -542,7 +542,7 @@ func TestLbbakImport_badXdbRejectedKeepsLocal(t *testing.T) {
 	}
 }
 
-// 历史修复：CRS 落盘失败只能丢弃备份版本行，不得抹掉导入前的本地版本/排程；
+// CRS 落盘失败只能丢弃备份版本行，不得抹掉导入前的本地版本/排程；
 // rearm 也不得用默认种子覆盖恢复后的本地行。
 func TestLbbakImport_crsFailureRestoresLocalVersionRow(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -666,15 +666,15 @@ func TestLbbakImport_threatSourceFailureWarnsAndKeepsLocal(t *testing.T) {
 	}
 }
 
-// ── 历史修复：commit 后应用日志级别 + admin TLS 重启提示 ──
+// ──：commit 后应用日志级别 + admin TLS 重启提示 ──
 
 func TestImportConfigBackup_appliesLogLevelAndAdminTLSTip(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	services.RecordRuntimeAdminTLS(services.AdminTLSConfig{Enabled: false, Mode: "selfsigned"})
 	t.Cleanup(func() { _ = services.ConfigureLogLevel("info") })
 
-	body := r78BackupJSON(t, nil, map[string]any{"log_level": "debug", "admin_tls_enabled": 1, "admin_tls_mode": "selfsigned"}, nil)
-	rec := r78Import(h, t, body)
+	body := legacyBackupJSON(t, nil, map[string]any{"log_level": "debug", "admin_tls_enabled": 1, "admin_tls_mode": "selfsigned"}, nil)
+	rec := importBackupShared(h, t, body)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -686,7 +686,7 @@ func TestImportConfigBackup_appliesLogLevelAndAdminTLSTip(t *testing.T) {
 	}
 }
 
-// ── 历史修复：运行期设置门 ──
+// ──：运行期设置门 ──
 
 func TestImportRuntimeSettings_gate(t *testing.T) {
 	cases := []struct {
@@ -717,12 +717,12 @@ func TestImportRuntimeSettings_gate(t *testing.T) {
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
 			h := newBackupTestHandlers(t)
-			body := r78BackupJSON(t, nil, tt.cfg, nil)
-			preview := r78ValidateResponse(t, h, body)
+			body := legacyBackupJSON(t, nil, tt.cfg, nil)
+			preview := validateResponseShared(t, h, body)
 			if preview.Valid != tt.ok {
 				t.Fatalf("preview.Valid=%v err=%q, want %v", preview.Valid, preview.Error, tt.ok)
 			}
-			rec := r78Import(h, t, body)
+			rec := importBackupShared(h, t, body)
 			if tt.ok {
 				if rec.Code != http.StatusOK {
 					t.Fatalf("合法设置导入 status=%d body=%s", rec.Code, rec.Body.String())
@@ -739,15 +739,15 @@ func TestImportRuntimeSettings_gate(t *testing.T) {
 	}
 }
 
-// ── 历史修复：导入 off→on 水位线 ──
+// ──：导入 off→on 水位线 ──
 
 func TestImportConfigBackup_autobackupWatermarkOnEnable(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_enabled=0, auto_backup_last_run='2020-01-01T00:00:00Z' WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
-	body := r78BackupJSON(t, nil, map[string]any{"auto_backup_enabled": 1}, nil)
-	rec := r78Import(h, t, body)
+	body := legacyBackupJSON(t, nil, map[string]any{"auto_backup_enabled": 1}, nil)
+	rec := importBackupShared(h, t, body)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -768,7 +768,7 @@ func TestImportConfigBackup_autobackupWatermarkOnEnable(t *testing.T) {
 	}
 }
 
-// ── 历史修复：sections 并集 == configBackupTables 且无重复 ──
+// ──：sections 并集 == configBackupTables 且无重复 ──
 
 func TestConfigBackupSections_unionMatchesTables(t *testing.T) {
 	seen := map[string]string{}
@@ -790,12 +790,12 @@ func TestConfigBackupSections_unionMatchesTables(t *testing.T) {
 	}
 }
 
-// ── 历史修复：cert_renewal_days 导入下界 1 ──
+// ──：cert_renewal_days 导入下界 1 ──
 
 func TestImportConfigBackup_clampsZeroCertRenewalDays(t *testing.T) {
 	h := newBackupTestHandlers(t)
-	body := r78BackupJSON(t, nil, map[string]any{"cert_renewal_days": 0}, nil)
-	rec := r78Import(h, t, body)
+	body := legacyBackupJSON(t, nil, map[string]any{"cert_renewal_days": 0}, nil)
+	rec := importBackupShared(h, t, body)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -817,7 +817,7 @@ func countAuditLike78(t *testing.T, fragment string) int {
 	return n
 }
 
-// ── 历史修复：导入后四族规则库首槽武装（DescribeAll NextSlot 非空的行为侧） ──
+// ──：导入后四族规则库首槽武装（DescribeAll NextSlot 非空的行为侧） ──
 
 func TestImportConfigBackup_rearmsSecurityLibrarySlots(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -875,7 +875,7 @@ func TestImportConfigBackup_rearmsSecurityLibrarySlots(t *testing.T) {
 	}
 }
 
-// ── 历史修复：证书队列未排空 → 导入 409 ──
+// ──：证书队列未排空 → 导入 409 ──
 
 func TestImportConfigBackup_rejectsWhenCertDrainIncomplete(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -887,7 +887,7 @@ func TestImportConfigBackup_rejectsWhenCertDrainIncomplete(t *testing.T) {
 	// 该队列后 active 仍非空 → 返回 false。
 	services.GetCAQueueManager().MarkJobRunningForTest("rule-drain", 4242)
 
-	rec := r78Import(h, t, r78BackupJSON(t, nil, nil, nil))
+	rec := importBackupShared(h, t, legacyBackupJSON(t, nil, nil, nil))
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("status=%d body=%s, want 409（证书任务执行中）", rec.Code, rec.Body.String())
 	}
@@ -900,7 +900,7 @@ func TestImportConfigBackup_rejectsWhenCertDrainIncomplete(t *testing.T) {
 	services.InitCAQueueManager(func() error { return nil })
 	services.GetCAQueueManager().Start()
 	h2 := newBackupTestHandlers(t)
-	if rec := r78Import(h2, t, r78BackupJSON(t, nil, nil, nil)); rec.Code != http.StatusOK {
+	if rec := importBackupShared(h2, t, legacyBackupJSON(t, nil, nil, nil)); rec.Code != http.StatusOK {
 		t.Fatalf("drained import status=%d body=%s, want 200", rec.Code, rec.Body.String())
 	}
 }
@@ -914,7 +914,7 @@ func TestImportConfigBackup_rechecksACMEReferencesAfterLock(t *testing.T) {
 	if _, err := db.DB.Exec(`INSERT INTO certificate_configs (id,name,dns_provider,dns_credentials,enabled) VALUES (1,'live','dnspod','{"mode":"tencent","secret_id":"id","secret_key":"key"}',1)`); err != nil {
 		t.Fatal(err)
 	}
-	body := r78BackupJSON(t, map[string][]map[string]any{
+	body := legacyBackupJSON(t, map[string][]map[string]any{
 		"lb_rules":  {{"caddy_id": "lb_ref_toctou", "name": "toctou", "protocol": "http", "domain": "toctou.example.test", "listen_port": 18551, "enabled": 1, "enable_tls": 1, "tls_source": "acme_dns", "acme_config_id": 1}},
 		"cert_jobs": {{"rule_id": "lb_ref_toctou", "domain": "toctou.example.test", "status": "issued", "cert_pem": "CERT", "key_pem": "KEY"}},
 	}, nil, []string{"rules"})
@@ -926,7 +926,7 @@ func TestImportConfigBackup_rechecksACMEReferencesAfterLock(t *testing.T) {
 	}
 	t.Cleanup(func() { configImportBeforeLock = oldHook })
 
-	rec := r78Import(h, t, body)
+	rec := importBackupShared(h, t, body)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d body=%s, want 400 after referenced DNS config disappeared before lock", rec.Code, rec.Body.String())
 	}
@@ -946,7 +946,7 @@ func TestImportConfigBackup_liveACMEPrecheckUsesLockedView(t *testing.T) {
 		VALUES ('lb_prelock','prelock','http','prelock.example.test',18550,1,1,'acme_dns',999)`); err != nil {
 		t.Fatal(err)
 	}
-	body := r78BackupJSON(t, map[string][]map[string]any{
+	body := legacyBackupJSON(t, map[string][]map[string]any{
 		"users":               {{"id": 1, "username": "admin", "password_hash": "hash", "role": "admin", "is_enabled": 1}},
 		"certificate_configs": {},
 	}, nil, []string{"users"})
@@ -959,7 +959,7 @@ func TestImportConfigBackup_liveACMEPrecheckUsesLockedView(t *testing.T) {
 	t.Cleanup(func() { configImportBeforeLock = oldHook })
 
 	// When importing system data after that live transition.
-	rec := r78Import(h, t, body)
+	rec := importBackupShared(h, t, body)
 
 	// Then the dangling-reference warning reflects the locked import-time view.
 	if rec.Code != http.StatusOK {
@@ -979,7 +979,7 @@ func TestImportConfigBackup_versionSeedCleanupUsesLockedSnapshot(t *testing.T) {
 	if _, err := db.DB.Exec(`INSERT OR REPLACE INTO security_crs_version (id, version, auto_update) VALUES (1, 'v4.0.0', 1)`); err != nil {
 		t.Fatal(err)
 	}
-	body := r78BackupJSON(t, map[string][]map[string]any{
+	body := legacyBackupJSON(t, map[string][]map[string]any{
 		"security_threat_sources": {{"name": "ustc", "display_name": "USTC", "url": "https://example.test/list", "update_enabled": 1, "apply_enabled": 1, "next_update": ""}},
 	}, nil, []string{"security"})
 	oldHook := configImportBeforeLock
@@ -991,7 +991,7 @@ func TestImportConfigBackup_versionSeedCleanupUsesLockedSnapshot(t *testing.T) {
 	t.Cleanup(func() { configImportBeforeLock = oldHook })
 
 	// When importing another security table (which rearms the version slots).
-	rec := r78Import(h, t, body)
+	rec := importBackupShared(h, t, body)
 
 	// Then the absent unimported version row is not resurrected by rearm.
 	if rec.Code != http.StatusOK {
@@ -1009,12 +1009,12 @@ func TestImportConfigBackup_versionSeedCleanupUsesLockedSnapshot(t *testing.T) {
 func TestImportConfigBackup_globalConfigRearmsSecuritySlots(t *testing.T) {
 	// Given a pure global-config import that enables threat auto-update.
 	h := newBackupTestHandlers(t)
-	body := r78BackupJSON(t, map[string][]map[string]any{
+	body := legacyBackupJSON(t, map[string][]map[string]any{
 		"users": {{"id": 1, "username": "admin", "password_hash": "hash", "role": "admin", "is_enabled": 1}},
 	}, map[string]any{"threat_auto_update": 1}, []string{"users"})
 
 	// When importing only users/global config (no security-library tables).
-	rec := r78Import(h, t, body)
+	rec := importBackupShared(h, t, body)
 
 	// Then enabled threat sources receive a first slot and absent version rows stay absent.
 	if rec.Code != http.StatusOK {
@@ -1047,7 +1047,7 @@ func TestValidateV2Backup_rejectsMalformedTimestamps(t *testing.T) {
 		}
 	}
 	for _, bad := range []any{"", "   ", "not-a-time", int64(12345)} {
-		body := r78BackupJSON(t, map[string][]map[string]any{"users": {adminRow(bad)}}, nil, nil)
+		body := legacyBackupJSON(t, map[string][]map[string]any{"users": {adminRow(bad)}}, nil, nil)
 		var backup configBackup
 		if err := json.Unmarshal([]byte(body), &backup); err != nil {
 			t.Fatalf("unmarshal (%v): %v", bad, err)
@@ -1055,14 +1055,14 @@ func TestValidateV2Backup_rejectsMalformedTimestamps(t *testing.T) {
 		if _, err := validateV2Backup(backup); err == nil || !strings.Contains(err.Error(), "created_at") {
 			t.Fatalf("created_at=%#v err=%v, want 点名 created_at 拒绝", bad, err)
 		}
-		response := r78PostValidate(t, h, []byte(body))
+		response := postValidateBytes(t, h, []byte(body))
 		if response.Valid || !strings.Contains(response.Error, "created_at") {
 			t.Fatalf("created_at=%#v preview valid=%v error=%q, want invalid 且点名 created_at", bad, response.Valid, response.Error)
 		}
 	}
 	// 合法形态（NULL 由写入侧归一；flat/RFC3339/带毫秒）不得误拒。
 	for _, good := range []any{nil, "1970-01-01 00:00:00", "2026-10-18T00:00:00Z", "2026-10-18 00:00:00.123"} {
-		body := r78BackupJSON(t, map[string][]map[string]any{"users": {adminRow(good)}}, nil, nil)
+		body := legacyBackupJSON(t, map[string][]map[string]any{"users": {adminRow(good)}}, nil, nil)
 		var backup configBackup
 		if err := json.Unmarshal([]byte(body), &backup); err != nil {
 			t.Fatalf("unmarshal (%v): %v", good, err)
@@ -1070,7 +1070,7 @@ func TestValidateV2Backup_rejectsMalformedTimestamps(t *testing.T) {
 		if _, err := validateV2Backup(backup); err != nil {
 			t.Fatalf("created_at=%#v err=%v, want accepted", good, err)
 		}
-		if response := r78PostValidate(t, h, []byte(body)); !response.Valid {
+		if response := postValidateBytes(t, h, []byte(body)); !response.Valid {
 			t.Fatalf("created_at=%#v preview valid=false error=%q, want valid", good, response.Error)
 		}
 	}
@@ -1084,9 +1084,9 @@ func TestImportConfigBackup_replaysSystemIPListSeeds(t *testing.T) {
 		"id": 5, "name": "自动封禁名单", "description": "用户自建同名列表",
 		"category": "自定义", "entries": "[]", "system": 0,
 	}}
-	// 导入后必须有启用管理员：随包携带 users 分类（r78BackupJSON 的默认管理员行）。
-	body := r78BackupJSON(t, map[string][]map[string]any{"security_ip_lists": rows}, nil, []string{"security", "users"})
-	rec := r78Import(h, t, body)
+	// 导入后必须有启用管理员：随包携带 users 分类（legacyBackupJSON 的默认管理员行）。
+	body := legacyBackupJSON(t, map[string][]map[string]any{"security_ip_lists": rows}, nil, []string{"security", "users"})
+	rec := importBackupShared(h, t, body)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("import status=%d body=%s, want 200", rec.Code, rec.Body.String())
 	}

@@ -1,6 +1,6 @@
 package handlers
 
-// 拦截页 历史修复（2026-09-25 用户裁定）：创建/编辑可选内容类型
+// 拦截页 （2026-09-25 用户裁定）：创建/编辑可选内容类型
 // （默认 text/html; charset=utf-8，白名单=text/html、application/json、
 // application/xml、text/plain，均含 charset=utf-8）；列表新增内容类型与
 // 规则引用数（引用该页的规则去重计数=启用策略绑定 ∪ 规则级阶段覆盖）。

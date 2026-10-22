@@ -104,7 +104,7 @@ func TestConfigBackup_oldBackupWithoutNodesPreservesLocalTopology(t *testing.T) 
 	}
 }
 
-// ── 历史问题（历史）：nodes 导入行级门的
+// ──：nodes 导入行级门的
 // access_url / name+ip_address 形态，以及「存活身份键与落库 port 默认同源」。 ──
 
 func a3SeedLiveAdmin(t *testing.T) {
@@ -118,10 +118,10 @@ func a3ImportClusterRows(t *testing.T, h *Handlers, rows []map[string]any) *http
 	t.Helper()
 	a3SeedLiveAdmin(t)
 	body := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{"nodes": rows}, Config: nil, Sections: []string{"cluster"}, EmptyConfigIfNil: true})
-	return r78Import(h, t, body)
+	return importBackupShared(h, t, body)
 }
 
-func Test87_P2_01_nodesImportValidatesAccessURL(t *testing.T) {
+func TestNodesImportValidatesAccessURL(t *testing.T) {
 	base := func() map[string]any {
 		return map[string]any{"name": "edge-a", "ip_address": "10.0.0.2", "port": 8000, "protocol": "https"}
 	}
@@ -171,7 +171,7 @@ func Test87_P2_01_nodesImportValidatesAccessURL(t *testing.T) {
 	}
 }
 
-func Test87_P3_01_nodeRowsNormalizeNameAndValidateAddress(t *testing.T) {
+func TestNodeRowsNormalizeNameAndValidateAddress(t *testing.T) {
 	t.Run("名称", func(t *testing.T) {
 		cases := []struct {
 			name    string
@@ -238,7 +238,7 @@ func Test87_P3_01_nodeRowsNormalizeNameAndValidateAddress(t *testing.T) {
 	})
 }
 
-func Test87_P3_03_nodeSurvivingIdentitiesUseStoreDefaultPort(t *testing.T) {
+func TestNodeSurvivingIdentitiesUseStoreDefaultPort(t *testing.T) {
 	rows := []map[string]any{
 		{"name": "缺 port", "ip_address": "10.0.0.2"},
 		{"name": "port null", "ip_address": "10.0.0.3", "port": nil},

@@ -15,7 +15,7 @@ const initialCurrentPage: PageId =
   queryPageValid ??
   (hashPage && isPageId(hashPage) ? hashPage :
    storedCurrentPage && isPageId(storedCurrentPage) ? storedCurrentPage : 'dashboard')
-// 审计 历史修复：深链 ?page= 仅作首屏入口——消费后立即剥离并同步 localStorage，
+// 深链?page= 仅作首屏入口——消费后立即剥离并同步 localStorage，
 // 否则参数永久留在 URL 上遮蔽 hash 导航（深链标签页导航后刷新被拉回原页）。
 if (storedCurrentPage !== initialCurrentPage) localStorage.setItem('currentPage', initialCurrentPage)
 if (queryPageValid) {
@@ -33,11 +33,11 @@ interface AuthResponse {
 export const useAuthStore = defineStore('auth', () => {
   const user = ref<CurrentUser | null>(null)
   const token = ref<string | null>(localStorage.getItem('token'))
-  // 历史问题（历史）：节点模式三态化——null=未知（/config 未成功拉取），
+  // 节点模式三态化——null=未知（/config 未成功拉取），
   // 不再默认 'master'：从节点刷新+瞬时失败窗口曾按主节点 fail-open 渲染写控件。
   const nodeMode = ref<ClusterNodeMode | null>(null)
   const timezone = ref<string>('Asia/Shanghai')
-  // 历史修复：cert_renewal_days 并入 /config 消费面（CertJobs 曾挂载整取单键）；
+  // cert_renewal_days 并入 /config 消费面（CertJobs 曾挂载整取单键）；
   // ≤0（含 0）时按 30 展示，与后端口径对齐
   const certRenewalDays = ref(30)
   // 与 cert_renewal_days 同源：mfa_write_guard 随 /config 投影（Users 页曾为此
@@ -53,7 +53,7 @@ export const useAuthStore = defineStore('auth', () => {
     if (nodeMode.value === 'slave') return 'slave'
     if (user.value) {
       if (user.value.role !== 'admin') return 'non-admin'
-      // 历史问题：admin 用户但节点模式未知（/config 未成功拉取）同样按只读呈现
+      // admin 用户但节点模式未知（/config 未成功拉取）同样按只读呈现
       // （fail-closed），与下方用户信息未知窗口同口径。
       if (nodeMode.value === null) return isLoggedIn.value ? 'unknown' : null
       return null
@@ -68,7 +68,7 @@ export const useAuthStore = defineStore('auth', () => {
     if (readOnlyReason.value === 'unknown') return '信息加载中，暂以只读模式呈现'
     return ''
   })
-  // 历史修复（历史）：从节点判定单一事实源——Keys/Users/SecurityRules 曾各自
+  // 从节点判定单一事实源——Keys/Users/SecurityRules 曾各自
   // 复写 `nodeMode==='slave'`/`readOnlyReason==='slave'` 派生，收敛到本 getter。
   const isSlaveNode = computed(() => nodeMode.value === 'slave')
 
@@ -92,7 +92,7 @@ export const useAuthStore = defineStore('auth', () => {
   async function fetchUser() {
     if (!token.value) return
     try {
-      // 历史问题：静默拉取——失败态已由 15s 重试循环与 readOnlyMessage 横幅（AppLayout
+      // 静默拉取——失败态已由 15s 重试循环与 readOnlyMessage 横幅（AppLayout
       // 只读标签）持续反馈，与其余轮询体系的 silent 口径一致，不再叠加 toast 噪音。
       const res = await request.get<APIResponse<CurrentUser>>('/users/me', { silent: true })
       if (res.data) {
@@ -106,7 +106,7 @@ export const useAuthStore = defineStore('auth', () => {
           auth_provider: res.data.auth_provider ?? 'local',
         }
       } else {
-        // 历史问题：200 但 data 为空——user 仍为 null（unknown 只读窗口）且原先此处
+        // 200 但 data 为空——user 仍为 null（unknown 只读窗口）且原先此处
         // 不安排重试（静默死亡，永不恢复）。与瞬时失败同口径：定时重试拉取。
         scheduleUserRetry()
       }
@@ -121,6 +121,10 @@ export const useAuthStore = defineStore('auth', () => {
 
   let configRetryTimer: number | null = null
   let configVisibilityBound = false
+  // 在途门：visibilitychange 补查与 15s 轮询可能同时点火（回前台瞬间定时器
+  // 恰好到期），同一轮 /config 不得双发；在飞时新触发直接跳过（补查语义
+  // 已被在途轮覆盖）。
+  let configFetchInFlight = false
 
   const clearConfigRetryTimer = (): void => {
     if (configRetryTimer !== null) {
@@ -129,7 +133,7 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
-  // 历史问题：恢复可见立即补查（与 usePollingTask/useLogTailPolling 的
+  // 恢复可见立即补查（与 usePollingTask/useLogTailPolling 的
   // 「hidden 暂停 + visible 立即补拉」同范式）——15s 轮询在隐藏页被顺延，
   // 回来时不必再等一个周期。单次绑定（store 生命周期内常驻；token 已清时空转）。
   const bindConfigVisibilityRefresh = (): void => {
@@ -159,7 +163,8 @@ export const useAuthStore = defineStore('auth', () => {
   }
 
   async function fetchConfig(silent = false) {
-    if (!token.value) return
+    if (!token.value || configFetchInFlight) return
+    configFetchInFlight = true
     try {
       const res = await request.get<APIResponse<{ readonly is_master: boolean; readonly timezone?: string; readonly cert_renewal_days?: number; readonly mfa_write_guard?: boolean }>>('/config', { silent })
       if (res.data) {
@@ -176,10 +181,12 @@ export const useAuthStore = defineStore('auth', () => {
       // 瞬时失败保留最近一次已知模式，未知态由重试循环收敛（401 走全局拦截器）
       if (!(e instanceof ApiRequestError && e.status === 401)) scheduleConfigRetry()
       console.error(e)
+    } finally {
+      configFetchInFlight = false
     }
   }
 
-// 历史修复：重入护栏显式化——loading 期间的重复调用不再伪装成「登录成功」
+// 重入护栏显式化——loading 期间的重复调用不再伪装成「登录成功」
 //（原 login 重入返回 { mfaRequired:false } 与成功形态无法区分），
 // skipped:true 表示本次请求未发出，调用方应提示并中止。
 interface LoginResult {
@@ -241,7 +248,7 @@ interface LoginResult {
         is_enabled: res.user.is_enabled,
         display_name: res.user.display_name,
         mfa_enabled: res.user.mfa_enabled ?? false,
-        // 历史修复:票据登录响应携带的来源标记——缺失按本地,避免从节点 UI 误判
+        // 票据登录响应携带的来源标记——缺失按本地,避免从节点 UI 误判
         auth_provider: res.user.auth_provider ?? 'local',
       }
     }
@@ -285,7 +292,7 @@ interface LoginResult {
     }
   }
 
-  // 历史修复：token 已在客户端判定过期（或本就不存在）时，服务端吊销毫无意义——
+  // token 已在客户端判定过期（或本就不存在）时，服务端吊销毫无意义——
   // 撤销表只对仍有效的 jti 有价值，过期令牌必吃 401 并在后端认证拒绝审计记
   // 一条 jwt_expired 噪音。此路径仅做本地清理；手动登出（logout）仍走服务端吊销。
   // intentionalLogout 语义与 logout() 一致：抑制后续在途请求 401 的全局弹窗。

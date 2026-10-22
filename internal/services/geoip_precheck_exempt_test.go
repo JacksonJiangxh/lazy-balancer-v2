@@ -118,7 +118,7 @@ func TestEngineGate_allowExemptWithGeoChain(t *testing.T) {
 	compileForEngineGate(t, mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{allowPolicy, geoPolicy}, 0, "lb_test")))
 }
 
-// 历史问题（历史）：deny 并集（id:2/4）须先于 allow 交集外拒绝（id:7）
+// deny 并集（id:2/4）须先于 allow 交集外拒绝（id:7）
 // 发射——同在 deny 名单与 allow 交集外的 IP，事件归因应为「IP 黑名单拒绝」
 // （deny 侧精确策略语义）而非「IP 白名单拒绝」。拦截结果不变（同 deny+status），
 // 仅消息与归因策略修正。
@@ -152,8 +152,8 @@ func TestBuildIPPrecheckDirectives_denyPrecedesAllowDeny(t *testing.T) {
 	_ = idxBlacklist
 }
 
-// 历史修复（历史）：阶段 1 抬码形态（denyStatus=481——id:2/4 带 status:481）
-// 过 历史修复 引擎编译门禁——曾全部门禁调用恒传 0，仅编译期可见的形状错误单测拦不住。
+// 阶段 1 抬码形态（denyStatus=481——id:2/4 带 status:481）
+// 过引擎编译门禁——曾全部门禁调用恒传 0，仅编译期可见的形状错误单测拦不住。
 func TestEngineGate_precheckDirectivesWithLiftedStatus481(t *testing.T) {
 	deny := &models.SecurityPolicy{Enabled: true, IPACLMode: "deny", IPACLEnabled: true, IPACLList: `["192.0.2.0/24"]`}
 	policies := []*models.SecurityPolicy{deny}

@@ -29,10 +29,63 @@ export const section = (text: string, startMarker: string, endMarker: string): s
 }
 
 /**
+ * 去掉注释（`//`、`/* *\/`、Vue 模板 `<!-- -->`），保留字符串字面量。
+ * 死代码扫描必须先剥注释：注释里提到退役符号不构成生产消费，否则维护者被迫
+ * 改写历史说明或放宽正则。
+ */
+export const stripComments = (text: string): string => {
+  let out = ''
+  let i = 0
+  while (i < text.length) {
+    const ch = text[i]
+    const next = text[i + 1]
+    if (ch === '/' && next === '/') {
+      while (i < text.length && text[i] !== '\n') i++
+      continue
+    }
+    if (ch === '/' && next === '*') {
+      i += 2
+      while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++
+      i += 2
+      continue
+    }
+    if (ch === '<' && text.startsWith('<!--', i)) {
+      const end = text.indexOf('-->', i + 4)
+      i = end < 0 ? text.length : end + 3
+      continue
+    }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      const quote = ch
+      out += ch
+      i++
+      while (i < text.length) {
+        const c = text[i]
+        out += c
+        if (c === '\\' && i + 1 < text.length) {
+          out += text[i + 1]
+          i += 2
+          continue
+        }
+        i++
+        if (c === quote) break
+      }
+      continue
+    }
+    out += ch
+    i++
+  }
+  return out
+}
+
+/**
  * 截取成员体：从 marker 处的函数/方法声明花括号配对到收尾。
  *
  * 必须按花括号配对——固定缩进启发式（找第一个 `\n    }`）会在函数内第一个内层
  * 块收尾处截断，块内文本的 doesNotMatch 断言因此空转（假绿）。
+ *
+ * 配对必须跳过字符串/模板量/注释里的括号：`const s = '}'` 或注释里的孤立 `}`
+ * 会让切片提前收尾（后续 doesNotMatch 假绿）；孤立 `{` 则越界吞下相邻函数
+ * （match 假绿）。模板量里的 `${...}` 是表达式，其内部括号按代码计。
  *
  * 函数体起点取 marker 之后首个 `{\n`：参数表里的对象类型字面量
  * （`opts?: { a: 1 }`）后面不跟换行，不会被误认。
@@ -42,10 +95,49 @@ export const member = (text: string, marker: string): string => {
   if (start < 0) throw new Error(`missing member: ${marker}`)
   const open = text.indexOf('{\n', start)
   if (open < 0) throw new Error(`member has no body: ${marker}`)
+  type Mode = 'code' | 'line' | 'block' | 'single' | 'double' | 'template'
+  let mode: Mode = 'code'
   let depth = 0
+  // 进入模板量 `${` 时记录当前 depth；同 depth 的 `}` 返回模板量文本。
+  const templateExprDepths: number[] = []
   for (let i = open; i < text.length; i++) {
-    if (text[i] === '{') depth++
-    else if (text[i] === '}' && --depth === 0) return text.slice(start, i + 1)
+    const ch = text[i]
+    const next = text[i + 1]
+    if (mode === 'line') {
+      if (ch === '\n') mode = 'code'
+      continue
+    }
+    if (mode === 'block') {
+      if (ch === '*' && next === '/') { mode = 'code'; i++ }
+      continue
+    }
+    if (mode === 'single' || mode === 'double') {
+      const quote = mode === 'single' ? "'" : '"'
+      if (ch === '\\') i++
+      else if (ch === quote) mode = 'code'
+      continue
+    }
+    if (mode === 'template') {
+      if (ch === '\\') i++
+      else if (ch === '`') mode = 'code'
+      else if (ch === '$' && next === '{') { templateExprDepths.push(depth); mode = 'code'; i++ }
+      continue
+    }
+    if (ch === '/' && next === '/') { mode = 'line'; i++; continue }
+    if (ch === '/' && next === '*') { mode = 'block'; i++; continue }
+    if (ch === '"') { mode = 'double'; continue }
+    if (ch === "'") { mode = 'single'; continue }
+    if (ch === '`') { mode = 'template'; continue }
+    if (ch === '{') { depth++; continue }
+    if (ch === '}') {
+      if (templateExprDepths.length > 0 && templateExprDepths[templateExprDepths.length - 1] === depth) {
+        templateExprDepths.pop()
+        mode = 'template'
+        continue
+      }
+      depth--
+      if (depth === 0) return text.slice(start, i + 1)
+    }
   }
   throw new Error(`unbalanced braces in member: ${marker}`)
 }

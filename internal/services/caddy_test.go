@@ -99,6 +99,30 @@ func TestGenerateCaddyConfig_upstream_scan_error_returns_generation_failure(t *t
 	}
 }
 
+func TestGenerateCaddyConfig_defaultsNullStrategy(t *testing.T) {
+	// Given an enabled legacy row whose nullable strategy was never backfilled.
+	_, database := newClusterTestService(t)
+	seedGenerationRule(t, database, "lb_null_strategy", false)
+	if _, err := database.Exec("UPDATE lb_rules SET strategy=NULL WHERE caddy_id='lb_null_strategy'"); err != nil {
+		t.Fatalf("seed null strategy: %v", err)
+	}
+
+	// When rendering the complete configuration.
+	generated := generateCaddyConfigFromStore(database)
+
+	// Then the row uses the schema default instead of poisoning the whole render.
+	if message, failed := generated[caddyConfigGenerationErrorKey].(string); failed {
+		t.Fatalf("null strategy blocked config generation: %s", message)
+	}
+	routes := httpRoutesFromServer(t, generated, "http_8080")
+	proxy := reverseProxyHandler(t, routes[0])
+	loadBalancing := mustMap(t, proxy["load_balancing"], "load balancing")
+	selection := mustMap(t, loadBalancing["selection_policy"], "selection policy")
+	if selection["policy"] != "weighted_round_robin" {
+		t.Fatalf("selection policy=%v, want weighted_round_robin", selection["policy"])
+	}
+}
+
 func TestGenerateCaddyConfig_ignores_malformed_upstream_for_disabled_rule(t *testing.T) {
 	// Given
 	_, database := newClusterTestService(t)
@@ -192,7 +216,7 @@ func TestGenerateCaddyConfig_fail_closed_errors_do_not_call_load(t *testing.T) {
 				t.Fatal(err)
 			}
 		}, want: "decode path upstreams"},
-		// 历史问题: 原用例以 path_rules 空数组 upstreams_json='[]' 触发
+		// 原用例以 path_rules 空数组 upstreams_json='[]' 触发
 		// "generate HTTP routes" 失败——该场景现按修复语义回退主上游（与 nil 同口径，
 		// 见 TestGenerateSingleRuleCaddyConfig_pathRuleEmptyUpstreamArray_...），
 		// 改用 dynamic-DNS 双上游维持 fail-closed 校验覆盖。
@@ -1107,11 +1131,11 @@ func TestGenerateRouteObject_placesWafHandlerFirst_whenBlockingPolicyBound(t *te
 		t.Fatalf("generate routes: %v", err)
 	}
 	names := handlerChainNames(t, routes[0])
-	// 历史修复：链首是 X-LB-Rule-ID 注入（headers），waf 紧随其后
+	// 链首是 X-LB-Rule-ID 注入（headers），waf 紧随其后
 	if names[0] != "headers" {
 		t.Fatalf("chain head=%q, want headers (X-LB-Rule-ID inject) in %v", names[0], names)
 	}
-	// 新-1(历史):request_body 限额前移至 waf 之前(coraza 读体无界)
+	// 新-1:request_body 限额前移至 waf 之前(coraza 读体无界)
 	bodyIndex := indexOfHandler(names, "request_body")
 	wafIndex := indexOfHandler(names, "waf")
 	if bodyIndex > wafIndex {
@@ -1973,7 +1997,7 @@ func TestBuildCorazaDirectives_chainedCustomRuleCarriesActionsOnlyOnStarter(t *t
 	if !strings.Contains(chainLines[0], "id:10007") || !strings.Contains(chainLines[0], "deny") || !strings.Contains(chainLines[0], ",chain") {
 		t.Fatalf("starter must carry id+disruptive+chain: %s", chainLines[0])
 	}
-	// 历史修复：多条件链的 setvar 挪到末条——起始条命中而后续条件未命中时
+	// 多条件链的 setvar 挪到末条——起始条命中而后续条件未命中时
 	// coraza 已执行起始条非破坏性动作，起始条携带 setvar 会泄漏幽灵异常分。
 	if strings.Contains(chainLines[0], "setvar:") {
 		t.Fatalf("starter must not carry setvar (leaks on failed chain, 历史修复): %s", chainLines[0])
@@ -2050,7 +2074,7 @@ func TestGenerateCaddyConfig_skips_redirect_route_when_same_domain_port80_rule_e
 	})
 }
 
-// 历史问题：DynamicDNS + weighted_round_robin 不再发射 weights=[1]——Caddy 的
+// DynamicDNS + weighted_round_robin 不再发射 weights=[1]——Caddy 的
 // WeightedRoundRobinSelection 对 len(Weights)<2 早退恒选 pool[0]（不做可用性
 // 检查），流量被钉死在解析列表首个 IP、其余 A 记录零流量，首 IP 宕机时
 // try_duration 内重试全撞同一 IP 后 502。改发内建 random（按 Available() 过滤
@@ -2086,9 +2110,9 @@ func TestGenerateSingleRuleCaddyConfig_dynamicDNS_selectionPolicy(t *testing.T) 
 }
 
 func TestApplyConfig_forceReloadHeader(t *testing.T) {
-	// 历史问题：数据类更新（xdb/CRS/证书文件）不改变配置 JSON，Caddy 对字节
+	// 数据类更新（xdb/CRS/证书文件）不改变配置 JSON，Caddy 对字节
 	// 相同的 /load 短路跳过 provision（errSameConfig）——force 变体必须带
-	// 历史修复: must-revalidate 绕过短路；常规 apply 不得带（避免无谓的
+	// must-revalidate 绕过短路；常规 apply 不得带（避免无谓的
 	// 全量重载开销）。
 	var loads int
 	var lastCacheControl string
@@ -2125,8 +2149,8 @@ func TestApplyConfig_forceReloadHeader(t *testing.T) {
 }
 
 func TestApplyConfig_autoForceOnCertSnapshot(t *testing.T) {
-	// 历史问题：生成期 MaterializeCertPairs 写盘了证书文件（快照非空）
-	// 时即使调用方走常规 ApplyConfig 也必须自动带 历史修复: must-revalidate
+	// 生成期 MaterializeCertPairs 写盘了证书文件（快照非空）
+	// 时即使调用方走常规 ApplyConfig 也必须自动带: must-revalidate
 	// ——证书路径确定性意味着重传证书不改变 JSON，不强制会被 errSameConfig
 	// 短路（旧证书继续服务）。快照为空时不得强制（避免冗余全量重载）。
 	var lastCacheControl string
@@ -2160,7 +2184,7 @@ func TestApplyConfig_autoForceOnCertSnapshot(t *testing.T) {
 }
 
 func TestHttpsRedirectLocationPreservesURI(t *testing.T) {
-	// 历史问题补正：301 Location 必须携带 {http.request.uri}（path+query）——
+	// 补正：301 Location 必须携带 {http.request.uri}（path+query）——
 	// v2.1.11 首发时该修复因实施脚本断言中止丢失且无测试兜底，发布信息与代码
 	// 不一致。本断言锁定占位符在位，防止再次静默丢失。
 	for _, port := range []int{443, 8443} {
@@ -2174,7 +2198,7 @@ func TestHttpsRedirectLocationPreservesURI(t *testing.T) {
 	}
 }
 
-// 历史问题(历史):80/443 同样整体禁用 autoHTTPS——disable_certificates
+// 80/443 同样整体禁用 autoHTTPS——disable_certificates
 // 下引擎仍恒向 http_80 追加被项目落地页遮蔽的 catch-all 308(死路由+
 // superfluous WriteHeader 日志噪音+未来 terminal 化后盲导 443 的地雷);
 // 跳转完全由项目自有 redirectRoutes 管理(TLSHTTPRedirect,任意端口)。
@@ -2242,7 +2266,7 @@ func TestGenerateCaddyConfig_wafNamespaceExcludedFromServerLog(t *testing.T) {
 
 // Given 后台 Force 重载与 handler 写路径（原 caddyOpMu——现共享 CaddyOpLock）。
 // When 两类写者并发。
-// Then 全程互斥（历史问题：曾后台仅持 s.mu，apply→commit 边界混合态窗口——
+// Then 全程互斥（曾后台仅持 s.mu，apply→commit 边界混合态窗口——
 // 此处钉「同一把锁」的结构事实：Force 持锁期间 handler 侧锁必须等待）。
 func TestCaddyOpLockSharedBetweenForceAndHandlers(t *testing.T) {
 	acquired := make(chan struct{})
@@ -2275,8 +2299,8 @@ func TestCaddyOpLockSharedBetweenForceAndHandlers(t *testing.T) {
 	}
 }
 
-// 历史修复（历史问题；LBS/历史修复跨包单源）：ExtractMetricLabel
-// 边界感知收敛（历史问题 精确键匹配）——裸子串匹配会把 peer_upstream 等
+// ExtractMetricLabel
+// 边界感知收敛——裸子串匹配会把 peer_upstream 等
 // 前缀兄弟标签的值误归到 upstream（现实标签集暂无前缀兄弟，防御性收敛）。
 func TestExtractMetricLabel_boundaryAware(t *testing.T) {
 	sibling := `caddy_reverse_proxy_upstreams_healthy{peer_upstream="10.0.0.1:80",upstream="10.0.0.2:80"} 1`
@@ -2300,9 +2324,9 @@ func TestExtractMetricLabel_boundaryAware(t *testing.T) {
 	}
 }
 
-// ---- 历史（历史问题）----
+// ---- 回归钉 ----
 
-// 历史问题：候选装载阶段必须预解析 Leaf（disabled 候选除外），供
+// 候选装载阶段必须预解析 Leaf（disabled 候选除外），供
 // SelectCertificate 走快路径并供过期回退复用。
 func TestACMECertCandidatesForRule_preparses_leaf(t *testing.T) {
 	_, database := newClusterTestService(t)
@@ -2376,7 +2400,7 @@ func TestUpstreamHealthSingleflight_panicDoesNotStrandInflight(t *testing.T) {
 	})
 }
 
-// 全局链钉测试（历史问题 补齐）：global_config.server_tokens_hidden=1（全局
+// 全局链钉测试：global_config.server_tokens_hidden=1（全局
 // TRUE）→ 全量渲染为规则发射 deferred Server 删除 headers handler。规则级
 // 覆盖（0/1/2）已有 TestGenerateSingleRuleCaddyConfig_serverTokensHidden*
 // 钉，本测试钉「全局列 → resolveRuleOverrides → handler 发射」链路本身。

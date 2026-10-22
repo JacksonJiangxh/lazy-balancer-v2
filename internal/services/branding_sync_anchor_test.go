@@ -9,7 +9,7 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// 历史问题：services 的空品牌镜像与 handlers 启动期再生模板必须逐字节一致。
+// services 的空品牌镜像与 handlers 启动期再生模板必须逐字节一致。
 // 外部测试包同时导入两侧，避免 services → handlers 的生产依赖环。
 func TestBrandingEmptyTemplate_matchesHandlerBytes(t *testing.T) {
 	handlerDir := t.TempDir()

@@ -11,7 +11,7 @@ import (
 
 // 统一编译器（唯一入口 CompileFromIplistFile）：
 // 源条目（.iplist 文本行）→ CIDR 聚合 → 排序 → 序列化 .fast 二进制。
-// 产出。历史修复（历史）：@ipListFast 算子恒读渲染期 per-policy .txt 投影
+// 产出。@ipListFast 算子恒读渲染期 per-policy.txt 投影
 // （iplistfile.go），不读 .fast；.fast 的真实消费方=本包从节点回退
 // （securityiplists.go ReadFastFile——waf_files 通道只同步二进制的形态）。
 //
@@ -29,7 +29,7 @@ func CompileFromIplistFile(iplistPath string) error {
 		return fmt.Errorf("读取 .iplist %s: %w", iplistPath, err)
 	}
 	lines := strings.Split(string(raw), "\n")
-	// 逐条目只解析一次（历史问题 单源原语）：解析产物直接进聚合，不再
+	// 逐条目只解析一次：解析产物直接进聚合，不再
 	// 「校验解析一次 + AggregatePrefixes 再解析一次」。
 	prefixes := make([]netip.Prefix, 0, len(lines))
 	skipped := 0
@@ -52,13 +52,13 @@ func CompileFromIplistFile(iplistPath string) error {
 	return wafiplist.WriteFastFile(wafiplist.FastPath(iplistPath), v4, v6)
 }
 
-// CompileFromEntries/CompileFromPrefixes 已删除（历史期新发现，用户
+// CompileFromEntries/CompileFromPrefixes 已删除（新发现，用户
 // 裁定删除）：两函数生产零消费方——注释声称的「自定义列表保存即时编译/
 // 渲染层 per-policy 投影」场景不存在（保存路径从不即时编译，per-policy
 // 投影是 .txt 文本形态不写 .fast）。
 
-// splitV4V6 前缀按地址族分拣（历史修复，历史：曾双份同型循环的收敛产物；
-// 历史问题 起由 .fast 编译单点消费，等价于旧的 aggregateAndSplit 末段）。
+// splitV4V6 前缀按地址族分拣（曾双份同型循环的收敛产物；
+// 自此由.fast 编译单点消费，等价于旧的 aggregateAndSplit 末段）。
 func splitV4V6(prefixes []netip.Prefix) (v4, v6 []netip.Prefix) {
 	for _, p := range prefixes {
 		if p.Addr().Is4() {

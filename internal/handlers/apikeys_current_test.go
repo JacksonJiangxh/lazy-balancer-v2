@@ -64,7 +64,7 @@ func setupAPIKeyTestDB(t *testing.T) *sql.DB {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 历史修复(历史测试卫生):历史修复 密码确认门已于 2026-09 裁定删除——
+	// 密码确认门已于 2026-09 裁定删除——
 	// 特权 Key(非只读或 MCP)创建不验密码,可选防线为 mfa_write_guard 的
 	// MFA step-up(428,见 apikeys.go createAPIKeyForUser);本文件用例未开
 	// guard,不再种子真实密码哈希、不再携带 password 载荷。
@@ -275,7 +275,7 @@ func TestCreateCurrentUserAPIKeyReturnsPlaintextOnce(t *testing.T) {
 	}
 }
 
-// 历史修复(历史):API Key 名称 TrimSpace 后非空且 ≤100 字符——空白名/超长名
+// API Key 名称 TrimSpace 后非空且 ≤100 字符——空白名/超长名
 // 此前直接落库(api_keys.name VARCHAR(100) 在 SQLite 不强制长度),列表与审计
 // 出现不可读名。重名不拒绝(既有产品决策保持)。
 func TestCreateCurrentUserAPIKey_validatesName(t *testing.T) {
@@ -360,7 +360,7 @@ func TestUpdateCurrentUserAPIKeyForcesLegacyKeyReadOnly(t *testing.T) {
 
 func TestAdminAPIKeyReadOnlySettingIsUnchanged(t *testing.T) {
 	database := setupAPIKeyTestDB(t)
-	// 历史修复:特权 Key(可写)创建现行语义=mfa_write_guard 的 MFA step-up
+	// 特权 Key(可写)创建现行语义=mfa_write_guard 的 MFA step-up
 	//(428),无密码确认门;本用例未开 guard,直接创建。
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
@@ -414,8 +414,8 @@ func TestCreateCurrentUserAPIKeyNormalizesMCPWhitelist(t *testing.T) {
 	database := setupAPIKeyTestDB(t)
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
-	// 历史修复:mcp_enabled Key 属特权 Key——现行确认门为 mfa_write_guard
-	// 的 MFA step-up(428),密码载荷已随 历史修复 裁定删除。
+	// mcp_enabled Key 属特权 Key——现行确认门为 mfa_write_guard
+	// 的 MFA step-up(428),密码载荷已随裁定删除。
 	ctx.Request = httptest.NewRequest(http.MethodPost, "/api/v1/users/me/api-keys", strings.NewReader(`{"name":"mcp","mcp_enabled":true,"read_only":true,"mcp_ip_whitelist":["192.168.1.5","2001:db8::1"]}`))
 	ctx.Request.Header.Set("Content-Type", "application/json")
 	ctx.Set("user_id", 1)
@@ -450,13 +450,13 @@ func TestUpdateAPIKeyRejectsInvalidMCPWhitelist(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：每用户 50 配额的判定与插入必须原子——并发创建
+// 每用户 50 配额的判定与插入必须原子——并发创建
 // 此前 count-then-insert TOCTOU 可越过上限。本测试用生产 DSN（db.Initialize：
 // WAL+busy_timeout+_txlock=immediate）并发轰 55 个创建，总数不得超 50。
 // 注：setupAPIKeyTestDB 的裸 sql.Open 无 busy_timeout，并发下会以 SQLITE_BUSY
 // 500 污染断言，故此处独立搭生产形态环境。
 func TestCreateAPIKey_quotaAtomicUnderConcurrency(t *testing.T) {
-	// 历史问题（历史）：db.Initialize 会替换三个全局句柄，恢复必须
+	// db.Initialize 会替换三个全局句柄，恢复必须
 	// 三者齐全——此前漏 MetricsDB，后续用例会踩已关闭的临时指标库。
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	if err := db.Initialize(t.TempDir()); err != nil {
@@ -510,7 +510,7 @@ func TestCreateAPIKey_quotaAtomicUnderConcurrency(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：创建审计必须区分特权授予——此前只记 id/name/过期，
+// 创建审计必须区分特权授予——此前只记 id/name/过期，
 // 「可写 + MCP 开 + 白名单」的 Key 与只读 Key 审计文案完全相同。字段级
 // detail 不得落完整密钥。
 func TestCreateAPIKey_auditDetailRecordsPrivilegeFields(t *testing.T) {
@@ -552,7 +552,7 @@ func TestCreateAPIKey_auditDetailRecordsPrivilegeFields(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：更新审计必须留痕安全相关变更（启用态/MCP/只读/白名单），
+// 更新审计必须留痕安全相关变更（启用态/MCP/只读/白名单），
 // 此前只有「密钥 id name」，禁用与放宽权限在审计中不可回溯。
 func TestUpdateAPIKey_auditDetailRecordsSecurityDelta(t *testing.T) {
 	setupAPIKeyTestDB(t)
@@ -575,7 +575,7 @@ func TestUpdateAPIKey_auditDetailRecordsSecurityDelta(t *testing.T) {
 	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='更新' AND resource='API密钥' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
 		t.Fatalf("read audit detail: %v", err)
 	}
-	for _, want := range []string{"启用状态：开→关", "MCP：关→开", "只读：false→true", "MCP 白名单：0 条→1 条"} {
+	for _, want := range []string{"启用状态：开→关", "MCP：关→开", "只读：关→开", "MCP 白名单：0 条→1 条"} {
 		if !strings.Contains(detail, want) {
 			t.Fatalf("audit detail=%q, want 含 %q", detail, want)
 		}

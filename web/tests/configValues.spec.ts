@@ -1,4 +1,4 @@
-// 配置值展示口径（历史修复历史问题-07，历史修复 注释校正）：合法正值原样展示；
+// 配置值展示口径（注释校正）：合法正值原样展示；
 // 0/负数/缺省（undefined/null）一律落内置默认 1,000,000（实现为 >0 直通，
 // 其余全落默认——负数仅可能来自遗留/带外数据，后端写侧拒绝 0/负数）。
 //
@@ -8,7 +8,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { displaySecurityEventsRowCap, securityEventsWritePayload } from '../src/utils/configValues.ts'
-import { section, source } from './_helpers.ts'
+import { section, source, repoSource } from './_helpers.ts'
 
 test('行数上限：1..999 等合法小值原样展示，不被夹到 1000/1,000,000', () => {
   for (const value of [1, 2, 500, 999, 1000, 5000, 100000000]) {
@@ -23,7 +23,7 @@ test('行数上限：0/负数/缺省按自动口径展示内置默认 1,000,000'
   assert.equal(displaySecurityEventsRowCap(null), 1_000_000)
 })
 
-test('保存载荷：未编辑不携带保留/行数上限——0=自动 哨兵不得被展示归一值物化（历史问题-05）', () => {
+test('保存载荷：未编辑不携带保留/行数上限——0=自动 哨兵不得被展示归一值物化', () => {
   // 仅回显（库值 0=自动，表单显示 90 天 / 1,000,000 行）→ 载荷省略两键，
   // 后端 COALESCE 保持现值。此前无条件回传会把 90/1,000,000 写进库。
   assert.deepEqual(
@@ -45,13 +45,13 @@ test('保存载荷：未编辑不携带保留/行数上限——0=自动 哨兵�
   )
 })
 
-// 历史修复：Caddy 全局配置保存键集与后端审计归因映射必须同集——两侧此前仅靠人工
+// Caddy 全局配置保存键集与后端审计归因映射必须同集——两侧此前仅靠人工
 // 核对（22 键），漂移会静默改变保存载荷覆盖面/审计归因段落。
-test('WS-19：CADDY_CONFIG_KEYS ⇄ ConfigFieldSections「Caddy配置」键集一致', () => {
+test('CADDY_CONFIG_KEYS ⇄ ConfigFieldSections「Caddy配置」键集一致', () => {
   const vue = source('src/views/settings/CaddyGlobalSettings.vue')
   const keysBlock = section(vue, 'const CADDY_CONFIG_KEYS = [', '] as const')
   const frontend = [...keysBlock.matchAll(/'([a-z0-9_]+)'/g)].map((m) => m[1])
-  const go = source('../internal/services/auditlog.go')
+  const go = repoSource('internal/services/auditlog.go')
   const mapBlock = section(go, 'var ConfigFieldSections = map[string]string{', '\n}\n')
   const backend = [...mapBlock.matchAll(/"([a-z0-9_]+)":\s*"Caddy配置"/g)].map((m) => m[1])
   assert.ok(frontend.length > 0 && backend.length > 0)

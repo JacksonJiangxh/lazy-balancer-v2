@@ -39,7 +39,7 @@ func fingerprintAdminTLS(cfg AdminTLSConfig) adminTLSFingerprint {
 	return adminTLSFingerprint{
 		Enabled: cfg.Enabled,
 		Mode:    cfg.Mode,
-		// 历史修复（历史）：\x00 分隔消除 cert/key 无分隔拼接的理论双解
+		// \x00 分隔消除 cert/key 无分隔拼接的理论双解
 		// （"A"+"BC" 与 "AB"+"C" 同串同哈希，真实轮换会被误判为未变化）；
 		// PEM 内容不含 NUL，分隔符不引入新的碰撞面。
 		Certificate: sha256.Sum256([]byte(cfg.Cert + "\x00" + cfg.Key)),
@@ -66,14 +66,14 @@ func RuntimeAdminTLSChanged(cfg AdminTLSConfig) bool {
 // LoadAdminTLSConfig 是只读消费面的降级变体：查询失败 warn 后按 selfsigned
 // 默认形态返回（Get/启动/集群比较对可用性敏感，一次读失败不中断）。写路径
 // 与备份合并路径必须使用 LoadAdminTLSConfigE——降级默认值不可作为读-改-写
-// 基线（历史修复）。
+// 基线。
 func LoadAdminTLSConfig() AdminTLSConfig {
 	if db.DB == nil {
 		return AdminTLSConfig{Mode: "selfsigned"}
 	}
 	cfg, err := LoadAdminTLSConfigE()
 	if err != nil {
-		// 历史问题-4：查询失败不得无声吞掉——warn 留痕后按默认形态返回（API
+		// 查询失败不得无声吞掉——warn 留痕后按默认形态返回（API
 		// 形态不变；db nil 分支属启动窗口正常路径不告警）。
 		Logf("warn", "LoadAdminTLSConfig: query failed, falling back to selfsigned default: %v", err)
 		return AdminTLSConfig{Mode: "selfsigned"}
@@ -81,7 +81,7 @@ func LoadAdminTLSConfig() AdminTLSConfig {
 	return cfg
 }
 
-// LoadAdminTLSConfigE 是写/合并路径的严格变体（历史修复）：读取失败（db 未
+// LoadAdminTLSConfigE 是写/合并路径的严格变体：读取失败（db 未
 // 初始化、查询错误、行缺失）返回 error。调用方必须中止写操作——把降级默认
 // 值当现有配置合并，会在「本次 SELECT 失败 + 随后 UPDATE 成功」的时序里把已
 // 上传证书/私钥改写为空，且接口仍可能返回成功。
@@ -124,7 +124,7 @@ func (c AdminTLSConfig) ResolveCertificate(dataDir string) (tls.Certificate, err
 func selfSignedCert(dataDir string) (tls.Certificate, error) {
 	certPath := filepath.Join(dataDir, "admin_tls.crt")
 	keyPath := filepath.Join(dataDir, "admin_tls.key")
-	// 历史修复（历史）：先读后验——「双文件可读」不代表是合法证书对；
+	// 先读后验——「双文件可读」不代表是合法证书对；
 	// 存在但损坏的对（截断/换位/垃圾内容）原样上抛会让启动进入崩溃循环且
 	// 面板无清除入口。X509KeyPair 验证通过才复用，否则记 warn 落既有重生成
 	// 路径自愈。

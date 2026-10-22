@@ -1,7 +1,7 @@
 package services
 
-// 审计动作 → 前端标签颜色映射契约（历史问题 D 域 历史修复）：actionTagType 的颜色白名单
-// 长期靠人肉与后端词条 diff 维护，已连续三轮审计（历史问题 漏 9、历史问题 漏 7、历史问题 漏 2）
+// 审计动作 → 前端标签颜色映射契约：actionTagType 的颜色白名单
+// 长期靠人肉与后端词条 diff 维护，已连续三轮审计（漏 9、漏 7、漏 2）
 // 发现漏映射。本测试把契约固化为 CI 卡口：
 //  1. 用与 audit_vocabulary_test.go 相同的 AST 扫描提取后端全部可落库动作词条
 //     （RecordAuditLog/recordAudit/recordSystemAudit 字面量 + FormatAuditAction
@@ -204,12 +204,12 @@ func backendAuditActions(t *testing.T) map[string]string {
 var (
 	auditTagColorLineRe  = regexp.MustCompile(`return '(success|warning|danger|info)'`)
 	auditTagActionLineRe = regexp.MustCompile(`action === '([^']+)'`)
-	// 历史问题:表驱动形态条目行
+	// 表驱动形态条目行
 	auditTagTableEntryRe = regexp.MustCompile(`'([^']+)':\s*'(success|warning|danger|info)',`)
 )
 
 // frontendAuditTagMapping 解析 AuditLog.vue 的 actionTagType：支持两种形态——
-// 旧 if 链与新表驱动(历史问题 后 ACTION_TAG_TABLE),返回 动作→颜色。
+// 旧 if 链与新表驱动( 后 ACTION_TAG_TABLE),返回 动作→颜色。
 // frontendAuditTagMapping 旧注释：逐行匹配
 // `action === '...' || ... return '<color>'` 形态的白名单 if 行，返回 动作 → 颜色。
 func frontendAuditTagMapping(t *testing.T) map[string]string {
@@ -222,7 +222,7 @@ func frontendAuditTagMapping(t *testing.T) map[string]string {
 	mapping := map[string]string{}
 	colors := map[string]bool{}
 	for _, rawLine := range strings.Split(string(data), "\n") {
-		// 历史问题：行内 `//` 之后的部分不参与匹配——文档化白名单历史的注释行
+		// 行内 `//` 之后的部分不参与匹配——文档化白名单历史的注释行
 		// 会注册幽灵映射（真条目被删时漏映射检查假绿/幽灵颜色误触 danger 契约）。
 		// actionTagType 白名单行为简单比较、不含 URL 类字符串，朴素截断无假阴性。
 		line := rawLine
@@ -274,7 +274,7 @@ func TestAuditActionMapping_backendActionsAllMapped(t *testing.T) {
 		slices.Sort(missing)
 		t.Fatalf("后端动作未在 AuditLog.vue actionTagType 映射（落库后渲染为兜底 info 灰标）：\n%s", strings.Join(missing, "\n"))
 	}
-	// 历史问题：info 是「无 action ===」的兜底行，任何后端动作被显式写进 info 行
+	// info 是「无 action ===」的兜底行，任何后端动作被显式写进 info 行
 	// （如 `if (action === 'X') return 'info'`）都能通过上面的映射检查而隐藏
 	// 分类错误。此处强制 info 行词条数为零——当前 info 行本就无词条，零成本绊线。
 	var infoMapped []string
@@ -307,8 +307,8 @@ func TestAuditActionMapping_dangerClassificationContract(t *testing.T) {
 	}
 }
 
-// genericRouteRegistry Generic 路由的 exactly-once 登记表（历史问题 引入，历史问题
-// 历史修复 提升为包级供穷尽性绊线共用）：handlerMustRecord=true 表示 handler 显式
+// genericRouteRegistry Generic 路由的 exactly-once 登记表（引入，
+// 提升为包级供穷尽性绊线共用）：handlerMustRecord=true 表示 handler 显式
 // 记录（FormatAuditAction 映射必须为空）；false 表示中间件经映射记录（映射
 // 必须非空且 handler 不得记录）。
 var genericRouteRegistry = []struct {
@@ -323,10 +323,10 @@ var genericRouteRegistry = []struct {
 	{"/api/v1/caddy/restart", "RestartCaddy", false},
 }
 
-// TestAuditGenericRoutesExactlyOnce Generic 路由 exactly-once 绊线（历史问题）：
+// TestAuditGenericRoutesExactlyOnce Generic 路由 exactly-once 绊线
 // Generic 分类的路由要么由中间件记录（FormatAuditAction 有映射、handler 不得
 // 再记），要么由 handler 记录（映射为空、中间件跳过）——两侧同时激活即单次
-// 动作双条 audit_log（/config/reload 曾如此；历史问题 删除循环前的同断言重复——
+// 动作双条 audit_log（/config/reload 曾如此；删除循环前的同断言重复——
 // 子测试已覆盖）。
 func TestAuditGenericRoutesExactlyOnce(t *testing.T) {
 	handlersRoot, err := filepath.Abs(filepath.Join("..", "handlers"))
@@ -356,10 +356,10 @@ func TestAuditGenericRoutesExactlyOnce(t *testing.T) {
 	}
 }
 
-// TestAuditExplicitRoutesMappingEmpty Explicit 路由映射漂移哨兵（历史问题）：
+// TestAuditExplicitRoutesMappingEmpty Explicit 路由映射漂移哨兵
 // Explicit 路由由 handler 显式记录且被 HasExplicitAuditEvent 前置短路——
 // FormatAuditAction 对它们必须返回空；映射非空意味着清单漂移漏掉该路由时
-// 中间件会恢复映射记录，与 handler 记录叠加成双条（历史问题 缺陷形态）。
+// 中间件会恢复映射记录，与 handler 记录叠加成双条。
 func TestAuditExplicitRoutesMappingEmpty(t *testing.T) {
 	for route, policy := range auditRoutePolicies {
 		if policy != AuditPolicyExplicit {
@@ -375,7 +375,7 @@ func TestAuditExplicitRoutesMappingEmpty(t *testing.T) {
 	}
 }
 
-// TestAuditGenericRoutesExhaustive Generic 路由穷尽性绊线（历史问题，C 域改进项）：
+// TestAuditGenericRoutesExhaustive Generic 路由穷尽性绊线
 // auditRoutePolicies 中每条 Generic 路由必须登记进 genericRouteRegistry——
 // 新增 Generic 路由未登记时其 exactly-once 契约对测试套件不可见。
 func TestAuditGenericRoutesExhaustive(t *testing.T) {
@@ -397,7 +397,7 @@ func TestAuditGenericRoutesExhaustive(t *testing.T) {
 	}
 }
 
-// TestAuditPolicyListsEqual 历史问题-4 后语义:HasExplicitAuditEvent 已从
+// TestAuditPolicyListsEqual 后语义:HasExplicitAuditEvent 已从
 // auditRoutePolicies 派生(原双清单 switch 已删)——本测试退化为「派生源
 // 非空且含已知 Explicit 路由」的活性钉(防策略表被清空后 Explicit 全静默
 // 降级为 Generic)。
@@ -421,12 +421,12 @@ func TestAuditPolicyListsEqual(t *testing.T) {
 	}
 }
 
-// TestAuditExplicitHandlersRecord Explicit 路由 handler-必须记录绊线（历史问题）：
+// TestAuditExplicitHandlersRecord Explicit 路由 handler-必须记录绊线
 // Explicit 路由的审计完全依赖 handler 显式记录——从中间件路由注册（AST 提取
 // METHOD("/path", h.Handler)）解析路由→handler 映射，断言每个 Explicit 路由的
 // handler 函数体（含一层 h.X 委托，如 clusterNodeAction）包含审计记录调用；
 // handler 删除记录或经未登记 helper 绕过时该路由静默零审计，本测试直接红。
-// engineMediatedAuditRoutes 历史修复（历史后裁定）：handler 经引擎 RunSync 执行
+// engineMediatedAuditRoutes：handler 经引擎 RunSync 执行
 // ——审计在执行器链（main 注入的 executor→RunAutoBackupOnce 内 RecordAuditLog）
 // 落盘，handler 体内无可达字面量（AST BFS 跨不过 main 装配闭包）。路由→执行
 // 仍恒有审计（RunAutoBackupOnce 内成功/失败双路径），此处豁免的是静态扫
@@ -493,7 +493,7 @@ func extractRouteHandlerRegistry(t *testing.T) map[string]string {
 			return true
 		}
 		// 注册形态：METHOD("/path"[, middleware...], h.Handler)——路径取首个
-		//字符串字面量，handler 取末参选择子（历史问题：auth 组带 loginRateLimit
+		//字符串字面量，handler 取末参选择子（auth 组带 loginRateLimit
 		// 中间件为 3 参形态）。
 		lit, ok := call.Args[0].(*ast.BasicLit)
 		if !ok || lit.Kind != token.STRING {
@@ -576,7 +576,7 @@ func scanHandlerForAuditCall(t *testing.T, root, funcName string) (bool, bool) {
 }
 
 // indexHandlerPackageFuncs 索引 handlers 包全部函数/方法的函数体字节
-// （同名冲突取首个——绊线用途下足够）。历史问题：切出前按 AST 注释区间把
+// （同名冲突取首个——绊线用途下足够）。切出前按 AST 注释区间把
 // 注释字节置零——字面量正则会命中「提及 recordAudit( 的注释」，删记录留
 // 注释即假绿（零审计逃逸通道）；置零保持偏移对齐。
 func indexHandlerPackageFuncs(t *testing.T, root string) map[string][]byte {
@@ -617,7 +617,7 @@ func indexHandlerPackageFuncs(t *testing.T, root string) map[string][]byte {
 
 // stripCommentBytes 返回把注释区间字节置零的源码副本（长度与偏移不变）——
 // 字面量正则对含注释的字节段会命中「提及目标 token 的注释」（假信号），置零
-// 后只可能命中代码。历史问题 引入于 indexHandlerPackageFuncs，历史问题 提取
+// 后只可能命中代码。引入于 indexHandlerPackageFuncs，提取
 // 为共享 helper 供 INSERT 入口绊线同用。
 func stripCommentBytes(fset *token.FileSet, file *ast.File, src []byte) []byte {
 	stripped := make([]byte, len(src))
@@ -633,7 +633,7 @@ func stripCommentBytes(fset *token.FileSet, file *ast.File, src []byte) []byte {
 	return stripped
 }
 
-// TestAuditInsertEntryPointsExhaustive 审计写入入口穷尽性绊线（历史问题）：
+// TestAuditInsertEntryPointsExhaustive 审计写入入口穷尽性绊线
 // 词汇/映射两个契约测试只扫描调用名命中 auditVocabCallSpecs 的调用点——若未来
 // 新增绕过这 4 个入口、直接向 audit_log 表 INSERT 的低层写入函数，其动作词条对
 // 两个契约测试均不可见（漏映射检查失效、超长词条不红，前端渲染兜底 info 灰标）。
@@ -649,7 +649,7 @@ func TestAuditInsertEntryPointsExhaustive(t *testing.T) {
 		"RecordAuditLog":       true, // services/auditlog.go —— auditVocabCallSpecs 已覆盖其调用点
 		"flushSystemAuditLogs": true, // db/audit.go —— recordSystemAudit 缓冲的唯一落库点，无字面量动作
 	}
-	// 历史问题：SQL 关键字与表名大小写不敏感，正则加 (?i) 防 "insert into
+	// SQL 关键字与表名大小写不敏感，正则加 (?i) 防 "insert into
 	// audit_log" 等变体从文件级预筛静默漏过。
 	pattern := regexp.MustCompile(`(?i)INTO\s+audit_log\b`)
 	found := false
@@ -672,7 +672,7 @@ func TestAuditInsertEntryPointsExhaustive(t *testing.T) {
 		if err != nil {
 			return fmt.Errorf("parse %s: %w", path, err)
 		}
-		// 历史问题：正文匹配改在注释置零副本上做——与 历史修复 的 handlers 侧免疫
+		// 正文匹配改在注释置零副本上做——与 handlers 侧免疫
 		// 同源：允许集函数体内「提及该 SQL 的注释」会假满足活性锚点（写入机制
 		// 整体迁移后测试恒绿），非允许集函数的注释则误红。预筛仍用原始 src
 		//（超集过滤，仅省解析），置零后无命中则 found 不置位。
@@ -694,7 +694,7 @@ func TestAuditInsertEntryPointsExhaustive(t *testing.T) {
 					}
 				}
 			case *ast.GenDecl:
-				// 历史问题：包级函数字面量（var x = func(){...INSERT...}）无外围
+				// 包级函数字面量（var x = func(){...INSERT...}）无外围
 				// FuncDecl，允许集检查对其永不触发——按整段文本命中即红（包级
 				// 裸写入点无法按函数名归因，契约上不应存在；确有需要先重构为
 				// 命名函数并加入允许集）。
@@ -715,10 +715,10 @@ func TestAuditInsertEntryPointsExhaustive(t *testing.T) {
 	}
 }
 
-// TestAuditEntryAliasExhaustive 审计入口别名穷尽性绊线（历史问题）：两个契约
+// TestAuditEntryAliasExhaustive 审计入口别名穷尽性绊线：两个契约
 // 测试按「调用名 ∈ auditVocabCallSpecs」提取调用点——入口被函数变量别名后以
 // 别名调用，别名未登记时该调用点对两测试整点不可见（动作词条不进后端动作集、
-// 漏映射检查失明、danger 契约条目虚设；历史问题 的「认证拒绝」缺失即此类，
+// 漏映射检查失明、danger 契约条目虚设；「认证拒绝」缺失即此类，
 // 当时仅靠人工审计发现）。本测试扫描 internal/ 生产代码中 RHS 为入口名的
 // var 值规格与赋值语句，断言 LHS 标识符 ∈ auditVocabCallSpecs；新别名未登记
 // 即红。

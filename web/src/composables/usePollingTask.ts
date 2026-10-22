@@ -46,7 +46,7 @@ export const usePollingTask = (
       try {
         await task({ signal: taskController.signal, sequence: taskSequence, isCurrent })
       } catch (error: unknown) {
-        // 历史修复：onError 是消费方回调——若其自身抛错，异常会经 drain→run() 的
+        // onError 是消费方回调——若其自身抛错，异常会经 drain→run() 的
         // Promise 拒绝逃逸，而定时器/可见性处用 void run() 丢弃 Promise，成为
         // unhandled rejection。回调异常就地记录并吞掉，不中断 drain、不影响下一轮。
         if (!controller.signal.aborted && !taskController.signal.aborted) {
@@ -126,15 +126,15 @@ export const usePollingTask = (
     }
   }
 
-  // 历史问题(历史):非终态暂停/恢复——stop() 永久置位 disposed,弹框级
+  // 非终态暂停/恢复——stop() 永久置位 disposed,弹框级
   // stop/start 循环的消费方(SecurityRules 更新进度)首轮 stop 后轮询永久
   // 失效。pause 停定时器、作废序列并 abort 每轮在途任务，resume 可反复调用；
-  // 与 stop 的区别是不 abort 永久 signal、非终态（历史问题 起同步摘除 visibility 监听）。
+  // 与 stop 的区别是不 abort 永久 signal、非终态（自此同步摘除 visibility 监听）。
   const pause = (): void => {
     invalidate()
     for (const active of taskControllers) active.abort()
     pauseInterval()
-    // 历史问题(历史):同步摘除 visibility 监听——否则暂停期间标签页
+    // 同步摘除 visibility 监听——否则暂停期间标签页
     // 可见性翻转会在 handler 里 beginInterval() 复活定时器(违反 pause
     // 契约);resume→start→ensureVisibilityPause 会重挂,前 5 个不 pause
     // 的消费方不受影响。
@@ -146,7 +146,7 @@ export const usePollingTask = (
 
   const resume = (): void => {
     start()
-    // 恢复即刷新（历史问题）：与 visibilitychange 恢复路径（beginInterval + void run()）
+    // 恢复即刷新：与 visibilitychange 恢复路径（beginInterval + void run()）
     // 同口径——pause 的 invalidate 已丢弃 pending，run 内 inFlight 去重，不会重复执行。
     void run()
   }

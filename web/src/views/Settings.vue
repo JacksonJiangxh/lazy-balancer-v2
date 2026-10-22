@@ -14,7 +14,7 @@
       </div>
     </div>
 
-    <!-- 历史修复：首屏 /config 失败显性化 + 重试——原仅 console，保存门永久禁用
+    <!-- 首屏 /config 失败显性化 + 重试——原仅 console，保存门永久禁用
          只能整页刷新 -->
     <el-alert v-if="configLoadFailed" type="error" :closable="false" show-icon class="error-banner" style="margin-bottom: 16px">
       <template #title>
@@ -70,7 +70,7 @@ const authStore = useAuthStore()
 
 const activeTab = ref<SettingsTabId>('basic')
 
-// 历史修复：/config 契约单一事实源迁至 types/index.ts（GlobalConfigData）——
+// /config 契约单一事实源迁至 types/index.ts（GlobalConfigData）——
 // 两块设置卡各持互斥子集，这里按卡片分组做派生别名，不再复制字段清单。
 import type { GlobalConfigData } from '@/types'
 
@@ -153,7 +153,7 @@ const applyBasicKeys = (data: ConfigPayload) => {
   settings.value.timezone = data.timezone || 'Asia/Shanghai'
   settings.value.mfa_write_guard = data.mfa_write_guard ?? false
   settings.value.mfa_lockout_enabled = data.mfa_lockout_enabled ?? false
-  // 基础卡自有字段（历史问题）：此前只在 Caddy 卡的合并函数里回写，基础卡保存后
+  // 基础卡自有字段：此前只在 Caddy 卡的合并函数里回写，基础卡保存后
   // 父模型停留旧值——切页重挂后用旧值覆盖本地 ref，再次保存即把旧值写回库。
   // 大屏本站坐标/视觉模式/安全事件保留/行数上限/流量采样均归基础卡所有。
   settings.value.server_map_lat = data.server_map_lat ?? 0
@@ -181,7 +181,7 @@ const applyCaddyKeys = (data: ConfigPayload) => {
   settings.value.proxy_stream_close_delay = data.proxy_stream_close_delay ?? 0
   settings.value.server_tokens_hidden = data.server_tokens_hidden ?? false
   settings.value.access_log_json = data.access_log_json ?? true
-  // 空格式需双向一致：DB 为空时 UI 同步清空，避免旧模板被下次保存写回 DB（历史修复）
+  // 空格式需双向一致：DB 为空时 UI 同步清空，避免旧模板被下次保存写回 DB
   settings.value.access_log_format = data.access_log_format ?? ''
   // v2.3.x 受信代理（CDN 真实 IP）
   settings.value.trusted_proxy_enabled = data.trusted_proxy_enabled ?? false
@@ -204,7 +204,7 @@ const applyCertKeys = (data: ConfigPayload) => {
 }
 
 const configLoaded = ref(false)
-// 历史修复：首屏失败显性化（模板重试入口）；任一成功 /config 读取都恢复保存门
+// 首屏失败显性化（模板重试入口）；任一成功 /config 读取都恢复保存门
 const configLoadFailed = ref(false)
 const fetchSettings = async () => {
   const requestSeq = ++settingsRequestSeq
@@ -230,7 +230,7 @@ const refreshConfigSection = async (apply: (data: ConfigPayload) => void) => {
     const res = await request.get('/config')
     if (requestSeq === settingsRequestSeq && res.data) {
       apply(res.data)
-      // 历史修复：任一成功读取即恢复保存门——首屏瞬时失败后经卡片保存后刷新
+      // 任一成功读取即恢复保存门——首屏瞬时失败后经卡片保存后刷新
       // 成功的路径不再让 Basic/Caddy 保存永久禁用（原只有 fetchSettings 置 true）。
       configLoaded.value = true
       configLoadFailed.value = false

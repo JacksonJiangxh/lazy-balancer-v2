@@ -13,7 +13,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 历史修复：树交换段的 prevTag 必须 fail-visible——读版本行失败时不得用展示
+// 树交换段的 prevTag 必须 fail-visible——读版本行失败时不得用展示
 // 口径回落 bundled 继续换树（重载失败回滚会把 bundled 写成真实版本）。
 func TestCRSSwap_prevTagReadFailureAbortsBeforeVersionWrite(t *testing.T) {
 	m := newTestCRSManager(t)
@@ -58,7 +58,7 @@ func TestCRSSwap_prevTagReadFailureAbortsBeforeVersionWrite(t *testing.T) {
 	}
 }
 
-// 历史修复：合法但仅 1 段的 xdb（header StartIndexPtr == EndIndexPtr）不是空库。
+// 合法但仅 1 段的 xdb（header StartIndexPtr == EndIndexPtr）不是空库。
 func TestIP2Region_singleSegmentXDBIsNotEmpty(t *testing.T) {
 	dir := t.TempDir()
 	live := filepath.Join(dir, "ip2region.xdb")
@@ -75,7 +75,7 @@ func TestIP2Region_singleSegmentXDBIsNotEmpty(t *testing.T) {
 	}
 }
 
-// 历史修复：版本行缺失时插入必须沿用 schema 默认（auto_update=TRUE），
+// 版本行缺失时插入必须沿用 schema 默认（auto_update=TRUE），
 // 不得硬编码 0 造成「自动更新默认关闭」。
 func TestSetIP2RegionVersion_missingRowKeepsAutoUpdateDefault(t *testing.T) {
 	if err := db.Initialize(t.TempDir()); err != nil {
@@ -96,7 +96,7 @@ func TestSetIP2RegionVersion_missingRowKeepsAutoUpdateDefault(t *testing.T) {
 	}
 }
 
-// 历史修复：版本行读取故障（非 ErrNoRows）不得被当作「未写入」而覆盖为
+// 版本行读取故障（非 ErrNoRows）不得被当作「未写入」而覆盖为
 // bundled/unknown——真实版本记录必须保留（fail-visible）。
 func TestInitIP2Region_versionReadFailureKeepsStoredVersion(t *testing.T) {
 	dir := t.TempDir()

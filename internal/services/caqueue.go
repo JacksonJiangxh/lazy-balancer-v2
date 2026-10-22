@@ -40,9 +40,9 @@ type CAQueueManager struct {
 type RuleBlockToken uint64
 
 // retiredCAQueue 登记 PauseAndDrain 超时退役的队列。retiredAt 供惰性摘除兜底
-// （历史问题 发现3）：滞行执行越过 caExecutionTimeoutMax+10min 宽松余量仍未退出只可能是
+// 滞行执行越过 caExecutionTimeoutMax+10min 宽松余量仍未退出只可能是
 // 僵尸（执行上限 ctx 早已触发），超时摘除并记日志；摘除时在途 jobID 迁入
-// zombieJobs 维持在途保护直到执行退出（历史修复），历史问题 双执行防护不回退。
+// zombieJobs 维持在途保护直到执行退出，双执行防护不回退。
 type retiredCAQueue struct {
 	queue     *caQueue
 	retiredAt time.Time
@@ -67,14 +67,14 @@ var (
 	caQueueManagerOnce sync.Once
 )
 
-// caProviderConfigVersion 是 CA provider 配置版本号（历史问题）：UpdateCAProvider
+// caProviderConfigVersion 是 CA provider 配置版本号：UpdateCAProvider
 // 提交后递增，队列 tick 发现版本与本地快照不一致时先重载 provider 再评估闸门。
 // 修复「缓存闸门先于 loadCAProvider」的滞后：积压窗口内把 max_concurrent 抬高
 // 或把 min_interval 下调，旧实现会一直用缓存值放行/拦截到 running 归零或间隔
 // 到期。原子读写避免 q.mu→m.mu 反向锁序（锁序恒为 m.mu→q.mu）。
 var caProviderConfigVersion atomic.Uint64
 
-// caExecutionTimeout 是单域名签发的执行预算。历史问题（历史）：预算必须严格
+// caExecutionTimeout 是单域名签发的执行预算。预算必须严格
 // 大于单域各分段预算之和，否则最坏路径被外层 ctx 抢先取消，错误归因从分段错误
 // （「wait authorization 超时」「finalize 超时」）退化为泛化「证书签发执行超时」
 // 并白烧一次 renewal_attempts。分段之和 = 注册 30s + DNS 传播 5m + 递归逐域
@@ -84,7 +84,7 @@ var caProviderConfigVersion atomic.Uint64
 const caExecutionTimeout = 40 * time.Minute
 
 // caExecutionTimeoutMax 是按域名数缩放后的执行预算封顶：多域名签发的
-// DNS 传播 + 递归逐域 + 验证按域名数串行叠加（历史修复：每域最坏
+// DNS 传播 + 递归逐域 + 验证按域名数串行叠加（每域最坏
 // 增量 ≈17min——传播 5m + 递归 2m + 验证 10m），固定基数会把合法慢签发
 // 误判为执行超时并白烧重试次数；每域 +15min 的缩放预算贴近该和。
 // 封顶 60min：2 域 55m，3 域即 70m→封顶（超出部分按快速失败立场截断，
@@ -92,7 +92,7 @@ const caExecutionTimeout = 40 * time.Minute
 const caExecutionTimeoutMax = 60 * time.Minute
 
 // caExecutionTimeoutFor 按授权域名数缩放执行预算：单域名 40min，每增加
-// 一个域名追加 15min（历史修复：原 10min 对每域最坏 ≈17min 单边
+// 一个域名追加 15min（原 10min 对每域最坏 ≈17min 单边
 // 低估，慢签发白烧重试次数），封顶 60min。
 func caExecutionTimeoutFor(domains string) time.Duration {
 	count := 0
@@ -112,14 +112,14 @@ func caExecutionTimeoutFor(domains string) time.Duration {
 }
 
 // caQueueDrainTimeout 上限 PauseAndDrain 等待队列执行退出；issuer 异常不响应
-// ctx 取消时等待永不返回，进程 Stop 会被永久挂起（历史修复，与 CancelJob 30s 同口径）。
+// ctx 取消时等待永不返回，进程 Stop 会被永久挂起（与 CancelJob 30s 同口径）。
 // var 而非 const：测试需要缩短超时以覆盖超时路径，生产代码不得改写。
 var caQueueDrainTimeout = 30 * time.Second
 
 // InitCAQueueManager initializes the singleton queue manager with the given
 // Caddy reloader. It must be called once during application startup before
 // GetCAQueueManager is used. 可选 dataDir 为 ACME 账户密钥数据目录（审计
-// 历史修复：留空时签发链路创建账户密钥会直接报错——密钥路径退化为 CWD 相对路径
+// 留空时签发链路创建账户密钥会直接报错——密钥路径退化为 CWD 相对路径
 // 曾在测试环境堆积数千个私钥，生产必须传 cfg.DataDir）。
 // reloader 契约：经 executeFn/retryCertificateDeployment 进入
 // certissuer 部署临界区后才被调用，彼时已持 CaddyOpLock——必须传 InLock
@@ -133,7 +133,7 @@ func InitCAQueueManager(reloader func() error, dataDir ...string) {
 		compensationCtx, compensationCancel := context.WithCancel(context.Background())
 		caQueueManager = &CAQueueManager{
 			queues: make(map[int]*caQueue),
-			// 历史问题-01：活动态由 cert-issuance 守护生命周期派生，初始化即为
+			// 活动态由 cert-issuance 守护生命周期派生，初始化即为
 			// 停止。唯一激活点=StartACME 的 Start()（daemon Run 经
 			// StartACME/StopACME 挂钩）；从节点启动、用户停止证书签发后重启
 			// 等「守护从未启动」形态不得留下可签发却无证书服务（部署重试/
@@ -164,14 +164,14 @@ func ResetCAQueueManagerForTest() {
 	caQueueManagerOnce = sync.Once{}
 }
 
-// caCancelWaitTimeout 是取消/删除路径等待在途执行退出的整体上限（历史问题）：
+// caCancelWaitTimeout 是取消/删除路径等待在途执行退出的整体上限
 // 逐 job 串行 30s 会让多任务挂起时 HTTP 调用方最坏等 N×30s。var 而非 const：
 // 测试注入缩短时限以覆盖超时路径，生产代码不得改写。
 var caCancelWaitTimeout = 30 * time.Second
 
 // collectCancellationLocked 收集匹配任务的取消函数与在途执行完成信号，供
 // CancelJob（按任务）与 CancelJobsForRule（按规则）共用同一扫描口径
-// （历史问题：此前按规则入口扫 m.queues + retiredQueues + zombieJobs，按任务
+// （此前按规则入口扫 m.queues + retiredQueues + zombieJobs，按任务
 // 入口只扫 m.queues，契约不对称且退役/僵尸形态靠 ctx 已取消「碰巧安全」）。
 // 调用方须持有 m.mu（锁序恒为 m.mu→q.mu）；返回的 cancel 必须在解锁后调用。
 // pending 命中项从队列摘除并清 active（执行中任务不由这里摘 active，仍由
@@ -237,8 +237,8 @@ func (m *CAQueueManager) CancelJob(jobID int) {
 		cancel()
 	}
 	// 在途执行退出等待必须有界：issuer 执行若不响应 ctx 取消（如 DNS 传播轮询
-	// 异常路径），HTTP 调用方（DeleteCertJob 等）会被永久挂起（历史问题）。
-	// 所有 done 共享一个截止时间（历史问题），不做逐 job 串行等待。
+	// 异常路径），HTTP 调用方（DeleteCertJob 等）会被永久挂起。
+	// 所有 done 共享一个截止时间，不做逐 job 串行等待。
 	deadline := time.After(caCancelWaitTimeout)
 	for _, executionDone := range done {
 		select {
@@ -260,8 +260,8 @@ func (m *CAQueueManager) CancelJobsForRule(ctx context.Context, ruleID string) e
 	}
 	done = append(done, deploymentDone...)
 	// 在途执行退出等待除 ctx 外还需有界上限：客户端不断连时 ctx.Done 不触发，
-	// issuer 异常不响应取消会把 DeleteRule 等 HTTP 调用方永久挂起（历史修复）。
-	// 所有 done 共享一个截止时间（历史问题）——逐 job 串行 30s 在规则多任务
+	// issuer 异常不响应取消会把 DeleteRule 等 HTTP 调用方永久挂起。
+	// 所有 done 共享一个截止时间——逐 job 串行 30s 在规则多任务
 	// 挂起时最坏 N×30s。
 	deadline := time.After(caCancelWaitTimeout)
 	for _, executionDone := range done {
@@ -294,7 +294,7 @@ func (m *CAQueueManager) BlockJobsForRule(ruleID string) RuleBlockToken {
 }
 
 // UnblockJobsForRule releases only the barrier created by the matching token.
-// 历史问题：单参形态由编译器保证恰好一个 token——变参 + len!=1 静默 no-op 曾
+// 单参形态由编译器保证恰好一个 token——变参 + len!=1 静默 no-op 曾
 // 让误传 0/2 个 token 的调用方永久持有租约（该规则证书操作长期 409）且无日志。
 func (m *CAQueueManager) UnblockJobsForRule(ruleID string, token RuleBlockToken) {
 	m.mu.Lock()
@@ -307,7 +307,7 @@ func (m *CAQueueManager) UnblockJobsForRule(ruleID string, token RuleBlockToken)
 	}
 	m.mu.Unlock()
 	if lastBarrierReleased {
-		// 规则解锁后补扫一次部署重试（历史问题）：阻塞期间被
+		// 规则解锁后补扫一次部署重试：阻塞期间被
 		// scheduleCertificateDeploymentRetry 丢弃的 'downloaded' 任务（窗口已过）
 		// 需重新调度，否则滞停到下次 Resume/Start。走全局函数通道，且必须先释放
 		// 队列锁——补扫回调会再次查询 IsRuleBlocked（重入本锁）。
@@ -376,7 +376,7 @@ func (m *CAQueueManager) compensateRuleDeletion(ctx context.Context, compensatio
 	if drainErr != nil {
 		return drainErr
 	}
-	// 规则存在性前置检查（历史修复）：补偿退避窗口内规则可能已被另一路径删除
+	// 规则存在性前置检查：补偿退避窗口内规则可能已被另一路径删除
 	// （管理员重试 DeleteRule、配置导入整树替换）。规则不存在时没有可恢复对象，
 	// 直接按成功收尾释放租约——restore/requeue 内部的存在性检查为第二道防线，
 	// 此处短路可避免无谓的 DELETE+INSERT 事务。
@@ -417,7 +417,7 @@ func ruleDeletionCompensationBackoff(attempt int) time.Duration {
 
 // PauseAndDrain prevents new work, cancels every queue, and waits for all
 // workers to exit before returning. The returned flag reports whether every
-// queue fully drained within caQueueDrainTimeout (历史问题): false means an
+// queue fully drained within caQueueDrainTimeout: false means an
 // execution that ignores ctx cancellation is still running (and was registered
 // in retiredQueues). Callers requiring a quiescent queue state (e.g. config
 // import) must reject/retry rather than proceed on false.
@@ -453,13 +453,13 @@ func (m *CAQueueManager) PauseAndDrain() bool {
 		}
 	}
 	if priorZombies > 0 {
-		// zombieJobs 是「退役队列 历史修复 后仍视为在途」的保护区，只在执行退出时
+		// zombieJobs 是「退役队列后仍视为在途」的保护区，只在执行退出时
 		// 惰性清除；非空即代表仍有未知在途签发。
 		drained = false
 	}
 	// q.wait 超时返回时滞行执行（issuer 不响应 ctx 取消）可能仍未退出：旧队列已被
 	// stopQueuesLocked 整体摘出 m.queues，Resume 的 stranded 扫描经 IsJobActive 只查
-	// 新 map 会漏判在途 job，导致同 jobID 双执行（历史问题）。把仍带在途执行的旧队列
+	// 新 map 会漏判在途 job，导致同 jobID 双执行。把仍带在途执行的旧队列
 	// 登记到 retiredQueues 供 IsJobActive 合并检查；执行退出后其 active 清空，
 	// 由 IsJobActive 惰性摘除，无需回调（避免与 m.mu→q.mu 锁序冲突）。
 	var retired []*caQueue
@@ -522,7 +522,7 @@ func (m *CAQueueManager) requeueLifecycleStrandedJobs() {
 		"节点生命周期切换后恢复排队", "CA queue resume")
 }
 
-// requeueStrandedQueuedJobs 是周期巡检入口（历史问题 发现1）：滞行执行退出后任务停在
+// requeueStrandedQueuedJobs 是周期巡检入口：滞行执行退出后任务停在
 // 'queued' 而队列中无此任务，Resume 之外的周期巡检原先均不覆盖纯 'queued'，任务
 // 会滞停至下次角色翻转/重启。CertificateService 的 30s waitingCA ticker 顺带调用
 // 本函数，把滞停窗口收敛到 30s。只扫 'queued'：'waiting_ca' 有独立冷却语义，由
@@ -532,7 +532,7 @@ func (m *CAQueueManager) requeueStrandedQueuedJobs() {
 }
 
 // requeueStrandedJobs 是 Resume 与周期巡检共用的滞留任务重入队实现：按 whereClause
-// 扫描任务，逐个经 IsJobActive（在途/滞行任务防双执行，历史问题）与
+// 扫描任务，逐个经 IsJobActive（在途/滞行任务防双执行）与
 // certJobRuleApplicable（孤儿交周期 sweep 禁用）守卫后，以归一化转换 +
 // EnqueueIfActive 重排队。
 func (m *CAQueueManager) requeueStrandedJobs(whereClause, message, logPrefix string) {
@@ -561,7 +561,7 @@ func (m *CAQueueManager) requeueStrandedJobs(whereClause, message, logPrefix str
 	for rows.Next() {
 		var job strandedJob
 		if err := rows.Scan(&job.id, &job.ruleID, &job.domain, &job.status, &job.providerID, &job.ruleDomain, &job.ruleBound); err != nil {
-			// 历史修复（历史）：Scan 失败留痕（曾静默 continue——列类型
+			// Scan 失败留痕（曾静默 continue——列类型
 			// 漂移等系统性失败每次巡检零处理且零信号）。
 			Logf("warn", "%s: stranded job scan row failed, skipped: %v", logPrefix, err)
 			continue
@@ -582,7 +582,7 @@ func (m *CAQueueManager) requeueStrandedJobs(whereClause, message, logPrefix str
 	}
 	for _, job := range jobs {
 		if m.IsJobActive(job.id) {
-			// 防御（历史问题）：任务正被队列执行时不得扫描重入队——把在途任务
+			// 防御：任务正被队列执行时不得扫描重入队——把在途任务
 			// 的 DB 状态置回 'queued' 会让执行结束后的状态转换失败并误标 failed。
 			// 当前生产调用点（PauseAndDrain 之后）不会触发，测试直接调用 Resume
 			// 时依赖此守卫。
@@ -696,10 +696,10 @@ func (m *CAQueueManager) IsJobActive(jobID int) bool {
 }
 
 // isJobActiveLocked 在途判定本体（调用方必须持 m.mu）——EnqueueIfActive
-// 在锁内复用本函数，使「在途判定 → 状态迁移 → 入队」同一临界区（历史问题：
+// 在锁内复用本函数，使「在途判定 → 状态迁移 → 入队」同一临界区
 // 锁外判定与锁内入队之间存在窗口，并发补扫/手动重试可同 jobID 双入队）。
 func (m *CAQueueManager) isJobActiveLocked(jobID int) bool {
-	// age-out 摘除后迁入 zombieJobs 的 jobID 仍视为在途（历史修复）：保护持续到
+	// age-out 摘除后迁入 zombieJobs 的 jobID 仍视为在途：保护持续到
 	// 滞行执行退出（releaseZombieJob），无 executionDone 信号的永久保留。
 	if _, zombie := m.zombieJobs[jobID]; zombie {
 		return true
@@ -712,7 +712,7 @@ func (m *CAQueueManager) isJobActiveLocked(jobID int) bool {
 			return true
 		}
 	}
-	// 合并检查 PauseAndDrain 超时后退役的队列（历史问题）：滞行执行退出前
+	// 合并检查 PauseAndDrain 超时后退役的队列：滞行执行退出前
 	// jobID 仍视为在途，阻止 Resume stranded 扫描重复入队；已全部退出的
 	// 退役队列在此惰性摘除。
 	active := false
@@ -738,9 +738,9 @@ func (m *CAQueueManager) isJobActiveLocked(jobID int) bool {
 			continue
 		}
 		if agedOut {
-			// 越过执行上限+10min 余量仍未退出的滞行执行只可能是僵尸（历史问题 发现3），
+			// 越过执行上限+10min 余量仍未退出的滞行执行只可能是僵尸，
 			// 摘除条目避免硬挂+高频角色翻转下 retiredQueues 理论无界增长；但在途
-			// jobID 不得随条目遗忘——迁入 zombieJobs 维持双执行防护（历史修复）。
+			// jobID 不得随条目遗忘——迁入 zombieJobs 维持双执行防护。
 			m.migrateZombieJobsLocked(stranded)
 			Logf("warn", "CA 队列退役条目超过 %s 仍有 %d 个在途任务未退出，摘除并迁入僵尸保护", caExecutionTimeoutMax+10*time.Minute, remaining)
 			continue
@@ -752,7 +752,7 @@ func (m *CAQueueManager) isJobActiveLocked(jobID int) bool {
 }
 
 // migrateZombieJobsLocked 把 age-out 摘除的退役队列在途 jobID 迁入 zombieJobs
-// （历史修复，历史问题 发现3 回归修复）：历史问题 的语义是 jobID 在滞行执行退出前永久
+// 语义是 jobID 在滞行执行退出前永久
 // 视为在途；直接摘除会让 IsJobActive 返回 false，重开同 jobID 双执行窗口
 // （RetryCertJob/CreateOrRequeueCertJob/Resume 扫描均依赖此守卫）。带
 // executionDone 信号的 jobID 挂 goroutine 等待执行退出后解除保护；无信号的
@@ -785,7 +785,7 @@ func (m *CAQueueManager) releaseZombieJob(jobID int, done <-chan struct{}) {
 }
 
 // Enqueue 是测试夹具（仅测试使用）：生产入队一律走 EnqueueIfActive
-// （在途守卫 + 状态迁移）或内部 enqueueLocked。保留导出形态避免平行测试脚手架（历史问题）。
+// （在途守卫 + 状态迁移）或内部 enqueueLocked。保留导出形态避免平行测试脚手架。
 func (m *CAQueueManager) Enqueue(providerID int, jobID int, ruleID, domains string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -802,7 +802,7 @@ func (m *CAQueueManager) EnqueueIfActive(providerID int, jobID int, ruleID, doma
 	if m.beforeActiveEnqueue != nil {
 		m.beforeActiveEnqueue()
 	}
-	// 在途检查在 m.mu 内先于 transition/入队（历史问题 发现2 + 锁内原子化）：
+	// 在途检查在 m.mu 内先于 transition/入队
 	// 滞行执行悬挂（PauseAndDrain
 	// 超时后登记在 retiredQueues）期间，手动重试/规则重建若放行会同 jobID 双执行，
 	// 且滞行退出时 requeueCanceledJob 会把已签发状态打回 'queued'。命中按阻塞同语义
@@ -819,7 +819,7 @@ func (m *CAQueueManager) EnqueueIfActive(providerID int, jobID int, ruleID, doma
 	}
 	if len(m.blockedRules[ruleID]) != 0 {
 		// 规则删除屏障期按冲突语义处理：返回 changed=false 让 handler 走 !changed
-		// 分支回 409，而不是把暂时性屏障当成 500 服务器错误（历史修复）。
+		// 分支回 409，而不是把暂时性屏障当成 500 服务器错误。
 		return jobID, false, nil
 	}
 	jobID, changed, err := transition()
@@ -832,10 +832,10 @@ func (m *CAQueueManager) EnqueueIfActive(providerID int, jobID int, ruleID, doma
 // errCAProviderUnavailable 标记入队时 CA provider 解析失败（被禁用/删除且无
 // enabled 回退）。该失败是已定局的业务状态而非瞬时错误：enqueueLocked 已同步
 // failJob（任务置 failed + job 日志 + 审计，即现有 job-status/audit 通道）。
-// 补偿重排队据此把此类错误按「该任务已定局」跳过而不上抛重试（历史问题：
+// 补偿重排队据此把此类错误按「该任务已定局」跳过而不上抛重试
 // 上抛会让 StartRuleDeletionCompensation 退避循环永久重试——每轮 restore 复活
 // failed 行再重新失败——且规则租约 blockedRules 永不释放，该规则证书操作持续 409）。
-// 历史修复 例外：只差部署的任务（certJobDeploymentOnly）不 failJob——部署链不
+// 例外：只差部署的任务（certJobDeploymentOnly）不 failJob——部署链不
 // 解析 provider，标 failed 会断开唯一自动恢复通道。
 var errCAProviderUnavailable = errors.New("CA Provider 不可用")
 
@@ -867,7 +867,7 @@ func (m *CAQueueManager) enqueueLocked(providerID int, jobID int, ruleID, domain
 		// 把它标 failed 会摘掉唯一的自动恢复通道（部署补扫只收 downloaded/cleanup_*），
 		// 因此保持可部署态并让 deployment_available_after 的补扫接管；provider
 		// 恢复前不触发重签。签发生命周期（queued/creating_*/waiting_ca 等）仍按
-		// 已定局的业务失败 failJob（历史问题语义不变）。
+		// 已定局的业务失败 failJob。
 		if certJobDeploymentOnly(jobID) {
 			Logf("warn", "CA queue: job %d 只差部署，CA Provider 不可用（%v）——保持待部署，由部署补扫接管", jobID, err)
 			return fmt.Errorf("%w: %w", errCAProviderUnavailable, err)
@@ -909,7 +909,7 @@ func (m *CAQueueManager) enqueueLocked(providerID int, jobID int, ruleID, domain
 }
 
 func (m *CAQueueManager) enqueueCompensation(providerID int, jobID int, ruleID, domains string) error {
-	// 在途检查必须先于入队（历史问题）：补偿退避循环在角色翻转退役旧队列后
+	// 在途检查必须先于入队：补偿退避循环在角色翻转退役旧队列后
 	// 重跑时，drain（CancelJobsForRule）只扫 m.queues，看不到 retiredQueues/
 	// zombieJobs 中的滞行执行，会误判"已全部退出"并放行补偿重入队——不经
 	// IsJobActive 守卫即二次入队同 jobID → 双执行。命中时跳过（非错误），
@@ -947,7 +947,7 @@ func (m *CAQueueManager) Stop() {
 	m.mu.Unlock()
 	m.compensationWG.Wait()
 	// 补偿 goroutine 已全部退出（WG.Wait 之后），其持有的 blockedRules 租约再无
-	// 释放者，必须统一回收（历史修复）：否则角色翻转/重启恢复后，复用同 caddy_id
+	// 释放者，必须统一回收：否则角色翻转/重启恢复后，复用同 caddy_id
 	// 的规则会被残留屏障永久拦截（EnqueueIfActive 命中 blocked → 证书静默停发）。
 	// PauseAndDrain 不得清理租约：它不弃置补偿（配置导入路径持 caddyOpMu 调用时
 	// 补偿可能仍在退避中），清租约会让在途补偿的 enqueueCompensation 永久失败。
@@ -1070,10 +1070,10 @@ func (q *caQueue) tick() {
 
 	// 并发/间隔闸门只用缓存 provider（newCAQueue 与每次成功加载后均已归一化）
 	// 与内存态即可判定，必须先于 loadCAProvider：积压窗口内每 100ms tick 都打
-	// 1-2 次 provider 查询（~10 次/秒，历史修复）。代价是闸门关闭期间对
+	// 1-2 次 provider 查询（~10 次/秒）。代价是闸门关闭期间对
 	// provider 失效的发现推迟到下一次真实派发窗口，由 drain 路径统一收口。
 	//
-	// 历史问题（历史）：UpdateCAProvider 提交后递增 caProviderConfigVersion——
+	// UpdateCAProvider 提交后递增 caProviderConfigVersion——
 	// 版本不一致即先重载快照再评估闸门，max_concurrent 抬高/min_interval 下调
 	// 在积压窗口内下一个 tick 生效；版本一致时不额外查库，查询收敛不回退。
 	if q.providerVersion != caProviderConfigVersion.Load() {
@@ -1156,7 +1156,7 @@ func (q *caQueue) refreshProviderLocked() bool {
 }
 
 // failPendingProviderUnavailable 在解锁后逐个处置因 provider 失效而排空的
-// pending 项（历史问题）：解锁→failJob 的窗口内，并发路径可能已接管该任务——
+// pending 项：解锁→failJob 的窗口内，并发路径可能已接管该任务——
 // 手动重试/滞留巡检的重入队会把行重置为新的一次尝试（renewal_attempts=0）
 // 并重新占位 q.active/q.pending，此时无条件 failJob 会把新尝试误标 failed
 // （attempts+1 + 错误审计，后续自愈但噪声）。故逐项复核：任务已被重新入队
@@ -1181,7 +1181,7 @@ func (q *caQueue) failPendingProviderUnavailable(items []queueItem, message stri
 
 // queuedJobStillExists 报告 pending 队列项对应的任务行仍存在且仍保持入队时
 // 预期的 'queued' 状态（所有重签发入队路径落库态均为 'queued'；例外是补偿重排队
-// 保留/归一化为 'downloaded' 的证书材料任务——含 cleanup_* 转入，历史问题——
+// 保留/归一化为 'downloaded' 的证书材料任务——含 cleanup_* 转入，——
 // 其重部署走 Issue 快速路径、不依赖 CA，被跳过后由部署补扫/重启恢复接管部署）。
 func queuedJobStillExists(jobID int) bool {
 	var queued int
@@ -1262,8 +1262,8 @@ func (q *caQueue) handleExecutionCancellation(execution queueExecution) {
 	}
 }
 
-// handleExecutionTimeout 归类执行超时（DeadlineExceeded）的终态（历史问题-02，
-// 历史问题-02 同族未收敛点）：证书材料先于部署落库（Issue 的 downloaded 中间态），
+// handleExecutionTimeout 归类执行超时（DeadlineExceeded）的终态
+// 同族未收敛点）：证书材料先于部署落库（Issue 的 downloaded 中间态），
 // 若超时发生在材料已落库之后，无条件 failJob 会把任务打成终态 failed——此时
 // 续期扫描（新证书不在窗口）、首发失败重试（有 expires_at）、部署补扫（只收
 // downloaded/cleanup_*）、启动恢复（终态跳过）、对账（只重建 issued/downloaded）
@@ -1274,9 +1274,16 @@ func handleExecutionTimeout(jobID int) {
 	var status, certPEM, keyPEM string
 	if err := db.DB.QueryRow("SELECT status, COALESCE(cert_pem,''), COALESCE(key_pem,'') FROM cert_jobs WHERE id=?", jobID).Scan(&status, &certPEM, &keyPEM); err == nil {
 		if certPEM != "" && keyPEM != "" && JobLifecycle(status) == JobLifecycleDownloaded {
-			if _, err := db.DB.Exec("UPDATE cert_jobs SET deployment_available_after=datetime('now'), message='执行超时：证书材料已落库，等待重新部署' WHERE id=? AND status=?", jobID, status); err != nil {
+			const message = "执行超时：证书材料已落库，等待重新部署"
+			// updated_at 与部署窗口同写：重试冷却门（certJobRetryBlocked）以
+			// updated_at 为计时基准，只推窗口不推 updated_at 会让本轮重排对
+			// 冷却门不可见（同口径见 handlers/certjobs.go 的部署重排写点）。
+			if _, err := db.DB.Exec("UPDATE cert_jobs SET deployment_available_after=datetime('now'), message=?, updated_at=datetime('now') WHERE id=? AND status=?", message, jobID, status); err != nil {
 				Logf("error", "CA queue: failed to defer deployment retry for timed-out job %d: %v", jobID, err)
 			}
+			// 与 deploymentFailed/failJob 同族：非终态收敛必须落 certjob-*.log
+			// 业务行，否则排障时磁盘日志只有签发阶段、超时重排无痕迹。
+			WriteCertJobLog(jobID, "WARN", "execution_timeout", message)
 			return
 		}
 	}
@@ -1297,7 +1304,7 @@ func (q *caQueue) stop() {
 func (q *caQueue) wait() bool {
 	<-q.loopDone
 	// executions.Wait 必须套 30s 上限：issuer 异常不响应 ctx 取消时 Wait 永不返回，
-	// PauseAndDrain/进程 Stop 会被永久挂起（历史修复，与 CancelJob 同口径）。
+	// PauseAndDrain/进程 Stop 会被永久挂起（与 CancelJob 同口径）。
 	done := make(chan struct{})
 	go func() {
 		q.executions.Wait()
@@ -1313,21 +1320,26 @@ func (q *caQueue) wait() bool {
 }
 
 func requeueCanceledJob(jobID int) {
-	// 历史问题：'downloaded' 且证书材料已落库的任务停在部署窗口——转 'queued'
-	// 会丢弃已签发证书并触发整轮重签（Issue 快速路径只认 issued/downloaded）。
-	// 保持 'downloaded' 并把重试窗口推到 now，Resume 的
-	// rescanDroppedDeploymentRetries 会统一重新调度部署（历史问题 起 30s 周期
-	// 补扫同口径覆盖——历史问题 起窗口未过也按剩余 delay 重排,不再要求到期）。
+	// 部署生命周期全集（downloaded/cleanup_dns/cleanup_warning，即
+	// JobLifecycleDownloaded）且证书材料已落库的任务停在部署窗口——转 'queued'
+	// 会丢弃已签发证书并触发整轮重签（Issue 快速路径只认 issued/downloaded，
+	// cleanup_* 只被部署补扫接管）。保持原状态并把重试窗口推到 now：Resume 的
+	// rescanDroppedDeploymentRetries 与 30s 周期补扫同口径覆盖（30s 补扫对
+	// cleanup_* 不要求窗口到期，对 downloaded 按剩余 delay 重排）。
+	// 判据用 JobLifecycle 而非裸 status=='downloaded'——cleanup_* 同属
+	// 「材料已落库、只差部署」，漏收敛会把它们打回 queued 重签烧 CA 配额。
 	var status, certPEM, keyPEM string
 	if err := db.DB.QueryRow("SELECT status, COALESCE(cert_pem,''), COALESCE(key_pem,'') FROM cert_jobs WHERE id=?", jobID).Scan(&status, &certPEM, &keyPEM); err == nil {
-		if status == "downloaded" && certPEM != "" && keyPEM != "" {
-			if _, err := db.DB.Exec("UPDATE cert_jobs SET deployment_available_after=datetime('now'), message='节点生命周期切换，等待恢复部署' WHERE id=? AND status='downloaded'", jobID); err != nil {
+		if certPEM != "" && keyPEM != "" && JobLifecycle(status) == JobLifecycleDownloaded {
+			// updated_at 与部署窗口同写：重试冷却门以 updated_at 为计时基准
+			// （同口径见 handlers/certjobs.go 的部署重排写点）。
+			if _, err := db.DB.Exec("UPDATE cert_jobs SET deployment_available_after=datetime('now'), message='节点生命周期切换，等待恢复部署', updated_at=datetime('now') WHERE id=? AND status=?", jobID, status); err != nil {
 				Logf("error", "CA queue: failed to defer deployment retry for canceled job %d: %v", jobID, err)
 			}
 			return
 		}
 	}
-	// 历史问题-04（历史核实成立）：from 集合收紧为 nonTerminalJobStatuses
+	// from 集合收紧为 nonTerminalJobStatuses
 	// （原 jobStatusesExceptDisabled 含终态 issued/failed）。可达性证据=本文件
 	// 的并发部署回调形态：在途执行已把行推进到 'downloaded' 后被生命周期取消
 	//（q.ctx 取消）与并发部署回调（30s 补扫/部署 timer）交错——回调 CAS 胜者
@@ -1387,7 +1399,7 @@ func loadCAProvider(id int) (models.CAProvider, error) {
 	if err == nil {
 		return p, nil
 	}
-	// 历史问题（历史）：显式选择的提供商「存在但已禁用」时不得静默改派——回退会
+	// 显式选择的提供商「存在但已禁用」时不得静默改派——回退会
 	// 把任务签到另一 CA（消耗其配额）并持久化改写 cert_jobs.ca_provider_id，
 	// 规则 UI 仍显示原提供商，仅有一条 resolved= 应用日志。改为显性失败（经
 	// enqueueLocked 落 failed + job 日志/审计）。「已删除」仍保留回退：历史/
@@ -1446,7 +1458,7 @@ func markJobWaitingCA(jobID int, retryAfter time.Duration) {
 	attempts++
 
 	cooling := computeBackoff(attempts, retryAfter)
-	// 历史问题：库内写规范 UTC（available），日志/审计展示跟随部署时区
+	// 库内写规范 UTC（available），日志/审计展示跟随部署时区
 	//（global_config.timezone，tz.go 周期刷新）——旧硬编码 UTC+8 在配置
 	// 非 Asia/Shanghai 的部署里展示时间漂移。
 	available := time.Now().Add(cooling).UTC()
@@ -1471,7 +1483,7 @@ func markJobWaitingCA(jobID int, retryAfter time.Duration) {
 		return
 	}
 
-	// 历史问题：available 已是 UTC（上方 历史问题 口径），不再重复 .UTC()。
+	// available 已是 UTC（上方写入侧口径），不再重复调 .UTC()。
 	err := transitionJob(db.DB, jobID, nonTerminalJobStatuses, "waiting_ca", map[string]any{
 		"message":            "等待 CA 频率限制冷却",
 		"ca_available_after": available.Format("2006-01-02 15:04:05"),
@@ -1499,7 +1511,7 @@ func maxRenewalAttemptsMessage(message string, maxAttempts int) string {
 	return fmt.Sprintf("%s（%s %d，停止自动重试，可手动重试）", message, marker, maxAttempts)
 }
 
-// failJobTransition 是失败终态迁移的共享实现（历史问题；历史问题-06 起
+// failJobTransition 是失败终态迁移的共享实现（起
 // failJobFromStatus 无调用方已删除，本函数唯一消费方为 failJob）：尝试次数
 // 封顶文案、消息截断、UPDATE、留痕。
 func failJobTransition(jobID int, fromSet []string, message string) {

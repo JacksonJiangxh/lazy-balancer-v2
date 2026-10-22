@@ -139,7 +139,7 @@ func l7BindingCount(t *testing.T, caddyID string) int {
 	return count
 }
 
-func TestP2_3_protocolSwitchToTCPDropsSecurityBindings(t *testing.T) {
+func TestProtocolSwitchToTCPDropsSecurityBindings(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
@@ -183,7 +183,7 @@ func TestP2_3_protocolSwitchToTCPDropsSecurityBindings(t *testing.T) {
 	}
 }
 
-func TestP2_3_v2ImportDropsBindingsForTCPRules(t *testing.T) {
+func TestV2ImportDropsBindingsForTCPRules(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	backup := completeBackupJSON(t, map[string][]map[string]any{
 		"lb_rules": {
@@ -231,7 +231,7 @@ func l7ConflictRows() []map[string]any {
 	}
 }
 
-func TestP2_3_duplicateTCPRuleDoesNotCopyInertBindings(t *testing.T) {
+func TestDuplicateTCPRuleDoesNotCopyInertBindings(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,description,protocol,listen_port,strategy,health_check_interval,health_check_timeout,
 		health_check_unhealthy_threshold,health_check_healthy_threshold,enabled)
@@ -272,7 +272,7 @@ func TestP2_3_duplicateTCPRuleDoesNotCopyInertBindings(t *testing.T) {
 	}
 }
 
-func TestP1_1_conflictMatrixDisablesPlaintextSideOfMixedTLSPort(t *testing.T) {
+func TestConflictMatrixDisablesPlaintextSideOfMixedTLSPort(t *testing.T) {
 	rows := l7ConflictRows()
 	conflicts := disableV2RuleConflicts(rows)
 	if len(conflicts) != 1 {
@@ -310,7 +310,7 @@ func TestP1_1_conflictMatrixDisablesPlaintextSideOfMixedTLSPort(t *testing.T) {
 	}
 }
 
-func TestP1_1_v1ConflictMatrixDisablesPlaintextSide(t *testing.T) {
+func TestV1ConflictMatrixDisablesPlaintextSide(t *testing.T) {
 	rules := []convertedRule{
 		{Name: "v1-plain", Protocol: "http", Domain: "v1-plain.test", ListenPort: 19831, Enabled: true},
 		{Name: "v1-tls", Protocol: "http", Domain: "v1-tls.test", ListenPort: 19831, Enabled: true, EnableTLS: true},
@@ -324,7 +324,7 @@ func TestP1_1_v1ConflictMatrixDisablesPlaintextSide(t *testing.T) {
 	}
 }
 
-func TestP1_1_v2ImportDisablesPlaintextSideOfMixedPort(t *testing.T) {
+func TestV2ImportDisablesPlaintextSideOfMixedPort(t *testing.T) {
 	t.Cleanup(services.SetCertDirForTest(t.TempDir()))
 	h := newBackupTestHandlers(t)
 	certPEM, keyPEM, err := generateTestCert("l7-mix-tls.test", time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
@@ -368,7 +368,7 @@ func TestP1_1_v2ImportDisablesPlaintextSideOfMixedPort(t *testing.T) {
 	}
 }
 
-func TestP2_5_importUsesProcessManagementPorts(t *testing.T) {
+func TestImportUsesProcessManagementPorts(t *testing.T) {
 	cases := []struct {
 		name      string
 		panelPort int
@@ -430,7 +430,7 @@ func TestP2_5_importUsesProcessManagementPorts(t *testing.T) {
 	}
 }
 
-func TestP2_5_v1ImportUsesProcessManagementPorts(t *testing.T) {
+func TestV1ImportUsesProcessManagementPorts(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	h.cfg.Port = 19000
 	backup := `{

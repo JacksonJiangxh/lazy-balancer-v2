@@ -26,7 +26,7 @@ caddy_http_requests_total{handler="headers",host="go029.com",server="http_443"} 
 
 func TestRateLimitBlocksParse_aggregatesPerHostByCode429(t *testing.T) {
 	// Given metrics text mixing codes, handlers, methods, servers, and sibling histogram series
-	// When the counters are parsed——仅按 code="429" 过滤（handler 标签自 历史修复 起恒为
+	// When the counters are parsed——仅按 code="429" 过滤（handler 标签自 自此恒为
 	// 主路由链首 headers，不可作区分维度；上游自返 429 如实纳入计数，卡片已标注口径）
 	counts := parseRateLimit429Counts(rateLimit429MetricsFixture)
 
@@ -122,7 +122,7 @@ func TestScrapeRateLimitBlocks_errorOnUnreachableServer(t *testing.T) {
 	}
 }
 
-// 历史问题：5s TTL 进程内缓存——仪表盘多调用点在窗口内只抓一次。
+// 5s TTL 进程内缓存——仪表盘多调用点在窗口内只抓一次。
 func TestScrapeRateLimitBlocks_cachedWithinTTL(t *testing.T) {
 	resetOverviewMetricsCacheForTest()
 	oldTTL := overviewMetricsCacheTTL
@@ -166,7 +166,7 @@ func TestScrapeRateLimitBlocks_cachedWithinTTL(t *testing.T) {
 	}
 }
 
-// 历史问题：失败轮不写缓存——瞬态故障后的下一个请求仍会重试。
+// 失败轮不写缓存——瞬态故障后的下一个请求仍会重试。
 func TestScrapeRateLimitBlocks_failureNotCached(t *testing.T) {
 	resetOverviewMetricsCacheForTest()
 	oldTTL := overviewMetricsCacheTTL
@@ -192,7 +192,7 @@ func TestScrapeRateLimitBlocks_failureNotCached(t *testing.T) {
 	}
 }
 
-// 历史问题：同 URL 并发单飞——在途请求共用一次抓取。
+// 同 URL 并发单飞——在途请求共用一次抓取。
 func TestScrapeRateLimitBlocks_singleFlight(t *testing.T) {
 	resetOverviewMetricsCacheForTest()
 	oldTTL := overviewMetricsCacheTTL
@@ -248,7 +248,7 @@ func TestScrapeRateLimitBlocks_emptyMetricsReturnsNonNilSlice(t *testing.T) {
 	}
 }
 
-// 历史修复：按 Prometheus exposition 规范解码标签值转义（\\ \" \n）——
+// 按 Prometheus exposition 规范解码标签值转义（\\ \" \n）——
 // 此前反斜杠被吞掉后原样写下一字节，\n 被解析成字面 n。规范未定义的转义
 // （\t 等）原样保留（含反斜杠），不静默丢字节。
 func TestParsePromLabelPairs_prometheusEscapes(t *testing.T) {

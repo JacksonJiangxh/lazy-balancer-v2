@@ -1,6 +1,6 @@
 package handlers
 
-// 历史问题（历史）：MFARecoveryCodes 缺 rejectOIDCUserMFAOperation 门——
+// MFARecoveryCodes 缺 rejectOIDCUserMFAOperation 门——
 // 五个 OIDC MFA 写入口（setup/activate/disable/recovery-codes/admin reset）
 // 仅此一处缺席（mfa.go:127/:186/:224/:340 有门）。OIDC 用户与本地 MFA 体系完全
 // 解耦（v2.3.0 用户裁定，身份保证在 IdP 侧），恢复码重生成对 OIDC 用户必须 403。

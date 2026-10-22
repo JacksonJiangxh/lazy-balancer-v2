@@ -12,7 +12,7 @@
   --text-regular: #374151;
   --text-secondary: #6b7280;
   --text-muted: #9ca3af;
-  /* 历史问题：ClusterSettings 服务控制弹框以 var(--text-tertiary) 消费（同文件
+  /* ClusterSettings 服务控制弹框以 var(--text-tertiary) 消费（同文件
      相邻行以 #909399 为回退）——补进变量集，避免声明无效回落继承色。 */
   --text-tertiary: #909399;
   
@@ -165,11 +165,11 @@ body {
 /* 表格单元格标签垂直居中(全部视图:Dashboard/Rules/SecurityPolicies/Keys 等):
    el-tag 是 inline-block,vertical-align: middle 按 x-height 对齐(视觉偏高);
    含标签的 cell 改 inline-flex+align-items:center(行盒级居中)。
-   历史问题(历史):原 d5ca6f91 仅 Dashboard scoped,同根因散落
+   原 d5ca6f91 仅 Dashboard scoped,同根因散落
    ≥10 视图——全局化;.cell 内纯文本/ellipsis 不受影响(规则只命中含 .el-tag 的 cell)。 */
 .el-table .cell:has(.el-tag) { display: inline-flex; align-items: center; }
 
-/* 列表分页器通用形态（历史问题）：Rules / SecurityRules / SecurityPolicies /
+/* 列表分页器通用形态：Rules / SecurityRules / SecurityPolicies /
    SecurityBlockPages 四处逐字重复的本地定义收敛于此（右对齐 + 16px 上距）。 */
 .rules-pagination { display: flex; justify-content: flex-end; margin-top: 16px; }
 
@@ -180,7 +180,7 @@ body {
 .error-banner .el-alert__title { line-height: 1.5; }
 .error-banner .error-banner-meta { display: block; font-size: 12px; margin-top: 0; line-height: 1.5; }
 
-/* 轮询错误横幅行内件（FE-R2，历史）：Rules/CertJobs/ClusterSettings/AppLayout
+/* 轮询错误横幅行内件：Rules/CertJobs/ClusterSettings/AppLayout
    四处模板共用，此前三文件 scoped 逐字重复；.polling-error-alert 容器声明各异
    （margin-bottom/align-self）保留在各文件本地。 */
 .polling-error-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; }
@@ -195,7 +195,7 @@ body {
 .info-note-bar--inset { margin-left: 20px; margin-right: 20px; }
 /* 连续 info-note-bar 相邻节奏（2026-10-03 用户裁定）：默认 12px，连续 bar
    间收紧到 8px（对齐 SecurityPolicies .bound-rule-alert 8px 堆叠上限与
-   .stage-projection-bar 相邻节奏）。:has 收窄前者底距——相邻 margin 塌陷
+   .stage-projection-bar 相邻节奏）。has 收窄前者底距——相邻 margin 塌陷
    取大，仅调后者的 margin-top 压不过前者 12px 底距。 */
 .info-note-bar:has(+ .info-note-bar) { margin-bottom: 8px; }
 /* 弹框正文 20px 水平留白工具类（2026-09-25 用户裁定）：挂到 el-dialog class 即生效；

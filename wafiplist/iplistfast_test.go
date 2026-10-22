@@ -168,7 +168,7 @@ func TestIPMatchVsIPListFast_equivalenceProbe(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：写锁代际守卫——并发重建时，基于更早 stat 的解析
+// 写锁代际守卫——并发重建时，基于更早 stat 的解析
 // 结果（旧代际）不得覆盖已落地的新代际缓存，否则旧内容会回流服役。
 func TestLoadIPListFile_staleGenerationDoesNotOverwriteNewer(t *testing.T) {
 	dir := useAllowedDir(t)
@@ -278,7 +278,7 @@ func TestLoadAndResolvePrefixes_contract(t *testing.T) {
 		t.Fatalf("fresh=%v, want 2 条", fresh)
 	}
 
-	// 运行期形态 = 归一（白名单）+ 热路径入口（历史修复：原 ResolvePrefixes
+	// 运行期形态 = 归一（白名单）+ 热路径入口（原 ResolvePrefixes
 	// 包装无生产调用方已删除，测试直用生产同款两步组合）。
 	cleaned, err := NormalizeAllowedPath(path)
 	if err != nil {

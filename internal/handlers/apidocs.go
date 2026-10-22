@@ -168,16 +168,16 @@ var apiDocRoutes = []apiDocRoute{
 	{"POST", "/settings/oidc/test", "系统", "OIDC 发现探测", `{"issuer":"https://sso.example.com"}`, `{"ok":true,"provider_name":"...","token_endpoint":"..."}`, []string{"400 invalid_request(缺服务地址)/error(只读 Key 仅支持测试已保存配置)", "403 admin_required"}, "完整 discovery+JWKS 可达性探测。"},
 	{"DELETE", "/settings/oidc", "系统", "OIDC 配置删除", "", `{"code":0}`, []string{"403 admin_required"}, "清空配置(等效禁用);已建 OIDC 用户保留。"},
 	{"GET", "/logs/stats", "日志", "日志存储状态", "", `{"logs":[{"key":"audit","name":"操作日志","size_bytes":1048576,"rotated_bytes":0,"keep_count":0,"rows":6895,"retention_note":"每日清理 · 保留 3 个月","config_source":"基础设置 · 日志保留"}]}`, []string{"401 unauthenticated"}, "静态日志类别与逐任务 task:<id> 行的当前大小/阈值/保留策略；key/keys 参数收窄到所请求行（弹框只取单行，未请求行不做 DB/目录统计），caddy_id 参数收窄证书任务与规则访问到单规则。"},
-	{"GET", "/security/overview", "安全", "安全总览", "", `{"today_blocked":0,"today_detected":0,"active_policies":0,"crs_version":"v4.28.0","includes_reserved":true,"trend":[{"date":"2026-08-04","blocked":0,"detected":0}],"top_ips":[{"ip":"1.2.3.4","blocked":5,"detected":10,"last_time":"2026-08-10 14:32:01","attack_type":"SQL注入"}],"attack_types":[{"name":"SQL注入","value":42}]}`, []string{"401 unauthenticated"}, "includes_reserved=true：今日/趋势/Top IP 总量含私网与保留地址事件（不排除，与大屏口径不同）。"},
-	{"GET", "/security/overview/threat-screen", "安全", "威胁大屏聚合", "", `{"hours":24,"window_start":"2026-10-14 20:00:00","window_start_minute":"2026-10-14 20:00","rollup_stale":false,"rollup_last_success":"2026-10-15 19:59:00","rollup_coverage_from":"2026-10-15 19:59","raw_coverage_from":"2026-10-09 00:00:00","backfill_incomplete":false,"total_events":123,"blocked_events":100,"logged_events":23,"block_rate":81.3,"ratelimit_blocks":12,"ratelimit_available":true,"active_sources":4,"countries":{"美国":30},"china_provinces":{"广东省":12},"top_countries":[{"name":"美国","value":30}],"top_attack_types":[{"name":"SQL注入","value":42}],"top_rules":[{"name":"SQL注入检测","value":36}],"top_targets":[{"name":"API 服务","domain":"api.example.com","value":36}],"hourly_hist":[{"name":"14:00","value":5}],"attack_type_share":[{"name":"SQL注入","value":42}],"recent_rate":2.4}`, []string{"401 unauthenticated", "500 metrics_unavailable"}, "威胁大屏数据源。query: hours（缺省 24，非法/越界回退 24，上限 720）。数据面=security_event_rollup 分钟 rollup（懒固化+60s 后台 warmer，保留/私网地址固化时排除；首轮未完成或固化陈旧时请求路径同步固化），rollup_ready/rollup_stale/rollup_last_success 披露固化就绪/陈旧度/最近成功时刻（未就绪时 last_success 为空串）。窗口总量/拦截率按 rollup 计数；logged_events=total-blocked（夹 >=0）；recent_rate=近 5 分钟 blocked/min（logged 不计）；ratelimit_blocks 为 Caddy /metrics 429 总计（重载口径，抓取失败降级 200：ratelimit_blocks=0 且 ratelimit_available=false，其余维度照常）；active_sources=近 10 分钟去重 client_ip（原始表，保留/私网排除）；countries/top_countries 按 ip_location 首段（国家）计数、空归属跳过；china_provinces 仅首段=「中国」的事件取省段（第 2 段）计数（大屏省级下钻数据源）；top_attack_types=family 归因 Top3；attack_type_share=全部 family 计数（占比条数据源，不截断）；top_rules=触发规则 ID 归因 Top3（无 ID 时回退负载规则名）；top_targets=目标维度分钟 rollup（security_event_target_rollup）计数前 3 的现存规则（name/domain 取 lb_rules，已删除规则跳过，进程内 5min 缓存）；hourly_hist 为滑动窗口分桶——hours≤24 时每整点一小时桶（共 hours 槽，名称 HH:00，末槽=当前小时），hours>24 时 24h 日桶（共 ceil(hours/24) 槽、上限 30，名称 MM-DD，末槽=今天；桶边界按 UTC+配置时区偏移帧计算）。任一安全库查询失败整卡 500。rollup_coverage_from 为 rollup 已覆盖的最旧分钟（无覆盖时为空串），backfill_incomplete=true 表示本次统计只覆盖 [rollup_coverage_from, now]、宽窗口回填仍在进行（后续轮询补齐）。"},
+	{"GET", "/security/overview", "安全", "安全总览", "", `{"today_blocked":0,"today_detected":0,"active_policies":0,"crs_version":"v4.28.0","includes_reserved":true,"trend":[{"date":"2026-08-04","blocked":0,"detected":0}],"top_ips":[{"ip":"1.2.3.4","blocked":5,"detected":10,"last_time":"2026-08-10 14:32:01","attack_type":"SQL注入"}],"attack_types":[{"name":"SQL注入","value":42}],"ingestion":{"observed":true,"healthy":true,"consecutive_failures":0,"task_state":"running","task_running":true,"writer_dropped":0,"writer_io_errors":0,"writer_degraded":false}}`, []string{"401 unauthenticated"}, "includes_reserved=true：今日/趋势/Top IP 总量含私网与保留地址事件（不排除，与大屏口径不同）。ingestion=采集健康位（与 GET /security/events 同源：任务已停/连续失败/审计写侧降级）。"},
+	{"GET", "/security/overview/threat-screen", "安全", "威胁大屏聚合", "", `{"hours":24,"window_start":"2026-10-14 20:00:00","window_start_minute":"2026-10-14 20:00","rollup_stale":false,"rollup_last_success":"2026-10-15 19:59:00","rollup_coverage_from":"2026-10-15 19:59","raw_coverage_from":"2026-10-09 00:00:00","backfill_incomplete":false,"total_events":123,"blocked_events":100,"logged_events":23,"block_rate":81.3,"ratelimit_blocks":12,"ratelimit_available":true,"active_sources":4,"countries":{"美国":30},"china_provinces":{"广东省":12},"top_countries":[{"name":"美国","value":30}],"top_attack_types":[{"name":"SQL注入","value":42}],"top_rules":[{"name":"SQL注入检测","value":36}],"top_targets":[{"name":"API 服务","domain":"api.example.com","value":36}],"hourly_hist":[{"name":"14:00","value":5}],"attack_type_share":[{"name":"SQL注入","value":42}],"recent_rate":2.4,"ingestion":{"observed":true,"healthy":true,"consecutive_failures":0,"task_state":"running","task_running":true,"writer_dropped":0,"writer_io_errors":0,"writer_degraded":false}}`, []string{"401 unauthenticated", "500 metrics_unavailable"}, "威胁大屏数据源。query: hours（缺省 24，非法/越界回退 24，上限 720）。数据面=security_event_rollup 分钟 rollup（懒固化+60s 后台 warmer，保留/私网地址固化时排除；首轮未完成或固化陈旧时请求路径同步固化），rollup_stale/rollup_last_success 披露固化陈旧度/最近成功时刻（未就绪时 last_success 为空串）。窗口总量/拦截率按 rollup 计数；logged_events=total-blocked（夹 >=0）；recent_rate=近 5 分钟 blocked/min（logged 不计）；ratelimit_blocks 为 Caddy /metrics 429 总计（重载口径，抓取失败降级 200：ratelimit_blocks=0 且 ratelimit_available=false，其余维度照常）；active_sources=近 10 分钟去重 client_ip（原始表，保留/私网排除）；countries/top_countries 按 ip_location 首段（国家）计数、空归属跳过；china_provinces 仅首段=「中国」的事件取省段（第 2 段）计数（大屏省级下钻数据源）；top_attack_types=family 归因 Top3；attack_type_share=全部 family 计数（占比条数据源，不截断）；top_rules=触发规则 ID 归因 Top3（无 ID 时回退负载规则名）；top_targets=目标维度分钟 rollup（security_event_target_rollup）计数前 3 的现存规则（name/domain 取 lb_rules，已删除规则跳过，进程内 5min 缓存）；hourly_hist 为滑动窗口分桶——hours≤24 时每整点一小时桶（共 hours 槽，名称 HH:00，末槽=当前小时），hours>24 时 24h 日桶（共 ceil(hours/24) 槽、上限 30，名称 MM-DD，末槽=今天；桶边界按 UTC+配置时区偏移帧计算）。任一安全库查询失败整卡 500。rollup_coverage_from 为 rollup 已覆盖的最旧分钟（无覆盖时为空串），backfill_incomplete=true 表示本次统计只覆盖 [rollup_coverage_from, now]、宽窗口回填仍在进行（后续轮询补齐）。ingestion=采集健康位（与事件列表同源：任务已停/连续失败/审计写侧降级）。"},
 	{"GET", "/security/events/feed", "安全", "威胁大屏增量事件流", "", `{"events":[{"id":210,"event_time":"2026-10-15 12:00:00","client_ip":"1.2.3.4","ip_location":"美国·加州·洛杉矶·ISP","action":"blocked","rule_name":"SQL注入检测","attack_type":"SQL注入"}],"since_id":0,"next_since_id":210,"limit":50,"has_more":false}`, []string{"401 unauthenticated"}, "升序无漏增量流：since_id=0（首屏）返回最新 limit 条（events 按 id 升序，next_since_id=返回集最大 id，has_more=false 不回溯更老）；since_id>0 返回 id > since_id 的升序增量（>limit 积压分多次拉取无重无漏，has_more=true 表示本页填满且可能还有更新未返回）。响应 next_since_id=本批实际扫描到的最大 id（含被保留地址过滤的行），消费者应推进到 next_since_id（恒 ≥ since_id、无重复）；limit 缺省 50、上限 200。attack_type 为后端 family 归因（与安全总览同源），同时下发 trigger_type 与 rule_triggered；rule_msg 不下发。"},
 	{"GET", "/security/events/toast-summary", "安全", "威胁大屏攻击弹框精确聚合", "since_id=0&limit=20&baseline=1", `{"groups":[{"client_ip":"1.2.3.4","ip_location":"美国·加州","action":"blocked","attack_type":"SQL注入","count":120,"last_id":210,"avg_duration_us":1200}],"next_id":210}`, []string{"401 unauthenticated"}, "按 since_id 游标聚合新安全事件，按 IP+攻击类型+动作精确计数；单次最多聚合最新 1200 条（400 事件/秒 × 3s 默认上限），超限跳过更老弹框展示并推进 next_id，安全日志仍完整。baseline=1 仅返回当前高水位且 groups 为空；since_id=0 非 baseline 从最早记录扫描。next_id 为本批最大 id。"},
 	{"GET", "/security/overview/threat-screen/attack-flow", "安全", "威胁大屏攻击光流事件流", "since=0&limit=200", `{"enabled":true,"events":[{"seq":1,"at":1792300000000,"country":"美国","province":"加州","action":"blocked","rule_triggered":"942100","weight":4}],"next_seq":1,"sample_n":4}`, []string{"401 unauthenticated"}, "独立攻击流环形缓冲（内存、非 security_events 查询）；仅大屏采集租约有效时记录，sample_n=1/4/8 自适应。weight 为写入时采样因子，前端按 sum(weight) 还原近似量级。next_seq 为本批实际推进序号；游标超前（进程重启）返回 0。"},
 	{"GET", "/security/overview/threat-screen/traffic", "安全", "大屏实时流量快照", "", `{"countries":{"美国":{"attack":12,"normal":345}},"available":true,"sample_n":1}`, []string{"401 unauthenticated"}, "代理 Caddy admin /lb/traffic-stats（caddygeoip per-country 原子计数器：attack=安全中断、normal=非安全中断，累计口径自进程启动；统计边界=链尾 lb_security_blocked_counter 计数，国名仅取 geoip2region 写入的服务端变量，无 GeoIP 变量的规则不产生国名桶）。国名翻译中文、空/Reserved/0 过滤；admin 不可达 200 空数据降级（available=false）。sample_n=QPS 保险丝抽样因子（1/N 抽样×N 还原，误差 ±N）。大屏 1-2s 轮询消费。"},
-	{"POST", "/security/overview/threat-screen/collector", "安全", "申请/续租大屏流量采集", `{"lease_id":"tab-uuid","ttl_ms":30000,"sample_n":1}`, `{"enabled":true}`, []string{"401 unauthenticated", "503 collector_unavailable"}, "大屏打开时申请采集租约；插件只在存在租约时执行流量计数，关闭/崩溃后 TTL 过期自动停止。lease_id 上限 64 字节、并发租约上限 64 条（超限 400 lease_id too long / too many leases；既有租约续租不受限）。审计跳过。"},
-	{"GET", "/security/overview/threat-screen/events", "安全", "大屏逐请求正常流量事件流", "since=0&limit=200", `{"enabled":true,"sample_n":8,"events":[{"seq":1,"country":"中国","province":"广东省","at":1792300000000}],"next_seq":1}`, []string{"401 unauthenticated", "503 collector_unavailable"}, "代理 Caddy admin /lb/traffic-events 环形缓冲；since=0 返回最近 limit 条，since>0 返回增量。仅采集租约有效时产生事件，sample_n=1/N 抽样。next_seq 恒为本批实际推进到的序号；游标超前于 Caddy 本进程已分配序号（重启后 seq 归零）时返回 next_seq=0，客户端须从 0 重新追赶（避免旧代际高水位永久过滤新事件）。"},
+	{"POST", "/security/overview/threat-screen/collector", "安全", "申请/续租大屏流量采集", `{"lease_id":"tab-uuid","ttl_ms":30000,"sample_n":1}`, `{"enabled":true}`, []string{"401 unauthenticated", "503 collector_unavailable"}, "大屏打开时申请采集租约；插件只在存在租约时执行流量计数，关闭/崩溃后 TTL 过期自动停止。sample_n 缺省=0。lease_id 上限 64 字节、并发租约上限 64 条（超限 400 lease_id too long / too many leases；既有租约续租不受限）。审计跳过。"},
+	{"GET", "/security/overview/threat-screen/events", "安全", "大屏逐请求正常流量事件流", "since=0&limit=200", `{"enabled":true,"sample_n":8,"events":[{"seq":1,"country":"中国","province":"广东省","at":1792300000000}],"next_seq":1,"gap":true,"gap_skipped":3}`, []string{"401 unauthenticated", "503 collector_unavailable"}, "代理 Caddy admin /lb/traffic-events 环形缓冲；since=0 返回最近 limit 条，since>0 返回增量。仅采集租约有效时产生事件，sample_n=1/N 抽样。gap=true 且 gap_skipped>0 表示环形缓冲溢出造成永久空洞，客户端须披露数据不完整并继续按 next_seq 追赶。next_seq 恒为本批实际推进到的序号；游标超前于 Caddy 本进程已分配序号（重启后 seq 归零）时返回 next_seq=0，客户端须从 0 重新追赶（避免旧代际高水位永久过滤新事件）。"},
 	{"DELETE", "/security/overview/threat-screen/collector", "安全", "释放大屏流量采集租约", `{"lease_id":"tab-uuid"}`, `{"enabled":false}`, []string{"401 unauthenticated"}, "大屏关闭时释放租约；最后一个租约释放后 Caddy 流量采集热路径只保留一次 atomic 判断。审计跳过。"},
-	// 口径实证(历史问题-1,历史):任何 /load 重建 metrics registry,
+	// 口径实证:任何 /load 重建 metrics registry,
 	// 429 计数随重载归零——公开文档只留净口径,追踪语留本注释。
 	{"GET", "/security/rate-limit-blocks", "安全", "各站点限流拦截累计次数", "", `{"total":12,"hosts":[{"host":"go029.com","count":9}]}`, []string{"401 unauthenticated", "500 metrics_unavailable"}, "数据来自 Caddy /metrics 的 429 计数，仅按 code=429 过滤（含上游自返 429），自最近一次 Caddy 配置重载以来累计，进程重启归零；采集失败返回 500。"},
 	{"GET", "/security/rules/:caddy_id/stage-stats", "安全", "单规则三阶段安全统计（流程抽屉计数）", "", `{"stage1_blocked_24h":3,"stage3_blocked_24h":5,"ratelimit_blocks_reload":9}`, []string{"401 unauthenticated", "404 not_found", "500 metrics_unavailable"}, "阶段 1/3=近 24h blocked 事件按触发 id 形状分桶（阶段 1={2,4,7,8,14}∪[800000,900000)，其余归阶段 3）；ratelimit_blocks_reload 为 429 计数按规则域名映射求和，自最近一次 Caddy 配置重载以来累计。caddy_id 不存在返回 404。"},
@@ -217,7 +217,7 @@ var apiDocRoutes = []apiDocRoute{
 	{"GET", "/security/ip-lists/:id/export", "安全", "导出 IP 地址列表（TXT）", "", "198.51.100.1 自动封禁\n198.51.100.2\n", []string{"401 unauthenticated", "404 not_found"}, "每行「IP/CIDR 备注」（备注为空仅 IP）；text/plain 附件下载。自定义名单读 DB 条目；威胁名单（system=1）回退读 .iplist 文件条目。"},
 	{"GET", "/security/autoban", "安全", "读取自动封禁配置", "", `{"enabled":false,"threshold":100,"window_minutes":5,"duration":"1h","scope":"all","dry_run":true}`, []string{"401 unauthenticated"}, "六项配置：启用/阈值（1-10000 次）/窗口（1-60 分钟）/封禁时长（10m,30m,1h,6h,12h,24h,permanent）/统计口径（blocked,logged,all）/观察模式。"},
 	{"PUT", "/security/autoban", "安全", "更新自动封禁配置", `{"enabled":true,"threshold":100,"window_minutes":5,"duration":"1h","scope":"all","dry_run":true}`, `{"code":0}`, []string{"400 validation_failed", "403 slave_or_admin_required", "500 save_or_apply_failed"}, "窗口或口径变更会重置固定窗口计数器（口径语义变化后旧计数不可混算）。固定窗口按事件到达对齐分桶、桶满跨界即重置（非平滑滑动）：跨窗口边界的突发计数可能分散到相邻两桶。保存即联动任务调度：启用=开启 autoban 循环调度、禁用=停止调度并立即收敛已到期条目与暂存重载（调度唯一前提=业务启用）。"},
-	{"GET", "/security/autoban/status", "安全", "自动封禁运行状态", "", `{"enabled":false,"dry_run":true,"threshold":100,"window_minutes":5,"duration":"1h","scope":"all","banned_today":0,"list_entries":0,"list_referenced":false,"tracked_ips":0,"suggestions":[],"is_master":true,"role":"master","running":false,"loop_on":false,"last_run":"","last_status":"","feed_degraded":false,"feed_degraded_reason":""}`, []string{"401 unauthenticated", "500 查询失败"}, "list_referenced=启用中的安全策略是否引用预置名单（false 时面板黄条提示名单未生效）；suggestions=上一轮观察建议（dry-run 模式达阈值 IP 及计数，按计数降序最多展示 50 条，含窗口内首末时间）；is_master/role=节点角色（调度仅主节点执行，从端写操作 403）；banned_today/list_entries 与封禁生效面同口径（已到期未清理条目不计入）；feed_degraded/feed_degraded_reason=计数喂入源（安全事件采集任务）停摆降级（调度已停止或自愈预算用尽），此时自动封禁计数不再更新、状态卡提示原因。"},
+	{"GET", "/security/autoban/status", "安全", "自动封禁运行状态", "", `{"enabled":false,"dry_run":true,"threshold":100,"window_minutes":5,"duration":"1h","scope":"all","banned_today":0,"list_entries":0,"list_referenced":false,"ban_effective":false,"tracked_ips":0,"suggestions":[],"is_master":true,"role":"master","running":false,"loop_on":false,"last_run":"","last_status":"","feed_degraded":false,"feed_degraded_reason":""}`, []string{"401 unauthenticated", "500 查询失败"}, "list_referenced=启用中的安全策略是否引用预置名单（热路径资格门四面引用集，不区分「引用」与「拦截生效」）；ban_effective=封禁是否实际生效（false 时面板黄条提示名单未生效）；suggestions=上一轮观察建议（dry-run 模式达阈值 IP 及计数，按计数降序最多展示 50 条，含窗口内首末时间）；is_master/role=节点角色（调度仅主节点执行，从端写操作 403）；banned_today/list_entries 与封禁生效面同口径（已到期未清理条目不计入）；feed_degraded/feed_degraded_reason=计数喂入源（安全事件采集任务）停摆降级（调度已停止或自愈预算用尽），此时自动封禁计数不再更新、状态卡提示原因。"},
 	{"GET", "/security/events", "安全", "安全事件日志", "", `{"events":[],"total":0,"page":1,"page_size":20}`, []string{"401 unauthenticated"}, "query: page, page_size, action, ip, rule_caddy_id, rule_name, policy_name, rule_triggered, rule_triggered_exclude（同 family 映射整体取反）, uri, start_time, end_time（配置时区，YYYY-MM-DD[ HH:MM:SS]）。"},
 	{"GET", "/security/events/count", "安全", "IP 事件计数（弹框上下文）", "", `{"count":2}`, []string{"401 unauthenticated", "400 缺少 ip", "500 查询失败"}, "query: ip（完整客户端 IP 精确匹配）, days（默认 30，1-365）。走 client_ip+event_time 索引范围 COUNT，近 N 天该 IP 的安全事件总数（含 blocked 与 logged）。"},
 	{"GET", "/security/crs", "安全", "CRS 规则集信息", "", `{"version":"v4.28.0","auto_update":true,"rule_count":832,"schedule_days":[1,2,3,4,5,6,7],"schedule_time":"04:00"}`, []string{"500 数据库故障", "401 unauthenticated"}, "schedule_days/schedule_time 为定时更新排程（星期集 1=周一…7=周日 + HH:MM，时区遵循基础设置）。"},
@@ -252,7 +252,7 @@ var apiDocRoutes = []apiDocRoute{
 func buildOpenAPIYAML() string {
 	var b strings.Builder
 	b.WriteString("openapi: 3.1.0\ninfo:\n  title: Lazy Balancer API\n  version: 1.0.0\n")
-	b.WriteString("  description: |\n    Lazy Balancer V2 REST API(/api/v1)。管理接口使用 Authorization: Bearer <JWT 或 lb_sk_ API Key>。\n    集群机器接口使用 X-Cluster-Token 或 X-Registration-Secret。业务 JSON 响应统一为 {code,message,data?}；示例除特别注明外均为 data 载荷，实际响应为 {code,message,data} 包装。\n    例外：登录直接返回登录对象；配置下载直接返回备份 JSON；MCP 返回 JSON-RPC；304 无响应体；API 文档 HTML 与 OpenAPI YAML 使用各自媒体类型。\n    不返回用户密码；TLS 私钥与 DNS 凭证仅对管理员（非只读 API Key）明文返回，其他已登录用户读取时一律掩码（TLSKeySet 标记是否已配置），仅管理员可修改；其余配置数据对所有已登录用户可读。集群快照包含密码和密钥哈希及证书私钥，部署时建议使用 HTTPS。\nservers:\n  - url: /api/v1\npaths:\n")
+	b.WriteString("  description: |\n    Lazy Balancer V2 REST API(/api/v1)。管理接口使用 Authorization: Bearer <JWT 或 lb_sk_ API Key>。\n    集群机器接口使用 X-Cluster-Token 或 X-Registration-Secret。业务 JSON 响应统一为 {code,message,data?}；示例除特别注明外均为 data 载荷，实际响应为 {code,message,data} 包装。\n    例外：登录直接返回登录对象；配置下载直接返回 lbbak 备份二进制（application/gzip）；MCP 返回 JSON-RPC；304 无响应体；API 文档 HTML 与 OpenAPI YAML 使用各自媒体类型。\n    不返回用户密码；TLS 私钥与 DNS 凭证仅对管理员（非只读 API Key）明文返回，其他已登录用户读取时一律掩码（TLSKeySet 标记是否已配置），仅管理员可修改；其余配置数据对所有已登录用户可读。集群快照包含密码和密钥哈希及证书私钥，部署时建议使用 HTTPS。\nservers:\n  - url: /api/v1\npaths:\n")
 	pathOrder := make([]string, 0)
 	routesByPath := make(map[string][]apiDocRoute)
 	for _, r := range apiDocRoutes {
@@ -314,7 +314,7 @@ func writeOpenAPIOperation(b *strings.Builder, route apiDocRoute) {
 	seenStatuses := make(map[string]bool, len(route.Errors))
 	for _, routeError := range route.Errors {
 		parts := strings.SplitN(routeError, " ", 2)
-		// 历史问题 关联(历史):同码多形态(如 400 invalid_request+
+		// 关联:同码多形态(如 400 invalid_request+
 		// 400 cannot_disable_self)去重取首——OpenAPI YAML 不允许重复键。
 		if seenStatuses[parts[0]] {
 			continue
@@ -351,7 +351,7 @@ type apiDocContract struct {
 	security             string
 }
 
-// 历史问题（历史）：/admin-tls 与 /admin-tls/inspect 同时接受 multipart
+// /admin-tls 与 /admin-tls/inspect 同时接受 multipart
 // 表单与 JSON（MCP 通道固定发 application/json）——两个 content type 都必须
 // 出现在生成规格中，各自携带形态匹配的示例。
 func adminTLSRequestVariants() []apiDocContentExample {
@@ -374,7 +374,7 @@ var apiDocContracts = map[string]apiDocContract{
 	"POST /auth/mfa/verify":   {rawResponse: true, security: "public"},
 	"GET /auth/setup":         {security: "public"},
 	"POST /auth/setup":        {security: "public"},
-	// 历史问题(历史修复):OIDC 公开路由契约——status 为登录页按钮显隐探测、login 为
+	// OIDC 公开路由契约——status 为登录页按钮显隐探测、login 为
 	// 浏览器 302 跳转、callback 为 IdP 回调重定向,三者均不携带 JWT/API Key;
 	// 漏登记会让 OpenAPI 把它们误标 bearerAuth。
 	"GET /auth/oidc/status":              {security: "public"},
@@ -394,11 +394,11 @@ var apiDocContracts = map[string]apiDocContract{
 	"POST /rules":                        {successStatus: http.StatusCreated},
 	"POST /rules/:caddy_id/duplicate":    {successStatus: http.StatusCreated},
 	"POST /certificate-configs":          {successStatus: http.StatusCreated},
-	// 历史问题(历史修复):v2.3.0 起导出恒为 lbbak tar.gz(writeLbbakResponse 以
+	// v2.3.0 起导出恒为 lbbak tar.gz(writeLbbakResponse 以
 	// application/gzip 下发);sections query 与导入侧对称（分类键清单由
-	// configBackupSections 单一事实源派生——历史问题，防文档与实现再分叉）。
+	// configBackupSections 单一事实源派生——，防文档与实现再分叉）。
 	"GET /config/export": {rawResponse: true, responseContentType: "application/gzip", queryParameters: []apiDocParameter{{"sections", "string", "可选配置分类（逗号分隔）：" + configBackupSectionKeysText() + "，默认全选；旧版 global_config/waf_files 键自动归一（分别视为 users/security）；未知分类返回 400"}}},
-	// 历史问题（历史）：两个非 JSON 下载端点显式登记 media type——漏登记
+	// 两个非 JSON 下载端点显式登记 media type——漏登记
 	// 会回落到 application/json 并被包成 {"code":0,...,"data":非 JSON}。
 	"GET /auto-backup/:id/download":        {rawResponse: true, responseContentType: "application/octet-stream"},
 	"GET /security/ip-lists/:id/export":    {rawResponse: true, responseContentType: "text/plain; charset=utf-8"},
@@ -445,7 +445,7 @@ func writeOpenAPIParameters(b *strings.Builder, route apiDocRoute, queryParamete
 	for part := range strings.SplitSeq(route.Path, "/") {
 		if name, found := strings.CutPrefix(part, ":"); found {
 			valueType := "string"
-			// 历史修复（历史）：任务 ID 是 "threat"/"cert-job:5" 等字符串
+			// 任务 ID 是 "threat"/"cert-job:5" 等字符串
 			// ——/system/tasks/ 前缀路由的 :id 保留 string，与其余数字 :id 路由
 			// 的 integer 判定分流（MCP 侧同参数始终 string，两侧此前自相矛盾）。
 			if name == "id" && !strings.HasPrefix(route.Path, "/system/tasks/") {
@@ -472,7 +472,7 @@ func writeOpenAPIParameters(b *strings.Builder, route apiDocRoute, queryParamete
 }
 
 // writeYAMLExample 输出 example 节点；多行纯文本（如 TXT/日志形态）用块标量，
-// 避免裸换行截断 YAML——历史问题 的 TXT 下载示例即此形态。
+// 避免裸换行截断 YAML——TXT 下载示例即此形态。
 func writeYAMLExample(b *strings.Builder, indent, example string) {
 	if strings.Contains(example, "\n") {
 		b.WriteString(indent + "example: |\n")
@@ -522,22 +522,22 @@ func operationDescription(route apiDocRoute) string {
 	case "PUT /users/:id", "PUT /users/:id/status", "PUT /config", "PUT /rules/:caddy_id", "PUT /cluster/settings", "PUT /cluster/nodes/:id/access-url", "PUT /cluster/nodes/:id/site", "PUT /certificate-configs/:id", "PUT /ca-providers/:id", "PUT /caddy/config", "PUT /admin-tls", "PUT /settings/oidc",
 		"PUT /settings/auto-backup", "PUT /security/policies/:id", "PUT /security/rules/:caddy_id/policies", "PUT /security/custom-rules/:id", "PUT /security/block-pages/:id", "PUT /security/ip-lists/:id", "PUT /security/crs/auto-update", "PUT /security/ip2region/auto-update",
 		"PUT /security/threat-lib/auto-update", "PUT /security/threat-lib/:id/flags", "PUT /security/crs/schedule", "PUT /security/ip2region/schedule", "PUT /security/threat-lib/schedule",
-		// 历史问题（历史）：爬虫库同族三条状态型 PUT 与自动封禁配置写
+		// 爬虫库同族三条状态型 PUT 与自动封禁配置写
 		// （同参数重发保持目标态，窗口/口径不变时不会二次重置计数器）。
 		"PUT /security/crawler-lib/auto-update", "PUT /security/crawler-lib/schedule", "PUT /security/crawler-lib/:id/flags", "PUT /security/autoban":
 		retry = "可安全重试：相同请求重复调用保持相同目标状态。"
 	case "PATCH /users/me", "PATCH /users/me/api-keys/:id", "PATCH /api-keys/:id/status":
-		// 历史问题:PATCH 语义化部分更新与 PUT 同格幂等。
+		// PATCH 语义化部分更新与 PUT 同格幂等。
 		retry = "可安全重试：相同请求重复调用保持相同目标状态。"
 	case "POST /security/ip-lists/:id/ips":
-		// 历史修复:幂等追加——条目已存在时返回 added=false,不重复落行。
+		// 幂等追加——条目已存在时返回 added=false,不重复落行。
 		retry = "可安全重试：重复追加同一条目返回 added=false，不产生重复数据。"
 	case "DELETE /settings/oidc":
-		// 历史修复(历史修复):OIDC 删除为幂等清空——重复调用保持配置为已删除状态
+		// OIDC 删除为幂等清空——重复调用保持配置为已删除状态
 		// 并返回成功(与资源型 DELETE 的 404 语义不同)。
 		retry = "可安全重试：重复调用保持 OIDC 配置为已删除状态并返回成功。"
 	case "DELETE /security/policies/:id/bind/:caddy_id":
-		// 历史问题（历史）：unbind 是无条件删除绑定行——未绑定时同样返回
+		// unbind 是无条件删除绑定行——未绑定时同样返回
 		// 成功、状态不变（handler 不返回 404），与资源型 DELETE 不同。
 		retry = "可安全重试：重复解除同一绑定保持已解绑状态并返回成功（未绑定时不做变更）。"
 	case "POST /config/preview", "POST /config/validate", "POST /config/import/validate", "POST /rules/cert-info", "POST /certificate-configs/test", "POST /certificate-configs/:id/test", "POST /ca-providers/:id/test", "POST /certificates/parse", "POST /admin-tls/inspect", "POST /settings/oidc/test":
@@ -551,7 +551,7 @@ func operationDescription(route apiDocRoute) string {
 	return description + " " + retry
 }
 
-// 历史问题（历史）：内容完全静态（apiDocRoutes 进程内不变，路由数随
+// 内容完全静态（apiDocRoutes 进程内不变，路由数随
 // 扩表增长），YAML 拼接缓存一次——此前每请求全量重建。
 var openAPIYAMLOnce = sync.OnceValue(buildOpenAPIYAML)
 
@@ -560,7 +560,7 @@ func (h *Handlers) GetOpenAPIYAML(c *gin.Context) {
 }
 
 // GetAPIDocs 返回 Swagger UI 的 HTML 壳（规格本体在 /api/v1/openapi.yaml，已鉴权）。
-// 历史问题-1（历史）：本页外部依赖面 = unpkg CDN 的 swagger-ui CSS/bundle
+// 本页外部依赖面 = unpkg CDN 的 swagger-ui CSS/bundle
 // （已带 SRI 完整性校验 + 加载失败 fallback），离线环境降级为「直接取 YAML」链接；
 // 该外链为开发者便利通道，面板自身运行不依赖它。
 func (h *Handlers) GetAPIDocs(c *gin.Context) {
@@ -595,7 +595,7 @@ func (h *Handlers) GetAPIDocs(c *gin.Context) {
         docExpansion: "list",
         filter: true,
         tryItOutEnabled: false,
-        // 历史问题-1（历史）：/openapi.yaml 已移入鉴权区，本页取自
+        // /openapi.yaml 已移入鉴权区，本页取自
         // localStorage 的登录令牌注入 Authorization 头（面板自身同源同键）。
         requestInterceptor: function (req) {
           try {

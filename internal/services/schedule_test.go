@@ -256,7 +256,7 @@ func TestSetIP2RegionSchedule_persistsAndRearms(t *testing.T) {
 	}
 }
 
-// 注：历史问题「失败行保留退避」两测试（CRS/IP2Region）随退避机制撤除
+// 注：「失败行保留退避」两测试（CRS/IP2Region）随退避机制撤除
 // （2026-09-25 用户裁定）删除；新语义「一律重排到新槽」由
 // scheduled_update_retry_test.go 的 TestSetCRSSchedule_failedRowRearmedToSlot 钉住。
 
@@ -347,10 +347,10 @@ func TestSetIP2RegionAutoUpdate_enableUsesConfiguredSchedule(t *testing.T) {
 	}
 }
 
-// 2026-09-25 用户裁定（原 历史问题 翻转）：失败退避机制撤除——重开开关一律
+// 2026-09-25 用户裁定（原翻转）：失败退避机制撤除——重开开关一律
 // 重排到排程槽，失败行不再保留退避点。
 func TestSetCRSAutoUpdate_failedRowRearmedToSlot(t *testing.T) {
-	// Given 失败行（历史退避形态的 next_update），当前开关关闭
+	// Given 失败行（退避形态的 next_update），当前开关关闭
 	newTestCRSManager(t)
 	loc := useShanghaiLocation(t)
 	seedCRSVersionRow(t, "v4.14.0", false)
@@ -508,7 +508,7 @@ func TestMarkSourceSuccess_usesConfiguredSchedule(t *testing.T) {
 	}
 }
 
-// 历史修复（历史问题）：SetThreatSchedule 两步写事务化——第二写点（重排
+// SetThreatSchedule 两步写事务化——第二写点（重排
 // 各源 next_update）失败时，第一写点（global_config 排程列）须整体回滚，
 // 不留「排程已改、槽位照旧」中间态（曾两独立 Exec 先后提交）。
 func TestSetThreatSchedule_rollsBackWhenRearmFails(t *testing.T) {

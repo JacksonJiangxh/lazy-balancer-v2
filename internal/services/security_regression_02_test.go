@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// TestRefreshLatestAsync_backsOffAfterFailure 验证 历史修复 新-1：上游版本检查失败
+// TestRefreshLatestAsync_backsOffAfterFailure 验证新-1：上游版本检查失败
 // 时同样记录尝试时间，10 分钟守卫对失败路径生效——前端轮询 CRS 卡片不会每次
 // 请求都重发一个 30s 超时的 GitHub fetch（持续失败会加速 403 限流）。
 func TestRefreshLatestAsync_backsOffAfterFailure(t *testing.T) {
@@ -53,7 +53,7 @@ func TestRefreshLatestAsync_backsOffAfterFailure(t *testing.T) {
 	}
 }
 
-// TestSeedCRSRules_versionOnlySnapshotTreatedAsDegenerate 验证 历史修复 新-4：
+// TestSeedCRSRules_versionOnlySnapshotTreatedAsDegenerate 验证新-4
 // 「VERSION 存在、rules 树缺失」的快照（persistCRSSnapshotFrom 的 RemoveAll
 // 之后崩溃残留）必须进入退化判定——回退 dist 播种后用健康 live 树重建快照，
 // 而不是留下一个永不自愈的 VERSION-only 残骸。
@@ -87,7 +87,7 @@ func TestSeedCRSRules_versionOnlySnapshotTreatedAsDegenerate(t *testing.T) {
 	}
 }
 
-// TestReconcileCRSState_versionOnlySnapshotHealed 验证 历史修复 新-4 的对账侧：
+// TestReconcileCRSState_versionOnlySnapshotHealed 验证新-4 的对账侧
 // VERSION-only 快照在 live 树健康且版本可确定时被重建，而非永久留残骸。
 func TestReconcileCRSState_versionOnlySnapshotHealed(t *testing.T) {
 	// Given 完好的 live 树（标记 v4.15.0）+ VERSION-only 快照，DB 记录与 live 一致

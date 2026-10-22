@@ -59,3 +59,55 @@ func TestEnsureSecurityEventsTransactionIndex_skipsDedupeScanWhenIndexExists(t *
 		t.Fatalf("索引重建后条数=%d, want 1", indexCount)
 	}
 }
+
+// 冗余索引回收同理：初始化时先探测 sqlite_master，fresh 库/已回收库零 DDL
+// （此前每次启动无条件两条 DROP INDEX），仅存量库索引真实在位时执行一次。
+func TestInitMetricsSchema_skipsRedundantIndexDropsWhenAbsent(t *testing.T) {
+	metrics, err := openAndPingMetricsDB(filepath.Join(t.TempDir(), "metrics-index-drop-probe.db"))
+	if err != nil {
+		t.Fatalf("open metrics database: %v", err)
+	}
+	t.Cleanup(func() { _ = metrics.Close() })
+
+	probesBefore, dropsBefore := metricsRedundantIndexProbes.Load(), metricsRedundantIndexDrops.Load()
+
+	// Given fresh 库：两条冗余索引均不存在。
+	if err := initMetricsSchema(metrics); err != nil {
+		t.Fatalf("first init: %v", err)
+	}
+	if got := metricsRedundantIndexProbes.Load() - probesBefore; got != 2 {
+		t.Fatalf("首次启动探测次数=%d, want 2", got)
+	}
+	if got := metricsRedundantIndexDrops.Load() - dropsBefore; got != 0 {
+		t.Fatalf("首次启动回收次数=%d, want 0（不存在即跳过 DROP）", got)
+	}
+
+	// When 存量库形态：两条冗余索引在位，再次初始化。
+	if _, err := metrics.Exec(`CREATE INDEX idx_metrics_rule ON metrics_history(rule_id);
+		CREATE INDEX idx_security_event_target_rollup_minute ON security_event_target_rollup(minute)`); err != nil {
+		t.Fatalf("seed legacy indexes: %v", err)
+	}
+	if err := initMetricsSchema(metrics); err != nil {
+		t.Fatalf("second init: %v", err)
+	}
+
+	// Then 两条索引各回收一次，且已从 schema 消失。
+	if got := metricsRedundantIndexDrops.Load() - dropsBefore; got != 2 {
+		t.Fatalf("存量库回收次数=%d, want 2", got)
+	}
+	var remaining int
+	if err := metrics.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('idx_metrics_rule','idx_security_event_target_rollup_minute')`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatalf("冗余索引残留=%d, want 0", remaining)
+	}
+
+	// And 再初始化一次：探测仍执行，但零回收。
+	if err := initMetricsSchema(metrics); err != nil {
+		t.Fatalf("third init: %v", err)
+	}
+	if got := metricsRedundantIndexDrops.Load() - dropsBefore; got != 2 {
+		t.Fatalf("已回收库重复回收=%d, want 2", got)
+	}
+}

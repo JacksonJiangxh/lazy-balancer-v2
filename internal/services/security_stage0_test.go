@@ -162,6 +162,6 @@ func TestBuildCorazaDirectives_stage0DetectionTrustEmitsId12(t *testing.T) {
 	if strings.Contains(plain, "id:12,") {
 		t.Fatalf("engine without stage0 trust must not emit id:12:\n%s", plain)
 	}
-	// 引擎门禁（历史修复）：新形状必须被 coraza 编译接受。
+	// 引擎门禁：新形状必须被 coraza 编译接受。
 	compileForEngineGate(t, directives)
 }

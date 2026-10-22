@@ -1,7 +1,7 @@
 package handlers
 
-// 历史修复——历史问题-01（v2 备份 users 键存在但空数组→校验期硬拒，
-// 键缺席的分类导出形态不受影响）与 历史问题-03（预览端镜像导入侧单侧 WAF
+// （v2 备份 users 键存在但空数组→校验期硬拒，
+// 键缺席的分类导出形态不受影响）与 （预览端镜像导入侧单侧 WAF
 // 文件缺失建模：剔对应版本表+告警）。
 
 import (
@@ -30,7 +30,7 @@ func postUsersGateImport(t *testing.T, h *Handlers, body string) *httptest.Respo
 	return response
 }
 
-// ── 历史问题-01 ──
+// ── 回归钉 ──
 
 // Given v2 备份 users 键存在但为空数组（合法导出永不产出该形态，仅手造/损坏）。
 // When 导入。
@@ -60,7 +60,7 @@ func TestValidateConfigImport_rejects_empty_users_array(t *testing.T) {
 		"users": {},
 	}, Config: nil})
 
-	got := r41PostValidate(t, h, body)
+	got := postValidateString(t, h, body)
 
 	if got.Valid {
 		t.Fatalf("users 空表备份预览必须 valid=false，got %+v", got)
@@ -95,7 +95,7 @@ func TestImportConfigBackup_users_key_absent_still_imports(t *testing.T) {
 	}
 }
 
-// ── 历史问题-03：预览镜像导入侧单侧 WAF 文件缺失建模 ──
+// ──：预览镜像导入侧单侧 WAF 文件缺失建模 ──
 
 // Given lbbak 备份只携带 xdb（无 CRS 文件），config.json 含两个版本表。
 // When 预览。

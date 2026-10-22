@@ -103,7 +103,7 @@ func TestEngine_PauseSchedulingStopsDispatch(t *testing.T) {
 	waitForEngine(t, "首轮派发", 2*time.Second, func() bool { return runs.Load() > 0 })
 
 	e.PauseScheduling()
-	// 历史修复：用引擎自己的排空 API 等待在途轮落定，替代 20ms 墙钟猜测。
+	// 用引擎自己的排空 API 等待在途轮落定，替代 20ms 墙钟猜测。
 	drainCtx, drainCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	if !e.WaitInFlightRuns(drainCtx) {
 		drainCancel()

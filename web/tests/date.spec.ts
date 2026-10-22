@@ -1,4 +1,4 @@
-// 配置时区格式化行为验收（历史问题：原源码正则断言改为运行时行为断言）。
+// 配置时区格式化行为验收（原源码正则断言改为运行时行为断言）。
 //
 // 运行：cd web && npm test
 
@@ -7,7 +7,7 @@ import assert from 'node:assert/strict'
 
 import { createTzFormatter, formatDateInTz } from '../src/utils/timeZoneFormat.ts'
 
-test('历史问题-18：配置时区格式化显式固定 h23，午夜不得显示 24 点', () => {
+test('配置时区格式化显式固定 h23，午夜不得显示 24 点', () => {
   // 2026-01-01T16:00:00Z = 北京 2026-01-02 00:00:00——h24 形态会输出 24:00:00
   const midnight = formatDateInTz(new Date('2026-01-01T16:00:00Z'), 'Asia/Shanghai')
   assert.equal(midnight, '2026-01-02 00:00:00')

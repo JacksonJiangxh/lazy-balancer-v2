@@ -10,7 +10,7 @@ import (
 	"lazy-balancer-v2/internal/models"
 )
 
-// 历史修复：历史修复 组合消息不得随连续失败无界增长——组合只保留标记段首个失败原因，
+// 组合消息不得随连续失败无界增长——组合只保留标记段首个失败原因，
 // 传输错误以「已连续 N 次」计数表示，消息长度必须有界（几百字节封顶）。
 func TestSyncService_recordSyncError_repeatedTransportFailures_boundedMessageWithCount(t *testing.T) {
 	// Given：重载失败标记已存在；之后连续 200 次传输层失败（错误内容固定）
@@ -49,7 +49,7 @@ func TestSyncService_recordSyncError_repeatedTransportFailures_boundedMessageWit
 	}
 }
 
-// 历史修复：PinMismatch 与传输错误同属自愈类，不得覆盖重载失败标记；
+// PinMismatch 与传输错误同属自愈类，不得覆盖重载失败标记；
 // 终止类错误（schema 过新，本节点无法安全解析）允许覆盖。
 func TestSyncService_recordSyncError_pinMismatchPreservesMarker_terminalOverwrites(t *testing.T) {
 	// Given：重载失败标记已存在
@@ -88,9 +88,9 @@ func TestSyncService_recordSyncError_pinMismatchPreservesMarker_terminalOverwrit
 	}
 }
 
-// 审计 历史修复：SchemaTooOld（v3 从节点拉到签名合法的旧 schema 主节点快照）与
+// SchemaTooOld（v3 从节点拉到签名合法的旧 schema 主节点快照）与
 // SignatureInvalid（含 v2 形态「主节点为旧版本」分支）同属非终止自愈类错误——
-// 历史修复 后 run 循环降级重试、主节点升级后自动恢复——不得覆盖重载失败标记；否则
+// 后 run 循环降级重试、主节点升级后自动恢复——不得覆盖重载失败标记；否则
 // 主节点临时回退旧版本期间标记丢失，304 全量重拉补偿永不触发，陈旧运行配置
 // 保持到下次真实版本变更或重启。
 func TestSyncService_recordSyncError_schemaTooOldAndSignatureInvalidPreserveMarker(t *testing.T) {
@@ -136,7 +136,7 @@ func TestSyncService_recordSyncError_schemaTooOldAndSignatureInvalidPreserveMark
 	}
 }
 
-// 历史修复：停机竞态下 beginPull 失败（Stop 期间）不得落库覆盖重载失败标记——
+// 停机竞态下 beginPull 失败（Stop 期间）不得落库覆盖重载失败标记——
 // 标记必须跨重启存活以触发首轮 304 全量重拉补偿。
 func TestSyncService_Pull_stopRace_doesNotOverwriteReloadMarker(t *testing.T) {
 	// Given：重载失败标记已存在；同步服务已停止（pullsStopped=true）

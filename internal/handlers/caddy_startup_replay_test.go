@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// 启动竞态修复（历史）测试夹具：临时监督器 pid 标记 + 临时回放标记路径
+// 启动竞态修复测试夹具：临时监督器 pid 标记 + 临时回放标记路径
 // + 短超时——与 caddy_test.go 监督器委托测试同注入缝模式（包级 var）。
 // supervisorAlive=true 形态以本测试进程 pid 冒充监督器（存活、状态非 Z，
 // caddyProcRoot 保持真 /proc）。

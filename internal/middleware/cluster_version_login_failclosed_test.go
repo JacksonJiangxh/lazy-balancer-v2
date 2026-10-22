@@ -1,6 +1,6 @@
 package middleware
 
-// 历史问题-13（历史）：登录/MFA 验证步的「触发器不可用即 500」fail-closed
+// 登录/MFA 验证步的「触发器不可用即 500」fail-closed
 // 仅主节点语义——users 触发器 WHEN COALESCE(is_master,1)=1，从节点锁写入
 // （login_locked_until 置锁/清零）本就不会 bump cluster_version，fail-closed
 // 在从端零保护收益、只截断登录可用性（与票据登录的排除口径一致）。

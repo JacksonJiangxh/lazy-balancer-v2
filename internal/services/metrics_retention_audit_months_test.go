@@ -7,7 +7,7 @@ import (
 )
 
 // 2026-09-15 用户裁定:指标历史固定保留最近 7 天,不读任何配置项
-// (覆盖 历史修复 复用「日志保留」的裁定);metrics_retention_days 死列已清退。
+// (覆盖复用「日志保留」的裁定);metrics_retention_days 死列已清退。
 func setupMetricsRetentionTest(t *testing.T) {
 	t.Helper()
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB

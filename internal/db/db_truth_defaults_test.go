@@ -7,7 +7,9 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -32,14 +34,16 @@ func TestFreshSchemaDefaults_MatchGovernedConstants(t *testing.T) {
 		{"lb_rules", "health_check_unhealthy_threshold", fmt.Sprint(DefaultHealthCheckUnhealthyThreshold), 1},
 		{"lb_rules", "health_check_healthy_threshold", fmt.Sprint(DefaultHealthCheckHealthyThreshold), 1},
 		{"lb_rules", "tcp_try_interval", fmt.Sprint(DefaultTCPTryInterval), 1},
-		// 历史修复（历史）：双向钉补齐——批 3 治理列此前只有消费侧 fail-visible 钉
+		// 双向钉补齐——批 3 治理列此前只有消费侧 fail-visible 钉
 		//（render_db_truth_test.go），DDL DEFAULT 与治理常量未双向钉。
 		{"global_config", "cert_expiry_days", fmt.Sprint(DefaultCertExpiryDays), 0},
-		// 历史问题（历史）：续期天数/次数与 cert_expiry_days 同族，DDL DEFAULT
+		// 续期天数/次数与 cert_expiry_days 同族，DDL DEFAULT
 		// 与常量双向钉死。
 		{"global_config", "cert_renewal_days", fmt.Sprint(DefaultCertRenewalDays), 0},
 		{"global_config", "cert_renewal_attempts", fmt.Sprint(DefaultCertRenewalAttempts), 0},
 		{"security_policies", "anomaly_threshold", fmt.Sprint(DefaultAnomalyThreshold), 0},
+		// 时区：fresh DDL DEFAULT 与读侧兜底单源（空串非法库值，启动归一收敛）。
+		{"global_config", "timezone", "'" + DefaultTimezone + "'", 0},
 	}
 	for _, tc := range cases {
 		var dflt *string
@@ -50,15 +54,15 @@ func TestFreshSchemaDefaults_MatchGovernedConstants(t *testing.T) {
 		if dflt == nil || *dflt != tc.want {
 			t.Fatalf("%s.%s DEFAULT=%v, want %s", tc.table, tc.column, dflt, tc.want)
 		}
-		// 历史问题（历史）：值型族钉测补 notnull——只比 dflt_value 会放过
-		// 「DEFAULT 对但可空」的重建退化（历史问题 同族事故）。
+		// 值型族钉测补 notnull——只比 dflt_value 会放过
+		// 「DEFAULT 对但可空」的重建退化。
 		if notNull != tc.notNull {
 			t.Fatalf("%s.%s notnull=%d, want %d", tc.table, tc.column, notNull, tc.notNull)
 		}
 	}
 }
 
-// 历史问题（历史）：安全事件保留/大屏四列只存在于 newColumns 补列通道
+// 安全事件保留/大屏四列只存在于 newColumns 补列通道
 // （fresh CREATE 无此四列），其 DDL 形状必须在真实启动迁移后与 db.Default*
 // 常量一致——默认值曾是 4 处字面量副本（DDL/回填/读侧/导入），漏改即漂移。
 func TestRunMigrationsColumnDefaults_MatchGovernedConstants(t *testing.T) {
@@ -97,7 +101,7 @@ func TestRunMigrationsColumnDefaults_MatchGovernedConstants(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：升级路径的 lb_rules 重建 DDL 必须与 fresh CREATE 同形
+// 升级路径的 lb_rules 重建 DDL 必须与 fresh CREATE 同形
 // ——健康检查族五列曾退化为可空（health_check_timeout 默认还是陈旧的 5），
 // 重建后的库形状与新建库分叉且无后续收敛路径。断言重建后 pragma_table_info
 // 与 fresh 逐列相等（name/type/notnull/dflt_value/pk 全字段）。
@@ -246,7 +250,7 @@ func TestRunMigrationsBackfillsInvalidValueColumns(t *testing.T) {
 	if _, err := database.Exec(`INSERT INTO global_config (id,caddy_config) VALUES (1,'{}')`); err != nil {
 		t.Fatalf("seed global config: %v", err)
 	}
-	// 历史修复（历史）：cert_expiry_days 回填钉（defaultUpdates 已含该列——
+	// cert_expiry_days 回填钉（defaultUpdates 已含该列——
 	// NULL/<=0 归 DefaultCertExpiryDays；用户已设有效值保留）。
 	if _, err := database.Exec("UPDATE global_config SET cert_expiry_days=0, cert_renewal_days=0, cert_renewal_attempts=0"); err != nil {
 		t.Fatalf("zero cert expiry/renewal columns: %v", err)
@@ -260,12 +264,15 @@ func TestRunMigrationsBackfillsInvalidValueColumns(t *testing.T) {
 	if _, err := database.Exec(`UPDATE global_config SET request_body_max_size_mb=0, http_read_timeout=0, http_write_timeout=0, http_idle_timeout=0, caddy_log_size_mb=0`); err != nil {
 		t.Fatalf("zero globals: %v", err)
 	}
-	if _, err := database.Exec(`UPDATE lb_rules SET health_check_interval=0, health_check_timeout=0, health_check_unhealthy_threshold=0, health_check_healthy_threshold=0, tcp_try_interval=0 WHERE caddy_id='lb-backfill-a'`); err != nil {
+	if _, err := database.Exec(`UPDATE lb_rules SET health_check_interval=0, health_check_timeout=0, health_check_unhealthy_threshold=0, health_check_healthy_threshold=0, tcp_try_interval=0, strategy=NULL WHERE caddy_id='lb-backfill-a'`); err != nil {
 		t.Fatalf("zero rule columns: %v", err)
 	}
 	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,listen_port,enabled,health_check_interval,health_check_timeout,health_check_unhealthy_threshold,health_check_healthy_threshold,tcp_try_interval)
 		VALUES ('lb-backfill-b','b','http',9102,1,37,13,5,4,777)`); err != nil {
 		t.Fatalf("seed rule b: %v", err)
+	}
+	if _, err := database.Exec("UPDATE lb_rules SET strategy='least_conn' WHERE caddy_id='lb-backfill-b'"); err != nil {
+		t.Fatalf("seed explicit strategy: %v", err)
 	}
 
 	// When：迁移两轮——幂等且不覆盖用户已设值。
@@ -298,9 +305,9 @@ func TestRunMigrationsBackfillsInvalidValueColumns(t *testing.T) {
 	assertScalar("SELECT http_write_timeout FROM global_config WHERE id=1", DefaultHTTPWriteTimeout)
 	assertScalar("SELECT http_idle_timeout FROM global_config WHERE id=1", DefaultHTTPIdleTimeout)
 	assertScalar("SELECT caddy_log_size_mb FROM global_config WHERE id=1", DefaultCaddyLogSizeMB)
-	// 历史修复（历史）：cert_expiry_days 回填归 DefaultCertExpiryDays。
+	// cert_expiry_days 回填归 DefaultCertExpiryDays。
 	assertScalar("SELECT cert_expiry_days FROM global_config WHERE id=1", DefaultCertExpiryDays)
-	// 历史问题（历史）：续期天数/次数同批回填（此前只有 DDL DEFAULT）。
+	// 续期天数/次数同批回填（此前只有 DDL DEFAULT）。
 	assertScalar("SELECT cert_renewal_days FROM global_config WHERE id=1", DefaultCertRenewalDays)
 	assertScalar("SELECT cert_renewal_attempts FROM global_config WHERE id=1", DefaultCertRenewalAttempts)
 	assertScalar("SELECT health_check_interval FROM lb_rules WHERE caddy_id='lb-backfill-a'", DefaultHealthCheckInterval)
@@ -308,19 +315,21 @@ func TestRunMigrationsBackfillsInvalidValueColumns(t *testing.T) {
 	assertScalar("SELECT health_check_unhealthy_threshold FROM lb_rules WHERE caddy_id='lb-backfill-a'", DefaultHealthCheckUnhealthyThreshold)
 	assertScalar("SELECT health_check_healthy_threshold FROM lb_rules WHERE caddy_id='lb-backfill-a'", DefaultHealthCheckHealthyThreshold)
 	assertScalar("SELECT tcp_try_interval FROM lb_rules WHERE caddy_id='lb-backfill-a'", DefaultTCPTryInterval)
+	assertScalar("SELECT COALESCE(strategy,'') FROM lb_rules WHERE caddy_id='lb-backfill-a'", "weighted_round_robin")
 	// 用户已设值保留（幂等第二轮后仍原样）。
 	assertScalar("SELECT health_check_interval FROM lb_rules WHERE caddy_id='lb-backfill-b'", 37)
 	assertScalar("SELECT health_check_timeout FROM lb_rules WHERE caddy_id='lb-backfill-b'", 13)
 	assertScalar("SELECT health_check_unhealthy_threshold FROM lb_rules WHERE caddy_id='lb-backfill-b'", 5)
 	assertScalar("SELECT health_check_healthy_threshold FROM lb_rules WHERE caddy_id='lb-backfill-b'", 4)
 	assertScalar("SELECT tcp_try_interval FROM lb_rules WHERE caddy_id='lb-backfill-b'", 777)
+	assertScalar("SELECT strategy FROM lb_rules WHERE caddy_id='lb-backfill-b'", "least_conn")
 }
 
-// 历史问题（历史）：6 张整表重建表此前只有 lb_rules/cert_jobs 有
+// 6 张整表重建表此前只有 lb_rules/cert_jobs 有
 // 「重建 DDL ≡ fresh DDL 全列 name/type/notnull/default/pk」钉测；users /
 // security_policies / nodes（nodes 见 db_nodes_rebuild_parity_test.go）缺回归
 // 形状——新增列只改 fresh 不改正重建时，二次 ensureNewColumns 会以默认值补回
-// 列，用户值静默丢失（OIDC / 历史修复 / 历史问题 三次先例）。
+// 列，用户值静默丢失（OIDC / 三次先例）。
 func assertShapeMatchesFresh(t *testing.T, table string, fresh []pragmaColumn, rebuilt []pragmaColumn) {
 	t.Helper()
 	freshColumns := make(map[string]pragmaColumn, len(fresh))
@@ -508,5 +517,75 @@ func TestRunMigrationsBackfillsEmptyTimezone(t *testing.T) {
 	}
 	if tz != "America/New_York" {
 		t.Fatalf("timezone=%q, want America/New_York（已设值不得被归一抹掉）", tz)
+	}
+}
+
+// 治理默认值消费侧单源：时区/安全策略异常评分/健康检查与重试间隔的库读兜底
+// 必须绑定 db.Default* 常量。此前这些读侧 SQL 各写一份字面量，DDL DEFAULT 改
+// 值后消费侧静默分叉（request_body 同族事故形态）。本钉测按源码文本双向断言：
+// 字面量不得回流 + 常量引用必须存在。
+func TestGovernedDefaultLiteralsBoundInConsumers(t *testing.T) {
+	cases := []struct {
+		file      string
+		forbidden []string
+		required  []string
+	}{
+		{
+			file:      "../handlers/caddy.go",
+			forbidden: []string{`COALESCE(timezone,'Asia/Shanghai')`},
+			required:  []string{"db.DefaultTimezone"},
+		},
+		{
+			file:      "../handlers/auditlog.go",
+			forbidden: []string{`COALESCE(timezone,'Asia/Shanghai')`},
+			required:  []string{"db.DefaultTimezone"},
+		},
+		{
+			file:      "../handlers/config_changes.go",
+			forbidden: []string{`COALESCE(timezone,'Asia/Shanghai')`},
+			required:  []string{"db.DefaultTimezone"},
+		},
+		{
+			file:      "../services/cluster_snapshot.go",
+			forbidden: []string{`COALESCE(timezone,'Asia/Shanghai')`},
+			required:  []string{"db.DefaultTimezone"},
+		},
+		{
+			file:      "../services/tz.go",
+			forbidden: []string{`COALESCE(timezone,'Asia/Shanghai')`},
+			required:  []string{"db.DefaultTimezone"},
+		},
+		{
+			file:      "../handlers/config_backup.go",
+			forbidden: []string{`"anomaly_threshold": int64(5)`, `policy["anomaly_threshold"] = int64(5)`},
+			required:  []string{"db.DefaultAnomalyThreshold"},
+		},
+		{
+			file: "../handlers/config_import_v1.go",
+			forbidden: []string{
+				"rule.HealthFails = 3", "rule.HealthInt = 10", ", 2, ?, 0, 0, 250,",
+			},
+			required: []string{
+				"db.DefaultHealthCheckUnhealthyThreshold", "db.DefaultHealthCheckInterval",
+				"db.DefaultHealthCheckHealthyThreshold", "db.DefaultTCPTryInterval",
+			},
+		},
+	}
+	for _, tc := range cases {
+		data, err := os.ReadFile(filepath.FromSlash(tc.file))
+		if err != nil {
+			t.Fatalf("read %s: %v", tc.file, err)
+		}
+		content := string(data)
+		for _, literal := range tc.forbidden {
+			if strings.Contains(content, literal) {
+				t.Errorf("%s 仍含写死治理默认值 %q（应绑定 db.Default* 常量）", tc.file, literal)
+			}
+		}
+		for _, binding := range tc.required {
+			if !strings.Contains(content, binding) {
+				t.Errorf("%s 未出现治理常量引用 %q", tc.file, binding)
+			}
+		}
 	}
 }

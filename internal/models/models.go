@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// RevokedTokenTimeFormat 吊销 JWT 的 expires_at 统一格式（历史修复 收敛：
+// RevokedTokenTimeFormat 吊销 JWT 的 expires_at 统一格式（收敛
 // handlers 写侧与 middleware 读侧曾跨包双份定义——单侧改动会静默失配）。
 const RevokedTokenTimeFormat = "2006-01-02T15:04:05Z"
 
@@ -37,8 +37,8 @@ type UserResponse struct {
 }
 
 // NewUserResponse 构造用户响应。mfaEnabled 必须由调用方从 users.mfa_enabled
-// 读取后传入：历史修复将原本「构造后手工 response.MFAEnabled=…」
-// 的口径收敛为签名参数——历史问题/两次历史问题 两次都因新增返回路径忘记
+// 读取后传入：将原本「构造后手工 response.MFAEnabled=…」
+// 的口径收敛为签名参数——/两次两次都因新增返回路径忘记
 // 补字段导致 mfa_enabled 恒 false（前端登录预检误报）。签名强制让遗漏在
 // 编译期失败，而不是静默返回错误值。
 func NewUserResponse(user User, mfaEnabled bool) UserResponse {
@@ -171,7 +171,7 @@ type LbRule struct {
 	TLSCert         string `json:"tls_cert,omitempty"`
 	TLSKey          string `json:"tls_key,omitempty"`
 	// TLSKeySet 标记「已有隐藏私钥」——GetRule 对只读 Key/非管理员掩码 tls_key
-	// 为空串时置 true，编辑表单借此区分「未配置」与「已隐藏」（历史问题）。
+	// 为空串时置 true，编辑表单借此区分「未配置」与「已隐藏」。
 	TLSKeySet       bool   `json:"tls_key_set,omitempty"`
 	TLSHTTPRedirect bool   `json:"tls_http_redirect"`
 	EnableCompress  bool   `json:"enable_compress"`
@@ -304,7 +304,7 @@ type Upstream struct {
 	Port   int    `json:"port"`
 	Weight int    `json:"weight"`
 	// DynamicDNS 是 upstreams 表的废弃列：渲染只读规则级 DynamicDNS，写侧
-	// 恒落 0（历史值不再传播）。保留字段仅维持 JSON 形状（导出/备份/快照
+	// 恒落 0（值不再传播）。保留字段仅维持 JSON 形状（导出/备份/快照
 	// 携带恒 false），新代码禁止据此做任何判定。
 	DynamicDNS     bool   `json:"dynamic_dns"`
 	Enabled        bool   `json:"enabled"`
@@ -420,7 +420,7 @@ type CertJob struct {
 	UpdatedAt        JSONNullTime `json:"updated_at"`
 }
 
-// LoginRequest 登录入参。历史问题（历史）：username/password 补长度上限——
+// LoginRequest 登录入参。username/password 补长度上限——
 // 此前仅 required，未认证请求可携带 ~64KiB「用户名」，失败登录按原文写入
 // audit_log（每次一行等大，限流 10/min/IP 可被分布式绕开，放大审计库）。
 // 上限与写入侧对齐：username=users.username 列宽 50；password=bcrypt 有效
@@ -512,14 +512,14 @@ type CreateRuleRequest struct {
 	BlockPageStage1Status int `json:"block_page_stage1_status"`
 	BlockPageStage3ID     int `json:"block_page_stage3_id"`
 	BlockPageStage3Status int `json:"block_page_stage3_status"`
-	// 历史修复：缺省（nil）=创建即启用（向后兼容历史调用方）；显式 false=创建为
+	// 缺省（nil）=创建即启用（向后兼容历史调用方）；显式 false=创建为
 	// 禁用（UI 复制向导按预览「禁用」态落库）。
 	Enabled *bool `json:"enabled,omitempty"`
 }
 
 type UpdateRuleRequest struct {
 	Name string `json:"name"`
-	// 历史修复：HostHeader/Description/DnsServer/HealthCheckPath 指针化——
+	// HostHeader/Description/DnsServer/HealthCheckPath 指针化——
 	// 省略（nil）=保留原值，显式空串=清空；旧行为空串与省略无法区分。
 	Description         *string `json:"description"`
 	Protocol            string  `json:"protocol"`
@@ -533,13 +533,13 @@ type UpdateRuleRequest struct {
 	HealthCheckPath     *string `json:"health_check_path"`
 	HealthCheckInterval int     `json:"health_check_interval"`
 	HealthCheckTimeout  int     `json:"health_check_timeout"`
-	// 历史问题（历史修复 口径续）：健康检查双阈值指针化——省略（nil）=保留原值。
+	// 健康检查双阈值指针化——省略（nil）=保留原值。
 	// 显式 0 不再落库：写侧校验 400、启动迁移回填默认 3/2，渲染层直读库值
 	// 且无效值显性失败（无写死兜底）。
 	HealthCheckUnhealthyThreshold *int  `json:"health_check_unhealthy_threshold"`
 	HealthCheckHealthyThreshold   *int  `json:"health_check_healthy_threshold"`
 	EnableActiveHealthCheck       *bool `json:"enable_active_health_check"`
-	// 历史修复（历史修复 口径续）：TCP 字段指针化——省略（nil）=保留原值。
+	// TCP 字段指针化——省略（nil）=保留原值。
 	// tcp_try_duration 0=不重试；tcp_try_interval 由启动回填默认 2（写侧
 	// <=0 拒绝），tcp_health_check_port 0=跟随上游端口。
 	TCPHealthCheckPort       *int  `json:"tcp_health_check_port"`
@@ -617,7 +617,7 @@ type UpdateConfigRequest struct {
 	JWTExpireMinutes           *int    `json:"jwt_expire_minutes"`
 	Timezone                   *string `json:"timezone"`
 	GitHubProxyURL             *string `json:"github_proxy_url"`
-	// GitHubToken 可选令牌三态（历史问题 起）：nil=保持现值、空串=清除
+	// GitHubToken 可选令牌三态：nil=保持现值、空串=清除
 	// （唯一撤销路径）、非空=覆盖。响应面永不回显（GlobalConfig.GitHubToken json:"-"）。
 	GitHubToken         *string `json:"github_token"`
 	DefaultCAProviderID *int    `json:"default_ca_provider_id"`
@@ -690,7 +690,7 @@ type SystemInfo struct {
 	RunningStatus string            `json:"running_status"`
 	Uptime        int64             `json:"uptime"`
 	// NodeMode 三态：master / slave / unknown（unknown=角色查询失败或库未装配，
-	// 历史修复——不得把查询失败静默呈现为 master 误导排障）。
+	// 不得把查询失败静默呈现为 master 误导排障）。
 	NodeMode string `json:"node_mode"`
 	Version  string `json:"version"`
 }

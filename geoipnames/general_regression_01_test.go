@@ -6,9 +6,9 @@ import (
 	"testing"
 )
 
-// officialUAs 每引擎一条官方 UA fixture（来源=各厂商官方爬虫文档）。历史修复：
+// officialUAs 每引擎一条官方 UA fixture（来源=各厂商官方爬虫文档）。
 // Sogou 正则此前只允许 `+` 分隔（官方 UA 是空格分隔）→「搜狗」豁免静默失效；
-// 历史修复：注册表无「每引擎一条官方 UA」合集断言，同族 bug 无绊线。本表与
+// 注册表无「每引擎一条官方 UA」合集断言，同族 bug 无绊线。本表与
 // 注册表一一对应——新增引擎不补 fixture 即跳红。
 var officialUAs = map[string]string{
 	"googlebot":     "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
@@ -28,7 +28,7 @@ var officialUAs = map[string]string{
 	"bytespider":    "Mozilla/5.0 (compatible; Bytespider; spider-feedback@bytedance.com)",
 }
 
-// 历史修复：搜狗官方 UA 形状（空格分隔，以及历史上少数 `+` 分隔变体）必须命中；
+// 搜狗官方 UA 形状（空格分隔，以及历史上少数 `+` 分隔变体）必须命中；
 // 无分隔的垃圾串不再视为爬虫。
 func TestMatchCrawlerEngine_sogouOfficialUAs(t *testing.T) {
 	for _, ua := range []string{
@@ -50,7 +50,7 @@ func TestMatchCrawlerEngine_sogouOfficialUAs(t *testing.T) {
 	}
 }
 
-// 历史修复：注册表结构不变量——ID 唯一/非空、UARegex 非 nil、每条官方 UA
+// 注册表结构不变量——ID 唯一/非空、UARegex 非 nil、每条官方 UA
 // fixture 命中且只命中本引擎、PTR 后缀以 "." 开头（防 evilgooglebot.com
 // 类后缀误命中）、iprange 引擎必须有可解析 IP 段、ptr 引擎必须有后缀。
 func TestCrawlerEngines_registryInvariants(t *testing.T) {
@@ -117,7 +117,7 @@ func TestCrawlerEngines_registryInvariants(t *testing.T) {
 	}
 }
 
-// 历史修复：PTR 后缀锚定 + FQDN 尾点容忍（消费方会剥尾点，库层亦不应因尾点
+// PTR 后缀锚定 + FQDN 尾点容忍（消费方会剥尾点，库层亦不应因尾点
 // 失效）；空串、根域、无主机标签、跨引擎后缀全部不命中。
 func TestCrawlerEnginePTRMatch_anchoringAndTrailingDot(t *testing.T) {
 	cases := []struct {
@@ -143,7 +143,7 @@ func TestCrawlerEnginePTRMatch_anchoringAndTrailingDot(t *testing.T) {
 	}
 }
 
-// 历史修复：CrawlerEngines 的「副本」必须深拷贝（裸 copy 只复制结构体，
+// CrawlerEngines 的「副本」必须深拷贝（裸 copy 只复制结构体，
 // PTRSuffixes/IPRanges 仍共享底层数组——out[i].PTRSuffixes[0]=… 会写穿全局）。
 func TestCrawlerEngines_returnsDeepCopy(t *testing.T) {
 	first := CrawlerEngines()
@@ -169,7 +169,7 @@ func TestCrawlerEngines_returnsDeepCopy(t *testing.T) {
 	}
 }
 
-// 历史修复：省/市规范化的表驱动语义单源（geoipnames）——选项树（tree）与
+// 省/市规范化的表驱动语义单源（geoipnames）——选项树（tree）与
 // 发射（emit）两端共用同一 core，策略差异仅在两端显式声明处。此前
 // internal/services 与 caddygeoip 各持一份手工镜像，语义分叉靠调用点补偿。
 func TestNormalizeRegion_singleSourceSemantics(t *testing.T) {

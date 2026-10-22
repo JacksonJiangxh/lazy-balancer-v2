@@ -15,7 +15,7 @@ const fastFileMagic = "LBF1"
 // fastFileHeaderSize 是 .fast 文件头固定长度。
 const fastFileHeaderSize = 16
 
-// MaxFastFileBytes 是 ReadFastFile 读取前的体积硬上限（历史问题，历史
+// MaxFastFileBytes 是 ReadFastFile 读取前的体积硬上限（历史
 // 审计）：.fast 是跨进程输入（节点回传/从节点回退），不能只依赖写侧自律——
 // 异常/恶意超大文件必须先过 Stat 体积门，再进入读取与内容校验。与文本名单
 // 路径的 MaxFileBytes（iplistfast.go）同型；二进制条目 5B/v4、17B/v6，
@@ -35,14 +35,14 @@ type FastFileState struct {
 // 防御性掩码主机位并排序——调用方切片的内容与顺序都不被改写。本函数不
 // 聚合/不去重；嵌套/同址形态由 ReadFastFile 拒绝。
 //
-// 族校验（历史问题）：v4 切片只接受纯 IPv4 前缀，v6 切片只接受纯 IPv6 前缀
+// 族校验：v4 切片只接受纯 IPv4 前缀，v6 切片只接受纯 IPv6 前缀
 // （4in6 映射形态须先 Unmap 归 v4）。族错配返回 error 而不是 panic/静默腐化
 // ——As4 对 v6 入参 panic；As16 对 v4 会写出「4-in-6 地址 + v4 bits」的
 // 可加载但永不命中形态。主机位未掩码的条目（如 1.2.3.200/24）会让二分查询
 // 用未掩码地址比较而假阴性——写侧必须先掩码；读侧亦对每项校验 p==p.Masked()
-// （历史问题：.fast 是跨进程输入，不单靠写侧自律）。
+// （.fast 是跨进程输入，不单靠写侧自律）。
 //
-// 原子写用独占临时名（CreateTemp，历史问题）：固定 path+".tmp" 在并发/多调用
+// 原子写用独占临时名（CreateTemp）：固定 path+".tmp" 在并发/多调用
 // 方下互相覆盖（rename ENOENT 或旧代际覆盖新代际）。本函数自身不持锁，
 // 生产调用方仍须持 wafFileMu 串行化代际。
 func WriteFastFile(path string, v4, v6 []netip.Prefix) error {
@@ -144,7 +144,7 @@ func WriteFastFile(path string, v4, v6 []netip.Prefix) error {
 // ReadFastFile 读取 .fast 二进制文件并展开为内存前缀集。
 // 加载成本 O(n) 纯内存拷贝——无文本解析、无排序（20 万条 ~0.2ms）。
 func ReadFastFile(path string) (*FastFileState, error) {
-	// 历史问题：读取前 Stat 体积门——超限文件不进入内存（防 OOM），
+	// 读取前 Stat 体积门——超限文件不进入内存（防 OOM），
 	// 读取后的 header/expectedSize 一致性校验保留作第二道。
 	if info, err := os.Stat(path); err != nil {
 		return nil, fmt.Errorf("fastfile stat: %w", err)
@@ -163,7 +163,7 @@ func ReadFastFile(path string) (*FastFileState, error) {
 	}
 	v4Count := binary.BigEndian.Uint32(data[4:8])
 	v6Count := binary.BigEndian.Uint32(data[8:12])
-	// 历史问题：未知 flags 位不得静默忽略（格式演进必须显式：未来的特性位
+	// 未知 flags 位不得静默忽略（格式演进必须显式：未来的特性位
 	// 若被当 0 解析，会按错误的条目布局读数据）。
 	if flags := binary.BigEndian.Uint32(data[12:16]); flags != 0 {
 		return nil, fmt.Errorf("fastfile: unknown flags %#x", flags)
@@ -179,7 +179,7 @@ func ReadFastFile(path string) (*FastFileState, error) {
 		V6: make([]netip.Prefix, v6Count),
 	}
 
-	// 历史修复（历史问题）：腐化防御——bits 越界（netip.PrefixFrom 产 invalid
+	// 腐化防御——bits 越界（netip.PrefixFrom 产 invalid
 	// 前缀）与地址降序都会静默破坏二分判定的排序不变量，响亮拒绝。
 	// 展开 v4
 	offset := fastFileHeaderSize
@@ -191,7 +191,7 @@ func ReadFastFile(path string) (*FastFileState, error) {
 			return nil, fmt.Errorf("fastfile: v4 entry %d bits out of range: %d", i, bits)
 		}
 		state.V4[i] = netip.PrefixFrom(netip.AddrFrom4(addr), bits)
-		// 历史问题：主机位必须已掩码——与写侧同一不变量。未掩码条目
+		// 主机位必须已掩码——与写侧同一不变量。未掩码条目
 		// （1.2.3.200/24）地址升序/不相交校验都可能通过，但二分查询用
 		// 未掩码地址比较会假阴性（威胁名单静默漏拦）。读侧是跨进程输入
 		// （节点回传的 .fast），不能只依赖写侧自律。
@@ -201,7 +201,7 @@ func ReadFastFile(path string) (*FastFileState, error) {
 		if i > 0 && state.V4[i-1].Addr().Compare(state.V4[i].Addr()) > 0 {
 			return nil, fmt.Errorf("fastfile: v4 entries not in ascending order at %d", i)
 		}
-		// 历史修复（历史问题）：嵌套/同址不同 bits（升序合法却互相包含）会被
+		// 嵌套/同址不同 bits（升序合法却互相包含）会被
 		// 窄段遮蔽产生二分假阴性——「可加载但查询错误」的最坏静默腐化形态，
 		// 响亮拒绝。
 		if i > 0 && state.V4[i-1].Contains(state.V4[i].Addr()) {
@@ -227,14 +227,14 @@ func ReadFastFile(path string) (*FastFileState, error) {
 			return nil, fmt.Errorf("fastfile: v6 entry %d is a 4-in-6 mapped address: %s", i, entryAddr)
 		}
 		state.V6[i] = netip.PrefixFrom(entryAddr, bits)
-		// 历史问题：v6 同口径——主机位未掩码即拒。
+		// v6 同口径——主机位未掩码即拒。
 		if state.V6[i] != state.V6[i].Masked() {
 			return nil, fmt.Errorf("fastfile: v6 entry %d host bits not masked: %s", i, state.V6[i])
 		}
 		if i > 0 && state.V6[i-1].Addr().Compare(state.V6[i].Addr()) > 0 {
 			return nil, fmt.Errorf("fastfile: v6 entries not in ascending order at %d", i)
 		}
-		// 历史修复：v6 同口径——互相包含即拒。
+		// v6 同口径——互相包含即拒。
 		if i > 0 && state.V6[i-1].Contains(state.V6[i].Addr()) {
 			return nil, fmt.Errorf("fastfile: v6 entries not disjoint at %d (%s contains %s)", i, state.V6[i-1], state.V6[i])
 		}

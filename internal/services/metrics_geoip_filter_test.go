@@ -36,7 +36,7 @@ func TestFilterGeoipPassSeries_shapes(t *testing.T) {
 	}
 }
 
-// 历史修复 联动：过滤后的文本必须同时用于 per-host 存储——此前只断言全局
+// 联动：过滤后的文本必须同时用于 per-host 存储——此前只断言全局
 // TotalRequests，per-host 仍按未过滤文本落库（双计）不会被发现。
 func TestCollect_perHostUsesFilteredSeries(t *testing.T) {
 	setupMetricsRetentionTest(t)

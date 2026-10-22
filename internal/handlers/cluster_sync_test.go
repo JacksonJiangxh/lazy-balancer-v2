@@ -15,7 +15,7 @@ import (
 )
 
 func TestAuthenticatedClusterToken_uses_bearer_token(t *testing.T) {
-	// 历史问题(历史):收敛为只读 ctx 值——两处调用方均挂
+	// 收敛为只读 ctx 值——两处调用方均挂
 	// clusterTokenAuth(成功恒 Set cluster_token),头部回退不可达且语义分叉。
 	// Given:中间件已注入
 	context, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -65,7 +65,7 @@ func TestPullClusterSnapshot_persists_manual_sync_failure(t *testing.T) {
 	}
 }
 
-// 历史问题(历史):同步下发审计的节点名查询失败(节点已删除)不得落
+// 同步下发审计的节点名查询失败(节点已删除)不得落
 // 尾部空名的「节点 」,回退「节点 #<id>」。
 func TestGetClusterSnapshot_auditFallsBackToNodeID(t *testing.T) {
 	// Given:主节点 + cluster_node_id 指向不存在的节点 999
@@ -107,7 +107,7 @@ func TestGetClusterSnapshot_auditFallsBackToNodeID(t *testing.T) {
 }
 
 func TestPullClusterSnapshot_master_rejected_without_sync_error(t *testing.T) {
-	// 历史修复 回归：主节点调手动同步端点必须入口直接 400（不调 Pull），
+	// 回归：主节点调手动同步端点必须入口直接 400（不调 Pull），
 	// 且 last_sync_error 保持为空——不得让节点页面显示无自愈路径的假错误。
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	if err := db.Initialize(t.TempDir()); err != nil {
@@ -191,7 +191,7 @@ func TestGetClusterWafFiles_demotedMasterForbidden(t *testing.T) {
 	}
 }
 
-// 历史问题（历史问题，历史修复 同族收敛）：PullClusterSnapshot 曾直接调用
+// PullClusterSnapshot 曾直接调用
 // h.syncService.Pull/Resume 而无 nil 判定——同族（SetClusterMode/Promote/
 // ForgetClusterPins）均以 503「同步服务未初始化」前置。装配缺失或测试注入
 // nil 时，从节点手动同步会 nil 指针 panic（Gin recovery → 500 空体），
@@ -216,7 +216,7 @@ func TestPullClusterSnapshot_missingSyncServiceReturnsUnavailable(t *testing.T) 
 	}
 }
 
-// 集群服务装配缺失时 ForgetClusterPins 必须 历史修复——此前
+// 集群服务装配缺失时 ForgetClusterPins 必须 ——此前
 // `if h.clusterService != nil` 包裹主节点守卫，nil 时直接放行清除本机全部
 // TOFU 钉（主节点误清从节点钉的风险路径）。
 func TestForgetClusterPins_missingClusterServiceFailsClosed(t *testing.T) {
@@ -234,7 +234,7 @@ func TestForgetClusterPins_missingClusterServiceFailsClosed(t *testing.T) {
 	}
 }
 
-// 配置导入窗口内手动同步必须 409 历史修复——Pull 会写
+// 配置导入窗口内手动同步必须 409 ——Pull 会写
 // global_config/lb_rules 等导入全量替代表，窗口内提交会被静默覆盖或阻塞至
 // busy_timeout 后 500；后台 daemon 仍按「主节点为准」保留。
 func TestPullClusterSnapshot_conflictsWhileImportInProgress(t *testing.T) {
@@ -253,5 +253,55 @@ func TestPullClusterSnapshot_conflictsWhileImportInProgress(t *testing.T) {
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/cluster/sync/pull", nil))
 	if response.Code != http.StatusConflict {
 		t.Fatalf("status=%d body=%s, want 409（导入窗口内手动同步）", response.Code, response.Body.String())
+	}
+}
+
+// 快照下发审计的节点名必须取自 handler 注入的 clusterService 句柄（与其快照
+// 读取同一库）；直读全局 db.DB 会在句柄与全局库不一致时（测试注入/多实例）
+// 审计到另一库的同 ID 节点名，审计对象被错标。
+func TestGetClusterSnapshot_auditNodeNameReadsServiceHandle(t *testing.T) {
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
+	if err := db.Initialize(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	serviceDB := db.DB
+	if err := db.Initialize(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+		_ = serviceDB.Close()
+		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		db.SetDB(oldDB)
+	})
+	// 两个库各有节点 21，名字不同：审计必须取服务句柄库里的名字。
+	if _, err := serviceDB.Exec(`INSERT INTO nodes (id,name,ip_address,port,status,is_approved) VALUES (21,'svc-named','10.0.0.21',8000,'online',1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO nodes (id,name,ip_address,port,status,is_approved) VALUES (21,'global-named','10.0.0.21',8000,'online',1)`); err != nil {
+		t.Fatal(err)
+	}
+	h := &Handlers{clusterService: services.NewClusterService(serviceDB, "")}
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/cluster/sync/snapshot", func(c *gin.Context) {
+		c.Set("cluster_node_id", 21)
+		h.GetClusterSnapshot(c)
+	})
+
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/cluster/sync/snapshot", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q, want 200", response.Code, response.Body.String())
+	}
+	var detail string
+	if err := db.AuditDB.QueryRow("SELECT detail FROM audit_log WHERE action='同步下发' AND resource='集群节点' ORDER BY id DESC LIMIT 1").Scan(&detail); err != nil {
+		t.Fatalf("query sync audit: %v", err)
+	}
+	if !strings.Contains(detail, "节点 svc-named") {
+		t.Fatalf("audit detail=%q, want 服务句柄库中的节点名 svc-named", detail)
+	}
+	if strings.Contains(detail, "global-named") {
+		t.Fatalf("audit detail=%q, 不得读取全局 db.DB 库中的节点名", detail)
 	}
 }

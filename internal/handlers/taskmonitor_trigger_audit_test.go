@@ -1,14 +1,14 @@
 package handlers
 
-// 历史问题-1（历史）：7/12 可手动触发族手动触发在 audit_log 无痕——
-// AuditPolicySkip 的前提「任务体 defer 单记审计」（历史问题 时仅 3 自记族）随 v2.0
+// 7/12 可手动触发族手动触发在 audit_log 无痕——
+// AuditPolicySkip 的前提「任务体 defer 单记审计」随 v2.0
 // 可触发族扩容失效：现 12 族中 5 族自记（threat/crs/ip2region 任务体 defer +
 // auto-backup 执行器 + startup:config-load 载入审计），7 族任务体零审计
 // （log-cleanup/audit-retention/security-events-retention/cert-renewal-scan/
 // cert-reconcile/cert-manual-poll/cert-waiting-ca）。自动执行有审计（自记族）
 // 而手动（更高特权）反而无痕的倒挂随 trigger 路由整族豁免固化。
 // 修复口径：trigger handler 对非自记族显式补记「触发/任务监控」，自记族复记
-// 会违反 历史问题-2 单记裁定（2026-09-29 用户裁定），必须跳过。
+// 会违反 单记裁定（2026-09-29 用户裁定），必须跳过。
 
 import (
 	"fmt"
@@ -45,7 +45,7 @@ func TestTriggerSystemTask_nonSelfRecordingTriggerLeavesAudit(t *testing.T) {
 	if resp.Code != http.StatusOK {
 		t.Fatalf("log-cleanup 手动触发应 200, got %d %s", resp.Code, resp.Body.String())
 	}
-	// 历史问题：审计在 goroutine 内于 Trigger 成功后记录——轮询落库。
+	// 审计在 goroutine 内于 Trigger 成功后记录——轮询落库。
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if countTriggerAudit(t) > 0 {
@@ -58,7 +58,7 @@ func TestTriggerSystemTask_nonSelfRecordingTriggerLeavesAudit(t *testing.T) {
 
 // 回归形状：自记族 auto-backup（执行器注入点，测试环境未注入→任务体立即失败
 // 且零审计）手动触发时 handler 不得复记——否则与任务体 defer/执行器审计构成
-// 双记，违反 历史问题-2（2026-09-29 用户裁定）的单记口径。
+// 双记，违反 （2026-09-29 用户裁定）的单记口径。
 func TestTriggerSystemTask_selfRecordingTriggerSkipsHandlerAudit(t *testing.T) {
 	initTaskEngineForTest(t)
 	newBackupTestHandlers(t)
@@ -69,7 +69,7 @@ func TestTriggerSystemTask_selfRecordingTriggerSkipsHandlerAudit(t *testing.T) {
 	if resp.Code != http.StatusOK {
 		t.Fatalf("auto-backup 手动触发应 200, got %d %s", resp.Code, resp.Body.String())
 	}
-	// 历史问题：异步审计落库窗口后再断言零复记（自记族恒零 handler 审计）。
+	// 异步审计落库窗口后再断言零复记（自记族恒零 handler 审计）。
 	time.Sleep(200 * time.Millisecond)
 	if n := countTriggerAudit(t); n != 0 {
 		t.Fatalf("自记族 auto-backup 的 handler 复记会产生双审计（历史问题-2 单记裁定）, got %d 行", n)
@@ -86,7 +86,7 @@ func countTriggerFailAudit(t *testing.T) int {
 	return n
 }
 
-// 历史问题+历史问题（历史）：四处 go 闭包 te.Trigger 错误被吞——非自记族已
+// +：四处 go 闭包 te.Trigger 错误被吞——非自记族已
 // 补记「触发」但 Trigger 失败时任务未执行，审计只剩孤儿行；自记族零痕迹。
 // 修复：go 内 err 非 nil 时补记「触发失败」审计+日志（operator 闭包外预取——
 // gin.Context 在 handler 返回后被复用，闭包内读是竞态）。
@@ -114,7 +114,7 @@ func TestTriggerSystemTask_triggerFailureLeavesCompensationAudit(t *testing.T) {
 	t.Fatal("Trigger 失败路径零补偿审计——任务未执行/失败无痕（孤儿审计）")
 }
 
-// 历史修复（历史）：手动触发 409 预检（IsTaskInFlight）与异步 goroutine
+// 手动触发 409 预检（IsTaskInFlight）与异步 goroutine
 // Trigger 之间无原子性——并发双击两请求均可过预检，后到者在引擎 CAS 落败拿
 // ErrAlreadyRunning：任务实际已由先到请求启动，落「触发失败」审计是语义
 // 失真（用户看到失败而任务在跑）。修复：该错误在 goroutine 内静默。
@@ -188,14 +188,14 @@ func TestTriggerSystemTask_doubleClickRaceNoMisleadingFailAudit(t *testing.T) {
 	}
 	if !materialized {
 		// 回归必须触达 ErrAlreadyRunning 补偿分支；跳过会让该断言在
-		// 慢速/单核 CI 上永久假绿（历史）。
+		// 慢速/单核 CI 上永久假绿。
 		t.Fatal("50 次尝试内双击竞态未成形（预检均拦截）——未验证到目标分支")
 	}
 }
 
-// 历史修复（历史）：手动触发落在 skipped 终态时仍落「触发失败」审计
-// ——threat/crs/ip2region Run 体 demote 中止返回 ErrTaskSkipped（历史修复
-// 哨兵，task_runs 已落 skipped 行），历史修复 修 ErrAlreadyRunning 时同族扫描
+// 手动触发落在 skipped 终态时仍落「触发失败」审计
+// threat/crs/ip2region Run 体 demote 中止返回 ErrTaskSkipped
+// 哨兵，task_runs 已落 skipped 行），修 ErrAlreadyRunning 时同族扫描
 // 未延伸到该哨兵。skipped=「非故障放弃」，复记「触发失败」是语义失真
 // （用户看到失败而任务体明确声明放弃）。修复：goroutine 内静默
 // （镜像 ErrAlreadyRunning 分支）。

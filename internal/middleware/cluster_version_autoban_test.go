@@ -1,9 +1,9 @@
 package middleware
 
-// 历史修复（历史）：global_config 触发器 OF 清单补自动封禁六列——
+// global_config 触发器 OF 清单补自动封禁六列——
 // 主端 PUT /security/autoban 保存（六列 UPDATE）不 bump cluster_version 时，
 // 稳态变更经 304 门滞留主节点、永不传播到从节点（从端升主后按陈旧默认值
-// 运行）。钉六列各自的 OF 成员资格（镜像 历史问题 自动备份组钉测形态）。
+// 运行）。钉六列各自的 OF 成员资格（镜像自动备份组钉测形态）。
 
 import "testing"
 

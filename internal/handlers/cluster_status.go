@@ -12,7 +12,7 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// clusterReportMaxBytes 限制节点上报请求体大小（历史）。异常从节点可能
+// clusterReportMaxBytes 限制节点上报请求体大小。异常从节点可能
 // 携带 MB 级 last_sync_error/health_json，防止其写入主节点 nodes 表。
 const clusterReportMaxBytes = 64 << 10
 
@@ -38,12 +38,12 @@ func (h *Handlers) ListClusterNodes(c *gin.Context) {
 }
 
 func (h *Handlers) ReportClusterNode(c *gin.Context) {
-	// 历史问题：导入窗口 fast-fail——上报写 nodes 瞬态列与分区上报缓存，
+	// 导入窗口 fast-fail——上报写 nodes 瞬态列与分区上报缓存，
 	// 导入全量替换 nodes 时窗口写入会被覆盖或阻塞至 busy_timeout。
 	if rejectNodeWriteDuringImport(c) {
 		return
 	}
-	// 历史问题:与快照端点对称加 requireMaster——降级主节点残留 nodes 行时,
+	// 与快照端点对称加 requireMaster——降级主节点残留 nodes 行时,
 	// 旧从节点上报照常写入(无审批),再提升后旧令牌静默重组集群。
 	if !h.requireMaster(c) {
 		return

@@ -89,7 +89,7 @@ func TestValidateRuleConfigGeneration_validRule_returnsNil(t *testing.T) {
 }
 
 // 已与 nil 统一回退主上游（caddy.go len(upstreams)==0），此前空数组触发
-// buildHTTPHandleChain 硬失败，预校验与全量渲染语义不对称（历史修复 聚合被绕过）。
+// buildHTTPHandleChain 硬失败，预校验与全量渲染语义不对称。
 func TestValidateRuleConfigGeneration_pathRuleEmptyUpstreams_returnsNil(t *testing.T) {
 	newBackupTestHandlers(t)
 	rule := models.LbRule{

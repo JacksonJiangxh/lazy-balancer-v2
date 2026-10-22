@@ -80,7 +80,7 @@ func TestGetSecurityRateLimitBlocks_scrapeFailureReturns500(t *testing.T) {
 	recorder := getRequest(t, router, "/security/rate-limit-blocks")
 
 	// Then the scrape failure surfaces as 500 so the frontend error state is
-	// reachable（历史问题 三-4：200+空列表会让「Caddy 指标不可达」与「暂无限流拦截」
+	// reachable（三-4：200+空列表会让「Caddy 指标不可达」与「暂无限流拦截」
 	// 不可区分，前端 catch 路径已就绪）
 	if recorder.Code != http.StatusInternalServerError {
 		t.Fatalf("status=%d body=%q, want 500", recorder.Code, recorder.Body.String())

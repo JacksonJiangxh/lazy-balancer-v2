@@ -59,7 +59,7 @@ func InitializeAuditDB(dataDir string) error {
 	}
 	AuditDB = auditDB
 	if err := migrateLegacyAuditLogs(DB, path); err != nil {
-		// 历史问题: 初始化中途失败时缓冲的系统事件原样保留（下次启动重放），
+		// 初始化中途失败时缓冲的系统事件原样保留（下次启动重放），
 		// 此处仅留痕条数，不静默丢弃。
 		log.Printf("audit log migration failed (%v); %d buffered system audit entries retained for next startup", err, systemAuditBufferLen())
 		return err
@@ -69,7 +69,7 @@ func InitializeAuditDB(dataDir string) error {
 	return nil
 }
 
-// 操作日志词汇标准（历史问题 起为系统标准）：操作标签 ≤4 词、事件对象 ≤5 词
+// 操作日志词汇标准：操作标签 ≤4 词、事件对象 ≤5 词
 // （词制：中文按字计、连续英文/数字串算 1 词、空白不计）。存量旧词条在此
 // 一次性归一——筛选下拉取自 audit_log 去重值，不迁移则旧词条永久残留。
 // 幂等：旧值不存在时零命中。新事件由 services.RecordAuditLog 入口告警 +
@@ -116,10 +116,10 @@ var auditVocabularyRenames = []struct {
 
 // 归一表只服务于存量数据迁移（下方 migrateAuditVocabulary）。写点侧的口径：
 // 新事件必须使用规范名——audit_vocabulary_test.go 的词数门只查词数，规范名
-// 由 audit_vocabulary_migration_test.go 的字面量扫描看守（历史问题：谓词
+// 由 audit_vocabulary_migration_test.go 的字面量扫描看守（谓词
 // 生产零消费，导出已删除）。
 
-// 历史问题（历史）：归一化的一次性 marker。此前每次启动都无条件执行 30 条
+// 归一化的一次性 marker。此前每次启动都无条件执行 30 条
 // UPDATE（16 条仅按 resource 命中且该列无索引），已收敛库每启动白跑一轮全表
 // 扫描/不动点循环。marker 存于审计库（归一对象在审计库内，生命周期随库文件
 // 一致），值为归一表指纹而非布尔——未来增删改名条目时指纹变化会自动重跑，
@@ -159,12 +159,12 @@ func auditVocabularyMigrated(fingerprint string) bool {
 	return stored == fingerprint
 }
 
-// 历史修复（历史）：归一表存在链式条目（如 ("重载","Caddy 配置") 单趟只能
+// 归一表存在链式条目（如 ("重载","Caddy 配置") 单趟只能
 // 命中对象改名条目变 ("重载","Caddy配置")——联动条目在表序上已越过），单趟
 // 循环需两次启动才收敛——循环至不动点（整趟零改动）使单次启动归一终态。
 // 趟数上限=条目数+1：无环表每趟严格推进，超限即未来编辑引入环，WARN 防御
 // 死循环（不改写结果，残留中间态词条下次启动继续收敛）。
-// 历史问题：marker 命中当前指纹时直接返回，零 UPDATE。
+// marker 命中当前指纹时直接返回，零 UPDATE。
 func migrateAuditVocabulary() {
 	if AuditDB == nil {
 		return
@@ -177,8 +177,10 @@ func migrateAuditVocabulary() {
 		log.Printf("audit vocabulary migration marker unavailable (%v); running normalization anyway", err)
 	}
 	maxPasses := len(auditVocabularyRenames) + 1
-	failed := false
 	for range maxPasses {
+		// failed 逐趟复位：失败只判定「本趟」——前一趟的瞬时失败若已恢复且
+		// 后续趟无改动，允许落 marker；本趟仍有失败则不得置位（下次启动重试）。
+		failed := false
 		changed := false
 		for _, r := range auditVocabularyRenames {
 			var sets, wheres []string
@@ -225,7 +227,7 @@ func migrateAuditVocabulary() {
 	log.Printf("audit vocabulary migration did not converge after %d passes (rename table cycle?)", maxPasses)
 }
 
-// 历史问题: 启动迁移跑在 InitializeAuditDB 之前，且 db 不能反向依赖
+// 启动迁移跑在 InitializeAuditDB 之前，且 db 不能反向依赖
 // services.RecordAuditLog（import 环）——迁移期的系统事件先入内存缓冲，审计库
 // 就绪后统一落 audit_log 表，与 UI 操作日志同源。
 type systemAuditEntry struct {
@@ -239,7 +241,7 @@ var systemAuditBuffer struct {
 	entries []systemAuditEntry
 }
 
-// 历史问题: 缓冲设上限，审计库长期不可用（或 flush 反复失败）时丢弃最旧条目并
+// 缓冲设上限，审计库长期不可用（或 flush 反复失败）时丢弃最旧条目并
 // 告警，避免内存无界增长。
 const systemAuditBufferCap = 10000
 
@@ -266,7 +268,7 @@ func trimSystemAuditBufferLocked() {
 }
 
 // flushSystemAuditLogs 将缓冲的系统事件写入审计库并清空缓冲；审计库未就绪或单条
-// 写失败时条目按原顺序留回缓冲（历史问题：等待下次 flush 重试，不再静默丢事件），
+// 写失败时条目按原顺序留回缓冲（等待下次 flush 重试，不再静默丢事件），
 // 与 services.RecordAuditLog 的 best-effort 语义一致。
 func flushSystemAuditLogs() {
 	systemAuditBuffer.mu.Lock()
@@ -321,8 +323,8 @@ func migrateLegacyAuditLogs(mainDB *sql.DB, auditPath string) error {
 		return fmt.Errorf("failed to attach audit database: %w", err)
 	}
 	defer func() {
-		// 历史修复（历史）：DETACH 失败曾静默忽略——连接归还池仍挂
-		// audit_migration schema，本次迁移虽已提交（历史修复 核实当前不可达），
+		// DETACH 失败曾静默忽略——连接归还池仍挂
+		// audit_migration schema，本次迁移虽已提交，
 		// 但失败须留痕便于排查连接池污染。
 		if _, err := conn.ExecContext(ctx, "DETACH DATABASE audit_migration"); err != nil {
 			log.Printf("migrateLegacyAuditLogs: DETACH audit_migration 失败（连接归还池仍挂 schema）: %v", err)

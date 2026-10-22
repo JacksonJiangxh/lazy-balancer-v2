@@ -13,8 +13,8 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// 历史修复：过期天数取整口径钉死——certjobs 与 certinfo.go:174 同表达式
-// （int() 向零截断）。历史修复 的 -int(Ceil(-x)) 与 floor(x) 恒等（空操作）未被
+// 过期天数取整口径钉死——certjobs 与 certinfo.go:174 同表达式
+// （int() 向零截断）。-int(Ceil(-x)) 与 floor(x) 恒等（空操作）未被
 // 任何测试捕获；本表驱动测试按小时偏移断言全部边界形态。
 func TestListCertJobs_daysRemainingTruncation(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -31,7 +31,7 @@ func TestListCertJobs_daysRemainingTruncation(t *testing.T) {
 		{-12, 0, "expired"},  // 过期半日 → -0（截断）
 		{-23, 0, "expired"},  // 差一小时满一天 → 0
 		{-24, -1, "expired"}, // 恰一天 → -1
-		{-27, -1, "expired"}, // 1 天 3 小时 → -1（历史修复 空操作时为 -2）
+		{-27, -1, "expired"}, // 1 天 3 小时 → -1
 		{-47, -1, "expired"},
 		{-72, -3, "expired"},
 		{1, 0, "expiring"},  // 剩 1 小时 → 0（原 Ceil 为 1）

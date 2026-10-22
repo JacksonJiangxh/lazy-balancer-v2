@@ -147,7 +147,7 @@
         <div v-if="serviceControlWarnings[serviceControlAction]" class="info-note-bar service-control-warning"><span class="info-note-desc">{{ serviceControlWarnings[serviceControlAction] }}</span></div>
       </transition>
 
-      <!-- 历史问题：服务控制返回证书指纹不匹配时提供按节点重钉通道（与从节点侧
+      <!-- 服务控制返回证书指纹不匹配时提供按节点重钉通道（与从节点侧
            forget-pins 补救对称）；确认后调用 POST /cluster/nodes/:id/forget-pin。 -->
       <transition name="el-fade-in">
         <div v-if="serviceControlPinMismatch" class="info-note-bar service-control-warning">
@@ -212,7 +212,7 @@ interface LoginTicketResponse {
 const authStore = useAuthStore()
 let disposed = false
 let requestSequence = 0
-// 历史问题：fetchNodes 独立计数器——updateNodeConfig 的手动刷新若与 fetchStatus 共享
+// fetchNodes 独立计数器——updateNodeConfig 的手动刷新若与 fetchStatus 共享
 // requestSequence，会顶掉轮询在途 fetchStatus 的序列号，导致状态响应被当作过期丢弃
 let nodesRequestSequence = 0
 const status = ref<ClusterStatus | null>(null)
@@ -231,7 +231,7 @@ const nodeConfigDialogVisible = ref(false)
 const editingNodeConfig = ref<ClusterNode | null>(null)
 const nodeConfigSaving = ref(false)
 const registrationRequest = ref(0)
-// 历史修复：注册请求被主节点受理后递增——子组件据此清空已消耗的一次性令牌
+// 注册请求被主节点受理后递增——子组件据此清空已消耗的一次性令牌
 //（取消确认或请求失败时令牌仍可能有效，必须保留）。
 const registrationSucceeded = ref(0)
 const tokenDialogVisible = ref(false)
@@ -274,7 +274,7 @@ const openServiceControlDialog = (node: ClusterNode): void => {
 const executeServiceControl = async (): Promise<void> => {
   if (isReadOnlyProp.value) return
   if (!serviceControlNode.value || !serviceControlAction.value) return
-  // 历史修复：占位先于确认——双击「执行操作」不再叠加两个确认框/重复下发。
+  // 占位先于确认——双击「执行操作」不再叠加两个确认框/重复下发。
   if (serviceControlLoading.value) {
     ElMessage.warning('服务控制请求正在执行，请稍候')
     return
@@ -296,7 +296,7 @@ const executeServiceControl = async (): Promise<void> => {
     mfaAwareSuccess('服务控制指令已下发')
   } catch (error: unknown) {
     // 全局拦截器已弹 toast；428 MFA 重试也由全局处理。
-    // 历史问题：指纹不匹配（后端 502 专属文案）在弹框内提供按节点重钉通道。
+    // 指纹不匹配（后端 502 专属文案）在弹框内提供按节点重钉通道。
     if (error instanceof Error && error.message.includes('证书指纹不匹配')) {
       serviceControlPinMismatch.value = true
     }
@@ -306,12 +306,12 @@ const executeServiceControl = async (): Promise<void> => {
   }
 }
 
-// 历史问题：清除该节点的 TOFU 证书指纹钉（POST /cluster/nodes/:id/forget-pin），
+// 清除该节点的 TOFU 证书指纹钉（POST /cluster/nodes/:id/forget-pin），
 // 成功后留在弹框内便于直接重试服务控制。
 const forgetNodePin = async (): Promise<void> => {
   const node = serviceControlNodeLive.value
   if (isReadOnlyProp.value || !node || nodePinForgetting.value) return
-  // 历史修复：占位先于确认（原确认后才置位——双击叠加确认框/重复请求）
+  // 占位先于确认（原确认后才置位——双击叠加确认框/重复请求）
   nodePinForgetting.value = true
   try {
     const confirmed = await confirmAction(
@@ -331,7 +331,7 @@ const forgetNodePin = async (): Promise<void> => {
   }
 }
 const registerToken = ref<ClusterRegisterToken | null>(null)
-// 历史问题：readOnlyReason 为 unknown（token 有效但 /users/me 尚未拉取成功）时同样
+// readOnlyReason 为 unknown（token 有效但 /users/me 尚未拉取成功）时同样
 // fail-closed——集群操作在该窗口期按只读呈现。slave 除外照旧：从节点管理员仍可
 // 操作集群管理（含「提升为主节点」），不随本项收紧。
 const isReadOnlyProp = computed(() => {
@@ -343,7 +343,7 @@ const fetchStatus = async (roundSignal?: AbortSignal): Promise<ClusterStatus> =>
   const requestSeq = ++requestSequence
   const response = await request.get<APIResponse<ClusterStatus>>('/cluster/status', { signal: roundSignal ?? clusterPolling.signal, silent: true })
   const data = response.data
-  // 历史修复：协议违例用 TypeError（Error 保留给业务失败）。
+  // 协议违例用 TypeError（Error 保留给业务失败）。
   if (!data) throw new TypeError('集群状态响应缺少数据')
   if (!disposed && requestSeq === requestSequence) {
     status.value = data
@@ -417,7 +417,7 @@ const promoteToMaster = async (): Promise<void> => {
   try {
     const confirmed = await confirmAction('将脱离集群，当前数据成为权威数据', '确认提升为主节点')
     if (!confirmed) return
-    // 历史问题:Promote 在途同步排空(含 apply+Caddy 重载)可超默认 30s——
+    // Promote 在途同步排空(含 apply+Caddy 重载)可超默认 30s——
     // 放大至 120s,防前端超时误报失败诱导重复点击(后端随后实际成功)。
     await request.post<ActionResponse>('/cluster/promote', undefined, { timeout: 120000 })
     mfaAwareSuccess('已提升为主节点')
@@ -432,7 +432,7 @@ const promoteToMaster = async (): Promise<void> => {
 
 const syncNow = async (): Promise<void> => {
   if (isReadOnlyProp.value) return
-  // 历史修复：占位先于确认——双击「立即同步」不再叠加确认框或重复拉取。
+  // 占位先于确认——双击「立即同步」不再叠加确认框或重复拉取。
   if (syncing.value) {
     ElMessage.warning('同步请求正在执行，请稍候')
     return
@@ -442,7 +442,7 @@ const syncNow = async (): Promise<void> => {
   try {
     const ok = await confirmAction('立即从主节点拉取并应用最新配置？', '手动同步')
     if (!ok) return
-    // 历史问题-07：/cluster/sync/pull 同样含「拉快照 → 应用 → Caddy 重载」，与
+    // /cluster/sync/pull 同样含「拉快照 → 应用 → Caddy 重载」，与
     // Promote 同口径放大到 120s——沿用全局 30s 会在后端成功时先超时误报失败，
     // 诱导用户重复点击（后端可能仍在应用）。
     const response = await request.post<APIResponse<ClusterSyncResult>>('/cluster/sync/pull', undefined, { timeout: 120000 })
@@ -458,13 +458,13 @@ const syncNow = async (): Promise<void> => {
   }
 }
 
-// 历史问题：PinMismatch 补救入口——主节点更换管理面板证书后从节点同步持续指纹不匹配，
+// PinMismatch 补救入口——主节点更换管理面板证书后从节点同步持续指纹不匹配，
 // 「重新注册」复用同一 TOFU transport 无法自救；清空本节点 TOFU 指纹钉
 // （POST /cluster/forget-pins）后，下一同步周期按主节点当前证书重新验证并钉扎。
 const forgettingPins = ref(false)
 const forgetPins = async (): Promise<void> => {
   if (isReadOnlyProp.value) return
-  // 历史修复：占位先于确认（原确认后才置位——双击叠加确认框/重复请求）
+  // 占位先于确认（原确认后才置位——双击叠加确认框/重复请求）
   if (forgettingPins.value) {
     ElMessage.warning('清除指纹请求正在执行，请稍候')
     return
@@ -507,7 +507,7 @@ const generateRegisterToken = async (): Promise<void> => {
 const copyRegisterToken = async (): Promise<void> => {
   const token = registerToken.value?.token
   if (!token) return
-  // 历史修复：复用 utils/copy 的 copyText（降级路径/类型收口与全站一致）。
+  // 复用 utils/copy 的 copyText（降级路径/类型收口与全站一致）。
   const ok = await copyText(token)
   if (ok) {
     mfaAwareSuccess('注册令牌已复制')
@@ -524,7 +524,7 @@ const syncSwitchLabels: Record<string, string> = {
 
 const updateSyncField = async (field: string, value: boolean): Promise<void> => {
   if (isReadOnlyProp.value) return
-  // 历史修复：占位先于确认（双击开关不再叠加确认框/重复 PUT）；取消路径回读状态
+  // 占位先于确认（双击开关不再叠加确认框/重复 PUT）；取消路径回读状态
   // 复位开关显示。
   if (settingsLoading.value) {
     ElMessage.warning('同步设置正在保存，请稍候')
@@ -569,10 +569,10 @@ const updateSyncInterval = async (value: number): Promise<void> => {
   }
 }
 
-// 历史修复：「入口取占位 → 确认 → 请求 → finally 释放」。占位（pendingNodeId）必须
+// 「入口取占位 → 确认 → 请求 → finally 释放」。占位（pendingNodeId）必须
 // 先于确认弹框取得——原实现在确认之后才占位，双击审批/拒绝/删除会叠加两个确认框，
 // 确认第二个时动作被静默丢弃（用户以为已处理）。与 TaskMonitor.runTaskAction
-// （历史问题）同范式。
+// 同范式。
 const runNodeAction = async (node: ClusterNode, action: 'approve' | 'reject' | 'remove'): Promise<void> => {
   // 占位已由调用方取得；本函数只负责请求与释放。
   try {
@@ -615,7 +615,7 @@ const confirmAndRunNodeAction = async (
   }
 }
 
-// 历史问题：审批是三个节点操作中安全面最大的「信任授予」动作（确认后外部节点
+// 审批是三个节点操作中安全面最大的「信任授予」动作（确认后外部节点
 // 入集群并开始同步），与拒绝/删除对称补二次确认，防 pending 列表误点。
 const approveNode = (node: ClusterNode): Promise<void> =>
   confirmAndRunNodeAction(node, 'approve', `确定确认节点“${node.name}”加入集群吗？确认后该节点将开始同步。`, '审批确认')
@@ -633,7 +633,7 @@ const removeNode = (node: ClusterNode): Promise<void> =>
 
 const loginNode = async (node: ClusterNode): Promise<void> => {
   if (isReadOnlyProp.value || node.status !== 'online' || loginNodeId.value !== null) return
-  // 历史问题 六次：403（未启用 MFA）预检——文案指向正确入口（用户管理）。
+  // 403（未启用 MFA）预检——文案指向正确入口（用户管理）。
   // v2.3.0:OIDC 会话豁免(与后端 cluster_ticket 两道门同口径)——二因子
   // 由 IdP 承担,本地 MFA 概念不适用。
   if (!authStore.user?.mfa_enabled && authStore.user?.auth_provider !== 'oidc') {
@@ -642,7 +642,7 @@ const loginNode = async (node: ClusterNode): Promise<void> => {
   }
   loginNodeId.value = node.id
   try {
-    // 历史问题 九次（用户反馈：先弹验证码再开页面）：票据请求先行、开窗后置——
+    // （用户反馈：先弹验证码再开页面）：票据请求先行、开窗后置——
     // 此前先 window.open 再 POST，428（每次都要求 MFA）时验证码弹框期间
     // 空白页已挂在旁边且取消后不一定关闭。现在 428 由全局拦截器弹码（无窗
     // 口），验证成功 → 拦截器自动重试 → 成功后才开窗导航；失败/取消则根本
@@ -769,7 +769,7 @@ onUnmounted(() => {
 .equal-height-row :deep(.el-card__body) { height: 100%; box-sizing: border-box; }
 .cluster-settings { display: flex; flex-direction: column; gap: 20px; }
 .polling-error-alert { align-self: stretch; }
-/* .polling-error-title/.polling-error-meta 已收敛 main.css（历史修复） */
+/* .polling-error-title/.polling-error-meta 已收敛 main.css*/
 .token-box { display: flex; align-items: center; gap: 12px; margin-top: 4px; padding: 14px; border-radius: var(--radius-md); background: var(--bg-secondary); border: 1px dashed var(--border-color, #dcdfe6); }
 .token-expiry { margin-top: 10px; }
 

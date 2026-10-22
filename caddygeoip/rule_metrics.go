@@ -119,15 +119,15 @@ func (h *RuleMetricsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, n
 	if h.requestsTotal != nil {
 		h.requestsTotal.WithLabelValues(h.Rule).Inc()
 	}
-	// 历史问题(历史):非 HandlerError 错误不计状态类(与 Caddy 自身
+	// 非 HandlerError 错误不计状态类(与 Caddy 自身
 	// instrumentation 同口径 metrics.go:368-373——错误只计 requestErrors,不计
 	// 2xx 状态类);HandlerError 携 statusCode 照常归类。
 	if h.statusTotal != nil && (err == nil || isHandlerError(err)) {
 		h.statusTotal.WithLabelValues(h.Rule, statusClass(statusCode)).Inc()
 	}
-	// 历史问题(历史):非 HandlerError 错误不计字节(与 Caddy 自身
+	// 非 HandlerError 错误不计字节(与 Caddy 自身
 	// instrumentation 同口径——错误路径不观测 size);HandlerError 携 statusCode
-	// 照常计(历史修复 只对齐了状态类,字节漏对齐)。
+	// 照常计（状态类与字节口径对齐）。
 	if h.bytesTotal != nil && (err == nil || isHandlerError(err)) {
 		h.bytesTotal.WithLabelValues(h.Rule, "in").Add(float64(computeApproximateRequestSize(r)))
 		h.bytesTotal.WithLabelValues(h.Rule, "out").Add(float64(wrec.Size()))
@@ -137,7 +137,7 @@ func (h *RuleMetricsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, n
 
 // computeApproximateRequestSize 与 Caddy 自身 metrics 完全一致的请求大小估算
 // (头+体:url+method+proto+headers+host+content_length,无分隔符)——
-// 历史问题(历史):原版无 +4/header,此前实现是 promhttp 变体致
+// 原版无 +4/header,此前实现是 promhttp 变体致
 // bytes_in 与全局口径恒定 +4/header 偏差。逐行对齐 caddyhttp/metrics.go:388。
 func computeApproximateRequestSize(r *http.Request) int64 {
 	size := 0

@@ -9,7 +9,7 @@ import (
 )
 
 // 只读 API Key 的导入导出/备份面收口（2026-09-24 用户裁定：导入导出/备份视为
-// 写入操作）：历史问题——GET /auto-backup/:id/download 下发与 config/export 同级的
+// 写入操作）：GET /auto-backup/:id/download 下发与 config/export 同级的
 // lbbak（私钥+凭证明文），此前 GET 特卡仅覆盖 export，只读 Key 可旁路下载。
 // 矩阵钉住整个表面：两敏感 GET + 三个写端点（基线钉），全部 403。
 
@@ -38,7 +38,7 @@ func TestAPIKeyReadOnlyGuard_backupSurfaceDenied(t *testing.T) {
 		method string
 		path   string
 	}{
-		// 历史问题：下载完整备份（含私钥+凭证明文）——修复前放行（本用例的 RED 形状）
+		// 下载完整备份（含私钥+凭证明文）——修复前放行（本用例的 RED 形状）
 		{"备份下载", http.MethodGet, "/api/v1/auto-backup/3/download"},
 		// 基线钉（既有正确行为，防回归）
 		{"配置导出", http.MethodGet, "/api/v1/config/export"},

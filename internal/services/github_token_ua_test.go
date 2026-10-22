@@ -1,6 +1,6 @@
 package services
 
-// GitHub API 令牌与 历史修复（2026-09-25 用户裁定，历史问题 修复）：
+// GitHub API 令牌与 （2026-09-25 用户裁定，修复）
 // 未认证 GitHub API 限流 60 次/小时/IP——共享出口 IP 常被打满致 CRS/IP2Region
 // 自动更新连日 403；可选 GITHUB_TOKEN（global_config.github_token）提升至
 // 5000/h，UA 为 GitHub 要求的请求卫生。令牌仅随 api.github.com 直连发送——
@@ -16,7 +16,7 @@ import (
 )
 
 // Given：配置了 GITHUB_TOKEN。When：直连 API 查询。
-// Then：请求带 历史修复 与 Authorization: Bearer。
+// Then：请求带与 Authorization: Bearer。
 func TestFetchGitHubLatestTagFromAPI_sendsUserAgentAndToken(t *testing.T) {
 	newTestCRSManager(t) // db.Initialize + 版本行
 	if _, err := db.DB.Exec(`UPDATE global_config SET github_token='ghp_test123' WHERE id=1`); err != nil {

@@ -1,6 +1,6 @@
 package services
 
-// 历史问题-1(历史,历史问题——幻影修复):历史问题-1 的 sync_interval 展示 clamp
+// 的 sync_interval 展示 clamp
 // 被插入 if err != nil 分支 return 之后(unreachable,go vet 机器诊断)——
 // Status() 展示链对存量脏值(0/负/1-9s)仍原样展示,与运行时 60s clamp 分叉。
 // 本测试钉住:脏值入库 → Status() 读出已 clamp 值。
@@ -18,7 +18,7 @@ import (
 )
 
 func TestClusterStatus_syncIntervalDisplayClamp(t *testing.T) {
-	// 历史问题-13（历史）：每个子用例 db.Initialize 后必须 Close 并恢复
+	// 每个子用例 db.Initialize 后必须 Close 并恢复
 	// 全局句柄（与 newClusterTestService 同款）——此前覆盖全局 db.DB 却无
 	// cleanup，-race/并行执行下可与其他用例互相污染，句柄也随全局注册表泄漏。
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
@@ -71,7 +71,7 @@ func TestNodeOfflineThreshold_clampsExcessiveSyncInterval(t *testing.T) {
 	}
 }
 
-// 历史问题-08：同一坏 health_json 行按 nodeID 60s 限频告警。
+// 同一坏 health_json 行按 nodeID 60s 限频告警。
 func TestNodes_throttlesCorruptedHealthWarnings(t *testing.T) {
 	_, database := newClusterTestService(t)
 	service := NewClusterService(database, "")

@@ -1,5 +1,5 @@
 // Package geoipnames 承载 ip2region 地理规范化的四张共享表——单一数据源
-// （历史修复，历史）。消费方两侧：
+// 消费方两侧
 //
 //   - internal/services（选项树构建 regionTreeFromXDB → GetIP2RegionRegions）
 //   - caddygeoip（发射 X-LB-GeoIP-Loc 匹配键，normalizeCity/normalizeProvince）
@@ -17,10 +17,10 @@ package geoipnames
 
 import "strings"
 
-// ProvinceAliases 省列别名规范化（历史问题）：xdb 原始省列存在双形态
+// ProvinceAliases 省列别名规范化：xdb 原始省列存在双形态
 // （上海/上海市、广西/广西壮族自治区）、台湾城市误入省列（台中市等）与个别
 // 乱码（UEruemqi）。选项树与 CEL 发射变量统一用规范名，两边一致才能命中。
-// 只收**非恒等**映射（历史修复）：canonicalProvince 未命中即原样返回，
+// 只收**非恒等**映射：canonicalProvince 未命中即原样返回，
 // 恒等别名（如「上海市」→「上海市」）不改变任何输出，属死条目。
 // 只读：禁止修改（全局单份）。
 var ProvinceAliases = map[string]string{
@@ -45,7 +45,7 @@ var TaiwanCities = map[string]bool{
 // CityPinyinFixes xdb 部分段的城市列为拼音/英文形态（v3.17.0 实测 45 条，
 // 如 Guangzhou Shi/Shanghai/Taipei City）——映射为规范中文名；不在此表的
 // ASCII 城市由选项树侧过滤（宁缺勿乱，无法可靠音译）、发射侧原样通过
-// （恒不命中，与不可识别省同语义）。历史问题起发射侧同步映射——
+// （恒不命中，与不可识别省同语义）。自此发射侧同步映射——
 // 城市级 CEL 规则对拼音段可命中。
 // 只读：禁止修改（全局单份）。
 var CityPinyinFixes = map[string]string{
@@ -66,7 +66,7 @@ var CityPinyinFixes = map[string]string{
 	"Guozhen": "郭镇", "Xi'an Shi": "西安市", "Kowloon": "九龙",
 }
 
-// AutonomousPrefectures（历史问题，用户反馈：「大理/怒江/凉山缺市字」——
+// AutonomousPrefectures（用户反馈：「大理/怒江/凉山缺市字」——
 // 实为少数民族自治州的简称）xdb 对自治州存简称、对普通地级市存全称
 // （如「呼和浩特市」），选项树里「大理」与「呼和浩特市」并列显得缺字。
 // 简称 → 全称 映射。
@@ -96,7 +96,7 @@ var AutonomousPrefectures = map[string]string{
 	"大兴安岭": "大兴安岭地区",
 }
 
-// OverseasCountries 海外国家名归一表（域 G，历史）。xdb 国家列（region
+// OverseasCountries 海外国家名归一表（域 G）。xdb 国家列（region
 // 第 1 列）非「中国」的行发射国名：v3.18.0 实测形态为完整英文国名（240 个
 // 国家列值中 238 个 ASCII 规范名，探针全量扫描），与省列的「ASCII=拼音残片」
 // 语义不同——国名列 ASCII 是规范形态，不做 ASCII 过滤。本表只处理已知异体：
@@ -108,7 +108,7 @@ var AutonomousPrefectures = map[string]string{
 //
 // 未列入表的值原样通过（纯白名单过滤）：选项树收集与 CEL/头发射两侧共用
 // NormalizeCountry，同进同出，不存在「树提供某国而发射变量发另一形态」的
-// 漂移面（历史修复 单源立场）。
+// 漂移面（单源立场）。
 // 只读：禁止修改（全局单份）。
 var OverseasCountries = map[string]string{
 	"美国":       "United States",
@@ -116,7 +116,7 @@ var OverseasCountries = map[string]string{
 }
 
 // NormalizeCountry 规范 xdb 国家列原始值：空白/「0」占位/「中国」（国内分支
-// 值，历史修复——含空白异形，与树侧 TrimSpace 判定对称）与归一表映射空串的
+// 值，——含空白异形，与树侧 TrimSpace 判定对称）与归一表映射空串的
 // 值（非国家）返回空串（调用方据此兜底「海外」哨兵/不入树）；其余原样或按
 // 归一表折叠返回。
 func NormalizeCountry(raw string) string {

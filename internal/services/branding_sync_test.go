@@ -167,7 +167,7 @@ func TestApplySnapshot_writesBrandingFileAndLanding(t *testing.T) {
 	}
 }
 
-// 历史问题：原子 rename 替换不得在原 inode 上截断写入。硬链接作为旧 inode
+// 原子 rename 替换不得在原 inode 上截断写入。硬链接作为旧 inode
 // 观测点：新路径读到新内容时，旧链接必须仍保留旧字节。
 func TestMaterializeBranding_atomicReplaceDoesNotMutateExistingInode(t *testing.T) {
 	dataDir := t.TempDir()
@@ -201,7 +201,7 @@ func TestMaterializeBranding_atomicReplaceDoesNotMutateExistingInode(t *testing.
 	}
 }
 
-// 历史问题-4：旧主端未携带 branding_json 时是缺席而非显式空串；
+// 旧主端未携带 branding_json 时是缺席而非显式空串；
 // 本地文件与 landing 必须保留，只有非 nil 空串才执行默认模板重置。
 func TestApplySnapshot_absentLegacyBrandingPreservesLocalFile(t *testing.T) {
 	_, database := newClusterTestService(t)
@@ -229,7 +229,7 @@ func TestApplySnapshot_absentLegacyBrandingPreservesLocalFile(t *testing.T) {
 	}
 }
 
-// 历史问题(历史):三分类合并后 users 节恒同步+schema v3 强制,BrandingJSON
+// 三分类合并后 users 节恒同步+schema v3 强制,BrandingJSON
 // 空串可判定为「主端无品牌文件」(旧语义「开关关闭/旧主节点」随三分类消失)。
 // 从端必须收敛默认品牌:本地文件重置为全空模板(与 handlers.EnsureBrandingFile
 // 缺失再生形态一致——其唯一调用点在启动期 main.go,运行期由同步代行);不直接
@@ -324,7 +324,7 @@ func TestUpdateSnapshotSettings_mirrorsBrandingColumn(t *testing.T) {
 	}
 }
 
-// 历史修复(历史):Go json.Marshal 对 <>& 产 \uXXXX 转义——手工提取器
+// Go json.Marshal 对 <>& 产 \uXXXX 转义——手工提取器
 // 不解 \u 时从节点 landing 注入乱码,与主节点 encoding/json 分叉。
 // 修复:提取值经 json.Unmarshal 值级解析。
 func TestInjectLandingFromBranding_unicodeEscape(t *testing.T) {
@@ -370,7 +370,7 @@ func TestRefreshBrandingMirror_skipsInvalidJSON(t *testing.T) {
 	}
 }
 
-// 历史问题-1(历史):无白名单 Key 快照同步——主端 ” → 从端必须落 ”
+// 无白名单 Key 快照同步——主端 ” → 从端必须落 ”
 // 而非 json.Marshal(nil) 的字面量 "null"(中间件把非空当白名单配置,
 // Unmarshal null 成功但 0 CIDR → 全来源 403)。
 func TestApplySnapshot_emptyWhitelistLandsEmptyString(t *testing.T) {
@@ -395,7 +395,7 @@ func TestApplySnapshot_emptyWhitelistLandsEmptyString(t *testing.T) {
 	}
 }
 
-// 历史问题-01 家族收敛（历史修复）：品牌落盘失败的审计同样按内容节流。
+// 家族收敛：品牌落盘失败的审计同样按内容节流。
 func TestApplySnapshotBrandingChecked_throttlesRepeatedFailureAudit(t *testing.T) {
 	_, database := newClusterTestService(t)
 	sync := NewSyncService(database, nil, nil)
@@ -413,7 +413,7 @@ func TestApplySnapshotBrandingChecked_throttlesRepeatedFailureAudit(t *testing.T
 	}
 }
 
-// brandingMirrorProbe 是 历史问题-05 零写断言的观测驱动：记录 UPDATE 执行次数，
+// brandingMirrorProbe 是 零写断言的观测驱动：记录 UPDATE 执行次数，
 // 并让镜像列预读返回指定内容（与文件内容一致时应完全不执行写语句）。
 type brandingMirrorProbe struct {
 	execCount atomic.Int32
@@ -464,7 +464,7 @@ func (rows *brandingMirrorProbeRows) Next(dest []driver.Value) error {
 	return nil
 }
 
-// 历史问题-05：内容未变时零写（先读短路），且显式库句柄决定落点。
+// 内容未变时零写（先读短路），且显式库句柄决定落点。
 func TestRefreshBrandingMirrorDB_zeroWriteWhenUnchanged(t *testing.T) {
 	newClusterTestService(t)
 	dir := t.TempDir()

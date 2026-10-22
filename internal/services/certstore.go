@@ -89,7 +89,7 @@ func safeRuleID(ruleID string) bool {
 
 // ValidCertRuleID 报告 ruleID 是否满足证书文件路径字母表（非空、≤64、仅
 // [a-z0-9_-]），与 safeRuleID 完全同源。导出供导入口等跨包调用方复用同一
-// 字母表（历史问题-07：v2 导入允许含 '.' 的 caddy_id，证书物化路径却拒绝——
+// 字母表（v2 导入允许含 '.' 的 caddy_id，证书物化路径却拒绝——
 // 必须在导入校验阶段 fail-fast 点名，而不是在证书阶段整体回滚）。
 func ValidCertRuleID(ruleID string) bool {
 	return safeRuleID(ruleID)
@@ -121,7 +121,7 @@ func writeCertPair(certPath, keyPath, certPEM, keyPEM string) error {
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("读取原证书: %w", err)
 	}
-	// 历史问题(历史,含权限修复契约修正):内容一致且权限正确才零写
+	// 内容一致且权限正确才零写
 	// ——旧内容本已读出,比对几乎免费;跳过可免每次 apply 的 tmp+fsync+
 	// rename 写放大。权限被外部改错时仍重写(既有契约:重复物化修复权限,
 	// TestMaterializeCertPairs_restores_permissions 钉住)。
@@ -415,7 +415,7 @@ func MaterializeAllCertsFromDB() {
 		rows.Close()
 	}
 
-	// 历史问题(历史):多行规则(同 rule_id 多 cert_jobs 行)必须按
+	// 多行规则(同 rule_id 多 cert_jobs 行)必须按
 	// certJobRuleApplicable 同语义过滤——否则灾备物化内容取决于扫描顺序,
 	// 可能重建旧域证书。取每 rule_id 最新行且校验域名适用。
 	rows2, err := db.DB.Query(`SELECT j.rule_id, j.cert_pem, j.key_pem, COALESCE(j.domain,''), COALESCE(r.domain,'') FROM cert_jobs j
@@ -435,13 +435,13 @@ func MaterializeAllCertsFromDB() {
 				continue
 			}
 			// 同 rule_id 多行只取首个**适用**行（ORDER BY updated_at DESC, id DESC）。
-			// 历史问题（历史修复 同族收敛，对齐 certificates.go reconcile 历史
-			// 历史问题）：必须先判适用性再标记 seen——先 seen 后适用性会让最新
+			// （同族收敛，对齐 certificates.go reconcile 历史
+			// 必须先判适用性再标记 seen——先 seen 后适用性会让最新
 			// 旧域行短路较旧的适用行，整条规则被跳过、证书文件不物化。
 			if seenRules[ruleID] {
 				continue
 			}
-			// 历史问题:域名适用性校验(与 certJobRuleApplicable 同语义)——任务签发
+			// 域名适用性校验(与 certJobRuleApplicable 同语义)——任务签发
 			// 域名与规则当前域名不一致时物化会写入不匹配证书。
 			if !certJobRuleApplicable(true, ruleDomain, jobDomain) {
 				continue
@@ -467,7 +467,7 @@ func MaterializeAllCertsFromDB() {
 }
 
 // materializeCertPair 把库内证书对物化到磁盘，返回是否真正发生了写入。
-// 历史问题：内容与权限已一致时零写（返回 changed=false）——调用方的恢复计数
+// 内容与权限已一致时零写（返回 changed=false）——调用方的恢复计数
 // 与审计/任务日志必须只统计 changed，否则每次启动都报「恢复 N 个」，稀释真正
 // 的恢复事件（运维无法区分「真恢复」与「本来就在」）。
 func materializeCertPair(ruleID, certPEM, keyPEM string) (bool, error) {
@@ -481,11 +481,11 @@ func materializeCertPair(ruleID, certPEM, keyPEM string) (bool, error) {
 	diskCert, certErr := os.ReadFile(certPath)
 	diskKey, keyErr := os.ReadFile(keyPath)
 	if certErr == nil && keyErr == nil && bytes.Equal(diskCert, []byte(certPEM)) && bytes.Equal(diskKey, []byte(keyPEM)) {
-		// 历史问题:跳过前检查权限(与 writeCertPair/MaterializeCertPairs 同
+		// 跳过前检查权限(与 writeCertPair/MaterializeCertPairs 同
 		// 契约)——私钥被 chmod 0644 后启动路径此前不修复,直到下次 apply。
 		if certInfo, serr := os.Stat(certPath); serr == nil && certInfo.Mode().Perm() == 0644 {
 			if keyInfo, kerr := os.Stat(keyPath); kerr == nil && keyInfo.Mode().Perm() == 0600 {
-				// 历史问题（历史）：删除对磁盘字节的重复 X509KeyPair 解析——
+				// 删除对磁盘字节的重复 X509KeyPair 解析——
 				// :467 的 bytes.Equal 已证明磁盘字节与 :458 刚验证通过的库内
 				// 字节完全相同，二次解析不可能产生不同结果。
 				return false, nil

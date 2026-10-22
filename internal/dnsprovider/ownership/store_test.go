@@ -309,7 +309,7 @@ func TestStore_quarantines_unsupported_version_state_file(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：隔离文件名原为秒级时间戳——同一秒内二次损坏时
+// 隔离文件名原为秒级时间戳——同一秒内二次损坏时
 // os.Rename 覆盖上一份隔离文件（POSIX rename 语义），取证样本丢失。判定用
 // 固定时钟（corruptClock 接缝）制造同刻碰撞：两轮损坏必须留下两份独立样本。
 func TestStore_quarantineKeepsDistinctSamplesOnClockCollision(t *testing.T) {
@@ -439,7 +439,7 @@ func TestStore_concurrent_stores_mixed_operations(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：Remove 的相等判定必须按语义（CreatedAt.Equal）——
+// Remove 的相等判定必须按语义（CreatedAt.Equal）——
 // Record 内联 == 比较含 time.Time 的表示细节（monotonic 位、loc 指针），
 // 语义相同的记录被判不等 → Remove 静默 no-op，记录永久残留两种真实形态：
 //  1. 调用方持有写入时的原值（time.Now() 带 monotonic）与文件读回值比较；
@@ -486,7 +486,7 @@ func TestReplace_sharesStoreLockAndPreservesStateOnInvalidSnapshot(t *testing.T)
 	}
 
 	// When：Store 的读写锁被持有时，快照替换必须等待同一把锁。
-	// 历史修复（历史）：原形态只用 50ms 固定窗口判定「未返回」——负载高
+	// 原形态只用 50ms 固定窗口判定「未返回」——负载高
 	// 时 goroutine 尚未走到 fileMu.Lock() 也会静默通过（锁共享断言变成空
 	// 断言）。现按可观察副作用判定：锁内文件内容必须保持原快照，解锁后必须
 	// 变成 replacement；Replace 自身先取锁再解码，锁前准备工作为零。

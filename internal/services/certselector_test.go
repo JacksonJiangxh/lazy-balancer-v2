@@ -155,7 +155,7 @@ func TestCertificateService_CheckExpiration_skipsRenewal_whenSelectedCertificate
 
 func TestRequeueNonTerminalCertJobs_skipsIssuance_whenSelectedCertificateIsOutsideWindow(t *testing.T) {
 	// Given：在途（creating_order）任务持有剩余有效期远超续签窗口（90 天 > 30 天）
-	// 的证书——"检测到已有有效证书"恢复优化适用。历史修复 起仅豁免 queued（用户显式
+	// 的证书——"检测到已有有效证书"恢复优化适用。自此仅豁免 queued（用户显式
 	// 重签请求必须重新排队），在途任务仍走该优化。
 	_, database := newClusterTestService(t)
 	now := time.Now().UTC()

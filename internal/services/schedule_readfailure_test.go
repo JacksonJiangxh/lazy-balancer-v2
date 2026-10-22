@@ -1,6 +1,6 @@
 package services
 
-// 历史问题：排程/配置读失败必须经 logScheduleReadFailure 单源留痕（首报
+// 排程/配置读失败必须经 logScheduleReadFailure 单源留痕（首报
 // warn + 恢复 info）——自动备份槽位计算与启用源最早槽两处此前静默归零，
 // 库故障窗口任务「静默停摆」零信号。
 

@@ -11,7 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// 历史问题（历史）：非规范数字 id（如 "5.0"/" 5"）不得借 SQLite 数值亲和
+// 非规范数字 id（如 "5.0"/" 5"）不得借 SQLite 数值亲和
 // 绕过「被启用策略引用不可删除」门——DeleteIPList:617 已修同型，本处为家族收敛。
 // RED：Atoi 失败时引用检查被跳过但 DELETE 照执行；GREEN：非规范 id 直接 400。
 func newCustomRuleDeleteRouter(t *testing.T) *gin.Engine {

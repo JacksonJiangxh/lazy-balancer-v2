@@ -15,7 +15,7 @@ import (
 	"lazy-balancer-v2/internal/taskengine"
 )
 
-// useCertJobLogTestEnv 经 taskengine.SetLogDir 注入临时任务日志目录（历史问题-03：
+// useCertJobLogTestEnv 经 taskengine.SetLogDir 注入临时任务日志目录
 // 目录已惰性化——旧的 certJobLogDir 变量覆写接缝随 IIFE 一并退役）并直接注入
 // 大小阈值（绕过 task_log_size_mb 的 DB 读取与 5 分钟缓存），返回后恢复原状。
 func useCertJobLogTestEnv(t *testing.T, thresholdBytes int64) {
@@ -23,7 +23,7 @@ func useCertJobLogTestEnv(t *testing.T, thresholdBytes int64) {
 	oldDir := taskengine.LogDir()
 	taskengine.SetLogDir(filepath.Join(t.TempDir(), "logs", "tasks"))
 	// 阈值注入缝直接替换 taskengine 的读取函数，绕过 getTaskLogSizeBytes/缓存
-	// （历史修复 后缓存内部结构不可直接写入；本注入缝已完全覆盖阈值取值）。
+	// （后缓存内部结构不可直接写入；本注入缝已完全覆盖阈值取值）。
 	taskengine.SetTaskLogSizeBytesFn(func() int64 { return thresholdBytes })
 	t.Cleanup(func() {
 		taskengine.SetLogDir(oldDir)
@@ -31,7 +31,7 @@ func useCertJobLogTestEnv(t *testing.T, thresholdBytes int64) {
 	})
 }
 
-// 历史问题-03≡历史问题-02：目录惰性求值——SetLogDir 注入后 CertJobLogPath 落
+// ≡：目录惰性求值——SetLogDir 注入后 CertJobLogPath 落
 // {任务日志目录}/certjobs/。曾为包初始化 IIFE 固化（LogDir 注入恒晚于包
 // 初始化），生产恒回退 /app/logs 根、脱离 housekeeping 清理面。
 func TestCertJobLogPath_followsTaskLogDir(t *testing.T) {
@@ -45,7 +45,7 @@ func TestCertJobLogPath_followsTaskLogDir(t *testing.T) {
 	}
 }
 
-// 一次性迁移：历史修复/固化期写入 {LogDir 父目录}（容器=/app/logs）
+// 一次性迁移：/固化期写入 {LogDir 父目录}（容器=/app/logs）
 // 的 certjob-*.log 搬入新目录——旧文件残留会脱离清理面；目标已存在不覆盖。
 func TestCertJobLogDir_migratesLegacyFilesOnce(t *testing.T) {
 	base := t.TempDir()
@@ -98,7 +98,7 @@ func captureCertJobLogWarns(t *testing.T) func() []string {
 	}
 }
 
-// 历史问题：删除规则时必须同时清掉当前日志、.N 轮转副本与 .log.gz
+// 删除规则时必须同时清掉当前日志、.N 轮转副本与.log.gz
 // 压缩归档；同目录其他规则文件不受影响。
 func TestRemoveCertJobLogFiles_removesCompressedAndRotatedGenerations(t *testing.T) {
 	useCertJobLogTestEnv(t, 1<<20)
@@ -133,7 +133,7 @@ func TestRemoveCertJobLogFiles_removesCompressedAndRotatedGenerations(t *testing
 	}
 }
 
-// 历史问题（2026-09-05 证书域审计裁定）：轮转失败不得静默吞没——此前
+// （2026-09-05 证书域审计裁定）：轮转失败不得静默吞没——此前
 // os.Remove/os.Rename 的错误全部丢弃，坏轮转（如备份槽位被非空目录占据）无任何
 // 留痕。确定性触发：.5 槽位放非空目录，os.Remove 报 ENOTEMPTY（非 IsNotExist）。
 func TestCertJobFileLogger_rotation_failure_is_surfaced(t *testing.T) {
@@ -164,7 +164,7 @@ func TestCertJobFileLogger_rotation_failure_is_surfaced(t *testing.T) {
 	}
 }
 
-// 历史问题 并发守护：每次写日志都新建实例（Issue 的 jobLogger / WriteCertJobLog* 是
+// 并发守护：每次写日志都新建实例（Issue 的 jobLogger / WriteCertJobLog* 是
 // 真实调用形态），8 实例并发写同 ruleID、阈值 1 字节使每次写都触发轮转。锁定后
 // check-rotate-append 原子化；断言全部落盘行完整无撕裂、代际集合不越界。
 // 注：并发交错本身概率性，本测试为回归守护（配合 -race），确定性红由
@@ -217,7 +217,7 @@ func TestCertJobFileLogger_concurrent_writers_keep_lines_intact(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：taskLogsHousekeeping 的唯一职责是保留期清理——尺寸轮转
+// taskLogsHousekeeping 的唯一职责是保留期清理——尺寸轮转
 // 已归写入侧 RotateTaskLogBeforeWrite，旧用例（调 housekeeping 后断言四代不丢）
 // 对被测逻辑零耦合，是无 RED 能力的空转。现注入「过期」与「活跃」两个证书任务
 // 日志：只删过期文件、活跃文件必须保留；保留期删除被移除/阈值失效即红。
@@ -265,7 +265,7 @@ func TestCertJobFileLogger_housekeepingDeletesOnlyExpiredFiles(t *testing.T) {
 	}
 }
 
-// 回归钉（历史问题-1 配套）：单轨超尺寸轮转保持 5 代上限——7 次写入（每次写入前
+// 回归钉：单轨超尺寸轮转保持 5 代上限——7 次写入（每次写入前
 // 判定超阈即轮转）后活动文件存最新一代，.1-.5 存最近 5 代，最老一代退役，
 // 不产生 .6。
 func TestCertJobFileLogger_singleTrackRotationKeepsFiveGenerations(t *testing.T) {
@@ -307,7 +307,7 @@ func TestCertJobFileLogger_singleTrackRotationKeepsFiveGenerations(t *testing.T)
 	}
 }
 
-// failingCertJobLogWriter 注入写/关闭失败（历史问题：磁盘配额/只读降级时
+// failingCertJobLogWriter 注入写/关闭失败（磁盘配额/只读降级时
 // OpenFile(O_APPEND) 可成功而后续 write 失败，此前 fmt.Fprint 与 Close 错误全被丢弃）。
 type failingCertJobLogWriter struct {
 	writeErr error
@@ -317,7 +317,7 @@ type failingCertJobLogWriter struct {
 func (w *failingCertJobLogWriter) Write([]byte) (int, error) { return 0, w.writeErr }
 func (w *failingCertJobLogWriter) Close() error              { return w.closeErr }
 
-// 历史问题（历史）：写/关闭错误必须经 Logf 留痕（error/warn），不得静默吞没——
+// 写/关闭错误必须经 Logf 留痕（error/warn），不得静默吞没——
 // 任务日志是证书域业务留痕的唯一文件源，磁盘故障时无告警会让日志与 DB 状态分叉。
 func TestCertJobFileLogger_writeAndCloseErrorsAreSurfaced(t *testing.T) {
 	// Given：捕获标准日志输出（Logf 经 log.Printf）

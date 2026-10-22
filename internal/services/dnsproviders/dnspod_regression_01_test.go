@@ -35,7 +35,7 @@ func TestDNSPod_Validate_cleanupFailureAdvisesManualCleanup(t *testing.T) {
 	creds := map[string]string{"auth_mode": "dnspod", "app_id": "123", "app_token": "abc"}
 
 	// When validation runs
-	err := provider.Validate(creds, "example.com")
+	err := provider.Validate(context.Background(), creds, "example.com")
 
 	// Then it still fails, and the message names the manual cleanup path
 	if err == nil {
@@ -49,7 +49,7 @@ func TestDNSPod_Validate_cleanupFailureAdvisesManualCleanup(t *testing.T) {
 	}
 }
 
-// 历史修复 回归形状：Present 失败不属于清理残留场景，文案不得出现手动清理提示。
+// 回归形状：Present 失败不属于清理残留场景，文案不得出现手动清理提示。
 func TestDNSPod_Validate_presentFailureKeepsOriginalMessage(t *testing.T) {
 	// Given a provider whose present fails
 	old := newDNSProviderFromCredentials
@@ -61,7 +61,7 @@ func TestDNSPod_Validate_presentFailureKeepsOriginalMessage(t *testing.T) {
 	creds := map[string]string{"auth_mode": "dnspod", "app_id": "123", "app_token": "abc"}
 
 	// When validation runs
-	err := provider.Validate(creds, "example.com")
+	err := provider.Validate(context.Background(), creds, "example.com")
 
 	// Then the write-test error is returned unchanged
 	if err == nil || !strings.Contains(err.Error(), "DNS 写入测试失败") {

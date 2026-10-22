@@ -1,6 +1,9 @@
 package dnsproviders
 
-import "sort"
+import (
+	"context"
+	"sort"
+)
 
 type CredentialField struct {
 	Name        string `json:"name"`
@@ -9,7 +12,7 @@ type CredentialField struct {
 	Required    bool   `json:"required"`
 	Placeholder string `json:"placeholder,omitempty"`
 	// VisibleWhen 声明字段可见性：{其它字段名: 允许取值}，全部条件命中才显示。
-	// 前端据此渲染表单（历史修复，历史）——原前端按 dnspod 的两种认证模式
+	// 前端据此渲染表单——原前端按 dnspod 的两种认证模式
 	// 硬编码可见字段，后端新增 provider 时其 credential_fields 会被整体隐藏。
 	// 为空 = 恒显示。
 	VisibleWhen map[string][]string `json:"visible_when,omitempty"`
@@ -25,14 +28,16 @@ type Provider interface {
 	CredentialFields() []CredentialField
 	CredentialFieldOptions(field string) []string
 	BuildCredentialsJSON(creds map[string]string) (map[string]interface{}, error)
-	Validate(creds map[string]string, testDomain string) error
+	// Validate 以调用方请求 ctx 为上界执行保存前验证：客户端断开/超时必须
+	// 立刻中止写入探测，不得跑满内部预算。
+	Validate(ctx context.Context, creds map[string]string, testDomain string) error
 }
 
 type BaseProvider struct{}
 
 func (b *BaseProvider) CredentialFieldOptions(field string) []string { return nil }
 
-func (b *BaseProvider) Validate(creds map[string]string, testDomain string) error {
+func (b *BaseProvider) Validate(ctx context.Context, creds map[string]string, testDomain string) error {
 	return nil
 }
 
@@ -52,7 +57,7 @@ func List() []Provider {
 	for _, p := range registry {
 		list = append(list, p)
 	}
-	// 历史修复(历史):map 遍历序不确定,/dns-providers 响应顺序随进程
+	// map 遍历序不确定,/dns-providers 响应顺序随进程
 	// 随机——按 Code(注册表键,唯一)排序输出稳定切片。
 	sort.Slice(list, func(i, j int) bool { return list[i].Code() < list[j].Code() })
 	return list

@@ -85,7 +85,10 @@ story.md
 # TypeScript 增量构建缓存
 *.tsbuildinfo
 
-# 审计过程记录/轮次测试——仅本地保留 .omp/legacy-audit，不入公网仓库
+# 审计过程记录/轮次测试——不入公网仓库，历史产物在私有审计仓。
+# 下方块与 scripts/check-no-audit-artifacts.sh 的模式表双向一致（脚本会逐行校验，
+# 多一行/少一行/改一行都使守卫失败）；改这里必须同步改脚本的模式表。
+# >>> audit-artifact patterns
 docs/audit/
 **/audit[0-9]*_test.go
 **/*_audit[0-9]*_test.go
@@ -94,3 +97,8 @@ docs/audit/
 **/round[0-9]*_test.go
 **/*_r[0-9]*_test.go
 **/*_round[0-9]*_test.go
+**/*audit[0-9]*
+**/*round[0-9]*
+**/*audit[0-9]*/
+**/*round[0-9]*/
+# <<< audit-artifact patterns

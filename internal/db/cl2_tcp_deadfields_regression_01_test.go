@@ -51,6 +51,55 @@ func TestMigrateTCPRuleDeadFields_clears_tcp_enable_tls_with_empty_certs(t *test
 // TCP 自愈族：TCP 自愈清单扩面——代理超时族/自定义路由/
 // dynamic_dns/strategy(cookie) 同迁移清零，残留 path_rules 同事务删除；
 // 非 TCP 行（含 HTTP+proxy 超时/cookie 策略）不得被触碰。
+func TestMigrateTCPRuleDeadFields_clearsRemainingHTTPOnlyFields(t *testing.T) {
+	database := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	if _, err := database.Exec("INSERT OR IGNORE INTO global_config (id,caddy_config) VALUES (1,'{}')"); err != nil {
+		t.Fatalf("seed global config: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO lb_rules
+		(caddy_id,name,protocol,domain,listen_port,tls_source,tls_http_redirect,health_check_host,
+		 block_page_stage1_id,block_page_stage1_status,block_page_stage3_id,block_page_stage3_status,log_enabled)
+		VALUES ('lb_migration_dead','migration-dead','tcp','dead.example.test',19444,'acme_dns',1,'probe.example.test',7,451,8,503,1)`); err != nil {
+		t.Fatalf("seed TCP dead fields: %v", err)
+	}
+
+	var staleBefore int
+	if err := database.QueryRow(tcpDeadFieldsProbeSQL).Scan(&staleBefore); err != nil {
+		t.Fatalf("probe before migration: %v", err)
+	}
+	if staleBefore != 1 {
+		t.Fatalf("probe before migration=%d, want 1", staleBefore)
+	}
+	if err := migrateTCPRuleDeadFields(); err != nil {
+		t.Fatalf("migrate TCP dead fields: %v", err)
+	}
+
+	var domain, tlsSource, healthHost string
+	var redirect, stage1ID, stage1Status, stage3ID, stage3Status, logEnabled int
+	if err := database.QueryRow(`SELECT COALESCE(domain,''),COALESCE(tls_source,''),COALESCE(health_check_host,''),
+		COALESCE(tls_http_redirect,0),COALESCE(block_page_stage1_id,0),COALESCE(block_page_stage1_status,0),
+		COALESCE(block_page_stage3_id,0),COALESCE(block_page_stage3_status,0),COALESCE(log_enabled,0)
+		FROM lb_rules WHERE caddy_id='lb_migration_dead'`).Scan(
+		&domain, &tlsSource, &healthHost, &redirect, &stage1ID, &stage1Status, &stage3ID, &stage3Status, &logEnabled); err != nil {
+		t.Fatalf("read migrated TCP rule: %v", err)
+	}
+	if domain != "" || tlsSource != "manual" || healthHost != "" || redirect != 0 ||
+		stage1ID != 0 || stage1Status != 0 || stage3ID != 0 || stage3Status != 0 || logEnabled != 0 {
+		t.Fatalf("TCP dead fields remain: domain=%q tls_source=%q health_host=%q redirect=%d stages=%d/%d/%d/%d log=%d",
+			domain, tlsSource, healthHost, redirect, stage1ID, stage1Status, stage3ID, stage3Status, logEnabled)
+	}
+	var staleAfter int
+	if err := database.QueryRow(tcpDeadFieldsProbeSQL).Scan(&staleAfter); err != nil {
+		t.Fatalf("probe after migration: %v", err)
+	}
+	if staleAfter != 0 {
+		t.Fatalf("probe after migration=%d, want 0", staleAfter)
+	}
+}
+
 func TestMigrateTCPRuleDeadFields_clearsHTTPOnlyProxyRoutesAndStrategy(t *testing.T) {
 	// Given
 	database := openMigrationTestDB(t)

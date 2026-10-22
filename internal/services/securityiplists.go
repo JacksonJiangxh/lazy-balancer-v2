@@ -28,10 +28,10 @@ type policyIPRefExpansion struct {
 // parseIPListRefs 解析 refs JSON（[]int64 形态）：nil/空串/空白 → nil；畸形 → nil
 // （跳过引用，仅保留 inline，发射不因此失败——与 resolvePolicyCustomRules 的
 // 悬空引用仅留痕口径一致）。条目去重，保持出现顺序。
-// parseIPListRefs 与 handlers.parseIPListRefsIDs 为镜像实现（历史问题
+// parseIPListRefs 与 handlers.parseIPListRefsIDs 为镜像实现
 // 裁定保留双份并声明）：本侧投影路径去重保序，handlers 侧校验路径不去重
 // ——语义有意分叉，勿单方面合并。
-// 历史修复（历史）：本函数为零日志形态（判定/兼容调用）；渲染路径
+// 本函数为零日志形态（判定/兼容调用）；渲染路径
 // 必须走 parseIPListRefsLogged——畸形 refs 静默按空集处理会让 deny ACL 仅引用
 // 列表的策略合并集为空、id:2 永不命中（静默 fail-open），此前零告警。
 func parseIPListRefs(raw string) []int64 {
@@ -72,7 +72,7 @@ func parseIPListRefsLogged(policyID int, field, raw string) []int64 {
 	return ids
 }
 
-// logMalformedIPListRefs 渲染期引用 IP 名单 JSON 畸形留痕（历史修复，限流）：
+// logMalformedIPListRefs 渲染期引用 IP 名单 JSON 畸形留痕
 // 与 logMalformedInlineIPList 同口径。写侧（handlers parseIPListRefsPayload）/
 // 导入校验已拒畸形，仅带外改库/集群快照继承/旧备份可达。
 func logMalformedIPListRefs(policyID int, field string, err error) {
@@ -88,7 +88,7 @@ func ipListRefsNonEmpty(raw string) bool {
 	return len(parseIPListRefs(raw)) > 0
 }
 
-// logMalformedInlineIPList 渲染期内联 IP 名单 JSON 畸形留痕（历史问题-03 第 83
+// logMalformedInlineIPList 渲染期内联 IP 名单 JSON 畸形留痕（第 83
 // 轮审计，限流）。写侧/导入侧已拒非 JSON，仅带外改库/旧库残留可达；旧实现
 // 静默按空集处理——deny ACL / 黑名单方向即 fail-open 且零告警。
 func logMalformedInlineIPList(policyID int, field string, err error) {
@@ -148,7 +148,7 @@ func expandPolicyIPRefs(p *models.SecurityPolicy, listsByID map[int64][]string) 
 		}
 		return merged
 	}
-	// 合并即聚合（历史问题 修复，用户上报「规则越多保存越慢」根因）：
+	// 合并即聚合（修复，用户上报「规则越多保存越慢」根因）
 	// 发射端 mergedACLList/mergedWhitelist 按规则×策略逐次调用，若在此处不
 	// 聚合，万条级合并集（如 USTC 11415 条）会被每次调用全量重聚合——保存
 	// 耗时随绑定规则数线性放大。聚合幂等，此处一次完成后发射端直接返回。
@@ -159,9 +159,9 @@ func expandPolicyIPRefs(p *models.SecurityPolicy, listsByID map[int64][]string) 
 
 // LoadIPListEntriesByID 以一次查询批量加载 IP 地址列表条目值（仅 value）。
 // ids 为空或数据库未初始化时返回空映射；缺失的 id 不出现在结果中。
-// loadIPListEntriesVia：唯一装载实现（历史问题 曾声明与 loadIPListEntries 双实现，
-// 后者零调用已删——历史修复；渲染与严格校验统一走 Via 错误通道）。
-// store 感知装载（审计 历史问题）——store 非-nil（v2 导入事务视图）经其查询，
+// loadIPListEntriesVia：唯一装载实现（曾声明与 loadIPListEntries 双实现，
+// 后者零调用已删——；渲染与严格校验统一走 Via 错误通道）。
+// store 感知装载（审计）——store 非-nil（v2 导入事务视图）经其查询，
 // nil 回退 db.DB。镜像 resolvePolicyIPListRefs 的回退逻辑。
 func loadIPListEntriesVia(store caddyConfigStore, ids []int64) (map[int64][]string, map[int64]bool, error) {
 	if store == nil {
@@ -204,11 +204,11 @@ func loadIPListEntriesVia(store caddyConfigStore, ids []int64) (map[int64][]stri
 			var system int
 			var name string
 			if err := rows.Scan(&id, &raw, &system, &name); err != nil {
-				// 历史修复（历史）：Scan 失败不再静默——行丢弃须留痕（该列表
+				// Scan 失败不再静默——行丢弃须留痕（该列表
 				// 若被引用，缺失表现为合并集静默缺条目）。
 				Logf("warn", "渲染: security_ip_lists 行扫描失败（该行丢弃）: %v", err)
 				// 严格模式必须把该 id 记为失败；仅 continue 会按 inline-only
-				// 继续渲染，deny 集合静默收窄（历史问题-2）。
+				// 继续渲染，deny 集合静默收窄。
 				failed[id] = true
 				if firstErr == nil {
 					firstErr = fmt.Errorf("scan security_ip_lists id %d: %w", id, err)
@@ -216,7 +216,7 @@ func loadIPListEntriesVia(store caddyConfigStore, ids []int64) (map[int64][]stri
 				continue
 			}
 			if system == 1 && threatSourceByListName(name) != "" {
-				// 威胁库（RDB 文件化名单）：读 .iplist 文件（源文件）。历史问题：
+				// 威胁库（RDB 文件化名单）：读.iplist 文件（源文件）。
 				// 以「名字映射到威胁源」路由而非 system=1——自动封禁预置名单
 				// 同为 system=1 但条目在 DB entries，走文件分支会恒失败并触发
 				// 严格模式跳过引用策略的渲染。
@@ -241,11 +241,11 @@ func loadIPListEntriesVia(store caddyConfigStore, ids []int64) (map[int64][]stri
 					failed[id] = true
 					continue
 				}
-				// 历史问题：过期条目（expires_at 可解析且 <= now）不再下发——到期即
+				// 过期条目（expires_at 可解析且 <= now）不再下发——到期即
 				// 自动解封的唯一发射面。解析失败的 expires_at 保留条目（fail-open
 				// 不误删）；判断以 UTC 墙钟串（autobanTimeLayout 同形态），
 				// 时钟走 autobanNow 缝（与自动封禁同源，测试可注入时间轴）。
-				// 历史修复（历史）：判据单源化 autobanEntryExpired——/status 计数
+				// 判据单源化 autobanEntryExpired——/status 计数
 				// 与渲染生效面共用同一谓词，永不漂移。
 				now := autobanNow()
 				vals := make([]string, 0, len(list))
@@ -262,7 +262,7 @@ func loadIPListEntriesVia(store caddyConfigStore, ids []int64) (map[int64][]stri
 				entries[id] = vals
 			}
 		}
-		// 历史修复（历史）：迭代错误必须显式捕获——rows.Next() 因错误
+		// 迭代错误必须显式捕获——rows.Next() 因错误
 		// （而非 EOF）返回 false 时静默走掉会让装载集合缺行而 failedIDs 不置位，
 		// 引用策略拿到「静默缺内容的合并集」绕过 IPRefMissing 严格模式
 		// （ACL/信任面静默收窄零留痕）。与查询失败分支同口径：warn+整块
@@ -300,13 +300,13 @@ func threatTextParseRatio(vals []string) float64 {
 	return float64(parsed) / float64(len(vals))
 }
 
-// readThreatIplistPath 按代际读取威胁名单文件（历史）：文本与
+// readThreatIplistPath 按代际读取威胁名单文件：文本与
 // .fast 同时存在时以 mtime 较新者为准——从节点只同步 .fast（零编译裁定），
 // 降级前遗留的文本可能是旧代；旧「文本优先」会让集群新同步的 .fast 被陈旧
 // 文本静默遮蔽（新威胁漏拦/已移除误拦）。同代（mtime 相等）保持文本优先
 // （主节点写入相位先落文本后落 fast，内容等价）。
 // 两个文件都缺失返回文本侧错误（os.ErrNotExist 语义由调用方判定）。
-// 历史问题（历史）：.fast 较新但损坏/不可读时回退文本（在场时）
+// .fast 较新但损坏/不可读时回退文本（在场时）
 // 并告警——旧实现直接失败，引用名单的 ACL/信任策略被渲染层整体跳过
 // （安全面静默缺失），且更新器哈希快路径按 stat 判定永不修复。
 func readThreatIplistPath(iplistPath string) ([]string, error) {
@@ -425,7 +425,7 @@ func LoadIPListEntriesByID(ids []int64) (map[int64][]string, error) {
 	if len(ids) == 0 || db.DB == nil {
 		return map[int64][]string{}, nil
 	}
-	// 历史问题-6(历史):db 分支错误上抛(对齐 store 分支 历史修复 契约)
+	// db 分支错误上抛(对齐 store 分支契约)
 	// ——委托 loadIPListEntriesVia(分块+错误通道),不再吞错返回恒 nil error。
 	entries, _, err := loadIPListEntriesVia(db.DB, ids)
 	return entries, err
@@ -453,7 +453,7 @@ func danglingIPListRefs(p *models.SecurityPolicy, listsByID map[int64][]string, 
 }
 
 // ResolvePolicyIPListRefsForSummary 供摘要/列表路径批量解析引用 IP 名单
-// （历史问题：SecurityPolicyHasIPControl 需要与发射面一致的合并集内容判定）。
+// （SecurityPolicyHasIPControl 需要与发射面一致的合并集内容判定）。
 // 与渲染加载路径同一实现（store=nil → db.DB）；批次内零引用时零查询。
 func ResolvePolicyIPListRefsForSummary(policies []*models.SecurityPolicy) {
 	resolvePolicyIPListRefs(policies, nil)
@@ -462,7 +462,7 @@ func ResolvePolicyIPListRefsForSummary(policies []*models.SecurityPolicy) {
 // resolvePolicyIPListRefs 在策略加载路径上完成引用解析：跨整个已加载批次收集
 // 引用的列表 id（去重），仅当存在引用时执行恰好一次批量查询，再把每条策略的
 // 合并集（inline ∪ 引用条目）附加到 MergedACLList / MergedWhitelist。
-// store 与策略预载同源（历史修复 同型约束）：v2 导入事务内重插的 security_ip_lists
+// store 与策略预载同源：v2 导入事务内重插的 security_ip_lists
 // 行只有 tx 视角可见，走 db.DB 会让引用条目在渲染期静默丢失；store=nil 回退
 // db.DB（非批量路径）。批次内无任何引用时零查询（性能预算：每次生成至多
 // 一次额外查询，与引用数无关）。
@@ -511,7 +511,7 @@ func resolvePolicyIPListRefs(policies []*models.SecurityPolicy, store caddyConfi
 			RecordAuditLog("system", "渲染跳过", "安全策略", refErr+"，已跳过该策略渲染", "")
 		}
 	}
-	// 历史修复（历史）：展开结果按「四条来源列完全相同」在本次调用内
+	// 展开结果按「四条来源列完全相同」在本次调用内
 	// 去重。多策略引用同一大名单（常见形态）时，per-policy aggregateIPEntries
 	// （20 万条 ≈ 19ms）只做一次；单一策略形态零行为差异。键只含策略来源列
 	// （纯函数输入，本次调用内 listsByID 固定），故不存在跨 tick 陈旧风险，
@@ -529,7 +529,7 @@ func resolvePolicyIPListRefs(policies []*models.SecurityPolicy, store caddyConfi
 		}
 		// RDB 严格模式：策略引用的任一列表装载失败（威胁库 .iplist 缺失或
 		// 自定义 entries 畸形）→ 标记跳过渲染，绝不以空集静默收窄 ACL 保护面。
-		// 历史问题：同一 policy+list+错误文本按 auditFailureShouldLog 限流。
+		// 同一 policy+list+错误文本按 auditFailureShouldLog 限流。
 		for _, id := range parseIPListRefs(p.IPACLListRefs) {
 			if failedIDs[id] {
 				p.IPRefMissing = true
@@ -593,7 +593,7 @@ func mergedWhitelist(p *models.SecurityPolicy) []string {
 
 // ReadThreatIplistForUI 供 UI 预览调用：按列表名读威胁名单条目。
 // 文件不存在返回空集（禁用/未更新源）。与渲染侧 readThreatIplistEntries 共用
-// readThreatIplistPath（代际感知：新同步的 .fast 不被陈旧文本遮蔽，历史问题）。
+// readThreatIplistPath（代际感知：新同步的.fast 不被陈旧文本遮蔽）。
 func ReadThreatIplistForUI(listName string) ([]string, error) {
 	source := threatSourceByListName(listName)
 	if source == "" {
@@ -603,7 +603,7 @@ func ReadThreatIplistForUI(listName string) ([]string, error) {
 	vals, err := readThreatIplistPath(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// 历史修复（历史）：从节点 waf_files 只同步 .fast——两个文件都
+			// 从节点 waf_files 只同步.fast——两个文件都
 			// 缺失才视为「未更新源」空集。
 			return nil, nil
 		}
@@ -613,7 +613,7 @@ func ReadThreatIplistForUI(listName string) ([]string, error) {
 }
 
 // ReadThreatIplistBySource 按源名读威胁名单内容（导出用）。
-// 历史问题：与渲染/UI 共用代际感知读取——从节点文本可能是旧代，导出必须与
+// 与渲染/UI 共用代际感知读取——从节点文本可能是旧代，导出必须与
 // 执行面一致（.fast 较新时展开为文本行）。两文件都缺失返回 nil。
 func ReadThreatIplistBySource(source string) ([]byte, error) {
 	if source == "" {

@@ -2,7 +2,7 @@ package services
 
 // 历史 用户反馈批次钉（SPEC §6.5 业务摘要行）：每个真实执行轮在
 // tasks/{id}.log 留业务结论——「无临期证书/清理 N 条/摄取 N 条/配置一致」。
-// 历史问题 收敛（2026-10-03 裁定）：一致轮不再逐轮记录，收敛为小时级心跳；
+// 收敛（2026-10-03 裁定）：一致轮不再逐轮记录，收敛为小时级心跳；
 // 漂移/异常轮照旧逐轮留痕。
 
 import (
@@ -20,7 +20,7 @@ import (
 func newTaskLogDir(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	// 历史问题：保存并恢复旧目录（原实现只在旧目录为空时置空——上一用例的
+	// 保存并恢复旧目录（原实现只在旧目录为空时置空——上一用例的
 	// 临时目录被删后残留指针，跨用例读日志失败/假绿）。
 	old := taskengine.LogDir()
 	taskengine.SetLogDir(filepath.Join(dir, "tasks"))
@@ -59,7 +59,7 @@ func TestTaskLogf_CertRenewalScanNoExpiringSummary(t *testing.T) {
 
 // Given audit-retention 已在引擎注册（真实 Run 体：CleanupAuditLogs→
 // PurgeTaskRuns→TaskLogf），库中含过期审计行。
-// When 经引擎 Trigger 执行真实 Run 体（历史问题-10 接线钉——曾由测试自调
+// When 经引擎 Trigger 执行真实 Run 体（接线钉——曾由测试自调
 // CleanupAuditLogs+自写 TaskLogf，删 Run 体内 TaskLogf 调用不会红）。
 // Then tasks/audit-retention.log 含 Run 体写出的带删除条数的结论行。
 func TestTaskLogf_AuditRetentionCleanupSummary(t *testing.T) {
@@ -81,10 +81,10 @@ func TestTaskLogf_AuditRetentionCleanupSummary(t *testing.T) {
 	}
 }
 
-// Given config-watchdog 已在引擎注册（真实 Run 体：WatchdogCheckOnce——历史问题 起
+// Given config-watchdog 已在引擎注册（真实 Run 体：WatchdogCheckOnce——自此
 // 一致轮零逐轮行，每 60 轮一条心跳；漂移轮逐轮行不变）。
-// When 经引擎 Trigger 连打 60 轮真实 Run 体（历史问题-10 接线钉——假 Caddy 提供
-// 空运行配置、空规则库 → 每轮真实完成且一致；历史问题 起跳过轮不计入干净轮，
+// When 经引擎 Trigger 连打 60 轮真实 Run 体（接线钉——假 Caddy 提供
+// 空运行配置、空规则库 → 每轮真实完成且一致；自此跳过轮不计入干净轮，
 // 心跳必须由真实检查轮驱动）。
 // Then tasks/config-watchdog.log 恰含一条「配置一致（心跳…）」结论行。
 func TestTaskLogf_WatchdogSummaryShape(t *testing.T) {
@@ -109,7 +109,7 @@ func TestTaskLogf_WatchdogSummaryShape(t *testing.T) {
 	}
 }
 
-// 历史问题 收敛（2026-10-03 裁定）：cert-manual-poll 全正常轮（无过期无临期）零任务
+// 收敛（2026-10-03 裁定）：cert-manual-poll 全正常轮（无过期无临期）零任务
 // 日志行；仅异常轮（过期或临期>0）记一行带计数的业务结论行。
 func TestTaskLogf_CertManualPoll_exceptionRoundsOnly(t *testing.T) {
 	_, database := newClusterTestService(t)
@@ -151,7 +151,7 @@ func TestTaskLogf_CertManualPoll_exceptionRoundsOnly(t *testing.T) {
 	}
 }
 
-// 历史问题-15③：PEM 损坏/解析失败行此前仅应用日志 warn 不计数，巡检摘要零
+// ③：PEM 损坏/解析失败行此前仅应用日志 warn 不计数，巡检摘要零
 // 痕迹。摘要须补「另 N 行解析失败已跳过」（对照续期扫描 skippedNote 口径）；
 // 纯解析失败轮（过期/临期计数为零）同属异常轮，必须留一行而非静默。
 func TestTaskLogf_CertManualPoll_parseFailureCountedInSummary(t *testing.T) {
@@ -221,7 +221,7 @@ func TestTaskEngineWire_KindMapping(t *testing.T) {
 	}
 }
 
-// 历史修复③：runtimeLogFile 未打开（旋转写入器打开失败）时 log-cleanup
+// runtimeLogFile 未打开（旋转写入器打开失败）时 log-cleanup
 // 整个 Run 体此前为空——任务监控恒绿却零动作、任务日志零行。必须留「未启用」行。
 func TestTaskLogf_LogCleanupDisabledWhenRuntimeLogFileMissing(t *testing.T) {
 	// runtimeLogFile 为空=旋转写入器打开失败的真实形态；InitTaskEngine 会按
@@ -238,7 +238,7 @@ func TestTaskLogf_LogCleanupDisabledWhenRuntimeLogFileMissing(t *testing.T) {
 	}
 }
 
-// 历史修复：失败轮任务日志不得写「清理完成」——task_runs 已落 failed，
+// 失败轮任务日志不得写「清理完成」——task_runs 已落 failed，
 // 日志称完成会把排障方向带偏（metrics 库不可用/ctx 取消）。
 func TestTaskLogf_SecurityEventsRetentionFailureSaysFailed(t *testing.T) {
 	newTaskLogDir(t)
@@ -260,7 +260,7 @@ func TestTaskLogf_SecurityEventsRetentionFailureSaysFailed(t *testing.T) {
 	}
 }
 
-// 历史修复：孤儿规则指标清理同族。
+// 孤儿规则指标清理同族。
 func TestTaskLogf_MetricsOrphanCleanupFailureSaysFailed(t *testing.T) {
 	newTaskLogDir(t)
 	te := newWireTestEngine(t)

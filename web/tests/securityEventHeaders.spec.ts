@@ -8,7 +8,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { member, repoSource } from './_helpers.ts'
+import { member, repoSource, source } from './_helpers.ts'
 
 /** Go map 字面量里的头名（小写键）。 */
 const backendHeaders = (): string[] => {
@@ -19,7 +19,7 @@ const backendHeaders = (): string[] => {
 
 /** 前端 Set 字面量里的头名。 */
 const frontendHeaders = (): string[] => {
-  const src = repoSource('web/src/views/security/SecurityEvents.vue')
+  const src = source('src/views/security/SecurityEvents.vue')
   const start = src.indexOf('const CTX_SENSITIVE_HEADERS = new Set([')
   assert.notEqual(start, -1, '缺少 CTX_SENSITIVE_HEADERS')
   const open = src.indexOf('[', start)

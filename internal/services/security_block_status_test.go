@@ -8,7 +8,7 @@ package services
 // 策略合成状态码。SecRuleUpdateActionById 949110 "deny,status:<syn>" 必须在
 // 引擎层真实抬码(interruption.Status==<syn>)——若引擎不支持(coraza 与
 // ModSecurity 行为差),fallback=CRS 中断走 403 兜底路由(计划 Assumptions 节)。
-// 这是引擎行为实证,非字符串断言(历史修复)。
+// 这是引擎行为实证,非字符串断言。
 
 import (
 	"encoding/json"
@@ -105,7 +105,7 @@ func TestBuildCorazaDirectives_blockStatusLiftsAllowModeDeny(t *testing.T) {
 	}
 }
 
-// 多策略链式自排除形状：链首段（disruptive 仅在首段，历史问题 引擎约束）抬码。
+// 多策略链式自排除形状：链首段（disruptive 仅在首段，引擎约束）抬码。
 func TestBuildCorazaDirectives_blockStatusLiftsChainedTrustExclusion(t *testing.T) {
 	policy := &models.SecurityPolicy{
 		AnomalyThreshold:   5,

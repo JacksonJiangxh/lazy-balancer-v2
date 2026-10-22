@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-// logf 是包级日志接缝（历史问题-16，镜像 services/certjoblog.go certJobLogWarnf
+// logf 是包级日志接缝（镜像 services/certjoblog.go certJobLogWarnf
 // 先例）：默认落到标准 log（stdout）；ownership 是独立 module 边界（被
 // dnsprovider/services 反向依赖，不得回依赖 services），故由
 // cmd/server/main.go 装配时注入 services.Logf，使告警进入统一日志级别链。
@@ -32,7 +32,7 @@ const ownershipFileName = "acme_dns_ownership.json"
 // staleOwnershipAge is the age beyond which an ownership entry can no longer
 // belong to a live issuance: the CA queue caps execution at 60 minutes and the
 // deferred cleanup budget is capped at 8 minutes (acme dnsCleanupBudgetMax,
-// 历史修复), so anything older is provably abandoned and may be removed by any
+// so anything older is provably abandoned and may be removed by any
 // later cleanup without endangering a concurrent challenge.
 const staleOwnershipAge = 75 * time.Minute
 
@@ -144,7 +144,7 @@ func New(dataDir string) (*Store, error) {
 // snapshot. It deliberately shares fileMu and the same atomic writer as Store
 // mutations so a snapshot apply cannot overwrite a concurrent Add/Remove.
 func Replace(dataDir string, data []byte) error {
-	// 历史修复（历史）：先取锁再做任何准备工作（解码/建目录）——锁前
+	// 先取锁再做任何准备工作（解码/建目录）——锁前
 	// 的准备会给「Replace 确实共用 fileMu」的并发测试留下假绿窗口：goroutine
 	// 还没走到加锁点，固定等待就静默通过，断言变成空断言。锁内解码的代价
 	// 可忽略（快照为单文件、签发级频次）。
@@ -235,7 +235,7 @@ func (s *Store) MatchingValue(provider, zone, fqdn, value string) ([]Record, err
 	return matching, nil
 }
 
-// sameRecord 语义相等（历史问题，历史）：Record 结构内联 == 比较含
+// sameRecord 语义相等：Record 结构内联 == 比较含
 // time.Time（wall/ext/loc 指针 + monotonic）——从文件读回经 Matching/
 // MatchingValue 得到的记录与调用方持有的原值逻辑时间相同，但 == 可能为
 // false（JSON 解码丢弃 monotonic、loc 指针不同），Remove 静默 no-op 留下
@@ -285,7 +285,7 @@ func (s *Store) load() (state, error) {
 		// brick all DNS-01 issuance) until manual deletion. The quarantined
 		// file stays on disk for inspection; only a failed quarantine (bytes
 		// not preserved) keeps returning the error.
-		// 历史修复（历史）：文件名原为秒级时间戳，同一秒内二次损坏会被
+		// 文件名原为秒级时间戳，同一秒内二次损坏会被
 		// os.Rename 覆盖（POSIX rename 语义）而丢失上一份取证样本——改为
 		// 纳秒时间戳 + 冲突探测。
 		quarantined := s.quarantinePath()
@@ -298,7 +298,7 @@ func (s *Store) load() (state, error) {
 	return current, nil
 }
 
-// corruptClock 是隔离文件名的时间源（历史修复 测试接缝：固定时钟下连续两次
+// corruptClock 是隔离文件名的时间源（测试接缝：固定时钟下连续两次
 // 隔离必须产生两份独立样本）。生产代码不得改写。
 var corruptClock = time.Now
 

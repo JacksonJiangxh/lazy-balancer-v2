@@ -25,20 +25,20 @@ type CrawlerEngine struct {
 	ID string
 	// Name 中文展示名（策略向导勾选组）。
 	Name string
-	// UARegex 历史修复 匹配（预编译，大小写不敏感）。
+	// UARegex 匹配（预编译，大小写不敏感）。
 	UARegex *regexp.Regexp
 	// VerifyMethod 验证方式：ptr（默认，双跳反查）/ iprange（官方声明
 	// 不支持 nslookup 的厂商，如 360，用官方公布 IP 段）。
 	VerifyMethod string
 	// PTRSuffixes 该引擎官方爬虫出口 IP 的 PTR 域名后缀（小写）。
 	PTRSuffixes []string
-	// IPRanges 该引擎官方公布的 CIDR 段（历史问题 Ruling：保留为**唯一权威
+	// IPRanges 该引擎官方公布的 CIDR 段（Ruling：保留为**唯一权威
 	// 数据源**——运行期 360 验证走 crawler-ip-lists.json 快照，而快照内容由
 	// crawler_seed_parity_test 断言必须落在本字段声明的段内，二者不得分叉）。
 	IPRanges []string
 }
 
-// 引擎验证方式常量（历史问题：未使用的 CrawlerVerifyPTR 已删除——空串即默认
+// 引擎验证方式常量（未使用的 CrawlerVerifyPTR 已删除——空串即默认
 // PTR 双跳验证）。
 const CrawlerVerifyIPRange = "iprange"
 
@@ -76,7 +76,7 @@ var crawlerEngines = []CrawlerEngine{
 		UARegex: regexp.MustCompile(`(?i)360Spider`),
 		// 官方声明不支持 nslookup（so.com/help/spider_ip.html）——IP 段验证；
 		// 段=官方公布全表归纳（42.236.10-15.x 归纳为 /21，含表外少量同段位；
-		// 历史问题-04 历史补齐 17.* / 101.* / 180.153.236.*）
+		// 历史补齐 17.* / 101.* / 180.153.236.*）
 		VerifyMethod: CrawlerVerifyIPRange,
 		IPRanges:     []string{"42.236.8.0/21", "42.236.17.0/24", "42.236.101.0/24", "180.153.236.0/24", "180.163.220.0/24"},
 	},
@@ -166,7 +166,7 @@ func CrawlerEngines() []CrawlerEngine {
 // 语义不变，与逐条匹配逐字节等价）。
 //
 // 不能用字面子串预筛（bot|spider|crawl 之类）：注册表里有裸 DeepSeek、
-// 历史修复、历史修复、历史修复、历史修复 等不含
+// ChatGPT-User、Claude-Web、anthropic-ai 等不含
 // spider/bot 字样的标记，字面预筛会把这些引擎整族漏掉。
 var crawlerUAPrefilter = buildCrawlerUAPrefilter()
 

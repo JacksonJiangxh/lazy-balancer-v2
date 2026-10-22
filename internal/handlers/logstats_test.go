@@ -18,7 +18,7 @@ import (
 )
 
 func TestLogRotatedBackups_matchServiceWriters(t *testing.T) {
-	// 历史修复（历史）：契约以服务端导出的数值钉住（此前读取 services 源码
+	// 契约以服务端导出的数值钉住（此前读取 services 源码
 	// 文本——常量改类型/加注释/第三个 writer 出现时会误红或漏验）。写侧与
 	// 展示层的保留份数必须同源同值。
 	if logRotatedBackups != services.CertJobLogMaxRotatedFiles() {
@@ -99,8 +99,8 @@ func TestGetLogStats_securityEventsRow(t *testing.T) {
 	}
 }
 
-// 历史问题-02 读侧同源：certjob 统计跟随 {任务日志目录}/certjobs（与写入端
-// CertJobLogPath 同源）。曾读写死 /app/logs 根——历史修复 惰性化后写入端已迁
+// 读侧同源：certjob 统计跟随 {任务日志目录}/certjobs（与写入端
+// CertJobLogPath 同源）。曾读写死 /app/logs 根——惰性化后写入端已迁
 // tasks/certjobs/，读侧不同源则统计恒 0B。
 func TestGetLogStats_certJobRowFollowsTaskLogDir(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -158,7 +158,7 @@ func TestGetLogStats_eachTaskUsesOwnRealFileSize(t *testing.T) {
 	initTaskEngineForTest(t)
 	tasksDir := filepath.Join(t.TempDir(), "tasks")
 	h.cfg.LogFile = filepath.Join(filepath.Dir(tasksDir), "app.log")
-	oldLogDir := taskengine.LogDir() // 历史问题：保存旧值，cleanup 无条件恢复（原置空——跨用例污染）
+	oldLogDir := taskengine.LogDir() // 保存旧值，cleanup 无条件恢复（原置空——跨用例污染）
 	taskengine.SetLogDir(tasksDir)
 	t.Cleanup(func() { taskengine.SetLogDir(oldLogDir) })
 	certDir := filepath.Join(tasksDir, "certjobs")
@@ -232,7 +232,7 @@ func TestGetLogStats_eachTaskUsesOwnRealFileSize(t *testing.T) {
 	}
 }
 
-// 历史问题：安全事件行的保留文案改由 services.SecurityEventsRetentionSummary
+// 安全事件行的保留文案改由 services.SecurityEventsRetentionSummary
 // 单源生成——显式 security_events_retention_days 生效（此前恒复用审计月数
 // 文案，显式设置被无视），且该行补 LimitBytes（审计写入侧 audit_log_size_mb）。
 func TestGetLogStats_securityEventsRetentionUsesExplicitSettings(t *testing.T) {
@@ -288,7 +288,7 @@ func TestGetLogStats_securityEventsRetentionUsesExplicitSettings(t *testing.T) {
 	}
 }
 
-// 历史问题：key/keys 收窄——任务监控弹框只取单行，缺省保持旧全量形状。
+// key/keys 收窄——任务监控弹框只取单行，缺省保持旧全量形状。
 func TestGetLogStats_keyFilterNarrowsRows(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	oldWafLog := wafAuditLogFile
@@ -333,7 +333,7 @@ func TestGetLogStats_keyFilterNarrowsRows(t *testing.T) {
 	}
 }
 
-// 历史问题：聚合一次 ReadDir——200 文件的 certjobs 目录单次请求只枚举一次
+// 聚合一次 ReadDir——200 文件的 certjobs 目录单次请求只枚举一次
 // （原逐文件 dirBytes 在其内部再 ReadDir，O(N²)）。
 func TestGetLogStats_aggregateDirReadsOnce(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -385,7 +385,7 @@ func TestGetLogStats_aggregateDirReadsOnce(t *testing.T) {
 	}
 }
 
-// 历史问题：聚合累加归档份数，且 .gz 归档不再冒充活跃文件。
+// 聚合累加归档份数，且.gz 归档不再冒充活跃文件。
 func TestGetLogStats_aggregateCountsRotationsAndGzAsArchive(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	base := t.TempDir()
@@ -437,7 +437,7 @@ func TestGetLogStats_aggregateCountsRotationsAndGzAsArchive(t *testing.T) {
 	}
 }
 
-// 历史问题-08（历史）：审计日志路径随 ConfigureWafDirs 按 data_dir 派生，
+// 审计日志路径随 ConfigureWafDirs 按 data_dir 派生，
 // 而 handlers 包 init 早于 main 的派生调用——包级固化会指向陈旧的 /app 路径。
 // 解析必须运行期进行：注入值优先，否则取 services.AuditLogPath()。
 func TestResolvedWafAuditLogFile_tracksDerivedPath(t *testing.T) {
@@ -455,7 +455,7 @@ func TestResolvedWafAuditLogFile_tracksDerivedPath(t *testing.T) {
 	}
 }
 
-// 历史修复：单行轮询（?key=certjob）不得读取与所选行无关的配置列。
+// 单行轮询（?key=certjob）不得读取与所选行无关的配置列。
 func TestGetLogStats_singleRowRequestSkipsUnrelatedConfigReads(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	probe := &prepareProbe{}

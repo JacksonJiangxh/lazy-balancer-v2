@@ -18,11 +18,11 @@ const (
 	trafficLeaseTTLDefault = 30 * time.Second
 	trafficLeaseTTLMax     = 120 * time.Second
 	trafficLeaseTTLMin     = 5 * time.Second
-	// trafficLeaseIDMaxLen 租约 ID 长度上限（历史问题）：管理端 POST 原样接受
+	// trafficLeaseIDMaxLen 租约 ID 长度上限：管理端 POST 原样接受
 	// 调用方投递的 lease_id（app 端点仅限 body 4096B），不设上限时单个键即可
 	// 占 4KiB 并驻留至 TTL 上限。正常形态每标签页一个 UUID（36 字符）。
 	trafficLeaseIDMaxLen = 64
-	// trafficLeasesMax 租约表条目上限（历史问题）：正常形态条目数=并发打开的
+	// trafficLeasesMax 租约表条目上限：正常形态条目数=并发打开的
 	// 大屏标签页数（个位数）。满时拒绝新键，既有键续租照常——绝不淘汰活跃租约
 	// （淘汰会让真实标签页静默失去采集）。
 	trafficLeasesMax = 64
@@ -59,7 +59,7 @@ func acquireTrafficLease(id string, ttl time.Duration, sampleN uint32) error {
 	if id == "" {
 		return errTrafficLeaseIDRequired
 	}
-	// 历史问题：字节长度上限（正常形态 UUID 36 字节），超限直接拒绝。
+	// 字节长度上限（正常形态 UUID 36 字节），超限直接拒绝。
 	if len(id) > trafficLeaseIDMaxLen {
 		return errTrafficLeaseIDTooLong
 	}
@@ -77,7 +77,7 @@ func acquireTrafficLease(id string, ttl time.Duration, sampleN uint32) error {
 		sampleN = trafficLeaseSampleNMax
 	}
 	trafficLeasesMu.Lock()
-	// 历史问题：条目上限只拦新键——续租既有键走原路径（否则满表会让真实
+	// 条目上限只拦新键——续租既有键走原路径（否则满表会让真实
 	// 标签页的心跳失败而静默断采）。
 	if _, exists := trafficLeases[id]; !exists && len(trafficLeases) >= trafficLeasesMax {
 		trafficLeasesMu.Unlock()

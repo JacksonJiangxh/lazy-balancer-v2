@@ -22,7 +22,7 @@ func RefreshBrandingMirror(dataDir string) (changed bool, err error) {
 }
 
 // RefreshBrandingMirrorDB 是 RefreshBrandingMirror 的显式库句柄形态
-// （历史问题-05，历史）：快照入口必须写本服务的 s.db，而不是全局
+// 快照入口必须写本服务的 s.db，而不是全局
 // db.DB——测试/多库构造下两者不同源，镜像可能落到非本服务的库。
 // 同时把「先读后写」短路落在这里：每次从节点轮询（含纯 304 轮）都会调用
 // 本函数，内容未变时不再向主库发一条 UPDATE 写语句（N 从节点 = N 次/分钟
@@ -43,7 +43,7 @@ func RefreshBrandingMirrorDB(database *sql.DB, dataDir string) (changed bool, er
 		// 半截写守卫(2026-09-11 裁定):非法 JSON 不镜像——坏内容永不
 		// 经集群通道流向从节点;文件恢复完整后下次轮询自然收敛。
 		// 必须是 JSON 对象：null/数组/数字语法合法但从端物化会拒绝，
-		// 造成每次 apply 失败与补偿重拉（历史）。
+		// 造成每次 apply 失败与补偿重拉。
 		if content != "" {
 			var object map[string]any
 			if err := json.Unmarshal([]byte(content), &object); err != nil || object == nil {
@@ -130,7 +130,7 @@ func MaterializeBranding(dataDir, content string) error {
 		_ = temporary.Close()
 		return fmt.Errorf("写入品牌配置临时文件: %w", err)
 	}
-	// 历史问题：tmp+rename 缺 fsync 可留 0 字节品牌文件（与 certstore 原子写
+	// tmp+rename 缺 fsync 可留 0 字节品牌文件（与 certstore 原子写
 	// 同口径：临时文件 fsync + 父目录 fsync）。
 	if err := temporary.Sync(); err != nil {
 		_ = temporary.Close()
@@ -154,7 +154,7 @@ func MaterializeBranding(dataDir, content string) error {
 // (幂等,零 mtime 扰动);内存快照(若有)由 handlers 侧 loadBrandingConfig
 // 的 stat 检测在下一次访问时自动重载;landing 立即注入保证随后的 Caddy
 // 重载渲染新文案。BrandingJSON 为空=主节点无品牌文件(三分类合并后 users 节
-// 恒同步+schema v3 强制,旧语义「开关关闭/旧主节点」消失,历史问题):重置为
+// 恒同步+schema v3 强制,旧语义「开关关闭/旧主节点」消失）:重置为
 // 全空模板收敛默认品牌——不直接删除,loadBrandingConfig 对缺失文件保内存
 // 上一份旧值(2026-09-11 半截写窗口裁定),删除会让从端 /branding 长期陈旧。
 func applySnapshotBranding(dataDir, content string) error {
@@ -165,7 +165,7 @@ func applySnapshotBranding(dataDir, content string) error {
 	if err := MaterializeBranding(dataDir, content); err != nil {
 		Logf("error", "同步品牌配置落盘失败: %v", err)
 		// 失败审计由调用方（applySnapshotBrandingChecked）经 SyncService 的
-		// 失败节流写入（历史问题-01）：品牌落盘失败会在 304 补偿重拉/标记重试
+		// 失败节流写入：品牌落盘失败会在 304 补偿重拉/标记重试
 		// 下每轮重达此处，未节流的操作审计会按退避轮次洪泛。
 		return err
 	}
@@ -179,7 +179,7 @@ func applySnapshotBranding(dataDir, content string) error {
 
 // ReconcileBrandingFile 核对本地 branding.json 与 global_config.branding_json
 // 镜像，不一致（缺失/损坏/陈旧）时按镜像重写并注入 landing——零 Caddy 重载
-// （历史问题）。从节点稳态 304 下 applySnapshot 不运行，品牌文件没有物化
+// 从节点稳态 304 下 applySnapshot 不运行，品牌文件没有物化
 // 通道：文件被删除或损坏后会永久停留默认品牌，直到 users 节发生任意变更。
 // 返回是否发生重写；内容一致时为 false（零 mtime 扰动）。
 func ReconcileBrandingFile(dataDir string) (bool, error) {
@@ -187,7 +187,7 @@ func ReconcileBrandingFile(dataDir string) (bool, error) {
 }
 
 // ReconcileBrandingFileDB 是 ReconcileBrandingFile 的显式库句柄形态
-// （历史问题-05）：集群同步路径读本服务 s.db 的镜像列，与写入侧同源。
+// 集群同步路径读本服务 s.db 的镜像列，与写入侧同源。
 func ReconcileBrandingFileDB(database *sql.DB, dataDir string) (bool, error) {
 	if database == nil || dataDir == "" {
 		return false, nil
@@ -223,7 +223,7 @@ func injectLandingFromBranding(content string) {
 
 // extractBrandingStringField 从 JSON 原文按字段名提取字符串值;任何解析
 // 失败回退空串。值经 json.Unmarshal 值级解析(与主节点 loadBrandingConfig
-// 同语义——含 \uXXXX/\n 等全部转义形态,历史修复)。
+// 同语义——含 \uXXXX/\n 等全部转义形态）。
 func extractBrandingStringField(content, field string) string {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(content), &raw); err != nil {

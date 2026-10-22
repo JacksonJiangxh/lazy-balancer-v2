@@ -535,7 +535,7 @@ func TestSyncService_applySnapshot_heals_local_rules_drift(t *testing.T) {
 	}
 }
 
-// 审计 历史问题：快照 dump 的 INTEGER 列 JSON 化为 float64（0/1）——断言 helper
+// 快照 dump 的 INTEGER 列 JSON 化为 float64（0/1）——断言 helper
 // 必须接受数字形态，否则主端 ip_whitelist_enabled=0 在从端被误存为启用。
 func TestPolicyWhitelistEnabled_acceptsNumericJSON(t *testing.T) {
 	cases := []struct {
@@ -607,7 +607,7 @@ func TestSyncService_applySnapshot_preservesOIDCIdentityAndConfig(t *testing.T) 
 	}
 }
 
-// 历史问题-11：nil 版本行规范化为空切片，空表不再恒判「有差异」。
+// nil 版本行规范化为空切片，空表不再恒判「有差异」。
 func TestSnapshotSecurityVersionRowsDiffer_normalizesNilRows(t *testing.T) {
 	_, database := newClusterTestService(t)
 	ctx := context.Background()
@@ -628,7 +628,7 @@ func TestSnapshotSecurityVersionRowsDiffer_normalizesNilRows(t *testing.T) {
 	}
 }
 
-// 历史问题-15：版本行读取列清单单源——排程列变化可被差分行观测（列清单分叉的
+// 版本行读取列清单单源——排程列变化可被差分行观测（列清单分叉的
 // 历史教训：差分行漏列 → 变化永判无差异）。
 func TestClusterRuleLibVersionRows_diffSeesScheduleColumns(t *testing.T) {
 	service, database := newClusterTestService(t)

@@ -75,7 +75,7 @@ func TestRegisterClusterNode_invalid_token_audit_detail_is_generic(t *testing.T)
 	// When
 	h.RegisterClusterNode(ctx)
 
-	// Then：401 且审计详情不含攻击者输入（历史问题）
+	// Then：401 且审计详情不含攻击者输入
 	if recorder.Code != http.StatusUnauthorized {
 		t.Fatalf("status=%d body=%s, want 401", recorder.Code, recorder.Body.String())
 	}
@@ -94,7 +94,7 @@ func TestRegisterClusterNode_invalid_token_audit_detail_is_generic(t *testing.T)
 	}
 }
 
-// （历史修复，历史：自 apikeys_current_test.go 迁回——本族为集群注册校验
+// （自 apikeys_current_test.go 迁回——本族为集群注册校验
 // 主题，此前仅因共用 newBackupTestHandlers 夹具寄居于 API Key 文件。）
 func TestRegisterClusterNodeRejectsInvalidAddressAndPort(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -121,7 +121,7 @@ func TestRegisterClusterNodeRejectsInvalidAddressAndPort(t *testing.T) {
 	}
 }
 
-// 历史问题-04：GET /cluster/register/:id/status 必须与同族机器端点（register/
+// GET /cluster/register/:id/status 必须与同族机器端点（register/
 // confirm/snapshot/waf-files/report）一致带主节点门——降级节点残留注册行
 // 不得继续应答 approved/重发集群令牌。
 func TestGetClusterRegistrationStatus_rejectsSlaveNode(t *testing.T) {

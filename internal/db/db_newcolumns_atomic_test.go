@@ -1,6 +1,6 @@
 package db
 
-// 历史问题（历史）：ensureNewColumns 的 ADD COLUMN 与一次性回填必须
+// ensureNewColumns 的 ADD COLUMN 与一次性回填必须
 // 原子——此前各自自动提交，ALTER 成功后回填失败/进程被杀会让「列已存在」
 // 成为下次启动的跳过判据，回填永久丢失（mfa_challenges.password_version
 // 会让存量挑战按 0 校验；upstream_keepalive_timeout 残留旧默认 60）。

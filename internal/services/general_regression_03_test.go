@@ -70,7 +70,7 @@ func TestPromote_reopensPullAdmissionOnCommitFailure(t *testing.T) {
 	assertPullAdmissionOpen(t, sync)
 }
 
-// 历史修复(a)/Promote 复位 last_sync（与 BecomeSlave 对称）并显式
+// /Promote 复位 last_sync（与 BecomeSlave 对称）并显式
 // 失效快照缓存（角色翻转后不得继续以旧缓存供快照）。
 func TestPromote_clearsLastSyncAndSnapshotCache(t *testing.T) {
 	service, database := newClusterTestService(t)
@@ -99,7 +99,7 @@ func TestPromote_clearsLastSyncAndSnapshotCache(t *testing.T) {
 	}
 }
 
-// 历史修复(b)/BecomeSlave 同样失效快照缓存并清空内存 TOFU pin 缓存
+// /BecomeSlave 同样失效快照缓存并清空内存 TOFU pin 缓存
 // （与 Promote handler 的 ForgetClusterPins 收尾对称）。
 func TestBecomeSlave_invalidatesSnapshotCacheAndPins(t *testing.T) {
 	service, database := newClusterTestService(t)
@@ -270,7 +270,7 @@ func TestCertificateService_StopWithoutStartReturns(t *testing.T) {
 	}
 }
 
-// 队列活动态由 历史修复 守护派生——初始化即停止；未启动时
+// 队列活动态由守护派生——初始化即停止；未启动时
 // 入队必须是无迁移的 no-op（从节点/用户停调度后重启不得留下半启动子系统）。
 func TestCAQueueManager_inactiveUntilDaemonStarts(t *testing.T) {
 	newClusterTestService(t)
@@ -467,7 +467,7 @@ func TestApplySnapshot_rulesDisabledPreservesLocalDNSOwnership(t *testing.T) {
 	}
 }
 
-// 历史修复（证伪 + 加固钉）：预检失败必须落「CA 提供商测试失败」精确归因。
+// （证伪 + 加固钉）：预检失败必须落「CA 提供商测试失败」精确归因。
 // 报告声称 from=creating_account 恒不命中，但 logger.Log("creating_account")
 // 已先行迁移状态；本测钉住最终 message（failJob 形态对 logger 迁移失败亦稳健）。
 func TestIssue_precheckFailureKeepsProviderAttribution(t *testing.T) {

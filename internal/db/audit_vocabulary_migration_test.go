@@ -14,7 +14,7 @@ import (
 	"testing"
 )
 
-// 历史问题 C-发现1: migrateAuditVocabulary 是「旧词条→当前标准」的唯一转换点，此前
+// C-发现1: migrateAuditVocabulary 是「旧词条→当前标准」的唯一转换点，此前
 // 无直接测试——映射表写错会在升级时把存量正确行改坏且无测试变红。本测试用
 // 每条映射的旧值各造一行验证全量转换、联动条目的双条件边界与幂等性。
 
@@ -137,7 +137,7 @@ func TestMigrateAuditVocabulary_convertsEveryLegacyEntry(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：归一化此前每次启动无条件执行 30 条 UPDATE（多数零命中
+// 归一化此前每次启动无条件执行 30 条 UPDATE（多数零命中
 // 仍走全表扫描/无索引 resource 列）。一次性 marker 置位后二次调用必须零写语句
 // ——用 PRAGMA query_only 把「试图写」变成可见错误：若仍执行 UPDATE，会打出
 // 「audit vocabulary migration failed」日志。
@@ -182,7 +182,7 @@ func TestMigrateAuditVocabulary_secondRunIssuesNoUpdate(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：归一表旧侧的成对字面量判定从 services 测试迁入本包
+// 归一表旧侧的成对字面量判定从 services 测试迁入本包
 // （谓词导出已删除）。扫描 internal/ 全部非测试源码的审计写入口调用，action/
 // resource 均为字面量且命中归一表旧侧即违规——动态传参不参与（其词条在调用方
 // 字面量处已由 services 的词数门扫描）。归一表多为动作作用域条目（重载+
@@ -198,7 +198,7 @@ type auditWritePoint struct {
 // collectAuditWritePoints 以 AST 遍历 internal/ 非测试源码，收集审计写入口的
 // action/resource 字面量参数。
 //
-// 为什么是 AST（历史问题，历史）：这组契约是「每个审计写点都在用规范
+// 为什么是 AST：这组契约是「每个审计写点都在用规范
 // 词条」「迁移目标存在真实写点」。写点分散在 handlers/services/taskengine 且
 // 动态传参不可穷举，行为测试无法覆盖；AST 绑定调用契约（函数名+参数位），不
 // 依赖源码文本格式/反引号边界，纯重构不会假红——属 AGENTS.md「只测可观察契约
@@ -287,7 +287,7 @@ func collectAuditWritePoints(t *testing.T) []auditWritePoint {
 // 用于「迁移目标必须存在写点」：新值可能经包装函数/映射表间接进入审计写点
 // （如 RecordAuditLog("system","校验阻断",resource,…) 的 resource 是动态值、
 // ACME配置 经 auditConfigResource 映射），逐个写入口取字面量参数会漏报，
-// 所以此契约要求「值在非测试源码中以字面量存在」即可——这是 历史问题 登记的
+// 所以此契约要求「值在非测试源码中以字面量存在」即可——这是登记的
 // AST 形态豁免，替代原实现的全文件字符串包含（注释/日志假绿、纯文本重构假红）。
 func collectProductionStringLiterals(t *testing.T) map[string]bool {
 	t.Helper()
@@ -352,7 +352,7 @@ func TestAuditWritePointsUseCanonicalVocabulary(t *testing.T) {
 }
 
 func TestMigrateAuditVocabulary_convergesChainedRenameInOnePass(t *testing.T) {
-	// Given 链式组合行（历史修复，历史）：("重载","Caddy 配置") 须先经对象改名
+	// Given 链式组合行：("重载","Caddy 配置") 须先经对象改名
 	// 条目变 ("重载","Caddy配置")、再经联动条目变 ("重载","Caddy服务")——单趟循环
 	// 下联动条目已越过，需两次启动才收敛；不动点循环要求单次调用即归一终态。
 	auditDB := openVocabularyTestAuditDB(t)
@@ -379,7 +379,7 @@ func TestMigrateAuditVocabulary_convergesChainedRenameInOnePass(t *testing.T) {
 // TestMigrateAuditVocabulary_newValuesHaveWritePoints 防「迁移目标与写点漂移」：
 // 每条映射的新值必须在 internal/ 非测试源码中以字面量存在（写点可能经包装
 // 函数/映射表间接引用，见 collectProductionStringLiterals 注释），否则迁移会把
-// 存量行归并到一个永不产生新事件的幽灵词条。历史问题：原实现读文件做子串包含
+// 存量行归并到一个永不产生新事件的幽灵词条。原实现读文件做子串包含
 // （注释/日志假绿、文本重构假红），改为 AST 字面量集合。
 func TestMigrateAuditVocabulary_newValuesHaveWritePoints(t *testing.T) {
 	literals := collectProductionStringLiterals(t)
@@ -394,5 +394,91 @@ func TestMigrateAuditVocabulary_newValuesHaveWritePoints(t *testing.T) {
 				t.Errorf("迁移目标 %q 在 internal/ 非测试源码中无任何字面量使用——迁移会归并到幽灵词条", newValue)
 			}
 		}
+	}
+}
+
+// 失败复位：首趟某条 UPDATE 失败、后续趟恢复且已无改动时必须落 marker——
+// 否则每次重启都为一次瞬时失败永久重跑全表归一。注入口用一次性触发器：
+// RAISE(FAIL) 保留触发器内的哨兵删除（RAISE(ABORT) 会连哨兵一起回滚）。
+func TestMigrateAuditVocabulary_marksAfterFailureRecovers(t *testing.T) {
+	auditDB := openVocabularyTestAuditDB(t)
+	oldRenames := auditVocabularyRenames
+	auditVocabularyRenames = []struct {
+		oldAction, newAction     string
+		oldResource, newResource string
+	}{
+		{"旧动作甲", "新动作甲", "", ""},
+		{"旧动作乙", "新动作乙", "", ""},
+	}
+	t.Cleanup(func() { auditVocabularyRenames = oldRenames })
+	if _, err := auditDB.Exec(`CREATE TABLE fail_once (id INTEGER PRIMARY KEY);
+		INSERT INTO fail_once (id) VALUES (1);
+		CREATE TRIGGER fail_once_update BEFORE UPDATE ON audit_log
+			WHEN OLD.action = '旧动作甲' AND EXISTS (SELECT 1 FROM fail_once)
+		BEGIN
+			DELETE FROM fail_once;
+			SELECT RAISE(FAIL, 'injected one-time failure');
+		END;
+		INSERT INTO audit_log (username, action, resource, detail, ip_address) VALUES
+			('system','旧动作甲','留存对象','',''),
+			('system','旧动作乙','留存对象','','')`); err != nil {
+		t.Fatalf("seed failure injection: %v", err)
+	}
+
+	migrateAuditVocabulary()
+
+	// Then 失败已恢复：marker 落位，两行均归一。
+	var fingerprint string
+	if err := auditDB.QueryRow(`SELECT fingerprint FROM audit_migration_state WHERE name=?`, auditVocabularyMarkerName).Scan(&fingerprint); err != nil {
+		t.Fatalf("marker missing after failure recovered: %v", err)
+	}
+	if fingerprint != auditVocabularyFingerprint() {
+		t.Fatalf("marker fingerprint=%q, want current table fingerprint", fingerprint)
+	}
+	got := auditVocabularySnapshot(t, auditDB)
+	want := [][2]string{{"新动作甲", "留存对象"}, {"新动作乙", "留存对象"}}
+	if len(got) != len(want) {
+		t.Fatalf("audit rows=%d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("row %d = (%q,%q), want (%q,%q)", i+1, got[i][0], got[i][1], want[i][0], want[i][1])
+		}
+	}
+}
+
+// 失败未恢复（同一趟零改动且仍有失败）：不得落 marker，下次启动继续重试。
+func TestMigrateAuditVocabulary_keepsMarkerUnsetWhileFailurePersists(t *testing.T) {
+	auditDB := openVocabularyTestAuditDB(t)
+	oldRenames := auditVocabularyRenames
+	auditVocabularyRenames = []struct {
+		oldAction, newAction     string
+		oldResource, newResource string
+	}{
+		{"旧动作丙", "新动作丙", "", ""},
+	}
+	t.Cleanup(func() { auditVocabularyRenames = oldRenames })
+	if _, err := auditDB.Exec(`CREATE TRIGGER fail_always BEFORE UPDATE ON audit_log
+			WHEN OLD.action = '旧动作丙'
+		BEGIN
+			SELECT RAISE(ABORT, 'persistent failure');
+		END;
+		INSERT INTO audit_log (username, action, resource, detail, ip_address) VALUES
+			('system','旧动作丙','留存对象','','')`); err != nil {
+		t.Fatalf("seed persistent failure: %v", err)
+	}
+
+	migrateAuditVocabulary()
+
+	var markers int
+	if err := auditDB.QueryRow(`SELECT COUNT(*) FROM audit_migration_state WHERE name=?`, auditVocabularyMarkerName).Scan(&markers); err != nil {
+		t.Fatalf("read marker table: %v", err)
+	}
+	if markers != 0 {
+		t.Fatalf("marker rows=%d, want 0（失败未恢复不得置位）", markers)
+	}
+	got := auditVocabularySnapshot(t, auditDB)
+	if len(got) != 1 || got[0] != [2]string{"旧动作丙", "留存对象"} {
+		t.Fatalf("rows=%v, want unchanged legacy row", got)
 	}
 }

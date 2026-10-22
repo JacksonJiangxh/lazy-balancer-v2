@@ -8,13 +8,13 @@ const base: PathRule = {
   match_type: 'prefix', path: '/api', upstream_path: '', sort_order: 0, upstreams: null,
 }
 
-test('历史问题-02：upstreams=null 投影保留默认上游语义', () => {
+test('upstreams=null 投影保留默认上游语义', () => {
   assert.deepEqual(projectRuleFlowPath(base), {
     path: '/api', match_type: 'prefix', upstreams: null,
   })
 })
 
-test('历史问题-02：自定义上游仍投影为启用明细', () => {
+test('自定义上游仍投影为启用明细', () => {
   assert.deepEqual(projectRuleFlowPath({
     ...base,
     upstreams: [{ protocol: 'http', address: '10.0.0.2', port: 8080, weight: 100 }],
@@ -24,7 +24,7 @@ test('历史问题-02：自定义上游仍投影为启用明细', () => {
   })
 })
 
-test('历史问题-02：静态返回与 301 回归形状保持', () => {
+test('静态返回与 301 回归形状保持', () => {
   assert.deepEqual(projectRuleFlowPath({ ...base, response_mode: 'static', response_status: 204 }), {
     path: '/api', match_type: 'prefix', upstreams: null,
     response_mode: 'static', response_status: 204, redirect_to: '',
@@ -32,7 +32,7 @@ test('历史问题-02：静态返回与 301 回归形状保持', () => {
   assert.equal(projectRuleFlowPath({ ...base, response_mode: 'redirect', redirect_to: 'https://example.com' }).response_mode, 'redirect')
 })
 
-// 处理流程弹框的阶段 1 文案（历史问题）：副标题与脚注必须覆盖渲染链全部拦截
+// 处理流程弹框的阶段 1 文案：副标题与脚注必须覆盖渲染链全部拦截
 // 来源——遗留黑名单字段 ip_blacklist（id:4 仍发射）与 v2.3.8 爬虫校验
 // （豁免 810000-849999 / 伪装拦截 850000-899999），链序按发射顺序。
 test('阶段 1 文案：副标题与脚注含爬虫校验，脚注含遗留黑名单且链序正确', () => {

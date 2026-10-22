@@ -45,7 +45,7 @@ func TestExpandPolicyIPRefs_mergeDedupInlineFirst(t *testing.T) {
 	}
 	exp := expandPolicyIPRefs(p, lists)
 
-	// 历史问题：合并即聚合——输出为聚合规范形（排序、兄弟归并、覆盖剔除），
+	// 合并即聚合——输出为聚合规范形（排序、兄弟归并、覆盖剔除），
 	// 匹配集合与旧 inline-first 去重口径逐点等价（1.2.3.4 与 10/8、192.0.2.1
 	// 互不覆盖，条数不变仅排序变化）。
 	wantACL := []string{"1.2.3.4/32", "10.0.0.0/8", "192.0.2.1/32"}
@@ -312,7 +312,7 @@ func TestBuildIPPrecheckDirectives_mergedAllowIntersection(t *testing.T) {
 	if !strings.Contains(directives, "id:7,phase:1,deny,status:403,log,msg:'IP 白名单拒绝',skipAfter:SECURITY_RULES_END") {
 		t.Fatalf("allow intersection rule missing:\n%s", directives)
 	}
-	// 历史问题 合并集 [198.51.100.1 203.0.113.5] ∩ 历史问题 合并集 [203.0.113.5] = [203.0.113.5]
+	// 合并集 [198.51.100.1 203.0.113.5] ∩ 合并集 [203.0.113.5] = [203.0.113.5]
 	intersection := readRenderedIPList(t, directives, "u-allow")
 	if intersection != "203.0.113.5/32\n" {
 		t.Fatalf("intersection must be merged(历史问题) ∩ merged(历史问题) = [203.0.113.5/32]: %q", intersection)
@@ -353,7 +353,7 @@ func fmtListIDs(ids ...int64) string {
 	return string(raw)
 }
 
-// ---- 历史修复（历史问题）：loadIPListEntriesVia 迭代错误驱动桩 ----
+// loadIPListEntriesVia 迭代错误驱动桩 ----
 
 // iplistIterFailConnector 让 security_ip_lists 查询「语句执行成功、迭代第一
 // 步即失败」——只有循环后检查 rows.Err() 才能发现，否则表现为装载成功但
@@ -395,7 +395,7 @@ func (zeroColsRows) Columns() []string         { return []string{"c"} }
 func (zeroColsRows) Close() error              { return nil }
 func (zeroColsRows) Next([]driver.Value) error { return io.EOF }
 
-// 历史修复：迭代错误必须与查询失败同通道上抛，且整块 id 进 failedIDs
+// 迭代错误必须与查询失败同通道上抛，且整块 id 进 failedIDs
 // （fail-closed）——修复前 rows.Err() 未检查，错误被静默吞掉。
 func TestLoadIPListEntriesVia_iterationErrorMarksChunkFailed(t *testing.T) {
 	broken := sql.OpenDB(iplistIterFailConnector{})
@@ -413,7 +413,7 @@ func TestLoadIPListEntriesVia_iterationErrorMarksChunkFailed(t *testing.T) {
 	}
 }
 
-// 历史修复 端到端形态：迭代错误下引用该列表的策略必须标记 IPRefMissing
+// 端到端形态：迭代错误下引用该列表的策略必须标记 IPRefMissing
 // 跳过渲染（严格模式）——修复前拿到「静默缺内容的合并集」，ACL/信任面
 // 静默收窄零留痕。
 func TestResolvePolicyIPListRefs_iterationErrorFailsClosed(t *testing.T) {
@@ -428,7 +428,7 @@ func TestResolvePolicyIPListRefs_iterationErrorFailsClosed(t *testing.T) {
 	}
 }
 
-// —— 畸形 refs 静默 fail-open（历史修复，历史） ——
+// 畸形 refs 静默 fail-open ——
 
 // 全形状：畸形（非 JSON / 错元素类型）/空/合法 + deny/allow 两种 ACL 语义。
 // 畸形：留痕且仅保留 inline（行为不变）；空：零告警（未配置引用）；合法：
@@ -507,7 +507,7 @@ func TestIPListRefs_shapesWarnAndMerge(t *testing.T) {
 	}
 }
 
-// —— 同一 tick 内相同来源列的展开结果去重（历史修复） ——
+// 同一 tick 内相同来源列的展开结果去重 ——
 
 // 多策略引用同一名单（相同来源列）共享一次性展开；不同 inline 的策略仍各自
 // 得到独立合并集（去重不得跨输入串味）。

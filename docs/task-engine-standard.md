@@ -3,8 +3,7 @@
 > 2026-10-01 用户裁定重构。任务类型决定一切——调度方式、记录策略、日志行为、控制面。
 > 零 flag、零补丁、零特判；任务体只写业务逻辑，引擎处理全部基础设施。
 >
-> 口径说明：本文是工程标准文档（不在 README 用户文档索引内），文中「第 N 轮/历史问题」
-> 等内部流程口径用于裁定溯源；面向用户/官网的文案不得引用此类内部口径。
+> 口径说明：本文是工程标准文档（不在 README 用户文档索引内），用于工程实现与裁定溯源；面向用户/官网的文案不得引用内部流程口径。
 
 ## 1. 四类型定义
 
@@ -24,7 +23,7 @@
 Scheduled: loopEnabled && !running && EnabledFn()≠false && NextSlotFn() ≤ now → Run
            （每 tick 重读槽——µs 级 SELECT；EnabledFn=false 整分支跳过：零评估零落行）
 Periodic : loopEnabled && !running && now-lastCheck ≥ IntervalFn() → Run
-           （EnabledFn=false 同跳过且不推进节拍——恢复后下一 tick 到期即跑，历史问题 历史）
+           （EnabledFn=false 同跳过且不推进节拍——恢复后下一 tick 到期即跑）
 Daemon   : 不进 tick——StartLoop 启动 Run 一次（阻塞）；StopLoop 取消 ctx；
            EnabledFn 不可用（Daemon 调度面永不消费——Register 期响亮拒绝，
            常驻业务门归 Run 体首行）
@@ -58,7 +57,7 @@ type Descriptor struct {
 2. 必须显式声明 `RunsOn=RoleAny`（含空值拒绝）——启动执行面无角色语义，
    漏声明不得回落到旧任务兼容默认值。
 
-已删除：`SilentProbes`/`RecordFailuresOnly`/`SignalledWork`/`AsKind`/`Cadence`/`Singleton`——Kind 单独决定全部行为；`ToggleFn`/`ToggleName`（2026-10-11）——v2.0 调度开关统一（StartLoop/StopLoop）后声明族零消费退役，TaskMeta/TaskInfo 的 `toggleable`/`toggle_name` 序列化字段一并删除；`ManualRun`（历史勘误）——手动触发能力由 Kind 派生（DescribeAll `CanTrigger`），声明字段无消费；`TaskMeta.Enabled`（任务监控只认 `loop_on`，`Lookup/DescribeAll` 不再求值 `EnabledFn`）——`Descriptor.EnabledFn` 仍保留为 Scheduled/Periodic 调度门。
+已删除：`SilentProbes`/`RecordFailuresOnly`/`SignalledWork`/`AsKind`/`Cadence`/`Singleton`——Kind 单独决定全部行为；`ToggleFn`/`ToggleName`（2026-10-11）——v2.0 调度开关统一（StartLoop/StopLoop）后声明族零消费退役，TaskMeta/TaskInfo 的 `toggleable`/`toggle_name` 序列化字段一并删除；`ManualRun`（勘误）——手动触发能力由 Kind 派生（DescribeAll `CanTrigger`），声明字段无消费；`TaskMeta.Enabled`（任务监控只认 `loop_on`，`Lookup/DescribeAll` 不再求值 `EnabledFn`）——`Descriptor.EnabledFn` 仍保留为 Scheduled/Periodic 调度门。
 
 ## 2. 任务清单（19 注册任务）
 
@@ -73,6 +72,14 @@ type Descriptor struct {
 | auto-backup | `nextAutoBackupSlot()`（last_run 感知——漏跑追补/已跑步进） | `runAutoBackupScheduled` |
 
 到期检查全部移出 Run 体——引擎保证在排程槽调用，Run 只执行业务。
+
+**固有边界（裁定：文档化，不修）**：定时族 DB 全不可读时，NextSlotFn
+fail-closed 返回零值槽 → 永不到期 → 零执行、零落行——任务历史不会出现
+failed 行（没有执行就没有 task_runs 记录）。该形态的可观测性由应用日志
+承担（排程读取失败按状态翻转留 WARN，恢复留 INFO），任务监控的「下次
+执行」列显示「—」。引擎层对「槽未推进+本轮 failed」另有退避兜底
+（1s→5s→30s 封顶，连续失败节流 WARN）——但那要求 Run 至少执行过一次；
+纯排程读取失败（连首轮都无法投递）不在退避覆盖面内。
 
 ### 常驻（3）——Run 阻塞自管理循环
 
@@ -142,7 +149,7 @@ queued/pending/waiting_ca 限流停车）=运行中。业务生命周期态
 
 ```
 默认：调度关闭（不在默认 StartLoop 清单）——引擎不 tick，页面状态列「空闲」+开关列「已停止」（方案 A，2026-10-12）
-唤醒（历史问题-05 勘误：非单点——四处入队成功路径各自唤醒）：
+唤醒（勘误：非单点——四处入队成功路径各自唤醒）：
       cert-renewal-scan Run 体入队后 → `RearmLoop("cert-waiting-ca", certJobsActive())`
       CreateOrRequeueCertJobWithChange 成功路径（规则写路径 Create/Retry/Renew 收敛点）
       RetryCertJob 成功路径（handlers/certjobs.go）
@@ -152,7 +159,7 @@ queued/pending/waiting_ca 限流停车）=运行中。业务生命周期态
 自停：Run 体发现 certJobsActive()==false → StopLoop（回到默认关闭态）
 ```
 
-唤醒语义（历史问题）：`RearmLoop(..., true)` 越过「已停止」态恢复调度并立即补跑，
+唤醒语义：`RearmLoop(..., true)` 越过「已停止」态恢复调度并立即补跑，
 `false` 零动作；唤醒不改写 `task_loop_prefs` 用户偏好。续期扫描以
 `certJobsActive()` 作为 hasWork，无活零动作；已确认入队成功的路径经
 `WakeCertWaitingCAForEnqueuedJob()` 直接传 `true`，避免任务快速转为 failed 后
@@ -177,7 +184,7 @@ queued/pending/waiting_ca 限流停车）=运行中。业务生命周期态
 - 调度列：非触发类=开关（绑定 loop_on）；触发类=禁用开关（一致性）；cert-job 动态行=「—」
 - 常驻族停止需确认弹框；操作列常驻族有「重启」
 
-### 4.1 逐任务启停持久化（历史问题，2026-10-18）
+### 4.1 逐任务启停持久化（2026-10-18 用户裁定）
 
 用户经任务监控显式停止/恢复的调度写入节点本地表 `task_loop_prefs`
 （`task_id` / `enabled` / `updated_at`）。`InitTaskEngine` 先按 §2 默认清单
@@ -209,7 +216,7 @@ queued/pending/waiting_ca 限流停车）=运行中。业务生命周期态
 
 - `Trigger/Toggle/Cancel/Control` 四个任务写端点统一 `requireMasterNode`，与路由组 `readOnlyGuard` 共同保证从节点只读和同步 403。角色查询失败（DB 故障/迁移窗口）返回 `500`「节点角色查询失败」，不得报 403（403 会把排障方向误导为集群角色问题）。
 - `Descriptor.RunsOn` 是**执行调度**唯一角色事实源（引擎 tick/Trigger/RunSync/BootSync）；它不承担面板 API 权限语义，不与集群只读写门混用。
-- 写端点状态码统一（历史问题）：引擎未初始化 `503`、任务不存在 `404`、语义拒绝（常驻族触发、触发类 toggle、业务驱动族 toggle 等）`400`。
+- 写端点状态码统一：引擎未初始化 `503`、任务不存在 `404`、语义拒绝（常驻族触发、触发类 toggle、业务驱动族 toggle 等）`400`。
 - 引擎角色种子（启动装配读 `global_config.is_master`）读失败时 warn + 重试一次，仍失败按**从节点 fail-closed** 启动（不得沿用引擎默认主节点——否则会拉起 master-only daemon 并放开写面）；后续并发角色翻转由 `SetRole` 正常收敛。
 
 ## 5. 记录与日志口径
@@ -255,13 +262,13 @@ task_runs 保留 90 天（audit-retention 每日清理）。`Engine.Stop` 先取
 3. 业务自动更新开关与调度开关双向同源（若任务有业务开关）。
 4. 业务日志走 `TaskLogf`/`TeeTaskLog`，状态与 `task_runs` 时间同源；写入前滚动自然覆盖，禁止自行实现第二种滚动。
 5. `/logs/stats` 返回 `task:<id>` 真实文件统计，任务监控弹框不得使用目录聚合值。
-6. 注册级测试必须覆盖：默认调度、精确槽值/间隔与 **`DescribeAll` 注册全集**（不写死条数——全集以注册表/`DescribeAll` 输出为准，本文 §2 的「当前 N 个」仅作对照；PD-03 历史：曾写死 18 与实际的 19 分叉）、全部业务开关双向同源、日志与状态时间、逐任务真实文件统计、停止/取消/角色翻转/崩溃恢复、旧调度器零旁路。
+6. 注册级测试必须覆盖：默认调度、精确槽值/间隔与 **`DescribeAll` 注册全集**（不写死条数——全集以注册表/`DescribeAll` 输出为准，本文 §2 的「当前 N 个」仅作对照；曾写死 18 与实际的 19 分叉）、全部业务开关双向同源、日志与状态时间、逐任务真实文件统计、停止/取消/角色翻转/崩溃恢复、旧调度器零旁路。
 
 ## 7. 修订记录
 
 - v2.0.3（2026-10-14，用户裁定「启用后按配置调度」）：autoban 调度模型收编——Descriptor 去除 EnabledFn（任务监控只认 `loop_on`，启停语义全在调度开关+事件页业务开关）；PUT /security/autoban 保存联动启停（enabled=true→StartLoop、false→StopLoop；历史补：禁用保存先收敛已到期条目与暂存重载再停调度——禁用后无循环 flush/到期清理点）；启动按库内业务开关实态对齐调度；手动开调度/手动触发但未启用由 Run 体首行业务门拦停（TaskLogf「手动调度，执行失败：未启用」+task_runs failed 行+StopLoop 重禁调度）；POST /security/autoban/run「立即执行」端点与前端按钮删除。
 
-- v2.0.2（2026-10-14，历史问题）：新增 autoban 循环任务（60s/主节点/EnabledFn=autoban_enabled 业务开关联动）——WAF 事件固定窗口计数（摄取提交点喂入）→ 阈值判定 →「自动封禁名单」merge（清到期/保留手动/已在名单过滤/超限挤最早到期）→ 重载 60s 节流暂存合并；观察模式（dry_run 默认开）仅记建议；每轮 TaskLogf 摘要行入 tasks/autoban.log。
+- v2.0.2（2026-10-14，用户裁定）：新增 autoban 循环任务（60s/主节点/EnabledFn=autoban_enabled 业务开关联动）——WAF 事件固定窗口计数（摄取提交点喂入）→ 阈值判定 →「自动封禁名单」merge（清到期/保留手动/已在名单过滤/超限挤最早到期）→ 重载 60s 节流暂存合并；观察模式（dry_run 默认开）仅记建议；每轮 TaskLogf 摘要行入 tasks/autoban.log。
 
-- v2.0.1（2026-10-14，历史问题）：EnabledFn 调度门补全——tick 的 Scheduled/Periodic 分支业务关即整支跳过（不落行不推进节拍，恢复后下一 tick 到期即跑；手动触发不受门拦）；术语统一「已暂停」→「已停止」（任务监控开关列/详情/tooltip、API 消息与本文档）。
+- v2.0.1（2026-10-14，用户裁定）：EnabledFn 调度门补全——tick 的 Scheduled/Periodic 分支业务关即整支跳过（不落行不推进节拍，恢复后下一 tick 到期即跑；手动触发不受门拦）；术语统一「已暂停」→「已停止」（任务监控开关列/详情/tooltip、API 消息与本文档）。
 - v2.0（2026-10-01）：四类型标准重构。Kind 枚举 4 值替代 Continuous/Queue/Info；删除 SilentProbes/RecordFailuresOnly/SignalledWork/Singleton/AsKind/Cadence；NextSlotFn 返回 time.Time；Daemon 生命周期（StartLoop 调 Run 一次+阻塞）；cert-waiting-ca 默认调度关闭+唤醒/自停；自动备份遗留 1min 调度器删除（追补语义移入 nextAutoBackupSlot 的 last_run 感知）；ingestion 改自管理循环。

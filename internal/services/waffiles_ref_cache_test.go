@@ -117,3 +117,53 @@ func TestWafRefStatSignature_tracksCRSVersionWithoutRules(t *testing.T) {
 		t.Fatal("missing VERSION must have an explicit signature state distinct from a readable value")
 	}
 }
+
+// .version（ip2region tag）与 CRS VERSION 同口径：内容入签名——tag 参与
+// waf_files 节哈希与从端漂移判定，「等长改写且保留 mtime/mode」时命中旧
+// 引用会让主从节哈希暂时不对齐（多一轮全量重拉才自愈）。
+func TestWafRefStatSignature_tracksIP2RegionVersionContent(t *testing.T) {
+	oldCrs, oldXdb, oldWaf := crsLiveDir, ip2regionLivePath, wafDir
+	t.Cleanup(func() { crsLiveDir, ip2regionLivePath, wafDir = oldCrs, oldXdb, oldWaf })
+	root := t.TempDir()
+	crsLiveDir = filepath.Join(root, "crs") // 不创建：rules 缺失形态下 tag 仍须入签名
+	ip2regionLivePath = filepath.Join(root, "ip2region.xdb")
+	wafDir = filepath.Join(root, "waf")
+	if err := os.WriteFile(ip2regionLivePath, []byte("xdb"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	versionPath := ip2regionLivePath + ".version"
+	fixed := time.Unix(1700000000, 0)
+	writeTag := func(value string) {
+		t.Helper()
+		if err := os.WriteFile(versionPath, []byte(value), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(versionPath, fixed, fixed); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeTag("v1.0")
+	first, err := wafRefStatSignature()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 等长 + 同 mtime/mode：内容变化必须改变签名。
+	writeTag("v2.0")
+	second, err := wafRefStatSignature()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatal(".version 等长同 mtime 改写必须改变引用签名")
+	}
+	if err := os.Remove(versionPath); err != nil {
+		t.Fatal(err)
+	}
+	missing, err := wafRefStatSignature()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if missing == second {
+		t.Fatal(".version 缺失必须是独立签名状态")
+	}
+}

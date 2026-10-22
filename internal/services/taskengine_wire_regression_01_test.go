@@ -1,6 +1,6 @@
 package services
 
-// （不再内部二次查表） / 历史修复 装配暂停与 BootSync 后恢复调度的结构钉。
+// （不再内部二次查表） / 装配暂停与 BootSync 后恢复调度的结构钉。
 
 import (
 	"errors"

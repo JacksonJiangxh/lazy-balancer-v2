@@ -87,7 +87,7 @@ func TestExecCaddyValidate_classifiesSuccessRejectAndUnavailable(t *testing.T) {
 	})
 }
 
-// 历史问题（历史）：错误详情必须先按字节上限截断、再回退到合法 UTF-8
+// 错误详情必须先按字节上限截断、再回退到合法 UTF-8
 // 边界——先归一再按固定字节位硬切会把切口落在多字节字符中间（JSON 响应变成
 // U+FFFD 乱码残片）。同时收集侧有界：异常巨量输出不得无界驻留内存。
 func TestCaddyValidateDetail_truncatesBytesBeforeUTF8Normalization(t *testing.T) {

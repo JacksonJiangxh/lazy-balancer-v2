@@ -33,7 +33,7 @@ type Handlers struct {
 	clusterService    *services.ClusterService
 	caProviderService *services.CAProviderService
 	removeCertFiles   func(string) error
-	caddyOpMu         caddyOpMutex // 历史问题：委托 services 共享实例（零值可用——测试直构安全）
+	caddyOpMu         caddyOpMutex // 委托 services 共享实例（零值可用——测试直构安全）
 }
 
 type Dependencies struct {
@@ -64,7 +64,7 @@ func NewHandlers(deps Dependencies) *Handlers {
 }
 
 // caddyOpMutex 零值锁类型：全部操作委托 services.CaddyOpLock 共享实例
-// （历史问题：后台 Force 重载与 handler 写路径全程互斥；零值可用——测试中
+// （后台 Force 重载与 handler 写路径全程互斥；零值可用——测试中
 // &Handlers{...} 直构无需初始化）。
 type caddyOpMutex struct{}
 
@@ -108,7 +108,7 @@ func ResolveEnableCertJobAction(hasJob bool, status string, expiresAt *time.Time
 		}
 		return EnableCertJobRetry
 	}
-	// 历史问题（历史）：issued 但缺到期日（历史/导入遗留形态）无从判定是否
+	// issued 但缺到期日无从判定是否
 	// 临期——此前落 InProgress，续签扫描按 expires_at 非空查询故永不可见。
 	// 按 Retry 重排队（与 failed/disabled 的同形兜底一致）。
 	if status == "issued" && expiresAt == nil {
@@ -132,12 +132,12 @@ func boolText(value bool) string {
 // survive restarts and async paths to stay visible to operators.
 func (h *Handlers) recordCaddyApplyResult(err error) {
 	if err == nil {
-		// 历史修复（历史）：渲染降级（如受信代理设置读取失败按未启用渲染）已随
+		// 渲染降级（如受信代理设置读取失败按未启用渲染）已随
 		// 配置成功应用——降级不是应用失败，横幅不得被成功清除吞掉。事务内
 		// apply 不写主库（避免与未提交事务争写锁），由本函数在 commit 后落库；
 		// 下次干净渲染（LastRenderDegradation 归空）恢复常规清除。
 		if degraded := services.LastRenderDegradation(); degraded != "" {
-			// 历史问题：事务内 apply 暂缓的降级审计在此补落（commit 已成功，
+			// 事务内 apply 暂缓的降级审计在此补落（commit 已成功，
 			// 降级描述的是真实生效的已提交配置）；非事务路径已即时落过，取不到。
 			if pending := services.TakePendingRenderDegradationAudit(); pending != "" {
 				services.RecordAuditLog("system", "应用降级", "Caddy配置", pending, "")
@@ -170,23 +170,27 @@ func (h *Handlers) recordCaddyApplyResult(err error) {
 // 已持 caddyOpMu 的后台/会话内路径使用（Start/Restart Caddy、集群应用、
 // 导入会话内重播种）；applyCaddyConfigE 不可重入，未持锁路径必须用它。
 //
-// 重载审计的家族（契约：触发重载必须留痕。69d809b4 曾误以为单一入口
-// 全覆盖而删光其余家族的手动审计，导致删除/启用规则等操作重载不留痕）：
+// 重载审计的留痕通道（契约：触发重载必须留痕。69d809b4 曾误以为单一入口
+// 全覆盖而删光其余通道的手动审计，导致删除/启用规则等操作重载不留痕）。
+// 三条通道（按入口形态命名，不使用数字编号——「家族 N」在配置域已被
+// 门控提交族占用，两套编号同名曾导致阅读歧义）：
 //  1. caddyApplyNoteLocked — 已持 caddyOpMu 的后台/会话内路径（Start/
 //     Restart Caddy、集群应用、导入会话内重播种）仅保证失败留痕+横幅；
 //     Start/Stop/Restart 的成功动作审计由 Generic 中间件动作映射承担，
 //     不产生「重载」审计；
 //  2. applyFromTxNote      — 事务内应用（规则生命周期 ×5、UpdateConfig、
-//     finishTxApply 家族）：重载发生在 Commit 前、审计只能落在 Commit 后，
+//     finishTxApply 各调用点）：重载发生在 Commit 前、审计只能落在 Commit 后，
 //     两点必然分离，由返回的 note 闭包绑定，漏调即编译错误。
-//     注意：UpdateConfig 是严格变体——任何 applyErr（含传输失败）都回滚
-//     事务并返回 400/500，不采用「传输失败退化提交」；该差异由
-//     handlers/caddy.go 的 UpdateConfig 与钉测固化。
+//     严格/退化差异按调用点，不按本通道：直接调用 applyFromTxNote 的六个
+//     调用点是严格形态（规则 ×5 + UpdateConfig——任何 applyErr 含传输失败都
+//     回滚事务并返回 400/500）；经 finishTxApply 的调用点在其上叠加退化分支
+//     （传输/系统失败 → 提交 + 横幅 + 200 带告警）。两形态由
+//     handlers/caddy.go 的 UpdateConfig、rules.go 五调用点与钉测固化。
 //  3. applyCaddyConfigE    — 未持锁的手动重载（POST /caddy/reload 等），
 //     自取 caddyOpMu 并持久化应用结果。
 //
-// 家族 2 的变体（不经 tx 渲染）：PutCaddyConfig（ApplyConfig 原始载荷）与
-// 备份导入 ×2（协调器内应用）各自在成功尾部补记，同受契约约束。
+// 不经 tx 渲染的变体：PutCaddyConfig（ApplyConfig 原始载荷）与备份导入 ×2
+// （协调器内应用）各自在成功尾部补记，同受契约约束。
 func (h *Handlers) caddyApplyNoteLocked() string {
 	err := h.caddyService.GenerateAndApplyConfig()
 	if services.IsSameConfig(err) {
@@ -199,7 +203,7 @@ func (h *Handlers) caddyApplyNoteLocked() string {
 	return ""
 }
 
-// applyFromTxNote 是家族 3 的统一入口：事务内应用（ApplyConfigFromTx，
+// applyFromTxNote 是事务内应用通道的统一入口（ApplyConfigFromTx，
 // 应用失败即回滚，DB 与运行配置不分叉）。重载发生在 Commit 之前，而提交
 // 失败会回滚并恢复运行配置快照——审计必须等 Commit 成功后才落盘，否则会
 // 留下从未真正生效的「重载」行。因此这里把「应用」与「审计登记」绑定在
@@ -236,8 +240,8 @@ func (h *Handlers) applyFromTxNote(c *gin.Context, tx *sql.Tx, reloadDetail stri
 		return nil, err
 	}
 	return func() {
-		// 2026-09-07 历史修复：成功重载后清除既往失败标记（对齐 finishTxApply
-		// 成功分支与 UpdateConfig/PutCaddyConfig 的 历史修复 口径——规则×5 不清
+		// 2026-09-07：成功重载后清除既往失败标记（对齐 finishTxApply
+		// 成功分支与 UpdateConfig/PutCaddyConfig 的口径——规则×5 不清
 		// 陈旧 caddy_apply_error 会导致横幅长亮）。
 		h.recordCaddyApplyResult(nil)
 		recordAudit(c, "重载", "Caddy服务", reloadDetail)
@@ -262,13 +266,14 @@ type txApplyFinish struct {
 	ReloadDetail  string
 }
 
-// finishTxApply 家族 3 统一收尾（2026-09-06 裁定 ①②：只有可渲染配置可落库，
+// finishTxApply 事务内应用的统一收尾（2026-09-06 裁定 ①②：只有可渲染配置可落库，
 // 杜绝坏配置持久化后重启全停）。调用方完成事务内写库后调用本方法，三分支：
 //
 //	渲染拒绝（Caddy 4xx / 生成失败）→ 不提交（调用方 defer 回滚）+ 失败审计
 //	  + 400「Caddy 配置应用失败，<Resource>未保存: <原因>」；
-//	传输/系统失败（Caddy down 等）→ 退化家族 1 语义：提交 + 业务审计 + 重载失败
-//	  审计 + caddy_apply_error 标记 + 200「<SuccessMsg>；但 Caddy 配置应用失败：…」；
+//	传输/系统失败（Caddy down 等）→ 退化语义（= 已持锁直应用通道的收尾口径）：
+//	  提交 + 业务审计 + 重载失败审计 + caddy_apply_error 标记 +
+//	  200「<SuccessMsg>；但 Caddy 配置应用失败：…」；
 //	成功 → 提交 + 业务审计 + 重载审计 + 200/201。
 //
 // 本方法自行提交或放行回滚；调用方的 rollback defer 必须容忍 ErrTxDone
@@ -283,8 +288,8 @@ func (h *Handlers) finishTxApply(c *gin.Context, tx *sql.Tx, f txApplyFinish) {
 	// note 闭包按 reloadDetailFor(f) 落盘）。
 	if applyErr == nil {
 		if err := tx.Commit(); err != nil {
-			// 2026-09-07 历史修复：SQLite commit 失败极罕见（磁盘满/IO 错误）。
-			// 历史修复：apply 已按未提交事务视图 /load 并把同一内容写入 LKG，
+			// 2026-09-07：SQLite commit 失败极罕见（磁盘满/IO 错误）。
+			// apply 已按未提交事务视图 /load 并把同一内容写入 LKG，
 			// commit 失败必须把运行配置/LKG/投影/证书统一回退到已提交视图。
 			restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
 			joined := errors.Join(err, restoreErr)
@@ -293,7 +298,7 @@ func (h *Handlers) finishTxApply(c *gin.Context, tx *sql.Tx, f txApplyFinish) {
 			return
 		}
 		recordAudit(c, f.AuditAction, f.Resource, f.AuditDetail)
-		// 重载审计与失败横幅清除的唯一收口（历史修复：此前上方已先清一次、
+		// 重载审计与失败横幅清除的唯一收口（此前上方已先清一次、
 		// 此处 reloadNote 内又清一次 = 同请求重复 UPDATE global_config；
 		// 同字节短路形态也由 note 覆盖）。
 		reloadNote()
@@ -302,7 +307,7 @@ func (h *Handlers) finishTxApply(c *gin.Context, tx *sql.Tx, f txApplyFinish) {
 	}
 	if services.IsConfigRejected(applyErr) {
 		// CLI 校验拒绝与 admin 4xx 同口径：不落库 + 400 + 失败审计。
-		// 历史修复（历史）：渲染副作用（稳定命名投影+证书物化）已按未提交
+		// 渲染副作用（稳定命名投影+证书物化）已按未提交
 		// 内容落盘——tx 回滚的同时把磁盘回退到已提交态（零 /load）。
 		h.caddyService.RollbackIPListProjectionsToCommittedInLock()
 		recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail("Caddy 校验未通过", applyErr.Error(), services.AuditResultPart("failure")))
@@ -312,9 +317,9 @@ func (h *Handlers) finishTxApply(c *gin.Context, tx *sql.Tx, f txApplyFinish) {
 	// 乱填保障（2026-09-06 补充裁定）：CLI 不可用 + 应用传输失败 = 未经任何
 	// Caddy 级校验——不得退化提交（无法排除坏配置），回滚 + 明确提示。
 	if errors.Is(applyErr, services.ErrUnvalidatedApply) {
-		// 历史修复 同收口：回滚分支磁盘回退到已提交态（零 /load）。
+		// 同收口：回滚分支磁盘回退到已提交态（零 /load）。
 		h.caddyService.RollbackIPListProjectionsToCommittedInLock()
-		// 历史问题：传输错误可能发生在 Caddy 已应用候选之后（请求断连/
+		// 传输错误可能发生在 Caddy 已应用候选之后（请求断连/
 		// 超时）——只回滚 DB/投影会让运行配置停滞候选态，而看门狗只比对路由
 		// id（纯策略/限流变化不触发漂移横幅）。复用提交失败的统一恢复：
 		// 回滚事务 + 以已提交视图重渲染 /load + 回退 LKG/投影/证书副作用。
@@ -333,7 +338,7 @@ func (h *Handlers) finishTxApply(c *gin.Context, tx *sql.Tx, f txApplyFinish) {
 		return
 	}
 	if err := tx.Commit(); err != nil {
-		// 历史修复：退化提交分支同样可能已按未提交视图重写投影/证书并（若
+		// 退化提交分支同样可能已按未提交视图重写投影/证书并（若
 		// 传输失败前 /load 已生效）留下运行配置分叉——与成功分支同一收口。
 		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
 		joined := errors.Join(err, restoreErr)
@@ -347,7 +352,7 @@ func (h *Handlers) finishTxApply(c *gin.Context, tx *sql.Tx, f txApplyFinish) {
 	c.JSON(status, models.APIResponse{Code: 0, Message: f.SuccessMsg + "；但 Caddy 配置应用失败：" + applyErr.Error(), Data: f.Data})
 }
 
-// recoverCommittedViewAfterCommitFailure 是事务提交失败的统一恢复（历史修复）：
+// recoverCommittedViewAfterCommitFailure 是事务提交失败的统一恢复
 // 先回滚未提交事务（释放 SQLite 写锁，否则 db.DB 读会被阻塞），再以已提交
 // 视图重渲染并 /load——运行配置、last-known-good、名单投影与证书物化副作用
 // 全部回退到已提交状态，审计与 500 响应合并两类失败。
@@ -357,7 +362,7 @@ func (h *Handlers) recoverCommittedViewAfterCommitFailure(tx *sql.Tx) error {
 	var errs []error
 	if err := tx.Rollback(); err != nil {
 		if errors.Is(err, sql.ErrTxDone) {
-			// 历史问题：database/sql 在 Commit 失败后把 Tx 标记为 done 且
+			// database/sql 在 Commit 失败后把 Tx 标记为 done 且
 			// 不会调用 driver.Rollback（releaseConn 直接归还连接）。SQLite 的
 			// deferred 约束/IO 类失败会让底层事务保持活动——连接归还池后，
 			// 任何复用该连接的读都会看到未提交数据（已提交视图重渲染因此
@@ -379,7 +384,10 @@ func (h *Handlers) recoverCommittedViewAfterCommitFailure(tx *sql.Tx) error {
 // 连接池按 LIFO 复用，刚归还的泄漏连接会被优先取到；若取到的是无活动事务
 // 的其它空闲连接（池内有竞争），重试直到命中或次数用尽——此时泄漏事务仍
 // 持写锁，其它连接不可能有写事务，重复 ROLLBACK 不会误伤。
-func rollbackLeakedTx() {
+//
+// var 而非 func：测试缝（部署/回滚路径的可观测性断言——提交失败分支必须
+// 恰好走一次统一补发，不得自造 tx.Rollback 吞掉 ErrTxDone）。生产恒为本实现。
+var rollbackLeakedTx = func() {
 	if db.DB == nil {
 		return
 	}
@@ -405,7 +413,7 @@ func reloadDetailFor(f txApplyFinish) string {
 
 // applyCaddyConfigE serializes against rule/config writes (caddyOpMu) and
 // persists the apply outcome; all manual re-apply entry points must use it.
-// 历史问题：改用强制变体——手动重载（HTTP /caddy/reload 与 MCP
+// 改用强制变体——手动重载（HTTP /caddy/reload 与 MCP
 // reload_caddy）的语义就是「强制收敛」，必须能击穿 errSameConfig 短路
 // （磁盘数据变化而 JSON 相同的场景），否则文档承诺的收敛能力不存在。
 func (h *Handlers) applyCaddyConfigE() error {
@@ -417,9 +425,10 @@ func (h *Handlers) applyCaddyConfigE() error {
 }
 
 // rulePayloadInput 是规则保存字段层校验的归一视图：Create 取原值，Update
-// 解引用指针（nil=零值）。历史问题（历史）：视图与 models.CreateRuleRequest /
+// 解引用指针（nil=零值）。视图与 models.CreateRuleRequest /
 // UpdateRuleRequest 是平行字段清单——保留归一实现但加 parity 门禁
-// （audit78_b_core_test.go：模型字段要么在此声明、要么显式登记由
+// （b_core_regression_01_test.go 的 TestRulePayload_inputParityWithModels：
+// 模型字段要么在此声明、要么显式登记由
 // ruleFeatureInput 等单源校验豁免），新增模型字段漏登记即测试红。上游直接
 // 复用 models.Upstream（不再维护第二份上游镜像结构）。
 type rulePayloadInput struct {
@@ -491,7 +500,7 @@ func validateRuleUpstreams(protocol string, dynamicDNS bool, upstreams []models.
 		if u.Port < 1 || u.Port > 65535 {
 			return 0, fmt.Errorf("上游 #%d：端口 %d 无效（必须在 1-65535 之间）", i+1, u.Port)
 		}
-		// 历史修复（历史裁定）：weight<1 响亮拒绝——0→1 静默归一废除
+		// （裁定）：weight<1 响亮拒绝——0→1 静默归一废除
 		//（保存/导入同口径，导入侧见 config_backup.go 备份校验）；禁用行的
 		// 权重字段无业务意义但同样不得落 0（UI 载荷边界为禁用行送 1）。
 		if u.Weight < 1 {
@@ -652,7 +661,7 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 		}
 		data.Upstreams = r.Upstreams
 	default:
-		// 历史问题（历史）：未知请求类型此前静默放行（零校验通过）——调用方
+		// 未知请求类型此前静默放行（零校验通过）——调用方
 		// 只传 Create/Update，落此分支即契约破坏，须显性失败而非放过。
 		return fmt.Errorf("不支持的规则请求类型 %T", req)
 	}
@@ -672,12 +681,12 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 		return fmt.Errorf("无效的协议：仅支持 http 或 tcp")
 	}
 
-	// 历史问题:host_header 直写 reverse_proxy 头部——CRLF/控制字符可注入额外
+	// host_header 直写 reverse_proxy 头部——CRLF/控制字符可注入额外
 	// 头(请求拆分面);拒绝不可见字符,可见 ASCII 与常规 Unicode 放行。
 	if err := validateRuleHostHeader(data.HostHeader); err != nil {
 		return err
 	}
-	// 历史问题:dns_server 形状校验(host[:port])——垃圾串直写 caddy dns 模块
+	// dns_server 形状校验(host[:port])——垃圾串直写 caddy dns 模块
 	// 配置,渲染层报错位置深且难归因。
 	if err := validateDnsServerShape(data.DnsServer); err != nil {
 		return err
@@ -687,7 +696,7 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 		return fmt.Errorf("无效的监听端口：必须在 1-65535 之间")
 	}
 
-	// 历史修复（历史）：策略白名单委托共享实现——此前此处内联
+	// 策略白名单委托共享实现——此前此处内联
 	// httpStrategies/tcpStrategies 双 map 与 validateStrategyForProtocol
 	// 重复（保存链双重判定，两份 map 是漂移种子）。空 strategy 放行
 	// （渲染侧默认 weighted_round_robin；Create/Update 入口已默认/合并，
@@ -736,10 +745,10 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 		}
 	}
 
-	// 历史修复（历史）：证书来源白名单与规则级请求体上限收进共享保存门——
+	// 证书来源白名单与规则级请求体上限收进共享保存门——
 	// 四条调用路径（Create/Update/Duplicate/未来写入口）不再靠调用方自觉。
 	// 此前 tls_source 白名单在 Create/Update/存量启用门各写一遍，复制路径靠
-	// 「副本默认禁用 + 启用侧 stored 门」兜底（历史问题 在导入侧实证的漂移形态：
+	// 「副本默认禁用 + 启用侧 stored 门」兜底（在导入侧实证的漂移形态
 	// enable_tls=1 + tls_source 非白名单值 → 渲染 availableCerts 不认 → TLS
 	// 端口明文服务）；request_body_max_size_mb 同样在三处各调一次。
 	if data.EnableTLS && data.TLSSource != "manual" && data.TLSSource != "acme_dns" {
@@ -750,7 +759,7 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 	}
 
 	if data.EnableTLS && data.TLSSource == "acme_dns" {
-		// 历史问题（写侧）→ 历史问题 发现4 共享门：0 值、悬挂 id 与引用已禁用
+		// （写侧）→ 发现4 共享门：0 值、悬挂 id 与引用已禁用
 		// （enabled=0）配置/提供商一律 400——与签发侧 certissuer.go 的
 		// AND enabled=1 口径对齐，悬挂/禁用引用会静默落库并在签发期单任务失败。
 		if err := validateRuleACMEReferences(acmeReferenceInput{
@@ -775,7 +784,7 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 		return fmt.Errorf("健康检查超时必须 ≥ 1 秒")
 	}
 
-	// 历史问题 曾钉「负值 400（>=0 放行，0=默认语义）」；库值唯一真相批 1+2：
+	// 曾钉「负值 400（>=0 放行，0=默认语义）」；库值唯一真相批 1+2
 	// 阈值列转类型①值型，0 无效（渲染兜底 3/2 废除），<1 一律 400——
 	// UpdateRule 显式 0（指针可表达）由此拦截。
 	if data.HealthCheckUnhealthyThreshold < 1 {
@@ -799,7 +808,7 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 }
 
 // clampAuditRetentionMonthsOnStartup 将存量越界 audit_retention_months 钳位到
-// [1,12] 最近边界并记日志（历史问题）：写侧已加范围校验，历史越界值（超大值使
+// [1,12] 最近边界并记日志：写侧已加范围校验，历史越界值（超大值使
 // 年龄裁剪 datetime 越界静默失效，仅剩条数兜底）在启动时收敛。
 // 注：不得移入 caddy.go——TestCaddySectionKeys_matchUpdateSQL 按文本定位
 // caddy.go 内首个 "UPDATE global_config SET" 提取 UpdateConfig 的列集合。
@@ -829,14 +838,14 @@ func clampAuditRetentionMonthsOnStartup() {
 // caddyRestartTriggerFile 是监督器(entrypoint)在 Caddy 进程重启后写入的
 // 触发标记——本 watcher 检测到后调用 ApplyConfigOnStartup 走与容器启动完全
 // 相同的配置载入流程(DB 渲染→校验→admin API 应用),修正 last_good 快照可能
-// 滞后于 DB 的窗口(历史问题 用户裁定:自愈配置恢复须与启动初始化同一流程)。
+// 滞后于 DB 的窗口( 用户裁定:自愈配置恢复须与启动初始化同一流程)。
 const caddyRestartTriggerFile = "/tmp/caddy-restarted"
 
-// caddyRestartWatcherStarted 幂等守卫（历史问题：注释曾称幂等但无守卫——
+// caddyRestartWatcherStarted 幂等守卫（注释曾称幂等但无守卫——
 // 第二调用点会产生双 watcher）。
 var caddyRestartWatcherStarted atomic.Bool
 
-// caddyRestartProcessStart 进程启动时刻（历史问题 存量触发文件判定基准）：
+// caddyRestartProcessStart 进程启动时刻
 // mtime 早于此的文件属上一进程生命周期残留——删除不执行（启动应用已在启动
 // 流程完成，重放无意义）。
 var caddyRestartProcessStart = time.Now()
@@ -919,8 +928,8 @@ func caddyRestartBeginAttempt(now time.Time) (record bool, attempts int) {
 }
 
 // caddyRestartEndAttempt 记录本轮结果并安排下次尝试时刻：成功清零退避、
-// 失败按指数退避（上限 30s）。状态变化（failed→ok 或 ok→failed）强制落行。
-func caddyRestartEndAttempt(ok bool, now time.Time) {
+// 失败以尝试结束时刻为基准按指数退避（上限 30s）。状态变化（failed→ok 或 ok→failed）强制落行。
+func caddyRestartEndAttempt(ok bool) {
 	caddyRestartBackoff.mu.Lock()
 	defer caddyRestartBackoff.mu.Unlock()
 	status := "failed"
@@ -936,12 +945,12 @@ func caddyRestartEndAttempt(ok bool, now time.Time) {
 		if delay > caddyRestartBackoffMax {
 			delay = caddyRestartBackoffMax
 		}
-		caddyRestartBackoff.nextAttempt = now.Add(delay)
+		caddyRestartBackoff.nextAttempt = time.Now().Add(delay)
 	}
 	caddyRestartBackoff.lastStatus = status
 }
 
-// caddyRestartWatcherOnce 单轮处理（历史问题-03+历史问题，历史）：
+// caddyRestartWatcherOnce 单轮处理
 //   - 存量文件（mtime 早于进程启动）→ 删除不执行；
 //   - 新触发 → 先 RunSync 成功后才删文件——失败保留下轮重试（曾先删后跑，
 //     重应用失败即丢重试机会）；
@@ -964,7 +973,7 @@ func (h *Handlers) caddyRestartWatcherOnce(triggerFile string, processStart time
 	}
 	record, attempts := caddyRestartBeginAttempt(now)
 	services.Logf("info", "检测到 Caddy 进程重启，经任务引擎调度配置载入（DB 渲染；第 %d 次重试，落行=%v）", attempts, record)
-	// 历史修复（历史用户裁定）：一切任务统一引擎调度——曾直调
+	// 一切任务统一引擎调度——曾直调
 	// ApplyConfigOnStartup 绕过引擎（无 task_runs/[start]/[done]/单飞，
 	// 审计+任务日志双行）。Run 体触发门已放行 caddy-restart。
 	// 落行降频：连续失败时只有首次/状态变化/每 10 轮走 RunSync（落 task_runs），
@@ -980,26 +989,26 @@ func (h *Handlers) caddyRestartWatcherOnce(triggerFile string, processStart time
 		runErr = h.ApplyConfigOnStartup("")
 	}
 	if runErr != nil {
-		caddyRestartEndAttempt(false, now)
+		caddyRestartEndAttempt(false)
 		services.Logf("error", "Caddy 重启后配置重应用失败（触发文件保留，按退避重试）: %v", runErr)
 		return
 	}
-	caddyRestartEndAttempt(true, now)
+	caddyRestartEndAttempt(true)
 	services.Logf("info", "Caddy 重启后配置重应用完成（引擎调度，与启动流程同源）")
 	_ = os.Remove(triggerFile)
 }
 
 // ApplyConfigOnStartup 系统配置载入（startup:config-load Run 体唯一执行通道：
-// BootSync 启动传空 operator、手动重载经 wire 传操作者——历史问题-03）。
+// BootSync 启动传空 operator、手动重载经 wire 传操作者）。
 // operator 非空=手动触发，载入审计归因操作者；空=system。
 func (h *Handlers) ApplyConfigOnStartup(operator string) error {
 	actor := operator
 	if actor == "" {
 		actor = "system"
 	}
-	// 历史问题：存量越界 audit_retention_months 启动钳位（写侧已加 1-12 校验）。
+	// 存量越界 audit_retention_months 启动钳位（写侧已加 1-12 校验）。
 	clampAuditRetentionMonthsOnStartup()
-	// 历史问题: 启动路径补存量规则校验（保存/导入/启用路径已有自环与遮蔽拦截），
+	// 启动路径补存量规则校验（保存/导入/启用路径已有自环与遮蔽拦截），
 	// 命中即响亮报错并记审计，但不阻断启动：单条坏规则不应拖垮整个服务，与
 	// 「启动应用失败仅记日志保旧配置」的既有取舍一致（main.go 调用侧同样不退出）。
 	if err := validateEnabledStoredRuleConfigs(context.Background()); err != nil {
@@ -1007,7 +1016,7 @@ func (h *Handlers) ApplyConfigOnStartup(operator string) error {
 		services.RecordAuditLog(actor, "启动警告", "系统配置", "启动校验发现无效规则配置："+err.Error(), "")
 	}
 
-	// 启动竞态修复（历史）：先等监督器「启动回放阶段完成」标记再继续——
+	// 启动竞态修复：先等监督器「启动回放阶段完成」标记再继续——
 	// 监督器首启 last-good 回放与本 BootSync 应用各等 admin 就绪即写，先后为
 	// 硬币；本应用先落时监督器回放旧 LKG 覆盖新渲染（v2.3.7-beta 发版实锤）。
 	// 等标记把时序定死为「回放→标记→应用」。监督器不在场（测试/裸跑）立即
@@ -1020,8 +1029,8 @@ func (h *Handlers) ApplyConfigOnStartup(operator string) error {
 
 	for i := 0; i < maxRetries; i++ {
 		// 共享客户端（Transport 复用）+ 每请求 2s 超时（context 承载）。
-		// 历史问题: 即使 err != nil，resp 也可能非 nil（如重定向），需统一关闭。
-		resp, err := caddyAdminGet(context.Background(), h.cfg.CaddyAdminURL, "/config/", 2*time.Second) // 历史修复：就绪探针与 GetCaddyStatus 同源取配置地址，不再硬编码 localhost:2019
+		// 即使 err!= nil，resp 也可能非 nil（如重定向），需统一关闭。
+		resp, err := caddyAdminGet(context.Background(), h.cfg.CaddyAdminURL, "/config/", 2*time.Second) // 就绪探针与 GetCaddyStatus 同源取配置地址，不再硬编码 localhost:2019
 		if resp != nil {
 			resp.Body.Close()
 		}
@@ -1066,7 +1075,7 @@ func (h *Handlers) ApplyConfigOnStartup(operator string) error {
 		services.RecordAuditLog(actor, "启动警告", "系统配置", wrapped, "")
 	}
 
-	// 历史问题（历史·漂移横幅事故）：未初始化实例（无任何用户）空库
+	// 未初始化实例（无任何用户）空库
 	// 启动时，若 Caddy 运行配置仍含规则路由，跳过本次应用——几乎必然是数据
 	// 目录/Admin 地址误配（2026-09-24 实证：dev 实例误指生产 admin 清空运行
 	// 配置）。运行配置保持原样，分叉由看门狗「多余规则路由」横幅持续上报；
@@ -1080,7 +1089,7 @@ func (h *Handlers) ApplyConfigOnStartup(operator string) error {
 				wrapped := "启动守卫：未初始化实例（无用户、无启用规则），但 Caddy 运行配置仍含规则路由——跳过本次启动应用（疑似数据目录或 Caddy Admin 地址误配），运行配置保持原样；漂移状态由看门狗持续上报"
 				services.Logf("error", "问题: %s", wrapped)
 				services.RecordAuditLog(actor, "启动警告", "系统配置", wrapped, "")
-				// 历史问题（历史）：与同函数成功/回退分支一致，守卫命中属真实
+				// 与同函数成功/回退分支一致，守卫命中属真实
 				// 执行轮结论，须在 tasks/startup:config-load.log 留业务摘要行
 				// （此前只有 Logf+审计，任务日志看似「跑了但无结论」）。
 				services.TaskLogf("startup:config-load", "caddy", "启动守卫命中：已跳过配置应用（运行配置含非本库规则路由）")
@@ -1098,7 +1107,7 @@ func (h *Handlers) ApplyConfigOnStartup(operator string) error {
 			services.TaskLogf("startup:config-load", "caddy", "Caddy 应用被拒，已回退最后已知正确配置：%v", err)
 			services.Logf("error", "问题: %s", wrapped)
 			services.RecordAuditLog(actor, "启动警告", "系统配置", wrapped, "")
-			// 2026-09-07 裁定 历史修复：从节点追加补偿标记——Pull 的 304 分支识别后
+			// 2026-09-07 裁定：从节点追加补偿标记——Pull 的 304 分支识别后
 			// 全量重拉，消除「同步正常+运行旧配置」静默窗口；主节点不经 Pull
 			// 消费该标记，故不写。
 			if isMaster, mErr := services.RoleOf(context.Background(), db.DB); mErr == nil && !isMaster {
@@ -1109,7 +1118,7 @@ func (h *Handlers) ApplyConfigOnStartup(operator string) error {
 			return nil
 		} else {
 			services.Logf("error", "last-known-good fallback failed: %v", fbErr)
-			// 历史问题-02（历史）：双失败（渲染被拒+回退失败）从节点同样
+			// 双失败（渲染被拒+回退失败）从节点同样
 			// 写补偿标记——无标记时 Pull 的 304 分支永远判「同步正常」，运行配置
 			// 与数据库的未知分叉静默存活（自愈失明）；标记触发下轮全量重拉。
 			if isMaster, mErr := services.RoleOf(context.Background(), db.DB); mErr == nil && !isMaster {
@@ -1159,7 +1168,7 @@ func (h *Handlers) validatePortFromDB(protocol string, port int, excludeCaddyID 
 	return nil
 }
 
-// checkPortTLSMix(历史问题,历史):同端口 TLS/明文混布拦截——Caddy 监听器
+// checkPortTLSMix:同端口 TLS/明文混布拦截——Caddy 监听器
 // 按端口二选一,混布会把整个端口监听器切为 TLS,明文规则流量全部握手失败。
 // 判定键=enable_tls 意图(不看证书存在性:ACME 签发中/延迟翻转的同端口规则
 // 同样会被监听器形态波及);仅统计启用中的规则。
@@ -1168,7 +1177,7 @@ func checkPortTLSMix(excludeCaddyID string, port int, enableTLS bool) error {
 	if enableTLS {
 		opposite = 0
 	}
-	// 历史问题：对齐全仓 IIF 归一口径——NULL 行（远古存量/直改 DB）归一为
+	// 对齐全仓 IIF 归一口径——NULL 行（远古存量/直改 DB）归一为
 	// 明文（0）参与混布判定；裸 enable_tls=? 比较下 NULL 行漏检。
 	query := "SELECT COUNT(*) FROM lb_rules WHERE listen_port=? AND protocol='http' AND enabled=1 AND IIF(enable_tls IN ('1',1),1,0)=?"
 	args := []any{port, opposite}
@@ -1190,7 +1199,7 @@ func checkPortTLSMix(excludeCaddyID string, port int, enableTLS bool) error {
 	return nil
 }
 
-// validateDnsServerShape(历史问题):DNS 服务器地址形状校验——host[:port];
+// validateDnsServerShape:DNS 服务器地址形状校验——host[:port];
 // 裸 host 容错(SplitHostPort 报 missing port 时按裸 host 处理),拒绝空
 // host、非数字/越界端口与控制字符。
 // validateDnsServerShape(2026-10-04 多地址守卫):先按逗号/中文逗号/空格/分号
@@ -1206,7 +1215,7 @@ func validateDnsServerShape(raw string) error {
 
 // validateSingleDnsAddress 单地址校验:host[:port] 形态;host 须为 IP(netip)
 // 或含点的 FQDN 或 localhost;端口 1-65535;拒绝空 host 与控制字符。
-// 历史修复：含冒号的输入只接受合法 host:port（含 [v6]:port）——SplitHostPort
+// 含冒号的输入只接受合法 host:port（含 [v6]:port）——SplitHostPort
 // 失败的多冒号/空端口/括号畸形一律拒绝，不得回落「含点即 FQDN」（原实现让
 // bad.example.com:80:90 这类串整串当 host 通过字段门）。
 func validateSingleDnsAddress(server string) error {
@@ -1254,7 +1263,7 @@ func validateSingleDnsAddress(server string) error {
 	if host == "localhost" {
 		return nil
 	}
-	// 历史修复（历史）：host 部分复用 isValidHost 的标签字母表/首尾校验——
+	// host 部分复用 isValidHost 的标签字母表/首尾校验——
 	// 此前只判「不含控制字符 + 含点」，`a!b.example.com`、`x/y.example.com`
 	// 等畸形串通过字段门并落库；渲染侧把该串直接放进 resolver.addresses，
 	// Caddy 接受地址但不做可达性校验 → 动态上游解析静默失败（规则 502），

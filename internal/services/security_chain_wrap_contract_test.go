@@ -2,7 +2,7 @@ package services
 
 import "testing"
 
-// 历史修复 契约钉（历史）：「blocked_counter 恒包裹安全链」。
+// 契约钉：「blocked_counter 恒包裹安全链」。
 //
 // 计时注册表（caddygeoip auditTiming*）的终态收点 auditTimingClose 只在
 // lb_security_blocked_counter 的 post-next 执行；分段写点是
@@ -10,7 +10,7 @@ import "testing"
 // 审计行生产者是各 coraza waf（审计 Write 严格早于收点——coraza 中间件
 // defer ProcessLogging）。渲染层若让任一分段写点/审计行生产者出现在
 // counter 之后无包裹、或 counter 缺席，drain 侧等待语义失配：行入队时终态
-// 永不到场（有 pre 无终态，等待满上限——正是 历史修复 沉陷形态的渲染侧根源）。
+// 永不到场（有 pre 无终态，等待满上限——正是沉陷形态的渲染侧根源）。
 // 本钉测把每条规则渲染树扁平化为执行序，按形状矩阵断言：
 //  1. 树内出现任一安全段元素（waf/lb_security_timing_pre/lb_security_timing_end/
 //     rate_limit）⇒ counter 在场且先于全部安全段元素（最外层包裹）。覆盖
@@ -147,7 +147,7 @@ func TestBlockedCounterWrapContract_acrossAllRenderShapes(t *testing.T) {
 	}
 	assertBlockedCounterWrap(t, "lb_wrap4", "main", flattenRouteHandlers(t, mainRoute4))
 
-	// 形状 5：无策略规则——历史修复 语义面处理器全不发射。历史问题（历史
+	// 形状 5：无策略规则——语义面处理器全不发射。（历史
 	// 审计）起 lb_security_timing_end 也不再例外：无 counter 即无服务端
 	// timing ID 注入/覆盖，发射 timing_end 会让客户端伪造的计时头直进
 	// 进程内注册表（内存 DoS 面）——渲染层单点收口，无 counter 的路由

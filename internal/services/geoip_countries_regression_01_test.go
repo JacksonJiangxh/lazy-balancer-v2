@@ -1,6 +1,6 @@
 package services
 
-// 历史修复、校验并入国名、geoipLocOperator 国名精确匹配、预检渲染国名条目。
+// 校验并入国名、geoipLocOperator 国名精确匹配、预检渲染国名条目。
 
 import (
 	"encoding/json"
@@ -84,20 +84,20 @@ func TestRegionTree_countriesCacheJSON(t *testing.T) {
 	}
 }
 
-// TestStaleRegionTreeCache_invalidatesEarlierCache：修订号 bump（历史修复→历史修复）是
-// 旧缓存失效的唯一机制——历史修复 旧形态（无 countries）缓存必须判过期重建，否则
+// TestStaleRegionTreeCache_invalidatesEarlierCache：修订号 bump是
+// 旧缓存失效的唯一机制——旧形态（无 countries）缓存必须判过期重建，否则
 // 升级部署后选项树静默缺国家集。
 func TestStaleRegionTreeCache_invalidatesEarlierCache(t *testing.T) {
 	dir := t.TempDir()
 	live := filepath.Join(dir, "ip2region.xdb")
 	cachePath := live + ".regions.json"
-	oldShape := `{"revision":"r26","provinces":["广东省","海外"],"cities":{"广东省":["深圳市"]}}`
+	oldShape := `{"revision":"legacy","provinces":["广东省","海外"],"cities":{"广东省":["深圳市"]}}`
 	if err := os.WriteFile(cachePath, []byte(oldShape), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	withIP2RegionPaths(t, live, filepath.Join(dir, "missing.xdb"))
 	if !staleRegionTreeCache(cachePath) {
-		t.Fatal("r26 cache must be stale after r27 bump（旧缓存静默缺 countries）")
+		t.Fatal("旧缓存须在 revision 提升后失效（否则静默缺 countries）")
 	}
 	// 当前修订号产物（携带 countries）不判过期——回归形状。
 	fresh := `{"revision":"` + treeCacheRevision + `","provinces":["广东省","海外"],"cities":{"广东省":["深圳市"]},"countries":["United States"]}`
@@ -107,7 +107,7 @@ func TestStaleRegionTreeCache_invalidatesEarlierCache(t *testing.T) {
 	if staleRegionTreeCache(cachePath) {
 		t.Fatal("current-revision cache with countries must not be stale")
 	}
-	// 历史修复 缓存里的空串国名条目（带外手改形态）判过期——与省/市空串守卫同款。
+	// 缓存里的空串国名条目（带外手改形态）判过期——与省/市空串守卫同款。
 	tampered := strings.Replace(fresh, `"countries":["United States"]`, `"countries":[""]`, 1)
 	if err := os.WriteFile(cachePath, []byte(tampered), 0o644); err != nil {
 		t.Fatal(err)
@@ -208,7 +208,7 @@ func TestGeoipLocOperator_countryEntriesExact(t *testing.T) {
 	}
 }
 
-// TestBuildIPPrecheckDirectives_geoipCountryEntries（历史修复）：真实渲染产物含
+// TestBuildIPPrecheckDirectives_geoipCountryEntries：真实渲染产物含
 // 国名条目策略形状——国名精确/省份后缀/海外哨兵三形态并存，送 coraza
 // NewWAF 编译（引擎约束只在编译可见）。
 func TestBuildIPPrecheckDirectives_geoipCountryEntries(t *testing.T) {

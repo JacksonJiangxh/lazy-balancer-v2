@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-// 历史修复 行为锚定测试：cleanupLegacyCRSTransient 的可观察契约是「删除具名瞬态
+// 行为锚定测试：cleanupLegacyCRSTransient 的可观察契约是「删除具名瞬态
 // 目标与 *.bak/*.old 后缀条目、保留其余全部内容，且清理动作留审计日志行、
 // 目录缺失时静默无操作」。先于重构编写并在旧实现上验证通过（锁定现行为），
 // 重构（单次 ReadDir + 集合判断）后必须保绿。
@@ -32,7 +32,7 @@ func TestCleanupLegacyCRSTransient_removesOnlyLegacyTransientArtifacts(t *testin
 	for _, name := range []string{".staging", "rules.bak", "rules.bak.tmp", "rules.old"} {
 		write(filepath.Join(name, "leftover"), "x")
 	}
-	// 后缀形态：文件形（历史备份残件）与目录形
+	// 后缀形态：文件形（备份残件）与目录形
 	write("crs-setup.conf.bak", "old setup")
 	write("zz-user-overrides.conf.bak", "old overrides")
 	write(filepath.Join("tree.old", "leftover.conf"), "x")

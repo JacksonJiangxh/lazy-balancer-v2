@@ -189,7 +189,7 @@ func TestWatchdogCheckOnce_roleReadFailureCountsSkippedAndFails(t *testing.T) {
 	newTaskLogDir(t)
 	corruptClusterRole(t)
 
-	err := WatchdogCheckOnce()
+	err := WatchdogCheckOnce(context.Background())
 	if err == nil {
 		t.Fatal("角色读取失败必须返回错误（此前 return nil → task_runs 恒 success）")
 	}

@@ -14,6 +14,6 @@ export function showSaveResult(res: SaveResultLike | undefined | void, fallback:
     ElMessage({ type: 'warning', message, duration: 0, showClose: true })
     return
   }
-  // 历史问题 十三次→十八次：统一走 mfaAwareSuccess（全站写事件同口径）。
+  // →十八次：统一走 mfaAwareSuccess（全站写事件同口径）。
   mfaAwareSuccess(message)
 }

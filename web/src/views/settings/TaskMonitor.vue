@@ -1,7 +1,7 @@
 <template>
   <div class="tm-root">
-    <!-- 历史修复：轮询失败横幅（照 CertJobs 形态；行内件样式复用 main.css
-         .polling-error-*/.error-banner，FE-R2 家族收敛第 4 点） -->
+    <!-- 轮询失败横幅（照 CertJobs 形态；行内件样式复用 main.css
+         .polling-error-*/.error-banner，家族收敛第 4 点） -->
     <el-alert v-if="pollingError.errorMessage.value" type="error" :closable="false" show-icon class="polling-error-alert error-banner">
       <template #title>
         <div class="polling-error-title">
@@ -85,7 +85,7 @@
         </div>
         <div class="tm-cq-banner-live">
           <span v-if="certQueueError" class="tm-cq-idle">证书队列状态加载失败（下一轮轮询自动重试）</span>
-          <!-- 历史修复：正文空态改按聚合存活计数判定（原只看首页存活行——
+          <!-- 正文空态改按聚合存活计数判定（原只看首页存活行——
                首页均为终态而聚合计数非空时会谎报「空闲」）。 -->
           <template v-else-if="certQueueHasLive(certQueue)">
             <span v-for="j in certQueue.jobs.slice(0, CERT_QUEUE_VISIBLE_JOBS)" :key="j.id" class="tm-cq-domain-chip">
@@ -95,7 +95,7 @@
           </template>
           <span v-else class="tm-cq-idle">空闲——临期证书由「证书续期扫描」自动入队</span>
         </div>
-        <!-- 历史修复：标签判据与聚合计数同口径——排队/等 CA 亦为「非空闲」。 -->
+        <!-- 标签判据与聚合计数同口径——排队/等 CA 亦为「非空闲」。-->
         <el-tag :type="certQueueError ? 'danger' : certQueueIsBusy(certQueue) ? 'primary' : 'success'" size="small" effect="plain">
           {{ certQueueError ? '加载失败' : certQueueIsBusy(certQueue) ? '队列非空' : '空闲' }}
         </el-tag>
@@ -159,9 +159,10 @@
           <template #default="{ row }">
             <!-- v2.0 调度开关统一：定时/循环=停止/恢复调度、
                  常驻=启停自管理循环——绑定 loop_on 走 /toggle（后端按 Kind 路由）。
-                 方案 A（2026-10-12）：并判 enabled（业务开关联动，如自动更新关闭/
-                 备份未启用）——业务关时开关显示「已停止」，状态列不再用 disabled 表达 -->
-            <!-- 历史修复（历史）：cert-waiting-ca 默认调度关闭、续期扫描入队
+                 方案 A（2026-10-12）：开关只看 loop_on（TaskMeta.Enabled 字段已删除）——
+                 业务关时调度态由业务页开关停调度承载（business_driven 行开关只读），
+                 状态列不再用 disabled 表达 -->
+            <!-- cert-waiting-ca 默认调度关闭、续期扫描入队
                  唤醒——开关上加 tooltip 说明自动唤醒语义（页内既有 tooltip 范式） -->
             <el-tooltip v-if="row.id === 'cert-waiting-ca'" content="有证书任务入队时自动唤醒" placement="top" :offset="8" :show-after="150" :show-arrow="false">
               <el-switch :model-value="!!row.loop_on" :disabled="!canOperate" @change="(v: string | number | boolean) => onToggle(row, !!v)" />
@@ -221,7 +222,7 @@
               link type="danger" size="small" :disabled="!canOperate"
               @click="onCancel(row)"
             >取消</el-button>
-            <!-- 常驻行启停已由调度列开关承担（loop_on 同源，历史问题-6e）——操作列改「重启」 -->
+            <!-- 常驻行启停已由调度列开关承担（loop_on 同源）——操作列改「重启」-->
             <el-button
               v-if="row.controllable"
               link type="warning" size="small"
@@ -246,7 +247,7 @@
     </el-card>
 
     <!-- 任务详情 -->
-    <!-- 历史修复：同类弹框均 min(…,92vw)——固定 720px 在窄屏横向溢出。 -->
+    <!-- 同类弹框均 min(…,92vw)——固定 720px 在窄屏横向溢出。-->
     <el-dialog v-model="detailVisible" width="min(720px, 92vw)" top="8vh">
       <template #header>
         <DialogHeader
@@ -276,7 +277,7 @@
           <el-descriptions-item v-if="detailTask.last_run" label="触发 / 结果"><span class="tm-inline-flex">{{ triggerLabel(detailTask.last_run.trigger) }} · {{ detailTask.last_run.operator || '系统' }} · <el-tag size="small" :type="resultTagType(detailTask.last_run.result)">{{ statusResultLabel(detailTask.last_run.result) }}</el-tag></span></el-descriptions-item>
         </el-descriptions>
         <div v-if="detailTask.last_run?.message" class="tm-detail-msg">{{ detailTask.last_run.message }}</div>
-        <!-- 历史修复：历史加载失败显性化（原静默呈现为空表，与「无记录」不可区分） -->
+        <!-- 历史加载失败显性化（原静默呈现为空表，与「无记录」不可区分）-->
         <el-alert v-if="detailHistoryError" type="error" :closable="false" show-icon title="运行历史加载失败，请关闭后重新打开" style="margin-bottom: 12px" />
         <template v-if="history.length">
           <div class="tm-detail-section">{{ historyTitle }}</div>
@@ -363,7 +364,7 @@ interface TaskInfo {
 interface RunRecord {
   id: number; task_id: string; family: string; trigger: string; operator?: string; status: string
   started_at: string; finished_at: string; duration_ms: number
-  // 历史修复（历史）：stage/entry_count 恒零死列已随后端删除——不再声明。
+  // stage/entry_count 恒零死列已随后端删除——不再声明。
   message?: string
 }
 
@@ -377,13 +378,13 @@ const certJobsTruncated = ref(false)
 const loaded = ref(false)
 const series24h = ref<TaskHourlyStat[]>([])
 const refreshing = ref(false)
-// 历史问题（历史）：只读判定统一走全局 fail-closed 契约（authStore.
+// 只读判定统一走全局 fail-closed 契约（authStore.
 // readOnlyReason===null=可写；曾本地 isSlave fetch-open 且不随角色切换刷新，
-// 违反 历史问题——全站 14 页唯一偏离者）
+// 违反 ——全站 14 页唯一偏离者）
 const readOnly = computed(() => authStore.readOnlyReason !== null)
 const canOperate = computed(() => isAdmin.value && !readOnly.value)
 
-// 历史修复：200 但缺 data 是契约违约，不得静默渲染成「0 任务 / 空图表」——与
+// 200 但缺 data 是契约违约，不得静默渲染成「0 任务 / 空图表」——与
 // CertJobs.vue 同口径抛 TypeError，才能进入 usePollingErrorState 的契约退避与
 // 错误横幅（原 `res.data?.tasks || []` 把违约伪装成合法空集）。
 const fetchTasks = async (signal?: AbortSignal) => {
@@ -406,7 +407,7 @@ const refreshNow = async () => {
     await Promise.all([fetchTasks(), fetchSeries(), fetchCertQueue()])
     pollingError.clear()
   } catch (error: unknown) {
-    // 历史问题：原实现无 catch——网络/5xx 时按钮无反馈且产生 unhandled
+    // 原实现无 catch——网络/5xx 时按钮无反馈且产生 unhandled
     // rejection；与轮询失败同口径记录到可见横幅。
     pollingError.recordError(error)
   } finally { refreshing.value = false }
@@ -417,7 +418,7 @@ onMounted(() => {
 })
 onUnmounted(() => polling.stop())
 
-// 历史修复：轮询失败可见化（此前只落 console）。契约性失败（TypeError）退避
+// 轮询失败可见化（此前只落 console）。契约性失败（TypeError）退避
 // 期间轮询闭包经 canRun 门跳过；横幅「立即重试」重置退避立即拉取。
 const pollingError = usePollingErrorState()
 const pollingErrorDescription = computed(() => {
@@ -428,9 +429,9 @@ const pollingErrorDescription = computed(() => {
     : `最后错误：${lastError}`
 })
 const polling = usePollingTask(async ({ signal }) => {
-  // 历史问题-4：证书队列横幅与任务列表同频 10s（曾只在 mounted/手动刷新拉取，横幅最长陈旧一个会话）
+  // 证书队列横幅与任务列表同频 10s（曾只在 mounted/手动刷新拉取，横幅最长陈旧一个会话）
   if (!pollingError.canRun()) return
-  // 历史问题：消费每轮 abort signal——pause/stop（含组件卸载）可取消在途请求。
+  // 消费每轮 abort signal——pause/stop（含组件卸载）可取消在途请求。
   await Promise.all([fetchTasks(signal), fetchSeries(signal), fetchCertQueue(signal)])
   pollingError.clear()
 }, {
@@ -446,23 +447,23 @@ const retryPolling = async (): Promise<void> => {
 }
 // ===== 证书队列状态（独立卡——非任务族） =====
 interface CertJobRow { id: number; domain: string; status: string; updated_at?: string | null; ca_provider_name?: string }
-// 历史修复（历史）：certQueue.loaded 死字段删除（写字段零消费方）。
+// certQueue.loaded 死字段删除（写字段零消费方）。
 const certQueue = ref<{ queued: number; running: number; waiting: number; total: number; jobs: CertJobRow[]; truncated: boolean }>({
   queued: 0, running: 0, waiting: 0, total: 0, jobs: [], truncated: false,
 })
-// 历史问题：队列加载失败不得呈现为「全 0 / 空闲」——显式错误态（下一轮轮询自愈）
+// 队列加载失败不得呈现为「全 0 / 空闲」——显式错误态（下一轮轮询自愈）
 const certQueueError = ref(false)
-// 历史修复：列表只用于横幅列 4 个域名 chip——page_size=6 即够（原 200，每 10s
+// 列表只用于横幅列 4 个域名 chip——page_size=6 即够（原 200，每 10s
 // 让后端逐行截取 cert_pem/解析 issuer/算到期状态后丢弃）。计数仍以
 // status_counts 聚合为真源；该字段缺席时才退回「首页可见行推导 + total 超页
-// 声明 ≥」（历史问题 的降级路径保留）。
+// 声明 ≥」。
 const CERT_QUEUE_PAGE_SIZE = 6
-// 历史修复：接入轮询 AbortSignal——pause/stop（含组件卸载）可取消在途请求，
+// 接入轮询 AbortSignal——pause/stop（含组件卸载）可取消在途请求，
 // 与 fetchTasks/fetchSeries 同口径（补齐 :409 注释承诺）。
 const fetchCertQueue = async (signal?: AbortSignal) => {
   try {
     const res = await request.get<APIResponse<{ list: CertJobRow[]; total: number; status_counts?: Record<string, number> }>>('/certificates/jobs', { params: { page: 1, page_size: CERT_QUEUE_PAGE_SIZE }, silent: true, signal })
-    // 历史修复：缺 data 为契约违约（同 fetchTasks/fetchSeries），下面向上抛。
+    // 缺 data 为契约违约（同 fetchTasks/fetchSeries），下面向上抛。
     if (!res.data) throw new TypeError('证书队列响应缺少 data')
     const list = res.data.list || []
     const counts = res.data?.status_counts
@@ -494,9 +495,9 @@ const fetchCertQueue = async (signal?: AbortSignal) => {
     }
   } catch (error: unknown) {
     // 静默自动重试（下一轮轮询），但错误态必须显性——0 值会被误读为「无排队」；
-    // pause/stop 触发的取消不是失败（历史修复）
+    // pause/stop 触发的取消不是失败
     if (!axios.isCancel(error)) certQueueError.value = true
-    // 历史修复：契约违约（缺 data）与其余两份请求同语义——向上抛，交由轮询入口
+    // 契约违约（缺 data）与其余两份请求同语义——向上抛，交由轮询入口
     // 记录并进入 TypeError 退避；普通网络/5xx 仍在本层吞掉（下一轮自愈）。
     if (error instanceof TypeError) throw error
   }
@@ -509,7 +510,7 @@ const fail24h = computed(() => tasks.value.reduce((s, t) => s + (t.fail_24h || 0
 
 // ===== 筛选 + 分页 =====
 const kindFilter = ref('all')
-// 历史问题：分类筛选原为 el-table 列级 filter（作用在 pagedTasks 切片上=
+// 分类筛选原为 el-table 列级 filter（作用在 pagedTasks 切片上=
 // 只过滤当前页），现提升到 filteredTasks 参与计数/分页。
 const categoryFilter = ref('all')
 const categoryOptions = computed(() => [...new Set(tasks.value.map(t => t.category))].sort())
@@ -517,12 +518,12 @@ const filteredTasks = computed(() => {
   const list = tasks.value
     .filter(t => kindFilter.value === 'all' || t.kind === kindFilter.value)
     .filter(t => categoryFilter.value === 'all' || !categoryFilter.value || t.category === categoryFilter.value)
-  // 默认按分类排序（安全防护→证书→备份→集群→系统→触发），类内稳定
+  // 默认按分类排序（安全防护→证书→备份→集群→系统），类内稳定
   return [...list].sort((a, b) => (categoryOrder[a.category] ?? 9) - (categoryOrder[b.category] ?? 9))
 })
 const page = ref(1)
 const pageSize = ref(20)
-// 历史问题：页码夹紧单源（useClampedPagination）——任务列表收缩（cert-job 动态行
+// 页码夹紧单源（useClampedPagination）——任务列表收缩（cert-job 动态行
 // 完成消失）或增大 pageSize 后自动回夹，不再停留在空页。原 slice 无夹紧，仅筛选
 // 变化复位。
 const { pagedItems: pagedTasks } = useClampedPagination(filteredTasks, page, pageSize)
@@ -569,7 +570,7 @@ const statsBarOption = computed<EChartsOption>((): EChartsOption => {
 })
 
 // ===== 操作 =====
-// 历史问题：请求调用原在 confirm 的 try 之外 → 失败产生 unhandled
+// 请求调用原在 confirm 的 try 之外 → 失败产生 unhandled
 // rejection；且无重入守卫（快速双击叠加多个确认框/重复请求）。统一范式：
 // pending 守卫 → confirm → try/catch 包住请求 → finally 释放。
 const taskActionPendingId = ref<string | null>(null)
@@ -585,7 +586,7 @@ interface TaskActionOptions {
 }
 
 /**
- * 任务操作统一执行器（历史问题）：占位守卫 → 确认 → 请求 → 记录失败
+ * 任务操作统一执行器：占位守卫 → 确认 → 请求 → 记录失败
  * → 释放占位。原实现把 request 放在 confirm 的 try 之外（失败 unhandled
  * rejection）且无重入守卫（双击叠加确认框/重复请求）。
  */
@@ -647,7 +648,7 @@ const onCancel = (row: TaskInfo): Promise<void> => runTaskAction(row, {
   failureLabel: 'cancel task',
 })
 
-// 历史问题-6e：常驻行操作列「重启」（control restart——启停已由调度列开关承担）
+// 常驻行操作列「重启」（control restart——启停已由调度列开关承担）
 const onRestart = (row: TaskInfo): Promise<void> => runTaskAction(row, {
   confirm: { message: `确认重启「${row.name}」？重启期间相关功能将短暂中断。`, title: '常驻任务控制', confirmButtonText: '重启' },
   request: () => request.post<APIResponse>(`/system/tasks/${row.id}/control`, { action: 'restart' }),
@@ -657,7 +658,7 @@ const onRestart = (row: TaskInfo): Promise<void> => runTaskAction(row, {
 
 // ===== 详情 =====
 const detailVisible = ref(false)
-// 历史修复：详情按 id 从最新 tasks 派生（此前持有打开时的行快照——轮询每轮整体替换
+// 详情按 id 从最新 tasks 派生（此前持有打开时的行快照——轮询每轮整体替换
 // tasks 后，状态/24h 计数/下次执行在弹框内永远不再更新）。行从列表消失（cert-job
 // 完成退役）时退回打开时的行，避免正文瞬间清空。
 const detailTaskId = ref<string | null>(null)
@@ -673,7 +674,6 @@ const detailTone = computed((): 'primary' | 'success' | 'warning' | 'danger' | u
   const st = detailTask.value?.status
   if (st === 'failed') return 'danger'
   if (st === 'running') return 'primary'
-  if (st === 'disabled') return 'warning' // 仅 cert-job 退役行（方案 A：stopped 已退役）
   return undefined
 })
 const isCertJobRow = (id: string): boolean => id.startsWith('cert-job:')
@@ -691,7 +691,7 @@ const fetchCertJobHistory = async (jobId: number): Promise<RunRecord[]> => {
   const end = j.updated_at ? Date.parse(j.updated_at) : NaN
   return [{
     id: j.id, task_id: `cert-job:${j.id}`, family: 'cert-job', trigger: 'queue', status: j.status,
-    // 历史修复：cert_jobs 为 UTC 存储族（RFC3339Z）——映射时经 formatDate 转配置
+    // cert_jobs 为 UTC 存储族（RFC3339Z）——映射时经 formatDate 转配置
     // 时区墙串再入列（fmtTime 对墙串原样渲染）；同页引擎族 last_run 为配置时区
     // 墙串不经此处。duration 用原始 RFC3339 串 Date.parse 差值，不受格式化影响。
     started_at: j.created_at ? formatDate(j.created_at) : '',
@@ -701,7 +701,7 @@ const fetchCertJobHistory = async (jobId: number): Promise<RunRecord[]> => {
   }]
 }
 let detailSeq = 0
-// 历史修复：详情历史加载失败显性化（原静默 catch 呈现为空「运行历史」，与
+// 详情历史加载失败显性化（原静默 catch 呈现为空「运行历史」，与
 // 无记录不可区分）
 const detailHistoryError = ref(false)
 const openDetail = async (row: TaskInfo) => {
@@ -731,7 +731,7 @@ const logsText = ref('')
 const logsTask = ref<TaskInfo | null>(null)
 const logsTaskStorageKey = computed(() => logsTask.value ? `task:${logsTask.value.id}` : 'tasks')
 const logContainerRef = ref<HTMLElement | null>(null)
-// 历史修复：日志加载失败显性化（原静默）；历史修复：轮询收敛
+// 日志加载失败显性化（原静默）；轮询收敛
 // useLogTailPolling 单源——补上本页原缺的后台标签页暂停。
 const logsLoadError = ref(false)
 const taskLogEndpoint = (id: string): string =>
@@ -752,7 +752,7 @@ const logsTail = useLogTailPolling({
   onError: () => { logsLoadError.value = true },
 })
 const openLogs = (row: TaskInfo): void => {
-  // 历史问题：先清空上一任务内容并同步装定时器（start 内部即此序）——不再清空
+  // 先清空上一任务内容并同步装定时器（start 内部即此序）——不再清空
   // 残留，也不会出现「首拉未完成就关闭 → await 后续体又装 interval」的关闭后
   // 永久轮询。
   logsTask.value = row
@@ -772,7 +772,8 @@ onUnmounted(closeLogs)
 
 // ===== 文案 =====
 // 状态列方案 A（2026-10-12 用户裁定）：只承载执行语义——running/idle/failed
-// （cert-job 行另走 certJobStatusLabel 全状态集：queued/waiting_ca/disabled=已禁用）。
+// 三态（cert-job 动态行同口径：退役/终态成功归 idle，证书业务生命周期态
+// 由业务文本承载，不进状态列）。
 // stopped/disabled 已从引擎族状态产出退役（调度语义归开关列 loop_on&&enabled）。
 const statusLabels: Record<string, string> = {
   running: '运行中', idle: '空闲', failed: '失败',
@@ -787,12 +788,12 @@ const kindTag = (k: string): 'primary' | 'success' | 'info' | 'warning' =>
   k === 'scheduled' ? 'primary' : k === 'daemon' ? 'success' : k === 'periodic' ? 'info' : 'warning'
 const kindTagClass = (k: string) => (k === 'periodic' ? 'tm-tag-periodic' : '')
 const isBusinessDrivenTask = (row: TaskInfo) => !!row.business_driven
-const categoryOrder: Record<string, number> = { '安全防护': 0, '证书': 1, '备份': 2, '集群': 3, '系统': 4, '触发': 5 }
+const categoryOrder: Record<string, number> = { '安全防护': 0, '证书': 1, '备份': 2, '集群': 3, '系统': 4 }
 const categoryTagType = (c: string): 'primary' | 'success' | 'warning' | 'info' =>
-  c === '安全防护' ? 'primary' : c === '证书' ? 'success' : c === '备份' ? 'warning' : c === '触发' ? 'info' : 'info'
-// 历史修复（历史）：caddy-restart（Caddy 崩溃自愈 watcher 通道）此前裸显
+  c === '安全防护' ? 'primary' : c === '证书' ? 'success' : c === '备份' ? 'warning' : 'info'
+// caddy-restart（Caddy 崩溃自愈 watcher 通道）此前裸显
 // 英文 token——补中文标签，未列触发值仍回退原文。
-const triggerLabels: Record<string, string> = { manual: '手动', auto: '自动', schedule: '排程', queue: '队列', 'slave-sync': '从节点同步', startup: '启动', 'caddy-restart': 'Caddy重启' }
+const triggerLabels: Record<string, string> = { manual: '手动', auto: '自动', schedule: '排程', queue: '队列', startup: '启动', 'caddy-restart': 'Caddy重启' }
 const triggerLabel = (t: string) => triggerLabels[t] || t || '—'
 // 结果串双源：引擎 task_runs 结果（success/failed/…/skipped）+ cert-job 动态行
 // 的 cert_jobs 状态机（issued/validating/…）——前者未命中时回退 certJobStatusLabel
@@ -803,7 +804,7 @@ const resultTagType = (r: string): 'success' | 'danger' | 'info' | 'warning' =>
 
 // 时间显示（时区基本原则 2026-10-11 用户重申）：task_runs 由引擎按**配置时区**
 // 写入无时区字符串（engineNowStr=CurrentLocation）——原样渲染即配置时区，禁止
-// 再作任何时区换算。历史修复 曾委托 formatDate（其把无时区串强制按 UTC 解析再转
+// 再作任何时区换算。曾委托 formatDate（其把无时区串强制按 UTC 解析再转
 // 配置时区），任务时间全部被 +8h 偏移（22:12→次日 06:12 实证）；formatDate 其余
 // 消费方（audit/cert_jobs/nodes 等 UTC 存储族）不受影响、保持原样。
 const fmtTime = (s?: string) => {
@@ -863,7 +864,6 @@ const fmtDuration = (ms?: number) => {
 .tm-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--tm-c, #9aa0b5); box-shadow: 0 0 6px var(--tm-c, transparent); }
 .tm-status[data-status="running"] { --tm-c: #4f8cff; }
 .tm-status[data-status="failed"] { --tm-c: #f87171; }
-.tm-status[data-status="disabled"] { --tm-c: #62687f; } /* 方案 A：stopped 退役；disabled 仅 cert-job 退役行 */
 .tm-status[data-status="idle"] { --tm-c: #9aa0b5; }
 .tm-tag-periodic {
   --el-tag-bg-color: rgba(0, 168, 168, 0.1);

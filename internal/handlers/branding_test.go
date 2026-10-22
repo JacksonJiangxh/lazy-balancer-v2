@@ -21,7 +21,7 @@ func initBrandingTestDB(t *testing.T) {
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
-		// 历史修复（历史）：同步复位 currentDB，后台循环不得持有已关闭测试库
+		// 同步复位 currentDB，后台循环不得持有已关闭测试库
 		db.SetDB(oldDB)
 	})
 }
@@ -54,7 +54,7 @@ func TestRenderDefaultBlockPage_substitutes_app_name_and_footer_text(t *testing.
 	}
 }
 
-// 2026-09-25 用户裁定（推翻既往历史修复的全宽裁定）：默认拦截页改浅色精美
+// 2026-09-25 用户裁定（推翻既往全宽裁定）：默认拦截页改浅色精美
 // 风，内容卡片限宽居中、不占满页面宽度。锁定限宽 token 与精美化形状
 // （SVG 徽章 + 403 胶囊），防止回退到全宽或纯文字布局。
 func TestRenderDefaultBlockPage_card_width_capped_and_centered(t *testing.T) {
@@ -310,7 +310,7 @@ func TestLoadBrandingConfig_memorySnapshotDetectsFileChange(t *testing.T) {
 	}
 
 	// 删除(运行期瞬态窗口):保旧值(2026-09-11 裁定——重启重建负责重置,
-	// 历史问题;半截写/删除同属「文件暂不可用」,不闪回默认)。
+	// ;半截写/删除同属「文件暂不可用」,不闪回默认)。
 	os.Remove(path)
 	if cfg := loadBrandingConfig(dir); cfg.AppName != "Beta" {
 		t.Fatalf("after remove: app_name=%q, want keep-last-good Beta", cfg.AppName)
@@ -499,7 +499,7 @@ func TestBrandingHotReload_touchNoChurn(t *testing.T) {
 	}
 }
 
-// 历史问题：公开无鉴权 GetBranding 端点的失败分支不再每请求重读+记日志——
+// 公开无鉴权 GetBranding 端点的失败分支不再每请求重读+记日志——
 // 60s 探测/日志限流；文件恢复后下一次访问立即读到新值（last-known-good 不变）。
 func TestLoadBrandingConfig_failureProbeThrottledAndRecovers(t *testing.T) {
 	resetBrandingStore()
@@ -564,7 +564,7 @@ func TestLoadBrandingConfig_failureProbeThrottledAndRecovers(t *testing.T) {
 	}
 }
 
-// 历史问题：内置页 id 被自定义页占用时，播种 UPDATE 不得改写该行
+// 内置页 id 被自定义页占用时，播种 UPDATE 不得改写该行
 // （INSERT OR IGNORE 冲突后原实现仍按 id 改写自定义内容/标志）。
 func TestSeedDefaultBlockPage_skipsWhenBuiltinIDOccupiedByCustomPage(t *testing.T) {
 	initBrandingTestDB(t)

@@ -1,4 +1,4 @@
-// 用户名/密码前端策略单源（历史问题）：与后端 validateUsernamePolicy /
+// 用户名/密码前端策略单源：与后端 validateUsernamePolicy /
 // validatePasswordPolicy（internal/handlers/auth.go）同口径——用户管理、
 // 首次设置管理员、个人资料三处入口不得各写字符串与正则。
 //

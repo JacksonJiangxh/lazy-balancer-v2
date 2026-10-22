@@ -50,7 +50,7 @@ func taskMonitorRouter() (*gin.Engine, *Handlers) {
 	return r, h
 }
 
-// 历史问题：历史端点与 trigger/toggle 同口径做注册存在性门；
+// 历史端点与 trigger/toggle 同口径做注册存在性门；
 // 已注册但零历史的任务仍返回 200 + 空数组。
 func TestGetSystemTaskHistory_checksTaskExistence(t *testing.T) {
 	newBackupTestHandlers(t)
@@ -108,7 +108,7 @@ func TestListSystemTasks_allFamiliesPresent(t *testing.T) {
 	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
 	}
-	// 历史问题：任务视图只承载 loop_on，不暴露诊断字段 enabled。
+	// 任务视图只承载 loop_on，不暴露诊断字段 enabled。
 	if strings.Contains(resp.Body.String(), `"enabled"`) {
 		t.Error("任务列表 JSON 不应含 enabled 键（调度语义只由 loop_on 表达）")
 	}
@@ -244,7 +244,7 @@ func TestToggleSystemTask_threatBusinessDrivenReadOnly(t *testing.T) {
 }
 
 // cancel：未运行 → 409；不可取消族 → 409（引擎 Cancel 返 false——handler
-// 不再有 400 分支，历史问题 回退 switch 已删，无引擎时统一 503）。
+// 不再有 400 分支，回退 switch 已删，无引擎时统一 503）。
 func TestCancelSystemTask_semantics(t *testing.T) {
 	initTaskEngineForTest(t)
 	newBackupTestHandlers(t)
@@ -315,7 +315,7 @@ func TestToggleSystemTask_businessDrivenTasksReadOnly(t *testing.T) {
 	}
 }
 
-// 历史问题：四个任务写端点的状态码统一——引擎未初始化 503、任务不存在 404
+// 四个任务写端点的状态码统一——引擎未初始化 503、任务不存在 404
 // （语义拒绝仍 400，见各端点既有用例）。
 func TestTaskWriteHandlers_unifiedStatusCodes(t *testing.T) {
 	initTaskEngineForTest(t)
@@ -392,7 +392,7 @@ func TestSystemTaskLogPath_certJobAndFallbackShapes(t *testing.T) {
 	}
 }
 
-// 历史问题：任务日志只读尾窗；偏移起点的残段（含整窗无换行的
+// 任务日志只读尾窗；偏移起点的残段（含整窗无换行的
 // 巨型行）统一经 tailLogWindow 丢弃，小文件保持原样。
 func TestGetSystemTaskLogs_boundedTailDropsPartialFirstLine(t *testing.T) {
 	dir := t.TempDir()
@@ -532,7 +532,7 @@ func TestGetSystemTaskLogs_rotationBudgetUsesConcatenatedTail(t *testing.T) {
 	})
 }
 
-// 历史问题：普通任务写侧只保留 1 份轮转副本，读侧不得按证书任务
+// 普通任务写侧只保留 1 份轮转副本，读侧不得按证书任务
 // 扫描 .1～.5；仅最近 .1 前置到活动日志，避免读取不存在/越权保留代。
 func TestGetSystemTaskLogs_includesOnlyLatestOrdinaryRotation(t *testing.T) {
 	dir := t.TempDir()
@@ -615,7 +615,7 @@ func TestGetSystemTaskLogs_rotationContentStaysWithinTailBudget(t *testing.T) {
 	}
 }
 
-// 历史问题：并发双击下「触发」审计行数必须等于实际 manual task_runs 行数——
+// 并发双击下「触发」审计行数必须等于实际 manual task_runs 行数——
 // 审计只在 Trigger 成功后记录，CAS 落败者不得留下孤儿「触发」行。
 func TestTriggerSystemTask_triggerAuditMatchesManualRuns(t *testing.T) {
 	initTaskEngineForTest(t)

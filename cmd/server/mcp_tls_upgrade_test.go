@@ -1,6 +1,6 @@
 package main
 
-// 历史问题-1 真实 TLS 升级链联测：明文 tools/call → 真实
+// 真实 TLS 升级链联测：明文 tools/call → 真实
 // newHTTPRedirectMux 302（此前所有测试只 mock 301，给了假绿）→ MCP 内部
 // 转发按原方法/原请求体重放 https。重放集合缺 302 时本测试拿到 {} 错误。
 

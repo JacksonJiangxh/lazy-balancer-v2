@@ -1,10 +1,10 @@
 package taskengine
 
-// 历史 EnabledFn 调度门补全钉测试（历史问题）：tick 的 Scheduled/Periodic
+// 历史 EnabledFn 调度门补全钉测试：tick 的 Scheduled/Periodic
 // 分支此前只认 loopEnabled/running/角色门——EnabledFn 仅进元数据展示
 // （Enabled 列），业务关时调度面照常投递（空转落行）。本文件钉三形状：
 // ① EnabledFn=false 不调度（零 task_runs 零执行）；② 恢复 true 后下一 tick
-// 到期即跑（节拍不被关闭期推进——与角色门 历史问题-02 同款）；③ 在途 Run 不被
+// 到期即跑（节拍不被关闭期推进——与角色门 同款）；③ 在途 Run 不被
 // EnabledFn 杀（门只作用于调度判定，当前轮跑完，下一轮才停）。
 
 import (
@@ -42,7 +42,7 @@ func TestEngine_EnabledFnFalseSkipsPeriodicScheduling(t *testing.T) {
 		t.Fatal("EnabledFn=false 期间 Run 体不得执行")
 	default:
 	}
-	// 形状②：业务开——恢复后下一 tick 到期即跑（不推进节拍，历史问题-02 同款）
+	// 形状②：业务开——恢复后下一 tick 到期即跑（不推进节拍， 同款）
 	enabled.Store(true)
 	select {
 	case <-ran:

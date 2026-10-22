@@ -93,7 +93,7 @@ func TestDNSPod_Validate_cleanupUsesIndependentBudget(t *testing.T) {
 
 	provider := &DNSPod{}
 	credentials := map[string]string{"auth_mode": "dnspod", "app_id": "123", "app_token": "abc"}
-	if err := provider.Validate(credentials, "example.com"); err != nil {
+	if err := provider.Validate(context.Background(), credentials, "example.com"); err != nil {
 		t.Fatalf("validate: %v（清理失败不得报假失败）", err)
 	}
 	if !fake.hasCleanupDead {
@@ -122,11 +122,11 @@ func TestDNSPod_Validate_usesRandomProbeValue(t *testing.T) {
 
 	provider := &DNSPod{}
 	credentials := map[string]string{"auth_mode": "dnspod", "app_id": "123", "app_token": "abc"}
-	if err := provider.Validate(credentials, "example.com"); err != nil {
+	if err := provider.Validate(context.Background(), credentials, "example.com"); err != nil {
 		t.Fatalf("first validate: %v", err)
 	}
 	first := fake.probeValue
-	if err := provider.Validate(credentials, "example.com"); err != nil {
+	if err := provider.Validate(context.Background(), credentials, "example.com"); err != nil {
 		t.Fatalf("second validate: %v", err)
 	}
 	second := fake.probeValue
@@ -138,5 +138,47 @@ func TestDNSPod_Validate_usesRandomProbeValue(t *testing.T) {
 	}
 	if fake.probeFVQDN != "_acme-challenge.lb-test.example.com." {
 		t.Fatalf("probe FQDN=%q", fake.probeFVQDN)
+	}
+}
+
+// canceledProbeProvider 模拟「客户端断开后 Present 立即感知取消」的传输层。
+type canceledProbeProvider struct {
+	presentCtxErr error
+	cleanupCalled bool
+}
+
+func (p *canceledProbeProvider) Present(ctx context.Context, _, _, _ string, _ int) error {
+	p.presentCtxErr = ctx.Err()
+	return ctx.Err()
+}
+
+func (p *canceledProbeProvider) CleanUp(context.Context, string, string) error {
+	p.cleanupCalled = true
+	return nil
+}
+
+// Given：调用方请求 ctx 已取消（客户端断开/请求超时）。
+// When：保存前验证进入 Present。
+// Then：Present 收到的 ctx 必须继承请求取消并立即失败——原实现从
+// context.Background 派生预算，断开后仍会跑满 30s。
+func TestDNSPod_Validate_honorsRequestContextCancellation(t *testing.T) {
+	fake := &canceledProbeProvider{}
+	originalFactory := newDNSProviderFromCredentials
+	newDNSProviderFromCredentials = func(string) (dnsprovider.Provider, error) { return fake, nil }
+	t.Cleanup(func() { newDNSProviderFromCredentials = originalFactory })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	provider := &DNSPod{}
+	credentials := map[string]string{"auth_mode": "dnspod", "app_id": "123", "app_token": "abc"}
+	err := provider.Validate(ctx, credentials, "example.com")
+	if err == nil {
+		t.Fatal("请求 ctx 已取消时必须立即失败")
+	}
+	if !strings.Contains(err.Error(), "DNS 写入测试失败") {
+		t.Fatalf("error=%v, want DNS 写入测试失败（取消归因到写入探测）", err)
+	}
+	if fake.presentCtxErr == nil {
+		t.Fatal("Present 收到的 ctx 未继承请求取消（客户端断开仍会跑满预算）")
 	}
 }

@@ -57,7 +57,7 @@ var configFileKeys = map[string]struct{}{
 }
 
 // minJWTSecretBytes 是 JWT/OIDC state 签名密钥的最短长度（HS256 强度下限）。
-// 文件通道（loadOrCreateJWTSecret）与环境变量通道共用本阈值——历史问题-2：旧实现
+// 文件通道（loadOrCreateJWTSecret）与环境变量通道共用本阈值——旧实现
 // 只校验文件通道，JWT_SECRET=abc 这类 3 字节密钥可直接绕过。
 const minJWTSecretBytes = 32
 
@@ -118,18 +118,18 @@ func Load(path string) *Config {
 	if path != "" {
 		data, err := os.ReadFile(path)
 		if err != nil {
-			// 历史修复：配置文件读取失败必须可见（与下方解析失败分支对称）——静默回落
+			// 配置文件读取失败必须可见（与下方解析失败分支对称）——静默回落
 			// 默认值会让「指定了 -config 却没生效」排查无门。
 			log.Printf("config: failed to read config file %s (%v); using defaults", path, err)
 		} else {
 			// Try to parse as JSON (simple approach)
 			var fileCfg map[string]interface{}
 			if jerr := json.Unmarshal(data, &fileCfg); jerr != nil {
-				// 历史问题：文件存在但解析失败必须可见——静默回落
+				// 文件存在但解析失败必须可见——静默回落
 				// 默认值会让「改了配置没生效」排查无门。
 				log.Printf("config: file %s exists but failed to parse (%v); using defaults", path, jerr)
 			} else {
-				// 历史问题（历史）：未知键必须可见——支持键之外的字段不会生效。
+				// 未知键必须可见——支持键之外的字段不会生效。
 				unsupported := make([]string, 0, len(fileCfg))
 				for key := range fileCfg {
 					if _, supported := configFileKeys[key]; !supported {
@@ -170,8 +170,8 @@ func Load(path string) *Config {
 					cfg.StaticDir = v
 				}
 				if v, ok := fileCfg["port"].(float64); ok {
-					// 历史问题-7（历史）：浮点截断不得静默——8000.9→8000 会让
-					// 「配置未生效」无从排查。历史修复：与
+					// 浮点截断不得静默——8000.9→8000 会让
+					// 「配置未生效」无从排查。与
 					// metrics_interval 同口径先判界再转换——1e300 之类巨值直接
 					// float→int 是实现相关结果（实测回绕成 MaxInt64），先转换
 					// 再回退会产生诡异日志与一次无意义的越界整数。
@@ -192,7 +192,7 @@ func Load(path string) *Config {
 					cfg.CaddyMetricsURL = v
 				}
 				if v, ok := fileCfg["metrics_interval"].(float64); ok {
-					// 历史问题-4：≤0 与超范围都必须可见（旧实现 0/负值静默回落
+					// ≤0 与超范围都必须可见（旧实现 0/负值静默回落
 					// 默认 30s；巨值 float→int 转换是未定义语义，可能回绕成负数
 					// 再被静默抬到 5s 高频采集）。先判界再转换。
 					switch {
@@ -202,7 +202,7 @@ func Load(path string) *Config {
 						log.Printf("config: metrics_interval %v above maximum %d; clamped to %d", v, metricsIntervalMax, metricsIntervalMax)
 						cfg.MetricsInterval = metricsIntervalMax
 					default:
-						// 历史问题-7（历史）：下限钳位与截断均留痕（此前 1 被静默
+						// 下限钳位与截断均留痕（此前 1 被静默
 						// 抬到 5、1.9 被静默截断——看似「配置未生效」）。
 						if v < 5 {
 							log.Printf("config: metrics_interval %v below minimum 5; clamped to 5", v)
@@ -219,7 +219,7 @@ func Load(path string) *Config {
 	// 自动备份目录(v2.3.x):默认挂 DataDir 同级 backup(容器 /app/data → /app/backup，
 	// 本地 ./data → ./backup)；BACKUP_DIR env 可覆盖。计算在配置文件解析之后——
 	// data_dir 可被文件覆盖，目录锚点必须取最终值。
-	// 历史问题：data_dir/backup_dir 进入投影与 @ipListFast 白名单前必须是绝对
+	// data_dir/backup_dir 进入投影与 @ipListFast 白名单前必须是绝对
 	// 路径；相对路径会让 IPListDataDir 越出 AllowedPathPrefix，整份配置被拒。
 	if abs, err := filepath.Abs(cfg.DataDir); err == nil {
 		cfg.DataDir = abs
@@ -234,16 +234,16 @@ func Load(path string) *Config {
 	if cfg.JWTSecret == "" {
 		cfg.JWTSecret = loadOrCreateJWTSecret(cfg.DataDir)
 	} else if reason := jwtSecretWeakness(cfg.JWTSecret); reason != "" {
-		// 历史问题-2：环境变量通道此前完全不校验长度（文件通道强制 ≥32 并再生）。
+		// 环境变量通道此前完全不校验长度（文件通道强制 ≥32 并再生）。
 		// env 是运维显式输入，不自动替换（替换会让所有令牌静默失效），只告警
-		// 可见。历史修复：判据增加熵下限——纯长度达标但形态可预测（空格/重复
+		// 可见。判据增加熵下限——纯长度达标但形态可预测（空格/重复
 		// 字节）的密钥同样告警。
 		log.Printf("config: JWT_SECRET 环境变量强度不足——%s；JWT HS256 与 OIDC state 可被离线伪造，请改用 ≥%d 字节的高熵随机密钥", reason, minJWTSecretBytes)
 	}
 
-	// 历史问题：端口范围校验——port=0 会绑随机端口、>65535 只在
+	// 端口范围校验——port=0 会绑随机端口、>65535 只在
 	// 监听时才报错，均早失败为佳。
-	// 历史问题（历史）：校验对称补齐（metrics_interval 有钳位而 port 无）
+	// 校验对称补齐（metrics_interval 有钳位而 port 无）
 	if cfg.Port < 1 || cfg.Port > 65535 {
 		log.Printf("config: invalid port %d (config file port field); falling back to 8000", cfg.Port)
 		cfg.Port = 8000
@@ -266,14 +266,14 @@ func loadOrCreateJWTSecret(dataDir string) string {
 			return string(data)
 		}
 		if len(data) > 0 {
-			// 历史修复（历史）：非空弱密钥的覆写必须可见——此前静默
+			// 非空弱密钥的覆写必须可见——此前静默
 			// 重生成，旧令牌全部失效且零日志信号；与下方目录/写失败分支
 			// 及端口回退的可见性准则对齐。空文件等同未初始化，不告警。
-			// 历史修复：原因含长度或熵两类（"长度过短"/"熵不足"）。
+			// 原因含长度或熵两类（"长度过短"/"熵不足"）。
 			log.Printf("JWT 密钥文件 %s 内容%s，已重新生成（旧令牌将失效）", secretPath, jwtSecretWeakness(string(data)))
 		}
 	} else if !os.IsNotExist(err) {
-		// 历史问题-5（历史）：文件存在但读取失败（瞬时 IO/ACL 形态）
+		// 文件存在但读取失败（瞬时 IO/ACL 形态）
 		// 此前静默落入重生成——写入成功则全部 JWT 失效且零日志，是同文件
 		// 唯一未留痕分支；ENOENT（首次启动）不告警。
 		log.Printf("JWT 密钥文件 %s 读取失败（%v），将重新生成（旧令牌将失效）", secretPath, err)
@@ -284,7 +284,7 @@ func loadOrCreateJWTSecret(dataDir string) string {
 	}
 	secret := hex.EncodeToString(buf)
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
-		// 历史问题：目录创建失败必须可见——此前静默跳过写入，JWT 密钥每次启动
+		// 目录创建失败必须可见——此前静默跳过写入，JWT 密钥每次启动
 		// 随机重生成（旧令牌全部失效）且零日志信号；与下方写失败分支对称。
 		log.Printf("JWT 密钥目录 %s 创建失败（重启后令牌将失效）: %v", dataDir, err)
 	} else if err := os.WriteFile(secretPath, []byte(secret), 0600); err != nil {

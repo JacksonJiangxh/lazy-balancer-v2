@@ -34,7 +34,7 @@ func newAutoBackupTestHandlers(t *testing.T) *Handlers {
 	return h
 }
 
-// wireAutoBackupEngineForTest 历史修复（历史后裁定）：/auto-backup/run 经引擎
+// wireAutoBackupEngineForTest：/auto-backup/run 经引擎
 // RunSync——测试环境装配引擎+执行器（镜像 main.go 注入形态）。
 func wireAutoBackupEngineForTest(t *testing.T, h *Handlers) {
 	t.Helper()
@@ -51,7 +51,7 @@ func wireAutoBackupEngineForTest(t *testing.T, h *Handlers) {
 	})
 }
 
-// waitForAutoBackupCondition 轮询等待后台备份/审计落行（历史问题 异步触发后，
+// waitForAutoBackupCondition 轮询等待后台备份/审计落行（异步触发后，
 // 响应返回时后台任务可能尚未完成）。
 func waitForAutoBackupCondition(t *testing.T, timeout time.Duration, condition func() bool) {
 	t.Helper()
@@ -301,15 +301,15 @@ func TestLoadAutoBackupKeepSetting_outOfRangeFallsBack(t *testing.T) {
 		if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_keep=? WHERE id=1`, stored); err != nil {
 			t.Fatal(err)
 		}
-		if got := loadAutoBackupKeepSetting(); got != 7 {
-			t.Fatalf("stored keep=%d loaded=%d, want fallback 7", stored, got)
+		if got, known := loadAutoBackupKeepSetting(); !known || got != 7 {
+			t.Fatalf("stored keep=%d loaded=%d known=%v, want fallback 7 (known)", stored, got, known)
 		}
 	}
 	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_keep=30 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
-	if got := loadAutoBackupKeepSetting(); got != 30 {
-		t.Fatalf("stored keep=30 loaded=%d, want 30", got)
+	if got, known := loadAutoBackupKeepSetting(); !known || got != 30 {
+		t.Fatalf("stored keep=30 loaded=%d known=%v, want 30 (known)", got, known)
 	}
 }
 
@@ -524,7 +524,7 @@ func TestAutoBackupSettings_returnsSettingsAndRowsDesc(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：GET /settings/auto-backup 的 last_run 此前恒 null——
+// GET /settings/auto-backup 的 last_run 此前恒 null——
 // auto_backup_last_run 扫描进 sql.NullString 后零消费（lastRunValue 零赋值）。
 // 钉：库中有水位线时响应面回传同值；库中 NULL 时保持 null 形态（不写空串）。
 func TestAutoBackupSettings_returnsLastRun(t *testing.T) {
@@ -575,7 +575,7 @@ func TestRunAutoBackupNow_endpointRunsAndRespondsRow(t *testing.T) {
 	h := newAutoBackupTestHandlers(t)
 	wireAutoBackupEngineForTest(t, h)
 	response := serveAutoBackupJSON(t, h, http.MethodPost, "/auto-backup/run", "/auto-backup/run", "", h.RunAutoBackupNow)
-	// 历史问题：异步接受（202）+ 后台执行，结果落 auto_backups。
+	// 异步接受（202）+ 后台执行，结果落 auto_backups。
 	if response.Code != http.StatusAccepted {
 		t.Fatalf("status=%d body=%s, want 202", response.Code, response.Body.String())
 	}
@@ -626,7 +626,7 @@ func TestDeleteAutoBackup_removesFileAndRow(t *testing.T) {
 }
 
 func TestDeleteAutoBackup_dbFailureReturns500(t *testing.T) {
-	// Given 主节点 + auto_backups 表不可用（DB 故障形态）——历史修复（历史）：
+	// Given 主节点 + auto_backups 表不可用（DB 故障形态）——
 	// DB 故障与「备份不存在」不得混同为 404（排障方向误导）；ErrNoRows 404、
 	// 其余响亮 500（dbQueryNotFound 分判，与 GetCurrentUser/requireAutoBackupMaster
 	// 已立先例同口径）。
@@ -811,7 +811,7 @@ func TestRunAutoBackupOnce_concurrentRunRejected(t *testing.T) {
 	}
 }
 
-// 历史问题(历史):RunAutoBackupOnce 成功落行后必须接线内务裁剪——
+// RunAutoBackupOnce 成功落行后必须接线内务裁剪——
 // keep=1 时连续两次执行仅保留最新 1 个 success(文件+行同删);failed 行按
 // autoBackupFailedRowsKeep=20 上限保留(前端文案「失败记录另保留最近 20 条」)。
 func TestRunAutoBackupOnce_prunesToKeepSetting(t *testing.T) {
@@ -855,7 +855,7 @@ func TestRunAutoBackupOnce_prunesToKeepSetting(t *testing.T) {
 	}
 }
 
-// 历史修复(历史):裁剪时文件删除失败(非 ErrNotExist)必须保留 DB 行
+// 裁剪时文件删除失败(非 ErrNotExist)必须保留 DB 行
 // 下轮重试——此前行随 warn 一并删除,残留文件成孤儿永不再裁剪。
 func TestPruneAutoBackups_fileRemovalOutcomes(t *testing.T) {
 	// Given:三个 success 行——同名非空目录(Remove 返回 ENOTEMPTY)/文件缺失/
@@ -920,7 +920,7 @@ func TestRunAutoBackupNow_auditOperatorIsCurrentUser(t *testing.T) {
 	router.ServeHTTP(response, request)
 
 	// Then: 202 接受且后台完成后「手动备份」审计行操作人为 operator-zhang
-	// （修复前恒 system；历史问题 起响应先返回，审计行需等待后台执行）。
+	// （修复前恒 system；自此响应先返回，审计行需等待后台执行）。
 	if response.Code != http.StatusAccepted {
 		t.Fatalf("status=%d body=%s, want 202", response.Code, response.Body.String())
 	}
@@ -933,7 +933,7 @@ func TestRunAutoBackupNow_auditOperatorIsCurrentUser(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：备份目录含私钥/凭证明文文件，目录权限必须 0700
+// 备份目录含私钥/凭证明文文件，目录权限必须 0700
 // （MkdirAll 建目录时生效；指向已存在目录时为 no-op，故指向不存在的子目录）。
 func TestRunAutoBackupOnce_backupDirPerm0700(t *testing.T) {
 	h := newAutoBackupTestHandlers(t)
@@ -953,7 +953,7 @@ func TestRunAutoBackupOnce_backupDirPerm0700(t *testing.T) {
 
 // backupListFailingConnector：global_config 设置行查询成功返回缺省值，
 // auto_backups 列表查询「语句成功、迭代即失败」——注入 AutoBackupSettings
-// 备份列表循环的 rows.Err() 故障（历史问题-⑫，历史问题 口径）。
+// 备份列表循环的 rows.Err() 故障。
 type backupListFailingConnector struct{}
 
 func (backupListFailingConnector) Connect(context.Context) (driver.Conn, error) {
@@ -1042,7 +1042,7 @@ func TestAutoBackupSettings_backupListIterationFailureReturns500(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：手动触发必须异步——慢备份（>60s 桩）不阻塞响应；
+// 手动触发必须异步——慢备份（>60s 桩）不阻塞响应；
 // 双击/并发触发 409。修复前同步 RunSync 在 main.go WriteTimeout(60s) 下
 // 会被截断客户端连接，且第二个请求排队等待。
 func TestRunAutoBackupNow_asyncReturnsBeforeSlowBackupCompletes(t *testing.T) {
@@ -1105,7 +1105,7 @@ func TestNextAutoBackupFilename_statFailureIsNotAvailable(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：文件名分配器在 200 个变体全冲突时必须报错，
+// 文件名分配器在 200 个变体全冲突时必须报错，
 // 不得回退到基础名（可能已存在）——否则写盘会覆盖既有备份。
 func TestNextAutoBackupFilename_errorsWhenAllVariantsTaken(t *testing.T) {
 	h := newAutoBackupTestHandlers(t)
@@ -1134,10 +1134,10 @@ func TestNextAutoBackupFilename_errorsWhenAllVariantsTaken(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：注释承诺「取消不落 failed 行」，但写盘阶段
+// 注释承诺「取消不落 failed 行」，但写盘阶段
 // （services.WriteAutoBackupFileSynced 无 ctx）出错时直接走 fail() —— 取消 +
 // 写盘错误同时发生会落 failed 行与「备份失败」审计，而 task_runs 记 cancelled。
-// 写盘错误归一 helper：ctx 已取消时必须按取消返回（与 历史问题-10 同口径）。
+// 写盘错误归一 helper：ctx 已取消时必须按取消返回（与 同口径）。
 func TestWriteAutoBackupPayload_canceledContextReturnsCancelError(t *testing.T) {
 	target := filepath.Join(t.TempDir(), "missing-subdir", "x.lbbak")
 

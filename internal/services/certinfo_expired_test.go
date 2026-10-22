@@ -1,6 +1,6 @@
 package services
 
-// 历史修复(历史):ACME 规则证书信息对「已过期证书」不得误报「尚未签发
+// ACME 规则证书信息对「已过期证书」不得误报「尚未签发
 // 或不存在」——cert_jobs 存在 PEM 但已过期时按 expired 呈现(解析真实
 // NotAfter),运维可从规则列表直接看到过期状态。
 
@@ -71,9 +71,9 @@ func TestGetRuleCertInfo_reportsExpiredACMECert(t *testing.T) {
 	}
 }
 
-// ---- 历史（历史问题）----
+// ---- 回归钉 ----
 
-// 历史问题：GetRuleCertInfo 的读故障必须上抛（handler 500），不得折叠成
+// GetRuleCertInfo 的读故障必须上抛（handler 500），不得折叠成
 // 「无证书信息」假成功；规则不存在仍是 (nil, nil)。
 func TestGetRuleCertInfo_propagates_database_errors(t *testing.T) {
 	newClusterTestService(t)

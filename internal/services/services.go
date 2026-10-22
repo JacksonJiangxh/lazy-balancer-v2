@@ -24,7 +24,7 @@ var (
 	prometheusLatencyBucketPattern = regexp.MustCompile(`caddy_http_request_duration_seconds_bucket\{[^}]*le="([^"]+)"[^}]*\}\s+(\S+)`)
 	prometheusBlockedPattern       = regexp.MustCompile(`lazybalancer_security_blocked_total\{[^}]*rule="([^"]+)"[^}]*\}\s+(\S+)`)
 	prometheusRuleRequestsPattern  = regexp.MustCompile(`lazybalancer_requests_total\{[^}]*rule="([^"]+)"[^}]*\}\s+(\S+)`)
-	// 历史问题(历史问题,历史):client_golang MakeLabelPairs 字典序排序
+	// client_golang MakeLabelPairs 字典序排序
 	// (value.go:235)——真实 exposition 是 class/direction 在前、rule 在后,
 	// 原正则要求 rule 在前恒不匹配(状态码/字节系列恒 0,已随 v2.2.10 发布)。
 	prometheusRuleStatusPattern = regexp.MustCompile(`lazybalancer_request_status_total\{[^}]*class="([^"]+)"[^}]*rule="([^"]+)"[^}]*\}\s+(\S+)`)
@@ -63,7 +63,7 @@ func (m *MetricsService) Start() {
 	defer ticker.Stop()
 	defer cleanupTicker.Stop()
 	m.cleanupHistory()
-	// 历史修复（历史）：启动即采集一轮——曾首 collect 等首个 interval
+	// 启动即采集一轮——曾首 collect 等首个 interval
 	// （默认 30s），重启后面板首屏 30s 全零；与 cleanupHistory 同点对称。
 	m.collect()
 
@@ -83,14 +83,14 @@ func (m *MetricsService) Stop() {
 	m.stopOnce.Do(func() { close(m.stopCh) })
 }
 
-// 历史问题：metrics 采集失败族状态转换日志。30s 采集周期下，持久性失败
+// metrics 采集失败族状态转换日志。30s 采集周期下，持久性失败
 // （端点不可达、非 200、body 中段读取失败、body 超限、解析/入库失败）逐
 // tick 裸记日志约 2880 行/天同一消息。改为状态转换口径：ok→fail 记一次
 // （warn）、fail→ok 恢复记一次（info）、持续同一状态静默。状态按失败类别
 // （key）独立跟踪：前置类别失败（如 Get 失败）不评估后续类别，其恢复标记
 // 只在后续 tick 实际通过该检查时才落，避免「仍失败却记恢复」。map 有界：
-// 生产类别集固定 7 个（历史修复 增补 body 中段读取失败类别——原枚举漏掉的
-// 唯一零信号成员），清扫上限（历史问题 同模式）仅为防御动态键场景——超上限整体
+// 生产类别集固定 7 个（增补 body 中段读取失败类别——原枚举漏掉的
+// 唯一零信号成员），清扫上限仅为防御动态键场景——超上限整体
 // 重置，各类别至多重复放行一条，无数据影响。
 var (
 	metricsStateMu     sync.Mutex
@@ -104,7 +104,7 @@ const metricsStateEvictCap = 64
 // ok→fail 返回 "warn"；fail→ok 返回 "info"；状态不变返回 ""。
 // 初始状态视为 ok：首次失败记一次 warn，首次成功静默（无恢复可记）。
 //
-// 历史问题：状态机本体已是通用实现（logStateTransition），metrics 采集族与
+// 状态机本体已是通用实现（logStateTransition），metrics 采集族与
 // 低频巡检循环（时区刷新/运行日志尺寸刷新）共用——持久失败的下行 SQL 在
 // 30s tick 下不再各打 2880 行/天同一消息。键空间按调用方前缀隔离。
 func logMetricsStateTransition(key string, failed bool) string {
@@ -148,10 +148,10 @@ const (
 // 序列片段——该路由无 reverse_proxy，其序列不含任何上游语义。
 const geoipPassSeriesMarker = `handler="http.handlers.geoip2region"`
 
-// filterGeoipPassSeries 剔除 geoip 透传路由注入的序列行（历史修复 单源纯函数）。
+// filterGeoipPassSeries 剔除 geoip 透传路由注入的序列行。
 // geoip 规则的请求先过独立透传路由再过主/路径路由，两条路由各自注入 metrics
-// ——同一请求的请求数/状态码/字节量在全局与 历史修复 全部翻倍。
-// 历史修复（历史）：Builder 逐行条件写入单副本（曾 Split+Join——行切片
+// 同一请求的请求数/状态码/字节量在全局与全部翻倍。
+// Builder 逐行条件写入单副本（曾 Split+Join——行切片
 // ~24B/行 + 16MB 拼接副本，与「拷贝只做一次」口径矛盾）。分隔符仅在保留行
 // 之间落盘：输出与「按 \n 切分后丢弃命中行、再用 \n 连接」逐字节等价，
 // 含尾部空行（"a\n" → 保留行的切分为 ["a",""]）与被删末行两形态。
@@ -204,8 +204,8 @@ func (m *MetricsService) collect() {
 		Logf("info", "metrics endpoint recovered")
 	}
 
-	// 历史问题 读取上限对齐 overviewmetrics 的 16MB 探测模式
-	//（历史问题同类）——规则数×状态码×host 序列的基数爆炸在 30s 采集周期里
+	// 读取上限对齐 overviewmetrics 的 16MB 探测模式
+	//规则数×状态码×host 序列的基数爆炸在 30s 采集周期里
 	// 可分配大块内存，超限按解析失败跳过本样本。
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20+1))
 	if err != nil {
@@ -229,7 +229,7 @@ func (m *MetricsService) collect() {
 		Logf("info", "metrics endpoint body back under 16MB cap")
 	}
 
-	// string 拷贝只做一次——parse 与 历史修复 store 共用同一
+	// string 拷贝只做一次——parse 与 store 共用同一
 	// text，此前两次 string(body) 最坏双拷贝 32MB（16MB body ×2）。
 	text := string(body)
 	// geoip 规则的请求先过独立透传路由（首处理器 http.handlers.geoip2region，
@@ -497,7 +497,7 @@ func parseRuleLabelMetrics(text string) (map[string]*ruleLabelAggregate, error) 
 		if err != nil {
 			return nil, fmt.Errorf("parse rule status %q: %w", m[3], err)
 		}
-		agg := get(m[2]) // 历史问题:组序对调后 m[2]=rule, m[1]=class
+		agg := get(m[2]) // 组序对调后 m[2]=rule, m[1]=class
 		switch m[1] {
 		case "2xx":
 			agg.status2xx += v
@@ -514,7 +514,7 @@ func parseRuleLabelMetrics(text string) (map[string]*ruleLabelAggregate, error) 
 		if err != nil {
 			return nil, fmt.Errorf("parse rule bytes %q: %w", m[3], err)
 		}
-		agg := get(m[2]) // 历史问题:组序对调后 m[2]=rule, m[1]=direction
+		agg := get(m[2]) // 组序对调后 m[2]=rule, m[1]=direction
 		if m[1] == "in" {
 			agg.bytesIn += v
 		} else {
@@ -558,7 +558,7 @@ func (m *MetricsService) storePerHostMetrics(text string) error {
 }
 
 func (m *MetricsService) cleanupHistory() {
-	// 2026-09-15 用户裁定:指标历史固定保留最近 7 天(覆盖 历史修复 复用「日志
+	// 2026-09-15 用户裁定:指标历史固定保留最近 7 天(覆盖复用「日志
 	// 保留」的裁定——用户明确指标类数据独立于日志保留配置);实时接口
 	// (/metrics/*)不受影响,仅历史图窗口收敛到 7 天。
 	const retentionDays = 7
@@ -597,7 +597,7 @@ func (m *MetricsService) refreshDBOverviewMetrics() {
 	activeRules, totalRules, onlineNodes := m.overview.ActiveRules, m.overview.TotalRules, m.overview.OnlineNodes
 	m.mu.RUnlock()
 
-	// 历史 历史修复: 错误必须显式处理，否则 DB 故障时 overview 三项指标静默归零。
+	// 错误必须显式处理，否则 DB 故障时 overview 三项指标静默归零。
 	// 查询失败时保留既有 overview 行中的前值（与 onlineNodes 分支同口径）。
 	if err := database.QueryRow("SELECT COUNT(*) FROM lb_rules WHERE enabled = 1").Scan(&activeRules); err != nil {
 		Logf("error", "updateOverview: query active rules failed: %v (keeping previous value=%d)", err, activeRules)

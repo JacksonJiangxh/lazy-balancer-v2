@@ -33,7 +33,7 @@ var autoBackupRunMu sync.Mutex
 // autoBackupFailedRowsKeep:failed 行保留上限（内务裁剪，与 keep 无关）。
 const autoBackupFailedRowsKeep = 20
 
-// HH:MM 校验统一走 services.ValidScheduleHHMM（历史修复：
+// HH:MM 校验统一走 services.ValidScheduleHHMM
 // 原本地正则与调度侧解析函数双实现，已收敛）
 
 // autoBackupSafeFilename:文件名一律取自 DB 行，文件操作必须限定在备份目录
@@ -75,7 +75,7 @@ func decodeAutoBackupSectionsRaw(raw sql.NullString) ([]string, error) {
 		return nil, errors.New("备份范围不能为空数组")
 	}
 	normalized := normalizeBackupSectionKeys(sections)
-	// 历史问题：未知分类名同样显式报错——此前仅导出时才 400，调度每轮失败
+	// 未知分类名同样显式报错——此前仅导出时才 400，调度每轮失败
 	// 而设置页无信号。
 	if _, _, ok := configBackupSectionTables(normalized); !ok {
 		return nil, fmt.Errorf("备份范围包含未知分类: %s", strings.Join(normalized, ","))
@@ -84,7 +84,7 @@ func decodeAutoBackupSectionsRaw(raw sql.NullString) ([]string, error) {
 }
 
 // allBackupSectionKeys 当前分类的键序（GET 设置读侧把「未设置=全量」
-// 展开成同一份有效范围，响应与执行语义不再分叉——历史问题）。
+// 展开成同一份有效范围，响应与执行语义不再分叉）。
 func allBackupSectionKeys() []string {
 	keys := make([]string, 0, len(configBackupSections))
 	for _, sec := range configBackupSections {
@@ -118,14 +118,22 @@ func autoBackupDayHigh(frequency string) int {
 	return 28
 }
 
-// loadAutoBackupKeepSetting 读取保留份数；越界/读失败回退 7（写侧已限 1-30；
-// 2026-09-19 追加裁定:上限 100→30,升级前保存的 31-100 存量值读侧回退）。
-func loadAutoBackupKeepSetting() int {
-	var keep int
-	if err := db.DB.QueryRow(`SELECT COALESCE(auto_backup_keep,7) FROM global_config WHERE id=1`).Scan(&keep); err != nil {
-		return autoBackupKeepDefault
+// loadAutoBackupKeepSetting 读取保留份数。返回 (keep, known)：
+//   - known=false 表示配置读取失败（库故障/表缺失）——调用方必须**跳过本轮
+//     裁剪**而不是按默认值删文件。此前读失败回退 7 并照常裁剪：用户配置 30
+//     份、库抖动一轮就把 7 份之外的备份（含文件）删掉，回退方向非保守。
+//   - 读成功但值越界（<1 或 >30，写侧已限 1-30）按默认 7 收敛——这是存量
+//     越界值归一，与读失败语义不同（后者不删任何文件）。
+//
+// 读失败/恢复留痕走 services 状态转换单源（首报 warn、恢复 info）。
+func loadAutoBackupKeepSetting() (keep int, known bool) {
+	var raw int
+	if err := db.DB.QueryRow(`SELECT COALESCE(auto_backup_keep,7) FROM global_config WHERE id=1`).Scan(&raw); err != nil {
+		services.LogConfigReadFailure("auto-backup-keep", err)
+		return autoBackupKeepDefault, false
 	}
-	return autoBackupKeepOrDefault(keep)
+	services.LogConfigReadRecovered("auto-backup-keep")
+	return autoBackupKeepOrDefault(raw), true
 }
 
 // autoBackupFilenameBase 返回同秒冲突比较与失败占位共用的基础名（无 I/O）。
@@ -138,12 +146,12 @@ func autoBackupFilenameBase(trigger string, now time.Time) string {
 }
 
 // autoBackupNameVariants 同秒文件名候选数：基础名 + -2..-200 共 200 个候选
-// （历史问题，历史：原注释写 -2..-201 与实现不符，按注释调参易错）。
+// （原注释写 -2..-201 与实现不符，按注释调参易错）。
 const autoBackupNameVariants = 200
 
 // nextAutoBackupFilename 生成不冲突的备份文件名：lbbak-{auto|manual}-YYYYMMDD-
 // HHMMSS.lbbak，同秒冲突追加 -2..-200（调度与手动同秒串行执行的场景）。
-// 历史问题（历史）：200 个变体全冲突时必须报错，不得回退到基础名
+// 200 个变体全冲突时必须报错，不得回退到基础名
 // （可能是已存在文件）——否则后续 os.Rename 会覆盖既有备份。
 func nextAutoBackupFilename(dir, trigger string, now time.Time) (string, error) {
 	base := autoBackupFilenameBase(trigger, now)
@@ -214,7 +222,7 @@ func pruneAutoBackupStatus(dir, status string, keep int) int {
 		r := all[idx]
 		if autoBackupSafeFilename(r.filename) {
 			if err := os.Remove(filepath.Join(dir, r.filename)); err != nil && !errors.Is(err, os.ErrNotExist) {
-				// 历史修复(历史):文件删除失败(非 ErrNotExist)保留行
+				// 文件删除失败(非 ErrNotExist)保留行
 				// 下轮重试——行随 warn 一并删除会让残留文件成孤儿永不再裁剪。
 				services.Logf("warn", "自动备份裁剪：删除文件失败 %s: %v", r.filename, err)
 				continue
@@ -273,11 +281,11 @@ func cleanupAutoBackupTempFiles(dir string) error {
 	return nil
 }
 
-// writeAutoBackupPayload 备份写盘单源（历史问题，历史）：写盘函数本身无 ctx，
+// writeAutoBackupPayload 备份写盘单源：写盘函数本身无 ctx，
 // 取消与写盘错误同时发生时此前直接走 fail()——task_runs 记 cancelled 而
 // auto_backups 落 failed 行 + 「备份失败」审计，两处终态分叉。写盘报错后先看
 // ctx：已取消（含 deadline）则按取消返回，交由调用方零行/零审计收尾（与
-// 历史问题-10 同口径）；未取消才是真实磁盘故障。
+// 同口径）；未取消才是真实磁盘故障。
 func writeAutoBackupPayload(ctx context.Context, path string, payload []byte) error {
 	err := services.WriteAutoBackupFileSynced(path, payload)
 	if err != nil && ctx != nil {
@@ -297,8 +305,8 @@ func writeAutoBackupPayload(ctx context.Context, path string, payload []byte) er
 // operator 为审计操作者:调度路径传 system,手动触发传当前登录用户
 // (2026-09-20 用户反馈:手动备份审计恒 system,看不出是谁点的)。
 // engineRunID>0=调用方（引擎 runNow/调度 tick）已落 task_runs 行——本函数
-// 跳过自记自收尾（历史问题-④ 单写方，行终态由引擎按返回错误落）。
-// ctx 来自引擎 Run 上下文（历史问题-10）：demote/停止时取消在途备份
+// 跳过自记自收尾（-④ 单写方，行终态由引擎按返回错误落）。
+// ctx 来自引擎 Run 上下文：demote/停止时取消在途备份
 // （buildLbbakExport 与写盘检查点消费），取消不落 failed 行。
 func (h *Handlers) RunAutoBackupOnce(ctx context.Context, trigger, operator string, engineRunID int64) (row autoBackupRowView, err error) {
 	if ctx == nil {
@@ -312,7 +320,7 @@ func (h *Handlers) RunAutoBackupOnce(ctx context.Context, trigger, operator stri
 			status, msg := "success", ""
 			switch {
 			case errors.Is(err, context.Canceled):
-				// 历史问题-10：取消（角色降级/引擎停止）落 cancelled，不得记 success。
+				// 取消（角色降级/引擎停止）落 cancelled，不得记 success。
 				status, msg = "cancelled", err.Error()
 			case err != nil:
 				status, msg = "failed", err.Error()
@@ -320,7 +328,7 @@ func (h *Handlers) RunAutoBackupOnce(ctx context.Context, trigger, operator stri
 			taskengine.RecordRunFinish(histRun, status, time.Since(histT0).Milliseconds(), msg)
 		}()
 	}
-	// 任务日志 tee（历史问题-6：手动/自动备份各阶段在 tasks/auto-backup.log 留痕）
+	// 任务日志 tee（手动/自动备份各阶段在 tasks/auto-backup.log 留痕）
 	backupTee := func(stage, msg string) {
 		taskengine.TeeTaskLog("auto-backup", time.Now().In(services.CurrentLocation()).Format("2006/01/02 15:04:05"), "INFO", stage, msg)
 	}
@@ -341,7 +349,7 @@ func (h *Handlers) RunAutoBackupOnce(ctx context.Context, trigger, operator stri
 	}
 	defer autoBackupRunMu.Unlock()
 
-	// 历史问题-10：取消检查点——取消不是「备份失败」，不落 failed 行/审计。
+	// 取消检查点——取消不是「备份失败」，不落 failed 行/审计。
 	if cerr := ctx.Err(); cerr != nil {
 		return autoBackupRowView{}, cerr
 	}
@@ -356,7 +364,7 @@ func (h *Handlers) RunAutoBackupOnce(ctx context.Context, trigger, operator stri
 	if trigger == "manual" {
 		triggerLabel = "手动"
 	}
-	// 历史修复（历史）：目录权限 0700——备份含私钥与凭证明文（文件 0600），
+	// 目录权限 0700——备份含私钥与凭证明文（文件 0600），
 	// 目录本身不得放宽到组/其他可读（0700 不受 umask 削弱）。
 	// 目录先于文件名分配校验：父路径不可用时应落「创建备份目录失败」，
 	// 而不是被文件名 Stat 抢先变成无法归因的命名错误。
@@ -394,7 +402,7 @@ func (h *Handlers) RunAutoBackupOnce(ctx context.Context, trigger, operator stri
 		return wrapped
 	}
 
-	// 残留临时文件清理是卫生动作：失败降 warn 不阻断备份本体（历史问题——
+	// 残留临时文件清理是卫生动作：失败降 warn 不阻断备份本体
 	// 此前 fail() 把整轮备份标 failed；残留文件下一轮清理重试，且两种临时
 	// 形态不参与下载/还原路径）。
 	if err := cleanupAutoBackupTempFiles(dir); err != nil {
@@ -418,7 +426,7 @@ func (h *Handlers) RunAutoBackupOnce(ctx context.Context, trigger, operator stri
 	}
 	if err := writeAutoBackupPayload(ctx, finalPath, payload); err != nil {
 		if cerr := ctx.Err(); cerr != nil {
-			// 历史问题：取消发生在写盘阶段——按取消返回，不落 failed 行/审计。
+			// 取消发生在写盘阶段——按取消返回，不落 failed 行/审计。
 			_ = os.Remove(finalPath)
 			return autoBackupRowView{}, cerr
 		}
@@ -437,20 +445,26 @@ func (h *Handlers) RunAutoBackupOnce(ctx context.Context, trigger, operator stri
 		_ = os.Remove(finalPath)
 		return autoBackupRowView{}, fail("备份记录写入失败", err)
 	}
-	// 成功落行后内务裁剪(流程注释「落行→裁剪→审计」的裁剪步,历史问题 接线):
+	// 成功落行后内务裁剪(流程注释「落行→裁剪→审计」的裁剪步, 接线)
 	// success 按 keep 保留、failed 按 autoBackupFailedRowsKeep=20 保留,
 	// 文件+行同删;裁剪失败仅告警不翻转本次成功结果。
-	pruneAutoBackups(dir, loadAutoBackupKeepSetting(), autoBackupFailedRowsKeep)
-	backupTee("prune", "过期备份裁剪完成（按保留份数设置）")
+	// 保留份数读取失败时跳过本轮裁剪（保守方向：未知保留意愿下不得删文件
+	// ——库抖动一轮不该按默认值淘汰用户配置的更多份数），下一轮读通后自然收敛。
+	if keep, known := loadAutoBackupKeepSetting(); known {
+		pruneAutoBackups(dir, keep, autoBackupFailedRowsKeep)
+		backupTee("prune", "过期备份裁剪完成（按保留份数设置）")
+	} else {
+		backupTee("prune", "读取保留份数失败，本轮跳过过期备份裁剪（不删除任何文件）")
+	}
 	services.Logf("info", "%s完成：文件 %s（%s，%.1f KB）", action, filename, countsSummary, float64(len(payload))/1024)
 	services.RecordAuditLog(operator, action, "配置备份", services.FormatAuditDetail(
 		fmt.Sprintf("备份 #%d", id), "文件："+filename, countsSummary,
 		fmt.Sprintf("大小：%d 字节", len(payload)), services.AuditResultPart("success")), "")
 	// 行视图在 TryLock 持有区内取——调用方回查「最新 manual 行」在并发手动
-	// 备份下会取到他人行（历史修复 展示竞态，此处从根上消除）。
+	// 备份下会取到他人行。
 	view, verr := scanAutoBackupRowView(db.DB.QueryRow(`SELECT `+autoBackupRowColumns+` FROM auto_backups WHERE id=?`, id))
 	if verr != nil {
-		// 历史问题-2:留 warn(备份已落盘,视图扫描失败不再静默)
+		// 留 warn(备份已落盘,视图扫描失败不再静默)
 		services.Logf("warn", "自动备份行视图扫描失败(备份已落盘): %v", verr)
 		return autoBackupRowView{}, nil
 	}
@@ -517,14 +531,14 @@ func (h *Handlers) AutoBackupSettings(c *gin.Context) {
 	// 与调度/裁剪消费端(loadAutoBackupKeepSetting)同口径——UI 显示的即
 	// 生效值,重存后落库收敛。
 	keep = autoBackupKeepOrDefault(keep)
-	// 历史修复（历史）：day 读侧按 frequency 钳制——与写侧校验同口径
+	// day 读侧按 frequency 钳制——与写侧校验同口径
 	//（UpdateAutoBackupSettings dayHigh：weekly 1-7、daily/monthly 1-28）。
 	// 越界存量值回退 1（DB 默认），与 keep 回退同格；合法值原样返回。
 	dayHigh := autoBackupDayHigh(freq)
 	if day < 1 || day > dayHigh {
 		day = autoBackupDayDefault
 	}
-	// 历史问题：读侧与执行侧（loadAutoBackupSectionsSetting）同一语义——
+	// 读侧与执行侧（loadAutoBackupSectionsSetting）同一语义——
 	// NULL/空串=全量，展开为全部分类键；损坏 JSON/[]/未知分类显式 500，
 	// 不再静默呈现空数组（调度侧这些形态本来就每轮失败）。复用本查询已
 	// 扫描的原始值，避免额外一次 DB 读（读侧语义单源在解码 helper）。
@@ -552,7 +566,7 @@ func (h *Handlers) AutoBackupSettings(c *gin.Context) {
 		}
 		backups = append(backups, view)
 	}
-	// 历史问题-⑫（历史主审补漏，历史问题 口径）：迭代失败显式 500——
+	// ⑫：迭代失败显式 500——
 	// 部分列表 + 200 会掩盖存储故障。
 	if err := rows.Err(); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取备份列表失败: " + err.Error()})
@@ -560,10 +574,10 @@ func (h *Handlers) AutoBackupSettings(c *gin.Context) {
 	}
 	var lastRunValue *string
 	if lastRun.Valid {
-		// 历史修复（历史）：水位线回传响应面（此前扫描后零消费恒 null）。
+		// 水位线回传响应面（此前扫描后零消费恒 null）。
 		lastRunValue = &lastRun.String
 	}
-	// 历史问题-03：last_run 是调度水位线（off→on=now，2026-09-19 裁定），不是
+	// last_run 是调度水位线（off→on=now，2026-09-19 裁定），不是
 	// 执行事实；「上次执行」必须取最近一次 success 备份行。列表已 DESC 加载，
 	// 直接取首条 success（零额外查询），失败行不得入选。
 	var lastSuccessValue *string
@@ -597,6 +611,12 @@ func (h *Handlers) AutoBackupSettings(c *gin.Context) {
 // last_run=now(2026-09-19 用户裁定)——不立即执行、不回补停用期旧槽,
 // 下一次执行=启用后下一个到期槽。
 func (h *Handlers) UpdateAutoBackupSettings(c *gin.Context) {
+	// 自动备份四列设置与开关都在 global_config 全量替换范围内：导入窗口内的
+	// 提交会被导入静默覆盖（数据丢失），事务开启后则阻塞至 busy_timeout 后
+	// 500——与同族 global_config 写者同口径 409 fast-fail。
+	if rejectWriteDuringImport(c, "保存自动备份设置（配置导入进行中）") {
+		return
+	}
 	if !h.requireAutoBackupMaster(c) {
 		return
 	}
@@ -650,7 +670,7 @@ func (h *Handlers) UpdateAutoBackupSettings(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "序列化备份范围失败: " + err.Error()})
 		return
 	}
-	// 历史问题-08：四列设置与业务开关同事务——修复前设置先落库、开关后写，
+	// 四列设置与业务开关同事务——修复前设置先落库、开关后写，
 	// 开关失败返回 500 但频率/范围/保留份数已生效（半保存）。
 	tx, err := db.DB.Begin()
 	if err != nil {
@@ -715,9 +735,9 @@ func autoBackupSectionLabels(sections []string) []string {
 
 // RunAutoBackupNow POST /api/v1/auto-backup/run：手动触发一次完整备份。
 //
-// 历史问题（历史）：响应前转后台——此前同步 te.RunSync 让「备份 >60s」
+// 响应前转后台——此前同步 te.RunSync 让「备份 >60s」
 // 撞 main.go WriteTimeout(60s) 截断响应。
-// 历史问题-02（历史）：占位改为引擎原子预留（RunAsync）——
+// 占位改为引擎原子预留（RunAsync）——
 // 入口门（paused/stopped/角色/单飞）与 running CAS 在请求线程内完成，
 // 失败在 202 之前同步映射 409/403/503 并留审计；不再出现「已受理但后台
 // 被静默拒绝」。运行期失败仍由引擎 task_runs/日志记录。
@@ -730,7 +750,7 @@ func (h *Handlers) RunAutoBackupNow(c *gin.Context) {
 		respondTaskEngineUnavailable(c)
 		return
 	}
-	// 审计分类单源 services.TriggerTaskAsync（历史问题：三份手动触发分类
+	// 审计分类单源 services.TriggerTaskAsync（三份手动触发分类
 	// 收敛）——ErrAlreadyRunning 并发双击静默（不再误记「触发失败」），
 	// 其余 admission/执行失败由单源补「触发失败」审计；HTTP 状态映射留本地
 	//（本端点 EngineStopped=503 等文案面向备份场景）。
@@ -754,7 +774,7 @@ func (h *Handlers) RunAutoBackupNow(c *gin.Context) {
 	c.JSON(http.StatusAccepted, models.APIResponse{Code: 0, Message: "手动备份已开始，完成后可在备份列表查看"})
 }
 
-// autoBackupRowByID 查行；不存在 404、DB 故障响亮 500（历史修复，历史：
+// autoBackupRowByID 查行；不存在 404、DB 故障响亮 500（历史
 // dbQueryNotFound 分判——此前 Scan 错误一律 404「备份不存在」，DB 故障窗口
 // 误导排障方向；与 GetCurrentUser/requireAutoBackupMaster 已立先例同口径）。
 func (h *Handlers) autoBackupRowByID(c *gin.Context) (autoBackupRowView, bool) {
@@ -784,11 +804,21 @@ func (h *Handlers) DeleteAutoBackup(c *gin.Context) {
 	if !ok {
 		return
 	}
-	// 行先删、文件后删（历史修复，用户裁定）：先删文件后删行会在「文件已删、
+	// 行先删、文件后删：先删文件后删行会在「文件已删、
 	// 行 DELETE 失败」时留下指向不存在文件的行（还原/下载 404）；反过来行已删
 	// 而文件残留仅为磁盘孤儿（无害，可手动清理），一致性方向更优。
-	if _, err := db.DB.Exec(`DELETE FROM auto_backups WHERE id=?`, view.ID); err != nil {
+	res, err := db.DB.Exec(`DELETE FROM auto_backups WHERE id=?`, view.ID)
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "删除备份记录失败: " + err.Error()})
+		return
+	}
+	if deleted, err := res.RowsAffected(); err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "删除备份记录失败: " + err.Error()})
+		return
+	} else if deleted == 0 {
+		// 并发删除（两个请求同读一行、先到者已删）：本次未删除任何行，不得
+		// 记「成功」审计（审计真实性）也不得再删文件（文件归属先到者收尾）。
+		c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "备份不存在（可能已被删除）"})
 		return
 	}
 	if err := os.Remove(filepath.Join(h.cfg.BackupDir, view.Filename)); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -859,7 +889,7 @@ func (h *Handlers) DownloadAutoBackup(c *gin.Context) {
 		return
 	}
 	path := filepath.Join(h.cfg.BackupDir, view.Filename)
-	// 历史修复（历史）：句柄先行——os.Open 成功后才审计并流式交付，
+	// 句柄先行——os.Open 成功后才审计并流式交付，
 	// 消除 Stat→FileAttachment 窗口内备份完成 prune 掉目标文件导致的
 	// 打开失败 panic/500 与「审计先于交付」虚记。
 	f, err := os.Open(path)

@@ -131,7 +131,7 @@ func TestQuarantineCorruptSQLiteFile_shortGarbageFile(t *testing.T) {
 	}
 }
 
-// 历史问题 回归：Ping 损坏类错误必须经 errors.As 命中驱动的类型化错误码
+// 回归：Ping 损坏类错误必须经 errors.As 命中驱动的类型化错误码
 // （SQLITE_NOTADB=26 / SQLITE_CORRUPT=11，可穿透 fmt.Errorf 包装链），
 // 字符串 Contains 仅作兜底——驱动消息措辞变化不得让损坏库错过隔离重建。
 // 真驱动口径：用真实驱动打开「魔数完好但内容损坏」的库取得_ping 错误。
@@ -163,7 +163,7 @@ func TestIsCorruptionError_typedCodeAndStringFallback(t *testing.T) {
 	}
 }
 
-// 历史问题 回归：同一秒内两次隔离不得静默覆盖此前的取证文件（rename 目标
+// 回归：同一秒内两次隔离不得静默覆盖此前的取证文件（rename 目标
 // 重名时 Unix 语义为直接替换）。
 func TestQuarantineCorruptSQLiteFile_sameSecondDoubleQuarantineKeepsBoth(t *testing.T) {
 	dir := t.TempDir()
@@ -220,7 +220,7 @@ func TestQuarantineMetricsFileUnconditional_sameSecondDoubleQuarantineKeepsBoth(
 	}
 }
 
-// 历史问题 回归：启动 GC 按基础名（主库/-wal/-shm）仅保留最新 3 份 .corrupt.*，
+// 回归：启动 GC 按基础名（主库/-wal/-shm）仅保留最新 3 份.corrupt.*，
 // 老文件清除；其他基础名的隔离文件不受波及。
 func TestGCQuarantinedMetricsFiles_keepsNewestThreePerBase(t *testing.T) {
 	dir := t.TempDir()
@@ -266,7 +266,7 @@ func TestGCQuarantinedMetricsFiles_keepsNewestThreePerBase(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：隔离文件的时间真相在文件名（os.Rename 保留源 mtime），
+// 隔离文件的时间真相在文件名（os.Rename 保留源 mtime），
 // GC 曾按 ModTime 排序——源文件 mtime 越旧的最新隔离件会被误删。4 份副本、
 // 文件名最新者的 mtime 最旧：GC 后必须保留文件名最新的 3 份，并记录删除。
 func TestGCQuarantinedMetricsFiles_ordersByFilenameTimestamp(t *testing.T) {
@@ -306,7 +306,7 @@ func TestGCQuarantinedMetricsFiles_ordersByFilenameTimestamp(t *testing.T) {
 	}
 }
 
-// 历史问题：Stat 返回非 ErrNotExist 持久错误（父路径是普通文件 → ENOTDIR）
+// Stat 返回非 ErrNotExist 持久错误（父路径是普通文件 → ENOTDIR）
 // 时，nextQuarantinePath 必须记日志并返回现值，不得无界自旋。
 func TestNextQuarantinePath_returnsCandidateOnPersistentStatError(t *testing.T) {
 	dir := t.TempDir()
@@ -336,7 +336,7 @@ func TestNextQuarantinePath_returnsCandidateOnPersistentStatError(t *testing.T) 
 	}
 }
 
-// 历史问题：伴生文件（-wal/-shm）必须先于主文件隔离。伴生改名失败时
+// 伴生文件（-wal/-shm）必须先于主文件隔离。伴生改名失败时
 // 主文件必须仍在原位并中止重建，避免下次启动在旧 WAL 残留时新建同名空库。
 func TestQuarantineCorruptSQLiteFile_companionRenameErrorPropagates(t *testing.T) {
 	for _, tc := range []struct {
@@ -400,7 +400,7 @@ func testQuarantineCompanionRenameFailure(t *testing.T, quarantine func(string) 
 	}
 }
 
-// 历史问题-3 正常路径：-wal/-shm 一并隔离，原位不再残留。
+// 正常路径：-wal/-shm 一并隔离，原位不再残留。
 func TestQuarantineCompanions_renamesWalAndShm(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "metrics.db")

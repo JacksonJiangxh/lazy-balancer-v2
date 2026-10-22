@@ -25,9 +25,9 @@ var downloadIntegrityPath = "/app/data/.download-integrity.json"
 
 // downloadIntegrityMu 串行化记录文件的 load-modify-persist：CRS 与 ip2region
 // 两个更新调度器可能同时到期下载（同小时并发），共享同一记录文件时丢失更新
-// 或撕裂 tmp 文件（历史问题）。所有读改写路径都必须在持锁下进行。
-// 历史问题：锁内只做文件 load-modify-persist 与状态判定——日志/审计落库（审计库
-// I/O）一律解锁后执行，照抄看门狗 历史问题 的 pendingIO 模式：审计库被外部写锁
+// 或撕裂 tmp 文件。所有读改写路径都必须在持锁下进行。
+// 锁内只做文件 load-modify-persist 与状态判定——日志/审计落库（审计库
+// I/O）一律解锁后执行，照抄看门狗 pendingIO 模式：审计库被外部写锁
 // 占住时（busy_timeout 30s），持锁落审计会让两族更新调度器互相阻塞。
 var downloadIntegrityMu sync.Mutex
 
@@ -51,15 +51,15 @@ type downloadIntegrityRecord struct {
 }
 
 // errDownloadIntegrityMismatch 标记「下载内容与 TOFU 基线不一致」的阻断性
-// 失败，供调用方与 I/O 类失败区分：mismatch 必须中止安装（历史修复），
-// I/O 失败仅记日志不阻断（历史问题 既有语义）。
+// 失败，供调用方与 I/O 类失败区分：mismatch 必须中止安装，
+// I/O 失败仅记日志不阻断。
 var errDownloadIntegrityMismatch = errors.New("下载完整性校验失败：内容与基线不一致")
 
 // recordDownloadIntegrity 校验并记录一次成功下载的完整性快照：首次下载写入
 // 基线；同一来源再次下载且 size/digest 与基线不符时 Logf("error") + 审计并
 // 返回 errDownloadIntegrityMismatch 包装错误（阻断安装、保留旧基线）。必须在
 // 下载文件的格式验证成功之后调用——验证前的坏工件基线会让下次同源好下载
-// 误报（历史问题）。
+// 误报。
 func recordDownloadIntegrity(source, destPath, resource string) error {
 	info, err := os.Stat(destPath)
 	if err != nil {
@@ -77,11 +77,11 @@ func recordDownloadIntegrity(source, destPath, resource string) error {
 		return err
 	}
 	prev, existed := records[source]
-	// 历史修复：mismatch 阻断安装并保留旧基线——ghfast.top 类镜像
+	// mismatch 阻断安装并保留旧基线——ghfast.top 类镜像
 	// 代理投毒时「仅告警+自动重定基线」无拦截力；内容变化必须经人工清理基线
 	// （删除记录文件中该来源条目）后重试。
 	if existed && (prev.Size != info.Size() || prev.SHA256 != digest) {
-		// 历史问题：锁内只构造文案与错误，日志/审计在解锁后落库。
+		// 锁内只构造文案与错误，日志/审计在解锁后落库。
 		mismatchErr := fmt.Errorf("来源 %s 下载内容与上次完整性记录不一致（size %d→%d，sha256 %s→%s），已阻断安装；如确认上游更新合法，删除 %s 中该来源条目后重试: %w",
 			source, prev.Size, info.Size(), prev.SHA256, digest, downloadIntegrityPath, errDownloadIntegrityMismatch)
 		audits = append(audits, downloadIntegrityAudit{
@@ -115,7 +115,7 @@ func sha256File(path string) (string, error) {
 }
 
 // loadDownloadIntegrityRecords 读取记录文件（调用方须持有 downloadIntegrityMu）。
-// 损坏文件的隔离审计以返回值交给调用方在解锁后落库（历史问题）。
+// 损坏文件的隔离审计以返回值交给调用方在解锁后落库。
 func loadDownloadIntegrityRecords() (map[string]downloadIntegrityRecord, []downloadIntegrityAudit, error) {
 	data, err := os.ReadFile(downloadIntegrityPath)
 	if errors.Is(err, os.ErrNotExist) {
@@ -126,13 +126,13 @@ func loadDownloadIntegrityRecords() (map[string]downloadIntegrityRecord, []downl
 	}
 	var records map[string]downloadIntegrityRecord
 	if err := json.Unmarshal(data, &records); err != nil {
-		// 损坏记录文件会静默禁用 TOFU 完整性检查且不自愈（历史问题）：隔离文件
+		// 损坏记录文件会静默禁用 TOFU 完整性检查且不自愈：隔离文件
 		// （rename 为 .corrupt-<ts>）保留取证现场，error 日志 + 审计记录告警，
 		// 并从头重建基线。
 		quarantined := downloadIntegrityPath + ".corrupt-" + time.Now().UTC().Format("20060102-150405")
 		if err := os.Rename(downloadIntegrityPath, quarantined); err != nil {
 			// 隔离失败时如实记录：文件仍在原位，后续 persist（tmp+rename）会覆盖
-			// 重建，但取证副本缺失（历史问题）。
+			// 重建，但取证副本缺失。
 			Logf("error", "download integrity: records file %s is corrupt, quarantine rename to %s failed: %v（原文件保留，直接重建基线）", downloadIntegrityPath, quarantined, err)
 			return map[string]downloadIntegrityRecord{}, []downloadIntegrityAudit{{
 				action:   "下载校验",
@@ -161,6 +161,6 @@ func persistDownloadIntegrityRecords(records map[string]downloadIntegrityRecord)
 	if err := os.MkdirAll(filepath.Dir(downloadIntegrityPath), 0o755); err != nil {
 		return err
 	}
-	// 历史问题：tmp+rename 缺 fsync 可留下 0 字节记录（基线丢失/误重建）。
+	// tmp+rename 缺 fsync 可留下 0 字节记录（基线丢失/误重建）。
 	return writeFileAtomicSynced(downloadIntegrityPath, data, 0o644)
 }

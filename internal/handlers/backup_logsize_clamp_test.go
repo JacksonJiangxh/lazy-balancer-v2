@@ -1,8 +1,8 @@
 package handlers
 
-// 历史问题(历史,历史问题):v2 备份导入钳制缺口——caddy_log_size_mb
+// v2 备份导入钳制缺口——caddy_log_size_mb
 // (写侧 ≥100,caddy.go:305-308)与 audit_log_size_mb(写侧 ≤512,:380-387)
-// 无导入侧钳制(历史问题 同族漏网):越界值原样落库后,
+// 无导入侧钳制:越界值原样落库后,
 // 基础设置保存被写侧校验锁死(400),直至人工修库或重启钳位(若有)。
 
 import (
@@ -24,15 +24,15 @@ func TestImportConfigBackup_clamps_caddy_log_size_mb(t *testing.T) {
 		{"合法值保持不变", 200, 200},
 		{"边界 100 保持不变", 100, 100},
 		{"边界 10240 保持不变", 10240, 10240},
-		{"10241 钳位到 10240（历史问题 上限）", 10241, 10240},
+		{"10241 钳位到 10240（上限）", 10241, 10240},
 		{"天文值钳位到 10240", 99999999, 10240},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			h := newBackupTestHandlers(t)
-			r55SeedCurrentAdmin(t)
+			seedCurrentAdminShared(t)
 			backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{}, Config: map[string]any{"caddy_log_size_mb": tt.value}})
-			response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
+			response := postImportShared(t, h.ImportConfigBackup, "/config/import", backup)
 			if response.Code != http.StatusOK {
 				t.Fatalf("import status=%d body=%s, want 200", response.Code, response.Body.String())
 			}
@@ -64,9 +64,9 @@ func TestImportConfigBackup_clamps_audit_log_size_mb(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			h := newBackupTestHandlers(t)
-			r55SeedCurrentAdmin(t)
+			seedCurrentAdminShared(t)
 			backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{}, Config: map[string]any{"audit_log_size_mb": tt.value}})
-			response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
+			response := postImportShared(t, h.ImportConfigBackup, "/config/import", backup)
 			if response.Code != http.StatusOK {
 				t.Fatalf("import status=%d body=%s, want 200", response.Code, response.Body.String())
 			}
@@ -81,7 +81,7 @@ func TestImportConfigBackup_clamps_audit_log_size_mb(t *testing.T) {
 	}
 }
 
-// 历史修复（历史，历史问题——历史问题 同族漏点）：task_log_size_mb 与
+// （同族漏点）：task_log_size_mb 与
 // runtime_log_size_mb 无导入侧钳制——越界值原样落库后基础设置保存被写侧
 // 1-1024 校验锁死（400）。钳到写侧同边界；非整数形态回退 schema 缺省
 //（10/100，db.go newColumns 登记）。
@@ -104,9 +104,9 @@ func TestImportConfigBackup_clamps_task_log_size_mb(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			h := newBackupTestHandlers(t)
-			r55SeedCurrentAdmin(t)
+			seedCurrentAdminShared(t)
 			backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{}, Config: map[string]any{"task_log_size_mb": tt.value}})
-			response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
+			response := postImportShared(t, h.ImportConfigBackup, "/config/import", backup)
 			if response.Code != http.StatusOK {
 				t.Fatalf("import status=%d body=%s, want 200", response.Code, response.Body.String())
 			}
@@ -139,9 +139,9 @@ func TestImportConfigBackup_clamps_runtime_log_size_mb(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			h := newBackupTestHandlers(t)
-			r55SeedCurrentAdmin(t)
+			seedCurrentAdminShared(t)
 			backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{}, Config: map[string]any{"runtime_log_size_mb": tt.value}})
-			response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
+			response := postImportShared(t, h.ImportConfigBackup, "/config/import", backup)
 			if response.Code != http.StatusOK {
 				t.Fatalf("import status=%d body=%s, want 200", response.Code, response.Body.String())
 			}

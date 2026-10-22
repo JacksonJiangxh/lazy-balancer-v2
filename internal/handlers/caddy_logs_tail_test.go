@@ -1,8 +1,8 @@
 package handlers
 
-// 历史修复（历史问题）：GetCaddyLogs 尾窗「无换行/残段」行为与 GetAppLogs
-// 统一 历史修复 口径（抽享 tailLogWindow）——修复前 GetCaddyLogs 在窗口内无
-// '\n' 时返回整段原始中段（历史只收敛了 system.go，历史修复 漏扫点）：
+// GetCaddyLogs 尾窗「无换行/残段」行为与 GetAppLogs
+// 统一口径（抽享 tailLogWindow）——修复前 GetCaddyLogs 在窗口内无
+// '\n' 时返回整段原始中段（只收敛了 system.go，漏扫点）
 // 单行 JSON 巨行（大请求头/大 body 访问日志可达 >128KB）时输出为巨行中段，
 // 首字节切在多字节 rune 中间时带无效字节，JSON 编码后以 U+FFFD 污染。
 // 统一口径：起点非零丢弃首行残段；窗口内无 '\n'（整窗为同一巨行中段）输出为空。
@@ -70,7 +70,7 @@ func TestGetCaddyLogs_tailWindowGiantLineReturnsEmpty(t *testing.T) {
 	}
 }
 
-// GetCaddyLogs 残段形状（镜像 历史修复 夹具）：起点恰落在「中」（3 字节）的
+// GetCaddyLogs 残段形状（镜像夹具）：起点恰落在「中」（3 字节）的
 // 第 2 字节——首行残段整体丢弃，输出恰为后续完整行，零 U+FFFD 污染。
 func TestGetCaddyLogs_tailWindowDropsFirstLineFragment(t *testing.T) {
 	// Given
@@ -129,7 +129,7 @@ func TestGetCaddyLogs_tailWindowDropsFirstLineFragment(t *testing.T) {
 	}
 }
 
-// logContentPreview 截取日志内容预览（历史问题）：断言失败消息里直接
+// logContentPreview 截取日志内容预览：断言失败消息里直接
 // content[:64] 会在内容不足 64 字节（含空串）时 panic，掩盖真实诊断。
 func logContentPreview(content string, limit int) string {
 	if limit <= 0 {
@@ -154,7 +154,7 @@ func TestLogContentPreview_shortContentDoesNotPanic(t *testing.T) {
 	}
 }
 
-// 历史问题（历史问题，族内一致性）：GetCaddyLogs 先 os.Stat 得 size 再
+// GetCaddyLogs 先 os.Stat 得 size 再
 // Seek(size-128KB) 后 io.ReadAll(f) 无 LimitReader——Stat 与 Read 之间日志
 // 增长时本次返回可超 128KB 上限（certjobs.readCertJobLogFile 同族已用
 // io.LimitReader）。测试钩子在 Stat 之后追加 200KB，钉住读取严格受窗口约束。

@@ -12,7 +12,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 历史修复：集群机器凭据的枚举尝试必须留安全审计痕迹——此前
+// 集群机器凭据的枚举尝试必须留安全审计痕迹——此前
 // clusterTokenAuth/registrationAuth 只返回 401，审计日志零线索（进程重启后
 // 内存限流桶也清零，取证完全缺失）。
 func TestClusterAuthMiddlewares_recordAuthRejectionAudit(t *testing.T) {
@@ -70,7 +70,7 @@ func TestClusterAuthMiddlewares_recordAuthRejectionAudit(t *testing.T) {
 	})
 }
 
-// 历史修复：API Key 认证必须区分「Key 无效」与基础设施故障——
+// API Key 认证必须区分「Key 无效」与基础设施故障——
 // DB 故障时返回 401「API 密钥无效」会诱导全站客户端重登且日志零线索。
 func TestAPIKeyAuth_mapsInfrastructureFailureTo500(t *testing.T) {
 	oldDB := db.DB

@@ -2,7 +2,9 @@ package db
 
 import (
 	"bytes"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -22,7 +25,7 @@ import (
 var sqliteHeaderMagic = []byte("SQLite format 3\x00")
 
 // nextQuarantinePath 返回不与现存文件冲突的隔离目标路径：<path>.corrupt.<unix秒>；
-// 同秒已有同名隔离文件时追加 -1/-2/… 序号（历史问题：同秒两次隔离不再静默覆盖
+// 同秒已有同名隔离文件时追加 -1/-2/… 序号（同秒两次隔离不再静默覆盖
 // 此前的取证文件——Unix rename 对已存在目标是直接替换）。stat-then-rename 的
 // 窗口仅存在于启动单线程路径，极端竞态下回退为旧的覆盖行为，不劣于修复前。
 func nextQuarantinePath(path string) string {
@@ -30,7 +33,7 @@ func nextQuarantinePath(path string) string {
 	for i := 1; ; i++ {
 		candidate := base
 		if i > 1 {
-			// 历史修复（历史）：后缀从 -1 起（i-1）——旧式 i 使序号
+			// 后缀从 -1 起（i-1）——旧式 i 使序号
 			// 跳号（base→base-2，base-1 永不生成）。
 			candidate = fmt.Sprintf("%s-%d", base, i-1)
 		}
@@ -38,7 +41,7 @@ func nextQuarantinePath(path string) string {
 			return candidate
 		} else if err != nil {
 			// 持久 Stat 错误（父路径 ENOTDIR/EACCES 等）——记日志返回现值，
-			// 不得无界自旋（历史问题）。后续 Rename 失败由调用方处理。
+			// 不得无界自旋。后续 Rename 失败由调用方处理。
 			log.Printf("nextQuarantinePath: stat %s: %v（返回现值候选路径）", candidate, err)
 			return candidate
 		}
@@ -49,7 +52,7 @@ func nextQuarantinePath(path string) string {
 var quarantineRename = os.Rename
 
 // quarantineCompanions 把主库 path 的 -wal/-shm 伴生文件一并改名为
-// <companion>.corrupt.<unix秒>（历史问题-3）。伴生文件承载未检查点化页与共享
+// <companion>.corrupt.<unix秒>。伴生文件承载未检查点化页与共享
 // 内存：主库改名后若静默留下旧 WAL，重建的新库下次打开会重放脏 WAL，再现
 // 损坏。因此任一伴生文件改名失败必须返回错误（由调用方中止重建/响亮失败），
 // 不得忽略。缺失伴生文件按正常路径跳过。
@@ -109,7 +112,7 @@ func InitializeMetricsDB(dataDir string) (err error) {
 	if err := secureDataDirectory(dataDir); err != nil {
 		return fmt.Errorf("failed to secure metrics data directory: %w", err)
 	}
-	// 先清扫历史隔离文件（含崩循环残留，历史问题）：每基础名留最新 3 份，防止
+	// 先清扫历史隔离文件（含崩循环残留）：每基础名留最新 3 份，防止
 	// 取证文件无界累积；本轮新隔离叠加其上，下次启动再收敛。
 	gcQuarantinedMetricsFiles(dbPath)
 	if err := prepareSQLiteDatabase(dbPath); err != nil {
@@ -154,9 +157,72 @@ func InitializeMetricsDB(dataDir string) (err error) {
 	if err := secureSQLiteArtifacts(dbPath); err != nil {
 		return fmt.Errorf("failed to secure metrics database artifacts: %w", err)
 	}
+	generation, err := ensureMetricsDBGeneration(db)
+	if err != nil {
+		return fmt.Errorf("failed to initialize metrics database generation: %w", err)
+	}
 
 	MetricsDB = db
+	metricsDBGeneration.set(db, generation)
 	return nil
+}
+
+// metricsDBGenerationKey 是 metrics_meta 里的创建代际键。
+const metricsDBGenerationKey = "db_generation"
+
+// metricsDBGeneration 记录当前 MetricsDB 句柄对应的库创建代际 token。代际在
+// 库文件创建时铸一次并随库持久（metrics_meta 表）：同一库文件重开/进程重启
+// 代际不变；损坏隔离重建产生新库文件 → 新代际。摄取侧据此判定「旧 offset 属于
+// 已丢弃的旧库」并从文件头重新摄取（安全事件 offset 复位判据）。
+// 句柄绑定：仅当查询时 MetricsDB 仍是记录的那个句柄才返回代际——测试/嵌入
+// 形态直换包级句柄时不会读到前一个库的陈旧代际。
+type metricsDBGenerationState struct {
+	mu  sync.Mutex
+	db  *sql.DB
+	gen string
+}
+
+var metricsDBGeneration metricsDBGenerationState
+
+func (g *metricsDBGenerationState) set(database *sql.DB, generation string) {
+	g.mu.Lock()
+	g.db, g.gen = database, generation
+	g.mu.Unlock()
+}
+
+func (g *metricsDBGenerationState) get() string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.db == nil || g.db != MetricsDB {
+		return ""
+	}
+	return g.gen
+}
+
+// MetricsDBGeneration 返回当前 metrics 库的创建代际 token（库未装配/句柄已
+// 被替换时为空串）。只读、无锁竞争（每 tick 一次）。
+func MetricsDBGeneration() string { return metricsDBGeneration.get() }
+
+// ensureMetricsDBGeneration 返回库文件当前的创建代际；老库（升级前没有
+// metrics_meta 行）在首次初始化时铸一个新值并持久，之后保持不变。
+func ensureMetricsDBGeneration(database *sql.DB) (string, error) {
+	var generation string
+	err := database.QueryRow(`SELECT value FROM metrics_meta WHERE key=?`, metricsDBGenerationKey).Scan(&generation)
+	if err == nil && generation != "" {
+		return generation, nil
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+	buf := make([]byte, 16)
+	if _, rerr := rand.Read(buf); rerr != nil {
+		return "", rerr
+	}
+	generation = hex.EncodeToString(buf)
+	if _, ierr := database.Exec(`INSERT OR REPLACE INTO metrics_meta (key, value) VALUES (?, ?)`, metricsDBGenerationKey, generation); ierr != nil {
+		return "", ierr
+	}
+	return generation, nil
 }
 
 // sqlite 扩展错误码的低 8 位为主码（>0xff 为扩展位）；仅用主码判定损坏类。
@@ -168,7 +234,7 @@ const (
 // isCorruptionError 区分损坏类错误（值得隔离重建）与瞬态错误（锁/IO，
 // 隔离只会白白丢弃好数据）。优先按驱动类型化错误码判定（glebarez/go-sqlite
 // 的 *sqlite.Error 经 errors.As 可穿透 database/sql 与 fmt.Errorf 包装链），
-// 字符串 Contains 仅作兜底（历史问题：驱动消息措辞变化不得让损坏库错过隔离）。
+// 字符串 Contains 仅作兜底（驱动消息措辞变化不得让损坏库错过隔离）。
 func isCorruptionError(err error) bool {
 	var sqliteErr *sqlite.Error
 	if errors.As(err, &sqliteErr) {
@@ -204,11 +270,11 @@ func quarantineMetricsFileUnconditionally(path string) (string, error) {
 }
 
 // quarantineKeepPerBase 是启动 GC 对每个基础名（主库/-wal/-shm）保留的隔离
-// 文件份数：留新删旧，兼顾取证与磁盘无界累积（历史问题）。
+// 文件份数：留新删旧，兼顾取证与磁盘无界累积。
 const quarantineKeepPerBase = 3
 
 // quarantineFileOrder 从隔离文件名解析 (unix 秒, 同秒序号)，用于「按文件名
-// 时间」排序。历史问题（历史）：os.Rename 保留源文件 mtime，隔离发生的
+// 时间」排序。os.Rename 保留源文件 mtime，隔离发生的
 // 时刻只记录在文件名里——按 ModTime 排序会把源 mtime 较旧的最新隔离件误判
 // 为最老而删除。解析失败（非本函数生成的形态）返回 false，排到最后。
 var quarantineFileNamePattern = regexp.MustCompile(`\.corrupt\.(\d+)(?:-(\d+))?$`)
@@ -301,11 +367,48 @@ func openAndPingMetricsDB(dbPath string) (*sql.DB, error) {
 	return db, nil
 }
 
+// metricsRedundantIndexProbes / Drops 冗余索引探测门的观测计数：Probes=每次
+// 初始化对 sqlite_master 的探测次数（两条索引各一次），Drops=索引真实在位
+// 并执行了 DROP 的次数。仅测试消费。
+var (
+	metricsRedundantIndexProbes atomic.Int64
+	metricsRedundantIndexDrops  atomic.Int64
+)
+
+// dropRedundantMetricsIndex 回收存量指标库上的冗余索引：先探测 sqlite_master，
+// 仅索引真实在位时执行 DROP——fresh 库与已回收库零 DDL（此前每次初始化无条件
+// 两条 DROP INDEX，空转一次 schema 写事务）。索引名来自本文件内固定清单。
+func dropRedundantMetricsIndex(db *sql.DB, name string) error {
+	metricsRedundantIndexProbes.Add(1)
+	var found string
+	err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='index' AND name=?`, name).Scan(&found)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect redundant metrics index %s: %w", name, err)
+	}
+	metricsRedundantIndexDrops.Add(1)
+	if _, err := db.Exec("DROP INDEX " + name); err != nil {
+		return fmt.Errorf("drop redundant metrics index %s: %w", name, err)
+	}
+	return nil
+}
+
 func initMetricsSchema(db *sql.DB) error {
 
-	// idx_metrics_rule 与 idx_metrics_rule_timestamp 左前缀重叠（历史清理），
-	// schema 内以 DROP INDEX IF EXISTS 一次性回收存量库上的冗余索引。
+	// idx_metrics_rule 与 idx_metrics_rule_timestamp 左前缀重叠（清理）：
+	// 初始化时经 dropRedundantMetricsIndex 探测 sqlite_master，仅存量库存在时
+	// 一次性回收（fresh 库不创建、已回收库零 DDL）。
 	schema := `
+	-- 指标库元数据（键值）：db_generation 记录库文件创建代际，随库持久——
+	-- 摄取侧以代际变化判定「库已隔离重建」，复位审计日志 offset（见
+	-- ensureMetricsDBGeneration）。已有库首次运行补建并铸代际（不触发复位）。
+	CREATE TABLE IF NOT EXISTS metrics_meta (
+		key TEXT PRIMARY KEY,
+		value TEXT NOT NULL
+	);
+
 	CREATE TABLE IF NOT EXISTS metrics_history (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		rule_id VARCHAR(20),
@@ -329,7 +432,6 @@ func initMetricsSchema(db *sql.DB) error {
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON metrics_history(timestamp);
-	DROP INDEX IF EXISTS idx_metrics_rule;
 	CREATE INDEX IF NOT EXISTS idx_metrics_rule_timestamp ON metrics_history(rule_id, timestamp);
 
 	CREATE TABLE IF NOT EXISTS security_events (
@@ -374,7 +476,7 @@ func initMetricsSchema(db *sql.DB) error {
 		PRIMARY KEY (minute, country, province, family, rule, action)
 	) WITHOUT ROWID;
 
-	-- 历史问题：被攻击目标（rule_caddy_id）分钟 rollup——与主 rollup
+	-- 被攻击目标（rule_caddy_id）分钟 rollup——与主 rollup
 	-- 同批写入，使「TOP 被攻击站点」与总量/国家等卡片同窗口，不再依赖原始表
 	-- （原始表受保留期/行帽裁剪；主 rollup 主键无法承载该维度）。
 	CREATE TABLE IF NOT EXISTS security_event_target_rollup (
@@ -383,13 +485,12 @@ func initMetricsSchema(db *sql.DB) error {
 		count INTEGER NOT NULL DEFAULT 0,
 		PRIMARY KEY (minute, rule_caddy_id)
 	) WITHOUT ROWID;
-	-- 历史问题-09（历史）：idx_security_event_target_rollup_minute 与 WITHOUT
+	-- idx_security_event_target_rollup_minute 与 WITHOUT
 	-- ROWID 主键 (minute, rule_caddy_id) 的排序前缀完全等价（WHERE minute>=?
-	-- 与 GROUP BY minute 本就走主键扫描），删除以省写入/存储成本；存量库
-	-- 由本语句在每次初始化时幂等回收。
-	DROP INDEX IF EXISTS idx_security_event_target_rollup_minute;
+	-- 与 GROUP BY minute 本就走主键扫描），删除以省写入/存储成本；存量库由
+	-- initMetricsSchema 的探测门一次性回收（fresh 库不创建、已回收库零 DDL）。
 
-	-- 指标库通用状态表（历史问题）：rollup 固化水位等持久元数据。
+	-- 指标库通用状态表：rollup 固化水位等持久元数据。
 	-- 键值单行形态，水位与分钟数据同事务提交——不再以数据行 MAX(minute)
 	-- 反推水位（空分钟不产行，MAX 水位会让空分钟永不推进）。
 	CREATE TABLE IF NOT EXISTS metrics_state (
@@ -401,8 +502,13 @@ func initMetricsSchema(db *sql.DB) error {
 	if _, err := db.Exec(schema); err != nil {
 		return fmt.Errorf("failed to initialize metrics database schema: %w", err)
 	}
+	for _, name := range []string{"idx_metrics_rule", "idx_security_event_target_rollup_minute"} {
+		if err := dropRedundantMetricsIndex(db, name); err != nil {
+			return err
+		}
+	}
 	// 幂等迁移：为既有指标库补齐 security_events 缺列（全新库由上面的建表语句
-	// 直接带出全部列）。历史修复（历史）：原四个逐字相同的「pragma 查列→缺则
+	// 直接带出全部列）。原四个逐字相同的「pragma 查列→缺则
 	// ADD COLUMN」函数（migrateSecurityEventsTransactionID/RequestContext/
 	// Duration/PrecheckUs）收敛为单一登记点 migrateSecurityEventsColumns。
 	if err := migrateSecurityEventsColumns(db); err != nil {
@@ -410,7 +516,7 @@ func initMetricsSchema(db *sql.DB) error {
 	}
 	// transaction_id 的幂等唯一部分索引（WHERE != ''）让重复事务写入被
 	// OR IGNORE 静默去重，同时保留历史遗留空 transaction_id 行不受唯一约束影响。
-	// 存量重复行：启动期去重（保留每事务最早行）后照常建索引（历史问题，
+	// 存量重复行：启动期去重（保留每事务最早行）后照常建索引
 	// 台账裁定：去重后再建索引，不靠跳过——跳过会让 offset 重建/轮转补采把
 	// 重复事件重新入库并重复喂 autoban/rollup）。
 	if err := ensureSecurityEventsTransactionIndex(db); err != nil {
@@ -423,7 +529,7 @@ func initMetricsSchema(db *sql.DB) error {
 }
 
 // ensureSecurityEventsTransactionIndex 在建立唯一部分索引前检查存量重复事务。
-// 历史问题：发现重复时不再 WARN+跳过（跳过期间 INSERT OR IGNORE 失去
+// 发现重复时不再 WARN+跳过（跳过期间 INSERT OR IGNORE 失去
 // 唯一约束兜底，offset 重建/轮转补采会把重复事件重新入库并重复喂
 // autoban/rollup）——改为启动期一次性去重：每个非空 transaction_id 保留
 // 最早行（MIN(id)，即首次摄取的事件），删除其余重复行后照常建索引，摄取
@@ -563,7 +669,7 @@ func migrateMetricsHistoryBlocked(db *sql.DB) error {
 	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON metrics_history(timestamp)"); err != nil {
 		return fmt.Errorf("failed to recreate metrics_history index: %w", err)
 	}
-	// 历史问题(历史):DROP 重建丢失
+	// DROP 重建丢失
 	// idx_metrics_rule_timestamp(原 schema 块在旧表建,重建后消失)——
 	// 重建后至重启前历史查询全表扫描。同步重建。
 	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS idx_metrics_rule_timestamp ON metrics_history(rule_id, timestamp)"); err != nil {
@@ -574,8 +680,8 @@ func migrateMetricsHistoryBlocked(db *sql.DB) error {
 
 // cleanupMetricsHistoryBatch 是历史清理的单批删除行数：镜像姊妹实现
 // securityEventsRetentionDeleteBatch（internal/services/securityevents_retention.go）
-// 的 历史问题 教训——大批量单语句 DELETE 长时间持指标库写锁，阻塞摄取 tick。
-// 同库同故障形态，同口径分批（历史修复）。做成 var 以便测试收缩批次观察多批行为。
+// 的教训——大批量单语句 DELETE 长时间持指标库写锁，阻塞摄取 tick。
+// 同库同故障形态，同口径分批。做成 var 以便测试收缩批次观察多批行为。
 var cleanupMetricsHistoryBatch = 5000
 
 // CleanupMetricsHistory 按 retentionDays 分批删除过期的 metrics_history 行。
@@ -598,7 +704,7 @@ func CleanupMetricsHistory(retentionDays int) error {
 		if affected == 0 {
 			return nil
 		}
-		// 批间短暂让出写锁，避免长时间阻塞摄取 INSERT（历史问题，与
+		// 批间短暂让出写锁，避免长时间阻塞摄取 INSERT（与
 		// securityEventsRetentionCleanup 同口径）。
 		time.Sleep(10 * time.Millisecond)
 	}

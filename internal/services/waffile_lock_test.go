@@ -1,6 +1,6 @@
 package services
 
-// 历史问题-02（历史问题）：lbbak 导入与三库更新器无写者互斥——CRS 树
+// lbbak 导入与三库更新器无写者互斥——CRS 树
 // 交换、威胁库 .iplist+.fast 写编译、ip2region xdb 安装段各自为政，交错产生
 // 混合/残缺 rules 树（部分防护静默失效）与撕裂 .iplist。修复=包级 wafFileMu
 // 串行化四方文件相位。本文件用「预持锁→调用文件相位→必须阻塞至释放」的

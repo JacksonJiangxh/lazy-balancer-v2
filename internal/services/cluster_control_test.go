@@ -193,7 +193,7 @@ func TestIssueServiceControlTicketPrefersAccessURL(t *testing.T) {
 	}
 }
 
-// 历史问题-12：无 GetBody 的带体请求在同主机 https 升级重定向下返回合成 301
+// 无 GetBody 的带体请求在同主机 https 升级重定向下返回合成 301
 // 空体，且目标端不再收到请求。
 func TestDoWithSameHostTLSUpgradeRedirect_unreplayableBodySynthetic301(t *testing.T) {
 	var hits atomic.Int32
@@ -227,5 +227,28 @@ func TestDoWithSameHostTLSUpgradeRedirect_unreplayableBodySynthetic301(t *testin
 	}
 	if got := hits.Load(); got != 1 {
 		t.Fatalf("target received %d requests, want 1 (no replay for unreplayable body)", got)
+	}
+}
+
+// 降级竞态：handler 角色门通过后节点簿记已降级——带角色条件的读取命中 0 行时
+// 必须复核角色返回 ErrNotMasterNode（403 语义），不得落成 ErrNodeNotFound(404)
+// （否则降级窗口里的调用被误报为「节点不存在」，运营方排查方向被引偏）。
+func TestIssueServiceControlTicket_demotionRaceReturnsNotMaster(t *testing.T) {
+	service, database := newClusterTestService(t)
+	key := sha256.Sum256([]byte("lb_cluster_control-demote-race"))
+	if _, err := database.Exec(`INSERT INTO nodes (id,name,ip_address,port,status,is_approved,cluster_token_hash) VALUES (12,'slave-race','10.0.0.12',8000,'online',1,?)`,
+		hex.EncodeToString(key[:])); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec("UPDATE global_config SET is_master=0 WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := service.IssueServiceControlTicket(context.Background(), 12, models.ClusterServiceActionStopCaddy, time.Now())
+	if !errors.Is(err, ErrNotMasterNode) {
+		t.Fatalf("降级窗口签发票据 error=%v, want ErrNotMasterNode(403 语义)", err)
+	}
+	if errors.Is(err, ErrNodeNotFound) {
+		t.Fatal("降级竞态不得误报为节点不存在(404)")
 	}
 }

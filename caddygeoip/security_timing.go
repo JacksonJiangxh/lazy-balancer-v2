@@ -30,27 +30,27 @@ const (
 )
 
 // recordSecurityTiming 读耗时关联头对（timing ID + 起始纳秒）并把一段耗时写入
-// 进程内计时注册表——历史修复（历史）：SecurityTimingPre/End 两 ServeHTTP
-// 原逐字重复，收敛为 本 helper，segment 区分收点。分段键语义（历史）：
+// 进程内计时注册表——SecurityTimingPre/End 两 ServeHTTP
+// 原逐字重复，收敛为 本 helper，segment 区分收点。分段键语义：
 // pre=预检段（放行由 timing_pre 记；预检拦由 blocked_counter 代记，决策口径）；
 // end 二态——拦截事件=链首→中断全链（blocked_counter），logged 事件=预检完成后
 // →链末（timing_end 读重写后的分段锚点）。头对缺失或起始时间戳不可解析时静默
 // 跳过（耗时是增强信息，不产生请求路径错误）。
 //
-// 历史：写入目标从旧侧车逐行追加（有界 channel 非阻塞丢行）改为进程内
+// 写入目标从旧侧车逐行追加（有界 channel 非阻塞丢行）改为进程内
 // 注册表（auditTimingRecord）——写入恒成功，由审计写插件的 drain goroutine
 // 注入审计行后落盘（零丢弃）。
 func recordSecurityTiming(r *http.Request, segment string) {
 	timingID := r.Header.Get(securityTimingHeader)
 	startNsStr := r.Header.Get(securityTimingStartHeader)
-	// 历史问题（历史）：计时 ID 是进程内注册表 key，头值客户端可控
+	// 计时 ID 是进程内注册表 key，头值客户端可控
 	// （无 counter 的路由无服务端注入/覆盖）——只接受与服务端 securityTimingID
 	// 同形态的 16 字符小写 hex，其余（含超长/非 hex 伪造头）一律静默忽略，
 	// 不得进入注册表（内存 DoS 面）。
 	if timingID != "" && startNsStr != "" && isValidSecurityTimingID(timingID) {
 		if startNs, perr := strconv.ParseInt(startNsStr, 10, 64); perr == nil {
 			us := (time.Now().UnixNano() - startNs) / 1000 // ns→µs
-			// 历史问题：挂钟回拨（或异常起始头解析出的未来时刻）会产生负时长，
+			// 挂钟回拨（或异常起始头解析出的未来时刻）会产生负时长，
 			// 直接注入审计行/UI 是脏数据；耗时下限钳 0（0µs 是合法计时值）。
 			if us < 0 {
 				us = 0
@@ -60,7 +60,7 @@ func recordSecurityTiming(r *http.Request, segment string) {
 	}
 }
 
-// securityTimingID 生成 16 字符随机 hex 作 timing 关联 ID(历史问题:
+// securityTimingID 生成 16 字符随机 hex 作 timing 关联 ID
 // 原 4 字节生日界下 1 万在途即 ~1.2% 任意对碰撞概率——扩到 8 字节对齐
 // coraza tx.ID 长度,碰撞面消除;rand 失败返回空串=该请求不计耗时,静默降级)。
 func securityTimingID() string {
@@ -72,7 +72,7 @@ func securityTimingID() string {
 }
 
 // isValidSecurityTimingID 校验计时 ID 与服务端生成形态（securityTimingID，
-// 8 字节小写 hex）逐形一致——历史问题：该 ID 是计时注册表 key 且头值客户端
+// 8 字节小写 hex）逐形一致——该 ID 是计时注册表 key 且头值客户端
 // 可控，消费侧（recordSecurityTiming/auditTimingRecord）只认 16 字符小写
 // hex，把 key 长度与字符集钉死在生成侧形态上，伪造头灌注册表的内存 DoS
 // 面闭合。

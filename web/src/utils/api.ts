@@ -37,35 +37,35 @@ interface RequestClient {
   get<T = APIResponse<unknown>>(url: string, config?: AxiosRequestConfig): Promise<T>
   post<T = APIResponse<unknown>>(url: string, data?: unknown, config?: AxiosRequestConfig): Promise<T>
   put<T = APIResponse<unknown>>(url: string, data?: unknown, config?: AxiosRequestConfig): Promise<T>
-  // 历史修复：本人资料自助更新——提交新密码必须带 current_password（后端密码确认门）。
+  // 本人资料自助更新——提交新密码必须带 current_password（后端密码确认门）。
   patch(url: '/users/me', data: UpdateCurrentUserInput, config?: AxiosRequestConfig): Promise<APIResponse>
   patch<T = APIResponse<unknown>>(url: string, data?: unknown, config?: AxiosRequestConfig): Promise<T>
   delete<T = APIResponse<unknown>>(url: string, config?: AxiosRequestConfig): Promise<T>
 }
 
 // v2.1.8 MFA step-up 弹码：返回验证码或 null（取消）。
-// 历史修复：并发 428 共享在途弹码 Promise（同码同结果），finally 清空供下一轮
+// 并发 428 共享在途弹码 Promise（同码同结果），finally 清空供下一轮
 // step-up 重新弹窗；下方 verify-step 刷新同样只发一次。
 let mfaPending: Promise<string | null> | null = null
-// 历史修复：在途 verify-step 刷新——同码重放会被后端 MFAVerifyTOTPCode 的
+// 在途 verify-step 刷新——同码重放会被后端 MFAVerifyTOTPCode 的
 // mfa_last_timestep 记录拒绝并计失败，并发等待者必须共享同一次刷新。
 let mfaStepUpRefresh: Promise<void> | null = null
-// 历史问题 八次：MFA 宽限窗提示节流（60 秒一次）
+// MFA 宽限窗提示节流（60 秒一次）
 let lastMfaGraceNoticeAt = 0
-// 历史问题：兜底 toast 的句柄——页面级反馈（mfaAwareSuccess）渲染同文案时关闭它，
+// 兜底 toast 的句柄——页面级反馈（mfaAwareSuccess）渲染同文案时关闭它，
 // 否则用户会同时看到「免验证」兜底条与「免验证+保存成功」业务条两条重复提示。
 let lastMfaGraceNotice: { close: () => void } | null = null
 
-// 历史问题 十三次：最近一次宽限窗放行时间戳——showSaveResult 读取（导出 getter），
+// 最近一次宽限窗放行时间戳——showSaveResult 读取（导出 getter），
 // 距今 <3s 视为「本次保存刚经过宽限窗」，业务 toast 追加（MFA 已验证）。
-// 历史问题 十五次：区分两种来源——grace（用户不知情，业务提示需说明）与 justNow
+// 区分两种来源——grace（用户不知情，业务提示需说明）与 justNow
 //（弹码后重试，用户刚验证过，业务提示不加缀）。
 let mfaGraceLastAt = 0
 let mfaVerifiedJustNowAt = 0
 const wasRecentMfaGrace = (): boolean =>
   Date.now() - mfaGraceLastAt < 3_000 && Date.now() - mfaVerifiedJustNowAt > 3_000
 
-// 历史问题 十八次（用户裁决）：写操作成功提示的统一 MFA 装饰——宽限窗内（用户不知情）
+// （用户裁决）：写操作成功提示的统一 MFA 装饰——宽限窗内（用户不知情）
 // 前缀「MFA 在验证窗口期，本次操作免验证，」；弹码后重试（用户刚验证）不加缀。
 // 所有写事件的成功提示都应经此助手发出。
 export const mfaAwareSuccess = (message: string): void => {
@@ -93,7 +93,7 @@ export const validateMfaCodeInput = (raw: string): boolean => {
 const validateTotpCodeInput = (raw: string): boolean => /^\d{6}$/.test(normalizeMfaCodeInput(raw))
 
 const promptMfaCode = (): Promise<string | null> => {
-  // 历史修复：弹窗已在途时直接共享同一 Promise——并发 428 不再连环弹窗/被误判取消。
+  // 弹窗已在途时直接共享同一 Promise——并发 428 不再连环弹窗/被误判取消。
   if (mfaPending) return mfaPending
   // 新一轮弹码意味着新验证码：作废旧刷新句柄，确认后的等待者各自重试原请求。
   mfaStepUpRefresh = null
@@ -204,13 +204,13 @@ service.interceptors.request.use(
 service.interceptors.response.use(
   (response) => {
     const res = response.data
-    // 历史问题 八次→十三次（用户裁决）：宽限窗放行时记录时间戳（mfaGraceLastAt）——
+    // →十三次（用户裁决）：宽限窗放行时记录时间戳（mfaGraceLastAt）——
     // showSaveResult 等页面级反馈读取它，在「保存成功」等 toast 文案后追加
     // 「（MFA 已验证）」；silent 请求（无页面级反馈）弹独立 info 兜底（60s 节流）。
     const mfaVerifiedAgo = response.headers?.['x-mfa-verified-seconds-ago']
     if (mfaVerifiedAgo !== undefined) {
       mfaGraceLastAt = Date.now()
-      // 历史问题：弹码验证后的自动重试不再发「免验证」兜底——用户刚输完码（与 历史问题 十五次
+      // 弹码验证后的自动重试不再发「免验证」兜底——用户刚输完码（与十五次
       // 页面级反馈同口径）；且新 toast 发出前关闭上一条，避免连发重复。
       if (response.config?.silent && Date.now() - mfaVerifiedJustNowAt > 3_000) {
         const now = Date.now()
@@ -225,7 +225,7 @@ service.interceptors.response.use(
       if (!response.config.silent) {
         ElMessage.error(res.message || '请求失败')
       }
-      // 业务码失败与 HTTP 失败统一错误类型（历史问题）：调用方按
+      // 业务码失败与 HTTP 失败统一错误类型：调用方按
       // instanceof ApiRequestError 判别（如 409/业务码分支）时不再漏判。
       return Promise.reject(new ApiRequestError(res.message || '请求失败', response.status))
     }
@@ -259,13 +259,13 @@ service.interceptors.response.use(
     const message = backendMsg || fallback || '网络错误'
     const isLoginRequest = error.config?.url?.includes('/auth/login') || error.config?.url?.includes('/auth/ticket-login')
     if (status === 401) {
-      // 历史问题 D-新2：MFA 自助端点的 401 是「凭证错误」（持有效 JWT 输错密码/验证码），
+      // D-新2：MFA 自助端点的 401 是「凭证错误」（持有效 JWT 输错密码/验证码），
       // 不是会话失效——直接传播后端文案，不得弹「会话失效」并强制登出。
-      // 历史问题 补正：管理员重置端点 /users/:id/mfa/reset 同样以 401 返回「验证码错误」，
+      // 补正：管理员重置端点 /users/:id/mfa/reset 同样以 401 返回「验证码错误」，
       // 需同口径放行（Users.vue 的 catch 展示后端文案供重试），否则误杀会话。
-      // 历史问题：只有后端明确的「当前密码错误」才豁免会话失效；同端点的
+      // 只有后端明确的「当前密码错误」才豁免会话失效；同端点的
       // token 过期/未登录 401 仍必须进入下方重新登录流程。
-      // 历史问题-04：MFA 端点同样收窄到后端文案白名单（验证码/挑战错误）——
+      // MFA 端点同样收窄到后端文案白名单（验证码/挑战错误）——
       // 428→verify-step 窗口内的会话过期 401 必须弹「会话失效」并重登。
       const isSelfProfileCurrentPasswordError = isCurrentPasswordRejection(
         error.config?.method,
@@ -287,7 +287,7 @@ service.interceptors.response.use(
           // 用户指令（会话过期全站止损）：置位后请求拦截器拒绝后续所有出站请求，
           // 阻断弹窗等待期间轮询器的 401 刷屏；随确认后的 reload 一并消亡。
           sessionExpiredDetected = true
-          // 历史问题 D-新1：confirm 的取消分支与确定行为完全相同，「取消」形同虚设且误导
+          // D-新1：confirm 的取消分支与确定行为完全相同，「取消」形同虚设且误导
           // ——改单按钮 alert（会话已死，任何请求都会 401，刷新是唯一合理结局）。
           ElMessageBox.alert(backendMsg || '登录已过期，请重新登录', '会话失效', {
             confirmButtonText: '重新登录',
@@ -306,7 +306,7 @@ service.interceptors.response.use(
         const authStore = useAuthStore()
         const code = await promptMfaCode()
         if (code) {
-          // 历史修复：并发 428 共享同一次 verify-step（同码重放会被后端 mfa_last_timestep
+          // 并发 428 共享同一次 verify-step（同码重放会被后端 mfa_last_timestep
           // 拒绝并计失败锁定），所有等待者用刷新后的 token 各自重试原请求。
           if (!mfaStepUpRefresh) {
             mfaStepUpRefresh = authStore.refreshMfaStep(code).finally(() => {
@@ -314,7 +314,7 @@ service.interceptors.response.use(
             })
           }
           await mfaStepUpRefresh
-          // 历史问题 十五次（用户裁决）：验证成功不再独立 toast——用户刚输完码知道
+          // （用户裁决）：验证成功不再独立 toast——用户刚输完码知道
           // 验证成功，反馈并入重试后的业务提示（宽限头会照常发出，但
           // wasRecentMfaGrace 因 justNow 标记而不加缀）。
           mfaVerifiedJustNowAt = Date.now()
@@ -325,13 +325,13 @@ service.interceptors.response.use(
         if (!error.config?.silent) {
           ElMessage.warning('已取消 MFA 验证，操作未执行')
         }
-        // 历史修复：静默取消同样以中文文案 reject，避免下方透出 428 英文常量。
+        // 静默取消同样以中文文案 reject，避免下方透出 428 英文常量。
         return Promise.reject(new ApiRequestError('已取消 MFA 验证，操作未执行', status))
       } catch (stepError: unknown) {
-        // 历史问题 D-新2/D-新4：verify-step 失败（如输错码，401 文案已由 /auth/mfa/
+        // D-新2/D-新4：verify-step 失败（如输错码，401 文案已由 /auth/mfa/
         // 豁免分支携带）——给出可见反馈，不再静默吞掉。
         ElMessage.error(stepError instanceof Error ? stepError.message : 'MFA 验证未完成')
-        // 历史修复：已 toast 的错误打标，下游 catch（Users.vue resetMfa）跳过二次弹窗。
+        // 已 toast 的错误打标，下游 catch（Users.vue resetMfa）跳过二次弹窗。
         if (stepError instanceof Error) {
           ;(stepError as Error & { mfaSurfaced?: boolean }).mfaSurfaced = true
         }

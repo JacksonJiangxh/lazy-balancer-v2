@@ -29,7 +29,7 @@ func setupSecurityPolicyTestDB(t *testing.T) {
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
-		// 历史问题（历史，历史修复 家族漏收敛点）：直换包级句柄必须同步复位
+		// 直换包级句柄必须同步复位
 		// currentDB——否则 GetDB()/后台循环继续持有已关闭的测试库句柄。
 		db.SetDB(oldDB)
 	})
@@ -899,7 +899,7 @@ func TestUpdateSecurityPolicy_anomalyThresholdZeroNormalizesToFive(t *testing.T)
 	router := newSecurityRouter(t)
 	id := createTestPolicy(t, router, map[string]any{"name": "阈值归一策略", "mode": "blocking"})
 
-	// When 更新请求显式传 anomaly_threshold=0（历史问题：0 非合法枚举值，直接
+	// When 更新请求显式传 anomaly_threshold=0（0 非合法枚举值，直接
 	// 落库会让发射端 services/security.go:157 的 `AnomalyThreshold > 0` 判断
 	// 跳过 SecAction id:900，CRS 回落默认阈值 5，UI 显示 0 与实际行为不符）
 	recorder := putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{
@@ -930,7 +930,7 @@ func TestUpdateSecurityPolicy_rejectsBlankIPACLMode(t *testing.T) {
 		"ip_acl_list":    `["203.0.113.0/24"]`,
 	})
 
-	// When 更新请求显式传空串 ip_acl_mode（历史问题：空串落库后发射端
+	// When 更新请求显式传空串 ip_acl_mode（空串落库后发射端
 	// services/security.go 仅 allow/deny 分支产出规则，零 ACL 规则生效；而
 	// SecurityPolicyHasIPControl 只看 enabled && list 非空，UI 仍宣称已启用）
 	recorder := putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{"ip_acl_mode": ""})
@@ -964,7 +964,7 @@ func TestCreateSecurityPolicy_defaultsIPACLMode(t *testing.T) {
 	})
 
 	// Then ip_acl_mode 按 geoip_mode 同口径归一为 "deny"：启用态 ACL 绝不携带
-	// 空模式落库（空模式在发射端产出零规则，历史问题）
+	// 空模式落库（空模式在发射端产出零规则）
 	var mode string
 	if err := db.DB.QueryRow("SELECT ip_acl_mode FROM security_policies WHERE id=?", id).Scan(&mode); err != nil {
 		t.Fatalf("read back ip_acl_mode: %v", err)
@@ -975,7 +975,7 @@ func TestCreateSecurityPolicy_defaultsIPACLMode(t *testing.T) {
 }
 
 // seedNullColumnPolicy 写入一条多个可空列显式为 NULL 的策略（模拟带外编辑/
-// 备份恢复/集群继承产生的 NULL 行），返回策略 ID。历史问题 测试共用。
+// 备份恢复/集群继承产生的 NULL 行），返回策略 ID。测试共用。
 func seedNullColumnPolicy(t *testing.T, name string) int64 {
 	t.Helper()
 	result, err := db.DB.Exec(`INSERT INTO security_policies
@@ -991,7 +991,7 @@ func seedNullColumnPolicy(t *testing.T, name string) int64 {
 	return id
 }
 
-// 历史问题 硬化（ListSecurityPolicies）：策略行可空列修复前原样扫入非指针字段——
+// 硬化（ListSecurityPolicies）：策略行可空列修复前原样扫入非指针字段——
 // 单行 NULL 即 Scan 报错，整个策略列表对 REST/MCP 消费方 500，而生成路径
 // （services/security.go scanSecurityPolicyByID）对同样 NULL 已按 COALESCE 口径
 // 容忍。修复后列表 SELECT 与生成投影逐列同默认值，NULL 行照常返回。
@@ -1026,7 +1026,7 @@ func TestListSecurityPolicies_toleratesNullNullableColumns(t *testing.T) {
 	}
 }
 
-// 历史问题 硬化（GetSecurityPolicy）：详情读路径与列表同口径——单行 NULL 不得把
+// 硬化（GetSecurityPolicy）：详情读路径与列表同口径——单行 NULL 不得把
 // 详情接口打成 500，归一化默认值与生成投影一致。
 func TestGetSecurityPolicy_toleratesNullNullableColumns(t *testing.T) {
 	// Given 一条多个可空列为 NULL 的策略
@@ -1133,9 +1133,9 @@ func TestCreateSecurityPolicy_rejectsUnknownMode(t *testing.T) {
 	}
 }
 
-// 历史修复(2026-09-10 审计):IP ACL allow 模式+空生效名单——发射端 len>0 门静默跳过
+// (2026-09-10 审计):IP ACL allow 模式+空生效名单——发射端 len>0 门静默跳过
 // (「其余一律拒绝」实际全放行 fail-open)。UI 有守卫,API/MCP 直写可绕;按
-// 历史问题 同型先例在写入侧 400(与 UI 文案同口径)。
+// 同型先例在写入侧 400(与 UI 文案同口径)。
 func TestCreateSecurityPolicy_rejectsAllowModeWithEmptyACLList(t *testing.T) {
 	// Given
 	setupSecurityPolicyTestDB(t)
@@ -1152,7 +1152,7 @@ func TestCreateSecurityPolicy_rejectsAllowModeWithEmptyACLList(t *testing.T) {
 	}
 }
 
-// 历史修复(2026-09-10 审计):HasCustomRules 需带模式门——off=全关(2026-09-09 四态化)
+// (2026-09-10 审计):HasCustomRules 需带模式门——off=全关(2026-09-09 四态化)
 // 后,off 策略的自定义规则不发射,能力列不得宣称「按规则内动作执行」。
 func TestSecurityPolicySummary_offModeHasCustomRulesFalse(t *testing.T) {
 	// Given
@@ -1178,7 +1178,7 @@ func TestSecurityPolicySummary_offModeHasCustomRulesFalse(t *testing.T) {
 	}
 }
 
-// 历史问题(历史):UpdateSecurityPolicy 限流门用请求裸值而非有效值回落
+// UpdateSecurityPolicy 限流门用请求裸值而非有效值回落
 // ——存量 rps=10 的策略发 {rate_limit_enabled:true}(部分重启用)时,
 // derefInt(req.RateLimitRPS)=0 → 400 误报「rps 必须 ≥1」;显式 {rate_limit_rps:0}
 // 时门短路 → 落库 enabled=1+rps=0 → UI 宣称限流启用实际零强制。
@@ -1208,20 +1208,20 @@ func TestUpdateSecurityPolicy_rateLimitGateUsesEffectiveValues(t *testing.T) {
 	}
 }
 
-// 历史问题：详情/列表 DTO 必须携带爬虫豁免两列。修复前两处均缺席 → 前端
+// 详情/列表 DTO 必须携带爬虫豁免两列。修复前两处均缺席 → 前端
 // 编辑策略时读不到（按 false/默认三引擎渲染），保存时恒回写 false，任何
 // 「重命名/改描述」都会静默关闭爬虫豁免（安全行为变更）。
 func TestSecurityPolicyDTO_crawlerExemptionRoundTrip(t *testing.T) {
 	// Given 一条开启爬虫豁免（引擎限 googlebot）的策略
 	setupSecurityPolicyTestDB(t)
-	// 启用态地域条目需要已装载的 IP 库（ValidateGeoIPCountries 历史修复 门）
+	// 启用态地域条目需要已装载的 IP 库（ValidateGeoIPCountries 门）
 	services.SetIP2RegionLiveProvincesForTest([]string{"海外", "广东省"})
 	t.Cleanup(func() { services.SetIP2RegionLiveProvincesForTest(nil) })
 	router := newSecurityRouter(t)
 	id := createTestPolicy(t, router, map[string]any{
 		"name":       "爬虫豁免策略",
 		"geoip_mode": "deny",
-		// 历史修复 启用态空名单 400 → 给一条真实地域条目
+		// 启用态空名单 400 → 给一条真实地域条目
 		"geoip_countries":       `["海外"]`,
 		"geoip_crawler_exempt":  true,
 		"geoip_crawler_engines": `["googlebot"]`,

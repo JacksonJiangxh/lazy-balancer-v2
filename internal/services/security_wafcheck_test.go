@@ -7,11 +7,11 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 回归锁定（历史问题；历史修复头注改写为现行链路口径）：DB
+// 回归锁定（头注改写为现行链路口径）：DB
 // waf_check_response 列必须经 scanSecurityPolicyByID（生产等价路径
 // GetSecurityPoliciesForRule 同用的 SQL 扫描）加载并传导至
 // BuildCorazaDirectives——否则「检查响应体」开关在 Caddy 渲染层被静默关闭。
-// GetSecurityPolicyForRule 已经 历史问题 退役为测试专用 helper（生产面零调用），
+// GetSecurityPolicyForRule 已经退役为测试专用 helper（生产面零调用），
 // 本测试的独立价值=「DB 列→渲染」端到端形状钉。
 func TestGetSecurityPolicyForRule_LoadsWafCheckResponse(t *testing.T) {
 	dir := t.TempDir()

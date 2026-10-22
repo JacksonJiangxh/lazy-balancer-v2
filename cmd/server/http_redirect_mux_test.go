@@ -247,7 +247,7 @@ func TestHTTPRedirectMux_Accept_backsOffTemporaryErrorsWithoutTimeout(t *testing
 	}
 }
 
-// 历史问题-1：嗅探槽耗尽时不得静默关闭连接（原实现 Close——静默连接占满
+// 嗅探槽耗尽时不得静默关闭连接（原实现 Close——静默连接占满
 // 128 槽后管理面板的全部新连接含 TLS 握手被拒）。修复后溢出连接交 TLS
 // 接受路径：Accept 必须返回该连接而不是无限等待。
 func TestHTTPRedirectMux_sniffSlotExhaustionHandsConnectionToTLS(t *testing.T) {

@@ -16,11 +16,11 @@ import (
 )
 
 // 2026-09-06 裁定 ①② 的契约测试（只有可渲染配置可落库，杜绝坏配置持久化后
-// 重启全停）：安全域写入口从家族 1（先提交后重放）转家族 3（事务内应用门控
-// 提交）后——
+// 重启全停）：安全域写入口从「先提交后重放」转到事务内应用门控提交后——
 //
 //	渲染拒绝（Caddy 4xx）→ 400 + DB 未落库 + 「<动作>失败」审计；
-//	传输失败（Caddy 不可达）→ 退化家族 1 语义：200 + 落库 + 重载失败审计
+//	传输失败（Caddy 不可达）→ 退化语义（与直应用通道同口径）：200 + 落库 +
+//	重载失败审计
 //	（与转换前行为等价，守护不回归）。
 func newSecurityGateRouter(t *testing.T, rejectLoads bool) *gin.Engine {
 	t.Helper()
@@ -99,7 +99,7 @@ func TestSecurityWrites_transportFailureDegradesToCommit(t *testing.T) {
 	request.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(rec, request)
 
-	// Then：退化家族 1——200 + 落库 + 重载失败审计（Caddy down 不阻断保存）
+	// Then：退化语义——200 + 落库 + 重载失败审计（Caddy down 不阻断保存）
 	if rec.Code != http.StatusOK {
 		t.Fatalf("create status=%d body=%s, want 200（传输失败退化为保存+标记）", rec.Code, rec.Body.String())
 	}
@@ -169,7 +169,7 @@ func TestSecurityWrites_serializeWithRuleWrites(t *testing.T) {
 	}
 }
 
-// 历史修复（源码文本断言退役）：绑定必须先于 caddyOpMu——可观察契约是
+// （源码文本断言退役）：绑定必须先于 caddyOpMu——可观察契约是
 // 「请求体尚未到齐时不得持共享锁」。以阻塞 body 证明：处理器读完 body 之后才
 // 触碰 caddyOpMu，慢客户端不会把规则域/安全域的全部写操作串行化在锁上。
 func TestSecurityWrite_parsesBodyBeforeCaddyOpLock(t *testing.T) {

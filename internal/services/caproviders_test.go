@@ -57,7 +57,7 @@ func TestCAProviderQueries_returns_credentials(t *testing.T) {
 }
 
 func TestCAProviderService_TestCAProviderWithContext_honors_parent_cancellation(t *testing.T) {
-	// 自有 DB 隔离（历史修复）：不得隐式依赖前置测试泄漏的 db.DB 全局。
+	// 自有 DB 隔离：不得隐式依赖前置测试泄漏的 db.DB 全局。
 	newClusterTestService(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -107,7 +107,7 @@ func TestCAProviderService_TestCAProviderWithContext_bounds_EAB_auto_provision_w
 		t.Fatalf("seed acme email: %v", err)
 	}
 
-	// 历史修复：伪 ZeroSSL EAB 端点延迟响应，晚于注入的 100ms 时限。父 ctx
+	// 伪 ZeroSSL EAB 端点延迟响应，晚于注入的 100ms 时限。父 ctx
 	// 为 Background（永不取消），服务端不自败——若 EAB 自动获取未被独立超时
 	// 包裹（原实现仅 RegisterAccount 有 10s 界），本调用将阻塞至 30s HTTP
 	// 客户端兜底；唯一可能的快速取消源即子超时。
@@ -256,7 +256,7 @@ func TestCAProviderService_UpdateCAProvider_rejects_disabling_last_enabled(t *te
 	}
 }
 
-// 历史修复（历史）：LE 凭证纯空白（如 "  "）通过空判定后原样落库，
+// LE 凭证纯空白（如 " "）通过空判定后原样落库，
 // 前端 parseCACredentials 对非空串走 JSON.parse 即抛错——归一为空串落库
 // （parseCACredentials 对空串走 falsy 分支）。
 func TestCAProviderService_UpdateCAProvider_normalizes_letsencrypt_whitespace_credentials(t *testing.T) {
@@ -307,7 +307,7 @@ func TestCAProviderService_UpdateCAProvider_normalizes_letsencrypt_whitespace_cr
 	}
 }
 
-// 历史修复（历史）：UpdateCAProvider 返回事务内读到的旧行——handler 审计
+// UpdateCAProvider 返回事务内读到的旧行——handler 审计
 // changed 清单的比对基线不再依赖事务外预读（预读与事务提交之间的并发写入
 // 会让清单基于陈旧旧值，漏记/多记变更字段）。
 func TestCAProviderService_UpdateCAProvider_returns_in_transaction_old_row(t *testing.T) {
@@ -351,7 +351,7 @@ func TestCAProviderService_UpdateCAProvider_returns_in_transaction_old_row(t *te
 }
 
 func TestMaskEmail_multibyteLocalPartStaysValidUTF8(t *testing.T) {
-	// 历史问题-15（历史）：@ 前缀为多字节 UTF-8（如 CJK 邮箱本地部分）
+	// @ 前缀为多字节 UTF-8（如 CJK 邮箱本地部分）
 	// 时，按字节截断前两个「字符」会切在 rune 中间产出非法 UTF-8 残片——
 	if got := maskEmail("张小三abc@example.com"); got != "张小***@example.com" {
 		t.Fatalf("maskEmail(张小三abc@example.com)=%q, want 张小***@example.com（前两个 rune）", got)
@@ -366,7 +366,7 @@ func TestMaskEmail_multibyteLocalPartStaysValidUTF8(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：「最后一个启用」守卫的语义矩阵钉测试。守卫已收敛为
+// 「最后一个启用」守卫的语义矩阵钉测试。守卫已收敛为
 // 原子条件 UPDATE（WHERE 子查询），逐形状钉住：放行形态/拦截形态/错误优先级/
 // 非禁用写不受守卫影响。
 func TestCAProviderService_UpdateCAProvider_lastEnabledGuard_matrix(t *testing.T) {
@@ -447,7 +447,7 @@ func TestCAProviderService_UpdateCAProvider_lastEnabledGuard_matrix(t *testing.T
 	}
 }
 
-// 历史修复（历史）：并发禁用仅剩的两个启用提供商时，启用计数恒不为零——
+// 并发禁用仅剩的两个启用提供商时，启用计数恒不为零——
 // 一个禁用成功、另一个必须被守卫拒绝（ErrCAProviderLastEnabled），禁止静默
 // 击穿到「零启用」（该状态会让全部 ACME 签发/续签失败）。原子条件 UPDATE
 // 形态下该不变量由数据库在写锁内保证，本测试钉住端到端可观察结果。
@@ -503,9 +503,9 @@ func TestCAProviderService_UpdateCAProvider_concurrentDisable_neverReachesZeroEn
 	}
 }
 
-// ---- 历史（历史问题 / 历史问题）----
+// ---- 回归钉 ----
 
-// 历史问题：默认提供商禁用守卫必须有钉测——此前 ErrCAProviderDefault
+// 默认提供商禁用守卫必须有钉测——此前 ErrCAProviderDefault
 // 零测试引用，守卫读失败还 fail-open（静默跳过）。
 func TestUpdateCAProvider_rejects_disabling_default_provider(t *testing.T) {
 	_, database := newClusterTestService(t)
@@ -534,7 +534,7 @@ func TestUpdateCAProvider_rejects_disabling_default_provider(t *testing.T) {
 	}
 }
 
-// 历史问题：global_config 行缺失（ErrNoRows）语义=未配置默认提供商——守卫
+// global_config 行缺失（ErrNoRows）语义=未配置默认提供商——守卫
 // 不适用，禁用应放行（fail-closed 只针对读故障，不针对「无默认」这一合法态）。
 func TestUpdateCAProvider_missing_global_config_row_means_no_default(t *testing.T) {
 	_, database := newClusterTestService(t)
@@ -556,7 +556,7 @@ func TestUpdateCAProvider_missing_global_config_row_means_no_default(t *testing.
 	}
 }
 
-// 历史问题：默认提供商守卫的读取故障必须 fail-closed（返回错误），不得静默
+// 默认提供商守卫的读取故障必须 fail-closed（返回错误），不得静默
 // 跳过守卫——否则可禁用当前默认提供商，令 0 值引用规则静默改派。
 func TestUpdateCAProvider_default_guard_fails_closed_on_read_error(t *testing.T) {
 	_, database := newClusterTestService(t)
@@ -564,7 +564,7 @@ func TestUpdateCAProvider_default_guard_fails_closed_on_read_error(t *testing.T)
 	if err := database.QueryRow(`SELECT id FROM ca_providers WHERE enabled=1 ORDER BY id LIMIT 1`).Scan(&providerID); err != nil {
 		t.Fatalf("read enabled provider: %v", err)
 	}
-	if _, err := database.Exec(`ALTER TABLE global_config RENAME TO global_config_audit87`); err != nil {
+	if _, err := database.Exec(`ALTER TABLE global_config RENAME TO global_config_broken`); err != nil {
 		t.Fatalf("rename global_config: %v", err)
 	}
 	disabled := false
@@ -585,7 +585,7 @@ func TestUpdateCAProvider_default_guard_fails_closed_on_read_error(t *testing.T)
 	}
 }
 
-// 历史问题：EAB 落库后必须递增 caProviderConfigVersion，令队列缓存的 provider
+// EAB 落库后必须递增 caProviderConfigVersion，令队列缓存的 provider
 // 快照失效（否则积压任务继续持空 EAB，签发前重复请求 ZeroSSL API）。
 func TestAutoProvisionZeroSSLEAB_bumps_provider_config_version(t *testing.T) {
 	_, database := newClusterTestService(t)

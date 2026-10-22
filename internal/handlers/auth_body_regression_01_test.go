@@ -12,7 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// 历史修复：公开 auth 端点的请求体上限——ContentLength 预检 413、chunked 读中途
+// 公开 auth 端点的请求体上限——ContentLength 预检 413、chunked 读中途
 // 超限走 binding 400 分支、合法小 body 照常进业务分支。限频中间件不在链上
 // （仅验体积门；loginRateLimit 只限次数不限体积正是缺陷背景）。
 func TestAuthEndpoints_reject_oversized_body(t *testing.T) {

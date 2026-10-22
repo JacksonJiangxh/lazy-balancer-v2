@@ -149,7 +149,7 @@ func TestMigrateSecurityPolicyCustomOnlyMode(t *testing.T) {
 	}
 }
 
-// 历史修复(2026-09-10 审计):迁移 SQL 对畸形 custom_rules JSON 无容错——json_each 抛
+// (2026-09-10 审计):迁移 SQL 对畸形 custom_rules JSON 无容错——json_each 抛
 // malformed JSON 会让 runMigrations 失败→启动失败。修复后畸形行跳过(不迁移不
 // 炸),其余行照常迁移。
 func TestMigrateSecurityPolicyCustomOnlyMode_toleratesMalformedJSON(t *testing.T) {
@@ -184,7 +184,7 @@ func TestMigrateSecurityPolicyCustomOnlyMode_toleratesMalformedJSON(t *testing.T
 	}
 }
 
-// 历史问题(历史问题):导入归一 SQL 缺 json_type 门——顶层字符串形状使
+// 导入归一 SQL 缺 json_type 门——顶层字符串形状使
 // json_each→json_extract 抛 malformed JSON→整包导入 500 回滚。
 // 迁移路径(db.go)已有双门,导入路径必须同口径。
 // 此测试直接跑与 config_backup.go 导入归一同款 SQL 形状,验证顶层字符串不炸。

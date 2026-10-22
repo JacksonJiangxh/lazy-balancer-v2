@@ -50,7 +50,7 @@ func (h *Handlers) ControlClusterNodeService(c *gin.Context) {
 	if !h.requireMaster(c) {
 		return
 	}
-	// 历史问题（历史）：特权服务控制的所有失败早退（编号非法/体解析失败/
+	// 特权服务控制的所有失败早退（编号非法/体解析失败/
 	// 动作不支持/票据签发失败）此前零审计，越权探测与故障签发在操作日志中不可见。
 	// 统一经 recordAudit 留痕「失败」；动作串经 registerAuditField 截断去控制字符。
 	auditFailure := func(nodeID int, detail string) {
@@ -79,6 +79,13 @@ func (h *Handlers) ControlClusterNodeService(c *gin.Context) {
 	}
 	issued, err := h.clusterService.IssueServiceControlTicket(c.Request.Context(), nodeID, req.Action, time.Now())
 	if err != nil {
+		// 服务层降级竞态：handler 角色门通过后节点簿记已降级——与 requireMaster
+		// 门同源 403（携带 X-LB-Error-Code），不得折叠成 404/500。
+		if errors.Is(err, services.ErrNotMasterNode) {
+			auditFailure(nodeID, "签发票据失败（动作："+registerAuditField(req.Action)+"）")
+			clusterMasterForbidden(c, err)
+			return
+		}
 		status := http.StatusInternalServerError
 		switch {
 		case errors.Is(err, services.ErrNodeNotFound):
@@ -96,7 +103,7 @@ func (h *Handlers) ControlClusterNodeService(c *gin.Context) {
 		result = "失败"
 	}
 	recordAudit(c, "服务控制", "节点服务", services.FormatAuditDetail(
-		// 历史问题:补节点 ID(nodes.name 无 UNIQUE,仅名无法定位行)。
+		// 补节点 ID(nodes.name 无 UNIQUE,仅名无法定位行)。
 		fmt.Sprintf("节点 %d（%s）", nodeID, issued.NodeName), "操作："+req.Action, "结果："+result))
 	if err != nil {
 		var rejected *clusterServiceControlRejection
@@ -104,7 +111,7 @@ func (h *Handlers) ControlClusterNodeService(c *gin.Context) {
 			c.JSON(http.StatusBadGateway, models.APIResponse{Code: http.StatusBadGateway, Message: rejected.message})
 			return
 		}
-		// 历史问题：指纹不匹配必须与通用不可达区分下发——否则前端无法提示
+		// 指纹不匹配必须与通用不可达区分下发——否则前端无法提示
 		//「清除该节点证书指纹」补救通道（该信息此前只进服务端日志）。
 		if errors.Is(err, services.ErrClusterPinMismatch) {
 			clusterError(c, http.StatusBadGateway, "从节点证书指纹不匹配（该节点管理面板证书可能已更换），可清除该节点证书指纹后重试", err)
@@ -127,10 +134,10 @@ func (h *Handlers) callClusterServiceControl(ctx context.Context, baseURL, actio
 		return "", fmt.Errorf("构造服务控制请求: %w", err)
 	}
 	request.Header.Set("Content-Type", "application/json")
-	// 历史问题（历史）：从节点启用管理 HTTPS 后明文端口 301——按集群同步
+	// 从节点启用管理 HTTPS 后明文端口 301——按集群同步
 	// 同一契约对同主机 https Location 重放一次，否则票据调用在空 body 上报解析
 	// 错误、服务控制全线不可用。
-	// 历史问题-04：客户端按请求构造（工厂是测试注入点），其 Transport 自带连接池
+	// 客户端按请求构造（工厂是测试注入点），其 Transport 自带连接池
 	// 且 IdleConnTimeout=90s——此前无关闭动作，每次控制调用都会留下一批空闲
 	// 连接与读循环 goroutine 直到空闲超时。用完即关闭空闲连接（body 已读完后
 	// 才执行，不影响本次请求）。
@@ -141,16 +148,21 @@ func (h *Handlers) callClusterServiceControl(ctx context.Context, baseURL, actio
 		return "", fmt.Errorf("调用从节点服务控制: %w", err)
 	}
 	defer response.Body.Close()
-	// 历史问题（历史）：同主机 https 升级已由 DoWithSameHostTLSUpgradeRedirect
+	// 同主机 https 升级已由 DoWithSameHostTLSUpgradeRedirect
 	// 重放，残留 3xx（跨主机/反代重定向）的空 body 落进 JSON 解析只会报
 	// 「unexpected end of JSON input」——与集群同步 Pull/Register 3xx 分支同款
 	// 可行动指引，在读 body 前拦截。
 	if response.StatusCode >= 300 && response.StatusCode < 400 {
 		return "", fmt.Errorf("从节点返回 %d 重定向(%s)——从节点启用 HTTPS 后请将该节点的访问地址改为 https://，或修正反向代理配置后重试", response.StatusCode, response.Header.Get("Location"))
 	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, clusterServiceControlMaxBytes))
+	body, err := io.ReadAll(io.LimitReader(response.Body, clusterServiceControlMaxBytes+1))
 	if err != nil {
 		return "", fmt.Errorf("读取从节点响应: %w", err)
+	}
+	// 与同族读端点一致的 limit+1 探测：超限显式报错，不把截断体交给 JSON
+	// 解析（只会得到「unexpected end of JSON input」并掩盖真实原因）。
+	if int64(len(body)) > clusterServiceControlMaxBytes {
+		return "", fmt.Errorf("从节点响应超过 %dKB 读取上限", clusterServiceControlMaxBytes>>10)
 	}
 	var slaveResponse models.APIResponse
 	if err := json.Unmarshal(body, &slaveResponse); err != nil {
@@ -176,7 +188,7 @@ func (h *Handlers) ClusterServiceControl(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, clusterServiceControlMaxBytes)
 	var req models.ClusterServiceControlRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		// 历史修复（历史）：解析失败时 Action 多为零值空串，审计
+		// 解析失败时 Action 多为零值空串，审计
 		// 「操作：」段落空——无法区分「动作未知的畸形请求」。部分绑定成功的
 		// 形态保留实际动作，空串以「<解析失败>」占位符显式留痕。
 		action := req.Action
@@ -203,7 +215,7 @@ func (h *Handlers) ClusterServiceControl(c *gin.Context) {
 		return
 	}
 	if req.Action == models.ClusterServiceActionRestartApp {
-		// 历史问题：与 caddy 分支同口径带 operator——空 operator 回退「主节点」，
+		// 与 caddy 分支同口径带 operator——空 operator 回退「主节点」，
 		// 非空则记录主节点侧实际操作人（此前 restart_app 恒匿名）。
 		recordClusterServiceControlAuditBy(c, req.Action, "已接受：服务即将重启", req.Operator)
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "服务正在重启"})
@@ -219,7 +231,7 @@ func (h *Handlers) ClusterServiceControl(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: http.StatusInternalServerError, Message: err.Error()})
 		return
 	}
-	// 历史修复:成功消息一并落审计——从节点操作日志可见「配置已从数据库载入」等
+	// 成功消息一并落审计——从节点操作日志可见「配置已从数据库载入」等
 	// 实际执行细节(原仅记「成功」,消息只回传主节点不落从节点审计)
 	recordClusterServiceControlAuditBy(c, req.Action, "成功："+message, req.Operator)
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: message})
@@ -266,7 +278,7 @@ func recordClusterServiceControlAudit(c *gin.Context, action, result string) {
 // recordClusterServiceControlAuditBy 带 operator 版——从节点审计记录主节点侧
 // 实际操作人(经票据保护的转发链传递);空串回退「主节点」(兼容旧主节点)。
 func recordClusterServiceControlAuditBy(c *gin.Context, action, result, operator string) {
-	// 历史问题（历史）：action/operator 来自请求体，须先经 registerAuditField
+	// action/operator 来自请求体，须先经 registerAuditField
 	// 清洗（去控制字符、截断 128B）再拼接，防伪造换行/超长注入审计详情。
 	op := registerAuditField(operator)
 	if op == "" {

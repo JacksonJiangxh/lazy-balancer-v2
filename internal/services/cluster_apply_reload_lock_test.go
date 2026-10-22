@@ -1,6 +1,6 @@
 package services
 
-// 历史问题-01（历史问题）：从端 applySnapshot 末段「渲染+强制重载」绕过
+// 从端 applySnapshot 末段「渲染+强制重载」绕过
 // CaddyOpLock——与重启 watcher（渲染 DB→/load，持 CaddyOpLock）交错时，跨同步
 // commit 点的旧渲染可后到覆盖新配置，从节点静默回退上一版本（三通道自愈全
 // 探不到）。修复=重载段包入 CaddyOpLock（Pull 路径锁不反向嵌套——锁内仅

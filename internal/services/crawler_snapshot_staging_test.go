@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// 历史修复 follow-up: snapshot writers may run concurrently (crawler task and
+// snapshot writers may run concurrently (crawler task and
 // backup import). A fixed ".tmp" sibling can collide; staging must be unique.
 func TestWriteCrawlerIPListSnapshotAll_usesUniqueTemporaryFile(t *testing.T) {
 	// Given the legacy fixed temp path occupied by an unrelated directory.

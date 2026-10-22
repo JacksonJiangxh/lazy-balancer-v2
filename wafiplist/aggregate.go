@@ -32,7 +32,7 @@ func AggregatePrefixes(entries []string) []netip.Prefix {
 // ——既是 @ipListFast 二分检索的加载形态，也是渲染层名单的规范发射形态。
 // 不变量：聚合前后匹配集合逐点相等。
 //
-// 单源原语（历史问题）：字符串入口（AggregatePrefixes/AggregateIPEntries）与
+// 单源原语：字符串入口（AggregatePrefixes/AggregateIPEntries）与
 // 「解析已完成」的调用方（名单加载、.fast 编译、选项树）共用同一聚合实现——
 // 同一条目只解析一次，不再「校验一次 + 聚合再解析一次」。
 func AggregateParsedPrefixes(parsed []netip.Prefix) []netip.Prefix {

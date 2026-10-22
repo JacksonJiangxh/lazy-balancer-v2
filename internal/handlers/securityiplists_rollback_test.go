@@ -1,17 +1,17 @@
 package handlers
 
-// 历史修复钉测（历史修复/TDD RED 先行）。
+// 回归钉测（TDD RED 先行）。
 //
-// 历史修复【历史问题】：拒绝路径投影未回滚——渲染副作用（稳定命名投影写盘）在
+// 拒绝路径投影未回滚：渲染副作用（稳定命名投影写盘）在
 // ConfigRejected/ErrUnvalidatedApply 分支只回滚证书不回滚投影，DB 回滚但
 // 投影文件=未提交内容，控制面与库分叉至下次成功渲染。修复：拒绝分支以
 // 已提交库值重渲染一次仅重写投影文件（零 /load）。
 //
-// 历史修复【历史问题】：NeedForce 强制被拒时的证书/投影材料回退——与 历史修复 同一
+// NeedForce 强制被拒时的证书/投影材料回退——与上一条同一
 // 机制收口（拒绝=磁盘回滚到已提交态；证书物化内容=已提交 PEM，物化落盘
 // 本身即已提交态，需回退的是投影与 DB 侧）。
 //
-// 历史修复（测试盲区）：handler tryIPListHotPathApply NeedForce 分支零覆盖。
+// （测试盲区）：handler tryIPListHotPathApply NeedForce 分支零覆盖。
 
 import (
 	"crypto/ecdsa"
@@ -37,10 +37,10 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// r77TestCertPEM 生成自签证书+私钥 PEM（ECDSA 历史问题，serial 取纳秒保证多次
+// testCertPEMShared 生成自签证书+私钥 PEM（ECDSA，serial 取纳秒保证多次
 // 调用内容互异——NeedForce 场景 v1/v2 材料必须字节不同）。与 services 侧
-// r76TestCertPEM 同形（测试助手不可跨包引用，各自持有）。
-func r77TestCertPEM(t *testing.T, cn string) (string, string) {
+// altTestCertPEMShared 同形（测试助手不可跨包引用，各自持有）。
+func testCertPEMShared(t *testing.T, cn string) (string, string) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -81,7 +81,7 @@ func seedInlineACLPolicy(t *testing.T, entries string) int64 {
 		t.Fatalf("seed upstream: %v", err)
 	}
 	res, err := db.DB.Exec(`INSERT INTO security_policies (name, mode, enabled, policy_type, ip_acl_enabled, ip_acl_mode, ip_acl_list, ip_acl_list_refs)
-		VALUES ('历史问题 策略', 'off', 1, 'stage1', 1, 'deny', ?, '[]')`, entries)
+		VALUES ('rollback 策略', 'off', 1, 'stage1', 1, 'deny', ?, '[]')`, entries)
 	if err != nil {
 		t.Fatalf("seed policy: %v", err)
 	}
@@ -95,7 +95,7 @@ func seedInlineACLPolicy(t *testing.T, entries string) int64 {
 	return policyID
 }
 
-// 历史修复 全量链形状（finishTxApply 拒绝分支）：已提交策略投影在役，策略更新
+// 全量链形状（finishTxApply 拒绝分支）：已提交策略投影在役，策略更新
 // 被 CLI 校验拒绝（渲染先于校验完成，投影文件已按未提交内容落盘）——拒绝后
 // 投影必须回到已提交内容（旧实现停留未提交内容=必红）。
 func TestSecurityPolicySave_cliRejectionRestoresCommittedProjection(t *testing.T) {
@@ -112,7 +112,7 @@ func TestSecurityPolicySave_cliRejectionRestoresCommittedProjection(t *testing.T
 
 	// CLI 校验桩拒绝一切（渲染已完成——投影已按未提交内容重写）。
 	f.h.caddyService.SetCLIValidatorForTest(func([]byte) error {
-		return fmt.Errorf("cli: r77 rejected")
+		return fmt.Errorf("cli: reject")
 	})
 	rec := f.putJSON(fmt.Sprintf("/security/policies/%d", policyID),
 		map[string]any{"ip_acl_list": `["198.51.100.7"]`})
@@ -120,7 +120,7 @@ func TestSecurityPolicySave_cliRejectionRestoresCommittedProjection(t *testing.T
 		t.Fatalf("status=%d body=%s, want 400", rec.Code, rec.Body.String())
 	}
 
-	// Then：投影文件回到已提交内容（历史修复：DB 回滚但文件=未提交内容即分叉）。
+	// Then：投影文件回到已提交内容（DB 回滚但文件=未提交内容即分叉）。
 	if got := f.projectionContent(policyID); got != committed {
 		t.Fatalf("拒绝后投影文件=%q, want 已提交内容 %q（拒绝路径投影未回滚）", got, committed)
 	}
@@ -133,7 +133,7 @@ func TestSecurityPolicySave_cliRejectionRestoresCommittedProjection(t *testing.T
 	}
 }
 
-// 历史修复 热路径形状 + 历史修复（历史修复 NeedForce 分支）：名单写经投影热路径重写
+// 热路径形状 +：名单写经投影热路径重写
 // 投影（未提交内容落盘）并物化已提交的新证书 → NeedForce；强制重载被 Caddy
 // 拒绝 → tx 回滚 + 磁盘回退到已提交态（投影=已提交名单内容，证书材料=已
 // 提交 PEM）。旧实现投影停留未提交内容=必红。
@@ -142,8 +142,8 @@ func TestIPListHotPath_needForceRejectedRestoresCommittedState(t *testing.T) {
 	certDir := t.TempDir()
 	restoreCertDir := services.SetCertDirForTest(certDir)
 	t.Cleanup(restoreCertDir)
-	certV1, keyV1 := r77TestCertPEM(t, "hot.example.test")
-	certV2, keyV2 := r77TestCertPEM(t, "hot.example.test")
+	certV1, keyV1 := testCertPEMShared(t, "hot.example.test")
+	certV2, keyV2 := testCertPEMShared(t, "hot.example.test")
 
 	listID, policyID := f.seedReferencedList(`[{"value":"203.0.113.5","remark":""}]`)
 	if _, err := db.DB.Exec(`UPDATE lb_rules SET enable_tls=1, tls_source='manual', tls_cert=?, tls_key=? WHERE caddy_id='lb-hot'`,
@@ -168,11 +168,11 @@ func TestIPListHotPath_needForceRejectedRestoresCommittedState(t *testing.T) {
 		t.Fatalf("status=%d body=%s, want 400（NeedForce 强制被拒=拒绝回滚）", rec.Code, rec.Body.String())
 	}
 
-	// 历史修复：投影文件回到已提交内容（refresh 渲染已按未提交条目重写）。
+	// 投影文件回到已提交内容（refresh 渲染已按未提交条目重写）。
 	if got := f.projectionContent(policyID); got != committed {
 		t.Fatalf("NeedForce 拒绝后投影文件=%q, want 已提交内容 %q（热路径形状）", got, committed)
 	}
-	// 历史修复：磁盘证书材料=已提交 PEM（v2 物化内容即已提交态）。
+	// 磁盘证书材料=已提交 PEM（v2 物化内容即已提交态）。
 	onDisk, err := os.ReadFile(filepath.Join(certDir, "lb-hot.crt"))
 	if err != nil {
 		t.Fatalf("读物化证书: %v", err)
@@ -238,8 +238,8 @@ func TestIPListHotPath_needForceCommitFailureRestoresCommittedView(t *testing.T)
 	f := newHotPathIPListFixture(t)
 	certDir := t.TempDir()
 	t.Cleanup(services.SetCertDirForTest(certDir))
-	certV1, keyV1 := r77TestCertPEM(t, "hot.example.test")
-	certV2, keyV2 := r77TestCertPEM(t, "hot.example.test")
+	certV1, keyV1 := testCertPEMShared(t, "hot.example.test")
+	certV2, keyV2 := testCertPEMShared(t, "hot.example.test")
 	listID, policyID := f.seedReferencedList(`[{"value":"203.0.113.5","remark":""}]`)
 	if _, err := db.DB.Exec(`UPDATE lb_rules SET enable_tls=1, tls_source='manual', tls_cert=?, tls_key=? WHERE caddy_id='lb-hot'`, certV1, keyV1); err != nil {
 		t.Fatal(err)
@@ -265,7 +265,7 @@ func TestIPListHotPath_needForceCommitFailureRestoresCommittedView(t *testing.T)
 	assertCommittedHotPathList(t, listID)
 }
 
-// 历史修复 链覆盖钉（发射面变化形态）：allow 模式名单空↔非空=发射面出现 →
+// 链覆盖钉（发射面变化形态）：allow 模式名单空↔非空=发射面出现 →
 // 热路径 Fallback 落回 finishTxApply 全量链 → CLI 拒绝 → 400 + DB 回滚。
 // （已提交态不发射该投影——回退后文件停留为未被运行配置引用的惰性孤儿，
 // 由 24h GC 回收；内容级回滚断言由上面两条在役投影形状承载。）
@@ -278,13 +278,13 @@ func TestIPListWrite_cliRejectionRollsBackListEntries(t *testing.T) {
 	if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,enabled,protocol) VALUES ('lb-hot','127.0.0.1',9000,1,'http')`); err != nil {
 		t.Fatalf("seed upstream: %v", err)
 	}
-	res, err := db.DB.Exec(`INSERT INTO security_ip_lists (name, category, entries) VALUES ('历史问题 名单', '测试', '[]')`)
+	res, err := db.DB.Exec(`INSERT INTO security_ip_lists (name, category, entries) VALUES ('rollback 名单', '测试', '[]')`)
 	if err != nil {
 		t.Fatalf("seed list: %v", err)
 	}
 	listID, _ := res.LastInsertId()
 	res, err = db.DB.Exec(`INSERT INTO security_policies (name, mode, enabled, policy_type, ip_acl_enabled, ip_acl_mode, ip_acl_list, ip_acl_list_refs)
-		VALUES ('历史问题 allow 策略', 'off', 1, 'stage1', 1, 'allow', '[]', ?)`, fmt.Sprintf("[%d]", listID))
+		VALUES ('rollback allow 策略', 'off', 1, 'stage1', 1, 'allow', '[]', ?)`, fmt.Sprintf("[%d]", listID))
 	if err != nil {
 		t.Fatalf("seed policy: %v", err)
 	}
@@ -297,7 +297,7 @@ func TestIPListWrite_cliRejectionRollsBackListEntries(t *testing.T) {
 	}
 
 	f.h.caddyService.SetCLIValidatorForTest(func([]byte) error {
-		return fmt.Errorf("cli: r77 rejected")
+		return fmt.Errorf("cli: reject")
 	})
 	rec := f.postJSON(fmt.Sprintf("/security/ip-lists/%d/ips", listID), map[string]string{"value": "198.51.100.7"})
 	if rec.Code != 400 {
@@ -312,7 +312,7 @@ func TestIPListWrite_cliRejectionRollsBackListEntries(t *testing.T) {
 	}
 }
 
-// 历史修复 链覆盖钉（导入链，ValidateTxRenderViaCLI 快照回退旁）：导入会话
+// 链覆盖钉（导入链，ValidateTxRenderViaCLI 快照回退旁）：导入会话
 // 的 CLI 校验拒绝 → session.abort 回滚 → 投影回已提交内容（旧实现停留导入
 // 内容=必红）。
 func TestImportConfigBackup_cliRejectionRestoresCommittedProjection(t *testing.T) {
@@ -329,12 +329,12 @@ func TestImportConfigBackup_cliRejectionRestoresCommittedProjection(t *testing.T
 	committed := f.projectionContent(policyID)
 
 	f.h.caddyService.SetCLIValidatorForTest(func([]byte) error {
-		return fmt.Errorf("cli: r77 rejected")
+		return fmt.Errorf("cli: reject")
 	})
 	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"lb_rules":                 {{"caddy_id": "lb-hot", "name": "hot", "protocol": "http", "domain": "hot.example.test", "listen_port": 8080, "enabled": 1}},
 		"upstreams":                {{"rule_id": "lb-hot", "host": "127.0.0.1", "port": 9000, "enabled": 1}},
-		"security_policies":        {{"id": policyID, "name": "历史问题 策略", "mode": "off", "enabled": 1, "policy_type": "stage1", "ip_acl_enabled": 1, "ip_acl_mode": "deny", "ip_acl_list": `["198.51.100.7"]`, "ip_acl_list_refs": "[]"}},
+		"security_policies":        {{"id": policyID, "name": "rollback 策略", "mode": "off", "enabled": 1, "policy_type": "stage1", "ip_acl_enabled": 1, "ip_acl_mode": "deny", "ip_acl_list": `["198.51.100.7"]`, "ip_acl_list_refs": "[]"}},
 		"security_policy_bindings": {{"rule_caddy_id": "lb-hot", "policy_id": policyID}},
 	}, EmptyConfigIfNil: true})
 

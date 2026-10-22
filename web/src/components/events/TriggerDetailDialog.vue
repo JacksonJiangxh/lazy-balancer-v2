@@ -16,7 +16,7 @@
           <span class="trg-hero-stage">{{ heroStage }}</span>
           <span class="trg-hero-ip">{{ row?.client_ip }}</span>
           <span v-if="row?.ip_location" class="trg-source-geo">{{ row.ip_location }}</span>
-          <!-- 历史修复（历史）：geoLabel（策略 geoip_countries 区域清单）回退加
+          <!-- geoLabel（策略 geoip_countries 区域清单）回退加
                kind 门控——归属地位置只对地域事件（kind==='geo'，xdb 未装时
                ip_location 为空的唯一回退位）展示区域清单有意义；非地域事件
                （ACL/信任/WAF…）显示策略区域清单会被误读为该事件归属地。
@@ -159,7 +159,7 @@ import type { APIResponse } from '@/types'
 
 // 历史（用户裁定）：统一触发详情弹框——全部触发类型（IP 黑白名单/地域/威胁
 // 情报库/信任/WAF·CRS/WAF·自定义/请求体异常）共用同一风格与交互；信息优先，
-// IP 处置动作收敛到 IP 快捷弹框（历史裁定：触发详情零操作，
+// IP 处置动作收敛到 IP 快捷弹框（裁定：触发详情零操作，
 // CRS 排除管理位于 安全防护 → 安全策略 → 策略编辑 → 排除规则）。
 interface TriggerRow {
   id: number
@@ -186,11 +186,11 @@ const emit = defineEmits<{ (e: 'update:modelValue', v: boolean): void }>()
 
 type Kind = 'acl' | 'geo' | 'crawler' | 'threat' | 'trust' | 'waf-crs' | 'waf-custom' | 'body' | 'other'
 
-// 历史修复：kind 改由共享 triggerStageFamily 投影（securityStages 唯一实现，原
-// 历史问题 双实现并存欠账）——细粒度族映射到本弹框展示 Kind（geoip→geo、
+// kind 改由共享 triggerStageFamily 投影（securityStages 唯一实现，原
+// 双实现并存欠账）——细粒度族映射到本弹框展示 Kind（geoip→geo、
 // threat→threat、wafCrs→waf-crs、wafCustom→waf-custom，其余同名）。
-// 空 id 恒 other；未匹配的非空值兜底 acl（历史共享 GeoIP id:8 等归「IP 访问
-// 控制」口径，历史问题，与列表列一致）。
+// 空 id 恒 other；未匹配的非空值兜底 acl（共享 GeoIP id:8 等归「IP 访问
+// 控制」口径，与列表列一致）。
 const kind = computed<Kind>(() => {
   const t = props.row?.rule_triggered ?? ''
   if (!t) return 'other'
@@ -207,7 +207,7 @@ const kind = computed<Kind>(() => {
   }
 })
 
-// 历史修复 ②（2026-10-03）：加和式仅 WAF 族——预检族（IP ACL/信任/
+// （2026-10-03）：加和式仅 WAF 族——预检族（IP ACL/信任/
 // GeoIP/威胁）duration_us≡precheck_us 同值（securityevents.go:202），加和
 // 会翻倍并误标 WAF 段。
 const isWafFamily = computed(() => ['waf-crs', 'waf-custom', 'body'].includes(kind.value))
@@ -234,13 +234,13 @@ const sourceTagType = computed(() =>
 // 命中概览（用户裁定：一眼可读）——阶段名 / 命中源
 const formatTriggerTime = (v: string): string => formatDate(v)
 
-// 组合语义说明（历史）：logged 事件的「为什么不拦」——检测模式策略 或
+// 组合语义说明：logged 事件的「为什么不拦」——检测模式策略 或
 // 信任保留检测（含跨策略豁免：预检 DetectionOnly 为事务级全局，命中策略与
 // 豁免信任策略可以是两条不同策略——「黑名单命中但被另一策略的信任放行为检测」）。
 const exemptingTrustPolicy = computed<string | null>(() => {
   if (!props.row || props.row.action === 'blocked') return null
   const ip = props.row.client_ip.trim()
-  // 历史问题：策略详情端点不过滤 enabled——属主策略可能事后被禁用，禁用策略不
+  // 策略详情端点不过滤 enabled——属主策略可能事后被禁用，禁用策略不
   // 渲染、不可能放行，不得参与豁免归因（判定单源 isTrustExemptionCandidate）。
   for (const p of [policy.value, ...enabledPolicies.value].filter((x): x is PolicyRow => !!x && isTrustExemptionCandidate(x))) {
     if (parseIPList(p.ip_whitelist).some((e) => entryMatchesIp(e, ip))) return p.name
@@ -252,7 +252,7 @@ const exemptingTrustPolicy = computed<string | null>(() => {
 const detectionNote = computed<string>(() => {
   if (!props.row || props.row.action === 'blocked') return ''
   if (kind.value === 'trust') return ''
-  // 历史问题：检测模式的 DetectionOnly 切换只覆盖 WAF 段（CRS/自定义含 body
+  // 检测模式的 DetectionOnly 切换只覆盖 WAF 段（CRS/自定义含 body
   // 目标）——阶段 1 族（IP ACL/地域/威胁/爬虫）的 logged 与模式无关，成因是
   // 信任保留检测，不能归因「检测模式」。
   if (detectionModeExplains(kind.value) && policy.value?.mode === 'detection') return '所属策略为检测模式：命中只记录，不拦截'
@@ -340,10 +340,10 @@ const heroHitSource = computed(() => {
 const loading = ref(false)
 const policyMissing = ref(false)
 const loadError = ref(false)
-// 历史修复：policy_id<=0 是后端归因的合法「无策略归属」态（规则未绑定策略时
+// policy_id<=0 是后端归因的合法「无策略归属」态（规则未绑定策略时
 // securityevents.go 返回 (0, "")），不是「策略已删除」——文案分离。
 const noPolicyAttribution = computed(() => (props.row?.policy_id ?? 0) <= 0)
-// 弹框会话序号（历史问题）：快速关开换行时丢弃在途响应（同文件 crsDialogSeq
+// 弹框会话序号：快速关开换行时丢弃在途响应（同文件 crsDialogSeq
 // / IPLocationAction loadPoliciesSeq 同仓模式）
 let loadSeq = 0
 interface PolicyRow {
@@ -370,15 +370,15 @@ interface PolicyRow {
   geoip_crawler_engines?: string
 }
 const policy = ref<PolicyRow | null>(null)
-// 全部启用策略（历史追加修复：跨策略信任豁免判定——预检 DetectionOnly
+// 全部启用策略（追加修复：跨策略信任豁免判定——预检 DetectionOnly
 // 为事务级全局，命中策略与豁免信任策略可以是两条不同策略）
 const enabledPolicies = ref<PolicyRow[]>([])
 const lists = ref<Array<{ id: number; name: string; system?: number | boolean }>>([])
-// 跨组件共享条目缓存（历史问题 修复：提升到 securityStages 模块级，
+// 跨组件共享条目缓存（修复：提升到 securityStages 模块级，
 // IPLocationAction 写入动作经 invalidateSharedEntriesCache 清空——原实现
 // 缓存在本组件 setup 内，快捷弹框的 onChanged 清不到它导致展示恒陈旧）
 const entriesCache = ref<Record<number, string[]>>({ ...sharedEntriesCache })
-// 历史修复：共享缓存失效即重拷本地副本（叠开 IP 处置改名单后徽标/列表即时
+// 共享缓存失效即重拷本地副本（叠开 IP 处置改名单后徽标/列表即时
 // 刷新——曾仅 loadAll 重拷，开放窗口滞留旧值）
 let unregisterEntriesCache: (() => void) | null = null
 onMounted(() => {
@@ -406,18 +406,18 @@ const loadAll = async (): Promise<void> => {
     if (row.policy_id > 0) {
       try {
         const res = await request.get<APIResponse<{ policy: PolicyRow }>>(`/security/policies/${row.policy_id}`, { silent: true })
-        if (seq !== loadSeq) return // 历史问题：首个 await 同样需竞态守卫
+        if (seq !== loadSeq) return // 首个 await 同样需竞态守卫
         policy.value = res.data?.policy ?? null
         if (!res.data?.policy) policyMissing.value = true
       } catch (err) {
-        // 历史问题：网络/5xx 与「策略已删除」不可混同——404 归缺失，
+        // 网络/5xx 与「策略已删除」不可混同——404 归缺失，
         // 其余按加载失败提示（hero 不误标「已删除」）。
         policyMissing.value = err instanceof Error && 'status' in err && (err as { status?: number }).status === 404
         if (!policyMissing.value) loadError.value = true
       }
     } else {
       // policy_id<=0 = 无策略归属（合法态），展示文案由 noPolicyAttribution 承载，
-      // 不归入「策略已删除」（历史修复）
+      // 不归入「策略已删除」
     }
     // 全部启用策略 + 名单/条目：ACL 与信任 refs 的条目缓存（信息展示用 +
     // 跨策略信任成员判定——历史追加修复）
@@ -433,11 +433,11 @@ const loadAll = async (): Promise<void> => {
       loadError.value = true
       lists.value = []
     }
-    // 历史问题：只补拉详情弹框真实消费的名单——属主策略 ACL refs（命中列表/
+    // 只补拉详情弹框真实消费的名单——属主策略 ACL refs（命中列表/
     // 内联判定）+ 全部信任 refs（跨策略信任豁免）；他策略 ACL refs 在本弹框
     // 零消费，原实现在启用策略多/引用大名单时首屏无谓全量下载。
     const refIds = eventDetailRefIds(policy.value, enabledPolicies.value)
-    // 只补拉共享缓存缺失的名单（历史问题）：原实现对全部 refIds 无条件
+    // 只补拉共享缓存缺失的名单：原实现对全部 refIds 无条件
     // 并发 GET——连续打开事件详情时同一批名单反复下载。写回/通知由缓存单源负责。
     try {
       await ensureSharedEntries(refIds, async (id) => {
@@ -455,7 +455,7 @@ const loadAll = async (): Promise<void> => {
   }
 }
 
-// 历史修复（历史）：区域清单展示层翻译——country_names_cn 单源映射，未命中
+// 区域清单展示层翻译——country_names_cn 单源映射，未命中
 // （省份/省市联值/海外哨兵）回退原文；geoip_countries 值零改动。
 const countryZh = useCountryNamesCn()
 const geoLabel = computed(() => {
@@ -493,7 +493,7 @@ const geoSummary = computed(() => {
   if (!p.geoip_mode || p.geoip_mode === 'off') return '未启用'
   return `${p.geoip_mode === 'allow' ? '仅允许' : '拦截'}区域：${geoLabel.value || '—'}`
 })
-// 爬虫豁免维度（历史问题）：事件来自 v2.3.8 爬虫两族，展示本策略的豁免引擎
+// 爬虫豁免维度：事件来自 v2.3.8 爬虫两族，展示本策略的豁免引擎
 const crawlerEngineIds = computed<string[]>(() => {
   try {
     const raw = JSON.parse(policy.value?.geoip_crawler_engines ?? '[]') as unknown
@@ -528,7 +528,7 @@ const wafSummary = computed(() => {
 // —— 来源语义行 ——
 
 // —— ACL/威胁/信任命中明细（只读信息） ——
-// 全部命中列表（历史补漏1）：自定义 + 内置威胁名单（只读展示名单名，
+// 全部命中列表（补漏1）：自定义 + 内置威胁名单（只读展示名单名，
 // 原实现只对自定义列表出「命中列表」行、内置名单仅泛化 tip——同一 IP 同时
 // 命中 测试列表+中科大恶意IP名单 时内置侧不可见）。
 const allHitLists = computed(() => {
@@ -540,7 +540,7 @@ const allHitLists = computed(() => {
   // 精确串匹配漏报导致「未定位到命中的地址列表」误显
   return lists.value.filter((l) => refs.includes(l.id) && (entriesCache.value[l.id] ?? []).some((e) => entryMatchesIp(e, ip)))
 })
-// 白名单外拒绝形态（历史补漏2）：id:5/7 = allow 交集外——IP 不在任何名单
+// 白名单外拒绝形态（补漏2）：id:5/7 = allow 交集外——IP 不在任何名单
 // 中，「命中列表」恒空是正确语义，须显式说明而非「未定位到」。
 const isAllowOutside = computed(() => {
   const n = Number(props.row?.rule_triggered)
@@ -549,7 +549,7 @@ const isAllowOutside = computed(() => {
 
 const inlineAclHit = computed(() => {
   const p = policy.value
-  // 历史问题：CIDR 感知（内联名单位 CIDR 条目命中实际 IP）
+  // CIDR 感知（内联名单位 CIDR 条目命中实际 IP）
   return !!p && parseIPList(p.ip_acl_list).some((e) => entryMatchesIp(e, props.row?.client_ip.trim() ?? ''))
 })
 const trustHitListsText = computed(() => {
@@ -567,7 +567,7 @@ const trustHitNote = computed(() => {
   if (!p || kind.value === 'trust') return ''
   const ip = props.row?.client_ip.trim() ?? ''
   const refs = parseRefIds(p.ip_whitelist_refs)
-  if (p.ip_whitelist_enabled === false) return '' // 历史问题：信任已关闭时条目不生效（trustDead 同口径）
+  if (p.ip_whitelist_enabled === false) return '' // 信任已关闭时条目不生效（trustDead 同口径）
   const trusted = parseIPList(p.ip_whitelist).some((e) => entryMatchesIp(e, ip))
     || refs.some((id) => (entriesCache.value[id] ?? []).some((e) => entryMatchesIp(e, ip)))
   return trusted ? '该 IP 在策略信任名单中（DetectionOnly：全评估不拦但全记录）' : ''
@@ -595,7 +595,7 @@ const customDbId = computed(() => {
   const n = Number(props.row?.rule_triggered)
   return Number.isFinite(n) && n >= 10000 ? n - 10000 : NaN
 })
-const ACTION_LABELS: Record<string, string> = { block: '拦截', log: '仅记录', pass: '放行' } // 后端合法动作仅 block/log/pass（历史问题：score 为不可达映射，已删）
+const ACTION_LABELS: Record<string, string> = { block: '拦截', log: '仅记录', pass: '放行' } // 后端合法动作仅 block/log/pass（score 为不可达映射，已删）
 const customActionLabel = computed(() => {
   const a = customRule.value?.action ?? ''
   return ACTION_LABELS[a] ?? a
@@ -604,7 +604,7 @@ const customConditions = computed<Array<{ target: string; operator: string; patt
   // 后端列表接口 conditions 已是结构化数组（非 JSON 字符串）
   return (customRule.value?.conditions ?? []).filter((c) => !!c && typeof c.target === 'string')
 })
-// 历史问题:补会话序号守卫(同 crsDialogSeq 范式)+try/catch——
+// 补会话序号守卫(同 crsDialogSeq 范式)+try/catch——
 // 快速关开弹框时在途响应晚到不再覆盖当前;加载失败不再误标「规则已删除」
 const customRuleSeq = ref(0)
 const customRuleLoadError = ref(false)

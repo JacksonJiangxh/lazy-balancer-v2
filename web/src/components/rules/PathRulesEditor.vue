@@ -192,7 +192,7 @@ const rowError = (index: number): string => {
   if (rule.path.trim() === '') return ''
   const canonical = canonicalPathKey(rule.match_type, rule.path)
   const duplicateKey = pathDuplicateKey(rule.match_type, rule.path)
-  // 历史问题-07：同类型查重按后端口径（exact 不剥尾 /，/a 与 /a/ 是两条独立
+  // 同类型查重按后端口径（exact 不剥尾 /，/a 与 /a/ 是两条独立
   // matcher）；canonicalPathKey 归一键只用于跨类型遮蔽互查。
   const dupIndex = pathRules.value.findIndex((other, otherIndex) =>
     otherIndex !== index && other.path.trim() !== ''
@@ -209,7 +209,7 @@ const rowError = (index: number): string => {
   return ''
 }
 
-// 历史问题(历史,历史问题):前序 prefix 规则遮蔽提示——后端有意放行(测试钉住),
+// 前序 prefix 规则遮蔽提示——后端有意放行(测试钉住),
 // 仅 UI 非阻断警告。判定口径与 services/caddy.go pathMatcherSpecs + terminal
 // 路由一致:prefix 渲染 [root, root/*] 双 matcher(root=剥尾 / 与 *,剥空=
 // /* 全匹配),路由按 sort_order 稳定排序、先命中即终结,故前序 prefix P 遮蔽

@@ -1,7 +1,7 @@
-// 威胁大屏展示指标纯函数（历史问题）：
+// 威胁大屏展示指标纯函数
 //   - trafficDelta：normal/attack 双桶计数器差分。首轮只建基线（原实现
 //     prev=0 → 首帧 delta=进程累计值），QPS 按真实采样间隔计算。
-//     历史问题：计数已是**抽样还原后**的真值（caddygeoip 生产端在
+//     计数已是**抽样还原后**的真值（caddygeoip 生产端在
 //     1/N 抽样时按 N 累加），前端不得再乘 sample_n（旧实现二次放大，N=8 时
 //     QPS/光流最高高估 8 倍）。sample_n 仅用于基线重建判定（抽样比切换时
 //     计数口径改变，必须重置基线避免尖峰）。
@@ -21,7 +21,7 @@ export interface TrafficDeltaResult {
   /** 本轮**归一后**的计数（缺失/非数值已按 0 处理）：调用方必须用它与
    *  `at`/`sampleN` 直接组装下一轮 `TrafficBaseline`，不得再从原始响应重建
    *  （原实现两侧各自归一，原始响应缺字段时基线存 undefined → 差分恒 NaN
-   *  静默丢弃该国，历史修复）。 */
+   * 静默丢弃该国）。*/
   readonly counts: ReadonlyMap<string, { normal: number; attack: number }>
   readonly normalDeltas: { name: string; count: number }[]
   readonly attackDeltas: { name: string; count: number }[]

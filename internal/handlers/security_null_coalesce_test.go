@@ -15,11 +15,11 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// 历史修复 NULL 容忍残余（历史修复）：handler 端点裸扫描可空列，
+// NULL 容忍残余：handler 端点裸扫描可空列，
 // 一行 NULL → 该端点 500。本文件三测试分别钉住三处修复：
-//   历史修复 GetSecurityPolicyBindings 逐策略查询改用 securityPolicySelectColumns
-//   历史修复 DeleteSecurityCustomRule 引用检查 COALESCE(custom_rules,'[]')
-//   历史修复 List/Update 自定义规则与拦截页裸扫描列 COALESCE（对齐 cluster_snapshot dump 侧）
+//   GetSecurityPolicyBindings 逐策略查询改用 securityPolicySelectColumns
+//   DeleteSecurityCustomRule 引用检查 COALESCE(custom_rules,'[]')
+//   List/Update 自定义规则与拦截页裸扫描列 COALESCE（对齐 cluster_snapshot dump 侧）
 
 // newNullCoalesceRouter 注册本文件三测试所需的全部端点。
 func newNullCoalesceRouter(t *testing.T) *gin.Engine {
@@ -41,7 +41,7 @@ func newNullCoalesceRouter(t *testing.T) *gin.Engine {
 	return router
 }
 
-// 历史修复（历史）：GetSecurityPolicyBindings 的逐策略查询与 securityPolicySelectColumns
+// GetSecurityPolicyBindings 的逐策略查询与 securityPolicySelectColumns
 // 同 25 列但无 COALESCE——绑定策略任一可空列（如 description）为 NULL 时整列表 500。
 // 修复后按常量投影返回 200 与该策略的默认值形态。
 func TestGetSecurityPolicyBindings_nullPolicyColumnsReturn200(t *testing.T) {
@@ -73,7 +73,7 @@ func TestGetSecurityPolicyBindings_nullPolicyColumnsReturn200(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：DeleteSecurityCustomRule 引用检查裸扫 custom_rules——任一启用
+// DeleteSecurityCustomRule 引用检查裸扫 custom_rules——任一启用
 // 策略该列为 NULL 时扫描报错 500，全部自定义规则删除被阻断。修复后 COALESCE '[]'
 // 落入既有的「不可解析→跳过」分支，删除按引用检查通过放行。
 func TestDeleteSecurityCustomRule_nullCustomRulesPolicyDoesNot500(t *testing.T) {
@@ -104,7 +104,7 @@ func TestDeleteSecurityCustomRule_nullCustomRulesPolicyDoesNot500(t *testing.T) 
 	}
 }
 
-// 历史修复（历史）：List/Update 自定义规则与拦截页的裸扫描可空列，一行 NULL →
+// List/Update 自定义规则与拦截页的裸扫描可空列，一行 NULL →
 // 对应端点 500。修复后四个端点对同一 NULL 种子行均不得 500（List 返默认值 200，
 // Update 读-合并-写放行 200）。
 func TestSecurityEntityEndpoints_nullColumnsDoNot500(t *testing.T) {
@@ -121,7 +121,7 @@ func TestSecurityEntityEndpoints_nullColumnsDoNot500(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pageRes, err := db.DB.Exec(`INSERT INTO security_block_pages (name, description, content, is_default) VALUES ('null拦截页', NULL, 'x', NULL)`)
+	pageRes, err := db.DB.Exec(`INSERT INTO security_block_pages (name, description, content, is_default) VALUES ('null拦截页', NULL, NULL, NULL)`)
 	if err != nil {
 		t.Fatalf("seed block page: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestSecurityEntityEndpoints_nullColumnsDoNot500(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：事件列表投影补齐 COALESCE——rule_name/
+// 事件列表投影补齐 COALESCE——rule_name/
 // policy_name/duration_us/precheck_us/request_headers/request_body 均为可空
 // 列（schema 仅 DEFAULT 无 NOT NULL），带外/异常写入显式 NULL 时旧实现整页 500。
 func TestListSecurityEvents_nullProjectionColumnsReturn200(t *testing.T) {

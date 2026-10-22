@@ -10,7 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// 历史修复（2026-09-05 审计复核收窄）：恢复码重生成是纯会话门（2026-09 裁定）下
+// （2026-09-05 审计复核收窄）：恢复码重生成是纯会话门（2026-09 裁定）下
 // 「旧码全部作废 + 明文下发 10 个登录可用凭证」的高敏动作（恢复码可在登录
 // MFA 验证步消费），与同卡片禁用/重置 MFA 的留痕密度对齐——成功路径必须产生
 // 审计事件（此前 AuditPolicySkip + handler 零 recordAudit，事后零痕）。
@@ -42,7 +42,7 @@ func TestMFARecoveryCodes_regeneratesWithAuditTrail(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：MFA 启用态读取的 DB 错误此前被并入「MFA 未启用」
+// MFA 启用态读取的 DB 错误此前被并入「MFA 未启用」
 // 400——DB 故障被误报为业务态。拆分：读失败 500，未启用保持 400。
 func TestMFARecoveryCodes_statusReadFailureReturns500(t *testing.T) {
 	h := newBackupTestHandlers(t)

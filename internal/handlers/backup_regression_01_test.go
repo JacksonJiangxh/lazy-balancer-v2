@@ -22,7 +22,7 @@ import (
 	"lazy-balancer-v2/internal/taskengine"
 )
 
-func audit85BackupJSON(t *testing.T, tables map[string][]map[string]any, config map[string]any, sections []string) []byte {
+func backupJSONFixture(t *testing.T, tables map[string][]map[string]any, config map[string]any, sections []string) []byte {
 	t.Helper()
 	backup := configBackup{
 		Sections: sections,
@@ -40,7 +40,7 @@ func audit85BackupJSON(t *testing.T, tables map[string][]map[string]any, config 
 	return raw
 }
 
-func audit85PostImport(t *testing.T, h *Handlers, body []byte) *httptest.ResponseRecorder {
+func postImportBytes(t *testing.T, h *Handlers, body []byte) *httptest.ResponseRecorder {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
@@ -52,7 +52,7 @@ func audit85PostImport(t *testing.T, h *Handlers, body []byte) *httptest.Respons
 	return rec
 }
 
-func audit85ThreatRow(name string) map[string]any {
+func threatRowShared(name string) map[string]any {
 	return map[string]any{
 		"id": 1, "name": name, "display_name": name, "url": "https://example.test/list.txt",
 		"format": "plain", "update_enabled": 1, "apply_enabled": 1, "entry_count": 1,
@@ -60,7 +60,7 @@ func audit85ThreatRow(name string) map[string]any {
 	}
 }
 
-func audit85SeedLiveAdmin(t *testing.T) {
+func seedLiveAdminShared(t *testing.T) {
 	t.Helper()
 	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (1,'current-admin','hash','admin',1)`); err != nil {
 		t.Fatal(err)
@@ -95,18 +95,18 @@ func TestFailedBackupRowsPrunedWithoutSuccess(t *testing.T) {
 
 func TestPureJSONThreatPreviewMatchesImport(t *testing.T) {
 	h := newBackupTestHandlers(t)
-	audit85SeedLiveAdmin(t)
+	seedLiveAdminShared(t)
 	if _, err := db.DB.Exec(`DELETE FROM security_threat_sources`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO security_threat_sources (id,name,display_name,update_enabled,apply_enabled) VALUES (91,'ustc','本地威胁源',1,1)`); err != nil {
 		t.Fatal(err)
 	}
-	body := audit85BackupJSON(t, map[string][]map[string]any{
-		"security_threat_sources": {audit85ThreatRow("firehol_l1")},
+	body := backupJSONFixture(t, map[string][]map[string]any{
+		"security_threat_sources": {threatRowShared("firehol_l1")},
 	}, nil, []string{"security"})
 
-	preview := r78PostValidate(t, h, body)
+	preview := postValidateBytes(t, h, body)
 	if !preview.Valid {
 		t.Fatalf("preview rejected valid backup: %s", preview.Error)
 	}
@@ -121,7 +121,7 @@ func TestPureJSONThreatPreviewMatchesImport(t *testing.T) {
 		t.Fatalf("preview warnings=%v, want local-threat preservation warning", preview.Warnings)
 	}
 
-	rec := audit85PostImport(t, h, body)
+	rec := postImportBytes(t, h, body)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("import status=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -137,18 +137,18 @@ func TestPureJSONThreatPreviewMatchesImport(t *testing.T) {
 func TestSoftSkipPrecedesRowValidation(t *testing.T) {
 	t.Run("empty domain rule with invalid gated fields", func(t *testing.T) {
 		h := newBackupTestHandlers(t)
-		audit85SeedLiveAdmin(t)
-		body := audit85BackupJSON(t, map[string][]map[string]any{
+		seedLiveAdminShared(t)
+		body := backupJSONFixture(t, map[string][]map[string]any{
 			"lb_rules": {{
 				"caddy_id": "lb_empty", "name": "empty", "protocol": "http", "domain": " ",
 				"listen_port": 8080, "enabled": "1", "created_at": "garbage",
 			}},
 		}, nil, []string{"rules"})
-		preview := r78PostValidate(t, h, body)
+		preview := postValidateBytes(t, h, body)
 		if !preview.Valid || preview.Summary["lb_rules"] != 0 || len(preview.Warnings) == 0 {
 			t.Fatalf("preview=%+v, want skipped empty-domain rule", preview)
 		}
-		rec := audit85PostImport(t, h, body)
+		rec := postImportBytes(t, h, body)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("import status=%d body=%s, want soft-skipped rule accepted", rec.Code, rec.Body.String())
 		}
@@ -162,17 +162,17 @@ func TestSoftSkipPrecedesRowValidation(t *testing.T) {
 	})
 	t.Run("empty block page with invalid gated fields", func(t *testing.T) {
 		h := newBackupTestHandlers(t)
-		body := audit85BackupJSON(t, map[string][]map[string]any{
+		body := backupJSONFixture(t, map[string][]map[string]any{
 			"security_block_pages": {{"id": 91, "name": "empty", "content": "", "is_default": "1"}},
 		}, nil, []string{"security"})
-		preview := r78PostValidate(t, h, body)
+		preview := postValidateBytes(t, h, body)
 		if !preview.Valid || preview.Summary["security_block_pages"] != 0 || len(preview.Warnings) == 0 {
 			t.Fatalf("preview=%+v, want skipped empty block page", preview)
 		}
 	})
 }
 
-func audit85IPListQuotaRows(userCount int) []map[string]any {
+func ipListQuotaRowsShared(userCount int) []map[string]any {
 	rows := make([]map[string]any, 0, userCount+len(db.ThreatSystemLists())+1)
 	for i := 0; i < userCount; i++ {
 		rows = append(rows, map[string]any{
@@ -196,9 +196,9 @@ func audit85IPListQuotaRows(userCount int) []map[string]any {
 func TestIPListQuotaMatchesPostImportState(t *testing.T) {
 	t.Run("200 users plus four seeded system rows stay within final ceiling", func(t *testing.T) {
 		h := newBackupTestHandlers(t)
-		audit85SeedLiveAdmin(t)
-		rec := audit85PostImport(t, h, audit85BackupJSON(t, map[string][]map[string]any{
-			"security_ip_lists": audit85IPListQuotaRows(200),
+		seedLiveAdminShared(t)
+		rec := postImportBytes(t, h, backupJSONFixture(t, map[string][]map[string]any{
+			"security_ip_lists": ipListQuotaRowsShared(200),
 		}, nil, []string{"security"}))
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status=%d body=%s, want 200-user backup accepted", rec.Code, rec.Body.String())
@@ -213,9 +213,9 @@ func TestIPListQuotaMatchesPostImportState(t *testing.T) {
 	})
 	t.Run("legacy 201 rows with system rows accepted", func(t *testing.T) {
 		h := newBackupTestHandlers(t)
-		audit85SeedLiveAdmin(t)
-		rec := audit85PostImport(t, h, audit85BackupJSON(t, map[string][]map[string]any{
-			"security_ip_lists": audit85IPListQuotaRows(197),
+		seedLiveAdminShared(t)
+		rec := postImportBytes(t, h, backupJSONFixture(t, map[string][]map[string]any{
+			"security_ip_lists": ipListQuotaRowsShared(197),
 		}, nil, []string{"security"}))
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status=%d body=%s, want legacy >200 total with 197 user rows accepted", rec.Code, rec.Body.String())
@@ -230,9 +230,9 @@ func TestIPListQuotaMatchesPostImportState(t *testing.T) {
 	})
 	t.Run("201 user rows rejected", func(t *testing.T) {
 		h := newBackupTestHandlers(t)
-		audit85SeedLiveAdmin(t)
-		rec := audit85PostImport(t, h, audit85BackupJSON(t, map[string][]map[string]any{
-			"security_ip_lists": audit85IPListQuotaRows(201),
+		seedLiveAdminShared(t)
+		rec := postImportBytes(t, h, backupJSONFixture(t, map[string][]map[string]any{
+			"security_ip_lists": ipListQuotaRowsShared(201),
 		}, nil, []string{"security"}))
 		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "数量已达上限") {
 			t.Fatalf("status=%d body=%s, want user quota rejection", rec.Code, rec.Body.String())
@@ -242,7 +242,7 @@ func TestIPListQuotaMatchesPostImportState(t *testing.T) {
 
 func TestCommittedThreatStateWouldPassNameOnlyRollbackAssertion(t *testing.T) {
 	h := newBackupTestHandlers(t)
-	audit85SeedLiveAdmin(t)
+	seedLiveAdminShared(t)
 	dir := t.TempDir()
 	restore := services.OverrideThreatWafDirForTest(dir)
 	defer restore()
@@ -254,8 +254,8 @@ func TestCommittedThreatStateWouldPassNameOnlyRollbackAssertion(t *testing.T) {
 	if _, err := db.DB.Exec(`INSERT INTO security_threat_sources (id,name,display_name,update_enabled,apply_enabled) VALUES (91,'ustc','本地威胁源',1,1)`); err != nil {
 		t.Fatal(err)
 	}
-	backupJSON := audit85BackupJSON(t, map[string][]map[string]any{
-		"security_threat_sources": {audit85ThreatRow("ustc")},
+	backupJSON := backupJSONFixture(t, map[string][]map[string]any{
+		"security_threat_sources": {threatRowShared("ustc")},
 	}, nil, []string{"security"})
 	payload := buildLbbakWithExtraThreatEntry(t, string(backupJSON), []byte("5.6.7.8\n"))
 
@@ -283,7 +283,7 @@ func TestCommittedThreatStateWouldPassNameOnlyRollbackAssertion(t *testing.T) {
 
 func TestSentinelFailureReturnsWafSplitWarning(t *testing.T) {
 	h := newBackupTestHandlers(t)
-	audit85SeedLiveAdmin(t)
+	seedLiveAdminShared(t)
 	dir := t.TempDir()
 	restore := services.OverrideThreatWafDirForTest(dir)
 	defer restore()
@@ -295,12 +295,12 @@ func TestSentinelFailureReturnsWafSplitWarning(t *testing.T) {
 	if _, err := db.DB.Exec(`INSERT INTO security_threat_sources (id,name,display_name,update_enabled,apply_enabled) VALUES (91,'ustc','本地威胁源',1,1)`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.DB.Exec(fmt.Sprintf(`CREATE TRIGGER audit85_fail_sentinel BEFORE INSERT ON security_crs_version
+	if _, err := db.DB.Exec(fmt.Sprintf(`CREATE TRIGGER failSentinelShared BEFORE INSERT ON security_crs_version
 		WHEN NEW.version='%s' BEGIN SELECT RAISE(ABORT,'forced sentinel failure'); END`, importVersionSeedSentinel)); err != nil {
 		t.Fatal(err)
 	}
-	backupJSON := audit85BackupJSON(t, map[string][]map[string]any{
-		"security_threat_sources": {audit85ThreatRow("ustc")},
+	backupJSON := backupJSONFixture(t, map[string][]map[string]any{
+		"security_threat_sources": {threatRowShared("ustc")},
 	}, nil, []string{"security"})
 	payload := buildLbbakWithExtraThreatEntry(t, string(backupJSON), []byte("5.6.7.8\n"))
 
@@ -376,7 +376,7 @@ func TestClusterVersionSuppressionUsesEffectiveRole(t *testing.T) {
 
 func TestImportSuppressesPerRowClusterVersionBumps(t *testing.T) {
 	h := newBackupTestHandlers(t)
-	audit85SeedLiveAdmin(t)
+	seedLiveAdminShared(t)
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled) VALUES ('lb_old','old','http','old.example.test',18080,1)`); err != nil {
 		t.Fatal(err)
 	}
@@ -398,7 +398,7 @@ func TestImportSuppressesPerRowClusterVersionBumps(t *testing.T) {
 		{"id": 101, "rule_id": "lb_new1", "host": "127.0.0.1", "port": 9001, "weight": 1, "enabled": 1},
 		{"id": 102, "rule_id": "lb_new2", "host": "127.0.0.1", "port": 9002, "weight": 1, "enabled": 1},
 	}
-	rec := audit85PostImport(t, h, audit85BackupJSON(t, map[string][]map[string]any{
+	rec := postImportBytes(t, h, backupJSONFixture(t, map[string][]map[string]any{
 		"lb_rules": rules, "upstreams": upstreams,
 	}, nil, []string{"rules"}))
 	if rec.Code != http.StatusOK {
@@ -413,9 +413,9 @@ func TestImportSuppressesPerRowClusterVersionBumps(t *testing.T) {
 	}
 }
 
-func audit85PolicyBackup(t *testing.T) []byte {
+func policyBackupShared(t *testing.T) []byte {
 	t.Helper()
-	return audit85BackupJSON(t, map[string][]map[string]any{
+	return backupJSONFixture(t, map[string][]map[string]any{
 		"security_policies": {{
 			"id": 5, "name": "live refs", "mode": "off", "ip_acl_mode": "deny", "geoip_mode": "deny",
 			"ip_acl_list_refs": "[77]", "ip_whitelist_refs": "[]", "crs_rule_groups": "[]",
@@ -426,16 +426,16 @@ func audit85PolicyBackup(t *testing.T) []byte {
 
 func TestPolicyIPListReferencesFallbackToLive(t *testing.T) {
 	h := newBackupTestHandlers(t)
-	audit85SeedLiveAdmin(t)
+	seedLiveAdminShared(t)
 	if _, err := db.DB.Exec(`INSERT INTO security_ip_lists (id,name,category,entries,system) VALUES (77,'live list','custom','[{"value":"192.0.2.1"}]',0)`); err != nil {
 		t.Fatal(err)
 	}
-	body := audit85PolicyBackup(t)
-	preview := r78PostValidate(t, h, body)
+	body := policyBackupShared(t)
+	preview := postValidateBytes(t, h, body)
 	if !preview.Valid {
 		t.Fatalf("live-resolvable policy reference rejected in preview: %s", preview.Error)
 	}
-	rec := audit85PostImport(t, h, body)
+	rec := postImportBytes(t, h, body)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("import status=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -450,7 +450,7 @@ func TestPolicyIPListReferencesFallbackToLive(t *testing.T) {
 
 func TestPolicyIPListLiveFallbackRevalidatesInsideImportLock(t *testing.T) {
 	h := newBackupTestHandlers(t)
-	audit85SeedLiveAdmin(t)
+	seedLiveAdminShared(t)
 	if _, err := db.DB.Exec(`INSERT INTO security_ip_lists (id,name,category,entries,system) VALUES (77,'live list','custom','[{"value":"192.0.2.1"}]',0)`); err != nil {
 		t.Fatal(err)
 	}
@@ -460,7 +460,7 @@ func TestPolicyIPListLiveFallbackRevalidatesInsideImportLock(t *testing.T) {
 		}
 	}
 	t.Cleanup(func() { configImportBeforeLock = nil })
-	rec := audit85PostImport(t, h, audit85PolicyBackup(t))
+	rec := postImportBytes(t, h, policyBackupShared(t))
 	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "导入期间") {
 		t.Fatalf("status=%d body=%s, want locked live-reference rejection", rec.Code, rec.Body.String())
 	}
@@ -598,7 +598,7 @@ func TestBackupProductVersionMetadataAndWarning(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	preview := r78PostValidate(t, h, body)
+	preview := postValidateBytes(t, h, body)
 	found := false
 	for _, warning := range preview.Warnings {
 		found = found || (strings.Contains(warning, "v1.2.3") && strings.Contains(warning, "v9.8.7"))

@@ -34,6 +34,24 @@ test('member() 按花括号配对：嵌套块完整保留，块内 doesNotMatch 
   assert.doesNotMatch(body, /const after/, '切片不得越过函数收尾')
 })
 
+test('member() 跳过字符串/模板量/注释中的大括号：字面量不参与配对', () => {
+  const sample = [
+    'function withLiterals(): void {',
+    "  const close = '}'",
+    '  // 孤立 { 注释',
+    '  /* 另一处 } */',
+    '  const tpl = `} ${ { a: 1 }.a }`',
+    '  done()',
+    '}',
+    'const after = 1',
+  ].join('\n')
+  const body = member(sample, 'function withLiterals(')
+  // 字符串/注释里的 } 不得提前收尾：体内收尾语句必须仍在切片内。
+  assert.match(body, /done\(\)/, '字面量中的 } 不得让切片提前收尾')
+  // 注释里的 { 不得让切片越界吞下相邻声明。
+  assert.doesNotMatch(body, /const after/, '字面量/注释中的 { 不得使切片越界')
+})
+
 test('复位/返回必须作废在途省界加载（与地图引擎同源）', () => {
   for (const name of ['zoomOut', 'resetView']) {
     const body = member(globeSrc, `${name}(): void {`)

@@ -10,7 +10,7 @@ import (
 	"github.com/miekg/dns"
 )
 
-// 历史问题（历史）：递归共识探测必须并行（每台独立 ctx 超时）。
+// 递归共识探测必须并行（每台独立 ctx 超时）。
 //
 // 判定形态：4 台递归各自「进入后阻塞直至 4 台同时在途」——并行时 4 台同时
 // 进入即解锁，串行时任一时刻仅 1 台在途 → 各台各自烧满 700ms 兜底超时。
@@ -71,7 +71,7 @@ func TestIssuer_waitForDNS_probesResolversInParallel(t *testing.T) {
 	}
 }
 
-// 历史问题：权威服务器与递归服务器一样必须同轮并行。四台服务器只有在
+// 权威服务器与递归服务器一样必须同轮并行。四台服务器只有在
 // 全部同时在途时才返回命中；串行实现会逐台等待兜底并全部返回 NODATA。
 func TestIssuer_probeAuthServersLogged_probesAuthoritativeInParallel(t *testing.T) {
 	const expected = "parallel-auth-value"
@@ -124,7 +124,7 @@ func TestIssuer_probeAuthServersLogged_probesAuthoritativeInParallel(t *testing.
 	}
 }
 
-// 历史问题 超时边界：每台权威使用独立短超时。应答慢于该超时时须按
+// 超时边界：每台权威使用独立短超时。应答慢于该超时时须按
 // 查询失败处理（不进入 alive），而不是串行等到服务端 NODATA 后当作存活未命中。
 func TestIssuer_probeAuthServersLogged_appliesPerServerTimeout(t *testing.T) {
 	oldTimeout := propagationResolverProbeTimeout
@@ -177,7 +177,7 @@ func TestIssuer_probeAuthServersLogged_emptyAndSingleServerBoundaries(t *testing
 	}
 }
 
-// 历史问题（历史）：逐台命中/未命中行按状态变化收敛——同一状态跨轮不重复
+// 逐台命中/未命中行按状态变化收敛——同一状态跨轮不重复
 // 打印（镜像 waitForValidation 的 lastChalStatus 先例），避免 5min 预算内
 // 逐台刷屏。放行/诊断行（递归共识放行、分歧诊断）不受影响。
 func TestIssuer_waitForDNS_convergesRepeatedProbeLogs(t *testing.T) {

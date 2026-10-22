@@ -1,9 +1,15 @@
 package caddygeoip
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
+
+func trafficEventSnapshot(since uint64, limit int) ([]trafficEvent, uint64) {
+	events, next, _ := trafficEventSnapshotWithGap(since, limit)
+	return events, next
+}
 
 func TestTrafficEventRing_recordsAndSnapshots(t *testing.T) {
 	resetTrafficState(t)
@@ -22,7 +28,7 @@ func TestTrafficEventRing_recordsAndSnapshots(t *testing.T) {
 		t.Fatalf("event0=%+v", events[0])
 	}
 	more, _ := trafficEventSnapshot(events[0].Seq, 10)
-	// 「美国」入口归一为英文规范名（历史问题，与计数桶/app 聚合同口径）。
+	// 「美国」入口归一为英文规范名。
 	if len(more) != 1 || more[0].Country != "United States" {
 		t.Fatalf("incremental=%+v", more)
 	}
@@ -32,7 +38,7 @@ func TestTrafficEventRing_recordsAndSnapshots(t *testing.T) {
 	}
 }
 
-// 历史问题：trafficEventSeq 是进程内计数器，Caddy 重启后归零；前端则保留
+// trafficEventSeq 是进程内计数器，Caddy 重启后归零；前端则保留
 // 上一代际的高水位 since。服务端若不判别代际而把入参 since 原样回吐，前端
 // 「next_seq < previous 才复位」的判据永不成立 → 正常流量光流永久停更。
 func TestTrafficEventSnapshot_cursorAheadOfGenerationResets(t *testing.T) {
@@ -80,4 +86,41 @@ func TestTrafficEventRing_sampling(t *testing.T) {
 		t.Fatalf("sampled events=%d, want 2 (1/8 of 16)", len(events))
 	}
 	releaseTrafficLease("sample-test")
+}
+
+func TestTrafficEventRing_concurrentSequenceOrder(t *testing.T) {
+	resetTrafficState(t)
+	resetTrafficEvents()
+	trafficCollectorEnabled.Store(false)
+	if err := acquireTrafficLease("concurrent-test", time.Minute, 1); err != nil {
+		t.Fatal(err)
+	}
+	defer releaseTrafficLease("concurrent-test")
+
+	const writers = 16
+	const eventsPerWriter = 64
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for range eventsPerWriter {
+				trafficEventRecord("中国", "广东省")
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	events, _ := trafficEventSnapshot(0, 1000)
+	if len(events) != 1000 {
+		t.Fatalf("events=%d, want latest 1000", len(events))
+	}
+	for i := 1; i < len(events); i++ {
+		if events[i].Seq <= events[i-1].Seq {
+			t.Fatalf("ring sequence is not strictly increasing at %d: previous=%d current=%d", i, events[i-1].Seq, events[i].Seq)
+		}
+	}
 }

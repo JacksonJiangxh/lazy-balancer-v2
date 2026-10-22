@@ -162,7 +162,7 @@ func TestParseGitHubLatestTag(t *testing.T) {
 }
 
 func TestExtractCRSTarball_stripsRootAndExtracts(t *testing.T) {
-	// Given a 历史修复 tarball with a single root directory
+	// Given a tarball with a single root directory
 	tarball := buildCRSTarball(t, map[string]string{
 		"coreruleset-4.15.0/crs-setup.conf.example":    "# setup",
 		"coreruleset-4.15.0/rules/REQUEST-900.conf":    "SecRule 1",

@@ -12,7 +12,7 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// TestUpdateSecurityPolicy_crsRuleGroupsRequiresTwoDigitGroupCode 验证 历史修复：
+// TestUpdateSecurityPolicy_crsRuleGroupsRequiresTwoDigitGroupCode 验证
 // crs_rule_groups 条目必须是两位数字组号（发射端拼接 REQUEST-9<code>-*.conf）。
 // "941"、"REQUEST-942" 这类写法会 glob 零匹配——coraza 对空 Include 静默接受，
 // blocking 模式将无任何 CRS 规则生效且无任何报错；旧校验只限字符集，放行此类
@@ -97,8 +97,8 @@ func TestUpdateSecurityPolicy_crsRuleGroupsRejectsUnknownTwoDigitGroup(t *testin
 	}
 }
 
-// TestStartCRSUpdate_slaveNodeRejected403 验证 历史修复：手动 CRS 更新从节点
-// 一律 403（镜像 历史修复 A 域手动同步门控：直查 is_master，查询失败按非主节点拒绝）。
+// TestStartCRSUpdate_slaveNodeRejected403 验证：手动 CRS 更新从节点
+// 一律 403（镜像 A 域手动同步门控：直查 is_master，查询失败按非主节点拒绝）。
 // 从节点本地更新会造成磁盘/DB 分叉——主节点下次同步把 version 行覆盖回主节点
 // 口径，而从节点的启动对账是 master-only，分叉长期残留。
 func TestStartCRSUpdate_slaveNodeRejected403(t *testing.T) {
@@ -126,7 +126,7 @@ func TestStartCRSUpdate_slaveNodeRejected403(t *testing.T) {
 	}
 }
 
-// TestStartIP2RegionUpdate_slaveNodeRejected403 验证 历史修复：手动 IP2Region
+// TestStartIP2RegionUpdate_slaveNodeRejected403 验证：手动 IP2Region
 // 更新从节点一律 403，与 StartCRSUpdate 同一门控口径。
 func TestStartIP2RegionUpdate_slaveNodeRejected403(t *testing.T) {
 	// Given 一个从节点（更新服务未初始化）

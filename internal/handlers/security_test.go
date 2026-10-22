@@ -13,7 +13,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 历史问题(历史):GetCRSInfo/GetIP2RegionInfo 对齐 历史修复——仅行缺失
+// GetCRSInfo/GetIP2RegionInfo 对齐 ——仅行缺失
 // (ErrNoRows)合法回落默认值,真实 DB 故障 500 可见(此前一律吞为默认)。
 func TestGetCRSInfo_dbFailureReturns500(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -40,7 +40,7 @@ func TestGetCRSInfo_dbFailureReturns500(t *testing.T) {
 	}
 }
 
-// IP 弹框增强(历史批准):近 30 天该 IP 事件计数——索引范围 COUNT。
+// IP 弹框增强(批准):近 30 天该 IP 事件计数——索引范围 COUNT。
 func TestGetIPEventCount(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	// 种子:2 条 30 天内 + 1 条 40 天前(metrics 库)
@@ -80,7 +80,7 @@ func TestGetIPEventCount(t *testing.T) {
 		t.Fatalf("empty ip count=%d, want 0", resp.Data.Count)
 	}
 
-	// 历史修复:边界形状——缺 ip 400 / days 超限 clamp 365 / days 非数字回落 30 / days=0 回落 30
+	// 边界形状——缺 ip 400 / days 超限 clamp 365 / days 非数字回落 30 / days=0 回落 30
 	rec3 := httptest.NewRecorder()
 	router.ServeHTTP(rec3, httptest.NewRequest(http.MethodGet, "/security/events/count", nil))
 	if rec3.Code != http.StatusBadRequest {

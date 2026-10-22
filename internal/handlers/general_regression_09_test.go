@@ -14,8 +14,8 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 历史修复 公共夹具：与 completeBackupJSON 同构，但允许注入全局配置区（Config）。
-func r55BackupJSONWithConfig(t *testing.T, tables map[string][]map[string]any, cfg map[string]any) string {
+// 公共夹具：与 completeBackupJSON 同构，但允许注入全局配置区（Config）。
+func configBackupJSON(t *testing.T, tables map[string][]map[string]any, cfg map[string]any) string {
 	t.Helper()
 	completeTables := make(map[string][]map[string]any, len(configBackupTables))
 	for _, table := range configBackupTables {
@@ -38,7 +38,7 @@ func r55BackupJSONWithConfig(t *testing.T, tables map[string][]map[string]any, c
 	return string(data)
 }
 
-func r55AssertZeroWrite(t *testing.T) {
+func assertZeroWriteShared(t *testing.T) {
 	t.Helper()
 	var count int
 	if err := db.DB.QueryRow("SELECT COUNT(*) FROM users WHERE username='backup-admin'").Scan(&count); err != nil {
@@ -55,7 +55,7 @@ func r55AssertZeroWrite(t *testing.T) {
 	}
 }
 
-// 历史修复：手造备份 enabled+acme_dns+domain="a.com,b.org"（两个合法单域但非
+// 手造备份 enabled+acme_dns+domain="a.com,b.org"（两个合法单域但非
 // root+www）+ 同形 cert_jobs 行——此前导入侧无 ACME 域名合法性门、cert_jobs
 // 不变量回退原串假放行，导入后运行期 certJobRuleApplicable 严格规范化失败 →
 // 任务置 disabled、续签永久断链、TLS 端口明文服务。保存侧（rules.go）与启用侧
@@ -63,8 +63,8 @@ func r55AssertZeroWrite(t *testing.T) {
 func TestImportConfigBackup_rejects_illegal_acme_domain_shape(t *testing.T) {
 	// Given
 	h := newBackupTestHandlers(t)
-	r55SeedCurrentAdmin(t)
-	rule := r53BackupACMERule(7)
+	seedCurrentAdminShared(t)
+	rule := backupACMERuleShared(7)
 	rule["domain"] = "a.com,b.org"
 	backup := completeBackupJSON(t, map[string][]map[string]any{
 		"lb_rules":            {rule},
@@ -73,7 +73,7 @@ func TestImportConfigBackup_rejects_illegal_acme_domain_shape(t *testing.T) {
 	})
 
 	// When
-	response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
+	response := postImportShared(t, h.ImportConfigBackup, "/config/import", backup)
 
 	// Then
 	if response.Code != http.StatusBadRequest {
@@ -82,10 +82,10 @@ func TestImportConfigBackup_rejects_illegal_acme_domain_shape(t *testing.T) {
 	if !strings.Contains(response.Body.String(), "bak-acme") {
 		t.Fatalf("拒绝必须点名规则，实际: %s", response.Body.String())
 	}
-	r55AssertZeroWrite(t)
+	assertZeroWriteShared(t)
 }
 
-// 历史修复（不变量严格化）：validateV2BackupCertJobs 的域比较两侧均须可规范化——
+// （不变量严格化）：validateV2BackupCertJobs 的域比较两侧均须可规范化——
 // canonicalACMEDomainForJobLookup 的原串回退是查询侧良性 miss 语义，用于校验侧
 // 会把不可规范化的域名假放行（与运行期 certJobRuleApplicable 严格语义对齐）。
 func TestValidateV2BackupCertJobs_rejects_uncanonicalizable_domains(t *testing.T) {
@@ -102,7 +102,7 @@ func TestValidateV2BackupCertJobs_rejects_uncanonicalizable_domains(t *testing.T
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			newBackupTestHandlers(t)
-			rule := r53BackupACMERule(7)
+			rule := backupACMERuleShared(7)
 			rule["domain"] = tt.ruleDomain
 			tables := map[string][]map[string]any{
 				"lb_rules":            {rule},
@@ -120,7 +120,7 @@ func TestValidateV2BackupCertJobs_rejects_uncanonicalizable_domains(t *testing.T
 	}
 }
 
-// 历史修复（校验门函数级）：acme_dns 分支对启用行强制 ValidateACMEDomains
+// （校验门函数级）：acme_dns 分支对启用行强制 ValidateACMEDomains
 // （与保存/启用侧同口径）——双非 root+www 域名与三域集拒绝并点名规则；
 // 合法 root+www（含用户输入顺序变体）放行。
 func TestValidateV2BackupTLSShape_acme_domain_legality(t *testing.T) {
@@ -138,7 +138,7 @@ func TestValidateV2BackupTLSShape_acme_domain_legality(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			newBackupTestHandlers(t)
-			rule := r53BackupACMERule(7)
+			rule := backupACMERuleShared(7)
 			rule["domain"] = tt.domain
 			tables := map[string][]map[string]any{
 				"lb_rules":            {rule},
@@ -161,11 +161,11 @@ func TestValidateV2BackupTLSShape_acme_domain_legality(t *testing.T) {
 	}
 }
 
-// 历史修复（合法 root+www 形态双门放行）：TLS 形态校验与 cert_jobs 不变量
+// （合法 root+www 形态双门放行）：TLS 形态校验与 cert_jobs 不变量
 // 均不得误伤合法 root+www 备份（含顺序变体）。
 func TestValidateV2Backup_accepts_legal_root_www_acme_shape(t *testing.T) {
 	newBackupTestHandlers(t)
-	rule := r53BackupACMERule(7)
+	rule := backupACMERuleShared(7)
 	rule["domain"] = "www.bak-acme.example.test,bak-acme.example.test"
 	tables := map[string][]map[string]any{
 		"lb_rules":            {rule},
@@ -180,19 +180,19 @@ func TestValidateV2Backup_accepts_legal_root_www_acme_shape(t *testing.T) {
 	}
 }
 
-// 历史修复：将被 disableV2RuleConflicts 自动置禁用的冲突规则不参与运行态 TLS
+// 将被 disableV2RuleConflicts 自动置禁用的冲突规则不参与运行态 TLS
 // 形态校验——冲突集内一方携带垃圾 tls_source（不渲染、无风险），整包不得 400；
 // 与 cert_jobs 不变量的豁免哲学同序（TLS 形态检查移到冲突置禁用之后）。
 func TestImportConfigBackup_conflict_disabled_rule_with_garbage_tls_source(t *testing.T) {
 	// Given
 	h := newBackupTestHandlers(t)
-	r55SeedCurrentAdmin(t)
-	ruleA := r53BackupACMERule(7)
+	seedCurrentAdminShared(t)
+	ruleA := backupACMERuleShared(7)
 	ruleA["caddy_id"] = "lb_bak_tls_conflict_a"
 	ruleA["name"] = "bak-tls-conflict-a"
 	ruleA["domain"] = "bak-tls-conflict.example.test"
 	ruleA["listen_port"] = 8475
-	ruleB := r54BackupTLSRule("")
+	ruleB := backupTLSRuleShared("")
 	ruleB["caddy_id"] = "lb_bak_tls_conflict_b"
 	ruleB["name"] = "bak-tls-conflict-b"
 	ruleB["domain"] = "bak-tls-conflict.example.test"
@@ -207,7 +207,7 @@ func TestImportConfigBackup_conflict_disabled_rule_with_garbage_tls_source(t *te
 	})
 
 	// When
-	response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
+	response := postImportShared(t, h.ImportConfigBackup, "/config/import", backup)
 
 	// Then
 	if response.Code != http.StatusOK {
@@ -224,18 +224,18 @@ func TestImportConfigBackup_conflict_disabled_rule_with_garbage_tls_source(t *te
 	}
 }
 
-// 历史修复（预览路径）：ValidateConfigImport 必须与 ImportConfigBackup 同序——
+// （预览路径）：ValidateConfigImport 必须与 ImportConfigBackup 同序——
 // 冲突置禁用后的垃圾 tls_source 规则不阻断预览，预览显示可导入且携带
 // disabled_conflicts。
 func TestValidateConfigImport_conflict_disabled_rule_with_garbage_tls_source(t *testing.T) {
 	// Given
 	h := newBackupTestHandlers(t)
-	ruleA := r53BackupACMERule(7)
+	ruleA := backupACMERuleShared(7)
 	ruleA["caddy_id"] = "lb_bak_tls_conflict_a"
 	ruleA["name"] = "bak-tls-conflict-a"
 	ruleA["domain"] = "bak-tls-conflict.example.test"
 	ruleA["listen_port"] = 8475
-	ruleB := r54BackupTLSRule("")
+	ruleB := backupTLSRuleShared("")
 	ruleB["caddy_id"] = "lb_bak_tls_conflict_b"
 	ruleB["name"] = "bak-tls-conflict-b"
 	ruleB["domain"] = "bak-tls-conflict.example.test"
@@ -247,7 +247,7 @@ func TestValidateConfigImport_conflict_disabled_rule_with_garbage_tls_source(t *
 	})
 
 	// When
-	response := r55Post(t, h.ValidateConfigImport, "/config/import/validate", backup)
+	response := postImportShared(t, h.ValidateConfigImport, "/config/import/validate", backup)
 
 	// Then
 	body := response.Body.String()
@@ -259,7 +259,7 @@ func TestValidateConfigImport_conflict_disabled_rule_with_garbage_tls_source(t *
 	}
 }
 
-// 历史修复：UpdateConfig 聚合校验须点名 enabled+http+enable_tls 但 tls_source
+// UpdateConfig 聚合校验须点名 enabled+http+enable_tls 但 tls_source
 // 为垃圾值的存量/篡改规则——渲染侧 availableCerts 仅认 manual/acme_dns，
 // 该规则 TLS 端口明文服务；与 validateStoredRuleConfig:697-699 同口径白名单。
 func TestUpdateConfig_flags_enabled_rule_with_unknown_tls_source(t *testing.T) {
@@ -288,7 +288,7 @@ func TestUpdateConfig_flags_enabled_rule_with_unknown_tls_source(t *testing.T) {
 	}
 }
 
-// 历史修复：v2 导入写 admin_tls_* 前必须按 UpdateAdminTLS 同口径校验——
+// v2 导入写 admin_tls_* 前必须按 UpdateAdminTLS 同口径校验——
 // enabled+upload+空证书（或过期证书）落库后下次启动 ResolveCertificate 失败
 // 即进程退出（崩溃循环）；坏形态整包 400 零写入，合法形态放行。
 func TestImportConfigBackup_rejects_bad_admin_tls_config(t *testing.T) {
@@ -344,11 +344,11 @@ func TestImportConfigBackup_rejects_bad_admin_tls_config(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Given
 			h := newBackupTestHandlers(t)
-			r55SeedCurrentAdmin(t)
-			backup := r55BackupJSONWithConfig(t, map[string][]map[string]any{}, tt.config)
+			seedCurrentAdminShared(t)
+			backup := configBackupJSON(t, map[string][]map[string]any{}, tt.config)
 
 			// When
-			response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
+			response := postImportShared(t, h.ImportConfigBackup, "/config/import", backup)
 
 			// Then
 			if response.Code != tt.wantStatus {
@@ -358,7 +358,7 @@ func TestImportConfigBackup_rejects_bad_admin_tls_config(t *testing.T) {
 				if !strings.Contains(response.Body.String(), tt.wantErrText) {
 					t.Fatalf("body must contain %q，实际: %s", tt.wantErrText, response.Body.String())
 				}
-				r55AssertZeroWrite(t)
+				assertZeroWriteShared(t)
 				return
 			}
 			var enabled bool
@@ -373,16 +373,16 @@ func TestImportConfigBackup_rejects_bad_admin_tls_config(t *testing.T) {
 	}
 }
 
-// 历史修复（预览路径）：ValidateConfigImport 必须与 ImportConfigBackup 同序——
+// （预览路径）：ValidateConfigImport 必须与 ImportConfigBackup 同序——
 // 坏 admin_tls_* 形态预览即报不可导入，不得预览通过、导入才 400。
 func TestValidateConfigImport_rejects_bad_admin_tls_config(t *testing.T) {
 	// Given
 	h := newBackupTestHandlers(t)
-	backup := r55BackupJSONWithConfig(t, map[string][]map[string]any{},
+	backup := configBackupJSON(t, map[string][]map[string]any{},
 		map[string]any{"admin_tls_enabled": 1, "admin_tls_mode": "upload", "admin_tls_cert": "", "admin_tls_key": ""})
 
 	// When
-	response := r55Post(t, h.ValidateConfigImport, "/config/import/validate", backup)
+	response := postImportShared(t, h.ValidateConfigImport, "/config/import/validate", backup)
 
 	// Then
 	body := response.Body.String()
@@ -394,7 +394,7 @@ func TestValidateConfigImport_rejects_bad_admin_tls_config(t *testing.T) {
 	}
 }
 
-// 历史修复：audit_retention_months 写侧范围校验（UI 口径 1-12）——超大值使年龄
+// audit_retention_months 写侧范围校验（UI 口径 1-12）——超大值使年龄
 // 裁剪的 datetime('now', '-N days') 越出 SQLite 年份范围返回 NULL，年龄 DELETE
 // 恒假静默失效（仅剩条数兜底）；越界值必须 400。
 func TestUpdateConfig_rejects_audit_retention_months_out_of_range(t *testing.T) {
@@ -454,7 +454,7 @@ func TestUpdateConfig_rejects_caddy_log_size_mb_above_10240(t *testing.T) {
 	}
 }
 
-// 历史修复 对照组：边界值 1 与 12 必须放行。
+// 对照组：边界值 1 与 12 必须放行。
 func TestUpdateConfig_accepts_audit_retention_months_bounds(t *testing.T) {
 	for _, months := range []int{1, 12} {
 		t.Run(fmt.Sprintf("边界 %d 放行", months), func(t *testing.T) {
@@ -482,7 +482,7 @@ func TestUpdateConfig_accepts_audit_retention_months_bounds(t *testing.T) {
 	}
 }
 
-// 历史修复：存量越界值启动钳位——写侧加范围校验后，历史越界值（含使年龄裁剪
+// 存量越界值启动钳位——写侧加范围校验后，历史越界值（含使年龄裁剪
 // 静默失效的超大值）在启动时钳位到最近边界并记日志。
 func TestClampAuditRetentionMonthsOnStartup(t *testing.T) {
 	tests := []struct {

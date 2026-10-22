@@ -140,7 +140,7 @@ func TestBuildCorazaDirectives_allowAndDenyModesUnchangedByBypass(t *testing.T) 
 	}
 }
 
-// 历史修复：IP ACL deny 规则引用的 skipAfter 终点与无条件发射的 SecMarker
+// IP ACL deny 规则引用的 skipAfter 终点与无条件发射的 SecMarker
 // 必须成对存在——marker 缺失时 coraza 拒绝编译整个 directives（配置自锁）。
 func TestBuildCorazaDirectives_ipACLDenyCarriesSkipAfterAndMarker(t *testing.T) {
 	// Given：deny 模式 ACL + 遗留黑名单各一条
@@ -237,11 +237,11 @@ func TestGetSecurityPolicyForRule_roundTripsIPWhitelistAndBlacklist(t *testing.T
 	}
 }
 
-// TestBuildCorazaDirectives_trimsLegacyCRSGroupWhitespace 验证 历史问题 发射侧：
+// TestBuildCorazaDirectives_trimsLegacyCRSGroupWhitespace 验证发射侧
 // 历史遗留行（旧校验放行过首尾空白条目）即使库中组号为 " 42 "，发射端也必须
 // trim 后拼接，产出合法 glob REQUEST-942-*.conf 而非零匹配的 REQUEST-9 42-*.conf
 // ——coraza 对零匹配 Include 静默接受，blocking 模式该组规则将静默缺失。
-// 历史修复 同行走同一变量，一并断言。
+// 同行走同一变量，一并断言。
 func TestBuildCorazaDirectives_trimsLegacyCRSGroupWhitespace(t *testing.T) {
 	// Given 一条历史遗留策略行：组号含首尾空白（模拟绕过校验直接落库的旧数据）
 	useCRSDirectivesDir(t, t.TempDir())
@@ -315,13 +315,13 @@ func TestBuildCorazaDirectives_omitsUserOverridesWhenFileMissing(t *testing.T) {
 }
 
 // 2026-09-09 排查 942550 误报（JSON 订单单被当 SQL 注入拦截）确认的集成缺口：
-// coraza 不按 历史修复 自动启用 JSON/XML body processor（源码注释明确
+// coraza 不按自动启用 JSON/XML body processor（源码注释明确
 // XML and JSON must be forced with ctl），CRS 901340 对无 processor 的 body 强制
 // forceRequestBodyVariable 后 coraza 兜底按 URLENCODED 解析——JSON 整串成为
 // 单个参数名：扫 ARGS_NAMES 的规则（942550/941100）在原始文本上误报，扫
 // ARGS 值的规则对 body 失明。修复：CRS Include 之前显式激活 processor（对齐
 // ModSecurity 连接器的引擎层行为；id 9/10 沿用本项目自有单数码段）。
-// 历史修复：历史修复 值大小写不受控（coraza 仅小写化 header 名），
+// 值大小写不受控（coraza 仅小写化 header 名），
 // 激活正则必须 (?i)，否则 Application/JSON 变体按请求退回兜底误报路径。
 func TestBuildCorazaDirectives_activatesJSONXMLBodyProcessors(t *testing.T) {
 	jsonRule := `SecRule REQUEST_HEADERS:Content-Type "@rx (?i)^application/(?:[\w.+-]+?\+)?json(?:\s*;|$)" "id:9,phase:1,pass,nolog,ctl:requestBodyProcessor=JSON"`
@@ -349,7 +349,7 @@ func TestBuildCorazaDirectives_activatesJSONXMLBodyProcessors(t *testing.T) {
 	}
 }
 
-// 历史修复：畸形 JSON/XML（或嵌套超深）使 coraza 解析失败——所有 body
+// 畸形 JSON/XML（或嵌套超深）使 coraza 解析失败——所有 body
 // 集合为空且 901340 不再 force，CRS 4.29 无任何规则消费 REQBODY_PROCESSOR_ERROR
 // （grep 实证零命中），恶意 body 可借「声明 JSON + 发非法 JSON」对全部 body
 // 规则隐身。守卫规则 id:11 计满临界异常分（默认阈值 5 → 拦截模式即拦），
@@ -430,7 +430,7 @@ func TestBuildCorazaDirectives_customOnlyWithoutAnythingIsEmpty(t *testing.T) {
 }
 
 func TestBuildCorazaDirectives_skipsIllegalSecRuleRemoveTargets(t *testing.T) {
-	// 历史问题 B-新1：SecRuleRemoveById 形态门——非法形态（coraza Atoi 失败→
+	// B-新1：SecRuleRemoveById 形态门——非法形态（coraza Atoi 失败→
 	// 全部配置编译失败/LB 停摆）与越界 range（1-999999 静默删光全部规则）
 	// 必须跳过；合法单 ID 与合法区间照常发射。
 	policy := &models.SecurityPolicy{
@@ -454,7 +454,7 @@ func TestBuildCorazaDirectives_skipsIllegalSecRuleRemoveTargets(t *testing.T) {
 }
 
 func TestMergeOverridesLines_preservesExistingAndDedups(t *testing.T) {
-	// 历史问题 B-新2：两次手改 setup 跨两次成功更新，前次迁移行必须保留；
+	// B-新2：两次手改 setup 跨两次成功更新，前次迁移行必须保留；
 	// 重复行去重；空 diff 且既有为空 → nil（不写空文件）。
 	dir := t.TempDir()
 	path := filepath.Join(dir, "zz-user-overrides.conf")
@@ -511,11 +511,11 @@ func TestBuildCorazaDirectives_emitsCustomRuleWithNullColumns(t *testing.T) {
 		t.Fatalf("null-action rule must default to deny (COALESCE 'block'):\n%s", directives)
 	}
 	// r1（conditions=NULL → '[]'）从 DB 加载成功但被发射侧正确跳过（空条件）——
-	// 关键是不得再被误报为「不存在」（历史修复 修复前 scan 失败 → continue → 静默丢弃）
+	// 关键是不得再被误报为「不存在」（修复前 scan 失败 → continue → 静默丢弃）
 }
 
 func TestBuildRateLimitHandler_sweepIntervalAtHandlerLevel(t *testing.T) {
-	// 历史问题：sweep_interval 必须在 handler 层而非 zone 级——Caddy v2.11.4
+	// sweep_interval 必须在 handler 层而非 zone 级——Caddy v2.11.4
 	// 对模块载荷 DisallowUnknownFields，zone 级未知字段使整个配置加载 400
 	// （开启限流即配置停摆，README 核心功能不可用）。
 	policy := &models.SecurityPolicy{RateLimitEnabled: true, RateLimitRPS: 5, RateLimitBurst: 10}
@@ -604,7 +604,7 @@ func extractCRSPoolFingerprint(t *testing.T, directives string) string {
 	return ""
 }
 
-// 历史修复(2026-09-10 审计):响应体缓冲(WAFCheckResponse)在 off/custom_only 下零消费
+// (2026-09-10 审计):响应体缓冲(WAFCheckResponse)在 off/custom_only 下零消费
 // (响应规则仅 blocking/detection Include,自定义无响应目标)——发射侧按 CRS
 // 生效模式门控,避免无谓内存/CPU 缓冲。
 func TestBuildCorazaDirectives_responseBodyAccessGatedByCRSMode(t *testing.T) {
@@ -655,5 +655,33 @@ func TestBuildCorazaDirectives_malformedCRSRuleGroupsLogsWarnAndUsesAll(t *testi
 	_ = mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_valid_groups"))
 	if strings.Contains(logBuf.String(), "crs_rule_groups 畸形") {
 		t.Fatalf("valid empty groups must not warn:\n%s", logBuf.String())
+	}
+}
+
+// 畸形列 WARN 与同族三处（内联/引用名单解析失败）同口径 60s 限流：同一脏
+// 策略在单次全量生成中被「规则×绑定策略」粒度重复渲染时，同窗口只放行
+// 首条 WARN（脏行存续期逐条刷会淹没同窗口真实告警）。
+func TestBuildCorazaDirectives_malformedJSONWarnRateLimited(t *testing.T) {
+	var logBuf bytes.Buffer
+	oldLog := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(oldLog) })
+
+	groupsPolicy := &models.SecurityPolicy{ID: 8, Name: "broken-groups-rl", Mode: "blocking", AnomalyThreshold: 5, CRSRuleGroups: json.RawMessage(`{"not":"an array"`)}
+	for range 3 {
+		_ = mustDirectives(BuildCorazaDirectives(groupsPolicy, nil, "", false, 0, "lb_broken_groups_rl"))
+	}
+	if got := strings.Count(logBuf.String(), "crs_rule_groups 畸形"); got != 1 {
+		t.Fatalf("3 次渲染同脏策略 crs_rule_groups WARN=%d 条, want 1（60s 限流）:\n%s", got, logBuf.String())
+	}
+
+	logBuf.Reset()
+	geoPolicy := &models.SecurityPolicy{ID: 9, Name: "broken-geo-rl", Mode: "off", GeoIPMode: "deny", GeoIPCountries: json.RawMessage(`{"not":"an array"`)}
+	for range 3 {
+		// GeoIP 在预检渲染链求值（策略引擎对纯 GeoIP 策略产空串，不经策略渲染）
+		_ = mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{geoPolicy}, 0, "lb_broken_geo_rl"))
+	}
+	if got := strings.Count(logBuf.String(), "geoip_countries 畸形"); got != 1 {
+		t.Fatalf("3 次渲染同脏策略 geoip_countries WARN=%d 条, want 1（60s 限流）:\n%s", got, logBuf.String())
 	}
 }

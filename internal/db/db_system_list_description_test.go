@@ -1,6 +1,6 @@
 package db
 
-// 历史问题（历史）：EnsureSystemIPList 对已存在的 system=1 行必须把
+// EnsureSystemIPList 对已存在的 system=1 行必须把
 // description 归一到当前种子文案——此前只在缺失时 INSERT，任何文案修订都要
 // 再写一次性 UPDATE 补丁（2026-10-15「删除条目即解封」即复发路径），存量库与
 // 新库文案长期分叉。

@@ -14,7 +14,7 @@ import (
 )
 
 // apiKeyVisibility 是 tools/list 过滤所需的 Key 属主属性。
-// 历史修复：role 与 readOnly 由同一次解析返回——admin 组路由对非管理员恒 403，
+// role 与 readOnly 由同一次解析返回——admin 组路由对非管理员恒 403，
 // 可见性必须同口径隐藏（此前只过滤只读 Key，非管理员属主的写工具全部可见）。
 type apiKeyVisibility struct {
 	readOnly bool
@@ -79,10 +79,10 @@ func isAdminOnlyTool(spec toolSpec) bool {
 
 // ReadOnlyProbeTools 只读 Key 可见的读探测 POST 工具清单（REST 白名单
 // auditpolicy.go readOnlyWriteRoutes 同口径）——serveWithToolVisibility 与
-// 可见性钉测试（server_test.go）共用的单一事实源（历史问题：
-// 原工具侧/测试侧两份手工平行清单收敛为一份）。历史问题（历史）：
+// 可见性钉测试（server_test.go）共用的单一事实源
+// 原工具侧/测试侧两份手工平行清单收敛为一份）。
 // test_certificate_config 会写 DNS TXT 验证记录，移出探测集（工具本身保留，
-// 管理员仍可用；只读 Key 不可见）。历史问题（历史）：test_ca_provider
+// 管理员仍可用；只读 Key 不可见）。test_ca_provider
 // 同理移出——ZeroSSL 缺 EAB 时会真实写 ca_providers.credentials。
 var ReadOnlyProbeTools = map[string]struct{}{
 	"parse_certificate": {},
@@ -90,10 +90,10 @@ var ReadOnlyProbeTools = map[string]struct{}{
 	"preview_config":    {},
 }
 
-// readOnlyHiddenTools 是「GET 但对只读 Key 不可见」的工具（历史修复：export_config
+// readOnlyHiddenTools 是「GET 但对只读 Key 不可见」的工具（export_config
 // 走 apiKeyReadOnlyGuard 403，只读 Key 不可见，避免呈现必然 403 的工具）。
 // 与 ReadOnlyProbeTools 同为 ListToolSpecs.read_only 元数据与
-// serveWithToolVisibility 可见性过滤的单一事实源（历史问题：原仅局部于
+// serveWithToolVisibility 可见性过滤的单一事实源（原仅局部于
 // filterReadOnlyTools，public 元数据与可见性过滤各自维护易漂移）。
 var readOnlyHiddenTools = map[string]struct{}{"export_config": {}}
 
@@ -190,7 +190,7 @@ func writeEmptyToolsList(writer http.ResponseWriter, requestID json.RawMessage) 
 	_, _ = writer.Write(data)
 }
 
-// resolveAPIKeyVisibility 解析 Key 属主属性（只读 + 是否管理员）。历史修复：
+// resolveAPIKeyVisibility 解析 Key 属主属性（只读 + 是否管理员）。
 // 与 middleware 认证共用 db.ResolveAPIKeyIdentity 单源。
 func resolveAPIKeyVisibility(apiKey string) (apiKeyVisibility, error) {
 	if apiKey == "" || db.DB == nil {
@@ -213,7 +213,7 @@ func filterReadOnlyTools(response []byte) ([]byte, error) {
 // filterTools 按 keep 谓词重建 tools 列表。keep 之外的形状语义见
 // filterReadOnlyTools 的历史注释（错误形态原样透传）。
 func filterTools(response []byte, keep func(name string) bool) ([]byte, error) {
-	// 历史问题:错误形态(含 error 成员)或缺 result/
+	// 错误形态(含 error 成员)或缺 result/
 	// result.tools 的响应原样透传——下方固定结构体重建会把 error 形态改写为
 	// 「result.tools:null」假成功,吞掉上游错误信号。
 	var envelope struct {
@@ -223,7 +223,7 @@ func filterTools(response []byte, keep func(name string) bool) ([]byte, error) {
 	if err := json.Unmarshal(response, &envelope); err != nil {
 		return nil, fmt.Errorf("解析 tools/list 响应: %w", err)
 	}
-	// 历史问题(历史修复 评审):显式 "error":null 经 RawMessage 得 4 字节
+	// 显式 "error":null 经 RawMessage 得 4 字节
 	// "null",须排除——否则错误判定把正常响应当错误形态透传、跳过过滤。
 	if (len(envelope.Error) > 0 && string(envelope.Error) != "null") || len(envelope.Result) == 0 {
 		return response, nil
@@ -234,7 +234,7 @@ func filterTools(response []byte, keep func(name string) bool) ([]byte, error) {
 	if err := json.Unmarshal(envelope.Result, &resultProbe); err != nil || len(resultProbe.Tools) == 0 {
 		return response, nil
 	}
-	// map 保字段重建（历史问题，用户裁定）：result/顶层除 tools 外的字段
+	// map 保字段重建：result/顶层除 tools 外的字段
 	// （如 mcp-go 未来引入的 nextCursor）原样透传，不随过滤重建丢失；键序不保证，
 	// JSON-RPC 消费方不依赖键序。
 	var doc map[string]json.RawMessage

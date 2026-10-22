@@ -52,7 +52,7 @@ func watchAdminServer(t *testing.T, config *atomic.Value) *httptest.Server {
 	return server
 }
 
-func TestP1_2_watchdogMatchesTLSCertificateRenderGate(t *testing.T) {
+func TestWatchdogMatchesTLSCertificateRenderGate(t *testing.T) {
 	newClusterTestService(t)
 	ResetConfigDrift()
 	t.Cleanup(ResetConfigDrift)
@@ -152,7 +152,7 @@ func TestWatchdogFixturesAreValidJSON(t *testing.T) {
 	}
 }
 
-// 发布谓词钉测试（历史问题 单源化）：看门狗期望集=「启用 ∧ 存在启用上游」——
+// 发布谓词钉测试：看门狗期望集=「启用 ∧ 存在启用上游」——
 // 与渲染侧 Go 跳过（零启用上游 warn+continue）恒等。谓词改为共享常量
 // publishableRulesSQLPredicate 后，本测试钉死两消费层语义不漂移。
 func TestExpectedRenderedRules_publishablePredicate(t *testing.T) {

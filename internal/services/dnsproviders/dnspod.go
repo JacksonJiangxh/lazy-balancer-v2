@@ -14,7 +14,7 @@ import (
 
 var newDNSProviderFromCredentials = dnsprovider.NewProviderFromCredentials
 
-// warnLog 是本包的告警输出接缝（历史问题）：包边界不允许导入 services 的分级
+// warnLog 是本包的告警输出接缝：包边界不允许导入 services 的分级
 // Logf，默认写标准库 log 并保留原有 "warn: " 前缀形态；services 侧在 init
 // 注入 Logf("warn", ...)，使告警与全局日志级别过滤/JSON 输出同形态（此前
 // 直接 log.Printf 的残留在 warn 以上级别过滤或 JSON 输出场景会丢失/形态分叉）。
@@ -38,7 +38,7 @@ func (d *DNSPod) Name() string       { return "DNSPod (腾讯云)" }
 func (d *DNSPod) ModuleName() string { return "dns.providers.dnspod" }
 
 func (d *DNSPod) CredentialFields() []CredentialField {
-	// visible_when/option_labels（历史修复，历史）：字段可见性与选项文案
+	// visible_when/option_labels：字段可见性与选项文案
 	// 由后端元数据下发，前端不再硬编码两种认证模式的字段名。
 	visibleOnly := func(mode string) map[string][]string {
 		return map[string][]string{"auth_mode": {mode}}
@@ -62,11 +62,11 @@ func (d *DNSPod) CredentialFieldOptions(field string) []string {
 	return nil
 }
 
-// buildCredentials 校验并产出规范凭据 map（历史修复，历史：内核直返
+// buildCredentials 校验并产出规范凭据 map（内核直返
 // map——曾先 Marshal 成 JSON 串、BuildCredentialsJSON 再 Unmarshal 回 map
 // 的序列化往返，仅为类型转换）。
 //
-// 历史问题（历史）：同时接受 UI 形态（auth_mode + 表单字段，存储形态）与
+// 同时接受 UI 形态（auth_mode + 表单字段，存储形态）与
 // canonical 形态（mode + api_token / mode + secret 对，本函数自身产出）——
 // 产出可回喂，避免「未来把 canonical 落库」让保存前测试端点误报 400。
 // 两种形态都出现时 auth_mode 优先（与协议面 factory 的「UI 形态是真相」同口径）。
@@ -91,7 +91,7 @@ func (d *DNSPod) buildCredentials(creds map[string]string) (map[string]string, e
 		if creds["secret_id"] == "" || creds["secret_key"] == "" {
 			return nil, fmt.Errorf("腾讯云认证方式需要提供 SecretId 和 SecretKey")
 		}
-		// 历史修复:canonical 不再携带 api_token 拼接值——tencent 模式消费端
+		// canonical 不再携带 api_token 拼接值——tencent 模式消费端
 		// (factory.go)只读 secret_id/secret_key,拼接串是零消费死字段。
 		return map[string]string{
 			"mode":       "tencent",
@@ -101,7 +101,7 @@ func (d *DNSPod) buildCredentials(creds map[string]string) (map[string]string, e
 	case "dnspod":
 		apiToken := ""
 		if creds["app_id"] != "" && creds["app_token"] != "" {
-			// 历史修复（历史）：app_id+app_token→api_token 拼接为双实现——本处
+			// app_id+app_token→api_token 拼接为双实现——本处
 			// （UI 面 canonical 产出）与 internal/dnsprovider/factory.go 的 legacy
 			// 归一化（协议面消费）互为镜像；任一侧改字段名/拼接格式须双侧同步。
 			apiToken = creds["app_id"] + "," + creds["app_token"]
@@ -136,7 +136,7 @@ func (d *DNSPod) BuildCredentialsJSON(creds map[string]string) (map[string]inter
 // 测试按比例缩放保持墙钟快速；生产代码不得改写）。
 var dnsProviderValidateTimeout = 30 * time.Second
 
-func (d *DNSPod) Validate(creds map[string]string, testDomain string) error {
+func (d *DNSPod) Validate(ctx context.Context, creds map[string]string, testDomain string) error {
 	m, err := d.buildCredentials(creds)
 	if err != nil {
 		return err
@@ -152,7 +152,7 @@ func (d *DNSPod) Validate(creds map[string]string, testDomain string) error {
 	if domain == "" {
 		return fmt.Errorf("测试域名不能为空")
 	}
-	// 历史问题：输入域用于 challenge FQDN，provider 调用必须用可注册根域——
+	// 输入域用于 challenge FQDN，provider 调用必须用可注册根域——
 	// 否则账户只管理 example.com 时输入 www.example.com 会在 getDomainID 精确
 	// 查找处误报「domain not found」，与真实签发链（PSL 解析）口径分裂。
 	// 已知限制：委派子区（账户实际 zone=sub.example.com）PSL 不可见，需以根域
@@ -165,22 +165,28 @@ func (d *DNSPod) Validate(creds map[string]string, testDomain string) error {
 		domain += "."
 	}
 	challengeName := "_acme-challenge.lb-test." + domain
-	// 历史问题（历史）：探针值带随机后缀——清理失败残留的常量值记录不会
+	// 探针值带随机后缀——清理失败残留的常量值记录不会
 	// 让下一次验证产生同 (名,值) 歧义（腾讯云对完全重复 TXT 的处理不在本仓
 	// 契约内，去掉可避免的碰撞面）。
 	probeValue := fmt.Sprintf("lazy-balancer-test-%08x", mathrand.Uint32())
-	presentCtx, presentCancel := context.WithTimeout(context.Background(), dnsProviderValidateTimeout)
+	// 写入探测同时受调用方请求 ctx（客户端断开/请求超时立即中止）与内部
+	// 预算约束——取二者更早者。清理预算必须独立（见下方注释）：请求 ctx 已
+	// 取消时仍要尽力删掉测试记录。
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	presentCtx, presentCancel := context.WithTimeout(ctx, dnsProviderValidateTimeout)
 	defer presentCancel()
 	if err := provider.Present(presentCtx, zone, challengeName, probeValue, 600); err != nil {
 		return fmt.Errorf("DNS 写入测试失败: %w", err)
 	}
-	// 历史问题：清理必须用独立预算——共用 Present 的 ctx 时，传输层重试包络
+	// 清理必须用独立预算——共用 Present 的 ctx 时，传输层重试包络
 	// （429/5xx 3 次 × 30s 退避）耗尽预算后 CleanUp 立即因 ctx.Err() 失败，
 	// 用户看到「DNS 清理测试失败」的假失败（记录其实写入成功）。
 	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), dnsProviderValidateTimeout)
 	defer cleanupCancel()
 	if err := provider.CleanUp(cleanupCtx, zone, challengeName); err != nil {
-		// 历史修复（历史）：清理失败时测试 TXT 记录可能已残留——记告警
+		// 清理失败时测试 TXT 记录可能已残留——记告警
 		// 并在错误文案点名手动清理路径；返回错误语义不变（验证仍判失败）。
 		warnLog("dnspod 验证清理失败，测试记录 %s 可能残留，请手动清理: %v", challengeName, err)
 		return fmt.Errorf("DNS 清理测试失败: %w（测试记录可能已残留，请登录 DNS 控制台手动清理 %s TXT 记录）", err, strings.TrimSuffix(challengeName, "."))

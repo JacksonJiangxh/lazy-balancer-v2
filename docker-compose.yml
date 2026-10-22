@@ -1,5 +1,5 @@
-# INFRA-R2（历史）：主从共用配置锚点——logging/ulimits/healthcheck 三处
-# 逐字重复收敛为单份（双份维护改一侧忘另一侧即分叉）。
+# 主从共用配置锚点——logging/ulimits/healthcheck 三处逐字重复收敛为单份
+#（双份维护改一侧忘另一侧即分叉）。
 x-common-logging: &common-logging
   driver: json-file
   options:
@@ -14,7 +14,7 @@ x-common-ulimits: &common-ulimits
 x-common-healthcheck: &common-healthcheck
   # 探针须模式无关：面板 HTTPS 可开关（开启时明文 HTTP 得 302），admin_tls 关闭时
   # 又只有明文可用；镜像内无 curl（仅构建期临时安装后 apk del），busybox wget
-  # 的 --no-check-certificate 经实证可完成自签 TLS 探测（历史 历史问题-30）。
+  # 的 --no-check-certificate 经实证可完成自签 TLS 探测。
   test: ["CMD-SHELL", "wget -q --no-check-certificate -O /dev/null https://127.0.0.1:8000/health || wget -q -O /dev/null http://127.0.0.1:8000/health"]
   interval: 30s
   timeout: 5s
@@ -28,7 +28,7 @@ services:
   # 主从两个容器共用同一镜像（image 标签与 Docker Hub 推送的一致）。
   # 本地开发迭代时执行：docker compose build lazy-balancer && docker compose up -d
   #
-  # 平台口径（A83H-历史问题）：主节点固定 network_mode: host，仅适用于 Linux 宿主。
+  # 平台口径：主节点固定 network_mode: host，仅适用于 Linux 宿主。
   # Docker Desktop（macOS/Windows）的 host 网络支持依版本/设置而异，默认请按
   # README「快速开始」的 Docker Desktop 命令（bridge + -p 8000/80/443/443-udp
   # + named volume）启动，而非直接 docker compose up。
@@ -38,11 +38,11 @@ services:
     build:
       context: .
       args:
-        # FE-8/INFRA-4（历史登记）：版本号硬编码点之一（本行即 compose
-        # build.args.VERSION）。全仓八处=README 两版 docker build 示例段、本文件
-        # 两处 image tag + 本行、Dockerfile ARG VERSION、branding.ts appVersion
-        # 回退值、internal/config/config.go APP_VERSION 回退、buildx --build-arg。
-        # 发版检查单以 lazy-balancer-release 技能步骤 2 为唯一清单。
+        # 版本号硬编码点之一（本行即 compose build.args.VERSION）。全仓其余
+        # 位置=Dockerfile ARG VERSION、本文件两处 image tag、README 两版
+        # docker build 示例（--build-arg VERSION 与镜像 tag）、
+        # web/src/utils/branding.ts 的 appVersion 回退值；发布时另需 buildx
+        # --build-arg 显式传参。以上各处须同步递增。
         # 正式版：VERSION 与上方两处 image tag 同为 v2.3.8。beta 通道才在
         # image tag 上加 -beta 后缀（镜像内 APP_VERSION 仍为正式版本号）。
         VERSION: v2.3.8
@@ -60,7 +60,7 @@ services:
       - NODE_NAME=master
       - LOG_FILE=/app/logs/lazy-balancer.log
     restart: unless-stopped
-    # INFRA-U5（历史）：PID1 退出前 POST Caddy admin /stop 排水在途连接，
+    # PID1 退出前 POST Caddy admin /stop 排水在途连接，
     # grace period 覆盖 HTTP ≤10s Shutdown + Caddy 排水窗口。
     stop_grace_period: 30s
     healthcheck: *common-healthcheck

@@ -9,7 +9,7 @@ import (
 )
 
 // 从端落库用秒精度 crsTimeLayout；快照哈希输入必须同精度，否则主从节哈希
-// 永久不等并触发多余全量重拉（历史问题）。
+// 永久不等并触发多余全量重拉。
 func TestSnapshotTime_truncatesToSecond(t *testing.T) {
 	in := time.Date(2026, 10, 19, 4, 5, 6, 123456789, time.FixedZone("CST", 8*3600))
 	got := snapshotTime(in)
@@ -25,7 +25,7 @@ func TestSnapshotTime_truncatesToSecond(t *testing.T) {
 	}
 }
 
-// 历史问题-03：规则时间戳按秒/UTC 归一——运行期带亚秒/时区偏移的写入不再让
+// 规则时间戳按秒/UTC 归一——运行期带亚秒/时区偏移的写入不再让
 // rules 节哈希主从形态分叉。
 func TestSnapshotRules_truncatesTimestampsToSecondUTC(t *testing.T) {
 	service, database := newClusterTestService(t)

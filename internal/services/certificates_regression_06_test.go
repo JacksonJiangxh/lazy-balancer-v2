@@ -7,7 +7,7 @@ import (
 )
 
 // TestCertificateService_scheduleDeploymentRetry_reentry_does_not_deadlock
-// （历史修复 红→绿）：部署回调内部署再失败会（异步）调用
+// 部署回调内部署再失败会（异步）调用
 // scheduleDeploymentRetry 重排同 jobID——重排的「等待在途回调退出」必须
 // 等到回调自身返回（done 由其 defer 关闭）而非死锁。修复前
 // certissuer.deploymentFailed 同步调用，重排在回调 goroutine 内等待自身
@@ -43,7 +43,7 @@ func TestCertificateService_scheduleDeploymentRetry_reentry_does_not_deadlock(t 
 	service.pauseDeploymentRetries()
 }
 
-// TestWaitDoneOrTimeout_returns_on_closed_channel（历史修复 语义验证）：
+// TestWaitDoneOrTimeout_returns_on_closed_channel
 // done 关闭即快速返回；慢路径（默认 30s 超时放弃）不在测试内等待真实 30s。
 func TestWaitDoneOrTimeout_returns_on_closed_channel(t *testing.T) {
 	done := make(chan struct{})

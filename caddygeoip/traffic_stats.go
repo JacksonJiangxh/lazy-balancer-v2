@@ -12,7 +12,7 @@ package caddygeoip
 //     误差——大屏光流为密度示意，可接受。
 //   - 国名口径：计数/事件桶键经 geoipnames.NormalizeCountry 归一（xdb 中文
 //     异体如「美国」折叠为英文规范名；「中国」保留）——app 聚合端点按翻译
-//     后中文名重建 map（覆盖语义），异体分键会被丢计数（历史问题）；
+//     后中文名重建 map（覆盖语义），异体分键会被丢计数；
 //     客户端请求头不参与计数，本模块不加依赖。
 //   - 统计边界：计数由链尾 lb_security_blocked_counter 执行；国名只来自
 //     geoip2region 的服务端变量。未启用地域能力的规则没有该变量，因此不产生
@@ -43,7 +43,7 @@ var (
 	trafficCountries = map[string]*trafficEntry{}
 
 	// trafficSecondState 惰性翻秒 + 当前秒计数的打包原子态：
-	// (unixSec<<32)|hits。历史问题（历史）：旧实现 second 与 hits 是
+	// (unixSec<<32)|hits。旧实现 second 与 hits 是
 	// 两个独立原子——翻秒路径 Swap(sec) 与并发 Add(1) 之间无配对，跨秒瞬间
 	// 的命中会落在被随后 Swap(0) 丢弃的计数里（翻秒丢计）。打包 CAS 把
 	// 「读当前秒 + 自增」变成单一线性化操作。
@@ -85,7 +85,7 @@ const (
 	fuseQPSPerSecond = 4000 // 单秒请求计数超过此值 → 进入 1/8 抽样
 	fuseSampleN      = 8
 	// 抽样期单秒计数低于此值 → 回落全量：×8 估计真值 <8000，与进入阈值
-	// 4000 构成 4000–8000 的滞回带（历史问题：旧注释「真值≈×8 < fuseQPS」
+	// 4000 构成 4000–8000 的滞回带（旧注释「真值≈×8 < fuseQPS」
 	// 与数值不符——1000×8=8000 > 4000）。
 	fuseFallbackPerSecond = 1000
 )
@@ -93,7 +93,7 @@ const (
 // trafficCountryKeyValid 判定国名键是否为可展示的国家值：xdb 对私网/保留
 // 网段行的国家列常为 "0"/"Reserved"，不可解析行为空串。与事件聚合端点
 // （internal/handlers/security_threat_screen.go 的 ""/"0"/"Reserved" 过滤）
-// 同口径——历史问题：大屏只为真实国家画弧/建桶。
+// 同口径——大屏只为真实国家画弧/建桶。
 func trafficCountryKeyValid(country string) bool {
 	switch strings.TrimSpace(country) {
 	case "", "0", "Reserved":
@@ -123,7 +123,7 @@ func trafficEntryFor(country string) *trafficEntry {
 	return e
 }
 
-// normalizeTrafficCountryKey 归一统计/事件桶的国名键（历史问题）：
+// normalizeTrafficCountryKey 归一统计/事件桶的国名键
 // TrimSpace 后海外异体（xdb 中文「美国」等）经 geoipnames.NormalizeCountry
 // 折叠为规范名——与发射侧 geoipLocFor（handler.go）同表同函数；「中国」
 // 保留（NormalizeCountry 对其返回空串，须前置保留）；无效值（空/0/Reserved）
@@ -140,7 +140,7 @@ func normalizeTrafficCountryKey(country string) string {
 // trafficRecord 记一次请求（country 非国家值=未解析/私网保留段——跳过；
 // 抽样期按 1/N 计数并 ×N 还原）。
 func trafficRecord(country string, attack bool) {
-	// 历史问题：国名键 TrimSpace + 异体归一——否则空白异形
+	// 国名键 TrimSpace + 异体归一——否则空白异形
 	// （" 中国"）与中文异体（"美国"）各建脏桶，大屏出现重复国桶且 app 侧
 	// 覆盖式聚合丢计数。发射侧已归一，此处为纵深防御。
 	country = normalizeTrafficCountryKey(country)
@@ -148,7 +148,7 @@ func trafficRecord(country string, attack bool) {
 		return
 	}
 	// 惰性翻秒 + 保险丝状态机（全量→1/8 抽样→全量，滞回防抖动）。
-	// 历史问题：翻秒与自增是单个 CAS（打包秒戳+计数），并发 Add 不会被
+	// 翻秒与自增是单个 CAS（打包秒戳+计数），并发 Add 不会被
 	// 随后清零的上一秒计数吞掉。
 	hits, prevHits, rolled := trafficBumpSecond(uint64(time.Now().Unix()))
 	if rolled && prevHits < fuseFallbackPerSecond {

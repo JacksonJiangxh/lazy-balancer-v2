@@ -20,7 +20,6 @@ type ThreatScreenAttackFlowEvent struct {
 	ClientIP      string `json:"client_ip"`
 	Action        string `json:"action"`
 	RuleTriggered string `json:"rule_triggered"`
-	RuleMsg       string `json:"rule_msg"`
 	// Weight 是写入时的采样因子：1=全量，4/8=1/N 抽样后的权重。
 	// 前端用 sum(weight) 还原近似总量，避免采样档位直接改变线宽语义。
 	Weight uint32 `json:"weight"`
@@ -31,7 +30,6 @@ type threatScreenAttackFlowItem struct {
 	clientIP      string
 	action        string
 	ruleTriggered string
-	ruleMsg       string
 }
 
 var (
@@ -40,7 +38,7 @@ var (
 	threatScreenAttackFlowSeq     atomic.Uint64
 	threatScreenAttackFlowAttempt atomic.Uint64
 	threatScreenAttackFlowSampleN atomic.Uint32
-	// 历史修复：采样档位租约表（与 Caddy 侧 traffic_lease.go 同模型）——
+	// 采样档位租约表（与 Caddy 侧 traffic_lease.go 同模型）——
 	// 取代「全局单值最后写者胜」：多标签页/多租约并存时单租约释放不误杀
 	// 其他租约；有效档位=存活租约的 min（最密），无租约=0（关闭）。
 	threatScreenAttackFlowLeases = map[string]threatScreenAttackFlowLease{}
@@ -194,7 +192,6 @@ func threatScreenAttackFlowRecordBatch(items []threatScreenAttackFlowItem) {
 			ClientIP:      item.clientIP,
 			Action:        item.action,
 			RuleTriggered: item.ruleTriggered,
-			RuleMsg:       item.ruleMsg,
 			Weight:        uint32(n),
 		})
 	}

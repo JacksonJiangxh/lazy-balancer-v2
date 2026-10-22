@@ -1,10 +1,10 @@
 package handlers
 
-//   历史修复① 自动封禁六列：布尔两键入 validateV2BackupBooleanTypes 枚举（非布尔
+//   自动封禁六列：布尔两键入 validateV2BackupBooleanTypes 枚举（非布尔
 //   形态整包 400 点名键）；threshold/window 数值钳制（写侧同边界 [1,10000]/
 //   [1,60]，非整数形态归一缺省）；duration/scope 枚举校验（空串/null 归一
 //   缺省、非空非法拒绝——镜像 security_policies mode 族口径），导入/预览双路径同序。
-//   历史修复 受信代理三 TEXT 列：复用保存侧 validateTrustedProxyFields 同一口径
+//   受信代理三 TEXT 列：复用保存侧 validateTrustedProxyFields 同一口径
 //   （形态门+归一+引用存在性+总量上限），畸形值不得落库致渲染 fail-closed
 //   而面板宣称已启用。
 
@@ -29,9 +29,9 @@ func TestImportConfigBackup_booleanTypeGate_autobanKeys(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			h := newBackupTestHandlers(t)
-			r55SeedCurrentAdmin(t)
-			backup := r55BackupJSONWithConfig(t, map[string][]map[string]any{}, tt.cfg)
-			response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
+			seedCurrentAdminShared(t)
+			backup := configBackupJSON(t, map[string][]map[string]any{}, tt.cfg)
+			response := postImportShared(t, h.ImportConfigBackup, "/config/import", backup)
 			if response.Code != http.StatusBadRequest {
 				t.Fatalf("import status=%d body=%s, want 400", response.Code, response.Body.String())
 			}
@@ -60,9 +60,9 @@ func TestImportConfigBackup_clamps_autoban_threshold(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			h := newBackupTestHandlers(t)
-			r55SeedCurrentAdmin(t)
-			backup := r55BackupJSONWithConfig(t, map[string][]map[string]any{}, map[string]any{"autoban_threshold": tt.value})
-			response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
+			seedCurrentAdminShared(t)
+			backup := configBackupJSON(t, map[string][]map[string]any{}, map[string]any{"autoban_threshold": tt.value})
+			response := postImportShared(t, h.ImportConfigBackup, "/config/import", backup)
 			if response.Code != http.StatusOK {
 				t.Fatalf("import status=%d body=%s, want 200", response.Code, response.Body.String())
 			}
@@ -91,9 +91,9 @@ func TestImportConfigBackup_clamps_autoban_window_minutes(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			h := newBackupTestHandlers(t)
-			r55SeedCurrentAdmin(t)
-			backup := r55BackupJSONWithConfig(t, map[string][]map[string]any{}, map[string]any{"autoban_window_minutes": tt.value})
-			response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
+			seedCurrentAdminShared(t)
+			backup := configBackupJSON(t, map[string][]map[string]any{}, map[string]any{"autoban_window_minutes": tt.value})
+			response := postImportShared(t, h.ImportConfigBackup, "/config/import", backup)
 			if response.Code != http.StatusOK {
 				t.Fatalf("import status=%d body=%s, want 200", response.Code, response.Body.String())
 			}
@@ -125,9 +125,9 @@ func TestImportConfigBackup_autobanEnumGate(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			h := newBackupTestHandlers(t)
-			r55SeedCurrentAdmin(t)
-			backup := r55BackupJSONWithConfig(t, map[string][]map[string]any{}, map[string]any{tt.key: tt.value})
-			response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
+			seedCurrentAdminShared(t)
+			backup := configBackupJSON(t, map[string][]map[string]any{}, map[string]any{tt.key: tt.value})
+			response := postImportShared(t, h.ImportConfigBackup, "/config/import", backup)
 			if response.Code != http.StatusBadRequest {
 				t.Fatalf("import status=%d body=%s, want 400", response.Code, response.Body.String())
 			}
@@ -158,9 +158,9 @@ func TestImportConfigBackup_autobanEnumGate(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			h := newBackupTestHandlers(t)
-			r55SeedCurrentAdmin(t)
-			backup := r55BackupJSONWithConfig(t, map[string][]map[string]any{}, tt.cfg)
-			response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
+			seedCurrentAdminShared(t)
+			backup := configBackupJSON(t, map[string][]map[string]any{}, tt.cfg)
+			response := postImportShared(t, h.ImportConfigBackup, "/config/import", backup)
 			if response.Code != http.StatusOK {
 				t.Fatalf("import status=%d body=%s, want 200", response.Code, response.Body.String())
 			}
@@ -180,74 +180,74 @@ func assertImportedAutobanText(t *testing.T, column, want string) {
 	}
 }
 
-// 历史修复：受信代理三 TEXT 列导入门——畸形形态/畸形 JSON/悬空引用/非法条目/总量
+// 受信代理三 TEXT 列导入门——畸形形态/畸形 JSON/悬空引用/非法条目/总量
 // 超限整包 400；合法载荷按保存侧同口径归一落库。
 func TestImportConfigBackup_trustedProxyTextColumnsGate(t *testing.T) {
 	t.Run("ranges 非字符串类型拒绝", func(t *testing.T) {
 		h := newBackupTestHandlers(t)
-		r55SeedCurrentAdmin(t)
-		backup := r55BackupJSONWithConfig(t, map[string][]map[string]any{}, map[string]any{"trusted_proxy_ranges": 123})
-		response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
+		seedCurrentAdminShared(t)
+		backup := configBackupJSON(t, map[string][]map[string]any{}, map[string]any{"trusted_proxy_ranges": 123})
+		response := postImportShared(t, h.ImportConfigBackup, "/config/import", backup)
 		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "trusted_proxy_ranges") {
 			t.Fatalf("status=%d body=%s, want 400 naming trusted_proxy_ranges", response.Code, response.Body.String())
 		}
 	})
 	t.Run("ranges 畸形 JSON 拒绝", func(t *testing.T) {
 		h := newBackupTestHandlers(t)
-		r55SeedCurrentAdmin(t)
-		backup := r55BackupJSONWithConfig(t, map[string][]map[string]any{}, map[string]any{"trusted_proxy_ranges": "not-json"})
-		response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
+		seedCurrentAdminShared(t)
+		backup := configBackupJSON(t, map[string][]map[string]any{}, map[string]any{"trusted_proxy_ranges": "not-json"})
+		response := postImportShared(t, h.ImportConfigBackup, "/config/import", backup)
 		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "JSON 数组") {
 			t.Fatalf("status=%d body=%s, want 400 JSON 数组", response.Code, response.Body.String())
 		}
 	})
 	t.Run("headers 非法字符拒绝", func(t *testing.T) {
 		h := newBackupTestHandlers(t)
-		r55SeedCurrentAdmin(t)
-		backup := r55BackupJSONWithConfig(t, map[string][]map[string]any{}, map[string]any{"trusted_proxy_headers": `["bad header!"]`})
-		response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
+		seedCurrentAdminShared(t)
+		backup := configBackupJSON(t, map[string][]map[string]any{}, map[string]any{"trusted_proxy_headers": `["bad header!"]`})
+		response := postImportShared(t, h.ImportConfigBackup, "/config/import", backup)
 		if response.Code != http.StatusBadRequest {
 			t.Fatalf("status=%d body=%s, want 400", response.Code, response.Body.String())
 		}
 	})
 	t.Run("refs 悬空引用拒绝", func(t *testing.T) {
 		h := newBackupTestHandlers(t)
-		r55SeedCurrentAdmin(t)
-		backup := r55BackupJSONWithConfig(t, map[string][]map[string]any{}, map[string]any{"trusted_proxy_range_refs": "[424242]"})
-		response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
+		seedCurrentAdminShared(t)
+		backup := configBackupJSON(t, map[string][]map[string]any{}, map[string]any{"trusted_proxy_range_refs": "[424242]"})
+		response := postImportShared(t, h.ImportConfigBackup, "/config/import", backup)
 		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "不存在") {
 			t.Fatalf("status=%d body=%s, want 400 不存在", response.Code, response.Body.String())
 		}
 	})
 	t.Run("内联+引用展开超总量拒绝", func(t *testing.T) {
 		h := newBackupTestHandlers(t)
-		r55SeedCurrentAdmin(t)
+		seedCurrentAdminShared(t)
 		entries := make([]string, 0, 2000)
 		for i := range 2000 {
 			entries = append(entries, fmt.Sprintf(`{"value":"198.51.%d.%d"}`, i/254, i%254+1))
 		}
 		// 替换），refs 存在性仅按备份行解析——被引用的 2000 条名单须随备份行
 		// 到场（自洽备份），总量门判定面=备份行展开。
-		backup := r55BackupJSONWithConfig(t, map[string][]map[string]any{
-			"security_ip_lists": {{"id": 5, "name": "r74c-huge-list", "entries": "[" + strings.Join(entries, ",") + "]"}},
+		backup := configBackupJSON(t, map[string][]map[string]any{
+			"security_ip_lists": {{"id": 5, "name": "huge-list", "entries": "[" + strings.Join(entries, ",") + "]"}},
 		}, map[string]any{
 			"trusted_proxy_ranges":     `["203.0.113.0/24"]`,
 			"trusted_proxy_range_refs": "[5]",
 		})
-		response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
+		response := postImportShared(t, h.ImportConfigBackup, "/config/import", backup)
 		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "2000") {
 			t.Fatalf("status=%d body=%s, want 400 with 2000 上限", response.Code, response.Body.String())
 		}
 	})
 	t.Run("refs 引用仅存在于备份内的名单（跨节点还原形态）导入成功", func(t *testing.T) {
 		h := newBackupTestHandlers(t)
-		r55SeedCurrentAdmin(t)
+		seedCurrentAdminShared(t)
 		// live 库无名单 99——名单随备份 security_ip_lists 表到达（「备份内优先」
 		// 解析；此前若只查库会把合法跨节点还原误拒为「不存在」）
-		backup := r55BackupJSONWithConfig(t, map[string][]map[string]any{
+		backup := configBackupJSON(t, map[string][]map[string]any{
 			"security_ip_lists": {{"id": 99, "name": "cross-node-cdn", "entries": `[{"value":"203.0.113.0/24","remark":""}]`}},
 		}, map[string]any{"trusted_proxy_range_refs": "[99]"})
-		response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
+		response := postImportShared(t, h.ImportConfigBackup, "/config/import", backup)
 		if response.Code != http.StatusOK {
 			t.Fatalf("import status=%d body=%s, want 200（备份内名单须可解析）", response.Code, response.Body.String())
 		}
@@ -261,16 +261,16 @@ func TestImportConfigBackup_trustedProxyTextColumnsGate(t *testing.T) {
 	})
 	t.Run("合法载荷归一落库", func(t *testing.T) {
 		h := newBackupTestHandlers(t)
-		r55SeedCurrentAdmin(t)
-		backup := r55BackupJSONWithConfig(t, map[string][]map[string]any{
-			"security_ip_lists": {{"id": 5, "name": "r74c-ref-list", "entries": `[{"value":"198.51.100.0/24","remark":""}]`}},
+		seedCurrentAdminShared(t)
+		backup := configBackupJSON(t, map[string][]map[string]any{
+			"security_ip_lists": {{"id": 5, "name": "ref-list", "entries": `[{"value":"198.51.100.0/24","remark":""}]`}},
 		}, map[string]any{
 			"trusted_proxy_enabled":    true,
 			"trusted_proxy_ranges":     `["198.51.100.7"]`,
 			"trusted_proxy_range_refs": "[5]",
 			"trusted_proxy_headers":    `["CF-Connecting-IP","X-Forwarded-For","CF-Connecting-IP"]`,
 		})
-		response := r55Post(t, h.ImportConfigBackup, "/config/import", backup)
+		response := postImportShared(t, h.ImportConfigBackup, "/config/import", backup)
 		if response.Code != http.StatusOK {
 			t.Fatalf("import status=%d body=%s, want 200", response.Code, response.Body.String())
 		}
@@ -306,9 +306,9 @@ func TestValidateConfigImport_autobanAndTrustedProxyGatesPreview(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			h := newBackupTestHandlers(t)
-			r55SeedCurrentAdmin(t)
-			backup := r55BackupJSONWithConfig(t, map[string][]map[string]any{}, tt.cfg)
-			response := r55Post(t, h.ValidateConfigImport, "/config/import/validate", backup)
+			seedCurrentAdminShared(t)
+			backup := configBackupJSON(t, map[string][]map[string]any{}, tt.cfg)
+			response := postImportShared(t, h.ValidateConfigImport, "/config/import/validate", backup)
 			if response.Code != http.StatusOK {
 				t.Fatalf("validate status=%d body=%s, want 200 envelope", response.Code, response.Body.String())
 			}

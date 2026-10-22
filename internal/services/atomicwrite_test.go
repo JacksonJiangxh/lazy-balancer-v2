@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// 历史问题 单源原子落盘 helper：写入内容/权限、覆盖既有文件、失败清理。
+// 单源原子落盘 helper：写入内容/权限、覆盖既有文件、失败清理。
 func TestWriteFileAtomicSynced_WritesAndReplaces(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "artifact.json")

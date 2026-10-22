@@ -138,7 +138,7 @@ func TestTrafficLease_renewalPreservesEventsAndSequence(t *testing.T) {
 	}
 }
 
-// 历史问题：租约表无界——管理端 POST 原样接受调用方投递的 lease_id，单条
+// 租约表无界——管理端 POST 原样接受调用方投递的 lease_id，单条
 // 4KiB ID 长期驻留（TTL ≤120s），条目数也无上限。ID 长度必须设上限。
 func TestTrafficLease_rejectsOversizedID(t *testing.T) {
 	resetTrafficState(t)
@@ -178,7 +178,7 @@ func TestTrafficLease_rejectsOversizedID(t *testing.T) {
 	}
 }
 
-// 历史问题：条目数上限——满表时拒绝新键，续租既有键不受影响（不淘汰活跃
+// 条目数上限——满表时拒绝新键，续租既有键不受影响（不淘汰活跃
 // 租约，否则真实标签页会静默失去采集）。
 func TestTrafficLease_entryCapRejectsNewKeys(t *testing.T) {
 	resetTrafficState(t)
@@ -225,7 +225,7 @@ func TestTrafficLease_entryCapRejectsNewKeys(t *testing.T) {
 	}
 }
 
-// 历史问题：DELETE 的畸形 JSON 不得中断 query 回退释放（旧实现忽略解码
+// DELETE 的畸形 JSON 不得中断 query 回退释放（旧实现忽略解码
 // 错误后继续走 query 回退，需钉住该形状不被「改写为严格 400」误伤）。
 func TestTrafficCollectorAdmin_deleteMalformedBody(t *testing.T) {
 	resetTrafficState(t)
@@ -250,7 +250,7 @@ func TestTrafficCollectorAdmin_deleteMalformedBody(t *testing.T) {
 	}
 }
 
-// 历史问题：POST 的畸形/负 sample_n 必须 400 且不建租约（uint32 解码拒绝
+// POST 的畸形/负 sample_n 必须 400 且不建租约（uint32 解码拒绝
 // 负值，不会静默折叠成 0=关闭事件流）。
 func TestTrafficCollectorAdmin_rejectsNegativeSampleN(t *testing.T) {
 	resetTrafficState(t)

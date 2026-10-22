@@ -73,7 +73,7 @@ func TestSetClusterMode_returns_registration_id_when_local_transition_fails(t *t
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
 		db.SetDB(oldDB)
 	})
-	// 历史修复（历史）：本地转换失败的注入不再关闭包级 db.DB——
+	// 本地转换失败的注入不再关闭包级 db.DB——
 	// 假 handler 关包级句柄会污染全局状态（Cleanup 前的审计与断言全踩
 	// closed 连接）。改为给 clusterService 单独注入已关闭句柄，BecomeSlave
 	// 的 DB 失败语义不变且不外溢。
@@ -126,7 +126,7 @@ func TestSetClusterMode_returns_registration_id_when_local_transition_fails(t *t
 	}
 }
 
-// 历史问题(历史):syncService 缺失的 503 必须先于 Promote 生效——此前先
+// syncService 缺失的 503 必须先于 Promote 生效——此前先
 // Promote(角色已提升)再报 503,调用方见到失败但节点已变主,重试撞
 // ErrAlreadyMaster。
 func TestPromoteClusterNode_reportsUnavailableBeforePromoting(t *testing.T) {
@@ -217,7 +217,7 @@ func TestSetClusterMode_rejectsCredentialedMasterURLWithoutAuditingCredentials(t
 }
 
 func TestUpdateClusterSettings_sync_interval_range_validation(t *testing.T) {
-	// 历史问题 发现1：handler 必须把 ErrInvalidSyncInterval 映射为 400（原实现统一 403），
+	// 发现1：handler 必须把 ErrInvalidSyncInterval 映射为 400（原实现统一 403），
 	// 合法区间仍返回 200。
 	h := newBackupTestHandlers(t)
 	router := gin.New()
@@ -252,7 +252,7 @@ func TestUpdateClusterSettings_sync_interval_range_validation(t *testing.T) {
 	}
 }
 
-// 历史问题(历史):恒同步拒绝属客户端错误 → 400(与间隔校验同型),
+// 恒同步拒绝属客户端错误 → 400(与间隔校验同型),
 // 此前普通 error 落 403 与 apidocs 声称相悖。
 func TestUpdateClusterSettings_rejectsDisablingSyncUsersAs400(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -267,7 +267,7 @@ func TestUpdateClusterSettings_rejectsDisablingSyncUsersAs400(t *testing.T) {
 	}
 }
 
-// 历史修复 观察项转正(历史):集群设置审计的 sync_rules 标签必须与设置卡/
+// 观察项转正:集群设置审计的 sync_rules 标签必须与设置卡/
 // 新版 hover 标签统一为「负载均衡规则」(不再用旧称「负载规则」)。
 func TestUpdateClusterSettings_auditUsesUnifiedRulesLabel(t *testing.T) {
 	// Given
@@ -294,7 +294,7 @@ func TestUpdateClusterSettings_auditUsesUnifiedRulesLabel(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：空 body 的幂等空保存曾落「更新/集群设置」零详情审计
+// 空 body 的幂等空保存曾落「更新/集群设置」零详情审计
 // （parts 为空 → Join 空串），无法区分「无修改」与记录缺陷——复用同域既有
 // 「无修改」文案（caproviders/certificates 同口径）。
 func TestUpdateClusterSettings_emptyChangeAuditsNoModification(t *testing.T) {
@@ -317,7 +317,7 @@ func TestUpdateClusterSettings_emptyChangeAuditsNoModification(t *testing.T) {
 	}
 }
 
-// 历史问题（历史问题，历史修复 家族收敛）：历史问题 的导入窗口节点写门覆盖了
+// 导入窗口节点写门覆盖了
 // 注册/审批/改址/清 pin/上报，但漏掉角色切换端点——SetClusterMode 在远端
 // 注册后写 global_config、Promote 写 global_config，导入事务全量替换
 // global_config 时会被覆盖（含远端孤儿注册）。本测试钉住三端点在导入窗口内

@@ -28,7 +28,7 @@ func TestImportFailureAuditDescriptionReflectsFailurePhase(t *testing.T) {
 		{name: "queue recovery after commit is partial", phase: importPhaseQueue, want: "导入部分失败"},
 		{name: "Caddy validation preserves database", phase: importPhaseCaddy, want: "数据库未变更"},
 		{name: "certificate failure identifies preparation", phase: importPhaseCertificate, want: "证书准备失败"},
-		{name: "commit failure identifies database commit", phase: importPhaseCommit, want: "数据库提交失败"},
+		{name: "commit failure does not claim unchanged database", phase: importPhaseCommit, want: "数据库提交结果不确定"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -46,7 +46,7 @@ func TestImportFailureAuditDescriptionReflectsFailurePhase(t *testing.T) {
 	}
 }
 
-// 历史修复 / 历史问题：并发导入必须串行；第二个会话在第一个
+// 并发导入必须串行；第二个会话在第一个
 // close 前不得已执行 Pause，否则第一个 Resume 会让它失去排空保护。
 func TestBeginConfigImport_serializesConcurrentSessions(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -103,7 +103,7 @@ func TestBeginConfigImport_serializesConcurrentSessions(t *testing.T) {
 	second.session.close()
 }
 
-// 历史问题：Resume 必须先于串行会话锁释放；否则后到导入可先 Pause，
+// Resume 必须先于串行会话锁释放；否则后到导入可先 Pause，
 // 再被前一代 Resume 覆盖，在调度恢复状态下执行事务。
 func TestConfigImportSessionClose_resumesBeforeReleasingSerialization(t *testing.T) {
 	h := &Handlers{}
@@ -127,7 +127,7 @@ func TestConfigImportSessionClose_resumesBeforeReleasingSerialization(t *testing
 	}
 }
 
-// 历史问题：ctx-blind 在途任务超过排空预算后不得继续全量导入；
+// ctx-blind 在途任务超过排空预算后不得继续全量导入；
 // 必须恢复调度、释放会话锁并返回可重试 409，而非留下 last-writer-wins 窗口。
 func TestBeginConfigImport_taskDrainTimeoutAbortsBeforeTransaction(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -347,7 +347,7 @@ func TestImportConfigBackup_invalidatesTaskLogCacheAndCancelsInFlightRuns(t *tes
 	}, Config: map[string]any{"task_log_size_mb": 20}, Sections: []string{"users"}, EmptyConfigIfNil: true})
 
 	// When committing an import that writes task_log_size_mb.
-	rec := r78Import(h, t, body)
+	rec := importBackupShared(h, t, body)
 
 	// Then the task log TTL cache is invalidated and in-flight engine runs are canceled.
 	if rec.Code != http.StatusOK {

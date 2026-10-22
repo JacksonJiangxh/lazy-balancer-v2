@@ -18,7 +18,7 @@ import (
 
 // ErrNodeOffline 表示目标节点已审批但当前不可达（从未上报或已超过在线阈值）：
 // 与「节点不存在/未审批」（ErrNodeNotFound → 404）区分开，handler 映射 409
-// 并给出「确认从节点在线后重试」的可行动文案（历史问题，历史）。
+// 并给出「确认从节点在线后重试」的可行动文案。
 var ErrNodeOffline = errors.New("节点尚未上报或已离线")
 
 var (
@@ -29,7 +29,7 @@ var (
 	ErrLoginTicketUserUnavailable = errors.New("登录票据用户不存在或已禁用")
 )
 
-// clusterTicketVerify 是集群一次性票据的验签结果分类（历史问题-04）：登录票据
+// clusterTicketVerify 是集群一次性票据的验签结果分类：登录票据
 // 与服务控制票据共用同一 HMAC/base64 实现，调用方只按分类映射各自哨兵
 // （两者错误文案不同，不能合并成同一 error）。
 type clusterTicketVerify uint8
@@ -77,7 +77,7 @@ func verifyClusterTicket(ticket string, key []byte) ([]byte, clusterTicketVerify
 
 // consumeClusterTicketJTI 在调用方事务内一次性消费票据（清理过期记录 +
 // jti 去重插入）；返回 false 表示重放。事务提交由调用方负责，DB 错误不消耗
-// 票据——登录票据与服务控制票据的唯一消费实现（历史问题-04）。
+// 票据——登录票据与服务控制票据的唯一消费实现。
 func consumeClusterTicketJTI(ctx context.Context, tx *sql.Tx, jti string, now, expiresAt time.Time) (bool, error) {
 	if _, err := tx.ExecContext(ctx, "DELETE FROM used_login_tickets WHERE expires_at<=?", now); err != nil {
 		return false, err
@@ -107,7 +107,7 @@ func (s *ClusterService) GenerateLoginTicket(ctx context.Context, claims models.
 		}
 		return models.ClusterLoginTicketResponse{}, fmt.Errorf("读取登录目标节点: %w", err)
 	}
-	// 历史修复：在线判定改动态口径（与 Nodes()/ComputeNodeStatus 一致）——nodes.status
+	// 在线判定改动态口径（与 Nodes()/ComputeNodeStatus 一致）——nodes.status
 	// 只在注册/上报时写入、从不回写 'offline'，按陈旧 status 列判定会把已停止
 	// 上报的从节点仍当作在线放行签发登录票据。sync_interval 同款读取（含脏值
 	// clamp，由 ComputeNodeStatus 内部归一）。
@@ -118,7 +118,7 @@ func (s *ClusterService) GenerateLoginTicket(ctx context.Context, claims models.
 	if !approved || keyHash == "" {
 		return models.ClusterLoginTicketResponse{}, ErrNodeNotFound
 	}
-	// 历史问题（历史修复）：已批准但从未上报/已离线与「节点不存在
+	// 已批准但从未上报/已离线与「节点不存在
 	// 或未审批」是两类问题——前者 handler 映射 409 + 「确认从节点在线后重试」，
 	// 后者维持 404。keyHash 为空（从未取得集群令牌）仍按不存在处理。
 	if ComputeNodeStatus(approved, lastSeen.Time, syncInterval, now) != "online" {
@@ -144,8 +144,8 @@ func (s *ClusterService) GenerateLoginTicket(ctx context.Context, claims models.
 	return models.ClusterLoginTicketResponse{Ticket: ticket, URL: accessURL, NodeName: nodeName}, nil
 }
 
-// 历史问题（历史裁定·设计声明）：票据登录刻意不检查从节点本地
-// login_locked_until——该列是从节点自身密码登录端点的暴破防护记账（历史修复，
+// 票据登录刻意不检查从节点本地
+// login_locked_until——该列是从节点自身密码登录端点的暴破防护记账
 // 本地写入、不随快照同步），而本路径不含任何口令猜测面：票据由主节点在
 // 完整认证（本地用户强制 MFA 步进验证/OIDC 会话经 IdP 二因子）后签发，
 // 票据本身即主端 MFA 事实；一次性消费（jti 入 used_login_tickets）+90s
@@ -182,7 +182,7 @@ func (s *ClusterService) ValidateLoginTicket(ctx context.Context, ticket string,
 	if err := json.Unmarshal(payload, &claims); err != nil || claims.UserID <= 0 || claims.Username == "" || claims.JTI == "" || claims.NodeID != registrationID {
 		return claims, models.User{}, 0, ErrInvalidLoginTicket
 	}
-	// 历史问题-08：以下全部失败分支的 claims 均已通过 HMAC 验签（主体身份可信），
+	// 以下全部失败分支的 claims 均已通过 HMAC 验签（主体身份可信），
 	// 必须随错误返回——此前一律返回零值，票据登录失败审计的 actor 恒为空，
 	// 「谁的票据被重放/过期」这两类最需取证的票据事件无法归因。未验签分支
 	// （上方签名/载荷解析失败）保持零值，不得凭空归因。

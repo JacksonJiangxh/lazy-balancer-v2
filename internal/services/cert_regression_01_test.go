@@ -13,7 +13,7 @@ import (
 	"lazy-balancer-v2/internal/models"
 )
 
-// 历史修复：提升/启动时为主从快照未携带任务行的启用 ACME 规则补建 queued 行，
+// 提升/启动时为主从快照未携带任务行的启用 ACME 规则补建 queued 行，
 // 否则续期/首发重试/补扫/对账全部 JOIN cert_jobs，自动签发链静默中断。
 func TestBackfillMissingACMECertJobs_CreatesRowsForEnabledACMERules(t *testing.T) {
 	_, database := newClusterTestService(t)
@@ -72,7 +72,7 @@ func TestBackfillMissingACMECertJobs_CreatesRowsForEnabledACMERules(t *testing.T
 	}
 }
 
-// 历史修复：执行超时发生在材料已落库后必须保持可部署态（否则 failJob 把新证书
+// 执行超时发生在材料已落库后必须保持可部署态（否则 failJob 把新证书
 // 打成终态，续期/首发重试/补扫/对账全部不可达）。
 func TestHandleExecutionTimeout_KeepsDownloadedMaterialDeployable(t *testing.T) {
 	_, database := newClusterTestService(t)
@@ -115,7 +115,7 @@ func TestHandleExecutionTimeout_KeepsDownloadedMaterialDeployable(t *testing.T) 
 	}
 }
 
-// 历史修复：waitDoneOrTimeout 超时后必须放弃本轮部署重试调度，不得以
+// waitDoneOrTimeout 超时后必须放弃本轮部署重试调度，不得以
 // cancelWaitTimeout 周期无限循环。
 func TestScheduleDeploymentRetry_AbandonsRoundWhenCallbackStuck(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -180,7 +180,7 @@ func TestCancelJobsForRule_UsesSingleSharedDeadline(t *testing.T) {
 	}
 }
 
-// 历史修复：水位线槽以触发时刻计算，跨槽边界完成不得写成未执行的新槽。
+// 水位线槽以触发时刻计算，跨槽边界完成不得写成未执行的新槽。
 func TestAutoBackupWatermarkSlot_UsesTriggerTime(t *testing.T) {
 	setupAutoBackupTestDB(t)
 	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_enabled=1, auto_backup_frequency='daily',
@@ -255,7 +255,7 @@ func TestReconcileBrandingFile_RestoresMissingAndCorruptFile(t *testing.T) {
 	}
 }
 
-// 历史修复：禁用被启用中 ACME 规则引用的 CA 提供商必须拒绝（409 语义）。
+// 禁用被启用中 ACME 规则引用的 CA 提供商必须拒绝（409 语义）。
 func TestUpdateCAProvider_RejectsDisableWhenReferenced(t *testing.T) {
 	_, database := newClusterTestService(t)
 	if _, err := database.Exec(`INSERT INTO ca_providers (id,name,provider,directory_url,credentials,max_concurrent,min_interval_ms,enabled)
@@ -292,7 +292,7 @@ func TestUpdateCAProvider_RejectsDisableWhenReferenced(t *testing.T) {
 	}
 }
 
-// 历史修复：证书文件路径字母表单源导出。
+// 证书文件路径字母表单源导出。
 func TestValidCertRuleID(t *testing.T) {
 	cases := map[string]bool{
 		"lb_abc-123":            true,

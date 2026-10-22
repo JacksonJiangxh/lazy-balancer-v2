@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-// 历史修复:同一证书同日同档位重复扫描只告警一次(10min 扫描周期不再刷屏)。
+// 同一证书同日同档位重复扫描只告警一次(10min 扫描周期不再刷屏)。
 func TestManualCertExpiryAlertGate_sameDaySameLevelSuppressed(t *testing.T) {
 	// Given
 	gate := newManualCertExpiryAlertGate()
@@ -20,7 +20,7 @@ func TestManualCertExpiryAlertGate_sameDaySameLevelSuppressed(t *testing.T) {
 	}
 }
 
-// 历史修复:状态加深(临期→已过期)当日可再告——新档位是新事件。
+// 状态加深(临期→已过期)当日可再告——新档位是新事件。
 func TestManualCertExpiryAlertGate_levelDeepeningRealertsSameDay(t *testing.T) {
 	// Given
 	gate := newManualCertExpiryAlertGate()
@@ -39,7 +39,7 @@ func TestManualCertExpiryAlertGate_levelDeepeningRealertsSameDay(t *testing.T) {
 	}
 }
 
-// 历史修复:跨日重新告警(每日最多每档一次)。
+// 跨日重新告警(每日最多每档一次)。
 func TestManualCertExpiryAlertGate_nextDayRealerts(t *testing.T) {
 	// Given
 	gate := newManualCertExpiryAlertGate()
@@ -54,7 +54,7 @@ func TestManualCertExpiryAlertGate_nextDayRealerts(t *testing.T) {
 	}
 }
 
-// 历史修复：跨日时淘汰前一天的全部证书键，已删除规则的历史 ID 不得
+// 跨日时淘汰前一天的全部证书键，已删除规则的历史 ID 不得
 // 随进程生命周期持续累积；同日去重与跨日重告语义保持不变。
 func TestManualCertExpiryAlertGate_prunesPreviousDayIDs(t *testing.T) {
 	gate := newManualCertExpiryAlertGate()
@@ -81,7 +81,7 @@ func TestManualCertExpiryAlertGate_prunesPreviousDayIDs(t *testing.T) {
 	}
 }
 
-// 历史修复:按证书 ID 独立记忆,互不影响。
+// 按证书 ID 独立记忆,互不影响。
 func TestManualCertExpiryAlertGate_perCertIndependent(t *testing.T) {
 	// Given
 	gate := newManualCertExpiryAlertGate()
@@ -99,7 +99,7 @@ func TestManualCertExpiryAlertGate_perCertIndependent(t *testing.T) {
 	}
 }
 
-// 历史修复:nil 门禁(测试直构 CertificateService 未初始化字段)防御性放行,
+// nil 门禁(测试直构 CertificateService 未初始化字段)防御性放行,
 // 保持告警不丢失。
 func TestManualCertExpiryAlertGate_nilGateAllows(t *testing.T) {
 	// Given

@@ -1,6 +1,8 @@
 package services
 
 import (
+	"bytes"
+	"encoding/json"
 	"testing"
 	"time"
 )
@@ -65,7 +67,7 @@ func TestThreatScreenAttackFlow_samplingAndCursor(t *testing.T) {
 	}
 }
 
-// 历史修复：攻击光流采样档位租约化——有效档位=存活租约的 min（最密），
+// 攻击光流采样档位租约化——有效档位=存活租约的 min（最密），
 // 单租约释放不误杀其他租约（旧码全局单值最后写者胜/DELETE 全局置 0）；
 // 无租约=0（关闭），过期懒清理自动归 0。与 Caddy 侧 traffic_lease.go 同模型。
 func TestThreatScreenAttackFlow_leaseTableMinAndExpiry(t *testing.T) {
@@ -148,6 +150,29 @@ func TestThreatScreenAttackFlow_leaseRenewAndClamps(t *testing.T) {
 	// 空 lease_id 拒绝
 	if err := acquireThreatScreenAttackFlowLeaseAt("", 30*time.Second, 1, now); err == nil {
 		t.Fatalf("empty lease_id must be rejected")
+	}
+}
+
+func TestThreatScreenAttackFlowSnapshot_omitsRuleMessage(t *testing.T) {
+	ResetThreatScreenAttackFlowForTest()
+	t.Cleanup(ResetThreatScreenAttackFlowForTest)
+	mustAcquireAttackFlowLease(t, "tab-output", 1)
+	threatScreenAttackFlowRecordBatch([]threatScreenAttackFlowItem{{
+		at:            time.Unix(1792300000, 0),
+		clientIP:      "203.0.113.1",
+		action:        "blocked",
+		ruleTriggered: "942100",
+	}})
+	events, _ := ThreatScreenAttackFlowSnapshot(0, 1)
+	if len(events) != 1 {
+		t.Fatalf("events=%d, want 1", len(events))
+	}
+	encoded, err := json.Marshal(events[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(encoded, []byte(`"rule_msg"`)) {
+		t.Fatalf("attack flow output must not contain rule_msg: %s", encoded)
 	}
 }
 

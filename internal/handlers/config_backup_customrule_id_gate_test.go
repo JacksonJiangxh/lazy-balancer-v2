@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// 历史问题-1：导入/还原经 restoreTable 按 dump 行**显式写入 id**，而自定义
+// 导入/还原经 restoreTable 按 dump 行**显式写入 id**，而自定义
 // 规则发射 id = DB id + 10000——DB id ≥ 790000 时发射 id 撞入 GeoIP 预检段
 // （800000-899999），渲染侧 `security.go:670` 跳过发射并仅告警 → 规则在 UI 显示
 // 启用却不生效，违反「只有可渲染配置可落库」不变量。导入侧此前对 id 无任何区间门

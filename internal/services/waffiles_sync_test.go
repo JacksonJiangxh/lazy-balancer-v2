@@ -243,7 +243,7 @@ func assertNoStagingRemains(t *testing.T, destDir string) {
 }
 
 func TestUntarGzTo_rejectsOversizedBundleAndCleansStaging(t *testing.T) {
-	// 历史问题：解包必须在写放大发生前拦截——文件数与字节数双限，且失败不得
+	// 解包必须在写放大发生前拦截——文件数与字节数双限，且失败不得
 	// 遗留 staging 目录到下一周期。
 	t.Run("file count over limit", func(t *testing.T) {
 		entries := make([]tarEntry, 0, maxWafSyncExtractFiles+1)
@@ -274,7 +274,7 @@ func TestUntarGzTo_rejectsOversizedBundleAndCleansStaging(t *testing.T) {
 }
 
 func TestUntarGzTo_rejectsIllegalPathAndCleansStaging(t *testing.T) {
-	// 历史问题：非法路径拒绝时同样不得遗留 staging 目录。
+	// 非法路径拒绝时同样不得遗留 staging 目录。
 	destDir := t.TempDir()
 	data := rawTarGz(t, []tarEntry{{name: "../evil.conf", body: []byte("SecRule X EVIL")}})
 	err := untarGzTo(data, destDir, "")
@@ -285,7 +285,7 @@ func TestUntarGzTo_rejectsIllegalPathAndCleansStaging(t *testing.T) {
 }
 
 func TestApplyWafFileBundle_rejectsCRSWithoutDeclaredHash(t *testing.T) {
-	// 历史问题 发现2：声明哈希为空但携带 CRS 内容——非法主节点构造（合法
+	// 发现2：声明哈希为空但携带 CRS 内容——非法主节点构造（合法
 	// BuildWafFileBundle 恒成对设置），untarGzTo 在 expectSum=="" 时跳过
 	// 整树哈希校验，未验证字节会直接安装进 live CRS 树。必须与 xdb 分支
 	// 对称拒绝，不得落盘。
@@ -303,7 +303,7 @@ func TestApplyWafFileBundle_rejectsCRSWithoutDeclaredHash(t *testing.T) {
 }
 
 func TestBuildWafFileRef_sanitizesMalformedIP2RegionTag(t *testing.T) {
-	// 历史修复：主端 BuildWafFileRef 把 .version 原文写进 ref.IP2RegionTag（参与
+	// 主端 BuildWafFileRef 把.version 原文写进 ref.IP2RegionTag（参与
 	// waf_files 节哈希），而从端落盘前经 sanitizeBundleVersion 置空——同一畸形
 	// 版本串两端推导结果不同，节哈希永不对齐，从端永久节流重拉。主端必须用同一
 	// 规则推导 tag。
@@ -357,7 +357,7 @@ func TestBuildWafFileRef_keepsWellFormedIP2RegionTag(t *testing.T) {
 }
 
 func TestApplyWafFileBundle_rejectsXdbWithoutDeclaredHash(t *testing.T) {
-	// 历史问题：声明哈希为空但携带 xdb 内容——非法主节点构造（合法
+	// 声明哈希为空但携带 xdb 内容——非法主节点构造（合法
 	// BuildWafFileBundle 恒成对设置），必须拒绝整包而非裸写原始字节。
 	dst := t.TempDir()
 	oldLive, oldXdb := crsLiveDir, ip2regionLivePath
@@ -373,7 +373,7 @@ func TestApplyWafFileBundle_rejectsXdbWithoutDeclaredHash(t *testing.T) {
 }
 
 func TestApplyWafFileBundle_preservesVersionFileRawBytes(t *testing.T) {
-	// 历史问题：上游 CRS 发布包的 VERSION 自带尾换行（如 "v4.29.0\n"），主端
+	// 上游 CRS 发布包的 VERSION 自带尾换行（如 "v4.29.0\n"），主端
 	// CRSSha256 基于含原始字节的 tar 计算。Apply 不得以 TrimSpace 后的
 	// bundle.CRSVersion 覆写 VERSION——否则本地 tar 哈希与已应用节哈希永久
 	// 分叉，wafFilesDrifted 每轮误判漂移、全量重拉永不收敛（从端持续
@@ -411,7 +411,7 @@ func TestApplyWafFileBundle_preservesVersionFileRawBytes(t *testing.T) {
 }
 
 func TestUntarGzTo_midCopyFailure_restoresPureOldTree(t *testing.T) {
-	// 历史问题：staging→destDir 复制中途失败时，恢复必须产出纯旧树。旧实现只
+	// staging→destDir 复制中途失败时，恢复必须产出纯旧树。旧实现只
 	// 用 backup 覆盖同名文件，已复制成功的新树文件残留为混合树。staging 预置
 	// 的只读子目录（含文件使函数起始的 RemoveAll(staging) 静默失败而存活）
 	// 让 copyDir 在复制完 a-new.conf 后失败。
@@ -510,7 +510,7 @@ func TestUntarGzTo_firstInstall_midCopyFailure_leavesNoPartialTree(t *testing.T)
 }
 
 func TestUntarGzTo_removeAllFailure_attemptsBackupRestore(t *testing.T) {
-	// 历史问题：rename 失败后 os.RemoveAll(destDir) 失败时 backup 已就绪，
+	// rename 失败后 os.RemoveAll(destDir) 失败时 backup 已就绪，
 	// 必须与 copyDir 失败分支对称地尝试从 backup 恢复（先清空再复制），恢复
 	// 错误 errors.Join 并入返回；而非直接 return 留下部分删除的旧树。
 	// Given：非空旧树（locked/ 0555 使 RemoveAll 失败但 backup 复制可读）+ 合法同步包
@@ -571,7 +571,7 @@ func TestUntarGzTo_removeAllFailure_attemptsBackupRestore(t *testing.T) {
 }
 
 func TestUntarGzTo_restoreFailure_joinedIntoReturnedError(t *testing.T) {
-	// 历史问题：恢复（清空+从 backup 复制）自身的错误不得被 `_ =` 吞掉，必须
+	// 恢复（清空+从 backup 复制）自身的错误不得被 `_ =` 吞掉，必须
 	// 并入返回错误。destDir 写入 32MB 新文件的窗口内注入只读子目录，使恢复路径
 	// 的 RemoveAll(destDir) 失败。
 	// Given：非空旧树 + 含大文件的同步包 + staging 内预置只读子目录
@@ -602,7 +602,7 @@ func TestUntarGzTo_restoreFailure_joinedIntoReturnedError(t *testing.T) {
 		_ = os.RemoveAll(staging)
 		_ = os.RemoveAll(destDir)
 	})
-	// 历史问题：copyFile 改用单源原子落盘，临时文件为同目录唯一名
+	// copyFile 改用单源原子落盘，临时文件为同目录唯一名
 	// （.<base>-<rand>.tmp）——按 glob 观测写入窗口，不再依赖固定
 	// 的 a-new.conf.tmp。
 	tmpPattern := filepath.Join(destDir, ".a-new.conf-*.tmp")
@@ -626,7 +626,7 @@ func TestUntarGzTo_restoreFailure_joinedIntoReturnedError(t *testing.T) {
 				_ = os.Chmod(blocker, 0000)
 				return
 			}
-			// 历史问题：轮询退避——无 sleep 的忙转会在整段 32MB 解包期间
+			// 轮询退避——无 sleep 的忙转会在整段 32MB 解包期间
 			// 空转一个核（CI 资源浪费）；写入窗口由 glob 观测，1ms 粒度足够。
 			time.Sleep(time.Millisecond)
 		}
@@ -652,7 +652,7 @@ func TestUntarGzTo_restoreFailure_joinedIntoReturnedError(t *testing.T) {
 }
 
 func TestUntarGzTo_nonEmptyDest_removesStaleFiles(t *testing.T) {
-	// 历史问题：rename 到非空目录恒失败，兜底分支即主路径；合并复制不删除旧树中
+	// rename 到非空目录恒失败，兜底分支即主路径；合并复制不删除旧树中
 	// 新包缺失的文件，CRS 更新删除/改名规则文件后从端树为旧+新合并、永不收敛。
 	// 兜底分支必须先清空 destDir 再复制。
 	// Given：非空目标树，含新包中不存在的陈旧文件与子目录
@@ -700,9 +700,9 @@ func TestUntarGzTo_nonEmptyDest_removesStaleFiles(t *testing.T) {
 	}
 }
 
-// 历史问题 单元：主节点 bundle tag 为空是合法收敛信号（主端 .version 缺失、损坏
+// 单元：主节点 bundle tag 为空是合法收敛信号（主端.version 缺失、损坏
 // 或形状校验置空），本地陈旧 tag 必须同步清空——否则 waf_files 节哈希（含
-// 标签）两端永不对齐，从端永久假漂移全量重拉（历史问题 不变量的空值半边）。
+// 标签）两端永不对齐，从端永久假漂移全量重拉。
 func TestRewriteVersionIfMissingOrStale_emptyTagClearsStaleSidecar(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "ip2region.xdb.version")
@@ -721,7 +721,7 @@ func TestRewriteVersionIfMissingOrStale_emptyTagClearsStaleSidecar(t *testing.T)
 	}
 }
 
-// 历史问题 端到端：主端 .version 缺失（tag 空）+ 从端内容一致但残留陈旧标签。
+// 端到端：主端.version 缺失（tag 空）+ 从端内容一致但残留陈旧标签。
 // 应用空 tag bundle 后从端标签必须清空，两端本地 ref 的 waf_files 节哈希
 // （漂移判定口径）必须一致——否则永久假漂移。
 func TestApplyWafFileBundle_emptyMasterTagConvergesSectionHash(t *testing.T) {
@@ -784,7 +784,7 @@ func (zeroReader) Read(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// 历史问题 回归：响应体超过 64MB 上限时必须显式拒绝并点名上限（疑似主节点
+// 回归：响应体超过 64MB 上限时必须显式拒绝并点名上限（疑似主节点
 // 数据异常），不得静默截断成损坏 JSON、以误导性的解析错误或哈希不匹配收场。
 func TestFetchWafFiles_rejectsOversizeBundleBody(t *testing.T) {
 	const bodyLimit = 64 << 20 // 与 fetchWafFiles 的响应体上限同口径
@@ -862,7 +862,7 @@ func TestWafFileBundleThreatFastRoundTrip(t *testing.T) {
 	}
 }
 
-// 历史问题-1（历史）：威胁库 .fast 分支防御奇偶——污染 bundle（声明
+// 威胁库.fast 分支防御奇偶——污染 bundle（声明
 // 哈希与内容不符）必须整包拒绝落盘，与 xdb 分支同形；否则 bundle 在主端
 // 构造或传输途中被污染的字节会直接安装进从节点威胁库（零编译直接消费）。
 func TestApplyWafFileBundle_rejectsTamperedThreatFast(t *testing.T) {
@@ -894,7 +894,7 @@ func TestApplyWafFileBundle_rejectsTamperedThreatFast(t *testing.T) {
 	}
 }
 
-// 历史问题-1：空声明哈希携内容——合法主节点 BuildWafFileBundle 恒成对设置，
+// 空声明哈希携内容——合法主节点 BuildWafFileBundle 恒成对设置，
 // 仅恶意/损坏主节点可构造；与 CRS/xdb 侧同纵深防御，拒绝而非裸写未验证
 // 字节（原实现会在本地文件缺失时以整读哈希空串哨兵==tf.Sha256 静默跳过或
 // 直接落盘）。
@@ -914,7 +914,7 @@ func TestApplyWafFileBundle_rejectsThreatFastWithoutDeclaredHash(t *testing.T) {
 	}
 }
 
-// 历史问题-1：wafFilesRefMatchesBundle 交叉核验必须覆盖威胁面——bundle 携带
+// wafFilesRefMatchesBundle 交叉核验必须覆盖威胁面——bundle 携带
 // 的逐源 .fast 哈希与 ref.ThreatSha256s 不符或缺失都必须判不匹配，否则
 // 威胁面与 ref 漂移的 bundle 会被静默放行装进从节点。
 func TestWafFilesRefMatchesBundle_verifiesThreatSha256s(t *testing.T) {
@@ -950,7 +950,7 @@ func TestWafFilesRefMatchesBundle_verifiesThreatSha256s(t *testing.T) {
 	})
 }
 
-// 历史问题（历史）：集群同步路径的 WAF ref 构建不得静默省略分量——
+// 集群同步路径的 WAF ref 构建不得静默省略分量——
 // 组件存在但读取/哈希失败时，旧实现少一项分量，从端不拉取、主端无告警，
 // 主从静默分叉（从端继续用旧 WAF 规则/旧库）。修复后读失败显式化：
 // 整个 ref 视为不可用（nil）+ 错误日志，从端漂移检测把 nil 当分叉处理
@@ -985,7 +985,7 @@ func TestBuildWafFileRef_readFailureIsExplicit(t *testing.T) {
 	}
 }
 
-// 历史问题：xdb sidecar 只在内容哈希校验通过后才改写（拒绝路径不得留下
+// xdb sidecar 只在内容哈希校验通过后才改写（拒绝路径不得留下
 // 「新标签 + 旧库」跨代偏斜）。
 func TestApplyWafFileBundle_xdbHashMismatchLeavesVersionSidecarUntouched(t *testing.T) {
 	dir := t.TempDir()
@@ -1019,7 +1019,7 @@ func TestApplyWafFileBundle_xdbHashMismatchLeavesVersionSidecarUntouched(t *test
 	}
 }
 
-// 历史问题：空内容 + 非空声明哈希的威胁条目拒绝整包（否则从端永不落盘、
+// 空内容 + 非空声明哈希的威胁条目拒绝整包（否则从端永不落盘、
 // ref 哈希永不等，每轮误判漂移全量重拉永不收敛）。
 func TestApplyWafFileBundle_emptyThreatContentWithDeclaredHashRejected(t *testing.T) {
 	dir := t.TempDir()
@@ -1047,7 +1047,7 @@ func TestApplyWafFileBundle_emptyThreatContentWithDeclaredHashRejected(t *testin
 	}
 }
 
-// 历史问题：不完整 bundle 的响应体不得进入合并缓存（异常形态不得在 2s
+// 不完整 bundle 的响应体不得进入合并缓存（异常形态不得在 2s
 // 窗口内放大传播）；完整 bundle 仍必须缓存。
 func TestBuildWafFileBundleResponse_incompleteBundleNotCached(t *testing.T) {
 	dir := t.TempDir()

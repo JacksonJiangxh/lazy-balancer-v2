@@ -2,7 +2,7 @@ package db
 
 import "testing"
 
-// 历史修复：system=1 名单必须有 name 唯一性兜底；同名 system=0 用户列表
+// system=1 名单必须有 name 唯一性兜底；同名 system=0 用户列表
 // 仍允许存在（部分索引只覆盖 system=1）。
 func TestMigrateSystemIPListUniqueIndex_dedupesAndEnforces(t *testing.T) {
 	database := openMigrationTestDB(t)
@@ -50,7 +50,7 @@ func TestMigrateSystemIPListUniqueIndex_dedupesAndEnforces(t *testing.T) {
 	}
 }
 
-// 历史修复：EnsureSystemIPList 在唯一索引下重复调用仍幂等（OR IGNORE 路径）。
+// EnsureSystemIPList 在唯一索引下重复调用仍幂等（OR IGNORE 路径）。
 func TestEnsureSystemIPList_idempotentWithUniqueIndex(t *testing.T) {
 	database := openMigrationTestDB(t)
 	if err := createTables(); err != nil {
@@ -73,5 +73,57 @@ func TestEnsureSystemIPList_idempotentWithUniqueIndex(t *testing.T) {
 	}
 	if rows != 1 {
 		t.Fatalf("rows=%d, want 1", rows)
+	}
+}
+
+// 启动期索引探测门：唯一部分索引已在位时，重启必须跳过重复查重/重建
+// （security_ip_lists 的 GROUP BY 查重是纯启动成本）。存量库索引缺失仍重建。
+func TestMigrateSystemIPListUniqueIndex_skipsRebuildWhenIndexInPlace(t *testing.T) {
+	database := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+
+	dedupesBefore, skipsBefore := systemIPListUniqueIndexDedupes.Load(), systemIPListUniqueIndexSkips.Load()
+
+	// Given 首次启动：索引缺失 → 查重 + 建索引。
+	if err := migrateSystemIPListUniqueIndex(); err != nil {
+		t.Fatalf("first migrate: %v", err)
+	}
+	if got := systemIPListUniqueIndexDedupes.Load() - dedupesBefore; got != 1 {
+		t.Fatalf("首次启动查重次数=%d, want 1", got)
+	}
+	if got := systemIPListUniqueIndexSkips.Load() - skipsBefore; got != 0 {
+		t.Fatalf("首次启动跳过次数=%d, want 0", got)
+	}
+
+	// When 二次启动（索引已在位）。
+	if err := migrateSystemIPListUniqueIndex(); err != nil {
+		t.Fatalf("second migrate: %v", err)
+	}
+	// Then 零查重、零重建。
+	if got := systemIPListUniqueIndexDedupes.Load() - dedupesBefore; got != 1 {
+		t.Fatalf("二次启动累计查重=%d, want 1（重启不得重复查重）", got)
+	}
+	if got := systemIPListUniqueIndexSkips.Load() - skipsBefore; got != 1 {
+		t.Fatalf("二次启动跳过次数=%d, want 1", got)
+	}
+
+	// And 索引被删（存量库形态）仍重新查重并补建——探测门不吞真实迁移。
+	if _, err := database.Exec(`DROP INDEX u_security_ip_lists_system_name`); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateSystemIPListUniqueIndex(); err != nil {
+		t.Fatalf("reinit after index drop: %v", err)
+	}
+	if got := systemIPListUniqueIndexDedupes.Load() - dedupesBefore; got != 2 {
+		t.Fatalf("索引缺失后累计查重=%d, want 2", got)
+	}
+	var indexCount int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='u_security_ip_lists_system_name'`).Scan(&indexCount); err != nil {
+		t.Fatal(err)
+	}
+	if indexCount != 1 {
+		t.Fatalf("索引重建后条数=%d, want 1", indexCount)
 	}
 }

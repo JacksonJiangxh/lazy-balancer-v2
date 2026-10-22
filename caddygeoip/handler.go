@@ -34,7 +34,7 @@ type GeoIPHandler struct {
 	XdbPath string `json:"xdb_path,omitempty"`
 
 	// CrawlerExempt 由渲染侧按绑定策略输出（任一策略 GeoIPCrawlerExempt）。
-	// 历史问题：false 时只剥离客户端伪造的验证头、不做 PTR/DNS 验证（无豁免
+	// false 时只剥离客户端伪造的验证头、不做 PTR/DNS 验证（无豁免
 	// 规则消费结论，验证纯属浪费；旧实现无法关闭验证）。未配置按 false。
 	CrawlerExempt bool `json:"crawler_exempt,omitempty"`
 
@@ -76,7 +76,7 @@ func (h *GeoIPHandler) Provision(ctx caddy.Context) error {
 	return nil
 }
 
-// geoipSharedSearcher（历史修复）：按 XdbPath 进程级共享的 Ip2Region 单例条目。
+// geoipSharedSearcher：按 XdbPath 进程级共享的 Ip2Region 单例条目。
 // 每条 GeoIP 规则各建一份 NewIp2RegionWithPath（内部 NewV4Config(VIndexCache,
 // path, 20)——20 个 searcher 各持 1 个 xdb fd + vIndex 缓冲），50 条规则≈1000 fd
 // 逼近 soft limit，重载期新旧实例并存再翻倍；fd 耗尽 → Provision 降级
@@ -98,7 +98,7 @@ var (
 
 // geoipOldInstanceCloseDelay 换库重建后旧实例的延迟关闭窗口：重载窗口内旧
 // 配置的 handler 仍可能持旧实例在途查询（BorrowSearcher 落空会判「海外」
-// 误拦——恰是 历史修复 要修的问题），故不立即关闭；但旧实例也不再「保留至进程
+// 误拦——恰是要修的问题），故不立即关闭；但旧实例也不再「保留至进程
 // 退出」（每次 xdb 更新遗留 20 个 fd + vIndex 缓冲），延迟窗口过后 Close
 // 收敛。测试可缩短。
 var geoipOldInstanceCloseDelay = 60 * time.Second
@@ -111,7 +111,7 @@ var geoipOldInstanceCloseDelay = 60 * time.Second
 func sharedGeoIPSearcher(path string) (*service.Ip2Region, error) {
 	st, err := os.Stat(path)
 	if err != nil {
-		// 历史修复（历史）：stat 失败（xdb 更新 rename 窗口/文件被删）且
+		// stat 失败（xdb 更新 rename 窗口/文件被删）且
 		// 缓存持有该路径条目时驱逐之——旧实例走既有 AfterFunc 延迟关闭
 		// （在途查询保护与换库路径一致）。不驱逐则旧 inode 实例永久占据
 		// 缓存槽：文件以「同 modtime+size」形态恢复（rsync -a 保时间戳重铺）
@@ -133,7 +133,7 @@ func sharedGeoIPSearcher(path string) (*service.Ip2Region, error) {
 	}
 	searcher, err := service.NewIp2RegionWithPath(path, "")
 	if err != nil {
-		// 历史问题：重建失败（带外损坏的 xdb 等）不回退缓存旧实例，则
+		// 重建失败（带外损坏的 xdb 等）不回退缓存旧实例，则
 		// Provision 收到 error → handler 降级 pass-through → 全部客户端判
 		// 「海外」→ deny 海外策略全量误拦（与 wafiplist 的 fail-stale 不对称）。
 		// 正常更新走 rename（文件形态变化即命中成功重建），失败分支只可能是
@@ -199,17 +199,17 @@ const (
 // applyCrawlerVerification UA 命中引擎 → PTR 双跳验证：通过置 Verified=引擎 ID
 // （下游豁免规则 @streq 消费）；未通过置 Spoof=引擎 ID（伪装事件规则消费——
 // 渲染侧按策略已选引擎集合 @rx^(?:engine|…)$ 匹配，见 buildIPPrecheckDirectives。
-// 历史问题：旧注释写 Spoof=1 与实际发射的引擎 ID 矛盾，按旧注释把规则改回
+// 旧注释写 Spoof=1 与实际发射的引擎 ID 矛盾，按旧注释把规则改回
 // @eq 1 会让伪装事件族静默永不命中）。
 // 非爬虫 UA 不做 DNS/PTR，但 MatchCrawlerEngine 仍需顺序扫描引擎正则表；
 // 未命中时承担全表预编译正则成本，命中时每个 UA 只匹配一次。
 func (h *GeoIPHandler) applyCrawlerVerification(r *http.Request) {
-	// 历史问题：渲染门控字段 false（无爬虫豁免策略）时零 DNS/PTR 开销；
+	// 渲染门控字段 false（无爬虫豁免策略）时零 DNS/PTR 开销；
 	// 客户端伪造头已在 ServeHTTP 入口剥离，因此「只剥不验」是安全形态。
 	if !h.CrawlerExempt {
 		return
 	}
-	// 历史问题（并入 历史问题）：UA 只匹配一次（旧实现对同一 UA 调两次
+	// （并入）：UA 只匹配一次（旧实现对同一 UA 调两次
 	// MatchCrawlerEngine，2000/s 正常流量下多付一次全表正则）。
 	engine := geoipnames.MatchCrawlerEngine(r.Header.Get("User-Agent"))
 	if engine == "" {
@@ -219,13 +219,13 @@ func (h *GeoIPHandler) applyCrawlerVerification(r *http.Request) {
 	if ip != "" && VerifyCrawler(ip, engine) {
 		r.Header.Set(crawlerVerifiedHeader, engine)
 	} else {
-		// 历史问题：值携带引擎 ID（与 Verified 对称）——coraza 伪装规则按
+		// 值携带引擎 ID（与 Verified 对称）——coraza 伪装规则按
 		// 策略已选引擎集合匹配，不再全局 @eq 1。
 		r.Header.Set(crawlerSpoofHeader, engine)
 	}
 }
 
-// clientIPForVerify 取验证用客户端 IP（历史问题）：复用 realClientIP 单源——
+// clientIPForVerify 取验证用客户端 IP：复用 realClientIP 单源——
 // 优先 Caddy client_ip 变量（受信代理还原后的真实客户端），而非 socket
 // RemoteAddr。旧注释「RemoteAddr 已是真实客户端地址」在 CDN/受信代理部署下
 // 不成立：socket 对端是 CDN 回源 IP，PTR 验证必然失败（真爬虫被判伪装）。
@@ -248,11 +248,11 @@ func (h *GeoIPHandler) Cleanup() error {
 // 解析失败与非国家值的兜底（详见下方）。
 func (h *GeoIPHandler) setGeoIPPlaceholders(r *http.Request) {
 	ctx := r.Context()
-	// 历史问题（裁决：fail-closed 哨兵）：不可解析客户端（全部 IPv6 流量、
+	// （裁决：fail-closed 哨兵）：不可解析客户端（全部 IPv6 流量、
 	// 查询失败、残缺 region）此前不发任何变量 → geoip CEL 对未设置变量求值出
 	// 错 → match=false → deny 模式地域拦截对 IPv6 静默零强制。现恒发全部变量，
 	// 空串哨兵下：海外项 country_name != "中国" 对空串成立（IPv6 按海外处理，
-	// 与 历史问题 fail-closed 立场一致）；省/市项对空串恒不匹配（不误伤）。
+	// 与 fail-closed 立场一致）；省/市项对空串恒不匹配（不误伤）。
 	// 头镜像同语义：X-LB-GeoIP-Loc 先置「海外」哨兵（承载 fail-closed 海外裁决
 	// ——不可解析客户端保此值）；已解析行随后覆盖为国名（海外）或省/省-市（国内，
 	// 域 G 历史）。省/市空串对 coraza 锚定正则（^(?:...)$）恒不匹配。
@@ -301,8 +301,8 @@ type geoIPRegionFields struct {
 	Loc      string // 地域规则匹配键
 }
 
-// parseGeoIPRegion 把 xdb region 行解析为发射字段（历史问题）。
-// 国家列统一 TrimSpace——历史问题 前变量/头发射原始列，而 geoipLocFor 与
+// parseGeoIPRegion 把 xdb region 行解析为发射字段。
+// 国家列统一 TrimSpace——前变量/头发射原始列，而 geoipLocFor 与
 // geoipnames.NormalizeCountry 都 TrimSpace：空白异形行（" 中国"）会出现
 // Loc=广东省 但 country_name=" 中国" 的自相矛盾取值，统计桶也建成脏键。
 func parseGeoIPRegion(region string) (geoIPRegionFields, bool) {
@@ -311,18 +311,18 @@ func parseGeoIPRegion(region string) (geoIPRegionFields, bool) {
 		return geoIPRegionFields{}, false
 	}
 	out := geoIPRegionFields{Country: strings.TrimSpace(fields[0]), Region: region}
-	// 历史问题(历史):上方 len(fields)>=5 已保证,原两处 len>=3 守卫
+	// 上方 len(fields)>=5 已保证,原两处 len>=3 守卫
 	// 恒真,直接执行块内逻辑。
 	if raw := fields[1]; raw != "" && raw != "0" {
-		// 历史问题：省列规范化——xdb 存在双形态（上海/上海市）与
+		// 省列规范化——xdb 存在双形态（上海/上海市）与
 		// 台湾城市误入省列；规范表已单源收敛进 geoipnames 包（选项树侧
 		// ProvinceForTree / 发射侧 ProvinceForEmit 同表驱动，见 region.go），
 		// 发射变量与选项树同规范化后 CEL 等值匹配才成立。
 		out.Province = normalizeProvince(raw)
 	}
-	// 历史问题：市级粒度——region 第 3 列为城市；无效值（空/0）置空串，
+	// 市级粒度——region 第 3 列为城市；无效值（空/0）置空串，
 	// 使 CEL {http.vars.geoip.city} == X 对无城市段恒不命中。
-	// 历史问题：城市列经 normalizeCity 规范化——xdb 部分段城市列为拼音/
+	// 城市列经 normalizeCity 规范化——xdb 部分段城市列为拼音/
 	// 英文（Guangzhou Shi/Taipei City），策略树侧已映射为中文，发射侧不映射
 	// 会导致「广东省/广州市」类城市级规则对这些段恒不命中。
 	// 台湾城市误入省列的段：城市名在省列（城市列是该段的乱码罗马化值）——
@@ -332,17 +332,17 @@ func parseGeoIPRegion(region string) (geoIPRegionFields, bool) {
 	} else if c := strings.TrimSpace(fields[2]); c != "" && c != "0" {
 		out.City = normalizeCity(c)
 	}
-	// geoipLocFor 承载三态判定（历史修复抽出可钉）。
+	// geoipLocFor 承载三态判定。
 	out.Loc = geoipLocFor(fields[0], out.Province, out.City)
 	return out, true
 }
 
 // geoipLocFor 由 xdb 国家列与规范化省/市列计算 X-LB-GeoIP-Loc 值：
-// 国内（国家列 TrimSpace 后为「中国」——历史修复 TrimSpace 对称，树侧
+// 国内（国家列 TrimSpace 后为「中国」——TrimSpace 对称，树侧
 // 收集判定同口径）→ 省 或 省/市；海外 → 归一化国名（域 G，历史——已
 // 解析海外行细化到国家，与选项树 Countries 同源同归一）；国家列不可解析为
 // 国名（空/0/Reserved/中国空白异形经 NormalizeCountry 折叠空串）→「海外」
-// 哨兵，与 历史修复 fail-closed 哨兵同口径（deny+海外仍拦此类客户端）。
+// 哨兵，与 fail-closed 哨兵同口径（deny+海外仍拦此类客户端）。
 func geoipLocFor(rawCountry, province, city string) string {
 	if strings.TrimSpace(rawCountry) == "中国" {
 		if city != "" {
@@ -376,12 +376,12 @@ func realClientIP(r *http.Request) string {
 }
 
 // 规范化四张表（省别名/台湾城市/拼音城市/自治州）单源在
-// lazy-balancer-v2/geoipnames（历史修复收敛——此前与
+// lazy-balancer-v2/geoipnames（收敛——此前与
 // internal/services 手工镜像双份，靠解析对侧源文本的镜像测试防漂移；
 // 中立叶模块经根/caddygeoip 双 replace 接线，与 wafiplist 同模式）。
 
 // normalizeProvince 发射侧省列规范化——单源 geoipnames.ProvinceForEmit
-// （历史问题下沉：此前与 internal/services.normalizeIP2Province 是
+// （下沉：此前与 internal/services.normalizeIP2Province 是
 // 两份手工镜像，语义分叉靠调用点补偿）。台湾城市误入省列时省变量按台湾省
 // 发射、城市变量改发省列值（见 setGeoIPPlaceholders——该类段的城市列是
 // 乱码值）；无效值（空/"0"）→ 空串；别名归一；不可识别（乱码）原样返回

@@ -202,7 +202,7 @@ export interface RuleFlowTarget {
 }
 
 // 阶段编号体系：阶段 0 · 信任名单 → 阶段 1 · IP 访问控制 → 阶段 2 · 限流 → 阶段 3 · WAF
-// （历史问题-9：STAGE_SHORT_TITLES 与本常量曾逐字同值双源，已合并为单一份）
+// （STAGE_SHORT_TITLES 与本常量曾逐字同值双源，已合并为单一份）
 export const STAGE_TITLES: Record<0 | 1 | 2 | 3, string> = {
   0: '阶段 0 · 信任名单',
   1: '阶段 1 · IP 访问控制',
@@ -211,7 +211,7 @@ export const STAGE_TITLES: Record<0 | 1 | 2 | 3, string> = {
 }
 
 // 阶段副标题（流程弹框节点）与阶段 1 脚注：渲染链语义的唯一文案源。
-// 历史问题：阶段 1 副标题/脚注此前漏列 v2.3.8 爬虫校验（豁免 id 810000-849999 /
+// 阶段 1 副标题/脚注此前漏列 v2.3.8 爬虫校验（豁免 id 810000-849999 /
 // 伪装拦截 850000-899999），脚注另漏列遗留黑名单字段 ip_blacklist（id:4 仍由
 // security.go 发射）。链序按发射顺序：信任(id:3/12) → 黑名单(id:2) → 遗留黑名单
 // (id:4) → 白名单外拒绝(id:5/7) → 白名单豁免 → 爬虫校验 → 地域拦截(id:800000+)。
@@ -291,7 +291,7 @@ export const mergeIpEntryCount = (
 
 // 生效条目合并内核：内联 ∪ 引用条目组（每项 trim 后按精确字符串去重，空串剔除）。
 // 三处调用方（本文件 / SecurityPolicies 向导 / IPLocationAction 处置页）数据源
-// 成形不同，各自薄包装后共用本内核（历史问题 收敛：原三份近逐字实现）。
+// 成形不同，各自薄包装后共用本内核。
 export const mergeIpEntryValues = (
   inline: readonly string[],
   refEntryGroups: Iterable<readonly string[]>,
@@ -345,7 +345,7 @@ export const hasTrustEntries = (p: { ip_whitelist?: string; ip_whitelist_refs?: 
 // `has_ip_control` 摘要标志。has_ip_control 摘要标志含信任（镜像后端发射语义），
 // 阶段归属判定不得直接消费它——否则纯信任策略会在阶段 1 投出空行并被误判为 mixed。
 //
-// 历史问题-09（分层命名，有意分歧，勿「统一」）：本函数是**内容门**（类型推断 +
+// （分层命名，有意分歧，勿「统一」）：本函数是**内容门**（类型推断 +
 // 阶段能力投影），不是摘要展示口径。后端 `SecurityPolicyHasIPControl`
 // （internal/services/security.go）对 `ip_acl_enabled` **开启即 true**——差异形态
 // 仅「显式开启 ACL 但名单为空」：该形态不产生任何 ACL 渲染产物（安全等价），
@@ -359,7 +359,7 @@ export const hasIPACLControl = (p: {
   ip_acl_list_refs?: string
   ip_blacklist?: string
 }): boolean => {
-  // 原始字段齐备时按定义判定（历史问题 对齐后端 历史修复：ACL 启用 ∧
+  // 原始字段齐备时按定义判定（对齐后端：ACL 启用 ∧
   // 内联∪引用非空，或黑名单非空——旧形态只按启用位判定，会使启用但空名单
   // 的策略在兜底推断路径归 stage1、后端归 stage3，SecurityBindingEditor 组位
   // 分叉）；缺失（如精简绑定载荷）回退摘要标志。
@@ -398,11 +398,11 @@ const buildStage0Rows = (policy: SecurityStagePolicy | undefined, ipLists: reado
 // 阶段 1 · IP 访问控制摘要（2026-09-24 用户裁定「所有统计类型数据必须是真实
 // 数据」）：deny 模式的生效黑名单 = 名单侧（内联 ∪ 引用，须 ip_acl_enabled）
 // + 独立 ip_blacklist 字段，两源合计如实呈现。锁摘要/流程弹框/策略列表共用。
-// 历史问题（历史·历史修复 四链实证）收窄：①名单侧计数必须过 ip_acl_enabled
+// 收窄：①名单侧计数必须过 ip_acl_enabled
 // 门——ACL 已关闭（保留名单）时名单不生效（渲染 buildIPPrecheckDirectives
 // security.go:996 同门）；②独立黑名单无模式/开关门（security.go:1004-1006，
 // 既有有意裁定）——allow/绕过 模式下摘要不得隐去它仍在拦截的事实。
-// 历史问题（历史）：全仓零外部消费——以下六个仅模块内使用的实现去掉 export
+// 全仓零外部消费——以下六个仅模块内使用的实现去掉 export
 // （parseGeoipCountryCount/aclEffectiveCounts/mergeIpEntryDetails/crsGroupLabel/
 // rateLimitDetailCaption/ipInCidr），消费面复核记录在修复报告
 const aclEffectiveCounts = (
@@ -444,7 +444,7 @@ export const formatAclModeDetail = (
   return `黑名单模式 · ${total}`
 }
 
-// IP 快捷弹框「加入名单」动作的模式门控（历史问题）：ip_acl_list_refs 是黑/白
+// IP 快捷弹框「加入名单」动作的模式门控：ip_acl_list_refs 是黑/白
 // 共用字段——名单本身没有黑白属性，语义完全由 ip_acl_mode 决定（渲染侧
 // security.go:414-423 仅 allow/deny 发射拒绝规则；绕过 为免检测、空模式不发射）。
 // 因此在共用字段上同时提供「拦截」「放行」两个动作会反转用户意图：
@@ -473,7 +473,7 @@ const buildStage1Rows = (
   stagePages?: RuleStagePages | null,
 ): StageRow[] => {
   const rows: StageRow[] = []
-  // 内容门（历史问题-09 有意口径）：启用但名单空不产生 ACL 渲染产物，故不出
+  // 内容门：启用但名单空不产生 ACL 渲染产物，故不出
   // 阶段 1 空组——与列表页摘要展示（后端 has_ip_control，开启即 true）分层。
   if (policy && hasIPACLControl(policy)) {
     // 阶段 1 不再承载信任名单（阶段 0 独立；契约：阶段 1 策略创建/显式切换时服务端归一清除）
@@ -485,7 +485,7 @@ const buildStage1Rows = (
     const geoModeLabel = policy?.geoip_mode === 'allow' ? '仅允许所选区域' : '拦截所选区域'
     rows.push({ label: '地域拦截', detail: policy?.has_geoip ? `${geoModeLabel} · ${geoCount} 区域` : `已关闭（保留 ${geoCount} 区域）` })
   }
-  // 策略级拦截页行（历史：2026-09-25 起 stage1 可配策略页，投影补呈现）
+  // 策略级拦截页行（2026-09-25 起 stage1 可配策略页，投影补呈现）
   const s1PageId = policy?.block_page_id ?? 0
   if (s1PageId > 0) {
     const page = blockPages.find((p) => p.id === s1PageId)
@@ -578,11 +578,11 @@ export const buildStageModel = (
     // 阶段 2：限流（全部策略的限流集中在 WAF 之前，拦截恒 429）
     if (policy?.has_rate_limit) {
       const s2rows = [{ label: '速率限制', detail: `${policy.rate_limit_rps} 次/秒 · 突发 ${policy.rate_limit_burst} 次` }]
-      // 策略级拦截页（历史：stage2 可配策略页，429 时渲染；未配不虚增行）
+      // 策略级拦截页（stage2 可配策略页，429 时渲染；未配不虚增行）
       const s2PageId = binding.block_page_id ?? policy?.block_page_id ?? 0
       if (s2PageId > 0) {
         const page = blockPages.find((p) => p.id === s2PageId)
-        // 历史问题-08：与阶段 1/3 同口径——页已删/内容空不得静默省略，须显示
+        // 与阶段 1/3 同口径——页已删/内容空不得静默省略，须显示
         // 失效文案（BLOCK_PAGE_BROKEN_429），否则用户看不到回落目标（与同抽屉
         // 其余阶段分裂）。
         const broken = !page || (page.content ?? '') === ''
@@ -666,7 +666,7 @@ const mergeIpEntryDetails = (
 // CRS 组码 → 「请求 · 942 · SQL 注入」式标签（与安全策略页组名表同口径，由规则文件列表推导；
 // 列表未加载/组已消失时回退裸组码，不阻断明细区）
 const crsGroupLabel = (groupCode: string, crsFiles: readonly CrsRuleFileOption[]): string => {
-  // 历史修复：组码直插 new RegExp——畸形存量组码（含正则元字符）可致构造/匹配抛错
+  // 组码直插 new RegExp——畸形存量组码（含正则元字符）可致构造/匹配抛错
   // 崩溃抽屉。先 /^\d{2}$/ 门禁，门内形态走 RegExp；非门禁形态退化为裸字符串拼接
   // 匹配（等价 includes 定位），不构造 RegExp，找不到照旧回退裸组码。
   let file: CrsRuleFileOption | undefined
@@ -689,7 +689,7 @@ const rateLimitDetailCaption = (rps: number, burst: number): string =>
     : `1s 窗口上限 ${rps} 次`
 
 // 原生 JSON（/security/rules/:id/policy 的 RawMessage 字段）→ 数字 id 数组
-//（兼容对象形态 [{id:…}]；历史修复 起导出为单源——SecurityPolicies 的
+//（兼容对象形态 [{id:…}]；自此导出为单源——SecurityPolicies 的
 // custom_rules 文本解析 JSON.parse 后同样走本守卫，不再各持一份同构实现）
 export const parseUnknownIds = (raw: unknown): number[] => {
   if (!Array.isArray(raw)) return []
@@ -723,7 +723,7 @@ const buildGroupDetails = (
   }
   if (stage === 1) {
     const details: StagePolicyDetails = {}
-    // 历史问题 同门（历史问题 修复）：ACL 已关闭（保留名单）时名单
+    // 同门：ACL 已关闭（保留名单）时名单
     // 不生效——明细与摘要（aclEffectiveCounts:355）及渲染（security.go:996）
     // 共用同一 ip_acl_enabled 门，否则「黑名单 1 条」摘要旁挂「合计 100 条」明细。
     if (policy.has_ip_control && policy.ip_acl_enabled !== false) {
@@ -789,7 +789,7 @@ export const attachStageDetails = (
 
 export type SecurityPolicyType = 'stage0' | 'stage1' | 'stage2' | 'stage3' | 'mixed'
 
-// 历史问题 追加（历史问题）：阶段文案单一事实源=STAGE_TITLES——历史问题-9 合并后
+// 追加：阶段文案单一事实源=STAGE_TITLES——合并后
 // 的遗留双源消除，阶段措辞微调不再需双处同步
 export const POLICY_TYPE_LABELS: Record<SecurityPolicyType, string> = {
   stage0: STAGE_TITLES[0],
@@ -841,15 +841,15 @@ export const inferPolicyType = (p: SecurityPolicyTypeInput): SecurityPolicyType 
   if (p.policy_type === 'stage0' || p.policy_type === 'stage1' || p.policy_type === 'stage2' || p.policy_type === 'stage3' || p.policy_type === 'mixed') {
     return p.policy_type
   }
-  // 兜底推断与后端 models.PolicyTypeFeatures 逐条同形（历史问题-2 收敛，
-  // 原两处口径差异已消除）：历史修复=信任名单启用且内联∪引用非空；历史修复=IP ACL 启用且
-  // 非空 / 黑名单非空 / 地域拦截生效；历史修复=限流启用且 rps>0；历史修复=mode∈三态或
+  // 兜底推断与后端 models.PolicyTypeFeatures 逐条同形（收敛，
+  // 原两处口径差异已消除）：=信任名单启用且内联∪引用非空；=IP ACL 启用且
+  // 非空 / 黑名单非空 / 地域拦截生效；=限流启用且 rps>0；=mode∈三态或
   // 自定义规则非空。原始字段齐备时按定义判定，缺失（如精简绑定载荷）回退摘要
-  // 标志：历史修复 不可直接用 has_waf（仅 blocking|detection，漏 custom_only），自定义
-  // 规则不可直接用 has_custom_rules（含 off=全关口径，比 历史修复 窄）。
+  // 标志：不可直接用 has_waf（仅 blocking|detection，漏 custom_only），自定义
+  // 规则不可直接用 has_custom_rules（含 off=全关口径，比窄）。
   const s0 =
     p.ip_whitelist_enabled === undefined ? hasTrustEntries(p) : p.ip_whitelist_enabled && hasTrustEntries(p)
-  // s1 用内容门（历史问题-09）：与后端 PolicyTypeFeatures/历史修复 同形；摘要标志
+  // s1 用内容门：与后端 PolicyTypeFeatures/ 同形；摘要标志
   // has_ip_control 开启即 true 且含信任，直接消费会把空 ACL 策略误归阶段 1。
   const s1 = hasIPACLControl(p) || hasGeoIPControl(p)
   const s2 = p.has_rate_limit
@@ -867,10 +867,10 @@ export const inferPolicyType = (p: SecurityPolicyTypeInput): SecurityPolicyType 
   return 'stage3'
 }
 
-// compareVersion 语义化版本比较（历史）：日期形态（2026.09.24）与
+// compareVersion 语义化版本比较：日期形态（2026.09.24）与
 // semver（v2.3.3）均可——逐段数值比较，非数值段字典序兜底。
 // 注意：预发布段（如 -beta vs 空）按字典序判 beta > 正式版（semver 反直觉）——
-// 当前消费方只比较日期/纯数字形态，无预发布版本号，无实际影响（历史声明）。
+// 当前消费方只比较日期/纯数字形态，无预发布版本号，无实际影响（声明）。
 export const compareVersion = (a: string, b: string): number => {
   const pa = a.replace(/^v/, '').split(/[.-]/)
   const pb = b.replace(/^v/, '').split(/[.-]/)
@@ -888,14 +888,14 @@ export const compareVersion = (a: string, b: string): number => {
   return 0
 }
 
-// —— CIDR 感知 IP 匹配（历史用户验收：威胁库条目为 CIDR，精确串匹配漏报） ——
+// —— CIDR 感知 IP 匹配（用户验收：威胁库条目为 CIDR，精确串匹配漏报） ——
 const ipv4ToLong = (ip: string): number => {
   const parts = ip.split('.').map(Number)
   if (parts.length !== 4 || parts.some(p => Number.isNaN(p) || p < 0 || p > 255)) return -1
   return (((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0)
 }
 
-// IPv6 → 128 位整数（历史问题-03）：支持 '::' 压缩、嵌入 IPv4 尾（::ffff:1.2.3.4）
+// IPv6 → 128 位整数：支持 '::' 压缩、嵌入 IPv4 尾（::ffff:1.2.3.4）
 // 与 %zone（丢弃）；拒绝多段 '::'/多余组/非法十六进制。无压缩形态必须恰好 8 组。
 const ipv6ToBigInt = (raw: string): bigint | null => {
   const zone = raw.indexOf('%')
@@ -940,7 +940,7 @@ const ipv6ToBigInt = (raw: string): bigint | null => {
   return out
 }
 
-// 历史修复 补正（历史问题-03）：IPv6 CIDR 按前 N 位比较——此前仅 IPv4，IPv6 CIDR
+// 补正：IPv6 CIDR 按前 N 位比较——此前仅 IPv4，IPv6 CIDR
 // 条目在命中定位/残余信任判定侧恒漏报（取消信任后 CIDR 仍信任却报「已恢复拦截」）。
 const ipInCidr = (ip: string, cidr: string): boolean => {
   const idx = cidr.indexOf('/')
@@ -972,12 +972,12 @@ export const entryMatchesIp = (entry: string, ip: string): boolean => {
   return false
 }
 
-// —— 跨组件共享条目缓存（历史）：IPLocationAction 与 TriggerDetailDialog
+// —— 跨组件共享条目缓存：IPLocationAction 与 TriggerDetailDialog
 // 共用，写入动作（useTrustAssociation/useIpListAdd 链路）调用 invalidate 清空 ——
-// 历史修复（历史）：invalidate 同时通知订阅者（已打开弹框的本地副本即时
+// invalidate 同时通知订阅者（已打开弹框的本地副本即时
 // 失效重拷——曾失效触不到本地 ref，开放窗口叠开 IP 处置后徽标滞留旧值）。
 export const sharedEntriesCache: Record<number, string[]> = {}
-// 历史问题-03：缓存代际。invalidate 递增代际，在途 loader 落地时校验代际——
+// 缓存代际。invalidate 递增代际，在途 loader 落地时校验代际——
 // 写动作后旧请求的返回值不得回填缓存（否则后续 ensure 命中失效前的旧条目）。
 let entriesCacheGeneration = 0
 type EntriesCacheListener = () => void
@@ -1021,18 +1021,18 @@ async function loadSharedEntry(id: number, loader: (id: number) => Promise<strin
 }
 
 /**
- * 按需补齐名单条目（历史问题）：只对「不在缓存」的 id 发请求，
+ * 按需补齐名单条目：只对「不在缓存」的 id 发请求，
  * 并发调用去重（in-flight 复用）；单名单失败不阻塞其他名单且不留失败缓存
  * （下次调用可重试）。loader 由调用方注入（axios 请求），本模块保持纯状态机。
  *
- * 历史问题-02：代际守卫必须覆盖「复用方」——原实现只让发起者校验代际，写动作
+ *：代际守卫必须覆盖「复用方」——原实现只让发起者校验代际，写动作
  * invalidate 后紧随的 ensure 会命中原 in-flight，唤醒后发现代际已变、结果被丢弃
  * 且自身不补取，调用方返回时缓存仍为空（IP 处置弹框把该 IP 显示为「未在名单」）。
  * 现口径：
  * - 复用的 in-flight 必须与**本次调用时代际**一致；跨代际在途请求不复用（其结果
  *   按守卫必被丢弃），直接按当前代际发起；
  * - 等待同代际请求期间再次失效 → 按新代际补取一次（有界，单次）。
- * 发起者自己的请求被丢弃时不自动重取（保持 历史问题-03「丢弃、待重取」语义）。
+ * 发起者自己的请求被丢弃时不自动重取（保持 「丢弃、待重取」语义）。
  */
 export async function ensureSharedEntries(ids: Iterable<number>, loader: (id: number) => Promise<string[]>): Promise<void> {
   const todo = [...new Set(ids)].filter((id) => id > 0 && !(id in sharedEntriesCache))
@@ -1060,7 +1060,7 @@ export const invalidateSharedEntriesCache = (): void => {
 }
 
 /**
- * 事件详情弹框需要预取的地址列表 id（历史问题）：属主策略的 ACL refs（命中列表/
+ * 事件详情弹框需要预取的地址列表 id：属主策略的 ACL refs（命中列表/
  * 内联判定只读本策略）+ 全部信任 refs（跨策略信任豁免判定要读他策略的信任名单）。
  * 原实现并入「全部启用策略的 ACL refs」——详情弹框内零消费，启用策略多时会把他
  * 策略引用的大名单（含内置威胁名单，数千~上万条）全量下载。
@@ -1093,7 +1093,7 @@ export const SECURITY_BULK_LIMITS = { policyBindings: 100, ruleBlockPages: 500 }
 
 // 单规则可绑定的策略条数上限（后端 maxBindingsPerRule=8 的前端单源镜像）：
 // SecurityBindingEditor（规则侧计数/选择器上限）与 SecurityPolicies（向导
-// 冲突检测注释/夹紧）共用，历史问题 前两份本地常量各写一遍，后端调整时易漏改。
+// 冲突检测注释/夹紧）共用，前两份本地常量各写一遍，后端调整时易漏改。
 export const MAX_POLICIES_PER_RULE = 8
 
 /** 按单次上限切分待提交项（顺序保持；空数组→空切分）。 */
@@ -1127,13 +1127,13 @@ export const formatDurationUs = (us: number | undefined): string => {
 }
 
 // IP 地址列表分类预设——SecurityRules「提取为列表」与 SecurityPolicies 分类
-// 选择共用同一组选项(历史修复 双源收敛,原两文件各自定义)。
+// 选择共用同一组选项。
 export const IP_LIST_CATEGORIES = ['搜索引擎爬虫', 'CDN 节点', '云服务商', '办公网络', '数据中心', '可信地址', '恶意 IP', '其他'] as const
 
-// triggerStageFamily 触发 id→阶段族归类（历史修复 收敛：TriggerDetailDialog kind 与
+// triggerStageFamily 触发 id→阶段族归类（收敛：TriggerDetailDialog kind 与
 // SecurityEvents stageCategory 的平行实现统一改引本函数）。
 //
-// 历史问题（历史）：映射必须与后端 v2.3.8 权威分类同步——
+// 映射必须与后端 v2.3.8 权威分类同步——
 //   ① attackFamilyClassOf（internal/handlers/security.go）——ID 形态族：
 //      5 位任意 = 自定义（发射 id=crID+10000 落 10000-99999；CRS 恒 6 位）；
 //      6 位 1-7 开头 = DB 自定义规则 id 10000-789999 发射 id+10000；
@@ -1150,11 +1150,11 @@ export const IP_LIST_CATEGORIES = ['搜索引擎爬虫', 'CDN 节点', '云服�
 // 校验」），ipAcl/geoip/threat→acl（阶段 1 合并口径：黑白名单、地域、威胁情报
 // 同列），wafCrs/wafCustom→waf，body→body；TriggerDetailDialog —— geoip→geo、
 // crawler→crawler、threat→threat、wafCrs→waf-crs、wafCustom→waf-custom。
-//   历史修复（历史登记）：合成自定义 id 上界段 [900000,1000000)（DB 规则 id
+//   合成自定义 id 上界段 [900000,1000000)（DB 规则 id
 //   ≥90000 → 触发 id ≥910000，会与 9\d{5} CRS 段重叠）——自定义规则 id 达 9 万
 //   不现实（不可达），边界不修，仅登记留痕。
-// 历史修复（有意设计，勿"统一"）：id '8' 例外——本函数归 ipAcl，而后端权威分类
-// （attackFamilyClassOf）把 8 归 GeoIP。这是 历史问题 的历史共享 id 口径，现代引擎
+// （有意设计，勿"统一"）：id '8' 例外——本函数归 ipAcl，而后端权威分类
+// （attackFamilyClassOf）把 8 归 GeoIP。这是 历史共享 id 口径，现代引擎
 // 地域事件已改发 800xxx、不再走 id 8，无现实影响；triggerFamily.spec.ts 与
 // TriggerDetailDialog 注释已显式钉住该例外，不得按「与后端同步」改回 geoip。
 export type TriggerStageFamily = 'trust' | 'ipAcl' | 'geoip' | 'crawler' | 'threat' | 'wafCustom' | 'wafCrs' | 'body' | 'other'
@@ -1173,7 +1173,7 @@ export const triggerStageFamily = (ruleTriggered: string): TriggerStageFamily =>
   if (!Number.isFinite(n)) return 'other'
   if (n === 3 || n === 12) return 'trust'
   if (n === 14) return 'threat'
-  // ② 数值段：爬虫两族与地域段互斥（后端 历史问题 口径）
+  // ② 数值段：爬虫两族与地域段互斥（后端口径）
   if (n >= 810000 && n < 900000) return 'crawler'
   if (n >= 800000 && n < 810000) return 'geoip'
   if (n === 2 || n === 4 || n === 5 || n === 7 || n === 8) return 'ipAcl'
@@ -1181,7 +1181,7 @@ export const triggerStageFamily = (ruleTriggered: string): TriggerStageFamily =>
 }
 
 /**
- * 「所属策略为检测模式（命中只记录）」能否解释本类事件的 logged 动作（历史问题）。
+ * 「所属策略为检测模式（命中只记录）」能否解释本类事件的 logged 动作。
  * 后端 detection 的 ctl:ruleEngine=DetectionOnly（security.go:453-454 id:6）在
  * IP ACL/遗留黑名单/自定义规则之后、CRS 与请求体规则之前发射——所以只有 WAF 族
  * （CRS/自定义含 body 目标）的 logged 可由检测模式解释；阶段 1 族（IP ACL/地域/
@@ -1192,7 +1192,7 @@ export const triggerStageFamily = (ruleTriggered: string): TriggerStageFamily =>
 export const detectionModeExplains = (kind: string): boolean => kind === 'waf-crs' || kind === 'waf-custom'
 
 /**
- * 跨策略信任豁免判定的候选策略（历史问题）：事件详情端点不过滤 enabled，属主
+ * 跨策略信任豁免判定的候选策略：事件详情端点不过滤 enabled，属主
  * 策略可能事后被禁用——禁用策略不渲染、不可能放行，不得参与豁免归因。
  */
 export const isTrustExemptionCandidate = (p: {
@@ -1201,7 +1201,7 @@ export const isTrustExemptionCandidate = (p: {
   trust_detection?: boolean
 }): boolean => p.enabled !== false && !!p.ip_whitelist_enabled && p.trust_detection === true
 
-// ── 拦截页归因（历史修复） ─────────────────────────────────────────────
+// ── 拦截页归因 ─────────────────────────────────────────────
 // 后端渲染事实（internal/services/caddy.go）：
 //  - 阶段 3：每策略恒得合成码 483+（policySynthetic），页面归属=触发策略自身；
 //    若规则级 stage3 覆盖（id>0 ∧ 内容非空）在场 → 全规则恒 482，逐策略归因不可达。
@@ -1237,13 +1237,13 @@ export interface BlockPageAttribution {
 const chainHasValidPage = (p: BlockPageChainPolicy): boolean => (p.blockPageId ?? 0) > 0 && p.pageHasContent === true
 
 /**
- * 「拦截页缺失/内容为空」判定（历史修复）。
+ * 「拦截页缺失/内容为空」判定。
  *
  * loaded=false（拦截页列表尚未成功落地过一次）时**不得判定缺失**——辅助端点部分
  * 失败会让所有启用策略挂上「页面已删除或内容为空」的假警告。pageId<=0（未配置
  * 自定义页）不是缺失。
  *
- * 同时是 历史修复 归因与空页预告的共用谓词（单一真相，避免两处各写一份）。
+ * 同时是归因与空页预告的共用谓词（单一真相，避免两处各写一份）。
  */
 export const blockPageMissing = (
   pageId: number,
@@ -1260,7 +1260,7 @@ export const blockPageMissing = (
  *
  * chain 顺序不重要：函数内部按后端绑定序（policy_id ASC，未保存策略 id=null 视作
  * 最大）排序——视图侧传入的是「按阶段 rank 排序的展示链」，与渲染序不同，故不能
- * 依赖入参顺序（历史修复 的关键防错点）。
+ * 依赖入参顺序。
  */
 export const resolveBlockPageAttribution = (
   stage: BlockPageStage,

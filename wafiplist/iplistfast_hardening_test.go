@@ -69,7 +69,7 @@ func TestIPListFast_unmaps4in6(t *testing.T) {
 	}
 }
 
-// ParseIPEntry 4in6 归一（历史问题）：名单条目写作 4in6 映射形态（::ffff:a.b.c.d
+// ParseIPEntry 4in6 归一：名单条目写作 4in6 映射形态（::ffff:a.b.c.d
 // 裸 IP 或 ::ffff:a.b.c.d/120 前缀）时必须 Unmap 归一为 v4 前缀——netip 的 v4
 // 前缀不含 4in6 地址，不归一则条目落入 v6 集、v4 查询恒不命中（名单静默失效）。
 func TestParseIPEntry_unmaps4in6Entries(t *testing.T) {
@@ -98,7 +98,7 @@ func TestParseIPEntry_unmaps4in6Entries(t *testing.T) {
 	}
 }
 
-// 算子级端到端（历史问题）：4in6 裸 IP 与 /120 前缀两条目对被 Unmap 后的 v4
+// 算子级端到端：4in6 裸 IP 与 /120 前缀两条目对被 Unmap 后的 v4
 // 查询命中（修复前条目落入 v6 集，v4 查询恒不命中）。
 func TestIPListFast_4in6EntriesHitV4Queries(t *testing.T) {
 	dir := useAllowedDir(t)
@@ -119,7 +119,7 @@ func TestIPListFast_4in6EntriesHitV4Queries(t *testing.T) {
 	}
 }
 
-// EvictIPListCache（历史问题 缓存 GC）：淘汰后同路径下次加载重新读盘解析——
+// EvictIPListCache：淘汰后同路径下次加载重新读盘解析——
 // services 侧删除孤儿文件后，fail-stale 不得把旧集合无限期留在内存。
 func TestIPListFast_evictCacheForcesReparse(t *testing.T) {
 	dir := useAllowedDir(t)
@@ -386,8 +386,8 @@ func TestIPListFast_factoryDedupSharedState(t *testing.T) {
 	}
 }
 
-// 体积上限必须是**读侧**硬上限：调用方 历史修复 与本次读之间有窗口（tmp+rename
-// 原子替换任意大小文件），只按 历史修复 判限等于没判——这里绕过 loadIPListFile
+// 体积上限必须是**读侧**硬上限：调用方与本次读之间有窗口（tmp+rename
+// 原子替换任意大小文件），只按判限等于没判——这里绕过 loadIPListFile
 // 直接喂解析器，模拟「stat 见小、实际读到超大」的形态。
 func TestParseIPListFile_enforcesMaxFileBytesAfterRead(t *testing.T) {
 	dir := useAllowedDir(t)

@@ -1,6 +1,6 @@
 package middleware
 
-// 历史问题-19①：PurgeAPIKeyWhitelistCache 必须按 keyID 前缀精确清扫——
+// ①：PurgeAPIKeyWhitelistCache 必须按 keyID 前缀精确清扫——
 // "|" 分隔保证 keyID=3 不误伤 "30|…" 前缀；其他 Key 的条目不受影响。
 
 import (
@@ -35,7 +35,7 @@ func TestPurgeAPIKeyWhitelistCache_sweepsByKeyIDPrefix(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：配置导入/集群快照的 api_keys 整体替换后，白名单
+// 配置导入/集群快照的 api_keys 整体替换后，白名单
 // CIDR 解析缓存必须整体清空——键含 keyID 前缀无法枚举存活 Key，逐 Key
 // 清扫不可行；批量替换后缓存必须为空（解析缓存重建廉价）。
 func TestPurgeAllAPIKeyWhitelistCache_emptiesCache(t *testing.T) {

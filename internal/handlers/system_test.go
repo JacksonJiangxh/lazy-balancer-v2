@@ -70,7 +70,7 @@ func TestGetAppLogs_returns_empty_content_when_log_file_missing(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：节点角色查询失败/库未装配时 node_mode 为 unknown，
+// 节点角色查询失败/库未装配时 node_mode 为 unknown，
 // 不得静默冒充 master（排障窗口的误导；同域写门对同一故障响亮 500）。
 func TestGetSystemInfo_nodeModeUnknownWhenRoleUnavailable(t *testing.T) {
 	oldDB := db.DB

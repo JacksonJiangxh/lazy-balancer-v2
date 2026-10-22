@@ -21,7 +21,7 @@ func forceRenameFailure(t *testing.T) {
 }
 
 func TestCopyFile_atomicWriteNoTmpResidue(t *testing.T) {
-	// Given 历史问题：copyFile 原子落盘（历史问题 起为同目录唯一临时名
+	// Given：copyFile 原子落盘（自此为同目录唯一临时名
 	// .<base>-<rand>.tmp + fsync；成功后只留目标文件）
 	root := t.TempDir()
 	src := filepath.Join(root, "src.xdb")
@@ -144,7 +144,7 @@ func TestCRSUpdateRun_successWhenRenameUnavailable(t *testing.T) {
 	}
 }
 
-// TestCRSUpdateRun_backupCopyFailureLeavesNoPartialRulesBak 验证 历史问题(a)：
+// TestCRSUpdateRun_backupCopyFailureLeavesNoPartialRulesBak 验证
 // rules→rules.bak 的备份拷贝中途失败（ENOSPC/EIO 类故障）时不得残留部分
 // rules.bak——旧实现直接 copyDir 到 rules.bak，失败留下残树，restoreBackup
 // 无完整性校验即消费它，会把残树搬入 live、WAF 静默削弱。事务化备份
@@ -196,7 +196,7 @@ func TestCRSUpdateRun_backupCopyFailureLeavesNoPartialRulesBak(t *testing.T) {
 // TestCRSUpdateRun_installFailureRemovesFreshlyCreatedOverrides 验证审计场景：
 // 手动改过 crs-setup.conf（迁移 diff 非空）且 overrides 由本次迁移新建，重载
 // 失败后 overrides 被删除、旧 setup 恢复——恢复后的重载不再重复应用同一批
-// 自定义行（历史问题）。
+// 自定义行。
 func TestCRSUpdateRun_installFailureRemovesFreshlyCreatedOverrides(t *testing.T) {
 	// Given a live setup with user customizations and no pre-existing overrides
 	m := newTestCRSManager(t)
@@ -251,7 +251,7 @@ func TestCRSUpdateRun_installFailureRemovesFreshlyCreatedOverrides(t *testing.T)
 }
 
 // TestCRSUpdateRun_installFailureRestoresPreexistingOverrides 验证 overrides 在
-// 更新前已存在（前次迁移产物）时，安装失败后其内容被还原而非保留本次覆写（历史问题）。
+// 更新前已存在（前次迁移产物）时，安装失败后其内容被还原而非保留本次覆写。
 func TestCRSUpdateRun_installFailureRestoresPreexistingOverrides(t *testing.T) {
 	// Given a live setup with user customizations and a pre-existing overrides file
 	m := newTestCRSManager(t)
@@ -287,9 +287,9 @@ func TestCRSUpdateRun_installFailureRestoresPreexistingOverrides(t *testing.T) {
 	}
 }
 
-// TestCRSUpdateRun_preservedOverridesBakSurvivesNextRunFailure 验证 历史问题 1.1：
+// TestCRSUpdateRun_preservedOverridesBakSurvivesNextRunFailure 验证 1.1
 // 运行 N 因还原失败保全的 zz-user-overrides.conf.bak（三-1 唯一恢复副本），在
-// 运行 N+1 创建新备份前失败时不得被先行清除——旧实现 历史修复 无条件 os.Remove 会在
+// 运行 N+1 创建新备份前失败时不得被先行清除——旧实现无条件 os.Remove 会在
 // 新备份尚未创建时毁掉该副本，恢复路径全失。
 func TestCRSUpdateRun_preservedOverridesBakSurvivesNextRunFailure(t *testing.T) {
 	// Given 运行 N 保全的 overrides 备份 + N+1 备份 crs-setup.conf 时失败
@@ -372,7 +372,7 @@ func TestCRSUpdate_recordsReloadFailureAudit(t *testing.T) {
 	}
 }
 
-// 历史问题-03（历史）：重载失败回滚（树还原 + VERSION 标记 + DB 版本行）
+// 重载失败回滚（树还原 + VERSION 标记 + DB 版本行）
 // 必须在同一 wafFileMu 临界区内完成——旧实现 restoreBackup 取锁后立即释放，
 // 标记/版本行锁外写（持锁读者可见「旧树+新标记」，并发导入可被覆盖标记）。
 func TestCRSRollbackAfterReloadFailure_blocksWhileWafFileLockHeld(t *testing.T) {
@@ -381,7 +381,7 @@ func TestCRSRollbackAfterReloadFailure_blocksWhileWafFileLockHeld(t *testing.T) 
 	writeTestFile(t, filepath.Join(m.crsDir, "rules", "REQUEST-901-INITIALIZATION.conf"), "SecRule live")
 	writeTestFile(t, filepath.Join(crsTransientPath(m.crsDir, "rules.bak"), "REQUEST-901-INITIALIZATION.conf"), "SecRule old")
 	writeTestFile(t, filepath.Join(m.crsDir, crsVersionFile), "v4.15.0\n")
-	m.rulesBakCreated = true // 本运行已创建 rules.bak（历史问题 守卫）
+	m.rulesBakCreated = true // 本运行已创建 rules.bak
 
 	probeBlocksUnderWafFileLock(t, "CRS 重载失败回滚（树+VERSION+版本行）", func() {
 		m.rollbackAfterReloadFailure("v4.14.0")
@@ -403,12 +403,12 @@ func TestCRSRollbackAfterReloadFailure_blocksWhileWafFileLockHeld(t *testing.T) 
 	}
 }
 
-// 历史问题（历史）：rules/setup/stock .bak 无「本运行创建」守卫——上一
+// rules/setup/stock.bak 无「本运行创建」守卫——上一
 // 运行在「备份已建→清理前」崩溃残留的完整备份，会在本运行到达备份点前失败
 // （如下载失败走 fail(..., true)）时被 restoreBackup 无条件消费：live 树/setup
-// 被回滚到崩溃前状态（若崩溃发生在 swap 后则与 DB 版本行分叉，同 历史问题 形态；
+// 被回滚到崩溃前状态（若崩溃发生在 swap 后则与 DB 版本行分叉，同形态；
 // 同版本也会回滚用户崩溃后的 setup 手改）。修复：镜像 overridesBakCreated
-// （历史问题 1.1）为三类备份补「本运行创建」标记，陈旧备份永不消费、原样保全
+// 为三类备份补「本运行创建」标记，陈旧备份永不消费、原样保全
 // （崩溃现场唯一恢复素材，与 overrides.bak 三-1 保全语义一致）。
 func TestCRSUpdateRun_staleBaksNotConsumedOnEarlyFailure(t *testing.T) {
 	m := newTestCRSManager(t)
@@ -454,7 +454,50 @@ func TestCRSUpdateRun_staleBaksNotConsumedOnEarlyFailure(t *testing.T) {
 	}
 }
 
-// 历史问题 回归形状（正向）：陈旧备份在场时，本运行到达备份点会用新备份覆盖
+// 回滚契约：restoreBackupInLock 返回 true 必须意味着「live 规则树已完整还原
+// 到更新前状态」。两种「树未还原」形态不得按已还原上报——否则
+// rollbackAfterReloadFailure 会把旧版本号（prevTag）写到仍是新树的
+// VERSION 标记与 DB 版本行（版本行是 crsPoolFingerprint 池键输入，跨代态可
+// 复用旧 coraza 池实例、新规则静默不生效）。
+func TestCRSRollbackAfterReloadFailure_noBackupKeepsNewVersion(t *testing.T) {
+	t.Run("无本运行备份", func(t *testing.T) {
+		m := newTestCRSManager(t)
+		seedCRSVersionRow(t, "v4.15.0", true) // DB 行已是新版本
+		// live 是本运行安装的新树且完整（首装/带外清空旧树后直达交换的形态——
+		// 备份点无旧树可备份，rulesBakCreated 保持 false）
+		writeTestFile(t, filepath.Join(m.crsDir, "rules", crsRulesProbeFile), "SecRule new")
+		writeTestFile(t, filepath.Join(m.crsDir, crsVersionFile), "v4.15.0\n")
+
+		m.rollbackAfterReloadFailure("v4.14.0")
+
+		// 树未还原 → 旧版本号不得回写（保留新版本，待下次成功更新/启动对账收敛）
+		if got := readCRSVersionMarker(m.crsDir); got != "v4.15.0" {
+			t.Fatalf("VERSION 标记=%q, want v4.15.0（无备份时不得回写旧版本到新树）", got)
+		}
+		if version, _, _, _, _, _, _ := crsVersionRow(t); version != "v4.15.0" {
+			t.Fatalf("DB 版本行=%q, want v4.15.0（无备份时不得回写旧版本到新树）", version)
+		}
+	})
+
+	t.Run("本运行备份不可读", func(t *testing.T) {
+		m := newTestCRSManager(t)
+		seedCRSVersionRow(t, "v4.15.0", true)
+		writeTestFile(t, filepath.Join(m.crsDir, "rules", crsRulesProbeFile), "SecRule new")
+		writeTestFile(t, filepath.Join(m.crsDir, crsVersionFile), "v4.15.0\n")
+		m.rulesBakCreated = true // 本运行已建备份，但备份目录被带外移走
+
+		m.rollbackAfterReloadFailure("v4.14.0")
+
+		if got := readCRSVersionMarker(m.crsDir); got != "v4.15.0" {
+			t.Fatalf("VERSION 标记=%q, want v4.15.0（备份不可读时不得回写旧版本到新树）", got)
+		}
+		if version, _, _, _, _, _, _ := crsVersionRow(t); version != "v4.15.0" {
+			t.Fatalf("DB 版本行=%q, want v4.15.0（备份不可读时不得回写旧版本到新树）", version)
+		}
+	})
+}
+
+// 回归形状（正向）：陈旧备份在场时，本运行到达备份点会用新备份覆盖
 // 之（复制覆写语义不变），失败路径消费的是本运行备份——live 回到「本次更新前」
 // 状态而非崩溃前的陈旧状态。
 func TestCRSUpdateRun_thisRunBaksConsumedOnSwapFailure(t *testing.T) {

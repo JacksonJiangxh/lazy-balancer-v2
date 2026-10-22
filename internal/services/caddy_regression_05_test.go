@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// 历史修复: 跳转收集此前按上游裸计数（len(upstreams)==0），与规则渲染跳过的
+// 跳转收集此前按上游裸计数（len(upstreams)==0），与规则渲染跳过的
 // 启用上游口径不一致——全部上游被禁用的启用规则不渲染任何端口路由，却仍生成
 // terminal 301 跳转，域名被跳到无服务的 TLS 端口。跳转收集必须按启用上游判定。
 func TestGenerateCaddyConfig_skips_redirect_route_when_all_upstreams_disabled(t *testing.T) {

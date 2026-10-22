@@ -22,7 +22,7 @@ func TestCollectCertJobRows_TerminalCounts(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = db.Close(); db.DB, db.MetricsDB, db.AuditDB = oldDB, oldM, oldA })
 	now := time.Now().UTC().Format("2006-01-02 15:04:05")
-	// 历史问题（历史）：种子写入错误不得丢弃——静默失败会让整条断言链
+	// 种子写入错误不得丢弃——静默失败会让整条断言链
 	// 在空表上「通过」。
 	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, updated_at) VALUES ('r1','a.test','issued',?)`, now); err != nil {
 		t.Fatalf("seed issued row: %v", err)
@@ -88,7 +88,7 @@ func TestCollectSystemTasks_ContinuousStartedAtAndLoopOn(t *testing.T) {
 	}
 }
 
-// 历史问题-06：从未运行的常驻任务 StartedAt 置零值——UI「常驻 · 启动于」已有
+// 从未运行的常驻任务 StartedAt 置零值——UI「常驻 · 启动于」已有
 // '—' 兜底；不再回退引擎进程启动时刻（=uptime 语义，与「空闲」状态矛盾）。
 func TestCollectSystemTasks_DaemonNeverRunStartedAtEmpty(t *testing.T) {
 	te := newWireTestEngine(t)
@@ -127,7 +127,7 @@ func TestCollectCertJobRows_excludesSyncedMaterialRows(t *testing.T) {
 	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, message, created_at) VALUES ('r2','real.test','issued','',?)`, now); err != nil {
 		t.Fatalf("seed real row: %v", err)
 	}
-	// 历史问题：镜像行过滤绑定「本节点当前为从节点」——物化行只在从节点存在，
+	// 镜像行过滤绑定「本节点当前为从节点」——物化行只在从节点存在，
 	// 主节点（promote 后）这些行归本节点，必须可见（见 mirrorFilterOnlyOnSlave）。
 	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
 		t.Fatalf("set slave role: %v", err)
@@ -147,7 +147,7 @@ func TestCollectCertJobRows_excludesSyncedMaterialRows(t *testing.T) {
 	if !found {
 		t.Fatal("真实签发行应保留显示")
 	}
-	// 历史问题-2：LIMIT 100（第 100 新行仍显示——20 截断回归钉）
+	// LIMIT 100（第 100 新行仍显示——20 截断回归钉）
 	if len(rows) > 100 {
 		t.Fatalf("上限 100, got %d", len(rows))
 	}
@@ -182,7 +182,7 @@ func TestCollectCertJobRows_oldTerminalStillShown(t *testing.T) {
 	}
 }
 
-// 历史修复：读库失败的回退值不得写入缓存——DB 瞬时不可用时任务日志此前按
+// 读库失败的回退值不得写入缓存——DB 瞬时不可用时任务日志此前按
 // 10MB 滚动并钉死整个 5 分钟窗口（审计侧同职责缓存已按「失败不缓存」实现）。
 func TestGetTaskLogSizeBytes_readFailureNotCached(t *testing.T) {
 	initServicesDB(t)

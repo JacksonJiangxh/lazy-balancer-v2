@@ -1,9 +1,11 @@
 package handlers
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -41,22 +43,22 @@ func (h *Handlers) GetCAProvider(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: p})
 }
 
-// credentialAuditState 是 CA 提供商凭证字段的审计口径（历史问题，历史）：
-// 把「空白串（会真实清空 credentials 列）」「全星号占位（前端掩码回传，
-// 保留占位而非用户意图值）」「真实值变更」「无变更」四态区分开。旧实现
-// 把空白串与全星号一律视为未变更——清空落库却审计成「无修改」，占位也被
-// 误读为把凭证改成了星号。
+// credentialAuditState 是 CA 提供商凭证字段的审计口径：把「空白串（会真实
+// 清空 credentials 列）」「真实值变更」「无变更」三态区分开。旧实现把空白串
+// 视为未变更——清空落库却审计成「无修改」。
+//
+// 全星号占位（前端掩码回传）不在此枚举内：服务层对非 LE 提供商的凭证执行
+// JSON 门（ErrCAProviderInvalidCredentials），全星号载荷在进入审计判定前即
+// 被 400 拒绝，故「掩码回传」态在生产不可达，不得为不可达态保留分支/文案。
 type credentialAuditState int
 
 const (
 	credentialUnchanged credentialAuditState = iota
 	credentialChanged
 	credentialCleared
-	credentialMaskEcho
 )
 
-// credentialAuditStateFor 判定凭证载荷的审计/变更语义。全星号为保留占位
-// 契约：只有整串星号视为占位，不参与落库比较。
+// credentialAuditStateFor 判定凭证载荷的审计/变更语义。
 func credentialAuditStateFor(newCredentials, oldCredentials string) credentialAuditState {
 	trimmed := strings.TrimSpace(newCredentials)
 	if trimmed == "" {
@@ -66,13 +68,25 @@ func credentialAuditStateFor(newCredentials, oldCredentials string) credentialAu
 		// 空串=显式清空：服务层会把 credentials 写成空（ZeroSSL 分支放行空值）。
 		return credentialCleared
 	}
-	if strings.Trim(trimmed, "*") == "" {
-		return credentialMaskEcho
-	}
-	if trimmed == oldCredentials {
+	if credentialsSemanticallyEqual(trimmed, oldCredentials) {
 		return credentialUnchanged
 	}
 	return credentialChanged
+}
+
+// credentialsSemanticallyEqual 报告两段凭证 JSON 语义相等（键序/空白无关）：
+// 解析后按规范化形态比较，避免前端重排键序被误记为「凭证变更」。
+// 任一侧不是合法 JSON 时退化为字符串比较（判别本身不吞错——合法 JSON 门
+// 由服务层负责）。
+func credentialsSemanticallyEqual(a, b string) bool {
+	var left, right any
+	if err := json.Unmarshal([]byte(a), &left); err != nil {
+		return a == b
+	}
+	if err := json.Unmarshal([]byte(b), &right); err != nil {
+		return a == b
+	}
+	return reflect.DeepEqual(left, right)
 }
 
 func (h *Handlers) UpdateCAProvider(c *gin.Context) {
@@ -86,13 +100,13 @@ func (h *Handlers) UpdateCAProvider(c *gin.Context) {
 		return
 	}
 
-	// 历史问题：与 CreateRule/历史问题 问题 同款 1MB 请求体上限——credentials 为
+	// 与 CreateRule/ 问题 同款 1MB 请求体上限——credentials 为
 	// 自由 JSON 字符串，无上限时超大合法 JSON 经 ShouldBindJSON 等量内存驻留并
 	// 原样落库（域内其余写端点均已设限，本端点为漏网）。
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20)
 	var req models.UpdateCAProviderRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		// 历史修复（历史）：MaxBytesReader 超限映射 413，与导入/
+		// MaxBytesReader 超限映射 413，与导入/
 		// PutCaddyConfig/admin-tls 同口径（此前并入 400）。
 		if isRequestBodyTooLarge(err) {
 			c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: "请求体过大"})
@@ -116,7 +130,7 @@ func (h *Handlers) UpdateCAProvider(c *gin.Context) {
 			return
 		}
 		if errors.Is(err, services.ErrCAProviderInUse) {
-			// 历史问题-04（历史）：禁用被规则/任务引用的 CA 提供商 → 409 点名
+			// 禁用被规则/任务引用的 CA 提供商 → 409 点名
 			// 引用方（对齐 DNS 配置禁用守卫），不再静默改派到其他 CA。
 			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: err.Error()})
 			return
@@ -128,7 +142,7 @@ func (h *Handlers) UpdateCAProvider(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "名称不能为空"})
 		case errors.Is(err, services.ErrCAProviderNameTooLong):
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "名称不能超过 100 个字符"})
-		// 历史问题：directory_url 两个 400 分支已删——服务层按 provider 无条件覆写
+		// directory_url 两个 400 分支已删——服务层按 provider 无条件覆写
 		// 常量（services/caproviders.go:195-199），用户输入实际无效，两错误永不触发。
 		case errors.Is(err, services.ErrCAProviderInvalidCredentials):
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "凭证必须是有效的 JSON"})
@@ -144,7 +158,7 @@ func (h *Handlers) UpdateCAProvider(c *gin.Context) {
 		}
 		return
 	}
-	// 历史修复（历史）：changed 清单的比对基线改为服务层返回的事务内旧行，
+	// changed 清单的比对基线改为服务层返回的事务内旧行，
 	// 消除「事务外预读 → 事务提交」窗口内并发写入导致的清单失真（基于陈旧
 	// 旧值漏记/多记变更字段）。
 	changed := []string{}
@@ -162,7 +176,7 @@ func (h *Handlers) UpdateCAProvider(c *gin.Context) {
 	case credentialChanged:
 		changed = append(changed, "凭证")
 	case credentialCleared:
-		// 历史问题（历史）：空串会真实清空 credentials 列，不得记「无修改」。
+		// 空串会真实清空 credentials 列，不得记「无修改」。
 		changed = append(changed, "凭证（清空）")
 	}
 	if req.MaxConcurrent != nil && *req.MaxConcurrent != old.MaxConcurrent {
@@ -175,13 +189,7 @@ func (h *Handlers) UpdateCAProvider(c *gin.Context) {
 		changed = append(changed, "启用状态")
 	}
 	if len(changed) == 0 {
-		parts := []string{fmt.Sprintf("提供商 %d", id), old.Name}
-		if credentialState == credentialMaskEcho {
-			// 全星号=前端掩码回传占位（保留占位契约），不是用户意图值——
-			// 单列备注以便追溯，不记成真实变更。
-			parts = append(parts, "凭证（掩码回传，未变更）")
-		}
-		parts = append(parts, "无修改")
+		parts := []string{fmt.Sprintf("提供商 %d", id), old.Name, "无修改"}
 		recordAudit(c, "更新", "CA提供商", services.FormatAuditDetail(parts...))
 	} else {
 		recordAudit(c, "更新", "CA提供商", services.FormatAuditDetail(fmt.Sprintf("提供商 %d", id), old.Name, fmt.Sprintf("变更：%s", strings.Join(changed, "、"))))

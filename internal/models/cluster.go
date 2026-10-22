@@ -52,7 +52,7 @@ func ValidateClusterAccessURL(value string) error {
 	return nil
 }
 
-// NormalizeClusterNodeName 节点名落库侧单源归一（历史问题-05）：去首尾空白、
+// NormalizeClusterNodeName 节点名落库侧单源归一：去首尾空白、
 // 剥离控制字符、按 schema VARCHAR(100) 上限截断到合法 UTF-8 边界。HTTP 入口
 // 由 binding max=100 拦截；服务层直调与旧客户端仍需同一兜底（SQLite 不强制
 // VARCHAR 长度），否则 16KB 注册体可把超长/带换行的名字写进 nodes 并回显。
@@ -60,7 +60,7 @@ func NormalizeClusterNodeName(name string) string {
 	name = strings.TrimSpace(name)
 	name = strings.Map(func(r rune) rune {
 		// C0、DEL 与 C1（0x80-0x9F）均为控制字符；旧实现漏 C1，注释口径
-		// 与行为不一致（历史问题-2）。
+		// 与行为不一致。
 		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
 			return -1
 		}
@@ -74,7 +74,7 @@ func NormalizeClusterNodeName(name string) string {
 }
 
 // ClusterAccessURLHostMatchesIP 判定自述访问地址的主机是否即注册来源 IP
-// （历史问题-06 信任边界）：access_url 是能力票据（服务控制/登录票据）的投递
+// access_url 是能力票据（服务控制/登录票据）的投递
 // 地址，注册方自述值只在与来源 IP 一致时可信；其余必须由管理员经节点访问
 // 地址端点显式配置，避免已发注册令牌把票据引向任意第三方主机。
 func ClusterAccessURLHostMatchesIP(accessURL, ipAddress string) bool {
@@ -204,7 +204,7 @@ type ClusterModeRequest struct {
 
 type ClusterSettingsRequest struct {
 	// SyncInterval 范围校验（10-86400）在 ClusterService.UpdateSettings 完成，
-	// 以便返回「同步间隔需在 10-86400 秒之间」的具体文案；binding 层不再拦截（历史问题 发现1）。
+	// 以便返回「同步间隔需在 10-86400 秒之间」的具体文案；binding 层不再拦截。
 	// 三分类合并(2026-09-19):sync_global_config/sync_waf_files 字段随开关
 	// 列删除(全局配置并入系统数据、规则库并入安全防护)。
 	SyncInterval *int  `json:"sync_interval"`
@@ -217,12 +217,12 @@ type ClusterRegistration struct {
 	RegistrationID     int    `json:"registration_id"`
 	RegistrationSecret string `json:"registration_secret"`
 	// OverwrittenNodeID/OverwrittenNodeName 在重复 ip:port 注册命中「已批准」
-	// 节点时回填（历史问题，历史）：upsert 是既有兼容路径，但静默重置审批
+	// 节点时回填：upsert 是既有兼容路径，但静默重置审批
 	// 与令牌会让运营方误以为是新节点——响应与审计必须点名被覆盖的节点。
 	OverwrittenNodeID   int    `json:"overwritten_node_id,omitempty"`
 	OverwrittenNodeName string `json:"overwritten_node_name,omitempty"`
 	// AccessURLIgnored 表示注册请求自述的 access_url 与来源 IP 不一致而被忽略
-	// （历史问题-06：access_url 是能力票据投递地址，只接受与注册来源一致的
+	// （access_url 是能力票据投递地址，只接受与注册来源一致的
 	// 自述值；其余必须由管理员经节点访问地址端点显式配置）。
 	AccessURLIgnored bool `json:"access_url_ignored,omitempty"`
 }
@@ -260,7 +260,7 @@ type ClusterHealth struct {
 
 type ClusterReport struct {
 	AppliedVersion int `json:"applied_version" binding:"min=0"`
-	// ServiceStatus 保留（历史问题 裁定：有意设计-保留）：主节点
+	// ServiceStatus 保留：主节点
 	// 当前不消费该字段（cluster_status.go 的节点视图不读它，前端亦无渲染点），
 	// 但 binding 强校验仍要求从节点上报 ok/degraded。删除会破坏旧主/旧从
 	// 滚动升级期的上报契约（旧主节点对缺字段的绑定校验直接 400），故保留到
@@ -353,7 +353,7 @@ type ClusterBasicSettings struct {
 	// 闭环需要本地可读 issuer/client 凭证(JWKS 验签在从节点本地完成)。
 	OIDCConfig        *string `json:"oidc_config,omitempty"`
 	MFALockoutEnabled *bool   `json:"mfa_lockout_enabled,omitempty"`
-	// v2.3.x 历史问题:自动备份设置随 users 节同步——从节点提升为主节点后调度
+	// v2.3.x:自动备份设置随 users 节同步——从节点提升为主节点后调度
 	// 直接生效,无需重启。指针+omitempty 缺席语义(镜像 branding_json
 	// d55a675 偏斜处理):旧主端快照缺该组字段时从端 apply 跳过写入、保留
 	// 本地设置,不清零;新主端装载恒非 nil(COALESCE 兜底),快照恒携带。
@@ -365,8 +365,8 @@ type ClusterBasicSettings struct {
 	AutoBackupDay       *int    `json:"auto_backup_day,omitempty"`
 	AutoBackupKeep      *int    `json:"auto_backup_keep,omitempty"`
 	AutoBackupSections  *string `json:"auto_backup_sections,omitempty"`
-	// 历史问题-01（历史）：威胁库任务级排程三列随 users 节同步——从节点
-	// 提升为主后调度直接生效（镜像 历史问题 自动备份组）。指针+omitempty 缺席
+	// 威胁库任务级排程三列随 users 节同步——从节点
+	// 提升为主后调度直接生效（镜像自动备份组）。指针+omitempty 缺席
 	// 语义：旧主端快照缺该组时从端 apply 跳过写入、保留本地设置，不清零；
 	// 新主端装载恒非 nil（COALESCE 兜底），快照恒携带。
 	ThreatAutoUpdate   *bool   `json:"threat_auto_update,omitempty"`
@@ -376,8 +376,8 @@ type ClusterBasicSettings struct {
 	CrawlerAutoUpdate   *bool   `json:"crawler_auto_update,omitempty"`
 	CrawlerScheduleDays *string `json:"crawler_schedule_days,omitempty"`
 	CrawlerScheduleTime *string `json:"crawler_schedule_time,omitempty"`
-	// 历史修复（历史）：自动封禁六项配置随 users 节同步——从节点提升为主节点
-	// 后调度按主端配置直接生效（镜像 历史问题 自动备份组/历史问题-01 威胁排程组）。
+	// 自动封禁六项配置随 users 节同步——从节点提升为主节点
+	// 后调度按主端配置直接生效（镜像自动备份组/ 威胁排程组）。
 	// 指针+omitempty 缺席语义：旧主端快照缺该组时从端 apply 跳过写入、保留本地
 	// 设置，不清零；新主端装载恒非 nil（COALESCE 兜底），快照恒携带。此前六列
 	// 不入快照：从端恒默认值（名单传播而配置不传播），升主后按陈旧配置静默运行。
@@ -414,7 +414,7 @@ type ClusterUser struct {
 	// pending 密钥不跨节点（绑定向导是节点本地交互；半途切换面板属可重做流程）。
 }
 
-// ClusterLockedUser 是主节点活跃登录锁的同步载荷（历史修复 修订）：主节点账号被锁
+// ClusterLockedUser 是主节点活跃登录锁的同步载荷：主节点账号被锁
 // 状态必须传播到从节点（从节点本地锁定独立生效）。走快照独立顶层载荷
 // locked_users 而非 users 节列——login_* 不在 users 触发器快照列/节哈希/漂移
 // 守卫内，避免每次登录失败触发 users/api_keys 全量重放与漂移循环。只携带
@@ -491,10 +491,10 @@ type ClusterSnapshot struct {
 	SecurityCrawlerSources json.RawMessage   `json:"security_crawler_sources,omitempty"`
 	SectionHashes          map[string]string `json:"section_hashes,omitempty"`
 	// MasterSyncSwitches 为主节点三类同步开关（users/rules/security，2026-09-19
-	// 三分类归一；历史修复修正「五类」陈旧注释），随快照下发；从节点跳过判定
+	// 三分类归一；修正「五类」陈旧注释），随快照下发；从节点跳过判定
 	// 以此为准（从节点本地开关列不参与，避免永远默认全开导致开关失效）。
 	MasterSyncSwitches *ClusterSyncSwitchesPayload `json:"master_sync_switches,omitempty"`
-	// LockedUsers（历史修复 修订）：主节点活跃登录锁，独立顶层载荷——不参与任何
+	// LockedUsers：主节点活跃登录锁，独立顶层载荷——不参与任何
 	// 节哈希/漂移守卫（避免登录失败触发 users 全量重放）；从端只延长不清除。
 	// 加性可选字段、omitempty：旧主端缺省 → 从端 no-op；旧从端忽略未知字段
 	// （先例：MasterSyncSwitches/WafFiles），故不 bump CurrentSnapshotSchema。
@@ -550,7 +550,7 @@ type ClusterSecurityCRSVersion struct {
 	Trigger      string `json:"trigger"`
 	StartedAt    string `json:"started_at"`
 	FinishedAt   string `json:"finished_at"`
-	// 历史问题-01（历史）：定时更新排程两列随版本行同步（升主即生效）。
+	// 定时更新排程两列随版本行同步（升主即生效）。
 	ScheduleDays string `json:"schedule_days"`
 	ScheduleTime string `json:"schedule_time"`
 }
@@ -567,7 +567,7 @@ type ClusterSecurityIP2RegionVersion struct {
 	Trigger      string `json:"trigger"`
 	StartedAt    string `json:"started_at"`
 	FinishedAt   string `json:"finished_at"`
-	// 历史问题-01（历史）：定时更新排程两列随版本行同步（升主即生效）。
+	// 定时更新排程两列随版本行同步（升主即生效）。
 	ScheduleDays string `json:"schedule_days"`
 	ScheduleTime string `json:"schedule_time"`
 }
@@ -634,6 +634,6 @@ type ClusterStatus struct {
 	ApprovedCount  int           `json:"approved_count"`
 	// TransportInsecure 表示从节点→主节点链路为明文 HTTP（快照承载证书私钥
 	// 与 CA/DNS 凭据、服务控制票据为 Bearer，且 HTTP 下无 TOFU 指纹防护）。
-	// 注册时刻的一次性告警之外，UI 据此常驻提示（历史问题-09）。
+	// 注册时刻的一次性告警之外，UI 据此常驻提示。
 	TransportInsecure bool `json:"transport_insecure"`
 }

@@ -37,7 +37,7 @@ func (f *clusterLifecycleFake) StopSync()  { f.syncStopped.Store(true) }
 
 // v3SnapshotWithACMESection 将直调 applySnapshot 的夹具补齐为生产可达形态：
 // 生产快照经 verifiedSnapshotIntegrity 闸门后必为当前 schema 且携带 ACME
-// 区段；validateSnapshotACMEState 对缺区段统一硬拒（历史问题 移除 v2 放行
+// 区段；validateSnapshotACMEState 对缺区段统一硬拒（移除 v2 放行
 // 死分支后，未设 SchemaVersion/ACME 的旧夹具会被拒）。
 func v3SnapshotWithACMESection(snapshot models.ClusterSnapshot) models.ClusterSnapshot {
 	snapshot.SchemaVersion = CurrentSnapshotSchema
@@ -58,7 +58,7 @@ func newClusterTestService(t *testing.T) (*ClusterService, *sql.DB) {
 	database := db.DB
 	service := NewClusterService(database, "")
 	t.Cleanup(func() {
-		// 历史问题-06：显式注销全局注册表条目（LIFO：先注销，再 Close/恢复）。
+		// 显式注销全局注册表条目（LIFO：先注销，再 Close/恢复）。
 		unregisterClusterService(service)
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
@@ -232,7 +232,7 @@ func TestClusterService_ApproveNode_redelivers_cluster_token_until_confirmed(t *
 	if storedRegistrationSecret != tokenHash(registration.RegistrationSecret) {
 		t.Fatal("registration secret was not stored as its SHA-256 hash")
 	}
-	if err := service.ApproveNode(context.Background(), registration.RegistrationID); err != nil {
+	if err := service.ApproveNode(context.Background(), registration.RegistrationID, time.Now()); err != nil {
 		t.Fatalf("approve node: %v", err)
 	}
 
@@ -285,7 +285,7 @@ func TestClusterService_RegistrationStatus_rejects_expired_secret(t *testing.T) 
 	if err != nil {
 		t.Fatalf("register node: %v", err)
 	}
-	if err := service.ApproveNode(context.Background(), registration.RegistrationID); err != nil {
+	if err := service.ApproveNode(context.Background(), registration.RegistrationID, time.Now()); err != nil {
 		t.Fatalf("approve node: %v", err)
 	}
 	if _, err := database.Exec("UPDATE nodes SET registration_secret_expires_at=datetime('now','-1 second') WHERE id=?", registration.RegistrationID); err != nil {
@@ -533,7 +533,7 @@ func TestComputeNodeStatus_marks_stale_approved_node_offline(t *testing.T) {
 	}
 }
 
-// 历史问题-02（历史）：巡检离线阈值 max(2×sync_interval,120s)
+// 巡检离线阈值 max(2×sync_interval,120s)
 // （cluster_masterserving.go）与 UI 阈值 2×clamp(sync_interval)（ComputeNodeStatus/
 // updateOverview）在 sync_interval∈[10,59] 分叉——interval=30 时巡检以 120s 判
 // 在线、UI 以 60s 判离线，同一节点在告警与节点列表两口径打架。归一为同一函数
@@ -555,7 +555,7 @@ func TestNodeOfflineThreshold_unifiesInspectAndUIAtLowInterval(t *testing.T) {
 	if status != "online" {
 		t.Fatalf("ComputeNodeStatus(interval=30, last_seen 90s 前)=%q, want online（巡检同刻判在线，两口径必须一致）", status)
 	}
-	// 脏值 clamp 保持 历史问题 口径：sync_interval=5 按 60s 计 → max(120,120)=120s
+	// 脏值 clamp 保持口径：sync_interval=5 按 60s 计 → max(120,120)=120s
 	if got := nodeOfflineThreshold(5); got != 120*time.Second {
 		t.Fatalf("nodeOfflineThreshold(5)=%v, want 120s（脏值 clamp 60s 后与下限取大）", got)
 	}
@@ -567,7 +567,7 @@ func TestNodeOfflineThreshold_unifiesInspectAndUIAtLowInterval(t *testing.T) {
 
 func TestClusterService_Promote_resets_slave_state(t *testing.T) {
 	// Given
-	// Promote 成功路径会拉起自动备份调度器(历史问题)——测试结束即停,
+	// Promote 成功路径会拉起自动备份调度器——测试结束即停,
 	// 防止泄漏的 worker 跨用例 tick 全局 DB。
 	_, database := newClusterTestService(t)
 	lifecycle := &clusterLifecycleFake{}
@@ -605,7 +605,7 @@ func TestClusterService_Promote_resets_slave_state(t *testing.T) {
 
 func TestClusterService_Promote_removes_old_master_pin_and_audits(t *testing.T) {
 	// Given
-	// Promote 成功路径会拉起自动备份调度器(历史问题)——测试结束即停。
+	// Promote 成功路径会拉起自动备份调度器——测试结束即停。
 	_, database := newClusterTestService(t)
 	service := NewClusterService(database, "")
 	masterURL := "https://master.example:8443"
@@ -643,7 +643,7 @@ func TestClusterService_Promote_removes_old_master_pin_and_audits(t *testing.T) 
 
 func TestClusterService_Promote_succeeds_when_pin_cleanup_fails_then_retries_on_snapshot(t *testing.T) {
 	// Given
-	// Promote 成功路径会拉起自动备份调度器(历史问题)——测试结束即停。
+	// Promote 成功路径会拉起自动备份调度器——测试结束即停。
 	service, database := newClusterTestService(t)
 	masterURL := "https://master.example:8443"
 	if _, err := database.Exec("UPDATE global_config SET is_master=0, master_url=?, cluster_token='secret' WHERE id=1", masterURL); err != nil {
@@ -1233,7 +1233,7 @@ func TestClusterSnapshot_alwaysCarriesGlobalSettings(t *testing.T) {
 	}
 }
 
-// 历史问题-14（历史）：测试名/注释原以「Caddy 同步开关关闭」描述行为，
+// 测试名/注释原以「Caddy 同步开关关闭」描述行为，
 // 但三分类合并后已无 sync_caddy_config 开关（列已删，见下方
 // TestClusterService_Status_removesLegacySyncCaddyConfig）。真实契约是：
 // 快照未携带 caddy_config（=旧主端缺席）时跳过 Caddy 全局列，保留从端本地值。
@@ -1297,7 +1297,7 @@ func TestUpdateSnapshotSettings_preservesSlaveAccessLogSettingsWhenSnapshotOmits
 	}
 }
 
-// 历史问题-4：旧主端 basic_settings 缺字段与显式零值不同。缺席字段必须
+// 旧主端 basic_settings 缺字段与显式零值不同。缺席字段必须
 // 全部跳过写入，不能将本节点现有配置清成 Go 零值。
 func TestUpdateSnapshotSettings_legacyAbsentFieldsPreserveEntireLocalRow(t *testing.T) {
 	_, database := newClusterTestService(t)
@@ -1421,7 +1421,7 @@ func TestClusterService_UpdateSettings_ignoresLegacySyncCaddyConfig(t *testing.T
 }
 
 func TestClusterService_UpdateSettings_sync_interval_range_validation(t *testing.T) {
-	// 历史问题 发现1：sync_interval 落库前必须做范围校验，否则从节点 run 循环
+	// 发现1：sync_interval 落库前必须做范围校验，否则从节点 run 循环
 	// waitDelay(0) 进入零间隔 Pull 风暴。
 	service, database := newClusterTestService(t)
 	ctx := context.Background()
@@ -1452,7 +1452,7 @@ func TestClusterService_UpdateSettings_sync_interval_range_validation(t *testing
 }
 
 func TestClusterService_Nodes_matchesOverviewOnlineCount_withDirtySyncInterval(t *testing.T) {
-	// 历史问题：存量脏值 sync_interval=5（历史问题 前残留，低于校验下限 10）时，从节点
+	// 存量脏值 sync_interval=5时，从节点
 	// run loop 实际以 60s 上报；节点列表（ComputeNodeStatus）与总览在线数
 	// （updateOverview）必须同口径按 60s 计（阈值 120s），否则同一节点在两页面
 	// 判定打架，且上报窗口内的从节点被误判离线。
@@ -1493,7 +1493,7 @@ func TestClusterService_Nodes_matchesOverviewOnlineCount_withDirtySyncInterval(t
 	}
 }
 
-// 历史问题(历史):重新注册不携带 AccessURL(cluster_mode.go 恒空)时
+// 重新注册不携带 AccessURL(cluster_mode.go 恒空)时
 // 必须保留管理员维护的存量,不静默清空。
 func TestClusterService_ReRegisterPreservesAccessURL(t *testing.T) {
 	service, database := newClusterTestService(t)
@@ -1534,7 +1534,7 @@ func TestClusterService_ReRegisterPreservesAccessURL(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：ConfirmRegistration 清列必须与 Snapshot 旧协议交付
+// ConfirmRegistration 清列必须与 Snapshot 旧协议交付
 // 确认（cluster_snapshot.go:84）对齐——registration_secret_expires_at 一并
 // 置 NULL，否则残留过期时间戳与已清空的 secret 长期分叉。
 func TestConfirmRegistration_clearsSecretAndExpiry(t *testing.T) {
@@ -1559,7 +1559,7 @@ func TestConfirmRegistration_clearsSecretAndExpiry(t *testing.T) {
 	}
 }
 
-// 历史问题-05（历史）：nodes 不在 cluster_version 触发器清单——删除节点
+// nodes 不在 cluster_version 触发器清单——删除节点
 // 必须与注册/改坐标同构地在同事务 bump，否则快照缓存（键含 cluster_version）
 // 继续携带被删节点的站点项，直到下一次无关 bump。
 func TestDeleteNodeBumpsClusterVersion(t *testing.T) {
@@ -1579,5 +1579,113 @@ func TestDeleteNodeBumpsClusterVersion(t *testing.T) {
 	}
 	if after := version(); after != before+1 {
 		t.Fatalf("cluster_version %d→%d，want +1（拓扑变更必须传播）", before, after)
+	}
+}
+
+// 作废旧令牌与写入新令牌必须同成同败：分两语句无事务时，INSERT 失败会留下
+// 「旧令牌已被 DELETE、新令牌未落库」的空窗——管理员拿到的仍是错误提示，
+// 却已无任何可用令牌。
+func TestGenerateRegisterToken_invalidationAndInsertAreAtomic(t *testing.T) {
+	service, database := newClusterTestService(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	first, _, err := service.GenerateRegisterToken(ctx, 1, now)
+	if err != nil {
+		t.Fatalf("generate first token: %v", err)
+	}
+	if _, err := database.Exec(`CREATE TRIGGER reject_register_token_insert BEFORE INSERT ON cluster_register_tokens
+		BEGIN SELECT RAISE(ABORT, 'injected insert failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := service.GenerateRegisterToken(ctx, 1, now); err == nil {
+		t.Fatal("注入的 INSERT 失败必须以错误上抛")
+	}
+	if _, err := database.Exec("DROP TRIGGER reject_register_token_insert"); err != nil {
+		t.Fatal(err)
+	}
+
+	var tokenCount int
+	if err := database.QueryRow("SELECT COUNT(*) FROM cluster_register_tokens").Scan(&tokenCount); err != nil {
+		t.Fatal(err)
+	}
+	if tokenCount != 1 {
+		t.Fatalf("生成失败后令牌数=%d, want 1（作废必须随生成失败回滚）", tokenCount)
+	}
+	req := models.ClusterRegisterRequest{Token: first, Name: "slave-atomic", IPAddress: "10.0.0.2", Port: 8000}
+	if _, err := service.RegisterNode(ctx, req, now); err != nil {
+		t.Fatalf("旧令牌必须仍可用（作废被回滚）: %v", err)
+	}
+}
+
+// 并发生成注册令牌后只允许留一枚有效令牌（作废+生成在同一事务内串行化）。
+func TestGenerateRegisterToken_concurrentGenerationLeavesSingleValidToken(t *testing.T) {
+	service, database := newClusterTestService(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	const workers = 16
+	start := make(chan struct{})
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, _, err := service.GenerateRegisterToken(ctx, 1, now)
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("并发生成令牌失败: %v", err)
+		}
+	}
+	var valid int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM cluster_register_tokens WHERE used_at IS NULL AND expires_at > ?`, now.UTC()).Scan(&valid); err != nil {
+		t.Fatal(err)
+	}
+	if valid != 1 {
+		t.Fatalf("并发生成后有效令牌数=%d, want 1（只允许最晚一次生成存活）", valid)
+	}
+}
+
+// 审批同时推进注册密钥的 24h 到期窗口，必须与同域其他方法一样使用注入 now
+// （真实时钟会让到期边界无法确定性断言）。
+func TestApproveNode_expiryUsesInjectedNow(t *testing.T) {
+	service, database := newClusterTestService(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	token, _, err := service.GenerateRegisterToken(ctx, 1, now)
+	if err != nil {
+		t.Fatalf("generate register token: %v", err)
+	}
+	registration, err := service.RegisterNode(ctx, models.ClusterRegisterRequest{
+		Token: token, Name: "slave-expiry", IPAddress: "10.0.0.21", Port: 8000,
+	}, now)
+	if err != nil {
+		t.Fatalf("register node: %v", err)
+	}
+	if err := service.ApproveNode(ctx, registration.RegistrationID, now); err != nil {
+		t.Fatalf("approve node: %v", err)
+	}
+	var expiresAt sql.NullTime
+	if err := database.QueryRow(`SELECT registration_secret_expires_at FROM nodes WHERE id=?`, registration.RegistrationID).Scan(&expiresAt); err != nil {
+		t.Fatal(err)
+	}
+	want := now.Add(24 * time.Hour)
+	if !expiresAt.Valid || !expiresAt.Time.UTC().Equal(want) {
+		t.Fatalf("registration_secret_expires_at=%v, want 注入 now+24h=%v", expiresAt, want)
+	}
+	// 落库形态必须仍可被 SQLite datetime() 解析（cluster_auth 的注册密钥
+	// 到期门用 datetime(...) 比较；解析失败会静默按过期拒绝）。
+	var parsed sql.NullString
+	if err := database.QueryRow(`SELECT datetime(registration_secret_expires_at) FROM nodes WHERE id=?`, registration.RegistrationID).Scan(&parsed); err != nil {
+		t.Fatal(err)
+	}
+	if !parsed.Valid {
+		t.Fatalf("datetime(registration_secret_expires_at) 解析失败（值 %v）——认证门会静默拒绝注册密钥", expiresAt)
 	}
 }

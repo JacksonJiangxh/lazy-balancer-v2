@@ -1,4 +1,4 @@
-// 用户名/密码前端策略单源验收（历史问题-01/02）：
+// 用户名/密码前端策略单源验收
 //   A. 字符集与长度口径与后端 validateUsernamePolicy / validatePasswordPolicy 对齐
 //   B. 三处密码入口 + 用户管理/首次设置用户名均消费同一模块（不得各写正则/文案）
 //
@@ -15,7 +15,7 @@ import {
   PASSWORD_LENGTH_MESSAGE,
   PASSWORD_CHARSET_MESSAGE,
 } from '../src/utils/credentials.ts'
-import { source } from './_helpers.ts'
+import { section, source } from './_helpers.ts'
 
 test('A 用户名字符集：小写字母开头 + 小写字母/数字，长度 3-50', () => {
   assert.equal(validateUsername(''), null, '空值由调用方按入口语义拦截')
@@ -59,4 +59,24 @@ test('B 三处密码入口 + 两处用户名入口均消费 credentials 单源',
   // 不得回流本地正则/长度字面量
   assert.doesNotMatch(login, /const usernamePolicyRe = \/\^\[a-z\]\[a-z0-9\]\*\$\//, '本地用户名字符集正则必须退役')
   assert.doesNotMatch(users, /密码长度8-24位，仅限数字、大小写字母和特殊字符/, '本地密码文案必须退役')
+})
+
+// 编辑态用户名前置校验必须对齐后端 usernameChanged 口径（users.go：仅在用户名
+// 实际变更时过策略，OIDC 行整体豁免）——OIDC 用户名可含 . / _ / 大写，无条件
+// 校验会把 OIDC 用户的角色编辑在 UI 层永久拦死。
+test('编辑门控：用户名校验仅创建/实际改名且非 OIDC 行执行', () => {
+  const users = source('src/views/Users.vue')
+  const submit = section(users, 'const handleSubmit = async ()', 'closeForm()')
+  assert.match(
+    submit,
+    /const usernameChanged = editingUser\.value !== null && form\.value\.username !== editingUser\.value\.username/,
+    '须按后端 usernameChanged 口径计算用户名实际变更',
+  )
+  assert.match(
+    submit,
+    /!editingUser\.value \|\| \(usernameChanged && !editingIsOIDC\.value\)/,
+    '编辑态未改名或 OIDC 行不得执行用户名策略校验',
+  )
+  // OIDC 行编辑提交仍不落 username/display_name/password（后端 400 守卫的前端镜像）
+  assert.match(submit, /username: oidcTarget \? undefined : form\.value\.username/)
 })

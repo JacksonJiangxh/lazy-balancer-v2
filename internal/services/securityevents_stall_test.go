@@ -8,7 +8,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 历史问题（2026-09-18 第三轮 UI 精修期间实证）：并发/突发请求下 coraza 审计
+// （2026-09-18 第三轮 UI 精修期间实证）：并发/突发请求下 coraza 审计
 // 追加对 2s tick 呈现「暂时性中段残缺」（写入进行中的字节，随后补全；实测审计
 // 文件最终 192/192 行全部合法）。旧重同步分支「找到下一文档头即跳过」把跳过
 // 窗口内随后补全的文档永久丢弃（19 条审计事务仅 11 条落库）。修复语义：解码
@@ -38,7 +38,7 @@ func stallFixtureBytes(doc2, doc3 string) []byte {
 
 func stallSetup(t *testing.T) (logPath, offsetPath string) {
 	t.Helper()
-	// 历史修复（历史）：保存/还原全局库指针并 Close——裸 Initialize
+	// 保存/还原全局库指针并 Close——裸 Initialize
 	// 会覆盖包级 DB/MetricsDB/AuditDB 且不关旧句柄，后续用例可能静默跑到已删除
 	// 临时目录并用陈旧库（顺序依赖/假绿）。
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB

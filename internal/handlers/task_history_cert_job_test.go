@@ -1,0 +1,129 @@
+package handlers
+
+// 任务历史 API 的 cert-job:<id> 分支：证书动态行无引擎 task_runs 记录，历史即
+// cert_jobs 行本身——按 RunRecord 同形返回（started_at=created_at、
+// finished_at=updated_at、duration=两者差、trigger=queue），时间戳由 UTC 转
+// 配置时区墙串；不存在/非法的 id 走与相邻分支一致的错误口径而非 500。
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"testing"
+
+	"github.com/gin-gonic/gin"
+
+	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/services"
+)
+
+type taskHistoryResponse struct {
+	Code int `json:"code"`
+	Data struct {
+		Runs []struct {
+			ID         int64  `json:"id"`
+			TaskID     string `json:"task_id"`
+			Family     string `json:"family"`
+			Trigger    string `json:"trigger"`
+			Status     string `json:"status"`
+			Message    string `json:"message"`
+			StartedAt  string `json:"started_at"`
+			FinishedAt string `json:"finished_at"`
+			DurationMs int64  `json:"duration_ms"`
+		} `json:"runs"`
+	} `json:"data"`
+}
+
+func getTaskHistory(t *testing.T, handler gin.HandlerFunc, taskID string) (*httptest.ResponseRecorder, taskHistoryResponse) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/system/tasks/:id/history", handler)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/system/tasks/"+taskID+"/history", nil))
+	var response taskHistoryResponse
+	if recorder.Code == http.StatusOK {
+		if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+			t.Fatalf("decode response: %v body=%s", err, recorder.Body.String())
+		}
+	}
+	return recorder, response
+}
+
+func TestGetSystemTaskHistory_mapsCertJobRowToRunRecord(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	if _, err := services.ConfigureLocation("Asia/Shanghai"); err != nil {
+		t.Fatalf("configure location: %v", err)
+	}
+	t.Cleanup(func() { _, _ = services.ConfigureLocation("Asia/Shanghai") })
+
+	// Given 一条已签发的证书任务行（UTC 时间戳）。
+	result, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, message, created_at, updated_at)
+		VALUES ('lb_hist','hist.example.test','issued','签发完成','2026-10-20T04:00:00Z','2026-10-20T04:00:05Z')`)
+	if err != nil {
+		t.Fatalf("seed cert job: %v", err)
+	}
+	jobID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// When
+	recorder, response := getTaskHistory(t, h.GetSystemTaskHistory, "cert-job:"+strconv.FormatInt(jobID, 10))
+
+	// Then 单行映射为 RunRecord 同形（时区墙串、duration、trigger=queue）。
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
+	}
+	if len(response.Data.Runs) != 1 {
+		t.Fatalf("runs=%d, want 1（cert_jobs 行本身）", len(response.Data.Runs))
+	}
+	run := response.Data.Runs[0]
+	if run.TaskID != "cert-job:"+strconv.FormatInt(jobID, 10) || run.Family != "cert-job" || run.Trigger != "queue" {
+		t.Fatalf("run identity=(%q,%q,%q), want cert-job/queue", run.TaskID, run.Family, run.Trigger)
+	}
+	if run.Status != "issued" || run.Message != "签发完成" || run.ID != jobID {
+		t.Fatalf("run=(%+v), want status/message/id 取自 cert_jobs 行", run)
+	}
+	if run.StartedAt != "2026-10-20 12:00:00" || run.FinishedAt != "2026-10-20 12:00:05" {
+		t.Fatalf("时间墙串=(%q,%q), want 配置时区(+8)串", run.StartedAt, run.FinishedAt)
+	}
+	if run.DurationMs != 5000 {
+		t.Fatalf("duration_ms=%d, want 5000", run.DurationMs)
+	}
+}
+
+func TestGetSystemTaskHistory_certJobMissingAndInvalidIDs(t *testing.T) {
+	h := newBackupTestHandlers(t)
+
+	// Then 不存在的 job → 与相邻「任务不存在」分支同口径 404（不是 500/空 200）。
+	recorder, _ := getTaskHistory(t, h.GetSystemTaskHistory, "cert-job:999999")
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("不存在 job status=%d body=%s, want 404", recorder.Code, recorder.Body.String())
+	}
+
+	// Then 非法 id → 400。
+	recorder, _ = getTaskHistory(t, h.GetSystemTaskHistory, "cert-job:not-a-number")
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("非法 job id status=%d body=%s, want 400", recorder.Code, recorder.Body.String())
+	}
+
+	// 回归形状：时间戳缺失时仍返回该行，duration=0 且时间列留空。
+	result, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, message, created_at, updated_at)
+		VALUES ('lb_hist2','hist2.example.test','queued','', NULL, NULL)`)
+	if err != nil {
+		t.Fatalf("seed cert job without timestamps: %v", err)
+	}
+	jobID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder, response := getTaskHistory(t, h.GetSystemTaskHistory, "cert-job:"+strconv.FormatInt(jobID, 10))
+	if recorder.Code != http.StatusOK || len(response.Data.Runs) != 1 {
+		t.Fatalf("缺失时间戳行 status=%d runs=%d, want 200/1", recorder.Code, len(response.Data.Runs))
+	}
+	if run := response.Data.Runs[0]; run.DurationMs != 0 || run.StartedAt != "" || run.FinishedAt != "" {
+		t.Fatalf("缺失时间戳形态=(%+v), want 空时间列与 duration=0", run)
+	}
+}

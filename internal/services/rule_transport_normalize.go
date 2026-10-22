@@ -21,11 +21,11 @@ import (
 )
 
 // normalizeRuleForTransport 规则传输归一（单一事实源）：
-// ① body 上限钳 [0,4096]（历史问题）；
-// ② TCP+TLS 死形态清除（历史问题）；
-// ③ TCP 行 HTTP 专属字段归零（历史修复 同族，2026-10-11 裁定并入导出侧；
+// ① body 上限钳 [0,4096]；
+// ② TCP+TLS 死形态清除；
+// ③ TCP 行 HTTP 专属字段归零（含代理超时族、自定义路由、动态上游与
 //
-//	补 health_check_host）。
+//	cookie 策略；health_check_host 同族清零）。
 //
 // ④ 健康检查族/tcp_try_interval 值型列回填（库值唯一真相批 1+2，2026-10-14
 //
@@ -36,7 +36,7 @@ import (
 // 调用方：snapshotRules（主端导出）、insertSnapshotRules（从端落库）、
 // 备份导入后置归一——三面同构是 rules 节哈希主从相等的不变量基础。
 //
-// 历史修复（历史裁定，采用头注声明防重报）：传输族刻意窄于保存族
+// 传输族刻意窄于保存族
 // （rules.go 保存/更新路径的 TCP 零值化清单还含 tls_source/acme_config_id/
 // ca_provider_id/tls_http_redirect 与 stage 拦截页 4 列）——传输/导入/迁移产生
 // 的 TCP 行残留这些列已推演为惰性无害：全部 ACME 消费方（签发/续签/证书
@@ -76,7 +76,7 @@ func normalizeRuleForTransport(rule *models.LbRule) {
 		// 「没有就都应该没有」：主端存储、导出、从端落库三面全零。
 		rule.HostHeader = ""
 		rule.HealthCheckPath = ""
-		// 历史问题：健康检查域名同为 HTTP-only（TCP 探针走端口）——
+		// 健康检查域名同为 HTTP-only（TCP 探针走端口）——
 		// 保存族（tcpDeadFieldReset）已清，传输族补齐，避免主从/导入面分叉。
 		rule.HealthCheckHost = ""
 		rule.EnableCompress = false
@@ -87,5 +87,26 @@ func normalizeRuleForTransport(rule *models.LbRule) {
 		// NTLM 兼容仅 HTTP 语义（2026-10-12）——与保存族/迁移族同一归一口径。
 		rule.NTLMCompatible = 0
 		rule.UpstreamForceHTTP1 = 0
+		rule.ProxyDialTimeout = 0
+		rule.ProxyResponseHeaderTimeout = 0
+		rule.ProxyReadTimeout = 0
+		rule.ProxyWriteTimeout = 0
+		rule.ProxyStreamTimeout = 0
+		rule.ProxyFlushInterval = 0
+		rule.ProxyStreamCloseDelay = 0
+		rule.CustomRoutesEnabled = false
+		rule.DynamicDNS = false
+		if rule.Strategy == "cookie" {
+			rule.Strategy = "weighted_round_robin"
+		}
 	}
+}
+
+// normalizeUpstreamForTransport 上游传输归一（单一事实源）：upstreams.dynamic_dns
+// 是废弃列（渲染只读规则级 DynamicDNS，保存/复制/集群落库写侧恒 0）。主端导出
+// 若直读存量 1 值，快照 canonical 与从端落库（恒 0）不同形——rules 节哈希每次
+// 主端 bump 恒不等，每版本一轮全量重拉。导出与从端本地重建共用本函数，
+// 三面（主端导出/从端落库/从端重建）同 0。
+func normalizeUpstreamForTransport(upstream *models.Upstream) {
+	upstream.DynamicDNS = false
 }

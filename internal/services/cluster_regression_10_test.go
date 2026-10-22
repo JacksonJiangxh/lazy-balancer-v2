@@ -149,7 +149,7 @@ func TestClusterService_Snapshot_accepts_legacy_empty_value_ownership(t *testing
 
 func TestValidateSnapshotACMEState_missingACMESectionRejected(t *testing.T) {
 	// Given：缺 ACME 区段的快照。生产仅 v3 可达（verifiedSnapshotIntegrity
-	// 先按 schema 拒掉过旧/过新），历史修复 移除 v2 放行死分支后统一硬拒。
+	// 先按 schema 拒掉过旧/过新），移除 v2 放行死分支后统一硬拒。
 	v3 := models.ClusterSnapshot{SchemaVersion: 3}
 	v2 := models.ClusterSnapshot{SchemaVersion: 2}
 
@@ -191,7 +191,7 @@ func TestValidateSnapshotACMEState_acceptsDefaultCAAndDisabledTLSRule(t *testing
 }
 
 func TestValidateSnapshotACMEState_toleratesUnsetOrDanglingConfigWithWarning(t *testing.T) {
-	// 历史修复(b)：acme_config_id=0 / 悬挂配置引用的规则在主节点是「单规则
+	// acme_config_id=0 / 悬挂配置引用的规则在主节点是「单规则
 	// 损坏」状态（issuer 按单任务失败），整包拒绝会让一条可经 API/导入产生的
 	// 坏规则瘫痪全部从节点同步——对齐 verifySnapshotConsistency 的 fail-open
 	// 哲学，逐条跳过+warn，主节点修复后随后续同步自愈。
@@ -215,8 +215,8 @@ func TestValidateSnapshotACMEState_toleratesUnsetOrDanglingConfigWithWarning(t *
 }
 
 func TestValidateSnapshotACMEState_toleratesDanglingCAProviderWithWarning(t *testing.T) {
-	// 历史修复 + 历史修复（从节点侧）：rules 循环的 ca_provider 分支与 certs 循环
-	// 仍对悬挂 ca_provider_id 整包硬拒——重新引入 历史修复 已消灭的
+	// + （从节点侧）：rules 循环的 ca_provider 分支与 certs 循环
+	// 仍对悬挂 ca_provider_id 整包硬拒——重新引入已消灭的
 	// 「一条坏规则/坏证书瘫痪全部从节点同步」失败模式。对齐 fail-open：
 	// 逐条 skip+warn，主节点修复后随后续同步自愈。
 	// Given：规则与证书各携带一个悬挂 ca_provider_id（providers 集合为空）
@@ -239,7 +239,7 @@ func TestValidateSnapshotACMEState_toleratesDanglingCAProviderWithWarning(t *tes
 
 func TestValidateSnapshotACMEState_toleratesBrokenProviderAndConfigRowsWithWarning(t *testing.T) {
 	// 仅 v1 导入残留/直改库可达）整包硬拒会让 rules/users 等无关节同步一并
-	// 瘫痪——与 历史修复 同型 fail-open：逐行 warn+continue，坏行
+	// 瘫痪——与同型 fail-open：逐行 warn+continue，坏行
 	// 照常镜像落库，主节点修复后随后续同步自愈。
 	// Given：一条空字段 provider 行 + 一条空字段 config 行
 	snapshot := models.ClusterSnapshot{SchemaVersion: 3, ACME: &models.ClusterACMEState{
@@ -506,7 +506,7 @@ func TestSnapshotOwnershipHash_realReadErrorStillFails(t *testing.T) {
 	}
 }
 
-// 历史修复 回归：损坏文件的快照侧回退告警必须经 60s 限流（throttledAuditFailureLogf）。
+// 回归：损坏文件的快照侧回退告警必须经 60s 限流（throttledAuditFailureLogf）。
 // 该读取点在每次全量快照构建（主节点 ticker + 每个从节点 Pull）都会执行，坏文件
 // 在 store 侧被实际隔离前会持续存在——无限流时每个周期都刷一条 warn。
 func TestSnapshotOwnershipHash_corruptFileWarnThrottled(t *testing.T) {

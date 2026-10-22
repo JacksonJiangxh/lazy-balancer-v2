@@ -29,7 +29,7 @@ const (
 	CRSStatusReloading   CRSUpdateStatus = "reloading"
 	CRSStatusSuccess     CRSUpdateStatus = "success"
 	CRSStatusFailed      CRSUpdateStatus = "failed"
-	// CRSStatusSkipped 历史问题-05（历史）：起点角色复查中止的正常语义
+	// CRSStatusSkipped：起点角色复查中止的正常语义
 	// 终态——对齐威胁族 lastTaskOutcome=skipped（从节点中止非故障）。
 	CRSStatusSkipped CRSUpdateStatus = "skipped"
 	// CRSStatusCancelled 用户主动取消：与 task_runs cancelled 同终态，
@@ -79,13 +79,13 @@ type CRSUpdateManager struct {
 	hasRuleCount bool
 
 	// overridesBakCreated 标记本次运行已在迁移分支创建 zz-user-overrides.conf.bak
-	// （历史问题 1.1）：restoreBackup 只消费本运行创建的 bak——三-1 跨运行保全的恢复
+	// restoreBackup 只消费本运行创建的 bak——三-1 跨运行保全的恢复
 	// 副本在下次成功更新前始终可用，三-2 也不会把 overrides 还原到两版本之前。
 	// 每次 downloadAndInstall 开始时重置，迁移分支创建成功后置位。
 	overridesBakCreated bool
 
 	// rulesBakCreated/setupBakCreated/stockBakCreated 同口径「本运行创建」标记
-	// （历史问题，历史，镜像 overridesBakCreated 的 历史问题 1.1）：上一运行
+	// （镜像 overridesBakCreated 的 1.1）：上一运行
 	// 在「备份已建→清理前」崩溃会残留完整的 rules/setup/stock .bak；本运行在
 	// 到达备份点前失败（如下载失败走 fail/cancel(..., true)）时 restoreBackup
 	// 不得消费这些陈旧备份覆盖 live——它们是崩溃现场的唯一排障/恢复素材
@@ -147,7 +147,7 @@ func ResetCRSUpdateManagerForTest() {
 
 // SetCRSAutoUpdate toggles the auto-update flag without touching the stored
 // version; a missing row is seeded with the image-bundled version.
-// 历史问题（用户报告）：开启时与 IP2Region 的 SetIP2RegionAutoUpdate 同步写
+// （用户报告）：开启时与 IP2Region 的 SetIP2RegionAutoUpdate 同步写
 // next_update（关闭清空）——开关动作即重排程（v2.3.x 起写下一个排程槽，
 // 原 now+24h）。此前只翻标志，开启自动更新后「下次更新」一直显示 —，
 // 直到调度器下一次小时级 tick 预写才有值（手动更新成功也不写，见 run()
@@ -226,7 +226,7 @@ func (m *CRSUpdateManager) RefreshLatestAsync() {
 	}()
 }
 
-// readCurrentCRSVersion 是版本读取的唯一真源（历史问题）：区分
+// readCurrentCRSVersion 是版本读取的唯一真源：区分
 // 「行缺失/空值（首装→镜像捆绑版本，与 ensureCRSVersionRow 播种同口径）」与
 // 「读失败（返回错误，由调用方 fail-visible）」。此前二者共用一处回落逻辑，
 // 版本行瞬时读取失败被当作 bundled 参与「已是最新」短路——远端 tag 恰等于
@@ -263,12 +263,12 @@ func currentCRSVersion() string {
 var crsCurrentVersionForRun = readCurrentCRSVersion
 
 // StartUpdate begins an async update; only one may run at a time. 返回本次 run
-// 的完成通道（历史修复）：调度器 rearm 须等待该捕获通道而非回读现行 m.runDone
+// 的完成通道：调度器 rearm 须等待该捕获通道而非回读现行 m.runDone
 // ——StartUpdate 返回与 rearm 取锁之间存在微秒级窗口，快失败的 auto run 被手动
 // 更新插队覆盖 m.runDone 时，rearm 会错等手动 run 的完成并按其终态跳过 auto 的
 // 失败退避重写。手动调用方可忽略返回通道。
-// rc 非 nil 且 RunID>0=引擎已预插 task_runs 行（历史问题-④ 单写方：族体跳过自记，
-// 行终态由引擎 finishRun 按 Run 返回错误落）；Operator 供审计归人（历史问题-1）。
+// rc 非 nil 且 RunID>0=引擎已预插 task_runs 行（-④ 单写方：族体跳过自记，
+// 行终态由引擎 finishRun 按 Run 返回错误落）；Operator 供审计归人。
 func (m *CRSUpdateManager) StartUpdate(trigger string, rc *taskengine.RunContext) (chan struct{}, error) {
 	m.mu.Lock()
 	if m.running {
@@ -278,7 +278,7 @@ func (m *CRSUpdateManager) StartUpdate(trigger string, rc *taskengine.RunContext
 	m.running = true
 	m.runDone = make(chan struct{})
 	m.state = crsTaskState{status: CRSStatusChecking, trigger: trigger, startedAt: time.Now().UTC()}
-	// 历史问题：可取消 ctx 与 running 在同一临界区登记——StartUpdate 返回后
+	// 可取消 ctx 与 running 在同一临界区登记——StartUpdate 返回后
 	// 立刻 CancelRunning（任务引擎 CancelHook／前端连点／自动化脚本）必须命中，
 	// 不得因 run goroutine 尚未执行而读到 runCancel==nil 静默返回 false。
 	runCtx, runCancel := context.WithCancel(updateRunBaseContext(rc))
@@ -294,7 +294,7 @@ func (m *CRSUpdateManager) StartUpdate(trigger string, rc *taskengine.RunContext
 	return done, nil
 }
 
-// updateRunBaseContext 任务运行上下文基座（CRS/IP2Region 同源）：历史问题-01
+// updateRunBaseContext 任务运行上下文基座（CRS/IP2Region 同源）
 // 引擎 demote 中止（SetRole 取消在途 Scheduled）与手动取消同通道传播；
 // nil rc（测试/内部路径）回退 Background 保持旧语义。
 func updateRunBaseContext(rc *taskengine.RunContext) context.Context {
@@ -362,10 +362,10 @@ func (m *CRSUpdateManager) runWithContext(runCtx context.Context, trigger string
 		operator = rc.Operator
 	}
 	// 任务自记审计：手动/自动同一审计（用户裁定 2026-09-29）。manager 内联
-	// 结果审计已撤（历史问题-2 审计单记——曾是 defer+内联双记）。
+	// 结果审计已撤（审计单记——曾是 defer+内联双记）。
 	defer func() {
 		snap := m.StatusSnapshot()
-		// 状态中文归一（历史问题-08b：曾混英文 status token，与 threat 族口径不一）
+		// 状态中文归一（曾混英文 status token，与 threat 族口径不一）
 		statusLabel := map[string]string{
 			string(CRSStatusSuccess): "成功", string(CRSStatusFailed): "失败",
 			string(CRSStatusSkipped): "跳过", string(CRSStatusCancelled): "已取消",
@@ -385,31 +385,31 @@ func (m *CRSUpdateManager) runWithContext(runCtx context.Context, trigger string
 		}
 	}()
 
-	// 历史问题 单写方：task_runs 由引擎统一记录（manual 预插/ SilentProbes 有工作标记后插入）
+	// 单写方：task_runs 由引擎统一记录（manual 预插/ SilentProbes 有工作标记后插入）
 	// 族体零 RecordRun 调用。
-	// 历史问题-01（历史）：runCtx 派生自 rc.Ctx——引擎 demote 中止（SetRole
+	// runCtx 派生自 rc.Ctx——引擎 demote 中止（SetRole
 	// 取消在途 Scheduled）与手动取消同通道传播；nil rc（测试/内部路径）回退
-	// Background 保持旧语义。：ctx 由调用方（StartUpdate/run）预建。
+	// Background 保持旧语义。ctx 由调用方（StartUpdate/run）预建。
 	defer func() {
 		m.mu.Lock()
 		m.running = false
 		m.mu.Unlock()
 	}()
 
-	// 起点角色复查（历史问题）：调度器 tick 的 is_master 守卫与更新启动之间存在
+	// 起点角色复查：调度器 tick 的 is_master 守卫与更新启动之间存在
 	// demote 竞态窗口——tick 越过守卫、更新刚发出时节点被降级，从节点继续执行
 	// 会写本地版本行、替换规则树并 reload，瞬时打破只读不变量。
-	// 历史问题（历史）：NULL 兜底归一为 1，与 IsMaster/readonly 写闸/
-	// 调度器 tick 的 COALESCE(is_master,1) 同口径（历史 NULL 视为主节点）。
+	// NULL 兜底归一为 1，与 IsMaster/readonly 写闸/
+	// 调度器 tick 的 COALESCE(is_master,1) 同口径（NULL 视为主节点）。
 	if isMaster, roleErr := RoleOf(context.Background(), db.DB); roleErr != nil {
 		// 角色读取失败（DB 瞬断/脏行）≠从节点——按失败落定（task_runs/任务
-		// 监控可见），不得静默跳过（历史问题：err!=nil||!isMaster 把 DB 故障
+		// 监控可见），不得静默跳过（err!=nil||!isMaster 把 DB 故障
 		// 当从节点）。
 		m.fail(fmt.Errorf("角色读取失败，无法判定本节点是否主节点，已中止 CRS 更新: %w", roleErr), false)
 		m.advanceSlotIfAuto(trigger)
 		return
 	} else if !isMaster {
-		// 历史问题-05（历史）：从节点中止是正常跳过语义，对齐威胁族——
+		// 从节点中止是正常跳过语义，对齐威胁族——
 		// 落 skipped 终态、审计「更新跳过」，不再记「更新失败」。
 		m.syncInstalledVersionToState()
 		m.setStage(CRSStatusSkipped, "当前节点为从节点，终止 CRS 更新")
@@ -440,7 +440,7 @@ func (m *CRSUpdateManager) runWithContext(runCtx context.Context, trigger string
 		WriteCRSUpdateLog("WARN", "retry", fmt.Sprintf("查询 CRS 最新版本失败: %v；等待 %s 重试，第 %d 次，共 %d 次", rerr, wait, nextAttempt, updateMaxAttempts))
 	})
 	if err != nil {
-		// 历史问题-01：runCtx 取消且已非主节点=demote 在途中止——落 skipped
+		// runCtx 取消且已非主节点=demote 在途中止——落 skipped
 		// （与起点角色复查同语义），不走 fail（从节点中止非故障、不 restore）。
 		if master, known := updateRunRole(); runCtx.Err() != nil && known && !master {
 			m.syncInstalledVersionToState()
@@ -457,12 +457,12 @@ func (m *CRSUpdateManager) runWithContext(runCtx context.Context, trigger string
 	}
 	WriteCRSUpdateLog("INFO", string(CRSStatusChecking), fmt.Sprintf("最新版本 %s，当前版本 %s", tag, currentCRSVersion()))
 
-	// 历史修复(历史问题):tag < current 时也跳过(防静默降级)——
+	// tag < current 时也跳过(防静默降级)——
 	// 此前仅精确相等跳过,捆绑版本 > 远端最新(如上游 release 被删/转 pre)时
 	// 无条件 downloadAndInstall 降级为更旧树,与 UI IsLatest(<=0 即最新)语义相悖。
-	// 历史问题：精确相等短路（与格式无关）——相同版本即「已是最新」，不再依赖
+	// 精确相等短路（与格式无关）——相同版本即「已是最新」，不再依赖
 	// 版本解析；不同且不可比较显式 fail-visible（见下方 else-if）。
-	// 历史问题：读版本行失败（非「行缺失」）不再回落 bundled 参与短路——
+	// 读版本行失败（非「行缺失」）不再回落 bundled 参与短路——
 	// 以 bundled 参与「已是最新」判定会在远端 tag 恰等于 bundled 时静默跳过，
 	// 且掩盖瞬时 DB 故障；此处显式失败（下一排程槽重试）。
 	currentVersion, verErr := crsCurrentVersionForRun()
@@ -516,7 +516,7 @@ func (m *CRSUpdateManager) runWithContext(runCtx context.Context, trigger string
 		installErr = runCtx.Err()
 	}
 	if installErr != nil {
-		// 历史问题-01：同上方 fetch 分支——demote 在途中止落 skipped（不 restore：
+		// 同上方 fetch 分支——demote 在途中止落 skipped（不 restore
 		// 从节点不回滚不 reload，保持只读不变量）。
 		if master, known := updateRunRole(); runCtx.Err() != nil && known && !master {
 			m.syncInstalledVersionToState()
@@ -544,7 +544,7 @@ func (m *CRSUpdateManager) runWithContext(runCtx context.Context, trigger string
 	m.state.finishedAt = time.Now().UTC()
 	m.mu.Unlock()
 	WriteCRSUpdateLog("INFO", string(CRSStatusSuccess), fmt.Sprintf("CRS 已更新到 %s", tag))
-	// 复审裁定 3：清理 历史修复 之前版本残留在 live 目录的瞬态工件（仅更新成功后执行）
+	// 复审裁定 3：清理之前版本残留在 live 目录的瞬态工件（仅更新成功后执行）
 	m.cleanupLegacyCRSTransient()
 }
 
@@ -581,7 +581,7 @@ func advanceVersionSlotIfDue(table string) {
 func (m *CRSUpdateManager) restoreAfterInstallError(restore bool) {
 	if restore {
 		m.restoreBackup()
-		// 历史修复(历史):reloader nil 守卫(与 crsinstall.go 的
+		// reloader nil 守卫(与 crsinstall.go 的
 		// swapCRSTreeFromStaging 内守卫同口径)——
 		// 测试注入 nil reloader 时 panic。
 		if m.reloader != nil {
@@ -594,7 +594,7 @@ func (m *CRSUpdateManager) restoreAfterInstallError(restore bool) {
 
 // cancel 记录用户主动取消：安装段已发生树变更时沿用失败路径的回滚/重载
 // 安全编舞，但终态不是 failed，连续失败计数不增加。
-// 历史问题：若取消发生在树交换之后，downloadAndInstall 已在返回前走
+// 若取消发生在树交换之后，downloadAndInstall 已在返回前走
 // rollbackAfterReloadFailure 同代回滚（树+VERSION 标记+DB 版本行）——此处
 // restoreAfterInstallError 的 restoreBackup 是幂等兜底（本运行备份已被回滚
 // 消费），reloader 负责让 Caddy 追上还原后的旧树。
@@ -633,7 +633,7 @@ func (m *CRSUpdateManager) cancel(cause error, restore bool) {
 func (m *CRSUpdateManager) fail(cause error, restore bool) {
 	m.restoreAfterInstallError(restore)
 	// 连续失败计数 +1（失败趋势可观测；操作审计由 run 的 defer 单记——
-	// 历史问题-2 收敛后内联首败审计已撤）。
+	// 收敛后内联首败审计已撤）。
 	if _, err := db.DB.Exec(
 		"UPDATE security_crs_version SET update_status='failed', message=?, finished_at=datetime('now'), consecutive_failures=consecutive_failures+1 WHERE id=1",
 		cause.Error(),
@@ -649,10 +649,10 @@ func (m *CRSUpdateManager) fail(cause error, restore bool) {
 	WriteCRSUpdateLog("ERROR", string(CRSStatusFailed), cause.Error())
 }
 
-// downloadTarballLogged 包装下载 seam 写更新日志（历史问题）：开始行由下载函数的
+// downloadTarballLogged 包装下载 seam 写更新日志：开始行由下载函数的
 // (0, total) 开始信号触发，携带完整来源 URL（含 GitHub 加速代理前缀，代理
 // 取值经 github_proxy_url 白名单，历史硬编码 ghfast.top 已废弃），
-// 历史修复 已知时附预计大小；进度行经节流闭包按 10%（总量已知）/5MB
+// 已知时附预计大小；进度行经节流闭包按 10%（总量已知）/5MB
 // （未知）步进；完成行记录落盘字节与耗时。stage 沿用下载阶段的 downloading。
 func (m *CRSUpdateManager) downloadTarballLogged(ctx context.Context, tag, destPath string) error {
 	logLine := func(message string) { WriteCRSUpdateLog("INFO", string(CRSStatusDownloading), message) }

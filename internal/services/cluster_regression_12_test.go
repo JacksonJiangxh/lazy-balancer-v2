@@ -1,8 +1,8 @@
 package services
 
-// 历史修复 同步包声明哈希非空但未携带内容 → 拒绝应用(主端瞬态 IO 下轮自愈);
-// 历史修复 ReportNode 落库前 last_sync_error 与从端写侧同口径截断(≤512B);
-// 历史修复 ApproveNode 重复审批(非 pending)→ 409 语义错误而非 404。
+// 同步包声明哈希非空但未携带内容 → 拒绝应用(主端瞬态 IO 下轮自愈);
+// ReportNode 落库前 last_sync_error 与从端写侧同口径截断(≤512B);
+// ApproveNode 重复审批(非 pending)→ 409 语义错误而非 404。
 
 import (
 	"context"
@@ -69,10 +69,10 @@ func TestApproveNode_conflictVsNotFound(t *testing.T) {
 	svc, database := newClusterTestService(t)
 	nodeID := insertApprovedClusterNode(t, database, "slave-approved")
 
-	if err := svc.ApproveNode(context.Background(), nodeID); !errors.Is(err, ErrNodeNotPending) {
+	if err := svc.ApproveNode(context.Background(), nodeID, time.Now()); !errors.Is(err, ErrNodeNotPending) {
 		t.Fatalf("re-approve must return ErrNodeNotPending, got %v", err)
 	}
-	if err := svc.ApproveNode(context.Background(), 99999); !errors.Is(err, ErrNodeNotFound) {
+	if err := svc.ApproveNode(context.Background(), 99999, time.Now()); !errors.Is(err, ErrNodeNotFound) {
 		t.Fatalf("missing node must return ErrNodeNotFound, got %v", err)
 	}
 }

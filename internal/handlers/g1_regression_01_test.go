@@ -1,6 +1,6 @@
 package handlers
 
-// 历史修复(tcp→http 回切恢复 dns_family 默认)。
+// (tcp→http 回切恢复 dns_family 默认)。
 
 import (
 	"net/http"
@@ -13,7 +13,7 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// 限流(overviewmetrics.go:83-90 限流卡片按 code=429 计数),WAF 拦截页 429
+// 限流(scrapeRateLimitBlocksUncached 限流卡片按 code=429 计数),WAF 拦截页 429
 // 会混入限流指标口径。
 func TestValidateSecurityPolicyEnums_rejectsBlockStatus429(t *testing.T) {
 	// Given 合法基线枚举(mode/ip_acl_mode/geoip_mode 均合法)
@@ -34,8 +34,8 @@ func TestValidateSecurityPolicyEnums_rejectsBlockStatus429(t *testing.T) {
 	}
 }
 
-// CreateRule :758-760 默认同口径;切 TCP 清零在 :1337,不补恢复会让存量 ”
-// 直接落库,DB 终态与创建态分叉)。
+// CreateRule 对 HTTP 新规则补 ipv4 默认;UpdateRule 切 TCP 时清零
+// dns_family,不补恢复会让存量空串直接落库,DB 终态与创建态分叉)。
 func TestProtocolSwitchBackToHTTPRestoresDNSFamily(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
 	gin.SetMode(gin.TestMode)

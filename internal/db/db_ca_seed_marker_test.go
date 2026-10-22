@@ -1,6 +1,6 @@
 package db
 
-// 历史问题（历史）：CA 提供商播种必须是一次性的（marker 门）——此前
+// CA 提供商播种必须是一次性的（marker 门）——此前
 // 「表空即播种」每次启动评估，导入/集群快照清空 ca_providers 后重启会复活
 // ZeroSSL/LE 并覆盖 default_ca_provider_id，与「删除即不存在」相悖。
 

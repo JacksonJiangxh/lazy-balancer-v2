@@ -2,7 +2,7 @@ package handlers
 
 // 对 security_ip_lists 全量替换（DELETE 全表+插备份行），但内存 autobanWindows
 // 保留旧计数桶：还原旧备份后 ≤1 tick 内零新流量重封已被「替换掉」的 IP（与
-// 「删除即解封」同型撤销，历史修复 两接线点不覆盖导入面）。
+// 「删除即解封」同型撤销，两接线点不覆盖导入面）。
 //
 // 修复口径（Ruling，2026-10-15 主审裁定）：导入 commit 成功后
 // services.ResetAutobanCounters 整体清桶，而非按名单差集 AutobanForgetIPs——
@@ -98,7 +98,7 @@ func TestImportConfigBackup_resetsAutobanCountersOnListsReplacement(t *testing.T
 		t.Fatalf("import status=%d body=%s, want 200", response.Code, response.Body.String())
 	}
 
-	// 直接断言：导入 commit 后计数桶清零（历史修复 接线点）
+	// 直接断言：导入 commit 后计数桶清零
 	if got := services.AutobanTrackedIPs(); got != 0 {
 		t.Fatalf("导入 commit 后 autoban 计数桶=%d, want 0（备份导入面未接清桶：还原旧备份后零新流量 ≤1 tick 重封）", got)
 	}

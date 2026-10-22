@@ -5,6 +5,7 @@ package handlers
 // 禁用拒绝/同邮箱不绑定/JWT auth_method+pwd_ver/MFA 解耦守卫矩阵。
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -15,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -44,7 +46,7 @@ type mockIdP struct {
 	// usePref/prefUsername:覆盖 id_token 的 preferred_username(测空白用户名形状)
 	usePref      bool
 	prefUsername string
-	// claimName:覆盖 id_token 的 name（历史修复：重复登录刷新显示名）
+	// claimName:覆盖 id_token 的 name
 	claimName atomic.Value
 	// nonceByChallenge:PKCE challenge → nonce——并发双登录各自 authorize 后,
 	// 令牌交换按 code_verifier 派生 challenge 回查本登录的 nonce(单登录场景
@@ -188,7 +190,7 @@ func setupOIDCTest(t *testing.T, idp *mockIdP) (*gin.Engine, *Handlers) {
 	}
 	cfg := &config.Config{JWTSecret: "test-secret", DataDir: dir}
 	h := &Handlers{cfg: cfg}
-	// 历史问题：流程测试无 cookie 容器，关闭 state↔浏览器绑定；绑定行为由
+	// 流程测试无 cookie 容器，关闭 state↔浏览器绑定；绑定行为由
 	// TestOIDCCallback_stateBoundToBrowser 专题覆盖。
 	oldBinding := oidcStateBindingEnabled
 	oidcStateBindingEnabled = false
@@ -361,6 +363,38 @@ func TestOIDCCallback_full_flow_jit(t *testing.T) {
 	}
 }
 
+// 回跳前 last_login 记账写失败：登录已成功（JWT 已签发）——不得 500/不得
+// 撤销登录（与密码登录「清零失败计数失败仅留痕」同族口径），但必须 warn
+// 留痕便于排障（此前静默吞错）。
+func TestOIDCCallback_lastLoginWriteFailureLoggedButLoginSucceeds(t *testing.T) {
+	idp := newMockIdP(t)
+	router, _ := setupOIDCTest(t, idp)
+	putOIDCConfig(t, router, `{"issuer":"`+idp.issuer+`","client_id":"test-client","client_secret":"s","enabled":true}`)
+	if _, err := db.DB.Exec("ALTER TABLE users RENAME COLUMN last_login TO last_login_unwritable"); err != nil {
+		t.Fatalf("break last_login column: %v", err)
+	}
+	var logBuf bytes.Buffer
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/auth/oidc/login", nil))
+	u, _ := url.Parse(rec.Header().Get("Location"))
+	code := simulateIdPIssuesCode(t, u.String())
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/auth/oidc/callback?code="+code+"&state="+u.Query().Get("state"), nil))
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status=%d body=%s, want 302（last_login 记账失败不得撤销已签发登录）", rec.Code, rec.Body.String())
+	}
+	if loc := rec.Header().Get("Location"); !strings.Contains(loc, "token=") {
+		t.Fatalf("Location=%q, want 携带 token 的成功回跳", loc)
+	}
+	if !strings.Contains(logBuf.String(), "last_login") {
+		t.Fatalf("last_login 写失败必须 warn 留痕, captured log=%q", logBuf.String())
+	}
+}
+
 // 场景 4:重复登录命中既有 OIDC 用户;禁用后拒绝。
 func TestOIDCCallback_repeat_and_disabled(t *testing.T) {
 	idp := newMockIdP(t)
@@ -398,7 +432,7 @@ func TestOIDCCallback_repeat_and_disabled(t *testing.T) {
 	if role != "admin" {
 		t.Fatalf("role must persist across logins, got %q", role)
 	}
-	// 禁用后拒绝(历史问题:浏览器导航形态,失败 302 回前端错误页；不得带 token)
+	// 禁用后拒绝（浏览器导航形态,失败 302 回前端错误页；不得带 token)
 	db.DB.Exec("UPDATE users SET is_enabled=0 WHERE auth_provider='oidc'")
 	rec := doLoginRec()
 	if rec.Code != http.StatusFound {
@@ -422,13 +456,13 @@ func TestOIDC_disabled_state(t *testing.T) {
 	}
 	rec = httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/auth/oidc/login", nil))
-	// 历史问题-2:未启用也是浏览器导航形态——302 回登录页错误位,不渲染 404 JSON
+	// 未启用也是浏览器导航形态——302 回登录页错误位,不渲染 404 JSON
 	if rec.Code != http.StatusFound || !strings.Contains(rec.Header().Get("Location"), "#/login?oidc_error=") {
 		t.Fatalf("login when disabled must 302 to login error page, got %d %s", rec.Code, rec.Header().Get("Location"))
 	}
 }
 
-// 历史问题：公开 OIDC 状态端点在配置持续损坏时不得每请求写一条 warn；
+// 公开 OIDC 状态端点在配置持续损坏时不得每请求写一条 warn；
 // 响应仍按未启用 fail-closed。
 func TestOIDCStatus_failureWarningIsThrottled(t *testing.T) {
 	idp := newMockIdP(t)
@@ -481,7 +515,7 @@ func TestOIDCCallback_bad_state_rejected(t *testing.T) {
 	}
 }
 
-// 场景 7:OAuth 配置组装(回调 URL 反代头尊重)。历史修复 后采信前提=直连
+// 场景 7:OAuth 配置组装(回调 URL 反代头尊重)。后采信前提=直连
 // 对端为回环/私网可信反代,故 RemoteAddr 置 RFC1918 地址。
 func TestOIDC_requestOrigin_forwarded(t *testing.T) {
 	idp := newMockIdP(t)
@@ -498,7 +532,7 @@ func TestOIDC_requestOrigin_forwarded(t *testing.T) {
 	}
 }
 
-// 历史修复(历史,2026-09-19 用户裁定按建议收窄):X-Forwarded-Proto/Host
+// （2026-09-19 用户裁定按建议收窄):X-Forwarded-Proto/Host
 // 仅当直连对端为回环/私网(RFC1918+ULA+链路本地)时采信;公网直连一律忽略转发
 // 头——路由器 SetTrustedProxies(nil) 意味着任何客户端都能伪造 X-Forwarded-Host,
 // 无来源校验会把回调 redirect_uri 与成功回跳基址(令牌走 fragment)指向攻击者域。
@@ -536,7 +570,39 @@ func TestOIDC_requestOrigin_trustedProxyGate(t *testing.T) {
 	}
 }
 
-// 历史修复 端到端:公网直连伪造 X-Forwarded-Host 不得污染 OIDC redirect_uri。
+// 受信反代头的 scheme 取值同样必须过白名单：X-Forwarded-Proto 只采信
+// http/https（与 oidcCookieSecure 同判据），其余取值（javascript:/data:/
+// 大小写变体之外的任意串）回退请求自身 scheme——否则回调基址与成功回跳
+// 可被拼成非 HTTP(S) scheme 的攻击面。
+func TestOIDC_requestOrigin_forwardedProtoSchemeWhitelist(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	origin := func(fwdProto string) string {
+		rec := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(rec)
+		req := httptest.NewRequest(http.MethodGet, "http://self.example.com/api/v1/auth/oidc/login", nil)
+		req.RemoteAddr = "127.0.0.1:9000" // 回环=可信反代
+		if fwdProto != "" {
+			req.Header.Set("X-Forwarded-Proto", fwdProto)
+		}
+		ctx.Request = req
+		return requestOrigin(ctx)
+	}
+	// 白名单取值照常采信。
+	if got := origin("https"); got != "https://self.example.com" {
+		t.Fatalf("https: origin=%q, want https://self.example.com", got)
+	}
+	if got := origin("http"); got != "http://self.example.com" {
+		t.Fatalf("http: origin=%q, want http://self.example.com", got)
+	}
+	// 非白名单取值一律回退默认 scheme（不采信、不拼入）。
+	for _, proto := range []string{"javascript", "javascript:alert(1)", "data", "file", "gopher", "https://evil"} {
+		if got := origin(proto); got != "http://self.example.com" {
+			t.Fatalf("proto=%q: origin=%q, want 回退 http://self.example.com", proto, got)
+		}
+	}
+}
+
+// 端到端:公网直连伪造 X-Forwarded-Host 不得污染 OIDC redirect_uri。
 func TestOIDC_login_redirectURI_ignoresForwardedFromPublicRemote(t *testing.T) {
 	idp := newMockIdP(t)
 	router, _ := setupOIDCTest(t, idp)
@@ -575,7 +641,7 @@ func TestOIDC_normalize_issuer(t *testing.T) {
 // 场景 9(v2.3.0 裁定):OIDC 用户与本地 MFA 完全解耦——
 // 启用/禁用/激活/管理员重置全 403;登录从节点两道 MFA 门豁免。
 func TestOIDCUser_mfa_decoupled(t *testing.T) {
-	// 历史问题（历史）：初始化临时库必须完整快照并在 cleanup 恢复
+	// 初始化临时库必须完整快照并在 cleanup 恢复
 	// 三个全局句柄（同 setupOIDCTest）——否则后续用例踩已关闭的临时库。
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	dir := t.TempDir()
@@ -584,7 +650,7 @@ func TestOIDCUser_mfa_decoupled(t *testing.T) {
 	}
 	cfg := &config.Config{JWTSecret: "test-secret", DataDir: dir}
 	h := &Handlers{cfg: cfg}
-	// 历史问题：流程测试无 cookie 容器，关闭 state↔浏览器绑定；绑定行为由
+	// 流程测试无 cookie 容器，关闭 state↔浏览器绑定；绑定行为由
 	// TestOIDCCallback_stateBoundToBrowser 专题覆盖。
 	oldBinding := oidcStateBindingEnabled
 	oidcStateBindingEnabled = false
@@ -630,7 +696,7 @@ func TestOIDCUser_mfa_decoupled(t *testing.T) {
 
 // 场景 10:登录从节点 MFA 门对 OIDC 会话豁免(本地用户仍要求)。
 func TestOIDCUser_slave_login_gate_exempt(t *testing.T) {
-	// 历史问题：完整快照/恢复全局 DB 句柄（同 setupOIDCTest）。
+	// 完整快照/恢复全局 DB 句柄（同 setupOIDCTest）。
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	dir := t.TempDir()
 	if err := db.Initialize(dir); err != nil {
@@ -728,7 +794,7 @@ func TestOIDCSettingsTest_verifiesClientCredentials(t *testing.T) {
 	})
 }
 
-// 场景 11(历史修复):JIT 开户并发回调竞态——双请求同窗口双双走
+// 场景 11:JIT 开户并发回调竞态——双请求同窗口双双走
 // no-rows 分支,u_oidc_identity 唯一索引保证至多一行;后到的 INSERT 撞索引后
 // 回退重 SELECT 命中既有行:两个回调都成功签发,最终恰一个身份行。
 func TestOIDCCallback_jit_race_conflict_falls_back_to_existing_row(t *testing.T) {
@@ -797,7 +863,7 @@ func TestOIDCCallback_jit_race_conflict_falls_back_to_existing_row(t *testing.T)
 }
 
 func TestIsUniqueConstraintError_coversDriverDialects(t *testing.T) {
-	// 历史修复（历史）：users.go 两处 409 分支的双段判定（modernc「UNIQUE
+	// users.go 两处 409 分支的双段判定（modernc「UNIQUE
 	// constraint failed」+ 历史驱动兼容段「already exists」）并入本 helper——
 	// 钉住两口径，防单侧回归。
 	cases := []struct {
@@ -817,7 +883,7 @@ func TestIsUniqueConstraintError_coversDriverDialects(t *testing.T) {
 	}
 }
 
-// 历史问题：正式路径（绑定开启）下 state 必须与发起登录的浏览器绑定。
+// 正式路径（绑定开启）下 state 必须与发起登录的浏览器绑定。
 // 无 cookie / 另一 jar 的 cookie 交叉提交 code+state 都必须失败（302 error=，
 // 不含 token）；同 jar 正常流程成功。
 func TestOIDCCallback_stateBoundToBrowser(t *testing.T) {
@@ -900,7 +966,7 @@ func TestOIDCCookieSecure_forwardedProtoOnlyFromTrustedProxy(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：OIDC 配置读失败/损坏时更新端点必须整体拒绝——
+// OIDC 配置读失败/损坏时更新端点必须整体拒绝——
 // 旧实现以零值 cfg 继续合并并整体写回，会清空 issuer/client_id/secret。
 func TestOIDCSettingsUpdate_readFailureDoesNotOverwriteConfig(t *testing.T) {
 	router, _ := setupOIDCTest(t, newMockIdP(t))
@@ -923,7 +989,7 @@ func TestOIDCSettingsUpdate_readFailureDoesNotOverwriteConfig(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：OIDC 配置更新/删除审计必须带字段级 delta，
+// OIDC 配置更新/删除审计必须带字段级 delta，
 // secret 只记「已更换/已清除」不落值。
 func TestOIDCSettings_auditFieldDelta(t *testing.T) {
 	idp := newMockIdP(t)

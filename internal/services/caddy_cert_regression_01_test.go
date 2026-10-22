@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-// 历史修复 回归锁定：tx 渲染路径的 ACME 证书候选可见性。
+// 回归锁定：tx 渲染路径的 ACME 证书候选可见性。
 
 // 谓词 miss 补查：事务引入/翻转的 acme 规则（已提交视图的 lb_rules 子查询将其
 // 排除——UpdateRule manual→acme、EnableRule、v2 导入新 caddy_id 三形态同根）
@@ -26,9 +26,9 @@ func TestGenerateCaddyConfig_txFallbackFillsCandidatesForPredicateMiss(t *testin
 	defer tx.Rollback()
 	// committed 库中不存在该规则（子查询必 miss）；规则与证书行均只存在于 tx。
 	if _, err := tx.ExecContext(ctx, `INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled,enable_tls,tls_source)
-		VALUES ('lb_r65_fallback','r65','http','fallback.test',443,1,1,'acme_dns');
-		INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb_r65_fallback','127.0.0.1',9443,1,1,'http');
-		INSERT INTO cert_jobs (rule_id,domain,status,cert_pem,key_pem) VALUES ('lb_r65_fallback','fallback.test','issued',?,?)`, certPEM, keyPEM); err != nil {
+		VALUES ('lb_fallback_probe','fallback-probe','http','fallback.test',443,1,1,'acme_dns');
+		INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb_fallback_probe','127.0.0.1',9443,1,1,'http');
+		INSERT INTO cert_jobs (rule_id,domain,status,cert_pem,key_pem) VALUES ('lb_fallback_probe','fallback.test','issued',?,?)`, certPEM, keyPEM); err != nil {
 		t.Fatalf("seed in tx: %v", err)
 	}
 
@@ -40,7 +40,7 @@ func TestGenerateCaddyConfig_txFallbackFillsCandidatesForPredicateMiss(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(configJSON), `"any_tag":["lb_r65_fallback"]`) {
+	if !strings.Contains(string(configJSON), `"any_tag":["lb_fallback_probe"]`) {
 		t.Fatalf("tx 渲染缺少谓词 miss 规则的 TLS 策略（any_tag 缺失）: %s", configJSON)
 	}
 }
@@ -55,9 +55,9 @@ func TestGenerateCaddyConfig_txCertSourceUsesInTxPEM(t *testing.T) {
 
 	ctx := context.Background()
 	if _, err := database.ExecContext(ctx, `INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled,enable_tls,tls_source)
-		VALUES ('lb_r65_import','r65i','http','import.test',443,1,1,'acme_dns');
-		INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb_r65_import','127.0.0.1',9444,1,1,'http');
-		INSERT INTO cert_jobs (id,rule_id,domain,status,cert_pem,key_pem) VALUES (501,'lb_r65_import','import.test','issued',?,?)`, oldPEM, oldKey); err != nil {
+		VALUES ('lb_import_probe','import-probe','http','import.test',443,1,1,'acme_dns');
+		INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb_import_probe','127.0.0.1',9444,1,1,'http');
+		INSERT INTO cert_jobs (id,rule_id,domain,status,cert_pem,key_pem) VALUES (501,'lb_import_probe','import.test','issued',?,?)`, oldPEM, oldKey); err != nil {
 		t.Fatalf("seed committed: %v", err)
 	}
 
@@ -68,7 +68,7 @@ func TestGenerateCaddyConfig_txCertSourceUsesInTxPEM(t *testing.T) {
 	defer tx.Rollback()
 	// 导入形态：同 id 重插，PEM 更新（restoreTable 保留原 id）。
 	if _, err := tx.ExecContext(ctx, `DELETE FROM cert_jobs;
-		INSERT INTO cert_jobs (id,rule_id,domain,status,cert_pem,key_pem) VALUES (501,'lb_r65_import','import.test','issued',?,?)`, newPEM, newKey); err != nil {
+		INSERT INTO cert_jobs (id,rule_id,domain,status,cert_pem,key_pem) VALUES (501,'lb_import_probe','import.test','issued',?,?)`, newPEM, newKey); err != nil {
 		t.Fatalf("rewrite in tx: %v", err)
 	}
 
@@ -76,7 +76,7 @@ func TestGenerateCaddyConfig_txCertSourceUsesInTxPEM(t *testing.T) {
 	if message, failed := generated[caddyConfigGenerationErrorKey].(string); failed {
 		t.Fatalf("generate config: %s", message)
 	}
-	certPath, _ := CertFilePaths("lb_r65_import")
+	certPath, _ := CertFilePaths("lb_import_probe")
 	content, err := os.ReadFile(certPath)
 	if err != nil {
 		t.Fatalf("read materialized cert: %v", err)

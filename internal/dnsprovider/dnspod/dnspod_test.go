@@ -259,7 +259,7 @@ func (transport *flakyTransport) RoundTrip(request *http.Request) (*http.Respons
 	}
 	transport.mu.Lock()
 	transport.attempts++
-	// 历史问题：失败注入限定 failPath 动作——创建类 5xx 不再重放（见
+	// 失败注入限定 failPath 动作——创建类 5xx 不再重放（见
 	// TestProvider_Present_does_not_replay_create_on_5xx），接线本意
 	// 「瞬时故障重试」由非创建动作承载。
 	failing := transport.attempts <= transport.failCount && strings.HasSuffix(request.URL.Path, transport.failPath)
@@ -346,7 +346,7 @@ func (transport *gatewayBodyTransport) RoundTrip(request *http.Request) (*http.R
 	}, nil
 }
 
-// 历史修复（历史）：网关返回 HTML/空体（502/503）时解码失败必须带
+// 网关返回 HTML/空体（502/503）时解码失败必须带
 // HTTP 状态码与动作名——原文案只剩「decode response: invalid character '<'…」，
 // 排障只能翻 network 日志（429/5xx 已由 retry.Transport 吸收，这里是最终失败形态）。
 func TestProvider_apiCall_decodeErrorCarriesStatusAndMethod(t *testing.T) {
@@ -423,7 +423,7 @@ func TestProvider_apiCall_truncatesErrorBody(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：Record.Create 命中 5xx 不得重放——创建响应丢失时
+// Record.Create 命中 5xx 不得重放——创建响应丢失时
 // 重试会产生无 ID 幽灵 TXT（ownership 清理只按记录 ID 删除），首个 5xx
 // 原样上抛、创建动作单次调用。
 func TestProvider_Present_does_not_replay_create_on_5xx(t *testing.T) {
@@ -568,7 +568,7 @@ func TestProvider_CleanUpValue_removes_stale_ownership_entries(t *testing.T) {
 	provider.client.Transport = transport
 	ownershipPath := filepath.Join(dataDir, "acme_dns_ownership.json")
 	// 条目带本账户摘要——「同账户的陈旧条目由后续清理回收」
-	// 是 历史修复 的既有契约（崩溃遗留的 TXT 必须能被清掉）；账户维度只保护
+	// 是 既有契约（崩溃遗留的 TXT 必须能被清掉）；账户维度只保护
 	// 无法归属当前账户的条目（见 TestProvider_CleanUpValue_dropsStaleLegacyRecordWithoutDeleting）。
 	raw := fmt.Sprintf(`{"version":1,"records":[
 		{"provider":"dnspod","zone":"example.com","fqdn":"_acme-challenge.example.com.","value":"abandoned","record_id":"100","account":%q,"created_at":%q},
@@ -612,7 +612,7 @@ func TestNew_client_timeout_covers_retry_envelope(t *testing.T) {
 	provider := New("id,token")
 
 	// Then: http.Client.Timeout spans the whole retry loop (3 attempts plus
-	// backoff/历史修复 waits capped at 30s each), so it must exceed that
+	// backoff/ waits capped at 30s each), so it must exceed that
 	// envelope instead of cutting it short
 	if provider.client.Timeout < 90*time.Second {
 		t.Fatalf("client timeout=%v, want >= 90s retry-envelope headroom", provider.client.Timeout)
@@ -697,7 +697,7 @@ func TestProvider_CleanUp_removes_ownership_of_independently_deleted_records(t *
 	}
 }
 
-// staleRemoveTransport 模拟 cleanUp 阶段的陈旧 zone→domain_id（历史问题）：
+// staleRemoveTransport 模拟 cleanUp 阶段的陈旧 zone→domain_id
 // Domain.List 恒返回 currentID；Record.Remove 对 staleID 报「域名不存在」
 // （code 7），对 currentID 默认删除成功（failFreshID 时改报非域名类错误）。
 // 记录每次 Remove 的 {domain_id, record_id} 与 Domain.List 调用数。
@@ -766,7 +766,7 @@ func (transport *staleRemoveTransport) flipStaleDomain(cachedID, freshID string,
 	transport.failFreshID = failFresh
 }
 
-// 历史问题（历史）：cleanUp 侧的 历史修复 同族自愈——缓存的 zone→
+// cleanUp 侧的同族自愈——缓存的 zone→
 // domain_id 陈旧（域名移出账户/删除重建）时，deleteRecord 对旧 ID 报「域名
 // 不存在」类错误，须作废缓存重解析后重试一次，而非把清理失败抛给签发链。
 func TestDNSPodCleanUp_staleDomainIDInvalidatesAndRetries(t *testing.T) {
@@ -816,7 +816,7 @@ func TestDNSPodCleanUp_staleDomainIDInvalidatesAndRetries(t *testing.T) {
 	}
 }
 
-// 历史问题 回归形状一：未命中陈旧 ID 时清理恰好删除一次——不作废缓存、不重解析、
+// 回归形状一：未命中陈旧 ID 时清理恰好删除一次——不作废缓存、不重解析、
 // 不发第二次删除。
 func TestDNSPodCleanUp_freshDomainIDDeletesOnce(t *testing.T) {
 	// Given: the cached id still matches the API
@@ -848,9 +848,9 @@ func TestDNSPodCleanUp_freshDomainIDDeletesOnce(t *testing.T) {
 	}
 }
 
-// 历史问题 回归形状二 + 历史问题 基线钉：重试仍失败照旧记 failed（不循环）——内存
+// 回归形状二 + 基线钉：重试仍失败照旧记 failed（不循环）——内存
 // 模式下失败记录须回到 owned 表（failed 存储的唯一消费者），供同进程后续
-// 清理重试。历史修复（历史）：自愈重解析已把 domain_id 换代（1→2），
+// 清理重试。自愈重解析已把 domain_id 换代（1→2），
 // 回填与残留条目必须落在新键——旧键条目对后续 cleanUp/Present 永不可达，
 // 「failed 回填供后续清理重试」形同虚设（旧钉测钉住了这个自相矛盾形态）。
 func TestDNSPodCleanUp_staleRetryStillFailsReappendsUnderFreshKey(t *testing.T) {
@@ -903,7 +903,7 @@ func TestDNSPodCleanUp_staleRetryStillFailsReappendsUnderFreshKey(t *testing.T) 
 	}
 }
 
-// 历史问题 回归形状三（生产形状）：ownership 模式下重试仍失败时，失败记录保留
+// 回归形状三（生产形状）：ownership 模式下重试仍失败时，失败记录保留
 // ownership 条目（DNS 记录可能仍存在），后续清理可自愈。
 func TestDNSPodCleanUp_staleRetryFailureKeepsOwnershipEntry(t *testing.T) {
 	// Given: a stale cached id and an API that also fails the fresh-id retry
@@ -946,7 +946,7 @@ func TestDNSPodCleanUp_staleRetryFailureKeepsOwnershipEntry(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：内存模式失败回填必须保留 challenge value——否则后续
+// 内存模式失败回填必须保留 challenge value——否则后续
 // 按值清理（CleanUpValue）的 entry.value != value 过滤会永久跳过该条目，
 // 「失败回填供后续清理重试」的意图落空。
 func TestProvider_CleanUp_memoryModeFailedValueRetriedByCleanUpValue(t *testing.T) {

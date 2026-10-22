@@ -12,8 +12,8 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// 历史修复(a)：TestCertificateConfig 的 storage_corrupted 分支——存量凭证
-// 「非空但不可解析」归 500（历史修复），与空凭证的缺凭证 400（既有测试钉住）
+// TestCertificateConfig 的 storage_corrupted 分支——存量凭证
+// 「非空但不可解析」归 500，与空凭证的缺凭证 400（既有测试钉住）
 // 分界。
 func TestCertificateConfigStorageCorrupted(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -38,8 +38,8 @@ func TestCertificateConfigStorageCorrupted(t *testing.T) {
 	}
 }
 
-// 历史修复(b)：UpdateSecurityCustomRule 的 storage_corrupted 分支（历史修复）
-// 与指针合并语义在事务下的回归（历史修复 的行为面）。
+// UpdateSecurityCustomRule 的 storage_corrupted 分支
+// 与指针合并语义在事务下的回归。
 func TestUpdateSecurityCustomRuleStorageCorrupted(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	ginRouter := newCustomRuleRouter(t)
@@ -58,7 +58,7 @@ func TestUpdateSecurityCustomRuleStorageCorrupted(t *testing.T) {
 	}
 }
 
-// 历史修复(b)：GetCRSRuleContent 的路径门与 404 基线（413 分支需 >1MB 实文件，
+// GetCRSRuleContent 的路径门与 404 基线（413 分支需 >1MB 实文件，
 // 路径硬编码 /app 不可注入，钉住可测的两分支）。
 func TestGetCRSRuleContentPathGateAndMissing(t *testing.T) {
 	h := newBackupTestHandlers(t)

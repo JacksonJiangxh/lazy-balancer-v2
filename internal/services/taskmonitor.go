@@ -25,7 +25,7 @@ const (
 	// 状态列词表=引擎执行语义三态（2026-10-22 用户裁定，取代旧 stopped/
 	// disabled/queued 扩展值）：调度语义归开关列 loop_on；业务生命周期态
 	// （cert_jobs.status 等）只能进业务文本位，禁止进入任务状态列。
-	// 历史修复（历史）：cancelled 常量删除——零产出零消费（取消只存在于
+	// cancelled 常量删除——零产出零消费（取消只存在于
 	// task_runs.result 字段，非 TaskStatus 状态产出）。
 )
 
@@ -56,7 +56,7 @@ type TaskRunInfo struct {
 	StartedAt  string `json:"started_at"`
 	FinishedAt string `json:"finished_at"`
 	DurationMs int64  `json:"duration_ms"`
-	Trigger    string `json:"trigger"`            // manual/auto/startup/caddy-restart/schedule（queue=cert-job 动态行合成值；slave-sync 为历史版本遗留取值，仅展示层保留映射）
+	Trigger    string `json:"trigger"`            // manual/auto/startup/caddy-restart/schedule（queue=cert-job 动态行合成值；slave-sync 为历史版本遗留取值，零产出已退役，展示层不再保留映射——遗留行原样回显 token）
 	Operator   string `json:"operator,omitempty"` // 手动触发操作者（manual 触发归人；auto/startup=空）
 	Result     string `json:"result"`             // success/failed/cancelled/skipped/…
 	Message    string `json:"message,omitempty"`
@@ -92,19 +92,19 @@ func CollectSystemTasks() (tasks []TaskInfo, certJobsTruncated bool) {
 // collectCertJobRows 逐签发任务行：非终态（实时队列内容）+ 24h 内终态
 // （结果可见）；id=cert-job:{jobID}，日志走 /certificates/jobs/{id}/logs。
 func collectCertJobRows() ([]TaskInfo, bool) {
-	// 历史修复（历史问题）：db.DB nil 防护——与引擎侧导出 DB 函数同形
+	// db.DB nil 防护——与引擎侧导出 DB 函数同形
 	// （装配顺序变化即 nil panic，曾裸用）。
 	if db.DB == nil {
 		return nil, false
 	}
 	// 2026-10-01 用户裁定：行存在即显示（无状态/时间过滤——曾按
 	// 「issued 超 1 天隐藏」窗口过滤致主节点签发行消失）；仅排除从节点
-	// 材料物化行（非签发任务，从节点禁签发）。LIMIT 100（历史问题-2 裁定后
+	// 材料物化行（非签发任务，从节点禁签发）。LIMIT 100（裁定后
 	// 收敛：20 截断「存在即显示」——100 贴近裁定原文且长周期主节点不触顶）。
 	// 审计项：多取 1 行作截断探针（LIMIT 101），触达上限时回传 truncated
 	// 标记——此前 100 行静默截断，消费方无法区分「恰好 100 条」与「被截」。
 	//
-	// 历史问题：镜像行过滤条件绑定「本节点当前为从节点」——曾无条件按 message
+	// 镜像行过滤条件绑定「本节点当前为从节点」——曾无条件按 message
 	// 前缀过滤，promote 后保留下来的同主节点同步行永久不可见（它们已经是本
 	// 节点自己的签发工作项）。读角色失败按主节点处理（行可见：多展示无害，
 	// 静默丢行不可恢复）。
@@ -152,7 +152,7 @@ func collectCertJobRows() ([]TaskInfo, bool) {
 			// 触发语义（2026-10-11 用户裁定）：cert-job 行视为触发任务——可自动
 			// 调度（签发守护消费）即可手动调度（证书可重签发）；重试门（在途 409/
 			// 退役 429/冷却 429）由 TriggerSystemTask 的 cert-job 分支复用承担。
-			// 历史修复（历史问题）：disabled 为恒终态退役行——重试门对其恒 429，
+			// disabled 为恒终态退役行——重试门对其恒 429，
 			// Triggerable=false 让按钮呈现禁用态（点击必 429 是交互噪音）。
 			Triggerable: status != "disabled",
 			LastRun: &TaskRunInfo{StartedAt: localDisplayUTC(updatedAt), FinishedAt: localDisplayUTC(updatedAt),
@@ -175,7 +175,7 @@ func collectCertJobRows() ([]TaskInfo, bool) {
 		out = append(out, ti)
 	}
 	if err := rows.Err(); err != nil {
-		// 历史问题-4：迭代失败不再静默部分列表（曾 rows.Err 未查）
+		// 迭代失败不再静默部分列表（曾 rows.Err 未查）
 		Logf("warn", "cert 任务行迭代失败: %v", err)
 	}
 	truncated := len(out) > certJobRowsLimit
@@ -193,7 +193,7 @@ const certJobRowsLimit = 100
 // 来自 task_runs，下次时间兜底 last+interval）。
 func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 	var out []TaskInfo
-	// 历史问题-06：最近运行与 24h 统计一次批量取（修复前逐任务 LatestRun+Stats24h
+	// 最近运行与 24h 统计一次批量取（修复前逐任务 LatestRun+Stats24h
 	// = 2N 条 SQL，前端 5s 轮询下为稳定常驻负载）。
 	latestRuns, runStats := te.RunOverview()
 	for _, m := range te.DescribeAll() {
@@ -210,7 +210,7 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 				ti.Cadence = "每 " + humanInterval(m.IntervalSec)
 			}
 		case taskengine.KindScheduled:
-			// 历史修复（历史）：Scheduled 族节奏补显——原缺分支恒空，前端显示「—」；
+			// Scheduled 族节奏补显——原缺分支恒空，前端显示「—」；
 			// 槽位由 NextSlotFn 按用户配置派生（每日时刻等），具体时间归「下次执行」列。
 			ti.Cadence = "定时排程"
 		case taskengine.KindDaemon:
@@ -218,8 +218,8 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 		case taskengine.KindOneshot:
 			ti.Cadence = "手动触发"
 		}
-		// 历史修复（历史问题）：db.DB nil 防护（与同层 collectCertJobRows 同形）。
-		// 历史问题：LatestRun 单次查询复用（曾每任务两查）；历史问题-06：全部任务
+		// db.DB nil 防护（与同层 collectCertJobRows 同形）。
+		// LatestRun 单次查询复用（曾每任务两查）；全部任务
 		// 合并为两条批量查询（RunOverview）。
 		latestRun := latestRuns[m.ID]
 		// 状态分流（方案 A，2026-10-12 用户裁定）：状态列只承载执行语义
@@ -227,13 +227,26 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 		// 调度语义全部归开关列——调度语义只由 loop_on 表达；business_driven
 		// 为只读态（由对应业务页开关驱动调度）。stopped/disabled 不再作为
 		// 状态列产出（原「stopped 仅常驻」模型与 disabled 三源混用同轮废除）。
-		if m.StatusMirror != "" {
-			ti.Status = TaskStatus(m.StatusMirror)
+		// StatusMirror 词表归一：产出侧（StatusFn）与消费侧（前端色表/标签）
+		// 同守三态词表——非词表值（业务态混入/未来新增态未同步）不得直通
+		// 状态列，按空镜像回落执行实态推导；状态翻转留痕（持续词表外不刷屏）。
+		mirror := m.StatusMirror
+		switch mirror {
+		case "", string(TaskStatusIdle), string(TaskStatusRunning), string(TaskStatusFailed):
+			logStateTransition("status-mirror-"+m.ID, false)
+		default:
+			if lvl := logStateTransition("status-mirror-"+m.ID, true); lvl != "" {
+				Logf(lvl, "任务 %s 状态镜像 %q 不在执行态词表（idle/running/failed），按空镜像回落执行实态", m.ID, mirror)
+			}
+			mirror = ""
+		}
+		if mirror != "" {
+			ti.Status = TaskStatus(mirror)
 		} else if m.Kind == taskengine.KindDaemon {
 			if m.Running {
 				ti.Status = TaskStatusRunning
 			} else if (m.LoopOn || m.RestartExhausted) && latestRun != nil && latestRun.Status == "failed" {
-				// 历史问题-04 + 历史问题-03：Run 已死（有界重拉窗口）或自愈预算
+				// +：Run 已死（有界重拉窗口）或自愈预算
 				// 用尽（此时 LoopOn=false，与用户主动停止同形）——必须呈现
 				// failed。修复前恒 idle「空闲」，采集/签发永久停摆无信号。
 				ti.Status = TaskStatusFailed
@@ -277,8 +290,8 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 		ti.Runs24h, ti.Success24h, ti.Fail24h = st.Runs, st.Success, st.Fail
 		// 常驻族启动时刻——「常驻 · 启动于」。用该 daemon 最近 boot 行时刻
 		// （重启后正确更新）；从未运行的常驻任务（角色门未获/调度关闭未拉起）
-		// 置零值——UI '—' 兜底（历史问题-06），不再回退引擎进程启动时刻
-		// （=uptime 语义，与「空闲/已停止」状态矛盾）。历史问题（历史）。
+		// 置零值——UI '—' 兜底，不再回退引擎进程启动时刻
+		// （=uptime 语义，与「空闲/已停止」状态矛盾）。。
 		if m.Kind == taskengine.KindDaemon {
 			// 真实运行=本代 boot 行；停用有史=最近一次启动；从未运行且未运行=零值。
 			switch {

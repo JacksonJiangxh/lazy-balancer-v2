@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// 历史问题-1（历史 + 用户反馈）：漂移横幅检测时间从正文拆出——正文只留
+// 漂移横幅检测时间从正文拆出——正文只留
 // 漂移内容（供横幅主文案），检测时间经独立字段供 meta 次行展示。
 
 func TestFormatDriftBanner_excludesDetectTime(t *testing.T) {

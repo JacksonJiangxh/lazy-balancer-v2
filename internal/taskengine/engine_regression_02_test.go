@@ -1,6 +1,6 @@
 package taskengine
 
-// 历史修复 BootSync 前暂停 tick / 历史修复 在途排空 API / 历史修复 demote×pendingRestart
+// BootSync 前暂停 tick / 在途排空 API / demote×pendingRestart
 
 import (
 	"sync/atomic"
@@ -12,7 +12,7 @@ import (
 
 // waitForEngine 轮询条件直至超时（竞态测试的终态收敛等待）。
 
-// 历史修复：Stop 的 cancel 遍历与 runNow 的 cancel 登记交错。确定性编排
+// Stop 的 cancel 遍历与 runNow 的 cancel 登记交错。确定性编排
 // （in-package 直调 runNow）：测试持 roleMu 写锁——runNow 已过 stopped 检查
 // 并阻塞在 roleMu.RLock（cancel 未登记）；随后 Stop 置 stopped、cancel 遍历
 // 见 r.cancel==nil 跳过、阻塞在 runWG.Wait；放开 roleMu 后旧实现裸登记并
@@ -50,7 +50,7 @@ func TestEngine_StopRacingRunNowCancelsInFlight(t *testing.T) {
 	}
 }
 
-// 历史修复（门内化钉）：slave 角色下直调 tryStartDaemon 内部入口（绕过 StartLoop
+// （门内化钉）：slave 角色下直调 tryStartDaemon 内部入口（绕过 StartLoop
 // 预检）必须被内化角色门拒绝——旧实现无门内复查，master-only daemon 在
 // slave 上被拉起。
 func TestEngine_TryStartDaemonRefusedOnSlave(t *testing.T) {
@@ -74,7 +74,7 @@ func TestEngine_TryStartDaemonRefusedOnSlave(t *testing.T) {
 	}
 }
 
-// 历史修复（全链路竞态钉）：master-only daemon 运行中连续 demote→promote→demote
+// （全链路竞态钉）：master-only daemon 运行中连续 demote→promote→demote
 // （promote 在旧代退出清理前栽 pendingRestart），旧实现的退出清理以陈旧角色
 // 快照内联登记新代——demote 的 cancel 遍历未及新登记，daemon 在 slave 存活。
 // 修复后换代经 tryStartDaemon 以新鲜角色复核，终态恒不运行。
@@ -110,7 +110,7 @@ func TestEngine_DemotePendingRestartNoSlaveDaemon(t *testing.T) {
 	}
 }
 
-// 历史修复：StartPaused 引擎的 tick 不投递周期任务；ResumeScheduling 后恢复。
+// StartPaused 引擎的 tick 不投递周期任务；ResumeScheduling 后恢复。
 func TestEngine_StartPausedDefersTickUntilResume(t *testing.T) {
 	e := newTestEngineWithOptions(t, Options{TickInterval: time.Hour, StartPaused: true})
 	var runs atomic.Int32
@@ -131,7 +131,7 @@ func TestEngine_StartPausedDefersTickUntilResume(t *testing.T) {
 	waitForEngine(t, "恢复后首轮投递", 2*time.Second, func() bool { return runs.Load() >= 1 })
 }
 
-// 历史修复：BootSync 任务在装配暂停期照常同步执行（暂停只作用于 tick 投递）。
+// BootSync 任务在装配暂停期照常同步执行（暂停只作用于 tick 投递）。
 func TestEngine_BootSyncRunsWhilePaused(t *testing.T) {
 	e := newTestEngineWithOptions(t, Options{TickInterval: time.Hour, StartPaused: true})
 	var runs atomic.Int32
@@ -146,7 +146,7 @@ func TestEngine_BootSyncRunsWhilePaused(t *testing.T) {
 	}
 }
 
-// 历史修复：StatusFn 闭包 panic 在 Lookup/DescribeAll 隔离为空镜像（与
+// StatusFn 闭包 panic 在 Lookup/DescribeAll 隔离为空镜像（与
 // IntervalFn/NextSlotFn/EnabledFn 同口径），不得杀死整页聚合。
 func TestEngine_StatusFnPanicIsolated(t *testing.T) {
 	e := newTestEngine(t)
@@ -200,7 +200,7 @@ func TestRecordRunFinish_NilDBNoPanic(t *testing.T) {
 	RecordRunFinish(1, "failed", 1, "boom")
 }
 
-// 历史修复：CancelInFlightRuns 取消全部在途非常驻 Run（导入前排空），常驻族
+// CancelInFlightRuns 取消全部在途非常驻 Run（导入前排空），常驻族
 // 不在排空范围。
 func TestEngine_CancelInFlightRuns(t *testing.T) {
 	e := newTestEngine(t)

@@ -1,6 +1,6 @@
 package middleware
 
-// 历史问题(历史分歧裁定后补):logout 属自助语义路径——当前路由不在
+// logout 属自助语义路径——当前路由不在
 // readOnlyGuard 链上(行为已正确),白名单收录为防御性对齐:未来若把
 // /auth/logout 挪入 business 组,非管理员登出不因守卫误拒。
 import "testing"

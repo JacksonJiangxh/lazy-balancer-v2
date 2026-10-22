@@ -11,7 +11,7 @@ import (
 
 // DNSCredentials is the unified credential envelope. 真实存储位置是
 // certificate_configs.dns_credentials（global_config.dns_credentials 为已停用的
-// 遗留字段，2026-09-05 证书域审计 历史问题 核实签发链无消费方）。
+// 遗留字段，2026-09-05 证书域审计核实签发链无消费方）。
 type DNSCredentials struct {
 	Mode      string `json:"mode"` // "dnspod" or "tencent"
 	APIToken  string `json:"api_token,omitempty"`
@@ -41,10 +41,10 @@ func newProviderFromCredentials(rawJSON, dataDir string) (Provider, error) {
 	// auth_mode, app_id, app_token (DNSPod) or auth_mode, secret_id, secret_key
 	// (Tencent). legacy app_id+app_token→api_token 的拼接在此存在双实现（协议
 	// 面归一化）：本处与 internal/services/dnsproviders/dnspod.go 的
-	// buildCredentials（UI 面 canonical 产出，历史修复）——任一侧改
+	// buildCredentials（UI 面 canonical 产出）——任一侧改
 	// 字段名/拼接格式须双侧同步。
 	//
-	// 历史问题（历史）：UI 形态是凭据真相——只要 auth_mode 存在，表单字段
+	// UI 形态是凭据真相——只要 auth_mode 存在，表单字段
 	// 就压过游离的消费层 mode 字段与陈旧 api_token。否则提交中同时带
 	// auth_mode=dnspod 与 mode=tencent 时，「保存前测试」（buildCredentials 走
 	// auth_mode）与真实签发（本函数原先 mode 优先）会用两套不同凭据。
@@ -83,7 +83,7 @@ func newProviderFromCredentials(rawJSON, dataDir string) (Provider, error) {
 
 	// 迁移早于 mode 字段落库的存量行只带凭证字段本身：按字段形态推断
 	// provider（APIToken→DNSPod token；SecretID+SecretKey→腾讯云 secret）。
-	// 无法判定时给出可诊断的分流文案（历史修复）：两类凭证并存=歧义
+	// 无法判定时给出可诊断的分流文案：两类凭证并存=歧义
 	// （需显式 mode 消歧）；全缺/不完整=缺失（需补齐凭证）。原实现两者同落
 	// default 的「unsupported dns provider mode: 」（mode 为空），排障无法区分。
 	if creds.Mode == "" {

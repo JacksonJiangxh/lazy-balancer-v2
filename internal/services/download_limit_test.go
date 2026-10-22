@@ -1,6 +1,6 @@
 package services
 
-// allow: SIZE_OK — 历史问题 download size cap regression tests.
+// allow: SIZE_OK — download size cap regression tests.
 
 import (
 	"bytes"
@@ -12,8 +12,8 @@ import (
 	"testing"
 )
 
-// TestWriteRuleSetDownload_limitsDownloadSize 验证下载限界（历史问题）：
-// 历史修复 超上限先拒绝落盘；流式拷贝超上限报错中止；上限内正常。
+// TestWriteRuleSetDownload_limitsDownloadSize 验证下载限界
+// 超上限先拒绝落盘；流式拷贝超上限报错中止；上限内正常。
 func TestWriteRuleSetDownload_limitsDownloadSize(t *testing.T) {
 	const cap = int64(1024)
 	cases := []struct {

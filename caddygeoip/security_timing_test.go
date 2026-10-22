@@ -11,7 +11,7 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
-// 计时注册表契约测试（历史：侧车退役，耗时写入进程内
+// 计时注册表契约测试（侧车退役，耗时写入进程内
 // 注册表，由审计写插件注入审计行——写侧三写点的行为钉）。
 
 // useTestTimingRegistry 隔离全局注册表并收窄等待参数到测试量级。
@@ -47,7 +47,7 @@ func auditTimingLookupForTest(t *testing.T, id string) auditTimingSnapshot {
 
 // Given: 正常调用
 // When: securityTimingID
-// Then: 16 字符 hex(8 字节;历史问题 扩容后)
+// Then: 16 字符 hex(8 字节; 扩容后)
 func TestSecurityTimingID_length(t *testing.T) {
 	id := securityTimingID()
 	if len(id) != 16 {
@@ -60,7 +60,7 @@ func TestSecurityTimingID_length(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：security_timing_pre/end 两 ServeHTTP 逐字重复收敛为
+// security_timing_pre/end 两 ServeHTTP 逐字重复收敛为
 // recordSecurityTiming helper——钉 helper 契约：合法头对写一段注册表耗时，
 // 缺头对零写入（静默降级语义不变）。
 func TestRecordSecurityTiming_writesRegistrySegment(t *testing.T) {
@@ -132,7 +132,7 @@ func TestSecurityTimingPre_passAnchorsSegmentViaHeaderRewrite(t *testing.T) {
 	}
 }
 
-// 历史：畸形形态——缺关联头对的请求零写入、零改写、不 panic（静默降级）。
+// 畸形形态——缺关联头对的请求零写入、零改写、不 panic（静默降级）。
 func TestSecurityTimingPre_missingHeadersNoop(t *testing.T) {
 	useTestTimingRegistry(t)
 	h := &SecurityTimingPre{}
@@ -179,7 +179,7 @@ func TestSecurityTimingEnd_recordsEndSegmentFromAnchor(t *testing.T) {
 	}
 }
 
-// 历史问题：挂钟回拨/异常起始头（未来时刻）产生的负时长不得注入审计行——
+// 挂钟回拨/异常起始头（未来时刻）产生的负时长不得注入审计行——
 // 耗时下限钳 0（0µs 是合法计时值）。
 func TestRecordSecurityTiming_negativeClampedToZero(t *testing.T) {
 	useTestTimingRegistry(t)
@@ -210,7 +210,7 @@ func auditTimingEntriesSnapshotForTest(t *testing.T) map[string]*auditTimingEntr
 	return out
 }
 
-// 历史问题（历史）：计时 ID 是注册表 key，客户端可对无 counter 的
+// 计时 ID 是注册表 key，客户端可对无 counter 的
 // 路由伪造任意头值灌入注册表（内存 DoS）。recordSecurityTiming 只接受与
 // 服务端 securityTimingID 同形态的 16 字符 hex ID，其余一律静默忽略。
 func TestRecordSecurityTiming_rejectsForgedID(t *testing.T) {

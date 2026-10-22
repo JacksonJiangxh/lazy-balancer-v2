@@ -2,7 +2,7 @@ package handlers
 
 // 库值唯一真相（批 1+2）写侧门钉测：类型①值型字段 0/空 → 400（前端表单
 // 初值=默认，清空提交被拦）；类型②省略型（upstream_keepalive_timeout 0=继承
-// Caddy/Go Transport 默认 2 分钟，历史问题 用户裁定）仅拒负数。导入/快照链归一门
+// Caddy/Go Transport 默认 2 分钟，用户裁定）仅拒负数。导入/快照链归一门
 // 见 config_backup/cluster_apply（传输归一 normalizeRuleForTransport 由
 // services 侧 TestSnapshot_rulesInvalidHealthColumns_normalizedByTransportGate 钉测）。
 

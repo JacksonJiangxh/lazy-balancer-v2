@@ -109,3 +109,57 @@ func TestAutobanMerge_evictionPrecomputedOrderAndParseBound(t *testing.T) {
 		t.Fatalf("time.Parse 次数=%d, 超过线性上界 %d（挤出仍为 O(n²) 逐次重解析）", parses, upperBound)
 	}
 }
+
+// 挤出序畸形形状钉测：畸形/空 expires_at 视为永久（到期过滤同口径——畸形
+// 保留不误删，挤出序排在所有有到期者之后）；永久条目间畸形/空 created_at
+// 视为零值排最后，同值按键序（先出现先挤，稳定序）。
+func TestAutobanMerge_evictionOrderMalformedTimestamps(t *testing.T) {
+	installAutobanFixture(t, "2026-10-14 10:00:00")
+	oldCap := AutobanListEntryCap
+	AutobanListEntryCap = 3
+	t.Cleanup(func() { AutobanListEntryCap = oldCap })
+
+	seeded := []models.IPListEntry{
+		{Value: "192.0.2.1", Remark: "事件处置"}, // 手动条目：永不挤出
+		{Value: "192.0.2.2", Remark: "手动封禁"},
+		// 有到期者按到期升序先挤。
+		{Value: "198.51.100.11", Remark: AutobanEntryRemark, ExpiresAt: "2026-10-14 10:30:00"},
+		{Value: "198.51.100.12", Remark: AutobanEntryRemark, ExpiresAt: "2026-10-14 11:00:00"},
+		// 畸形/空 expires_at → 永久档；档内按 created_at 升序。
+		{Value: "198.51.100.13", Remark: AutobanEntryRemark, ExpiresAt: "not-a-timestamp", CreatedAt: "2026-10-14 09:00:00"},
+		{Value: "198.51.100.14", Remark: AutobanEntryRemark, ExpiresAt: "", CreatedAt: "2026-10-14 09:30:00"},
+		// 永久档内畸形/空 created_at → 零值排最后（同零值保持写入序）。
+		{Value: "198.51.100.15", Remark: AutobanEntryRemark, ExpiresAt: "2026-13-99 99:99:99", CreatedAt: "garbage"},
+		{Value: "198.51.100.16", Remark: AutobanEntryRemark, CreatedAt: ""},
+	}
+	seedPresetEntries(t, seeded)
+
+	out, err := autobanMergeEntries(AutobanConfig{
+		Enabled: true, Threshold: 1, WindowMinutes: 5, Duration: "1h", Scope: "all", DryRun: false,
+	}, []AutobanSuggestion{{IP: "10.10.0.1", Count: 9}})
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+
+	// 总量 8+1=9，容量 3 → 挤出 6（全部自动条目），顺序=到期升序 → 永久
+	// created_at 升序 → 畸形 created_at（零值，写入序）。
+	want := []string{
+		"198.51.100.11", "198.51.100.12",
+		"198.51.100.13", "198.51.100.14",
+		"198.51.100.15", "198.51.100.16",
+	}
+	if out.Evicted != len(want) || len(out.EvictedIPs) != len(want) {
+		t.Fatalf("evicted=%d EvictedIPs=%v, want %d 条", out.Evicted, out.EvictedIPs, len(want))
+	}
+	for i := range want {
+		if out.EvictedIPs[i] != want[i] {
+			t.Fatalf("挤出序第 %d 项=%s, want %s（畸形 expires_at→永久档；畸形 created_at→档内最后）", i, out.EvictedIPs[i], want[i])
+		}
+	}
+	// 畸形 expires_at 条目未被「到期过滤」误删——它们全部经挤出离场（=被
+	// 计入名单容量），最终名单=2 手动+1 新封。
+	final := presetEntries(t)
+	if len(final) != 3 || final[0].Value != "192.0.2.1" || final[1].Value != "192.0.2.2" || final[2].Value != "10.10.0.1" {
+		t.Fatalf("最终名单=%+v, want [192.0.2.1 192.0.2.2 10.10.0.1]", final)
+	}
+}

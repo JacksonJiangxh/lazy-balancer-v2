@@ -17,9 +17,9 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// round40BackupJSON 构造自定义 sections/表区的 v2 备份;值为 nil 的表整体
+// sectionsBackupJSON 构造自定义 sections/表区的 v2 备份;值为 nil 的表整体
 // 缺席(模拟分类导出产物——缺席表不得被当作「清空本地表」应用)。
-func round40BackupJSON(t *testing.T, sections []string, tables map[string][]map[string]any) string {
+func sectionsBackupJSON(t *testing.T, sections []string, tables map[string][]map[string]any) string {
 	t.Helper()
 	payload := map[string][]map[string]any{}
 	for table, rows := range tables {
@@ -73,7 +73,7 @@ func TestImportBackup_emptyUsersSectionDoesNotBumpOrWarn(t *testing.T) {
 	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled,password_version) VALUES (1,'current-admin','hash','admin',1,7)`); err != nil {
 		t.Fatalf("seed local admin: %v", err)
 	}
-	backup := round40BackupJSON(t, []string{"users"}, map[string][]map[string]any{
+	backup := sectionsBackupJSON(t, []string{"users"}, map[string][]map[string]any{
 		"users":    nil, // 缺席
 		"lb_rules": {{"caddy_id": "imp1", "name": "imp", "protocol": "http", "domain": "a.example.com", "listen_port": 80, "enabled": 1}},
 	})
@@ -146,7 +146,7 @@ func TestImportBackup_commitFailureCarriesWafApplyWarning(t *testing.T) {
 	if rec.Code == http.StatusOK {
 		t.Fatalf("import with unreachable caddy must fail, got 200 %s", rec.Body.String())
 	}
-	// 历史修复：坏 xdb 在落盘前即被装载验证拒绝（文件未落盘 → 版本记录同批
+	// 坏 xdb 在落盘前即被装载验证拒绝（文件未落盘 → 版本记录同批
 	// 丢弃）；commit 失败响应必须携带该落盘/丢弃告警。
 	if !strings.Contains(rec.Body.String(), "版本记录已丢弃") {
 		t.Fatalf("commit-failure response must carry waf apply warning, body=%s", rec.Body.String())

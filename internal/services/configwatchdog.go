@@ -24,7 +24,7 @@ type ConfigDriftStatus struct {
 	Since      string   `json:"since"`   // 首次确认不一致的时间（UTC）
 	CheckedAt  string   `json:"checked_at"`
 	// SkippedRounds 自上次真实检查以来未能判定的轮数（规则读取失败/Caddy
-	// 不可达整轮跳过）——历史问题：跳过轮不构成「一致」证据，心跳文案附此计数。
+	// 不可达整轮跳过）——跳过轮不构成「一致」证据，心跳文案附此计数。
 	SkippedRounds int `json:"skipped_rounds,omitempty"`
 }
 
@@ -32,13 +32,13 @@ var (
 	configDriftMu               sync.RWMutex
 	configDriftStatus           = ConfigDriftStatus{Consistent: true}
 	configDriftStreak           int
-	configDriftCleanRounds      int  // 历史问题 心跳窗口：连续「真实检查且一致」轮计数（60s 节拍 × 60 轮 ≈ 1h 一条心跳）
-	configDriftSkipped          int  // 历史问题：自上次真实检查以来的跳过轮数（未判定，不计入干净轮）
+	configDriftCleanRounds      int  // 心跳窗口：连续「真实检查且一致」轮计数（60s 节拍 × 60 轮 ≈ 1h 一条心跳）
+	configDriftSkipped          int  // 自上次真实检查以来的跳过轮数（未判定，不计入干净轮）
 	configDriftHeartbeatSkipped int  // 自上次心跳以来的跳过轮数：仅用于心跳文案，与状态字段窗口分离。
 	configDriftQueryWarned      bool // 规则数据读取失败首报留痕
 	configDriftReadWarned       bool // 运行配置读取失败首报留痕
-	// 历史修复（历史）：configWatchdogMu/Cancel/Done 三个引擎化前残留
-	// 死变量已删（StartConfigWatchdog/StopConfigWatchdog 随 历史修复 退役，零消费方）。
+	// configWatchdogMu/Cancel/Done 三个引擎化前残留
+	// 死变量已删（StartConfigWatchdog/StopConfigWatchdog 随退役，零消费方）。
 )
 
 // ResetConfigDrift 角色切换时重置看门狗状态——曾漂移的主节点降级为从节点后，
@@ -69,14 +69,14 @@ func CurrentConfigDrift() ConfigDriftStatus {
 // 经系统日志 + 操作日志 + GetCaddyStatus（前端全局横幅）三通道告知，连续两轮不一致
 // 才置状态（防配置应用窗口的瞬时误报）。从节点不运行——同步链路已有 drift 检测与
 // 重载失败标记自愈覆盖。恢复由用户手动重启完成（横幅入口），不做自动重应用。
-// 历史修复（历史）引擎化口径：60s 节拍由任务引擎 config-watchdog 族驱动
+// 引擎化口径：60s 节拍由任务引擎 config-watchdog 族驱动
 // （taskengine_wire.go 注册），停止随 StopTaskEngine 统一收尾；admin 地址由
 // InitTaskEngine 装配时注入下方包级变量。
 var watchdogAdminURLValue string
 
 // WatchdogCheckOnce 单轮一致性检查（panic 留痕——看门狗是唯一消费者，
 // goroutine 静默死亡是最坏形态；引擎 60s 节拍调用）。
-// 历史问题-2（历史）：主节点专属检测——从节点整轮短路（循环保持存活，
+// 主节点专属检测——从节点整轮短路（循环保持存活，
 // 升主后自动生效；COALESCE(is_master,1) 口径与全仓一致）。此前从节点每轮
 // 空跑簿记：心跳计数累积并逐小时发「配置一致」假心跳（从未真实检查）。
 //
@@ -85,9 +85,16 @@ var watchdogAdminURLValue string
 // 丢弃，本轮零业务日志且 task_runs 恒 success，任务监控无法区分「真实检查且
 // 一致」与「整轮没查」（与同文件「跳过轮不构成一致证据」口径冲突）。引擎
 // 通用行为不变：只有 Run 返回 error 才落 failed。
-func WatchdogCheckOnce() (runErr error) {
+// 降级/停机窗口（BecomeSlave 的 SetRole(false) 取消在途 Periodic Run 的
+// rc.Ctx）：在途轮不消费 ctx 会以旧主节点视角跑完，把漂移簿记/状态覆写到
+// 已复位的漂移态上（复位→误报漂移窗口）。入口与比对出口各复核一次，
+// 命中即整轮中止——零簿记、零心跳、零任务日志（与从节点整轮短路同口径）。
+func WatchdogCheckOnce(ctx context.Context) (runErr error) {
 	if db.DB == nil {
 		return nil
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return ctx.Err()
 	}
 	if isMaster, err := RoleOf(context.Background(), db.DB); err != nil {
 		// 看门狗角色读失败留痕：角色读失败=本轮未判定——计入跳过轮簿记（不宣称一致、
@@ -108,15 +115,20 @@ func WatchdogCheckOnce() (runErr error) {
 		if r := recover(); r != nil {
 			Logf("error", "配置一致性看门狗：检查 panic: %v", r)
 			TaskLogfWarn("config-watchdog", "check", "检查异常（panic 已拦，明细见运行日志）")
-			// panic 同样意味着本轮没有完成判定：按失败上报（历史修复 同口径）。
+			// panic 同样意味着本轮没有完成判定：按失败上报。
 			runErr = fmt.Errorf("配置一致性检查 panic: %v", r)
 		}
 	}()
 	checked, checkErr := checkConfigConsistency(watchdogAdminURLValue)
-	// 历史问题 日志收敛（2026-10-03 裁定，历史问题「日志只记真实执行」延伸）：一致轮
+	// 比对出口复核：比对窗口期内降级/停机的在途轮不得落写簿记（防覆写
+	// 复位态——入口复核只覆盖轮次开始前已取消的形态）。
+	if ctx != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	// 日志收敛（2026-10-03 裁定，「日志只记真实执行」延伸）：一致轮
 	// 零逐轮行，每 configWatchdogHeartbeatRounds 轮（60s×60≈1h）一条心跳；
 	// 漂移期逐轮漂移行与恢复事件照旧（task_runs 维持失败留痕不膨胀）。
-	// 历史问题：只有真实完成的检查轮才累加干净轮——整轮跳过（规则/运行配置
+	// 只有真实完成的检查轮才累加干净轮——整轮跳过（规则/运行配置
 	// 读取失败、Caddy 不可达）不构成「一致」证据，此前会把跳过轮计入干净轮
 	// 并发出「配置一致」假心跳。跳过轮单独计数并附在心跳文案里。
 	configDriftMu.Lock()
@@ -176,12 +188,12 @@ func WatchdogCheckOnce() (runErr error) {
 
 // checkConfigConsistency 单轮真实比对，返回本轮是否真正完成判定（checked）：
 // false=整轮跳过（规则读取失败/Caddy 运行配置不可读），调用方不得据此记
-// 「一致」簿记（历史问题）。
+// 「一致」簿记。
 func checkConfigConsistency(adminURL string) (checked bool, err error) {
 	if db.DB == nil {
 		return false, nil
 	}
-	// 历史修复（历史）：角色门单层化——内层「非主节点跳过」门删除，
+	// 角色门单层化——内层「非主节点跳过」门删除，
 	// 由唯一生产调用方 WatchdogCheckOnce 外层门承担短路+簿记语义（双层
 	// 背靠背同一句 is_master 查询曾每轮白打一次主库；外层若删会双条 warn）。
 	expected, err := expectedRenderedRules()
@@ -198,7 +210,7 @@ func checkConfigConsistency(adminURL string) (checked bool, err error) {
 	if err != nil {
 		// Caddy 不可达由 GetCaddyStatus 的 status 通道报告；但「配置超解析上限/
 		// 解析失败」会让看门狗永久静默——须留痕（首次失败告警，恢复后复位）。
-		// 历史问题：超限（与瞬时读失败不同——不会自愈）单独留痕文案。
+		// 超限（与瞬时读失败不同——不会自愈）单独留痕文案。
 		configDriftMu.Lock()
 		if !configDriftReadWarned {
 			configDriftReadWarned = true
@@ -221,10 +233,11 @@ func checkConfigConsistency(adminURL string) (checked bool, err error) {
 
 // expectedRenderedRules 计算应出现在运行配置中的规则：启用中且至少有一个启用上游，
 // 并排除渲染侧有意跳过的三类，否则会被误报为「缺失」：
-//   - TCP+动态 DNS 逐规则跳过、同端口多 TCP 整组拒绝（历史问题，与 caddy.go 同口径）；
-//   - 历史问题：HTTP+TLS 规则在 caddy.go 渲染门因「无可用证书（manual 材料缺失 /
-//     ACME 无域匹配且未过期证书）」整条 fail-closed 跳过。看门狗必须消费同一判据，
-//     否则 ACME 首签窗口（或证书过期窗口）连续两轮即误报配置漂移、全局横幅常亮。
+//
+//	TCP+动态 DNS 逐规则跳过、同端口多 TCP 整组拒绝；
+//	HTTP+TLS 规则在 caddy.go 渲染门因「无可用证书（manual 材料缺失 /
+//	  ACME 无域匹配且未过期证书）」整条 fail-closed 跳过。看门狗必须消费同一判据，
+//	  否则 ACME 首签窗口（或证书过期窗口）连续两轮即误报配置漂移、全局横幅常亮。
 //
 // 返回 caddy_id → 规则名称。
 func expectedRenderedRules() (map[string]string, error) {
@@ -281,7 +294,7 @@ func expectedRenderedRules() (map[string]string, error) {
 				closeErr := certRows.Close()
 				return nil, fmt.Errorf("解析 ACME 证书候选失败: %w", errors.Join(scanErr, closeErr))
 			}
-			// 历史问题：与渲染装载同口径预解析（certReady 对每条规则只做选择，
+			// 与渲染装载同口径预解析（certReady 对每条规则只做选择，
 			// 但同一候选集会在多次巡检比较中重复使用）。
 			if candidate.Status != "disabled" {
 				candidate.Leaf = ParseCertificateLeaf(candidate.CertPEM, candidate.KeyPEM)
@@ -336,12 +349,12 @@ func expectedRenderedRules() (map[string]string, error) {
 }
 
 // configWatchdogHeartbeatRounds 一致轮心跳间隔：60s 节拍 × 60 轮 = 每小时一条
-// 「配置一致」心跳（历史问题 收敛——一致轮不再逐轮记录）。
+// 「配置一致」心跳。
 const configWatchdogHeartbeatRounds = 60
 
 // runningRuleRouteIDs 从 Caddy 运行配置收集规则路由 @id（lb_ 前缀），
 // 覆盖 http 与 layer4 两类服务器。
-// 历史问题：读取/上限/状态分类统一委托 readAdminConfigBody（caddy.go）——
+// 读取/上限/状态分类统一委托 readAdminConfigBody（caddy.go）——
 // 32MB+1 超限探测、非 2xx 显式错误、超限返回 errCaddyAdminConfigTooLarge，
 // 与 GetConfig/getRunningConfigBytes 同源；裸 LimitReader 会让「超限」与
 // 「瞬时读失败」不可区分，超大部署漂移检测长期静默。
@@ -360,7 +373,7 @@ func runningRuleRouteIDs(adminURL string) (map[string]bool, error) {
 	// 解析保持与旧实现同容忍度：json.Decoder 只消费第一个顶层值（尾随字节/
 	// 多余闭合符被忽略），json.Unmarshal 则要求整份字节恰为一个值。Caddy admin
 	// 契约外尾随内容不应把「运行配置可读」降级为「读取失败」——看门狗与启动
-	// 守卫的探针宁可沿用既有容忍面（历史问题 只统一读取上限/状态分类，未收紧
+	// 守卫的探针宁可沿用既有容忍面（只统一读取上限/状态分类，未收紧
 	// 解析语义）。
 	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&config); err != nil {
 		return nil, err
@@ -371,7 +384,7 @@ func runningRuleRouteIDs(adminURL string) (map[string]bool, error) {
 		app, _ := apps[appName].(map[string]interface{})
 		servers, _ := app["servers"].(map[string]interface{})
 		for _, srv := range servers {
-			// 历史问题：形状异常（带外 /load 或版本漂移）不得 panic——一律
+			// 形状异常（带外 /load 或版本漂移）不得 panic——一律
 			// comma-ok 断言跳过。
 			srvObj, ok := srv.(map[string]interface{})
 			if !ok {
@@ -396,11 +409,11 @@ func runningRuleRouteIDs(adminURL string) (map[string]bool, error) {
 }
 
 // RunningConfigHasRuleRoutes 报告 Caddy 运行配置是否仍含规则路由（lb_ 前缀
-// @id）——启动「0 规则应用」守卫的探测面（历史问题）：空库实例启动时若运行
+// @id）——启动「0 规则应用」守卫的探测面：空库实例启动时若运行
 // 配置仍带规则路由，极可能是数据目录/Admin 地址误配，不得把空配置 /load
 // 进去。admin 不可达返回错误，调用方按「无正向证据」放行（保持既有行为）。
 func RunningConfigHasRuleRoutes(adminURL string) (has bool, err error) {
-	// 历史问题：导出入口兜底 recover——运行配置是外部输入（Caddy admin 可能被
+	// 导出入口兜底 recover——运行配置是外部输入（Caddy admin 可能被
 	// 其他实例/版本写入），解析 panic 不得带崩启动守卫调用方。
 	defer func() {
 		if r := recover(); r != nil {
@@ -422,7 +435,7 @@ func RunningConfigHasRuleRoutes(adminURL string) (has bool, err error) {
 // 清空路由两次实证事故）。子路由（lb_x_path_0 等）归主规则认领，不计外来。
 // admin 不可达返回错误，调用方按「无正向证据」跳过告警（与看门狗同口径）。
 func ForeignRunningRuleRoutes(adminURL string, ownIDs map[string]bool) (foreign []string, err error) {
-	// 历史问题：同上——导出入口兜底 recover（外部输入解析 panic 不得带崩启动守卫）。
+	// 同上——导出入口兜底 recover（外部输入解析 panic 不得带崩启动守卫）。
 	defer func() {
 		if r := recover(); r != nil {
 			foreign = nil
@@ -454,7 +467,7 @@ func diffExpectedMissing(expected map[string]string, running map[string]bool) []
 			missing = append(missing, fmt.Sprintf("%s（%s）", name, caddyID))
 		}
 	}
-	// 历史问题：map 遍历顺序随机——状态切片直接进横幅/审计文本会造成展示抖动；
+	// map 遍历顺序随机——状态切片直接进横幅/审计文本会造成展示抖动；
 	// 排序保证同一集合的检查结果稳定（missing 按「名称（id）」字典序）。
 	sort.Strings(missing)
 	return missing
@@ -465,16 +478,16 @@ func diffRunningExtra(expected map[string]string, running map[string]bool) []str
 	claimed := claimedRoutePrefixes(expected)
 	for routeID := range running {
 		// 子路由（lb_x_redirect / lb_x_path_0 等，caddy.go tagRuleRoute 系）属于其
-		// 主规则——仅当没有任何期望规则认领该 @id 时才计为多余（历史问题 		// 精确匹配会把每条 HTTPS 跳转/路径规则的子路由误报为多余）。
+		// 主规则——仅当没有任何期望规则认领该 @id 时才计为多余（// 精确匹配会把每条 HTTPS 跳转/路径规则的子路由误报为多余）。
 		if !routeClaimedByAny(routeID, claimed) {
 			extra = append(extra, routeID)
 		}
 	}
-	sort.Strings(extra) // 历史问题：同上，顺序稳定
+	sort.Strings(extra) // 同上，顺序稳定
 	return extra
 }
 
-// claimedRoutePrefixes（历史修复，历史）预建路由认领前缀集合：每个期望
+// claimedRoutePrefixes预建路由认领前缀集合：每个期望
 // @id 收录其自身与 "<id>_" 两种形态，供 routeClaimedByAny 单次 O(1)/O(len)
 // 判定——替代原先每 routeID 全量扫描期望集合的 O(running×expected)。行为
 // 等价于 `routeID == caddyID || strings.HasPrefix(routeID, caddyID+"_")`。
@@ -504,13 +517,13 @@ func routeClaimedByAny(routeID string, claimed map[string]struct{}) bool {
 	return false
 }
 
-// updateConfigDrift 写入一轮比对结果。历史问题：锁内只更新状态并拷贝待写
+// updateConfigDrift 写入一轮比对结果。锁内只更新状态并拷贝待写
 // 内容，日志/审计落库移到 Unlock 之后——审计库 busy（30s busy_timeout）时
 // 持有 configDriftMu 会阻塞读者（GetCaddyStatus 的 CurrentConfigDrift）。
 func updateConfigDrift(missing, extra []string) {
 	drifted := len(missing) > 0 || len(extra) > 0
 	now := time.Now().UTC().Format("2006-01-02 15:04:05")
-	// 展示/审计文本顺序稳定（历史问题：调用方若传未排序切片也不抖动）。
+	// 展示/审计文本顺序稳定。
 	sort.Strings(missing)
 	sort.Strings(extra)
 	// 待写动作（0=无, 1=恢复, 2=漂移）——锁外执行。
@@ -550,7 +563,7 @@ func updateConfigDrift(missing, extra []string) {
 	}
 }
 
-// 历史问题：漂移文案单源（横幅 GetCaddyStatus 与看门狗审计共用）——
+// 漂移文案单源（横幅 GetCaddyStatus 与看门狗审计共用）——
 // 此前两处各自拼接「缺失规则路由/多余规则路由」，跨包维护两份。展示上限
 // 防止规则数很大时 60s 轮询响应与 audit_log.detail 无界增长。
 const (

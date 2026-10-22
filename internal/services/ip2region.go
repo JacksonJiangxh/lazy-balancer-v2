@@ -38,7 +38,7 @@ var (
 	// concurrent searches, even in BufferCache mode.
 	ip2regionSearchMu sync.Mutex
 	// ip2regionGeneration 归属地库代际（0=从未加载；每次安装/热换 +1）。
-	// 威胁大屏 rollup 据此判定历史空归属地维度是否值得重固（历史问题）。
+	// 威胁大屏 rollup 据此判定历史空归属地维度是否值得重固。
 	ip2regionGeneration atomic.Int64
 )
 
@@ -104,8 +104,8 @@ func InitIP2Region() {
 			}
 		}
 	}
-	// 历史问题：省→市树缓存（首次装载或缺失时全量扫描重建）。
-	// 历史问题：缓存含 ASCII 城市/省名（拼音规范化前的旧产物）也视为过期
+	// 省→市树缓存（首次装载或缺失时全量扫描重建）。
+	// 缓存含 ASCII 城市/省名（拼音规范化前的旧产物）也视为过期
 	// 重建——升级部署后旧缓存不会自动消失。
 	if staleRegionTreeCache(ip2RegionLivePathForTreeCache()) {
 		writeRegionTreeCache(regionTreeFromXDB(ip2regionLivePath))
@@ -117,7 +117,7 @@ func InitIP2Region() {
 // previous searcher stays in service if the new file cannot be loaded; the
 // open failure is returned so update/rollback callers can treat a failed
 // hot-swap as a failed install/restore level instead of silently diverging
-// memory from disk (历史修复).
+// memory from disk.
 func Reload() error {
 	searcher, err := openIP2RegionSearcher(ip2regionLivePath)
 	if err != nil {
@@ -151,7 +151,7 @@ func swapIP2RegionSearcher(searcher *ip2regionService.Ip2Region) {
 
 // Lookup returns the alpha-2 country code for the given IP address, or ""
 // when no database is loaded, the IP is unknown, or the region string
-// cannot be parsed. 历史问题（历史）：取锁+搜索序列委托 LookupRegion
+// cannot be parsed.：取锁+搜索序列委托 LookupRegion
 // 单点，本函数只做第五段解析。
 func Lookup(ip string) string {
 	return parseCountryCode(LookupRegion(ip))
@@ -206,7 +206,7 @@ func GetIP2RegionVersion() (string, error) {
 // SetIP2RegionVersion records the installed GeoIP database version and caches provinces.
 func SetIP2RegionVersion(version string) {
 	// 插入不写 auto_update——沿用 schema DEFAULT TRUE（与迁移播种
-	// ensureIP2RegionVersionRow 的 TRUE、历史修复 用户裁定一致）；硬编码 0 会让
+	// ensureIP2RegionVersionRow 的 TRUE、用户裁定一致）；硬编码 0 会让
 	// 「行缺失 + Init 先跑」形态静默关闭自动更新。
 	if _, err := db.DB.Exec(`INSERT INTO security_ip2region_version (id, version, updated_at)
 		VALUES (1, ?, datetime('now'))
@@ -219,14 +219,14 @@ func SetIP2RegionVersion(version string) {
 			Logf("warn", "ip2region: 省份列表缓存落盘失败（下次重建）: %v", err)
 		}
 	}
-	// 历史问题：版本更新即新库——树缓存同步重建。
+	// 版本更新即新库——树缓存同步重建。
 	writeRegionTreeCache(regionTreeFromXDB(ip2regionLivePath))
 }
 
 // writeProvincesCache atomically writes the province JSON cache by writing to a
 // temporary file then renaming, so concurrent readers never see a partial file.
-// 历史问题（历史）：写/换名错误沿返回值上抛——此前静默吞错，调用点
-// 无从留痕。历史问题：改用单源原子落盘（tmp+fsync+父目录 fsync）。
+// 写/换名错误沿返回值上抛——此前静默吞错，调用点
+// 无从留痕。改用单源原子落盘（tmp+fsync+父目录 fsync）。
 func writeProvincesCache(path string, data []byte) error {
 	return writeFileAtomicSynced(path, data, 0644)
 }
@@ -258,10 +258,10 @@ func openIP2RegionSearcher(path string) (*ip2regionService.Ip2Region, error) {
 func GetIP2RegionEntryCount() int {
 	ip2regionMu.RLock()
 	defer ip2regionMu.RUnlock()
-	// 历史修复(历史):条目数从 header StartIndexPtr/EndIndexPtr 直读
+	// 条目数从 header StartIndexPtr/EndIndexPtr 直读
 	// (xdb v2 官方边界,[8:16],2 次 ReadAt)——原实现扫 65536 格 vector 推导
 	// (BufferCache 已全内存,每调用 65536 次 8B ReadAt 纯浪费;且 vector 端点
-	// 语义含末条结尾,推导 历史修复;header 真值=/14+1)。
+	// 语义含末条结尾,推导;header 真值=/14+1)。
 	f, err := os.Open(ip2regionLivePath)
 	if err != nil {
 		return 0
@@ -303,6 +303,25 @@ func GetIP2RegionProvinces() []string {
 	if searcher == nil {
 		return []string{"海外"}
 	}
+	// stat 键记忆化（与 regionTreeMemo 同构）：下方 336 次采样搜索全程持
+	// ip2regionSearchMu 全局锁——校验端（ValidateGeoIPCountries）与缓存重建
+	// 在同一份 xdb 上的重复调用是纯重复劳动且拖住全局锁。键含 searcher
+	// 指针（测试/热换直换实例不吃陈旧值）+path|size|mtime（xdb 更新落盘
+	// 后 mtime 变化自然失效）。stat 失败（键为空）不记忆化——退化现扫。
+	key := ""
+	if fi, err := os.Stat(ip2regionLivePath); err == nil {
+		key = fmt.Sprintf("%p|%s|%d:%d", searcher, ip2regionLivePath, fi.Size(), fi.ModTime().UnixNano())
+	}
+	if key != "" {
+		provincesMemoMu.Lock()
+		if provincesMemo != nil && provincesMemoKey == key {
+			out := provincesMemo
+			provincesMemoMu.Unlock()
+			return out
+		}
+		provincesMemoMu.Unlock()
+	}
+	ip2regionProvinceScans.Add(1)
 	ip2regionSearchMu.Lock()
 	defer ip2regionSearchMu.Unlock()
 	chineseBlocks := []int{1, 14, 27, 36, 39, 42, 49, 58, 59, 60, 61, 101, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 139, 175, 180, 182, 183, 202, 210, 211, 218, 219, 220, 221, 222, 223}
@@ -316,7 +335,7 @@ func GetIP2RegionProvinces() []string {
 			}
 			fields := strings.Split(region, "|")
 			if len(fields) >= 2 && fields[0] == "中国" {
-				// 历史问题：采样列表与地域树同款规范化（normalizeIP2Province），
+				// 采样列表与地域树同款规范化（normalizeIP2Province），
 				// 消除双形态省名（上海/上海市）在同一列表中重复出现。
 				prov := normalizeIP2Province(fields[1])
 				if prov != "" {
@@ -331,11 +350,28 @@ func GetIP2RegionProvinces() []string {
 	}
 	sort.Strings(result)
 	result = append(result, "海外")
+	if key != "" {
+		provincesMemoMu.Lock()
+		provincesMemo, provincesMemoKey = result, key
+		provincesMemoMu.Unlock()
+	}
 	return result
 }
 
+// provincesMemo* 是 GetIP2RegionProvinces 的记忆化状态（语义见函数注释）。
+// 并发冷调用可能各扫一次（良性的一次性重复劳动，与 regionTreeMemo 同声明）。
+var (
+	provincesMemoMu  sync.Mutex
+	provincesMemo    []string
+	provincesMemoKey string
+)
+
+// ip2regionProvinceScans 省份全量采样执行次数（测试观测记忆化命中；
+// 生产成本=每冷调用一次原子加，镜像 autobanEntryTimeParses 先例）。
+var ip2regionProvinceScans atomic.Int64
+
 // GetIP2RegionProvinceList 返回省份列表，live searcher 优先、缓存兜底：仅供
-// UI 列表端（GetIP2RegionRegions）——校验端（ValidateGeoIPCountries）历史问题
+// UI 列表端（GetIP2RegionRegions）——校验端（ValidateGeoIPCountries）
 // 起改用 live-only 的 GetIP2RegionProvinces 判 loaded，避免 xdb 失效后缓存
 // 放行而发射端静默零强制。ip2region 未加载且无缓存时仅返回 ["海外"]。
 func GetIP2RegionProvinceList() []string {
@@ -347,16 +383,16 @@ func GetIP2RegionProvinceList() []string {
 }
 
 // 省列/城市列规范化四张表（别名/台湾城市/拼音城市/自治州）单源在
-// lazy-balancer-v2/geoipnames（历史修复收敛——此前与 caddygeoip
+// lazy-balancer-v2/geoipnames（收敛——此前与 caddygeoip
 // 手工镜像双份，漂移曾致城市级地域规则静默恒不命中）。选项树与 CEL 发射
 // 变量统一用规范名，两边一致才能命中。
 // treeCacheRevision 地域树缓存修订号——规范化规则（映射/别名/结构）变更时
 // 递增，旧缓存据此判定过期重建。ASCII 残留探测只能发现「缓存里有脏数据」，
-// 发现不了「该有而没有」的条目（如 历史修复 前整段被丢的 新疆/乌鲁木齐市）。
-const treeCacheRevision = "r27" // 历史修复：海外分支收集国家名（Countries）——旧缓存静默缺国名集，必须重建
+// 发现不了「该有而没有」的条目（如前整段被丢的 新疆/乌鲁木齐市）。
+const treeCacheRevision = "r27" // 海外分支收集国家名（Countries）——旧缓存静默缺国名集，必须重建
 
 // normalizeIP2Province 选项树侧省列规范化——单源 geoipnames.ProvinceForTree
-// （历史问题下沉：此前与 caddygeoip.normalizeProvince 是两份手工镜像，
+// （下沉：此前与 caddygeoip.normalizeProvince 是两份手工镜像，
 // 语义分叉靠调用点补偿）。语义：无效值（空/"0"）→ 空串；别名表归一
 // （上海→上海市、UEruemqi→新疆维吾尔自治区）；台湾城市误置省列 → 空串
 // （由调用方归入台湾省城市集）；未映射 ASCII（乱码/拼音残片）→ 空串；
@@ -372,9 +408,9 @@ func normalizeIP2City(raw string) string {
 	return geoipnames.CityForTree(raw)
 }
 
-// IP2RegionRegionTree 地域树（历史问题，用户裁决：区域精确到市）：省级
+// IP2RegionRegionTree 地域树：省级
 // 列表 + 省→城市集映射；「海外」哨兵仍为一级条目（Provinces 末位，承载
-// 解析失败/库缺失的 fail-closed 兜底），域 G（历史）起海外已解析行细化
+// 解析失败/库缺失的 fail-closed 兜底），域 G起海外已解析行细化
 // 为国家集（Countries——xdb 国家列归一后去重排序）。数据源为 xdb 段索引
 // 全量扫描（每段 14B：startIP 4 + endIP 4 + dataLen 2 + dataPtr 4），
 // region 数据按 dataPtr 去重读取（大量段共享同一 region 指针，实际读取量为
@@ -413,7 +449,7 @@ func regionTreeFromXDB(path string) *IP2RegionRegionTree {
 	if maxPtr < minPtr {
 		return nil
 	}
-	// 2) 遍历段索引，按 dataPtr 去重读 region。历史问题（历史）：
+	// 2) 遍历段索引，按 dataPtr 去重读 region。
 	// int64 运算 + 文件大小上界钳制——uint32 ptr 在带外 ≥4GB 假 xdb
 	//（EndIndexPtr 近 2^32）下 ptr += 14 回绕、扫描永不终止。
 	fi, err := f.Stat()
@@ -452,7 +488,7 @@ func regionTreeFromXDB(path string) *IP2RegionRegionTree {
 			continue
 		}
 		if strings.TrimSpace(fields[0]) != "中国" {
-			// 域 G（历史）：海外行收集归一化国名（异体折叠/非国家值剔
+			// 域 G：海外行收集归一化国名（异体折叠/非国家值剔
 			// 除，见 geoipnames.OverseasCountries）；「海外」哨兵仍由 Provinces
 			// 末位承载（解析失败/库缺失兜底），已解析海外行发射国名。
 			if country := geoipnames.NormalizeCountry(fields[0]); country != "" {
@@ -599,7 +635,7 @@ func staleRegionTreeCache(path string) bool {
 		return true
 	}
 	for _, prov := range tree.Provinces {
-		// 历史修复(历史):空串条目索引越界——缓存被带外手改(非本
+		// 空串条目索引越界——缓存被带外手改(非本
 		// 进程写入)时空串可入,prov[0] panic。启动路径,崩溃即启动失败。
 		if prov == "" || (prov != "海外" && prov[0] < 0x80) {
 			return true
@@ -623,7 +659,7 @@ func staleRegionTreeCache(path string) bool {
 }
 
 // writeRegionTreeCache 原子写树缓存（在库装载/更新成功时调用）。留 INFO 更新
-// 日志（历史问题）：缓存是派生数据不进审计，但静默重建会让「选项树何时
+// 日志：缓存是派生数据不进审计，但静默重建会让「选项树何时
 // 变化」在排障时不可见。
 func writeRegionTreeCache(tree *IP2RegionRegionTree) {
 	if tree == nil {
@@ -633,7 +669,7 @@ func writeRegionTreeCache(tree *IP2RegionRegionTree) {
 	if err != nil {
 		return
 	}
-	// 历史问题（历史）：落盘失败写 WARN「重建落盘失败」并返回——此前
+	// 落盘失败写 WARN「重建落盘失败」并返回——此前
 	// 静默吞错且仍写下方 INFO「已重建」成功行（日志谎报，排障误导）。
 	if err := writeProvincesCache(ip2RegionLivePathForTreeCache(), data); err != nil {
 		Logf("warn", "地域树缓存重建落盘失败（下次重建）: %v", err)

@@ -1,7 +1,7 @@
 package services
 
-// 历史修复（历史）：自动封禁六列集群传播四段接线钉测——
-//   ①主端快照恒携带六列（指针非 nil+线格式六键，镜像 历史问题 自动备份组）；
+// 自动封禁六列集群传播四段接线钉测——
+//   ①主端快照恒携带六列（指针非 nil+线格式六键，镜像自动备份组）；
 //   ②快照携带时从端 apply 落库；③旧主端快照缺席（全 nil）时从端保留本地值；
 //   ④主端保存（列变化）→ OF 触发器 bump（middleware 侧钉）→ 快照 → 从端收敛；
 //   ⑤升主后按 AutobanEnabled() 重开 autoban 调度（从端期间调度未开）。
@@ -91,7 +91,7 @@ func TestUpdateSnapshotSettings_autobanSettingsAppliedWhenPresent(t *testing.T) 
 	}
 }
 
-// 偏斜面（镜像 历史问题 缺席语义）：旧主端快照缺该组字段（全 nil 指针）时，
+// 偏斜面（镜像缺席语义）：旧主端快照缺该组字段（全 nil 指针）时，
 // 从端 apply 必须跳过写入、保留本地设置——不得把从端本地值清成零值。
 func TestUpdateSnapshotSettings_autobanSettingsAbsentPreservesLocal(t *testing.T) {
 	_, database := newClusterTestService(t)
@@ -127,7 +127,7 @@ func TestUpdateSnapshotSettings_autobanSettingsAbsentPreservesLocal(t *testing.T
 }
 
 // 全链路钉：主端六列非默认值 → bump → 快照 → 从端本地漂移值被收敛
-// （镜像 历史问题-01 三库排程列传播钉测）。
+// （镜像 三库排程列传播钉测）。
 func TestClusterSync_autobanColumnsPropagate(t *testing.T) {
 	cluster, database, syncService, bump := syncSemanticsEnv(t)
 	ctx := context.Background()
@@ -168,7 +168,7 @@ func TestClusterSync_autobanColumnsPropagate(t *testing.T) {
 }
 
 // 升主后调度恢复：从节点启动时未启用（调度未开）→ 主端快照把 autoban_enabled=1
-// 落到从端库（配置传播，历史修复 前四段）→ 升主。Promote 尾部必须按 AutobanEnabled()
+// 落到从端库（配置传播，前四段）→ 升主。Promote 尾部必须按 AutobanEnabled()
 // 重开 autoban 调度——否则库值已启用而 loop 永不开（静默停摆）。
 func TestClusterService_Promote_resumesAutobanScheduling(t *testing.T) {
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB

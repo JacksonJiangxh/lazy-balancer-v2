@@ -259,10 +259,10 @@ const handleMfaVerify = async () => {
   error.value = ''
   loading.value = true
   try {
-    // 历史修复：与 step-up/管理员重置同口径——归一化后仅提交首个 token，
+    // 与 step-up/管理员重置同口径——归一化后仅提交首个 token，
     // 兼容整段粘贴恢复代码块（@input 已在恢复模式归一化，此处兜底）。
     const result = await authStore.verifyMfaLogin(mfaToken.value, normalizeMfaCodeInput(mfaCode.value))
-    // 历史修复：store 重入护栏命中（请求未发出）——显式提示而非静默无事发生。
+    // store 重入护栏命中（请求未发出）——显式提示而非静默无事发生。
     if (result.skipped) error.value = '登录请求进行中，请稍候'
   } catch (caught: unknown) {
     error.value = errorMessage(caught, '验证失败，请重试')
@@ -279,8 +279,8 @@ const oidcDisplayName = ref('OIDC')
 const showLocalForm = ref(false)
 const oidcRedirecting = ref(false)
 onMounted(async () => {
-  // 历史问题-2:OIDC 跳转失败(302)经 hash query 携带 oidc_error——展示后从
-  // hash 清除(参照 历史问题 回调错误链的一次性语义)。
+  // OIDC 跳转失败(302)经 hash query 携带 oidc_error——展示后从
+  // hash 清除(参照回调错误链的一次性语义)。
   try {
     const hash = window.location.hash
     const qIndex = hash.indexOf('?')
@@ -291,12 +291,12 @@ onMounted(async () => {
         ElMessage.error(`OIDC 登录失败：${oidcError}`)
         params.delete('oidc_error')
         const rest = params.toString()
-        // 历史修复(历史):rest 为空串时不拼「?」——避免 URL 残留「#/?」。
+        // rest 为空串时不拼「?」——避免 URL 残留「#/?」。
         window.history.replaceState(null, '', window.location.pathname + hash.slice(0, qIndex) + (rest ? `?${rest}` : ''))
       }
     }
   } catch { /* 隐私模式 */ }
-  // 历史问题（历史）：回调失败不再经 sessionStorage 传递——App 在解析 hash 时
+  // 回调失败不再经 sessionStorage 传递——App 在解析 hash 时
   // 当场提示（已持有效会话、Login 不挂载的路径也能看到），此读取通道随之删除。
   try {
     const res = await request.get<{ data?: { enabled?: boolean; display_name?: string } }>('/auth/oidc/status', { silent: true })
@@ -313,7 +313,7 @@ const goOIDCLogin = () => {
   const returnTo = encodeURIComponent('/')
   window.location.href = `/api/v1/auth/oidc/login?return_to=${returnTo}`
 }
-// 历史问题:IdP 侧「返回」经 bfcache 恢复时 JS 状态保留——复位跳转锁,防 SSO
+// IdP 侧「返回」经 bfcache 恢复时 JS 状态保留——复位跳转锁,防 SSO
 // 按钮永久禁用(整页跳转本无重复提交面,disabled 仅作点击反馈)。
 // 监听器随组件卸载移除(防登出-登录循环渐进累积)。
 const onPageShow = (e: PageTransitionEvent) => {
@@ -333,7 +333,7 @@ const handleLogin = async () => {
     loading.value = true
     try {
       const result = await authStore.login(form.username, form.password)
-      // 历史修复：重入护栏命中时不再伪装成功——分流前先判 skipped。
+      // 重入护栏命中时不再伪装成功——分流前先判 skipped。
       if (result.skipped) {
         error.value = '登录请求进行中，请稍候'
         return
@@ -362,7 +362,7 @@ const handleSetup = async () => {
     error.value = ''
     loading.value = true
     try {
-      // 历史问题：silent 抑制全局拦截器 toast——403「已完成初始化」竞态时
+      // silent 抑制全局拦截器 toast——403「已完成初始化」竞态时
       // 全局 toast 与 inline alert 双通道呈现同一文案；改为单通道 inline。
       await request.post('/auth/setup', {
         username: setupForm.username,
@@ -370,16 +370,16 @@ const handleSetup = async () => {
         display_name: setupForm.display_name,
       }, { silent: true })
       const loginResult = await authStore.login(setupForm.username, setupForm.password)
-      // 历史修复：管理员已创建但登录被重入护栏跳过（防御路径）——切回登录表单提示手动登录。
+      // 管理员已创建但登录被重入护栏跳过（防御路径）——切回登录表单提示手动登录。
       if (loginResult.skipped) {
         setupMode.value = false
         error.value = '管理员已创建，请登录'
       }
     } catch (caught: unknown) {
-      // 历史问题：403 = 提交期间系统已被另一路径初始化——复探状态并切换
+      // 403 = 提交期间系统已被另一路径初始化——复探状态并切换
       // 登录表单（后端文案即指引），而非停在 setup 表单要求手动刷新。
       if (caught instanceof ApiRequestError && caught.status === 403) {
-        // 历史问题：复探失败时回显可行动提示（原代码清空错误但注释称「仍呈现」，
+        // 复探失败时回显可行动提示（原代码清空错误但注释称「仍呈现」，
         // 复探失败态下用户停留 setup 表单且无任何提示）；复探成功才切换登录表单。
         try {
           const res = await request.get<SetupStatusResponse>('/auth/setup', { silent: true })

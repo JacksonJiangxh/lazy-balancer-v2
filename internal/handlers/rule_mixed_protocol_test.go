@@ -1,6 +1,6 @@
 package handlers
 
-// 历史修复（历史问题）：HTTP 规则混合 http/https 上游池在 Caddy 无逐上游
+// HTTP 规则混合 http/https 上游池在 Caddy 无逐上游
 // 协议概念（shouldUseTLS 传输级+except_ports 例外表，v2.11.6 httptransport.go:
 // 674-680）——任一 https 上游使池级 TLS 传输生效，http 上游明文打 TLS 端口
 // 静默全灭 502。保存/导入侧显式拒绝混布（用户裁定修法①）。
@@ -54,7 +54,7 @@ func TestRulePayload_rejectsMixedHttpHttpsUpstreamPool(t *testing.T) {
 	}
 }
 
-// 备份侧同门（历史问题 同位）：手造备份带混布池须 400。
+// 备份侧同门：手造备份带混布池须 400。
 func TestValidateBackupRuleReferences_rejectsMixedHttpHttpsPool(t *testing.T) {
 	tables := map[string][]map[string]any{
 		"lb_rules": {{"caddy_id": "lb_mixbak", "protocol": "http"}},
@@ -69,7 +69,7 @@ func TestValidateBackupRuleReferences_rejectsMixedHttpHttpsPool(t *testing.T) {
 	}
 }
 
-// 同族（路径规则自定义上游池，历史修复 收敛面）：路径级自定义上游混布同样拒绝。
+// 同族（路径规则自定义上游池，收敛面）：路径级自定义上游混布同样拒绝。
 func TestRulePayload_rejectsMixedPathRuleUpstreamPool(t *testing.T) {
 	handler := newRuleFeatureTestHandlers(t)
 	gin.SetMode(gin.TestMode)
@@ -89,7 +89,7 @@ func TestRulePayload_rejectsMixedPathRuleUpstreamPool(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：混布门收敛三链——存量混布行（69 轮修复前落库/
+// 混布门收敛三链——存量混布行（69 轮修复前落库/
 // 直改 DB）不得经启用/复制静默投入运行，启动聚合校验须点名告警。保存门与
 // v2 导入链已拦新数据（上方两测试）；此前启用链/聚合校验/复制链零检查。
 

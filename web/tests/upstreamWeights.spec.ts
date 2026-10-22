@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { normalizeWeights, payloadWeight, redistributeWeight, weightPercent } from '../src/utils/upstreamWeights.ts'
 
-test('历史问题-01：重新启用上游至少分配 1，UI 不再显示 0%', () => {
+test('重新启用上游至少分配 1，UI 不再显示 0%', () => {
   const rows = [
     { weight: 100, enabled: true },
     { weight: 0, enabled: true },
@@ -14,7 +14,7 @@ test('历史问题-01：重新启用上游至少分配 1，UI 不再显示 0%', 
   ])
 })
 
-test('历史问题-01：禁用行仍为 0，其余启用行合计 100', () => {
+test('禁用行仍为 0，其余启用行合计 100', () => {
   const rows = [
     { weight: 60, enabled: true },
     { weight: 40, enabled: true },
@@ -27,7 +27,7 @@ test('历史问题-01：禁用行仍为 0，其余启用行合计 100', () => {
   ])
 })
 
-test('历史问题-01：全零与单行边界仍归一到 100', () => {
+test('全零与单行边界仍归一到 100', () => {
   const rows = [{ weight: 0, enabled: true }, { weight: 0, enabled: true }]
   normalizeWeights(rows)
   assert.equal(rows.reduce((sum, row) => sum + row.weight, 0), 100)

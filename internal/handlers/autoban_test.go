@@ -1,6 +1,6 @@
 package handlers
 
-// 自动封禁（历史问题）端点与预置名单例外钉：
+// 自动封禁端点与预置名单例外钉
 //   GET/PUT /security/autoban 六项配置（校验/审计；保存联动调度启停）
 //   POST /security/autoban/run 已废除（2026-10-14 裁定：调度唯一前提=启用）
 //   GET  /security/autoban/status 运行态+今日封禁+名单数+观察建议+引用状态
@@ -35,7 +35,7 @@ func newAutobanTestEnv(t *testing.T) *gin.Engine {
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
-		// 历史修复（历史）：同步复位 currentDB，后台循环不得持有已关闭测试库
+		// 同步复位 currentDB，后台循环不得持有已关闭测试库
 		db.SetDB(oldDB)
 	})
 	fakeCaddy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -273,7 +273,7 @@ func TestAutobanStatus_banEffectiveTruthTable(t *testing.T) {
 		{name: "empty list", entries: `[]`, aclEnabled: true, aclMode: "deny", refsField: "ip_acl_list_refs", bind: true, ruleEnabled: true, upstreams: []bool{true}, want: false},
 		{name: "IP ACL disabled", entries: `[{"value":"198.51.100.8"}]`, aclEnabled: false, aclMode: "deny", refsField: "ip_acl_list_refs", bind: true, ruleEnabled: true, upstreams: []bool{true}, want: false},
 		{name: "whitelist reference only", entries: `[{"value":"198.51.100.8"}]`, aclEnabled: false, aclMode: "deny", refsField: "ip_whitelist_refs", bind: true, ruleEnabled: true, upstreams: []bool{true}, want: false},
-		// 历史问题（历史）：渲染层对零启用上游的规则整条 continue——此时名单
+		// 渲染层对零启用上游的规则整条 continue——此时名单
 		// 实际不拦截，卡片不得再报 ban_effective=true（否则黄条被抑制）。
 		{name: "no upstream", entries: `[{"value":"198.51.100.8"}]`, aclEnabled: true, aclMode: "deny", refsField: "ip_acl_list_refs", bind: true, ruleEnabled: true, upstreams: nil, want: false},
 		{name: "only disabled upstream", entries: `[{"value":"198.51.100.8"}]`, aclEnabled: true, aclMode: "deny", refsField: "ip_acl_list_refs", bind: true, ruleEnabled: true, upstreams: []bool{false}, want: false},
@@ -339,7 +339,7 @@ func TestAutobanStatus_banEffectiveTruthTable(t *testing.T) {
 	})
 }
 
-// 历史问题（历史）：autobanListReferenced / autobanBanEffective 的查询失败
+// autobanListReferenced / autobanBanEffective 的查询失败
 // fail-closed 分支此前无测试——预置名单查询失败时必须按「已引用/已生效」处理
 // （不弹误导性黄条）。status 端点在名单表缺失时更早的 AutobanListEntries 已
 // 500，故直接钉两个判据 helper 的失败分支。
@@ -505,7 +505,7 @@ func TestAutobanListEntryCap_matchesHandlerCap(t *testing.T) {
 	}
 }
 
-// ---- 历史修复（历史）：内置名单引用门提示语按名单名分流 ----
+// 内置名单引用门提示语按名单名分流 ----
 
 // Given 自动封禁预置名单（system=1，非威胁情报源）。
 // When 信任名单引用它（内置名单引用门拒绝的唯一非法形态之一）。
@@ -535,7 +535,7 @@ func TestCreatePolicy_builtinAutobanListRefMessageNamesAutoban(t *testing.T) {
 	}
 }
 
-// ---- 历史修复（历史）：PUT 禁用路径收尾接线 ----
+// PUT 禁用路径收尾接线 ----
 
 // Given 名单含已到期自动条目+未到期自动条目；重载回调间谍；名单无任何发射面引用。
 // When PUT enabled=false（禁用保存）。
@@ -599,7 +599,7 @@ func TestAutobanPreset_categoryDescriptionLocked(t *testing.T) {
 	}
 }
 
-// ---- 历史问题（历史）：过期自动封禁条目的手动封禁 ----
+// 过期自动封禁条目的手动封禁 ----
 
 // Given 预置名单含一条已到期未清理的自动封禁条目（自动封禁关闭时不会清理）。
 // When 从事件页对该 IP 手动封禁（AddIPToList）。
@@ -635,7 +635,7 @@ func TestAddIPToList_replacesExpiredAutobanEntry(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：威胁名单导出时文件读取/解析故障必须显式 500——
+// 威胁名单导出时文件读取/解析故障必须显式 500——
 // 旧实现吞掉非 NotExist 错误返回 200 空 TXT，调用方无法区分「名单为空」。
 func TestExportIPList_threatFileReadErrorReturns500(t *testing.T) {
 	router := newAutobanTestEnv(t)
@@ -667,7 +667,7 @@ func TestExportIPList_threatFileReadErrorReturns500(t *testing.T) {
 	}
 }
 
-// 历史问题-02（历史）：自动封禁计数的唯一喂入源是安全事件采集任务——
+// 自动封禁计数的唯一喂入源是安全事件采集任务——
 // 用户停止它（或自愈预算用尽停环）后本任务仍每轮 success 记「计数 0 IP」。
 // /security/autoban/status 必须暴露降级原因（只做可见性，不自动拉起显式停止
 // 的任务）。

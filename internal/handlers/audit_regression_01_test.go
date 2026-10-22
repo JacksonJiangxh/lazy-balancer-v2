@@ -67,7 +67,7 @@ func TestUserPasswordEndpoints_reject_passwords_shorter_than_policy(t *testing.T
 func TestUpdateCurrentUser_rolls_back_display_name_when_password_update_fails(t *testing.T) {
 	// Given
 	h := newBackupTestHandlers(t)
-	// 历史修复（契约）：本用例穿过共享密码确认门，种子须为真实 bcrypt 哈希且携带
+	// （契约）：本用例穿过共享密码确认门，种子须为真实 bcrypt 哈希且携带
 	// current_password（占位 'old-hash' 会在门处 401，到不了触发器路径）。
 	hash, err := bcrypt.GenerateFromPassword([]byte("old-secret"), bcrypt.MinCost)
 	if err != nil {
@@ -250,7 +250,7 @@ func TestUpdateRule_stops_before_database_commit_when_route_snapshot_fails(t *te
 	router.ServeHTTP(response, request)
 
 	// Then
-	// 历史修复-b：快照先于 validate 摄取——管理接口不可达现于快照阶段以 500
+	// b：快照先于 validate 摄取——管理接口不可达现于快照阶段以 500
 	// 阶段重排并入此处）。核心不变量不变：数据库未提交。
 	if response.Code != http.StatusInternalServerError {
 		t.Fatalf("status=%d body=%s, want 500", response.Code, response.Body.String())
@@ -456,7 +456,7 @@ func TestScanAPIKeys_returns_rows_iteration_error(t *testing.T) {
 
 func TestValidateCRSField_excludedRuleIDForm(t *testing.T) {
 	useCRSRuleIndexFixture(t)
-	// 历史修复：排除 ID 与发射门 validSecRuleRemoveTarget 同口径
+	// 排除 ID 与发射门 validSecRuleRemoveTarget 同口径
 	//（纯数字或 数字-数字）；字母后缀形态保存即拒绝（此前保存 200、发射静默跳过）。
 	ok := `["942100","942100-942199","REQUEST-942-APPLICATION-ATTACK-SQLI.conf"]`
 	v := ok

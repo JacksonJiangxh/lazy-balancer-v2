@@ -42,7 +42,7 @@ type metricsCursorErrorRows struct {
 	read bool
 }
 
-// 历史修复：列必须与 GetRuleMetricsHistory 的 SELECT 完全一致（9 列，含
+// 列必须与 GetRuleMetricsHistory 的 SELECT 完全一致（9 列，含
 // requests_blocked）——原 8 列让首次 Scan 就失败，游标中断分支从未执行。
 func (*metricsCursorErrorRows) Columns() []string {
 	return []string{"timestamp", "requests_total", "requests_2xx", "requests_3xx", "requests_4xx", "requests_5xx", "requests_blocked", "bytes_in", "bytes_out"}
@@ -71,7 +71,7 @@ func newMetricsTestDatabase(t *testing.T) {
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
-		// 历史问题：直换包级句柄必须同步复位 currentDB（历史修复 契约，
+		// 直换包级句柄必须同步复位 currentDB（契约，
 		// 与 newBackupTestHandlers 同型），防跨用例留下 nil/已关闭句柄。
 		db.SetDB(oldDB)
 	})
@@ -211,7 +211,7 @@ func TestGetRuleMetricsHistory_returns_error_when_cursor_fails(t *testing.T) {
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/rules/lb_history/metrics-history", nil))
 
-	// Then：历史修复——必须真正到达 rows.Err() 分支（原假驱动列数 8 vs Scan 9
+	// Then：必须真正到达 rows.Err() 分支（原假驱动列数 8 vs Scan 9
 	// 让首次 Scan 即以列数不匹配 500，游标中断分支从未被覆盖）。
 	if response.Code != http.StatusInternalServerError {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
@@ -264,7 +264,7 @@ func TestLoadRuleUpstreams_coalesces_nullable_columns(t *testing.T) {
 
 var _ driver.QueryerContext = metricsCursorErrorConn{}
 
-// 历史问题(历史):监控面板聚合端点 5s TTL 缓存(与 helpers.go
+// 监控面板聚合端点 5s TTL 缓存(与 helpers.go
 // systemSampleTTL 同模式)——TTL 内重复调用不得重复抓取 Caddy /metrics。
 func TestGetMetricsDashboard_cachesCaddyFetchWithinTTL(t *testing.T) {
 	// Given:假 Caddy 计数 /metrics 命中
@@ -298,8 +298,8 @@ func TestGetMetricsDashboard_cachesCaddyFetchWithinTTL(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：MetricsDB 未装配时两个历史端点必须返回空数据
-// 200（历史问题 家族口径），不得 nil-deref panic。
+// MetricsDB 未装配时两个历史端点必须返回空数据
+// 200，不得 nil-deref panic。
 func TestMetricsHistory_nilMetricsDBReturnsEmpty(t *testing.T) {
 	newMetricsTestDatabase(t)
 	if _, err := db.DB.Exec("INSERT INTO lb_rules (caddy_id, name, protocol, listen_port, enabled) VALUES ('lb_nil_metrics', 'nil', 'http', 8081, 1)"); err != nil {

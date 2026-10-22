@@ -4,8 +4,8 @@ package taskengine
 // 时间序列替代任务名柱状图——高频任务不再压制其他任务，且新增时间分布信息。
 // 口径：配置时区墙面小时（engineNowStr 同基准，与 task_runs 存储串一致）。
 //
-// 历史修复（历史问题，含 历史修复）：桶键构造期望随生产侧改为墙面小时
-// （time.Date 日历分量取整），并补时区形状三枚举（历史修复 谓词真值表）：
+// 桶键构造期望随生产侧改为墙面小时
+// （time.Date 日历分量取整），并补时区形状三枚举
 //   - 整小时偏移（+08:00 固定）——生产行为不变（回归形状）
 //   - 非整小时偏移（+05:30）——Truncate(1h) 纪元取整会产出 :30 桶键，
 //     与 strftime('%H:00:00') 墙面键永不相交 → 24 桶全零（原缺陷形状）
@@ -31,7 +31,7 @@ func runHourlySeriesShape(t *testing.T, loc *time.Location) {
 
 	e := newTestEngine(t)
 	now := time.Now().In(loc)
-	// 期望锚点=墙面小时（历史修复 修复后的生产口径；Truncate 在非整小时
+	// 期望锚点=墙面小时（修复后的生产口径；Truncate 在非整小时
 	// 偏移时区下会产出 :30 分钟分量）
 	curHour := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 0, 0, 0, loc)
 	mk := func(h time.Time, status string) {

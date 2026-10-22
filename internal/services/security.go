@@ -58,8 +58,8 @@ func scanSecurityPolicyByID(policyID int) *models.SecurityPolicy {
 }
 
 // GetSecurityPoliciesForRule returns all enabled policies bound to a rule,
-// ordered by policy_id ASC (历史问题 v2.2.0 multi-policy binding).
-// 历史问题（历史）：先收集 policy_id 并关闭 rows，再做逐条策略
+// ordered by policy_id ASC ( v2.2.0 multi-policy binding).
+// 先收集 policy_id 并关闭 rows，再做逐条策略
 // 加载与引用解析——旧实现在 rows 打开期间嵌套 QueryRow/批量查询，db.DB
 // 连接池（上限 10）打满即互相等待永久阻塞（无 context 超时）。
 func GetSecurityPoliciesForRule(ruleCaddyID string) []*models.SecurityPolicy {
@@ -102,9 +102,9 @@ func GetSecurityPoliciesForRule(ruleCaddyID string) []*models.SecurityPolicy {
 
 // geoipCountries parses the policy's geoip_countries JSON array, skipping
 // blank entries. A missing or malformed payload yields nil.
-// 历史修复（历史）：畸形 JSON 不再静默——WARN 留痕后按无地域规则渲染。
+// 畸形 JSON 不再静默——WARN 留痕后按无地域规则渲染。
 // 不 fail-visible 的推演披露：geoip_countries 是单策略 TEXT 列，fail-visible
-// 会让一份带外脏行阻断整份配置生成（全部规则重载失败），与 历史修复 受信代理
+// 会让一份带外脏行阻断整份配置生成（全部规则重载失败），与受信代理
 // 裁定同向（可用性优先+降级可见）；写侧/导入门已拒绝该形态，WARN 面向
 // 带外直写/旧备份绕过残留。
 func geoipCountries(p *models.SecurityPolicy) []string {
@@ -113,7 +113,13 @@ func geoipCountries(p *models.SecurityPolicy) []string {
 	}
 	var entries []string
 	if err := json.Unmarshal(p.GeoIPCountries, &entries); err != nil {
-		Logf("warn", "策略 %q（#%d）geoip_countries 畸形 JSON，渲染按无地域规则处理: %v", p.Name, p.ID, err)
+		// 与同族三处（内联/引用名单、crawlerEngineSelected）同口径：60s 限流
+		// 留痕——渲染按「规则×绑定策略」粒度执行，脏行存续期逐条刷 WARN 会
+		// 淹没同窗口真实告警。
+		msg := fmt.Sprintf("策略 %q（#%d）geoip_countries 畸形 JSON，渲染按无地域规则处理: %v", p.Name, p.ID, err)
+		if auditFailureShouldLog(msg) {
+			Logf("warn", "%s", msg)
+		}
 		return nil
 	}
 	out := make([]string, 0, len(entries))
@@ -132,18 +138,18 @@ func PolicyHasGeoIP(p *models.SecurityPolicy) bool {
 	return p.GeoIPMode != "off" && len(geoipCountries(p)) > 0
 }
 
-// crsPoolFingerprint（历史问题）：coraza-caddy v2.5.0 的 computePoolKey()
+// crsPoolFingerprint：coraza-caddy v2.5.0 的 computePoolKey()
 // = hash(directives + include + crs flag)——directives 只含固定 Include 路径，
 // CRS 文件替换/手动改 zz-user-overrides.conf 后池键不变，新 Caddy 配置 Provision
 // 复用旧 WAF（LoadOrNew refcount++），旧规则静默继续生效直到进程重启。在
 // directives 里嵌内容指纹（CRS 版本 + overrides mtime+size，每次配置生成仅
 // 2 个 stat + 1 个 db 查询，远低于 tarGzDirSum 的整树遍历成本），指纹变 →
 // 池键变 → 新 WAF 真正编译新规则。Coraza 把 '#' 当注释行，不影响语义。
-// 覆盖边界（历史问题核实，维持设计）：crs-setup.conf 与 rules/*.conf 的
+// 覆盖边界：crs-setup.conf 与 rules/*.conf 的
 // 直接手改不进池指纹（指纹只含版本行+overrides mtime/size）——标准变更链路
 // （CRS 更新器/导入）必改版本行触发指纹翻转；绕过链路的手改需重启进程生效，
 // 属已声明的成本权衡。
-// crsPoolFingerprintForChain 是批量链构建入口的一次性指纹取值点（审计 历史修复）。
+// crsPoolFingerprintForChain 是批量链构建入口的一次性指纹取值点（审计）。
 func crsPoolFingerprintForChain() string {
 	return crsPoolFingerprint()
 }
@@ -163,7 +169,7 @@ func crsPoolFingerprint() string {
 }
 
 // crsFingerprint：批量生成方按链计算一次并透传，避免逐 (规则×策略) 对重复
-// 执行 DB 查询+stat（审计 历史修复）；空串回退自算。multiPolicy（历史问题）：
+// 执行 DB 查询+stat（审计）；空串回退自算。multiPolicy
 // 预检存在时策略层 IP ACL 链式自排除本策略信任集。blockStatus：拦截页按触发
 // 策略归因的合成中断码（481+，securityPolicyContext.policySynthetic 按策略
 // 身份分配）；>0 时段内全部 deny 显式抬码（IP ACL/GeoIP/自定义规则/CRS
@@ -174,12 +180,12 @@ func crsPoolFingerprint() string {
 // 热路径，2026-10-15 始终发射收敛）；缺省=无此类策略（不发射）。并集元素为
 // 按规则绑定的信任地址（直通形态 trust_detection=0 由路由层 subroute 短路，
 // 不进本参数）。
-// ruleCaddyID（第 6 参，历史修复）：id:12 的 u-trust12 投影 scope 编入
+// ruleCaddyID（第 6 参）：id:12 的 u-trust12 投影 scope 编入
 // 规则身份（u-trust12-<ruleCaddyID>）——stage0DetectionTrust 是逐规则并集
 // （policiesForRule），全局单文件名下异策略集多规则后渲染覆盖前者=信任集
 // 串染。空值显性报错。
 //
-// 历史修复（历史裁定，维持 fail-loud 不收窄）：空身份的爆炸半径=整份配置
+// （裁定，维持 fail-loud 不收窄）：空身份的爆炸半径=整份配置
 // 被拒（保存失败/重载失败）。已裁定豁免不修——生产路径 ruleCaddyID 恒非空
 // （两个渲染入口都由规则身份驱动），空值=数据损坏/调用错位的显性信号；收窄
 // 为「跳过该规则+告警」会让受影响规则的 IP 控制面静默缺失（安全面静默缺口），
@@ -200,7 +206,7 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 		return "", fmt.Errorf("u-trust12 引擎投影缺少规则身份（ruleCaddyID 为空）——id:12 逐规则渲染，scope 必须编入规则身份（历史 HP-1）")
 	}
 	var sb strings.Builder
-	// 历史问题：嵌 coraza 池键指纹（见 crsPoolFingerprint）——CRS 文件
+	// 嵌 coraza 池键指纹（见 crsPoolFingerprint）——CRS 文件
 	// 替换/手动改 overrides 后池键必须变化，否则新 Caddy 配置复用旧 WAF
 	//（旧规则静默继续生效）。
 	crsFp := crsFingerprint
@@ -231,7 +237,7 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 	// opt-in，flag 门控会使全部默认策略凭空获得引擎/信任规则——发射面膨胀，
 	// 门禁钉测实证），维持内容门控；allow ACL（否定算子）与遗留黑名单同理
 	// 维持内容门控（见下 ipListRuleOperand 调用点注释）。
-	// 历史问题-02：启用 allow 时即使合并后有效条目为空也必须发射
+	// 启用 allow 时即使合并后有效条目为空也必须发射
 	// 否定算子（空文件 = 全不匹配 = 恒拒），覆盖备份导入、带外改库和条目
 	// 自然到期三条路径；内容门只用于语义不等价的信任/黑名单/deny。
 	hasNonTrustIPControl := len(ipBL) > 0 || p.IPACLEnabled
@@ -265,7 +271,7 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 		// 阻断;随后通过 phase:1 的 SecAction 仅将 CRS 规则集切换为
 		// DetectionOnly(该切换在 CRS Include 之前生效),自定义拦截规则与 IP
 		// ACL 不受影响,仍在检测模式下强制阻断。
-		// 例外(历史修复):body 目标的自定义拦截规则发射为 phase:2(REQUEST_BODY
+		// 例外:body 目标的自定义拦截规则发射为 phase:2(REQUEST_BODY
 		// 仅 phase:2 可读),而 DetectionOnly ctl 是事务级指令持续到 phase:2——
 		// 该类规则在检测模式下仅记录不阻断(见 emitCustomRules 相位说明)。
 		sb.WriteString("SecRuleEngine On\n")
@@ -279,13 +285,13 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 	default:
 		return "", nil
 	}
-	// 历史问题-1 + 历史问题/新-3(历史收紧):仅存在 body 消费者时开启
+	// + /新-3:仅存在 body 消费者时开启
 	// 请求体访问——coraza-caddy v2.6.0 的 body 缓冲唯一门控是
 	// RequestBodyAccess(无惰性检查)。消费者精确枚举:
 	//   ① CRS(phase:2 规则集,blocking/detection);
 	//   ② 自定义规则可发射的模式(custom_only)且存在已启用规则(可有 body 目标;
 	//      规则启停经 finishTxApply 重渲染,收紧零滞后)。off 态停放启用规则
-	//      不发射,不计入(历史问题:历史修复 形态在 off+停放规则形状反向回归)。
+	//      不发射,不计入（形态在 off+停放规则形状反向回归)。
 	// 历史的第三条件 log_request_body 经引擎源码验证在 mode=off 不可消费
 	// (phase:1 中断先于 body 读、C 段恒空)——移除;对照同型 IP 预检正确用
 	// Off+无 C 段。
@@ -304,10 +310,10 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 	} else {
 		sb.WriteString("SecResponseBodyAccess Off\n")
 	}
-	// 历史修复（v2.2.3）：策略级「记录请求体」开关——开启时审计 parts 加 C，coraza
+	// （v2.2.3）：策略级「记录请求体」开关——开启时审计 parts 加 C，coraza
 	// 在事件事务（RelevantOnly 门控）输出 transaction.request.body，摄入落库
 	// request_body（64KB 截断）。请求体 access 由上方 crsActive/customActive
-	// 门控决定（历史问题-1 后 :214-218 条件发射，不再恒 On）；本开关
+	// 门控决定（后:214-218 条件发射，不再恒 On）；本开关
 	// （LogRequestBody）仅扩展审计输出面（加 C 段）。
 	auditParts := "ABIJDEFHKZ"
 	if p.LogRequestBody {
@@ -315,10 +321,11 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 	}
 	// SecAuditLogType lbfile：审计写插件（caddygeoip auditwriter.go，xcaddy
 	// 链入）——异步有界队列+bufio 批量落盘，刷盘前把进程内计时注册表的分段
-	// 耗时注入审计行顶层 lb_timing 字段（历史：侧车退役，摄取管道改读
-	// 行内嵌字段）。零丢弃：队列满时阻塞等消化（退化价=
-	// serial 同步写）。coraza NewWAF 时 Init 打开文件（目录缺失=配置拒绝，
-	// 历史问题-1 语义不变）；轮转=copytruncate，长生命周期 fd 恒有效。
+	// 耗时注入审计行顶层 lb_timing 字段（侧车退役，摄取管道改读
+	// 行内嵌字段）。有界背压：队列满时请求路径最多等待 2s，超时丢弃该条并
+	// 计数告警（drain 沉陷不再拖住数据面；丢弃计数见 auditwriter dropped）。
+	// coraza NewWAF 时 Init 打开文件（目录缺失=配置拒绝，
+	// 语义不变）；轮转=copytruncate，长生命周期 fd 恒有效。
 	sb.WriteString(fmt.Sprintf("SecAuditEngine RelevantOnly\nSecAuditLog %s\nSecAuditLogType lbfile\nSecAuditLogFormat JSON\nSecAuditLogParts %s\n", auditLogPath, auditParts))
 
 	// SecRule id map: 2 = ACL allow/deny, 3 = 绕过-mode (legacy), 4 = legacy
@@ -345,7 +352,7 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 	// 锁死风险——同样维持内容门控。遗留黑名单为内联字段，仅经策略保存（全
 	// 量链）变化，维持内容门控。
 	// allow 内容的空集不是“无规则”：否定算子空文件=恒拒。删除内容门，
-	// 让条目全部过期/备份导入空引用时仍发射 deny（历史问题-02）。
+	// 让条目全部过期/备份导入空引用时仍发射 deny。
 	if p.IPACLEnabled {
 		operand, err := ipListRuleOperand(fmt.Sprintf("p%d-acl", p.ID), ipACLList, p.IPACLMode == "allow")
 		if err != nil {
@@ -389,17 +396,17 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 		sb.WriteString(fmt.Sprintf("SecRule REMOTE_ADDR \"%s\" \"id:12,phase:1,pass,nolog,ctl:ruleEngine=DetectionOnly\"\n", operand))
 	}
 
-	// 历史问题(历史,历史问题,取代 历史问题 抑制方案):多策略(预检存在)
+	// （取代抑制方案):多策略(预检存在)
 	// 时策略层 id:2/4 改链式自排除本策略信任集——
 	//   · 本策略信任 IP:预检信任并集 DetectionOnly 统一记录(去重保持,
-	//     历史问题 目标),策略层链第二段 !@ipListFast 信任集 不命中→链整体
+	//     目标),策略层链第二段!@ipListFast 信任集 不命中→链整体
 	//     不触发→不重复;
 	//   · 他策略信任 IP(∉本策略信任集):链两段全命中→首段 deny 执行
-	//     403——恢复「信任仅豁免所属策略」裁定边界(抑制方案下 历史问题 层无拦截
+	//     403——恢复「信任仅豁免所属策略」裁定边界(抑制方案下层无拦截
 	//     点击穿);
 	//   · 无信任名单的策略:无排除项→平原 id:2/4(与单策略形状一致);
 	//   · 单策略(无预检):同实例信任 DetectionOnly 已正确处理,平原形态。
-	// 历史问题(历史,历史问题,引擎约束):coraza「disruptive 动作仅允许
+	// coraza「disruptive 动作仅允许
 	// 链首段」(rule_parser.go:421)——deny/status/log/msg/skipAfter 必须在
 	// 首段并以 ,chain 收尾,续段仅 t:none(GeoIP id:8 同款生产形状);
 	// deny 在续段的形状被解析器整体拒绝(v2.2.11 出厂事故)。
@@ -459,9 +466,9 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 	}
 
 	// 仅自定义模式同样需要 body processor 激活:自定义 body 条件规则依赖解析
-	// (历史修复 随四态化一并解决);id:11 守卫计分在本模式无 949 消费,
+	// ;id:11 守卫计分在本模式无 949 消费,
 	// 仅留事件——与计分动作的检测计分退化口径一致。
-	// 历史问题（历史）：门收紧 hasCustomRules——custom_only+仅 IP 控制
+	// 门收紧 hasCustomRules——custom_only+仅 IP 控制
 	// 形状下上方 SecRequestBodyAccess 恒 Off（BodyAccessTruthTable 已钉），
 	// id:9/10/11 无消费者，发射即死指令。
 	if p.Mode == "custom_only" && hasCustomRules {
@@ -472,10 +479,14 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 		var groups []string
 		if err := json.Unmarshal(p.CRSRuleGroups, &groups); err != nil {
 			// D7 同族（geoip_countries 先例）：畸形列不 fail-visible，按空=全量
-			// 发射；WARN 留痕供带外改库/旧备份残留诊断。
-			Logf("warn", "策略 %q（#%d）crs_rule_groups 畸形 JSON，渲染按空=全量规则组处理: %v", p.Name, p.ID, err)
+			// 发射；WARN 留痕供带外改库/旧备份残留诊断，60s 限流与同族三处一致
+			// （渲染按规则×策略粒度执行，脏行存续期逐条刷会淹没真实告警）。
+			msg := fmt.Sprintf("策略 %q（#%d）crs_rule_groups 畸形 JSON，渲染按空=全量规则组处理: %v", p.Name, p.ID, err)
+			if auditFailureShouldLog(msg) {
+				Logf("warn", "%s", msg)
+			}
 		}
-		// 历史修复（读取面兜底）：存量/带外数据（写入面剥离生效前落库、集群同步旧快照）
+		// （读取面兜底）：存量/带外数据（写入面剥离生效前落库、集群同步旧快照）
 		// 可能仍含基础设施组号——按数组原位发射 REQUEST-901/949/959-*.conf glob
 		// 会破坏 901 最前/949、959 殿后的强制序（偏执级守卫空转、阻断静默漏拦）。
 		// 与写入面 validateAndNormalizeCRSField 同口径剥离；剥离后为空落入全量
@@ -484,7 +495,7 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 			Logf("debug", "策略 %q 的 crs_rule_groups 含基础设施组号 %v，发射时已剥离（由强制 Include 按正确次序补齐）", p.Name, stripped)
 			groups = kept
 		}
-		// 历史修复：索引取值链级惰性一次——下方三个消费点（crsCoveredInfraGroupCodes/
+		// 索引取值链级惰性一次——下方三个消费点（crsCoveredInfraGroupCodes/
 		// emitCRSRuleGroupSelection/emitScopedCRSExclusions）各自直调 GetCRSRuleIndex
 		// 会各付一次缓存键计算（ReadDir+全量 stat），全量生成时数百次纯浪费。
 		chainIndex := lazyCRSRuleIndex()
@@ -495,12 +506,12 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 		//           即正确先例：先 Include 父文件再逐 ID RemoveById）
 		//   运行时：必须在 Include 之前（phase:1 按插入序执行，ctl 规则先于被禁
 		//           规则才能在其求值前标记 tx.ruleRemoveByID——coraza ctl.go:85）
-		// 第四轮 历史问题 把整个块搬到 Include 前修好了 ctl 却弄坏了配置期。
+		// 第四轮把整个块搬到 Include 前修好了 ctl 却弄坏了配置期。
 		// 作用域限定（ip/list）条目收集后统一发射：列表引用需单批解析，合并去重。
 		var scoped []CRSExcludedEntry
 		var scopeAllTargets []string
 		for _, entry := range ParseCRSExcludedRules(string(p.CRSExcludedRules)) {
-			// 历史修复 存量兜底：命中 901 初始化组的排除一律跳过——初始化组已由下方
+			// 存量兜底：命中 901 初始化组的排除一律跳过——初始化组已由下方
 			// 去重强制包含，排除若放行会在 Include 后（scope=all）或运行时
 			//（scoped ctl）将其删除，守卫按 0 处理、策略空转。写入面对新提交
 			// 已 400 硬拒（CRSExclusionTargetRemovesInit），此处拦存量老数据。
@@ -553,7 +564,7 @@ func buildCorazaDirectivesWithScopedCache(p *models.SecurityPolicy, store caddyC
 				sb.WriteString("Include /app/waf/crs/rules/REQUEST-*.conf\n")
 			}
 		} else {
-			// 基础设施组强制包含（去重，历史修复）：901 提供偏执级默认值与评分初始化——
+			// 基础设施组强制包含（去重）：901 提供偏执级默认值与评分初始化——
 			// 缺失时偏执级守卫把未初始化变量按 0 处理、整段 skipAfter，策略空转
 			// 且 980099 每事务打 ERROR；949/959 是评分阈值拦截的唯一执行者——缺失
 			// 时拦截模式静默退化为仅记录。两者均属静默失效，不开放用户配置
@@ -679,13 +690,13 @@ func hasStage0TrustDetection(policies []*models.SecurityPolicy) bool {
 }
 
 // emitBodyProcessorRules 发射 JSON/XML body processor 激活与畸形 body 守卫
-// (id:9/10/11)。coraza 不按 历史修复 自动启用 JSON/XML processor(与
+// (id:9/10/11)。coraza 不按自动启用 JSON/XML processor(与
 // ModSecurity 连接器不同,须 ctl 显式激活),否则 body 被兜底按 URLENCODED
 // 解析——JSON/XML 整串成为单个参数名:ARGS_NAMES 规则(942550/941100)在原始
 // 文本上误报,ARGS 值规则对 body 失明(2026-09-09 942550 误报排查裁定)。
 // 在 CRS 模式下先于 Include 发射(文档化意图;运行时 ctl 于 phase:1 全部生效,
 // 先后均等价);custom_only 模式为自定义 body 规则提供解析。正则 (?i):
-// 历史修复 值大小写不受控(coraza 仅小写化 header 名,历史修复)。
+// 值大小写不受控(coraza 仅小写化 header 名）。
 // id:11:畸形 JSON/XML 解析失败后所有 body 集合为空且 901340
 // 不再 force,CRS 4.29 无任何规则消费 REQBODY_PROCESSOR_ERROR(grep 实证)——
 // 「声明 JSON + 发非法 JSON」可对全部 body 规则隐身;守卫计满临界异常分
@@ -715,11 +726,11 @@ const geoipLocOverseas = "海外"
 // 条目经 QuoteMeta 转义——集群同步/历史行可携带绕过校验的特殊字符，未转义会
 // 注入正则元字符（ReDoS/越权匹配）。
 func geoipLocOperator(countries []string, allowMode bool, exactSet map[string]bool) string {
-	// 历史问题 兼容补丁（2026-10-14 用户裁定）：「海外」条目语义展开——发射端
+	// 兼容补丁（2026-10-14 用户裁定）：「海外」条目语义展开——发射端
 	// 改造后已解析海外行发国名，存量「禁止海外」规则的「海外」条目必须覆盖
 	// 「哨兵 ∪ 树 Countries 全集」，否则已解析海外流量漏放（deny）/误拒（allow）。
 	// exactSet 为空（树缺失）时仅保留哨兵（fail-safe 不产生死条目）。
-	// 历史修复+历史修复（历史）：展开集先收集后 sort.Strings 定序——exactSet map
+	// +：展开集先收集后 sort.Strings 定序——exactSet map
 	// 迭代序非确定，内联展开会让同 DB 视图两次渲染产出不同算子字节，
 	// errSameConfig 同字节短路门失效（每次写路径真重载+预检池键漂移）；
 	// 混选「海外+国名」时展开集与显式国名条目按全 alternative 去重。
@@ -761,7 +772,7 @@ func geoipLocOperator(countries []string, allowMode bool, exactSet map[string]bo
 
 // customRuleTargets / customRuleOperators 是自定义规则条件允许的目标与运算符
 // 映射；emitCustomRules 与校验函数共用同一份，避免两处硬编码漂移。
-// equals → @streq（历史修复）：@pm 是短语匹配（大小写不敏感+空格分词），
+// equals → @streq：@pm 是短语匹配（大小写不敏感+空格分词），
 // 与 UI「等于」承诺不符，收紧为大小写敏感精确匹配，存量规则行为随之收紧。
 var (
 	customRuleTargets   = map[string]string{"uri": "REQUEST_URI", "args": "ARGS", "body": "REQUEST_BODY|ARGS_POST|ARGS_POST_NAMES|XML:/*|XML://@*", "headers": "REQUEST_HEADERS", "user_agent": "REQUEST_HEADERS:User-Agent"}
@@ -785,7 +796,7 @@ func conditionsEmissionIssue(conditions []models.CustomRuleCondition) string {
 		if customRuleTargets[cond.Target] == "" || customRuleOperators[cond.Operator] == "" {
 			return "非法 target 或 operator"
 		}
-		// 历史问题（历史）：模式内容（空/纯空白、控制字符、尾部反斜杠）与
+		// 模式内容（空/纯空白、控制字符、尾部反斜杠）与
 		// 保存/导入侧共用 validateCustomRulePattern 单一实现——集群 apply 等
 		// 绕过保存校验的路径在这里兜底；空模式 @contains "" 等于匹配一切，
 		// 绝不能发射成无条件 deny。
@@ -800,7 +811,7 @@ func conditionsEmissionIssue(conditions []models.CustomRuleCondition) string {
 // （无 conditions、靠 target/operator/pattern 发射），并对该形状同样校验 target/
 // operator 合法性。
 func customRuleEmissionIssue(cr models.CustomRule) string {
-	// 历史问题-01（历史）：负 ID 不受下方 ≥790000 门约束——cr.ID=-9990
+	// 负 ID 不受下方 ≥790000 门约束——cr.ID=-9990
 	// 发射 id:10 与引擎 body processor 冲突，cr.ID<=-10000 产出负 SecRule id；
 	// 二者均使 coraza 拒绝整份配置（违背「单条坏规则不得拖垮整站」的守卫契约）。
 	if cr.ID < 0 {
@@ -838,7 +849,7 @@ func customRuleEmissionIssue(cr models.CustomRule) string {
 // emitCustomRules writes user rules ahead of any DetectionOnly switch so a
 // rule-level "拦截" action always blocks regardless of the policy WAF mode,
 // mirroring how IP control behaves（例外：body 目标规则发射为 phase:2，检测模式
-// 的 DetectionOnly 事务级切换对其生效，仅记录不阻断——历史修复）。
+// 的 DetectionOnly 事务级切换对其生效，仅记录不阻断）。
 // 动作语义与前端编辑器一致：拦截=命中即阻断；
 // 仅记录=只记录事件、不向异常分累加；放行计分=记录并向异常分累加，由 949
 // 评估（受 WAF 模式约束）统一裁决。
@@ -870,12 +881,12 @@ func emitCustomRules(sb *strings.Builder, customRules []models.CustomRule, block
 		// 配置生成失败——一条坏规则不得拖垮所有站点；存量脏规则与集群同步绕过的规则
 		// 均在此兜底。
 		if issue := customRuleEmissionIssue(cr); issue != "" {
-			// 历史问题 分级日志——裸 log.Printf 无级别前缀，日志级别调至 warn/error
-			// 时会被过滤出文件日志（与 历史问题 修复口径一致）。
+			// 分级日志——裸 log.Printf 无级别前缀，日志级别调至 warn/error
+			// 时会被过滤出文件日志（与修复口径一致）。
 			Logf("warn", "自定义规则 %d(%s) %s，已跳过发射，请修正或禁用", cr.ID, cr.Name, issue)
 			continue
 		}
-		// 历史问题-2（阶段化模型收紧 890000→790000）:DB id ≥790000 经发射偏移
+		// （阶段化模型收紧 890000→790000）:DB id ≥790000 经发射偏移
 		// +10000 后撞入 GeoIP 预检段(800000-899999,geoipPrecheckRuleBase 起)——
 		// 同 id 冲突会使整份 coraza 配置编译失败;≥890000 仍撞 CRS 保留段
 		// (900000+)。发射侧跳过并告警(镜像上方坏规则兜底同款)。
@@ -968,7 +979,7 @@ func SecurityPolicyHasIPControl(p *models.SecurityPolicy) bool {
 	if p == nil {
 		return false
 	}
-	// 历史问题（历史）：摘要必须与发射面同判定，不再按「refs 非空」虚报。
+	// 摘要必须与发射面同判定，不再按「refs 非空」虚报。
 	// 严格模式装载失败（IPRefMissing）时发射端整条跳过渲染 → false。
 	if p.IPRefMissing {
 		return false
@@ -1113,9 +1124,9 @@ func buildWafHandlerWithPolicy(ruleCaddyID string, policy *models.SecurityPolicy
 	if directives == "" {
 		return nil, nil
 	}
-	// 历史问题-1/2(历史):coraza 默认 RequestBodyLimit=128MiB,
+	// /2:coraza 默认 RequestBodyLimit=128MiB,
 	// 用户限额>128MiB 时 WAF 活跃规则 body 在 128MiB 处被拦(用户限额不可达);
-	// 413 语义被 历史修复 压平为 500。WAF 活跃恒发射
+	// 413 语义被压平为 500。WAF 活跃恒发射
 	// SecRequestBodyLimit(有效值经 resolveRuleOverrides 归一恒>0,
 	// min(用户值,1GiB) 与 coraza Validate 上限对齐)。
 	if bodyLimitMB > 0 {
@@ -1140,7 +1151,7 @@ func buildWafHandlerWithPolicy(ruleCaddyID string, policy *models.SecurityPolicy
 // 回退归到首启用策略，id:7 不改变归因结果）。
 const ipPrecheckAllowRuleID = 7
 
-// ipPrecheckAllowExemptRuleID 是 allow 白名单命中豁免规则（历史用户裁定）：
+// ipPrecheckAllowExemptRuleID 是 allow 白名单命中豁免规则（用户裁定）：
 // allow 交集命中的 IP 以 pass+nolog+skipAfter 跳过后续 GeoIP 逐策略链——白名单
 // 作为「VIP 豁免」语义；显式 deny（id:2/4）先于本规则评估，命中照常拦截。
 // nolog：豁免本身不产生安全事件。无 allow 名单时不发射（避免恒真跳过）。
@@ -1152,7 +1163,7 @@ const ipPrecheckAllowExemptRuleID = 13
 // emitCustomRules 发射守卫（DB id ≥790000 跳过）保证自定义规则 emit id
 // （DB id+10000）不撞入本段。
 //
-// 历史问题：三个家族的段界与编码收敛到本文件的 encode/decode
+// 三个家族的段界与编码收敛到本文件的 encode/decode
 // 函数（单一事实源）。族划分互斥且编码越界即拒绝——此前三段各自只守
 // 「<900000」，爬虫豁免 id（810000+policyID*16+引擎序号）在 policyID≥2500 时
 // 溢入伪装段 [850000,900000)，既与伪装 id 碰撞（p=2666, i=10 → 852666）又被
@@ -1215,7 +1226,7 @@ func encodeCrawlerSpoofRuleID(policyID int) (int, bool) {
 }
 
 // decodePrecheckRuleID 把 rule_triggered 文本解码为家族+属主策略（+引擎序号）。
-// 唯一解码是归因与评分的共同前提：越界/无法唯一解码（历史行、p=0 边界值）
+// 唯一解码是归因与评分的共同前提：越界/无法唯一解码（行、p=0 边界值）
 // 返回 ok=false，消费方走能力 fallback，禁止用 n-800000 猜属主。
 func decodePrecheckRuleID(ruleID string) (precheckRuleFamily, int, int, bool) {
 	n, err := strconv.Atoi(ruleID)
@@ -1245,14 +1256,14 @@ func decodePrecheckRuleID(ruleID string) (precheckRuleFamily, int, int, bool) {
 // IsGeoIPPrecheckID 报告 n 是否落在阶段 1 预检的 8xxxxx 段
 // [geoipPrecheckRuleBase, geoipPrecheckRuleLimit)——含普通 GeoIP（800xxx 属主
 // 精确段）与爬虫豁免/伪装两族。段界单一事实源——事件归因、stage-stats 分桶、
-// 筛选族条件等消费方一律经本谓词取段界, 禁止各自复写字面量(历史问题:字面量散布
+// 筛选族条件等消费方一律经本谓词取段界, 禁止各自复写字面量（字面量散布
 // 六处,段基址调整时漏改即静默分叉)。逐策略属主解码请用 decodePrecheckRuleID
 // （本谓词只判「是否预检 8 段」，不区分家族）。
 func IsGeoIPPrecheckID(n int) bool {
 	return n >= geoipPrecheckRuleBase && n < geoipPrecheckRuleLimit
 }
 
-// IsStage1PrecheckID 判定事件触发 id 是否属阶段 1 预检族（历史问题
+// IsStage1PrecheckID 判定事件触发 id 是否属阶段 1 预检族
 // 收敛：{2,4,7,8,14} 五元组此前在 services 谓词与 handlers/security_overview
 // 两处独立字面量维护——阶段 1 新增预检 id 时两处漏改即分叉。单一事实源在此，
 // 消费方改调本函数）。
@@ -1265,29 +1276,46 @@ func IsStage1PrecheckID(n int) bool {
 }
 
 // Stage1PrecheckIDSQLList 是预检段固定规则 ID 的 SQL 字面量清单（8 项）——
-// 与 IsStage1PrecheckID 同文件维护（历史问题 原居 securityevents.go，
+// 与 IsStage1PrecheckID 同文件维护（原居 securityevents.go，
 // 与 Go 谓词分居两文件，阶段 1 新增预检 id 时易漏改）。3/5/12 为防御性包含
-// ——当前 nolog pass 不产事件（历史问题 三处字面量收敛沿用）。
+// 当前 nolog pass 不产事件。
 const Stage1PrecheckIDSQLList = "('2','3','4','5','7','8','12','14')"
+
+// IsStage1PrecheckEventID 是「事件层面阶段 1 预检段」判定的单一事实源：
+// IsStage1PrecheckID（固定族 {2,4,7,8,14}+GeoIP 预检段）∪ 防御性包含集
+// {3,5,12}——与 Stage1PrecheckIDSQLList 同集合。SQL 归因清单、事件分段
+// 耗时选值（securityEventsIsPrecheckRule）一律消费本谓词，禁止复写字面量
+// （新增/删除预检 id 时字面量分叉即静默漂移；一致性由
+// security_stage1_segment_test.go 三集合对账钉死）。
+func IsStage1PrecheckEventID(n int) bool {
+	if IsStage1PrecheckID(n) {
+		return true
+	}
+	switch n {
+	case 3, 5, 12: // 防御性包含（nolog pass 不产事件，同 SQL 清单口径）
+		return true
+	}
+	return false
+}
 
 // Stage1PrecheckSegmentSQL 是阶段 1 预检段（IP 访问控制/威胁情报库/地域拦截）
 // 事件归因的完整 SQL 谓词单一事实源——rule_triggered（文本 id）落在本段即
 // 阶段 1：固定 ID 清单 Stage1PrecheckIDSQLList ∪ GeoIP 预检归因段
 // [geoipPrecheckRuleBase, +100000) 的 6 位文本形态（8 开头 6 位）。
-// 消费方：handlers.GetRuleStageStats 分段耗时归因（历史修复 收敛：原
+// 消费方：handlers.GetRuleStageStats 分段耗时归因（收敛：原
 // 内联 "IN %s OR (LENGTH=6 AND LIKE '8%%')" 与 ID 清单分居两文件两处字面量）。
 // 与 IsStage1PrecheckID 同文件维护，一致性由 security_stage1_segment_test.go 钉死。
 const Stage1PrecheckSegmentSQL = "rule_triggered IN " + Stage1PrecheckIDSQLList +
 	" OR (LENGTH(rule_triggered)=6 AND rule_triggered LIKE '8%')"
 
-// intersectIPLists 返回多组 IP/CIDR 名单的网络感知交集（裁定 2026-09-07 历史修复）：
+// intersectIPLists 返回多组 IP/CIDR 名单的网络感知交集（裁定 2026-09-07）
 // 对每对条目判断 CIDR 包含关系，保留更具体的一方（10.0.0.0/8 ∩ 10.1.0.5
 // = 10.1.0.5）。字符串精确匹配兼容（相同文本=同网络）。空交集返回 nil。
 func intersectIPLists(lists [][]string) []string {
 	if len(lists) == 0 {
 		return nil
 	}
-	// 历史问题(历史):预解析缓存——原实现每对条目都重新 ParseCIDR/ParseIP,
+	// 预解析缓存——原实现每对条目都重新 ParseCIDR/ParseIP,
 	// 64 份满额 allow 名单最坏 ~1575 万次解析;缓存后每唯一条目只解析一次。
 	cache := make(map[string]*parsedEntry, 512)
 	candidate := make(map[string]struct{}, len(lists[0]))
@@ -1323,7 +1351,7 @@ func intersectIPLists(lists [][]string) []string {
 	return intersection
 }
 
-// parsedEntry 是 IP/CIDR 条目的一次解析结果(历史问题 预解析缓存条目)。
+// parsedEntry 是 IP/CIDR 条目的一次解析结果。
 type parsedEntry struct {
 	raw   string     // 原始条目串(交集结果须返回原始形态)
 	ip    net.IP     // 非 nil = 纯 IP 条目
@@ -1351,14 +1379,14 @@ func parseEntryCached(s string, cache map[string]*parsedEntry) *parsedEntry {
 }
 
 // cidrIntersectParsed 判断两个预解析 IP/CIDR 条目的网络包含关系，返回更具体
-// 一方（历史修复起为唯一实现——旧字符串入参变体 cidrIntersectEntry 在
-// 历史问题 预解析缓存改造后生产零调用，已删除，语义钉迁至 cidrIntersectParsed）。
+// 一方（自此为唯一实现——旧字符串入参变体 cidrIntersectEntry 在
+// 预解析缓存改造后生产零调用，已删除，语义钉迁至 cidrIntersectParsed）。
 // a 保留原串供返回（交集结果须是原始字符串形态）。
 func cidrIntersectParsed(pa, b *parsedEntry) string {
 	if !pa.valid || !b.valid {
 		return ""
 	}
-	// 字面相等且合法（历史问题 合法性门同口径：bad 条目字面相等不得顶出交集）
+	// 字面相等且合法（合法性门同口径：bad 条目字面相等不得顶出交集）
 	if pa.raw == b.raw {
 		return pa.raw
 	}
@@ -1387,7 +1415,7 @@ func cidrIntersectParsed(pa, b *parsedEntry) string {
 }
 
 // precheckProjectionScope 把规则身份编入预检/引擎层 u-* 投影 scope（历史
-// 历史修复）：scope 形态 u-<kind>-<ruleCaddyID>（如 u-deny-lb_2r8dosptk1）——投影
+// scope 形态 u-<kind>-<ruleCaddyID>（如 u-deny-lb_2r8dosptk1）——投影
 // 实例身份=调用方规则，异策略集多规则各得独立文件（互不覆盖）。kind 取
 // deny/trust/trust12/bl/allow/allow-exempt。空 ruleCaddyID 由两个渲染入口
 // （buildIPPrecheckDirectives/BuildCorazaDirectives）统一显性报错（fail-loud
@@ -1400,8 +1428,8 @@ func precheckProjectionScope(kind, ruleCaddyID string) string {
 // ACL 并集 id:2、allow 模式 ACL 交集外拒绝 id:7、遗留黑名单并集 id:4）与逐策略
 // GeoIP 链（800000+policyID）为一个极简 coraza 配置（阶段 1）。预检查器置于
 // 处理器链最前（先于全部 rate_limit/waf）：被拒 IP/区域在任何策略的 CRS/自定义
-// 规则评估前即中断——修复 `[coraza_历史修复, coraza_历史修复]` 链中 历史问题 的 CRS 先评估产生
-// 检测事件、历史问题 的 IP ACL 才拦截的双重检测问题（IP ACL 最高优先级）。预检仍是
+// 规则评估前即中断——修复 `[coraza_, coraza_]` 链中 CRS 先评估产生
+// 检测事件、IP ACL 才拦截的双重检测问题（IP ACL 最高优先级）。预检仍是
 // coraza 拒绝：audit log 留痕供安全事件管线归因（id:2/id:4 归因口径不变）。
 // 2026-09-15 用户裁定:信任最高优先——预检信任 ctl:ruleEngine=
 // DetectionOnly 先行(id:3,取代「deny 优先于信任」与「并入 allow 放行集」),
@@ -1413,12 +1441,12 @@ func precheckProjectionScope(kind, ruleCaddyID string) string {
 // 时调用方传 denyStatus=481，全部 deny 抬码落 481 阶段路由（阶段化模型）。
 // 无 deny 侧控制且无 GeoIP 策略时返回空串（不发射）。
 //
-// ruleCaddyID（历史修复）：本函数逐规则渲染（policiesForRule——每条规则
+// ruleCaddyID：本函数逐规则渲染（policiesForRule——每条规则
 // 的绑定策略集不同，u-* 并集内容是调用方规则的函数），u-* 投影 scope 必须编入
 // 规则身份（u-deny-<ruleCaddyID> 等）；全局单文件名下异策略集多规则的后渲染
 // 会覆盖前者=漏拦+误拦（热路径稳定命名粒度教训的预检形态）。空值显性报错
-// （fail-loud，禁止静默退回全局名重建冲突）。爆炸半径=整份配置被拒——历史修复
-// （历史）已裁定维持 fail-loud 不收窄（跳过+告警=IP 控制面静默缺失，
+// （fail-loud，禁止静默退回全局名重建冲突）。爆炸半径=整份配置被拒——
+// 已裁定维持 fail-loud 不收窄（跳过+告警=IP 控制面静默缺失，
 // fail-closed 整拒更安全），载体见 BuildCorazaDirectives 同名注释。
 func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int, ruleCaddyID string) (string, error) {
 	if ruleCaddyID == "" {
@@ -1445,7 +1473,7 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 				}
 			case "allow":
 				// 空集也加入 allowLists：交集为空 → 下方发射恒拒规则，
-				// 不得因内容门静默 fail-open（历史问题-02）。
+				// 不得因内容门静默 fail-open。
 				allowLists = append(allowLists, aclList)
 			}
 		}
@@ -1478,11 +1506,11 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 	sb.WriteString("SecResponseBodyAccess Off\n")
 	// 与 BuildCorazaDirectives 同款审计配置：IP 拒绝事件经 audit log 进入
 	// 安全事件管线（ RelevantOnly + deny 中断 = relevant）；写插件同 lbfile
-	// （历史侧车退役，耗时注入审计行——见 BuildCorazaDirectives 的 lbfile
+	// （侧车退役，耗时注入审计行——见 BuildCorazaDirectives 的 lbfile
 	// 注释）。
 	sb.WriteString(fmt.Sprintf("SecAuditEngine RelevantOnly\nSecAuditLog %s\nSecAuditLogType lbfile\nSecAuditLogFormat JSON\nSecAuditLogParts ABIJDEFHKZ\n", auditLogPath))
 	// 2026-09-15 用户裁定:信任最高优先(任何规则不拦)+检测事件全记录——
-	// 预检层信任改 ctl:ruleEngine=DetectionOnly 先行(取代 历史修复 的「并入 allow
+	// 预检层信任改 ctl:ruleEngine=DetectionOnly 先行(取代 「并入 allow
 	// 放行集」):信任 IP 经 DetectionOnly 后,deny/黑名单/GeoIP/CRS 全评估
 	// 不拦但全记录(动作=检测);并入 allow 会使信任 IP 根本不触发规则=
 	// 无检测事件,与新语义(可见放行)冲突。
@@ -1540,7 +1568,7 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 		sb.WriteString(fmt.Sprintf("SecRule REMOTE_ADDR \"%s\" \"id:4,phase:1,deny,status:%d,log,msg:'IP 黑名单',skipAfter:SECURITY_RULES_END\"\n", operand, denyStatus))
 	}
 	var allowIntersection []string
-	// allow 交集外拒绝（id:7，历史问题 后移）：置于 deny 并集/黑名单之后
+	// allow 交集外拒绝（id:7，后移）：置于 deny 并集/黑名单之后
 	// ——同在 deny 名单与 allow 交集外的 IP 先被 id:2/4 拒绝，事件归因「IP 黑名单
 	// 拒绝」（deny 侧精确语义）；id:7 只对「未被显式 deny 且不在 allow 交集」的
 	// IP 生效。拦截结果与既有语义等价（同 deny+status+skipAfter）。
@@ -1558,7 +1586,7 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 			sb.WriteString(fmt.Sprintf("SecRule REMOTE_ADDR \"%s\" \"id:%d,phase:1,deny,status:%d,log,msg:'IP 白名单拒绝',skipAfter:SECURITY_RULES_END\"\n", operand, ipPrecheckAllowRuleID, denyStatus))
 		}
 	}
-	// allow 白名单豁免（历史用户裁定）：交集命中 = pass + 跳过后续 GeoIP
+	// allow 白名单豁免（用户裁定）：交集命中 = pass + 跳过后续 GeoIP
 	// 逐策略链（VIP 豁免语义）。置于 deny/blacklist 之后——显式 deny 命中照常
 	// 拦截（其 skipAfter 先行短路，豁免规则不参与评估）；置于 GeoIP 链之前——
 	// 白名单成员不再被区域拦截。交集为空（恒拒形态）时无成员可豁免，不发射。
@@ -1571,26 +1599,26 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 	}
 	// 逐策略 GeoIP 链（阶段 1：GeoIP 自策略引擎 id:8 迁入预检，id=800000+policyID
 	// 精确归因段）。链首 deny+skipAfter+chain（disruptive 动作仅允许链首段，
-	// 历史问题），续段 X-LB-GeoIP-Loc 匹配策略 geoip_countries（caddygeoip pass
+	// 续段 X-LB-GeoIP-Loc 匹配策略 geoip_countries（caddygeoip pass
 	// route 先于本预检设置该头）；策略有启用信任名单时追加第三续段——预检信任∪
 	// DetectionOnly 是事务级全局的（2026-09-20 用户裁定：信任 IP 对全部策略的
 	// GeoIP 全局放行，取代旧引擎层「跨策略信任不豁免」边界），此续段仅抑制
-	// 本策略链对自有信任 IP 的自欺事件。历史问题-1（历史）：在 id:3
+	// 本策略链对自有信任 IP 的自欺事件。在 id:3
 	// （非 stage0 信任并集）/id:12（stage0 保留检测）已把信任 IP 的事务级引擎
 	// 切为 DetectionOnly 的前提下，该续段对判定结果不产生差异（信任 IP 本就不
 	// 拦）——属防御性冗余，保留为纵深层；删除它同样安全，但若未来收窄
 	// DetectionOnly 的适用范围，此续段是唯一的链内自抑制，勿视作死代码清理。
 	// denyStatus=403（阶段 1 页未配）时不带
 	// status：默认 403 → 403 兜底错误路由（跟随策略的默认层，回归形状）；
-	// =481 时链首显式抬码（disruptive 动作仅允许链首段，历史问题）。
+	// =481 时链首显式抬码（disruptive 动作仅允许链首段）。
 	geoipStatusFragment := ""
 	if denyStatus != 403 {
 		geoipStatusFragment = fmt.Sprintf(",status:%d", denyStatus)
 	}
-	// 域 G（历史）：国名条目精确匹配集——树 Countries（live 优先、缓存
+	// 域 G：国名条目精确匹配集——树 Countries（live 优先、缓存
 	// 兜底，与 ValidateGeoIPCountries 同源）；树缺失（无库且无缓存）时空集，
 	// 国名条目退回后缀形态（geoipLocOperator 注释）。单次取树供全部策略链
-	// 复用（历史修复 同款：避免循环内重复全量扫描；树扫描本身有 memo）。
+	// 复用（同款：避免循环内重复全量扫描；树扫描本身有 memo）。
 	geoipCountryExact := map[string]bool{}
 	if tree := GetIP2RegionRegionTree(); tree != nil {
 		for _, c := range tree.Countries {
@@ -1598,7 +1626,7 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 		}
 	}
 	// precheckRuleIDs 本函数已发射的 SecRule id：跨家族唯一性硬错误（历史
-	// 历史问题）——编码函数已保证族内唯一且互斥，本表是防御层：任何未来改动
+	// 编码函数已保证族内唯一且互斥，本表是防御层：任何未来改动
 	// 让两族产生同 id 时渲染直接失败，而不是把碰撞送进引擎/事件归因。
 	precheckRuleIDs := map[int]bool{}
 	claimRuleID := func(id int, desc string) error {
@@ -1612,8 +1640,8 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 		if p == nil || !PolicyHasGeoIP(p) {
 			continue
 		}
-		// 历史问题（历史）：策略编号越出普通 GeoIP 段 [800001,810000) 时
-		// 跳过该策略链并告警（历史问题 起段界由编码函数单一裁决；
+		// 策略编号越出普通 GeoIP 段 [800001,810000) 时
+		// 跳过该策略链并告警（自此段界由编码函数单一裁决；
 		// 旧实现只守 <900000，policyID≥10000 会溢入爬虫段）。危害是归因/分桶
 		// 错位而非编译失败（预检是独立 coraza 配置）。
 		geoipRuleID, ok := encodeGeoIPPrecheckRuleID(p.ID)
@@ -1627,12 +1655,12 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 		// v2.3.8 爬虫豁免（用户裁定方案 B）：已验证爬虫（caddygeoip handler 双跳
 		// PTR/官方 IP 段验证后注入 X-LB-Crawler-Verified=引擎 ID）逐引擎放行——
 		// ctl 移除本策略 GeoIP 链；伪装（UA 声称引擎但验证失败，handler 置
-		// X-LB-Crawler-Spoof=引擎 ID，历史问题：旧注释的「=1」与发射值矛盾）
+		// X-LB-Crawler-Spoof=引擎 ID，旧注释的「=1」与发射值矛盾）
 		// 独立事件族显式拒绝。id 编码见
-		// encodeCrawlerExemptRuleID/encodeCrawlerSpoofRuleID（历史：豁免 id
+		// encodeCrawlerExemptRuleID/encodeCrawlerSpoofRuleID（豁免 id
 		// 越出 [810000,850000) 时跳过+告警，不再溢出伪装段）。
 		if p.GeoIPCrawlerExempt {
-			// 历史问题：伪装头改为携带引擎 ID（与 Verified 对称），规则条件
+			// 伪装头改为携带引擎 ID（与 Verified 对称），规则条件
 			// 收窄到「本策略已勾选的引擎集合」——旧实现 @eq 1 对任何引擎的
 			// 伪装都 deny（仅勾选 googlebot 的策略会把 bingbot 失败也拦下）。
 			selectedEngines := make([]string, 0, 4)
@@ -1716,7 +1744,7 @@ func buildIPPrecheckHandler(policies []*models.SecurityPolicy, denyStatus int, r
 // failed the whole query so custom rules were silently lost (WAF weakened).
 var policyCustomRuleChunkSize = 500
 
-// policyCustomRulesCached 以策略为粒度缓存自定义规则解析（审计 历史问题）：批量
+// policyCustomRulesCached 以策略为粒度缓存自定义规则解析（审计）：批量
 // 生成期由 loadSecurityPolicyContext 对每个去重策略解析一次，替代逐
 // (规则×策略) 对的重复 IN 查询；非批量路径首次调用即缓存，语义不变。
 func policyCustomRulesCached(p *models.SecurityPolicy, store caddyConfigStore) []models.CustomRule {
@@ -1776,7 +1804,7 @@ func resolvePolicyCustomRules(raw json.RawMessage, store caddyConfigStore) []mod
 				var rowID int
 				var cr models.CustomRule
 				var conditionsJSON string
-				// 历史问题-02（历史）：先单独接收 id——Scan 中途失败时该
+				// 先单独接收 id——Scan 中途失败时该
 				// 列已赋值，可把本行从「悬空引用」计数中排除（行存在但解析失败
 				// 不是「规则已删除」，旧实现把它计入 N 个不存在）。
 				if err := rows.Scan(&rowID, &cr.Name, &conditionsJSON, &cr.Action, &cr.Score, &cr.Enabled); err != nil {
@@ -1790,9 +1818,9 @@ func resolvePolicyCustomRules(raw json.RawMessage, store caddyConfigStore) []mod
 					continue
 				}
 				cr.ID = rowID
-				// 历史问题-5:跨 500 分块重复引用查重——同 ID 双 SecRule 会被
+				// 跨 500 分块重复引用查重——同 ID 双 SecRule 会被
 				// coraza 编译拒绝,毒化策略无法落库。
-				// 历史问题(历史):O(m²) 线性扫→map 判重(queriedIDs
+				// O(m²) 线性扫→map 判重(queriedIDs
 				// 是「已查」集,入列判重需独立 seen 集)。
 				if _, dup := seenIDs[cr.ID]; dup {
 					continue
@@ -1801,7 +1829,7 @@ func resolvePolicyCustomRules(raw json.RawMessage, store caddyConfigStore) []mod
 				json.Unmarshal([]byte(conditionsJSON), &cr.Conditions)
 				rules = append(rules, cr)
 			}
-			// 历史问题(历史):迭代错误检查——与同函数 历史 G 口径一致,
+			// 迭代错误检查——与同函数 历史 G 口径一致,
 			// 迭代中途失败静默截断自定义规则会致 WAF 削弱无留痕。
 			if rerr := rows.Err(); rerr != nil {
 				Logf("warn", "解析策略自定义规则迭代失败（本块可能被截断）: %v", rerr)
@@ -1811,9 +1839,9 @@ func resolvePolicyCustomRules(raw json.RawMessage, store caddyConfigStore) []mod
 		// 悬空引用（规则已被删除）不改变解析行为，仅记录日志便于排查；
 		// 只统计查询成功分块内未找到的 id——查询失败的分块已单独留痕，
 		// 其 id 从未读回，计入悬空会把「查询失败」误报为「规则已删除」。
-		// 历史问题 queried 按去重后的 id 计数——custom_rules 数组含重复 id 时
-		// IN 只返回一行，不去重会把「重复引用」误报为「历史问题 个不存在」。
-		// 历史问题-02（历史）：行扫描失败（行存在、内容不可解析）不得
+		// queried 按去重后的 id 计数——custom_rules 数组含重复 id 时
+		// IN 只返回一行，不去重会把「重复引用」误报为「 个不存在」。
+		// 行扫描失败（行存在、内容不可解析）不得
 		// 计入「不存在」——按 queried∩未成功∩非 scan 失败 逐 id 判定。
 		dropped := 0
 		for id := range queriedIDs {
@@ -1855,8 +1883,8 @@ func validSecRuleRemoveTarget(s string) bool {
 	return loErr == nil && hiErr == nil && loN >= 900000 && hiN >= loN && hiN <= 999999
 }
 
-// CRSExcludedEntryEffective 判定排除条目是否会被发射端实际发射（历史问题
-// 历史修复）：与发射链同款门——文件名先经 crsFilenameToRuleIDRange 映射为 ID 区间，
+// CRSExcludedEntryEffective 判定排除条目是否会被发射端实际发射
+// 与发射链同款门——文件名先经 crsFilenameToRuleIDRange 映射为 ID 区间，
 // 再过 validSecRuleRemoveTarget 形态/边界门。保存侧复用本门可在保存时拒绝
 // 「保存 200、发射静默跳过」的条目（如字母后缀 "942100L"），同时不误伤合法的
 // CRS 文件名形态（"REQUEST-942-*.conf" → 942000-942999）。
@@ -2018,8 +2046,8 @@ const crsScopedExclusionIDBase = 2000000
 // 引用悬空时不发射空匹配）；target 经 expandCRSScopedExclusionTargets 展开
 // 为逐 ID（ctl:ruleRemoveById 不支持区间），每 ID 一条 phase:1 运行时 ctl 规则。
 // emitScopedCRSExclusions 发射作用域限定 ctl 规则。store 非-nil 时经其解析列表引用
-// （v2 导入事务视图——历史修复 不变式，审计 历史问题）；nil 回退 db.DB（测试/直调路径）。
-// chainIndex 为链级惰性索引取值闭包（历史修复）——单次 BuildCorazaDirectives 内与其他
+// （v2 导入事务视图——不变式，审计）；nil 回退 db.DB（测试/直调路径）。
+// chainIndex 为链级惰性索引取值闭包——单次 BuildCorazaDirectives 内与其他
 // 消费点共享一次缓存键计算。
 //
 // 历史 匹配集不再内联 @ipMatch 展开——引用名单是大名单时单行撞
@@ -2027,9 +2055,9 @@ const crsScopedExclusionIDBase = 2000000
 // 统一投影 @ipListFast」的架构总述矛盾。改投影 @ipListFast（同族单源
 // writeIPListFile/ipListRuleOperand：稳定命名、原子写、同字节跳写、写失败沿
 // 渲染链路上报）。投影 scope 按匹配集**组合键哈希**编入（p<policyID>-crsxc-<sha256[:12]>，
-// 历史修复 由「组合首次出现序 n」改哈希：序号是位置身份，条目增删/
+// 由「组合首次出现序 n」改哈希：序号是位置身份，条目增删/
 // 重排使 seq 重编号→旧文件名承载另一条目的匹配集（正常路径字节变化走
-// Fallback 自愈仅毫秒窗，与 历史修复 拒绝不回滚叠加才持续）；组合键=ips 字面+
+// Fallback 自愈仅毫秒窗，与拒绝不回滚叠加才持续）；组合键=ips 字面+
 // 排序后 listRefs，同名必同键、异键必异名，键不变则文件名稳定（名单条目
 // 内容变化热路径原位重写，@ipListFast ≤1s stat 热感知），键变化才换名（旧
 // 文件由 24h GC 回收）。同组合多条目共享一份投影（配置字节恒定）。
@@ -2099,7 +2127,7 @@ func emitScopedCRSExclusions(sb *strings.Builder, p *models.SecurityPolicy, entr
 		}
 		// 组合键与解析内容无关（名单条目变化不换名）——ips 字面 + 排序后
 		// listRefs；同组合条目共享一份投影文件。scope=组合键 sha256[:12]
-		//（历史修复：位置序号改内容身份——同名必同键，重排/增删不使旧名承载
+		//（位置序号改内容身份——同名必同键，重排/增删不使旧名承载
 		// 他条目匹配集）。
 		sortedRefs := append([]int64(nil), entry.ListRefs...)
 		sort.Slice(sortedRefs, func(i, j int) bool { return sortedRefs[i] < sortedRefs[j] })
@@ -2147,7 +2175,7 @@ func expandCRSScopedExclusionTargets(target string, index *CRSRuleIndex, p *mode
 	return nil
 }
 
-// crsFileGroupPattern 从 CRS 规则文件名提取两位组号（REQUEST-942-…/历史修复-…
+// crsFileGroupPattern 从 CRS 规则文件名提取两位组号（REQUEST-942-…/-…
 // → "42"/"51"）；不匹配常见形态时返回空串（永不命中任何已选组 → 走父文件补删）。
 var crsFileGroupPattern = regexp.MustCompile(`^(?:REQUEST|RESPONSE)-9([0-9]{2})-`)
 
@@ -2210,7 +2238,7 @@ func crsNumericIDRange(s string) (int, int, bool) {
 // crsCoveredInfraGroupCodes 计算混合选择已覆盖的组号集合：两位组号直接计入；
 // 6 位 ID 条目经索引定位父文件后其父文件组号同样计入（emitCRSRuleGroupSelection
 // 会 Include 该父文件）。陈旧 ID（索引不存在）与 emit 同口径跳过。chainIndex
-// 为链级惰性索引取值闭包（历史修复），仅在遇到 6 位 ID 时才真正取值。
+// 为链级惰性索引取值闭包，仅在遇到 6 位 ID 时才真正取值。
 func crsCoveredInfraGroupCodes(chainIndex func() *CRSRuleIndex, groups []string) map[string]struct{} {
 	covered := make(map[string]struct{}, len(groups))
 	var index *CRSRuleIndex
@@ -2232,10 +2260,10 @@ func crsCoveredInfraGroupCodes(chainIndex func() *CRSRuleIndex, groups []string)
 	return covered
 }
 
-// stripInfraCRSGroupCodes（历史修复 读取面兜底）从 crs_rule_groups 载荷剥离基础设施
+// stripInfraCRSGroupCodes从 crs_rule_groups 载荷剥离基础设施
 // 组号（01/49/59）及其文件内规则 ID，返回（保留条目, 被剥条目）。判定复用
 // IsCRSInfraGroupCode/IsCRSInfraRuleID——与写入面 validateAndNormalizeCRSField
-// 的剥离同口径；条目 trim 后判定以覆盖 历史问题空白行，保留条目原样交由
+// 的剥离同口径；条目 trim 后判定以覆盖空白行，保留条目原样交由
 // 发射端既有 trim 逻辑。
 func stripInfraCRSGroupCodes(groups []string) (kept, stripped []string) {
 	kept = make([]string, 0, len(groups))
@@ -2261,7 +2289,7 @@ func emitCRSRuleGroupSelection(sb *strings.Builder, p *models.SecurityPolicy, gr
 	var idTargets []string
 	seenID := make(map[string]struct{})
 	for _, g := range groups {
-		// 历史问题：历史遗留行可能含首尾空白（旧校验曾放行），trim 后拼接，
+		// 历史遗留行可能含首尾空白（旧校验曾放行），trim 后拼接，
 		// 保证 glob 恒为 REQUEST-9<code>-*.conf 的合法形态（镜像下方排除项的 trim）。
 		g = strings.TrimSpace(g)
 		if IsCRSRuleIDTarget(g) {
@@ -2343,20 +2371,20 @@ func ValidateGeoIPCountries(raw string, geoipMode string) error {
 	if geoipMode == "allow" && len(entries) == 0 {
 		return fmt.Errorf("地域控制为仅允许模式时区域名单不能为空（空名单会放行所有请求）")
 	}
-	// 历史问题（裁决）：IP 库未装载时拒绝启用任何地域条目（含海外——
+	// （裁决）：IP 库未装载时拒绝启用任何地域条目（含海外——
 	// 海外拦截同样依赖 live searcher 设置占位变量，缺库时 CEL 全部恒假、
 	// 地域拦截静默零强制）。用户语义：缺库 = IP 相关规则不可启用，待自动/
 	// 手动更新 IP 库后恢复；「IP 库」卡片的「未安装」标签提供常态可见性。
 	if len(entries) > 0 && len(GetIP2RegionProvinces()) <= 1 {
 		return fmt.Errorf("IP 库未安装或未加载：地域相关规则不可启用，请先在「安全规则」页更新 IP 库后重试")
 	}
-	// 历史问题：loaded 判据必须取 live searcher 而非缓存兜底列表——xdb 损坏/
+	// loaded 判据必须取 live searcher 而非缓存兜底列表——xdb 损坏/
 	// 带外替换后 live 已死但省份缓存仍在，用缓存判 loaded 会放行 deny+省份
 	// 策略，而发射端占位变量从未设置（CEL 恒假）→ 地域拦截静默零强制。缓存
 	// 兜底仅服务于 UI 列表（GetIP2RegionRegions），校验侧以 live 为准。
 	liveProvinces := GetIP2RegionProvinces()
 	provincesLoaded := len(liveProvinces) > 1
-	// 历史问题（历史核心发现，主线亲证 tree=35 sampled=28 missing=
+	// （核心发现，主线亲证 tree=35 sampled=28 missing=
 	// [山西/广西/海南/澳门/西藏/青海]）：known 集必须从全扫描树构建而非 336 点
 	// 采样子集（GetIP2RegionProvinceList）——采样网格（42 个 /8 块 × 第二字节
 	// {0,32,64,96,128,160,192,224}）漏掉了不与网格相交的省，而 UI
@@ -2366,7 +2394,7 @@ func ValidateGeoIPCountries(raw string, geoipMode string) error {
 	known := make(map[string]bool, 36)
 	knownCities := map[string]map[string]bool{}
 	// 树为 nil（无 xdb 且无缓存兜底）时 known 仅含「海外」——非海外条目由
-	// 历史修复 门（live 未装载）先行拒绝，不会走到这里；空条目则允许通过。
+	// 门（live 未装载）先行拒绝，不会走到这里；空条目则允许通过。
 	// 单次取树复用 known 集与城市集两处——原实现两次背靠背
 	// GetIP2RegionRegionTree 各做一次 xdb 全量扫描（~220ms×2）；两次调用间
 	// 无任何状态变更（仅纯 map 构建），单次快照语义等价。
@@ -2375,12 +2403,12 @@ func ValidateGeoIPCountries(raw string, geoipMode string) error {
 		for _, p := range tree.Provinces {
 			known[p] = true
 		}
-		// 域 G（历史）：海外国家并入 known 集——国名条目与省份条目同校验
+		// 域 G：海外国家并入 known 集——国名条目与省份条目同校验
 		// 口径（未知国名在发射端永不匹配，静默削弱地域控制）。
 		for _, c := range tree.Countries {
 			known[c] = true
 		}
-		// 历史问题：城市树供「省/市」条目校验（市必须在省的城市集内——防
+		// 城市树供「省/市」条目校验（市必须在省的城市集内——防
 		// 拼写错误生成 CEL 恒假死条目）。
 		for prov, cities := range tree.Cities {
 			set := make(map[string]bool, len(cities))
@@ -2506,7 +2534,7 @@ func validateCustomRulePattern(operator, pattern string) error {
 	}
 	// coraza 的 @contains/@streq/@beginsWith 会把参数包成 Macro 并做
 	// %{VAR} 宏展开；@rx 不展开。非 regex 运算符里的宏会让规则语义静默
-	// 动态化，畸形宏还会让 NewWAF 拒绝整份配置（历史问题-2）。
+	// 动态化，畸形宏还会让 NewWAF 拒绝整份配置。
 	if operator != "regex" && strings.Contains(pattern, "%{") {
 		return fmt.Errorf("该运算符不支持 %%{...} 宏语法；如需匹配字面量请使用正则运算符并转义 %%")
 	}
@@ -2541,7 +2569,7 @@ func escapeCorazaPattern(pattern string) string {
 
 // crawlerEngineSelected（v2.3.8 爬虫豁免）：策略勾选引擎集合判定——空集视为
 // 全部引擎（向后兼容豁免开启但未存 engines 的形态；空串/`[]` 均属未配置）。
-// 历史修复（历史）：畸形非空 JSON 与空集分流——旧实现失败即返回
+// 畸形非空 JSON 与空集分流——旧实现失败即返回
 // true，勾选面被静默放大成「全部引擎」且零告警。保留向后兼容的「全部引擎」
 // 语义，但按同文件畸形 JSON 既定口径（auditFailureShouldLog）留痕。
 func crawlerEngineSelected(p *models.SecurityPolicy, engineID string) bool {

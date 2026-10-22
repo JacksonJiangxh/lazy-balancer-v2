@@ -1,6 +1,6 @@
 package services
 
-// 历史问题: GitHub 最新版本查询的代理回退 + 下载 URL/进度日志测试。
+// GitHub 最新版本查询的代理回退 + 下载 URL/进度日志测试。
 
 import (
 	"bytes"
@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-// withGHFastProxy 将 ghFastProxy 指向测试代理并在测试结束后还原（历史问题）。
+// withGHFastProxy 将 ghFastProxy 指向测试代理并在测试结束后还原。
 func withGHFastProxy(t *testing.T, base string) {
 	t.Helper()
 	old := ghFastProxy
@@ -332,7 +332,7 @@ func TestDownloadProgressReader_callbacksViaWriteRuleSetDownload(t *testing.T) {
 }
 
 func TestCRSDownloadTarballLogged_startProgressCompletionLines(t *testing.T) {
-	// Given 内存下载服务：显式 历史修复 + 分 10 块 flush 模拟流式到达
+	// Given 内存下载服务：显式 + 分 10 块 flush 模拟流式到达
 	body := bytes.Repeat([]byte("c"), 64*1024)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
@@ -372,7 +372,7 @@ func TestCRSDownloadTarballLogged_startProgressCompletionLines(t *testing.T) {
 	}
 
 	// And 更新日志包含：开始行（完整代理 URL+预计大小）、进度行、完成行（字节+耗时）
-	// （历史问题-3：更新日志=任务日志 tasks/crs.log 唯一数据源）
+	// （更新日志=任务日志 tasks/crs.log 唯一数据源）
 	data, err := os.ReadFile(taskengine.TaskLogPath("crs"))
 	if err != nil {
 		t.Fatal(err)
@@ -399,7 +399,7 @@ func TestCRSDownloadTarballLogged_startProgressCompletionLines(t *testing.T) {
 	}
 }
 
-// 历史问题（历史）：gitHubAPIToken 读库失败（非 ErrNoRows）此前静默
+// gitHubAPIToken 读库失败（非 ErrNoRows）此前静默
 // 降级无令牌——与同文件 getGitHubProxyURL「读库故障记日志留痕」口径分裂。
 // 补 warn 后降级可见；行缺失（ErrNoRows）属正常「未配置」不告警。
 func TestGitHubAPIToken_readFailureLogsWarn(t *testing.T) {

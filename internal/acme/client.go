@@ -34,7 +34,7 @@ type Logger interface {
 	Log(stage, message string)
 }
 
-// logf 是包级日志接缝（历史问题-16，镜像 services/certjoblog.go certJobLogWarnf
+// logf 是包级日志接缝（镜像 services/certjoblog.go certJobLogWarnf
 // 先例）：默认落到标准 log（stdout）；acme 是独立 module 边界（services 反向
 // 依赖 acme，acme 不得回依赖），故由 cmd/server/main.go 装配时注入
 // services.Logf，使告警进入统一日志级别链（level 语义同 services.Logf）。
@@ -60,7 +60,7 @@ type Client struct {
 	finalizedOrder []string // FIFO 插入序（上限逐出最旧）
 }
 
-// maxFinalizedCerts finalize 缓存上限（历史问题：此前无界——finalize 成功后
+// maxFinalizedCerts finalize 缓存上限（此前无界——finalize 成功后
 // 走 FetchCert 之外的失败路径（wait-valid 超时/订单非 valid/下载失败/任务
 // 取消）留下的证书字节永不释放）。FIFO 逐出最旧兜底；失败路径另由
 // DiscardFinalizedCert 显式清理。
@@ -120,18 +120,18 @@ func newClient(directoryURL, email, dataDir string, eab *acme.ExternalAccountBin
 			RetryBackoff: func(n int, r *http.Request, resp *http.Response) time.Duration {
 				if resp != nil && resp.StatusCode == http.StatusTooManyRequests {
 					// 429：库内立即放弃重试（返回 0），让错误上抛给上层
-					// waiting_ca 记账按 CA 的 历史修复 统一退避——语义保持不变。
+					// waiting_ca 记账按 CA 的统一退避——语义保持不变。
 					return 0
 				}
 				// 非 429 重试（5xx 等）：截断指数退避 1,2,4,8s、封顶 10s，对齐
 				// x/crypto defaultBackoff 曲线（1<<(n-1)s+jitter、封顶 10s）。
-				// 此前固定 2s 在 CA 5xx 过载时维持约 5 倍请求压力（历史修复）。
+				// 此前固定 2s 在 CA 5xx 过载时维持约 5 倍请求压力。
 				// 注：自定义 RetryBackoff 的返回值即重试延迟本身（x/crypto 不会
-				// 再叠加默认曲线或解析 历史修复），故曲线在此显式给出。
-				// 历史问题（历史）：自定义曲线会丢失默认实现的 jitter——多规则
+				// 再叠加默认曲线或解析），故曲线在此显式给出。
+				// 自定义曲线会丢失默认实现的 jitter——多规则
 				// 并发签发（max_concurrent>1）在同一 CA 5xx 窗口会以相同延迟同步
 				// 重试（thundering herd）。补 0~1s 均匀抖动（同默认曲线量级）。
-				// 历史修复（历史）：x/crypto 文档「The value of n for the
+				// x/crypto 文档「The value of n for the
 				// first call on failure is 1」（acme.go），实际序列必须从 n=1
 				// 起跳为 1s——原实现 1<<min(n,4) 使首召即 2s，整条曲线右移一档
 				// 且提前封顶。n<1 仅防御（生产不出现）。
@@ -150,7 +150,7 @@ func newClient(directoryURL, email, dataDir string, eab *acme.ExternalAccountBin
 var acmeAccountKeyMu sync.Mutex
 
 // eabKeyDigestRaw 原始 EAB key 的 sha256 摘要（空 key 亦有确定值——路径公式
-// 需要它）；历史问题-5（历史）：路径公式与元数据共用同一实现，此前两份内联
+// 需要它）；路径公式与元数据共用同一实现，此前两份内联
 // sha256+hex。
 func eabKeyDigestRaw(eabKey []byte) string {
 	sum := sha256.Sum256(eabKey)
@@ -167,14 +167,14 @@ type accountKeyMetadata struct {
 	DirectoryURL string `json:"directory_url"`
 	Email        string `json:"email"`
 	EABKID       string `json:"eab_kid"`
-	// 历史问题：密钥路径由 (directory|email|KID|hmac摘要) 决定但元数据此前缺 hmac
+	// 密钥路径由 (directory|email|KID|hmac摘要) 决定但元数据此前缺 hmac
 	// 摘要——同三元组双 HMAC 配置（EAB 轮换）会被闲置清理互删密钥，后续注册以新
 	// 密钥撞旧账户，签发持续失败直至人工恢复。
 	EABKeyDigest string `json:"eab_key_digest,omitempty"`
 }
 
 func loadOrCreateAccountKey(dataDir, directoryURL, email, eabKID string, eabKey []byte) (*ecdsa.PrivateKey, error) {
-	// 历史修复：dataDir 为空时密钥路径退化为 CWD 相对路径（曾使 handlers 测试
+	// dataDir 为空时密钥路径退化为 CWD 相对路径（曾使 handlers 测试
 	// 在仓库内堆积数千个账户私钥），入口直接拒绝，对齐 dnsprovider/factory.go
 	// 的 dataDir 必填校验。
 	if dataDir == "" {
@@ -205,9 +205,9 @@ func loadOrCreateAccountKey(dataDir, directoryURL, email, eabKID string, eabKey 
 			created = fmt.Sprintf("，首次注册时间: %s", fi.ModTime().Format("2006-01-02 15:04:05"))
 		}
 		logf("info", "ACME 账户密钥 %s 已加载%s", filepath.Base(keyPath), created)
-		// 历史修复（历史）：元数据只服务 removeStaleAccountKeys 的卫生
+		// 元数据只服务 removeStaleAccountKeys 的卫生
 		// 清理（mtime=最近使用时间），刷新失败（只读挂载/权限漂移）不得连坐
-		// 签发主路径——镜像注册侧「清理失败仅记 warn」的同族口径（历史修复）。
+		// 签发主路径——镜像注册侧「清理失败仅记 warn」的同族口径。
 		if err := writeAccountKeyMetadata(keyPath, directoryURL, email, eabKID, eabKeyDigestOf(eabKey)); err != nil {
 			logf("warn", "acme: 刷新账户密钥元数据失败（密钥可用，不影响本次签发）: %v", err)
 		}
@@ -232,7 +232,7 @@ func loadOrCreateAccountKey(dataDir, directoryURL, email, eabKID string, eabKey 
 		_ = os.Remove(tmp)
 		return nil, fmt.Errorf("部署 ACME 账户密钥: %w", err)
 	}
-	// 历史修复（历史，历史收敛）：与既有密钥路径同口径——密钥已
+	// 与既有密钥路径同口径——密钥已
 	// 落盘即可用，元数据仅是卫生清理的输入，写失败只记 warn。
 	if err := writeAccountKeyMetadata(keyPath, directoryURL, email, eabKID, eabKeyDigestOf(eabKey)); err != nil {
 		logf("warn", "acme: 写入账户密钥元数据失败（密钥可用，不影响本次签发）: %v", err)
@@ -308,7 +308,7 @@ func (c *Client) RegisterAccount(ctx context.Context) error {
 		}
 		logf("info", "ACME 账户已注册，复用现有账户（directory: %s）", c.DirectoryURL)
 	}
-	// 历史修复（历史）：清理失效账户密钥是卫生动作，注册三分支已成功——
+	// 清理失效账户密钥是卫生动作，注册三分支已成功——
 	// 清理失败仅记 warn，不得连坐注册结果（残留密钥下一轮注册时再清理）。
 	if err := c.removeStaleAccountKeys(); err != nil {
 		logf("warn", "acme: 清理失效账户密钥失败（不影响本次注册）: %v", err)
@@ -317,7 +317,7 @@ func (c *Client) RegisterAccount(ctx context.Context) error {
 }
 
 // staleAccountKeyIdleThreshold 是 removeStaleAccountKeys 清理密钥前的最小闲置时长
-// （历史问题-18：当前账户密钥路径公式使该清理恒为空操作，见函数内守卫注释；阈值保留
+// （当前账户密钥路径公式使该清理恒为空操作，见函数内守卫注释；阈值保留
 // 以备路径公式变更时启用），
 // 不得小于签发执行预算封顶（caExecutionTimeoutFor 上限 caExecutionTimeoutMax=60min），
 // 否则会误删在途签发的账户密钥，取 1h。
@@ -335,8 +335,8 @@ func (c *Client) removeStaleAccountKeys() error {
 	// 可能正在使用。密钥元数据在每次加载/创建时都会重写，其 mtime 即最近使用时间；
 	// 在途签发执行预算至多 60min（caExecutionTimeoutFor 按域名数缩放，封顶
 	// caExecutionTimeoutMax），mtime 必然不旧于 1h 阈值——仅清理闲置超 1h 的
-	// 密钥，避免误删并发任务密钥导致重试/重启后密钥反复再生（历史问题）。
-	// 备查（历史问题 发现5）：系统时钟回拨 >1h 时在途密钥 mtime 会早于 cutoff 而被误删，
+	// 密钥，避免误删并发任务密钥导致重试/重启后密钥反复再生。
+	// 备查：系统时钟回拨 >1h 时在途密钥 mtime 会早于 cutoff 而被误删，
 	// 后果仅是账户密钥换新并重新注册（账户 churn），无证书/数据损失，无安全影响。
 	cutoff := time.Now().Add(-staleAccountKeyIdleThreshold)
 	for _, entry := range entries {
@@ -346,7 +346,7 @@ func (c *Client) removeStaleAccountKeys() error {
 		metadataPath := filepath.Join(filepath.Dir(c.accountKeyPath), entry.Name())
 		data, err := os.ReadFile(metadataPath)
 		if err != nil {
-			// 历史问题：单条目读/解析失败不再中止整轮清理——与下方 stat 失败的
+			// 单条目读/解析失败不再中止整轮清理——与下方 stat 失败的
 			// 「跳过+日志」同口径（原口径会使任一损坏元数据永久阻塞该提供商注册）。
 			logf("warn", "acme: 读取账户密钥元数据 %s 失败，跳过: %v", entry.Name(), err)
 			continue
@@ -357,15 +357,15 @@ func (c *Client) removeStaleAccountKeys() error {
 			continue
 		}
 		keyPath := strings.TrimSuffix(metadataPath, ".json")
-		// 历史问题-18/历史问题 裁定：轮换后的旧 HMAC 密钥必须保留（字节级残留
+		// 裁定：轮换后的旧 HMAC 密钥必须保留（字节级残留
 		// 无害；删除会让旧账户身份无法恢复）。当前路径公式下本条件恒真，
-		// 保留为路径公式未来变更时的迁移钩子（历史问题-3 复核后不修）。
+		// 保留为路径公式未来变更时的迁移钩子。
 		if metadata != want || keyPath == c.accountKeyPath {
 			continue
 		}
 		info, err := entry.Info()
 		if err != nil {
-			// 单条目 stat 失败（权限/外部并发删除）不应中止整轮清理（历史问题 发现4）：
+			// 单条目 stat 失败（权限/外部并发删除）不应中止整轮清理
 			// 跳过该条目并记日志，下一轮注册时自愈。
 			logf("warn", "清理 ACME 账户密钥：读取元数据状态失败，跳过 %s: %v", entry.Name(), err)
 			continue
@@ -381,7 +381,7 @@ func (c *Client) removeStaleAccountKeys() error {
 }
 
 // removeStaleAccountKeyPair 删除一对失效账户密钥及其元数据。两个删除同口径容忍
-// os.ErrNotExist（历史修复，历史）：读取元数据到执行删除之间存在外部
+// os.ErrNotExist：读取元数据到执行删除之间存在外部
 // 清理窗口（其他进程的 RegisterAccount/手工清理），文件已消失即目标终态，不算
 // 失败——此前仅 key 删除容忍，元数据删除在窗口内报错会中止整轮清理。
 func removeStaleAccountKeyPair(keyPath, metadataPath string) error {

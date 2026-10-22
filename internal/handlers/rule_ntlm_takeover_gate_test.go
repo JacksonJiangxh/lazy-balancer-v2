@@ -120,7 +120,7 @@ func TestValidateStoredRuleConfig_rejects_stored_ntlm_with_incomplete_takeover(t
 
 // 导入链同口径：备份行 ntlm=1 但接管四列不齐 → 整包 400；四列补齐 → 放行。
 func TestValidateV2BackupRules_ntlmOn_requiresFullTakeoverColumns(t *testing.T) {
-	tables := audit79RuleTables()
+	tables := ruleTablesShared()
 	rule := tables["lb_rules"][0]
 	rule["strategy"] = "cookie"
 	rule["ntlm_compatible"] = 1

@@ -6,7 +6,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { section, source } from './_helpers.ts'
+import { section, source, repoSource } from './_helpers.ts'
 import { shouldToastQuietPollError } from '../src/utils/pollErrorToast.ts'
 import {
   CERT_QUEUE_VISIBLE_JOBS,
@@ -416,12 +416,12 @@ test('DNS 凭证字段可见性按 visible_when 求值，无元数据时恒显�
 })
 
 test('后端下发 visible_when/option_labels，前端不再硬编码 dnspod 字段名', () => {
-  const go = source('../internal/services/dnsproviders/dnspod.go')
+  const go = repoSource('internal/services/dnsproviders/dnspod.go')
   const cf = section(go, 'func (d *DNSPod) CredentialFields()', '\nfunc (d *DNSPod) CredentialFieldOptions')
   assert.match(cf, /VisibleWhen: visibleOnly\("dnspod"\)/)
   assert.match(cf, /VisibleWhen: visibleOnly\("tencent_cloud"\)/)
   assert.match(cf, /OptionLabels: map\[string\]string\{"dnspod": "DNSPod API", "tencent_cloud": "腾讯云 API"\}/)
-  const handler = source('../internal/handlers/certificates.go')
+  const handler = repoSource('internal/handlers/certificates.go')
   const list = section(handler, 'func (h *Handlers) ListDNSProviders', 'func (h *Handlers) TestCertificateConfig')
   assert.match(list, /field\["visible_when"\] = f\.VisibleWhen/)
   assert.match(list, /field\["option_labels"\] = f\.OptionLabels/)

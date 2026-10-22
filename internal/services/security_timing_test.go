@@ -1,6 +1,6 @@
 package services
 
-// 审计行内嵌 timing（lb_timing）读侧契约测试（历史：
+// 审计行内嵌 timing（lb_timing）读侧契约测试（
 // 侧车退役——耗时随审计写插件注入审计 JSON 顶层 lb_timing 字段，摄取管道直接
 // 从审计行取值，选值规则与退役前 securityEventsStageDuration 分段键二态契约逐
 // 字对齐）。

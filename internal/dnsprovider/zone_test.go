@@ -2,7 +2,7 @@ package dnsprovider
 
 import "testing"
 
-// 历史问题（历史）：zone 解析单源。输入域用于 challenge FQDN，provider 调用
+// zone 解析单源。输入域用于 challenge FQDN，provider 调用
 // 必须用可注册根域（PSL）；两层后缀（co.uk）、委派子域与非法输入在此固化语义。
 func TestResolveZone_table(t *testing.T) {
 	tests := []struct {
@@ -19,7 +19,7 @@ func TestResolveZone_table(t *testing.T) {
 		{name: "two-level suffix", input: "www.example.co.uk", want: "example.co.uk"},
 		{name: "two-level suffix with trailing dot", input: "api.example.com.cn.", want: "example.com.cn"},
 		// 委派子区（账户实际 zone 为 sub.example.com）PSL 不可见——仍按可注册域
-		// 解析；委派区需显式配置（历史问题 声明的已知限制）。
+		// 解析；委派区需显式配置。
 		{name: "delegated subdomain stays PSL", input: "api.sub.example.com", want: "example.com"},
 		{name: "single label fallback", input: "localhost", want: "localhost"},
 		{name: "unknown tld fallback", input: "host.example.internal", want: "example.internal"},

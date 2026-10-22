@@ -104,6 +104,6 @@ func TestBusinessWriteEndpoints_selfServiceAndReadsStayOpen(t *testing.T) {
 		t.Fatalf("读形态 POST 被误拦：%s", rec.Body.String())
 	}
 
-	// 历史问题（历史）：DNS 凭证测试端点已移出只读白名单——非管理员必须 403
+	// DNS 凭证测试端点已移出只读白名单——非管理员必须 403
 	// （真实 DNS TXT 写副作用），见 TestBusinessWriteEndpoints_requireAdmin 用例表。
 }

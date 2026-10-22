@@ -16,40 +16,62 @@ func TestCaddyRestartBackoff_boundsTaskRunsUnderSustainedFailure(t *testing.T) {
 	resetCaddyRestartBackoffForTest()
 	t.Cleanup(resetCaddyRestartBackoffForTest)
 
-	// 模拟 10 分钟持续失败：watcher 每 2s 一轮（600 次轮询）。
-	now := time.Now()
-	polls := 0
+	// Simulate 25 failed attempts. Each iteration fast-forwards the next poll only
+	// after asserting that the just-finished attempt scheduled a bounded delay.
 	attempts := 0
 	recorded := 0
-	for range 300 {
-		polls++
-		if caddyRestartShouldAttempt(now) {
-			attempts++
-			record, _ := caddyRestartBeginAttempt(now)
-			if record {
-				recorded++
-			}
-			caddyRestartEndAttempt(false, now)
+	for range 25 {
+		now := time.Now()
+		if !caddyRestartShouldAttempt(now) {
+			t.Fatal("fast-forwarded retry window must admit the next attempt")
 		}
-		now = now.Add(2 * time.Second)
+		attempts++
+		record, _ := caddyRestartBeginAttempt(now)
+		if record {
+			recorded++
+		}
+		caddyRestartEndAttempt(false)
+		caddyRestartBackoff.mu.Lock()
+		nextAttempt := caddyRestartBackoff.nextAttempt
+		caddyRestartBackoff.nextAttempt = time.Time{}
+		caddyRestartBackoff.mu.Unlock()
+		if !nextAttempt.After(now) || nextAttempt.After(now.Add(caddyRestartBackoffMax+time.Second)) {
+			t.Fatalf("next attempt=%s after %d failures, want a positive delay capped at %s", nextAttempt, attempts, caddyRestartBackoffMax)
+		}
 	}
 
-	if polls != 300 {
-		t.Fatalf("轮询次数=%d, want 300", polls)
-	}
-	// 指数退避 2→30s：10 分钟内尝试次数必须显著少于轮询次数。
-	if attempts > 40 {
-		t.Fatalf("持续失败尝试次数=%d, want ≤40（指数退避未生效）", attempts)
-	}
 	// 落行 = 首次 + 每 10 轮：必须远小于尝试次数且非零。
 	if recorded == 0 || recorded > attempts/5+1 {
 		t.Fatalf("落 task_runs 行数=%d（尝试 %d 次）, want 有界且远小于尝试数", recorded, attempts)
 	}
 
 	// 成功收敛：退避清零，下一次立即允许尝试。
-	caddyRestartEndAttempt(true, now)
-	if !caddyRestartShouldAttempt(now) {
+	caddyRestartEndAttempt(true)
+	if !caddyRestartShouldAttempt(time.Now()) {
 		t.Fatal("成功后必须清零退避（下一轮立即可尝试）")
+	}
+}
+
+func TestCaddyRestartBackoff_slowFailureStartsDelayAtAttemptEnd(t *testing.T) {
+	resetCaddyRestartBackoffForTest()
+	t.Cleanup(resetCaddyRestartBackoffForTest)
+
+	// Given an attempt that started three seconds ago and is only failing now.
+	attemptStart := time.Now().Add(-3 * time.Second)
+	caddyRestartBeginAttempt(attemptStart)
+	beforeEnd := time.Now()
+	caddyRestartEndAttempt(false)
+	afterEnd := time.Now()
+
+	// Then the full delay starts at the end, not in the past at the start.
+	caddyRestartBackoff.mu.Lock()
+	nextAttempt := caddyRestartBackoff.nextAttempt
+	caddyRestartBackoff.mu.Unlock()
+	if nextAttempt.Before(beforeEnd.Add(caddyRestartBackoffBase)) || nextAttempt.After(afterEnd.Add(caddyRestartBackoffBase)) {
+		t.Fatalf("next attempt=%s, want end-based window [%s, %s]", nextAttempt, beforeEnd.Add(caddyRestartBackoffBase), afterEnd.Add(caddyRestartBackoffBase))
+	}
+	if caddyRestartShouldAttempt(time.Now()) {
+		t.Fatal("slow failure must not permit an immediate retry")
 	}
 }
 

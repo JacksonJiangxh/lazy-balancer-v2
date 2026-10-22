@@ -12,7 +12,7 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// 历史修复: an XDB failure after the CRS phase must not delete a correct CRS
+// an XDB failure after the CRS phase must not delete a correct CRS
 // version record. Cover both changed and already-current CRS trees because the
 // changed flag alone cannot distinguish the latter from a CRS failure.
 func TestLbbakImport_xdbFailurePreservesAppliedCrsRecord(t *testing.T) {
@@ -26,7 +26,7 @@ func TestLbbakImport_xdbFailurePreservesAppliedCrsRecord(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Given a valid CRS/XDB bundle and a deterministic XDB version-write failure.
 			h := newBackupTestHandlers(t)
-			audit79SeedAdmin(t)
+			seedAdminShared(t)
 			t.Cleanup(services.ResetIP2RegionSearcherForTest)
 			g := newBackupSectionRouter(h)
 			crsDir, xdbPath := overrideTestWafPaths(t)
@@ -91,8 +91,8 @@ func TestLbbakImport_xdbFailurePreservesAppliedCrsRecord(t *testing.T) {
 	}
 }
 
-// 历史修复: a write/compile failure must leave the previous live .iplist intact.
-// 历史修复 the live .fast as a directory deterministically fails after the
+// a write/compile failure must leave the previous live.iplist intact.
+// the live.fast as a directory deterministically fails after the
 // new text has been staged, without depending on filesystem permissions.
 func TestLbbakImport_threatCompileFailurePreservesLiveIplist(t *testing.T) {
 	// Given an old live text file and a failure at compiled-file replacement.
@@ -176,7 +176,7 @@ func TestLbbakImport_threatOnlyCommitFailureWarnsFileLanded(t *testing.T) {
 	}
 }
 
-// 历史修复: only the three built-in source names are valid lbbak threat entry
+// only the three built-in source names are valid lbbak threat entry
 // names. This rejects Windows separators/traversal and arbitrary extra files on
 // every host platform.
 func TestParseLbbak_rejectsUnsafeThreatEntryNames(t *testing.T) {

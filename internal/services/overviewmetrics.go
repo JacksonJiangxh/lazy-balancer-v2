@@ -19,7 +19,7 @@ const rateLimit429CountMetric = `caddy_http_request_duration_seconds_count{`
 
 var overviewMetricsHTTPClient = &http.Client{Timeout: 5 * time.Second}
 
-// overviewMetricsCacheTTL 概览指标抓取的进程内缓存窗口（历史问题）：仪表盘
+// overviewMetricsCacheTTL 概览指标抓取的进程内缓存窗口：仪表盘
 // 三个调用点（限流卡片/单规则 stage-stats）各自抓取一次是重复放大面；
 // 5s 窗口内同一 metricsURL 复用同一份解析结果。var 供测试缩短/复位。
 var overviewMetricsCacheTTL = 5 * time.Second
@@ -55,7 +55,7 @@ func resetOverviewMetricsCacheForTest() {
 // 计数自最近一次 Caddy 配置重载以来累计（/load 重建 registry 即归零；进程重启
 // 同），非按天口径。任何抓取/解析失败
 // 都返回 error，由调用方决定降级策略，绝不静默返回空列表。
-// 历史问题：5s TTL 进程内缓存 + 同 URL 单飞——失败轮不写缓存（下一请求重试），
+// 5s TTL 进程内缓存 + 同 URL 单飞——失败轮不写缓存（下一请求重试），
 // 返回副本避免调用方改动共享切片。
 func ScrapeRateLimitBlocks(metricsURL string) ([]RateLimitHostBlocks, error) {
 	overviewMetricsCache.Lock()
@@ -78,6 +78,21 @@ func ScrapeRateLimitBlocks(metricsURL string) ([]RateLimitHostBlocks, error) {
 	call := &overviewMetricsCall{done: make(chan struct{})}
 	overviewMetricsCache.inflight[metricsURL] = call
 	overviewMetricsCache.Unlock()
+
+	// 单飞清理必须 defer：抓取 panic（解析器越界等）时 inflight 条目残留会让
+	// 同 URL 的后续请求全部永久阻塞在 <-call.done——一个坏响应把限流卡片钉死
+	// 到进程重启。panic 照常向上传播（中间件恢复口径不变），等待方收到 error
+	// 而非挂死。
+	defer func() {
+		if r := recover(); r != nil {
+			overviewMetricsCache.Lock()
+			call.err = fmt.Errorf("抓取限流指标 panic: %v", r)
+			delete(overviewMetricsCache.inflight, metricsURL)
+			overviewMetricsCache.Unlock()
+			close(call.done)
+			panic(r)
+		}
+	}()
 
 	blocks, err := scrapeRateLimitBlocksUncached(metricsURL)
 
@@ -116,7 +131,7 @@ type RateLimitHostBlocks struct {
 }
 
 // overviewMetricsReadLimit 是 Caddy /metrics 响应体的读取上限：指标基数异常膨胀
-// 时防止大块内存分配拖垮仪表盘请求（历史问题）。
+// 时防止大块内存分配拖垮仪表盘请求。
 const overviewMetricsReadLimit = int64(16 << 20)
 
 // scrapeRateLimitBlocksUncached 抓取 Caddy admin /metrics 并按站点聚合 429 限流
@@ -159,7 +174,7 @@ func scrapeRateLimitBlocksUncached(metricsURL string) ([]RateLimitHostBlocks, er
 // 含上游自返 429，handler 标签恒不命中（见下方内联注释）；抓取失败由调用方
 // 返回 500。
 // 注释行、其他指标、_bucket/_sum 序列、缺 host 标签或数值非法的行一律跳过。
-// NormalizeMetricsHost 统一 host 标签归一（历史问题）：Caddy metrics 的 host
+// NormalizeMetricsHost 统一 host 标签归一：Caddy metrics 的 host
 // 标签是原文 r.Host（可能含 :8080 / [::1]:8443），而 lb_rules.domain 不带端口
 // ——不归一会让带端口部署的规则限流计数恒 0。IPv6 方括号在比较域一并剥除。
 func NormalizeMetricsHost(host string) string {
@@ -185,7 +200,7 @@ func parseRateLimit429Counts(body string) map[string]float64 {
 		}
 		labels := parsePromLabelPairs(line[len(rateLimit429CountMetric):braceEnd])
 		// 仅按 code=429 过滤：Caddy metrics 的 handler 标签取主路由链首处理器
-		//（routes.go:174），历史修复 注入后恒为 headers、错误路由响应亦继承主路由
+		//（routes.go:174），注入后恒为 headers、错误路由响应亦继承主路由
 		// 标签——handler="rate_limit" 永不命中。本栈限流拦截自 v2.2.3 起恒 429
 		//（buildRateLimitErrorRoute），上游自返 429 无法区分、如实纳入计数
 		//（卡片文案已标注口径）。
@@ -211,7 +226,7 @@ func parseRateLimit429Counts(body string) map[string]float64 {
 
 // parsePromLabelPairs 解析 Prometheus 标签列表（key="value",...），容忍值内的
 // 逗号；残缺片段直接丢弃。
-// 转义按 exposition format 规范解码（历史修复）：`\\`→`\`、`\"`→`"`、
+// 转义按 exposition format 规范解码：`\\`→`\`、`\"`→`"`、
 // `\n`→换行。规范未定义的转义（如 `\t`）原样保留（反斜杠+字符）——此前
 // 实现直接吞掉反斜杠写下一字节，`\n` 被解析成字面 n（值失真），且静默丢字节。
 func parsePromLabelPairs(s string) map[string]string {

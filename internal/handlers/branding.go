@@ -87,14 +87,14 @@ var brandingStore = struct {
 	cfg     brandingConfig
 	modTime time.Time
 	size    int64
-	// failedProbeAt 失败探测缓存时间戳（历史问题）：GetBranding 是公开无鉴权
+	// failedProbeAt 失败探测缓存时间戳：GetBranding 是公开无鉴权
 	// 端点，文件缺失/半截写时每请求一次重读+日志是放大面——同一失败形态
 	// 60s 内只探测/留痕一次（stat 成功但仍不可解析的形态仍逐请求重读，保证
 	// 恢复后立即收敛）。
 	failedProbeAt time.Time
 }{}
 
-// brandingFailureProbeWindow 失败探测/日志的限流窗口（历史问题）。
+// brandingFailureProbeWindow 失败探测/日志的限流窗口。
 const brandingFailureProbeWindow = time.Minute
 
 // loadBrandingConfig returns the in-memory branding snapshot, transparently
@@ -114,7 +114,7 @@ func loadBrandingConfig(dataDir string) brandingConfig {
 		brandingStore.mu.RUnlock()
 		return cfg
 	}
-	// 历史问题：stat 失败（文件缺失/不可读）且近期已探测过失败 → 直接返回
+	// stat 失败（文件缺失/不可读）且近期已探测过失败 → 直接返回
 	// last-known-good，不再每请求重读+记日志；文件恢复（stat 成功）即走
 	// 慢路径立即收敛。
 	if stErr != nil && brandingStore.loaded && brandingStore.dataDir == dataDir &&
@@ -138,7 +138,7 @@ func loadBrandingConfig(dataDir string) brandingConfig {
 		// 有效配置,不更新 stat 标记——文件恢复完整后下次访问立即重读收敛;
 		// 跨目录的前值不属于本文件,不保(测试隔离即依赖此语义);boot 无
 		// 前值时 ok=false 的 cfg(默认)照常入库。
-		// 历史问题：失败日志 60s 限流（公开端点每请求一条是放大面；lookup 失败
+		// 失败日志 60s 限流（公开端点每请求一条是放大面；lookup 失败
 		// 原因仅窗口内记一次，同一形态重复无新增信息）。
 		if brandingStore.failedProbeAt.IsZero() || time.Since(brandingStore.failedProbeAt) >= brandingFailureProbeWindow {
 			brandingStore.failedProbeAt = time.Now()
@@ -165,7 +165,7 @@ func loadBrandingConfig(dataDir string) brandingConfig {
 	brandingStore.loaded = true
 	brandingStore.dataDir = dataDir
 	if ok {
-		// 成功读取即清失败探测标记（历史问题）：下一轮失败重新计时/留痕。
+		// 成功读取即清失败探测标记：下一轮失败重新计时/留痕。
 		brandingStore.failedProbeAt = time.Time{}
 	}
 	if stErr == nil {
@@ -204,7 +204,7 @@ func brandingReloadDetail(prev, next brandingConfig) string {
 			filtered = append(filtered, p)
 		}
 	}
-	// 历史问题③:filtered 恒非空(调用点 cfg!=prev 蕴含 4 字段至少一个不等,
+	// filtered 恒非空(调用点 cfg!=prev 蕴含 4 字段至少一个不等,
 	// parts 全覆盖)——原「内容无实际变化」防御分支不可达已删;若未来加第
 	// 5 字段须同步 parts,否则此处返回空 detail(编译期无守卫)。
 	return services.FormatAuditDetail(filtered...)
@@ -216,7 +216,7 @@ func brandingReloadDetail(prev, next brandingConfig) string {
 // 「该字段用默认」语义处理。
 // ok=false 表示文件缺失/不可读/整体 JSON 非法(调用方:boot 用默认 cfg,
 // 热重载保旧值);字段级类型错不改变 ok=true(该字段回退默认,既有裁定)。
-// 历史问题：失败原因经 readErr 上抛，由调用方按 60s 窗口限流留痕（原此处
+// 失败原因经 readErr 上抛，由调用方按 60s 窗口限流留痕（原此处
 // 每请求 error 日志——公开 GetBranding 端点的日志放大面）。
 func readBrandingFile(path string) (brandingConfig, bool, error) {
 	data, err := os.ReadFile(path)
@@ -258,7 +258,7 @@ func readBrandingFile(path string) (brandingConfig, bool, error) {
 //   - 畸形 JSON → 不动(保守:不破坏用户数据;运行时按字段级回退并日志告警)
 //
 // 落盘统一走 services.MaterializeBranding 原子写（tmp+fsync+rename+父目录
-// fsync，历史问题：此前 os.WriteFile 直写，进程崩溃可留半截 branding.json）；
+// fsync，此前 os.WriteFile 直写，进程崩溃可留半截 branding.json）；
 // 顺带完成 landing 文案注入（与 SyncDefaultLandingText 幂等同源）。
 func EnsureBrandingFile(dataDir string) error {
 	path := filepath.Join(dataDir, "branding.json")
@@ -306,7 +306,7 @@ type brandingResponse struct {
 	LandingUsesDefault bool   `json:"landing_uses_default"`
 }
 
-// brandingSyncGate 60s 采样门（历史问题，用户裁定）：GetBranding 是公开
+// brandingSyncGate 60s 采样门：GetBranding 是公开
 // 无鉴权端点，幂等同步/种子/镜像每请求 ~7 条 SQL 是残余放大面——boot+首请求
 // 已完成播种，门内跳过仅推迟带外变更 ≤60s 可见。branding.json 为手工编辑/
 // 集群同步文件，无管理面写路径（因此无需写侧主动失效）；内容热重载由 stat
@@ -373,7 +373,7 @@ func (h *Handlers) GetBranding(c *gin.Context) {
 			go func() {
 				isMaster, roleErr := services.RoleOf(context.Background(), db.DB)
 				if roleErr != nil {
-					// 历史问题-3b（历史）：角色读失败不得按主节点继续写
+					// 角色读失败不得按主节点继续写
 					// ——公开 GET 触发的异步重应用在从节点上会造成本地 /load 漂移。
 					services.Logf("warn", "branding：读取节点角色失败，跳过本地 Caddy 重应用: %v", roleErr)
 					return
@@ -393,7 +393,7 @@ func (h *Handlers) GetBranding(c *gin.Context) {
 // renderDefaultBlockPage renders the branded default block page; consumed by
 // SeedDefaultBlockPage(种子默认拦截页)与预览路径。
 func renderDefaultBlockPage(cfg brandingConfig) string {
-	// 页脚由 renderBlockPageShell 内部按同一 cfg 构建（历史 历史问题：
+	// 页脚由 renderBlockPageShell 内部按同一 cfg 构建
 	// 此处曾有逐字重复的死计算，已删）。
 	return renderBlockPageShell(cfg, blockPageSpecs["default"])
 }
@@ -549,7 +549,7 @@ func SeedDefaultBlockPage(dataDir string) (bool, error) {
 	}
 	isMaster, roleErr := services.RoleOf(context.Background(), db.DB)
 	if roleErr != nil {
-		// 历史问题-3b（历史）：角色不可判定时跳过写——本函数会
+		// 角色不可判定时跳过写——本函数会
 		// 写同步表 security_block_pages，从节点瞬时读错会让本地渲染覆盖主端
 		// 同步内容。与下方「owned by master」语义一致。
 		services.Logf("warn", "branding：读取节点角色失败，跳过默认拦截页播种: %v", roleErr)
@@ -563,9 +563,9 @@ func SeedDefaultBlockPage(dataDir string) (bool, error) {
 	}
 	cfg := loadBrandingConfig(dataDir)
 	content := renderDefaultBlockPage(cfg)
-	// 默认页 历史修复 恒 html（带外改库漂移自愈；白名单类型不影响——
+	// 默认页恒 html（带外改库漂移自愈；白名单类型不影响——
 	// 渲染处空值回退与写侧白名单把守，此处仅归位默认页）。
-	result, err := db.DB.Exec(`UPDATE security_block_pages SET content=?, content_type=?, updated_at=datetime('now') WHERE is_default=1 AND (COALESCE(content,'') != ? OR COALESCE(content_type,'') != ?) /* 历史问题：content=NULL 行 != ? 为 NULL 不命中——COALESCE 同 content_type 侧 */`, content, models.DefaultBlockPageContentType, content, models.DefaultBlockPageContentType)
+	result, err := db.DB.Exec(`UPDATE security_block_pages SET content=?, content_type=?, updated_at=datetime('now') WHERE is_default=1 AND (COALESCE(content,'') != ? OR COALESCE(content_type,'') != ?) /* content=NULL 行 != ? 为 NULL 不命中——COALESCE 同 content_type 侧 */`, content, models.DefaultBlockPageContentType, content, models.DefaultBlockPageContentType)
 	if err != nil {
 		return false, fmt.Errorf("更新默认拦截页面内容: %w", err)
 	}
@@ -578,10 +578,10 @@ func SeedDefaultBlockPage(dataDir string) (bool, error) {
 		if _, err := db.DB.Exec(`INSERT OR IGNORE INTO security_block_pages (id, name, description, content, is_default, is_builtin, created_at, updated_at) VALUES (?, ?, ?, ?, FALSE, TRUE, datetime('now'), datetime('now'))`, bp.id, bp.name, bp.desc, stock); err != nil {
 			return changed, fmt.Errorf("播种内置拦截页面 %d: %w", bp.id, err)
 		}
-		// 历史修复（历史）：name/description/content 裸 != 对 NULL 不命中（带外改库
-		// 置 NULL 正是本函数自称要自愈的形态）——COALESCE 同 :510 默认页历史问题
+		// name/description/content 裸!= 对 NULL 不命中（带外改库
+		// 置 NULL 正是本函数自称要自愈的形态）——COALESCE 同:510 默认页
 		// 修复口径（name 列 NOT NULL，一并包仅为统一口径）。
-		// 历史问题：UPDATE 增身份守卫——INSERT OR IGNORE 因 id 冲突未插入时，无守卫的
+		// UPDATE 增身份守卫——INSERT OR IGNORE 因 id 冲突未插入时，无守卫的
 		// UPDATE 会按 id 改写「占用了内置 id 的自定义页」。身份判据=is_builtin=1
 		// （正常行）或 name=库存名（备份导入/带外改库丢了标志但仍是内置页——既有
 		// 自愈用例要求该形态归位）。其余（自定义页占 id）一律跳过并 warn。
@@ -594,7 +594,7 @@ func SeedDefaultBlockPage(dataDir string) (bool, error) {
 		changed = changed || bn > 0
 		if bn == 0 {
 			// 未命中且该 id 被非内置行（名称亦非库存名）占用 → 明确告警并跳过
-			// （历史问题：自定义页永不改写）。
+			// （自定义页永不改写）。
 			var occupied int
 			if err := db.DB.QueryRow(`SELECT COALESCE(is_builtin,0) FROM security_block_pages WHERE id=? AND name<>?`, bp.id, bp.name).Scan(&occupied); err == nil && occupied != 1 {
 				services.Logf("warn", "内置拦截页面 %d（%s）的 ID 已被自定义页面占用，跳过播种（不改写自定义页）", bp.id, bp.name)

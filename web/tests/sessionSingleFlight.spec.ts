@@ -8,7 +8,7 @@ import assert from 'node:assert/strict'
 
 import { createSessionSingleFlight } from '../src/utils/sessionSingleFlight.ts'
 
-test('CRS 新对话框会话不会被旧单飞请求饿死（历史问题 行为）', async () => {
+test('CRS 新对话框会话不会被旧单飞请求饿死', async () => {
   // 场景：会话 1 的请求在途 → 会话 2 打开（旧请求失效）→ 旧请求后到。
   // 期望：旧结果丢弃、会话 2 追加一次请求并落地；（原子实现会让会话 2 空等且永不 loaded）
   const loads: number[] = []
@@ -91,7 +91,7 @@ test('旧会话失败不消耗新会话的加载态', async () => {
 })
 
 
-// ---- 历史修复④：sessionSingleFlight 的 onError/requestedSession/isInflight ----
+// sessionSingleFlight 的 onError/requestedSession/isInflight ----
 
 test('sessionSingleFlight：失败走 onError（带会话）且不落 loadedSession，在途状态可观测', async () => {
   const gate = Promise.withResolvers<string>()

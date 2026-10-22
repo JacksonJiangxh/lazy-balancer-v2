@@ -1,8 +1,8 @@
 package services
 
-//   历史修复 MFAIssueChallenge 落签发时 password_version（挑战与密码版本绑定）；
-//   历史修复 锁定开关读取失败必须显式报错（fail-closed 由调用方落实）；
-//   历史修复 恢复码消费的存储错误不得降级为「未命中」。
+//   MFAIssueChallenge 落签发时 password_version（挑战与密码版本绑定）；
+//   锁定开关读取失败必须显式报错（fail-closed 由调用方落实）；
+//   恢复码消费的存储错误不得降级为「未命中」。
 
 import (
 	"testing"

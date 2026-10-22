@@ -268,7 +268,7 @@ func TestExportIPList_threatUsesFileTruth(t *testing.T) {
 	if got, want := resp.Body.String(), "192.0.2.0/24\n198.51.100.7\n"; got != want {
 		t.Fatalf("threat export=%q, want file truth %q (stale DB entries must be ignored)", got, want)
 	}
-	// 历史修复（历史）：文件名恒为「名单 ID」形态（此前 name 非空只作条件，
+	// 文件名恒为「名单 ID」形态（此前 name 非空只作条件，
 	// 实际仍用 id，死分支误导）。
 	if got, want := resp.Header().Get("Content-Disposition"), `attachment; filename="ip-list-`+strconv.FormatInt(id, 10)+`.txt"`; got != want {
 		t.Fatalf("Content-Disposition=%q, want %q", got, want)
@@ -424,7 +424,7 @@ func threatSystemListNameForOrderTest(t *testing.T) string {
 	return name
 }
 
-// 历史修复（历史）：导出文件名恒取**库内行 ID**。此前以 name 非空作条件
+// 导出文件名恒取**库内行 ID**。此前以 name 非空作条件
 // 却仍用路由段经 safeAtoiOrZero 折算——名称从不参与文件名（死分支），且非规范
 // 路由段 "<id>.0"（SQLite INTEGER 亲和命中该行）会导出成 ip-list-0.txt。
 func TestExportIPList_filenameUsesListRowID(t *testing.T) {

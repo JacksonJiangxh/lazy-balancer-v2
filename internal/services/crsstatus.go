@@ -10,7 +10,7 @@ func storedStatusSnapshot() CRSUpdateStatusSnapshot {
 	var stored struct {
 		status, trigger, startedAt, finishedAt, message, version string
 	}
-	// 历史问题：半初始化（db.DB=nil）时降级 idle 而非 panic——与同包
+	// 半初始化（db.DB=nil）时降级 idle 而非 panic——与同包
 	// crs_rule_index/securityevents_retention 的 nil 守卫同口径。
 	if db.DB == nil {
 		return CRSUpdateStatusSnapshot{Status: string(CRSStatusIdle)}
@@ -20,7 +20,7 @@ func storedStatusSnapshot() CRSUpdateStatusSnapshot {
 		FROM security_crs_version WHERE id=1`).
 		Scan(&stored.status, &stored.trigger, &stored.startedAt, &stored.finishedAt, &stored.message, &stored.version)
 	if err != nil {
-		// DB 读失败静默回退 idle 会丢可回溯性（历史问题）：留 warn 后回退。
+		// DB 读失败静默回退 idle 会丢可回溯性：留 warn 后回退。
 		Logf("warn", "CRS 状态: 读取存储快照失败，回退 idle: %v", err)
 		return CRSUpdateStatusSnapshot{Status: string(CRSStatusIdle)}
 	}
@@ -73,7 +73,7 @@ func (m *CRSUpdateManager) RuleCount() int {
 		Logf("error", "crs update: failed to count SecRules: %v", err)
 		return 0
 	}
-	// 历史修复(历史):放锁扫描期间 rescan 可能已写入新值——
+	// 放锁扫描期间 rescan 可能已写入新值——
 	// 重锁写回前双重检查,不覆盖更新值(展示层一致性)。
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -109,7 +109,7 @@ func (m *CRSUpdateManager) InvalidateRuleCount() {
 }
 
 // InvalidateCRSRuleCount 供带外替换 live CRS 树的通道丢弃规则数缓存
-// 历史问题：集群同步/备份导入的文件相位统一收敛在
+// 集群同步/备份导入的文件相位统一收敛在
 // ApplyWafFileBundle，由该函数在 CRS 落盘成功后调用；manager 未初始化
 // （测试/半初始化装配）时为空操作，不 panic。
 func InvalidateCRSRuleCount() {

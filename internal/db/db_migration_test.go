@@ -4,8 +4,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"os"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -25,29 +28,107 @@ func TestCreateTables_omits_dead_upstream_accessURL_column(t *testing.T) {
 	}
 }
 
-func TestRunMigrations_oneShotMarkersRegisteredInNewColumns(t *testing.T) {
-	data, err := os.ReadFile("db.go")
+// 一次性迁移 marker 的可观察契约：启动迁移执行后每个 marker 列/键都必须已
+// 置位（行为断言）。marker 的作用是让下一次启动零扫描/零写入——只断言源码
+// 里登记了列名无法证明迁移真的落位，也无法发现「登记了列但迁移未写 marker」。
+func TestRunMigrations_oneShotMarkersPersistedByMigration(t *testing.T) {
+	database := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	if _, err := database.Exec("INSERT INTO global_config (id,caddy_config) VALUES (1,'{}')"); err != nil {
+		t.Fatalf("seed global config: %v", err)
+	}
+
+	if err := runMigrations(); err != nil {
+		t.Fatalf("run migrations: %v", err)
+	}
+	if err := migrateSyncSwitches(); err != nil {
+		t.Fatalf("migrate sync switches: %v", err)
+	}
+
+	// 六个一次性 marker（newColumns 登记点）：迁移完成后必须全部置位。
+	for _, tc := range []struct {
+		name  string
+		query string
+		want  string
+	}{
+		{name: "global_config.waf_mode4_migrated", query: `SELECT CAST(COALESCE(waf_mode4_migrated,0) AS TEXT) FROM global_config WHERE id=1`, want: "1"},
+		{name: "global_config.sync_switches_migrated", query: `SELECT CAST(COALESCE(sync_switches_migrated,0) AS TEXT) FROM global_config WHERE id=1`, want: "1"},
+		{name: "global_config.legacy_custom_rule_sanitize_fp", query: `SELECT COALESCE(legacy_custom_rule_sanitize_fp,'') FROM global_config WHERE id=1`, want: legacyCustomRuleSanitizeFingerprint},
+		{name: "global_config.threat_traffic_sample_unified_migrated", query: `SELECT CAST(COALESCE(threat_traffic_sample_unified_migrated,0) AS TEXT) FROM global_config WHERE id=1`, want: "1"},
+		{name: "global_config.security_events_retention_migrated", query: `SELECT CAST(COALESCE(security_events_retention_migrated,0) AS TEXT) FROM global_config WHERE id=1`, want: "1"},
+		{name: "global_config.ca_providers_seeded", query: `SELECT CAST(COALESCE(ca_providers_seeded,0) AS TEXT) FROM global_config WHERE id=1`, want: "1"},
+	} {
+		var got string
+		if err := database.QueryRow(tc.query).Scan(&got); err != nil {
+			t.Errorf("%s: marker column must exist and be readable after migration: %v", tc.name, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("%s=%q, want %q（一次性迁移必须落位 marker）", tc.name, got, tc.want)
+		}
+	}
+}
+
+// marker 列必须登记在 newColumns 统一补列通道（否则存量库升级缺列、迁移直接
+// 报 no such column）。用 AST 读取 newColumns 复合字面量的键集——文本切片会
+// 把注释中的列名也算作登记。
+func TestRunMigrations_oneShotMarkerColumnsRegisteredInNewColumns(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "db.go", nil, 0)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("parse db.go: %v", err)
 	}
-	text := string(data)
-	start := strings.Index(text, "newColumns := map[string]string{")
-	if start < 0 {
-		t.Fatal("newColumns registry not found")
+	registered := map[string]struct{}{}
+	ast.Inspect(file, func(node ast.Node) bool {
+		assign, ok := node.(*ast.AssignStmt)
+		if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
+			return true
+		}
+		ident, ok := assign.Lhs[0].(*ast.Ident)
+		if !ok || ident.Name != "newColumns" {
+			return true
+		}
+		literal, ok := assign.Rhs[0].(*ast.CompositeLit)
+		if !ok {
+			return true
+		}
+		for _, element := range literal.Elts {
+			kv, ok := element.(*ast.KeyValueExpr)
+			if !ok {
+				continue
+			}
+			key, ok := kv.Key.(*ast.BasicLit)
+			if !ok || key.Kind != token.STRING {
+				continue
+			}
+			unquoted, err := strconv.Unquote(key.Value)
+			if err != nil {
+				continue
+			}
+			registered[unquoted] = struct{}{}
+		}
+		return false
+	})
+	if len(registered) == 0 {
+		t.Fatal("newColumns registry not found（AST 形态漂移）")
 	}
-	end := strings.Index(text[start:], "\n\t}\n")
-	if end < 0 {
-		t.Fatal("newColumns registry end not found")
-	}
-	registry := text[start : start+end]
-	for _, key := range []string{"global_config.waf_mode4_migrated", "global_config.sync_switches_migrated"} {
-		if !strings.Contains(registry, `"`+key+`"`) {
+	for _, key := range []string{
+		"global_config.waf_mode4_migrated",
+		"global_config.sync_switches_migrated",
+		"global_config.legacy_custom_rule_sanitize_fp",
+		"global_config.threat_traffic_sample_unified_migrated",
+		"global_config.security_events_retention_migrated",
+		"global_config.ca_providers_seeded",
+	} {
+		if _, ok := registered[key]; !ok {
 			t.Errorf("one-shot migration marker %s must use the idempotent newColumns ALTER path", key)
 		}
 	}
 }
 
-// 历史问题-03：存量库补列——task_runs.operator（TEXT NOT NULL DEFAULT ”）。
+// 存量库补列——task_runs.operator（TEXT NOT NULL DEFAULT ”）。
 // fresh DDL 建表含列；pre-升级库经 runMigrations 幂等补列（schedule_days
 // 曾漏登记致升级安装必报 no such column——同位点回归钉）。
 func TestRunMigrationsAddsTaskRunsOperatorColumn(t *testing.T) {
@@ -89,7 +170,7 @@ func TestRunMigrationsAddsTaskRunsOperatorColumn(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：task_runs.stage/entry_count 零写入方死列清理——
+// task_runs.stage/entry_count 零写入方死列清理——
 // fresh DDL 不含两列；存量库经 runMigrations 的 deadColumnDrops 幂等删除。
 func TestRunMigrationsDropsTaskRunsStageEntryCount(t *testing.T) {
 	// Given 存量库形态：task_runs 带 stage/entry_count 两列（fresh DDL 已删
@@ -217,7 +298,7 @@ func TestRunMigrationsDropsLegacyTLSCertificatesAndNodeSyncColumnsIdempotently(t
 func TestRunMigrationsNodesDeadColumnsPreservesServerMapCoordinates(t *testing.T) {
 	// Given 存量库：nodes 仍带 sync_enabled/sync_scope 死列（触发
 	// migrateNodesDeadColumns 整表重建），且节点已写入大屏坐标——
-	// 重建 DDL 必须携 server_map_lat/lon 并保值（历史问题）。
+	// 重建 DDL 必须携 server_map_lat/lon 并保值。
 	database := openMigrationTestDB(t)
 	if err := createTables(); err != nil {
 		t.Fatalf("create tables: %v", err)
@@ -396,7 +477,7 @@ func TestRunMigrations_migratesLegacyHTTPSRulesToHTTPWithTLS(t *testing.T) {
 	}
 
 	// And 无证书的 https 行归一为普通 HTTP（enable_tls=0 且清 tls_http_redirect，
-	// 不制造 TLS 端口明文/幻影跳转的 历史修复 形态）
+	// 不制造 TLS 端口明文/幻影跳转的形态）
 	var redirect int
 	if err := database.QueryRow("SELECT protocol, enable_tls, tls_http_redirect FROM lb_rules WHERE caddy_id='lb_https_notls'").Scan(&protocol, &enableTLS, &redirect); err != nil {
 		t.Fatalf("read migrated certless rule: %v", err)
@@ -406,7 +487,7 @@ func TestRunMigrations_migratesLegacyHTTPSRulesToHTTPWithTLS(t *testing.T) {
 	}
 
 	// And 受影响规则逐条进入操作日志缓冲（待审计库就绪落库），重跑零命中。
-	// 第三个条目是 历史问题 新增的 TCP 死字段清零聚合审计（本夹具的 tcp 行
+	// 第三个条目是新增的 TCP 死字段清零聚合审计（本夹具的 tcp 行
 	// compress_types 默认 'gzip' 命中死值谓词，首轮被归一）。
 	entries := drainSystemAuditBuffer()
 	if len(entries) != 3 {
@@ -445,7 +526,7 @@ func TestRunMigrations_migratesLegacyHTTPSRulesToHTTPWithTLS(t *testing.T) {
 	}
 }
 
-// 历史问题: 存量 https 行的「有证」判定须覆盖 cert_jobs 承载的 ACME 证书——签发
+// 存量 https 行的「有证」判定须覆盖 cert_jobs 承载的 ACME 证书——签发
 // 门控不筛 protocol，历史 https 行可能已签出证书，仅查内联列会误归无证分支，
 // 导致已签发证书静默不再加载且永不续期。
 func TestRunMigrations_migratesLegacyHTTPSRulesWithACMECertJobToHTTPWithTLS(t *testing.T) {
@@ -494,7 +575,7 @@ func TestRunMigrations_migratesLegacyHTTPSRulesWithACMECertJobToHTTPWithTLS(t *t
 		t.Fatalf("disabled-cert-job rule protocol=%q enable_tls=%d tls_http_redirect=%d, want http/0/0", protocol, enableTLS, redirect)
 	}
 
-	// And 完全无证行保持既有无证分支（历史问题 行为不回退）
+	// And 完全无证行保持既有无证分支
 	if err := database.QueryRow("SELECT protocol, enable_tls FROM lb_rules WHERE caddy_id='lb_https_certless'").Scan(&protocol, &enableTLS); err != nil {
 		t.Fatalf("read migrated certless rule: %v", err)
 	}
@@ -573,7 +654,7 @@ func drainSystemAuditBuffer() []systemAuditEntry {
 	return entries
 }
 
-// 历史问题: 迁移缓冲的系统事件在审计库就绪后落 audit_log 表（UI 操作日志可见），
+// 迁移缓冲的系统事件在审计库就绪后落 audit_log 表（UI 操作日志可见），
 // 并清空缓冲不重复写。
 func TestFlushSystemAuditLogs_writesBufferedEntriesToAuditDB(t *testing.T) {
 	// Given 一条迁移期缓冲的系统事件 + 就位的审计库
@@ -619,7 +700,7 @@ func TestFlushSystemAuditLogs_writesBufferedEntriesToAuditDB(t *testing.T) {
 	}
 }
 
-// 历史问题: flush 写失败时条目按原序留回缓冲等待下轮重试，不再先清缓冲导致
+// flush 写失败时条目按原序留回缓冲等待下轮重试，不再先清缓冲导致
 // 事件永久丢失；审计库未就绪（InitializeAuditDB 中途失败）同样保留。
 func TestFlushSystemAuditLogs_retainsEntriesOnInsertFailure(t *testing.T) {
 	// Given 一个 audit_log 表被改名（INSERT 必失败）的审计库 + 两条缓冲事件
@@ -704,7 +785,7 @@ func TestFlushSystemAuditLogs_retainsEntriesWhenAuditDBNotReady(t *testing.T) {
 	drainSystemAuditBuffer()
 }
 
-// 历史问题: 缓冲设上限，审计库长期不可用时丢弃最旧条目，内存不无界增长。
+// 缓冲设上限，审计库长期不可用时丢弃最旧条目，内存不无界增长。
 func TestRecordSystemAudit_capsBufferDroppingOldest(t *testing.T) {
 	// Given 缓冲已被灌入超过上限的事件
 	drainSystemAuditBuffer()
@@ -772,8 +853,8 @@ func TestRunMigrations_dropsDeadLbRulesIPACLColumns(t *testing.T) {
 func TestRunMigrations_makes_users_isEnabled_notNull_and_backfills_null(t *testing.T) {
 	// Given
 	database := openMigrationTestDB(t)
-	// 历史问题：生产迁移顺序是 newColumns 先补齐 mfa 列再执行本重建——种子
-	// 表按同一形状建（重建白名单含 mfa 列，缺列即报错，这本身就是 历史问题 修复
+	// 生产迁移顺序是 newColumns 先补齐 mfa 列再执行本重建——种子
+	// 表按同一形状建（重建白名单含 mfa 列，缺列即报错，这本身就是修复
 	// 的回归锚点）。
 	if _, err := database.Exec(`CREATE TABLE users (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -826,7 +907,7 @@ func TestRunMigrations_makes_users_isEnabled_notNull_and_backfills_null(t *testi
 	if _, err := database.Exec("UPDATE users SET is_enabled=NULL WHERE username='legacy'"); err == nil {
 		t.Fatal("users.is_enabled accepted NULL after migration")
 	}
-	// 历史修复：重建白名单含登录锁定列（newColumns 先补齐、重建保留，缺列即报错——
+	// 重建白名单含登录锁定列（newColumns 先补齐、重建保留，缺列即报错——
 	// 与 mfa 列同为回归锚点），且 NOT NULL 约束在重建后保持。
 	var loginColsNull int
 	if err := database.QueryRow(`SELECT "notnull" FROM pragma_table_info('users') WHERE name='login_failed_attempts'`).Scan(&loginColsNull); err != nil {
@@ -951,12 +1032,12 @@ func TestMigrateCertJobsStatusConstraint_rebuilds_constraint_with_deprecated_sta
 	if err := database.QueryRow("SELECT status FROM cert_jobs WHERE rule_id='lb_old'").Scan(&status); err != nil {
 		t.Fatalf("read migrated certificate job status: %v", err)
 	}
-	// 历史问题（历史）：枚举外状态归一到终态 failed——'queued' 是活跃
+	// 枚举外状态归一到终态 failed——'queued' 是活跃
 	// 起始态会被签发队列立即拾取，等于升级时静默发起一次签发/部署尝试。
 	if status != "failed" {
 		t.Fatalf("migrated deprecated status=%q, want failed", status)
 	}
-	// 历史问题：改写用户可见数据必须留痕（系统审计聚合一行）。
+	// 改写用户可见数据必须留痕（系统审计聚合一行）。
 	audited := false
 	for _, entry := range drainSystemAuditBuffer() {
 		if strings.Contains(entry.detail, "枚举外状态归一到 failed") {
@@ -1434,7 +1515,7 @@ func TestInitialize_certJobNormalizationPreservesUnparseableValues(t *testing.T)
 	}
 }
 
-// 历史修复 回归：ca_available_after 规范化必须是一次性回填——WHERE 排除已
+// 回归：ca_available_after 规范化必须是一次性回填——WHERE 排除已
 // 规范化的行（值未变不重写），否则每次启动全量重写匹配行（页脏 + WAL
 // 增长）。不可解析值仍由 datetime(...) IS NOT NULL 守卫保留。
 func TestInitialize_certJobCAAvailableAfterNormalizationRewritesOnlyStaleRows(t *testing.T) {
@@ -1496,7 +1577,7 @@ func TestInitialize_certJobCAAvailableAfterNormalizationRewritesOnlyStaleRows(t 
 	}
 }
 
-// 历史问题: 历史 NOT-NULL 窗口期建库的 security_policies 四列停留 NOT NULL，
+// 历史 NOT-NULL 窗口期建库的 security_policies 四列停留 NOT NULL，
 // fresh CREATE 与 newColumns 迁移对「列已存在」的库均不生效；启动迁移必须
 // 收敛为可空并保数据。
 func TestInitialize_convergesWindowEraSecurityPoliciesNotNullColumns(t *testing.T) {
@@ -1570,7 +1651,7 @@ func TestInitialize_convergesWindowEraSecurityPoliciesNotNullColumns(t *testing.
 	if _, err := DB.Exec(`INSERT INTO security_policies (id,name,geoip_countries) VALUES (2,'null-restore',NULL)`); err != nil {
 		t.Fatalf("insert NULL geoip_countries after convergence: %v", err)
 	}
-	// 审计 历史问题：窗口期收敛不得丢失 refs 两列——rebuild 曾以陈旧 DDL 重建，
+	// 窗口期收敛不得丢失 refs 两列——rebuild 曾以陈旧 DDL 重建，
 	// 把同一 runMigrations 早前 newColumns 刚加的列丢掉，安全策略子系统当次
 	// 启动整体 500（no such column）、启动配置不应用、集群快照停摆。
 	for _, name := range []string{"ip_acl_list_refs", "ip_whitelist_refs"} {
@@ -1591,7 +1672,7 @@ func TestInitialize_convergesWindowEraSecurityPoliciesNotNullColumns(t *testing.
 	}
 }
 
-// 历史问题: users.is_enabled 重建迁移的 DDL 停留在 OIDC 集成之前——
+// users.is_enabled 重建迁移的 DDL 停留在 OIDC 集成之前——
 // runMigrations 早前 newColumns 循环补的 auth_provider/oidc_subject/oidc_issuer
 // 三列随 DROP TABLE 一并丢失；存量 OIDC 用户升级重启后无法再按
 // (issuer,subject) 命中，下次登录退化为重复建行。重建必须携带三列并保数据。
@@ -1659,10 +1740,10 @@ func TestMigrateUsersRebuildPreservesOIDCColumns(t *testing.T) {
 	}
 }
 
-// 历史问题: PK 重建迁移的 upstreams_new.enabled 此前为可空（与 fresh CREATE 的
+// PK 重建迁移的 upstreams_new.enabled 此前为可空（与 fresh CREATE 的
 // NOT NULL DEFAULT 1 漂移）；对齐后重建结果必须 notnull=1，且遗留 NULL 行
 // 经 COALESCE 拷贝归一为 0。
-// 审计 历史修复：FK OFF 时代积累的 path_rules 孤儿（rule_id 不在 lb_rules）在
+// FK OFF 时代积累的 path_rules 孤儿（rule_id 不在 lb_rules）在
 // 启动迁移中被一次性清理；DeleteRule/removeCreatedRule 已补显式删除断新增。
 func TestInitialize_cleansOrphanedPathRules(t *testing.T) {
 	dir := t.TempDir()
@@ -1684,7 +1765,7 @@ func TestInitialize_cleansOrphanedPathRules(t *testing.T) {
 	if err := Initialize(dir); err != nil {
 		t.Fatalf("re-initialize database: %v", err)
 	}
-	// 历史问题：删除用户数据（孤儿 path_rules）必须留痕。完整 Initialize 会把
+	// 删除用户数据（孤儿 path_rules）必须留痕。完整 Initialize 会把
 	// 迁移期缓冲 flush 进审计库，故在 AuditDB 断言而非内存缓冲。
 	var audited int
 	if err := AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='启动迁移' AND detail LIKE '%孤儿 path_rules%'`).Scan(&audited); err != nil {
@@ -1734,7 +1815,7 @@ func TestMigrateLbRulesPrimaryKey_rebuildsUpstreamEnabledNotNull(t *testing.T) {
 	}
 }
 
-// 历史问题: 版本表 consecutive_failures 与 global_config.is_master 的
+// 版本表 consecutive_failures 与 global_config.is_master 的
 // 遗留 NULL 由启动迁移一次性回填（0/0/1），消灭读侧 COALESCE 语义分裂。
 func TestInitialize_backfillsNullConsecutiveFailuresAndIsMaster(t *testing.T) {
 	dir := t.TempDir()
@@ -1856,7 +1937,7 @@ func TestMigrateLegacyDNSCredentials_rollsBackAllRowsOnFailure(t *testing.T) {
 }
 
 func TestEnsureNewColumns_rejectsMalformedKey(t *testing.T) {
-	// Given 历史修复（历史）：登记 key 非 "table.column" 形态时须启动期响亮
+	// Given：登记 key 非 "table.column" 形态时须启动期响亮
 	// 失败——此前静默跳过（continue），笔误列静默不补、运行时才以 no such column 暴露。
 	openMigrationTestDB(t)
 
@@ -1933,7 +2014,7 @@ func TestSanitizeLegacyCustomRulePatterns_disablesDirtyRulesIdempotently(t *test
 		t.Fatalf("embedded clean entry = %+v, want enabled", embedded[1])
 	}
 
-	// And 历史问题：改写用户规则留痕（独立 2 条 + 内嵌 1 条 = 聚合审计一行）。
+	// And：改写用户规则留痕（独立 2 条 + 内嵌 1 条 = 聚合审计一行）。
 	entries := drainSystemAuditBuffer()
 	if len(entries) != 1 || entries[0].action != "启动迁移" || !strings.Contains(entries[0].detail, "已禁用 3 条") {
 		t.Fatalf("自定义规则清洗审计=%+v, want 一行「已禁用 3 条」", entries)
@@ -1980,11 +2061,11 @@ func TestSanitizeLegacyCustomRulePatterns_survivesNullColumns(t *testing.T) {
 
 func TestInitialize_backfillsLegacyTimeoutColumnsAndNormalizesZeroOnRestart(t *testing.T) {
 	// 库值唯一真相（批 1+2，2026-10-14 用户裁定）改判：http_read/write/idle_timeout
-	// 为类型①值型列（0 无效）——旧 历史问题「显式 0 跨重启保留」语义随渲染层
+	// 为类型①值型列（0 无效）——旧 「显式 0 跨重启保留」语义随渲染层
 	// 「0=省略」形态一并废除：新增列一次性回填照旧（60/60/120），此后每启动
 	// 幂等回填把 0/NULL 行归默认（带外直写/旧备份恢复的脏行在下次启动收敛）。
 	// upstream_keepalive_timeout 保持类型②省略型（0=继承 Caddy/Go Transport
-	// 默认 2 分钟，历史问题 三次用户反馈）——显式 0 跨重启原样保留，任何迁移不改写。
+	// 默认 2 分钟，三次用户反馈）——显式 0 跨重启原样保留，任何迁移不改写。
 	// Given a legacy database whose global_config predates the four timeout columns
 	dir := t.TempDir()
 	legacy, err := sql.Open("sqlite", filepath.Join(dir, "lazy-balancer.db"))
@@ -2019,7 +2100,7 @@ func TestInitialize_backfillsLegacyTimeoutColumnsAndNormalizesZeroOnRestart(t *t
 	}
 
 	// Then the newly added timeout columns are backfilled to the recommended defaults
-	//（历史问题 三次：keepalive 默认 0——60s 空闲关闭会中断 SSE/WebSocket 上游长连接，
+	//（keepalive 默认 0——60s 空闲关闭会中断 SSE/WebSocket 上游长连接，
 	// 0 继承 Caddy/Go Transport 默认 2 分钟）
 	if r, w, i, k := readTimeouts(); r != 60 || w != 60 || i != 120 || k != 0 {
 		t.Fatalf("backfilled timeouts=(%d,%d,%d,%d), want (60,60,120,0)", r, w, i, k)
@@ -2044,7 +2125,7 @@ func TestInitialize_backfillsLegacyTimeoutColumnsAndNormalizesZeroOnRestart(t *t
 }
 
 func TestMigrateCanonicalDomains_skipsIndexRebuildWhenNothingToDo(t *testing.T) {
-	// 历史修复：无事可做时迁移不得白跑 DROP/CREATE 唯一索引（每次启动一次立即
+	// 无事可做时迁移不得白跑 DROP/CREATE 唯一索引（每次启动一次立即
 	// 写事务 + 三次全表扫描）。观察缝：预先把唯一索引移除——若迁移仍执行
 	// DROP/CREATE，索引会被重建回来；整段跳过时索引保持缺失。
 	// Given：存量域/host 全部已是规范形，cert_jobs 无重复组；唯一索引不存在
@@ -2097,7 +2178,7 @@ func TestMigrateCanonicalDomains_normalizesAndRebuildsIndexWhenWorkNeeded(t *tes
 	if domain != "example.com" {
 		t.Fatalf("domain=%q, want normalized example.com", domain)
 	}
-	// 历史问题：域名归一改写用户数据 → 聚合审计一行。
+	// 域名归一改写用户数据 → 聚合审计一行。
 	entries := drainSystemAuditBuffer()
 	if len(entries) != 1 || !strings.Contains(entries[0].detail, "域名归一为规范形") {
 		t.Fatalf("域名归一审计=%+v, want 一行归一记录", entries)
@@ -2136,7 +2217,7 @@ func TestMigrateCanonicalDomains_deduplicatesAndRebuildsIndexWhenDuplicatesExist
 	if rows != 1 {
 		t.Fatalf("duplicate group rows=%d, want deduplicated to 1", rows)
 	}
-	// 历史问题：删除重复证书任务行（用户数据）→ 聚合审计一行。
+	// 删除重复证书任务行（用户数据）→ 聚合审计一行。
 	entries := drainSystemAuditBuffer()
 	if len(entries) != 1 || !strings.Contains(entries[0].detail, "重复行已去重") {
 		t.Fatalf("cert_jobs 去重审计=%+v, want 一行去重记录", entries)
@@ -2150,7 +2231,7 @@ func TestMigrateCanonicalDomains_deduplicatesAndRebuildsIndexWhenDuplicatesExist
 	}
 }
 
-// 历史修复（历史）：migrateLbRulesPrimaryKey 重建 lb_rules/upstreams 时，随表
+// migrateLbRulesPrimaryKey 重建 lb_rules/upstreams 时，随表
 // DROP 级联删除既有索引——三张高频索引若只在重建前创建，则整个启动周期内缺失，
 // 要到下次启动才被 IF NOT EXISTS 自愈。同一启动内必须补齐。
 func TestInitialize_recreatesIndexesDroppedByPkRebuildInSameBoot(t *testing.T) {
@@ -2193,10 +2274,10 @@ func TestInitialize_recreatesIndexesDroppedByPkRebuildInSameBoot(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：备份恢复通道的 epoch 归一（backupTableNullDefaults）只守住
+// 备份恢复通道的 epoch 归一（backupTableNullDefaults）只守住
 // 「新恢复」的行——修复前已恢复的存量 NULL 时间戳持续毒化集群 dump（裸扫
 // time.Time 对 NULL 失败）。启动幂等回填 epoch，真实时间戳的对照行不得被改写。
-// 历史问题（历史）：同一恢复通道还归一 users/api_keys/path_rules/cert_jobs 的
+// 同一恢复通道还归一 users/api_keys/path_rules/cert_jobs 的
 // created_at（裸 time.Time 消费端：登录/用户列表/密钥列表/证书任务/集群快照），
 // 回填范围随之补齐这四列。
 func TestInitialize_backfillsLegacyNullTimestampColumns(t *testing.T) {
@@ -2627,7 +2708,7 @@ func openMigrationTestDB(t *testing.T) *sql.DB {
 }
 
 // legacyLbRulesSchema 描述「PK 重建前」的 lb_rules/upstreams 形态变体
-// （历史）：此前 6 处测试各自复制同一份 DDL，漂移风险与维护成本
+// 此前 6 处测试各自复制同一份 DDL，漂移风险与维护成本
 // 双高。每个变体逐列对应原有 DDL（含可选列与 upstreams 两侧历史死列），
 // 迁移前置断言所依赖的差异（有无 caddy_id/阶段页列/新健康列、upstreams 死列
 // 或 origin_domain）由调用方显式声明。
@@ -2710,7 +2791,7 @@ func createLegacyLbRulesTables(t *testing.T, database *sql.DB, variant legacyLbR
 	}
 }
 
-// 历史问题（历史）：cert_jobs 状态枚举单源（db.CertJobStatuses ← fresh CHECK /
+// cert_jobs 状态枚举单源（db.CertJobStatuses ← fresh CHECK /
 // 重建 DDL / 迁移拷贝白名单全部由 strings.Join 生成）。本测试钉住 DDL 与枚举
 // 一致，并以真实 INSERT 验证每个枚举值被接受、枚举外值被拒绝。
 func TestCertJobStatuses_drivesDDLAndAcceptance(t *testing.T) {
@@ -2801,10 +2882,10 @@ func TestRunMigrations_addsGitHubProxyURLColumnWithDefault(t *testing.T) {
 	}
 }
 
-// 历史修复：存量库经 newColumns 循环补齐登录锁定列（login_failed_attempts NOT NULL
+// 存量库经 newColumns 循环补齐登录锁定列（login_failed_attempts NOT NULL
 // DEFAULT 0 / login_locked_until TEXT），幂等，存量行取默认 0。
 func TestRunMigrations_addsUserLoginLockoutColumns(t *testing.T) {
-	// Given 旧形状 users 表（createTables 的 users 无 login_* 列，模拟 历史修复 前建库）
+	// Given 旧形状 users 表（createTables 的 users 无 login_* 列，模拟前建库）
 	database := openMigrationTestDB(t)
 	if err := createTables(); err != nil {
 		t.Fatalf("create tables: %v", err)
@@ -2849,7 +2930,7 @@ func TestRunMigrations_addsUserLoginLockoutColumns(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：fresh CREATE 的 DDL 滞后——security_policies 缺
+// fresh CREATE 的 DDL 滞后——security_policies 缺
 // policy_type/trust_detection、lb_rules 缺 block_page_stage1/3_id/status、
 // auto_backups 缺 app_version，四组列此前仅靠 newColumns 启动补列；新库
 // 建表即应携带完整形状（newColumns 保留作存量库 ALTER 通道不动）。
@@ -2904,7 +2985,7 @@ func TestCreateTables_freshSchemaCarriesACMEAndTCPProxyColumns(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：migrateSecurityPoliciesNullable 重建 DDL 滞后——
+// migrateSecurityPoliciesNullable 重建 DDL 滞后——
 // DDL 未携带 policy_type/trust_detection，窗口期库重建把 newColumns 早前
 // 加的两列连同数据一并丢弃：trust_detection 无任何回填路径（显式值永久
 // 归零）；policy_type 靠内容重推断「自愈」但显式 stage0 空信任列表行会被
@@ -2980,9 +3061,9 @@ func TestInitialize_preservesStagedColumnsOnSecurityPoliciesRebuild(t *testing.T
 	}
 }
 
-// 历史修复（历史）：migrateLbRulesPrimaryKey 重建 DDL/拷贝清单滞后——
+// migrateLbRulesPrimaryKey 重建 DDL/拷贝清单滞后——
 // 未携带 block_page_stage1/3_id/status 四列，遗留 id-主键库启动重建把阶段
-// 拦截页列连同值一并丢弃；且本重建位于 历史问题 二次 ensureNewColumns
+// 拦截页列连同值一并丢弃；且本重建位于二次 ensureNewColumns
 // 安全网之后，丢列无同启动自愈（规则保存/读取直接 no such column）。
 func TestInitialize_preservesStagePageColumnsOnLbRulesPkRebuild(t *testing.T) {
 	dir := t.TempDir()
@@ -3031,7 +3112,7 @@ func TestInitialize_preservesStagePageColumnsOnLbRulesPkRebuild(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：OIDC 身份三元组唯一索引——JIT 开户并发回调窗口可
+// OIDC 身份三元组唯一索引——JIT 开户并发回调窗口可
 // 产生重复 (issuer,subject) 行。partial 索引只约束 oidc 行：本地用户、历史
 // 空 subject 行不受影响。
 func TestInitialize_createsOidcIdentityUniqueIndex(t *testing.T) {
@@ -3080,7 +3161,7 @@ func TestInitialize_createsOidcIdentityUniqueIndex(t *testing.T) {
 	}
 }
 
-// 历史修复（历史）：安全阀——存量库存在重复 OIDC 身份时跳过建索引并
+// 安全阀——存量库存在重复 OIDC 身份时跳过建索引并
 // 告警，绝不因历史脏数据拖垮启动；重复行原样保留，待人工处置后重启自动建索引。
 func TestInitialize_skipsOidcIdentityIndexOnHistoricalDuplicates(t *testing.T) {
 	dir := t.TempDir()
@@ -3154,7 +3235,7 @@ func TestInitialize_adds_path_rules_upstream_path_column(t *testing.T) {
 	}
 }
 
-// 历史问题-1（历史）：存量 TCP 规则的 enable_dns_server/dns_server
+// 存量 TCP 规则的 enable_dns_server/dns_server
 // 落库恒无效，迁移按 migrateTCPRuleDeadFields 同口径清空；HTTP 规则同名字段
 // （DNS 服务发现合法配置）不受影响。
 func TestRunMigrations_clearsTCPRuleStaleDNSServerFields(t *testing.T) {
@@ -3195,7 +3276,7 @@ func TestRunMigrations_clearsTCPRuleStaleDNSServerFields(t *testing.T) {
 	}
 
 	// And 受影响规则逐条进入操作日志缓冲，重跑零命中（2 条逐条 DNS + 1 条
-	// 历史问题 新增的 TCP 死字段清零聚合审计=3 条；第二轮不再新增）。
+	// 新增的 TCP 死字段清零聚合审计=3 条；第二轮不再新增）。
 	entries := drainSystemAuditBuffer()
 	if len(entries) != 3 {
 		t.Fatalf("system audit entries=%d, want 3（2 条 stale DNS 逐条 + 1 条 TCP 死字段聚合；重跑幂等）", len(entries))
@@ -3331,7 +3412,7 @@ func TestRunMigrations_addsUpstreamHostColumnsToLegacyRows(t *testing.T) {
 
 // TestInitialize_carriesUpstreamHostColumnsThroughPkRebuild：遗留库（int PK，
 // 触发 migrateLbRulesPrimaryKey 重建）上两列已带真实值——重建 DDL 必须携带，
-// 否则重建丢列、值被安全网以默认值回填（历史修复 同型先例）。
+// 否则重建丢列、值被安全网以默认值回填。
 func TestInitialize_carriesUpstreamHostColumnsThroughPkRebuild(t *testing.T) {
 	// Given 遗留库：int PK lb_rules/upstreams + 两新列已带值（模拟 ensureNewColumns
 	// 已在重建前补列并被写入真实配置的形态）
@@ -3463,7 +3544,7 @@ func TestRunMigrations_addsPathRuleResponseColumnsToLegacyRows(t *testing.T) {
 }
 
 // 库值唯一真相（批 3，2026-10-14/15 用户裁定）：global_config.cert_expiry_days
-// 类型①值型列——写侧 [1,365] 校验（历史问题）+ 导入钳制（历史问题）
+// 类型①值型列——写侧 [1,365] 校验+ 导入钳制
 // 之外的最后防线：NULL/<=0 随启动幂等回填 30；用户已设有效值（>0）恒不触碰。
 func TestInitialize_backfillsCertExpiryDays(t *testing.T) {
 	dir := t.TempDir()

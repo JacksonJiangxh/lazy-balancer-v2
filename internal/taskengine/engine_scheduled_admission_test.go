@@ -1,6 +1,6 @@
 package taskengine
 
-// 历史问题-18（历史）：Scheduled 派发 admission 窗口——tick 在 due&&eligible
+// Scheduled 派发 admission 窗口——tick 在 due&&eligible
 // 判定后以 go runNow 异步派发，admission（reserveRun）不复核 loopEnabled/槽
 // 状态；StopLoop/业务关闭落在「判定后、reserve 前」时任务仍启动一次，与
 // 「已停止」契约矛盾。Periodic 已有 reservePeriodicRun 同族收口，本文件钉

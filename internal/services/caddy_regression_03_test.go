@@ -183,7 +183,7 @@ func TestGenerateRuleServerContext_gatesByEnableTLSAndEnabledUpstreams(t *testin
 	}
 	serverOff := cfgOff["apps"].(map[string]interface{})["http"].(map[string]interface{})["servers"].(map[string]interface{})["http_9443"].(map[string]interface{})
 	if serverOff["tls_connection_policies"] == nil {
-		t.Fatal("LBS-A-3：无策略时 tls_connection_policies 应为空数组（非 nil/JSON null）")
+		t.Fatal("无策略时 tls_connection_policies 应为空数组（非 nil/JSON null）")
 	}
 }
 

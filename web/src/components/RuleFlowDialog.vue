@@ -213,7 +213,7 @@
                         </template>
                         <template v-if="group.details.geoipRegions && group.details.geoipRegions.length > 0">
                           <div class="flow-detail-block-title">地域拦截区域（{{ group.details.geoipRegions.length }} 个）</div>
-                          <!-- 历史修复（历史）：国家条目展示层翻译（country_names_cn 单源），
+                          <!-- 国家条目展示层翻译（country_names_cn 单源），
                                省份/省市联值/海外哨兵未命中回退原文；geoipRegions 值零改动 -->
                           <div class="flow-detail-chips">
                             <el-tag v-for="region in group.details.geoipRegions" :key="region" size="small" effect="plain" class="flow-detail-chip">{{ countryLabel(countryZh, region) }}</el-tag>
@@ -384,7 +384,7 @@ const props = defineProps<{
 const emit = defineEmits<{ 'update:modelValue': [value: boolean] }>()
 
 const isTcp = computed(() => props.target?.protocol === 'tcp')
-// 历史修复（历史）：海外国家中文映射（模块级缓存，setup 期触发一次拉取；模板
+// 海外国家中文映射（模块级缓存，setup 期触发一次拉取；模板
 // 读 ref 自动解包并注册响应依赖）。
 const countryZh = useCountryNamesCn()
 const protocolLabel = computed(() => {
@@ -514,7 +514,7 @@ const ensureDetails = async (): Promise<void> => {
         ? request.get<APIResponse<SecurityStagePolicyDetail[]>>(`/security/rules/${encodeURIComponent(caddyId)}/policy`, { silent: true })
         : Promise.resolve<APIResponse<SecurityStagePolicyDetail[]>>({ code: 0, data: [] }),
       request.get<APIResponse<SecurityStageCustomRule[]>>('/security/custom-rules', { silent: true }),
-      // 历史问题:50=CRS 文件数假设(当前远小于 50;超页宽时组名映射静默回退裸组码)
+      // 50=CRS 文件数假设(当前远小于 50;超页宽时组名映射静默回退裸组码)
       request.get<APIResponse<{ rules: CrsRuleFileOption[] }>>('/security/crs/rules?page_size=50', { silent: true }),
     ])
     // 续体落地前校验会话序号：弹框已切换（onDialogOpen ++）或更新一次拉取已发起
@@ -547,7 +547,7 @@ const ensureDetails = async (): Promise<void> => {
       })
       ipListEntryCache.value = cache
     }
-    // 历史问题-36：三端点全部 rejected 时不置 detailsAttached——原无条件置位会把弹框
+    // 三端点全部 rejected 时不置 detailsAttached——原无条件置位会把弹框
     // 锁死在「明细按钮缺失且不可重试」且 silent 请求零反馈；保持可重试（下次点击
     // 重新拉取）并显式提示一次；部分成功仍置 attached（可用数据降级展示，保持现状语义）
     if (policyRes.status === 'rejected' && customRes.status === 'rejected' && crsRes.status === 'rejected') {
@@ -682,7 +682,7 @@ const flowNodes = computed<FlowNode[]>(() => {
   return nodes
 })
 
-// 阶段 1 脚注（历史文案修正，历史问题 补齐）：合并预检真实链序由
+// 阶段 1 脚注：合并预检真实链序由
 // securityStages.stage1FootnoteText 单源给出（信任 DetectionOnly → 黑名单 →
 // 遗留黑名单 → 白名单外拒绝 → 爬虫校验 → 地域拦截）；原实现漏列遗留黑名单
 // （id:4 仍由 security.go 发射）与 v2.3.8 爬虫校验。
@@ -706,7 +706,7 @@ const onDialogOpen = (): void => {
   fullPolicies.value = new Map()
   customRules.value = []
   crsFiles.value = []
-  ipListEntryCache.value = new Map() // 引用名单条目缓存同重置（历史 历史问题：页间编辑名单后不再显示旧条目）
+  ipListEntryCache.value = new Map() // 引用名单条目缓存同重置（页间编辑名单后不再显示旧条目）
   const caddyId = props.target?.caddyId
   if (!caddyId) {
     statsSettled.value = true

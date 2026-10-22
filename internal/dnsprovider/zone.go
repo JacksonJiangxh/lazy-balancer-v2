@@ -17,7 +17,7 @@ import (
 // falls back to the last two labels, matching the issuance chain's historical
 // behavior.
 //
-// Known limitation (历史问题): a delegated sub-zone (account manages
+// Known limitation: a delegated sub-zone (account manages
 // sub.example.com, not example.com) is invisible to the PSL and still resolves
 // to example.com. Supporting delegated zones needs an explicit zone setting
 // rather than guessing from the test input.

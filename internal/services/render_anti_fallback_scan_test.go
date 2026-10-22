@@ -2,7 +2,7 @@ package services
 
 // 库值唯一真相（批 1+2）机制级反兜底钉测：
 // 扫描 caddy.go 渲染函数体，断言不存在「零值守卫 + 字面量赋值」的写死
-// 兜底模式（`if x <= 0 { x = <N> }` / `if x == 0 { x = <N> }`）。历史修复（历史）
+// 兜底模式（`if x <= 0 { x = <N> }` / `if x == 0 { x = <N> }`）。
 // 形状扩展：字面量含 STRING（"5s"/"250ms" 类字符串兜底同在禁区）、命中面
 // 扩到 else 链（`if x > 0 {…} else { x = "…" }` 的尾 else 兜底形态）、
 // 赋值限定 plain `=`（:= 定义与 += 累加非兜底）。规则→全局变量回退
@@ -10,7 +10,7 @@ package services
 // 不在扫描命中面。允许列表逐条携带 Ruling（类型②省略型/治理范围外），
 // 双向精确匹配：扫描出清单外命中=有人往渲染层塞了写死兜底（FAIL）；
 // 清单条目在源码中消失=该条目已退役、清单过期（FAIL）——防允许列表腐化。
-// 历史问题（历史）：命中面扩展到 LSS(<0/<1)、NEQ(!=0)、GTR/GEQ 反向分支、
+// 命中面扩展到 LSS(<0/<1)、NEQ(!=0)、GTR/GEQ 反向分支、
 // switch/case 零值守卫与非 map 非空复合字面量默认值，并为每形态配夹具（
 // TestFallbackScan_detectsEquivalentGuardShapes）——语义等价写法不得绕过机制。
 
@@ -62,8 +62,8 @@ var antiFallbackAllowlist = map[string]map[string]string{
 		"weight = 1": "上游权重 weight<=0→1：upstreams.weight 非本批治理字段清单（范围外），原状保留；Caddy WRR 亦不接受零权重",
 	},
 	"buildHTTPHandleChain": {
-		"weight = 1": "上游权重 weight<=0→1：同上（范围外，历史问题 分组层归一删除后链构建层唯一存留点）",
-		// 历史修复（历史）Ruling：HTTP 侧 try_duration==0 → 5s/250ms——存量 HTTP 行
+		"weight = 1": "上游权重 weight<=0→1：同上（范围外：分组层归一删除后链构建层唯一存留点）",
+		// Ruling：HTTP 侧 try_duration==0 → 5s/250ms——存量 HTTP 行
 		// 恒 0（列语义「0=默认重试窗口」，2026-09 渲染审计+方案 C 协议分叉已披露
 		// UI/文档），行为不变的非治理形态；TCP 侧同列 0/-1 走显性报错/显式禁用，
 		// 协议分叉为披露语义非写死兜底。td==-1 分支发射 retries=0 为「显式禁用
@@ -71,7 +71,7 @@ var antiFallbackAllowlist = map[string]map[string]string{
 		`loadBalancing["try_duration"] = "5s"`:                    "HTTP 侧 try_duration==0→5s：存量 HTTP 行恒 0（0=默认重试窗口语义），方案 C 协议分叉+UI 已披露——G3 Ruling 披露",
 		`loadBalancing["try_interval"] = "250ms"`:                 "HTTP 侧 try_interval==0→250ms：同上（与 5s 窗口成对发射）——G3 Ruling 披露",
 		`serverName = "{lb.upstream_sni}"`:                        "逐上游回源域名在场时 SNI 改走占位符（逐连接展开实证）——host_header 缺省形态的发射形态切换（占位符 vs 静态值），非无效库值兜底；upstream-sni-host 方案披露——G3 Ruling 披露",
-		`hostFallback = "{http.reverse_proxy.upstream.hostport}"`: "Host 回退 TLS 池形态：host_header 未配置时绑定上游 hostport 占位符（LBS-A-L2 池形态分流），类型②省略型同族——G3 Ruling 披露",
+		`hostFallback = "{http.reverse_proxy.upstream.hostport}"`: "Host 回退 TLS 池形态：host_header 未配置时绑定上游 hostport 占位符（池形态分流），类型②省略型同族——G3 Ruling 披露",
 		`hostFallback = "{http.request.hostport}"`:                "Host 回退常规池形态：host_header 未配置时绑定原始请求 hostport 占位符（现状复现）——G3 Ruling 披露",
 		`sniFallback = "{http.reverse_proxy.upstream.host}"`:      "SNI 回退：host_header 未配置时绑定上游 host 占位符（stdlib 空 server_name 默认的同义载体）——G3 Ruling 披露",
 	},
@@ -84,10 +84,10 @@ var antiFallbackAllowlist = map[string]map[string]string{
 	"buildBlockPageErrorRoute": {
 		"statusCode = 403": "block_status_code=0→403：同 buildBlockPageAttributionRoute（类型②省略型）——批 3 Ruling 披露",
 	},
-	// 历史问题（历史）覆盖面扫描新发现：路径规则 static_response 的状态码
+	// 覆盖面扫描新发现：路径规则 static_response 的状态码
 	// 缺省形态（写侧允许 0=未配置，声明默认 200；空字符串守卫不在扫描命中面）。
 	"buildStaticResponseHandler": {
-		"status = 200": "path rule ResponseStatus=0→200：类型②省略型（写侧允许 0=未配置并声明默认），非无效库值兜底——历史问题 Ruling 披露",
+		"status = 200": "path rule ResponseStatus=0→200：类型②省略型（写侧允许 0=未配置并声明默认），非无效库值兜底——见该处 Ruling 披露",
 	},
 	"buildIPPrecheckDirectives": {
 		"denyStatus = 403": "阶段 1 预检 denyStatus=0→403：类型②省略型（0=规则未配阶段 1 拦截页，stage1BlockStatus 契约的未设置态；coraza deny 必须显式状态码，省略以默认 403 替换实现，保持 403 兜底归因边界）——批 3 Ruling 披露",
@@ -149,7 +149,7 @@ func TestRenderLayer_hasNoHardcodedZeroFallbacks(t *testing.T) {
 		}
 	}
 
-	// 方向三（历史问题）：扫描包内全部非测试 .go——渲染族命名函数若出现兜底
+	// 方向三：扫描包内全部非测试.go——渲染族命名函数若出现兜底
 	// 形态却未登记 antiFallbackScanTargets，说明新增渲染文件/函数绕过了扫描面。
 	listed := map[string]bool{}
 	for fileName, functions := range antiFallbackScanTargets {
@@ -186,8 +186,8 @@ func TestRenderLayer_hasNoHardcodedZeroFallbacks(t *testing.T) {
 
 // fallbackAssignmentsInFunction 扫描函数体内的「零值守卫 + 字面量赋值」兜底
 // 形态，返回赋值文本 → 位置。
-// 历史修复 形状：INT/STRING 字面量、plain `=`、else 链纳入。
-// 历史问题 扩展：LSS(<0/<1)、NEQ(!=0 的 else 链)、GEQ(>=1 的 else 链) 零值守卫、
+// 形状：INT/STRING 字面量、plain `=`、else 链纳入。
+// 扩展：LSS(<0/<1)、NEQ(!=0 的 else 链)、GEQ(>=1 的 else 链) 零值守卫、
 // switch/case 的零值守卫分支、复合字面量默认值（`v = cfg{...}`）——原命中面
 // 可被这些语义等价写法绕过，机制失效时无红灯。
 func fallbackAssignmentsInFunction(fset *token.FileSet, fn *ast.FuncDecl) map[string]string {
@@ -201,7 +201,7 @@ func fallbackAssignmentsInFunction(fset *token.FileSet, fn *ast.FuncDecl) map[st
 		}
 		ast.Inspect(branch, func(m ast.Node) bool {
 			assign, ok := m.(*ast.AssignStmt)
-			// 历史修复：仅 plain `=`（:= 定义与 += 累加非兜底赋值）。
+			// 仅 plain `=`（= 定义与 += 累加非兜底赋值）。
 			if !ok || assign.Tok != token.ASSIGN {
 				return true
 			}
@@ -226,7 +226,7 @@ func fallbackAssignmentsInFunction(fset *token.FileSet, fn *ast.FuncDecl) map[st
 	ast.Inspect(fn.Body, func(n ast.Node) bool {
 		switch node := n.(type) {
 		case *ast.IfStmt:
-			// 历史问题：逐级 else-if 链按各自守卫判定（外层守卫形态变化不改变
+			// 逐级 else-if 链按各自守卫判定（外层守卫形态变化不改变
 			// 内层判定的独立性）。
 			matched := false
 			for current := node; current != nil; {
@@ -263,7 +263,7 @@ func fallbackAssignmentsInFunction(fset *token.FileSet, fn *ast.FuncDecl) map[st
 				}
 			}
 		case *ast.SwitchStmt:
-			// 历史问题：`switch { case x <= 0: x = 10 }` 与 `case x == 0:` 形态。
+			// `switch { case x <= 0: x = 10 }` 与 `case x == 0:` 形态。
 			for _, stmt := range node.Body.List {
 				clause, ok := stmt.(*ast.CaseClause)
 				if !ok {
@@ -297,7 +297,7 @@ const (
 //
 //	x == 0 / x <= 0 / x < 0 / x < 1  → if 体
 //	x != 0 / x >= 1                   → else 块
-//	x > 0                             → else 块 + if 体（历史命中面保留）
+//	x > 0 → else 块 + if 体（命中面保留）
 //
 // GTR 保留 if 体扫描：`if len(x) > 0 { … }` 体内的字面量赋值由旧扫描器纳入，
 // 收窄会让既有 allowlist 条目腐化——命中面只扩不收。
@@ -355,7 +355,7 @@ func isLiteralDefault(rhs ast.Expr) bool {
 	return false
 }
 
-// isRenderFamilyFunction 按命名识别渲染族函数（历史问题 覆盖面扫描）：
+// isRenderFamilyFunction 按命名识别渲染族函数
 // build*/generate*/emit*/resolve*/format* 前缀，或 Handler/Directives/Route 后缀。
 func isRenderFamilyFunction(name string) bool {
 	for _, prefix := range []string{"build", "Build", "generate", "Generate", "emit", "Emit", "resolve", "Resolve", "format", "Format"} {
@@ -389,7 +389,7 @@ func containsString(list []string, want string) bool {
 	return false
 }
 
-// 历史问题（历史）：兜底扫描命中面必须覆盖语义等价写法——原实现只认
+// 兜底扫描命中面必须覆盖语义等价写法——原实现只认
 // `EQL/LEQ/GTR 对比 INT 0` 的 if 体，以下形态全部逃逸（机制失效时无红灯）：
 //   - `x < 1`（LSS 对比 1，整数域等价 x<=0）；
 //   - `x != 0 { … } else { x = 7 }`（NEQ 对比 0，兜底在 else 链）；

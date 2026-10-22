@@ -50,8 +50,8 @@ func validCustomRulePayload(name string) map[string]any {
 	}
 }
 
-// 历史问题（历史）/历史问题（历史常量化）：全局 200 条上限的目标形状钉测试
-// ——上限行为历史已存在（基线钉，历史修复 豁免 RED，见修复报告），历史
+// 全局 200 条上限的目标形状钉测试
+// 上限行为历史已存在（基线钉，豁免 RED，见修复报告），历史
 // 常量化 securityCustomRuleMaxGlobalCount 不改变阈值与文案语义。
 func TestCreateSecurityCustomRule_rejectsAtGlobalCountLimit(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
@@ -93,7 +93,7 @@ func TestCreateSecurityCustomRule_allowsAtLimitMinusOne(t *testing.T) {
 	}
 }
 
-// customRuleCountFailConnector 注入「规则计数查询失败」的主库故障（历史问题
+// customRuleCountFailConnector 注入「规则计数查询失败」的主库故障
 // fail-closed 形状）——Begin/INSERT 照常成功，仅命中 security_custom_rules
 // 计数的查询失败。
 type customRuleCountFailConnector struct{}
@@ -140,7 +140,7 @@ type customRuleFakeResult struct{}
 func (customRuleFakeResult) LastInsertId() (int64, error) { return 1, nil }
 func (customRuleFakeResult) RowsAffected() (int64, error) { return 1, nil }
 
-// 历史问题（历史）：计数查询失败必须拒绝创建（fail-closed）——此前
+// 计数查询失败必须拒绝创建（fail-closed）——此前
 // `err == nil && ruleCount >= 200` 使 DB 故障静默跳过上限检查继续创建
 // （fail-open）；计数移入 BeginTx 事务内后同型故障返回 500，不再有绕过
 // 上限的通道。

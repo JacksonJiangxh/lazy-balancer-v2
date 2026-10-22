@@ -34,8 +34,24 @@ test('文件内不存在按行渲染证书状态标签的 helper（certJobLabel/
 })
 
 test('服务端 TaskStatus 枚举收敛三态（无 queued/disabled 扩展值）', () => {
-  const enumBlock = section(svc, 'const (', ')')
+  // 锚定 TaskStatus 常量块本身（而非通用 const ( 首块）——其他常量块先行
+  // 出现时旧锚点会切错段，负断言空转。
+  const enumBlock = section(svc, 'TaskStatusRunning TaskStatus = "running"', '\n)')
   assert.doesNotMatch(enumBlock, /TaskStatusQueued|TaskStatusDisabled/, 'TaskStatus 枚举不得再含 queued/disabled')
   assert.match(svc, /case "issued", "downloaded", "disabled":/)
   assert.match(svc, /ti\.Status = TaskStatusRunning/)
+})
+
+// 三态收敛后的死分支清零：TaskInfo.status 产出恒 ∈ {running,idle,failed}
+// （引擎 StatusMirror 仅 "running"/""，cert-job 退役行归 idle），前端任何
+// queued/disabled 消费分支、零产出分类「触发」与零产出触发值 slave-sync
+// 均不得残留（残留=死代码，且误导后续维护者以为仍有产出）。
+test('三态收敛后前端死分支清零', () => {
+  const theme = source('src/utils/chartTheme.ts')
+  const statusColors = section(theme, 'export const statusColor', '\n}')
+  assert.doesNotMatch(statusColors, /queued|disabled/, 'statusColor 不得保留零产出键')
+  assert.doesNotMatch(vue, /st === 'disabled'/, 'detailTone 不得保留 disabled 分支')
+  assert.doesNotMatch(vue, /\.tm-status\[data-status="disabled"\]/, '状态 CSS 不得保留 disabled 规则')
+  assert.doesNotMatch(vue, /'触发': 5|c === '触发'/, '分类序/分类标签不得保留零产出「触发」类')
+  assert.doesNotMatch(vue, /'slave-sync'/, '触发标签不得保留零产出 slave-sync 映射')
 })

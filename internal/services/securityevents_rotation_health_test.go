@@ -1,6 +1,6 @@
 package services
 
-// 历史问题-23（历史）：审计日志轮转失败必须进入采集健康态——此前
+// 审计日志轮转失败必须进入采集健康态——此前
 // rotateAuditLogIfNeeded 的所有失败分支只经 60s 限流日志留痕，不参与
 // SecurityEventsPollOnce 的健康快照记账，磁盘写满/copy 持续失败时事件页
 // 健康位恒 healthy、任务监控零痕迹。
@@ -16,7 +16,7 @@ import (
 // last_error 指向轮转失败；恢复后健康位复位；「补采失败不截断」语义不变。
 func TestSecurityEventsPollOnce_rotationFailureEntersHealthSnapshot(t *testing.T) {
 	// Given：一条已摄取事件 + 超阈活文件（每 tick 触发轮转）。
-	// 历史修复（历史）：库夹具必须保存/还原全局指针并 Close（同包
+	// 库夹具必须保存/还原全局指针并 Close（同包
 	// stallSetup/setupSecurityEventsRetentionTestDB 口径）——裸 Initialize 会让
 	// 包级 DB 指向已删除的临时目录。
 	logPath, offsetPath := stallSetup(t)

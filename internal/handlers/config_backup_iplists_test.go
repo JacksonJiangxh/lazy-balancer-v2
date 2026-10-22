@@ -25,8 +25,8 @@ func postBackupImport(t *testing.T, h *Handlers, backup string) *httptest.Respon
 	return response
 }
 
-// 历史修复：策略 refs 引用备份内不存在的 IP 列表 → 整包 400 点名策略与悬挂 id，
-// 零写入（与 历史问题 绑定悬挂引用同口径——refs 落库后引用展开静默跳过，
+// 策略 refs 引用备份内不存在的 IP 列表 → 整包 400 点名策略与悬挂 id，
+// 零写入（与绑定悬挂引用同口径——refs 落库后引用展开静默跳过，
 // UI 宣称的引用控制静默失效）。
 func TestImportConfigBackup_rejectsPolicyReferencingMissingIPList(t *testing.T) {
 	// Given：策略引用列表 99，备份仅有列表 1
@@ -65,7 +65,7 @@ func TestImportConfigBackup_rejectsPolicyReferencingMissingIPList(t *testing.T) 
 	}
 }
 
-// 历史修复 对照组：引用完整的 refs + 列表（含空串 entries 视同 '[]'）导入成功并落库。
+// 对照组：引用完整的 refs + 列表（含空串 entries 视同 '[]'）导入成功并落库。
 func TestImportConfigBackup_acceptsValidIPListReferences(t *testing.T) {
 	// Given
 	h := newBackupTestHandlers(t)
@@ -98,7 +98,7 @@ func TestImportConfigBackup_acceptsValidIPListReferences(t *testing.T) {
 	if listCount != 2 {
 		t.Fatalf("imported user ip lists=%d, want 2", listCount)
 	}
-	// 历史问题-1：导入后必须重播 system 名单（威胁三源 + 自动封禁）。
+	// 导入后必须重播 system 名单（威胁三源 + 自动封禁）。
 	if err := db.DB.QueryRow("SELECT COUNT(*) FROM security_ip_lists WHERE system=1").Scan(&systemCount); err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func TestImportConfigBackup_acceptsValidIPListReferences(t *testing.T) {
 	}
 }
 
-// 历史修复：refs 形状门——必须是整数数组的 JSON 文本（字符串列），非数组 JSON、
+// refs 形状门——必须是整数数组的 JSON 文本（字符串列），非数组 JSON、
 // 非整数元素、非字符串类型均 400 点名字段。
 func TestImportConfigBackup_rejectsMalformedIPListRefs(t *testing.T) {
 	tests := []struct {
@@ -147,7 +147,7 @@ func TestImportConfigBackup_rejectsMalformedIPListRefs(t *testing.T) {
 	}
 }
 
-// 历史修复：security_ip_lists.entries 形状门——备份携带该表时 entries 需为 JSON
+// security_ip_lists.entries 形状门——备份携带该表时 entries 需为 JSON
 // 数组文本（空串视同 '[]'）；非 JSON / 非数组 / 非字符串类型均 400 点名行。
 func TestImportConfigBackup_rejectsIPListWithInvalidEntries(t *testing.T) {
 	tests := []struct {
@@ -182,7 +182,7 @@ func TestImportConfigBackup_rejectsIPListWithInvalidEntries(t *testing.T) {
 	}
 }
 
-// 历史修复：导出携带 security_ip_lists 行与策略 refs 列（导出/导入往返不丢引用）。
+// 导出携带 security_ip_lists 行与策略 refs 列（导出/导入往返不丢引用）。
 func TestExportConfigBackup_includesSecurityIPLists(t *testing.T) {
 	// Given
 	h := newBackupTestHandlers(t)
@@ -231,7 +231,7 @@ func TestExportConfigBackup_includesSecurityIPLists(t *testing.T) {
 	}
 }
 
-// 历史修复：全量替换语义——备份携带空 security_ip_lists 表（主节点已清空）时，
+// 全量替换语义——备份携带空 security_ip_lists 表（主节点已清空）时，
 // 导入必须清掉本地列表行（deleteOrder/insertOrder 含新表）。
 func TestImportConfigBackup_emptyIPListsTableWipesLocalLists(t *testing.T) {
 	// Given：本地存在备份之外的列表行
@@ -257,7 +257,7 @@ func TestImportConfigBackup_emptyIPListsTableWipesLocalLists(t *testing.T) {
 	if count != 0 {
 		t.Fatalf("security_ip_lists rows=%d after empty-table import, want 0", count)
 	}
-	// 历史问题-1：空表导入后 system 名单仍由提交后重播补回。
+	// 空表导入后 system 名单仍由提交后重播补回。
 	var systemCount int
 	if err := db.DB.QueryRow("SELECT COUNT(*) FROM security_ip_lists WHERE system=1").Scan(&systemCount); err != nil {
 		t.Fatal(err)
@@ -277,8 +277,8 @@ func emptyBackupSecurityTables() map[string][]map[string]any {
 }
 
 func TestValidateV2BackupSecurityPolicies_rejectsBuiltinListMisuse(t *testing.T) {
-	// 历史问题：内置名单名称走种子白名单，夹具必须使用真实种子名（此前
-	// 用「内置威胁名单」占位名——历史修复 门会按伪造内置名拒绝）。
+	// 内置名单名称走种子白名单，夹具必须使用真实种子名（此前
+	// 用「内置威胁名单」占位名——门会按伪造内置名拒绝）。
 	builtinList := map[string]any{"id": 1, "name": db.ThreatSystemLists()[0].Name, "system": 1, "entries": `[{"value":"203.0.113.8","remark":""}]`}
 	for _, tc := range []struct {
 		name   string
@@ -424,10 +424,10 @@ func TestValidateBuiltinThreatListRefs_chunksLargeReferenceSets(t *testing.T) {
 	}
 }
 
-// ── 历史问题（历史）：system=1 名单名称白名单（威胁/爬虫/自动封禁
+// ──：system=1 名单名称白名单（威胁/爬虫/自动封禁
 // 种子集合）——任意伪造内置名入库后管理员无法编辑/删除，UI 却宣称任务维护。 ──
 
-func Test87_P3_02_rejectsForgedSystemIPListNames(t *testing.T) {
+func TestRejectsForgedSystemIPListNames(t *testing.T) {
 	threatName := db.ThreatSystemLists()[0].Name
 	crawlerName := services.CrawlerIPListName("googlebot")
 	for _, tc := range []struct {

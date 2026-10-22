@@ -1,11 +1,14 @@
 package handlers
 
 import (
+	"database/sql"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -39,13 +42,13 @@ type LogStorageInfo struct {
 }
 
 // dirBytes 返回 path 的活跃文件大小与轮转副本合计。两类轮转家族都统计
-// (历史修复,2026-09-10 审计):自研 .1..9 shift 后缀;时间戳后缀家族——运行日志
-// <path>.历史修复(logrotate.go)与 Caddy/timberjack 的 <name>-<ts>-size.log
+// 自研.1..9 shift 后缀;时间戳后缀家族——运行日志
+// <path>.(logrotate.go)与 Caddy/timberjack 的 <name>-<ts>-size.log
 // isTimberjackRotationCopy 判定文件名是否为 timberjack 轮转副本
 // (<stem>-<ts>-size.log / .gz,ts 首字符为数字)。与 timestampedRotationStatsWithEntries
-// 的 timberjack 分支同口径(历史问题 数字边界校验),聚合枚举时跳过这些副本
+// 的 timberjack 分支同口径,聚合枚举时跳过这些副本
 // ——它们已由 base 文件的 timestampedRotationStatsWithEntries 计入 rotated,
-// 再计入 active 即双计(历史修复,历史)。
+// 再计入 active 即双计。
 func isTimberjackRotationCopy(name string) bool {
 	suffix := ""
 	if strings.HasSuffix(name, "-size.log.gz") {
@@ -89,10 +92,10 @@ func dirBytesWithEntries(path string, entries []os.DirEntry) (int64, int64, int)
 
 func timestampedRotationStatsWithEntries(path string, entries []os.DirEntry) (int64, int) {
 	dir := filepath.Dir(path)
-	// 历史修复 根因(历史):运行日志 path=/app/logs/lazy-balancer.log,
+	// 根因:运行日志 path=/app/logs/lazy-balancer.log,
 	// TrimSuffix 去 .log 后 base=lazy-balancer,而轮转副本实际是
-	// lazy-balancer.log.历史修复 → rest=.log.2026... 不匹配 16 字符判定。
-	// 修复:不去扩展名,base 含 .log → rest=.历史修复 恰 16 字符。
+	// lazy-balancer.log. → rest=.log.2026... 不匹配 16 字符判定。
+	// 修复:不去扩展名,base 含.log → rest=. 恰 16 字符。
 	// timberjack 族(caddy/rules)的副本 <base去ext>-<ts>-size.log 需去 ext,
 	// 故两种 base 各算一次:扩展 base 匹配运行日志族,去 ext base 匹配 timberjack。
 	base := filepath.Base(path)
@@ -111,7 +114,7 @@ func timestampedRotationStatsWithEntries(path string, entries []os.DirEntry) (in
 			continue
 		}
 		name := e.Name()
-		// 历史问题（历史）：整文件 gzip 归档 <base>.gz（如
+		// 整文件 gzip 归档 <base>.gz（如
 		// certjob-lb_x.log.gz）同属该文件的轮转副本——按规则/证书收窄路径
 		// (dirBytes) 此前漏计，与聚合路径展示分叉。
 		if name == base+".gz" {
@@ -121,8 +124,8 @@ func timestampedRotationStatsWithEntries(path string, entries []os.DirEntry) (in
 			}
 			continue
 		}
-		// 运行日志族(base 含 .log):rest = .历史修复(16 字符)；
-		// 历史修复（历史）：gzip 压缩副本 .历史修复.gz 同族计入
+		// 运行日志族(base 含.log):rest =.(16 字符)；
+		// gzip 压缩副本..gz 同族计入
 		// （此前漏计，与聚合路径分叉）。
 		if strings.HasPrefix(name, base) {
 			rest := name[len(base):]
@@ -136,7 +139,7 @@ func timestampedRotationStatsWithEntries(path string, entries []os.DirEntry) (in
 			}
 		}
 		// timberjack 族(stem 去 .log):caddy-<ts>-size.log 不以 caddy.log 开头,
-		// 须独立按 stem 前缀匹配。历史问题(历史):stem='caddy' 的前缀会把
+		// 须独立按 stem 前缀匹配。stem='caddy' 的前缀会把
 		// 兄弟文件 caddy-tls-<ts>-size.log 也吞入(聚合双计)——加 stem 边界校验:
 		// stem 后紧跟的 '-<ts>' 段必须以数字开头(timberjack 时间戳以数字开头,
 		// 兄弟文件名如 caddy-tls 的 '-tls' 以字母开头)。
@@ -144,12 +147,12 @@ func timestampedRotationStatsWithEntries(path string, entries []os.DirEntry) (in
 			rest2 := name[len(stem):]
 			if strings.HasPrefix(rest2, "-") && (strings.HasSuffix(rest2, "-size.log") || strings.HasSuffix(rest2, "-size.log.gz")) {
 				// stem 后 '-' 到下一 '-' 之间(或到 '-size' 之间)必须全数字
-				// 历史问题:timberjack 时间戳含 T/-/. 非全数字——只需首字符为数字
+				// timberjack 时间戳含 T/-/. 非全数字——只需首字符为数字
 				// (区分 own 'caddy-2026...' 与 brother 'caddy-tls-...')
 				if len(rest2) > 1 && rest2[1] >= '0' && rest2[1] <= '9' {
 					if info, err := e.Info(); err == nil {
 						total += info.Size()
-						cnt++ // 历史问题-1:timberjack 族份数同计(原漏)
+						cnt++ // timberjack 族份数同计(原漏)
 					}
 				}
 			}
@@ -168,7 +171,7 @@ func isDigits(s string) bool {
 }
 
 // logStatsReadDir 是统计面的目录枚举入口（包级 var 支持测试注入计数——
-// 历史问题 断言聚合只做一次 ReadDir）。
+// 断言聚合只做一次 ReadDir）。
 var logStatsReadDir = os.ReadDir
 
 // dirStats 单个基名日志文件的体量归并结果。
@@ -179,11 +182,11 @@ type dirStats struct {
 }
 
 // aggregateDirStats 单次目录枚举归并匹配文件的活跃/轮转体量与归档份数
-// （历史问题：替代「逐目录项 dirBytes → 其内部再 ReadDir」的 O(N²) 形态；
-// 历史问题：聚合累加 RotatedCount，且 .gz 归档不再冒充活跃）。
+// （替代「逐目录项 dirBytes → 其内部再 ReadDir」的 O(N²) 形态；
+// 聚合累加 RotatedCount，且.gz 归档不再冒充活跃）。
 // 返回 基名 → 归并结果。分类口径与 dirBytes 一致：
 //   - base（匹配、非轮转副本、非 .gz）计入 Active；
-//   - .1..9 移位副本、运行日志族 base.历史修复、timberjack
+//     .1..9 移位副本、运行日志族 base.、timberjack
 //     <stem>-<ts>-size.log[.gz] 副本计入所属 base 的 Rotated/RotCount；
 //   - 不归属任何匹配 base 的 .gz 按归档计入 Rotated（压缩归档不是活跃文件）。
 func aggregateDirStats(dir string, match func(name string) bool) map[string]dirStats {
@@ -252,7 +255,7 @@ func isRotationCopyShape(name string) bool {
 			return true
 		}
 	}
-	// 运行日志族 base.历史修复（rest 恰 16 字符）
+	// 运行日志族 base.（rest 恰 16 字符）
 	if len(name) > 17 {
 		rest := name[len(name)-16:]
 		if rest[0] == '.' && isDigits(rest[1:9]) && rest[9] == '-' && isDigits(rest[10:]) {
@@ -265,8 +268,8 @@ func isRotationCopyShape(name string) bool {
 // rotationCopyBaseOf 把轮转副本归到所属 base（与 dirBytes/timestampedRotationStatsWithEntries
 // 同口径：移位后缀、运行日志时间戳后缀、timberjack 时间戳后缀三族）。
 func rotationCopyBaseOf(name string, bases map[string]struct{}, stemToBase map[string]string) (string, bool) {
-	// 历史修复（历史）：整文件 gzip 归档 <base>.gz 归到 base——与
-	// dirBytes/timestampedRotationStatsWithEntries 的 历史问题 分支同口径。
+	// 整文件 gzip 归档 <base>.gz 归到 base——与
+	// dirBytes/timestampedRotationStatsWithEntries 的分支同口径。
 	// 此前只对齐了运行日志族与 timberjack 族，整文件归档落入下方通用 .gz
 	// 独立键（消费侧按固定基名取值 → 该文件字节从聚合行消失）。
 	if base := strings.TrimSuffix(name, ".gz"); base != name {
@@ -283,7 +286,7 @@ func rotationCopyBaseOf(name string, bases map[string]struct{}, stemToBase map[s
 			}
 		}
 	}
-	// 运行日志族 base.历史修复[.gz]（rest 恰 16 字符；历史修复
+	// 运行日志族 base.[.gz]（rest 恰 16 字符；
 	// 审计：gzip 压缩副本同族归并，此前落入通用 .gz 独立键与 dirBytes 分叉）
 	core := strings.TrimSuffix(name, ".gz")
 	if len(core) > 17 {
@@ -308,7 +311,7 @@ func rotationCopyBaseOf(name string, bases map[string]struct{}, stemToBase map[s
 		if !strings.HasSuffix(rest, "-size.log") && !strings.HasSuffix(rest, "-size.log.gz") {
 			continue
 		}
-		// 历史问题：stem 后紧跟的 '-<ts>' 段须以数字开头（区分 caddy 与 caddy-tls）
+		// stem 后紧跟的 '-<ts>' 段须以数字开头（区分 caddy 与 caddy-tls）
 		if len(rest) > 1 && rest[1] >= '0' && rest[1] <= '9' {
 			return base, true
 		}
@@ -317,14 +320,14 @@ func rotationCopyBaseOf(name string, bases map[string]struct{}, stemToBase map[s
 }
 
 func globalConfigInt(column string, fallback int64) int64 {
-	// nil 守卫(历史修复 集成事故):guardConfiguredJSONBody 经本函数
+	// nil 守卫:guardConfiguredJSONBody 经本函数
 	// 读配置,无 DB 脚手架的测试/调用形态下 db.DB 为 nil,QueryRow 直接 panic
 	// ——nil 与读失败同口径回退默认值。
 	if db.DB == nil {
 		return fallback
 	}
 	var v int64
-	// 历史问题：读失败回退默认必须留痕（此前静默——库故障窗口阈值展示/滚动
+	// 读失败回退默认必须留痕（此前静默——库故障窗口阈值展示/滚动
 	// 口径失真零信号）；接 services 单源状态转换留痕（首报 warn+恢复 info，
 	// 面板轮询不刷屏）。nil 与读失败同口径回退默认值。
 	if err := db.DB.QueryRow("SELECT COALESCE("+column+",?) FROM global_config WHERE id=1", fallback).Scan(&v); err != nil {
@@ -340,25 +343,75 @@ func sizeLimitMB(column string, def int64) *int64 {
 	return &limit
 }
 
+// logStatsRowCountCacheTTL 是日志统计行数（全表 COUNT(*)）的进程内缓存窗口：
+// audit_log / security_events 均为百万行级，面板全量轮询每次各付一次全表
+// 计数；行数是展示性指标，5s 陈旧对用户不可感知。读失败不缓存（下一请求
+// 重试），失败/恢复留痕走 services 状态转换单源（首报 warn、恢复 info）。
+const logStatsRowCountCacheTTL = 5 * time.Second
+
+type logStatsRowCountEntry struct {
+	rows int64
+	at   time.Time
+}
+
+var logStatsRowCounts struct {
+	sync.Mutex
+	entries map[string]logStatsRowCountEntry
+}
+
+// resetLogStatsRowCountCacheForTest 仅供测试隔离（跨用例的 DB 交换后不得
+// 读到上一夹具的行数）。
+func resetLogStatsRowCountCacheForTest() {
+	logStatsRowCounts.Lock()
+	logStatsRowCounts.entries = nil
+	logStatsRowCounts.Unlock()
+}
+
+// cachedLogTableCount 返回表行数（TTL 缓存 + 读失败留痕）。ok=false 表示
+// 本次读取失败（响应不携带该行数，与缓存前语义一致）。
+func cachedLogTableCount(database *sql.DB, key, query string) (int64, bool) {
+	logStatsRowCounts.Lock()
+	if entry, ok := logStatsRowCounts.entries[key]; ok && time.Since(entry.at) < logStatsRowCountCacheTTL {
+		logStatsRowCounts.Unlock()
+		return entry.rows, true
+	}
+	logStatsRowCounts.Unlock()
+	var n int64
+	if err := database.QueryRow(query).Scan(&n); err != nil {
+		// 此前两处 COUNT 失败被 `err == nil` 静默吞掉——行数缺失与「表为空」
+		// 在前端不可区分，排障零信号。
+		services.LogConfigReadFailure(key, err)
+		return 0, false
+	}
+	services.LogConfigReadRecovered(key)
+	logStatsRowCounts.Lock()
+	if logStatsRowCounts.entries == nil {
+		logStatsRowCounts.entries = map[string]logStatsRowCountEntry{}
+	}
+	logStatsRowCounts.entries[key] = logStatsRowCountEntry{rows: n, at: time.Now()}
+	logStatsRowCounts.Unlock()
+	return n, true
+}
+
 // logPaths resolves the two distinct log roots GetLogStats probes:
 //   - fixedDir is the hardcoded writer directory (/app/logs) shared by the
 //     hardcoded-writer log families — caddy 四份日志（caddy.log/caddy-tls.log/
 //     caddy-server.log/caddy-proxy.log）、rules/*.log。这些写入端写死 /app/logs，
 //     与 LOG_FILE 无关，故其路径拼接必须固定用 /app/logs；若跟随 LogFile 目录
 //     推导，自定义 LOG_FILE 时这些日志会全部显示 0B。
-//     certjob-*.log 不在此列（历史问题-03≡历史问题-02）：写入端已并入统一任务日志
+//     certjob-*.log 不在此列：写入端已并入统一任务日志
 //     体系（{任务日志目录}/certjobs/，services.CertJobLogDir 同源）。
 //   - runtimePath is the runtime log path, which follows LogFile
 //     （空 → /app/logs/lazy-balancer.log）。
 //
 // wafAuditLogFile 是 Coraza 审计日志文件路径覆盖值。空值=运行期按
 // services.AuditLogPath() 解析——审计路径随 ConfigureWafDirs 按 data_dir 派生
-// （历史问题-08），而本包 init 早于 main 的派生调用，包级固化会指向陈旧的 /app
+// 而本包 init 早于 main 的派生调用，包级固化会指向陈旧的 /app
 // 路径（自定义 data_dir 下统计恒 0B）。测试可注入具体路径。
 var wafAuditLogFile = ""
 
 // resolvedWafAuditLogFile 返回审计日志路径：测试注入值优先，否则运行期解析
-// services.AuditLogPath()（历史问题-08：路径随 ConfigureWafDirs 派生，包级固化
+// services.AuditLogPath()（路径随 ConfigureWafDirs 派生，包级固化
 // 会在自定义 data_dir 下陈旧）。
 func resolvedWafAuditLogFile() string {
 	if wafAuditLogFile != "" {
@@ -387,7 +440,7 @@ func logPaths(cfg *config.Config) (fixedDir, runtimePath string) {
 // 「当前大小 / 阈值（保留 N 份）」与清理策略说明。caddy_id 参数可将
 // 证书任务/规则访问两项收窄到单规则。
 // requestedLogKeys 解析可选 ?key=a,b / ?keys=a,b（缺省 nil=全量）——任务监控
-// 弹框只关心单行日志统计（历史问题）。空串与空白项忽略。
+// 弹框只关心单行日志统计。空串与空白项忽略。
 func requestedLogKeys(c *gin.Context) map[string]bool {
 	raw := strings.TrimSpace(c.Query("key"))
 	if extra := strings.TrimSpace(c.Query("keys")); extra != "" {
@@ -415,7 +468,7 @@ func requestedLogKeys(c *gin.Context) map[string]bool {
 var caddyLogFamilyBases = []string{"caddy.log", "caddy-tls.log", "caddy-server.log", "caddy-proxy.log"}
 
 // caddyLogFamilyMatch 匹配 caddy 四份日志及其轮转副本（移位/时间戳/timberjack
-// 形态）——聚合一次目录枚举即可归并四文件与总行（历史问题）。
+// 形态）——聚合一次目录枚举即可归并四文件与总行。
 func caddyLogFamilyMatch(name string) bool {
 	for _, base := range caddyLogFamilyBases {
 		if name == base || strings.HasPrefix(name, base+".") {
@@ -439,7 +492,7 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		dataDir = h.cfg.DataDir
 	}
 
-	// 历史问题：可选 key/keys 收窄——缺省（nil）保持旧全量语义；指定时跳过
+	// 可选 key/keys 收窄——缺省（nil）保持旧全量语义；指定时跳过
 	// 未请求行的 DB/文件统计并只回这些行（任务监控弹框轮询不再放大全族统计）。
 	requested := requestedLogKeys(c)
 	want := func(key string) bool { return requested == nil || requested[key] }
@@ -452,17 +505,17 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		return false
 	}
 
-	// 历史修复（2026-09-06 裁定）已被 2026-09-15 裁定部分覆盖:指标历史固定保留
+	// （2026-09-06 裁定）已被 2026-09-15 裁定部分覆盖:指标历史固定保留
 	// 最近 7 天(services/services.go cleanupHistory),不再复用「日志保留」
-	// ——ConfigSource 类目清单不得再含指标历史(历史问题,历史)。
+	// ConfigSource 类目清单不得再含指标历史。
 	// 历史(用户裁定文案精简):可见文案短化——类目清单移 ConfigSource
 	// (tooltip 展示),行内只留「每日清理 · 保留 N 个月」。
 	//
-	// 历史修复（历史）：保留口径/事件上限同样按 want 门控——此前三处无条件
+	// 保留口径/事件上限同样按 want 门控——此前三处无条件
 	// 求值（audit_retention_months 点查 + 安全事件策略两次点查），单行轮询也付
-	// 3 次多余 SQLite 往返，与下方 历史修复 声明的门控不成立；安全事件两项
+	// 3 次多余 SQLite 往返，与下方声明的门控不成立；安全事件两项
 	// （摘要+行帽）收敛为一次策略读取（services.SecurityEventsRetentionSnapshot）。
-	// 历史修复：阈值按 want 门控——日志弹框只请求单行时不得读其它配置列。
+	// 阈值按 want 门控——日志弹框只请求单行时不得读其它配置列。
 	// 每列只读一次（此前任务循环逐任务重复读 task_log_size_mb）。
 	var (
 		auditLogLimit   *int64
@@ -507,7 +560,7 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		{Key: "caddy_server", Name: "Caddy HTTP 服务器日志", LimitBytes: caddyLimit, KeepCount: logRotatedBackups, ConfigSource: "Caddy 全局配置 · 日志大小"},
 		{Key: "caddy_proxy", Name: "Caddy 反向代理日志", LimitBytes: caddyLimit, KeepCount: logRotatedBackups, ConfigSource: "Caddy 全局配置 · 日志大小"},
 		{Key: "rule_access", Name: "规则访问日志", LimitBytes: caddyLimit, KeepCount: logRotatedBackups, ConfigSource: "Caddy 全局配置 · 日志大小"},
-		// 历史问题-03（历史）：原 coraza_audit 行删除——前端零消费方
+		// 原 coraza_audit 行删除——前端零消费方
 		// （LogStorageBar 仅 security_events/rule_access 两键），且与
 		// security_events 行同文件同统计，纯重复死面；audit_log_size_mb 配置
 		// 链仍由 auditlog_rotation.go 完整消费。
@@ -520,12 +573,12 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		}
 		return nil
 	}
-	// 历史修复：保留口径与事件上限只在所请求行内读取（各一次点查）。
+	// 保留口径与事件上限只在所请求行内读取（各一次点查）。
 	if info := byKey("audit"); info != nil && want("audit") {
 		info.RetentionNote = "每日清理 · 保留 " + strconv.FormatInt(globalConfigInt("audit_retention_months", 3), 10) + " 个月"
 	}
 	if info := byKey("security_events"); info != nil && want("security_events") {
-		// 历史问题：安全事件行文案/行帽由 services 单源生成（显式
+		// 安全事件行文案/行帽由 services 单源生成（显式
 		// security_events_retention_days/row_cap 生效，不再复用审计月数文案）；
 		// 其写入侧与审计日志同文件，大小限值随 audit_log_size_mb。
 		note, rowCap := services.SecurityEventsRetentionSnapshot()
@@ -537,8 +590,7 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 	// DB 体量按库文件大小近似；行数供 UI 显示条目规模
 	if want("audit") {
 		if db.AuditDB != nil {
-			var n int64
-			if err := db.AuditDB.QueryRow("SELECT COUNT(*) FROM audit_log").Scan(&n); err == nil {
+			if n, ok := cachedLogTableCount(db.AuditDB, "logstats-audit-count", "SELECT COUNT(*) FROM audit_log"); ok {
 				byKey("audit").Rows = &n
 			}
 		}
@@ -548,8 +600,7 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 	}
 	if want("security_events") {
 		if db.MetricsDB != nil {
-			var n int64
-			if err := db.MetricsDB.QueryRow("SELECT COUNT(*) FROM security_events").Scan(&n); err == nil {
+			if n, ok := cachedLogTableCount(db.MetricsDB, "logstats-security-events-count", "SELECT COUNT(*) FROM security_events"); ok {
 				byKey("security_events").Rows = &n
 			}
 		}
@@ -572,7 +623,7 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 			info.SizeBytes, info.RotatedBytes, info.RotatedCount = rtA, rtR, rtC
 		}
 	}
-	// 历史问题-3 + 历史问题:四文件与「caddy」聚合行共用一次目录枚举——聚合按
+	// +:四文件与「caddy」聚合行共用一次目录枚举——聚合按
 	// 基名归并（原实现每文件各一次 dirBytes、聚合行再扫一遍）。
 	if want("caddy") || want("caddy_runtime") || want("caddy_tls") || want("caddy_server") || want("caddy_proxy") {
 		caddyStats := aggregateDirStats(fixedLogsDir, caddyLogFamilyMatch)
@@ -638,6 +689,10 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		}
 	}
 	var taskLogPath systemTaskLogPathResolver
+	// certJobsTruncated 透传 CollectSystemTasks 的第二返回值：证书动态行触达
+	// 上限时任务族清单被截断（面板因此可能缺行）。单行/全量响应都携带该标记
+	// ——此前消费端直接丢弃，「列表少了」与「本来就没有」不可区分。
+	certJobsTruncated := false
 	taskDirEntries := map[string][]os.DirEntry{}
 	readTaskDir := func(dir string) []os.DirEntry {
 		if entries, ok := taskDirEntries[dir]; ok {
@@ -651,7 +706,10 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		return entries
 	}
 	if wantsPerTaskRows {
-		taskRows, _ := services.CollectSystemTasks()
+		var tasksTruncated bool
+		var taskRows []services.TaskInfo
+		taskRows, tasksTruncated = services.CollectSystemTasks()
+		certJobsTruncated = tasksTruncated
 		for _, task := range taskRows {
 			key := "task:" + task.ID
 			if !want(key) {
@@ -680,7 +738,7 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 	}
 	ruleID := strings.TrimSpace(c.Query("caddy_id"))
 	if ruleID != "" && (strings.ContainsAny(ruleID, "/\\") || ruleID == "." || ruleID == "..") {
-		// 历史问题（历史）：读侧不再要求「净化结果==原值」——写入端规则日志
+		// 读侧不再要求「净化结果==原值」——写入端规则日志
 		// 文件名改为可逆编码（合法字母表原样、其余字符 %hex），含点等 v2 导入
 		// ID 的日志因此可读。这里只保留路径穿越形状的拒绝；文件名一律经
 		// services.RuleLogFileComponent 生成，输出恒为安全字符集。
@@ -688,15 +746,15 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		return
 	}
 	if info := byKey("certjob"); info != nil && want("certjob") {
-		// 历史问题-02 读侧同源：与写入端 CertJobLogPath 同取 {任务日志目录}/certjobs
-		// （曾读写死 /app/logs 根——历史修复 惰性化后写入端已迁，不同源恒 0B）。
+		// 读侧同源：与写入端 CertJobLogPath 同取 {任务日志目录}/certjobs
+		// （曾读写死 /app/logs 根——惰性化后写入端已迁，不同源恒 0B）。
 		certJobDir := services.CertJobLogDir()
 		if ruleID != "" {
 			cjA, cjR, cjC := dirBytes(services.CertJobLogPath(ruleID))
 			info.SizeBytes, info.RotatedBytes, info.RotatedCount = cjA, cjR, cjC
 			info.Name = "证书任务日志 #" + ruleID
 		} else {
-			// 历史问题：一次目录枚举归并（原逐文件 dirBytes = O(N²)）；
+			// 一次目录枚举归并（原逐文件 dirBytes = O(N²)）；
 			// 归档份数与 .gz 归档同时计入（原丢弃 rotCount、.gz 冒充活跃）。
 			var active, rotated int64
 			var rotCount int
@@ -734,7 +792,7 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		}
 		infos = filtered
 	}
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]interface{}{"logs": infos}})
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]interface{}{"logs": infos, "cert_jobs_truncated": certJobsTruncated}})
 }
 
 // isCertJobLogName 证书任务日志文件名（含 .N 移位副本与 .gz 压缩归档）。

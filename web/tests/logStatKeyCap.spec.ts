@@ -31,9 +31,6 @@ test('统计键上限 O(1)：计数随新增键自增，不再数整表', () => 
 // （计数侵蚀：容量被幽灵键吃满），且永远不会归入「其他」。`constructor`/
 // `toString` 同样只能靠 own-property 守卫侥幸正确，容器本身必须是原型安全的
 // （Object.create(null) 或 Map）才不依赖守卫细节。
-//
-// 本钉依赖生产侧修复（跨批次依赖）：当前实现仍用 `{}` 桶，预期红；生产改为
-// 原型安全容器后转绿——不 skip，避免修复前后都"通过"。
 test('统计键：原型链敌意键不得侵蚀计数，满表回落「其他」', () => {
   const createBuckets = section(rules, 'const createLogStatBuckets = (', '\n})')
   const increment = section(rules, 'const incrementCappedStat = (', '\n}\n')

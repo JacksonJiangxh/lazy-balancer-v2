@@ -7,7 +7,7 @@ import (
 )
 
 // 阶段外字段归零矩阵必须单源——Create 与 Update 两条写路径对同一阶段
-// 归零同一组字段。此前双份逐字段 switch 已产生 历史修复 的
+// 归零同一组字段。此前双份逐字段 switch 已产生
 // IPWhitelistEnabled nil/false 形状漂移。本测试把两条 applier 的决策逐阶段对齐：
 // 请求全字段填入非零哨兵值，归零后两边的「字段→零/非零」视图必须完全一致。
 func TestStageZeroMatrix_createUpdateParity(t *testing.T) {

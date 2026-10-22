@@ -118,7 +118,7 @@ func monotonicNowNano() int64 { return int64(time.Since(clockBase)) }
 var parseCountForTest atomic.Int64
 
 // parseEntryCallsForTest 条目解析调用计数（测试观测「逐条目单次解析」——
-// 历史问题 修复前后分别为 2×/1×）。仅在 ParseIPEntry 入口 incr，成本可忽略。
+// 修复前后分别为 2×/1×）。仅在 ParseIPEntry 入口 incr，成本可忽略。
 var parseEntryCallsForTest atomic.Int64
 
 func init() {
@@ -284,7 +284,7 @@ func loadIPListFile(path string, fresh bool) (state *ipListFileState, err error)
 	}
 
 	// 同一路径的解析单飞：1s 节流窗口过期后并发请求不得同时 ReadFile+解析
-	// 超大名单（历史）。拿到锁后重新检查缓存，后到者直接复用。
+	// 超大名单。拿到锁后重新检查缓存，后到者直接复用。
 	unlock := lockIPListLoad(path)
 	defer unlock()
 	ipListCache.RLock()
@@ -309,7 +309,7 @@ func loadIPListFile(path string, fresh bool) (state *ipListFileState, err error)
 			clearStaleReport(path)
 			return current, nil
 		}
-		// 历史问题（历史）代际守卫：并发重建时缓存里已是更晚 mtime 的
+		// 代际守卫：并发重建时缓存里已是更晚 mtime 的
 		// 新代际——本代际基于更早 stat 的解析结果不得覆盖（旧内容回流）。
 		// 判定单源=SnapshotGeneration 守卫（与爬虫快照加载器共用）。
 		if StaleSnapshotGeneration(
@@ -363,7 +363,7 @@ func EvictIPListCache(paths ...string) int {
 
 // parseIPListFile 读盘+严格解析+防御性归并（写入侧已聚合，加载侧再跑一次
 // 保证「排序+去重+不相交」检索不变式——二分正确性依赖不相交）。逐条目
-// **只解析一次**（历史问题：此前「逐行校验解析 → AggregatePrefixes 再解析」
+// **只解析一次**（此前「逐行校验解析 → AggregatePrefixes 再解析」
 // 是每条目 2×）；逐行遍历取原串子串而非 strings.Split（百万条名单的
 // []string 头分配约 16MB+）。
 //
@@ -402,7 +402,7 @@ func parseIPListFile(path string) (*ipListFileState, error) {
 		capHint = MaxEntries + 1
 	}
 	prefixes := make([]netip.Prefix, 0, capHint)
-	// 历史修复 直接在原始字节上按行迭代（bytes.IndexByte + TrimSpace），
+	// 直接在原始字节上按行迭代（bytes.IndexByte + TrimSpace），
 	// 不再整文件复制成 string（MaxFileBytes 64MB 上限时 raw+string 双份常驻
 	// =2× 文件体积峰值）；仅实际条目行短生命周期转 string 供 ParseIPEntry，
 	// 空行/注释行零分配跳过。
@@ -487,8 +487,8 @@ func ParseIPEntry(entry string) (netip.Prefix, error) {
 	if err != nil {
 		return netip.Prefix{}, err
 	}
-	// zone 拒绝（历史问题）：ParseAddr 接受 fe80::1%eth0（甚至 %eth0/64，
-	// zone 原样吞下），PrefixFrom 会静默剥离 zone——与写侧校验器 历史问题
+	// zone 拒绝：ParseAddr 接受 fe80::1%eth0（甚至 %eth0/64，
+	// zone 原样吞下），PrefixFrom 会静默剥离 zone——与写侧校验器
 	// 「带 zone 的地址不视为有效条目」口径相左。同一契约在此处拒绝。
 	if zone := addr.Zone(); zone != "" {
 		return netip.Prefix{}, fmt.Errorf("IP 条目 %q 含 zone（%q），不支持", entry, zone)

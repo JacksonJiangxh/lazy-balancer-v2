@@ -33,12 +33,12 @@ func AppendThreatUpdateLog(level, stage, message string) {
 	taskengine.TeeTaskLog("threat", time.Now().In(CurrentLocation()).Format("2006/01/02 15:04:05"), level, stage, message)
 }
 
-// 任务日志大小配置缓存（历史修复：缓存机制单源 dbValueCache——此前与审计
+// 任务日志大小配置缓存（缓存机制单源 dbValueCache——此前与审计
 // 侧各有一套实现，任务侧还把读库失败的回退值写进缓存）。TTL 5 分钟：设置保存
 // 经 InvalidateTaskLogSizeCache 立刻生效，TTL 只覆盖带外改库。
 var taskLogSizeCache = dbValueCache{ttl: 5 * time.Minute}
 
-// InvalidateTaskLogSizeCache 使任务日志大小配置缓存失效（历史问题）。
+// InvalidateTaskLogSizeCache 使任务日志大小配置缓存失效。
 // 设置保存成功后必须调用——否则改库后仍有最长 5 分钟（TTL）按旧阈值滚动。
 func InvalidateTaskLogSizeCache() {
 	taskLogSizeCache.invalidate()
@@ -53,7 +53,7 @@ func getTaskLogSizeBytes() int64 {
 		var sizeMB int
 		if err := db.DB.QueryRow("SELECT COALESCE(task_log_size_mb, 10) FROM global_config WHERE id = 1").Scan(&sizeMB); err != nil {
 			Logf("warn", "读取任务日志大小配置失败,按 10MB 降级: %v", err)
-			// 失败不缓存（历史修复）：回退值只对本轮生效，下一轮重试。
+			// 失败不缓存：回退值只对本轮生效，下一轮重试。
 			return 0, err
 		}
 		if sizeMB <= 0 {

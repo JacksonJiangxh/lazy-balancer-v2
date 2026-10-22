@@ -20,16 +20,16 @@ func TestSetupRouter_writeRoutesHaveExplicitAuditClassification(t *testing.T) {
 		"POST /api/v1/cluster/service-control": {},
 		"POST /api/v1/config/import/validate":  {},
 		"POST /api/v1/config/preview":          {},
-		// 历史问题-c：/config/validate 已升为 Explicit（handler 记录校验三态）。
+		// c：/config/validate 已升为 Explicit（handler 记录校验三态）。
 		"POST /api/v1/mcp":             {},
 		"POST /api/v1/rules/cert-info": {},
 		// v2.1.8 MFA：setup/verify-step 为读形态或内部动作（不产生审计；handler
 		// 对失败已按认证拒绝/错误路径细分记录）。recovery-codes 已升为 Explicit
-		//（历史修复：handler 显式记录「生成/恢复码」），不再属有意跳过。
+		//（handler 显式记录「生成/恢复码」），不再属有意跳过。
 		"POST /api/v1/auth/mfa/setup":       {},
 		"POST /api/v1/auth/mfa/verify-step": {},
 		// 三库手动更新：审计由任务体 defer 单记（2026-09-29 用户裁定 + 历史
-		// 历史问题-2 收敛——handler 补记已撤、operator 经 RunContext 归人）。
+		// 收敛——handler 补记已撤、operator 经 RunContext 归人）。
 		"POST /api/v1/security/crs/update":         {},
 		"POST /api/v1/security/ip2region/update":   {},
 		"POST /api/v1/security/threat-lib/update":  {},
@@ -37,9 +37,9 @@ func TestSetupRouter_writeRoutesHaveExplicitAuditClassification(t *testing.T) {
 		// 大屏流量采集租约：UI 生命周期内部动作，显式 skip。
 		"POST /api/v1/security/overview/threat-screen/collector":   {},
 		"DELETE /api/v1/security/overview/threat-screen/collector": {},
-		// 任务触发（历史问题-1，历史）：已升 Explicit——12 个可触发族中 7 族
+		// 任务触发：已升 Explicit——12 个可触发族中 7 族
 		// 任务体零审计，handler 对非自记族显式补记「触发/任务监控」（自记族
-		// 跳过，保 历史问题-2 单记裁定），不再属有意跳过。
+		// 跳过，保 单记裁定），不再属有意跳过。
 	}
 	writeMethods := map[string]struct{}{
 		http.MethodPost: {}, http.MethodPut: {}, http.MethodPatch: {}, http.MethodDelete: {},
