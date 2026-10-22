@@ -701,8 +701,15 @@ func autobanMergeEntries(cfg AutobanConfig, candidates []AutobanSuggestion) (aut
 		return out, err
 	}
 	out.ListID = id
+	// 读改写包进单一事务：集群 apply/导入可能在两步之间整表替换该行，
+	// 无事务时陈旧快照会覆盖刚同步的名单（RowsAffected=0 还会被当成成功）。
+	tx, err := db.DB.Begin()
+	if err != nil {
+		return out, err
+	}
+	defer func() { _ = tx.Rollback() }()
 	var raw string
-	if err := db.DB.QueryRow(`SELECT COALESCE(entries,'[]') FROM security_ip_lists WHERE id=?`, id).Scan(&raw); err != nil {
+	if err := tx.QueryRow(`SELECT COALESCE(entries,'[]') FROM security_ip_lists WHERE id=?`, id).Scan(&raw); err != nil {
 		return out, err
 	}
 	var entries []models.IPListEntry
@@ -853,7 +860,18 @@ func autobanMergeEntries(cfg AutobanConfig, candidates []AutobanSuggestion) (aut
 	if err != nil {
 		return out, err
 	}
-	if _, err := db.DB.Exec(`UPDATE security_ip_lists SET entries=?, updated_by=0, updated_at=? WHERE id=?`, string(merged), nowStr, id); err != nil {
+	res, err := tx.Exec(`UPDATE security_ip_lists SET entries=?, updated_by=0, updated_at=? WHERE id=?`, string(merged), nowStr, id)
+	if err != nil {
+		return out, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return out, err
+	}
+	if affected != 1 {
+		return out, fmt.Errorf("预置名单行已被并发替换（rows=%d），本轮封禁未落库", affected)
+	}
+	if err := tx.Commit(); err != nil {
 		return out, err
 	}
 	return out, nil
