@@ -22,16 +22,16 @@ export type CertJobColumnId =
 
 /** 各列固定宽度（px）；合计须与 CertJobs.vue 的 width 声明一致。 */
 export const CERT_JOB_COLUMN_WIDTHS: Record<CertJobColumnId, number> = {
-  rule_id: 120,
-  domain: 230,
+  rule_id: 116,
+  domain: 210,
   status: 84,
-  issuer: 90,
-  validity: 160,
-  renewal: 100,
-  updated: 100,
-  attempts: 60,
-  cooling: 96,
-  actions: 96,
+  issuer: 84,
+  validity: 155,
+  renewal: 150,
+  updated: 150,
+  attempts: 80,
+  cooling: 90,
+  actions: 90,
 }
 
 export const CERT_JOB_COLUMNS: readonly CertJobColumnId[] = [
@@ -49,14 +49,14 @@ export const CERT_JOB_COLUMNS: readonly CertJobColumnId[] = [
 
 /**
  * 隐藏优先级：容器不足时依次让位。规则 ID 与域名是排查主键，**最后**让位；
- * 先让位低价值列：冷却时间（并入重试单元格 tooltip）、更新时间、自动重签时间、
- * 颁发者。域名/状态/有效期/重试/操作恒保留——没有它们表格失去意义。
+ * 先让位低价值列：冷却时间（并入重试单元格 tooltip）、颁发者、自动重签时间、
+ * 更新时间。域名/状态/有效期/重试/操作恒保留——没有它们表格失去意义。
  */
 export const CERT_JOB_COLUMN_HIDE_ORDER: readonly CertJobColumnId[] = [
   'cooling',
-  'updated',
-  'renewal',
   'issuer',
+  'renewal',
+  'updated',
   'rule_id',
 ]
 
