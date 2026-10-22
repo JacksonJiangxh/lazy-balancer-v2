@@ -49,7 +49,7 @@
                   <div class="stat-box__value">{{ overview.today_blocked }}</div>
                   <div class="stat-box__label">
                     今日拦截
-                    <el-tooltip v-if="overview.includes_reserved" content="总量含私网/保留地址事件（内网扫描、文档测试段等也会计入，与大屏排除口径不同）" placement="top">
+                    <el-tooltip :content="overview.includes_reserved ? '总量含私网/保留地址事件（内网扫描、文档测试段等也会计入，与大屏排除口径不同）' : '与大屏同口径（分钟汇总）：不含私网/保留地址事件，当前未满一分钟的事件下一分钟计入'" placement="top">
                       <el-icon class="stat-box__tip"><InfoFilled /></el-icon>
                     </el-tooltip>
                   </div>
@@ -63,7 +63,7 @@
                   <div class="stat-box__value">{{ overview.today_detected }}</div>
                   <div class="stat-box__label">
                     今日检测
-                    <el-tooltip v-if="overview.includes_reserved" content="总量含私网/保留地址事件（内网扫描、文档测试段等也会计入，与大屏排除口径不同）" placement="top">
+                    <el-tooltip :content="overview.includes_reserved ? '总量含私网/保留地址事件（内网扫描、文档测试段等也会计入，与大屏排除口径不同）' : '与大屏同口径（分钟汇总）：不含私网/保留地址事件，当前未满一分钟的事件下一分钟计入'" placement="top">
                       <el-icon class="stat-box__tip"><InfoFilled /></el-icon>
                     </el-tooltip>
                   </div>
@@ -306,7 +306,8 @@ interface Overview {
   crs_available?: boolean; ip2region_available?: boolean; update_status?: string
   trend: TrendPoint[]; top_ips: TopIP[]; attack_types: AttackType[]; attack_types_stage: AttackType[]
   raw_coverage_from?: string; backfill_incomplete?: boolean
-  // includes_reserved：后端口径披露——总量含私网/保留地址事件（总量卡片 tooltip）
+  // includes_reserved：后端口径披露——true=今日计数回退原始表直算（含私网/保留
+  // 地址事件）；false=走分钟 rollup 与大屏同口径（不含私网）。tooltip 按此切换文案
   includes_reserved?: boolean
   // ingestion：与事件列表同源的采集健康位（见 utils/ingestionHealth）
   ingestion?: IngestionHealth

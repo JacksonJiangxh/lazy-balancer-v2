@@ -7,7 +7,8 @@ export interface Upstream {
   host: string
   port: number
   weight: number
-  dynamic_dns: boolean
+  // 废弃列（写侧恒 0，渲染只读规则级 dynamic_dns）；响应面已 omitempty 收敛，键可能缺席
+  dynamic_dns?: boolean
   enabled: boolean
   protocol: UpstreamProtocol
   max_connections: number

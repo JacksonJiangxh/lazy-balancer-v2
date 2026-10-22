@@ -6,9 +6,14 @@ package db
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
-	"os"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -477,6 +482,45 @@ func TestSecurityPoliciesRebuildSchema_matchesFreshDDL(t *testing.T) {
 	}
 }
 
+// upstreams 与 lb_rules 在 migrateLbRulesPrimaryKey 同事务重建——其余 5 张
+// 重建表均有「重建 DDL ≡ fresh DDL」全列钉测，upstreams 此前只有零散断言。
+// 缺门时给 upstreams 加列只改 fresh DDL + newColumns，重建丢列后二次
+// ensureNewColumns 以默认值补回、用户值静默丢失（server_map_lat/lon 先例）。
+func TestUpstreamsRebuildSchema_matchesFreshDDL(t *testing.T) {
+	// Given fresh 稳态形状
+	freshDB := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create fresh tables: %v", err)
+	}
+	freshShape := tablePragmaShape(t, freshDB, "upstreams")
+
+	// And 旧 PK 库形态（lb_rules id 主键 + upstreams 整型 rule_id + 历史死列）
+	legacyDB := openMigrationTestDB(t)
+	createLegacyLbRulesTables(t, legacyDB, legacyLbRulesSchema{withCaddyID: true, withStagePages: true, withNewHealthCols: true, upstreams: legacyUpstreamsLegacyOrigin})
+	if _, err := legacyDB.Exec(`
+		INSERT INTO lb_rules (id, name, protocol, listen_port, caddy_id) VALUES (7, 'legacy', 'http', 8080, 'lb_upstreams_parity');
+		INSERT INTO upstreams (id, rule_id, host, port, max_connections, origin_domain) VALUES (9, 7, '127.0.0.1', 8443, 37, 'origin.example');
+	`); err != nil {
+		t.Fatalf("seed legacy schema: %v", err)
+	}
+
+	// When 真实重建路径
+	if err := migrateLbRulesPrimaryKey(); err != nil {
+		t.Fatalf("migrate load-balancer primary key: %v", err)
+	}
+
+	// Then upstreams 重建形状与 fresh 逐列一致，行数据保留
+	assertShapeMatchesFresh(t, "upstreams", freshShape, tablePragmaShape(t, legacyDB, "upstreams"))
+	var maxConnections int
+	var originDomain string
+	if err := legacyDB.QueryRow(`SELECT max_connections, origin_domain FROM upstreams WHERE id=9`).Scan(&maxConnections, &originDomain); err != nil {
+		t.Fatalf("read rebuilt upstream: %v", err)
+	}
+	if maxConnections != 37 || originDomain != "origin.example" {
+		t.Fatalf("rebuilt upstream=(%d,%q), want (37,origin.example)（用户值必须随重建保留）", maxConnections, originDomain)
+	}
+}
+
 // global_config.timezone 的空串不是合法库值：time.LoadLocation("") 是 Go 的
 // 特殊值（返回 UTC）→ ConfigureLocation("") 静默把全站时区切成 UTC，而读侧
 // COALESCE(timezone,'Asia/Shanghai') 只兜 NULL。写侧已拒绝空串（设置保存/
@@ -520,10 +564,87 @@ func TestRunMigrationsBackfillsEmptyTimezone(t *testing.T) {
 	}
 }
 
+// fresh DDL 与 newColumns 双通道登记同一列时，两份定义的 type/notnull/default
+// 必须逐字段相等——否则 fresh 库（CREATE）与升级库（ALTER）schema 静默分叉
+// （health_check_timeout 旧默认 5、request_body 兜底失效的事故形态）。
+// 机械门：交集列在 fresh 库取 pragma_table_info，再用登记 dtype 在探针表
+// ALTER 补列取 pragma，逐字段比对。有意分叉列登记白名单并携理由。
+func TestNewColumnsDualRegistered_matchFreshColumnShape(t *testing.T) {
+	database := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	// 有意双通道分叉白名单（键 → 理由）。ALTER ADD COLUMN 不支持非常量
+	// DEFAULT（如 (datetime('now'))），时间戳默认值列双通道天然分叉。
+	allowedDivergence := map[string]string{}
+	if _, err := database.Exec(`CREATE TABLE shape_probe (id INTEGER)`); err != nil {
+		t.Fatalf("create shape probe: %v", err)
+	}
+	keys := make([]string, 0, len(newColumnsRegistry))
+	for key := range newColumnsRegistry {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	dualRegistered := 0
+	for _, key := range keys {
+		parts := strings.SplitN(key, ".", 2)
+		table, column := parts[0], parts[1]
+		var freshType string
+		var freshNotNull int
+		var freshDefault sql.NullString
+		err := database.QueryRow(`SELECT type, "notnull", dflt_value FROM pragma_table_info(?) WHERE name=?`, table, column).Scan(&freshType, &freshNotNull, &freshDefault)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue // 仅 newColumns 通道列（fresh CREATE 不携带）不参与本门
+		}
+		if err != nil {
+			t.Fatalf("read fresh %s: %v", key, err)
+		}
+		dualRegistered++
+		if _, err := database.Exec(`ALTER TABLE shape_probe ADD COLUMN ` + column + ` ` + newColumnsRegistry[key]); err != nil {
+			if reason, ok := allowedDivergence[key]; ok {
+				t.Logf("%s: ALTER 不支持登记形状（白名单：%s）：%v", key, reason, err)
+				continue
+			}
+			t.Errorf("%s: 登记 dtype %q 无法 ALTER 补列（非常量 DEFAULT 等有意分叉须登记白名单）: %v", key, newColumnsRegistry[key], err)
+			continue
+		}
+		var alterType string
+		var alterNotNull int
+		var alterDefault sql.NullString
+		if err := database.QueryRow(`SELECT type, "notnull", dflt_value FROM pragma_table_info('shape_probe') WHERE name=?`, column).Scan(&alterType, &alterNotNull, &alterDefault); err != nil {
+			t.Fatalf("read probe %s: %v", key, err)
+		}
+		if _, err := database.Exec(`ALTER TABLE shape_probe DROP COLUMN ` + column); err != nil {
+			t.Fatalf("reset probe %s: %v", key, err)
+		}
+		diverged := !strings.EqualFold(strings.TrimSpace(freshType), strings.TrimSpace(alterType)) ||
+			freshNotNull != alterNotNull ||
+			freshDefault.Valid != alterDefault.Valid ||
+			(freshDefault.Valid && freshDefault.String != alterDefault.String)
+		if !diverged {
+			continue
+		}
+		if reason, ok := allowedDivergence[key]; ok {
+			t.Logf("%s: 白名单分叉（%s）：fresh={%s,%d,%v} alter={%s,%d,%v}", key, reason, freshType, freshNotNull, freshDefault, alterType, alterNotNull, alterDefault)
+			continue
+		}
+		t.Errorf("%s 双通道形状分叉：fresh={type:%s notnull:%d default:%v} newColumns={type:%s notnull:%d default:%v}",
+			key, freshType, freshNotNull, freshDefault, alterType, alterNotNull, alterDefault)
+	}
+	if dualRegistered == 0 {
+		t.Fatal("双登记交集为空（登记或 fresh DDL 结构漂移，门失效）")
+	}
+	t.Logf("双登记交集 %d 列全部通过相等门", dualRegistered)
+}
+
 // 治理默认值消费侧单源：时区/安全策略异常评分/健康检查与重试间隔的库读兜底
 // 必须绑定 db.Default* 常量。此前这些读侧 SQL 各写一份字面量，DDL DEFAULT 改
-// 值后消费侧静默分叉（request_body 同族事故形态）。本钉测按源码文本双向断言：
-// 字面量不得回流 + 常量引用必须存在。
+// 值后消费侧静默分叉（request_body 同族事故形态）。本钉测按 AST 双向断言：
+// 字面量不得回流（只扫字符串字面量，注释里的同款文本不再假红）+
+// 常量引用必须是真实选择器表达式（注释/文本提及不再假绿）。
+// 豁免声明（audit_vocabulary_migration_test.go 同形态）：本测试断言的是
+// 「字面量内容+选择器引用」契约而非源码排版，属「禁止断言源码文本」约定
+// 的 AST 登记豁免。
 func TestGovernedDefaultLiteralsBoundInConsumers(t *testing.T) {
 	cases := []struct {
 		file      string
@@ -572,19 +693,40 @@ func TestGovernedDefaultLiteralsBoundInConsumers(t *testing.T) {
 		},
 	}
 	for _, tc := range cases {
-		data, err := os.ReadFile(filepath.FromSlash(tc.file))
+		path := filepath.FromSlash(tc.file)
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, path, nil, 0)
 		if err != nil {
-			t.Fatalf("read %s: %v", tc.file, err)
+			t.Fatalf("parse %s: %v", tc.file, err)
 		}
-		content := string(data)
+		var literals []string
+		selectors := map[string]bool{}
+		ast.Inspect(file, func(node ast.Node) bool {
+			switch n := node.(type) {
+			case *ast.BasicLit:
+				if n.Kind == token.STRING {
+					if value, err := strconv.Unquote(n.Value); err == nil {
+						literals = append(literals, value)
+					}
+				}
+			case *ast.SelectorExpr:
+				if x, ok := n.X.(*ast.Ident); ok {
+					selectors[x.Name+"."+n.Sel.Name] = true
+				}
+			}
+			return true
+		})
 		for _, literal := range tc.forbidden {
-			if strings.Contains(content, literal) {
-				t.Errorf("%s 仍含写死治理默认值 %q（应绑定 db.Default* 常量）", tc.file, literal)
+			for _, lit := range literals {
+				if strings.Contains(lit, literal) {
+					t.Errorf("%s 字符串字面量仍含写死治理默认值 %q（应绑定 db.Default* 常量）", tc.file, literal)
+					break
+				}
 			}
 		}
 		for _, binding := range tc.required {
-			if !strings.Contains(content, binding) {
-				t.Errorf("%s 未出现治理常量引用 %q", tc.file, binding)
+			if !selectors[binding] {
+				t.Errorf("%s 缺少治理常量选择器引用 %s", tc.file, binding)
 			}
 		}
 	}

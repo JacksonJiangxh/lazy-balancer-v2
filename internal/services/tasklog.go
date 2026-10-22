@@ -18,19 +18,26 @@ func TaskLogfWarn(taskID, stage, format string, args ...any) {
 	taskengine.TeeTaskLogTime(taskID, "WARN", stage, fmt.Sprintf(format, args...))
 }
 
+// writeUpdateLog 更新流水日志单实现（时间戳/级别/阶段口径唯一来源——
+// TeeTaskLogTime 与引擎生命周期行同用 engineLogTimeStr 斜杠形态）。
+// 三族导出名保持（调用方零改动），禁止再复制「自算时间戳+TeeTaskLog」形态。
+func writeUpdateLog(taskID, level, stage, message string) {
+	taskengine.TeeTaskLogTime(taskID, level, stage, message)
+}
+
 // WriteCRSUpdateLog CRS 更新流水（单一日志入口，统一 tee 到 tasks/crs.log）。
 func WriteCRSUpdateLog(level, stage, message string) {
-	taskengine.TeeTaskLog("crs", time.Now().In(CurrentLocation()).Format("2006/01/02 15:04:05"), level, stage, message)
+	writeUpdateLog("crs", level, stage, message)
 }
 
 // WriteIP2RegionUpdateLog IP2Region 更新流水（统一到 tasks/ip2region.log）。
 func WriteIP2RegionUpdateLog(level, stage, message string) {
-	taskengine.TeeTaskLog("ip2region", time.Now().In(CurrentLocation()).Format("2006/01/02 15:04:05"), level, stage, message)
+	writeUpdateLog("ip2region", level, stage, message)
 }
 
 // AppendThreatUpdateLog 威胁库更新流水（统一到 tasks/threat.log）。
 func AppendThreatUpdateLog(level, stage, message string) {
-	taskengine.TeeTaskLog("threat", time.Now().In(CurrentLocation()).Format("2006/01/02 15:04:05"), level, stage, message)
+	writeUpdateLog("threat", level, stage, message)
 }
 
 // 任务日志大小配置缓存（缓存机制单源 dbValueCache——此前与审计

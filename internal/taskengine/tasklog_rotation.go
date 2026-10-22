@@ -9,14 +9,20 @@ import (
 
 // 任务日志统一滚动：所有写入都在追加前按真实文件大小判断。
 // 阈值由 services 注入 task_log_size_mb（默认 10MB）；保留期清理由
-// log-cleanup 另行负责，不参与尺寸滚动。
-var taskLogSizeBytesFn func() int64
-
-func SetTaskLogSizeBytesFn(fn func() int64) { taskLogSizeBytesFn = fn }
+// log-cleanup 另行负责，不参与尺寸滚动。尺寸函数存于 taskLogConf
+// （与目录同一把读写锁——裸全局在测试并发下存在数据竞争）。
+func SetTaskLogSizeBytesFn(fn func() int64) {
+	taskLogConf.Lock()
+	taskLogConf.sizeFn = fn
+	taskLogConf.Unlock()
+}
 
 func taskLogSizeBytes() int64 {
-	if taskLogSizeBytesFn != nil {
-		return taskLogSizeBytesFn()
+	taskLogConf.RLock()
+	fn := taskLogConf.sizeFn
+	taskLogConf.RUnlock()
+	if fn != nil {
+		return fn()
 	}
 	return 10 * 1024 * 1024
 }

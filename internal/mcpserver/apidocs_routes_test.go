@@ -12,6 +12,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"gopkg.in/yaml.v3"
 
+	"lazy-balancer-v2/internal/apipath"
 	"lazy-balancer-v2/internal/config"
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/handlers"
@@ -28,7 +29,7 @@ func TestOpenAPIDocumentation_covers_registeredGinAPIRoutes(t *testing.T) {
 		if !found || path == "/docs" || path == "/openapi.yaml" {
 			continue
 		}
-		want[route.Method+" "+ginPathToOpenAPI(path)] = struct{}{}
+		want[route.Method+" "+apipath.ToOpenAPI(path)] = struct{}{}
 	}
 
 	request := httptest.NewRequest(http.MethodGet, "/api/v1/openapi.yaml", nil)
@@ -132,16 +133,6 @@ func newAPIDocTestRouter(t *testing.T) *gin.Engine {
 	return middleware.SetupRouter(handler, cfg)
 }
 
-func ginPathToOpenAPI(path string) string {
-	parts := strings.Split(path, "/")
-	for index, part := range parts {
-		if name, found := strings.CutPrefix(part, ":"); found {
-			parts[index] = "{" + name + "}"
-		}
-	}
-	return strings.Join(parts, "/")
-}
-
 func routeSetDifference(left, right map[string]struct{}) []string {
 	difference := make([]string, 0)
 	for route := range left {
@@ -151,4 +142,84 @@ func routeSetDifference(left, right map[string]struct{}) []string {
 	}
 	sort.Strings(difference)
 	return difference
+}
+
+// 集群机器接口绊线：文档声明的认证方式必须与 SetupRouter 注册真实认证链一致。
+// 行为面——有效 JWT 打机器接口恒 401（证明不在 bearerAuth 链上）；文档面——
+// 生成规格的 security scheme 与期望逐一相等，且全文档中带 clusterToken/
+// registrationSecret 的操作必须落在本表（反向防误标）。
+func TestClusterMachineEndpoints_documentMachineTokenScheme(t *testing.T) {
+	router := newAPIDocTestRouter(t)
+	// 与 SetupRouter 公开块注册的机器认证链一一对应。
+	machineSchemes := map[string]string{
+		"GET /cluster/register/:id/status":   "registrationSecret",
+		"GET /cluster/sync/snapshot":         "clusterToken",
+		"GET /cluster/sync/waf-files":        "clusterToken",
+		"POST /cluster/registration/confirm": "clusterToken",
+		"POST /cluster/nodes/report":         "clusterToken",
+	}
+
+	// 行为面：有效 JWT（bearerAuth 凭证）对机器接口恒 401。
+	token := apiDocTestToken(t)
+	for key := range machineSchemes {
+		method, path, _ := strings.Cut(key, " ")
+		url := strings.ReplaceAll(path, ":id", "1")
+		var request *http.Request
+		if method == http.MethodPost {
+			request = httptest.NewRequest(method, "/api/v1"+url, strings.NewReader(`{}`))
+			request.Header.Set("Content-Type", "application/json")
+		} else {
+			request = httptest.NewRequest(method, "/api/v1"+url, nil)
+		}
+		request.Header.Set("Authorization", "Bearer "+token)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusUnauthorized {
+			t.Errorf("%s 携有效 JWT status=%d, want 401（机器接口不在 bearerAuth 链上）", key, response.Code)
+		}
+	}
+
+	// 文档面：生成的 OpenAPI security 与期望 scheme 相等。
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/openapi.yaml", nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("取规格 status=%d", response.Code)
+	}
+	var document struct {
+		Paths map[string]map[string]struct {
+			Security []map[string][]string `yaml:"security"`
+		} `yaml:"paths"`
+	}
+	if err := yaml.Unmarshal(response.Body.Bytes(), &document); err != nil {
+		t.Fatalf("parse generated OpenAPI YAML: %v", err)
+	}
+	covered := make(map[string]bool, len(machineSchemes))
+	for path, operations := range document.Paths {
+		for method, operation := range operations {
+			for _, requirement := range operation.Security {
+				for scheme := range requirement {
+					if scheme != "clusterToken" && scheme != "registrationSecret" {
+						continue
+					}
+					key := strings.ToUpper(method) + " " + apipath.ToGin(path)
+					want, ok := machineSchemes[key]
+					if !ok {
+						t.Errorf("%s %s 文档标注 %s，但它不是已登记的集群机器接口（误标或漏登记）", method, path, scheme)
+						continue
+					}
+					if scheme != want {
+						t.Errorf("%s 文档 security=%s, want %s", key, scheme, want)
+					}
+					covered[key] = true
+				}
+			}
+		}
+	}
+	for key, scheme := range machineSchemes {
+		if !covered[key] {
+			t.Errorf("%s 未在生成规格中标注 %s——契约表缺键会静默回落 bearerAuth", key, scheme)
+		}
+	}
 }

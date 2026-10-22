@@ -6,6 +6,7 @@ package services
 // 部分调用点把 demote skipped / 并发 CAS 落败记成「触发失败」）。
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -63,7 +64,10 @@ func RecordTaskTriggerResult(taskID string, actx TriggerAuditContext, runErr err
 		RecordAuditLog(actx.Operator, "触发", actx.Family, triggerAuditDetail(actx), actx.IP)
 		return
 	}
-	if errors.Is(runErr, taskengine.ErrAlreadyRunning) || errors.Is(runErr, taskengine.ErrTaskSkipped) {
+	if errors.Is(runErr, taskengine.ErrAlreadyRunning) || errors.Is(runErr, taskengine.ErrTaskSkipped) ||
+		errors.Is(runErr, taskengine.ErrRunCancelled) || errors.Is(runErr, context.Canceled) {
+		// 用户取消（ErrRunCancelled/context.Canceled）与并发/跳过语义同级——
+		// task_runs 已落 cancelled 行，补记「触发失败」是语义失真。
 		return
 	}
 	Logf("error", "手动触发任务 %s 失败: %v", taskID, runErr)

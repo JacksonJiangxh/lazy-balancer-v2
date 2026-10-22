@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"database/sql"
+	"errors"
 	"strconv"
 	"strings"
 
@@ -9,9 +11,10 @@ import (
 	"lazy-balancer-v2/internal/taskengine"
 )
 
-// systemTaskLogPathResolver 是任务日志路径唯一解析入口。普通注册任务直接按
-// 任务 ID；cert-job 动态工作项首批载入 job_id→rule_id，单条与批量调用共享
-// 同一实现，批量调用方复用 resolver 避免 N+1。
+// systemTaskLogPathResolver 任务日志路径批量解析入口：普通注册任务直接按
+// 任务 ID；cert-job 动态工作项一次全表预载 job_id→rule_id，供批量调用方
+// （logstats 逐任务解析）复用避免 N+1。单条入口（GetSystemTaskLogs）走
+// systemTaskLogPath 的单行查询，不经本 resolver。
 type systemTaskLogPathResolver struct {
 	certJobRuleIDs map[string]string
 	certJobsLoaded bool
@@ -57,6 +60,30 @@ func (r *systemTaskLogPathResolver) resolve(taskID string) (string, error) {
 }
 
 func systemTaskLogPath(taskID string) (string, error) {
-	var resolver systemTaskLogPathResolver
-	return resolver.resolve(taskID)
+	// 单条入口（日志弹框/MCP get_system_task_logs）：单行查询替代全表
+	// 预载——cert_jobs 行数=规则×域名（无保留期清理，长期可达数千行），
+	// 每次查看日志全表扫不可持续。批量调用方（logstats）仍走 resolver
+	// 预载（一次全表扫供 N 次解析复用，N+1 防护不变）。
+	if !strings.HasPrefix(taskID, "cert-job:") {
+		return taskengine.TaskLogPath(taskID), nil
+	}
+	if db.DB == nil {
+		return "", nil
+	}
+	jobID, err := strconv.Atoi(strings.TrimPrefix(taskID, "cert-job:"))
+	if err != nil || jobID <= 0 {
+		return "", nil
+	}
+	var ruleID string
+	err = db.DB.QueryRow(`SELECT rule_id FROM cert_jobs WHERE id=?`, jobID).Scan(&ruleID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", err
+	}
+	if ruleID == "" {
+		return "", nil
+	}
+	return services.CertJobLogPath(ruleID), nil
 }

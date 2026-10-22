@@ -345,17 +345,14 @@ func gcQuarantinedMetricsFiles(dbPath string) {
 }
 
 func openAndPingMetricsDB(dbPath string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", dbPath+"?_txlock=immediate&_pragma=journal_mode(WAL)&_pragma=busy_timeout(30000)&_pragma=synchronous(NORMAL)")
-	if err != nil {
-		return nil, fmt.Errorf("failed to open metrics database: %w", err)
-	}
 	// MaxIdle == MaxOpen：空闲连接永不驱逐，避免安静期（30s 指标 tick 间）
 	// 池收缩到 0 触发「最后一个连接关闭 → checkpoint + 删除 -wal」突发，
 	// 下一个 tick 再重建 WAL——该 checkpoint 风暴是页回写暴露于宿主丢写
 	// 窗口的放大器。生命周期过期逐连接轮换，5 条常驻下永不触达 last-close。
-	db.SetMaxOpenConns(5)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(30 * time.Minute)
+	db, err := openSQLiteDB(dbPath, sqlitePoolConfig{maxOpen: 5, maxIdle: 5, connMaxLifetime: 30 * time.Minute})
+	if err != nil {
+		return nil, fmt.Errorf("failed to open metrics database: %w", err)
+	}
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to ping metrics database: %w", err)
@@ -687,7 +684,12 @@ var cleanupMetricsHistoryBatch = 5000
 // CleanupMetricsHistory 按 retentionDays 分批删除过期的 metrics_history 行。
 // 本函数无 ctx（沿用既有调用方签名）：循环以 RowsAffected==0 自然终止——
 // 摄取侧只写入 datetime('now') 新鲜行，过期行总量单调递减，批批有推进。
+// MetricsDB 为 nil（库未装配/已关闭，嵌入与测试直调可达）时早退 nil——
+// 与同族导出函数守卫口径一致（PurgeOrphanMetricsHistory/PurgeTaskRuns 先例）。
 func CleanupMetricsHistory(retentionDays int) error {
+	if MetricsDB == nil {
+		return nil
+	}
 	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays).Format("2006-01-02 15:04:05")
 	for {
 		res, err := MetricsDB.Exec(

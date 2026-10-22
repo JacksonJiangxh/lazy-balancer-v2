@@ -4448,9 +4448,14 @@ func (h *Handlers) GetSecurityOverview(c *gin.Context) {
 			firstErr = err
 		}
 	}
+	todayFromRollup := false
 	if db.MetricsDB != nil {
-		trackErr(db.MetricsDB.QueryRow("SELECT COUNT(*) FROM security_events WHERE action='blocked' AND event_time >= ?", todayStartUTC).Scan(&overview.TodayBlocked))
-		trackErr(db.MetricsDB.QueryRow("SELECT COUNT(*) FROM security_events WHERE action='logged' AND event_time >= ?", todayStartUTC).Scan(&overview.TodayDetected))
+		// 今日计数与威胁大屏同源（分钟 rollup）：行帽触顶时原始表只剩
+		// 最近若干分钟，直算静默少计；rollup 覆盖不足/固化陈旧时回退
+		// 原始表直算（fromRollup=false → includes_reserved 披露含私网）。
+		blocked, detected, fromRollup, err := securityOverviewTodayCounts(db.MetricsDB, todayStart, now)
+		trackErr(err)
+		overview.TodayBlocked, overview.TodayDetected, todayFromRollup = blocked, detected, fromRollup
 		coverageFrom, err := threatRawCoverageStart(db.MetricsDB)
 		trackErr(err)
 		rawCoverageFrom = coverageFrom
@@ -4546,8 +4551,10 @@ func (h *Handlers) GetSecurityOverview(c *gin.Context) {
 		SecurityOverview:   overview,
 		RawCoverageFrom:    rawCoverageFrom,
 		BackfillIncomplete: backfillIncomplete,
-		IncludesReserved:   true,
-		Ingestion:          services.SecurityEventsIngestionHealthSnapshot(),
+		// 今日计数走 rollup 时与大屏同口径排除私网/保留地址（false）；
+		// 回退原始表直算时含私网（true，旧口径）。
+		IncludesReserved: !todayFromRollup,
+		Ingestion:        services.SecurityEventsIngestionHealthSnapshot(),
 	}})
 }
 

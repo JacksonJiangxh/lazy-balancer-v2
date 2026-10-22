@@ -224,10 +224,13 @@ type UpdateCAProviderRequest struct {
 
 // GlobalConfig represents global configuration
 type GlobalConfig struct {
-	ID                         int    `json:"id"`
-	CaddyConfig                string `json:"caddy_config"`
-	DNSProvider                string `json:"dns_provider"`
-	DNSCredentials             string `json:"dns_credentials"`
+	ID          int    `json:"id"`
+	CaddyConfig string `json:"caddy_config"`
+	// DNSProvider/DNSCredentials 是全局配置遗留字段——签发链唯一凭证来源是
+	// certificate_configs 表；响应面已收敛（omitempty，空值不下发；
+	// 集群快照走 ClusterBasicSettings 独立字段，不受此收敛影响）。
+	DNSProvider                string `json:"dns_provider,omitempty"`
+	DNSCredentials             string `json:"dns_credentials,omitempty"`
 	ACMEEmail                  string `json:"acme_email"`
 	CertExpiryDays             int    `json:"cert_expiry_days"`
 	CertRenewalDays            int    `json:"cert_renewal_days"`
@@ -304,9 +307,10 @@ type Upstream struct {
 	Port   int    `json:"port"`
 	Weight int    `json:"weight"`
 	// DynamicDNS 是 upstreams 表的废弃列：渲染只读规则级 DynamicDNS，写侧
-	// 恒落 0（值不再传播）。保留字段仅维持 JSON 形状（导出/备份/快照
-	// 携带恒 false），新代码禁止据此做任何判定。
-	DynamicDNS     bool   `json:"dynamic_dns"`
+	// 恒落 0（值不再传播）。响应面已收敛（omitempty——恒 false 不下发，
+	// 防消费者据恒假值误判；导入/快照缺省即零值，双向兼容），新代码禁止
+	// 据此做任何判定。
+	DynamicDNS     bool   `json:"dynamic_dns,omitempty"`
 	Enabled        bool   `json:"enabled"`
 	Protocol       string `json:"protocol"`
 	MaxConnections int    `json:"max_connections"`

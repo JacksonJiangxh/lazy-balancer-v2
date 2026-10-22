@@ -127,3 +127,40 @@ func TestGetSystemTaskHistory_certJobMissingAndInvalidIDs(t *testing.T) {
 		t.Fatalf("缺失时间戳形态=(%+v), want 空时间列与 duration=0", run)
 	}
 }
+
+// 平面 UTC 墙串（crsTimeLayout，空格分隔）形态：与 RFC3339 同权解析——
+// 仅 RFC3339 的单布局解析在驱动/列表达式形态变化时静默归零（时间列空 +
+// duration=0）。双布局单源=services.ParseUTCTimeDual。
+func TestGetSystemTaskHistory_certJobFlatUTCLayout(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	if _, err := services.ConfigureLocation("Asia/Shanghai"); err != nil {
+		t.Fatalf("configure location: %v", err)
+	}
+	t.Cleanup(func() { _, _ = services.ConfigureLocation("Asia/Shanghai") })
+
+	// Given 平面 UTC 布局时间戳（空格分隔、无 T/Z）。
+	result, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, message, created_at, updated_at)
+		VALUES ('lb_hist3','hist3.example.test','issued','签发完成','2026-10-20 04:00:00','2026-10-20 04:00:05')`)
+	if err != nil {
+		t.Fatalf("seed cert job: %v", err)
+	}
+	jobID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// When
+	recorder, response := getTaskHistory(t, h.GetSystemTaskHistory, "cert-job:"+strconv.FormatInt(jobID, 10))
+
+	// Then 双布局解析：时间列填充 + duration 正确（UTC→配置时区 +8）。
+	if recorder.Code != http.StatusOK || len(response.Data.Runs) != 1 {
+		t.Fatalf("status=%d runs=%d, want 200/1", recorder.Code, len(response.Data.Runs))
+	}
+	run := response.Data.Runs[0]
+	if run.StartedAt != "2026-10-20 12:00:00" || run.FinishedAt != "2026-10-20 12:00:05" {
+		t.Fatalf("平面 UTC 布局时间墙串=(%q,%q), want 配置时区(+8)串（单布局解析会静默归零）", run.StartedAt, run.FinishedAt)
+	}
+	if run.DurationMs != 5000 {
+		t.Fatalf("duration_ms=%d, want 5000", run.DurationMs)
+	}
+}

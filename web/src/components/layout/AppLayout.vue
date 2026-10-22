@@ -157,6 +157,21 @@
         </template>
       </el-alert>
 
+      <!-- 配置应用失败全局横幅：写路径保存分叉（apply_error，含「已保存但
+           未生效」退化提交两态文案）与后台重载失败（background_apply_error，
+           含从节点集群同步重载失败）同源轮询——全部节点全部页面可见 -->
+      <el-alert
+        v-if="applyErrorBanner"
+        :type="applyErrorBannerKind"
+        :closable="false"
+        show-icon
+        class="error-banner"
+      >
+        <template #title>
+          <span>{{ applyErrorBanner }}</span>
+        </template>
+      </el-alert>
+
       <el-main class="layout-main">
         <slot />
       </el-main>
@@ -366,18 +381,28 @@ const saveProfile = async () => {
 // 配置一致性看门狗横幅：轮询 /caddy/status，漂移时展示并给出重启恢复入口。
 const configDrift = ref('')
 const configDriftSince = ref('')
+// 配置应用失败全局横幅（全部节点、全部页面）：apply_error=写路径
+// 「保存失败/已保存未生效」（库态分叉），background_apply_error=后台数据类
+// 重载失败（证书部署/CRS/IP库/威胁库/自动封禁/集群同步重载——从节点
+// 「快照已提交但运行配置未收敛」分叉的唯一全局信号）。此前两者都只在
+// 仪表盘以标签呈现，非仪表盘页面与从节点完全不可见。
+const applyErrorBanner = ref('')
+const applyErrorBannerKind = ref<'error' | 'warning'>('error')
 const restarting = ref(false)
 let disposed = false
 
 const fetchDriftStatus = async () => {
-  // 看门狗语义主节点权威（横幅本就仅 master 渲染）：从节点不发请求；
-  // 节点模式未知（null，/config 未就绪窗口）同样跳过，下轮 interval 自然补查。
-  if (authStore.nodeMode !== 'master') return
+  // 节点模式未知（/config 未就绪窗口）仍查询——apply 失败横幅全节点有效；
+  // 漂移看门狗语义主节点权威，漂移文案仍仅 master 渲染。
   try {
     const res = await request.get('/caddy/status', { silent: true })
-    const drifted = res.data?.config_consistent === 'false'
+    const drifted = res.data?.config_consistent === 'false' && authStore.nodeMode === 'master'
     configDrift.value = drifted ? (res.data?.config_drift || '规则路由与运行配置不一致') : ''
     configDriftSince.value = drifted ? (res.data?.config_drift_since || '') : ''
+    const applyErr = res.data?.apply_error || ''
+    const bgErr = res.data?.background_apply_error || ''
+    applyErrorBanner.value = applyErr || bgErr
+    applyErrorBannerKind.value = applyErr ? 'error' : 'warning'
   } catch {
     // 状态查询失败静默——网络层错误已有全局处理
   }

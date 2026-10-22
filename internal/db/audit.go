@@ -22,13 +22,10 @@ func InitializeAuditDB(dataDir string) error {
 	if err := prepareSQLiteDatabase(path); err != nil {
 		return fmt.Errorf("failed to secure audit database: %w", err)
 	}
-	auditDB, err := sql.Open("sqlite", path+"?_txlock=immediate&_pragma=journal_mode(WAL)&_pragma=busy_timeout(30000)&_pragma=synchronous(NORMAL)")
+	auditDB, err := openSQLiteDB(path, sqlitePoolConfig{maxOpen: 5, maxIdle: 2, connMaxLifetime: 30 * time.Minute})
 	if err != nil {
 		return fmt.Errorf("failed to open audit database: %w", err)
 	}
-	auditDB.SetMaxOpenConns(5)
-	auditDB.SetMaxIdleConns(2)
-	auditDB.SetConnMaxLifetime(30 * time.Minute)
 	if err := auditDB.Ping(); err != nil {
 		auditDB.Close()
 		return fmt.Errorf("failed to ping audit database: %w", err)
@@ -49,6 +46,10 @@ func InitializeAuditDB(dataDir string) error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_audit_log_created ON audit_log(created_at);
 		CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action);
+		-- username/resource 不建索引：列表筛选是 COALESCE 包裹 + LIKE 前导通配
+		--（handlers.buildAuditLogFilters），索引对该形态不可用；时间范围过滤走
+		-- idx_audit_log_created（裸列比较），每请求全表 COUNT 已由 5s 进程缓存
+		-- 收敛（cachedAuditLogTotal，响应以 total_stale 披露）。
 	`); err != nil {
 		auditDB.Close()
 		return fmt.Errorf("failed to create audit schema: %w", err)
@@ -360,7 +361,16 @@ func migrateLegacyAuditLogs(mainDB *sql.DB, auditPath string) error {
 		return fmt.Errorf("failed to verify audit migration: %w", err)
 	}
 	if mismatch > 0 {
-		return fmt.Errorf("audit migration conflict: %d source rows differ from destination", mismatch)
+		// 冲突=主库 audit_log 与审计库来自不同时点/节点（仅人工恢复旧主库
+		// 副本可达）。此前直接返回错误 → InitializeAuditDB 上抛 → 进程无法
+		// 启动且无不改库的恢复路径。改为服务可用优先：保留主库旧表（不
+		// DROP，冲突行留作人工核对依据）+ WARN 日志 + 系统审计留痕（审计页
+		// 可见，每次启动一条直至人工处理）；无冲突行已由上方 INSERT OR
+		// IGNORE 并入（幂等，不覆盖目标库既有行）。
+		detail := fmt.Sprintf("启动迁移：旧审计表与审计库存在 %d 行冲突，已跳过迁移并保留主库 audit_log 表（冲突行需人工核对；确认后可手动删除主库 audit_log 表完成迁移）", mismatch)
+		log.Print("WARN: " + detail)
+		recordSystemAudit("启动迁移", "操作日志", detail)
+		return nil
 	}
 	if _, err := mainDB.Exec("DROP TABLE audit_log"); err != nil {
 		return fmt.Errorf("failed to remove legacy audit table: %w", err)

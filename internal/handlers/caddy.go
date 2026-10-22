@@ -920,6 +920,11 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 			// 此分支仅可能为环境级异常；配置已提交并应用，宣告 500 更新失败会
 			// 误导客户端（重试=重复写同一已生效值）。降级为错误日志，响应保持成功。
 			services.Logf("error", "配置已提交并应用，但运行时应用时区失败（提交前已预校验，疑似环境异常）: %v", err)
+		} else if *req.Timezone != old.Timezone {
+			// 时区真实变更：已武装的未来排程槽按新时区重算（槽=本地日历
+			// 计算、UTC 落库——不重排则首轮仍按旧偏移触发，「下次执行」
+			// 展示同错）。过期槽不动（补跑语义保留）。
+			services.RearmScheduleSlotsAfterTimezoneChange()
 		}
 	}
 

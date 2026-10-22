@@ -62,6 +62,7 @@ func TestStartupLegacyMigrations_secondStartWriteFree(t *testing.T) {
 
 	// When 二次启动（等价重启，数据已是收敛态）。
 	writeBase, scanBase = startupMigrationWriteTx.Load(), startupLegacySanitizeMigrations.Load()
+	stmtBase := startupMigrationWriteStatements.Load()
 	if err := runMigrations(); err != nil {
 		t.Fatalf("second migrations: %v", err)
 	}
@@ -72,6 +73,11 @@ func TestStartupLegacyMigrations_secondStartWriteFree(t *testing.T) {
 	}
 	if got := startupLegacySanitizeMigrations.Load() - scanBase; got != 0 {
 		t.Fatalf("二次启动自定义规则整表扫描=%d, want 0（指纹 marker 未生效）", got)
+	}
+	// 无条件写语句族（默认回填/时间戳归一/权重与 NTLM 归一/孤儿清理）在
+	// 收敛库上探测门零命中——二次启动连写语句都不执行（不写锁）。
+	if got := startupMigrationWriteStatements.Load() - stmtBase; got != 0 {
+		t.Fatalf("二次启动写语句=%d, want 0（无条件写语句探测门失效）", got)
 	}
 
 	// And 终态幂等：TCP 死字段仍清零、https 已归一、绑定已删。

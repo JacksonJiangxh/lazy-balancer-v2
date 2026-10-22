@@ -303,10 +303,10 @@ test('SecurityBindingEditor 先声明 props/emits 再派生 computed', () => {
   assert.ok(subtitleIdx > emitIdx, 'bindSubtitle 必须在 props 之后声明（不得依赖 TDZ 惰性求值）')
 })
 
-test('总览总量卡片披露含保留地址口径（includes_reserved tooltip）', () => {
+test('总览总量卡片按 includes_reserved 切换口径 tooltip（含/不含私网双文案）', () => {
   const text = source('src/views/security/SecurityOverview.vue')
-  assert.match(text, /v-if="overview\.includes_reserved"[^>]*content="总量含私网\/保留地址事件/, '今日拦截/今日检测卡片须有总量口径 tooltip')
-  assert.ok([...text.matchAll(/overview\.includes_reserved/g)].length >= 2, '今日拦截与今日检测两处都须披露')
+  assert.ok([...text.matchAll(/overview\.includes_reserved \? '总量含私网\/保留地址事件/g)].length >= 2, '今日拦截与今日检测两处都须按 includes_reserved 切换口径 tooltip')
+  assert.ok([...text.matchAll(/与大屏同口径（分钟汇总）：不含私网\/保留地址事件/g)].length >= 2, 'rollup 口径（不含私网）文案两处都须存在')
 })
 
 test('自动封禁预置名单条目数标注含已到期条目', () => {

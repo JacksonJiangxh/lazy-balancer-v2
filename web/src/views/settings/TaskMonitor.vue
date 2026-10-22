@@ -266,7 +266,9 @@
               <el-tag v-else size="small" type="info" effect="plain">不可调度</el-tag>
             </el-tooltip>
           </el-descriptions-item>
-          <el-descriptions-item label="下次执行">{{ detailTask.next_run_at || '—' }}</el-descriptions-item>
+          <!-- 与列表「下次执行」列同门（loop_on 且非常驻）——停用任务的
+               排程槽是陈旧预约值，详情无条件显示会与列表「—」口径分叉 -->
+          <el-descriptions-item label="下次执行">{{ (detailTask.next_run_at && detailTask.loop_on && detailTask.kind !== 'daemon') ? detailTask.next_run_at : '—' }}</el-descriptions-item>
           <el-descriptions-item label="24h 成功 / 失败">
             <span class="tm-ok">{{ detailTask.success_24h }}</span> / <span :class="{ 'tm-bad': detailTask.fail_24h > 0 }">{{ detailTask.fail_24h }}</span>
           </el-descriptions-item>
@@ -505,8 +507,11 @@ const fetchCertQueue = async (signal?: AbortSignal) => {
 
 // ===== 概览统计 =====
 const runningCount = computed(() => tasks.value.filter(t => t.status === 'running').length)
-const total24h = computed(() => tasks.value.reduce((s, t) => s + (t.runs_24h || 0), 0))
-const fail24h = computed(() => tasks.value.reduce((s, t) => s + (t.fail_24h || 0), 0))
+// 24h KPI 只聚合引擎族执行行——cert-job 行的 runs_24h/fail_24h 语义是
+// 「工作项终态事件」（每行 ≤1），与引擎族「执行轮次」混加会把两种口径
+// 并成一个数（高频引擎任务淹没证书计数，反之亦然）。
+const total24h = computed(() => tasks.value.reduce((s, t) => s + (isCertJobRow(t.id) ? 0 : (t.runs_24h || 0)), 0))
+const fail24h = computed(() => tasks.value.reduce((s, t) => s + (isCertJobRow(t.id) ? 0 : (t.fail_24h || 0)), 0))
 
 // ===== 筛选 + 分页 =====
 const kindFilter = ref('all')
@@ -681,25 +686,9 @@ const isCertJobRow = (id: string): boolean => id.startsWith('cert-job:')
 // 单行在册，展示该签发任务当前记录）
 const historyTitle = computed(() =>
   detailTask.value && isCertJobRow(detailTask.value.id) ? '签发任务记录（cert_jobs）' : `运行历史（最近 ${history.value.length} 次）`)
-// cert-job 详情数据源（GET /certificates/jobs/:id——与 CertJobs 页同源字段）
-interface CertJobDetail { id: number; rule_id: string; domain: string; status: string; message: string; created_at?: string; updated_at?: string | null }
-const fetchCertJobHistory = async (jobId: number): Promise<RunRecord[]> => {
-  const res = await request.get<APIResponse<CertJobDetail>>(`/certificates/jobs/${jobId}`, { silent: true })
-  const j = res.data
-  if (!j) return []
-  const start = j.created_at ? Date.parse(j.created_at) : NaN
-  const end = j.updated_at ? Date.parse(j.updated_at) : NaN
-  return [{
-    id: j.id, task_id: `cert-job:${j.id}`, family: 'cert-job', trigger: 'queue', status: j.status,
-    // cert_jobs 为 UTC 存储族（RFC3339Z）——映射时经 formatDate 转配置
-    // 时区墙串再入列（fmtTime 对墙串原样渲染）；同页引擎族 last_run 为配置时区
-    // 墙串不经此处。duration 用原始 RFC3339 串 Date.parse 差值，不受格式化影响。
-    started_at: j.created_at ? formatDate(j.created_at) : '',
-    finished_at: j.updated_at ? formatDate(j.updated_at) : '',
-    duration_ms: !isNaN(start) && !isNaN(end) && end > start ? end - start : 0,
-    message: j.message || undefined,
-  }]
-}
+// cert-job 动态行历史与引擎族同端点（GET /system/tasks/:id/history 的
+// cert-job 分支直接返回 RunRecord 形状，时间已按配置时区转换）——
+// 前端不再自建映射（字段推导/时区转换双实现漂移面收敛到后端单源）。
 let detailSeq = 0
 // 详情历史加载失败显性化（原静默 catch 呈现为空「运行历史」，与
 // 无记录不可区分）
@@ -712,14 +701,8 @@ const openDetail = async (row: TaskInfo) => {
   history.value = []
   detailHistoryError.value = false
   try {
-    let runs: RunRecord[] = []
-    if (isCertJobRow(row.id)) {
-      runs = await fetchCertJobHistory(Number(row.id.slice(9)))
-    } else {
-      const res = await request.get<APIResponse<{ runs: RunRecord[] }>>(`/system/tasks/${row.id}/history`, { silent: true })
-      runs = res.data?.runs || []
-    }
-    if (seq === detailSeq) history.value = runs
+    const res = await request.get<APIResponse<{ runs: RunRecord[] }>>(`/system/tasks/${row.id}/history`, { silent: true })
+    if (seq === detailSeq) history.value = res.data?.runs || []
   } catch {
     if (seq === detailSeq) detailHistoryError.value = true
   }

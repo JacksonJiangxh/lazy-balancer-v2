@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"lazy-balancer-v2/internal/db"
 )
@@ -1140,5 +1141,94 @@ func TestServeWithToolVisibilityFailsClosedOnFilterError(t *testing.T) {
 	}
 	if string(payload.ID) != `"abc"` {
 		t.Fatalf("fail-closed response lost JSON-RPC id: %s", response.Body.String())
+	}
+}
+
+func TestRemoveIPFromListToolForwardsIDAndValue(t *testing.T) {
+	// Given：封禁处置闭环的解封原语——幂等单条移除（与 add_ip_to_list 对称），
+	// 免去读全表-改-全量写回与自动封禁并发写入的竞态路径。
+	var receivedMethod, receivedPath, receivedBody string
+	rest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedMethod, receivedPath = r.Method, r.URL.Path
+		body, _ := io.ReadAll(r.Body)
+		receivedBody = string(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"removed":true}}`))
+	}))
+	defer rest.Close()
+
+	// When
+	result := callTool(t, New(rest.URL+"/api/v1", rest.Client()), "remove_ip_from_list", `{"id":9,"value":"203.0.113.7"}`)
+
+	// Then
+	if receivedMethod != http.MethodPost || receivedPath != "/api/v1/security/ip-lists/9/remove-ip" {
+		t.Fatalf("request=%s %s", receivedMethod, receivedPath)
+	}
+	if receivedBody != `{"value":"203.0.113.7"}` {
+		t.Fatalf("body=%s, want value only (id belongs to path)", receivedBody)
+	}
+	if strings.Contains(result, `"isError":true`) {
+		t.Fatalf("result=%s, want success", result)
+	}
+}
+
+// 缺路径参数/缺 API Key/传输失败是调用方可恢复的调用层错误——按文档承诺以
+// IsError+文本返回，而非 JSON-RPC -32603（Agent 只处理 IsError 分支时会漏掉）。
+func TestForward_callLayerErrorsReturnIsErrorResults(t *testing.T) {
+	rest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0}`))
+	}))
+	defer rest.Close()
+	handler := New(rest.URL+"/api/v1", rest.Client())
+
+	// 缺路径参数
+	result := callTool(t, handler, "get_rule", `{}`)
+	if !strings.Contains(result, "缺少参数") || !strings.Contains(result, `"isError":true`) {
+		t.Fatalf("missing path arg result=%s, want IsError tool result", result)
+	}
+	if strings.Contains(result, "-32603") {
+		t.Fatalf("missing path arg surfaced as JSON-RPC internal error: %s", result)
+	}
+
+	// 缺 API Key
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_rules","arguments":{}}}`
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/mcp", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json, text/event-stream")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if !strings.Contains(response.Body.String(), "缺少 API 密钥") || !strings.Contains(response.Body.String(), `"isError":true`) {
+		t.Fatalf("missing API key body=%s, want IsError tool result", response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "-32603") {
+		t.Fatalf("missing API key surfaced as JSON-RPC internal error: %s", response.Body.String())
+	}
+
+	// 传输失败（连接拒绝）
+	down := New("http://127.0.0.1:1/api/v1", &http.Client{Timeout: 2 * time.Second})
+	result = callTool(t, down, "list_rules", `{}`)
+	if !strings.Contains(result, `"isError":true`) || strings.Contains(result, "-32603") {
+		t.Fatalf("transport failure result=%s, want IsError tool result", result)
+	}
+}
+
+// 无分页参数的整份返回 GET 工具（list_rules/list_ip_lists/get_config 等）超限时
+// 通用「改用分页」指引是死路——必须给单条查询/管理面板的可执行路径；
+// 有分页参数的工具维持通用分页指引。
+func TestOversizedResponseMessageGuidesNonPaginatedGetTools(t *testing.T) {
+	rest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(bytes.Repeat([]byte("x"), maxResponseSize+1))
+	}))
+	defer rest.Close()
+	handler := New(rest.URL+"/api/v1", rest.Client())
+
+	noPagination := callTool(t, handler, "list_ip_lists", `{}`)
+	if !strings.Contains(noPagination, "无分页参数") || strings.Contains(noPagination, "请改用分页或专用导出工具") {
+		t.Fatalf("list_ip_lists result=%s, want 单条查询/面板指引而非死路分页文案", noPagination)
+	}
+	paginated := callTool(t, handler, "list_security_events", `{}`)
+	if !strings.Contains(paginated, "请改用分页或专用导出工具") {
+		t.Fatalf("list_security_events result=%s, want 通用分页指引保留", paginated)
 	}
 }

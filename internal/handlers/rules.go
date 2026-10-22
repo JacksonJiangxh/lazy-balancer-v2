@@ -708,6 +708,12 @@ func (h *Handlers) respondRuleApplyError(c *gin.Context, applyErr, restoreErr er
 	if restoreErr != nil {
 		applyErr = errors.Join(applyErr, restoreErr)
 	}
+	// 横幅事实源收口（与配置域 UpdateConfig/PutCaddyConfig/finishTxApply
+	// 同写点）：apply 失败只回 500+审计时，刷新页面后分叉完全不可见
+	// （看门狗只比对路由 id，纯策略/限流变化不触发漂移横幅）。调用方已先走
+	// recoverCommittedViewAfterCommitFailure——恢复成功时运行配置确为
+	// 「旧配置已保留」；恢复失败（双失败）时横幅更是最后留痕。
+	h.recordCaddyApplyResult(applyErr)
 	// 规则五端点均为 Explicit 审计策略（中间件对 Explicit 整体
 	// 跳过）——此前 apply 失败只写 HTTP 响应，操作审计完全缺席。与配置域
 	// finishTxApply（拒绝/未校验分支）及安全域同口径：失败必须留痕。
@@ -1475,7 +1481,19 @@ func (h *Handlers) CreateRule(c *gin.Context) {
 
 	reloadNote, applyErr := h.applyFromTxNote(c, tx, txReloadDetail("rule_create", caddyID), true)
 	if applyErr != nil {
-		restoreErr := h.restoreImportRuntime(runtimeSnapshot)
+		// 恢复收口（四步，与配置域同口径横幅事实源）：①显式回滚事务
+		// （释放 SQLite 写锁——已提交视图重渲染读 db.DB 不被阻塞；defer
+		// 回滚对 ErrTxDone 幂等）；②运行配置+证书文件按请求前快照回退
+		// （同字节短路安全——候选未生效时零 /load；新规则证书文件快照为
+		// 空对即删除孤儿）；③LKG 钉回已提交视图（零 /load——候选 /load
+		// 成功会把未提交字节写进 LKG，恢复 /load 再失败时重启兜底不得
+		// 回放未提交内容）；④横幅持久化（respondRuleApplyError 内）。
+		var restoreErr error
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			restoreErr = fmt.Errorf("回滚未提交事务失败: %w", rbErr)
+		}
+		restoreErr = errors.Join(restoreErr, h.restoreImportRuntime(runtimeSnapshot))
+		restoreErr = errors.Join(restoreErr, h.caddyService.PersistCommittedViewAsLastGoodInLock())
 		h.respondRuleApplyError(c, applyErr, restoreErr, "创建")
 		return
 	}
@@ -2619,7 +2637,15 @@ func (h *Handlers) UpdateRule(c *gin.Context) {
 
 	reloadNote, applyErr := h.applyFromTxNote(c, tx, txReloadDetail("rule_update", caddyID), true)
 	if applyErr != nil {
-		restoreErr := h.restoreImportRuntime(runtimeSnapshot)
+		// 恢复收口（与创建分支同构）：显式回滚事务 → 快照回退运行配置/
+		// 证书文件（同字节短路安全）→ LKG 钉回已提交视图（零 /load）→
+		// 横幅持久化（respondRuleApplyError 内）。
+		var restoreErr error
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			restoreErr = fmt.Errorf("回滚未提交事务失败: %w", rbErr)
+		}
+		restoreErr = errors.Join(restoreErr, h.restoreImportRuntime(runtimeSnapshot))
+		restoreErr = errors.Join(restoreErr, h.caddyService.PersistCommittedViewAsLastGoodInLock())
 		h.respondRuleApplyError(c, applyErr, restoreErr, "更新")
 		return
 	}
@@ -3123,7 +3149,14 @@ func (h *Handlers) DeleteRule(c *gin.Context) {
 	}
 	reloadNote, applyErr := h.applyFromTxNote(c, tx, txReloadDetail("rule_delete", caddyID), true)
 	if applyErr != nil {
-		restoreErr := h.restoreImportRuntime(runtimeSnapshot)
+		// 恢复收口（与创建分支同构）：显式回滚事务 → 快照回退 → LKG 钉回
+		// 已提交视图（零 /load）→ 横幅持久化。
+		var restoreErr error
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			restoreErr = fmt.Errorf("回滚未提交事务失败: %w", rbErr)
+		}
+		restoreErr = errors.Join(restoreErr, h.restoreImportRuntime(runtimeSnapshot))
+		restoreErr = errors.Join(restoreErr, h.caddyService.PersistCommittedViewAsLastGoodInLock())
 		if restoreErr != nil {
 			services.Logf("error", "问题: DeleteRule Caddy apply and runtime restore failed for caddy_id=%s: apply=%v restore=%v", caddyID, applyErr, restoreErr)
 		}
@@ -3936,7 +3969,14 @@ func (h *Handlers) EnableRule(c *gin.Context) {
 	}
 	reloadNote, applyErr := h.applyFromTxNote(c, tx, txReloadDetail("rule_enable", caddyID), true)
 	if applyErr != nil {
-		restoreErr := h.restoreImportRuntime(runtimeSnapshot)
+		// 恢复收口（与创建分支同构）：显式回滚事务 → 快照回退 → LKG 钉回
+		// 已提交视图（零 /load）→ 横幅持久化（respondRuleApplyError 内）。
+		var restoreErr error
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			restoreErr = fmt.Errorf("回滚未提交事务失败: %w", rbErr)
+		}
+		restoreErr = errors.Join(restoreErr, h.restoreImportRuntime(runtimeSnapshot))
+		restoreErr = errors.Join(restoreErr, h.caddyService.PersistCommittedViewAsLastGoodInLock())
 		h.respondRuleApplyError(c, applyErr, restoreErr, "启用")
 		return
 	}
@@ -4379,7 +4419,14 @@ func (h *Handlers) DisableRule(c *gin.Context) {
 	}
 	reloadNote, applyErr := h.applyFromTxNote(c, tx, txReloadDetail("rule_disable", caddyID), true)
 	if applyErr != nil {
-		restoreErr := h.restoreImportRuntime(runtimeSnapshot)
+		// 恢复收口（与创建分支同构）：显式回滚事务 → 快照回退 → LKG 钉回
+		// 已提交视图（零 /load）→ 横幅持久化（respondRuleApplyError 内）。
+		var restoreErr error
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			restoreErr = fmt.Errorf("回滚未提交事务失败: %w", rbErr)
+		}
+		restoreErr = errors.Join(restoreErr, h.restoreImportRuntime(runtimeSnapshot))
+		restoreErr = errors.Join(restoreErr, h.caddyService.PersistCommittedViewAsLastGoodInLock())
 		h.respondRuleApplyError(c, applyErr, restoreErr, "禁用")
 		return
 	}

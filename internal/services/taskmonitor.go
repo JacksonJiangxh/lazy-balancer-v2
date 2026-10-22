@@ -298,9 +298,10 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 			case m.Running:
 				if latestRun != nil {
 					ti.StartedAt = latestRun.StartedAt
-				} else {
-					ti.StartedAt = te.StartedAt().In(CurrentLocation()).Format("2006-01-02 15:04:05")
 				}
+				// Running=true 但 boot 行缺失（插入失败仅 WARN / DB 短窗）：
+				// 置零值——UI '—' 兜底，不得回退引擎进程启动时刻（uptime
+				// 语义，与「常驻 · 启动于」契约矛盾）。
 			default:
 				if latestRun != nil {
 					ti.StartedAt = latestRun.StartedAt

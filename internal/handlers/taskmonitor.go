@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -20,7 +21,6 @@ import (
 	"lazy-balancer-v2/internal/models"
 	"lazy-balancer-v2/internal/services"
 	"lazy-balancer-v2/internal/taskengine"
-	"os"
 )
 
 // ListSystemTasks 聚合全部任务族状态（全员可见）。
@@ -334,12 +334,10 @@ func (h *Handlers) certJobRunHistory(c *gin.Context, taskID string) {
 		if !raw.Valid || strings.TrimSpace(raw.String) == "" {
 			return time.Time{}, false
 		}
-		if ts, err := time.Parse(time.RFC3339, raw.String); err == nil {
-			return ts, true
-		}
-		// 存量行可能是墙串形态：按 UTC 解析失败即视为不可用（duration=0、
-		// 时间列留空），不阻断历史响应。
-		return time.Time{}, false
+		// 双布局解析单源（services.ParseUTCTimeDual：crsTimeLayout 平面串 +
+		// RFC3339）——仅 RFC3339 的单布局解析在列表达式/驱动形态变化时
+		// 静默归零（时间列空 + duration=0）。解析失败视为不可用，不阻断响应。
+		return services.ParseUTCTimeDual(raw.String)
 	}
 	started, startedOK := parseUTC(createdAt)
 	finished, finishedOK := parseUTC(updatedAt)
@@ -389,35 +387,37 @@ func (h *Handlers) GetSystemTaskLogs(c *gin.Context) {
 	// 尾部 256KB（日志弹框消费口径，防超长载荷）。先 Seek 再限量读，
 	// 不把最大 1GB 的任务日志整文件读入内存。
 	const tail = 256 << 10
-	info, err := os.Stat(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"content": ""}})
+	var data []byte
+	info, statErr := os.Stat(path)
+	switch {
+	case statErr == nil:
+		startOffset := int64(0)
+		if info.Size() > tail {
+			startOffset = info.Size() - tail
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "任务日志读取失败: " + err.Error()})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "任务日志读取失败: " + err.Error()})
+		defer file.Close()
+		if _, err := file.Seek(startOffset, io.SeekStart); err != nil {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "任务日志读取失败: " + err.Error()})
+			return
+		}
+		data, err = io.ReadAll(io.LimitReader(file, int64(tail)))
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "任务日志读取失败: " + err.Error()})
+			return
+		}
+		data = tailLogWindow(data, startOffset)
+	case errors.Is(statErr, os.ErrNotExist):
+		// 活动文件缺失（外部删除，或轮转 rename 完成后写入失败）不得直接
+		// 返回空——轮转副本（.1…）可能仍有内容，落入下方统一拼接。
+	default:
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "任务日志读取失败: " + statErr.Error()})
 		return
 	}
-	startOffset := int64(0)
-	if info.Size() > tail {
-		startOffset = info.Size() - tail
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "任务日志读取失败: " + err.Error()})
-		return
-	}
-	defer file.Close()
-	if _, err := file.Seek(startOffset, io.SeekStart); err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "任务日志读取失败: " + err.Error()})
-		return
-	}
-	data, err := io.ReadAll(io.LimitReader(file, int64(tail)))
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "任务日志读取失败: " + err.Error()})
-		return
-	}
-	data = tailLogWindow(data, startOffset)
 	keep := 1 // 普通任务写侧 RotateTaskLogBeforeWrite(..., 1)
 	if strings.HasPrefix(id, "cert-job:") {
 		keep = certJobLogMaxRotatedBackups

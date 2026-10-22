@@ -52,13 +52,65 @@ const parseCertificateSchema = `{"type":"object","required":["cert_pem","key_pem
 
 const updateNodeAccessURLSchema = `{"type":"object","required":["id","access_url"],"properties":{"id":{"type":"integer","description":"节点 ID"},"access_url":{"type":"string","description":"访问地址，允许空串（登录票据回退 protocol://ip:port）"}},"additionalProperties":true}`
 
-const updateCAProviderSchema = `{"type":"object","required":["id"],"properties":{"id":{"type":"integer","description":"CA ID"},"name":{"type":"string","description":"名称（≤100 字符）"},"provider":{"type":"string","enum":["letsencrypt","zerossl"]},"credentials":{"type":"string","description":"凭证 JSON 字符串（Let's Encrypt 必须为空字符串）"},"max_concurrent":{"type":"integer","description":"最大并发（≤100）"},"min_interval_ms":{"type":"integer","description":"最小间隔毫秒（≤60000）"},"enabled":{"type":"boolean"}},"additionalProperties":true}`
+const updateCAProviderSchema = `{"type":"object","required":["id"],"properties":{"id":{"type":"integer","description":"CA ID"},"name":{"type":"string","description":"名称（≤100 字符）"},"provider":{"type":"string","enum":["letsencrypt","zerossl"]},"credentials":{"type":"string","description":"凭证 JSON 字符串（Let's Encrypt 必须为空字符串）"},"max_concurrent":{"type":"integer","minimum":1,"maximum":100,"description":"最大并发（≤100）"},"min_interval_ms":{"type":"integer","minimum":0,"maximum":60000,"description":"最小间隔毫秒（≤60000）"},"enabled":{"type":"boolean"}},"additionalProperties":true}`
 
 const updateAdminTLSSchema = `{"type":"object","properties":{"enabled":{"type":"boolean","description":"省略=保持现值；false=禁用"},"mode":{"type":"string","enum":["selfsigned","upload"],"description":"证书来源"},"cert_file":{"type":"string","description":"证书 PEM（JSON 通道；multipart 通道为文件字段）"},"key_file":{"type":"string","description":"私钥 PEM（JSON 通道；multipart 通道为文件字段）"}},"additionalProperties":true}`
 
 const inspectAdminTLSSchema = `{"type":"object","required":["cert_file","key_file"],"properties":{"cert_file":{"type":"string","description":"证书 PEM（JSON 通道；multipart 通道为文件字段）"},"key_file":{"type":"string","description":"私钥 PEM（JSON 通道；multipart 通道为文件字段）"}},"additionalProperties":true}`
 
 const toggleTaskSchema = `{"type":"object","required":["id","enabled"],"properties":{"id":{"type":"string","description":"任务 ID（见 list_system_tasks）"},"enabled":{"type":"boolean","description":"true=恢复 false=停止"}}}`
+
+// —— 高风险写工具的 body 字段契约（与 REST 请求 struct 同字段名）——
+// 运行时 input schema 校验刻意未启用，schema 是 Agent 唯一构参契约：
+// 零字段契约只能靠工具描述猜字段名，错名由 REST 400 暴露。
+// additionalProperties:true 保留向前兼容（低频/新增字段不被挡）。
+
+// securityPolicyFieldsSchema 与 models.CreateSecurityPolicyRequest /
+// UpdateSecurityPolicyRequest 字段集同名（创建必填 name，更新全可选）。
+const securityPolicyFieldsSchema = `"name":{"type":"string","description":"策略名称"},"description":{"type":"string"},"mode":{"type":"string","enum":["off","detection","blocking","custom_only"],"description":"off=全关/detection=检测仅记录/blocking=拦截/custom_only=仅自定义规则"},"policy_type":{"type":"string","enum":["stage0","stage1","stage2","stage3"],"description":"缺省按内容自动推断；显式 mixed 拒绝（混合策略为存量兼容形态，请按阶段类型分别创建）；跨阶段内容推断为 mixed 同样 400"},"anomaly_threshold":{"type":"integer","description":"CRS 异常分阈值"},"trust_detection":{"type":"boolean","description":"仅 stage0 信任策略消费：false=直通上游零事件，true=保留检测记录"},"ip_acl_enabled":{"type":"boolean","description":"IP 访问控制开关"},"ip_acl_mode":{"type":"string","enum":["allow","deny"],"description":"IP 访问控制模式（缺省归一 deny）"},"ip_acl_list":{"type":"string","description":"内联 CIDR 数组 JSON 文本"},"ip_acl_list_refs":{"type":"string","description":"引用的 IP 地址列表 id 数组 JSON 文本"},"ip_whitelist_enabled":{"type":"boolean"},"ip_whitelist":{"type":"string","description":"IP 白名单（JSON 数组文本）"},"ip_blacklist":{"type":"string","description":"IP 黑名单（JSON 数组文本）"},"rate_limit_enabled":{"type":"boolean"},"rate_limit_rps":{"type":"integer","description":"限流请求速率（次/秒）"},"rate_limit_burst":{"type":"integer","description":"限流突发容量"},"geoip_mode":{"type":"string","description":"地域拦截模式（off=关闭）"},"geoip_countries":{"type":"string","description":"地域名单（JSON 数组文本）"},"geoip_crawler_exempt":{"type":"boolean","description":"地域拦截对已知爬虫豁免"},"geoip_crawler_engines":{"type":"string","description":"参与豁免的爬虫引擎（JSON 数组文本）"},"crs_rule_groups":{"type":"string","description":"启用的 CRS 规则组（JSON 数组文本）"},"crs_excluded_rules":{"type":"string","description":"排除的 CRS 规则 ID（JSON 数组文本）"},"custom_rules":{"type":"string","description":"自定义规则 ID 数组 JSON 文本"},"block_page_id":{"type":"integer","description":"拦截页面 ID（0=默认页）"},"block_status_code":{"type":"integer","description":"拦截状态码（0=默认 403）"},"waf_check_response":{"type":"boolean","description":"WAF 检查响应体"},"log_request_body":{"type":"boolean","description":"记录请求体（审计体积换取证）"},"enabled":{"type":"boolean"}`
+
+var createSecurityPolicySchema = `{"type":"object","required":["name"],"properties":{` + securityPolicyFieldsSchema + `},"additionalProperties":true}`
+var updateSecurityPolicySchema = `{"type":"object","required":["id"],"properties":{"id":{"type":"integer","description":"策略 ID"},` + securityPolicyFieldsSchema + `},"additionalProperties":true}`
+
+// customRuleFieldsSchema 与 validateSecurityCustomRule 校验同口径：
+// action 三值、score 五值、条件 target/operator 枚举均为后端硬校验。
+const customRuleFieldsSchema = `"name":{"type":"string","description":"规则名称（≤100 字符，禁控制字符与双引号）"},"description":{"type":"string","description":"规则描述（≤500 字符）"},"conditions":{"type":"array","minItems":1,"items":{"type":"object","required":["target","operator","pattern"],"properties":{"target":{"type":"string","enum":["uri","args","body","headers","user_agent"]},"operator":{"type":"string","enum":["contains","regex","equals","starts_with"]},"pattern":{"type":"string","description":"匹配模式"}}},"description":"匹配条件（AND 关系，至少一条）"},"action":{"type":"string","enum":["block","log","pass"]},"score":{"type":"integer","enum":[1,3,5,10,20],"description":"异常分值"},"enabled":{"type":"boolean","description":"创建省略=启用，显式 false=禁用；更新省略=保持现值"}`
+
+var createCustomRuleSchema = `{"type":"object","required":["name","conditions","action","score"],"properties":{` + customRuleFieldsSchema + `},"additionalProperties":true}`
+var updateCustomRuleSchema = `{"type":"object","required":["id"],"properties":{"id":{"type":"integer","description":"规则 ID"},` + customRuleFieldsSchema + `},"additionalProperties":true}`
+
+// blockPageFieldsSchema 与 validateBlockPagePayload 同口径（name/content
+// 必填、content ≤64KB、content_type 四值白名单缺省 text/html）。
+const blockPageFieldsSchema = `"name":{"type":"string","description":"拦截页名称（≤100 字符）"},"description":{"type":"string","description":"≤500 字符"},"content":{"type":"string","description":"拦截页内容（≤64KB）"},"content_type":{"type":"string","enum":["text/html; charset=utf-8","application/json; charset=utf-8","application/xml; charset=utf-8","text/plain; charset=utf-8"],"description":"缺省 text/html; charset=utf-8"}`
+
+var createBlockPageSchema = `{"type":"object","required":["name","content"],"properties":{` + blockPageFieldsSchema + `},"additionalProperties":true}`
+var updateBlockPageSchema = `{"type":"object","required":["id"],"properties":{"id":{"type":"integer","description":"页面 ID"},` + blockPageFieldsSchema + `},"additionalProperties":true}`
+
+// ipListFieldsSchema：entries 为 {value, remark} 对象数组的 JSON 文本；
+// 名称全局唯一（忽略大小写）、≤50 字符。
+const ipListFieldsSchema = `"name":{"type":"string","description":"名单名称（≤50 字符，全局唯一忽略大小写）"},"description":{"type":"string"},"category":{"type":"string","description":"分类"},"entries":{"type":"string","description":"条目 JSON 文本：[{\"value\":\"10.0.0.0/8\",\"remark\":\"备注\"}]（创建/全量替换用；单条处置用 add_ip_to_list/remove_ip_from_list）"}`
+
+var createIPListSchema = `{"type":"object","required":["name"],"properties":{` + ipListFieldsSchema + `},"additionalProperties":true}`
+var updateIPListSchema = `{"type":"object","required":["id"],"properties":{"id":{"type":"integer","description":"列表 ID"},` + ipListFieldsSchema + `},"additionalProperties":true}`
+
+// certificateConfigFieldsSchema 与 models.Create/UpdateCertificateConfigRequest
+// 同字段名；dns_credentials 为字段名→值的映射（键面由 list_dns_providers 给出）。
+const certificateConfigFieldsSchema = `"name":{"type":"string","description":"配置名称"},"dns_provider":{"type":"string","description":"DNS 提供商代码（见 list_dns_providers）"},"dns_credentials":{"type":"object","additionalProperties":{"type":"string"},"description":"凭证键值映射（更新时回传掩码串按未改动处理）"},"enabled":{"type":"boolean"}`
+
+var createCertificateConfigSchema = `{"type":"object","required":["name","dns_provider"],"properties":{` + certificateConfigFieldsSchema + `},"additionalProperties":true}`
+var updateCertificateConfigSchema = `{"type":"object","required":["id"],"properties":{"id":{"type":"integer","description":"配置 ID"},` + certificateConfigFieldsSchema + `},"additionalProperties":true}`
+
+const createUserSchema = `{"type":"object","required":["username","password","role"],"properties":{"username":{"type":"string","description":"用户名（3-50 字符）"},"password":{"type":"string","description":"初始密码（≤72 字符）"},"role":{"type":"string","enum":["admin","user"]},"display_name":{"type":"string","description":"显示名（≤50 字符）"}},"additionalProperties":true}`
+const updateUserSchema = `{"type":"object","required":["id"],"properties":{"id":{"type":"integer","description":"用户 ID"},"username":{"type":"string"},"role":{"type":"string","enum":["admin","user"]},"display_name":{"type":"string"},"password":{"type":"string","description":"新密码（省略=不修改）"}},"additionalProperties":true}`
+
+const createAPIKeySchema = `{"type":"object","required":["name"],"properties":{"name":{"type":"string","description":"密钥名称"},"expires_at":{"type":["string","null"],"description":"过期时间（RFC3339），null=永不过期"},"mcp_enabled":{"type":"boolean","description":"允许该 Key 调 MCP"},"read_only":{"type":"boolean","description":"只读 Key（仅查询与读探测工具）"},"mcp_ip_whitelist":{"type":"array","items":{"type":"string"},"description":"来源 IP 白名单（CIDR，约束该 Key 的全部 REST 与 MCP 调用）"}},"additionalProperties":true}`
+const updateAPIKeyStatusSchema = `{"type":"object","required":["id"],"properties":{"id":{"type":"integer","description":"密钥 ID"},"is_enabled":{"type":"boolean"},"mcp_enabled":{"type":"boolean"},"read_only":{"type":"boolean"},"mcp_ip_whitelist":{"type":"array","items":{"type":"string"},"description":"来源 IP 白名单（CIDR）"}},"additionalProperties":true,"description":"四个字段均可选但至少提交一个"}`
+
+const previewConfigSchema = `{"type":"object","properties":{"source":{"type":"string","description":"配置分区标识（如 caddy/basic/security，分区字段清单同 update_config）"}},"additionalProperties":true,"description":"预览配置变更（不写库不触发 Caddy）；分区字段同 update_config 的 properties"}`
+const validateConfigSchema = `{"type":"object","description":"完整 Caddy 配置 JSON 本体（无固定子集——校验目标是任意 Caddy 配置）","additionalProperties":true}`
+const updateCaddyConfigSchema = `{"type":"object","description":"完整 Caddy 配置 JSON 本体（一次性逃生口：后续任何配置变更以数据库权威配置覆盖它）","additionalProperties":true}`
+const configImportSchema = `{"type":"object","properties":{"meta":{"type":"object","description":"备份元信息（app/version）"},"config":{"type":"object","description":"全局配置段"},"tables":{"type":"object","description":"分表数据段"},"sections":{"type":"array","items":{"type":"string"},"description":"可选导入分类子集（JSON 备份形态）"}},"additionalProperties":true,"description":"v2 配置备份 JSON；lbbak 二进制备份与超过 1 MiB 网关上限的备份请走 REST /config/import 或管理面板"}`
+const importV1ConfigSchema = `{"type":"object","description":"v1（nginx 版）备份 JSON 整体作为请求体（仅导入负载规则部分；覆盖导入会清理旧规则及其安全策略绑定）","additionalProperties":true}`
 
 var tools = []toolSpec{
 	{"list_rules", "列出全部负载均衡规则", http.MethodGet, "/rules", nil, nil, emptySchema},
@@ -77,7 +129,7 @@ var tools = []toolSpec{
 	{"get_config", "读取全局配置", http.MethodGet, "/config", nil, nil, emptySchema},
 	{"update_config", "更新全局配置并应用 Caddy", http.MethodPut, "/config", nil, nil, updateConfigSchema},
 	{"reload_caddy", "从数据库重新生成并加载 Caddy 配置", http.MethodPost, "/config/reload", nil, nil, emptySchema},
-	{"export_config", "导出完整配置备份", http.MethodGet, "/config/export", nil, nil, emptySchema},
+	{"export_config", "导出完整配置备份（lbbak 二进制 tar.gz；MCP 通道不支持二进制下载，本工具恒返回面板/REST 下载指引）", http.MethodGet, "/config/export", nil, nil, emptySchema},
 	{"get_metrics_dashboard", "获取聚合监控面板指标", http.MethodGet, "/metrics/dashboard", nil, nil, emptySchema},
 	{"get_metrics_overview", "获取指标总览", http.MethodGet, "/metrics/overview", nil, nil, emptySchema},
 	{"get_realtime_traffic", "获取实时流量", http.MethodGet, "/metrics/realtime", nil, nil, emptySchema},
@@ -107,39 +159,43 @@ var tools = []toolSpec{
 	{"get_ip2region_update_logs", "获取 IP2Region 更新日志", http.MethodGet, "/security/ip2region/update/logs", nil, nil, emptySchema},
 	{"get_rate_limit_blocks", "获取限流拦截统计", http.MethodGet, "/security/rate-limit-blocks", nil, nil, emptySchema},
 	{"get_rule_stage_stats", "获取单规则三阶段安全统计（阶段 1/3 近 24h 拦截数+限流重载口径计数）", http.MethodGet, "/security/rules/{caddy_id}/stage-stats", []string{"caddy_id"}, nil, idSchema("caddy_id", "规则 Caddy ID", "string")},
-	{"create_security_policy", "创建安全策略（WAF 模式/CRS/IP ACL/GeoIP/限流/拦截页面）", http.MethodPost, "/security/policies", nil, nil, bodySchema},
-	{"update_security_policy", "更新指定安全策略", http.MethodPut, "/security/policies/{id}", []string{"id"}, nil, bodySchemaWithID("策略 ID")},
+	{"create_security_policy", "创建安全策略（WAF 模式/CRS/IP ACL/GeoIP/限流/拦截页面）", http.MethodPost, "/security/policies", nil, nil, createSecurityPolicySchema},
+	{"update_security_policy", "更新指定安全策略", http.MethodPut, "/security/policies/{id}", []string{"id"}, nil, updateSecurityPolicySchema},
 	{"delete_security_policy", "删除指定安全策略", http.MethodDelete, "/security/policies/{id}", []string{"id"}, nil, idSchema("id", "策略 ID", "integer")},
-	{"bind_security_policy", "将安全策略绑定到指定规则", http.MethodPost, "/security/policies/{id}/bind", []string{"id"}, nil, bodySchemaWithID("策略 ID")},
-	// DELETE 请求体恒被后端丢弃——bodySchema(任意字段放行)会误导
+	{"bind_security_policy", "将安全策略绑定到指定规则", http.MethodPost, "/security/policies/{id}/bind", []string{"id"}, nil, `{"type":"object","required":["id","rule_caddy_id"],"properties":{"id":{"type":"integer","description":"策略 ID"},"rule_caddy_id":{"type":"string","description":"规则 Caddy ID（additive 绑定，不覆盖已有绑定）"}},"additionalProperties":false}`},
+	// DELETE 请求体恒被后端丢弃——宽松 body schema(任意字段放行)会误导
 	// Agent 构造无效 body;换成路径参数契约形态(required id+caddy_id,
 	// forward 按 pathArgs 从 arguments 取值)。
 	{"unbind_security_policy", "解除安全策略与规则的绑定", http.MethodDelete, "/security/policies/{id}/bind/{caddy_id}", []string{"id", "caddy_id"}, nil, `{"type":"object","required":["id","caddy_id"],"properties":{"id":{"type":"integer","description":"策略 ID"},"caddy_id":{"type":"string","description":"规则 Caddy ID"}},"additionalProperties":false}`},
 	// v2.2.0 多策略绑定：原子替换规则绑定的策略集合（整体替换而非追加），
 	// policy_ids maxItems=8 与后端 maxBindingsPerRule 校验对齐。
 	{"set_rule_security_policies", "原子设置规则的安全策略集合（按 policy_id ASC 顺序评估）", http.MethodPut, "/security/rules/{caddy_id}/policies", []string{"caddy_id"}, nil, setRuleSecurityPoliciesSchema},
-	{"create_custom_rule", "创建自定义安全规则", http.MethodPost, "/security/custom-rules", nil, nil, bodySchema},
-	{"update_custom_rule", "更新指定自定义安全规则", http.MethodPut, "/security/custom-rules/{id}", []string{"id"}, nil, bodySchemaWithID("规则 ID")},
+	{"create_custom_rule", "创建自定义安全规则", http.MethodPost, "/security/custom-rules", nil, nil, createCustomRuleSchema},
+	{"update_custom_rule", "更新指定自定义安全规则", http.MethodPut, "/security/custom-rules/{id}", []string{"id"}, nil, updateCustomRuleSchema},
 	{"delete_custom_rule", "删除指定自定义安全规则", http.MethodDelete, "/security/custom-rules/{id}", []string{"id"}, nil, idSchema("id", "规则 ID", "integer")},
-	{"create_block_page", "创建拦截页面", http.MethodPost, "/security/block-pages", nil, nil, bodySchema},
-	{"update_block_page", "更新指定拦截页面", http.MethodPut, "/security/block-pages/{id}", []string{"id"}, nil, bodySchemaWithID("页面 ID")},
+	{"create_block_page", "创建拦截页面", http.MethodPost, "/security/block-pages", nil, nil, createBlockPageSchema},
+	{"update_block_page", "更新指定拦截页面", http.MethodPut, "/security/block-pages/{id}", []string{"id"}, nil, updateBlockPageSchema},
 	{"delete_block_page", "删除指定拦截页面", http.MethodDelete, "/security/block-pages/{id}", []string{"id"}, nil, idSchema("id", "页面 ID", "integer")},
 	{"list_ip_lists", "列出全部 IP 地址列表", http.MethodGet, "/security/ip-lists", nil, nil, emptySchema},
 	// v2.3.2 名单瘦身后 list_ip_lists 仅含 entry_count，
 	// 读条目唯一通道是 GET /security/ip-lists/:id——补工具覆盖，免豁免。
 	{"get_ip_list", "获取指定 IP 地址列表详情（含全部条目）", http.MethodGet, "/security/ip-lists/{id}", []string{"id"}, nil, idSchema("id", "列表 ID", "integer")},
-	{"create_ip_list", "创建 IP 地址列表", http.MethodPost, "/security/ip-lists", nil, nil, bodySchema},
-	{"update_ip_list", "更新指定 IP 地址列表", http.MethodPut, "/security/ip-lists/{id}", []string{"id"}, nil, bodySchemaWithID("列表 ID")},
+	{"create_ip_list", "创建 IP 地址列表", http.MethodPost, "/security/ip-lists", nil, nil, createIPListSchema},
+	{"update_ip_list", "更新指定 IP 地址列表", http.MethodPut, "/security/ip-lists/{id}", []string{"id"}, nil, updateIPListSchema},
 	{"delete_ip_list", "删除指定 IP 地址列表", http.MethodDelete, "/security/ip-lists/{id}", []string{"id"}, nil, idSchema("id", "列表 ID", "integer")},
 	// （2026-09 审计）：安全事件处置工作流——单条追加幂等（已存在返回
 	// added=false），免去 Agent 读全表-改-全量替换的竞态路径。
 	{"add_ip_to_list", "向 IP 地址列表追加单条 IP/CIDR（安全事件处置用，幂等；内置威胁名单只读返回 400）", http.MethodPost, "/security/ip-lists/{id}/ips", []string{"id"}, nil, `{"type":"object","required":["id","value"],"properties":{"id":{"type":"integer","description":"列表 ID"},"value":{"type":"string","description":"IP 或 CIDR，如 203.0.113.7 或 10.0.0.0/8。remark 无需提交：自定义名单固定为「事件处置」，自动封禁预置名单固定为「手动封禁」（任务挤出豁免判据）"}},"additionalProperties":false}`},
+	// 封禁处置闭环的解封原语：幂等单条移除（value 不在名单返回 removed=false）。
+	// 不得用 get_ip_list+update_ip_list 读-改-全量写回替代——自动封禁任务并发
+	// 向同一名单写入时全量回写会覆盖并发新增（丢失封禁条目）。
+	{"remove_ip_from_list", "从 IP 地址列表移除单条 IP/CIDR（解封/误封处置，幂等；内置威胁名单只读返回 400）", http.MethodPost, "/security/ip-lists/{id}/remove-ip", []string{"id"}, nil, `{"type":"object","required":["id","value"],"properties":{"id":{"type":"integer","description":"列表 ID"},"value":{"type":"string","description":"要移除的 IP 或 CIDR，如 203.0.113.7 或 10.0.0.0/8"}},"additionalProperties":false}`},
 	{"toggle_crs_auto_update", "开关 CRS 自动更新", http.MethodPut, "/security/crs/auto-update", nil, nil, toggleAutoUpdateSchema},
 	{"trigger_crs_update", "手动触发 CRS 规则库更新", http.MethodPost, "/security/crs/update", nil, nil, emptySchema},
 	{"toggle_ip2region_auto_update", "开关 IP2Region 自动更新", http.MethodPut, "/security/ip2region/auto-update", nil, nil, toggleAutoUpdateSchema},
 	{"trigger_ip2region_update", "手动触发 IP2Region 数据库更新", http.MethodPost, "/security/ip2region/update", nil, nil, emptySchema},
 	{"list_cluster_nodes", "列出全部集群节点", http.MethodGet, "/cluster/nodes", nil, nil, emptySchema},
-	{"create_register_token", "生成集群注册令牌", http.MethodPost, "/cluster/register-tokens", nil, nil, bodySchema},
+	{"create_register_token", "生成集群注册令牌（无需请求体；明文仅返回一次，30 分钟过期）", http.MethodPost, "/cluster/register-tokens", nil, nil, emptySchema},
 	{"approve_cluster_node", "审批通过从节点注册", http.MethodPost, "/cluster/nodes/{id}/approve", []string{"id"}, nil, idSchema("id", "节点 ID", "integer")},
 	{"reject_cluster_node", "拒绝从节点注册", http.MethodPost, "/cluster/nodes/{id}/reject", []string{"id"}, nil, idSchema("id", "节点 ID", "integer")},
 	{"create_login_ticket", "为从节点生成登录票据（操作者账户必须已启用 MFA，否则 403；人类 JWT 路径还需 60 秒内通过 MFA 验证（428 step-up），API Key/MCP 路径仅豁免该验证窗口）", http.MethodPost, "/cluster/nodes/{id}/login-ticket", []string{"id"}, nil, idSchema("id", "节点 ID", "integer")},
@@ -161,8 +217,8 @@ var tools = []toolSpec{
 	{"control_system_task", "常驻任务控制（action=start|stop|restart 均可用；常驻任务的启停也可经 toggle_system_task 的 enabled 实现，control 额外提供 restart 组合动作）", http.MethodPost, "/system/tasks/{id}/control", []string{"id"}, nil, controlTaskSchema},
 	{"update_cluster_settings", "更新集群同步设置", http.MethodPut, "/cluster/settings", nil, nil, updateClusterSettingsSchema},
 	{"list_certificate_configs", "列出全部 DNS 证书配置", http.MethodGet, "/certificate-configs", nil, nil, emptySchema},
-	{"create_certificate_config", "创建 DNS 证书配置", http.MethodPost, "/certificate-configs", nil, nil, bodySchema},
-	{"update_certificate_config", "更新指定 DNS 证书配置", http.MethodPut, "/certificate-configs/{id}", []string{"id"}, nil, bodySchemaWithID("配置 ID")},
+	{"create_certificate_config", "创建 DNS 证书配置", http.MethodPost, "/certificate-configs", nil, nil, createCertificateConfigSchema},
+	{"update_certificate_config", "更新指定 DNS 证书配置", http.MethodPut, "/certificate-configs/{id}", []string{"id"}, nil, updateCertificateConfigSchema},
 	{"delete_certificate_config", "删除指定 DNS 证书配置", http.MethodDelete, "/certificate-configs/{id}", []string{"id"}, nil, idSchema("id", "配置 ID", "integer")},
 	// handler 要求 body 携带 domain（测试用的域名）——此前
 	// schema 只有 id（additionalProperties:false），经 MCP 调用恒 400「请求参数
@@ -176,20 +232,20 @@ var tools = []toolSpec{
 	{"get_cert_job", "获取指定证书签发任务详情", http.MethodGet, "/certificates/jobs/{id}", []string{"id"}, nil, idSchema("id", "任务 ID", "integer")},
 	{"get_cert_job_logs", "获取指定证书签发任务日志", http.MethodGet, "/certificates/jobs/{id}/logs", []string{"id"}, nil, idSchema("id", "任务 ID", "integer")},
 	{"parse_certificate", "解析上传的证书内容", http.MethodPost, "/certificates/parse", nil, nil, parseCertificateSchema},
-	{"create_user", "创建用户", http.MethodPost, "/users", nil, nil, bodySchema},
-	{"update_user", "更新指定用户", http.MethodPut, "/users/{id}", []string{"id"}, nil, bodySchemaWithID("用户 ID")},
+	{"create_user", "创建用户", http.MethodPost, "/users", nil, nil, createUserSchema},
+	{"update_user", "更新指定用户", http.MethodPut, "/users/{id}", []string{"id"}, nil, updateUserSchema},
 	{"toggle_user_status", "启用/禁用指定用户", http.MethodPut, "/users/{id}/status", []string{"id"}, nil, toggleUserStatusSchema},
 	{"reset_user_password", "重置指定用户密码", http.MethodPost, "/users/{id}/reset-password", []string{"id"}, nil, idSchema("id", "用户 ID", "integer")},
 	{"delete_user", "删除指定用户", http.MethodDelete, "/users/{id}", []string{"id"}, nil, idSchema("id", "用户 ID", "integer")},
 	{"reset_user_mfa", "重置用户 MFA（仅管理员；操作者已启用 MFA 时须提交本人 6 位动态验证码，未启用传空串——MCP/API Key 路径不走 428 step-up，直接在本接口验码）", http.MethodPost, "/users/{id}/mfa/reset", []string{"id"}, nil, `{"type":"object","required":["id","code"],"properties":{"id":{"type":"integer","description":"用户 ID"},"code":{"type":"string","description":"操作者自己的 6 位 MFA 动态验证码；操作者未启用 MFA 时传空串"}},"additionalProperties":false}`},
-	{"create_api_key", "创建 API 密钥", http.MethodPost, "/api-keys", nil, nil, bodySchema},
-	{"update_api_key_status", "更新 API 密钥状态（启用/只读/MCP 开关）", http.MethodPatch, "/api-keys/{id}/status", []string{"id"}, nil, bodySchemaWithID("密钥 ID")},
+	{"create_api_key", "创建 API 密钥", http.MethodPost, "/api-keys", nil, nil, createAPIKeySchema},
+	{"update_api_key_status", "更新 API 密钥状态（启用/只读/MCP 开关）", http.MethodPatch, "/api-keys/{id}/status", []string{"id"}, nil, updateAPIKeyStatusSchema},
 	{"delete_api_key", "删除指定 API 密钥", http.MethodDelete, "/api-keys/{id}", []string{"id"}, nil, idSchema("id", "密钥 ID", "integer")},
-	{"preview_config", "预览配置变更（不应用）", http.MethodPost, "/config/preview", nil, nil, bodySchema},
-	{"validate_config", "验证配置文件有效性", http.MethodPost, "/config/validate", nil, nil, bodySchema},
-	{"import_config", "导入 v2 配置备份", http.MethodPost, "/config/import", nil, nil, bodySchema},
-	{"validate_import", "验证导入文件（不写入）", http.MethodPost, "/config/import/validate", nil, nil, bodySchema},
-	{"import_v1_config", "导入 v1（nginx）配置", http.MethodPost, "/config/import/v1", nil, nil, bodySchema},
+	{"preview_config", "预览配置变更（不应用）", http.MethodPost, "/config/preview", nil, nil, previewConfigSchema},
+	{"validate_config", "验证配置文件有效性", http.MethodPost, "/config/validate", nil, nil, validateConfigSchema},
+	{"import_config", "导入 v2 配置备份", http.MethodPost, "/config/import", nil, nil, configImportSchema},
+	{"validate_import", "验证导入文件（不写入）", http.MethodPost, "/config/import/validate", nil, nil, configImportSchema},
+	{"import_v1_config", "导入 v1（nginx）配置", http.MethodPost, "/config/import/v1", nil, nil, importV1ConfigSchema},
 	{"get_rule_logs", "获取指定规则的访问日志（最近 1000 行尾读，无 offset 续读）", http.MethodGet, "/rules/{caddy_id}/logs", []string{"caddy_id"}, nil, idSchema("caddy_id", "规则 Caddy ID", "string")},
 	{"get_rule_caddy_config", "获取指定规则的 Caddy 配置片段", http.MethodGet, "/rules/{caddy_id}/caddy-config", []string{"caddy_id"}, nil, idSchema("caddy_id", "规则 Caddy ID", "string")},
 	{"get_rule_metrics_history", "获取指定规则的历史指标（range 选窗 1h/6h/24h/7d；跨规则全局趋势用 get_metrics_history）", http.MethodGet, "/rules/{caddy_id}/metrics-history", []string{"caddy_id"}, []string{"range"}, ruleMetricsHistorySchema},
@@ -197,7 +253,7 @@ var tools = []toolSpec{
 	{"get_caddy_status", "获取 Caddy 运行状态", http.MethodGet, "/caddy/status", nil, nil, emptySchema},
 	{"get_caddy_config", "获取 Caddy 当前配置", http.MethodGet, "/caddy/config", nil, nil, emptySchema},
 	{"get_caddy_logs", "获取 Caddy 日志", http.MethodGet, "/caddy/logs", nil, []string{"type"}, caddyLogsSchema},
-	{"update_caddy_config", "直接更新 Caddy 配置", http.MethodPut, "/caddy/config", nil, nil, bodySchema},
+	{"update_caddy_config", "直接更新 Caddy 配置", http.MethodPut, "/caddy/config", nil, nil, updateCaddyConfigSchema},
 	{"start_caddy", "启动 Caddy", http.MethodPost, "/caddy/start", nil, nil, emptySchema},
 	{"stop_caddy", "停止 Caddy", http.MethodPost, "/caddy/stop", nil, nil, emptySchema},
 	{"restart_caddy", "重启 Caddy", http.MethodPost, "/caddy/restart", nil, nil, emptySchema},
@@ -213,7 +269,6 @@ var tools = []toolSpec{
 }
 
 const emptySchema = `{"type":"object","properties":{},"additionalProperties":false}`
-const bodySchema = `{"type":"object","additionalProperties":true}`
 const maxResponseSize = 4 << 20
 const InternalAuthHeader = "X-Lazy-Balancer-Internal-MCP-Auth"
 
@@ -266,7 +321,7 @@ const serverInstructions = `Lazy Balancer V2 负载均衡管理接口。认证�
 - 快速看全局指标：get_metrics_overview（轻量）；get_metrics_dashboard 为全量聚合，数据量大，非必要不用
 - 修改规则前先 get_rule 取完整现状；delete_rule 不可恢复，调用前必须确认
 
-错误约定：401=密钥无效/缺失或使用 JWT；403=未开启 MCP/IP 白名单拦截/只读 Key 越权/从节点非集群写工具；参数校验在 REST 侧执行，业务错误以 IsError+文本返回（含具体 message，读后修正重试）；协议层暂不启用 input_schema 校验（不产生 -32602），schema 仅作构参契约——先读 schema 再调用，不要猜测字段名。
+错误约定：401=密钥无效/缺失或使用 JWT；403=未开启 MCP/IP 白名单拦截/只读 Key 越权/从节点非集群写工具；缺参/缺密钥/传输失败与 REST 业务错误均以 IsError+文本返回（含具体 message，读后修正重试）；协议层暂不启用 input_schema 校验（不产生 -32602），schema 仅作构参契约——先读 schema 再调用，不要猜测字段名。
 
 完整操作手册：resources/read 读取 lazy-balancer://docs/ops-playbook（接入/scope/工作流/排障/纪律/性能建议）。`
 
@@ -286,9 +341,9 @@ func toolDescription(spec toolSpec) string {
 	return spec.description
 }
 
-const createRuleSchema = `{"type":"object","required":["name","protocol","listen_port","upstreams"],"properties":{"name":{"type":"string"},"description":{"type":"string"},"protocol":{"type":"string","enum":["http","tcp"]},"domain":{"type":"string"},"listen_port":{"type":"integer","minimum":1,"maximum":65535},"enabled":{"type":"boolean","description":"缺省=创建即启用；显式 false=创建为禁用"},"strategy":{"type":"string","enum":["weighted_round_robin","ip_hash","least_conn","random","first","cookie"],"description":"负载策略。HTTP 六值全集；TCP 规则不支持 cookie（后端将拒绝，保存前请改用其余五值）"},"ntlm_compatible":{"type":"integer","enum":[0,1],"description":"NTLM 兼容开关，仅 HTTP 规则可用；1=开启（要求 strategy=cookie，后端将拒绝其余策略；TCP 规则携带即拒）"},"upstream_force_http1":{"type":"integer","enum":[0,1],"description":"上游强制 HTTP/1.1（通用列，仅 HTTP 规则渲染生效；https 上游禁 ALPN h2）。后端不支持 HTTP/2 或使用 NTLM 认证时开启"},"dynamic_dns":{"type":"boolean"},"enable_dns_server":{"type":"boolean"},"dns_server":{"type":"string"},"dns_family":{"type":"string","enum":["ipv4","ipv6","both"]},"health_check_path":{"type":"string"},"health_check_interval":{"type":"integer"},"health_check_timeout":{"type":"integer"},"health_check_unhealthy_threshold":{"type":"integer"},"health_check_healthy_threshold":{"type":"integer"},"enable_active_health_check":{"type":"boolean"},"health_check_host":{"type":"string","description":"健康检查域名：主动健康检查请求的 Host 头（纯主机名不带端口）；空=跟随 host_header"},"tcp_health_check_port":{"type":"integer"},"tcp_proxy_protocol":{"type":"boolean"},"tcp_try_duration":{"type":"integer"},"tcp_try_interval":{"type":"integer"},"request_body_max_size_mb":{"type":"integer"},"upstream_keepalive_timeout":{"type":"integer"},"server_tokens_hidden":{"type":"integer"},"custom_routes_enabled":{"type":"boolean"},"proxy_dial_timeout":{"type":"integer","minimum":0},"proxy_response_header_timeout":{"type":"integer","minimum":0},"proxy_read_timeout":{"type":"integer","minimum":0},"proxy_write_timeout":{"type":"integer","minimum":0},"proxy_stream_timeout":{"type":"integer","minimum":0},"proxy_flush_interval":{"type":"integer","minimum":-1},"proxy_stream_close_delay":{"type":"integer","minimum":0},"path_rules":{"type":"array","items":{"type":"object","required":["match_type","path"],"properties":{"id":{"type":"integer"},"sort_order":{"type":"integer"},"match_type":{"type":"string","enum":["prefix","exact"]},"path":{"type":"string"},"upstream_path":{"type":"string"},"response_mode":{"type":"string","enum":["","static","redirect"]},"response_status":{"type":"integer"},"response_body":{"type":"string","maxLength":64},"response_content_type":{"type":"string","enum":["","text/plain","application/json","text/html"]},"redirect_to":{"type":"string"},"upstreams":{"type":"array","items":{"type":"object","required":["address","port"],"properties":{"address":{"type":"string"},"port":{"type":"integer","minimum":1,"maximum":65535},"weight":{"type":"integer","minimum":1},"protocol":{"type":"string","description":"http 或 https；省略=http"}}}}},"description":"路径规则：match_type/path/upstream_path/upstreams；另支持 response_mode 直返/跳转（2026-10-10）——static=静态响应（response_status 常用码，0=缺省 200/response_body ≤64 字符/response_content_type text/plain|application/json|text/html，空=缺省 text/plain），redirect=301+redirect_to 目标（须 http(s):// 绝对地址或 / 开头路径，禁控制字符）；互斥：直返/跳转与 upstreams/upstream_path 互斥、static 与 redirect_to 互斥、redirect 与 response_body/response_content_type 互斥"}},"host_header":{"type":"string"},"upstreams":{"type":"array","items":{"type":"object","required":["host","port"],"properties":{"host":{"type":"string"},"port":{"type":"integer"},"weight":{"type":"integer","minimum":1},"enabled":{"type":"boolean"},"protocol":{"type":"string"},"max_connections":{"type":"integer"},"origin_domain":{"type":"string","description":"该上游独立的回源 Host 头与 HTTPS SNI（纯主机名不带端口）；空=跟随规则 host_header；dynamic_dns 规则与 TCP 规则不支持"}}}},"enable_tls":{"type":"boolean"},"tls_source":{"type":"string","enum":["manual","acme_dns"],"description":"证书来源：manual=手动上传证书/私钥（tls_cert/tls_key），acme_dns=ACME DNS 验证签发（需 acme_config_id）"},"block_page_stage1_id":{"type":"integer","description":"阶段 1（IP 预检）拦截页面 ID，0=跟随全局/策略"},"block_page_stage1_status":{"type":"integer","description":"阶段 1 拦截状态码（0=默认 403）"},"block_page_stage3_id":{"type":"integer","description":"阶段 3（WAF）拦截页面 ID，0=跟随全局/策略"},"block_page_stage3_status":{"type":"integer","description":"阶段 3 拦截状态码（0=默认 403）"},"acme_config_id":{"type":"integer"},"ca_provider_id":{"type":"integer"},"tls_cert":{"type":"string"},"tls_key":{"type":"string"},"tls_http_redirect":{"type":"boolean"},"enable_compress":{"type":"boolean"},"compress_types":{"type":"string"},"log_enabled":{"type":"boolean"}},"additionalProperties":false}`
+const createRuleSchema = `{"type":"object","required":["name","protocol","listen_port","upstreams"],"properties":{"name":{"type":"string"},"description":{"type":"string"},"protocol":{"type":"string","enum":["http","tcp"]},"domain":{"type":"string"},"listen_port":{"type":"integer","minimum":1,"maximum":65535},"enabled":{"type":"boolean","description":"缺省=创建即启用；显式 false=创建为禁用"},"strategy":{"type":"string","enum":["weighted_round_robin","ip_hash","least_conn","random","first","cookie"],"description":"负载策略。HTTP 六值全集；TCP 规则不支持 cookie（后端将拒绝，保存前请改用其余五值）"},"ntlm_compatible":{"type":"integer","enum":[0,1],"description":"NTLM 兼容开关，仅 HTTP 规则可用；1=开启（要求 strategy=cookie，后端将拒绝其余策略；TCP 规则携带即拒）"},"upstream_force_http1":{"type":"integer","enum":[0,1],"description":"上游强制 HTTP/1.1（通用列，仅 HTTP 规则渲染生效；https 上游禁 ALPN h2）。后端不支持 HTTP/2 或使用 NTLM 认证时开启"},"dynamic_dns":{"type":"boolean"},"enable_dns_server":{"type":"boolean"},"dns_server":{"type":"string"},"dns_family":{"type":"string","enum":["ipv4","ipv6","both"]},"health_check_path":{"type":"string"},"health_check_interval":{"type":"integer"},"health_check_timeout":{"type":"integer"},"health_check_unhealthy_threshold":{"type":"integer"},"health_check_healthy_threshold":{"type":"integer"},"enable_active_health_check":{"type":"boolean"},"health_check_host":{"type":"string","description":"健康检查域名：主动健康检查请求的 Host 头（纯主机名不带端口）；空=跟随 host_header"},"tcp_health_check_port":{"type":"integer"},"tcp_proxy_protocol":{"type":"boolean"},"tcp_try_duration":{"type":"integer"},"tcp_try_interval":{"type":"integer"},"request_body_max_size_mb":{"type":"integer"},"upstream_keepalive_timeout":{"type":"integer"},"server_tokens_hidden":{"type":"integer","enum":[0,1,2],"description":"Server 头隐藏级别：0=显示/1=隐藏版本/2=完全隐藏"},"custom_routes_enabled":{"type":"boolean"},"proxy_dial_timeout":{"type":"integer","minimum":0},"proxy_response_header_timeout":{"type":"integer","minimum":0},"proxy_read_timeout":{"type":"integer","minimum":0},"proxy_write_timeout":{"type":"integer","minimum":0},"proxy_stream_timeout":{"type":"integer","minimum":0},"proxy_flush_interval":{"type":"integer","minimum":-1},"proxy_stream_close_delay":{"type":"integer","minimum":0},"path_rules":{"type":"array","items":{"type":"object","required":["match_type","path"],"properties":{"id":{"type":"integer"},"sort_order":{"type":"integer"},"match_type":{"type":"string","enum":["prefix","exact"]},"path":{"type":"string"},"upstream_path":{"type":"string"},"response_mode":{"type":"string","enum":["","static","redirect"]},"response_status":{"type":"integer"},"response_body":{"type":"string","maxLength":64},"response_content_type":{"type":"string","enum":["","text/plain","application/json","text/html"]},"redirect_to":{"type":"string"},"upstreams":{"type":"array","items":{"type":"object","required":["address","port"],"properties":{"address":{"type":"string"},"port":{"type":"integer","minimum":1,"maximum":65535},"weight":{"type":"integer","minimum":1},"protocol":{"type":"string","description":"http 或 https；省略=http"}}}}},"description":"路径规则：match_type/path/upstream_path/upstreams；另支持 response_mode 直返/跳转（2026-10-10）——static=静态响应（response_status 常用码，0=缺省 200/response_body ≤64 字符/response_content_type text/plain|application/json|text/html，空=缺省 text/plain），redirect=301+redirect_to 目标（须 http(s):// 绝对地址或 / 开头路径，禁控制字符）；互斥：直返/跳转与 upstreams/upstream_path 互斥、static 与 redirect_to 互斥、redirect 与 response_body/response_content_type 互斥"}},"host_header":{"type":"string"},"upstreams":{"type":"array","items":{"type":"object","required":["host","port"],"properties":{"host":{"type":"string"},"port":{"type":"integer","minimum":1,"maximum":65535},"weight":{"type":"integer","minimum":1},"enabled":{"type":"boolean"},"protocol":{"type":"string"},"max_connections":{"type":"integer"},"origin_domain":{"type":"string","description":"该上游独立的回源 Host 头与 HTTPS SNI（纯主机名不带端口）；空=跟随规则 host_header；dynamic_dns 规则与 TCP 规则不支持"}}}},"enable_tls":{"type":"boolean"},"tls_source":{"type":"string","enum":["manual","acme_dns"],"description":"证书来源：manual=手动上传证书/私钥（tls_cert/tls_key），acme_dns=ACME DNS 验证签发（需 acme_config_id）"},"block_page_stage1_id":{"type":"integer","description":"阶段 1（IP 预检）拦截页面 ID，0=跟随全局/策略"},"block_page_stage1_status":{"type":"integer","description":"阶段 1 拦截状态码（0=默认 403）"},"block_page_stage3_id":{"type":"integer","description":"阶段 3（WAF）拦截页面 ID，0=跟随全局/策略"},"block_page_stage3_status":{"type":"integer","description":"阶段 3 拦截状态码（0=默认 403）"},"acme_config_id":{"type":"integer"},"ca_provider_id":{"type":"integer"},"tls_cert":{"type":"string"},"tls_key":{"type":"string"},"tls_http_redirect":{"type":"boolean"},"enable_compress":{"type":"boolean"},"compress_types":{"type":"string"},"log_enabled":{"type":"boolean"}},"additionalProperties":false}`
 
-const updateRuleSchema = `{"type":"object","required":["caddy_id"],"properties":{"caddy_id":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"protocol":{"type":"string"},"domain":{"type":"string"},"listen_port":{"type":"integer"},"strategy":{"type":"string","enum":["weighted_round_robin","ip_hash","least_conn","random","first","cookie"],"description":"负载策略。HTTP 六值全集；TCP 规则不支持 cookie（后端将拒绝，保存前请改用其余五值）"},"ntlm_compatible":{"type":"integer","enum":[0,1],"description":"NTLM 兼容开关，仅 HTTP 规则可用；1=开启（要求 strategy=cookie，后端将拒绝其余策略；TCP 规则携带即拒）"},"upstream_force_http1":{"type":"integer","enum":[0,1],"description":"上游强制 HTTP/1.1（通用列，仅 HTTP 规则渲染生效）。省略=保留原值"},"dynamic_dns":{"type":"boolean"},"enable_dns_server":{"type":"boolean"},"dns_server":{"type":"string"},"dns_family":{"type":"string"},"health_check_path":{"type":"string"},"health_check_interval":{"type":"integer"},"health_check_timeout":{"type":"integer"},"health_check_unhealthy_threshold":{"type":"integer"},"health_check_healthy_threshold":{"type":"integer"},"enable_active_health_check":{"type":"boolean"},"health_check_host":{"type":"string","description":"健康检查域名：主动健康检查请求的 Host 头（纯主机名不带端口）；空=跟随 host_header；省略=保留原值"},"tcp_health_check_port":{"type":"integer"},"tcp_proxy_protocol":{"type":"boolean"},"tcp_try_duration":{"type":"integer"},"tcp_try_interval":{"type":"integer"},"request_body_max_size_mb":{"type":"integer"},"upstream_keepalive_timeout":{"type":"integer"},"server_tokens_hidden":{"type":"integer"},"custom_routes_enabled":{"type":"boolean"},"proxy_dial_timeout":{"type":"integer","minimum":0},"proxy_response_header_timeout":{"type":"integer","minimum":0},"proxy_read_timeout":{"type":"integer","minimum":0},"proxy_write_timeout":{"type":"integer","minimum":0},"proxy_stream_timeout":{"type":"integer","minimum":0},"proxy_flush_interval":{"type":"integer","minimum":-1},"proxy_stream_close_delay":{"type":"integer","minimum":0},"path_rules":{"type":"array","items":{"type":"object","required":["match_type","path"],"properties":{"id":{"type":"integer"},"sort_order":{"type":"integer"},"match_type":{"type":"string","enum":["prefix","exact"]},"path":{"type":"string"},"upstream_path":{"type":"string"},"response_mode":{"type":"string","enum":["","static","redirect"]},"response_status":{"type":"integer"},"response_body":{"type":"string","maxLength":64},"response_content_type":{"type":"string","enum":["","text/plain","application/json","text/html"]},"redirect_to":{"type":"string"},"upstreams":{"type":"array","items":{"type":"object","required":["address","port"],"properties":{"address":{"type":"string"},"port":{"type":"integer","minimum":1,"maximum":65535},"weight":{"type":"integer","minimum":1},"protocol":{"type":"string","description":"http 或 https；省略=http"}}}}},"description":"路径规则：match_type/path/upstream_path/upstreams；另支持 response_mode 直返/跳转（2026-10-10）——static=静态响应（response_status 常用码，0=缺省 200/response_body ≤64 字符/response_content_type text/plain|application/json|text/html，空=缺省 text/plain），redirect=301+redirect_to 目标（须 http(s):// 绝对地址或 / 开头路径，禁控制字符）；互斥：直返/跳转与 upstreams/upstream_path 互斥、static 与 redirect_to 互斥、redirect 与 response_body/response_content_type 互斥"}},"host_header":{"type":"string"},"upstreams":{"type":"array","items":{"type":"object","required":["host","port"],"properties":{"host":{"type":"string"},"port":{"type":"integer","minimum":1,"maximum":65535},"weight":{"type":"integer","minimum":1},"enabled":{"type":"boolean"},"protocol":{"type":"string"},"max_connections":{"type":"integer"},"origin_domain":{"type":"string","description":"该上游独立的回源 Host 头与 HTTPS SNI（纯主机名不带端口）；空=跟随规则 host_header"}},"description":"上游条目（全量替换）；支持 host/port/weight/enabled/protocol/max_connections/origin_domain（该上游独立的回源 Host 头与 HTTPS SNI，纯主机名不带端口）"}},"enable_tls":{"type":"boolean"},"tls_source":{"type":"string","enum":["manual","acme_dns"],"description":"证书来源：manual=手动证书（tls_cert/tls_key），acme_dns=ACME DNS 验证签发（需 acme_config_id）"},"block_page_stage1_id":{"type":"integer","description":"阶段 1（IP 预检）拦截页面 ID，0=跟随全局/策略"},"block_page_stage1_status":{"type":"integer","description":"阶段 1 拦截状态码（0=默认 403）"},"block_page_stage3_id":{"type":"integer","description":"阶段 3（WAF）拦截页面 ID，0=跟随全局/策略"},"block_page_stage3_status":{"type":"integer","description":"阶段 3 拦截状态码（0=默认 403）"},"acme_config_id":{"type":"integer"},"ca_provider_id":{"type":"integer"},"tls_cert":{"type":"string"},"tls_key":{"type":"string"},"tls_http_redirect":{"type":"boolean"},"enable_compress":{"type":"boolean"},"compress_types":{"type":"string"},"enabled":{"type":"boolean"},"log_enabled":{"type":"boolean"}},"additionalProperties":false}`
+const updateRuleSchema = `{"type":"object","required":["caddy_id"],"properties":{"caddy_id":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"protocol":{"type":"string"},"domain":{"type":"string"},"listen_port":{"type":"integer","minimum":1,"maximum":65535},"strategy":{"type":"string","enum":["weighted_round_robin","ip_hash","least_conn","random","first","cookie"],"description":"负载策略。HTTP 六值全集；TCP 规则不支持 cookie（后端将拒绝，保存前请改用其余五值）"},"ntlm_compatible":{"type":"integer","enum":[0,1],"description":"NTLM 兼容开关，仅 HTTP 规则可用；1=开启（要求 strategy=cookie，后端将拒绝其余策略；TCP 规则携带即拒）"},"upstream_force_http1":{"type":"integer","enum":[0,1],"description":"上游强制 HTTP/1.1（通用列，仅 HTTP 规则渲染生效）。省略=保留原值"},"dynamic_dns":{"type":"boolean"},"enable_dns_server":{"type":"boolean"},"dns_server":{"type":"string"},"dns_family":{"type":"string"},"health_check_path":{"type":"string"},"health_check_interval":{"type":"integer"},"health_check_timeout":{"type":"integer"},"health_check_unhealthy_threshold":{"type":"integer"},"health_check_healthy_threshold":{"type":"integer"},"enable_active_health_check":{"type":"boolean"},"health_check_host":{"type":"string","description":"健康检查域名：主动健康检查请求的 Host 头（纯主机名不带端口）；空=跟随 host_header；省略=保留原值"},"tcp_health_check_port":{"type":"integer"},"tcp_proxy_protocol":{"type":"boolean"},"tcp_try_duration":{"type":"integer"},"tcp_try_interval":{"type":"integer"},"request_body_max_size_mb":{"type":"integer"},"upstream_keepalive_timeout":{"type":"integer"},"server_tokens_hidden":{"type":"integer","enum":[0,1,2],"description":"Server 头隐藏级别：0=显示/1=隐藏版本/2=完全隐藏"},"custom_routes_enabled":{"type":"boolean"},"proxy_dial_timeout":{"type":"integer","minimum":0},"proxy_response_header_timeout":{"type":"integer","minimum":0},"proxy_read_timeout":{"type":"integer","minimum":0},"proxy_write_timeout":{"type":"integer","minimum":0},"proxy_stream_timeout":{"type":"integer","minimum":0},"proxy_flush_interval":{"type":"integer","minimum":-1},"proxy_stream_close_delay":{"type":"integer","minimum":0},"path_rules":{"type":"array","items":{"type":"object","required":["match_type","path"],"properties":{"id":{"type":"integer"},"sort_order":{"type":"integer"},"match_type":{"type":"string","enum":["prefix","exact"]},"path":{"type":"string"},"upstream_path":{"type":"string"},"response_mode":{"type":"string","enum":["","static","redirect"]},"response_status":{"type":"integer"},"response_body":{"type":"string","maxLength":64},"response_content_type":{"type":"string","enum":["","text/plain","application/json","text/html"]},"redirect_to":{"type":"string"},"upstreams":{"type":"array","items":{"type":"object","required":["address","port"],"properties":{"address":{"type":"string"},"port":{"type":"integer","minimum":1,"maximum":65535},"weight":{"type":"integer","minimum":1},"protocol":{"type":"string","description":"http 或 https；省略=http"}}}}},"description":"路径规则：match_type/path/upstream_path/upstreams；另支持 response_mode 直返/跳转（2026-10-10）——static=静态响应（response_status 常用码，0=缺省 200/response_body ≤64 字符/response_content_type text/plain|application/json|text/html，空=缺省 text/plain），redirect=301+redirect_to 目标（须 http(s):// 绝对地址或 / 开头路径，禁控制字符）；互斥：直返/跳转与 upstreams/upstream_path 互斥、static 与 redirect_to 互斥、redirect 与 response_body/response_content_type 互斥"}},"host_header":{"type":"string"},"upstreams":{"type":"array","items":{"type":"object","required":["host","port"],"properties":{"host":{"type":"string"},"port":{"type":"integer","minimum":1,"maximum":65535},"weight":{"type":"integer","minimum":1},"enabled":{"type":"boolean"},"protocol":{"type":"string"},"max_connections":{"type":"integer"},"origin_domain":{"type":"string","description":"该上游独立的回源 Host 头与 HTTPS SNI（纯主机名不带端口）；空=跟随规则 host_header"}},"description":"上游条目（全量替换）；支持 host/port/weight/enabled/protocol/max_connections/origin_domain（该上游独立的回源 Host 头与 HTTPS SNI，纯主机名不带端口）"}},"enable_tls":{"type":"boolean"},"tls_source":{"type":"string","enum":["manual","acme_dns"],"description":"证书来源：manual=手动证书（tls_cert/tls_key），acme_dns=ACME DNS 验证签发（需 acme_config_id）"},"block_page_stage1_id":{"type":"integer","description":"阶段 1（IP 预检）拦截页面 ID，0=跟随全局/策略"},"block_page_stage1_status":{"type":"integer","description":"阶段 1 拦截状态码（0=默认 403）"},"block_page_stage3_id":{"type":"integer","description":"阶段 3（WAF）拦截页面 ID，0=跟随全局/策略"},"block_page_stage3_status":{"type":"integer","description":"阶段 3 拦截状态码（0=默认 403）"},"acme_config_id":{"type":"integer"},"ca_provider_id":{"type":"integer"},"tls_cert":{"type":"string"},"tls_key":{"type":"string"},"tls_http_redirect":{"type":"boolean"},"enable_compress":{"type":"boolean"},"compress_types":{"type":"string"},"enabled":{"type":"boolean"},"log_enabled":{"type":"boolean"}},"additionalProperties":false}`
 
 // 确认门（与 REST 侧 POST /certificates/issue 的 {"all":true} 同步）
 // 空 body（全量重签）不再放行——批量必须显式 all:true（enum 锁死 true，防
@@ -321,7 +376,7 @@ const ruleMetricsHistorySchema = `{"type":"object","required":["caddy_id"],"prop
 
 // dns_provider/dns_credentials 是全局配置遗留字段——证书签发链
 // 实际消费 certificate_configs 表的 DNS 凭证,标注防 Agent 误把凭证写进全局配置。
-const updateConfigSchemaTemplate = `{"type":"object","properties":{"source":{"type":"string"},"dns_provider":{"type":"string","description":"遗留字段，签发链不消费；DNS 凭证配置请用 certificate_configs 系列"},"dns_credentials":{"type":"string","description":"遗留字段，签发链不消费；DNS 凭证配置请用 certificate_configs 系列"},"acme_email":{"type":"string"},"cert_expiry_days":{"type":"integer"},"cert_renewal_days":{"type":"integer"},"cert_renewal_attempts":{"type":"integer"},"server_map_lat":{"type":"number","description":"威胁大屏本站纬度（-90~90，0=未设置）"},"server_map_lon":{"type":"number","description":"威胁大屏本站经度（-180~180，0=未设置）"},"threat_screen_mode":{"type":"string","enum":["map","globe"],"description":"威胁大屏模式：map=平面地图，globe=三维地球"},"threat_traffic_sample_n":{"type":"integer","enum":[-1,0],"description":"大屏光流采样：-1=自适应（低流量等价全量），0=关闭"},"security_events_retention_days":{"type":"integer","minimum":1,"maximum":3650,"description":"安全事件保留天数（1-3650）"},"security_events_row_cap":{"type":"integer","minimum":1,"maximum":100000000,"description":"安全事件最大行数（1-1 亿）"},"log_level":{"type":"string"},"caddy_log_level":{"type":"string"},"caddy_log_size_mb":{"type":"integer"},"request_body_max_size_mb":{"type":"integer"},"http_read_timeout":{"type":"integer"},"http_write_timeout":{"type":"integer"},"http_idle_timeout":{"type":"integer"},"upstream_keepalive_timeout":{"type":"integer"},"proxy_dial_timeout":{"type":"integer","minimum":0},"proxy_response_header_timeout":{"type":"integer","minimum":0},"proxy_read_timeout":{"type":"integer","minimum":0},"proxy_write_timeout":{"type":"integer","minimum":0},"proxy_stream_timeout":{"type":"integer","minimum":0},"proxy_flush_interval":{"type":"integer","minimum":-1},"proxy_stream_close_delay":{"type":"integer","minimum":0},"server_tokens_hidden":{"type":"boolean"},"trusted_proxy_enabled":{"type":"boolean","description":"受信代理（CDN 真实 IP 还原）总开关"},"trusted_proxy_ranges":{"type":"string","description":"受信代理网段（JSON 字符串数组文本，如 [\"203.0.113.0/24\"]；裸 IP 自动补 /32 或 /128；仅这些来源的 X-Forwarded-For 被采信）"},"trusted_proxy_range_refs":{"type":"string","description":"受信代理引用的 IP 地址列表 id（JSON 整数数组文本，如 [3,7]；与 trusted_proxy_ranges 合并生效）"},"trusted_proxy_headers":{"type":"string","description":"真实 IP 取值头（JSON 字符串数组文本，如 [\"X-Forwarded-For\",\"X-Real-IP\"]；按数组顺序取值）"},"trusted_proxy_strict":{"type":"boolean","description":"严格模式：非受信来源的伪造头一律拒绝"},"task_log_size_mb":{"type":"integer"},"runtime_log_size_mb":{"type":"integer"},"access_log_json":{"type":"boolean"},"access_log_format":{"type":"string"},"audit_retention_months":{"type":"integer"},"jwt_expire_minutes":{"type":"integer"},"timezone":{"type":"string"},"default_ca_provider_id":{"type":"integer"},"audit_log_size_mb":{"type":"integer"},"mfa_write_guard":{"type":"boolean"},"mfa_lockout_enabled":{"type":"boolean"},"github_proxy_url":{"type":"string","enum":["https://v4.gh-proxy.org/","https://axisnow.gh-proxy.org/","https://cdn.gh-proxy.org/"]},"github_token":{"type":"string","description":"可选 GITHUB_TOKEN（认证后 GitHub API 限流 60→5000 次/小时）；空串=清除已配置令牌，非空=覆盖，省略=保持现值；响应面仅以 has_github_token 显隐"}},"additionalProperties":false}`
+const updateConfigSchemaTemplate = `{"type":"object","properties":{"source":{"type":"string"},"dns_provider":{"type":"string","description":"遗留字段，签发链不消费；DNS 凭证配置请用 certificate_configs 系列"},"dns_credentials":{"type":"string","description":"遗留字段，签发链不消费；DNS 凭证配置请用 certificate_configs 系列"},"acme_email":{"type":"string"},"cert_expiry_days":{"type":"integer"},"cert_renewal_days":{"type":"integer"},"cert_renewal_attempts":{"type":"integer"},"server_map_lat":{"type":"number","minimum":-90,"maximum":90,"description":"威胁大屏本站纬度（-90~90，0=未设置）"},"server_map_lon":{"type":"number","minimum":-180,"maximum":180,"description":"威胁大屏本站经度（-180~180，0=未设置）"},"threat_screen_mode":{"type":"string","enum":["map","globe"],"description":"威胁大屏模式：map=平面地图，globe=三维地球"},"threat_traffic_sample_n":{"type":"integer","enum":[-1,0],"description":"大屏光流采样：-1=自适应（低流量等价全量），0=关闭"},"security_events_retention_days":{"type":"integer","minimum":1,"maximum":3650,"description":"安全事件保留天数（1-3650）"},"security_events_row_cap":{"type":"integer","minimum":1,"maximum":100000000,"description":"安全事件最大行数（1-1 亿）"},"log_level":{"type":"string"},"caddy_log_level":{"type":"string"},"caddy_log_size_mb":{"type":"integer"},"request_body_max_size_mb":{"type":"integer"},"http_read_timeout":{"type":"integer"},"http_write_timeout":{"type":"integer"},"http_idle_timeout":{"type":"integer"},"upstream_keepalive_timeout":{"type":"integer"},"proxy_dial_timeout":{"type":"integer","minimum":0},"proxy_response_header_timeout":{"type":"integer","minimum":0},"proxy_read_timeout":{"type":"integer","minimum":0},"proxy_write_timeout":{"type":"integer","minimum":0},"proxy_stream_timeout":{"type":"integer","minimum":0},"proxy_flush_interval":{"type":"integer","minimum":-1},"proxy_stream_close_delay":{"type":"integer","minimum":0},"server_tokens_hidden":{"type":"boolean"},"trusted_proxy_enabled":{"type":"boolean","description":"受信代理（CDN 真实 IP 还原）总开关"},"trusted_proxy_ranges":{"type":"string","description":"受信代理网段（JSON 字符串数组文本，如 [\"203.0.113.0/24\"]；裸 IP 自动补 /32 或 /128；仅这些来源的 X-Forwarded-For 被采信）"},"trusted_proxy_range_refs":{"type":"string","description":"受信代理引用的 IP 地址列表 id（JSON 整数数组文本，如 [3,7]；与 trusted_proxy_ranges 合并生效）"},"trusted_proxy_headers":{"type":"string","description":"真实 IP 取值头（JSON 字符串数组文本，如 [\"X-Forwarded-For\",\"X-Real-IP\"]；按数组顺序取值）"},"trusted_proxy_strict":{"type":"boolean","description":"严格模式：非受信来源的伪造头一律拒绝"},"task_log_size_mb":{"type":"integer"},"runtime_log_size_mb":{"type":"integer"},"access_log_json":{"type":"boolean"},"access_log_format":{"type":"string"},"audit_retention_months":{"type":"integer"},"jwt_expire_minutes":{"type":"integer"},"timezone":{"type":"string"},"default_ca_provider_id":{"type":"integer"},"audit_log_size_mb":{"type":"integer"},"mfa_write_guard":{"type":"boolean"},"mfa_lockout_enabled":{"type":"boolean"},"github_proxy_url":{"type":"string","enum":["https://v4.gh-proxy.org/","https://axisnow.gh-proxy.org/","https://cdn.gh-proxy.org/"]},"github_token":{"type":"string","description":"可选 GITHUB_TOKEN（认证后 GitHub API 限流 60→5000 次/小时）；空串=清除已配置令牌，非空=覆盖，省略=保持现值；响应面仅以 has_github_token 显隐"}},"additionalProperties":false}`
 
 // updateConfigSchema 的安全事件保留边界由 db.Max* 常量生成（上限单源：
 // 写侧校验 caddy.go / 导入钳制 config_backup.go / 从端 apply 归一
@@ -372,7 +427,7 @@ func forward(ctx context.Context, client *http.Client, baseURL, internalAuthSecr
 	for _, name := range spec.pathArgs {
 		value, ok := arguments[name]
 		if !ok {
-			return nil, fmt.Errorf("缺少参数 %s", name)
+			return toolCallError("缺少参数 %s", name)
 		}
 		path = strings.ReplaceAll(path, "{"+name+"}", url.PathEscape(scalarString(value)))
 	}
@@ -442,7 +497,7 @@ func forward(ctx context.Context, client *http.Client, baseURL, internalAuthSecr
 	if apiKey := extractAPIKey(call.Header); apiKey != "" {
 		request.Header.Set("X-API-Key", apiKey)
 	} else {
-		return nil, fmt.Errorf("MCP 请求缺少 API 密钥")
+		return toolCallError("MCP 请求缺少 API 密钥")
 	}
 	if internalAuthSecret != "" {
 		request.Header.Set(InternalAuthHeader, internalAuthSecret)
@@ -461,9 +516,9 @@ func forward(ctx context.Context, client *http.Client, baseURL, internalAuthSecr
 		// 重启等长操作),直接重试会重复执行非幂等操作。
 		var netErr net.Error
 		if (errors.As(err, &netErr) && netErr.Timeout()) || errors.Is(err, context.DeadlineExceeded) {
-			return nil, fmt.Errorf("内部 API 请求超时: %w（操作可能已在服务端生效,请先用查询类工具核对状态再重试）", err)
+			return toolCallError("内部 API 请求超时: %v（操作可能已在服务端生效,请先用查询类工具核对状态再重试）", err)
 		}
-		return nil, fmt.Errorf("内部 API 请求失败: %w", err)
+		return toolCallError("内部 API 请求失败: %v", err)
 	}
 	// 面板启用 HTTPS 时明文请求命中 TLS 嗅探层收到 302（cmd/server
 	// http_redirect_mux.go）；客户端不自动跟随（避免 POST 变 GET），
@@ -472,14 +527,14 @@ func forward(ctx context.Context, client *http.Client, baseURL, internalAuthSecr
 		location := response.Header.Get("Location")
 		response.Body.Close()
 		if location == "" {
-			return nil, fmt.Errorf("内部 API 重定向缺少目标地址")
+			return toolCallError("内部 API 重定向缺少目标地址")
 		}
 		redirectURL, err := request.URL.Parse(location)
 		if err != nil {
-			return nil, fmt.Errorf("解析内部 API 重定向地址: %w", err)
+			return toolCallError("解析内部 API 重定向地址: %v", err)
 		}
 		if !isLoopbackHTTPURL(redirectURL) {
-			return nil, fmt.Errorf("拒绝非回环内部 API 重定向地址")
+			return toolCallError("拒绝非回环内部 API 重定向地址")
 		}
 		var retryBody io.Reader
 		if bodyBytes != nil {
@@ -501,11 +556,11 @@ func forward(ctx context.Context, client *http.Client, baseURL, internalAuthSecr
 		}
 		response, err = redirectlessClient.Do(request)
 		if err != nil {
-			return nil, fmt.Errorf("内部 API 请求失败: %w", err)
+			return toolCallError("内部 API 请求失败: %v", err)
 		}
 		if isReplayableRedirectStatus(response.StatusCode) {
 			response.Body.Close()
-			return nil, fmt.Errorf("内部 API 重定向次数超过限制")
+			return toolCallError("内部 API 重定向次数超过限制")
 		}
 	}
 	defer response.Body.Close()
@@ -523,6 +578,10 @@ func forward(ctx context.Context, client *http.Client, baseURL, internalAuthSecr
 		message := "内部 API 响应超过 4 MiB 上限，请改用分页或专用导出工具"
 		if hint, ok := noPaginationToolHints[spec.name]; ok {
 			message = hint
+		} else if spec.method == http.MethodGet && len(spec.queryArgs) == 0 {
+			// 整份返回的只读工具没有分页参数，通用「改用分页」指引对它们
+			// 是死路——给真能走通的路径（单条查询收敛范围/管理面板）。
+			message = "内部 API 响应超过 4 MiB 上限；本工具无分页参数——请改用对应的单条查询工具（get_* 系列）缩小范围，或经管理面板查看/导出"
 		}
 		result := mcp.NewToolResultText(message)
 		result.IsError = true
@@ -549,6 +608,13 @@ func forward(ctx context.Context, client *http.Client, baseURL, internalAuthSecr
 }
 
 const randomPasswordCharset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+// toolCallError 把可恢复的调用层错误（缺参/缺 Key/传输失败/重定向异常）以
+// IsError 工具结果返回——文档承诺 Agent 只需处理 IsError 分支；仅内部不变量
+// 破坏（地址构造/序列化失败等）才走 handler error（mcp-go 包成 -32603）。
+func toolCallError(format string, args ...any) (*mcp.CallToolResult, error) {
+	return mcp.NewToolResultError(fmt.Sprintf(format, args...)), nil
+}
 
 // generateRandomPassword 用 crypto/rand 生成无偏字母数字密码，供 reset_user_password 注入后端请求体
 func generateRandomPassword(length int) (string, error) {
@@ -603,12 +669,4 @@ func scalarString(value any) string {
 
 func idSchema(name, description, valueType string) string {
 	return fmt.Sprintf(`{"type":"object","required":[%q],"properties":{%q:{"type":%q,"description":%q}},"additionalProperties":false}`, name, name, valueType, description)
-}
-
-// bodySchemaWithID 为「按 id 更新且 body 字段随工具而异」的工具声明路径参数：
-// 保留宽松 body（additionalProperties:true 向前兼容），同时把 id 写进
-// properties（此前这些工具复用 bodySchema，pathArgs 声明了 id 却无
-// 任何 schema 线索，Agent 只能凭描述猜参数名）。
-func bodySchemaWithID(description string) string {
-	return fmt.Sprintf(`{"type":"object","properties":{"id":{"type":"integer","description":%q}},"additionalProperties":true}`, description)
 }

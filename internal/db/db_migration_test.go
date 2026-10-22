@@ -72,8 +72,8 @@ func TestRunMigrations_oneShotMarkersPersistedByMigration(t *testing.T) {
 }
 
 // marker 列必须登记在 newColumns 统一补列通道（否则存量库升级缺列、迁移直接
-// 报 no such column）。用 AST 读取 newColumns 复合字面量的键集——文本切片会
-// 把注释中的列名也算作登记。
+// 报 no such column）。用 AST 读取 newColumnsRegistry 复合字面量的键集——
+// 文本切片会把注释中的列名也算作登记。
 func TestRunMigrations_oneShotMarkerColumnsRegisteredInNewColumns(t *testing.T) {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "db.go", nil, 0)
@@ -81,19 +81,7 @@ func TestRunMigrations_oneShotMarkerColumnsRegisteredInNewColumns(t *testing.T) 
 		t.Fatalf("parse db.go: %v", err)
 	}
 	registered := map[string]struct{}{}
-	ast.Inspect(file, func(node ast.Node) bool {
-		assign, ok := node.(*ast.AssignStmt)
-		if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
-			return true
-		}
-		ident, ok := assign.Lhs[0].(*ast.Ident)
-		if !ok || ident.Name != "newColumns" {
-			return true
-		}
-		literal, ok := assign.Rhs[0].(*ast.CompositeLit)
-		if !ok {
-			return true
-		}
+	collectKeys := func(literal *ast.CompositeLit) {
 		for _, element := range literal.Elts {
 			kv, ok := element.(*ast.KeyValueExpr)
 			if !ok {
@@ -109,7 +97,16 @@ func TestRunMigrations_oneShotMarkerColumnsRegisteredInNewColumns(t *testing.T) 
 			}
 			registered[unquoted] = struct{}{}
 		}
-		return false
+	}
+	ast.Inspect(file, func(node ast.Node) bool {
+		// 包级登记单源：var newColumnsRegistry = map[string]string{...}
+		if spec, ok := node.(*ast.ValueSpec); ok && len(spec.Names) == 1 && len(spec.Values) == 1 && spec.Names[0].Name == "newColumnsRegistry" {
+			if literal, ok := spec.Values[0].(*ast.CompositeLit); ok {
+				collectKeys(literal)
+			}
+			return false
+		}
+		return true
 	})
 	if len(registered) == 0 {
 		t.Fatal("newColumns registry not found（AST 形态漂移）")
@@ -1549,9 +1546,14 @@ func TestInitialize_certJobCAAvailableAfterNormalizationRewritesOnlyStaleRows(t 
 	if err != nil {
 		t.Fatalf("normalize ca_available_after again: %v", err)
 	}
-	again, err := resAgain.RowsAffected()
-	if err != nil {
-		t.Fatalf("rows affected again: %v", err)
+	// 探测门：第二遍零命中时连写语句都不执行（返回 nil Result 即 0 行改写）。
+	var again int64
+	if resAgain != nil {
+		var err error
+		again, err = resAgain.RowsAffected()
+		if err != nil {
+			t.Fatalf("rows affected again: %v", err)
+		}
 	}
 
 	// Then：首遍仅 legacy 1 行待回填（canonical 不再匹配）；第二遍零行
@@ -2231,6 +2233,90 @@ func TestMigrateCanonicalDomains_deduplicatesAndRebuildsIndexWhenDuplicatesExist
 	}
 }
 
+// cert_jobs (rule_id,domain) 去重判据单源=certJobsDedupeSQL 常量：
+// 保留「有证书材料优先，同列 id 大者」（与原逐行相关子查询判据逐行等价）。
+// 实现必须单趟窗口函数——旧相关子查询每行对全表做一次匹配子扫（O(n²)），
+// EXPLAIN QUERY PLAN 不得再出现 CORRELATED 子查询。
+func TestMigrateCanonicalDomains_dedupeKeepsCertMaterialRowInSinglePass(t *testing.T) {
+	database := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	// 三组：①晚行有证书材料、早行无 → 保留晚行；②均无材料 → 保留 id 大者；
+	// ③单行组不动。
+	if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, cert_pem, key_pem) VALUES
+		('lb_d','a.example.com','failed','',''),
+		('lb_d','a.example.com','issued','PEM','KEY'),
+		('lb_d','b.example.com','failed','',''),
+		('lb_d','b.example.com','failed','',''),
+		('lb_d','c.example.com','issued','PEM','KEY')`); err != nil {
+		t.Fatalf("seed duplicate groups: %v", err)
+	}
+
+	if err := migrateCanonicalDomains(); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	var pem string
+	if err := database.QueryRow(`SELECT cert_pem FROM cert_jobs WHERE domain='a.example.com'`).Scan(&pem); err != nil {
+		t.Fatalf("group a survivor: %v", err)
+	}
+	if pem != "PEM" {
+		t.Fatalf("group a survivor cert_pem=%q, want PEM（有证书材料行优先存活）", pem)
+	}
+	var survivingID int
+	if err := database.QueryRow(`SELECT id FROM cert_jobs WHERE domain='b.example.com'`).Scan(&survivingID); err != nil {
+		t.Fatalf("group b survivor: %v", err)
+	}
+	var bIDs []int
+	idRows, err := database.Query(`SELECT id FROM cert_jobs WHERE domain='b.example.com'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for idRows.Next() {
+		var id int
+		if err := idRows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		bIDs = append(bIDs, id)
+	}
+	idRows.Close()
+	if len(bIDs) != 1 {
+		t.Fatalf("group b rows=%v, want 单行存活", bIDs)
+	}
+	if survivingID != 4 {
+		t.Fatalf("group b survivor id=%d, want 4（均无证书材料时 id 大者存活）", survivingID)
+	}
+	var singles int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM cert_jobs WHERE domain='c.example.com'`).Scan(&singles); err != nil {
+		t.Fatal(err)
+	}
+	if singles != 1 {
+		t.Fatalf("group c rows=%d, want 1（单行组不动）", singles)
+	}
+
+	// 计划钉：单趟窗口函数，无逐行相关子查询。
+	planRows, err := database.Query("EXPLAIN QUERY PLAN " + certJobsDedupeSQL)
+	if err != nil {
+		t.Fatalf("explain dedupe sql: %v", err)
+	}
+	var plan strings.Builder
+	for planRows.Next() {
+		var id, parent, notUsed int
+		var detail string
+		if err := planRows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+			planRows.Close()
+			t.Fatalf("scan plan: %v", err)
+		}
+		plan.WriteString(detail)
+		plan.WriteString("\n")
+	}
+	planRows.Close()
+	if strings.Contains(strings.ToUpper(plan.String()), "CORRELATED") {
+		t.Fatalf("去重计划仍含逐行相关子查询（O(n²)）：\n%s", plan.String())
+	}
+}
+
 // migrateLbRulesPrimaryKey 重建 lb_rules/upstreams 时，随表
 // DROP 级联删除既有索引——三张高频索引若只在重建前创建，则整个启动周期内缺失，
 // 要到下次启动才被 IF NOT EXISTS 自愈。同一启动内必须补齐。
@@ -2636,8 +2722,11 @@ func TestMigrateLegacyAuditLogs_copiesVerifiesAndDropsLegacyTable(t *testing.T) 
 		VALUES (101,'attacker','篡改','冲突','different','','2020-01-01 00:00:00')`); err != nil {
 		t.Fatalf("seed conflicting legacy row: %v", err)
 	}
-	if err := migrateLegacyAuditLogs(DB, filepath.Join(dir, AuditDBFilename)); err == nil {
-		t.Fatal("conflicting legacy audit row passed verification")
+	// 冲突改为跳过+保留源表（服务可用优先，冲突留痕见
+	// TestMigrateLegacyAuditLogs_conflictKeepsSourceTableAndSkips）——不得
+	// DROP 源表或覆盖目标行，也不得硬失败阻断启动。
+	if err := migrateLegacyAuditLogs(DB, filepath.Join(dir, AuditDBFilename)); err != nil {
+		t.Fatalf("conflict must skip without failing startup: %v", err)
 	}
 	if err := DB.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='audit_log'`).Scan(&legacyTables); err != nil {
 		t.Fatal(err)

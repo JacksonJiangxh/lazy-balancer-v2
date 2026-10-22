@@ -60,6 +60,86 @@ func parseUTCSlot(s string) time.Time {
 	return time.Time{}
 }
 
+// ParseUTCTimeDual 双布局 UTC 时间解析的包外入口（单源=parseUTCSlot：
+// crsTimeLayout 平面串 + RFC3339 双形态）。cert_jobs 等 UTC 时间列的消费方
+// （handlers cert-job 历史等）一律走本入口，禁止另写单布局 time.Parse——
+// 驱动/列表达式形态变化时单布局解析会静默归零（时间列空 + duration=0）。
+func ParseUTCTimeDual(s string) (time.Time, bool) {
+	t := parseUTCSlot(s)
+	return t, !t.IsZero()
+}
+
+// RearmScheduleSlotsAfterTimezoneChange 时区变更后按新时区重算四个已武装
+// 排程族的**未来**槽（CRS/IP2Region 版本表单行 + 威胁/爬虫源表逐启用行）。
+// 排程槽按配置时区本地日历计算、UTC 落库——时区切换后旧槽仍按旧偏移触发
+// （「下次执行」展示与实际触发同错）。已过期槽不动（到期补跑语义保留，
+// 重排会吞掉等待中的补跑轮）；空槽不动（首槽武装归 armSecurityLibraryFirstSlots）。
+// 调用前必须已完成 ConfigureLocation（CurrentLocation 已是新时区）。
+// 自动备份族无落库槽（NextSlotFn 按设置实时计算），天然随新时区生效。
+func RearmScheduleSlotsAfterTimezoneChange() {
+	if db.DB == nil {
+		return
+	}
+	now := time.Now().UTC()
+	for _, table := range []string{"security_crs_version", "security_ip2region_version"} {
+		var autoUpdate int
+		var nextUpdate string
+		if err := db.DB.QueryRow(`SELECT COALESCE(auto_update,1), COALESCE(next_update,'') FROM `+table+` WHERE id=1`).Scan(&autoUpdate, &nextUpdate); err != nil {
+			Logf("warn", "时区变更重排：读取 %s 排程失败: %v", table, err)
+			continue
+		}
+		if autoUpdate != 1 || nextUpdate == "" {
+			continue
+		}
+		if slot := parseUTCSlot(nextUpdate); slot.IsZero() || !slot.After(now) {
+			continue // 过期槽保留（补跑）；非法串由首槽武装/保存路径自愈
+		}
+		if _, err := db.DB.Exec(`UPDATE `+table+` SET next_update=? WHERE id=1`, versionTableNextSlot(table, now)); err != nil {
+			Logf("warn", "时区变更重排：%s 写入 next_update 失败: %v", table, err)
+		}
+	}
+	// 威胁/爬虫源表：逐启用行重排（行键不同——威胁按 id、爬虫按 name）。
+	for _, st := range []struct {
+		table  string
+		keyCol string
+		slotFn func(time.Time) string
+	}{
+		{"security_threat_sources", "id", threatNextSlot},
+		{"security_crawler_sources", "name", crawlerNextSlot},
+	} {
+		rows, err := db.DB.Query(`SELECT ` + st.keyCol + `, COALESCE(next_update,'') FROM ` + st.table + ` WHERE update_enabled=1 AND COALESCE(next_update,'')<>''`)
+		if err != nil {
+			Logf("warn", "时区变更重排：读取 %s 排程失败: %v", st.table, err)
+			continue
+		}
+		type rearm struct {
+			key  string
+			slot string
+		}
+		var rearms []rearm
+		for rows.Next() {
+			var key, nextUpdate string
+			if err := rows.Scan(&key, &nextUpdate); err != nil {
+				Logf("warn", "时区变更重排：%s 行扫描失败（跳过该行）: %v", st.table, err)
+				continue
+			}
+			if slot := parseUTCSlot(nextUpdate); slot.IsZero() || !slot.After(now) {
+				continue // 过期槽保留（补跑语义）
+			}
+			rearms = append(rearms, rearm{key: key, slot: st.slotFn(now)})
+		}
+		if err := rows.Err(); err != nil {
+			Logf("warn", "时区变更重排：%s 迭代失败（部分行未重排）: %v", st.table, err)
+		}
+		rows.Close()
+		for _, ra := range rearms {
+			if _, err := db.DB.Exec(`UPDATE `+st.table+` SET next_update=? WHERE `+st.keyCol+`=?`, ra.slot, ra.key); err != nil {
+				Logf("warn", "时区变更重排：%s(%s=%s) 写入 next_update 失败: %v", st.table, st.keyCol, ra.key, err)
+			}
+		}
+	}
+}
+
 // NormalizeScheduleDays 归一写侧输入：过滤非法值、去重、升序；结果为空表示
 // 输入无有效星期（调用方按校验失败拒绝）。
 func NormalizeScheduleDays(days []int) []int {

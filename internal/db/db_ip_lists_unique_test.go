@@ -1,6 +1,9 @@
 package db
 
-import "testing"
+import (
+	"strconv"
+	"testing"
+)
 
 // system=1 名单必须有 name 唯一性兜底；同名 system=0 用户列表
 // 仍允许存在（部分索引只覆盖 system=1）。
@@ -125,5 +128,107 @@ func TestMigrateSystemIPListUniqueIndex_skipsRebuildWhenIndexInPlace(t *testing.
 	}
 	if indexCount != 1 {
 		t.Fatalf("索引重建后条数=%d, want 1", indexCount)
+	}
+}
+
+// 去重保留优先级：同名重复 system 行中被策略/全局配置引用的行必须存活，
+// 指向被删行的引用重写为存活 id——此前按 MIN(id) 删行不修引用，策略引用
+// 被删 id 时渲染期该名单条目整体消失（少拦/少放，安全面静默）。
+func TestMigrateSystemIPListUniqueIndex_keepsReferencedRowAndRewritesRefs(t *testing.T) {
+	database := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO security_ip_lists (name,description,category,entries,system,created_at,updated_at) VALUES
+		('威胁情报甲','早','恶意 IP','[]',1,datetime('now'),datetime('now')),
+		('威胁情报甲','晚','恶意 IP','[]',1,datetime('now'),datetime('now'))`); err != nil {
+		t.Fatalf("seed duplicates: %v", err)
+	}
+	var earlyID, lateID int
+	if err := database.QueryRow(`SELECT MIN(id) FROM security_ip_lists WHERE name='威胁情报甲' AND system=1`).Scan(&earlyID); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRow(`SELECT MAX(id) FROM security_ip_lists WHERE name='威胁情报甲' AND system=1`).Scan(&lateID); err != nil {
+		t.Fatal(err)
+	}
+	// trusted_proxy_range_refs 走 newColumns 补列通道（fresh CREATE 不携带）——
+	// 本测试直接建库后补列，模拟迁移后形态。
+	if _, err := database.Exec(`ALTER TABLE global_config ADD COLUMN trusted_proxy_range_refs TEXT NOT NULL DEFAULT '[]'`); err != nil {
+		t.Fatalf("add trusted_proxy_range_refs: %v", err)
+	}
+	// 策略引用较晚行（非 MIN(id)）；全局受信代理引用较早行——两 id 均被引用
+	// 时保留 MIN(被引用 id)，指向被删 id 的引用重写为存活 id。
+	if _, err := database.Exec(`INSERT INTO security_policies (name,ip_acl_list_refs,ip_whitelist_refs) VALUES (?,?,?)`,
+		"引用策略", `[`+strconv.Itoa(lateID)+`]`, `[]`); err != nil {
+		t.Fatalf("seed policy: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO global_config (id,caddy_config,trusted_proxy_range_refs) VALUES (1,'{}',?)`, `[`+strconv.Itoa(earlyID)+`]`); err != nil {
+		t.Fatalf("seed global config: %v", err)
+	}
+
+	if err := migrateSystemIPListUniqueIndex(); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	var survivingID, survivingDesc int
+	var desc string
+	if err := database.QueryRow(`SELECT id, description FROM security_ip_lists WHERE name='威胁情报甲' AND system=1`).Scan(&survivingID, &desc); err != nil {
+		t.Fatalf("surviving row: %v", err)
+	}
+	if survivingID != earlyID {
+		t.Fatalf("surviving id=%d, want %d（被引用行优先，两个被引用 id 取 MIN）", survivingID, earlyID)
+	}
+	_ = survivingDesc
+	var aclRefs string
+	if err := database.QueryRow(`SELECT ip_acl_list_refs FROM security_policies WHERE name='引用策略'`).Scan(&aclRefs); err != nil {
+		t.Fatalf("read policy refs: %v", err)
+	}
+	if aclRefs != `[`+strconv.Itoa(earlyID)+`]` {
+		t.Fatalf("policy ip_acl_list_refs=%s, want [%d]（被删 id %d 必须重写为存活 id）", aclRefs, earlyID, lateID)
+	}
+	var proxyRefs string
+	if err := database.QueryRow(`SELECT trusted_proxy_range_refs FROM global_config WHERE id=1`).Scan(&proxyRefs); err != nil {
+		t.Fatalf("read proxy refs: %v", err)
+	}
+	if proxyRefs != `[`+strconv.Itoa(earlyID)+`]` {
+		t.Fatalf("trusted_proxy_range_refs=%s, want [%d]（存活引用不得改写）", proxyRefs, earlyID)
+	}
+}
+
+// 单侧引用形态：只有较晚行被引用时必须保留较晚行（而非 MIN(id)）。
+func TestMigrateSystemIPListUniqueIndex_referencedNonMinRowSurvives(t *testing.T) {
+	database := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO security_ip_lists (name,description,category,entries,system,created_at,updated_at) VALUES
+		('威胁情报乙','早','恶意 IP','[]',1,datetime('now'),datetime('now')),
+		('威胁情报乙','晚','恶意 IP','[]',1,datetime('now'),datetime('now'))`); err != nil {
+		t.Fatalf("seed duplicates: %v", err)
+	}
+	var lateID int
+	if err := database.QueryRow(`SELECT MAX(id) FROM security_ip_lists WHERE name='威胁情报乙' AND system=1`).Scan(&lateID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT INTO security_policies (name,ip_whitelist_refs) VALUES (?,?)`,
+		"白名单策略", `[`+strconv.Itoa(lateID)+`]`); err != nil {
+		t.Fatalf("seed policy: %v", err)
+	}
+	if err := migrateSystemIPListUniqueIndex(); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	var survivingID int
+	if err := database.QueryRow(`SELECT id FROM security_ip_lists WHERE name='威胁情报乙' AND system=1`).Scan(&survivingID); err != nil {
+		t.Fatalf("surviving row: %v", err)
+	}
+	if survivingID != lateID {
+		t.Fatalf("surviving id=%d, want 被引用行 %d", survivingID, lateID)
+	}
+	var wlRefs string
+	if err := database.QueryRow(`SELECT ip_whitelist_refs FROM security_policies WHERE name='白名单策略'`).Scan(&wlRefs); err != nil {
+		t.Fatalf("read policy refs: %v", err)
+	}
+	if wlRefs != `[`+strconv.Itoa(lateID)+`]` {
+		t.Fatalf("policy ip_whitelist_refs=%s, want [%d]（存活行引用保持原样）", wlRefs, lateID)
 	}
 }

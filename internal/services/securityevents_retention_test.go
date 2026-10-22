@@ -444,16 +444,18 @@ func TestSecurityEventsRetention_summaryIncludesRowCap(t *testing.T) {
 	if rowCap != 5000 {
 		t.Fatalf("rowCap=%d, want 5000", rowCap)
 	}
-	if summary != "每日清理 · 保留 30 天 / 上限 5000 行" {
-		t.Fatalf("summary=%q, want 同时表达天数与行帽（cleanup 按 count-max 提前裁剪）", summary)
+	// 双口径 + 行帽按字节披露：行帽按行不按字节，理论体积上限必须随文案
+	// 可见（5000 行 ×128KiB = 625 MiB）。
+	if summary != "每日清理 · 保留 30 天 / 上限 5000 行（按行计，单行最大约 128KiB，理论体积上限约 625 MiB）" {
+		t.Fatalf("summary=%q, want 天数+行帽+字节预算三口径", summary)
 	}
-	// 缺省形态（0=内置默认）同样表达双口径。
+	// 缺省形态（0=内置默认）同样表达双口径与字节预算（100 万行 ≈ 122 GiB）。
 	if _, err := db.DB.Exec(`UPDATE global_config SET security_events_retention_days=0, security_events_row_cap=0 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
 	summary, _ = SecurityEventsRetentionSnapshot()
-	if !strings.Contains(summary, "90 天") || !strings.Contains(summary, "1000000 行") {
-		t.Fatalf("默认 summary=%q, want 含 90 天与 1000000 行", summary)
+	if !strings.Contains(summary, "90 天") || !strings.Contains(summary, "1000000 行") || !strings.Contains(summary, "122 GiB") {
+		t.Fatalf("默认 summary=%q, want 含 90 天、1000000 行与 122 GiB 字节预算", summary)
 	}
 }
 

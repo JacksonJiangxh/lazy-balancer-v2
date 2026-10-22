@@ -44,6 +44,12 @@ const (
 	BackgroundApplyIP2Region  BackgroundApplySource = "IP2Region"
 	BackgroundApplyThreat     BackgroundApplySource = "威胁情报库"
 	BackgroundApplyAutoban    BackgroundApplySource = "自动封禁"
+	// BackgroundApplyClusterSync 从节点集群同步快照提交后的 Caddy 重载。
+	// 该路径不走 TrackBackgroundReload（重载在 applySnapshot 内联执行），
+	// 失败面由 cluster_apply 经 RecordBackgroundApplyFailure 手工登记——
+	// 从节点的 caddy_apply_error 从不由 handlers 写路径落盘，本来源是
+	// 从节点「库态≠运行态」分叉的全局可观测信号。
+	BackgroundApplyClusterSync BackgroundApplySource = "集群同步重载"
 )
 
 // TrackBackgroundReload 返回包装后的后台重载回调：失败登记到失败面并按原样

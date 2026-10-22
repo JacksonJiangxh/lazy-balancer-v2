@@ -8,11 +8,12 @@ package mcpserver
 import (
 	"testing"
 
+	"lazy-balancer-v2/internal/apipath"
 	"lazy-balancer-v2/internal/services"
 )
 
-// ginPath 生产实现在 tool_visibility.go（自此可见性按
-// "METHOD /api/v1"+ginPath(spec.path) 匹配 admin 路由集合）；外部测试包经
+// 路径形态转换（{param}→:param）单源在 internal/apipath（自此可见性按
+// "METHOD /api/v1"+apipath.ToGin(spec.path) 匹配 admin 路由集合）；外部测试包经
 // export_test.go 的 GinPathForTest 共享。
 
 // Given 全部注册工具规格与 REST 只读白名单。
@@ -26,7 +27,7 @@ func TestReadOnlyProbeTools_matchRestWhitelist(t *testing.T) {
 			inProbe = true
 			probeHit++
 		}
-		restReadOnly := services.IsReadOnlyWriteRoute(spec.method, ginPath("/api/v1"+spec.path))
+		restReadOnly := services.IsReadOnlyWriteRoute(spec.method, apipath.ToGin("/api/v1"+spec.path))
 		if spec.method == "GET" {
 			if inProbe {
 				t.Errorf("GET 工具 %s 不应出现在只读探测集", spec.name)

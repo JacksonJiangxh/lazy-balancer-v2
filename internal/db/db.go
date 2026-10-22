@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -30,6 +32,42 @@ var (
 	openDatabase  = sql.Open
 	domainProfile = idna.New(idna.MapForLookup(), idna.BidiRule(), idna.VerifyDNSLength(true))
 )
+
+// sqliteWALDSNParams 三库共用的 DSN 参数串单源——此前主库/metrics/审计
+// 三份字面量复制，参数漂移只能靠 sqlite_pragmas.go 运行期守卫兜底；
+// 单源后漂移在编译期即不可能。
+// glebarez 仅识别 _pragma/_txlock/_time_format 三类 DSN 参数；_pragma 会在
+// 每条新建连接上执行（applyQueryParams），正适合 busy_timeout 这类连接级参数。
+// journal_mode 是文件级（一次设置持久生效），放这里仅为幂等兜底。
+const sqliteWALDSNParams = "?_txlock=immediate&_pragma=journal_mode(WAL)&_pragma=busy_timeout(30000)&_pragma=synchronous(NORMAL)"
+
+// sqlitePoolConfig 连接池三参数显式命名组——池尺寸差异常驻（metrics
+// MaxIdle==MaxOpen 防 last-close checkpoint 风暴，见 openAndPingMetricsDB），
+// 单源只收敛 DSN 与设置通道，不收敛池尺寸。
+type sqlitePoolConfig struct {
+	maxOpen         int
+	maxIdle         int
+	connMaxLifetime time.Duration
+}
+
+// applySQLitePool 按命名池参数配置句柄（三库共用设置通道）。
+func applySQLitePool(database *sql.DB, pool sqlitePoolConfig) {
+	database.SetMaxOpenConns(pool.maxOpen)
+	database.SetMaxIdleConns(pool.maxIdle)
+	database.SetConnMaxLifetime(pool.connMaxLifetime)
+}
+
+// openSQLiteDB 以共享 DSN 打开库并按命名池参数配置——metrics/audit 两库
+// 打开路径单源。主库不走本函数：其打开必须经 openDatabase 测试缝
+// （初始化失败清理断言依赖捕获主库句柄）。
+func openSQLiteDB(path string, pool sqlitePoolConfig) (*sql.DB, error) {
+	database, err := sql.Open("sqlite", path+sqliteWALDSNParams)
+	if err != nil {
+		return nil, err
+	}
+	applySQLitePool(database, pool)
+	return database, nil
+}
 
 // 库值唯一真相（批 1+2，2026-10-14 用户裁定）类型①值型列默认值——渲染层
 // 写死兜底废除后，默认值的唯一入口：fresh DDL DEFAULT、启动迁移回填
@@ -189,10 +227,9 @@ func Initialize(dataDir string) (err error) {
 		return fmt.Errorf("failed to secure database file: %w", err)
 	}
 
-	// glebarez 仅识别 _pragma/_txlock/_time_format 三类 DSN 参数；_pragma 会在
-	// 每条新建连接上执行（applyQueryParams），正适合 busy_timeout 这类连接级参数。
-	// journal_mode 是文件级（一次迁移持久生效），放这里仅为幂等兜底。
-	database, err := openDatabase("sqlite", dbPath+"?_txlock=immediate&_pragma=journal_mode(WAL)&_pragma=busy_timeout(30000)&_pragma=synchronous(NORMAL)")
+	// 主库打开必须经 openDatabase 测试缝（初始化失败清理断言依赖捕获
+	// 主库句柄）；DSN 与池设置走三库共享单源。
+	database, err := openDatabase("sqlite", dbPath+sqliteWALDSNParams)
 	if err != nil {
 		return fmt.Errorf("failed to open database: %w", err)
 	}
@@ -212,12 +249,10 @@ func Initialize(dataDir string) (err error) {
 		DB, MetricsDB, AuditDB = oldDB, oldMetricsDB, oldAuditDB
 	}()
 
-	database.SetMaxOpenConns(10)
-	database.SetMaxIdleConns(5)
 	// 连接最长存活 30 分钟：Begin/Commit 歧义（客户端超时取消）可能在池中留下
 	// SQLite 层事务未关闭的「中毒连接」（表现为 cannot start a transaction within
 	// a transaction / 持锁不放）；定期换血把最坏影响面限制在半个生命周期内。
-	database.SetConnMaxLifetime(30 * time.Minute)
+	applySQLitePool(database, sqlitePoolConfig{maxOpen: 10, maxIdle: 5, connMaxLifetime: 30 * time.Minute})
 
 	if err := database.Ping(); err != nil {
 		return fmt.Errorf("failed to ping database: %w", err)
@@ -328,6 +363,9 @@ func createTables() error {
 
 	-- LB Rules table (caddy_id is now the primary key)
 	CREATE TABLE IF NOT EXISTS lb_rules (
+		-- id 是主键迁移（id→caddy_id）前的历史列：新行恒 NULL，唯一残存消费是
+		-- 一处兼容排序（NULL 列 ORDER BY 退化为 rowid 序，行为等价）。长期保留
+		-- 以兼容旧备份/旧快照的按列名回放，禁止新消费。
 		id INTEGER,
 		name VARCHAR(100) NOT NULL,
 		description VARCHAR(300),
@@ -562,12 +600,14 @@ func createTables() error {
 	--                              唯一判定性读点是审批 SQL 的 status='pending'
 	--                              （若未来重建表，可改 is_approved=0 且
 	--                              registration_secret 非空）。
-	--   cluster_token_delivered    只写不读（注册/审批置 0、令牌下发置 1）；令牌重投
-	--                              语义由 registration_secret 保留 + Snapshot 确认清除
-	--                              承载，本列无消费方。
-	--   sync_interval              写侧从不写（schema 默认 60），阈值口径统一读
-	--                              global_config.sync_interval。
-	-- 三列随下一次 nodes 重建迁移删除；此前保留仅为兼容旧库/旧快照回放。
+	--   cluster_token_delivered    注册/审批置 0、令牌下发置 1；业务读侧零消费，
+	--                              但备份恢复链路会写入本列且参与导入类型门
+	--                              （handlers/config_backup.go 节点拓扑段）。
+	--   sync_interval              运行期写侧从不写（schema 默认 60），阈值口径
+	--                              统一读 global_config.sync_interval；备份恢复
+	--                              会按备份载荷写入本列。
+	-- 三列长期保留：旧备份/旧快照回放按列名对齐写入，删除会让历史备份还原
+	-- 缺列报错——「下次重建删除」承诺作废（保留即兼容契约）。
 	CREATE TABLE IF NOT EXISTS nodes (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		name VARCHAR(100) NOT NULL,
@@ -871,6 +911,289 @@ CREATE TABLE IF NOT EXISTS security_threat_sources (
 	return nil
 }
 
+var newColumnsRegistry = map[string]string{
+	// 迁入登记：原 runMigrations 头部的逐列硬编码检查与
+	// apiKeyColumns/newLbColumns 局部 map 循环——DDL 与默认值逐字沿用原登记。
+	"users.display_name":                  "VARCHAR(100)",
+	"users.is_enabled":                    "BOOLEAN NOT NULL DEFAULT 1",
+	"api_keys.is_enabled":                 "BOOLEAN DEFAULT TRUE",
+	"api_keys.mcp_enabled":                "INTEGER DEFAULT 0",
+	"api_keys.read_only":                  "INTEGER DEFAULT 0",
+	"api_keys.mcp_ip_whitelist":           "TEXT DEFAULT ''",
+	"lb_rules.domain":                     "VARCHAR(255)",
+	"lb_rules.tls_cert":                   "TEXT",
+	"lb_rules.tls_key":                    "TEXT",
+	"lb_rules.tls_http_redirect":          "BOOLEAN DEFAULT FALSE",
+	"lb_rules.dynamic_dns":                "BOOLEAN DEFAULT FALSE",
+	"lb_rules.enable_active_health_check": "BOOLEAN DEFAULT FALSE",
+	"lb_rules.tls_source":                 "VARCHAR(20) DEFAULT 'manual'",
+	"lb_rules.acme_config_id":             "INTEGER DEFAULT 0",
+	"lb_rules.ca_provider_id":             "INTEGER DEFAULT 0",
+	"lb_rules.caddy_id":                   "VARCHAR(20)",
+	"lb_rules.dns_family":                 "VARCHAR(20) DEFAULT 'ipv4'",
+	"lb_rules.updated_by":                 "INTEGER",
+	"lb_rules.tcp_health_check_port":      "INTEGER DEFAULT 0",
+	"lb_rules.tcp_proxy_protocol":         "BOOLEAN DEFAULT 0",
+	"lb_rules.tcp_try_duration":           "INTEGER DEFAULT 0",
+	"lb_rules.tcp_try_interval":           "INTEGER NOT NULL DEFAULT 250",
+	"lb_rules.request_body_max_size_mb":   "INTEGER DEFAULT 0",
+	"lb_rules.upstream_keepalive_timeout": "INTEGER DEFAULT 0",
+	"lb_rules.server_tokens_hidden":       "INTEGER DEFAULT 0",
+	"lb_rules.ntlm_compatible":            "INTEGER NOT NULL DEFAULT 0",
+	"lb_rules.upstream_force_http1":       "INTEGER NOT NULL DEFAULT 0",
+	"lb_rules.block_page_stage1_id":       "INTEGER NOT NULL DEFAULT 0",
+	"lb_rules.block_page_stage1_status":   "INTEGER NOT NULL DEFAULT 0",
+	"lb_rules.block_page_stage3_id":       "INTEGER NOT NULL DEFAULT 0",
+	"lb_rules.block_page_stage3_status":   "INTEGER NOT NULL DEFAULT 0",
+	"auto_backups.app_version":            "TEXT NOT NULL DEFAULT ''",
+	// 统一任务引擎：手动触发操作者归因列——runNow/Trigger 落
+	// 操作者，auto/startup/legacy 落空串。存量库幂等补列（ensureNewColumns）。
+	"task_runs.operator":                              "TEXT NOT NULL DEFAULT ''",
+	"security_custom_rules.updated_by":                "INTEGER DEFAULT 0",
+	"security_policies.policy_type":                   "TEXT NOT NULL DEFAULT ''",
+	"security_policies.trust_detection":               "BOOLEAN NOT NULL DEFAULT 0",
+	"security_crs_version.update_status":              "TEXT DEFAULT 'idle'",
+	"security_crs_version.message":                    "TEXT DEFAULT ''",
+	"security_crs_version.last_checked":               "DATETIME",
+	"security_crs_version.next_update":                "DATETIME",
+	"security_crs_version.trigger":                    "TEXT DEFAULT ''",
+	"security_crs_version.started_at":                 "DATETIME",
+	"security_crs_version.finished_at":                "DATETIME",
+	"security_crs_version.consecutive_failures":       "INTEGER DEFAULT 0",
+	"security_ip2region_version.update_status":        "TEXT DEFAULT 'idle'",
+	"security_ip2region_version.message":              "TEXT DEFAULT ''",
+	"security_ip2region_version.last_checked":         "DATETIME",
+	"security_ip2region_version.next_update":          "DATETIME",
+	"security_ip2region_version.trigger":              "TEXT DEFAULT ''",
+	"security_ip2region_version.started_at":           "DATETIME",
+	"security_ip2region_version.finished_at":          "DATETIME",
+	"security_ip2region_version.consecutive_failures": "INTEGER DEFAULT 0",
+	"upstreams.max_connections":                       "INTEGER DEFAULT 0",
+	// 逐上游回源域名 + 健康检查域名（2026-10-10）：空串=不配置，
+	// 回退规则级 host_header / 现状默认。
+	"upstreams.origin_domain":          "TEXT NOT NULL DEFAULT ''",
+	"lb_rules.health_check_host":       "TEXT NOT NULL DEFAULT ''",
+	"global_config.threat_auto_update": "INTEGER NOT NULL DEFAULT 1",
+	// 一次性迁移旗标列：迁移函数只读/置位，列创建统一走本登记点
+	// （幂等 ensureNewColumns），不再各自 pragma 探测 + ALTER。
+	"global_config.waf_mode4_migrated":     "BOOLEAN DEFAULT 0",
+	"global_config.sync_switches_migrated": "BOOLEAN DEFAULT 0",
+	// 存量自定义规则清理的一次性指纹 marker（迁移定义版本；''=未跑）。
+	// 该迁移的判据在 JSON 内容里，无法用索引探测，只能整表读+解析——marker
+	// 置位后启动零读零写。
+	"global_config.legacy_custom_rule_sanitize_fp": "TEXT NOT NULL DEFAULT ''",
+	"security_ip_lists.system":                     "INTEGER NOT NULL DEFAULT 0",
+	// MFA 登录挑战绑定签发时密码版本。
+	"mfa_challenges.password_version":      "INTEGER NOT NULL DEFAULT 0",
+	"path_rules.upstream_path":             "TEXT NOT NULL DEFAULT ''",
+	"security_threat_sources.content_hash": "TEXT DEFAULT ''",
+	"security_threat_sources.raw_hash":     "TEXT DEFAULT ''",
+	// 规则库定时调度（v2.3.x）：星期多选逗号串（1=周一…7=周日，默认全选=
+	// 每天）+ HH:MM 时间（默认 04:00），槽位按基础设置时区本地日历计算、
+	// UTC 落库。CRS/IP2Region 列落版本表；威胁库为任务级排程，列挂
+	// global_config（与 threat_auto_update 同表先例）。
+	"security_crs_version.schedule_days": "TEXT NOT NULL DEFAULT '1,2,3,4,5,6,7'",
+	"security_crs_version.schedule_time": "TEXT NOT NULL DEFAULT '04:00'",
+	// 自定义路由静态响应/301 跳转（2026-10-10）：path_rules 五列，''=转发零漂移。
+	"path_rules.response_mode":         "TEXT NOT NULL DEFAULT ''",
+	"path_rules.response_status":       "INTEGER NOT NULL DEFAULT 200",
+	"path_rules.response_body":         "TEXT NOT NULL DEFAULT ''",
+	"path_rules.response_content_type": "TEXT NOT NULL DEFAULT ''",
+	"path_rules.redirect_to":           "TEXT NOT NULL DEFAULT ''",
+	// ip2region 侧同族两列（追加问题，用户上报）：fresh DDL 建表
+	// 含两列（db.go ip2region_version CREATE），存量库补列迁移此前漏登记
+	// ——升级安装更新定时排程必报 no such column: schedule_days。
+	"security_ip2region_version.schedule_days": "TEXT NOT NULL DEFAULT '1,2,3,4,5,6,7'",
+	"security_ip2region_version.schedule_time": "TEXT NOT NULL DEFAULT '04:00'",
+	// global_config 单行表恒经 newColumns 补列（threat_auto_update 起的既定
+	// 口径——fresh DDL 不追平，对齐仅适用多行版本/策略表）。
+	"global_config.threat_schedule_days": "TEXT NOT NULL DEFAULT '1,2,3,4,5,6,7'",
+	"global_config.threat_schedule_time": "TEXT NOT NULL DEFAULT '04:00'",
+	// 爬虫地址库（v2.3.8 独立库）：任务级总闸与排程独立三列，
+	// 不共享 threat_* 配置。
+	"global_config.crawler_auto_update":    "INTEGER NOT NULL DEFAULT 1",
+	"global_config.crawler_schedule_days":  "TEXT NOT NULL DEFAULT '1,2,3,4,5,6,7'",
+	"global_config.crawler_schedule_time":  "TEXT NOT NULL DEFAULT '04:00'",
+	"cert_jobs.ca_provider_id":             "INTEGER DEFAULT 0",
+	"cert_jobs.renewal_attempts":           "INTEGER DEFAULT 0",
+	"cert_jobs.ca_available_after":         "DATETIME",
+	"cert_jobs.last_error_code":            "VARCHAR(20)",
+	"cert_jobs.deployment_attempts":        "INTEGER DEFAULT 0",
+	"cert_jobs.deployment_available_after": "DATETIME",
+	"users.mfa_enabled":                    "BOOLEAN DEFAULT 0",
+	"users.mfa_secret":                     "TEXT DEFAULT ''",
+	"users.mfa_pending_secret":             "TEXT DEFAULT ''",
+	"users.mfa_recovery_codes":             "TEXT DEFAULT '[]'",
+	"users.mfa_last_timestep":              "INTEGER DEFAULT 0",
+	"users.mfa_pending_fails":              "INTEGER DEFAULT 0",
+	// （契约）：账户级登录锁定列（auth.go Login 写读；与 MFA 写保护的
+	// mfa_* 计数列独立，登录锁定与 MFA 冷却互不牵连）。计数列 NOT NULL——
+	// 存量行取默认 0，不存在 NULL 语义。
+	"users.login_failed_attempts": "INTEGER NOT NULL DEFAULT 0",
+	"users.login_locked_until":    "TEXT",
+	// OIDC 集成(2026-09-17 v2.3.0):用户来源标记与身份三元组——
+	// auth_provider 'local'/'oidc';oidc 用户不绑定本地账号(独立行),
+	// (issuer, subject) 唯一定位,重复登录按此命中。
+	"users.auth_provider":               "TEXT NOT NULL DEFAULT 'local'",
+	"users.oidc_subject":                "TEXT DEFAULT ''",
+	"users.oidc_issuer":                 "TEXT DEFAULT ''",
+	"global_config.oidc_config":         "TEXT",
+	"mfa_challenges.attempts":           "INTEGER DEFAULT 0",
+	"global_config.mfa_write_guard":     "BOOLEAN DEFAULT 0",
+	"global_config.mfa_lockout_enabled": "BOOLEAN DEFAULT 0",
+	// v2.3.x 真实 IP 支持：受信代理（CDN 回源）四列——启用开关、回源网段
+	// （CIDR JSON 数组）、请求头名（有序 JSON 数组）、严格模式。渲染层
+	// （servers.trusted_proxies）与 caddygeoip/限流/阶段 0 取值共用。
+	"global_config.trusted_proxy_enabled": "INTEGER NOT NULL DEFAULT 0",
+	"global_config.trusted_proxy_ranges":  "TEXT NOT NULL DEFAULT '[]'",
+	// 受信网段引用名单（2026-10-12）：JSON 数组文本，存 security_ip_lists 的
+	// id 列表（镜像策略 ip_acl_list_refs 形态）；渲染与内联 CIDR 合并投影
+	// （2026-10-15 热路径化：tp.txt/lb_file 文件源，内容变化零 /load）。
+	"global_config.trusted_proxy_range_refs":               "TEXT NOT NULL DEFAULT '[]'",
+	"global_config.trusted_proxy_headers":                  "TEXT NOT NULL DEFAULT '[]'",
+	"global_config.trusted_proxy_strict":                   "INTEGER NOT NULL DEFAULT 1",
+	"global_config.default_ca_provider_id":                 "INTEGER DEFAULT 0",
+	"global_config.cert_renewal_days":                      "INTEGER DEFAULT 30",
+	"global_config.cert_renewal_attempts":                  "INTEGER DEFAULT 5",
+	"global_config.task_log_size_mb":                       "INTEGER DEFAULT 10",
+	"global_config.audit_log_size_mb":                      "INTEGER DEFAULT 10",
+	"global_config.caddy_apply_error":                      "TEXT DEFAULT ''",
+	"global_config.runtime_log_size_mb":                    "INTEGER DEFAULT 100",
+	"global_config.acme_email":                             "VARCHAR(255)",
+	"global_config.cert_expiry_days":                       "INTEGER DEFAULT 30",
+	"global_config.caddy_log_level":                        "VARCHAR(10) DEFAULT 'info'",
+	"global_config.caddy_log_size_mb":                      "INTEGER NOT NULL DEFAULT 100",
+	"global_config.request_body_max_size_mb":               "INTEGER NOT NULL DEFAULT 128",
+	"global_config.http_read_timeout":                      "INTEGER NOT NULL DEFAULT 60",
+	"global_config.http_write_timeout":                     "INTEGER NOT NULL DEFAULT 60",
+	"global_config.http_idle_timeout":                      "INTEGER NOT NULL DEFAULT 120",
+	"global_config.upstream_keepalive_timeout":             "INTEGER DEFAULT 0",
+	"global_config.server_tokens_hidden":                   "BOOLEAN DEFAULT FALSE",
+	"global_config.admin_tls_enabled":                      "BOOLEAN DEFAULT 0",
+	"global_config.admin_tls_mode":                         "VARCHAR(20) DEFAULT 'selfsigned'",
+	"global_config.admin_tls_cert":                         "TEXT DEFAULT ''",
+	"global_config.admin_tls_key":                          "TEXT DEFAULT ''",
+	"global_config.access_log_json":                        "BOOLEAN DEFAULT TRUE",
+	"global_config.access_log_format":                      "TEXT DEFAULT ''",
+	"global_config.audit_retention_months":                 "INTEGER DEFAULT 3",
+	"global_config.jwt_expire_minutes":                     fmt.Sprintf("INTEGER DEFAULT %d", DefaultJWTExpireMinutes),
+	"global_config.timezone":                               "VARCHAR(50) DEFAULT 'Asia/Shanghai'",
+	"global_config.github_proxy_url":                       "TEXT NOT NULL DEFAULT 'https://v4.gh-proxy.org/'",
+	"global_config.github_token":                           "TEXT NOT NULL DEFAULT ''",
+	"global_config.server_map_lat":                         "REAL NOT NULL DEFAULT 0",
+	"global_config.threat_screen_mode":                     fmt.Sprintf("TEXT NOT NULL DEFAULT '%s'", DefaultThreatScreenMode),
+	"global_config.threat_traffic_sample_n":                fmt.Sprintf("INTEGER NOT NULL DEFAULT %d", DefaultThreatTrafficSampleN), // -1=自适应/0=关闭（全量/固定档废除）
+	"global_config.threat_traffic_sample_unified_migrated": "INTEGER NOT NULL DEFAULT 0",
+	// 安全事件保留显式化：默认 90 天 / 100 万行由配置本身承载，
+	// 不再用 0 隐式映射服务层写死默认值。默认值单源=Default* 常量。
+	"global_config.security_events_retention_days":     fmt.Sprintf("INTEGER NOT NULL DEFAULT %d", DefaultSecurityEventsRetentionDays),
+	"global_config.security_events_row_cap":            fmt.Sprintf("INTEGER NOT NULL DEFAULT %d", DefaultSecurityEventsRowCap),
+	"global_config.security_events_retention_migrated": "INTEGER NOT NULL DEFAULT 0",
+	// CA 提供商播种一次性 marker。此前「表空即
+	// 播种」每次启动评估——导入/集群快照把 ca_providers 清空后重启会复活
+	// ZeroSSL/LE 并覆盖 default_ca_provider_id，与「删除即不存在」相悖。
+	// marker=1 表示本库已完成首播，此后表空保持空（节点本地语义：不参与
+	// 集群快照/配置备份——见 runMigrations 播种块注释）。
+	"global_config.ca_providers_seeded":           "INTEGER NOT NULL DEFAULT 0",
+	"global_config.server_map_lon":                "REAL NOT NULL DEFAULT 0",
+	"lb_rules.log_enabled":                        "BOOLEAN DEFAULT 0",
+	"lb_rules.custom_routes_enabled":              "BOOLEAN NOT NULL DEFAULT 0",
+	"lb_rules.proxy_dial_timeout":                 "INTEGER NOT NULL DEFAULT 0",
+	"lb_rules.proxy_response_header_timeout":      "INTEGER NOT NULL DEFAULT 0",
+	"lb_rules.proxy_read_timeout":                 "INTEGER NOT NULL DEFAULT 0",
+	"lb_rules.proxy_write_timeout":                "INTEGER NOT NULL DEFAULT 0",
+	"lb_rules.proxy_stream_timeout":               "INTEGER NOT NULL DEFAULT 0",
+	"lb_rules.proxy_flush_interval":               "INTEGER NOT NULL DEFAULT 0",
+	"lb_rules.proxy_stream_close_delay":           "INTEGER NOT NULL DEFAULT 0",
+	"global_config.proxy_dial_timeout":            "INTEGER DEFAULT 0",
+	"global_config.proxy_response_header_timeout": "INTEGER DEFAULT 0",
+	"global_config.proxy_read_timeout":            "INTEGER DEFAULT 0",
+	"global_config.proxy_write_timeout":           "INTEGER DEFAULT 0",
+	"global_config.proxy_stream_timeout":          "INTEGER DEFAULT 0",
+	"global_config.proxy_flush_interval":          "INTEGER DEFAULT 0",
+	"global_config.proxy_stream_close_delay":      "INTEGER DEFAULT 0",
+	"users.password_changed_at":                   "DATETIME",
+	"users.password_version":                      "INTEGER NOT NULL DEFAULT 0",
+	"global_config.cluster_version":               "INTEGER DEFAULT 0",
+	"global_config.sync_users":                    "BOOLEAN DEFAULT 1",
+	// branding.json 原文镜像(2026-09-11):主节点经快照分发到从节点,
+	// 入触发器 OF 列表——文件变化即 bump cluster_version。
+	"global_config.branding_json":                 "TEXT DEFAULT ''",
+	"global_config.sync_rules":                    "BOOLEAN DEFAULT 1",
+	"global_config.sync_security":                 "BOOLEAN DEFAULT 1",
+	"global_config.cluster_token":                 "TEXT DEFAULT ''",
+	"global_config.registration_id":               "INTEGER DEFAULT 0",
+	"global_config.registration_secret":           "TEXT DEFAULT ''",
+	"global_config.registration_confirm_failures": "INTEGER DEFAULT 0",
+	"global_config.applied_version":               "INTEGER DEFAULT 0",
+	"global_config.last_sync_error":               "TEXT DEFAULT ''",
+	"global_config.sync_fingerprint":              "TEXT DEFAULT ''",
+	"nodes.cluster_token_hash":                    "VARCHAR(64)",
+	"nodes.protocol":                              "VARCHAR(10) DEFAULT 'http'",
+	"nodes.access_url":                            "VARCHAR(255) DEFAULT ''",
+	"nodes.registration_secret":                   "VARCHAR(64)",
+	"nodes.registration_secret_expires_at":        "DATETIME",
+	"nodes.cluster_token_delivered":               "BOOLEAN DEFAULT FALSE",
+	"nodes.reported_version":                      "INTEGER DEFAULT 0",
+	"nodes.health_json":                           "TEXT",
+	"nodes.last_sync_at":                          "DATETIME",
+	"nodes.last_sync_error":                       "TEXT",
+	"security_policies.crs_excluded_rules":        "TEXT DEFAULT '[]'",
+	"security_policies.ip_acl_mode":               "TEXT DEFAULT ''",
+	"security_policies.ip_acl_list":               "TEXT DEFAULT '[]'",
+	"security_policies.ip_acl_enabled":            "BOOLEAN DEFAULT FALSE",
+	"security_policies.block_page_id":             "INTEGER DEFAULT 0",
+	"security_block_pages.created_by":             "INTEGER DEFAULT 0",
+	"security_block_pages.updated_by":             "INTEGER DEFAULT 0",
+	// 内置备选拦截页标志（2026-09-25 裁定）：id 9001 限流/9002 维护，与
+	// is_default 同门禁（不可编辑/删除），仅作模板手动选用，无自动绑定。
+	"security_block_pages.is_builtin":   "BOOLEAN DEFAULT FALSE",
+	"security_block_pages.content_type": "TEXT DEFAULT 'text/html; charset=utf-8'",
+	"security_policies.updated_by":      "INTEGER DEFAULT 0",
+	// 四列刻意可空（不加 NOT NULL）：restoreTable/快照/带外脏数据可携带 NULL，
+	// 读路径 loadSecurityPolicyContext 以 COALESCE 归一化；加 NOT NULL 会拒绝 null 恢复。
+	"security_policies.ip_whitelist_enabled":  "INTEGER DEFAULT 1",
+	"security_policies.geoip_countries":       "TEXT DEFAULT '[]'",
+	"security_policies.geoip_mode":            "TEXT DEFAULT 'deny'",
+	"security_policies.geoip_crawler_exempt":  "INTEGER NOT NULL DEFAULT 0",
+	"security_policies.geoip_crawler_engines": "TEXT NOT NULL DEFAULT '[]'",
+	"security_policies.waf_check_response":    "INTEGER DEFAULT 0",
+	"security_policies.block_status_code":     "INTEGER DEFAULT 0",
+	// 策略级「记录请求体」开关（v2.2.3）：开启后该策略 handler 的审计 parts
+	// 加 C，事件落 request_body（64KB 截断）。同口径刻意可空，读路径
+	// COALESCE(...,0) 归一。
+	"security_policies.log_request_body": "INTEGER DEFAULT 0",
+	// 可复用 IP 列表引用列（v2.3.0）：JSON 数组文本，存 security_ip_lists 的
+	// id 列表；同样刻意可空——读路径一律 COALESCE(...,'[]') 归一（同上口径）。
+	"security_policies.ip_acl_list_refs":  "TEXT DEFAULT '[]'",
+	"security_policies.ip_whitelist_refs": "TEXT DEFAULT '[]'",
+	// 自动备份(v2.3.x):设置五列 + 节点本地运行态 last_run
+	"global_config.auto_backup_enabled":          "INTEGER DEFAULT 0",
+	"global_config.auto_backup_frequency":        "TEXT DEFAULT 'daily'",
+	"global_config.auto_backup_time":             "TEXT DEFAULT '03:00'",
+	"global_config.auto_backup_day":              "INTEGER DEFAULT 1",
+	"global_config.auto_backup_keep":             "INTEGER DEFAULT 7",
+	"global_config.auto_backup_sections":         "TEXT DEFAULT '[\"users\",\"rules\",\"security\",\"cluster\"]'",
+	"global_config.auto_backup_sections_version": "INTEGER NOT NULL DEFAULT 0",
+	"global_config.auto_backup_last_run":         "DATETIME",
+	// 三分类合并·方案A(2026-09-19):文件态记账专用列(wafFilesDrifted
+	// 的 304 兜底与标签自愈依赖;哈希域=纯 ref 含版本标签)。
+	"global_config.applied_waf_ref_hash":    "TEXT DEFAULT ''",
+	"global_config.applied_waf_ref_version": "INTEGER DEFAULT 0",
+	// 自动封禁六项配置列：启用/阈值/窗口分钟/封禁时长（枚举
+	// '10m','30m','1h','6h','12h','24h','permanent'）/统计口径（'blocked',
+	// 'logged','all'）/观察模式（1=默认 dry-run，仅记录建议不落名单）。
+	// 全部 NOT NULL——语义零值即合法值（关/100/5/'1h'/'all'/观察），无 NULL 分支。
+	"global_config.autoban_enabled":        "INTEGER NOT NULL DEFAULT 0",
+	"global_config.autoban_threshold":      "INTEGER NOT NULL DEFAULT 100",
+	"global_config.autoban_window_minutes": "INTEGER NOT NULL DEFAULT 5",
+	"global_config.autoban_duration":       "TEXT NOT NULL DEFAULT '1h'",
+	"global_config.autoban_scope":          "TEXT NOT NULL DEFAULT 'all'",
+	"global_config.autoban_dry_run":        "INTEGER NOT NULL DEFAULT 1",
+	"nodes.server_map_lat":                 "REAL NOT NULL DEFAULT 0",
+	"nodes.server_map_lon":                 "REAL NOT NULL DEFAULT 0",
+}
+
 func runMigrations() error {
 	// users.display_name/is_enabled、api_keys.is_enabled/
 	// mcp_enabled/read_only/mcp_ip_whitelist 与 lb_rules 八列（domain/tls_cert/
@@ -879,15 +1202,17 @@ func runMigrations() error {
 	// 三代并存惯用法（逐列硬编码/局部 map 循环/通用 ensureNewColumns）只留后者，
 	// 下次加列只有一处登记点（schedule_days 单侧漏登记事故即登记点分裂的代价）。
 
-	strategyResult, err := DB.Exec("UPDATE lb_rules SET strategy='weighted_round_robin' WHERE strategy='round_robin'")
+	strategyResult, err := execMigrationWriteIfNeeded("UPDATE lb_rules SET strategy='weighted_round_robin' WHERE strategy='round_robin'")
 	if err != nil {
 		return fmt.Errorf("failed to normalize lb_rules strategy: %w", err)
 	}
-	if n, _ := strategyResult.RowsAffected(); n > 0 {
-		// 用户规则配置被改写须留痕。
-		detail := fmt.Sprintf("启动迁移：存量规则负载策略 round_robin 归一为 weighted_round_robin：%d 条", n)
-		log.Print(detail)
-		recordSystemAudit("启动迁移", "负载规则", detail)
+	if strategyResult != nil {
+		if n, _ := strategyResult.RowsAffected(); n > 0 {
+			// 用户规则配置被改写须留痕。
+			detail := fmt.Sprintf("启动迁移：存量规则负载策略 round_robin 归一为 weighted_round_robin：%d 条", n)
+			log.Print(detail)
+			recordSystemAudit("启动迁移", "负载规则", detail)
+		}
 	}
 
 	if _, err := DB.Exec("DROP TABLE IF EXISTS config_versions"); err != nil {
@@ -898,9 +1223,10 @@ func runMigrations() error {
 	}
 	// （2026-09-05/06 审计裁定）：metrics_public/metrics_origins 为零
 	// 消费死列（历史上预留给「指标公开访问/CORS」设想，从未接线）；
-	// metrics_retention_days 的指标保留期已改用 audit_retention_months
-	//（2026-09-06 裁定）——三列存量库逐列删除（逐列判定使单列残留
-	// 形态也可收敛）；新库由建表语句与 newColumns 不再补建。
+	// metrics_retention_days 是旧可配置指标保留期列——现行保留期固定 7 天
+	//（services cleanupHistory 写死，不读 audit_retention_months）——三列
+	// 存量库逐列删除（逐列判定使单列残留形态也可收敛）；新库由建表语句
+	// 与 newColumns 不再补建。
 	for _, deadMetricsColumn := range []string{"metrics_public", "metrics_origins", "metrics_retention_days"} {
 		if _, err := dropColumnIfExists("global_config", deadMetricsColumn); err != nil {
 			return err
@@ -918,288 +1244,7 @@ func runMigrations() error {
 	// 例外：整表重建迁移（users/security_policies/nodes/lb_rules+upstreams/
 	// cert_jobs 重建 DDL）必须同步携列——重建位于二次 ensureNewColumns 安全网
 	// 之后，丢列无同启动自愈。
-	newColumns := map[string]string{
-		// 迁入登记：原 runMigrations 头部的逐列硬编码检查与
-		// apiKeyColumns/newLbColumns 局部 map 循环——DDL 与默认值逐字沿用原登记。
-		"users.display_name":                  "VARCHAR(100)",
-		"users.is_enabled":                    "BOOLEAN DEFAULT 1",
-		"api_keys.is_enabled":                 "BOOLEAN DEFAULT 1",
-		"api_keys.mcp_enabled":                "INTEGER DEFAULT 0",
-		"api_keys.read_only":                  "INTEGER DEFAULT 0",
-		"api_keys.mcp_ip_whitelist":           "TEXT DEFAULT ''",
-		"lb_rules.domain":                     "VARCHAR(255)",
-		"lb_rules.tls_cert":                   "TEXT",
-		"lb_rules.tls_key":                    "TEXT",
-		"lb_rules.tls_http_redirect":          "BOOLEAN DEFAULT 0",
-		"lb_rules.dynamic_dns":                "BOOLEAN DEFAULT 0",
-		"lb_rules.enable_active_health_check": "BOOLEAN DEFAULT 0",
-		"lb_rules.tls_source":                 "VARCHAR(20) DEFAULT 'manual'",
-		"lb_rules.acme_config_id":             "INTEGER DEFAULT 0",
-		"lb_rules.ca_provider_id":             "INTEGER DEFAULT 0",
-		"lb_rules.caddy_id":                   "VARCHAR(20)",
-		"lb_rules.dns_family":                 "VARCHAR(20) DEFAULT 'ipv4'",
-		"lb_rules.updated_by":                 "INTEGER",
-		"lb_rules.tcp_health_check_port":      "INTEGER DEFAULT 0",
-		"lb_rules.tcp_proxy_protocol":         "BOOLEAN DEFAULT 0",
-		"lb_rules.tcp_try_duration":           "INTEGER DEFAULT 0",
-		"lb_rules.tcp_try_interval":           "INTEGER NOT NULL DEFAULT 250",
-		"lb_rules.request_body_max_size_mb":   "INTEGER DEFAULT 0",
-		"lb_rules.upstream_keepalive_timeout": "INTEGER DEFAULT 0",
-		"lb_rules.server_tokens_hidden":       "INTEGER DEFAULT 0",
-		"lb_rules.ntlm_compatible":            "INTEGER NOT NULL DEFAULT 0",
-		"lb_rules.upstream_force_http1":       "INTEGER NOT NULL DEFAULT 0",
-		"lb_rules.block_page_stage1_id":       "INTEGER NOT NULL DEFAULT 0",
-		"lb_rules.block_page_stage1_status":   "INTEGER NOT NULL DEFAULT 0",
-		"lb_rules.block_page_stage3_id":       "INTEGER NOT NULL DEFAULT 0",
-		"lb_rules.block_page_stage3_status":   "INTEGER NOT NULL DEFAULT 0",
-		"auto_backups.app_version":            "TEXT NOT NULL DEFAULT ''",
-		// 统一任务引擎：手动触发操作者归因列——runNow/Trigger 落
-		// 操作者，auto/startup/legacy 落空串。存量库幂等补列（ensureNewColumns）。
-		"task_runs.operator":                              "TEXT NOT NULL DEFAULT ''",
-		"security_custom_rules.updated_by":                "INTEGER DEFAULT 0",
-		"security_policies.policy_type":                   "TEXT NOT NULL DEFAULT ''",
-		"security_policies.trust_detection":               "BOOLEAN NOT NULL DEFAULT 0",
-		"security_crs_version.update_status":              "TEXT DEFAULT 'idle'",
-		"security_crs_version.message":                    "TEXT DEFAULT ''",
-		"security_crs_version.last_checked":               "DATETIME",
-		"security_crs_version.next_update":                "DATETIME",
-		"security_crs_version.trigger":                    "TEXT DEFAULT ''",
-		"security_crs_version.started_at":                 "DATETIME",
-		"security_crs_version.finished_at":                "DATETIME",
-		"security_crs_version.consecutive_failures":       "INTEGER DEFAULT 0",
-		"security_ip2region_version.update_status":        "TEXT DEFAULT 'idle'",
-		"security_ip2region_version.message":              "TEXT DEFAULT ''",
-		"security_ip2region_version.last_checked":         "DATETIME",
-		"security_ip2region_version.next_update":          "DATETIME",
-		"security_ip2region_version.trigger":              "TEXT DEFAULT ''",
-		"security_ip2region_version.started_at":           "DATETIME",
-		"security_ip2region_version.finished_at":          "DATETIME",
-		"security_ip2region_version.consecutive_failures": "INTEGER DEFAULT 0",
-		"upstreams.max_connections":                       "INTEGER DEFAULT 0",
-		// 逐上游回源域名 + 健康检查域名（2026-10-10）：空串=不配置，
-		// 回退规则级 host_header / 现状默认。
-		"upstreams.origin_domain":          "TEXT NOT NULL DEFAULT ''",
-		"lb_rules.health_check_host":       "TEXT NOT NULL DEFAULT ''",
-		"global_config.threat_auto_update": "INTEGER NOT NULL DEFAULT 1",
-		// 一次性迁移旗标列：迁移函数只读/置位，列创建统一走本登记点
-		// （幂等 ensureNewColumns），不再各自 pragma 探测 + ALTER。
-		"global_config.waf_mode4_migrated":     "BOOLEAN DEFAULT 0",
-		"global_config.sync_switches_migrated": "BOOLEAN DEFAULT 0",
-		// 存量自定义规则清理的一次性指纹 marker（迁移定义版本；''=未跑）。
-		// 该迁移的判据在 JSON 内容里，无法用索引探测，只能整表读+解析——marker
-		// 置位后启动零读零写。
-		"global_config.legacy_custom_rule_sanitize_fp": "TEXT NOT NULL DEFAULT ''",
-		"security_ip_lists.system":                     "INTEGER NOT NULL DEFAULT 0",
-		// MFA 登录挑战绑定签发时密码版本。
-		"mfa_challenges.password_version":      "INTEGER NOT NULL DEFAULT 0",
-		"path_rules.upstream_path":             "TEXT NOT NULL DEFAULT ''",
-		"security_threat_sources.content_hash": "TEXT DEFAULT ''",
-		"security_threat_sources.raw_hash":     "TEXT DEFAULT ''",
-		// 规则库定时调度（v2.3.x）：星期多选逗号串（1=周一…7=周日，默认全选=
-		// 每天）+ HH:MM 时间（默认 04:00），槽位按基础设置时区本地日历计算、
-		// UTC 落库。CRS/IP2Region 列落版本表；威胁库为任务级排程，列挂
-		// global_config（与 threat_auto_update 同表先例）。
-		"security_crs_version.schedule_days": "TEXT NOT NULL DEFAULT '1,2,3,4,5,6,7'",
-		"security_crs_version.schedule_time": "TEXT NOT NULL DEFAULT '04:00'",
-		// 自定义路由静态响应/301 跳转（2026-10-10）：path_rules 五列，''=转发零漂移。
-		"path_rules.response_mode":         "TEXT NOT NULL DEFAULT ''",
-		"path_rules.response_status":       "INTEGER NOT NULL DEFAULT 200",
-		"path_rules.response_body":         "TEXT NOT NULL DEFAULT ''",
-		"path_rules.response_content_type": "TEXT NOT NULL DEFAULT ''",
-		"path_rules.redirect_to":           "TEXT NOT NULL DEFAULT ''",
-		// ip2region 侧同族两列（追加问题，用户上报）：fresh DDL 建表
-		// 含两列（db.go ip2region_version CREATE），存量库补列迁移此前漏登记
-		// ——升级安装更新定时排程必报 no such column: schedule_days。
-		"security_ip2region_version.schedule_days": "TEXT NOT NULL DEFAULT '1,2,3,4,5,6,7'",
-		"security_ip2region_version.schedule_time": "TEXT NOT NULL DEFAULT '04:00'",
-		// global_config 单行表恒经 newColumns 补列（threat_auto_update 起的既定
-		// 口径——fresh DDL 不追平，对齐仅适用多行版本/策略表）。
-		"global_config.threat_schedule_days": "TEXT NOT NULL DEFAULT '1,2,3,4,5,6,7'",
-		"global_config.threat_schedule_time": "TEXT NOT NULL DEFAULT '04:00'",
-		// 爬虫地址库（v2.3.8 独立库）：任务级总闸与排程独立三列，
-		// 不共享 threat_* 配置。
-		"global_config.crawler_auto_update":    "INTEGER NOT NULL DEFAULT 1",
-		"global_config.crawler_schedule_days":  "TEXT NOT NULL DEFAULT '1,2,3,4,5,6,7'",
-		"global_config.crawler_schedule_time":  "TEXT NOT NULL DEFAULT '04:00'",
-		"cert_jobs.ca_provider_id":             "INTEGER DEFAULT 0",
-		"cert_jobs.renewal_attempts":           "INTEGER DEFAULT 0",
-		"cert_jobs.ca_available_after":         "DATETIME",
-		"cert_jobs.last_error_code":            "VARCHAR(20)",
-		"cert_jobs.deployment_attempts":        "INTEGER DEFAULT 0",
-		"cert_jobs.deployment_available_after": "DATETIME",
-		"users.mfa_enabled":                    "BOOLEAN DEFAULT 0",
-		"users.mfa_secret":                     "TEXT DEFAULT ''",
-		"users.mfa_pending_secret":             "TEXT DEFAULT ''",
-		"users.mfa_recovery_codes":             "TEXT DEFAULT '[]'",
-		"users.mfa_last_timestep":              "INTEGER DEFAULT 0",
-		"users.mfa_pending_fails":              "INTEGER DEFAULT 0",
-		// （契约）：账户级登录锁定列（auth.go Login 写读；与 MFA 写保护的
-		// mfa_* 计数列独立，登录锁定与 MFA 冷却互不牵连）。计数列 NOT NULL——
-		// 存量行取默认 0，不存在 NULL 语义。
-		"users.login_failed_attempts": "INTEGER NOT NULL DEFAULT 0",
-		"users.login_locked_until":    "TEXT",
-		// OIDC 集成(2026-09-17 v2.3.0):用户来源标记与身份三元组——
-		// auth_provider 'local'/'oidc';oidc 用户不绑定本地账号(独立行),
-		// (issuer, subject) 唯一定位,重复登录按此命中。
-		"users.auth_provider":               "TEXT NOT NULL DEFAULT 'local'",
-		"users.oidc_subject":                "TEXT DEFAULT ''",
-		"users.oidc_issuer":                 "TEXT DEFAULT ''",
-		"global_config.oidc_config":         "TEXT",
-		"mfa_challenges.attempts":           "INTEGER DEFAULT 0",
-		"global_config.mfa_write_guard":     "BOOLEAN DEFAULT 0",
-		"global_config.mfa_lockout_enabled": "BOOLEAN DEFAULT 0",
-		// v2.3.x 真实 IP 支持：受信代理（CDN 回源）四列——启用开关、回源网段
-		// （CIDR JSON 数组）、请求头名（有序 JSON 数组）、严格模式。渲染层
-		// （servers.trusted_proxies）与 caddygeoip/限流/阶段 0 取值共用。
-		"global_config.trusted_proxy_enabled": "INTEGER NOT NULL DEFAULT 0",
-		"global_config.trusted_proxy_ranges":  "TEXT NOT NULL DEFAULT '[]'",
-		// 受信网段引用名单（2026-10-12）：JSON 数组文本，存 security_ip_lists 的
-		// id 列表（镜像策略 ip_acl_list_refs 形态）；渲染与内联 CIDR 合并投影
-		// （2026-10-15 热路径化：tp.txt/lb_file 文件源，内容变化零 /load）。
-		"global_config.trusted_proxy_range_refs":               "TEXT NOT NULL DEFAULT '[]'",
-		"global_config.trusted_proxy_headers":                  "TEXT NOT NULL DEFAULT '[]'",
-		"global_config.trusted_proxy_strict":                   "INTEGER NOT NULL DEFAULT 1",
-		"global_config.default_ca_provider_id":                 "INTEGER DEFAULT 0",
-		"global_config.cert_renewal_days":                      "INTEGER DEFAULT 30",
-		"global_config.cert_renewal_attempts":                  "INTEGER DEFAULT 5",
-		"global_config.task_log_size_mb":                       "INTEGER DEFAULT 10",
-		"global_config.audit_log_size_mb":                      "INTEGER DEFAULT 10",
-		"global_config.caddy_apply_error":                      "TEXT DEFAULT ''",
-		"global_config.runtime_log_size_mb":                    "INTEGER DEFAULT 100",
-		"global_config.acme_email":                             "VARCHAR(255)",
-		"global_config.cert_expiry_days":                       "INTEGER DEFAULT 30",
-		"global_config.caddy_log_level":                        "VARCHAR(10) DEFAULT 'info'",
-		"global_config.caddy_log_size_mb":                      "INTEGER NOT NULL DEFAULT 100",
-		"global_config.request_body_max_size_mb":               "INTEGER NOT NULL DEFAULT 128",
-		"global_config.http_read_timeout":                      "INTEGER NOT NULL DEFAULT 60",
-		"global_config.http_write_timeout":                     "INTEGER NOT NULL DEFAULT 60",
-		"global_config.http_idle_timeout":                      "INTEGER NOT NULL DEFAULT 120",
-		"global_config.upstream_keepalive_timeout":             "INTEGER DEFAULT 0",
-		"global_config.server_tokens_hidden":                   "BOOLEAN DEFAULT FALSE",
-		"global_config.admin_tls_enabled":                      "BOOLEAN DEFAULT 0",
-		"global_config.admin_tls_mode":                         "VARCHAR(20) DEFAULT 'selfsigned'",
-		"global_config.admin_tls_cert":                         "TEXT DEFAULT ''",
-		"global_config.admin_tls_key":                          "TEXT DEFAULT ''",
-		"global_config.access_log_json":                        "BOOLEAN DEFAULT TRUE",
-		"global_config.access_log_format":                      "TEXT DEFAULT ''",
-		"global_config.audit_retention_months":                 "INTEGER DEFAULT 3",
-		"global_config.jwt_expire_minutes":                     fmt.Sprintf("INTEGER DEFAULT %d", DefaultJWTExpireMinutes),
-		"global_config.timezone":                               "VARCHAR(50) DEFAULT 'Asia/Shanghai'",
-		"global_config.github_proxy_url":                       "TEXT NOT NULL DEFAULT 'https://v4.gh-proxy.org/'",
-		"global_config.github_token":                           "TEXT NOT NULL DEFAULT ''",
-		"global_config.server_map_lat":                         "REAL NOT NULL DEFAULT 0",
-		"global_config.threat_screen_mode":                     fmt.Sprintf("TEXT NOT NULL DEFAULT '%s'", DefaultThreatScreenMode),
-		"global_config.threat_traffic_sample_n":                fmt.Sprintf("INTEGER NOT NULL DEFAULT %d", DefaultThreatTrafficSampleN), // -1=自适应/0=关闭（全量/固定档废除）
-		"global_config.threat_traffic_sample_unified_migrated": "INTEGER NOT NULL DEFAULT 0",
-		// 安全事件保留显式化：默认 90 天 / 100 万行由配置本身承载，
-		// 不再用 0 隐式映射服务层写死默认值。默认值单源=Default* 常量。
-		"global_config.security_events_retention_days":     fmt.Sprintf("INTEGER NOT NULL DEFAULT %d", DefaultSecurityEventsRetentionDays),
-		"global_config.security_events_row_cap":            fmt.Sprintf("INTEGER NOT NULL DEFAULT %d", DefaultSecurityEventsRowCap),
-		"global_config.security_events_retention_migrated": "INTEGER NOT NULL DEFAULT 0",
-		// CA 提供商播种一次性 marker。此前「表空即
-		// 播种」每次启动评估——导入/集群快照把 ca_providers 清空后重启会复活
-		// ZeroSSL/LE 并覆盖 default_ca_provider_id，与「删除即不存在」相悖。
-		// marker=1 表示本库已完成首播，此后表空保持空（节点本地语义：不参与
-		// 集群快照/配置备份——见 runMigrations 播种块注释）。
-		"global_config.ca_providers_seeded":           "INTEGER NOT NULL DEFAULT 0",
-		"global_config.server_map_lon":                "REAL NOT NULL DEFAULT 0",
-		"lb_rules.log_enabled":                        "BOOLEAN DEFAULT 0",
-		"lb_rules.custom_routes_enabled":              "BOOLEAN NOT NULL DEFAULT 0",
-		"lb_rules.proxy_dial_timeout":                 "INTEGER NOT NULL DEFAULT 0",
-		"lb_rules.proxy_response_header_timeout":      "INTEGER NOT NULL DEFAULT 0",
-		"lb_rules.proxy_read_timeout":                 "INTEGER NOT NULL DEFAULT 0",
-		"lb_rules.proxy_write_timeout":                "INTEGER NOT NULL DEFAULT 0",
-		"lb_rules.proxy_stream_timeout":               "INTEGER NOT NULL DEFAULT 0",
-		"lb_rules.proxy_flush_interval":               "INTEGER NOT NULL DEFAULT 0",
-		"lb_rules.proxy_stream_close_delay":           "INTEGER NOT NULL DEFAULT 0",
-		"global_config.proxy_dial_timeout":            "INTEGER DEFAULT 0",
-		"global_config.proxy_response_header_timeout": "INTEGER DEFAULT 0",
-		"global_config.proxy_read_timeout":            "INTEGER DEFAULT 0",
-		"global_config.proxy_write_timeout":           "INTEGER DEFAULT 0",
-		"global_config.proxy_stream_timeout":          "INTEGER DEFAULT 0",
-		"global_config.proxy_flush_interval":          "INTEGER DEFAULT 0",
-		"global_config.proxy_stream_close_delay":      "INTEGER DEFAULT 0",
-		"users.password_changed_at":                   "DATETIME",
-		"users.password_version":                      "INTEGER NOT NULL DEFAULT 0",
-		"global_config.cluster_version":               "INTEGER DEFAULT 0",
-		"global_config.sync_users":                    "BOOLEAN DEFAULT 1",
-		// branding.json 原文镜像(2026-09-11):主节点经快照分发到从节点,
-		// 入触发器 OF 列表——文件变化即 bump cluster_version。
-		"global_config.branding_json":                 "TEXT DEFAULT ''",
-		"global_config.sync_rules":                    "BOOLEAN DEFAULT 1",
-		"global_config.sync_security":                 "BOOLEAN DEFAULT 1",
-		"global_config.cluster_token":                 "TEXT DEFAULT ''",
-		"global_config.registration_id":               "INTEGER DEFAULT 0",
-		"global_config.registration_secret":           "TEXT DEFAULT ''",
-		"global_config.registration_confirm_failures": "INTEGER DEFAULT 0",
-		"global_config.applied_version":               "INTEGER DEFAULT 0",
-		"global_config.last_sync_error":               "TEXT DEFAULT ''",
-		"global_config.sync_fingerprint":              "TEXT DEFAULT ''",
-		"nodes.cluster_token_hash":                    "VARCHAR(64)",
-		"nodes.protocol":                              "VARCHAR(10) DEFAULT 'http'",
-		"nodes.access_url":                            "VARCHAR(255) DEFAULT ''",
-		"nodes.registration_secret":                   "VARCHAR(64)",
-		"nodes.registration_secret_expires_at":        "DATETIME",
-		"nodes.cluster_token_delivered":               "BOOLEAN DEFAULT 0",
-		"nodes.reported_version":                      "INTEGER DEFAULT 0",
-		"nodes.health_json":                           "TEXT",
-		"nodes.last_sync_at":                          "DATETIME",
-		"nodes.last_sync_error":                       "TEXT",
-		"security_policies.crs_excluded_rules":        "TEXT DEFAULT '[]'",
-		"security_policies.ip_acl_mode":               "TEXT DEFAULT ''",
-		"security_policies.ip_acl_list":               "TEXT DEFAULT '[]'",
-		"security_policies.ip_acl_enabled":            "BOOLEAN DEFAULT FALSE",
-		"security_policies.block_page_id":             "INTEGER DEFAULT 0",
-		"security_block_pages.created_by":             "INTEGER DEFAULT 0",
-		"security_block_pages.updated_by":             "INTEGER DEFAULT 0",
-		// 内置备选拦截页标志（2026-09-25 裁定）：id 9001 限流/9002 维护，与
-		// is_default 同门禁（不可编辑/删除），仅作模板手动选用，无自动绑定。
-		"security_block_pages.is_builtin":   "INTEGER DEFAULT 0",
-		"security_block_pages.content_type": "TEXT DEFAULT 'text/html; charset=utf-8'",
-		"security_policies.updated_by":      "INTEGER DEFAULT 0",
-		// 四列刻意可空（不加 NOT NULL）：restoreTable/快照/带外脏数据可携带 NULL，
-		// 读路径 loadSecurityPolicyContext 以 COALESCE 归一化；加 NOT NULL 会拒绝 null 恢复。
-		"security_policies.ip_whitelist_enabled":  "INTEGER DEFAULT 1",
-		"security_policies.geoip_countries":       "TEXT DEFAULT '[]'",
-		"security_policies.geoip_mode":            "TEXT DEFAULT 'deny'",
-		"security_policies.geoip_crawler_exempt":  "INTEGER NOT NULL DEFAULT 0",
-		"security_policies.geoip_crawler_engines": "TEXT NOT NULL DEFAULT '[]'",
-		"security_policies.waf_check_response":    "INTEGER DEFAULT 0",
-		"security_policies.block_status_code":     "INTEGER DEFAULT 0",
-		// 策略级「记录请求体」开关（v2.2.3）：开启后该策略 handler 的审计 parts
-		// 加 C，事件落 request_body（64KB 截断）。同口径刻意可空，读路径
-		// COALESCE(...,0) 归一。
-		"security_policies.log_request_body": "INTEGER DEFAULT 0",
-		// 可复用 IP 列表引用列（v2.3.0）：JSON 数组文本，存 security_ip_lists 的
-		// id 列表；同样刻意可空——读路径一律 COALESCE(...,'[]') 归一（同上口径）。
-		"security_policies.ip_acl_list_refs":  "TEXT DEFAULT '[]'",
-		"security_policies.ip_whitelist_refs": "TEXT DEFAULT '[]'",
-		// 自动备份(v2.3.x):设置五列 + 节点本地运行态 last_run
-		"global_config.auto_backup_enabled":          "INTEGER DEFAULT 0",
-		"global_config.auto_backup_frequency":        "TEXT DEFAULT 'daily'",
-		"global_config.auto_backup_time":             "TEXT DEFAULT '03:00'",
-		"global_config.auto_backup_day":              "INTEGER DEFAULT 1",
-		"global_config.auto_backup_keep":             "INTEGER DEFAULT 7",
-		"global_config.auto_backup_sections":         "TEXT DEFAULT '[\"users\",\"rules\",\"security\",\"cluster\"]'",
-		"global_config.auto_backup_sections_version": "INTEGER NOT NULL DEFAULT 0",
-		"global_config.auto_backup_last_run":         "DATETIME",
-		// 三分类合并·方案A(2026-09-19):文件态记账专用列(wafFilesDrifted
-		// 的 304 兜底与标签自愈依赖;哈希域=纯 ref 含版本标签)。
-		"global_config.applied_waf_ref_hash":    "TEXT DEFAULT ''",
-		"global_config.applied_waf_ref_version": "INTEGER DEFAULT 0",
-		// 自动封禁六项配置列：启用/阈值/窗口分钟/封禁时长（枚举
-		// '10m','30m','1h','6h','12h','24h','permanent'）/统计口径（'blocked',
-		// 'logged','all'）/观察模式（1=默认 dry-run，仅记录建议不落名单）。
-		// 全部 NOT NULL——语义零值即合法值（关/100/5/'1h'/'all'/观察），无 NULL 分支。
-		"global_config.autoban_enabled":        "INTEGER NOT NULL DEFAULT 0",
-		"global_config.autoban_threshold":      "INTEGER NOT NULL DEFAULT 100",
-		"global_config.autoban_window_minutes": "INTEGER NOT NULL DEFAULT 5",
-		"global_config.autoban_duration":       "TEXT NOT NULL DEFAULT '1h'",
-		"global_config.autoban_scope":          "TEXT NOT NULL DEFAULT 'all'",
-		"global_config.autoban_dry_run":        "INTEGER NOT NULL DEFAULT 1",
-		"nodes.server_map_lat":                 "REAL NOT NULL DEFAULT 0",
-		"nodes.server_map_lon":                 "REAL NOT NULL DEFAULT 0",
-	}
+	newColumns := newColumnsRegistry
 	// 四个全局超时列的 0→推荐默认回填原为「仅新增列时执行一次」——
 	// 当时渲染层把 0 当作「省略=用 Caddy 默认」的有效值，每启动无条件回填会
 	// 静默改写用户显式设置的 0。批 1+2（库值唯一真相，2026-10-14 用户裁定）
@@ -1283,16 +1328,19 @@ func runMigrations() error {
 		return fmt.Errorf("failed to drop tls_certificates: %w", err)
 	}
 	// 审计 FK OFF 时代 DeleteRule 缺 path_rules 显式删除所积累的孤儿行
-	// 一次性清理（幂等，无孤儿零命中）——孤儿随备份导出会使导入侧引用校验 400。
-	orphanPathResult, err := DB.Exec("DELETE FROM path_rules WHERE rule_id NOT IN (SELECT caddy_id FROM lb_rules)")
+	// 一次性清理（幂等，无孤儿零命中且探测门不取写锁）——孤儿随备份导出
+	// 会使导入侧引用校验 400。
+	orphanPathResult, err := execMigrationWriteIfNeeded("DELETE FROM path_rules WHERE rule_id NOT IN (SELECT caddy_id FROM lb_rules)")
 	if err != nil {
 		return fmt.Errorf("failed to clean orphaned path_rules: %w", err)
 	}
-	if n, _ := orphanPathResult.RowsAffected(); n > 0 {
-		// 删除用户数据须留痕（与孤儿 upstream 审计同口径）。
-		detail := fmt.Sprintf("启动迁移：已清理 %d 条孤儿 path_rules 行（rule_id 无对应规则）", n)
-		log.Print(detail)
-		recordSystemAudit("启动迁移", "负载规则", detail)
+	if orphanPathResult != nil {
+		if n, _ := orphanPathResult.RowsAffected(); n > 0 {
+			// 删除用户数据须留痕（与孤儿 upstream 审计同口径）。
+			detail := fmt.Sprintf("启动迁移：已清理 %d 条孤儿 path_rules 行（rule_id 无对应规则）", n)
+			log.Print(detail)
+			recordSystemAudit("启动迁移", "负载规则", detail)
+		}
 	}
 	if _, err := DB.Exec("CREATE INDEX IF NOT EXISTS idx_api_keys_prefix_hash ON api_keys(key_prefix,key_hash)"); err != nil {
 		return fmt.Errorf("failed to index API key authentication: %w", err)
@@ -1364,7 +1412,9 @@ func runMigrations() error {
 		"UPDATE global_config SET autoban_dry_run=1 WHERE autoban_dry_run IS NULL OR autoban_dry_run NOT IN (0,1)",
 	}
 	for _, statement := range defaultUpdates {
-		if _, err := DB.Exec(statement); err != nil {
+		// 先只读探测再写：收敛库上这批回填全部零命中，探测门让二次启动
+		// 不取写锁（与「二次启动零写事务」口径一致）。
+		if _, err := execMigrationWriteIfNeeded(statement); err != nil {
 			return fmt.Errorf("failed to update global config defaults: %w", err)
 		}
 	}
@@ -1566,14 +1616,14 @@ func runMigrations() error {
 
 	// 一次性迁移——存量 upstreams.enabled 为 NULL 的遗留行归一化为 0
 	// （NULL 视禁用，与渲染/CRUD/度量侧 IIF 口径一致；幂等，重跑无副作用）。
-	if _, err := DB.Exec("UPDATE upstreams SET enabled=0 WHERE enabled IS NULL"); err != nil {
+	if _, err := execMigrationWriteIfNeeded("UPDATE upstreams SET enabled=0 WHERE enabled IS NULL"); err != nil {
 		return fmt.Errorf("failed to normalize NULL upstreams.enabled: %w", err)
 	}
 
 	// 一次性迁移——存量 lb_rules.enabled 为 NULL 的遗留行归一化为 0
 	// （NULL 视禁用，与渲染侧 WHERE enabled=1 口径一致；幂等，重跑无副作用）。
 	// migrateLbRulesPrimaryKey 的重建拷贝已用 COALESCE(enabled,0) 兜底，顺序无关。
-	if _, err := DB.Exec("UPDATE lb_rules SET enabled=0 WHERE enabled IS NULL"); err != nil {
+	if _, err := execMigrationWriteIfNeeded("UPDATE lb_rules SET enabled=0 WHERE enabled IS NULL"); err != nil {
 		return fmt.Errorf("failed to normalize NULL lb_rules.enabled: %w", err)
 	}
 
@@ -1582,16 +1632,16 @@ func runMigrations() error {
 	// NULL 时间戳，集群 dump 侧 snapshotRules/snapshotACME 裸列直扫 time.Time
 	// 对 NULL 失败会中断整集群同步。启动幂等回填 epoch（与恢复通道、dump 侧
 	// COALESCE 同值）；须在 PK 重建之后（重建拷贝对 created_at 原样保留 NULL）。
-	if _, err := DB.Exec("UPDATE lb_rules SET created_at='1970-01-01 00:00:00' WHERE created_at IS NULL"); err != nil {
+	if _, err := execMigrationWriteIfNeeded("UPDATE lb_rules SET created_at='1970-01-01 00:00:00' WHERE created_at IS NULL"); err != nil {
 		return fmt.Errorf("failed to backfill NULL lb_rules.created_at: %w", err)
 	}
-	if _, err := DB.Exec("UPDATE ca_providers SET created_at='1970-01-01 00:00:00' WHERE created_at IS NULL"); err != nil {
+	if _, err := execMigrationWriteIfNeeded("UPDATE ca_providers SET created_at='1970-01-01 00:00:00' WHERE created_at IS NULL"); err != nil {
 		return fmt.Errorf("failed to backfill NULL ca_providers.created_at: %w", err)
 	}
-	if _, err := DB.Exec("UPDATE ca_providers SET updated_at='1970-01-01 00:00:00' WHERE updated_at IS NULL"); err != nil {
+	if _, err := execMigrationWriteIfNeeded("UPDATE ca_providers SET updated_at='1970-01-01 00:00:00' WHERE updated_at IS NULL"); err != nil {
 		return fmt.Errorf("failed to backfill NULL ca_providers.updated_at: %w", err)
 	}
-	if _, err := DB.Exec("UPDATE certificate_configs SET created_at='1970-01-01 00:00:00' WHERE created_at IS NULL"); err != nil {
+	if _, err := execMigrationWriteIfNeeded("UPDATE certificate_configs SET created_at='1970-01-01 00:00:00' WHERE created_at IS NULL"); err != nil {
 		return fmt.Errorf("failed to backfill NULL certificate_configs.created_at: %w", err)
 	}
 
@@ -1645,26 +1695,26 @@ func runMigrations() error {
 	// 详情/重试）。同块补齐同值 epoch 回填；users_not_null 重建
 	// （migrateUsersIsEnabledNotNull，上方先行执行）的 INSERT 拷贝对
 	// created_at 原样保留 NULL，此处位于重建之后，顺序安全；幂等。
-	if _, err := DB.Exec("UPDATE users SET created_at='1970-01-01 00:00:00' WHERE created_at IS NULL"); err != nil {
+	if _, err := execMigrationWriteIfNeeded("UPDATE users SET created_at='1970-01-01 00:00:00' WHERE created_at IS NULL"); err != nil {
 		return fmt.Errorf("failed to backfill NULL users.created_at: %w", err)
 	}
-	if _, err := DB.Exec("UPDATE api_keys SET created_at='1970-01-01 00:00:00' WHERE created_at IS NULL"); err != nil {
+	if _, err := execMigrationWriteIfNeeded("UPDATE api_keys SET created_at='1970-01-01 00:00:00' WHERE created_at IS NULL"); err != nil {
 		return fmt.Errorf("failed to backfill NULL api_keys.created_at: %w", err)
 	}
-	if _, err := DB.Exec("UPDATE path_rules SET created_at='1970-01-01 00:00:00' WHERE created_at IS NULL"); err != nil {
+	if _, err := execMigrationWriteIfNeeded("UPDATE path_rules SET created_at='1970-01-01 00:00:00' WHERE created_at IS NULL"); err != nil {
 		return fmt.Errorf("failed to backfill NULL path_rules.created_at: %w", err)
 	}
-	if _, err := DB.Exec("UPDATE cert_jobs SET created_at='1970-01-01 00:00:00' WHERE created_at IS NULL"); err != nil {
+	if _, err := execMigrationWriteIfNeeded("UPDATE cert_jobs SET created_at='1970-01-01 00:00:00' WHERE created_at IS NULL"); err != nil {
 		return fmt.Errorf("failed to backfill NULL cert_jobs.created_at: %w", err)
 	}
 
 	// 版本表 consecutive_failures 一次性 NULL 回填（读取端
 	// crsupdate.go/crsscheduler.go readConsecutiveFailures 对 NULL 优雅回退 0，
 	// 此处消灭理论 NULL 使落库形态与备份归一口径一致；幂等）。
-	if _, err := DB.Exec("UPDATE security_crs_version SET consecutive_failures=0 WHERE consecutive_failures IS NULL"); err != nil {
+	if _, err := execMigrationWriteIfNeeded("UPDATE security_crs_version SET consecutive_failures=0 WHERE consecutive_failures IS NULL"); err != nil {
 		return fmt.Errorf("failed to backfill NULL security_crs_version.consecutive_failures: %w", err)
 	}
-	if _, err := DB.Exec("UPDATE security_ip2region_version SET consecutive_failures=0 WHERE consecutive_failures IS NULL"); err != nil {
+	if _, err := execMigrationWriteIfNeeded("UPDATE security_ip2region_version SET consecutive_failures=0 WHERE consecutive_failures IS NULL"); err != nil {
 		return fmt.Errorf("failed to backfill NULL security_ip2region_version.consecutive_failures: %w", err)
 	}
 
@@ -1677,7 +1727,7 @@ func runMigrations() error {
 		return fmt.Errorf("failed to check global_config.is_master: %w", err)
 	}
 	if isMasterColumn > 0 {
-		if _, err := DB.Exec("UPDATE global_config SET is_master=1 WHERE id=1 AND is_master IS NULL"); err != nil {
+		if _, err := execMigrationWriteIfNeeded("UPDATE global_config SET is_master=1 WHERE id=1 AND is_master IS NULL"); err != nil {
 			return fmt.Errorf("failed to backfill NULL global_config.is_master: %w", err)
 		}
 	}
@@ -1937,11 +1987,12 @@ func migrateSecurityPolicyCustomOnlyMode() error {
 
 // normalizeCertJobsCAAvailableAfter 将 cert_jobs.ca_available_after 规范化为
 // SQLite 规范 UTC 格式（详见 runMigrations 调用点注释）。返回执行结果供
-// 调用方/测试断言受影响行数。WHERE 追加 ca_available_after != datetime(...)
+// 调用方/测试断言受影响行数；探测门零命中时返回 (nil, nil)（连写语句都不
+// 执行，等价 0 行改写）。WHERE 追加 ca_available_after != datetime(...)
 // 排除已规范化的行：SQLite 对值未变的 UPDATE 也写页（页脏 + WAL 增长），
 // 该守卫让迁移成为真正的一次性回填。
 func normalizeCertJobsCAAvailableAfter() (sql.Result, error) {
-	return DB.Exec(`UPDATE cert_jobs SET ca_available_after = datetime(ca_available_after)
+	return execMigrationWriteIfNeeded(`UPDATE cert_jobs SET ca_available_after = datetime(ca_available_after)
 		WHERE ca_available_after IS NOT NULL
 		AND datetime(ca_available_after) IS NOT NULL
 		AND ca_available_after != datetime(ca_available_after)`)
@@ -2152,6 +2203,52 @@ var startupLegacySanitizeMigrations atomic.Int64 // 真正执行整表扫描的�
 // startupMigrationWriteTx 启动迁移开启写事务的次数（测试观测二次启动零写事务）。
 var startupMigrationWriteTx atomic.Int64
 
+// startupMigrationWriteStatements 探测门后真实执行的写语句数（测试观测
+// 二次启动收敛库零写语句）。
+var startupMigrationWriteStatements atomic.Int64
+
+// execMigrationWriteIfNeeded 先只读探测（不取写锁）再决定是否执行写语句。
+// _txlock=immediate 下每条 DB.Exec 的 UPDATE/DELETE 都是立即取写锁的事务，
+// 收敛库上数十条零命中写语句是每启动的固定写锁成本。探测从语句自身的
+// WHERE 段派生（UPDATE/DELETE 的 <table> 与 <cond> → SELECT 1 FROM <table>
+// WHERE <cond> LIMIT 1），条件与写语句天然同源零漂移；有命中行才执行写。
+// 多行语句先折叠空白再解析（WHERE 段常换行起始）。
+// 返回 (nil, nil) 表示探测零命中、语句被跳过；无法解析 WHERE 段的语句形态
+// 直接执行（响亮可见，不静默跳过）。
+func execMigrationWriteIfNeeded(statement string) (sql.Result, error) {
+	squashed := strings.Join(strings.Fields(statement), " ")
+	var table string
+	var rest string
+	switch {
+	case strings.HasPrefix(squashed, "UPDATE "):
+		rest = strings.TrimPrefix(squashed, "UPDATE ")
+	case strings.HasPrefix(squashed, "DELETE FROM "):
+		rest = strings.TrimPrefix(squashed, "DELETE FROM ")
+	default:
+		startupMigrationWriteStatements.Add(1)
+		return DB.Exec(statement)
+	}
+	spaceIdx := strings.Index(rest, " ")
+	if spaceIdx > 0 {
+		table = rest[:spaceIdx]
+	}
+	whereIdx := strings.Index(rest, " WHERE ")
+	if table == "" || whereIdx < 0 {
+		startupMigrationWriteStatements.Add(1)
+		return DB.Exec(statement)
+	}
+	var hit int
+	err := DB.QueryRow("SELECT 1 FROM " + table + rest[whereIdx:] + " LIMIT 1").Scan(&hit)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("probe before write %q: %w", statement, err)
+	}
+	startupMigrationWriteStatements.Add(1)
+	return DB.Exec(statement)
+}
+
 func sanitizeLegacyCustomRulePatterns() error {
 	return sanitizeLegacyCustomRulePatternsAt(legacyCustomRuleSanitizeFingerprint)
 }
@@ -2305,6 +2402,22 @@ var canonicalDomainMigrationSources = []struct {
 	{table: "upstreams", column: "host", query: "SELECT id, host FROM upstreams WHERE trim(host) != ''"},
 }
 
+// certJobsDedupeSQL 是 cert_jobs (rule_id,domain) 去重的单趟窗口函数语句
+// （与 nodesDedupeSQL 同形态）：保留「有证书材料优先，同列 id 大者」。
+// 此前用逐行相关子查询（每行对全表做一次匹配子扫，O(n²)）——DROP 唯一
+// 索引后执行，证书任务量上行时成本线性放大。
+// 判据与原相关子查询逐行等价：ORDER BY 材料有無 DESC, id DESC 的 rn=1 行
+// 即原 ORDER BY ... LIMIT 1 的选中行。
+const certJobsDedupeSQL = `DELETE FROM cert_jobs WHERE id IN (
+	SELECT id FROM (
+		SELECT id, ROW_NUMBER() OVER (
+			PARTITION BY rule_id, domain
+			ORDER BY (CASE WHEN COALESCE(cert_pem,'')='' OR COALESCE(key_pem,'')='' THEN 0 ELSE 1 END) DESC, id DESC
+		) AS rn
+		FROM cert_jobs
+	) WHERE rn > 1
+)`
+
 // canonicalDomainMigrationNeeded 以与迁移本体相同的口径判定是否有事可做：任一存量
 // 值与规范形不同，或 cert_jobs 仍存在 (rule_id, domain) 重复组。无事可做时调用方
 // 整段跳过——否则每次启动都白跑一次 DROP/CREATE 唯一索引（立即写事务）加三次全表
@@ -2422,12 +2535,8 @@ func migrateCanonicalDomains() error {
 	// 去重保留判据改为「优先有证书材料的行，同列再比 id」——原 MAX(id)
 	// 在规范域碰撞时（legacy 大小写/IDN 变体行）可能删掉带已签发证书的旧行、
 	// 保留其后创建的无证书行，规则丢失现网证书需重签。一次性迁移窗口内生效。
-	dedupeResult, err := tx.Exec(`DELETE FROM cert_jobs WHERE id NOT IN (
-		SELECT a.id FROM cert_jobs a WHERE a.id = (
-			SELECT b.id FROM cert_jobs b
-			WHERE b.rule_id = a.rule_id AND b.domain = a.domain
-			ORDER BY (CASE WHEN COALESCE(b.cert_pem,'')='' OR COALESCE(b.key_pem,'')='' THEN 0 ELSE 1 END) DESC, b.id DESC
-			LIMIT 1))`)
+	// 单趟窗口函数（certJobsDedupeSQL），替代逐行相关子查询的 O(n²) 形态。
+	dedupeResult, err := tx.Exec(certJobsDedupeSQL)
 	if err != nil {
 		return fmt.Errorf("deduplicate cert_jobs: %w", err)
 	}
@@ -2505,10 +2614,10 @@ func migrateThreatTrafficSampleUnified() error {
 	return nil
 }
 
-// migrateSecurityEventRetentionDefaults 一次性把旧库的 0=自动 语义回填为显式
-// 默认值（保留天数 90 天、行数上限 100 万），marker 置 1 后不再触碰运行期写值
-// （原实现每启动无条件把 0 改写为 90——写侧拒绝 0 后的存量
-// 0 只来自旧版本/旧导入，迁移一次即可；运行期显式值不得被重启静默改写）。
+// migrateAutoBackupNodeTopologySection 一次性把旧默认备份范围（三分类
+// users/rules/security）升级为含节点拓扑的四分类，version marker 置 1 后
+// 不再触碰用户后续显式保存的三键形态；畸形存量值不猜测修复，置 marker 后
+// 交由设置读侧 fail-visible。
 func migrateAutoBackupNodeTopologySection() error {
 	var version int
 	var raw sql.NullString
@@ -2545,15 +2654,17 @@ func migrateAutoBackupNodeTopologySection() error {
 }
 
 func normalizeUpstreamWeightsMigration() error {
-	res, err := DB.Exec(`UPDATE upstreams SET weight=1 WHERE weight IS NULL OR weight < 1`)
+	res, err := execMigrationWriteIfNeeded(`UPDATE upstreams SET weight=1 WHERE weight IS NULL OR weight < 1`)
 	if err != nil {
 		return err
 	}
-	if n, _ := res.RowsAffected(); n > 0 {
-		// 上游权重被改写须留痕。
-		detail := fmt.Sprintf("启动迁移：存量上游权重无效值（NULL/<1）归 1：%d 条", n)
-		log.Print(detail)
-		recordSystemAudit("启动迁移", "负载规则", detail)
+	if res != nil {
+		if n, _ := res.RowsAffected(); n > 0 {
+			// 上游权重被改写须留痕。
+			detail := fmt.Sprintf("启动迁移：存量上游权重无效值（NULL/<1）归 1：%d 条", n)
+			log.Print(detail)
+			recordSystemAudit("启动迁移", "负载规则", detail)
+		}
 	}
 	return nil
 }
@@ -2568,21 +2679,27 @@ func normalizeUpstreamWeightsMigration() error {
 // 经向导重新开启开关即恢复完整接管形态。幂等：一致行与 ntlm=0 行零命中。
 // 集群同步侧不需单独处理——主端归一后经快照收敛从端。
 func normalizeNtlmTakeoverConsistencyMigration() error {
-	res, err := DB.Exec(`UPDATE lb_rules SET ntlm_compatible=0 WHERE ntlm_compatible=1 AND (
+	res, err := execMigrationWriteIfNeeded(`UPDATE lb_rules SET ntlm_compatible=0 WHERE ntlm_compatible=1 AND (
 		COALESCE(tcp_try_duration,0)<>-1 OR COALESCE(upstream_force_http1,0)<>1
 		OR COALESCE(proxy_flush_interval,0)<>-1 OR COALESCE(upstream_keepalive_timeout,0)<>300)`)
 	if err != nil {
 		return err
 	}
-	if n, _ := res.RowsAffected(); n > 0 {
-		// 与孤儿 path_rules/上游权重归一同口径：归一用户数据须留痕。
-		detail := fmt.Sprintf("启动迁移：已将 %d 条「ntlm_compatible=1 但接管四列不齐」的规则归一为 ntlm_compatible=0（渲染对该列零感知，运行行为不变）", n)
-		log.Print(detail)
-		recordSystemAudit("启动迁移", "负载规则", detail)
+	if res != nil {
+		if n, _ := res.RowsAffected(); n > 0 {
+			// 与孤儿 path_rules/上游权重归一同口径：归一用户数据须留痕。
+			detail := fmt.Sprintf("启动迁移：已将 %d 条「ntlm_compatible=1 但接管四列不齐」的规则归一为 ntlm_compatible=0（渲染对该列零感知，运行行为不变）", n)
+			log.Print(detail)
+			recordSystemAudit("启动迁移", "负载规则", detail)
+		}
 	}
 	return nil
 }
 
+// migrateSecurityEventRetentionDefaults 一次性把旧库的 0=自动 语义回填为显式
+// 默认值（保留天数 90 天、行数上限 100 万），marker 置 1 后不再触碰运行期写值
+// （原实现每启动无条件把 0 改写为 90——写侧拒绝 0 后的存量
+// 0 只来自旧版本/旧导入，迁移一次即可；运行期显式值不得被重启静默改写）。
 func migrateSecurityEventRetentionDefaults() error {
 	var done int
 	if err := DB.QueryRow(`SELECT COALESCE(security_events_retention_migrated,0) FROM global_config WHERE id=1`).Scan(&done); err != nil && err != sql.ErrNoRows {
@@ -2622,9 +2739,11 @@ var (
 )
 
 // migrateSystemIPListUniqueIndex 为 security_ip_lists 的 system=1 行建立
-// (name) 部分唯一索引。存量重复行先按 MIN(id) 去重——同名
-// system=1 行只可能来自竞态，保留最早一行（与其它
-// 迁移的去重优先级一致）；删除行数留运行日志，便于事后核对引用。
+// (name) 部分唯一索引。存量重复行去重时「被引用优先」：同名组内有行被
+// 策略 ip_acl_list_refs/ip_whitelist_refs 或全局 trusted_proxy_range_refs
+// 引用时保留 MIN(被引用 id)（否则 MIN(id)），指向被删行的引用重写为
+// 存活 id——此前按 MIN(id) 删行不修引用，策略引用被删 id 时渲染期该
+// 名单条目整体消失（少拦/少放，安全面静默）。
 // 同名 system=0 用户列表不受索引约束（部分索引仅覆盖 system=1）。
 func migrateSystemIPListUniqueIndex() error {
 	// 先探测索引是否已在位：唯一索引建立后重复 system=1 行在写入侧即被拒绝，
@@ -2639,15 +2758,60 @@ func migrateSystemIPListUniqueIndex() error {
 		return nil
 	}
 	systemIPListUniqueIndexDedupes.Add(1)
-	var duplicates int
-	if err := DB.QueryRow(`SELECT COUNT(*) FROM security_ip_lists WHERE system=1 AND id NOT IN (SELECT MIN(id) FROM security_ip_lists WHERE system=1 GROUP BY name)`).Scan(&duplicates); err != nil {
-		return fmt.Errorf("count duplicate system ip lists: %w", err)
+	referenced, err := collectReferencedSystemIPListIDs()
+	if err != nil {
+		return fmt.Errorf("collect system ip list references: %w", err)
 	}
-	if duplicates > 0 {
-		if _, err := DB.Exec(`DELETE FROM security_ip_lists WHERE system=1 AND id NOT IN (SELECT MIN(id) FROM security_ip_lists WHERE system=1 GROUP BY name)`); err != nil {
+	rows, err := DB.Query(`SELECT id, name FROM security_ip_lists WHERE system=1 ORDER BY name, id`)
+	if err != nil {
+		return fmt.Errorf("list system ip lists: %w", err)
+	}
+	groups := map[string][]int{}
+	for rows.Next() {
+		var id int
+		var name string
+		if err := rows.Scan(&id, &name); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan system ip list row: %w", err)
+		}
+		groups[name] = append(groups[name], id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate system ip lists: %w", err)
+	}
+	rows.Close()
+	// ids 按 id 升序（ORDER BY name, id）——组内第一个被引用者即 MIN(被引用 id)。
+	remap := map[int]int{}
+	for _, ids := range groups {
+		if len(ids) < 2 {
+			continue
+		}
+		keep := ids[0]
+		for _, id := range ids {
+			if _, ok := referenced[id]; ok {
+				keep = id
+				break
+			}
+		}
+		for _, id := range ids {
+			if id != keep {
+				remap[id] = keep
+			}
+		}
+	}
+	if len(remap) > 0 {
+		deleted := make([]string, 0, len(remap))
+		for id := range remap {
+			deleted = append(deleted, strconv.Itoa(id))
+		}
+		if _, err := DB.Exec(`DELETE FROM security_ip_lists WHERE system=1 AND id IN (` + strings.Join(deleted, ",") + `)`); err != nil {
 			return fmt.Errorf("dedupe system ip lists: %w", err)
 		}
-		detail := fmt.Sprintf("启动迁移：security_ip_lists 重复的 system=1 名单行已去重（保留每组 MIN(id)）：%d 条", duplicates)
+		if err := rewriteSystemIPListRefs(remap); err != nil {
+			return fmt.Errorf("rewrite system ip list references: %w", err)
+		}
+		detail := fmt.Sprintf("启动迁移：security_ip_lists 重复的 system=1 名单行已去重（被引用行优先保留，引用已重写）：%d 条", len(remap))
 		log.Print(detail)
 		// 删除整行属用户可见数据改写（重复行可能携带已入库 IP 条目）：与
 		// cert_jobs 去重/域名归一同口径落「全操作审计」，不只留进程 stdout。
@@ -2655,6 +2819,146 @@ func migrateSystemIPListUniqueIndex() error {
 	}
 	if _, err := DB.Exec("CREATE UNIQUE INDEX IF NOT EXISTS u_security_ip_lists_system_name ON security_ip_lists(name) WHERE system=1"); err != nil {
 		return fmt.Errorf("create unique system ip list index: %w", err)
+	}
+	return nil
+}
+
+// systemIPListRefColumns 引用 security_ip_lists 行的 JSON id 数组列清单
+// （策略 ACL/白名单引用 + 全局受信代理范围引用）——去重保留优先级与引用
+// 重写共用同一引用面，新增引用列时必须同步登记。
+var systemIPListRefColumns = []struct {
+	table  string
+	column string
+}{
+	{"security_policies", "ip_acl_list_refs"},
+	{"security_policies", "ip_whitelist_refs"},
+	{"global_config", "trusted_proxy_range_refs"},
+}
+
+// collectReferencedSystemIPListIDs 收集全部引用面出现的名单 id 集合。
+// 仅在唯一索引缺失的一次性迁移路径执行（策略数规模），逐行 JSON 解析
+// 成本可忽略；畸形 JSON 响亮报错（迁移不得猜测修复引用）。
+// 引用列/表在该库形态下尚不存在（列由 newColumns 后补、测试直调旧形态）
+// 时跳过该引用面——不存在的列不可能持有引用。
+func collectReferencedSystemIPListIDs() (map[int]struct{}, error) {
+	ids := map[int]struct{}{}
+	for _, ref := range systemIPListRefColumns {
+		var hasTable, hasColumn int
+		if err := DB.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, ref.table).Scan(&hasTable); err != nil {
+			return nil, fmt.Errorf("inspect table %s: %w", ref.table, err)
+		}
+		if hasTable == 0 {
+			continue
+		}
+		if err := DB.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?`, ref.table, ref.column).Scan(&hasColumn); err != nil {
+			return nil, fmt.Errorf("inspect column %s.%s: %w", ref.table, ref.column, err)
+		}
+		if hasColumn == 0 {
+			continue
+		}
+		rows, err := DB.Query(`SELECT COALESCE(` + ref.column + `,'[]') FROM ` + ref.table)
+		if err != nil {
+			return nil, fmt.Errorf("query %s.%s: %w", ref.table, ref.column, err)
+		}
+		for rows.Next() {
+			var raw string
+			if err := rows.Scan(&raw); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan %s.%s: %w", ref.table, ref.column, err)
+			}
+			var parsed []int64
+			if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("parse %s.%s value %q: %w", ref.table, ref.column, raw, err)
+			}
+			for _, id := range parsed {
+				ids[int(id)] = struct{}{}
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("iterate %s.%s: %w", ref.table, ref.column, err)
+		}
+		rows.Close()
+	}
+	return ids, nil
+}
+
+// rewriteSystemIPListRefs 把引用面中指向被删行的 id 重写为存活 id；
+// 指向存活行的引用原样保留。数组内 id 顺序与重复形态保持不变。
+func rewriteSystemIPListRefs(remap map[int]int) error {
+	for _, ref := range systemIPListRefColumns {
+		// 与 collectReferencedSystemIPListIDs 同口径：库形态缺表/列时跳过
+		//（不存在的引用面不可能持有被删 id）。
+		var hasTable, hasColumn int
+		if err := DB.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, ref.table).Scan(&hasTable); err != nil {
+			return fmt.Errorf("inspect table %s: %w", ref.table, err)
+		}
+		if hasTable == 0 {
+			continue
+		}
+		if err := DB.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?`, ref.table, ref.column).Scan(&hasColumn); err != nil {
+			return fmt.Errorf("inspect column %s.%s: %w", ref.table, ref.column, err)
+		}
+		if hasColumn == 0 {
+			continue
+		}
+		var rowQuery, updateQuery string
+		if ref.table == "global_config" {
+			rowQuery = `SELECT id, COALESCE(` + ref.column + `,'[]') FROM global_config WHERE id=1`
+			updateQuery = `UPDATE global_config SET ` + ref.column + `=? WHERE id=?`
+		} else {
+			rowQuery = `SELECT id, COALESCE(` + ref.column + `,'[]') FROM ` + ref.table
+			updateQuery = `UPDATE ` + ref.table + ` SET ` + ref.column + `=? WHERE id=?`
+		}
+		rows, err := DB.Query(rowQuery)
+		if err != nil {
+			return fmt.Errorf("query %s.%s: %w", ref.table, ref.column, err)
+		}
+		type pendingUpdate struct {
+			rowID int
+			value string
+		}
+		var pending []pendingUpdate
+		for rows.Next() {
+			var rowID int
+			var raw string
+			if err := rows.Scan(&rowID, &raw); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan %s.%s: %w", ref.table, ref.column, err)
+			}
+			var parsed []int64
+			if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+				rows.Close()
+				return fmt.Errorf("parse %s.%s value %q: %w", ref.table, ref.column, raw, err)
+			}
+			changed := false
+			for i, id := range parsed {
+				if keep, ok := remap[int(id)]; ok {
+					parsed[i] = int64(keep)
+					changed = true
+				}
+			}
+			if !changed {
+				continue
+			}
+			encoded, err := json.Marshal(parsed)
+			if err != nil {
+				rows.Close()
+				return fmt.Errorf("encode %s.%s row %d: %w", ref.table, ref.column, rowID, err)
+			}
+			pending = append(pending, pendingUpdate{rowID, string(encoded)})
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("iterate %s.%s: %w", ref.table, ref.column, err)
+		}
+		rows.Close()
+		for _, update := range pending {
+			if _, err := DB.Exec(updateQuery, update.value, update.rowID); err != nil {
+				return fmt.Errorf("rewrite %s.%s row %d: %w", ref.table, ref.column, update.rowID, err)
+			}
+		}
 	}
 	return nil
 }
@@ -2710,17 +3014,68 @@ func SeedSystemIPLists(database *sql.DB) error {
 
 // ensureNewColumns 按清单逐列补齐（幂等：列已存在零命中）。提取自
 // runMigrations 内联循环：三个整表重建迁移之后需再次调用，收敛重建以陈旧 DDL
-// 重建时丢失的列（数据按列默认值回填，不再永久丢失）。
-func ensureNewColumns(columns, backfills map[string]string) error {
-	var colCount int
-	for col, dtype := range columns {
+// orderNewColumnKeys 把 newColumns 登记键排成确定性执行顺序：
+// ①键按字典序排序（map 迭代序随机，排序后每轮启动的补列顺序与失败诊断
+// 位置稳定）；②回填 SQL 引用同批其他登记表的键（跨表回填，如
+// mfa_challenges.password_version ← users.password_version）推迟到第二趟，
+// 保证被引用列先完成 ADD COLUMN——乱序执行在旧 SQLite 上以
+// no such column 启动失败，当前 SQLite 虽经外层作用域绑定静默吞掉
+// 但回填语义错误。依赖链不允许成环（成环在第二趟执行期自然报错，
+// 启动期响亮失败）。
+func orderNewColumnKeys(columns, backfills map[string]string) ([]string, error) {
+	keys := make([]string, 0, len(columns))
+	tables := map[string]struct{}{}
+	for col := range columns {
 		parts := strings.Split(col, ".")
 		// 畸形登记 key 启动期响亮失败——此前静默跳过
 		//（continue），登记笔误（漏点/多段）会让列静默不补、运行时才以
 		// no such column 暴露，与「启动期响亮失败」基调不一致。
 		if len(parts) != 2 {
-			return fmt.Errorf("malformed newColumns key %q: want table.column", col)
+			return nil, fmt.Errorf("malformed newColumns key %q: want table.column", col)
 		}
+		tables[parts[0]] = struct{}{}
+		keys = append(keys, col)
+	}
+	sort.Strings(keys)
+	ordered := make([]string, 0, len(keys))
+	var deferred []string
+	for _, key := range keys {
+		backfill := backfills[key]
+		ownTable := strings.SplitN(key, ".", 2)[0]
+		crossTable := false
+		if backfill != "" {
+			for table := range tables {
+				if table == ownTable {
+					continue
+				}
+				if strings.Contains(backfill, table+".") ||
+					strings.Contains(backfill, "FROM "+table) ||
+					strings.Contains(backfill, "JOIN "+table) ||
+					strings.Contains(backfill, "UPDATE "+table) {
+					crossTable = true
+					break
+				}
+			}
+		}
+		if crossTable {
+			deferred = append(deferred, key)
+		} else {
+			ordered = append(ordered, key)
+		}
+	}
+	return append(ordered, deferred...), nil
+}
+
+// 重建时丢失的列（数据按列默认值回填，不再永久丢失）。
+func ensureNewColumns(columns, backfills map[string]string) error {
+	keys, err := orderNewColumnKeys(columns, backfills)
+	if err != nil {
+		return err
+	}
+	var colCount int
+	for _, col := range keys {
+		dtype := columns[col]
+		parts := strings.Split(col, ".")
 		table, name := parts[0], parts[1]
 		if err := DB.QueryRow("SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?", table, name).Scan(&colCount); err != nil {
 			return fmt.Errorf("failed to check column %s.%s: %w", table, name, err)
@@ -2772,6 +3127,15 @@ func addColumnWithBackfill(table, name, dtype, backfill string) error {
 // security_threat_sources，导致威胁情报库弹框与更新任务混入爬虫。将源行及
 // 用户开关/版本/状态/排程迁入独立表，再从威胁表删除；名单与快照文件不动。
 func migrateCrawlerSourcesOutOfThreat() error {
+	// 探测门：威胁表已无爬虫源行（收敛库）时不开写事务——二次启动零写口径。
+	var pending int
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM security_threat_sources WHERE name IN ('googlebot','gptbot','bingbot','so360spider')`).Scan(&pending); err != nil {
+		return fmt.Errorf("探测威胁表爬虫源: %w", err)
+	}
+	if pending == 0 {
+		return nil
+	}
+	startupMigrationWriteTx.Add(1)
 	tx, err := DB.Begin()
 	if err != nil {
 		return err
@@ -3132,6 +3496,8 @@ func nodesRebuildDDL(target string) string {
 // nodesRebuildCopySQL 与 nodesRebuildDDL 同源配套：列清单与 COALESCE 归一
 // 必须逐项对应（mode/protocol/access_url/坐标在存量脏行上可能为 NULL，重建
 // 时归一到当前默认，避免 NOT NULL 列拒绝拷贝）。
+// status/cluster_token_delivered/sync_interval 三列随重建原样搬运——三列
+// 长期保留（旧备份/旧快照回放兼容契约，见 fresh DDL 头注释），重建不得丢列。
 func nodesRebuildCopySQL(target string) string {
 	return `INSERT INTO ` + target + ` (id,name,mode,ip_address,port,protocol,access_url,is_approved,sync_interval,status,cluster_token_hash,registration_secret,registration_secret_expires_at,cluster_token_delivered,reported_version,health_json,last_sync_at,last_sync_error,last_seen,created_at,server_map_lat,server_map_lon)
 		SELECT id,name,COALESCE(mode,'slave'),ip_address,port,COALESCE(protocol,'http'),COALESCE(access_url,''),is_approved,sync_interval,status,cluster_token_hash,registration_secret,registration_secret_expires_at,cluster_token_delivered,reported_version,health_json,last_sync_at,last_sync_error,last_seen,created_at,COALESCE(server_map_lat,0),COALESCE(server_map_lon,0) FROM nodes;`
@@ -3175,17 +3541,22 @@ func migrateOidcIdentityUniqueIndex() error {
 }
 
 func migrateLegacyDNSCredentials() error {
+	// 逐列探测（只读，不取写锁）：历史中断可能只留下 dns_id 或 dns_key
+	// 单列；旧实现要求两列同时存在，残形会被永久跳过。两列均不存在
+	//（收敛库常态）时不开写事务——二次启动零写口径。
+	var hasID, hasKey bool
+	if err := DB.QueryRow(`SELECT
+		EXISTS(SELECT 1 FROM pragma_table_info('certificate_configs') WHERE name='dns_id'),
+		EXISTS(SELECT 1 FROM pragma_table_info('certificate_configs') WHERE name='dns_key')`).Scan(&hasID, &hasKey); err != nil {
+		return fmt.Errorf("failed to check legacy certificate credential columns: %w", err)
+	}
+	if !hasID && !hasKey {
+		return nil
+	}
+	startupMigrationWriteTx.Add(1)
 	tx, err := DB.Begin()
 	if err != nil {
 		return fmt.Errorf("failed to begin legacy certificate credential migration: %w", err)
-	}
-	// 逐列探测：历史中断可能只留下 dns_id 或 dns_key 单列；旧实现要求
-	// 两列同时存在，残形会被永久跳过。
-	var hasID, hasKey bool
-	if err := tx.QueryRow(`SELECT
-		EXISTS(SELECT 1 FROM pragma_table_info('certificate_configs') WHERE name='dns_id'),
-		EXISTS(SELECT 1 FROM pragma_table_info('certificate_configs') WHERE name='dns_key')`).Scan(&hasID, &hasKey); err != nil {
-		return rollbackMigration(tx, fmt.Errorf("failed to check legacy certificate credential columns: %w", err))
 	}
 	if hasID || hasKey {
 		idExpr, keyExpr := "''", "''"
@@ -3448,7 +3819,7 @@ func migrateLbRulesPrimaryKey() error {
 		enabled BOOLEAN NOT NULL DEFAULT 1,
 		protocol VARCHAR(10) DEFAULT 'http',
 	max_connections INTEGER DEFAULT 0,
-	origin_domain TEXT NOT NULL DEFAULT '',
+origin_domain TEXT NOT NULL DEFAULT '',
 		FOREIGN KEY (rule_id) REFERENCES lb_rules(caddy_id) ON DELETE CASCADE
 	)
 `)
@@ -3808,7 +4179,8 @@ func migrateTCPRuleSecurityPolicyBindings() error {
 func normalizeRuleTimestampsMigration() error {
 	for _, table := range []string{"lb_rules", "path_rules"} {
 		for _, col := range []string{"created_at", "updated_at"} {
-			if _, err := DB.Exec(`UPDATE ` + table + ` SET ` + col + `=strftime('%Y-%m-%d %H:%M:%S', ` + col + `)
+			// 探测门：全平面格式的收敛库零命中，四条 UPDATE 不取写锁。
+			if _, err := execMigrationWriteIfNeeded(`UPDATE ` + table + ` SET ` + col + `=strftime('%Y-%m-%d %H:%M:%S', ` + col + `)
 				WHERE ` + col + ` IS NOT NULL AND (` + col + ` LIKE '%T%' OR ` + col + ` LIKE '%+%')
 				  AND strftime('%Y-%m-%d %H:%M:%S', ` + col + `) IS NOT NULL`); err != nil {
 				return fmt.Errorf("failed to normalize %s.%s timestamp format: %w", table, col, err)

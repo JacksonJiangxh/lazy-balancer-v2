@@ -10,7 +10,7 @@ import (
 // TestMCPToolSpecs_cover_registeredGinRoutes MCP 工具↔路由对照绊线
 // 每个工具的 (method, path) 必须命中 SetupRouter 注册的真实路由——工具指向已
 // 改名/删除的路由只会在 Agent 调用时 404，编译期与既有测试均不可见（OpenAPI
-// 侧有同款绊线，MCP 侧此前为空白）。{param} 形态经 ginPathToOpenAPI 反向
+// 侧有同款绊线，MCP 侧此前为空白）。{param} 形态经 apipath.ToGin 反向
 // 归一为 Gin 的 :param 后比对。
 func TestMCPToolSpecs_cover_registeredGinRoutes(t *testing.T) {
 	router := newAPIDocTestRouter(t)
@@ -47,9 +47,7 @@ var mcpUncoveredRoutes = map[string]string{
 	"POST /api/v1/security/overview/threat-screen/collector":   "大屏流量采集租约申请/续租：浏览器生命周期内部动作，Agent 无 UI 会话场景且不应远程控制采集开关",
 	"GET /api/v1/security/overview/threat-screen/events":       "大屏逐请求正常流量增量事件流：前端光流可视化专用，Agent 无消费场景",
 	"DELETE /api/v1/security/overview/threat-screen/collector": "大屏流量采集租约释放：浏览器生命周期内部动作，Agent 无 UI 会话场景",
-	// —— IP 快捷弹框处置（新增：前端弹框专用；Agent 侧 get_ip_list →
-	//    update_ip_list 全量写回可达成移除，专用工具冗余）——
-	"POST /api/v1/security/ip-lists/:id/remove-ip": "IP 快捷弹框移除处置端点：从地址列表移除单条 IP；Agent 可用 get_ip_list+update_ip_list 组合等价完成",
+	// —— IP 快捷弹框处置：remove-ip 已有 remove_ip_from_list 工具覆盖——
 	// —— 认证 / 会话 / MFA（JWT 会话专属；MCP 仅 API Key，无用户会话概念）——
 	"GET /api/v1/auth/setup":               "首次初始化探测：用户表为空时返回 needs_setup=true，前端引导创建首个管理员",
 	"POST /api/v1/auth/setup":              "首次初始化：创建首个管理员账号，用户表非空后 403",
@@ -116,12 +114,13 @@ var mcpUncoveredRoutes = map[string]string{
 	"GET /api/v1/security/crs/setup":            "CRS setup.conf 配置文件原文查看，面板 CRS 配置展示用；Agent 排查规则走 get_crs_rule/get_crs_rule_index",
 	"GET /api/v1/security/events/count":         "IP 弹框上下文查询(近 N 天单 IP 事件计数),轻量专用端点;MCP 场景用 list_security_events 的 ip 过滤+total 覆盖同等信息",
 	"GET /api/v1/system/tasks/stats-24h-series": "面板「近 24 小时执行」时间序列图专用聚合（task_runs 分小时桶）；Agent 查任务状态用 list_system_tasks/get_system_task_history 覆盖同等信息",
-	// —— 威胁情报库（v2.3.x）：内置只读源的面板管理面（与 CRS/IP2Region 更新
-	//    端点同类——后者本就无 MCP 工具），MCP 后续按需补工具 ——
+	// —— 威胁情报库（v2.3.x）：内置只读源的面板管理面。CRS/IP2Region 同族端点
+	//    已有 toggle/trigger 工具覆盖，威胁库按面板低频操作口径未补工具（能力面
+	//    不一致为已知状态，如需 Agent 侧管理再按需补） ——
 	"GET /api/v1/security/threat-lib":             "威胁库源列表与条目合计数（面板规则集卡片数据源）",
 	"PUT /api/v1/security/threat-lib/auto-update": "威胁库自动更新总闸（低频管理面板操作）",
 	"PUT /api/v1/security/threat-lib/:id/flags":   "威胁库逐源更新开关（低频管理面板操作）",
-	"POST /api/v1/security/threat-lib/update":     "手动更新威胁库（低频管理面板操作；与 CRS/IP2Region 更新端点同族未覆盖）",
+	"POST /api/v1/security/threat-lib/update":     "手动更新威胁库（低频管理面板操作；CRS/IP2Region 同族端点已有工具，本族按面板低频口径未补）",
 	// 自动封禁：面板状态卡/配置弹框专用面 ——
 	"GET /api/v1/security/autoban":             "自动封禁六项配置读（面板配置弹框数据源）",
 	"PUT /api/v1/security/autoban":             "自动封禁配置写（低频管理面板操作；保存联动调度启停）",
@@ -133,12 +132,14 @@ var mcpUncoveredRoutes = map[string]string{
 	"PUT /api/v1/security/threat-lib/schedule":      "威胁库定时更新排程（低频管理面板操作）",
 	"GET /api/v1/security/threat-lib/update/status": "威胁库更新任务状态（面板更新弹框轮询数据源）",
 	"GET /api/v1/security/threat-lib/update/logs":   "威胁库更新日志（面板更新弹框日志流）",
-	// —— 爬虫地址库（v2.3.8）：内置只读源的面板管理面（与威胁库同族未覆盖） ——
+	// —— 爬虫地址库（v2.3.8）：内置只读源的面板管理面。CRS/IP2Region 同族端点
+	//    已有 toggle/trigger 工具而本族未补——能力面不一致为已知状态，按「面板
+	//    低频操作」口径维持豁免；如需 Agent 侧管理爬虫库再按需补工具 ——
 	"GET /api/v1/security/crawler-lib":               "爬虫地址库源列表与条目合计数（面板规则库卡片数据源）",
-	"PUT /api/v1/security/crawler-lib/auto-update":   "爬虫地址库自动更新总闸（低频管理面板操作）",
+	"PUT /api/v1/security/crawler-lib/auto-update":   "爬虫地址库自动更新总闸（低频管理面板操作；CRS/IP2Region 同族已有工具，本族按低频口径未补）",
 	"PUT /api/v1/security/crawler-lib/schedule":      "爬虫地址库定时更新排程（低频管理面板操作）",
 	"PUT /api/v1/security/crawler-lib/:id/flags":     "爬虫地址库逐源更新开关（低频管理面板操作）",
-	"POST /api/v1/security/crawler-lib/update":       "手动更新爬虫地址库（低频管理面板操作；与威胁库更新端点同族未覆盖）",
+	"POST /api/v1/security/crawler-lib/update":       "手动更新爬虫地址库（低频管理面板操作；CRS/IP2Region 同族已有工具，本族按低频口径未补）",
 	"GET /api/v1/security/crawler-lib/update/status": "爬虫地址库更新任务状态（面板更新弹框轮询数据源）",
 	"GET /api/v1/security/crawler-lib/update/logs":   "爬虫地址库更新任务日志（面板更新弹框日志流）",
 	// —— 集群节点站点坐标：主节点节点列表专用，不走 MCP ——

@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -82,17 +83,22 @@ func TestAPIMCP_forward_timeout_error_carries_state_check_hint(t *testing.T) { /
 	call.Header.Set("X-API-Key", "lb_sk_test")
 
 	// When
-	_, err := forward(context.Background(), client, slow.URL, "", spec, call)
+	result, err := forward(context.Background(), client, slow.URL, "", spec, call)
 
-	// Then 超时错误必须含状态核对提示
-	if err == nil {
-		t.Fatal("慢上游+短超时必须产生错误")
+	// Then 超时是调用方可恢复的调用层错误——IsError 工具结果（非 -32603），
+	// 且必须含状态核对提示
+	if err != nil {
+		t.Fatalf("超时须以 IsError 工具结果返回（不产出 JSON-RPC 错误）,实际: %v", err)
 	}
-	if !strings.Contains(err.Error(), "超时") {
-		t.Fatalf("超时错误须点名超时语义,实际: %v", err)
+	if result == nil || !result.IsError {
+		t.Fatalf("超时必须产生 IsError 工具结果,实际: %+v", result)
 	}
-	if !strings.Contains(err.Error(), "操作可能已在服务端生效") {
-		t.Fatalf("超时错误须附「先核对状态再重试」提示,实际: %v", err)
+	text := fmt.Sprint(result.Content)
+	if !strings.Contains(text, "超时") {
+		t.Fatalf("超时错误须点名超时语义,实际: %s", text)
+	}
+	if !strings.Contains(text, "操作可能已在服务端生效") {
+		t.Fatalf("超时错误须附「先核对状态再重试」提示,实际: %s", text)
 	}
 }
 
@@ -106,17 +112,21 @@ func TestAPIMCP_forward_non_timeout_error_keeps_original_message(t *testing.T) {
 	call.Header.Set("X-API-Key", "lb_sk_test")
 
 	// When
-	_, err := forward(context.Background(), client, "http://127.0.0.1:1", "", spec, call)
+	result, err := forward(context.Background(), client, "http://127.0.0.1:1", "", spec, call)
 
 	// Then
-	if err == nil {
-		t.Fatal("不可达地址必须产生错误")
+	if err != nil {
+		t.Fatalf("不可达地址须以 IsError 工具结果返回（不产出 JSON-RPC 错误）,实际: %v", err)
 	}
-	if !strings.Contains(err.Error(), "内部 API 请求失败") {
-		t.Fatalf("非超时失败须保持原文案,实际: %v", err)
+	if result == nil || !result.IsError {
+		t.Fatalf("不可达地址必须产生 IsError 工具结果,实际: %+v", result)
 	}
-	if strings.Contains(err.Error(), "操作可能已在服务端生效") {
-		t.Fatalf("非超时失败不得带超时提示,实际: %v", err)
+	text := fmt.Sprint(result.Content)
+	if !strings.Contains(text, "内部 API 请求失败") {
+		t.Fatalf("非超时失败须保持原文案,实际: %s", text)
+	}
+	if strings.Contains(text, "操作可能已在服务端生效") {
+		t.Fatalf("非超时失败不得带超时提示,实际: %s", text)
 	}
 }
 

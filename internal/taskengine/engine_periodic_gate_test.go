@@ -93,9 +93,13 @@ func TestEngine_PeriodicEnabledFnSkipsSecondCheckWhenNotDueOrDisallowed(t *testi
 		name   string
 		due    bool
 		master bool
+		// wantEnabledCalls：非 due&&allows 路径的 EnabledFn 求值次数。
+		// 「角色不符」经前置角色门整分支跳过（与 Scheduled 同型对称），
+		// EnabledFn 零求值——从节点不再每 tick 白付闭包 DB 读。
+		wantEnabledCalls int32
 	}{
-		{name: "not due", due: false, master: true},
-		{name: "due but role disallowed", due: true, master: false},
+		{name: "not due", due: false, master: true, wantEnabledCalls: 1},
+		{name: "due but role disallowed", due: true, master: false, wantEnabledCalls: 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := newTestEngineWithOptions(t, Options{TickInterval: time.Hour})
@@ -121,8 +125,8 @@ func TestEngine_PeriodicEnabledFnSkipsSecondCheckWhenNotDueOrDisallowed(t *testi
 
 			e.tick()
 
-			if got := enabledCalls.Load(); got != 1 {
-				t.Fatalf("非 due&&allows 路径 EnabledFn 调用=%d 次, want 1（不得增加每 tick DB 读）", got)
+			if got := enabledCalls.Load(); got != tc.wantEnabledCalls {
+				t.Fatalf("非 due&&allows 路径 EnabledFn 调用=%d 次, want %d（不得增加每 tick DB 读）", got, tc.wantEnabledCalls)
 			}
 			if got := runs.Load(); got != 0 {
 				t.Fatalf("非投递路径执行次数=%d, want 0", got)

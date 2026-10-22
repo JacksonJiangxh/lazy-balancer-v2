@@ -283,3 +283,178 @@ func TestListToolSpecs_returns_sanitized_independent_copy(t *testing.T) {
 		}
 	}
 }
+
+// 高风险写工具的 body 字段契约——运行时 schema 校验刻意关闭，input_schema 是
+// Agent 唯一构参契约；零字段契约（裸 additionalProperties）只能靠描述猜名。
+// 每工具至少声明高频字段与必填项（additionalProperties:true 保留向前兼容）。
+func TestWriteToolSchemasDeclareBodyFields(t *testing.T) {
+	cases := []struct {
+		name       string
+		required   []string
+		properties []string
+	}{
+		{"create_security_policy", []string{"name"}, []string{"name", "mode", "policy_type", "anomaly_threshold", "ip_acl_enabled", "rate_limit_enabled", "geoip_mode", "crs_rule_groups", "custom_rules", "block_page_id", "enabled"}},
+		{"update_security_policy", []string{"id"}, []string{"id", "name", "mode", "policy_type", "enabled"}},
+		{"create_custom_rule", []string{"name", "conditions", "action", "score"}, []string{"name", "conditions", "action", "score", "enabled"}},
+		{"update_custom_rule", []string{"id"}, []string{"id", "name", "conditions", "action", "score", "enabled"}},
+		{"create_block_page", []string{"name", "content"}, []string{"name", "content", "content_type", "description"}},
+		{"update_block_page", []string{"id"}, []string{"id", "name", "content", "content_type"}},
+		{"create_ip_list", []string{"name"}, []string{"name", "description", "category", "entries"}},
+		{"update_ip_list", []string{"id"}, []string{"id", "name", "entries"}},
+		{"create_certificate_config", []string{"name", "dns_provider"}, []string{"name", "dns_provider", "dns_credentials", "enabled"}},
+		{"update_certificate_config", []string{"id"}, []string{"id", "name", "dns_provider", "dns_credentials", "enabled"}},
+		{"create_user", []string{"username", "password", "role"}, []string{"username", "password", "role", "display_name"}},
+		{"update_user", []string{"id"}, []string{"id", "username", "role", "display_name", "password"}},
+		{"create_api_key", []string{"name"}, []string{"name", "expires_at", "mcp_enabled", "read_only", "mcp_ip_whitelist"}},
+		{"update_api_key_status", []string{"id"}, []string{"id", "is_enabled", "mcp_enabled", "read_only", "mcp_ip_whitelist"}},
+		{"bind_security_policy", []string{"id", "rule_caddy_id"}, []string{"id", "rule_caddy_id"}},
+		{"remove_ip_from_list", []string{"id", "value"}, []string{"id", "value"}},
+		{"preview_config", nil, []string{"source"}},
+		{"import_config", nil, []string{"meta", "config", "tables"}},
+		{"validate_import", nil, []string{"meta", "config", "tables"}},
+	}
+	byName := make(map[string]toolSpec, len(tools))
+	for _, spec := range tools {
+		byName[spec.name] = spec
+	}
+	for _, testCase := range cases {
+		spec, ok := byName[testCase.name]
+		if !ok {
+			t.Errorf("tool %s not registered", testCase.name)
+			continue
+		}
+		var shape struct {
+			Required   []string                   `json:"required"`
+			Properties map[string]json.RawMessage `json:"properties"`
+		}
+		if err := json.Unmarshal([]byte(spec.schema), &shape); err != nil {
+			t.Errorf("tool %s schema is not valid JSON: %v", testCase.name, err)
+			continue
+		}
+		for _, property := range testCase.properties {
+			if _, ok := shape.Properties[property]; !ok {
+				t.Errorf("tool %s schema lacks property %q", testCase.name, property)
+			}
+		}
+		for _, required := range testCase.required {
+			if !containsString(shape.Required, required) {
+				t.Errorf("tool %s schema required=%v, want %q", testCase.name, shape.Required, required)
+			}
+		}
+	}
+	// 无 body 工具不得再背宽松 body schema——create_register_token 无需请求体。
+	if spec := byName["create_register_token"]; spec.schema != emptySchema {
+		t.Errorf("create_register_token schema=%s, want emptySchema（handler 不读 body）", spec.schema)
+	}
+}
+
+// schema 边界与写侧校验对齐（Agent 唯一契约，运行时无校验兜底）：
+// update 与 create 同名字段边界对称；枚举/上下限与后端 400 校验一致。
+func TestWriteToolSchemaBoundsMatchBackendValidation(t *testing.T) {
+	type bounds struct {
+		Minimum *float64  `json:"minimum"`
+		Maximum *float64  `json:"maximum"`
+		Enum    []float64 `json:"enum"`
+	}
+	node := func(t *testing.T, schema string, path ...string) bounds {
+		t.Helper()
+		var root map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(schema), &root); err != nil {
+			t.Fatalf("parse schema: %v", err)
+		}
+		var current map[string]json.RawMessage
+		if err := json.Unmarshal(root["properties"], &current); err != nil || current == nil {
+			t.Fatalf("schema lacks top-level properties")
+		}
+		for i, segment := range path {
+			raw, ok := current[segment]
+			if !ok {
+				t.Fatalf("schema path %v 缺 %q", path[:i+1], segment)
+			}
+			if i == len(path)-1 {
+				var result bounds
+				if err := json.Unmarshal(raw, &result); err != nil {
+					t.Fatalf("parse bounds: %v", err)
+				}
+				return result
+			}
+			var next map[string]json.RawMessage
+			if err := json.Unmarshal(raw, &next); err != nil {
+				t.Fatalf("parse intermediate: %v", err)
+			}
+			var props map[string]json.RawMessage
+			if err := json.Unmarshal(next["properties"], &props); err == nil && props != nil {
+				current = props
+				continue
+			}
+			var items map[string]json.RawMessage
+			if err := json.Unmarshal(next["items"], &items); err == nil && items != nil {
+				var itemProps map[string]json.RawMessage
+				if err := json.Unmarshal(items["properties"], &itemProps); err == nil && itemProps != nil {
+					current = itemProps
+					continue
+				}
+				current = items
+				continue
+			}
+			t.Fatalf("schema path %v 在 %q 处无 properties/items", path, segment)
+		}
+		return bounds{}
+	}
+	for _, testCase := range []struct {
+		name   string
+		schema string
+		path   []string
+		min    float64
+		max    float64
+	}{
+		{"create_rule listen_port", createRuleSchema, []string{"listen_port"}, 1, 65535},
+		{"update_rule listen_port", updateRuleSchema, []string{"listen_port"}, 1, 65535},
+		{"create_rule upstreams.port", createRuleSchema, []string{"upstreams", "port"}, 1, 65535},
+		{"update_rule upstreams.port", updateRuleSchema, []string{"upstreams", "port"}, 1, 65535},
+	} {
+		got := node(t, testCase.schema, testCase.path...)
+		if got.Minimum == nil || *got.Minimum != testCase.min || got.Maximum == nil || *got.Maximum != testCase.max {
+			t.Errorf("%s bounds=%+v, want %v-%v", testCase.name, got, testCase.min, testCase.max)
+		}
+	}
+	// server_tokens_hidden ∈ {0,1,2}（rules.go 写侧校验同口径），create/update 对称。
+	for _, testCase := range []struct {
+		name   string
+		schema string
+	}{{"create_rule", createRuleSchema}, {"update_rule", updateRuleSchema}} {
+		got := node(t, testCase.schema, "server_tokens_hidden")
+		if len(got.Enum) != 3 {
+			t.Errorf("%s server_tokens_hidden enum=%v, want [0,1,2]", testCase.name, got.Enum)
+		}
+	}
+	// CA 提供商上限（caproviders 写侧 ≤100/≤60000 同口径）。
+	if got := node(t, updateCAProviderSchema, "max_concurrent"); got.Maximum == nil || *got.Maximum != 100 {
+		t.Errorf("update_ca_provider max_concurrent bounds=%+v, want maximum 100", got)
+	}
+	if got := node(t, updateCAProviderSchema, "min_interval_ms"); got.Maximum == nil || *got.Maximum != 60000 {
+		t.Errorf("update_ca_provider min_interval_ms bounds=%+v, want maximum 60000", got)
+	}
+	// 大屏坐标经纬度边界（caddy.go 写侧严格校验同口径）。
+	if got := node(t, updateConfigSchema, "server_map_lat"); got.Minimum == nil || *got.Minimum != -90 || got.Maximum == nil || *got.Maximum != 90 {
+		t.Errorf("update_config server_map_lat bounds=%+v, want -90~90", got)
+	}
+	if got := node(t, updateConfigSchema, "server_map_lon"); got.Minimum == nil || *got.Minimum != -180 || got.Maximum == nil || *got.Maximum != 180 {
+		t.Errorf("update_config server_map_lon bounds=%+v, want -180~180", got)
+	}
+}
+
+// export_config 是恒失败工具（备份为 lbbak 二进制，MCP 通道不支持）——描述
+// 必须明示，Agent 不应把它当可用导出路径反复调用。
+func TestExportConfigToolDocumentsAlwaysGuidance(t *testing.T) {
+	for _, spec := range tools {
+		if spec.name != "export_config" {
+			continue
+		}
+		if !strings.Contains(spec.description, "MCP 通道不支持二进制") {
+			t.Errorf("export_config description=%q, want 明示 MCP 通道恒返回下载指引", spec.description)
+		}
+		return
+	}
+	t.Fatal("export_config tool not registered")
+}

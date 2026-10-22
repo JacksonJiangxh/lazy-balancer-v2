@@ -5,8 +5,10 @@ import (
 )
 
 // （2026-09-05/06 审计裁定）：global_config 的 metrics_public /
-// metrics_origins（零消费死列）与 metrics_retention_days（指标保留期已改用
-// audit_retention_months，2026-09-06 裁定）三列迁移删除。契约：①存量库迁移
+// metrics_origins（零消费死列）与 metrics_retention_days（旧可配置指标保留
+// 期列——现行指标保留期为固定 7 天，services.go cleanupHistory 写死且不读
+// audit_retention_months，由 services/metrics_retention_audit_months_test.go
+// 反向钉测看守）三列迁移删除。契约：①存量库迁移
 // 删除且幂等、行数据存活；②新库经 createTables+runMigrations 全流程后不再
 // 补建。镜像 TestRunMigrations_dropsDeadSecurityAndAdminTLSColumns 的
 // legacy 列残留 → 两次迁移 → 数据存活模式。

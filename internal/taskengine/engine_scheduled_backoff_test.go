@@ -76,8 +76,10 @@ func TestEngine_ScheduledAdvancedSlotFailureNoBackoff(t *testing.T) {
 	}
 }
 
-// 回归形状：成功轮清零退避状态（成功不累计 streak——槽未推进的成功轮
-// 如「无启用源」空转形态不得被退避误伤）。
+// 回归形状：成功轮清零退避状态（failed 退避不被成功轮继承），且「成功 +
+// 槽未推进」按「同一槽只执行一次」消费——不再每 tick 重投（旧语义「成功
+// 不受退避约束、每 tick 到期」在 tick=1s 下最坏 8.6 万行 task_runs/天，
+// 已裁定为槽消费语义）。
 func TestEngine_ScheduledSuccessClearsBackoff(t *testing.T) {
 	e := newTestEngine(t)
 	pastSlot := time.Now().Add(-time.Minute)
@@ -91,8 +93,8 @@ func TestEngine_ScheduledSuccessClearsBackoff(t *testing.T) {
 	e.SetRole(true)
 	e.StartLoop("t-ok-slot")
 
-	time.Sleep(150 * time.Millisecond)
-	if got := runs.Load(); got < 2 {
-		t.Fatalf("成功轮不受退避约束（槽未推进的空转形态每 tick 到期）, got %d", got)
+	time.Sleep(350 * time.Millisecond)
+	if got := runs.Load(); got != 1 {
+		t.Fatalf("成功轮消费本槽（同一槽只执行一次，不再每 tick 到期重投）, got %d, want 1", got)
 	}
 }

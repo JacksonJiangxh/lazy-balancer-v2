@@ -7,8 +7,9 @@ import (
 )
 
 // 自动封禁迁移钉：六项配置列 + 预置名单行。
-// fresh DDL 携带全部形状；存量库经 Initialize/runMigrations 幂等补齐
-//（global_config 列走 newColumns 唯一登记通道——口径）。
+// 六列不在 fresh CREATE 里——fresh 与存量库同走 newColumns 补列通道；
+// 预置名单行由 runMigrations→SeedSystemIPLists 播种（schema 段不播种子，
+// 见 db.go schema 注释），Initialize/runMigrations 幂等补齐。
 
 // autobanColumnsExpected 全部六列的期望默认值（与 newColumns 登记逐字对齐）。
 var autobanColumnsExpected = []struct{ column, dflt string }{
@@ -95,8 +96,9 @@ func TestRunMigrations_addsAutobanColumnsAndSeedToLegacyDB(t *testing.T) {
 		}
 	}
 	// 生产升级序列=Initialize 每次启动先 createTables 再 runMigrations——
-	// 预置行由 schema 段承担（NOT EXISTS 种子），这里按真实顺序重放 schema 段
-	//（模拟存量旧库升级到新版后的首个启动）。
+	// 预置行由 runMigrations→SeedSystemIPLists 播种（schema 段只做结构，
+	// 不播种子），这里按真实顺序重放 schema 段（模拟存量旧库升级到新版后
+	// 的首个启动）。
 	if err := createTables(); err != nil {
 		t.Fatalf("replay createTables: %v", err)
 	}

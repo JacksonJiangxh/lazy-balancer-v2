@@ -166,6 +166,21 @@ func (h *Handlers) recordCaddyApplyResult(err error) {
 	}
 }
 
+// recordCaddyApplySavedNotLive 退化提交形态（DB 已提交、运行配置未生效）的
+// 横幅写点。横幅文案两态化：本形态=「已保存但未生效」，与 recordCaddyApplyResult
+// 失败分支的「未保存（旧配置已保留）」区分——共用同一句曾被误读为「没保存」，
+// 管理员重复提交造成重复对象。本形态的业务/重载审计由调用方按操作者归因
+// 落盘，此处只写横幅事实源 + 错误日志（不再补系统级「应用失败」审计）。
+func (h *Handlers) recordCaddyApplySavedNotLive(err error) {
+	text := fmt.Sprintf("配置已保存，但 Caddy 应用失败（运行配置未生效）：%v", err)
+	services.Logf("error", "%s", text)
+	if db.DB != nil {
+		if _, derr := db.DB.Exec(`UPDATE global_config SET caddy_apply_error=? WHERE id=1`, text); derr != nil {
+			services.Logf("warn", "持久化 caddy_apply_error 失败(重启后真实失败不可见): %v", derr)
+		}
+	}
+}
+
 // caddyApplyNoteLocked 返回应用失败时的响应文案后缀（空=配置干净应用）。
 // 已持 caddyOpMu 的后台/会话内路径使用（Start/Restart Caddy、集群应用、
 // 导入会话内重播种）；applyCaddyConfigE 不可重入，未持锁路径必须用它。
@@ -359,7 +374,9 @@ func (h *Handlers) finishTxApply(c *gin.Context, tx *sql.Tx, f txApplyFinish) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + ": " + joined.Error()})
 		return
 	}
-	h.recordCaddyApplyResult(applyErr)
+	// 退化提交（DB 已提交、运行配置未生效）：横幅文案与「未保存（旧配置
+	// 已保留）」分两态——误读为「没保存」会诱发重复提交（重复对象）。
+	h.recordCaddyApplySavedNotLive(applyErr)
 	recordAudit(c, f.AuditAction, f.Resource, f.AuditDetail)
 	recordAudit(c, "重载失败", "Caddy服务", applyErr.Error())
 	c.JSON(status, models.APIResponse{Code: 0, Message: f.SuccessMsg + "；但 Caddy 配置应用失败：" + applyErr.Error(), Data: f.Data})

@@ -388,6 +388,10 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	if reloadErr != nil {
 		err := reloadErr
 		Logf("error", "集群同步后重载 Caddy 失败（快照已提交）: %v", err)
+		// 登记后台重载失败面——从节点的 caddy_apply_error 从不由 handlers
+		// 写路径落盘，本登记是「快照已提交但运行配置未收敛」分叉的全局
+		// 横幅/状态接口信号（与证书/CRS 等后台来源同一消费面）。
+		RecordBackgroundApplyFailure(BackgroundApplyClusterSync, err)
 		// Caddy /load 持续故障时补偿重拉每轮都会到达此处——同内容
 		// 重载失败只留一条操作审计（标记/日志仍按轮刷新）。
 		detail := fmt.Sprintf("同步应用后自动重载失败: %v", err)
@@ -407,6 +411,9 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 			Logf("error", "集群同步重载失败标记写入异常（影响 %d 行，错误 %v）：自愈通道失效，请检查数据库", rows, raerr)
 		}
 	} else if mustReload {
+		// 重载成功即清除本来源的失败面记录（含 304 补偿重拉成功形态——
+		// 上轮失败登记的失败面随本轮成功收敛）。
+		ClearBackgroundApplyFailure(BackgroundApplyClusterSync)
 		RecordAuditLog("system", "重载", "Caddy服务", "同步应用后自动重载", "")
 	} else {
 		// 跳过重载本身留一行应用日志（不进操作审计——零真实重载不落审计，

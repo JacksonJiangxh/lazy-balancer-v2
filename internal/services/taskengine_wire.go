@@ -466,6 +466,11 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			if m.StatusSnapshot().Outcome == "skipped" {
 				return taskengine.ErrTaskSkipped
 			}
+			if m.StatusSnapshot().Outcome == "cancelled" {
+				// 用户取消确定性映射 cancelled 终态——manager 取消先于引擎
+				// ctx 取消落定，仅靠 ctx.Err() 判定存在竞态窗（误记 success）。
+				return taskengine.ErrRunCancelled
+			}
 			return nil
 		},
 	})
@@ -526,6 +531,11 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 				// demote 中止落 skipped 终态而非 success
 				return taskengine.ErrTaskSkipped
 			}
+			if snap := m.StatusSnapshot(); snap.Status == string(CRSStatusCancelled) {
+				// 用户取消确定性落 cancelled（引擎 ctx 取消生效前的竞态窗
+				// 不再误记 success）。
+				return taskengine.ErrRunCancelled
+			}
 			if snap := m.StatusSnapshot(); snap.Status == string(CRSStatusFailed) {
 				return fmt.Errorf("CRS 更新失败: %s", snap.Message)
 			}
@@ -582,6 +592,10 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			if snap := m.StatusSnapshot(); snap.Status == string(IP2RegionStatusSkipped) {
 				// demote 中止落 skipped 终态而非 success
 				return taskengine.ErrTaskSkipped
+			}
+			if snap := m.StatusSnapshot(); snap.Status == string(IP2RegionStatusCancelled) {
+				// 用户取消确定性落 cancelled（与 CRS/威胁族同口径）。
+				return taskengine.ErrRunCancelled
 			}
 			if snap := m.StatusSnapshot(); snap.Status == string(IP2RegionStatusFailed) {
 				return fmt.Errorf("IP2Region 更新失败: %s", snap.Message)

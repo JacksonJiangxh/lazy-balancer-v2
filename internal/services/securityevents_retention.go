@@ -35,9 +35,28 @@ const ThreatRollupEventHighwaterPrefix = "threat_rollup_max_event_id:"
 // 摘要必须同时表达 Days 与 Max 双口径——cleanup
 // 按 count-max 裁剪，只写「保留 N 天」会让行帽提前裁剪的用户可见文案与实际
 // 行为漂移（securityEventsRetentionPolicy 本就 Days+Max 双口径）。
+// 行帽按行不按字节：单行最坏 ≈ 请求头 64KiB + 响应体 64KiB（采集上限
+// securityEventsHeadersCap/BodyCap）加字段余量——摘要披露理论体积上限，
+// 避免「100 万行」被误读为固定小体积（理论 ≈128GiB 量级）。
 func SecurityEventsRetentionSnapshot() (string, int) {
 	policy := securityEventsRetentionPolicyFromDB()
-	return fmt.Sprintf("每日清理 · 保留 %d 天 / 上限 %d 行", policy.Days, policy.Max), policy.Max
+	return fmt.Sprintf("每日清理 · 保留 %d 天 / 上限 %d 行（按行计，单行最大约 128KiB，理论体积上限约 %s）",
+		policy.Days, policy.Max, securityEventsRowCapByteBudget(policy.Max)), policy.Max
+}
+
+// securityEventsRowCapByteBudget 行帽对应的理论体积上限（单行按 headers+body
+// 采集上限 128KiB 计，索引/元数据余量忽略——披露用约数，非配额语义）。
+func securityEventsRowCapByteBudget(rowCap int) string {
+	const rowBytes = int64(securityEventsHeadersCap + securityEventsBodyCap)
+	bytes := int64(rowCap) * rowBytes
+	switch {
+	case bytes >= 1<<30:
+		return fmt.Sprintf("%d GiB", bytes/(1<<30))
+	case bytes >= 1<<20:
+		return fmt.Sprintf("%d MiB", bytes/(1<<20))
+	default:
+		return fmt.Sprintf("%d KiB", bytes/(1<<10))
+	}
 }
 
 // securityEventsRetentionPolicy 是安全事件保留策略的解析结果（单源——清理体、

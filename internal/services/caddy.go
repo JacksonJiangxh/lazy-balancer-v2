@@ -4942,6 +4942,30 @@ func (s *CaddyService) RestoreRuntimeToCommittedInLock() error {
 	return marshalErr
 }
 
+// PersistCommittedViewAsLastGoodInLock 以已提交库值重渲染并把字节写入
+// last-known-good（零 /load——运行配置恢复由调用方的快照回退承担，同字节
+// 短路语义不破）。规则×5 apply 失败分支的 LKG 收口：候选 /load 成功会把
+// 未提交字节写进 LKG（每次成功 /load 都持久化），恢复 /load 再失败时 LKG
+// 滞留未提交配置、进程重启兜底回放未提交内容——本方法把 LKG 钉回已提交
+// 视图，与恢复成败解耦。
+//
+// 锁契约：调用方须已持 CaddyOpLock（=caddyOpMu 写路径临界区）；渲染读
+// db.DB，调用方须先回滚未提交事务（SQLite 写锁会阻塞渲染读取）。
+func (s *CaddyService) PersistCommittedViewAsLastGoodInLock() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	config := generateCaddyConfigFromStore(db.DB)
+	if message, ok := config[caddyConfigGenerationErrorKey].(string); ok {
+		return &ConfigRejectedError{Err: errors.New(message)}
+	}
+	data, err := json.Marshal(caddyPayload(config))
+	if err != nil {
+		return err
+	}
+	s.persistLastGoodLocked(data)
+	return nil
+}
+
 // ApplyConfigFromTxCertAwareForce：证书候选改读事务自身（restoreTable
 // 保留原 id 重插证书行，已提交视图的旧行会经 MaterializeCertPairs 用旧 PEM 覆写
 // 导入刚落盘的新证书文件）+ 强制重载（v2 导入在 apply 之前

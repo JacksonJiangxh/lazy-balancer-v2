@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"sync/atomic"
 
+	"lazy-balancer-v2/internal/apipath"
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/services"
 )
@@ -41,23 +41,6 @@ func SetAdminOnlyRoutes(routes map[string]struct{}) {
 	adminOnlyRoutePaths.Store(&copied)
 }
 
-// ginPath 将工具规格的 {param} 形态还原为 Gin 的 :param（ginPathToOpenAPI
-// 反函数，全替换循环——多参路径逐段转换）。历史起为生产单一实现
-// （原位于跨包互检测试文件），外部测试包经 export_test.go 共享。
-func ginPath(path string) string {
-	for {
-		i := strings.IndexByte(path, '{')
-		if i < 0 {
-			return path
-		}
-		j := strings.IndexByte(path[i:], '}')
-		if j < 0 {
-			return path
-		}
-		path = path[:i] + ":" + path[i+1:i+j] + path[i+j+1:]
-	}
-}
-
 // toolSpecsByName 是工具名 → 规格的索引（可见性过滤按名称回查能力）。
 var toolSpecsByName = func() map[string]toolSpec {
 	result := make(map[string]toolSpec, len(tools))
@@ -73,7 +56,7 @@ func isAdminOnlyTool(spec toolSpec) bool {
 	if routes == nil || len(*routes) == 0 {
 		return false
 	}
-	_, ok := (*routes)[spec.method+" /api/v1"+ginPath(spec.path)]
+	_, ok := (*routes)[spec.method+" /api/v1"+apipath.ToGin(spec.path)]
 	return ok
 }
 

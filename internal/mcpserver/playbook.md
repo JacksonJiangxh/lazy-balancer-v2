@@ -72,7 +72,7 @@
 ## 6. 性能建议
 
 - 轻量优先：能 `get_metrics_overview` 就不用 `get_metrics_dashboard`；能 `get_rule` 就不用反复 `list_rules`
-- 审计日志务必分页；单工具响应上限 4 MiB，超限请改用分页参数（page/page_size）缩小返回范围
+- 审计日志务必分页；单工具响应上限 4 MiB，超限请改用分页参数（page/page_size）缩小返回范围；无分页参数的整份返回工具（list_rules/list_ip_lists/get_config 等）超限时改用对应的单条查询工具（get_* 系列）缩小范围，或经管理面板查看/导出
 - 配置备份导入（import_config/import_v1_config/validate_import）请求体上限 1 MiB（网关体积限制，REST 侧为 128 MiB）：备份超过 1 MiB 时 MCP 通道不可用，请改用管理面板或 REST 导入
 - 保持 HTTP 连接复用（一个 MCP 会话内不要每次新建连接）
 
@@ -82,5 +82,6 @@
 |---|---|
 | 401 | 密钥无效/缺失，或使用 JWT（MCP 仅支持 API Key）→ 换用开启了 MCP 的 lb_sk_ 密钥 |
 | 403 | 未开启 MCP / 来源 IP 不在白名单 / 只读 Key 越权 / 从节点非集群写工具 → 开启 MCP 开关、放行来源 IP、换非只读 Key；集群运维对目标从节点本身调用、其余写操作对主节点调用 |
-| 参数错误 | 参数校验在 REST 侧执行，以 IsError + 文本返回（含具体 message）→ 读 message 修正重试；协议层暂不启用 `input_schema` 校验（不会产生 -32602），schema 仅作构参契约——先读 schema 再调用，不要猜字段名 |
+| 参数错误 | 缺参/缺密钥/传输失败与 REST 业务错误均以 IsError + 文本返回（含具体 message）→ 读 message 修正重试；协议层暂不启用 `input_schema` 校验（不会产生 -32602），schema 仅作构参契约——先读 schema 再调用，不要猜字段名 |
 | IsError + 4xx/5xx 文本 | 内部 REST 返回的业务错误，响应体里有具体 message |
+| JSON-RPC -32603 | 仅内部不变量破坏（地址构造/序列化失败等），属服务端缺陷——请反馈维护者，不要重试 |

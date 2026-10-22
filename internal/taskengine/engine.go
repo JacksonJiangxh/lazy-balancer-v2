@@ -118,6 +118,13 @@ var ErrSchedulingPaused = errors.New("taskengine: 调度已暂停")
 // 放弃」语义由 Run 体返回该哨兵，terminalStatus 映射为 task_runs skipped 终态
 // （CHECK 约束内既有值，此前零写入方）。
 var ErrTaskSkipped = errors.New("taskengine: 任务跳过")
+
+// ErrRunCancelled 用户主动取消哨兵：manager 终态为「已取消」时 Run 体返回
+// 本哨兵（terminalStatus 映射 cancelled）。仅靠 ctx.Err() 判定存在竞态窗——
+// Cancel 的 hook（manager 取消）先于引擎 ctx 取消返回，Run 若在引擎 ctx
+// 取消生效前落定，取消轮会被误记 success。TriggerTaskAsync 对本哨兵与
+// context.Canceled 静默分类（不补记「触发失败」）。
+var ErrRunCancelled = errors.New("taskengine: 任务已取消")
 var ErrNotFound = errors.New("taskengine: 任务未注册")
 var ErrEngineStopped = errors.New("taskengine: 引擎已停止")
 var ErrNotMaster = errors.New("taskengine: 该操作仅允许在主节点执行")
@@ -127,6 +134,10 @@ var ErrNotMaster = errors.New("taskengine: 该操作仅允许在主节点执行"
 // 引擎调度（StartLoop/StopLoop 启停即可），直跑会绕过 startDaemon 生命周期
 // 挂钩与常驻循环双跑。
 var errDaemonManualUnsupported = errors.New("taskengine: 常驻任务不支持手动触发（启停即可）")
+
+// errDaemonPrematureExit 常驻 Run 未收到取消信号却净返回（实现缺陷/内部
+// 条件早退）——按异常退出同口径处理（failed 行 + 有界重拉）。
+var errDaemonPrematureExit = errors.New("taskengine: 常驻任务 Run 未收到取消信号却提前返回（实现缺陷或内部条件早退）")
 var errPeriodicLoopDisabled = errors.New("taskengine: 周期调度已停止")
 
 // Scheduled admission 同族收口的拒绝哨兵——
@@ -161,6 +172,17 @@ type registration struct {
 	schedFailStreak        int
 	schedRetryAfter        time.Time
 	schedBackoffLastWarnAt time.Time
+	// schedDoneSlot 已消费的排程槽：同一槽值只执行一次（success 落定后
+	// 业务未把槽推进到未来，或用户在任务监控显式取消在途轮——取消=显式
+	// 放弃本槽）。tick 与 admission 的到期判定要求 slot > schedDoneSlot，
+	// 槽被业务推进/重排为新值后自然恢复到期语义。failed 轮不消费槽
+	// （由上方退避兜底重投）；skipped（demote 中止）不消费——promote 后
+	// 到期槽补跑语义保留；导入排空取消（CancelInFlightRuns，不经 Cancel）
+	// 不消费——恢复后到期轮补跑（业务侧 cancelSourceRow 注释契约）。
+	schedDoneSlot time.Time
+	// schedSlotEvalAt 槽闭包最近求值时刻（Scheduled 降频：槽远期/已消费时
+	// 不必每 tick 重读 DB，仅临近到期前导窗或重评地板周期到点才再求值）。
+	schedSlotEvalAt time.Time
 }
 
 // ---- Engine ----
@@ -212,6 +234,15 @@ type Options struct {
 var defaultDaemonRestartDelays = []time.Duration{time.Second, 5 * time.Second, 30 * time.Second}
 
 const daemonAbnormalResetAfter = time.Minute
+
+// Scheduled 槽闭包降频参数（测试可调——生产装配后不再变更）：
+// schedSlotEvalLead=到期前导窗（窗内每 tick 求值，保证到点即投）；
+// schedSlotEvalFloor=槽远期/已消费时的重评地板周期（收敛用户重排/带外
+// 改库造成的陈旧缓存——生效延迟上界即本周期）。
+var (
+	schedSlotEvalLead  = 30 * time.Second
+	schedSlotEvalFloor = time.Minute
+)
 
 func NewEngine(opts Options) *Engine {
 	if opts.TickInterval <= 0 {
@@ -543,6 +574,17 @@ func (e *Engine) Register(d Descriptor) error {
 	if d.Kind == KindDaemon && d.EnabledFn != nil {
 		return fmt.Errorf("taskengine: %s 为常驻任务，EnabledFn 不参与调度（Daemon 不进 tick，静默忽略）——业务门须内置到 Run 体", d.ID)
 	}
+	// RestartOnRoleFlip 仅在 daemon 分支消费（角色翻转换代）；声明于
+	// Periodic/Scheduled/Oneshot 静默无效——装配错误注册期响亮拒绝（与
+	// Daemon∧EnabledFn 同范式）。
+	if d.RestartOnRoleFlip && d.Kind != KindDaemon {
+		return fmt.Errorf("taskengine: %s 声明 RestartOnRoleFlip 但 Kind=%s（仅常驻族消费角色翻转换代，声明即静默忽略）", d.ID, d.Kind)
+	}
+	// CancelHook 仅在 Cancelable=true 时可达（Cancel 先按 Cancelable 短路）——
+	// 未置 Cancelable 的 CancelHook 永不触达，注册期响亮拒绝。
+	if d.CancelHook != nil && !d.Cancelable {
+		return fmt.Errorf("taskengine: %s 声明 CancelHook 但未置 Cancelable（CancelHook 永不可达，静默忽略）", d.ID)
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if _, exists := e.regs[d.ID]; exists {
@@ -665,6 +707,16 @@ func (e *Engine) Cancel(id string) bool {
 	r.mu.Lock()
 	c := r.cancel
 	running := r.running
+	if running && r.desc.Kind == KindScheduled && !r.nextScheduledTime.IsZero() {
+		// 用户显式取消在途定时轮=放弃本槽：消费当前排程槽，取消落定后
+		// tick 不得按「槽仍过期」立即重投同一槽（整轮全量重下载/重复整包
+		// 备份）。仅用户取消路径（本函数）消费；demote（SetRole 直调 cancel）
+		// 与导入排空（CancelInFlightRuns）不消费——两者的「恢复后到期轮
+		// 补跑」语义保留。槽被业务推进/重排为新值后自然恢复到期语义。
+		if r.nextScheduledTime.After(r.schedDoneSlot) {
+			r.schedDoneSlot = r.nextScheduledTime
+		}
+	}
 	r.mu.Unlock()
 	hook := r.desc.CancelHook
 	if hook != nil {
@@ -908,7 +960,9 @@ func (e *Engine) startDaemon(id string, r *registration, ctx context.Context, ca
 		defer e.daemonWG.Done()
 		err := runGuarded(r.desc.Run, RunContext{Ctx: ctx, Trigger: "auto", RunID: runID})
 		dur := time.Since(start).Milliseconds()
-		// 异常退出（非取消）＝Run 返回错误或 panic。
+		// 异常退出（非取消）＝Run 返回错误或 panic；净返回值提前退出
+		// （ctx 未取消、调度仍开）同为异常——在 r.mu 临界区内定案
+		// （需 loopEnabled 新鲜快照，见下）。
 		abnormal := err != nil && ctx.Err() == nil
 
 		var relaunchIntent bool
@@ -923,6 +977,15 @@ func (e *Engine) startDaemon(id string, r *registration, ctx context.Context, ca
 		r.mu.Lock()
 		r.running = false
 		r.cancel = nil
+		if !abnormal && err == nil && ctx.Err() == nil && r.loopEnabled && !stopped && allows {
+			// 常驻 Run 未收到取消信号却净返回（实现缺陷/内部条件早退）——
+			// 此前按「正常停止」落 [done] stopped，监控呈现「空闲」而任务
+			// 永久停摆（不重拉/不告警/不落 failed）。全部常驻装配均阻塞至
+			// ctx（daemonLifecycleRun），净返回恒为异常：按异常同口径走
+			// 有界重拉 + failed 行 + WARN。
+			abnormal = true
+			err = errDaemonPrematureExit
+		}
 		if r.pendingRestart {
 			r.pendingRestart = false
 			if r.loopEnabled && !abnormal && !stopped && allows {
@@ -1274,6 +1337,15 @@ func (e *Engine) reserveRunInternal(id, trigger string, admission Kind, beat tim
 			e.runWG.Done()
 			return nil, errScheduledNotDue
 		}
+		// 「同一槽只执行一次」收口复核：窗口内另一轮（手动/自动）完成或
+		// 用户取消可能已消费本槽——按 tick 的陈旧快照投递会重复执行同一槽。
+		if admission == KindScheduled && !r.nextScheduledTime.After(r.schedDoneSlot) {
+			r.mu.Unlock()
+			e.roleMu.RUnlock()
+			e.inFlight.Add(-1)
+			e.runWG.Done()
+			return nil, errScheduledNotDue
+		}
 	}
 	r.running = true
 	if admission == KindPeriodic {
@@ -1378,21 +1450,41 @@ func (e *Engine) executeRun(res *runReservation, id, trigger, operator string) (
 		r.mu.Lock()
 		prevSlot := r.nextScheduledTime
 		r.nextScheduledTime = nextSlot
-		if status == "failed" && (nextSlot.IsZero() || !nextSlot.After(prevSlot)) {
+		switch {
+		case status == "failed" && (nextSlot.IsZero() || !nextSlot.After(prevSlot)):
 			// 「槽未推进+本轮 failed」兜底退避：业务侧未推进槽的失败轮
 			// （如装配缺陷响亮失败、nil-manager）此前每 tick 重投。
 			r.schedFailStreak++
 			delay := scheduledFailBackoff(r.schedFailStreak)
 			r.schedRetryAfter = time.Now().Add(delay)
-			// 连续失败留 WARN 行（节流：首轮+其后至多每分钟一条——兜底
-			// 本身的降噪，不得再制造日志洪峰）。
-			if r.schedFailStreak == 1 || time.Since(r.schedBackoffLastWarnAt) >= time.Minute {
+			// 连续失败留 WARN 行（节流：非首轮至多每分钟一条——兜底
+			// 本身的降噪，不得再制造日志洪峰）。首轮豁免也受
+			// scheduledBackoffFirstWarnFloor 地板约束：槽消费机制覆盖
+			// success/skipped/cancelled 后，failed 仍会清零重计——交替
+			// 「成功(新槽)/失败」形态每轮都是 streak==1，无地板可 1 条/s；
+			// 长静默后的首次失败距上次 WARN 远超地板，可见性不变。
+			warnDue := time.Since(r.schedBackoffLastWarnAt) >= time.Minute
+			if r.schedFailStreak == 1 {
+				warnDue = time.Since(r.schedBackoffLastWarnAt) >= scheduledBackoffFirstWarnFloor
+			}
+			if warnDue {
 				r.schedBackoffLastWarnAt = time.Now()
 				taskLogAppend(id, fmt.Sprintf("[warn] 排程槽未推进且本轮失败，退避 %s 后重投（连续 %d 轮；业务 Run 早退须推进槽，见任务引擎标准）", delay, r.schedFailStreak))
 			}
-		} else {
+		default:
 			r.schedFailStreak = 0
 			r.schedRetryAfter = time.Time{}
+			if status == "success" && !nextSlot.IsZero() && !time.Now().Before(nextSlot) {
+				// 同一槽只执行一次：成功落定后重读槽仍已到期（业务未把槽
+				// 推进到未来）——消费本槽，tick 不再按「槽过期」重投（含
+				// 手动触发轮：手动成功同样消费过期槽；「手动不改预约」只约束
+				// 未来槽不被回拨，已过期槽不得再驱动一次重复执行）。失败轮
+				// 不进本分支（由退避兜底重投）；skipped/cancelled 的消费语义
+				// 见 schedDoneSlot 字段注释。
+				if nextSlot.After(r.schedDoneSlot) {
+					r.schedDoneSlot = nextSlot
+				}
+			}
 		}
 		r.mu.Unlock()
 	}
@@ -1423,6 +1515,12 @@ func truncMsg(err error) string {
 	return m
 }
 
+// scheduledBackoffFirstWarnFloor 退避 WARN「首轮」的最小间隔地板：
+// 首轮本为「首次异常必可见」的豁免，但 streak 会被 success/skipped/cancelled
+// 清零——交替形态下每轮失败都是首轮，豁免即失效（1 条/s）。首轮也须距上次
+// 退避 WARN ≥ 地板才放行；长静默后的首次失败不受影响（距上次远超地板）。
+const scheduledBackoffFirstWarnFloor = 5 * time.Minute
+
 // scheduledFailBackoff Scheduled「槽未推进+失败」退避表（与常驻重拉
 // defaultDaemonRestartDelays 同形 1s/5s/30s，第 3 次起封顶 30s）——节流
 // 不是停摆：退避衰减后照常重投（业务修复/槽刷新即恢复常轨）。
@@ -1444,7 +1542,7 @@ func terminalStatus(ctx context.Context, err error) string {
 	if errors.Is(err, ErrTaskSkipped) {
 		return "skipped"
 	}
-	if ctx.Err() != nil {
+	if ctx.Err() != nil || errors.Is(err, ErrRunCancelled) {
 		return "cancelled"
 	}
 	if err != nil {
@@ -1509,8 +1607,9 @@ func (e *Engine) tick() {
 
 		switch r.desc.Kind {
 		case KindScheduled:
-			// 排程感知：每 tick 重读 NextSlotFn（简单 SELECT——µs 级）；
-			// 槽到点才触发 Run（中间零执行零落行零日志）；in-flight 不重入。
+			// 排程感知：槽缓存驱动，到点才触发 Run（中间零执行零落行零日志）；
+			// in-flight 不重入。槽闭包（生产=DB 直读）降频求值——槽远期/已消费
+			// 时按重评地板周期求值，到期前导窗内每 tick 求值（见下方求值门）。
 			// 固有边界（裁定见 docs/task-engine-standard.md「定时」节）：DB 全
 			// 不可读时 NextSlotFn fail-closed 零值槽 → 永不到期 → 零落行——
 			// 任务历史无 failed 行（没有执行就没有记录），可观测性由应用日志
@@ -1529,6 +1628,24 @@ func (e *Engine) tick() {
 			slotFn := r.desc.NextSlotFn
 			enabledFn := r.desc.EnabledFn
 			prevSlot := r.nextScheduledTime // 求值窗口起点快照
+			doneSlot := r.schedDoneSlot
+			// 槽闭包降频求值门（EnabledFn/NextSlotFn 均为装配方 DB 直读闭包，
+			// 每 tick 双求值 ≈10 SELECT/s 常驻读放大）：
+			//  ① 槽缓存为零（未求值/未武装）→ 每 tick 求值——尽快发现首槽武装；
+			//  ② 槽已消费（slot ≤ schedDoneSlot：成功落定/用户取消的本槽）→
+			//     仅地板周期到点求值——等业务推进/重排为新槽，期间零 DB 读；
+			//  ③ 未消费且进入到期前导窗（now ≥ slot-lead）→ 每 tick 求值——
+			//     到点即投，新鲜度与降频前一致；
+			//  ④ 槽远期 → 仅地板周期到点求值——收敛用户重排/带外改库造成的
+			//     陈旧缓存（生效延迟上界=地板周期；排程保存路径本身即重排
+			//     next_update，地板内自然收敛）。
+			consumed := !prevSlot.IsZero() && !prevSlot.After(doneSlot)
+			floorDue := now.Sub(r.schedSlotEvalAt) >= schedSlotEvalFloor
+			needEval := prevSlot.IsZero() || floorDue ||
+				(!consumed && !now.Before(prevSlot.Add(-schedSlotEvalLead)))
+			if needEval {
+				r.schedSlotEvalAt = now
+			}
 			r.mu.Unlock()
 			// 角色门前置（与 Periodic 分支 allows 快照同构）：从节点/角色不符时
 			// 整分支跳过——EnabledFn/NextSlotFn 是装配方闭包（生产=DB 直读），
@@ -1537,9 +1654,14 @@ func (e *Engine) tick() {
 			if !e.roleAllows(r.desc.RunsOn) {
 				continue
 			}
+			if !needEval {
+				// 槽缓存未到求值时机 ⇒ 槽必未到期（到期槽恒在前导窗内，恒
+				// 求值）或已消费——本 tick 零闭包求值零 DB 读。
+				continue
+			}
 			// EnabledFn 业务门——false 时整分支跳过：不评估
 			// 槽（省 µs 级 SELECT）、不落槽缓存、零执行零落行零日志；节拍（槽
-			// 缓存每 tick 重读）天然不推进——恢复 true 后下一 tick 重读槽，到期
+			// 缓存重读）天然不推进——恢复 true 后下一 tick 重读槽，到期
 			// 槽立即投递。闭包 panic 经 safeBool fail-closed 为 false。
 			if enabledFn != nil && !safeBool(id+".EnabledFn", enabledFn) {
 				continue
@@ -1557,7 +1679,10 @@ func (e *Engine) tick() {
 					r.nextScheduledTime = next
 				}
 			}
-			due := !r.nextScheduledTime.IsZero() && now.After(r.nextScheduledTime)
+			// 到期判定含「同一槽只执行一次」门：slot ≤ schedDoneSlot 的槽
+			// （成功落定未推进/用户取消放弃）不再投递，业务推进/重排为新槽
+			// 后自然恢复。
+			due := !r.nextScheduledTime.IsZero() && now.After(r.nextScheduledTime) && r.nextScheduledTime.After(r.schedDoneSlot)
 			eligible := r.loopEnabled && !r.running
 			r.mu.Unlock()
 			if !due || !eligible || !e.roleAllows(r.desc.RunsOn) {
@@ -1594,6 +1719,13 @@ func (e *Engine) tick() {
 			// （原实现在角色门判定前推进节拍，从节点
 			// 时钟照常走，promote 后首轮要等残余 interval，最坏 6h/24h）。
 			allows := e.roleAllows(r.desc.RunsOn)
+			// 角色门前置（与 Scheduled 分支同型对称）：角色不符时整分支
+			// 跳过——EnabledFn/IntervalFn 是装配方闭包（可含 DB 直读），
+			// 从节点不得每 tick 白付求值。节拍复位由 SetRole 的 demote/promote
+			// 分支承担（lastCheck 置零），本分支无需再动 lastCheck。
+			if !allows {
+				continue
+			}
 			r.mu.Lock()
 			if !r.loopEnabled || r.running {
 				r.mu.Unlock()
@@ -1724,15 +1856,46 @@ func engineLogTimeStr() string { return time.Now().In(engineLocPtr()).Format("20
 
 // ---- 日志 ----
 
-var taskLogDir string
+// taskLogConf 任务日志目录/尺寸配置与目录熔断状态（同一把读写锁——装配期
+// 写一次、热路径逐行读）。此前为裸全局（taskLogDir/taskLogSizeBytesFn），
+// 测试在引擎存活期与任务写日志并发调用 SetLogDir/SetTaskLogSizeBytesFn
+// 存在数据竞争。
+var taskLogConf = struct {
+	sync.RWMutex
+	dir    string
+	sizeFn func() int64
+	// 目录熔断：目录不可创建/不可写（MkdirAll 失败）时一次性 ERROR 并进入
+	// 熔断，窗口内任务日志静默丢弃——不再逐行「mkdir 失败 + open 失败」
+	// 双 WARNING 刷运行日志（高频族每秒数行会把排障信号淹没）；每
+	// taskLogDirProbeInterval 探测一次，恢复时补 INFO 并退出熔断
+	// （logStateTransition 首报/恢复同范式）。
+	dirDown      bool
+	dirNextProbe time.Time
+}{}
 
-func SetLogDir(dir string) { taskLogDir = dir }
+// taskLogDirProbeInterval 目录熔断恢复探测周期（测试可调）。
+var taskLogDirProbeInterval = time.Minute
+
+// SetLogDir 设置任务日志目录；换目录即重置熔断（新目录健康状况未知，
+// 首行写入重新判定）。
+func SetLogDir(dir string) {
+	taskLogConf.Lock()
+	taskLogConf.dir = dir
+	taskLogConf.dirDown = false
+	taskLogConf.dirNextProbe = time.Time{}
+	taskLogConf.Unlock()
+}
 
 // LogDir 当前任务日志目录（certjoblog 子目录挂靠点；空串=未初始化）。
-func LogDir() string { return taskLogDir }
+func LogDir() string {
+	taskLogConf.RLock()
+	defer taskLogConf.RUnlock()
+	return taskLogConf.dir
+}
 
 func TaskLogPath(taskID string) string {
-	if taskLogDir == "" {
+	dir := LogDir()
+	if dir == "" {
 		return ""
 	}
 	// 白名单统一：任务 ID 路径净化由
@@ -1761,7 +1924,7 @@ func TaskLogPath(taskID string) string {
 	if sanitized == "" {
 		return ""
 	}
-	return filepath.Join(taskLogDir, sanitized+".log")
+	return filepath.Join(dir, sanitized+".log")
 }
 
 // taskLogLineMaxBytes 单行任务日志上限：DB 侧 message 经
@@ -1796,6 +1959,38 @@ func appendTaskLogLine(path, line string) {
 	// 截断必须先于滚动判定——否则巨型单行会先
 	// 触发滚动、再把超限活动文件写出来，后续每行都反复触发滚动。
 	line = truncateTaskLogLine(line)
+	// 目录熔断前置判定（在 rotate/open 之前——熔断期二者必然失败，
+	// 逐行 WARNING 会淹没运行日志）。
+	taskLogConf.RLock()
+	dir := taskLogConf.dir
+	down := taskLogConf.dirDown
+	nextProbe := taskLogConf.dirNextProbe
+	taskLogConf.RUnlock()
+	if down && time.Now().Before(nextProbe) {
+		return // 熔断窗口内静默丢弃（进入熔断时已留一次性 ERROR）
+	}
+	if dir != "" {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			taskLogConf.Lock()
+			if !taskLogConf.dirDown {
+				taskLogConf.dirDown = true
+				log.Printf("ERROR: taskengine: 任务日志目录不可用（%s）——进入熔断（每 %s 探测恢复，熔断期任务日志静默丢弃）: %v", dir, taskLogDirProbeInterval, err)
+			}
+			taskLogConf.dirNextProbe = time.Now().Add(taskLogDirProbeInterval)
+			taskLogConf.Unlock()
+			return
+		}
+		if down {
+			taskLogConf.Lock()
+			stillDown := taskLogConf.dirDown
+			taskLogConf.dirDown = false
+			taskLogConf.dirNextProbe = time.Time{}
+			taskLogConf.Unlock()
+			if stillDown {
+				log.Printf("INFO: taskengine: 任务日志目录恢复可写（%s），任务日志恢复写入", dir)
+			}
+		}
+	}
 	// 按路径互斥包住「stat→rotate→append」整段——锁只覆盖滚动判定
 	// 与本次写入，不同任务日志路径互不阻塞。
 	pathLock := lockTaskLogPath(path)
@@ -1806,7 +2001,6 @@ func appendTaskLogLine(path, line string) {
 	if _, err := RotateTaskLogBeforeWrite(path, int64(len(line)+1), 1); err != nil {
 		log.Printf("WARNING: taskengine: rotate %s failed: %v", path, err)
 	}
-	_ = os.MkdirAll(taskLogDir, 0755)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		log.Printf("WARNING: taskengine: open task log %s failed: %v", path, err)

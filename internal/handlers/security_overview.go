@@ -288,6 +288,61 @@ func resetSecurityOverviewAggCacheForTest() {
 	securityOverviewAggCacheMu.Unlock()
 }
 
+// securityOverviewTodayCounts 今日拦截/检测计数单源：优先读分钟 rollup
+// （与威胁大屏同源，与原始表规模解耦——行帽触顶时原始表只剩最近若干
+// 分钟，直算会静默少计且面板照常渲染）。rollup 覆盖水位未回推到今日
+// 起点（启动回填中）或固化陈旧（warmer 停转）时回退原始表直算。
+// fromRollup 披露口径分叉：rollup 固化时排除私网/保留地址（大屏口径），
+// 原始表回退含私网（旧口径）。rollup 只固化完整分钟——当前未满分钟
+// 不计入（与大屏 recent_rate 同口径，滞后 ≤1 分钟，轮询下下轮即补上）。
+func securityOverviewTodayCounts(database *sql.DB, todayStart time.Time, now time.Time) (blocked, detected int, fromRollup bool, err error) {
+	todayStartUTC := todayStart.UTC()
+	lastComplete := now.UTC().Add(-time.Minute).Truncate(time.Minute)
+	coveredFrom, okCovered, err := loadThreatRollupState(database, threatRollupCoveredFromKey)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	watermark, okFixed, err := loadThreatRollupState(database, threatRollupWatermarkKey)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	usable := okCovered && okFixed && !coveredFrom.After(todayStartUTC) &&
+		lastComplete.Sub(watermark) <= threatRollupStaleAfter
+	if usable {
+		rows, qerr := database.Query(`SELECT action, COALESCE(SUM(count),0) FROM security_event_rollup
+			WHERE minute >= ? AND action IN ('blocked','logged') GROUP BY action`, todayStartUTC.Format("2006-01-02 15:04"))
+		if qerr != nil {
+			return 0, 0, false, qerr
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var action string
+			var count int
+			if err := rows.Scan(&action, &count); err != nil {
+				return 0, 0, false, err
+			}
+			if action == "blocked" {
+				blocked = count
+			} else {
+				detected = count
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return 0, 0, false, err
+		}
+		return blocked, detected, true, nil
+	}
+	// 回退：原始表直算（含私网/保留地址，includes_reserved 披露）。
+	todayStartText := todayStartUTC.Format("2006-01-02 15:04:05")
+	if err := database.QueryRow("SELECT COUNT(*) FROM security_events WHERE action='blocked' AND event_time >= ?", todayStartText).Scan(&blocked); err != nil {
+		return 0, 0, false, err
+	}
+	if err := database.QueryRow("SELECT COUNT(*) FROM security_events WHERE action='logged' AND event_time >= ?", todayStartText).Scan(&detected); err != nil {
+		return 0, 0, false, err
+	}
+	return blocked, detected, false, nil
+}
+
 // threatRawCoverageStart 返回原始事件表最早事件时间（空表=""）。总览与
 // 威胁大屏共用同一覆盖事实，避免保留期/行帽裁剪后的披露口径分叉。
 func threatRawCoverageStart(database *sql.DB) (string, error) {
@@ -298,8 +353,10 @@ func threatRawCoverageStart(database *sql.DB) (string, error) {
 
 // securityOverviewResponse 在不改变公共 SecurityOverview 模型的前提下，为
 // 原始表直读的近 7 天卡片附带覆盖披露；nil metrics 的零面板也保持同键。
-// IncludesReserved 口径披露：today_blocked/today_detected/trend/top_ips
-// 总量不排除私网/保留地址事件（与大屏排除口径不同，前端 tooltip 消歧）。
+// IncludesReserved 口径披露：trend/top_ips/attack_types 总量不排除私网/保留
+// 地址事件；today_blocked/today_detected 走 rollup 时与大屏同口径排除私网
+// （includes_reserved=false），回退原始表直算时含私网（=true）——前端
+// tooltip 按该字段切换两种口径文案消歧。
 type securityOverviewResponse struct {
 	models.SecurityOverview
 	RawCoverageFrom    string `json:"raw_coverage_from"`

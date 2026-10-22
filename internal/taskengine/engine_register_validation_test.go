@@ -116,3 +116,34 @@ func TestEngine_nonPositivePeriodicIntervalDisablesLoopWithoutRun(t *testing.T) 
 		})
 	}
 }
+
+// 注册期响亮拒绝静默忽略的 Descriptor 组合：RestartOnRoleFlip 仅常驻族
+// 消费（Periodic/Scheduled/Oneshot 声明即无效）；CancelHook 在
+// Cancelable=false 时永不可达（Cancel 先按 Cancelable 短路）。
+func TestEngineRegister_rejectsRestartOnRoleFlipNonDaemon(t *testing.T) {
+	e := NewEngine(Options{})
+	t.Cleanup(e.Stop)
+	d := validRegisterDescriptor()
+	d.RestartOnRoleFlip = true
+	if err := e.Register(d); err == nil {
+		t.Fatal("RestartOnRoleFlip∧Kind!=Daemon 必须响亮拒绝（声明于非常驻族静默无效）")
+	}
+}
+
+func TestEngineRegister_rejectsCancelHookWithoutCancelable(t *testing.T) {
+	e := NewEngine(Options{})
+	t.Cleanup(e.Stop)
+	d := validRegisterDescriptor()
+	d.CancelHook = func() bool { return true }
+	if err := e.Register(d); err == nil {
+		t.Fatal("CancelHook∧!Cancelable 必须响亮拒绝（CancelHook 永不可达）")
+	}
+	// 对照形状：Cancelable+CancelHook 合法。
+	d2 := validRegisterDescriptor()
+	d2.ID = "valid-hook"
+	d2.Cancelable = true
+	d2.CancelHook = func() bool { return true }
+	if err := e.Register(d2); err != nil {
+		t.Fatalf("Cancelable+CancelHook 合法组合不得误拒: %v", err)
+	}
+}

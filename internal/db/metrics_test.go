@@ -10,6 +10,17 @@ import (
 	"time"
 )
 
+func TestCleanupMetricsHistory_nilMetricsDBReturnsNil(t *testing.T) {
+	// 库未装配/已关闭（嵌入与测试直调可达）：必须早退 nil 而非 nil 解引用
+	// panic——同族导出函数（PurgeOrphanMetricsHistory/PurgeTaskRuns）同口径。
+	old := MetricsDB
+	MetricsDB = nil
+	t.Cleanup(func() { MetricsDB = old })
+	if err := CleanupMetricsHistory(7); err != nil {
+		t.Fatalf("CleanupMetricsHistory with nil MetricsDB = %v, want nil", err)
+	}
+}
+
 func TestCleanupMetricsHistory_deletes_expired_global_and_rule_rows(t *testing.T) {
 	// Given
 	oldDB, oldMetricsDB, oldAuditDB := DB, MetricsDB, AuditDB
