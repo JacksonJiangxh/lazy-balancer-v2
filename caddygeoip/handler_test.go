@@ -2,10 +2,13 @@ package caddygeoip
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,6 +30,30 @@ func findTestXdb() string {
 		}
 	}
 	return ""
+}
+
+// testdataXdbSHA256 是仓库测试夹具 testdata/ip2region_v4.xdb 的内容指纹钉：
+// 该夹具是地域树/规范化/发射测试的唯一数据源，被替换或与生产库代次分叉时
+// 测试会在与生产不同的数据上保持绿色（少量 IP 断言只能部分兜底）——改动
+// 夹具必须显式更新本钉。
+//
+// 来源口径：夹具是**仓库独立代次**，不是 Dockerfile 下载物。生产镜像钉
+// ip2region v3.17.0 的 ip2region_v4.xdb（sha256 6307a969…，中国段城市列
+// 为拼音的 45 条与本仓 CityPinyinFixes 表一一对应）；本夹具的中国段 ASCII
+// 城市列与 v3.18.0 同形（只有「台湾省|Taichung County」一条，见
+// CityPinyinFixes 的 Taichung County 条目说明），二者内容不同属设计现状。
+const testdataXdbSHA256 = "95e00400137b517ef97ad0f3c808ff8ca397575d8669bec1b7f32948ff13a7f6"
+
+func TestTestdataXDB_fingerprintPinned(t *testing.T) {
+	path := filepath.Join("testdata", "ip2region_v4.xdb")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("仓库测试夹具必须随仓提供（不得用 skip 掩盖缺失）: %v", err)
+	}
+	sum := sha256.Sum256(data)
+	if got := hex.EncodeToString(sum[:]); got != testdataXdbSHA256 {
+		t.Fatalf("testdata/ip2region_v4.xdb sha256=%s, want %s（夹具变更须显式更新指纹与来源说明）", got, testdataXdbSHA256)
+	}
 }
 
 func TestCaddyModule_registers_as_http_handlers_geoip2region(t *testing.T) {
@@ -87,7 +114,8 @@ func TestProvision_missing_xdb_disables_lookups_and_passes_through(t *testing.T)
 	if !nextCalled {
 		t.Fatal("next handler was not called")
 	}
-	// F49-P5-6：geoip.country_code 死发射已删除（fields[4]=ISP 列语义错位），
+	// geoip.country_code 死发射已删除：v4 xdb 行是 国家|省|市|ISP|国家代码
+	// （fields[3]=ISP，fields[4]=国家代码），该变量无任何消费方（纯死发射），
 	// 任何路径都不得再产出该变量。
 	if _, ok := repl.GetString("geoip.country_code"); ok {
 		t.Fatal("geoip.country_code must not be published (dead emission removed)")
@@ -131,7 +159,7 @@ func TestServeHTTP_sets_geoip_placeholders_for_known_ip(t *testing.T) {
 		t.Fatalf("serve: %v", err)
 	}
 	if _, ok := vars["geoip.country_code"]; ok {
-		t.Fatal("geoip.country_code must not be published (dead emission removed, F49-P5-6)")
+		t.Fatal("geoip.country_code must not be published (dead emission removed)")
 	}
 	if name, _ := vars["geoip.country_name"].(string); name == "" {
 		t.Fatal("geoip.country_name var is empty for a known IP")
@@ -230,7 +258,7 @@ func TestServeHTTP_setsCorazaHeaders_forKnownIP(t *testing.T) {
 	if got := downstream.Header.Get("X-LB-GeoIP-Country"); got != "中国" {
 		t.Fatalf("X-LB-GeoIP-Country = %q, want 中国（spoofed value must be overwritten）", got)
 	}
-	// F49-P5-6：X-LB-GeoIP-Country-Code 头发射已删除（ISP 列语义错位死发射）；
+	// X-LB-GeoIP-Country-Code 头发射已删除（ISP 列语义错位死发射）；
 	// 剥离清单保留（防伪造）但模块自身不再产出该头。
 	if got := downstream.Header.Get("X-LB-GeoIP-Country-Code"); got != "" {
 		t.Fatalf("X-LB-GeoIP-Country-Code = %q, want not emitted", got)
@@ -256,7 +284,7 @@ func TestServeHTTP_setsCorazaHeaders_forKnownIP(t *testing.T) {
 
 // TestServeHTTP_overseasSentinels_forUnresolvableClient：fail-closed 哨兵——
 // 不可解析客户端（IPv6 对 v4-only xdb 查询失败）全头发空串、X-LB-GeoIP-Loc 恒
-// 「海外」（deny 模式海外策略对其拦截，与 D1 裁决一致）。
+// 「海外」（deny 模式海外策略对其拦截，与裁决一致）。
 func TestServeHTTP_overseasSentinels_forUnresolvableClient(t *testing.T) {
 	xdb := findTestXdb()
 	if xdb == "" {
@@ -294,12 +322,156 @@ func TestServeHTTP_overseasSentinels_forUnresolvableClient(t *testing.T) {
 	}
 }
 
-// TestProvision_sharedSearcherSingletonPerXdbPath（审计 M2）：同 XdbPath 的
+// TestServeHTTP_overseasEmitsCountryName（域 G）：已解析海外行
+// X-LB-GeoIP-Loc 发射归一化国名（United States）——非「海外」哨兵；非国家
+// 值（Reserved 文档段）形态仍回落「海外」哨兵（fail-closed 兜底不变：
+// 解析失败/库缺失/非国家值按海外处理）。
+func TestServeHTTP_overseasEmitsCountryName(t *testing.T) {
+	xdb := findTestXdb()
+	if xdb == "" {
+		t.Skip("no ip2region xdb available; place one under caddygeoip/testdata/ to run this test")
+	}
+	h := &GeoIPHandler{XdbPath: xdb}
+	if err := h.Provision(caddy.Context{Context: context.Background()}); err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := h.Cleanup(); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
+
+	serve := func(t *testing.T, remote string) string {
+		t.Helper()
+		repl := caddy.NewReplacer()
+		req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+		req = req.WithContext(context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl))
+		req.RemoteAddr = remote
+		var downstream *http.Request
+		vars := map[string]any{}
+		req = req.WithContext(context.WithValue(req.Context(), caddyhttp.VarsCtxKey, vars))
+		if err := h.ServeHTTP(httptest.NewRecorder(), req, geoipTestNext(t, &downstream)); err != nil {
+			t.Fatalf("serve: %v", err)
+		}
+		return downstream.Header.Get("X-LB-GeoIP-Loc")
+	}
+
+	// 8.8.8.8 → "United States|California|0|Google LLC|US"：海外行发国名。
+	if got := serve(t, "8.8.8.8:12345"); got != "United States" {
+		t.Fatalf("X-LB-GeoIP-Loc = %q; want United States（已解析海外行发国名）", got)
+	}
+	// 203.0.113.10 → "Reserved|Reserved|Reserved|0|0"：非国家值回落哨兵。
+	if got := serve(t, "203.0.113.10:12345"); got != "海外" {
+		t.Fatalf("X-LB-GeoIP-Loc = %q; want 海外（Reserved 非国家，兜底哨兵）", got)
+	}
+}
+
+// TestGeoipLocFor_trimsChinaCountryColumn：国家列「中国」判定
+// TrimSpace 对称——树侧收集判定本就 Trim（ip2region.go），发射侧此前裸比较
+// （" 中国" 异形行走海外分支后 NormalizeCountry 折叠出「中国」串发射，匹配
+// 键恒不命中）。国内 → 省/省-市；海外 → 归一化国名；不可解析 → 哨兵。
+func TestGeoipLocFor_trimsChinaCountryColumn(t *testing.T) {
+	cases := []struct{ country, province, city, want string }{
+		{"中国", "广东省", "深圳市", "广东省/深圳市"},
+		{"中国", "广东省", "", "广东省"},
+		{" 中国", "广东省", "", "广东省"},
+		{"\t中国 ", "广东省", "深圳市", "广东省/深圳市"},
+		{"United States", "", "", "United States"},
+		{" 美国", "", "", "United States"},
+		{"Reserved", "", "", "海外"},
+		{"", "广东省", "", "海外"},
+	}
+	for _, tc := range cases {
+		if got := geoipLocFor(tc.country, tc.province, tc.city); got != tc.want {
+			t.Errorf("geoipLocFor(%q,%q,%q)=%q; want %q", tc.country, tc.province, tc.city, got, tc.want)
+		}
+	}
+}
+
+// 发射侧国家列 TrimSpace + 异体归一——变量/头与 geoipLocFor、统计桶同口径
+// （中文异体「美国」折叠为规范名；「中国」保留；Reserved/0/空归空串）。
+// 修复前变量/头发射原始列：同一 xdb 行 Loc=United States 而
+// country_name=美国，按 Country 头/变量的匹配对异体段恒不命中。
+func TestParseGeoIPRegion_trimsCountryForEmission(t *testing.T) {
+	cases := []struct {
+		region      string
+		wantCountry string
+		wantLoc     string
+	}{
+		{"中国|广东省|深圳市|0|ISP", "中国", "广东省/深圳市"},
+		{" 中国|广东省|深圳市|0|ISP", "中国", "广东省/深圳市"},
+		{"\t中国 |广东省|0|0|ISP", "中国", "广东省"},
+		{"United States|0|0|0|ISP", "United States", "United States"},
+		{" 美国|0|0|0|ISP", "United States", "United States"},
+		{"Reserved|Reserved|Reserved|0|0", "", "海外"},
+	}
+	for _, tc := range cases {
+		got, ok := parseGeoIPRegion(tc.region)
+		if !ok {
+			t.Fatalf("parseGeoIPRegion(%q) rejected a %d-field row", tc.region, 5)
+		}
+		if got.Country != tc.wantCountry {
+			t.Errorf("parseGeoIPRegion(%q).Country=%q, want %q（发射侧必须 TrimSpace）", tc.region, got.Country, tc.wantCountry)
+		}
+		if got.Loc != tc.wantLoc {
+			t.Errorf("parseGeoIPRegion(%q).Loc=%q, want %q", tc.region, got.Loc, tc.wantLoc)
+		}
+	}
+	if _, ok := parseGeoIPRegion("中国|广东省"); ok {
+		t.Fatal("截断行（<5 列）必须拒绝发射")
+	}
+}
+
+// TestParseGeoIPRegion_noCityWithoutProvince：随包三份
+// xdb（caddygeoip/testdata、data/、data-slave/，各 553,954+ 段全量扫描）中
+// 「国家=中国 + 省列无效 + 城市列有效」的行数为 0——省列无效的 13 种 region
+// 串（如「中国|0|0|阿里|CN」）城市列同为 0/空。但 xdb 可在线更新，
+// parseGeoIPRegion 另有代码级守卫（省列归一为空 ⇒ 城市置空），新库即使
+// 引入该形态也不会发射树侧不可表达的「/城市」Loc 值：省无效行 Loc 为空
+// （省/城市规则均不命中，与树不变式一致），台湾城市误置省列的行由
+// ProvinceForEmit 归一为台湾省，仍落「省/城市」形态。
+func TestParseGeoIPRegion_noCityWithoutProvince(t *testing.T) {
+	cases := []struct {
+		region   string
+		wantProv string
+		wantCity string
+		wantLoc  string
+	}{
+		// 真实形态（xdb 中的 13 种省无效行同族）：ISP 可识别、省市均无效。
+		{"中国|0|0|阿里|CN", "", "", ""},
+		{"中国|0|0|0|CN", "", "", ""},
+		{"中国|0|0|中国移动|CN", "", "", ""},
+		// 台湾城市误置省列：省列归一为台湾省（树侧同样挂到台湾省下）。
+		{"中国|台中市|0|0|CN", "台湾省", "台中市", "台湾省/台中市"},
+		// 假设形态（现有库 0 行，在线更新引入时的守卫对象）：省无效但城市
+		// 有效——城市必须随省一起置空，不得发射「/城市」死值。
+		{"中国|0|杭州市|阿里|CN", "", "", ""},
+		{"中国||深圳市|0|CN", "", "", ""},
+	}
+	for _, tc := range cases {
+		got, ok := parseGeoIPRegion(tc.region)
+		if !ok {
+			t.Fatalf("parseGeoIPRegion(%q) rejected", tc.region)
+		}
+		if got.Province != tc.wantProv || got.City != tc.wantCity || got.Loc != tc.wantLoc {
+			t.Errorf("parseGeoIPRegion(%q) = {prov:%q city:%q loc:%q}; want {%q %q %q}",
+				tc.region, got.Province, got.City, got.Loc, tc.wantProv, tc.wantCity, tc.wantLoc)
+		}
+		// 树侧不变式（ip2region.go 中 prov=="" → continue）保证省无效行不会
+		// 出现在选项树里；发射侧因此不得产生以 "/" 开头的 Loc。
+		if strings.HasPrefix(got.Loc, "/") {
+			t.Fatalf("parseGeoIPRegion(%q).Loc=%q must not start with '/' (unrepresentable in the policy tree)", tc.region, got.Loc)
+		}
+	}
+}
+
+// TestProvision_sharedSearcherSingletonPerXdbPath：同 XdbPath 的
 // 多个 handler 必须共享同一 Ip2Region 实例——每 handler 各建一份会各开 20 个
 // searcher fd（50 条 GeoIP 规则≈1000 fd 逼近 soft limit，重载期翻倍），fd 耗尽
 // → Provision 降级 pass-through → 全客户端判「海外」误拦。指针同一即证明
-// 只开了一份 20-searcher 池。Cleanup 只解除引用不关闭单例（关闭会打断共享方）；
-// xdb 文件形态变化（更新流程 rename 换库后重载）→ 重建新实例而非复用旧 inode。
+// 只开了一份 20-searcher 池。Cleanup 不置空也不关闭单例（旧配置在途请求与
+// 其他共享方都可继续查询）；xdb 文件形态变化（更新流程 rename 换库后重载）
+// → 重建新实例而非复用旧 inode。
 func TestProvision_sharedSearcherSingletonPerXdbPath(t *testing.T) {
 	src := findTestXdb()
 	if src == "" {
@@ -329,15 +501,15 @@ func TestProvision_sharedSearcherSingletonPerXdbPath(t *testing.T) {
 	}
 	shared := h1.searcher
 
-	// h1 清理不关单例：h2 引用仍可用（Search 正常返回）
+	// h1 清理不清空也不关闭共享单例：旧配置的在途请求仍可使用 h1，h2 亦然。
 	if err := h1.Cleanup(); err != nil {
 		t.Fatalf("cleanup h1: %v", err)
 	}
-	if h1.searcher != nil {
-		t.Fatal("cleanup must drop the handler's own reference")
+	if h1.searcher != shared {
+		t.Fatal("cleanup must retain the handler's shared searcher for in-flight requests")
 	}
-	if region, err := h2.searcher.Search("114.114.114.114"); err != nil || region == "" {
-		t.Fatalf("shared searcher must stay usable after a sibling's cleanup: region=%q err=%v", region, err)
+	if region, err := h1.searcher.Search("114.114.114.114"); err != nil || region == "" {
+		t.Fatalf("cleaned-up handler's in-flight searcher must stay usable: region=%q err=%v", region, err)
 	}
 
 	// xdb 更新（rename 换库后 mtime/size 变化）→ 新 Provision 重建实例
@@ -360,7 +532,7 @@ func TestProvision_sharedSearcherSingletonPerXdbPath(t *testing.T) {
 	}
 }
 
-// TestProvision_replacedSearcherClosedAfterDelay（F49-5）：换库重建后被替换的
+// TestProvision_replacedSearcherClosedAfterDelay：换库重建后被替换的
 // 旧实例不再「保留至进程退出」——延迟窗口（防重载期在途查询落空误判海外）
 // 过后旧实例被 Close（查询报 pool closed），新实例立即可查。
 func TestProvision_replacedSearcherClosedAfterDelay(t *testing.T) {
@@ -424,7 +596,7 @@ func TestProvision_replacedSearcherClosedAfterDelay(t *testing.T) {
 	}
 }
 
-func TestRealClientIP_honorsHeadersAndStripsPort(t *testing.T) {
+func TestRealClientIP_ignoresUntrustedProxyHeadersAndStripsPort(t *testing.T) {
 	tests := []struct {
 		name   string
 		remote string
@@ -458,7 +630,7 @@ func TestRealClientIP_honorsHeadersAndStripsPort(t *testing.T) {
 }
 
 func TestNormalizeCity_pinyinMappedAndPassthrough(t *testing.T) {
-	// R72 二十五次：发射侧城市列规范化——拼音段映射为规范中文（策略树侧同款
+	// 发射侧城市列规范化——拼音段映射为规范中文（策略树侧同款
 	// 表，城市级 CEL 规则对拼音段可命中）；中文原样通过；无效值置空。
 	cases := map[string]string{
 		"Guangzhou Shi": "广州市",
@@ -490,7 +662,7 @@ func TestNormalizeProvince_taiwanCityPromotion(t *testing.T) {
 }
 
 func TestNormalizeCity_autonomousPrefecture(t *testing.T) {
-	// R72 二十八次（用户反馈）：少数民族自治州简称 → 全称（与树侧同款表
+	// （用户反馈）：少数民族自治州简称 → 全称（与树侧同款表
 	// 同步）；「大理市」是另一个县级市，全称必须是「大理白族自治州」。
 	cases := map[string]string{
 		"大理":   "大理白族自治州",
@@ -509,13 +681,13 @@ func TestNormalizeCity_autonomousPrefecture(t *testing.T) {
 	}
 }
 
-// TestSharedGeoIPSearcher_statFailureEvictsCachedEntry（PLUG-N2，第 72 轮）：
+// TestSharedGeoIPSearcher_statFailureEvictsCachedEntry
 // stat 失败（xdb 更新 rename 窗口/文件被删）且缓存持有该路径条目时，条目
 // 必须驱逐——旧实例走既有 AfterFunc 延迟关闭（在途查询保护与换库路径一致）。
 // 不驱逐时旧 inode 实例永久占据缓存槽：stat 失败路径原样 return err 不碰
 // 缓存，文件以「同 modtime+size」形态恢复（rsync -a/touch -r 保时间戳重铺）
 // 时缓存命中判定通过，被删 inode 的旧库被无限期当有效数据服务（更新静默
-// 失效——恰是 M2 缓存条目要防的形态）。
+// 失效——恰是缓存条目要防的形态）。
 func TestSharedGeoIPSearcher_statFailureEvictsCachedEntry(t *testing.T) {
 	src := findTestXdb()
 	if src == "" {
@@ -584,5 +756,215 @@ func TestSharedGeoIPSearcher_statFailureEvictsCachedEntry(t *testing.T) {
 	}
 	if region, err := second.Search("114.114.114.114"); err != nil || region == "" {
 		t.Fatalf("rebuilt instance must serve lookups: region=%q err=%v", region, err)
+	}
+}
+
+// xdb 带外损坏（文件形态变化但重建失败）时不得让 Provision 收到
+// error 而降级 pass-through（全部客户端判「海外」→ deny 海外全量误拦）；
+// 必须 fail-stale 继续服务缓存旧实例（与 wafiplist 的 fail-stale 对称）。
+func TestSharedGeoIPSearcher_rebuildFailureServesStale(t *testing.T) {
+	src := findTestXdb()
+	if src == "" {
+		t.Skip("no ip2region xdb available; place one under caddygeoip/testdata/ to run this test")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ip2region.xdb")
+	data, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatalf("read source xdb: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("seed xdb copy: %v", err)
+	}
+	oldDelay := geoipOldInstanceCloseDelay
+	geoipOldInstanceCloseDelay = 200 * time.Millisecond
+	t.Cleanup(func() {
+		geoipOldInstanceCloseDelay = oldDelay
+		geoipSharedMu.Lock()
+		delete(geoipSharedSearchers, path)
+		geoipSharedMu.Unlock()
+	})
+
+	first, err := sharedGeoIPSearcher(path)
+	if err != nil {
+		t.Fatalf("seed cache: %v", err)
+	}
+
+	// 带外损坏：原子 rename 换入坏文件（文件形态变化 → 触发重建且必失败）。
+	// 用 rename 而非原地截断：旧实例持有旧 inode 的 fd，原地改写会连旧实例
+	// 一起破坏（生产更新路径本身就是 rename）。
+	badPath := filepath.Join(dir, "corrupt.xdb")
+	if err := os.WriteFile(badPath, []byte("corrupted-xdb"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(badPath, path); err != nil {
+		t.Fatal(err)
+	}
+	second, err := sharedGeoIPSearcher(path)
+	if err != nil {
+		t.Fatalf("rebuild failure must fail stale (nil error), got %v", err)
+	}
+	if second != first {
+		t.Fatal("rebuild failure must serve the cached instance, not a replacement")
+	}
+	if region, err := second.Search("114.114.114.114"); err != nil || region == "" {
+		t.Fatalf("stale instance must still serve lookups: region=%q err=%v", region, err)
+	}
+	// 缓存条目保留（文件修复后下一次 stat 变化仍会触发重建）。
+	geoipSharedMu.Lock()
+	cached := geoipSharedSearchers[path]
+	geoipSharedMu.Unlock()
+	if cached == nil || cached.searcher != first {
+		t.Fatal("rebuild failure must not evict the cached entry")
+	}
+}
+
+// ---- 回归钉 ----
+
+const googlebotUA = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+
+func TestCrawlerVerify_usesClientIPVarOverRemoteAddr(t *testing.T) {
+	ResetCrawlerVerifyCacheForTest(&fakeResolver{
+		ptr: map[string][]string{
+			"66.249.66.1": {"crawl-66-249-66-1.googlebot.com."},
+			// socket 对端（CDN 回源）没有官方 PTR：若实现仍用 RemoteAddr 必判伪装
+		},
+		host: map[string][]string{
+			"crawl-66-249-66-1.googlebot.com": {"66.249.66.1"},
+		},
+	})
+	h := &GeoIPHandler{CrawlerExempt: true}
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "203.0.113.50:443" // CDN 回源 IP
+	req.Header.Set("User-Agent", googlebotUA)
+	ctx := context.WithValue(req.Context(), caddyhttp.VarsCtxKey, map[string]any{
+		caddyhttp.ClientIPVarKey: "66.249.66.1",
+	})
+	req = req.WithContext(ctx)
+
+	h.applyCrawlerVerification(req)
+
+	if got := req.Header.Get(crawlerVerifiedHeader); got != "googlebot" {
+		t.Fatalf("verified header=%q, want googlebot (client_ip variable must win over socket addr)", got)
+	}
+	if got := req.Header.Get(crawlerSpoofHeader); got != "" {
+		t.Fatalf("spoof header=%q, want empty", got)
+	}
+
+	// 变量缺席 → 回退 socket（fail-closed 回归：CDN 回源 IP 不属官方段）。
+	ResetCrawlerVerifyCacheForTest(&fakeResolver{})
+	req2 := httptest.NewRequest(http.MethodGet, "/", nil)
+	req2.RemoteAddr = "203.0.113.50:443"
+	req2.Header.Set("User-Agent", googlebotUA)
+	h.applyCrawlerVerification(req2)
+	if got := req2.Header.Get(crawlerVerifiedHeader); got != "" {
+		t.Fatalf("verified header=%q without client_ip, want empty", got)
+	}
+	if got := req2.Header.Get(crawlerSpoofHeader); got != "googlebot" {
+		t.Fatalf("spoof header=%q, want googlebot (fallback socket IP fails closed)", got)
+	}
+}
+
+func TestCrawlerVerification_gatedByRenderFlag(t *testing.T) {
+	resolver := &fakeResolver{
+		ptr:  map[string][]string{"66.249.66.1": {"crawl-66-249-66-1.googlebot.com."}},
+		host: map[string][]string{"crawl-66-249-66-1.googlebot.com": {"66.249.66.1"}},
+	}
+	ResetCrawlerVerifyCacheForTest(resolver)
+	off := &GeoIPHandler{} // crawler_exempt 未配置 = false
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "66.249.66.1:443"
+	req.Header.Set("User-Agent", googlebotUA)
+	off.applyCrawlerVerification(req)
+	if req.Header.Get(crawlerVerifiedHeader) != "" || req.Header.Get(crawlerSpoofHeader) != "" {
+		t.Fatal("crawler_exempt=false must not set verification headers")
+	}
+	// 门控 true 时验证路径不变。
+	onReq := httptest.NewRequest(http.MethodGet, "/", nil)
+	onReq.RemoteAddr = "66.249.66.1:443"
+	onReq.Header.Set("User-Agent", googlebotUA)
+	(&GeoIPHandler{CrawlerExempt: true}).applyCrawlerVerification(onReq)
+	if onReq.Header.Get(crawlerVerifiedHeader) != "googlebot" {
+		t.Fatal("crawler_exempt=true must keep the verification path")
+	}
+}
+
+// 瞬态验证结论（DNS 解析失败/超时/并发饱和）不得置伪装头：真实搜索引擎
+// 爬虫在 DNS 抖动时既不被伪装规则阻断，也不产生伪伪装事件。
+func TestCrawlerVerification_transientSetsNoSpoofHeader(t *testing.T) {
+	ResetCrawlerVerifyCacheForTest(&fakeResolver{
+		ptrErr: map[string]error{"66.249.66.1": context.DeadlineExceeded},
+	})
+	h := &GeoIPHandler{CrawlerExempt: true}
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "66.249.66.1:443"
+	req.Header.Set("User-Agent", googlebotUA)
+
+	h.applyCrawlerVerification(req)
+
+	if got := req.Header.Get(crawlerSpoofHeader); got != "" {
+		t.Fatalf("瞬态验证不得置伪装头，got %q", got)
+	}
+	if got := req.Header.Get(crawlerVerifiedHeader); got != "" {
+		t.Fatalf("瞬态验证不得置已验证头，got %q", got)
+	}
+}
+
+// 宽品牌标记不构成伪装证据：裸 DeepSeek / ChatGPT-User / Claude-Web 等标记
+// 会出现在普通客户端 UA 里，单独命中不得发射伪装头（否则制造伪安全事件）；
+// 官方爬虫 token 仍判伪装，官方 PTR 仍判已验证。
+func TestCrawlerVerification_weakBrandMarkerIsNotSpoofEvidence(t *testing.T) {
+	ResetCrawlerVerifyCacheForTest(&fakeResolver{})
+	h := &GeoIPHandler{CrawlerExempt: true}
+
+	wide := []struct {
+		ua, engine string
+	}{
+		{"Mozilla/5.0 (compatible; DeepSeek/1.0)", "deepseekbot"},
+		{"Mozilla/5.0 (compatible; ChatGPT-User/1.0; +https://openai.com/bot)", "gptbot"},
+		{"Mozilla/5.0 (compatible; Claude-Web/1.0; +claude.ai)", "claudebot"},
+		{"Mozilla/5.0 (compatible; anthropic-ai/1.0)", "claudebot"},
+	}
+	for _, c := range wide {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.RemoteAddr = "203.0.113.7:443" // 无官方 PTR → 确定否定
+		req.Header.Set("User-Agent", c.ua)
+		h.applyCrawlerVerification(req)
+		if got := req.Header.Get(crawlerSpoofHeader); got != "" {
+			t.Fatalf("裸 %s 品牌串: 宽品牌标记不得单独判伪装，spoof=%q", c.engine, got)
+		}
+		if got := req.Header.Get(crawlerVerifiedHeader); got != "" {
+			t.Fatalf("%q 不得判已验证，verified=%q", c.ua, got)
+		}
+	}
+
+	// 官方 token + 无官方 PTR：伪装证据成立。
+	for _, c := range []struct{ ua, engine string }{
+		{"Mozilla/5.0 (compatible; DeepSeekBot/1.0)", "deepseekbot"},
+		{"Mozilla/5.0 (compatible; OAI-SearchBot/1.0)", "gptbot"},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.RemoteAddr = "203.0.113.7:443"
+		req.Header.Set("User-Agent", c.ua)
+		h.applyCrawlerVerification(req)
+		if got := req.Header.Get(crawlerSpoofHeader); got != c.engine {
+			t.Fatalf("官方 token %q spoof=%q, want %q", c.ua, got, c.engine)
+		}
+	}
+
+	// 官方 PTR + 宽标记：Verified 路径必须不受证据门影响。
+	ResetCrawlerVerifyCacheForTest(&fakeResolver{
+		ptr:  map[string][]string{"198.51.100.9": {"crawl.deepseek.com."}},
+		host: map[string][]string{"crawl.deepseek.com": {"198.51.100.9"}},
+	})
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "198.51.100.9:443"
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; DeepSeek/1.0)")
+	h.applyCrawlerVerification(req)
+	if got := req.Header.Get(crawlerVerifiedHeader); got != "deepseekbot" {
+		t.Fatalf("官方 PTR 应判已验证（宽标记不影响 Verified 路径），verified=%q", got)
+	}
+	if got := req.Header.Get(crawlerSpoofHeader); got != "" {
+		t.Fatalf("已验证路径不得置伪装头，spoof=%q", got)
 	}
 }

@@ -68,7 +68,7 @@ docker compose up -d
 # 从源码构建
 # 前端由 Dockerfile 内的 node 构建阶段产出，无需先本地 npm build
 docker buildx build --platform linux/amd64,linux/arm64 \
-  --build-arg VERSION=v2.3.5 \
+  --build-arg VERSION=v2.3.8 \
   --provenance=false --sbom=false \
   -t docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2:latest --push .
 ```
@@ -82,14 +82,15 @@ docker buildx build --platform linux/amd64,linux/arm64 \
 
 ## 我们相对上游改了什么
 
-**当前上游基线：`v2.3.6`（`9c759716`，v2.3.6 正式版）。**
-上游这一段里的迭代已全部吃进：Caddy v2.11.7（修 v2.11.6 流式转发回归）、
-Go 1.26.9 + x/net v0.60.0 + Alpine 3.24.2（10 项 CVE）、coraza-caddy v2.6.2 /
-coraza v3.8.1、规则级 NTLM 兼容开关、第 70/71/72 轮审计修复、task-engine 状态列
-方案 A、geoipnames 共享表库、受信网段名单化（`trusted_proxy_range_refs`）、
-ACME 传播判据改造，以及 `v2.3.5` 的回源域名原生 `map`、静态响应 `response_mode` 三值、
-健康检查域名、SNI 剥端口、仪表盘分位数插值、第 69 轮 151 项审计修复等；
-逐条对账见[上游合并清单](docs/upstream-merge.zh-CN.md)。
+**当前上游基线：`v2.3.8`（`d65578fc`，v2.3.8 正式版）。**
+上游这一段的迭代已全部吃进：威胁大屏（2D 地图 + 3D 地球双视图、光流三档聚合、
+自适应采样与采集租约）、WAF 触发自动封禁（阈值计数模型，含观察模式与名单联动）、
+地域拦截海外细化到国家、爬虫豁免（UA + 反向 DNS/官方 IP 段双跳验证，官方爬虫
+地址库定时更新）、厂商爬虫 `.fast` 预编译地址库、安全事件独立保留与流量采样随
+集群同步、全项目多轮审计修复全量落地；
+再往前 `v2.3.6`/`v2.3.7` 的 Caddy v2.11.7、Go 1.26.9、coraza v3.8.1、NTLM 兼容
+开关、`geoipnames` 共享表库、受信网段名单化（`trusted_proxy_range_refs`）、ACME
+传播判据改造等一并保留；逐条对账见[上游合并清单](docs/upstream-merge.zh-CN.md)。
 
 下表只列「人话版」的**我们独有**能力（上游没有的部分）：
 
@@ -149,8 +150,9 @@ ACME 传播判据改造，以及 `v2.3.5` 的回源域名原生 `map`、静态�
 
 | 日期 | 内容 |
 |---|---|
-| 2026-10-13 | **追平上游 `v2.3.6` 正式版**（`9c759716`，23 提交 / 192 文件）：新增 `geoipnames` 零依赖共享表库（xcaddy `--with` 与 `replace` 双保险）、受信网段名单化 `trusted_proxy_range_refs`、NTLM 开关 UI 归位「路由与后端兼容」区、ACME 传播判据改造、第 72 轮 35 项审计修复、规则列表 TLS 标签签发态实时可见、CRS v4.28.0；版本口径统一到 `v2.3.6`（取消 beta 后缀）；7 个冲突文件按圈层规则解决，自维护能力（链式回退、引用型证书、端口换位）原样保留 |
-| 2026-10-12 | **追平上游 `v2.3.5` 之后的 11 个未打标签提交**（至 `v2.3.6-beta` / `c617664b`）：Caddy v2.11.7 流式转发回归修复、Go 1.26.9 + x/net v0.60.0 + Alpine 3.24.2（10 项 CVE）、coraza v3.8.1 安全修复、新增规则级 NTLM 兼容开关、第 70/71 轮审计修复、task-engine 状态列方案 A——一次安全/回归级升级；自维护能力（链式回退、引用型证书、端口换位）与规则级 `origin_domain` 口径原样保留 |
+| 2026-10-23 | **追平上游 `v2.3.8` 正式版**（`d65578fc`，90 提交 / 300 文件）：吃进威胁大屏（2D 地图 + 3D 地球、光流三档聚合、自适应采样与采集租约）、WAF 触发自动封禁（阈值计数模型 + 观察模式）、地域拦截海外细化到国家、爬虫豁免（UA + 反向 DNS/官方 IP 段双跳）与官方爬虫地址库定时更新、厂商爬虫 `.fast` 预编译地址库、安全事件独立保留与采样随集群同步、全项目多轮审计；`geoipnames`/`wafiplist`/`caddygeoip` 以上游为骨（耗时侧车退役，改走审计行 `lb_timing` 内嵌），自维护三项能力（链式回退、引用型证书摄取入库、端口换位）原样保留；Dockerfile 取上游层序（BUILDPLATFORM 交叉编译 + 显式 COPY 清单）并补回 `caddychain` 与前端构建阶段 |
+| 2026-10-13 | **追平上游 `v2.3.6` 正式版**（`9c759716`，23 提交 / 192 文件）：新增 `geoipnames` 零依赖共享表库（xcaddy `--with` 与 `replace` 双保险）、受信网段名单化 `trusted_proxy_range_refs`、NTLM 开关 UI 归位「路由与后端兼容」区、ACME 传播判据改造、多轮审计修复、规则列表 TLS 标签签发态实时可见、CRS v4.28.0；版本口径统一到 `v2.3.6`（取消 beta 后缀）；7 个冲突文件按圈层规则解决，自维护能力（链式回退、引用型证书、端口换位）原样保留 |
+| 2026-10-12 | **追平上游 `v2.3.5` 之后的 11 个未打标签提交**（至 `v2.3.6-beta` / `c617664b`）：Caddy v2.11.7 流式转发回归修复、Go 1.26.9 + x/net v0.60.0 + Alpine 3.24.2（10 项 CVE）、coraza v3.8.1 安全修复、新增规则级 NTLM 兼容开关、审计修复、task-engine 状态列方案 A——一次安全/回归级升级；自维护能力（链式回退、引用型证书、端口换位）与规则级 `origin_domain` 口径原样保留 |
 | 2026-10-11 | **合入上游 v2.3.5**（`98c607ac`）：逐上游回源域名改吃上游 `origin_domain` + 原生 `map`，静态响应改吃上游 `response_mode` 三值——自研 `host_header` / `action=respond` 两套实现退役，存量数据自动双向迁移；保留链式回退、引用型证书摄取入库、端口换位三项自维护能力 |
 | 2026-10-11 | 清理仓库内与内部开发平台相关的描述（页脚链接、CI 章节、迁移说明），公开面统一指向本仓库 |
 | 2026-10-11 | 端口换位补齐默认口漏网点；引用证书摄取入库；链式回退策略；新增 GitHub Actions 上游同步与版本巡检；重写 README；`docker-compose` 引用改为自维护镜像 |

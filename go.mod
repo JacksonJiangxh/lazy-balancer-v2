@@ -89,6 +89,8 @@ require (
 	rsc.io/binaryregexp v0.2.0 // indirect
 )
 
+replace lazy-balancer-v2/caddychain => ./caddychain
+
 replace lazy-balancer-v2/wafiplist => ./wafiplist
 
 replace lazy-balancer-v2/geoipnames => ./geoipnames

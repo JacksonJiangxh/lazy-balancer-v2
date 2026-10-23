@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -168,7 +170,7 @@ func TestIPMatchVsIPListFast_equivalenceProbe(t *testing.T) {
 	}
 }
 
-// P5-1（第 50 轮审计）：写锁代际守卫——并发重建时，基于更早 stat 的解析
+// 写锁代际守卫——并发重建时，基于更早 stat 的解析
 // 结果（旧代际）不得覆盖已落地的新代际缓存，否则旧内容会回流服役。
 func TestLoadIPListFile_staleGenerationDoesNotOverwriteNewer(t *testing.T) {
 	dir := useAllowedDir(t)
@@ -203,5 +205,198 @@ func TestLoadIPListFile_staleGenerationDoesNotOverwriteNewer(t *testing.T) {
 	// Then：缓存仍是新代际（旧解析不得覆盖）
 	if state != newerState {
 		t.Fatal("旧代际解析覆盖了新代际缓存（写锁缺代际守卫）")
+	}
+}
+
+// 空文件合法（2026-10-15 始终发射收敛）：空名单投影空文件后 @ipListFast 构建
+// 期加载必须无错误（空集=匹配器永不命中，与无规则语义等价）——否则空名单
+// 策略的恒发射规则会在 Caddy validate 阶段被 fail-closed 拒绝。含坏行仍报错
+// （严格解析不变）；空→有内容的 mtime+size stat 变化照常热感知。
+func TestIPListFast_emptyFileLoadsNoErrorAndNeverMatches(t *testing.T) {
+	dir := useAllowedDir(t)
+	path := filepath.Join(dir, "empty.txt")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	state, err := loadIPListFileFresh(path)
+	if err != nil {
+		t.Fatalf("空文件构建期加载必须无错误: %v", err)
+	}
+	if len(state.v4) != 0 || len(state.v6) != 0 {
+		t.Fatalf("空文件集合 v4=%d v6=%d, want 0/0", len(state.v4), len(state.v6))
+	}
+	// 注释/空行文件同形（解析后 0 条目）
+	path2 := writeListFile(t, dir, "blank.txt", []string{"# 注释", "", "; 注释"})
+	if _, err := loadIPListFileFresh(path2); err != nil {
+		t.Fatalf("注释/空行文件加载必须无错误: %v", err)
+	}
+
+	op := newOp(t, path)
+	for _, v := range []string{"203.0.113.7", "10.0.0.1", "2001:db8::1", "not-an-ip"} {
+		if op.Evaluate(nil, v) {
+			t.Fatalf("空文件算子对 %q 不得命中", v)
+		}
+	}
+}
+
+// ResolvePrefixesNormalized 是 Provision 已归一路径的热路径入口：复用同一
+// 缓存快照与网段语义，不再重复 Clean/白名单校验。
+func TestResolvePrefixesNormalized_contract(t *testing.T) {
+	// Given: Provision 已完成白名单归一和首次新鲜加载。
+	dir := useAllowedDir(t)
+	path := writeListFile(t, dir, "tp-normalized.txt", []string{"203.0.113.7", "10.8.0.0/16"})
+	cleaned, err := NormalizeAllowedPath(path)
+	if err != nil {
+		t.Fatalf("NormalizeAllowedPath: %v", err)
+	}
+	if _, err := LoadPrefixesFresh(cleaned); err != nil {
+		t.Fatalf("LoadPrefixesFresh: %v", err)
+	}
+
+	// When: 热路径使用已归一入口。
+	prefixes, err := ResolvePrefixesNormalized(cleaned)
+
+	// Then: 复用同一缓存快照与网段语义，不重复路径归一。
+	if err != nil {
+		t.Fatalf("ResolvePrefixesNormalized: %v", err)
+	}
+	if len(prefixes) != 2 {
+		t.Fatalf("prefixes=%v, want 2 entries", prefixes)
+	}
+}
+
+// LoadPrefixesFresh 与 NormalizeAllowedPath+ResolvePrefixesNormalized 组合是
+// 白名单校验导出入口：fresh=构建期 fail-closed，组合=运行期节流+fail-stale；
+// 返回缓存共享只读快照。
+func TestLoadAndResolvePrefixes_contract(t *testing.T) {
+	dir := useAllowedDir(t)
+	path := writeListFile(t, dir, "tp-accessor.txt", []string{"203.0.113.7", "10.8.0.0/16"})
+
+	fresh, err := LoadPrefixesFresh(path)
+	if err != nil {
+		t.Fatalf("LoadPrefixesFresh: %v", err)
+	}
+	if len(fresh) != 2 {
+		t.Fatalf("fresh=%v, want 2 条", fresh)
+	}
+
+	// 运行期形态 = 归一（白名单）+ 热路径入口（原 ResolvePrefixes
+	// 包装无生产调用方已删除，测试直用生产同款两步组合）。
+	cleaned, err := NormalizeAllowedPath(path)
+	if err != nil {
+		t.Fatalf("NormalizeAllowedPath: %v", err)
+	}
+	resolve, err := ResolvePrefixesNormalized(cleaned)
+	if err != nil {
+		t.Fatalf("ResolvePrefixesNormalized: %v", err)
+	}
+	if len(resolve) != 2 {
+		t.Fatalf("resolve=%v, want 2 条", resolve)
+	}
+
+	// 白名单外路径拒绝（与算子同规，防目录穿越）。
+	for _, p := range []string{"/etc/passwd", "relative.txt"} {
+		if _, err := LoadPrefixesFresh(p); err == nil {
+			t.Fatalf("LoadPrefixesFresh(%q) 必须被白名单拒绝", p)
+		}
+		if _, err := NormalizeAllowedPath(p); err == nil {
+			t.Fatalf("NormalizeAllowedPath(%q) 必须被白名单拒绝", p)
+		}
+	}
+
+	// fail-stale：重建失败（坏行）且有旧集 → 返回旧集；从未加载 → error。
+	if err := os.WriteFile(path, []byte("garbage!!!\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(2 * time.Second)
+	_ = os.Chtimes(path, future, future)
+	old := StatCheckInterval
+	StatCheckInterval = 0
+	t.Cleanup(func() { StatCheckInterval = old })
+	stale, err := ResolvePrefixesNormalized(cleaned)
+	if err != nil || len(stale) != 2 {
+		t.Fatalf("fail-stale 必须返回旧集: got=%v err=%v", stale, err)
+	}
+	if _, err := LoadPrefixesFresh(path); err == nil {
+		t.Fatal("fresh 路径坏行必须报错（构建期 fail-closed）")
+	}
+}
+
+// fakeFileStat 实现 os.FileInfo（读后复核谓词的单测替身）。
+type fakeFileStat struct {
+	size int64
+	mod  time.Time
+}
+
+func (f fakeFileStat) Name() string       { return "iplist" }
+func (f fakeFileStat) Size() int64        { return f.size }
+func (f fakeFileStat) Mode() os.FileMode  { return 0o644 }
+func (f fakeFileStat) ModTime() time.Time { return f.mod }
+func (f fakeFileStat) IsDir() bool        { return false }
+func (f fakeFileStat) Sys() any           { return nil }
+
+// 读后复核必须覆盖同尺寸原位改写：size 不变而 mtime 变化同样是「读取期间
+// 被改写」——只比 size 会把混合字节当完整代际缓存（半新半旧的拒绝面）。
+func TestIPListGenerationChanged_detectsSameSizeRewrite(t *testing.T) {
+	base := time.Unix(1_700_000_000, 0)
+	before := fakeFileStat{size: 100, mod: base}
+	if ipListGenerationChanged(before, fakeFileStat{size: 100, mod: base}, nil) {
+		t.Fatal("同形态不得判为改写")
+	}
+	if !ipListGenerationChanged(before, fakeFileStat{size: 100, mod: base.Add(time.Millisecond)}, nil) {
+		t.Fatal("同尺寸 mtime 变化必须判为改写")
+	}
+	if !ipListGenerationChanged(before, fakeFileStat{size: 101, mod: base}, nil) {
+		t.Fatal("size 变化必须判为改写")
+	}
+	if !ipListGenerationChanged(before, nil, os.ErrNotExist) {
+		t.Fatal("读后 stat 失败必须判为改写")
+	}
+}
+
+// 锁表不得随历史路径永驻：最后一个使用者释放后条目退役——否则 u-*/p<id>-*
+// 投影按规则身份命名，删除规则后锁表随历史规则数量单调增长。
+func TestIPListLoadLocks_retiredAfterRelease(t *testing.T) {
+	const path = "/app/waf/locks-retire-probe.iplist"
+	unlock := lockIPListLoad(path)
+	if _, ok := ipListLoadLocks.Load(path); !ok {
+		unlock()
+		t.Fatal("持锁期间锁表必须有条目")
+	}
+	unlock()
+	if _, ok := ipListLoadLocks.Load(path); ok {
+		t.Fatal("最后一个使用者释放后锁表条目必须退役")
+	}
+	// 退役后复取用仍正常工作并再次回收（串行化契约不变）。
+	unlock = lockIPListLoad(path)
+	unlock()
+	if _, ok := ipListLoadLocks.Load(path); ok {
+		t.Fatal("退役后复取用仍须回收")
+	}
+}
+
+// 取用/退役并发不得产生双锁（两把锁并发解析同一文件）——互斥区内同时在
+// 场者必须恒为 1。
+func TestIPListLoadLocks_concurrentAcquireRelease(t *testing.T) {
+	const path = "/app/waf/locks-concurrent-probe.iplist"
+	var inside atomic.Int64
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 200 {
+				unlock := lockIPListLoad(path)
+				if n := inside.Add(1); n != 1 {
+					t.Errorf("互斥区内同时 %d 个持有者（双锁并发解析）", n)
+				}
+				inside.Add(-1)
+				unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if _, ok := ipListLoadLocks.Load(path); ok {
+		t.Fatal("并发取用/释放后锁表必须清空")
 	}
 }

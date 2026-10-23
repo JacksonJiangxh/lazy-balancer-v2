@@ -17,7 +17,7 @@ const securityBlockedMetricName = "security_blocked_total"
 // newSecurityBlockedCounterVec 每次 Provision 新建 CounterVec 并注册——
 // caddy-l4 newProxyMetrics 同模式(l4proxy/metrics.go:54):同 registry 时
 // registerOrExisting 复用已注册实例(不丢数据),跨 reload 新 registry 时
-// 全新注册(归零,与 caddy_http_* 同纪元)——P3-1(第 28.5 轮审计):包级
+// 全新注册(归零,与 caddy_http_* 同纪元)——包级
 // singleton 跨 reload 不归零,与 caddy_http_* 纪元错位,扣除常态钳 4xx 到 0。
 func newSecurityBlockedCounterVec(reg *prometheus.Registry) *prometheus.CounterVec {
 	return registerOrExisting(reg, prometheus.NewCounterVec(
@@ -61,7 +61,7 @@ func init() {
 //   - 无锁/无共享态——prometheus counter 线程安全,reload 幂等;
 //   - API 兼容面:caddy.Module/caddyhttp.HandlerError 稳定(v2.0 起);
 //     ctx.GetMetricsRegistry() 是 EXPERIMENTAL(Caddy 标注 subject to change)
-//     ——已 nil 守卫(移除则降级为不计数而非崩溃),P5-3(第 28.5 轮审计)。
+//     已 nil 守卫(移除则降级为不计数而非崩溃),。
 type SecurityBlockedCounter struct {
 	// Rule 是所属负载均衡规则的 caddy_id(渲染期静态注入)。
 	Rule string `json:"rule,omitempty"`
@@ -79,19 +79,13 @@ func (SecurityBlockedCounter) CaddyModule() caddy.ModuleInfo {
 
 // Provision 注册计数器到 Caddy 的 metrics registry(非默认 registry——
 // 默认 registry 的指标不暴露在 Caddy /metrics 端点);registerOrExisting
-// 保证 reload 幂等(重复注册复用实例,不 panic)。同时启动耗时侧车写管线
-// 引用（PLUG-N1 第 72 轮——本 handler 是拦截点耗时写点之一）。
+// 保证 reload 幂等(重复注册复用实例,不 panic)。计时写目标是进程内注册表
+// （auditTimingRecord，auditwriter.go）——无后台管线生命周期，本 handler
+// 不再持有 Provision/Cleanup 引用计数（侧车退役）。
 func (h *SecurityBlockedCounter) Provision(ctx caddy.Context) error {
 	if reg := ctx.GetMetricsRegistry(); reg != nil {
 		h.metrics = newSecurityBlockedCounterVec(reg)
 	}
-	securityTimingWriterAcquire()
-	return nil
-}
-
-// Cleanup 释放本 handler 的耗时侧车写管线引用（PLUG-N1 第 72 轮）。
-func (h *SecurityBlockedCounter) Cleanup() error {
-	securityTimingWriterRelease()
 	return nil
 }
 
@@ -99,47 +93,85 @@ func (h *SecurityBlockedCounter) Cleanup() error {
 // 4xx status,且 len(ID)==16[coraza tx.ID] 或 status==429[限流])时按规则计数;
 // 上游 4xx 不产 HandlerError(反向代理直写响应)不误计;返回值原样透传。
 //
-// 安全处理耗时(2026-09-27 用户裁定):请求进入时注入 X-Lb-Security-Timing-Id
-// 请求头(coraza 审计日志的 request.headers 天然收录该头——摄取管道从审计
-// 条目读出同一 ID 即可对上),next 返回后记录耗时到共享表——弹框「处理耗时」
-// 的数据源。写侧在本方法(拦截事件)+security_timing_pre/end(放行事件);
-// 读侧在 internal/services/securityevents.go 的 securityTimingLoad(tick 级
-// 合并 map+读后截断)。
+// 安全处理耗时(2026-09-27 用户裁定;历史侧车退役):请求进入时注入
+// X-Lb-Security-Timing-Id 请求头(coraza 审计日志 request.headers 天然收录——
+// 审计写插件从审计事务头提取该 ID 作进程内计时注册表的关联键),next 返回后
+// 把耗时写入注册表——经审计写插件注入审计行 lb_timing 字段,弹框「处理耗时」
+// 的数据源。写侧在本方法(拦截事件+终态标记)+security_timing_pre/end(放行
+// 事件分段);读侧在 internal/services/securityevents.go 的
+// securityEventsParseTransaction(直接读审计行内嵌 lb_timing)。
 func (h *SecurityBlockedCounter) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	// 安全处理耗时:注入 timing ID + 起始纳秒双头(coraza 审计日志收录 ID;
-	// SecurityTimingEnd 处理器在安全链末尾读起始头计算 passed 事件的纯评估
-	// 耗时)。起始头与 ID 头均在 proxyRequestHeaders 删除清单剥离,不上泄上游。
+	// SecurityTimingPre 记 pre 后把起始头重写为「预检完成」分段锚点,
+	// SecurityTimingEnd 读锚点计算 logged 事件的 WAF 段耗时)。起始头与 ID 头
+	// 均在 proxyRequestHeaders 删除清单剥离,不上泄上游。
 	timingID := securityTimingID()
+	var timingStartVal string
 	if timingID != "" {
+		timingStartVal = strconv.FormatInt(time.Now().UnixNano(), 10)
 		r.Header.Set(securityTimingHeader, timingID)
-		r.Header.Set(securityTimingStartHeader, strconv.FormatInt(time.Now().UnixNano(), 10))
+		r.Header.Set(securityTimingStartHeader, timingStartVal)
 	}
 	start := time.Now()
+
+	isSecurityBlock := false
+	// 终态与流量计数必须覆盖 panic 展开路径：coraza 的 ProcessLogging 也会
+	// 在 panic 时执行，若此处不 close，drain 会为该审计行等满超时。
+	defer func() {
+		if timingID != "" {
+			auditTimingClose(timingID)
+		}
+		// 采集关闭时只做一次 atomic load：不读 GeoIP 变量、不做 map/原子计数。
+		// 安全事件日志与 timingClose 仍始终执行。
+		if !trafficCollectorActive() {
+			return
+		}
+		// 国名只取 geoip handler 写入的 Caddy 服务端变量。无 GeoIP handler
+		// 时变量缺席即跳过，客户端自带的同名请求头永不可信。
+		country, _ := caddyhttp.GetVar(r.Context(), "geoip.country_name").(string)
+		trafficRecord(country, isSecurityBlock)
+		if !isSecurityBlock && country != "" {
+			province, _ := caddyhttp.GetVar(r.Context(), "geoip.province").(string)
+			if country != "中国" {
+				province = ""
+			}
+			trafficEventRecord(country, province)
+		}
+	}()
 
 	err := next.ServeHTTP(w, r)
 
 	var herr caddyhttp.HandlerError
-	// P3-2(第 28.5 轮审计):「ID 非空+4xx」误纳非安全 4xx——caddyhttp.Error
+	// 「ID 非空+4xx」误纳非安全 4xx——caddyhttp.Error
 	// 恒生成 ID(randString 9 字符),proxy 499/request_body 413 也被计入。
 	// 精确判定:len(ID)==16(coraza tx.ID,randomString(16))或 status==429
 	// (限流,caddyhttp.Error 生成 9 字符 ID)——覆盖安全拦截全部,排除
 	// proxy 499/request_body 413/其他 caddyhttp.Error 4xx(全 9 字符)。
-	// 脆弱点:coraza 若改 tx.ID 长度→断;但 v2.x 一直 16 且 coraza 由
-	// Dockerfile pin+构建断言控制——可控。
-	isSecurityBlock := err != nil && errors.As(err, &herr) &&
+	// 脆弱点:coraza 若改 tx.ID 长度→断;但 v2.x 一直 16,且 coraza 版本由
+	// go.mod pin(v3.8.1)+Dockerfile 构建断言(区间 [v3.8.1,v3.9)）
+	// 双重控制——可控。
+	isSecurityBlock = err != nil && errors.As(err, &herr) &&
 		herr.StatusCode >= 400 && herr.StatusCode < 500 &&
 		(len(herr.ID) == 16 || herr.StatusCode == http.StatusTooManyRequests)
 
-	// 安全处理耗时——双点计时的「拦截点」:安全中断(HandlerError 返回)时
-	// 链未到 reverse_proxy,此处耗时=纯安全评估;放行事件的耗时由安全链末尾
-	// 的 SecurityTimingEnd 处理器记录(此处 next 返回值混入上游代理往返,
-	// 不能用——实测 329ms 中主要是上游响应时间而非 WAF 评估)。
+	// 安全处理耗时——分段选键(预检拦口径):单一写点保证同 ID 恰一段,
+	// 无双段混乱。此刻中断已裁决、403 响应尚未写出(错误路由在 Server
+	// 层于本 handler 返回后才执行)——两种键都是纯评估口径(决策→计时→注册表
+	// →入队注入的顺序保证降级模式下耗时数字不受污染,见 auditwriter.go):
+	//   起始头仍=注入原值 → 链未抵达预检收点(SecurityTimingPre 未重写锚点)
+	//     =预检段拦(IP ACL/GeoIP/信任/威胁)→ 写 pre=预检决策耗时;
+	//   头已被重写 → 预检已放行,中断出自 WAF/限流段 → 写 end=链首至此全链
+	//     (读侧 - pre 得 WAF 段)。
+	// timingID 为空(随机源失败)时全程无计时,不写(下分支同门)。
 	if timingID != "" && isSecurityBlock {
-		AppendSecurityTiming(timingID+":end", time.Since(start).Microseconds()) // 分段键:end(预检拦时=end 即预检耗时)
+		if r.Header.Get(securityTimingStartHeader) == timingStartVal {
+			auditTimingRecord(timingID, timingSegmentPre, time.Since(start).Microseconds())
+		} else {
+			auditTimingRecord(timingID, timingSegmentEnd, time.Since(start).Microseconds())
+		}
 	}
-
 	if isSecurityBlock {
-		// F1(第 28.6 轮审计):P3-2 判定丢失 4xx 约束——coraza 引擎 500
+		// 判定丢失 4xx 约束——coraza 引擎 500
 		// (16 字符 tx.ID)被误计为安全拦截且吃掉一个合法 4xx。恢复 4xx 约束。
 		if h.metrics != nil {
 			h.metrics.WithLabelValues(h.Rule).Inc()
@@ -148,9 +180,18 @@ func (h *SecurityBlockedCounter) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	return err
 }
 
+// Cleanup 在 Caddy reload/优雅停机时冲刷审计管线（上游 coraza 不调用
+// AuditLogWriter.Close）。每个规则一个实例，一次 reload 会调用 N 次；
+// FlushAuditPipelines 内部按合并窗口去重，只有首个调用付出排空等待——
+// 收尾成本与规则数解耦。
+func (h *SecurityBlockedCounter) Cleanup() error {
+	FlushAuditPipelines()
+	return nil
+}
+
 // Interface guards(编译期契约,零运行时成本)。
 var (
 	_ caddy.Provisioner           = (*SecurityBlockedCounter)(nil)
-	_ caddy.CleanerUpper          = (*SecurityBlockedCounter)(nil)
 	_ caddyhttp.MiddlewareHandler = (*SecurityBlockedCounter)(nil)
+	_ caddy.CleanerUpper          = (*SecurityBlockedCounter)(nil)
 )
