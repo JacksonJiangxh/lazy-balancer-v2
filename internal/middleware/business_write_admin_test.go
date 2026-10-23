@@ -51,7 +51,8 @@ func TestBusinessWriteEndpoints_requireAdmin(t *testing.T) {
 		req.Header.Set("X-API-Key", userKey)
 		rec := httptest.NewRecorder()
 		router.ServeHTTP(rec, req)
-		// Then：必须 403（adminOnly）
+		// Then：必须 403（business 组 readOnlyGuard 对非管理员拒绝；admin 组
+		// 才是 adminOnly——两组的 403 来源不同，排查时先看路由挂在哪组）
 		if rec.Code != http.StatusForbidden {
 			t.Errorf("%s %s：非管理员状态=%d body=%s，要求 403", tc.method, tc.path, rec.Code, rec.Body.String())
 		}

@@ -328,9 +328,12 @@ func TestImportConfigBackup_cliRejectionRestoresCommittedProjection(t *testing.T
 	}
 	committed := f.projectionContent(policyID)
 
+	cliCalls := 0
 	f.h.caddyService.SetCLIValidatorForTest(func([]byte) error {
+		cliCalls++
 		return fmt.Errorf("cli: reject")
 	})
+	loadsBefore := f.loadCount()
 	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{
 		"lb_rules":                 {{"caddy_id": "lb-hot", "name": "hot", "protocol": "http", "domain": "hot.example.test", "listen_port": 8080, "enabled": 1}},
 		"upstreams":                {{"rule_id": "lb-hot", "host": "127.0.0.1", "port": 9000, "enabled": 1}},
@@ -342,8 +345,23 @@ func TestImportConfigBackup_cliRejectionRestoresCommittedProjection(t *testing.T
 	req := httptest.NewRequest(http.MethodPost, "/config/import", strings.NewReader(backup))
 	req.Header.Set("Content-Type", "application/json")
 	f.router.ServeHTTP(rec, req)
-	if rec.Code == 200 {
-		t.Fatalf("导入应被 CLI 校验拒绝: body=%s", rec.Body.String())
+	// 拒绝必须来自渲染后的 CLI 校验（4xx 语义化分支 + 注入文案），而非
+	// requireMaster/结构校验等前置门的任意非 200：后者下投影本就不会被写，
+	// 「投影等于已提交内容」会成为恒真断言。
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s, want 400（CLI 校验拒绝）", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "未通过 Caddy 验证") {
+		t.Fatalf("body=%s, want CLI 校验拒绝文案", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "cli: reject") {
+		t.Fatalf("body=%s, want 注入的 CLI 错误文案", rec.Body.String())
+	}
+	if cliCalls == 0 {
+		t.Fatal("CLI 校验器未被调用：导入未进入渲染后校验阶段，回滚断言无保护力")
+	}
+	if got := f.loadCount(); got != loadsBefore {
+		t.Fatalf("CLI 拒绝后 /load 次数=%d, want %d（增量必须为 0）", got, loadsBefore)
 	}
 	if got := f.projectionContent(policyID); got != committed {
 		t.Fatalf("导入拒绝后投影文件=%q, want 已提交内容 %q（导入链）", got, committed)

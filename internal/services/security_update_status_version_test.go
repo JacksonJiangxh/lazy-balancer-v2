@@ -37,6 +37,37 @@ func TestCRSUpdateStatus_failedRunReportsInstalledVersion(t *testing.T) {
 	}
 }
 
+// 取消路径（注释宣称「取消后接口报已安装版本」此前零覆盖）：下载期取消 →
+// status=cancelled 且 version 必须是已安装版本（不是尝试安装的远端 tag）。
+func TestCRSUpdateStatus_cancelledRunReportsInstalledVersion(t *testing.T) {
+	m := newTestCRSManager(t)
+	seedCRSVersionRow(t, "v4.14.0", true)
+	m.fetchLatestTag = func(context.Context) (string, error) { return "v4.15.0", nil }
+	m.downloadTarball = func(ctx context.Context, _, _ string, _ downloadProgressFunc) error {
+		m.CancelRunning()
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	m.reloader = func() error { return nil }
+
+	done, err := m.StartUpdate("manual", nil)
+	if err != nil {
+		t.Fatalf("start update: %v", err)
+	}
+	<-done
+
+	snap := m.StatusSnapshot()
+	if snap.Status != string(CRSStatusCancelled) {
+		t.Fatalf("status=%q, want cancelled", snap.Status)
+	}
+	if snap.Version != "v4.14.0" {
+		t.Fatalf("status version=%q, want 已安装版本 v4.14.0（不是取消前写入的 v4.15.0）", snap.Version)
+	}
+	if version, _, _, _, _, _, _ := crsVersionRow(t); version != "v4.14.0" {
+		t.Fatalf("db version=%q, want v4.14.0（下载期取消不得写版本行）", version)
+	}
+}
+
 func TestIP2RegionUpdateStatus_failedRunReportsInstalledVersion(t *testing.T) {
 	m := newTestIP2RegionManager(t)
 	seedIP2RegionVersionRow(t, "v3.0.0", true)
@@ -58,5 +89,36 @@ func TestIP2RegionUpdateStatus_failedRunReportsInstalledVersion(t *testing.T) {
 	}
 	if snap.Version != "v3.0.0" {
 		t.Fatalf("status version=%q, want 已安装版本 v3.0.0（不是尝试安装的 v3.1.0）", snap.Version)
+	}
+}
+
+// 取消路径（安装前）：status=cancelled 且 version=已安装版本，DB 版本行不变。
+func TestIP2RegionUpdateStatus_cancelledRunReportsInstalledVersion(t *testing.T) {
+	m := newTestIP2RegionManager(t)
+	seedIP2RegionVersionRow(t, "v3.0.0", true)
+	m.fetchLatestTag = func(context.Context) (string, error) { return "v3.1.0", nil }
+	m.downloadXDB = func(ctx context.Context, _, _ string, _ downloadProgressFunc) error {
+		m.CancelRunning()
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	m.reloader = func() error { return nil }
+
+	done, err := m.StartUpdate("manual", nil)
+	if err != nil {
+		t.Fatalf("start update: %v", err)
+	}
+	<-done
+
+	snap := m.StatusSnapshot()
+	if snap.Status != string(IP2RegionStatusCancelled) {
+		t.Fatalf("status=%q, want cancelled", snap.Status)
+	}
+	if snap.Version != "v3.0.0" {
+		t.Fatalf("status version=%q, want 已安装版本 v3.0.0（不是取消前写入的 v3.1.0）", snap.Version)
+	}
+	version, status, _, _, _, _, _ := ip2RegionVersionRow(t)
+	if status != "cancelled" || version != "v3.0.0" {
+		t.Fatalf("(status,version)=(%q,%q), want (cancelled,v3.0.0)", status, version)
 	}
 }

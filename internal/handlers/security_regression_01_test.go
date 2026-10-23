@@ -8,15 +8,54 @@ import (
 	"net/http"
 	"strings"
 	"testing"
-	"time"
 
 	"lazy-balancer-v2/internal/db"
 )
 
-// TestBindDeleteRace_serializableIsolationBlocksConcurrentDelete 串行模拟
-// 交错：绑定事务的存在性 COUNT 之后、INSERT 之前，并发的策略删除不得提交。
-// 可序列化隔离（BEGIN IMMEDIATE）下 COUNT 即持写锁，删除只能等绑定事务结束后执行。
-func TestBindDeleteRace_serializableIsolationBlocksConcurrentDelete(t *testing.T) {
+// openNoBusyWaitDB 打开与当前测试库同文件、busy_timeout=0 的独立连接：
+// 写锁被持有时写操作立即返回 SQLITE_BUSY（不等待），用作确定性交错屏障。
+// 驱动 DSN 的 _txlock=immediate 让事务一开始就持写锁——写锁来源是 DSN 选项，
+// 与 sql.LevelSerializable 无关。
+func openNoBusyWaitDB(t *testing.T) *sql.DB {
+	t.Helper()
+	rows, err := db.DB.Query(`PRAGMA database_list`)
+	if err != nil {
+		t.Fatalf("database_list: %v", err)
+	}
+	defer rows.Close()
+	path := ""
+	for rows.Next() {
+		var seq int
+		var name, file string
+		if err := rows.Scan(&seq, &name, &file); err != nil {
+			t.Fatalf("scan database_list: %v", err)
+		}
+		if name == "main" {
+			path = file
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate database_list: %v", err)
+	}
+	if path == "" {
+		t.Fatal("main database file not found")
+	}
+	conn, err := sql.Open("sqlite", path+"?_txlock=immediate&_pragma=busy_timeout(0)")
+	if err != nil {
+		t.Fatalf("open no-busy-wait connection: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	if err := conn.Ping(); err != nil {
+		t.Fatalf("ping no-busy-wait connection: %v", err)
+	}
+	return conn
+}
+
+// TestBindDeleteRace_immediateTxBlocksConcurrentDelete 串行模拟交错：绑定事务的
+// 存在性 COUNT 之后、INSERT 之前，并发的策略删除不得提交。写锁来自 DSN
+// `_txlock=immediate`（事务开始即 BEGIN IMMEDIATE），因此独立 busy_timeout=0
+// 连接上的删除会立即 SQLITE_BUSY——不需要固定 sleep 的时间窗。
+func TestBindDeleteRace_immediateTxBlocksConcurrentDelete(t *testing.T) {
 	// Given a policy and a rule eligible for binding
 	setupSecurityPolicyTestDB(t)
 	router := newSecurityRouter(t)
@@ -26,8 +65,8 @@ func TestBindDeleteRace_serializableIsolationBlocksConcurrentDelete(t *testing.T
 	}
 
 	ctx := context.Background()
-	// bind 侧事务：与 BindRuleToPolicy 相同的可序列化隔离 + 存在性 COUNT
-	bindTx, err := db.DB.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	// bind 侧事务：与 BindRuleToPolicy 同形态（BeginTx(nil)，默认隔离）
+	bindTx, err := db.DB.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatalf("begin bind tx: %v", err)
 	}
@@ -37,32 +76,13 @@ func TestBindDeleteRace_serializableIsolationBlocksConcurrentDelete(t *testing.T
 		t.Fatalf("rule count in tx: n=%d err=%v", n, err)
 	}
 
-	// delete 侧事务（同 DeleteSecurityPolicy 语义：删除策略）在 bind 事务持锁期间发起；
-	// BEGIN IMMEDIATE 需要写锁，故 BeginTx 本身就会被写锁阻塞（busy_timeout 内等待）。
-	type delResult struct {
-		tx  *sql.Tx
-		err error
-	}
-	delDone := make(chan delResult, 1)
-	go func() {
-		dt, err := db.DB.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
-		if err != nil {
-			delDone <- delResult{err: err}
-			return
-		}
-		if _, err := dt.ExecContext(ctx, "DELETE FROM security_policies WHERE id=?", policyID); err != nil {
-			delDone <- delResult{tx: dt, err: err}
-			return
-		}
-		delDone <- delResult{tx: dt}
-	}()
-
-	// Then the concurrent delete is blocked by the write lock: it cannot complete
-	// between bind's COUNT and INSERT（回归：写窗口）
-	select {
-	case res := <-delDone:
-		t.Fatalf("并发删除在 bind 事务持锁期间完成: %v（回归：历史修复写窗口）", res.err)
-	case <-time.After(200 * time.Millisecond):
+	// Then the concurrent delete cannot commit between bind's COUNT and INSERT：
+	// 独立连接（busy_timeout=0）上的写立即被拒。
+	concurrent := openNoBusyWaitDB(t)
+	if _, err := concurrent.ExecContext(ctx, "DELETE FROM security_policies WHERE id=?", policyID); err == nil {
+		t.Fatal("并发删除在 bind 事务持锁期间完成（必须在校验与写入之间被写锁拒绝）")
+	} else if !strings.Contains(strings.ToLower(err.Error()), "locked") {
+		t.Fatalf("并发删除错误=%v, want database is locked（写锁屏障）", err)
 	}
 
 	// bind 事务完成绑定 INSERT + Commit
@@ -73,21 +93,12 @@ func TestBindDeleteRace_serializableIsolationBlocksConcurrentDelete(t *testing.T
 		t.Fatalf("commit bind tx: %v", err)
 	}
 
-	// 删除事务此时才能完成（含绑定清理，同 DeleteSecurityPolicy）
-	var res delResult
-	select {
-	case res = <-delDone:
-	case <-time.After(10 * time.Second):
-		t.Fatal("并发删除在 bind 提交后仍被阻塞")
+	// 屏障解除后同一删除必须成功——证明上面的失败确实来自写锁而非其他错误
+	if _, err := concurrent.ExecContext(ctx, "DELETE FROM security_policy_bindings WHERE policy_id=?", policyID); err != nil {
+		t.Fatalf("delete bindings after commit: %v", err)
 	}
-	if res.err != nil {
-		t.Fatalf("delete after bind commit: %v", res.err)
-	}
-	if _, err := res.tx.ExecContext(ctx, "DELETE FROM security_policy_bindings WHERE policy_id=?", policyID); err != nil {
-		t.Fatalf("clean bindings: %v", err)
-	}
-	if err := res.tx.Commit(); err != nil {
-		t.Fatalf("commit delete tx: %v", err)
+	if _, err := concurrent.ExecContext(ctx, "DELETE FROM security_policies WHERE id=?", policyID); err != nil {
+		t.Fatalf("delete policy after bind commit: %v", err)
 	}
 
 	// And no dangling binding survives the interleave
@@ -96,7 +107,7 @@ func TestBindDeleteRace_serializableIsolationBlocksConcurrentDelete(t *testing.T
 		t.Fatalf("count dangling: %v", err)
 	}
 	if dangling != 0 {
-		t.Fatalf("dangling bindings=%d, want 0（历史修复）", dangling)
+		t.Fatalf("dangling bindings=%d, want 0", dangling)
 	}
 }
 

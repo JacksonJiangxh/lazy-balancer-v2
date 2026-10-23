@@ -1030,29 +1030,43 @@ func TestClusterVersionTrigger_loginHotPathNoBump(t *testing.T) {
 	if err := installClusterVersionTriggers(database); err != nil {
 		t.Fatal(err)
 	}
-	database.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled,login_failed_attempts,login_locked_until) VALUES (1,'u','h','admin',1,0,NULL)`)
-	database.Exec("UPDATE global_config SET is_master=1,cluster_version=0 WHERE id=1")
+	// 每条种子的 error 必须显式检查：schema 漂移（列改名/删表）时静默失败
+	// 会让后续「版本不涨」断言变成空转（误报成 bump 语义问题）。
+	if _, err := database.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled,login_failed_attempts,login_locked_until) VALUES (1,'u','h','admin',1,0,NULL)`); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	if _, err := database.Exec("UPDATE global_config SET is_master=1,cluster_version=0 WHERE id=1"); err != nil {
+		t.Fatalf("seed global_config: %v", err)
+	}
 
 	// 成功登录路径:同值 NULL→NULL 写
-	database.Exec(`UPDATE users SET login_failed_attempts=0, login_locked_until=NULL WHERE id=1`)
+	if _, err := database.Exec(`UPDATE users SET login_failed_attempts=0, login_locked_until=NULL WHERE id=1`); err != nil {
+		t.Fatalf("same-value write: %v", err)
+	}
 	if got := clusterVersion(t, database); got != 0 {
 		t.Fatalf("same-value NULL write bumped version to %d, want 0 (登录热路径)", got)
 	}
 
 	// 失败计数路径:CASE 保值(未达阈值)
-	database.Exec(`UPDATE users SET login_failed_attempts=COALESCE(login_failed_attempts,0)+1, login_locked_until=CASE WHEN COALESCE(login_failed_attempts,0)+1>=5 THEN datetime('now','+10 minutes') ELSE login_locked_until END WHERE id=1`)
+	if _, err := database.Exec(`UPDATE users SET login_failed_attempts=COALESCE(login_failed_attempts,0)+1, login_locked_until=CASE WHEN COALESCE(login_failed_attempts,0)+1>=5 THEN datetime('now','+10 minutes') ELSE login_locked_until END WHERE id=1`); err != nil {
+		t.Fatalf("case-preserving write: %v", err)
+	}
 	if got := clusterVersion(t, database); got != 0 {
 		t.Fatalf("CASE same-value write bumped version to %d, want 0", got)
 	}
 
 	// 真实置锁:值变化 → bump
-	database.Exec(`UPDATE users SET login_locked_until=datetime('now','+10 minutes') WHERE id=1`)
+	if _, err := database.Exec(`UPDATE users SET login_locked_until=datetime('now','+10 minutes') WHERE id=1`); err != nil {
+		t.Fatalf("lock write: %v", err)
+	}
 	if got := clusterVersion(t, database); got != 1 {
 		t.Fatalf("real lock transition should bump to 1, got %d", got)
 	}
 
 	// 真实解锁 → bump
-	database.Exec(`UPDATE users SET login_locked_until=NULL WHERE id=1`)
+	if _, err := database.Exec(`UPDATE users SET login_locked_until=NULL WHERE id=1`); err != nil {
+		t.Fatalf("unlock write: %v", err)
+	}
 	if got := clusterVersion(t, database); got != 2 {
 		t.Fatalf("unlock should bump to 2, got %d", got)
 	}
@@ -1235,21 +1249,15 @@ func TestClusterVersionTriggers_bumpForTrustedProxyColumns(t *testing.T) {
 // Then LRU 淘汰最久未命中桶为新 IP 建桶：请求照常记账（起不再放行
 // 不计数），map 规模保持上限。
 func TestClusterRateLimitRespectsBucketCap(t *testing.T) {
+	withIsolatedRateLimitBuckets(t)
 	now := time.Now()
 	loginRateBuckets.Lock()
-	savedEntries := loginRateBuckets.entries
-	loginRateBuckets.entries = make(map[string]*loginRateBucket)
-	for i := range 1024 {
+	for i := range rateLimitBucketCapacity {
 		bucket := &loginRateBucket{until: now.Add(time.Minute), count: 1}
 		bucket.lastUsed.Store(now.Add(time.Duration(i) * time.Millisecond).UnixNano())
 		loginRateBuckets.entries[fmt.Sprintf("cap-%d", i)] = bucket
 	}
 	loginRateBuckets.Unlock()
-	t.Cleanup(func() {
-		loginRateBuckets.Lock()
-		loginRateBuckets.entries = savedEntries
-		loginRateBuckets.Unlock()
-	})
 	h := clusterRateLimit("test", 30, "测试限流")
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
 	c.Request = httptest.NewRequest(http.MethodPost, "/cluster/service-control", nil)

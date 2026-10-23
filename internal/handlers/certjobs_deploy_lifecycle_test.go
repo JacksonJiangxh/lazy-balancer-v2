@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -50,7 +51,7 @@ func TestRetryCertJob_deployLifecycleReschedulesInsteadOfReissuing(t *testing.T)
 			router := gin.New()
 			router.POST("/jobs/:id/retry", h.RetryCertJob)
 			response := httptest.NewRecorder()
-			router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/jobs/"+itoa(id)+"/retry", nil))
+			router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/jobs/"+strconv.FormatInt(id, 10)+"/retry", nil))
 
 			if response.Code == http.StatusInternalServerError {
 				t.Fatalf("status=%d body=%s（回落 queued 重签路径）", response.Code, response.Body.String())
@@ -93,7 +94,7 @@ func TestRetryCertJob_deployLifecycleWithoutMaterialFallsBackToIssuance(t *testi
 	router := gin.New()
 	router.POST("/jobs/:id/retry", h.RetryCertJob)
 	response := httptest.NewRecorder()
-	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/jobs/"+itoa(id)+"/retry", nil))
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/jobs/"+strconv.FormatInt(id, 10)+"/retry", nil))
 	if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), "CA queue manager not initialized") {
 		t.Fatalf("status=%d body=%s, want 500 回落重新入队路径", response.Code, response.Body.String())
 	}

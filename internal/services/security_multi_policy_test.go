@@ -12,14 +12,14 @@ import (
 // （非空切片）；单绑定时与 GetSecurityPolicyForRule 返回同一策略。
 
 // mpInitDB 初始化一个独立的临时 SQLite 库并接管全局 db.DB（与
-// security_wafcheck_test.go 同款模式，测试间互不串扰）。
+// security_wafcheck_test.go 同款模式，测试间互不串扰）。保存/恢复三库句柄
+// ——裸 Close+nil 丢弃旧句柄会让后续用例读到已删除临时目录。
 func mpInitDB(t *testing.T) {
 	t.Helper()
 	dir := t.TempDir()
-	if err := db.Initialize(dir); err != nil {
+	if err := initSecurityEventsTestDB(t, dir); err != nil {
 		t.Fatalf("init db: %v", err)
 	}
-	t.Cleanup(func() { db.DB.Close(); db.DB = nil })
 }
 
 // mpSeedPolicy 插入一条最小安全策略（blocking 模式）并返回其 id；

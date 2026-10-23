@@ -95,21 +95,18 @@ func TestGetSecurityThreatScreen_partialMinuteScopeIsExplicit(t *testing.T) {
 	seedThreatScreenEvent(t, currentMinute.Add(5*time.Second).Format("2006-01-02 15:04:05"), "93.184.216.8", "942100", "SQL Injection", "blocked")
 	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
 
+	// 单次请求即须含当前部分分钟：首个请求返回落后值再靠重试掩盖，等于
+	// 把「请求路径未固化当前分钟」的缺陷藏进轮询间隙。
+	recorder := getRequest(t, router, "/security/overview/threat-screen")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
 	var payload threatScreenPayload
-	for range 4 {
-		recorder := getRequest(t, router, "/security/overview/threat-screen")
-		if recorder.Code != http.StatusOK {
-			t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
-		}
-		if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
-			t.Fatalf("decode: %v", err)
-		}
-		if payload.Data.TotalEvents == 2 {
-			break
-		}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode: %v", err)
 	}
 	if payload.Data.TotalEvents != 2 || payload.Data.BlockedEvents != 2 {
-		t.Fatalf("大屏总量含当前部分分钟: total=%d blocked=%d, want 2/2（滞后 ≤60s，与 UI 文案一致）",
+		t.Fatalf("首个请求的大屏总量=total %d/blocked %d, want 2/2（含当前部分分钟，滞后 ≤60s，与 UI 文案一致）",
 			payload.Data.TotalEvents, payload.Data.BlockedEvents)
 	}
 }

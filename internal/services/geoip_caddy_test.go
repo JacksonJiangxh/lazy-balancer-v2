@@ -549,6 +549,28 @@ func TestPolicyHasGeoIP_modeGate(t *testing.T) {
 	}
 }
 
+// TestPolicyHasGeoIP_nilPolicyIsSafeAndIgnored：nil 策略必须视为无地域控制
+// （与 geoipCountries 的 nil 安全、预检/信任并集循环的 `if p == nil { continue }`
+// 同口径），且 nil 元素混入预检渲染切片时不得 panic、不得影响其余策略发射。
+func TestPolicyHasGeoIP_nilPolicyIsSafeAndIgnored(t *testing.T) {
+	if PolicyHasGeoIP(nil) {
+		t.Fatal("nil policy must be inactive")
+	}
+	geo := &models.SecurityPolicy{
+		ID:             42,
+		Mode:           "blocking",
+		GeoIPMode:      "deny",
+		GeoIPCountries: json.RawMessage(`["海外"]`),
+	}
+	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{nil, geo}, 0, "lb_test"))
+	if !strings.Contains(directives, "GeoIP 区域拦截") {
+		t.Fatalf("nil 元素不得吞掉同切片的 GeoIP 预检链，got:\n%s", directives)
+	}
+	if PolicyHasGeoIP(geo) != true {
+		t.Fatal("geo policy 应活跃（nil 守卫不得改变既有语义）")
+	}
+}
+
 // TestBuildHTTPHandleChain_stripsGeoIPHeadersBeforeUpstream：X-LB-GeoIP-* 是
 // caddygeoip→coraza 的进程内控制头，绝不允许透传上游后端。reverse_proxy 必须在
 // headers.request.delete 中剥离全部 6 个头；无条件剥离（不依赖安全策略绑定），

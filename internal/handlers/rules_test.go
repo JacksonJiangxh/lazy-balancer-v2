@@ -60,6 +60,9 @@ func TestCreateRule_disabledRuleDoesNotQueueCertJob(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
+	if resp.Data.CaddyID == "" {
+		t.Fatalf("创建响应缺少 caddy_id: %s", rec.Body.String())
+	}
 	var count int
 	if err := db.DB.QueryRow("SELECT COUNT(*) FROM cert_jobs WHERE rule_id=?", resp.Data.CaddyID).Scan(&count); err != nil {
 		t.Fatal(err)
@@ -111,6 +114,9 @@ func TestCreateRule_enabledACMECreatesCertJob(t *testing.T) {
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &created); err != nil {
 		t.Fatalf("decode response: %v", err)
+	}
+	if created.Data.CaddyID == "" {
+		t.Fatalf("创建响应缺少 caddy_id（cert_jobs 查询会退化为空集假绿）: %s", response.Body.String())
 	}
 	var count int
 	if err := db.DB.QueryRow("SELECT COUNT(*) FROM cert_jobs WHERE rule_id=?", created.Data.CaddyID).Scan(&count); err != nil {

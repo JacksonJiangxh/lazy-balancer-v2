@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/services"
 )
 
 // 规则库定时调度端点（v2.3.x）：三库同构 PUT /security/<lib>/schedule——
@@ -49,6 +51,9 @@ func TestUpdateCRSSchedule_saveAndReadBack(t *testing.T) {
 	if nextUpdate == "" {
 		t.Fatal("next_update empty after schedule save（保存即重排）")
 	}
+	// 槽位语义：next_update 必须落在选中星期 + HH:MM（配置时区）且在未来。
+	// 只断言非空会让「重排成任意时间/立刻过期」的实现通过。
+	assertNextUpdateSlot(t, "security_crs_version", []time.Weekday{time.Tuesday}, 4, 30)
 
 	// And GET 载荷携带排程字段
 	get := getRequest(t, router, "/security/crs")
@@ -116,6 +121,8 @@ func TestUpdateIP2RegionSchedule_saveAndReadBack(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
+	assertNextUpdateSlot(t, "security_ip2region_version",
+		[]time.Weekday{time.Monday, time.Wednesday, time.Friday}, 23, 15)
 
 	get := getRequest(t, router, "/security/ip2region")
 	if get.Code != http.StatusOK {
@@ -172,5 +179,34 @@ func TestUpdateThreatSchedule_validation(t *testing.T) {
 	recorder := putJSON(t, router, "/security/threat-lib/schedule", map[string]any{"days": []int{}, "time": "04:00"})
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("空星期集: status=%d body=%s, want 400", recorder.Code, recorder.Body.String())
+	}
+}
+
+// assertNextUpdateSlot 校验 table.id=1 的 next_update 落在允许星期 + HH:MM
+// （配置时区）且在未来——只断非空会放过「重排成任意槽 / 立即过期」的实现。
+func assertNextUpdateSlot(t *testing.T, table string, allowedWeekdays []time.Weekday, hour, minute int) {
+	t.Helper()
+	var raw string
+	if err := db.DB.QueryRow(`SELECT COALESCE(next_update,'') FROM ` + table + ` WHERE id=1`).Scan(&raw); err != nil {
+		t.Fatalf("read %s next_update: %v", table, err)
+	}
+	slotUTC, err := time.ParseInLocation("2006-01-02 15:04:05", raw, time.UTC)
+	if err != nil {
+		t.Fatalf("%s next_update=%q 无法解析: %v", table, raw, err)
+	}
+	slotLocal := slotUTC.In(services.CurrentLocation())
+	weekdayOK := false
+	for _, day := range allowedWeekdays {
+		if slotLocal.Weekday() == day {
+			weekdayOK = true
+			break
+		}
+	}
+	if !weekdayOK || slotLocal.Hour() != hour || slotLocal.Minute() != minute {
+		t.Fatalf("%s next_update=%q（配置时区）= %s %02d:%02d, want 星期%v %02d:%02d",
+			table, raw, slotLocal.Weekday(), slotLocal.Hour(), slotLocal.Minute(), allowedWeekdays, hour, minute)
+	}
+	if !slotUTC.After(time.Now().UTC()) {
+		t.Fatalf("%s next_update=%q 不在未来（重排必须取下一个槽）", table, raw)
 	}
 }

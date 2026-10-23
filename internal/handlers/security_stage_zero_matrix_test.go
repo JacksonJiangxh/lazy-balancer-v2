@@ -6,6 +6,36 @@ import (
 	"lazy-balancer-v2/internal/models"
 )
 
+// stageZeroMatrixFields 是归零矩阵管辖的全部字段（与 outOfStageZeroFamilies
+// 的族展开一一对应）。用例以它为准双向校验两侧形状：既要求每个字段存在，
+// 也要求形状没有多出未声明的键——任何一侧漏掉字段都会因「键集不等」转红，
+// 不再出现「两侧同时漏键仍绿」。
+var stageZeroMatrixFields = []string{
+	"mode",
+	"crs_rule_groups",
+	"crs_excluded_rules",
+	"custom_rules",
+	"rate_limit_enabled",
+	"rate_limit_rps",
+	"rate_limit_burst",
+	"waf_check_response",
+	"log_request_body",
+	"ip_acl_enabled",
+	"ip_acl_list",
+	"ip_acl_list_refs",
+	"ip_whitelist_enabled",
+	"ip_whitelist",
+	"ip_whitelist_refs",
+	"ip_blacklist",
+	"geoip_mode",
+	"geoip_countries",
+	"geoip_crawler_exempt",
+	"geoip_crawler_engines",
+	"block_page_id",
+	"block_status_code",
+	"trust_detection",
+}
+
 // 阶段外字段归零矩阵必须单源——Create 与 Update 两条写路径对同一阶段
 // 归零同一组字段。此前双份逐字段 switch 已产生
 // IPWhitelistEnabled nil/false 形状漂移。本测试把两条 applier 的决策逐阶段对齐：
@@ -24,8 +54,20 @@ func TestStageZeroMatrix_createUpdateParity(t *testing.T) {
 
 			created := createShape(createReq)
 			updated := updateShape(updateReq)
-			for field, want := range created {
-				if got := updated[field]; got != want {
+			if len(created) != len(stageZeroMatrixFields) || len(updated) != len(stageZeroMatrixFields) {
+				t.Fatalf("形状键集=create %d/update %d, 声明矩阵 %d（多出或漏掉的键必须先更新声明矩阵）",
+					len(created), len(updated), len(stageZeroMatrixFields))
+			}
+			for _, field := range stageZeroMatrixFields {
+				want, ok := created[field]
+				if !ok {
+					t.Fatalf("stage=%s: create 形状缺少矩阵字段 %s", stage, field)
+				}
+				got, ok := updated[field]
+				if !ok {
+					t.Fatalf("stage=%s: update 形状缺少矩阵字段 %s", stage, field)
+				}
+				if got != want {
 					t.Fatalf("stage=%s field=%s: create zeroed=%v, update zeroed=%v（矩阵必须单源）", stage, field, want, got)
 				}
 			}
@@ -61,7 +103,11 @@ func TestStageZeroMatrix_keepsInStageFields(t *testing.T) {
 	for _, tc := range cases {
 		createReq := pollutedCreateRequest()
 		applyStageZerosToCreate(&createReq, tc.stage)
-		got := createShape(createReq)[tc.field]
+		shape := createShape(createReq)
+		got, ok := shape[tc.field]
+		if !ok {
+			t.Fatalf("stage=%s field=%s 不在声明矩阵中（键集漂移）", tc.stage, tc.field)
+		}
 		if got != tc.zeroed {
 			t.Fatalf("stage=%s field=%s zeroed=%v, want %v", tc.stage, tc.field, got, tc.zeroed)
 		}
@@ -132,19 +178,28 @@ func pollutedUpdateRequest() models.UpdateSecurityPolicyRequest {
 
 func createShape(r models.CreateSecurityPolicyRequest) map[string]bool {
 	wlEnabled := r.IPWhitelistEnabled == nil || !*r.IPWhitelistEnabled
+	strZero := func(v string) bool { return v == "" || v == "[]" }
 	return map[string]bool{
 		"mode":                  r.Mode == "" || r.Mode == "off",
-		"crs_rule_groups":       r.CRSRuleGroups == "" || r.CRSRuleGroups == "[]",
+		"crs_rule_groups":       strZero(r.CRSRuleGroups),
+		"crs_excluded_rules":    strZero(r.CRSExcludedRules),
+		"custom_rules":          strZero(r.CustomRules),
+		"rate_limit_enabled":    !r.RateLimitEnabled,
 		"rate_limit_rps":        r.RateLimitRPS == 0,
+		"rate_limit_burst":      r.RateLimitBurst == 0,
 		"waf_check_response":    !r.WAFCheckResponse,
+		"log_request_body":      !r.LogRequestBody,
 		"ip_acl_enabled":        !r.IPACLEnabled,
-		"ip_acl_list":           r.IPACLList == "" || r.IPACLList == "[]",
+		"ip_acl_list":           strZero(r.IPACLList),
+		"ip_acl_list_refs":      strZero(r.IPACLListRefs),
 		"ip_whitelist_enabled":  wlEnabled,
-		"ip_whitelist":          r.IPWhitelist == "" || r.IPWhitelist == "[]",
-		"ip_blacklist":          r.IPBlacklist == "" || r.IPBlacklist == "[]",
+		"ip_whitelist":          strZero(r.IPWhitelist),
+		"ip_whitelist_refs":     strZero(r.IPWhitelistRefs),
+		"ip_blacklist":          strZero(r.IPBlacklist),
 		"geoip_mode":            r.GeoIPMode == "" || r.GeoIPMode == "off",
-		"geoip_countries":       r.GeoIPCountries == "" || r.GeoIPCountries == "[]",
-		"geoip_crawler_engines": r.GeoIPCrawlerEngines == "" || r.GeoIPCrawlerEngines == "[]",
+		"geoip_countries":       strZero(r.GeoIPCountries),
+		"geoip_crawler_exempt":  !r.GeoIPCrawlerExempt,
+		"geoip_crawler_engines": strZero(r.GeoIPCrawlerEngines),
 		"block_page_id":         r.BlockPageID == 0,
 		"block_status_code":     r.BlockStatusCode == 0,
 		"trust_detection":       !r.TrustDetection,
@@ -158,15 +213,23 @@ func updateShape(r models.UpdateSecurityPolicyRequest) map[string]bool {
 	return map[string]bool{
 		"mode":                  r.Mode == nil || *r.Mode == "" || *r.Mode == "off",
 		"crs_rule_groups":       strZero(r.CRSRuleGroups),
+		"crs_excluded_rules":    strZero(r.CRSExcludedRules),
+		"custom_rules":          strZero(r.CustomRules),
+		"rate_limit_enabled":    boolZero(r.RateLimitEnabled),
 		"rate_limit_rps":        intZero(r.RateLimitRPS),
+		"rate_limit_burst":      intZero(r.RateLimitBurst),
 		"waf_check_response":    boolZero(r.WAFCheckResponse),
+		"log_request_body":      boolZero(r.LogRequestBody),
 		"ip_acl_enabled":        boolZero(r.IPACLEnabled),
 		"ip_acl_list":           strZero(r.IPACLList),
+		"ip_acl_list_refs":      strZero(r.IPACLListRefs),
 		"ip_whitelist_enabled":  boolZero(r.IPWhitelistEnabled),
 		"ip_whitelist":          strZero(r.IPWhitelist),
+		"ip_whitelist_refs":     strZero(r.IPWhitelistRefs),
 		"ip_blacklist":          strZero(r.IPBlacklist),
 		"geoip_mode":            r.GeoIPMode == nil || *r.GeoIPMode == "" || *r.GeoIPMode == "off",
 		"geoip_countries":       strZero(r.GeoIPCountries),
+		"geoip_crawler_exempt":  boolZero(r.GeoIPCrawlerExempt),
 		"geoip_crawler_engines": strZero(r.GeoIPCrawlerEngines),
 		"block_page_id":         intZero(r.BlockPageID),
 		"block_status_code":     intZero(r.BlockStatusCode),

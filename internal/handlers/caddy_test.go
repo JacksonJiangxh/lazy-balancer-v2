@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -298,7 +299,8 @@ func TestValidateConfig_validates_submitted_config(t *testing.T) {
 	// 零运行时扰动（与 apidocs「不触发 Caddy」承诺对齐）；CLI 不可用回退
 	// c 的 load+回弹口径。
 	newBackupTestHandlers(t)
-	requests := 0
+	var requests atomic.Int32
+	handlerErrs := make(chan string, 4)
 	fakeCaddy := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		// GET /config/ = 同字节短路门的只读快照（2026-09-25 审计真实性改造），
 		// 零运行时扰动，与 validate-only 语义兼容——不计数；仅 /load POST 计入。
@@ -307,12 +309,18 @@ func TestValidateConfig_validates_submitted_config(t *testing.T) {
 			return
 		}
 		if request.URL.Path != "/load" {
-			t.Fatalf("validation request path=%q query=%q", request.URL.Path, request.URL.RawQuery)
+			// httptest handler 运行在 server goroutine：t.Fatalf 只能从测试
+			// goroutine 调用，这里回传错误由主 goroutine 断言。
+			handlerErrs <- fmt.Sprintf("validation request path=%q query=%q", request.URL.Path, request.URL.RawQuery)
+			response.WriteHeader(http.StatusInternalServerError)
+			return
 		}
-		requests++
+		requests.Add(1)
 		var config map[string]any
 		if err := json.NewDecoder(request.Body).Decode(&config); err != nil {
-			t.Fatalf("decode submitted config: %v", err)
+			handlerErrs <- fmt.Sprintf("decode submitted config: %v", err)
+			response.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		if invalid, _ := config["invalid"].(bool); invalid {
 			response.WriteHeader(http.StatusBadRequest)
@@ -363,8 +371,13 @@ func TestValidateConfig_validates_submitted_config(t *testing.T) {
 			}
 		})
 	}
-	if requests != 0 {
-		t.Fatalf("CLI 校验路径不应触碰 admin（requests=%d, want 0）", requests)
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("CLI 校验路径不应触碰 admin（requests=%d, want 0）", got)
+	}
+	select {
+	case msg := <-handlerErrs:
+		t.Fatalf("fake admin handler 报告错误: %s", msg)
+	default:
 	}
 
 	// And：CLI 不可用回退——valid 用例回到 -c 的 load+回弹（2 次 /load）。
@@ -378,8 +391,8 @@ func TestValidateConfig_validates_submitted_config(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("fallback status=%d body=%s, want 200", response.Code, response.Body.String())
 	}
-	if requests != 2 {
-		t.Fatalf("fallback /load requests=%d, want 2（校验 + 回弹）", requests)
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("fallback /load requests=%d, want 2（校验 + 回弹）", got)
 	}
 }
 
@@ -438,12 +451,17 @@ func TestCaddySectionKeys_matchUpdateSQL(t *testing.T) {
 	}
 
 	updateStart := strings.Index(string(caddySrc), "UPDATE global_config SET")
+	// 判空必须先于切片：caddySrc[updateStart:] 在 -1 时直接 panic，
+	// 后面的 <0 检查成不可达分支。
+	if updateStart < 0 {
+		t.Fatal("cannot locate UPDATE global_config block in caddy.go")
+	}
 	updateEnd := strings.Index(string(caddySrc[updateStart:]), "WHERE id = 1")
-	if updateStart < 0 || updateEnd < 0 {
-		t.Fatalf("cannot locate UPDATE global_config block in caddy.go")
+	if updateEnd < 0 {
+		t.Fatal("cannot locate UPDATE global_config WHERE clause in caddy.go")
 	}
 	updateBlock := string(caddySrc[updateStart : updateStart+updateEnd])
-	colRe := regexp.MustCompile(`(?m)^\s*([a-z0-9_]+)\s*=\s*(?:COALESCE|CASE WHEN)`)
+	colRe := regexp.MustCompile(`(?m)^\s*([a-z0-9_]+)\s*=\s*(?:COALESCE|CASE WHEN|\?)`)
 	sqlKeys := map[string]bool{}
 	for _, m := range colRe.FindAllStringSubmatch(updateBlock, -1) {
 		if services.GetConfigSection(m[1]) == "Caddy配置" {
@@ -510,7 +528,7 @@ func TestReloadCaddy_records_failure_audit_with_error_detail(t *testing.T) {
 // 对齐；SQL 失败分支不再有已交换的运行配置需回弹= 根因消解）。
 func TestUpdateConfig_appliesExactlyOnce(t *testing.T) {
 	newBackupTestHandlers(t)
-	var loads int
+	var loads atomic.Int32
 	fakeCaddy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/config/" {
 			w.Header().Set("Content-Type", "application/json")
@@ -518,7 +536,7 @@ func TestUpdateConfig_appliesExactlyOnce(t *testing.T) {
 			return
 		}
 		if r.Method == http.MethodPost && r.URL.Path == "/load" {
-			loads++
+			loads.Add(1)
 		}
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -530,9 +548,19 @@ func TestUpdateConfig_appliesExactlyOnce(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPut, "/config", strings.NewReader(`{"log_level":"warn"}`))
 	request.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(rec, request)
-	t.Logf("update status=%d body=%s", rec.Code, rec.Body.String())
-	if loads != 1 {
-		t.Fatalf("/load calls=%d, want 1（探针已撤，仅事务内应用）", loads)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("update status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	if got := loads.Load(); got != 1 {
+		t.Fatalf("/load calls=%d, want 1（探针已撤，仅事务内应用）", got)
+	}
+	// 成功路径不得留下失败横幅（recordCaddyApplyResult 在成功时清空）。
+	var banner string
+	if err := db.DB.QueryRow(`SELECT COALESCE(caddy_apply_error,'') FROM global_config WHERE id=1`).Scan(&banner); err != nil {
+		t.Fatalf("read banner: %v", err)
+	}
+	if banner != "" {
+		t.Fatalf("caddy_apply_error=%q, want 空（成功路径清横幅）", banner)
 	}
 }
 
@@ -703,10 +731,23 @@ func TestUpdateConfig_samplingContractOnlyAdaptiveOffFull(t *testing.T) {
 		return response
 	}
 
+	readSampleN := func() int64 {
+		t.Helper()
+		var value int64
+		if err := db.DB.QueryRow(`SELECT COALESCE(threat_traffic_sample_n, -999) FROM global_config WHERE id=1`).Scan(&value); err != nil {
+			t.Fatalf("read threat_traffic_sample_n: %v", err)
+		}
+		return value
+	}
+	baseline := readSampleN()
 	for _, value := range []string{"1", "2", "4", "8", "64", "-2"} {
 		response := put(`{"source":"basic","threat_traffic_sample_n":` + value + `}`)
 		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "仅支持 -1（自适应）或 0（关闭）") {
 			t.Fatalf("sample_n=%s status=%d body=%s, want 400 contract", value, response.Code, response.Body.String())
+		}
+		// 拒绝不得部分落库：写侧校验先于 UPDATE，坏值不能进库。
+		if got := readSampleN(); got != baseline {
+			t.Fatalf("sample_n=%s 拒绝后库值=%d, want 原值 %d", value, got, baseline)
 		}
 	}
 	for _, value := range []string{"-1", "0"} {
@@ -714,6 +755,9 @@ func TestUpdateConfig_samplingContractOnlyAdaptiveOffFull(t *testing.T) {
 		if response.Code != http.StatusOK {
 			t.Fatalf("sample_n=%s status=%d body=%s, want 200", value, response.Code, response.Body.String())
 		}
+	}
+	if got := readSampleN(); got != 0 {
+		t.Fatalf("threat_traffic_sample_n=%d after 0, want 0（末次合法写入落库）", got)
 	}
 }
 
@@ -815,6 +859,15 @@ func TestUpdateConfig_rejectsZeroRetentionValues(t *testing.T) {
 		router.ServeHTTP(response, request)
 		return response
 	}
+	readRetention := func() (int64, int64) {
+		t.Helper()
+		var days, cap int64
+		if err := db.DB.QueryRow(`SELECT COALESCE(security_events_retention_days, -999), COALESCE(security_events_row_cap, -999) FROM global_config WHERE id=1`).Scan(&days, &cap); err != nil {
+			t.Fatalf("read retention columns: %v", err)
+		}
+		return days, cap
+	}
+	baseDays, baseCap := readRetention()
 	for _, body := range []string{
 		`{"source":"basic","security_events_retention_days":0}`,
 		`{"source":"basic","security_events_row_cap":0}`,
@@ -822,6 +875,10 @@ func TestUpdateConfig_rejectsZeroRetentionValues(t *testing.T) {
 	} {
 		if res := put(body); res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "必须在 1 到") {
 			t.Fatalf("body=%s status=%d resp=%s, want 400 1..N", body, res.Code, res.Body.String())
+		}
+		// 拒绝不得部分落库（同 body 只含单列，另一列也必须原样）。
+		if days, cap := readRetention(); days != baseDays || cap != baseCap {
+			t.Fatalf("body=%s 拒绝后=(%d,%d), want 原值 (%d,%d)", body, days, cap, baseDays, baseCap)
 		}
 	}
 	for _, body := range []string{
@@ -831,5 +888,136 @@ func TestUpdateConfig_rejectsZeroRetentionValues(t *testing.T) {
 		if res := put(body); res.Code != http.StatusOK {
 			t.Fatalf("body=%s status=%d resp=%s, want 200", body, res.Code, res.Body.String())
 		}
+	}
+	if days, cap := readRetention(); days != 1 || cap != 1 {
+		t.Fatalf("retention after valid writes=(%d,%d), want (1,1)", days, cap)
+	}
+}
+
+// 校验回退（CLI 不可用 → load+回弹）中「恢复权威配置」失败必须持久化横幅：
+// 运行配置可能停留在校验载荷，请求响应丢失后仍需在状态接口可见（与
+// UpdateConfig/PutCaddyConfig 同一事实源），否则重启后无任何痕迹。
+func TestValidateConfig_restoreFailurePersistsApplyBanner(t *testing.T) {
+	newBackupTestHandlers(t)
+	fakeCaddy := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		response.WriteHeader(http.StatusInternalServerError)
+		_, _ = response.Write([]byte("caddy unavailable"))
+	}))
+	t.Cleanup(fakeCaddy.Close)
+	h := &Handlers{
+		cfg:          &config.Config{CaddyAdminURL: fakeCaddy.URL},
+		caddyService: services.NewCaddyService(fakeCaddy.URL),
+	}
+	// CLI 校验器不可用 → 走 load+回弹回退路径。
+	h.caddyService.SetCLIValidatorForTest(func([]byte) error { return services.ErrCLIValidatorUnavailable })
+	router := gin.New()
+	router.POST("/config/validate", h.ValidateConfig)
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/config/validate", strings.NewReader(`{"apps":{"http":{}}}`))
+	request.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s, want 500", response.Code, response.Body.String())
+	}
+	var banner string
+	if err := db.DB.QueryRow(`SELECT COALESCE(caddy_apply_error,'') FROM global_config WHERE id=1`).Scan(&banner); err != nil {
+		t.Fatalf("read banner: %v", err)
+	}
+	if !strings.Contains(banner, "恢复运行配置失败") && !strings.Contains(banner, "配置") {
+		t.Fatalf("横幅未持久化恢复失败事实: %q", banner)
+	}
+}
+
+// pause 生命周期（与 entrypoint 监督器协议）：stopCaddy 先建 pause 抑制
+// 监督器重启，停止失败必须回滚删除——否则监督器被永久抑制，Caddy 停摆。
+func TestStopCaddy_failureRemovesPauseFile(t *testing.T) {
+	dir := t.TempDir()
+	oldPause, oldStop := caddyPauseFile, caddyStopCommand
+	caddyPauseFile = filepath.Join(dir, "paused")
+	caddyStopCommand = func(string) *exec.Cmd { return exec.Command("sh", "-c", "exit 9") }
+	t.Cleanup(func() { caddyPauseFile, caddyStopCommand = oldPause, oldStop })
+
+	if err := os.WriteFile(caddyPauseFile, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := stopCaddy("http://127.0.0.1:1"); err == nil {
+		t.Fatal("stopping with failing command must return error")
+	}
+	if _, err := os.Stat(caddyPauseFile); !os.IsNotExist(err) {
+		t.Fatalf("停止失败必须回滚 pause（监督器需继续看护）, stat err=%v", err)
+	}
+}
+
+// 监督器委托成功路径同样要解除 pause：pause 残留会让监督器永不重启 Caddy
+// （admin 就绪=委托完成即返回，不能靠后续操作兜底清理）。
+func TestStartCaddy_supervisorDelegationClearsPause(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "supervisor.pid")
+	if err := os.WriteFile(pidFile, []byte("12345"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	procRoot := t.TempDir()
+	seedProcStat(t, procRoot, "12345", "caddy-superv", 'S')
+	oldPid, oldPause, oldTimeout, oldProc := caddySupervisorPidFile, caddyPauseFile, caddySupervisorWaitTimeout, caddyProcRoot
+	caddySupervisorPidFile = pidFile
+	caddyPauseFile = filepath.Join(dir, "paused")
+	caddySupervisorWaitTimeout = time.Second
+	caddyProcRoot = procRoot
+	t.Cleanup(func() {
+		caddySupervisorPidFile, caddyPauseFile, caddySupervisorWaitTimeout, caddyProcRoot = oldPid, oldPause, oldTimeout, oldProc
+	})
+	if err := os.WriteFile(caddyPauseFile, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fakeAdmin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(fakeAdmin.Close)
+
+	if err := startCaddy(fakeAdmin.URL); err != nil {
+		t.Fatalf("supervisor delegation should succeed: %v", err)
+	}
+	if _, err := os.Stat(caddyPauseFile); !os.IsNotExist(err) {
+		t.Fatalf("委托成功必须解除 pause, stat err=%v", err)
+	}
+}
+
+// PutCaddyConfig 请求体上限边界：恰好 1MB 放行、1MB+1 拒绝（ContentLength
+// 快速门与 MaxBytesReader 兜底同界，边界差一字节的配置不得被误拒/误收）。
+func TestPutCaddyConfig_acceptsExactLimitRejectsOneByteOver(t *testing.T) {
+	handler := newBackupTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.PUT("/caddy/config", handler.PutCaddyConfig)
+
+	const limit = 1 << 20
+	// 端点入参是 {"content":"<JSON 字符串>"}；content 本身须是对象。
+	// 外层固定 14 字节（{"content":" 与 "}），content 内 4 个引号各转义 +1。
+	build := func(total int) string {
+		pad := total - 26
+		return `{"content":"{\"a\":\"` + strings.Repeat("b", pad) + `\"}"}`
+	}
+
+	within := httptest.NewRecorder()
+	bodyWithin := build(limit)
+	if len(bodyWithin) != limit {
+		t.Fatalf("fixture length=%d, want %d", len(bodyWithin), limit)
+	}
+	request := httptest.NewRequest(http.MethodPut, "/caddy/config", strings.NewReader(bodyWithin))
+	request.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(within, request)
+	if within.Code != http.StatusOK {
+		t.Fatalf("exact-limit status=%d body=%.200s, want 200", within.Code, within.Body.String())
+	}
+
+	over := httptest.NewRecorder()
+	request = httptest.NewRequest(http.MethodPut, "/caddy/config", strings.NewReader(build(limit+1)))
+	request.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(over, request)
+	if over.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("limit+1 status=%d body=%.200s, want 413", over.Code, over.Body.String())
 	}
 }

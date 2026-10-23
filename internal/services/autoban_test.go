@@ -458,9 +458,9 @@ func TestAutobanMerge_expiryManualAndNewEntries(t *testing.T) {
 	f := installAutobanFixture(t, "2026-10-14 10:00:00")
 	setAutobanConfigRaw(t, true, 1, 5, "1h", "all", false)
 	seedPresetEntries(t, []models.IPListEntry{
-		{Value: "198.51.100.1", Remark: AutobanEntryRemark, CreatedAt: "2026-10-13 10:00:00", ExpiresAt: "2026-10-14 09:00:00"}, // 已到期
+		{Value: "198.51.100.1", Remark: autobanEntryRemark, CreatedAt: "2026-10-13 10:00:00", ExpiresAt: "2026-10-14 09:00:00"}, // 已到期
 		{Value: "198.51.100.2", Remark: "事件处置", CreatedAt: "2026-10-13 10:00:00"},                                               // 手动条目
-		{Value: "198.51.100.3", Remark: AutobanEntryRemark, CreatedAt: "2026-10-14 09:30:00", ExpiresAt: "2026-10-14 10:30:00"}, // 未到期
+		{Value: "198.51.100.3", Remark: autobanEntryRemark, CreatedAt: "2026-10-14 09:30:00", ExpiresAt: "2026-10-14 10:30:00"}, // 未到期
 	})
 
 	out, err := autobanMergeEntries(AutobanConfig{Enabled: true, Threshold: 1, WindowMinutes: 5, Duration: "1h", Scope: "all", DryRun: false},
@@ -484,8 +484,8 @@ func TestAutobanMerge_expiryManualAndNewEntries(t *testing.T) {
 	if !exists {
 		t.Fatal("新 IP 必须追加")
 	}
-	if newEntry.Remark != AutobanEntryRemark {
-		t.Fatalf("新封条目 remark=%q, want %q", newEntry.Remark, AutobanEntryRemark)
+	if newEntry.Remark != autobanEntryRemark {
+		t.Fatalf("新封条目 remark=%q, want %q", newEntry.Remark, autobanEntryRemark)
 	}
 	exp, perr := time.ParseInLocation("2006-01-02 15:04:05", newEntry.ExpiresAt, time.UTC)
 	if perr != nil {
@@ -521,7 +521,7 @@ func TestAutobanMerge_reQualifiesAfterManualDelete(t *testing.T) {
 
 	// 封禁中：已在名单 → 不重复追加
 	seedPresetEntries(t, []models.IPListEntry{
-		{Value: "203.0.113.9", Remark: AutobanEntryRemark, CreatedAt: "2026-10-14 09:00:00", ExpiresAt: "2026-10-14 11:00:00"},
+		{Value: "203.0.113.9", Remark: autobanEntryRemark, CreatedAt: "2026-10-14 09:00:00", ExpiresAt: "2026-10-14 11:00:00"},
 	})
 	out, err := autobanMergeEntries(cfg, candidates)
 	if err != nil {
@@ -562,9 +562,9 @@ func TestAutobanMerge_evictsEarliestExpiringAutobanEntries(t *testing.T) {
 		AutobanListEntryCap = 4
 		seedPresetEntries(t, []models.IPListEntry{
 			{Value: "198.51.100.2", Remark: "事件处置"},                                               // 手动
-			{Value: "198.51.100.3", Remark: AutobanEntryRemark, ExpiresAt: "2026-10-14 12:00:00"}, // 自动，晚到期
-			{Value: "198.51.100.4", Remark: AutobanEntryRemark, ExpiresAt: "2026-10-14 11:00:00"}, // 自动，最早到期
-			{Value: "198.51.100.6", Remark: AutobanEntryRemark, CreatedAt: "2026-10-13 10:00:00"}, // 自动，永久
+			{Value: "198.51.100.3", Remark: autobanEntryRemark, ExpiresAt: "2026-10-14 12:00:00"}, // 自动，晚到期
+			{Value: "198.51.100.4", Remark: autobanEntryRemark, ExpiresAt: "2026-10-14 11:00:00"}, // 自动，最早到期
+			{Value: "198.51.100.6", Remark: autobanEntryRemark, CreatedAt: "2026-10-13 10:00:00"}, // 自动，永久
 		})
 		out, err := autobanMergeEntries(AutobanConfig{Enabled: true, Threshold: 1, WindowMinutes: 5, Duration: "1h", Scope: "all", DryRun: false},
 			[]AutobanSuggestion{{IP: "203.0.113.10", Count: 120}})
@@ -593,7 +593,7 @@ func TestAutobanMerge_evictsEarliestExpiringAutobanEntries(t *testing.T) {
 		AutobanListEntryCap = 2
 		seedPresetEntries(t, []models.IPListEntry{
 			{Value: "198.51.100.2", Remark: "事件处置"},                                               // 手动
-			{Value: "198.51.100.7", Remark: AutobanEntryRemark, CreatedAt: "2026-10-13 08:00:00"}, // 自动，永久
+			{Value: "198.51.100.7", Remark: autobanEntryRemark, CreatedAt: "2026-10-13 08:00:00"}, // 自动，永久
 		})
 		out, err := autobanMergeEntries(AutobanConfig{Enabled: true, Threshold: 1, WindowMinutes: 5, Duration: "permanent", Scope: "all", DryRun: false},
 			[]AutobanSuggestion{{IP: "203.0.113.10", Count: 120}})
@@ -628,8 +628,8 @@ func TestAutobanMerge_reportsEvictedIPs(t *testing.T) {
 	AutobanListEntryCap = 2
 	t.Cleanup(func() { AutobanListEntryCap = oldCap })
 	seedPresetEntries(t, []models.IPListEntry{
-		{Value: "198.51.100.3", Remark: AutobanEntryRemark, ExpiresAt: "2026-10-14 12:00:00"}, // 晚到期
-		{Value: "198.51.100.4", Remark: AutobanEntryRemark, ExpiresAt: "2026-10-14 11:00:00"}, // 最早到期→被挤
+		{Value: "198.51.100.3", Remark: autobanEntryRemark, ExpiresAt: "2026-10-14 12:00:00"}, // 晚到期
+		{Value: "198.51.100.4", Remark: autobanEntryRemark, ExpiresAt: "2026-10-14 11:00:00"}, // 最早到期→被挤
 	})
 	out, err := autobanMergeEntries(AutobanConfig{Enabled: true, Threshold: 1, WindowMinutes: 5, Duration: "1h", Scope: "all", DryRun: false},
 		[]AutobanSuggestion{{IP: "203.0.113.10", Count: 120}})
@@ -713,7 +713,7 @@ func TestAutobanRunCycle_capacityConvergenceListsEvictedIdentities(t *testing.T)
 		// 到期时间递增 → 挤出序即编号升序（确定性身份断言）。
 		seeded = append(seeded, models.IPListEntry{
 			Value:     fmt.Sprintf("198.51.100.%d", i),
-			Remark:    AutobanEntryRemark,
+			Remark:    autobanEntryRemark,
 			ExpiresAt: fmt.Sprintf("2026-10-14 11:%02d:00", i),
 		})
 	}
@@ -1111,7 +1111,7 @@ func TestAutobanBannedToday_countsAuditBansOfDay(t *testing.T) {
 	//（created_at >= 今日零点为开放上界：生产写入恒为当下时刻，无未来行形态）
 
 	seedPresetEntries(t, []models.IPListEntry{
-		{Value: "203.0.113.1", Remark: AutobanEntryRemark, CreatedAt: "2026-10-14 09:00:00", ExpiresAt: "2026-10-15 09:00:00"},
+		{Value: "203.0.113.1", Remark: autobanEntryRemark, CreatedAt: "2026-10-14 09:00:00", ExpiresAt: "2026-10-15 09:00:00"},
 	})
 	if n := AutobanBannedToday(); n != 2 {
 		t.Fatalf("今日自动封禁数=%d, want 2（按审计事件计数：时区边界/昨日/非封禁均不混计）", n)
@@ -1316,8 +1316,8 @@ func TestAutobanRunCycle_capacityConvergenceObservable(t *testing.T) {
 	AutobanListEntryCap = 2
 	t.Cleanup(func() { AutobanListEntryCap = oldCap })
 	seedPresetEntries(t, []models.IPListEntry{
-		{Value: "198.51.100.3", Remark: AutobanEntryRemark, ExpiresAt: "2026-10-14 12:00:00"}, // 晚到期
-		{Value: "198.51.100.4", Remark: AutobanEntryRemark, ExpiresAt: "2026-10-14 11:00:00"}, // 最早到期→被挤
+		{Value: "198.51.100.3", Remark: autobanEntryRemark, ExpiresAt: "2026-10-14 12:00:00"}, // 晚到期
+		{Value: "198.51.100.4", Remark: autobanEntryRemark, ExpiresAt: "2026-10-14 11:00:00"}, // 最早到期→被挤
 	})
 	autobanObserveEvent("203.0.113.10", "blocked", "942100")
 
@@ -1557,8 +1557,8 @@ func TestAutobanDisableFlush_expiresOnceAndForceFlushes(t *testing.T) {
 	installAutobanFixture(t, "2026-10-14 10:00:00")
 	setAutobanConfigRaw(t, true, 1, 5, "1h", "all", false)
 	seedPresetEntries(t, []models.IPListEntry{
-		{Value: "198.51.100.1", Remark: AutobanEntryRemark, CreatedAt: "2026-10-13 10:00:00", ExpiresAt: "2026-10-14 09:00:00"}, // 已到期
-		{Value: "198.51.100.2", Remark: AutobanEntryRemark, CreatedAt: "2026-10-14 09:30:00", ExpiresAt: "2026-10-14 11:00:00"}, // 未到期
+		{Value: "198.51.100.1", Remark: autobanEntryRemark, CreatedAt: "2026-10-13 10:00:00", ExpiresAt: "2026-10-14 09:00:00"}, // 已到期
+		{Value: "198.51.100.2", Remark: autobanEntryRemark, CreatedAt: "2026-10-14 09:30:00", ExpiresAt: "2026-10-14 11:00:00"}, // 未到期
 		{Value: "198.51.100.3", Remark: "事件处置", CreatedAt: "2026-10-13 10:00:00"},                                               // 手动
 	})
 	reloads := 0
@@ -1868,8 +1868,8 @@ func TestAutobanDisableFlush_forgetsExpiredCounters(t *testing.T) {
 	clock := installAutobanFixture(t, "2026-10-14 10:00:00")
 	setAutobanConfigRaw(t, true, 1, 5, "1h", "all", false)
 	seedPresetEntries(t, []models.IPListEntry{
-		{Value: "198.51.100.1", Remark: AutobanEntryRemark, CreatedAt: "2026-10-13 10:00:00", ExpiresAt: "2026-10-14 09:00:00"}, // 已到期
-		{Value: "198.51.100.2", Remark: AutobanEntryRemark, CreatedAt: "2026-10-14 09:30:00", ExpiresAt: "2026-10-14 11:00:00"}, // 未到期
+		{Value: "198.51.100.1", Remark: autobanEntryRemark, CreatedAt: "2026-10-13 10:00:00", ExpiresAt: "2026-10-14 09:00:00"}, // 已到期
+		{Value: "198.51.100.2", Remark: autobanEntryRemark, CreatedAt: "2026-10-14 09:30:00", ExpiresAt: "2026-10-14 11:00:00"}, // 未到期
 	})
 	oldReloader := autobanReloader
 	autobanReloader = func() error { return nil }

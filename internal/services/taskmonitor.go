@@ -310,22 +310,11 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 		// 常驻族启动时刻——「常驻 · 启动于」。用该 daemon 最近 boot 行时刻
 		// （重启后正确更新）；从未运行的常驻任务（角色门未获/调度关闭未拉起）
 		// 置零值——UI '—' 兜底，不再回退引擎进程启动时刻
-		// （=uptime 语义，与「空闲/已停止」状态矛盾）。。
-		if m.Kind == taskengine.KindDaemon {
-			// 真实运行=本代 boot 行；停用有史=最近一次启动；从未运行且未运行=零值。
-			switch {
-			case m.Running:
-				if latestRun != nil {
-					ti.StartedAt = latestRun.StartedAt
-				}
-				// Running=true 但 boot 行缺失（插入失败仅 WARN / DB 短窗）：
-				// 置零值——UI '—' 兜底，不得回退引擎进程启动时刻（uptime
-				// 语义，与「常驻 · 启动于」契约矛盾）。
-			default:
-				if latestRun != nil {
-					ti.StartedAt = latestRun.StartedAt
-				}
-			}
+		// （=uptime 语义，与「空闲/已停止」状态矛盾）。两种形态（运行中/
+		// 已停止）同取最近一行：Running=true 但 boot 行缺失（插入失败仅 WARN /
+		// DB 短窗）保持零值，同样落 UI '—'。
+		if m.Kind == taskengine.KindDaemon && latestRun != nil {
+			ti.StartedAt = latestRun.StartedAt
 		}
 		out = append(out, ti)
 	}

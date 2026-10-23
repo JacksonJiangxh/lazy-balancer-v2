@@ -4,6 +4,7 @@ package handlers
 // 轮询不得每轮落一条 task_runs 失败行——退避指数增长、行数有界。
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -105,5 +106,59 @@ func TestCaddyRestartWatcher_backoffSkipsImmediateRetry(t *testing.T) {
 	}
 	if _, err := os.Stat(trigger); err != nil {
 		t.Fatalf("失败轮必须保留触发文件: %v", err)
+	}
+}
+
+// 退避窗口内的「跳过」与「RunSyncQuiet 执行但不落行」必须可区分：
+// 注入执行计数证明窗口内根本没有执行（不是执行了却静默）；快进退避后
+// 确实执行，且第 2 次尝试按降频契约不落 task_runs 行。
+func TestCaddyRestartWatcher_backoffWindowSkipsExecutionAndQuietRoundOmitsRow(t *testing.T) {
+	initTaskEngineForTest(t)
+	newBackupTestHandlers(t)
+	executions := 0
+	services.SetConfigLoadRerun(func(string) error {
+		executions++
+		return errors.New("caddy unavailable")
+	})
+	t.Cleanup(func() { services.SetConfigLoadRerun(nil) })
+	resetCaddyRestartBackoffForTest()
+	t.Cleanup(resetCaddyRestartBackoffForTest)
+
+	h := &Handlers{}
+	trigger := filepath.Join(t.TempDir(), "caddy-restarted")
+	if err := os.WriteFile(trigger, []byte("1"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	processStart := time.Now().Add(-time.Minute)
+
+	// 首次尝试：执行 + 落行。
+	h.caddyRestartWatcherOnce(trigger, processStart)
+	if executions != 1 {
+		t.Fatalf("首轮执行次数=%d, want 1", executions)
+	}
+	rowsAfterFirst := countCaddyRestartRuns(t)
+	if rowsAfterFirst != 1 {
+		t.Fatalf("首轮落行=%d, want 1", rowsAfterFirst)
+	}
+
+	// 退避窗口内：不执行（计数不变）且不落行。
+	h.caddyRestartWatcherOnce(trigger, processStart)
+	if executions != 1 {
+		t.Fatalf("退避窗口内执行次数=%d, want 1（窗口内必须完全跳过）", executions)
+	}
+	if got := countCaddyRestartRuns(t); got != rowsAfterFirst {
+		t.Fatalf("退避窗口内落行：%d → %d, want 不变", rowsAfterFirst, got)
+	}
+
+	// 快进退避到点：真实执行（RunSyncQuiet），第 2 次尝试按降频不落行。
+	caddyRestartBackoff.mu.Lock()
+	caddyRestartBackoff.nextAttempt = time.Now().Add(-time.Second)
+	caddyRestartBackoff.mu.Unlock()
+	h.caddyRestartWatcherOnce(trigger, processStart)
+	if executions != 2 {
+		t.Fatalf("退避到点后执行次数=%d, want 2", executions)
+	}
+	if got := countCaddyRestartRuns(t); got != rowsAfterFirst {
+		t.Fatalf("第 2 次尝试（Quiet）落行：%d → %d, want 不新增", rowsAfterFirst, got)
 	}
 }

@@ -36,7 +36,7 @@ func TestCertificateConfig_fullMaskedCredentialsKeepStored(t *testing.T) {
 		`{"dns_credentials":{"auth_mode":"***","secret_id":"***","secret_key":"***"}}`))
 	router.ServeHTTP(rec, req)
 
-	// Then:200 且库中凭证原值不变(现行 400「请选择认证方式」)
+	// Then:200 且库中凭证原值不变（修复前该形态被 400「请选择认证方式」拒绝）
 	if rec.Code != http.StatusOK {
 		t.Fatalf("full masked update: %d %s, want 200", rec.Code, rec.Body.String())
 	}

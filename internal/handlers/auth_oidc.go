@@ -99,6 +99,9 @@ const (
 	// 4096 条 ~1MB 的 return_to 近似保留数 GB 内存。站内前端页面键远短于此，
 	// 超限一律按非法值丢弃（fail-safe，跳回默认首页）。
 	oidcReturnToMaxBytes = 2048
+	// oidcDisplayNameMaxRunes 登录页展示名预算，与设置页输入框 maxlength 30
+	// 同源：保存侧超限 400，公开状态端点对存量坏值按同一预算截断。
+	oidcDisplayNameMaxRunes = 30
 )
 
 // oidcStateMaxEntries 在册 state 条目上限（未认证泛洪内存封顶;
@@ -281,6 +284,12 @@ func normalizeOIDCIssuer(raw string) string {
 // oidcProvider 按 issuer 获取(带缓存的 discovery;:网络发现移出全局锁,
 // 失败负缓存 oidcNegCacheTTL——IdP 故障时不再持锁串行 8s 逐请求回源)。
 func oidcProvider(issuer string) (*oidc.Provider, error) {
+	// 入口复验出站地址策略：库中 issuer 可能来自配置导入、自动备份还原、
+	// 集群快照或带外改库（写侧校验只覆盖面板保存路径）。discovery 会把它
+	// 当作唯一出站目标，策略不合格必须零出站拒绝。
+	if err := validateOIDCIssuerURL(issuer); err != nil {
+		return nil, fmt.Errorf("OIDC 服务地址不合规: %w", err)
+	}
 	oidcProvMu.Lock()
 	e, ok := oidcProvCach[issuer]
 	oidcProvMu.Unlock()
@@ -369,6 +378,13 @@ func (h *Handlers) OIDCStatus(c *gin.Context) {
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"enabled": false}})
 		return
 	}
+	// 库中 issuer 可能由导入/自动备份还原/集群快照带入（写侧校验只覆盖面板
+	// 保存路径），不合规的地址必然登录失败——未认证端点不得宣告一个恒失败的
+	// 登录按钮，按未启用呈现（与读失败同口径 fail-closed）。
+	if err := validateOIDCIssuerURL(cfg.Issuer); err != nil {
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"enabled": false}})
+		return
+	}
 	name := cfg.DisplayName
 	if name == "" {
 		if u, err := url.Parse(cfg.Issuer); err == nil {
@@ -377,6 +393,9 @@ func (h *Handlers) OIDCStatus(c *gin.Context) {
 			name = "OIDC"
 		}
 	}
+	// 展示名上限兜底：带外写入/历史坏值可能是任意长度，公开响应必须按
+	// 与保存侧同一口径（30 字符）截断。
+	name = truncateRunes(name, oidcDisplayNameMaxRunes)
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"enabled": true, "display_name": name}})
 }
 
@@ -1062,6 +1081,26 @@ func (h *Handlers) OIDCSettingsUpdate(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取 OIDC 配置失败"})
 		return
 	}
+	// 自由文本上限与前端 maxlength/实际用途对齐（此前无上限：任意长度
+	// 直接落库，公开状态端点把超大展示名回给未认证请求，也撑大集群快照）。
+	for _, field := range []struct {
+		name  string
+		value *string
+		max   int
+	}{
+		{"显示名", req.DisplayName, oidcDisplayNameMaxRunes},
+		{"Client ID", req.ClientID, 255},
+		{"服务地址", req.Issuer, 512},
+		{"Client Secret", req.ClientSecret, 512},
+	} {
+		if field.value == nil {
+			continue
+		}
+		if trimmed := strings.TrimSpace(*field.value); truncateRunes(trimmed, field.max) != trimmed {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("%s 过长（最多 %d 字符）", field.name, field.max)})
+			return
+		}
+	}
 	before := cfg // 字段级变更留痕基线
 	if req.Enabled != nil {
 		cfg.Enabled = *req.Enabled
@@ -1477,7 +1516,33 @@ func oidcCheckRedirect(req *http.Request, via []*http.Request) error {
 	return nil
 }
 
+// oidcOutboundGuardTransport 出站请求逐一复验目标 URL 的 scheme 策略。
+// discovery 文档内容由 IdP 提供、不受本机控制：一个合规的 https issuer 完全
+// 可以把 token_endpoint / jwks_uri 指向内网主机或本机端口，go-oidc 不校验
+// endpoint 与 issuer 同源——只验 issuer 会让 client_secret 明文发往任意地址。
+// 因此在传输层对每次出站的初始 URL 复验同一策略（重定向另由
+// oidcCheckRedirect 逐跳复验）。
+type oidcOutboundGuardTransport struct {
+	base http.RoundTripper
+}
+
+func (t oidcOutboundGuardTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if err := validateOIDCIssuerURL(req.URL.String()); err != nil {
+		return nil, fmt.Errorf("OIDC 出站地址不合规: %w", err)
+	}
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return base.RoundTrip(req)
+}
+
 // oidcOutboundClient discovery/JWKS/令牌交换共用的出站客户端：有界超时 +
-// 逐跳重定向复验。go-oidc 通过 oidc.ClientContext 注入（同一 context key 也
-// 被 oauth2 的令牌交换消费），JWKS 验签复用 discovery 时注入的客户端。
-var oidcOutboundClient = &http.Client{Timeout: 10 * time.Second, CheckRedirect: oidcCheckRedirect}
+// 初始地址策略复验 + 逐跳重定向复验。go-oidc 通过 oidc.ClientContext 注入
+// （同一 context key 也被 oauth2 的令牌交换消费），JWKS 验签复用 discovery
+// 时注入的客户端。
+var oidcOutboundClient = &http.Client{
+	Timeout:       10 * time.Second,
+	CheckRedirect: oidcCheckRedirect,
+	Transport:     oidcOutboundGuardTransport{},
+}

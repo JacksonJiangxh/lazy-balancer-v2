@@ -98,7 +98,8 @@ func TestMFAStepUpGuard_endToEnd(t *testing.T) {
 		t.Fatal("read-semantics POST (cert-info) must be exempt from step-up（打开列表页不弹码）")
 	}
 
-	// 时会真实写 ca_providers.credentials，MFA step-up 必须重新拦截。
+	// CASE 6：ca-providers/:id/test 已移出只读豁免——ZeroSSL 缺 EAB 时该端点
+	// 会真实写 ca_providers.credentials，MFA step-up 必须重新拦截。
 	if code := post("/api/v1/ca-providers/1/test", tokenOld); code != http.StatusPreconditionRequired {
 		t.Fatalf("CA provider test with stale mfa_ts: got %d, want 428（写侧非探测语义）", code)
 	}

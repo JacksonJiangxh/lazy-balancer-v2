@@ -51,10 +51,10 @@ func seedACMEManualSwitchFixture(t *testing.T, caddyID, domain, jobStatus string
 	return jobID
 }
 
-func putUpdateRule(t *testing.T, h interface{}, caddyID, body string) *httptest.ResponseRecorder {
+func putUpdateRule(t *testing.T, h *updateAuditHarness, caddyID, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	router := gin.New()
-	router.PUT("/rules/:caddy_id", h.(*updateAuditHarness).handler.UpdateRule)
+	router.PUT("/rules/:caddy_id", h.handler.UpdateRule)
 	request := httptest.NewRequest(http.MethodPut, "/rules/"+caddyID, strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()

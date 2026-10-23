@@ -121,6 +121,9 @@ func validateUploadCertificatePair(certPEM, keyPEM string, now time.Time) error 
 // application/json）。字段名与表单一致（enabled/mode/cert_file/key_file），
 // JSON 通道的 cert_file/key_file 为 PEM 字符串；两条通道共用完全相同的
 // 校验与落盘链路。
+//
+// 取值只认请求体：multipart 通道读 PostForm（URL query 同名参数不参与本端点
+// 语义），JSON 通道读 body 字段——同一请求的 query 不得静默覆盖提交意图。
 type adminTLSInput struct {
 	c *gin.Context // multipart 通道：经 FormFile 读取上传文件
 
@@ -150,11 +153,31 @@ func decodeAdminTLSInput(c *gin.Context) (*adminTLSInput, error) {
 	if err := c.Request.ParseMultipartForm(2 << 20); err != nil {
 		return nil, fmt.Errorf("表单解析失败: %w", err)
 	}
+	// PostForm 只含请求体字段：ParseMultipartForm 会把 URL query 合并进
+	// Form 且 query 值排在前面，用 Form.Get 会让 `?enabled=false` 静默覆盖
+	// 表单里的 enabled=true（落库与提交意图相反）。
 	return &adminTLSInput{
 		c:            c,
-		enabledValue: c.Request.Form.Get("enabled"),
-		modeValue:    c.Request.Form.Get("mode"),
+		enabledValue: c.Request.PostForm.Get("enabled"),
+		modeValue:    c.Request.PostForm.Get("mode"),
 	}, nil
+}
+
+const adminTLSEnabledWhitelistMessage = "enabled 仅支持 true、1、false 或 0"
+
+// parseAdminTLSEnabledValue 归一 enabled 取值：true/1/false/0 两种通道同一
+// 白名单（multipart 表单字符串与 JSON 布尔/数值字面量归一后同域）。
+func parseAdminTLSEnabledValue(value string) (string, bool) {
+	switch value {
+	case "true", "1", "false", "0":
+		return value, true
+	}
+	return "", false
+}
+
+// adminTLSFileTooLargeError 单文件/单字段 1 MiB 上限的统一文案。
+func adminTLSFileTooLargeError(label string) error {
+	return fmt.Errorf("%s 超过 1 MiB 上限，请裁剪后重试", label)
 }
 
 func parseAdminTLSJSONInput(body []byte) (*adminTLSInput, error) {
@@ -173,19 +196,33 @@ func parseAdminTLSJSONInput(body []byte) (*adminTLSInput, error) {
 		certValue: req.CertFile,
 		keyValue:  req.KeyFile,
 	}
-	// enabled 归一化为字符串（bool → "true"/"false"，字符串原样），使后续
-	// 「"true"或"1"」判定与 multipart 通道完全同语义；null/缺省=未提交。
+	// enabled 归一化为字符串（bool → "true"/"false"，字符串/数值字面量原样），
+	// 使后续白名单判定与 multipart 通道完全同语义；null/缺省=未提交。
+	// 数值形态（1/0）经 UseNumber 保留字面量后同样交白名单——错误文案承诺的
+	// true/1/false/0 取值域对两条通道一致，2/1.5 等其余数值显式 400。
 	if len(req.Enabled) > 0 && string(req.Enabled) != "null" {
-		var boolValue bool
-		if err := json.Unmarshal(req.Enabled, &boolValue); err == nil {
-			input.enabledValue = strconv.FormatBool(boolValue)
-		} else {
-			var stringValue string
-			if err := json.Unmarshal(req.Enabled, &stringValue); err == nil {
-				input.enabledValue = stringValue
-			} else {
-				return nil, errors.New("enabled 字段须为布尔或字符串")
+		dec := json.NewDecoder(bytes.NewReader(req.Enabled))
+		dec.UseNumber()
+		var raw any
+		if err := dec.Decode(&raw); err != nil {
+			return nil, errors.New("enabled 字段格式无效")
+		}
+		switch v := raw.(type) {
+		case bool:
+			input.enabledValue = strconv.FormatBool(v)
+		case string:
+			// 字符串原样交给 UpdateAdminTLS 的同一白名单判定（那里同时记审计
+			// 「enabled 取值不在白名单」，保留可归因的失败原因）。
+			input.enabledValue = v
+		case json.Number:
+			// 数值形态在此收口：错误文案承诺的 true/1/false/0 域对 JSON 数值
+			// 同样成立，2/1.5 等其余数值显式 400。
+			if _, ok := parseAdminTLSEnabledValue(v.String()); !ok {
+				return nil, errors.New(adminTLSEnabledWhitelistMessage)
 			}
+			input.enabledValue = v.String()
+		default:
+			return nil, errors.New("enabled 字段须为布尔、字符串或 0/1 数值")
 		}
 	}
 	return input, nil
@@ -209,6 +246,14 @@ func (in *adminTLSInput) certificatePair() (string, string, error) {
 		}
 		if in.keyValue == "" {
 			return "", "", errors.New("缺少 key_file 字段（PEM 字符串）")
+		}
+		// 单字段上限与 multipart 单文件同口径（1 MiB）：同一份材料在两条
+		// 通道的接受面必须一致，超限同样显式 400 而非落到「证书与私钥不匹配」。
+		if len(in.certValue) > maxAdminTLSFileBytes {
+			return "", "", adminTLSFileTooLargeError("证书文件")
+		}
+		if len(in.keyValue) > maxAdminTLSFileBytes {
+			return "", "", adminTLSFileTooLargeError("私钥文件")
 		}
 		return in.certValue, in.keyValue, nil
 	}
@@ -258,12 +303,14 @@ func (h *Handlers) InspectAdminTLSCert(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: info})
 }
 
+// maxAdminTLSFileBytes 证书/私钥单文件（multipart）与单字段（JSON）的共用
+// 上限（整体 body 上限 2 MiB 见调用方的 MaxBytesReader）。
+const maxAdminTLSFileBytes = 1 << 20
+
 func readAdminTLSFiles(c *gin.Context) (string, string, error) {
-	// 单文件上限 1 MiB（整体 body 上限 2 MiB 见调用方的 MaxBytesReader）。
 	// limit+1 探测：超限必须显式 400——静默截断后的 PEM 进入
 	// tls.X509KeyPair/证书解析只会得到「证书与私钥不匹配」这类误导性材料
 	// 错误，用户无从知道是大小超限。
-	const maxAdminTLSFileBytes = 1 << 20
 	read := func(field, label string) (string, error) {
 		f, _, err := c.Request.FormFile(field)
 		if err != nil {
@@ -275,7 +322,7 @@ func readAdminTLSFiles(c *gin.Context) (string, string, error) {
 			return "", err
 		}
 		if len(data) > maxAdminTLSFileBytes {
-			return "", fmt.Errorf("%s 超过 1 MiB 上限，请裁剪后重试", label)
+			return "", adminTLSFileTooLargeError(label)
 		}
 		return string(data), nil
 	}
@@ -337,11 +384,9 @@ func (h *Handlers) UpdateAdminTLS(c *gin.Context) {
 		return
 	}
 	if v := input.enabledValue; v != "" {
-		switch v {
-		case "true", "1", "false", "0":
-		default:
+		if _, ok := parseAdminTLSEnabledValue(v); !ok {
 			auditAdminTLSFailure(c, "enabled 取值不在白名单（仅 true/1/false/0）")
-			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "enabled 仅支持 true、1、false 或 0"})
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: adminTLSEnabledWhitelistMessage})
 			return
 		}
 	}

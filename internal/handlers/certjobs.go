@@ -51,6 +51,10 @@ var cancelCertJob = func(id int) {
 // 写侧改保留数时读侧漏同步）。Caddy 日志族保留数仍由 logRotatedBackups 服务。
 var certJobLogMaxRotatedBackups = services.CertJobLogMaxRotatedFiles()
 
+// certJobLogsMaxResponseBytes 单响应硬上限（尾窗）。轮转保留份数不改——
+// 那是写侧契约（排障需要的历史深度），读侧只约束单次下发的体积。
+const certJobLogsMaxResponseBytes = 256 << 10
+
 const maxCertJobPage = 1_000_000
 
 func certJobOperationLock(id int) *sync.Mutex {
@@ -114,9 +118,16 @@ func (j *certJobListItem) scanFrom(scanner certJobScanner, now time.Time, expiry
 	}
 	j.Issuer = certificateIssuerCached(certPEM)
 	j.CertificateStatus = "unknown"
+	notAfter := time.Time{}
 	if j.ExpiresAt.Valid {
-		j.DaysRemaining = services.CertDaysRemaining(j.ExpiresAt.Time, now)
-		j.CertificateStatus = services.CertificateExpiryStatus(j.ExpiresAt.Time, now, expiryDays)
+		notAfter = j.ExpiresAt.Time
+	} else if derived, ok := services.CertNotAfterFromPEM(certPEM); ok {
+		// expires_at 缺失时由 PEM 回退派生（expires_at 本身仍按原契约下发 null）。
+		notAfter = derived
+	}
+	if !notAfter.IsZero() {
+		j.DaysRemaining = services.CertDaysRemaining(notAfter, now)
+		j.CertificateStatus = services.CertificateExpiryStatus(notAfter, now, expiryDays)
 	}
 	return nil
 }
@@ -382,7 +393,11 @@ func (h *Handlers) retryCertJobByID(c *gin.Context, id int) {
 	// 不得静默越过：冷却未到期且未显式 force 时 429 并给出剩余时长；
 	// force=true（前端确认对话框已明示风险）显式越过并留审计痕迹。
 	forceRetry := c.Query("force") == "true"
-	if status == "waiting_ca" && caAvailableAfter.Valid && time.Now().Before(caAvailableAfter.Time) && !forceRetry {
+	// 冷却是否真的未到期——429 判定与「手动越过 CA 冷却」审计片段共用同一
+	// 布尔：冷却已自然到期时带 force 的重试并未越过任何东西，记入会让越权
+	// 留痕被稀释。
+	cooldownActive := status == "waiting_ca" && caAvailableAfter.Valid && time.Now().Before(caAvailableAfter.Time)
+	if cooldownActive && !forceRetry {
 		remaining := time.Until(caAvailableAfter.Time).Round(time.Second)
 		c.JSON(http.StatusTooManyRequests, models.APIResponse{Code: http.StatusTooManyRequests,
 			Message: fmt.Sprintf("CA 限流冷却未到期（剩余约 %s）。冷却到期后将自动重排；确需立即重签请确认后强制重试（可能再次被 CA 拒绝）", remaining)})
@@ -483,8 +498,8 @@ func (h *Handlers) retryCertJobByID(c *gin.Context, id int) {
 	// 入队成功即真实工作，唤醒入口不重查活跃态（队列可能已快速失败）。
 	services.WakeCertWaitingCAForEnqueuedJob()
 	auditParts := []string{services.AuditJobPart(id), services.AuditRulePart(ruleID), domain, fmt.Sprintf("原状态：%s", status)}
-	if status == "waiting_ca" && forceRetry {
-		// 越过冷却必须可见（运维逃生通道的留痕义务）
+	if cooldownActive && forceRetry {
+		// 越过冷却必须可见（运维逃生通道的留痕义务）；冷却已到期时不记。
 		auditParts = append(auditParts, "手动越过 CA 冷却")
 	}
 	if renewalAttempts > 0 {
@@ -516,7 +531,7 @@ func rescheduleDownloadedCertJobDeployment(id int, ruleID, domain string) (bool,
 	result, err := db.DB.Exec(`UPDATE cert_jobs
 		SET deployment_available_after=datetime('now'), message='手动重试：等待恢复部署', updated_at=datetime('now')
 		WHERE id=? AND status IN ('downloaded','cleanup_dns','cleanup_warning')
-		  AND COALESCE(cert_pem,'') <> '' AND COALESCE(key_pem,'') <> ''
+		  AND `+services.CertJobMaterialPredicateSQL("")+`
 		  AND EXISTS (
 			SELECT 1 FROM lb_rules
 			WHERE caddy_id=? AND enabled=1 AND enable_tls=1 AND tls_source='acme_dns' AND lower(replace(domain,' ','')) IN (?,?)
@@ -620,7 +635,14 @@ func certJobDeleteGuard(status string) (bool, string) {
 }
 
 func (h *Handlers) DeleteCertJob(c *gin.Context) {
-
+	// 门必须早于 caddyOpMu：导入会话全程持有该锁，排队等待后再按陈旧 id 落库
+	// 等价于「导入完成后被旧请求改写导入结果」（导入全量重插 cert_jobs 并保留
+	// 原 id，删除会命中导入后同 id 的另一条任务，且可能连带删掉刚物化的证书
+	// 文件）。与 retryCertJobByID 共用同一探测。
+	if configImportBusy() {
+		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "配置导入进行中，暂不能删除证书任务"})
+		return
+	}
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil || id <= 0 {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Invalid job ID"})
@@ -770,7 +792,7 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 		if deleteCertJobPreRestoreHook != nil {
 			deleteCertJobPreRestoreHook(id)
 		}
-		if services.JobLifecycle(status) == services.JobLifecycleDownloaded && certPEM != "" && keyPEM != "" {
+		if services.JobLifecycle(status) == services.JobLifecycleDownloaded && services.CertJobMaterialUsable(status, certPEM, keyPEM) {
 			// 与 caqueue requeueCanceledJob 同口径：部署生命周期
 			// （downloaded/cleanup_dns/cleanup_warning）+ 证书材料的任务停在部署
 			// 窗口——转 'queued' 会丢弃已签发证书并触发整轮重签（Issue 快速路径
@@ -889,7 +911,21 @@ func (h *Handlers) GetCertJobLogs(c *gin.Context) {
 	// 截断；缺失的备份序号按空跳过。
 	content := prependTaskLogRotations(logPath, readCertJobLogFile(logPath), certJobLogMaxRotatedBackups)
 
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]string{"content": content}})
+	// 单响应硬上限（尾窗）：6 份 × 128KB ≈ 768KB 会让「100 个失败任务刷一轮」
+	// 产生 ~76MB 出流量与 600 次文件读。保留最近 256KB 并显式标注 truncated，
+	// 前端据此提示「仅显示最近部分」。写侧轮转保留份数不变（写侧契约）。
+	truncated := false
+	if len(content) > certJobLogsMaxResponseBytes {
+		content = content[len(content)-certJobLogsMaxResponseBytes:]
+		// 丢弃首个残行：截断点落在行中间时首个片段不是完整日志行。
+		if idx := strings.Index(content, "\n"); idx >= 0 {
+			content = content[idx+1:]
+		}
+		truncated = true
+		content = "[日志过长，仅显示最近 256KB]\n" + content
+	}
+
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]interface{}{"content": content, "truncated": truncated}})
 }
 
 // prependTaskLogRotations 按 maxBackups 把 .1～.N 逐代前置到活动日志

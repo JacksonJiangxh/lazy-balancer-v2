@@ -96,12 +96,17 @@ func TestSecurityLibraryStatus_matchesCRSIntegrityProbe(t *testing.T) {
 	cases := []struct {
 		name      string
 		files     []string
+		xdb       string // "valid" | "missing" | "empty"
 		wantCRSOK bool
+		wantXDBOK bool
 	}{
-		{name: "missing rules", wantCRSOK: false},
-		{name: "empty rules", files: []string{}, wantCRSOK: false},
-		{name: "unrelated conf only", files: []string{"REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf"}, wantCRSOK: false},
-		{name: "901 probe present", files: []string{crsRulesProbeFile}, wantCRSOK: true},
+		{name: "missing rules", xdb: "valid", wantCRSOK: false, wantXDBOK: true},
+		{name: "empty rules", files: []string{}, xdb: "valid", wantCRSOK: false, wantXDBOK: true},
+		{name: "unrelated conf only", files: []string{"REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf"}, xdb: "valid", wantCRSOK: false, wantXDBOK: true},
+		{name: "901 probe present", files: []string{crsRulesProbeFile}, xdb: "valid", wantCRSOK: true, wantXDBOK: true},
+		// ip2region 空文件/缺失必须判不可用（st.Size()>0 分支此前零覆盖）。
+		{name: "901 probe present, xdb missing", files: []string{crsRulesProbeFile}, xdb: "missing", wantCRSOK: true, wantXDBOK: false},
+		{name: "901 probe present, xdb empty", files: []string{crsRulesProbeFile}, xdb: "empty", wantCRSOK: true, wantXDBOK: false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -118,14 +123,25 @@ func TestSecurityLibraryStatus_matchesCRSIntegrityProbe(t *testing.T) {
 				}
 			}
 			xdb := filepath.Join(root, "ip2region.xdb")
-			if err := os.WriteFile(xdb, []byte("xdb"), 0o644); err != nil {
-				t.Fatal(err)
+			switch tc.xdb {
+			case "valid":
+				if err := os.WriteFile(xdb, []byte("xdb"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			case "empty":
+				if err := os.WriteFile(xdb, nil, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			case "missing":
+				// 不创建文件
+			default:
+				t.Fatalf("未知 xdb 形态 %q", tc.xdb)
 			}
 			restore := SetSecurityLibsDirsForTest(crsDir, xdb)
 			t.Cleanup(restore)
 			crsOK, ip2regionOK := SecurityLibraryStatus()
-			if crsOK != tc.wantCRSOK || !ip2regionOK {
-				t.Fatalf("SecurityLibraryStatus=(%v,%v), want (%v,true)", crsOK, ip2regionOK, tc.wantCRSOK)
+			if crsOK != tc.wantCRSOK || ip2regionOK != tc.wantXDBOK {
+				t.Fatalf("SecurityLibraryStatus=(%v,%v), want (%v,%v)", crsOK, ip2regionOK, tc.wantCRSOK, tc.wantXDBOK)
 			}
 		})
 	}

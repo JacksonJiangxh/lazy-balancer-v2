@@ -67,69 +67,111 @@ func ip2RegionStartupRepairWritesAllowed() bool {
 
 // InitIP2Region loads the GeoIP database into the singleton searcher using
 // BufferCache mode (whole xdb in memory, zero-contention reads). The live
-// xdb wins when present; otherwise the bundled distribution copy is copied
-// into the live path first. A missing xdb is not fatal: Lookup returns an
-// empty country code until one is installed.
+// xdb wins when present; otherwise, on the master node, the bundled
+// distribution copy is copied into the live path first. A missing xdb is not
+// fatal: Lookup returns an empty country code until one is installed.
+// 从节点/角色不可证实时以镜像内置库只读装载（不写 live 文件、版本行与
+// 派生缓存）——文件由集群同步治理，见 ip2RegionStartupRepairWritesAllowed。
 func InitIP2Region() {
+	// 写入门一次性取值：live 文件替换、版本行/sidecar、派生缓存同口径——
+	// 从节点的 IP 库文件与版本行都由集群同步治理，本地改写会与主端声明打架
+	// （契约见 ip2RegionStartupRepairWritesAllowed）。非主节点/角色不可证实
+	// 时以镜像内置库只读装载，绝不落盘 live。
+	writesAllowed := ip2RegionStartupRepairWritesAllowed()
+	readOnlyDist := false
+	var searcher *ip2regionService.Ip2Region
 	if _, err := os.Stat(ip2regionLivePath); err != nil {
 		if _, distErr := os.Stat(ip2regionDistPath); distErr != nil {
 			Logf("info", "ip2region: no xdb found at %s or %s; GeoIP lookups return empty", ip2regionLivePath, ip2regionDistPath)
 			return
 		}
-		if err := copyFile(ip2regionDistPath, ip2regionLivePath); err != nil {
+		if !writesAllowed {
+			// live 由集群同步治理，本地补齐会与主端声明打架并延长整库漂移
+			// 重拉——只读装载镜像库供本地查询，文件/版本行/派生缓存一律不写。
+			s, oErr := openIP2RegionSearcher(ip2regionDistPath)
+			if oErr != nil {
+				Logf("error", "ip2region: live 库缺失且非主节点，镜像内置库只读装载失败: %v", oErr)
+				return
+			}
+			searcher = s
+			readOnlyDist = true
+			Logf("info", "ip2region: live 库缺失且非主节点（或角色不可证实），以镜像内置库只读装载，不写 live；等待集群同步")
+			RecordAuditLog("system", "更新", "IP数据库", "启动时 live IP 库缺失且本节点非主节点，按镜像内置库只读装载（不覆盖 live 文件/版本行）", "")
+		} else if err := copyFile(ip2regionDistPath, ip2regionLivePath); err != nil {
 			Logf("error", "ip2region: failed to copy %s to %s: %v", ip2regionDistPath, ip2regionLivePath, err)
 			return
 		}
 	}
-	searcher, err := openIP2RegionSearcher(ip2regionLivePath)
-	if err != nil {
-		Logf("error", "ip2region: failed to load %s: %v", ip2regionLivePath, err)
-		// live 存在但不可装载（掉电半写/带外损坏）：旧行为直接放弃——
-		// 面板归属地全空、渲染侧 size>0 仍照常发射 geoip 策略而 Caddy 侧
-		// Provision 失败 pass-through，地域拦截静默失效且无自愈通道。
-		// 回退镜像内置库（仅在装载失败时，不做任何版本优劣判断），
-		// 版本行/sidecar 写保守标识 bundled 并记审计——回退必须可见，
-		// 否则等于静默降级为旧库。
-		if _, distErr := os.Stat(ip2regionDistPath); distErr == nil {
-			if cErr := copyFile(ip2regionDistPath, ip2regionLivePath); cErr != nil {
-				Logf("error", "ip2region: 损坏 live 库的 dist 回退拷贝失败: %v", cErr)
-			} else if fallback, oErr := openIP2RegionSearcher(ip2regionLivePath); oErr != nil {
-				Logf("error", "ip2region: dist 回退库装载失败: %v", oErr)
-			} else {
-				searcher = fallback
-				Logf("warn", "ip2region: 损坏的 live 库已回退为镜像内置库（标记 bundled，待下次成功更新自愈）")
-				RecordAuditLog("system", "更新", "IP数据库", "启动检测到 IP 数据库文件损坏不可装载，已回退镜像内置库（待下次成功更新恢复）", "")
-				// 版本行/sidecar 只在主节点写：从节点由集群同步治理（见
-				// ip2RegionStartupRepairWritesAllowed）；审计照记（节点本地面）。
-				if ip2RegionStartupRepairWritesAllowed() {
-					if _, uErr := db.DB.Exec("UPDATE security_ip2region_version SET version='bundled', updated_at=datetime('now') WHERE id=1"); uErr != nil {
-						Logf("error", "ip2region: 写入 dist 回退标识失败: %v", uErr)
+	if searcher == nil {
+		loaded, err := openIP2RegionSearcher(ip2regionLivePath)
+		if err != nil {
+			Logf("error", "ip2region: failed to load %s: %v", ip2regionLivePath, err)
+			// live 存在但不可装载（掉电半写/带外损坏）：旧行为直接放弃——
+			// 面板归属地全空、渲染侧 size>0 仍照常发射 geoip 策略而 Caddy 侧
+			// Provision 失败 pass-through，地域拦截静默失效且无自愈通道。
+			// 回退镜像内置库（仅在装载失败时，不做任何版本优劣判断），
+			// 版本行/sidecar 写保守标识 bundled 并记审计——回退必须可见，
+			// 否则等于静默降级为旧库。
+			if _, distErr := os.Stat(ip2regionDistPath); distErr == nil {
+				if !writesAllowed {
+					// 从节点同样不覆盖 live（集群同步自愈），只读装载镜像库。
+					if fallback, oErr := openIP2RegionSearcher(ip2regionDistPath); oErr != nil {
+						Logf("error", "ip2region: 损坏 live 库且非主节点，镜像内置库只读装载失败: %v", oErr)
+					} else {
+						searcher = fallback
+						readOnlyDist = true
+						Logf("warn", "ip2region: 损坏 live 库且非主节点（或角色不可证实），以镜像内置库只读装载，不覆盖 live（等待集群同步自愈）")
+						RecordAuditLog("system", "更新", "IP数据库", "启动检测到 IP 数据库文件损坏且本节点非主节点，按镜像内置库只读装载（不覆盖 live 文件/版本行）", "")
 					}
-					if rErr := rewriteVersionIfMissingOrStale(ip2regionLivePath+".version", "bundled"); rErr != nil {
-						Logf("error", "ip2region: 写入 dist 回退 sidecar 失败: %v", rErr)
+				} else if cErr := copyFile(ip2regionDistPath, ip2regionLivePath); cErr != nil {
+					Logf("error", "ip2region: 损坏 live 库的 dist 回退拷贝失败: %v", cErr)
+				} else if fallback, oErr := openIP2RegionSearcher(ip2regionLivePath); oErr != nil {
+					Logf("error", "ip2region: dist 回退库装载失败: %v", oErr)
+				} else {
+					searcher = fallback
+					Logf("warn", "ip2region: 损坏的 live 库已回退为镜像内置库（标记 bundled，待下次成功更新自愈）")
+					RecordAuditLog("system", "更新", "IP数据库", "启动检测到 IP 数据库文件损坏不可装载，已回退镜像内置库（待下次成功更新恢复）", "")
+					// 版本行/sidecar 只在主节点写：从节点由集群同步治理（见
+					// ip2RegionStartupRepairWritesAllowed）；审计照记（节点本地面）。
+					if writesAllowed {
+						if _, uErr := db.DB.Exec("UPDATE security_ip2region_version SET version='bundled', updated_at=datetime('now') WHERE id=1"); uErr != nil {
+							Logf("error", "ip2region: 写入 dist 回退标识失败: %v", uErr)
+						}
+						if rErr := rewriteVersionIfMissingOrStale(ip2regionLivePath+".version", "bundled"); rErr != nil {
+							Logf("error", "ip2region: 写入 dist 回退 sidecar 失败: %v", rErr)
+						}
 					}
+					// dist 回退把 live 换成镜像旧库（内容代际变化）：树缓存有效性
+					// 判据只看修订号/ASCII 残留，不参与内容代际比较——不显式重建会
+					// 留下「新库的省市树」给在役旧库用（扫描失败时展示错误选项树）。
+					// 与更新路径 SetIP2RegionVersion 的无条件重建口径对齐。
+					writeRegionTreeCache(regionTreeFromXDB(ip2regionLivePath))
 				}
-				// dist 回退把 live 换成镜像旧库（内容代际变化）：树缓存有效性
-				// 判据只看修订号/ASCII 残留，不参与内容代际比较——不显式重建会
-				// 留下「新库的省市树」给在役旧库用（扫描失败时展示错误选项树）。
-				// 与更新路径 SetIP2RegionVersion 的无条件重建口径对齐。
-				writeRegionTreeCache(regionTreeFromXDB(ip2regionLivePath))
 			}
-		}
-		if searcher == nil {
-			return
+			if searcher == nil {
+				return
+			}
+		} else {
+			searcher = loaded
 		}
 	}
 	ip2regionMu.Lock()
 	swapIP2RegionSearcher(searcher)
 	ip2regionMu.Unlock()
 
+	if readOnlyDist {
+		// 只读装载形态：live 文件、版本行/sidecar、派生缓存均由主节点同步
+		// 治理，本节点不落盘（等待 waf_files 同步收敛）。
+		Logf("info", "ip2region: 以镜像内置库只读模式装载完成，文件/版本行/派生缓存不落盘")
+		return
+	}
+
 	// 版本同步：xdb 文件存在但 DB 版本仍为种子值 'unknown' 时，从 .version
 	// 伴生文件读取实际版本写回 DB；伴生文件缺失（清理/手工删除后仅 xdb 残留）
 	// 则写 'bundled' 标记为镜像内置版本——消除 unknown+已最新 矛盾态。
 	// 写入门与 CRS 同口径（从节点的文件与版本行由集群同步治理）；角色读故障
 	// 按不写处理并留痕。
-	if ip2RegionStartupRepairWritesAllowed() {
+	if writesAllowed {
 		// 只有「行缺失」或哨兵值才同步种子版本——读取故障（非
 		// ErrNoRows）时保留原版本行并留痕，否则会把真实版本覆盖成 bundled
 		// （版本溯源丢失、下次更新按哨兵重装）。

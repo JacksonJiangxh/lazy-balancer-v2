@@ -19,12 +19,14 @@ import (
 )
 
 type CertificateService struct {
-	mu                  sync.Mutex
-	ctx                 context.Context
-	cancel              context.CancelFunc
-	done                chan struct{}
-	recoverJobs         func(context.Context)
-	deploymentRetry     func(int, issuedCertificate, time.Duration)
+	mu          sync.Mutex
+	ctx         context.Context
+	cancel      context.CancelFunc
+	done        chan struct{}
+	recoverJobs func(context.Context)
+	// deploymentRetry 登记一次部署重试；返回错误表示本轮**未登记**（暂停/
+	// 停止/规则补偿屏障）。可观测结果是补扫计数与摘要行的正确性前提。
+	deploymentRetry     func(int, issuedCertificate, time.Duration) error
 	timerMu             sync.Mutex
 	deploymentTimers    map[int]*deploymentTimer
 	deploymentCallbacks map[int]map[*deploymentTimer]struct{}
@@ -460,7 +462,7 @@ func requeueCertJobsSnapshot(ctx context.Context, snapshot CertJobsSnapshot, man
 		// 分叉（snapshot.preserved），其余行沿用快照状态——不给正常路径额外增加
 		// 每任务一次读（补偿流程与队列执行存在既有时序耦合）。
 		liveStatus := job.status
-		hasMaterial := job.certPEM.Valid && job.certPEM.String != "" && job.keyPEM.Valid && job.keyPEM.String != ""
+		hasMaterial := job.certPEM.Valid && job.keyPEM.Valid && CertJobMaterialUsable(job.status, job.certPEM.String, job.keyPEM.String)
 		if _, preserved := snapshot.preserved[job.id]; preserved {
 			if status, material, found, stateErr := certJobCurrentRequeueState(job.id); stateErr != nil {
 				Logf("warn", "证书任务补偿重排队：读取任务 %d 当前状态失败，按快照状态处理: %v", job.id, stateErr)
@@ -562,7 +564,7 @@ func certJobCurrentRequeueState(jobID int) (status string, hasMaterial bool, fou
 	if err != nil {
 		return "", false, false, err
 	}
-	return status, strings.TrimSpace(certPEM) != "" && strings.TrimSpace(keyPEM) != "", true, nil
+	return status, CertJobMaterialUsable(status, certPEM, keyPEM), true, nil
 }
 
 func NewCertificateService() *CertificateService {
@@ -654,6 +656,22 @@ func (s *CertificateService) scheduleDelayedReload(jobID int, ruleID string, del
 			Logf("error", "证书任务 %d（规则 %s）生效后重载失败: %v", jobID, ruleID, err)
 		}
 	})
+}
+
+// deploymentRetrySchedulable 是「部署重试能否登记」的唯一判据——规则补偿
+// 屏障、暂停与停止态都收敛在这里，包级调度入口与 30s 补扫共用，避免两处
+// 判据漂移。登记本身仍由 scheduleDeploymentRetry 在锁内二次确认（判据与
+// 登记之间可能被暂停打断，二者不可合并为一次非原子检查）。
+func (s *CertificateService) deploymentRetrySchedulable(ruleID string) error {
+	if manager := GetCAQueueManager(); manager != nil && manager.IsRuleBlocked(ruleID) {
+		return ErrCertificateDeploymentRetryBlocked
+	}
+	s.timerMu.Lock()
+	defer s.timerMu.Unlock()
+	if s.stopping || s.timersPaused {
+		return ErrCertificateQueueInactive
+	}
+	return nil
 }
 
 func (s *CertificateService) scheduleDeploymentRetry(jobID int, ruleID string, delay time.Duration) error {
@@ -883,7 +901,7 @@ func (s *CertificateService) rescanDroppedDeploymentRetries() (rescheduled int, 
 		SELECT j.id, COALESCE(j.rule_id,''), COALESCE(j.domain,''), COALESCE(j.ca_provider_id,0), COALESCE(j.deployment_attempts,0),
 		       COALESCE(r.domain,''),
 		       CASE WHEN r.caddy_id IS NOT NULL AND r.enabled=1 AND r.enable_tls=1 AND r.tls_source='acme_dns' THEN 1 ELSE 0 END,
-		       CASE WHEN COALESCE(j.cert_pem,'') <> '' AND COALESCE(j.key_pem,'') <> '' THEN 1 ELSE 0 END,
+		       CASE WHEN ` + CertJobMaterialPredicateSQL("j") + ` THEN 1 ELSE 0 END,
 		       COALESCE(j.deployment_available_after,'')
 		FROM cert_jobs j
 		LEFT JOIN lb_rules r ON r.caddy_id=j.rule_id
@@ -953,7 +971,21 @@ func (s *CertificateService) rescanDroppedDeploymentRetries() (rescheduled int, 
 			// warn/error 级别下仍进文件日志。
 			Logf("warn", "证书任务 %d：deployment_available_after=%q 无法解析，按立即重试处理", job.id, job.availableAfter)
 		}
-		s.deploymentRetry(job.id, issuedCertificate{ruleID: job.ruleID, providerID: job.providerID, deploymentAttempt: job.deploymentAttempts}, delay)
+		// 暂停/停止/规则补偿屏障期不进入调度：本轮不会登记任何 timer，
+		// 计数与摘要行必须保持一致（包级入口的判据收敛在
+		// deploymentRetrySchedulable，此处先看避免逐行调用再丢弃）。
+		if err := s.deploymentRetrySchedulable(job.ruleID); err != nil {
+			continue
+		}
+		// 只有真正登记了 timer 才算「部署重建」。暂停/停止/规则补偿屏障
+		// 期间本轮未调度——计数与摘要行必须如实反映，否则任务监控会在导入/
+		// 删除补偿窗口每 30s 谎报一次动作。
+		if err := s.deploymentRetry(job.id, issuedCertificate{ruleID: job.ruleID, providerID: job.providerID, deploymentAttempt: job.deploymentAttempts}, delay); err != nil {
+			if !errors.Is(err, ErrCertificateQueueInactive) && !errors.Is(err, ErrCertificateDeploymentRetryBlocked) {
+				Logf("warn", "证书任务 %d：部署重试登记失败（本轮不计入补扫）: %v", job.id, err)
+			}
+			continue
+		}
 		rescheduled++
 	}
 	return rescheduled, nil
@@ -998,11 +1030,12 @@ var lastCertServiceMissing atomic.Bool
 // 钉住 demote 竞争形态（Run 体不消费 ctx，入口角色检查只做一次）。
 var certRenewalRoleRecheckHook func()
 
-// withActiveCertServiceTick 引擎单轮 tick 的活动证书服务执行体
-// 服务未运行时跳过执行，轮次本身照常按 success 记账。收敛（2026-10-03
-// 裁定）：跳过说明收敛为状态变化行——lastCertServiceMissing false→true 转换
-// 记一次跳过行，缺失持续期静默，恢复（true→false）记一次恢复行；三个证书
-// tick 任务共享同一状态门（全局单例服务指针）。
+// withActiveCertServiceTick 引擎单轮 tick 的活动证书服务执行体。**仅**用于
+// 工作确实依赖服务实例的任务（cert-waiting-ca：补扫/重排需要服务的定时器族
+// 与 DB 锁）；服务缺失时轮次照常 success。手动证书巡检与续期扫描不走这里
+// ——它们的「跳过」必须可观测（见 CertManualCheckOnce / CertRenewalScanOnce）。
+// 收敛（2026-10-03 裁定）：跳过说明收敛为状态变化行——lastCertServiceMissing
+// false→true 转换记一次跳过行，缺失持续期静默，恢复（true→false）记一次恢复行。
 func withActiveCertServiceTick(taskID, stage string, fn func(s *CertificateService)) {
 	activeCertService.Lock()
 	svc := activeCertService.svc
@@ -1022,22 +1055,33 @@ func withActiveCertServiceTick(taskID, stage string, fn func(s *CertificateServi
 // —— 引擎单轮 tick（certificates.go 四 ticker 的循环体；引擎接管节拍）——
 
 // CertRenewalScanOnce 续期扫描（临期证书入队）。
-// 扫描/入队前置读失败必须上抛（Run 返回 error → task_runs 失败终态），
-// 服务缺失跳过仍是 nil（跳过不是失败）。
+// 扫描/入队前置读失败必须上抛（Run 返回 error → task_runs 失败终态）。
+// 服务缺失时**不得记成功**：此时续期链完全停摆（ACME 证书到期无人处理），
+// 必须落可见业务行并返回 ErrTaskSkipped（task_runs=skipped，非成功）。
 func CertRenewalScanOnce() error {
-	var scanErr error
-	withActiveCertServiceTick("cert-renewal-scan", "scan", func(s *CertificateService) { scanErr = s.renewExpiringCertificates() })
-	return scanErr
+	activeCertService.Lock()
+	svc := activeCertService.svc
+	activeCertService.Unlock()
+	if svc == nil {
+		TaskLogf("cert-renewal-scan", "scan", "证书签发任务未运行：本轮续期扫描已跳过（停止期间不会自动续签，请恢复调度以免证书到期）")
+		return taskengine.ErrTaskSkipped
+	}
+	return svc.renewExpiringCertificates()
 }
 
 // CertManualCheckOnce 手动证书到期检查。
-// 巡检读失败必须上抛（Run 返回 error → task_runs 失败终态），
-// 服务缺失跳过仍是 nil（跳过不是失败）——对齐 cert-renewal-scan/
-// cert-reconcile 同族口径。
+// 巡检只读 lb_rules 的手动证书并用告警门去重，不依赖 CA 队列/服务实例——
+// 停止「证书签发」调度时手动证书没有自动续签，告警是唯一信号，巡检因此照常
+// 执行（服务实例缺失时使用包级去重门）。巡检读失败必须上抛。
 func CertManualCheckOnce() error {
-	var checkErr error
-	withActiveCertServiceTick("cert-manual-poll", "check", func(s *CertificateService) { checkErr = s.checkManualCertExpiration() })
-	return checkErr
+	activeCertService.Lock()
+	svc := activeCertService.svc
+	activeCertService.Unlock()
+	gate := manualCertExpiryFallbackGate
+	if svc != nil && svc.expiryAlertGate != nil {
+		gate = svc.expiryAlertGate
+	}
+	return runManualCertExpiryCheck(gate)
 }
 
 // certJobsActive 报告是否存在非终态证书任务（issued/failed/disabled 之外）——
@@ -1090,20 +1134,68 @@ func CertWaitingCATickOnce() error {
 	return tickErr
 }
 
+// certReconcileRoleRecheckHook 测试缝：每个对账写点前调用一次——用于在
+// 「扫描判定通过 → 写落定」的窗口内制造节点降级/取消，验证写前门。
+var certReconcileRoleRecheckHook func()
+
+// certReconcileWriteGate 证书状态对账每个写点前的逐项门（重建证书文件 /
+// 禁用孤儿任务 / 补建任务行）：
+//   - 调度取消（降级/导入排空/停机）：返回包装后的 ctx 错误——终态
+//     cancelled，与降级跳过区分；
+//   - 节点已切从：返回 ErrTaskSkipped——从节点不得改写证书态（扫描开始时的
+//     角色判定在长轮次内会过期，逐项复核才是写侧的唯一事实）。
+//
+// 角色读取失败不猜测：上抛为失败轮（下一周期重试），与续期扫描入口同口径。
+func certReconcileWriteGate(ctx context.Context) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("证书状态对账被中止: %w", err)
+		}
+	}
+	if certReconcileRoleRecheckHook != nil {
+		certReconcileRoleRecheckHook()
+	}
+	roleCtx := ctx
+	if roleCtx == nil {
+		roleCtx = context.Background()
+	}
+	isMaster, err := RoleOf(roleCtx, db.DB)
+	if err != nil {
+		return fmt.Errorf("证书状态对账写前复核节点角色: %w", err)
+	}
+	if !isMaster {
+		return taskengine.ErrTaskSkipped
+	}
+	return nil
+}
+
 // CertReconcileOnce 状态对账（缺失证书文件/孤儿任务清理/缺失任务补建）。
 // 对账读失败必须上抛（Run 返回 error → task_runs 失败终态），且失败轮
 // 摘要不得写「完成」——此前查询失败只 Logf + 摘要仍报「状态对账完成 0」，
 // 任务监控呈现假健康。服务缺失不适用（本函数无服务依赖）。
-func CertReconcileOnce() error {
-	rebuilt, reconcileErr := reconcileMissingCertFiles(db.DB)
-	swept, sweepErr := sweepOrphanedCertJobs(context.Background())
+//
+// ctx 由引擎 RunContext 驱动（降级/停机/导入排空即取消），三个写点各自在
+// 写前经 certReconcileWriteGate 复核——长轮次内节点降级不得继续写库。
+func CertReconcileOnce(ctx context.Context) error {
+	rebuilt, reconcileErr := reconcileMissingCertFiles(ctx, db.DB)
+	swept, sweepErr := sweepOrphanedCertJobs(ctx)
 	// 兜底：6h 对账同时补建「启用 ACME 但无任务行」的规则——覆盖
 	// 提升窗口之外的行丢失（快照整树替换后残留的中间态）。
-	created, backfillErr := BackfillMissingACMECertJobs(context.Background(), GetCAQueueManager())
+	created, backfillErr := BackfillMissingACMECertJobs(ctx, GetCAQueueManager())
 	if backfillErr != nil {
 		Logf("warn", "证书任务对账补建失败: %v", backfillErr)
 	}
 	if err := errors.Join(reconcileErr, sweepErr, backfillErr); err != nil {
+		// 降级跳过/调度取消不是故障——但轮次未完成，摘要必须如实说明
+		// 中止而非「完成」（部分计数不可信）。ctx 已取消同样按中止：
+		// 驱动层可能返回自己的取消包装错误（errors.Is 不可达）。
+		aborted := errors.Is(err, taskengine.ErrTaskSkipped) ||
+			errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+			(ctx != nil && ctx.Err() != nil)
+		if aborted {
+			TaskLogf("cert-reconcile", "skipped", "状态对账中止：%v（已收敛 %d 个断链、%d 个孤儿、%d 个补建——均为部分计数，恢复后下一周期重做）", err, rebuilt, swept, created)
+			return err
+		}
 		TaskLogf("cert-reconcile", "reconcile", "状态对账失败：%v（失败轮结果不可信，下一周期重试；已收敛 %d 个断链、%d 个孤儿——均为部分计数）", err, rebuilt, swept)
 		return err
 	}
@@ -1231,13 +1323,15 @@ func (s *CertificateService) recoverCertJobs(ctx context.Context) {
 // 查询/迭代失败必须返回 error（CertReconcileOnce 上抛 → task_runs 失败终态，
 // 摘要不再谎报「对账完成」）；单行 Scan 失败仍跳过（该行不可信，其余行可继续收敛），
 // 但迭代错误表明结果集不完整，按失败处理。
-func reconcileMissingCertFiles(dbh *sql.DB) (int, error) {
+// ctx 取消即中止（返回包装后的取消错误）；每个重建写点前另经
+// certReconcileWriteGate 复核节点角色（扫描期降级不得继续写盘）。
+func reconcileMissingCertFiles(ctx context.Context, dbh *sql.DB) (int, error) {
 	// 多行规则必须按 certJobRuleApplicable 同语义过滤——
 	// 否则灾备重建内容取决于扫描顺序,可能重建旧域证书且无自愈。
-	rows, err := dbh.Query(`SELECT j.rule_id, j.domain, COALESCE(j.cert_pem,''), COALESCE(j.key_pem,''), COALESCE(r.domain,'') AS rule_domain
+	rows, err := dbh.QueryContext(ctx, `SELECT j.rule_id, j.domain, COALESCE(j.cert_pem,''), COALESCE(j.key_pem,''), COALESCE(r.domain,'') AS rule_domain
 		FROM cert_jobs j
 		JOIN lb_rules r ON r.caddy_id=j.rule_id
-		WHERE ` + CertJobMaterialPredicateSQL("j") + `
+		WHERE `+CertJobMaterialPredicateSQL("j")+`
 		  AND r.enabled=1 AND r.enable_tls=1 AND r.tls_source='acme_dns'
 		ORDER BY j.rule_id, j.updated_at DESC, j.id DESC`)
 	if err != nil {
@@ -1270,6 +1364,15 @@ func reconcileMissingCertFiles(dbh *sql.DB) (int, error) {
 		}
 		if fileExists(certPath) && fileExists(keyPath) {
 			continue
+		}
+		// 写前门：扫描判定到落盘之间节点可已降级/轮次可已取消——
+		// 从节点写证书文件会与主节点内容分叉（且轮次谎报完成）。
+		if gateErr := certReconcileWriteGate(ctx); gateErr != nil {
+			Logf("warn", "cert reconcile: 重建证书文件前写门拦截（%s）: %v", ruleID, gateErr)
+			if rebuilt > 0 {
+				RecordAuditLog("system", "重建", "证书文件", FormatAuditDetail(AuditSourcePart("runtime_reconcile"), fmt.Sprintf("重建 %d 个证书文件", rebuilt)), "")
+			}
+			return rebuilt, gateErr
 		}
 		changed, materializeErr := materializeCertPair(ruleID, certPEM, keyPEM)
 		if materializeErr != nil {
@@ -1305,11 +1408,11 @@ func RequeueNonTerminalCertJobs() error {
 	return requeueNonTerminalCertJobs(context.Background(), scheduleCertificateDeploymentRetry)
 }
 
-func requeueNonTerminalCertJobs(ctx context.Context, deploymentRetry func(int, issuedCertificate, time.Duration)) error {
+func requeueNonTerminalCertJobs(ctx context.Context, deploymentRetry func(int, issuedCertificate, time.Duration) error) error {
 	rows, err := db.DB.QueryContext(ctx, `
 		SELECT j.id, j.rule_id, j.domain, j.status, j.ca_provider_id, COALESCE(j.deployment_attempts,0), j.deployment_available_after,
 		       COALESCE(r.domain,''), CASE WHEN r.caddy_id IS NOT NULL AND r.enabled=1 AND r.enable_tls=1 AND r.tls_source='acme_dns' THEN 1 ELSE 0 END,
-		       CASE WHEN COALESCE(j.cert_pem,'') <> '' AND COALESCE(j.key_pem,'') <> '' THEN 1 ELSE 0 END
+		       CASE WHEN `+CertJobMaterialPredicateSQL("j")+` THEN 1 ELSE 0 END
 		FROM cert_jobs j
 		LEFT JOIN lb_rules r ON r.caddy_id=j.rule_id
 		WHERE j.status != 'disabled'
@@ -1413,7 +1516,13 @@ func requeueNonTerminalCertJobs(ctx context.Context, deploymentRetry func(int, i
 					delay = 0
 				}
 			}
-			deploymentRetry(job.id, issuedCertificate{ruleID: job.ruleID, providerID: job.providerID, deploymentAttempt: job.deploymentAttempts}, delay)
+			if err := deploymentRetry(job.id, issuedCertificate{ruleID: job.ruleID, providerID: job.providerID, deploymentAttempt: job.deploymentAttempts}, delay); err != nil {
+				// 暂停/屏障期的未登记不是故障（Resume/解锁补扫接管），
+				// 其余错误必须留痕：否则部署重试断链只表现为「什么都没发生」。
+				if !errors.Is(err, ErrCertificateQueueInactive) && !errors.Is(err, ErrCertificateDeploymentRetryBlocked) {
+					Logf("warn", "证书任务 %d：恢复链部署重试登记失败（补扫接管）: %v", job.id, err)
+				}
+			}
 			continue
 		}
 
@@ -1508,6 +1617,11 @@ func sweepOrphanedCertJobs(ctx context.Context) (int, error) {
 		if err := ctx.Err(); err != nil {
 			return swept, errors.Join(sweepErr, fmt.Errorf("孤儿清理被中止: %w", err))
 		}
+		// 写前门：逐项复核节点角色（扫描开始时的判定在长轮次内会过期）。
+		if gateErr := certReconcileWriteGate(ctx); gateErr != nil {
+			Logf("warn", "cert sweep: 禁用孤儿任务前写门拦截（job=%d）: %v", job.id, gateErr)
+			return swept, errors.Join(sweepErr, gateErr)
+		}
 		if err := transitionJob(db.DB, job.id, nonTerminalJobStatuses, "disabled", map[string]any{"message": "关联规则已不再使用当前 ACME 证书任务"}); err != nil {
 			if errors.Is(err, ErrJobTransitionConflict) {
 				continue
@@ -1552,6 +1666,11 @@ func (s *CertificateService) Stop() {
 // handler 必须映射 409/503 并点明「证书签发任务已停止」，不得
 // 折成 500 让规则保存看起来像内部错误。
 var ErrCertificateQueueInactive = errors.New("证书签发任务未运行")
+
+// ErrCertificateDeploymentRetryBlocked 标记部署重试因规则处于补偿屏障
+// （CA 队列锁定该规则）而未登记。与 ErrCertificateQueueInactive 同为「本轮
+// 未调度」的可观测结果：补扫不得把它计成一次成功的部署重建。
+var ErrCertificateDeploymentRetryBlocked = errors.New("规则补偿屏障中，部署重试暂不登记")
 
 // ErrCertRuleStateConflict 标记 upsert 时规则当前态守卫拒绝：规则已删除、
 // 被禁用、非 ACME 或域名已变更。属并发冲突语义——
@@ -1770,6 +1889,11 @@ func BackfillMissingACMECertJobs(ctx context.Context, qm *CAQueueManager) (int, 
 			Logf("warn", "证书任务补建跳过规则 %s：ACME 域名不可规范化（%q）", candidate.ruleID, candidate.domain)
 			continue
 		}
+		// 写前门：补建=新增任务行（含入队），从节点落定会与主节点重复签发。
+		if gateErr := certReconcileWriteGate(ctx); gateErr != nil {
+			Logf("warn", "证书任务补建前写门拦截（rule=%s）: %v", candidate.ruleID, gateErr)
+			return created, gateErr
+		}
 		jobID, changed, uerr := upsertQueuedCertJob(candidate.ruleID, list, candidate.caProvider)
 		if uerr != nil {
 			Logf("error", "证书任务补建失败 rule=%s: %v", candidate.ruleID, uerr)
@@ -1973,9 +2097,27 @@ func (s *CertificateService) renewExpiringCertificates() error {
 	return nil
 }
 
+// manualCertExpiryCheckMu 串行化手动证书巡检的扫描体：包级巡检（服务实例
+// 缺失/停止调度时仍要告警）与实例方法共享同一临界区，避免并发轮次重复读表
+// 与重复告警判定。
+var manualCertExpiryCheckMu sync.Mutex
+
+// manualCertExpiryFallbackGate 服务实例缺失时的手动证书告警去重门：巡检不
+// 依赖队列/服务实例，停止「证书签发」调度不应让 10 分钟一次的巡检失去去重。
+var manualCertExpiryFallbackGate = newManualCertExpiryAlertGate()
+
 func (s *CertificateService) checkManualCertExpiration() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return runManualCertExpiryCheck(s.expiryAlertGate)
+}
+
+// runManualCertExpiryCheck 是手动证书到期巡检的包级实现：只读 lb_rules 的
+// 手动证书并用告警门去重，与 CA 队列/证书服务实例无关。
+func runManualCertExpiryCheck(gate *manualCertExpiryAlertGate) error {
+	manualCertExpiryCheckMu.Lock()
+	defer manualCertExpiryCheckMu.Unlock()
+	if gate == nil {
+		gate = manualCertExpiryFallbackGate
+	}
 
 	// all manual certificates into memory, then close cursor before parsing
 	// 与其余全部扫描/渲染口径对齐（enabled=1）——禁用规则的证书
@@ -2051,13 +2193,13 @@ func (s *CertificateService) checkManualCertExpiration() error {
 		case "expired":
 			// 同一证书同日同档只告一次(10min 扫描周期去重);
 			// 计数不受门禁影响,汇总如实反映当前状态。
-			if s.expiryAlertGate.shouldAlert(c.caddyID, manualCertExpiryLevelExpired, now) {
+			if gate.shouldAlert(c.caddyID, manualCertExpiryLevelExpired, now) {
 				Logf("error", "⚠️ 问题: TLS certificate expired for rule '%s' (domain: %s, caddy_id: %s). Expired on %s",
 					c.name, c.domain, c.caddyID, cert.NotAfter.Format("2006-01-02"))
 			}
 			expiredCount++
 		case "expiring":
-			if s.expiryAlertGate.shouldAlert(c.caddyID, manualCertExpiryLevelExpiringSoon, now) {
+			if gate.shouldAlert(c.caddyID, manualCertExpiryLevelExpiringSoon, now) {
 				Logf("warn", "cert expiration check: TLS certificate expiring soon for rule '%s' (domain: %s, caddy_id: %s). Expires in %d days (%s)",
 					c.name, c.domain, c.caddyID, daysUntilExpiry, cert.NotAfter.Format("2006-01-02"))
 			}
@@ -2082,6 +2224,57 @@ func (s *CertificateService) checkManualCertExpiration() error {
 		TaskLogf("cert-manual-poll", "check", "手动证书到期检查：无过期无临期（阈值 %d 天）%s", warnDays, skippedNote)
 	}
 	return nil
+}
+
+// certRenewalGuaranteedGrace：续签窗口覆盖证书寿命时的保护区——证书剩余
+// 有效期不足该值时仍放行续签，避免「配置越界」演变成「证书到期中断」。
+const certRenewalGuaranteedGrace = 7 * 24 * time.Hour
+
+// certRenewalWindowCoversLifetime 报告续签窗口是否覆盖整张证书寿命
+// （window >= NotAfter-NotBefore）且证书仍处于保护区之外。
+//
+// 窗口 ≥ 寿命意味着证书一签发出来就落进续签窗口：唯一的去抖门（选中证书
+// NotAfter 晚于 now+days）在成功签发后恒假，每次扫描都重新入队，形成每轮
+// 重签循环；CA 侧重复证书限流后任务落 failed（只能手动重试），约一个寿命周期
+// 后证书到期、TLS 中断。写侧上界 0-90 与 90 天证书寿命重合是常态，故防线放在
+// 扫描侧（不改写侧 API 契约）。剩余 ≤ 保护区时放行续签。
+func certRenewalWindowCoversLifetime(window time.Duration, leaf *x509.Certificate, now time.Time) bool {
+	if leaf == nil || window <= 0 {
+		return false
+	}
+	lifetime := leaf.NotAfter.Sub(leaf.NotBefore)
+	if lifetime <= 0 || window < lifetime {
+		return false
+	}
+	return leaf.NotAfter.Sub(now) > certRenewalGuaranteedGrace
+}
+
+// certRenewalWindowWarnInterval 限频：同一规则每小时最多一条告警——扫描周期
+// 最短 6h，但手动触发/多规则场景不应刷屏。
+const certRenewalWindowWarnInterval = time.Hour
+
+var certRenewalWindowWarnGate struct {
+	mu   sync.Mutex
+	last map[string]time.Time
+}
+
+func warnRenewalWindowCoversLifetime(ruleID string, windowDays int, leaf *x509.Certificate) {
+	if leaf == nil {
+		return
+	}
+	now := time.Now()
+	certRenewalWindowWarnGate.mu.Lock()
+	if certRenewalWindowWarnGate.last == nil {
+		certRenewalWindowWarnGate.last = make(map[string]time.Time)
+	}
+	if last, ok := certRenewalWindowWarnGate.last[ruleID]; ok && now.Sub(last) < certRenewalWindowWarnInterval {
+		certRenewalWindowWarnGate.mu.Unlock()
+		return
+	}
+	certRenewalWindowWarnGate.last[ruleID] = now
+	certRenewalWindowWarnGate.mu.Unlock()
+	Logf("warn", "证书规则 %s：自动续签时间 %d 天 ≥ 证书寿命 %s（剩余 %s），本轮跳过续签以免每轮重签；请把续签时间调到小于证书寿命",
+		ruleID, windowDays, leaf.NotAfter.Sub(leaf.NotBefore).Truncate(time.Hour), leaf.NotAfter.Sub(now).Truncate(time.Hour))
 }
 
 // scanRenewalCandidates：CheckExpiration 与
@@ -2127,8 +2320,17 @@ func scanRenewalCandidates(rows *sql.Rows, days int, warnPrefix string) (jobs []
 		}
 		if selected {
 			canonicalSelected, selectedErr := CanonicalACMEDomains(selection.Candidate.Domain)
-			if selectedErr == nil && canonicalSelected == canonicalRule && selection.Certificate.NotAfter.After(now.Add(time.Duration(days)*24*time.Hour)) {
-				continue
+			if selectedErr == nil && canonicalSelected == canonicalRule {
+				window := time.Duration(days) * 24 * time.Hour
+				if selection.Certificate.NotAfter.After(now.Add(window)) {
+					continue
+				}
+				// 窗口覆盖整张证书寿命：刚签下的证书也「在窗口内」，不设防
+				// 会每轮重签。保护区（剩余 ≤ 7 天）放行。
+				if certRenewalWindowCoversLifetime(window, selection.Certificate, now) {
+					warnRenewalWindowCoversLifetime(j.RuleID, days, selection.Certificate)
+					continue
+				}
 			}
 		}
 		jobs = append(jobs, j)
@@ -2212,7 +2414,7 @@ func (s *CertificateService) checkFailedFirstIssuance(maxAttempts int) ([]models
 func selectStoredRuleCertificate(ctx context.Context, ruleID, ruleDomains string, now time.Time) (CertificateSelection, bool, error) {
 	rows, err := db.DB.QueryContext(ctx, `SELECT id,domain,status,COALESCE(cert_pem,''),COALESCE(key_pem,''),
 		COALESCE(julianday(COALESCE(updated_at,created_at)),0)
-		FROM cert_jobs WHERE rule_id=? AND COALESCE(cert_pem,'')<>'' AND COALESCE(key_pem,'')<>''`, ruleID)
+		FROM cert_jobs WHERE rule_id=? AND `+CertJobMaterialPredicateSQL(""), ruleID)
 	if err != nil {
 		return CertificateSelection{}, false, err
 	}

@@ -12,6 +12,8 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+
+	"lazy-balancer-v2/internal/db"
 )
 
 func TestSettingsWrites409DuringImport(t *testing.T) {
@@ -26,7 +28,25 @@ func TestSettingsWrites409DuringImport(t *testing.T) {
 	router.PUT("/security/ip2region/schedule", h.UpdateIP2RegionSchedule)
 	router.PUT("/security/threat/schedule", h.UpdateThreatSchedule)
 	router.PUT("/security/crawler/schedule", h.UpdateCrawlerSchedule)
+	router.PUT("/security/crawler-lib/auto-update", h.UpdateCrawlerAutoUpdate)
+	router.PUT("/security/crawler-lib/:id/flags", h.UpdateCrawlerLibFlags)
 	router.PUT("/security/autoban", h.UpdateAutobanConfig)
+
+	// 落库侧快照：409 必须是「未落库」而不是「落库后报错」。
+	if _, err := db.DB.Exec(`INSERT OR IGNORE INTO security_crawler_sources
+		(id, name, display_name, url, format, update_enabled, update_status)
+		VALUES (1, 'googlebot', 'Google', 'https://example.test/crawlers.txt', 'txt', 0, 'idle')`); err != nil {
+		t.Fatalf("seed crawler source: %v", err)
+	}
+	var autoBefore int
+	if err := db.DB.QueryRow(`SELECT COALESCE(crawler_auto_update,0) FROM global_config WHERE id=1`).Scan(&autoBefore); err != nil {
+		t.Fatalf("read crawler auto update: %v", err)
+	}
+	var enabledBefore, statusBefore string
+	if err := db.DB.QueryRow(`SELECT COALESCE(update_enabled,0), COALESCE(update_status,'') FROM security_crawler_sources WHERE id=1`).
+		Scan(&enabledBefore, &statusBefore); err != nil {
+		t.Fatalf("read crawler source: %v", err)
+	}
 
 	// 模拟导入会话持锁（configImportBusy 的探测对象）。
 	configImportBeginMu.Lock()
@@ -41,6 +61,8 @@ func TestSettingsWrites409DuringImport(t *testing.T) {
 		{"PUT", "/security/ip2region/schedule", `{"days":[1,2],"time":"04:00"}`},
 		{"PUT", "/security/threat/schedule", `{"days":[1,2],"time":"04:00"}`},
 		{"PUT", "/security/crawler/schedule", `{"days":[1,2],"time":"04:00"}`},
+		{"PUT", "/security/crawler-lib/auto-update", `{"auto_update":true}`},
+		{"PUT", "/security/crawler-lib/1/flags", `{"update_enabled":true}`},
 		{"PUT", "/security/autoban", `{"enabled":true}`},
 	}
 	for _, call := range calls {
@@ -56,6 +78,22 @@ func TestSettingsWrites409DuringImport(t *testing.T) {
 			t.Fatalf("%s %s body=%s, want 配置导入进行中 文案", call.method, call.path, recorder.Body.String())
 		}
 	}
+
+	var autoAfter int
+	if err := db.DB.QueryRow(`SELECT COALESCE(crawler_auto_update,0) FROM global_config WHERE id=1`).Scan(&autoAfter); err != nil {
+		t.Fatalf("read crawler auto update after: %v", err)
+	}
+	if autoAfter != autoBefore {
+		t.Fatalf("窗口内 crawler_auto_update %d→%d，409 前不得落库", autoBefore, autoAfter)
+	}
+	var enabledAfter, statusAfter string
+	if err := db.DB.QueryRow(`SELECT COALESCE(update_enabled,0), COALESCE(update_status,'') FROM security_crawler_sources WHERE id=1`).
+		Scan(&enabledAfter, &statusAfter); err != nil {
+		t.Fatalf("read crawler source after: %v", err)
+	}
+	if enabledAfter != enabledBefore || statusAfter != statusBefore {
+		t.Fatalf("窗口内爬虫源 %s/%s→%s/%s，409 前不得落库", enabledBefore, statusBefore, enabledAfter, statusAfter)
+	}
 }
 
 // 对照：窗口外同一端点不被 409 门恒拒（门只按导入会话持锁判定）。
@@ -64,12 +102,21 @@ func TestSettingsWritesAllowedOutsideImportWindow(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.PUT("/security/autoban", h.UpdateAutobanConfig)
+	router.PUT("/security/crawler-lib/auto-update", h.UpdateCrawlerAutoUpdate)
+	router.PUT("/security/crawler-lib/:id/flags", h.UpdateCrawlerLibFlags)
 
-	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPut, "/security/autoban", strings.NewReader(`{not-json`))
-	request.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(recorder, request)
-	if recorder.Code == http.StatusConflict {
-		t.Fatalf("窗口外请求被 409 门恒拒: body=%s", recorder.Body.String())
+	calls := []struct{ path, body string }{
+		{"/security/autoban", `{not-json`},
+		{"/security/crawler-lib/auto-update", `{not-json`},
+		{"/security/crawler-lib/1/flags", `{not-json`},
+	}
+	for _, call := range calls {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPut, call.path, strings.NewReader(call.body))
+		request.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(recorder, request)
+		if recorder.Code == http.StatusConflict {
+			t.Fatalf("%s 窗口外请求被 409 门恒拒: body=%s", call.path, recorder.Body.String())
+		}
 	}
 }

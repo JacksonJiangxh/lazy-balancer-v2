@@ -78,9 +78,13 @@ func TestIP2Region_singleSegmentXDBIsNotEmpty(t *testing.T) {
 // 版本行缺失时插入必须沿用 schema 默认（auto_update=TRUE），
 // 不得硬编码 0 造成「自动更新默认关闭」。
 func TestSetIP2RegionVersion_missingRowKeepsAutoUpdateDefault(t *testing.T) {
-	if err := db.Initialize(t.TempDir()); err != nil {
+	if err := initSecurityEventsTestDB(t, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
+	// SetIP2RegionVersion 会写 live+".provinces.json" 与地域树缓存——默认路径
+	// 指向容器 /app 目录，容器内跑测试会污染库目录；注入临时路径。
+	dir := t.TempDir()
+	withIP2RegionPaths(t, filepath.Join(dir, "ip2region.xdb"), filepath.Join(dir, "missing-dist.xdb"))
 	if _, err := db.DB.Exec("DELETE FROM security_ip2region_version"); err != nil {
 		t.Fatal(err)
 	}

@@ -209,7 +209,11 @@ func TestValidateV2BackupRules_saveSideValueDomain(t *testing.T) {
 		{name: "retry duration above maximum", mutate: func(r map[string]any) { r["tcp_try_duration"] = 60001 }},
 		{name: "retry interval above maximum", mutate: func(r map[string]any) { r["tcp_try_interval"] = 60001 }},
 		{name: "host header contains CRLF", mutate: func(r map[string]any) { r["host_header"] = "backend.example\r\nX-Injected: true" }},
-		{name: "health path lacks slash", mutate: func(r map[string]any) { r["health_check_path"] = "health" }},
+		{name: "health path lacks slash", mutate: func(r map[string]any) {
+			// 该形状只在主动健康检查启用时参与校验（死字段不校验）。
+			r["enable_active_health_check"] = 1
+			r["health_check_path"] = "health"
+		}},
 		{name: "dns server malformed", mutate: func(r map[string]any) { r["dns_server"] = "not a dns server" }},
 	}
 	for _, tt := range tests {
@@ -712,5 +716,140 @@ func TestSecurityOnlyImportDropsTCPRuleBindings(t *testing.T) {
 	}
 	if bindings != 0 {
 		t.Fatalf("TCP 绑定条数=%d, want 0（TCP 渲染链不消费策略，绑定为死绑定）", bindings)
+	}
+}
+
+// INTEGER 声明列收到文本值必须整包 400 并点名列名、零写入：文本落库后保留
+// TEXT 存储类，MFA 校验（users.mfa_last_timestep）与证书任务列表
+// （cert_jobs.renewal_attempts）的 raw int 扫描会持续 500 且无 UI 自愈路径。
+func TestImportRejectsTextInIntegerColumns(t *testing.T) {
+	cases := []struct {
+		name      string
+		usersRow  map[string]any
+		certJob   map[string]any
+		wantInMsg string
+	}{
+		{
+			name: "mfa_last_timestep",
+			usersRow: map[string]any{
+				"id": 1, "username": "backup-admin", "password_hash": "hash", "role": "admin",
+				"is_enabled": 1, "mfa_enabled": 1, "mfa_secret": "SECRET", "mfa_last_timestep": "abc",
+			},
+			certJob: map[string]any{
+				"rule_id": "lb_int_gate", "domain": "int.example.com", "status": "issued",
+				"cert_pem": "PEM", "key_pem": "KEY", "renewal_attempts": 2,
+			},
+			wantInMsg: "mfa_last_timestep",
+		},
+		{
+			name: "cert_jobs_renewal_attempts",
+			usersRow: map[string]any{
+				"id": 1, "username": "backup-admin", "password_hash": "hash", "role": "admin",
+				"is_enabled": 1, "mfa_enabled": 1, "mfa_secret": "SECRET", "mfa_last_timestep": 0,
+			},
+			certJob: map[string]any{
+				"rule_id": "lb_int_gate", "domain": "int.example.com", "status": "issued",
+				"cert_pem": "PEM", "key_pem": "KEY", "renewal_attempts": "abc",
+			},
+			wantInMsg: "renewal_attempts",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newBackupTestHandlers(t)
+			seedAdminShared(t)
+			body := buildBackup(t, backupFixtureOptions{Tables: map[string][]map[string]any{
+				"users": {tc.usersRow},
+				"lb_rules": {{
+					"caddy_id": "lb_int_gate", "name": "int-gate", "protocol": "http",
+					"domain": "int.example.com", "listen_port": 80, "enabled": 1,
+				}},
+				"cert_jobs": {tc.certJob},
+			}})
+
+			recorder := postBackupImport(t, h, body)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s, want 400（文本形态数值列不得导入 200）", recorder.Code, recorder.Body.String())
+			}
+			if !strings.Contains(recorder.Body.String(), tc.wantInMsg) {
+				t.Fatalf("body=%s, want 点名 %s 列", recorder.Body.String(), tc.wantInMsg)
+			}
+			// 校验在事务前：本地数据零写入（当前管理员仍在）。
+			var admins int
+			if err := db.DB.QueryRow(`SELECT COUNT(*) FROM users WHERE username='admin'`).Scan(&admins); err != nil {
+				t.Fatal(err)
+			}
+			if admins != 1 {
+				t.Fatalf("被拒绝的导入写入了数据（admin 行数=%d）", admins)
+			}
+		})
+	}
+}
+
+// 回归：整数形字符串与整数数值照常放行（既有各门对数值字符串均放行），
+// 落库后存储类为 INTEGER。
+func TestImportAcceptsNumericStringInIntegerColumns(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	seedAdminShared(t)
+	body := buildBackup(t, backupFixtureOptions{Tables: map[string][]map[string]any{
+		"users": {{
+			"id": 1, "username": "backup-admin", "password_hash": "hash", "role": "admin",
+			"is_enabled": 1, "mfa_enabled": 1, "mfa_secret": "SECRET", "mfa_last_timestep": "5",
+		}},
+		"lb_rules": {{
+			"caddy_id": "lb_int_ok", "name": "int-ok", "protocol": "http",
+			"domain": "int-ok.example.com", "listen_port": 80, "enabled": 1,
+		}},
+		"cert_jobs": {{
+			"rule_id": "lb_int_ok", "domain": "int-ok.example.com", "status": "issued",
+			"cert_pem": "PEM", "key_pem": "KEY", "renewal_attempts": "2",
+		}},
+	}})
+
+	recorder := postBackupImport(t, h, body)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
+	}
+	var timestep int64
+	if err := db.DB.QueryRow(`SELECT COALESCE(mfa_last_timestep,0) FROM users WHERE id=1`).Scan(&timestep); err != nil {
+		t.Fatalf("raw int 扫描失败（存储类未收敛为 INTEGER）: %v", err)
+	}
+	if timestep != 5 {
+		t.Fatalf("mfa_last_timestep=%d, want 5", timestep)
+	}
+}
+
+// users 分节替换后，未随包替换的规则/安全表归属列仍按数字 id 解析：
+// 同 id 换人时作者列会静默指向另一位用户。导入只告警/审计，不改写归属字段。
+func TestImportUsers_warnsAboutAttributionMismatch(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (1,'bob','hash','admin',1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (2,'carol','hash','user',1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled,updated_by) VALUES ('lb_attr','attr','http','attr.example.com',80,1,2)`); err != nil {
+		t.Fatal(err)
+	}
+	// 备份只含 users：id 2 由 carol 变成 alice（同 id 换人）。
+	body := buildBackup(t, backupFixtureOptions{Sections: []string{"users"}, Tables: map[string][]map[string]any{
+		"users": {{"id": 2, "username": "alice", "password_hash": "hash", "role": "admin", "is_enabled": 1}},
+	}})
+
+	recorder := postBackupImport(t, h, body)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "归属用户未随备份包含或已被替换") {
+		t.Fatalf("body=%s, want 归属用户告警", recorder.Body.String())
+	}
+	// 只告警不改写：规则归属字段保持原 id。
+	var updatedBy int
+	if err := db.DB.QueryRow(`SELECT COALESCE(updated_by,0) FROM lb_rules WHERE caddy_id='lb_attr'`).Scan(&updatedBy); err != nil {
+		t.Fatal(err)
+	}
+	if updatedBy != 2 {
+		t.Fatalf("updated_by=%d, want 保持 2（导入不改写归属字段）", updatedBy)
 	}
 }

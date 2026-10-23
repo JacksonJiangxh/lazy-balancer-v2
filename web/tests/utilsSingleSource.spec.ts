@@ -44,12 +44,21 @@ test('highlight 的 Prism 异常兜底必须转义（注入面不得回退原文
   assert.match(catchBlock, /return escapeHtml\(content\)/, '兜底必须走共享 escapeHtml，不得返回原文')
 })
 
-test('branding.footerHtml：默认加 GitHub 链接、自定义仅转义文本', async () => {
+test('branding.footerHtml：默认加 GitHub 链接、自定义仅转义文本', async (t) => {
   // 先加载模块（vue runtime-dom 在无 document 时初始化），再注入 host——先注入
   // 半成品 document 会让 runtime-dom 的探测代码调用不存在的 createElement。
   const branding = await import('../src/utils/branding.ts')
+  const host = globalThis as { document?: unknown }
+  const previousDocument = host.document
   const documentStub = { title: '' }
-  ;(globalThis as unknown as { document: { title: string } }).document = documentStub
+  host.document = documentStub
+  // 与 threatHotPathCaching 同范式：假 DOM 不得留给同进程其它用例
+  // （node --test --test-isolation=none 下会污染 Vue 的 DOM 探测）。
+  t.after(() => {
+    if (previousDocument === undefined) Reflect.deleteProperty(host, 'document')
+    else host.document = previousDocument
+    assert.equal(host.document, previousDocument, 'document 替身必须还原')
+  })
 
   // 默认分支（footer_uses_default 未关闭）：带 GitHub 外链
   const defaultHtml = branding.footerHtml.value

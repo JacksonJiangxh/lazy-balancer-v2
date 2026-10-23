@@ -2,7 +2,7 @@
 
 ## 概述
 
-Lazy Balancer V2 内置 **Model Context Protocol (MCP)** 服务，AI 代理可操作全部主要功能。工具数量以运行时 `tools/list` 输出为准（当前约 136 个，随版本变化；`GET /api/v1/mcp/tools` 提供同一注册表），本文不复制固定数字。少数聚合/只读便利端点仅经 REST API 提供，见文末「仅 REST 可用的端点」。
+Lazy Balancer V2 内置 **Model Context Protocol (MCP)** 服务，AI 代理可操作全部主要功能。工具清单以运行时 `tools/list` 输出为准（`GET /api/v1/mcp/tools` 提供同一注册表），本文不复制固定数字——增删工具不会让本文失真。少数能力仅经 REST API 提供，见文末「仅 REST 可用的能力」。
 
 ## 接入
 
@@ -86,16 +86,23 @@ lazy-balancer://docs/ops-playbook
 | 401 | API Key 无效 |
 | 403 | MCP 未启用 / IP 不在白名单 / 只读 Key 调写工具 ；非 admin 属主的写工具 403；从节点非集群写工具 403 |
 
-## 仅 REST 可用的端点
+## 仅 REST 可用的能力
 
-以下聚合/只读便利端点暂无对应 MCP 工具，需要时经 REST API（`http://<host>:8000/api/v1`，同一 API Key 认证）访问：
+以下能力暂无对应 MCP 工具，需要时经 REST API（`http://<host>:8000/api/v1`，同一 API Key 认证）访问。
+**没有 MCP 工具 ≠ 只读**：表中既有机读聚合端点，也有配置写入/批量运维端点。
 
-| 端点 | 说明 |
-|---|---|
-| `GET /caddy/metrics` | Caddy 进程级聚合指标（Prometheus 解析结果） |
-| `GET /caddy/host-metrics` | 按域名（host）维度的请求数/状态码/流量指标 |
-| `GET /logs/stats` | 日志文件大小与保留统计 |
-| `POST /rules/cert-info` | 按域名批量查询规则关联证书信息 |
-| `POST /certificates/jobs/current` | 查询当前进行中的证书签发任务 |
-| `GET /audit-logs/options` | 审计日志筛选下拉选项 |
-| `GET /security/crs/setup` | CRS 全局配置（crs-setup 摘要） |
+| 域 | 仅 REST 的端点示例 | 说明 |
+|---|---|---|
+| 监控指标 | `GET /caddy/metrics`、`GET /caddy/host-metrics`、`GET /logs/stats` | Caddy 进程级/按域名聚合指标与日志保留统计 |
+| 规则查询 | `POST /rules/cert-info` | 按域名批量查询规则关联证书信息 |
+| 证书队列 | `POST /certificates/jobs/current` | 查询当前进行中的证书签发任务 |
+| 审计 | `GET /audit-logs/options` | 审计日志筛选下拉选项 |
+| WAF 规则库 | `GET /security/crs/setup` | CRS 全局配置（crs-setup 摘要） |
+| 自动封禁 | `GET /security/autoban`、`PUT /security/autoban` | 自动封禁阈值/窗口/时长/作用域/演练模式配置 |
+| 威胁情报库 | `PUT /security/threat-lib/auto-update`、`PUT /security/threat-lib/schedule`、各源开关 | 库开关与排程 |
+| 爬虫地址库 | `PUT /security/crawler-lib/auto-update`、`PUT /security/crawler-lib/schedule` | 库开关与排程 |
+| CRS / IP 库开关与排程 | `PUT /security/crs/auto-update`、`PUT /security/crs/schedule`、`PUT /security/ip2region/auto-update`、`PUT /security/ip2region/schedule` | 库开关与排程 |
+| 安全策略与规则 | `POST /security/policies/batch-bind`、`POST /rules/batch-block-pages` | 策略批量绑定、规则批量指定拦截页 |
+| 系统任务 | `POST /system/tasks/:id/{toggle,control}` | 任务调度启停（引擎元数据驱动） |
+
+完整豁免清单以 MCP 工具与 REST 路由的一致性测试（parity）和 `GET /api/v1/openapi.yaml` 为准——两份清单任一变更都会被机械对账拦下。

@@ -150,10 +150,15 @@ var errScheduledNotDue = errors.New("taskengine: 定时槽未到期")
 type registration struct {
 	desc Descriptor
 
-	mu                sync.Mutex
-	running           bool
-	cancel            context.CancelFunc
-	runTrigger        string    // 在途轮的触发来源（manual/auto/startup/caddy-restart）
+	mu         sync.Mutex
+	running    bool
+	cancel     context.CancelFunc
+	runTrigger string // 在途轮的触发来源（manual/auto/startup/caddy-restart）
+	// runSeq 在途轮代际身份：每次成功占位（reserveRunInternal /
+	// tryStartDaemon）自增。取消路径以快照代际复核复锁——CancelHook 窗口内
+	// 本轮结束、tick 已派发同 trigger 新一轮时，旧取消动作（c()/槽消费）
+	// 不得作用于新一轮。
+	runSeq            uint64
 	lastCheck         time.Time // Periodic：最近到期判定基准
 	nextScheduledTime time.Time // Scheduled：下一槽（槽缓存+降频求值，见 tick）
 	loopEnabled       bool      // 循环/调度开关
@@ -541,6 +546,7 @@ func (e *Engine) tryStartDaemon(r *registration, restartIntent bool) {
 	// 占位与 cancel 登记同临界区——StopLoop/Stop/角色翻转
 	// 不再有「running=true 但 cancel==nil」的首停信号丢失窗口。
 	r.running = true
+	r.runSeq++
 	ctx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
 	r.mu.Unlock()
@@ -589,11 +595,25 @@ func (e *Engine) Register(d Descriptor) error {
 	if d.Kind == KindScheduled && d.NextSlotFn == nil {
 		return fmt.Errorf("taskengine: %s 为 Scheduled 任务，必须提供 NextSlotFn", d.ID)
 	}
+	// 调度 Fn 按 Kind 白名单：每族只在固定分支消费（IntervalFn 仅 Periodic、
+	// NextSlotFn 仅 Scheduled、EnabledFn 仅 Scheduled/Periodic），错配声明
+	// 即静默忽略——注册方会误以为调度面/业务门生效，注册期响亮拒绝。
+	if d.IntervalFn != nil && d.Kind != KindPeriodic {
+		return fmt.Errorf("taskengine: %s 声明 IntervalFn 但 Kind=%s（仅 Periodic 消费，声明即静默忽略）", d.ID, d.Kind)
+	}
+	if d.NextSlotFn != nil && d.Kind != KindScheduled {
+		return fmt.Errorf("taskengine: %s 声明 NextSlotFn 但 Kind=%s（仅 Scheduled 消费，声明即静默忽略）", d.ID, d.Kind)
+	}
 	// Daemon 不进周期 tick——EnabledFn 在调度面永不消费
 	//（静默忽略）。挂 EnabledFn 会让注册方误以为业务门生效，注册期响亮拒绝；
 	// 常驻业务门归 Run 体首行（autoban 形态，见 docs/task-engine-standard.md §4）。
 	if d.Kind == KindDaemon && d.EnabledFn != nil {
 		return fmt.Errorf("taskengine: %s 为常驻任务，EnabledFn 不参与调度（Daemon 不进 tick，静默忽略）——业务门须内置到 Run 体", d.ID)
+	}
+	// 同族：Oneshot 不进 tick（tick 只派发 Scheduled/Periodic），EnabledFn 声
+	// 明在触发形态同样静默忽略。
+	if d.EnabledFn != nil && d.Kind != KindScheduled && d.Kind != KindPeriodic {
+		return fmt.Errorf("taskengine: %s 声明 EnabledFn 但 Kind=%s（仅 Scheduled/Periodic 在 tick 消费，声明即静默忽略）", d.ID, d.Kind)
 	}
 	// RestartOnRoleFlip 仅在 daemon 分支消费（角色翻转换代）；声明于
 	// Periodic/Scheduled/Oneshot 静默无效——装配错误注册期响亮拒绝（与
@@ -729,6 +749,10 @@ func (e *Engine) Cancel(id string) bool {
 	c := r.cancel
 	running := r.running
 	trigger := r.runTrigger
+	// 在途轮代际快照：CancelHook 是任意时长窗口（manager 取消可能阻塞），
+	// 其间本轮可自然结束且 tick 已派发同 trigger 新一轮——复锁时仅代际
+	// 未变才允许动作，否则会取消/消费新一轮的槽。
+	seq := r.runSeq
 	r.mu.Unlock()
 	hook := r.desc.CancelHook
 	if hook != nil {
@@ -742,19 +766,21 @@ func (e *Engine) Cancel(id string) bool {
 		// 时 terminalStatus 判 cancelled（曾 manager 取消路径引擎 ctx 不动，
 		// 终态落 failed，历史无法区分「用户取消」与「真失败」）。
 		r.mu.Lock()
-		if c != nil && r.running && r.runTrigger == trigger {
+		if c != nil && r.running && r.runSeq == seq && r.runTrigger == trigger {
 			c()
+			consumeCancelledSlotLocked(r, trigger)
 		}
-		consumeCancelledSlotLocked(r, trigger)
 		r.mu.Unlock()
 		return true
 	}
 	if c == nil || !running {
 		return false
 	}
-	c()
 	r.mu.Lock()
-	consumeCancelledSlotLocked(r, trigger)
+	if r.running && r.runSeq == seq {
+		c()
+		consumeCancelledSlotLocked(r, trigger)
+	}
 	r.mu.Unlock()
 	return true
 }
@@ -889,8 +915,11 @@ func (e *Engine) StartLoop(id string) {
 		// 失败退避/求值节拍（否则用户在停摆后重开调度，旧水位仍会压掉
 		// 当前槽——显式复位入口，见 ResetScheduleProgress）。
 		resetScheduleProgressLocked(r)
+		// 节拍复位只属于「关→开」过渡：置零=立刻到期。已开启状态的重复
+		// StartLoop 不得重置节拍（否则对运行中的 Periodic 任务重复调用
+		// 幂等入口会凭空多跑一轮）；显式补跑归 RearmLoop。
+		r.lastCheck = time.Time{}
 	}
-	r.lastCheck = time.Time{}
 	r.mu.Unlock()
 	// Daemon：CAS 启动。关→开过渡=真实重启意图（背靠背
 	// restart 语义保持）；已开启状态的重复 StartLoop 不再栽重启意图。
@@ -1435,6 +1464,7 @@ func (e *Engine) reserveRunInternal(id, trigger string, admission Kind, beat tim
 		}
 	}
 	r.running = true
+	r.runSeq++
 	r.runTrigger = trigger
 	if admission == KindPeriodic {
 		r.lastCheck = beat
@@ -1539,16 +1569,18 @@ func (e *Engine) executeRun(res *runReservation, id, trigger, operator string) (
 		prevSlot := r.nextScheduledTime
 		r.nextScheduledTime = nextSlot
 		switch {
-		case status == "failed" && slotDueForBackoff(nextSlot, prevSlot, time.Now()):
-			// 「已到期槽未推进+本轮 failed」兜底退避：业务侧未推进槽的失败轮
-			// （如装配缺陷响亮失败、nil-manager）此前每 tick 重投。未来槽
-			// （手动触发轮在预约到期前失败）不在退避范围——未来槽本来就不会
-			// 被 tick 重投，写「退避后重投」告警是失实信号，且会无谓消耗
-			// streak/5 分钟告警地板。判据与成功消费分支同口径（槽已到期）。
+		case (status == "failed" || status == "skipped") && slotDueForBackoff(nextSlot, prevSlot, time.Now()):
+			// 「已到期槽未推进+本轮失败/跳过」兜底退避：业务侧未推进槽的
+			// 失败轮（如装配缺陷响亮失败、nil-manager）与降级跳过轮（如
+			// Run 体首行角色门 return ErrTaskSkipped）此前每 tick 重投——
+			// 1s 节拍下 ≈8.6 万行 task_runs/天。未来槽（手动触发轮在预约
+			// 到期前失败）不在退避范围——未来槽本来就不会被 tick 重投，
+			// 写「退避后重投」告警是失实信号，且会无谓消耗 streak/5 分钟
+			// 告警地板。判据与成功消费分支同口径（槽已到期）。
 			r.schedFailStreak++
 			delay := scheduledFailBackoff(r.schedFailStreak)
 			r.schedRetryAfter = time.Now().Add(delay)
-			// 连续失败留 WARN 行（节流：非首轮至多每分钟一条——兜底
+			// 连续失败/跳过留 WARN 行（节流：非首轮至多每分钟一条——兜底
 			// 本身的降噪，不得再制造日志洪峰）。首轮豁免也受
 			// scheduledBackoffFirstWarnFloor 地板约束：槽消费机制覆盖
 			// success/skipped/cancelled 后，failed 仍会清零重计——交替
@@ -1560,7 +1592,8 @@ func (e *Engine) executeRun(res *runReservation, id, trigger, operator string) (
 			}
 			if warnDue {
 				r.schedBackoffLastWarnAt = time.Now()
-				taskLogAppend(id, fmt.Sprintf("[warn] 排程槽未推进且本轮失败，退避 %s 后重投（连续 %d 轮；业务 Run 早退须推进槽，见任务引擎标准）", delay, r.schedFailStreak))
+				outcome := map[bool]string{true: "失败", false: "跳过"}[status == "failed"]
+				taskLogAppend(id, fmt.Sprintf("[warn] 排程槽未推进且本轮%s，退避 %s 后重投（连续 %d 轮；业务 Run 早退须推进槽，见任务引擎标准）", outcome, delay, r.schedFailStreak))
 			}
 		default:
 			r.schedFailStreak = 0
@@ -1612,7 +1645,7 @@ func truncMsg(err error) string {
 // 退避 WARN ≥ 地板才放行；长静默后的首次失败不受影响（距上次远超地板）。
 const scheduledBackoffFirstWarnFloor = 5 * time.Minute
 
-// slotDueForBackoff 判定「失败轮是否属于已到期且未被业务推进的槽」——
+// slotDueForBackoff 判定「失败/跳过轮是否属于已到期且未被业务推进的槽」——
 // 退避兜底只覆盖这类形态（未来槽/零槽失败不进退避、不写重投告警）：
 //   - nextSlot 为零：业务未武装槽（或开关关闭），tick 不会按槽投递，无重投；
 //   - nextSlot 在未来：下一次预约尚未到期，本轮是手动/提前执行，无重投；
@@ -2293,35 +2326,46 @@ func (e *Engine) Lookup(id string) (TaskMeta, bool) {
 	r.mu.Lock()
 	loopOn, running, exhausted := r.loopEnabled, r.running, r.restartExhausted
 	r.mu.Unlock()
+	return buildTaskMeta(id, r.desc, loopOn, running, exhausted, e.roleAllows(r.desc.RunsOn)), true
+}
+
+// buildTaskMeta 元数据构建单源（Lookup 与 DescribeAll 共用）：调用方只负责
+// 快照 running/loop_on/自愈态并传入角色判定结果，派生字段与闭包求值集中在此。
+// Fn 求值发生在锁外（调用方不持 r.mu），与 tick 同口径经 safe* 隔离 panic——
+// 装配闭包单任务缺陷不得让 GET /system/tasks / toggle / detail 整页 500。
+// 求值面按 Kind 收窄：IntervalFn 仅 Periodic、NextSlotFn 仅 Scheduled 产出
+// 对应字段（错配声明即使绕过注册校验也不产出假 interval_sec/next_slot）。
+func buildTaskMeta(id string, d Descriptor, loopOn, running, exhausted, roleAllows bool) TaskMeta {
 	m := TaskMeta{
-		ID: id, Family: r.desc.Family, Name: r.desc.Name,
+		ID: id, Family: d.Family, Name: d.Name,
+		Description: d.Description, Category: d.Category, Kind: d.Kind,
+		// 类型派生：定时/循环/触发均可手动调度；常驻族恒不可（启停语义，
+		// 调度开关+重启承担）。
+		CanTrigger:       d.Kind != KindDaemon,
+		Cancelable:       d.Cancelable,
+		LoopOn:           loopOn,
+		Running:          running,
+		Controllable:     d.Kind == KindDaemon, // 常驻族可启停（真实生命周期挂钩）
 		RestartExhausted: exhausted,
-		Description:      r.desc.Description, Category: r.desc.Category, Kind: r.desc.Kind,
-		// 类型派生（2026-10-11 用户裁定，取代 ManualRun 白名单）：定时/循环/
-		// 触发均可手动调度；常驻族恒不可（启停语义，调度开关+重启承担）。
-		CanTrigger:   r.desc.Kind != KindDaemon,
-		Cancelable:   r.desc.Cancelable,
-		LoopOn:       loopOn,
-		Running:      running,
-		Controllable: r.desc.Kind == KindDaemon,
 	}
-	// 与 tick 同口径的闭包 panic 隔离（safe*）——装配闭包单任务
-	// 缺陷不得让 GET /system/tasks / toggle / detail 整页 500。
-	if r.desc.IntervalFn != nil {
-		m.IntervalSec = int(safeInterval(id+".IntervalFn", r.desc.IntervalFn).Seconds())
+	if d.Kind == KindPeriodic && d.IntervalFn != nil {
+		m.IntervalSec = int(safeInterval(id+".IntervalFn", d.IntervalFn).Seconds())
 	}
-	if r.desc.NextSlotFn != nil {
-		if t := safeSlot(id+".NextSlotFn", r.desc.NextSlotFn); !t.IsZero() {
+	if d.Kind == KindScheduled && d.NextSlotFn != nil {
+		if t := safeSlot(id+".NextSlotFn", d.NextSlotFn); !t.IsZero() {
 			m.NextSlot = t.In(engineLocPtr()).Format("2006-01-02 15:04:05")
 		}
 	}
-	// 状态镜像角色门：与 DescribeAll 同门（2026-10-03 裁定）——角色不符
-	// 不采纳，单任务查询不旁路。StatusFn 闭包 panic
-	// 经 safeString 隔离（与 IntervalFn/NextSlotFn/EnabledFn 同口径）。
-	if r.desc.StatusFn != nil && e.roleAllows(r.desc.RunsOn) {
-		m.StatusMirror = safeString(id+".StatusFn", r.desc.StatusFn)
+	// 状态镜像角色门（2026-10-03 裁定）：任务不在本角色运行时，其
+	// StatusFn 读到的常是同步来的业务数据（从节点 cert_jobs/
+	// ip2region update_status 均有主端快照镜像）——采纳即伪造本节点
+	// running。角色不符一律不采纳（空）→ 视图层呈现本节点实态。
+	// StatusFn 不限 Kind（任何族的元数据都消费），闭包 panic 经 safeString
+	// 隔离。
+	if d.StatusFn != nil && roleAllows {
+		m.StatusMirror = safeString(id+".StatusFn", d.StatusFn)
 	}
-	return m, true
+	return m
 }
 
 func (e *Engine) DescribeAll() []TaskMeta {
@@ -2344,35 +2388,7 @@ func (e *Engine) DescribeAll() []TaskMeta {
 
 	out := make([]TaskMeta, 0, len(snaps))
 	for _, s := range snaps {
-		m := TaskMeta{
-			ID: s.id, Family: s.desc.Family, Name: s.desc.Name,
-			Description: s.desc.Description, Category: s.desc.Category, Kind: s.desc.Kind,
-			CanTrigger:       s.desc.Kind != KindDaemon,
-			Cancelable:       s.desc.Cancelable,
-			LoopOn:           s.loopOn,
-			Running:          s.running,
-			RestartExhausted: s.exhausted,
-			Controllable:     s.desc.Kind == KindDaemon, // 常驻族可启停（真实生命周期挂钩——B 完全标准化）
-		}
-		// 闭包 panic 隔离（与 Lookup/tick 同口径）
-		if s.desc.IntervalFn != nil {
-			m.IntervalSec = int(safeInterval(s.id+".IntervalFn", s.desc.IntervalFn).Seconds())
-		}
-		if s.desc.NextSlotFn != nil {
-			if t := safeSlot(s.id+".NextSlotFn", s.desc.NextSlotFn); !t.IsZero() {
-				m.NextSlot = t.In(engineLocPtr()).Format("2006-01-02 15:04:05")
-			}
-		}
-		// 状态镜像角色门（2026-10-03 裁定）：任务不在本角色运行时，其
-		// StatusFn 读到的常是同步来的业务数据（从节点 cert_jobs/
-		// ip2region update_status 均有主端快照镜像）——采纳即伪造本节点
-		// running。角色不符一律不采纳（空）→ 视图层呈现本节点实态；
-		// 主节点行为不变（StatusFn 保留，主侧为真实业务态）。
-		// StatusFn 闭包 panic 经 safeString 隔离。
-		if s.desc.StatusFn != nil && e.roleAllows(s.desc.RunsOn) {
-			m.StatusMirror = safeString(s.id+".StatusFn", s.desc.StatusFn)
-		}
-		out = append(out, m)
+		out = append(out, buildTaskMeta(s.id, s.desc, s.loopOn, s.running, s.exhausted, e.roleAllows(s.desc.RunsOn)))
 	}
 	// 按「分类固定序 + 类内 ID 字典序」稳定排序——曾直接 range map
 	// 输出，连续请求行序随机（前端只做分类排序，类内仍抖动）。

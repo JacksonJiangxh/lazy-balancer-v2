@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"database/sql"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -69,15 +70,25 @@ type rotationCopyName struct {
 }
 
 // classifyRotationCopyName 仅按文件名形态解析轮转副本（与目录内容无关）。
-// 先剥 .gz 再按族判定：双重后缀副本（<base>.<ts>.gz /
+// 先剥 .gz 与同秒碰撞后缀再按族判定：双重后缀副本（<base>.<ts>.gz /
 // <stem>-<ts>-size.log.gz）必须归到剥掉时间戳后的基名——否则会派生出一个
 // 「副本名本身当基名」的非规范条目，按固定基名取值的消费方取不到。
 func classifyRotationCopyName(name string) rotationCopyName {
 	core := strings.TrimSuffix(name, ".gz")
-	// 移位后缀：<base>.1..9（core 的最后一个点后须全数字）。
-	if dot := strings.LastIndexByte(core, '.'); dot > 0 && dot < len(core)-1 && isDigits(core[dot+1:]) {
-		if n, err := strconv.Atoi(core[dot+1:]); err == nil && n >= 1 && n <= 9 {
-			return rotationCopyName{kind: rotationCopyShift, base: core[:dot]}
+	gzipped := core != name
+	originalCore := core
+	collision := false
+	if stripped, ok := stripRotationCollisionSuffix(core); ok {
+		core, collision = stripped, true
+	}
+	// 移位后缀：<base>.1..9999（位数 ≤4——纯日期形态 <base>.YYYYMMDD 不得
+	// 被当成移位副本；外部 logrotate 的历史代次可到两位数）。
+	if dot := strings.LastIndexByte(core, '.'); dot > 0 && dot < len(core)-1 {
+		digits := core[dot+1:]
+		if len(digits) <= 4 && isDigits(digits) {
+			if n, err := strconv.Atoi(digits); err == nil && n >= 1 {
+				return rotationCopyName{kind: rotationCopyShift, base: core[:dot]}
+			}
 		}
 	}
 	// 运行日志族时间戳：.<8 位日期>-<6 位时刻>（16 字符）。
@@ -87,29 +98,70 @@ func classifyRotationCopyName(name string) rotationCopyName {
 			return rotationCopyName{kind: rotationCopyTimestamp, base: core[:len(core)-16]}
 		}
 	}
-	// timberjack：<stem>-<ts>-size.log；ts 首字符为数字（区分 caddy 与兄弟
-	// 文件 caddy-tls——后者的 stem 含 '-tls'，故逐 '-' 位置试探）。
+	// timberjack：<stem>-<ts>-size.log。stem 边界取「从右往左最后一个合法
+	// 时间戳段」——规则/任务日志基名允许含 '-<数字>'（存量/导入 ID，如
+	// lb_abc-123），按首个 '-<数字>' 切分会把副本串到同前缀的兄弟规则。
+	// 尺寸数字与兄弟文件段（-tls-/-1048576-）不构成时间戳，故不误切。
 	if strings.HasSuffix(core, "-size.log") {
 		trimmed := core[:len(core)-len("-size.log")]
-		for i := range trimmed {
+		for i := len(trimmed) - 1; i >= 0; i-- {
 			if trimmed[i] != '-' || i+1 >= len(trimmed) {
 				continue
 			}
-			if trimmed[i+1] < '0' || trimmed[i+1] > '9' {
+			if !isRotationTimestampTail(trimmed[i+1:]) {
 				continue
 			}
 			return rotationCopyName{kind: rotationCopyTimberjack, base: trimmed[:i] + ".log", stem: trimmed[:i]}
 		}
 	}
-	if core != name {
-		return rotationCopyName{kind: rotationCopyWholeGzip, base: core}
+	if gzipped {
+		// 无可识别轮转族时按整文件归档归并；碰撞后缀未命中任何族时按原始名
+		// 归并（避免把 <base>-2.gz 这类合法基名误剥成幻影基名）。
+		base := core
+		if collision {
+			base = originalCore
+		}
+		return rotationCopyName{kind: rotationCopyWholeGzip, base: base}
 	}
 	return rotationCopyName{}
 }
 
-// dirBytes 返回 path 的活跃文件大小与轮转副本合计：自研 .1..9 shift 后缀
-// （Stat 探测）与时间戳/timberjack/整文件 .gz 家族（目录枚举，复用同一分类器
-// classifyRotationCopyName）。
+// isRotationTimestampTail 判定轮转副本名里时间戳段的开头形状（其后可带
+// 尺寸/碰撞余段）：紧凑 YYYYMMDD[T|-]HHMMSS（timberjack 与运行日志族）
+// 或常规的短横线分隔形态。
+func isRotationTimestampTail(s string) bool {
+	if len(s) >= 15 && isDigits(s[:8]) && (s[8] == 'T' || s[8] == '-') && isDigits(s[9:15]) {
+		return true
+	}
+	if len(s) >= 19 && isDigits(s[:4]) && s[4] == '-' && isDigits(s[5:7]) && s[7] == '-' &&
+		isDigits(s[8:10]) && s[10] == 'T' && isDigits(s[11:13]) && s[13] == '-' && isDigits(s[14:16]) {
+		return true
+	}
+	return false
+}
+
+// stripRotationCollisionSuffix 剥掉同秒重复轮转的碰撞后缀 -N（N≥2，至多
+// 两位）：写侧在同秒重名时产出 <副本名>-2/-3…。位数上限避免误剥时间戳
+// 时刻段（-150405）。
+func stripRotationCollisionSuffix(s string) (string, bool) {
+	dash := strings.LastIndexByte(s, '-')
+	if dash <= 0 || len(s)-dash-1 == 0 || len(s)-dash-1 > 2 {
+		return "", false
+	}
+	digits := s[dash+1:]
+	if !isDigits(digits) {
+		return "", false
+	}
+	n, err := strconv.Atoi(digits)
+	if err != nil || n < 2 {
+		return "", false
+	}
+	return s[:dash], true
+}
+
+// dirBytes 返回 path 的活跃文件大小与轮转副本合计。唯一实现与聚合行共用
+// 「目录枚举 + 分类器归属」口径（移位 .N[.gz]、运行日志时间戳、timberjack、
+// 同秒碰撞后缀、整文件 .gz 全族），两套口径结构上不可能再分叉。
 func dirBytes(path string) (int64, int64, int) {
 	return dirBytesWithEntries(path, nil)
 }
@@ -117,63 +169,23 @@ func dirBytes(path string) (int64, int64, int) {
 // dirBytesWithEntries 与 dirBytes 同口径；entries 非 nil 时复用同目录的一次
 // ReadDir 结果（GetLogStats 批量任务行不再逐任务枚举整个目录）。
 func dirBytesWithEntries(path string, entries []os.DirEntry) (int64, int64, int) {
-	var active, rotated int64
-	count := 0
-	if st, err := os.Stat(path); err == nil && !st.IsDir() {
-		active = st.Size()
-	}
-	for i := 1; i <= 9; i++ {
-		if st, err := os.Stat(path + "." + strconv.Itoa(i)); err == nil {
-			rotated += st.Size()
-			count++
-		}
-	}
-	rotBytes, rotCount := timestampedRotationStatsWithEntries(path, entries)
-	rotated += rotBytes
-	count += rotCount
-	return active, rotated, count
-}
-
-func timestampedRotationStatsWithEntries(path string, entries []os.DirEntry) (int64, int) {
-	dir := filepath.Dir(path)
-	// 基名含扩展名（运行日志 path=/app/logs/lazy-balancer.log，副本是
-	// lazy-balancer.log.<ts>）；timberjack 族（caddy/rules）的副本
-	// <stem>-<ts>-size.log 按去扩展名的 stem 归并。两族共用同一分类器，
-	// 形态语法只在 classifyRotationCopyName 一处维护。
 	base := filepath.Base(path)
 	stem := strings.TrimSuffix(base, filepath.Ext(base))
-	if entries == nil {
-		var err error
-		entries, err = os.ReadDir(dir)
-		if err != nil {
-			return 0, 0
+	belongs := func(name string) bool {
+		if name == base {
+			return true
 		}
+		shape := classifyRotationCopyName(name)
+		if shape.kind == rotationCopyNone {
+			return false
+		}
+		if shape.base == base {
+			return true
+		}
+		return shape.kind == rotationCopyTimberjack && shape.stem != "" && shape.stem == stem
 	}
-	var total int64
-	var cnt int
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		shape := classifyRotationCopyName(e.Name())
-		// 移位副本 .1..9 由 dirBytesWithEntries 的 Stat 循环计入——此处再计
-		// 即双计（该族不在本枚举职责内）。
-		if shape.kind == rotationCopyNone || shape.kind == rotationCopyShift {
-			continue
-		}
-		matched := shape.base != "" && shape.base == base
-		if !matched && shape.kind == rotationCopyTimberjack {
-			matched = shape.stem != "" && shape.stem == stem
-		}
-		if !matched {
-			continue
-		}
-		if info, err := e.Info(); err == nil {
-			total += info.Size()
-			cnt++
-		}
-	}
-	return total, cnt
+	st := aggregateDirStatsWithEntries(filepath.Dir(path), entries, belongs)[base]
+	return st.Active, st.Rotated, st.RotCount
 }
 
 func isDigits(s string) bool {
@@ -186,8 +198,57 @@ func isDigits(s string) bool {
 }
 
 // logStatsReadDir 是统计面的目录枚举入口（包级 var 支持测试注入计数——
-// 断言聚合只做一次 ReadDir）。
+// 断言聚合只做一次 ReadDir；也用于注入读失败以覆盖体量留痕）。
 var logStatsReadDir = os.ReadDir
+
+// logStatsVolumeState 日志体量读取失败的状态转换去重：首报 warn、恢复补
+// info、同状态静默（面板轮询不刷屏）。ENOENT（日志尚未产生）不记——正常形态。
+var logStatsVolumeState struct {
+	sync.Mutex
+	failed map[string]bool
+}
+
+// logStatsVolumeStateCap 状态键上限（按目录/文件路径去重，防御动态路径）。
+const logStatsVolumeStateCap = 256
+
+func logStatsVolumeReadFailure(key string, err error) {
+	if err == nil || errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	logStatsVolumeState.Lock()
+	if logStatsVolumeState.failed == nil {
+		logStatsVolumeState.failed = map[string]bool{}
+	}
+	if logStatsVolumeState.failed[key] {
+		logStatsVolumeState.Unlock()
+		return
+	}
+	if len(logStatsVolumeState.failed) >= logStatsVolumeStateCap {
+		logStatsVolumeState.failed = map[string]bool{}
+	}
+	logStatsVolumeState.failed[key] = true
+	logStatsVolumeState.Unlock()
+	services.Logf("warn", "日志体量读取失败（%s）: %v", key, err)
+}
+
+func logStatsVolumeReadRecovered(key string) {
+	logStatsVolumeState.Lock()
+	if !logStatsVolumeState.failed[key] {
+		logStatsVolumeState.Unlock()
+		return
+	}
+	delete(logStatsVolumeState.failed, key)
+	logStatsVolumeState.Unlock()
+	services.Logf("info", "日志体量读取已恢复（%s）", key)
+}
+
+// resetLogStatsVolumeStateForTest 仅供测试隔离（跨用例的注入失败状态不得
+// 让后续断言的「首报」被去重成 0 条）。
+func resetLogStatsVolumeStateForTest() {
+	logStatsVolumeState.Lock()
+	logStatsVolumeState.failed = nil
+	logStatsVolumeState.Unlock()
+}
 
 // dirStats 单个基名日志文件的体量归并结果。
 type dirStats struct {
@@ -205,11 +266,22 @@ type dirStats struct {
 //     <stem>-<ts>-size.log[.gz] 副本计入所属 base 的 Rotated/RotCount；
 //   - 不归属任何匹配 base 的 .gz 按归档计入 Rotated（压缩归档不是活跃文件）。
 func aggregateDirStats(dir string, match func(name string) bool) map[string]dirStats {
+	return aggregateDirStatsWithEntries(dir, nil, match)
+}
+
+// aggregateDirStatsWithEntries 是聚合与单文件口径的唯一实现；entries 非 nil
+// 时复用调用方已枚举的目录结果。
+func aggregateDirStatsWithEntries(dir string, entries []os.DirEntry, match func(name string) bool) map[string]dirStats {
 	out := map[string]dirStats{}
-	entries, err := logStatsReadDir(dir)
-	if err != nil {
-		return out
+	if entries == nil {
+		var err error
+		entries, err = logStatsReadDir(dir)
+		if err != nil {
+			logStatsVolumeReadFailure("logstats-dir-"+dir, err)
+			return out
+		}
 	}
+	logStatsVolumeReadRecovered("logstats-dir-" + dir)
 	bases := make(map[string]struct{}, len(entries))
 	stemToBase := make(map[string]string, len(entries))
 	for _, e := range entries {
@@ -230,6 +302,7 @@ func aggregateDirStats(dir string, match func(name string) bool) map[string]dirS
 		name := e.Name()
 		info, infoErr := e.Info()
 		if infoErr != nil {
+			logStatsVolumeReadFailure("logstats-file-"+filepath.Join(dir, name), infoErr)
 			continue
 		}
 		if _, isBase := bases[name]; isBase {
@@ -822,14 +895,12 @@ func isRuleAccessLogName(name string) bool {
 	return isTaskLogFamilyName(name)
 }
 
-// isTaskLogFamilyName 任务日志文件名族：base.log[.gz] 与其 .N 移位副本
-// （聚合按 base 归并，副本必须参与匹配才能归到所属 base）。
+// isTaskLogFamilyName 任务日志文件名族：活跃文件 base.log[.gz] 与全部轮转
+// 副本形态（移位 .N[.gz]、时间戳、同秒碰撞后缀、timberjack）——副本形态
+// 判定走分类器单源，避免两处语法各自演化（.N.gz 曾在此漏判而聚合少计）。
 func isTaskLogFamilyName(name string) bool {
-	if strings.HasSuffix(name, ".log") || strings.HasSuffix(name, ".log.gz") {
+	if strings.HasSuffix(strings.TrimSuffix(name, ".gz"), ".log") {
 		return true
 	}
-	if dot := strings.LastIndexByte(name, '.'); dot > 0 && isDigits(name[dot+1:]) {
-		return strings.HasSuffix(name[:dot], ".log")
-	}
-	return false
+	return isRotationCopyShape(name)
 }

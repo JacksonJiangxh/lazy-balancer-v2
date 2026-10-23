@@ -129,16 +129,41 @@ test('写入在途时重入直接拒绝（双击只产生一次 POST）', async 
   assert.equal(adding.value, false)
 })
 
-test('写入失败返回 false 且释放重入锁（错误提示归全局拦截器）', async () => {
+test('确认框未决时重入直接拒绝（双击只叠一个确认框）', async () => {
   reset()
-  g.__post = async () => {
-    throw new Error('500')
+  const { promise, resolve } = Promise.withResolvers<unknown>()
+  let confirms = 0
+  g.__confirm = async () => {
+    confirms += 1
+    return promise
+  }
+  const posted: unknown[] = []
+  g.__post = async (url: unknown) => {
+    posted.push(url)
+    return { data: { added: true } }
+  }
+  const { adding, addIpToList } = useIpListAdd()
+  const first = addIpToList('1.2.3.4', list)
+  await tick()
+  assert.equal(adding.value, true, '确认框尚未决时锁必须已置位（原实现在确认后才置位）')
+  assert.equal(await addIpToList('1.2.3.4', list), false, '确认期间重入必须立即拒绝')
+  assert.equal(confirms, 1, '双击不得叠第二个确认框')
+  resolve(undefined)
+  assert.equal(await first, true)
+  assert.deepEqual(posted, ['/security/ip-lists/7/ips'], '只产生一次 POST')
+  assert.equal(adding.value, false)
+})
+
+test('确认框取消后释放锁（可再次发起）', async () => {
+  reset()
+  let attempts = 0
+  g.__confirm = async () => {
+    attempts += 1
+    if (attempts === 1) throw new Error('cancel')
   }
   const { adding, addIpToList } = useIpListAdd()
   assert.equal(await addIpToList('1.2.3.4', list), false)
-  assert.equal(adding.value, false)
-  assert.equal(callsOf('showSaveResult').length, 0, '失败不得弹成功/退化提示')
-  // 失败后可再次发起（锁已释放）
-  g.__post = async () => ({ data: { added: true } })
+  assert.equal(adding.value, false, '取消分支必须释放占位')
   assert.equal(await addIpToList('1.2.3.4', list), true)
+  assert.equal(attempts, 2)
 })

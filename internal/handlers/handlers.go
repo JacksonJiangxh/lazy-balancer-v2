@@ -127,6 +127,20 @@ func boolText(value bool) string {
 	return "禁用"
 }
 
+// caddyApplyFailureLabel 是应用失败横幅的状态断言（两态，单源）：
+//   - 恢复（快照重放/已提交视图重载）成功 ⇒ 「旧配置已保留」是事实；
+//   - 恢复失败 ⇒ 运行配置可能停留候选态，「旧配置已保留」会与事实相反
+//     （管理员据此判断要不要回退），必须显式降级为状态未知。
+const caddyApplyRestoreFailedLabel = "运行配置状态未知，恢复失败"
+const caddyApplyOldConfigKeptLabel = "旧配置已保留"
+
+func caddyApplyFailureLabel(restoreErr error) string {
+	if restoreErr != nil {
+		return caddyApplyRestoreFailedLabel
+	}
+	return caddyApplyOldConfigKeptLabel
+}
+
 // recordCaddyApplyResult persists the last apply outcome and leaves an audit
 // trail. Failures keep the previous Caddy config running, so the error must
 // survive restarts and async paths to stay visible to operators.
@@ -156,23 +170,33 @@ func (h *Handlers) recordCaddyApplyResult(err error) {
 		}
 		return
 	}
-	wrapped := fmt.Sprintf("Caddy 配置应用失败（旧配置已保留）：%v", err)
+	h.recordCaddyApplyFailure(err, nil)
+}
+
+// recordCaddyApplyFailure 是失败横幅/系统审计的唯一写点。restoreErr 非空
+// （恢复运行配置失败）时横幅改走「状态未知」文案——apply 错误本身可能来自
+// /load 传输失败（请求超时/响应丢失发生在 Caddy 已 provision 之后），此时
+// 断言「旧配置已保留」或「运行配置未生效」都与事实可能相反。
+func (h *Handlers) recordCaddyApplyFailure(err, restoreErr error) {
+	wrapped := fmt.Sprintf("Caddy 配置应用失败（%s）：%v", caddyApplyFailureLabel(restoreErr), err)
 	services.Logf("error", "%s", wrapped)
 	services.RecordAuditLog("system", "应用失败", "Caddy配置", wrapped, "")
 	if db.DB != nil {
-		if _, err := db.DB.Exec(`UPDATE global_config SET caddy_apply_error=? WHERE id=1`, wrapped); err != nil {
-			services.Logf("warn", "RH-2: 持久化 caddy_apply_error 失败(重启后真实失败不可见): %v", err)
+		if _, derr := db.DB.Exec(`UPDATE global_config SET caddy_apply_error=? WHERE id=1`, wrapped); derr != nil {
+			services.Logf("warn", "RH-2: 持久化 caddy_apply_error 失败(重启后真实失败不可见): %v", derr)
 		}
 	}
 }
 
-// recordCaddyApplySavedNotLive 退化提交形态（DB 已提交、运行配置未生效）的
-// 横幅写点。横幅文案两态化：本形态=「已保存但未生效」，与 recordCaddyApplyResult
-// 失败分支的「未保存（旧配置已保留）」区分——共用同一句曾被误读为「没保存」，
-// 管理员重复提交造成重复对象。本形态的业务/重载审计由调用方按操作者归因
-// 落盘，此处只写横幅事实源 + 错误日志（不再补系统级「应用失败」审计）。
+// recordCaddyApplySavedNotLive 退化提交形态（DB 已提交、运行配置可能未生效）
+// 的横幅写点。文案必须是不确定口径：触发本形态的主力是 /load 传输失败
+// （超时/连接重置/响应丢失），Caddy 可能已经 provision 成功——断言「未生效」
+// 会诱导管理员重复提交或错误回退。与 recordCaddyApplyResult 的失败分支
+// （未保存）同样两态化，避免共用一句被误读为「没保存」。
+// 本形态的业务/重载审计由调用方按操作者归因落盘，此处只写横幅事实源 + 错误
+// 日志（不再补系统级「应用失败」审计）。
 func (h *Handlers) recordCaddyApplySavedNotLive(err error) {
-	text := fmt.Sprintf("配置已保存，但 Caddy 应用失败（运行配置未生效）：%v", err)
+	text := fmt.Sprintf("配置已保存，但 Caddy 应用失败（运行配置可能未生效，请核对后重试）：%v", err)
 	services.Logf("error", "%s", text)
 	if db.DB != nil {
 		if _, derr := db.DB.Exec(`UPDATE global_config SET caddy_apply_error=? WHERE id=1`, text); derr != nil {
@@ -242,7 +266,8 @@ func (h *Handlers) applyFromTxNote(c *gin.Context, tx *sql.Tx, reloadDetail stri
 	}
 	services.Logf("info", "保存链计时: cli_validate=%dms", time.Since(cliStart).Milliseconds())
 	applyStart := time.Now()
-	if err := h.caddyService.ApplyConfigFromTx(tx, rulesWrittenInTx); err != nil {
+	appliedConfig, err := h.caddyService.ApplyConfigFromTx(tx, rulesWrittenInTx)
+	if err != nil {
 		// 审计真实性裁定（2026-09-25 用户裁定）：同字节短路=未发生真实重载——
 		// 按成功收尾但 note 不落「重载」审计（否则出现从未发生的重载记录）。
 		if services.IsSameConfig(err) {
@@ -257,6 +282,11 @@ func (h *Handlers) applyFromTxNote(c *gin.Context, tx *sql.Tx, reloadDetail stri
 		return nil, err
 	}
 	return func() {
+		// commit 成功后才写 last-known-good（事务内 apply 有意不落盘）：
+		// 本闭包在全部调用点都只在 tx.Commit() 成功返回后执行——LKG 的语义
+		// 因此恒为「已提交且已下发」的配置，进程中断窗口不再把从未提交的
+		// 候选固化成启动兜底。
+		h.caddyService.PersistLastGoodBytesInLock(appliedConfig)
 		// 2026-09-07：成功重载后清除既往失败标记（对齐 finishTxApply
 		// 成功分支与 UpdateConfig/PutCaddyConfig 的口径——规则×5 不清
 		// 陈旧 caddy_apply_error 会导致横幅长亮）。
@@ -356,7 +386,7 @@ func (h *Handlers) finishTxApply(c *gin.Context, tx *sql.Tx, f txApplyFinish) {
 		if restoreErr != nil {
 			joined = errors.Join(applyErr, fmt.Errorf("回滚到已提交运行配置失败: %w", restoreErr))
 		}
-		h.recordCaddyApplyResult(joined)
+		h.recordCaddyApplyFailure(joined, restoreErr)
 		recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail("Caddy 应用失败且 CLI 校验不可用", joined.Error(), services.AuditResultPart("failure")))
 		restoreNote := "已回滚到已提交运行配置"
 		if restoreErr != nil {
@@ -760,8 +790,15 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 		return fmt.Errorf("无效的 DNS 协议栈 '%s'（仅支持 ipv4、ipv6 或 both）", data.DnsFamily)
 	}
 
-	if err := validateRuleHealthCheckPath(data.HealthCheckPath); err != nil {
-		return err
+	// 健康检查路径只在主动健康检查启用时被渲染消费（caddy.go 的
+	// health_checks.active 块）——未启用时属死字段，不参与形状校验：否则
+	// 存量死组合（enable=0 + path 无前导 /）的任何无关编辑恒 400，且新建与
+	// 更新的校验/清零先后顺序会给出不同结果。健康检查域名仍无条件走形状门
+	// （畸形值在任何状态下都不得落库）。
+	if data.EnableActiveHealthCheck {
+		if err := validateRuleHealthCheckPath(data.HealthCheckPath); err != nil {
+			return err
+		}
 	}
 
 	// 健康检查域名（2026-10-10）：probe 的 Host 头（health_checks.active.headers.

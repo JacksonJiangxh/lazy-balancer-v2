@@ -105,6 +105,10 @@
           <div v-if="activeNode === 'stage0'" class="flow-panel tl-panel">
             <template v-if="stageZero">
             <div class="flow-panel-head"><span class="flow-panel-title">{{ stageZero.title }}</span></div>
+            <div v-if="detailFailedSources.length > 0" class="flow-detail-line">
+              部分明细加载失败（{{ detailFailedSources.join('、') }}）
+              <el-button link type="warning" size="small" @click="ensureDetails(true)">重试</el-button>
+            </div>
             <div
               v-for="group in stageZero.groups"
               :key="group.key"
@@ -116,7 +120,7 @@
                 <span class="flow-policy-name" :title="group.name">{{ group.name }}</span>
                 <el-tag v-if="!group.enabled" type="info" size="small" effect="plain">已禁用</el-tag>
                 <el-button
-                  v-if="groupHasDetails(group)"
+                  v-if="groupHasDetails(group) || detailFailedSources.length > 0"
                   link
                   type="primary"
                   size="small"
@@ -134,7 +138,6 @@
               </div>
               <el-collapse-transition>
                 <div v-if="expandedPolicyKey === `0:${group.key}`" class="flow-policy-details">
-                  <div v-if="detailFailedSources.includes('引用名单条目')" class="flow-detail-line">引用名单条目加载失败，以下明细可能不完整（可收起重开重试）</div>
                   <template v-if="group.details?.trustEntries">
                     <div class="flow-detail-block-title">信任名单（{{ group.details.trustEntries.length }} 条{{ group.details.trustEntries.length > 200 ? '，仅显示前 200 条' : '' }}）</div>
                     <div v-for="entry in group.details.trustEntries.slice(0, 200)" :key="`trust:${entry.value}`" class="flow-detail-entry">
@@ -162,6 +165,10 @@
                 <el-tag v-else-if="typedStageByKey(node.key)!.stage !== 2" type="info" size="small" effect="plain">拦截页跟随策略</el-tag>
                 <el-tag v-if="!typedStageByKey(node.key)!.enabled" type="info" size="small" effect="plain">未启用</el-tag>
               </div>
+              <div v-if="detailFailedSources.length > 0" class="flow-detail-line">
+                部分明细加载失败（{{ detailFailedSources.join('、') }}）
+                <el-button link type="warning" size="small" @click="ensureDetails(true)">重试</el-button>
+              </div>
               <div v-if="stageStatsText(typedStageByKey(node.key)!.stage)" class="flow-panel-stats">{{ stageStatsText(typedStageByKey(node.key)!.stage) }}</div>
               <template v-if="typedStageByKey(node.key)!.enabled">
                 <div
@@ -176,7 +183,7 @@
                     <el-tag v-if="policyTypeOf(group.key) === 'mixed'" type="warning" size="small" effect="plain">混合</el-tag>
                     <el-tag v-if="!group.enabled" type="info" size="small" effect="plain">已禁用</el-tag>
                     <el-button
-                      v-if="groupHasDetails(group)"
+                      v-if="groupHasDetails(group) || detailFailedSources.length > 0"
                       link
                       type="primary"
                       size="small"
@@ -239,7 +246,6 @@
                         </template>
                       </template>
                       <div v-else class="flow-detail-line">该阶段此策略无更多明细</div>
-                      <div v-if="detailFailedSources.length > 0" class="flow-detail-line">部分明细加载失败（{{ detailFailedSources.join('、') }}），可收起重开重试</div>
                     </div>
                   </el-collapse-transition>
                 </div>
@@ -361,7 +367,7 @@ import type { APIResponse } from '@/types'
 import type { RuleFlowPathRule } from '@/types/rules'
 import { hostPortKey } from '@/utils/upstreamKeys'
 import { weightPercent } from '@/utils/upstreamWeights'
-import { STAGE_TITLES, attachStageDetails, formatDurationUs, inferPolicyType, mergeIpEntries, parseIPList, parseRefIds, stage1FootnoteText, stageSubLabel } from '@/utils/securityStages'
+import { STAGE_TITLES, attachStageDetails, formatDurationUs, inferPolicyType, mergeIpEntries, parseIPList, parseRefIds, stage1FootnoteText, stageSubLabel, trustHitMode } from '@/utils/securityStages'
 import { useCountryNamesCn, countryLabel } from '@/composables/useCountryNamesCn'
 import type {
   CrsRuleFileOption,
@@ -484,10 +490,13 @@ const stageZero = computed<StageZeroPanel | undefined>(() => {
 const typedStagePanels = computed<StageGroup[]>(() => (displayModel.value?.stages ?? []).filter((s) => s.stage !== 0))
 const typedStageByKey = (key: string): StageGroup | undefined => typedStagePanels.value.find((s) => `stage${s.stage}` === key)
 
-// 阶段 0 导航副标题按该规则 stage0 策略的实际模式聚合：全直通/全保留检测/混合
+// 阶段 0 导航副标题按该规则 stage0 策略的实际信任命中模式聚合：全直通/全保留检测/混合
 const stageZeroSubtitle = computed(() => {
   if (!stageZero.value) return ''
-  const states = stageZero.value.groups.map((g) => props.policies.find((p) => p.id === g.key)?.trust_detection === true)
+  const states = stageZero.value.groups.map((g) => {
+    const policy = props.policies.find((p) => p.id === g.key)
+    return trustHitMode(policy?.policy_type, policy?.trust_detection) === 'detection'
+  })
   // 空数组时 every(Boolean) 恒真会误报「保留检测记录」：阶段 0 已启用但未绑定
   // 任何名单/策略时，副标题按「未启用」呈现（不暗示存在检测保留语义）。
   if (states.length === 0) return '未启用'
@@ -531,8 +540,10 @@ const fetchAllCrsRuleFiles = async (): Promise<CrsRuleFileOption[]> => {
   return all
 }
 
-const ensureDetails = async (): Promise<void> => {
-  if (detailsAttached.value || detailLoading.value) return
+const ensureDetails = async (force = false): Promise<void> => {
+  // force=用户点「重试」：即使已附着（部分源失败）也重拉；在途请求不叠加。
+  if (detailLoading.value) return
+  if (detailsAttached.value && !force) return
   const seq = ++detailsSeq
   detailFailedSources.value = []
   detailLoading.value = true
@@ -587,6 +598,8 @@ const ensureDetails = async (): Promise<void> => {
     // 锁死在「明细按钮缺失且不可重试」且 silent 请求零反馈；保持可重试（下次点击
     // 重新拉取）并显式提示一次；部分成功仍置 attached（可用数据降级展示，保持现状语义）
     if (policyRes.status === 'rejected' && customRes.status === 'rejected' && crsRes.status === 'rejected') {
+      // 全源失败同样保留失败位：面板级说明与「明细」按钮据此恒可见（可重试）。
+      detailFailedSources.value = failedSources
       ElMessage.warning('明细数据加载失败，可重试')
       return
     }

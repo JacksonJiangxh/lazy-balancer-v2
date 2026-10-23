@@ -6,6 +6,7 @@ package handlers
 // 仅属 http 侧，TCP 三字段无哨兵语义，负值一律拒。
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -21,21 +22,27 @@ func TestValidateRuleFeatures_rejectsNegativeTcpFields(t *testing.T) {
 		}
 	}
 
-	// 目标形状：三字段各自 -1 → 拒绝
+	// 目标形状：三字段各自 -1 → 拒绝，且文案点名对应字段族
+	//（只断 err != nil 无法区分「被正确字段的校验拒绝」与「被别的规则误拦」）。
 	negativeCases := []struct {
-		name   string
-		mutate func(*ruleFeatureInput)
+		name      string
+		mutate    func(*ruleFeatureInput)
+		wantError string
 	}{
-		{"tcp_health_check_port", func(i *ruleFeatureInput) { i.TCPHealthCheckPort = -1 }},
-		{"tcp_try_duration", func(i *ruleFeatureInput) { i.TCPTryDuration = -1 }},
-		{"tcp_try_interval", func(i *ruleFeatureInput) { i.TCPTryInterval = -1 }},
+		{"tcp_health_check_port", func(i *ruleFeatureInput) { i.TCPHealthCheckPort = -1 }, "健康检查端口"},
+		{"tcp_try_duration", func(i *ruleFeatureInput) { i.TCPTryDuration = -1 }, "重试时长/间隔"},
+		{"tcp_try_interval", func(i *ruleFeatureInput) { i.TCPTryInterval = -1 }, "重试时长/间隔"},
 	}
 	for _, tc := range negativeCases {
 		t.Run(tc.name, func(t *testing.T) {
 			input := base()
 			tc.mutate(&input)
-			if err := validateRuleFeatures(input); err == nil {
+			err := validateRuleFeatures(input)
+			if err == nil {
 				t.Fatalf("negative %s must be rejected, got nil error", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("negative %s error=%q, want 含 %q", tc.name, err, tc.wantError)
 			}
 		})
 	}

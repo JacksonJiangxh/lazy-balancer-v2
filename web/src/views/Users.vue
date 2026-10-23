@@ -32,7 +32,7 @@
           </div>
         </div>
       </template>
-      <el-form :model="form" label-width="90px" :disabled="isReadOnly || submitting">
+      <el-form :model="form" label-width="90px" :disabled="(isReadOnly && !editingSelf) || submitting">
         <!-- 2026-09-19 用户裁定布局:左列 用户名/显示名称/角色;右列 密码组
              (编辑=新密码+确认新密码,创建=密码+确认密码);OIDC 用户右列示数据来源 -->
         <el-row :gutter="16">
@@ -45,7 +45,7 @@
               <el-input v-else :model-value="form.display_name" disabled />
             </el-form-item>
             <el-form-item label="角色">
-              <el-select v-model="form.role" style="width: 100%">
+              <el-select v-model="form.role" style="width: 100%" :disabled="editingSelf">
                 <el-option label="管理员" value="admin">
                   <el-tag type="danger" size="small">管理员</el-tag>
                 </el-option>
@@ -149,9 +149,9 @@
             <!-- 每行只显示一个必要 MFA 操作——操作即状态（2026-09-21 用户裁定）：
                  本人本地未启用 → 启用 MFA；其余 → 重置 MFA（禁用原因 hover 透出：
                  OIDC 提供商管理 / 该用户未启用 / 只读） -->
-            <el-tooltip v-if="!row.mfa_enabled && row.id === authStore.user?.id && row.auth_provider !== 'oidc'" :disabled="!isReadOnly" :content="readOnlyMessage">
+            <el-tooltip v-if="!row.mfa_enabled && isSelfRow(row) && row.auth_provider !== 'oidc'" :disabled="!selfServiceBlocked" :content="readOnlyMessage">
               <div>
-                <el-button type="success" link size="small" :disabled="isReadOnly || nodeModeSlave || submitting" @click="openMfaBinding(row)">
+                <el-button type="success" link size="small" :disabled="selfServiceBlocked || submitting" @click="openMfaBinding(row)">
                   启用 MFA
                 </el-button>
               </div>
@@ -168,14 +168,28 @@
         <el-table-column label="操作" width="200" fixed="right" align="center">
           <template #default="{ row }">
             <div class="operation-buttons">
-            <el-tooltip :disabled="!isReadOnly" :content="readOnlyMessage">
+            <el-tooltip v-if="isSelfRow(row) && !isAdmin" :disabled="!selfServiceBlocked" :content="readOnlyMessage">
+              <div>
+                <el-button type="primary" link size="small" :disabled="selfServiceBlocked || submitting" @click="editUser(row)">
+                  编辑
+                </el-button>
+              </div>
+            </el-tooltip>
+            <el-tooltip v-else :disabled="!isReadOnly" :content="readOnlyMessage">
               <div>
                 <el-button type="primary" link size="small" :disabled="isReadOnly || submitting" @click="editUser(row)">
                   编辑
                 </el-button>
               </div>
             </el-tooltip>
-            <el-tooltip :disabled="!isReadOnly && row.auth_provider !== 'oidc'" :content="row.auth_provider === 'oidc' ? 'OIDC 用户的密码由身份提供商管理' : readOnlyMessage">
+            <el-tooltip v-if="isSelfRow(row) && !isAdmin" :disabled="!selfServiceBlocked && row.auth_provider !== 'oidc'" :content="row.auth_provider === 'oidc' ? 'OIDC 用户的密码由身份提供商管理' : readOnlyMessage">
+              <div>
+                <el-button type="warning" link size="small" :disabled="selfServiceBlocked || row.auth_provider === 'oidc'" @click="resetPassword(row.id)">
+                  重置密码
+                </el-button>
+              </div>
+            </el-tooltip>
+            <el-tooltip v-else :disabled="!isReadOnly && row.auth_provider !== 'oidc'" :content="row.auth_provider === 'oidc' ? 'OIDC 用户的密码由身份提供商管理' : readOnlyMessage">
               <div>
                 <el-button type="warning" link size="small" :disabled="isReadOnly || row.auth_provider === 'oidc' || submittingUserId === row.id || operatingUserIds.has(row.id) || switchingIds.has(row.id)" @click="resetPassword(row.id)">
                   重置密码
@@ -329,6 +343,9 @@ const fetchOIDCStatus = async () => {
 
 const authStore = useAuthStore()
 const isReadOnly = computed(() => authStore.readOnlyReason !== null)
+const isAdmin = computed(() => authStore.user?.role === 'admin')
+const isSelfRow = (row: UserListItem): boolean => row.id === authStore.user?.id
+const selfServiceBlocked = computed(() => authStore.readOnlyReason === 'slave' || authStore.readOnlyReason === 'unknown')
 const users = ref<UserListItem[]>([])
 // 列表加载失败与真实空列表不可区分 → 显性错误态 + 重试
 const loadError = ref(false)
@@ -357,6 +374,7 @@ const openCreateForm = () => {
   showForm.value = true
 }
 const editingIsOIDC = computed(() => editingUser.value?.auth_provider === 'oidc')
+const editingSelf = computed(() => editingUser.value !== null && editingUser.value.id === authStore.user?.id && !isAdmin.value)
 const editingUser = ref<UserListItem | null>(null)
 const switchingIds = ref(new Set<number>())
 let usersRequestSeq = 0
@@ -391,7 +409,7 @@ const fetchUsers = async () => {
 }
 
 const handleSubmit = async () => {
-  if (isReadOnly.value || submitting.value) return
+  if ((isReadOnly.value && !editingSelf.value) || submitting.value) return
   // 用户名前置校验（对齐后端 CreateUser/UpdateUser 的 min=3,max=50、
   // 字符集 ^[a-z][a-z0-9]*$ 与 Login.vue setup 口径）——创建必填；编辑态按
   // 后端 usernameChanged 口径（users.go：仅实际改名才过策略，OIDC 行由 IdP
@@ -426,19 +444,19 @@ const handleSubmit = async () => {
   submitting.value = true
   try {
     if (editingUser.value) {
-      const editingSelf = editingUser.value.id === authStore.user?.id
+      const editingSelfRow = editingUser.value.id === authStore.user?.id
       // OIDC 用户的 username/display_name/password 源自 IdP(后端守卫必 400)——
       // 管理员编辑仅提交本地管理语义字段(角色),undefined 不会被序列化。
       const oidcTarget = editingUser.value.auth_provider === 'oidc'
       await request.put(`/users/${editingUser.value.id}`, {
         username: oidcTarget ? undefined : form.value.username,
-        role: form.value.role,
+        role: editingSelf.value ? undefined : form.value.role,
         display_name: oidcTarget ? undefined : form.value.display_name,
         password: oidcTarget ? undefined : (form.value.password || undefined),
       })
       // admin 编辑本人行且提交了密码：同，干净登出替代死 token 误报。
-      if (editingSelf && form.value.password) {
-        authStore.showToast('success', '密码已修改，请重新登录')
+      if (editingSelfRow && form.value.password) {
+        authStore.showToast('success', '密码已重置，请重新登录')
         await authStore.logout()
         return
       }
@@ -466,14 +484,11 @@ const handleSubmit = async () => {
   fetchUsers()
 }
 
-const nodeModeSlave = computed(() => authStore.isSlaveNode)
 
 const editUser = (user: UserListItem) => {
-  // 2026-09-19 用户裁定（覆盖六次）：非管理员只读范围含用户认证页——
-  // 不允许编辑任何行（含本人），修改密码/个人资料只走右上角个人资料弹框；
-  // 编辑表单（含其密码字段=重置语义，不验当前密码）为管理员专属，统一走
-  // admin PUT 端点。
-  if (isReadOnly.value || submitting.value) return
+  // 非管理员仅可编辑本人行（重置语义，不验当前密码）；他人行仍只读。
+  const isSelf = user.id === authStore.user?.id
+  if ((isReadOnly.value && !isSelf) || submitting.value) return
   // 复审回归修复：编辑必须置 editingUser，否则 handleSubmit 走 POST 误建用户
   editingUser.value = user
   form.value = {
@@ -494,7 +509,8 @@ const closeForm = () => {
 }
 
 const deleteUser = async (id: number) => {
-  if (isReadOnly.value || submittingUserId.value === id || operatingUserIds.value.has(id) || switchingIds.value.has(id)) return
+  const isSelfReset = id === authStore.user?.id
+  if ((isReadOnly.value && !isSelfReset) || submittingUserId.value === id || operatingUserIds.value.has(id) || switchingIds.value.has(id)) return
   operatingUserIds.value.add(id)
   try {
     await ElMessageBox.confirm('确定要删除这个用户吗？', '警告', { type: 'warning' })
@@ -585,7 +601,8 @@ function lbConfirm() {
 }
 
 const resetPassword = async (id: number) => {
-  if (isReadOnly.value || submittingUserId.value === id || operatingUserIds.value.has(id) || switchingIds.value.has(id)) return
+  const isSelfReset = id === authStore.user?.id
+  if ((isReadOnly.value && !isSelfReset) || submittingUserId.value === id || operatingUserIds.value.has(id) || switchingIds.value.has(id)) return
   operatingUserIds.value.add(id)
   const isSelf = id === authStore.user?.id
   // 2026-09-19 用户裁定:重置密码为管理员专属(经用户管理端点重置任意用户含
@@ -709,7 +726,7 @@ const mfaBindingClosed = () => {
 const openMfaBinding = async (row: UserListItem): Promise<void> => {
   // 与 resetMfa/resetPassword 同款函数级纵深守卫（按钮已禁用；此处防
   // 后续调用方绕过）。是否向非管理员放行自助绑定属产品裁定（见 fix 报告）。
-  if (isReadOnly.value || mfaBinding.value.loading) return
+  if (selfServiceBlocked.value || mfaBinding.value.loading) return
   try {
     const res = await request.post<APIResponse<{ secret: string; uri: string }>>('/auth/mfa/setup', {}, { silent: true })
     if (!res.data) return
@@ -731,7 +748,7 @@ const openMfaBinding = async (row: UserListItem): Promise<void> => {
 const activateMfa = async (): Promise<void> => {
   // 按钮已按 6 位禁用（原实现在不足 6 位时静默 no-op，用户以为页面卡住）；
   // 函数内保留短路作为纵深兜底（脚本/键盘直触路径）。
-  if (isReadOnly.value || mfaBinding.value.code.length !== 6 || mfaBinding.value.loading) return
+  if (selfServiceBlocked.value || mfaBinding.value.code.length !== 6 || mfaBinding.value.loading) return
   mfaBinding.value.loading = true
   try {
     const res = await request.post<APIResponse<{ recovery_codes: string[] }>>('/auth/mfa/activate', { code: mfaBinding.value.code }, { silent: true })

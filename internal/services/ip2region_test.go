@@ -214,25 +214,97 @@ func Test_LookupRegion_empty_without_loaded_database(t *testing.T) {
 }
 
 func Test_InitIP2Region_copies_distribution_xdb_when_live_missing(t *testing.T) {
-	// Given only the distribution copy exists
+	for _, tc := range []struct {
+		name     string
+		master   bool
+		wantLive bool
+	}{
+		{name: "master copies dist into live", master: true, wantLive: true},
+		{name: "slave loads dist read-only without touching live", master: false, wantLive: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setupSecurityEnumTestDB(t)
+			if !tc.master {
+				if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
+					t.Fatalf("set slave role: %v", err)
+				}
+			}
+			// Given only the distribution copy exists
+			dir := t.TempDir()
+			live := filepath.Join(dir, "ip2region.xdb")
+			dist := filepath.Join(dir, "waf.dist", "ip2region.xdb")
+			if err := os.MkdirAll(filepath.Dir(dist), 0755); err != nil {
+				t.Fatal(err)
+			}
+			writeTestXDB(t, dist, testSegments)
+			withIP2RegionPaths(t, live, dist)
+
+			// When initialized
+			InitIP2Region()
+
+			if tc.wantLive {
+				// Then the live copy exists and lookups work
+				if _, err := os.Stat(live); err != nil {
+					t.Fatalf("live xdb not copied from distribution: %v", err)
+				}
+			} else {
+				// 从节点：live 由集群同步治理，本地补齐会与主端声明打架——
+				// 文件、派生缓存、版本行一律不落盘，但查询必须可用。
+				if _, err := os.Stat(live); !os.IsNotExist(err) {
+					t.Fatalf("从节点不得写 live 文件（stat err=%v）", err)
+				}
+				if _, err := os.Stat(live + ".provinces.json"); !os.IsNotExist(err) {
+					t.Fatalf("从节点不得写派生缓存（stat err=%v）", err)
+				}
+				if v, _ := GetIP2RegionVersion(); v == "bundled" {
+					t.Fatal("从节点不得写版本行标识（bundled 属主节点本地修复产物）")
+				}
+			}
+			if got := Lookup("1.2.3.1"); got != "US" {
+				t.Fatalf("Lookup after dist load=%q, want US", got)
+			}
+		})
+	}
+}
+
+// 从节点（is_master=0）遇到损坏 live 库：不得以 dist 覆盖（文件/版本行/
+// sidecar 由集群同步治理），但必须只读装载镜像库供本地查询——否则面板归属地
+// 全空且地域拦截静默失效。
+func Test_InitIP2Region_slaveKeepsCorruptLiveAndLoadsDistReadOnly(t *testing.T) {
+	setupSecurityEnumTestDB(t)
+	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
+		t.Fatalf("set slave role: %v", err)
+	}
 	dir := t.TempDir()
 	live := filepath.Join(dir, "ip2region.xdb")
 	dist := filepath.Join(dir, "waf.dist", "ip2region.xdb")
-	if err := os.MkdirAll(filepath.Dir(dist), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dist), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	writeTestXDB(t, dist, testSegments)
+	const corrupt = "corrupt-half-written-xdb"
+	if err := os.WriteFile(live, []byte(corrupt), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	withIP2RegionPaths(t, live, dist)
 
-	// When initialized
 	InitIP2Region()
 
-	// Then the live copy exists and lookups work
-	if _, err := os.Stat(live); err != nil {
-		t.Fatalf("live xdb not copied from distribution: %v", err)
+	if got := Lookup("1.2.3.100"); got != "US" {
+		t.Fatalf("从节点损坏 live 未只读装载 dist: Lookup=%q, want US", got)
 	}
-	if got := Lookup("1.2.3.1"); got != "US" {
-		t.Fatalf("Lookup after dist copy=%q, want US", got)
+	raw, err := os.ReadFile(live)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != corrupt {
+		t.Fatal("从节点不得覆盖损坏的 live 库（等待集群同步自愈）")
+	}
+	if _, err := os.Stat(live + ".version"); !os.IsNotExist(err) {
+		t.Fatalf("从节点不得写 .version sidecar（stat err=%v）", err)
+	}
+	if v, _ := GetIP2RegionVersion(); v == "bundled" {
+		t.Fatal("从节点不得写版本行标识（bundled 属主节点本地修复产物）")
 	}
 }
 

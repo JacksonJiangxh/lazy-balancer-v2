@@ -13,6 +13,11 @@ package services
 //   AutobanIsMaster 导出（/status is_master 数据源，与调度门同源）。
 
 import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"errors"
+	"strings"
 	"testing"
 
 	"lazy-balancer-v2/internal/db"
@@ -161,6 +166,96 @@ func TestAutobanIsMaster_exportsSchedulerRole(t *testing.T) {
 	if AutobanIsMaster() {
 		t.Fatal("缝覆写后应如实反映（同源）")
 	}
+}
+
+// Given 已启用且调度开启，但 global_config 的 autoban_enabled 读取瞬时失败
+// （角色读/引擎写行仍正常）。
+// When Run 体业务门读取启用状态。
+// Then 按失败返回（错误点名读库失败）且**不停环**——瞬时读错误不得把已启用
+// 任务永久停调度（启用状态不可判定 ≠ 未启用）；DB 恢复后下一轮照常执行。
+func TestAutobanRunGate_enabledReadFailureKeepsLoopOn(t *testing.T) {
+	te := installAutobanEngineFixture(t)
+	setAutobanConfigRaw(t, true, 1, 5, "1h", "all", true)
+	te.StartLoop(AutobanTaskID)
+	if m, _ := te.Lookup(AutobanTaskID); !m.LoopOn {
+		t.Fatal("前置：调度应已开启")
+	}
+
+	orig := db.DB
+	db.DB = openAutobanEnabledFailingDB(t)
+	// LIFO：本清理先于夹具清理执行，恢复真实库后再 StopTaskEngine/db.Close。
+	t.Cleanup(func() { db.DB = orig })
+
+	err := RunAutobanCycle(taskengine.RunContext{Trigger: "manual"})
+	if err == nil || !strings.Contains(err.Error(), "启用状态") {
+		t.Fatalf("读库失败必须按失败返回并点名启用状态读取，err=%v", err)
+	}
+	if m, _ := te.Lookup(AutobanTaskID); !m.LoopOn {
+		t.Fatal("启用状态不可判定不得停环（瞬时读错误不得永久停调度）")
+	}
+
+	// 恢复真实 DB：下一轮照常执行（不停环后无需外部事件即可自愈）。
+	db.DB = orig
+	if err := RunAutobanCycle(taskengine.RunContext{Trigger: "auto"}); err != nil {
+		t.Fatalf("DB 恢复后正常轮不得被门拦: %v", err)
+	}
+	if m, _ := te.Lookup(AutobanTaskID); !m.LoopOn {
+		t.Fatal("恢复后调度应保持开启")
+	}
+}
+
+// openAutobanEnabledFailingDB 打开同一 sqlite 文件、仅让
+// 「SELECT ... autoban_enabled ...」查询失败的连接（角色读/引擎写行正常）。
+// 真实驱动包装（而非恒失败驱动）：证明修复点是启用状态的读错误分类，
+// 不是让整个 DB 不可用。
+func openAutobanEnabledFailingDB(t *testing.T) *sql.DB {
+	t.Helper()
+	var path string
+	if err := db.DB.QueryRow(`SELECT file FROM pragma_database_list WHERE name='main'`).Scan(&path); err != nil {
+		t.Fatalf("读取主库路径: %v", err)
+	}
+	wrapped := sql.OpenDB(autobanEnabledFailConnector{inner: dsnConnector{drv: db.DB.Driver(), dsn: path}})
+	t.Cleanup(func() { _ = wrapped.Close() })
+	return wrapped
+}
+
+type dsnConnector struct {
+	drv driver.Driver
+	dsn string
+}
+
+func (c dsnConnector) Connect(context.Context) (driver.Conn, error) { return c.drv.Open(c.dsn) }
+func (c dsnConnector) Driver() driver.Driver                        { return c.drv }
+
+type autobanEnabledFailConnector struct{ inner driver.Connector }
+
+func (c autobanEnabledFailConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	conn, err := c.inner.Connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &autobanEnabledFailConn{Conn: conn}, nil
+}
+
+func (c autobanEnabledFailConnector) Driver() driver.Driver { return c.inner.Driver() }
+
+type autobanEnabledFailConn struct{ driver.Conn }
+
+func (c *autobanEnabledFailConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	if strings.Contains(query, "autoban_enabled") {
+		return nil, errors.New("注入的启用状态读失败")
+	}
+	if qc, ok := c.Conn.(driver.QueryerContext); ok {
+		return qc.QueryContext(ctx, query, args)
+	}
+	return nil, driver.ErrSkip
+}
+
+func (c *autobanEnabledFailConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	if ec, ok := c.Conn.(driver.ExecerContext); ok {
+		return ec.ExecContext(ctx, query, args)
+	}
+	return nil, driver.ErrSkip
 }
 
 // seedPresetEntriesForTest 直接覆写预置名单条目（本文件专用，避免与既有

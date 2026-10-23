@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -59,7 +60,7 @@ func TestGetSecurityEventToastSummary_groupsAllEventsSinceCursor(t *testing.T) {
 	// 从基线游标扫描：120 条必须聚合为一组 count=120（不按最新窗口截断）。
 	second := httptest.NewRecorder()
 	router.ServeHTTP(second, httptest.NewRequest(http.MethodGet,
-		"/security/events/toast-summary?since_id="+itoa(baselineID), nil))
+		"/security/events/toast-summary?since_id="+strconv.FormatInt(baselineID, 10), nil))
 	var payload struct {
 		Data struct {
 			Groups []struct {
@@ -113,7 +114,7 @@ func TestGetSecurityEventToastSummary_capsAggregationAtDefaultBudget(t *testing.
 	router.GET("/security/events/toast-summary", h.GetSecurityEventToastSummary)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet,
-		"/security/events/toast-summary?since_id="+itoa(baselineID)+"&limit=5", nil))
+		"/security/events/toast-summary?since_id="+strconv.FormatInt(baselineID, 10)+"&limit=5", nil))
 	var payload struct {
 		Data struct {
 			Groups []struct {
@@ -128,29 +129,13 @@ func TestGetSecurityEventToastSummary_capsAggregationAtDefaultBudget(t *testing.
 	if len(payload.Data.Groups) != 1 || payload.Data.Groups[0].Count != 1200 {
 		t.Fatalf("groups=%+v, want one group count=1200（默认 400/s×3s 上限）", payload.Data.Groups)
 	}
-	if payload.Data.NextID == baselineID {
-		t.Fatalf("next_id 未推进")
+	var maxEventID int64
+	if err := db.MetricsDB.QueryRow(`SELECT COALESCE(MAX(id),0) FROM security_events`).Scan(&maxEventID); err != nil {
+		t.Fatal(err)
 	}
-}
-
-func itoa(v int64) string {
-	if v == 0 {
-		return "0"
+	// 超限时只聚合最新 1200 条但游标必须推进到库内最大事件 id（跳过更老的
+	// 展示），否则下次轮询会重复扫描同一批积压。
+	if payload.Data.NextID != maxEventID {
+		t.Fatalf("next_id=%d, want MAX(id)=%d（超限也必须推进到库尾）", payload.Data.NextID, maxEventID)
 	}
-	negative := v < 0
-	if negative {
-		v = -v
-	}
-	var buf [20]byte
-	i := len(buf)
-	for v > 0 {
-		i--
-		buf[i] = byte('0' + v%10)
-		v /= 10
-	}
-	if negative {
-		i--
-		buf[i] = '-'
-	}
-	return string(buf[i:])
 }

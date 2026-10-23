@@ -31,7 +31,7 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import { libraryScheduleError } from '@/utils/securityLibraries'
+import { libraryScheduleError, scheduleEditUntouched } from '@/utils/securityLibraries'
 
 // 规则库（CRS/IP2Region/威胁情报库）更新弹框共享的「定时更新」卡片区：
 // 星期多选（1=周一…7=周日）+ HH:MM 时间，保存即由后端重排下次更新。
@@ -62,9 +62,10 @@ const editTime = ref(props.time || '04:00')
 // 保存成功后父级刷新库信息 → props 变化时回填（不覆盖用户未保存的编辑：
 // 仅当与父级值一致时才同步——编辑中父级轮询刷新不丢输入）
 watch(() => [props.days, props.time] as const, ([days, time], prev) => {
-  const prevDays = prev?.[0] ?? []
-  const prevTime = prev?.[1] ?? ''
-  const untouched = editDays.value.join() === prevDays.join() && editTime.value === (prevTime || '04:00')
+  const untouched = scheduleEditUntouched(
+    { days: editDays.value, time: editTime.value },
+    { days: prev?.[0] ?? [], time: prev?.[1] ?? '' },
+  )
   if (untouched) {
     editDays.value = [...days]
     editTime.value = time || '04:00'

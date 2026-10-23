@@ -175,14 +175,18 @@ func (h *Handlers) ToggleSystemTask(c *gin.Context) {
 				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "该任务由对应业务页开关控制，请在业务页修改自动更新设置"})
 				return
 			}
+			// 用户显式启停落节点本地偏好（重启后不得按默认清单复活）。
+			// 先持久化再切换内存态：写失败时调度状态必须原样保留并响亮
+			// 500——此前先切换再吞 WARN，响应仍 200 且偏好零行，重启后按
+			// 默认清单复活与用户意图相反。
+			if err := services.RecordTaskLoopPref(id, *req.Enabled); err != nil {
+				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "任务调度偏好保存失败，调度状态未改变：" + err.Error()})
+				return
+			}
 			if *req.Enabled {
 				te.StartLoop(id)
 			} else {
 				te.StopLoop(id)
-			}
-			// 用户显式启停落节点本地偏好（重启后不得按默认清单复活）。
-			if err := services.RecordTaskLoopPref(id, *req.Enabled); err != nil {
-				services.Logf("warn", "任务调度偏好写入失败（%s）: %v", id, err)
 			}
 			if *req.Enabled {
 				recordAudit(c, "恢复", "任务监控", m.Name+" 调度")
@@ -261,6 +265,13 @@ func (h *Handlers) ControlSystemTask(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "该任务不支持启停（角色驱动或纯被动循环）"})
 		return
 	}
+	// 用户显式启停落节点本地偏好；restart 的终态为运行。与 toggle 同口径：
+	// 先持久化再动作——写失败即 500 且内存态不动（否则「已重启」是假信号，
+	// 重启后偏好仍是旧值）。
+	if err := services.RecordTaskLoopPref(id, req.Action != "stop"); err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "任务调度偏好保存失败，调度状态未改变：" + err.Error()})
+		return
+	}
 	switch req.Action {
 	case "start":
 		te.StartLoop(id)
@@ -269,10 +280,6 @@ func (h *Handlers) ControlSystemTask(c *gin.Context) {
 	case "restart":
 		te.StopLoop(id)
 		te.StartLoop(id)
-	}
-	// 用户显式启停落节点本地偏好；restart 的终态为运行。
-	if err := services.RecordTaskLoopPref(id, req.Action != "stop"); err != nil {
-		services.Logf("warn", "任务调度偏好写入失败（%s）: %v", id, err)
 	}
 	switch req.Action {
 	case "start":
@@ -321,6 +328,13 @@ func (h *Handlers) certJobRunHistory(c *gin.Context, taskID string) {
 	jobID, err := strconv.Atoi(strings.TrimPrefix(taskID, "cert-job:"))
 	if err != nil || jobID <= 0 {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Invalid job ID"})
+		return
+	}
+	// 库句柄缺失属「服务暂不可用」而非任务不存在——与 requireMasterNode
+	// 的角色读失败同口径 500；裸用 db.DB 会 nil 解引用 panic（gin.Recovery
+	// 兜成 500 + 栈噪声）。
+	if db.DB == nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "数据库未初始化"})
 		return
 	}
 	var status, message string

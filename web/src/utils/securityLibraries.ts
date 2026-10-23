@@ -164,3 +164,17 @@ export const libraryScheduleError = (days: readonly number[], time: string | nul
   if (!time) return '请选择时间'
   return null
 }
+
+/**
+ * 定时更新卡片「父级轮询刷新是否可回填」判据：仅当用户未改动编辑态
+ * （编辑值与上一次 props 快照一致）时才允许同步——否则用户编辑中的星期/时间
+ * 会被 15s 轮询覆盖（用户输入丢失）。星期顺序敏感（周一/周二 ≠ 周二/周一），
+ * 上一次时间为空时按默认显示值 04:00 比较（与输入框初值同口径）。
+ */
+export const scheduleEditUntouched = (
+  edit: { readonly days: readonly number[]; readonly time: string },
+  previous: { readonly days?: readonly number[]; readonly time?: string },
+): boolean =>
+  edit.days.join() === (previous.days ?? []).join()
+  && edit.time === ((previous.time ?? '') || '04:00')
+

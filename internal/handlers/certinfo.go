@@ -93,8 +93,8 @@ func (h *Handlers) GetRulesCertInfo(c *gin.Context) {
 		SELECT rule_id, id, status, COALESCE(cert_pem,''), COALESCE(key_pem,''),
 		       COALESCE(julianday(COALESCE(updated_at, created_at)), 0), COALESCE(domain,'')
 		FROM cert_jobs
-		WHERE rule_id IN (%s) AND COALESCE(cert_pem,'')<>'' AND COALESCE(key_pem,'')<>''
-		ORDER BY rule_id, updated_at DESC, id DESC`, placeholders), args...)
+		WHERE rule_id IN (%s) AND %s
+		ORDER BY rule_id, updated_at DESC, id DESC`, placeholders, services.CertJobMaterialPredicateSQL("")), args...)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "批量读取签发证书失败"})
 		return

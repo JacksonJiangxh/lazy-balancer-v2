@@ -614,3 +614,34 @@ func TestMaskRuleCaddyPrivateKeys_loadPEMBody(t *testing.T) {
 		t.Fatalf("certificate must stay intact, got %v", cert["certificate"])
 	}
 }
+
+// load_files 形态：证书与私钥以文件路径嵌套在 load_files 下——掩码按
+// 「条目含 certificate 字段」递归识别，嵌套键同样清空并置 key_redacted。
+func TestMaskRuleCaddyPrivateKeys_loadFilesPath(t *testing.T) {
+	payload := map[string]interface{}{
+		"config": map[string]interface{}{
+			"tls_certificates": []interface{}{
+				map[string]interface{}{
+					"load_files": map[string]interface{}{
+						"certificate": "/etc/lazy-balancer/certs/cert.pem",
+						"key":         "/etc/lazy-balancer/certs/key.pem",
+					},
+					"tags": []string{"lb_tlsview"},
+				},
+			},
+		},
+	}
+	maskRuleCaddyPrivateKeys(payload)
+	config := payload["config"].(map[string]interface{})
+	entry := config["tls_certificates"].([]interface{})[0].(map[string]interface{})
+	files := entry["load_files"].(map[string]interface{})
+	if files["key"] != "" {
+		t.Fatalf("load_files private key path must be masked, got %v", files["key"])
+	}
+	if files["key_redacted"] != true {
+		t.Fatalf("masked load_files entry must set key_redacted=true: %v", files)
+	}
+	if files["certificate"] != "/etc/lazy-balancer/certs/cert.pem" {
+		t.Fatalf("certificate path must stay intact, got %v", files["certificate"])
+	}
+}

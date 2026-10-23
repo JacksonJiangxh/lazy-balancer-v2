@@ -418,7 +418,7 @@ func (h *Handlers) GetConfig(c *gin.Context) {
 	cfg.HasGitHubToken = cfg.GitHubToken != ""
 	// 自定义 Caddy 配置可能内联私钥或敏感 header；与规则 tls_key 同口径，
 	// 非管理员及只读 API Key 不返回原文，管理员 JWT/读写 Key 保持可读。
-	if c.GetString("role") != "admin" || (c.GetString("auth_type") == "api_key" && c.GetBool("api_key_read_only")) {
+	if !canReadSensitiveSecrets(c) {
 		cfg.CaddyConfig = ""
 	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: cfg})
@@ -903,13 +903,18 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 			restoreErr = nil
 		}
 		applyErr = errors.Join(applyErr, restoreErr)
-		// 回弹也可能失败（Caddy 不可达/超时）——运行
-		// 配置可能停留候选态而 DB 已回滚，仅响应+审计会在重启后消失。先显式
-		// 回滚事务释放写锁，再持久化横幅（recordCaddyApplyResult 写主库）。
+		// 回弹目标可能本身就是漂移形态（外来路由/带外改动）——先回滚事务
+		// 释放写锁，再把 LKG 钉回已提交库视图：LKG 的全族不变量是「最后一次
+		// 已提交且已下发的配置」，不得被请求前运行配置固化。
 		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
 			applyErr = errors.Join(applyErr, rbErr)
 		}
-		h.recordCaddyApplyResult(applyErr)
+		if pinErr := h.caddyService.PersistCommittedViewAsLastGoodInLock(); pinErr != nil {
+			services.Logf("warn", "配置应用失败后把 last-known-good 钉回已提交视图失败（LKG 可能仍为请求前运行配置）: %v", pinErr)
+		}
+		// 回弹也可能失败（Caddy 不可达/超时）——运行
+		// 配置可能停留候选态而 DB 已回滚，仅响应+审计会在重启后消失。
+		h.recordCaddyApplyFailure(applyErr, restoreErr)
 		recordAudit(c, "更新失败", "全局配置", services.FormatAuditDetail("Caddy 配置应用失败", applyErr.Error(), services.AuditResultPart("failure")))
 		// 2026-09-07：与规则域统一——配置拒绝→400，传输/系统→500。
 		if services.IsConfigRejected(applyErr) {
@@ -1020,6 +1025,9 @@ func (h *Handlers) ValidateConfig(c *gin.Context) {
 	}
 	if restoreErr != nil {
 		joined := errors.Join(validateErr, restoreErr)
+		// 横幅事实源：恢复 /load 失败意味着运行配置可能停留为校验载荷，
+		// 响应丢失后必须仍可见（与 UpdateConfig/PutCaddyConfig 同一持久化口径）。
+		h.recordCaddyApplyFailure(joined, restoreErr)
 		recordAudit(c, "校验失败", "Caddy配置", services.FormatAuditDetail(
 			"校验回退加载后恢复权威配置失败，运行配置可能停留为校验载荷", joined.Error(), services.AuditResultPart("failure")))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "配置校验后恢复运行配置失败: " + joined.Error()})
@@ -1130,7 +1138,7 @@ func (h *Handlers) GetCaddyConfig(c *gin.Context) {
 	// 原始运行配置可能含经 PUT /caddy/config 逃生口写入的内联私钥
 	// 或敏感 header——与 GetConfig 的 caddy_config 脱敏同口径：非管理员及
 	// 只读 API Key 一律拒绝（路由已收敛到 admin 组，此处为纵深防御）。
-	if c.GetString("role") != "admin" || (c.GetString("auth_type") == "api_key" && c.GetBool("api_key_read_only")) {
+	if !canReadSensitiveSecrets(c) {
 		c.JSON(http.StatusForbidden, models.APIResponse{Code: 403, Message: "仅管理员可读取原始 Caddy 配置"})
 		return
 	}
@@ -1172,11 +1180,20 @@ var caddyLogPaths = map[string]string{
 // 读取必须受 128KB 窗口上限约束，不得随增长无界放大）。
 var caddyLogsStatHook func()
 
+// caddyLogTypes 是 caddyLogPaths 的确定性展示顺序（错误文案与文档共用），
+// 避免直接遍历 map 造成顺序漂移。
+var caddyLogTypes = []string{"runtime", "tls", "server", "proxy"}
+
 func (h *Handlers) GetCaddyLogs(c *gin.Context) {
 	logType := c.DefaultQuery("type", "runtime")
 	logPath, ok := caddyLogPaths[logType]
 	if !ok {
-		logPath = caddyLogPaths["runtime"]
+		// fail-visible：未知类型此前静默回落到 runtime 日志，
+		// 排障者会误读错误文件（不同日志族内容完全不同）。
+		c.JSON(http.StatusBadRequest, models.APIResponse{
+			Code: 400, Message: fmt.Sprintf("未知日志类型 %q，可选值：%s", logType, strings.Join(caddyLogTypes, "、")),
+		})
+		return
 	}
 
 	const maxBytes = 128 * 1024
@@ -1238,13 +1255,13 @@ func (h *Handlers) GetCaddyLogs(c *gin.Context) {
 
 var logTimeRe = regexp.MustCompile(`^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\.\d+)`)
 
+// convertLogTimezone 把 Caddy 日志行首的 UTC 时间戳转换为当前生效时区。
+// 时区取 services.CurrentLocation（启动与设置变更时已刷新，含 taskengine），
+// 不再每请求点查 global_config + LoadLocation——日志查看是高频只读路径，
+// 每次展示几百行只需一次原子读。UTC 时区直接短路（无需逐行换算）。
 func convertLogTimezone(content string) string {
-	var tzStr string
-	if err := db.DB.QueryRow("SELECT COALESCE(timezone,?) FROM global_config WHERE id=1", db.DefaultTimezone).Scan(&tzStr); err != nil {
-		return content
-	}
-	loc, err := time.LoadLocation(tzStr)
-	if err != nil || loc.String() == "UTC" {
+	loc := services.CurrentLocation()
+	if loc == nil || loc.String() == "UTC" {
 		return content
 	}
 	lines := strings.Split(content, "\n")
@@ -1354,8 +1371,14 @@ func (h *Handlers) PutCaddyConfig(c *gin.Context) {
 		}
 		restoreErr := h.restoreImportRuntime(runtimeSnapshot)
 		err = errors.Join(err, rollbackErr, restoreErr)
+		// 回弹目标是请求前运行配置（可能已漂移）——事务已显式回滚，把 LKG
+		// 钉回已提交库视图，维持「LKG=已提交库视图」的全族不变量（逃生口的
+		// 成功路径仍是例外：LKG=用户原始载荷）。
+		if pinErr := h.caddyService.PersistCommittedViewAsLastGoodInLock(); pinErr != nil {
+			services.Logf("warn", "原始配置应用失败后把 last-known-good 钉回已提交视图失败（LKG 可能仍为请求前运行配置）: %v", pinErr)
+		}
 		// 回弹失败持久化横幅（事务已显式回滚）。
-		h.recordCaddyApplyResult(err)
+		h.recordCaddyApplyFailure(err, restoreErr)
 		recordAudit(c, "更新失败", "Caddy配置", services.FormatAuditDetail("Caddy 配置应用失败", err.Error(), services.AuditResultPart("failure")))
 		// 2026-09-07：与统一——配置拒绝→400，传输/系统→500。
 		if services.IsConfigRejected(err) {
@@ -1394,6 +1417,11 @@ func (h *Handlers) PutCaddyConfig(c *gin.Context) {
 }
 
 func (h *Handlers) StartCaddy(c *gin.Context) {
+	// 导入窗口 fast-fail（与 ReloadCaddy 同门，且必须在取 caddyOpMu 之前）：
+	// 导入全程持锁，排队请求会在导入提交后才执行——启停按陈旧意图落地。
+	if rejectWriteDuringImport(c, "启停 Caddy 服务（配置导入进行中）") {
+		return
+	}
 	h.caddyOpMu.Lock()
 	defer h.caddyOpMu.Unlock()
 
@@ -1413,6 +1441,11 @@ func (h *Handlers) StartCaddy(c *gin.Context) {
 }
 
 func (h *Handlers) StopCaddy(c *gin.Context) {
+	// Stop 是不可逆的可用性动作（pause 文件同时抑制监督器自愈）：导入窗口内
+	// 排队到导入提交后再停，会在用户以为「还原成功」的时刻中断全部流量。
+	if rejectWriteDuringImport(c, "启停 Caddy 服务（配置导入进行中）") {
+		return
+	}
 	h.caddyOpMu.Lock()
 	defer h.caddyOpMu.Unlock()
 
@@ -1424,6 +1457,9 @@ func (h *Handlers) StopCaddy(c *gin.Context) {
 }
 
 func (h *Handlers) RestartCaddy(c *gin.Context) {
+	if rejectWriteDuringImport(c, "启停 Caddy 服务（配置导入进行中）") {
+		return
+	}
 	h.caddyOpMu.Lock()
 	defer h.caddyOpMu.Unlock()
 

@@ -129,17 +129,17 @@
         </el-form-item>
         <el-form-item label="MCP 客户端配置 JSON（粘贴到客户端，替换 <YOUR_API_KEY> 为密钥全文）">
           <div style="width: 100%">
-            <div style="position: relative">
-              <el-input
-                class="mcp-config-json"
-                type="textarea"
-                :model-value="mcpConfigJSON"
-                readonly
-                :rows="13"
-              />
-              <el-button aria-label="复制 MCP 配置" size="small" style="position: absolute; top: 8px; right: 8px; z-index: 1" @click="copyMCPConfig">
+            <el-input
+              class="mcp-config-json"
+              type="textarea"
+              :model-value="mcpConfigJSON"
+              readonly
+              :rows="13"
+            />
+            <div class="mcp-config-toolbar">
+              <el-button size="small" @click="copyMCPConfig">
                 <el-icon><CopyDocument /></el-icon>
-                复制
+                复制配置
               </el-button>
             </div>
             <div class="mcp-config-hints" style="margin-top: 6px">
@@ -168,7 +168,7 @@
             <div class="mcp-guide-subtitle">常见错误</div>
             <div class="mcp-guide-text">401：密钥无效或缺失 / JWT 无效；403：MCP 未开启 / 只读 Key 调用写工具 / 来源 IP 不在白名单；参数错误：校验在 REST 侧执行，以 IsError + 具体 message 文本返回（协议层不做 input_schema 校验，无 -32602）——读 message 修正后重试。</div>
             <div class="mcp-guide-subtitle">权限范围（scope）</div>
-            <div class="mcp-guide-text">只读 Key 可调用 GET 查询类工具及 5 个读探测 POST 工具（test_ca_provider / test_certificate_config / parse_certificate / validate_import / preview_config）；其余写工具（POST/PUT/DELETE）需非只读 Key 且仅在主节点可用（从节点一律 403——集群端点 promote_cluster / pull_sync / set_cluster_mode / forget_cluster_pins 除外，在从节点本身可用）。写操作校验后即时生效，失败自动回滚，无需手动 reload。</div>
+            <div class="mcp-guide-text">只读 Key 可调用 GET 查询类工具及 3 个读探测 POST 工具（parse_certificate / validate_import / preview_config；证书配置测试与 CA 提供商测试会写入真实 DNS 记录/凭据，属写语义，只读 Key 不可用）；其余写工具（POST/PUT/DELETE）需非只读 Key 且仅在主节点可用（从节点一律 403——集群端点 promote_cluster / pull_sync / set_cluster_mode / forget_cluster_pins 除外，在从节点本身可用）。写操作校验后即时生效，失败自动回滚，无需手动 reload。</div>
             <div class="mcp-guide-subtitle">常用流程</div>
             <pre class="mcp-guide-pre">新建 HTTP 代理：create_rule（protocol=http + domain + listen_port + upstreams）
   → 需要免费证书再 issue_certificate 传 caddy_id
@@ -712,6 +712,7 @@ onMounted(() => {
 .mcp-schema-pre { max-height: 320px; overflow-y: auto; }
 .mcp-config-json { margin-top: 12px; }
 .mcp-config-json :deep(textarea) { font-family: 'SF Mono', Menlo, monospace; font-size: 12px; }
+.mcp-config-toolbar { display: flex; justify-content: flex-end; margin-top: 8px; }
 .mcp-config-hints { margin-top: 10px; color: var(--el-text-color-secondary); font-size: 12px; line-height: 1.8; }
 .mcp-tool-expand { padding: 4px 12px 10px; }
 .mcp-tool-usage { font-size: 13px; line-height: 1.6; margin-bottom: 8px; }

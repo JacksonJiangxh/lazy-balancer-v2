@@ -47,11 +47,11 @@ func TestParseCrawlerCIDRsForFormat_versionPrefixesRejected(t *testing.T) {
 		t.Fatalf("parse: %v", err)
 	}
 	for _, bad := range []string{"140.0.0.0/32", "1.2.3.4/32", "141.0.0.1/32"} {
-		if containsStr(got, bad) {
+		if containsString(got, bad) {
 			t.Fatalf("版本串被误收为 %s: %v", bad, got)
 		}
 	}
-	if !containsStr(got, "203.0.113.9/32") {
+	if !containsString(got, "203.0.113.9/32") {
 		t.Fatalf("URL 路径中的合法 IP 被过度拒绝: %v", got)
 	}
 }

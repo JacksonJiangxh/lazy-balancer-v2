@@ -152,6 +152,7 @@ func TestRulePayload_inputParityWithModels(t *testing.T) {
 		"PathRules":                  "ruleFeatureInput 单源（TCP 禁用）",
 		"LogEnabled":                 "布尔开关，无值域校验（直读落库）",
 		"Enabled":                    "布尔开关，无值域校验（直读落库）",
+		"ExpectedUpdatedAt":          "乐观并发前置条件（不落库，仅事务内与 updated_at 比对）",
 	}
 
 	mirror := reflect.TypeOf(rulePayloadInput{})

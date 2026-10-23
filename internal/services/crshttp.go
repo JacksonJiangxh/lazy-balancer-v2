@@ -21,8 +21,11 @@ var crsHTTPClient = &http.Client{Timeout: 30 * time.Second}
 // 避免 30s 短路读 body（50KB/s × 2-3MB ≈ 40-60s 常态超越）。tag 查询用原 client。
 var crsDownloadClient = &http.Client{}
 
-// ruleSetDownloadSizeCap 是 CRS/ip2region 下载的最大字节数（2GB）：代理在超时
-// 窗口内可无限流式灌入，无界 io.Copy 会写爆数据卷 staging 目录。
+// ruleSetDownloadSizeCap 是 CRS 发布包（tarball）下载的最大字节数（2GB）：代理
+// 在超时窗口内可无限流式灌入，无界 io.Copy 会写爆数据卷 staging 目录。
+// ip2region 的 xdb 走独立上限 ip2RegionXDBDownloadSizeCap（100MB）——xdb 在
+// BufferCache 构造期全量入内存，按 2GB 设限会让恶意/损坏响应体在内存小的
+// 容器里 OOM。两者不得合并回单常量。
 const ruleSetDownloadSizeCap = int64(2 << 30)
 
 // downloadProgressFunc 是下载进度回调：written 为已落盘字节数，total 为预期总

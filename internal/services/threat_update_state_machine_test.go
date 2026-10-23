@@ -52,7 +52,7 @@ func TestThreatUpdate_demoteMidRun_doesNotWriteSourceRow(t *testing.T) {
 
 // （错误传播）：成功状态落库失败不得让任务仍报 success。
 func TestMarkSourceSuccess_returnsStoreError(t *testing.T) {
-	if err := db.Initialize(t.TempDir()); err != nil {
+	if err := initSecurityEventsTestDB(t, t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	var id int

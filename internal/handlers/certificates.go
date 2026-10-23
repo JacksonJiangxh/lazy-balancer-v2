@@ -24,6 +24,23 @@ import (
 // FreeCertificates 的编辑表单会原样回传 GET 到的值。
 const maskedDNSCredentialsSentinel = "***"
 
+// certificateConfigNameMaxRunes 与 CA 提供商名称校验同口径（services
+// ErrCAProviderNameTooLong=100 rune）。binding:"required" 不拦纯空白，SQLite
+// 也不强制 VARCHAR(100)——校验必须在这里做。
+const certificateConfigNameMaxRunes = 100
+
+// normalizeCertificateConfigName 统一 trim + 非空 + 长度校验，写入 trimmed 值。
+func normalizeCertificateConfigName(raw string) (string, error) {
+	name := strings.TrimSpace(raw)
+	if name == "" {
+		return "", errors.New("DNS 配置名称不能为空")
+	}
+	if len([]rune(name)) > certificateConfigNameMaxRunes {
+		return "", fmt.Errorf("DNS 配置名称不能超过 %d 个字符", certificateConfigNameMaxRunes)
+	}
+	return name, nil
+}
+
 // maskDNSCredentialsJSON 把凭证 JSON 串的每个值替换为掩码（保留键形态，
 // 前端表单按 provider 字段渲染）。解析失败时整体掩码（防御性）。
 func maskDNSCredentialsJSON(raw string) string {
@@ -86,7 +103,7 @@ func mergeMaskedDNSCredentials(submitted, stored map[string]string) (map[string]
 }
 
 func (h *Handlers) ListCertificateConfigs(c *gin.Context) {
-	rows, err := db.DB.Query("SELECT id, name, dns_provider, COALESCE(dns_credentials,''), enabled, created_at, updated_at FROM certificate_configs ORDER BY id")
+	rows, err := db.DB.Query("SELECT id, name, dns_provider, COALESCE(dns_credentials,''), COALESCE(enabled,1), created_at, updated_at FROM certificate_configs ORDER BY id")
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to query configs"})
 		return
@@ -136,6 +153,13 @@ func (h *Handlers) CreateCertificateConfig(c *gin.Context) {
 		return
 	}
 
+	// 名称与 CA 提供商同族校验：trim 后非空且 ≤100 rune，写 trimmed 值入库。
+	name, nameErr := normalizeCertificateConfigName(req.Name)
+	if nameErr != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: nameErr.Error()})
+		return
+	}
+
 	// 删除「空则默认 dnspod」死代码——binding:"required"
 	// 保证 dns_provider 非空，兜底不可达；缺字段请求由 400 契约拒绝。
 	provider, ok := dnsproviders.Get(req.DNSProvider)
@@ -161,7 +185,7 @@ func (h *Handlers) CreateCertificateConfig(c *gin.Context) {
 	result, err := db.DB.Exec(`
 		INSERT INTO certificate_configs (name, dns_provider, dns_credentials, enabled)
 		VALUES (?, ?, ?, ?)
-	`, req.Name, req.DNSProvider, string(credsJSON), req.Enabled)
+	`, name, req.DNSProvider, string(credsJSON), req.Enabled)
 
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to create config"})
@@ -175,7 +199,7 @@ func (h *Handlers) CreateCertificateConfig(c *gin.Context) {
 	if idErr != nil {
 		services.Logf("error", "CreateCertificateConfig: 读取新配置 ID 失败（审计将记为 0）: %v", idErr)
 	}
-	recordAudit(c, "创建", "DNS配置", services.FormatAuditDetail(fmt.Sprintf("配置 %d", id), req.Name, req.DNSProvider, fmt.Sprintf("启用：%t", req.Enabled)))
+	recordAudit(c, "创建", "DNS配置", services.FormatAuditDetail(fmt.Sprintf("配置 %d", id), name, req.DNSProvider, fmt.Sprintf("启用：%t", req.Enabled)))
 	c.JSON(http.StatusCreated, models.APIResponse{Code: 0, Message: "Config created", Data: gin.H{"id": id}})
 }
 
@@ -353,6 +377,14 @@ func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 	query := "UPDATE certificate_configs SET "
 	var args []interface{}
 
+	if req.Name != "" {
+		normalizedName, nameErr := normalizeCertificateConfigName(req.Name)
+		if nameErr != nil {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: nameErr.Error()})
+			return
+		}
+		req.Name = normalizedName
+	}
 	if req.Name != "" && req.Name != oldName {
 		query += "name = ?, "
 		args = append(args, req.Name)
@@ -617,15 +649,13 @@ func (h *Handlers) ListCertificates(c *gin.Context) {
 	for rows.Next() {
 		var id int
 		var ruleID, domain, status, message, expiresAt, updatedAt string
-		var expiresNull, updatedNull sql.NullString
-		if err := rows.Scan(&id, &ruleID, &domain, &status, &message, &expiresNull, &updatedNull); err != nil {
+		if err := rows.Scan(&id, &ruleID, &domain, &status, &message, &expiresAt, &updatedAt); err != nil {
 			// 单行 Scan 失败 warn 留痕+跳过（对齐
 			// 口径）——静默丢行会让该域名在证书清单中无故缺席；
 			// 迭代级失败仍由下方 rows.Err() 500 兜底。
 			services.Logf("warn", "证书任务列表：跳过扫描失败行（该域名聚合行本轮缺失）: %v", err)
 			continue
 		}
-		expiresAt, updatedAt = expiresNull.String, updatedNull.String
 		certs = append(certs, gin.H{"id": id, "rule_id": ruleID, "domain": domain, "status": status, "message": message, "expires_at": expiresAt, "updated_at": updatedAt})
 	}
 	if err := rows.Err(); err != nil {
@@ -996,6 +1026,12 @@ func (h *Handlers) ParseCertificate(c *gin.Context) {
 		KeyPEM  string `json:"key_pem"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
+		// 体积超限是与「PEM 格式非法」不同的可重试语义——与 ca-providers 等
+		// 同域写端点同口径映射 413。
+		if isRequestBodyTooLarge(err) {
+			c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: "请求体过大"})
+			return
+		}
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Invalid request"})
 		return
 	}

@@ -1,0 +1,36 @@
+// 规则编辑的乐观并发前置条件 + 规则日志「实时统计」窗口口径。
+
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+
+import { source, stripComments } from './_helpers.ts'
+
+const page = source('src/views/Rules.vue')
+const types = source('src/types/rules.ts')
+
+test('编辑向导记录打开时的 updated_at 并随保存回传 expected_updated_at', () => {
+  assert.match(page, /const editingRuleVersion = ref\(''\)/)
+  assert.match(page, /editingRuleVersion\.value = fullRule\.updated_at \|\| ''/)
+  assert.match(page, /expected_updated_at: editingRuleVersion\.value/)
+  assert.match(types, /expected_updated_at\?: string/)
+})
+
+test('版本冲突（409）刷新列表并提示重新打开，不静默覆盖', () => {
+  assert.match(page, /error instanceof ApiRequestError && error\.status === 409/)
+  assert.match(page, /规则已被他人修改/)
+  const catchBlock = page.slice(page.indexOf("console.error('submit wizard failed'"))
+  assert.ok(catchBlock.length > 0)
+  const conflict = page.slice(page.indexOf('error instanceof ApiRequestError && error.status === 409'), page.indexOf("console.error('submit wizard failed'"))
+  assert.match(conflict, /fetchRules\(\)/)
+})
+
+test('实时统计只借 /logs 的 offset，不消费打开前的历史内容', () => {
+  const start = page.indexOf('const startLogStats = async () => {')
+  assert.ok(start >= 0, 'missing startLogStats')
+  const end = page.indexOf('const onRuleLogTabChange', start)
+  assert.ok(end > start, 'missing startLogStats end marker')
+  const body = stripComments(page.slice(start, end))
+  // 增量路径仍是纯实时；起始路径不得把 tail 内容灌进同一组桶。
+  assert.doesNotMatch(body, /consumeLogLinesChunked\(/)
+  assert.match(body, /logStatsOffset\.value = res\.data\?\.offset \?\? 0/)
+})

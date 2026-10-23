@@ -11,6 +11,7 @@ package services
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -115,25 +116,61 @@ func TestGetSecurityPoliciesForRule_filtersIPRefMissing(t *testing.T) {
 }
 
 // crs_rule_groups 渲染侧条数上限（写入侧 200）：带外 1 万条组号不得放大成
-// 1 万条 Include。
+// 1 万条 Include。夹具必须使用**互异**条目——旧夹具用 250 条全为 "42" 的
+// 组号，渲染先截断再去重，去重后恒为 1 行，删掉上限门测试依然绿（断言不可
+// 失败）。这里用 80 个互异两位组号 + 130 个互异 6 位规则 ID（各自独占一个
+// 父文件、组 90 未选中）共 210 条 > 上限，按是否渲染出第 121 个 ID 的文件
+// 与 Include 行数判定截断门。
 func TestEmitCRSRuleGroupSelection_capsEntries(t *testing.T) {
-	seedCRSRuleIndexFixture(t)
+	dir := t.TempDir()
+	// 130 个互异 6 位 ID，各独占父文件 REQUEST-90-Gnnn.conf（组 90 不在选择内）。
+	for i := 1; i <= 130; i++ {
+		file := filepath.Join(dir, fmt.Sprintf("REQUEST-90-G%03d.conf", i))
+		body := fmt.Sprintf("SecRule ARGS \"@rx x\" \"id:90%04d,phase:2,pass\"\n", i)
+		if err := os.WriteFile(file, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldDir := CRSRuleIndexDir
+	CRSRuleIndexDir = dir
+	t.Cleanup(func() { CRSRuleIndexDir = oldDir })
+
 	var sb strings.Builder
-	groups := make([]string, 0, CRSRuleGroupsMaxEntries+50)
-	for i := 0; i < CRSRuleGroupsMaxEntries+50; i++ {
-		groups = append(groups, "42")
+	groups := make([]string, 0, CRSRuleGroupsMaxEntries+10)
+	for i := 1; i <= 80; i++ {
+		groups = append(groups, fmt.Sprintf("%02d", i))
+	}
+	for i := 1; i <= 130; i++ {
+		groups = append(groups, fmt.Sprintf("90%04d", i))
+	}
+	if len(groups) <= CRSRuleGroupsMaxEntries {
+		t.Fatalf("夹具无效：条目数 %d 未超过上限 %d", len(groups), CRSRuleGroupsMaxEntries)
 	}
 	policy := &models.SecurityPolicy{ID: 2, Name: "cap"}
 	emitCRSRuleGroupSelection(&sb, policy, groups, lazyCRSRuleIndex())
 
-	lines := 0
-	for _, line := range strings.Split(sb.String(), "\n") {
+	out := sb.String()
+	includes := 0
+	for _, line := range strings.Split(out, "\n") {
 		if strings.HasPrefix(line, "Include ") {
-			lines++
+			includes++
 		}
 	}
-	if lines > CRSRuleGroupsMaxEntries {
-		t.Fatalf("Include 行数=%d, 上限 %d（渲染侧必须截断）", lines, CRSRuleGroupsMaxEntries)
+	if includes > CRSRuleGroupsMaxEntries {
+		t.Fatalf("Include 行数=%d, 上限 %d（渲染侧必须按条目截断）", includes, CRSRuleGroupsMaxEntries)
+	}
+	// 窗口内（第 1..120 个 ID）父文件必须在场；超窗（121..130）必须缺席。
+	for _, i := range []int{1, 120} {
+		want := fmt.Sprintf("REQUEST-90-G%03d.conf", i)
+		if !strings.Contains(out, want) {
+			t.Fatalf("窗口内父文件 %s 缺席（截断过早）:\n%s", want, out)
+		}
+	}
+	for _, i := range []int{121, 122, 123} {
+		unwanted := fmt.Sprintf("REQUEST-90-G%03d.conf", i)
+		if strings.Contains(out, unwanted) {
+			t.Fatalf("超窗父文件 %s 不应被渲染（上限门失效）", unwanted)
+		}
 	}
 }
 

@@ -55,8 +55,9 @@ func TestCAQueueManager_UnblockJobsForRule_rescansDroppedDeploymentRetries(t *te
 	}
 	service := NewCertificateService()
 	retried := make(chan int, 1)
-	service.deploymentRetry = func(jobID int, _ issuedCertificate, _ time.Duration) {
+	service.deploymentRetry = func(jobID int, _ issuedCertificate, _ time.Duration) error {
 		retried <- jobID
+		return nil
 	}
 	t.Cleanup(func() {
 		certificateServiceMu.Lock()

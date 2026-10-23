@@ -266,14 +266,16 @@ func nextAutoBackupSlot(now time.Time) (time.Time, bool) {
 		if row.lastRun == nil || due.After(*row.lastRun) {
 			return due, true
 		}
-		// 已执行——步进到下一未来槽
-		// （曾恒 +24h——weekly/monthly 时追不上下一槽，下次执行恒显示过去时刻）
-		step := now.In(loc).Add(24 * time.Hour)
+		// 已执行——从「已执行的槽」而非 now 步进（曾恒 +24h——weekly/monthly
+		// 时追不上下一槽，下次执行恒显示过去时刻）。从槽步进还消除了月末日历
+		// 归一溢出：1/31.AddDate(0,1,0)=3/3 → 回落 3 月槽，2 月槽消失；
+		// due 恒为当月合法槽（day 已在读侧收敛到 1..28），+1 月不会溢出。
+		step := due.Add(24 * time.Hour)
 		switch row.freq {
 		case "weekly":
-			step = now.In(loc).Add(7 * 24 * time.Hour)
+			step = due.Add(7 * 24 * time.Hour)
 		case "monthly":
-			step = now.In(loc).AddDate(0, 1, 0)
+			step = due.AddDate(0, 1, 0)
 		}
 		due, ok = autoBackupDueSlot(step, row.freq, row.hhmm, row.day, loc)
 	}

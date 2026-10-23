@@ -793,7 +793,10 @@ func TestReadOnlyGuard_writeRouteClassificationIsIndependentFromAuditPolicy(t *t
 // 从节点 MCP 写工具调用→403 实际接线回归钉（曾仅守卫级
 // 通用测试，无「POST /mcp 经守卫组」端到端形状——v1.POST("/mcp") 注册于
 // adminOnly/readOnlyGuard 组之外，写保护依赖 loopback 转发重入间接达成）。
-func TestReadOnlyGuard_SlaveMcpWriteRouteRejected(t *testing.T) {
+// MCP 写工具转发目标路由在从节点被 readOnlyGuard 拒绝（中间件级）。
+// 端到端形态（真实 listener + 完整 router + 管理员 mcp Key）见
+// TestMCPEndpoint_slaveWriteToolRejectedByInnerReadOnlyGuard。
+func TestReadOnlyGuard_slaveRejectsMcpForwardTargetWriteRoute(t *testing.T) {
 	router := newReadOnlyGuardTestRouter(t, false, "admin")
 	body := `{"jsonrpc":"2.0","method":"tools/call","params":{"name":"create_rule","arguments":{}}}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/rules", strings.NewReader(body))

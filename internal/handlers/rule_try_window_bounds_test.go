@@ -1,16 +1,16 @@
 package handlers
 
-// 重试窗口上界缺失——rule_features.go 注释
-// 宣称 http 侧 [-1,60000]、TCP 侧 [0,60000]，但 TCP 分支只拒负值
-//（tcp_try_duration/tcp_try_interval 均无 >60000 上界）、http 侧
-// tcp_try_interval 亦无上界。999999ms/10^12ms 可经 API/MCP/导入/集群快照
-// 落库并渲染（L4 proxy try_duration 溢出）。本文件锁定三道面：
-//   ① 保存门（validateRuleFeatures）两协议上界；
+// 重试窗口值域（单源 validateTCPTryWindowBounds）：http 侧 [-1,60000]
+//（-1=NTLM 接管哨兵）、tcp 侧 [0,60000]、duration>0 ⇒ interval≥1。本文件锁定
+// 全部消费面：
+//   ① 保存族三入口——保存门（validateRuleFeatures）；
 //   ② UpdateRule 存量越界行的编辑自愈（镜像负值先例）；
-//   ③ DuplicateRule 源行越界值不放大到副本。
+//   ③ DuplicateRule 源行越界值不放大到副本；
+//   ④ 存量两面——单规则启用门与启动/UpdateConfig 聚合门（同一值域表）。
 // 存量为纯测试文件（唯一写点），不触碰既有钉测。
 
 import (
+	"context"
 	"database/sql"
 	"net/http"
 	"net/http/httptest"
@@ -225,4 +225,55 @@ func TestDuplicateRule_healsOutOfRangeTryWindowResidue(t *testing.T) {
 			}
 		})
 	}
+}
+
+// 存量面：直改 DB / 导入 / 集群快照落库的越界重试窗口，必须在启用门与
+// 启动（UpdateConfig）聚合门同样被拒——否则同一坏行「启用报错、重启静默降级」。
+// 单源 validateTCPTryWindowBounds 是保存门与存量门的唯一值域表。
+func TestStoredOutOfRangeTryWindowRejectedOnEnableAndAggregate(t *testing.T) {
+	t.Run("enable gate", func(t *testing.T) {
+		handler, _, _ := newAuditRuleHandlers(t, 0)
+		seedTCPStoredRule(t, "lb_tcptry_store", "tcptry-store", 18621, false, "weighted_round_robin", false)
+		if _, err := db.DB.Exec(`UPDATE lb_rules SET tcp_try_duration=60001, tcp_try_interval=250 WHERE caddy_id='lb_tcptry_store'`); err != nil {
+			t.Fatal(err)
+		}
+		router := gin.New()
+		router.POST("/rules/:caddy_id/enable", handler.EnableRule)
+
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/rules/lb_tcptry_store/enable", nil))
+
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("enable status=%d body=%s, want 400（越界重试窗口必须拒绝启用）", response.Code, response.Body.String())
+		}
+		if !strings.Contains(response.Body.String(), "60000") {
+			t.Fatalf("enable body=%s, want 值域文案", response.Body.String())
+		}
+		var enabled bool
+		if err := db.DB.QueryRow(`SELECT enabled FROM lb_rules WHERE caddy_id='lb_tcptry_store'`).Scan(&enabled); err != nil {
+			t.Fatal(err)
+		}
+		if enabled {
+			t.Fatal("越界重试窗口的规则不得被启用")
+		}
+	})
+
+	t.Run("startup aggregate gate", func(t *testing.T) {
+		initializeRuleFeatureTestDB(t)
+		seedTCPStoredRule(t, "lb_tcptry_agg", "tcptry-agg", 18622, true, "weighted_round_robin", false)
+		if _, err := db.DB.Exec(`UPDATE lb_rules SET tcp_try_interval=70000 WHERE caddy_id='lb_tcptry_agg'`); err != nil {
+			t.Fatal(err)
+		}
+
+		err := validateEnabledStoredRuleConfigs(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "60000") {
+			t.Fatalf("aggregate validation must reject out-of-range try window, got %v", err)
+		}
+	})
+
+	t.Run("http ntlm sentinel still allowed", func(t *testing.T) {
+		if err := validateTCPTryWindowBounds("http", -1, 250); err != nil {
+			t.Fatalf("http duration=-1（NTLM 接管哨兵）必须放行, got %v", err)
+		}
+	})
 }

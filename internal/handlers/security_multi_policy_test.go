@@ -74,15 +74,8 @@ func createMultiPolicy(t *testing.T, router *gin.Engine, name string) int {
 
 func putMultiJSON(t *testing.T, router *gin.Engine, path string, body any) *httptest.ResponseRecorder {
 	t.Helper()
-	raw, err := json.Marshal(body)
-	if err != nil {
-		t.Fatalf("marshal body: %v", err)
-	}
-	recorder := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPut, path, bytes.NewReader(raw))
-	req.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(recorder, req)
-	return recorder
+	// 与 putJSON 同实现，保留具名包装以免本文件 30+ 调用点全部改名。
+	return putJSON(t, router, path, body)
 }
 
 func queryBoundPolicyIDs(t *testing.T, caddyID string) []int {

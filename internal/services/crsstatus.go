@@ -7,31 +7,51 @@ import (
 )
 
 func storedStatusSnapshot() CRSUpdateStatusSnapshot {
-	var stored struct {
-		status, trigger, startedAt, finishedAt, message, version string
-	}
-	// 半初始化（db.DB=nil）时降级 idle 而非 panic——与同包
-	// crs_rule_index/securityevents_retention 的 nil 守卫同口径。
-	if db.DB == nil {
-		return CRSUpdateStatusSnapshot{Status: string(CRSStatusIdle)}
-	}
-	err := db.DB.QueryRow(`SELECT COALESCE(update_status,'idle'), COALESCE(trigger,''),
-		COALESCE(started_at,''), COALESCE(finished_at,''), COALESCE(message,''), version
-		FROM security_crs_version WHERE id=1`).
-		Scan(&stored.status, &stored.trigger, &stored.startedAt, &stored.finishedAt, &stored.message, &stored.version)
+	row, ok, err := versionTableStatusRowOf("security_crs_version")
 	if err != nil {
 		// DB 读失败静默回退 idle 会丢可回溯性：留 warn 后回退。
 		Logf("warn", "CRS 状态: 读取存储快照失败，回退 idle: %v", err)
+	}
+	if !ok {
 		return CRSUpdateStatusSnapshot{Status: string(CRSStatusIdle)}
 	}
 	return CRSUpdateStatusSnapshot{
-		Status:     stored.status,
-		Trigger:    stored.trigger,
-		StartedAt:  stored.startedAt,
-		FinishedAt: stored.finishedAt,
-		Message:    stored.message,
-		Version:    stored.version,
+		Status:     row.status,
+		Trigger:    row.trigger,
+		StartedAt:  row.startedAt,
+		FinishedAt: row.finishedAt,
+		Message:    row.message,
+		Version:    row.version,
 	}
+}
+
+// versionTableStatusRow 版本表族（security_crs_version /
+// security_ip2region_version）存储快照行的列集：两族完全相同，读取与
+// 「库未初始化/读失败回退 idle」判定收敛为单一事实源（此前两份逐字同构，
+// 任一族新增字段或改判定都会漂移）。表名只接受包内常量，不接受外部输入。
+type versionTableStatusRow struct {
+	status, trigger, startedAt, finishedAt, message, version string
+}
+
+// versionTableStatusRowOf 读取版本表族状态快照行。
+//   - ok=false 且 err=nil：库未初始化（半初始化降级 idle，非故障）；
+//   - ok=false 且 err!=nil：读失败，由调用方按族前缀留痕后回退 idle；
+//   - ok=true：行值可用。
+func versionTableStatusRowOf(table string) (versionTableStatusRow, bool, error) {
+	var row versionTableStatusRow
+	// 半初始化（db.DB=nil）时降级 idle 而非 panic——与同包
+	// crs_rule_index/securityevents_retention 的 nil 守卫同口径。
+	if db.DB == nil {
+		return row, false, nil
+	}
+	err := db.DB.QueryRow(`SELECT COALESCE(update_status,'idle'), COALESCE(trigger,''),
+		COALESCE(started_at,''), COALESCE(finished_at,''), COALESCE(message,''), version
+		FROM `+table+` WHERE id=1`).
+		Scan(&row.status, &row.trigger, &row.startedAt, &row.finishedAt, &row.message, &row.version)
+	if err != nil {
+		return versionTableStatusRow{}, false, err
+	}
+	return row, true, nil
 }
 
 func snapshotFromState(state crsTaskState) CRSUpdateStatusSnapshot {

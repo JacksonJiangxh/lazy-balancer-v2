@@ -9,23 +9,30 @@ import (
 // 面板页面与 API 响应缺 X-Content-Type-Options/
 // X-Frame-Options——点击劫持表面。基线钉：全局中间件恒施加 nosniff+DENY。
 
-func TestSetupRouter_setsSecurityHeadersOnAllResponses(t *testing.T) {
-	// Given 完整路由（匿名 /health 即可观测）。
+// 名称如实反映覆盖面：四类代表性响应（健康检查、/ui 壳、公开 branding API、
+// 匿名 API 拒绝）都必须带 nosniff+DENY——此前只验 /health 一条。
+func TestSetupRouter_setsSecurityHeadersOnRepresentativeResponses(t *testing.T) {
 	router := newMiddlewareTestRouter(t)
-
-	// When
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
-
-	// Then
-	if rec.Code != http.StatusOK {
-		t.Fatalf("/health status=%d, want 200", rec.Code)
+	cases := []struct {
+		name string
+		path string
+	}{
+		{"health", "/health"},
+		{"ui-shell", "/ui/index.html"},
+		{"public-branding", "/api/v1/branding"},
+		{"anonymous-api", "/api/v1/rules"},
 	}
-	if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
-		t.Fatalf("X-Content-Type-Options=%q, want nosniff", got)
-	}
-	if got := rec.Header().Get("X-Frame-Options"); got != "DENY" {
-		t.Fatalf("X-Frame-Options=%q, want DENY", got)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
+			if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+				t.Fatalf("GET %s X-Content-Type-Options=%q, want nosniff", tc.path, got)
+			}
+			if got := rec.Header().Get("X-Frame-Options"); got != "DENY" {
+				t.Fatalf("GET %s X-Frame-Options=%q, want DENY", tc.path, got)
+			}
+		})
 	}
 }
 

@@ -8,7 +8,12 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { section, source } from './_helpers.ts'
-import { CERT_JOB_COLUMNS_MIN_WIDTH, CERT_JOB_COLUMNS_TOTAL_WIDTH } from '../src/utils/certJobColumns.ts'
+import {
+  CERT_JOB_COLUMNS_MIN_WIDTH,
+  CERT_JOB_COLUMN_WIDTHS,
+  CERT_JOB_COLUMNS_TOTAL_WIDTH,
+} from '../src/utils/certJobColumns.ts'
+import type { CertJobColumnId } from '../src/utils/certJobColumns.ts'
 
 const page = source('src/views/settings/CertJobs.vue')
 
@@ -22,12 +27,6 @@ const startOf = (label: string): number => {
   return tableBody.lastIndexOf('<el-table-column', at)
 }
 
-/** 列开标签（自闭合列也能取到属性）。 */
-const openTagOf = (label: string): string => {
-  const start = startOf(label)
-  return tableBody.slice(start, tableBody.indexOf('>', start) + 1)
-}
-
 /** 列块（含模板体，到 </el-table-column> 为止）。 */
 const columnBody = (label: string): string => {
   const start = startOf(label)
@@ -35,6 +34,24 @@ const columnBody = (label: string): string => {
   assert.ok(end > start, `列「${label}」缺少模板体`)
   return tableBody.slice(start, end)
 }
+
+// 列标签 → 单源列 id：宽度期望一律取自 CERT_JOB_COLUMN_WIDTHS（此前手抄两份，
+// 合法调宽时实现与常量表都改了仍被测试字面量拦住——假红）。
+const COLUMN_IDS: Record<string, CertJobColumnId> = {
+  '规则 ID': 'rule_id',
+  域名: 'domain',
+  状态: 'status',
+  颁发者: 'issuer',
+  证书有效期: 'validity',
+  自动重签时间: 'renewal',
+  更新时间: 'updated',
+  重试次数: 'attempts',
+  冷却时间: 'cooling',
+  操作: 'actions',
+}
+
+/** 固定宽列（不参与「宽容器占满」的均分）；其余为弹性 min-width 列。 */
+const FIXED_COLUMNS: Partial<Record<CertJobColumnId, true>> = { status: true, attempts: true, actions: true }
 
 test('消息列已删除：message 由状态标签 hover tooltip 承载', () => {
   assert.doesNotMatch(tableBody, /label="消息"/)
@@ -44,33 +61,27 @@ test('消息列已删除：message 由状态标签 hover tooltip 承载', () => 
   assert.match(status, /certJobStatusLabel\(row\.status\)/)
 })
 
-test('列宽基线 1209px：弹性列 min-width 占满整宽，固定列 width', () => {
+test('列宽基线取自 CERT_JOB_COLUMN_WIDTHS 单源（弹性 min-width / 固定 width）', () => {
   const tags = columnTags()
-  assert.equal(tags.length, 10, `列数应为 10，实际 ${tags.length}`)
-  const flexible: Record<string, number> = {
-    '规则 ID': 116,
-    域名: 210,
-    颁发者: 84,
-    证书有效期: 155,
-    自动重签时间: 150,
-    更新时间: 150,
-    冷却时间: 90,
+  const mappedLabels = Object.keys(COLUMN_IDS)
+  assert.equal(tags.length, mappedLabels.length, `列数应为 ${mappedLabels.length}，实际 ${tags.length}`)
+  const seen = new Set<CertJobColumnId>()
+  for (const tag of tags) {
+    const label = /label="([^"]+)"/.exec(tag)?.[1]
+    assert.ok(label, `列开标签缺 label：${tag}`)
+    const id = COLUMN_IDS[label]
+    assert.ok(id, `列「${label}」未登记到 label→columnId 映射（新增列须同步单源常量表）`)
+    seen.add(id)
+    const width = CERT_JOB_COLUMN_WIDTHS[id]
+    if (FIXED_COLUMNS[id] === true) {
+      assert.match(tag, new RegExp(`(?<!min-)width="${width}"`), `固定列「${label}」宽度应为 ${width}px`)
+      assert.doesNotMatch(tag, /min-width="/, `固定列「${label}」不应弹性伸展`)
+    } else {
+      assert.match(tag, new RegExp(`\\bmin-width="${width}"`), `弹性列「${label}」应为 min-width ${width}px`)
+      assert.doesNotMatch(tag, /(?<!min-)width="/, `弹性列「${label}」不得用固定 width（会留白）`)
+    }
   }
-  const fixed: Record<string, number> = {
-    状态: 84,
-    重试次数: 80,
-    操作: 90,
-  }
-  for (const [label, width] of Object.entries(flexible)) {
-    const tag = openTagOf(label)
-    assert.match(tag, new RegExp(`\\bmin-width="${width}"`), `弹性列「${label}」应为 min-width ${width}px`)
-    assert.doesNotMatch(tag, /(?<!min-)width="/, `弹性列「${label}」不得用固定 width（会留白）`)
-  }
-  for (const [label, width] of Object.entries(fixed)) {
-    const tag = openTagOf(label)
-    assert.match(tag, new RegExp(`(?<!min-)width="${width}"`), `固定列「${label}」宽度应为 ${width}px`)
-    assert.doesNotMatch(tag, /min-width="/, `固定列「${label}」不应弹性伸展`)
-  }
+  assert.equal(seen.size, mappedLabels.length, 'label→id 映射必须与模板列一一对应（不留死映射）')
   const total = tags.reduce((sum, tag) => sum + Number(tag.match(/(?:min-)?width="(\d+)"/)?.[1] ?? 0), 0)
   assert.equal(total, CERT_JOB_COLUMNS_TOTAL_WIDTH, `列宽基线合计应为 ${CERT_JOB_COLUMNS_TOTAL_WIDTH}px，实际 ${total}px`)
   assert.match(tableBody, /:fit="true"/)
@@ -80,7 +91,7 @@ test('证书有效期合并单列：日期 + 剩余/已过期天数，精确时�
   assert.doesNotMatch(tableBody, /label="过期时间"/)
   assert.doesNotMatch(tableBody, /label="剩余天数"/)
   const body = columnBody('证书有效期')
-  assert.match(body, /\bmin-width="155"/)
+  assert.match(body, new RegExp(`\\bmin-width="${CERT_JOB_COLUMN_WIDTHS.validity}"`))
   assert.match(body, /formatDateShort\(row\.expires_at\)/)
   assert.ok(body.includes('剩 ${row.days_remaining} 天'), '缺少「剩 N 天」分支')
   assert.ok(body.includes('已过期 ${Math.abs(row.days_remaining)} 天'), '缺少「已过期 N 天」分支')
@@ -91,11 +102,12 @@ test('证书有效期合并单列：日期 + 剩余/已过期天数，精确时�
 
 test('时间列显示完整时间戳 YYYY-MM-DD HH:mm:ss（配置时区）', () => {
   assert.doesNotMatch(page, /formatDateCompact/)
-  for (const [label, body] of [
-    ['自动重签时间', columnBody('自动重签时间')],
-    ['更新时间', columnBody('更新时间')],
+  for (const [label, id] of [
+    ['自动重签时间', 'renewal'],
+    ['更新时间', 'updated'],
   ] as const) {
-    assert.match(body, /\bmin-width="150"/, `列「${label}」最小宽度应为 150px`)
+    const body = columnBody(label)
+    assert.match(body, new RegExp(`\\bmin-width="${CERT_JOB_COLUMN_WIDTHS[id]}"`), `列「${label}」最小宽度须取单源常量`)
     assert.match(body, /\{\{ formatDate\(/, `列「${label}」必须显示配置时区的完整时间戳`)
     assert.doesNotMatch(body, /toLocaleString|toLocaleDateString|toLocaleTimeString/, `列「${label}」不得绕过配置时区`)
   }
@@ -107,6 +119,10 @@ test('容器窄于最小集时切横向滚动：操作列不得被 overflow:hidd
   assert.equal(CERT_JOB_COLUMNS_MIN_WIDTH, 619)
   assert.match(page, /const tableBelowMinWidth = computed\(\(\) => tableWrapWidth\.value < CERT_JOB_COLUMNS_MIN_WIDTH\)/)
   assert.match(page, /:class="\{ 'cert-jobs-wrap--scroll': tableBelowMinWidth \}"/)
-  const style = page.slice(page.indexOf('.cert-jobs-wrap {'))
-  assert.match(style, /\.cert-jobs-wrap--scroll \{\s*\/\*[^*]*\*\/\s*overflow-x: auto;/, '窄容器必须恢复横向滚动')
+  // 规则块语义匹配：注释与否、Prettier 断行都不影响判定
+  const ruleStart = page.indexOf('.cert-jobs-wrap--scroll {')
+  assert.ok(ruleStart > 0, '缺少窄容器滚动规则块')
+  const rule = page.slice(ruleStart, page.indexOf('}', ruleStart))
+  assert.match(rule, /overflow-x:\s*auto/, '窄容器必须恢复横向滚动')
+  assert.doesNotMatch(rule, /overflow-x:\s*hidden/, '裁切会让右侧操作列不可达')
 })

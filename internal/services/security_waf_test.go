@@ -517,17 +517,29 @@ func TestBuildCorazaDirectives_emitsCustomRuleWithNullColumns(t *testing.T) {
 
 	// Then：r2（action=NULL → COALESCE 'block'）必须发射为 deny 规则
 	wantID2 := fmt.Sprintf("id:%d", r2ID+10000)
-	if !strings.Contains(directives, wantID2) {
+	var r2Line string
+	for _, line := range strings.Split(directives, "\n") {
+		if strings.Contains(line, wantID2) {
+			r2Line = line
+		}
+	}
+	if r2Line == "" {
 		t.Fatalf("null-action rule must be emitted with id %s:\n%s", wantID2, directives)
 	}
-	if !strings.Contains(directives, "null-action") {
-		t.Fatalf("null-action rule name must appear in msg:\n%s", directives)
+	if !strings.Contains(r2Line, "null-action") {
+		t.Fatalf("null-action rule name must appear in its own directive line:\n%s", r2Line)
 	}
-	if !strings.Contains(directives, "deny") {
-		t.Fatalf("null-action rule must default to deny (COALESCE 'block'):\n%s", directives)
+	// deny 必须锚定 r2 自身指令行——其它 deny 行（949 抬码/ACL 拒绝等）会让
+	// 宽断言恒真。
+	if !strings.Contains(r2Line, "deny") {
+		t.Fatalf("null-action rule must default to deny (COALESCE 'block'):\n%s", r2Line)
 	}
 	// r1（conditions=NULL → '[]'）从 DB 加载成功但被发射侧正确跳过（空条件）——
-	// 关键是不得再被误报为「不存在」（修复前 scan 失败 → continue → 静默丢弃）
+	// 负向断言：不得出现其发射行，也不得再被误报为「不存在」（修复前 scan
+	// 失败 → continue → 静默丢弃）。
+	if wantID1 := fmt.Sprintf("id:%d", r1ID+10000); strings.Contains(directives, wantID1) {
+		t.Fatalf("空条件规则不得发射（want 无 %s）:\n%s", wantID1, directives)
+	}
 }
 
 func TestBuildRateLimitHandler_sweepIntervalAtHandlerLevel(t *testing.T) {

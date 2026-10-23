@@ -171,7 +171,7 @@ func TestRequeueNonTerminalCertJobs_skipsIssuance_whenSelectedCertificateIsOutsi
 	queued := 0
 
 	// When
-	err := requeueNonTerminalCertJobs(context.Background(), func(int, issuedCertificate, time.Duration) { queued++ })
+	err := requeueNonTerminalCertJobs(context.Background(), func(int, issuedCertificate, time.Duration) error { queued++; return nil })
 
 	// Then
 	if err != nil {

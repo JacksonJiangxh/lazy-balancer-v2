@@ -297,8 +297,13 @@ func cleanupAutoBackupTempFiles(dir string) error {
 // auto_backups 落 failed 行 + 「备份失败」审计，两处终态分叉。写盘报错后先看
 // ctx：已取消（含 deadline）则按取消返回，交由调用方零行/零审计收尾（与
 // 同口径）；未取消才是真实磁盘故障。
+// autoBackupWriteFile 落盘入口（测试缝）：生产恒等
+// services.WriteAutoBackupFileSynced（唯一原子写实现，不另造平行路径）；
+// 用例经此注入写错误，使写失败回归不依赖进程身份（root/容器内 chmod 不拦截）。
+var autoBackupWriteFile = services.WriteAutoBackupFileSynced
+
 func writeAutoBackupPayload(ctx context.Context, path string, payload []byte) error {
-	err := services.WriteAutoBackupFileSynced(path, payload)
+	err := autoBackupWriteFile(path, payload)
 	if err != nil && ctx != nil {
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr

@@ -186,7 +186,7 @@ func validateV2Backup(backup configBackup) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if err := validateV2BackupRows(backup); err != nil {
+	if err := validateV2BackupRows(context.Background(), db.DB, backup); err != nil {
 		return false, err
 	}
 	if err := validateV2BackupCertJobStatuses(backup.Tables); err != nil {

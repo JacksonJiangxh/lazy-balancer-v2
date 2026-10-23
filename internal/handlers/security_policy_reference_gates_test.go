@@ -37,6 +37,7 @@ func TestLibAutoUpdateEndpoints_rejectWriteDuringImport(t *testing.T) {
 		{"ip2region", "/security/ip2region/auto-update", h.UpdateIP2RegionAutoUpdate},
 		{"crs", "/security/crs/auto-update", h.UpdateCRSAutoUpdate},
 		{"threat", "/security/threat/auto-update", h.UpdateThreatAutoUpdate},
+		{"crawler", "/security/crawler-lib/auto-update", h.UpdateCrawlerAutoUpdate},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

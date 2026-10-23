@@ -222,7 +222,7 @@ export interface CertJobListItem {
   retry_cooldown_seconds: number | null
 }
 
-export type ClusterNodeMode = 'master' | 'slave'
+export type ClusterNodeMode = 'master' | 'slave' | 'unknown'
 
 export type ClusterNodeStatus = 'pending' | 'online' | 'offline'
 

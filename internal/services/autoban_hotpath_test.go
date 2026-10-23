@@ -198,8 +198,8 @@ func TestAutobanDisableFlush_hotPathWhenEligible(t *testing.T) {
 	setAutobanConfigRaw(t, true, 1, 5, "1h", "all", false)
 	seedAutobanListReferencedByPolicy(t)
 	seedPresetEntries(t, []models.IPListEntry{
-		{Value: "198.51.100.1", Remark: AutobanEntryRemark, CreatedAt: "2026-10-13 10:00:00", ExpiresAt: "2026-10-14 09:00:00"}, // 已到期
-		{Value: "198.51.100.2", Remark: AutobanEntryRemark, CreatedAt: "2026-10-14 09:30:00", ExpiresAt: "2026-10-14 11:00:00"}, // 未到期
+		{Value: "198.51.100.1", Remark: autobanEntryRemark, CreatedAt: "2026-10-13 10:00:00", ExpiresAt: "2026-10-14 09:00:00"}, // 已到期
+		{Value: "198.51.100.2", Remark: autobanEntryRemark, CreatedAt: "2026-10-14 09:30:00", ExpiresAt: "2026-10-14 11:00:00"}, // 未到期
 	})
 	spy := installAutobanConvergeSpy(t, func() (IPListProjectionOutcome, error) { return ProjectionConverged, nil })
 

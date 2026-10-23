@@ -311,7 +311,7 @@ func getACMECertInfo(caddyID, ruleDomain string) (*models.RuleCertInfo, error) {
 		SELECT id, status, COALESCE(cert_pem, ''), COALESCE(key_pem, ''),
 		       COALESCE(julianday(COALESCE(updated_at, created_at)), 0), COALESCE(domain, '')
 		FROM cert_jobs
-		WHERE rule_id = ? AND COALESCE(cert_pem, '') != '' AND COALESCE(key_pem, '') != ''
+		WHERE rule_id = ? AND `+CertJobMaterialPredicateSQL("")+`
 		ORDER BY updated_at DESC, id DESC`, caddyID)
 	if err != nil {
 		Logf("error", "GetRuleCertInfo: failed to read ACME certificates for %s: %v", caddyID, err)

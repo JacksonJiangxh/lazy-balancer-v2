@@ -13,7 +13,7 @@ import { COUNTRY_CENTROIDS, FALLBACK_CENTROID } from '@/utils/countryCentroids'
 import { THREAT_COUNTRIES } from '@/utils/worldBorders'
 import { CHINA_PROVINCES } from '@/utils/chinaProvinces'
 import { loadAdmin1Tables, loadedAdmin1Tables } from '@/utils/admin1Loader'
-import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, arcEndpoints, normalizeCountryName, aggregateCountryCounts, drillCountryAllowed, DOT_LAND, arcOriginForLocation, hasProvinceStats, drillCommitAllowed, drillClickIntent, provinceDotGrid, trafficOriginForCountry } from '@/utils/threatShared'
+import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, arcEndpoints, normalizeCountryName, aggregateCountryCounts, buildCountryCellGrid, countryGridCell, drillCountryAllowed, DOT_LAND, arcOriginForLocation, hasProvinceStats, drillCommitAllowed, drillClickIntent, provinceDotGrid, trafficOriginForCountry } from '@/utils/threatShared'
 import type { ThreatScene, ThreatSceneOptions, CountryHeat } from '@/utils/threatScene'
 import { FLOW_ATTACK_COLOR, FLOW_NORMAL_COLOR, FLOW_FLIGHT_MS, FLOW_HOVER_TIP_COLOR, FLOW_RIPPLE_SECONDS, FLOW_RIPPLE_START_RADIUS, FLOW_RIPPLE_GROWTH_RADIUS, FLOW_RIPPLE_LINE_WIDTH, FLOW_RIPPLE_ALPHA, easeOutCubic, flowArcLabel, flowArcTierWidth, type FlowArcTier } from '@/utils/threatTheme'
 import { planFlowArcs } from '@/utils/threatFlowRules'
@@ -214,19 +214,12 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
   let hoveredDotCountry: string | null = null
   // 本实例是否持有共享点阵贴图的一次引用（dispose 时释放，最后一个实例归零销毁）。
   let dotTextureHeld = false
-  // 国家级 bbox 预筛（构造期算一次）：点阵构建 + hover/click 命中测试共用
-  // （countryHit）。历史：只给 buildWorldDots 消费，hover/click 对 177 国全量
-  // 射线，下钻态每 120ms 复测仍付全表成本。
-  const dotBboxes = THREAT_COUNTRIES.map((c) => {
-    let minLon = 180, maxLon = -180, minLat = 90, maxLat = -90
-    for (const poly of c.polys) for (const ring of poly) for (let k = 0; k + 1 < ring.length; k += 2) {
-      if (ring[k] < minLon) minLon = ring[k]
-      if (ring[k] > maxLon) maxLon = ring[k]
-      if (ring[k + 1] < minLat) minLat = ring[k + 1]
-      if (ring[k + 1] > maxLat) maxLat = ring[k + 1]
-    }
-    return { minLon, maxLon, minLat, maxLat }
-  })
+  // 国家级 bbox 预筛（构造期算一次，由共享 5° 网格一并产出）：点阵构建 +
+  // hover/click 命中测试共用（countryHit）。历史：只给 buildWorldDots 消费，
+  // hover/click 对 177 国全量射线，下钻态每 120ms 复测仍付全表成本。
+  // 点阵构建与地图引擎共用同一空间网格（原逐点全表 239 国扫描是首开长任务根因）。
+  const sharedCountryGrid = buildCountryCellGrid(THREAT_COUNTRIES)
+  const dotBboxes = sharedCountryGrid.bounds
   const arcs: ArcDatum[] = []
   let disposed = false
   let paused = false
@@ -706,7 +699,8 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
     for (let lat = DOT_LAT_BOTTOM; lat < DOT_LAT_TOP; lat += DOT_STEP, row++) {
       const offset = row % 2 === 1 ? DOT_STEP / 2 : 0
       for (let lon = -179.5 + offset; lon < 180; lon += DOT_STEP) {
-        for (let ci = 0; ci < THREAT_COUNTRIES.length; ci++) {
+        const candidates = sharedCountryGrid.grid.get(countryGridCell(lon, lat)) ?? []
+        for (const ci of candidates) {
           const b = dotBboxes[ci]
           if (lon < b.minLon || lon > b.maxLon || lat < b.minLat || lat > b.maxLat) continue
           if (!sharedPointInPolys(lon, lat, THREAT_COUNTRIES[ci].polys)) continue

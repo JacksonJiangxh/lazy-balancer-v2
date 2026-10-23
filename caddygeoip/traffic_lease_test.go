@@ -312,3 +312,48 @@ func TestTrafficLease_clampsSampleNToSupportedRange(t *testing.T) {
 		t.Fatalf("effective sample_n=%d, want 3", got)
 	}
 }
+
+// 多租约下释放其一：DELETE 必须报告释放后的真实状态（仍 enabled、租约数
+// 递减），与 GET 完全同形——此前无条件回 {"enabled":false}，调用方会误以为
+// 采集已停止。
+func TestTrafficCollectorAdmin_deleteReportsLiveState(t *testing.T) {
+	resetTrafficState(t)
+	trafficCollectorEnabled.Store(false)
+
+	for _, id := range []string{"tab-1", "tab-2"} {
+		body := bytes.NewBufferString(`{"lease_id":"` + id + `","ttl_ms":30000}`)
+		rec := httptest.NewRecorder()
+		if err := serveTrafficCollector(rec, httptest.NewRequest(http.MethodPost, "/lb/traffic-collector", body)); err != nil {
+			t.Fatal(err)
+		}
+		if rec.Code != http.StatusOK {
+			t.Fatalf("post %s status=%d", id, rec.Code)
+		}
+	}
+
+	rec := httptest.NewRecorder()
+	if err := serveTrafficCollector(rec, httptest.NewRequest(http.MethodDelete, "/lb/traffic-collector?lease_id=tab-1", nil)); err != nil {
+		t.Fatal(err)
+	}
+	deleteBody := rec.Body.String()
+	if deleteBody != `{"enabled":true,"leases":1}` {
+		t.Fatalf("DELETE 后状态=%s, want enabled=true leases=1（仍有活跃租约）", deleteBody)
+	}
+
+	rec = httptest.NewRecorder()
+	if err := serveTrafficCollector(rec, httptest.NewRequest(http.MethodGet, "/lb/traffic-collector", nil)); err != nil {
+		t.Fatal(err)
+	}
+	if got := rec.Body.String(); got != deleteBody {
+		t.Fatalf("GET=%s, DELETE=%s（两路由必须同形同值）", got, deleteBody)
+	}
+
+	// 末租约释放后如实报告关闭。
+	rec = httptest.NewRecorder()
+	if err := serveTrafficCollector(rec, httptest.NewRequest(http.MethodDelete, "/lb/traffic-collector?lease_id=tab-2", nil)); err != nil {
+		t.Fatal(err)
+	}
+	if got := rec.Body.String(); got != `{"enabled":false,"leases":0}` {
+		t.Fatalf("末租约释放后状态=%s, want enabled=false leases=0", got)
+	}
+}

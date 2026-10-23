@@ -391,22 +391,29 @@ func TestListIPLists_systemListsPinnedFirst(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows := payload.Data
-	if len(rows) < 6 {
-		t.Fatalf("行数=%d, want ≥6（4 系统+2 用户）", len(rows))
+	// 系统名单数量取自种子行（威胁三源 + 自动封禁名单），不硬编码。
+	var wantSystem int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM security_ip_lists WHERE system=1`).Scan(&wantSystem); err != nil {
+		t.Fatal(err)
 	}
+	if len(rows) < wantSystem+2 {
+		t.Fatalf("行数=%d, want ≥%d（%d 系统+2 用户）", len(rows), wantSystem+2, wantSystem)
+	}
+	// 系统行必须是**连续前缀**（置顶形态）——不绑定具体系统名单数量。
 	sysCount := 0
+	seenUser := false
 	for i, row := range rows {
 		if row.System {
-			if i >= 4 {
-				t.Fatalf("系统名单必须置顶：第 %d 行仍是系统名单 %q", i, row.Name)
+			if seenUser {
+				t.Fatalf("系统名单必须连续置顶：第 %d 行 %q 出现在用户列表之后", i, row.Name)
 			}
 			sysCount++
-		} else if i < 4 {
-			t.Fatalf("前 4 行必须是系统名单：第 %d 行是用户列表 %q", i, row.Name)
+			continue
 		}
+		seenUser = true
 	}
-	if sysCount != 4 {
-		t.Fatalf("系统名单=%d, want 4", sysCount)
+	if sysCount != wantSystem {
+		t.Fatalf("系统名单=%d, want %d（种子表）", sysCount, wantSystem)
 	}
 	if rows[0].Name != threatSystemListNameForOrderTest(t) {
 		t.Fatalf("系统组内应按更新时间序（最新在前），首行=%q", rows[0].Name)

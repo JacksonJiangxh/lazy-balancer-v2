@@ -41,8 +41,6 @@ const threatRollupRewindWindowHours = 24 * 7
 // threatActiveSourceWindow 活跃攻击源窗口（设计定稿）：近 10 分钟去重 client_ip。
 const threatActiveSourceWindow = 10 * time.Minute
 
-// topThreatEntries 计数 map → 前 n 条（值降序；同值按名称升序——确定性输出，
-// 大屏 30s 轮询重渲染名次不抖动）。
 // describeThreatRuleName 把「命中规则」维度的原始 SecRule id 翻译为可读标签。
 // 大屏直接展示本标签：事件里的 rule_triggered 是 coraza SecRule id，裸数字
 // 对用户无意义（阶段 1 预检为合成 id、CRS 为 9xxxxx、自定义规则为 DB id+10000、
@@ -128,6 +126,8 @@ func labeledThreatRuleCounts(counts map[string]int) map[string]int {
 	return labeled
 }
 
+// topThreatEntries 计数 map → 前 n 条（值降序；同值按名称升序——确定性输出，
+// 大屏 30s 轮询重渲染名次不抖动）。
 func topThreatEntries(counts map[string]int, n int) []models.SecurityAttackType {
 	entries := make([]models.SecurityAttackType, 0, len(counts))
 	for name, value := range counts {
@@ -193,12 +193,14 @@ const (
 	// 递增 threatRollupClassifierVersion，代际不一致按空覆盖重固。
 	threatRollupClassifierVersionKey = "threat_rollup_classifier_version"
 	threatRollupClassifierVersion    = "2"
-	// threatRollupPredicateVersionKey / threatRollupPredicateVersion 保留地址
-	// 排除谓词（isReservedIP 族）的口径代际：谓词变更会让已固化分钟的口径
-	// 静默过时（水位机制只保护迟到事件，不保护语义变更）——修改保留地址
-	// 排除口径时必须 bump 本版本，代际不一致按空覆盖重固。
+	// threatRollupPredicateVersionKey / threatRollupPredicateVersion 固化口径
+	// 代际：保留地址排除谓词与攻击口径（爬虫放行不计入攻击）都会让已固化
+	// 分钟的口径静默过时（水位机制只保护迟到事件，不保护语义变更）——口径
+	// 变更必须 bump 本版本，代际不一致按空覆盖重固。
+	// v2：爬虫放行的 logged 事件不再计入攻击面（总量/拦截率分母/攻击族/
+	// Top 规则/被攻击目标）。
 	threatRollupPredicateVersionKey = "threat_rollup_predicate_version"
-	threatRollupPredicateVersion    = "1"
+	threatRollupPredicateVersion    = "2"
 	// threatRollupActionEnumVersionKey / threatRollupActionEnumVersion 事件
 	// action 取值枚举（blocked/logged 族）的口径代际：枚举/命名变更必须
 	// bump，否则大屏 blocked/总量比例静默漂移。
@@ -645,6 +647,7 @@ func ensureThreatRollupWithYields(hours int) error {
 			{threatRollupActionEnumVersionKey, threatRollupActionEnumVersion},
 		} {
 			if _, err := tx.Exec(`INSERT INTO metrics_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, kv[0], kv[1]); err != nil {
+				tx.Rollback()
 				return err
 			}
 		}
@@ -873,6 +876,114 @@ func saveThreatRollupEventHighwater(tx *sql.Tx, minute string, id int64) error {
 	return err
 }
 
+// threatRollupKey 分钟 rollup 的维度键（与 security_event_rollup 主键同集合）。
+type threatRollupKey struct{ country, province, family, rule, action string }
+
+// loadExistingRollup 读取某分钟已固化的两张 rollup 行（增量基线）。读入即按
+// 当前攻击口径过滤：口径升级前固化的放行行（原始事件可能已被保留期裁剪、
+// 无法重算）不得继续计入。目标维度行无规则/动作列，无法按行判定，按原值
+// 保留（仅影响历史分钟的「被攻击目标」展示，已知且有界）。
+func loadExistingRollup(tx *sql.Tx, minuteStr string) (map[threatRollupKey]int, map[string]int, error) {
+	agg := map[threatRollupKey]int{}
+	targetAgg := map[string]int{}
+	oldRows, err := tx.Query(`SELECT country, province, family, rule, action, count FROM security_event_rollup WHERE minute=?`, minuteStr)
+	if err != nil {
+		return nil, nil, err
+	}
+	for oldRows.Next() {
+		var k threatRollupKey
+		var count int
+		if err := oldRows.Scan(&k.country, &k.province, &k.family, &k.rule, &k.action, &count); err != nil {
+			oldRows.Close()
+			return nil, nil, err
+		}
+		if !services.SecurityEventCountsAsAttack(k.action, k.rule) {
+			continue
+		}
+		agg[k] = count
+	}
+	if err := oldRows.Err(); err != nil {
+		oldRows.Close()
+		return nil, nil, err
+	}
+	oldRows.Close()
+	targetRows, err := tx.Query(`SELECT rule_caddy_id, count FROM security_event_target_rollup WHERE minute=?`, minuteStr)
+	if err != nil {
+		return nil, nil, err
+	}
+	for targetRows.Next() {
+		var ruleID string
+		var count int
+		if err := targetRows.Scan(&ruleID, &count); err != nil {
+			targetRows.Close()
+			return nil, nil, err
+		}
+		targetAgg[ruleID] = count
+	}
+	if err := targetRows.Err(); err != nil {
+		targetRows.Close()
+		return nil, nil, err
+	}
+	targetRows.Close()
+	return agg, targetAgg, nil
+}
+
+// aggregateEvents 聚合 [from, to) 分钟内的原始事件到 rollup 维度，只计计入
+// 攻击口径的事件（爬虫放行的 logged 事件不是攻击）；afterID>0 时只取 id 更大
+// 的迟到事件（增量模式）。返回维度计数、目标计数与本次计入的事件总数。
+func aggregateEvents(tx *sql.Tx, from, to time.Time, afterID int64) (map[threatRollupKey]int, map[string]int, int, error) {
+	agg := map[threatRollupKey]int{}
+	targetAgg := map[string]int{}
+	rawQuery := `SELECT client_ip, COALESCE(NULLIF(rule_name,''), COALESCE(rule_triggered,'')), COALESCE(rule_triggered,''), COALESCE(rule_msg,''), action, COALESCE(rule_caddy_id,''), COUNT(*)
+		FROM security_events
+		WHERE event_time >= ? AND event_time < ?`
+	args := []any{from.Format("2006-01-02 15:04:05"), to.Format("2006-01-02 15:04:05")}
+	if afterID > 0 {
+		rawQuery += ` AND id > ?`
+		args = append(args, afterID)
+	}
+	rawQuery += `
+		GROUP BY client_ip, COALESCE(NULLIF(rule_name,''), COALESCE(rule_triggered,'')), COALESCE(rule_triggered,''), COALESCE(rule_msg,''), action, COALESCE(rule_caddy_id,'')`
+	rows, err := tx.Query(rawQuery, args...)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	total := 0
+	for rows.Next() {
+		var ip, ruleName, ruleTriggered, ruleMsg, action, ruleCaddyID string
+		var count int
+		if err := rows.Scan(&ip, &ruleName, &ruleTriggered, &ruleMsg, &action, &ruleCaddyID, &count); err != nil {
+			rows.Close()
+			return nil, nil, 0, err
+		}
+		if isReservedIP(ip) {
+			continue
+		}
+		if !services.SecurityEventCountsAsAttack(action, ruleTriggered) {
+			continue
+		}
+		country, province := threatLocationParts(enrichIPLocation(ip))
+		// top_rules 维度优先 rule_triggered（真正的 WAF/CRS/自定义规则 ID），
+		// 无归属时才回退负载规则名；混用两者会让「TOP 命中规则」名不副实
+		//
+		ruleKey := ruleTriggered
+		if ruleKey == "" {
+			ruleKey = ruleName
+		}
+		agg[threatRollupKey{country, province, categorizeAttack(ruleTriggered, ruleMsg), ruleKey, action}] += count
+		total += count
+		if ruleCaddyID != "" {
+			targetAgg[ruleCaddyID] += count
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, nil, 0, err
+	}
+	rows.Close()
+	return agg, targetAgg, total, nil
+}
+
 // threatFixMinuteWithMode 单分钟固化：首次/旧状态按全量重建，已有事件高水位后
 // 增量模式只叠加 id 更大的迟到事件；fullRebuild 强制丢弃旧水位并全量重建。
 func threatFixMinuteWithMode(tx *sql.Tx, m time.Time, fullRebuild bool) error {
@@ -887,94 +998,28 @@ func threatFixMinuteWithMode(tx *sql.Tx, m time.Time, fullRebuild bool) error {
 		m.Format("2006-01-02 15:04:05"), next.Format("2006-01-02 15:04:05")).Scan(&currentMaxID); err != nil {
 		return err
 	}
-	type key struct{ country, province, family, rule, action string }
-	agg := map[key]int{}
+	agg := map[threatRollupKey]int{}
 	targetAgg := map[string]int{}
 	incremental := !fullRebuild && previousMaxID > 0
+	afterID := int64(0)
 	if incremental {
-		oldRows, err := tx.Query(`SELECT country, province, family, rule, action, count FROM security_event_rollup WHERE minute=?`, minuteStr)
-		if err != nil {
-			return err
+		var lerr error
+		agg, targetAgg, lerr = loadExistingRollup(tx, minuteStr)
+		if lerr != nil {
+			return lerr
 		}
-		for oldRows.Next() {
-			var k key
-			var count int
-			if err := oldRows.Scan(&k.country, &k.province, &k.family, &k.rule, &k.action, &count); err != nil {
-				oldRows.Close()
-				return err
-			}
-			agg[k] = count
-		}
-		if err := oldRows.Err(); err != nil {
-			oldRows.Close()
-			return err
-		}
-		oldRows.Close()
-		targetRows, err := tx.Query(`SELECT rule_caddy_id, count FROM security_event_target_rollup WHERE minute=?`, minuteStr)
-		if err != nil {
-			return err
-		}
-		for targetRows.Next() {
-			var ruleID string
-			var count int
-			if err := targetRows.Scan(&ruleID, &count); err != nil {
-				targetRows.Close()
-				return err
-			}
-			targetAgg[ruleID] = count
-		}
-		if err := targetRows.Err(); err != nil {
-			targetRows.Close()
-			return err
-		}
-		targetRows.Close()
+		afterID = previousMaxID
 	}
-
-	rawQuery := `SELECT client_ip, COALESCE(NULLIF(rule_name,''), COALESCE(rule_triggered,'')), COALESCE(rule_triggered,''), COALESCE(rule_msg,''), action, COALESCE(rule_caddy_id,''), COUNT(*)
-		FROM security_events
-		WHERE event_time >= ? AND event_time < ?`
-	args := []any{m.Format("2006-01-02 15:04:05"), next.Format("2006-01-02 15:04:05")}
-	if incremental {
-		rawQuery += ` AND id > ?`
-		args = append(args, previousMaxID)
-	}
-	rawQuery += `
-		GROUP BY client_ip, COALESCE(NULLIF(rule_name,''), COALESCE(rule_triggered,'')), COALESCE(rule_triggered,''), COALESCE(rule_msg,''), action, COALESCE(rule_caddy_id,'')`
-	rows, err := tx.Query(rawQuery, args...)
+	deltaAgg, deltaTarget, deltaTotal, err := aggregateEvents(tx, m, next, afterID)
 	if err != nil {
 		return err
 	}
-	deltaTotal := 0
-	for rows.Next() {
-		var ip, ruleName, ruleTriggered, ruleMsg, action, ruleCaddyID string
-		var count int
-		if err := rows.Scan(&ip, &ruleName, &ruleTriggered, &ruleMsg, &action, &ruleCaddyID, &count); err != nil {
-			rows.Close()
-			return err
-		}
-		if isReservedIP(ip) {
-			continue
-		}
-		country, province := threatLocationParts(enrichIPLocation(ip))
-		// top_rules 维度优先 rule_triggered（真正的 WAF/CRS/自定义规则 ID），
-		// 无归属时才回退负载规则名；混用两者会让「TOP 命中规则」名不副实
-		//
-		ruleKey := ruleTriggered
-		if ruleKey == "" {
-			ruleKey = ruleName
-		}
-		k := key{country, province, categorizeAttack(ruleTriggered, ruleMsg), ruleKey, action}
+	for k, count := range deltaAgg {
 		agg[k] += count
-		deltaTotal += count
-		if ruleCaddyID != "" {
-			targetAgg[ruleCaddyID] += count
-		}
 	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return err
+	for id, count := range deltaTarget {
+		targetAgg[id] += count
 	}
-	rows.Close()
 	highwater := currentMaxID
 	if previousMaxID > highwater {
 		highwater = previousMaxID
@@ -993,11 +1038,39 @@ func threatFixMinuteWithMode(tx *sql.Tx, m time.Time, fullRebuild bool) error {
 			return err
 		}
 		if newTotal < oldTotal {
-			// 原始事件已被裁剪且无高水位可做增量：保留两张 rollup 原行，
-			// 但记录当前最大 id，下一次迟到事件起走增量叠加。
-			return saveThreatRollupEventHighwater(tx, minuteStr, highwater)
-		}
-		if newTotal == 0 && oldTotal == 0 {
+			// 原始事件已被保留期/行帽裁剪：全量重算只看得到剩余行，直接覆盖
+			// 会丢掉「已固化但原始行已消失」的历史。保留旧行（读入时已按当前
+			// 攻击口径过滤）并叠加高水位之后的迟到事件——迟到事件仍在原始表
+			// 内，可安全并入。无高水位（口径上线前的历史分钟）时无法区分「迟到」
+			// 与「已计入」，不做增量叠加；但口径外行（放行族）仍须借本次重写
+			// 落库清除，否则旧口径固化行永久留存。
+			oldAgg, oldTarget, lerr := loadExistingRollup(tx, minuteStr)
+			if lerr != nil {
+				return lerr
+			}
+			kept := 0
+			for _, count := range oldAgg {
+				kept += count
+			}
+			lateTotal := 0
+			if previousMaxID > 0 {
+				lateAgg, lateTarget, lateCount, aerr := aggregateEvents(tx, m, next, previousMaxID)
+				if aerr != nil {
+					return aerr
+				}
+				lateTotal = lateCount
+				for k, count := range lateAgg {
+					oldAgg[k] += count
+				}
+				for id, count := range lateTarget {
+					oldTarget[id] += count
+				}
+			}
+			agg, targetAgg = oldAgg, oldTarget
+			if lateTotal == 0 && kept == oldTotal {
+				return saveThreatRollupEventHighwater(tx, minuteStr, highwater)
+			}
+		} else if newTotal == 0 && oldTotal == 0 {
 			return saveThreatRollupEventHighwater(tx, minuteStr, highwater)
 		}
 	}
@@ -1315,6 +1388,41 @@ func threatBucketIndex(mt time.Time, bucketStarts []time.Time) int {
 	return idx
 }
 
+// threatScreenZeroPayload 零值面板（MetricsDB 未装配）：键集与成功路径一致，
+// top_targets 用与成功路径相同的元素类型（[]threatTopTarget，而非另一族
+// SecurityAttackType）——空数组在 JSON 层无差别，但类型契约分叉会让后续
+// 给零值面板补条目时静默产出缺字段的条目。
+func threatScreenZeroPayload(hours int, now time.Time, loc *time.Location) gin.H {
+	_, hourly := threatHourlyBuckets(hours, now, loc)
+	return gin.H{
+		"hours":                hours,
+		"window_start":         "",
+		"window_start_minute":  "",
+		"rollup_stale":         threatRollupStale(),
+		"rollup_last_success":  "",
+		"rollup_coverage_from": "",
+		"raw_coverage_from":    "",
+		"backfill_incomplete":  false,
+		"total_events":         0,
+		"blocked_events":       0,
+		"logged_events":        0,
+		"block_rate":           0.0,
+		"ratelimit_blocks":     0.0,
+		"ratelimit_available":  false,
+		"active_sources":       0,
+		"countries":            map[string]int{},
+		"china_provinces":      map[string]int{},
+		"top_countries":        []models.SecurityAttackType{},
+		"top_attack_types":     []models.SecurityAttackType{},
+		"top_rules":            []models.SecurityAttackType{},
+		"top_targets":          []threatTopTarget{},
+		"hourly_hist":          hourly,
+		"attack_type_share":    []models.SecurityAttackType{},
+		"recent_rate":          0.0,
+		"ingestion":            services.SecurityEventsIngestionHealthSnapshot(),
+	}
+}
+
 // GetSecurityThreatScreen GET /security/overview/threat-screen?hours=24
 // 返回大屏聚合：窗口总量/拦截率/logged 数/限流拦截数（Caddy metrics 429，
 // 重载口径）/活跃攻击源（近 10min 去重）/国家计数 map（ip_location 首段，
@@ -1332,39 +1440,9 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 	}
 	now := threatScreenNow()
 	loc := services.CurrentLocation()
-	zero := func() gin.H {
-		_, hourly := threatHourlyBuckets(hours, now, loc)
-		return gin.H{
-			"hours":                hours,
-			"window_start":         "",
-			"window_start_minute":  "",
-			"rollup_stale":         threatRollupStale(),
-			"rollup_last_success":  "",
-			"rollup_coverage_from": "",
-			"raw_coverage_from":    "",
-			"backfill_incomplete":  false,
-			"total_events":         0,
-			"blocked_events":       0,
-			"logged_events":        0,
-			"block_rate":           0.0,
-			"ratelimit_blocks":     0.0,
-			"ratelimit_available":  false,
-			"active_sources":       0,
-			"countries":            map[string]int{},
-			"china_provinces":      map[string]int{},
-			"top_countries":        []models.SecurityAttackType{},
-			"top_attack_types":     []models.SecurityAttackType{},
-			"top_rules":            []models.SecurityAttackType{},
-			"top_targets":          []models.SecurityAttackType{},
-			"hourly_hist":          hourly,
-			"attack_type_share":    []models.SecurityAttackType{},
-			"recent_rate":          0.0,
-			"ingestion":            services.SecurityEventsIngestionHealthSnapshot(),
-		}
-	}
 	if db.MetricsDB == nil {
 		// MetricsDB 未装配：零值面板 200 而非 panic
-		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: zero()})
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: threatScreenZeroPayload(hours, now, loc)})
 		return
 	}
 
@@ -1662,6 +1740,7 @@ func (h *Handlers) GetSecurityEventToastSummary(c *gin.Context) {
 			SELECT client_ip, action, rule_triggered, rule_msg, duration_us, id
 			FROM security_events
 			WHERE id > ? AND event_time >= datetime('now','-5 minutes')
+			  AND `+services.AttackEventSQLPredicate("rule_triggered", "action")+`
 			ORDER BY id DESC
 			LIMIT ?
 		)
@@ -1817,6 +1896,11 @@ func (h *Handlers) GetSecurityEventFeed(c *gin.Context) {
 			// 保留/私网 IP 不进大屏事件流（v4 裁定，与聚合口径一致）；游标
 			// 语义不受影响——next_since_id 恒为已扫描最大 id，被过滤行只是跳过。
 			if isReservedIP(e.ClientIP) {
+				continue
+			}
+			// 爬虫放行不是攻击：不进大屏事件流（与聚合口径一致）；游标照常
+			// 推进——next_since_id 恒为已扫描最大 id，被过滤行只是跳过。
+			if !services.SecurityEventCountsAsAttack(e.Action, ruleTriggered) {
 				continue
 			}
 			e.AttackType = categorizeAttack(ruleTriggered, ruleMsg)

@@ -106,6 +106,11 @@ func storeAuditOptionsCache(payload map[string]interface{}, now time.Time) {
 // 披露「本次计数来自缓存」，消费方据此判断是否需要刷新核对。
 var auditLogCountCacheTTL = 5 * time.Second
 
+// auditLogCountCacheMaxEntries 计数缓存桶上限（任意筛选组合不得让缓存无界
+// 增长）；越界逐出 at 最旧的一个桶，而非清空全表——清空会让紧接着的请求
+// 全部退化回全表 COUNT(*)。
+const auditLogCountCacheMaxEntries = 64
+
 type auditLogCountEntry struct {
 	total int64
 	at    time.Time
@@ -135,8 +140,10 @@ func auditLogCountCacheKey(where string, args []interface{}) string {
 }
 
 // cachedAuditLogTotal 返回当前筛选条件的 total；stale=true 表示来自缓存。
-// 缓存桶上限 64（任意筛选组合不得让缓存无界增长），越界整表重置。
-func cachedAuditLogTotal(database *sql.DB, where string, args []interface{}) (int64, bool, error) {
+// 缓存桶上限 auditLogCountCacheMaxEntries，越界逐出 at 最旧的一个桶。
+// 计数走请求 context：百万行 COUNT(*) 在客户端断开后不应继续跑完并占用
+// SQLite 连接。
+func cachedAuditLogTotal(ctx context.Context, database *sql.DB, where string, args []interface{}) (int64, bool, error) {
 	key := auditLogCountCacheKey(where, args)
 	now := time.Now()
 	auditLogCounts.Lock()
@@ -146,15 +153,23 @@ func cachedAuditLogTotal(database *sql.DB, where string, args []interface{}) (in
 		return entry.total, true, nil
 	}
 	var total int64
-	if err := database.QueryRow("SELECT COUNT(*) FROM audit_log"+where, args...).Scan(&total); err != nil {
+	if err := database.QueryRowContext(ctx, "SELECT COUNT(*) FROM audit_log"+where, args...).Scan(&total); err != nil {
 		return 0, false, err
 	}
 	auditLogCounts.Lock()
-	if len(auditLogCounts.entries) >= 64 {
-		auditLogCounts.entries = nil
-	}
 	if auditLogCounts.entries == nil {
 		auditLogCounts.entries = map[string]auditLogCountEntry{}
+	}
+	if len(auditLogCounts.entries) >= auditLogCountCacheMaxEntries {
+		oldestKey, oldestAt := "", time.Time{}
+		for k, v := range auditLogCounts.entries {
+			if oldestKey == "" || v.at.Before(oldestAt) {
+				oldestKey, oldestAt = k, v.at
+			}
+		}
+		if oldestKey != "" {
+			delete(auditLogCounts.entries, oldestKey)
+		}
 	}
 	auditLogCounts.entries[key] = auditLogCountEntry{total: total, at: now}
 	auditLogCounts.Unlock()
@@ -362,13 +377,13 @@ func (h *Handlers) GetAuditLogs(c *gin.Context) {
 	// total 走 5s 进程缓存（键=筛选条件签名）：百万行审计库下每请求一次
 	// 全表 COUNT(*) 是首屏固定成本，翻页/筛选反复支付；行数是展示与翻页
 	// 锚点，短陈旧不可感知，响应以 total_stale 披露来源（不静默）。
-	total, totalStale, err := cachedAuditLogTotal(db.AuditDB, where, args)
+	total, totalStale, err := cachedAuditLogTotal(c.Request.Context(), db.AuditDB, where, args)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "查询操作日志失败"})
 		return
 	}
 
-	rows, err := db.AuditDB.Query(`
+	rows, err := db.AuditDB.QueryContext(c.Request.Context(), `
 		SELECT id,
 		       COALESCE(username, ''),
 		       action,
@@ -425,7 +440,7 @@ func (h *Handlers) GetAuditLogs(c *gin.Context) {
 			placeholders = append(placeholders, "?")
 			args = append(args, name)
 		}
-		userRows, err := db.DB.Query("SELECT username, COALESCE(NULLIF(TRIM(display_name), ''), username) FROM users WHERE username IN ("+strings.Join(placeholders, ",")+")", args...)
+		userRows, err := db.DB.QueryContext(c.Request.Context(), "SELECT username, COALESCE(NULLIF(TRIM(display_name), ''), username) FROM users WHERE username IN ("+strings.Join(placeholders, ",")+")", args...)
 		if err != nil {
 			services.Logf("error", "GetAuditLogs: failed to enrich usernames, using usernames: %v", err)
 		} else {

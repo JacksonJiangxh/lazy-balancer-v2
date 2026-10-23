@@ -151,6 +151,16 @@ func TestThreatEndpoints_rejectWriteDuringImport(t *testing.T) {
 	if recorder.Code != http.StatusConflict {
 		t.Fatalf("UpdateThreatSourceFlags during import = %d body=%s, want 409", recorder.Code, recorder.Body.String())
 	}
+
+	// 爬虫源开关同族：门同样先于 body 解析（空 body 也得 409 而非 400）。
+	recorder = httptest.NewRecorder()
+	ctx, _ = gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPut, "/security/crawler-lib/1/flags", nil)
+	ctx.Params = gin.Params{{Key: "id", Value: "1"}}
+	h.UpdateCrawlerLibFlags(ctx)
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("UpdateCrawlerLibFlags during import = %d body=%s, want 409", recorder.Code, recorder.Body.String())
+	}
 }
 
 // batch-bind 幂等 merge（目标集与现绑定完全一致）不得计为「成功」——
@@ -235,9 +245,16 @@ func TestListSecurityPolicies_exposesStaleCRSSelections(t *testing.T) {
 		got[p.Name] = p.CRSStale
 	}
 	want := map[string]bool{"stale-group": true, "stale-id": true, "fresh": false, "empty": false}
+	if len(payload.Data) != len(want) {
+		t.Fatalf("列表行数=%d, want %d（行被丢弃时仅查 map 会把缺失当成 false 蒙混通过）", len(payload.Data), len(want))
+	}
 	for name, w := range want {
-		if got[name] != w {
-			t.Fatalf("policy %s crs_stale_selections=%v, want %v", name, got[name], w)
+		v, present := got[name]
+		if !present {
+			t.Fatalf("策略 %s 未出现在列表（行被丢弃）", name)
+		}
+		if v != w {
+			t.Fatalf("policy %s crs_stale_selections=%v, want %v", name, v, w)
 		}
 	}
 }
@@ -304,12 +321,13 @@ func TestValidateAndNormalizeCRSField_dedupesRuleGroups(t *testing.T) {
 }
 
 // crs_rule_groups 条数上限（与 crs_excluded_rules 50 条同族限量）：
-// 超大数组放大配置体积与生成时间。
+// 超大数组放大配置体积与生成时间。夹具使用 201 个**互不相同**的 6 位合法形态
+// ID——全同条目会被去重压到上限以内，上限实现若先归一后计数就会蒙混通过。
 func TestValidateAndNormalizeCRSField_ruleGroupsCapped(t *testing.T) {
 	useCRSRuleIndexFixture(t)
 	entries := make([]string, 0, services.CRSRuleGroupsMaxEntries+1)
 	for i := 0; i <= services.CRSRuleGroupsMaxEntries; i++ {
-		entries = append(entries, fmt.Sprintf(`"%d"`, 942100))
+		entries = append(entries, fmt.Sprintf(`"%d"`, 942100+i))
 	}
 	val := "[" + strings.Join(entries, ",") + "]"
 	err := validateAndNormalizeCRSField("crs_rule_groups", &val, true)

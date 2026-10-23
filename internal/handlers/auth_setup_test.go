@@ -48,7 +48,9 @@ func setupAuthTestDB(t *testing.T) *sql.DB {
 		-- 的建表依赖保留——改密吊销 Key 语义已删（2026-09 裁定）：改密不再
 		-- 产生任何 api_keys DELETE，API Key 无密码门、改密不吊销。
 		login_failed_attempts INTEGER NOT NULL DEFAULT 0,
-		login_locked_until TEXT
+		login_locked_until TEXT,
+		-- break-glass 管理入口标记（保护判定读本列，常量仅作缺省）。
+		is_setup_admin INTEGER NOT NULL DEFAULT 0
 	);
 	CREATE TABLE api_keys (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -291,10 +291,8 @@ func TestPersistCRSSnapshotFrom_blocksWhileWafFileLockHeld(t *testing.T) {
 	writeTestFile(t, filepath.Join(liveDir, "rules", crsProbeFile), "SecRule installed")
 	writeTestFile(t, filepath.Join(liveDir, crsVersionFile), "v4.15.0")
 
-	probeBlocksUnderWafFileLock(t, "CRS 快照持久化", func() {
-		if err := persistCRSSnapshotFrom(liveDir, snapshotDir, "v4.15.0"); err != nil {
-			t.Errorf("persist snapshot: %v", err)
-		}
+	probeBlocksUnderWafFileLock(t, "CRS 快照持久化", func() error {
+		return persistCRSSnapshotFrom(liveDir, snapshotDir, "v4.15.0")
 	})
 }
 
@@ -326,8 +324,9 @@ func TestSeedCRSRules_blocksWhileWafFileLockHeld(t *testing.T) {
 	distDir := filepath.Join(root, "waf.dist", "crs")
 	writeTestFile(t, filepath.Join(liveDir, "rules", crsRulesProbeFile), "SecRule live")
 
-	probeBlocksUnderWafFileLock(t, "CRS 播种判定与写相位", func() {
+	probeBlocksUnderWafFileLock(t, "CRS 播种判定与写相位", func() error {
 		seedCRSRulesFrom(liveDir, snapshotDir, distDir)
+		return nil
 	})
 }
 
@@ -349,7 +348,8 @@ func TestReconcileCRSState_blocksWhileWafFileLockHeld(t *testing.T) {
 	writeTestFile(t, filepath.Join(liveDir, "rules", crsRulesProbeFile), "SecRule live")
 	writeTestFile(t, filepath.Join(liveDir, crsVersionFile), "v4.15.0\n")
 
-	probeBlocksUnderWafFileLock(t, "CRS 对账判定与写相位", func() {
+	probeBlocksUnderWafFileLock(t, "CRS 对账判定与写相位", func() error {
 		reconcileCRSStateFrom(liveDir, snapshotDir, "v4.15.0")
+		return nil
 	})
 }

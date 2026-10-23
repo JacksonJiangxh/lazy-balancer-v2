@@ -1,12 +1,7 @@
 package handlers
 
 import (
-	"context"
-	"database/sql"
-	"database/sql/driver"
-	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -282,74 +277,16 @@ func TestBulkUpdatePolicyBindings_rejectsBindUnbindConflict(t *testing.T) {
 	}
 }
 
-// bindingWriteErrConnector：注入绑定写路径的规则查询故障——策略/绑定前置查询
-// 成功，规则查询即失败（DB 错误须映射 500，而非 400 裸串外泄）。
-type bindingWriteErrConnector struct{}
-
-func (bindingWriteErrConnector) Connect(context.Context) (driver.Conn, error) {
-	return bindingWriteErrConn{}, nil
-}
-
-func (bindingWriteErrConnector) Driver() driver.Driver { return bindingWriteErrDriver{} }
-
-type bindingWriteErrDriver struct{}
-
-func (bindingWriteErrDriver) Open(string) (driver.Conn, error) { return bindingWriteErrConn{}, nil }
-
-type bindingWriteErrConn struct{}
-
-func (bindingWriteErrConn) Prepare(string) (driver.Stmt, error) {
-	return nil, errors.New("unexpected prepare")
-}
-func (bindingWriteErrConn) Close() error              { return nil }
-func (bindingWriteErrConn) Begin() (driver.Tx, error) { return bindingWriteErrTx{}, nil }
-
-func (bindingWriteErrConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
-	switch {
-	case strings.Contains(query, "COALESCE(MAX(policy_type)"):
-		return &bindingWriteErrRows{cols: []string{"c", "t"}, rows: [][]driver.Value{{int64(1), "stage3"}}}, nil
-	case strings.Contains(query, "policy_type='mixed'"):
-		return &bindingWriteErrRows{cols: []string{"c"}, rows: [][]driver.Value{{int64(0)}}}, nil
-	case strings.Contains(query, "GROUP BY rule_caddy_id"):
-		return &bindingWriteErrRows{cols: []string{"r", "c"}}, nil
-	case strings.Contains(query, "SELECT COUNT(*), COALESCE(MAX(protocol)"):
-		return nil, errors.New("注入的规则查询失败")
-	default:
-		return nil, fmt.Errorf("unexpected query: %s", query)
-	}
-}
-
-type bindingWriteErrTx struct{}
-
-func (bindingWriteErrTx) Commit() error   { return nil }
-func (bindingWriteErrTx) Rollback() error { return nil }
-
-type bindingWriteErrRows struct {
-	cols []string
-	rows [][]driver.Value
-}
-
-func (r *bindingWriteErrRows) Columns() []string { return r.cols }
-func (r *bindingWriteErrRows) Close() error      { return nil }
-
-func (r *bindingWriteErrRows) Next(dest []driver.Value) error {
-	if len(r.rows) == 0 {
-		return io.EOF
-	}
-	copy(dest, r.rows[0])
-	r.rows = r.rows[1:]
-	return nil
-}
-
 // （bulk applyOne）：规则查询 DB 故障 → 500「读取/写入策略绑定失败」，
-// 而非把裸错误串当 400 校验失败外泄。
+// 而非把裸错误串当 400 校验失败外泄。故障注入用语义化手段（删除规则表），
+// 不按 SQL 文本路由——查询形态调整不会让注入落到别的分支。
 func TestBulkUpdatePolicyBindings_dbErrorReturns500(t *testing.T) {
-	orig := db.DB
-	db.DB = sql.OpenDB(bindingWriteErrConnector{})
-	t.Cleanup(func() { _ = db.DB.Close(); db.DB = orig })
-	gin.SetMode(gin.TestMode)
-	router := gin.New()
-	router.POST("/security/policies/:id/bindings/bulk", (&Handlers{}).BulkUpdatePolicyBindings)
+	setupSecurityPolicyTestDB(t)
+	seedPolicyWithType(t, 7, "bulk-err-p", "stage3")
+	router, _ := newBulkBindingsRouter(t)
+	if _, err := db.DB.Exec(`DROP TABLE lb_rules`); err != nil {
+		t.Fatalf("drop lb_rules: %v", err)
+	}
 
 	recorder := postJSON(t, router, "/security/policies/7/bindings/bulk", map[string]any{
 		"bind":   []string{"lb_x"},
@@ -365,12 +302,13 @@ func TestBulkUpdatePolicyBindings_dbErrorReturns500(t *testing.T) {
 
 // （setRulePoliciesInTx）：规则查询 DB 故障 → 500「读取/写入策略绑定失败」。
 func TestSetRuleSecurityPolicies_dbErrorReturns500(t *testing.T) {
-	orig := db.DB
-	db.DB = sql.OpenDB(bindingWriteErrConnector{})
-	t.Cleanup(func() { _ = db.DB.Close(); db.DB = orig })
+	setupSecurityPolicyTestDB(t)
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	router.PUT("/security/rules/:caddy_id/policies", (&Handlers{}).SetRuleSecurityPolicies)
+	if _, err := db.DB.Exec(`DROP TABLE lb_rules`); err != nil {
+		t.Fatalf("drop lb_rules: %v", err)
+	}
 
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPut, "/security/rules/lb_x/policies", strings.NewReader(`{"policy_ids":[1]}`))
@@ -407,4 +345,29 @@ func TestBulkUpdatePolicyBindings_sizeLimitAfterNormalization(t *testing.T) {
 		t.Fatalf("归一后仅 1 条规则: status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
 	}
 	assertIDSlice(t, queryBoundPolicyIDs(t, "lb_bulk_norm"), []int{policy})
+}
+
+// unbind 侧不受「仅支持 HTTP 规则」门约束：存量 TCP 绑定（历史数据，bind 侧
+// 早已拒绝新建）必须能解绑，否则旧绑定永远清不掉。协议门只保护 bind 目标。
+func TestBulkUpdatePolicyBindings_unbindLegacyTCPBinding(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router, loads := newBulkBindingsRouter(t)
+	seedTCPRule(t, "lb_bulk_tcp")
+	policy := createMultiPolicy(t, router, "bulk-tcp")
+	if _, err := db.DB.Exec(`INSERT INTO security_policy_bindings (rule_caddy_id, policy_id) VALUES (?, ?)`, "lb_bulk_tcp", policy); err != nil {
+		t.Fatalf("seed legacy tcp binding: %v", err)
+	}
+	baseline := loads.Load()
+
+	recorder := postJSON(t, router, fmt.Sprintf("/security/policies/%d/bindings/bulk", policy), map[string]any{
+		"bind":   []string{},
+		"unbind": []string{"lb_bulk_tcp"},
+	})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200（解绑存量 TCP 绑定须放行）", recorder.Code, recorder.Body.String())
+	}
+	assertIDSlice(t, queryBoundPolicyIDs(t, "lb_bulk_tcp"), nil)
+	if n := loads.Load() - baseline; n != 1 {
+		t.Fatalf("caddy /load delta=%d, want exactly 1", n)
+	}
 }

@@ -10,13 +10,15 @@ import (
 // LRU 若把 login 桶淘汰，攻击者即可重置登录/MFA 暴力破解限流。
 // 淘汰必须优先选择机器凭证桶，认证作用域桶不得被凭证泛洪冲掉。
 func TestRateLimitBucketEviction_protectsLoginScope(t *testing.T) {
+	withIsolatedRateLimitBuckets(t)
 	loginRateBuckets.Lock()
-	loginRateBuckets.entries = map[string]*loginRateBucket{}
 	now := time.Now()
 	login := &loginRateBucket{until: now.Add(time.Minute)}
 	login.lastUsed.Store(now.Add(-2 * time.Hour).UnixNano()) // 最久未命中，旧实现必淘汰
 	loginRateBuckets.entries["203.0.113.9|login"] = login
-	for i := 0; i < rateLimitBucketCapacity; i++ {
+	// 表容量含 login 桶本身：先放 1 个 login，再填到恰好满表（多填一个会让
+	// 「桶表有界」断言失去意义）。
+	for i := 0; i < rateLimitBucketCapacity-1; i++ {
 		key := "203.0.113.9|sync-snapshot|credential:" + string(rune('a'+i%26)) + string(rune('a'+i/26))
 		b := &loginRateBucket{until: now.Add(time.Minute)}
 		b.lastUsed.Store(now.Add(-time.Hour).UnixNano() + int64(i))
@@ -24,13 +26,23 @@ func TestRateLimitBucketEviction_protectsLoginScope(t *testing.T) {
 	}
 	loginRateBuckets.Unlock()
 
-	acquireRateLimitBucket("203.0.113.9", "sync-snapshot|credential:new", now)
+	newBucket := acquireRateLimitBucket("203.0.113.9", "sync-snapshot|credential:new", now)
 
 	loginRateBuckets.Lock()
 	_, kept := loginRateBuckets.entries["203.0.113.9|login"]
+	_, newKept := loginRateBuckets.entries["203.0.113.9|sync-snapshot|credential:new"]
+	size := len(loginRateBuckets.entries)
 	loginRateBuckets.Unlock()
 	if !kept {
 		t.Fatal("login bucket evicted by machine credential flood")
+	}
+	// 「淘汰根本没发生」也必须变红：新键必须有桶（否则等于本轮限流 fail-open），
+	// 且桶表保持容量上限。
+	if newBucket == nil || !newKept {
+		t.Fatal("新凭证桶必须真实建表（淘汰未发生=新来源零限流）")
+	}
+	if size > rateLimitBucketCapacity {
+		t.Fatalf("桶表越界：%d > %d", size, rateLimitBucketCapacity)
 	}
 }
 
@@ -40,8 +52,8 @@ func TestRateLimitBucketEviction_protectsLoginScope(t *testing.T) {
 // 爆破/审计放大窗口）被淘汰 → 限流窗口被重置且可循环推满。淘汰次序必须
 // 为 credential → 非受保护匿名桶 → 受保护桶（仅在别无选择时）。
 func TestRateLimitBucketEviction_protectsLoginAndRegisterAmongAnonymousBuckets(t *testing.T) {
+	withIsolatedRateLimitBuckets(t)
 	loginRateBuckets.Lock()
-	loginRateBuckets.entries = map[string]*loginRateBucket{}
 	now := time.Now()
 	add := func(key string, age time.Duration) {
 		bucket := &loginRateBucket{until: now.Add(time.Minute)}

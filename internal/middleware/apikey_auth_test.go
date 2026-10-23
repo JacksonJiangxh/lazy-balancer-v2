@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"lazy-balancer-v2/internal/models"
 	"net/http"
 	"net/http/httptest"
@@ -45,7 +46,9 @@ func TestAPIKeyAuthBindsOwningUser(t *testing.T) {
 	}
 	plain := "lb_sk_test-secret"
 	hash := sha256.Sum256([]byte(plain))
-	_, err = database.Exec("INSERT INTO api_keys VALUES (9, 'ci', ?, 'lb_sk_test-s', 7, NULL, NULL, 1, 0, 0, '', CURRENT_TIMESTAMP)", hex.EncodeToString(hash[:]))
+	// mcp_enabled=1、read_only=1：绑定链的每个字段都必须有断言（全 0 夹具
+	// 会让「值没绑上」与「默认 false」不可区分）。
+	_, err = database.Exec("INSERT INTO api_keys VALUES (9, 'ci', ?, 'lb_sk_test-s', 7, NULL, NULL, 1, 1, 1, '', CURRENT_TIMESTAMP)", hex.EncodeToString(hash[:]))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,12 +58,14 @@ func TestAPIKeyAuthBindsOwningUser(t *testing.T) {
 	router.Use(apiKeyAuth(&config.Config{}))
 	router.GET("/probe", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
-			"user_id":      c.GetInt("user_id"),
-			"username":     c.GetString("username"),
-			"role":         c.GetString("role"),
-			"auth_type":    c.GetString("auth_type"),
-			"api_key_id":   c.GetInt("api_key_id"),
-			"api_key_name": c.GetString("api_key_name"),
+			"user_id":             c.GetInt("user_id"),
+			"username":            c.GetString("username"),
+			"role":                c.GetString("role"),
+			"auth_type":           c.GetString("auth_type"),
+			"api_key_id":          c.GetInt("api_key_id"),
+			"api_key_name":        c.GetString("api_key_name"),
+			"api_key_mcp_enabled": c.GetBool("api_key_mcp_enabled"),
+			"api_key_read_only":   c.GetBool("api_key_read_only"),
 		})
 	})
 	req := httptest.NewRequest(http.MethodGet, "/probe", nil)
@@ -69,6 +74,26 @@ func TestAPIKeyAuthBindsOwningUser(t *testing.T) {
 	router.ServeHTTP(recorder, req)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	// Then：DB→context 的每个绑定都必须携带真实值（错键名/漏键在守卫处
+	// 静默降级为「非只读/未开 MCP」，只读 Key 会获得写权限）。
+	var bound struct {
+		UserID     int    `json:"user_id"`
+		Username   string `json:"username"`
+		Role       string `json:"role"`
+		AuthType   string `json:"auth_type"`
+		APIKeyID   int    `json:"api_key_id"`
+		APIKeyName string `json:"api_key_name"`
+		MCPEnabled bool   `json:"api_key_mcp_enabled"`
+		ReadOnly   bool   `json:"api_key_read_only"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &bound); err != nil {
+		t.Fatalf("decode probe body: %v", err)
+	}
+	if bound.UserID != 7 || bound.Username != "alice" || bound.Role != "user" ||
+		bound.AuthType != "api_key" || bound.APIKeyID != 9 || bound.APIKeyName != "ci" ||
+		!bound.MCPEnabled || !bound.ReadOnly {
+		t.Fatalf("API Key 绑定链不完整: %+v", bound)
 	}
 	var pendingLastUsed sql.NullTime
 	if err := database.QueryRow("SELECT last_used FROM api_keys WHERE id=9").Scan(&pendingLastUsed); err != nil {

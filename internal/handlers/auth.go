@@ -94,15 +94,21 @@ func recordLoginFailure(userID int) {
 		enabled = true
 	}
 	if !enabled {
-		_, _ = db.DB.Exec(`UPDATE users SET login_failed_attempts=COALESCE(login_failed_attempts,0)+1 WHERE id=?`, userID)
+		if _, err := db.DB.Exec(`UPDATE users SET login_failed_attempts=COALESCE(login_failed_attempts,0)+1 WHERE id=?`, userID); err != nil {
+			// 记账失败不改变认证响应（失败仍是失败），但必须留痕——
+			// 否则「登录失败计数/账户锁定」静默失效，暴力破解计数形同虚设。
+			services.Logf("error", "登录失败计数写入失败（账户锁定可能失效）: user_id=%d: %v", userID, err)
+		}
 		return
 	}
-	_, _ = db.DB.Exec(`UPDATE users SET
+	if _, err := db.DB.Exec(`UPDATE users SET
 		login_failed_attempts=CASE WHEN COALESCE(login_failed_attempts,0)+1>=? THEN 0 ELSE COALESCE(login_failed_attempts,0)+1 END,
 		login_locked_until=CASE WHEN COALESCE(login_failed_attempts,0)+1>=? THEN ? ELSE login_locked_until END
 		WHERE id=?`,
 		loginLockMaxAttempts, loginLockMaxAttempts,
-		now.Add(loginLockCooldown).UTC().Format("2006-01-02 15:04:05"), userID)
+		now.Add(loginLockCooldown).UTC().Format("2006-01-02 15:04:05"), userID); err != nil {
+		services.Logf("error", "登录失败计数写入失败（账户锁定可能失效）: user_id=%d: %v", userID, err)
+	}
 }
 
 // parseLoginLockedUntil 锁定时间解析单源——写侧恒为 UTC「2006-01-02 15:04:05」，
@@ -296,8 +302,17 @@ func (h *Handlers) respondLoginWithMFA(c *gin.Context, user models.User, passwor
 
 	// node_mode 仅用于登录响应体的展示字段（JWT claim 已删除——
 	// jwtAuth 不消费，客户端声明无意义；响应体 NodeMode 保留）。
-	nodeMode := "master"
-	if isMaster, err := services.RoleOf(c.Request.Context(), db.DB); err == nil && !isMaster {
+	// 三态化：角色查询失败/库未装配不得静默呈现 master——写闸与 /system/info
+	// 对同一故障分别是 fail-closed 500 与 unknown，登录响应给 master 会让前端
+	// 按可写视图放行（授权侧仍拒，但排障方向被误导）。
+	nodeMode := "unknown"
+	if db.DB == nil {
+		services.Logf("warn", "login: 数据库未装配，节点角色未知（node_mode=unknown）")
+	} else if isMaster, err := services.RoleOf(c.Request.Context(), db.DB); err != nil {
+		services.Logf("warn", "login: 节点角色查询失败，按 unknown 下发（前端只读）: %v", err)
+	} else if isMaster {
+		nodeMode = "master"
+	} else {
 		nodeMode = "slave"
 	}
 
@@ -750,7 +765,7 @@ func (h *Handlers) SetupAdmin(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "密码加密失败"})
 		return
 	}
-	result, err := db.DB.Exec("INSERT INTO users (username, password_hash, role, display_name, is_enabled) SELECT ?, ?, 'admin', ?, 1 WHERE NOT EXISTS (SELECT 1 FROM users)",
+	result, err := db.DB.Exec("INSERT INTO users (username, password_hash, role, display_name, is_enabled, is_setup_admin) SELECT ?, ?, 'admin', ?, 1, 1 WHERE NOT EXISTS (SELECT 1 FROM users)",
 		req.Username, string(hash), req.DisplayName)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "创建管理员失败"})

@@ -604,6 +604,10 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 
 		v1.Use(apiKeyAuth(cfg))
 		v1.Use(jwtAuth(cfg))
+		// apiKeyReadOnlyGuard 挂 v1 级——**正覆盖**下方直挂在 v1 上的路由
+		// （openapi/caddy/metrics/logout 等），与 admin/business 组级
+		// mfaStepUpGuard 的覆盖面不同（后者只管两组内路由）。新增 v1 直挂写
+		// 路由时两守卫的覆盖差异须逐一确认，不能假定「组级守卫已覆盖」。
 		v1.Use(apiKeyReadOnlyGuard())
 		// mfaStepUpGuard 不在 v1 级挂载——admin 组内
 		// adminOnly 必须先于 step-up（非管理员先见 403 角色真因，而非 428 后
@@ -633,9 +637,7 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 			admin := recordingRouterGroup{RouterGroup: adminGroup, recorded: make(map[string]struct{})}
 			{
 				admin.POST("/users", h.CreateUser)
-				admin.PUT("/users/:id", h.UpdateUser)
 				admin.PUT("/users/:id/status", h.ToggleUserStatus)
-				admin.POST("/users/:id/reset-password", h.ResetUserPassword)
 				admin.DELETE("/users/:id", h.DeleteUser)
 				admin.POST("/users/:id/mfa/reset", h.MFAResetByAdmin)
 
@@ -771,6 +773,8 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 				// Current user (self)
 				business.GET("/users/me", h.GetCurrentUser)
 				business.PATCH("/users/me", h.UpdateCurrentUser)
+				business.PUT("/users/:id", adminOrSelfParam(), h.UpdateUser)
+				business.POST("/users/:id/reset-password", adminOrSelfParam(), h.ResetUserPassword)
 				// v2.1.8 MFA 自助端点（JWT 用户）
 				business.GET("/auth/mfa/status", h.MFAStatus)
 				business.POST("/auth/mfa/setup", h.MFASetup)
@@ -1275,6 +1279,14 @@ func apiKeyReadOnlyGuard() gin.HandlerFunc {
 		if path == "" {
 			path = c.Request.URL.Path
 		}
+		// 登出是会话自助语义（无同步表写）：三守卫（apiKeyReadOnlyGuard /
+		// mfaStepUpGuard 的 DecideMFAStepUp / readOnlyGuard 白名单）统一放行
+		// 到 handler，由其返回统一 404「无会话令牌可吊销」——只读 Key 此前
+		// 得 403，与 JWT/从节点口径不一致。
+		if c.Request.Method == http.MethodPost && path == "/api/v1/auth/logout" {
+			c.Next()
+			return
+		}
 		// （2026-09 审计）：导出类 GET 敏感度等同写操作（完整备份含全部用户/
 		// 密钥哈希与私钥明文）——只读 Key 不得经 GET 旁路导出，单独设卡。
 		if c.Request.Method == http.MethodGet && sensitiveExportGetRoutes[path] {
@@ -1394,6 +1406,41 @@ func adminOnly() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		role, exists := c.Get("role")
 		if !exists || role != "admin" {
+			recordAuthenticationRejection(c, "admin_required")
+			c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "需要管理员权限"})
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
+}
+
+// adminOrSelfParam 允许管理员操作任意用户，非管理员仅允许操作自己的用户行
+// （路径 :id == JWT user_id）。用于用户管理页「本人编辑/重置密码」自助路径；
+// 该页的编辑/重置为重置语义（不验当前密码），正常改密仍走个人资料弹框。
+// 角色/用户名的自助限制由 handler 二次守卫。
+func adminOrSelfParam() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.GetString("role") == "admin" {
+			c.Next()
+			return
+		}
+		target, err := strconv.Atoi(c.Param("id"))
+		if err != nil || target <= 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "用户 ID 无效"})
+			c.Abort()
+			return
+		}
+		var actor int
+		switch v := c.Value("user_id").(type) {
+		case int:
+			actor = v
+		case int64:
+			actor = int(v)
+		case float64:
+			actor = int(v)
+		}
+		if actor <= 0 || actor != target {
 			recordAuthenticationRejection(c, "admin_required")
 			c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "需要管理员权限"})
 			c.Abort()

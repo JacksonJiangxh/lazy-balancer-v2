@@ -185,7 +185,19 @@ func TestMCPToolsListForNonAdminKeyHidesAdminGroupTools(t *testing.T) {
 	// tools/list 必须同口径隐藏；business 组只读查询与读探测 POST 保留。
 	// preview_config/validate_import 虽为只读探测语义，但注册在 admin 组
 	// （adminOnly 对非管理员一律 403），故仍不可见。
-	for _, hidden := range []string{"get_caddy_config", "preview_config", "validate_import", "update_user", "create_user", "create_rule", "update_rule", "retry_cert_job", "inspect_admin_tls"} {
+	known := map[string]bool{}
+	for _, spec := range mcpserver.ListToolSpecs() {
+		known[spec.Name] = true
+	}
+	hiddenNames := []string{"get_caddy_config", "preview_config", "validate_import", "update_user", "create_user", "create_rule", "update_rule", "retry_cert_job", "inspect_admin_tls"}
+	// 反向对账：隐藏名单必须先落在真实工具目录内——工具改名/删除后旧名恒
+	// false，`visible[hidden]` 断言会静默通过（假绿）。
+	for _, hidden := range hiddenNames {
+		if !known[hidden] {
+			t.Fatalf("隐藏名单中的 %s 不在 ListToolSpecs（改名/删除后的陈旧键）", hidden)
+		}
+	}
+	for _, hidden := range hiddenNames {
 		if visible[hidden] {
 			t.Errorf("non-admin tools/list exposes tool %s（调用恒 403）", hidden)
 		}
@@ -393,5 +405,63 @@ func TestMCPAccessGuard_rejectionsAreAudited(t *testing.T) {
 	}
 	if len(*recorded) != 2 {
 		t.Fatalf("pass-through must not add rejection audits, got %d: %q", len(*recorded), *recorded)
+	}
+}
+
+// 从节点 MCP 写工具的端到端契约：真实 listener + 完整 router + 管理员 Key
+// （mcp_enabled=1）。MCP 层不做从节点判定，写请求经回环转发后被 REST 侧
+// readOnlyGuard 拦截——工具结果必须是内层 403「从节点只读」，且规则零落库
+// （此前只有转发目标路由的中间件级钉测，没有「转发确实发生且被拦」的证明）。
+func TestMCPEndpoint_slaveWriteToolRejectedByInnerReadOnlyGuard(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	router := newMiddlewareTestRouterAtPort(t, port)
+	server := &httptest.Server{Listener: listener, Config: &http.Server{Handler: router}}
+	server.Start()
+	t.Cleanup(server.Close)
+
+	key := "lb_sk_mcp-slave-write"
+	hash := sha256.Sum256([]byte(key))
+	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (34,'mcp-slave','x','admin',1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO api_keys (name,key_hash,key_prefix,created_by,is_enabled,mcp_enabled)
+		VALUES ('mcp-slave',?,?,34,1,1)`, hex.EncodeToString(hash[:]), key[:12]); err != nil {
+		t.Fatal(err)
+	}
+	// Given 本节点为从节点
+	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+
+	body := []byte(`{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"create_rule","arguments":{}}}`)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/mcp", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json, text/event-stream")
+	request.Header.Set("X-API-Key", key)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	// Then ① JSON-RPC 层成功返回（错误经工具结果表达，不劫持协议层）
+	if response.Code != http.StatusOK {
+		t.Fatalf("mcp status=%d body=%q", response.Code, response.Body.String())
+	}
+	// ② 工具结果标记 isError 且携带内层 403 真因
+	if !strings.Contains(response.Body.String(), `"isError":true`) {
+		t.Fatalf("body=%q, want 工具结果 isError=true", response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "从节点只读") {
+		t.Fatalf("body=%q, want 内层 403「从节点只读」", response.Body.String())
+	}
+	// ③ 规则零落库
+	var count int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM lb_rules`).Scan(&count); err != nil {
+		t.Fatalf("count rules: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("lb_rules 行数=%d, want 0（从节点写入必须被拦截且不落库）", count)
 	}
 }

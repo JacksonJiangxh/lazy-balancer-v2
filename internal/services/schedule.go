@@ -46,6 +46,43 @@ const (
 	threatSlotAdvanceSQL = `next_update=IIF(` + slotAdvanceGateSQL + `, ?, next_update)`
 )
 
+// setVersionTableAutoUpdate 版本表族（CRS/IP2Region）自动更新开关的单源写侧：
+// 行缺失先按 seed 播种（INSERT OR IGNORE），再写标志与排程槽，最后联动任务
+// 调度。两族此前三句 SQL 逐字同构（含「失败退避撤除」裁定），任一处改动都
+// 需双点同步；label 仅用于保留各族既有错误文案，taskID 联动调度。
+//
+// 排程槽生命周期（2026-10-11 用户裁定）：仅 auto 且现存槽空/过期才由运行侧
+// 推进；此处开关动作立即重排程——开启写下一槽、关闭无条件清空（2026-09-25
+// 用户裁定：失败退避机制撤除）。
+func setVersionTableAutoUpdate(table, label, seed, taskID string, enabled bool) error {
+	if _, err := db.DB.Exec(
+		"INSERT OR IGNORE INTO "+table+" (id, version, auto_update) VALUES (1, ?, ?)",
+		seed, enabled,
+	); err != nil {
+		return fmt.Errorf("初始化 %s 版本记录: %w", label, err)
+	}
+	nextUpdate := ""
+	if enabled {
+		nextUpdate = versionTableNextSlot(table, time.Now().UTC())
+	}
+	if _, err := db.DB.Exec("UPDATE "+table+" SET auto_update=?, next_update=CASE WHEN ? THEN ? ELSE '' END WHERE id=1", enabled, enabled, nextUpdate); err != nil {
+		return fmt.Errorf("更新 %s 自动更新开关: %w", label, err)
+	}
+	syncTaskLoop(taskID, enabled)
+	return nil
+}
+
+// ensureVersionTableRow 版本表族种子行单源：仅行缺失时按 seed 播种
+// （auto_update 默认 ON，logPrefix 保留各族既有日志前缀）。
+func ensureVersionTableRow(table, seed, logPrefix string) {
+	if _, err := db.DB.Exec(
+		"INSERT OR IGNORE INTO "+table+" (id, version, auto_update) VALUES (1, ?, TRUE)",
+		seed,
+	); err != nil {
+		Logf("error", "%s: failed to ensure version row: %v", logPrefix, err)
+	}
+}
+
 // parseUTCSlot 解析 DB 存的 UTC 排程串为 time.Time（crsTimeLayout 与
 // RFC3339 双形态——与 localDisplayUTC 同口径）。
 func parseUTCSlot(s string) time.Time {

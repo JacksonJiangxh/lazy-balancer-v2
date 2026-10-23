@@ -701,7 +701,7 @@ func replaceSnapshotTx(ctx context.Context, tx *sql.Tx, snapshot models.ClusterS
 			if cert.SourceStatus != "" {
 				message += "，源任务状态：" + cert.SourceStatus
 			}
-			if _, err := tx.ExecContext(ctx, `INSERT INTO cert_jobs (rule_id,domain,status,message,expires_at,cert_pem,key_pem,ca_provider_id,renewal_attempts,ca_available_after,last_error_code) SELECT ?,COALESCE(NULLIF(?,''),domain),'issued',?,?,?,?,?,?,?,? FROM lb_rules WHERE caddy_id=? AND tls_source='acme_dns'`, cert.RuleID, cert.Domain, message, nullableString(cert.ExpiresAt), cert.CertPEM, cert.KeyPEM, cert.CAProviderID, cert.RenewalAttempts, nullableTimeFlat(cert.CAAvailableAfter.NullTime), nullableString(cert.LastErrorCode), cert.RuleID); err != nil {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO cert_jobs (rule_id,domain,status,message,expires_at,cert_pem,key_pem,ca_provider_id,renewal_attempts,ca_available_after,last_error_code,created_at,updated_at) SELECT ?,COALESCE(NULLIF(?,''),domain),'issued',?,?,?,?,?,?,?,?,COALESCE(NULLIF(?,''),CURRENT_TIMESTAMP),NULLIF(?,'') FROM lb_rules WHERE caddy_id=? AND tls_source='acme_dns'`, cert.RuleID, cert.Domain, message, nullableString(cert.ExpiresAt), cert.CertPEM, cert.KeyPEM, cert.CAProviderID, cert.RenewalAttempts, nullableTimeFlat(cert.CAAvailableAfter.NullTime), nullableString(cert.LastErrorCode), cert.CreatedAt, cert.UpdatedAt, cert.RuleID); err != nil {
 				return fmt.Errorf("写入快照证书 %s: %w", cert.RuleID, err)
 			}
 		}
@@ -763,12 +763,17 @@ func clearSyncTables(ctx context.Context, tx *sql.Tx, tables ...string) error {
 
 func insertSnapshotUsersAndKeys(ctx context.Context, tx *sql.Tx, snapshot models.ClusterSnapshot) error {
 	for _, user := range snapshot.Users {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO users (id,username,password_hash,role,display_name,is_enabled,password_version,password_changed_at,created_at,last_login,mfa_enabled,mfa_secret,mfa_recovery_codes,mfa_last_timestep,auth_provider,oidc_subject,oidc_issuer) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		if _, err := tx.ExecContext(ctx, `INSERT INTO users (id,username,password_hash,role,display_name,is_enabled,password_version,password_changed_at,created_at,last_login,mfa_enabled,mfa_secret,mfa_recovery_codes,mfa_last_timestep,auth_provider,oidc_subject,oidc_issuer,is_setup_admin) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			user.ID, user.Username, user.PasswordHash, user.Role, user.DisplayName, user.IsEnabled, user.PasswordVersion, user.PasswordChangedAt, user.CreatedAt.UTC().Format(crsTimeLayout), nullableTimeFlat(user.LastLogin.NullTime),
 			user.MFAEnabled, user.MFASecret, user.MFARecoveryCodes, user.MFALastTimestep,
-			user.AuthProvider, user.OIDCSubject, user.OIDCIssuer); err != nil {
+			user.AuthProvider, user.OIDCSubject, user.OIDCIssuer, user.IsSetupAdmin); err != nil {
 			return fmt.Errorf("写入快照用户 %s: %w", user.Username, err)
 		}
+	}
+	// 保护目标兜底：旧主端载荷不含 is_setup_admin（全 false）或标记行不是启用
+	// 管理员时，按「最低 id 的启用管理员」在从节点重建，保证本地保护面可用。
+	if err := db.EnsureSetupAdminFlag(ctx, tx); err != nil {
+		return fmt.Errorf("归一 setup 管理员标记: %w", err)
 	}
 	for _, key := range snapshot.APIKeys {
 		// 空白名单落 ''(与主端 encodeMCPIPWhitelist
@@ -1442,8 +1447,9 @@ func insertSnapshotPathRules(ctx context.Context, tx *sql.Tx, ruleID string, pat
 
 func updateSnapshotSettings(ctx context.Context, tx *sql.Tx, snapshot models.ClusterSnapshot) error {
 	settings := snapshot.BasicSettings
-	if settings.JWTExpireMinutes != nil && (*settings.JWTExpireMinutes <= 0 || *settings.JWTExpireMinutes > 1440) {
-		settings.JWTExpireMinutes = new(db.DefaultJWTExpireMinutes)
+	if settings.JWTExpireMinutes != nil {
+		normalized := normalizeJWTExpireMinutes(*settings.JWTExpireMinutes)
+		settings.JWTExpireMinutes = &normalized
 	}
 	var baseClauses []string
 	var baseArgs []any
@@ -1476,10 +1482,7 @@ func updateSnapshotSettings(ctx context.Context, tx *sql.Tx, snapshot models.Clu
 		addBase("acme_email", *settings.ACMEEmail)
 	}
 	if settings.CertExpiryDays != nil {
-		days := *settings.CertExpiryDays
-		if days <= 0 || days > 365 {
-			days = db.DefaultCertExpiryDays
-		}
+		days := normalizeCertExpiryDays(*settings.CertExpiryDays)
 		addBase("cert_expiry_days", days)
 	}
 	if settings.CertRenewalDays != nil {

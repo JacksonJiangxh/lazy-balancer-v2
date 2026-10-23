@@ -206,6 +206,10 @@ func (deleteKeyIterFailConn) Begin() (driver.Tx, error) {
 }
 func (deleteKeyIterFailConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
 	switch {
+	// 保护标记查询（DeleteUser 前置门）必须与目标用户行查询分判：标记缺失
+	// （零行）按缺省判定处理，不影响本用例要验证的级联清单迭代失败路径。
+	case strings.Contains(query, "is_setup_admin"):
+		return rowsErrZeroRows{}, nil
 	case strings.Contains(query, "FROM users WHERE id"):
 		return &deleteTargetUserRows{}, nil
 	case strings.Contains(query, "FROM api_keys WHERE created_by"):

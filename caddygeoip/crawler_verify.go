@@ -436,12 +436,6 @@ func commitCrawlerIPRangeSnapshot(next *crawlerIPRangeSnapshot) *crawlerIPRangeS
 	return next
 }
 
-// verifyCrawlerIPRangeFromList 从共享快照文件验证 IP 段命中（缺失/为空=fail-closed；
-// 快照每 10 分钟定时重读，不依赖 mtime/stat 触发）。
-func verifyCrawlerIPRangeFromList(ipStr, engineID string) bool {
-	return verifyCrawlerIPRangeVerdict(ipStr, engineID) == CrawlerVerdictVerified
-}
-
 // verifyCrawlerIPRangeVerdict 官方 IP 段验证三态：快照不可用（缺失/损坏/
 // 无该引擎段）=瞬态（无法判定，不得据此判伪装）；地址不可解析（含带 zone
 // 形态）与段外 = 确定否定。

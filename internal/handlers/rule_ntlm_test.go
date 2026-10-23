@@ -206,6 +206,19 @@ func TestUpdateRule_ntlm_off_restores_zero_and_omitted_keeps_value(t *testing.T)
 	if after != 0 {
 		t.Fatalf("ntlm_compatible after off=%d, want 0", after)
 	}
+	// ntlm=0 不负责复位接管四列（设计契约：UI 的 restoreNtlmDefaults 才复位；
+	// 后端不静默改写用户显式/存量的代理参数）。
+	var tryDuration, forceHTTP1, flushInterval, keepalive int
+	if err := db.DB.QueryRow(`SELECT COALESCE(tcp_try_duration,0), COALESCE(upstream_force_http1,0),
+		COALESCE(proxy_flush_interval,0), COALESCE(upstream_keepalive_timeout,0)
+		FROM lb_rules WHERE listen_port=18006`).
+		Scan(&tryDuration, &forceHTTP1, &flushInterval, &keepalive); err != nil {
+		t.Fatalf("read takeover columns: %v", err)
+	}
+	if tryDuration != -1 || forceHTTP1 != 1 || flushInterval != -1 || keepalive != 300 {
+		t.Fatalf("ntlm=0 不得复位接管四列: td=%d force=%d flush=%d keepalive=%d, want -1/1/-1/300",
+			tryDuration, forceHTTP1, flushInterval, keepalive)
+	}
 }
 
 // ---- ④ 导入携带 ntlm 字段 ----
@@ -293,5 +306,49 @@ func TestImportConfigBackup_rejects_ntlm_with_invalid_shape(t *testing.T) {
 				t.Fatalf("import status=%d body=%.300s, want 400 containing %q", response.Code, response.Body.String(), testCase.want)
 			}
 		})
+	}
+}
+
+// TCP 行的 ntlm_compatible 是死列（TCP 规则创建/导入显式携带即 400）。
+// 存量/直改 DB 的残留 1 不得让任何无关编辑恒 400（死端），也不得被用户显式
+// 携带的 1 静默改写成 0（意图丢失）。形态一：未携带 → 200 且存量 1 自愈归零；
+// 形态二：显式携带 1 → 400 点名 NTLM，且库值保持 0（未落库）。
+func TestUpdateRule_tcpExplicitNTLMRejectedAndStaleValueSelfHeals(t *testing.T) {
+	handler := newRuleFeatureTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.PUT("/rules/:caddy_id", handler.UpdateRule)
+
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,description,protocol,domain,listen_port,strategy,enabled,ntlm_compatible)
+		VALUES ('lb_tcpntlm','tcp-ntlm','','tcp','',18021,'weighted_round_robin',1,1)`); err != nil {
+		t.Fatalf("seed tcp rule: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb_tcpntlm','127.0.0.1',9000,1,1,'tcp')`); err != nil {
+		t.Fatalf("seed tcp upstream: %v", err)
+	}
+
+	// ① 未携带 ntlm：存量死值自愈归零，编辑成功。
+	response := serveJSON(t, router, http.MethodPut, "/rules/lb_tcpntlm", `{"name":"tcp-ntlm-renamed","protocol":"tcp"}`)
+	if response.Code != http.StatusOK {
+		t.Fatalf("omitted ntlm update status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	var ntlm int
+	if err := db.DB.QueryRow(`SELECT COALESCE(ntlm_compatible,0) FROM lb_rules WHERE caddy_id='lb_tcpntlm'`).Scan(&ntlm); err != nil {
+		t.Fatal(err)
+	}
+	if ntlm != 0 {
+		t.Fatalf("存量 ntlm 死值未自愈: ntlm_compatible=%d, want 0", ntlm)
+	}
+
+	// ② 显式携带 1：保存门 400 点名，不静默弃置。
+	response = serveJSON(t, router, http.MethodPut, "/rules/lb_tcpntlm", `{"ntlm_compatible":1,"protocol":"tcp"}`)
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "NTLM") {
+		t.Fatalf("explicit ntlm update status=%d body=%s, want 400 with NTLM message", response.Code, response.Body.String())
+	}
+	if err := db.DB.QueryRow(`SELECT COALESCE(ntlm_compatible,0) FROM lb_rules WHERE caddy_id='lb_tcpntlm'`).Scan(&ntlm); err != nil {
+		t.Fatal(err)
+	}
+	if ntlm != 0 {
+		t.Fatalf("被拒的显式 ntlm 不得落库: ntlm_compatible=%d, want 0", ntlm)
 	}
 }

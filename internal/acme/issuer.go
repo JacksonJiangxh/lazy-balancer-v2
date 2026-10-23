@@ -361,6 +361,12 @@ func dnsCleanupBudget(challengeCount, recordCount int) time.Duration {
 	return min(max(budget, dnsCleanupBudgetMin), dnsCleanupBudgetMax)
 }
 
+// DNSCleanupBudgetMax 暴露清理预算上限，供上层（services）做跨层耦合断言：
+// 「CA 队列执行预算上限 + 清理上限 < ownership.StaleOwnershipAge」是该不变量
+// 的论证基础。acme 是被依赖层，无法导入 services 的常量，故把断言放在
+// services 侧、由本 getter 取值——避免两侧各自字面量漂移。
+func DNSCleanupBudgetMax() time.Duration { return dnsCleanupBudgetMax }
+
 // ChallengeInfo holds the info needed to clean up a DNS record.
 type ChallengeInfo struct {
 	Domain    string

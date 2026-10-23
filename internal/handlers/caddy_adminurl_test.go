@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -23,10 +24,10 @@ import (
 
 func TestGetCaddyConfig_dialsConfiguredAdminURL(t *testing.T) {
 	// Given 配置指向假 admin 端点（非默认 localhost:2019）
-	hit := false
+	var hit atomic.Bool
 	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/config/" {
-			hit = true
+			hit.Store(true)
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"apps":{}}`))
 			return
@@ -48,7 +49,7 @@ func TestGetCaddyConfig_dialsConfiguredAdminURL(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
 	}
-	if !hit {
+	if !hit.Load() {
 		t.Fatalf("GetCaddyConfig 未拨号 cfg.CaddyAdminURL（%s）下的 GET /config/", fake.URL)
 	}
 }

@@ -518,19 +518,12 @@ func TestListSecurityPolicies_carriesBlocked24h(t *testing.T) {
 	if _, err := db.DB.Exec(`INSERT INTO security_policies (id,name,mode,policy_type,enabled) VALUES (1,'b24','blocking','stage3',1),(2,'b24b','off','stage1',1)`); err != nil {
 		t.Fatal(err)
 	}
-	seedEvt := func(policyID int, action, timeExpr string) {
-		t.Helper()
-		if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time,rule_caddy_id,policy_id,client_ip,method,uri,event_type,rule_triggered,rule_msg,action,anomaly_score,rule_name,policy_name,transaction_id)
-			VALUES (`+timeExpr+`,'lb_x',?,'203.0.113.9','GET','/x','waf','942100','msg',?,0,'x','b24',?)`, policyID, action, fmt.Sprintf("tx-%d-%s-%s", policyID, action, timeExpr)); err != nil {
-			t.Fatalf("seed event: %v", err)
-		}
-	}
-	seedEvt(1, "blocked", "datetime('now','-1 hour')")
-	seedEvt(1, "blocked", "datetime('now','-2 hours')")
-	seedEvt(1, "blocked", "datetime('now','-25 hours')") // 超窗不计
-	seedEvt(1, "logged", "datetime('now','-1 hour')")    // 非 blocked 不计
-	seedEvt(2, "blocked", "datetime('now','-1 hour')")
-	seedEvt(0, "blocked", "datetime('now','-1 hour')") // 未归因不计
+	seedPolicyAttributionEvent(t, 1, "blocked", "datetime('now','-1 hour')", "b24")
+	seedPolicyAttributionEvent(t, 1, "blocked", "datetime('now','-2 hours')", "b24")
+	seedPolicyAttributionEvent(t, 1, "blocked", "datetime('now','-25 hours')", "b24") // 超窗不计
+	seedPolicyAttributionEvent(t, 1, "logged", "datetime('now','-1 hour')", "b24")    // 非 blocked 不计
+	seedPolicyAttributionEvent(t, 2, "blocked", "datetime('now','-1 hour')", "b24")
+	seedPolicyAttributionEvent(t, 0, "blocked", "datetime('now','-1 hour')", "b24") // 未归因不计
 
 	recorder := getRequest(t, router, "/security/policies")
 	var payload struct {
@@ -560,19 +553,12 @@ func TestListSecurityPolicies_carriesTrigger24h(t *testing.T) {
 	if _, err := db.DB.Exec(`INSERT INTO security_policies (id,name,mode,policy_type,enabled) VALUES (1,'trg','blocking','stage3',1),(2,'trgb','off','stage1',1)`); err != nil {
 		t.Fatal(err)
 	}
-	seedEvt := func(policyID int, action, timeExpr string) {
-		t.Helper()
-		if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time,rule_caddy_id,policy_id,client_ip,method,uri,event_type,rule_triggered,rule_msg,action,anomaly_score,rule_name,policy_name,transaction_id)
-			VALUES (`+timeExpr+`,'lb_x',?,'203.0.113.9','GET','/x','waf','942100','msg',?,0,'x','trg',?)`, policyID, action, fmt.Sprintf("tx-%d-%s-%s", policyID, action, timeExpr)); err != nil {
-			t.Fatalf("seed event: %v", err)
-		}
-	}
-	seedEvt(1, "blocked", "datetime('now','-1 hour')")
-	seedEvt(1, "logged", "datetime('now','-2 hours')")
-	seedEvt(1, "logged", "datetime('now','-1 hour')")
-	seedEvt(1, "logged", "datetime('now','-25 hours')") // 超窗不计
-	seedEvt(2, "logged", "datetime('now','-1 hour')")
-	seedEvt(0, "logged", "datetime('now','-1 hour')") // 未归因不计
+	seedPolicyAttributionEvent(t, 1, "blocked", "datetime('now','-1 hour')", "trg")
+	seedPolicyAttributionEvent(t, 1, "logged", "datetime('now','-2 hours')", "trg")
+	seedPolicyAttributionEvent(t, 1, "logged", "datetime('now','-1 hour')", "trg")
+	seedPolicyAttributionEvent(t, 1, "logged", "datetime('now','-25 hours')", "trg") // 超窗不计
+	seedPolicyAttributionEvent(t, 2, "logged", "datetime('now','-1 hour')", "trg")
+	seedPolicyAttributionEvent(t, 0, "logged", "datetime('now','-1 hour')", "trg") // 未归因不计
 	if _, err := db.DB.Exec(`INSERT INTO security_policies (id,name,mode,policy_type,enabled) VALUES (3,'trgz','blocking','stage3',1)`); err != nil {
 		t.Fatal(err)
 	} // trgz：零事件策略
@@ -815,5 +801,15 @@ func TestUpdateSecurityPolicy_keepsTrustDetectionForStage0(t *testing.T) {
 	}
 	if stored != 1 {
 		t.Fatalf("stage0 policy trust_detection=%d after update, want 1", stored)
+	}
+}
+
+// seedPolicyAttributionEvent 写入一条归因到指定策略的指标事件（策略列表
+// 24h 计数用例共用）：timeExpr 为 SQLite 时间表达式（窗口边界由调用方选）。
+func seedPolicyAttributionEvent(t *testing.T, policyID int, action, timeExpr, policyName string) {
+	t.Helper()
+	if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time,rule_caddy_id,policy_id,client_ip,method,uri,event_type,rule_triggered,rule_msg,action,anomaly_score,rule_name,policy_name,transaction_id)
+		VALUES (`+timeExpr+`,'lb_x',?,'203.0.113.9','GET','/x','waf','942100','msg',?,0,'x',?,?)`, policyID, action, policyName, fmt.Sprintf("tx-%d-%s-%s", policyID, action, timeExpr)); err != nil {
+		t.Fatalf("seed event: %v", err)
 	}
 }

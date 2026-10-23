@@ -890,7 +890,7 @@ func securityEventsPolicyContainsRuleWithExclusions(policy *models.SecurityPolic
 	case n == 14:
 		// 历史威胁情报库共享 id:14：由带 ACL 引用/内联名单的 IP 控制策略认领。
 		return policy.IPACLEnabled && (len(policy.MergedACLList) > 0 || ipListRefsNonEmpty(policy.IPACLListRefs))
-	case n >= 900000 && n < 1000000:
+	case securityEventsRuleIsCRSFamily(ruleTriggered):
 		// v2.2.2 混合选择——crs_rule_groups 可含六位 CRS ID 正选；六位 ID 触发的
 		// CRS 事件应先按六位正选归因，未命中时回落既有组号归因（空组=全部 CRS）。
 		// 早期实现把本分支放在组号分支（:371）之前且直接 return false，使后者成为
@@ -1002,7 +1002,7 @@ func securityEventsFallbackCanProduce(policy *models.SecurityPolicy, action, rul
 		return false
 	}
 	ipControl := securityEventsRuleIsIPFamily(ruleTriggered)
-	crs := n >= 900000 && n < 1000000
+	crs := securityEventsRuleIsCRSFamily(ruleTriggered)
 	customFam := securityEventsRuleIsCustomFamily(ruleTriggered)
 	switch policy.Mode {
 	case "off":
@@ -1811,10 +1811,14 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 						}
 						// 不可恢复尾部=该段事件永久丢弃——计入跳过健康信号
 						// （跳过≠失败返回，不登记则本轮三面仍显示 healthy）。
-						// 字节口径=[offset, EOF)：offset 恒等于 decoderStart，即
-						// 最后一条成功摄取文档的末尾=畸形区起点；解码已消费的前缀
-						// （decoder.InputOffset()）仍属被丢弃的畸形文档字节，必须
-						// 计入，故不得改成 offset+InputOffset（那会少报丢失规模）。
+						// 字节口径=[offset, EOF)：offset=最后一条成功摄取文档的末尾
+						// （每成功解码一条即推进到 docEnd）；decoderStart=本次解码流
+						// 起点（pass 开始/重同步后更新）——二者仅在 pass 起点与刚
+						// 重同步后相等，不得互替：用 decoderStart 会低报丢弃字节。
+						// 解码已消费的前缀（decoder.InputOffset()）仍属被丢弃的畸形
+						// 文档字节，必须计入。
+						// malformedStart 仅用于日志定位（畸形区起点=decoderStart+已
+						// 消费前缀），不参与健康计数字节口径。
 						malformedStart := decoderStart + decoder.InputOffset()
 						securityEventsRecordSkips(info.Size()-offset, 1)
 						Logf("error", "security events ingestion: unrecoverable unreadable audit data at offset %d in archive, ending pass", malformedStart)
@@ -2289,9 +2293,8 @@ var securityEventsWriterHealth struct {
 	windowFailures  uint64
 	lastFailureAt   time.Time
 	// sidecarReadFailures 连续读取/解析失败计数（文件缺失不计——插件未
-	// 产生失败/未启动是正常形态）；sidecarLastOK 是最近一次成功读取时间。
+	// 产生失败/未启动是正常形态）。
 	sidecarReadFailures int
-	sidecarLastOK       time.Time
 	// sidecarWriteFailureHits 连续观测到插件写盘失败标记的轮数：标记在场=
 	// 插件写不进计数侧车（磁盘满/目录只读），此刻读到的是旧值、文件可能
 	// 根本不存在（首写即失败）——计数不可信，按阈值置 unavailable。
@@ -2353,7 +2356,6 @@ func securityEventsObserveAuditWriterStats() {
 			securityEventsWriterHealth.baselineDropped = 0
 			securityEventsWriterHealth.baselineIO = 0
 			securityEventsWriterHealth.sidecarReadFailures = 0
-			securityEventsWriterHealth.sidecarLastOK = time.Now()
 			securityEventsWriterHealth.mu.Unlock()
 			return
 		}
@@ -2370,7 +2372,6 @@ func securityEventsObserveAuditWriterStats() {
 	securityEventsWriterHealth.mu.Lock()
 	defer securityEventsWriterHealth.mu.Unlock()
 	securityEventsWriterHealth.sidecarReadFailures = 0
-	securityEventsWriterHealth.sidecarLastOK = now
 	droppedDelta := delta(payload.Dropped, &securityEventsWriterHealth.baselineDropped)
 	ioDelta := delta(payload.IOErrors, &securityEventsWriterHealth.baselineIO)
 	securityEventsWriterHealth.droppedTotal += droppedDelta
@@ -2527,7 +2528,6 @@ func SecurityEventsSetIngestionHealthForTest(status SecurityEventsIngestionStatu
 	securityEventsWriterHealth.windowFailures = 0
 	securityEventsWriterHealth.lastFailureAt = time.Time{}
 	securityEventsWriterHealth.sidecarReadFailures = 0
-	securityEventsWriterHealth.sidecarLastOK = time.Time{}
 	securityEventsWriterHealth.sidecarWriteFailureHits = 0
 	securityEventsWriterHealth.mu.Unlock()
 	// 跳过累计同属健康位整体，重置时一并清空（防跨用例泄漏）。
@@ -2745,4 +2745,62 @@ func securityEventsIsCrawlerSpoofRule(id string) bool {
 	}
 	enc, eok := encodeCrawlerSpoofRuleID(pid)
 	return eok && enc == n
+}
+
+// —— 攻击口径（放行不计入攻击）——
+
+// 安全事件 action 取值（写侧 securityEventsParseTransaction 单源）。
+const (
+	// SecurityEventActionBlocked 事件被拦截（coraza 事务 is_interrupted）。
+	SecurityEventActionBlocked = "blocked"
+	// SecurityEventActionLogged 事件仅记录（检测/信任/爬虫放行）。
+	SecurityEventActionLogged = "logged"
+)
+
+// IsCrawlerExemptRuleID 报告 rule_triggered 是否为「已验证爬虫放行」规则 id
+// （geoipCrawlerRuleBase+policyID*16+引擎序号，段内起始 id 之后）。
+// 必须是 6 位纯数字形态：归因/评分走 Atoi 宽松形态，"+810016"/前导零/空白
+// 会被当成同一 id，而放行口径是面向用户展示的统计维度，宽松形态一律不认。
+// 段界判定复用 decode+encode 回环（单源），不在此复写段基址。
+func IsCrawlerExemptRuleID(id string) bool {
+	if len(id) != 6 {
+		return false
+	}
+	for i := range len(id) {
+		if id[i] < '0' || id[i] > '9' {
+			return false
+		}
+	}
+	n, err := strconv.Atoi(id)
+	if err != nil {
+		return false
+	}
+	if n < geoipCrawlerRuleBase+geoipCrawlerEngineSlots || n >= geoipCrawlerSpoofRuleBase {
+		return false
+	}
+	return securityEventsIsCrawlerExemptRule(id)
+}
+
+// SecurityEventCountsAsAttack 攻击口径唯一判据：仅「已记录 + 爬虫放行族」
+// 不计入攻击（放行不是攻击）；其余一律计入。
+//
+// 边界：归因取审计首条消息，多策略下「A 放行 + B 拦截」的事件仍可能被记在
+// 放行规则名下——因此这里按 action 判定而非按规则族：action=blocked 的放行族
+// 事件仍然计入，不隐藏真实拦截。
+func SecurityEventCountsAsAttack(action, ruleTriggered string) bool {
+	return !(action == SecurityEventActionLogged && IsCrawlerExemptRuleID(ruleTriggered))
+}
+
+// CrawlerExemptRuleIDSQLPredicate 返回「rule_triggered 属爬虫放行族」的 SQL
+// 谓词（与 IsCrawlerExemptRuleID 同集合）：GLOB 六位数字同时约束长度与字符集，
+// CAST 后落在 [段内起始, 伪装段起点)。
+func CrawlerExemptRuleIDSQLPredicate(col string) string {
+	return fmt.Sprintf(`(COALESCE(%s,'') GLOB '[0-9][0-9][0-9][0-9][0-9][0-9]' AND CAST(COALESCE(%s,'') AS INTEGER) BETWEEN %d AND %d)`,
+		col, col, geoipCrawlerRuleBase+geoipCrawlerEngineSlots, geoipCrawlerSpoofRuleBase-1)
+}
+
+// AttackEventSQLPredicate 返回「该行计入攻击」的 SQL 谓词（与
+// SecurityEventCountsAsAttack 同集合）：非「logged 且爬虫放行族」。
+func AttackEventSQLPredicate(ruleCol, actionCol string) string {
+	return fmt.Sprintf(`NOT (COALESCE(%s,'') = '%s' AND %s)`, actionCol, SecurityEventActionLogged, CrawlerExemptRuleIDSQLPredicate(ruleCol))
 }

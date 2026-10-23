@@ -453,7 +453,15 @@ func migrateLegacyAuditLogs(mainDB *sql.DB, auditPath string) error {
 	// 无冲突：清除可能存在的旧冲突标记后删除旧表（收敛库零写）。
 	clearAuditMigrationState(auditLegacyConflictMarkerName)
 	if _, err := mainDB.Exec("DROP TABLE audit_log"); err != nil {
-		return fmt.Errorf("failed to remove legacy audit table: %w", err)
+		// 数据已全量并入审计库且逐列校验通过（上方 mismatch=0），此处的
+		// DROP 只是清理动作。删除失败（典型：另一连接持主库写锁）若上抛会
+		// 让服务无法启动，而数据事实上已迁移安全。降级为 WARN + 系统审计
+		// 留痕并保留旧表：下次启动的复制路径 INSERT OR IGNORE 幂等，
+		// mismatch 仍为 0，DROP 自然重试。
+		detail := fmt.Sprintf("启动迁移：旧审计表已迁移完成但删除失败，已保留主库 audit_log 表待下次启动重试（%v）", err)
+		log.Print("WARN: " + detail)
+		recordSystemAudit("启动迁移", "操作日志", detail)
+		return nil
 	}
 	return nil
 }

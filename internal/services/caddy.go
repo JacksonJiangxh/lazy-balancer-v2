@@ -358,10 +358,38 @@ func (s *CaddyService) ApplyConfigForce(config map[string]interface{}) (err erro
 	return s.applyConfigLockedOpt(config, true, true)
 }
 
-func (s *CaddyService) applyConfigLockedOpt(config map[string]interface{}, force, persistDegradation bool) (err error) {
+// caddyApplyOptions 收集一次 apply 的副作用开关：
+//   - force：强制 /load（must-revalidate，击穿 Caddy 同字节短路）；
+//   - persistDegradation：应用成功即持久化渲染降级横幅与审计（事务内 apply
+//     必须为 false——未提交配置的降级不得写入主库/审计）；
+//   - persistLastGood：应用成功即写 last-known-good。事务内 apply 必须为
+//     false：apply 在 commit 之前执行，进程若在 commit 前中断（SIGKILL/OOM/
+//     容器被杀），启动兜底会把从未提交的配置当作「最后已知正确」真实回放。
+//     调用方在 commit 成功后用返回的应用字节调 PersistLastGoodBytesInLock
+//     补齐（零额外渲染）。
+type caddyApplyOptions struct {
+	force              bool
+	persistDegradation bool
+	persistLastGood    bool
+}
+
+func (s *CaddyService) applyConfigLockedOpt(config map[string]interface{}, force, persistDegradation bool) error {
+	_, err := s.applyConfigWithOptions(config, caddyApplyOptions{
+		force:              force,
+		persistDegradation: persistDegradation,
+		persistLastGood:    true,
+	})
+	return err
+}
+
+// applyConfigWithOptions 是 apply 的唯一实现。返回本次真实下发到 /load 的
+// 载荷字节（nil=同字节短路或被拒/失败）——仅事务内调用方（persistLastGood=
+// false）消费，用于 commit 成功后补写 last-known-good。
+func (s *CaddyService) applyConfigWithOptions(config map[string]interface{}, opts caddyApplyOptions) (applied []byte, err error) {
+	force := opts.force
 	if message, ok := config[caddyConfigGenerationErrorKey].(string); ok {
 		// 生成失败 = 该 DB 视图渲染不出合法配置，按「配置被拒」分类（门控回滚）。
-		return &ConfigRejectedError{Err: errors.New(message)}
+		return nil, &ConfigRejectedError{Err: errors.New(message)}
 	}
 	snapshot, hasSnapshot := config[caddyCertFilesSnapshotKey].(CertFilesSnapshot)
 	// 本次生成实际写盘了证书文件（MaterializeCertPairs 检出
@@ -381,7 +409,7 @@ func (s *CaddyService) applyConfigLockedOpt(config map[string]interface{}, force
 
 	data, err := json.Marshal(caddyPayload(config))
 	if err != nil {
-		return fmt.Errorf("failed to marshal config: %w", err)
+		return nil, fmt.Errorf("failed to marshal config: %w", err)
 	}
 	// 审计真实性门（2026-09-25 用户裁定）：非强制路径先比对运行配置字节——
 	// 相同则跳过 /load（Caddy changeConfig 本就短路零 provision），返回
@@ -391,8 +419,8 @@ func (s *CaddyService) applyConfigLockedOpt(config map[string]interface{}, force
 		running, runningErr := s.getRunningConfigBytes()
 		if runningErr == nil && caddyConfigJSONEqual(running, data) {
 			// 同字节短路同样收敛降级状态（见函数说明）。
-			applyRenderDegradationState(config, persistDegradation)
-			return errSameConfig
+			applyRenderDegradationState(config, opts.persistDegradation)
+			return nil, errSameConfig
 		}
 		if errors.Is(runningErr, errCaddyAdminConfigTooLarge) {
 			// 超限是形态异常（非常规瞬时读失败），跳过短路但显式留痕。
@@ -402,7 +430,7 @@ func (s *CaddyService) applyConfigLockedOpt(config map[string]interface{}, force
 
 	req, err := http.NewRequest(http.MethodPost, s.adminURL+"/load", bytes.NewReader(data))
 	if err != nil {
-		return fmt.Errorf("failed to build config apply request: %w", err)
+		return nil, fmt.Errorf("failed to build config apply request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if force {
@@ -413,7 +441,7 @@ func (s *CaddyService) applyConfigLockedOpt(config map[string]interface{}, force
 	}
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to apply config: %w", err)
+		return nil, fmt.Errorf("failed to apply config: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
@@ -421,32 +449,34 @@ func (s *CaddyService) applyConfigLockedOpt(config map[string]interface{}, force
 		if resp.StatusCode < 500 {
 			// admin 4xx = Caddy 拒绝该配置（provision/校验失败），配置本身不可用；
 			// 5xx 归为系统失败（Caddy 存活但内部错误），不阻断落库。
-			return &ConfigRejectedError{Err: inner}
+			return nil, &ConfigRejectedError{Err: inner}
 		}
-		return inner
+		return nil, inner
 	}
 
 	Logf("info", "Caddy config applied successfully")
-	s.persistLastGoodLocked(data)
+	if opts.persistLastGood {
+		s.persistLastGoodLocked(data)
+	}
 	// 整轮渲染 apply 成功（=本轮全部在役名单已投影且被 Caddy 接受）后统一
 	// GC 名单投影文件——此时引用集落齐，差集安全。
 	maybeGCStaleIPListFiles()
 	// 渲染降级随配置图到达此处——成功应用后落审计行+
 	// caddy_apply_error 横幅（不阻断应用）；干净渲染置空状态，handlers 侧
 	// recordCaddyApplyResult(nil) 据此恢复常规清除。
-	applyRenderDegradationState(config, persistDegradation)
+	applyRenderDegradationState(config, opts.persistDegradation)
 	// 后台强制重载（证书部署 / CRS / IP 库 / 威胁库 / 自动封禁）成功即运行
 	// 配置已按库对齐——此前这类成功不清陈旧 caddy_apply_error（只有 handler
 	// 写路径经 recordCaddyApplyResult 清），上一次写路径失败留下的横幅会一直
 	// 亮到下一次写请求，与实际状态相反。仅强制且非事务内形态（persist）执行：
 	// 事务内 apply 会在 commit 前清横幅，commit 失败时留下「看起来已恢复」的
 	// 假象；本轮渲染有降级时上方刚写入降级横幅，不得覆盖。
-	if force && persistDegradation && LastRenderDegradation() == "" && db.DB != nil {
+	if force && opts.persistDegradation && LastRenderDegradation() == "" && db.DB != nil {
 		if _, execErr := db.DB.Exec(`UPDATE global_config SET caddy_apply_error='' WHERE id=1 AND caddy_apply_error<>''`); execErr != nil {
 			Logf("warn", "后台重载成功但清除陈旧应用失败横幅失败（横幅可能滞留）: %v", execErr)
 		}
 	}
-	return nil
+	return data, nil
 }
 
 // applyRenderDegradationState 收敛本轮渲染的降级状态。
@@ -836,12 +866,38 @@ func caddyPayload(config map[string]interface{}) map[string]interface{} {
 }
 
 // RouteIDBelongsToRule 判断运行配置中的路由 @id 是否归属某规则：主路由
-// （@id == ruleID）或其带后缀的兄弟路由（ruleID_ 前缀：path_N / geoip /
-// redirect 等）。当前唯一生产消费点是 handlers 侧 GetRuleCaddyConfig 的
-// 兄弟路由收集（规则删除依赖全量重渲染收敛，不做路由清理扫描）——跨包
-// 复用故保持导出。
+// （@id == ruleID）或其兄弟路由。兄弟路由按生成侧已知后缀精确判定
+// （tagRuleRoute 的 path_<序号>、geoip，以及 HTTP→HTTPS 跳转的 redirect），
+// 不做 ruleID+"_" 的裸前缀匹配——v1 导入/历史 ID 可含下划线，`lb_web` 与
+// `lb_web_path` 两条规则并存时裸前缀会把后者的主路由混进前者的配置查看框。
+// 当前唯一生产消费点是 handlers 侧 GetRuleCaddyConfig 的兄弟路由收集。
 func RouteIDBelongsToRule(routeID, ruleID string) bool {
-	return ruleID != "" && (routeID == ruleID || strings.HasPrefix(routeID, ruleID+"_"))
+	if ruleID == "" {
+		return false
+	}
+	if routeID == ruleID {
+		return true
+	}
+	suffix, ok := strings.CutPrefix(routeID, ruleID+"_")
+	if !ok || suffix == "" {
+		return false
+	}
+	switch {
+	case suffix == "geoip", suffix == "redirect":
+		return true
+	case strings.HasPrefix(suffix, "path_"):
+		rest := strings.TrimPrefix(suffix, "path_")
+		if rest == "" {
+			return false
+		}
+		for _, r := range rest {
+			if r < '0' || r > '9' {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 // GetConfig gets current Caddy configuration
@@ -4814,10 +4870,18 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 // ApplyConfigFromTx renders the Caddy config from an uncommitted transaction
 // and applies it, keeping the database unchanged when Caddy rejects the config.
 // rulesWrittenInTx：调用方事务是否写过 lb_rules（ACME 谓词 miss 补查门控）。
-func (s *CaddyService) ApplyConfigFromTx(tx *sql.Tx, rulesWrittenInTx bool) error {
+//
+// 返回本次真实下发到 /load 的载荷字节（nil=同字节短路，无真实重载）。事务内
+// apply 不写 last-known-good——apply 发生在 commit 之前，进程若在该窗口中断，
+// 启动兜底会回放从未提交的配置；调用方必须在 tx.Commit() 成功后调
+// PersistLastGoodBytesInLock(data) 补齐（零额外渲染）。
+func (s *CaddyService) ApplyConfigFromTx(tx *sql.Tx, rulesWrittenInTx bool) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.applyConfigLocked(generateCaddyConfigWithCertSource(tx, db.DB, rulesWrittenInTx), false)
+	return s.applyConfigWithOptions(generateCaddyConfigWithCertSource(tx, db.DB, rulesWrittenInTx), caddyApplyOptions{
+		persistDegradation: false,
+		persistLastGood:    false,
+	})
 }
 
 // RefreshIPListProjectionsFromTxInLock 投影热路径（2026-10-15 用户裁定）：
@@ -4960,9 +5024,9 @@ func (s *CaddyService) RollbackIPListProjectionsToCommittedInLock() {
 }
 
 // RestoreRuntimeToCommittedInLock 是提交失败分支的运行配置恢复
-// 事务内 apply 已按未提交视图 /load 并写入 last-known-good（持久化发生在每次
-// 成功 /load 之后），commit 失败只回退投影会让数据面继续生效未提交内容、重启
-// 兜底也回到未提交配置。本方法以已提交库值（db.DB）重渲染并 /load：运行配置、
+// 事务内 apply 已按未提交视图 /load（事务内 apply 不写 LKG，LKG 仍停留在
+// 上一份已提交配置），commit 失败只回退投影会让数据面继续生效未提交内容。
+// 本方法以已提交库值（db.DB）重渲染并 /load：运行配置、
 // LKG（成功 /load 经 persistLastGoodLocked 写回）、投影与证书物化副作用全部
 // 收敛到「已提交视图」。
 //
@@ -4999,12 +5063,25 @@ func (s *CaddyService) RestoreRuntimeToCommittedInLock() error {
 	return marshalErr
 }
 
+// PersistLastGoodBytesInLock 把事务内 apply 返回的已下发字节写入
+// last-known-good（零 /load、零渲染）。调用契约：必须是 commit 成功之后的
+// 首次落盘——事务内 apply 有意不写 LKG（见 caddyApplyOptions.persistLastGood），
+// 这里的字节就是刚刚被 Caddy 接受且已成为已提交视图的配置。空字节（同字节
+// 短路，无真实 /load）为 no-op：运行配置与 LKG 都不需要变化。
+func (s *CaddyService) PersistLastGoodBytesInLock(data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.persistLastGoodLocked(data)
+}
+
 // PersistCommittedViewAsLastGoodInLock 以已提交库值重渲染并把字节写入
 // last-known-good（零 /load——运行配置恢复由调用方的快照回退承担，同字节
-// 短路语义不破）。规则×5 apply 失败分支的 LKG 收口：候选 /load 成功会把
-// 未提交字节写进 LKG（每次成功 /load 都持久化），恢复 /load 再失败时 LKG
-// 滞留未提交配置、进程重启兜底回放未提交内容——本方法把 LKG 钉回已提交
-// 视图，与恢复成败解耦。
+// 短路语义不破）。apply 失败分支的 LKG 收口：任何回弹（快照重放/传输失败后
+// 的恢复尝试）都可能让 LKG 偏离已提交视图，本方法把它钉回「LKG=已提交库视图」
+// 这一全族不变量，与恢复成败解耦。
 //
 // 锁契约：调用方须已持 CaddyOpLock（=caddyOpMu 写路径临界区）；渲染读
 // db.DB，调用方须先回滚未提交事务（SQLite 写锁会阻塞渲染读取）。
@@ -5031,10 +5108,16 @@ func (s *CaddyService) PersistCommittedViewAsLastGoodInLock() error {
 // 旧证书继续服务）。非强制的 ApplyConfigFromTxCertAware 已于删除
 // （唯一生产调用方即本函数的调用点，保留旧版只会让未来调用方重新引入静默
 // 旧证书缺陷）。
-func (s *CaddyService) ApplyConfigFromTxCertAwareForce(tx *sql.Tx) error {
+// ApplyConfigFromTxCertAwareForce 的返回语义同 ApplyConfigFromTx：返回真实
+// 下发字节供 commit 成功后补写 last-known-good（事务内不落 LKG）。
+func (s *CaddyService) ApplyConfigFromTxCertAwareForce(tx *sql.Tx) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.applyConfigLockedOpt(generateCaddyConfigWithCertSource(tx, tx, true), true, false)
+	return s.applyConfigWithOptions(generateCaddyConfigWithCertSource(tx, tx, true), caddyApplyOptions{
+		force:              true,
+		persistDegradation: false,
+		persistLastGood:    false,
+	})
 }
 
 // normalizeWeights 按 gcd 约分权重表（Caddy WRR 权重越小越高效）。

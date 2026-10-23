@@ -125,8 +125,20 @@ func TestGetAuditLogs_totalServedFromShortCacheWithDisclosure(t *testing.T) {
 }
 
 func TestGetAuditLogs_invalidTimezoneLoggedByStateTransitionOnly(t *testing.T) {
-	// Given：带外写入非法时区值。
+	// Given：先以合法时区跑一轮，把状态机位复位为「健康」——同一 key 的状态
+	// 跨用例共享（前序用例可能已报过失败），不复位则首轮 fail 可能被去重成 0
+	// 条，断言随用例执行顺序漂移。
 	router := newAuditLogTestRouter(t, "")
+	if _, err := db.DB.Exec(`UPDATE global_config SET timezone='Asia/Shanghai' WHERE id=1`); err != nil {
+		t.Fatalf("seed valid timezone: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/audit-logs", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("prime status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+
+	// Given：带外写入非法时区值，此后开始捕获日志。
 	if _, err := db.DB.Exec(`UPDATE global_config SET timezone='Mars/Phobos' WHERE id=1`); err != nil {
 		t.Fatalf("seed invalid timezone: %v", err)
 	}
@@ -144,12 +156,18 @@ func TestGetAuditLogs_invalidTimezoneLoggedByStateTransitionOnly(t *testing.T) {
 		}
 	}
 
-	// Then：不再是每请求一条 error（旧实现每轮一次 Logf("error", ...)）。
-	if got := strings.Count(logs.String(), "failed to load timezone"); got != 0 {
-		t.Fatalf("仍存在每请求 error 留痕 %d 条: %q", got, logs.String())
+	// Then：断言绑定真实日志文案单源（services.LogConfigReadFailure 的固定
+	// 格式）——失败留痕恰 1 条（第二轮状态未变、不再刷屏）。
+	const failureLine = "读取任务排程失败（audit-log-timezone-value）"
+	const detailLine = `审计日志筛选时区 "Mars/Phobos" 非法`
+	if got := strings.Count(logs.String(), failureLine); got != 1 {
+		t.Fatalf("状态转换失败留痕 %d 条, want 1（首报去重）: %q", got, logs.String())
 	}
-	// 状态转换留痕最多一条（跨用例状态共享时可能为 0——已报过即不重复）。
-	if got := strings.Count(logs.String(), "时区"); got > 1 {
-		t.Fatalf("非法时区留痕 %d 条, want ≤1（首报去重）: %q", got, logs.String())
+	if got := strings.Count(logs.String(), detailLine); got != 1 {
+		t.Fatalf("失败详情留痕 %d 条, want 1: %q", got, logs.String())
+	}
+	// 级别契约：状态转换首报为 warn，不得落到 error（旧实现每请求 error）。
+	if strings.Contains(logs.String(), "ERROR:") {
+		t.Fatalf("非法时区留痕出现 error 级别: %q", logs.String())
 	}
 }

@@ -349,20 +349,10 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 	if input.UpstreamForceHTTP1 != 0 && input.UpstreamForceHTTP1 != 1 {
 		return fmt.Errorf("upstream_force_http1 必须为 0 或 1")
 	}
-	// 重试窗口值域（方案 C，2026-10-12）：http 规则 tcp_try_duration ∈ [-1,60000]
-	// （-1=显式禁用重试，NTLM 接管态）；tcp 规则 ∈ [0,60000]（下方 TCP 分支拒负值）。
-	// 上界两协议两字段同值 60000——此前 http 侧
-	// tcp_try_interval、tcp 侧 duration/interval 均无 >60000 上界，越界值
-	//（999999ms/10^12ms）可经 API/MCP/导入/集群快照落库渲染（L4 proxy
-	// try_duration 溢出，注释宣称值域未兑现）。
-	if input.Protocol == "http" && (input.TCPTryDuration < -1 || input.TCPTryDuration > 60000) {
-		return fmt.Errorf("重试窗口必须在 -1 到 60000 毫秒之间（-1=禁用重试，0=默认 5 秒窗口）")
-	}
-	// http 侧重试间隔补下界——此前只判 >60000，负值可保存后
-	// 成为死值（渲染走默认分支）或触发泛化的配置生成失败，用户拿不到字段级
-	// 400。TCP 侧下界在下方 TCP 分支（同值域文案）。
-	if input.Protocol == "http" && (input.TCPTryInterval < 0 || input.TCPTryInterval > 60000) {
-		return fmt.Errorf("重试间隔必须在 0 到 60000 毫秒之间")
+	// 重试窗口值域（单源 validateTCPTryWindowBounds，见下）——保存族与存量门
+	// 共用同一张值域表，避免「保存拒绝、启用/启动放行」分叉。
+	if err := validateTCPTryWindowBounds(input.Protocol, input.TCPTryDuration, input.TCPTryInterval); err != nil {
+		return err
 	}
 	if input.NTLMCompatible == 1 {
 		if input.Protocol == "tcp" {
@@ -443,25 +433,15 @@ func validateRuleFeatures(input ruleFeatureInput) error {
 		if input.ProxyDialTimeout > 0 || input.ProxyResponseHeaderTimeout > 0 || input.ProxyReadTimeout > 0 || input.ProxyWriteTimeout > 0 || input.ProxyStreamTimeout > 0 || input.ProxyFlushInterval != 0 || input.ProxyStreamCloseDelay > 0 {
 			return fmt.Errorf("TCP 规则不支持 HTTP 代理超时配置")
 		}
-		// TCP 三字段无哨兵语义——负值仅被渲染侧静默钳制(caddy.go 3503-3522),
-		// 保存前拒绝显式负值。proxy_flush_interval 的 -1 哨兵仅属 http 侧,不适用此处。
-		if input.TCPHealthCheckPort < 0 || input.TCPTryDuration < 0 || input.TCPTryInterval < 0 {
+		// TCP 三字段无哨兵语义——负值仅被渲染侧静默钳制，保存前拒绝显式负值。
+		// 重试时长/间隔的负值已由上方 validateTCPTryWindowBounds 统一拒绝
+		// （与存量门同源），此处只余健康检查端口。
+		if input.TCPHealthCheckPort < 0 {
 			return fmt.Errorf("TCP 健康检查端口与重试时长/间隔不能为负数")
 		}
-		// TCP 重试窗口补上界——[0,60000]（与 http 侧
-		// 上界同值），此前仅拒负值，越界值落库渲染溢出。
-		if input.TCPTryDuration > 60000 || input.TCPTryInterval > 60000 {
-			return fmt.Errorf("TCP 重试时长/间隔必须在 0 到 60000 毫秒之间")
-		}
 	}
-	// 渲染侧要求「重试窗口 >0 时重试间隔必填」（HTTP
-	// buildHTTPHandleChain 与 TCP buildTCPProxyRoute 两处 <=0 显性报错），
-	// 字段门此前只拒负值/越界——duration>0 + interval=0 可通过保存门后在
-	// 事务渲染阶段失败，用户拿到「Caddy 配置应用失败」泛化 400。此处与渲染门
-	// 同文案前置，两协议同口径（负值仍由上方值域门先行点名）。
-	if input.TCPTryDuration > 0 && input.TCPTryInterval < 1 {
-		return fmt.Errorf("重试间隔必须大于 0（重试窗口 >0 时必填）")
-	}
+	// 「重试窗口 >0 时重试间隔必填」与渲染门同文案，已由
+	// validateTCPTryWindowBounds 前置（与存量门同源）；此处不再重复。
 	if !input.CustomRoutesEnabled && len(input.PathRules) > 0 {
 		return fmt.Errorf("自定义路径规则未启用，不能提交路径规则")
 	}
@@ -1282,6 +1262,34 @@ func mixedUpstreamPoolError(rule models.LbRule) error {
 	return nil
 }
 
+// validateTCPTryWindowBounds 是重试窗口的单源值域门：保存族
+// （Create/Update/复制）与存量门（单规则启用、启动/UpdateConfig 聚合）共用。
+// http 侧 tcp_try_duration ∈ [-1,60000]（-1=显式禁用重试，NTLM 接管态），
+// tcp 规则 ∈ [0,60000]（L4 无哨兵语义）；两协议同值上界 60000——越界值落库
+// 后 L4 proxy try_duration 溢出、http 侧亦为死值。duration>0 时 interval 必须
+// ≥1，与渲染侧两处 <=0 显性报错同文案前置，避免用户在事务渲染阶段拿到泛化失败。
+func validateTCPTryWindowBounds(protocol string, duration, interval int) error {
+	if protocol == "http" {
+		if duration < -1 || duration > 60000 {
+			return fmt.Errorf("重试窗口必须在 -1 到 60000 毫秒之间（-1=禁用重试，0=默认 5 秒窗口）")
+		}
+		if interval < 0 || interval > 60000 {
+			return fmt.Errorf("重试间隔必须在 0 到 60000 毫秒之间")
+		}
+	} else {
+		if duration < 0 || interval < 0 {
+			return fmt.Errorf("TCP 重试时长/间隔不能为负数")
+		}
+		if duration > 60000 || interval > 60000 {
+			return fmt.Errorf("TCP 重试时长/间隔必须在 0 到 60000 毫秒之间")
+		}
+	}
+	if duration > 0 && interval < 1 {
+		return fmt.Errorf("重试间隔必须大于 0（重试窗口 >0 时必填）")
+	}
+	return nil
+}
+
 // validateStoredRuleProtocolFields 是单规则启用门与启动/UpdateConfig 聚合门
 // 共用的字段检查：先按保存族归一 TCP 死字段，再校验策略/协议白名单、NTLM
 // 形态与上游池混布。两入口必须同源，否则同一坏规则会「启用时报错、重启时静默降级」。
@@ -1291,6 +1299,11 @@ func validateStoredRuleProtocolFields(rule models.LbRule, includeMixedPool bool)
 		rule.PathRules = []models.PathRule{}
 	}
 	if err := validateStrategyForProtocol(rule.Protocol, rule.Strategy); err != nil {
+		return &configValidationError{message: err.Error()}
+	}
+	// 重试窗口与保存族同源：存量/导入/集群快照的越界值不得「启用时报错、
+	// 重启时静默降级」——两入口共用同一张值域表。
+	if err := validateTCPTryWindowBounds(rule.Protocol, rule.TCPTryDuration, rule.TCPTryInterval); err != nil {
 		return &configValidationError{message: err.Error()}
 	}
 	if rule.NTLMCompatible != 0 {

@@ -51,7 +51,7 @@ func TestNewAdminHTTPServer_largeTransferTimeouts(t *testing.T) {
 		t.Fatalf("ReadHeaderTimeout=%s, want 10s slow-header guard", server.ReadHeaderTimeout)
 	}
 	if server.ReadTimeout != 5*time.Minute {
-		t.Fatalf("ReadTimeout=%s, want 5m for 48MB imports", server.ReadTimeout)
+		t.Fatalf("ReadTimeout=%s, want 5m for large config imports", server.ReadTimeout)
 	}
 	if server.WriteTimeout != 10*time.Minute {
 		t.Fatalf("WriteTimeout=%s, want 10m for large backup downloads", server.WriteTimeout)

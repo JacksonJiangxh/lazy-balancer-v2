@@ -107,24 +107,18 @@ func (h *Handlers) StartCrawlerLibUpdate(c *gin.Context) {
 
 // UpdateCrawlerAutoUpdate 爬虫地址库任务级总开关（与威胁库总闸解耦）。
 func (h *Handlers) UpdateCrawlerAutoUpdate(c *gin.Context) {
-	if !guardConfiguredJSONBody(c) {
+	// crawler_auto_update 存在 global_config（导入 Config 区整体改写）、
+	// security_crawler_sources 在导入全量替代表内——窗口内写会被导入覆盖或
+	// 撞写锁 500，与 CRS/IP2Region/威胁库同口径 409 fast-fail（同一骨架，
+	// 门序先于 body 解析）。
+	autoUpdate, ok := h.libAutoUpdate(c, libAutoUpdateSpec{
+		ImportAction:   "修改爬虫地址库设置（配置导入进行中）",
+		InvalidMessage: "请求无效",
+	}, services.SetCrawlerAutoUpdate)
+	if !ok {
 		return
 	}
-	var body struct {
-		AutoUpdate *bool `json:"auto_update"`
-	}
-	if err := c.ShouldBindJSON(&body); err != nil || body.AutoUpdate == nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求无效"})
-		return
-	}
-	if !requireMasterNode(c) {
-		return
-	}
-	if err := services.SetCrawlerAutoUpdate(*body.AutoUpdate); err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新失败: " + err.Error()})
-		return
-	}
-	recordAudit(c, "更新", "爬虫地址库", "自动更新总开关："+enabledStateLabel(*body.AutoUpdate))
+	recordAudit(c, "更新", "爬虫地址库", "自动更新总开关："+enabledStateLabel(autoUpdate))
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已更新"})
 }
 
@@ -165,6 +159,12 @@ func (h *Handlers) GetCrawlerLibUpdateStatus(c *gin.Context) {
 
 // UpdateCrawlerLibFlags 更新爬虫源开关（update_enabled 单字段，同 UpdateThreatSourceFlags）。
 func (h *Handlers) UpdateCrawlerLibFlags(c *gin.Context) {
+	// security_crawler_sources 在导入全量替代表清单内：窗口内写会被静默
+	// 覆盖或撞写锁 500——与威胁库 UpdateThreatSourceFlags 同口径 409
+	// fast-fail，先于 body 解析。
+	if rejectWriteDuringImport(c, "修改爬虫地址库设置（配置导入进行中）") {
+		return
+	}
 	if !guardConfiguredJSONBody(c) {
 		return
 	}

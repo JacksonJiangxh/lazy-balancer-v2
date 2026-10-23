@@ -3,6 +3,7 @@ package services
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log"
 	"strings"
 	"testing"
@@ -437,6 +438,86 @@ func TestAutoBackupNextSlot_outOfRangeWeeklyDayStillSchedules(t *testing.T) {
 	if slot.After(now) {
 		// 未跑过 → 返回最近过去槽（≤now，跨停机补跑）；形态断言即可。
 		t.Fatalf("slot=%v 应 ≤now（未执行过时返回最近槽）", slot)
+	}
+}
+
+// 月度「已执行→步进」必须以最近槽为起点：以 now 步进时，1/31、3/31、5/31、
+// 8/31、10/31 的 AddDate(0,1,0) 会归一到下下月（1/31+1 月=3/3），回落到已
+// 执行月份之后的第二个月，设置页把下个月槽整月显示为跳过。day∈{1,2,3} 时
+// 恰落入该窗口；day≥4 因当月槽仍早于 step 而侥幸正确——矩阵同时钉住两端。
+func TestAutoBackupNextSlot_monthEndStepsToAdjacentMonth(t *testing.T) {
+	cases := []struct {
+		year, month int
+		day         int
+	}{
+		{2026, 1, 1}, {2026, 1, 2}, {2026, 1, 3}, {2026, 1, 28},
+		{2026, 3, 1}, {2026, 3, 2}, {2026, 3, 3}, {2026, 3, 28},
+		{2026, 5, 1}, {2026, 5, 2}, {2026, 5, 3}, {2026, 5, 28},
+		{2026, 8, 1}, {2026, 8, 2}, {2026, 8, 3}, {2026, 8, 28},
+		{2026, 10, 1}, {2026, 10, 2}, {2026, 10, 3}, {2026, 10, 28},
+	}
+	for _, tc := range cases {
+		name := time.Date(tc.year, time.Month(tc.month), 1, 0, 0, 0, 0, time.UTC).Format("2006-01")
+		t.Run(fmt.Sprintf("%s-day%d", name, tc.day), func(t *testing.T) {
+			setupAutoBackupTestDB(t)
+			executed := time.Date(tc.year, time.Month(tc.month), tc.day, 3, 0, 0, 0, time.UTC)
+			if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_enabled=1, auto_backup_frequency='monthly',
+				auto_backup_time='03:00', auto_backup_day=?, auto_backup_last_run=? WHERE id=1`, tc.day, executed.Format(time.RFC3339)); err != nil {
+				t.Fatal(err)
+			}
+			now := time.Date(tc.year, time.Month(tc.month), autoBackupDaysInMonth(tc.year, time.Month(tc.month)), 12, 0, 0, 0, time.UTC)
+
+			slot, ok := nextAutoBackupSlot(now)
+			if !ok {
+				t.Fatal("monthly 已启用必须有下一槽")
+			}
+			nextMonth := time.Date(tc.year, time.Month(tc.month), 1, 0, 0, 0, 0, time.UTC).AddDate(0, 1, 0)
+			want := time.Date(nextMonth.Year(), nextMonth.Month(), tc.day, 3, 0, 0, 0, time.UTC)
+			if !slot.Equal(want) {
+				t.Fatalf("月末步进 slot=%v, want 紧邻下一月槽 %v（不得跳月）", slot, want)
+			}
+		})
+	}
+}
+
+// 回归：daily/weekly 从槽步进后仍落在紧邻下一周期槽（不得因改为 due 起点
+// 而原地踏步或多跳）。
+func TestAutoBackupNextSlot_dailyWeeklyStepFromExecutedSlot(t *testing.T) {
+	cases := []struct {
+		name string
+		freq string
+		day  int
+		now  time.Time
+		want time.Time
+	}{
+		{
+			name: "daily", freq: "daily", day: 1,
+			now:  time.Date(2026, 9, 20, 15, 0, 0, 0, time.UTC),
+			want: time.Date(2026, 9, 21, 3, 0, 0, 0, time.UTC),
+		},
+		{
+			name: "weekly", freq: "weekly", day: 1,
+			now:  time.Date(2026, 9, 22, 15, 0, 0, 0, time.UTC),
+			want: time.Date(2026, 9, 28, 3, 0, 0, 0, time.UTC),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setupAutoBackupTestDB(t)
+			if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_enabled=1, auto_backup_frequency=?,
+				auto_backup_time='03:00', auto_backup_day=?, auto_backup_last_run=? WHERE id=1`,
+				tc.freq, tc.day, "2026-09-21T03:00:00Z"); err != nil {
+				t.Fatal(err)
+			}
+
+			slot, ok := nextAutoBackupSlot(tc.now)
+			if !ok {
+				t.Fatal("已启用必须有下一槽")
+			}
+			if !slot.Equal(tc.want) {
+				t.Fatalf("slot=%v, want %v", slot, tc.want)
+			}
+		})
 	}
 }
 

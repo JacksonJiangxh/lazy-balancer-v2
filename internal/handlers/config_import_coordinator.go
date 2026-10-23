@@ -373,7 +373,7 @@ func (session *configImportSession) abort(importErr error) error {
 				// RestoreRuntimeToCommittedInLock 钉回已提交字节，但横幅事实
 				// 源此前为空——刷新页面后分叉完全不可见。与规则域 apply 失败
 				// 同口径持久化失败横幅。
-				session.h.recordCaddyApplyResult(fmt.Errorf("导入失败后恢复已提交运行配置失败: %w", restoreErr))
+				session.h.recordCaddyApplyFailure(fmt.Errorf("导入失败后恢复已提交运行配置失败: %w", restoreErr), restoreErr)
 			}
 			importErr = errors.Join(importErr, certErr, restoreErr)
 			session.finished = true
@@ -411,8 +411,9 @@ func (session *configImportSession) commit(affectedRuleIDs []string, certificate
 		return &importCoordinatorError{phase: importPhaseCaddy, err: session.abort(err), caddyRejected: services.IsConfigRejected(err), action: session.action}
 	}
 	session.runtimeApplyAttempted = true
-	if err := session.h.caddyService.ApplyConfigFromTxCertAwareForce(session.tx); err != nil {
-		return &importCoordinatorError{phase: importPhaseCaddy, err: session.abort(err), caddyRejected: services.IsConfigRejected(err), action: session.action}
+	appliedConfig, applyErr := session.h.caddyService.ApplyConfigFromTxCertAwareForce(session.tx)
+	if applyErr != nil {
+		return &importCoordinatorError{phase: importPhaseCaddy, err: session.abort(applyErr), caddyRejected: services.IsConfigRejected(applyErr), action: session.action}
 	}
 	if err := services.BumpClusterVersion(session.ctx, session.tx); err != nil {
 		return &importCoordinatorError{phase: importPhaseVersion, err: session.abort(err), action: session.action}
@@ -420,6 +421,9 @@ func (session *configImportSession) commit(affectedRuleIDs []string, certificate
 	if err := session.tx.Commit(); err != nil {
 		return &importCoordinatorError{phase: importPhaseCommit, err: session.abort(err), action: session.action}
 	}
+	// commit 成功后才落 last-known-good（事务内 apply 有意不写），字节即
+	// 刚被 Caddy 接受的候选——导入的 LKG 因此恒为已提交视图。
+	session.h.caddyService.PersistLastGoodBytesInLock(appliedConfig)
 	session.runtime = nil
 	// /全量替换导入对消失规则的产物清理。v2/v1 导入均清光
 	// lb_rules 后重插（v1 还换新 caddy_id），但产物轴此前只写不删：消失规则的

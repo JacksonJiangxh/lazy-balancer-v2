@@ -446,9 +446,14 @@ func TestListIPLists_refCountsAndRefPolicies(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
-	// 16 个夹具行 + 4 个 system=1 内置名单种子（v2.3.2 名单化 + 自动封禁名单）
-	if resp.Code != 0 || len(resp.Data) != 20 {
-		t.Fatalf("code=%d rows=%d, want 20 rows（16 夹具 + 4 内置名单）", resp.Code, len(resp.Data))
+	// 夹具行数 + 内置系统名单（数量直接取自种子行，名单族增减不再需要改断言）
+	var seedSystem int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM security_ip_lists WHERE system=1`).Scan(&seedSystem); err != nil {
+		t.Fatal(err)
+	}
+	wantRows := 16 + seedSystem
+	if resp.Code != 0 || len(resp.Data) != wantRows {
+		t.Fatalf("code=%d rows=%d, want %d rows（16 夹具 + %d 内置名单）", resp.Code, len(resp.Data), wantRows, seedSystem)
 	}
 	for _, row := range resp.Data {
 		if int64(row.ID) == target {

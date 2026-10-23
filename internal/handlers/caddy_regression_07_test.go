@@ -9,6 +9,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 	"lazy-balancer-v2/internal/services"
 )
@@ -60,16 +61,30 @@ func TestUpdateConfig_rejectsAuditLogSizeAbove512MB(t *testing.T) {
 	router.PUT("/config", handler.UpdateConfig)
 
 	// When 超上限
+	before := readAuditLogSizeMB(t)
 	request := httptest.NewRequest(http.MethodPut, "/config", strings.NewReader(`{"source":"basic","audit_log_size_mb":600}`))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, request)
 
-	// Then 400 + 明确中文文案
+	// Then 400 + 明确中文文案 + 库值不变（拒绝必须零落库）
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d body=%s, want 400", response.Code, response.Body.String())
 	}
 	if !strings.Contains(response.Body.String(), "审计日志轮转大小上限 512MB") {
 		t.Fatalf("body=%s, want 审计日志轮转大小上限 512MB", response.Body.String())
 	}
+	if after := readAuditLogSizeMB(t); after != before {
+		t.Fatalf("拒绝后 audit_log_size_mb 变化: %d → %d, want 不变", before, after)
+	}
+}
+
+// readAuditLogSizeMB 读取当前审计日志轮转大小（拒绝路径断言零落库用）。
+func readAuditLogSizeMB(t *testing.T) int {
+	t.Helper()
+	var size int
+	if err := db.DB.QueryRow(`SELECT COALESCE(audit_log_size_mb,0) FROM global_config WHERE id=1`).Scan(&size); err != nil {
+		t.Fatalf("read audit_log_size_mb: %v", err)
+	}
+	return size
 }

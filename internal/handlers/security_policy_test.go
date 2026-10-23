@@ -1093,11 +1093,16 @@ func TestCreateSecurityPolicy_acceptsCustomOnlyModeAndThreshold15(t *testing.T) 
 		t.Fatalf("create custom_only policy status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 	var mode string
-	if err := db.DB.QueryRow(`SELECT mode FROM security_policies WHERE name='仅自定义策略'`).Scan(&mode); err != nil {
+	var threshold int
+	if err := db.DB.QueryRow(`SELECT mode, COALESCE(anomaly_threshold,0) FROM security_policies WHERE name='仅自定义策略'`).Scan(&mode, &threshold); err != nil {
 		t.Fatalf("read back policy: %v", err)
 	}
 	if mode != "custom_only" {
 		t.Fatalf("mode=%q, want custom_only", mode)
+	}
+	// 15 档必须真实落库：归一逻辑（0→5）若误伤 15，阈值会静默退回默认。
+	if threshold != 15 {
+		t.Fatalf("anomaly_threshold=%d, want 15", threshold)
 	}
 }
 
@@ -1183,10 +1188,19 @@ func TestSecurityPolicySummary_offModeHasCustomRulesFalse(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
+	found := false
 	for _, p := range resp.Data {
-		if p.Name == "off带规则" && p.HasCustomRules {
+		if p.Name != "off带规则" {
+			continue
+		}
+		found = true
+		if p.HasCustomRules {
 			t.Fatalf("off 策略 HasCustomRules=true, want false(模式门)")
 		}
+	}
+	// 行缺失时上面的循环恒不命中——必须先证明该行在列表里。
+	if !found {
+		t.Fatal("列表中缺少 off带规则（断言未被实际校验）")
 	}
 }
 
@@ -1216,7 +1230,9 @@ func TestUpdateSecurityPolicy_rateLimitGateUsesEffectiveValues(t *testing.T) {
 	// 且不得落库 enabled=1+rps=0 形态
 	var rps int
 	var enabled bool
-	db.DB.QueryRow("SELECT COALESCE(rate_limit_rps,0), COALESCE(rate_limit_enabled,0) FROM security_policies WHERE id=?", id).Scan(&rps, &enabled)
+	if err := db.DB.QueryRow("SELECT COALESCE(rate_limit_rps,0), COALESCE(rate_limit_enabled,0) FROM security_policies WHERE id=?", id).Scan(&rps, &enabled); err != nil {
+		t.Fatalf("read back rate limit columns: %v", err)
+	}
 	if enabled && rps == 0 {
 		t.Fatalf("落库 enabled=true+rps=0: UI 宣称限流启用实际零强制")
 	}
@@ -1321,4 +1337,36 @@ func decodeStringArray(t *testing.T, raw string) []string {
 		t.Fatalf("parse string array %q: %v", raw, err)
 	}
 	return list
+}
+
+// 内置威胁名单禁令的「请求值 ?? 存量值」合并判定：只改 ip_acl_mode 的更新
+// 必须看到存量 crs_excluded_rules 里 scope=list 的内置名单引用——否则
+// 「先存内置名单、后翻 allow 模式」可绕过禁令（白名单模式下内置黑名单被
+// 当成放行集合，语义反转）。
+func TestUpdateSecurityPolicy_builtinListInStoredCRSExclusionsRejected(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	var builtinID int64
+	if err := db.DB.QueryRow(`SELECT id FROM security_ip_lists WHERE system=1 ORDER BY id LIMIT 1`).Scan(&builtinID); err != nil {
+		t.Fatalf("read builtin list id: %v", err)
+	}
+	// 存量行直接落库（创建门会拒绝该组合，历史行是本次判定的对象）。
+	excluded := fmt.Sprintf(`[{"target":"942100","scope":"list","listRefs":[%d]}]`, builtinID)
+	res, err := db.DB.Exec(`INSERT INTO security_policies (name, mode, ip_acl_enabled, ip_acl_mode, crs_excluded_rules) VALUES ('legacy-builtin-crs', 'blocking', 0, 'deny', ?)`, excluded)
+	if err != nil {
+		t.Fatalf("insert policy: %v", err)
+	}
+	id, _ := res.LastInsertId()
+
+	router := newSecurityRouter(t)
+	rec := putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{"ip_acl_mode": "allow"})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400（存量 CRS 排除引用内置名单时不得翻 allow）body=%s", rec.Code, rec.Body.String())
+	}
+	var mode string
+	if err := db.DB.QueryRow(`SELECT ip_acl_mode FROM security_policies WHERE id=?`, id).Scan(&mode); err != nil {
+		t.Fatalf("read back mode: %v", err)
+	}
+	if mode != "deny" {
+		t.Fatalf("ip_acl_mode=%q, want 未变更的 deny", mode)
+	}
 }

@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -30,11 +31,11 @@ func TestParseCrawlerCIDRs_strictTokenBoundaries(t *testing.T) {
 	for _, v := range got {
 		joined += v + ","
 	}
-	if !containsStr(got, "42.236.12.130/32") {
+	if !containsString(got, "42.236.12.130/32") {
 		t.Fatalf("合法裸 IP 未提取: %v", got)
 	}
 	for _, bad := range []string{"1.2.3.4/32", "9.9.9.9/32"} {
-		if containsStr(got, bad) {
+		if containsString(got, bad) {
 			t.Fatalf("版本号/多段数字被误收为 %s: %v", bad, got)
 		}
 	}
@@ -47,12 +48,12 @@ func TestParseCrawlerCIDRsForFormat_rejectsErrorPage(t *testing.T) {
 	}
 	// 合法 JSON：结构化字段命中。
 	got, err := parseCrawlerCIDRsForFormat(`{"prefixes":[{"ipv4Prefix":"203.0.113.0/24"}]}`, "json")
-	if err != nil || !containsStr(got, "203.0.113.0/24") {
+	if err != nil || !containsString(got, "203.0.113.0/24") {
 		t.Fatalf("json 结构化提取失败: got=%v err=%v", got, err)
 	}
 	// html 源：词法提取照常。
 	got, err = parseCrawlerCIDRsForFormat("<table><td>198.51.100.7</td></table>", "html")
-	if err != nil || !containsStr(got, "198.51.100.7/32") {
+	if err != nil || !containsString(got, "198.51.100.7/32") {
 		t.Fatalf("html 词法提取失败: got=%v err=%v", got, err)
 	}
 }
@@ -79,10 +80,10 @@ func TestReadThreatIplistEntries_newerFastWinsOverStaleText(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if containsStr(vals, "198.51.100.1") {
+	if containsString(vals, "198.51.100.1") {
 		t.Fatalf("陈旧文本条目仍生效: %v", vals)
 	}
-	if !containsStr(vals, "203.0.113.0/24") {
+	if !containsString(vals, "203.0.113.0/24") {
 		t.Fatalf("新同步的 .fast 未生效: %v", vals)
 	}
 }
@@ -194,7 +195,7 @@ func TestResolvePolicyIPListRefs_missingRefAuditThrottled(t *testing.T) {
 
 	policy := func() []*models.SecurityPolicy {
 		return []*models.SecurityPolicy{{
-			ID: 1, Name: "限流测试策略", IPACLListRefs: "[" + itoa64(listID) + "]",
+			ID: 1, Name: "限流测试策略", IPACLListRefs: "[" + strconv.FormatInt(listID, 10) + "]",
 		}}
 	}
 	resolvePolicyIPListRefs(policy(), nil)
@@ -288,20 +289,6 @@ func TestApplySnapshot_rebuildsCrawlerRuntimeSnapshot(t *testing.T) {
 
 // ---- helpers ----
 
-func containsStr(list []string, want string) bool {
-	for _, v := range list {
-		if v == want {
-			return true
-		}
-	}
-	return false
-}
-
-func itoa64(v int64) string {
-	b, _ := json.Marshal(v)
-	return string(b)
-}
-
 // 此前 {"error":"rate limited from 1.2.3.4"} 会把 1.2.3.4 当官方网段写进
 // 爬虫豁免名单（真实爬虫失去豁免、被列 IP 反而获得豁免面）。
 func TestParseCrawlerCIDRs_jsonRequiresStructuredFields(t *testing.T) {
@@ -322,10 +309,10 @@ func TestParseCrawlerCIDRs_jsonRequiresStructuredFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("结构化 JSON 解析失败: %v", err)
 	}
-	if !containsStr(got, "203.0.113.0/24") {
+	if !containsString(got, "203.0.113.0/24") {
 		t.Fatalf("结构化网段缺失: %v", got)
 	}
-	if containsStr(got, "198.51.100.7/32") {
+	if containsString(got, "198.51.100.7/32") {
 		t.Fatalf("note 字段的 IP 被词法兜底误收: %v", got)
 	}
 	if len(got) != 1 {
@@ -334,7 +321,7 @@ func TestParseCrawlerCIDRs_jsonRequiresStructuredFields(t *testing.T) {
 
 	// 对照：非 json 格式（html/空）仍按词法提取（源站形态未变）。
 	got, err = parseCrawlerCIDRsForFormat(`{"error":"from 1.2.3.4"}`, "")
-	if err != nil || !containsStr(got, "1.2.3.4/32") {
+	if err != nil || !containsString(got, "1.2.3.4/32") {
 		t.Fatalf("非 JSON 格式词法提取回归: got=%v err=%v", got, err)
 	}
 }

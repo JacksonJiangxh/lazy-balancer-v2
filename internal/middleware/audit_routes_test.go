@@ -46,6 +46,18 @@ func TestSetupRouter_writeRoutesHaveExplicitAuditClassification(t *testing.T) {
 	}
 
 	// When
+	// 反向对账：intentionalSkip 的每个键必须是真实注册的写路由——路由删除/
+	// 改名后旧键恒不命中，跳过声明就成了永不生效的孤儿（后续新增写路由的
+	// 分类缺陷被掩盖）。
+	registered := map[string]struct{}{}
+	for _, route := range router.Routes() {
+		registered[route.Method+" "+route.Path] = struct{}{}
+	}
+	for key := range intentionalSkip {
+		if _, ok := registered[key]; !ok {
+			t.Fatalf("intentional audit skip 指向未注册路由: %s", key)
+		}
+	}
 	for _, route := range router.Routes() {
 		if _, write := writeMethods[route.Method]; !write {
 			continue

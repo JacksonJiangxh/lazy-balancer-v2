@@ -44,7 +44,9 @@ func TestUpdateRule_protocolSwitchToTCPZeroesDNSFields(t *testing.T) {
 		Scan(&dynamicDNS, &enableDNSServer, &dnsServer, &dnsFamily); err != nil {
 		t.Fatal(err)
 	}
-	if dynamicDNS != 0 || enableDNSServer != 0 || dnsServer != "" || dnsFamily != "" {
+	// dns_family 归一到建库默认 ipv4（而非空串）——同一 TCP 终态不得出现
+	// ''/ipv4 两形态，导出/快照 canonical 需要稳定值；其余 DNS 字段清空。
+	if dynamicDNS != 0 || enableDNSServer != 0 || dnsServer != "" || dnsFamily != "ipv4" {
 		t.Fatalf("tcp switch must zero dns fields, got dynamic_dns=%d enable_dns_server=%d dns_server=%q dns_family=%q", dynamicDNS, enableDNSServer, dnsServer, dnsFamily)
 	}
 }

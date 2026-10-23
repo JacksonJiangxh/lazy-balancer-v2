@@ -13,10 +13,12 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-// （用户裁定）：规则脱离 ACME（证书源改手动 / 禁用 TLS）时，
-// 该规则关联的证书签发任务必须**直接删除**（全部状态，含 failed/issued），
-// 不再残留失败行于任务列表。此前 acme→manual 仅翻转非终态行（failed 有意
-// 排除），失败任务永久残留且「重签」按钮误导（实际 409）；
+// （用户裁定，2026-10-19 收窄）：规则脱离 ACME（证书源改手动 / 禁用 TLS）时，
+// 该规则关联的证书签发任务**执行中先 409，其余一律删除**——「执行中/CA 往返
+// 在途」状态集（executingACMEJobStatuses）保留在途行并拒绝本次编辑，避免与
+// CA 往返中的任务竞争；queued/pending（未起动）、issued/failed/disabled（终态）
+// 全部直接删除，不再残留失败行于任务列表。此前 acme→manual 仅翻转非终态行
+// （failed 有意排除），失败任务永久残留且「重签」按钮误导（实际 409）；
 // 禁用 TLS 路径则完全无 cert_jobs 处理。
 
 func countRuleCertJobs(t *testing.T, caddyID string) int {

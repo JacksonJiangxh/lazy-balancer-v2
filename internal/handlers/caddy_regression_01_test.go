@@ -33,6 +33,14 @@ func TestCreateRule_rejects_unknown_protocol(t *testing.T) {
 	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "协议仅支持 http 或 tcp") {
 		t.Fatalf("create https protocol status=%d body=%s, want 400 协议白名单", response.Code, response.Body.String())
 	}
+	// 拒绝必须零落库：坏协议行一旦进库会被渲染为 TCP（域名匹配静默丢失）。
+	var rows int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM lb_rules WHERE name='https-proto'`).Scan(&rows); err != nil {
+		t.Fatalf("count rejected rule: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("rejected https rule rows=%d, want 0", rows)
+	}
 }
 
 func TestUpdateRule_rejects_unknown_protocol(t *testing.T) {
@@ -54,6 +62,16 @@ func TestUpdateRule_rejects_unknown_protocol(t *testing.T) {
 
 	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "协议仅支持 http 或 tcp") {
 		t.Fatalf("update to https protocol status=%d body=%s, want 400 协议白名单", response.Code, response.Body.String())
+	}
+	// 拒绝必须保留原值：协议/域名/端口不得被部分写入。
+	var protocol, domain string
+	var listenPort int
+	if err := db.DB.QueryRow(`SELECT protocol, domain, listen_port FROM lb_rules WHERE caddy_id='lb_proto'`).
+		Scan(&protocol, &domain, &listenPort); err != nil {
+		t.Fatalf("read back rule: %v", err)
+	}
+	if protocol != "http" || domain != "proto.example.test" || listenPort != 8080 {
+		t.Fatalf("rule after rejected update=(%q,%q,%d), want 原值 (http,proto.example.test,8080)", protocol, domain, listenPort)
 	}
 }
 

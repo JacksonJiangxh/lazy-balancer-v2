@@ -39,6 +39,23 @@ export const stageBlockPageOverrides = (source: {
 })
 
 /**
+ * 编辑向导只提交「相对打开快照真正变化」的阶段页键（后端 `PUT /rules/:id`
+ * 的 4 个字段是 `*int` 非 nil 即覆盖、nil=保留）。向导不展示这些字段，
+ * 无条件回写会把另一标签页/另一管理员在策略页刚写入的覆盖静默回退。
+ */
+export const stageBlockPagePatch = (
+  current: Partial<StageBlockPageOverrideState>,
+  snapshot: StageBlockPageOverrideState,
+): Partial<StageBlockPageOverrideState> => {
+  const patch: Partial<StageBlockPageOverrideState> = {}
+  for (const key of Object.keys(snapshot) as Array<keyof StageBlockPageOverrideState>) {
+    const value = current[key] || 0
+    if (value !== snapshot[key]) patch[key] = value
+  }
+  return patch
+}
+
+/**
  * 被动健康检查下隐藏的超时字段（只把 timeout 输入放进主动探测模板）
  * 后端 validateRuleFeatures（rule_features.go）**不区分主动/被动**地
  * 要求 `0 < timeout < interval`，提交载荷也恒带该值。存量/带外数据（历史

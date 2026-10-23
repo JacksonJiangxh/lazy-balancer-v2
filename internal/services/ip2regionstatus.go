@@ -2,8 +2,6 @@ package services
 
 import (
 	"time"
-
-	"lazy-balancer-v2/internal/db"
 )
 
 type ip2RegionTaskState struct {
@@ -38,29 +36,22 @@ func (m *IP2RegionUpdateManager) StatusSnapshot() IP2RegionUpdateStatusSnapshot 
 }
 
 func ip2RegionStoredStatusSnapshot() IP2RegionUpdateStatusSnapshot {
-	var stored struct {
-		status, trigger, startedAt, finishedAt, message, version string
-	}
 	// 半初始化（db.DB=nil）降级 idle（同 crsstatus 口径）。
-	if db.DB == nil {
-		return IP2RegionUpdateStatusSnapshot{Status: string(IP2RegionStatusIdle)}
-	}
-	err := db.DB.QueryRow(`SELECT COALESCE(update_status,'idle'), COALESCE(trigger,''),
-		COALESCE(started_at,''), COALESCE(finished_at,''), COALESCE(message,''), version
-		FROM security_ip2region_version WHERE id=1`).
-		Scan(&stored.status, &stored.trigger, &stored.startedAt, &stored.finishedAt, &stored.message, &stored.version)
+	row, ok, err := versionTableStatusRowOf("security_ip2region_version")
 	if err != nil {
 		// 同 crsstatus 口径：失败留 warn 后回退 idle。
 		Logf("warn", "IP2Region 状态: 读取存储快照失败，回退 idle: %v", err)
+	}
+	if !ok {
 		return IP2RegionUpdateStatusSnapshot{Status: string(IP2RegionStatusIdle)}
 	}
 	return IP2RegionUpdateStatusSnapshot{
-		Status:     stored.status,
-		Trigger:    stored.trigger,
-		StartedAt:  stored.startedAt,
-		FinishedAt: stored.finishedAt,
-		Message:    stored.message,
-		Version:    stored.version,
+		Status:     row.status,
+		Trigger:    row.trigger,
+		StartedAt:  row.startedAt,
+		FinishedAt: row.finishedAt,
+		Message:    row.message,
+		Version:    row.version,
 	}
 }
 

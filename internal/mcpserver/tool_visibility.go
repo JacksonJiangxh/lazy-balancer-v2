@@ -106,6 +106,14 @@ func isReadOnlyTool(spec toolSpec) bool {
 	return probe
 }
 
+// serveWithToolVisibility 按 Key 属主属性过滤 tools/list。
+//
+// 定位（重要）：工具目录本身不是机密面——`GET /api/v1/mcp/tools` 与
+// `/api/v1/openapi.yaml` 对任何已认证身份都全量暴露同一批工具/路由。本过滤
+// 只做 UX 与能力口径一致（不呈现调用必然 403 的工具），**不是访问控制**：
+// 真正的拦截始终由 REST 守卫（adminOnly / readOnlyGuard / apiKeyReadOnlyGuard /
+// mfaStepUpGuard）在转发目标上执行。因此「过滤名单不完整」不构成越权；
+// 新增/改名工具时只需保持能力元数据（read_only）与过滤口径一致。
 func serveWithToolVisibility(writer http.ResponseWriter, request *http.Request, next http.Handler, resolver visibilityResolver) {
 	requestBody, err := io.ReadAll(request.Body)
 	if err != nil {

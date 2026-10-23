@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"reflect"
+	"sort"
 	"strconv"
 	"testing"
 )
@@ -11,7 +12,10 @@ import (
 // 同一 DB 状态必须渲染出逐字节相同的配置。发布集与按端口分组在同一 allRules
 // （rowid 序）遍历内收集，不从 map 遍历重建——顺序确定化是不变量：任何未来
 // 消费方（logger_names 归属、日志发射面）都不应依赖 map 序。本测试按多端口 +
-// 同端口双规则形态反复渲染，任何顺序泄漏都会表现为字节差异或归属漂移。
+// 同端口双规则形态反复渲染。
+// 分辨力边界：encoding/json 对 map 键排序，逐字节相等只对**数组顺序**（routes、
+// TLS 策略、错误路由）有分辨力；servers / logger_names 等 map 的键集与归属
+// 不参与字节分辨，由下方结构断言独立覆盖。
 func TestGenerateCaddyConfig_loggerNamesDeterministicAcrossRenders(t *testing.T) {
 	_, database := newClusterTestService(t)
 	seedHTTPRuleForGeneration(t, database, "lb_lognames_first", "same-host.example.test", 8080)
@@ -36,17 +40,31 @@ func TestGenerateCaddyConfig_loggerNamesDeterministicAcrossRenders(t *testing.T)
 			continue
 		}
 		if !bytes.Equal(first, data) {
-			t.Fatalf("第 %d 次渲染与首次字节不同——map 遍历序泄漏进配置产物", render)
+			t.Fatalf("第 %d 次渲染与首次字节不同——数组顺序泄漏进配置产物", render)
 		}
 	}
 
 	// 确定性提升后归属也固定：rowid 靠后的规则最后写入 logger_names。
 	cfg := generateCaddyConfigFromStore(database)
 	servers := mustMap(t, mustMap(t, mustMap(t, cfg["apps"], "apps")["http"], "http")["servers"], "servers")
-	published := mustMap(t, servers["http_8080"], "http_8080")
-	loggerNames := mustMap(t, mustMap(t, mustMap(t, published["logs"], "logs")["logger_names"], "logger_names"), "logger_names")
-	if got := loggerNames["same-host.example.test"]; got != "rule_lb_lognames_second" {
-		t.Fatalf("logger_names[same-host.example.test]=%v, want rule_lb_lognames_second（rowid 序最后者）", got)
+	serverKeys := make([]string, 0, len(servers))
+	for name := range servers {
+		serverKeys = append(serverKeys, name)
+	}
+	sort.Strings(serverKeys)
+	assertEqual(t, serverKeys, []string{"http_80", "http_8080", "http_8081"})
+	for _, want := range []struct{ server, host, logger string }{
+		{server: "http_8080", host: "same-host.example.test", logger: "rule_lb_lognames_second"},
+		{server: "http_8081", host: "other-host.example.test", logger: "rule_lb_lognames_other_port"},
+	} {
+		published := mustMap(t, servers[want.server], want.server)
+		loggerNames := mustMap(t, mustMap(t, mustMap(t, published["logs"], "logs")["logger_names"], "logger_names"), "logger_names")
+		if len(loggerNames) != 1 {
+			t.Fatalf("%s logger_names 键集=%v, want 恰一项（同端口双规则归属唯一）", want.server, loggerNames)
+		}
+		if got := loggerNames[want.host]; got != want.logger {
+			t.Fatalf("%s logger_names[%s]=%v, want %s（rowid 序最后者）", want.server, want.host, got, want.logger)
+		}
 	}
 }
 

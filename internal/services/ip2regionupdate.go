@@ -56,6 +56,13 @@ type IP2RegionUpdateManager struct {
 	// 每次 run() 开始时重置，downloadAndInstall 备份成功后置位。
 	bakCreated bool
 
+	// installCommitted 标记本次运行的安装段已落盘（xdb 已 rename、版本行/
+	// sidecar 已写）。取消发生在安装段之后、重载之前时必须按「未重载即未生效」
+	// 回滚到同代基线（与 CRS 的 observeCancelAfterSwap 同构）——否则任务显示
+	// 已取消而磁盘/版本行已是新库、Caddy 仍按旧库执行。run() 开始时重置，
+	// downloadAndInstall 安装段完成后置位。
+	installCommitted bool
+
 	// prevVersion 记录安装锁段读出的事件前版本行值：版本行与
 	// sidecar 随安装段（wafFileMu 互斥区）写入新 tag，重载失败且磁盘已还原
 	// 旧 xdb 时（run() restored 分支）行与 sidecar 必须回滚到本值——否则
@@ -106,34 +113,14 @@ func ResetIP2RegionUpdateManagerForTest() {
 // SetIP2RegionAutoUpdate toggles the auto-update flag without touching the
 // stored version; a missing row is seeded with the fallback version.
 func SetIP2RegionAutoUpdate(enabled bool) error {
-	if _, err := db.DB.Exec(
-		"INSERT OR IGNORE INTO security_ip2region_version (id, version, auto_update) VALUES (1, 'unknown', ?)",
-		enabled,
-	); err != nil {
-		return fmt.Errorf("初始化 IP2Region 版本记录: %w", err)
-	}
-	nextUpdate := ""
-	if enabled {
-		nextUpdate = versionTableNextSlot("security_ip2region_version", time.Now().UTC())
-	}
-	// 2026-09-25 用户裁定：失败退避机制撤除——开启重排一律写下一排程槽；
-	// 关闭仍无条件清空。
-	if _, err := db.DB.Exec("UPDATE security_ip2region_version SET auto_update=?, next_update=CASE WHEN ? THEN ? ELSE '' END WHERE id=1", enabled, enabled, nextUpdate); err != nil {
-		return fmt.Errorf("更新 IP2Region 自动更新开关: %w", err)
-	}
-	syncTaskLoop("ip2region", enabled)
-	return nil
+	return setVersionTableAutoUpdate("security_ip2region_version", "IP2Region", "unknown", "ip2region", enabled)
 }
 
 func ensureIP2RegionVersionRow() {
-	if _, err := db.DB.Exec(
-		// （裁决）：IP 库自动更新默认 ON——与 CRS 种子及 schema
-		// DEFAULT TRUE 对齐（此前种子 FALSE 与 schema 默认矛盾；过期 xdb 同样
-		// 引发地域策略误拦/漏拦）。
-		"INSERT OR IGNORE INTO security_ip2region_version (id, version, auto_update) VALUES (1, 'unknown', TRUE)",
-	); err != nil {
-		Logf("error", "ip2region update: failed to ensure version row: %v", err)
-	}
+	// IP 库自动更新默认 ON——与 CRS 种子及 schema DEFAULT TRUE 对齐
+	//（此前种子 FALSE 与 schema 默认矛盾；过期 xdb 同样引发地域策略
+	// 误拦/漏拦）。
+	ensureVersionTableRow("security_ip2region_version", "unknown", "ip2region update")
 }
 
 func currentIP2RegionVersion() string {
@@ -307,6 +294,7 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 
 	// 每次运行重置：rollbackXDB 仅消费本运行创建的.bak。
 	m.bakCreated = false
+	m.installCommitted = false
 
 	ensureIP2RegionVersionRow()
 	runStartedAt := taskRunStartedAt(rc)
@@ -420,11 +408,20 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 			return
 		}
 		if runCtx.Err() != nil {
+			m.rollbackAfterCancel()
 			m.cancel(installErr)
 			return
 		}
 		m.fail(fmt.Errorf("安装 ip2region xdb 失败: %w", installErr))
 		m.advanceSlotIfAuto(trigger)
+		return
+	}
+
+	// 安装返回与重载之间的取消观察点：取消必须按「未重载即未生效」回滚，
+	// 不得让磁盘/版本行停在新库而任务显示已取消（Caddy 仍按旧库执行）。
+	if runCtx.Err() != nil {
+		m.rollbackAfterCancel()
+		m.cancel(runCtx.Err())
 		return
 	}
 
@@ -604,6 +601,27 @@ func (m *IP2RegionUpdateManager) syncInstalledVersionToState() {
 	m.mu.Unlock()
 }
 
+// rollbackAfterCancel 取消归因收尾：若本次运行的安装段已落盘但尚未重载，
+// 按「未重载即未生效」回滚到同代基线（xdb 文件 + 版本行/sidecar；无本运行
+// 基线时回落到 dist 并写保守标识 bundled）——与 CRS 的
+// observeCancelAfterSwap 同构，避免「已取消但库其实换了、Caddy 仍按旧库」
+// 的三方分叉。安装未提交（下载期取消）时为零操作，保留既有磁盘状态。
+func (m *IP2RegionUpdateManager) rollbackAfterCancel() {
+	if !m.installCommitted {
+		return
+	}
+	m.installCommitted = false
+	restored, distRestore, err := m.rollbackXDB()
+	switch {
+	case err != nil:
+		Logf("error", "ip2region update: 取消后回滚 xdb 失败（下次成功更新自愈）: %v", err)
+	case distRestore:
+		m.writeDistRollbackMarkers()
+	case restored:
+		m.restorePreviousVersionRow()
+	}
+}
+
 // cancel 记录用户主动取消：保留既有工件/快照，不增加连续失败计数。
 func (m *IP2RegionUpdateManager) cancel(cause error) {
 	if _, err := db.DB.Exec(
@@ -738,6 +756,9 @@ func (m *IP2RegionUpdateManager) downloadAndInstall(parent context.Context, tag 
 		Logf("error", "ip2region update: 安装段写入 .version sidecar 失败（稍后重写）: %v", err)
 	}
 	wafFileMu.Unlock()
+	// 安装段已落盘（xdb 已 rename、版本行/sidecar 已写）：此后到重载之间的
+	// 取消必须回滚到同代基线，见 installCommitted 契约。
+	m.installCommitted = true
 	// rename 后内存热换失败不得静默吞掉——磁盘已是新库而内存仍是旧
 	// 库，必须按安装失败处理（sentinel 标记），由 run() 走与 reloader 失败相同
 	// 的回滚路径。Reload 失败时旧 searcher 保持服役（ip2region.go Reload 语义）。

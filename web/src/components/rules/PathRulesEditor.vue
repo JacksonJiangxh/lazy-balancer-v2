@@ -49,14 +49,14 @@
                 size="small"
                 :aria-label="`路径规则 ${index + 1} 的路径`"
                 placeholder="例如：/api"
-                :class="{ 'is-error-input': rowError(index) }"
+                :class="{ 'is-error-input': pathRuleRowError(pathRules, index) }"
               />
-              <span v-if="rowError(index)" class="path-field-error">{{ rowError(index) }}</span>
-              <span v-else-if="rowShadowWarning(index)" class="path-field-warning">{{ rowShadowWarning(index) }}</span>
+              <span v-if="pathRuleRowError(pathRules, index)" class="path-field-error">{{ pathRuleRowError(pathRules, index) }}</span>
+              <span v-else-if="pathRuleShadowWarning(pathRules, index)" class="path-field-warning">{{ pathRuleShadowWarning(pathRules, index) }}</span>
             </div>
           </label>
 
-          <label v-if="isForwardMode(rule)" class="rule-field upstream-path-field">
+          <label v-if="isForwardResponseMode(rule)" class="rule-field upstream-path-field">
             <span class="rule-field-label">
               上游路径
               <!-- 语义说明合并为单一 tooltip:留空语义 + 前缀/精确改写示例 -->
@@ -78,13 +78,13 @@
         <!-- 响应方式行（2026-10-10 用户裁定）：转发上游（默认）/直接返回/301 跳转 -->
         <div class="rule-field path-rule-mode-row">
           <span class="rule-field-label">响应方式</span>
-          <el-select v-model="rule.response_mode" size="small" style="width: 160px;" aria-label="响应方式" @change="onModeChange(rule)">
+          <el-select v-model="rule.response_mode" size="small" style="width: 160px;" aria-label="响应方式" @change="applyResponseMode(rule)">
             <!-- forward 为 UI 哨兵（el-select 空串选项不显示标签）——提交归一 '' -->
             <el-option label="转发上游（默认）" value="forward" />
             <el-option label="直接返回" value="static" />
             <el-option label="301 跳转" value="redirect" />
           </el-select>
-          <span class="form-tip-inline" v-if="isForwardMode(rule)">按路径转发到上游</span>
+          <span class="form-tip-inline" v-if="isForwardResponseMode(rule)">按路径转发到上游</span>
           <span class="form-tip-inline" v-else-if="rule.response_mode === 'static'">不访问上游，直接返回指定状态码与内容（该路径不经安全链：信任/IP 访问控制/限流/WAF 不生效）</span>
           <span class="form-tip-inline" v-else>不访问上游，301 永久跳转到目标地址（该路径不经安全链：信任/IP 访问控制/限流/WAF 不生效）</span>
         </div>
@@ -119,13 +119,13 @@
           <label class="rule-field" style="flex: 1;">
             <span class="rule-field-label">跳转地址</span>
             <div class="rule-field-control">
-              <el-input v-model="rule.redirect_to" size="small" placeholder="https://example.com/new 或 /new/" :aria-label="`路径规则 ${index + 1} 的跳转地址`" :class="{ 'is-error-input': responseError(index) }" />
-              <span v-if="responseError(index)" class="path-field-error">{{ responseError(index) }}</span>
+              <el-input v-model="rule.redirect_to" size="small" placeholder="https://example.com/new 或 /new/" :aria-label="`路径规则 ${index + 1} 的跳转地址`" :class="{ 'is-error-input': pathRuleResponseError(rule) }" />
+              <span v-if="pathRuleResponseError(rule)" class="path-field-error">{{ pathRuleResponseError(rule) }}</span>
             </div>
           </label>
         </div>
 
-        <div v-if="isForwardMode(rule)" class="custom-upstream-toggle">
+        <div v-if="isForwardResponseMode(rule)" class="custom-upstream-toggle">
           <span class="custom-upstream-title">使用自定义上游</span>
           <el-switch :model-value="rule.upstreams !== null" @change="toggleCustomUpstreams(rule, $event)" />
           <span class="form-tip-inline">关闭时使用规则的默认上游服务器</span>
@@ -165,7 +165,8 @@
           </div>
           <div class="add-upstream-actions">
             <el-button class="add-upstream-button" size="small" plain :icon="Plus" :disabled="rule.upstreams.length >= MAX_UPSTREAM_ROWS" @click="addUpstream(rule)">添加上游</el-button>
-            <el-text v-if="rule.upstreams.length >= MAX_UPSTREAM_ROWS" type="info" size="small">最多添加 {{ MAX_UPSTREAM_ROWS }} 个上游</el-text>
+            <el-text v-if="rule.upstreams.length > MAX_UPSTREAM_ROWS" type="warning" size="small">已有 {{ rule.upstreams.length }} 个上游（超过编辑器 {{ MAX_UPSTREAM_ROWS }} 行上限）：权重仍可调整且不再被清零，保存前请删至 {{ MAX_UPSTREAM_ROWS }} 个以内，或通过 API 维护</el-text>
+            <el-text v-else-if="rule.upstreams.length >= MAX_UPSTREAM_ROWS" type="info" size="small">最多添加 {{ MAX_UPSTREAM_ROWS }} 个上游</el-text>
           </div>
         </div>
       </el-card>
@@ -178,107 +179,16 @@ import { ArrowDown, ArrowUp, Delete, Plus } from '@element-plus/icons-vue'
 import FieldHelpIcon from '@/components/common/FieldHelpIcon.vue'
 import type { PathRule, PathRuleUpstream } from '@/types'
 import { MAX_UPSTREAM_ROWS, normalizeWeights, redistributeWeight } from '@/utils/upstreamWeights'
-import { STATIC_RESPONSE_STATUSES, STATIC_RESPONSE_STATUS_REASONS, canonicalPathKey, pathDuplicateKey, pathRuleError, upstreamPathRuleError } from '@/utils/ruleValidation'
+import { STATIC_RESPONSE_STATUSES, STATIC_RESPONSE_STATUS_REASONS, upstreamPathRuleError } from '@/utils/ruleValidation'
+import {
+  applyResponseMode,
+  isForwardResponseMode,
+  pathRuleResponseError,
+  pathRuleRowError,
+  pathRuleShadowWarning,
+} from '@/utils/pathRulesEditor'
 
 const pathRules = defineModel<PathRule[]>({ required: true })
-
-const rowError = (index: number): string => {
-  const rule = pathRules.value[index]
-  if (!rule) return ''
-  // 字段级判据与整组校验单源（utils/ruleValidation.pathRuleError）：清空路径
-  // 立即在行内标红，不再等到点保存才被整组拒绝（晚失败）。
-  const fieldError = pathRuleError(rule)
-  if (fieldError) return fieldError
-  const canonical = canonicalPathKey(rule.match_type, rule.path)
-  const duplicateKey = pathDuplicateKey(rule.match_type, rule.path)
-  // 同类型查重按后端口径（exact 不剥尾 /，/a 与 /a/ 是两条独立
-  // matcher）；canonicalPathKey 归一键只用于跨类型遮蔽互查。
-  const dupIndex = pathRules.value.findIndex((other, otherIndex) =>
-    otherIndex !== index && other.path.trim() !== ''
-      && (other.match_type === rule.match_type
-        ? pathDuplicateKey(other.match_type, other.path) === duplicateKey
-        : canonicalPathKey(other.match_type, other.path) === canonical))
-  if (dupIndex >= 0) {
-    const other = pathRules.value[dupIndex]
-    if (!other) return ''
-    return other.match_type === rule.match_type
-      ? `与规则 ${dupIndex + 1} 重复`
-      : `与规则 ${dupIndex + 1} 同路径前缀+精确互相遮蔽`
-  }
-  return ''
-}
-
-// 前序 prefix 规则遮蔽提示——后端有意放行(测试钉住),
-// 仅 UI 非阻断警告。判定口径与 services/caddy.go pathMatcherSpecs + terminal
-// 路由一致:prefix 渲染 [root, root/*] 双 matcher(root=剥尾 / 与 *,剥空=
-// /* 全匹配),路由按 sort_order 稳定排序、先命中即终结,故前序 prefix P 遮蔽
-// 后序规则 Q 当且仅当 canonical(Q)===root(P) 或以 root(P)+"/" 开头。
-const shadowedByIndex = (index: number): number => {
-  const rule = pathRules.value[index]
-  if (!rule) return -1
-  // 非法/空路径由 rowError 负责,不参与遮蔽判定(避免提示噪音)
-  if (rule.path !== '' && !rule.path.startsWith('/')) return -1
-  if (/[*?{}]/.test(rule.path)) return -1
-  if (rule.path.trim() === '') return -1
-  const canonical = canonicalPathKey(rule.match_type, rule.path)
-  for (let priorIndex = 0; priorIndex < index; priorIndex++) {
-    const prior = pathRules.value[priorIndex]
-    if (!prior || prior.match_type !== 'prefix') continue
-    if (prior.path.trim() === '' || !prior.path.startsWith('/') || /[*?{}]/.test(prior.path)) continue
-    const root = canonicalPathKey('prefix', prior.path)
-    if (root === '/' || canonical === root || canonical.startsWith(`${root}/`)) return priorIndex
-  }
-  return -1
-}
-
-const rowShadowWarning = (index: number): string => {
-  const priorIndex = shadowedByIndex(index)
-  if (priorIndex < 0) return ''
-  const prior = pathRules.value[priorIndex]
-  return `被前序前缀规则 ${priorIndex + 1}（${prior?.path.trim() ?? ''}）遮蔽，不会生效`
-}
-
-
-
-// isForwardMode 转发判定：''（API 形态）与 'forward'（UI 哨兵——el-select 空串
-// 选项不显示标签）同为转发；提交时归一为 ''。
-const isForwardMode = (rule: PathRule): boolean => !rule.response_mode || rule.response_mode === 'forward'
-
-// onModeChange 模式切换归一：非转发模式清空转发专属字段（上游路径/自定义上游），
-// 跳转/静态互清对方字段，静态进场补默认值（后端写侧同口径归一）。
-const onModeChange = (rule: PathRule): void => {
-  if (!isForwardMode(rule)) {
-    rule.upstream_path = ''
-    rule.upstreams = null
-  }
-  if (rule.response_mode === 'static') {
-    rule.redirect_to = ''
-    if (!rule.response_status) rule.response_status = 200
-    if (!rule.response_content_type) rule.response_content_type = 'text/plain'
-  } else if (rule.response_mode === 'redirect') {
-    rule.response_body = ''
-    rule.response_content_type = ''
-  } else {
-    rule.response_status = 200
-    rule.response_body = ''
-    rule.response_content_type = ''
-    rule.redirect_to = ''
-  }
-}
-
-// responseError 行内校验（与后端 validateRuleFeatures / ruleValidation.ts 同口径）
-const responseError = (index: number): string => {
-  const rule = pathRules.value[index]
-  if (!rule) return ''
-  if (rule.response_mode === 'redirect') {
-    const target = (rule.redirect_to ?? '').trim()
-    if (!target) return '301 跳转需要填写跳转地址'
-    // eslint-disable-next-line no-control-regex
-    if (/[\x00-\x1f\x7f]/.test(target)) return '跳转地址含非法字符'
-    if (!target.startsWith('/') && !target.startsWith('http://') && !target.startsWith('https://')) return '跳转地址须为 http(s):// 绝对地址或 / 开头路径'
-  }
-  return ''
-}
 
 const normalizeOrder = (): void => {
   pathRules.value.forEach((rule, index) => { rule.sort_order = index })

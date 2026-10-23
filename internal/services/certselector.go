@@ -3,6 +3,7 @@ package services
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
 	"strings"
 	"time"
 )
@@ -44,6 +45,22 @@ func ParseCertificateLeaf(certPEM, keyPEM string) *x509.Certificate {
 		return nil
 	}
 	return leaf
+}
+
+// CertNotAfterFromPEM 解析证书 PEM 首块的 NotAfter（仅证书，不需要私钥）。
+// 用于 cert_jobs.expires_at 缺失（导入/旧备份/集群快照/对账遗留）时回退派生
+// 到期状态——否则任务页显示「-」而规则证书卡按 PEM 显示 valid/N 天，同一条
+// 证书两处结论冲突。
+func CertNotAfterFromPEM(certPEM string) (time.Time, bool) {
+	block, _ := pem.Decode([]byte(certPEM))
+	if block == nil {
+		return time.Time{}, false
+	}
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return leaf.NotAfter, true
 }
 
 func SelectCertificate(candidates []CertificateCandidate, ruleDomains string, now time.Time) (CertificateSelection, bool) {

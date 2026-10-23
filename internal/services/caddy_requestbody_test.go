@@ -48,8 +48,11 @@ func TestGenerateCaddyConfig_ruleLevelRequestBodyOverridesGlobal(t *testing.T) {
 }
 
 // 全量值贯通核查（用户质询后的系统性补验）：全部全局 Caddy 配置项设非默认
-// 哨兵值 → 渲染 → 逐项断言渲染值=设置值。历史上只验默认值形状导致 request_body
+// 哨兵值 → 渲染 → 逐节点断言渲染值=设置值。历史上只验默认值形状导致 request_body
 // 全局断裂漏检多年——本测试以非默认形态钉住全部全局→渲染链。
+//
+// 断言必须定位到节点：http server 与 proxy transport 存在同名键
+// （read/write/idle_timeout），对整份配置做子串匹配时两值互换/串写仍会命中。
 func TestGenerateCaddyConfig_allGlobalOverridesReachRender(t *testing.T) {
 	_, database := newClusterTestService(t)
 	seedGenerationRule(t, database, "lb_global_sentinel", false)
@@ -69,26 +72,38 @@ func TestGenerateCaddyConfig_allGlobalOverridesReachRender(t *testing.T) {
 			t.Fatalf("seed %s: %v", col, err)
 		}
 	}
+
+	// When
 	cfg := generateCaddyConfigFromStore(database)
-	raw, _ := json.Marshal(cfg)
-	s := strings.ReplaceAll(string(raw), " ", "")
-	want := []string{
-		`"max_size":67108864`,   // request_body 64MiB
-		`"read_timeout":"33s"`,  // http 读
-		`"write_timeout":"44s"`, // http 写
-		`"idle_timeout":"55s"`,  // http 空闲
-		`"dial_timeout":"11s"`,  // 代理拨号
-		`"response_header_timeout":"22s"`,
-		`"read_timeout":"77s"`,
-		`"write_timeout":"88s"`,
-		`"idle_timeout":"66s"`, // 上游 keepalive
-		`"stream_timeout":"99s"`,
-		`"flush_interval":"-1s"`,
-		`"stream_close_delay":"7s"`,
+
+	// Then
+	if message, failed := cfg[caddyConfigGenerationErrorKey].(string); failed {
+		t.Fatalf("generate: %s", message)
 	}
-	for _, w := range want {
-		if !strings.Contains(s, w) {
-			t.Errorf("渲染缺少全局哨兵值 %s", w)
-		}
+	apps := mustMap(t, cfg["apps"], "apps")
+	servers := mustMap(t, mustMap(t, apps["http"], "http app")["servers"], "servers")
+	server := mustMap(t, servers["http_8080"], "http_8080")
+	assertEqual(t, server["read_timeout"], "33s")
+	assertEqual(t, server["write_timeout"], "44s")
+	assertEqual(t, server["idle_timeout"], "55s")
+
+	proxy := findHandlerRecursive(server["routes"], "reverse_proxy")
+	if proxy == nil {
+		t.Fatal("reverse_proxy handler missing")
 	}
+	assertEqual(t, proxy["stream_timeout"], "99s")
+	assertEqual(t, proxy["flush_interval"], "-1s")
+	assertEqual(t, proxy["stream_close_delay"], "7s")
+	transport := mustMap(t, proxy["transport"], "transport")
+	assertEqual(t, transport["dial_timeout"], "11s")
+	assertEqual(t, transport["response_header_timeout"], "22s")
+	assertEqual(t, transport["read_timeout"], "77s")
+	assertEqual(t, transport["write_timeout"], "88s")
+	assertEqual(t, mustMap(t, transport["keep_alive"], "keep_alive")["idle_timeout"], "66s")
+
+	requestBody := findHandlerRecursive(server["routes"], "request_body")
+	if requestBody == nil {
+		t.Fatal("request_body handler missing")
+	}
+	assertEqual(t, requestBody["max_size"], int64(67108864))
 }

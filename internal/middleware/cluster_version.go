@@ -26,12 +26,12 @@ func clusterVersionMiddleware(database *sql.DB) gin.HandlerFunc {
 			return
 		}
 		if installErr != nil {
-			// 登录/MFA 验证步的 fail-closed 仅主节点
-			// 语义——users 触发器 WHEN COALESCE(is_master,1)=1，从节点锁写入
-			// 本就不会 bump，fail-closed 在从端零保护收益、只截断登录可用性
+			// users 表写路径的 fail-closed 仅主节点语义——users 触发器
+			// WHEN COALESCE(is_master,1)=1，从节点上这些写入本就不会 bump，
+			// fail-closed 在从端零保护收益、只截断登录/开户/改 MFA 可用性
 			// （与票据登录被排除出 fail-closed 面的口径一致）。角色读失败按
 			// 写闸同语义 fail-closed 落入 500（不猜测放行）。
-			if isLoginLockWritePath(c.Request.Method, c.FullPath()) {
+			if isUsersTableWritePath(c.Request.Method, c.FullPath()) {
 				if isMaster, err := services.RoleOf(c.Request.Context(), database); err == nil && !isMaster {
 					c.Next()
 					return
@@ -89,53 +89,64 @@ var globalConfigSyncedColumns = []string{
 	"threat_screen_mode",
 }
 
+// clusterSyncedTable 集群快照同步表与其触发列清单（触发器安装与「列清单↔
+// schema」漂移对账测试共用单源）。
+type clusterSyncedTable struct {
+	name            string
+	snapshotColumns string
+}
+
+// clusterSyncedTables 全部随集群快照同步的表（17 张）。增删表/列必须同时
+// 更新本清单与 clusterSyncedColumnExclusions（有意不同步的列携理由）——
+// 漏登记列时仅写该列的 UPDATE 不 bump cluster_version，从节点经 304 门永久
+// 滞留旧值（钉测见 cluster_synced_columns_test.go 的逐表 schema 对账）。
+var clusterSyncedTables = []clusterSyncedTable{
+	{name: "lb_rules", snapshotColumns: "caddy_id,name,description,protocol,domain,listen_port,strategy,dynamic_dns,enable_dns_server,dns_server,dns_family,health_check_path,health_check_interval,health_check_timeout,health_check_unhealthy_threshold,health_check_healthy_threshold,enable_active_health_check,tcp_health_check_port,tcp_proxy_protocol,tcp_try_duration,tcp_try_interval,request_body_max_size_mb,upstream_keepalive_timeout,server_tokens_hidden,ntlm_compatible,upstream_force_http1,host_header,health_check_host,custom_routes_enabled,proxy_dial_timeout,proxy_response_header_timeout,proxy_read_timeout,proxy_write_timeout,proxy_stream_timeout,proxy_flush_interval,proxy_stream_close_delay,enable_tls,tls_source,acme_config_id,ca_provider_id,tls_cert,tls_key,tls_http_redirect,enable_compress,compress_types,enabled,log_enabled,created_by,created_at,updated_at,updated_by,block_page_stage1_id,block_page_stage1_status,block_page_stage3_id,block_page_stage3_status"},
+	{name: "upstreams", snapshotColumns: "id,rule_id,host,port,weight,dynamic_dns,enabled,protocol,max_connections,origin_domain"},
+	{name: "path_rules", snapshotColumns: "id,rule_id,sort_order,match_type,path,upstream_path,upstreams_json,response_mode,response_status,response_body,response_content_type,redirect_to"},
+	// users 触发器 OF 列表补 v2.1.8 的 MFA 权威列——此前不在列表内，
+	// MFA 状态写（含管理员重置）不 bump cluster_version → 快照缓存持续命中
+	// 旧指纹 → 从节点 304 循环，主节点 MFA 变更稳态永不传播（泄露 secret 经
+	// 重置后在从节点仍可用）。记账两列（last_timestep/failed_attempts）不补
+	// 它们经 哈希清零已不参与漂移判定，入列只会让登录热路径的
+	// 计数推进引发无谓重放。pending 不跨节点不补。
+	// 修订：locked_until（login_locked_until）从初版「不补」枚举划出
+	// 入 OF 列表——主端置锁/解锁 UPDATE 即 bump cluster_version，快照缓存重建、
+	// locked_users 当周期下发（否则锁只在下次无关变更时才传播）；「补了
+	// 引发无谓重放」的前提已被 值变化守卫消除（登录热路径对
+	// login_locked_until 的保值写不 bump，见下方守卫段）。仅失败计数
+	// （login_failed_attempts）不入列：普通失败不产生版本抖动；从端本地写由
+	// WHEN is_master=1 守卫排除。
+	// auth_provider/oidc_subject/oidc_issuer 三列刻意不入
+	// OF——当前唯一写路径是 OIDC JIT 开户 INSERT(auth_oidc.go),无 UPDATE
+	// 写路径;若未来新增该三列 UPDATE 写路径(换绑/issuer 迁移),必须同步
+	// 补 OF,否则稳态变更不 bump 版本、永不传播到从节点。
+	{name: "users", snapshotColumns: "id,username,password_hash,role,display_name,is_enabled,password_version,password_changed_at,mfa_enabled,mfa_secret,mfa_recovery_codes,login_locked_until"},
+	{name: "api_keys", snapshotColumns: "id,name,key_hash,key_prefix,created_by,expires_at,is_enabled,mcp_enabled,read_only,mcp_ip_whitelist"},
+	{name: "ca_providers", snapshotColumns: "id,name,provider,directory_url,credentials,max_concurrent,min_interval_ms,enabled,created_at,updated_at"},
+	{name: "certificate_configs", snapshotColumns: "id,name,dns_provider,dns_credentials,enabled,created_at,updated_at"},
+	{name: "cert_jobs", snapshotColumns: "rule_id,domain,status,cert_pem,key_pem,expires_at,ca_provider_id,renewal_attempts,ca_available_after,last_error_code,created_at,updated_at"},
+	{name: "security_policies", snapshotColumns: "id,name,description,mode,anomaly_threshold,ip_acl_mode,ip_acl_list,ip_acl_enabled,ip_whitelist,ip_whitelist_enabled,ip_blacklist,rate_limit_enabled,rate_limit_rps,rate_limit_burst,crs_rule_groups,crs_excluded_rules,custom_rules,block_page_id,block_status_code,enabled,updated_by,created_at,updated_at,geoip_countries,geoip_mode,geoip_crawler_exempt,geoip_crawler_engines,waf_check_response,log_request_body,ip_acl_list_refs,ip_whitelist_refs,policy_type,trust_detection"},
+	{name: "security_policy_bindings", snapshotColumns: "rule_caddy_id,policy_id"},
+	{name: "security_custom_rules", snapshotColumns: "id,name,description,conditions,action,score,enabled,updated_by,created_at,updated_at"},
+	{name: "security_block_pages", snapshotColumns: "id,name,description,content,content_type,is_default,is_builtin,created_by,created_at,updated_by,updated_at"},
+	{name: "security_ip_lists", snapshotColumns: "id,name,description,category,entries,created_by,created_at,updated_by,updated_at,system"},
+	// schedule_days/schedule_time 入列——主端排程
+	// 保存（setVersionTableSchedule 同语句写两列+next_update）即 bump 版本，
+	// 排程随快照到达从端（升主即生效，自动备份先例）。
+	{name: "security_crs_version", snapshotColumns: "id,version,updated_at,auto_update,update_status,message,last_checked,next_update,trigger,started_at,finished_at,schedule_days,schedule_time"},
+	{name: "security_ip2region_version", snapshotColumns: "id,version,updated_at,auto_update,update_status,message,last_checked,next_update,trigger,started_at,finished_at,schedule_days,schedule_time"},
+	// 威胁情报库（v2.3.x）：多行表（每源一行状态机），随集群快照同步；
+	// last_checked 为运行态读路径指标，UPDATE 触发列排除（同 CRS/IP2Region）。
+	{name: "security_threat_sources", snapshotColumns: "id,name,display_name,url,format,update_enabled,apply_enabled,entry_count,version,update_status,message,last_checked,next_update,trigger,started_at,finished_at,consecutive_failures"},
+	// 爬虫地址库独立源表：无 apply_enabled；last_checked/consecutive_failures
+	// 与威胁源同口径排除运行态读路径写。
+	{name: "security_crawler_sources", snapshotColumns: "id,name,display_name,url,format,update_enabled,entry_count,version,update_status,message,last_checked,next_update,trigger,started_at,finished_at,consecutive_failures"},
+}
+
 func installClusterVersionTriggers(database *sql.DB) error {
-	tables := []struct {
-		name            string
-		snapshotColumns string
-	}{
-		{name: "lb_rules", snapshotColumns: "caddy_id,name,description,protocol,domain,listen_port,strategy,dynamic_dns,enable_dns_server,dns_server,dns_family,health_check_path,health_check_interval,health_check_timeout,health_check_unhealthy_threshold,health_check_healthy_threshold,enable_active_health_check,tcp_health_check_port,tcp_proxy_protocol,tcp_try_duration,tcp_try_interval,request_body_max_size_mb,upstream_keepalive_timeout,server_tokens_hidden,ntlm_compatible,upstream_force_http1,host_header,health_check_host,custom_routes_enabled,proxy_dial_timeout,proxy_response_header_timeout,proxy_read_timeout,proxy_write_timeout,proxy_stream_timeout,proxy_flush_interval,proxy_stream_close_delay,enable_tls,tls_source,acme_config_id,ca_provider_id,tls_cert,tls_key,tls_http_redirect,enable_compress,compress_types,enabled,log_enabled,created_by,created_at,updated_at,updated_by,block_page_stage1_id,block_page_stage1_status,block_page_stage3_id,block_page_stage3_status"},
-		{name: "upstreams", snapshotColumns: "id,rule_id,host,port,weight,dynamic_dns,enabled,protocol,max_connections,origin_domain"},
-		{name: "path_rules", snapshotColumns: "id,rule_id,sort_order,match_type,path,upstream_path,upstreams_json,response_mode,response_status,response_body,response_content_type,redirect_to"},
-		// users 触发器 OF 列表补 v2.1.8 的 MFA 权威列——此前不在列表内，
-		// MFA 状态写（含管理员重置）不 bump cluster_version → 快照缓存持续命中
-		// 旧指纹 → 从节点 304 循环，主节点 MFA 变更稳态永不传播（泄露 secret 经
-		// 重置后在从节点仍可用）。记账两列（last_timestep/failed_attempts）不补
-		// 它们经 哈希清零已不参与漂移判定，入列只会让登录热路径的
-		// 计数推进引发无谓重放。pending 不跨节点不补。
-		// 修订：locked_until（login_locked_until）从初版「不补」枚举划出
-		// 入 OF 列表——主端置锁/解锁 UPDATE 即 bump cluster_version，快照缓存重建、
-		// locked_users 当周期下发（否则锁只在下次无关变更时才传播）；「补了
-		// 引发无谓重放」的前提已被 值变化守卫消除（登录热路径对
-		// login_locked_until 的保值写不 bump，见下方守卫段）。仅失败计数
-		// （login_failed_attempts）不入列：普通失败不产生版本抖动；从端本地写由
-		// WHEN is_master=1 守卫排除。
-		// auth_provider/oidc_subject/oidc_issuer 三列刻意不入
-		// OF——当前唯一写路径是 OIDC JIT 开户 INSERT(auth_oidc.go),无 UPDATE
-		// 写路径;若未来新增该三列 UPDATE 写路径(换绑/issuer 迁移),必须同步
-		// 补 OF,否则稳态变更不 bump 版本、永不传播到从节点。
-		{name: "users", snapshotColumns: "id,username,password_hash,role,display_name,is_enabled,password_version,password_changed_at,mfa_enabled,mfa_secret,mfa_recovery_codes,login_locked_until"},
-		{name: "api_keys", snapshotColumns: "id,name,key_hash,key_prefix,created_by,expires_at,is_enabled,mcp_enabled,read_only,mcp_ip_whitelist"},
-		{name: "ca_providers", snapshotColumns: "id,name,provider,directory_url,credentials,max_concurrent,min_interval_ms,enabled,created_at,updated_at"},
-		{name: "certificate_configs", snapshotColumns: "id,name,dns_provider,dns_credentials,enabled,created_at,updated_at"},
-		{name: "cert_jobs", snapshotColumns: "rule_id,domain,status,cert_pem,key_pem,expires_at,ca_provider_id,renewal_attempts,ca_available_after,last_error_code,created_at,updated_at"},
-		{name: "security_policies", snapshotColumns: "id,name,description,mode,anomaly_threshold,ip_acl_mode,ip_acl_list,ip_acl_enabled,ip_whitelist,ip_whitelist_enabled,ip_blacklist,rate_limit_enabled,rate_limit_rps,rate_limit_burst,crs_rule_groups,crs_excluded_rules,custom_rules,block_page_id,block_status_code,enabled,updated_by,created_at,updated_at,geoip_countries,geoip_mode,geoip_crawler_exempt,geoip_crawler_engines,waf_check_response,log_request_body,ip_acl_list_refs,ip_whitelist_refs,policy_type,trust_detection"},
-		{name: "security_policy_bindings", snapshotColumns: "rule_caddy_id,policy_id"},
-		{name: "security_custom_rules", snapshotColumns: "id,name,description,conditions,action,score,enabled,updated_by,created_at,updated_at"},
-		{name: "security_block_pages", snapshotColumns: "id,name,description,content,content_type,is_default,is_builtin,created_by,created_at,updated_by,updated_at"},
-		{name: "security_ip_lists", snapshotColumns: "id,name,description,category,entries,created_by,created_at,updated_by,updated_at,system"},
-		// schedule_days/schedule_time 入列——主端排程
-		// 保存（setVersionTableSchedule 同语句写两列+next_update）即 bump 版本，
-		// 排程随快照到达从端（升主即生效，自动备份先例）。
-		{name: "security_crs_version", snapshotColumns: "id,version,updated_at,auto_update,update_status,message,last_checked,next_update,trigger,started_at,finished_at,schedule_days,schedule_time"},
-		{name: "security_ip2region_version", snapshotColumns: "id,version,updated_at,auto_update,update_status,message,last_checked,next_update,trigger,started_at,finished_at,schedule_days,schedule_time"},
-		// 威胁情报库（v2.3.x）：多行表（每源一行状态机），随集群快照同步；
-		// last_checked 为运行态读路径指标，UPDATE 触发列排除（同 CRS/IP2Region）。
-		{name: "security_threat_sources", snapshotColumns: "id,name,display_name,url,format,update_enabled,apply_enabled,entry_count,version,update_status,message,last_checked,next_update,trigger,started_at,finished_at,consecutive_failures"},
-		// 爬虫地址库独立源表：无 apply_enabled；last_checked/consecutive_failures
-		// 与威胁源同口径排除运行态读路径写。
-		{name: "security_crawler_sources", snapshotColumns: "id,name,display_name,url,format,update_enabled,entry_count,version,update_status,message,last_checked,next_update,trigger,started_at,finished_at,consecutive_failures"},
-	}
+	// 逐表逐语句安装触发器（清单=包级单源，对账测试共用）。
+	tables := clusterSyncedTables
 	const newCertificateMember = "NEW.status<>'disabled' AND COALESCE(NEW.cert_pem,'')<>'' AND COALESCE(NEW.key_pem,'')<>'' AND datetime(NEW.expires_at)>datetime('now')"
 	const oldCertificateMember = "OLD.status<>'disabled' AND COALESCE(OLD.cert_pem,'')<>'' AND COALESCE(OLD.key_pem,'')<>'' AND datetime(OLD.expires_at)>datetime('now')"
 	for _, table := range tables {
@@ -290,34 +301,47 @@ func installClusterVersionTriggers(database *sql.DB) error {
 	return nil
 }
 
-// isLoginLockWritePath 判定密码登录/MFA 验证步——失败置锁 login_locked_until、
-// 成功清零解锁，均写 users 同步列。isSynchronizedWrite 的分类
-// 与触发器降级态的角色分流（clusterVersionMiddleware）共用本清单，单源防漂移。
-func isLoginLockWritePath(method, path string) bool {
-	return method == http.MethodPost && (path == "/api/v1/auth/login" || path == "/api/v1/auth/mfa/verify")
-}
-
-func isSynchronizedWrite(method, path string) bool {
-	// auth/setup(初始化管理员)与 OIDC 回调(JIT 开户)写 users 表,
-	// 但回调是 GET 形态——精确匹配置于方法门之外,触发器不可用时同样
-	// fail-closed(否则首次开户静默绕过版本 bump,从节点用户集漂移)。
-	if method == http.MethodPost && path == "/api/v1/auth/setup" {
-		return true
-	}
+// isUsersTableWritePath 判定写 users 表同步列（users 触发器 OF 列）的路由单源：
+// 密码登录/MFA 验证步（置锁/解锁 login_locked_until）、初始化管理员
+// （auth/setup）、OIDC 回调 JIT 开户（GET 形态）、MFA 三段状态变更
+// （mfa_enabled/mfa_secret/mfa_recovery_codes）。
+//
+// 两处消费方共用本清单，单源防漂移：
+//   - isSynchronizedWrite 的同步写分类（触发器可用时写后必须 bump）；
+//   - 触发器降级态的角色分流——从节点 users 触发器 WHEN is_master=1 本就不
+//     bump，fail-closed 在从端零保护收益、只截断登录/开户可用性，故从端放行、
+//     主端仍 500。此前分流只覆盖 login/mfa-verify，setup/OIDC/改 MFA 在从端
+//     被误伤 500（与分类口径自相矛盾）。
+//
+// 反例（不属于本表写入，刻意不入列）：/auth/mfa/setup 与
+// /auth/mfa/verify-step 只写刻意排除的 pending/记账列（永不 bump），按前缀
+// 捕获会让降级态误伤 MFA 登录/step-up。
+func isUsersTableWritePath(method, path string) bool {
 	if method == http.MethodGet && path == "/api/v1/auth/oidc/callback" {
 		return true
 	}
-	// 登录锁传播：密码登录与 MFA 验证步都会写
-	// users 同步列——失败置锁 login_locked_until（auth.go recordLoginFailure /
-	// mfa.go 验证步同计一个账户级计数）、成功清零解锁。触发器不可用时若放行，
-	// 降级态真实置锁不 bump cluster_version，主节点锁状态无法随快照传播到
-	// 从节点（与语义冲突）——与 setup/OIDC 开户同口径 fail-closed。
-	// 该 fail-closed 仅主节点语义——触发器降级态下
-	// 从节点由 clusterVersionMiddleware 经 RoleOf 分流放行（users 触发器
-	// WHEN is_master=1，从端锁写入本就不 bump，拦截只损登录可用性）。
-	// 票据登录不写 users 同步列，不在此列（保全从节点登录
-	// 可用性）。
-	if isLoginLockWritePath(method, path) {
+	if method != http.MethodPost {
+		return false
+	}
+	switch path {
+	case "/api/v1/auth/login",
+		"/api/v1/auth/mfa/verify",
+		"/api/v1/auth/setup",
+		"/api/v1/auth/mfa/activate",
+		"/api/v1/auth/mfa/disable",
+		"/api/v1/auth/mfa/recovery-codes":
+		return true
+	}
+	return false
+}
+
+func isSynchronizedWrite(method, path string) bool {
+	// users 表同步列写入（登录锁传播 / 初始化管理员 / OIDC JIT 开户 / MFA
+	// 状态变更）——触发器不可用时同样 fail-closed（否则真实写库不 bump
+	// cluster_version，从节点用户集与锁状态漂移）。OIDC 回调是 GET 形态，
+	// 精确匹配置于方法门之外。票据登录不写 users 同步列，不在此列（保全从节点
+	// 登录可用性）。
+	if isUsersTableWritePath(method, path) {
 		return true
 	}
 	if method != http.MethodPost && method != http.MethodPut && method != http.MethodPatch && method != http.MethodDelete {
@@ -370,16 +394,6 @@ func isSynchronizedWrite(method, path string) bool {
 	// Certificate config test endpoints only probe DNS credentials without writing.
 	if method == http.MethodPost && strings.HasPrefix(path, "/api/v1/certificate-configs/") && strings.HasSuffix(path, "/test") {
 		return false
-	}
-	// 审计 //api/v1/auth/mfa 下仅 activate/disable/
-	// 三路由写 users 触发器 OF 列（mfa_enabled/mfa_secret/mfa_recovery_codes）；
-	// verify/verify-step/setup 只写刻意排除的记账/pending 列（永不 bump）——
-	// 不得按前缀捕获，否则触发器安装失败的降级态下 MFA 登录/step-up 被误伤
-	// 500，UI 恢复路径对 MFA 用户截断。
-	for _, exact := range []string{"/api/v1/auth/mfa/activate", "/api/v1/auth/mfa/disable", "/api/v1/auth/mfa/recovery-codes"} {
-		if path == exact {
-			return true
-		}
 	}
 	// 大屏流量采集租约 POST/DELETE 是 Caddy admin 的纯
 	// 代理（内存租约，不写任何同步表）——security 前缀捕获让触发器安装失败

@@ -114,7 +114,7 @@ import { useTrustAssociation } from '@/composables/useTrustAssociation'
 import { useCountryNamesCn, countryLabel } from '@/composables/useCountryNamesCn'
 import type { IpListOption } from '@/composables/useIpListAdd'
 // 分组类型路由：inferPolicyType 为策略类型单一实现（securityStages 导出，禁第二实现）
-import { aclAssociateSides, inferPolicyType, parseIPList, parseRefIds, entryMatchesIp, invalidateSharedEntriesCache, ensureSharedEntries, sharedEntriesCache, subscribeSharedEntriesCache, mergeIpEntryValues } from '@/utils/securityStages'
+import { aclAssociateSides, inferPolicyType, parseIPList, parseRefIds, entryMatchesIp, invalidateSharedEntriesCache, ensureSharedEntries, sharedEntriesCache, subscribeSharedEntriesCache, mergeIpEntryValues, trustHitMode } from '@/utils/securityStages'
 import { popperViewportSafe } from '@/utils/popper'
 import type { SecurityPolicyType, SecurityPolicyTypeInput } from '@/utils/securityStages'
 import { planTrustRemoval } from '@/utils/trustRemoval'
@@ -434,8 +434,9 @@ const trustHitSummary = computed(() => {
     if (!mergedTrustEntries(policy).some((entry) => entryMatchesIp(entry, ip))) continue
     if (!policy.ip_whitelist_enabled) continue
     trusted = true
-    if (policy.trust_detection === true) detectionOwner ??= policy
-    else if (policy.trust_detection === false) passthroughOwner ??= policy
+    // 语义单源：非阶段 0 存量信任引擎恒 DetectionOnly（与 trust_detection 无关）
+    if (trustHitMode(policy.policy_type, policy.trust_detection) === 'detection') detectionOwner ??= policy
+    else passthroughOwner ??= policy
   }
   return { trusted, detectionOwner, passthroughOwner }
 })
@@ -475,8 +476,8 @@ const rowView = (policy: PolicyRow): RowView => {
     inTrustInlineExact,
     trustEnabled: policy.ip_whitelist_enabled !== false,
     trustCount: trustEntries.length,
-    // 与 securityStages.buildStage0Rows 模式行同文案
-    trustDetectionLabel: policy.trust_detection === true ? '保留检测记录（事件动作=检测）' : '直通上游（不产生安全事件）',
+    // 与 securityStages.buildStage0Rows 模式行同文案（按策略类型单源）
+    trustDetectionLabel: trustHitMode(policy.policy_type, policy.trust_detection) === 'detection' ? '保留检测记录（事件动作=检测）' : '直通上游（不产生安全事件）',
     trustDead: false,
     canAddTrust: false,
     canClearDeadTrust: false,

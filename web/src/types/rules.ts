@@ -210,4 +210,6 @@ export interface UpdateRuleRequest extends Omit<CreateRuleRequest,
   block_page_stage3_id?: number
   block_page_stage3_status?: number
   enabled: boolean
+  // 乐观并发前置条件：编辑向导回传打开时的 updated_at；省略=不校验。
+  expected_updated_at?: string
 }

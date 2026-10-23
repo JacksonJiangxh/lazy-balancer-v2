@@ -409,13 +409,24 @@ export const hasGeoIPControl = (p: {
 export const hasStage3Features = (mode: string, customRuleRefs: number): boolean =>
   mode === 'blocking' || mode === 'detection' || mode === 'custom_only' || customRuleRefs > 0
 
+// 信任命中语义单源：阶段 0 策略按 trust_detection 决定「直通上游 / 保留检测」；
+// **任何非阶段 0 策略**的信任名单在引擎侧恒发 DetectionOnly（services/security.go
+// id:3），与 trust_detection 无关（该字段仅阶段 0 有语义）——展示与豁免归因必须
+// 共用本谓词，不得各自读取 trust_detection。
+// policyType 缺省（精简载荷/旧摘要）时回落 trust_detection 旧口径。
+export type TrustHitMode = 'passthrough' | 'detection'
+export const trustHitMode = (policyType: string | undefined, trustDetection: boolean | undefined): TrustHitMode => {
+  if (policyType !== undefined && policyType !== '' && policyType !== 'stage0') return 'detection'
+  return trustDetection === true ? 'detection' : 'passthrough'
+}
+
 // 阶段 0 · 信任名单行：条目数（空=未配置，任务 G 口径）+ 直通/保留检测模式
 const buildStage0Rows = (policy: SecurityStagePolicy | undefined, ipLists: readonly SecurityStageIPList[]): StageRow[] => {
   const rows: StageRow[] = []
   if (!policy || !hasTrustEntries(policy)) return rows
   const trustCount = mergeIpEntryCount(ipLists, parseIPList(policy.ip_whitelist), parseRefIds(policy.ip_whitelist_refs))
   rows.push({ label: '信任名单', detail: trustCount === 0 ? '未配置' : `${trustCount} 条${policy.ip_whitelist_enabled === false ? '（未启用）' : ''}` })
-  rows.push({ label: '模式', detail: policy.trust_detection === true ? '保留检测记录（事件动作=检测）' : '直通上游（不产生安全事件）' })
+  rows.push({ label: '模式', detail: trustHitMode(policy.policy_type, policy.trust_detection) === 'detection' ? '保留检测记录（事件动作=检测）' : '直通上游（不产生安全事件）' })
   return rows
 }
 
@@ -459,7 +470,11 @@ export const formatAclModeDetail = (
       ? '（全部来自引用列表）'
       : ''
   const total = breakdown !== '' ? `共 ${effective} 条${breakdown}` : `${effective} 条`
-  if (policy.ip_acl_mode === 'allow') return `白名单模式 · ${total}${blAlive}`
+  // allow 空生效集 = 引擎否定算子空集（恒拒）：带外直写/旧快照可达该形态，
+  // 摘要必须显性警示，否则用户看到「0 条」不会察觉全站被拒。
+  if (policy.ip_acl_mode === 'allow') {
+    return effective === 0 ? `白名单模式 · ${total}（将拒绝所有请求）` : `白名单模式 · ${total}${blAlive}`
+  }
   if (policy.ip_acl_mode === '绕过') return `免检测模式 · ${total}${blAlive}`
   // 空/未知模式：名单存在但渲染侧不发射任何拒绝规则（空模式 ACL 零发射）——
   // 如实显示「未配置模式」而非「黑名单模式」，免误导用户以为名单在拦截。
@@ -1142,14 +1157,26 @@ export const invalidateSharedEntriesCache = (): void => {
 
 /**
  * 事件详情弹框需要预取的地址列表 id：属主策略的 ACL refs（命中列表/
- * 内联判定只读本策略）+ 全部信任 refs（跨策略信任豁免判定要读他策略的信任名单）。
- * 原实现并入「全部启用策略的 ACL refs」——详情弹框内零消费，启用策略多时会把他
- * 策略引用的大名单（含内置威胁名单，数千~上万条）全量下载。
+ * 内联判定只读本策略）+ 信任 refs（本策略命中/跨策略豁免判定）。
+ * 消费方按事件类别与动作传入 scope 收窄预取面（WAF/请求体/爬虫事件的
+ * ACL 条目零消费，属主策略引用威胁库时曾每次无谓下载数百 KB）。
+ * 省略 scope = 全集（既有调用/测试口径不变）。
  */
+export interface EventDetailRefScope {
+  /** 属主策略 ACL 引用（命中列表与内联判定，仅 kind∈{acl,geo,threat} 消费） */
+  ownerAcl?: boolean
+  /** 属主策略信任引用（信任命中展示 + 豁免归因） */
+  ownerTrust?: boolean
+  /** 其他启用策略的信任引用（跨策略豁免归因，仅未拦截事件需要） */
+  otherTrust?: boolean
+}
+
 export const eventDetailRefIds = (
   policy: { ip_acl_list_refs?: string; ip_whitelist_refs?: string } | null,
   otherPolicies: ReadonlyArray<{ ip_whitelist_refs?: string }>,
+  scope?: EventDetailRefScope,
 ): number[] => {
+  const use = { ownerAcl: true, ownerTrust: true, otherTrust: true, ...scope }
   const ids: number[] = []
   const seen = new Set<number>()
   const add = (raw: string | undefined): void => {
@@ -1160,10 +1187,12 @@ export const eventDetailRefIds = (
     }
   }
   if (policy) {
-    add(policy.ip_acl_list_refs)
-    add(policy.ip_whitelist_refs)
+    if (use.ownerAcl) add(policy.ip_acl_list_refs)
+    if (use.ownerTrust) add(policy.ip_whitelist_refs)
   }
-  for (const p of otherPolicies) add(p.ip_whitelist_refs)
+  if (use.otherTrust) {
+    for (const p of otherPolicies) add(p.ip_whitelist_refs)
+  }
   return ids
 }
 
@@ -1275,12 +1304,15 @@ export const detectionModeExplains = (kind: string): boolean => kind === 'waf-cr
 /**
  * 跨策略信任豁免判定的候选策略：事件详情端点不过滤 enabled，属主
  * 策略可能事后被禁用——禁用策略不渲染、不可能放行，不得参与豁免归因。
+ * 判定按 trustHitMode：非阶段 0 存量信任引擎恒 DetectionOnly（可产生 logged
+ * 事件 → 可解释豁免）；阶段 0 直通模式不产生后续阶段事件，故不参与归因。
  */
 export const isTrustExemptionCandidate = (p: {
   enabled?: boolean
   ip_whitelist_enabled?: boolean
   trust_detection?: boolean
-}): boolean => p.enabled !== false && !!p.ip_whitelist_enabled && p.trust_detection === true
+  policy_type?: string
+}): boolean => p.enabled !== false && !!p.ip_whitelist_enabled && trustHitMode(p.policy_type, p.trust_detection) === 'detection'
 
 // ── 拦截页归因 ─────────────────────────────────────────────
 // 后端渲染事实（internal/services/caddy.go）：
@@ -1316,6 +1348,45 @@ export interface BlockPageAttribution {
 
 /** 有效页 = 页 id>0 且页内容非空（后端对空内容页视为无页）。 */
 const chainHasValidPage = (p: BlockPageChainPolicy): boolean => (p.blockPageId ?? 0) > 0 && p.pageHasContent === true
+
+/**
+ * 「该阶段在当前配置下能否产生拦截」能力门。
+ *
+ * resolveBlockPageAttribution 只判「页有效 + 绑定链位置」，不看阶段是否有
+ * 拒绝规则——stage3 默认 mode=off、stage1 无 ACL/地域/黑名单时永远不会触发
+ * 拦截，页面配置得再好也不会显示。向导注记必须先过本门，否则会与同页
+ * 「WAF 关闭」「未启用 ACL」的摘要自相矛盾。
+ *
+ * 引擎口径：
+ *  - 阶段 2：429 由绑定链任一启用限流策略产生（本谓词不承担限流门，
+ *    归因侧 rateLimitEnabled 已门控），恒 true。
+ *  - 阶段 3：mode=off 无 deny；detection/custom_only 只有自定义规则动作为
+ *    block 时才阻断（CRS 在检测模式仅记录）。
+ *  - 阶段 1：ACL（非绕过且有条目）/独立黑名单/地域任一成立才发射预检 deny。
+ */
+export interface BlockPageStageCapability {
+  stage: BlockPageStage
+  /** 阶段 3 WAF 模式（off/detection/blocking/custom_only） */
+  mode?: string
+  /** 阶段 3：至少一条启用且动作为 block 的自定义规则 */
+  hasBlockingCustomRule?: boolean
+  /** 阶段 1：ACL 已启用且有效条目非空（绕过模式不拦截） */
+  hasAclEntries?: boolean
+  /** 阶段 1：独立遗留黑名单非空 */
+  hasBlacklistEntries?: boolean
+  /** 阶段 1：地域拦截启用且区域非空 */
+  hasGeoip?: boolean
+}
+
+export const blockPageStageCanIntercept = (input: BlockPageStageCapability): boolean => {
+  if (input.stage === 2) return true
+  if (input.stage === 3) {
+    const mode = input.mode ?? 'off'
+    if (mode === 'off') return false
+    return mode === 'blocking' || input.hasBlockingCustomRule === true
+  }
+  return input.hasAclEntries === true || input.hasBlacklistEntries === true || input.hasGeoip === true
+}
 
 /**
  * 「拦截页缺失/内容为空」判定。

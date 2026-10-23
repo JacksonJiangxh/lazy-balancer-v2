@@ -50,7 +50,7 @@ func TestListRules_uses_schema_defaults_when_nullable_columns_are_NULL(t *testin
 	// 注：health_check_timeout 的 NULL 回退原钉 5（schema 旧默认口径），
 	//（用户裁定）已将读取/生成/渲染默认统一为 2（与写侧 CreateRule/校验副本
 	// 一致，见 rule_features.go lbRuleListColumns 与 services/caddy.go 渲染兜底）；
-	// 本期望随新契约更新，与 TestListRules_defaults_NULL_health_check_timeout_to_2 同口径。
+	// 本用例的期望值即该契约的唯一断言点（此前的交叉引用指向已不存在的用例，已删）。
 	if response.Code != http.StatusOK {
 		t.Fatalf("list status=%d body=%s", response.Code, response.Body.String())
 	}
@@ -262,7 +262,7 @@ func TestDeleteRule_removes_security_policy_bindings(t *testing.T) {
 
 func TestCreateRule_removes_rule_and_restores_Caddy_when_ACME_queue_is_unavailable(t *testing.T) {
 	// Given
-	handler, loadCalls, _ := newAuditRuleHandlers(t, 0)
+	handler, loadCalls, lastLoad := newAuditRuleHandlers(t, 0)
 	dnsResult, err := db.DB.Exec(`INSERT INTO certificate_configs (name,dns_provider,dns_credentials,enabled) VALUES ('dns','dnspod','{"token":"x"}',1)`)
 	if err != nil {
 		t.Fatalf("seed certificate config: %v", err)
@@ -288,14 +288,37 @@ func TestCreateRule_removes_rule_and_restores_Caddy_when_ACME_queue_is_unavailab
 	if err := db.DB.QueryRow("SELECT COUNT(*) FROM lb_rules WHERE domain='create.example.test'").Scan(&count); err != nil {
 		t.Fatalf("read created rule: %v", err)
 	}
-	if count != 0 || loadCalls.Load() == 0 {
-		t.Fatalf("rule count=%d Caddy loads=%d, want zero change compensation", count, loadCalls.Load())
+	if count != 0 {
+		t.Fatalf("rule count=%d, want zero change compensation", count)
+	}
+	// 补偿必须是「候选已应用 → 回弹创建前快照」两段，而不是在应用前就早退：
+	// 至少 2 次 /load，且最后一次载荷是捕获的原运行配置（"old":true）。
+	if loadCalls.Load() < 2 {
+		t.Fatalf("Caddy loads=%d, want ≥2（候选应用 + 快照回弹）", loadCalls.Load())
+	}
+	if !strings.Contains(*lastLoad, `"old":true`) {
+		t.Fatalf("最后一次 /load 未回弹创建前快照: %.300s", *lastLoad)
+	}
+	// 子表不得残留：规则行随事务回滚消失后，upstreams/path_rules/
+	// security_policy_bindings/cert_jobs 的孤儿行会让导出/快照放大死数据。
+	for _, table := range []string{"upstreams", "path_rules", "security_policy_bindings", "cert_jobs"} {
+		var rows int
+		column := "rule_id"
+		if table == "security_policy_bindings" {
+			column = "rule_caddy_id"
+		}
+		if err := db.DB.QueryRow("SELECT COUNT(*) FROM " + table + " WHERE COALESCE(" + column + ",'') NOT IN (SELECT caddy_id FROM lb_rules)").Scan(&rows); err != nil {
+			t.Fatalf("count orphan %s: %v", table, err)
+		}
+		if rows != 0 {
+			t.Fatalf("%s 残留孤儿行=%d, want 0（创建补偿必须连同子表一起回滚）", table, rows)
+		}
 	}
 }
 
 func TestEnableRule_restores_disabled_state_when_ACME_queue_is_unavailable(t *testing.T) {
 	// Given
-	handler, loadCalls, _ := newAuditRuleHandlers(t, 0)
+	handler, loadCalls, lastLoad := newAuditRuleHandlers(t, 0)
 	seedAuditRule(t, "lb_enable_acme", "enable", "enable.example.test", 8080, false, "acme_dns", true)
 	if _, err := db.DB.Exec("UPDATE lb_rules SET acme_config_id=? WHERE caddy_id='lb_enable_acme'", seedR52CertificateConfig(t)); err != nil {
 		t.Fatalf("bind certificate config: %v", err)
@@ -315,8 +338,19 @@ func TestEnableRule_restores_disabled_state_when_ACME_queue_is_unavailable(t *te
 	if err := db.DB.QueryRow("SELECT enabled FROM lb_rules WHERE caddy_id='lb_enable_acme'").Scan(&enabled); err != nil {
 		t.Fatalf("read enabled state: %v", err)
 	}
-	if enabled || loadCalls.Load() == 0 {
-		t.Fatalf("enabled=%v Caddy loads=%d, want disabled with candidate apply", enabled, loadCalls.Load())
+	if enabled {
+		t.Fatal("enable write remained after failed compensation")
+	}
+	// 补偿形态：候选（含启用路由）已应用 → 回弹请求前快照；至少 2 次 /load。
+	if loadCalls.Load() < 2 {
+		t.Fatalf("Caddy loads=%d, want ≥2（候选应用 + 快照回弹）", loadCalls.Load())
+	}
+	if !strings.Contains(*lastLoad, `"old":true`) {
+		t.Fatalf("最后一次 /load 未回弹请求前快照: %.300s", *lastLoad)
+	}
+	// 禁用规则不得继续被服务：恢复载荷里不得出现该规则路由。
+	if strings.Contains(*lastLoad, "lb_enable_acme") {
+		t.Fatalf("恢复载荷仍含 lb_enable_acme 路由（禁用规则继续被服务）: %.300s", *lastLoad)
 	}
 }
 
@@ -915,10 +949,12 @@ func TestRuleWriteEndpoints_roll_back_database_when_Caddy_apply_fails(t *testing
 		t.Run(test.name, func(t *testing.T) {
 			// Given
 			var handler *Handlers
+			var loads *atomic.Int32
 			if test.name == "create" || test.name == "update" {
-				handler = newUpdateAuditRuleHandlers(t, "lb_tx_update", 1, false).handler
+				harness := newUpdateAuditRuleHandlers(t, "lb_tx_update", 1, false)
+				handler, loads = harness.handler, harness.loadCalls
 			} else {
-				handler, _, _ = newAuditRuleHandlers(t, 1)
+				handler, loads, _ = newAuditRuleHandlers(t, 1)
 			}
 			test.seed(t)
 			router := gin.New()
@@ -933,6 +969,11 @@ func TestRuleWriteEndpoints_roll_back_database_when_Caddy_apply_fails(t *testing
 			// Then
 			if response.Code == http.StatusOK || response.Code == http.StatusCreated {
 				t.Fatalf("write unexpectedly succeeded: %s", response.Body.String())
+			}
+			// 必须真的走到 apply 才失败——0 次 /load 意味着失败发生在校验/
+			// 渲染阶段，回滚断言就失去了「应用到运行配置后回滚」的语义。
+			if loads.Load() == 0 {
+				t.Fatalf("Caddy loads=0, want ≥1（证明已尝试 apply 而非校验阶段早退）body=%s", response.Body.String())
 			}
 			test.assert(t)
 		})

@@ -126,6 +126,12 @@ func sanitizeUsersForHash(users []models.ClusterUser) []models.ClusterUser {
 		out[i] = u
 		out[i].LastLogin = models.JSONNullTime{}
 		out[i].MFALastTimestep = 0
+		// is_setup_admin 是由 (role,is_enabled) 确定性派生的保护标记：apply 侧
+		// 落库后会按「最低 id 的启用管理员」在本地归一（旧主端载荷不含该字段
+		// 时同样如此）。派生值不进哈希——进哈希会让「主端未携带标记」形态在
+		// 从端每轮重建出与载荷不同的哈希，触发永久重放/重载（waf ref 同型
+		// 乒乓）。
+		out[i].IsSetupAdmin = false
 	}
 	return out
 }
@@ -436,7 +442,12 @@ func logSyncSwitchGuards(dbh *sql.DB, snapshot models.ClusterSnapshot, sk *secti
 	// global_config.applied_waf_ref_version(方案A 列;security 关闭时
 	// recordAppliedSectionHashes 不写该列,版本冻结在开关关闭前,每版本
 	// bump 至多刷一条告警审计)。
-	if !sk.disabled["security"] || snapshot.WafFiles == nil || !wafFilesRefDiffers(snapshot.WafFiles) {
+	// 判定顺序「便宜门在前」：开关关闭 → 快照带引用 → 版本去重（一次点查）
+	// → 最后才 wafFilesRefDiffers（持 WafFileLock 做 CRS 全树打包 + xdb 全文件
+	// 哈希，数十至数百毫秒）。同版本重放（重载失败补偿重拉）本应被去重直接
+	// 跳过，若先算哈希会白付一次全树哈希并阻塞三库更新器与 lbbak 导入文件相位。
+	// 语义不变：三个条件仍同时成立才告警（AND）。
+	if !sk.disabled["security"] || snapshot.WafFiles == nil {
 		return
 	}
 	var lastWarnVersion int
@@ -448,6 +459,9 @@ func logSyncSwitchGuards(dbh *sql.DB, snapshot models.ClusterSnapshot, sk *secti
 		}
 	}
 	if lastWarnVersion >= snapshot.Version {
+		return
+	}
+	if !wafFilesRefDiffers(snapshot.WafFiles) {
 		return
 	}
 	RecordAuditLog("system", "同步警告", "集群同步", "检测到主节点 CRS/IP2Region 文件已更新（同步开关关闭），本地文件保持不变", "")

@@ -102,8 +102,17 @@ func WriteFastFile(path string, v4, v6 []netip.Prefix) error {
 		return err
 	}
 
+	// 读侧上限在写侧自证：产物越过条目数或体积上限时 ReadFastFile 必然
+	// 拒收，写出去只会得到「写成功、读失败」的名单——跨进程回退侧拿不到
+	// 可用数据，且失败点远离真实原因。宁可写侧显式报错且不落盘。
+	if total := len(mv4) + len(mv6); total > MaxFastEntries {
+		return fmt.Errorf("fastfile: 条目数 %d 超过读侧上限 %d（产物必被 ReadFastFile 拒收，未写出）", total, MaxFastEntries)
+	}
 	// 计算总大小（header + 条目 + 4 字节 crc32c 尾部）
 	size := fastFileHeaderSize + len(mv4)*5 + len(mv6)*17 + 4
+	if int64(size) > MaxFastFileBytes {
+		return fmt.Errorf("fastfile: 产物体积 %d 字节超过读侧上限 %d（产物必被 ReadFastFile 拒收，未写出）", size, MaxFastFileBytes)
+	}
 	buf := make([]byte, size)
 
 	// Header
@@ -156,7 +165,11 @@ func WriteFastFile(path string, v4, v6 []netip.Prefix) error {
 		discard()
 		return fmt.Errorf("fastfile tmp chmod: %w", err)
 	}
-	// 掉电窗口内空/半截 .fast 会被 @ipListFast 当合法空集（fail-open）。
+	// Sync 语义：写侧是「独占临时名写满 + fsync + rename」，正常路径不会
+	// 产生空/半截 .fast 产物（rename 前失败只留可回收的 .tmp）。即便产物在
+	// 极端掉电窗口内损坏，唯一生产读点 ReadFastFile 会以 magic/flags/尺寸/
+	// CRC 拒绝；消费方（services 侧名单加载）在文本名单在场时回退文本、
+	// 否则显式报错——不存在 fail-open 的空集装载。
 	if err := tmp.Sync(); err != nil {
 		discard()
 		return fmt.Errorf("fastfile tmp sync: %w", err)

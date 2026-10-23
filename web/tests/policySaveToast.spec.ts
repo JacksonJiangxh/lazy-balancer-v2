@@ -12,7 +12,7 @@ import { section, source } from './_helpers.ts'
 const page = source('src/views/security/SecurityPolicies.vue')
 
 test('策略保存：同步条数并入唯一的成功提示，不再叠加第二条 toast', () => {
-  const save = section(page, 'const pendingOverrides = pendingOverrideRules.value', 'const mergedBind = mergeBulkResults(')
+  const save = section(page, 'let pendingOverrides = pendingOverrideRules.value', 'const mergedBind = mergeBulkResults(')
   assert.doesNotMatch(save, /mfaAwareSuccess\(`已同步/, '不得再单独弹同步成功 toast')
   assert.match(save, /let syncedCount = 0/)
   assert.match(save, /syncedCount = pendingOverrides\.length - skippedNotes\.length/)

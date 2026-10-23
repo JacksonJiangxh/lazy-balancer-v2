@@ -59,9 +59,12 @@ func purgeAllAPIKeyWhitelistCache() {
 }
 
 // apiKeyListColumns API Key 列表查询的列清单（单一事实源：两处
-// handler 共用，新增列只改一处）。
-const apiKeyListColumns = `k.id, k.name, k.key_prefix, k.created_by, k.last_used, k.expires_at, k.is_enabled,
-	k.mcp_enabled, k.read_only, COALESCE(k.mcp_ip_whitelist,''), k.created_at, u.username`
+// handler 共用，新增列只改一处）。布尔列一律 COALESCE：带外写入/历史数据
+// 的 NULL 扫进 bool 会整表 500，鉴权侧（db.ResolveAPIKeyIdentity）同口径
+// 已按缺省收敛（mcp_enabled=0/read_only=0/is_enabled=1）。
+const apiKeyListColumns = `k.id, k.name, k.key_prefix, k.created_by, k.last_used, k.expires_at,
+	COALESCE(k.is_enabled,1), COALESCE(k.mcp_enabled,0), COALESCE(k.read_only,0),
+	COALESCE(k.mcp_ip_whitelist,''), k.created_at, u.username`
 
 // queryAPIKeys 按可选 WHERE 片段查询 API Key 列表（扫描仍走 scanAPIKeys）。
 func queryAPIKeys(where string, args ...any) (*sql.Rows, error) {
@@ -163,8 +166,11 @@ func scanAPIKeys(rows *sql.Rows) ([]models.APIKeyWithUserResponse, error) {
 			return nil, fmt.Errorf("scan API key: %w", err)
 		}
 		if whitelistJSON != "" {
+			// 单行白名单损坏只降级该行（空数组=不限制来源），不再让整张
+			// 列表 500——坏值来自带外写入/历史版本，用户仍需能看见并删除它。
 			if err := json.Unmarshal([]byte(whitelistJSON), &key.MCPIPWhitelist); err != nil {
-				return nil, fmt.Errorf("decode API key MCP IP whitelist: %w", err)
+				services.Logf("warn", "API Key 白名单 JSON 解析失败（已按空列表展示）: key_id=%d: %v", key.ID, err)
+				key.MCPIPWhitelist = nil
 			}
 		}
 		if key.MCPIPWhitelist == nil {

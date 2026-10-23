@@ -30,6 +30,21 @@ type syncBuffer struct {
 	buf bytes.Buffer
 }
 
+// initSecurityEventsTestDB 初始化隔离测试库并保存/恢复全局三库句柄。
+// 裸 db.Initialize 不还原会让后续用例（或 -shuffle 单跑）拿到指向已删除临时
+// 目录的句柄（假红/假绿），且不 Close 泄漏文件句柄。返回值保持既有
+// `if err := ...; err != nil` 调用形态。
+func initSecurityEventsTestDB(t testing.TB, dataDir string) error {
+	t.Helper()
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
+	err := db.Initialize(dataDir)
+	t.Cleanup(func() {
+		_ = db.Close()
+		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+	})
+	return err
+}
+
 func (s *syncBuffer) Write(p []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -241,7 +256,7 @@ func TestSecurityEventsParseTransaction_CleanPassThroughLogsWithoutRuleFields(t 
 func TestSecurityEventsMapHost_MatchesCanonicalAndReportsUnknown(t *testing.T) {
 	// Given: a seeded rule for go029.com bound to policy 7
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -286,7 +301,7 @@ func TestSecurityEventsMapHost_MatchesCanonicalAndReportsUnknown(t *testing.T) {
 func TestSecurityEventsMigration_NameColumnsExistWithDefaults(t *testing.T) {
 	// Given: a freshly initialized database (createTables + runMigrations)
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -339,7 +354,7 @@ func TestSecurityEventsMigration_NameColumnsExistWithDefaults(t *testing.T) {
 func TestSecurityEventsTickStoresResolvedNames(t *testing.T) {
 	// Given: rule go029.com -> lb_named1 (命名规则) bound to policy 命名策略
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -494,7 +509,7 @@ func TestSecurityEventsFindNextDocument_boundedBufferOnSmallTail(t *testing.T) {
 func TestSecurityEventsTickIngestsFixtureLog(t *testing.T) {
 	// Given: a DB with rule go029.com -> lb_rule1 -> policy 7 and an audit log with 2 transactions
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -616,7 +631,7 @@ func TestSecurityEventsTick_idleTickSkipsMappingLoad(t *testing.T) {
 	// 若空闲 tick 仍调 loadMappings 会返回 "database not initialized"；
 	// 追加新事务后应照常恢复摄取。
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -686,7 +701,7 @@ func TestSecurityEventsIngestRotatedDelta_recoversRotationWindowEvents(t *testin
 	// Given: DB with rule go029.com -> lb_rule1, an audit log with transaction A,
 	// and a tick that ingests A and persists its offset
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -770,7 +785,7 @@ func TestSecurityEventsIngestRotatedDelta_recoversRotationWindowEvents(t *testin
 func TestSecurityEventsTickDedupesDuplicateTransactionID(t *testing.T) {
 	// Given：审计日志中同一事务出现两次（模拟轮转/重放导致的重复读取）
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -816,7 +831,7 @@ func TestSecurityEventsTickDedupesDuplicateTransactionID(t *testing.T) {
 func TestSecurityEventsTickSkipsMalformedAndContinues(t *testing.T) {
 	// Given: an audit log with garbage bytes and a non-transaction JSON between valid docs
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -879,7 +894,7 @@ func TestSecurityEventsParseTransaction_rejectsEmptyID(t *testing.T) {
 func TestSecurityEventsTickSkipsTransactionWithoutIDAndContinues(t *testing.T) {
 	// Given：日志含一个空 transaction_id 的事务 + 一个正常事务
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -922,7 +937,7 @@ func TestSecurityEventsTickSkipsTransactionWithoutIDAndContinues(t *testing.T) {
 func TestRotateAuditLog_ingestsLiveTailWrittenBetweenCopyAndTruncate(t *testing.T) {
 	// Given：日志含事务 A（tick 已摄取并持久化偏移）
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -987,7 +1002,7 @@ func TestRotateAuditLog_ingestsLiveTailWrittenBetweenCopyAndTruncate(t *testing.
 func TestRotateAuditLog_retriesPendingDeltaBeforeShifting(t *testing.T) {
 	// Given：日志含 A（tick 已摄取）+ B（tick 后追加，只存在于归档窗口）
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -1064,7 +1079,7 @@ func TestRotateAuditLog_retriesPendingDeltaBeforeShifting(t *testing.T) {
 func TestSecurityEventsPollOnce_reportsPersistentFailureAndRecovery(t *testing.T) {
 	// Given 可摄取日志与已装配指标库。
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -1114,7 +1129,7 @@ func TestSecurityEventsPollOnce_reportsPersistentFailureAndRecovery(t *testing.T
 func TestSecurityEventsPollOnce_returnsCountWithoutWritingTaskLog(t *testing.T) {
 	// Given：一条可摄取事务与空任务日志目录。
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -1150,7 +1165,7 @@ func TestSecurityEventsPollOnce_returnsCountWithoutWritingTaskLog(t *testing.T) 
 
 func TestSecurityEventsPollOnce_callsRollupRewindHookForInsertedBatch(t *testing.T) {
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -1193,9 +1208,27 @@ func TestSecurityEventsPollOnce_callsRollupRewindHookForInsertedBatch(t *testing
 		t.Fatalf("rewind minute=%s, want %s", rewinds[0], want.Truncate(time.Minute))
 	}
 
-	// 幂等重放（INSERT OR IGNORE 未插入）不得再次回退水位。
+	// 幂等重放（真重放）：删除 offset 并复位轮询状态后再 Poll——仅第二轮 Poll
+	// 会走「无新增字节 + 上次 pass 干净」空闲早退，INSERT OR IGNORE 路径与
+	// 回退钩子都不会执行，断言恒真。真重放必须实际执行一轮提交（pass 见证）
+	// 且零插入、hooks 仍为 1。
+	commitsBefore := securityEventsIngestCommits.Load()
+	if err := os.Remove(offsetPath); err != nil {
+		t.Fatal(err)
+	}
+	resetSecurityEventsPollState(t)
 	if got, _ := SecurityEventsPollOnce(); got != 0 {
 		t.Fatalf("replayed poll ingested=%d, want 0", got)
+	}
+	if got := securityEventsIngestCommits.Load() - commitsBefore; got != 1 {
+		t.Fatalf("重放 pass 提交次数=%d, want 1（未执行重放则断言恒真）", got)
+	}
+	var rowCount int
+	if err := db.MetricsDB.QueryRow(`SELECT COUNT(*) FROM security_events`).Scan(&rowCount); err != nil {
+		t.Fatal(err)
+	}
+	if rowCount != 1 {
+		t.Fatalf("重放后事件行数=%d, want 1（INSERT OR IGNORE 不得重复入库）", rowCount)
 	}
 	if len(rewinds) != 1 {
 		t.Fatalf("idempotent replay called hook again: %v", rewinds)
@@ -1206,7 +1239,7 @@ func TestSecurityEventsTick_reportsErrorBeyondScanWindow(t *testing.T) {
 	// Given：日志含正常事务 + ≥4MB 无文档头畸形区（崩溃残片）+ 后续正常事务，
 	// 且指标库就绪
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -1265,7 +1298,7 @@ func TestRotateAuditLog_recoversCrossBoundaryTransaction(t *testing.T) {
 	// Given：日志含 A（tick 已摄取）+ 事务 T 的前半（copy 末次读截断在 T 中部，
 	// 前缀将只存在于 .1、后缀只追加到活文件——跨界事务两路补采各自不完整）
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -1446,7 +1479,7 @@ func TestSecurityEventsTick_warnRateLimitedPerOffset(t *testing.T) {
 	// Given：日志含正常事务 + ≥4MB 无文档头畸形区 + 后续事务（停摆场景，
 	// 偏移永久卡在畸形区前）
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -1485,7 +1518,7 @@ func TestRotateAuditLog_skipsMalformedRegionInArchive(t *testing.T) {
 	// Given：日志含 A（tick 已摄取）+ ≥4MB 畸形区 + B（tick 被畸形区卡住停采）——
 	// 轮转归档后补采必须跳过畸形区恢复摄取 B，否则 pending 标记永留、轮转死锁
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -1550,7 +1583,7 @@ func TestRotateAuditLog_skipsMalformedRegionInArchive(t *testing.T) {
 func TestRotateAuditLog_endsPassWhenArchiveGarbageUnrecoverable(t *testing.T) {
 	// Given：日志含 A + ≥4MB 畸形区在尾部（无后续事件，scan-to-EOF 找不到文档头）
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -1610,7 +1643,7 @@ func TestRotateAuditLog_backscanFindsStraddleDocStartBeyond8MB(t *testing.T) {
 	// Given：日志含 A + 事务 T 的前缀，T 文档头在归档起点 8MB 之前（旧固定 8MB
 	// 窗口回扫会漏掉文档头，跨界事务 T 两半皆失）；copy 完成后补写 T 的后缀
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -1699,7 +1732,7 @@ func TestRotateAuditLog_backscanFindsStraddleDocStartBeyond8MB(t *testing.T) {
 func TestRotateAuditLog_abortsRotationWhenMarkerWriteFails(t *testing.T) {
 	// Given：日志含 A（tick 已摄取）、超过轮转阈值
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -1762,7 +1795,7 @@ func TestRotateAuditLog_liveTailGarbageDoesNotBlockRotation(t *testing.T) {
 	// 整体为畸形区，旧行为（archive=false） 报错中止轮转：每 2s 周期反复复制
 	// 更大文件、永不截断
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -1892,7 +1925,7 @@ func securityEventsSeedAttrPolicy(t *testing.T, ruleTriggered string, policies [
 }, crs ...map[int]securityEventsAttrCRS) (int, string) {
 	t.Helper()
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -2094,7 +2127,7 @@ func TestSecurityEventsAttribution_CustomOnlyPolicyDoesNotClaimCRSEvents(t *test
 // 未绑定（无 security_policy_bindings 行）→ 归因零值。
 func TestSecurityEventsAttribution_UnboundReturnsZeroValue(t *testing.T) {
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -2131,7 +2164,7 @@ func TestSecurityEventsAttribution_UnboundReturnsZeroValue(t *testing.T) {
 // Then：归因到 policy-B(id3) —— 而非首绑定回退值 policy-A。
 func TestSecurityEventsAttribution_LegacyBlacklistDenyPicksOwnerPolicy(t *testing.T) {
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -2163,7 +2196,7 @@ func TestSecurityEventsAttribution_LegacyBlacklistDenyPicksOwnerPolicy(t *testin
 // Then：归因到 policy-C(id4) —— 而非首绑定回退值 policy-A。
 func TestSecurityEventsAttribution_IPACLDenyPicksOwnerPolicy(t *testing.T) {
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -2193,7 +2226,7 @@ func TestSecurityEventsAttribution_IPACLDenyPicksOwnerPolicy(t *testing.T) {
 // 配置已变更），禁止回归为零值或报错。
 func TestSecurityEventsAttribution_BlacklistDenyFallsBackToFirstEnabledWhenNoOwner(t *testing.T) {
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -2219,7 +2252,7 @@ func TestSecurityEventsAttribution_BlacklistDenyFallsBackToFirstEnabledWhenNoOwn
 // （归属口径仅认 deny 黑名单模式，与审计规格一致）；事件回退到第一个启用绑定。
 func TestSecurityEventsAttribution_IPACLAllowModeDoesNotOwnDenyEvent(t *testing.T) {
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -2547,7 +2580,7 @@ func TestRotateAuditLogIfNeeded_pendingArchiveMissing_removableMarkerWarnsOnceAn
 // Then：归因到 policy-B（携带 geoip 条目者），而非首绑定 policy-A。
 func TestSecurityEventsAttribution_GeoIPOwnerPicksGeoIPCarryingPolicy(t *testing.T) {
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -2937,7 +2970,7 @@ func TestSecurityEventsAttribution_singleRuleForms(t *testing.T) {
 // 全用例排空 contains() 命中(组号错配/空名单),确保走的是 fallback 门。
 func TestSecurityEventsAttribution_FallbackModeFeasibilityGate(t *testing.T) {
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -3013,7 +3046,7 @@ func TestSecurityEventsAttribution_FallbackModeFeasibilityGate(t *testing.T) {
 // 否则 off 模式 GeoIP 事件被误拒为 (0,"")）。
 func TestSecurityEventsAttribution_geoipPrecheckExactSegment(t *testing.T) {
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -3069,7 +3102,7 @@ func TestSecurityEventsAttribution_geoipPrecheckExactSegment(t *testing.T) {
 // 无能力策略。RED:当前代码返回首候选 42。
 func TestSecurityEventsAttribution_IPFamilyFallbackPrefersIPCapablePolicy(t *testing.T) {
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -3099,7 +3132,7 @@ func TestSecurityEventsAttribution_IPFamilyFallbackPrefersIPCapablePolicy(t *tes
 // 口径；条目支持精确与 CIDR）。IPv6 形状即生产事件源（::1）。
 func TestSecurityEventsAttribution_IPACLMemberOwnerWinsOverNonMemberDeny(t *testing.T) {
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -3150,7 +3183,7 @@ func TestSecurityEventsAttribution_IPACLMemberOwnerWinsOverNonMemberDeny(t *test
 // 首候选」双重击穿；本钉锁住「属主在绑定集内必胜出」的合同。
 func TestSecurityEventsAttribution_Stage1DenyOwnerBeatsIncapablePolicies(t *testing.T) {
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -3181,7 +3214,7 @@ func TestSecurityEventsAttribution_Stage1DenyOwnerBeatsIncapablePolicies(t *test
 // 首个可行绑定——禁止归零，禁止报错。
 func TestSecurityEventsAttribution_IncapableOnlyStillAttributed(t *testing.T) {
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -3213,7 +3246,7 @@ func TestSecurityEventsAttribution_IncapableOnlyStillAttributed(t *testing.T) {
 // 钉住的既有口径在能力层保持）；黑名单属主走 contains 不受影响。
 func TestSecurityEventsAttribution_IPFamilyCapabilityTruthTable(t *testing.T) {
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -3287,7 +3320,7 @@ func TestSecurityEventsAttribution_IPFamilyCapabilityTruthTable(t *testing.T) {
 // 不在任何策略引用集内），确保走的是 fallback 合成路径。
 func TestSecurityEventsAttribution_CustomFamilyCapabilityPreference(t *testing.T) {
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -3373,7 +3406,7 @@ func TestSecurityEventsAttribution_CustomFamilyCapabilityPreference(t *testing.T
 //     无关——均维持无能力维度）。
 func TestSecurityEventsFallbackGate_CustomFamilyTruthTable(t *testing.T) {
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -3496,7 +3529,7 @@ func TestSecurityEventsFallbackGate_CustomFamilyTruthTable(t *testing.T) {
 // 既有语义走必归属层归首绑（禁归零），一并锚定。
 func TestSecurityEventsAttribution_Stage0ZeroEmissionSurfaceLock(t *testing.T) {
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -3560,7 +3593,7 @@ func TestSecurityEventsAttribution_Stage0ZeroEmissionSurfaceLock(t *testing.T) {
 //     TestSecurityEventsAttribution_IPFamilyFallbackPrefersIPCapablePolicy 保持）。
 func TestSecurityEventsAttribution_Stage0PassthroughTrustDoesNotOwnLoggedIPEvent(t *testing.T) {
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -3761,7 +3794,7 @@ func securityEvents历史Fixture(txID, ip, uri string) string {
 func installSecurityEventsAutobanFixture(t *testing.T) {
 	t.Helper()
 	dataDir := t.TempDir()
-	if err := db.Initialize(dataDir); err != nil {
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitializeMetricsDB(dataDir); err != nil {
@@ -3925,6 +3958,68 @@ func TestSecurityEventsIngest_duplicateTransactionNotFedToAutoban(t *testing.T) 
 	}
 	if got := autobanCountForTest("203.0.113.99"); got != 0 {
 		t.Fatalf("failed insert fed %d items to autoban, want 0", got)
+	}
+}
+
+// 提交点对齐钉（攻击光流）：提交成功批次进环、offset 重放不重复进环、
+// 触发器 ABORT 回滚批次零进环。把 threatScreenAttackFlowRecordBatch 移到
+// Exec 之后（未提交）会让本用例 RED（幽灵事件：DB 没有、大屏有）。
+func TestSecurityEventsIngest_attackFlowAlignedWithCommitPoint(t *testing.T) {
+	installSecurityEventsAutobanFixture(t)
+	enableAttackFlowSampling(t)
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	offsetPath := filepath.Join(dir, "security_events.offset")
+	okDoc := securityEvents历史Fixture("tx-flow-ok", "203.0.113.61", "/flow-ok")
+	if err := os.WriteFile(logPath, []byte(okDoc+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	failDoc := securityEvents历史Fixture("tx-flow-fail", "203.0.113.62", "/flow-fail")
+
+	// 提交成功：恰好 1 条进环
+	tailer := securityEventsNewTailer(logPath, offsetPath)
+	if err := tailer.securityEventsTick(); err != nil {
+		t.Fatalf("first tick: %v", err)
+	}
+	events, _ := ThreatScreenAttackFlowSnapshot(0, 0)
+	if len(events) != 1 || events[0].ClientIP != "203.0.113.61" {
+		t.Fatalf("提交成功批次必须进环 1 条，got %+v", events)
+	}
+
+	// offset 重放（删除 offset 强制重放 → INSERT OR IGNORE 未插入）：不得重复进环
+	if err := os.Remove(offsetPath); err != nil {
+		t.Fatal(err)
+	}
+	replay := securityEventsNewTailer(logPath, offsetPath)
+	if err := replay.securityEventsTick(); err != nil {
+		t.Fatalf("replay tick: %v", err)
+	}
+	if events, _ := ThreatScreenAttackFlowSnapshot(0, 0); len(events) != 1 {
+		t.Fatalf("offset 重放不得重复进环，got %d 条", len(events))
+	}
+
+	// 触发器 ABORT：批次回滚 → 零进环（新增事件也不得出现）
+	if _, err := db.MetricsDB.Exec(`CREATE TRIGGER fail_security_events_flow BEFORE INSERT ON security_events BEGIN SELECT RAISE(ABORT,'injected failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, []byte(okDoc+"\n"+failDoc+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(offsetPath); err != nil {
+		t.Fatal(err)
+	}
+	failingTailer := securityEventsNewTailer(logPath, offsetPath)
+	if err := failingTailer.securityEventsTick(); err == nil {
+		t.Fatal("injected insert failure must surface as tick error")
+	}
+	events, _ = ThreatScreenAttackFlowSnapshot(0, 0)
+	if len(events) != 1 {
+		t.Fatalf("回滚批次必须零进环（幽灵事件），got %d 条: %+v", len(events), events)
+	}
+	for _, ev := range events {
+		if ev.ClientIP == "203.0.113.62" {
+			t.Fatalf("回滚批次事件进入光流: %+v", ev)
+		}
 	}
 }
 
@@ -4101,7 +4196,7 @@ func BenchmarkSecurityEventsLoadMappingsReferencedThreatList(b *testing.B) {
 		b.Run(fmt.Sprintf("mappings/policies=%d", policyCount), func(b *testing.B) {
 			oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 			dataDir := b.TempDir()
-			if err := db.Initialize(dataDir); err != nil {
+			if err := initSecurityEventsTestDB(b, dataDir); err != nil {
 				b.Fatal(err)
 			}
 			if err := db.InitializeMetricsDB(dataDir); err != nil {

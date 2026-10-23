@@ -217,13 +217,21 @@ func (m *ThreatUpdateManager) RunUpdate(trigger string, rc *taskengine.RunContex
 		return ErrThreatUpdateRunning
 	}
 	m.running = true
+	// 同族（家族收敛）：可取消 ctx 与 running 在同一临界区登记——生产入口
+	// 即本函数，解锁到管线执行之间不得留下「取消读不到本轮 ctx」的窗口
+	//（首次读到 nil=判不可取消；非首次读到上一轮陈旧 cancel=取消错轮）。
+	// StartUpdate（异步入口）同形。
+	runCtx, runCancel := context.WithCancel(updateRunBaseContext(rc))
+	m.runCancel = runCancel
 	m.mu.Unlock()
 	defer func() {
+		runCancel()
 		m.mu.Lock()
 		m.running = false
+		m.runCancel = nil
 		m.mu.Unlock()
 	}()
-	m.run(trigger, rc)
+	m.runWithContext(runCtx, trigger, rc)
 	// 失败终态回传引擎（镜像 crs/ip2region wire Run
 	// 体读 StatusSnapshot 判 failed 的口径）——恒返 nil 时引擎 task_runs 把
 	// 失败轮记成 success。
@@ -303,20 +311,8 @@ func threatListEmpty(source string) bool {
 	return threatIplistMissing(source) || threatFastUnusable(source)
 }
 
-// run 同步执行（测试/内部直调路径）：自建可取消 ctx 并登记 runCancel；
-// 生产入口经 StartUpdate 预建 ctx（同族——取消能力不得
-// 晚于 StartUpdate 返回才就绪）。
-func (m *ThreatUpdateManager) run(trigger string, rc *taskengine.RunContext) {
-	runCtx, runCancel := context.WithCancel(updateRunBaseContext(rc))
-	defer runCancel()
-	m.mu.Lock()
-	m.runCancel = runCancel
-	m.mu.Unlock()
-	m.runWithContext(runCtx, trigger, rc)
-}
-
-// runWithContext 是更新管线本体；runCtx 由调用方创建（StartUpdate 或 run），
-// 生命周期归还调用方。
+// runWithContext 是更新管线本体，runCtx 由调用方创建（StartUpdate 或
+// RunUpdate），生命周期归还调用方。
 func (m *ThreatUpdateManager) runWithContext(runCtx context.Context, trigger string, rc *taskengine.RunContext) {
 	operator := "system"
 	if rc != nil && rc.Operator != "" {

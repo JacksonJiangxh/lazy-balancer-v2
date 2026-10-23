@@ -3,6 +3,7 @@ package services
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -227,6 +228,56 @@ func TestScrapeRateLimitBlocks_singleFlight(t *testing.T) {
 	}
 	if got := hits.Load(); got != 1 {
 		t.Fatalf("并发抓取次数=%d, want 1（单飞未生效）", got)
+	}
+}
+
+// host 标签归一是「带端口部署的规则限流计数恒 0」的修复载体：metrics 的
+// host 是原文 r.Host（可能带 :port / IPv6 方括号），lb_rules.domain 不带端口。
+func TestNormalizeMetricsHost(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "empty", in: "", want: ""},
+		{name: "plain domain", in: "go029.com", want: "go029.com"},
+		{name: "uppercase", in: "A.COM", want: "a.com"},
+		{name: "surrounding spaces", in: " go029.com ", want: "go029.com"},
+		{name: "domain with port", in: "go029.com:8443", want: "go029.com"},
+		{name: "uppercase with port", in: "GO029.COM:8443", want: "go029.com"},
+		{name: "ipv6 with port", in: "[::1]:8443", want: "::1"},
+		{name: "bracketed ipv6", in: "[::1]", want: "::1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := NormalizeMetricsHost(tc.in); got != tc.want {
+				t.Fatalf("NormalizeMetricsHost(%q)=%q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// 指标响应超过 16MB 上限必须返回明确错误（fail-visible），不得静默返回空表——
+// 空表会让「限流拦截」卡片显示 0 而非「指标不可用」。
+func TestScrapeRateLimitBlocksRejectsOversizeBody(t *testing.T) {
+	resetOverviewMetricsCacheForTest()
+	t.Cleanup(resetOverviewMetricsCacheForTest)
+	oversize := make([]byte, overviewMetricsReadLimit+1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(oversize)
+	}))
+	t.Cleanup(server.Close)
+
+	blocks, err := ScrapeRateLimitBlocks(server.URL)
+
+	if err == nil {
+		t.Fatalf("超限响应必须报错，实际返回 blocks=%v", blocks)
+	}
+	if !strings.Contains(err.Error(), "上限") {
+		t.Fatalf("err=%v, want 明确的超限说明", err)
+	}
+	if blocks != nil {
+		t.Fatalf("超限不得返回部分数据: %v", blocks)
 	}
 }
 

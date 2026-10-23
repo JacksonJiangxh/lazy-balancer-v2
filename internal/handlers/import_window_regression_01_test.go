@@ -261,6 +261,8 @@ func TestRuleAndRawConfigWrites409DuringImport(t *testing.T) {
 	router.DELETE("/rules/:caddy_id", h.DeleteRule)
 	router.POST("/rules/:caddy_id/enable", h.EnableRule)
 	router.POST("/rules/:caddy_id/disable", h.DisableRule)
+	router.POST("/rules/:caddy_id/duplicate", h.DuplicateRule)
+	router.POST("/rules/batch-block-pages", h.BatchRuleBlockPages)
 	router.POST("/config/reload", h.ReloadCaddy)
 	router.POST("/config/validate", h.ValidateConfig)
 	router.PUT("/caddy/config", h.PutCaddyConfig)
@@ -274,6 +276,8 @@ func TestRuleAndRawConfigWrites409DuringImport(t *testing.T) {
 		{"DELETE", "/rules/lb_x", ""},
 		{"POST", "/rules/lb_x/enable", ""},
 		{"POST", "/rules/lb_x/disable", ""},
+		{"POST", "/rules/lb_x/duplicate", ""},
+		{"POST", "/rules/batch-block-pages", `{"rule_ids":["lb_x"],"block_page_stage1_id":0,"block_page_stage1_status":0}`},
 		{"POST", "/config/reload", ""},
 		{"POST", "/config/validate", `{}`},
 		{"PUT", "/caddy/config", `{"content":"{}"}`},

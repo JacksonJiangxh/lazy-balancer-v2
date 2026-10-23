@@ -218,12 +218,18 @@ const notify = () => emit('status', { enabled: enabled.value, configured: config
 // 「已启用/删除配置/暂停使用」，父级标签也被回填旧值）。catch 清空为未配置态
 // 并显性提示；保存门同时拦截，避免用户以「空表单」覆盖现有配置。
 const loadFailed = ref(false)
+// 读取回填的请求序号守卫（同族视图同口径：AuditLog/ClusterSettings/TaskMonitor）：
+// 快速重开弹框或保存后的 load 与旧 load 竞争时，旧响应晚到会把已保存的新值
+// 回滚成旧值显示，随后被误当作现存配置再次保存。
+let loadSeq = 0
 const load = async () => {
+  const seq = ++loadSeq
   invalidateProbe()
   loadFailed.value = false
   try {
     // silent——非管理员打开入口时 403 不弹全局 toast(入口按角色收口)
     const res = await request.get<{ data?: { enabled?: boolean; issuer?: string; client_id?: string; display_name?: string; has_secret?: boolean; allowed_email_domains?: string[]; allowed_groups?: string[] } }>('/settings/oidc', { silent: true })
+    if (seq !== loadSeq) return
     if (res.data) {
       enabled.value = !!res.data.enabled
       displayName.value = res.data.display_name || ''
@@ -238,6 +244,7 @@ const load = async () => {
       // load 开始已推进探测世代；响应回填的字段 watcher 会再次失效旧快照。
     }
   } catch {
+    if (seq !== loadSeq) return
     // 未配置/无权限/网络失败：一律回到「未配置」可见态（fail-visible）
     enabled.value = false
     displayName.value = ''
@@ -252,6 +259,7 @@ const load = async () => {
     lastTest.value = null
     loadFailed.value = true
   }
+  if (seq !== loadSeq) return
   notify()
 }
 

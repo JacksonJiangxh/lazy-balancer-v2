@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import {
   BACKUP_SECTIONS,
   LEGACY_SECTION_ALIASES,
+  importConfirmMessage,
   normalizeBackupSectionKeys,
 } from '../src/utils/backupSections.ts'
 import { repoSource, section, source } from './_helpers.ts'
@@ -134,4 +135,67 @@ test('导出/自动备份默认全选四分类，恢复路径必经归一', () =
   assert.match(loadBlock, /normalizeBackupSectionKeys\(d\.sections\)/)
   const labelBlock = section(page, 'const labels = normalizeBackupSectionKeys', '.map((k) => BACKUP_SECTIONS.find')
   assert.match(labelBlock, /row\.sections \|\| \[\]/)
+})
+
+// 纯 JSON（v3）的体内 sections 参与校验和：分类选择必须经 ?sections= query，
+// 请求体保持原始字节，否则 UI 默认全选注入会被判「已篡改」，导入彻底不可达。
+test('分类选择统一走 query，纯 JSON 请求体不被改写', () => {
+  const previewBody = section(page, 'const postImportValidation', 'const revalidateImport')
+  assert.ok(previewBody.includes('?sections='), '预览必须携带 sections query')
+  assert.ok(!previewBody.includes('parsed.sections'), '预览不得改写体内 sections')
+  assert.ok(!previewBody.includes('JSON.parse'), '预览不得为注入 sections 重新序列化请求体')
+
+  const importBody = section(page, 'const confirmImport', "const DEFAULT_GITHUB_PROXY_URL")
+  assert.ok(importBody.includes('?sections='), '导入必须携带 sections query')
+  assert.ok(!importBody.includes('parsed.sections'), '导入不得改写体内 sections')
+})
+
+// 自动备份还原与导入同口径：冲突自动禁用的规则必须出现在结果弹框里，
+// 否则「还原成功」后流量静默切走。
+test('自动备份还原结果展示冲突自动禁用明细', () => {
+  const body = section(page, 'const restoreAutoBackup', 'const deleteAutoBackup')
+  assert.ok(body.includes('disabled_conflicts'), '还原必须读取 data.disabled_conflicts')
+  assert.ok(body.includes('formatImportConflict'), '冲突明细必须复用 formatImportConflict')
+  assert.match(body, /冲突置为禁用/)
+  assert.match(body, /formatImportConflict\(conflict, true\)/, '还原路径的冲突文案须用已禁用时态')
+})
+
+// V1 备份按后端契约只导入规则部分；此前最终确认框沿用「覆盖当前全部配置」
+// ——与同一弹框的预览文案自相矛盾，会让人误判破坏范围。
+test('导入最终确认文案按备份类型单源：V1 不宣称全量，V2 全量含节点拓扑', () => {
+  const v1 = importConfirmMessage('v1', ['rules'])
+  assert.match(v1, /全部负载均衡规则及其安全策略绑定/)
+  assert.match(v1, /保持不变/)
+  assert.doesNotMatch(v1, /节点拓扑|全部凭证/, 'V1 不得宣称覆盖节点拓扑或全部凭证')
+
+  const full = importConfirmMessage('v2', BACKUP_SECTIONS.map((s) => s.key))
+  assert.match(full, /节点拓扑/, 'V2 全量必须与预览一致地包含节点拓扑')
+  assert.match(full, /全部凭证/)
+
+  const partial = importConfirmMessage('v2', ['rules', 'security'])
+  assert.match(partial, /仅覆盖所选分类：负载规则、安全防护/)
+  assert.match(partial, /未选分类保持现状/)
+
+  const body = section(page, 'const confirmImport', 'const DEFAULT_GITHUB_PROXY_URL')
+  assert.match(body, /importConfirmMessage\(validation\.type, importSections\.value\)/, '视图必须消费单源文案')
+  assert.doesNotMatch(body, /isFullImport/, '不得保留第二套覆盖面判断')
+})
+
+// 日志端点失败时此前只写 console，模板继续渲染「暂无日志」——排障最需要日志
+// 的时刻给出「没有日志」的错误结论。
+test('应用运行日志失败显性化：错误提示 + 空态文案切换 + 成功/关闭复位', () => {
+  const dialog = section(page, 'v-model="appLogVisible"', '</el-dialog>')
+  assert.match(dialog, /<el-text v-if="appLogError"[^>]*>日志加载失败，自动重试中/)
+  assert.match(dialog, /\{\{ appLogContent \|\| appLogEmptyText \}\}/)
+  assert.doesNotMatch(dialog, /\{\{ appLogContent \|\| '暂无日志' \}\}/, '失败态不得继续显示「暂无日志」')
+  assert.match(page, /const appLogEmptyText = computed\(\(\) => appLogError\.value \? '日志加载失败（自动重试中）' : '暂无日志'\)/)
+
+  const tail = section(page, 'const appLogTail = useLogTailPolling', 'const appLogLoading')
+  assert.match(tail, /appLogError\.value = false/, '任一成功响应必须清除错误态')
+  assert.match(tail, /onError:[\s\S]*?appLogError\.value = true/, '失败必须置位错误态')
+
+  const closed = section(page, 'const onAppLogClosed', 'watch(appLogAutoRefresh')
+  assert.match(closed, /appLogError\.value = false/, '关闭弹框复位')
+  const opened = section(page, 'const openAppLogDialog', 'const onAppLogOpened')
+  assert.match(opened, /appLogError\.value = false/, '重开弹框复位')
 })

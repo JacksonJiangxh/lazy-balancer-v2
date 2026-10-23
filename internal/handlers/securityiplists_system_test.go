@@ -57,8 +57,11 @@ func TestIPListWritePaths_rejectSystemLists(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	resp := httptest.NewRecorder()
 	router.ServeHTTP(resp, req)
-	if resp.Code == http.StatusOK {
-		t.Fatalf("占用内置名单名新建不得成功: %s", resp.Body.String())
+	if resp.Code != http.StatusConflict {
+		t.Fatalf("占用内置名单名新建 status=%d body=%s, want 409（不得以 500/404 冒充拒绝）", resp.Code, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), "保留") {
+		t.Fatalf("占用内置名单名新建 body=%s, want 点名「保留」的提示文案", resp.Body.String())
 	}
 
 	// 回归形状：普通列表照常可写

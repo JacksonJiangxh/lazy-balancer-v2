@@ -27,6 +27,13 @@ type CrawlerEngine struct {
 	Name string
 	// UARegex 匹配（预编译，大小写不敏感）。
 	UARegex *regexp.Regexp
+	// SpoofUARegex 是「伪装证据」的 UA 加严门：UA 只命中宽标记（厂商品牌串/
+	// 对话式标记，如裸 DeepSeek、ChatGPT-User）不足以单独判定伪装——这类
+	// 标记会出现在普通浏览器或第三方工具 UA 里，据此发射伪装头会制造大量
+	// 伪安全事件。Spoof 结论只有在 UA 同时命中本门时才作为证据（Verified
+	// 路径不受影响：PTR 双跳已自证）。nil = 该引擎的 UA 标记本身就是厂商
+	// 专有爬虫 token，无需加严。不变量：非 nil 时必须 ⊆ UARegex 的匹配面。
+	SpoofUARegex *regexp.Regexp
 	// VerifyMethod 验证方式：ptr（默认，双跳反查）/ iprange（官方声明
 	// 不支持 nslookup 的厂商，如 360，用官方公布 IP 段）。
 	VerifyMethod string
@@ -110,18 +117,26 @@ var crawlerEngines = []CrawlerEngine{
 		Name:        "OpenAI（GPTBot/OAI-SearchBot）",
 		UARegex:     regexp.MustCompile(`(?i)GPTBot|OAI-SearchBot|ChatGPT-User`),
 		PTRSuffixes: []string{".openai.com"},
+		// ChatGPT-User 是对话式标记（用户触发的浏览请求），不是爬虫出口
+		// 自证；伪装证据只认官方爬虫 token。
+		SpoofUARegex: regexp.MustCompile(`(?i)GPTBot|OAI-SearchBot`),
 	},
 	{
 		ID:          "deepseekbot",
 		Name:        "DeepSeek（观察级，无官方爬虫页）",
 		UARegex:     regexp.MustCompile(`(?i)DeepSeekBot|DeepSeek`),
 		PTRSuffixes: []string{".deepseek.com"},
+		// 裸品牌串 DeepSeek 出现在普通 UA 中不构成伪装证据。
+		SpoofUARegex: regexp.MustCompile(`(?i)DeepSeekBot`),
 	},
 	{
 		ID:          "claudebot",
 		Name:        "Anthropic Claude",
 		UARegex:     regexp.MustCompile(`(?i)ClaudeBot|Claude-SearchBot|Claude-User|Claude-Web|anthropic-ai`),
 		PTRSuffixes: []string{".anthropic.com", ".claude.ai"},
+		// Claude-Web 已停用、anthropic-ai 是通用 SDK/库标记：仅作 UA 匹配面
+		// （Verified 路径不受影响），伪装证据只认现行官方爬虫 token。
+		SpoofUARegex: regexp.MustCompile(`(?i)ClaudeBot|Claude-SearchBot|Claude-User`),
 	},
 	{
 		ID:          "perplexitybot",
@@ -141,6 +156,23 @@ var crawlerEngines = []CrawlerEngine{
 		UARegex:     regexp.MustCompile(`(?i)Bytespider`),
 		PTRSuffixes: []string{".byted.org", ".bytedance.com"},
 	},
+}
+
+// CrawlerSpoofEvidence 判定 Spoof 结论能否作为伪装证据发射：引擎已注册加严门
+// 时，UA 还必须命中该门（宽品牌标记/对话式标记单独命中不算证据）；未注册
+// 加严门的引擎（UA 标记本身即厂商专有爬虫 token）恒为证据。未知引擎返回
+// false——调用方只在 MatchCrawlerEngine 命中后询问，未知值表示调用方传错。
+func CrawlerSpoofEvidence(engineID, userAgent string) bool {
+	for _, e := range crawlerEngines {
+		if e.ID != engineID {
+			continue
+		}
+		if e.SpoofUARegex == nil {
+			return true
+		}
+		return e.SpoofUARegex.MatchString(userAgent)
+	}
+	return false
 }
 
 // CrawlerEngines 返回引擎注册表的**深拷贝**（防调用方篡改全局）：结构体与

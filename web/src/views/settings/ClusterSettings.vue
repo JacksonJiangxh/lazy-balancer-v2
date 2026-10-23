@@ -181,6 +181,7 @@ import { useAuthStore } from '@/stores/auth'
 import { request, mfaAwareSuccess } from '@/utils/api'
 import { copyText } from '@/utils/copy'
 import { CLUSTER_SYNC_SWITCHES } from '@/utils/clusterSyncSwitches'
+import { clusterWriteBlocked } from '@/utils/clusterWriteGate'
 import { formatDate } from '@/utils/date'
 import type {
   APIResponse,
@@ -333,13 +334,14 @@ const forgetNodePin = async (): Promise<void> => {
   }
 }
 const registerToken = ref<ClusterRegisterToken | null>(null)
-// readOnlyReason 为 unknown（token 有效但 /users/me 尚未拉取成功）时同样
-// fail-closed——集群操作在该窗口期按只读呈现。slave 除外照旧：从节点管理员仍可
-// 操作集群管理（含「提升为主节点」），不随本项收紧。
-const isReadOnlyProp = computed(() => {
-  const reason = authStore.readOnlyReason
-  return reason === 'non-admin' || reason === 'unknown'
-})
+// 写门单源在 utils/clusterWriteGate（角色独立参与）：stores/auth 的
+// readOnlyReason 先判节点模式，从节点上任何角色都只得到 'slave'——只按 reason
+// 集合判会漏掉「从节点 + 非管理员」，把破坏性按钮呈现为可写（点击 403）。
+// unknown（信息未就绪）fail-closed；从节点 admin 仍可操作集群管理。
+const isReadOnlyProp = computed(() => clusterWriteBlocked({
+  readOnlyReason: authStore.readOnlyReason,
+  role: authStore.user?.role,
+}))
 const clusterModeChanging = computed(() => syncing.value || promoting.value || modeLoading.value)
 const fetchStatus = async (roundSignal?: AbortSignal): Promise<ClusterStatus> => {
   const requestSeq = ++requestSequence

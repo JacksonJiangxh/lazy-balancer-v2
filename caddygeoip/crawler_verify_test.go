@@ -257,6 +257,12 @@ func TestVerifyCrawler_cacheCapacityPruneWorkBounded(t *testing.T) {
 	}
 }
 
+// ipRangeVerified 把生产入口的三态结论投影成布尔（测试侧 helper，不新增
+// 生产包装函数）：仅 Verified 视为段命中。
+func ipRangeVerified(ipStr, engineID string) bool {
+	return verifyCrawlerIPRangeVerdict(ipStr, engineID) == CrawlerVerdictVerified
+}
+
 func TestVerifyCrawlerIPRangeFromList_jsonPerEngine(t *testing.T) {
 	// Given：按引擎隔离的快照 JSON（与 root 服务 writeCrawlerIPListSnapshotAll 同形）
 	oldFile := crawlerIPListFile
@@ -268,10 +274,10 @@ func TestVerifyCrawlerIPRangeFromList_jsonPerEngine(t *testing.T) {
 	ResetCrawlerVerifyCacheForTest(nil)
 
 	// When / Then：360 命中只认 360 源，不得混用 Google 段
-	if !verifyCrawlerIPRangeFromList("42.236.8.1", "so360spider") {
+	if !ipRangeVerified("42.236.8.1", "so360spider") {
 		t.Fatal("360 官方段应命中 iprange")
 	}
-	if verifyCrawlerIPRangeFromList("42.236.8.1", "googlebot") {
+	if ipRangeVerified("42.236.8.1", "googlebot") {
 		t.Fatal("360 段不得串入 Googlebot 命中")
 	}
 }
@@ -305,14 +311,14 @@ func TestCrawlerIPRangeList_precompiledAndFailureThrottled(t *testing.T) {
 	resetCrawlerIPRangeCacheForTest()
 
 	// 缺失快照：fail-closed，且失败也写节流时间戳。
-	if verifyCrawlerIPRangeFromList("66.249.66.1", "googlebot") {
+	if ipRangeVerified("66.249.66.1", "googlebot") {
 		t.Fatal("missing snapshot must fail closed")
 	}
 	if err := os.WriteFile(crawlerIPListFile, []byte(`{"googlebot":["66.249.66.0/24"]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	// 失败节流期内不重读（旧实现在失败路径不写时间戳，会立即重读）。
-	if verifyCrawlerIPRangeFromList("66.249.66.1", "googlebot") {
+	if ipRangeVerified("66.249.66.1", "googlebot") {
 		t.Fatal("failure must be throttled for the retry interval")
 	}
 	// 失败只按短重试间隔节流（旧实现缓存满 10min，冷装窗口 360
@@ -320,7 +326,7 @@ func TestCrawlerIPRangeList_precompiledAndFailureThrottled(t *testing.T) {
 	crawlerFileCacheMu.Lock()
 	crawlerFileCacheSnap.loadedAt = time.Now().Add(-2 * time.Minute)
 	crawlerFileCacheMu.Unlock()
-	if !verifyCrawlerIPRangeFromList("66.249.66.1", "googlebot") {
+	if !ipRangeVerified("66.249.66.1", "googlebot") {
 		t.Fatal("snapshot reload must match the configured prefix")
 	}
 	crawlerFileCacheMu.Lock()
@@ -333,11 +339,11 @@ func TestCrawlerIPRangeList_precompiledAndFailureThrottled(t *testing.T) {
 	crawlerFileCacheMu.Lock()
 	crawlerFileCacheSnap.loadedAt = time.Now().Add(-2 * time.Minute)
 	crawlerFileCacheMu.Unlock()
-	if !verifyCrawlerIPRangeFromList("66.249.66.1", "googlebot") {
+	if !ipRangeVerified("66.249.66.1", "googlebot") {
 		t.Fatal("successful snapshot must stay cached until the reload interval")
 	}
 	// 回归形状：段外地址不命中。
-	if verifyCrawlerIPRangeFromList("66.249.67.1", "googlebot") {
+	if ipRangeVerified("66.249.67.1", "googlebot") {
 		t.Fatal("address outside the prefix must not match")
 	}
 }
@@ -351,11 +357,11 @@ func TestVerifyCrawlerIPRange_invalidAddrNoPanic(t *testing.T) {
 	}
 	resetCrawlerIPRangeCacheForTest()
 	for _, bad := range []string{"@", "not-an-addr", ""} {
-		if verifyCrawlerIPRangeFromList(bad, "so360spider") {
+		if ipRangeVerified(bad, "so360spider") {
 			t.Fatalf("invalid address %q must not match", bad)
 		}
 	}
-	if !verifyCrawlerIPRangeFromList("140.0.0.1", "so360spider") {
+	if !ipRangeVerified("140.0.0.1", "so360spider") {
 		t.Fatal("valid address regression: expected match")
 	}
 }
@@ -405,19 +411,19 @@ func TestVerifyCrawlerIPRange_v4MappedAndZoneNormalized(t *testing.T) {
 
 	// 目标形状：4in6 映射形态命中 v4 段（Unmap 归一；旧实现 netip v4 前缀
 	// 不含 4in6 地址，恒不命中 → 真爬虫被误判为伪装）。
-	if !verifyCrawlerIPRangeFromList("::ffff:42.236.8.1", "so360spider") {
+	if !ipRangeVerified("::ffff:42.236.8.1", "so360spider") {
 		t.Fatal("4in6 映射形态应命中 v4 官方段（Unmap 归一）")
 	}
 	// 回归形状 1：映射形态但段外 → fail-closed。
-	if verifyCrawlerIPRangeFromList("::ffff:42.236.16.1", "so360spider") {
+	if ipRangeVerified("::ffff:42.236.16.1", "so360spider") {
 		t.Fatal("映射形态段外地址不得命中")
 	}
 	// 回归形状 2：原生 v6 命中 v6 段不受影响。
-	if !verifyCrawlerIPRangeFromList("2408:4000::1", "so360spider") {
+	if !ipRangeVerified("2408:4000::1", "so360spider") {
 		t.Fatal("原生 v6 段内地址应命中")
 	}
 	// 畸形形状：带 zone 地址 fail-closed。
-	if verifyCrawlerIPRangeFromList("2408:4000::1%eth0", "so360spider") {
+	if ipRangeVerified("2408:4000::1%eth0", "so360spider") {
 		t.Fatal("带 zone 地址必须 fail-closed")
 	}
 }
@@ -447,7 +453,7 @@ func TestCrawlerIPRangeSnapshot_sizeGateAndBadCIDRs(t *testing.T) {
 		if len(snap.prefixes) != 0 {
 			t.Fatalf("超限文件不得产出豁免段: %v", snap.prefixes)
 		}
-		if verifyCrawlerIPRangeFromList("42.236.8.1", "so360spider") {
+		if ipRangeVerified("42.236.8.1", "so360spider") {
 			t.Fatal("超限快照下必须 fail-closed（段内地址也不得豁免）")
 		}
 	})
@@ -467,7 +473,7 @@ func TestCrawlerIPRangeSnapshot_sizeGateAndBadCIDRs(t *testing.T) {
 		if got := len(snap.prefixes["so360spider"]); got != 1 {
 			t.Fatalf("有效段=%d, want 1（坏条目逐条跳过）", got)
 		}
-		if !verifyCrawlerIPRangeFromList("42.236.8.1", "so360spider") {
+		if !ipRangeVerified("42.236.8.1", "so360spider") {
 			t.Fatal("有效段必须仍可命中")
 		}
 	})
@@ -586,7 +592,7 @@ func TestProvision_appliesCrawlerIPListFileAndResetsSnapshot(t *testing.T) {
 	}
 	setCrawlerIPListFilePath(oldPath)
 	resetCrawlerIPRangeCacheForTest()
-	if !verifyCrawlerIPRangeFromList("140.0.0.1", "so360spider") {
+	if !ipRangeVerified("140.0.0.1", "so360spider") {
 		t.Fatal("旧路径快照应命中（前置条件）")
 	}
 
@@ -604,10 +610,10 @@ func TestProvision_appliesCrawlerIPListFileAndResetsSnapshot(t *testing.T) {
 	if got := crawlerIPListFilePath(); got != newPath {
 		t.Fatalf("crawlerIPListFile=%q, want %q", got, newPath)
 	}
-	if !verifyCrawlerIPRangeFromList("42.236.8.1", "so360spider") {
+	if !ipRangeVerified("42.236.8.1", "so360spider") {
 		t.Fatal("Provision 后应按新路径快照判定（新名单命中）")
 	}
-	if verifyCrawlerIPRangeFromList("140.0.0.1", "so360spider") {
+	if ipRangeVerified("140.0.0.1", "so360spider") {
 		t.Fatal("路径切换必须重置快照缓存——旧路径名单不得继续服役")
 	}
 }

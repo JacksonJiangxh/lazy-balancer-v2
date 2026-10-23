@@ -66,7 +66,7 @@ func TestUpdateIP2RegionAutoUpdate_togglesFlag(t *testing.T) {
 	// When auto update is enabled
 	recorder := putJSON(t, router, "/security/ip2region/auto-update", map[string]any{"auto_update": true})
 
-	// Then the flag is persisted
+	// Then the flag is persisted and the info endpoint echoes it
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
@@ -76,6 +76,39 @@ func TestUpdateIP2RegionAutoUpdate_togglesFlag(t *testing.T) {
 	}
 	if !autoUpdate {
 		t.Fatal("auto_update should be true after PUT")
+	}
+	autoUpdateInfo := func() bool {
+		info := getRequest(t, router, "/security/ip2region")
+		if info.Code != http.StatusOK {
+			t.Fatalf("info status=%d body=%s", info.Code, info.Body.String())
+		}
+		var resp struct {
+			Data struct {
+				AutoUpdate bool `json:"auto_update"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(info.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("parse info response: %v", err)
+		}
+		return resp.Data.AutoUpdate
+	}
+	if !autoUpdateInfo() {
+		t.Fatal("GET /security/ip2region auto_update=false after enabling, want true（回读必须与库值一致）")
+	}
+
+	// And 关闭后库与回读同口径为 false（只测开启方向会漏掉「恒 true」的漂移）
+	recorder = putJSON(t, router, "/security/ip2region/auto-update", map[string]any{"auto_update": false})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("disable status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if err := db.DB.QueryRow("SELECT auto_update FROM security_ip2region_version WHERE id=1").Scan(&autoUpdate); err != nil {
+		t.Fatal(err)
+	}
+	if autoUpdate {
+		t.Fatal("auto_update should be false after disabling")
+	}
+	if autoUpdateInfo() {
+		t.Fatal("GET /security/ip2region auto_update=true after disabling, want false")
 	}
 }
 

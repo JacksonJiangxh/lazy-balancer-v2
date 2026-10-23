@@ -42,20 +42,42 @@ func waitTaskRun(t *testing.T, taskID string) {
 	t.Fatalf("task_runs 3s 内未落行（task_id=%s）——手动触发未经引擎", taskID)
 }
 
-// Given 主节点+引擎在场（manager 未初始化——引擎 Run 体对 nil manager no-op 成功）。
+// waitTaskRunManualSuccess 等最新一条 task_runs 落定为 manual/success。
+func waitTaskRunManualSuccess(t *testing.T, taskID string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	var trigger, status string
+	for time.Now().Before(deadline) {
+		trigger, status = "", ""
+		err := db.DB.QueryRow(`SELECT COALESCE(trigger,''), COALESCE(status,'') FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1`, taskID).Scan(&trigger, &status)
+		if err == nil && trigger == "manual" && status == "success" {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("task_runs(task_id=%s) 未在 3s 内落定 manual/success（trigger=%q status=%q）——手动触发未经引擎或任务体失败", taskID, trigger, status)
+}
+
+// Given 引擎在场且三库任务注册为**成功桩**。
 // When 调三个更新端点。
-// Then 200 running 且 task_runs 落行（trigger=manual）——现实现 500+零行（RED）。
+// Then 200 running 且 task_runs 落 trigger=manual + status=success（只数行数
+// 无法区分「引擎记录了口径」与「任务体失败但留了一行」）。
 func TestSecurityUpdateEndpoints_scheduleViaEngine(t *testing.T) {
-	initTaskEngineForTest(t)
 	newBackupTestHandlers(t)
-	services.ResetCRSUpdateManagerForTest()
-	services.ResetIP2RegionUpdateManagerForTest()
-	services.ClearThreatUpdateManagerForTest()
-	t.Cleanup(func() {
-		services.ResetCRSUpdateManagerForTest()
-		services.ResetIP2RegionUpdateManagerForTest()
-		services.ClearThreatUpdateManagerForTest()
-	})
+	services.StopTaskEngine()
+	te := taskengine.NewEngine(taskengine.Options{TickInterval: time.Hour})
+	services.SetTaskEngineForTest(te)
+	t.Cleanup(services.StopTaskEngine)
+	for _, id := range []string{"crs", "ip2region", "threat"} {
+		if err := te.Register(taskengine.Descriptor{
+			ID: id, Family: "security", Name: "更新任务（成功桩）", Category: "安全防护",
+			Kind: taskengine.KindScheduled, RunsOn: taskengine.RoleMasterOnly,
+			NextSlotFn: func() time.Time { return time.Now().Add(24 * time.Hour) }, // 未来槽——调度器不自动点火
+			Run:        func(taskengine.RunContext) error { return nil },
+		}); err != nil {
+			t.Fatalf("register %s: %v", id, err)
+		}
+	}
 
 	gin.SetMode(gin.TestMode)
 	h := &Handlers{}
@@ -78,7 +100,7 @@ func TestSecurityUpdateEndpoints_scheduleViaEngine(t *testing.T) {
 		if resp.Code != http.StatusOK {
 			t.Fatalf("%s 应 200（经引擎触发）, got %d %s", tc.path, resp.Code, resp.Body.String())
 		}
-		waitTaskRun(t, tc.taskID)
+		waitTaskRunManualSuccess(t, tc.taskID)
 	}
 }
 

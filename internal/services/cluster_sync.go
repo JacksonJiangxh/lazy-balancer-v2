@@ -952,7 +952,11 @@ func (s *SyncService) Pull(ctx context.Context) (result SyncResult, err error) {
 			// 上一轮应用已提交但 Caddy 重载失败：运行配置与库数据不一致，
 			// 需要全量重拉以补偿重试（不能靠 304 跳过期瞒）。
 			var lastSyncErr string
-			if err := s.db.QueryRowContext(ctx, "SELECT COALESCE(last_sync_error,'') FROM global_config WHERE id=1").Scan(&lastSyncErr); err == nil {
+			if err := s.db.QueryRowContext(ctx, "SELECT COALESCE(last_sync_error,'') FROM global_config WHERE id=1").Scan(&lastSyncErr); err != nil {
+				// 读失败=标记存在性未知：本轮无法判定是否需要补偿重拉，但下一
+				// 周期/重启会重试；留痕避免补偿通道静默失明。
+				Logf("warn", "读取 last_sync_error 失败（304 补偿重拉判定已跳过）: %v", err)
+			} else {
 				if msg, _ := decodeSyncError(lastSyncErr); syncPostCommitMarkerPrefix(msg) != "" {
 					// 补偿重拉节流（与 WAF 兜底重拉同款）——
 					// 持续失败 5 轮后降频为每 10 轮一次，避免后置副作用持续
@@ -1211,7 +1215,13 @@ func (s *SyncService) trackWafRepullConvergence(ctx context.Context) bool {
 //	→ 只保留标记段，标记的补偿重拉语义不受影响。
 func (s *SyncService) clearWafRepullFailureMessage(ctx context.Context) {
 	var stored string
-	if err := s.db.QueryRowContext(context.WithoutCancel(ctx), "SELECT COALESCE(last_sync_error,'') FROM global_config WHERE id=1").Scan(&stored); err != nil || stored == "" {
+	if err := s.db.QueryRowContext(context.WithoutCancel(ctx), "SELECT COALESCE(last_sync_error,'') FROM global_config WHERE id=1").Scan(&stored); err != nil {
+		// 读失败=无法判定文案形态：本轮跳过清理（方向安全），留痕避免自愈
+		// 文案永久残留却无信号。
+		Logf("warn", "读取 last_sync_error 失败（WAF 专项文案清理已跳过）: %v", err)
+		return
+	}
+	if stored == "" {
 		return
 	}
 	msg, _ := decodeSyncError(stored)
@@ -1233,6 +1243,9 @@ func (s *SyncService) clearWafRepullFailureMessage(ctx context.Context) {
 func (s *SyncService) trackReloadRepullConvergence(ctx context.Context) {
 	var lastSyncErr string
 	if err := s.db.QueryRowContext(ctx, "SELECT COALESCE(last_sync_error,'') FROM global_config WHERE id=1").Scan(&lastSyncErr); err != nil {
+		// 读失败=收敛判定未知：计数器不复位（方向安全），但必须留痕，否则
+		// 「持续失败降频」的复位通道静默失明。
+		Logf("warn", "读取 last_sync_error 失败（补偿重拉计数复位已跳过）: %v", err)
 		return
 	}
 	if msg, _ := decodeSyncError(lastSyncErr); !strings.HasPrefix(msg, syncReloadFailureMarkerPrefix) {
@@ -1460,19 +1473,36 @@ func syncPostCommitMarkerPrefix(message string) string {
 	return ""
 }
 
-// syncMarkerPresent 报告 last_sync_error 是否携带指定后置副作用标记。
-// （cluster 审计同证）：读侧用 WithoutCancel——Stop 的
-// cancel 在 apply 提交与 defer 检查之间到达时，可取消 ctx 会读失败 → 成功清除
-// defer 误判「标记不存在」→ 跳过清除 → 标记存活（正确语义）；但若标记刚被
-// persistSyncError（WithoutCancel）写入，可取消读也会失败 → 误删刚写的标记。
-// 与写侧（persistSyncError WithoutCancel）对齐。
-func (s *SyncService) syncMarkerPresent(ctx context.Context, prefix string) bool {
+// syncMarkerState 是 last_sync_error 标记的三态读取结果：present=携带指定
+// 前缀；known=false 表示读取失败（存在性未知，不等于「不存在」）。
+type syncMarkerState struct {
+	present bool
+	known   bool
+}
+
+// readSyncMarkerState 读取 last_sync_error 并判定其后置副作用标记前缀。
+// 读侧用 WithoutCancel——Stop 的 cancel 在 apply 提交与 defer 检查之间到达时，
+// 可取消 ctx 会读失败；与写侧（persistSyncError WithoutCancel）对齐后，
+// 「刚写入即被误判不存在」的窗口也一并关闭。
+// 读失败必须与「标记不存在」区分：把未知当不存在会让调用方执行清空/覆盖写，
+// 静默销毁 304 补偿重拉的唯一触发器——此后主节点无新变更时恒 304，
+// 「库=新版本、Caddy=旧运行配置」的分叉存活到下次真实变更或重启。
+func (s *SyncService) readSyncMarkerState(ctx context.Context, prefix string) syncMarkerState {
 	var stored string
 	if err := s.db.QueryRowContext(context.WithoutCancel(ctx), "SELECT COALESCE(last_sync_error,'') FROM global_config WHERE id=1").Scan(&stored); err != nil {
-		return false
+		Logf("warn", "读取 last_sync_error 标记失败（%s）：存在性未知，按存在处理: %v", prefix, err)
+		return syncMarkerState{known: false}
 	}
 	msg, _ := decodeSyncError(stored)
-	return strings.HasPrefix(msg, prefix)
+	return syncMarkerState{present: strings.HasPrefix(msg, prefix), known: true}
+}
+
+// syncMarkerPresent 报告 last_sync_error 是否携带指定后置副作用标记。
+// 读失败时按「存在」返回（fail-closed）：调用方据此跳过清空/覆盖，宁可让
+// 标记消息暂不刷新，也不冒静默销毁补偿触发器的风险。
+func (s *SyncService) syncMarkerPresent(ctx context.Context, prefix string) bool {
+	st := s.readSyncMarkerState(ctx, prefix)
+	return st.present || !st.known
 }
 
 // syncReloadFailureMarkerPresent 报告 last_sync_error 当前是否携带重载失败标记。
@@ -1557,13 +1587,17 @@ func (s *SyncService) combineOrReplaceSyncError(ctx context.Context, message str
 		var stored string
 		// 新2:读侧 WithoutCancel(与:1043 syncReloadFailureMarkerPresent
 		// 同口径)——可取消读在 Stop cancel 落窗时失败,误跳过组合使标记被覆盖。
-		if err := s.db.QueryRowContext(context.WithoutCancel(ctx), "SELECT COALESCE(last_sync_error,'') FROM global_config WHERE id=1").Scan(&stored); err == nil {
-			// 自愈类错误不得覆盖重载失败标记：标记是全量重拉补偿的唯一触发器，
-			// 覆盖后下一周期 304 将跳过补偿，陈旧运行配置保持到下次真实变更。
-			// 组合只保留首个失败原因 + 计数。
-			if storedMsg, _ := decodeSyncError(stored); syncPostCommitMarkerPrefix(storedMsg) != "" {
-				message = combineSyncErrorWithMarker(storedMsg, message)
-			}
+		if err := s.db.QueryRowContext(context.WithoutCancel(ctx), "SELECT COALESCE(last_sync_error,'') FROM global_config WHERE id=1").Scan(&stored); err != nil {
+			// 读失败=标记存在性未知：跳过覆盖（fail-closed）。否则可能把仍存活
+			// 的后置副作用标记替换成普通错误消息，304 补偿通道随即失明。
+			Logf("warn", "读取 last_sync_error 失败（跳过覆盖以保留可能存在的后置副作用标记）: %v", err)
+			return
+		}
+		// 自愈类错误不得覆盖重载失败标记：标记是全量重拉补偿的唯一触发器，
+		// 覆盖后下一周期 304 将跳过补偿，陈旧运行配置保持到下次真实变更。
+		// 组合只保留首个失败原因 + 计数。
+		if storedMsg, _ := decodeSyncError(stored); syncPostCommitMarkerPrefix(storedMsg) != "" {
+			message = combineSyncErrorWithMarker(storedMsg, message)
 		}
 	}
 	s.persistSyncError(ctx, message, code)
@@ -1972,21 +2006,34 @@ func (s *SyncService) pollRegistration(ctx context.Context) {
 		confirm.Header.Set("X-Cluster-Token", envelope.Data.ClusterToken)
 		confirmed, err := s.do(confirm)
 		if err != nil {
-			s.bumpRegistrationConfirmFailure(ctx, envelope.Data.ClusterToken, "confirm 端点网络错误: "+err.Error())
+			// 网络错误是暂时性故障：可重试、不得推进终止计数、不得清注册态。
+			// 终止轨道只服务于凭证类拒绝（主节点明确不认这份令牌/节点行），
+			// 否则主节点瞬时不可达就会摧毁仍然有效的集群令牌。
+			s.combineOrReplaceSyncError(ctx, "集群注册确认暂时失败（网络错误），稍后自动重试: "+err.Error(), models.SyncErrorCodeTransportError)
 			return
 		}
 		defer confirmed.Body.Close()
 		// 历史 移除 404/405 fallback 兼容（v2.0.9+ 主节点均支持 confirm 端点）。
-		// 任何 4xx/5xx 不再静默重试。累计失败达到上限后停止注册循环，
-		// 持久化错误并提示用户人工处理（在 UI 重新注册或提升为主节点）。
+		// 只有凭证类拒绝（401 令牌无效/404 节点不存在/410 节点已移除）才推进
+		// 5 连败终止轨道；403（目标降级）、409（导入窗口）、5xx（主节点暂时
+		// 不可用）与网络错误一律可重试且不清任何注册态——confirm 仅是冗余交付
+		// 确认（令牌在审批时刻即有效），暂时性拒绝不应具备摧毁注册态的能力。
 		if confirmed.StatusCode >= http.StatusBadRequest {
 			// 与模式一致——200B 截断 + UTF-8 边界回退，
 			// 确保 confirm 失败原因落入 last_sync_error 后不超过 512B 有界设计。
 			body, _ := io.ReadAll(io.LimitReader(confirmed.Body, 200))
 			body = truncateValidUTF8Tail(body)
-			s.bumpRegistrationConfirmFailure(ctx, envelope.Data.ClusterToken,
-				fmt.Sprintf("confirm 端点返回 %d（%s）。主节点可能版本过旧或 confirm 端点异常，请在集群管理页面重新注册或提升为主节点",
-					confirmed.StatusCode, strings.TrimSpace(string(body))))
+			if !registrationConfirmTerminal(confirmed.StatusCode) {
+				message := fmt.Sprintf("集群注册确认暂时受阻（HTTP %d）：%s。主节点可能正在导入配置或角色翻转，稍后自动重试",
+					confirmed.StatusCode, strings.TrimSpace(string(body)))
+				s.combineOrReplaceSyncError(ctx, message, models.SyncErrorCodeTransportError)
+				return
+			}
+			reason := fmt.Sprintf("confirm 端点返回 %d（%s）。主节点可能版本过旧或 confirm 端点异常，请在集群管理页面重新注册或提升为主节点",
+				confirmed.StatusCode, strings.TrimSpace(string(body)))
+			// 先落可行动文案再累计——第 5 次时 bump 的终止文案覆盖本条。
+			s.combineOrReplaceSyncError(ctx, "集群注册确认被主节点拒绝（HTTP "+strconv.Itoa(confirmed.StatusCode)+"），请重新注册或提升为主节点", models.SyncErrorCodeValidationFailed)
+			s.bumpRegistrationConfirmFailure(ctx, envelope.Data.ClusterToken, reason)
 			return
 		}
 		s.resetRegistrationConfirmFailure(ctx)
@@ -2055,6 +2102,18 @@ func (s *SyncService) ForgetPins() (int, error) {
 
 // registrationConfirmMaxFailures 定义 confirm 端点连续失败上限。达到后停止注册循环。
 const registrationConfirmMaxFailures = 5
+
+// registrationConfirmTerminal 判定 confirm 失败是否属于「凭证类拒绝」——只有
+// 这类拒绝才允许推进 5 连败终止轨道并清除注册态：
+//   - 401：令牌无效/已撤销（主节点不认这份凭证）；
+//   - 404：节点行不存在（已被移除）；
+//   - 410：节点记录已消失（显式移除）。
+//
+// 403（目标降级 master_required）、409（导入窗口）与 5xx/网络错误都是暂时性
+// 故障：主节点仍在、令牌仍有效，必须保持可重试且不清任何注册态。
+func registrationConfirmTerminal(status int) bool {
+	return status == http.StatusUnauthorized || status == http.StatusNotFound || status == http.StatusGone
+}
 
 // bumpRegistrationConfirmFailure 累计 confirm 失败次数。达到上限后清除 registration_secret，
 // 让从节点脱离注册状态，并通过 persistSyncError 提示运维人工介入。

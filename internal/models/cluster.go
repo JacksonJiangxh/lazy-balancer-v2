@@ -416,6 +416,10 @@ type ClusterUser struct {
 	AuthProvider string `json:"auth_provider,omitempty"`
 	OIDCSubject  string `json:"oidc_subject,omitempty"`
 	OIDCIssuer   string `json:"oidc_issuer,omitempty"`
+	// IsSetupAdmin 标记 break-glass 管理入口：随快照同步，从节点对目标账号
+	// 的不可删/禁/降级保护与主节点一致。旧主端载荷缺该字段时为 false，
+	// 从节点按「最低 id 的启用管理员」本地重建（db.EnsureSetupAdminFlag）。
+	IsSetupAdmin bool `json:"is_setup_admin,omitempty"`
 
 	// pending 密钥不跨节点（绑定向导是节点本地交互；半途切换面板属可重做流程）。
 }
@@ -456,6 +460,11 @@ type ClusterCertificate struct {
 	RenewalAttempts  int          `json:"renewal_attempts,omitempty"`
 	CAAvailableAfter JSONNullTime `json:"ca_available_after"`
 	LastErrorCode    string       `json:"last_error_code,omitempty"`
+	// 源 row 的时间轴（平面 UTC 串）：从端镜像行若不自带时间，任务行时间会归零
+	// 为「同步时刻」，升主后历史时间线失真。旧主端快照缺省时 apply 回落既有
+	// DB 默认（created_at=CURRENT_TIMESTAMP/updated_at=NULL）。
+	CreatedAt string `json:"created_at,omitempty"`
+	UpdatedAt string `json:"updated_at,omitempty"`
 }
 
 type ClusterACMEState struct {

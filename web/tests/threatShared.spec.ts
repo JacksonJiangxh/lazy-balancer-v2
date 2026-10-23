@@ -8,7 +8,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { heatEntriesEqual, heatCss, DOT_LAND, arcEndpoints, POINTY_TOP_HEX_VERTICES, drillCountryAllowed, arcOriginForLocation, normalizeCountryName, adminShortName, aggregateCountryCounts, hasProvinceStats, drillCommitAllowed } from '../src/utils/threatShared.ts'
+import { heatEntriesEqual, heatCss, DOT_LAND, arcEndpoints, POINTY_TOP_HEX_VERTICES, drillCountryAllowed, arcOriginForLocation, normalizeCountryName, adminShortName, aggregateCountryCounts, hasProvinceStats, drillCommitAllowed, buildCountryCellGrid, countryGridCell } from '../src/utils/threatShared.ts'
 import { FALLBACK_CENTROID } from '../src/utils/countryCentroids.ts'
 
 test('六边形点阵：pointy-top 六顶点且上下尖角', () => {
@@ -218,4 +218,29 @@ test('中国省界回归：北京与天津不被河北孔洞吸收，河北本�
   assert.equal(pointInPolys(117.35, 39.28, tianjin.polys), true)
   assert.equal(pointInPolys(117.35, 39.28, hebei.polys), false)
   assert.equal(pointInPolys(114.5, 38.0, hebei.polys), true)
+})
+
+test('国家网格：候选收敛、远海空集、键夹紧', () => {
+  // 两个矩形国家：东经 100-110 北纬 20-30；西经 10-0 北纬 40-50
+  const box = (minLon: number, maxLon: number, minLat: number, maxLat: number): number[][][] => [
+    [[minLon, minLat], [maxLon, minLat], [maxLon, maxLat], [minLon, maxLat], [minLon, minLat]],
+  ]
+  const countries = [
+    { name: 'A', polys: box(100, 110, 20, 30) },
+    { name: 'B', polys: box(-10, 0, 40, 50) },
+  ]
+  const { grid, bounds } = buildCountryCellGrid(countries)
+  assert.equal(bounds.length, 2)
+  assert.deepEqual(bounds[0], { minLon: 100, maxLon: 110, minLat: 20, maxLat: 30 })
+  // 命中单元格只含对应国家（5° 网格 -> 105,25 = x57 y23）
+  assert.deepEqual(grid.get(countryGridCell(105, 25)), [0])
+  assert.deepEqual(grid.get(countryGridCell(-5, 45)), [1])
+  // 远海（南大西洋）无候选
+  assert.deepEqual(grid.get(countryGridCell(-30, -30)) ?? [], [])
+  // 同一单元格不会被重复登记同一个国家（矩形只登记一次）
+  const counts = [...grid.values()].flat().filter((ci) => ci === 0).length
+  assert.equal(counts, Math.ceil(10 / 5 + 1) * Math.ceil(10 / 5 + 1))
+  // 键夹紧：极值不越界（0..35 行、0..71 列）
+  assert.equal(countryGridCell(-180, -90), 0)
+  assert.equal(countryGridCell(180, 90), 35 * 100 + 71)
 })

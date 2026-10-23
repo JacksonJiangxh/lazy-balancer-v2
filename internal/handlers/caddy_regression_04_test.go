@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -101,7 +102,7 @@ func TestImportV1Config_clamps_short_active_health_interval(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	backup := `{
 		"proxy_config":{"config":[
-			{"pk":1,"fields":{"proxy_name":"hc-clamp","protocol":true,"listen":8464,"server_name":"hc-clamp.example.test","status":true,"ssl":false,"http_check":true,"fail_timeout":3,"upstream_list":[1]}}
+			{"pk":1,"fields":{"proxy_name":"hc-clamp","protocol":true,"listen":8464,"server_name":"hc-clamp.example.test","status":true,"ssl":false,"http_check":true,"fail_timeout":2,"upstream_list":[1]}}
 		]},
 		"upstream_config":{"config":[
 			{"pk":1,"fields":{"status":true,"address":"127.0.0.1","port":9464,"weight":100}}
@@ -118,7 +119,7 @@ func TestImportV1Config_clamps_short_active_health_interval(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("import status=%d body=%s, want 200", response.Code, response.Body.String())
 	}
-	if !strings.Contains(response.Body.String(), "已提为 6 秒") {
+	if !strings.Contains(response.Body.String(), fmt.Sprintf("已提为 %d 秒", db.DefaultHealthCheckTimeout+1)) {
 		t.Fatalf("import response missing clamp warning: %s", response.Body.String())
 	}
 	var interval, timeout int
@@ -126,8 +127,10 @@ func TestImportV1Config_clamps_short_active_health_interval(t *testing.T) {
 		t.Fatalf("read imported rule: %v", err)
 	}
 	// 库值唯一真相批 1+2：v1 导入 health_check_timeout 落治理默认 2（原硬编码
-	if interval != 6 || timeout != 2 {
-		t.Fatalf("health interval=%d timeout=%d, want 6/2", interval, timeout)
+	// 5 秒），间隔阈值与文案同源派生自该常量。
+	if interval != db.DefaultHealthCheckTimeout+1 || timeout != db.DefaultHealthCheckTimeout {
+		t.Fatalf("health interval=%d timeout=%d, want %d/%d", interval, timeout,
+			db.DefaultHealthCheckTimeout+1, db.DefaultHealthCheckTimeout)
 	}
 }
 

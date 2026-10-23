@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 )
 
@@ -805,12 +806,9 @@ func (s *ClusterService) Promote(ctx context.Context) error {
 			RecordAuditLog("system", "提升完成", "集群节点", FormatAuditDetail(detail, AuditResultPart("warning")), "")
 		}
 	}
-	// 升主后按库实态统一恢复六个业务驱动任务，而非只恢复 autoban。
-	SyncBusinessTaskDrivers()
-	// Promote 后补重装首槽：从节点期间规则库更新任务由角色门停跑，版本行
-	// 可能残留「auto_update 开、next_update 空」形态——与引擎装配同源武装
-	// 否则空槽只能靠重启恢复，升主节点静默停更。
-	RearmSecurityLibrarySlots()
+	// 升主后的任务面收尾（六业务驱动任务对齐 + 规则库首槽重装）与角色对账
+	// 升主分支共用单源——两条升主路径分头维护会漏项。
+	applyPromoteTaskSideEffects()
 	s.detachFromMaster(ctx, masterURL, oldToken)
 	return nil
 }
@@ -927,6 +925,25 @@ func normalizeSyncInterval(interval int) int {
 		return maxSyncIntervalSeconds
 	}
 	return interval
+}
+
+// normalizeJWTExpireMinutes 把 jwt_expire_minutes 收敛到写侧允许区间
+// 1..1440（越界回退治理默认）。装载侧与 apply 侧共用同一 helper——两侧口径
+// 分叉会让 users 节哈希主从不相等（脏值触发的整节重放与漂移补偿全量重拉）。
+func normalizeJWTExpireMinutes(minutes int) int {
+	if minutes <= 0 || minutes > 1440 {
+		return db.DefaultJWTExpireMinutes
+	}
+	return minutes
+}
+
+// normalizeCertExpiryDays 把 cert_expiry_days 收敛到写侧允许区间 1..365
+// （越界回退治理默认）。与 normalizeJWTExpireMinutes 同族、同单源理由。
+func normalizeCertExpiryDays(days int) int {
+	if days <= 0 || days > 365 {
+		return db.DefaultCertExpiryDays
+	}
+	return days
 }
 
 // nodeOfflineMultiplier 判定节点离线时 last_seen 的允许超时倍率（× sync_interval 秒）。

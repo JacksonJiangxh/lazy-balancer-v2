@@ -1,20 +1,23 @@
 // 历史 WEB-VIEWS-CORE 验收：
 //   A. 可抽出的纯逻辑做 node 行为测试（向导阶段覆盖/复制 Host、审计筛选参数、
 //      API 密钥白名单归一、分页夹紧）；
-//   B. 视图内行为（错误态/CSS 映射/权限态）沿用本仓既有「源码钉」形态——SFC 无法
-//      在 node --test 下挂载，钉住的是可判定的结构化形态，并对同族全量收敛。
+//   B. 视图内行为（错误态/CSS 映射/权限态）沿用本仓既有「源码钉」形态。
+//      真实前提：node --test 没有 .vue 装载器（本套件禁止静态 import .vue），
+//      且这些模板依赖 element-plus 全局组件与样式——不可在 node 下挂载；
+//      可判定的语义一律抽 utils 行为求值，其余用「限段 + 调用点」文本钉。
 //
 // 运行：cd web && npm test
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readdirSync, readFileSync } from 'node:fs'
 import { nextTick, ref } from 'vue'
 
-import { copyRuleHostHeader, newRuleWizardStageOverrides, stageBlockPageOverrides } from '../src/utils/ruleWizard.ts'
+import { copyRuleHostHeader, newRuleWizardStageOverrides, stageBlockPageOverrides, stageBlockPagePatch } from '../src/utils/ruleWizard.ts'
 import { buildAuditLogParams } from '../src/utils/auditLogFilters.ts'
 import { normalizeCidr, serializeWhitelist } from '../src/utils/apiKeyWhitelist.ts'
 import { useClampedPagination } from '../src/composables/useClampedPagination.ts'
-import { section, source } from './_helpers.ts'
+import { section, source, stripComments } from './_helpers.ts'
 
 const rules = source('src/views/Rules.vue')
 const dashboard = source('src/views/Dashboard.vue')
@@ -64,11 +67,37 @@ test('水合/新建/重置三处共用同一键集（双向清单，防再次分
   const reset = section(rules, 'const resetWizard = () => {', 'const beforeWizardClose')
   assert.match(reset, /Object\.assign\(wizardForm, newRuleWizardStageOverrides\(\)\)/)
 
-  // 提交载荷仍显式发送四键（0=不覆盖）
+  // 编辑载荷只提交相对快照变化的键（后端 nil=保留）；新建/复制显式全量
   const payload = section(rules, 'const data: UpdateRuleRequest = {', 'request.')
-  for (const key of ['block_page_stage1_id', 'block_page_stage1_status', 'block_page_stage3_id', 'block_page_stage3_status']) {
-    assert.match(payload, new RegExp(`${key}: wizardForm\\.${key} \\|\\| 0`), `payload must send ${key}`)
+  assert.match(payload, /isCopyMode\.value \|\| !editingRule\.value/)
+  assert.match(payload, /\.\.\.\(\(isCopyMode\.value \|\| !editingRule\.value\)/)
+  assert.match(payload, /stageBlockPageOverrides\(wizardForm\)/)
+  assert.match(payload, /stageBlockPagePatch\(wizardForm, wizardStagePageSnapshot\.value\)/)
+  assert.doesNotMatch(payload, /block_page_stage1_id: wizardForm\.block_page_stage1_id \|\| 0/, '编辑态不得无条件回写四字段（旧快照回退）')
+})
+
+test('阶段页覆盖差异门：只提交相对打开快照变化的键', () => {
+  const snapshot = {
+    block_page_stage1_id: 7,
+    block_page_stage1_status: 403,
+    block_page_stage3_id: 9,
+    block_page_stage3_status: 451,
   }
+  // 未修改 → 空 patch（后端 nil=保留）
+  assert.deepEqual(stageBlockPagePatch({ ...snapshot }, snapshot), {})
+  // 仅阶段 1 改页 → 只提交 stage1 两个键
+  assert.deepEqual(stageBlockPagePatch({ ...snapshot, block_page_stage1_id: 8 }, snapshot), { block_page_stage1_id: 8 })
+  // 清空覆盖（id/status 归 0）
+  assert.deepEqual(
+    stageBlockPagePatch({ ...snapshot, block_page_stage3_id: 0, block_page_stage3_status: 0 }, snapshot),
+    { block_page_stage3_id: 0, block_page_stage3_status: 0 },
+  )
+  // 缺键的当前值按 0 归一（与保存载荷同口径）
+  assert.deepEqual(stageBlockPagePatch({}, newRuleWizardStageOverrides()), {})
+  assert.deepEqual(
+    stageBlockPagePatch({ block_page_stage1_id: 3 }, newRuleWizardStageOverrides()),
+    { block_page_stage1_id: 3 },
+  )
 })
 
 // ============ 复制路径携带规则级回源 Host ============
@@ -194,14 +223,14 @@ test('非管理员渲染权限空态且不发请求（深链同样覆盖）', ()
 test('MFA 激活按钮按 6 位禁用（不再静默 no-op）', () => {
   assert.match(users, /:disabled="mfaBinding\.code\.length !== 6"/)
   const activate = section(users, 'const activateMfa = async', 'const copyMfaRecovery')
-  assert.match(activate, /isReadOnly\.value \|\| mfaBinding\.value\.code\.length !== 6/)
+  assert.match(activate, /selfServiceBlocked\.value \|\| mfaBinding\.value\.code\.length !== 6/)
 })
 
 test('MFA 两个入口补函数级只读守卫（纵深防御）', () => {
   const open = section(users, 'const openMfaBinding = async', 'const activateMfa')
-  assert.match(open, /if \(isReadOnly\.value \|\| mfaBinding\.value\.loading\) return/)
+  assert.match(open, /if \(selfServiceBlocked\.value \|\| mfaBinding\.value\.loading\) return/)
   const activate = section(users, 'const activateMfa = async', 'const copyMfaRecovery')
-  assert.match(activate, /isReadOnly\.value/)
+  assert.match(activate, /selfServiceBlocked\.value/)
 })
 
 test('resetPassword 删除 lbOpen 时代残留的 cancel/close 分支', () => {
@@ -278,4 +307,25 @@ test('白名单逻辑单源（视图不再内联实现）', () => {
   // 审计筛选参数同样单源
   assert.match(auditLog, /import \{ buildAuditLogParams \} from '@\/utils\/auditLogFilters'/)
   assert.doesNotMatch(auditLog, /const buildParams = \(\) => \{\n/)
+})
+
+// 只读 Key 的可见工具集与后端单一事实源（3 个读探测）一致：写语义的
+// test_ca_provider / test_certificate_config 不得再被宣称为可用。
+test('只读 Key 工具清单与后端只读探测集一致', () => {
+  assert.match(keys, /3 个读探测 POST 工具（parse_certificate \/ validate_import \/ preview_config/)
+  assert.doesNotMatch(keys, /5 个读探测 POST 工具/)
+})
+
+// 本套件的前提守卫：node --test 没有 .vue 装载器，spec 一律不得静态 import
+// SFC（引入 loader 时本用例转红，提醒同步更正各 spec 的「文本钉」前提注释）。
+test('spec 不得静态 import .vue（SFC 无 node 装载器）', () => {
+  const offenders: string[] = []
+  const specDir = new URL('./', import.meta.url)
+  for (const name of readdirSync(specDir)) {
+    const text = readFileSync(new URL(name, specDir), 'utf8')
+    // 剥注释后扫描静态 import/export-from 语句
+    if (/^\s*(?:import|export)\b[^\n]*from\s+['"][^'"]+\.vue['"]/m.test(stripComments(text))) offenders.push(name)
+    if (/^\s*import\s+['"][^'"]+\.vue['"]/m.test(stripComments(text))) offenders.push(name)
+  }
+  assert.deepEqual(offenders, [], 'spec 出现 .vue 静态导入——node 无法装载，需改为 utils 行为求值或文本钉')
 })

@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { normalizeWeights, payloadWeight, redistributeWeight, weightPercent } from '../src/utils/upstreamWeights.ts'
+import { source } from './_helpers.ts'
 
 test('重新启用上游至少分配 1，UI 不再显示 0%', () => {
   const rows = [
@@ -59,11 +60,28 @@ test('weightPercent 展示口径（禁用行=0、总和≤0→0、四舍五入�
   )
 })
 
-test('超出 100 行上限的行权重清零且不参与分配', () => {
+test('超出 100 行编辑器上限的行保留原权重并继续参与分配，不再被清零', () => {
+  // 后端对上游条数无上限（API/导入可写入 101+ 行）；编辑器上限只是「添加上游」
+  // 按钮门。清零会让改任一权重后「一保存就 400」。
   const rows = Array.from({ length: 101 }, () => ({ weight: 1, enabled: true }))
   normalizeWeights(rows)
-  assert.equal(rows[100]!.weight, 0, '第 101 行必须被清零')
-  assert.equal(rows.slice(0, 100).reduce((sum, row) => sum + row.weight, 0), 100)
+  assert.equal(rows[100]!.weight, 1, '第 101 行不得被清零')
+  assert.equal(rows.reduce((sum, row) => sum + row.weight, 0), 101, '每行至少 1，合计随行数抬升')
+})
+
+test('超限行改权重时预算随行数抬升（每行仍 ≥1，可正常保存）', () => {
+  const rows = Array.from({ length: 101 }, () => ({ weight: 1, enabled: true }))
+  redistributeWeight(rows, 0)
+  assert.ok(rows.every((row) => row.weight >= 1), '任何行都不得落到 0 权重')
+  assert.equal(rows.reduce((sum, row) => sum + row.weight, 0), 101)
+  const otherTotal = rows.slice(1).reduce((sum, row) => sum + row.weight, 0)
+  assert.equal(otherTotal, 100, '其余 100 行按既有语义合计 100，每行各 1')
+})
+
+test('编辑器超限提示显性化（可调权重 / 需删至上限或走 API）', () => {
+  const editor = source('src/components/rules/PathRulesEditor.vue')
+  assert.match(editor, /rule\.upstreams\.length > MAX_UPSTREAM_ROWS[\s\S]{0,200}?保存前请删至/, '超限必须给出可操作提示')
+  assert.doesNotMatch(editor, /item\.weight = 0|weight = 0/, '组件不得自行清零权重')
 })
 
 test('payloadWeight 保存载荷边界——禁用行送 1、启用行原样、缺省 100', () => {

@@ -170,6 +170,10 @@ func TestUpdateSecurityPolicy_rejectsNonexistentReferences(t *testing.T) {
 func TestCreateSecurityPolicy_geoipUnknownProvinceRejectedWhileCacheEmpty(t *testing.T) {
 	// Given：ip2region 未加载（无缓存文件，live 与缓存兜底均只返回 ["海外"]）
 	setupSecurityPolicyTestDB(t)
+	// 显式复位进程级 searcher 全局态：依赖同包其它用例的残留会让「未加载」
+	// 分支在乱序执行时变成假红/假绿。
+	services.ResetIP2RegionSearcherForTest()
+	t.Cleanup(services.ResetIP2RegionSearcherForTest)
 	router := securityR29Router(t)
 
 	// When：创建策略使用任意非空省份名

@@ -20,13 +20,10 @@ import (
 // 规则与 Caddy 实际运行配置的比对结果。
 type ConfigDriftStatus struct {
 	Consistent bool     `json:"consistent"`
-	Missing    []string `json:"missing"` // 应渲染但运行配置缺失的规则（名称（caddy_id））
-	Extra      []string `json:"extra"`   // 运行配置中存在但 DB 已不存在的规则路由
-	Since      string   `json:"since"`   // 首次确认不一致的时间（UTC）
-	CheckedAt  string   `json:"checked_at"`
-	// SkippedRounds 自上次真实检查以来未能判定的轮数（规则读取失败/Caddy
-	// 不可达整轮跳过）——跳过轮不构成「一致」证据，心跳文案附此计数。
-	SkippedRounds int `json:"skipped_rounds,omitempty"`
+	Missing    []string `json:"missing"`    // 应渲染但运行配置缺失的规则（名称（caddy_id））
+	Extra      []string `json:"extra"`      // 运行配置中存在但 DB 已不存在的规则路由
+	Since      string   `json:"since"`      // 首次确认不一致的时间（UTC）
+	CheckedAt  string   `json:"checked_at"` // 最近一轮完成检查的时间（UTC）
 }
 
 var (
@@ -114,7 +111,6 @@ func WatchdogCheckOnce(ctx context.Context) (runErr error) {
 		configDriftMu.Lock()
 		configDriftSkipped++
 		configDriftHeartbeatSkipped++
-		configDriftStatus.SkippedRounds = configDriftSkipped
 		configDriftMu.Unlock()
 		TaskLogfWarn("config-watchdog", "skipped", "配置检查未完成：角色读取失败（%v），本轮未判定，不计入一致轮", roleErr)
 		return fmt.Errorf("角色读取失败: %w", roleErr)
@@ -151,6 +147,9 @@ func WatchdogCheckOnce(ctx context.Context) (runErr error) {
 	case !checked:
 		configDriftSkipped++
 		configDriftHeartbeatSkipped++
+		// 严格「连续两轮」语义：跳过轮不含任何证据，必须打断连续窗口——
+		// 否则「漂移→跳过→漂移」会被当作两轮连续证据而确认漂移。
+		configDriftStreak = 0
 	case driftInProgress && configDriftStatus.Consistent:
 		// 防抖轮（streak=1，状态仍为 Consistent）已观测到一轮不一致：
 		// 它既不是「一致」证据，也必须清空本窗口——旧实现只是不计入
@@ -158,6 +157,10 @@ func WatchdogCheckOnce(ctx context.Context) (runErr error) {
 		// 漂移」的反事实心跳（漂移征兆落在窗口内）。重置后心跳窗口语义恢复为
 		// 「自最近一次不一致观测以来连续无漂移」。
 		configDriftCleanRounds = 0
+		// 心跳文案的「期间跳过 N 轮」窗口与干净轮窗口同起点：不一致观测已
+		// 重启干净轮窗口，跳过计数必须同步重启，否则恢复后的心跳会把漂移
+		// 之前的跳过轮算进本窗口。
+		configDriftHeartbeatSkipped = 0
 	case configDriftStatus.Consistent:
 		configDriftCleanRounds++
 		configDriftSkipped = 0 // 字段口径为「自上次真实检查以来」；真实检查成功即开启新窗口。
@@ -176,7 +179,6 @@ func WatchdogCheckOnce(ctx context.Context) (runErr error) {
 		configDriftSkipped = 0 // 窗口关闭：跳过轮计数随心跳归零
 		configDriftHeartbeatSkipped = 0
 	}
-	configDriftStatus.SkippedRounds = configDriftSkipped
 	status := configDriftStatus
 	status.Missing = append([]string(nil), configDriftStatus.Missing...)
 	status.Extra = append([]string(nil), configDriftStatus.Extra...)
@@ -574,7 +576,7 @@ func updateConfigDrift(missing, extra []string) {
 			pendingIO = 1
 		}
 		configDriftStreak = 0
-		configDriftStatus = ConfigDriftStatus{Consistent: true, CheckedAt: now, SkippedRounds: configDriftStatus.SkippedRounds}
+		configDriftStatus = ConfigDriftStatus{Consistent: true, CheckedAt: now}
 	} else {
 		configDriftStreak++
 		if configDriftStatus.Consistent && configDriftStreak < 2 {
@@ -583,7 +585,7 @@ func updateConfigDrift(missing, extra []string) {
 			if configDriftStatus.Consistent {
 				detail = formatDriftDetail(missing, extra)
 				pendingIO = 2
-				configDriftStatus = ConfigDriftStatus{Consistent: false, Since: now, SkippedRounds: configDriftStatus.SkippedRounds}
+				configDriftStatus = ConfigDriftStatus{Consistent: false, Since: now}
 			}
 			configDriftStatus.Missing = missing
 			configDriftStatus.Extra = extra

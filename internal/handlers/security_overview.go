@@ -318,7 +318,7 @@ func securityOverviewTodayCounts(database *sql.DB, todayStart time.Time, now tim
 		lastComplete.Sub(watermark) <= threatRollupStaleAfter
 	if usable {
 		rows, qerr := database.Query(`SELECT action, COALESCE(SUM(count),0) FROM security_event_rollup
-			WHERE minute >= ? AND action IN ('blocked','logged') GROUP BY action`, todayStartUTC.Format("2006-01-02 15:04"))
+			WHERE minute >= ? AND action IN ('blocked','logged') AND `+services.AttackEventSQLPredicate("rule", "action")+` GROUP BY action`, todayStartUTC.Format("2006-01-02 15:04"))
 		if qerr != nil {
 			return 0, 0, false, qerr
 		}
@@ -345,7 +345,7 @@ func securityOverviewTodayCounts(database *sql.DB, todayStart time.Time, now tim
 	if err := database.QueryRow("SELECT COUNT(*) FROM security_events WHERE action='blocked' AND event_time >= ?", todayStartText).Scan(&blocked); err != nil {
 		return 0, 0, false, err
 	}
-	if err := database.QueryRow("SELECT COUNT(*) FROM security_events WHERE action='logged' AND event_time >= ?", todayStartText).Scan(&detected); err != nil {
+	if err := database.QueryRow("SELECT COUNT(*) FROM security_events WHERE action='logged' AND event_time >= ? AND "+services.AttackEventSQLPredicate("rule_triggered", "action"), todayStartText).Scan(&detected); err != nil {
 		return 0, 0, false, err
 	}
 	return blocked, detected, false, nil
@@ -413,7 +413,7 @@ func loadSecurityOverviewAggregates(metricsDB *sql.DB, today time.Time, todaySta
 		point := models.SecurityTrendPoint{Date: dayStarts[i].In(today.Location()).Format("2006-01-02")}
 		err := metricsDB.QueryRow(`SELECT COALESCE(SUM(CASE WHEN action='blocked' THEN 1 ELSE 0 END),0),
 			COALESCE(SUM(CASE WHEN action='logged' THEN 1 ELSE 0 END),0)
-			FROM security_events WHERE event_time >= ? AND event_time < ?`,
+			FROM security_events WHERE event_time >= ? AND event_time < ? AND `+services.AttackEventSQLPredicate("rule_triggered", "action"),
 			dayStarts[i].UTC().Format(eventTimeLayout), dayStarts[i+1].UTC().Format(eventTimeLayout)).
 			Scan(&point.Blocked, &point.Detected)
 		track(err)
@@ -426,7 +426,7 @@ func loadSecurityOverviewAggregates(metricsDB *sql.DB, today time.Time, todaySta
 		lastTime          string
 	}
 	var topRows []topIPRow
-	ipRows, err := metricsDB.Query(`SELECT client_ip, SUM(CASE WHEN action='blocked' THEN 1 ELSE 0 END) as b, SUM(CASE WHEN action='logged' THEN 1 ELSE 0 END) as l, MAX(event_time) as last_time FROM security_events WHERE event_time >= ? GROUP BY client_ip ORDER BY b + l DESC LIMIT 10`, windowStartUTC)
+	ipRows, err := metricsDB.Query(`SELECT client_ip, SUM(CASE WHEN action='blocked' THEN 1 ELSE 0 END) as b, SUM(CASE WHEN action='logged' THEN 1 ELSE 0 END) as l, MAX(event_time) as last_time FROM security_events WHERE event_time >= ? AND `+services.AttackEventSQLPredicate("rule_triggered", "action")+` GROUP BY client_ip ORDER BY b + l DESC LIMIT 10`, windowStartUTC)
 	track(err)
 	for ipRows != nil && ipRows.Next() {
 		var row topIPRow
@@ -447,7 +447,7 @@ func loadSecurityOverviewAggregates(metricsDB *sql.DB, today time.Time, todaySta
 			placeholders[i] = "?"
 			famArgs = append(famArgs, row.ip)
 		}
-		famRows, ferr := metricsDB.Query(fmt.Sprintf(`SELECT client_ip, COALESCE(rule_triggered,''), COALESCE(rule_msg,''), COUNT(*) as cnt FROM security_events WHERE event_time >= ? AND client_ip IN (%s) GROUP BY client_ip, rule_triggered, rule_msg`, strings.Join(placeholders, ",")), famArgs...)
+		famRows, ferr := metricsDB.Query(fmt.Sprintf(`SELECT client_ip, COALESCE(rule_triggered,''), COALESCE(rule_msg,''), COUNT(*) as cnt FROM security_events WHERE event_time >= ? AND client_ip IN (%s) AND `+services.AttackEventSQLPredicate("rule_triggered", "action")+` GROUP BY client_ip, rule_triggered, rule_msg`, strings.Join(placeholders, ",")), famArgs...)
 		track(ferr)
 		for famRows != nil && famRows.Next() {
 			var ip, ruleTriggered, ruleMsg string
@@ -484,7 +484,7 @@ func loadSecurityOverviewAggregates(metricsDB *sql.DB, today time.Time, todaySta
 		})
 	}
 
-	typeRows, err := metricsDB.Query(`SELECT COALESCE(rule_triggered,''), COALESCE(rule_msg,''), COUNT(*) as cnt FROM security_events WHERE event_time >= ? GROUP BY rule_triggered, rule_msg`, windowStartUTC)
+	typeRows, err := metricsDB.Query(`SELECT COALESCE(rule_triggered,''), COALESCE(rule_msg,''), COUNT(*) as cnt FROM security_events WHERE event_time >= ? AND `+services.AttackEventSQLPredicate("rule_triggered", "action")+` GROUP BY rule_triggered, rule_msg`, windowStartUTC)
 	track(err)
 	familyCounts := map[string]int{}
 	stageCounts := map[string]int{}

@@ -1215,7 +1215,7 @@
 <script setup lang="ts">
 import { ref, reactive, onMounted, onUnmounted, computed, watch } from 'vue'
 import { useAuthStore } from '@/stores/auth'
-import { request, mfaAwareSuccess } from '@/utils/api'
+import { request, mfaAwareSuccess, ApiRequestError } from '@/utils/api'
 import { Plus, Operation, Delete, InfoFilled, Lock, Connection, Guide, Check, ArrowLeft, ArrowRight, Document, CircleCheckFilled, CircleCloseFilled, Setting, RefreshRight, Search, WarningFilled, Location, Monitor, Link, Tickets } from '@element-plus/icons-vue'
 import DialogHeader from '@/components/DialogHeader.vue'
 import FieldHelpIcon from '@/components/common/FieldHelpIcon.vue'
@@ -1264,7 +1264,7 @@ import { popperViewportSafe } from '@/utils/popper'
 import { hostPortKey } from '@/utils/upstreamKeys'
 import { MAX_UPSTREAM_ROWS, normalizeWeights, payloadWeight, redistributeWeight, weightPercent } from '@/utils/upstreamWeights'
 import { projectRuleFlowPath } from '@/utils/ruleFlow'
-import { clampPassiveHealthCheckTimeout, copyRuleHostHeader, dnsServerAfterToggle, newRuleWizardStageOverrides, stageBlockPageOverrides } from '@/utils/ruleWizard'
+import { clampPassiveHealthCheckTimeout, copyRuleHostHeader, dnsServerAfterToggle, newRuleWizardStageOverrides, stageBlockPageOverrides, stageBlockPagePatch } from '@/utils/ruleWizard'
 import { createLogStatBuckets, incrementCappedStat, type LogStatBuckets } from '@/utils/logStatCap'
 import { certJobStatusLabel } from '@/utils/certJobStatus'
 import type { CertJobStatus } from '@/utils/certJobStatus'
@@ -1785,6 +1785,10 @@ const loading = ref(false)
 const wizardVisible = ref(false)
 const saving = ref(false)
 const editingRule = ref<Rule | null>(null)
+// 打开编辑表单时该行 updated_at 的基线（乐观并发前置条件）：保存时随
+// expected_updated_at 回传，服务端在事务内比对——他人已提交时返回 409，
+// 而不是让陈旧表单静默覆盖（含 enabled 翻转与上游/路径规则整组替换）。
+const editingRuleVersion = ref('')
 const isCopyMode = ref(false)
 // 复制源规则（openCopyWizard 带入）——POST /rules 不携带策略绑定，副本创建后
 // 经 PUT /security/rules/:id/policies 从源快照复制（submitWizard 复制分支消费）
@@ -1792,6 +1796,9 @@ const copySourceRuleId = ref<string | null>(null)
 // 复制走 POST /rules 重建，Create 无 nil=保留语义——规则级回源 Host
 // 必须显式随载荷携带，否则副本静默丢失 Host 覆盖（编辑路径不受影响）。
 const copySourceHostHeader = ref('')
+// 向导打开时的阶段页覆盖快照：编辑保存只提交相对快照变化的键（后端 nil=保留），
+// 避免把另一会话写入的覆盖静默回退。
+const wizardStagePageSnapshot = ref(newRuleWizardStageOverrides())
 const WIZARD_STEP = {
   BASIC: 0,
   TLS: 1,
@@ -2393,6 +2400,9 @@ const validateCertificate = async () => {
   }
 
   if (!keyPEM) {
+    // 掩码私钥（后端 tls_key 空 + tls_key_set=true）：沿用已保存私钥，
+    // 不误报「请提供私钥」（保存门已按同一契约放行）。
+    if (wizardForm.tlsKeySet) return
     certInfo.error = '请提供私钥 (KEY)'
     return
   }
@@ -2642,11 +2652,16 @@ const openWizard = async (rule?: Rule) => {
     }
     }
     editingRule.value = fullRule
+    // 版本基线取水合用的那份行（手动 TLS 编辑时是 GET 的新鲜行）。
+    editingRuleVersion.value = fullRule.updated_at || ''
     Object.assign(wizardForm, wizardFormFromRule(fullRule))
+    wizardStagePageSnapshot.value = stageBlockPageOverrides(fullRule)
     weightsToPercent(wizardForm.upstreams)
     if (wizardForm.dynamic_dns) onDynamicDnsToggle(true)
   } else {
     editingRule.value = null
+    editingRuleVersion.value = ''
+    wizardStagePageSnapshot.value = newRuleWizardStageOverrides()
     Object.assign(wizardForm, {
       name: '',
       description: '',
@@ -2719,6 +2734,7 @@ const resetWizard = () => {
   wizardForm.tls_key = ''
   upstreamTouched.value = []
   editingRule.value = null
+  editingRuleVersion.value = ''
   isCopyMode.value = false
   copySourceRuleId.value = null
   copySourceHostHeader.value = ''
@@ -3209,6 +3225,11 @@ const submitWizard = async () => {
 
     const data: UpdateRuleRequest = {
       name: wizardForm.name,
+      // 编辑保存的乐观并发前置条件（仅编辑态有基线；新建/复制为空）。
+      // 省略键=后端不校验（API/MCP 兼容），编辑态恒回传打开时基线。
+      ...(editingRule.value && !isCopyMode.value && editingRuleVersion.value
+        ? { expected_updated_at: editingRuleVersion.value }
+        : {}),
       // 复制重建规则时必须显式携带源规则级回源 Host（省略=落空串）；
       // 编辑/新建不带该键——Update 的 nil=保留语义不需要，新建本就无覆盖。
       ...(isCopyMode.value ? { host_header: copySourceHostHeader.value } : {}),
@@ -3242,10 +3263,11 @@ const submitWizard = async () => {
       tls_http_redirect: wizardForm.tls_http_redirect,
       enable_compress: wizardForm.enable_compress,
       compress_types: wizardForm.compress_types.join(',') || 'gzip',
-      block_page_stage1_id: wizardForm.block_page_stage1_id || 0,
-      block_page_stage1_status: wizardForm.block_page_stage1_status || 0,
-      block_page_stage3_id: wizardForm.block_page_stage3_id || 0,
-      block_page_stage3_status: wizardForm.block_page_stage3_status || 0,
+      // 编辑态只提交相对打开快照变化的阶段页键（后端 *int nil=保留）；
+      // 新建/复制显式全量（Create 无 nil 语义，副本需继承源覆盖）。
+      ...((isCopyMode.value || !editingRule.value)
+        ? stageBlockPageOverrides(wizardForm)
+        : stageBlockPagePatch(wizardForm, wizardStagePageSnapshot.value)),
       request_body_max_size_mb: wizardForm.request_body_max_size_mb || 0,
       upstream_keepalive_timeout: wizardForm.upstream_keepalive_timeout || 0,
       server_tokens_hidden: wizardForm.server_tokens_hidden || 0,
@@ -3317,6 +3339,12 @@ const submitWizard = async () => {
     wizardVisible.value = false
     fetchRules()
   } catch (error: unknown) {
+    // 版本前置条件冲突：他人已提交该规则，本表单是陈旧快照。刷新列表并
+    // 提示重开——继续用旧表单重试只会重复 409（或在不带版本时静默覆盖）。
+    if (error instanceof ApiRequestError && error.status === 409 && error.message.includes('规则已被他人修改')) {
+      fetchRules()
+      ElMessage.warning('规则已被他人修改，已刷新列表，请关闭向导后重新打开再编辑')
+    }
     // Error message is already shown by the global axios interceptor.
     console.error('submit wizard failed', error)
   } finally {
@@ -3461,6 +3489,8 @@ const openCopyWizard = async (rule: Rule) => {
   upstreamTouched.value = []
   isCopyMode.value = true
   copySourceRuleId.value = rule.caddy_id
+  // 复制走 POST /rules（新建），不存在版本前置条件。
+  editingRuleVersion.value = ''
   let fullRule: Rule = rule
   if (rule.enable_tls && rule.tls_source === 'manual') {
     try {
@@ -3481,6 +3511,7 @@ const openCopyWizard = async (rule: Rule) => {
     name: `${fullRule.name}（副本）`,
     enabled: false,
   })
+  wizardStagePageSnapshot.value = stageBlockPageOverrides(fullRule)
   weightsToPercent(wizardForm.upstreams)
   if (wizardForm.dynamic_dns) onDynamicDnsToggle(true)
   hydratingWizard = false
@@ -3682,18 +3713,12 @@ const startLogStats = async () => {
   ruleLogStatsError.value = ''
   logStatsOffset.value = 0
   try {
+    // 只借 /logs 取尾部 EOF offset 作为增量起点，不消费其 content：标签
+    // 承诺「自 started_at 起实时统计」，若把弹框打开前的最近 1000 行灌进同一
+    // 组桶，total/Top 会把数小时前的历史流量算成「本次观察」，两次打开读数
+    // 也不可比。窗口口径 = 打开时刻起（log-stream 增量是纯实时的）。
     const res = await request.get<APIResponse<RuleLogData>>(`/rules/${targetId}/logs`, { signal: healthPolling.signal, silent: true })
     if (disposed || requestSeq !== ruleLogRequestSeq || !ruleLogDialogVisible.value || ruleLogTab.value !== 'stats' || ruleLogCaddyId.value !== targetId || logStatsMaps.value !== maps) return
-    const content: string = res.data?.content || ''
-    const completed = await consumeLogLinesChunked(content.split('\n'), maps, () => (
-      !disposed
-      && requestSeq === ruleLogRequestSeq
-      && ruleLogDialogVisible.value
-      && ruleLogTab.value === 'stats'
-      && ruleLogCaddyId.value === targetId
-      && logStatsMaps.value === maps
-    ))
-    if (!completed) return
     rebuildStatsView(maps)
     logStatsOffset.value = res.data?.offset ?? 0
   } catch (error: unknown) {

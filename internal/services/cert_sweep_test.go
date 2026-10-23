@@ -2,10 +2,12 @@ package services
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/taskengine"
@@ -111,48 +113,33 @@ func TestSweepOrphanedCertJobs_countsDisabledOrphans(t *testing.T) {
 	}
 }
 
-// + 收敛（2026-10-03 裁定）：证书服务缺失行收敛为状态变化——
-// nil 持续期仅 false→true 转换记一次跳过行，持续缺失静默，恢复（true→false）
-// 记一次恢复行；三个证书 tick 任务共享同一状态门（全局单例服务指针）。
-// 设计变更披露：原 「每轮一行跳过说明」按新裁定收敛，非弱化。
-func TestCertTicks_skipAndRecoveryLinesTransitionOnce(t *testing.T) {
+// 停止「证书签发」调度后：续期扫描每轮必须留可见业务行并落 skipped 终态
+// （不假成功）；手动证书巡检不依赖服务实例，照常执行且不得写「服务未运行」。
+// 旧口径把两者都折成 success + 一条共享状态行：手动证书的告警（手动证书没有
+// 自动续签，告警是唯一信号）随调度停止而静默消失，任务监控全绿。
+func TestCertTicks_skippedRenewalScanIsVisibleAndManualPollStillRuns(t *testing.T) {
 	useCertSweepTickTestEnv(t)
 
-	// 连续两轮 nil：仅一行跳过说明（原每轮一行）
-	CertRenewalScanOnce()
-	CertRenewalScanOnce()
+	// 连续两轮缺失：每轮都要留痕（续期停摆是持续风险，不做状态变化收敛）
+	for round := 1; round <= 2; round++ {
+		if err := CertRenewalScanOnce(); !errors.Is(err, taskengine.ErrTaskSkipped) {
+			t.Fatalf("round %d err=%v, want ErrTaskSkipped", round, err)
+		}
+	}
 	data, err := os.ReadFile(taskengine.TaskLogPath("cert-renewal-scan"))
 	if err != nil {
 		t.Fatalf("read task log: %v", err)
 	}
-	if got := strings.Count(string(data), "证书服务未运行，跳过本轮"); got != 1 {
-		t.Fatalf("skip lines=%d, want 1（状态门：缺失期只记一次）: %q", got, string(data))
+	if got := strings.Count(string(data), "续期扫描已跳过"); got != 2 {
+		t.Fatalf("skip lines=%d, want 2（每轮留痕）: %q", got, string(data))
 	}
 
-	// 共享状态：第二个任务同处缺失期，不重复记行
-	CertManualCheckOnce()
+	// 手动巡检：无服务实例仍照常执行，且不得写「证书服务未运行」
+	if err := CertManualCheckOnce(); err != nil {
+		t.Fatalf("manual check without service: %v", err)
+	}
 	if data, err := os.ReadFile(taskengine.TaskLogPath("cert-manual-poll")); err == nil && strings.Contains(string(data), "证书服务未运行") {
-		t.Fatalf("共享状态门失效：cert-manual-poll 重复记缺失行: %q", string(data))
-	}
-
-	// 恢复：true→false 转换记一次恢复行，随后正常执行不再记
-	resetCertificateServiceForTest(t)
-	SetActiveCertificateService(NewCertificateService())
-	CertRenewalScanOnce()
-	data, err = os.ReadFile(taskengine.TaskLogPath("cert-renewal-scan"))
-	if err != nil {
-		t.Fatalf("reread task log: %v", err)
-	}
-	if got := strings.Count(string(data), "证书服务已恢复"); got != 1 {
-		t.Fatalf("recovery lines=%d, want 1: %q", got, string(data))
-	}
-	CertRenewalScanOnce()
-	data, err = os.ReadFile(taskengine.TaskLogPath("cert-renewal-scan"))
-	if err != nil {
-		t.Fatalf("reread task log: %v", err)
-	}
-	if got := strings.Count(string(data), "证书服务已恢复"); got != 1 {
-		t.Fatalf("恢复后持续运行不得追加恢复行: got %d", got)
+		t.Fatalf("cert-manual-poll 不得再以服务缺失为由跳过: %q", string(data))
 	}
 }
 
@@ -199,7 +186,7 @@ func TestCertReconcileOnce_propagates_read_failure(t *testing.T) {
 	}
 
 	// When
-	err := CertReconcileOnce()
+	err := CertReconcileOnce(context.Background())
 
 	// Then 1：读失败上抛（Run 随之返回 error → task_runs 失败终态）
 	if err == nil {
@@ -223,7 +210,7 @@ func TestCertReconcileOnce_propagates_read_failure(t *testing.T) {
 func TestCertReconcileOnce_healthy_round_reports_completion(t *testing.T) {
 	useCertSweepTickTestEnv(t)
 
-	if err := CertReconcileOnce(); err != nil {
+	if err := CertReconcileOnce(context.Background()); err != nil {
 		t.Fatalf("CertReconcileOnce err=%v, want nil", err)
 	}
 	data, err := os.ReadFile(taskengine.TaskLogPath("cert-reconcile"))
@@ -258,12 +245,21 @@ func TestCertRenewalScanOnce_propagates_scan_failure(t *testing.T) {
 	}
 }
 
-// 回归形状：服务缺失跳过不是失败（Run 返回 nil，任务不进入失败终态）。
-func TestCertRenewalScanOnce_service_missing_is_not_a_failure(t *testing.T) {
+// 服务缺失时续期扫描必须落 skipped 终态（并留可见业务行），不得记成功：
+// 停用「证书签发」期间自动续签完全停摆，成功终态会让任务监控假健康。
+func TestCertRenewalScanOnce_service_missing_landsSkipped(t *testing.T) {
 	useCertSweepTickTestEnv(t)
 
-	if err := CertRenewalScanOnce(); err != nil {
-		t.Fatalf("err=%v, want nil（服务未运行=跳过，不是失败）", err)
+	err := CertRenewalScanOnce()
+	if !errors.Is(err, taskengine.ErrTaskSkipped) {
+		t.Fatalf("err=%v, want ErrTaskSkipped（服务未运行=跳过，不是成功）", err)
+	}
+	data, readErr := os.ReadFile(taskengine.TaskLogPath("cert-renewal-scan"))
+	if readErr != nil {
+		t.Fatalf("read task log: %v", readErr)
+	}
+	if !strings.Contains(string(data), "续期扫描已跳过") {
+		t.Fatalf("跳过轮必须留可见业务行: %q", string(data))
 	}
 }
 
@@ -463,5 +459,30 @@ func TestJobLogger_Log_neverMovesTerminalJobBackToInflight(t *testing.T) {
 	}
 	if status != "downloaded" {
 		t.Fatalf("status=%q, want downloaded（白名单 from 必须放行快速路径）", status)
+	}
+}
+
+// 手动证书巡检不依赖证书服务实例：停止「证书签发」调度后，手动证书没有
+// 自动续签，10 分钟一次的到期巡检是唯一信号，必须照常执行并产出摘要行。
+func TestCertManualCheckOnce_runsWithoutCertificateService(t *testing.T) {
+	useCertSweepTickTestEnv(t)
+	certPEM, _ := certificatePairForDomains(t, time.Now().Add(-time.Hour), time.Now().Add(3*24*time.Hour), "manual-poll.example.test")
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled,enable_tls,tls_source,tls_cert)
+		VALUES ('lb_manual_poll','manual-poll','http','manual-poll.example.test',8080,1,1,'manual',?)`, certPEM); err != nil {
+		t.Fatalf("seed manual TLS rule: %v", err)
+	}
+
+	// When：无活动证书服务
+	if err := CertManualCheckOnce(); err != nil {
+		t.Fatalf("manual check without service: %v", err)
+	}
+
+	// Then：巡检真实执行并落摘要（1 张临期）
+	data, err := os.ReadFile(taskengine.TaskLogPath("cert-manual-poll"))
+	if err != nil {
+		t.Fatalf("read task log: %v", err)
+	}
+	if !strings.Contains(string(data), "1 张临期") {
+		t.Fatalf("task log=%q, want 「1 张临期」（巡检不得因服务缺失停摆）", string(data))
 	}
 }

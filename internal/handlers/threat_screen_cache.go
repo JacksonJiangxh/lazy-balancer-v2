@@ -12,6 +12,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/services"
 )
 
 // 威胁大屏进程内缓存与请求合并——大屏 30s（聚合）/1-2s（流量）轮询下的
@@ -322,7 +323,7 @@ func threatRollupDimAggregateQuery(database *sql.DB, sinceMinute string, bucketS
 	}
 
 	rows, err := database.Query(`SELECT COALESCE(country,''), COALESCE(province,''), COALESCE(family,''), COALESCE(rule,''), COALESCE(action,''), SUM(count)
-		FROM security_event_rollup WHERE minute >= ? GROUP BY 1,2,3,4,5`, sinceMinute)
+		FROM security_event_rollup WHERE minute >= ? AND `+services.AttackEventSQLPredicate("rule", "action")+` GROUP BY 1,2,3,4,5`, sinceMinute)
 	if err != nil {
 		return agg, err
 	}
@@ -357,7 +358,7 @@ func threatRollupDimAggregateQuery(database *sql.DB, sinceMinute string, bucketS
 	rows.Close()
 
 	if len(bucketStarts) > 0 {
-		minuteRows, merr := database.Query(`SELECT minute, SUM(count) FROM security_event_rollup WHERE minute >= ? GROUP BY minute`, sinceMinute)
+		minuteRows, merr := database.Query(`SELECT minute, SUM(count) FROM security_event_rollup WHERE minute >= ? AND `+services.AttackEventSQLPredicate("rule", "action")+` GROUP BY minute`, sinceMinute)
 		if merr != nil {
 			return agg, merr
 		}

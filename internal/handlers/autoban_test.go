@@ -713,3 +713,29 @@ func TestGetAutobanStatusExposesFeedHealth(t *testing.T) {
 		t.Fatal("可见性修复不得自动拉起用户显式停止的任务")
 	}
 }
+
+// 状态卡读取失败只回泛化文案：驱动/SQLite 错误会带表名/列名/SQL 片段，
+// 不得外泄给任意已登录用户（原文只进服务端日志）。
+func TestGetAutobanStatus_genericErrorText(t *testing.T) {
+	router := newAutobanTestEnv(t)
+	if _, err := db.DB.Exec(`DROP TABLE security_ip_lists`); err != nil {
+		t.Fatalf("drop table: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/security/autoban/status", nil))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d, want 500 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if payload.Message != "读取自动封禁名单失败" {
+		t.Fatalf("message=%q, want 泛化文案", payload.Message)
+	}
+	if body := rec.Body.String(); strings.Contains(body, "no such table") {
+		t.Fatalf("响应体泄漏内部错误原文: %s", body)
+	}
+}

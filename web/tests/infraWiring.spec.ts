@@ -1,6 +1,7 @@
 // 前端基础设施接线的回归钉（页面键/导航文案/轮询 API/弹窗序号/阶段副标题/
-// CRS 全量分页/高亮策略）：这些是应用外壳与共享组件的行为契约，SFC 无挂载
-// 能力处以「限段 + 调用点」文本钉覆盖。
+// CRS 全量分页/高亮策略）：这些是应用外壳与共享组件的行为契约。真实前提：
+// node --test 无 .vue 装载器且模板依赖 element-plus 全局组件——不可挂载，
+// 故以「限段 + 调用点」文本钉覆盖。
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'

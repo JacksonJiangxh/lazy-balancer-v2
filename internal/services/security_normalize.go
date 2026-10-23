@@ -16,6 +16,13 @@ var legacySecurityEnumBackfills = []string{
 	// 'DENY'）在渲染端同样零产出规则/落入错误分支而 UI 宣称启用，与空串
 	// 同型；Update 400 拒修、集群快照原样镜像，启动归一是唯一自愈路径。
 	// 归一目标值沿用空串先例（deny/off/deny=Create 侧默认值族）。
+	// 首尾空白脏值（带外直写/旧快照）先写回 trim 值，再由下方枚举外语句
+	// 处理 trim 后仍非法的值：下方谓词用 TRIM 判定白名单，命中即跳过——
+	// 而渲染/事件归属按原始值精确比较，带空白值零发射且 UI 下拉无法匹配，
+	// 归一口径必须自洽（否则 ' blocking ' 永不自愈）。
+	"UPDATE security_policies SET ip_acl_mode=TRIM(ip_acl_mode) WHERE ip_acl_mode IS NOT NULL AND ip_acl_mode<>TRIM(ip_acl_mode)",
+	"UPDATE security_policies SET mode=TRIM(mode) WHERE mode IS NOT NULL AND mode<>TRIM(mode)",
+	"UPDATE security_policies SET geoip_mode=TRIM(geoip_mode) WHERE geoip_mode IS NOT NULL AND geoip_mode<>TRIM(geoip_mode)",
 	"UPDATE security_policies SET ip_acl_mode='deny' WHERE COALESCE(TRIM(ip_acl_mode),'') NOT IN ('allow','deny','绕过')",
 	"UPDATE security_policies SET mode='off' WHERE COALESCE(TRIM(mode),'') NOT IN ('off','custom_only','detection','blocking')",
 	"UPDATE security_policies SET geoip_mode='deny' WHERE COALESCE(TRIM(geoip_mode),'') NOT IN ('off','allow','deny')",

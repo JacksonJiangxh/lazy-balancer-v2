@@ -1993,8 +1993,8 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 	// （deny→allow）而存量引用携带内置名单、或只改引用为内置名单而存量模式为
 	// allow，都必须拦截。
 	if req.IPACLListRefs != nil || req.IPWhitelistRefs != nil || req.IPACLMode != nil || req.CRSExcludedRules != nil {
-		var storedMode, storedACLRefs, storedWLRefs string
-		if err := tx.QueryRow("SELECT COALESCE(ip_acl_mode,''), COALESCE(ip_acl_list_refs,'[]'), COALESCE(ip_whitelist_refs,'[]') FROM security_policies WHERE id=?", id).Scan(&storedMode, &storedACLRefs, &storedWLRefs); err != nil {
+		var storedMode, storedACLRefs, storedWLRefs, storedCRSExcluded string
+		if err := tx.QueryRow("SELECT COALESCE(ip_acl_mode,''), COALESCE(ip_acl_list_refs,'[]'), COALESCE(ip_whitelist_refs,'[]'), COALESCE(crs_excluded_rules,'[]') FROM security_policies WHERE id=?", id).Scan(&storedMode, &storedACLRefs, &storedWLRefs, &storedCRSExcluded); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "策略不存在"})
 			} else {
@@ -2016,6 +2016,11 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 		var effCRSRefs []int64
 		if req.CRSExcludedRules != nil {
 			effCRSRefs = crsExcludedListRefs(*req.CRSExcludedRules)
+		} else {
+			// 未提交 CRS 排除列表时按存量判定：只改 ip_acl_mode=allow 的请求
+			// 仍须看到存量 scope=ip/list 引用的内置名单（否则「先存内置名单、
+			// 后翻模式」可绕过禁令）。
+			effCRSRefs = crsExcludedListRefs(storedCRSExcluded)
 		}
 		if msg, err := validateBuiltinThreatListRefs(tx, effACLRefs, effWLRefs, effCRSRefs, effMode); err != nil {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: serverErrMsg("服务器内部错误", err)})
@@ -2734,7 +2739,7 @@ func normalizeRuleIDs(ids []string) []string {
 func (h *Handlers) BulkUpdatePolicyBindings(c *gin.Context) {
 	policyID, err := strconv.Atoi(c.Param("id"))
 	if err != nil || policyID <= 0 {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Invalid policy ID"})
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的策略 ID"})
 		return
 	}
 	const maxBulkBindings = 100
@@ -2879,7 +2884,7 @@ func (h *Handlers) BulkUpdatePolicyBindings(c *gin.Context) {
 			}
 			return "规则不存在: " + ruleCaddyID, nil
 		}
-		if ruleProtocol != "http" {
+		if bind && ruleProtocol != "http" {
 			return ruleCaddyID + ": 安全策略仅支持绑定 HTTP 规则（TCP 规则不经过 WAF/IP 访问控制/限流链）", nil
 		}
 		if bind {
@@ -3256,23 +3261,24 @@ func (h *Handlers) SplitSecurityPolicy(c *gin.Context) {
 	// security_regression_13 钉住），直接复制给子策略会让 ACL/信任合并集静默
 	// 缩窄为 inline-only、自定义拦截/拦截页静默缺席，且归因困难（启用门在
 	// 「另一次操作」才报错）。拒绝拆分并指引先修原策略——不产生半截子策略。
+	// 子策略 ACL 模式归一：空 ip_acl_mode 为存量脏值，与 Create 的缺省归一
+	// （deny）同口径。校验与落库共用同一形态——校验用归一值、写入用原值会让
+	// 「存量为空」的策略拆出 ip_acl_mode='' 的子策略（写入形态与校验结论脱节）。
+	childACLMode := "deny"
+	if features.G1 && p.IPACLMode != "" {
+		childACLMode = p.IPACLMode
+	}
 	if trustEntriesNonEmpty || features.G1 || features.G2 || features.G3 {
 		childCustomRules := ""
 		childCRSExcluded := ""
 		childBlockPageID := 0
 		var childACLRefs, childWLRefs []int64
-		childACLMode := "deny"
 		if features.G3 {
 			childCustomRules = rawJSONString(p.CustomRules)
 			childCRSExcluded = rawJSONString(p.CRSExcludedRules)
 		}
 		if features.G1 {
 			childACLRefs = parseIPListRefsIDs(p.IPACLListRefs)
-			// 空 ip_acl_mode 为存量脏值——与 Create 的缺省归一（deny）同口径，
-			// 避免内置名单门把「模式未设置」误判成 allow 侧拒绝。
-			if p.IPACLMode != "" {
-				childACLMode = p.IPACLMode
-			}
 		}
 		if trustEntriesNonEmpty {
 			childWLRefs = parseIPListRefsIDs(p.IPWhitelistRefs)
@@ -3297,6 +3303,27 @@ func (h *Handlers) SplitSecurityPolicy(c *gin.Context) {
 			return
 		}
 	}
+	// 全局数量上限（与 Create 同口径）：拆分一次最多新建 4 条子策略，
+	// 计数与插入同事务同锁（BEGIN IMMEDIATE），查询失败 fail-closed——否则
+	// 「策略总数未到上限」的检查点可被拆分批量绕开（200 条混合策略一次拆成
+	// 800 条子策略）。
+	childCount := 0
+	for _, present := range []bool{trustEntriesNonEmpty, features.G1, features.G2, features.G3} {
+		if present {
+			childCount++
+		}
+	}
+	if childCount > 0 {
+		var policyCount int
+		if err := tx.QueryRowContext(c.Request.Context(), "SELECT COUNT(*) FROM security_policies").Scan(&policyCount); err != nil {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "统计安全策略数量失败"})
+			return
+		}
+		if policyCount+childCount > securityPolicyMaxGlobalCount {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("安全策略总数上限为 %d 条，本次拆分将新增 %d 条子策略（当前 %d 条），请先清理不再使用的策略", securityPolicyMaxGlobalCount, childCount, policyCount)})
+			return
+		}
+	}
 	if trustEntriesNonEmpty {
 		if err := insertChild(models.PolicyTypeStage0, p.Name+stageSuffix[models.PolicyTypeStage0], "off", "deny", "[]", false,
 			p.IPWhitelist, p.IPWhitelistEnabled, json.RawMessage("[]"), false, 0, 0, "[]", "[]", "[]", 0, 0,
@@ -3306,7 +3333,7 @@ func (h *Handlers) SplitSecurityPolicy(c *gin.Context) {
 		}
 	}
 	if features.G1 {
-		if err := insertChild(models.PolicyTypeStage1, p.Name+stageSuffix[models.PolicyTypeStage1], "off", p.IPACLMode, p.IPACLList, p.IPACLEnabled,
+		if err := insertChild(models.PolicyTypeStage1, p.Name+stageSuffix[models.PolicyTypeStage1], "off", childACLMode, p.IPACLList, p.IPACLEnabled,
 			json.RawMessage("[]"), false, p.IPBlacklist, false, 0, 0, "[]", "[]", "[]", p.BlockPageID, p.BlockStatusCode,
 			p.GeoIPCountries, p.GeoIPMode, false, false, p.IPACLListRefs, "[]", false); err != nil {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: serverErrMsg("服务器内部错误", err)})
@@ -3817,8 +3844,15 @@ func (h *Handlers) GetIPEventCount(c *gin.Context) {
 		return
 	}
 	days := 30
-	if d := c.Query("days"); d != "" {
-		if v, err := strconv.Atoi(d); err == nil && v > 0 {
+	if raw := strings.TrimSpace(c.Query("days")); raw != "" {
+		// 与分页参数同口径：非整数显式 400（静默回落会让拼写错误无信号），
+		// <1 沿用默认、>365 钳到上限。
+		v, err := strconv.Atoi(raw)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "days 参数无效"})
+			return
+		}
+		if v >= 1 {
 			if v > 365 {
 				v = 365
 			}
@@ -4906,6 +4940,23 @@ func (h *Handlers) GetCRSUpdateStatus(c *gin.Context) {
 	})
 }
 
+// updateLogMaxBytes 更新日志响应体上限（单代）。两代拼接后同受此上限约束，
+// 否则「.1 副本 + 当前文件」会把响应体放大到两倍（各代独立 128KiB 截断）。
+const updateLogMaxBytes = 128 * 1024
+
+// truncateLogTail 保留文本末尾 maxBytes 字节（日志看的是最近输出）。截断点
+// 回退到 UTF-8 字符边界，避免把多字节字符切成半个（前端按文本渲染）。
+func truncateLogTail(text string, maxBytes int) string {
+	if maxBytes <= 0 || len(text) <= maxBytes {
+		return text
+	}
+	cut := len(text) - maxBytes
+	for cut < len(text) && text[cut]&0xC0 == 0x80 {
+		cut++
+	}
+	return text[cut:]
+}
+
 // readUpdateLogWithRotation 读更新日志（含上一代 .1 轮转副本，旧代在前）——
 // CRS/IP2Region/威胁三库更新日志端点共用。
 func readUpdateLogWithRotation(path string) string {
@@ -4913,7 +4964,7 @@ func readUpdateLogWithRotation(path string) string {
 	if oldData := readCertJobLogFile(path + ".1"); oldData != "" {
 		content = oldData + content
 	}
-	return content
+	return truncateLogTail(content, updateLogMaxBytes)
 }
 
 func (h *Handlers) GetCRSUpdateLogs(c *gin.Context) {

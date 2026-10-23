@@ -11,6 +11,7 @@ package services
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -85,6 +86,23 @@ func TestThreatRDBBootstrap_hashHitStillWritesFiles(t *testing.T) {
 	}
 	if _, err := os.Stat(iplistPath + ".fast"); err != nil {
 		t.Fatalf("哈希命中但文件缺失时必须重编译 .fast: %v", err)
+	}
+	// 只 Stat 存在性会让空/截断文件同样通过——必须校验重写内容与读回条目。
+	raw, err := os.ReadFile(iplistPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"192.0.2.0/24", "198.51.100.7"} {
+		if !strings.Contains(string(raw), want) {
+			t.Fatalf("重写 .iplist 缺条目 %q: %q", want, raw)
+		}
+	}
+	vals, err := readThreatIplistPath(iplistPath)
+	if err != nil {
+		t.Fatalf("读回重写 .iplist: %v", err)
+	}
+	if len(vals) != 2 {
+		t.Fatalf("读回条目数=%d, want 2（%v）", len(vals), vals)
 	}
 }
 

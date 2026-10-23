@@ -759,3 +759,60 @@ func TestApplySnapshot_securitySwitchOffSkipsCRSVersionRows(t *testing.T) {
 		t.Error("IP2Region version row must NOT apply when security switch off")
 	}
 }
+
+// 同步开关关闭告警的「版本去重」必须早于 WAF 文件全树哈希：同版本重放
+// （重载失败补偿重拉对同一版本重复 apply）本应被去重直接跳过，不得持
+// WafFileLock 重算 CRS 全树打包 + xdb 全文件 sha256（数十至数百毫秒，阻塞
+// 三库更新器与 lbbak 导入文件相位）。以「预持锁后调用必须立即返回」实证：
+// 若仍先算哈希，调用会阻塞直至 2s 超时。
+func TestLogSyncSwitchGuards_sameVersionDoesNotHashWafFiles(t *testing.T) {
+	_, database := newClusterTestService(t)
+	overrideWafPathsForServicesTest(t)
+	if _, err := database.Exec(`UPDATE global_config SET applied_waf_ref_version=7 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := models.ClusterSnapshot{
+		Version:  7,
+		WafFiles: &models.ClusterWafFilesRef{CRSVersion: "v1", CRSSha256: "deadbeef"},
+	}
+	sk := &sectionSkips{disabled: map[string]bool{"security": true}, unchanged: map[string]bool{}}
+
+	WafFileLock().Lock()
+	done := make(chan struct{})
+	go func() {
+		logSyncSwitchGuards(database, snapshot, sk, SyncSwitches{})
+		close(done)
+	}()
+	select {
+	case <-done:
+		WafFileLock().Unlock()
+	case <-time.After(2 * time.Second):
+		WafFileLock().Unlock()
+		t.Fatal("同版本告警去重前重算了 WAF 文件哈希（持 WafFileLock 全树打包）")
+	}
+}
+
+// 回归：版本推进时仍要走到文件比对与告警（去重不得把新版本也短路），
+// 并把去重版本推进到快照版本。
+func TestLogSyncSwitchGuards_newVersionHashesAndAdvancesDedup(t *testing.T) {
+	_, database := newClusterTestService(t)
+	overrideWafPathsForServicesTest(t)
+	if _, err := database.Exec(`UPDATE global_config SET applied_waf_ref_version=7 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := models.ClusterSnapshot{
+		Version:  8,
+		WafFiles: &models.ClusterWafFilesRef{CRSVersion: "v1", CRSSha256: "deadbeef"},
+	}
+	sk := &sectionSkips{disabled: map[string]bool{"security": true}, unchanged: map[string]bool{}}
+
+	logSyncSwitchGuards(database, snapshot, sk, SyncSwitches{})
+
+	var applied int
+	if err := database.QueryRow(`SELECT COALESCE(applied_waf_ref_version,0) FROM global_config WHERE id=1`).Scan(&applied); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 8 {
+		t.Fatalf("applied_waf_ref_version=%d, want 8（新版本必须走到文件比对并推进去重）", applied)
+	}
+}

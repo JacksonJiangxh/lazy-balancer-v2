@@ -113,3 +113,62 @@ func TestCrawlerEnginePrefilter_matchesEveryEngine(t *testing.T) {
 		}
 	}
 }
+
+// 伪装证据门：宽品牌串/对话式标记单独命中不足以判伪装（普通 UA 里合法
+// 出现），只有厂商专有爬虫 token 才作证据；未注册加严门的引擎恒为证据。
+// 不变量：加严门的匹配面必须 ⊆ UA 匹配面（否则引擎匹配不到却先问证据，
+// 或证据门放行了 UARegex 不认的形态）。
+func TestCrawlerSpoofEvidence_brandMarkersExcluded(t *testing.T) {
+	brandMarkers := []struct {
+		ua, engine string
+	}{
+		{"Mozilla/5.0 (compatible; DeepSeek/1.0)", "deepseekbot"},
+		{"Mozilla/5.0 (compatible; ChatGPT-User/1.0; +https://openai.com/bot)", "gptbot"},
+		{"Mozilla/5.0 (compatible; Claude-Web/1.0; +claude.ai)", "claudebot"},
+		{"Mozilla/5.0 (compatible; anthropic-ai/1.0)", "claudebot"},
+	}
+	for _, c := range brandMarkers {
+		if got := MatchCrawlerEngine(c.ua); got != c.engine {
+			t.Fatalf("前置：%q 应匹配 %q，实际 %q", c.ua, c.engine, got)
+		}
+		if CrawlerSpoofEvidence(c.engine, c.ua) {
+			t.Errorf("%q 属宽标记，不得单独构成伪装证据", c.ua)
+		}
+	}
+
+	officialTokens := []struct {
+		ua, engine string
+	}{
+		{"Mozilla/5.0 (compatible; GPTBot/1.0)", "gptbot"},
+		{"Mozilla/5.0 (compatible; OAI-SearchBot/1.0)", "gptbot"},
+		{"Mozilla/5.0 (compatible; DeepSeekBot/1.0)", "deepseekbot"},
+		{"Mozilla/5.0 (compatible; ClaudeBot/1.0)", "claudebot"},
+		{"Mozilla/5.0 (compatible; Claude-SearchBot/1.0)", "claudebot"},
+		{"Mozilla/5.0 (compatible; Googlebot/2.1)", "googlebot"},
+		{"Mozilla/5.0 (compatible; PetalBot/2.0)", "petalbot"},
+	}
+	for _, c := range officialTokens {
+		if !CrawlerSpoofEvidence(c.engine, c.ua) {
+			t.Errorf("%q 是官方 token，必须构成伪装证据（引擎 %q）", c.ua, c.engine)
+		}
+	}
+	if CrawlerSpoofEvidence("no-such-engine", "anything") {
+		t.Error("未知引擎不得构成伪装证据")
+	}
+
+	// 不变量：SpoofUARegex ⊆ UARegex。
+	for _, e := range crawlerEngines {
+		if e.SpoofUARegex == nil {
+			continue
+		}
+		if e.UARegex == nil {
+			t.Errorf("engine %q 注册了加严门但无 UARegex", e.ID)
+			continue
+		}
+		for _, ua := range []string{"Googlebot/2.1", "GPTBot/1.0", "OAI-SearchBot", "ChatGPT-User", "DeepSeekBot/1.0", "DeepSeek/1.0", "ClaudeBot/1.0", "Claude-SearchBot", "Claude-User", "Claude-Web", "anthropic-ai", "Bingbot"} {
+			if e.SpoofUARegex.MatchString(ua) && !e.UARegex.MatchString(ua) {
+				t.Errorf("engine %q: 加严门放行了 UA 匹配面之外的 %q", e.ID, ua)
+			}
+		}
+	}
+}

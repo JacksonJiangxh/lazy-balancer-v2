@@ -440,6 +440,54 @@ func TestSyncService_applySnapshot_replays_cert_jobs_when_rules_section_skipped(
 	}
 }
 
+// 从端镜像行必须回写源行时间轴：created_at/updated_at 取快照携带值（缺失时
+// 回落 DB 默认 CURRENT_TIMESTAMP/NULL，保持旧主端快照行为）。
+func TestApplySnapshot_restoresCertificateJobTimestamps(t *testing.T) {
+	_, database := newClusterTestService(t)
+	originalCertDir := certDir
+	certDir = t.TempDir()
+	t.Cleanup(func() { certDir = originalCertDir })
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enable_tls,tls_source,acme_config_id,ca_provider_id,enabled)
+		VALUES ('lb_ts_apply','ts','http','ts.example.com',443,1,'acme_dns',11,7,1)`); err != nil {
+		t.Fatal(err)
+	}
+	certPEM, keyPEM := matchingCertificatePair(t, "ts.example.com")
+	snapshot := v3SnapshotWithACMESection(models.ClusterSnapshot{
+		Version: 4,
+		Rules: []models.LbRule{{
+			CaddyID: "lb_ts_apply", Name: "ts", Protocol: "http", Domain: "ts.example.com",
+			ListenPort: 443, EnableTLS: true, TLSSource: "acme_dns",
+			ACMEConfigID: 11, CAProviderID: 7, Enabled: true,
+		}},
+		Certs: []models.ClusterCertificate{{
+			RuleID: "lb_ts_apply", Domain: "ts.example.com",
+			CertPEM: certPEM, KeyPEM: keyPEM, CAProviderID: 7,
+			CreatedAt: "2025-01-02 03:04:05", UpdatedAt: "2025-03-04 05:06:07",
+		}},
+	})
+	snapshot.SectionHashes = ComputeSnapshotSectionHashes(&snapshot)
+	caddyServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.WriteHeader(http.StatusOK)
+	}))
+	defer caddyServer.Close()
+	syncService := NewSyncService(database, &config.Config{CaddyAdminURL: caddyServer.URL}, NewCaddyService(caddyServer.URL))
+
+	if err := syncService.applySnapshot(context.Background(), snapshot); err != nil {
+		t.Fatalf("apply snapshot: %v", err)
+	}
+
+	var createdAt, updatedAt string
+	if err := database.QueryRow(`SELECT created_at, COALESCE(updated_at,'') FROM cert_jobs WHERE rule_id='lb_ts_apply'`).Scan(&createdAt, &updatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if normalizeSnapshotDatetime(createdAt) != "2025-01-02 03:04:05" {
+		t.Fatalf("created_at=%q（归一后 %q），want 源行时间（不得归零为同步时刻）", createdAt, normalizeSnapshotDatetime(createdAt))
+	}
+	if normalizeSnapshotDatetime(updatedAt) != "2025-03-04 05:06:07" {
+		t.Fatalf("updated_at=%q（归一后 %q），want 源行时间", updatedAt, normalizeSnapshotDatetime(updatedAt))
+	}
+}
+
 func TestClearSyncTables_propagatesDeleteError(t *testing.T) {
 	// Given
 	_, database := newClusterTestService(t)

@@ -2,6 +2,8 @@ package handlers
 
 import (
 	"bytes"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/models"
 	"lazy-balancer-v2/internal/services"
 )
 
@@ -130,17 +133,95 @@ func TestSecurityEntityEndpoints_nullColumnsDoNot500(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// When/Then：四个端点均不得 500（逐端点记录，一次性报告全部失败面）
-	statuses := map[string]int{}
-	statuses["GET /security/custom-rules"] = getRequest(t, router, "/security/custom-rules").Code
-	statuses[fmt.Sprintf("PUT /security/custom-rules/%d", ruleID)] = putJSON(t, router, fmt.Sprintf("/security/custom-rules/%d", ruleID), map[string]any{"name": "null规则改名"}).Code
-	statuses["GET /security/block-pages"] = getRequest(t, router, "/security/block-pages").Code
-	statuses[fmt.Sprintf("PUT /security/block-pages/%d", pageID)] = putJSON(t, router, fmt.Sprintf("/security/block-pages/%d", pageID), map[string]any{"name": "null拦截页改名", "content": "x"}).Code
-	for endpoint, code := range statuses {
-		if code == http.StatusInternalServerError {
-			t.Errorf("%s status=500（NULL 可空列不得拖垮端点）", endpoint)
+	// When/Then：四个端点均返回 200，且投影/落库值为 COALESCE 归一默认值
+	//（仅排除 500 会放过「非 500 的任意错误码」与「零值悄悄丢字段」两种漂移）。
+	listRules := getRequest(t, router, "/security/custom-rules")
+	if listRules.Code != http.StatusOK {
+		t.Fatalf("GET /security/custom-rules status=%d body=%s, want 200", listRules.Code, listRules.Body.String())
+	}
+	var rulesPayload struct {
+		Data []models.SecurityCustomRule `json:"data"`
+	}
+	if err := json.Unmarshal(listRules.Body.Bytes(), &rulesPayload); err != nil {
+		t.Fatalf("解析自定义规则列表: %v", err)
+	}
+	foundRule := false
+	for _, rule := range rulesPayload.Data {
+		if rule.ID != int(ruleID) {
+			continue
+		}
+		foundRule = true
+		if rule.Description != "" || rule.Action != "block" {
+			t.Fatalf("NULL 列投影 description=%q action=%q, want \"\"/block（COALESCE 默认值）", rule.Description, rule.Action)
 		}
 	}
+	if !foundRule {
+		t.Fatalf("自定义规则列表未包含 #%d", ruleID)
+	}
+
+	listPages := getRequest(t, router, "/security/block-pages")
+	if listPages.Code != http.StatusOK {
+		t.Fatalf("GET /security/block-pages status=%d body=%s, want 200", listPages.Code, listPages.Body.String())
+	}
+	var pagesPayload struct {
+		Data []models.SecurityBlockPage `json:"data"`
+	}
+	if err := json.Unmarshal(listPages.Body.Bytes(), &pagesPayload); err != nil {
+		t.Fatalf("解析拦截页列表: %v", err)
+	}
+	foundPage := false
+	for _, page := range pagesPayload.Data {
+		if page.ID != int(pageID) {
+			continue
+		}
+		foundPage = true
+		if page.Description != "" || page.Content != "" || page.IsDefault {
+			t.Fatalf("NULL 列投影 description=%q content=%q is_default=%v, want \"\"/\"\"/false",
+				page.Description, page.Content, page.IsDefault)
+		}
+		if page.ContentType != models.DefaultBlockPageContentType {
+			t.Fatalf("NULL content_type 投影=%q, want 默认 %q", page.ContentType, models.DefaultBlockPageContentType)
+		}
+	}
+	if !foundPage {
+		t.Fatalf("拦截页列表未包含 #%d", pageID)
+	}
+
+	if rec := putJSON(t, router, fmt.Sprintf("/security/custom-rules/%d", ruleID), map[string]any{"name": "null规则改名"}); rec.Code != http.StatusOK {
+		t.Fatalf("PUT custom rule status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	var ruleDescription, ruleAction sql.NullString
+	if err := db.DB.QueryRow(`SELECT description, action FROM security_custom_rules WHERE id=?`, ruleID).Scan(&ruleDescription, &ruleAction); err != nil {
+		t.Fatal(err)
+	}
+	// 读-合并-写必须把归一值落回库：NULL 不得继续留在列里（否则下次裸扫描
+	// 的消费方仍会 500）。
+	if !ruleDescription.Valid || ruleDescription.String != "" {
+		t.Fatalf("自定义规则 description 落库=%v, want 非 NULL 空串", ruleDescription)
+	}
+	if !ruleAction.Valid || ruleAction.String != "block" {
+		t.Fatalf("自定义规则 action 落库=%v, want 非 NULL \"block\"", ruleAction)
+	}
+
+	if rec := putJSON(t, router, fmt.Sprintf("/security/block-pages/%d", pageID), map[string]any{"name": "null拦截页改名", "content": "x"}); rec.Code != http.StatusOK {
+		t.Fatalf("PUT block page status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	var pageDescription, pageContent, pageContentType sql.NullString
+	if err := db.DB.QueryRow(`SELECT description, content, content_type FROM security_block_pages WHERE id=?`, pageID).
+		Scan(&pageDescription, &pageContent, &pageContentType); err != nil {
+		t.Fatal(err)
+	}
+	if !pageDescription.Valid || pageDescription.String != "" {
+		t.Fatalf("拦截页 description 落库=%v, want 非 NULL 空串", pageDescription)
+	}
+	if !pageContent.Valid || pageContent.String != "x" {
+		t.Fatalf("拦截页 content 落库=%v, want \"x\"", pageContent)
+	}
+	if !pageContentType.Valid || pageContentType.String != models.DefaultBlockPageContentType {
+		t.Fatalf("拦截页 content_type 落库=%v, want 非 NULL %q", pageContentType, models.DefaultBlockPageContentType)
+	}
+	// is_default 不在 Update 的可写字段面内：该列的 NULL 由列表投影的
+	// COALESCE(is_default,0) 吸收（上面已断言投影为 false），此处不再要求落库归一。
 }
 
 // 事件列表投影补齐 COALESCE——rule_name/

@@ -503,13 +503,14 @@ func validateConvertedV1Rules(rules []convertedRule, portGates ...func(string, i
 			skips = append(skips, fmt.Sprintf("规则 #%d（%s）：%v", index+1, rule.Name, err))
 			continue
 		}
-		// 导入 INSERT 的探测超时硬编码 5s，
-		// timeout<interval 不变量（保存侧门控）在导入链未生效——fail_timeout ≤ 5 的
-		// v1 规则会让活动检查单次耗时与间隔重叠。钳位 interval ≥ 6（语义近似保留，
-		// 仅活动检查启用时生效；被动检查的 fail_duration=interval*3 不受超时约束）。
-		if rule.ActiveHC && rule.HealthInt <= 5 {
-			rule.HealthInt = 6
-			normalizations = append(normalizations, fmt.Sprintf("规则 #%d（%s）：v1 健康检查间隔过短，已提为 6 秒（探测超时 5 秒须小于间隔）", index+1, rule.Name))
+		// 导入 INSERT 的 health_check_timeout 恒取 db.DefaultHealthCheckTimeout，
+		// 而保存/启用侧的不变式要求超时小于间隔。v1 的 fail_timeout 直接映射为
+		// 间隔，过短时该行落库后会在下一次保存/启用被拒（规则变成不可维护的
+		// 陷阱行），故按落库超时归一间隔。阈值与文案同源派生自默认超时，
+		// 不区分主动/被动（被动熔断窗口同样由间隔派生）。
+		if minInterval := db.DefaultHealthCheckTimeout + 1; rule.HealthInt < minInterval {
+			rule.HealthInt = minInterval
+			normalizations = append(normalizations, fmt.Sprintf("规则 #%d（%s）：v1 健康检查间隔过短，已提为 %d 秒（须大于健康检查超时 %d 秒）", index+1, rule.Name, minInterval, db.DefaultHealthCheckTimeout))
 		}
 		// TCP 规则在 v2 渲染侧不终结入站 TLS（buildTCPServer 不触碰 TLS
 		// 字段），v1 的 SSL 开关对 TCP 无意义；保留 enable_tls=1 + 空 manual 证书会因
@@ -661,7 +662,7 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 		// 取交集而非替换，纯 JSON 以体内 sections 为准；交集为空与导入同文案
 		// valid=false（此前预览替换后可能「可导入」而导入 400）。
 		// 须在完整性校验之后——v3 校验和覆盖体内 sections（还原范围）。
-		if err := resolveImportSectionSelection(&backup, c.Query("sections"), lbbakPayloadFromCtx(c) != nil); err != nil {
+		if err := resolveImportSectionSelection(&backup, c.Query("sections")); err != nil {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
 			return
 		}
@@ -707,7 +708,7 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 		// idle 并告警，预览此前跳过该步，导致同一备份的 warnings 双路径不同。
 		skipWarnings = append(skipWarnings, normalizeImportedVersionUpdateStatuses(backup.Tables)...)
 		// 行级门在 sections 过滤与软跳过之后（与导入同序）。
-		if err := validateV2BackupRows(backup); err != nil {
+		if err := validateV2BackupRows(c.Request.Context(), db.DB, backup); err != nil {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
 			return
 		}
@@ -841,12 +842,12 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 				validateWarnings = append(validateWarnings, warning)
 			}
 		}
-		// 本剔除步位于全部校验器之后，与导入侧
-		//（ImportConfigBackup 在行级校验之前剔除）顺序不一致——「导入/预览双路径
-		// 同序」不变量的有意例外：现存校验器均不读 security_crs_version/
-		// security_ip2region_version 两行表（逐函数核实），剔除先后无可观察
-		// 分叉。**未来新增读取这两表的校验器时，必须先把本步前移到
-		// validateBackupRuleReferences 之前与导入逐行对齐。**
+		// 本剔除步与导入侧（ImportConfigBackup 的版本表剔除）相对次序一致：
+		// 两侧都是「行级校验 → 版本表剔除」。行级校验器
+		//（validateV2BackupRows → validateV2BackupBooleanTypes）已登记并消费
+		// security_crs_version / security_ip2region_version 的 auto_update 列，
+		// 因此剔除前移会先删表、双路径都静默放过坏值——它必须留在校验之后；
+		// 未来若确需调整次序，预览与导入必须同步改并保持这一相对关系。
 		// 镜像导入侧单侧文件缺失建模——
 		// 单侧缺失剔对应版本表并告警（此前仅建模双侧缺失，单侧形态预览计数
 		// 含两表且无警告，与导入实际落库分叉）；双侧缺失语义保持

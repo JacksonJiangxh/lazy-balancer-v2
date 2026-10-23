@@ -142,6 +142,16 @@ func (s *ClusterService) Snapshot(ctx context.Context, sinceVersion int, clientF
 		// 注册轮询侧的 confirm 交付语义同源），在 304 门之前执行纯属浪费。
 		return snapshot, false, nil
 	}
+	// 只读事务视图在第一条 SELECT 时冻结：cachedSnapshot 起点的角色复核之后
+	// 提交的降级对该事务不可见，仍会按主节点视图组装并下发一份完整快照
+	// （用户 hash/证书私钥/云凭据）。构建返回后、写响应前做一次事务外点查
+	// 复核；读失败按 fail-closed 处理（无法确认角色即不下发）。成本=一次主键
+	// 点查，仅真正下发的快照承担。
+	if isMaster, err := RoleOf(ctx, s.db); err != nil {
+		return models.ClusterSnapshot{}, false, fmt.Errorf("复核节点角色: %w", err)
+	} else if !isMaster {
+		return models.ClusterSnapshot{}, false, ErrNotMasterNode
+	}
 	snapshot.CanonicalPayload = append(json.RawMessage(nil), canonical...)
 	if tokenKey != "" {
 		// 签名绑定 canonical(含版本),
@@ -517,6 +527,21 @@ func nearestSnapshotCertificateExpiry(certificates []models.ClusterCertificate, 
 	return nearest
 }
 
+// normalizeSnapshotDatetime 把源行时间列归一为平面 UTC 串（crsTimeLayout，
+// 与 cert_jobs 写侧/读取侧同口径）。双布局解析（平面串 + RFC3339）后统一转
+// UTC；无法解析（空/畸形）返回空串，由 apply 侧回落 DB 默认，避免把畸形源值
+// 原样搬进从端。
+func normalizeSnapshotDatetime(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	parsed := parseUTCSlot(raw)
+	if parsed.IsZero() {
+		return ""
+	}
+	return parsed.UTC().Format(crsTimeLayout)
+}
+
 func parseSnapshotExpiry(value string) (time.Time, error) {
 	for _, layout := range []string{time.RFC3339Nano, "2006-01-02 15:04:05.999999999-07:00", "2006-01-02 15:04:05.999999999"} {
 		if parsed, err := time.Parse(layout, value); err == nil {
@@ -565,6 +590,16 @@ func (s *ClusterService) loadSnapshotGlobalSettings(ctx context.Context, store s
 	if snapshot.BasicSettings.SyncInterval != nil {
 		normalized := normalizeSyncInterval(*snapshot.BasicSettings.SyncInterval)
 		snapshot.BasicSettings.SyncInterval = &normalized
+	}
+	// 同族剩余两列：apply 侧会归一后落库并重建节哈希，主端装载侧必须同口径，
+	// 否则带外写入的上限越界值（运行期直改库）让 users 节哈希主从恒不等。
+	if snapshot.BasicSettings.JWTExpireMinutes != nil {
+		normalized := normalizeJWTExpireMinutes(*snapshot.BasicSettings.JWTExpireMinutes)
+		snapshot.BasicSettings.JWTExpireMinutes = &normalized
+	}
+	if snapshot.BasicSettings.CertExpiryDays != nil {
+		normalized := normalizeCertExpiryDays(*snapshot.BasicSettings.CertExpiryDays)
+		snapshot.BasicSettings.CertExpiryDays = &normalized
 	}
 	snapshot.BasicSettings.BrandingJSON = new(brandingJSON)
 	snapshot.CaddyConfig = &caddyConfig
@@ -1176,7 +1211,8 @@ func (s *ClusterService) snapshotUsers(ctx context.Context, store snapshotStore)
 	rows, err := store.QueryContext(ctx, `SELECT id, username, password_hash, role, COALESCE(display_name,''), COALESCE(is_enabled,1),
 		COALESCE(password_version,0), strftime('%Y-%m-%dT%H:%M:%fZ', password_changed_at), created_at, last_login,
 		COALESCE(mfa_enabled,0), COALESCE(mfa_secret,''), COALESCE(mfa_recovery_codes,'[]'),
-		COALESCE(mfa_last_timestep,0), COALESCE(auth_provider,''), COALESCE(oidc_subject,''), COALESCE(oidc_issuer,'') FROM users ORDER BY username`)
+		COALESCE(mfa_last_timestep,0), COALESCE(auth_provider,''), COALESCE(oidc_subject,''), COALESCE(oidc_issuer,''),
+		COALESCE(is_setup_admin,0) FROM users ORDER BY username`)
 	if err != nil {
 		return nil, fmt.Errorf("读取快照用户: %w", err)
 	}
@@ -1187,7 +1223,7 @@ func (s *ClusterService) snapshotUsers(ctx context.Context, store snapshotStore)
 		var passwordChangedAt sql.NullString
 		if err := rows.Scan(&user.ID, &user.Username, &user.PasswordHash, &user.Role, &user.DisplayName, &user.IsEnabled, &user.PasswordVersion, &passwordChangedAt, &user.CreatedAt, &user.LastLogin,
 			&user.MFAEnabled, &user.MFASecret, &user.MFARecoveryCodes, &user.MFALastTimestep,
-			&user.AuthProvider, &user.OIDCSubject, &user.OIDCIssuer); err != nil {
+			&user.AuthProvider, &user.OIDCSubject, &user.OIDCIssuer, &user.IsSetupAdmin); err != nil {
 			return nil, fmt.Errorf("扫描快照用户: %w", err)
 		}
 		if passwordChangedAt.Valid {
@@ -1281,7 +1317,8 @@ func (s *ClusterService) snapshotCertificates(ctx context.Context, store snapsho
 	// 改为「启用或仍持有有效证书」属数据面语义变更，需用户裁定——本轮仅
 	// 声明契约并以 TestSnapshotCertificates_mirrorsOnlyEnabledRules 钉死。
 	rows, err = store.QueryContext(ctx, `SELECT r.caddy_id,r.domain,j.domain,j.cert_pem,j.key_pem,COALESCE(j.expires_at,''),COALESCE(j.ca_provider_id,0),j.status,
-		COALESCE(j.renewal_attempts,0),j.ca_available_after,COALESCE(j.last_error_code,''),COALESCE(julianday(COALESCE(j.updated_at,j.created_at)),0),j.id
+		COALESCE(j.renewal_attempts,0),j.ca_available_after,COALESCE(j.last_error_code,''),COALESCE(julianday(COALESCE(j.updated_at,j.created_at)),0),j.id,
+		COALESCE(j.created_at,''),COALESCE(j.updated_at,'')
 		FROM lb_rules r JOIN cert_jobs j ON j.rule_id=r.caddy_id
 		WHERE r.enabled=1 AND r.enable_tls=1 AND r.tls_source='acme_dns' AND j.status<>'disabled'
 		AND COALESCE(j.cert_pem,'')<>'' AND COALESCE(j.key_pem,'')<>''
@@ -1300,10 +1337,14 @@ func (s *ClusterService) snapshotCertificates(ctx context.Context, store snapsho
 	for rows.Next() {
 		var cert models.ClusterCertificate
 		var ruleDomain string
+		var sourceCreatedAt, sourceUpdatedAt string
 		var candidate CertificateCandidate
-		if err := rows.Scan(&cert.RuleID, &ruleDomain, &cert.Domain, &cert.CertPEM, &cert.KeyPEM, &cert.ExpiresAt, &cert.CAProviderID, &cert.SourceStatus, &cert.RenewalAttempts, &cert.CAAvailableAfter, &cert.LastErrorCode, &candidate.UpdatedAt, &candidate.ID); err != nil {
+		if err := rows.Scan(&cert.RuleID, &ruleDomain, &cert.Domain, &cert.CertPEM, &cert.KeyPEM, &cert.ExpiresAt, &cert.CAProviderID, &cert.SourceStatus, &cert.RenewalAttempts, &cert.CAAvailableAfter, &cert.LastErrorCode, &candidate.UpdatedAt, &candidate.ID, &sourceCreatedAt, &sourceUpdatedAt); err != nil {
 			return nil, fmt.Errorf("扫描快照 ACME 证书: %w", err)
 		}
+		// 时间轴按平面 UTC 归一（源行原值；无法解析时留空，apply 回落 DB 默认）。
+		cert.CreatedAt = normalizeSnapshotDatetime(sourceCreatedAt)
+		cert.UpdatedAt = normalizeSnapshotDatetime(sourceUpdatedAt)
 		canonicalRuleDomain, err := CanonicalACMEDomains(ruleDomain)
 		if err != nil {
 			// fail-open 裁定家族：单条规则的域名串损坏（导入残留/

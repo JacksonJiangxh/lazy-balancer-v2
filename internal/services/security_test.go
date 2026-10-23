@@ -167,10 +167,9 @@ func TestBuildCorazaDirectives_BodyAccessTruthTable(t *testing.T) {
 			if tc.mode == "blocking" || tc.mode == "detection" {
 				p.AnomalyThreshold = 5
 			}
-			switch tc.rulesState {
-			case "parked-enabled":
-				p.CustomRules = rulesJSON(true)
-			case "emitted-enabled":
+			if tc.rulesState != "none" {
+				// parked-enabled 与 emitted-enabled 对本谓词是同一输入等价类
+				//（只有「无自定义规则」/「有启用规则」两态）——单一分支。
 				p.CustomRules = rulesJSON(true)
 			}
 			if tc.ipControl {
@@ -416,5 +415,20 @@ func TestCrawlerEngines_malformedWarnsAndKeepsCompat(t *testing.T) {
 	}
 	if strings.Contains(logs.String(), "解析失败") {
 		t.Fatalf("合法 engines 不得留痕:\n%s", logs.String())
+	}
+}
+
+// CRS 段界单源：fallback 门与归因 switch 复用 securityEventsRuleIsCRSFamily，
+// 不再各自复写 9xxxxx 字面量。段界 [900000,1000000) 的邻值必须严格分侧。
+func TestSecurityEventsRuleIsCRSFamily_boundaries(t *testing.T) {
+	for _, id := range []string{"900000", "942100", "999999"} {
+		if !securityEventsRuleIsCRSFamily(id) {
+			t.Fatalf("securityEventsRuleIsCRSFamily(%q)=false, want true", id)
+		}
+	}
+	for _, id := range []string{"899999", "1000000", "8", ""} {
+		if securityEventsRuleIsCRSFamily(id) {
+			t.Fatalf("securityEventsRuleIsCRSFamily(%q)=true, want false", id)
+		}
 	}
 }

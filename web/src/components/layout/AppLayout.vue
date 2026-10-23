@@ -180,48 +180,7 @@
       </el-footer>
     </el-container>
 
-    <el-dialog v-model="showProfile" width="min(520px, 92vw)" :close-on-click-modal="false" :before-close="beforeProfileClose" class="profile-dialog">
-      <template #header>
-        <DialogHeader :icon="User" title="个人资料" :subtitle="isOIDCUser ? 'OIDC 企业认证账户' : '本地账户'" />
-      </template>
-      <div v-if="isReadOnly" class="info-note-bar profile-readonly-note"><span class="info-note-desc">{{ authStore.readOnlyMessage }}</span></div>
-      <el-form :model="profileForm" label-width="80px" class="profile-form" :disabled="saving">
-        <el-form-item label="用户名">
-          <el-input v-model="profileForm.username" disabled />
-        </el-form-item>
-        <!-- v2.3.0:OIDC 用户显示名/密码源自 IdP,本地不可改(用户裁定) -->
-        <template v-if="isOIDCUser">
-          <el-form-item label="显示名">
-            <el-input :model-value="profileForm.display_name" disabled />
-          </el-form-item>
-          <el-form-item label="认证方式">
-            <el-tag type="primary" effect="plain" size="small">OIDC 企业认证</el-tag>
-          </el-form-item>
-          <el-form-item label-width="0">
-            <div class="oidc-hint-block">显示名与密码由认证服务管理，如需修改请前往 OIDC 服务</div>
-          </el-form-item>
-        </template>
-        <template v-else>
-          <el-form-item label="显示名">
-            <el-input v-model="profileForm.display_name" :disabled="isReadOnly" placeholder="选填" maxlength="50" />
-          </el-form-item>
-          <el-form-item label="新密码">
-            <el-input v-model="profileForm.password" :disabled="isReadOnly" type="password" minlength="8" maxlength="24" placeholder="如不修改请留空（8-24位）" show-password />
-          </el-form-item>
-          <el-form-item label="确认新密码">
-            <el-input v-model="profileForm.passwordConfirm" :disabled="isReadOnly" type="password" minlength="8" maxlength="24" placeholder="再次输入新密码" show-password />
-          </el-form-item>
-          <el-form-item label="当前密码">
-            <el-input v-model="profileForm.currentPassword" :disabled="isReadOnly" type="password" maxlength="72" :placeholder="profileForm.password ? '修改密码时必填' : '填写新密码后需确认'" show-password />
-          </el-form-item>
-        </template>
-      </el-form>
-      <template #footer>
-        <el-button :disabled="saving" @click="closeProfile">取消</el-button>
-        <!-- OIDC 用户全部字段只读（显示名/密码源自 IdP），保存必败（后端 400）——直接隐藏保存钮-->
-        <el-button v-if="!isOIDCUser" type="primary" :loading="saving" :disabled="isReadOnly || saving" @click="saveProfile">保存</el-button>
-      </template>
-    </el-dialog>
+    <ProfileDialog v-model="showProfile" />
   </el-container>
 </template>
 
@@ -230,14 +189,12 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useMediaQuery } from '@vueuse/core'
 import { useAuthStore } from '@/stores/auth'
 import type { PageId } from '@/utils/pageIds'
-import { request, mfaAwareSuccess, ApiRequestError } from '@/utils/api'
-import { isCurrentPasswordRejection } from '@/utils/profileUpdate'
+import { request } from '@/utils/api'
 import {Timer,  DataAnalysis, List, Setting, Cpu, User, Connection, Lock, Key, Document, Warning, Notebook } from '@element-plus/icons-vue'
-import DialogHeader from '@/components/DialogHeader.vue'
+import ProfileDialog from '@/components/ProfileDialog.vue'
 import AppLogo from '@/components/AppLogo.vue'
 import { appName, footerHtml } from '@/utils/branding'
 import { restartServiceWithFeedback } from '@/utils/restart'
-import { validatePassword } from '@/utils/credentials'
 import { createVisibilityIntervals } from '@/composables/useVisibilityIntervals'
 import { SETTINGS_BREADCRUMB_PARENT, SETTINGS_TAB_IDS, SETTINGS_TAB_TITLES } from '@/utils/settingsPages'
 
@@ -246,7 +203,6 @@ const collapsed = ref(false)
 const isNarrowViewport = useMediaQuery('(max-width: 768px)')
 const effectiveCollapsed = computed(() => collapsed.value || isNarrowViewport.value)
 const showProfile = ref(false)
-const saving = ref(false)
 const loggingOut = ref(false)
 
 const currentPage = computed(() => authStore.currentPage)
@@ -254,7 +210,6 @@ const currentPage = computed(() => authStore.currentPage)
 // 自助资料编辑；非管理员的自我显示名/改密是自助能力而非管理员操作，不随此收紧
 //（后端恢复后仍按自身身份正确鉴权）。
 const isOIDCUser = computed(() => authStore.user?.auth_provider === 'oidc')
-const isReadOnly = computed(() => authStore.readOnlyReason === 'slave' || authStore.readOnlyReason === 'unknown')
 const menuDisplayName = computed(() => authStore.user?.display_name || authStore.user?.username || '用户')
 const hasCustomDisplayName = computed(() => {
   const displayName = authStore.user?.display_name || ''
@@ -295,26 +250,6 @@ const pageTitle: Record<string, string> = {
   ...settingsPageTitles,
 }
 
-const profileForm = ref({
-  username: '',
-  display_name: '',
-  password: '',
-  // 2026-09-19 用户裁定：密码修改需二次确认
-  passwordConfirm: '',
-  // 提交新密码时的当前密码确认（后端密码确认门，不改密码时不需要）
-  currentPassword: '',
-})
-
-const syncProfileForm = () => {
-  profileForm.value = {
-    username: authStore.user?.username || '',
-    display_name: authStore.user?.display_name || '',
-    password: '',
-    passwordConfirm: '',
-    currentPassword: '',
-  }
-}
-
 const goPage = (page: PageId) => {
   authStore.setCurrentPage(page)
 }
@@ -331,64 +266,9 @@ const logout = async (): Promise<void> => {
 
 const handleCommand = async (command: string): Promise<void> => {
   if (command === 'profile') {
-    if (saving.value) return
-    syncProfileForm()
     showProfile.value = true
   } else if (command === 'logout') {
     await logout()
-  }
-}
-
-const beforeProfileClose = (done: () => void): void => {
-  if (!saving.value) done()
-}
-
-const closeProfile = (): void => {
-  if (!saving.value) showProfile.value = false
-}
-
-const saveProfile = async () => {
-  if (isReadOnly.value || saving.value) return
-  const passwordError = validatePassword(profileForm.value.password)
-  if (passwordError) {
-    authStore.showToast('warning', passwordError)
-    return
-  }
-  // 提交新密码必须携带当前密码（后端密码确认门），不改密码时不需要。
-  if (profileForm.value.password && !profileForm.value.currentPassword) {
-    authStore.showToast('warning', '请输入当前密码')
-    return
-  }
-  if (profileForm.value.password && profileForm.value.password !== profileForm.value.passwordConfirm) {
-    authStore.showToast('warning', '两次输入的新密码不一致')
-    return
-  }
-  saving.value = true
-  const passwordChanged = Boolean(profileForm.value.password)
-  try {
-    await request.patch('/users/me', {
-      display_name: profileForm.value.display_name,
-      ...(profileForm.value.password && { password: profileForm.value.password, current_password: profileForm.value.currentPassword }),
-    })
-    showProfile.value = false
-    if (passwordChanged) {
-      authStore.showToast('success', '密码已修改，请重新登录')
-      await logout()
-    } else {
-      mfaAwareSuccess('保存成功')
-      await authStore.fetchUser()
-    }
-  } catch (error: unknown) {
-    // 当前密码错误被拦截器有意豁免全局 toast/会话弹窗，必须在页面本地可见；
-    // 其它错误仍由全局拦截器反馈，避免重复 toast。
-    if (error instanceof ApiRequestError
-      && isCurrentPasswordRejection('patch', '/users/me', error.status, error.message)) {
-      authStore.showToast('error', error.message)
-    } else {
-      console.error('Failed to save profile:', error)
-    }
-  } finally {
-    saving.value = false
   }
 }
 
@@ -445,7 +325,6 @@ const driftPolling = createVisibilityIntervals({
 })
 
 onMounted(() => {
-  syncProfileForm()
   driftPolling.start()
 })
 
@@ -728,19 +607,6 @@ onUnmounted(() => {
   opacity: 0;
 }
 
-.profile-form { padding: 4px 28px 0; }
-.profile-form :deep(.el-form-item) { margin-bottom: 20px; }
-.profile-form :deep(.el-form-item__label) { color: var(--el-text-color-regular); }
-.profile-readonly-note { margin: 0 28px 12px; }
 .user-name-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .user-source-tag { flex-shrink: 0; height: 18px; padding: 0 6px; font-size: 11px; line-height: 16px; }
-.oidc-hint-block {
-  width: 100%;
-  padding: 8px 12px;
-  border-radius: 6px;
-  background: var(--el-fill-color-light);
-  color: var(--el-text-color-secondary);
-  font-size: 12.5px;
-  line-height: 1.6;
-}
 </style>

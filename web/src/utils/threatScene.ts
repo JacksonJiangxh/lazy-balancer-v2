@@ -18,7 +18,7 @@ import {
 } from '@/utils/threatProjection'
 import { THREAT_COUNTRIES } from '@/utils/worldBorders'
 import { CHINA_PROVINCES } from '@/utils/chinaProvinces'
-import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, adminShortName as sharedShortName, DOT_LAND as SHARED_DOT_LAND, normalizeCountryName, aggregateCountryCounts, POINTY_TOP_HEX_VERTICES, drillCountryAllowed, arcOriginForLocation, hasProvinceStats, drillCommitAllowed, drillClickIntent, polysBounds, trafficOriginForCountry } from '@/utils/threatShared'
+import { heatCss, heatEntriesEqual, pointInPolys as sharedPointInPolys, adminShortName as sharedShortName, DOT_LAND as SHARED_DOT_LAND, normalizeCountryName, aggregateCountryCounts, buildCountryCellGrid, countryGridCell, POINTY_TOP_HEX_VERTICES, drillCountryAllowed, arcOriginForLocation, hasProvinceStats, drillCommitAllowed, drillClickIntent, polysBounds, trafficOriginForCountry } from '@/utils/threatShared'
 import type { Centroid } from '@/utils/countryCentroids'
 import { loadAdmin1Tables } from '@/utils/admin1Loader'
 import { FLOW_ATTACK_COLOR as ATTACK_COLOR, FLOW_NORMAL_COLOR as NORMAL_COLOR, FLOW_FLIGHT_MS, FLOW_HOVER_TIP_COLOR, FLOW_RIPPLE_SECONDS, FLOW_RIPPLE_START_RADIUS, FLOW_RIPPLE_GROWTH_RADIUS, FLOW_RIPPLE_LINE_WIDTH, FLOW_RIPPLE_ALPHA, easeOutCubic, flowArcLabel, flowArcTierWidth, type FlowArcTier } from '@/utils/threatTheme'
@@ -266,58 +266,15 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
   // 保持「点径/间距」与原地图一致，避免点互相粘连成色块。
   const DOT_R = 0.18
   const DOT_LAND = SHARED_DOT_LAND
-  // 国家 bbox 预筛缓存
-  const countryBboxes = THREAT_COUNTRIES.map((c) => ({ name: c.name, minLon: 0, maxLon: 0, minLat: 0, maxLat: 0, polys: c.polys, computed: false }))
-  function bboxOf(i: number): { minLon: number; maxLon: number; minLat: number; maxLat: number } {
-    const b = countryBboxes[i]
-    if (!b.computed) {
-      let minLon = 180, maxLon = -180, minLat = 90, maxLat = -90
-      for (const poly of b.polys) for (const ring of poly) for (let k = 0; k + 1 < ring.length; k += 2) {
-        if (ring[k] < minLon) minLon = ring[k]
-        if (ring[k] > maxLon) maxLon = ring[k]
-        if (ring[k + 1] < minLat) minLat = ring[k + 1]
-        if (ring[k + 1] > maxLat) maxLat = ring[k + 1]
-      }
-      Object.assign(b, { minLon, maxLon, minLat, maxLat, computed: true })
-    }
-    return b
-  }
-
-  // 国家 bbox 空间网格：首屏点阵不再对每个点全量遍历 239 国。5° 网格把
-  // pointInPolys 候选压到个位数，点阵构建从秒级降到毫秒级。
-  const COUNTRY_GRID_DEG = 5
-  let countryGrid: Map<number, number[]> | null = null
-  const countryCell = (lon: number, lat: number): number => {
-    const x = Math.min(71, Math.max(0, Math.floor((lon + 180) / COUNTRY_GRID_DEG)))
-    const y = Math.min(35, Math.max(0, Math.floor((lat + 90) / COUNTRY_GRID_DEG)))
-    return y * 100 + x
-  }
-  function ensureCountryGrid(): Map<number, number[]> {
-    if (countryGrid) return countryGrid
-    const grid = new Map<number, number[]>()
-    for (let ci = 0; ci < THREAT_COUNTRIES.length; ci++) {
-      const b = bboxOf(ci)
-      const x0 = Math.min(71, Math.max(0, Math.floor((b.minLon + 180) / COUNTRY_GRID_DEG)))
-      const x1 = Math.min(71, Math.max(0, Math.floor((b.maxLon + 180) / COUNTRY_GRID_DEG)))
-      const y0 = Math.min(35, Math.max(0, Math.floor((b.minLat + 90) / COUNTRY_GRID_DEG)))
-      const y1 = Math.min(35, Math.max(0, Math.floor((b.maxLat + 90) / COUNTRY_GRID_DEG)))
-      for (let y = y0; y <= y1; y++) {
-        for (let x = x0; x <= x1; x++) {
-          const key = y * 100 + x
-          const list = grid.get(key)
-          if (list) list.push(ci)
-          else grid.set(key, [ci])
-        }
-      }
-    }
-    countryGrid = grid
-    return grid
-  }
+  // 国家 bbox 预筛缓存（外包框由共享网格构建一并算出，hover/点击与点阵共用）
+  const sharedCountryGrid = buildCountryCellGrid(THREAT_COUNTRIES)
+  const countryBboxes = THREAT_COUNTRIES.map((c, i) => ({ name: c.name, ...sharedCountryGrid.bounds[i], polys: c.polys }))
+  const bboxOf = (i: number): { minLon: number; maxLon: number; minLat: number; maxLat: number } => countryBboxes[i]
 
   function buildWorldDots(): void {
     if (worldDots) return
     const dots: Dot[] = []
-    const grid = ensureCountryGrid()
+    const grid = sharedCountryGrid.grid
     let rowIdx = 0
     // Mercator 下按「投影后 y」等距布点，而不是按纬度等距：等纬度步长
     // 会在高纬被拉稀、低纬挤密（用户实测：上方稀、下方密、南半球显小）。
@@ -328,7 +285,7 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
       const lat = yToLat(y)
       const lonOffset = rowIdx % 2 === 1 ? DOT_STEP / 2 : 0
       for (let lon = -179.5 + lonOffset; lon < 180; lon += DOT_STEP) {
-        const candidates = grid.get(countryCell(lon, lat)) ?? []
+        const candidates = grid.get(countryGridCell(lon, lat)) ?? []
         for (const ci of candidates) {
           const b = bboxOf(ci)
           if (lon < b.minLon || lon > b.maxLon || lat < b.minLat || lat > b.maxLat) continue

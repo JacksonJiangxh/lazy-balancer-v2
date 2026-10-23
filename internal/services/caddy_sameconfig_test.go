@@ -86,3 +86,61 @@ func TestApplyConfig_failsOpenWhenRunningConfigUnreadable(t *testing.T) {
 		t.Fatalf("/load 次数=%d, want 1（比对失败不阻断）", posts)
 	}
 }
+
+// Given：运行配置可读但与渲染产物不同（A≠B）。
+// Then：必须真 /load（不得误判同字节短路），也不是 errSameConfig。
+func TestApplyConfig_loadsWhenRunningConfigDiffers(t *testing.T) {
+	newClusterTestService(t)
+	posts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/config/":
+			_, _ = w.Write([]byte(`{"apps":{"http":{"servers":{}}}}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/load":
+			posts++
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+	s := NewCaddyService(srv.URL)
+
+	err := s.GenerateAndApplyConfig()
+
+	if err != nil {
+		t.Fatalf("运行配置不同必须照常应用: %v", err)
+	}
+	if posts != 1 {
+		t.Fatalf("/load 次数=%d, want 1（A≠B 时不得短路）", posts)
+	}
+}
+
+// Given：GET /config/ 返回 200 但载荷畸形 JSON。
+// Then：比对无法判定 → fail-open 照常 /load（不得因解析失败阻断写入）。
+func TestApplyConfig_failsOpenWhenRunningConfigMalformedJSON(t *testing.T) {
+	newClusterTestService(t)
+	posts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/config/":
+			_, _ = w.Write([]byte(`{"apps":`))
+		case r.Method == http.MethodPost && r.URL.Path == "/load":
+			posts++
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+	s := NewCaddyService(srv.URL)
+
+	err := s.GenerateAndApplyConfig()
+
+	if err != nil {
+		t.Fatalf("畸形运行配置应 fail-open 照常应用: %v", err)
+	}
+	if posts != 1 {
+		t.Fatalf("/load 次数=%d, want 1（畸形 JSON 不得短路）", posts)
+	}
+}

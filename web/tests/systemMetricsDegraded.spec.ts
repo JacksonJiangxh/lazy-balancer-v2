@@ -1,6 +1,7 @@
 // 系统指标分项降级展示：后端对失败分项返回零值 + degraded 披露，展示层必须
 // 把「没采到」显示为「采集失败」，不得把零值当真实用量（CPU 单点故障时内存/
-// 磁盘仍应可用）。纯函数行为求值 + 视图接线钉（SFC 无法在 node 下挂载）。
+// 磁盘仍应可用）。纯函数行为求值 + 视图接线钉（真实前提：node --test 无 .vue
+// 装载器且模板依赖 element-plus 全局组件，不可挂载）。
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'

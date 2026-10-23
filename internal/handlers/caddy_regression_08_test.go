@@ -72,7 +72,7 @@ func TestUpdateRule_toleratesNullEnabledUpstream(t *testing.T) {
 	}
 }
 
-// 与渲染同口径（NULL=禁用）后命中零上游特判：启用成功且渲染侧明确提示跳过
+// 启用路径按与渲染同口径（NULL=禁用）判定后命中零上游特判：启用成功且渲染侧明确提示跳过
 // （规则「已启用」但无可用上游不再静默）。
 func TestEnableRule_ruleWithOnlyNullEnabledUpstreams_clearSkipLog(t *testing.T) {
 	// Given
@@ -110,7 +110,7 @@ func TestEnableRule_ruleWithOnlyNullEnabledUpstreams_clearSkipLog(t *testing.T) 
 	}
 }
 
-// 副本上游显式落 0（NULL 视同禁用，复制后不意外启用）。
+// DuplicateRule 的副本上游显式落 0（NULL 视同禁用，复制后不意外启用）。
 func TestDuplicateRule_toleratesNullEnabledUpstream(t *testing.T) {
 	// Given
 	handler := newRuleFeatureTestHandlers(t)
@@ -149,7 +149,7 @@ func TestDuplicateRule_toleratesNullEnabledUpstream(t *testing.T) {
 	}
 }
 
-// 不得 500（裸 scan NULL→bool 报错）；副本按 0 归一落库（与 NULL enabled
+// dynamic_dns 为 NULL 的上游不得 500（裸 scan NULL→bool 报错）；副本按 0 归一落库（与 NULL enabled
 // 同批的 IIF 归一口径）。
 func TestDuplicateRule_toleratesNullDynamicDNSUpstream(t *testing.T) {
 	// Given
@@ -180,7 +180,7 @@ func TestDuplicateRule_toleratesNullDynamicDNSUpstream(t *testing.T) {
 	}
 }
 
-// 的 >0 校验同口径），负值不再经集群同步照单全收。
+// audit_log_size_mb 沿用保存侧 >0 校验同口径（负值不再经集群同步照单全收）。
 func TestUpdateConfig_rejectsAuditLogSizeMBAtOrBelowZero(t *testing.T) {
 	// Given
 	handler := newBackupTestHandlers(t)

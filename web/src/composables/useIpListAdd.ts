@@ -34,15 +34,17 @@ export const useIpListAdd = () => {
   const addIpToList = async (ip: string, list: IpListOption, options: AddIpToListOptions = {}): Promise<boolean> => {
     if (adding.value) return false
     const verb = options.verb ?? '加入'
-    try {
-      await ElMessageBox.confirm(
-        `将把 ${ip} ${verb}地址列表「${list.name}」（幂等，已存在时不会重复添加）。是否继续？`,
-        `${verb}地址列表`,
-        { confirmButtonText: '确定', cancelButtonText: '取消', type: 'info' },
-      )
-    } catch { return false }
+    // 确认框弹出前即占位——双击不再叠两个确认框、两次 POST（与
+    // useTrustAssociation 同型）；取消分支统一由 finally 复位。
     adding.value = true
     try {
+      try {
+        await ElMessageBox.confirm(
+          `将把 ${ip} ${verb}地址列表「${list.name}」（幂等，已存在时不会重复添加）。是否继续？`,
+          `${verb}地址列表`,
+          { confirmButtonText: '确定', cancelButtonText: '取消', type: 'info' },
+        )
+      } catch { return false }
       // 非 silent：错误走全局拦截器提示，428 时全局 MFA step-up 弹码链完整生效
       const res = await request.post<APIResponse<{ added: boolean }>>(`/security/ip-lists/${list.id}/ips`, { value: ip })
       if (res.data?.added) {

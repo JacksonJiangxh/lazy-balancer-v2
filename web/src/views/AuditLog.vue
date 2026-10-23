@@ -82,6 +82,11 @@
 
       <div style="margin-top: 16px; display: flex; align-items: center; flex-wrap: wrap; row-gap: 8px;">
         <LogStorageBar log-key="audit" style="margin-right: auto" />
+        <!-- 后端 total 走 5 秒进程内缓存并以 total_stale 披露来源——陈旧计数
+             必须可见，避免列表条数与总数短暂不一致时无任何提示。 -->
+        <el-text v-if="totalStale" type="info" size="small" style="margin-right: 12px">
+          统计总数来自缓存，可能滞后数秒
+        </el-text>
         <el-pagination
           v-model:current-page="page"
           v-model:page-size="pageSize"
@@ -122,6 +127,9 @@ const loading = ref(false)
 const page = ref(1)
 const pageSize = ref(20)
 const total = ref(0)
+// 后端 total 5 秒缓存命中时下发 total_stale=true——列表条数与总数短暂不一致
+// 必须有可见提示（不静默）。
+const totalStale = ref(false)
 let requestSeq = 0
 
 const filters = ref({
@@ -181,10 +189,11 @@ const fetchLogs = async () => {
   const currentRequestSeq = ++requestSeq
   loading.value = true
   try {
-    const res = await request.get<{ data?: { list?: AuditLogEntry[]; total?: number } }>('/audit-logs', { params: buildParams() })
+    const res = await request.get<{ data?: { list?: AuditLogEntry[]; total?: number; total_stale?: boolean } }>('/audit-logs', { params: buildParams() })
     if (currentRequestSeq !== requestSeq || page.value !== targetPage || pageSize.value !== targetPageSize) return
     logs.value = res.data?.list || []
     total.value = res.data?.total || 0
+    totalStale.value = res.data?.total_stale === true
     loadError.value = false
   } catch (e) {
     console.error('Failed to fetch audit logs:', e)

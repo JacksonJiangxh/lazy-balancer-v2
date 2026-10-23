@@ -1,6 +1,7 @@
 package services
 
 import (
+	"strings"
 	"testing"
 
 	"lazy-balancer-v2/internal/db"
@@ -39,6 +40,27 @@ func seedMetricsRow(t *testing.T, ruleID, ageModifier string) {
 	}
 }
 
+// seedMetricsRowModifiers 以多个 SQLite 时间修饰符落一行
+// （datetime('now','-7 days','+1 second')）：边界行需要「整窗 + 偏移」组合，
+// 单个修饰符表达不出来。
+func seedMetricsRowModifiers(t *testing.T, ruleID string, modifiers ...string) {
+	t.Helper()
+	placeholders := make([]string, 0, len(modifiers))
+	args := []any{ruleID}
+	for _, modifier := range modifiers {
+		placeholders = append(placeholders, "?")
+		args = append(args, modifier)
+	}
+	query := "INSERT INTO metrics_history (rule_id, timestamp) VALUES (?, datetime('now'"
+	if len(placeholders) > 0 {
+		query += ", " + strings.Join(placeholders, ", ")
+	}
+	query += "))"
+	if _, err := db.MetricsDB.Exec(query, args...); err != nil {
+		t.Fatalf("seed metrics history %s: %v", ruleID, err)
+	}
+}
+
 func countMetricsRow(t *testing.T, ruleID string) int {
 	t.Helper()
 	var n int
@@ -68,6 +90,35 @@ func TestMetricsServiceCleanupHistory_usesFixedSevenDayWindow(t *testing.T) {
 	}
 	if got := countMetricsRow(t, "lb_now"); got != 1 {
 		t.Fatalf("fresh row count=%d, want 1", got)
+	}
+}
+
+// 7 天窗口的裁剪边界与时区口径：cutoff 必须按 UTC 计算。用「整窗 ∓1 秒」
+// 两行把窗口边沿夹住——8 天/5 天的宽边距对半天级偏差与时区偏移（如 +8h）
+// 没有分辨力。两种面板时区下各跑一遍：切到 Asia/Shanghai 时若实现改用本地
+// 时区算 cutoff，边界行会翻转。
+func TestMetricsServiceCleanupHistory_sevenDayBoundaryIsUTCBased(t *testing.T) {
+	for _, zone := range []string{"UTC", "Asia/Shanghai"} {
+		t.Run(zone, func(t *testing.T) {
+			setupMetricsRetentionTest(t)
+			previous := CurrentLocation()
+			if _, err := ConfigureLocation(zone); err != nil {
+				t.Fatalf("configure location %s: %v", zone, err)
+			}
+			t.Cleanup(func() { _, _ = ConfigureLocation(previous.String()) })
+
+			seedMetricsRowModifiers(t, "lb_just_outside", "-7 days", "-1 second")
+			seedMetricsRowModifiers(t, "lb_just_inside", "-7 days", "+1 second")
+
+			NewMetricsService("", 30).cleanupHistory()
+
+			if got := countMetricsRow(t, "lb_just_outside"); got != 0 {
+				t.Fatalf("7 天减 1 秒的行 count=%d, want 0（窗口外必须删除）", got)
+			}
+			if got := countMetricsRow(t, "lb_just_inside"); got != 1 {
+				t.Fatalf("7 天加 1 秒的行 count=%d, want 1（窗口内必须保留）", got)
+			}
+		})
 	}
 }
 

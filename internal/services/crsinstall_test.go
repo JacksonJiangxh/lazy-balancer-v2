@@ -383,8 +383,9 @@ func TestCRSRollbackAfterReloadFailure_blocksWhileWafFileLockHeld(t *testing.T) 
 	writeTestFile(t, filepath.Join(m.crsDir, crsVersionFile), "v4.15.0\n")
 	m.rulesBakCreated = true // 本运行已创建 rules.bak
 
-	probeBlocksUnderWafFileLock(t, "CRS 重载失败回滚（树+VERSION+版本行）", func() {
+	probeBlocksUnderWafFileLock(t, "CRS 重载失败回滚（树+VERSION+版本行）", func() error {
 		m.rollbackAfterReloadFailure("v4.14.0")
+		return nil
 	})
 
 	data, err := os.ReadFile(filepath.Join(m.crsDir, "rules", "REQUEST-901-INITIALIZATION.conf"))

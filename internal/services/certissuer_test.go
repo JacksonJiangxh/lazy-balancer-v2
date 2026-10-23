@@ -73,16 +73,18 @@ func TestCertIssuer_deployIssuedCertificate_keeps_nonterminal_state_when_reload_
 	// 自此再调度为异步（go deploymentRetry）——断言必须经 channel 等待
 	// 回调到达，裸读计数器既是顺序竞态也是数据竞态（全量并发下偶发 flake）。
 	retried := make(chan struct{}, 1)
-	issuer.deploymentRetry = func(gotJobID int, got issuedCertificate, _ time.Duration) {
+	issuer.deploymentRetry = func(gotJobID int, got issuedCertificate, _ time.Duration) error {
 		if gotJobID != jobID || got.ruleID != ruleID {
 			t.Fatalf("retry job=(%d,%q), want (%d,%q)", gotJobID, got.ruleID, jobID, ruleID)
 		}
 		retried <- struct{}{}
+		return nil
 	}
 	material := issuedCertificate{
 		ruleID: ruleID, certPEM: "new-cert", keyPEM: "new-key",
 		notAfter: time.Now().Add(90 * 24 * time.Hour), providerID: 1,
 	}
+	installCertJobVersionTrigger(t)
 
 	// When
 	err := issuer.deployIssuedCertificate(context.Background(), jobID, material)
@@ -105,7 +107,7 @@ func TestCertIssuer_deployIssuedCertificate_keeps_nonterminal_state_when_reload_
 	if err := db.DB.QueryRow("SELECT cluster_version FROM global_config WHERE id=1").Scan(&version); err != nil {
 		t.Fatalf("read cluster version: %v", err)
 	}
-	if status != "downloaded" || certPEM != "new-cert" || keyPEM != "new-key" || deploymentAttempts != 1 || deploymentAvailableAfter == "" || version != 0 {
+	if status != "downloaded" || certPEM != "new-cert" || keyPEM != "new-key" || deploymentAttempts != 1 || deploymentAvailableAfter == "" || version != 1 {
 		t.Fatalf("job=(%q,%q,%q) deployment_attempts=%d available_after=%q version=%d", status, certPEM, keyPEM, deploymentAttempts, deploymentAvailableAfter, version)
 	}
 }
@@ -184,6 +186,7 @@ func TestCertIssuer_deployIssuedCertificate_restores_files_when_job_disabled_bef
 		ruleID: ruleID, certPEM: "new-cert", keyPEM: "new-key",
 		notAfter: time.Now().Add(90 * 24 * time.Hour), providerID: 1,
 	}
+	installCertJobVersionTrigger(t)
 
 	// When
 	err := issuer.deployIssuedCertificate(context.Background(), jobID, material)
@@ -209,7 +212,7 @@ func TestCertIssuer_deployIssuedCertificate_restores_files_when_job_disabled_bef
 	if err := db.DB.QueryRow("SELECT cluster_version FROM global_config WHERE id=1").Scan(&version); err != nil {
 		t.Fatalf("read cluster version: %v", err)
 	}
-	if string(certPEM) != "old-cert" || string(keyPEM) != "old-key" || status != "disabled" || version != 0 || reloads != 2 {
+	if string(certPEM) != "old-cert" || string(keyPEM) != "old-key" || status != "disabled" || version != 2 || reloads != 2 {
 		t.Fatalf("files=(%q,%q) status=%q version=%d reloads=%d", certPEM, keyPEM, status, version, reloads)
 	}
 }
@@ -376,7 +379,7 @@ func TestCertIssuer_Issue_fast_path_returns_reload_error_and_keeps_downloaded(t 
 	issuer := NewCertIssuer(func() error { return errors.New("reload failed") })
 	// 自此再调度异步——channel 等待替代裸计数器（消顺序/数据竞态）。
 	retried := make(chan struct{}, 1)
-	issuer.deploymentRetry = func(int, issuedCertificate, time.Duration) { retried <- struct{}{} }
+	issuer.deploymentRetry = func(int, issuedCertificate, time.Duration) error { retried <- struct{}{}; return nil }
 
 	// When
 	err := issuer.Issue(context.Background(), jobID, ruleID, "example.com", models.CAProvider{ID: 1})
@@ -661,8 +664,9 @@ func TestCertIssuer_deploymentFailed_doesNotDowngradeOutsideDeployableLifecycle(
 				t.Fatal(err)
 			}
 			issuer := NewCertIssuer(nil)
-			issuer.deploymentRetry = func(int, issuedCertificate, time.Duration) {
+			issuer.deploymentRetry = func(int, issuedCertificate, time.Duration) error {
 				t.Error("non-deployable job must not schedule a retry")
+				return nil
 			}
 
 			_ = issuer.deploymentFailed(jobID, issuedCertificate{ruleID: ruleID, providerID: 1}, "late deployment failure", errors.New("late failure"))
@@ -729,8 +733,9 @@ func TestCertIssuer_deploymentFailed_backs_off_then_slowRetriesAtMaxAttempts(t *
 		delay    time.Duration
 	}
 	retries := make(chan retryCall, maxCertificateDeploymentAttempts)
-	issuer.deploymentRetry = func(_ int, material issuedCertificate, delay time.Duration) {
+	issuer.deploymentRetry = func(_ int, material issuedCertificate, delay time.Duration) error {
 		retries <- retryCall{material: material, delay: delay}
+		return nil
 	}
 
 	// When：连续打满退避上限，attempt 从 DB 重算（deploymentFailed 同步维护）。
@@ -794,9 +799,10 @@ func TestCertificateService_recoverCertJobs_preserves_deployment_retry_state(t *
 	resetCertificateServiceForTest(t)
 	var gotAttempt int
 	var gotDelay time.Duration
-	service.deploymentRetry = func(_ int, material issuedCertificate, delay time.Duration) {
+	service.deploymentRetry = func(_ int, material issuedCertificate, delay time.Duration) error {
 		gotAttempt = material.deploymentAttempt
 		gotDelay = delay
+		return nil
 	}
 
 	// When
@@ -911,13 +917,78 @@ func TestRetryCertificateDeployment_cleanup_dns_job_slowRetriesAtMaxAttempts(t *
 	}
 }
 
+// installCertJobVersionTrigger 安装与生产同语义的 cert_jobs 版本触发器
+// （镜像 middleware 的 cluster_version_cert_jobs_update）：主节点守卫 +
+// 成员条件（非 disabled 且材料齐全且未过期）+ 语义列值真实变化守卫 +
+// disabled 双向例外。
+//
+// services 测试库不安装生产触发器（由 middleware 装配），此前的合成版本只按
+// 列名触发、无值变化守卫：断言「失败/回滚不推进版本」在簿记列抖动时假绿，
+// 而材料真实变化时的 bump 又无法区分。断言必须跑在与生产同形的语义上。
 func installCertJobVersionTrigger(t *testing.T) {
 	t.Helper()
 	if _, err := db.DB.Exec(`CREATE TRIGGER test_cluster_version_cert_jobs_update
-		AFTER UPDATE OF rule_id, cert_pem, key_pem, expires_at ON cert_jobs
-		WHEN (SELECT is_master FROM global_config WHERE id=1)=1
-		BEGIN UPDATE global_config SET cluster_version=cluster_version+1 WHERE id=1; END`); err != nil {
+		AFTER UPDATE OF rule_id, domain, status, cert_pem, key_pem, expires_at, ca_provider_id, renewal_attempts, ca_available_after, last_error_code, created_at, updated_at ON cert_jobs
+		WHEN (SELECT COALESCE(is_master,1) FROM global_config WHERE id=1)=1
+		 AND (
+			(OLD.status<>'disabled' AND COALESCE(OLD.cert_pem,'')<>'' AND COALESCE(OLD.key_pem,'')<>'' AND datetime(OLD.expires_at)>datetime('now'))
+			OR (NEW.status<>'disabled' AND COALESCE(NEW.cert_pem,'')<>'' AND COALESCE(NEW.key_pem,'')<>'' AND datetime(NEW.expires_at)>datetime('now'))
+		 )
+		 AND (
+			OLD.rule_id IS NOT NEW.rule_id
+			OR OLD.domain IS NOT NEW.domain
+			OR OLD.cert_pem IS NOT NEW.cert_pem
+			OR OLD.key_pem IS NOT NEW.key_pem
+			OR OLD.expires_at IS NOT NEW.expires_at
+			OR OLD.ca_provider_id IS NOT NEW.ca_provider_id
+			OR (OLD.status<>'disabled' AND NEW.status='disabled')
+			OR (OLD.status='disabled' AND NEW.status<>'disabled')
+		 )
+		BEGIN UPDATE global_config SET cluster_version=COALESCE(cluster_version,0)+1 WHERE id=1; END`); err != nil {
 		t.Fatalf("install certificate job version trigger: %v", err)
+	}
+}
+
+// 簿记列抖动（message/attempts/available_after/updated_at）不得推进
+// cluster_version：这些列在每次签发的阶段写里反复变化，bump 会让 304 门
+// 失效、从节点反复全量重放。材料列的真实变化则必须 bump（从端要看到新证书）。
+func TestClusterVersion_certJobBookkeepingDoesNotBump(t *testing.T) {
+	jobID, _ := seedCertificateJob(t, "downloaded")
+	installCertJobVersionTrigger(t)
+	expiresAt := time.Now().UTC().Add(90 * 24 * time.Hour).Format("2006-01-02 15:04:05")
+	if _, err := db.DB.Exec(`UPDATE cert_jobs SET cert_pem='cert-a', key_pem='key-a', expires_at=? WHERE id=?`, expiresAt, jobID); err != nil {
+		t.Fatalf("seed certificate material: %v", err)
+	}
+	var version int
+	if err := db.DB.QueryRow("SELECT cluster_version FROM global_config WHERE id=1").Scan(&version); err != nil {
+		t.Fatalf("read cluster version: %v", err)
+	}
+	if version != 1 {
+		t.Fatalf("材料落库后 version=%d, want 1", version)
+	}
+
+	// When：仅簿记列变化
+	if _, err := db.DB.Exec(`UPDATE cert_jobs SET message='等待排队签发', deployment_attempts=3, deployment_available_after=datetime('now'), updated_at=datetime('now') WHERE id=?`, jobID); err != nil {
+		t.Fatalf("bump bookkeeping columns: %v", err)
+	}
+
+	// Then：版本不变
+	if err := db.DB.QueryRow("SELECT cluster_version FROM global_config WHERE id=1").Scan(&version); err != nil {
+		t.Fatalf("read cluster version: %v", err)
+	}
+	if version != 1 {
+		t.Fatalf("簿记列抖动使 version=%d, want 1（仅语义列变化才推进）", version)
+	}
+
+	// 对照：材料变化必须推进
+	if _, err := db.DB.Exec(`UPDATE cert_jobs SET cert_pem='cert-b' WHERE id=?`, jobID); err != nil {
+		t.Fatalf("update certificate material: %v", err)
+	}
+	if err := db.DB.QueryRow("SELECT cluster_version FROM global_config WHERE id=1").Scan(&version); err != nil {
+		t.Fatalf("read cluster version: %v", err)
+	}
+	if version != 2 {
+		t.Fatalf("材料变化后 version=%d, want 2", version)
 	}
 }
 
@@ -932,7 +1003,7 @@ func TestCertIssuer_Issue_fastPathMaterialReadFailure_defersDeployment(t *testin
 	t.Cleanup(func() { taskengine.SetLogDir("") })
 	issuer := NewCertIssuer(func() error { return nil })
 	retried := make(chan struct{}, 1)
-	issuer.deploymentRetry = func(int, issuedCertificate, time.Duration) { retried <- struct{}{} }
+	issuer.deploymentRetry = func(int, issuedCertificate, time.Duration) error { retried <- struct{}{}; return nil }
 	oldReader := readFastPathIssuedMaterial
 	readFastPathIssuedMaterial = func(context.Context, int) (string, string, error) {
 		return "", "", errors.New("injected material read failure")
@@ -1297,28 +1368,33 @@ func TestCAQueue_execute_roleInterruptionRequeuesWithoutRenewalAttempts(t *testi
 
 func TestHandleQueueExecutionError_roleInterruptionDoesNotConsumeRenewalAttempts(t *testing.T) {
 	for _, tc := range []struct {
-		name          string
+		name string
+		// plainFailure：非角色错误的对照分支——同一张表必须真实调用
+		// handleQueueExecutionError 走 failJob，否则「master 未变化不消耗预算」
+		// 的一半语义（普通失败照常 failed + 预算+1）无人覆盖。
+		plainFailure  bool
 		status        string
 		prepare       func(*testing.T)
 		wantRoleError bool
 		wantStatus    string
+		wantAttempts  int
 	}{
-		{name: "master remains unchanged", status: "downloading", prepare: func(*testing.T) {}, wantStatus: "downloading"},
+		{name: "master unchanged routes to plain CA failure", plainFailure: true, status: "downloading", prepare: func(*testing.T) {}, wantStatus: "failed", wantAttempts: 3},
 		{name: "slave transition requeues", status: "downloading", prepare: func(t *testing.T) {
 			if _, err := db.DB.Exec("UPDATE global_config SET is_master=0 WHERE id=1"); err != nil {
 				t.Fatalf("demote node: %v", err)
 			}
-		}, wantRoleError: true, wantStatus: "queued"},
+		}, wantRoleError: true, wantStatus: "queued", wantAttempts: 2},
 		{name: "role read failure requeues", status: "downloading", prepare: func(t *testing.T) {
 			if _, err := db.DB.Exec("DELETE FROM global_config WHERE id=1"); err != nil {
 				t.Fatalf("remove role row: %v", err)
 			}
-		}, wantRoleError: true, wantStatus: "queued"},
+		}, wantRoleError: true, wantStatus: "queued", wantAttempts: 2},
 		{name: "disabled job remains disabled", status: "disabled", prepare: func(t *testing.T) {
 			if _, err := db.DB.Exec("UPDATE global_config SET is_master=0 WHERE id=1"); err != nil {
 				t.Fatalf("demote node: %v", err)
 			}
-		}, wantRoleError: true, wantStatus: "disabled"},
+		}, wantRoleError: true, wantStatus: "disabled", wantAttempts: 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// Given：角色检查发生在 CA 已签发之后，既有预算为 2。
@@ -1327,29 +1403,33 @@ func TestHandleQueueExecutionError_roleInterruptionDoesNotConsumeRenewalAttempts
 				t.Fatalf("seed renewal attempts: %v", err)
 			}
 			tc.prepare(t)
-			roleErr := checkCertificateIssuanceRole(context.Background())
-			if !tc.wantRoleError {
-				if roleErr != nil {
-					t.Fatalf("master role check failed: %v", roleErr)
+			if tc.plainFailure {
+				// 对照分支：普通（非角色）失败必须落 failed 并消耗一次预算。
+				handleQueueExecutionError(jobID, errors.New("普通 CA 失败"))
+			} else {
+				roleErr := checkCertificateIssuanceRole(context.Background())
+				if !tc.wantRoleError {
+					if roleErr != nil {
+						t.Fatalf("master role check failed: %v", roleErr)
+					}
+					return
 				}
-				return
-			}
-			var typedRoleErr *certificateRoleError
-			if !errors.As(roleErr, &typedRoleErr) {
-				t.Fatalf("role error=%v, want certificateRoleError", roleErr)
+				var typedRoleErr *certificateRoleError
+				if !errors.As(roleErr, &typedRoleErr) {
+					t.Fatalf("role error=%v, want certificateRoleError", roleErr)
+				}
+				// When：队列按执行错误分类（含包装层）。
+				handleQueueExecutionError(jobID, fmt.Errorf("execute: %w", roleErr))
 			}
 
-			// When：队列按执行错误分类（含包装层）。
-			handleQueueExecutionError(jobID, fmt.Errorf("execute: %w", roleErr))
-
-			// Then：生命周期中断不得进入 CA failed 终态或消耗预算。
+			// Then：生命周期中断不得进入 CA failed 终态或消耗预算；普通失败照常。
 			var status string
 			var attempts int
 			if err := db.DB.QueryRow("SELECT status,renewal_attempts FROM cert_jobs WHERE id=?", jobID).Scan(&status, &attempts); err != nil {
 				t.Fatalf("read job after role interruption: %v", err)
 			}
-			if status != tc.wantStatus || attempts != 2 {
-				t.Fatalf("job status=%q attempts=%d, want %q/2", status, attempts, tc.wantStatus)
+			if status != tc.wantStatus || attempts != tc.wantAttempts {
+				t.Fatalf("job status=%q attempts=%d, want %q/%d", status, attempts, tc.wantStatus, tc.wantAttempts)
 			}
 		})
 	}
@@ -1451,7 +1531,7 @@ func TestCertIssuer_Issue_fastPathMaterialReadFailure_issuedStaysIssued(t *testi
 	t.Cleanup(func() { taskengine.SetLogDir("") })
 	issuer := NewCertIssuer(func() error { return nil })
 	retried := make(chan struct{}, 1)
-	issuer.deploymentRetry = func(int, issuedCertificate, time.Duration) { retried <- struct{}{} }
+	issuer.deploymentRetry = func(int, issuedCertificate, time.Duration) error { retried <- struct{}{}; return nil }
 	oldReader := readFastPathIssuedMaterial
 	readFastPathIssuedMaterial = func(context.Context, int) (string, string, error) {
 		return "", "", errors.New("injected material read failure")

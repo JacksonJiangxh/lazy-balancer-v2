@@ -104,6 +104,76 @@ func TestConfigBackup_oldBackupWithoutNodesPreservesLocalTopology(t *testing.T) 
 	}
 }
 
+// 同一身份 (ip,port) 的本地节点持有令牌时，导入的备份令牌不得覆盖它：
+// 跨环境导入/回滚旧备份若替换令牌，真实从节点立即 401 并按终止类停止重试。
+// 导入仍应恢复拓扑属性（名称），并以 warning + 审计披露「备份令牌被忽略」。
+func TestImportNodes_preservesLiveTokenForMatchingIdentity(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	seedAdminShared(t)
+	if _, err := db.DB.Exec(`INSERT INTO nodes (name,mode,ip_address,port,protocol,is_approved,sync_interval,status,cluster_token_hash,cluster_token_delivered)
+		VALUES ('live-name','slave','10.0.0.2',8000,'http',1,60,'online','live-token',1)`); err != nil {
+		t.Fatal(err)
+	}
+	body := buildBackup(t, backupFixtureOptions{Sections: []string{"cluster"}, Tables: map[string][]map[string]any{
+		"nodes": {{
+			"name": "backup-name", "mode": "slave", "ip_address": "10.0.0.2", "port": 8000,
+			"protocol": "http", "is_approved": 1, "sync_interval": 60,
+			"cluster_token_hash": "backup-token", "cluster_token_delivered": 1,
+		}},
+	}})
+
+	recorder := postBackupImport(t, h, body)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "备份令牌与本地不一致") {
+		t.Fatalf("body=%s, want 令牌不一致告警", recorder.Body.String())
+	}
+	var name, tokenHash string
+	var approved int
+	if err := db.DB.QueryRow(`SELECT name, COALESCE(cluster_token_hash,''), COALESCE(is_approved,0) FROM nodes WHERE ip_address='10.0.0.2' AND port=8000`).
+		Scan(&name, &tokenHash, &approved); err != nil {
+		t.Fatal(err)
+	}
+	if name != "backup-name" {
+		t.Fatalf("name=%q, want 备份拓扑属性生效", name)
+	}
+	if tokenHash != "live-token" {
+		t.Fatalf("cluster_token_hash=%q, want 保留本地令牌 live-token", tokenHash)
+	}
+	if approved != 1 {
+		t.Fatalf("is_approved=%d, want 保留本地审批态", approved)
+	}
+}
+
+// 灾备主路径回归：本地无该身份（真正新机导入）时沿用备份令牌。
+func TestImportNodes_usesBackupTokenForNewIdentity(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	seedAdminShared(t)
+	body := buildBackup(t, backupFixtureOptions{Sections: []string{"cluster"}, Tables: map[string][]map[string]any{
+		"nodes": {{
+			"name": "dr-node", "mode": "slave", "ip_address": "10.0.0.9", "port": 8000,
+			"protocol": "http", "is_approved": 1, "sync_interval": 60,
+			"cluster_token_hash": "backup-token", "cluster_token_delivered": 1,
+		}},
+	}})
+
+	recorder := postBackupImport(t, h, body)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "备份令牌与本地不一致") {
+		t.Fatalf("新机导入不得产生令牌忽略告警: %s", recorder.Body.String())
+	}
+	var tokenHash string
+	if err := db.DB.QueryRow(`SELECT COALESCE(cluster_token_hash,'') FROM nodes WHERE ip_address='10.0.0.9'`).Scan(&tokenHash); err != nil {
+		t.Fatal(err)
+	}
+	if tokenHash != "backup-token" {
+		t.Fatalf("cluster_token_hash=%q, want 沿用备份令牌（灾备主路径）", tokenHash)
+	}
+}
+
 // ──：nodes 导入行级门的
 // access_url / name+ip_address 形态，以及「存活身份键与落库 port 默认同源」。 ──
 

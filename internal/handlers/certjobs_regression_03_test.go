@@ -52,17 +52,19 @@ func TestListCertJobs_daysRemainingTruncation(t *testing.T) {
 				t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
 			}
 			body := recorder.Body.String()
-			// 精确断言该任务的两个字段值（同一行内 days_remaining 与 certificate_status 相邻出现）
-			want := fmt.Sprintf(`"days_remaining":%d`, tc.wantDays)
-			if !strings.Contains(body, want) {
-				t.Fatalf("hours=%v: body 缺少 %q（截断口径被破坏？）", tc.hoursRemaining, want)
-			}
+			// 断言限定到该任务行窗口：同 body 内多行同值时全 body 匹配会命中
+			// 他行（覆盖缺口伪装成通过）。
 			idx := strings.Index(body, `"rule_id":"lb_trunc"`)
 			if idx < 0 {
 				t.Fatalf("seeded job not in response")
 			}
 			segment := body[idx:]
-			if !strings.Contains(segment[:min(len(segment), 600)], `"certificate_status":"`+tc.wantStatus+`"`) {
+			window := segment[:min(len(segment), 600)]
+			want := fmt.Sprintf(`"days_remaining":%d`, tc.wantDays)
+			if !strings.Contains(window, want) {
+				t.Fatalf("hours=%v: row 缺少 %q（截断口径被破坏？）: %s", tc.hoursRemaining, want, window)
+			}
+			if !strings.Contains(window, `"certificate_status":"`+tc.wantStatus+`"`) {
 				t.Fatalf("hours=%v: certificate_status != %q near rule row", tc.hoursRemaining, tc.wantStatus)
 			}
 		})

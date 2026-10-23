@@ -40,6 +40,19 @@ func TestUpdateSecurityPolicy_partialEnableRejectsDanglingReferences(t *testing.
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("partial enable status=%d body=%s, want 400", recorder.Code, recorder.Body.String())
 	}
+	// 拒绝必须整笔不落库：enabled 仍为 0、custom_rules 仍是原悬空引用
+	//（部分保存会让策略半启用或静默丢掉存量引用）。
+	var stillEnabled int
+	var storedRefs string
+	if err := db.DB.QueryRow("SELECT enabled, COALESCE(custom_rules,'') FROM security_policies WHERE id=?", id).Scan(&stillEnabled, &storedRefs); err != nil {
+		t.Fatalf("read back rejected policy: %v", err)
+	}
+	if stillEnabled != 0 {
+		t.Fatalf("enabled=%d after rejected update, want 0（拒绝不得部分落库）", stillEnabled)
+	}
+	if storedRefs != fmt.Sprintf("[%d]", ruleID) {
+		t.Fatalf("custom_rules=%q after rejected update, want 原引用 [%d]", storedRefs, ruleID)
+	}
 
 	// And 显式清空引用后的启用可通过（自助修复路径不受阻）
 	recorder = putJSON(t, router, fmt.Sprintf("/security/policies/%d", id), map[string]any{"enabled": true, "custom_rules": "[]"})

@@ -1,7 +1,8 @@
 // IP 处置弹框（IPLocationAction）的地址列表加载态：名单/引用条目加载失败时，
 // rowView 的 inList/inTrust 只剩内联口径——引用名单命中会被渲染成「未命中」，
 // 与真实未命中无法区分。必须显式失败（横幅 + 重试）并暂停处置动作。
-// SFC 无法在 node --test 下挂载，沿用本仓「源码钉」形态（限段 + 边界）。
+// 真实前提：node --test 无 .vue 装载器（本套件禁止静态 import .vue），且模板
+// 依赖 element-plus 全局组件——不可在 node 下挂载，故用「限段 + 边界」文本钉。
 //
 // 运行：cd web && npm test
 

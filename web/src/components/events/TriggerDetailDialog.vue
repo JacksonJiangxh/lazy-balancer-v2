@@ -70,7 +70,7 @@
         <!-- 信任名单：直通/保留检测语义说明 -->
         <template v-else-if="kind === 'trust'">
           <div class="trg-kv"><span class="k">命中名单</span><span>{{ trustHitListsText || '策略信任名单（内联）' }}</span></div>
-          <div class="trg-kv"><span class="k">信任语义</span><span>{{ policy?.trust_detection === true ? '保留检测：继续后续阶段评估，事件动作=检测' : '直通上游：跳过后续安全阶段，不产生拦截' }}</span></div>
+          <div class="trg-kv"><span class="k">信任语义</span><span>{{ trustModeText }}</span></div>
         </template>
 
         <!-- WAF · CRS：规则信息 + 源码折叠（只读） -->
@@ -121,7 +121,7 @@
                 <span v-if="customConditions.length === 0">—</span>
               </span>
             </div>
-            <div class="trg-kv"><span class="k">动作</span><span>{{ customActionLabel }}<template v-if="customRule.action === 'score'">（{{ customRule.score }} 分）</template></span></div>
+            <div class="trg-kv"><span class="k">动作</span><span>{{ customActionLabel }}</span></div>
             <div class="trg-kv"><span class="k">状态</span><span>{{ customRule.enabled ? '启用' : '禁用' }}</span></div>
           </template>
           <div v-else-if="!loading && customRuleLoadError" class="trg-tip">自定义规则加载失败，可关闭弹框后重新打开重试（事件为历史记录，展示不完整）</div>
@@ -152,7 +152,7 @@ import { ArrowRight } from '@element-plus/icons-vue'
 import SyntaxHighlight from '@/components/SyntaxHighlight.vue'
 import { request } from '@/utils/api'
 import { formatDate } from '@/utils/date'
-import { parseIPList, parseRefIds, createIpMatcher, triggerStageFamily, sharedEntriesCache, subscribeSharedEntriesCache, ensureSharedEntries, formatDurationUs, eventDetailRefIds, detectionModeExplains, isTrustExemptionCandidate } from '@/utils/securityStages'
+import { parseIPList, parseRefIds, createIpMatcher, triggerStageFamily, sharedEntriesCache, subscribeSharedEntriesCache, ensureSharedEntries, formatDurationUs, eventDetailRefIds, detectionModeExplains, isTrustExemptionCandidate, trustHitMode } from '@/utils/securityStages'
 import { issueCrsIndexSession, useCrsRuleIndex } from '@/composables/useCrsRuleIndex'
 import { useCountryNamesCn, countryLabel } from '@/composables/useCountryNamesCn'
 import type { APIResponse } from '@/types'
@@ -410,8 +410,17 @@ const loadAll = async (): Promise<void> => {
     }
     // 全部启用策略 + 名单/条目：ACL 与信任 refs 的条目缓存（信息展示用 +
     // 跨策略信任成员判定——历史追加修复）
+    // 预取面按事件类别/动作收敛（详见 eventDetailRefIds 注释）：
+    //  - 豁免归因只在未拦截事件需要（blocked 事件不会由信任放行）；
+    //  - ACL 条目只被 kind∈{acl,geo,threat} 消费，WAF/请求体/爬虫事件引用
+    //    威胁库时曾每次无谓下载数百 KB~数 MB。
+    const needExemption = row.action !== 'blocked'
+    const needAclEntries = kind.value === 'acl' || kind.value === 'geo' || kind.value === 'threat'
+    const needOwnerTrust = needAclEntries || kind.value === 'trust' || needExemption
     const [polRes, listRes] = await Promise.allSettled([
-      request.get<APIResponse<PolicyRow[]>>('/security/policies?enabled=true', { silent: true }),
+      needExemption
+        ? request.get<APIResponse<PolicyRow[]>>('/security/policies?enabled=true', { silent: true })
+        : Promise.resolve<APIResponse<PolicyRow[]>>({ code: 0, data: [] }),
       request.get<APIResponse<Array<{ id: number; name: string; system?: number | boolean }>>>('/security/ip-lists', { silent: true }),
     ])
     if (seq !== loadSeq) return
@@ -422,10 +431,12 @@ const loadAll = async (): Promise<void> => {
       loadError.value = true
       lists.value = []
     }
-    // 只补拉详情弹框真实消费的名单——属主策略 ACL refs（命中列表/
-    // 内联判定）+ 全部信任 refs（跨策略信任豁免）；他策略 ACL refs 在本弹框
-    // 零消费，原实现在启用策略多/引用大名单时首屏无谓全量下载。
-    const refIds = eventDetailRefIds(policy.value, enabledPolicies.value)
+    // 只补拉详情弹框真实消费的名单——范围由类别/动作决定。
+    const refIds = eventDetailRefIds(policy.value, enabledPolicies.value, {
+      ownerAcl: needAclEntries,
+      ownerTrust: needOwnerTrust,
+      otherTrust: needExemption,
+    })
     // 只补拉共享缓存缺失的名单：原实现对全部 refIds 无条件
     // 并发 GET——连续打开事件详情时同一批名单反复下载。写回/通知由缓存单源负责。
     try {
@@ -581,6 +592,10 @@ const trustHitNote = computed(() => {
   if (!policy.value || kind.value === 'trust') return ''
   return ipHitScan.value.ownerTrust ? '该 IP 在策略信任名单中（DetectionOnly：全评估不拦但全记录）' : ''
 })
+// 信任命中语义按策略类型单源（非阶段 0 存量信任引擎恒 DetectionOnly）
+const trustModeText = computed(() => trustHitMode(policy.value?.policy_type, policy.value?.trust_detection) === 'detection'
+  ? '保留检测：继续后续阶段评估，事件动作=检测'
+  : '直通上游：跳过后续安全阶段，不产生拦截')
 const memberSystemTip = computed(() =>
   policy.value && ipHitScan.value.sysAclHit ? '内置威胁名单为只读来源；误报可将该 IP 加入信任名单豁免。' : ''
 )

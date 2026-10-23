@@ -13,6 +13,15 @@ package services
 // 命中面扩展到 LSS(<0/<1)、NEQ(!=0)、GTR/GEQ 反向分支、
 // switch/case 零值守卫与非 map 非空复合字面量默认值，并为每形态配夹具（
 // TestFallbackScan_detectsEquivalentGuardShapes）——语义等价写法不得绕过机制。
+//
+// 字符串列同属失效族（strategy/content_type/log level/protocol 等）：
+// 空字符串守卫（`if s == "" { s = "x" }`）与反向操作数（`0 == x` / `"" == s`）
+// 纳入命中面；守卫分支内的单一返回值字面量（`if v < 0 { return "-1s" }`）同属
+// 写死默认值形态。
+//
+// 机制边界（有意不纳入）：右值为常量/selector（`x = models.DefaultX`）或算术
+// （`x = 5 * time.Second`）——纯 AST 无法与普通变量/算术区分（`x = x + 1`），
+// 纳入会产生大量误报；`x := <字面量>` 是影子变量定义，不改写库值来源。
 
 import (
 	"bytes"
@@ -60,6 +69,11 @@ var antiFallbackScanTargets = map[string][]string{
 		"emitCRSRuleGroupSelection",
 		"emitScopedCRSExclusions",
 	},
+	// 展示层：证书卡/规则证书字段的占位文案（非配置投影，但同属「无效库值 →
+	// 写死常量」可见面，纳入扫描以防新增渲染文案绕过机制）。
+	"certinfo.go": {
+		"formatRuleCertInfo",
+	},
 }
 
 // antiFallbackAllowlist 允许列表：函数名 → 赋值形态 → Ruling。
@@ -67,6 +81,22 @@ var antiFallbackScanTargets = map[string][]string{
 var antiFallbackAllowlist = map[string]map[string]string{
 	"generateCaddyConfigWithCertSource": {
 		"weight = 1": "上游权重 weight<=0→1：upstreams.weight 非本批治理字段清单（范围外），原状保留；Caddy WRR 亦不接受零权重",
+		// 字符串列缺省（类型②省略型）：空串=未配置，默认值由 DB DEFAULT/写侧
+		// 归一保证；渲染层必须替换以实现「省略」语义（否则引擎收到空值）。
+		`r.Strategy = "weighted_round_robin"`: "负载策略空串=未配置→默认加权轮询：类型②省略型（写侧归一+DB DEFAULT 单源，渲染层承担省略替换）——G3 Ruling 披露",
+		`protocol = "http"`:                   "上游协议空串=未配置→http：类型②省略型（写侧允许空并声明默认）——G3 Ruling 披露",
+	},
+	"buildCaddyLogging": {
+		"level = \"info\"": "日志级别空串=未配置→info：类型②省略型（字符串缺省，写侧校验非空枚举但存量空值合法）——G3 Ruling 披露",
+	},
+	"formatFlushInterval": {
+		"return \"-1s\"": "负值哨兵映射：Caddy flush_interval=-1s 表示「立即刷新」，v<0 映射为哨兵字符串而非库值兜底——G3 Ruling 披露",
+	},
+	"GenerateSingleRuleCaddyConfig": {
+		`rule.Strategy = "weighted_round_robin"`: "负载策略空串=未配置→默认加权轮询：类型②省略型（与全量渲染同口径，单规则预览不得分叉）——G3 Ruling 披露",
+	},
+	"generateHTTPRouteObjects": {
+		`rule.Strategy = "weighted_round_robin"`: "负载策略空串=未配置→默认加权轮询：类型②省略型（与全量渲染同口径）——G3 Ruling 披露",
 	},
 	"buildHTTPHandleChain": {
 		"weight = 1": "上游权重 weight<=0→1：同上（范围外：分组层归一删除后链构建层唯一存留点）",
@@ -75,9 +105,10 @@ var antiFallbackAllowlist = map[string]map[string]string{
 		// UI/文档），行为不变的非治理形态；TCP 侧同列 0/-1 走显性报错/显式禁用，
 		// 协议分叉为披露语义非写死兜底。td==-1 分支发射 retries=0 为「显式禁用
 		// 重试」语义载体（cond 非零值守卫，不在扫描命中面）。
-		`loadBalancing["try_duration"] = "5s"`:                    "HTTP 侧 try_duration==0→5s：存量 HTTP 行恒 0（0=默认重试窗口语义），方案 C 协议分叉+UI 已披露——G3 Ruling 披露",
-		`loadBalancing["try_interval"] = "250ms"`:                 "HTTP 侧 try_interval==0→250ms：同上（与 5s 窗口成对发射）——G3 Ruling 披露",
-		`serverName = "{lb.upstream_sni}"`:                        "逐上游回源域名在场时 SNI 改走占位符（逐连接展开实证）——host_header 缺省形态的发射形态切换（占位符 vs 静态值），非无效库值兜底；upstream-sni-host 方案披露——G3 Ruling 披露",
+		`loadBalancing["try_duration"] = "5s"`:    "HTTP 侧 try_duration==0→5s：存量 HTTP 行恒 0（0=默认重试窗口语义），方案 C 协议分叉+UI 已披露——G3 Ruling 披露",
+		`loadBalancing["try_interval"] = "250ms"`: "HTTP 侧 try_interval==0→250ms：同上（与 5s 窗口成对发射）——G3 Ruling 披露",
+		`hcPath = "/"`:                     "主动健康检查路径空串=未配置→/：类型②省略型（字符串缺省，写侧允许空）——G3 Ruling 披露",
+		`serverName = "{lb.upstream_sni}"`: "逐上游回源域名在场时 SNI 改走占位符（逐连接展开实证）——host_header 缺省形态的发射形态切换（占位符 vs 静态值），非无效库值兜底；upstream-sni-host 方案披露——G3 Ruling 披露",
 		`hostFallback = "{http.reverse_proxy.upstream.hostport}"`: "Host 回退 TLS 池形态：host_header 未配置时绑定上游 hostport 占位符（池形态分流），类型②省略型同族——G3 Ruling 披露",
 		`hostFallback = "{http.request.hostport}"`:                "Host 回退常规池形态：host_header 未配置时绑定原始请求 hostport 占位符（现状复现）——G3 Ruling 披露",
 		`sniFallback = "{http.reverse_proxy.upstream.host}"`:      "SNI 回退：host_header 未配置时绑定上游 host 占位符（stdlib 空 server_name 默认的同义载体）——G3 Ruling 披露",
@@ -94,7 +125,16 @@ var antiFallbackAllowlist = map[string]map[string]string{
 	// 覆盖面扫描新发现：路径规则 static_response 的状态码
 	// 缺省形态（写侧允许 0=未配置，声明默认 200；空字符串守卫不在扫描命中面）。
 	"buildStaticResponseHandler": {
-		"status = 200": "path rule ResponseStatus=0→200：类型②省略型（写侧允许 0=未配置并声明默认），非无效库值兜底——见该处 Ruling 披露",
+		"status = 200":               "path rule ResponseStatus=0→200：类型②省略型（写侧允许 0=未配置并声明默认），非无效库值兜底——见该处 Ruling 披露",
+		`contentType = "text/plain"`: "path rule ResponseContentType 空=未配置→text/plain：类型②省略型（写侧允许空并声明默认），非无效库值兜底——G3 Ruling 披露",
+	},
+	"buildTCPProxyRoute": {
+		`strategy = "weighted_round_robin"`: "TCP 负载策略空串=未配置→默认加权轮询：类型②省略型（写侧归一单源，渲染层承担省略替换；cookie 策略对 layer4 不可用另行归一）——G3 Ruling 披露",
+	},
+	"formatRuleCertInfo": {
+		`info.Error = "ACME 证书尚未签发或不存在"`: "展示层占位文案：ACME 证书未签发时证书卡说明（非配置投影）——G3 Ruling 披露",
+		`info.Error = "证书不存在"`:           "展示层占位文案：manual 源无证书时证书卡说明（非配置投影）——G3 Ruling 披露",
+		`info.Issuer = "-"`:              "展示层占位：签发者不可解析时以「-」占位（非配置投影）——G3 Ruling 披露",
 	},
 	"buildIPPrecheckDirectives": {
 		"denyStatus = 403": "阶段 1 预检 denyStatus=0→403：类型②省略型（0=规则未配阶段 1 拦截页，stage1BlockStatus 契约的未设置态；coraza deny 必须显式状态码，省略以默认 403 替换实现，保持 403 兜底归因边界）——批 3 Ruling 披露",
@@ -105,7 +145,7 @@ func TestRenderLayer_hasNoHardcodedZeroFallbacks(t *testing.T) {
 	fset := token.NewFileSet()
 
 	scanned := map[string]bool{}
-	violations := map[string]string{}
+	violations := map[string][]string{}
 	for fileName, functions := range antiFallbackScanTargets {
 		file, err := parser.ParseFile(fset, fileName, nil, 0)
 		if err != nil {
@@ -120,8 +160,8 @@ func TestRenderLayer_hasNoHardcodedZeroFallbacks(t *testing.T) {
 				continue
 			}
 			scanned[fn.Name.Name] = true
-			for assign, pos := range fallbackAssignmentsInFunction(fset, fn) {
-				violations[fn.Name.Name+":"+assign] = pos
+			for assign, positions := range fallbackAssignmentsInFunction(fset, fn) {
+				violations[fn.Name.Name+":"+assign] = positions
 			}
 		}
 	}
@@ -136,15 +176,18 @@ func TestRenderLayer_hasNoHardcodedZeroFallbacks(t *testing.T) {
 	}
 
 	// 方向一：清单外命中=新兜底混入渲染层。
-	for key, pos := range violations {
+	for key, positions := range violations {
 		funcName, assign := splitScanKey(key)
-		allowed, inAllowlist := antiFallbackAllowlist[funcName]
-		reason, allowedAssign := allowed[assign]
-		if !inAllowlist || !allowedAssign {
-			t.Errorf("渲染函数 %s 出现清单外写死兜底 %q（%s）——库值唯一真相治理禁止在渲染层以数字字面量兜底无效库值；若为类型②省略型/范围外字段，请携 Ruling 加入 antiFallbackAllowlist", funcName, assign, pos)
+		allowed := antiFallbackAllowlist[funcName]
+		if _, allowedAssign := allowed[assign]; !allowedAssign {
+			t.Errorf("渲染函数 %s 出现清单外写死兜底 %q（%v）——库值唯一真相治理禁止在渲染层以字面量兜底无效库值；若为类型②省略型/范围外字段，请携 Ruling 加入 antiFallbackAllowlist", funcName, assign, positions)
 			continue
 		}
-		_ = reason
+		// 允许列表按「赋值文本」登记，同文本出现多处时必须收窄后才可登记：
+		// 次数上界=1，新增同文本兜底立即变红（原实现只判存在性，多写一处无人发现）。
+		if len(positions) != 1 {
+			t.Errorf("允许列表条目 %s:%q 命中 %d 处（%v）——同一文本多处出现，允许列表必须按守卫形态/位置收窄到单点后登记", funcName, assign, len(positions), positions)
+		}
 	}
 
 	// 方向二：清单条目必须仍存在于扫描命中（防允许列表腐化成死清单）。
@@ -184,8 +227,8 @@ func TestRenderLayer_hasNoHardcodedZeroFallbacks(t *testing.T) {
 			if listed[path+"|"+fn.Name.Name] {
 				continue
 			}
-			for assign, pos := range fallbackAssignmentsInFunction(fset, fn) {
-				t.Errorf("渲染族函数 %s（%s）含兜底 %q（%s）但未登记 antiFallbackScanTargets——新增渲染函数必须纳入扫描面或携 Ruling 说明非渲染用途", fn.Name.Name, path, assign, pos)
+			for assign, positions := range fallbackAssignmentsInFunction(fset, fn) {
+				t.Errorf("渲染族函数 %s（%s）含兜底 %q（%v）但未登记 antiFallbackScanTargets——新增渲染函数必须纳入扫描面或携 Ruling 说明非渲染用途", fn.Name.Name, path, assign, positions)
 			}
 		}
 	}
@@ -197,28 +240,51 @@ func TestRenderLayer_hasNoHardcodedZeroFallbacks(t *testing.T) {
 // 扩展：LSS(<0/<1)、NEQ(!=0 的 else 链)、GEQ(>=1 的 else 链) 零值守卫、
 // switch/case 的零值守卫分支、复合字面量默认值（`v = cfg{...}`）——原命中面
 // 可被这些语义等价写法绕过，机制失效时无红灯。
-func fallbackAssignmentsInFunction(fset *token.FileSet, fn *ast.FuncDecl) map[string]string {
-	hits := map[string]string{}
+func fallbackAssignmentsInFunction(fset *token.FileSet, fn *ast.FuncDecl) map[string][]string {
+	hits := map[string][]string{}
+	// 嵌套守卫会让同一节点被外层与内层各扫一次——按「位置 + 文本」去重，
+	// 保证位置清单与真实站点一一对应（允许列表的次数上界才有意义）。
+	seen := map[string]bool{}
 	if fn.Body == nil {
 		return hits
 	}
-	scanAssigns := func(branch ast.Node) {
+	record := func(text string, pos token.Pos) {
+		position := fset.Position(pos).String()
+		key := position + "|" + text
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		hits[text] = append(hits[text], position)
+	}
+	scanBranch := func(branch ast.Node) {
 		if branch == nil {
 			return
 		}
 		ast.Inspect(branch, func(m ast.Node) bool {
-			assign, ok := m.(*ast.AssignStmt)
-			// 仅 plain `=`（= 定义与 += 累加非兜底赋值）。
-			if !ok || assign.Tok != token.ASSIGN {
-				return true
-			}
-			for _, rhs := range assign.Rhs {
-				if isLiteralDefault(rhs) {
-					var buf bytes.Buffer
-					_ = printer.Fprint(&buf, fset, assign)
-					hits[buf.String()] = fset.Position(assign.Pos()).String()
-					break
+			switch node := m.(type) {
+			case *ast.AssignStmt:
+				// 仅 plain `=`（:= 定义与 += 累加非兜底赋值）。
+				if node.Tok != token.ASSIGN {
+					return true
 				}
+				for _, rhs := range node.Rhs {
+					if isLiteralDefault(rhs) {
+						var buf bytes.Buffer
+						_ = printer.Fprint(&buf, fset, node)
+						record(buf.String(), node.Pos())
+						break
+					}
+				}
+			case *ast.ReturnStmt:
+				// 守卫分支内的单一返回值字面量（哨兵值域映射等）同属写死默认值；
+				// 多返回值 `return <零值>, err` 是错误路径，不纳入。
+				if len(node.Results) != 1 || !isLiteralDefault(node.Results[0]) {
+					return true
+				}
+				var buf bytes.Buffer
+				_ = printer.Fprint(&buf, fset, node)
+				record(buf.String(), node.Pos())
 			}
 			return true
 		})
@@ -227,7 +293,7 @@ func fallbackAssignmentsInFunction(fset *token.FileSet, fn *ast.FuncDecl) map[st
 		// 只扫终端 else 块；else-if 由链循环按各自守卫独立判定（直接 Inspect
 		// else-if 节点会下钻其 body，把「非零值显式分支」误判为兜底）。
 		if block, ok := ifStmt.Else.(*ast.BlockStmt); ok {
-			scanAssigns(block)
+			scanBranch(block)
 		}
 	}
 	ast.Inspect(fn.Body, func(n ast.Node) bool {
@@ -239,13 +305,13 @@ func fallbackAssignmentsInFunction(fset *token.FileSet, fn *ast.FuncDecl) map[st
 			for current := node; current != nil; {
 				switch guardBranchOf(current.Cond) {
 				case guardFallbackBody:
-					scanAssigns(current.Body)
+					scanBranch(current.Body)
 					matched = true
 				case guardFallbackElse:
 					scanElseBlock(current)
 					matched = true
 				case guardFallbackBoth:
-					scanAssigns(current.Body)
+					scanBranch(current.Body)
 					matched = true
 				}
 				next, ok := current.Else.(*ast.IfStmt)
@@ -266,7 +332,7 @@ func fallbackAssignmentsInFunction(fset *token.FileSet, fn *ast.FuncDecl) map[st
 					terminal = next
 				}
 				if block, ok := terminal.Else.(*ast.BlockStmt); ok {
-					scanAssigns(block)
+					scanBranch(block)
 				}
 			}
 		case *ast.SwitchStmt:
@@ -278,7 +344,7 @@ func fallbackAssignmentsInFunction(fset *token.FileSet, fn *ast.FuncDecl) map[st
 				}
 				for _, expr := range clause.List {
 					if guardBranchOf(expr) != guardNone {
-						scanAssigns(&ast.BlockStmt{List: clause.Body})
+						scanBranch(&ast.BlockStmt{List: clause.Body})
 						break
 					}
 				}
@@ -306,6 +372,10 @@ const (
 //	x != 0 / x >= 1                   → else 块
 //	x > 0 → else 块 + if 体（命中面保留）
 //
+// 字符串域（无效库值=空串）：`s == ""` → if 体；`s != ""` → else 块。
+// 操作数可交换（`0 == x` / `"" == s` 等价归一）——反向书写是最容易逃逸的
+// 形态。`len(x) == 0` 由整数域 EQL 0 覆盖。
+//
 // GTR 保留 if 体扫描：`if len(x) > 0 { … }` 体内的字面量赋值由旧扫描器纳入，
 // 收窄会让既有 allowlist 条目腐化——命中面只扩不收。
 func guardBranchOf(cond ast.Expr) guardBranch {
@@ -313,33 +383,75 @@ func guardBranchOf(cond ast.Expr) guardBranch {
 	if !isBinary {
 		return guardNone
 	}
-	lit, isInt := bin.Y.(*ast.BasicLit)
-	if !isInt || lit.Kind != token.INT {
+	bin = flippedComparison(bin)
+	lit, isLiteral := bin.Y.(*ast.BasicLit)
+	if !isLiteral {
 		return guardNone
 	}
-	switch bin.Op {
-	case token.EQL, token.LEQ:
-		if lit.Value == "0" {
-			return guardFallbackBody
+	switch lit.Kind {
+	case token.STRING:
+		if lit.Value != `""` {
+			return guardNone
 		}
-	case token.LSS:
-		if lit.Value == "0" || lit.Value == "1" {
+		switch bin.Op {
+		case token.EQL:
 			return guardFallbackBody
-		}
-	case token.NEQ:
-		if lit.Value == "0" {
+		case token.NEQ:
 			return guardFallbackElse
 		}
-	case token.GTR:
-		if lit.Value == "0" {
-			return guardFallbackBoth
-		}
-	case token.GEQ:
-		if lit.Value == "1" {
-			return guardFallbackElse
+		return guardNone
+	case token.INT:
+		switch bin.Op {
+		case token.EQL, token.LEQ:
+			if lit.Value == "0" {
+				return guardFallbackBody
+			}
+		case token.LSS:
+			if lit.Value == "0" || lit.Value == "1" {
+				return guardFallbackBody
+			}
+		case token.NEQ:
+			if lit.Value == "0" {
+				return guardFallbackElse
+			}
+		case token.GTR:
+			if lit.Value == "0" {
+				return guardFallbackBoth
+			}
+		case token.GEQ:
+			if lit.Value == "1" {
+				return guardFallbackElse
+			}
 		}
 	}
 	return guardNone
+}
+
+// flippedComparison 把「字面量在左」的比较归一为「变量在左」：
+// `0 == x` → `x == 0`、`"" != s` → `s != ""`（关系运算符同步翻转）。
+func flippedComparison(bin *ast.BinaryExpr) *ast.BinaryExpr {
+	if !isLiteralOperand(bin.X) || isLiteralOperand(bin.Y) {
+		return bin
+	}
+	flipped := &ast.BinaryExpr{X: bin.Y, Y: bin.X}
+	switch bin.Op {
+	case token.LSS:
+		flipped.Op = token.GTR
+	case token.GTR:
+		flipped.Op = token.LSS
+	case token.LEQ:
+		flipped.Op = token.GEQ
+	case token.GEQ:
+		flipped.Op = token.LEQ
+	default:
+		flipped.Op = bin.Op
+	}
+	return flipped
+}
+
+func isLiteralOperand(expr ast.Expr) bool {
+	lit, ok := expr.(*ast.BasicLit)
+	return ok && (lit.Kind == token.INT || lit.Kind == token.STRING)
 }
 
 // isLiteralDefault 报告赋值右值是否为写死字面量默认值（INT/STRING 字面量、
@@ -424,6 +536,30 @@ func TestFallbackScan_detectsEquivalentGuardShapes(t *testing.T) {
 		{
 			name:   "composite-literal",
 			source: "package p\ntype c struct{ Timeout int }\nfunc f(x int) c { var v c; if x == 0 { v = c{Timeout: 5} }; return v }\n",
+		},
+		{
+			name:   "empty-string-guard",
+			source: "package p\nfunc f(s string) string { if s == \"\" { s = \"x\" }; return s }\n",
+		},
+		{
+			name:   "reversed-empty-string-guard",
+			source: "package p\nfunc f(s string) string { if \"\" == s { s = \"x\" }; return s }\n",
+		},
+		{
+			name:   "reversed-zero-int-guard",
+			source: "package p\nfunc f(x int) int { if 0 == x { x = 5 }; return x }\n",
+		},
+		{
+			name:   "len-zero-guard",
+			source: "package p\nfunc f(v []int) []int { if len(v) == 0 { v = []int{5} }; return v }\n",
+		},
+		{
+			name:   "not-empty-string-else",
+			source: "package p\nfunc f(s string) string { if s != \"\" { s = s } else { s = \"y\" }; return s }\n",
+		},
+		{
+			name:   "literal-return-in-guard",
+			source: "package p\nfunc f(x int) string { if x == 0 { return \"d\" }; return \"z\" }\n",
 		},
 	}
 	for _, fixture := range fixtures {

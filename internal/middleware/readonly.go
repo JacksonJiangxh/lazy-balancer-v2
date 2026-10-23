@@ -3,6 +3,7 @@ package middleware
 import (
 	"database/sql"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -46,8 +47,9 @@ func readOnlyGuard(database *sql.DB) gin.HandlerFunc {
 			return
 		}
 		if c.GetString("role") != "admin" {
-			// 主节点非管理员仅放行自管理（个人资料、自己的 API 密钥）
-			if isSelfServicePath(path) {
+			// 主节点非管理员仅放行自管理（个人资料、自己的 API 密钥、
+			// 用户管理页的本人编辑/重置密码——后者为重置语义，无当前密码）。
+			if isSelfServicePath(path) || isSelfServiceUserWrite(c) {
 				c.Next()
 				return
 			}
@@ -78,6 +80,34 @@ func isReadOnlyGuardWhitelisted(path string) bool {
 }
 
 // isSelfServicePath 是主节点上非管理员用户可自助维护资源的路径
+// isSelfServiceUserWrite 报告当前写请求是否为「用户管理页本人行」操作：
+// PUT /api/v1/users/<自己的 id> 或 POST /api/v1/users/<自己的 id>/reset-password。
+// 只接受数字 id，不接受 :id 模板——工具可见性枚举（按路由模板）不会因此把
+// update_user 暴露给非管理员。
+func isSelfServiceUserWrite(c *gin.Context) bool {
+	path := strings.TrimPrefix(c.Request.URL.Path, "/api/v1/users/")
+	if i := strings.IndexByte(path, '/'); i >= 0 {
+		if path[i:] != "/reset-password" {
+			return false
+		}
+		path = path[:i]
+	}
+	target, err := strconv.Atoi(path)
+	if err != nil || target <= 0 {
+		return false
+	}
+	var actor int
+	switch v := c.Value("user_id").(type) {
+	case int:
+		actor = v
+	case int64:
+		actor = int(v)
+	case float64:
+		actor = int(v)
+	}
+	return actor > 0 && actor == target
+}
+
 func isSelfServicePath(path string) bool {
 	return path == "/api/v1/users/me" ||
 		path == "/api/v1/users/me/api-keys" ||

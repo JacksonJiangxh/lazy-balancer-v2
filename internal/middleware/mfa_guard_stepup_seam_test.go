@@ -23,6 +23,24 @@ import (
 // 链路：旧 JWT（无 mfa_ts）→ verify-step 验码 → 新 JWT（新鲜 mfa_ts）→
 // disable 空码体 → 守卫宽限窗置标记放行 → handler 见标记跳过本层验码 → 200。
 // 无此接缝时 handler 对空码必 401。
+// totpCodeAwayFromBoundary 生成 TOTP 码并避开时间片边界：距边界 ≤2s 时等到
+// 下一片再生码——「片尾生成、请求跨片到达」会让验证落到下一片，造成与实现
+// 无关的偶发假红。
+func totpCodeAwayFromBoundary(t *testing.T, secret string) string {
+	t.Helper()
+	const periodSeconds = 30
+	now := time.Now()
+	if remaining := periodSeconds - now.Unix()%periodSeconds; remaining <= 2 {
+		time.Sleep(time.Duration(remaining) * time.Second)
+		now = time.Now()
+	}
+	code, err := totp.GenerateCodeCustom(secret, now, totp.ValidateOpts{Period: periodSeconds, Skew: 0, Digits: otp.DigitsSix, Algorithm: otp.AlgorithmSHA1})
+	if err != nil {
+		t.Fatalf("generate totp code: %v", err)
+	}
+	return code
+}
+
 func TestMFAStepUpSeam_guardMarkerFlowDisablesWithoutCode(t *testing.T) {
 	router := newMiddlewareTestRouter(t)
 	const jwtSecret = "test-secret" // 与 newMiddlewareTestRouterAtPort 相同
@@ -76,10 +94,7 @@ func TestMFAStepUpSeam_guardMarkerFlowDisablesWithoutCode(t *testing.T) {
 	}
 
 	// When①：verify-step 验码 → 新 JWT 携新鲜 mfa_ts。
-	code, err := totp.GenerateCodeCustom(secret, time.Now(), totp.ValidateOpts{Period: 30, Skew: 0, Digits: otp.DigitsSix, Algorithm: otp.AlgorithmSHA1})
-	if err != nil {
-		t.Fatal(err)
-	}
+	code := totpCodeAwayFromBoundary(t, secret)
 	rec := do(http.MethodPost, "/api/v1/auth/mfa/verify-step", fmt.Sprintf(`{"code":%q}`, code), oldToken)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("verify-step: status=%d body=%s, want 200", rec.Code, rec.Body.String())

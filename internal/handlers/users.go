@@ -146,9 +146,13 @@ func (h *Handlers) UpdateUser(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "角色无效"})
 		return
 	}
-	// 初始管理员(setup 首个用户)不可降级——与不可删除/禁用同语义,
-	// break-glass 能力不可被移除(存在另一管理员时也不放行)。
-	if id == setupAdminUserID && req.Role != nil && *req.Role == "user" {
+	// break-glass 管理入口（初始化创建的首个管理员，按 is_setup_admin 标记
+	// 判定）不可降级——与不可删除/禁用同语义，存在另一管理员时也不放行。
+	protected, ok := setupAdminProtected(c, id)
+	if !ok {
+		return
+	}
+	if protected && req.Role != nil && *req.Role == "user" {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "初始管理员不可降级"})
 		return
 	}
@@ -199,6 +203,18 @@ func (h *Handlers) UpdateUser(c *gin.Context) {
 	// 同值均为「不修改」（与下方 UPDATE 分支同一谓词），非空密码恒视为改密尝试。
 	usernameChanged := req.Username != nil && *req.Username != "" && *req.Username != oldUsername
 	displayNameChanged := req.DisplayName != nil && *req.DisplayName != oldDisplayName
+	// 非管理员本人自助（用户管理页）只允许改显示名与重置密码；用户名/角色是
+	// 管理语义，自助路径一律拒绝（防提权/身份漂移）。管理员不受此门限制。
+	if c.GetString("role") == "user" {
+		if usernameChanged {
+			c.JSON(http.StatusForbidden, models.APIResponse{Code: 403, Message: "非管理员不能修改用户名"})
+			return
+		}
+		if req.Role != nil && *req.Role != "" && *req.Role != oldRole {
+			c.JSON(http.StatusForbidden, models.APIResponse{Code: 403, Message: "非管理员不能修改角色"})
+			return
+		}
+	}
 	if usernameChanged || displayNameChanged || passwordChangeRequested {
 		oidcUser, err := isOIDCUser(c.Request.Context(), id)
 		if err != nil {
@@ -345,9 +361,19 @@ func isOIDCUser(ctx context.Context, userID int) (bool, error) {
 	return provider == "oidc", nil
 }
 
-// setupAdminUserID:系统 setup 创建的首个用户(auth.go SetupAdmin 仅在
-// users 空表时插入一行)——恒为 id=1,作为本地 break-glass 入口受保护。
-const setupAdminUserID = 1
+// setupAdminProtected 判定目标用户是否为受保护的 break-glass 管理入口
+// （初始化创建的首个管理员，按 users.is_setup_admin 标记判定；标记缺失的
+// 旧库回落到 db.SetupAdminFallbackUserID）。读库失败必须 500 fail-closed——
+// 无法判定保护目标时不得放行删除/禁用/降级。
+func setupAdminProtected(c *gin.Context, id int) (protected bool, ok bool) {
+	protected, err := db.IsSetupAdmin(c.Request.Context(), db.DB, id)
+	if err != nil {
+		services.Logf("error", "读取 setup 管理员标记失败: user_id=%d: %v", id, err)
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取用户保护状态失败"})
+		return false, false
+	}
+	return protected, true
+}
 
 func (h *Handlers) DeleteUser(c *gin.Context) {
 	// 导入窗口 409。
@@ -368,9 +394,13 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 		return
 	}
 
-	// 初始管理员(setup 创建的首个用户)不可删除——break-glass 入口保护
-	// (2026-09-18 用户裁定:提权后的 OIDC 管理员也不可动)。
-	if id == setupAdminUserID {
+	// break-glass 管理入口（setup 创建的首个用户）不可删除——存在另一
+	// 管理员时也不放行（2026-09-18 裁定：提权后的 OIDC 管理员同样不可动）。
+	protected, ok := setupAdminProtected(c, id)
+	if !ok {
+		return
+	}
+	if protected {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "初始管理员不可删除"})
 		return
 	}
@@ -510,10 +540,16 @@ func (h *Handlers) ToggleUserStatus(c *gin.Context) {
 		}
 	}
 
-	// 初始管理员不可禁用(同 DeleteUser 保护)
-	if !enable && id == setupAdminUserID {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "初始管理员不可禁用"})
-		return
+	// break-glass 管理入口不可禁用（同 DeleteUser 保护）
+	if !enable {
+		protected, ok := setupAdminProtected(c, id)
+		if !ok {
+			return
+		}
+		if protected {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "初始管理员不可禁用"})
+			return
+		}
 	}
 
 	tx, err := db.DB.BeginTx(c.Request.Context(), nil)

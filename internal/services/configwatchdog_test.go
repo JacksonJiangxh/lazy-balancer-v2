@@ -40,6 +40,14 @@ func resetConfigWatchdogForTest(t *testing.T) {
 	t.Cleanup(reset)
 }
 
+// currentSkippedRounds 读包内「自上次真实检查以来的跳过轮数」。
+// 该计数不随状态结构导出（无外部消费方），仅供包内簿记断言。
+func currentSkippedRounds() int {
+	configDriftMu.RLock()
+	defer configDriftMu.RUnlock()
+	return configDriftSkipped
+}
+
 func fakeCaddyWithRoutes(t *testing.T, configJSON string) *httptest.Server {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -286,8 +294,8 @@ func TestConfigWatchdog_heartbeatRetainsSkippedCountAcrossCleanWindow(t *testing
 
 	// Then the public since-last-check counter is zero, while the heartbeat's
 	// independent since-last-heartbeat window still reports the skipped round.
-	if drift := CurrentConfigDrift(); drift.SkippedRounds != 0 {
-		t.Fatalf("status skipped rounds=%d, want 0 after real checks", drift.SkippedRounds)
+	if got := currentSkippedRounds(); got != 0 {
+		t.Fatalf("status skipped rounds=%d, want 0 after real checks", got)
 	}
 	log := readTaskLog(t, "config-watchdog")
 	if !strings.Contains(log, "期间跳过 1 轮未判定") {
@@ -365,8 +373,8 @@ func TestConfigWatchdog_skippedRoundsDoNotEmitHeartbeat(t *testing.T) {
 	if drift := CurrentConfigDrift(); !drift.Consistent {
 		t.Fatalf("跳过轮不得置漂移态: %+v", drift)
 	}
-	if drift := CurrentConfigDrift(); drift.SkippedRounds != 2*configWatchdogHeartbeatRounds {
-		t.Fatalf("状态跳过轮字段=%d, want %d", drift.SkippedRounds, 2*configWatchdogHeartbeatRounds)
+	if got := currentSkippedRounds(); got != 2*configWatchdogHeartbeatRounds {
+		t.Fatalf("跳过轮计数=%d, want %d", got, 2*configWatchdogHeartbeatRounds)
 	}
 }
 
@@ -428,8 +436,8 @@ func TestConfigWatchdog_successfulCheckResetsSkippedRounds(t *testing.T) {
 	watchdogAdminURLValue = "http://127.0.0.1:1"
 	WatchdogCheckOnce(context.Background())
 	WatchdogCheckOnce(context.Background())
-	if drift := CurrentConfigDrift(); drift.SkippedRounds != 2 {
-		t.Fatalf("setup skipped rounds=%d, want 2", drift.SkippedRounds)
+	if got := currentSkippedRounds(); got != 2 {
+		t.Fatalf("setup skipped rounds=%d, want 2", got)
 	}
 	server := fakeCaddyWithRoutes(t, emptyCaddyConfig)
 	watchdogAdminURLValue = server.URL
@@ -439,8 +447,8 @@ func TestConfigWatchdog_successfulCheckResetsSkippedRounds(t *testing.T) {
 
 	// Then the counter defined as "since the last real check" returns to zero,
 	// while the successful round still advances the clean-round window.
-	if drift := CurrentConfigDrift(); drift.SkippedRounds != 0 {
-		t.Fatalf("skipped rounds after real consistent check=%d, want 0", drift.SkippedRounds)
+	if got := currentSkippedRounds(); got != 0 {
+		t.Fatalf("skipped rounds after real consistent check=%d, want 0", got)
 	}
 	configDriftMu.RLock()
 	cleanRounds := configDriftCleanRounds
@@ -452,8 +460,89 @@ func TestConfigWatchdog_successfulCheckResetsSkippedRounds(t *testing.T) {
 	// And a later skipped round is counted from this new real-check boundary.
 	watchdogAdminURLValue = "http://127.0.0.1:1"
 	WatchdogCheckOnce(context.Background())
-	if drift := CurrentConfigDrift(); drift.SkippedRounds != 1 {
-		t.Fatalf("skipped rounds after new failure=%d, want 1", drift.SkippedRounds)
+	if got := currentSkippedRounds(); got != 1 {
+		t.Fatalf("skipped rounds after new failure=%d, want 1", got)
+	}
+}
+
+// 漂移证据必须连续：一轮未判定（规则/Caddy 读取失败）本身不含证据，
+// 不得让「漂移→跳过→漂移」跨过它拼成两轮证据而确认漂移。
+func TestConfigWatchdog_skippedRoundBreaksDriftStreak(t *testing.T) {
+	_, database := newClusterTestService(t)
+	seedGenerationRule(t, database, "lb_watchdog_streak", false)
+	resetConfigWatchdogForTest(t)
+	oldURL := watchdogAdminURLValue
+	t.Cleanup(func() { watchdogAdminURLValue = oldURL })
+	driftServer := fakeCaddyWithRoutes(t, emptyCaddyConfig)
+
+	// 第一轮不一致（防抖：只计数不置状态）
+	watchdogAdminURLValue = driftServer.URL
+	WatchdogCheckOnce(context.Background())
+	// 一轮未判定（Caddy 不可达）
+	watchdogAdminURLValue = "http://127.0.0.1:1"
+	WatchdogCheckOnce(context.Background())
+	// 再一轮不一致：与首轮之间隔了未知轮，不构成连续证据
+	watchdogAdminURLValue = driftServer.URL
+	WatchdogCheckOnce(context.Background())
+	if drift := CurrentConfigDrift(); !drift.Consistent {
+		t.Fatalf("漂移→跳过→漂移不是连续两轮证据，不得确认漂移: %+v", drift)
+	}
+	configDriftMu.RLock()
+	streak := configDriftStreak
+	configDriftMu.RUnlock()
+	if streak != 1 {
+		t.Fatalf("streak=%d, want 1（跳过轮必须打断连续窗口）", streak)
+	}
+
+	// 第四轮仍不一致 → 此时才是连续两轮有效证据
+	WatchdogCheckOnce(context.Background())
+	if drift := CurrentConfigDrift(); drift.Consistent {
+		t.Fatalf("连续两轮有效不一致应确认漂移: %+v", drift)
+	}
+}
+
+// 心跳文案的「期间跳过 N 轮」窗口与干净轮窗口同起点：一轮不一致观测
+// 已清空干净轮窗口，跳过计数必须同步重启——否则恢复后的心跳会把漂移之前的
+// 跳过轮算进「近 60 轮」窗口。
+func TestConfigWatchdog_heartbeatSkippedWindowRestartsAtDriftObservation(t *testing.T) {
+	_, database := newClusterTestService(t)
+	seedGenerationRule(t, database, "lb_watchdog_hb_window", false)
+	resetConfigWatchdogForTest(t)
+	newTaskLogDir(t)
+	oldURL := watchdogAdminURLValue
+	t.Cleanup(func() { watchdogAdminURLValue = oldURL })
+
+	// 一轮未判定（跳过轮）
+	watchdogAdminURLValue = "http://127.0.0.1:1"
+	WatchdogCheckOnce(context.Background())
+	// 一轮不一致观测（防抖）
+	driftServer := fakeCaddyWithRoutes(t, emptyCaddyConfig)
+	watchdogAdminURLValue = driftServer.URL
+	WatchdogCheckOnce(context.Background())
+
+	configDriftMu.RLock()
+	cleanRounds, heartbeatSkipped := configDriftCleanRounds, configDriftHeartbeatSkipped
+	configDriftMu.RUnlock()
+	if cleanRounds != 0 || heartbeatSkipped != 0 {
+		t.Fatalf("不一致观测须重启心跳窗口: clean=%d heartbeatSkipped=%d, want 0/0", cleanRounds, heartbeatSkipped)
+	}
+
+	// 第二轮不一致 → 确认漂移；恢复后积满心跳窗口，心跳不得携带漂移前的跳过轮
+	WatchdogCheckOnce(context.Background())
+	if drift := CurrentConfigDrift(); drift.Consistent {
+		t.Fatalf("连续两轮不一致应确认漂移: %+v", drift)
+	}
+	full := fakeCaddyWithRoutes(t, `{"apps":{"http":{"servers":{"http_8080":{"listen":[":8080"],"routes":[{"@id":"lb_watchdog_hb_window","handle":[{"handler":"reverse_proxy"}]}]}}}}}`)
+	watchdogAdminURLValue = full.URL
+	for range configWatchdogHeartbeatRounds {
+		WatchdogCheckOnce(context.Background())
+	}
+	log := readTaskLog(t, "config-watchdog")
+	if !strings.Contains(log, "配置一致（心跳，近 60 轮无漂移）") {
+		t.Fatalf("恢复后满窗口应发无跳过计数的历史心跳: %q", log)
+	}
+	if strings.Contains(log, "期间跳过") {
+		t.Fatalf("不一致观测之前的跳过轮不得计入心跳窗口: %q", log)
 	}
 }
 

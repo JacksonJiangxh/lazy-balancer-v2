@@ -10,16 +10,16 @@ import (
 	"net/http"
 	"strings"
 	"testing"
-	"time"
 
 	"lazy-balancer-v2/internal/db"
 )
 
-// TestDeleteCustomRuleRace_serializableIsolationBlocksConcurrentPolicyEnable
+// TestDeleteCustomRuleRace_immediateTxBlocksConcurrentPolicyEnable
 // 串行模拟交错：删除事务的引用检查 SELECT 之后、DELETE 之前，并发的
-// 策略启用（UpdateSecurityPolicy 语义）不得提交。BEGIN IMMEDIATE 下引用检查即
-// 持写锁，策略启用只能等删除事务提交后执行——检查与删除之间不存在插队窗口。
-func TestDeleteCustomRuleRace_serializableIsolationBlocksConcurrentPolicyEnable(t *testing.T) {
+// 策略启用（UpdateSecurityPolicy 语义）不得提交。写锁来自 DSN
+// `_txlock=immediate`（事务开始即持写锁），独立 busy_timeout=0 连接上的写会
+// 立即 SQLITE_BUSY——检查与删除之间不存在插队窗口，无需固定 sleep。
+func TestDeleteCustomRuleRace_immediateTxBlocksConcurrentPolicyEnable(t *testing.T) {
 	// Given a custom rule referenced only by a disabled policy (delete allowed)
 	setupSecurityPolicyTestDB(t)
 	res, err := db.DB.Exec(`INSERT INTO security_custom_rules (name, conditions, action, score, enabled) VALUES ('竞态规则', '[]', 'block', 5, 1)`)
@@ -39,8 +39,8 @@ func TestDeleteCustomRuleRace_serializableIsolationBlocksConcurrentPolicyEnable(
 	}
 
 	ctx := context.Background()
-	// delete 侧事务（同修复后 DeleteSecurityCustomRule 语义）：引用检查 SELECT 即持写锁
-	delTx, err := db.DB.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	// delete 侧事务（同 DeleteSecurityCustomRule 语义）：引用检查 SELECT 即持写锁
+	delTx, err := db.DB.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatalf("begin delete tx: %v", err)
 	}
@@ -69,19 +69,12 @@ func TestDeleteCustomRuleRace_serializableIsolationBlocksConcurrentPolicyEnable(
 		t.Fatalf("referenced=%d, want 0 (policy disabled)", referenced)
 	}
 
-	// 并发策略启用（使引用生效）在检查之后、删除之前发起
-	updateDone := make(chan error, 1)
-	go func() {
-		_, err := db.DB.Exec("UPDATE security_policies SET enabled=1 WHERE id=?", policyID)
-		updateDone <- err
-	}()
-
-	// Then the concurrent enable is blocked by the write lock: it cannot commit
-	// between the reference check and the DELETE（回归：写窗口）
-	select {
-	case err := <-updateDone:
-		t.Fatalf("并发策略启用已在检查与删除之间完成: %v（回归：历史修复写窗口）", err)
-	case <-time.After(200 * time.Millisecond):
+	// Then 并发策略启用立即被写锁拒绝（不能提交在检查与 DELETE 之间）
+	concurrent := openNoBusyWaitDB(t)
+	if _, err := concurrent.ExecContext(ctx, "UPDATE security_policies SET enabled=1 WHERE id=?", policyID); err == nil {
+		t.Fatal("并发策略启用已在检查与删除之间完成（必须被写锁拒绝）")
+	} else if !strings.Contains(strings.ToLower(err.Error()), "locked") {
+		t.Fatalf("并发启用错误=%v, want database is locked（写锁屏障）", err)
 	}
 
 	// delete 侧完成 DELETE + Commit
@@ -92,14 +85,9 @@ func TestDeleteCustomRuleRace_serializableIsolationBlocksConcurrentPolicyEnable(
 		t.Fatalf("commit delete tx: %v", err)
 	}
 
-	// 并发启用此时才能提交（删除已提交，无死锁）
-	select {
-	case err := <-updateDone:
-		if err != nil {
-			t.Fatalf("并发策略启用: %v", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("并发策略启用被永久阻塞")
+	// 屏障解除后同一启用必须成功——证明上面失败源自写锁而非其他错误
+	if _, err := concurrent.ExecContext(ctx, "UPDATE security_policies SET enabled=1 WHERE id=?", policyID); err != nil {
+		t.Fatalf("策略启用 after delete commit: %v", err)
 	}
 
 	// And the rule is deleted；引用检查与删除之间不存在交错窗口
@@ -112,10 +100,10 @@ func TestDeleteCustomRuleRace_serializableIsolationBlocksConcurrentPolicyEnable(
 	}
 }
 
-// TestDeleteBlockPageRace_serializableIsolationBlocksConcurrentPolicyEnable
+// TestDeleteBlockPageRace_immediateTxBlocksConcurrentPolicyEnable
 // 同模拟，针对 DeleteSecurityBlockPage：引用 COUNT 检查与 DELETE 同事务，
-// 并发的策略启用无法插队到检查与 DELETE 之间。
-func TestDeleteBlockPageRace_serializableIsolationBlocksConcurrentPolicyEnable(t *testing.T) {
+// 并发的策略启用无法插队到检查与 DELETE 之间（写锁来自 DSN `_txlock=immediate`）。
+func TestDeleteBlockPageRace_immediateTxBlocksConcurrentPolicyEnable(t *testing.T) {
 	// Given a block page referenced only by a disabled policy (delete allowed)
 	setupSecurityPolicyTestDB(t)
 	res, err := db.DB.Exec(`INSERT INTO security_block_pages (name, content, is_default) VALUES ('竞态页面', '<html></html>', 0)`)
@@ -135,8 +123,8 @@ func TestDeleteBlockPageRace_serializableIsolationBlocksConcurrentPolicyEnable(t
 	}
 
 	ctx := context.Background()
-	// delete 侧事务（同修复后 DeleteSecurityBlockPage 语义）：默认页检查 + 引用 COUNT 即持写锁
-	delTx, err := db.DB.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	// delete 侧事务（同 DeleteSecurityBlockPage 语义）：默认页检查 + 引用 COUNT 即持写锁
+	delTx, err := db.DB.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatalf("begin delete tx: %v", err)
 	}
@@ -156,19 +144,12 @@ func TestDeleteBlockPageRace_serializableIsolationBlocksConcurrentPolicyEnable(t
 		t.Fatalf("referenced=%d, want 0 (policy disabled)", referenced)
 	}
 
-	// 并发策略启用（使引用生效）在检查之后、删除之前发起
-	updateDone := make(chan error, 1)
-	go func() {
-		_, err := db.DB.Exec("UPDATE security_policies SET enabled=1 WHERE id=?", policyID)
-		updateDone <- err
-	}()
-
-	// Then the concurrent enable is blocked: it cannot commit between the
-	// reference COUNT and the DELETE（回归：写窗口）
-	select {
-	case err := <-updateDone:
-		t.Fatalf("并发策略启用已在检查与删除之间完成: %v（回归：历史修复写窗口）", err)
-	case <-time.After(200 * time.Millisecond):
+	// Then 并发策略启用立即被写锁拒绝（不能提交在 COUNT 与 DELETE 之间）
+	concurrent := openNoBusyWaitDB(t)
+	if _, err := concurrent.ExecContext(ctx, "UPDATE security_policies SET enabled=1 WHERE id=?", policyID); err == nil {
+		t.Fatal("并发策略启用已在检查与删除之间完成（必须被写锁拒绝）")
+	} else if !strings.Contains(strings.ToLower(err.Error()), "locked") {
+		t.Fatalf("并发启用错误=%v, want database is locked（写锁屏障）", err)
 	}
 
 	// delete 侧完成 DELETE + Commit
@@ -179,14 +160,9 @@ func TestDeleteBlockPageRace_serializableIsolationBlocksConcurrentPolicyEnable(t
 		t.Fatalf("commit delete tx: %v", err)
 	}
 
-	// 并发启用此时才能提交
-	select {
-	case err := <-updateDone:
-		if err != nil {
-			t.Fatalf("并发策略启用: %v", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("并发策略启用被永久阻塞")
+	// 屏障解除后同一启用必须成功——证明上面失败源自写锁而非其他错误
+	if _, err := concurrent.ExecContext(ctx, "UPDATE security_policies SET enabled=1 WHERE id=?", policyID); err != nil {
+		t.Fatalf("策略启用 after delete commit: %v", err)
 	}
 
 	// And the page is deleted；引用检查与删除之间不存在交错窗口

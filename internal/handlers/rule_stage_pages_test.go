@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -112,9 +113,15 @@ func TestRule_stageBlockPages_validation(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			before := stagePageColumnsKey(t)
 			response := putStageRule(t, router, tc.body)
 			if response.Code != http.StatusBadRequest {
 				t.Fatalf("status=%d body=%s, want 400", response.Code, response.Body.String())
+			}
+			// 拒绝不得部分写入：四个阶段页列必须与请求前逐列一致
+			//（如 stage3 合法、stage1 悬空时，stage3 不得先落库）。
+			if after := stagePageColumnsKey(t); after != before {
+				t.Fatalf("stage page columns after rejected update=%s, want 原值 %s", after, before)
 			}
 		})
 	}
@@ -160,4 +167,11 @@ func TestCreateRule_stageBlockPages_roundTrip(t *testing.T) {
 	if s1id != 7 || s1status != 403 || s3id != 8 || s3status != 0 {
 		t.Fatalf("created stage columns=(%d,%d,%d,%d), want (7,403,8,0)", s1id, s1status, s3id, s3status)
 	}
+}
+
+// stagePageColumnsKey 把四个阶段页列拼成可比较键（拒绝路径逐列不变的断言用）。
+func stagePageColumnsKey(t *testing.T) string {
+	t.Helper()
+	s1id, s1status, s3id, s3status := stagePageColumns(t)
+	return fmt.Sprintf("%d,%d,%d,%d", s1id, s1status, s3id, s3status)
 }

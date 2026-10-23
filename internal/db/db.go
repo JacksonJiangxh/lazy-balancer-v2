@@ -336,6 +336,9 @@ func createTables() error {
 		role VARCHAR(20) NOT NULL DEFAULT 'user',
 		display_name VARCHAR(100),
 		is_enabled BOOLEAN NOT NULL DEFAULT 1,
+		-- is_setup_admin 标记 break-glass 管理入口（初始化创建的首个管理员）。
+		-- 恒为单行标记：不可删/禁/降级由 handlers 读本列判定，常量仅作缺省。
+		is_setup_admin INTEGER NOT NULL DEFAULT 0,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		last_login DATETIME
 	);
@@ -909,19 +912,26 @@ CREATE TABLE IF NOT EXISTS security_threat_sources (
 }
 
 // seedThreatSourcesIfNeeded 按需播种/跟进威胁源三源（判定全部为只读）。
+//
+// 收敛判据覆盖播种语句投影的全部列（display_name/url/format）：只判
+// display_name 时，内置下载端 URL 或解析格式的修订永远到不了存量库，而
+// 面板展示与更新任务读的正是库里这两列。用户可改列（update_enabled/
+// apply_enabled/状态/排程）不参与判据也不参与写。
 func seedThreatSourcesIfNeeded() error {
-	existing := map[string]string{}
-	rows, err := DB.Query(`SELECT name, COALESCE(display_name,'') FROM security_threat_sources`)
+	type storedSource struct{ displayName, url, format string }
+	existing := map[string]storedSource{}
+	rows, err := DB.Query(`SELECT name, COALESCE(display_name,''), COALESCE(url,''), COALESCE(format,'') FROM security_threat_sources`)
 	if err != nil {
 		return fmt.Errorf("failed to inspect threat sources: %w", err)
 	}
 	for rows.Next() {
-		var name, displayName string
-		if err := rows.Scan(&name, &displayName); err != nil {
+		var name string
+		var current storedSource
+		if err := rows.Scan(&name, &current.displayName, &current.url, &current.format); err != nil {
 			rows.Close()
 			return fmt.Errorf("failed to scan threat source: %w", err)
 		}
-		existing[name] = displayName
+		existing[name] = current
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -932,7 +942,8 @@ func seedThreatSourcesIfNeeded() error {
 	}
 	converged := true
 	for _, seed := range threatSourceSeeds {
-		if current, ok := existing[seed.Name]; !ok || current != seed.DisplayName {
+		current, ok := existing[seed.Name]
+		if !ok || current.displayName != seed.DisplayName || current.url != seed.URL || current.format != seed.Format {
 			converged = false
 			break
 		}
@@ -944,9 +955,11 @@ func seedThreatSourcesIfNeeded() error {
 		if _, err := DB.Exec(`INSERT OR IGNORE INTO security_threat_sources (name, display_name, url, format) VALUES (?, ?, ?, ?)`, seed.Name, seed.DisplayName, seed.URL, seed.Format); err != nil {
 			return fmt.Errorf("failed to seed threat source %s: %w", seed.Name, err)
 		}
-		// 存量行 display_name 专业化跟进（2026-09-24 用户裁定；name 为定位键不变）
-		if _, err := DB.Exec(`UPDATE security_threat_sources SET display_name=? WHERE name=? AND COALESCE(display_name,'')<>?`, seed.DisplayName, seed.Name, seed.DisplayName); err != nil {
-			return fmt.Errorf("failed to refresh threat source display_name %s: %w", seed.Name, err)
+		// 存量行下载端定义跟进（name 为定位键不变）：三列守卫，仅真正漂移的
+		// 行写——收敛库每次启动不再产生无条件写。
+		if _, err := DB.Exec(`UPDATE security_threat_sources SET display_name=?, url=?, format=? WHERE name=? AND (COALESCE(display_name,'')<>? OR COALESCE(url,'')<>? OR COALESCE(format,'')<>?)`,
+			seed.DisplayName, seed.URL, seed.Format, seed.Name, seed.DisplayName, seed.URL, seed.Format); err != nil {
+			return fmt.Errorf("failed to refresh threat source %s: %w", seed.Name, err)
 		}
 	}
 	return nil
@@ -972,6 +985,7 @@ var newColumnsRegistry = map[string]string{
 	// apiKeyColumns/newLbColumns 局部 map 循环——DDL 与默认值逐字沿用原登记。
 	"users.display_name":                  "VARCHAR(100)",
 	"users.is_enabled":                    "BOOLEAN NOT NULL DEFAULT 1",
+	"users.is_setup_admin":                "INTEGER NOT NULL DEFAULT 0",
 	"api_keys.is_enabled":                 "BOOLEAN DEFAULT TRUE",
 	"api_keys.mcp_enabled":                "INTEGER DEFAULT 0",
 	"api_keys.read_only":                  "INTEGER DEFAULT 0",
@@ -1319,6 +1333,11 @@ func runMigrations() error {
 		// 历史 存量挑战按用户当前密码版本回填（列新增当刻这些
 		// 挑战本就按「当前密码未变」语义有效，行为零漂移；一次性形状）。
 		"mfa_challenges.password_version": "UPDATE mfa_challenges SET password_version=COALESCE((SELECT COALESCE(password_version,0) FROM users WHERE users.id=mfa_challenges.user_id),0)",
+		// 存量库首次补列：把「最低 id 的启用管理员」标为 break-glass 管理入口
+		// （与运行期 EnsureSetupAdminFlag 同一判据；已有标记则不覆盖）。
+		"users.is_setup_admin": `UPDATE users SET is_setup_admin=1
+			WHERE id=(SELECT id FROM users WHERE role='admin' AND is_enabled=1 ORDER BY id LIMIT 1)
+			  AND NOT EXISTS (SELECT 1 FROM users WHERE COALESCE(is_setup_admin,0)=1 AND role='admin' AND is_enabled=1)`,
 	}
 	if err := ensureNewColumns(newColumns, newColumnBackfills); err != nil {
 		return err
@@ -1347,6 +1366,11 @@ func runMigrations() error {
 	// 补齐收敛——重建迁移自身漏列不再造成列永久丢失（数据按列默认值回填）。
 	if err := ensureNewColumns(newColumns, newColumnBackfills); err != nil {
 		return err
+	}
+	// 保护目标自愈：users 重建/存量迁移可能留下「无标记」状态，按「最低 id
+	// 的启用管理员」补标（空库/无启用管理员时零命中，不阻断启动）。
+	if err := EnsureSetupAdminFlag(context.Background(), DB); err != nil {
+		return fmt.Errorf("failed to ensure setup admin flag: %w", err)
 	}
 	if err := migrateAutoBackupNodeTopologySection(); err != nil {
 		return fmt.Errorf("failed to migrate auto backup node topology section: %w", err)
@@ -2955,33 +2979,10 @@ func countDanglingSystemIPListRefs(q migrationExecer) (int, error) {
 	}
 	dangling := 0
 	for _, ref := range systemIPListRefColumns {
-		var hasTable, hasColumn int
-		if err := q.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, ref.table).Scan(&hasTable); err != nil {
-			return 0, fmt.Errorf("inspect table %s: %w", ref.table, err)
-		}
-		if hasTable == 0 {
-			continue
-		}
-		if err := q.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?`, ref.table, ref.column).Scan(&hasColumn); err != nil {
-			return 0, fmt.Errorf("inspect column %s.%s: %w", ref.table, ref.column, err)
-		}
-		if hasColumn == 0 {
-			continue
-		}
-		rows, err := q.Query(`SELECT COALESCE(` + ref.column + `,'[]') FROM ` + ref.table)
-		if err != nil {
-			return 0, fmt.Errorf("query %s.%s: %w", ref.table, ref.column, err)
-		}
-		for rows.Next() {
-			var raw string
-			if err := rows.Scan(&raw); err != nil {
-				rows.Close()
-				return 0, fmt.Errorf("scan %s.%s: %w", ref.table, ref.column, err)
-			}
-			var parsed []int64
-			if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
-				rows.Close()
-				return 0, fmt.Errorf("parse %s.%s value %q: %w", ref.table, ref.column, raw, err)
+		err := iterSystemIPListRefs(q, ref, func(row systemIPListRefRow) error {
+			parsed, err := decodeSystemIPListRefIDs(ref, row)
+			if err != nil {
+				return err
 			}
 			for _, id := range parsed {
 				if _, ok := rowsExist[int(id)]; !ok {
@@ -2989,13 +2990,10 @@ func countDanglingSystemIPListRefs(q migrationExecer) (int, error) {
 					break
 				}
 			}
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return 0, fmt.Errorf("iterate %s.%s: %w", ref.table, ref.column, err)
-		}
-		if err := rows.Close(); err != nil {
-			return 0, fmt.Errorf("close %s.%s rows: %w", ref.table, ref.column, err)
+			return nil
+		})
+		if err != nil {
+			return 0, err
 		}
 	}
 	return dangling, nil
@@ -3052,16 +3050,78 @@ func planSystemIPListDedupe(q migrationExecer) (map[int]int, error) {
 	return remap, nil
 }
 
+// systemIPListRef 是一个引用面（表 + JSON id 数组列）。
+type systemIPListRef struct {
+	table  string
+	column string
+}
+
 // systemIPListRefColumns 引用 security_ip_lists 行的 JSON id 数组列清单
 // （策略 ACL/白名单引用 + 全局受信代理范围引用）——去重保留优先级与引用
 // 重写共用同一引用面，新增引用列时必须同步登记。
-var systemIPListRefColumns = []struct {
-	table  string
-	column string
-}{
+var systemIPListRefColumns = []systemIPListRef{
 	{"security_policies", "ip_acl_list_refs"},
 	{"security_policies", "ip_whitelist_refs"},
 	{"global_config", "trusted_proxy_range_refs"},
+}
+
+// systemIPListRefRow 是引用面的一行（未解码）：rowID 为该表主键 id，raw 为
+// JSON id 数组原文。global_config 是全局单行表，其定位恒为 id=1。
+type systemIPListRefRow struct {
+	rowID int
+	raw   string
+}
+
+// iterSystemIPListRefs 遍历一个引用面的全部行（存在性探测 + 整列读的单源
+// 实现，悬空统计/引用集合/引用重写三个消费方共用）。库形态缺表或缺列时整面
+// 跳过——列由 newColumns 后补、测试直调旧形态，不存在的列不可能持有引用。
+// 回调只在游标存活期间调用，写操作必须由调用方在迭代结束后执行。
+func iterSystemIPListRefs(q migrationExecer, ref systemIPListRef, fn func(row systemIPListRefRow) error) error {
+	var hasTable, hasColumn int
+	if err := q.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, ref.table).Scan(&hasTable); err != nil {
+		return fmt.Errorf("inspect table %s: %w", ref.table, err)
+	}
+	if hasTable == 0 {
+		return nil
+	}
+	if err := q.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?`, ref.table, ref.column).Scan(&hasColumn); err != nil {
+		return fmt.Errorf("inspect column %s.%s: %w", ref.table, ref.column, err)
+	}
+	if hasColumn == 0 {
+		return nil
+	}
+	rowQuery := `SELECT id, COALESCE(` + ref.column + `,'[]') FROM ` + ref.table
+	if ref.table == "global_config" {
+		rowQuery += ` WHERE id=1`
+	}
+	rows, err := q.Query(rowQuery)
+	if err != nil {
+		return fmt.Errorf("query %s.%s: %w", ref.table, ref.column, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var row systemIPListRefRow
+		if err := rows.Scan(&row.rowID, &row.raw); err != nil {
+			return fmt.Errorf("scan %s.%s: %w", ref.table, ref.column, err)
+		}
+		if err := fn(row); err != nil {
+			return err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate %s.%s: %w", ref.table, ref.column, err)
+	}
+	return nil
+}
+
+// decodeSystemIPListRefIDs 解析引用面一行的 JSON id 数组；畸形 JSON 响亮
+// 失败——迁移不得猜测修复引用。
+func decodeSystemIPListRefIDs(ref systemIPListRef, row systemIPListRefRow) ([]int64, error) {
+	var parsed []int64
+	if err := json.Unmarshal([]byte(row.raw), &parsed); err != nil {
+		return nil, fmt.Errorf("parse %s.%s value %q: %w", ref.table, ref.column, row.raw, err)
+	}
+	return parsed, nil
 }
 
 // collectReferencedSystemIPListIDs 收集全部引用面出现的名单 id 集合。
@@ -3072,43 +3132,19 @@ var systemIPListRefColumns = []struct {
 func collectReferencedSystemIPListIDs(q migrationExecer) (map[int]struct{}, error) {
 	ids := map[int]struct{}{}
 	for _, ref := range systemIPListRefColumns {
-		var hasTable, hasColumn int
-		if err := q.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, ref.table).Scan(&hasTable); err != nil {
-			return nil, fmt.Errorf("inspect table %s: %w", ref.table, err)
-		}
-		if hasTable == 0 {
-			continue
-		}
-		if err := q.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?`, ref.table, ref.column).Scan(&hasColumn); err != nil {
-			return nil, fmt.Errorf("inspect column %s.%s: %w", ref.table, ref.column, err)
-		}
-		if hasColumn == 0 {
-			continue
-		}
-		rows, err := q.Query(`SELECT COALESCE(` + ref.column + `,'[]') FROM ` + ref.table)
-		if err != nil {
-			return nil, fmt.Errorf("query %s.%s: %w", ref.table, ref.column, err)
-		}
-		for rows.Next() {
-			var raw string
-			if err := rows.Scan(&raw); err != nil {
-				rows.Close()
-				return nil, fmt.Errorf("scan %s.%s: %w", ref.table, ref.column, err)
-			}
-			var parsed []int64
-			if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
-				rows.Close()
-				return nil, fmt.Errorf("parse %s.%s value %q: %w", ref.table, ref.column, raw, err)
+		err := iterSystemIPListRefs(q, ref, func(row systemIPListRefRow) error {
+			parsed, err := decodeSystemIPListRefIDs(ref, row)
+			if err != nil {
+				return err
 			}
 			for _, id := range parsed {
 				ids[int(id)] = struct{}{}
 			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
 		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return nil, fmt.Errorf("iterate %s.%s: %w", ref.table, ref.column, err)
-		}
-		rows.Close()
 	}
 	return ids, nil
 }
@@ -3116,50 +3152,17 @@ func collectReferencedSystemIPListIDs(q migrationExecer) (map[int]struct{}, erro
 // rewriteSystemIPListRefs 把引用面中指向被删行的 id 重写为存活 id；
 // 指向存活行的引用原样保留。数组内 id 顺序与重复形态保持不变。
 func rewriteSystemIPListRefs(q migrationExecer, remap map[int]int) error {
+	type pendingUpdate struct {
+		rowID int
+		value string
+	}
 	for _, ref := range systemIPListRefColumns {
-		// 与 collectReferencedSystemIPListIDs 同口径：库形态缺表/列时跳过
-		//（不存在的引用面不可能持有被删 id）。
-		var hasTable, hasColumn int
-		if err := q.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, ref.table).Scan(&hasTable); err != nil {
-			return fmt.Errorf("inspect table %s: %w", ref.table, err)
-		}
-		if hasTable == 0 {
-			continue
-		}
-		if err := q.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?`, ref.table, ref.column).Scan(&hasColumn); err != nil {
-			return fmt.Errorf("inspect column %s.%s: %w", ref.table, ref.column, err)
-		}
-		if hasColumn == 0 {
-			continue
-		}
-		var rowQuery, updateQuery string
-		if ref.table == "global_config" {
-			rowQuery = `SELECT id, COALESCE(` + ref.column + `,'[]') FROM global_config WHERE id=1`
-			updateQuery = `UPDATE global_config SET ` + ref.column + `=? WHERE id=?`
-		} else {
-			rowQuery = `SELECT id, COALESCE(` + ref.column + `,'[]') FROM ` + ref.table
-			updateQuery = `UPDATE ` + ref.table + ` SET ` + ref.column + `=? WHERE id=?`
-		}
-		rows, err := q.Query(rowQuery)
-		if err != nil {
-			return fmt.Errorf("query %s.%s: %w", ref.table, ref.column, err)
-		}
-		type pendingUpdate struct {
-			rowID int
-			value string
-		}
 		var pending []pendingUpdate
-		for rows.Next() {
-			var rowID int
-			var raw string
-			if err := rows.Scan(&rowID, &raw); err != nil {
-				rows.Close()
-				return fmt.Errorf("scan %s.%s: %w", ref.table, ref.column, err)
-			}
-			var parsed []int64
-			if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
-				rows.Close()
-				return fmt.Errorf("parse %s.%s value %q: %w", ref.table, ref.column, raw, err)
+		// 写操作收集到游标关闭之后统一执行（迭代期间不 Exec）。
+		err := iterSystemIPListRefs(q, ref, func(row systemIPListRefRow) error {
+			parsed, err := decodeSystemIPListRefIDs(ref, row)
+			if err != nil {
+				return err
 			}
 			changed := false
 			for i, id := range parsed {
@@ -3169,20 +3172,19 @@ func rewriteSystemIPListRefs(q migrationExecer, remap map[int]int) error {
 				}
 			}
 			if !changed {
-				continue
+				return nil
 			}
 			encoded, err := json.Marshal(parsed)
 			if err != nil {
-				rows.Close()
-				return fmt.Errorf("encode %s.%s row %d: %w", ref.table, ref.column, rowID, err)
+				return fmt.Errorf("encode %s.%s row %d: %w", ref.table, ref.column, row.rowID, err)
 			}
-			pending = append(pending, pendingUpdate{rowID, string(encoded)})
+			pending = append(pending, pendingUpdate{row.rowID, string(encoded)})
+			return nil
+		})
+		if err != nil {
+			return err
 		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return fmt.Errorf("iterate %s.%s: %w", ref.table, ref.column, err)
-		}
-		rows.Close()
+		updateQuery := `UPDATE ` + ref.table + ` SET ` + ref.column + `=? WHERE id=?`
 		for _, update := range pending {
 			if _, err := q.Exec(updateQuery, update.value, update.rowID); err != nil {
 				return fmt.Errorf("rewrite %s.%s row %d: %w", ref.table, ref.column, update.rowID, err)
@@ -3230,15 +3232,74 @@ func EnsureSystemIPList(database *sql.DB, name, description, category string) (b
 	return false, nil
 }
 
+// systemIPListSeed 是一条内置 system=1 名单的播种形态。
+type systemIPListSeed struct {
+	Name        string
+	Description string
+	Category    string
+}
+
+// systemIPListSeeds 是内置 system=1 名单播种的单源清单（播种与只读收敛探测
+// 共用）：威胁情报库三源 + 自动封禁名单。三列必须与 EnsureSystemIPList 的
+// 调用参数逐字一致——探测门与播种分叉会让「文案修订」永不落库，或反之
+// 让收敛库每次启动都判未收敛。
+func systemIPListSeeds() []systemIPListSeed {
+	threatLists := ThreatSystemLists()
+	seeds := make([]systemIPListSeed, 0, len(threatLists)+1)
+	for _, sl := range threatLists {
+		seeds = append(seeds, systemIPListSeed{Name: sl.Name, Description: sl.Description, Category: "恶意 IP"})
+	}
+	seeds = append(seeds, systemIPListSeed{
+		Name:        "自动封禁名单",
+		Description: "自动封禁命中 IP（自动封禁任务维护；可手动追加或删除条目）",
+		Category:    "自动封禁",
+	})
+	return seeds
+}
+
+// systemIPListSeedsConverged 只读探测内置名单是否全部在位且描述已对齐。
+// 名称+描述双判据：仅判名称存在于位会让描述文案修订到不了存量库
+// （EnsureSystemIPList 对已存在行的描述归一是既有契约）。
+//
+// 命中即整段零写：此前的重播对每条名单至少执行一次 INSERT OR IGNORE
+// （并在已存在分支做描述 UPDATE），收敛库每次启动都要取主库写锁；在只读
+// 部署形态（如备份校验句柄）上更是直接以 readonly 失败。
+func systemIPListSeedsConverged(database *sql.DB) (bool, error) {
+	if database == nil {
+		return false, errors.New("探测内置名单: 数据库未初始化")
+	}
+	for _, seed := range systemIPListSeeds() {
+		var matched int
+		if err := database.QueryRow(`SELECT COUNT(*) FROM security_ip_lists
+			WHERE name=? AND system=1 AND COALESCE(description,'')=?`, seed.Name, seed.Description).Scan(&matched); err != nil {
+			return false, fmt.Errorf("failed to inspect system list %s: %w", seed.Name, err)
+		}
+		if matched == 0 {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 // SeedSystemIPLists 重播全部内置 system 名单（启动播种与导入提交后共用单源）。
+// 收敛库（全部在位且文案已对齐）整段零写，直接返回。
 func SeedSystemIPLists(database *sql.DB) error {
-	for _, sl := range ThreatSystemLists() {
-		if _, err := EnsureSystemIPList(database, sl.Name, sl.Description, "恶意 IP"); err != nil {
+	if database == nil {
+		return errors.New("播种内置名单: 数据库未初始化")
+	}
+	converged, err := systemIPListSeedsConverged(database)
+	if err != nil {
+		return err
+	}
+	if converged {
+		return nil
+	}
+	for _, seed := range systemIPListSeeds() {
+		if _, err := EnsureSystemIPList(database, seed.Name, seed.Description, seed.Category); err != nil {
 			return err
 		}
 	}
-	_, err := EnsureSystemIPList(database, "自动封禁名单", "自动封禁命中 IP（自动封禁任务维护；可手动追加或删除条目）", "自动封禁")
-	return err
+	return nil
 }
 
 // ensureNewColumns 按清单逐列补齐（幂等：列已存在零命中）。提取自
@@ -3521,6 +3582,17 @@ func migrateUsersIsEnabledNotNull() error {
 		return nil
 	}
 	return withTableRebuild(context.Background(), "users", func(tx *sql.Tx) error {
+		// 本迁移可被直接调用（测试/历史路径）而未经 newColumns 补列：先确认
+		// is_setup_admin 在位，重建搬运语句才不会引用缺列。
+		var hasFlag int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('users') WHERE name='is_setup_admin'`).Scan(&hasFlag); err != nil {
+			return fmt.Errorf("inspect users.is_setup_admin: %w", err)
+		}
+		if hasFlag == 0 {
+			if _, err := tx.Exec(`ALTER TABLE users ADD COLUMN is_setup_admin INTEGER NOT NULL DEFAULT 0`); err != nil {
+				return fmt.Errorf("add users.is_setup_admin before rebuild: %w", err)
+			}
+		}
 		if _, err := tx.Exec(`UPDATE users SET is_enabled=1 WHERE is_enabled IS NULL;
 		CREATE TABLE users_not_null (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3529,6 +3601,7 @@ func migrateUsersIsEnabledNotNull() error {
 			role VARCHAR(20) NOT NULL DEFAULT 'user',
 			display_name VARCHAR(100),
 			is_enabled BOOLEAN NOT NULL DEFAULT 1,
+			is_setup_admin INTEGER NOT NULL DEFAULT 0,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			last_login DATETIME,
 			password_changed_at DATETIME,
@@ -3545,8 +3618,8 @@ func migrateUsersIsEnabledNotNull() error {
 			oidc_subject TEXT DEFAULT '',
 			oidc_issuer TEXT DEFAULT ''
 		);
-		INSERT INTO users_not_null (id,username,password_hash,role,display_name,is_enabled,created_at,last_login,password_changed_at,password_version,mfa_enabled,mfa_secret,mfa_pending_secret,mfa_recovery_codes,mfa_last_timestep,mfa_pending_fails,login_failed_attempts,login_locked_until,auth_provider,oidc_subject,oidc_issuer)
-		SELECT id,username,password_hash,role,display_name,is_enabled,created_at,last_login,password_changed_at,password_version,mfa_enabled,mfa_secret,mfa_pending_secret,mfa_recovery_codes,mfa_last_timestep,mfa_pending_fails,login_failed_attempts,login_locked_until,auth_provider,oidc_subject,oidc_issuer FROM users;
+		INSERT INTO users_not_null (id,username,password_hash,role,display_name,is_enabled,is_setup_admin,created_at,last_login,password_changed_at,password_version,mfa_enabled,mfa_secret,mfa_pending_secret,mfa_recovery_codes,mfa_last_timestep,mfa_pending_fails,login_failed_attempts,login_locked_until,auth_provider,oidc_subject,oidc_issuer)
+		SELECT id,username,password_hash,role,display_name,is_enabled,COALESCE(is_setup_admin,0),created_at,last_login,password_changed_at,password_version,mfa_enabled,mfa_secret,mfa_pending_secret,mfa_recovery_codes,mfa_last_timestep,mfa_pending_fails,login_failed_attempts,login_locked_until,auth_provider,oidc_subject,oidc_issuer FROM users;
 		DROP TABLE users;
 		ALTER TABLE users_not_null RENAME TO users;`); err != nil {
 			return fmt.Errorf("rebuild users table: %w", err)
@@ -4441,8 +4514,8 @@ func normalizeRuleTimestampsMigration() error {
 // 私钥正文因此可长期随备份/快照放大——tls_cert/tls_key 非空必须入选。
 // TCPRuleDeadFieldsResetSQL：TCP 行 HTTP 专属死值清零（HTTP 头/健康检查/
 // 压缩/请求体/NTLM/force_http1 + TLS 来源、跳转与材料 + 代理超时族七列 +
-// 自定义路由 + dynamic_dns + strategy(cookie) + 阶段页四列 + log_enabled，
-// 共 31 列 SET）的 SQL 字面量单源——启动迁移（migrateTCPRuleDeadFields）
+// 自定义路由 + dynamic_dns + strategy(cookie) + dns_family(ipv4) + 阶段页四列
+// + log_enabled，共 32 列 SET）的 SQL 字面量单源——启动迁移（migrateTCPRuleDeadFields）
 // 与导入归一（handlers normalizeRuleRowsForTransport）共用本常量；此前跨包
 // 双份逐字镜像靠测试字符串 parity 维系，任一侧扩列漏同步即终态漂移。
 // WHERE 谓词与 tcpDeadFieldsProbeSQL 逐字对齐（改一侧必改另一侧）。
@@ -4452,6 +4525,7 @@ const TCPRuleDeadFieldsResetSQL = `UPDATE lb_rules SET
 	proxy_dial_timeout=0, proxy_response_header_timeout=0, proxy_read_timeout=0, proxy_write_timeout=0, proxy_stream_timeout=0, proxy_flush_interval=0, proxy_stream_close_delay=0,
 	custom_routes_enabled=0, dynamic_dns=0,
 	strategy=CASE WHEN strategy='cookie' THEN 'weighted_round_robin' ELSE strategy END,
+	dns_family='ipv4',
 	enable_tls=0, tls_source='manual', tls_http_redirect=0, tls_cert='', tls_key='',
 	block_page_stage1_id=0, block_page_stage1_status=0, block_page_stage3_id=0, block_page_stage3_status=0, log_enabled=0
 	WHERE protocol='tcp' AND (
@@ -4461,6 +4535,7 @@ const TCPRuleDeadFieldsResetSQL = `UPDATE lb_rules SET
 		OR proxy_dial_timeout<>0 OR proxy_response_header_timeout<>0 OR proxy_read_timeout<>0 OR proxy_write_timeout<>0 OR proxy_stream_timeout<>0 OR proxy_flush_interval<>0 OR proxy_stream_close_delay<>0
 		OR custom_routes_enabled=1 OR dynamic_dns=1
 		OR COALESCE(strategy,'')='cookie'
+		OR COALESCE(dns_family,'')<>'ipv4'
 		OR enable_tls=1 OR COALESCE(tls_source,'')<>'manual' OR tls_http_redirect=1
 		OR COALESCE(tls_cert,'')<>'' OR COALESCE(tls_key,'')<>''
 		OR COALESCE(block_page_stage1_id,0)<>0 OR COALESCE(block_page_stage1_status,0)<>0
@@ -4485,6 +4560,7 @@ const tcpDeadFieldsProbeSQL = `SELECT
 			OR proxy_dial_timeout<>0 OR proxy_response_header_timeout<>0 OR proxy_read_timeout<>0 OR proxy_write_timeout<>0 OR proxy_stream_timeout<>0 OR proxy_flush_interval<>0 OR proxy_stream_close_delay<>0
 			OR custom_routes_enabled=1 OR dynamic_dns=1
 			OR COALESCE(strategy,'')='cookie'
+			OR COALESCE(dns_family,'')<>'ipv4'
 			OR enable_tls=1 OR COALESCE(tls_source,'')<>'manual' OR tls_http_redirect=1
 			OR COALESCE(tls_cert,'')<>'' OR COALESCE(tls_key,'')<>''
 			OR COALESCE(block_page_stage1_id,0)<>0 OR COALESCE(block_page_stage1_status,0)<>0

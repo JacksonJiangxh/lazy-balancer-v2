@@ -313,7 +313,7 @@ func TestTxApplyDefersRenderDegradationAuditUntilCommit(t *testing.T) {
 		t.Fatalf("tx update: %v", err)
 	}
 	// When：事务内 apply（persist=false；事务只写 global_config → 补查门控 false）
-	if err := h.caddyService.ApplyConfigFromTx(tx, false); err != nil {
+	if _, err := h.caddyService.ApplyConfigFromTx(tx, false); err != nil {
 		t.Fatalf("tx apply: %v", err)
 	}
 	if msg := services.LastRenderDegradation(); msg == "" {

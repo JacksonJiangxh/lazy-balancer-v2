@@ -3,6 +3,7 @@ package services
 import (
 	"bytes"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -13,6 +14,14 @@ import (
 // ruleLogDir 规则访问日志目录（写入端写死 /app/logs/rules）。包级 var 仅为
 // 测试注入缝（handlers.wafAuditLogFile 同模式）；生产路径不得改写。
 var ruleLogDir = "/app/logs/rules"
+
+// SetRuleLogDirForTest 覆盖规则日志目录并返回恢复函数（handlers 侧端点测试
+// 需要真实文件系统形态：目录/权限故障必须映射 500 而不是空日志）。
+func SetRuleLogDirForTest(dir string) func() {
+	original := ruleLogDir
+	ruleLogDir = dir
+	return func() { ruleLogDir = original }
+}
 
 func RuleLogPath(ruleID string) string {
 	return filepath.Join(ruleLogDir, fmt.Sprintf("%s.log", RuleLogFileComponent(ruleID)))
@@ -70,16 +79,22 @@ func decodeFileComponent(component string) string {
 // ReadRuleLogFrom reads the access log from offset to EOF and returns the new
 // lines plus the end offset, so callers can incrementally consume without any
 // server-side state. If the file rotated (size < offset), it restarts at 0.
-func ReadRuleLogFrom(ruleID string, offset int64) (lines []string, next int64) {
+// 日志文件尚不存在=正常空（规则刚创建/尚无流量，非法 caddy_id 另由端点
+// 存在性门拦截）；其余 I/O 错误（权限/目录/EISDIR 等）必须上抛——静默返回
+// 空会让「日志读不出来」与「没有日志」在 UI 与运维侧无从区分。
+func ReadRuleLogFrom(ruleID string, offset int64) (lines []string, next int64, err error) {
 	path := RuleLogPath(ruleID)
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, offset
+	f, openErr := os.Open(path)
+	if openErr != nil {
+		if errors.Is(openErr, os.ErrNotExist) {
+			return nil, offset, nil
+		}
+		return nil, offset, fmt.Errorf("open rule log %s: %w", path, openErr)
 	}
 	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return nil, offset
+	info, statErr := f.Stat()
+	if statErr != nil {
+		return nil, offset, fmt.Errorf("stat rule log %s: %w", path, statErr)
 	}
 	if info.Size() < offset {
 		offset = 0
@@ -87,16 +102,16 @@ func ReadRuleLogFrom(ruleID string, offset int64) (lines []string, next int64) {
 	if offset < 0 {
 		offset = 0
 	}
-	if _, err := f.Seek(offset, io.SeekStart); err != nil {
-		return nil, offset
+	if _, seekErr := f.Seek(offset, io.SeekStart); seekErr != nil {
+		return nil, offset, fmt.Errorf("seek rule log %s: %w", path, seekErr)
 	}
 	// Cap each poll so a huge or maliciously reset offset cannot force a
 	// full-log allocation; the caller continues from the returned offset.
 	// 8MB covers ~1.6-4K header-rich lines per 5s poll.
 	const maxRead = 8 << 20
-	data, err := io.ReadAll(io.LimitReader(f, maxRead+1))
-	if err != nil {
-		return nil, offset
+	data, readErr := io.ReadAll(io.LimitReader(f, maxRead+1))
+	if readErr != nil {
+		return nil, offset, fmt.Errorf("read rule log %s: %w", path, readErr)
 	}
 	if len(data) > maxRead {
 		data = data[:maxRead]
@@ -114,7 +129,7 @@ func ReadRuleLogFrom(ruleID string, offset int64) (lines []string, next int64) {
 			// next==offset 原地不动，日志流永久卡死。至少前进一个窗口：丢弃
 			// 本窗字节并把 next 推到窗口末，后续轮询从新 offset 继续。
 			next = offset + int64(len(data))
-			return nil, next
+			return nil, next, nil
 		} else {
 			// 未满窗且无换行（文件/记录暂未终结）：保持扣留语义——data 置空、
 			// next 停在 offset，待写侧补全换行后下轮交付完整行（访问日志逐行
@@ -131,7 +146,7 @@ func ReadRuleLogFrom(ruleID string, offset int64) (lines []string, next int64) {
 			parts = parts[:len(parts)-1]
 		}
 	}
-	return parts, next
+	return parts, next, nil
 }
 
 // ReadRuleLogTail returns the last maxLines lines of the rule's access log
@@ -141,16 +156,22 @@ func ReadRuleLogFrom(ruleID string, offset int64) (lines []string, next int64) {
 // 防止 O(n²) 全量拷贝(100MB 无换行 ≈ 数十 GB 级复制)
 const maxBackwardScan = 4 << 20 // 4MB
 
-func ReadRuleLogTail(ruleID string, maxLines int) (content string, offset int64) {
+func ReadRuleLogTail(ruleID string, maxLines int) (content string, offset int64, err error) {
 	path := RuleLogPath(ruleID)
-	f, err := os.Open(path)
-	if err != nil {
-		return "", 0
+	f, openErr := os.Open(path)
+	if openErr != nil {
+		if errors.Is(openErr, os.ErrNotExist) {
+			return "", 0, nil
+		}
+		return "", 0, fmt.Errorf("open rule log %s: %w", path, openErr)
 	}
 	defer f.Close()
-	info, err := f.Stat()
-	if err != nil || info.Size() == 0 {
-		return "", 0
+	info, statErr := f.Stat()
+	if statErr != nil {
+		return "", 0, fmt.Errorf("stat rule log %s: %w", path, statErr)
+	}
+	if info.Size() == 0 {
+		return "", 0, nil
 	}
 	size := info.Size()
 	const blockSize = int64(64 * 1024)
@@ -177,7 +198,13 @@ func ReadRuleLogTail(ruleID string, maxLines int) (content string, offset int64)
 			start = 0
 		}
 		n := int(end - start)
-		if _, err := f.ReadAt(scratch[:n], start); err != nil {
+		if _, readErr := f.ReadAt(scratch[:n], start); readErr != nil {
+			// 首块即失败=文件根本读不出来（目录/EISDIR/权限/介质错误），
+			// 必须上抛而不是伪装成「空日志」；后续块的失败维持既有「窗口止于
+			// 已读前缀」语义（部分 tail 优于整体失败）。
+			if scanned == 0 {
+				return "", 0, fmt.Errorf("read rule log %s: %w", path, readErr)
+			}
 			break
 		}
 		winStart = start
@@ -222,7 +249,7 @@ func ReadRuleLogTail(ruleID string, maxLines int) (content string, offset int64)
 			}
 		}
 	}
-	return string(buf[cut:]), size - int64(len(buf)-cut)
+	return string(buf[cut:]), size - int64(len(buf)-cut), nil
 }
 
 func RemoveRuleLogFiles(ruleID string) {

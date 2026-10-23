@@ -527,3 +527,51 @@ func TestFastFile_ReadEntryCap(t *testing.T) {
 		t.Fatalf("loaded v4 entries=%d, want 3", len(state.V4))
 	}
 }
+
+// 写侧自证读侧上限：越过 MaxFastEntries / MaxFastFileBytes 的产物读侧必然
+// 拒收——写出来只会得到「写成功、读失败」的名单。写侧必须显式报错且不落盘，
+// 上限恢复后同一输入可写出并被 ReadFastFile 接受（读侧实证）。
+func TestWriteFastFile_selfEnforcesReadCaps(t *testing.T) {
+	prefixes := []netip.Prefix{
+		netip.MustParsePrefix("10.0.0.0/24"),
+		netip.MustParsePrefix("10.0.1.0/24"),
+		netip.MustParsePrefix("10.0.2.0/24"),
+		netip.MustParsePrefix("10.0.3.0/24"),
+		netip.MustParsePrefix("10.0.4.0/24"),
+	}
+	path := filepath.Join(t.TempDir(), "caps.fast")
+
+	oldEntries := MaxFastEntries
+	t.Cleanup(func() { MaxFastEntries = oldEntries })
+	MaxFastEntries = 4
+	if err := WriteFastFile(path, prefixes, nil); err == nil {
+		t.Fatal("超出 MaxFastEntries 的写入必须被拒绝（读侧必然拒收）")
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Fatalf("被拒绝的写入不得落盘: stat err=%v", statErr)
+	}
+
+	MaxFastEntries = oldEntries
+	oldBytes := MaxFastFileBytes
+	t.Cleanup(func() { MaxFastFileBytes = oldBytes })
+	MaxFastFileBytes = 32
+	if err := WriteFastFile(path, prefixes, nil); err == nil {
+		t.Fatal("超出 MaxFastFileBytes 的写入必须被拒绝（读侧必然拒收）")
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Fatalf("被拒绝的写入不得落盘: stat err=%v", statErr)
+	}
+
+	// 上限恢复：同一输入可写出，且读侧接受（证明拒绝理由确实是上限而非输入）。
+	MaxFastFileBytes = oldBytes
+	if err := WriteFastFile(path, prefixes, nil); err != nil {
+		t.Fatalf("上限恢复后写入失败: %v", err)
+	}
+	state, err := ReadFastFile(path)
+	if err != nil {
+		t.Fatalf("上限恢复后产物必须被读侧接受: %v", err)
+	}
+	if len(state.V4) != len(prefixes) {
+		t.Fatalf("loaded v4=%d, want %d", len(state.V4), len(prefixes))
+	}
+}

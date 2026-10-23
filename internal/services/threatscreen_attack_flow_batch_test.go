@@ -58,6 +58,41 @@ func TestThreatScreenAttackFlowRecordBatch_singleFlushPerBatch(t *testing.T) {
 	}
 }
 
+// Given 采样档位 n=4 且单批 4 条事件（旧夹具固定 sample_n=1，n>1 的逐事件
+// 采样只被单事件批次覆盖过）。
+// When 记录该批次。
+// Then 恰好保留每第 4 次尝试的一条：Weight=4、批次顺序保留（第 4 条）、序号
+// 递增，且仍只在批级加锁一次。
+func TestThreatScreenAttackFlowRecordBatch_sampledMultiEventBatch(t *testing.T) {
+	ResetThreatScreenAttackFlowForTest()
+	if err := AcquireThreatScreenAttackFlowLease("batch-test-n4", time.Minute, 4); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(ResetThreatScreenAttackFlowForTest)
+	base := threatScreenAttackFlowFlushCalls.Load()
+
+	items := newAttackFlowBatchItems(4, time.Now())
+	threatScreenAttackFlowRecordBatch(items)
+
+	if got := threatScreenAttackFlowFlushCalls.Load() - base; got != 1 {
+		t.Fatalf("单批采样写入的加锁/裁剪次数=%d, want 1（采样不得逐事件加锁）", got)
+	}
+	events, _ := ThreatScreenAttackFlowSnapshot(0, 10)
+	if len(events) != 1 {
+		t.Fatalf("n=4 采样应从 4 条中保留 1 条，got %d（%v）", len(events), events)
+	}
+	ev := events[0]
+	if ev.Weight != 4 {
+		t.Fatalf("Weight=%d, want 4（采样档位必须随事件披露）", ev.Weight)
+	}
+	if ev.ClientIP != items[3].clientIP || ev.At != items[3].at.UnixMilli() {
+		t.Fatalf("采样必须保留第 4 次尝试对应事件（批次顺序/时间），got %+v want ip=%q at=%d", ev, items[3].clientIP, items[3].at.UnixMilli())
+	}
+	if ev.Seq != 1 {
+		t.Fatalf("Seq=%d, want 1（采样后仍严格递增）", ev.Seq)
+	}
+}
+
 // 等价形状（回归）：超过环形上限的批次仍裁剪到最近 ringMax 条。
 func TestThreatScreenAttackFlowRecordBatch_trimsToRingMax(t *testing.T) {
 	enableAttackFlowSampling(t)

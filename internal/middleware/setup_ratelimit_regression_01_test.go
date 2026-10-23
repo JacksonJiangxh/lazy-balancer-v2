@@ -11,7 +11,7 @@ import (
 func TestSetupRouter_authSetupRoutesRateLimited(t *testing.T) {
 	// Given
 	router := newMiddlewareTestRouter(t)
-	resetLoginRateBuckets(t)
+	withIsolatedRateLimitBuckets(t)
 	body := `{"username":"adminuser","password":"adminpass123"}`
 
 	// When：连续 11 次创建管理员请求

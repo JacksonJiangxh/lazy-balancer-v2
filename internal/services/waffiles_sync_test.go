@@ -21,6 +21,16 @@ import (
 	"lazy-balancer-v2/internal/models"
 )
 
+// skipChmodFaultInjectionIfRoot：权限位故障注入在 root 下无效（root 无视
+// 0000/0555 权限），用例会从「期望失败」静默变成「成功」。显式跳过并声明
+// 原因，而不是让断言隐式失效。
+func skipChmodFaultInjectionIfRoot(t *testing.T) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("root 无视文件权限位，chmod 故障注入不生效（CI 容器以 root 运行时跳过）")
+	}
+}
+
 func TestSanitizeBundleVersion(t *testing.T) {
 	tests := []struct {
 		name, input, want string
@@ -75,10 +85,23 @@ func TestBuildWafFileBundleInLockChecked_reportsRefReadFailure(t *testing.T) {
 func TestWafFileBundleRoundTrip(t *testing.T) {
 	src := t.TempDir()
 	rules := filepath.Join(src, "crs", "rules")
-	os.MkdirAll(rules, 0755)
-	os.WriteFile(filepath.Join(rules, "a.conf"), []byte("SecRule X 1"), 0644)
-	os.WriteFile(filepath.Join(rules, "sub", "b.conf"), []byte("SecRule X 2"), 0644)
-	os.WriteFile(filepath.Join(src, "crs", "VERSION"), []byte("v4.14.0"), 0644)
+	// 布景错误必须 Fatal：旧实现忽略 MkdirAll/WriteFile 错误，sub 目录从未
+	// 创建导致嵌套目录还原能力零覆盖（只验证了 a.conf）。
+	if err := os.MkdirAll(filepath.Join(rules, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []struct {
+		path    string
+		content string
+	}{
+		{filepath.Join(rules, "a.conf"), "SecRule X 1"},
+		{filepath.Join(rules, "sub", "b.conf"), "SecRule X 2"},
+		{filepath.Join(src, "crs", "VERSION"), "v4.14.0"},
+	} {
+		if err := os.WriteFile(f.path, []byte(f.content), 0o644); err != nil {
+			t.Fatalf("fixture %s: %v", f.path, err)
+		}
+	}
 
 	oldLive := crsLiveDir
 	oldXdb := ip2regionLivePath
@@ -112,6 +135,9 @@ func TestWafFileBundleRoundTrip(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(filepath.Join(rules, "a.conf")); string(got) != "SecRule X 1" {
 		t.Fatalf("rules not restored: %q", got)
+	}
+	if got, err := os.ReadFile(filepath.Join(rules, "sub", "b.conf")); err != nil || string(got) != "SecRule X 2" {
+		t.Fatalf("嵌套规则未还原: (%q,%v)", got, err)
 	}
 	if got, _ := os.ReadFile(ip2regionLivePath); string(got) != "fake-xdb-bytes" {
 		t.Fatalf("xdb not restored: %q", got)
@@ -411,6 +437,7 @@ func TestApplyWafFileBundle_preservesVersionFileRawBytes(t *testing.T) {
 }
 
 func TestUntarGzTo_midCopyFailure_restoresPureOldTree(t *testing.T) {
+	skipChmodFaultInjectionIfRoot(t)
 	// staging→destDir 复制中途失败时，恢复必须产出纯旧树。旧实现只
 	// 用 backup 覆盖同名文件，已复制成功的新树文件残留为混合树。staging 预置
 	// 的只读子目录（含文件使函数起始的 RemoveAll(staging) 静默失败而存活）
@@ -468,6 +495,7 @@ func TestUntarGzTo_midCopyFailure_restoresPureOldTree(t *testing.T) {
 }
 
 func TestUntarGzTo_firstInstall_midCopyFailure_leavesNoPartialTree(t *testing.T) {
+	skipChmodFaultInjectionIfRoot(t)
 	// Given：destDir 不存在（首装）且 copy 回退在复制新文件后失败。
 	destDir := filepath.Join(t.TempDir(), "crs")
 	newTree := t.TempDir()
@@ -510,6 +538,7 @@ func TestUntarGzTo_firstInstall_midCopyFailure_leavesNoPartialTree(t *testing.T)
 }
 
 func TestUntarGzTo_removeAllFailure_attemptsBackupRestore(t *testing.T) {
+	skipChmodFaultInjectionIfRoot(t)
 	// rename 失败后 os.RemoveAll(destDir) 失败时 backup 已就绪，
 	// 必须与 copyDir 失败分支对称地尝试从 backup 恢复（先清空再复制），恢复
 	// 错误 errors.Join 并入返回；而非直接 return 留下部分删除的旧树。
@@ -571,6 +600,7 @@ func TestUntarGzTo_removeAllFailure_attemptsBackupRestore(t *testing.T) {
 }
 
 func TestUntarGzTo_restoreFailure_joinedIntoReturnedError(t *testing.T) {
+	skipChmodFaultInjectionIfRoot(t)
 	// 恢复（清空+从 backup 复制）自身的错误不得被 `_ =` 吞掉，必须
 	// 并入返回错误。destDir 写入 32MB 新文件的窗口内注入只读子目录，使恢复路径
 	// 的 RemoveAll(destDir) 失败。
@@ -831,12 +861,14 @@ func TestWafFileBundleThreatFastRoundTrip(t *testing.T) {
 		t.Fatal("bundle 必须非 nil（含威胁文件时）")
 	}
 	found := false
+	var wantFast []byte
 	for _, tf := range bundle.ThreatFiles {
 		if tf.Name == "ustc" {
 			found = true
 			if len(tf.Content) == 0 {
 				t.Fatal("ustc .fast 内容必须随 bundle 携带")
 			}
+			wantFast = append([]byte(nil), tf.Content...)
 		}
 	}
 	if !found {
@@ -847,18 +879,29 @@ func TestWafFileBundleThreatFastRoundTrip(t *testing.T) {
 		t.Fatalf("ref.ThreatSha256s 必须含 ustc: %+v", ref)
 	}
 
-	// 从节点：清掉 .fast 模拟未同步，再 Apply 落盘
-	os.Remove(fastPath)
-	if _, _, _, err := ApplyWafFileBundle(bundle); err != nil {
+	// 从节点：清掉 .fast 模拟未同步，再 Apply 落盘——字节必须等于主端内容
+	// （只 Stat 存在性会让写空/截断同样通过）。
+	if err := os.Remove(fastPath); err != nil {
+		t.Fatal(err)
+	}
+	_, _, threatChanged, err := ApplyWafFileBundle(bundle)
+	if err != nil {
 		t.Fatalf("ApplyWafFileBundle: %v", err)
 	}
-	if _, err := os.Stat(fastPath); err != nil {
-		t.Fatalf("从节点必须落盘 .fast: %v", err)
+	if !threatChanged {
+		t.Fatal("威胁 .fast 首次落盘必须报告 threat 变更")
+	}
+	if got, readErr := os.ReadFile(fastPath); readErr != nil || !bytes.Equal(got, wantFast) {
+		t.Fatalf(".fast 落盘字节与主端内容不一致（got %d bytes, err=%v）", len(got), readErr)
 	}
 
-	// 幂等：再次 Apply 不报错
-	if _, _, _, err := ApplyWafFileBundle(bundle); err != nil {
-		t.Fatalf("幂等 Apply: %v", err)
+	// 幂等：再次 Apply 三标志全 false 且字节不变（不得重写/截断）。
+	crsChanged, xdbChanged, threatChanged, err := ApplyWafFileBundle(bundle)
+	if err != nil || crsChanged || xdbChanged || threatChanged {
+		t.Fatalf("幂等 Apply crs=%v xdb=%v threat=%v err=%v, want 全 false", crsChanged, xdbChanged, threatChanged, err)
+	}
+	if got, readErr := os.ReadFile(fastPath); readErr != nil || !bytes.Equal(got, wantFast) {
+		t.Fatalf("幂等 Apply 后 .fast 字节变化（got %d bytes, err=%v）", len(got), readErr)
 	}
 }
 
@@ -1072,7 +1115,7 @@ func TestBuildWafFileBundleResponse_incompleteBundleNotCached(t *testing.T) {
 
 	ref := BuildWafFileRef()
 	if ref == nil || ref.CRSSha256 == "" {
-		t.Skip("测试布景未能构造 CRS 引用（目录不可哈希）")
+		t.Fatal("测试布景未能构造 CRS 引用（目录不可哈希）——布景失败必须显式失败，不得静默跳过回归")
 	}
 	wafFileBundleCache.key = wafFileRefKey(ref)
 	wafFileBundleCache.bundle = &WafFileBundle{CRSVersion: ref.CRSVersion, CRSSha256: ref.CRSSha256} // 缺 CRSTarGz

@@ -216,7 +216,8 @@ func (h *GeoIPHandler) applyCrawlerVerification(r *http.Request) {
 	}
 	// （并入）：UA 只匹配一次（旧实现对同一 UA 调两次
 	// MatchCrawlerEngine，2000/s 正常流量下多付一次全表正则）。
-	engine := geoipnames.MatchCrawlerEngine(r.Header.Get("User-Agent"))
+	ua := r.Header.Get("User-Agent")
+	engine := geoipnames.MatchCrawlerEngine(ua)
 	if engine == "" {
 		return
 	}
@@ -231,7 +232,13 @@ func (h *GeoIPHandler) applyCrawlerVerification(r *http.Request) {
 	case CrawlerVerdictSpoof:
 		// 值携带引擎 ID（与 Verified 对称）——coraza 伪装规则按
 		// 策略已选引擎集合匹配，不再全局 @eq 1。
-		r.Header.Set(crawlerSpoofHeader, engine)
+		//
+		// 只有「UA 命中了该引擎的伪装证据门」才发射：宽品牌标记（裸
+		// DeepSeek 等）或对话式标记单独命中不构成伪装证据，否则普通浏览器
+		// UA 会产出伪伪装事件（判定口径留在引擎注册表单源）。
+		if geoipnames.CrawlerSpoofEvidence(engine, ua) {
+			r.Header.Set(crawlerSpoofHeader, engine)
+		}
 	default:
 		// 瞬态：不置头（见上方三态说明）。
 	}

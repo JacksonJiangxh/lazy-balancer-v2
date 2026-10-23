@@ -32,7 +32,7 @@ registerModuleHooks({
   '@/utils/api': STUB_API,
   '@/utils/saveResult': STUB_SAVE_RESULT,
 })
-const { useTrustAssociation } = await import('../src/composables/useTrustAssociation.ts')
+const { useTrustAssociation, fitAutoListName } = await import('../src/composables/useTrustAssociation.ts')
 
 interface PostRecord {
   url: string
@@ -221,4 +221,34 @@ test('移除：removed=true 成功提示；removed=false 如实提示 CIDR 覆�
   assert.match(String(infos[0].arg), /CIDR/, '必须给出 CIDR 覆盖的解释')
   assert.equal(callsOf('ElMessage.success').length, 0)
   assert.equal(changed, 2, '无精确条目同样改变了列表可见状态，须刷新')
+})
+
+test('自动名单名按 50 rune 预算：超长策略名截断且保留后缀', () => {
+  // 46 rune 策略名 + 4 rune 后缀 = 50（恰满，不截断）
+  const exact = 'a'.repeat(46)
+  assert.deepEqual(fitAutoListName(exact, '-黑名单'), { name: `${exact}-黑名单`, truncated: false })
+  // 55 rune 策略名 + 后缀 = 58 → 截断策略名部分，后缀完整保留，总长 50
+  const long = 'a'.repeat(55)
+  const fitted = fitAutoListName(long, '-信任')
+  assert.equal(fitted.truncated, true)
+  assert.equal(Array.from(fitted.name).length, 50)
+  assert.ok(fitted.name.endsWith('-信任'))
+  // 多字节字符按 rune 计数，不按 UTF16 编码单元
+  const cjk = '策'.repeat(60)
+  assert.equal(Array.from(fitAutoListName(cjk, '-黑名单').name).length, 50)
+})
+
+test('超长策略名创建并加入：名单名不超 50 且确认文案披露截断', async () => {
+  const { posts, confirmArgs } = reset()
+  const long = '长'.repeat(55)
+  const { ensureListAndJoin } = useTrustAssociation({ getList: () => lists })
+  await ensureListAndJoin({ id: 5, name: long, ip_acl_list_refs: '' }, '203.0.113.9', 'deny')
+  const created = posts.find((post) => post.url === '/security/ip-lists')
+  assert.ok(created, '必须发起创建')
+  const name = (created.body as { name: string }).name
+  assert.equal(Array.from(name).length, 50)
+  assert.ok(name.endsWith('-黑名单'))
+  assert.match(String(confirmArgs[0][0]), /已截断至 50 字符上限/, '确认文案必须披露截断')
+  const saves = callsOf('showSaveResult')
+  assert.match(String(saves[0].args?.[1]), new RegExp(`已创建「${name}」`), '成功文案必须用实际名单名')
 })

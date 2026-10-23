@@ -45,12 +45,28 @@ test('前端业务码失败分支携带 HTTP status（api.ts 契约）', () => {
   assert.doesNotMatch(branch, /new ApiRequestError\([^)]*,\s*res\.code\)/, '不得改携带业务码（调用方按 status 分类）')
 })
 
+// 两种成功载荷形态都在本仓真实存在（正扫描同源）：models.APIResponse{Code: N}
+// 与 gin.H{"code": N}。负断言必须与正扫描同覆盖——只认大写 Code: 会让
+// gin.H{"code": 500} 这种「HTTP 200 + 非零业务码」静默通过守卫。
+const OK_NONZERO_CODE = /http\.StatusOK,\s*(?:models\.APIResponse\{Code:|gin\.H\{"code":)\s*[1-9]/
+
+test('负断言形态自测：两种载荷形态都能命中，零业务码/非 200 不命中', () => {
+  for (const fixture of [
+    'c.JSON(http.StatusOK, models.APIResponse{Code: 500, Message: "x"})',
+    'c.JSON(http.StatusOK, gin.H{"code": 500, "message": "x"})',
+  ]) {
+    assert.match(fixture, OK_NONZERO_CODE, `守卫正则退化为漏形态：${fixture}`)
+  }
+  assert.doesNotMatch('c.JSON(http.StatusOK, models.APIResponse{Code: 0})', OK_NONZERO_CODE)
+  assert.doesNotMatch('c.JSON(http.StatusOK, gin.H{"code": 0})', OK_NONZERO_CODE)
+  assert.doesNotMatch('c.JSON(http.StatusBadRequest, gin.H{"code": 400})', OK_NONZERO_CODE)
+})
+
 test('后端不存在「HTTP 200 + 非零业务码」形态', () => {
   for (const file of handlerFiles()) {
-    const go = repoSource(file)
     assert.doesNotMatch(
-      go,
-      /http\.StatusOK,\s*(?:models\.APIResponse|gin\.H)\{Code:\s*[1-9]/,
+      repoSource(file),
+      OK_NONZERO_CODE,
       `${file}：HTTP 200 配非零业务码——前端按 status 分类会漏判`,
     )
   }

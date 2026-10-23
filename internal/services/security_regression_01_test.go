@@ -2,9 +2,11 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/models"
 )
 
 // setupSecurityEnumTestDB 初始化隔离测试库并恢复全局句柄（同 cluster_test.go 惯例）。
@@ -120,6 +122,44 @@ func TestNormalizeLegacySecurityPolicyEnums_normalizesNonEnumValues(t *testing.T
 	}
 	if v := clusterVersion(t); v != before+1 {
 		t.Fatalf("cluster_version=%d, want +1", v)
+	}
+}
+
+// 首尾空白脏值（带外直写/旧快照）必须写回归一值：归一谓词按 TRIM 判定
+// 白名单，若不写回，' blocking ' 这类「合法但带空白」的行永远跳过归一；而
+// 渲染与事件归属按原始值精确比较——策略零发射、UI 下拉匹配不上、事件也不
+// 认领。本用例同时给出未 trim 的反证（归属谓词为 false）。
+func TestNormalizeLegacySecurityPolicyEnums_trimsWhitespaceDirtyValues(t *testing.T) {
+	setupSecurityEnumTestDB(t)
+	insertLegacyPolicyRow(t, "padded-mode", " blocking ", "deny", "off")
+	insertLegacyPolicyRow(t, "padded-geo", "off", "deny", "  banana  ")
+	before := clusterVersion(t)
+
+	// 反证：带空白的 mode 不认领 CRS 事件（精确比较）——证明夹具形态有效。
+	if securityEventsPolicyContainsRule(&models.SecurityPolicy{Mode: " blocking ", CRSRuleGroups: json.RawMessage(`[]`)}, "942100", "") {
+		t.Fatal("未 trim 的 mode 不应认领 CRS 事件（反证失效）")
+	}
+
+	NormalizeLegacySecurityPolicyEnums(context.Background())
+
+	var mode, acl, geo string
+	if err := db.DB.QueryRow("SELECT mode, ip_acl_mode, geoip_mode FROM security_policies WHERE name='padded-mode'").Scan(&mode, &acl, &geo); err != nil {
+		t.Fatal(err)
+	}
+	if mode != "blocking" || acl != "deny" || geo != "off" {
+		t.Fatalf("padded-mode=(%q,%q,%q), want (blocking,deny,off)", mode, acl, geo)
+	}
+	if !securityEventsPolicyContainsRule(&models.SecurityPolicy{Mode: mode, CRSRuleGroups: json.RawMessage(`[]`)}, "942100", "") {
+		t.Fatal("归一后 mode=blocking 必须认领 CRS 事件（渲染/归属面恢复）")
+	}
+	if err := db.DB.QueryRow("SELECT geoip_mode FROM security_policies WHERE name='padded-geo'").Scan(&geo); err != nil {
+		t.Fatal(err)
+	}
+	if geo != "deny" {
+		t.Fatalf("padded-geo geoip_mode=%q, want deny（trim 后仍非法→枚举外默认值族）", geo)
+	}
+	if v := clusterVersion(t); v != before+1 {
+		t.Fatalf("cluster_version=%d, want %d（归一变更必须 bump 一次）", v, before+1)
 	}
 }
 

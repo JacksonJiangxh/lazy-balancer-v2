@@ -24,13 +24,13 @@ func Test_manualTLSRedirectRequiresReadyCert(t *testing.T) {
 	if _, ok := servers["http_18445"]; ok {
 		t.Fatalf("unready manual TLS rule must not publish a server: %#v", servers["http_18445"])
 	}
-	// 80 端口 301 跳转也不得发射（本修复点）。
-	server80, ok := servers["http_80"].(map[string]interface{})
-	if ok {
-		if redirect := findRouteByID(t, httpRoutesFromServer(t, generated, "http_80"), "lb_mredir_redirect"); redirect != nil {
-			t.Fatalf("证书未就绪的 manual TLS 规则不得发射 301 跳转: %#v", redirect)
-		}
-		_ = server80
+	// 80 端口 301 跳转也不得发射（本修复点）。默认站恒渲染——缺失即形态
+	// 异常，负断言不得被存在性检查静默跳过。
+	if _, ok := servers["http_80"].(map[string]interface{}); !ok {
+		t.Fatalf("默认站 http_80 必须存在（301 负断言前置）: %#v", servers)
+	}
+	if redirect := findRouteByID(t, httpRoutesFromServer(t, generated, "http_80"), "lb_mredir_redirect"); redirect != nil {
+		t.Fatalf("证书未就绪的 manual TLS 规则不得发射 301 跳转: %#v", redirect)
 	}
 
 	// 回归形状：证书物化后 server 与跳转同时出现（同判据的另一面）。

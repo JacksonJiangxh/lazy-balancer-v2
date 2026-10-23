@@ -53,6 +53,9 @@ export const useAuthStore = defineStore('auth', () => {
   const isLoggedIn = computed(() => !!token.value && !isTokenExpired(token.value))
   const readOnlyReason = computed<'slave' | 'non-admin' | 'unknown' | null>(() => {
     if (nodeMode.value === 'slave') return 'slave'
+    // 角色未判定（登录响应 node_mode=unknown，或 /config 未成功拉取给 null）
+    // 一律 fail-closed 只读：授权侧本就拒绝写请求，UI 不得呈现为可写主节点。
+    if (nodeMode.value === 'unknown') return isLoggedIn.value ? 'unknown' : null
     if (user.value) {
       if (user.value.role !== 'admin') return 'non-admin'
       // admin 用户但节点模式未知（/config 未成功拉取）同样按只读呈现

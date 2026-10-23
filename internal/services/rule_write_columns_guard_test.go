@@ -10,6 +10,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -20,30 +21,54 @@ import (
 // handwrittenRuleInsertPattern 匹配「手写 lb_rules INSERT」的归一化形态。
 // 原判定 strings.Contains(query, "INSERT INTO lb_rules (")
 // 是字面量、单空格、必须同串——`INSERT INTO lb_rules\n(…`、`INSERT OR REPLACE INTO
-// lb_rules`、`INSERT INTO "lb_rules"` 全部静默绕过单源门。匹配前统一做空白折叠
-// （strings.Fields 重连）与双引号剥离，再按大小写不敏感模式判定。
-var handwrittenRuleInsertPattern = regexp.MustCompile(`(?i)\bINSERT(?:\s+OR\s+(?:REPLACE|IGNORE))?\s+INTO\s+lb_rules\s*\(`)
+// lb_rules`、`INSERT INTO "lb_rules"` 全部静默绕过单源门。归一化（空白折叠 +
+// 去引号/方括号）后按表名边界判定；列清单不再是必要条件——无列清单的
+// `INSERT INTO lb_rules VALUES (…)` 是隐式列序清单，同属单源禁区。
+var handwrittenRuleInsertPattern = regexp.MustCompile(`(?i)\binsert(?:\s+or\s+(?:replace|ignore))?\s+into\s+lb_rules\b`)
 
 // isHandwrittenRuleInsert 报告 SQL 文本是否是手写规则 INSERT。
 func isHandwrittenRuleInsert(query string) bool {
-	normalized := strings.ReplaceAll(query, `"`, "")
-	normalized = strings.Join(strings.Fields(normalized), " ")
+	normalized := strings.Join(strings.Fields(query), " ")
+	normalized = strings.NewReplacer(`"`, "", "`", "", "[", "", "]", "").Replace(normalized)
 	return handwrittenRuleInsertPattern.MatchString(normalized)
 }
 
-func TestLbRuleInsertStatements_useSingleSource(t *testing.T) {
-	// file → 允许的函数集（比整文件豁免更紧：事实源文件内也只允许生成器本体）。
-	allowed := map[string]map[string]bool{
-		"handlers/config_import_v1.go":   {"ImportV1Config": true},
-		"services/rule_write_columns.go": {"LbRuleInsertSQL": true},
-	}
+// ruleInsertViolations 扫描 root 下全部生产 Go 文件（跳过 _test.go 与
+// .git/vendor/node_modules/web）中手写 lb_rules INSERT 的站点：
+//   - 函数体内字面量按「文件 → 允许函数集」豁免；
+//   - 包级 var/const 字面量一律违规（包级 SQL 常量无函数归属，等同新增第二份
+//     列清单）。
+func ruleInsertViolations(root string, allowed map[string]map[string]bool) ([]string, error) {
+	skipDirs := map[string]bool{".git": true, "vendor": true, "node_modules": true, "web": true}
 	var violations []string
-	root := filepath.Join("..")
+	inspectLiterals := func(fileSet *token.FileSet, node ast.Node, file, owner string) {
+		if allowed[file][owner] {
+			return
+		}
+		ast.Inspect(node, func(candidate ast.Node) bool {
+			literal, ok := candidate.(*ast.BasicLit)
+			if !ok || literal.Kind != token.STRING {
+				return true
+			}
+			query, unquoteErr := strconv.Unquote(literal.Value)
+			if unquoteErr != nil || !isHandwrittenRuleInsert(query) {
+				return true
+			}
+			violations = append(violations, fileSet.Position(literal.Pos()).String()+" in "+owner)
+			return true
+		})
+	}
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		if entry.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+		if entry.IsDir() {
+			if path != root && skipDirs[entry.Name()] {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
 		fileSet := token.NewFileSet()
@@ -57,30 +82,34 @@ func TestLbRuleInsertStatements_useSingleSource(t *testing.T) {
 		}
 		rel = filepath.ToSlash(rel)
 		for _, declaration := range file.Decls {
-			function, ok := declaration.(*ast.FuncDecl)
-			if !ok || function.Body == nil {
-				continue
+			switch node := declaration.(type) {
+			case *ast.FuncDecl:
+				if node.Body != nil {
+					inspectLiterals(fileSet, node.Body, rel, node.Name.Name)
+				}
+			case *ast.GenDecl:
+				inspectLiterals(fileSet, node, rel, "package-level declaration")
 			}
-			ast.Inspect(function.Body, func(node ast.Node) bool {
-				literal, ok := node.(*ast.BasicLit)
-				if !ok || literal.Kind != token.STRING {
-					return true
-				}
-				query, unquoteErr := strconv.Unquote(literal.Value)
-				if unquoteErr != nil || !isHandwrittenRuleInsert(query) {
-					return true
-				}
-				if !allowed[rel][function.Name.Name] {
-					position := fileSet.Position(literal.Pos())
-					violations = append(violations, position.String()+" in "+function.Name.Name)
-				}
-				return true
-			})
 		}
 		return nil
 	})
+	return violations, err
+}
+
+func TestLbRuleInsertStatements_useSingleSource(t *testing.T) {
+	// file → 允许的函数集（比整文件豁免更紧：事实源文件内也只允许生成器本体）。
+	allowed := map[string]map[string]bool{
+		"internal/handlers/config_import_v1.go":   {"ImportV1Config": true},
+		"internal/services/rule_write_columns.go": {"LbRuleInsertSQL": true},
+	}
+	// 扫描根=仓库根：internal/ 之外的顶层包与 cmd/ 同样是单源门的覆盖面。
+	root := filepath.Join("..", "..")
+	if _, err := os.Stat(filepath.Join(root, "go.mod")); err != nil {
+		t.Fatalf("扫描根必须为仓库根（含 go.mod）: %v", err)
+	}
+	violations, err := ruleInsertViolations(root, allowed)
 	if err != nil {
-		t.Fatalf("walk: %v", err)
+		t.Fatalf("scan: %v", err)
 	}
 	if len(violations) > 0 {
 		t.Fatalf("手写规则 INSERT 列清单（必须经 LbRuleInsertSQL 单源）:\n%s", strings.Join(violations, "\n"))
@@ -112,5 +141,64 @@ func TestHandwrittenRuleInsertMatcher_normalizesFormattingVariants(t *testing.T)
 				t.Fatalf("isHandwrittenRuleInsert(%q)=%v, want %v", test.query, got, test.want)
 			}
 		})
+	}
+}
+
+// 守卫自检矩阵（临时目录夹具）：覆盖形态必须逐项命中，豁免与扫描面必须精确。
+//   - 包级 var/const 字面量：无函数归属，等同第二份列清单 → 违规；
+//   - 允许函数内的同形态字面量（生成器本体）→ 不误报；
+//   - `_test.go` 不在扫描面；
+//   - 无列清单的 VALUES 形态（隐式列序）与带引号/方括号表名 → 命中。
+func TestRuleInsertScan_coversPackageLevelAndValuesForm(t *testing.T) {
+	root := t.TempDir()
+	writeFixture := func(name, content string) {
+		t.Helper()
+		path := filepath.Join(root, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir fixture: %v", err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatalf("write fixture: %v", err)
+		}
+	}
+	writeFixture("fixture.go", `package fixture
+
+func LbRuleInsertSQL(column string) string {
+	return "INSERT INTO lb_rules (" + column + ") VALUES (?)"
+}
+
+var packageLevelValues = "INSERT INTO lb_rules VALUES (1, 2)"
+
+const quotedTable = "INSERT INTO \"lb_rules\" VALUES (3)"
+`)
+	writeFixture("fixture_test.go", `package fixture
+
+var testOnly = "INSERT INTO lb_rules VALUES (9)"
+`)
+
+	violations, err := ruleInsertViolations(root, map[string]map[string]bool{"fixture.go": {"LbRuleInsertSQL": true}})
+	if err != nil {
+		t.Fatalf("scan fixture: %v", err)
+	}
+	joined := strings.Join(violations, "\n")
+	if len(violations) != 2 {
+		t.Fatalf("违规数=%d, want 2（包级 VALUES + 引号表名）:\n%s", len(violations), joined)
+	}
+	if !strings.Contains(joined, "package-level") {
+		t.Fatalf("包级声明违规必须标注归属:\n%s", joined)
+	}
+	if strings.Contains(joined, "LbRuleInsertSQL") {
+		t.Fatalf("允许函数内的生成器字面量被误报:\n%s", joined)
+	}
+	if strings.Contains(joined, "fixture_test.go") {
+		t.Fatalf("_test.go 不得进入扫描面:\n%s", joined)
+	}
+
+	// 带方括号的表名同样命中（归一化覆盖 SQLite 标识符引号形态）。
+	if !isHandwrittenRuleInsert("INSERT INTO [lb_rules] VALUES (4)") {
+		t.Fatal("方括号表名形态未命中")
+	}
+	if isHandwrittenRuleInsert("SELECT * FROM lb_rules WHERE id = ?") {
+		t.Fatal("非 INSERT 语句误报")
 	}
 }

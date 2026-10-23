@@ -37,7 +37,7 @@ func TestAutobanMerge_evictionPrecomputedOrderAndParseBound(t *testing.T) {
 		value := fmt.Sprintf("198.51.100.%d", i+1)
 		expires := fmt.Sprintf("2026-10-14 11:%02d:00", expiring-1-i)
 		seeded = append(seeded, models.IPListEntry{
-			Value: value, Remark: AutobanEntryRemark, ExpiresAt: expires,
+			Value: value, Remark: autobanEntryRemark, ExpiresAt: expires,
 		})
 		wantExpiringOrder = append([]string{value}, wantExpiringOrder...)
 	}
@@ -45,7 +45,7 @@ func TestAutobanMerge_evictionPrecomputedOrderAndParseBound(t *testing.T) {
 	for i := range permanent {
 		value := fmt.Sprintf("203.0.113.%d", i+1)
 		seeded = append(seeded, models.IPListEntry{
-			Value: value, Remark: AutobanEntryRemark,
+			Value: value, Remark: autobanEntryRemark,
 			CreatedAt: fmt.Sprintf("2026-10-10 00:00:%02d", permanent-i),
 		})
 		wantPermanentOrder = append([]string{value}, wantPermanentOrder...)
@@ -97,7 +97,7 @@ func TestAutobanMerge_evictionPrecomputedOrderAndParseBound(t *testing.T) {
 	for i := range newBanned {
 		wantValue := fmt.Sprintf("10.10.0.%d", i+1)
 		got := final[manualCount+i]
-		if got.Value != wantValue || got.Remark != AutobanEntryRemark {
+		if got.Value != wantValue || got.Remark != autobanEntryRemark {
 			t.Fatalf("新封第 %d 条=%+v, want %s", i, got, wantValue)
 		}
 	}
@@ -123,14 +123,14 @@ func TestAutobanMerge_evictionOrderMalformedTimestamps(t *testing.T) {
 		{Value: "192.0.2.1", Remark: "事件处置"}, // 手动条目：永不挤出
 		{Value: "192.0.2.2", Remark: "手动封禁"},
 		// 有到期者按到期升序先挤。
-		{Value: "198.51.100.11", Remark: AutobanEntryRemark, ExpiresAt: "2026-10-14 10:30:00"},
-		{Value: "198.51.100.12", Remark: AutobanEntryRemark, ExpiresAt: "2026-10-14 11:00:00"},
+		{Value: "198.51.100.11", Remark: autobanEntryRemark, ExpiresAt: "2026-10-14 10:30:00"},
+		{Value: "198.51.100.12", Remark: autobanEntryRemark, ExpiresAt: "2026-10-14 11:00:00"},
 		// 畸形/空 expires_at → 永久档；档内按 created_at 升序。
-		{Value: "198.51.100.13", Remark: AutobanEntryRemark, ExpiresAt: "not-a-timestamp", CreatedAt: "2026-10-14 09:00:00"},
-		{Value: "198.51.100.14", Remark: AutobanEntryRemark, ExpiresAt: "", CreatedAt: "2026-10-14 09:30:00"},
+		{Value: "198.51.100.13", Remark: autobanEntryRemark, ExpiresAt: "not-a-timestamp", CreatedAt: "2026-10-14 09:00:00"},
+		{Value: "198.51.100.14", Remark: autobanEntryRemark, ExpiresAt: "", CreatedAt: "2026-10-14 09:30:00"},
 		// 永久档内畸形/空 created_at → 零值排最后（同零值保持写入序）。
-		{Value: "198.51.100.15", Remark: AutobanEntryRemark, ExpiresAt: "2026-13-99 99:99:99", CreatedAt: "garbage"},
-		{Value: "198.51.100.16", Remark: AutobanEntryRemark, CreatedAt: ""},
+		{Value: "198.51.100.15", Remark: autobanEntryRemark, ExpiresAt: "2026-13-99 99:99:99", CreatedAt: "garbage"},
+		{Value: "198.51.100.16", Remark: autobanEntryRemark, CreatedAt: ""},
 	}
 	seedPresetEntries(t, seeded)
 

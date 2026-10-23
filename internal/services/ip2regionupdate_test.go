@@ -103,6 +103,99 @@ func TestIP2RegionUpdateRun_success(t *testing.T) {
 	}
 }
 
+// 取消落在「安装段已落盘、Caddy 重载尚未执行」的窗口：未重载即未生效——
+// live xdb、版本行、sidecar 必须回滚到同代基线，reloader 不得被调用。
+func TestIP2RegionUpdateRun_cancelAfterInstallRollsBackSameGeneration(t *testing.T) {
+	m := newTestIP2RegionManager(t)
+	seedIP2RegionVersionRow(t, "v3.0.0", true)
+	writeTestXDB(t, ip2regionLivePath, testSegments)
+	oldBytes, err := os.ReadFile(ip2regionLivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldReload := reloadIP2RegionSearcher
+	t.Cleanup(func() { reloadIP2RegionSearcher = oldReload })
+	cancelIssued := false
+	reloadCalls := 0
+	reloadIP2RegionSearcher = func() error {
+		reloadCalls++
+		if reloadCalls == 1 {
+			// 安装段末的内存热换完成后立刻取消（该窗口即用户点取消的落点）。
+			cancelIssued = m.CancelRunning()
+		}
+		return Reload()
+	}
+	m.fetchLatestTag = func(context.Context) (string, error) { return "v3.1.0", nil }
+	m.downloadXDB = fakeIP2RegionDownload(t, true)
+	reloads := 0
+	m.reloader = func() error { reloads++; return nil }
+
+	done, err := m.StartUpdate("manual", nil)
+	if err != nil {
+		t.Fatalf("start update: %v", err)
+	}
+	<-done
+
+	if !cancelIssued {
+		t.Fatal("前置：安装段末的取消必须命中在途运行（CancelRunning=false）")
+	}
+	data, err := os.ReadFile(ip2regionLivePath)
+	if err != nil || string(data) != string(oldBytes) {
+		t.Fatalf("取消后 live xdb 必须回滚到更新前基线（err=%v）", err)
+	}
+	if _, err := os.Stat(ip2regionLivePath + ".bak"); !os.IsNotExist(err) {
+		t.Fatal("取消回滚必须消费本运行的 .bak")
+	}
+	if reloads != 0 {
+		t.Fatalf("reloader 调用 %d 次，want 0（未重载即未生效，取消不得触发重载）", reloads)
+	}
+	version, status, message, _, _, _, _ := ip2RegionVersionRow(t)
+	if status != "cancelled" {
+		t.Fatalf("update_status=%q, want cancelled (message=%q)", status, message)
+	}
+	if version != "v3.0.0" {
+		t.Fatalf("version=%q, want v3.0.0（版本行必须同代回滚）", version)
+	}
+	if side, sErr := os.ReadFile(ip2regionLivePath + ".version"); sErr != nil || strings.TrimSpace(string(side)) != "v3.0.0" {
+		t.Fatalf(".version sidecar=%q,%v, want v3.0.0（sidecar 必须同代回滚）", string(side), sErr)
+	}
+}
+
+// 下载期取消（安装段未提交）：零回滚——live 保持取消前形态、无 .bak 残留、
+// 版本行保持旧值、reloader 不调用。
+func TestIP2RegionUpdateRun_cancelDuringDownloadKeepsDisk(t *testing.T) {
+	m := newTestIP2RegionManager(t)
+	seedIP2RegionVersionRow(t, "v3.0.0", true)
+	m.fetchLatestTag = func(context.Context) (string, error) { return "v3.1.0", nil }
+	m.downloadXDB = func(ctx context.Context, _, _ string, _ downloadProgressFunc) error {
+		m.CancelRunning()
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	reloads := 0
+	m.reloader = func() error { reloads++; return nil }
+
+	done, err := m.StartUpdate("manual", nil)
+	if err != nil {
+		t.Fatalf("start update: %v", err)
+	}
+	<-done
+
+	if _, err := os.Stat(ip2regionLivePath); !os.IsNotExist(err) {
+		t.Fatalf("下载期取消不得产生 live 文件（stat err=%v）", err)
+	}
+	if _, err := os.Stat(ip2regionLivePath + ".bak"); !os.IsNotExist(err) {
+		t.Fatal("下载期取消不得留下 .bak")
+	}
+	if reloads != 0 {
+		t.Fatalf("reloader 调用 %d 次，want 0", reloads)
+	}
+	version, status, _, _, _, _, _ := ip2RegionVersionRow(t)
+	if status != "cancelled" || version != "v3.0.0" {
+		t.Fatalf("(status,version)=(%q,%q), want (cancelled,v3.0.0)", status, version)
+	}
+}
+
 func TestIP2RegionUpdateRun_skipWhenSameVersion(t *testing.T) {
 	m := newTestIP2RegionManager(t)
 	seedIP2RegionVersionRow(t, "v3.0.0", true)

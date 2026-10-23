@@ -1448,6 +1448,65 @@ func TestAPIDocs_systemTasksExampleKeysMatchImplementation(t *testing.T) {
 	}
 }
 
+// 自动备份列表：doc 示例 backups[] 曾漏 app_version（实现恒下发、设置页
+// 「版本号」列已消费）——对账同时锁顶层键与行视图键集，防再漂移。
+func TestAPIDocs_autoBackupSettingsExampleKeysMatchImplementation(t *testing.T) {
+	h := newAutoBackupTestHandlers(t)
+	if _, err := db.DB.Exec(`INSERT INTO auto_backups (filename, status, size_bytes, sections, trigger_type, message, app_version)
+		VALUES ('lbbak-auto-20260920-030000.lbbak','success',1024,'["users"]','schedule','','v2.3.8-beta')`); err != nil {
+		t.Fatalf("seed auto_backups row: %v", err)
+	}
+	response := serveAutoBackupJSON(t, h, http.MethodGet, "/settings/auto-backup", "/settings/auto-backup", "", h.AutoBackupSettings)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var impl struct {
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &impl); err != nil {
+		t.Fatalf("parse implementation response: %v", err)
+	}
+	example := docResponseExample(t, "GET /settings/auto-backup")
+	assertKeySetsEqual(t, "GET /settings/auto-backup", mapKeysOf(example), mapKeysOf(impl.Data))
+
+	// 行视图双向对账（结构体全部键，含空 message 与 app_version）。
+	docBackups, ok := example["backups"].([]any)
+	if !ok || len(docBackups) == 0 {
+		t.Fatalf("GET /settings/auto-backup 示例缺 backups 数组元素")
+	}
+	docRow, ok := docBackups[0].(map[string]any)
+	if !ok {
+		t.Fatalf("GET /settings/auto-backup 示例 backups[0] 不是对象")
+	}
+	implBackups, ok := impl.Data["backups"].([]any)
+	if !ok || len(implBackups) == 0 {
+		t.Fatalf("实现响应缺 backups 数组元素")
+	}
+	implRow, ok := implBackups[0].(map[string]any)
+	if !ok {
+		t.Fatalf("实现响应 backups[0] 不是对象")
+	}
+	assertKeySetsEqual(t, "GET /settings/auto-backup backups[]", mapKeysOf(docRow), mapKeysOf(implRow))
+}
+
+// 审计列表：total 5 秒缓存以 total_stale 披露来源——示例缺键会让按文档生成
+// 的客户端拿不到该披露字段（面板已消费）。
+func TestAPIDocs_auditLogsExampleKeysMatchImplementation(t *testing.T) {
+	router := newAuditLogTestRouter(t, "")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/audit-logs", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var impl struct {
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &impl); err != nil {
+		t.Fatalf("parse implementation response: %v", err)
+	}
+	assertKeySetsEqual(t, "GET /audit-logs", mapKeysOf(docResponseExample(t, "GET /audit-logs")), mapKeysOf(impl.Data))
+}
+
 // 废弃字段响应面收敛：upstreams.dynamic_dns（写侧恒 0 的废弃列）与全局
 // dns_provider/dns_credentials（签发链不消费的遗留字段，凭证恒空）不再随
 // API 响应下发——消费者不得据恒假值做判定。DB 列与导入/快照兼容不受影响

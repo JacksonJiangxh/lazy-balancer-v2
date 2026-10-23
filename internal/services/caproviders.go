@@ -38,6 +38,26 @@ type caProviderScanner interface {
 	Scan(...any) error
 }
 
+// NormalizeCAProviderMaxConcurrent 是「最大并发」钳制的单源实现：<=0 视为
+// 默认 1（保留「0 即默认」的 API 兼容语义）。落库与审计比对必须共用它——
+// handler 按请求原值比对会把「提交 0、库值 1、落库仍 1」记成一次变更（审计
+// 假阳性）。
+func NormalizeCAProviderMaxConcurrent(value int) int {
+	if value <= 0 {
+		return 1
+	}
+	return value
+}
+
+// NormalizeCAProviderMinIntervalMS 同 NormalizeCAProviderMaxConcurrent：
+// <=0 视为默认 1000ms。
+func NormalizeCAProviderMinIntervalMS(value int) int {
+	if value <= 0 {
+		return 1000
+	}
+	return value
+}
+
 func scanCAProvider(scanner caProviderScanner, provider *models.CAProvider) error {
 	var createdAt, updatedAt sql.NullTime
 	if err := scanner.Scan(&provider.ID, &provider.Name, &provider.Provider, &provider.DirectoryURL, &provider.Credentials, &provider.MaxConcurrent, &provider.MinIntervalMS, &provider.Enabled, &createdAt, &updatedAt); err != nil {
@@ -280,15 +300,11 @@ func (s *CAProviderService) UpdateCAProvider(id int, req models.UpdateCAProvider
 		}
 	}
 
-	if existing.MaxConcurrent <= 0 {
-		existing.MaxConcurrent = 1
-	}
+	existing.MaxConcurrent = NormalizeCAProviderMaxConcurrent(existing.MaxConcurrent)
 	if existing.MaxConcurrent > 100 {
 		return models.CAProvider{}, ErrCAProviderMaxConcurrentTooHigh
 	}
-	if existing.MinIntervalMS <= 0 {
-		existing.MinIntervalMS = 1000
-	}
+	existing.MinIntervalMS = NormalizeCAProviderMinIntervalMS(existing.MinIntervalMS)
 	if existing.MinIntervalMS > 60000 {
 		return models.CAProvider{}, ErrCAProviderMinIntervalTooHigh
 	}

@@ -1378,7 +1378,7 @@ func (h *Handlers) tryIPListHotPathApply(c *gin.Context, tx *sql.Tx, id string, 
 		// errSameConfig），收尾分支镜像 finishTxApply 三分支（拒绝回滚/系统
 		// 失败退化提交/成功提交），重载审计照常落「重载」行（审计真实性：
 		// 本次确有真实重载）。
-		applyErr := h.caddyService.ApplyConfigFromTxCertAwareForce(tx)
+		appliedConfig, applyErr := h.caddyService.ApplyConfigFromTxCertAwareForce(tx)
 		if applyErr != nil {
 			if services.IsConfigRejected(applyErr) {
 				// 强制被拒=tx 回滚——refresh 渲染已按
@@ -1419,6 +1419,7 @@ func (h *Handlers) tryIPListHotPathApply(c *gin.Context, tx *sql.Tx, id string, 
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + "：" + joined.Error()})
 			return true
 		}
+		h.caddyService.PersistLastGoodBytesInLock(appliedConfig)
 		h.recordCaddyApplyResult(nil)
 		recordAudit(c, f.AuditAction, f.Resource, f.AuditDetail)
 		recordAudit(c, "重载", "Caddy服务", services.FormatAuditDetail("IP 名单热路径证书物化，强制重载收敛", services.AuditResultPart("success")))

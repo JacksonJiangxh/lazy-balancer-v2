@@ -57,7 +57,7 @@ func threatActiveSourcesCount(metricsDB *sql.DB, activeSince string, now time.Ti
 		threatActiveSourcesMu.Unlock()
 	}
 
-	rows, err := metricsDB.Query(`SELECT client_ip FROM security_events WHERE event_time >= ? GROUP BY client_ip`, activeSince)
+	rows, err := metricsDB.Query(`SELECT client_ip FROM security_events WHERE event_time >= ? AND `+services.AttackEventSQLPredicate("rule_triggered", "action")+` GROUP BY client_ip`, activeSince)
 	if err != nil {
 		return 0, err
 	}

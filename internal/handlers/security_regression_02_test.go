@@ -17,9 +17,11 @@ import (
 	"lazy-balancer-v2/internal/db"
 )
 
-// aggregateFailingConnector 返回一个假 metrics 库：GROUP BY 聚合查询「语句执行
-// 成功、迭代第一步即失败」，标量 COUNT 查询正常返回 0。用于注入聚合循环的
-// rows.Err() 故障。
+// aggregateFailingConnector 返回一个假 metrics 库：按语句语义路由——rollup
+// 状态/覆盖起点返回可扫描的字符串、标量计数与趋势返回数字零值、类型聚合返回
+// 空集，仅综合攻击 Top IP 的维度聚合「语句执行成功、迭代第一步即失败」。
+// 前置查询全部给出本用例需要的合法形状，确保唯一失败源是聚合循环的
+// rows.Err() 检查：若该检查缺失，端点会以「部分数据 + 200」通过。
 type aggregateFailingConnector struct{}
 
 func (aggregateFailingConnector) Connect(context.Context) (driver.Conn, error) {
@@ -42,18 +44,41 @@ func (aggregateFailingConn) Close() error { return nil }
 
 func (aggregateFailingConn) Begin() (driver.Tx, error) { return nil, errors.New("no tx") }
 
+// QueryContext 只按「返回形状」路由，不依赖具体列清单：前置标量必须先给出
+// 与生产同形的可扫描值，否则更早的类型不匹配错误会掩盖聚合迭代失败。
 func (aggregateFailingConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
-	if strings.Contains(query, "GROUP BY") {
-		// 聚合语句成功返回行集，但迭代失败：只有检查 rows.Err() 才能被发现，
-		// 否则表现为「部分数据 + 200」
+	q := strings.Join(strings.Fields(query), " ")
+	switch {
+	case strings.Contains(q, "MIN(event_time)"):
+		// 原始事件覆盖起点：空表 = 空串。
+		return scratchRowsOf([]string{"earliest"}, driver.Value("")), nil
+	case strings.Contains(q, "FROM metrics_state"):
+		// rollup 水位/代际状态：空串 = 未初始化（走原始表回退分支）。
+		return scratchRowsOf([]string{"value"}, driver.Value("")), nil
+	case strings.Contains(q, "GROUP BY client_ip"):
+		// 综合攻击 Top IP 维度聚合：语句成功、迭代即失败。只有检查
+		// rows.Err() 才能发现，否则表现为「部分数据 + 200」。
 		return aggregateFailingRows{}, nil
+	case strings.Contains(q, "GROUP BY action"):
+		// rollup 按 action 汇总（本用例走不到，给同形空集兜底）。
+		return scratchRowsOf([]string{"action", "total"}), nil
+	case strings.Contains(q, "GROUP BY rule_triggered"):
+		// 攻击类型/攻击族聚合：空集。
+		return scratchRowsOf([]string{"rule_triggered", "rule_msg", "cnt"}), nil
+	case strings.Contains(q, "SUM(CASE WHEN action='blocked'"):
+		// 7 日趋势单日两列计数。
+		return scratchRowsOf([]string{"blocked", "detected"}, int64(0), int64(0)), nil
+	default:
+		// 标量计数（今日拦截/检测等）。
+		return scratchRowsOf([]string{"c"}, int64(0)), nil
 	}
-	return &scalarZeroRows{}, nil
 }
 
 type aggregateFailingRows struct{}
 
-func (aggregateFailingRows) Columns() []string { return []string{"c"} }
+func (aggregateFailingRows) Columns() []string {
+	return []string{"client_ip", "blocked", "detected", "last_time"}
+}
 
 func (aggregateFailingRows) Close() error { return nil }
 
@@ -61,18 +86,28 @@ func (aggregateFailingRows) Next([]driver.Value) error {
 	return errors.New("注入的聚合迭代失败")
 }
 
-type scalarZeroRows struct{ done bool }
+// scratchRowsOf 返回一次性固定行集：cols 决定列数，values 为唯一一行；
+// 无 values 时是合法空集。
+func scratchRowsOf(cols []string, values ...driver.Value) *scratchRows {
+	return &scratchRows{cols: cols, row: values}
+}
 
-func (r *scalarZeroRows) Columns() []string { return []string{"c"} }
+type scratchRows struct {
+	cols []string
+	row  []driver.Value
+}
 
-func (r *scalarZeroRows) Close() error { return nil }
+func (r *scratchRows) Columns() []string { return r.cols }
 
-func (r *scalarZeroRows) Next(dest []driver.Value) error {
-	if r.done {
+func (r *scratchRows) Close() error { return nil }
+
+func (r *scratchRows) Next(dest []driver.Value) error {
+	if r.row == nil {
 		return io.EOF
 	}
-	r.done = true
-	dest[0] = int64(0)
+	row := r.row
+	r.row = nil
+	copy(dest, row)
 	return nil
 }
 

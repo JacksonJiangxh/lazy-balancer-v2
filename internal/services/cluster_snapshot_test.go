@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 )
 
@@ -541,6 +542,35 @@ func TestSnapshotCertificates_mirrorsOnlyEnabledRules(t *testing.T) {
 	}
 }
 
+// 证书轴必须携带源 cert_jobs 行的时间轴（平面 UTC 归一）：否则从端镜像行
+// created_at 落为同步时刻、updated_at 为空，任务行时间线归零，升主后历史
+// 时间与日志时间错位。
+func TestSnapshotCertificates_carriesSourceJobTimestamps(t *testing.T) {
+	service, database := newClusterTestService(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	certPEM, keyPEM := certificatePairForDomains(t, now.Add(-time.Hour), now.Add(24*time.Hour), "ts.example.com")
+	seedSnapshotCertificate(t, database, "lb_ts", "ts.example.com", "ts.example.com", certPEM, keyPEM, now.Add(24*time.Hour), 701)
+	// 混合布局：平面串 + RFC3339（带偏移）都必须归一到平面 UTC。
+	if _, err := database.Exec(`UPDATE cert_jobs SET created_at='2025-01-02 03:04:05', updated_at='2025-06-07T18:09:10+08:00' WHERE id=701`); err != nil {
+		t.Fatal(err)
+	}
+
+	certs, err := service.snapshotCertificates(ctx, database)
+	if err != nil {
+		t.Fatalf("snapshot certificates: %v", err)
+	}
+	if len(certs) != 1 {
+		t.Fatalf("certs=%d, want 1", len(certs))
+	}
+	if got := certs[0].CreatedAt; got != "2025-01-02 03:04:05" {
+		t.Fatalf("created_at=%q, want 源行原值平面串", got)
+	}
+	if got := certs[0].UpdatedAt; got != "2025-06-07 10:09:10" {
+		t.Fatalf("updated_at=%q, want RFC3339 归一到平面 UTC", got)
+	}
+}
+
 // clusterSnapshotBypassingCache 绕过共享快照缓存，直接从数据库全量重建快照
 // （含 BuildWafFileRef 与证书解析）。缓存键为 cluster_version/所有权/开关，
 // 本地写入（如 users.last_login）不会递增 cluster_version——测试需要真实库
@@ -559,4 +589,59 @@ func (s *ClusterService) clusterSnapshotBypassingCache(ctx context.Context) (mod
 		return models.ClusterSnapshot{}, fmt.Errorf("提交集群快照事务: %w", err)
 	}
 	return snapshot, nil
+}
+
+// jwt_expire_minutes / cert_expiry_days 的装载侧归一必须与 apply 侧同口径：
+// 带外直改库写入越上限值时，主端若按脏值算 users 节哈希，从端 apply 归一后
+// 落库，两边哈希恒不等——每次版本递增整节重放，并额外触发一次 304 漂移全量
+// 重拉。断言装载结果已归一到治理默认，且漂移守卫与全量快照哈希相等（单源）。
+func TestSnapshotGlobalSettings_normalizesJWTAndCertExpiryOnLoad(t *testing.T) {
+	service, database := newClusterTestService(t)
+	ctx := context.Background()
+	if _, err := database.Exec(`UPDATE global_config SET jwt_expire_minutes=1441, cert_expiry_days=999 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot, err := service.clusterSnapshotBypassingCache(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.BasicSettings.JWTExpireMinutes == nil || *snapshot.BasicSettings.JWTExpireMinutes != db.DefaultJWTExpireMinutes {
+		t.Fatalf("jwt_expire_minutes=%v, want 装载侧归一到默认 %d", snapshot.BasicSettings.JWTExpireMinutes, db.DefaultJWTExpireMinutes)
+	}
+	if snapshot.BasicSettings.CertExpiryDays == nil || *snapshot.BasicSettings.CertExpiryDays != db.DefaultCertExpiryDays {
+		t.Fatalf("cert_expiry_days=%v, want 装载侧归一到默认 %d", snapshot.BasicSettings.CertExpiryDays, db.DefaultCertExpiryDays)
+	}
+
+	guard, err := service.driftGuardSectionHashes(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := ComputeSnapshotSectionHashes(&snapshot)["users"]; guard["users"] != want {
+		t.Fatalf("漂移守卫 users 哈希=%s, want 与全量快照同口径 %s（归一必须单源）", guard["users"], want)
+	}
+}
+
+// 只读事务视图在第一条 SELECT 时冻结：起点复核之后的降级对 buildFullSnapshot
+// 不可见。构建返回后必须再做一次事务外角色复核，否则降级瞬间仍会向已授权从
+// 节点下发一份完整快照（用户 hash/证书私钥/云凭据）。
+func TestClusterService_Snapshot_rejectsDemotionCommittedDuringBuild(t *testing.T) {
+	service, database := newClusterTestService(t)
+	ctx := context.Background()
+	base := time.Now()
+	demoted := false
+	service.snapshotNow = func() time.Time {
+		if !demoted {
+			demoted = true
+			// 事务视图已建立（角色读取先于本钩子）：此提交对该只读事务不可见。
+			if _, err := database.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
+				t.Errorf("提交构建期降级失败: %v", err)
+			}
+		}
+		return base
+	}
+
+	if _, _, err := service.Snapshot(ctx, 0, "", ""); !errors.Is(err, ErrNotMasterNode) {
+		t.Fatalf("构建期降级仍下发了完整快照: err=%v, want ErrNotMasterNode(403 语义)", err)
+	}
 }

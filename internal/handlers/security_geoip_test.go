@@ -155,10 +155,21 @@ func TestListSecurityPolicies_geoipSummary(t *testing.T) {
 	if len(resp.Data) == 0 {
 		t.Fatal("list is empty")
 	}
-	if got := resp.Data[0]["geoip_countries"]; got != `["海外"]` {
+	// 按名字定位目标行：依赖 Data[0] 会在夹具新增行/排序变化时读到别的策略。
+	var row map[string]any
+	for _, candidate := range resp.Data {
+		if name, _ := candidate["name"].(string); name == "摘要地理" {
+			row = candidate
+			break
+		}
+	}
+	if row == nil {
+		t.Fatalf("列表缺少「摘要地理」策略: %s", recorder.Body.String())
+	}
+	if got := row["geoip_countries"]; got != `["海外"]` {
 		t.Fatalf("summary geoip_countries=%q, want [\"海外\"]", got)
 	}
-	if got := resp.Data[0]["geoip_mode"]; got != "allow" {
+	if got := row["geoip_mode"]; got != "allow" {
 		t.Fatalf("summary geoip_mode=%q, want allow", got)
 	}
 }

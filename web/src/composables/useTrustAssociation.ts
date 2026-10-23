@@ -30,6 +30,18 @@ const SIDE_CONFIG: Record<ListSide, {
   trust: { refField: 'ip_whitelist_refs', suffix: '-信任', verb: '信任' },
 }
 
+// 后端 IP 名单名上限（securityiplists.go ipListMaxNameLength=50 rune）。
+// 自动名 = 策略名（上限 100 rune）+ 后缀 → 长名策略拼出必然 400。
+const IP_LIST_NAME_MAX_RUNES = 50
+
+/** 自动名单名按 50 rune 预算：超限截断策略名部分、保留后缀。 */
+export const fitAutoListName = (policyName: string, suffix: string): { name: string; truncated: boolean } => {
+  const chars = Array.from(policyName)
+  const room = IP_LIST_NAME_MAX_RUNES - Array.from(suffix).length
+  if (chars.length <= room) return { name: policyName + suffix, truncated: false }
+  return { name: chars.slice(0, Math.max(0, room)).join('') + suffix, truncated: true }
+}
+
 interface TrustPolicyLike {
   id: number
   name: string
@@ -89,6 +101,10 @@ export const useTrustAssociation = (options: {
     const lead = parseRefIds(policy[cfg.refField]).length === 0
       ? `策略「${policy.name}」尚未关联${cfg.verb}用地址列表`
       : `策略「${policy.name}」同侧仅关联系统内置名单（快捷处置不直接操作系统名单）`
+    // 自动名先按后端 50 rune 上限预算（超长策略名截断并显式披露），
+    // 否则确认后创建必然 400，动作无法在当前弹框内完成。
+    const auto = fitAutoListName(policy.name, cfg.suffix)
+    const truncatedNote = auto.truncated ? '（策略名过长，名单名已截断至 50 字符上限）' : ''
     // 确认框弹出前即占位——双击不再叠两个确认框/重复创建
     // （原 creating 在 confirm 之后才置位）。
     if (creating.value) return
@@ -96,7 +112,7 @@ export const useTrustAssociation = (options: {
     try {
       try {
         await ElMessageBox.confirm(
-          `${lead}，将创建「${policy.name}${cfg.suffix}」并把 ${ip} 加入${tip}。是否继续？`,
+          `${lead}，将创建「${auto.name}」${truncatedNote}并把 ${ip} 加入${tip}。是否继续？`,
           `创建列表并${cfg.verb}`,
           { confirmButtonText: '确定', cancelButtonText: '取消', type: 'info' },
         )
@@ -105,7 +121,7 @@ export const useTrustAssociation = (options: {
       }
       // 同侧已有同名未引用列表时复用而非
       // 重复创建——按名称在现有列表中查找（category 无关，仅看名字精确相等）。
-      const wantName = `${policy.name}${cfg.suffix}`
+      const wantName = auto.name
       const sameName = options.getList().find((l) => l.name === wantName && !l.system)
       let newId: number | undefined = sameName?.id
       if (!newId) {
@@ -129,7 +145,7 @@ export const useTrustAssociation = (options: {
         if (assocRes.message?.includes(CADDY_APPLY_FAILED_MARKER)) showSaveResult(assocRes, '')
       }
       const added = await request.post<APIResponse<{ added: boolean }>>(`/security/ip-lists/${newId}/ips`, { value: ip })
-      showSaveResult(added as unknown as { message?: string }, `已${sameName ? '关联既有' : '创建'}「${policy.name}${cfg.suffix}」并加入 ${ip}`)
+      showSaveResult(added as unknown as { message?: string }, `已${sameName ? '关联既有' : '创建'}「${auto.name}」并加入 ${ip}`)
       await options.onChanged?.()
     } catch {
       // 失败提示由全局拦截器弹出

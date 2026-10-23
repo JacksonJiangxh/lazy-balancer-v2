@@ -105,6 +105,50 @@ export function polysBounds(polys: number[][][]): PolysBounds {
   return { minLon, maxLon, minLat, maxLat }
 }
 
+/**
+ * 国家级 bbox 空间网格（两引擎点阵构建共用）：5° 网格把 pointInPolys 候选
+ * 从 239 国全表压到个位数。地图侧原已实现，地球侧仍逐点全表扫描——两引擎
+ * 首开耗时不对称的根因，抽到共享层单源。
+ */
+export const COUNTRY_GRID_DEG = 5
+const COUNTRY_GRID_MAX_X = 71
+const COUNTRY_GRID_MAX_Y = 35
+
+/** 经纬度 → 网格键（y*100+x；越界夹紧到扫描域边界）。 */
+export const countryGridCell = (lon: number, lat: number): number => {
+  const x = Math.min(COUNTRY_GRID_MAX_X, Math.max(0, Math.floor((lon + 180) / COUNTRY_GRID_DEG)))
+  const y = Math.min(COUNTRY_GRID_MAX_Y, Math.max(0, Math.floor((lat + 90) / COUNTRY_GRID_DEG)))
+  return y * 100 + x
+}
+
+/**
+ * 国家 bbox 覆盖的网格 → 候选国家索引列表。bounds 可传入已算好的外包框
+ * （引擎侧 hover/点击命中已缓存 bbox 时避免重复扫描多边形）。
+ */
+export function buildCountryCellGrid(
+  countries: readonly { name: string; polys: number[][][] }[],
+  bounds?: readonly PolysBounds[],
+): { grid: Map<number, number[]>; bounds: PolysBounds[] } {
+  const cellBounds = countries.map((c, i) => bounds?.[i] ?? polysBounds(c.polys))
+  const grid = new Map<number, number[]>()
+  for (let ci = 0; ci < countries.length; ci++) {
+    const b = cellBounds[ci]
+    const x0 = Math.min(COUNTRY_GRID_MAX_X, Math.max(0, Math.floor((b.minLon + 180) / COUNTRY_GRID_DEG)))
+    const x1 = Math.min(COUNTRY_GRID_MAX_X, Math.max(0, Math.floor((b.maxLon + 180) / COUNTRY_GRID_DEG)))
+    const y0 = Math.min(COUNTRY_GRID_MAX_Y, Math.max(0, Math.floor((b.minLat + 90) / COUNTRY_GRID_DEG)))
+    const y1 = Math.min(COUNTRY_GRID_MAX_Y, Math.max(0, Math.floor((b.maxLat + 90) / COUNTRY_GRID_DEG)))
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) {
+        const key = y * 100 + x
+        const list = grid.get(key)
+        if (list) list.push(ci)
+        else grid.set(key, [ci])
+      }
+    }
+  }
+  return { grid, bounds: cellBounds }
+}
+
 export interface ProvinceGridDot {
   lat: number
   lng: number

@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -116,13 +117,20 @@ func TestDeployLock_serializes_waiters_and_keeps_entry_until_final_release(t *te
 		}()
 	}
 	first := <-acquired
+	// 忙等必须有截止：引用计数回收被改坏时，无界循环会把断言失败伪装成
+	// 测试超时（CI 挂起）；类型断言带 ok 避免私有字段形态变更直接 panic。
+	deadline := time.Now().Add(2 * time.Second)
 	for {
 		certificateDeployLocksMu.Lock()
 		value, exists := certificateDeployLocks.Load("lb_serial")
-		registered := exists && value.(*certificateDeployLock).refs == 3
+		lock, ok := value.(*certificateDeployLock)
+		registered := exists && ok && lock.refs == 3
 		certificateDeployLocksMu.Unlock()
 		if registered {
 			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("deployment lock refs did not reach 3 within 2s（expected=%v ok=%v）", exists, ok)
 		}
 		runtime.Gosched()
 	}
@@ -331,7 +339,7 @@ func TestReconcileMissingCertFiles_rebuilds_deleted_files(t *testing.T) {
 	}
 
 	// When
-	reconcileMissingCertFiles(db.DB)
+	reconcileMissingCertFiles(context.Background(), db.DB)
 
 	// Then
 	certPEM, err := os.ReadFile(certPath)

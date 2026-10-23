@@ -569,9 +569,18 @@ func parseMemInfo(input string) (uint64, uint64, error) {
 		}
 		values[fields[0]] = value * 1024
 	}
-	total, available := values["MemTotal:"], values["MemAvailable:"]
-	if total == 0 || available > total {
-		return 0, 0, fmt.Errorf("解析系统内存指标失败: MemTotal 或 MemAvailable 无效")
+	total, hasTotal := values["MemTotal:"]
+	available, hasAvailable := values["MemAvailable:"]
+	if !hasTotal || total == 0 {
+		return 0, 0, fmt.Errorf("缺少 MemTotal，无法计算内存使用")
+	}
+	// MemAvailable 缺失（内核 < 3.14 / 裁剪过的 meminfo）时必须报错走分项
+	// 降级——按「可用=0」计算会输出恒 100% 使用率的伪造数据。
+	if !hasAvailable {
+		return 0, 0, fmt.Errorf("缺少 MemAvailable，无法计算内存使用")
+	}
+	if available > total {
+		return 0, 0, fmt.Errorf("MemAvailable 大于 MemTotal，内存指标无效")
 	}
 	return total, total - available, nil
 }
@@ -1063,7 +1072,7 @@ func (index prometheusMetricsIndex) ruleMetrics(target ruleMetricTarget) gin.H {
 		// 拓扑下跨规则串流量;兜底仅在插件未升级(全局空)时启用)。
 		if len(index.ruleMetricsByRule) > 0 {
 			if agg := index.ruleMetricsByRule[target.ruleID]; agg != nil {
-				return agg.ruleMetrics(true)
+				return agg.ruleMetrics()
 			}
 			return emptyRuleMetrics() // 本规则零流量(插件已升级,无序列)
 		}
@@ -1088,7 +1097,7 @@ func (index prometheusMetricsIndex) ruleMetrics(target ruleMetricTarget) gin.H {
 			result.subtract(index.httpHosts[host])
 		}
 	}
-	return result.ruleMetrics(true)
+	return result.ruleMetrics()
 }
 
 // tcpRuleMetrics 按上游地址归集 TCP 单规则指标
@@ -1109,7 +1118,7 @@ func (index prometheusMetricsIndex) tcpRuleMetrics(upstreams []models.Upstream) 
 	for address := range addresses {
 		result.add(index.tcpUpstreams[address])
 	}
-	return result.ruleMetrics(false)
+	return result.ruleMetrics()
 }
 
 func (metrics *ruleMetricsAggregate) add(other *ruleMetricsAggregate) {
@@ -1165,8 +1174,11 @@ func (metrics *ruleMetricsAggregate) subtract(other *ruleMetricsAggregate) {
 	metrics.bytesOut -= other.bytesOut
 }
 
-func (metrics ruleMetricsAggregate) ruleMetrics(includeHealthy bool) gin.H {
-	result := gin.H{
+// ruleMetrics 规则指标的统一键集（HTTP/TCP/空指标一致）。健康语义由
+// /config/health 通道承载——此处曾有恒假 healthy 键（唯一写点、零读点），
+// 外部消费者会把它当成真实健康状态。
+func (metrics ruleMetricsAggregate) ruleMetrics() gin.H {
+	return gin.H{
 		"requests_total":     metrics.requestsTotal,
 		"requests_in_flight": metrics.requestsInFlight,
 		"status_2xx":         metrics.status2xx,
@@ -1176,10 +1188,6 @@ func (metrics ruleMetricsAggregate) ruleMetrics(includeHealthy bool) gin.H {
 		"bytes_in":           metrics.bytesIn,
 		"bytes_out":          metrics.bytesOut,
 	}
-	if includeHealthy {
-		result["healthy"] = false
-	}
-	return result
 }
 
 func ruleMetricHosts(target ruleMetricTarget) map[string]struct{} {
@@ -1408,7 +1416,7 @@ func classifyStatusCode(code string) string {
 
 func emptyRuleMetrics() gin.H {
 	// 双源收敛：空值形状与 ruleMetricsAggregate 零值输出同源，禁手工维护两套键表。
-	return ruleMetricsAggregate{}.ruleMetrics(true)
+	return ruleMetricsAggregate{}.ruleMetrics()
 }
 
 func isValidHost(host string) bool {

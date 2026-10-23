@@ -54,7 +54,10 @@ func (h *Handlers) ControlClusterNodeService(c *gin.Context) {
 	// 动作不支持/票据签发失败）此前零审计，越权探测与故障签发在操作日志中不可见。
 	// 统一经 recordAudit 留痕「失败」；动作串经 registerAuditField 截断去控制字符。
 	auditFailure := func(nodeID int, detail string) {
-		nodePart := "节点 " + c.Param("id")
+		// 路径参数未清洗：已认证管理员可经 %0A 等注入换行/控制字符伪造审计
+		// 段落。与 action/operator 同源走 registerAuditField（去控制字符 +
+		// 128B 截断），可打印原值保留供取证。
+		nodePart := "节点 " + registerAuditField(c.Param("id"))
 		if nodeID > 0 {
 			nodePart = fmt.Sprintf("节点 %d", nodeID)
 		}

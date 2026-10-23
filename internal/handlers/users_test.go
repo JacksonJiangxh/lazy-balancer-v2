@@ -240,6 +240,7 @@ func serveUserMutation(h *Handlers, method, path, body string, actorID int, hand
 	context.Request.Header.Set("Content-Type", "application/json")
 	context.Params = gin.Params{{Key: "id", Value: strings.TrimPrefix(path, "/users/")}}
 	context.Set("user_id", actorID)
+	context.Set("role", "admin")
 	handler(context)
 	return response
 }

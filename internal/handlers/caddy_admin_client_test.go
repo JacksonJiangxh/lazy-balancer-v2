@@ -132,16 +132,30 @@ func TestCaddyAdminGet_preservesPerRequestTimeout(t *testing.T) {
 	}
 }
 
-// 超时成功后连接池仍可用（cancel 随 Body.Close 回收，不污染后续请求）。
+// 超时成功后连接池仍可用（cancel 随 Body.Close 回收，不污染后续请求）：
+// 必须是真实超时（短超时打慢端点），而不是直接用快端点发首请求——否则
+// 测不到「超时请求遗留在途状态」这一目标形态。
 func TestCaddyAdminGet_succeedsAfterTimeout(t *testing.T) {
 	fast := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/slow" {
+			// 500ms 响应：50ms 超时必然先触发真实超时。
+			time.Sleep(500 * time.Millisecond)
+			_, _ = io.WriteString(w, `{"slow":true}`)
+			return
+		}
 		_, _ = io.WriteString(w, `{"ok":true}`)
 	}))
 	t.Cleanup(fast.Close)
 
+	// 第一次：真实超时（同一共享客户端的连接/context 进入取消态）。
+	if _, err := caddyAdminGet(context.Background(), fast.URL, "/slow", 50*time.Millisecond); err == nil {
+		t.Fatal("首请求未超时：慢端点应触发每请求 timeout")
+	}
+
+	// 第二次：同一客户端、同一主机，超时后必须仍可成功。
 	resp, err := caddyAdminGet(context.Background(), fast.URL, "/config/", time.Second)
 	if err != nil {
-		t.Fatalf("get: %v", err)
+		t.Fatalf("超时后的第二次请求失败: %v", err)
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {

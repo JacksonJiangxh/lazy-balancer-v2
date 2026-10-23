@@ -2,20 +2,19 @@ package handlers
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
+	"strings"
 	"testing"
-	"time"
 
 	"lazy-balancer-v2/internal/db"
 )
 
-// TestPolicyWriteTx_serializableIsolationBlocksConcurrentRuleDelete 串行模拟
-// 三-3 交错：策略写入事务的引用校验 SELECT 之后、
-// INSERT 之前，并发的规则删除不得提交。BEGIN IMMEDIATE 下校验即持写锁，删除
-// 只能等写入事务提交后执行——校验与写入之间不存在插队窗口，写入的策略绝不会
-// 引用「校验与写入之间」被删的规则（悬空引用）。
-func TestPolicyWriteTx_serializableIsolationBlocksConcurrentRuleDelete(t *testing.T) {
+// TestPolicyWriteTx_immediateTxBlocksConcurrentRuleDelete 串行模拟
+// 策略写入事务的引用校验 SELECT 之后、INSERT 之前的交错：并发的规则删除不得
+// 提交。写锁来自 DSN `_txlock=immediate`（事务开始即持写锁），独立
+// busy_timeout=0 连接上的删除会立即 SQLITE_BUSY——校验与写入之间不存在插队
+// 窗口，写入的策略绝不会引用「校验与写入之间」被删的规则（悬空引用）。
+func TestPolicyWriteTx_immediateTxBlocksConcurrentRuleDelete(t *testing.T) {
 	// Given a custom rule referenced by no policy yet (delete would be legal)
 	setupSecurityPolicyTestDB(t)
 	res, err := db.DB.Exec(`INSERT INTO security_custom_rules (name, conditions, action, score, enabled) VALUES ('竞态规则', '[]', 'block', 5, 1)`)
@@ -28,8 +27,8 @@ func TestPolicyWriteTx_serializableIsolationBlocksConcurrentRuleDelete(t *testin
 	}
 
 	ctx := context.Background()
-	// 写入侧事务（同修复后 CreateSecurityPolicy 语义）：引用校验 SELECT 即持写锁
-	polTx, err := db.DB.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	// 写入侧事务（同 CreateSecurityPolicy 语义）：引用校验 SELECT 即持写锁
+	polTx, err := db.DB.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatalf("begin policy tx: %v", err)
 	}
@@ -42,19 +41,12 @@ func TestPolicyWriteTx_serializableIsolationBlocksConcurrentRuleDelete(t *testin
 		t.Fatalf("rule exists=%d, want 1", exists)
 	}
 
-	// 并发删除规则（无引用策略，本应合法）在校验之后、INSERT 之前发起
-	deleteDone := make(chan error, 1)
-	go func() {
-		_, err := db.DB.Exec("DELETE FROM security_custom_rules WHERE id=?", ruleID)
-		deleteDone <- err
-	}()
-
-	// Then the concurrent delete is blocked by the write lock: it cannot commit
-	// between the reference check and the INSERT（回归：三-3 写窗口）
-	select {
-	case err := <-deleteDone:
-		t.Fatalf("并发删除已在校验与写入之间完成: %v（回归：R38 三-3 写窗口）", err)
-	case <-time.After(200 * time.Millisecond):
+	// Then 并发删除立即被写锁拒绝（不能提交在校验与 INSERT 之间）
+	concurrent := openNoBusyWaitDB(t)
+	if _, err := concurrent.ExecContext(ctx, "DELETE FROM security_custom_rules WHERE id=?", ruleID); err == nil {
+		t.Fatal("并发删除已在校验与写入之间完成（必须被写锁拒绝）")
+	} else if !strings.Contains(strings.ToLower(err.Error()), "locked") {
+		t.Fatalf("并发删除错误=%v, want database is locked（写锁屏障）", err)
 	}
 
 	// 写入侧完成 INSERT + Commit（提交时规则必然仍在，无悬空引用）
@@ -65,14 +57,9 @@ func TestPolicyWriteTx_serializableIsolationBlocksConcurrentRuleDelete(t *testin
 		t.Fatalf("commit policy tx: %v", err)
 	}
 
-	// 并发删除此时才能提交（写入已提交，无死锁）
-	select {
-	case err := <-deleteDone:
-		if err != nil {
-			t.Fatalf("并发删除: %v", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("并发删除被永久阻塞")
+	// 屏障解除后同一删除必须成功——证明上面失败源自写锁而非其他错误
+	if _, err := concurrent.ExecContext(ctx, "DELETE FROM security_custom_rules WHERE id=?", ruleID); err != nil {
+		t.Fatalf("并发删除 after policy commit: %v", err)
 	}
 
 	// And the enabled policy references a rule that existed at write time —

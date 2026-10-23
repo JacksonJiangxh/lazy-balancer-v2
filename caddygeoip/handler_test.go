@@ -909,3 +909,62 @@ func TestCrawlerVerification_transientSetsNoSpoofHeader(t *testing.T) {
 		t.Fatalf("瞬态验证不得置已验证头，got %q", got)
 	}
 }
+
+// 宽品牌标记不构成伪装证据：裸 DeepSeek / ChatGPT-User / Claude-Web 等标记
+// 会出现在普通客户端 UA 里，单独命中不得发射伪装头（否则制造伪安全事件）；
+// 官方爬虫 token 仍判伪装，官方 PTR 仍判已验证。
+func TestCrawlerVerification_weakBrandMarkerIsNotSpoofEvidence(t *testing.T) {
+	ResetCrawlerVerifyCacheForTest(&fakeResolver{})
+	h := &GeoIPHandler{CrawlerExempt: true}
+
+	wide := []struct {
+		ua, engine string
+	}{
+		{"Mozilla/5.0 (compatible; DeepSeek/1.0)", "deepseekbot"},
+		{"Mozilla/5.0 (compatible; ChatGPT-User/1.0; +https://openai.com/bot)", "gptbot"},
+		{"Mozilla/5.0 (compatible; Claude-Web/1.0; +claude.ai)", "claudebot"},
+		{"Mozilla/5.0 (compatible; anthropic-ai/1.0)", "claudebot"},
+	}
+	for _, c := range wide {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.RemoteAddr = "203.0.113.7:443" // 无官方 PTR → 确定否定
+		req.Header.Set("User-Agent", c.ua)
+		h.applyCrawlerVerification(req)
+		if got := req.Header.Get(crawlerSpoofHeader); got != "" {
+			t.Fatalf("裸 %s 品牌串: 宽品牌标记不得单独判伪装，spoof=%q", c.engine, got)
+		}
+		if got := req.Header.Get(crawlerVerifiedHeader); got != "" {
+			t.Fatalf("%q 不得判已验证，verified=%q", c.ua, got)
+		}
+	}
+
+	// 官方 token + 无官方 PTR：伪装证据成立。
+	for _, c := range []struct{ ua, engine string }{
+		{"Mozilla/5.0 (compatible; DeepSeekBot/1.0)", "deepseekbot"},
+		{"Mozilla/5.0 (compatible; OAI-SearchBot/1.0)", "gptbot"},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.RemoteAddr = "203.0.113.7:443"
+		req.Header.Set("User-Agent", c.ua)
+		h.applyCrawlerVerification(req)
+		if got := req.Header.Get(crawlerSpoofHeader); got != c.engine {
+			t.Fatalf("官方 token %q spoof=%q, want %q", c.ua, got, c.engine)
+		}
+	}
+
+	// 官方 PTR + 宽标记：Verified 路径必须不受证据门影响。
+	ResetCrawlerVerifyCacheForTest(&fakeResolver{
+		ptr:  map[string][]string{"198.51.100.9": {"crawl.deepseek.com."}},
+		host: map[string][]string{"crawl.deepseek.com": {"198.51.100.9"}},
+	})
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "198.51.100.9:443"
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; DeepSeek/1.0)")
+	h.applyCrawlerVerification(req)
+	if got := req.Header.Get(crawlerVerifiedHeader); got != "deepseekbot" {
+		t.Fatalf("官方 PTR 应判已验证（宽标记不影响 Verified 路径），verified=%q", got)
+	}
+	if got := req.Header.Get(crawlerSpoofHeader); got != "" {
+		t.Fatalf("已验证路径不得置伪装头，spoof=%q", got)
+	}
+}

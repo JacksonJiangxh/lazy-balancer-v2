@@ -2,6 +2,7 @@ package services
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"regexp"
 	"strings"
@@ -13,16 +14,19 @@ import (
 // 上游启用谓词单源：整个 services 包只允许一处 IIF 字面量（常量定义），
 // 渲染上游装载 / 单规则服务上下文预览 / 看门狗发布谓词必须复用常量——
 // 新增第二处字面量（单侧漂移面）即红。
+// 判定在「去注释 + SQL 归一」后进行：注释里的引用不误红，引号/空白/大小写/
+// 别名等等价写法不得逃逸。
 func TestUpstreamEnabledPredicateHasOneLiteral(t *testing.T) {
 	src, err := os.ReadFile("caddy.go")
 	if err != nil {
 		t.Fatalf("read caddy.go: %v", err)
 	}
-	if got := strings.Count(string(src), "u.enabled IN"); got != 1 {
-		t.Fatalf("caddy.go 含 %d 处上游启用 IIF 字面量, want 1（只允许 upstreamEnabledSQLValue 定义）", got)
+	code := stripGoComments(string(src))
+	if got := strings.Count(normalizeSQL(code), "u.enabled in("); got != 1 {
+		t.Fatalf("caddy.go 含 %d 处上游启用 IIF 字面量, want 1（只允许 upstreamEnabledSQLValue 定义，注释不计）", got)
 	}
 	// 单规则服务上下文预览的两处 EXISTS 必须引用常量而非内联表达式。
-	if got := strings.Count(string(src), "u.rule_id = lb_rules.caddy_id AND `+UpstreamEnabledSQLPredicate+`"); got != 2 {
+	if got := strings.Count(code, "u.rule_id = lb_rules.caddy_id AND `+UpstreamEnabledSQLPredicate+`"); got != 2 {
 		t.Fatalf("GenerateRuleServerContext 引用单源谓词 %d 处, want 2", got)
 	}
 	for _, path := range []string{"configwatchdog.go"} {
@@ -30,21 +34,20 @@ func TestUpstreamEnabledPredicateHasOneLiteral(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read %s: %v", path, err)
 		}
-		if strings.Contains(string(data), "u.enabled IN") {
+		if strings.Contains(normalizeSQL(stripGoComments(string(data))), "u.enabled in(") {
 			t.Fatalf("%s 内联了上游启用表达式（应复用单源谓词）", path)
 		}
 	}
 
-	// handlers 侧同族守卫（上游启用判定全仓收敛后）：别名 u 的谓词直写
-	// （u.enabled=1 / u.enabled IN）一律禁止；upstreams 查询字面量内的
-	// 投影形态（IIF(...enabled IN...)）与 WHERE 直写（enabled=1）同样禁止——
-	// 一律引用 services.UpstreamEnabledSQLValue / UpstreamEnabledSQLPredicate。
+	// handlers 侧同族守卫（上游启用判定全仓收敛后）：别名限定直写
+	// （u./up./upstreams.enabled）一律禁止；upstreams 查询字面量内的投影
+	// （enabled IN(...)）与 WHERE 直写（enabled=1）同样禁止——一律引用
+	// services.UpstreamEnabledSQLValue / UpstreamEnabledSQLPredicate。
 	// 注意 lb_rules.enabled（规则启用列）不属本族，不在禁止范围。
 	entries, err := os.ReadDir("../handlers")
 	if err != nil {
 		t.Fatalf("read handlers dir: %v", err)
 	}
-	upstreamsStringLiteral := regexp.MustCompile("(?s:`[^`]*`)|\"([^\"\\\\]|\\\\.)*\"")
 	for _, entry := range entries {
 		name := entry.Name()
 		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
@@ -54,23 +57,144 @@ func TestUpstreamEnabledPredicateHasOneLiteral(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read handlers/%s: %v", name, err)
 		}
-		src := string(data)
-		for _, pat := range []string{"u.enabled=1", "u.enabled = 1", "u.enabled IN"} {
-			if strings.Contains(src, pat) {
-				t.Fatalf("handlers/%s 内联上游启用谓词 %q（应引用 services.UpstreamEnabledSQLPredicate）", name, pat)
-			}
+		for _, violation := range upstreamEnabledViolations(string(data)) {
+			t.Fatalf("handlers/%s %s（应引用 services.UpstreamEnabledSQLValue/Predicate）", name, violation)
 		}
-		for _, lit := range upstreamsStringLiteral.FindAllString(src, -1) {
-			if !strings.Contains(lit, "FROM upstreams") {
-				continue
+	}
+}
+
+var (
+	// Go 源码中的 SQL 字符串字面量（raw 与解释两种形态）。
+	sqlStringLiteral = regexp.MustCompile("(?s:`[^`]*`)|\"([^\"\\\\]|\\\\.)*\"")
+	// SQL 归一后的「未限定 enabled 投影」：前一位不是 '.' 或标识符字符，
+	// 避免把 u.enabled / lb_rules.enabled 误判为本族。
+	unqualifiedEnabledProjection = regexp.MustCompile(`(^|[^.\w])enabled in\(`)
+	unqualifiedEnabledFilter     = regexp.MustCompile(`(^|[^.\w])enabled=1`)
+)
+
+// stripGoComments 去掉 Go 源码注释，保留字符串/字符字面量内容：注释里的
+// 谓词引用不得触发守卫，而字符串里的 SQL 必须原样参与判定。
+func stripGoComments(src string) string {
+	var out strings.Builder
+	out.Grow(len(src))
+	for i := 0; i < len(src); {
+		switch {
+		case src[i] == '/' && i+1 < len(src) && src[i+1] == '/':
+			for i < len(src) && src[i] != '\n' {
+				i++
 			}
-			if strings.Contains(lit, "enabled IN (") {
-				t.Fatalf("handlers/%s 的 upstreams 查询内联启用投影（应引用 services.UpstreamEnabledSQLValue）: %.80q", name, lit)
+		case src[i] == '/' && i+1 < len(src) && src[i+1] == '*':
+			end := strings.Index(src[i+2:], "*/")
+			if end < 0 {
+				return out.String()
 			}
-			tail := lit[strings.LastIndex(lit, "FROM upstreams"):]
-			if regexp.MustCompile(`enabled\s*=\s*1`).MatchString(tail) {
-				t.Fatalf("handlers/%s 的 upstreams 查询内联启用过滤（应引用 services.UpstreamEnabledSQLPredicate）: %.80q", name, lit)
+			i += 2 + end + 2
+		case src[i] == '`', src[i] == '"', src[i] == '\'':
+			quote := src[i]
+			start := i
+			i++
+			for i < len(src) {
+				if src[i] == '\\' && quote != '`' {
+					i += 2
+					continue
+				}
+				if src[i] == quote {
+					i++
+					break
+				}
+				i++
 			}
+			if i > len(src) {
+				i = len(src)
+			}
+			out.WriteString(src[start:i])
+		default:
+			out.WriteByte(src[i])
+			i++
+		}
+	}
+	return out.String()
+}
+
+var sqlOperatorSpacing = regexp.MustCompile(`\s*([(),=])\s*`)
+
+// normalizeSQL 归一化 SQL 文本：小写、去标识符/字面量引号与方括号、折叠
+// 空白并移除括号/逗号/等号两侧空白——使 `enabled IN('1',1)`、
+// `enabled  in ( 1 )`、`ENABLED = '1'` 落到同一形态。
+func normalizeSQL(s string) string {
+	s = strings.ToLower(s)
+	s = strings.Map(func(r rune) rune {
+		switch r {
+		case '"', '\'', '`', '[', ']':
+			return -1
+		}
+		if r == '\n' || r == '\t' || r == '\r' {
+			return ' '
+		}
+		return r
+	}, s)
+	s = sqlOperatorSpacing.ReplaceAllString(s, "$1")
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// upstreamEnabledViolations 扫描一段 Go 源码中违反「上游启用谓词单源」的
+// 写法，返回违规描述（空=合规）。
+func upstreamEnabledViolations(src string) []string {
+	code := stripGoComments(src)
+	normalized := normalizeSQL(code)
+	var violations []string
+	for _, pattern := range []string{
+		"u.enabled=1", "u.enabled in(",
+		"up.enabled=1", "up.enabled in(",
+		"upstreams.enabled=1", "upstreams.enabled in(",
+	} {
+		if strings.Contains(normalized, pattern) {
+			violations = append(violations, fmt.Sprintf("内联上游启用谓词 %q", pattern))
+		}
+	}
+	for _, literal := range sqlStringLiteral.FindAllString(code, -1) {
+		normalizedLiteral := normalizeSQL(literal)
+		if !strings.Contains(normalizedLiteral, "from upstreams") {
+			continue
+		}
+		if unqualifiedEnabledProjection.MatchString(normalizedLiteral) {
+			violations = append(violations, fmt.Sprintf("upstreams 查询内联启用投影: %.80q", literal))
+			continue
+		}
+		subquery := normalizedLiteral[strings.LastIndex(normalizedLiteral, "from upstreams"):]
+		if unqualifiedEnabledFilter.MatchString(subquery) {
+			violations = append(violations, fmt.Sprintf("upstreams 查询内联启用过滤: %.80q", literal))
+		}
+	}
+	return violations
+}
+
+// 归一化守卫的自检矩阵：等价写法（大小写/引号/无空格/别名/跨行/包级常量）
+// 全部命中；注释引用与 lb_rules.enabled（规则启用列）不误报。
+func TestUpstreamEnabledGuard_detectsEquivalentForms(t *testing.T) {
+	bad := []string{
+		"SELECT 1 FROM upstreams WHERE enabled = 1",
+		"SELECT 1 FROM upstreams WHERE enabled = '1'",
+		"SELECT 1 FROM upstreams WHERE enabled IN('1',1)",
+		"SELECT 1,\n\t enabled IN ( 1 ) FROM upstreams",
+		"SELECT 1 FROM upstreams u WHERE u.enabled=1",
+		"SELECT 1 FROM upstreams up WHERE up.enabled = 1",
+		"SELECT 1 FROM upstreams WHERE upstreams.enabled = 1",
+	}
+	for _, sql := range bad {
+		src := "rows, err := db.Query(`" + sql + "`)\n_ = rows\n_ = err\n"
+		if violations := upstreamEnabledViolations(src); len(violations) == 0 {
+			t.Fatalf("等价形态未命中: %q", sql)
+		}
+	}
+	good := []string{
+		"// 与上游启用谓词 u.enabled IN ('1',1) 同口径\nrows, _ := db.Query(`SELECT 1 FROM upstreams u WHERE ` + services.UpstreamEnabledSQLPredicate)\n",
+		"rows, _ := db.Query(`SELECT 1 FROM lb_rules WHERE enabled = 1 AND ` + services.UpstreamEnabledSQLPredicate)\n",
+		"rows, _ := db.Query(`SELECT host FROM upstreams u WHERE rule_id = ?`, id)\n",
+	}
+	for _, src := range good {
+		if violations := upstreamEnabledViolations(src); len(violations) != 0 {
+			t.Fatalf("合规形态误报: %v（src=%q）", violations, src)
 		}
 	}
 }

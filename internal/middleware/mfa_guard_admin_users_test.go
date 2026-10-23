@@ -67,13 +67,30 @@ func TestMFAStepUpGuard_protectsAdminUserPasswordEndpoints(t *testing.T) {
 		t.Fatalf("POST /users/:id/reset-password without mfa_ts: got %d, want 428（管理员重置密码须 MFA 验证）", code)
 	}
 
-	// When/Then 2：验码后的新 JWT（mfa_ts 新鲜）→ 直通 handler → 200
-	if code := do(http.MethodPut, "/api/v1/users/102", tokenVerified, `{"display_name":"Guard"}`); code != http.StatusOK {
+	// When/Then 2：验码后的新 JWT（mfa_ts 新鲜）→ 直通 handler → 200。
+	// 空 body 的 200 只证明守卫放行——带 password 字段并断言 password_version
+	// 递增，才证明密码真的被改写（旧 JWT 由此失效）。
+	if code := do(http.MethodPut, "/api/v1/users/102", tokenVerified, `{"display_name":"Guard","password":"fresh-pass-1"}`); code != http.StatusOK {
 		t.Fatalf("PUT /users/:id with fresh mfa_ts: got %d, want 200", code)
 	}
-	if code := do(http.MethodPost, "/api/v1/users/102/reset-password", tokenVerified, `{"new_password":"fresh-pass-1"}`); code != http.StatusOK {
+	if got := userPasswordVersion(t, 102); got != 1 {
+		t.Fatalf("PUT /users/:id password 后 password_version=%d, want 1（密码必须真实写入）", got)
+	}
+	if code := do(http.MethodPost, "/api/v1/users/102/reset-password", tokenVerified, `{"new_password":"fresh-pass-2"}`); code != http.StatusOK {
 		t.Fatalf("POST /users/:id/reset-password with fresh mfa_ts: got %d, want 200", code)
 	}
+	if got := userPasswordVersion(t, 102); got != 2 {
+		t.Fatalf("reset-password 后 password_version=%d, want 2（重置必须使既有令牌失效）", got)
+	}
+}
+
+func userPasswordVersion(t *testing.T, userID int) int {
+	t.Helper()
+	var version int
+	if err := db.DB.QueryRow(`SELECT COALESCE(password_version,0) FROM users WHERE id=?`, userID).Scan(&version); err != nil {
+		t.Fatalf("read password_version of user %d: %v", userID, err)
+	}
+	return version
 }
 
 // admin 组端点的拒绝次序——非管理员（含 MFA 启用

@@ -28,7 +28,7 @@ import (
 // runs the ACME flow, persists cert+key to DB, and triggers Caddy reload.
 type CertIssuer struct {
 	caddyReloader   func() error
-	deploymentRetry func(int, issuedCertificate, time.Duration)
+	deploymentRetry func(int, issuedCertificate, time.Duration) error
 	dataDir         string
 }
 
@@ -140,19 +140,21 @@ func NewCertIssuer(reloader func() error, dataDir ...string) *CertIssuer {
 	return issuer
 }
 
-func scheduleCertificateDeploymentRetry(jobID int, material issuedCertificate, delay time.Duration) {
-	manager := GetCAQueueManager()
-	if manager != nil && manager.IsRuleBlocked(material.ruleID) {
-		return
-	}
+// scheduleCertificateDeploymentRetry 是包级部署重试调度入口。返回值即「本轮
+// 是否登记了 timer」：暂停/停止/规则补偿屏障都会使它为非 nil，
+// 调用方（补扫、恢复链）据此如实计数与留痕，不再把未调度谎报成部署重建。
+func scheduleCertificateDeploymentRetry(jobID int, material issuedCertificate, delay time.Duration) error {
 	certificateServiceMu.Lock()
 	service := certificateService
 	certificateServiceMu.Unlock()
 	if service == nil {
 		Logf("warn", "certificate deployment retry skipped for job %d: certificate service is not initialized", jobID)
-		return
+		return ErrCertificateQueueInactive
 	}
-	service.scheduleDeploymentRetry(jobID, material.ruleID, delay)
+	if err := service.deploymentRetrySchedulable(material.ruleID); err != nil {
+		return err
+	}
+	return service.scheduleDeploymentRetry(jobID, material.ruleID, delay)
 }
 
 func signalCancelCertificateDeploymentRetriesForRule(ruleID string) []<-chan struct{} {
@@ -316,7 +318,15 @@ func (s *CertIssuer) deploymentFailed(jobID int, material issuedCertificate, mes
 		// goroutine 自锁，重试链永久断裂并毒化 Resume/导入/启动恢复。起独立
 		// goroutine 后等待变为跨 goroutine（回调返回即 done 关闭），「同
 		// jobID 永不并发部署」不变量由该等待继续保证。
-		go s.deploymentRetry(jobID, material, delay)
+		go func() {
+			if err := s.deploymentRetry(jobID, material, delay); err != nil {
+				// 暂停/屏障期未登记由 Resume/解锁补扫接管（deployment_available_after
+				// 已落库），其余错误必须留痕，避免重试链静默断裂。
+				if !errors.Is(err, ErrCertificateQueueInactive) && !errors.Is(err, ErrCertificateDeploymentRetryBlocked) {
+					Logf("warn", "证书任务 %d：部署失败后的重试登记失败（补扫接管）: %v", jobID, err)
+				}
+			}
+		}()
 	}
 	if updateErr == nil && attempt == maxCertificateDeploymentAttempts {
 		// 封顶只留一条审计（后续每 30 分钟慢速重试不再刷屏）；结果码说明

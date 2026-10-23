@@ -44,12 +44,17 @@ func TestThreatUpdateOneSource_demoteAtWriteGate_zeroWrite(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(wafDir, "threat-ustc.iplist")); !os.IsNotExist(err) {
 		t.Fatal("降级窗口不得写名单文件（从节点零写）")
 	}
+	if _, err := os.Stat(filepath.Join(wafDir, "threat-ustc.iplist.fast")); !os.IsNotExist(err) {
+		t.Fatal("降级窗口不得写 .fast 编译产物（从节点零写）")
+	}
 	var status string
 	if err := db.DB.QueryRow(`SELECT update_status FROM security_threat_sources WHERE id=?`, id).Scan(&status); err != nil {
 		t.Fatal(err)
 	}
-	if status == "success" {
-		t.Fatal("降级窗口不得落 success 终态（源行由集群同步收敛）")
+	// 精确断言：源行必须滞留 running——只比 !=success 会让写 failed/skipped
+	// 等错误终态同样通过（写门本应在任何写库前中止）。
+	if status != "running" {
+		t.Fatalf("status=%q, want running（降级窗口不写任何终态，源行由集群同步收敛）", status)
 	}
 }
 

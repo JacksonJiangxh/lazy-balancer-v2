@@ -9,12 +9,14 @@ const minimumWeight = (item: WeightedItem): number => item.enabled === false ? 0
 const normalizedWeight = (item: WeightedItem): number => Math.max(minimumWeight(item), Math.round(item.weight || 0))
 
 const participatingItems = <Item extends WeightedItem>(items: Item[]): Item[] => {
-  const withinLimit = items.slice(0, MAX_UPSTREAM_ROWS)
-  items.slice(MAX_UPSTREAM_ROWS).forEach((item) => { item.weight = 0 })
+  // 只清零禁用行；MAX_UPSTREAM_ROWS 仅是编辑器的「添加上游」按钮上限，
+  // 后端对上游条数无上限（API/导入可写入更多）。此前把超限行权重写 0，
+  // 使经 API 写入的 101+ 行规则在编辑器改任一权重后「一保存就 400」，
+  // 且本地缓存权重被静默清零。超限由编辑器提示显性化，权重照常参与分配。
   items.forEach((item) => {
     if (item.enabled === false) item.weight = 0
   })
-  return withinLimit.filter((item) => item.enabled !== false)
+  return items.filter((item) => item.enabled !== false)
 }
 
 const distributeWeight = <Item extends WeightedItem>(items: Item[], totalWeight: number): void => {
@@ -64,12 +66,16 @@ export const redistributeWeight = <Item extends WeightedItem>(items: Item[], cha
   }
   const otherItems = participating.filter((item) => item !== changed)
   const otherMinimum = otherItems.reduce((sum, item) => sum + minimumWeight(item), 0)
-  changed.weight = Math.min(100 - otherMinimum, normalizedWeight(changed))
-  distributeWeight(otherItems, 100 - changed.weight)
+  // 预算随参与行数抬升：超过 100 行时每行仍需 ≥1（否则末位分配会压到 0，
+  // 后端保存 400）；≤100 行时保持既有「合计 100」语义。
+  const budget = Math.max(100, participating.reduce((sum, item) => sum + minimumWeight(item), 0))
+  changed.weight = Math.min(budget - otherMinimum, normalizedWeight(changed))
+  distributeWeight(otherItems, budget - changed.weight)
 }
 
 // ⚠ 变异契约:participatingItems 及依赖它的函数会
-// **就地改写** items[].weight——禁用行与超出 MAX_UPSTREAM_ROWS 的行被写 0。
+// **就地改写** items[].weight——仅禁用行被写 0（超出 MAX_UPSTREAM_ROWS 的行
+// 保留原权重并继续参与分配：该常量只是编辑器新增按钮的上限，后端无条数上限）。
 // 当前调用方(编辑器草稿态)依赖此行为;未来在只读场景复用时须先剥离副作用。
 // weightPercent 权重百分比展示( 收敛——原 RuleFlowDialog/Rules 两份
 // 同口径复刻)。签名:(upstreams, row)→0-100 整数;禁用行 0;总和≤0 时 0。

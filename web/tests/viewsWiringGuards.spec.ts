@@ -6,7 +6,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { section, source, repoSource } from './_helpers.ts'
+import { member, section, source, stripComments, repoSource } from './_helpers.ts'
 import { shouldToastQuietPollError } from '../src/utils/pollErrorToast.ts'
 import {
   CERT_QUEUE_VISIBLE_JOBS,
@@ -60,9 +60,16 @@ test('证书队列拉取接入轮询 AbortSignal', () => {
 
 test('任务详情历史与日志加载失败显性化', () => {
   const text = source('src/views/settings/TaskMonitor.vue')
-  assert.match(text, /detailHistoryError/)
-  assert.match(text, /logsLoadError/)
-  assert.doesNotMatch(section(text, 'const openDetail', '// ===== 日志抽屉'), /catch \{ \/\/ 无历史族静默 \}/, '详情历史失败不得静默')
+  // 消费点：失败态必须真的渲染出来（原断言只查符号出现——删掉模板分支仍绿）
+  assert.match(text, /<el-alert v-if="detailHistoryError" type="error"[\s\S]{0,120}?title="运行历史加载失败/)
+  assert.match(text, /<span v-if="logsLoadError"[^>]*>日志加载失败，自动重试中<\/span>/)
+  // 置位路径：详情历史只在最新详情序号下置位，日志失败由轮询 onError 置位
+  const detail = section(text, 'const openDetail', '// ===== 日志抽屉')
+  assert.match(detail, /if \(seq === detailSeq\) detailHistoryError\.value = true/)
+  const tail = section(text, 'const logsLoadError = ref(false)', 'const openLogs')
+  assert.match(tail, /onError: \(\) => \{ logsLoadError\.value = true \}/)
+  assert.match(tail, /logsLoadError\.value = false/, '成功响应必须清除错误态')
+  assert.doesNotMatch(detail, /catch \{ \/\/ 无历史族静默 \}/, '详情历史失败不得静默')
 })
 
 test('规则向导关闭即清空私钥/证书明文', () => {
@@ -130,7 +137,6 @@ test('DNS 凭证测试按掩码回传分流（***→库中原值 :id/test）', (
 
 test('管理 TLS 读取失败显性化，开关禁用至加载成功', () => {
   const text = source('src/views/settings/BasicSettings.vue')
-  assert.match(text, /adminTlsLoaded/)
   assert.match(text, /:disabled="isReadOnly \|\| !adminTlsLoaded"/)
 })
 
@@ -200,9 +206,14 @@ test('区域树加载失败保留旧数据并显性提示+重试', () => {
 
 test('事件页刷新按钮联动自动封禁状态', () => {
   const text = source('src/views/security/SecurityEvents.vue')
-  const start = text.indexOf('const refreshPage')
-  assert.ok(start > 0, '缺 refreshPage')
-  assert.match(text.slice(start, start + 300), /fetchAutobanStatus/)
+  // 函数级限段 + 剥注释：固定字符窗口会被增长后的函数挤出（假红），
+  // 也会被窗口内的无关同名文本命中（假绿）。
+  const body = stripComments(member(text, 'const refreshPage'))
+  const eventsAt = body.indexOf('fetchEvents(')
+  const statusAt = body.indexOf('fetchAutobanStatus(')
+  assert.ok(eventsAt > 0, 'refreshPage 必须刷新事件列表')
+  assert.ok(statusAt > 0, 'refreshPage 必须联动自动封禁状态')
+  assert.ok(statusAt > eventsAt, '先刷新列表，再补拉自动封禁状态')
   assert.match(text, /@click="refreshPage"/)
 })
 
@@ -386,7 +397,7 @@ test('各写函数入口自带只读/在途守卫（纵深防御）', () => {
   const free = source('src/views/settings/FreeCertificates.vue')
   assert.match(section(free, 'const saveCAProvider = async', '\nconst '), /if \(isReadOnly\.value \|\| savingCA\.value\) return/)
   assert.match(section(free, 'const saveConfig = async', '\nconst '), /if \(isReadOnly\.value \|\| savingConfig\.value\) return/)
-  assert.match(section(free, 'const deleteConfig = async', '\nconst '), /savingConfig\.value/)
+  assert.match(section(free, 'const deleteConfig = async', '\nconst '), /if \(isReadOnly\.value \|\| savingConfig\.value \|\| deletingId\.value !== null\) return/)
   // 两个「测试」端点会真实写 DNS TXT / 申请 EAB（后端非只读豁免）
   assert.match(section(free, 'const testCAProvider = async', '\nconst '), /if \(isReadOnly\.value \|\| isTesting\.value\) return/)
   assert.match(section(free, 'const testConfig = async', '\nconst '), /if \(isReadOnly\.value \|\| isTesting\.value \|\| !config\.id\) return/)

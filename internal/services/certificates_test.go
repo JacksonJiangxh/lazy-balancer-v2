@@ -297,8 +297,9 @@ func TestRequeueNonTerminalCertJobs_skips_downloaded_job_missing_cert_material_w
 	retried := make(chan int, 1)
 
 	// When
-	err := requeueNonTerminalCertJobs(context.Background(), func(gotJobID int, _ issuedCertificate, _ time.Duration) {
+	err := requeueNonTerminalCertJobs(context.Background(), func(gotJobID int, _ issuedCertificate, _ time.Duration) error {
 		retried <- gotJobID
+		return nil
 	})
 
 	// Then：无证书材料的 downloaded 任务不得走部署重试；暂停期不入队也不写库
@@ -362,8 +363,9 @@ func TestRequeueNonTerminalCertJobs_skips_job_still_active_in_retired_queue(t *t
 	manager.mu.Unlock()
 
 	// When
-	err := requeueNonTerminalCertJobs(context.Background(), func(gotJobID int, _ issuedCertificate, _ time.Duration) {
+	err := requeueNonTerminalCertJobs(context.Background(), func(gotJobID int, _ issuedCertificate, _ time.Duration) error {
 		t.Errorf("deployment retry scheduled for non-downloaded job %d", gotJobID)
+		return nil
 	})
 
 	// Then：无错误；zombie job 42 状态不变、未二次入队、不记审计；对照 job 43
@@ -398,7 +400,11 @@ func TestRequeueNonTerminalCertJobs_skips_job_still_active_in_retired_queue(t *t
 	}
 }
 
-func TestCertificateService_deployment_retry_deduplicates_job_id(t *testing.T) {
+func TestCertificateService_deployment_retry_replacesPendingTimer(t *testing.T) {
+	// 同 jobID 的重排语义是「替换」而非「拒绝」：旧 timer 必须被取消（不得
+	// 之后又执行一次延迟部署），新 timer 恰执行一次回调，且不残留 timer/回调。
+	// 断言必须可观测——旧实现只裸等一个 channel，若实现改为「忽略重复调度」
+	// 会阻塞到 1h timer 到期（测试挂起而非明确失败）。
 	// Given
 	service := NewCertificateService()
 	resetCertificateServiceForTest(t)
@@ -407,20 +413,56 @@ func TestCertificateService_deployment_retry_deduplicates_job_id(t *testing.T) {
 		calls <- jobID
 		return nil
 	}
-	service.scheduleDeploymentRetry(42, "lb_retry", time.Hour)
+	if err := service.scheduleDeploymentRetry(42, "lb_retry", time.Hour); err != nil {
+		t.Fatalf("schedule initial retry: %v", err)
+	}
+	service.timerMu.Lock()
+	original := service.deploymentTimers[42]
+	service.timerMu.Unlock()
+	if original == nil {
+		t.Fatal("precondition: pending timer not registered")
+	}
 
 	// When
-	service.scheduleDeploymentRetry(42, "lb_retry", 0)
+	if err := service.scheduleDeploymentRetry(42, "lb_retry", 0); err != nil {
+		t.Fatalf("reschedule retry: %v", err)
+	}
 
-	// Then
-	if jobID := <-calls; jobID != 42 {
-		t.Fatalf("retry job ID=%d, want 42", jobID)
+	// Then 1：旧 timer 被取消（done 关闭），不会再执行回调
+	select {
+	case <-original.done:
+	case <-time.After(time.Second):
+		t.Fatal("replaced timer was not canceled")
+	}
+	// Then 2：新 timer 恰执行一次回调
+	select {
+	case jobID := <-calls:
+		if jobID != 42 {
+			t.Fatalf("retry job ID=%d, want 42", jobID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement retry was never executed")
+	}
+	// Then 3：无残留 timer / 在途回调（回调自摘在有界窗口内完成）
+	waitDeadline := time.Now().Add(2 * time.Second)
+	for {
+		service.timerMu.Lock()
+		_, hasTimer := service.deploymentTimers[42]
+		hasCallback := len(service.deploymentCallbacks[42]) > 0
+		service.timerMu.Unlock()
+		if !hasTimer && !hasCallback {
+			break
+		}
+		if time.Now().After(waitDeadline) {
+			t.Fatalf("deployment retry state not released (timer=%v callback=%v)", hasTimer, hasCallback)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 	service.pauseDeploymentRetries()
 	select {
 	case jobID := <-calls:
 		t.Fatalf("duplicate retry ran for job %d", jobID)
-	default:
+	case <-time.After(50 * time.Millisecond):
 	}
 }
 
@@ -1072,7 +1114,7 @@ func TestRequeueNonTerminalCertJobs_disables_jobs_outside_acme_rule_gate(t *test
 	}
 
 	// When
-	err := requeueNonTerminalCertJobs(context.Background(), func(int, issuedCertificate, time.Duration) {})
+	err := requeueNonTerminalCertJobs(context.Background(), func(int, issuedCertificate, time.Duration) error { return nil })
 
 	// Then
 	if err != nil {
@@ -1110,13 +1152,14 @@ func TestRequeueNonTerminalCertJobs_continues_past_disable_transition_conflict(t
 	var retried []int
 
 	// When
-	err := requeueNonTerminalCertJobs(context.Background(), func(gotJobID int, _ issuedCertificate, _ time.Duration) {
+	err := requeueNonTerminalCertJobs(context.Background(), func(gotJobID int, _ issuedCertificate, _ time.Duration) error {
 		retried = append(retried, gotJobID)
 		if gotJobID == 1 {
 			if _, mutateErr := database.Exec("UPDATE cert_jobs SET status='failed' WHERE id=2"); mutateErr != nil {
 				t.Errorf("mutate conflicting job status: %v", mutateErr)
 			}
 		}
+		return nil
 	})
 
 	// Then：冲突不得返回错误，job 3 仍被处理；job 2 保持并发写入方的终态。
@@ -1159,13 +1202,14 @@ func TestRequeueNonTerminalCertJobs_continues_past_existing_cert_transition_conf
 	var retried []int
 
 	// When
-	err := requeueNonTerminalCertJobs(context.Background(), func(gotJobID int, _ issuedCertificate, _ time.Duration) {
+	err := requeueNonTerminalCertJobs(context.Background(), func(gotJobID int, _ issuedCertificate, _ time.Duration) error {
 		retried = append(retried, gotJobID)
 		if gotJobID == 1 {
 			if _, mutateErr := database.Exec("UPDATE cert_jobs SET status='failed' WHERE id=2"); mutateErr != nil {
 				t.Errorf("mutate conflicting job status: %v", mutateErr)
 			}
 		}
+		return nil
 	})
 
 	// Then：冲突不得返回错误，job 3 仍被处理；job 2 保持并发写入方的终态。
@@ -1804,7 +1848,7 @@ func TestRequeueNonTerminalCertJobs_does_not_resurrect_failed_job(t *testing.T) 
 	manager.mu.Unlock()
 
 	// When
-	err := requeueNonTerminalCertJobs(context.Background(), func(int, issuedCertificate, time.Duration) {})
+	err := requeueNonTerminalCertJobs(context.Background(), func(int, issuedCertificate, time.Duration) error { return nil })
 
 	// Then
 	if err != nil {
@@ -1876,8 +1920,9 @@ func TestRequeueNonTerminalCertJobs_requeues_queued_job_despite_valid_stored_cer
 	manager.mu.Unlock()
 
 	// When
-	err := requeueNonTerminalCertJobs(context.Background(), func(int, issuedCertificate, time.Duration) {
+	err := requeueNonTerminalCertJobs(context.Background(), func(int, issuedCertificate, time.Duration) error {
 		t.Error("deployment retry scheduled for non-downloaded job")
+		return nil
 	})
 
 	// Then
@@ -1929,9 +1974,10 @@ func TestCertificateService_resumeDeploymentRetries_reschedulesDroppedRetries(t 
 	resetCertificateServiceForTest(t)
 	var scheduled []int
 	var delays []time.Duration
-	service.deploymentRetry = func(jobID int, _ issuedCertificate, delay time.Duration) {
+	service.deploymentRetry = func(jobID int, _ issuedCertificate, delay time.Duration) error {
 		scheduled = append(scheduled, jobID)
 		delays = append(delays, delay)
+		return nil
 	}
 	service.pauseDeploymentRetries()
 
@@ -2251,8 +2297,9 @@ func TestCertificateService_rescanSkipsJobsWithActiveTimer(t *testing.T) {
 	service := NewCertificateService()
 	resetCertificateServiceForTest(t)
 	rescheduled := make(chan int, 4)
-	service.deploymentRetry = func(id int, _ issuedCertificate, _ time.Duration) {
+	service.deploymentRetry = func(id int, _ issuedCertificate, _ time.Duration) error {
 		rescheduled <- id
+		return nil
 	}
 
 	// 已有活跃 timer(模拟正常重试链在跑)
@@ -2304,8 +2351,9 @@ func TestCertificateService_rescanPicksUpDroppedRetry(t *testing.T) {
 	service := NewCertificateService()
 	resetCertificateServiceForTest(t)
 	rescheduled := make(chan int, 4)
-	service.deploymentRetry = func(id int, _ issuedCertificate, _ time.Duration) {
+	service.deploymentRetry = func(id int, _ issuedCertificate, _ time.Duration) error {
 		rescheduled <- id
+		return nil
 	}
 
 	// When:周期补扫
@@ -2339,8 +2387,9 @@ func TestCertificateService_rescanPicksUpCleanupAfterWritebackFailure(t *testing
 	service := NewCertificateService()
 	resetCertificateServiceForTest(t)
 	rescheduled := make(chan int, 4)
-	service.deploymentRetry = func(id int, _ issuedCertificate, _ time.Duration) {
+	service.deploymentRetry = func(id int, _ issuedCertificate, _ time.Duration) error {
 		rescheduled <- id
+		return nil
 	}
 	service.rescanDroppedDeploymentRetries()
 	select {
@@ -2369,7 +2418,7 @@ func TestCertIssuer_deploymentFailed_persistsMaterial(t *testing.T) {
 	jobID := int(jobID64)
 
 	notAfter := time.Now().UTC().Add(90 * 24 * time.Hour).Truncate(time.Second)
-	issuer := &CertIssuer{deploymentRetry: func(int, issuedCertificate, time.Duration) {}}
+	issuer := &CertIssuer{deploymentRetry: func(int, issuedCertificate, time.Duration) error { return nil }}
 
 	// When: deploymentFailed 携带内存材料
 	_ = issuer.deploymentFailed(jobID, issuedCertificate{
@@ -2612,7 +2661,7 @@ func TestRequeueCertJobsSnapshot_material_fast_path_opens_deployment_window(t *t
 
 			// Then 2：补扫谓词实证——该行必须被 rescanDroppedDeploymentRetries 拾起并调度
 			scheduled := make(chan int, 1)
-			service := &CertificateService{deploymentRetry: func(id int, _ issuedCertificate, _ time.Duration) { scheduled <- id }}
+			service := &CertificateService{deploymentRetry: func(id int, _ issuedCertificate, _ time.Duration) error { scheduled <- id; return nil }}
 			service.rescanDroppedDeploymentRetries()
 			select {
 			case id := <-scheduled:
@@ -2661,7 +2710,7 @@ func TestRequeueCertJobsSnapshot_provider_unavailable_keeps_deployment_only_job_
 	}
 	// Then 3：部署补扫确实能拾起该任务
 	scheduled := make(chan int, 1)
-	service := &CertificateService{deploymentRetry: func(id int, _ issuedCertificate, _ time.Duration) { scheduled <- id }}
+	service := &CertificateService{deploymentRetry: func(id int, _ issuedCertificate, _ time.Duration) error { scheduled <- id; return nil }}
 	service.rescanDroppedDeploymentRetries()
 	select {
 	case id := <-scheduled:

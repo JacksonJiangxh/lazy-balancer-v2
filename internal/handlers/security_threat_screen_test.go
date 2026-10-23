@@ -768,6 +768,10 @@ func TestThreatScreenRollup_fixationIdempotentAndEquivalent(t *testing.T) {
 	if rollCount != 3 {
 		t.Errorf("rollup sum=%d, want 3（幂等固化，不随请求次数翻倍）", rollCount)
 	}
+	var rollRows int
+	if err := db.MetricsDB.QueryRow(`SELECT COUNT(*) FROM security_event_rollup`).Scan(&rollRows); err != nil {
+		t.Fatal(err)
+	}
 	// 等价性：清空原始表（模拟原始表被保留策略裁剪/规模解耦），聚合仍来自 rollup
 	if _, err := db.MetricsDB.Exec(`DELETE FROM security_events`); err != nil {
 		t.Fatal(err)
@@ -791,8 +795,13 @@ func TestThreatScreenRollup_fixationIdempotentAndEquivalent(t *testing.T) {
 	}
 	// 国家维度依赖 xdb 归属（测试环境无 xdb → country 空），只验计数等价；
 	// 国家/省产出在 rollup 行中有独立断言（下）。
-	if rollCount == 0 {
-		t.Errorf("rollup empty")
+	// 行级幂等（独立于 SUM 口径）：清空原始表后再请求，已固化分钟不得重复建行。
+	var rollRowsAfterWipe int
+	if err := db.MetricsDB.QueryRow(`SELECT COUNT(*) FROM security_event_rollup`).Scan(&rollRowsAfterWipe); err != nil {
+		t.Fatal(err)
+	}
+	if rollRowsAfterWipe != rollRows {
+		t.Errorf("rollup 行数=%d after raw wipe, want %d（已固化分钟不得重复建行）", rollRowsAfterWipe, rollRows)
 	}
 }
 
@@ -970,19 +979,41 @@ func TestThreatRollup_watermarkAdvancesOnEmptyAndClamps(t *testing.T) {
 		// 3 小时前的公网事件 + 同分钟的全私网事件（私网不进 rollup）。
 		seedThreatScreenEvent(t, "2026-10-18 09:00:10", "93.184.216.7", "942100", "SQL Injection", "blocked")
 		seedThreatScreenEvent(t, "2026-10-18 10:00:10", "10.0.0.8", "942100", "SQL Injection", "blocked")
+		lastComplete := base.Add(-time.Minute).Truncate(time.Minute)
+		windowStart := lastComplete.Add(-24 * time.Hour)
+		mustParse := func(raw, label string) time.Time {
+			t.Helper()
+			if raw == "" {
+				t.Fatalf("%s watermark 为空（未固化）", label)
+			}
+			parsed, err := time.Parse("2006-01-02 15:04", raw)
+			if err != nil {
+				t.Fatalf("%s watermark=%q 无法解析: %v", label, raw, err)
+			}
+			return parsed
+		}
 
 		if err := ensureThreatRollup(24); err != nil {
 			t.Fatalf("first rollup: %v", err)
 		}
-		first := threatRollupWatermarkForTest(t)
-		if first != "2026-10-18 11:58" {
-			t.Fatalf("first watermark=%q, want 11:58 (24h window fits the per-call batch budget)", first)
+		// 形状断言：单次调用只推进到窗口内某处，不得一次跑到尾端（批预算
+		// 调整不应让用例转红），但必须已越过窗口下界（空分钟照常推进）。
+		first := mustParse(threatRollupWatermarkForTest(t), "first")
+		if !first.After(windowStart) {
+			t.Fatalf("first watermark=%s, want 越过窗口下界 %s（空分钟必须推进）", first, windowStart)
+		}
+		if !first.Before(lastComplete) {
+			t.Fatalf("first watermark=%s, want 未达尾端 %s（回填必须分批）", first, lastComplete)
 		}
 		if err := ensureThreatRollup(24); err != nil {
 			t.Fatalf("second rollup: %v", err)
 		}
-		if got := threatRollupWatermarkForTest(t); got != "2026-10-18 11:58" {
-			t.Fatalf("second watermark=%q, want 11:58 (coverage complete, no drift)", got)
+		second := mustParse(threatRollupWatermarkForTest(t), "second")
+		if second.Before(first) {
+			t.Fatalf("second watermark=%s 倒退（first=%s）", second, first)
+		}
+		if second.After(lastComplete) {
+			t.Fatalf("second watermark=%s 越过失完整分钟边界 %s", second, lastComplete)
 		}
 		if got := threatRollupCountForMinute(t, "2026-10-18 09:00"); got != 1 {
 			t.Fatalf("public event minute count=%d, want 1", got)
@@ -993,24 +1024,42 @@ func TestThreatRollup_watermarkAdvancesOnEmptyAndClamps(t *testing.T) {
 		if err := ensureThreatRollup(24); err != nil {
 			t.Fatalf("third rollup: %v", err)
 		}
-		if got := threatRollupWatermarkForTest(t); got != "2026-10-18 11:58" {
-			t.Fatalf("steady-state watermark=%q, want 11:58 (no drift backwards)", got)
+		third := mustParse(threatRollupWatermarkForTest(t), "third")
+		if third.Before(second) {
+			t.Fatalf("steady-state watermark=%s 倒退（second=%s）", third, second)
+		}
+		if third != second {
+			t.Fatalf("steady-state watermark=%s 漂移（second=%s，覆盖完成后不得再推进）", third, second)
 		}
 	})
 
 	t.Run("stale watermark is clamped to the backfill horizon", func(t *testing.T) {
 		setupSecurityPolicyTestDB(t)
 		installThreatClock(t, base)
-		stale := base.AddDate(0, 0, -40).Format("2006-01-02 15:04")
+		staleTime := base.AddDate(0, 0, -40)
+		stale := staleTime.Format("2006-01-02 15:04")
 		if _, err := db.MetricsDB.Exec(`INSERT INTO metrics_state (key, value) VALUES (?, ?)`, threatRollupWatermarkKey, stale); err != nil {
 			t.Fatal(err)
 		}
 		if err := ensureThreatRollup(24); err != nil {
 			t.Fatalf("rollup with stale watermark: %v", err)
 		}
-		got := threatRollupWatermarkForTest(t)
-		if got != "2026-10-18 11:58" {
-			t.Fatalf("watermark after clamp=%q, want 11:58 (clamped to 24h horizon)", got)
+		// 形状断言：陈旧水位被钳进窗口（严格晚于窗口下界、不晚于完整分钟
+		// 尾端），而不是把 40 天前的原值留在库里。
+		raw := threatRollupWatermarkForTest(t)
+		got, err := time.Parse("2006-01-02 15:04", raw)
+		if err != nil {
+			t.Fatalf("watermark=%q 无法解析: %v", raw, err)
+		}
+		windowStart := base.Add(-time.Minute).Truncate(time.Minute).Add(-24 * time.Hour)
+		if !got.After(windowStart) {
+			t.Fatalf("watermark after clamp=%s, want 晚于窗口下界 %s（陈旧值必须推进）", got, windowStart)
+		}
+		if got.After(base.Add(-time.Minute).Truncate(time.Minute)) {
+			t.Fatalf("watermark after clamp=%s 越过失完整分钟尾端", got)
+		}
+		if !got.After(staleTime) {
+			t.Fatalf("watermark after clamp=%s 未推进（仍停留在陈旧值 %s）", got, stale)
 		}
 	})
 }
@@ -2126,5 +2175,149 @@ func TestEnsureThreatRollup_semanticVersionKeysPersistedAndRefixedOnDrift(t *tes
 	}
 	if got := readKey(threatRollupPredicateVersionKey); got != threatRollupPredicateVersion {
 		t.Fatalf("漂移后 predicate version=%q, want 重固回写 %q", got, threatRollupPredicateVersion)
+	}
+}
+
+// 最新段事务内的代际写入失败必须回滚：该路径此前直接 return err，事务既不
+// 提交也不回滚——连接被永久占用（GET 大屏持续失败后连接池耗尽）。
+func TestEnsureThreatRollup_stateWriteFailureReleasesTransaction(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	// 触发器只在写「谓词代际」时失败——最新段事务的前几条写入已成功，失败点
+	// 落在循环内（正是此前漏 rollback 的分支）。
+	if _, err := db.MetricsDB.Exec(`CREATE TRIGGER fail_predicate_generation BEFORE INSERT ON metrics_state
+		WHEN NEW.key = '` + threatRollupPredicateVersionKey + `'
+		BEGIN SELECT RAISE(ABORT, 'injected generation write failure'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+	if err := ensureThreatRollup(1); err == nil {
+		t.Fatal("注入代际写入失败后应上抛错误")
+	}
+	if inUse := db.MetricsDB.Stats().InUse; inUse != 0 {
+		t.Fatalf("Stats().InUse=%d, want 0（失败分支必须回滚，不得泄漏事务连接）", inUse)
+	}
+	// 回滚须完全生效：不能留下半截固化结果（触发器之前的写入也不得提交）。
+	var locked int
+	if err := db.MetricsDB.QueryRow(`SELECT COUNT(*) FROM metrics_state WHERE key=?`, threatRollupTargetReadyKey).Scan(&locked); err != nil {
+		t.Fatalf("read target ready key: %v", err)
+	}
+	if locked != 0 {
+		t.Fatalf("%s 半截写入 %d 条, want 0（事务须整体回滚）", threatRollupTargetReadyKey, locked)
+	}
+}
+
+// 全量重建遇「原始事件已被裁剪」（重算总量 < 已固化总量）时，保留旧行并叠加
+// 高水位之后的迟到事件：直接覆盖会丢掉原始行已消失的历史，只保留旧行又会
+// 永久吞掉迟到事件。
+func TestThreatFixMinute_fullRebuildKeepsLateArrivals(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	minute := time.Date(2026, 10, 19, 12, 5, 0, 0, time.UTC)
+	minuteStr := minute.Format("2006-01-02 15:04")
+	// 已固化历史：3 条（原始事件已被保留期裁掉）。
+	if _, err := db.MetricsDB.Exec(`INSERT INTO security_event_rollup (minute, country, province, family, rule, action, count)
+		VALUES (?, '', '', 'SQL注入', '942100', 'blocked', 3)`, minuteStr); err != nil {
+		t.Fatalf("seed rollup: %v", err)
+	}
+	// 高水位 = 旧行覆盖到的最后一个事件 id（先在窗外插一行占位 id）。
+	res, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time, client_ip, rule_triggered, rule_msg, action)
+		VALUES ('2026-10-19 12:09:30', '93.184.216.7', '942100', 'SQL Injection', 'blocked')`)
+	if err != nil {
+		t.Fatalf("seed highwater marker: %v", err)
+	}
+	highwater, _ := res.LastInsertId()
+	if err := saveThreatRollupEventHighwaterForTest(t, minuteStr, highwater); err != nil {
+		t.Fatal(err)
+	}
+	// 迟到事件：高水位之后写入本分钟（原始表里仅剩这一条可见行）。
+	if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time, client_ip, rule_triggered, rule_msg, action)
+		VALUES ('2026-10-19 12:05:30', '93.184.216.8', '942100', 'SQL Injection', 'blocked')`); err != nil {
+		t.Fatalf("seed late event: %v", err)
+	}
+
+	tx, err := db.MetricsDB.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := threatFixMinuteWithMode(tx, minute, true); err != nil {
+		tx.Rollback()
+		t.Fatalf("fix minute: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	var total int
+	if err := db.MetricsDB.QueryRow(`SELECT COALESCE(SUM(count),0) FROM security_event_rollup WHERE minute=?`, minuteStr).Scan(&total); err != nil {
+		t.Fatalf("read rollup: %v", err)
+	}
+	if total != 4 {
+		t.Fatalf("rollup 总量=%d, want 4（3 条历史 + 1 条迟到）", total)
+	}
+}
+
+// saveThreatRollupEventHighwaterForTest 落库分钟高水位（测试辅助）。
+func saveThreatRollupEventHighwaterForTest(t *testing.T, minute string, id int64) error {
+	t.Helper()
+	tx, err := db.MetricsDB.Begin()
+	if err != nil {
+		return err
+	}
+	if err := saveThreatRollupEventHighwater(tx, minute, id); err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+// 零值面板与成功路径的键集/目标元素类型必须一致：top_targets 曾用另一族
+// 元素类型（SecurityAttackType），JSON 层同为 [] 故不可见，但给零值面板补
+// 条目时会静默产出缺 name/domain/value 字段的条目。
+func TestGetSecurityThreatScreen_degradedTopTargetsShape(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	t.Cleanup(resetThreatScreenCachesForTest)
+	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
+
+	// 成功路径键集（空库）。
+	success := getRequest(t, router, "/security/overview/threat-screen")
+	if success.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", success.Code, success.Body.String())
+	}
+	var successPayload struct {
+		Data map[string]json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(success.Body.Bytes(), &successPayload); err != nil {
+		t.Fatal(err)
+	}
+
+	// 降级路径：MetricsDB 未装配。
+	old := db.MetricsDB
+	db.MetricsDB = nil
+	t.Cleanup(func() { db.MetricsDB = old })
+	degraded := getRequest(t, router, "/security/overview/threat-screen")
+	if degraded.Code != http.StatusOK {
+		t.Fatalf("degraded status=%d body=%s", degraded.Code, degraded.Body.String())
+	}
+	var degradedPayload struct {
+		Data map[string]json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(degraded.Body.Bytes(), &degradedPayload); err != nil {
+		t.Fatal(err)
+	}
+	if len(degradedPayload.Data) != len(successPayload.Data) {
+		t.Fatalf("降级面板键数=%d, want %d（两版本同键）", len(degradedPayload.Data), len(successPayload.Data))
+	}
+	for key := range successPayload.Data {
+		if _, ok := degradedPayload.Data[key]; !ok {
+			t.Fatalf("降级面板缺少键 %q", key)
+		}
+	}
+
+	// Go 层元素类型断言（JSON 层空数组不可分辨）。
+	zero := threatScreenZeroPayload(24, threatScreenNow(), services.CurrentLocation())
+	targets, ok := zero["top_targets"].([]threatTopTarget)
+	if !ok {
+		t.Fatalf("top_targets 类型=%T, want []threatTopTarget", zero["top_targets"])
+	}
+	if len(targets) != 0 {
+		t.Fatalf("零值面板 top_targets 长度=%d, want 0", len(targets))
 	}
 }

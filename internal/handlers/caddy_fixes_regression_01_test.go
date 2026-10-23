@@ -109,7 +109,7 @@ func TestValidateRuleConfigGeneration_pathRuleEmptyUpstreams_returnsNil(t *testi
 	}
 }
 
-// 上下文）仍被 errors.Is 命中；且单规则生成 map 的 error 值本身即为哨兵 error，
+// 哨兵错误经包装后（生成失败 + 规则名上下文）仍被 errors.Is 命中；且单规则生成 map 的 error 值本身即为哨兵 error，
 // 特判不依赖精确字符串、不随包装静默失效。
 func TestValidateRuleConfigGeneration_zeroUpstreams_sentinelSurvivesWrapping(t *testing.T) {
 	// Given 生成侧 map 携带哨兵 error（非字符串）
@@ -130,7 +130,7 @@ func TestValidateRuleConfigGeneration_zeroUpstreams_sentinelSurvivesWrapping(t *
 	}
 }
 
-// （含 IP 等非法域名时整串报错）必须回退小写拆分保留，而非返回 nil 丢弃域名——
+// CanonicalDomains 整串失败时（含 IP 等非法域名）必须回退小写拆分保留，而非返回 nil 丢弃域名——
 // 与渲染侧 normalizedDomainSet（caddy.go）同口径，避免遮蔽检查静默通过。
 func TestNormalizedRuleDomains_fallsBackOnCanonicalizationFailure(t *testing.T) {
 	// CanonicalDomains 对 IP 报错 → 整串失败 → 回退小写拆分

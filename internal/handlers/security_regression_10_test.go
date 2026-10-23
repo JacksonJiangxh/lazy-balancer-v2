@@ -13,7 +13,7 @@ import (
 
 // validateV2BackupSecurityPolicies 此前只归一/校验 crs_rule_groups 与
 // crs_excluded_rules，ip_acl_mode/mode/geoip_mode 经 restoreTable 原样落库。
-// 前的旧备份合法携带空串（旧 Create 不归一、列默认 TEXT DEFAULT ”），导入后
+// 此前的旧备份合法携带空串（旧 Create 不归一、列默认 TEXT DEFAULT ”），导入后
 // 重现零强制状态：发射端仅 bypass/allow/deny 分支产出 ACL 规则，"" 零产出，而
 // UI 仍宣称 IP 访问控制已启用（mode/geoip_mode 空串同型漂移：汇总计数与发射行为
 // 分裂、地域控制静默失效）。导入侧必须与 Create 侧同口径归一/校验：
@@ -110,19 +110,14 @@ func TestImportConfigBackup_rejects_invalid_security_policy_enum_fields(t *testi
 			// When
 			router.ServeHTTP(response, request)
 
-			// Then：整包 400 拒绝并点名策略，且零写入（策略未落库）
+			// Then：整包 400 拒绝并点名策略。此处不断言「零写入」——枚举校验在
+			// 事务开始前就拒绝，写入路径根本不会执行，该断言恒真且无原子性信息量；
+			// 事务内失败回滚由导入链的回滚用例（security_regression_05）承载。
 			if response.Code != http.StatusBadRequest {
 				t.Fatalf("status=%d body=%s, want 400", response.Code, response.Body.String())
 			}
 			if !strings.Contains(response.Body.String(), "bad-enum-policy") {
 				t.Fatalf("response missing policy name: %s", response.Body.String())
-			}
-			var count int
-			if err := db.DB.QueryRow("SELECT COUNT(*) FROM security_policies WHERE name='bad-enum-policy'").Scan(&count); err != nil {
-				t.Fatalf("count imported policies: %v", err)
-			}
-			if count != 0 {
-				t.Fatalf("rejected backup still persisted %d policy rows, want 0", count)
 			}
 		})
 	}

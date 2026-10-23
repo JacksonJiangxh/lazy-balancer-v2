@@ -212,3 +212,29 @@ func TestGetCaddyLogs_capsWindowReadAt128KB(t *testing.T) {
 		t.Fatal("content 为空——夹具日志应命中完整行窗口")
 	}
 }
+
+// 未知日志类型必须 fail-visible：此前静默回落到 runtime 日志，排障者会
+// 误读另一族日志（runtime/tls/server/proxy 内容完全不同），且响应无任何信号。
+func TestGetCaddyLogs_unknownTypeRejectedWithValidValues(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	oldPaths := caddyLogPaths
+	caddyLogPaths = map[string]string{"runtime": filepath.Join(t.TempDir(), "caddy.log")}
+	t.Cleanup(func() { caddyLogPaths = oldPaths })
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/caddy/logs", h.GetCaddyLogs)
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/caddy/logs?type=access", nil))
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s, want 400", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	for _, want := range []string{"access", "runtime", "tls", "server", "proxy"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("body=%s, want 点名可选值 %q", body, want)
+		}
+	}
+}

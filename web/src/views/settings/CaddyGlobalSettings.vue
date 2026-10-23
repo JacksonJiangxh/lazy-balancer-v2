@@ -145,7 +145,7 @@
       <el-divider content-position="left">访问日志</el-divider>
       <el-form-item label="自定义格式">
         <el-switch v-model="settings.access_log_json" :disabled="isReadOnly" active-text="自定义 JSON" inactive-text="Caddy JSON" />
-        <div class="form-tip-line">开启后使用 filter 编码器按自定义格式输出；关闭时输出 Caddy 原生 JSON（X-API-Key 请求头始终脱敏）</div>
+        <div class="form-tip-line">开启后使用 filter 编码器按自定义格式输出；关闭时输出 Caddy 原生 JSON（X-API-Key 请求头始终脱敏）。关闭后保存会清空已配置的自定义字段映射</div>
       </el-form-item>
       <el-form-item v-if="settings.access_log_json" label="日志格式">
         <div class="format-field">
@@ -246,6 +246,7 @@ import { IP_LIST_MAX_ENTRIES } from '@/utils/ipListSaveGuard'
 import { ansiToHtml } from '@/utils/ansi'
 import { request, mfaAwareSuccess } from '@/utils/api'
 import { CDN_PRESETS, DEFAULT_ACCESS_LOG_FORMAT } from '@/utils/caddyDefaults'
+import { buildCaddyConfigPayload } from '@/utils/caddyConfigPayload'
 import { IP_LIST_CATEGORIES, parseIPList, parseRefIds } from '@/utils/securityStages'
 import type { APIResponse, ProxyTimeoutConfig } from '@/types'
 import ProxyTimeoutFields from '@/components/rules/ProxyTimeoutFields.vue'
@@ -465,16 +466,18 @@ const handleSave = async (): Promise<void> => {
   saving.value = true
   try {
     // 显式白名单：settings 是与 BasicSettings 共享的同一对象，全量展开会把
-    // 兄弟卡片未保存的编辑（basic 键）连带提交；只发 caddy 键
-    const payload = {
-      ...Object.fromEntries(CADDY_CONFIG_KEYS.map((key) => [key, settings.value[key]] as const)),
-      source: 'caddy',
-    }
+    // 兄弟卡片未保存的编辑（basic 键）连带提交；只发 caddy 键。
+    // 载荷组装单源：关闭自定义 JSON 时剔除格式键（后端跨字段门会以 400 拒绝
+    // 「json=false + 非空格式」，而清空入口又随开关隐藏）。
+    const { payload: caddyPayload, accessLogFormatCleared } = buildCaddyConfigPayload(settings.value, CADDY_CONFIG_KEYS)
+    const payload = { ...caddyPayload, source: 'caddy' }
     const preview = await request.post<ConfigPreviewResponse>('/config/preview', payload)
     const changed = preview.data?.changed ?? false
     if (changed) {
       const changes = preview.data?.changes?.length ? preview.data.changes.join('；') : '检测到配置变更'
-      await ElMessageBox.confirm(changes, `确认保存${preview.data?.section || 'Caddy 配置'}？`, {
+      // 清空语义必须在确认框显性告知（载荷已剔除该键，用户此后无处可查）
+      const clearedNote = accessLogFormatCleared ? '；已关闭自定义 JSON：库中自定义字段映射将被清空（该格式不生效）' : ''
+      await ElMessageBox.confirm(`${changes}${clearedNote}`, `确认保存${preview.data?.section || 'Caddy 配置'}？`, {
         confirmButtonText: '确认', cancelButtonText: '取消', type: 'warning',
       })
     }

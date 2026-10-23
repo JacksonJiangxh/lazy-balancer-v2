@@ -22,7 +22,7 @@ import (
 //	传输失败（Caddy 不可达）→ 退化语义（与直应用通道同口径）：200 + 落库 +
 //	重载失败审计
 //	（与转换前行为等价，守护不回归）。
-func newSecurityGateRouter(t *testing.T, rejectLoads bool) *gin.Engine {
+func newSecurityGateRouter(t *testing.T, rejectLoads bool) (*gin.Engine, *atomic.Int32) {
 	t.Helper()
 	var loads atomic.Int32
 	fakeCaddy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -41,14 +41,13 @@ func newSecurityGateRouter(t *testing.T, rejectLoads bool) *gin.Engine {
 	h := &Handlers{caddyService: services.NewCaddyService(fakeCaddy.URL)}
 	router := gin.New()
 	router.POST("/security/custom-rules", h.CreateSecurityCustomRule)
-	router.POST("/security/block-pages", h.CreateSecurityBlockPage)
-	return router
+	return router, &loads
 }
 
 func TestSecurityWrites_caddyRejectionBlocksCommit(t *testing.T) {
 	// Given：Caddy 拒绝全部 /load（4xx = 配置本身不可用）
 	setupSecurityPolicyTestDB(t)
-	router := newSecurityGateRouter(t, true)
+	router, loads := newSecurityGateRouter(t, true)
 
 	// When：创建一条安全自定义规则
 	rec := httptest.NewRecorder()
@@ -60,6 +59,11 @@ func TestSecurityWrites_caddyRejectionBlocksCommit(t *testing.T) {
 	// Then：400 + 未落库 + 失败审计——坏配置不得进 DB（否则重启即全停）
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("create status=%d body=%s, want 400（配置被拒不得落库）", rec.Code, rec.Body.String())
+	}
+	// 应用门控必须真的尝试过应用且不重试：拒绝=一次 /load 即回滚，
+	// 计数器恒 0 说明校验阶段早退、本用例未覆盖应用门。
+	if got := loads.Load(); got != 1 {
+		t.Fatalf("/load 次数=%d, want 1（拒绝不重试；0 表示未进入应用门）", got)
 	}
 	var count int
 	if err := db.DB.QueryRow("SELECT COUNT(*) FROM security_custom_rules WHERE name='会被拒绝的规则'").Scan(&count); err != nil {

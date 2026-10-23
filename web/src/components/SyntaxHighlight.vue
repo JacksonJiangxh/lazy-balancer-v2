@@ -25,7 +25,7 @@ watchDebounced(
   ([content, language]) => {
     highlighted.value = highlightCode(content, language)
   },
-  { debounce: 160, maxWait: 500 },
+  { debounce: 160, maxWait: 500, immediate: true },
 )
 </script>
 

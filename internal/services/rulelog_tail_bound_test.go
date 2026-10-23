@@ -34,7 +34,10 @@ func TestReadRuleLogTail_noNewlineFileBounded(t *testing.T) {
 	size := 8 << 20
 	writeRuleLogFile(t, "probe", bytes.Repeat([]byte{0x41}, size))
 
-	content, offset := ReadRuleLogTail("probe", 100)
+	content, offset, err := ReadRuleLogTail("probe", 100)
+	if err != nil {
+		t.Fatalf("read tail: %v", err)
+	}
 
 	if content == "" {
 		t.Fatal("tail of newline-free log returned empty content, want bounded partial tail")
@@ -54,7 +57,10 @@ func TestReadRuleLogTail_multilineTailSemanticsUnchanged(t *testing.T) {
 	}
 	writeRuleLogFile(t, "multi", []byte(b.String()))
 
-	content, offset := ReadRuleLogTail("multi", 100)
+	content, offset, err := ReadRuleLogTail("multi", 100)
+	if err != nil {
+		t.Fatalf("read tail: %v", err)
+	}
 
 	lines := strings.Split(strings.TrimSuffix(content, "\n"), "\n")
 	if len(lines) != 100 {
@@ -114,7 +120,10 @@ func TestReadRuleLogTail_windowEquivalenceShapes(t *testing.T) {
 			fmt.Fprintf(&b, "L%07d\n", i)
 		}
 		writeRuleLogFile(t, "eq-multi", []byte(b.String()))
-		content, offset := ReadRuleLogTail("eq-multi", 5)
+		content, offset, err := ReadRuleLogTail("eq-multi", 5)
+		if err != nil {
+			t.Fatalf("read tail: %v", err)
+		}
 		var want strings.Builder
 		for i := 29996; i <= 30000; i++ {
 			fmt.Fprintf(&want, "L%07d\n", i)
@@ -129,14 +138,20 @@ func TestReadRuleLogTail_windowEquivalenceShapes(t *testing.T) {
 	t.Run("行跨64KB块边界", func(t *testing.T) {
 		data := append(append(bytes.Repeat([]byte{'A'}, 65530), '\n'), append(bytes.Repeat([]byte{'B'}, 100), '\n')...)
 		writeRuleLogFile(t, "eq-boundary", data)
-		content, offset := ReadRuleLogTail("eq-boundary", 1)
+		content, offset, err := ReadRuleLogTail("eq-boundary", 1)
+		if err != nil {
+			t.Fatalf("read tail: %v", err)
+		}
 		if content != string(bytes.Repeat([]byte{'B'}, 100))+"\n" {
 			t.Fatalf("块边界行尾窗不等价: %q", content)
 		}
 		if offset != 65531 {
 			t.Fatalf("offset=%d, want 65531（B 行起点）", offset)
 		}
-		content2, offset2 := ReadRuleLogTail("eq-boundary", 2)
+		content2, offset2, err2 := ReadRuleLogTail("eq-boundary", 2)
+		if err2 != nil {
+			t.Fatalf("read tail: %v", err2)
+		}
 		if content2 != string(data) || offset2 != 0 {
 			t.Fatalf("maxLines=2 应整窗: offset=%d len=%d", offset2, len(content2))
 		}
@@ -149,7 +164,10 @@ func TestReadRuleLogTail_windowEquivalenceShapes(t *testing.T) {
 		}
 		data[0] = '\n'
 		writeRuleLogFile(t, "eq-cap", data)
-		content, offset := ReadRuleLogTail("eq-cap", 10)
+		content, offset, err := ReadRuleLogTail("eq-cap", 10)
+		if err != nil {
+			t.Fatalf("read tail: %v", err)
+		}
 		if l := int64(len(content)); l != maxBackwardScan {
 			t.Fatalf("cap 部分尾窗长度=%d, want %d", l, maxBackwardScan)
 		}
@@ -162,14 +180,20 @@ func TestReadRuleLogTail_windowEquivalenceShapes(t *testing.T) {
 	})
 	t.Run("未终结尾行计为一行", func(t *testing.T) {
 		writeRuleLogFile(t, "eq-partial", []byte("a\nb\nc"))
-		content, offset := ReadRuleLogTail("eq-partial", 2)
+		content, offset, err := ReadRuleLogTail("eq-partial", 2)
+		if err != nil {
+			t.Fatalf("read tail: %v", err)
+		}
 		if content != "b\nc" || offset != 2 {
 			t.Fatalf("未终结尾行不等价: content=%q offset=%d", content, offset)
 		}
 	})
 	t.Run("行数少于maxLines整窗返回", func(t *testing.T) {
 		writeRuleLogFile(t, "eq-short", []byte("x\ny\n"))
-		content, offset := ReadRuleLogTail("eq-short", 100)
+		content, offset, err := ReadRuleLogTail("eq-short", 100)
+		if err != nil {
+			t.Fatalf("read tail: %v", err)
+		}
 		if content != "x\ny\n" || offset != 0 {
 			t.Fatalf("短文件不等价: content=%q offset=%d", content, offset)
 		}
@@ -189,7 +213,10 @@ func TestReadRuleLogFrom_newlineFreeAdvancesWindow(t *testing.T) {
 
 	offset := int64(0)
 	for window := 1; window <= 3; window++ {
-		lines, next := ReadRuleLogFrom("advance", offset)
+		lines, next, err := ReadRuleLogFrom("advance", offset)
+		if err != nil {
+			t.Fatalf("read from: %v", err)
+		}
 		if len(lines) != 0 {
 			t.Fatalf("window %d: 无行边界窗口不得交付行, got %d", window, len(lines))
 		}
@@ -199,7 +226,10 @@ func TestReadRuleLogFrom_newlineFreeAdvancesWindow(t *testing.T) {
 		offset = next
 	}
 	// 残段（未满窗且无换行）：扣留——next 停在 offset，等待写侧补全换行。
-	lines, next := ReadRuleLogFrom("advance", offset)
+	lines, next, err := ReadRuleLogFrom("advance", offset)
+	if err != nil {
+		t.Fatalf("read from: %v", err)
+	}
 	if len(lines) != 0 {
 		t.Fatalf("残段不得交付行, got %d", len(lines))
 	}
@@ -213,7 +243,10 @@ func TestReadRuleLogFrom_newlineFreeAdvancesWindow(t *testing.T) {
 
 func TestReadRuleLogFrom_newlineFileDeliversCompleteLines(t *testing.T) {
 	writeRuleLogFile(t, "complete", []byte("a\nbb\nccc\npartial"))
-	lines, next := ReadRuleLogFrom("complete", 0)
+	lines, next, err := ReadRuleLogFrom("complete", 0)
+	if err != nil {
+		t.Fatalf("read from: %v", err)
+	}
 	if len(lines) != 3 || lines[0] != "a" || lines[1] != "bb" || lines[2] != "ccc" {
 		t.Fatalf("lines=%v, want [a bb ccc]（未终结尾行须扣留）", lines)
 	}
@@ -234,9 +267,15 @@ func TestReadRuleLogTail_capWarnThrottledPerRule(t *testing.T) {
 	t.Cleanup(func() { delete(metricsStateFailed, stateKey) })
 	buf := captureLogf(t)
 
-	ReadRuleLogTail("capwarn", 100)
-	ReadRuleLogTail("capwarn", 100)
-	ReadRuleLogTail("capwarn", 100)
+	if _, _, err := ReadRuleLogTail("capwarn", 100); err != nil {
+		t.Fatalf("read tail: %v", err)
+	}
+	if _, _, err := ReadRuleLogTail("capwarn", 100); err != nil {
+		t.Fatalf("read tail: %v", err)
+	}
+	if _, _, err := ReadRuleLogTail("capwarn", 100); err != nil {
+		t.Fatalf("read tail: %v", err)
+	}
 
 	if warns := strings.Count(buf.String(), "backward scan cap"); warns != 1 {
 		t.Fatalf("cap warn count=%d, want 1（首报后节流）\n%s", warns, buf.String())
@@ -244,7 +283,9 @@ func TestReadRuleLogTail_capWarnThrottledPerRule(t *testing.T) {
 
 	// 恢复形状：换成正常多行小文件后读取 → 一条恢复 info。
 	writeRuleLogFile(t, "capwarn", []byte("a\nb\nc\n"))
-	ReadRuleLogTail("capwarn", 100)
+	if _, _, err := ReadRuleLogTail("capwarn", 100); err != nil {
+		t.Fatalf("read tail: %v", err)
+	}
 	if !strings.Contains(buf.String(), "resumed below the backward scan cap") {
 		t.Fatalf("recovery info missing\n%s", buf.String())
 	}

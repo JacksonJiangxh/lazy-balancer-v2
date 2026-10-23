@@ -1,0 +1,100 @@
+package handlers
+
+// 日志体量读取失败的可观测契约：目录枚举/Info 失败必须留痕（状态转换去重：
+// 首报 warn、恢复 info、持续失败不刷屏），响应形状不变——「没有日志」与
+// 「读不到日志」不得混为一谈。
+
+import (
+	"bytes"
+	"log"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func captureHandlerLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	buffer := &bytes.Buffer{}
+	oldWriter := log.Writer()
+	log.SetOutput(buffer)
+	t.Cleanup(func() { log.SetOutput(oldWriter) })
+	return buffer
+}
+
+func countLogOccurrences(logs *bytes.Buffer, fragment string) int {
+	return strings.Count(logs.String(), fragment)
+}
+
+func TestLogStatsVolume_dirReadFailureIsVisibleAndRecovers(t *testing.T) {
+	resetLogStatsVolumeStateForTest()
+	t.Cleanup(resetLogStatsVolumeStateForTest)
+	dir := t.TempDir()
+	match := func(name string) bool { return strings.HasSuffix(name, ".log") }
+
+	origReadDir := logStatsReadDir
+	logStatsReadDir = func(string) ([]os.DirEntry, error) { return nil, os.ErrPermission }
+	t.Cleanup(func() { logStatsReadDir = origReadDir })
+	logs := captureHandlerLog(t)
+
+	// When：连续两轮枚举失败。
+	for range 2 {
+		if stats := aggregateDirStats(dir, match); len(stats) != 0 {
+			t.Fatalf("读取失败应返回空聚合, got %v", stats)
+		}
+	}
+	// Then：恰一条 warn（状态转换去重），key 携带目录路径。
+	if got := countLogOccurrences(logs, "日志体量读取失败（logstats-dir-"+dir+"）"); got != 1 {
+		t.Fatalf("失败留痕 %d 条, want 1: %q", got, logs.String())
+	}
+	if strings.Contains(logs.String(), "ERROR:") {
+		t.Fatalf("体量读取失败应记 warn: %q", logs.String())
+	}
+
+	// When：恢复（真实枚举），有文件的目录。
+	if err := os.WriteFile(filepath.Join(dir, "app.log"), []byte("abc"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	logStatsReadDir = origReadDir
+	if stats := aggregateDirStats(dir, match); stats["app.log"].Active != 3 {
+		t.Fatalf("恢复后聚合=%v, want app.log Active=3", stats)
+	}
+	// Then：恰一条恢复 info。
+	if got := countLogOccurrences(logs, "日志体量读取已恢复（logstats-dir-"+dir+"）"); got != 1 {
+		t.Fatalf("恢复留痕 %d 条, want 1: %q", got, logs.String())
+	}
+}
+
+// 端点级：体量读取失败时响应保持 200 与单行形状（不新增错误面），失败由
+// 日志留痕承担。
+func TestGetLogStats_responseStaysOKOnVolumeReadFailure(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	resetLogStatsVolumeStateForTest()
+	t.Cleanup(resetLogStatsVolumeStateForTest)
+	origReadDir := logStatsReadDir
+	logStatsReadDir = func(string) ([]os.DirEntry, error) { return nil, os.ErrPermission }
+	t.Cleanup(func() { logStatsReadDir = origReadDir })
+	logs := captureHandlerLog(t)
+
+	resp := fetchLogStatsRows(t, h.GetLogStats, "?keys=runtime")
+	active, rotated, count, ok := logStatsRowByKey(resp, "runtime")
+	if !ok || active != 0 || rotated != 0 || count != 0 {
+		t.Fatalf("runtime row=(%d,%d,%d,found=%v), want 零值但存在", active, rotated, count, ok)
+	}
+	if got := countLogOccurrences(logs, "日志体量读取失败"); got == 0 {
+		t.Fatalf("端点路径失败必须留痕: %q", logs.String())
+	}
+}
+
+// ENOENT（日志尚未产生）是正常形态，不得留痕。
+func TestLogStatsVolume_missingDirectoryIsNotLogged(t *testing.T) {
+	resetLogStatsVolumeStateForTest()
+	t.Cleanup(resetLogStatsVolumeStateForTest)
+	logs := captureHandlerLog(t)
+	missing := filepath.Join(t.TempDir(), "absent")
+	resetLogStatsVolumeStateForTest()
+	aggregateDirStats(missing, func(name string) bool { return true })
+	if strings.Contains(logs.String(), "日志体量读取失败") {
+		t.Fatalf("目录不存在不得留痕: %q", logs.String())
+	}
+}

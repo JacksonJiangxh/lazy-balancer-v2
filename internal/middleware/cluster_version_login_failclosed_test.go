@@ -17,6 +17,20 @@ import (
 	"lazy-balancer-v2/internal/models"
 )
 
+// usersTableWriteRoutes 写 users 表同步列的 POST 路由（单源分类的 6 条 POST
+// + GET /auth/oidc/callback）——分类与 fail-closed 分流共用同一清单。
+var usersTableWriteRoutes = []string{
+	"/api/v1/auth/login",
+	"/api/v1/auth/mfa/verify",
+	"/api/v1/auth/setup",
+	"/api/v1/auth/mfa/activate",
+	"/api/v1/auth/mfa/disable",
+	"/api/v1/auth/mfa/recovery-codes",
+}
+
+// usersTableWriteTargets 上述 POST 路由 + GET 形态的 OIDC 回调（并发请求面）。
+var usersTableWriteTargets = append(append([]string{}, usersTableWriteRoutes...), "/api/v1/auth/oidc/callback")
+
 // newLoginFailClosedTestRouter 构造「触发器安装失败但 DB 本体可用」的中间件
 // 形态：DROP TABLE users 使 CREATE TRIGGER ... ON users 报错（installErr
 // 非空），global_config 完好（RoleOf 可读）。返回 router 与 database。
@@ -39,8 +53,12 @@ func newLoginFailClosedTestRouter(t *testing.T) (*gin.Engine, func()) {
 	router := gin.New()
 	router.Use(clusterVersionMiddleware(database))
 	noContent := func(c *gin.Context) { c.Status(http.StatusNoContent) }
-	router.POST("/api/v1/auth/login", noContent)
-	router.POST("/api/v1/auth/mfa/verify", noContent)
+	for _, route := range usersTableWriteRoutes {
+		router.POST(route, noContent)
+	}
+	router.GET("/api/v1/auth/oidc/callback", noContent)
+	router.POST("/api/v1/auth/mfa/setup", noContent)
+	router.POST("/api/v1/auth/mfa/verify-step", noContent)
 	router.POST("/api/v1/rules", noContent)
 	return router, cleanup
 }
@@ -62,9 +80,13 @@ func TestClusterVersionMiddleware_loginFailClosedIsMasterOnly(t *testing.T) {
 	if _, err := database.Exec("UPDATE global_config SET is_master=0 WHERE id=1"); err != nil {
 		t.Fatal(err)
 	}
-	// When/Then：从端密码登录与 MFA 验证步放行（登录可用性保留）
-	for _, path := range []string{"/api/v1/auth/login", "/api/v1/auth/mfa/verify"} {
-		if code, body := serveStatus(router, http.MethodPost, path); code != http.StatusNoContent {
+	// When/Then：从端 users 表写路径全部放行（登录/开户/改 MFA 可用性保留）
+	for _, path := range usersTableWriteTargets {
+		method := http.MethodPost
+		if path == "/api/v1/auth/oidc/callback" {
+			method = http.MethodGet
+		}
+		if code, body := serveStatus(router, method, path); code != http.StatusNoContent {
 			t.Fatalf("从节点 %s status=%d body=%q, want 204（从端 fail-closed 无保护收益）", path, code, body)
 		}
 	}
@@ -77,9 +99,13 @@ func TestClusterVersionMiddleware_loginFailClosedIsMasterOnly(t *testing.T) {
 	if _, err := database.Exec("UPDATE global_config SET is_master=1 WHERE id=1"); err != nil {
 		t.Fatal(err)
 	}
-	// 回归：主端登录/MFA 验证步仍 fail-closed 500（锁传播保护语义不变）
-	for _, path := range []string{"/api/v1/auth/login", "/api/v1/auth/mfa/verify"} {
-		code, body := serveStatus(router, http.MethodPost, path)
+	// 回归：主端 users 表写路径仍 fail-closed 500（锁传播/用户集保护语义不变）
+	for _, path := range usersTableWriteTargets {
+		method := http.MethodPost
+		if path == "/api/v1/auth/oidc/callback" {
+			method = http.MethodGet
+		}
+		code, body := serveStatus(router, method, path)
 		if code != http.StatusInternalServerError {
 			t.Fatalf("主节点 %s status=%d body=%q, want fail-closed 500", path, code, body)
 		}
@@ -90,8 +116,26 @@ func TestClusterVersionMiddleware_loginFailClosedIsMasterOnly(t *testing.T) {
 	}
 }
 
-// 畸形形状：角色读失败（DB 已关闭）时登录路径按写闸同语义 fail-closed 500——
-// 不得因「可能从节点」猜测放行。
+// 分类表：users 表写路径 7 条全部命中；两条反例（只写记账/pending 列）不得
+// 被前缀捕获（否则降级态误伤 MFA 登录/step-up）。
+func TestIsUsersTableWritePath_classification(t *testing.T) {
+	for _, path := range usersTableWriteRoutes {
+		if !isUsersTableWritePath(http.MethodPost, path) {
+			t.Fatalf("POST %s 必须归类为 users 表写路径", path)
+		}
+	}
+	if !isUsersTableWritePath(http.MethodGet, "/api/v1/auth/oidc/callback") {
+		t.Fatal("GET /api/v1/auth/oidc/callback 必须归类为 users 表写路径（JIT 开户）")
+	}
+	for _, path := range []string{"/api/v1/auth/mfa/setup", "/api/v1/auth/mfa/verify-step"} {
+		if isUsersTableWritePath(http.MethodPost, path) {
+			t.Fatalf("POST %s 只写记账/pending 列，不得归类为 users 表写路径", path)
+		}
+	}
+}
+
+// 畸形形状：角色读失败（DB 已关闭）时 users 表写路径按写闸同语义 fail-closed
+// 500——不得因「可能从节点」猜测放行。
 func TestClusterVersionMiddleware_loginFailClosedOnRoleReadError(t *testing.T) {
 	router, cleanup := newLoginFailClosedTestRouter(t)
 	defer cleanup()

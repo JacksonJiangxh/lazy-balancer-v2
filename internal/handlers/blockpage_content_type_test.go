@@ -115,6 +115,30 @@ func TestUpdateSecurityBlockPage_contentTypeUpdated(t *testing.T) {
 	}
 }
 
+func TestUpdateSecurityBlockPage_omittedContentTypeKeepsExisting(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newBlockPageContentTypeRouter(t)
+	res, err := db.DB.Exec(`INSERT INTO security_block_pages (name, content, content_type, is_default) VALUES ('省略类型页', '{}', 'application/json; charset=utf-8', 0)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pageID, _ := res.LastInsertId()
+
+	// 指针合并语义：省略 content_type 是「不改」，不得回落默认 text/html。
+	recorder := blockPageRequest(t, router, http.MethodPut, fmt.Sprintf("/security/block-pages/%d", pageID),
+		`{"name":"省略类型页","content":"{\"ok\":true}"}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
+	}
+	var ct string
+	if err := db.DB.QueryRow(`SELECT COALESCE(content_type,'') FROM security_block_pages WHERE id=?`, pageID).Scan(&ct); err != nil {
+		t.Fatal(err)
+	}
+	if ct != "application/json; charset=utf-8" {
+		t.Fatalf("省略 content_type 后=%q, want 保留原值 application/json; charset=utf-8", ct)
+	}
+}
+
 func TestUpdateSecurityBlockPage_rejectsUnknownContentType(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newBlockPageContentTypeRouter(t)
@@ -135,12 +159,16 @@ func TestListSecurityBlockPages_ruleRefCount(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	router := newBlockPageContentTypeRouter(t)
 	// Given：页面被 ①一条启用策略（绑定规则 lb_ra）②规则 lb_rb 的阶段 1 覆盖引用
-	res, err := db.DB.Exec(`INSERT INTO security_block_pages (name, content, is_default) VALUES ('引用统计页', '<html>x</html>', 0)`)
+	res, err := db.DB.Exec(`INSERT INTO security_block_pages (name, content, content_type, is_default) VALUES ('引用统计页', '<html>x</html>', 'application/json; charset=utf-8', 0)`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	pageID, _ := res.LastInsertId()
 	if _, err := db.DB.Exec(`INSERT INTO security_policies (id, name, block_page_id, enabled) VALUES (901, '引用策略', ?, 1)`, pageID); err != nil {
+		t.Fatal(err)
+	}
+	// 禁用策略即使被绑定也不得计入 rule_ref_count（展示口径=生效引用）。
+	if _, err := db.DB.Exec(`INSERT INTO security_policies (id, name, block_page_id, enabled) VALUES (902, '禁用引用策略', ?, 0)`, pageID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled) VALUES ('lb_ra','ra','http','ra.test',8080,1)`); err != nil {
@@ -149,7 +177,13 @@ func TestListSecurityBlockPages_ruleRefCount(t *testing.T) {
 	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled,block_page_stage1_id) VALUES ('lb_rb','rb','http','rb.test',8081,1,?)`, pageID); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled) VALUES ('lb_rc','rc','http','rc.test',8082,1)`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := db.DB.Exec(`INSERT INTO security_policy_bindings (rule_caddy_id, policy_id) VALUES ('lb_ra', 901)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO security_policy_bindings (rule_caddy_id, policy_id) VALUES ('lb_rc', 902)`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -173,7 +207,10 @@ func TestListSecurityBlockPages_ruleRefCount(t *testing.T) {
 		if p.ID == int(pageID) {
 			found = true
 			if p.RuleRefCount != 2 {
-				t.Fatalf("rule_ref_count=%d, want 2（lb_ra 策略绑定 ∪ lb_rb 阶段覆盖）", p.RuleRefCount)
+				t.Fatalf("rule_ref_count=%d, want 2（lb_ra 策略绑定 ∪ lb_rb 阶段覆盖；禁用策略的 lb_rc 不计）", p.RuleRefCount)
+			}
+			if p.ContentType != "application/json; charset=utf-8" {
+				t.Fatalf("列表 content_type=%q, want application/json; charset=utf-8（列表投影必须携带库值）", p.ContentType)
 			}
 		}
 	}

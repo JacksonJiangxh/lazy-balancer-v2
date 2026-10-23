@@ -355,9 +355,12 @@ func TestGenerateSingleRuleCaddyConfig_CustomPathRules_ordersAndSelectsUpstreams
 }
 
 func TestGenerateCaddyConfig_propagatesCertificateMaterializationFailure(t *testing.T) {
-	// Given
+	// Given 合法 PEM + 逃逸规则编号：错误只可能来自路径逃逸拒绝分支
+	// （密钥对校验在前，非法 PEM 会让 ID 分支永不执行）。
+	certDir := useTemporaryCertDir(t)
 	_, database := newClusterTestService(t)
-	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,strategy,health_check_path,enable_tls,tls_source,tls_cert,tls_key) VALUES ('../invalid','invalid cert','http','example.com',443,'weighted_round_robin','',1,'manual','new-cert','new-key')`); err != nil {
+	certPEM, keyPEM := matchingCertificatePair(t, "example.com")
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,strategy,health_check_path,enable_tls,tls_source,tls_cert,tls_key) VALUES ('../invalid','invalid cert','http','example.com',443,'weighted_round_robin','',1,'manual',?,?)`, certPEM, keyPEM); err != nil {
 		t.Fatalf("seed invalid certificate rule: %v", err)
 	}
 	if _, err := database.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('../invalid','127.0.0.1',8080,1,1,'http')`); err != nil {
@@ -373,8 +376,15 @@ func TestGenerateCaddyConfig_propagatesCertificateMaterializationFailure(t *test
 	err := NewCaddyService(server.URL).ApplyConfig(GenerateCaddyConfig())
 
 	// Then
-	if err == nil || !strings.Contains(err.Error(), "invalid") {
-		t.Fatalf("expected materialization error for invalid rule ID, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "非法的规则编号") {
+		t.Fatalf("expected invalid rule ID rejection, got %v", err)
+	}
+	entries, readErr := os.ReadDir(certDir)
+	if readErr != nil {
+		t.Fatalf("read certificate directory: %v", readErr)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("invalid rule ID materialized %d files: %v", len(entries), entries)
 	}
 	if requests != 0 {
 		t.Fatalf("Caddy received %d requests after certificate materialization failed", requests)
@@ -457,13 +467,13 @@ func TestGenerateCaddyConfig_does_not_select_single_domain_certificate_after_dom
 }
 
 func TestGenerateCaddyConfig_restoresCertificateSnapshotWhenMaterializationFails(t *testing.T) {
-	// Given
-	oldCertDir := certDir
-	certDir = t.TempDir()
-	t.Cleanup(func() { certDir = oldCertDir })
+	// Given 真实密钥对（非法 PEM 会在写盘前被拒，快照恒空 → 恢复分支零执行），
+	// 第二对私钥的临时路径被目录占位 → 第一对已写盘后失败。
+	useTemporaryCertDir(t)
 	_, database := newClusterTestService(t)
+	certPEM, keyPEM := matchingCertificatePair(t, "example.com")
 	for _, ruleID := range []string{"a-valid", "z-fail"} {
-		if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,strategy,health_check_path,enable_tls,tls_source,tls_cert,tls_key) VALUES (?,?, 'http','example.com',443,'weighted_round_robin','',1,'manual','new-cert','new-key')`, ruleID, ruleID); err != nil {
+		if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,strategy,health_check_path,enable_tls,tls_source,tls_cert,tls_key) VALUES (?,?, 'http','example.com',443,'weighted_round_robin','',1,'manual',?,?)`, ruleID, ruleID, certPEM, keyPEM); err != nil {
 			t.Fatalf("seed certificate rule %s: %v", ruleID, err)
 		}
 		if _, err := database.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES (?,'127.0.0.1',8080,1,1,'http')`, ruleID); err != nil {
@@ -508,10 +518,11 @@ func TestGenerateCaddyConfig_restoresCertificateSnapshotWhenMaterializationFails
 }
 
 func TestApplyConfig_restoresCertificateSnapshotWhenLoadRejects(t *testing.T) {
-	// Given
+	// Given 真实密钥对：物化先写盘（快照非空），/load 被拒后 defer 必须恢复。
 	useTemporaryCertDir(t)
 	_, database := newClusterTestService(t)
-	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,strategy,health_check_path,enable_tls,tls_source,tls_cert,tls_key) VALUES ('lb-rejected','rejected cert','http','example.com',443,'weighted_round_robin','',1,'manual','new-cert','new-key')`); err != nil {
+	certPEM, keyPEM := matchingCertificatePair(t, "example.com")
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,strategy,health_check_path,enable_tls,tls_source,tls_cert,tls_key) VALUES ('lb-rejected','rejected cert','http','example.com',443,'weighted_round_robin','',1,'manual',?,?)`, certPEM, keyPEM); err != nil {
 		t.Fatalf("seed certificate rule: %v", err)
 	}
 	if _, err := database.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb-rejected','127.0.0.1',8080,1,1,'http')`); err != nil {
@@ -524,8 +535,14 @@ func TestApplyConfig_restoresCertificateSnapshotWhenLoadRejects(t *testing.T) {
 	if err := os.WriteFile(keyPath, []byte("old-key"), 0600); err != nil {
 		t.Fatalf("seed old key: %v", err)
 	}
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-		http.Error(writer, "load rejected", http.StatusBadRequest)
+	loadRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/load" {
+			loadRequests++
+			http.Error(writer, "load rejected", http.StatusBadRequest)
+			return
+		}
+		http.NotFound(writer, request)
 	}))
 	defer server.Close()
 
@@ -535,6 +552,9 @@ func TestApplyConfig_restoresCertificateSnapshotWhenLoadRejects(t *testing.T) {
 	// Then
 	if err == nil {
 		t.Fatal("Caddy load rejection reported success")
+	}
+	if loadRequests != 1 {
+		t.Fatalf("Caddy /load received %d requests, want 1 (apply rejection branch)", loadRequests)
 	}
 	cert, certErr := os.ReadFile(certPath)
 	if certErr != nil {
@@ -2148,8 +2168,12 @@ func TestHttpsRedirectLocationPreservesURI(t *testing.T) {
 // superfluous WriteHeader 日志噪音+未来 terminal 化后盲导 443 的地雷);
 // 跳转完全由项目自有 redirectRoutes 管理(TLSHTTPRedirect,任意端口)。
 func TestGenerateCaddyConfig_autoHTTPSFullyDisabled(t *testing.T) {
+	// 443 规则只在证书可用时进入发布集（无证书整条不发布），故物化真实密钥对，
+	// 使 http_80 与 http_443 两个 server 同时在场参与断言。
+	useTemporaryCertDir(t)
 	_, database := newClusterTestService(t)
-	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,strategy,enable_tls,tls_source,enabled) VALUES ('lb-autohttps','autohttps','http','example.com',443,'weighted_round_robin',1,'manual',1)`); err != nil {
+	certPEM, keyPEM := matchingCertificatePair(t, "example.com")
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,strategy,enable_tls,tls_source,tls_cert,tls_key,enabled) VALUES ('lb-autohttps','autohttps','http','example.com',443,'weighted_round_robin',1,'manual',?,?,1)`, certPEM, keyPEM); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := database.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb-autohttps','127.0.0.1',8080,1,1,'http')`); err != nil {
@@ -2160,6 +2184,11 @@ func TestGenerateCaddyConfig_autoHTTPSFullyDisabled(t *testing.T) {
 		t.Fatalf("generate: %s", message)
 	}
 	servers := config["apps"].(map[string]interface{})["http"].(map[string]interface{})["servers"].(map[string]interface{})
+	for _, required := range []string{"http_80", "http_443"} {
+		if _, exists := servers[required]; !exists {
+			t.Fatalf("server %s missing: 断言前置不成立（servers=%v）", required, servers)
+		}
+	}
 	for name, sv := range servers {
 		server, ok := sv.(map[string]interface{})
 		if !ok {

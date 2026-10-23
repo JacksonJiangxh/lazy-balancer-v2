@@ -17,8 +17,6 @@ import (
 
 	"github.com/miekg/dns"
 	"golang.org/x/crypto/acme"
-
-	"lazy-balancer-v2/internal/dnsprovider/ownership"
 )
 
 type cleanupTrackingProvider struct {
@@ -1146,13 +1144,8 @@ func TestIssuer_cleanupBudget_scalesWithChallengeCount(t *testing.T) {
 	}
 }
 
-// 清理预算上限与 ownership 陈旧判定的耦合断言：CA 队列执行预算（60min，
-// services/caqueue.go caExecutionTimeout）+ 清理上限必须仍小于
-// staleOwnershipAge——否则在途清理中的条目会被他方清理判为陈旧而并发删除。
-func TestDNSCleanupBudget_staysBelowStaleOwnershipAge(t *testing.T) {
-	const caExecutionBudget = 60 * time.Minute // 镜像 services caExecutionTimeout
-	if caExecutionBudget+dnsCleanupBudgetMax >= ownership.StaleOwnershipAge {
-		t.Fatalf("执行预算 %v + 清理上限 %v 必须 < staleOwnershipAge %v",
-			caExecutionBudget, dnsCleanupBudgetMax, ownership.StaleOwnershipAge)
-	}
-}
+// 清理预算上限与 ownership 陈旧判定的耦合断言已下沉到 services 层
+// （services.TestCleanupBudget_staysBelowStaleOwnershipAge）：该断言需要同时读取
+// CA 队列执行预算上限（services 私有常量）与清理上限，acme 作为被依赖层无法
+// 导入 services，留在本层的字面量镜像正是漂移来源。此处只保留本包自洽的预算
+// 形状断言。

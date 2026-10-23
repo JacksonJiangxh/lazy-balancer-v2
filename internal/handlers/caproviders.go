@@ -115,6 +115,12 @@ func (h *Handlers) UpdateCAProvider(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Invalid request: " + err.Error()})
 		return
 	}
+	// CA 提供商的「守卫 + 提交」必须与规则/默认 CA 的「校验 + 提交」互斥：
+	// 否则并发写可提交「启用 ACME 规则 × 禁用 provider」（规则侧随后每次签发
+	// 硬失败）或「默认 CA = 禁用 provider」（静默改派到首个启用 provider）。
+	// 锁序 caddyOpMu → DB，与证书配置写路径同序。
+	h.caddyOpMu.Lock()
+	defer h.caddyOpMu.Unlock()
 	old, err := h.caProviderService.UpdateCAProvider(id, req)
 	if err != nil {
 		if errors.Is(err, services.ErrCAProviderNotFound) {
@@ -179,10 +185,12 @@ func (h *Handlers) UpdateCAProvider(c *gin.Context) {
 		// 空串会真实清空 credentials 列，不得记「无修改」。
 		changed = append(changed, "凭证（清空）")
 	}
-	if req.MaxConcurrent != nil && *req.MaxConcurrent != old.MaxConcurrent {
+	// 钳制后的生效值才算变更：服务层把 <=0 归一为默认（0→1 / 0→1000），
+	// 按请求原值比对会把「提交 0 而库值已是 1」记成「变更」（审计假阳性）。
+	if req.MaxConcurrent != nil && services.NormalizeCAProviderMaxConcurrent(*req.MaxConcurrent) != old.MaxConcurrent {
 		changed = append(changed, "最大并发")
 	}
-	if req.MinIntervalMS != nil && *req.MinIntervalMS != old.MinIntervalMS {
+	if req.MinIntervalMS != nil && services.NormalizeCAProviderMinIntervalMS(*req.MinIntervalMS) != old.MinIntervalMS {
 		changed = append(changed, "最小间隔")
 	}
 	if req.Enabled != nil && *req.Enabled != old.Enabled {
@@ -198,6 +206,12 @@ func (h *Handlers) UpdateCAProvider(c *gin.Context) {
 }
 
 func (h *Handlers) TestCAProvider(c *gin.Context) {
+	// ZeroSSL EAB 测试会写 ca_providers.credentials（账户绑定结果）——与
+	// 导入的整表替换互斥。这里不取 caddyOpMu：测试含网络往返，持全局锁会把
+	// 规则/证书配置写路径拖死（锁只保护本地事务级竞态）。
+	if rejectWriteDuringImport(c, "测试 CA 提供商（配置导入进行中）") {
+		return
+	}
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil || id <= 0 {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的 ID 参数"})

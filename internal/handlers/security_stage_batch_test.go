@@ -453,9 +453,18 @@ func TestGetRuleStageStats_nilMetricsDBReturnsFullZeroShape(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
 	}
+	// 键存在 + 值为零：只查键存在会让零值面板漂移成任意占位值仍绿。
 	for _, key := range []string{"stage1_blocked_24h", "stage3_blocked_24h", "ratelimit_blocks_reload", "precheck_avg_us", "precheck_samples", "waf_avg_us", "waf_samples"} {
-		if _, ok := payload.Data[key]; !ok {
+		raw, ok := payload.Data[key]
+		if !ok {
 			t.Fatalf("nil MetricsDB fallback missing key %q: %s", key, response.Body.String())
+		}
+		var value float64
+		if err := json.Unmarshal(raw, &value); err != nil {
+			t.Fatalf("nil MetricsDB fallback key %q 不是数值: %s", key, raw)
+		}
+		if value != 0 {
+			t.Fatalf("nil MetricsDB fallback key %q=%v, want 0（零值面板）", key, value)
 		}
 	}
 }

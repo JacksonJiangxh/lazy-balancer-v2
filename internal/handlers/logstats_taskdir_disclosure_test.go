@@ -231,7 +231,11 @@ func TestClassifyRotationCopyName_familiesAgreeAcrossConsumers(t *testing.T) {
 	}{
 		{"caddy.log.1", rotationCopyShift, "caddy.log"},
 		{"caddy.log.9", rotationCopyShift, "caddy.log"},
-		{"caddy.log.10", rotationCopyNone, ""}, // 只认 .1..9
+		{"caddy.log.10", rotationCopyShift, "caddy.log"},                    // 外部 logrotate 两位代次
+		{"caddy.log.20260921", rotationCopyNone, ""},                        // 纯日期不是移位副本
+		{"caddy.log.20260921-120000-2", rotationCopyTimestamp, "caddy.log"}, // 同秒碰撞后缀
+		{"caddy.log.1.gz", rotationCopyShift, "caddy.log"},
+		{"lb_abc-123-20260921-120000-64-size.log", rotationCopyTimberjack, "lb_abc-123.log"},
 		{"caddy.log.20260921-120000", rotationCopyTimestamp, "caddy.log"},
 		{"caddy.log.20260921-120000.gz", rotationCopyTimestamp, "caddy.log"},
 		{"caddy-20260921-120000-64-size.log", rotationCopyTimberjack, "caddy.log"},

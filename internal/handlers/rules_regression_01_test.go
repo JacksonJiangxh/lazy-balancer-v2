@@ -299,3 +299,54 @@ func TestCreateRule_omittedWeightDefaultsToOne(t *testing.T) {
 		t.Fatalf("weights=%v, want [1 1]（省略键默认 1 落库）", weights)
 	}
 }
+
+// 启用/禁用主 UPDATE 必须校验 RowsAffected：放锁窗口（预校验/快照期间）内
+// 规则被并发删除时，0 行更新若被当成成功，会产出与真实状态相反的审计并渲染
+// 一条不存在的规则。RAISE(IGNORE) 触发器精确制造「行存在但更新 0 行」形态
+// （先删行会让预校验提前 404，测不到目标分支）。
+func TestEnableAndDisableRule_rejectWhenRowVanishesBeforeUpdate(t *testing.T) {
+	handler, _, _ := newAuditRuleHandlers(t, 0)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/rules/:caddy_id/enable", handler.EnableRule)
+	router.POST("/rules/:caddy_id/disable", handler.DisableRule)
+	seedTCPStoredRule(t, "lb_vanish", "vanish", 18641, false, "weighted_round_robin", false)
+	if _, err := db.DB.Exec(`CREATE TRIGGER ignore_lb_vanish_update BEFORE UPDATE ON lb_rules WHEN OLD.caddy_id = 'lb_vanish' BEGIN SELECT RAISE(IGNORE); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	enableResponse := httptest.NewRecorder()
+	router.ServeHTTP(enableResponse, httptest.NewRequest(http.MethodPost, "/rules/lb_vanish/enable", nil))
+	if enableResponse.Code != http.StatusConflict || !strings.Contains(enableResponse.Body.String(), "规则已被删除或并发变更") {
+		t.Fatalf("enable status=%d body=%s, want 409 规则已被删除或并发变更", enableResponse.Code, enableResponse.Body.String())
+	}
+	var enabled bool
+	if err := db.DB.QueryRow(`SELECT enabled FROM lb_rules WHERE caddy_id='lb_vanish'`).Scan(&enabled); err != nil {
+		t.Fatalf("read rule: %v", err)
+	}
+	if enabled {
+		t.Fatal("0 行更新不得落成启用态")
+	}
+
+	// 禁用方向：先置启用态（绕过触发器）。
+	if _, err := db.DB.Exec(`DROP TRIGGER ignore_lb_vanish_update`); err != nil {
+		t.Fatalf("drop trigger: %v", err)
+	}
+	if _, err := db.DB.Exec(`UPDATE lb_rules SET enabled=1 WHERE caddy_id='lb_vanish'`); err != nil {
+		t.Fatalf("enable seed: %v", err)
+	}
+	if _, err := db.DB.Exec(`CREATE TRIGGER ignore_lb_vanish_update BEFORE UPDATE ON lb_rules WHEN OLD.caddy_id = 'lb_vanish' BEGIN SELECT RAISE(IGNORE); END`); err != nil {
+		t.Fatalf("recreate trigger: %v", err)
+	}
+	disableResponse := httptest.NewRecorder()
+	router.ServeHTTP(disableResponse, httptest.NewRequest(http.MethodPost, "/rules/lb_vanish/disable", nil))
+	if disableResponse.Code != http.StatusConflict || !strings.Contains(disableResponse.Body.String(), "规则已被删除或并发变更") {
+		t.Fatalf("disable status=%d body=%s, want 409 规则已被删除或并发变更", disableResponse.Code, disableResponse.Body.String())
+	}
+	if err := db.DB.QueryRow(`SELECT enabled FROM lb_rules WHERE caddy_id='lb_vanish'`).Scan(&enabled); err != nil {
+		t.Fatalf("read rule: %v", err)
+	}
+	if !enabled {
+		t.Fatal("0 行更新不得落成禁用态")
+	}
+}

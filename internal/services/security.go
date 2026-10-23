@@ -145,6 +145,9 @@ func geoipCountries(p *models.SecurityPolicy) []string {
 // be "off" (the persisted off-state; countries are retained, not cleared) and
 // the country list must be non-empty. Gates caddygeoip handler insertion.
 func PolicyHasGeoIP(p *models.SecurityPolicy) bool {
+	if p == nil {
+		return false
+	}
 	return p.GeoIPMode != "off" && len(geoipCountries(p)) > 0
 }
 

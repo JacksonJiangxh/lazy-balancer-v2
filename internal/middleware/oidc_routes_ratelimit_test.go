@@ -12,7 +12,7 @@ import (
 func TestSetupRouter_oidcStatusRouteRateLimited(t *testing.T) {
 	// Given
 	router := newMiddlewareTestRouter(t)
-	resetLoginRateBuckets(t)
+	withIsolatedRateLimitBuckets(t)
 
 	// When：连续 61 次 OIDC 状态查询
 	var last *httptest.ResponseRecorder
@@ -42,7 +42,7 @@ func TestSetupRouter_oidcStatusRouteRateLimited(t *testing.T) {
 func TestSetupRouter_oidcLoginRouteRateLimited(t *testing.T) {
 	// Given
 	router := newMiddlewareTestRouter(t)
-	resetLoginRateBuckets(t)
+	withIsolatedRateLimitBuckets(t)
 
 	// When：连续 11 次 OIDC 登录跳转请求
 	var last *httptest.ResponseRecorder

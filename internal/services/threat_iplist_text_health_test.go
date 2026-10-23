@@ -33,8 +33,13 @@ func TestReadThreatIplistPath_corruptTextFallsBackToFast(t *testing.T) {
 		if err != nil {
 			t.Fatalf("读取失败: %v", err)
 		}
-		if len(vals) != 2 {
-			t.Fatalf("损坏文本必须回退 .fast（2 条），got %v", vals)
+		// 必须比对条目值集合——只比条数时返回任意两条（含乱码行）都会通过。
+		gotSet := map[string]bool{}
+		for _, v := range vals {
+			gotSet[v] = true
+		}
+		if len(vals) != 2 || !gotSet["203.0.113.0/24"] || !gotSet["198.51.100.0/24"] {
+			t.Fatalf("损坏文本必须回退 .fast 的条目集合（不混入坏行），got %v", vals)
 		}
 	})
 

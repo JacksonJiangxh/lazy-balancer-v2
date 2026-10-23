@@ -92,9 +92,7 @@ func TestRuleTriggeredMultiFilterSQL_partialFamilyPrefix(t *testing.T) {
 // 源，总览判「其他」）不得被 LIKE 前缀误并入。以真实 SQLite 判定生成的条件
 // 实际命中哪些 ID。
 func TestRuleTriggeredFilterSQL_customRuleFamilyMatchesCategorizeAttackScope(t *testing.T) {
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
+	setupSecurityPolicyTestDB(t)
 	if _, err := db.DB.Exec(`CREATE TABLE rule_triggered_family_probe (rule_triggered TEXT)`); err != nil {
 		t.Fatal(err)
 	}
@@ -143,9 +141,7 @@ func TestRuleTriggeredFilterSQL_customRuleFamilyMatchesCategorizeAttackScope(t *
 // = [810000,900000)。两者以互斥 6 位 GLOB 表达，且均不得落入「WAF 规则
 // （CRS）」family（CRS 规则 ID 恒 9xxxxx）。
 func TestRuleTriggeredFilterSQL_geoipPrecheckSegmentFamily(t *testing.T) {
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
+	setupSecurityPolicyTestDB(t)
 	if _, err := db.DB.Exec(`CREATE TABLE rule_triggered_geoip_probe (rule_triggered TEXT)`); err != nil {
 		t.Fatal(err)
 	}

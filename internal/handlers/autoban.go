@@ -84,7 +84,7 @@ func (h *Handlers) GetAutobanStatus(c *gin.Context) {
 	cfg := services.GetAutobanConfig()
 	entries, listID, err := services.AutobanListEntries()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取自动封禁名单失败: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: serverErrMsg("读取自动封禁名单失败", err)})
 		return
 	}
 	preset := autobanPresetListState{id: listID, entries: entries}

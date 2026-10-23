@@ -42,12 +42,6 @@
           </el-select>
           <span class="form-tip-inline">系统默认使用的证书签发机构</span>
         </el-form-item>
-        <el-form-item label="DNS 提供商">
-          <el-select v-model="global.dns_provider" style="width: 240px;" placeholder="请选择 DNS 提供商">
-            <el-option label="DNSPod" value="dnspod" />
-          </el-select>
-          <span class="form-tip-inline">全局默认 DNS 提供商，创建规则时默认使用</span>
-        </el-form-item>
           <el-form-item>
             <el-button type="primary" :loading="savingGlobal" :disabled="isReadOnly || !props.configLoaded" @click="handleSave">
               <el-icon><Check /></el-icon>
@@ -748,6 +742,9 @@ const handleSave = async () => {
       cert_renewal_days: global.value.cert_renewal_days,
       cert_renewal_attempts: global.value.cert_renewal_attempts,
       default_ca_provider_id: global.value.default_ca_provider_id,
+      // 全局 dns_provider 已无消费者（签发链按证书配置行读取 provider；新建 DNS
+      // 配置取 /dns-providers 首项），UI 入口已移除。键仍按库值回传：保存载荷
+      // 若省略该键，/config 的写入语义会把它当成「未提供」而静默改写存量列。
       dns_provider: global.value.dns_provider || 'dnspod',
       source: 'acme',
     }

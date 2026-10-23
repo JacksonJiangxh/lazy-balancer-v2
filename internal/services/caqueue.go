@@ -438,8 +438,13 @@ func (m *CAQueueManager) PauseAndDrain() bool {
 	m.mu.Unlock()
 
 	drained := true
+	// 截止时间在所有队列间**共享**（与 CancelJobsForRule、部署回调暂停同构）：
+	// 逐队列各自等 caQueueDrainTimeout 会让 N 个 provider 的最坏等待变成
+	// N×30s，而配置导入在取 caddyOpMu 之前调用本函数，该窗口内全部配置写
+	// 请求排队。共享截止下总等待预算恒为一个 caQueueDrainTimeout。
+	drainDeadline := time.Now().Add(caQueueDrainTimeout)
 	for _, q := range queues {
-		if !q.wait() {
+		if !q.wait(drainDeadline) {
 			drained = false
 		}
 	}
@@ -934,7 +939,7 @@ func certJobDeploymentOnly(jobID int) bool {
 		Scan(&status, &certPEM, &keyPEM); err != nil {
 		return false
 	}
-	return strings.TrimSpace(certPEM) != "" && strings.TrimSpace(keyPEM) != "" && JobLifecycle(status) == JobLifecycleDownloaded
+	return JobLifecycle(status) == JobLifecycleDownloaded && CertJobMaterialUsable(status, certPEM, keyPEM)
 }
 
 // errCAQueueInactive 标记补偿重排队时队列未激活/已暂停。任务按分支语义保留：
@@ -1423,20 +1428,27 @@ func (q *caQueue) stop() {
 	close(q.stopCh)
 }
 
-func (q *caQueue) wait() bool {
+func (q *caQueue) wait(deadline time.Time) bool {
 	<-q.loopDone
-	// executions.Wait 必须套 30s 上限：issuer 异常不响应 ctx 取消时 Wait 永不返回，
-	// PauseAndDrain/进程 Stop 会被永久挂起（与 CancelJob 同口径）。
+	// executions.Wait 必须套上限：issuer 异常不响应 ctx 取消时 Wait 永不返回，
+	// PauseAndDrain/进程 Stop 会被永久挂起（与 CancelJob 同口径）。上限由
+	// 调用方以共享截止时间传入——多队列串行等待不得各自重新计时。
 	done := make(chan struct{})
 	go func() {
 		q.executions.Wait()
 		close(done)
 	}()
+	remaining := time.Until(deadline)
+	if remaining < 0 {
+		remaining = 0
+	}
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
 	select {
 	case <-done:
 		return true
-	case <-time.After(caQueueDrainTimeout):
-		Logf("warn", "CA 队列暂停：等待在途执行退出超时（%s），继续关闭流程", caQueueDrainTimeout)
+	case <-timer.C:
+		Logf("warn", "CA 队列暂停：等待在途执行退出超时（共享截止），继续关闭流程")
 		return false
 	}
 }
@@ -1452,7 +1464,7 @@ func requeueCanceledJob(jobID int) {
 	// 「材料已落库、只差部署」，漏收敛会把它们打回 queued 重签烧 CA 配额。
 	var status, certPEM, keyPEM string
 	if err := db.DB.QueryRow("SELECT status, COALESCE(cert_pem,''), COALESCE(key_pem,'') FROM cert_jobs WHERE id=?", jobID).Scan(&status, &certPEM, &keyPEM); err == nil {
-		if certPEM != "" && keyPEM != "" && JobLifecycle(status) == JobLifecycleDownloaded {
+		if JobLifecycle(status) == JobLifecycleDownloaded && CertJobMaterialUsable(status, certPEM, keyPEM) {
 			// updated_at 与部署窗口同写：重试冷却门以 updated_at 为计时基准
 			// （同口径见 handlers/certjobs.go 的部署重排写点）。
 			if _, err := db.DB.Exec("UPDATE cert_jobs SET deployment_available_after=datetime('now'), message='节点生命周期切换，等待恢复部署', updated_at=datetime('now') WHERE id=? AND status=?", jobID, status); err != nil {
@@ -1672,7 +1684,7 @@ func deferDeploymentForMaterialBearingJob(jobID int, logCode, message string) bo
 		Scan(&status, &certPEM, &keyPEM); err != nil {
 		return false
 	}
-	if strings.TrimSpace(certPEM) == "" || strings.TrimSpace(keyPEM) == "" || JobLifecycle(status) != JobLifecycleDownloaded {
+	if JobLifecycle(status) != JobLifecycleDownloaded || !CertJobMaterialUsable(status, certPEM, keyPEM) {
 		return false
 	}
 	message = truncateJobMessage(message)

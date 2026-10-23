@@ -91,9 +91,10 @@ func TestRetryCertJob_downloadedJobWithoutMaterialStillRequeues(t *testing.T) {
 	if !strings.Contains(response.Body.String(), "Retry triggered") {
 		t.Fatalf("body=%s, want 重新入队语义", response.Body.String())
 	}
-	// 不校验 DB 终态：队列管理器可能在响应后毫秒级消费任务并推进/打回
-	// （与 task_certjob_trigger 测试同口径）——「未走部署快速路径」由响应
-	// 文案（Retry triggered 而非 Deployment retry triggered）确定。
+	// 已知覆盖缺口：不校验 DB 终态——队列管理器可能在响应后毫秒级消费任务并
+	// 推进/打回（与 task_certjob_trigger 测试同口径）。「未走部署快速路径」仅由
+	// 响应文案（Retry triggered 而非 Deployment retry triggered）确定；DB 侧
+	// 断言由 acme_regression_01 的队列执行用例与 certjobs 部署生命周期用例承载。
 }
 
 // Given：证书服务已停止，downloaded 任务仍满足部署重排的 DB 条件。

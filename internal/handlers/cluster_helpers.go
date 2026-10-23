@@ -33,6 +33,13 @@ func requireMasterResult(c *gin.Context, isMaster bool, err error, options maste
 }
 
 func (h *Handlers) requireMaster(c *gin.Context) bool {
+	// 装配缺失 fail-closed：同族端点（Pull/ForgetPins/mode/sync）对未初始化的
+	// 集群服务统一 503；此处单点守卫覆盖全部 requireMaster 调用方，避免 nil
+	// 解引用走 Gin recovery 变成空体 500（无法与真实内部故障区分）。
+	if h.clusterService == nil {
+		clusterError(c, http.StatusServiceUnavailable, "集群服务未初始化", nil)
+		return false
+	}
 	isMaster, err := h.clusterService.IsMaster(c.Request.Context())
 	return requireMasterResult(c, isMaster, err, masterGateOptions{
 		queryFailure: "读取节点模式失败",

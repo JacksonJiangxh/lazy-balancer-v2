@@ -153,32 +153,11 @@ func ResetCRSUpdateManagerForTest() {
 // 直到调度器下一次小时级 tick 预写才有值（手动更新成功也不写，见 run()
 // 成功分支的补齐）。
 func SetCRSAutoUpdate(enabled bool) error {
-	if _, err := db.DB.Exec(
-		"INSERT OR IGNORE INTO security_crs_version (id, version, auto_update) VALUES (1, ?, ?)",
-		CRSBundledVersion, enabled,
-	); err != nil {
-		return fmt.Errorf("初始化 CRS 版本记录: %w", err)
-	}
-	nextUpdate := ""
-	if enabled {
-		nextUpdate = versionTableNextSlot("security_crs_version", time.Now().UTC())
-	}
-	// 2026-09-25 用户裁定：失败退避机制撤除——开启重排一律写下一排程槽，
-	// 失败行不再保留退避点（重试在任务内完成）；关闭仍无条件清空。
-	if _, err := db.DB.Exec("UPDATE security_crs_version SET auto_update=?, next_update=CASE WHEN ? THEN ? ELSE '' END WHERE id=1", enabled, enabled, nextUpdate); err != nil {
-		return fmt.Errorf("更新 CRS 自动更新开关: %w", err)
-	}
-	syncTaskLoop("crs", enabled)
-	return nil
+	return setVersionTableAutoUpdate("security_crs_version", "CRS", CRSBundledVersion, "crs", enabled)
 }
 
 func ensureCRSVersionRow() {
-	if _, err := db.DB.Exec(
-		"INSERT OR IGNORE INTO security_crs_version (id, version, auto_update) VALUES (1, ?, TRUE)",
-		CRSBundledVersion,
-	); err != nil {
-		Logf("error", "crs update: failed to ensure version row: %v", err)
-	}
+	ensureVersionTableRow("security_crs_version", CRSBundledVersion, "crs update")
 }
 
 // CurrentCRSVersionForLog 面向日志的当前 CRS 版本（main 载入摘要行消费）。

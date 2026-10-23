@@ -94,9 +94,9 @@ func TestAutobanDisableFlush_capacityEvictionLeavesWarnAndAudit(t *testing.T) {
 	// 带外超限形态：3 条自动条目（容量=2）→ 禁用收尾 merge 挤出 1 条。
 	expires := "2026-10-14 11:00:00"
 	seeded := []models.IPListEntry{
-		{Value: "198.51.100.1", Remark: AutobanEntryRemark, CreatedAt: "2026-10-14 09:00:00", ExpiresAt: expires},
-		{Value: "198.51.100.2", Remark: AutobanEntryRemark, CreatedAt: "2026-10-14 09:01:00", ExpiresAt: expires},
-		{Value: "198.51.100.3", Remark: AutobanEntryRemark, CreatedAt: "2026-10-14 09:02:00", ExpiresAt: expires},
+		{Value: "198.51.100.1", Remark: autobanEntryRemark, CreatedAt: "2026-10-14 09:00:00", ExpiresAt: expires},
+		{Value: "198.51.100.2", Remark: autobanEntryRemark, CreatedAt: "2026-10-14 09:01:00", ExpiresAt: expires},
+		{Value: "198.51.100.3", Remark: autobanEntryRemark, CreatedAt: "2026-10-14 09:02:00", ExpiresAt: expires},
 	}
 	raw, err := json.Marshal(seeded)
 	if err != nil {

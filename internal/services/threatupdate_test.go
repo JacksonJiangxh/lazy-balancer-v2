@@ -1220,6 +1220,57 @@ func TestThreatStartUpdate_registersCancelBeforeReturn(t *testing.T) {
 	}
 }
 
+// RunUpdate（生产同步入口）同样必须在进入管线前登记可取消 ctx：任务引擎的
+// CancelHook 读到 running+runCancel 组合，缺一即「取消不可用/取消错轮」。
+func TestThreatRunUpdate_registersCancelBeforePipeline(t *testing.T) {
+	overrideWafDirForTest(t)
+	newClusterTestService(t)
+	setupThreatTest(t, nil, nil, nil)
+	started := make(chan struct{}, 1)
+	blocked := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-r.Context().Done() // 下载在途：只有取消能结束
+	}))
+	t.Cleanup(blocked.Close)
+	for _, name := range []string{"ustc", "firehol_l1", "et_compromised"} {
+		if _, err := db.DB.Exec(`UPDATE security_threat_sources SET url=? WHERE name=?`, blocked.URL, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	m := GetThreatUpdateManager()
+	errCh := make(chan error, 1)
+	go func() { errCh <- m.RunUpdate("manual", nil) }()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("下载未在 5s 内启动")
+	}
+	m.mu.Lock()
+	cancelRegistered := m.runCancel != nil
+	m.mu.Unlock()
+	if !cancelRegistered {
+		t.Fatal("RunUpdate 进入管线时 runCancel 未登记（取消将静默失效）")
+	}
+	if !m.CancelRunning() {
+		t.Fatal("RunUpdate 在途时 CancelRunning 必须命中本轮")
+	}
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("取消后 RunUpdate 应正常返回（参与方取消非错误），err=%v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("取消后运行未退出")
+	}
+	if got := m.StatusSnapshot().Outcome; got != "cancelled" {
+		t.Fatalf("终态=%q, want cancelled", got)
+	}
+}
+
 // 快速路径（raw_hash 一致）的内置名单存在性判定必须限定 system=1：
 // 同名用户自建列表（system=0）不得抑制内置行穿透补建——否则引用旧 id 的
 // 策略漏拦且无任何告警，直到上游内容变化才自愈。

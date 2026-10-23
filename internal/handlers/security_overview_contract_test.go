@@ -117,8 +117,23 @@ func TestListSecurityEvents_masksThirdPartyCredentialHeaders(t *testing.T) {
 			t.Fatalf("凭据头原文泄露 (%s): %s", secret, got)
 		}
 	}
-	if !strings.Contains(got, "X-Request-ID") {
-		t.Fatalf("非敏感头名必须保留: %s", got)
+	// 只断言「原文不出现」会放过「键被整体丢弃」：前端需要头名与掩码值。
+	var masked map[string]any
+	if err := json.Unmarshal([]byte(got), &masked); err != nil {
+		t.Fatalf("request_headers 需为 JSON 对象: %v (%s)", err, got)
+	}
+	for _, name := range []string{"X-Api-Key", "X-Auth-Token", "X-Csrf-Token", "X-Forwarded-Access-Token", "X-Amz-Security-Token"} {
+		raw, present := masked[name]
+		if !present {
+			t.Fatalf("凭据头 %s 的键被丢弃（保留键名+掩码值）: %s", name, got)
+		}
+		values, ok := raw.([]any)
+		if !ok || len(values) != 1 || values[0] != "••••••" {
+			t.Fatalf("凭据头 %s 掩码形态=%v, want [\"••••••\"]", name, raw)
+		}
+	}
+	if value, ok := masked["X-Request-ID"]; !ok || value != "ok" {
+		t.Fatalf("非敏感头必须原样保留: %v (%s)", masked["X-Request-ID"], got)
 	}
 }
 

@@ -916,6 +916,18 @@ const flowTask = usePollingTask(async ({ signal, isCurrent }) => {
 
 // ============ 引擎装载（与配置并行，import 失败可重试） ============
 const engineError = ref(false)
+// 引擎未就绪（装载失败/尚未装载成功）时两条光流没有消费方：游标不能推进，
+// 轮询会每秒重复拉取同一批 backlog（各最多 1000 条）。装载失败即暂停，
+// 成功装载/恢复可见/取消手动暂停时按引擎状态恢复。
+function pauseFlowStreamsForEngine(): void {
+  attackFlowTask.pause()
+  flowTask.pause()
+}
+function resumeFlowStreamsForEngine(): void {
+  if (engineError.value || !threatMap || paused.value || screenHidden) return
+  attackFlowTask.resume()
+  flowTask.resume()
+}
 let mountedMode: 'map' | 'globe' | null = null
 let engineMounting = false
 let remountRequested = false
@@ -969,12 +981,16 @@ async function mountEngine(): Promise<void> {
     }
     applyMapPause()
     if (siteConfigured.value) engine.setServer([serverLatLon[1], serverLatLon[0]])
+    // 引擎就绪：恢复因装载期间/失败而暂停的两条光流（手动暂停/页面隐藏时不恢复）。
+    resumeFlowStreamsForEngine()
   } catch (error: unknown) {
     // 动态 chunk 404（发布中途旧页面）/网络失败：显性错误态 + 重试入口，
     // 数据轮询不受影响。
     console.error('threat screen engine load failed', error)
     engineError.value = true
     mountedMode = null
+    // 无引擎则光流无消费方——暂停轮询，避免每秒重复拉同一批 backlog。
+    pauseFlowStreamsForEngine()
   } finally {
     engineMounting = false
     if (remountRequested && !disposed) {
@@ -1012,10 +1028,10 @@ function togglePause(): void {
     trafficBaseline = null
     feedTask.resume()
     toastTask.resume()
-    attackFlowTask.resume()
     statsTask.resume()
     trafficTask.resume()
-    flowTask.resume()
+    // 引擎装载失败期间光流保持暂停（恢复后也不空转）；正常时恢复轮询。
+    resumeFlowStreamsForEngine()
     acquireCollector()
   }
   applyMapPause()
@@ -1096,6 +1112,9 @@ const screenLoop = createVisibilityIntervals({
     toastInitialized = false
     toastLastPollAt = 0
     applyMapPause()
+    // 引擎失败期间光流被暂停（visibility 监听已摘除），恢复可见时按引擎状态恢复；
+    // 引擎正常时与 polling composable 的可见性恢复同路径，run 去重不重复执行。
+    resumeFlowStreamsForEngine()
   },
 })
 

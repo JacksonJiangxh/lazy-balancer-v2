@@ -1,16 +1,23 @@
 package handlers
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"lazy-balancer-v2/internal/config"
+	"lazy-balancer-v2/internal/services"
 )
 
 // 启动竞态修复测试夹具：临时监督器 pid 标记 + 临时回放标记路径
 // + 短超时——与 caddy_test.go 监督器委托测试同注入缝模式（包级 var）。
-// supervisorAlive=true 形态以本测试进程 pid 冒充监督器（存活、状态非 Z，
-// caddyProcRoot 保持真 /proc）。
+// supervisorAlive=true 形态用**伪 /proc**（caddyProcRoot 指向 t.TempDir()，
+// seedProcStat 种入固定 pid 12345，存活、状态非 Z）冒充监督器——不读真
+// /proc，也不占用本测试进程 pid。
 func setupStartupReplayFixture(t *testing.T, supervisorUp bool) string {
 	t.Helper()
 	oldPid, oldMarker, oldTimeout, oldProc := caddySupervisorPidFile, caddyStartupReplayMarkerFile, startupReplayWaitTimeout, caddyProcRoot
@@ -92,5 +99,51 @@ func TestWaitStartupReplayDone_timesOutAndProceeds(t *testing.T) {
 	waitStartupReplayDone()
 	if elapsed := time.Since(start); elapsed < 1500*time.Millisecond {
 		t.Fatalf("应等满超时（%s）再放行，实际 %s 即返回", startupReplayWaitTimeout, elapsed)
+	}
+}
+
+// 生产调用点钉测：ApplyConfigOnStartup 必须等到回放标记才应用配置——
+// 只测 waitStartupReplayDone 无法发现调用点被删/移位。标记延迟落盘期间
+// 采样 /load 次数为 0，落盘后才 >0。
+func TestApplyConfigOnStartup_waitsForReplayMarkerBeforeApplying(t *testing.T) {
+	markerFile := setupStartupReplayFixture(t, true)
+
+	var loads int32
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/load" {
+			atomic.AddInt32(&loads, 1)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(fake.Close)
+	h := newBackupTestHandlers(t)
+	h.cfg = &config.Config{CaddyAdminURL: fake.URL}
+	h.caddyService = services.NewCaddyService(fake.URL)
+
+	done := make(chan error, 1)
+	go func() { done <- h.ApplyConfigOnStartup("") }()
+
+	// 标记未落盘：应用必须仍在等待（零 /load）。
+	time.Sleep(300 * time.Millisecond)
+	if got := atomic.LoadInt32(&loads); got != 0 {
+		t.Fatalf("回放标记缺失期间 /load=%d, want 0（应用不得先于监督器回放）", got)
+	}
+
+	if err := os.WriteFile(markerFile, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ApplyConfigOnStartup: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("标记落盘后应用仍未返回")
+	}
+	if got := atomic.LoadInt32(&loads); got == 0 {
+		t.Fatal("标记落盘后必须实际应用配置（/load > 0）")
 	}
 }

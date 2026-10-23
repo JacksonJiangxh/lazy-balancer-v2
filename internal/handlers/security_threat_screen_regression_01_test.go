@@ -134,6 +134,11 @@ func TestThreatRollup_geoGenerationPreservesTrimmedMinutes(t *testing.T) {
 	if _, err := db.MetricsDB.Exec(`DELETE FROM security_events`); err != nil {
 		t.Fatal(err)
 	}
+	// 未固化旧分钟：11:40 在首次固化的覆盖区间内（按空分钟推进过去），
+	// 之后才到的原始事件常规轮次不会重扫。代际变化必须把窗口按空覆盖重固，
+	// 从而把它纳入——没有这条，只有「11:50 保留」无法区分「真的重固了」与
+	// 「根本没重固、旧行原样躺着」。
+	seedThreatScreenEvent(t, "2026-10-18 11:40:10", "93.184.216.9", "942100", "SQL Injection", "blocked")
 	if _, err := db.MetricsDB.Exec(`UPDATE metrics_state SET value='999999' WHERE key=?`, threatRollupGeoIPGenerationKey); err != nil {
 		t.Fatal(err)
 	}
@@ -142,6 +147,9 @@ func TestThreatRollup_geoGenerationPreservesTrimmedMinutes(t *testing.T) {
 	}
 	if got := threatRollupCountForMinute(t, "2026-10-18 11:50"); got != 1 {
 		t.Fatalf("trimmed minute count=%d after refix, want preserved 1", got)
+	}
+	if got := threatRollupCountForMinute(t, "2026-10-18 11:40"); got != 1 {
+		t.Fatalf("late unfixed minute count=%d after geo generation refix, want 1（窗口必须按空覆盖重固）", got)
 	}
 }
 

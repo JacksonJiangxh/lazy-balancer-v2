@@ -369,8 +369,9 @@ func run() error {
 }
 
 // newAdminHTTPServer 统一面板 HTTP 超时。请求头仍保持 10s 慢头护栏；
-// 48MB 导入与含 CRS/IP2Region 的大备份下载需要分钟级正文读写预算，
-// 不再沿用 30s/60s 的绝对截止。
+// 大体积备份导入/导出（上限由 handlers.maxConfigImportBytes 定义，不在本文件
+// 重复数字）与含 CRS/IP2Region 的大备份下载需要分钟级正文读写预算，不再沿用
+// 30s/60s 的绝对截止。
 func newAdminHTTPServer(addr string, handler http.Handler) *http.Server {
 	return &http.Server{
 		Addr:              addr,

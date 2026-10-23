@@ -130,6 +130,7 @@ func TestClusterMachineEndpoints_rateLimitBeforeAuthentication(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			withIsolatedRateLimitBuckets(t)
 			router := newMiddlewareTestRouter(t)
 			// When：同一 IP 连续 30 次无效认证仍按原契约返回 401。
 			for attempt := 1; attempt <= 30; attempt++ {
@@ -156,38 +157,46 @@ func TestClusterMachineEndpoints_rateLimitBeforeAuthentication(t *testing.T) {
 }
 
 func TestClusterMachineRateLimit_validResponsesDoNotConsumeFailureBudget(t *testing.T) {
-	// Given：六个经同一 NAT 出口的合法节点，各自每 10 秒一次同步（36 请求/分钟）。
+	// Given：单个合法凭证经同一出口连续 31 次成功——必须跨越凭证桶上限
+	// （credentialLimit=30），否则「成功不耗预算」的回滚分支永远打不到；
+	// 同出口第二个凭证在同窗口内仍可同步（IP 宽桶未被成功流量消耗）。
+	withIsolatedRateLimitBuckets(t)
 	database, firstToken := newClusterAuthContractDatabase(t)
-	tokens := []string{firstToken}
-	for index := 1; index < 6; index++ {
-		token := fmt.Sprintf("cluster-contract-token-%d", index)
-		hash := sha256.Sum256([]byte(token))
-		if _, err := database.Exec(`INSERT INTO nodes (id,cluster_token_hash,is_approved) VALUES (?,?,1)`, 7+index, hex.EncodeToString(hash[:])); err != nil {
-			t.Fatal(err)
-		}
-		tokens = append(tokens, token)
+	secondToken := "cluster-contract-token-valid-second"
+	hash := sha256.Sum256([]byte(secondToken))
+	if _, err := database.Exec(`INSERT INTO nodes (id,cluster_token_hash,is_approved) VALUES (?,?,1)`, 99, hex.EncodeToString(hash[:])); err != nil {
+		t.Fatal(err)
 	}
 	router := gin.New()
 	router.Use(clusterMachineRateLimit("valid-nat-traffic", clusterCredentialFromToken))
 	router.Use(clusterTokenAuth(database))
 	router.GET("/cluster", func(c *gin.Context) { c.Status(http.StatusNoContent) })
 
-	// When / Then：成功请求不得消耗认证失败配额，第 31-36 次也不能 429。
-	for attempt := range 36 {
+	// When / Then：成功请求不得消耗配额，第 31 次同一凭证仍 204。
+	for attempt := range 31 {
 		request := httptest.NewRequest(http.MethodGet, "/cluster", nil)
 		request.RemoteAddr = "198.51.100.60:1234"
-		request.Header.Set("X-Cluster-Token", tokens[attempt%len(tokens)])
+		request.Header.Set("X-Cluster-Token", firstToken)
 		response := httptest.NewRecorder()
 		router.ServeHTTP(response, request)
 		if response.Code != http.StatusNoContent {
-			t.Fatalf("attempt %d status=%d body=%s, want valid NAT traffic 204", attempt+1, response.Code, response.Body.String())
+			t.Fatalf("attempt %d status=%d body=%s, want 204（成功轮必须回滚凭证预算）", attempt+1, response.Code, response.Body.String())
 		}
+	}
+	request := httptest.NewRequest(http.MethodGet, "/cluster", nil)
+	request.RemoteAddr = "198.51.100.60:1234"
+	request.Header.Set("X-Cluster-Token", secondToken)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("同出口第二凭证 status=%d body=%s, want 204（IP 宽桶不得被成功流量打满）", response.Code, response.Body.String())
 	}
 }
 
 func TestClusterMachineRateLimit_concurrentFailuresReserveAtomically(t *testing.T) {
 	// Given：同一凭证/IP 同时发起 100 个必然 401 的请求，计数进入认证桩的次数。
 	const scope = "concurrent-failure-reservation"
+	withIsolatedRateLimitBuckets(t)
 	var entered, rejected, throttled atomic.Int32
 	router := gin.New()
 	router.Use(clusterMachineRateLimit(scope, clusterCredentialFromToken))
@@ -221,6 +230,7 @@ func TestClusterMachineRateLimit_concurrentFailuresReserveAtomically(t *testing.
 
 func TestClusterMachineRateLimit_failureDoesNotBlockValidCredentialFromSameIP(t *testing.T) {
 	// Given：同一出口先出现 30 次同凭证失败，随后合法节点使用自己的凭证同步。
+	withIsolatedRateLimitBuckets(t)
 	database, validToken := newClusterAuthContractDatabase(t)
 	router := gin.New()
 	router.Use(clusterMachineRateLimit("mixed-credential-traffic", clusterCredentialFromToken))
@@ -265,6 +275,7 @@ func TestClusterMachineRateLimit_ignoresHeadersNotUsedByRouteAuth(t *testing.T) 
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			withIsolatedRateLimitBuckets(t)
 			router := newMiddlewareTestRouter(t)
 			stableAuthorization := "Bearer " + "invalid-stable-credential"
 			for attempt := 1; attempt <= 30; attempt++ {
@@ -296,22 +307,16 @@ func TestClusterMachineRateLimit_capacityFullEvictsLRUAndKeepsLimiting(t *testin
 	// Given：共享桶容量已满；合法节点的机器认证不得被误报为限流。
 	// 容量满不得 fail-open（不建桶=本分钟对该来源零限流）——
 	// 改为 LRU 淘汰最久未命中桶后照常预占。
+	withIsolatedRateLimitBuckets(t)
 	database, token := newClusterAuthContractDatabase(t)
-	loginRateBuckets.Lock()
-	savedEntries := loginRateBuckets.entries
-	loginRateBuckets.entries = make(map[string]*loginRateBucket)
 	now := time.Now()
-	for index := range 1024 {
+	loginRateBuckets.Lock()
+	for index := range rateLimitBucketCapacity {
 		bucket := &loginRateBucket{until: now.Add(time.Minute), count: 1}
 		bucket.lastUsed.Store(now.Add(time.Duration(index) * time.Millisecond).UnixNano())
 		loginRateBuckets.entries[fmt.Sprintf("machine-cap-%d", index)] = bucket
 	}
 	loginRateBuckets.Unlock()
-	t.Cleanup(func() {
-		loginRateBuckets.Lock()
-		loginRateBuckets.entries = savedEntries
-		loginRateBuckets.Unlock()
-	})
 	router := gin.New()
 	router.Use(clusterMachineRateLimit("capacity-full", clusterCredentialFromToken))
 	router.Use(clusterTokenAuth(database))

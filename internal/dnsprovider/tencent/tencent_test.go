@@ -62,12 +62,21 @@ type flakyRecordTransport struct {
 	failStatus int
 	failCount  int
 	attempts   int
+	// actionAttempts 按动作计数失败注入：跨动作共享一个计数器会让「先
+	// Present 再 CleanUp」的用例把 Create 的消耗算进 Delete 的失败注入，
+	// 429/5xx 重试实际一次都没触发而用例假绿。
+	actionAttempts map[string]int
 }
 
 func (transport *flakyRecordTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	action := request.Header.Get("X-TC-Action")
 	transport.mu.Lock()
 	transport.attempts++
-	failing := request.Header.Get("X-TC-Action") == transport.failAction && transport.attempts <= transport.failCount
+	if transport.actionAttempts == nil {
+		transport.actionAttempts = make(map[string]int)
+	}
+	transport.actionAttempts[action]++
+	failing := action == transport.failAction && transport.actionAttempts[action] <= transport.failCount
 	status := transport.failStatus
 	transport.mu.Unlock()
 	if failing {
@@ -230,6 +239,9 @@ func TestProvider_CleanUp_retries_transient_429(t *testing.T) {
 	}
 	transport.mu.Lock()
 	defer transport.mu.Unlock()
+	if got := transport.actionAttempts["DeleteRecord"]; got != 2 {
+		t.Fatalf("DeleteRecord attempts=%d, want 2（首次 429 + 重试成功）", got)
+	}
 	if len(transport.records) != 1 || transport.records[100] != "another-task" {
 		t.Fatalf("remaining records=%v, want only unrelated record", transport.records)
 	}
@@ -326,12 +338,19 @@ type slowFlakyTransport struct {
 	failCount  int
 	attempts   int
 	delay      time.Duration
+	// actionAttempts 同 flakyRecordTransport：失败注入必须按动作隔离。
+	actionAttempts map[string]int
 }
 
 func (transport *slowFlakyTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	action := request.Header.Get("X-TC-Action")
 	transport.mu.Lock()
 	transport.attempts++
-	failing := request.Header.Get("X-TC-Action") == transport.failAction && transport.attempts <= transport.failCount
+	if transport.actionAttempts == nil {
+		transport.actionAttempts = make(map[string]int)
+	}
+	transport.actionAttempts[action]++
+	failing := action == transport.failAction && transport.actionAttempts[action] <= transport.failCount
 	transport.mu.Unlock()
 	time.Sleep(transport.delay)
 	if failing {
@@ -375,8 +394,11 @@ func TestProvider_CleanUp_survives_slow_5xx_sequence(t *testing.T) {
 	}
 	transport.mu.Lock()
 	defer transport.mu.Unlock()
-	if transport.attempts != 3 {
-		t.Fatalf("attempts=%d, want 3", transport.attempts)
+	if transport.attempts != 4 {
+		t.Fatalf("total attempts=%d, want 4（Create 1 + Delete 3）", transport.attempts)
+	}
+	if got := transport.actionAttempts["DeleteRecord"]; got != 3 {
+		t.Fatalf("DeleteRecord attempts=%d, want 3（502,502,200 全部命中注入）", got)
 	}
 }
 

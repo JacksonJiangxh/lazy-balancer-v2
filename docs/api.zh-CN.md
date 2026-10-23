@@ -14,7 +14,7 @@
 | 方式 | Header | 说明 |
 |---|---|---|
 | JWT | `Authorization: Bearer <token>` | 登录 `/api/v1/auth/login` 获取 |
-| API Key | `X-API-Key: lb_sk_...` | 管理面板创建；非管理员 Key 强制只读 |
+| API Key | `X-API-Key: lb_sk_...` | 管理面板创建；非管理员 Key 默认只读（自助写除外：`PATCH /users/me`、`/users/me/api-keys` 系列） |
 
 ## 端点概览
 

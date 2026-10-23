@@ -52,6 +52,55 @@ func TestStage1PrecheckSegmentSQL_matchesGoPredicate(t *testing.T) {
 	}
 }
 
+// 真执行钉：把整段 Stage1PrecheckSegmentSQL 送进真实 SQLite 执行（不是子串
+// 形状断言）——删掉 LENGTH(rule_triggered)=6 后 '80'/'80000'/'8000000' 会落进
+// 阶段 1 段，逐值对账即刻失败。同时显式断言 6 位防护子串仍在。
+func TestStage1PrecheckSegmentSQL_executesAgainstSQLite(t *testing.T) {
+	if !strings.Contains(Stage1PrecheckSegmentSQL, "LENGTH(rule_triggered)=6") {
+		t.Fatalf("段谓词缺少 6 位长度防护：%s", Stage1PrecheckSegmentSQL)
+	}
+	_, database := newClusterTestService(t)
+	if _, err := database.Exec(`CREATE TABLE stage1_probe (rule_triggered TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	values := []string{
+		// 固定族（含防御性 3/5/12）与近邻非成员
+		"2", "3", "4", "5", "7", "8", "12", "14", "1", "6", "9", "10", "11", "13", "15",
+		// GeoIP 段界内/外 + 短文本/超长文本（长度防护）
+		"800000", "800001", "899999", "900000", "80", "80000", "8000000", "",
+	}
+	for _, v := range values {
+		if _, err := database.Exec(`INSERT INTO stage1_probe (rule_triggered) VALUES (?)`, v); err != nil {
+			t.Fatalf("insert %q: %v", v, err)
+		}
+	}
+	rows, err := database.Query(`SELECT rule_triggered FROM stage1_probe WHERE ` + Stage1PrecheckSegmentSQL)
+	if err != nil {
+		t.Fatalf("阶段 1 段谓词在 SQLite 执行失败: %v", err)
+	}
+	defer rows.Close()
+	got := map[string]bool{}
+	for rows.Next() {
+		var v string
+		if err := rows.Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		got[v] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range values {
+		want := false
+		if n, convErr := strconv.Atoi(v); convErr == nil {
+			want = IsStage1PrecheckEventID(n)
+		}
+		if got[v] != want {
+			t.Fatalf("值 %q 在段谓词中命中=%v, want %v（SQL 与 Go 谓词分叉）", v, got[v], want)
+		}
+	}
+}
+
 // 三集合对账：事件分段耗时选值谓词 securityEventsIsPrecheckRule 必须与
 // IsStage1PrecheckID/Stage1PrecheckIDSQLList 同集合——第三处字面量漏改
 // （新增/删除预检 id 时）即在此失败。

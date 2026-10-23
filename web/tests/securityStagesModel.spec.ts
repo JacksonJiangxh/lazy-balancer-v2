@@ -10,12 +10,15 @@ import assert from 'node:assert/strict'
 
 import {
   aclAssociateSides,
+  blockPageStageCanIntercept,
   buildStageModel,
   entryMatchesIp,
   eventDetailRefIds,
   formatAclModeDetail,
   hasIPACLControl,
   inferPolicyType,
+  isTrustExemptionCandidate,
+  trustHitMode,
   type SecurityStageBinding,
   type SecurityStageBlockPage,
   type SecurityStagePolicy,
@@ -200,3 +203,69 @@ test('ACL 摘要：有名单但模式为空/未知时显示「未配置模式」
     '黑名单模式 · 2 条（名单 1 + 独立 1）',
   )
 })
+
+test('白名单空生效集必须显性警示「将拒绝所有请求」', () => {
+  // 引擎 allow 空集发射否定算子＝恒拒（带外直写/旧快照可达）
+  assert.equal(formatAclModeDetail([], { ip_acl_mode: 'allow', ip_acl_list: '[]', ip_blacklist: '[]' }), '白名单模式 · 0 条（将拒绝所有请求）')
+  // 有条目/其他模式不追加警示（回归形状）
+  assert.equal(formatAclModeDetail([], { ip_acl_mode: 'allow', ip_acl_list: '["1.1.1.1"]' }), '白名单模式 · 1 条')
+  assert.equal(formatAclModeDetail([], { ip_acl_mode: 'deny', ip_acl_list: '[]' }), '黑名单模式 · 0 条')
+})
+
+test('阶段可拦截能力门：stage3 关模式/检测无 block 规则、stage1 无能力均不得宣称生效', () => {
+  // 阶段 2 恒可（429 归因另由绑定链限流门控）
+  assert.equal(blockPageStageCanIntercept({ stage: 2 }), true)
+  // 阶段 3：off 恒 false；blocking 恒 true；detection/custom_only 仅 block 自定义规则
+  assert.equal(blockPageStageCanIntercept({ stage: 3, mode: 'off', hasBlockingCustomRule: true }), false)
+  assert.equal(blockPageStageCanIntercept({ stage: 3, mode: 'blocking' }), true)
+  assert.equal(blockPageStageCanIntercept({ stage: 3, mode: 'detection' }), false)
+  assert.equal(blockPageStageCanIntercept({ stage: 3, mode: 'detection', hasBlockingCustomRule: true }), true)
+  assert.equal(blockPageStageCanIntercept({ stage: 3, mode: 'custom_only' }), false)
+  assert.equal(blockPageStageCanIntercept({ stage: 3, mode: 'custom_only', hasBlockingCustomRule: true }), true)
+  // 阶段 1：ACL/独立黑名单/地域任一成立
+  assert.equal(blockPageStageCanIntercept({ stage: 1 }), false)
+  assert.equal(blockPageStageCanIntercept({ stage: 1, hasAclEntries: true }), true)
+  assert.equal(blockPageStageCanIntercept({ stage: 1, hasBlacklistEntries: true }), true)
+  assert.equal(blockPageStageCanIntercept({ stage: 1, hasGeoip: true }), true)
+})
+
+test('信任命中语义：非阶段 0 策略恒保留检测（与 trust_detection 无关）', () => {
+  assert.equal(trustHitMode('stage0', false), 'passthrough')
+  assert.equal(trustHitMode('stage0', true), 'detection')
+  assert.equal(trustHitMode('mixed', false), 'detection')
+  assert.equal(trustHitMode('stage1', false), 'detection')
+  // 类型缺省（精简载荷/旧摘要）回落旧口径
+  assert.equal(trustHitMode(undefined, false), 'passthrough')
+  assert.equal(trustHitMode(undefined, true), 'detection')
+})
+
+test('阶段 0 投影：非阶段 0 策略的存量信任显示保留检测', () => {
+  const mixed = policyOf({ policy_type: 'mixed', ip_whitelist: '["1.1.1.1"]', trust_detection: false })
+  const rows = stageRows(bindingOf(), mixed, [], 0)
+  assert.equal(rows.find((row) => row.label === '模式')?.detail, '保留检测记录（事件动作=检测）')
+  const stage0 = policyOf({ policy_type: 'stage0', ip_whitelist: '["1.1.1.1"]', trust_detection: false })
+  const stage0Rows = stageRows(bindingOf(), stage0, [], 0)
+  assert.equal(stage0Rows.find((row) => row.label === '模式')?.detail, '直通上游（不产生安全事件）')
+})
+
+test('豁免候选：非阶段 0 存量信任（trust_detection=false）参与归因，阶段 0 直通不参与', () => {
+  const base = { enabled: true, ip_whitelist_enabled: true }
+  assert.equal(isTrustExemptionCandidate({ ...base, policy_type: 'mixed', trust_detection: false }), true)
+  assert.equal(isTrustExemptionCandidate({ ...base, policy_type: 'stage0', trust_detection: false }), false)
+  assert.equal(isTrustExemptionCandidate({ ...base, policy_type: 'stage0', trust_detection: true }), true)
+  assert.equal(isTrustExemptionCandidate({ ...base, enabled: false, policy_type: 'mixed' }), false)
+})
+
+test('事件详情预取按类别/动作收窄：WAF 已拦截事件不取 ACL/信任引用', () => {
+  const own = { ip_acl_list_refs: '[1,2]', ip_whitelist_refs: '[3]' }
+  const others = [{ ip_whitelist_refs: '[4]' }]
+  // 省略 scope = 全集（既有调用口径不变）
+  assert.deepEqual(eventDetailRefIds(own, others), [1, 2, 3, 4])
+  // WAF 拦截事件：三类全关（只保留名单名称查询，不下载条目）
+  assert.deepEqual(eventDetailRefIds(own, others, { ownerAcl: false, ownerTrust: false, otherTrust: false }), [])
+  // IP 类拦截事件：仍需属主 ACL 条目，无需信任/跨策略豁免
+  assert.deepEqual(eventDetailRefIds(own, others, { ownerAcl: true, ownerTrust: false, otherTrust: false }), [1, 2])
+  // 未拦截事件的豁免归因：属主 + 他策略信任，不含属主 ACL
+  assert.deepEqual(eventDetailRefIds(own, others, { ownerAcl: false, ownerTrust: true, otherTrust: true }), [3, 4])
+})
+

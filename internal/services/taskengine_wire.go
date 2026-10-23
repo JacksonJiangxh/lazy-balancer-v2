@@ -171,9 +171,11 @@ func reconcileTaskEngineRoleFor(te *taskengine.Engine) {
 		Logf("warn", "任务引擎角色对账：旧拓扑记账清理失败（下一次角色翻转会重做）: %v", err)
 	}
 	te.SetRole(roleMaster)
-	// 方向性收尾与翻转路径同源：升主重建爬虫快照；切从恢复拉取调度。
+	// 方向性收尾与翻转路径同源：升主重建爬虫快照 + 任务面收尾（业务驱动
+	// 任务对齐 + 规则库首槽重装）；切从恢复拉取调度。
 	if roleMaster {
 		rebuildCrawlerSnapshotAfterPromote()
+		applyPromoteTaskSideEffects()
 		return
 	}
 	restoreClusterSyncSchedulingAfterDemote()
@@ -389,7 +391,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Description: "核对证书文件与数据库状态一致性，修复中断任务残留的中间态",
 		Category:    "证书", Kind: taskengine.KindPeriodic, RunsOn: taskengine.RoleMasterOnly,
 		IntervalFn: func() time.Duration { return 6 * time.Hour },
-		Run:        func(rc taskengine.RunContext) error { return CertReconcileOnce() },
+		Run:        func(rc taskengine.RunContext) error { return CertReconcileOnce(rc.Ctx) },
 	})
 
 	mustRegisterTask(te, taskengine.Descriptor{
@@ -883,6 +885,19 @@ func syncTaskLoop(id string, enabled bool) {
 	} else {
 		te.StopLoop(id)
 	}
+}
+
+// applyPromoteTaskSideEffects 升主后的任务面收尾单源（集群 Promote 与角色
+// 对账的升主分支共用）：
+//   - 按库实态统一对齐六个业务驱动任务的调度（开启启用、关闭停止）；
+//   - 补重装四个规则库首槽：从节点期间规则库更新任务由角色门停跑，版本行
+//     可能残留「auto_update 开、next_update 空」形态——不重装则 NextSlotFn
+//     永不到期，升主节点静默停更，只能靠重启恢复。
+//
+// 只在这一处增删收尾步骤：两条升主路径分头维护会漏项（对账升主曾漏掉两项）。
+func applyPromoteTaskSideEffects() {
+	SyncBusinessTaskDrivers()
+	RearmSecurityLibrarySlots()
 }
 
 // WakeCertWaitingCAForEnqueuedJob 已知任务入队成功时的唤醒。

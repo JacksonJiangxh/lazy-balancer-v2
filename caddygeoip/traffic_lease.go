@@ -179,6 +179,18 @@ func scheduleTrafficLeaseCleanupLocked() {
 	})
 }
 
+// writeTrafficCollectorState 输出采集器当前状态（enabled + 活跃租约数）。
+// 两个字段在同一把锁内取得（采集开关的全部写入路径都持该锁），否则并发
+// 申请/释放会让响应自相矛盾（enabled=true 而 leases=0），DELETE 也会把
+// 「仍有其他租约」谎报成关闭。
+func writeTrafficCollectorState(w http.ResponseWriter) {
+	trafficLeasesMu.Lock()
+	enabled := trafficCollectorEnabled.Load()
+	n := len(trafficLeases)
+	trafficLeasesMu.Unlock()
+	_, _ = w.Write([]byte(`{"enabled":` + strconv.FormatBool(enabled) + `,"leases":` + strconv.Itoa(n) + `}`))
+}
+
 // trafficLeaseRequest admin API 请求体。
 type trafficLeaseRequest struct {
 	LeaseID string `json:"lease_id"`
@@ -214,13 +226,10 @@ func serveTrafficCollector(w http.ResponseWriter, r *http.Request) error {
 			req.LeaseID = r.URL.Query().Get("lease_id")
 		}
 		releaseTrafficLease(req.LeaseID)
-		_, _ = w.Write([]byte(`{"enabled":false}`))
+		writeTrafficCollectorState(w)
 		return nil
 	case http.MethodGet:
-		trafficLeasesMu.Lock()
-		n := len(trafficLeases)
-		trafficLeasesMu.Unlock()
-		_, _ = w.Write([]byte(`{"enabled":` + strconv.FormatBool(trafficCollectorActive()) + `,"leases":` + strconv.Itoa(n) + `}`))
+		writeTrafficCollectorState(w)
 		return nil
 	default:
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)

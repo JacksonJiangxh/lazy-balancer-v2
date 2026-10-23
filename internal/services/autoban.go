@@ -53,8 +53,10 @@ const (
 	// autobanPresetListDescription 预置行描述（db 播种文案同字面值；描述禁改，
 	// 运行期自愈补建时须与播种一致）。
 	autobanPresetListDescription = "自动封禁命中 IP（自动封禁任务维护；可手动追加或删除条目）"
-	// AutobanEntryRemark 自动条目标记：merge 挤出与「今日封禁数」统计的唯一判据。
-	AutobanEntryRemark = "自动封禁"
+	// autobanEntryRemark 自动条目标记：merge 挤出与「今日封禁数」统计的唯一
+	// 判据。仅包内消费（跨包不得引用——地址列表页手动封禁/解封判定用
+	// AutobanManualUnbanRemark），导出会让读者误以为是跨包契约。
+	autobanEntryRemark = "自动封禁"
 	// AutobanManualUnbanRemark 手动追加条目的默认备注（地址列表页手动封禁）。
 	AutobanManualUnbanRemark = "手动封禁"
 	// AutobanAuditAction 封禁审计动作名（merge 写点与 AutobanBannedToday
@@ -256,14 +258,24 @@ func SetAutobanConfig(cfg AutobanConfig) error {
 
 // AutobanEnabled 业务开关（EnabledFn 数据源，fail-closed：读库失败=已停止）。
 func AutobanEnabled() bool {
+	enabled, known := autobanEnabledState()
+	return known && enabled
+}
+
+// autobanEnabledState 业务开关三态读取：known=false 表示启用状态不可判定
+// （DB 不可读/瞬断）。调度面（EnabledFn）用 AutobanEnabled 的二态 fail-closed
+// 口径；Run 体业务门必须区分「确认未启用」与「不可判定」——后者按失败落定
+// 且不得停环（瞬时读错误不得把已启用的任务永久停调度），与角色读取
+// （updateRunRole 三态）同口径。
+func autobanEnabledState() (enabled, known bool) {
 	if db.DB == nil {
-		return false
+		return false, false
 	}
 	var en int
 	if err := db.DB.QueryRow(`SELECT COALESCE(autoban_enabled,0) FROM global_config WHERE id=1`).Scan(&en); err != nil {
-		return false
+		return false, false
 	}
-	return en == 1
+	return en == 1, true
 }
 
 // ---- 计数器（固定窗口） ----
@@ -749,7 +761,7 @@ func autobanMergeEntries(cfg AutobanConfig, candidates []AutobanSuggestion) (aut
 		if _, exists := inList[c.IP]; exists {
 			continue
 		}
-		entry := models.IPListEntry{Value: c.IP, Remark: AutobanEntryRemark, CreatedAt: nowStr}
+		entry := models.IPListEntry{Value: c.IP, Remark: autobanEntryRemark, CreatedAt: nowStr}
 		if duration > 0 {
 			entry.ExpiresAt = now.Add(duration).Format(autobanTimeLayout)
 		}
@@ -773,7 +785,7 @@ func autobanMergeEntries(cfg AutobanConfig, candidates []AutobanSuggestion) (aut
 	}
 	evictQueue := make([]evictCandidate, 0, len(kept))
 	for i, e := range kept {
-		if e.Remark != AutobanEntryRemark {
+		if e.Remark != autobanEntryRemark {
 			continue
 		}
 		exp := parseAutobanEntryTime(e.ExpiresAt)
@@ -1105,7 +1117,13 @@ func RunAutobanCycle(rc taskengine.RunContext) error {
 	} else if !isMaster {
 		return taskengine.ErrTaskSkipped
 	}
-	if !AutobanEnabled() && !autobanRecheckEnabled() {
+	// 启用状态不可判定（DB 瞬断/关闭期）≠ 未启用：本轮按失败返回（失败行+
+	// WARN 可见），**不停环**——读错误恢复后自动恢复执行；只有成功读到
+	// enabled=0 才停止调度。
+	if enabled, known := autobanEnabledState(); !known {
+		TaskLogfWarn(AutobanTaskID, "failed", "读取启用状态失败（数据库暂不可读），本轮自动封禁未执行，调度保持运行")
+		return errors.New("读取自动封禁启用状态失败，本轮未执行（数据库暂不可读，调度保持运行）")
+	} else if !enabled && !autobanRecheckEnabled() {
 		if te := TaskEngine(); te != nil {
 			te.StopLoop(AutobanTaskID)
 		}

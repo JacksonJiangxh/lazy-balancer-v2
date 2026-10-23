@@ -197,8 +197,8 @@ func TestWatchdogCheckOnce_roleReadFailureCountsSkippedAndFails(t *testing.T) {
 		t.Fatalf("err=%v 必须显性说明角色读取失败", err)
 	}
 	drift := CurrentConfigDrift()
-	if drift.SkippedRounds != 1 {
-		t.Fatalf("SkippedRounds=%d, want 1（角色读失败计入跳过轮簿记）", drift.SkippedRounds)
+	if got := currentSkippedRounds(); got != 1 {
+		t.Fatalf("跳过轮计数=%d, want 1（角色读失败计入跳过轮簿记）", got)
 	}
 	if !drift.Consistent {
 		t.Fatalf("角色读失败不得置漂移/不一致结论（未判定≠不一致）: %+v", drift)

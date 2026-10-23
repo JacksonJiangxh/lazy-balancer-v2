@@ -66,58 +66,34 @@ func (d *DNSPod) CredentialFieldOptions(field string) []string {
 // map——曾先 Marshal 成 JSON 串、BuildCredentialsJSON 再 Unmarshal 回 map
 // 的序列化往返，仅为类型转换）。
 //
-// 同时接受 UI 形态（auth_mode + 表单字段，存储形态）与
-// canonical 形态（mode + api_token / mode + secret 对，本函数自身产出）——
-// 产出可回喂，避免「未来把 canonical 落库」让保存前测试端点误报 400。
-// 两种形态都出现时 auth_mode 优先（与协议面 factory 的「UI 形态是真相」同口径）。
+// 推断/归一逻辑不在本函数：`dnsprovider.CanonicalCredentials` 是「原始凭证 →
+// 规范凭据」的唯一实现，保存前验证（本函数）与签发链 provider 构造共用它。
+// 两侧曾各写一份推断，导致同一份库内 JSON 在「测试」与「签发」上结论相反。
+// 同时接受 UI 形态（auth_mode + 表单字段，存储形态）与 canonical 形态
+// （mode + api_token / mode + secret 对，本函数产物）——产出可回喂。
 func (d *DNSPod) buildCredentials(creds map[string]string) (map[string]string, error) {
-	mode := creds["auth_mode"]
-	if mode == "" {
-		mode = creds["mode"]
+	canonical, err := (dnsprovider.CredentialEnvelope{
+		Mode:      creds["mode"],
+		AuthMode:  creds["auth_mode"],
+		APIToken:  creds["api_token"],
+		AppID:     creds["app_id"],
+		AppToken:  creds["app_token"],
+		SecretID:  creds["secret_id"],
+		SecretKey: creds["secret_key"],
+	}).Canonical()
+	if err != nil {
+		return nil, err
 	}
-	if mode == "" {
-		switch {
-		case creds["secret_id"] != "" && creds["secret_key"] != "":
-			mode = "tencent_cloud"
-		case creds["app_id"] != "" && creds["app_token"] != "":
-			mode = "dnspod"
-		case creds["api_token"] != "":
-			mode = "dnspod"
-		}
+	if canonical.Mode == "dnspod" {
+		return map[string]string{"mode": "dnspod", "api_token": canonical.APIToken}, nil
 	}
-
-	switch mode {
-	case "tencent_cloud", "tencent":
-		if creds["secret_id"] == "" || creds["secret_key"] == "" {
-			return nil, fmt.Errorf("腾讯云认证方式需要提供 SecretId 和 SecretKey")
-		}
-		// canonical 不再携带 api_token 拼接值——tencent 模式消费端
-		// (factory.go)只读 secret_id/secret_key,拼接串是零消费死字段。
-		return map[string]string{
-			"mode":       "tencent",
-			"secret_id":  creds["secret_id"],
-			"secret_key": creds["secret_key"],
-		}, nil
-	case "dnspod":
-		apiToken := ""
-		if creds["app_id"] != "" && creds["app_token"] != "" {
-			// app_id+app_token→api_token 拼接为双实现——本处
-			// （UI 面 canonical 产出）与 internal/dnsprovider/factory.go 的 legacy
-			// 归一化（协议面消费）互为镜像；任一侧改字段名/拼接格式须双侧同步。
-			apiToken = creds["app_id"] + "," + creds["app_token"]
-		} else if creds["api_token"] != "" {
-			// canonical 直传形态。
-			apiToken = creds["api_token"]
-		}
-		if apiToken == "" {
-			return nil, fmt.Errorf("DNSPod 认证方式需要提供 App ID 和 App Token")
-		}
-		return map[string]string{
-			"mode":      "dnspod",
-			"api_token": apiToken,
-		}, nil
-	}
-	return nil, fmt.Errorf("请选择认证方式")
+	// canonical 的 tencent 形态不再携带 api_token 拼接值——tencent 模式消费端
+	// 只读 secret_id/secret_key，拼接串是零消费死字段。
+	return map[string]string{
+		"mode":       canonical.Mode,
+		"secret_id":  canonical.SecretID,
+		"secret_key": canonical.SecretKey,
+	}, nil
 }
 
 func (d *DNSPod) BuildCredentialsJSON(creds map[string]string) (map[string]interface{}, error) {

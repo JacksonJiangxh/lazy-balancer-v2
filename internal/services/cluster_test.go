@@ -1705,7 +1705,8 @@ func TestSyncService_pollRegistration_retriesConfirmAndStopsAfterConsecutiveFail
 	master := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if request.Method == http.MethodPost && request.URL.Path == "/api/v1/cluster/registration/confirm" {
 			confirmHits++
-			response.WriteHeader(http.StatusInternalServerError)
+			// 凭证类拒绝（令牌无效）才推进终止轨道；5xx/409/403 属暂时性。
+			response.WriteHeader(http.StatusUnauthorized)
 			return
 		}
 		if request.Header.Get("X-Registration-Secret") != "temporary-secret" {
@@ -1764,5 +1765,102 @@ func TestSyncService_pollRegistration_retriesConfirmAndStopsAfterConsecutiveFail
 	syncService.pollRegistration(context.Background())
 	if confirmHits != registrationConfirmMaxFailures {
 		t.Fatalf("终止后仍在重试 confirm: attempts=%d", confirmHits)
+	}
+}
+
+// seedApprovedRegistration 建立「主节点已审批、本地待 confirm」的注册态，
+// confirm 端点按 confirmStatus 返回（0=网络中断形态）。
+func seedApprovedRegistration(t *testing.T, database *sql.DB, masterURL string) {
+	t.Helper()
+	if _, err := database.Exec("UPDATE global_config SET is_master=0, master_url=?, registration_id=7, registration_secret='temporary-secret', cluster_token='', registration_confirm_failures=0 WHERE id=1", masterURL); err != nil {
+		t.Fatalf("seed pending registration: %v", err)
+	}
+}
+
+// 暂时性 confirm 失败（409 导入窗口 / 403 目标降级 / 5xx 主节点故障）必须
+// 可重试且不清任何注册态：confirm 只是冗余交付确认，令牌在审批时刻即有效。
+func TestPollRegistration_transientConfirmFailuresKeepRegistrationState(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+	}{
+		{name: "import_window_409", status: http.StatusConflict},
+		{name: "demoted_403", status: http.StatusForbidden},
+		{name: "master_error_500", status: http.StatusInternalServerError},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, database := newClusterTestService(t)
+			var confirmHits int
+			master := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				if request.Method == http.MethodPost && request.URL.Path == "/api/v1/cluster/registration/confirm" {
+					confirmHits++
+					response.WriteHeader(tc.status)
+					return
+				}
+				response.Header().Set("Content-Type", "application/json")
+				_, _ = response.Write([]byte(`{"code":0,"data":{"status":"approved","cluster_token":"lb_cluster_approved"}}`))
+			}))
+			defer master.Close()
+			seedApprovedRegistration(t, database, master.URL)
+			syncService := NewSyncService(database, &config.Config{}, NewCaddyService(master.URL))
+
+			for range registrationConfirmMaxFailures * 2 {
+				syncService.pollRegistration(context.Background())
+			}
+			if confirmHits < registrationConfirmMaxFailures*2 {
+				t.Fatalf("confirm attempts=%d, want 持续重试（不得提前终止）", confirmHits)
+			}
+
+			var registrationID sql.NullInt64
+			var secret, clusterToken, lastSyncError string
+			var failures int
+			if err := database.QueryRow("SELECT registration_id, COALESCE(registration_secret,''), COALESCE(cluster_token,''), COALESCE(last_sync_error,''), COALESCE(registration_confirm_failures,0) FROM global_config WHERE id=1").Scan(&registrationID, &secret, &clusterToken, &lastSyncError, &failures); err != nil {
+				t.Fatalf("read registration state: %v", err)
+			}
+			if !registrationID.Valid || secret != "temporary-secret" || clusterToken != "lb_cluster_approved" {
+				t.Fatalf("暂时性失败清除了注册态: id=%v secret=%q token=%q", registrationID, secret, clusterToken)
+			}
+			if failures != 0 {
+				t.Fatalf("registration_confirm_failures=%d, want 0（暂时性失败不得计入终止轨道）", failures)
+			}
+			msg, _ := decodeSyncError(lastSyncError)
+			if !strings.Contains(msg, "稍后自动重试") {
+				t.Fatalf("last_sync_error=%q, want 可重试文案", msg)
+			}
+		})
+	}
+}
+
+// 网络错误同样不得推进终止轨道或清除注册态。
+func TestPollRegistration_networkFailureKeepsRegistrationState(t *testing.T) {
+	_, database := newClusterTestService(t)
+	var confirmHits int
+	master := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodPost && request.URL.Path == "/api/v1/cluster/registration/confirm" {
+			confirmHits++
+			// ErrAbortHandler 直接断连（客户端观测到网络错误，而非 HTTP 状态）。
+			panic(http.ErrAbortHandler)
+		}
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{"code":0,"data":{"status":"approved","cluster_token":"lb_cluster_approved"}}`))
+	}))
+	defer master.Close()
+	seedApprovedRegistration(t, database, master.URL)
+	syncService := NewSyncService(database, &config.Config{}, NewCaddyService(master.URL))
+
+	for range registrationConfirmMaxFailures * 2 {
+		syncService.pollRegistration(context.Background())
+	}
+	if confirmHits < registrationConfirmMaxFailures*2 {
+		t.Fatalf("confirm attempts=%d, want 持续重试（不得提前终止）", confirmHits)
+	}
+	var registrationID sql.NullInt64
+	var secret, clusterToken string
+	if err := database.QueryRow("SELECT registration_id, COALESCE(registration_secret,''), COALESCE(cluster_token,'') FROM global_config WHERE id=1").Scan(&registrationID, &secret, &clusterToken); err != nil {
+		t.Fatalf("read registration state: %v", err)
+	}
+	if !registrationID.Valid || secret != "temporary-secret" || clusterToken != "lb_cluster_approved" {
+		t.Fatalf("网络失败清除了注册态: id=%v secret=%q token=%q", registrationID, secret, clusterToken)
 	}
 }

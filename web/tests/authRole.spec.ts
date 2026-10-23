@@ -21,9 +21,9 @@ test('成功拉取配置后排下一轮全站角色刷新', () => {
   assert.match(successBranch, /scheduleConfigRetry\(\)/, '成功响应也必须续排刷新，否则其他页面永久保留旧 nodeMode')
 
   // 回归/异常形状：单定时器防重、空 data 与非 401 失败仍保留原重试链。
-  assert.match(authSrc, /if \(configRetryTimer !== null \|\| !token\.value\) return/)
+  assert.match(authSrc, /if \(configRetryTimer !== null \|\| !token\.value\)\s+return/)
   assert.match(fetchBody, /\} else \{\s*scheduleConfigRetry\(\)/)
-  assert.match(fetchBody, /!\(e instanceof ApiRequestError && e\.status === 401\)\) scheduleConfigRetry\(\)/)
+  assert.match(fetchBody, /!\(e instanceof ApiRequestError && e\.status === 401\)\)\s+scheduleConfigRetry\(\)/)
   assert.match(authSrc, /function localLogout[\s\S]*?clearConfigRetryTimer\(\)/)
 })
 

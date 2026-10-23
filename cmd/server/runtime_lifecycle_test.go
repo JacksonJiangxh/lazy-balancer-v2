@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"log"
 	"math/big"
 	"strings"
@@ -17,6 +18,7 @@ import (
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/services"
+	"lazy-balancer-v2/internal/taskengine"
 )
 
 type blockingCertificateWorker struct {
@@ -118,21 +120,27 @@ func TestRuntimeLifecycle_StopACME_clearsActiveCertificateService(t *testing.T) 
 	lifecycle := newRuntimeLifecycle(idleSyncWorker{}, func() certificateWorker { return services.NewCertificateService() })
 	lifecycle.StartACME()
 
-	// 正向对照：注入生效——单轮体产出到期汇总日志
-	buf.Reset()
-	services.CertManualCheckOnce()
-	if !strings.Contains(buf.String(), "TLS Certificate Check: 1 expired") {
-		t.Fatalf("after StartACME the manual check should consume the active service, log=%q", buf.String())
+	// 观察口：CertRenewalScanOnce 依赖活动证书服务实例（缺失即返回
+	// ErrTaskSkipped 哨兵）。CertManualCheckOnce 已与该指针解耦（停机后仍执行
+	// 只读巡检），不再能作为「实例已摘除」的观察口。
+	// 正向对照：注入生效——扫描进入真实服务路径（不返回 skipped 哨兵）。
+	if err := services.CertRenewalScanOnce(); errors.Is(err, taskengine.ErrTaskSkipped) {
+		t.Fatalf("after StartACME the renewal scan should reach the active service, err=%v", err)
 	}
 
 	// When
 	lifecycle.StopACME()
 
-	// Then：active 指针已清除——同一入口不再驱动已停服务
+	// Then ①：active 指针已清除——续期扫描回到 skipped 哨兵
+	if err := services.CertRenewalScanOnce(); !errors.Is(err, taskengine.ErrTaskSkipped) {
+		t.Fatalf("active certificate service survived StopACME: cert-renewal-scan would keep driving a stopped service, err=%v", err)
+	}
+	// Then ②（交叉断言）：手动到期巡检不依赖实例，停机后照常执行——停机
+	// 不得把「手动证书即将到期」这条唯一信号一起关掉。
 	buf.Reset()
 	services.CertManualCheckOnce()
-	if strings.Contains(buf.String(), "TLS Certificate Check") {
-		t.Fatalf("active certificate service survived StopACME: cert-manual-poll would keep driving a stopped service, log=%q", buf.String())
+	if !strings.Contains(buf.String(), "TLS Certificate Check") {
+		t.Fatalf("manual expiry check must keep running after StopACME (independent of service instance), log=%q", buf.String())
 	}
 }
 

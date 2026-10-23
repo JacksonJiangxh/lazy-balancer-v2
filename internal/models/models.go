@@ -602,6 +602,10 @@ type UpdateRuleRequest struct {
 	BlockPageStage1Status *int `json:"block_page_stage1_status"`
 	BlockPageStage3ID     *int `json:"block_page_stage3_id"`
 	BlockPageStage3Status *int `json:"block_page_stage3_status"`
+	// ExpectedUpdatedAt 是可选乐观并发前置条件：客户端回传打开编辑表单时
+	// 看到的 updated_at（RFC3339 或库内平面 UTC 形态）。省略/空串=不校验
+	// （API/MCP 向后兼容）；提供且与事务内读到的库值不一致 → 409。
+	ExpectedUpdatedAt string `json:"expected_updated_at"`
 }
 
 type UpdateConfigRequest struct {

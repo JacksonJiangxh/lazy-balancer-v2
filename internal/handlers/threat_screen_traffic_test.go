@@ -114,9 +114,16 @@ func TestGetThreatScreenTraffic_timeoutGuard(t *testing.T) {
 	rec := getRequest(t, router, "/security/overview/threat-screen/traffic")
 	elapsed := time.Since(start)
 
-	// Then: 约 2s 返回降级（<3s 挂起时长）
+	// Then: 约 2s 返回降级（<3s 挂起时长）；降级必须是显式 available=false，
+	// 且确实等到了超时（删除抓取逻辑后用例会立即返回，一眼转红）。
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"available":false`) {
+		t.Fatalf("body=%s, want available=false（超时降级）", rec.Body.String())
+	}
+	if elapsed < 1500*time.Millisecond {
+		t.Fatalf("elapsed=%v, want ≥1.5s（必须真实等待 2s 超时，而非早退空降级）", elapsed)
 	}
 	if elapsed >= 3*time.Second {
 		t.Fatalf("elapsed=%v, want <3s（2s 超时保护）", elapsed)

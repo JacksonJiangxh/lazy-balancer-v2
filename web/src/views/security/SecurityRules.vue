@@ -277,26 +277,26 @@
                   <el-icon v-if="cond.operator === 'regex' && !isValidRegex(cond.pattern)" class="regex-error-icon"><WarningFilled /></el-icon>
                 </div>
                 <div v-if="cond.target === 'user_agent'" class="preset-section">
-                  <div class="preset-header" @click="uaCollapsed[idx] = !uaCollapsed[idx]">
+                  <button type="button" class="preset-header" :aria-expanded="!uaCollapsed[idx]" @click="uaCollapsed[idx] = !uaCollapsed[idx]">
                     <span class="preset-toggle">{{ uaCollapsed[idx] ? '▶' : '▼' }} 快捷标签</span>
-                  </div>
+                  </button>
                   <div v-show="!uaCollapsed[idx]" class="preset-tags-block">
                     <div v-for="g in UA_PRESET_GROUPS" :key="g.label" class="preset-group">
                       <span class="preset-group-label">{{ g.label }}</span>
                       <div class="preset-group-tags">
-                        <el-tag v-for="t in g.values" :key="t.value" size="small" effect="plain" class="preset-tag" @click="cond.pattern = t.value">{{ t.label }}</el-tag>
+                        <el-tag v-for="t in g.values" :key="t.value" size="small" effect="plain" class="preset-tag" role="button" tabindex="0" @click="cond.pattern = t.value" @keydown.enter.prevent="cond.pattern = t.value" @keydown.space.prevent="cond.pattern = t.value">{{ t.label }}</el-tag>
                       </div>
                     </div>
                     <div class="preset-hint">标签写入真实 UA 片段（contains 精确匹配，区分大小写）</div>
                   </div>
                 </div>
                 <div v-if="cond.operator === 'regex'" class="preset-section">
-                  <div class="preset-header" @click="regexCollapsed[idx] = !regexCollapsed[idx]">
+                  <button type="button" class="preset-header" :aria-expanded="!regexCollapsed[idx]" @click="regexCollapsed[idx] = !regexCollapsed[idx]">
                     <span class="preset-toggle">{{ regexCollapsed[idx] ? '▶' : '▼' }} 正则模板与测试</span>
-                  </div>
+                  </button>
                   <div v-show="!regexCollapsed[idx]" class="regex-extras">
                     <div class="regex-presets">
-                      <el-link v-for="p in REGEX_PRESETS" :key="p.label" type="primary" underline="never" class="regex-preset-link" @click="cond.pattern = p.value">{{ p.label }}</el-link>
+                      <el-button v-for="p in REGEX_PRESETS" :key="p.label" link type="primary" size="small" class="regex-preset-link" @click="cond.pattern = p.value">{{ p.label }}</el-button>
                     </div>
                     <div class="regex-tester">
                       <el-input v-model="regexTestStrings[idx]" placeholder="输入测试字符串" size="small" class="regex-test-input" />
@@ -351,21 +351,21 @@
         <span class="info-note-desc">名单条目加载失败：为避免以空条目覆盖原列表，保存已禁用。</span>
         <el-button size="small" type="primary" plain @click="reloadIpListDetail">重新加载</el-button>
       </div>
-      <el-form :model="ipListForm" label-width="80px" label-position="right" :disabled="ipListDialogReadOnly" v-loading="loadingIpListDetail">
+      <el-form :model="ipListForm" label-width="80px" label-position="right" v-loading="loadingIpListDetail">
         <!-- 自动封禁预置名单名称/分类/描述为内置字段（后端 400 守卫同口径），
              前端直接禁用灰态——禁止修改的字段不可输入，而非提交后报 400 -->
         <div v-if="editingIpListPreset" class="form-tip-line">内置名单字段不可修改，仅条目可编辑（手动封禁 / 删除条目）</div>
         <el-form-item label="名称" required>
-          <el-input v-model="ipListForm.name" placeholder="列表名称" maxlength="50" show-word-limit :disabled="editingIpListPreset" />
+          <el-input v-model="ipListForm.name" placeholder="列表名称" maxlength="50" show-word-limit :disabled="ipListDialogReadOnly || editingIpListPreset" />
         </el-form-item>
         <el-form-item label="分类">
-          <el-select v-model="ipListForm.category" allow-create filterable default-first-option placeholder="选择或输入分类" style="width: 100%" :disabled="editingIpListPreset">
+          <el-select v-model="ipListForm.category" allow-create filterable default-first-option placeholder="选择或输入分类" style="width: 100%" :disabled="ipListDialogReadOnly || editingIpListPreset">
             <el-option v-for="c in IP_LIST_CATEGORIES" :key="c" :label="c" :value="c" />
           </el-select>
           <div class="form-tip-line">预设分类可直接选择，也可自定义（≤32 字符）</div>
         </el-form-item>
         <el-form-item label="描述">
-          <el-input v-model="ipListForm.description" placeholder="列表用途说明" maxlength="200" show-word-limit :disabled="editingIpListPreset" />
+          <el-input v-model="ipListForm.description" placeholder="列表用途说明" maxlength="200" show-word-limit :disabled="ipListDialogReadOnly || editingIpListPreset" />
         </el-form-item>
         <el-form-item label="条目" required>
           <div class="entries-block">
@@ -1784,7 +1784,14 @@ onUnmounted(() => {
 .pattern-col { flex: 1; min-width: 220px; display: flex; flex-direction: column; gap: 6px; }
 .pattern-input-row { display: flex; align-items: center; gap: 6px; }
 .preset-section { margin-top: 4px; }
-.preset-header { cursor: pointer; padding: 2px 0; user-select: none; }
+.preset-header {
+  cursor: pointer; padding: 2px 0; user-select: none;
+  display: inline-flex; align-items: center; width: 100%;
+  background: none; border: 0; font: inherit; text-align: left;
+}
+.preset-header:focus-visible,
+.preset-tag:focus-visible,
+.regex-preset-link:focus-visible { outline: 2px solid #409eff; outline-offset: 2px; border-radius: 2px; }
 .preset-toggle { font-size: 12px; color: #6b7280; }
 .preset-tags-block { display: flex; flex-direction: column; gap: 4px; padding: 6px 8px; background: #fff; border: 1px dashed #e5e7eb; border-radius: 4px; margin-left: 0; }
 .preset-group { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }

@@ -68,3 +68,43 @@ func TestGetThreatScreenFlowEvents_rejectsMalformedAdminBody(t *testing.T) {
 		t.Fatalf("status=%d body=%s, want 502", rec.Code, rec.Body.String())
 	}
 }
+
+// admin 不可达 → 503 语义化（大屏轮询据 code 决定是否暂停，不得 500/裸连）。
+func TestGetThreatScreenFlowEvents_adminUnreachableReturns503(t *testing.T) {
+	closed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	url := closed.URL
+	closed.Close()
+
+	h := &Handlers{cfg: &config.Config{CaddyAdminURL: url}}
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.GET("/security/overview/threat-screen/events", h.GetThreatScreenFlowEvents)
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/security/overview/threat-screen/events", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s, want 503", rec.Code, rec.Body.String())
+	}
+}
+
+// 响应体超过 1MB → 413 显式拒绝（截断的 JSON 不得以 200 当完整增量透传）。
+func TestGetThreatScreenFlowEvents_oversizeResponseReturns413(t *testing.T) {
+	admin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"enabled":true,"events":[`))
+		_, _ = w.Write([]byte(strings.Repeat(" ", 1<<20+16)))
+		_, _ = w.Write([]byte(`]}`))
+	}))
+	defer admin.Close()
+
+	h := &Handlers{cfg: &config.Config{CaddyAdminURL: admin.URL}}
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.GET("/security/overview/threat-screen/events", h.GetThreatScreenFlowEvents)
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/security/overview/threat-screen/events", nil))
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status=%d body=%s, want 413", rec.Code, rec.Body.String())
+	}
+}

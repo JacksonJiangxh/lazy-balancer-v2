@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -91,5 +92,71 @@ func TestConfigBackup_sectionFiltering(t *testing.T) {
 	var rules int
 	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM lb_rules WHERE caddy_id='imp1'`).Scan(&rules); err != nil || rules != 1 {
 		t.Fatalf("sections=rules import must apply rules, count=%d err=%v", rules, err)
+	}
+}
+
+// v3 纯 JSON 的分节选择必须走 ?sections= query（体内 sections 参与校验和，
+// 改写会被判「已篡改」）。请求体保持原始字节：query 只缩不扩，交集为空 400。
+func TestImportPureJson_sectionsQueryNarrowsWithoutBreachingChecksum(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	seedAdminShared(t)
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled) VALUES ('lb_local_keep','keep','http','keep.example.com',80,1)`); err != nil {
+		t.Fatal(err)
+	}
+	payload, _, _, _, err := h.buildLbbakExport(context.Background(), []string{"users"})
+	if err != nil {
+		t.Fatalf("buildLbbakExport: %v", err)
+	}
+	parsed, err := parseLbbak(payload)
+	if err != nil {
+		t.Fatalf("parseLbbak: %v", err)
+	}
+	// 取出 lbbak 内的 config.json：v3 纯 JSON（sections=["users"]，checksum 覆盖）。
+	body := string(parsed.ConfigJSON)
+
+	gin.SetMode(gin.TestMode)
+	validateRouter := gin.New()
+	validateRouter.POST("/config/import/validate", h.ValidateConfigImport)
+	preview := func(endpoint string) importValidateResponse {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, endpoint, strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		validateRouter.ServeHTTP(recorder, request)
+		var envelope struct {
+			Data importValidateResponse `json:"data"`
+		}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &envelope); err != nil {
+			t.Fatalf("decode validate: %v body=%s", err, recorder.Body.String())
+		}
+		return envelope.Data
+	}
+
+	// query 与体内 sections 有交集：交集生效，且不改写体内值（否则判篡改）。
+	if got := preview("/config/import/validate?sections=users,rules,security"); !got.Valid {
+		t.Fatalf("preview 应可导入: %+v", got)
+	}
+	// query 与体内无交集：与导入同文案拒绝（不得零导入冒充成功）。
+	if got := preview("/config/import/validate?sections=rules"); got.Valid || !strings.Contains(got.Error, "无交集") {
+		t.Fatalf("preview=%+v, want 无交集", got)
+	}
+
+	disjoint := httptest.NewRecorder()
+	disjointReq := httptest.NewRequest(http.MethodPost, "/config/import?sections=rules", strings.NewReader(body))
+	disjointReq.Header.Set("Content-Type", "application/json")
+	newBackupSectionRouter(h).ServeHTTP(disjoint, disjointReq)
+	if disjoint.Code != http.StatusBadRequest || !strings.Contains(disjoint.Body.String(), "无交集") {
+		t.Fatalf("disjoint import status=%d body=%s, want 400 无交集", disjoint.Code, disjoint.Body.String())
+	}
+
+	narrowed := httptest.NewRecorder()
+	narrowedReq := httptest.NewRequest(http.MethodPost, "/config/import?sections=users", strings.NewReader(body))
+	narrowedReq.Header.Set("Content-Type", "application/json")
+	newBackupSectionRouter(h).ServeHTTP(narrowed, narrowedReq)
+	if narrowed.Code != http.StatusOK {
+		t.Fatalf("import status=%d body=%s, want 200", narrowed.Code, narrowed.Body.String())
+	}
+	var kept int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM lb_rules WHERE caddy_id='lb_local_keep'`).Scan(&kept); err != nil || kept != 1 {
+		t.Fatalf("本地规则 count=%d err=%v, want 未随 users 分节替换", kept, err)
 	}
 }

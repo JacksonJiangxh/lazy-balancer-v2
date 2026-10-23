@@ -49,6 +49,7 @@ var tcpSQLColumnFallback = map[string]string{
 	"block_page_stage3_id":          "BlockPageStage3ID",
 	"block_page_stage3_status":      "BlockPageStage3Status",
 	"log_enabled":                   "LogEnabled",
+	"dns_family":                    "DnsFamily",
 }
 
 // TestTCPDeadFieldsSaveFamily_coversSQLColumns 钉住保存族与 SQL 归一的列覆盖
@@ -85,8 +86,16 @@ func TestTCPDeadFieldsSaveFamily_coversSQLColumns(t *testing.T) {
 			t.Fatalf("tcpDeadFields 结构体缺少字段 %s（列 %s）", field, col)
 		}
 		// 复制/编辑适配器必须接字段（自愈路径实际生效处）。
+		// Update 侧例外：NTLMCompatible 在 TCP 行走「显式携带 400 / 未携带自愈」
+		// 双分支（UpdateRule 调用点），通用归一无法区分用户是否显式提交。
+		updateAdapterExemptions := map[string]string{
+			"NTLMCompatible": "UpdateRule 显式携带由保存门 400，未携带由调用点归零自愈",
+		}
 		for name, adapter := range map[string]string{"storedRuleTCPDeadFields": storedBody, "updateRuleTCPDeadFields": updateBody} {
 			if !strings.Contains(adapter, field+":") {
+				if _, exempted := updateAdapterExemptions[field]; exempted && name == "updateRuleTCPDeadFields" {
+					continue
+				}
 				t.Fatalf("%s 未接线字段 %s（列 %s）——该列在复制/编辑路径不自愈", name, field, col)
 			}
 		}

@@ -165,3 +165,73 @@ func TestControlThreatScreenCollector_adminFailureKeepsLocalLeases(t *testing.T)
 		t.Fatalf("after failed DELETE sample_n=%d, want 1（失败不释放本地）", got)
 	}
 }
+
+// 本地登记失败（lease_id 超长）不得影响 admin 侧已生效租约：响应原样透传
+// 200，本地光流档位保持旧值（不回滚、不误设）。
+func TestControlThreatScreenCollector_localLeaseFailureKeepsTier(t *testing.T) {
+	services.ResetThreatScreenAttackFlowForTest()
+	t.Cleanup(services.ResetThreatScreenAttackFlowForTest)
+	admin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"enabled":true}`))
+	}))
+	defer admin.Close()
+
+	h := &Handlers{cfg: &config.Config{CaddyAdminURL: admin.URL}}
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.POST("/security/overview/threat-screen/collector", h.ControlThreatScreenCollector)
+
+	// admin 成功、本地登记失败（65 字节 > 64 上限）：响应仍为 admin 的成功体。
+	longLease := strings.Repeat("x", 65)
+	body := `{"lease_id":"` + longLease + `","ttl_ms":30000,"sample_n":8}`
+	req := httptest.NewRequest(http.MethodPost, "/security/overview/threat-screen/collector", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"enabled":true`) {
+		t.Fatalf("status=%d body=%s, want 200 + admin 体透传", rec.Code, rec.Body.String())
+	}
+	if got := services.ThreatScreenAttackFlowSampleN(); got != 0 {
+		t.Fatalf("本地登记失败后 sample_n=%d, want 0（档位保持旧值）", got)
+	}
+}
+
+// DELETE 空体时以 ?lease_id= 回退取租约 id——否则页面关闭（fetch 不带 body）
+// 的释放会被当成空 id，本地光流租约永不回收。
+func TestControlThreatScreenCollector_deleteQueryLeaseIDFallback(t *testing.T) {
+	services.ResetThreatScreenAttackFlowForTest()
+	t.Cleanup(services.ResetThreatScreenAttackFlowForTest)
+	admin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"enabled":true}`))
+	}))
+	defer admin.Close()
+
+	h := &Handlers{cfg: &config.Config{CaddyAdminURL: admin.URL}}
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.POST("/security/overview/threat-screen/collector", h.ControlThreatScreenCollector)
+	r.DELETE("/security/overview/threat-screen/collector", h.ControlThreatScreenCollector)
+
+	acquire := httptest.NewRequest(http.MethodPost, "/security/overview/threat-screen/collector",
+		strings.NewReader(`{"lease_id":"tab-query","ttl_ms":30000,"sample_n":4}`))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, acquire)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := services.ThreatScreenAttackFlowSampleN(); got != 4 {
+		t.Fatalf("sample_n=%d, want 4", got)
+	}
+
+	// 空体 DELETE + 查询参数
+	release := httptest.NewRequest(http.MethodDelete, "/security/overview/threat-screen/collector?lease_id=tab-query", strings.NewReader(""))
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, release)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("DELETE status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := services.ThreatScreenAttackFlowSampleN(); got != 0 {
+		t.Fatalf("空体 DELETE 后 sample_n=%d, want 0（必须用 ?lease_id= 回退释放）", got)
+	}
+}

@@ -108,11 +108,24 @@ func TestGenerateCaddyConfig_noAccessLogConsumerUsesBareJSONEncoder(t *testing.T
 	}
 	cfg := generateCaddyConfigFromStore(database)
 	raw, _ := json.Marshal(cfg)
-	logging, _ := cfg["logging"].(map[string]interface{})
-	logs, _ := logging["logs"].(map[string]interface{})
+	logging, ok := cfg["logging"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("logging 缺失: %s", raw)
+	}
+	logs, ok := logging["logs"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("logging.logs 缺失: %s", raw)
+	}
+	accessEntries := 0
 	for name, value := range logs {
-		entry, _ := value.(map[string]interface{})
-		includes, _ := entry["include"].([]string)
+		entry, ok := value.(map[string]interface{})
+		if !ok {
+			t.Fatalf("日志条目 %s 类型=%T: %s", name, value, raw)
+		}
+		includes, ok := entry["include"].([]string)
+		if !ok {
+			continue // 非访问日志条目（如服务器运行日志）形态合法
+		}
 		isAccess := false
 		for _, inc := range includes {
 			if strings.HasPrefix(inc, "http.log.access") {
@@ -122,9 +135,17 @@ func TestGenerateCaddyConfig_noAccessLogConsumerUsesBareJSONEncoder(t *testing.T
 		if !isAccess {
 			continue
 		}
-		encoder, _ := entry["encoder"].(map[string]interface{})
+		accessEntries++
+		encoder, ok := entry["encoder"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("访问日志条目 %s 缺少 encoder: %s", name, raw)
+		}
 		if encoder["format"] != "filter" {
 			t.Fatalf("访问日志条目 %s 使用 %v 编码器（无删除通道）: %s", name, encoder["format"], raw)
 		}
+	}
+	// 正向控制：条目（或其 include）整体消失时循环零命中，不得视为通过。
+	if accessEntries == 0 {
+		t.Fatalf("未找到任何 http.log.access 消费者（守卫扫描面为空）: %s", raw)
 	}
 }

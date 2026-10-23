@@ -37,13 +37,20 @@ func TestCaddyService_persistsLastGoodConfigOnSuccessfulApply(t *testing.T) {
 		t.Fatalf("apply config: %v", err)
 	}
 
-	// Then：落盘文件包含已应用的 JSON 载荷
+	// Then：落盘文件内容=已应用的 JSON 载荷（逐字节），权限 0600
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("last-good file missing: %v", err)
 	}
-	if !strings.Contains(string(data), `"test":true`) {
-		t.Fatalf("last-good content=%s, want applied payload", string(data))
+	if string(data) != `{"apps":{"test":true}}` {
+		t.Fatalf("last-good content=%s, want applied payload bytes", string(data))
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat last-good file: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("last-good perm=%o, want 600", perm)
 	}
 }
 
@@ -53,12 +60,10 @@ func TestCaddyService_ApplyLastKnownGood_sendsFileContentToLoad(t *testing.T) {
 	var bodies []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost && r.URL.Path == "/load" {
-			// 单次 Read 不保证读满——短读会截断断言
-			// 内容致偶发红，改 io.ReadFull。
-			buf := make([]byte, r.ContentLength)
-			_, _ = io.ReadFull(r.Body, buf)
+			// io.ReadAll：chunked 请求的 ContentLength=-1，按长度分配会 panic。
+			body, _ := io.ReadAll(r.Body)
 			mu.Lock()
-			bodies = append(bodies, string(buf))
+			bodies = append(bodies, string(body))
 			mu.Unlock()
 		}
 		w.WriteHeader(http.StatusOK)
@@ -77,11 +82,47 @@ func TestCaddyService_ApplyLastKnownGood_sendsFileContentToLoad(t *testing.T) {
 		t.Fatalf("apply last-known-good: %v", err)
 	}
 
-	// Then：/load 收到文件原样内容
+	// Then：/load 收到文件原样字节
 	mu.Lock()
 	defer mu.Unlock()
-	if len(bodies) != 1 || !strings.Contains(bodies[0], `"fallback":true`) {
-		t.Fatalf("loads=%v, want file content delivered", bodies)
+	if len(bodies) != 1 || bodies[0] != payload {
+		t.Fatalf("loads=%v, want file content delivered verbatim", bodies)
+	}
+}
+
+// 失败 apply 不得覆盖已有的 last-known-good：落盘只发生在 2xx 之后，
+// 失败路径（含 5xx 系统错误）保留上一次可用的配置。
+func TestCaddyService_failedApplyDoesNotOverwriteLastGood(t *testing.T) {
+	// Given：已落盘的旧载荷 + 恒 500 的假 admin
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/load" {
+			http.Error(w, "load failed", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	path := filepath.Join(t.TempDir(), "last_good.json")
+	previous := `{"apps":{"previous":true}}`
+	if err := os.WriteFile(path, []byte(previous), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	svc := NewCaddyService(server.URL)
+	svc.SetLastGoodPath(path)
+
+	// When：应用一份新配置但 /load 失败
+	err := svc.ApplyConfig(map[string]interface{}{"apps": map[string]interface{}{"next": true}})
+
+	// Then：报错且旧载荷原样保留
+	if err == nil {
+		t.Fatal("/load 失败必须返回错误")
+	}
+	data, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatalf("read last-good: %v", readErr)
+	}
+	if string(data) != previous {
+		t.Fatalf("失败 apply 覆写了 last-good: %s", string(data))
 	}
 }
 

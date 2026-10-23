@@ -837,14 +837,71 @@ func TestGetCertJobLogs_concatenates_all_rotated_backups_oldest_first(t *testing
 		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
 	}
 	var body struct {
-		Data map[string]string `json:"data"`
+		Data struct {
+			Content   string `json:"content"`
+			Truncated bool   `json:"truncated"`
+		} `json:"data"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode log response: %v", err)
 	}
 	want := "line-rotated-5\nline-rotated-4\nline-rotated-3\nline-rotated-2\nline-rotated-1\nline-current\n"
-	if got := body.Data["content"]; got != want {
+	if got := body.Data.Content; got != want {
 		t.Fatalf("content=%q, want %q", got, want)
+	}
+	if body.Data.Truncated {
+		t.Fatal("truncated=true, want false（小日志不做尾窗截断）")
+	}
+}
+
+// 单响应硬上限：总量超过 256KB 时必须尾窗保留并标注 truncated，避免
+// 「N 个失败任务 × 768KB」批量拉日志造成出流量/IO 抖动。
+func TestGetCertJobLogs_capsTotalResponseBytes(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (id,rule_id,domain,status) VALUES (9,'lb_logs_cap','logs-cap.example.test','failed')`); err != nil {
+		t.Fatalf("seed cert job: %v", err)
+	}
+	dir := t.TempDir()
+	original := certJobLogPathForRule
+	certJobLogPathForRule = func(ruleID string) string {
+		return filepath.Join(dir, "certjob-"+ruleID+".log")
+	}
+	t.Cleanup(func() { certJobLogPathForRule = original })
+	base := certJobLogPathForRule("lb_logs_cap")
+	line := strings.Repeat("x", 1023) + "\n"
+	for i := 1; i <= 5; i++ {
+		if err := os.WriteFile(fmt.Sprintf("%s.%d", base, i), []byte(strings.Repeat(line, 120)), 0644); err != nil {
+			t.Fatalf("write rotated backup .%d: %v", i, err)
+		}
+	}
+	if err := os.WriteFile(base, []byte(strings.Repeat(line, 120)), 0644); err != nil {
+		t.Fatalf("write current log: %v", err)
+	}
+	router := gin.New()
+	router.GET("/jobs/:id/logs", h.GetCertJobLogs)
+
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/jobs/9/logs", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	var body struct {
+		Data struct {
+			Content   string `json:"content"`
+			Truncated bool   `json:"truncated"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode log response: %v", err)
+	}
+	if !body.Data.Truncated {
+		t.Fatal("truncated=false, want true（6×120KB 超过单响应上限）")
+	}
+	if len(body.Data.Content) > certJobLogsMaxResponseBytes+256 {
+		t.Fatalf("content bytes=%d, want ≤ %d（尾窗硬上限）", len(body.Data.Content), certJobLogsMaxResponseBytes+256)
+	}
+	if !strings.Contains(body.Data.Content, "仅显示最近") {
+		t.Fatal("截断响应必须带提示行")
 	}
 }
 
@@ -910,17 +967,21 @@ func TestListCertJobs_degrades_to_default_expiry_days_when_config_missing(t *tes
 func TestCertJobEndpointsSerializeNullableTimes(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	validTime := time.Date(2026, time.July, 30, 12, 34, 56, 0, time.UTC)
-	result, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, expires_at, created_at, updated_at, ca_available_after)
+	_, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, expires_at, created_at, updated_at, ca_available_after)
 		VALUES ('lb_valid', 'valid.example', 'issued', ?, ?, ?, ?),
 		       ('lb_null', 'null.example', 'queued', NULL, ?, NULL, NULL)`, validTime, validTime, validTime, validTime, validTime)
 	if err != nil {
 		t.Fatalf("seed certificate jobs: %v", err)
 	}
-	nullID, err := result.LastInsertId()
-	if err != nil {
-		t.Fatalf("read certificate job ID: %v", err)
+	// 按 rule_id 反查（多行 INSERT 的 LastInsertId 只保证最后一行，连号假设
+	// 在夹具预置行时静默指向错误 id）。
+	var validID, nullID int64
+	if err := db.DB.QueryRow("SELECT id FROM cert_jobs WHERE rule_id='lb_valid'").Scan(&validID); err != nil {
+		t.Fatalf("read valid job ID: %v", err)
 	}
-	validID := nullID - 1
+	if err := db.DB.QueryRow("SELECT id FROM cert_jobs WHERE rule_id='lb_null'").Scan(&nullID); err != nil {
+		t.Fatalf("read null job ID: %v", err)
+	}
 
 	t.Run("list", func(t *testing.T) {
 		recorder := httptest.NewRecorder()

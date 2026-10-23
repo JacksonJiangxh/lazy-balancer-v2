@@ -256,9 +256,10 @@
       </template>
       <div class="log-toolbar">
         <el-switch v-model="appLogAutoRefresh" active-text="自动刷新" />
+        <el-text v-if="appLogError" type="danger" size="small">日志加载失败，自动重试中（当前展示上一次内容）</el-text>
         <el-button size="small" :loading="appLogLoading" @click="fetchAppLogs">刷新</el-button>
       </div>
-      <div ref="appLogContainer" class="log-viewer"><pre>{{ appLogContent || '暂无日志' }}</pre></div>
+      <div ref="appLogContainer" class="log-viewer"><pre>{{ appLogContent || appLogEmptyText }}</pre></div>
       <template #footer>
         <div style="display: flex; align-items: center;">
           <LogStorageBar log-key="runtime" style="margin-right: auto" />
@@ -500,7 +501,7 @@ import { normalizeTrafficSampleN } from '@/utils/threatFlowRules'
 import { shouldToastQuietPollError } from '@/utils/pollErrorToast'
 import { displaySecurityEventsRetentionDays, displaySecurityEventsRowCap, displayThreatScreenMode, securityEventsWritePayload } from '@/utils/configValues'
 import { CHINA_SITE_CHOICES, COUNTRY_SITE_CHOICES, coordsForSiteLocation, nearestSiteLocation } from '@/utils/siteLocation'
-import { BACKUP_SECTIONS, normalizeBackupSectionKeys } from '@/utils/backupSections'
+import { BACKUP_SECTIONS, importConfirmMessage, normalizeBackupSectionKeys } from '@/utils/backupSections'
 import { MFA_SCOPE_GROUPS } from '@/utils/mfaScopeGroups'
 import { Setting, InfoFilled, Check, View, Upload, Download, Timer, Lock, Document } from '@element-plus/icons-vue'
 import DialogHeader from '@/components/DialogHeader.vue'
@@ -526,6 +527,10 @@ const appLogVisible = ref(false)
 const appLogContent = ref('')
 const appLogAutoRefresh = ref(true)
 const appLogContainer = ref<HTMLElement | null>(null)
+// 日志端点失败必须显性化：此前失败只写 console，模板继续以空内容渲染
+// 「暂无日志」——排障最需要日志的时刻给出「没有日志」的错误结论。
+const appLogError = ref(false)
+const appLogEmptyText = computed(() => appLogError.value ? '日志加载失败（自动重试中）' : '暂无日志')
 
 // （过度修复审查 REMOVE：appLogRequestSeq 已删——入口 loading 门 +
 // appLogVisible 析取使其作为裁决条件永不为真。）
@@ -537,16 +542,21 @@ const appLogTail = useLogTailPolling({
   isActive: () => appLogVisible.value,
   fetch: async () => {
     const res = await request.get<{ data?: { content?: string } }>('/system/logs', { silent: true })
+    appLogError.value = false
     if (!appLogVisible.value) return null
     return res.data?.content || ''
   },
-  onError: (error) => { console.error('Failed to fetch app logs:', error) },
+  onError: (error) => {
+    appLogError.value = true
+    console.error('Failed to fetch app logs:', error)
+  },
 })
 const appLogLoading = appLogTail.loading
 
 const fetchAppLogs = async (): Promise<void> => appLogTail.refresh()
 
 const openAppLogDialog = (): void => {
+  appLogError.value = false
   appLogVisible.value = true
 }
 
@@ -558,6 +568,7 @@ const onAppLogOpened = (): void => {
 const onAppLogClosed = (): void => {
   appLogTail.stop()
   appLogContent.value = ''
+  appLogError.value = false
 }
 
 watch(appLogAutoRefresh, (enabled) => {
@@ -853,17 +864,24 @@ const restoreAutoBackup = async (row: AutoBackupRow): Promise<void> => {
   }
   try {
     // 还原走导入 core(config_backup.go importConfigBackupCore),响应同样携带
-    // data.warnings(操作账户替换/会话吊销/ACME 悬挂等)——与导入同口径展示
-    const res = await request.post<{ message?: string; data?: { warnings?: string[] } }>(`/auto-backup/${row.id}/restore`, undefined, { timeout: 0 })
+    // data.warnings 与 data.disabled_conflicts——与导入弹框同口径展示：冲突
+    // 自动禁用的规则若无提示，业务流量会在「还原成功」后静默切走。
+    const res = await request.post<{ message?: string; data?: { warnings?: string[]; disabled_conflicts?: DisabledRuleConflict[] } }>(`/auto-backup/${row.id}/restore`, undefined, { timeout: 0 })
     autoBackupVisible.value = false
     const warnings = res.data?.warnings ?? []
-    const resultLines = [res.message || '配置还原成功', ...warnings]
+    const disabledConflicts = res.data?.disabled_conflicts ?? []
+    const resultLines = [
+      res.message || '配置还原成功',
+      ...warnings,
+      ...(disabledConflicts.length > 0 ? [`冲突置为禁用：${disabledConflicts.length} 条`] : []),
+      ...disabledConflicts.map((conflict) => formatImportConflict(conflict, true)),
+    ]
     await ElMessageBox.alert(
       h('div', resultLines.map((line) => h('div', line))),
       '还原完成',
       {
         confirmButtonText: '刷新页面',
-        type: warnings.length > 0 ? 'warning' : 'success',
+        type: warnings.length > 0 || disabledConflicts.length > 0 ? 'warning' : 'success',
         showClose: false,
         closeOnClickModal: false,
         closeOnPressEscape: false,
@@ -962,11 +980,11 @@ const summaryLabels: Record<string, string> = {
 
 const conflictIdentifier = (conflict: { name?: string; caddy_id?: string }): string => conflict.name || conflict.caddy_id || '未命名规则'
 
-const formatImportConflict = (conflict: DisabledRuleConflict): string => {
+const formatImportConflict = (conflict: DisabledRuleConflict, alreadyDisabled = false): string => {
   const opponents = conflict.conflicts_with
     .map((opponent) => `${conflictIdentifier(opponent)}（${opponent.reason}）`)
     .join('；')
-  return `规则 ${conflictIdentifier(conflict)} 将被禁用：与${opponents}冲突`
+  return `规则 ${conflictIdentifier(conflict)} ${alreadyDisabled ? '已禁用' : '将被禁用'}：与${opponents}冲突`
 }
 
 const triggerImport = (): void => {
@@ -1056,22 +1074,12 @@ const handleImportFile = async (event: Event): Promise<void> => {
 
 // 预览校验请求统一构造——携带当前分类选择（后端
 // ValidateConfigImport 在校验前按 sections 过滤未选分类的表，坏行不误拒，
-// summary/warnings 亦只含所选分类）。参数形态与导入端点对齐：lbbak 二进制
-// 经?sections= query，JSON 备份体内顶层注入 sections（备份
-// 不消费该键，解析时忽略）。
+// summary/warnings 亦只含所选分类）。分类选择一律经 ?sections= query，请求体
+// 保持原始字节：v3 纯 JSON 的体内 sections 参与校验和，改写会被判成「已篡改」。
 const postImportValidation = async (sections: string[]): Promise<ImportValidation | undefined> => {
   const isLbbak = importFileIsLbbak.value
-  let endpoint = '/config/import/validate'
-  let body: string | Blob = importFileContent.value
-  if (isLbbak) {
-    endpoint = `/config/import/validate?sections=${encodeURIComponent(sections.join(','))}`
-  } else {
-    try {
-      const parsed = JSON.parse(typeof importFileContent.value === 'string' ? importFileContent.value : '') as Record<string, unknown>
-      parsed.sections = sections
-      body = JSON.stringify(parsed)
-    } catch { /* 原样提交（后端按无效备份返回 valid=false） */ }
-  }
+  const endpoint = `/config/import/validate?sections=${encodeURIComponent(sections.join(','))}`
+  const body: string | Blob = importFileContent.value
   const res = await request.post<{ data: ImportValidation }>(endpoint, body, {
     headers: { 'Content-Type': isLbbak ? 'application/octet-stream' : 'application/json' },
     timeout: 0,
@@ -1109,11 +1117,10 @@ const confirmImport = async (): Promise<void> => {
   // 全量导入是全仓破坏性最强的操作（覆盖规则、用户、密钥、证书任务与全部凭证），
   // 此前是唯一缺二次确认弹框的破坏性操作——「确认导入」按钮与警示文案不足以兜底误点。
   try {
-    const isFullImport = validation.type === 'v1' || importSections.value.length === BACKUP_SECTIONS.length
+    // 文案单源在 utils/backupSections（V1 仅覆盖规则及其策略绑定；V2 全量含
+    // 节点拓扑）——预览与最终确认必须同一覆盖面口径。
     await ElMessageBox.confirm(
-      isFullImport
-        ? '导入将覆盖当前全部配置（规则、用户、API 密钥、证书任务及全部凭证），此操作不可撤销。确认导入？'
-        : `将仅覆盖所选分类：${importSections.value.map((k) => BACKUP_SECTIONS.find((s) => s.key === k)?.label || k).join('、')}，未选分类保持现状。此操作不可撤销。确认导入？`,
+      importConfirmMessage(validation.type, importSections.value),
       '最终确认',
       { type: 'warning', confirmButtonText: '确认导入', cancelButtonText: '取消' },
     )
@@ -1123,20 +1130,12 @@ const confirmImport = async (): Promise<void> => {
   importing.value = true
   try {
     let endpoint = validation.type === 'v1' ? '/config/import/v1' : '/config/import'
-    let importBody: string | Blob = importFileContent.value
-    if (!importFileIsLbbak.value && validation.type !== 'v1') {
-      // 顶层注入 sections(不重排原 JSON)
-      try {
-        const raw = typeof importFileContent.value === 'string' ? importFileContent.value : ''
-        const parsed = JSON.parse(raw) as Record<string, unknown>
-        parsed.sections = importSections.value
-        importBody = JSON.stringify(parsed)
-      } catch { /* 原样提交(后端会 400 校验失败) */ }
-    }
-    if (importFileIsLbbak.value && validation.type !== 'v1') {
-      // lbbak 二进制无法体内携带 sections——分类选择经 query 传输
+    // 分类选择一律经 query（v1 路径忽略该参数）：v3 纯 JSON 的体内 sections
+    // 参与校验和，改写会被判成「已篡改」，请求体恒为原始字节。
+    if (validation.type !== 'v1') {
       endpoint = `/config/import?sections=${encodeURIComponent(importSections.value.join(','))}`
     }
+    const importBody: string | Blob = importFileContent.value
     const res = await request.post<ImportResponse>(endpoint, importBody, {
       headers: { 'Content-Type': importFileIsLbbak.value ? 'application/octet-stream' : 'application/json' },
       timeout: 0,
@@ -1151,7 +1150,7 @@ const confirmImport = async (): Promise<void> => {
       ...warnings,
       // 无冲突时不占位——「冲突置为禁用：0 条」恒显属噪音行
       ...(disabledConflicts.length > 0 ? [`冲突置为禁用：${disabledConflicts.length} 条`] : []),
-      ...disabledConflicts.map(formatImportConflict),
+      ...disabledConflicts.map((conflict) => formatImportConflict(conflict)),
     ]
     await ElMessageBox.alert(
       h('div', resultLines.map((line) => h('div', line))),

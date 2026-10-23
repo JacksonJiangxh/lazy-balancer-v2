@@ -216,6 +216,12 @@ func (h *Handlers) ForgetClusterNodePin(c *gin.Context) {
 // 响应体按引用指纹缓存（一次 base64/JSON 编码），不再每请求
 // 全树打包 + 重新序列化；限流由 clusterMachineRateLimit 在路由层预占。
 func (h *Handlers) GetClusterWafFiles(c *gin.Context) {
+	// 导入窗口 fast-fail：本端点打包时取 WafFileLock，而导入排空阶段即预持该锁
+	// 至会话结束——不接门会让请求阻塞到导入完成（14MB 级打包后客户端易超时
+	// 截断），与导出端点同口径 409。
+	if rejectWriteDuringImport(c, "下发规则库文件") {
+		return
+	}
 	if !h.requireMaster(c) {
 		return
 	}

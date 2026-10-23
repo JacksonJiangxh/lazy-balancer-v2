@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"path/filepath"
 	"strings"
@@ -141,5 +142,96 @@ func TestMigrateLegacyAuditLogs_cleanCopyDropsSourceTable(t *testing.T) {
 	}
 	if copied != 1 {
 		t.Fatalf("audit row copied=%d, want 1", copied)
+	}
+}
+
+// 无冲突路径的旧表删除失败（典型：另一连接持主库写锁）不得阻断启动：
+// 此时数据已全量并入并逐列校验通过，剩余动作只是清理。降级为 WARN +
+// 系统审计留痕 + 保留旧表，下次启动幂等重试删除。
+func TestMigrateLegacyAuditLogs_dropFailureDegradesAndRetries(t *testing.T) {
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "main.db")
+	mainDB, err := sql.Open("sqlite", mainPath+"?_pragma=busy_timeout(0)")
+	if err != nil {
+		t.Fatalf("open main database: %v", err)
+	}
+	t.Cleanup(func() { _ = mainDB.Close() })
+	if _, err := mainDB.Exec(legacyAuditTableDDL); err != nil {
+		t.Fatalf("create legacy audit table: %v", err)
+	}
+	if _, err := mainDB.Exec(`INSERT INTO audit_log (id, username, action, resource, detail, ip_address, created_at) VALUES
+		(1, 'admin', '登录', '会话', 'ok', '1.1.1.1', '2026-01-01 00:00:00')`); err != nil {
+		t.Fatalf("seed legacy audit rows: %v", err)
+	}
+	auditPath := filepath.Join(dir, "audit.db")
+	auditDB, err := sql.Open("sqlite", auditPath)
+	if err != nil {
+		t.Fatalf("open audit database: %v", err)
+	}
+	if _, err := auditDB.Exec(legacyAuditTableDDL); err != nil {
+		t.Fatalf("create audit table: %v", err)
+	}
+	if err := auditDB.Close(); err != nil {
+		t.Fatalf("close audit database: %v", err)
+	}
+
+	// 独占连接持主库 RESERVED 写锁：DROP TABLE 必然 SQLITE_BUSY。
+	locker, err := sql.Open("sqlite", mainPath+"?_pragma=busy_timeout(0)")
+	if err != nil {
+		t.Fatalf("open locker: %v", err)
+	}
+	t.Cleanup(func() { _ = locker.Close() })
+	locker.SetMaxOpenConns(1)
+	lockConn, err := locker.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("acquire lock conn: %v", err)
+	}
+	if _, err := lockConn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
+		t.Fatalf("begin immediate: %v", err)
+	}
+
+	drainSystemAuditBuffer()
+	if err := migrateLegacyAuditLogs(mainDB, auditPath); err != nil {
+		t.Fatalf("DROP 失败不得阻断启动: %v", err)
+	}
+
+	// 旧表保留（待重试）；数据已复制到审计库。
+	var tableCount int
+	if err := mainDB.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='audit_log'`).Scan(&tableCount); err != nil {
+		t.Fatal(err)
+	}
+	if tableCount != 1 {
+		t.Fatalf("legacy audit table count=%d, want 1（删除失败须保留旧表待重试）", tableCount)
+	}
+	verify, err := sql.Open("sqlite", auditPath)
+	if err != nil {
+		t.Fatalf("reopen audit database: %v", err)
+	}
+	defer func() { _ = verify.Close() }()
+	var copied int
+	if err := verify.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE id=1 AND action='登录'`).Scan(&copied); err != nil {
+		t.Fatal(err)
+	}
+	if copied != 1 {
+		t.Fatalf("audit row copied=%d, want 1（删除失败前复制应已完成）", copied)
+	}
+	entries := drainSystemAuditBuffer()
+	if len(entries) != 1 || !strings.Contains(entries[0].detail, "删除失败") {
+		t.Fatalf("删除失败留痕=%+v, want 一条", entries)
+	}
+
+	// 释放锁后重试：旧表删除成功。
+	if _, err := lockConn.ExecContext(context.Background(), "ROLLBACK"); err != nil {
+		t.Fatalf("release lock: %v", err)
+	}
+	_ = lockConn.Close()
+	if err := migrateLegacyAuditLogs(mainDB, auditPath); err != nil {
+		t.Fatalf("retry after lock release: %v", err)
+	}
+	if err := mainDB.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='audit_log'`).Scan(&tableCount); err != nil {
+		t.Fatal(err)
+	}
+	if tableCount != 0 {
+		t.Fatalf("legacy audit table count=%d after retry, want 0", tableCount)
 	}
 }

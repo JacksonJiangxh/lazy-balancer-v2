@@ -84,7 +84,10 @@ func TestSecurityEventsPollOnce_auditWriterFailuresDegradeHealth(t *testing.T) {
 
 	writeWriterStats := func(dropped, ioErrors uint64) {
 		t.Helper()
-		body := fmt.Sprintf(`{"dropped":%d,"io_errors":%d,"written_at":%q}`, dropped, ioErrors, time.Now().UTC().Format(time.RFC3339))
+		// written_at 为秒精度，而进程启动基线是纳秒时刻：单跑时同秒写入会被
+		// 判为「上一代进程产物」并复位基线（WriterDropped 恒 0 假红）。
+		// 夹具统一写 now+1s（与 sidecar_health 用例同法）。
+		body := fmt.Sprintf(`{"dropped":%d,"io_errors":%d,"written_at":%q}`, dropped, ioErrors, time.Now().Add(time.Second).UTC().Format(time.RFC3339))
 		if err := os.WriteFile(securityEventsAuditWriterStatsPath(), []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}

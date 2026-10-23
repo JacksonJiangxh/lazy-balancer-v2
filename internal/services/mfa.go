@@ -3,6 +3,7 @@ package services
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base32"
 	"encoding/hex"
 	"encoding/json"
@@ -273,6 +274,11 @@ func MFARecordChallengeFailure(token string) bool {
 		    consumed=CASE WHEN COALESCE(attempts,0)+1>=? THEN 1 ELSE consumed END
 		WHERE token=? AND consumed=0 AND expires_at > datetime('now')
 		RETURNING COALESCE(attempts,0)`, mfaChallengeFailThreshold, token).Scan(&attempts); err != nil {
+		// 挑战不存在/已消费/已过期是正常判定分支；其余写失败说明失败计数
+		// 没落库（挑战级作废阈值会静默失效），必须留痕。
+		if !errors.Is(err, sql.ErrNoRows) {
+			Logf("error", "MFA 挑战失败计数写入失败: %v", err)
+		}
 		return false
 	}
 	return attempts >= mfaChallengeFailThreshold
@@ -303,8 +309,12 @@ func MFAConsumeChallenge(token string, userID int) (bool, error) {
 // 作废（consumed=1），B 的归还若在此后到达会把作废状态抹回未消费——单挑战
 // 10 次硬闸被并发抹平。阈值判定与写入同一条件 UPDATE，归还永不复活已作废挑战。
 func MFARestoreChallenge(token string, userID int) {
-	_, _ = db.DB.Exec("UPDATE mfa_challenges SET consumed=0 WHERE token=? AND user_id=? AND consumed=1 AND COALESCE(attempts,0) < ?",
-		token, userID, mfaChallengeFailThreshold)
+	// 归还是「错误验证码不烧挑战」的实现基础：写失败会让用户持同一 token
+	// 也无法重试（挑战停在已消费态），因此必须留痕而非静默丢弃。
+	if _, err := db.DB.Exec("UPDATE mfa_challenges SET consumed=0 WHERE token=? AND user_id=? AND consumed=1 AND COALESCE(attempts,0) < ?",
+		token, userID, mfaChallengeFailThreshold); err != nil {
+		Logf("warn", "MFA 挑战归还失败: %v", err)
+	}
 }
 
 // —— 主验证入口 ——

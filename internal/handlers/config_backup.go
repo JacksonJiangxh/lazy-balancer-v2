@@ -185,22 +185,18 @@ func parseSectionsParam(qs string) []string {
 
 // resolveImportSectionSelection 解析本次导入/预览的有效分类选择——单源，
 // 两条路径各调一次，保证「预览通过=导入可提交」。
-//   - lbbak 通道的分类选择经 ?sections= query 传输（与导出对称），体内
-//     sections 是打包时的分类记录：两者同时给值时取交集——query 选到备份未含
-//     的分类会过滤掉全部表，替换式覆盖会让「零导入」冒充成功；
-//   - 纯 JSON 通道无 query 语义，体内 sections 即有效选择（归一 legacy 键）。
+// 分类选择经 ?sections= query 传输（与导出对称），体内 sections 是打包时的
+// 分类记录：两者同时给值时取交集——query 选到备份未含的分类会过滤掉全部表，
+// 替换式覆盖会让「零导入」冒充成功；只缩不扩，绝不改写体内值（v3 纯 JSON 的
+// 体内 sections 参与校验和，改写会被判成「已篡改」）。
 //
 // 交集为空返回与导入 400 完全一致的文案错误（预览以 valid=false 呈现）。
-func resolveImportSectionSelection(backup *configBackup, queryRaw string, viaLbbak bool) error {
+func resolveImportSectionSelection(backup *configBackup, queryRaw string) error {
 	bodySections := normalizeBackupSectionKeys(backup.Sections)
-	if !viaLbbak {
-		backup.Sections = bodySections
-		return nil
-	}
 	querySections := normalizeBackupSectionKeys(parseSectionsParam(queryRaw))
 	switch {
 	case len(querySections) == 0:
-		// query 未指定：沿用体内 sections（lbbak 打包时的分类记录）。
+		// query 未指定：沿用体内 sections（打包时的分类记录）。
 		backup.Sections = bodySections
 		return nil
 	case len(bodySections) == 0:
@@ -334,7 +330,7 @@ var backupBooleanTableColumns = map[string][]string{
 	// DEFAULT 0 的 INTEGER 0/1 语义列——此前漏列，字符串形态可绕过布尔类型门。
 	"lb_rules":              {"dynamic_dns", "enable_dns_server", "enable_active_health_check", "tcp_proxy_protocol", "custom_routes_enabled", "enable_tls", "tls_http_redirect", "enable_compress", "enabled", "log_enabled", "ntlm_compatible", "upstream_force_http1"},
 	"upstreams":             {"dynamic_dns", "enabled"},
-	"users":                 {"is_enabled", "mfa_enabled"},
+	"users":                 {"is_enabled", "mfa_enabled", "is_setup_admin"},
 	"api_keys":              {"is_enabled", "mcp_enabled", "read_only"},
 	"ca_providers":          {"enabled"},
 	"certificate_configs":   {"enabled"},
@@ -444,9 +440,10 @@ var backupTableNullDefaults = map[string]map[string]any{
 		"origin_domain": "",
 	},
 	"users": {
-		"role": "user", "display_name": "", "is_enabled": int64(1), "password_version": int64(0),
-		"created_at":  "1970-01-01 00:00:00",
-		"mfa_enabled": int64(0), "mfa_secret": "", "mfa_recovery_codes": "[]",
+		"role": "user", "display_name": "", "is_enabled": int64(1), "is_setup_admin": int64(0),
+		"password_version": int64(0),
+		"created_at":       "1970-01-01 00:00:00",
+		"mfa_enabled":      int64(0), "mfa_secret": "", "mfa_recovery_codes": "[]",
 		"mfa_last_timestep": int64(0),
 		// 登录记账/来源标记（db.go users DDL）：NOT NULL DEFAULT 0 / 'local'。
 		"login_failed_attempts": int64(0), "auth_provider": "local",
@@ -721,6 +718,97 @@ func validateV2BackupTimestamps(tables map[string][]map[string]any) error {
 	return nil
 }
 
+// isBackupIntegerValue 判定备份值能否安全落入 INTEGER 声明列。允许整数数值、
+// 布尔（落库为 1/0）与整数形字符串（无首尾空白）；拒绝 "abc"、小数、数组等
+// ——它们落库后保留 TEXT/REAL 存储类，读侧 raw int/int64 扫描持续 500。
+func isBackupIntegerValue(value any) bool {
+	switch v := value.(type) {
+	case nil:
+		return true
+	case bool:
+		return true
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32:
+		return true
+	case uint64:
+		return v <= uint64(math.MaxInt64)
+	case float32:
+		f := float64(v)
+		return f == math.Trunc(f) && f >= math.MinInt64 && f <= math.MaxInt64
+	case float64:
+		return v == math.Trunc(v) && v >= math.MinInt64 && v <= math.MaxInt64
+	case json.Number:
+		_, err := v.Int64()
+		return err == nil
+	case string:
+		// 逐字校验（不 TrimSpace）：首尾空白串在驱动扫描时不可解析，校验期
+		// 宽松放行只会把失败推迟到读侧。
+		if v == "" || strings.TrimSpace(v) != v {
+			return false
+		}
+		_, err := strconv.ParseInt(v, 10, 64)
+		return err == nil
+	default:
+		return false
+	}
+}
+
+// backupIntegerColumnsForTable 返回实时 schema 中声明 INTEGER 的列名。
+// 判据取 PRAGMA（列声明事实），不维护静态清单——新增 INTEGER 列自动纳入，
+// 不会像静态表那样随 schema 漂移。
+func backupIntegerColumnsForTable(ctx context.Context, database *sql.DB, table string) ([]string, error) {
+	rows, err := database.QueryContext(ctx, `SELECT name, type FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var columns []string
+	for rows.Next() {
+		var name, declType string
+		if err := rows.Scan(&name, &declType); err != nil {
+			return nil, err
+		}
+		if strings.Contains(strings.ToUpper(declType), "INT") {
+			columns = append(columns, name)
+		}
+	}
+	return columns, rows.Err()
+}
+
+// validateV2BackupIntegerTypes 数值列类型门：声明 INTEGER 的列只接受整数形态。
+// 与布尔/时间门同位（写入侧 restoreTable 只做布尔归一与 NULL 默认，其余值原样
+// 绑定），否则文本值落库保留 TEXT 存储类，MFA 校验（users.mfa_last_timestep）、
+// 证书任务列表（cert_jobs.renewal_attempts）等 raw int 扫描持续 500。
+// database==nil（旧脚手架）跳过——写入侧列约束兜底。
+func validateV2BackupIntegerTypes(ctx context.Context, database *sql.DB, tables map[string][]map[string]any) error {
+	if database == nil {
+		return nil
+	}
+	for table, rows := range tables {
+		if len(rows) == 0 {
+			continue
+		}
+		columns, err := backupIntegerColumnsForTable(ctx, database, table)
+		if err != nil {
+			return fmt.Errorf("备份校验失败：读取 %s 列类型失败: %w", table, err)
+		}
+		if len(columns) == 0 {
+			continue
+		}
+		for index, row := range rows {
+			for _, column := range columns {
+				raw, exists := row[column]
+				if !exists {
+					continue
+				}
+				if !isBackupIntegerValue(raw) {
+					return fmt.Errorf("备份校验失败：%s 第 %d 行 %s 需为整数（整数数值或整数形字符串），实际类型 %T", table, index+1, column, raw)
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // normalizeBackupBooleanValue 把已通过行级门的布尔列值归一为 INTEGER 0/1。
 // 规范与 legacy 导入都会先经 validateV2BackupBooleanTypes，字符串、数值 2
 // 及其他畸形形态均在到达写入侧前拒绝；这里不保留第二套字符串解释语义。
@@ -975,10 +1063,10 @@ func restoreTable(ctx context.Context, tx *sql.Tx, database *sql.DB, table strin
 
 // tcpRuleDeadFieldsResetSQL：TCP 行 HTTP 专属死值清零（HTTP 头/健康检查/
 // 压缩/请求体/NTLM/force_http1 + TLS 来源、跳转与材料 + 代理超时族七列 +
-// 自定义路由 + dynamic_dns + strategy(cookie) + 阶段页四列 + log_enabled，
-// 共 31 列 SET）——字面量单源已下沉 db 包（启动迁移与导入归一共用同一
-// 常量，消灭跨包双份逐字镜像的漂移面）；本别名仅保留 handlers 包内既有
-// 引用点与派生（下方单规则变体）。
+// 自定义路由 + dynamic_dns + strategy(cookie) + dns_family(ipv4) + 阶段页四列
+// + log_enabled，共 32 列 SET）——字面量单源已下沉 db 包（启动迁移与导入归一
+// 共用同一常量，消灭跨包双份逐字镜像的漂移面）；本别名仅保留 handlers 包内
+// 既有引用点与派生（下方单规则变体）。
 const tcpRuleDeadFieldsResetSQL = db.TCPRuleDeadFieldsResetSQL
 
 // tcpRulePathRulesResetSQL：TCP 规则残留路径规则清理（TCP 自愈族）——
@@ -1774,7 +1862,7 @@ func backupUserLoginCapable(user map[string]any) bool {
 // validateV2BackupRows 行级门（布尔类型/白名单/凭证），必须在
 // sections 过滤之后执行：未选分类的坏行不误拒整包，选中分类照常
 // 严格校验。checksum 已在 verifyBackupIntegrity 对全量计算。
-func validateV2BackupRows(backup configBackup) error {
+func validateV2BackupRows(ctx context.Context, database *sql.DB, backup configBackup) error {
 	// 自定义规则行级验证（保存侧同款约束）。
 	if rows, ok := backup.Tables["security_custom_rules"]; ok {
 		if err := validateImportedSecurityCustomRules(rows); err != nil {
@@ -1824,6 +1912,11 @@ func validateV2BackupRows(backup configBackup) error {
 	// 时间列空串/不可解析文本门——必须在写入前拦下，
 	// 否则导入后 users/lb_rules/cert_jobs/path_rules 的 raw time 扫描每次 500。
 	if err := validateV2BackupTimestamps(backup.Tables); err != nil {
+		return err
+	}
+	// 数值列类型门与布尔/时间门同位：文本形态落库后保留 TEXT 存储类，读侧
+	// raw int/int64 扫描（MFA 时间步/证书任务重试计数）持续 500 且无自愈路径。
+	if err := validateV2BackupIntegerTypes(ctx, database, backup.Tables); err != nil {
 		return err
 	}
 	const invalidCredentialsMsg = "备份包含无效的凭证格式（ca_providers.credentials / certificate_configs.dns_credentials 需为 JSON 对象）"
@@ -2379,8 +2472,13 @@ func validateV2BackupRules(tables map[string][]map[string]any, portGates ...func
 		if err := validateRuleHostHeader(backupString(rule["host_header"])); err != nil {
 			return fmt.Errorf("规则 #%d：%w", index+1, err)
 		}
-		if err := validateRuleHealthCheckPath(backupString(rule["health_check_path"])); err != nil {
-			return fmt.Errorf("规则 #%d：%w", index+1, err)
+		// 健康检查路径与保存侧同口径：仅在主动健康检查启用时有渲染消费，
+		// 未启用属死字段——存量死组合（enable=0 + path 无前导 /）不得让整包
+		// 导入被无关校验拒绝。不改写备份数据（导入是存量行还原）。
+		if backupBooleanEnabled(rule["enable_active_health_check"]) {
+			if err := validateRuleHealthCheckPath(backupString(rule["health_check_path"])); err != nil {
+				return fmt.Errorf("规则 #%d：%w", index+1, err)
+			}
 		}
 		if err := validateDnsServerShape(backupString(rule["dns_server"])); err != nil {
 			return fmt.Errorf("规则 #%d：%w", index+1, err)
@@ -4559,6 +4657,159 @@ func nodeSurvivingIdentities(backupRows []map[string]any) map[string]bool {
 	return surviving
 }
 
+// reconcileImportNodeTokens 在 nodes 全表替换前按 (ip_address,port) 与本地现存
+// 节点比对：身份匹配且本地持有令牌时保留本地 cluster_token_hash / is_approved /
+// cluster_token_delivered（备份只提供坐标/名称/同步间隔等拓扑属性）。否则跨环境
+// 导入或「回滚旧备份」会把备份里的旧令牌哈希覆盖到仍存活的节点行上，真实从节点
+// 令牌立即 401，从端按终止类停止重试，全集群需人工重新审批。
+// 返回「备份令牌被忽略」的节点数（用于 warnings + 审计）。本地无该身份（真正
+// 灾备到新机）时沿用备份令牌，保持灾备主路径不变。
+func reconcileImportNodeTokens(ctx context.Context, tx *sql.Tx, rows []map[string]any) (int, error) {
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	type liveNodeToken struct {
+		hash      string
+		approved  int
+		delivered int
+	}
+	live := make(map[string]liveNodeToken)
+	liveRows, err := tx.QueryContext(ctx, `SELECT COALESCE(ip_address,''), COALESCE(port,8000),
+		COALESCE(cluster_token_hash,''), COALESCE(is_approved,0), COALESCE(cluster_token_delivered,0) FROM nodes`)
+	if err != nil {
+		return 0, fmt.Errorf("读取本地节点令牌: %w", err)
+	}
+	for liveRows.Next() {
+		var ip, hash string
+		var port, approved, delivered int
+		if err := liveRows.Scan(&ip, &port, &hash, &approved, &delivered); err != nil {
+			liveRows.Close()
+			return 0, err
+		}
+		if ip == "" {
+			continue
+		}
+		live[ip+":"+strconv.Itoa(port)] = liveNodeToken{hash: hash, approved: approved, delivered: delivered}
+	}
+	if err := liveRows.Err(); err != nil {
+		liveRows.Close()
+		return 0, err
+	}
+	liveRows.Close()
+
+	ignored := 0
+	for _, row := range rows {
+		ip := backupString(row["ip_address"])
+		if ip == "" {
+			continue
+		}
+		// port 缺键/NULL 取与落库同源默认（backupTableNullDefaults），与
+		// nodeSurvivingIdentities 口径一致。
+		port, ok := backupInteger(row["port"])
+		if !ok {
+			port = backupInt(backupTableNullDefaults["nodes"]["port"])
+		}
+		local, exists := live[ip+":"+strconv.Itoa(port)]
+		if !exists || local.hash == "" {
+			continue
+		}
+		if backupHash := backupString(row["cluster_token_hash"]); backupHash != "" && backupHash != local.hash {
+			ignored++
+		}
+		row["cluster_token_hash"] = local.hash
+		row["is_approved"] = local.approved
+		row["cluster_token_delivered"] = local.delivered
+	}
+	return ignored, nil
+}
+
+// importAttributionTables 全部引用 users.id 的归属列（lb_rules 两列 + 安全四表；
+// api_keys.created_by 随 users 分节同批替换、cluster_register_tokens 不在备份面，
+// 均不入列）。
+var importAttributionTables = map[string][]string{
+	"lb_rules":              {"created_by", "updated_by"},
+	"security_policies":     {"updated_by"},
+	"security_ip_lists":     {"created_by", "updated_by"},
+	"security_block_pages":  {"created_by", "updated_by"},
+	"security_custom_rules": {"updated_by"},
+}
+
+// snapshotImportUserNames 在 users 全表替换前快照本地 id→username，供导入后
+// 判断归属列是否「换了人」。读失败仅留痕（告警降级，不影响导入）。
+func snapshotImportUserNames(ctx context.Context, tx *sql.Tx) map[int]string {
+	names := make(map[int]string)
+	rows, err := tx.QueryContext(ctx, `SELECT id, COALESCE(username,'') FROM users`)
+	if err != nil {
+		services.Logf("warn", "配置导入：快照本地用户名失败（归属告警跳过）: %v", err)
+		return names
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int
+		var name string
+		if err := rows.Scan(&id, &name); err != nil {
+			services.Logf("warn", "配置导入：扫描本地用户名失败（归属告警跳过）: %v", err)
+			return names
+		}
+		names[id] = name
+	}
+	return names
+}
+
+// collectImportAttributionMismatches 统计「users 已替换、但该归属表未随包替换」
+// 时归属 id 指向的人发生变化的行数：同 id 在导入用户集中换成了另一位用户，或
+// 该 id 已不在导入用户集中。只统计导入引入的变化——本地与导入两侧都缺失的
+// 「—」不算。用户名变化也可能只是重命名（合法），因此只告警/审计，不改写。
+func collectImportAttributionMismatches(ctx context.Context, tx *sql.Tx, tables map[string][]map[string]any, localUserNames map[int]string) int {
+	importedUserNames := make(map[int]string)
+	for _, row := range tables["users"] {
+		id, ok := backupInteger(row["id"])
+		if !ok {
+			continue
+		}
+		importedUserNames[id] = backupString(row["username"])
+	}
+	total := 0
+	for table, columns := range importAttributionTables {
+		if _, replaced := tables[table]; replaced {
+			// 表随包替换：归属值来自同一份备份，与本包用户集自洽。
+			continue
+		}
+		rows, err := tx.QueryContext(ctx, "SELECT "+strings.Join(columns, ", ")+" FROM "+table)
+		if err != nil {
+			services.Logf("warn", "配置导入：读取 %s 归属列失败（归属告警跳过）: %v", table, err)
+			return total
+		}
+		values := make([]sql.NullInt64, len(columns))
+		targets := make([]any, len(columns))
+		for index := range values {
+			targets[index] = &values[index]
+		}
+		for rows.Next() {
+			if err := rows.Scan(targets...); err != nil {
+				services.Logf("warn", "配置导入：扫描 %s 归属列失败（归属告警跳过）: %v", table, err)
+				break
+			}
+			mismatched := false
+			for _, value := range values {
+				if !value.Valid || value.Int64 == 0 {
+					continue
+				}
+				id := int(value.Int64)
+				if localUserNames[id] != importedUserNames[id] {
+					mismatched = true
+					break
+				}
+			}
+			if mismatched {
+				total++
+			}
+		}
+		rows.Close()
+	}
+	return total
+}
+
 // suppressImportClusterVersionBumps 在导入事务内暂时把 is_master 置为 0，
 // 使既有行级触发器跳过逐行 cluster_version 写放大；提交前由返回的 restore
 // 恢复角色。读取/恢复都采用 COALESCE(is_master,1) 单源口径（NULL 视为主节点，
@@ -4913,7 +5164,7 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	// sections 为准；交集为空显式 400 点名双方选择。
 	// 必须在完整性校验之后解析——v3 校验和覆盖体内 sections（还原范围），
 	// 用请求交集覆盖后再校验会把合法的子集导入误判为篡改。
-	if err := resolveImportSectionSelection(&backup, c.Query("sections"), lbbakFiles != nil); err != nil {
+	if err := resolveImportSectionSelection(&backup, c.Query("sections")); err != nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
@@ -4980,7 +5231,7 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	// 同哲学）。
 	skipWarnings = append(skipWarnings, normalizeImportedVersionUpdateStatuses(backup.Tables)...)
 	// 行级门在 sections 过滤与软跳过之后（未选/已跳分类的坏行不误拒整包）。
-	if err := validateV2BackupRows(backup); err != nil {
+	if err := validateV2BackupRows(c.Request.Context(), db.DB, backup); err != nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
 	}
@@ -5349,6 +5600,25 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	if nodeRows, nodesCarried := backup.Tables["nodes"]; nodesCarried && h.clusterService != nil {
 		clearedNodeArtifacts = h.clearDeletedNodeStateBeforeRestore(ctx, tx, nodeRows)
 	}
+	// nodes 全表替换前保留「身份匹配且本地持有令牌」节点的本地令牌/审批态，
+	// 避免备份中的旧令牌哈希切断仍存活从节点的认证（跨环境导入/回滚旧备份）。
+	ignoredNodeTokens := 0
+	if nodeRows, nodesCarried := backup.Tables["nodes"]; nodesCarried {
+		ignoredNodeTokens, err = reconcileImportNodeTokens(ctx, tx, nodeRows)
+		if err != nil {
+			err = session.abort(err)
+			recordAudit(c, action+"失败", "配置备份", err.Error())
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: action + "失败，已回滚: " + err.Error()})
+			return
+		}
+	}
+	// users 分节替换会同时改变归属列的「作者」语义：归属列是数字 id、无外键，
+	// 未随包替换的规则/安全表仍指向同一 id，但该 id 已换成另一个人（或不再
+	// 存在）。导入前快照本地用户名，提交前只统计与告警，不改写归属字段。
+	var localUserNames map[int]string
+	if _, usersCarried := backup.Tables["users"]; usersCarried {
+		localUserNames = snapshotImportUserNames(ctx, tx)
+	}
 	deleteOrder := []string{"security_policy_bindings", "security_crs_version", "security_ip2region_version", "security_threat_sources", "security_crawler_sources", "security_custom_rules", "security_block_pages", "security_ip_lists", "security_policies", "api_keys", "path_rules", "upstreams", "cert_jobs", "lb_rules", "users", "ca_providers", "certificate_configs", "nodes"}
 	for _, table := range deleteOrder {
 		if _, exists := backup.Tables[table]; !exists {
@@ -5388,6 +5658,23 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: action + "失败，已回滚: " + err.Error()})
 			return
 		}
+	}
+	// setup 管理员标记兜底：旧备份不含 is_setup_admin（缺键→列默认 0）或标记
+	// 行已不是启用的管理员时，按「最低 id 的启用管理员」重建 break-glass 保护
+	// 目标——否则跨实例还原后保护可能落到普通账号（错保护）或不落任何行
+	// （漏保护）。与启动迁移同一实现，事务内执行随导入一并回滚。
+	if _, usersCarried := backup.Tables["users"]; usersCarried {
+		if err := db.EnsureSetupAdminFlag(ctx, tx); err != nil {
+			err = session.abort(err)
+			recordAudit(c, action+"失败", "配置备份", err.Error())
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: action + "失败，已回滚: " + err.Error()})
+			return
+		}
+	}
+	// users 已替换、归属表未替换时统计「换了人/已不存在」的行数（只告警不改写）。
+	attributionMismatches := 0
+	if localUserNames != nil {
+		attributionMismatches = collectImportAttributionMismatches(ctx, tx, backup.Tables, localUserNames)
 	}
 	// 规则三面同构（2026-10-11 用户裁定；收敛）：导入的规则行
 	// 在事务内做 TCP 死值清零（七字段+TLS 三字段）+ lb_rules/path_rules 时间戳
@@ -5904,6 +6191,12 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	if clearedNodeArtifacts > 0 {
 		auditParts = append(auditParts, fmt.Sprintf("清理已删除节点 %d 个的证书指纹钉与分区上报缓存", clearedNodeArtifacts))
 	}
+	if ignoredNodeTokens > 0 {
+		auditParts = append(auditParts, fmt.Sprintf("%d 个节点的备份令牌被忽略（已保留本地令牌与审批状态）", ignoredNodeTokens))
+	}
+	if attributionMismatches > 0 {
+		auditParts = append(auditParts, fmt.Sprintf("%d 条记录的归属用户与导入用户集不一致（未改写归属字段）", attributionMismatches))
+	}
 	if prunedBindings > 0 {
 		auditParts = append(auditParts, fmt.Sprintf("清理悬挂安全策略绑定：%d 条", prunedBindings))
 	}
@@ -5932,6 +6225,12 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	}
 	if brandingWarning != "" {
 		responseWarnings = append(append([]string{}, responseWarnings...), brandingWarning)
+	}
+	if ignoredNodeTokens > 0 {
+		responseWarnings = append(append([]string{}, responseWarnings...), fmt.Sprintf("%d 个节点的备份令牌与本地不一致，已保留本地令牌与审批状态（备份仅恢复拓扑属性，从节点无需重新审批）", ignoredNodeTokens))
+	}
+	if attributionMismatches > 0 {
+		responseWarnings = append(append([]string{}, responseWarnings...), fmt.Sprintf("%d 条记录的归属用户未随备份包含或已被替换，作者显示可能为空或错配（导入未改写归属字段）", attributionMismatches))
 	}
 	if prunedBindings > 0 {
 		responseWarnings = append(append([]string{}, responseWarnings...), fmt.Sprintf("已按导入后的规则与策略视图清理 %d 条悬挂安全策略绑定", prunedBindings))

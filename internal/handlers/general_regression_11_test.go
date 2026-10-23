@@ -143,22 +143,60 @@ func TestRunAutoBackupOnce_cancelledContextWritesNothing(t *testing.T) {
 
 // auto_backups 行 → prune 永不回收；修复前仅 Rename 失败分支清理）。
 func TestRunAutoBackupOnce_writeFailureLeavesNoTmp(t *testing.T) {
-	h := newAutoBackupTestHandlers(t)
-	dir := h.cfg.BackupDir
-	if err := os.Chmod(dir, 0o500); err != nil {
-		t.Fatalf("chmod backup dir: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	// 写失败注入走落盘缝（autoBackupWriteFile）：不依赖文件系统权限语义——
+	// root / 容器内 chmod 0500 不阻断写入，权限位形态会让该回归在 CI 假红
+	// （或被跳过而彻底失去覆盖）。注入形态任何身份都可跑。
+	t.Run("injected", func(t *testing.T) {
+		h := newAutoBackupTestHandlers(t)
+		dir := h.cfg.BackupDir
+		orig := autoBackupWriteFile
+		autoBackupWriteFile = func(string, []byte) error { return os.ErrPermission }
+		t.Cleanup(func() { autoBackupWriteFile = orig })
 
-	// When
-	if _, err := h.RunAutoBackupOnce(context.Background(), "manual", "system", 0); err == nil {
-		t.Fatal("只读备份目录下应写盘失败")
-	}
+		// When
+		if _, err := h.RunAutoBackupOnce(context.Background(), "manual", "system", 0); err == nil {
+			t.Fatal("落盘失败应返回错误")
+		}
 
-	// Then：目录内无 .tmp 残留
-	if matches, _ := filepath.Glob(filepath.Join(dir, "*.tmp")); len(matches) != 0 {
-		t.Fatalf("写失败后残留 tmp=%v, want 零", matches)
-	}
+		// Then：失败后不得留下 success 行（失败行是允许的终态留痕），
+		// 目录内无 .tmp 残留。
+		var successRows int
+		if err := db.DB.QueryRow(`SELECT COUNT(*) FROM auto_backups WHERE status='success'`).Scan(&successRows); err != nil {
+			t.Fatal(err)
+		}
+		if successRows != 0 {
+			t.Fatalf("写盘失败后仍有 success 行 %d 条", successRows)
+		}
+		if matches, _ := filepath.Glob(filepath.Join(dir, "*.tmp")); len(matches) != 0 {
+			t.Fatalf("写失败后残留 tmp=%v, want 零", matches)
+		}
+	})
+
+	// 权限位形态保留为附加子用例，但先探测 0500 是否真的拦截写入（root 下
+	// 不拦截 → skip 并说明语义已由注入子用例覆盖）。
+	t.Run("readonly-dir", func(t *testing.T) {
+		h := newAutoBackupTestHandlers(t)
+		dir := h.cfg.BackupDir
+		if err := os.Chmod(dir, 0o500); err != nil {
+			t.Fatalf("chmod backup dir: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+		probe := filepath.Join(dir, ".write-probe")
+		if err := os.WriteFile(probe, []byte("x"), 0o600); err == nil {
+			_ = os.Remove(probe)
+			t.Skip("当前身份不受目录权限位约束（root/容器内），写失败语义已由 injected 子用例覆盖")
+		}
+
+		// When
+		if _, err := h.RunAutoBackupOnce(context.Background(), "manual", "system", 0); err == nil {
+			t.Fatal("只读备份目录下应写盘失败")
+		}
+
+		// Then：目录内无 .tmp 残留
+		if matches, _ := filepath.Glob(filepath.Join(dir, "*.tmp")); len(matches) != 0 {
+			t.Fatalf("写失败后残留 tmp=%v, want 零", matches)
+		}
+	})
 }
 
 // ABORT）时频率/范围/保留份数不得已生效（修复前先落库后写开关，返回 500

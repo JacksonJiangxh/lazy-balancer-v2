@@ -11,6 +11,7 @@ cd "$(dirname "$0")/.."
 # 守卫本体 + 守卫自检（自检在临时夹具仓里验证命中面与误报边界——守卫的
 # 模式退化必须在这里先红，而不是等到审计产物真的混进公网仓库）。
 ./scripts/check-no-audit-artifacts.sh
+./scripts/check-bulk-edit-safety.sh
 ./scripts/tests/guard-selftest.sh
 
 # 启动链工件语法：docker-entrypoint.sh 是每次部署的唯一入口（语法错误 = 面板
@@ -173,10 +174,12 @@ for module in "${modules[@]}"; do
 done
 rm -rf "$cross_bin"
 
-# 竞态门：并发核心（任务引擎 + 进程内 Caddy 协作/监督器探测）此前只在本地
-# 手工跑 -race。全量 -race 会把门禁时长成倍拉长，故只覆盖并发密集入口。
+# 竞态门：并发核心（任务引擎 + 中间件限流/白名单缓存 + 进程内 Caddy 协作/
+# 监督器探测）此前只在本地手工跑 -race，且 middleware 不在覆盖内——限流桶
+# （双层锁 + 换代计数）、API Key 白名单缓存、认证审计限流、MCP 响应缓冲都在
+# 这个包里。全量 -race 会把门禁时长成倍拉长，故只覆盖并发密集入口。
 echo "== go test -race (concurrency cores) =="
-go test -race -count=1 ./internal/taskengine ./cmd/...
+go test -race -count=1 ./internal/taskengine ./internal/middleware ./cmd/...
 
 echo "== frontend tests/typecheck/build =="
 # vue-tsc 看不到模板编译期错误，发布契约要求真实 vite build

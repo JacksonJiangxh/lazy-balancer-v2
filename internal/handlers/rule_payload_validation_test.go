@@ -12,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 	"lazy-balancer-v2/internal/services"
 )
@@ -44,6 +45,14 @@ func TestRulePayload_hostHeaderAndDnsServerValidation(t *testing.T) {
 	rec = create(base(`"dynamic_dns":true,"dns_server":"8.8.8.8:notaport"`))
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("garbage dns_server must 400, got %d %s", rec.Code, rec.Body.String())
+	}
+	// 拒绝必须零落库：动态 DNS 行带着不可用解析器进库会让渲染期静默降级。
+	var rejectedRows int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM lb_rules WHERE name='payload-v'`).Scan(&rejectedRows); err != nil {
+		t.Fatalf("count rejected rows: %v", err)
+	}
+	if rejectedRows != 0 {
+		t.Fatalf("rejected dns_server payload rows=%d, want 0", rejectedRows)
 	}
 
 	// 形状三(回归):合法形状放行

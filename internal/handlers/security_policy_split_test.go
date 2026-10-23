@@ -521,3 +521,88 @@ func TestSplitSecurityPolicy_skipsRuleWithExistingStage2(t *testing.T) {
 		t.Fatal("original mixed policy must be kept while a skipped rule still references it")
 	}
 }
+
+// fillSecurityPolicies 补足策略行到 total 条（上限判定的种子辅助）。
+func fillSecurityPolicies(t *testing.T, total int) {
+	t.Helper()
+	var current int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM security_policies`).Scan(&current); err != nil {
+		t.Fatal(err)
+	}
+	for i := current; i < total; i++ {
+		if _, err := db.DB.Exec(`INSERT INTO security_policies (name, mode) VALUES (?, 'off')`, "filler-"+strconv.Itoa(i)); err != nil {
+			t.Fatalf("fill policy %d: %v", i, err)
+		}
+	}
+}
+
+// 拆分是「新建策略」路径：子策略同样受全局 200 条上限约束。上限检查必须在
+// 事务内按「当前条数 + 本次子策略数」fail-closed——否则 200 条混合策略一次
+// 拆成 800 条子策略，逐行消费的列表/导入面被批量绕开。
+func TestSplitSecurityPolicy_respectsGlobalPolicyLimit(t *testing.T) {
+	t.Run("over limit rejects without partial children", func(t *testing.T) {
+		setupSecurityPolicyTestDB(t)
+		mixedID := seedSplitFixture(t) // 1 行；本次将产出 3 条子策略（阶段 1/2/3）
+		fillSecurityPolicies(t, securityPolicyMaxGlobalCount-2)
+		router := splitRouter(t)
+		recorder := postSplit(t, router, mixedID)
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("status=%d body=%s, want 400（%d 条 + 3 子策略触顶）", recorder.Code, recorder.Body.String(), securityPolicyMaxGlobalCount-2)
+		}
+		var total int
+		if err := db.DB.QueryRow(`SELECT COUNT(*) FROM security_policies`).Scan(&total); err != nil {
+			t.Fatal(err)
+		}
+		if total != securityPolicyMaxGlobalCount-2 {
+			t.Fatalf("策略总数=%d, want %d（拒绝时不得留下半截子策略）", total, securityPolicyMaxGlobalCount-2)
+		}
+		var childCount int
+		if err := db.DB.QueryRow(`SELECT COUNT(*) FROM security_policies WHERE name LIKE 'legacy-mix（%'`).Scan(&childCount); err != nil {
+			t.Fatal(err)
+		}
+		if childCount != 0 {
+			t.Fatalf("子策略落库 %d 条, want 0", childCount)
+		}
+	})
+
+	t.Run("at boundary accepts", func(t *testing.T) {
+		setupSecurityPolicyTestDB(t)
+		mixedID := seedSplitFixture(t)
+		fillSecurityPolicies(t, securityPolicyMaxGlobalCount-3)
+		recorder := postSplit(t, splitRouter(t), mixedID)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s, want 200（%d 条 + 3 子策略恰好到顶）", recorder.Code, recorder.Body.String(), securityPolicyMaxGlobalCount-3)
+		}
+		var total int
+		if err := db.DB.QueryRow(`SELECT COUNT(*) FROM security_policies`).Scan(&total); err != nil {
+			t.Fatal(err)
+		}
+		// 无 skipped 时原策略被删除：197 + 3 子策略 - 1 原策略 = 199。
+		if total != securityPolicyMaxGlobalCount-1 {
+			t.Fatalf("策略总数=%d, want %d", total, securityPolicyMaxGlobalCount-1)
+		}
+	})
+}
+
+// 空 ip_acl_mode 是存量脏值：拆出的阶段 1 子策略落库必须用归一后的 deny
+// （与 Create 缺省口径一致），而校验与落库共用同一归一值。
+func TestSplitSecurityPolicy_normalizesEmptyACLMode(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	res, err := db.DB.Exec(`INSERT INTO security_policies (name,mode,ip_acl_enabled,ip_acl_mode,ip_acl_list,policy_type,enabled)
+		VALUES ('legacy-empty-acl','blocking',1,'','["203.0.113.0/24"]','mixed',0)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := res.LastInsertId()
+	recorder := postSplit(t, splitRouter(t), int(id))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
+	}
+	var mode string
+	if err := db.DB.QueryRow(`SELECT COALESCE(ip_acl_mode,'') FROM security_policies WHERE name='legacy-empty-acl（阶段 1）'`).Scan(&mode); err != nil {
+		t.Fatalf("read stage1 child: %v", err)
+	}
+	if mode != "deny" {
+		t.Fatalf("stage1 子策略 ip_acl_mode=%q, want 归一后的 deny", mode)
+	}
+}

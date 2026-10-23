@@ -86,6 +86,48 @@ func TestTrustedProxyDegradation_bannerRecordsOnApply(t *testing.T) {
 	if got := LastRenderDegradation(); got != "" {
 		t.Fatalf("clean render+apply must clear degradation state, got %q", got)
 	}
+	// 横幅清除完全依赖强制重载成功分支（applyRenderDegradationState 空值早退，
+	// 不清库）——必须显式断言，否则「横幅滞留」回归全绿。
+	var bannerAfterClean string
+	if err := database.QueryRow(`SELECT COALESCE(caddy_apply_error,'') FROM global_config WHERE id=1`).Scan(&bannerAfterClean); err != nil {
+		t.Fatalf("read banner after clean apply: %v", err)
+	}
+	if bannerAfterClean != "" {
+		t.Fatalf("干净强制应用必须清除 caddy_apply_error，实际残留 %q", bannerAfterClean)
+	}
+}
+
+// TestTrustedProxyDegradation_transactionalApplyKeepsBanner：事务内 apply
+// （persist=false）在 commit 前不得清横幅——否则 commit 失败会留下「看起来
+// 已恢复」的假象；清除只属于强制且持久化的成功路径。
+func TestTrustedProxyDegradation_transactionalApplyKeepsBanner(t *testing.T) {
+	stubSecurityLibsAvailable(t)
+	_, database := newClusterTestService(t)
+	seedGenerationRule(t, database, "lb-d3-tx", false)
+	if _, err := database.Exec(`UPDATE global_config SET trusted_proxy_enabled=0, caddy_apply_error='上一次应用失败'`); err != nil {
+		t.Fatalf("seed banner: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(server.Close)
+	service := NewCaddyService(server.URL)
+
+	cfg := GenerateCaddyConfig()
+	service.mu.Lock()
+	err := service.applyConfigLockedOpt(cfg, true, false)
+	service.mu.Unlock()
+	if err != nil {
+		t.Fatalf("transactional apply: %v", err)
+	}
+
+	var banner string
+	if err := database.QueryRow(`SELECT COALESCE(caddy_apply_error,'') FROM global_config WHERE id=1`).Scan(&banner); err != nil {
+		t.Fatalf("read banner: %v", err)
+	}
+	if banner != "上一次应用失败" {
+		t.Fatalf("事务内 apply 不得清除横幅，实际 %q", banner)
+	}
 }
 
 // TestTrustedProxyDegradation_disabledIsNotDegraded：enabled=false 是「未启用」

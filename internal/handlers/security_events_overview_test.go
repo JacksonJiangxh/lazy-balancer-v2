@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -38,8 +39,14 @@ func newSecurityEventsRouter(t *testing.T) *gin.Engine {
 func seedSecurityEvent(t *testing.T, eventTime, ruleCaddyID string, policyID any, ruleTriggered, ruleMsg string) {
 	t.Helper()
 	var ruleName, policyName string
-	db.DB.QueryRow("SELECT name FROM lb_rules WHERE caddy_id=?", ruleCaddyID).Scan(&ruleName)
-	db.DB.QueryRow("SELECT name FROM security_policies WHERE id=?", policyID).Scan(&policyName)
+	// 规则/策略不存在时快照留空（种子允许只建事件），其余读取错误必须暴露——
+	// 静默忽略会把库结构漂移伪装成「快照本来为空」。
+	if err := db.DB.QueryRow("SELECT name FROM lb_rules WHERE caddy_id=?", ruleCaddyID).Scan(&ruleName); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("read rule name for %s: %v", ruleCaddyID, err)
+	}
+	if err := db.DB.QueryRow("SELECT name FROM security_policies WHERE id=?", policyID).Scan(&policyName); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("read policy name for %v: %v", policyID, err)
+	}
 	if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time, rule_caddy_id, policy_id, client_ip, method, uri, event_type, rule_triggered, rule_msg, action, rule_name, policy_name)
 		VALUES (?, ?, ?, '185.199.109.9', 'GET', '/a', 'crs', ?, ?, 'blocked', ?, ?)`,
 		eventTime, ruleCaddyID, policyID, ruleTriggered, ruleMsg, ruleName, policyName); err != nil {

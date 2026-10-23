@@ -72,9 +72,10 @@ test('A 密码字符集：Go 常量派生的长度区间 + 可打印 ASCII；汉
 
 test('B 三处密码入口 + 两处用户名入口均消费 credentials 单源', () => {
   const users = source('src/views/Users.vue')
-  const layout = source('src/components/layout/AppLayout.vue')
+  // 个人资料表单已抽成共享组件（顶栏入口使用）
+  const profile = source('src/components/ProfileDialog.vue')
   const login = source('src/views/Login.vue')
-  for (const [name, text] of [['Users', users], ['AppLayout', layout], ['Login', login]] as const) {
+  for (const [name, text] of [['Users', users], ['ProfileDialog', profile], ['Login', login]] as const) {
     assert.match(text, /from '@\/utils\/credentials'/, `${name} 必须导入共享校验`)
   }
   // Users：创建/编辑 + 重置密码两入口
@@ -82,7 +83,7 @@ test('B 三处密码入口 + 两处用户名入口均消费 credentials 单源',
   assert.match(users, /const passwordError = validatePassword\(/)
   assert.equal([...users.matchAll(/validatePassword\(/g)].length, 2, 'Users 两处密码入口必须同源')
   // 个人资料
-  assert.match(layout, /const passwordError = validatePassword\(/)
+  assert.match(profile, /const passwordError = validatePassword\(/)
   // 首次设置管理员：用户名/密码规则均走 validator
   assert.match(login, /validateUsername\(value\)/)
   assert.match(login, /validatePassword\(value\)/)
