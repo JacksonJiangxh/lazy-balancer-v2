@@ -15,7 +15,7 @@ import {
   credentialFieldVisible,
   type CredentialFieldMeta,
 } from '../src/utils/dnsProviderFields.ts'
-import { source } from './_helpers.ts'
+import { section, source } from './_helpers.ts'
 
 const doubleSelectFields: readonly CredentialFieldMeta[] = [
   { name: 'region', label: '区域', type: 'select', required: true, options: ['cn', 'global'] },
@@ -38,6 +38,31 @@ test('切换第二个 select 不清空第一个 select 与文本字段', () => {
     { region: 'cn', auth_mode: 'token', token: 'abc' },
   )
   assert.deepEqual(next, { region: 'cn', auth_mode: 'token', token: 'abc' })
+})
+
+test('双 select：改认证模式保留区域、清理被隐藏的旧模式字段', () => {
+  // 从 token 切到 pair：region（另一 select）与仍可见的 secret_id 保留，
+  // 仅 token 被 visible_when 隐藏而清理。
+  const next = applyCredentialFieldChange(
+    doubleSelectFields,
+    { region: 'cn', auth_mode: 'pair', token: 'old-token', secret_id: 'sid' },
+  )
+  assert.deepEqual(next, { region: 'cn', auth_mode: 'pair', secret_id: 'sid' })
+})
+
+test('双 select：先填 token 再切 pair 再切回 token，区域始终保留', () => {
+  let credentials: Record<string, unknown> = { region: 'cn', auth_mode: 'token', token: 'abc' }
+  credentials = applyCredentialFieldChange(doubleSelectFields, {
+    ...credentials,
+    auth_mode: 'pair',
+    secret_id: 'sid',
+  })
+  assert.deepEqual(credentials, { region: 'cn', auth_mode: 'pair', secret_id: 'sid' })
+  credentials = applyCredentialFieldChange(doubleSelectFields, {
+    ...credentials,
+    auth_mode: 'token',
+  })
+  assert.deepEqual(credentials, { region: 'cn', auth_mode: 'token' })
 })
 
 test('切换认证模式只清理被 visible_when 隐藏的字段', () => {
@@ -80,4 +105,17 @@ test('组件接线：select 变更按字段求值，无 auth_mode 字面量重�
     credentialFieldVisible(dnspodFields[1], { auth_mode: 'dnspod' }),
     '元数据可见性契约不变',
   )
+})
+
+test('编辑回填不按 provider 名推断认证方式（缺失键交后端 canonical 归一）', () => {
+  // 库值 → 规范凭据的唯一实现是后端 dnsprovider.CanonicalCredentials（保存前
+  // 验证与签发链共用）；前端复刻该推断会按 provider 名硬编码，第二个 provider
+  // 即被注入无关的 auth_mode。回填只做 JSON 解析，不做任何凭证语义推断。
+  const page = source('src/views/settings/FreeCertificates.vue')
+  const backfill = section(page, 'if (config) {\n    editingId.value', '} else {\n    editingId.value = null')
+  assert.doesNotMatch(backfill, /auth_mode\s*=\s*'/, '回填不得注入 auth_mode 字面量')
+  assert.doesNotMatch(backfill, /tencent_cloud/, '回填不得按 provider 名分派')
+  assert.doesNotMatch(backfill, /secret_id && parsedCreds\.secret_key/, '凭证形态推断属后端单源')
+  // 遗留空凭据形态的「不注入、保存省略」契约不变
+  assert.match(backfill, /legacyEmptyCredentials\.value = Object\.keys\(parsedCreds\)\.length === 0/)
 })

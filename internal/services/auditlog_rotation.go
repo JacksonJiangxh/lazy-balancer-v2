@@ -146,6 +146,11 @@ var auditLogSizeBytes = getAuditLogSizeBytes
 // auditLogCopyFile 将当前日志归档为 .1；测试可注入以模拟复制失败。
 var auditLogCopyFile = copyAuditLogTo
 
+// auditLogRotationBeforeTailIngest 在活文件尾部补采前调用（生产为 nil，仅测试
+// 注入）：模拟 Coraza 在「本轮 stat → 补采」窗口内追写。持续写入下轮转仍必须
+// 能截断，判据是摄取到达偏移而非本轮起始文件大小——注入点正是这两者的分界。
+var auditLogRotationBeforeTailIngest func()
+
 // rotateAuditLogIfNeeded 在审计日志超过大小阈值时轮转：先把当前日志复制到
 // 暂存名 .1.new，成功后滚动历史副本（.4→.5 … .1→.2）并把暂存归档提升为 .1，
 // 最后截断原文件（copytruncate）。复制/提升失败不改变归档代际、不截断活文件。
@@ -208,7 +213,13 @@ func rotateAuditLogIfNeeded() (total int, rotErr error) {
 			// 永久丢失。保留标记并中止本轮（下轮依赖恢复后先重试补采）。
 			throttledAuditFailureLogf("audit log rotation: pending delta ingest deferred (security events database unavailable)")
 			return total, fmt.Errorf("pending delta ingest deferred: security events database unavailable")
-		} else if n, err := securityEventsIngestDeltaFrom(pending.Path, pending.Offset, true); err != nil {
+		} else if pendingDeltaArchiveReplaced(pending) {
+			// Size 是写标记时的归档大小：当前 .1 小于该值说明归档已被外部替换/
+			// 截短（原窗口内容已不可考），按旧 Offset 补采只会从无关内容解析。
+			// 标记无恢复价值，丢弃并留痕。
+			throttledAuditFailureLogf("audit log rotation: pending delta archive %s shrunk below recorded window (%d bytes), dropping marker", pending.Path, pending.Size)
+			_ = os.Remove(securityEventsPendingDeltaPath())
+		} else if n, _, err := securityEventsIngestDeltaFrom(pending.Path, pending.Offset, true); err != nil {
 			throttledAuditFailureLogf("audit log rotation: pending delta ingest retry failed (rotation deferred): %v", err)
 			return total, fmt.Errorf("pending delta ingest retry (rotation deferred): %w", err)
 		} else {
@@ -274,6 +285,10 @@ func rotateAuditLogIfNeeded() (total int, rotErr error) {
 		}
 	}
 	// 提升暂存归档为 .1——新归档在此刻才对外可见；失败清理暂存且不截断活文件。
+	// 已知中间态：历史档已移位（旧 .1 已在 .2）而提升失败时，下一轮成功轮转会
+	// 把活文件（含本轮全部内容）重新复制为 .1，同一批内容在 .1/.2 各留一份
+	// （代际语义错位，事件不重复入库——transaction_id 唯一索引去重）。活文件
+	// 始终完整，故此处不回滚移位：回滚 rename 自身也可能失败，复杂度高于收益。
 	if err := os.Rename(staging, current); err != nil {
 		_ = os.Remove(staging)
 		throttledAuditFailureLogf("audit log rotation: promote staged archive to .1 failed (not truncating): %v", err)
@@ -290,51 +305,76 @@ func rotateAuditLogIfNeeded() (total int, rotErr error) {
 		throttledAuditFailureLogf("audit log rotation: stat %s failed (not truncating): %v", current, err)
 		return total, fmt.Errorf("stat %s failed (not truncating): %w", current, err)
 	}
-	archSize := archInfo.Size()
-	// 补采活文件 [archSize, truncate 前) 的新写尾部：copy 最后一次读取后、truncate
+	archiveSize := archInfo.Size()
+	// 补采活文件 [archiveSize, truncate 前) 的新写尾部：copy 最后一次读取后、truncate
 	// 前 Coraza 新写入的事件两边都不在（.1 没有、活文件将被截断），须先于 truncate
 	// 从活文件直接补采。补采失败绝不截断——尾部事件仍完整留在活文件中，下次 tick
 	// 自然续读，不会丢失。
 	// 有界循环（最多 3 轮）：补采 INSERT 耗时期间新写入的尾部也一并收敛，把残余
-	// 窗口压缩到最后一轮 stat→truncate 的系统调用间隙。该间隙内的写入两边都不在
+	// 窗口压缩到最后一轮补采→truncate 的系统调用间隙。该间隙内的写入两边都不在
 	// （copy 早已完成、未进 .1；truncate 后活文件里也没有），下次轮转的 .1 补采
 	// 覆盖不到，为可接受的尽力而为缺口（毫秒级，仅损失该瞬间的尾部事件）。
-	// 补采起点不取 archSize 本身，而是后向回扫到最近一个文档头：copy 末次读可能
-	// 截断在正在写入的事务中部（前缀在 .1、后缀在活文件），从截断点直接解码会
-	// 前向跳过该事务后半，.1 补采又因前缀 JSON 不完整无法解码——跨界事务将两半
-	// 皆失。从文档头开始即可在活文件中完整解码整个事务。
-	for i := 0; i < 3; i++ {
+	// 本轮进度基准是「摄取到达偏移」reached（补采 pass 返回的已提交文档末尾），
+	// 不是本轮起始的文件大小：补采窗口内的追写只要已被本轮解码摄入，reached 就
+	// 随之前进，不会把「已摄取但文件变大」误判为「还有未摄取字节」而永远放弃
+	// 截断——审计日志每事务追写，该误判在持续写入下恒成立。
+	// 首轮补采起点不取 archiveSize 本身，而是后向回扫到最近一个文档头：copy 末次
+	// 读可能截断在正在写入的事务中部（前缀在 .1、后缀在活文件），从截断点直接
+	// 解码会前向跳过该事务后半，.1 补采又因前缀 JSON 不完整无法解码——跨界事务
+	// 将两半皆失。从文档头开始即可在活文件中完整解码整个事务。
+	reached := archiveSize
+	for i := range 3 {
 		tailInfo, terr := os.Stat(auditLogPath)
-		if terr != nil || tailInfo.Size() <= archSize {
+		if terr != nil || tailInfo.Size() <= reached {
 			break
 		}
-		// 依赖不可用时补采是 no-op——不得据此推进 archSize 并截断活文件：
+		// 依赖不可用时补采是 no-op——不得据此推进 reached 并截断活文件：
 		// 尾部事件只在活文件里，截断即永久丢失。保留现场，下轮依赖恢复后续采。
 		if !securityEventsIngestDepsReady() {
 			throttledAuditFailureLogf("audit log rotation: live tail ingest deferred (security events database unavailable, not truncating)")
 			return total, fmt.Errorf("live tail ingest deferred (not truncating): security events database unavailable")
 		}
-		ingestFrom, berr := securityEventsBackscanDocumentStart(auditLogPath, archSize)
-		if berr != nil {
-			throttledAuditFailureLogf("audit log rotation: backscan live tail failed (not truncating): %v", berr)
-			return total, fmt.Errorf("backscan live tail failed (not truncating): %w", berr)
+		ingestFrom := reached
+		if i == 0 {
+			from, berr := securityEventsBackscanDocumentStart(auditLogPath, archiveSize)
+			if berr != nil {
+				throttledAuditFailureLogf("audit log rotation: backscan live tail failed (not truncating): %v", berr)
+				return total, fmt.Errorf("backscan live tail failed (not truncating): %w", berr)
+			}
+			ingestFrom = from
+		}
+		if auditLogRotationBeforeTailIngest != nil {
+			auditLogRotationBeforeTailIngest()
 		}
 		// 活文件补采以归档语义进行（archive=true）：补采区间有界且完整内容已在
 		// 刚拷贝的 .1 中以归档语义摄取，活文件畸形区（≥4MB 无文档头）可安全跳过；
 		// 若按活文件语义报错，轮转每 2s 周期反复中止，文件永不截断。
-		if n, ierr := securityEventsIngestDeltaFrom(auditLogPath, ingestFrom, true); ierr != nil {
+		n, next, ierr := securityEventsIngestDeltaFrom(auditLogPath, ingestFrom, true)
+		if ierr != nil {
 			throttledAuditFailureLogf("audit log rotation: ingest live tail [%d, %d) failed (not truncating): %v", ingestFrom, tailInfo.Size(), ierr)
 			return total, fmt.Errorf("ingest live tail failed (not truncating): %w", ierr)
-		} else {
-			total += n
 		}
-		archSize = tailInfo.Size()
+		total += n
+		if next <= reached {
+			// 本 pass 没有推进到达偏移（尾部只剩空白分隔/解码器已到 EOF）：
+			// 再循环也读不到新内容，交给截断判据决定。
+			break
+		}
+		reached = next
 	}
-	// B-新1：末轮补采后文件若仍在增长（EOF 读取期间有新写入，尾部可能在途
-	// 事务），跳过本轮 truncate——下周期先经正常路径摄取尾部、再轮转；否则半条
-	// 事务被截断抹除且后续归档 pass 同样静默跳过，事件永久丢失（实际丢失窗口
-	// 大于原「stat→truncate 系统调用间隙毫秒级」注释所述）。
-	if finalInfo, ferr := os.Stat(auditLogPath); ferr == nil && finalInfo.Size() > archSize {
+	// 截断判据=摄取到达偏移：尾部已无未摄取内容（reached 追平文件大小，或剩余
+	// 的仅是文档间空白分隔）才截断；否则保留本轮现场、下周期先经正常路径摄取
+	// 尾部再轮转——半条在途事务被截断抹除后，后续归档 pass 同样静默跳过，事件
+	// 永久丢失。放宽截断必须留痕：该分支此前完全静默（rotErr 保持 nil、健康位
+	// 正常、任务日志零痕迹），持续高流量下退化为「每 2s 全量复制并移位归档但
+	// 永不 truncate」，活文件无界增长且磁盘放大 ~6×。
+	finalInfo, ferr := os.Stat(auditLogPath)
+	if ferr != nil {
+		throttledAuditFailureLogf("audit log rotation: stat live log before truncate failed (not truncating): %v", ferr)
+		return total, fmt.Errorf("stat live log before truncate failed (not truncating): %w", ferr)
+	}
+	if finalInfo.Size() > reached && !auditLogTailOnlyWhitespace(auditLogPath, reached, finalInfo.Size()) {
+		throttledAuditFailureLogf("audit log rotation: live tail not fully ingested (reached %d of %d bytes), truncate deferred", reached, finalInfo.Size())
 		return total, rotErr
 	}
 	// truncate 前先落 pending 标记。标记写失败绝不在无标记状态下截断——
@@ -342,7 +382,7 @@ func rotateAuditLogIfNeeded() (total int, rotErr error) {
 	// 的任何崩溃点，标记都已在盘上（补采成功即删除、失败保留），下次轮转 shift 前
 	// 先重试，双向崩溃安全；truncate 失败则移除标记——活文件未截断、内容完整，
 	// 无需补采。
-	if err := securityEventsWritePendingDelta(securityEventsPendingDelta{Path: current, Offset: persistedOffset, Size: archSize}); err != nil {
+	if err := securityEventsWritePendingDelta(securityEventsPendingDelta{Path: current, Offset: persistedOffset, Size: archiveSize}); err != nil {
 		throttledAuditFailureLogf("audit log rotation: write pending delta marker failed, aborting rotation without truncate: %v", err)
 		return total, fmt.Errorf("write pending delta marker (aborting rotation without truncate): %w", err)
 	}
@@ -377,6 +417,51 @@ func rotateAuditLogIfNeeded() (total int, rotErr error) {
 		_ = os.Remove(securityEventsPendingDeltaPath())
 	}
 	return total, rotErr
+}
+
+// auditLogWhitespaceTailLimit 是「尾部剩余字节」按空白处理的判定上限：
+// 摄取到达偏移与当前文件大小之间的差值超过该值只可能来自补采 pass 结束后的
+// 新写入，按未摄取处理（保守推迟截断，下轮再判），也避免按差值分配内存。
+const auditLogWhitespaceTailLimit = 1 << 20
+
+// auditLogTailOnlyWhitespace 报告文件 [from, size) 区间是否只含空白字节
+// （JSON 文档之间的分隔符/尾随换行）。JSON 解码器在 EOF 时停在最后一条文档
+// 末尾、不消费其后的换行，若把该换行当成「未摄取内容」，正常 tick 的轮转
+// 都会推迟截断——退化为永不 truncate。分段读取（64KiB），读取失败按非空白
+// 处理（保守：本轮不截断，下轮重判）。
+func auditLogTailOnlyWhitespace(path string, from, size int64) bool {
+	if size <= from {
+		return true
+	}
+	if size-from > auditLogWhitespaceTailLimit {
+		return false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	buf := make([]byte, 64<<10)
+	pos := from
+	for pos < size {
+		want := size - pos
+		if want > int64(len(buf)) {
+			want = int64(len(buf))
+		}
+		n, rerr := f.ReadAt(buf[:want], pos)
+		for _, b := range buf[:n] {
+			switch b {
+			case ' ', '\t', '\r', '\n':
+			default:
+				return false
+			}
+		}
+		pos += int64(n)
+		if rerr != nil {
+			return pos >= size
+		}
+	}
+	return true
 }
 
 // securityEventsBackscanDocumentStart 后向扫描 [0, from) 内最近一个文档头 "\n{"
@@ -477,10 +562,25 @@ func auditLogBaseName() string {
 // securityEventsPendingDelta 记录一次失败的归档补采：内容为待补采的归档路径 +
 // 起始偏移 + 归档大小，持久化为 <auditlog>.delta-pending 标记文件。下次轮转
 // shift 前先重试补采（成功才删除标记），防止 .1 被 shift 覆盖后事件永久丢失。
+// Size 用于识别「归档被外部替换/截短」：当前文件小于记录值时旧偏移已无意义。
 type securityEventsPendingDelta struct {
 	Path   string `json:"path"`
 	Offset int64  `json:"offset"`
 	Size   int64  `json:"size"`
+}
+
+// pendingDeltaArchiveReplaced 报告标记记录的归档窗口是否已失效：写标记时的
+// .1 大小（Size）大于当前文件即说明归档被替换/截短，按旧 Offset 补采只会从
+// 无关内容解析。Size<=0 为旧版标记（无该字段），不做判定。
+func pendingDeltaArchiveReplaced(p *securityEventsPendingDelta) bool {
+	if p == nil || p.Size <= 0 {
+		return false
+	}
+	info, err := os.Stat(p.Path)
+	if err != nil {
+		return false // 缺失/不可读由补采分支自身的错误路径处理
+	}
+	return info.Size() < p.Size
 }
 
 func securityEventsPendingDeltaPath() string {

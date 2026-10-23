@@ -288,9 +288,13 @@ func buildCorazaDirectivesWithIndex(p *models.SecurityPolicy, store caddyConfigS
 	hasNonTrustIPControl := len(ipBL) > 0 || p.IPACLEnabled
 	emitTrustControl := p.IPWhitelistEnabled && p.PolicyType != models.PolicyTypeStage0 && len(ipWL) > 0
 	customRules := policyCustomRulesCached(p, store)
+	// 与摘要（CountEnabledCustomRules）同判据：启用 ∧ 无发射缺陷 ∧ id 不撞
+	// 预检/保留段。仅判 Enabled 会把「引擎为一条永不发射的规则而开」当成
+	// 有自定义规则（摘要已按 customRuleEmittable 报 false → 列表徽标少报
+	// IP 控制能力，与引擎实际发射的信任规则分叉）。
 	hasCustomRules := false
 	for _, cr := range customRules {
-		if cr.Enabled {
+		if customRuleEmittable(cr) {
 			hasCustomRules = true
 			break
 		}
@@ -585,12 +589,13 @@ func buildCorazaDirectivesWithIndex(p *models.SecurityPolicy, store caddyConfigS
 			}
 		}
 		for _, entry := range excludedEntries {
-			// 存量兜底：命中 901 初始化组的排除一律跳过——初始化组已由下方
-			// 去重强制包含，排除若放行会在 Include 后（scope=all）或运行时
-			//（scoped ctl）将其删除，守卫按 0 处理、策略空转。写入面对新提交
-			// 已 400 硬拒（CRSExclusionTargetRemovesInit），此处拦存量老数据。
-			if CRSExclusionTargetRemovesInit(entry.Target) {
-				Logf("warn", "跳过命中初始化组的 CRS 排除条目 %q（策略 %q）：初始化规则为系统强制加载，排除不生效", entry.Target, p.Name)
+			// 存量兜底：命中基础设施组（901 初始化/949 请求评估/959 响应评估）的
+			// 排除一律跳过——这些文件已由下方强制包含，排除若放行会在 Include 后
+			//（scope=all）或运行时（scoped ctl）摘除评估组，守卫按 0 空转 /
+			// blocking 退化为仅记录。写入面对新提交
+			// 已 400 硬拒（CRSExclusionTargetRemovesInfra），此处拦存量老数据。
+			if CRSExclusionTargetRemovesInfra(entry.Target) {
+				Logf("warn", "跳过命中基础设施组（901/949/959）的 CRS 排除条目 %q（策略 %q）：这些规则为系统强制加载，排除不生效", entry.Target, p.Name)
 				continue
 			}
 			if entry.Scope == "ip" || entry.Scope == "list" {
@@ -2188,7 +2193,7 @@ func resolvePolicyCustomRules(raw json.RawMessage, store caddyConfigStore) []mod
 // 下界 <900000 或上界 >999999 的区间会静默删除本地/自定义规则，一律拒绝。
 // 注意：界内宽区间（如 902000-999999）可通过本门——它删除除 901 段外的
 // 全部 CRS 规则，属管理员的显式选择（与 901 初始化组相交的区间由
-// CRSExclusionTargetRemovesInit 另一道守卫拒绝），本门只管「不越界出
+// CRSExclusionTargetRemovesInfra 另一道守卫拒绝），本门只管「不越界出
 // 9xxxxx CRS 空间」。
 func validSecRuleRemoveTarget(s string) bool {
 	if n, err := strconv.Atoi(s); err == nil {
@@ -2204,12 +2209,18 @@ func validSecRuleRemoveTarget(s string) bool {
 }
 
 // CRSExcludedEntryEffective 判定排除条目是否会被发射端实际发射
-// 与发射链同款门——文件名先经 crsFilenameToRuleIDRange 映射为 ID 区间，
-// 再过 validSecRuleRemoveTarget 形态/边界门。保存侧复用本门可在保存时拒绝
+// 与发射链同款门——两位组号（发射侧映射为 9xx000-9xx999）直接有效；其余
+// 条目先经 crsFilenameToRuleIDRange 映射为 ID 区间，再过
+// validSecRuleRemoveTarget 形态/边界门。保存侧复用本门可在保存时拒绝
 // 「保存 200、发射静默跳过」的条目（如字母后缀 "942100L"），同时不误伤合法的
-// CRS 文件名形态（"REQUEST-942-*.conf" → 942000-942999）。
+// CRS 文件名形态（"REQUEST-942-*.conf" → 942000-942999）。基础设施组号
+// （01/49/59）另由 CRSExclusionTargetRemovesInfra 拒绝，不在本门。
 func CRSExcludedEntryEffective(entry string) bool {
-	return validSecRuleRemoveTarget(crsFilenameToRuleIDRange(strings.TrimSpace(entry)))
+	trimmed := strings.TrimSpace(entry)
+	if IsCRSGroupCode(trimmed) {
+		return true
+	}
+	return validSecRuleRemoveTarget(crsFilenameToRuleIDRange(trimmed))
 }
 
 // crsFilenameToRuleIDRange 仅把真实 CRS 文件名形态（REQUEST-9XX-…/
@@ -2576,24 +2587,35 @@ func IsCRSInfraRuleID(id string) bool {
 	return strings.HasPrefix(id, "901") || strings.HasPrefix(id, "949") || strings.HasPrefix(id, "959")
 }
 
-// CRSExclusionTargetRemovesInit 报告排除目标与初始化组（901000-901999）是否
-// 相交：组号 "01"、组内规则 ID、REQUEST-901-*.conf 文件名、或与之相交的数字
-// 区间（含跨界区间如 900500-902000）。排除初始化规则无合法用途——偏执级默认
-// 值与评分初始化缺失会让守卫按 0 处理整段跳过、策略静默空转，写入面据此拒绝。
-func CRSExclusionTargetRemovesInit(target string) bool {
+// crsInfraRuleIDRanges 基础设施组的规则 ID 区间（与 crsInfraGroupCodes 同源：
+// 901 初始化 / 949 请求评估 / 959 响应评估）。
+var crsInfraRuleIDRanges = [][2]int{{901000, 901999}, {949000, 949999}, {959000, 959999}}
+
+// CRSExclusionTargetRemovesInfra 报告排除目标是否触及基础设施组：两位组号
+// ("01"/"49"/"59")、组内规则 ID、REQUEST/RESPONSE-9xx-*.conf 文件名、或与之
+// 相交的数字区间（含跨界区间如 900500-902000）。排除基础设施规则无合法用途
+// ——偏执级默认值与评分初始化缺失会让守卫按 0 整段跳过、策略静默空转；949/
+// 959 评估组缺失会让拦截模式静默退化为仅记录。写入面据此 400，发射面据此
+// 跳过 + WARN（与 crs_rule_groups 的剥离口径一致）。
+func CRSExclusionTargetRemovesInfra(target string) bool {
 	target = strings.TrimSpace(target)
 	if IsCRSGroupCode(target) {
-		return target == "01"
+		return IsCRSInfraGroupCode(target)
 	}
 	if IsCRSRuleIDTarget(target) {
-		return strings.HasPrefix(target, "901")
+		return IsCRSInfraRuleID(target)
 	}
 	mapped := crsFilenameToRuleIDRange(target)
 	lo, hi, ok := crsNumericIDRange(mapped)
 	if !ok {
 		return false
 	}
-	return lo <= 901999 && hi >= 901000
+	for _, infra := range crsInfraRuleIDRanges {
+		if lo <= infra[1] && hi >= infra[0] {
+			return true
+		}
+	}
+	return false
 }
 
 func crsNumericIDRange(s string) (int, int, bool) {
@@ -2755,18 +2777,21 @@ func ValidateGeoIPCountries(raw string, geoipMode string) error {
 	if geoipMode == "allow" && len(entries) == 0 {
 		return fmt.Errorf("地域控制为仅允许模式时区域名单不能为空（空名单会拒绝所有请求）")
 	}
+	// 省份列表单次快照：可用性门与 loaded 判据共用同一取值（冷启动首次
+	// 调用会真正执行 336 次采样搜索，两次背靠背调用在多规则校验下放大成本；
+	// 且两次调用间若 searcher 热换会读出不同代际）。
+	liveProvinces := GetIP2RegionProvinces()
 	// （裁决）：IP 库未装载时拒绝启用任何地域条目（含海外——
 	// 海外拦截同样依赖 live searcher 设置占位变量，缺库时 CEL 全部恒假、
 	// 地域拦截静默零强制）。用户语义：缺库 = IP 相关规则不可启用，待自动/
 	// 手动更新 IP 库后恢复；「IP 库」卡片的「未安装」标签提供常态可见性。
-	if len(entries) > 0 && len(GetIP2RegionProvinces()) <= 1 {
+	if len(entries) > 0 && len(liveProvinces) <= 1 {
 		return fmt.Errorf("IP 库未安装或未加载：地域相关规则不可启用，请先在「安全规则」页更新 IP 库后重试")
 	}
 	// loaded 判据必须取 live searcher 而非缓存兜底列表——xdb 损坏/
 	// 带外替换后 live 已死但省份缓存仍在，用缓存判 loaded 会放行 deny+省份
 	// 策略，而发射端占位变量从未设置（CEL 恒假）→ 地域拦截静默零强制。缓存
 	// 兜底仅服务于 UI 列表（GetIP2RegionRegions），校验侧以 live 为准。
-	liveProvinces := GetIP2RegionProvinces()
 	provincesLoaded := len(liveProvinces) > 1
 	// （核心发现，主线亲证 tree=35 sampled=28 missing=
 	// [山西/广西/海南/澳门/西藏/青海]）：known 集必须从全扫描树构建而非 336 点

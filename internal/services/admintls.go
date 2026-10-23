@@ -129,12 +129,17 @@ func selfSignedCert(dataDir string) (tls.Certificate, error) {
 	// 面板无清除入口。X509KeyPair 验证通过才复用，否则记 warn 落既有重生成
 	// 路径自愈。
 	if certPEM, err1 := os.ReadFile(certPath); err1 == nil {
-		if keyPEM, err2 := os.ReadFile(keyPath); err2 == nil {
+		keyPEM, err2 := os.ReadFile(keyPath)
+		if err2 == nil {
 			cert, err3 := tls.X509KeyPair(certPEM, keyPEM)
 			if err3 == nil {
 				return cert, nil
 			}
 			Logf("warn", "管理面板自签名证书对损坏（%s / %s），将重新生成: %v", certPath, keyPath, err3)
+		} else if !os.IsNotExist(err2) {
+			// 证书可读而私钥读失败（权限/挂载/属主漂移）与「首次生成」不同：
+			// 不清空现场诊断线索，否则会被静默重生成掩盖（证书信任需重建）。
+			Logf("warn", "管理面板自签名私钥读取失败（%s），将重新生成证书对: %v", keyPath, err2)
 		}
 	}
 

@@ -243,10 +243,12 @@ test('名单条目上限/备注长度与后端 securityiplists.go 同源（跨�
   assert.ok(go.includes('len([]rune('), '备注长度后端必须按 rune 计数（与前端 code point 一致）')
   assert.equal(IP_LIST_MAX_ENTRIES, 2000)
   assert.equal(ipListRemarkMaxLength, 100)
-  // SFC 不得再硬编码条目上限字面量（双源会漂移）：收窄到常量引用与两个具体形态，
-  // 避免「全页任何合法 2000（超时/注释/示例）」假红。
+  // SFC 不得再硬编码条目上限字面量（双源会漂移）：只钉两个**语义形态**——
+  // 校验比较与控件上限；不再用「全页任何 `= 2000`」的宽口径（未来合法超时/
+  // 分页示例会假红）。
   const rules = source('src/views/security/SecurityRules.vue')
   assert.match(rules, /IP_LIST_MAX_ENTRIES/, 'SecurityRules 必须引用单源常量')
-  assert.doesNotMatch(rules, /=\s*2000\b/, 'SecurityRules 不得再硬编码 2000（统一走 IP_LIST_MAX_ENTRIES）')
-  assert.doesNotMatch(rules, /:max="2000"/, '控件上限不得写死 2000')
+  assert.match(rules, /entries\.length > IP_LIST_MAX_ENTRIES/, '条目数校验必须引用单源常量')
+  assert.doesNotMatch(rules, /length\s*>\s*2000\b/, '条目数比较不得写死 2000')
+  assert.doesNotMatch(rules, /:max="\s*2000\s*"/, '控件上限不得写死 2000')
 })

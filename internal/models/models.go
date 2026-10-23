@@ -38,7 +38,7 @@ type UserResponse struct {
 
 // NewUserResponse 构造用户响应。mfaEnabled 必须由调用方从 users.mfa_enabled
 // 读取后传入：将原本「构造后手工 response.MFAEnabled=…」
-// 的口径收敛为签名参数——/两次两次都因新增返回路径忘记
+// 的口径收敛为签名参数——历史上两次都因新增返回路径忘记
 // 补字段导致 mfa_enabled 恒 false（前端登录预检误报）。签名强制让遗漏在
 // 编译期失败，而不是静默返回错误值。
 func NewUserResponse(user User, mfaEnabled bool) UserResponse {

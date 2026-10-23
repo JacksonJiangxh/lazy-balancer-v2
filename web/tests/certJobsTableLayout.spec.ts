@@ -95,9 +95,19 @@ test('证书有效期合并单列：日期 + 剩余/已过期天数，精确时�
   assert.match(body, /formatDateShort\(effectiveNotAfter\(row\)\)/)
   assert.ok(body.includes('剩 ${row.days_remaining} 天'), '缺少「剩 N 天」分支')
   assert.ok(body.includes('已过期 ${Math.abs(row.days_remaining)} 天'), '缺少「已过期 N 天」分支')
-  assert.match(body, /certificateStatus\(row\) === 'expired'/, '过期判据必须复用 certificateStatus')
+  assert.match(body, /row\.certificate_status === 'expired'/, '过期判据必须读后端 certificate_status 字段（无第二份派生）')
   assert.match(body, /<el-tooltip[^>]*:content="formatDate\(effectiveNotAfter\(row\)\)"/, '精确过期时间必须进 tooltip')
   assert.match(body, /class="cell-empty"/, '非 issued/缺失必须沿用 cell-empty 占位')
+})
+
+test('自动重签时间列经 renewalAt（not_after 派生），不回退 expires_at', () => {
+  const body = columnBody('自动重签时间')
+  // 与有效期列共用同一到期口径：expires_at 在导入/旧备份/集群回插行上可能为
+  // null——若本列回退 row.expires_at，同一行会出现「有效期有值、重签显示 -」的
+  // 跨列分叉，运维据空列误判未排期重签。
+  assert.match(body, /v-if="row\.status === 'issued' && renewalAt\(row\)"/, '显示门必须用 renewalAt')
+  assert.match(body, /formatDate\(renewalAt\(row\)\)/, '本列必须经 renewalAt 渲染')
+  assert.doesNotMatch(body, /expires_at/, '不得直接消费 expires_at')
 })
 
 test('时间列显示完整时间戳 YYYY-MM-DD HH:mm:ss（配置时区）', () => {
@@ -115,8 +125,16 @@ test('时间列显示完整时间戳 YYYY-MM-DD HH:mm:ss（配置时区）', () 
 })
 
 test('容器窄于最小集时切横向滚动：操作列不得被 overflow:hidden 裁到不可达', () => {
-  // 最小集 = 域名 210 + 状态 84 + 有效期 155 + 重试 80 + 操作 90
-  assert.equal(CERT_JOB_COLUMNS_MIN_WIDTH, 619)
+  // 最小集 = 不可让位列之和。断言取派生式（单源），不手抄 619——合法调宽
+  // （如有效期 155→165）只需改 CERT_JOB_COLUMN_WIDTHS 一处。
+  const nonYieldingColumns: CertJobColumnId[] = ['domain', 'status', 'validity', 'attempts', 'actions']
+  assert.equal(
+    CERT_JOB_COLUMNS_MIN_WIDTH,
+    nonYieldingColumns.reduce((sum, id) => sum + CERT_JOB_COLUMN_WIDTHS[id], 0),
+    '不可让位列宽度之和必须等于单源下限常量',
+  )
+  // 独立业务基线锚：下限过小会让窄屏把操作列挤到不可达。
+  assert.ok(CERT_JOB_COLUMNS_MIN_WIDTH >= 600, `最小集下限 ${CERT_JOB_COLUMNS_MIN_WIDTH}px 低于业务基线 600px`)
   assert.match(page, /const tableBelowMinWidth = computed\(\(\) => tableWrapWidth\.value < CERT_JOB_COLUMNS_MIN_WIDTH\)/)
   assert.match(page, /:class="\{ 'cert-jobs-wrap--scroll': tableBelowMinWidth \}"/)
   // 规则块语义匹配：注释与否、Prettier 断行都不影响判定

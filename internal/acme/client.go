@@ -358,9 +358,14 @@ func (c *Client) removeStaleAccountKeys() error {
 		}
 		keyPath := strings.TrimSuffix(metadataPath, ".json")
 		// 裁定：轮换后的旧 HMAC 密钥必须保留（字节级残留
-		// 无害；删除会让旧账户身份无法恢复）。当前路径公式下本条件恒真，
-		// 保留为路径公式未来变更时的迁移钩子。
-		if metadata != want || keyPath == c.accountKeyPath {
+		// 无害；删除会让旧账户身份无法恢复）。
+		if metadata != want {
+			continue
+		}
+		// 本分支恒真（不可达）：账户密钥路径公式含 directory|email|KID|HMAC
+		// 摘要，metadata == want 即 metadataPath 就是本账户密钥文件。保留该显式
+		// 分支作为路径公式未来变更时的迁移钩子，避免公式放宽后误删在用密钥。
+		if keyPath == c.accountKeyPath {
 			continue
 		}
 		info, err := entry.Info()

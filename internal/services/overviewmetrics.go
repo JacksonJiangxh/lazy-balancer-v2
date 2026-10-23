@@ -14,7 +14,7 @@ import (
 
 // rateLimit429CountMetric 是 Caddy 按 host/handler/code 暴露的请求时长直方图计数序列；
 // 限流口径：仅按 code="429" 过滤、含上游自返 429，handler 标签不参与判定
-// （见 parseRateLimit429Counts 内联说明）。
+// （见 parseRateLimit429CountsByServer 内联说明）。
 const rateLimit429CountMetric = `caddy_http_request_duration_seconds_count{`
 
 var overviewMetricsHTTPClient = &http.Client{Timeout: 5 * time.Second}
@@ -200,10 +200,7 @@ func scrapeRateLimitBlocksUncached(metricsURL string) ([]RateLimitHostBlocks, []
 		return nil, nil, fmt.Errorf("Caddy 指标响应超过 %d 字节上限", overviewMetricsReadLimit)
 	}
 	byServer := parseRateLimit429CountsByServer(string(body))
-	hostCounts := map[string]float64{}
-	for key, count := range byServer {
-		hostCounts[key.host] += count
-	}
+	hostCounts := rateLimit429HostCounts(byServer)
 	blocks := make([]RateLimitHostBlocks, 0, len(hostCounts))
 	for host, count := range hostCounts {
 		blocks = append(blocks, RateLimitHostBlocks{Host: host, Count: count})
@@ -230,13 +227,6 @@ func scrapeRateLimitBlocksUncached(metricsURL string) ([]RateLimitHostBlocks, []
 	return blocks, serverBlocks, nil
 }
 
-// parseRateLimit429Counts 从 Prometheus 文本中挑出
-// caddy_http_request_duration_seconds_count{code="429",host=...} 序列并按 host
-// 累加（同一 host 的不同 method/server 序列求和）——站点级卡片的口径。
-// 单规则流程抽屉需要端口维度，见 parseRateLimit429CountsByServer。
-// 口径：仅按 code=429 过滤、含上游自返 429，handler 标签恒不命中（见下方内联
-// 注释）；抓取失败由调用方返回 500。
-// 注释行、其他指标、_bucket/_sum 序列、缺 host 标签或数值非法的行一律跳过。
 // NormalizeMetricsHost 统一 host 标签归一：Caddy metrics 的 host
 // 标签是原文 r.Host（可能含 :8080 / [::1]:8443），而 lb_rules.domain 不带端口
 // ——不归一会让带端口部署的规则限流计数恒 0。IPv6 方括号在比较域一并剥除。
@@ -250,10 +240,15 @@ func NormalizeMetricsHost(host string) string {
 	return h
 }
 
-// parseRateLimit429CountsByServer 按 (host, server) 聚合：server 是 Caddy 的
-// 监听端口分组名（本系统恒为 http_<listen_port>），同域多端口部署下必须与
-// host 一起作为键——只按 host 求和会让每条规则的限流 chip 拿到同域全部端口
-// 的合计（各自被放大）。
+// parseRateLimit429CountsByServer 从 Prometheus 文本中挑出
+// caddy_http_request_duration_seconds_count{code="429",host=...} 序列并按
+// (host, server) 聚合：server 是 Caddy 的监听端口分组名（本系统恒为
+// http_<listen_port>），同域多端口部署下必须与 host 一起作为键——只按 host
+// 求和会让每条规则的限流 chip 拿到同域全部端口的合计（各自被放大）。
+// 站点级卡片按 host 求和（rateLimit429HostCounts）。
+// 口径：仅按 code=429 过滤、含上游自返 429，handler 标签恒不命中（见下方内联
+// 注释）；抓取失败由调用方返回 500。
+// 注释行、其他指标、_bucket/_sum 序列、缺 host 标签或数值非法的行一律跳过。
 func parseRateLimit429CountsByServer(body string) map[rateLimitHostServerKey]float64 {
 	counts := map[rateLimitHostServerKey]float64{}
 	for line := range strings.Lines(body) {
@@ -291,11 +286,12 @@ func parseRateLimit429CountsByServer(body string) map[rateLimitHostServerKey]flo
 	return counts
 }
 
-// parseRateLimit429Counts 是站点级视图（host 求和），复用 host+server 解析器保证
-// 两个口径同源（过滤规则、归一、数值解析只有一份实现）。
-func parseRateLimit429Counts(body string) map[string]float64 {
-	counts := map[string]float64{}
-	for key, value := range parseRateLimit429CountsByServer(body) {
+// rateLimit429HostCounts 是站点级视图（host 求和），由 host+server 解析结果
+// 聚合而来——过滤规则、归一、数值解析与站点聚合只有一份实现，抓取路径与
+// 测试断言消费同一函数，避免未来只改一侧造成生产/断言静默分叉。
+func rateLimit429HostCounts(byServer map[rateLimitHostServerKey]float64) map[string]float64 {
+	counts := make(map[string]float64, len(byServer))
+	for key, value := range byServer {
 		counts[key.host] += value
 	}
 	return counts

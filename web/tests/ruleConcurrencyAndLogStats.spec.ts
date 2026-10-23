@@ -3,7 +3,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { source, stripComments } from './_helpers.ts'
+import { member, source, stripComments } from './_helpers.ts'
 
 const page = source('src/views/Rules.vue')
 const types = source('src/types/rules.ts')
@@ -25,11 +25,9 @@ test('版本冲突（409）刷新列表并提示重新打开，不静默覆盖',
 })
 
 test('实时统计只借 /logs 的 offset，不消费打开前的历史内容', () => {
-  const start = page.indexOf('const startLogStats = async () => {')
-  assert.ok(start >= 0, 'missing startLogStats')
-  const end = page.indexOf('const onRuleLogTabChange', start)
-  assert.ok(end > start, 'missing startLogStats end marker')
-  const body = stripComments(page.slice(start, end))
+  // 结构边界：花括号配对取函数体（下一条函数声明作终点会让后插的语句落进
+  // 切片，断言可能被相邻函数满足）。
+  const body = stripComments(member(page, 'const startLogStats = async'))
   // 增量路径仍是纯实时；起始路径不得把 tail 内容灌进同一组桶。
   assert.doesNotMatch(body, /consumeLogLinesChunked\(/)
   assert.match(body, /logStatsOffset\.value = res\.data\?\.offset \?\? 0/)

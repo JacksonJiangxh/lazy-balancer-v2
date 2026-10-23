@@ -118,6 +118,17 @@ const (
 	// 特殊值（返回 UTC），读侧 COALESCE 只兜 NULL——空串落库会让全站展示/
 	// 审计窗口静默切 UTC，故写侧拒绝、启动归一、DDL DEFAULT 三处同口径。
 	DefaultTimezone = "Asia/Shanghai"
+	// DefaultScheduleDays/Time 是任务级排程（CRS/IP2Region 版本表、威胁/爬虫
+	// 源表）的治理默认：fresh DDL DEFAULT、迁移补列与 services 读失败兜底同源，
+	// db_truth_defaults_test 双向钉死字面量。
+	DefaultScheduleDays = "1,2,3,4,5,6,7"
+	DefaultScheduleTime = "04:00"
+	// 日志体量/保留期治理默认：fresh DDL DEFAULT、迁移补列与读侧 COALESCE
+	// 绑定参数同源（config_changes 预览快照与 caddy 设置读路径共用）。
+	DefaultTaskLogSizeMB        = 10
+	DefaultAuditLogSizeMB       = 10
+	DefaultRuntimeLogSizeMB     = 100
+	DefaultAuditRetentionMonths = 3
 )
 
 // certJobStatuses 是 cert_jobs.status 的规范枚举。
@@ -1369,7 +1380,8 @@ func runMigrations() error {
 	}
 	// 保护目标自愈：users 重建/存量迁移可能留下「无标记」状态，按「最低 id
 	// 的启用管理员」补标（空库/无启用管理员时零命中，不阻断启动）。
-	if err := EnsureSetupAdminFlag(context.Background(), DB); err != nil {
+	// 经只读探测门 + 单一写事务（收敛库启动零写，见 ensureSetupAdminFlagAtStartup）。
+	if err := ensureSetupAdminFlagAtStartup(); err != nil {
 		return fmt.Errorf("failed to ensure setup admin flag: %w", err)
 	}
 	if err := migrateAutoBackupNodeTopologySection(); err != nil {
@@ -2030,14 +2042,26 @@ func migrateDropMergedSyncSwitchColumns() error {
 		return err
 	}
 	if tableCount > 0 {
-		if _, err := DB.Exec(`UPDATE global_config SET
-			applied_waf_ref_hash=COALESCE((SELECT hash FROM cluster_applied_sections WHERE section='waf_files'),''),
-			applied_waf_ref_version=COALESCE((SELECT applied_version FROM cluster_applied_sections WHERE section='waf_files'),0)
-			WHERE id=1 AND COALESCE(applied_waf_ref_hash,'')=''`); err != nil {
-			return fmt.Errorf("failed to move waf bookkeeping into global_config columns: %w", err)
+		// 只读探测：仅当遗留记账行仍存在时才搬移/删除。此前搬运语句的谓词
+		// 只看「目标列是否为空」——目标列为空的库（主端/单机）在**每次启动**
+		// 都执行一条值不变的 UPDATE（SQLite 对等值 UPDATE 也写页，见同文件
+		// normalizeCertJobsCAAvailableAfter 注释），收敛库每启动固定取写锁。
+		var legacySections int
+		if err := DB.QueryRow(`SELECT COUNT(*) FROM cluster_applied_sections WHERE section IN ('global_config','waf_files')`).Scan(&legacySections); err != nil {
+			return fmt.Errorf("failed to probe legacy applied sections: %w", err)
 		}
-		if _, err := DB.Exec(`DELETE FROM cluster_applied_sections WHERE section IN ('global_config','waf_files')`); err != nil {
-			return fmt.Errorf("failed to clear legacy applied sections: %w", err)
+		if legacySections > 0 {
+			startupMigrationWriteStatements.Add(1)
+			if _, err := DB.Exec(`UPDATE global_config SET
+				applied_waf_ref_hash=COALESCE((SELECT hash FROM cluster_applied_sections WHERE section='waf_files'),''),
+				applied_waf_ref_version=COALESCE((SELECT applied_version FROM cluster_applied_sections WHERE section='waf_files'),0)
+				WHERE id=1 AND COALESCE(applied_waf_ref_hash,'')=''`); err != nil {
+				return fmt.Errorf("failed to move waf bookkeeping into global_config columns: %w", err)
+			}
+			startupMigrationWriteStatements.Add(1)
+			if _, err := DB.Exec(`DELETE FROM cluster_applied_sections WHERE section IN ('global_config','waf_files')`); err != nil {
+				return fmt.Errorf("failed to clear legacy applied sections: %w", err)
+			}
 		}
 	}
 	return nil
@@ -3487,6 +3511,11 @@ func migrateCrawlerSourcesOutOfThreat() error {
 // 事务内执行 fn → 提交 → 还原 FK。fn 返回错误或提交失败时整体回滚，崩溃不会
 // 留下半建表（DROP 与 RENAME 之间失败曾可致表丢失/残留 _new 表阻断重跑）。
 // label 只用于日志与错误上下文。
+//
+// 事务生命周期归骨架所有：闭包只返回错误，**不得**自行 Commit/Rollback——
+// 自行回滚会被 defer 再回滚一次（ErrTxDone 静默吞掉），自行提交则被
+// committed=false 再回滚后报「提交失败」，两种误读都表现为难以定位的迁移
+// 失败。闭包内一律 `return fmt.Errorf(...)`。
 func withTableRebuild(ctx context.Context, label string, fn func(tx *sql.Tx) error) error {
 	conn, err := DB.Conn(ctx)
 	if err != nil {
@@ -3958,22 +3987,18 @@ func migrateLegacyGlobalDNSCredentials() error {
 	if !hasColumn {
 		return nil
 	}
-	res, err := DB.Exec(`UPDATE global_config SET dns_credentials = NULL
-		WHERE dns_credentials IS NOT NULL AND dns_credentials <> ''`)
+	res, err := execMigrationWriteIfNeeded(updateWhere("global_config", "dns_credentials = NULL",
+		"dns_credentials IS NOT NULL AND dns_credentials <> ''"))
 	if err != nil {
 		return fmt.Errorf("failed to clear legacy global_config.dns_credentials: %w", err)
+	}
+	if res == nil {
+		return nil
 	}
 	if affected, rowsErr := res.RowsAffected(); rowsErr == nil && affected > 0 {
 		log.Printf("Cleared legacy global_config.dns_credentials (%d row(s))", affected)
 	}
 	return nil
-}
-
-func rollbackMigration(tx *sql.Tx, migrationErr error) error {
-	if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
-		return errors.Join(migrationErr, rollbackErr)
-	}
-	return migrationErr
 }
 
 // readForeignKeysSetting 读取连接当前 foreign_keys 设置（0/1）。表重建
@@ -4091,7 +4116,7 @@ func migrateLbRulesPrimaryKey() error {
 		)
 	`)
 		if err != nil {
-			return rollbackMigration(tx, fmt.Errorf("failed to create lb_rules_new: %w", err))
+			return fmt.Errorf("failed to create lb_rules_new: %w", err)
 		}
 
 		// Copy data from old table to new table。注意：ip_acl_mode / ip_acl_list 是已废弃的规则级
@@ -4135,19 +4160,19 @@ func migrateLbRulesPrimaryKey() error {
 		FROM lb_rules
 	`)
 		if err != nil {
-			return rollbackMigration(tx, fmt.Errorf("failed to copy lb_rules data: %w", err))
+			return fmt.Errorf("failed to copy lb_rules data: %w", err)
 		}
 
 		// Drop old table
 		_, err = tx.Exec("DROP TABLE lb_rules")
 		if err != nil {
-			return rollbackMigration(tx, fmt.Errorf("failed to drop old lb_rules: %w", err))
+			return fmt.Errorf("failed to drop old lb_rules: %w", err)
 		}
 
 		// Rename new table
 		_, err = tx.Exec("ALTER TABLE lb_rules_new RENAME TO lb_rules")
 		if err != nil {
-			return rollbackMigration(tx, fmt.Errorf("failed to rename lb_rules_new: %w", err))
+			return fmt.Errorf("failed to rename lb_rules_new: %w", err)
 		}
 
 		// Create new upstreams table with VARCHAR rule_id
@@ -4170,7 +4195,7 @@ origin_domain TEXT NOT NULL DEFAULT '',
 	)
 `)
 		if err != nil {
-			return rollbackMigration(tx, fmt.Errorf("failed to create upstreams_new: %w", err))
+			return fmt.Errorf("failed to create upstreams_new: %w", err)
 		}
 
 		// Copy data from old upstreams table to new (convert rule_id from int to string)
@@ -4182,19 +4207,19 @@ origin_domain TEXT NOT NULL DEFAULT '',
 		JOIN lb_rules r ON u.rule_id = r.id
 	`)
 		if err != nil {
-			return rollbackMigration(tx, fmt.Errorf("failed to copy upstreams data: %w", err))
+			return fmt.Errorf("failed to copy upstreams data: %w", err)
 		}
 
 		// Drop old upstreams table
 		_, err = tx.Exec("DROP TABLE upstreams")
 		if err != nil {
-			return rollbackMigration(tx, fmt.Errorf("failed to drop old upstreams: %w", err))
+			return fmt.Errorf("failed to drop old upstreams: %w", err)
 		}
 
 		// Rename new upstreams table
 		_, err = tx.Exec("ALTER TABLE upstreams_new RENAME TO upstreams")
 		if err != nil {
-			return rollbackMigration(tx, fmt.Errorf("failed to rename upstreams_new: %w", err))
+			return fmt.Errorf("failed to rename upstreams_new: %w", err)
 		}
 		return nil
 	}); err != nil {
@@ -4285,19 +4310,21 @@ func migrateCertJobsStatusConstraint() error {
 
 	log.Println("Migrating cert_jobs status constraint...")
 
-	// 枚举外状态（已废弃/拼写错误）是用户可见数据
-	// 改写——归一到终态 failed（保守：failed 不会被签发队列拾取，且
+	// 非法状态（已废弃/拼写错误/历史 DDL 允许的 NULL）是用户可见数据改写——
+	// 一律归一到终态 failed（保守：failed 不会被签发队列拾取，且
 	// certificates.go 的「无 expires_at 的 failed」重签路径可手动恢复），
 	// 不再回 'queued'（活跃起始态，会被队列立刻拾取并触发一次无审计的签发/
-	// 部署尝试）。改写数量先计数，重建提交后聚合写一条系统审计。
+	// 部署尝试）。NULL 与枚举外值同保守度，且同样计入留痕（此前 NULL 走
+	// 回 'queued' 分支且零留痕，与枚举外策略相反）。改写数量先计数，重建
+	// 提交后聚合写一条系统审计。
 	var unknownStatusRows int
-	if err := DB.QueryRow(`SELECT COUNT(*) FROM cert_jobs WHERE status IS NOT NULL AND status NOT IN (` + certJobStatusListSQL() + `)`).Scan(&unknownStatusRows); err != nil {
+	if err := DB.QueryRow(`SELECT COUNT(*) FROM cert_jobs WHERE status IS NULL OR status NOT IN (` + certJobStatusListSQL() + `)`).Scan(&unknownStatusRows); err != nil {
 		return fmt.Errorf("failed to count unknown cert_jobs statuses: %w", err)
 	}
 
 	if err := withTableRebuild(context.Background(), "cert_jobs", func(tx *sql.Tx) error {
 		if _, err := tx.Exec("ALTER TABLE cert_jobs RENAME TO cert_jobs_old"); err != nil {
-			return rollbackMigration(tx, fmt.Errorf("failed to rename cert_jobs: %w", err))
+			return fmt.Errorf("failed to rename cert_jobs: %w", err)
 		}
 
 		if _, err := tx.Exec(`
@@ -4320,7 +4347,7 @@ func migrateCertJobsStatusConstraint() error {
 			updated_at DATETIME
 		)
 	`); err != nil {
-			return rollbackMigration(tx, fmt.Errorf("failed to create new cert_jobs table: %w", err))
+			return fmt.Errorf("failed to create new cert_jobs table: %w", err)
 		}
 
 		if _, err := tx.Exec(`
@@ -4331,17 +4358,17 @@ func migrateCertJobsStatusConstraint() error {
 		)
 		SELECT
 			id, rule_id, domain,
-			CASE WHEN COALESCE(status,'queued') IN (` + certJobStatusListSQL() + `) THEN COALESCE(status,'queued') ELSE 'failed' END,
+			CASE WHEN status IN (` + certJobStatusListSQL() + `) THEN status ELSE 'failed' END,
 			message, expires_at, cert_pem, key_pem,
 			ca_provider_id, renewal_attempts, ca_available_after, last_error_code, deployment_attempts, deployment_available_after,
 			created_at, updated_at
 		FROM cert_jobs_old
 	`); err != nil {
-			return rollbackMigration(tx, fmt.Errorf("failed to copy cert_jobs data: %w", err))
+			return fmt.Errorf("failed to copy cert_jobs data: %w", err)
 		}
 
 		if _, err := tx.Exec("DROP TABLE cert_jobs_old"); err != nil {
-			return rollbackMigration(tx, fmt.Errorf("failed to drop old cert_jobs table: %w", err))
+			return fmt.Errorf("failed to drop old cert_jobs table: %w", err)
 		}
 		return nil
 	}); err != nil {
@@ -4350,7 +4377,7 @@ func migrateCertJobsStatusConstraint() error {
 
 	log.Println("cert_jobs status constraint migration completed")
 	if unknownStatusRows > 0 {
-		detail := fmt.Sprintf("cert_jobs 枚举外状态归一到 failed（不再回 queued，避免触发新签发）：%d 行", unknownStatusRows)
+		detail := fmt.Sprintf("cert_jobs 枚举外或 NULL 状态归一到 failed（不再回 queued，避免触发新签发）：%d 行", unknownStatusRows)
 		log.Print(detail)
 		recordSystemAudit("启动迁移", "证书任务", detail)
 	}

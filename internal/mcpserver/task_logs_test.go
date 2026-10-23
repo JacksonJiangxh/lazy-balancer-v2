@@ -47,7 +47,7 @@ func TestGetSystemTaskLogs_certJobReadsRealLogThroughMCP(t *testing.T) {
 	defer rest.Close()
 
 	// When：经 MCP tools/call → 真实 API handler → DB → 文件读取。
-	mcpHandler := mcpserver.New(rest.URL+"/api/v1", rest.Client())
+	mcpHandler := mcpserver.NewForTest(rest.URL+"/api/v1", rest.Client())
 	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_system_task_logs","arguments":{"id":"cert-job:1"}}}`
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/mcp", strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")

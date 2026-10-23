@@ -91,7 +91,7 @@
           <div class="cred-row__label">邮箱域</div>
           <div class="cred-row__field">
             <el-input v-model="form.allowedEmailDomains" placeholder="example.com, corp.example.org（逗号分隔；留空=不限制）" clearable />
-            <div class="form-tip-line">仅这些邮箱域的用户可登录（写入侧自动去空白、转小写并去重）</div>
+            <div class="form-tip-line">仅这些邮箱域的用户可登录（写入侧自动去空白、转小写并去重）；邮箱还须由认证服务标记为已验证（email_verified=true），未验证的邮箱一律拒登</div>
           </div>
         </div>
         <div class="cred-row">
@@ -128,7 +128,7 @@ import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { CircleCheckFilled, CircleCloseFilled, Connection } from '@element-plus/icons-vue'
 import DialogHeader from '@/components/DialogHeader.vue'
-import { request, ApiRequestError } from '@/utils/api'
+import { request, mfaAwareSuccess, ApiRequestError } from '@/utils/api'
 import { copyText } from '@/utils/copy'
 import { useAuthStore } from '@/stores/auth'
 import { formatAllowList, parseDomainAllowList, parseGroupAllowList } from '@/utils/oidcAllowList'
@@ -371,7 +371,7 @@ const save = async () => {
     await load()
     form.clientSecret = '' // 已保存,清空避免下次测试误带旧输入
     // load() 已回填最新启用态,按回填值提示(修复保存后恒走启用分支的死文案)
-    ElMessage.success(enabled.value ? 'OIDC 已启用——登录页将出现认证服务入口' : '配置已更新')
+    mfaAwareSuccess(enabled.value ? 'OIDC 已启用——登录页将出现认证服务入口' : '配置已更新')
     emit('update:modelValue', false) // 成功即关闭;失败留在弹框由拦截器报错
   } catch { /* 拦截器已提示 */ } finally {
     saving.value = false
@@ -383,7 +383,7 @@ const toggleEnabled = async (on: boolean) => {
   saving.value = true
   try {
     await request.put('/settings/oidc', { enabled: on })
-    ElMessage.success(on ? '已启用' : '已暂停（本地账号登录不受影响）')
+    mfaAwareSuccess(on ? '已启用' : '已暂停（本地账号登录不受影响）')
     await load()
   } catch { /* 拦截器已提示 */ } finally {
     saving.value = false
@@ -398,7 +398,7 @@ const remove = async () => {
   try {
     await request.delete('/settings/oidc')
   } catch { /* 拦截器已提示 */ return }
-  ElMessage.success('已删除')
+  mfaAwareSuccess('已删除')
   form.issuer = ''; form.clientId = ''; form.clientSecret = ''; form.displayName = ''
   form.allowedEmailDomains = ''; form.allowedGroups = ''
   probe.checked = false; probe.ok = false; lastTest.value = null

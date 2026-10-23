@@ -5,6 +5,7 @@ package handlers
 // 开户；IdP 未返回对应声明 = fail-visible 拒登。写侧规范化与校验同钉。
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -161,11 +162,99 @@ func TestOIDCSettings_whitelistValidationAndEcho(t *testing.T) {
 // （fail-visible 方向安全但全员拒登属可用性自伤）。
 func TestOIDCAccessAllowed_normalizesDomainListAtRead(t *testing.T) {
 	cfg := OIDCConfig{AllowedEmailDomains: []string{" Example.COM ", "corp.example.org"}}
-	ok, reason := oidcAccessAllowed(cfg, "user@example.com", nil)
+	ok, reason := oidcAccessAllowed(cfg, oidcAccessClaims{
+		Email: "user@example.com", EmailVerified: true, EmailVerifiedSeen: true,
+	})
 	if !ok {
 		t.Fatalf("allowed=%v reason=%q, want 命中（读侧 trim+小写）", ok, reason)
 	}
-	if ok, _ := oidcAccessAllowed(cfg, "user@evil.example", nil); ok {
+	if ok, _ := oidcAccessAllowed(cfg, oidcAccessClaims{
+		Email: "user@evil.example", EmailVerified: true, EmailVerifiedSeen: true,
+	}); ok {
 		t.Fatal("未命中域不得放行")
+	}
+}
+
+// 配置了域名单时 email_verified 是硬门：false 与缺失（IdP 不返回该声明）
+// 都必须 fail-visible 拒登——域白名单信任的是「IdP 已验证邮箱归属」，否则
+// 任何能改 profile 邮箱的人把地址指向允许域即通过。
+func TestOIDCAccessAllowed_requiresVerifiedEmail(t *testing.T) {
+	cfg := OIDCConfig{AllowedEmailDomains: []string{"example.com"}}
+	cases := []struct {
+		name    string
+		claims  oidcAccessClaims
+		wantOK  bool
+		wantSub string
+	}{
+		{"verified", oidcAccessClaims{Email: "user@example.com", EmailVerified: true, EmailVerifiedSeen: true}, true, ""},
+		{"unverified", oidcAccessClaims{Email: "user@example.com", EmailVerified: false, EmailVerifiedSeen: true}, false, "email_verified=false"},
+		{"missing claim", oidcAccessClaims{Email: "user@example.com"}, false, "未返回 email_verified"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, reason := oidcAccessAllowed(cfg, tc.claims)
+			if ok != tc.wantOK {
+				t.Fatalf("allowed=%v, want %v (reason=%q)", ok, tc.wantOK, reason)
+			}
+			if tc.wantSub != "" && !strings.Contains(reason, tc.wantSub) {
+				t.Fatalf("reason=%q, want 含 %q", reason, tc.wantSub)
+			}
+		})
+	}
+}
+
+// email_verified 的解析容忍布尔与字符串两种形态（部分 IdP 返回 "true"）；
+// 未知形态按「未验证」处理（fail-closed）。
+func TestOIDCEmailVerified_parsesBoolAndStringForms(t *testing.T) {
+	cases := []struct {
+		raw          string
+		wantVerified bool
+		wantKnown    bool
+	}{
+		{`true`, true, true},
+		{`false`, false, true},
+		{`"true"`, true, true},
+		{`"false"`, false, true},
+		{`null`, false, false},
+		{``, false, false},
+		{`"yes"`, false, false},
+	}
+	for _, tc := range cases {
+		verified, known := oidcEmailVerified(json.RawMessage(tc.raw))
+		if verified != tc.wantVerified || known != tc.wantKnown {
+			t.Fatalf("raw=%q → (%v,%v), want (%v,%v)", tc.raw, verified, known, tc.wantVerified, tc.wantKnown)
+		}
+	}
+}
+
+// 端到端：IdP 返回 email_verified=false 时，域名单即使命中也必须拒登
+// （未验证的自定义邮箱可被任意指向允许域），且不发生 JIT 开户、审计写明原因。
+func TestOIDCCallback_unverifiedEmailRejected(t *testing.T) {
+	for _, mode := range []string{"false", "absent"} {
+		t.Run(mode, func(t *testing.T) {
+			idp := newMockIdP(t)
+			idp.emailVerifiedMode.Store(mode)
+			router, _ := setupOIDCTest(t, idp)
+			putOIDCConfig(t, router, `{"issuer":"`+idp.issuer+`","client_id":"test-client","client_secret":"s","enabled":true,"allowed_email_domains":["example.com"]}`)
+
+			front := runOIDCLoginFlow(t, router)
+			if !strings.Contains(front, "error=") {
+				t.Fatalf("未验证邮箱必须拒登（mode=%s），got redirect: %s", mode, front)
+			}
+			var cnt int
+			if err := db.DB.QueryRow("SELECT COUNT(*) FROM users WHERE auth_provider='oidc'").Scan(&cnt); err != nil {
+				t.Fatal(err)
+			}
+			if cnt != 0 {
+				t.Fatalf("oidc users=%d, want 0（未验证邮箱不得开户）", cnt)
+			}
+			var audits int
+			if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='认证拒绝' AND detail LIKE '%email_verified%'`).Scan(&audits); err != nil {
+				t.Fatal(err)
+			}
+			if audits == 0 {
+				t.Fatal("拒登审计必须写明 email_verified 原因")
+			}
+		})
 	}
 }

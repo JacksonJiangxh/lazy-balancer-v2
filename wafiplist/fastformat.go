@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"log"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -184,10 +185,18 @@ func WriteFastFile(path string, v4, v6 []netip.Prefix) error {
 	}
 	if dir, derr := os.Open(filepath.Dir(path)); derr == nil {
 		if serr := dir.Sync(); serr != nil {
-			_ = dir.Close()
-			return fmt.Errorf("fastfile dir sync: %w", serr)
+			// rename 已生效：新 .fast 可见且内容完整（写侧 fsync 已完成），
+			// 目录 fsync 失败只影响「掉电后 rename 本身是否持久」。返回 error
+			// 会让上层（ipcompile）记「编译失败」并可能按失败回退文本/保留旧
+			// 产物——与磁盘状态不一致（产物已替换）。降级为告警：可观测，但
+			// 不谎报失败。
+			log.Printf("WARNING: fastfile dir sync after rename %q failed (artifact replaced, durability unconfirmed): %v", path, serr)
 		}
 		_ = dir.Close()
+	} else {
+		// 与上分支口径一致：目录打不开同样意味着 durability 未确认，不得
+		// 静默（旧实现只对 Sync 失败返回 error、对 Open 失败完全静默）。
+		log.Printf("WARNING: fastfile dir open for sync %q failed (durability unconfirmed): %v", path, derr)
 	}
 	return nil
 }

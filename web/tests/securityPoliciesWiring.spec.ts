@@ -91,8 +91,12 @@ test('爬虫引擎：字段缺失→默认三项，显式 "[]" 原样保留（�
   assert.doesNotMatch(detailBlock, /length > 0 \?/, '空数组不得再被三引擎兜底改写')
 })
 
-test('保存语义注释与批量端点实现同源（不得再写逐规则 PUT）', () => {
-  assert.doesNotMatch(page, /收尾逐规则 PUT/, '注释不得回退为逐规则 PUT 口径')
-  assert.doesNotMatch(page, /在策略落库后逐规则 PUT/)
-  assert.match(page, /batch-block-pages/)
+test('保存收尾走批量端点，不回流逐规则 PUT（钉调用点而非注释措辞）', () => {
+  // 断言对象是**调用点**：收尾段（绑定批量汇总 → 合并结果）内必须是单次
+  // batch-block-pages 请求，且不得出现逐规则 request.put。此前钉的是历史
+  // 注释措辞——删注释后断言恒真，口径回归实际守护为零。
+  const tail = section(page, 'const bindResponses', 'const mergedBind')
+  assert.ok(tail.includes("('/rules/batch-block-pages', {"), '收尾必须调用批量端点')
+  assert.match(tail, /request\.post</, '批量端点必须经 POST 提交')
+  assert.doesNotMatch(tail, /request\.put\(/, '收尾不得逐规则 PUT')
 })

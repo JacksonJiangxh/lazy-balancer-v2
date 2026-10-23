@@ -2,12 +2,16 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
+
+	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/models"
 )
 
 // 受信代理四字段（v2.3.x CDN 真实 IP 支持）：合法值写入成功并经 GET 回读；
@@ -140,5 +144,46 @@ func TestPreviewConfigUpdate_trustedProxy_sameValidation(t *testing.T) {
 	router.ServeHTTP(response, request)
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d body=%s, want 400", response.Code, response.Body.String())
+	}
+}
+
+// 总量门按规范化前缀集合计数（与渲染去重同源）：同一网段既内联又列在引用
+// 名单时只计一次——按条目数累加会把实际展开集合没超限的合法载荷 400 拒绝。
+func TestTrustedProxyTotalGate_countsDedupedPrefixes(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	_ = h
+	inlineValues := make([]string, 0, 1501)
+	for i := 0; i < 1500; i++ {
+		inlineValues = append(inlineValues, fmt.Sprintf("10.1.%d.%d", i/256, i%256))
+	}
+	entries := make([]models.IPListEntry, 0, 1000)
+	for i := 0; i < 500; i++ { // 前 500 条与内联完全重叠
+		entries = append(entries, models.IPListEntry{Value: fmt.Sprintf("10.1.%d.%d", i/256, i%256)})
+	}
+	for i := 0; i < 500; i++ {
+		entries = append(entries, models.IPListEntry{Value: fmt.Sprintf("10.2.%d.%d", i/256, i%256)})
+	}
+	encoded, err := json.Marshal(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO security_ip_lists (id, name, entries, system) VALUES (321, 'overlap-cdn', ?, 0)`, string(encoded)); err != nil {
+		t.Fatalf("seed list: %v", err)
+	}
+
+	_, refKeys, err := normalizeTrustedProxyRangeRefsWithSource("[321]", trustedProxyBackupSource{})
+	if err != nil {
+		t.Fatalf("normalize refs: %v", err)
+	}
+	inlineKeys := trustedProxyPrefixKeys(inlineValues)
+	if got := len(inlineKeys) + len(refKeys); got != 2500 {
+		t.Fatalf("条目和=%d, want 2500（前置：确有 500 条重叠）", got)
+	}
+	if err := trustedProxyTotalGate(inlineKeys, refKeys); err != nil {
+		t.Fatalf("去重后合计 2000 必须放行（当前按条目累加=2500 的假拒绝）: %v", err)
+	}
+	inlineKeys["10.9.9.9/32"] = struct{}{}
+	if err := trustedProxyTotalGate(inlineKeys, refKeys); err == nil {
+		t.Fatal("去重后合计 2001 必须拒绝")
 	}
 }

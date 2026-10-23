@@ -49,7 +49,9 @@ const mfaGrace = createMfaGraceTracker()
 
 // （用户裁决）：写操作成功提示的统一 MFA 装饰——宽限窗内（用户不知情）
 // 前缀「MFA 在验证窗口期，本次操作免验证，」；弹码后重试（用户刚验证）不加缀。
-// 所有写事件的成功提示都应经此助手发出。
+// 所有写事件（含任务触发/开关、配置保存、名单增删、导入）的成功提示都应经此
+// 助手发出；复制/查看类非写事件（复制密钥、读取文件内容、重新加载详情）不走
+// MFA step-up，直接 ElMessage.success 即可——该豁免是契约的一部分。
 export const mfaAwareSuccess = (message: string): void => {
   if (mfaGrace.consumeGraceForSuccess(Date.now())) {
     ElMessage.success(`MFA 在验证窗口期，本次操作免验证，${message}`)

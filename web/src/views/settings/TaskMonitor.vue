@@ -46,6 +46,9 @@
           <template #header>
             <div class="card-header">
               <div class="card-title"><el-icon class="title-icon"><PieChartIcon /></el-icon><span>任务状态分布</span></div>
+              <!-- 口径显性化：本图是「列表全部任务行」的分布，与只数引擎族的 KPI
+                   不同源（cert-job 动态行最多 100 条会主导占比）。 -->
+              <span class="form-tip-inline">口径：全部任务行（含证书工作项，上限 100）</span>
             </div>
           </template>
           <v-chart v-if="loaded" :option="statusPieOption" autoresize class="tm-chart" />
@@ -350,7 +353,7 @@ import VChart from 'vue-echarts'
 import axios from 'axios'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh, PieChart as PieChartIcon, DataLine, List, Monitor, Lock, Box, Timer } from '@element-plus/icons-vue'
-import { request } from '@/utils/api'
+import { request, mfaAwareSuccess } from '@/utils/api'
 import { useAuthStore } from '@/stores/auth'
 import { usePollingTask } from '@/composables/usePollingTask'
 import { useLogTailPolling } from '@/composables/useLogTailPolling'
@@ -552,6 +555,9 @@ const { pagedItems: pagedTasks } = useClampedPagination(filteredTasks, page, pag
 watch([kindFilter, categoryFilter], () => { page.value = 1 })
 
 // ===== 图表（引擎真数据） =====
+// 口径（有意保留「全部任务行」）：本图回答「列表里各状态各有多少」，故与表格同集，
+// 与只数引擎族的 KPI 不同源——cert-job 动态行（上限 100）会主导占比，卡片头已
+// 显式标注该口径；若改为引擎族分布须同时标注，避免两处对同一事实呈现强弱相反。
 const statusPieOption = computed<EChartsOption>((): EChartsOption => {
   const counts = new Map<string, number>()
   for (const t of tasks.value) counts.set(t.status, (counts.get(t.status) || 0) + 1)
@@ -626,7 +632,7 @@ async function runTaskAction(row: TaskInfo, options: TaskActionOptions): Promise
       }
     }
     const res = await options.request()
-    ElMessage.success(res.message || options.successFallback)
+    mfaAwareSuccess(res.message || options.successFallback)
     void fetchTasks().catch(() => {})
   } catch (error: unknown) {
     // 全局拦截器已 toast；仅记录，避免 unhandled rejection

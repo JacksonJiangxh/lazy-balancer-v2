@@ -14,8 +14,8 @@ import (
 	"lazy-balancer-v2/internal/models"
 )
 
-// 标记——标记是 304 全量重拉补偿的唯一触发器。失败周期组合保留标记；loadState 恢复后
-// 304 分支必须触发 since_version=0 全量重拉补偿。
+// 覆盖：重载失败标记必须跨失败周期存活——标记是 304 全量重拉补偿的唯一触发器。
+// 失败周期组合保留标记；loadState 恢复后 304 分支必须触发 since_version=0 全量重拉补偿。
 func TestSyncService_run_loadStateTransientFailure_preservesReloadMarker_then304Repull(t *testing.T) {
 	// Given：重载失败标记已存在；主节点对 since_version=7 回 304、对 since_version=0
 	// 返回 v9 全量快照

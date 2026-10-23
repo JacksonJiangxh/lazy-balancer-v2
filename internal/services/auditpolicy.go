@@ -1,5 +1,16 @@
 package services
 
+// 审计路由分类：AuditPolicyExplicit 由 handler 亲自记录、
+// AuditPolicyGeneric 由 auditMiddleware 生成通用行、AuditPolicySkip 明确不留痕。
+//
+// 通用审计不覆盖 4xx（auditMiddleware 在 400≤status<500 时直接返回）：
+//   - 401/403/428/429 由各守卫经 recordAuthenticationRejection 留痕
+//     （含限流去重），不是留白；
+//   - 400/409（参数错误、导入与集群写冲突）在 handler 未显式记录时**没有**
+//     通用审计行——权威痕迹在访问日志与具体 handler 的显式事件里。
+//
+// 这是有意口径：4xx 是「请求未生效」，逐条入操作审计会淹没真实业务拒绝面；
+// 若某个 409 代表真实业务拒绝且需要操作审计，应由该 handler 显式记录。
 type AuditPolicy int
 
 const (
@@ -15,11 +26,11 @@ var auditRoutePolicies = map[string]AuditPolicy{
 	// 认证拒绝/登录成功）；自助端点 handler 显式记录启用/禁用（用户认证对象）；
 	// recovery-codes 重生成成功由 handler 显式记录「生成/恢复码」（2026-09-05
 	// 审计裁定——纯会话门下旧码全作废+明文下发登录可用凭证，须留痕）；setup/
-	// status/verify-step 为读或内部动作不产生审计（Generic 中间件映射为空 →
-	// 不记录——后的收敛形态）；admin reset handler 记录「重置/用户认证」。
+	// verify-step 为内部动作，显式登记 Skip 以固定契约；admin reset handler
+	// 记录「重置/用户认证」。读端点（如 GET /auth/mfa/status）走默认 Skip，
+	// 不登记——本表只承载写路由的显式分类。
 	"POST /api/v1/auth/mfa/verify":         AuditPolicyExplicit,
 	"POST /api/v1/auth/mfa/setup":          AuditPolicySkip,
-	"GET /api/v1/auth/mfa/status":          AuditPolicySkip,
 	"POST /api/v1/auth/mfa/activate":       AuditPolicyExplicit,
 	"POST /api/v1/auth/mfa/disable":        AuditPolicyExplicit,
 	"POST /api/v1/auth/mfa/recovery-codes": AuditPolicyExplicit,

@@ -3,9 +3,14 @@ package handlers
 import (
 	"bytes"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +20,15 @@ import (
 	"lazy-balancer-v2/internal/config"
 	"lazy-balancer-v2/internal/db"
 )
+
+// newAdminTLSHandlers admin TLS 测试单源夹具：恒带隔离 DataDir——空 DataDir 时
+// 启用态 selfsigned 探针会把 admin_tls.crt/key 写进包源码树（曾被 git add -A
+// 扫进仓库）。裸 Handlers 字面量一律经本 helper（源扫描钉测见
+// TestAdminTLSTests_allFixturesCarryIsolatedDataDir）。
+func newAdminTLSHandlers(t *testing.T) *Handlers {
+	t.Helper()
+	return &Handlers{cfg: &config.Config{Port: 8000, DataDir: t.TempDir()}}
+}
 
 func TestUpdateAdminTLS_disables_upload_mode_without_new_files(t *testing.T) {
 	initializeRuleFeatureTestDB(t)
@@ -34,7 +48,7 @@ func TestUpdateAdminTLS_disables_upload_mode_without_new_files(t *testing.T) {
 	if err := writer.Close(); err != nil {
 		t.Fatalf("close multipart writer: %v", err)
 	}
-	handler := &Handlers{cfg: &config.Config{Port: 8000}}
+	handler := newAdminTLSHandlers(t)
 	router := gin.New()
 	router.POST("/admin-tls", handler.UpdateAdminTLS)
 	request := httptest.NewRequest(http.MethodPost, "/admin-tls", strings.NewReader(body.String()))
@@ -73,7 +87,7 @@ func TestInspectAdminTLSCertJSONBody_acceptsPEMStringFields(t *testing.T) {
 		t.Fatalf("marshal inspect body: %v", err)
 	}
 	router := gin.New()
-	router.POST("/admin-tls/inspect", (&Handlers{cfg: &config.Config{}}).InspectAdminTLSCert)
+	router.POST("/admin-tls/inspect", (newAdminTLSHandlers(t)).InspectAdminTLSCert)
 	request := httptest.NewRequest(http.MethodPost, "/admin-tls/inspect", bytes.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
@@ -125,7 +139,7 @@ func TestInspectAdminTLSCertJSONBody_rejectsInvalidPEMLikeMultipart(t *testing.T
 		t.Fatalf("close multipart writer: %v", err)
 	}
 	router := gin.New()
-	router.POST("/admin-tls/inspect", (&Handlers{cfg: &config.Config{}}).InspectAdminTLSCert)
+	router.POST("/admin-tls/inspect", (newAdminTLSHandlers(t)).InspectAdminTLSCert)
 
 	// When：multipart 文件上传
 	multipartRequest := httptest.NewRequest(http.MethodPost, "/admin-tls/inspect", bytes.NewReader(formBody.Bytes()))
@@ -166,7 +180,7 @@ func TestUpdateAdminTLSJSONBody_savesUploadModeCertificate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal update body: %v", err)
 	}
-	handler := &Handlers{cfg: &config.Config{Port: 8000}}
+	handler := newAdminTLSHandlers(t)
 	router := gin.New()
 	router.PUT("/admin-tls", handler.UpdateAdminTLS)
 	request := httptest.NewRequest(http.MethodPut, "/admin-tls", bytes.NewReader(body))
@@ -213,7 +227,7 @@ func TestUpdateAdminTLSJSONBody_rejectsMismatchedPairWithoutSaving(t *testing.T)
 	if err != nil {
 		t.Fatalf("marshal update body: %v", err)
 	}
-	handler := &Handlers{cfg: &config.Config{Port: 8000}}
+	handler := newAdminTLSHandlers(t)
 	router := gin.New()
 	router.PUT("/admin-tls", handler.UpdateAdminTLS)
 	request := httptest.NewRequest(http.MethodPut, "/admin-tls", bytes.NewReader(body))
@@ -255,8 +269,8 @@ func TestAdminTLSOversizedBodyReturns413(t *testing.T) {
 	}
 
 	// When：保存与预检两入口各发一次超限请求
-	updateResponse := send(newRouter((&Handlers{cfg: &config.Config{}}).UpdateAdminTLS, http.MethodPut, "/admin-tls"), http.MethodPut, "/admin-tls")
-	inspectResponse := send(newRouter((&Handlers{cfg: &config.Config{}}).InspectAdminTLSCert, http.MethodPost, "/admin-tls/inspect"), http.MethodPost, "/admin-tls/inspect")
+	updateResponse := send(newRouter((newAdminTLSHandlers(t)).UpdateAdminTLS, http.MethodPut, "/admin-tls"), http.MethodPut, "/admin-tls")
+	inspectResponse := send(newRouter((newAdminTLSHandlers(t)).InspectAdminTLSCert, http.MethodPost, "/admin-tls/inspect"), http.MethodPost, "/admin-tls/inspect")
 
 	// Then：均为 413（非 400）
 	if updateResponse.Code != http.StatusRequestEntityTooLarge {
@@ -292,7 +306,7 @@ func TestUpdateAdminTLS_auditDetailRecordsCertificateReplacement(t *testing.T) {
 		request := httptest.NewRequest(http.MethodPut, "/admin-tls", bytes.NewReader(body))
 		request.Header.Set("Content-Type", "application/json")
 		response := httptest.NewRecorder()
-		newRouter((&Handlers{cfg: &config.Config{Port: 8000}}).UpdateAdminTLS).ServeHTTP(response, request)
+		newRouter((newAdminTLSHandlers(t)).UpdateAdminTLS).ServeHTTP(response, request)
 		if response.Code != http.StatusOK {
 			t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
 		}
@@ -402,6 +416,14 @@ func TestUpdateAdminTLS_switchingToSelfsignedClearsUploadedMaterial(t *testing.T
 	if mode != "selfsigned" || cert != "" || key != "" {
 		t.Fatalf("saved=(%q,%q,%q), want selfsigned 且证书材料清空", mode, cert, key)
 	}
+	// 清空是安全相关动作：审计必须与「只切来源、材料保留」可区分。
+	var detail string
+	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='更新' AND resource='基础设置' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
+		t.Fatalf("query audit: %v", err)
+	}
+	if !strings.Contains(detail, "证书：已清除") {
+		t.Fatalf("audit detail=%q, want 含「证书：已清除（切换到 selfsigned）」", detail)
+	}
 	// 变更路径必重启——且须在本测试内收走 500ms 延迟的 exitProcess 调用，
 	// 否则残留 goroutine 会打进后续测试的 stub（跨测试污染实证）。
 	select {
@@ -484,7 +506,7 @@ func TestUpdateAdminTLSJSONBody_rejectsUploadPayloadWithoutUploadMode(t *testing
 	oldExit := exitProcess
 	exitProcess = func(int) { t.Error("rejected update must not schedule restart") }
 	t.Cleanup(func() { exitProcess = oldExit })
-	handler := &Handlers{cfg: &config.Config{Port: 8000}}
+	handler := newAdminTLSHandlers(t)
 	router := gin.New()
 	router.PUT("/admin-tls", handler.UpdateAdminTLS)
 
@@ -528,6 +550,10 @@ func TestUpdateAdminTLS_enabledValueWhitelist(t *testing.T) {
 		wantRestart bool
 	}{
 		{name: "JSON invalid uppercase", value: "TRUE", wantStatus: http.StatusBadRequest, wantEnabled: true},
+		// 显式空串（脚本拼接/模板缺值）必须与 TRUE/on 同走白名单 400，不得被
+		// 当作「未提交」而返回 200「配置未变更」。
+		{name: "JSON explicit empty", value: "", wantStatus: http.StatusBadRequest, wantEnabled: true},
+		{name: "multipart explicit empty", multipart: true, value: "", wantStatus: http.StatusBadRequest, wantEnabled: true},
 		{name: "multipart invalid text", multipart: true, value: "on", wantStatus: http.StatusBadRequest, wantEnabled: true},
 		{name: "JSON valid zero", value: "0", wantStatus: http.StatusOK, wantEnabled: false, wantRestart: true},
 	} {
@@ -540,7 +566,7 @@ func TestUpdateAdminTLS_enabledValueWhitelist(t *testing.T) {
 			exited := make(chan struct{}, 1)
 			exitProcess = func(int) { exited <- struct{}{} }
 			t.Cleanup(func() { exitProcess = oldExit })
-			handler := &Handlers{cfg: &config.Config{Port: 8000}}
+			handler := newAdminTLSHandlers(t)
 			router := gin.New()
 			router.PUT("/admin-tls", handler.UpdateAdminTLS)
 
@@ -639,7 +665,7 @@ func TestUpdateAdminTLS_failuresAreAudited(t *testing.T) {
 	if err := db.InitializeAuditDB(t.TempDir()); err != nil {
 		t.Fatalf("initialize audit db: %v", err)
 	}
-	handler := &Handlers{cfg: &config.Config{Port: 8000}}
+	handler := newAdminTLSHandlers(t)
 	send := func(payload string) *httptest.ResponseRecorder {
 		recorder := httptest.NewRecorder()
 		ctx, _ := gin.CreateTestContext(recorder)
@@ -713,8 +739,8 @@ func TestAdminTLSOversizedMultipartBodyReturns413(t *testing.T) {
 		return response
 	}
 
-	updateResponse := send(newRouter((&Handlers{cfg: &config.Config{}}).UpdateAdminTLS, http.MethodPut, "/admin-tls"), http.MethodPut, "/admin-tls")
-	inspectResponse := send(newRouter((&Handlers{cfg: &config.Config{}}).InspectAdminTLSCert, http.MethodPost, "/admin-tls/inspect"), http.MethodPost, "/admin-tls/inspect")
+	updateResponse := send(newRouter((newAdminTLSHandlers(t)).UpdateAdminTLS, http.MethodPut, "/admin-tls"), http.MethodPut, "/admin-tls")
+	inspectResponse := send(newRouter((newAdminTLSHandlers(t)).InspectAdminTLSCert, http.MethodPost, "/admin-tls/inspect"), http.MethodPost, "/admin-tls/inspect")
 
 	if updateResponse.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("PUT /admin-tls multipart oversized status=%d body=%s, want 413", updateResponse.Code, updateResponse.Body.String())
@@ -746,7 +772,7 @@ func TestUpdateAdminTLS_serializesReadModifyWriteWithCaddyOpLock(t *testing.T) {
 	if err := writer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	handler := &Handlers{cfg: &config.Config{Port: 8000}}
+	handler := newAdminTLSHandlers(t)
 	router := gin.New()
 	router.POST("/admin-tls", handler.UpdateAdminTLS)
 	request := httptest.NewRequest(http.MethodPost, "/admin-tls", strings.NewReader(body.String()))
@@ -780,5 +806,69 @@ func TestUpdateAdminTLS_serializesReadModifyWriteWithCaddyOpLock(t *testing.T) {
 	case <-exited:
 	case <-time.After(2 * time.Second):
 		t.Fatal("restart was not scheduled after successful save")
+	}
+}
+
+// 配置读失败必须显式披露：降级默认形态（未启用/自签名）与真实启用态相反，
+// 静默展示会误导运维（DB 故障/迁移窗口）。
+func TestGetAdminTLS_reportsConfigUnavailableOnReadFailure(t *testing.T) {
+	old := db.DB
+	db.DB = nil
+	t.Cleanup(func() { db.DB = old })
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/admin-tls", nil)
+	(&Handlers{}).GetAdminTLS(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, `"config_unavailable":true`) {
+		t.Fatalf("body=%s, want config_unavailable=true", body)
+	}
+	if !strings.Contains(body, `"enabled":false`) {
+		t.Fatalf("body=%s, want 降级 enabled=false", body)
+	}
+}
+
+// admin TLS 测试的 Handlers 字面量必须带隔离 DataDir（只允许 newAdminTLSHandlers
+// 这一处单源夹具）：空 DataDir 的启用态 selfsigned 探针会把证书/私钥写进包
+// 源码树，而该事故形态已知会被 git add -A 误收。
+func TestAdminTLSTests_allFixturesCarryIsolatedDataDir(t *testing.T) {
+	files, err := filepath.Glob("admintls*_test.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 只校验带 cfg 的夹具：空 Handlers{} 用于只读端点（InspectAdminTLSCert/
+	// GetAdminTLS），不触达 DataDir 探针；写路径夹具必须经单源 helper。
+	for _, file := range files {
+		raw, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fset := token.NewFileSet()
+		parsed, err := parser.ParseFile(fset, file, raw, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", file, err)
+		}
+		ast.Inspect(parsed, func(node ast.Node) bool {
+			composite, ok := node.(*ast.CompositeLit)
+			if !ok {
+				return true
+			}
+			ident, ok := composite.Type.(*ast.Ident)
+			if !ok || ident.Name != "Handlers" || len(composite.Elts) == 0 {
+				return true
+			}
+			startOffset := fset.Position(composite.Pos()).Offset
+			endOffset := fset.Position(composite.End()).Offset
+			literal := string(raw[startOffset:endOffset])
+			if !strings.Contains(literal, "DataDir") {
+				t.Errorf("%s: Handlers 夹具缺少隔离 DataDir: %s（请改用 newAdminTLSHandlers）", file, literal)
+			}
+			return true
+		})
 	}
 }

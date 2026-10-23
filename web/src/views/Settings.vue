@@ -16,7 +16,7 @@
 
     <!-- 首屏 /config 失败显性化 + 重试——原仅 console，保存门永久禁用
          只能整页刷新 -->
-    <el-alert v-if="configLoadFailed" type="error" :closable="false" show-icon class="error-banner" style="margin-bottom: 16px">
+    <el-alert v-if="configBannerVisible" type="error" :closable="false" show-icon class="error-banner" style="margin-bottom: 16px">
       <template #title>
         基础配置加载失败，保存已暂停以避免默认值覆盖真实配置。<el-button link type="danger" @click="fetchSettings">重试</el-button>
       </template>
@@ -51,12 +51,13 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, computed, watch } from 'vue'
+import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
+import { resetSettingsDraft } from '@/composables/useSettingsDraft'
 import { request } from '@/utils/api'
 import { DEFAULT_ACCESS_LOG_FORMAT } from '@/utils/caddyDefaults'
 import { normalizeTrafficSampleN } from '@/utils/threatFlowRules'
 import { displaySecurityEventsRetentionDays, displaySecurityEventsRowCap, displayThreatScreenMode } from '@/utils/configValues'
-import { SETTINGS_TAB_DESCS, SETTINGS_TAB_TITLES, settingsTabOfPage, type SettingsTabId } from '@/utils/settingsPages'
+import { SETTINGS_TAB_DESCS, SETTINGS_TAB_TITLES, settingsTabConsumesConfig, settingsTabOfPage, type SettingsTabId } from '@/utils/settingsPages'
 import { useAuthStore } from '@/stores/auth'
 import { Setting } from '@element-plus/icons-vue'
 import BasicSettings from './settings/BasicSettings.vue'
@@ -214,6 +215,8 @@ const applyCertKeys = (data: ConfigPayload) => {
 const configLoaded = ref(false)
 // 首屏失败显性化（模板重试入口）；任一成功 /config 读取都恢复保存门
 const configLoadFailed = ref(false)
+// 横幅只在消费 /config 的分页成立（集群/任务监控不读它，文案会误导）
+const configBannerVisible = computed(() => configLoadFailed.value && settingsTabConsumesConfig(activeTab.value))
 const fetchSettings = async () => {
   const requestSeq = ++settingsRequestSeq
   configLoaded.value = false
@@ -275,6 +278,13 @@ watch(() => authStore.currentPage, () => {
 
 onMounted(() => {
   if (tabConsumesConfig(activeTab.value)) void fetchSettings()
+})
+
+// 设置草稿（令牌输入/安全事件 dirty/管理面板证书暂存）随「设置」逻辑页面
+// 存活：页内切换分页不重置（否则基础设置卡的暂存内容静默丢失），离开系统
+// 设置（本组件卸载）才复位。
+onUnmounted(() => {
+  resetSettingsDraft()
 })
 </script>
 

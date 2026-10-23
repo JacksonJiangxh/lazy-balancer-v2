@@ -319,6 +319,12 @@ func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 		req.DNSCredentials = merged
 		effectiveCredentials = merged
 	}
+	// 表单形态的空对象（用户未编辑任何凭证字段）与省略等价：归一为「未提交」，
+	// 否则遗留空凭据配置的改名/禁用会被旧空值阻断（前端表单恒提交凭证对象）。
+	// 只含认证方式而无凭证值的载荷长度非零，仍必须过下方 provider 校验。
+	if req.DNSCredentials != nil && len(effectiveCredentials) == 0 {
+		req.DNSCredentials = nil
+	}
 	provider, ok := dnsproviders.Get(effectiveProvider)
 	if !ok {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Unknown DNS provider"})
@@ -669,8 +675,9 @@ func (h *Handlers) ListCertificates(c *gin.Context) {
 
 // formulaSkippedNote 生成批量签发跳过归因片段：仅列出非零项，
 // 全零返回空串。计数全部来自 changed=false/冷却门出口，响应与审计共用。
-func formulaSkippedNote(cooldown, inFlight, blocked, unsupported int) string {
-	parts := make([]string, 0, 4)
+// retired（已退役任务，disabled 行）必须与冷却分开：它是永久条件，不是限流。
+func formulaSkippedNote(cooldown, inFlight, blocked, unsupported, retired int) string {
+	parts := make([]string, 0, 5)
 	if cooldown > 0 {
 		parts = append(parts, fmt.Sprintf("冷却跳过 %d 个", cooldown))
 	}
@@ -680,6 +687,9 @@ func formulaSkippedNote(cooldown, inFlight, blocked, unsupported int) string {
 	if blocked > 0 {
 		parts = append(parts, fmt.Sprintf("规则屏障跳过 %d 个", blocked))
 	}
+	if retired > 0 {
+		parts = append(parts, fmt.Sprintf("已退役任务 %d 个", retired))
+	}
 	if unsupported > 0 {
 		parts = append(parts, fmt.Sprintf("状态不支持重排 %d 个", unsupported))
 	}
@@ -687,6 +697,12 @@ func formulaSkippedNote(cooldown, inFlight, blocked, unsupported int) string {
 }
 
 func (h *Handlers) IssueCertificate(c *gin.Context) {
+	// 导入窗口 fast-fail：导入全程持有 caddyOpMu（可达分钟级，含 30s 在途
+	// 任务排空等待），签发请求排队到导入后再按导入前快照/导入后库校验会产生
+	// 语义错乱。与 DNS 配置/CA 提供商/任务重试删除共用同一门。
+	if rejectWriteDuringImport(c, "触发证书签发（配置导入进行中）") {
+		return
+	}
 	var req struct {
 		CaddyID string `json:"caddy_id"`
 		Domain  string `json:"domain"`
@@ -790,6 +806,9 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 	skippedInFlight := 0
 	skippedBlocked := 0
 	skippedUnsupported := 0
+	// disabled 任务行（历史残留/脏快照）是永久不可重试条件，必须与冷却分开
+	// 计数——把 409 永久条件折进「冷却跳过」会误导用户等待限流恢复。
+	skippedRetired := 0
 	// force=true 显式越过 CA 冷却（与任务重试同一契约），仅在实际越过时留痕。
 	forceCAOverride := false
 	forceIssue := c.Query("force") == "true"
@@ -834,9 +853,14 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 				return
 			}
 		}
+		var jobID int
 		var jobStatus string
 		var jobUpdatedAt, jobCreatedAt, jobCAAvailableAfter sql.NullTime
-		err = db.DB.QueryRow("SELECT status, updated_at, created_at, ca_available_after FROM cert_jobs WHERE rule_id=? AND domain=?", req.CaddyID, canonicalRuleDomain).Scan(&jobStatus, &jobUpdatedAt, &jobCreatedAt, &jobCAAvailableAfter)
+		var jobMaterialUsable bool
+		err = db.DB.QueryRow(`SELECT id, status, updated_at, created_at, ca_available_after,
+			CASE WHEN `+services.CertJobMaterialPredicateSQL("")+` THEN 1 ELSE 0 END
+			FROM cert_jobs WHERE rule_id=? AND domain=?`, req.CaddyID, canonicalRuleDomain).
+			Scan(&jobID, &jobStatus, &jobUpdatedAt, &jobCreatedAt, &jobCAAvailableAfter, &jobMaterialUsable)
 		if err == nil {
 			if blocked, statusCode, message := certJobRetryBlocked(jobStatus, jobUpdatedAt, jobCreatedAt, time.Now()); blocked {
 				auditFailure("blocked", message)
@@ -854,6 +878,27 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 					return
 				}
 				forceCAOverride = true
+			}
+			// 部署生命周期 + 材料在库：只差部署，与证书任务重试入口同源
+			// （rescheduleDownloadedCertJobDeployment）。整轮重签会丢弃已签发
+			// 证书并消耗 CA 配额，且与 certjobs 的重试语义分叉。
+			if jobMaterialUsable && services.JobLifecycle(jobStatus) == services.JobLifecycleDownloaded {
+				rescheduled, deployErr := rescheduleDownloadedCertJobDeployment(jobID, req.CaddyID, canonicalRuleDomain)
+				if deployErr != nil {
+					statusCode, message := deploymentRetryFailureResponse(deployErr)
+					if statusCode >= http.StatusInternalServerError {
+						services.Logf("error", "IssueCertificate deployment retry failed for job %d: %v", jobID, deployErr)
+					}
+					auditFailure("failed", message)
+					c.JSON(statusCode, models.APIResponse{Code: statusCode, Message: message})
+					return
+				}
+				if rescheduled {
+					recordAudit(c, "触发签发", "证书", services.FormatAuditDetail(scope, "已触发重新部署（不重新签发）", services.AuditResultPart("deployment_retry")))
+					c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "已触发重新部署（不重新签发）", Data: gin.H{"queued": 0, "redeployed": true}})
+					return
+				}
+				// rescheduled=false：规则/材料在窗口内刚变化，回落整轮重签。
 			}
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			auditFailure("failed", "读取证书任务失败: "+err.Error())
@@ -901,6 +946,12 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 			return
 		}
 		var failed []string
+		// 规则当前态冲突（ErrCertRuleStateConflict）单列：全部失败且均为冲突时
+		// 与定向签发同口径 409（可行动：刷新后重试），不折成 500 服务器故障。
+		conflictFailed := 0
+		// 只重排部署（材料在库、未重新签发）的目标数——与 queued（新建签发任务）
+		// 分列，响应文案不得把「重新部署」谎报为「已创建签发任务」。
+		redeployed := 0
 		// 批量循环中队列被并发暂停（不可再入队）的显式信号。
 		pausedMidBatch := false
 		targets := batchTargets
@@ -922,13 +973,23 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 			// 逐目标套用与定向签发同款冷却门
 			// （certJobRetryBlocked）——失败 5 分钟内/执行中的任务跳过，不再
 			// 被批量重签静默重排队、反复消耗 CA 配额；跳过数单列响应计数。
+			var jobID int
 			var jobStatus string
 			var jobUpdatedAt, jobCreatedAt, jobCAAvailableAfter sql.NullTime
-			jobErr := db.DB.QueryRow("SELECT status, updated_at, created_at, ca_available_after FROM cert_jobs WHERE rule_id=? AND domain=?", target.ruleID, canonicalDomain).Scan(&jobStatus, &jobUpdatedAt, &jobCreatedAt, &jobCAAvailableAfter)
+			var jobMaterialUsable bool
+			jobErr := db.DB.QueryRow(`SELECT id, status, updated_at, created_at, ca_available_after,
+				CASE WHEN `+services.CertJobMaterialPredicateSQL("")+` THEN 1 ELSE 0 END
+				FROM cert_jobs WHERE rule_id=? AND domain=?`, target.ruleID, canonicalDomain).
+				Scan(&jobID, &jobStatus, &jobUpdatedAt, &jobCreatedAt, &jobCAAvailableAfter, &jobMaterialUsable)
 			switch {
 			case jobErr == nil:
-				if blocked, _, _ := certJobRetryBlocked(jobStatus, jobUpdatedAt, jobCreatedAt, time.Now()); blocked {
-					skippedCooldown++
+				if blocked, statusCode, _ := certJobRetryBlocked(jobStatus, jobUpdatedAt, jobCreatedAt, time.Now()); blocked {
+					if statusCode == http.StatusConflict {
+						// 永久条件（disabled 行）：不是冷却，单列归因。
+						skippedRetired++
+					} else {
+						skippedCooldown++
+					}
 					continue
 				}
 				// CA 退避窗口未到期：与定向签发/任务重试同一门（force 才越过）。
@@ -939,12 +1000,33 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 					}
 					forceCAOverride = true
 				}
+				// 部署生命周期 + 材料在库：与定向签发/任务重试同源，只重排部署，
+				// 不整轮重签（丢弃已签发证书 + 消耗 CA 配额）。
+				if jobMaterialUsable && services.JobLifecycle(jobStatus) == services.JobLifecycleDownloaded {
+					rescheduled, deployErr := rescheduleDownloadedCertJobDeployment(jobID, target.ruleID, canonicalDomain)
+					if deployErr != nil {
+						statusCode, message := deploymentRetryFailureResponse(deployErr)
+						if statusCode >= http.StatusInternalServerError {
+							services.Logf("error", "Batch issue deployment retry failed for job %d: %v", jobID, deployErr)
+						}
+						failed = append(failed, fmt.Sprintf("%s(%s)", target.domain, message))
+						continue
+					}
+					if rescheduled {
+						redeployed++
+						continue
+					}
+					// rescheduled=false：规则/材料在窗口内刚变化，回落整轮重签。
+				}
 			case !errors.Is(jobErr, sql.ErrNoRows):
 				failed = append(failed, fmt.Sprintf("%s(%v)", target.domain, jobErr))
 				continue
 			}
 			jobID, changed, err := services.CreateOrRequeueCertJobWithChange(target.ruleID, canonicalDomain, 0, qm)
 			if err != nil {
+				if errors.Is(err, services.ErrCertRuleStateConflict) {
+					conflictFailed++
+				}
 				failed = append(failed, fmt.Sprintf("%s(%v)", target.domain, err))
 				continue
 			}
@@ -964,46 +1046,101 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 			}
 			queued++
 		}
-		skippedTotal := skippedCooldown + skippedWaitingCA + skippedBlocked + skippedInFlight + skippedUnsupported
-		if pausedMidBatch && queued == 0 {
-			auditFailure("skipped", formulaSkippedNote(skippedCooldown+skippedWaitingCA, skippedInFlight, skippedBlocked, skippedUnsupported), "证书签发队列已暂停")
+		skippedTotal := skippedCooldown + skippedWaitingCA + skippedBlocked + skippedInFlight + skippedUnsupported + skippedRetired
+		// forceNote 只在真实越过 CA 冷却时为非空；批量各出口（暂停/全部失败/
+		// 全部跳过/部分成功）都必须携带——被清空 ca_available_after 的行已真实
+		// 发生，留痕不能只存在于全成功出口。
+		batchForceNote := ""
+		if forceCAOverride {
+			batchForceNote = "，手动越过 CA 冷却"
+		}
+		withForceNote := func(text string) string {
+			if batchForceNote == "" {
+				return text
+			}
+			if text == "" {
+				return strings.TrimPrefix(batchForceNote, "，")
+			}
+			return text + batchForceNote
+		}
+		if pausedMidBatch && queued == 0 && redeployed == 0 {
+			auditFailure("skipped", withForceNote(formulaSkippedNote(skippedCooldown+skippedWaitingCA, skippedInFlight, skippedBlocked, skippedUnsupported, skippedRetired)), "证书签发队列已暂停")
 			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "证书签发队列已暂停，无法创建签发任务"})
 			return
 		}
-		if pausedMidBatch && queued > 0 {
-			// 已入队 N>0 后队列被并发暂停：按部分成功返回，不能 409 谎报全失败
+		if pausedMidBatch && (queued > 0 || redeployed > 0) {
+			// 已入队/重排后队列被并发暂停：按部分成功返回，不能 409 谎报全失败
 			// 剩余目标留给下次触发。
-			skipNote := formulaSkippedNote(skippedCooldown+skippedWaitingCA, skippedInFlight, skippedBlocked, skippedUnsupported)
-			message := fmt.Sprintf("已创建 %d 个签发任务；证书签发队列被暂停，剩余目标未处理", queued)
+			skipNote := formulaSkippedNote(skippedCooldown+skippedWaitingCA, skippedInFlight, skippedBlocked, skippedUnsupported, skippedRetired)
+			message := fmt.Sprintf("已创建 %d 个签发任务，已触发重新部署 %d 个；证书签发队列被暂停，剩余目标未处理", queued, redeployed)
 			if skipNote != "" {
 				message += "（" + skipNote + "）"
 			}
+			message += batchForceNote
 			recordAudit(c, "触发签发", "证书", services.FormatAuditDetail(scope, message, services.AuditResultPart("partial")))
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: message, Data: gin.H{
 				"queued":             queued,
+				"redeployed":         redeployed,
 				"failed":             len(failed),
 				"skipped_cooldown":   skippedCooldown,
 				"skipped_waiting_ca": skippedWaitingCA,
 				"skipped_in_flight":  skippedInFlight,
 				"skipped_blocked":    skippedBlocked,
 				"skipped_other":      skippedUnsupported,
+				"skipped_retired":    skippedRetired,
 				"paused_mid_batch":   true,
 			}})
 			return
 		}
-		if queued == 0 && len(failed) > 0 {
-			auditFailure("failed")
+		if queued == 0 && len(failed) > 0 && redeployed == 0 {
+			// 全部失败且均为规则当前态冲突：与定向签发同口径 409——批量快照
+			// 取于锁外，期间规则被删除/禁用/改域属可行动冲突，不是服务端故障。
+			if conflictFailed == len(failed) {
+				auditFailure("conflict", "规则状态已变更（规则已删除、禁用或域名已修改）")
+				c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "规则状态已变更（规则已删除、禁用或域名已修改），请刷新后重试"})
+				return
+			}
+			detail := ""
+			if batchForceNote != "" {
+				detail = strings.TrimPrefix(batchForceNote, "，")
+			}
+			auditFailure("failed", detail)
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "全部签发任务创建失败: " + strings.Join(failed, "; ")})
 			return
 		}
-		if queued == 0 {
+		if queued == 0 && redeployed > 0 {
+			// 全部目标都只差部署：如实回报「重新部署」而不是「创建签发任务」。
+			skipNote := withForceNote(formulaSkippedNote(skippedCooldown+skippedWaitingCA, skippedInFlight, skippedBlocked, skippedUnsupported, skippedRetired))
+			message := fmt.Sprintf("已触发重新部署 %d 个（不重新签发）", redeployed)
+			if len(failed) > 0 {
+				message += fmt.Sprintf("；%d 个失败: %s", len(failed), strings.Join(failed, "; "))
+			}
+			if skipNote != "" {
+				message += "；" + skipNote
+			}
+			recordAudit(c, "触发签发", "证书", services.FormatAuditDetail(scope, message, services.AuditResultPart("deployment_retry")))
+			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: message, Data: gin.H{
+				"queued":             0,
+				"redeployed":         redeployed,
+				"failed":             len(failed),
+				"skipped_cooldown":   skippedCooldown,
+				"skipped_waiting_ca": skippedWaitingCA,
+				"skipped_in_flight":  skippedInFlight,
+				"skipped_blocked":    skippedBlocked,
+				"skipped_other":      skippedUnsupported,
+				"skipped_retired":    skippedRetired,
+			}})
+			return
+		}
+		if queued == 0 && redeployed == 0 {
 			// 批量全部跳过（冷却/在途/屏障/状态不支持）→ 409，不得 200 假成功。
 			// 零目标（尚无启用中的 ACME 规则）时 skipNote 为空，
 			// 不能返回以冒号结尾的空原因——单列文案。
-			skipNote := formulaSkippedNote(skippedCooldown+skippedWaitingCA, skippedInFlight, skippedBlocked, skippedUnsupported)
+			skipNote := formulaSkippedNote(skippedCooldown+skippedWaitingCA, skippedInFlight, skippedBlocked, skippedUnsupported, skippedRetired)
 			if skipNote == "" {
 				skipNote = "当前没有处于启用状态的 ACME 签发规则"
 			}
+			skipNote = withForceNote(skipNote)
 			auditFailure("skipped", skipNote)
 			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "未创建任何签发任务：" + skipNote, Data: gin.H{
 				"queued":             0,
@@ -1013,13 +1150,18 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 				"skipped_in_flight":  skippedInFlight,
 				"skipped_blocked":    skippedBlocked,
 				"skipped_other":      skippedUnsupported,
+				"skipped_retired":    skippedRetired,
 			}})
 			return
 		}
-		if len(failed) > 0 || skippedTotal > 0 {
-			skipNote := formulaSkippedNote(skippedCooldown+skippedWaitingCA, skippedInFlight, skippedBlocked, skippedUnsupported)
+		if len(failed) > 0 || skippedTotal > 0 || redeployed > 0 {
+			skipNote := formulaSkippedNote(skippedCooldown+skippedWaitingCA, skippedInFlight, skippedBlocked, skippedUnsupported, skippedRetired)
 			format := "入队 %d 个任务"
 			message := fmt.Sprintf("已创建 %d 个签发任务", queued)
+			if redeployed > 0 {
+				format += "，重新部署 %d 个"
+				message += fmt.Sprintf("，已触发重新部署 %d 个（不重新签发）", redeployed)
+			}
 			if len(failed) > 0 {
 				format += "，失败 %d 个"
 				message += fmt.Sprintf("，%d 个失败: %s", len(failed), strings.Join(failed, "; "))
@@ -1028,19 +1170,26 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 				format += "，" + skipNote
 				message += "，" + skipNote
 			}
+			format += batchForceNote
+			message += batchForceNote
 			args := []any{queued}
+			if redeployed > 0 {
+				args = append(args, redeployed)
+			}
 			if len(failed) > 0 {
 				args = append(args, len(failed))
 			}
 			recordAudit(c, "触发签发", "证书", services.FormatAuditDetail(scope, fmt.Sprintf(format, args...), services.AuditResultPart("partial")))
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: message, Data: gin.H{
 				"queued":             queued,
+				"redeployed":         redeployed,
 				"failed":             len(failed),
 				"skipped_cooldown":   skippedCooldown,
 				"skipped_waiting_ca": skippedWaitingCA,
 				"skipped_in_flight":  skippedInFlight,
 				"skipped_blocked":    skippedBlocked,
 				"skipped_other":      skippedUnsupported,
+				"skipped_retired":    skippedRetired,
 			}})
 			return
 		}

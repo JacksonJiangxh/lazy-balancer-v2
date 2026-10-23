@@ -101,15 +101,11 @@ func TestCrawlerSeedIPRanges_alignWithGeoIPNames(t *testing.T) {
 			}
 		}
 		for _, official := range officials {
-			covered := false
-			for _, prefix := range prefixes {
-				if prefix.Bits() >= official.Bits() && official.Contains(prefix.Addr()) {
-					covered = true
-					break
-				}
-			}
-			if !covered {
-				t.Errorf("引擎 %q 无种子条目覆盖官方段 %s（声明 %v）", engineID, official, declared)
+			// 覆盖门复用运行期同一判定（每官方段 ≥1/8 地址空间）：
+			// 「任一更具体条目」的弱门会让「每段一个 /32」的种子测试仍绿，
+			// 却在运行期被 validateCrawlerEntriesSanity 永久拒绝。
+			if !crawlerPrefixCoverageSufficient(official, prefixes) {
+				t.Errorf("引擎 %q 种子对官方段 %s 的地址覆盖不足 1/8（声明 %v）", engineID, official, declared)
 			}
 		}
 	}

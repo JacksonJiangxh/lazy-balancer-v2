@@ -53,7 +53,7 @@
              expires_at 会让导入/集群回插的 NULL 有效期行显示「-」，而规则页
              同一证书显示「剩 N 天」。 -->
         <el-tooltip v-if="row.status === 'issued' && effectiveNotAfter(row)" :content="formatDate(effectiveNotAfter(row))">
-          <span :class="['cert-days', certificateStatus(row)]">{{ formatDateShort(effectiveNotAfter(row)) }} · {{ certificateStatus(row) === 'expired' ? `已过期 ${Math.abs(row.days_remaining)} 天` : `剩 ${row.days_remaining} 天` }}</span>
+          <span :class="['cert-days', row.certificate_status]">{{ formatDateShort(effectiveNotAfter(row)) }} · {{ row.certificate_status === 'expired' ? `已过期 ${Math.abs(row.days_remaining)} 天` : `剩 ${row.days_remaining} 天` }}</span>
         </el-tooltip>
         <span v-else class="cell-empty">-</span>
       </template>
@@ -158,7 +158,6 @@ import { usePollingErrorState } from '@/composables/usePollingErrorState'
 
 // 视图类型收敛 types/index.ts 的 CertJobListItem（后端 certJobListItem 投影单源）。
 type CertJob = CertJobListItem
-type CertificateStatus = CertJobListItem['certificate_status']
 
 const authStore = useAuthStore()
 const isReadOnly = computed(() => authStore.readOnlyReason !== null)
@@ -258,12 +257,13 @@ const effectiveNotAfter = (row: CertJob): string => certJobEffectiveNotAfter(row
 // 与 tooltip 完整格式各自取用，不在 helper 里预先格式化（避免双口径）。
 const renewalAt = (row: CertJob): string => certJobRenewalAt(row, certRenewalDays.value)
 
-const certificateStatus = (row: CertJob): CertificateStatus => row.certificate_status
-
 const formatCoolingTime = (iso: string): string => {
-  const t = new Date(iso)
-  const now = new Date()
-  const diff = t.getTime() - now.getTime()
+  // 畸形/缺失时间返回空串（与 utils/certJobExpiry 同族口径）：不做防御会渲染
+  // 「NaN小时NaN分钟后」。后端 ca_available_after 为 RFC3339 或 null，正常链路
+  // 不触发，此处仅防御带外/旧版响应。
+  const t = Date.parse(iso)
+  if (!Number.isFinite(t)) return ''
+  const diff = t - Date.now()
   if (diff <= 0) return '可重试'
   const hours = Math.floor(diff / (1000 * 60 * 60))
   const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60))

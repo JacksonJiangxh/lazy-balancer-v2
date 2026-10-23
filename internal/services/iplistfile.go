@@ -1,6 +1,7 @@
 package services
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -126,8 +127,10 @@ func validIPListScope(scope string) bool {
 // 命中（输入指纹一致且文件 mtime/size 与落盘记录一致）即跳过聚合与读回。
 // 残余风险披露：外部改写内容但保持 mtime+size 不变时不被检测（原整文件
 // 读回可比对字节）——投影目录由本进程独占写入，该形态只可能来自刻意带外
-// 构造；文件被删/mtime 漂移仍走完整重写路径。RestoreIPListProjections
-// 回滚重写文件后清空备忘（防陈旧命中跳过必要重写）。
+// 构造；文件被删/mtime 漂移仍走完整重写路径。指纹为 FNV-1a 64 位非密码学
+// 哈希（抗碰撞不是本判据的依赖）：陈旧命中需同时满足同指纹 + 同 size +
+// 同 mtime，慢路径的字节比对才是内容判据，快路只跳过重复工作。
+// RestoreIPListProjections 回滚重写文件后清空备忘（防陈旧命中跳过必要重写）。
 var (
 	ipListProjectionMemoMu sync.Mutex
 	ipListProjectionMemo   = map[string]ipListProjectionMemoEntry{}
@@ -209,6 +212,14 @@ func writeIPListFile(scope string, merged []string) (string, error) {
 		return "", fmt.Errorf("创建 IP 名单临时文件失败 %s: %w", name, err)
 	}
 	tmpName := tmp.Name()
+	// CreateTemp 默认 0600，而回滚路径与 atomicwrite.writeFileAtomicSynced
+	// 用 0644——@ipListFast 是跨进程读文件协议，正常渲染产出 0600、回滚后变
+	// 0644 的形态分叉会在 Caddy 换 uid 部署时表现为名单读不到。显式对齐。
+	if err := tmp.Chmod(0o644); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return "", fmt.Errorf("设置 IP 名单临时文件权限失败 %s: %w", name, err)
+	}
 	if _, err := tmp.WriteString(content); err != nil {
 		_ = tmp.Close()
 		_ = os.Remove(tmpName)
@@ -293,6 +304,11 @@ func RestoreIPListProjections(snapshot IPListProjectionSnapshot) error {
 		}
 	}
 	for path, data := range snapshot {
+		// 内容相同的文件不重写：回滚会改写全部投影 inode/mtime，运行中 Caddy 的
+		// @ipListFast stat 缓存在 ≤1s 内对所有名单重建（读盘放大 + 统计形态全变）。
+		if current, rerr := os.ReadFile(path); rerr == nil && bytes.Equal(current, data) {
+			continue
+		}
 		if werr := writeFileAtomicSynced(path, data, 0o644); werr != nil {
 			errs = append(errs, fmt.Errorf("回写投影 %s: %w", path, werr))
 		}
@@ -349,6 +365,10 @@ var ipListRenderRefs = struct {
 
 // ipListLastGC 上次自动 GC 时间；初始化为进程启动时刻——启动渲染尚未完成
 // 引用集采集前不得触发首轮 GC。
+// 并发前提（调用方契约）：本变量无锁保护，正确性依赖「成功渲染串行」——
+// maybeGCStaleIPListFiles 只在整轮渲染 apply 成功且引用集落齐后调用；若未来
+// 出现并发渲染，差集会基于半落齐的引用集误删在役投影（allow 方向 403 风暴，
+// deny 方向 fail-open）。新增并发渲染路径必须先把本状态收进带锁结构。
 var ipListLastGC = time.Now()
 
 func noteIPListRenderRef(path string) {

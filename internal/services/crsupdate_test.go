@@ -222,7 +222,41 @@ func TestCRSUpdateRun_fetchFailure(t *testing.T) {
 	}
 }
 
-func TestCRSUpdateRun_installFailureRestoresBackup(t *testing.T) {
+// 下载阶段失败（备份点尚未建立、live 树未触碰）不得触发还原 + 重载：
+// 旧实现按「进入安装循环」置 restore=true，每次下载/校验失败都多跑一轮
+// GenerateAndApplyConfig（重试场景放大），而无任何东西可还原。
+func TestCRSUpdateRun_downloadFailureDoesNotReload(t *testing.T) {
+	m := newTestCRSManager(t)
+	seedCRSVersionRow(t, "v4.14.0", true)
+	writeTestFile(t, filepath.Join(m.crsDir, "rules", "REQUEST-OLD.conf"), "SecRule old")
+
+	m.fetchLatestTag = func(context.Context) (string, error) { return "v4.15.0", nil }
+	m.downloadTarball = func(context.Context, string, string, downloadProgressFunc) error {
+		return errors.New("boom download")
+	}
+	reloads := 0
+	m.reloader = func() error { reloads++; return nil }
+
+	m.run("manual", nil)
+
+	_, status, message, _, _, _, _ := crsVersionRow(t)
+	if status != "failed" {
+		t.Fatalf("update_status=%q, want failed", status)
+	}
+	if !strings.Contains(message, "boom download") {
+		t.Fatalf("message=%q, want it to contain the download cause", message)
+	}
+	if _, err := os.Stat(filepath.Join(m.crsDir, "rules", "REQUEST-OLD.conf")); err != nil {
+		t.Fatal("live rules must be untouched")
+	}
+	if reloads != 0 {
+		t.Fatalf("reloads=%d, want 0（下载失败未触碰 live 树，无需还原/重载）", reloads)
+	}
+}
+
+// 校验阶段失败（备份点尚未建立、live 树未触碰）：树原样保留，且不得
+// 触发还原/重载——失败重试场景否则每轮多一次全量渲染（S6 口径）。
+func TestCRSUpdateRun_stagingValidationFailureLeavesLiveUntouched(t *testing.T) {
 	m := newTestCRSManager(t)
 	seedCRSVersionRow(t, "v4.14.0", true)
 	writeTestFile(t, filepath.Join(m.crsDir, "rules", "REQUEST-OLD.conf"), "SecRule old")
@@ -239,7 +273,7 @@ func TestCRSUpdateRun_installFailureRestoresBackup(t *testing.T) {
 	// When installation fails
 	m.run("manual", nil)
 
-	// Then status is failed and the previous tree is restored + reloaded
+	// Then status is failed and the previous tree is untouched (no restore/reload)
 	_, status, message, _, _, _, _ := crsVersionRow(t)
 	if status != "failed" {
 		t.Fatalf("update_status=%q, want failed", status)
@@ -248,17 +282,17 @@ func TestCRSUpdateRun_installFailureRestoresBackup(t *testing.T) {
 		t.Fatal("message empty after failure")
 	}
 	if _, err := os.Stat(filepath.Join(m.crsDir, "rules", "REQUEST-OLD.conf")); err != nil {
-		t.Fatal("backup should have been restored")
+		t.Fatal("live tree must be untouched before the first backup point")
 	}
 	setup, _ := os.ReadFile(filepath.Join(m.crsDir, "crs-setup.conf"))
 	if string(setup) != "# tweaked" {
 		t.Fatalf("crs-setup.conf=%q, want preserved", setup)
 	}
-	if reloads != 1 {
-		t.Fatalf("reloads=%d, want 1 (reload after restore)", reloads)
+	if reloads != 0 {
+		t.Fatalf("reloads=%d, want 0（树未被触碰，无需还原/重载）", reloads)
 	}
 	if _, err := os.Stat(crsTransientPath(m.crsDir, "rules.bak")); !os.IsNotExist(err) {
-		t.Fatal("rules.bak should be cleaned up after restore")
+		t.Fatal("rules.bak must not exist when no backup was created")
 	}
 }
 
@@ -466,9 +500,10 @@ func TestSetCRSAutoUpdate_schedulesNextUpdate(t *testing.T) {
 	}
 }
 
-// 排程槽生命周期（2026-10-11 用户裁定，取代旧口径）：手动触发成功
-// **不刷新** next_update——手动执行不得改变下一次预约执行时间，空槽亦不
-// 补写（预约由排程保存/启动武装路径建立）；auto_update=0 保持空。
+// 排程槽生命周期：手动触发成功不得改变**既有预约**——空槽不补写（预约由
+// 排程保存/启动武装路径建立）、未来槽不回拨；已过期槽必须推进（引擎成功轮已
+// 消费该槽，业务不推进=停摆，见 schedule_slot_lifecycle_test.go 的
+// 「过期槽上的手动成功必须推进业务槽」用例）。auto_update=0 恒不写。
 func TestCRSRun_manualSuccessKeepsNextUpdate(t *testing.T) {
 	m := newTestCRSManager(t)
 	seedCRSVersionRow(t, "v4.14.0", true)
@@ -503,8 +538,9 @@ func TestCRSRun_manualSuccessKeepsNextUpdate(t *testing.T) {
 
 // 安装成功分支（tag != currentVersion，走完整下载→校验→换树→写版本行）的
 // 排程槽语义与「已是最新」短路不同：后者只走 recordLatestSkip，从不经过
-// versionTableSlotAdvanceSQL。本用例覆盖手动触发不补写空槽、auto 触发推进
-// 空槽两条真实安装路径。
+// versionTableSlotSuccessSQL。本用例覆盖手动触发不补写空槽、auto 触发推进
+// 空槽两条真实安装路径（手动成功只推进已过期槽，见
+// schedule_slot_lifecycle_test.go 的同名用例组）。
 func TestCRSRun_installSuccessSlotSemantics(t *testing.T) {
 	m := newTestCRSManager(t)
 	seedCRSVersionRow(t, "v4.14.0", true)

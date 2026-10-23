@@ -655,7 +655,12 @@ func (s *ClusterService) DeleteNode(ctx context.Context, nodeID int) error {
 		return fmt.Errorf("删除节点: %w", err)
 	}
 	rows, err := result.RowsAffected()
-	if err != nil || rows != 1 {
+	if err != nil {
+		// 结果读取故障不是「节点不存在」：映射为 nodeWriteMissError 会把驱动
+		// 故障误导成 404/降级 403，且删除是否生效不可判定。
+		return fmt.Errorf("读取删除节点结果: %w", err)
+	}
+	if rows != 1 {
 		// 降级窗口内的删除按 403 语义拒绝（节点仍在），而非 404。
 		// 复核角色用独立连接（nodeWriteMissError），必须先退出写事务。
 		_ = tx.Rollback()

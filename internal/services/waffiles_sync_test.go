@@ -224,6 +224,8 @@ type tarEntry struct {
 	name         string
 	declaredSize int64
 	body         []byte
+	// typeflag 非零时写入指定 tar 类型（如 tar.TypeDir 构造目录条目）。
+	typeflag byte
 }
 
 // rawTarGz 按给定条目直接构造 tar.gz（不做路径归一/排序，用于构造恶意包）。
@@ -245,7 +247,7 @@ func rawTarGz(t *testing.T, entries []tarEntry) []byte {
 			}
 			entry.body = body
 		}
-		if err := tw.WriteHeader(&tar.Header{Name: entry.name, Mode: 0644, Size: size}); err != nil {
+		if err := tw.WriteHeader(&tar.Header{Name: entry.name, Mode: 0644, Size: size, Typeflag: entry.typeflag}); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := tw.Write(entry.body); err != nil {
@@ -283,6 +285,23 @@ func TestUntarGzTo_rejectsOversizedBundleAndCleansStaging(t *testing.T) {
 		err := untarGzTo(rawTarGz(t, entries), destDir, "")
 		if err == nil || !strings.Contains(err.Error(), "文件数超过上限") {
 			t.Fatalf("error=%v, want file-count limit rejection", err)
+		}
+		assertNoStagingRemains(t, destDir)
+	})
+	t.Run("directory entries over limit", func(t *testing.T) {
+		// 目录条目无上限时，64MB 包可让 staging 建出十余万目录
+		// （元数据/inode 写放大）——必须在落盘前按条目数拦截。
+		entries := make([]tarEntry, 0, maxWafSyncExtractDirs+1)
+		for i := 0; i <= maxWafSyncExtractDirs; i++ {
+			entries = append(entries, tarEntry{
+				name:     fmt.Sprintf("d%05d", i),
+				typeflag: tar.TypeDir,
+			})
+		}
+		destDir := t.TempDir()
+		err := untarGzTo(rawTarGz(t, entries), destDir, "")
+		if err == nil || !strings.Contains(err.Error(), "目录条目数超过上限") {
+			t.Fatalf("error=%v, want directory-count limit rejection", err)
 		}
 		assertNoStagingRemains(t, destDir)
 	})

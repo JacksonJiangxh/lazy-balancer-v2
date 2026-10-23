@@ -67,7 +67,7 @@ var toolUsage = map[string]string{
 	"get_metrics_overview":         "获取轻量级指标总览（累计请求/字节/延迟分位数）",
 	"get_realtime_traffic":         "获取实时出入站速率（网卡计数器差分）",
 	"get_upstream_health":          "查看全部上游的三态健康（正常/异常/不健康），故障排查入口",
-	"list_audit_logs":              "分页查询操作审计（谁/何时/对什么/做了什么），支持 page/page_size/username/action/resource/ip/keyword/start_time/end_time",
+	"list_audit_logs":              "分页查询操作审计（谁/何时/对什么/做了什么），支持 page/page_size/username/action/resource/ip/keyword/start_time/end_time；page≤500（超过 REST 返回 400），更大历史请用时间/用户/动作筛选",
 	"get_system_info":              "查看版本/运行时间/主机/系统信息",
 	"list_users":                   "列出用户（角色/启用状态），判断操作者权限",
 	"list_api_keys":                "列出 API 密钥（不含明文），核对 MCP 启用与只读属性",

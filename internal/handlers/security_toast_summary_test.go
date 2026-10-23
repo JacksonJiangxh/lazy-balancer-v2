@@ -139,3 +139,41 @@ func TestGetSecurityEventToastSummary_capsAggregationAtDefaultBudget(t *testing.
 		t.Fatalf("next_id=%d, want MAX(id)=%d（超限也必须推进到库尾）", payload.Data.NextID, maxEventID)
 	}
 }
+
+// 指标库重建/恢复使 id 回退时，客户端持有的旧游标会大于当前 MAX(id)。
+// 该形态必须把游标重新基线到当前库尾——返回 next_id=0 会让下一次轮询以
+// since_id=0 全量扫描近 5 分钟历史并当作「新事件」弹框回放。
+func TestGetSecurityEventToastSummary_rebasesCursorWhenSinceExceedsMax(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	now := time.Now().UTC().Truncate(time.Second).Format("2006-01-02 15:04:05")
+	res, err := db.MetricsDB.Exec(`INSERT INTO security_events
+		(event_time, client_ip, method, uri, event_type, rule_triggered, rule_msg, action)
+		VALUES (?, '93.184.216.7', 'GET', '/a', 'crs', '942100', 'SQL Injection', 'blocked')`, now)
+	if err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	maxID, _ := res.LastInsertId()
+
+	gin.SetMode(gin.TestMode)
+	h := &Handlers{cfg: &config.Config{}}
+	router := gin.New()
+	router.GET("/security/events/toast-summary", h.GetSecurityEventToastSummary)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet,
+		"/security/events/toast-summary?since_id="+strconv.FormatInt(maxID+500, 10), nil))
+	var payload struct {
+		Data struct {
+			Groups []any `json:"groups"`
+			NextID int64 `json:"next_id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode: %v body=%s", err, rec.Body.String())
+	}
+	if len(payload.Data.Groups) != 0 {
+		t.Fatalf("groups=%d, want 0（回退形态不得回放历史）", len(payload.Data.Groups))
+	}
+	if payload.Data.NextID != maxID {
+		t.Fatalf("next_id=%d, want MAX(id)=%d（重新基线到库尾，不得复位为 0）", payload.Data.NextID, maxID)
+	}
+}

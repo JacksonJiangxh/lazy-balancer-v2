@@ -127,11 +127,14 @@ func validateUploadCertificatePair(certPEM, keyPEM string, now time.Time) error 
 type adminTLSInput struct {
 	c *gin.Context // multipart 通道：经 FormFile 读取上传文件
 
-	jsonMode     bool
-	enabledValue string // 归一化为与表单 Get 同构的字符串；""=未提交
-	modeValue    string // ""=未提交
-	certValue    string // JSON 通道提交的证书 PEM
-	keyValue     string // JSON 通道提交的私钥 PEM
+	jsonMode bool
+	// enabledPresent 区分「未提交」与「显式空串」：空串必须走同一白名单 400，
+	// 不得静默按「未提交」返回 200「配置未变更」（脚本拼模板缺值时排障误导）。
+	enabledValue   string
+	enabledPresent bool
+	modeValue      string // ""=未提交
+	certValue      string // JSON 通道提交的证书 PEM
+	keyValue       string // JSON 通道提交的私钥 PEM
 }
 
 // decodeAdminTLSInput 解析请求入参：为 multipart 表单时走原
@@ -157,10 +160,12 @@ func decodeAdminTLSInput(c *gin.Context) (*adminTLSInput, error) {
 	// PostForm 只含请求体字段：ParseMultipartForm 会把 URL query 合并进
 	// Form 且 query 值排在前面，用 Form.Get 会让 `?enabled=false` 静默覆盖
 	// 表单里的 enabled=true（落库与提交意图相反）。
+	_, enabledPresent := c.Request.PostForm["enabled"]
 	return &adminTLSInput{
-		c:            c,
-		enabledValue: c.Request.PostForm.Get("enabled"),
-		modeValue:    c.Request.PostForm.Get("mode"),
+		c:              c,
+		enabledValue:   c.Request.PostForm.Get("enabled"),
+		enabledPresent: enabledPresent,
+		modeValue:      c.Request.PostForm.Get("mode"),
 	}, nil
 }
 
@@ -202,6 +207,7 @@ func parseAdminTLSJSONInput(body []byte) (*adminTLSInput, error) {
 	// 数值形态（1/0）经 UseNumber 保留字面量后同样交白名单——错误文案承诺的
 	// true/1/false/0 取值域对两条通道一致，2/1.5 等其余数值显式 400。
 	if len(req.Enabled) > 0 && string(req.Enabled) != "null" {
+		input.enabledPresent = true
 		dec := json.NewDecoder(bytes.NewReader(req.Enabled))
 		dec.UseNumber()
 		var raw any
@@ -344,10 +350,18 @@ func readAdminTLSFiles(c *gin.Context) (string, string, error) {
 }
 
 func (h *Handlers) GetAdminTLS(c *gin.Context) {
-	cfg := services.LoadAdminTLSConfig()
+	// 读失败必须显式披露：降级 loader 返回 selfsigned/未启用形态，静默展示会
+	// 让运维在 DB 故障/迁移窗口看到与真实启用态相反的视图（写路径用严格
+	// loader，不会回写降级值，故无二次破坏）。内部可用性敏感调用方
+	// （启动/集群比较）继续用降级 loader。
+	cfg, cfgErr := services.LoadAdminTLSConfigE()
+	if cfgErr != nil {
+		services.Logf("warn", "管理面板 HTTPS 配置读取失败，按未启用/自签名降级展示: %v", cfgErr)
+	}
 	resp := gin.H{
-		"enabled": cfg.Enabled,
-		"mode":    cfg.Mode,
+		"enabled":            cfg.Enabled,
+		"mode":               cfg.Mode,
+		"config_unavailable": cfgErr != nil,
 	}
 	if cfg.Cert != "" {
 		info, err := parseAdminTLSCertInfo(cfg.Cert)
@@ -389,8 +403,8 @@ func (h *Handlers) UpdateAdminTLS(c *gin.Context) {
 		respondAdminTLSBodyError(c, err)
 		return
 	}
-	if v := input.enabledValue; v != "" {
-		if _, ok := parseAdminTLSEnabledValue(v); !ok {
+	if input.enabledPresent {
+		if _, ok := parseAdminTLSEnabledValue(input.enabledValue); !ok {
 			auditAdminTLSFailure(c, "enabled 取值不在白名单（仅 true/1/false/0）")
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: adminTLSEnabledWhitelistMessage})
 			return
@@ -526,8 +540,13 @@ func (h *Handlers) UpdateAdminTLS(c *gin.Context) {
 	// 来源——「只开关未换证书」与「换证书」在审计里不可区分。显式留痕（不落
 	// 证书本体）。
 	certPart := "证书：未更换"
-	if uploadedCertificate {
+	switch {
+	case uploadedCertificate:
 		certPart = "证书：已更换（来源 upload）"
+	case current.Cert != "" && cert == "":
+		// 上传证书材料被本次切换到非 upload 来源清空——安全相关动作，
+		// 审计必须与「只切来源、材料原样保留」可区分。
+		certPart = "证书：已清除（切换到 selfsigned）"
 	}
 	recordAudit(c, "更新", "基础设置", services.FormatAuditDetail(
 		map[bool]string{true: "启用", false: "禁用"}[enabled],

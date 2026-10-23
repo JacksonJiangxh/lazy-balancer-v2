@@ -684,6 +684,23 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 		}
 		// 证书任务级 CA 提供商悬挂/禁用引用的归一警告（与导入同通道）。
 		validateWarnings = append(validateWarnings, certJobProviderWarnings...)
+		// 链内自动封禁钳制事实（阈值/窗口越界被归一）与上述并列，预览必须
+		// 可见——否则预览显示 valid 且无提示，导入后实际生效值已变。
+		validateWarnings = append(validateWarnings, chain.AutobanClampNotes...)
+		// live 证书任务引用 live CA 提供商的悬挂预检：与导入锁内同一判据
+		// （certJobProviderDanglingCounts，按「已禁用=真失败 / 不存在=回落自愈」
+		// 分档），预览与导入对同一备份给出同一组告警。
+		if disabledProviders, missingProviders, countErr := certJobProviderDanglingCounts(c.Request.Context(), db.DB, backup.Tables, sectionTables); countErr != nil {
+			services.Logf("warn", "配置预览：证书任务 CA 提供商悬挂统计失败: %v", countErr)
+			validateWarnings = append(validateWarnings, "证书任务 CA 提供商悬挂统计未完成（读取失败）："+countErr.Error())
+		} else {
+			if disabledProviders > 0 {
+				validateWarnings = append(validateWarnings, fmt.Sprintf("导入后 %d 个证书任务的 CA 提供商已禁用——续签将失败（任务转 failed 终态），请补齐 CA 提供商或在证书页手工重试", disabledProviders))
+			}
+			if missingProviders > 0 {
+				validateWarnings = append(validateWarnings, fmt.Sprintf("导入后 %d 个证书任务引用的 CA 提供商已不存在——续签时将回落首个启用提供商（自愈），如需保持原提供商请补齐", missingProviders))
+			}
+		}
 		hasWaf := false
 		if payload := lbbakPayloadFromCtx(c); payload != nil {
 			// 威胁库名单条目也是规则库数据文件

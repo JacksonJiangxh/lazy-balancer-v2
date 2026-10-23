@@ -8,6 +8,7 @@ package main
 //     立即退出。注册前置后，窗口内到达的信号必须在监听前被识别并走正常关停。
 
 import (
+	"bytes"
 	"log"
 	"os"
 	"regexp"
@@ -212,7 +213,7 @@ func (w *stuckCertificateWorker) Stop() {}
 // Then 有界返回并记录 error 日志（不再无界 <-done）。
 func TestRuntimeLifecycle_ShutdownWithTimeoutBoundsStuckWorker(t *testing.T) {
 	worker := &stuckCertificateWorker{entered: make(chan struct{}), release: make(chan struct{})}
-	lifecycle := newRuntimeLifecycle(idleSyncWorker{}, func() certificateWorker { return worker })
+	lifecycle := newRuntimeLifecycle(idleSyncWorker{}, func() lifecycleWorker { return worker })
 	lifecycle.StartACME()
 	select {
 	case <-worker.entered:
@@ -332,4 +333,64 @@ func TestWaitForServerStopConsumesSignalBufferedDuringStartup(t *testing.T) {
 	if got := len(quit); got != 0 {
 		t.Fatalf("信号通道未消费干净：残留 %d", got)
 	}
+}
+
+// runWithin 是关停期「不可预算调用按预算有界执行」的唯一入口（metrics 清理
+// 等待段）。四种形状：预算充足且 fn 立即返回、fn 卡住超时放弃、预算已耗尽
+// 完全不执行 fn、fn 在后台完成后不影响返回值。
+func TestRunWithin_shapes(t *testing.T) {
+	t.Run("预算充足时执行并等待完成", func(t *testing.T) {
+		ran := make(chan struct{})
+		if ok := runWithin("测试收尾", time.Second, func() { close(ran) }); !ok {
+			t.Fatal("预算充足且 fn 立即返回时必须报告已完成")
+		}
+		select {
+		case <-ran:
+		default:
+			t.Fatal("fn 未被调用")
+		}
+	})
+
+	t.Run("fn 卡住时按预算放弃", func(t *testing.T) {
+		var logs bytes.Buffer
+		previous := log.Writer()
+		log.SetOutput(&logs)
+		t.Cleanup(func() { log.SetOutput(previous) })
+		block := make(chan struct{})
+		t.Cleanup(func() { close(block) })
+
+		started := time.Now()
+		if ok := runWithin("卡住的收尾", 20*time.Millisecond, func() { <-block }); ok {
+			t.Fatal("fn 卡住时不得报告已完成")
+		}
+		if elapsed := time.Since(started); elapsed > time.Second {
+			t.Fatalf("等待 %s，远超 20ms 预算", elapsed)
+		}
+		if !strings.Contains(logs.String(), "卡住的收尾") {
+			t.Fatalf("超时必须留痕，got %q", logs.String())
+		}
+	})
+
+	t.Run("预算耗尽时不执行 fn", func(t *testing.T) {
+		var logs bytes.Buffer
+		previous := log.Writer()
+		log.SetOutput(&logs)
+		t.Cleanup(func() { log.SetOutput(previous) })
+		called := false
+		if ok := runWithin("跳过段", 0, func() { called = true }); ok {
+			t.Fatal("预算耗尽必须返回 false")
+		}
+		if called {
+			t.Fatal("预算耗尽不得启动收尾 goroutine")
+		}
+		if !strings.Contains(logs.String(), "跳过等待") {
+			t.Fatalf("跳过必须留痕，got %q", logs.String())
+		}
+	})
+
+	t.Run("负预算与零预算同语义", func(t *testing.T) {
+		if ok := runWithin("负预算", -time.Second, func() {}); ok {
+			t.Fatal("负预算必须按耗尽处理")
+		}
+	})
 }

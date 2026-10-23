@@ -266,3 +266,11 @@ test('国家网格：候选收敛、远海空集、键夹紧', () => {
   assert.equal(countryGridCell(-180, -90), 0)
   assert.equal(countryGridCell(180, 90), 35 * 100 + 71)
 })
+
+// 消费侧接线钉：parseIpLocation 的唯一生产消费点是威胁光流的地域键/
+// 端点省派生——被绕过时表现为「光流地域键与端点省漂移」，纯函数用例不会红。
+test('parseIpLocation 接线：threatShared 经它派生国家与省份', () => {
+  const shared = source('src/utils/threatShared.ts')
+  assert.match(shared, /import \{ parseIpLocation \} from '\.\/ipLocationParts\.ts'/, '必须复用单源解析器')
+  assert.match(shared, /parseIpLocation\(ipLocation\)/, '光流地域派生必须经 parseIpLocation')
+})

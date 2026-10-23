@@ -163,3 +163,39 @@ func TestPublicModelsSerializeNullableTimesAsStringsOrNull(t *testing.T) {
 		t.Fatalf("public model leaked sql.NullTime representation: %s", body)
 	}
 }
+
+// 拦截页内容类型白名单必须是封闭常量集：导出可变切片时任意包可
+// append/改写，ValidBlockPageContentType 的封闭性随之失效且无测试会红。
+// 期望集合在此硬编码（遍历自身白名单是自证型断言）。
+func TestBlockPageContentTypeWhitelistIsClosed(t *testing.T) {
+	want := []string{
+		"text/html; charset=utf-8",
+		"application/json; charset=utf-8",
+		"application/xml; charset=utf-8",
+		"text/plain; charset=utf-8",
+	}
+	got := BlockPageContentTypeWhitelist()
+	if len(got) != len(want) {
+		t.Fatalf("白名单=%v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("白名单[%d]=%q, want %q", i, got[i], want[i])
+		}
+		if !ValidBlockPageContentType(want[i]) {
+			t.Fatalf("白名单成员 %q 必须被校验接受", want[i])
+		}
+	}
+	for _, bad := range []string{"text/css", "application/pdf", "text/html"} {
+		if ValidBlockPageContentType(bad) {
+			t.Fatalf("白名单外 %q 必须被拒", bad)
+		}
+	}
+
+	// 返回值是副本：调用方改写不得影响校验面。
+	mutated := BlockPageContentTypeWhitelist()
+	mutated[0] = "text/css"
+	if !ValidBlockPageContentType("text/html; charset=utf-8") || ValidBlockPageContentType("text/css") {
+		t.Fatalf("白名单副本被改写后仍污染了 ValidBlockPageContentType")
+	}
+}

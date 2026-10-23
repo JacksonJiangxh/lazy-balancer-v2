@@ -321,3 +321,25 @@ func TestValidateConfigImport_autobanAndTrustedProxyGatesPreview(t *testing.T) {
 		})
 	}
 }
+
+// 预览必须呈现链内自动封禁钳制事实：预览显示 valid 且无提示、导入后实际
+// 生效值已被归一，是「预览与提交不同源」的可解释性缺口。
+func TestValidateConfigImport_previewSurfacesAutobanClampNotes(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	seedCurrentAdminShared(t)
+	backup := configBackupJSON(t, map[string][]map[string]any{}, map[string]any{
+		"autoban_threshold":      999999,
+		"autoban_window_minutes": 0,
+	})
+	response := postImportShared(t, h.ValidateConfigImport, "/config/import/validate", backup)
+	if response.Code != http.StatusOK {
+		t.Fatalf("validate status=%d body=%s", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	if !strings.Contains(body, `"valid":true`) {
+		t.Fatalf("钳制不阻断导入: body=%s", body)
+	}
+	if !strings.Contains(body, "autoban_threshold 越界") || !strings.Contains(body, "autoban_window_minutes 越界") {
+		t.Fatalf("预览 warnings 缺少钳制事实: body=%s", body)
+	}
+}

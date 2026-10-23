@@ -89,7 +89,7 @@ func TestMCPForwardFollowsRealMux302PreservingMethodAndBody(t *testing.T) {
 			return http.ErrUseLastResponse
 		},
 	}
-	handler := mcpserver.New(fmt.Sprintf("http://%s/api/v1", listener.Addr().String()), client)
+	handler := mcpserver.NewForTest(fmt.Sprintf("http://%s/api/v1", listener.Addr().String()), client)
 
 	// When：经 MCP 信封调用 POST 工具——转发层先以 http 明文命中嗅探层 302。
 	envelope := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_certificate","arguments":` + wantBody + `}}`

@@ -133,7 +133,7 @@ func (s *SyncService) Report(ctx context.Context) error {
 		return fmt.Errorf("上报主节点失败: %w", err)
 	}
 	defer resp.Body.Close()
-	// 同主机 http→https 升级已被 doWithTLSUpgradeRedirect 按
+	// 同主机 http→https 升级已被 DoWithSameHostTLSUpgradeRedirect 按
 	// 原方法重放,残留 3xx(跨主机/反代重定向)说明主节点地址形态需
 	// 人工修正——此前落进「非 4xx 即成功」被静默吞掉;给与 Pull 3xx 分支同款
 	// 可行动指引,经 reportErr→recordSyncError 通道落库(last_sync_error

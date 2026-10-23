@@ -2326,6 +2326,13 @@ func validateV2BackupRules(tables map[string][]map[string]any, portGates ...func
 	if err != nil {
 		return err
 	}
+	// 生成式子路由 @id 命名空间保留：规则 ID 取 <另一规则ID>_path_<序号>/_geoip/
+	// _redirect 形态时，两条规则拼接出的 @id 相同，Caddy /load 以 duplicate ID
+	// 整份拒绝（导入事务回滚）。逐行校验前先收集全量 ID，冲突点名两条规则。
+	backupRuleIDs := make([]string, 0, len(rows))
+	for _, row := range rows {
+		backupRuleIDs = append(backupRuleIDs, backupString(row["caddy_id"]))
+	}
 	// 阶段拦截页引用/状态码必须与保存侧同门。页存在性按
 	// 「备份携带 security_block_pages 则备份行、缺席则 live」解析
 	// 同口径）——备份行才是导入后的真实数据。
@@ -2416,6 +2423,9 @@ func validateV2BackupRules(tables map[string][]map[string]any, portGates ...func
 		// 日志文件名净化键碰撞；导入期 fail-fast 点名。
 		if !services.ValidCertRuleID(ruleID) {
 			return fmt.Errorf("规则 #%d：caddy_id %q 含证书路径不支持的字符（仅允许小写字母、数字、_ 与 -，长度 1-64）", index+1, ruleID)
+		}
+		if conflict := services.RuleIDNamespaceConflict(ruleID, backupRuleIDs); conflict != "" {
+			return fmt.Errorf("规则 #%d：caddy_id %q 与规则 %q 的子路由 @id 命名空间冲突（子路由 @id 形如 <规则ID>_path_<序号>/_geoip/_redirect），请修改其中一个 ID", index+1, ruleID, conflict)
 		}
 		// 阶段拦截页四列（仅生效 HTTP 规则；TCP 行残留属已裁定豁免）。
 		if enabled && (protocol == "http" || protocol == "") {
@@ -2610,15 +2620,138 @@ func validateV2BackupTLSShapeSoft(tables map[string][]map[string]any, softLiveAC
 	return acmeDangling, nil
 }
 
+// certJobShape 是启用 ACME 规则不变量判定所需的证书任务行形状。
+type certJobShape struct {
+	domain string
+	status string
+	pem    bool
+}
+
+// certJobShapesByRule 把证书任务行按 rule_id 归组（跳过 disabled 行）。
+// writeBackCanonical=true 时把规范域名写回行载荷——持久化与运行期查找共用
+// 排序规范形式；非法形态留给启用不变量按既有错误口径拒绝，禁用/历史行保持
+// 原容错语义。
+func certJobShapesByRule(jobs []map[string]any, writeBackCanonical bool) map[string][]certJobShape {
+	jobsByRule := make(map[string][]certJobShape)
+	for _, job := range jobs {
+		domain := backupString(job["domain"])
+		if canonical, err := services.CanonicalACMEDomains(domain); err == nil {
+			if writeBackCanonical {
+				job["domain"] = canonical
+			}
+			domain = canonical
+		}
+		if backupString(job["status"]) == "disabled" {
+			continue
+		}
+		if ruleID, ok := job["rule_id"].(string); ok && ruleID != "" {
+			status := backupString(job["status"])
+			// issued/downloaded 必须带可用证书材料；空 PEM 的 issued 会让
+			// 启用规则在 TLS 端口无证书运行，且 EnableRule/续期都按到期日
+			// 跳过补签。
+			hasMaterial := backupString(job["cert_pem"]) != "" && backupString(job["key_pem"]) != ""
+			jobsByRule[ruleID] = append(jobsByRule[ruleID], certJobShape{domain: domain, status: status, pem: hasMaterial})
+		}
+	}
+	return jobsByRule
+}
+
+// loadLiveCertJobShapes 读取本地 cert_jobs 行（形状与备份行一致）。
+// 备份未携带该表时「缺席=保留本地」（deleteOrder 对缺席表直接跳过），
+// 因此导入后的任务行就是本地行——启用 ACME 规则的不变量必须针对它校验，
+// 按空集硬拒会让「仅规则」的部分备份被误判为缺少任务行。
+func loadLiveCertJobShapes() ([]map[string]any, error) {
+	rows, err := db.DB.Query(`SELECT rule_id, domain, COALESCE(status,''), COALESCE(cert_pem,''), COALESCE(key_pem,'') FROM cert_jobs`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []map[string]any
+	for rows.Next() {
+		var ruleID, domain, status, certPEM, keyPEM string
+		if err := rows.Scan(&ruleID, &domain, &status, &certPEM, &keyPEM); err != nil {
+			return nil, err
+		}
+		out = append(out, map[string]any{
+			"rule_id": ruleID, "domain": domain, "status": status,
+			"cert_pem": certPEM, "key_pem": keyPEM,
+		})
+	}
+	return out, rows.Err()
+}
+
+// certJobRowQueryer 是证书任务统计的查询面：导入锁内传 *sql.Tx，预览传
+// *sql.DB——同一判据两条路径共用，避免预览与导入对同一备份给出不同告警。
+type certJobRowQueryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// certJobProviderDanglingCounts 统计「导入后会参与续签」的证书任务中 CA 提供商
+// 在导入后不可解析的行数，并按消费侧语义分两档：
+//   - disabled：提供商行存在但 enabled=0 → loadCAProvider 硬失败，任务落
+//     failed 终态（显式选择不会静默改派）；
+//   - missing：提供商行不存在 → loadCAProvider 回落首个启用提供商并成功续签
+//     （自愈，不应断言「续签将失败」）。
+//
+// 计数面收敛为「非终态 ∧ 规则为启用 ACME」——此前对 cert_jobs 全表（含
+// failed/disabled 残留行与非 ACME 规则的孤儿行）计数，告警系统性偏高。
+func certJobProviderDanglingCounts(ctx context.Context, q certJobRowQueryer, tables map[string][]map[string]any, sectionTables map[string]bool) (disabled, missing int, err error) {
+	if _, certJobsCarried := tables["cert_jobs"]; certJobsCarried {
+		return 0, 0, nil
+	}
+	if !sectionTables["ca_providers"] && !sectionTables["certificate_configs"] {
+		return 0, 0, nil
+	}
+	rows, qerr := q.QueryContext(ctx, `
+		SELECT COALESCE(j.ca_provider_id,0) FROM cert_jobs j
+		JOIN lb_rules r ON r.caddy_id=j.rule_id
+		WHERE COALESCE(j.ca_provider_id,0) <> 0
+		  AND r.enabled=1 AND r.enable_tls=1 AND r.tls_source='acme_dns'
+		  AND j.status NOT IN ('failed','disabled')`)
+	if qerr != nil {
+		return 0, 0, qerr
+	}
+	defer rows.Close()
+	state := make(map[int]struct{ exists, enabled bool })
+	for rows.Next() {
+		var providerID int
+		if scanErr := rows.Scan(&providerID); scanErr != nil {
+			return 0, 0, scanErr
+		}
+		st, seen := state[providerID]
+		if !seen {
+			if _, carried := tables["ca_providers"]; carried {
+				row, found := backupRowByID(tables, "ca_providers", providerID)
+				st = struct{ exists, enabled bool }{exists: found, enabled: found && backupRowEnabled(row)}
+			} else {
+				var enabled int
+				liveErr := db.DB.QueryRow("SELECT COALESCE(enabled,0) FROM ca_providers WHERE id=?", providerID).Scan(&enabled)
+				if liveErr != nil && !errors.Is(liveErr, sql.ErrNoRows) {
+					return 0, 0, liveErr
+				}
+				st = struct{ exists, enabled bool }{exists: liveErr == nil, enabled: liveErr == nil && enabled == 1}
+			}
+			state[providerID] = st
+		}
+		switch {
+		case !st.exists:
+			missing++
+		case !st.enabled:
+			disabled++
+		}
+	}
+	return disabled, missing, rows.Err()
+}
+
 // validateV2BackupCertJobs 校验最终处于启用态的 acme_dns 规则携带域名匹配的
-// 证书任务行。导入为全量替换（deleteOrder 清光 cert_jobs 后仅插入
+// 证书任务行。备份携带 cert_jobs 时导入为全量替换（deleteOrder 清光后仅插入
 // 备份行），缺失即导入后续签永久断链且无信号（周期路径只遍历已存在的任务行，
-// 不补建）。新发现2：必须在 disableV2RuleConflicts 之后执行——将被冲突
-// 自动置禁用的规则不投入运行，不参与运行态不变量；此前不变量先执行会把可自愈
-// 的冲突备份整包 400。新发现3：不变量还须校验 job.domain 与规则域名一致
-// （canonical/reversed 双形式，与 certjobs.go 续签扫描 lower+replace 口径同型）——
-// 错域残留行只凭存在性放行后，续签扫描按 rule_id+domain 匹配永不命中，断链同果。
-// 域比较两侧（规则域名与任务域名）均须可规范化——
+// 不补建）；备份未携带该表时「缺席=保留本地」，校验对象是本地行（见
+// loadLiveCertJobShapes）。必须在 disableV2RuleConflicts 之后执行——将被冲突
+// 自动置禁用的规则不投入运行，不参与运行态不变量。不变量还须校验 job.domain
+// 与规则域名一致（canonical/reversed 双形式，与 certjobs.go 续签扫描
+// lower+replace 口径同型）——错域残留行只凭存在性放行后，续签扫描按
+// rule_id+domain 匹配永不命中，断链同果。域比较两侧均须可规范化——
 // canonicalACMEDomainForJobLookup 的原串回退是查询侧良性 miss 语义（视为无任务），
 // 用于校验侧会把 "a.com,b.org" 等不可规范化形态假放行；与运行期
 // certJobRuleApplicable 的严格 CanonicalACMEDomains 全等语义对齐，不可规范化即
@@ -2652,32 +2785,17 @@ func validateV2BackupCertJobs(tables map[string][]map[string]any) ([]string, err
 	if danglingProviderJobs > 0 {
 		warnings = append(warnings, fmt.Sprintf("%d 条证书任务引用的 CA 提供商不存在或已禁用，已归一为跟随默认提供商（原引用会导致任务首次入队即失败）", danglingProviderJobs))
 	}
-	type certJobShape struct {
-		domain string
-		status string
-		pem    bool
+	jobRows, carried := tables["cert_jobs"]
+	if !carried {
+		// 「缺席=保留本地」：deleteOrder/insertOrder 对缺席表直接 continue，
+		// live 任务行在导入后仍然有效，校验对象必须是它们而不是空集。
+		liveRows, err := loadLiveCertJobShapes()
+		if err != nil {
+			return nil, fmt.Errorf("读取本地证书任务用于启用 ACME 规则校验: %w", err)
+		}
+		jobRows = liveRows
 	}
-	jobsByRule := make(map[string][]certJobShape)
-	for _, job := range tables["cert_jobs"] {
-		domain := backupString(job["domain"])
-		if canonical, err := services.CanonicalACMEDomains(domain); err == nil {
-			// 持久化与运行期查找共用排序规范形式；非法形态留给下方启用 ACME
-			// 不变量按既有错误口径拒绝，禁用/历史行保持原容错语义。
-			job["domain"] = canonical
-			domain = canonical
-		}
-		if backupString(job["status"]) == "disabled" {
-			continue
-		}
-		if ruleID, ok := job["rule_id"].(string); ok && ruleID != "" {
-			status := backupString(job["status"])
-			// issued/downloaded 必须带可用证书材料；空 PEM 的 issued 会让
-			// 启用规则在 TLS 端口无证书运行，且 EnableRule/续期都按到期日
-			// 跳过补签。
-			hasMaterial := backupString(job["cert_pem"]) != "" && backupString(job["key_pem"]) != ""
-			jobsByRule[ruleID] = append(jobsByRule[ruleID], certJobShape{domain: domain, status: status, pem: hasMaterial})
-		}
-	}
+	jobsByRule := certJobShapesByRule(jobRows, carried)
 	for index, rule := range tables["lb_rules"] {
 		protocol, _ := rule["protocol"].(string)
 		if !backupRuleEnabled(rule) || protocol != "http" ||
@@ -2686,7 +2804,10 @@ func validateV2BackupCertJobs(tables map[string][]map[string]any) ([]string, err
 		}
 		jobDomains := jobsByRule[backupString(rule["caddy_id"])]
 		if len(jobDomains) == 0 {
-			return nil, fmt.Errorf("规则 #%d（%s）：启用的 ACME 规则缺少证书签发任务（cert_jobs 无非 disabled 行），导入后将无法自动续签", index+1, backupString(rule["name"]))
+			if !carried {
+				return nil, fmt.Errorf("规则 #%d（%s）：启用的 ACME 规则缺少证书签发任务（备份未携带 cert_jobs 表，导入将保留本地任务行，而本地也没有该规则的非 disabled 任务），导入后将无法自动续签", index+1, backupString(rule["name"]))
+			}
+			return nil, fmt.Errorf("规则 #%d（%s）：启用的 ACME 规则缺少证书签发任务（导入后的 cert_jobs 无非 disabled 行），导入后将无法自动续签", index+1, backupString(rule["name"]))
 		}
 		canonical, err := services.CanonicalACMEDomains(backupString(rule["domain"]))
 		if err != nil {
@@ -4537,17 +4658,21 @@ func disableV2RuleConflicts(rows []map[string]any) []disabledRuleConflict {
 	return conflicts
 }
 
-// backupConfigClampRule 导入侧整型配置钳制规格（六段逐字同构的
-// clampBackup* 收敛为单表）。mode 两种语义：
-//   - clampToBound：越界钳到最近边界（日志大小/保留月数族）
+// backupConfigClampRule 导入侧整型配置钳制规格（同族钳制段收敛为单表，新增
+// 配置键只需登记一行）。mode 语义：
+//   - clampToBound（默认）：越界钳到最近边界（日志大小/保留月数/证书参数族）
 //   - resetDefault：越界一律回退默认值（jwt 过期分钟：越界与非法同待遇）
+//   - ResetOnLow：低于下界一律回退 Def（http 三超时：0/NULL 是旧省略语义残留，
+//     不是用户选择，钳到 1 会产生一个虚假的极小值）
 //
+// Hi=0 表示无上界（http 三超时；写侧同样无上界，导入不得新造上界）。
 // 非整数形态一律回退 Def（与 schema 缺省/显示侧 COALESCE 对齐）。
 type backupConfigClampRule struct {
 	Key         string
 	Lo, Hi      int
 	Def         int
 	ResetOnHigh bool
+	ResetOnLow  bool
 }
 
 var backupConfigClampRules = []backupConfigClampRule{
@@ -4557,6 +4682,18 @@ var backupConfigClampRules = []backupConfigClampRule{
 	{Key: "audit_log_size_mb", Lo: 1, Hi: 512, Def: 10},
 	{Key: "task_log_size_mb", Lo: 1, Hi: 1024, Def: 10},
 	{Key: "runtime_log_size_mb", Lo: 1, Hi: 1024, Def: 100},
+	// 续签/有效期数值（与写侧 caddy.go 校验同边界）：cert_renewal_days 超大值
+	// 会让续签扫描窗口覆盖一切证书（续签成功后仍在窗口内 → 永久续签风暴耗尽
+	// CA 配额）；负值漂移 Keep/Resume 决策。0=默认 30（不参与下界钳制）。
+	{Key: "cert_renewal_days", Lo: 0, Hi: services.CertRenewalDaysMax, Def: 30},
+	{Key: "cert_renewal_attempts", Lo: 1, Hi: 10, Def: 5},
+	{Key: "cert_expiry_days", Lo: 1, Hi: 365, Def: 30},
+	// 库值唯一真相（批 1+2）：http 三超时为类型①值型列（NOT NULL DEFAULT
+	// 60/60/120+启动回填）——旧备份的 0/NULL（省略语义时代残留）在导入门归
+	// 治理默认；写侧无上界，故 Hi=0。
+	{Key: "http_read_timeout", Lo: 1, Hi: 0, Def: db.DefaultHTTPReadTimeout, ResetOnLow: true},
+	{Key: "http_write_timeout", Lo: 1, Hi: 0, Def: db.DefaultHTTPWriteTimeout, ResetOnLow: true},
+	{Key: "http_idle_timeout", Lo: 1, Hi: 0, Def: db.DefaultHTTPIdleTimeout, ResetOnLow: true},
 }
 
 // clampBackupConfigInts 按 backupConfigClampRules 就地钳制全局配置区，返回
@@ -4577,10 +4714,20 @@ func clampBackupConfigInts(config map[string]any) []string {
 			notes = append(notes, fmt.Sprintf("%s 非法形态，已重置为 %d", rule.Key, rule.Def))
 			continue
 		}
-		if n >= rule.Lo && n <= rule.Hi {
+		if rule.ResetOnLow && n < rule.Lo {
+			config[rule.Key] = rule.Def
+			notes = append(notes, fmt.Sprintf("%s 非法（须为正整数），已归默认 %d", rule.Key, rule.Def))
 			continue
 		}
-		if rule.ResetOnHigh {
+		if rule.Hi == 0 {
+			// 无上界：只校验下界（越下界按钳到边界处理）。
+			if n >= rule.Lo {
+				continue
+			}
+		} else if n >= rule.Lo && n <= rule.Hi {
+			continue
+		}
+		if rule.ResetOnHigh && n > rule.Hi {
 			config[rule.Key] = rule.Def
 			notes = append(notes, fmt.Sprintf("%s 越界，已重置为 %d", rule.Key, rule.Def))
 			continue
@@ -5133,6 +5280,64 @@ func normalizeImportedVersionUpdateStatuses(tables map[string][]map[string]any) 
 	return []string{fmt.Sprintf("%d 条版本/源记录的 update_status 不在词表内，已归一为 idle", total)}
 }
 
+// backfillCertJobExpiryFromPEM 为「有效材料但 expires_at 缺失」的证书任务
+// 行派生并回填到期时间。列值优先（不覆盖已有值）；不可解析材料跳过。
+// 目的：/certificates/jobs 已按 PEM 派生展示，而聚合消费面（节点健康
+// certs_expiring_30d、/certificates）仍以列为门——不回填会让同一条证书在
+// 两处给出不同到期结论。
+func backfillCertJobExpiryFromPEM(ctx context.Context, tx *sql.Tx) (int, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT id, COALESCE(cert_pem,'') FROM cert_jobs
+		WHERE COALESCE(expires_at,'')='' AND COALESCE(cert_pem,'')<>''`)
+	if err != nil {
+		return 0, err
+	}
+	type expiryUpdate struct {
+		id     int64
+		expiry string
+	}
+	var updates []expiryUpdate
+	for rows.Next() {
+		var id int64
+		var certPEM string
+		if err := rows.Scan(&id, &certPEM); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		if notAfter, ok := services.CertNotAfterFromPEM(certPEM); ok {
+			updates = append(updates, expiryUpdate{id: id, expiry: notAfter.UTC().Format("2006-01-02 15:04:05")})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	for _, update := range updates {
+		if _, err := tx.ExecContext(ctx, `UPDATE cert_jobs SET expires_at=? WHERE id=? AND COALESCE(expires_at,'')=''`, update.expiry, update.id); err != nil {
+			return 0, err
+		}
+	}
+	return len(updates), nil
+}
+
+// failImportTx 是导入事务内失败分支的单一收尾：「回滚 → 失败审计 → 响应」。
+// 同函数内其余失败分支均如此；漏接会让该失败面在 audit_log 中完全无痕
+// （会话吊销/管理员门/OIDC/配置结构读取恰是运维最需要复盘的面），且各分支
+// 各写一份响应文案容易漂移。responsePrefix 为空时直接以错误文本作响应
+// （客户端可修正的 400），否则拼「<前缀>，已回滚: <err>」（500）。
+func failImportTx(c *gin.Context, session *configImportSession, action, detail string, cause error, status int, responsePrefix string) error {
+	err := session.abort(cause)
+	recordAudit(c, action+"失败", "配置备份", detail+": "+err.Error())
+	message := err.Error()
+	if responsePrefix != "" {
+		message = responsePrefix + "，已回滚: " + err.Error()
+	}
+	c.JSON(status, models.APIResponse{Code: status, Message: message})
+	return err
+}
+
 // importConfigBackupCore 携带导入全量逻辑,HTTP 导入端点与自动备份还原端点
 // (autobackup.go)共用。128MB 压缩上限由 HTTP 调用方 limitConfigImportBody
 // 与自动备份还原读取侧共同把守。内存
@@ -5211,51 +5416,15 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	if wafXdbMetadataSkipped {
 		recordAudit(c, action+"警告", "配置备份", warningWafXdbMetadataSkipped)
 	}
-	// 六个整型钳制键收敛为单表单循环（审计留痕随钳制产生）。
+	// 六个整型钳制键 + 证书续签三键 + http 三超时统一收敛为单表单循环
+	// （backupConfigClampRules；审计留痕随钳制产生）。
 	configClampNotes := clampBackupConfigInts(backup.Config)
-	// 续签/有效期数值导入钳制（与写侧 caddy.go 校验同边界）——
-	// cert_renewal_days 超大值会让续签扫描窗口覆盖一切证书（续签成功后仍在
-	// 窗口内 → 永久续签风暴耗尽 CA 配额）；负值漂移 Keep/Resume 决策。
-	certNumericClamped := make([]string, 0, 4)
-	for _, kc := range []struct {
-		key         string
-		lo, hi      int
-		fallbackDef int
-	}{
-		// 非法形态回退值对齐 schema 默认（db.go cert_renewal_days=30/
-		// cert_renewal_attempts=5/cert_expiry_days=30）与显示侧 COALESCE——
-		// 此前 3/90 与写侧校验边界一致但与默认值漂移，修复后的续签窗口/到期
-		// 提醒参数会静默偏离系统默认直至管理员重存。
-		// cert_renewal_days 0=默认 30（与 UI/写侧/读侧统一），导入不再钳到 1
-		// （0 不参与下界钳制，只按上界 90 校验）。
-		{"cert_renewal_days", 0, 90, 30},
-		{"cert_renewal_attempts", 1, 10, 5},
-		{"cert_expiry_days", 1, 365, 30},
-	} {
-		if value, exists := backup.Config[kc.key]; exists {
-			if n, ok := backupInteger(value); ok {
-				if n < kc.lo || n > kc.hi {
-					clamped := n
-					if n < kc.lo {
-						clamped = kc.lo
-					}
-					if n > kc.hi {
-						clamped = kc.hi
-					}
-					backup.Config[kc.key] = clamped
-					certNumericClamped = append(certNumericClamped, fmt.Sprintf("%s 越界（%d），已钳位为 %d", kc.key, n, clamped))
-				}
-			} else if value != nil {
-				backup.Config[kc.key] = kc.fallbackDef
-				certNumericClamped = append(certNumericClamped, fmt.Sprintf("%s 非法形态，已重置为 %d", kc.key, kc.fallbackDef))
-			}
-		}
-	}
+	certNumericClamped := make([]string, 0, 1)
 	// request_body_max_size_mb 导入钳制（与写侧三处
 	// 同边界）——溢出向量此前只堵了保存/更新，备份导入可携带天文数字绕过，
 	// 渲染侧 MB→字节 int64 乘法回绕会让 body 限制静默取消。库值唯一真相
 	//（批 1+2）：该列为类型①值型列，<=0（旧备份的渲染兜底时代残留/NULL）
-	// 归治理默认 128。
+	// 归治理默认 128。归一形态带值回显，保留为该表的专用分支。
 	if value, exists := backup.Config["request_body_max_size_mb"]; exists {
 		normalized := normalizeBackupRequestBodyMB(value, 1, db.DefaultRequestBodyMaxSizeMB)
 		n, integerShape := backupInteger(value)
@@ -5264,24 +5433,6 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 			certNumericClamped = append(certNumericClamped, fmt.Sprintf("request_body_max_size_mb 非法形态（%v），已归一为 %d", value, normalized))
 		} else if n <= 0 || n > 4096 {
 			certNumericClamped = append(certNumericClamped, fmt.Sprintf("request_body_max_size_mb 越界（%d），已钳位为 %d", n, normalized))
-		}
-	}
-	// 库值唯一真相（批 1+2）：http 三超时为类型①值型列（NOT NULL DEFAULT
-	// 60/60/120+启动回填）——旧备份的 0/NULL（省略语义时代残留）在导入门归
-	// 治理默认，restoreTable 的字段级 UPDATE 直写后库恒有效（渲染层已零兜底）。
-	for _, kc := range []struct {
-		key string
-		def int
-	}{
-		{"http_read_timeout", db.DefaultHTTPReadTimeout},
-		{"http_write_timeout", db.DefaultHTTPWriteTimeout},
-		{"http_idle_timeout", db.DefaultHTTPIdleTimeout},
-	} {
-		if value, exists := backup.Config[kc.key]; exists {
-			if n, ok := backupInteger(value); !ok || n <= 0 {
-				backup.Config[kc.key] = kc.def
-				certNumericClamped = append(certNumericClamped, fmt.Sprintf("%s 非法（须为正整数），已归默认 %d", kc.key, kc.def))
-			}
 		}
 	}
 	ctx := c.Request.Context()
@@ -5379,29 +5530,19 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	}
 	// 「系统数据」替换 CA 提供商（或证书配置）而证书任务未随包时，live
 	// cert_jobs 的显式 provider 引用不重验：备份里同 id 提供商可为 disabled
-	// （或该 id 在备份中缺失），导入后该任务按显式 provider 解析失败 →
-	// failed 终态（不在续签/补扫通道内，只能手工重试），证书到期无自动接管。
-	// 规则侧同条件已有悬挂告警（上方 acmeDanglingRules），此处补齐任务侧的
-	// 可观测性：只告警不阻断（「缺席=保留本地」语义不变；id 缺失由 caqueue
-	// 回落首个启用提供商自愈，禁用则是真实失败面）。
-	certJobDanglingProviders := 0
-	if _, certJobsCarried := backup.Tables["cert_jobs"]; !certJobsCarried &&
-		(sectionTables["ca_providers"] || sectionTables["certificate_configs"]) {
-		if rows, qerr := tx.QueryContext(ctx, `SELECT COALESCE(ca_provider_id,0) FROM cert_jobs WHERE COALESCE(ca_provider_id,0) <> 0`); qerr == nil {
-			for rows.Next() {
-				var providerID int
-				if rows.Scan(&providerID) != nil {
-					continue
-				}
-				if !acmeRefResolvablePostImport(backup.Tables, "ca_providers", providerID) {
-					certJobDanglingProviders++
-				}
-			}
-			rows.Close()
-		}
+	// （真实失败面），也可能整行缺失（caqueue 回落首个启用提供商并自愈）。
+	// 两种语义必须分开计数与措辞——混为「续签将失败」对缺失子集是过度断言。
+	// 只告警不阻断（「缺席=保留本地」语义不变）。
+	certJobProviderDisabled, certJobProviderMissing, certJobProviderCountErr := certJobProviderDanglingCounts(ctx, tx, backup.Tables, sectionTables)
+	if certJobProviderCountErr != nil {
+		// 计数失败不阻断导入（纯可观测性）：留痕并在响应中显式说明未完成统计。
+		services.Logf("warn", "配置导入：证书任务 CA 提供商悬挂统计失败: %v", certJobProviderCountErr)
 	}
-	if certJobDanglingProviders > 0 {
-		recordAudit(c, action+"警告", "配置备份", fmt.Sprintf(action+"后 %d 个证书任务的 CA 提供商已禁用或不存在——续签将失败（任务转 failed 终态），请补齐 CA 提供商或在证书页手工重试", certJobDanglingProviders))
+	if certJobProviderDisabled > 0 {
+		recordAudit(c, action+"警告", "配置备份", fmt.Sprintf(action+"后 %d 个证书任务的 CA 提供商已禁用——续签将失败（任务转 failed 终态），请补齐 CA 提供商或在证书页手工重试", certJobProviderDisabled))
+	}
+	if certJobProviderMissing > 0 {
+		recordAudit(c, action+"警告", "配置备份", fmt.Sprintf(action+"后 %d 个证书任务引用的 CA 提供商已不存在——续签时将回落首个启用提供商（自愈），如需保持原提供商请补齐", certJobProviderMissing))
 	}
 	// 初检读取 live 的三项合并校验在锁内重跑（任何写之前）。
 	if err := revalidateImportLiveDependencies(ctx, tx, &backup, sectionTables); err != nil {
@@ -5695,21 +5836,18 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	// 备份 users 表缺席=用户数据未替换,同样不吊销。
 	if sectionTables["users"] && len(backup.Tables["users"]) > 0 {
 		if _, err := tx.ExecContext(ctx, "UPDATE users SET password_version=COALESCE(password_version,0)+1"); err != nil {
-			err = session.abort(err)
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "吊销现有登录会话失败，已回滚: " + err.Error()})
+			failImportTx(c, session, action, "吊销现有登录会话失败", err, http.StatusInternalServerError, "吊销现有登录会话失败")
 			return
 		}
 		revokedSessions = true
 	}
 	var enabledAdmins int
 	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM users WHERE role='admin' AND is_enabled=1").Scan(&enabledAdmins); err != nil {
-		err = session.abort(err)
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "确认管理员账号失败，已回滚: " + err.Error()})
+		failImportTx(c, session, action, "确认管理员账号失败", err, http.StatusInternalServerError, "确认管理员账号失败")
 		return
 	}
 	if enabledAdmins == 0 {
-		err = session.abort(errors.New("导入后必须至少保留一个已启用的管理员账号"))
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
+		failImportTx(c, session, action, "导入后必须至少保留一个已启用的管理员账号", errors.New("导入后必须至少保留一个已启用的管理员账号"), http.StatusBadRequest, "")
 		return
 	}
 	var importUserID sql.NullInt64
@@ -5754,6 +5892,15 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "清理失效证书任务失败，已回滚: " + err.Error()})
 			return
 		}
+		// 到期口径收敛：有效材料但 expires_at 缺失的导入行按 PEM 派生回填
+		// （已有列值优先，不改写）。不回填会让 /certificates/jobs 的派生值
+		// 与聚合端（节点健康 certs_expiring_30d、证书页）的列值口径分叉。
+		if _, err := backfillCertJobExpiryFromPEM(ctx, tx); err != nil {
+			err = session.abort(err)
+			recordAudit(c, action+"失败", "配置备份", "回填证书任务到期时间失败: "+err.Error())
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "回填证书任务到期时间失败，已回滚: " + err.Error()})
+			return
+		}
 	}
 	// 冲突矩阵置禁用的规则与 DisableRule 端点
 	// 同口径暂停证书任务——否则导入提交后队列恢复（RequeueNonTerminalCertJobs）
@@ -5781,8 +5928,7 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 		if _, hasOIDC := backup.Config["oidc_config"]; !hasOIDC {
 			var liveOIDC string
 			if err := tx.QueryRowContext(ctx, "SELECT COALESCE(oidc_config,'') FROM global_config WHERE id=1").Scan(&liveOIDC); err != nil {
-				err = session.abort(err)
-				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取 OIDC 配置失败: " + err.Error()})
+				failImportTx(c, session, action, "读取 OIDC 配置失败", err, http.StatusInternalServerError, "读取 OIDC 配置失败")
 				return
 			}
 			if liveOIDC != "" {
@@ -5794,8 +5940,7 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	if backup.Config != nil {
 		valid, err := tableColumns(ctx, db.DB, "global_config")
 		if err != nil {
-			err = session.abort(err)
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取配置结构失败: " + err.Error()})
+			failImportTx(c, session, action, "读取配置结构失败", err, http.StatusInternalServerError, "读取配置结构失败")
 			return
 		}
 		sets := []string{}
@@ -5834,8 +5979,9 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 		failureWarnings := append([]string{}, skipWarnings...)
 		failureWarnings = append(failureWarnings, wafApply.Warnings...)
 		// 文件面提示按 abort 的实际回退结论生成：已回退=明示一致；
-		// 回退失败=显性告知可能分裂（不得沿用固定文案谎报）。
-		if warning := lbbakWafRollbackWarning(wafApply.FilesLanded, session.wafRestoreAttempted, session.wafRestoreErr); warning != "" {
+		// 回退失败=显性告知可能分裂（不得沿用固定文案谎报）；提交结果不确定=
+		// 文件保持导入后状态并给人工核对指引（不得断言一致/分裂）。
+		if warning := lbbakWafRollbackWarning(wafApply.FilesLanded, session.wafRestoreAttempted, session.wafRestoreErr, session.commitIndeterminate); warning != "" {
 			failureWarnings = append(failureWarnings, warning)
 		}
 		failureWarnings = append(failureWarnings, session.wafRestoreWarnings...)
@@ -6088,6 +6234,11 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 		// 证书链/域名警告随成功审计留痕(不阻断)。
 		auditParts = append(auditParts, "证书警告："+strings.Join(importCertWarnings, "；"))
 	}
+	if len(certJobProviderWarnings) > 0 {
+		// 证书任务 CA 提供商归一（ca_provider_id 就地写回 0）会改变无人值守
+		// 签发路径，必须与响应 warnings 双通道留痕（同 custom_only 归一）。
+		auditParts = append(auditParts, "证书任务提供商归一："+strings.Join(certJobProviderWarnings, "；"))
+	}
 	if len(disabledConflicts) > 0 {
 		auditParts = append(auditParts, "冲突置为禁用："+formatDisabledRuleConflicts(disabledConflicts))
 	}
@@ -6141,8 +6292,14 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	if customOnlyNormalized > 0 {
 		responseWarnings = append(append([]string{}, responseWarnings...), fmt.Sprintf("%d 个 WAF 模式为 off 且挂启用自定义规则的策略已按旧语义归一为 custom_only（自定义规则开始生效）", customOnlyNormalized))
 	}
-	if certJobDanglingProviders > 0 {
-		responseWarnings = append(append([]string{}, responseWarnings...), fmt.Sprintf("%d 个证书任务的 CA 提供商已禁用或不存在——续签将失败（任务转 failed 终态），请补齐 CA 提供商或在证书页手工重试", certJobDanglingProviders))
+	if certJobProviderDisabled > 0 {
+		responseWarnings = append(append([]string{}, responseWarnings...), fmt.Sprintf("%d 个证书任务的 CA 提供商已禁用——续签将失败（任务转 failed 终态），请补齐 CA 提供商或在证书页手工重试", certJobProviderDisabled))
+	}
+	if certJobProviderMissing > 0 {
+		responseWarnings = append(append([]string{}, responseWarnings...), fmt.Sprintf("%d 个证书任务引用的 CA 提供商已不存在——续签时将回落首个启用提供商（自愈），如需保持原提供商请补齐", certJobProviderMissing))
+	}
+	if certJobProviderCountErr != nil {
+		responseWarnings = append(append([]string{}, responseWarnings...), "证书任务 CA 提供商悬挂统计未完成（读取失败，导入本身不受影响）："+certJobProviderCountErr.Error())
 	}
 	if droppedTCPBindings > 0 {
 		responseWarnings = append(append([]string{}, responseWarnings...), fmt.Sprintf("已解除 %d 条 TCP 规则的安全策略绑定（TCP 不参与策略渲染）", droppedTCPBindings))
@@ -6176,7 +6333,12 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 		responseWarnings = append(append([]string{}, responseWarnings...), "备份不含当前操作账户——系统数据已替换，请使用备份内的管理员账户登录")
 	}
 	if oidcConverged {
-		responseWarnings = append(append([]string{}, responseWarnings...), "备份未携带 OIDC 配置——现有 OIDC 配置已随备份收敛清空（用户数据按备份替换，避免「OIDC 启用但零用户」不一致状态）")
+		// 双通道：收敛清空会让启用中的 OIDC 登出（用户按备份替换），
+		// 与同函数 custom_only 归一一致——响应 warnings 之外必须落操作审计，
+		// 否则事后只能看到「OIDC 忽然关闭」而无从追溯来源。
+		detail := "备份未携带 OIDC 配置——现有 OIDC 配置已随备份收敛清空（用户数据按备份替换，避免「OIDC 启用但零用户」不一致状态）"
+		responseWarnings = append(append([]string{}, responseWarnings...), detail)
+		recordAudit(c, action+"警告", "配置备份", detail)
 	}
 	if revokedSessions && !operatorReplaced {
 		responseWarnings = append(append([]string{}, responseWarnings...), "系统数据已"+action+"：全部登录会话已吊销，请重新登录")
@@ -6274,7 +6436,11 @@ func collectImportCertificates(rows []map[string]any) ([]importCertificate, []st
 		if tlsSource := backupString(row["tls_source"]); tlsSource != "" && tlsSource != "manual" {
 			continue
 		}
-		if enabled, ok := row["enable_tls"]; ok && enabled != nil && !backupBooleanEnabled(enabled) {
+		// enable_tls 键缺失按 schema 默认 FALSE（db.go lb_rules DDL
+		// BOOLEAN DEFAULT FALSE；restoreTable 对缺键行落 0）——此前缺失即视为
+		// 启用，会把 DB 侧实际 enable_tls=0（渲染零消费）的行私钥物化到
+		// /app/certs 长期驻留。与 validateV2BackupTLSShapeSoft 的判定同口径。
+		if !backupBooleanEnabled(row["enable_tls"]) {
 			continue
 		}
 		certPEM, _ := row["tls_cert"].(string)

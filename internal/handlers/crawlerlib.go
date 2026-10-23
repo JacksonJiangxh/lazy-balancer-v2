@@ -19,8 +19,7 @@ import (
 // （SQL 文本/表列名等内部结构）只进运行日志——crawler-lib 端点属 business
 // 组，任意登录用户可读，与认证域「固定文案 + 服务端留痕」同口径。
 func crawlerLibInternalError(message string, err error) models.APIResponse {
-	services.Logf("error", "爬虫地址库: %s: %v", message, err)
-	return models.APIResponse{Code: http.StatusInternalServerError, Message: message}
+	return internalError("爬虫地址库", message, err)
 }
 
 // crawlerSourceDTO 爬虫源行（与 threatSourceDTO 同构字段，便于规则库卡片复用渲染）。

@@ -7,8 +7,10 @@
 // 契约要点（与 internal/models/security.go UpdateSecurityPolicyRequest 对齐）：
 //  - 显式 policy_type 提交后服务端把阶段外字段归一为零值；mixed 不显式提交
 //  （兼容组仅存量可编辑，省略=后端按内容推断）。
-//  - ip_acl_list_refs / ip_whitelist_refs 随开关释放（'[]'）——开关关闭时引用列表
-//    的真实占用必须释放，否则列表页引用数虚高且阻塞删除；内联名单保留不丢数据。
+//  - ip_acl_list_refs / ip_whitelist_refs 与内联名单同口径保留（开关关闭不释放）
+//    ——关闭开关只影响生效判定，再打开不丢配置；唯一释放路径=用户在引用选择器
+//    里显式清空。引用保留期间该名单在列表页仍计为被引用（删除守卫按启用的策略
+//    计），用户可先解除引用再删除。
 //  - geoip_enabled 是编辑器本地派生开关，后端无此字段，不下发；geoip_mode 关闭时
 //    提交 'off'（后端零发射）。
 //  - 空名单不清空（关闭开关再打开不丢配置）。
@@ -95,9 +97,11 @@ export const buildPolicyPayload = (input: PolicyPayloadInput): PolicyPayload => 
     ip_whitelist: JSON.stringify(input.ipWhitelist),
     // 阶段 0 信任名单策略：名单非空即生效（恒启用）；其余类型按开关三态语义
     ip_whitelist_enabled: trustEnabled,
-    // 开关关闭即释放引用（共享列表的占用可见性；内联名单按三态语义保留）
-    ip_acl_list_refs: input.ipAclEnabled ? JSON.stringify(input.ipAclListRefs) : '[]',
-    ip_whitelist_refs: trustEnabled ? JSON.stringify(input.ipWhitelistRefs) : '[]',
+    // 引用列表与内联名单同口径保留：开关关闭只影响生效判定（后端按启用位决定
+    // 是否消费），不得静默释放已配置的引用——否则「关掉开关再打开」丢配置。
+    // 唯一释放路径=用户在引用选择器里显式清空（此时入参已是空数组）。
+    ip_acl_list_refs: JSON.stringify(input.ipAclListRefs),
+    ip_whitelist_refs: JSON.stringify(input.ipWhitelistRefs),
     rate_limit_enabled: input.rateLimitEnabled,
     rate_limit_rps: input.rateLimitRps,
     rate_limit_burst: input.rateLimitBurst,

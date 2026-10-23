@@ -71,6 +71,69 @@ func TestBuildWafFileRef_cheapSignatureShortCircuitsFullBuild(t *testing.T) {
 	}
 }
 
+// 等长 + 同 mtime 的原地改写不改廉价签名（rsync -t / install -p / 备份还原
+// 保留时间戳）：缓存必须有 TTL 兜底，否则旧 ref 与旧 bundle 永久命中
+// （主端发旧字节给从端=静默分叉，或用旧哈希标注新字节=从端整包拒绝且无
+// 自愈路径）。
+func TestBuildWafFileRef_ttlRecoversFromSameSizeSameMtimeRewrite(t *testing.T) {
+	oldCrs, oldXdb, oldWaf := crsLiveDir, ip2regionLivePath, wafDir
+	t.Cleanup(func() { crsLiveDir, ip2regionLivePath, wafDir = oldCrs, oldXdb, oldWaf })
+	oldTTL := wafFileRefCacheTTL
+	wafFileRefCacheTTL = time.Minute
+	t.Cleanup(func() { wafFileRefCacheTTL = oldTTL })
+
+	dir := t.TempDir()
+	crsLiveDir = filepath.Join(dir, "crs")
+	ip2regionLivePath = filepath.Join(dir, "ip2region.xdb")
+	wafDir = filepath.Join(dir, "waf")
+	rulesDir := filepath.Join(crsLiveDir, "rules")
+	for _, d := range []string{rulesDir, wafDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rulePath := filepath.Join(rulesDir, "REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf")
+	before := []byte("SecRule ARGS \"@rx foo\" \"id:1,deny\"\n")
+	after := []byte("SecRule ARGS \"@rx bar\" \"id:1,deny\"\n")
+	if len(before) != len(after) {
+		t.Fatal("fixture must keep the same content length")
+	}
+	if err := os.WriteFile(rulePath, before, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(rulePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wafFileRefCache.mu.Lock()
+	wafFileRefCache.valid = false
+	wafFileRefCache.validatedAt = time.Time{}
+	wafFileRefCache.mu.Unlock()
+
+	first := BuildWafFileRef()
+	if first == nil || first.CRSSha256 == "" {
+		t.Fatalf("first ref = %+v, want CRS hash", first)
+	}
+	// 同尺寸改写后还原 mtime：签名不变，缓存期内仍返回旧 ref（已知窗口）
+	if err := os.WriteFile(rulePath, after, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(rulePath, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if cached := BuildWafFileRef(); cached == nil || cached.CRSSha256 != first.CRSSha256 {
+		t.Fatalf("cache-hit ref = %+v, want old hash %q within TTL", cached, first.CRSSha256)
+	}
+	// TTL 到期后必须全量重读，产出新哈希（自愈）
+	wafFileRefCache.mu.Lock()
+	wafFileRefCache.validatedAt = time.Now().Add(-2 * wafFileRefCacheTTL)
+	wafFileRefCache.mu.Unlock()
+	refreshed := BuildWafFileRef()
+	if refreshed == nil || refreshed.CRSSha256 == first.CRSSha256 {
+		t.Fatalf("ref after TTL expiry = %+v, want a different CRS hash", refreshed)
+	}
+}
+
 func TestWafRefStatSignature_tracksCRSVersionWithoutRules(t *testing.T) {
 	oldCrs, oldXdb, oldWaf := crsLiveDir, ip2regionLivePath, wafDir
 	t.Cleanup(func() { crsLiveDir, ip2regionLivePath, wafDir = oldCrs, oldXdb, oldWaf })

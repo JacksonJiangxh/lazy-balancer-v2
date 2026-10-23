@@ -1037,7 +1037,7 @@ func TestMigrateCertJobsStatusConstraint_rebuilds_constraint_with_deprecated_sta
 	// 改写用户可见数据必须留痕（系统审计聚合一行）。
 	audited := false
 	for _, entry := range drainSystemAuditBuffer() {
-		if strings.Contains(entry.detail, "枚举外状态归一到 failed") {
+		if strings.Contains(entry.detail, "枚举外或 NULL 状态归一到 failed") {
 			audited = true
 		}
 	}
@@ -1140,11 +1140,21 @@ func TestMigrateCertJobsStatusConstraint_backfills_null_status_and_is_idempotent
 	if err := database.QueryRow("SELECT status FROM cert_jobs WHERE rule_id='lb_null'").Scan(&status); err != nil {
 		t.Fatalf("read migrated certificate job status: %v", err)
 	}
-	if notNull != 1 || status != "queued" {
-		t.Fatalf("cert_jobs.status notnull=%d value=%q, want 1/queued", notNull, status)
+	if notNull != 1 || status != "failed" {
+		t.Fatalf("cert_jobs.status notnull=%d value=%q, want 1/failed（NULL 与枚举外同保守度）", notNull, status)
 	}
 	if _, err := database.Exec("UPDATE cert_jobs SET status=NULL WHERE rule_id='lb_null'"); err == nil {
 		t.Fatal("cert_jobs.status accepted NULL after migration")
+	}
+	// NULL 改写同样必须留痕（与枚举外值同一条系统审计）。
+	audited := false
+	for _, entry := range drainSystemAuditBuffer() {
+		if strings.Contains(entry.detail, "枚举外或 NULL 状态归一到 failed") {
+			audited = true
+		}
+	}
+	if !audited {
+		t.Fatal("NULL 状态改写缺少系统审计记录")
 	}
 }
 

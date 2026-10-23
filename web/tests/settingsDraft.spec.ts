@@ -1,0 +1,115 @@
+// 设置页暂存态生存周期：基础设置卡在页内切换设置分页时会被卸载
+// （Settings.vue 按 activeTab 挂载 BasicSettings+CaddyGlobalSettings），组件内
+// ref 的暂存内容随之复位——与同卡直绑 settings（父级共享模型）的字段行为不
+// 一致。需要「提交前只存在于本地」的状态提升到 useSettingsDraft 模块单例：
+// 页内切分页不丢，离开系统设置（Settings.vue 卸载）才复位。可落父级模型的
+// 字段（大屏视觉模式/流量采样/保留与行数编辑值）改为写回 settings。
+//
+// 运行：cd web && npm test
+
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+
+import { resetSettingsDraft, useSettingsDraft } from '../src/composables/useSettingsDraft.ts'
+import { securityEventsWritePayload } from '../src/utils/configValues.ts'
+import { section, source } from './_helpers.ts'
+
+const certInfo = { domain: 'example.com', issuer: 'fixture', not_after: '2027-01-01', days_left: 365 }
+
+test('暂存态跨基础设置卡挂载保留（切分页不丢），离开设置页才复位', () => {
+  resetSettingsDraft()
+  const certFile = new File(['cert'], 'cert.pem')
+  const keyFile = new File(['key'], 'key.pem')
+  const first = useSettingsDraft()
+  first.githubTokenInput.value = 'ghp_fixture'
+  first.githubTokenClearPending.value = true
+  first.securityEventsRetentionDirty.value = true
+  first.securityEventsRowCapDirty.value = true
+  first.adminTls.value = { enabled: true, mode: 'upload' }
+  first.adminTlsSaved.value = { enabled: false, mode: 'selfsigned' }
+  first.adminTlsCertError.value = 'bad pem'
+  first.stagedAdminTlsCert.value = { certFile, keyFile, certInfo }
+
+  // 模拟切到别的设置分页再切回：BasicSettings 重新 setup，取到同一份草稿
+  const second = useSettingsDraft()
+  assert.equal(second.githubTokenInput.value, 'ghp_fixture', '令牌输入不得在切页后丢失')
+  assert.equal(second.githubTokenClearPending.value, true, '清除标记同样不得丢失')
+  assert.equal(second.securityEventsRetentionDirty.value, true)
+  assert.equal(second.securityEventsRowCapDirty.value, true)
+  assert.deepEqual(second.adminTls.value, { enabled: true, mode: 'upload' }, '暂存的强制加密开关不得回退')
+  assert.equal(second.adminTlsSaved.value.enabled, false)
+  assert.equal(second.adminTlsCertError.value, 'bad pem')
+  assert.equal(second.stagedAdminTlsCert.value?.certFile, certFile, '已暂存证书材料必须仍是同一对象')
+
+  // 离开系统设置（Settings.vue 卸载）→ 复位
+  resetSettingsDraft()
+  const third = useSettingsDraft()
+  assert.equal(third.githubTokenInput.value, '')
+  assert.equal(third.githubTokenClearPending.value, false)
+  assert.equal(third.securityEventsRetentionDirty.value, false)
+  assert.equal(third.securityEventsRowCapDirty.value, false)
+  assert.deepEqual(third.adminTls.value, { enabled: false, mode: 'selfsigned' })
+  assert.equal(third.adminTlsCertError.value, '')
+  assert.equal(third.stagedAdminTlsCert.value, null)
+})
+
+test('安全事件编辑：编辑值写回共享模型，dirty 跨挂载保留，保存载荷携带编辑值', () => {
+  resetSettingsDraft()
+  // 父级共享模型（Settings.vue 持有，切分页不卸载）
+  const settings = { security_events_retention_days: 90, security_events_row_cap: 1_000_000 }
+  // BasicSettings 的 v-model 写回共享模型并置 dirty（computed setter 同形）
+  settings.security_events_retention_days = 120
+  useSettingsDraft().securityEventsRetentionDirty.value = true
+
+  // 切页重挂：值在共享模型、dirty 在草稿，两者都不随组件卸载消失
+  const remounted = useSettingsDraft()
+  const payload = securityEventsWritePayload({
+    retentionDays: settings.security_events_retention_days,
+    retentionDirty: remounted.securityEventsRetentionDirty.value,
+    rowCap: settings.security_events_row_cap,
+    rowCapDirty: remounted.securityEventsRowCapDirty.value,
+  })
+  assert.deepEqual(payload, { security_events_retention_days: 120 }, '切页后保存必须写入编辑值而非旧值')
+  resetSettingsDraft()
+})
+
+test('BasicSettings 接线：暂存态取草稿单例，可落父级模型的字段写回 settings', () => {
+  const page = source('src/views/settings/BasicSettings.vue')
+  const draft = source('src/composables/useSettingsDraft.ts')
+  assert.match(draft, /const githubTokenInput = ref\(''\)/, '令牌输入必须由草稿持有')
+  assert.match(draft, /const adminTlsCertError = ref\(''\)/, '证书损坏原因必须由草稿持有')
+  assert.match(draft, /const stagedAdminTlsCert = ref<StagedAdminTlsCert \| null>\(null\)/, '证书暂存必须由草稿持有')
+  assert.match(page, /\} = useSettingsDraft\(\)/, '设置卡必须消费草稿单例')
+  assert.doesNotMatch(page, /const githubTokenInput = ref\(''\)/, '不得在组件内重建令牌暂存')
+  assert.doesNotMatch(page, /const stagedAdminTlsCert = ref/, '不得在组件内重建证书暂存')
+  assert.doesNotMatch(page, /const adminTls = ref/, '不得在组件内重建管理面板 HTTPS 暂存')
+
+  // 可直绑父级模型的字段：写回 settings（卸载即复位的问题消失）
+  const mode = section(page, 'const threatScreenMode = computed', '\n})')
+  assert.match(mode, /settings\.value\.threat_screen_mode = value/)
+  const sample = section(page, 'const trafficSampleN = computed', '\n})')
+  assert.match(sample, /settings\.value\.threat_traffic_sample_n = value/)
+  const retention = section(page, 'const seRetentionDays = computed', '\n})')
+  assert.match(retention, /settings\.value\.security_events_retention_days = value/)
+  assert.match(retention, /securityEventsRetentionDirty\.value = true/, '编辑必须置 dirty（保存载荷才携带该键）')
+  const rowCap = section(page, 'const seRowCap = computed', '\n})')
+  assert.match(rowCap, /settings\.value\.security_events_row_cap = value/)
+  assert.match(rowCap, /securityEventsRowCapDirty\.value = true/)
+  assert.doesNotMatch(
+    page,
+    /watch\(\(\) => \[settings\.value\.security_events_retention_days/,
+    '「settings → 本地」单向同步 watcher 必须退役',
+  )
+})
+
+test('Settings.vue 仅在离开设置页时复位草稿', () => {
+  const page = source('src/views/Settings.vue')
+  assert.match(page, /import \{ resetSettingsDraft \} from '@\/composables\/useSettingsDraft'/)
+  const unmounted = section(page, 'onUnmounted(', '</script>')
+  assert.match(unmounted, /resetSettingsDraft\(\)/)
+  assert.doesNotMatch(
+    unmounted,
+    /syncActiveTabFromPage|activeTab/,
+    '页内切分页不得复位草稿（否则暂存内容仍会丢）',
+  )
+})

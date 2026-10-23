@@ -339,7 +339,7 @@ func TestClusterVersionTriggers_bump_for_snapshot_insert_update_delete(t *testin
 			if _, err := database.Exec("UPDATE global_config SET is_master=1, cluster_version=100 WHERE id=1"); err != nil {
 				t.Fatalf("seed cluster version: %v", err)
 			}
-			if err := installClusterVersionTriggers(database); err != nil {
+			if err := InstallClusterVersionTriggers(database); err != nil {
 				t.Fatalf("install triggers: %v", err)
 			}
 			if _, err := database.Exec("UPDATE global_config SET cluster_version=0 WHERE id=1"); err != nil {
@@ -409,7 +409,7 @@ func TestClusterVersionTriggers_bump_for_security_tables(t *testing.T) {
 			if _, err := database.Exec("UPDATE global_config SET is_master=1, cluster_version=100 WHERE id=1"); err != nil {
 				t.Fatalf("seed cluster version: %v", err)
 			}
-			if err := installClusterVersionTriggers(database); err != nil {
+			if err := InstallClusterVersionTriggers(database); err != nil {
 				t.Fatalf("install triggers: %v", err)
 			}
 			for _, operation := range []string{"insert", "update", "delete"} {
@@ -453,7 +453,7 @@ func TestClusterVersionTriggers_bump_for_security_tables(t *testing.T) {
 func TestClusterVersionTriggers_coverEverySecurityPolicySchemaColumn(t *testing.T) {
 	// Given：真实 schema 与触发器；逐列 UPDATE OF 行为是比手写清单更可靠的契约。
 	database := newClusterVersionTestDB(t)
-	if err := installClusterVersionTriggers(database); err != nil {
+	if err := InstallClusterVersionTriggers(database); err != nil {
 		t.Fatalf("install triggers: %v", err)
 	}
 	if _, err := database.Exec(`INSERT INTO security_policies (id,name) VALUES (7,'trigger parity');
@@ -496,7 +496,7 @@ func TestClusterVersionTriggers_coverEverySecurityPolicySchemaColumn(t *testing.
 func TestClusterVersionTriggers_bumpForCrawlerExemptionColumns(t *testing.T) {
 	// Given：真实触发器与预热快照缓存。
 	database := newClusterVersionTestDB(t)
-	if err := installClusterVersionTriggers(database); err != nil {
+	if err := InstallClusterVersionTriggers(database); err != nil {
 		t.Fatalf("install triggers: %v", err)
 	}
 	if _, err := database.Exec(`INSERT INTO security_policies (id,name,mode) VALUES (7,'crawler trigger','blocking');
@@ -549,7 +549,7 @@ func TestClusterVersionTriggers_bumpForCrawlerExemptionColumns(t *testing.T) {
 func TestClusterVersionTriggers_bumpForIPListSystemColumn(t *testing.T) {
 	// Given
 	database := newClusterVersionTestDB(t)
-	if err := installClusterVersionTriggers(database); err != nil {
+	if err := InstallClusterVersionTriggers(database); err != nil {
 		t.Fatalf("install triggers: %v", err)
 	}
 	if _, err := database.Exec(`INSERT INTO security_ip_lists (id,name,entries,system) VALUES (77,'system toggle','[]',0);
@@ -588,7 +588,7 @@ func TestClusterVersionTriggers_doNotBumpForAPIKeyLastUsed(t *testing.T) {
 		BEGIN UPDATE global_config SET cluster_version=COALESCE(cluster_version,0)+1 WHERE id=1; END`); err != nil {
 		t.Fatalf("install legacy trigger: %v", err)
 	}
-	if err := installClusterVersionTriggers(database); err != nil {
+	if err := InstallClusterVersionTriggers(database); err != nil {
 		t.Fatalf("replace triggers: %v", err)
 	}
 	if _, err := database.Exec("UPDATE global_config SET cluster_version=100 WHERE id=1"); err != nil {
@@ -614,7 +614,7 @@ func TestClusterVersionTriggersBumpForAPIKeyRestrictions(t *testing.T) {
 	if _, err := database.Exec(`INSERT INTO users (id,username,password_hash) VALUES (1,'owner','hash'); INSERT INTO api_keys (id,name,key_hash,key_prefix,created_by) VALUES (1,'key','hash','prefix',1)`); err != nil {
 		t.Fatal(err)
 	}
-	if err := installClusterVersionTriggers(database); err != nil {
+	if err := InstallClusterVersionTriggers(database); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := database.Exec("UPDATE global_config SET is_master=1,cluster_version=0 WHERE id=1"); err != nil {
@@ -633,7 +633,7 @@ func TestClusterVersionTriggers_bumpForUserPasswordVersion(t *testing.T) {
 	if _, err := database.Exec(`INSERT INTO users (id,username,password_hash,password_version) VALUES (1,'alice','hash',0)`); err != nil {
 		t.Fatalf("seed user: %v", err)
 	}
-	if err := installClusterVersionTriggers(database); err != nil {
+	if err := InstallClusterVersionTriggers(database); err != nil {
 		t.Fatalf("install triggers: %v", err)
 	}
 	if _, err := database.Exec("UPDATE global_config SET is_master=1,cluster_version=0 WHERE id=1"); err != nil {
@@ -706,7 +706,7 @@ func TestClusterVersionTriggers_doNotBumpForCertificateProgress(t *testing.T) {
 	if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain) VALUES ('progress_rule','example.com')`); err != nil {
 		t.Fatalf("seed certificate job: %v", err)
 	}
-	if err := installClusterVersionTriggers(database); err != nil {
+	if err := InstallClusterVersionTriggers(database); err != nil {
 		t.Fatalf("install triggers: %v", err)
 	}
 	if _, err := database.Exec("UPDATE global_config SET cluster_version=100 WHERE id=1"); err != nil {
@@ -740,7 +740,7 @@ func TestClusterVersionTriggers_refreshCachedSnapshotWhenCertificateEntersAndLea
 	if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,cert_pem,key_pem,expires_at) VALUES ('status_rule','example.com','downloaded',?,?,datetime('now','+60 days'))`, certPEM, keyPEM); err != nil {
 		t.Fatalf("seed downloaded certificate: %v", err)
 	}
-	if err := installClusterVersionTriggers(database); err != nil {
+	if err := InstallClusterVersionTriggers(database); err != nil {
 		t.Fatalf("install triggers: %v", err)
 	}
 	cluster := services.NewClusterService(database, "")
@@ -795,7 +795,7 @@ func TestClusterVersionTriggers_bumpForTimestampOnlyUpdates(t *testing.T) {
 		if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,listen_port) VALUES ('stamp_rule','rule','http',8080)`); err != nil {
 			t.Fatalf("seed rule: %v", err)
 		}
-		if err := installClusterVersionTriggers(database); err != nil {
+		if err := InstallClusterVersionTriggers(database); err != nil {
 			t.Fatalf("install triggers: %v", err)
 		}
 		if _, err := database.Exec("UPDATE global_config SET is_master=1, cluster_version=0 WHERE id=1"); err != nil {
@@ -816,7 +816,7 @@ func TestClusterVersionTriggers_bumpForTimestampOnlyUpdates(t *testing.T) {
 		if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,cert_pem,key_pem,expires_at) VALUES ('stamp_cert','example.com','issued',?,?,datetime('now','+30 days'))`, certPEM, keyPEM); err != nil {
 			t.Fatalf("seed issued job: %v", err)
 		}
-		if err := installClusterVersionTriggers(database); err != nil {
+		if err := InstallClusterVersionTriggers(database); err != nil {
 			t.Fatalf("install triggers: %v", err)
 		}
 		if _, err := database.Exec("UPDATE global_config SET is_master=1, cluster_version=0 WHERE id=1"); err != nil {
@@ -838,7 +838,7 @@ func TestClusterVersionTriggers_bumpForTimestampOnlyUpdates(t *testing.T) {
 		if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status) VALUES ('stamp_progress','example.com','processing')`); err != nil {
 			t.Fatalf("seed progress job: %v", err)
 		}
-		if err := installClusterVersionTriggers(database); err != nil {
+		if err := InstallClusterVersionTriggers(database); err != nil {
 			t.Fatalf("install triggers: %v", err)
 		}
 		if _, err := database.Exec("UPDATE global_config SET is_master=1, cluster_version=0 WHERE id=1"); err != nil {
@@ -869,7 +869,7 @@ func clusterVersionCertificatePair(t *testing.T) (string, string) {
 func TestClusterVersionTriggers_doNotBumpForGlobalSyncMetadata(t *testing.T) {
 	// Given
 	database := newClusterVersionTestDB(t)
-	if err := installClusterVersionTriggers(database); err != nil {
+	if err := InstallClusterVersionTriggers(database); err != nil {
 		t.Fatalf("install triggers: %v", err)
 	}
 	if _, err := database.Exec("UPDATE global_config SET cluster_version=100 WHERE id=1"); err != nil {
@@ -919,7 +919,7 @@ func clusterVersion(t *testing.T, database *sql.DB) int {
 // 各从节点强制 Caddy 重载。
 func TestClusterVersionTrigger_lastCheckedExcluded(t *testing.T) {
 	database := newClusterVersionTestDB(t)
-	if err := installClusterVersionTriggers(database); err != nil {
+	if err := InstallClusterVersionTriggers(database); err != nil {
 		t.Fatal(err)
 	}
 	// 种子行 + 版本重置
@@ -963,7 +963,7 @@ func TestClusterVersionTrigger_lastCheckedExcluded(t *testing.T) {
 // auto_update/排程）值真实变化照常 bump。
 func TestClusterVersionTrigger_runtimeBookkeepingExcluded(t *testing.T) {
 	database := newClusterVersionTestDB(t)
-	if err := installClusterVersionTriggers(database); err != nil {
+	if err := InstallClusterVersionTriggers(database); err != nil {
 		t.Fatal(err)
 	}
 	for _, seed := range []string{
@@ -1017,7 +1017,7 @@ func TestClusterVersionTrigger_runtimeBookkeepingExcluded(t *testing.T) {
 // 排程列，钉排程列自身的 OF 成员资格，而非搭车 next_update 的偶然 bump。）
 func TestClusterVersionTrigger_ruleLibScheduleBumps(t *testing.T) {
 	database := newClusterVersionTestDB(t)
-	if err := installClusterVersionTriggers(database); err != nil {
+	if err := InstallClusterVersionTriggers(database); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := database.Exec(`INSERT OR IGNORE INTO security_crs_version (id, version) VALUES (1, '4.28.0')`); err != nil {
@@ -1054,7 +1054,7 @@ func TestClusterVersionTrigger_ruleLibScheduleBumps(t *testing.T) {
 // 使快照缓存失效、变更流向从节点。
 func TestClusterVersionTrigger_brandingJSONBumps(t *testing.T) {
 	database := newClusterVersionTestDB(t)
-	if err := installClusterVersionTriggers(database); err != nil {
+	if err := InstallClusterVersionTriggers(database); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := database.Exec("UPDATE global_config SET is_master=1,cluster_version=0 WHERE id=1"); err != nil {
@@ -1084,7 +1084,7 @@ func TestClusterVersionTrigger_brandingJSONBumps(t *testing.T) {
 // 过渡仍须 bump。
 func TestClusterVersionTrigger_loginHotPathNoBump(t *testing.T) {
 	database := newClusterVersionTestDB(t)
-	if err := installClusterVersionTriggers(database); err != nil {
+	if err := InstallClusterVersionTriggers(database); err != nil {
 		t.Fatal(err)
 	}
 	// 每条种子的 error 必须显式检查：schema 漂移（列改名/删表）时静默失败
@@ -1135,7 +1135,7 @@ func TestClusterVersionTrigger_loginHotPathNoBump(t *testing.T) {
 // 引发全集群快照重放。
 func TestClusterVersionTrigger_autoBackupSettingsBumpLastRunExcluded(t *testing.T) {
 	database := newClusterVersionTestDB(t)
-	if err := installClusterVersionTriggers(database); err != nil {
+	if err := InstallClusterVersionTriggers(database); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := database.Exec("UPDATE global_config SET is_master=1,cluster_version=0 WHERE id=1"); err != nil {
@@ -1183,7 +1183,7 @@ func TestClusterVersionTrigger_autoBackupSettingsBumpLastRunExcluded(t *testing.
 // 永不传播到从节点。
 func TestClusterVersionTrigger_bumpsOnStagePageColumns(t *testing.T) {
 	database := newClusterVersionTestDB(t)
-	if err := installClusterVersionTriggers(database); err != nil {
+	if err := InstallClusterVersionTriggers(database); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,listen_port,enabled) VALUES ('lb_stage_of','stage-of','http',8080,1)`); err != nil {
@@ -1234,7 +1234,7 @@ func TestClusterVersionTrigger_bumpsOnStagePageColumns(t *testing.T) {
 // 信任语义变更经 304 门滞留主节点。
 func TestClusterVersionTrigger_bumpsOnPolicyTypeColumns(t *testing.T) {
 	database := newClusterVersionTestDB(t)
-	if err := installClusterVersionTriggers(database); err != nil {
+	if err := InstallClusterVersionTriggers(database); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := database.Exec(`INSERT INTO security_policies (name,mode,policy_type,enabled) VALUES ('of-typed','blocking','stage3',1)`); err != nil {
@@ -1277,7 +1277,7 @@ func TestClusterVersionTrigger_bumpsOnPolicyTypeColumns(t *testing.T) {
 // 须即 bump cluster_version 随快照下发；不在 OF 内则稳态变更永不传播。
 func TestClusterVersionTriggers_bumpForTrustedProxyColumns(t *testing.T) {
 	database := newClusterVersionTestDB(t)
-	if err := installClusterVersionTriggers(database); err != nil {
+	if err := InstallClusterVersionTriggers(database); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := database.Exec("UPDATE global_config SET is_master=1,cluster_version=0 WHERE id=1"); err != nil {
@@ -1345,7 +1345,7 @@ func TestClusterRateLimitRespectsBucketCap(t *testing.T) {
 // 快照 304 门失效、全集群重放。
 func TestClusterVersionTrigger_threatConsecutiveFailuresExcluded(t *testing.T) {
 	database := newClusterVersionTestDB(t)
-	if err := installClusterVersionTriggers(database); err != nil {
+	if err := InstallClusterVersionTriggers(database); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := database.Exec(`INSERT OR IGNORE INTO security_threat_sources (id, name) VALUES (1, 'ustc')`); err != nil {
@@ -1391,7 +1391,7 @@ func TestClusterVersionTrigger_threatConsecutiveFailuresExcluded(t *testing.T) {
 // 已在 OF 内，钉既有正确行为）。
 func TestClusterVersionTriggers_bumpForRuleSurfaceNewColumns(t *testing.T) {
 	database := newClusterVersionTestDB(t)
-	if err := installClusterVersionTriggers(database); err != nil {
+	if err := InstallClusterVersionTriggers(database); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,listen_port,enabled) VALUES ('lb_newcol','newcol','http',8080,1)`); err != nil {
@@ -1436,7 +1436,7 @@ func TestClusterVersionTriggers_bumpForRuleSurfaceNewColumns(t *testing.T) {
 // bump（304 门保持有效），数据/开关类语义列变化照常 bump。
 func TestClusterVersionTrigger_sourceRuntimeColumnsDoNotBump(t *testing.T) {
 	database := newClusterVersionTestDB(t)
-	if err := installClusterVersionTriggers(database); err != nil {
+	if err := InstallClusterVersionTriggers(database); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := database.Exec(`INSERT OR IGNORE INTO security_threat_sources (id, name) VALUES (1, 'ustc')`); err != nil {

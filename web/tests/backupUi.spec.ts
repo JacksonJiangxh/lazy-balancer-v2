@@ -58,7 +58,7 @@ test('还原文案按备份分类，失败行不显示下载', () => {
 })
 
 test('下次备份只消费调度器返回值并标明补跑', () => {
-  const label = section(page, 'const autoBackupNextRunLabel', '// 与导出按钮同口径')
+  const label = section(page, 'const autoBackupNextRunLabel', 'const autoBackupCanRunNow')
   assert.match(label, /autoBackupNextRunAt\.value/)
   assert.match(label, /autoBackupCatchUpDue\.value/)
   assert.match(label, /待补跑/)
@@ -69,19 +69,19 @@ test('下次备份只消费调度器返回值并标明补跑', () => {
 
 test('立即备份按已保存范围门控，60 秒无结果有提示', () => {
   assert.match(page, /:disabled="!autoBackupCanRunNow" title="按已保存的自动备份设置执行一次备份/)
-  const run = section(page, 'const runAutoBackupNow', '// 备份大小')
+  const run = section(page, 'const runAutoBackupNow', 'const downloadAutoBackup')
   assert.match(run, /if \(!autoBackupCanRunNow\.value\)/)
   assert.doesNotMatch(run, /if \(!autoBackupSectionsValid\.value\)/)
   assert.match(run, /else if \(!completed && autoBackupVisible\.value\)/)
   assert.match(run, /60 秒内未检测到本次备份结果/)
-  const saved = section(page, 'const saveAutoBackupSettings', '// 「立即备份」')
+  const saved = section(page, 'const saveAutoBackupSettings', 'const runAutoBackupNow')
   assert.match(saved, /autoBackupSavedSections\.value = \[\.\.\.autoBackupSections\.value\]/)
 })
 
 // 点「立即备份」后切到其它设置页（组件卸载）：轮询只以弹框可见为门时，
 // 卸载后仍每 2s 拉取最多 30 次并在其它页面弹结果 toast。
 test('立即备份轮询在组件卸载后终止且不再弹结果', () => {
-  const run = section(page, 'const runAutoBackupNow', '// 备份大小')
+  const run = section(page, 'const runAutoBackupNow', 'const downloadAutoBackup')
   assert.match(run, /while \(!disposed && autoBackupVisible\.value && Date\.now\(\) < deadline\)/)
   assert.match(run, /if \(disposed\) break/)
   // 循环后的二次复查必须是**顺序**门：切片起点即断言标记属按构造恒真。

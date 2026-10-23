@@ -73,6 +73,10 @@
       <div v-if="autobanIneffective" class="info-note-bar autoban-warn-bar">
         <span class="info-note-desc">「自动封禁名单」尚未生效——名单为空，或尚未被启用中的 IP 访问控制（deny）策略引用；请到「安全规则 → IP 地址列表」将该名单引用到 IP 访问控制（deny）策略</span>
       </div>
+      <!-- 喂入源降级：采集停止/连续失败时计数恒 0，轮次仍 success——不提示会被误读为「无攻击」 -->
+      <div v-if="autobanFeedDegraded" class="info-note-bar autoban-warn-bar">
+        <span class="info-note-desc">数据源降级：{{ autobanStatus.feed_degraded_reason || '安全事件采集已停止或连续失败，自动封禁计数不会增长（轮次仍显示成功）' }}</span>
+      </div>
       <!-- 观察模式建议列表：dry-run 下达阈值 IP（不封禁，供评估阈值/口径） -->
       <template v-if="autobanStatus.enabled && autobanStatus.dry_run && (autobanStatus.suggestions?.length ?? 0) > 0">
         <div class="info-note-bar autoban-warn-bar">
@@ -396,7 +400,7 @@ import { Refresh, Warning, View, Hide, Document, Lock } from '@element-plus/icon
 import DialogHeader from '@/components/DialogHeader.vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { CheckboxValueType } from 'element-plus'
-import { request } from '@/utils/api'
+import { request, mfaAwareSuccess } from '@/utils/api'
 import { useAuthStore } from '@/stores/auth'
 import LogStorageBar from '@/components/LogStorageBar.vue'
 import TriggerDetailDialog from '@/components/events/TriggerDetailDialog.vue'
@@ -423,6 +427,10 @@ interface AutobanStatus {
   // 引用集（含白名单/受信代理/CRS 排除），不能区分「引用」与「拦截生效」——
   // 纯后端内部字段，本卡不声明不消费。
   ban_effective: boolean
+  // 喂入源（安全事件采集）健康：数据源停摆时计数恒 0、轮次仍 success，
+  // 状态卡据此就近提示降级原因（不自动拉起用户显式停止的采集任务）。
+  feed_degraded: boolean
+  feed_degraded_reason: string
   suggestions: AutobanSuggestion[]
   // 后端另有 running/last_run/last_status/role/tracked_ips（API 契约保留）——
   // 本卡零消费，不再声明。
@@ -441,6 +449,8 @@ const AUTOBAN_SCOPES = [
 const autobanStatus = ref<AutobanStatus>({
   enabled: false, dry_run: true, threshold: 100, window_minutes: 5, duration: '1h', scope: 'all',
   banned_today: 0, list_entries: 0, ban_effective: true, suggestions: [],
+  // 成功响应前不得假定喂入源健康（默认 false：无额外黄条）
+  feed_degraded: false, feed_degraded_reason: '',
   // 默认 false：成功响应前不得假定主节点可写
   is_master: false,
 })
@@ -450,6 +460,8 @@ const autobanToggling = ref(false)
 const autobanStatusError = ref(false)
 // 黄条判据单源（utils/autobanStatus，行为钉测）：仅 enabled ∧ ban_effective===false
 const autobanIneffective = computed(() => isAutobanIneffective(autobanStatus.value))
+// 喂入源降级：仅在启用时提示（未启用时「不计数」无需解释）
+const autobanFeedDegraded = computed(() => autobanStatus.value.enabled && autobanStatus.value.feed_degraded === true)
 const authStore = useAuthStore()
 // 四写入口统一门控（启用/禁用/编辑/保存）：全局只读契约 ∧ 主节点 ∧ 状态已加载
 const autobanWritable = computed(() => authStore.readOnlyReason === null && autobanStatus.value.is_master && !autobanStatusError.value && !autobanStatusLoading.value)
@@ -544,7 +556,7 @@ const saveAutobanConfig = async (): Promise<void> => {
   autobanSaving.value = true
   try {
     await request.put('/security/autoban', { ...autobanForm.value, enabled: true })
-    ElMessage.success('自动封禁配置已更新')
+    mfaAwareSuccess('自动封禁配置已更新')
     autobanDialogVisible.value = false
     fetchAutobanStatus()
   } catch { /* 错误已由全局拦截器 toast */ }
@@ -616,7 +628,7 @@ const toggleAutobanEnabled = async (): Promise<void> => {
       duration: autobanStatus.value.duration,
       scope: autobanStatus.value.scope,
     })
-    ElMessage.success('自动封禁已禁用（调度已停止）')
+    mfaAwareSuccess('自动封禁已禁用（调度已停止）')
     fetchAutobanStatus()
   } catch { /* 错误已由全局拦截器 toast */ }
   finally { autobanToggling.value = false }

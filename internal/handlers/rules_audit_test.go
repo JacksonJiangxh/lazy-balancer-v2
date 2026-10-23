@@ -65,6 +65,8 @@ func TestUpdateRule_rejects_duplicate_domain_after_merging_existing_protocol(t *
 	// Given
 	handler := newRuleFeatureTestHandlers(t)
 	seedAuditRule(t, "lb_existing", "existing", "duplicate.example.test", 8080, true, "manual", false)
+	// 占用方须有启用上游（零启用上游规则不产生 host 路由、不占位）。
+	seedAuditUpstream(t, "lb_existing")
 	seedAuditRule(t, "lb_target", "target", "old.example.test", 8080, true, "manual", false)
 	if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb_target','127.0.0.1',9000,1,1,'http')`); err != nil {
 		t.Fatalf("seed target upstream: %v", err)
@@ -106,6 +108,8 @@ func TestRuleWrites_reject_overlapping_domain_lists(t *testing.T) {
 			// Given
 			handler := newRuleFeatureTestHandlers(t)
 			seedAuditRule(t, "lb_existing", "existing", "b.example.test,c.example.test", 8080, true, "manual", false)
+			// 占用方须有启用上游（零启用上游的规则不产生 host 路由、不占位）。
+			seedAuditUpstream(t, "lb_existing")
 			if test.name == "update" {
 				seedAuditRule(t, "lb_target", "target", "old.example.test", 8080, true, "manual", false)
 				seedAuditUpstream(t, "lb_target")

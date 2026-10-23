@@ -613,6 +613,11 @@ func (h *Handlers) ToggleUserStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "用户状态更新成功"})
 }
 
+// ResetUserPassword 重置密码（管理员重置任意用户 / 非管理员重置本人）。
+// 重置语义：不验证当前密码，也不接受 current_password——自助重置与管理员
+// 重置共用同一语义（用户裁定维持：正常改密走 PATCH /users/me，该端点要求
+// current_password；本端点只做「重置」）。授权仍由路由级 adminOrSelfParam
+// 决定，不放宽到他人。成功后 pwd_ver 递增、在册 MFA 挑战吊销。
 func (h *Handlers) ResetUserPassword(c *gin.Context) {
 	// 导入窗口 409。
 	if rejectWriteDuringImport(c, "执行用户写操作") {

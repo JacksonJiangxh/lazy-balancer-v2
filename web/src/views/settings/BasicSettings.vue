@@ -36,9 +36,9 @@
             <span class="form-tip-inline">个月，仅操作审计日志超期自动清理</span>
           </el-form-item>
           <el-form-item label="安全事件保留">
-            <el-input-number v-model="seRetentionDays" :disabled="isReadOnly" :min="1" :max="3650" :step="30" controls-position="right" style="width: 120px;" @change="seRetentionDaysDirty = true" />
+            <el-input-number v-model="seRetentionDays" :disabled="isReadOnly" :min="1" :max="3650" :step="30" controls-position="right" style="width: 120px;" />
             <span class="form-tip-inline">天</span>
-            <el-input-number v-model="seRowCap" :disabled="isReadOnly" :min="1" :max="100000000" :step="100000" controls-position="right" style="width: 170px; margin-left: 10px;" @change="seRowCapDirty = true" />
+            <el-input-number v-model="seRowCap" :disabled="isReadOnly" :min="1" :max="100000000" :step="100000" controls-position="right" style="width: 170px; margin-left: 10px;" />
             <span class="form-tip-inline">行数上限</span>
             <div class="form-tip-line">安全事件日志每日清理：超出保留天数或行数上限时按最旧优先删除（行数上限在两次清理之间可能短暂超出）。默认 90 天 / 1,000,000 行；高攻击流量部署可按需上调。</div>
           </el-form-item>
@@ -496,6 +496,7 @@ import { useAuthStore } from '@/stores/auth'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { request, mfaAwareSuccess, formatBytes } from '@/utils/api'
 import { useLogTailPolling } from '@/composables/useLogTailPolling'
+import { useSettingsDraft, type AdminTlsCertInfo } from '@/composables/useSettingsDraft'
 import { restartServiceWithFeedback } from '@/utils/restart'
 import { adminTlsConfirmDisabled, adminTlsReusesSavedCert } from '@/utils/adminTlsGate'
 import { formatDate } from '@/utils/date'
@@ -1174,13 +1175,15 @@ const confirmImport = async (): Promise<void> => {
   }
 }
 
+// 本卡读写的配置键（父级传入完整配置对象；此处只声明本卡可能访问的字段，
+// 缺失键由下方 computed 归一默认值——键本身已在 GlobalConfigData 声明）。
 interface BasicSettingsConfig {
   log_level: string
   task_log_size_mb: number
   audit_log_size_mb: number
   runtime_log_size_mb: number
   audit_retention_months: number
-  // 威胁大屏本站坐标（v3，可选：父级 SettingsConfig 未声明时由 computed 兜底 0）
+  // 威胁大屏本站坐标（v3；父级未下发时为 undefined，由下方 computed 归一为 0）
   server_map_lat?: number
   threat_screen_mode?: string
   security_events_retention_days?: number
@@ -1191,8 +1194,6 @@ interface BasicSettingsConfig {
   timezone: string
   mfa_write_guard: boolean
   mfa_lockout_enabled: boolean
-  // 可选：父级 Settings.vue 的 SettingsConfig 尚未声明此键（vue-tsc 模板检查
-  // 要求父类型可赋值给本接口），由下方 computed 兜底默认值
   github_proxy_url?: string
   has_github_token?: boolean
 }
@@ -1216,13 +1217,6 @@ interface ConfigPreviewResponse {
     section: string
     changes: string[]
   }
-}
-
-interface AdminTlsCertInfo {
-  domain: string
-  issuer: string
-  not_after: string
-  days_left: number
 }
 
 interface AdminTlsForm {
@@ -1262,10 +1256,19 @@ const githubProxyUrl = computed<string>({
 })
 
 // GitHub 令牌三态：省略=保持、显式空串（清除钮）=撤销、非空=覆盖；has_github_token 仅显隐占位
-const githubTokenInput = ref('')
-// 清除标记（用户裁定三态语义：nil=保持/空串=清除/非空=覆盖）
-// 点「清除」置位，保存时显式提交空串撤销令牌；用户重新输入自动撤销标记。
-const githubTokenClearPending = ref(false)
+// 令牌输入与清除标记、安全事件 dirty、管理面板 HTTPS 暂存态统一由设置草稿
+// （模块单例）持有——切分页重挂不丢（见 useSettingsDraft）。
+const {
+  githubTokenInput,
+  githubTokenClearPending,
+  securityEventsRetentionDirty,
+  securityEventsRowCapDirty,
+  adminTls,
+  adminTlsSaved,
+  adminTlsHasCert,
+  adminTlsCertError,
+  stagedAdminTlsCert,
+} = useSettingsDraft()
 const clearGithubToken = () => {
   githubTokenInput.value = ''
   githubTokenClearPending.value = true
@@ -1302,35 +1305,42 @@ watch(
   },
   { immediate: true },
 )
-// v2.3.8 威胁大屏中央视觉模式（map/globe）：独立持有，父组件配置装载后经
-// watch 同步（settings 为父级响应式对象）
-const threatScreenMode = ref<'map' | 'globe'>('map')
-// 安全事件滚动保留：展示归一 90 天 / 1,000,000 行；库值 0=自动 的哨兵保持不变
-// dirty 标记记录用户是否实际编辑，保存载荷只在编辑过时携带该
-// 字段，避免把展示归一值物化进库（见 utils/configValues securityEventsWritePayload）。
-const seRetentionDays = ref(90)
-const seRowCap = ref(1_000_000)
-const seRetentionDaysDirty = ref(false)
-const seRowCapDirty = ref(false)
-const trafficSampleN = ref(-1)
-watch(() => settings.value.threat_screen_mode, (v) => { threatScreenMode.value = displayThreatScreenMode(v) }, { immediate: true })
-watch(() => [settings.value.security_events_retention_days, settings.value.security_events_row_cap] as const, ([d, c]) => {
-  seRetentionDays.value = displaySecurityEventsRetentionDays(d)
-  // 1..999 等小值是后端合法配置（行帽），原样展示；仅 0=自动按默认显示。
-  seRowCap.value = displaySecurityEventsRowCap(c)
-}, { immediate: true })
-watch(() => settings.value.threat_traffic_sample_n, (v) => {
-  trafficSampleN.value = normalizeTrafficSampleN(v)
-}, { immediate: true })
-const adminTls = ref({ enabled: false, mode: 'selfsigned' })
-const adminTlsSaved = ref({ enabled: false, mode: 'selfsigned' })
-const adminTlsHasCert = ref(false)
-// 库内证书解析失败的原因（后端 fail-visible 字段 cert_info_error）。仅申报不
-// 消费会让「带外改库/旧导入造成的损坏证书」继续表现为「无证书信息」——用户
-// 看到 enabled=true 却查无原因，排障靠猜。
-const adminTlsCertError = ref('')
+// v2.3.8 威胁大屏中央视觉模式（map/globe）：直接写回父级共享模型——切分页
+// 重挂不回退（原组件内 ref 卸载即复位），与同卡直绑 settings 的字段同口径。
+// 展示归一由单源 helper 承担（库值非法时的回显口径不在此重复实现）。
+const threatScreenMode = computed<'map' | 'globe'>({
+  get: () => displayThreatScreenMode(settings.value.threat_screen_mode),
+  set: (value) => {
+    settings.value.threat_screen_mode = value
+  },
+})
+// 安全事件滚动保留：展示归一 90 天 / 1,000,000 行；库值 0=自动 的哨兵保持不变。
+// 编辑值写回父级共享模型（切分页不丢），dirty 标记只在用户实际编辑时置位，
+// 保存载荷按 dirty 携带字段（见 utils/configValues securityEventsWritePayload），
+// 避免把展示归一值物化进库。
+const seRetentionDays = computed<number>({
+  get: () => displaySecurityEventsRetentionDays(settings.value.security_events_retention_days),
+  set: (value) => {
+    settings.value.security_events_retention_days = value
+    securityEventsRetentionDirty.value = true
+  },
+})
+const seRowCap = computed<number>({
+  get: () => displaySecurityEventsRowCap(settings.value.security_events_row_cap),
+  set: (value) => {
+    settings.value.security_events_row_cap = value
+    securityEventsRowCapDirty.value = true
+  },
+})
+const trafficSampleN = computed<number>({
+  get: () => normalizeTrafficSampleN(settings.value.threat_traffic_sample_n),
+  set: (value) => {
+    settings.value.threat_traffic_sample_n = value
+  },
+})
+// 证书弹框表单（文件选择/校验）是临时态：随弹框关闭销毁，不随分页切换保留；
+// 已确认的暂存材料（stagedAdminTlsCert）在设置草稿里存活。
 const adminTlsForm = ref<AdminTlsForm>({ mode: 'selfsigned', certFile: null, keyFile: null, certInfo: null, inspecting: false })
-const stagedAdminTlsCert = ref<{ certFile: File; keyFile: File; certInfo: AdminTlsCertInfo } | null>(null)
 const adminTlsDialogVisible = ref(false)
 // 隐藏文件选择器代理（弹框 destroy-on-close，input 置于弹框外）
 const tlsCertFileInput = ref<HTMLInputElement | null>(null)
@@ -1370,11 +1380,15 @@ const loadAdminTls = async () => {
     const res = await request.get('/admin-tls')
     if (res.data) {
       const saved = { enabled: res.data.enabled, mode: res.data.mode || 'selfsigned' }
+      // 暂存判定必须在写入新 saved 之前取：写入后 adminTls 与 saved 的差异会把
+      // 「服务端状态刚变化」误判成「用户暂存」（首次进入且服务端已启用时开关
+      // 会错显关闭）。有暂存时保留用户的编辑与暂存证书，无暂存时以服务端为准
+      // （暂存证书只在保存成功后清空）。
+      const wasStaged = adminTlsDirty.value
       adminTlsSaved.value = saved
-      adminTls.value = { ...saved }
+      if (!wasStaged) adminTls.value = { ...saved }
       adminTlsHasCert.value = res.data.cert_info != null || saved.mode === 'selfsigned'
       adminTlsCertError.value = res.data.cert_info_error || ''
-      stagedAdminTlsCert.value = null
       adminTlsLoaded.value = true
     }
   } catch {
@@ -1551,9 +1565,9 @@ const handleSave = async () => {
       // 后端 COALESCE 保持现值——库值 0=自动 不被展示归一值物化）。
       ...securityEventsWritePayload({
         retentionDays: seRetentionDays.value,
-        retentionDirty: seRetentionDaysDirty.value,
+        retentionDirty: securityEventsRetentionDirty.value,
         rowCap: seRowCap.value,
-        rowCapDirty: seRowCapDirty.value,
+        rowCapDirty: securityEventsRowCapDirty.value,
       }),
       threat_traffic_sample_n: trafficSampleN.value,
       mfa_write_guard: settings.value.mfa_write_guard,
@@ -1596,8 +1610,8 @@ const handleSave = async () => {
     }
     // 保存成功后清除编辑标记——后续保存继续省略未再编辑的字段，
     // 避免一次编辑把值永久物化为每次提交的显式载荷。
-    seRetentionDaysDirty.value = false
-    seRowCapDirty.value = false
+    securityEventsRetentionDirty.value = false
+    securityEventsRowCapDirty.value = false
     // 保存成功后立即刷新全局配置，让 timezone 在 authStore 中立竿见影（date.ts formatDate 展示侧即时生效）；
     // silent：保存已成功，随后的 GET /config 刷新失败不应再弹误导性错误 toast
     try {
@@ -1619,9 +1633,13 @@ const handleSave = async () => {
         }
         // silent：失败文案由本段自报（全局「保存失败」会被读成整单未生效）
         await request.put('/admin-tls', fd, { silent: true })
+        // 成功态以读路径回填（唯一真相）：后端新证书可解析时不再下发
+        // cert_info_error，损坏横幅与「可复用已保存证书」确认门随之复位。
+        // 手工补丁 saved/hasCert 会残留旧 error——修好证书后仍报「坏」，
+        // 且确认门被旧 error 灰置到整页刷新。
         adminTlsSaved.value = { ...adminTls.value }
-        adminTlsHasCert.value = adminTlsHasCert.value || adminTls.value.enabled
         stagedAdminTlsCert.value = null
+        await loadAdminTls()
         notifyTlsRestarting(adminTls.value.enabled)
       } catch (tlsError) {
         // 部分成功必须显性披露：基础键已落库，证书与重启语义未生效

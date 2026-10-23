@@ -1701,3 +1701,36 @@ func TestAPIDocs_decisionKeyExamplesMatchImplementation(t *testing.T) {
 	assertStructKeysDocumented(t, "GET /security/ip2region", mapKeysOf(docResponseExample(t, "GET /security/ip2region")), models.IP2RegionInfo{})
 	assertStructKeysDocumented(t, "GET /system/info", mapKeysOf(docResponseExample(t, "GET /system/info")), models.SystemInfo{})
 }
+
+// summary/tags 必须可原样还原：裸拼自由文本会在含 ": "/"#" 等字符时破坏
+// YAML 或静默截断（解析门只能保证「仍可解析」，不能保证语义未被改写）。
+func TestBuildOpenAPIYAML_summaryAndTagRoundTrip(t *testing.T) {
+	openAPI := buildOpenAPIYAML()
+	var document struct {
+		Paths map[string]map[string]struct {
+			Tags    []string `yaml:"tags"`
+			Summary string   `yaml:"summary"`
+		} `yaml:"paths"`
+	}
+	if err := yaml.Unmarshal([]byte(openAPI), &document); err != nil {
+		t.Fatalf("parse generated OpenAPI YAML: %v", err)
+	}
+	checked := 0
+	for _, route := range apiDocRoutes {
+		path := apipath.ToOpenAPI(route.Path)
+		op, ok := document.Paths[path][strings.ToLower(route.Method)]
+		if !ok {
+			t.Fatalf("missing operation %s %s", route.Method, path)
+		}
+		if op.Summary != route.Summary {
+			t.Fatalf("%s %s summary=%q, want %q（自由文本被 YAML 改写）", route.Method, path, op.Summary, route.Summary)
+		}
+		if len(op.Tags) != 1 || op.Tags[0] != route.Tag {
+			t.Fatalf("%s %s tags=%v, want [%q]", route.Method, path, op.Tags, route.Tag)
+		}
+		checked++
+	}
+	if checked != len(apiDocRoutes) {
+		t.Fatalf("checked=%d routes=%d", checked, len(apiDocRoutes))
+	}
+}

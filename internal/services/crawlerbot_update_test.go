@@ -174,10 +174,10 @@ func TestMarkCrawlerSourceFailed_usesScheduleNotBackoff(t *testing.T) {
 	}
 }
 
-// crawlerbot 源族排程槽写入必须继承威胁源族门禁
-// ——仅 auto 触发且现存槽空/过期才推进；手动触发（成功/失败）不动预约、
-// 未来槽不回拨。旧实现无条件改写 next_update：手动轮可静默吞掉当天自动轮，
-// 一次瞬时手动失败可抑制自动重试。
+// crawlerbot 源族排程槽写入门禁：失败落仅 auto 推进、成功落 auto/manual 同权
+// （manual 仅推进已过期槽）。未来槽一律不回拨；手动失败不得抢先推进过期槽
+// ——引擎按退避重投同一槽，业务吃掉它=该自动槽静默消失。旧实现无条件改写
+// next_update：手动轮可静默吞掉当天自动轮，一次瞬时手动失败可抑制自动重试。
 func TestCrawlerSlotAdvance_triggerGate(t *testing.T) {
 	const past = "2000-01-01 00:00:00"
 	future := time.Now().UTC().Add(48 * time.Hour).Format("2006-01-02 15:04:05")
@@ -194,10 +194,12 @@ func TestCrawlerSlotAdvance_triggerGate(t *testing.T) {
 	}{
 		{name: "auto success advances past slot", kind: "success", trigger: "auto", initial: past, wantAdvanced: true},
 		{name: "auto failed advances past slot", kind: "failed", trigger: "auto", initial: past, wantAdvanced: true},
-		{name: "manual success keeps slot", kind: "success", trigger: "manual", initial: past, wantAdvanced: false},
+		// 手动成功必须推进过期槽：引擎成功轮已消费该槽，业务不推进=自动更新停摆。
+		{name: "manual success advances past slot", kind: "success", trigger: "manual", initial: past, wantAdvanced: true},
 		{name: "manual failed keeps slot", kind: "failed", trigger: "manual", initial: past, wantAdvanced: false},
 		{name: "auto success keeps future slot", kind: "success", trigger: "auto", initial: future, wantAdvanced: false},
 		{name: "auto failed keeps future slot", kind: "failed", trigger: "auto", initial: future, wantAdvanced: false},
+		{name: "manual success keeps future slot", kind: "success", trigger: "manual", initial: future, wantAdvanced: false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

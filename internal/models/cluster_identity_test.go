@@ -9,8 +9,9 @@ import (
 	"unicode/utf8"
 )
 
-// 节点名归一：去首尾空白、剥离 C0/DEL/C1 控制字符、按 VARCHAR(100) 上限截断
-// 到合法 UTF-8 边界。此前该函数（含 C1 剥离修复）零覆盖——回归无人拦。
+// 节点名归一：去首尾空白、剥离 C0/DEL/C1 控制字符与 Cf 格式字符、按
+// VARCHAR(100) 上限截断到合法 UTF-8 边界。此前该函数（含 C1 剥离修复）零覆盖
+// ——回归无人拦。
 func TestNormalizeClusterNodeName(t *testing.T) {
 	long := strings.Repeat("名", ClusterNodeNameMaxLen+1)
 	for _, tc := range []struct {
@@ -23,6 +24,14 @@ func TestNormalizeClusterNodeName(t *testing.T) {
 		{name: "strip C0", in: "no\x00de\x1f-1", want: "node-1"},
 		{name: "strip DEL", in: "node\x7f-1", want: "node-1"},
 		{name: "strip C1", in: "node\u0085\u009f-1", want: "node-1"},
+		// Cf 格式字符：双向覆盖可让 "主节点\u202E-xx" 在列表/审计里视觉重排、
+		// 与真实主节点名混淆；零宽空格/BOM 则可伪造同名视觉。
+		{name: "strip bidi override", in: "主节点\u202e-xx", want: "主节点-xx"},
+		{name: "strip bidi isolate", in: "node\u2066\u2069-1", want: "node-1"},
+		{name: "strip zero width", in: "no\u200bde\u200e-1", want: "node-1"},
+		{name: "strip BOM", in: "\ufeffnode-1", want: "node-1"},
+		// ZWJ 是 emoji 组合的合法组成，不得被当作格式字符剥掉。
+		{name: "keep ZWJ", in: "节点\u200d01", want: "节点\u200d01"},
 		{name: "only whitespace becomes empty", in: " \t\n\x00 ", want: ""},
 		{name: "exact limit kept", in: strings.Repeat("a", ClusterNodeNameMaxLen), want: strings.Repeat("a", ClusterNodeNameMaxLen)},
 		{name: "over limit truncated by rune", in: long, want: strings.Repeat("名", ClusterNodeNameMaxLen)},

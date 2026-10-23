@@ -1,6 +1,7 @@
 package handlers
 
-// 通配符)、page clamp 上限收紧 10000、options 三条 GROUP BY 进程内缓存 60s。
+// 通配符转义、深翻页超阈值 400（阈值 auditLogDeepPageLimit=500）、options
+// 三条 GROUP BY 进程内缓存 60s。
 
 import (
 	"encoding/json"
@@ -40,7 +41,8 @@ func TestAuditLogs_likeEscaping(t *testing.T) {
 	}
 }
 
-func TestAuditLogs_pageClamp(t *testing.T) {
+// 深翻页超过 auditLogDeepPageLimit 时显式 400 并给出筛选指引（不静默 clamp）。
+func TestAuditLogs_deepPageRejected(t *testing.T) {
 	router, _ := newAuditLogRouter(t)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/audit-logs?page=10001", nil))

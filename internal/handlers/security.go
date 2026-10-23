@@ -163,10 +163,10 @@ func validateSecurityCustomRule(rule *models.SecurityCustomRule) error {
 // 任意已登录用户（与 ListSecurityEvents「泛化文案 + 服务端留痕」同标准）。
 // 400/404/409 等可判定错误不走此函数（那些文案本就是面向用户的校验结论）。
 func serverErrMsg(publicMsg string, err error) string {
-	if err != nil {
-		services.Logf("error", "安全处理器 500（%s）: %v", publicMsg, err)
-	}
-	return publicMsg
+	// 与 system/crawler 同一装配实现（internalError）：本变体保留 string 返回，
+	// 供 139 处「c.JSON(..., APIResponse{Message: serverErrMsg(...)})」调用点
+	// 零改动收敛；语义（固定文案 + 服务端留痕 + err==nil 不重复日志）同源。
+	return internalError("安全处理器", publicMsg, err).Message
 }
 
 // securityCustomRuleMaxGlobalCount 自定义规则全局数量上限
@@ -1471,10 +1471,11 @@ func validateCRSExcludedRulesPayload(val *string, checkIndices bool) error {
 			if !services.CRSExcludedEntryEffective(entry) {
 				return fmt.Errorf("crs_excluded_rules 条目必须是 CRS 规则 ID（如 \"942100\"）或规则文件名（如 \"REQUEST-942-APPLICATION-ATTACK-SQLI.conf\"）: %q", entry)
 			}
-			// 排除守卫：初始化组（901）由发射面强制包含，排除它会让偏执级
-			// 守卫按 0 处理整段跳过、策略静默空转——无合法用途，保存即拒。
-			if services.CRSExclusionTargetRemovesInit(entry) {
-				return fmt.Errorf("crs_excluded_rules 条目 %q 命中初始化规则组（901xxx）：初始化规则为系统强制加载，不能排除", entry)
+			// 排除守卫：基础设施组（901 初始化/949 请求评估/959 响应评估）由
+			// 发射面强制包含——排除初始化会让守卫按 0 整段跳过、策略空转；
+			// 排除 949/959 会让拦截模式静默退化为仅记录。无合法用途，保存即拒。
+			if services.CRSExclusionTargetRemovesInfra(entry) {
+				return fmt.Errorf("crs_excluded_rules 条目 %q 命中基础设施规则组（901 初始化 / 949 请求评估 / 959 响应评估）：这些规则为系统强制加载，不能排除", entry)
 			}
 			if checkIndices {
 				if index == nil {
@@ -1548,10 +1549,11 @@ func validateCRSExcludedRulesPayload(val *string, checkIndices bool) error {
 			// 形态（映射为 ID 区间）无法展开——保存即拒，与发射端能力对齐。
 			return fmt.Errorf("crs_excluded_rules 条目 #%d：target %q 为文件名/区间形态，仅支持 scope=all（作用域限定请使用两位组号或 6 位规则 ID）", i+1, entry.Target)
 		}
-		// 排除守卫：初始化组（901）由发射面强制包含，排除它会让偏执级守卫
-		// 按 0 处理整段跳过、策略静默空转——无合法用途，保存即拒。
-		if services.CRSExclusionTargetRemovesInit(target) {
-			return fmt.Errorf("crs_excluded_rules 条目 #%d 命中初始化规则组（901xxx）：初始化规则为系统强制加载，不能排除", i+1)
+		// 排除守卫：基础设施组（901 初始化/949 请求评估/959 响应评估）由发射面
+		// 强制包含——排除初始化会让守卫按 0 整段跳过、策略空转；排除 949/959
+		// 会让拦截模式静默退化为仅记录。无合法用途，保存即拒。
+		if services.CRSExclusionTargetRemovesInfra(target) {
+			return fmt.Errorf("crs_excluded_rules 条目 #%d 命中基础设施规则组（901 初始化 / 949 请求评估 / 959 响应评估）：这些规则为系统强制加载，不能排除", i+1)
 		}
 		ips := strings.TrimSpace(entry.IPs)
 		switch scope {
@@ -2863,6 +2865,7 @@ func (h *Handlers) BulkUpdatePolicyBindings(c *gin.Context) {
 	// 「不含本策略」绑定计数，本策略为 stage2 时再一次 IN 查询取「已含其他
 	// stage2 绑定」的规则集合——避免逐规则 2N 次查询（bulk 上限 100 条）。
 	bindCounts := map[string]int{}
+	boundToPolicy := map[string]struct{}{}
 	otherStage2Rules := map[string]struct{}{}
 	if len(bindIDs) > 0 {
 		placeholders := make([]string, len(bindIDs))
@@ -2872,6 +2875,29 @@ func (h *Handlers) BulkUpdatePolicyBindings(c *gin.Context) {
 			args = append(args, id)
 		}
 		args = append(args, policyID)
+		// 已绑定本策略的规则集合：bind 上限门只对「新增绑定」生效——与单条
+		// bind 端点同口径（已绑定即幂等 200）。存量超限规则（旧版本导入/历史
+		// 数据，绑定数≥9）在 bulk 里重复提交本策略时不得 400，否则同批无关
+		// 规则的变更也整体失败。
+		boundRows, err := tx.QueryContext(c.Request.Context(), "SELECT rule_caddy_id FROM security_policy_bindings WHERE rule_caddy_id IN ("+strings.Join(placeholders, ",")+") AND policy_id = ?", args...)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: serverErrMsg("服务器内部错误", err)})
+			return
+		}
+		for boundRows.Next() {
+			var rid string
+			if err := boundRows.Scan(&rid); err != nil {
+				boundRows.Close()
+				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: serverErrMsg("服务器内部错误", err)})
+				return
+			}
+			boundToPolicy[rid] = struct{}{}
+		}
+		boundRows.Close()
+		if err := boundRows.Err(); err != nil {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: serverErrMsg("服务器内部错误", err)})
+			return
+		}
 		countRows, err := tx.QueryContext(c.Request.Context(), "SELECT rule_caddy_id, COUNT(*) FROM security_policy_bindings WHERE rule_caddy_id IN ("+strings.Join(placeholders, ",")+") AND policy_id != ? GROUP BY rule_caddy_id", args...)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: serverErrMsg("服务器内部错误", err)})
@@ -2942,7 +2968,7 @@ func (h *Handlers) BulkUpdatePolicyBindings(c *gin.Context) {
 			return ruleCaddyID + ": 安全策略仅支持绑定 HTTP 规则（TCP 规则不经过 WAF/IP 访问控制/限流链）", nil
 		}
 		if bind {
-			if bindCounts[ruleCaddyID] >= maxBindingsPerRule {
+			if _, already := boundToPolicy[ruleCaddyID]; !already && bindCounts[ruleCaddyID] >= maxBindingsPerRule {
 				return fmt.Sprintf("%s: 最多绑定 %d 条策略", ruleCaddyID, maxBindingsPerRule), nil
 			}
 			if policyType == models.PolicyTypeStage2 {
@@ -3529,14 +3555,28 @@ func (h *Handlers) UnbindRuleFromPolicy(c *gin.Context) {
 		return
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(c.Request.Context(), "DELETE FROM security_policy_bindings WHERE rule_caddy_id=? AND policy_id=?", ruleCaddyID, policyID); err != nil {
+	res, err := tx.ExecContext(c.Request.Context(), "DELETE FROM security_policy_bindings WHERE rule_caddy_id=? AND policy_id=?", ruleCaddyID, policyID)
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: serverErrMsg("服务器内部错误", err)})
+		return
+	}
+	affected, aerr := res.RowsAffected()
+	if aerr != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: serverErrMsg("读取写入结果失败", aerr)})
+		return
+	}
+	if affected == 0 {
+		// 幂等入口保留 200，但无变更不得写「已解除」审计：重复提交/并发解绑
+		// 会制造一条未发生的绑定解除记录（审计是取证面，虚假变更为害）。
+		_ = tx.Rollback()
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "该规则未与此策略建立绑定", Data: gin.H{"changed": false}})
 		return
 	}
 	h.finishTxApply(c, tx, txApplyFinish{
 		Resource: "安全策略", AuditAction: "更新",
 		AuditDetail: fmt.Sprintf("解除规则 %s 与策略 #%s 的绑定", ruleCaddyID, policyID),
 		SuccessMsg:  "已取消关联",
+		Data:        gin.H{"changed": true},
 	})
 }
 
@@ -4237,8 +4277,10 @@ func truncateEventListHeaders(value string) string {
 }
 
 // securityEventDroppedHeadersKey 与摄取侧写侧的丢弃计数合成键同源（采集
-// 64KB 上限：快照插件与落库裁剪共用）。
-const securityEventDroppedHeadersKey = "_lb_dropped_headers"
+// 64KB 上限：快照插件与落库裁剪共用）——引用 services 导出常量，跨包字符串
+// 契约不得各写一份字面量（改一侧另一边会静默漂移，列表裁剪会把采集计数键
+// 当普通头统计/丢弃且不会编译失败）。
+const securityEventDroppedHeadersKey = services.SecurityEventsDroppedHeadersKey
 
 // securityEventListDroppedHeadersKey 是列表侧 16KB 裁剪的丢弃计数合成键——
 // 与采集 64KB 的 securityEventDroppedHeadersKey 分离：头数多但总量 <64KB
@@ -4526,6 +4568,12 @@ func crsAttackLabel(ruleTriggered string) string {
 }
 
 func categorizeAttack(ruleTriggered, ruleMsg string) string {
+	// 限流拦截（rule_triggered=429）与事件列表「限流」族/筛选同口径：此前
+	// 429 落 attackFamilyOther（「其他」），纯限流站点于是显示「拦截很多但
+	// 攻击类型几乎全是其他」。429 是精确 ID，无前缀歧义。
+	if ruleTriggered == "429" {
+		return "限流"
+	}
 	// 5 位 ID 恒为自定义规则——先于 3 位前缀判定,crID≥82000
 	// 发射 92000-99999 时不再被 9 前缀遮蔽误标。
 	if len(ruleTriggered) == 5 {
@@ -4561,7 +4609,7 @@ func categorizeAttack(ruleTriggered, ruleMsg string) string {
 //
 //	信任名单（id 3/12）/ IP 访问控制（黑白名单 2/4/5/7 + 地域 8/8xxxxx +
 //	威胁库 14/msg）/ WAF（CRS 9xxxxx + 自定义 5 位与 1 开头 ≥7 位合成）/
-//	请求体异常（id 11）/ 其他。
+//	请求体异常（id 11）/ 限流（429 精确）/ 其他。
 //
 // ID 形态判定收敛至 attackFamilyClassOf 单一事实源，
 // 本函数只做类→桶映射。与概览视图的唯一有意分叉：9 开头 CRS 段整段归 WAF
@@ -4569,6 +4617,11 @@ func categorizeAttack(ruleTriggered, ruleMsg string) string {
 // msg/id 门。与 family 筛选表（ruleTriggeredFamilyPrefixes/
 // customRuleFamilyCondition/geoipFamilyCondition）SQL 侧口径同步义务不变。
 func stageCategorizeAttack(ruleTriggered, ruleMsg string) string {
+	// 限流（429）独立成桶：与事件列表「限流」族、429 筛选及限流卡片同口径，
+	// 此前落「其他」——同一事件在列表与总览口径分叉。
+	if ruleTriggered == "429" {
+		return "限流"
+	}
 	class := attackFamilyClassOf(ruleTriggered, ruleMsg)
 	// WAF=自定义规则类+CRS 9 前缀段（categorizeAttack 的 crsAttackLabel 细分段
 	// 此处整段归一）。msg 门命中的 9 开头形态同样归 WAF（不 fall-through）。
@@ -4719,6 +4772,7 @@ func (h *Handlers) GetSecurityOverview(c *gin.Context) {
 			SecurityOverview:   overview,
 			RawCoverageFrom:    rawCoverageFrom,
 			BackfillIncomplete: backfillIncomplete,
+			RawCoverageLimited: backfillIncomplete,
 			IncludesReserved:   true,
 			Ingestion:          services.SecurityEventsIngestionHealthSnapshot(),
 		}})
@@ -4742,6 +4796,7 @@ func (h *Handlers) GetSecurityOverview(c *gin.Context) {
 		SecurityOverview:   overview,
 		RawCoverageFrom:    rawCoverageFrom,
 		BackfillIncomplete: backfillIncomplete,
+		RawCoverageLimited: backfillIncomplete,
 		// 今日计数走 rollup 时与大屏同口径排除私网/保留地址（false）；
 		// 回退原始表直算时含私网（true，旧口径）。
 		IncludesReserved: !todayFromRollup,

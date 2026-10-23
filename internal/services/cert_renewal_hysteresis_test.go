@@ -86,7 +86,8 @@ func hysteresisCertPair(t *testing.T, notBefore, notAfter time.Time) (certPEM, k
 	return certPEM, keyPEM
 }
 
-// 真实扫描链路：刚签发的 90 天证书（剩余略小于 89 天窗口）不得被再次选中；
+// 真实扫描链路：窗口接近证书寿命（库值 89 天按安全上限 88 天生效；证书实际
+// 寿命 88.5 天 → L−W = 12h）时，签发 13h 后仍处于迟滞窗口，不得被再次选中；
 // 签发时刻超过 24h 后恢复可续签。
 func TestCheckExpiration_hysteresisBlocksFreshRenewalWhenWindowNearLifetime(t *testing.T) {
 	_, database := newClusterTestService(t)
@@ -95,15 +96,16 @@ func TestCheckExpiration_hysteresisBlocksFreshRenewalWhenWindowNearLifetime(t *t
 		VALUES (?, 'hysteresis', 'example.com', 'http', 8443, 1, 1, 'acme_dns')`, ruleID); err != nil {
 		t.Fatalf("seed rule: %v", err)
 	}
+	// 旧版本遗留的 89 天：库值原样保留，读侧按安全上限 88 天生效（显性告警）。
 	if _, err := database.Exec("UPDATE global_config SET cert_renewal_days=89 WHERE id=1"); err != nil {
 		t.Fatalf("set renewal days: %v", err)
 	}
 	now := time.Now()
-	notAfter := now.Add(89*24*time.Hour - 30*time.Minute) // 剩余 < 89 天 → 进入续签窗口
-	notBefore := now.Add(-time.Hour)                      // 寿命 ≈ 89 天 + 30 分钟 → L−W < 24h
+	notBefore := now.Add(-13 * time.Hour)
+	notAfter := notBefore.Add(88*24*time.Hour + 12*time.Hour) // 寿命 88.5 天 → L−W = 12h
 	certPEM, keyPEM := hysteresisCertPair(t, notBefore, notAfter)
 	result, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,ca_provider_id,cert_pem,key_pem,expires_at,updated_at)
-		VALUES (?, 'example.com', 'issued', 0, ?, ?, ?, datetime('now'))`, ruleID, certPEM, keyPEM, notAfter.UTC().Format("2006-01-02 15:04:05"))
+		VALUES (?, 'example.com', 'issued', 0, ?, ?, ?, datetime('now','-13 hours'))`, ruleID, certPEM, keyPEM, notAfter.UTC().Format("2006-01-02 15:04:05"))
 	if err != nil {
 		t.Fatalf("seed job: %v", err)
 	}
@@ -131,9 +133,14 @@ func TestCheckExpiration_hysteresisBlocksFreshRenewalWhenWindowNearLifetime(t *t
 		}
 	}
 
-	// When：签发时刻回拨 25h（超过 24h 下限）
-	if _, err := database.Exec("UPDATE cert_jobs SET updated_at=datetime('now','-25 hours') WHERE id=?", jobID); err != nil {
-		t.Fatalf("age job: %v", err)
+	// When：真实签发时刻回拨 25h（超过 24h 下限）——迟滞以证书 NotBefore
+	// 为签发时刻，簿记写（updated_at）不参与判定，因此必须连同材料一起回拨。
+	agedNotBefore := now.Add(-25 * time.Hour)
+	agedNotAfter := agedNotBefore.Add(88*24*time.Hour + 12*time.Hour)
+	agedCertPEM, agedKeyPEM := hysteresisCertPair(t, agedNotBefore, agedNotAfter)
+	if _, err := database.Exec("UPDATE cert_jobs SET cert_pem=?, key_pem=?, expires_at=?, updated_at=datetime('now','-25 hours') WHERE id=?",
+		agedCertPEM, agedKeyPEM, agedNotAfter.UTC().Format("2006-01-02 15:04:05"), jobID); err != nil {
+		t.Fatalf("age job issuance: %v", err)
 	}
 	jobs, _, err = service.CheckExpiration()
 	if err != nil {

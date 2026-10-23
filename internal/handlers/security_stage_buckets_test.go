@@ -38,6 +38,9 @@ func TestStageCategorizeAttack_buckets(t *testing.T) {
 		{"crs synthetic custom", "1000001", "旧版规则", "WAF"},
 		// 请求体异常：id 11
 		{"body id 11", "11", "", "请求体异常"},
+		// 限流：429 精确（与事件列表「限流」族/筛选/限流卡片同口径）
+		{"ratelimit 429", "429", "", "限流"},
+		{"ratelimit 429 with msg", "429", "请求过于频繁", "限流"},
 		// 其他
 		{"empty", "", "", "其他"},
 		{"custom rule six-digit id", "123456", "something else", "WAF"},

@@ -240,7 +240,16 @@
         </el-table-column>
         <el-table-column label="健康" width="64" align="center">
           <template #default="{ row }">
-            <el-popover v-if="row.enabled && healthStatus[row.caddy_id]" placement="top" trigger="hover" :width="240" :popper-options="popperViewportSafe">
+            <!-- 零启用上游的启用态规则：渲染层跳过（不发路由/不注册 logger），
+                 与「已禁用」的「-」同形会让用户无法从列表区分「未发布」。 -->
+            <el-tooltip
+              v-if="row.enabled && Array.isArray(row.upstreams) && getEnabledUpstreams(row).length === 0"
+              content="未发布：已启用但零启用上游，运行配置跳过该规则（Caddy 不会代理）"
+              placement="top"
+            >
+              <el-tag type="warning" size="small" effect="plain">未发布</el-tag>
+            </el-tooltip>
+            <el-popover v-else-if="row.enabled && healthStatus[row.caddy_id]" placement="top" trigger="hover" :width="240" :popper-options="popperViewportSafe">
               <template #reference>
                 <el-tag :type="getHealthTagType(healthStatus[row.caddy_id])" size="small" effect="plain" class="health-tag">
                   {{ getHealthLabel(healthStatus[row.caddy_id]) }}
@@ -549,7 +558,7 @@
             <div v-if="wizardForm.dynamic_dns" class="info-note-bar"><span class="info-note-desc">动态上游模式下仅需一个上游条目，DNS 将动态解析出多个 IP</span></div>
 
             <el-table :data="wizardForm.upstreams" border class="upstream-table" :fit="true">
-              <el-table-column label="主机地址 *" min-width="220">
+              <el-table-column label="主机地址 *" min-width="150">
                 <template #default="{ row, $index }">
                   <el-input 
                     v-model="row.host" 
@@ -561,12 +570,12 @@
                   />
                 </template>
               </el-table-column>
-              <el-table-column label="端口" width="88">
+              <el-table-column label="端口" width="96">
                 <template #default="{ row }">
                   <el-input-number v-model="row.port" :min="1" :max="65535" size="small" controls-position="right" class="upstream-input-small" />
                 </template>
               </el-table-column>
-              <el-table-column label="协议" width="96">
+              <el-table-column label="协议" width="88">
                 <template #default="{ row }">
                   <el-select v-model="row.protocol" size="small" placeholder="协议">
                     <template v-if="wizardForm.protocol === 'tcp'">
@@ -580,7 +589,7 @@
                   </el-select>
                 </template>
               </el-table-column>
-              <el-table-column min-width="180" v-if="wizardForm.protocol === 'http'">
+              <el-table-column min-width="124" v-if="wizardForm.protocol === 'http'">
                 <template #header>
                   回源域名<FieldHelpIcon content="该上游独立的回源 Host 头与 HTTPS SNI（主机名，不带端口；端口沿用左侧端口列配置）。留空=不覆盖（Host 跟随客户端请求或上游地址）" />
                 </template>
@@ -596,7 +605,7 @@
                   </el-tooltip>
                 </template>
               </el-table-column>
-              <el-table-column width="84">
+              <el-table-column width="80">
                 <template #header>
                   权重 %<FieldHelpIcon content="数字越大，分配到的请求越多；权重相同时即为普通轮询。至少需要添加一个上游服务器。" />
                 </template>
@@ -604,7 +613,7 @@
                   <el-input-number v-model="row.weight" :min="1" :max="100" size="small" controls-position="right" class="upstream-input-small" :disabled="!row.enabled" @change="onWeightChange($index)" />
                 </template>
               </el-table-column>
-              <el-table-column width="118">
+              <el-table-column width="104">
                 <template #header>
                   {{ wizardForm.protocol === 'tcp' ? '最大连接' : '最大请求数' }}<FieldHelpIcon :content="wizardForm.protocol === 'tcp'
                     ? '该上游并发连接数上限（HTTP 规则映射为 reverse_proxy 每上游并发请求数 max_requests；TCP 规则映射为 caddy-l4 max_connections），0 为不限制'
@@ -616,12 +625,12 @@
                   </el-tooltip>
                 </template>
               </el-table-column>
-              <el-table-column label="启用" width="56" align="center">
+              <el-table-column label="启用" width="52" align="center">
                 <template #default="{ row, $index }">
                   <el-switch v-model="row.enabled" size="small" @change="onWeightChange($index)" />
                 </template>
               </el-table-column>
-              <el-table-column width="46" align="center">
+              <el-table-column width="48" align="center">
                 <template #default="{ $index }">
                   <el-button type="danger" link size="small" @click="removeUpstream($index)">
                     <el-icon><Delete /></el-icon>
@@ -677,9 +686,15 @@
                   :class="{ active: wizardForm.strategy === card.value, locked: ntlmOn && card.value !== 'cookie' }"
                   @click="selectStrategy(card.value)"
                 >
-                  <div class="strategy-card-title">
-                    {{ card.title }}
-                    <el-icon v-if="ntlmOn && card.value === 'cookie'" class="strategy-lock-icon"><Lock /></el-icon>
+                  <div class="strategy-card-head">
+                    <span class="strategy-card-icon" aria-hidden="true">
+                      <el-icon><component :is="strategyIcon(card.value)" /></el-icon>
+                    </span>
+                    <span class="strategy-card-title">{{ card.title }}</span>
+                    <span class="strategy-card-mark" aria-hidden="true">
+                      <el-icon v-if="ntlmOn && card.value === 'cookie'" class="strategy-lock-icon"><Lock /></el-icon>
+                      <el-icon v-else-if="wizardForm.strategy === card.value" class="strategy-check-icon"><Check /></el-icon>
+                    </span>
                   </div>
                   <div class="strategy-card-desc">{{ card.desc }}</div>
                 </div>
@@ -2834,6 +2849,18 @@ const ntlmOn = computed(() => wizardForm.protocol === 'http' && wizardForm.ntlm_
 // 在向导内无卡片高亮，点任意卡片即静默改写策略。
 const strategyCardOptions = computed(() => strategyCardsForProtocol(wizardForm.protocol))
 
+// 策略卡片图标：仅作视觉分区，语义以标题为准（六种策略一一对应，
+// 新增策略必须同时补图标，缺失时回落到轮询图标而不是渲染空白）。
+const STRATEGY_ICONS: Record<string, typeof Connection> = {
+  weighted_round_robin: RefreshRight,
+  least_conn: Connection,
+  ip_hash: Location,
+  random: Operation,
+  first: Guide,
+  cookie: Link,
+}
+const strategyIcon = (strategy: string) => STRATEGY_ICONS[strategy] ?? RefreshRight
+
 const selectStrategy = (strategy: string): void => {
   if (ntlmOn.value) return // NTLM 接管：策略锁定 cookie，其余卡片置灰不可选
   wizardForm.strategy = strategy
@@ -3495,6 +3522,9 @@ const openCopyWizard = async (rule: Rule) => {
   upstreamTouched.value = []
   isCopyMode.value = true
   copySourceRuleId.value = rule.caddy_id
+  // 复制是新建路径：显式清空编辑目标（submitWizard 以 editingRule 判定 PUT/POST，
+  // 依赖调用前状态会在新入口出现时静默变成「改源规则」）。
+  editingRule.value = null
   // 复制走 POST /rules（新建），不存在版本前置条件。
   editingRuleVersion.value = ''
   let fullRule: Rule = rule
@@ -3897,7 +3927,10 @@ onUnmounted(() => {
   configRequestSeq++
   ruleLogRequestSeq++
   certInfoGeneration++
+  // 弹框 OPEN 时 SPA 切页不会触发 @close——必须在此显式停 tail，
+  // 否则 5s 定时器与整份组件闭包永久存活（isActive 已 false，轮次空转）。
   stopRuleLogPolling()
+  ruleLogTail.stop()
 })
 </script>
 
@@ -4136,6 +4169,11 @@ onUnmounted(() => {
 }
 
 .upstream-table { width: 100%; margin-bottom: 8px; }
+/* 上游表紧凑行高：列宽收窄后仍需让两行上游 + 负载策略卡落在首屏内，
+   减少纵向滚动条出现概率。 */
+.upstream-table :deep(.el-table__cell) { padding: 4px 0; }
+.upstream-table :deep(.el-table__header th .cell) { padding: 0 6px; }
+.upstream-table :deep(.el-table__body td .cell) { padding: 0 6px; }
 
 .upstream-input { width: 100%; }
 .upstream-input.is-error :deep(.el-input__wrapper) {
@@ -4146,36 +4184,106 @@ onUnmounted(() => {
    el-input-number 的 .el-input__wrapper 恒 padding 42px 双侧（为侧排 +/- 预留），
    controls-position=right 时左侧 42px 纯浪费——窄值居中/贴边都救不了，须收
    wrapper 层；右 31px 保留给右侧 spinner。内层同时左对齐。 */
-.upstream-input-small :deep(.el-input__wrapper) { padding-left: 6px; padding-right: 31px; }
+.upstream-input-small :deep(.el-input__wrapper) { padding-left: 6px; padding-right: 24px; }
 .upstream-input-small :deep(.el-input__inner) { padding-left: 0; text-align: left; }
 /* 上游表列标题不换行（列宽按内容精修后防止标题折行） */
 .upstream-table :deep(.el-table__header th .cell) { white-space: nowrap; }
 
+/* 策略卡片：3 列紧凑网格。六张卡占两行（约 140px），比原先的整卡
+   两行描述省出近 70px，避免弹框过早出现纵向滚动条；标题/描述统一基线，
+   选中态用主色描边 + 图标底色 + 右上勾选，锁定态灰化。 */
 .strategy-cards {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
   width: 100%;
-  padding: 10px 20px 14px;
+  padding: 8px 20px 10px;
   box-sizing: border-box;
+}
+
+@media (max-width: 960px) {
+  .strategy-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 560px) {
+  .strategy-cards { grid-template-columns: minmax(0, 1fr); }
 }
 
 .strategy-card {
-  flex: 1;
   min-width: 0;
-  padding: 8px 10px;
-  border: 1px solid #e5e7eb;
-  border-radius: 4px;
+  padding: 6px 10px;
+  border: 1px solid var(--el-border-color);
+  border-radius: 8px;
+  background: var(--el-fill-color-blank);
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition: border-color 0.18s ease, background-color 0.18s ease, box-shadow 0.18s ease;
   display: flex;
   flex-direction: column;
   justify-content: center;
-  min-height: 44px;
+  gap: 2px;
+  min-height: 52px;
   box-sizing: border-box;
 }
 
+.strategy-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.strategy-card-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  flex: 0 0 20px;
+  border-radius: 6px;
+  background: var(--el-fill-color-light);
+  color: var(--el-text-color-secondary);
+  font-size: 13px;
+  transition: background-color 0.18s ease, color 0.18s ease;
+}
+
+.strategy-card-title {
+  flex: 1;
+  min-width: 0;
+  font-weight: 600;
+  color: var(--el-text-color-primary);
+  font-size: 13px;
+  line-height: 18px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.strategy-card-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
+}
+
+.strategy-check-icon {
+  color: var(--el-color-primary);
+  font-size: 14px;
+}
+
+.strategy-card-desc {
+  font-size: 11px;
+  color: var(--el-text-color-secondary);
+  line-height: 14px;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+
 .compact-divider {
-  margin: 16px 0 12px 0;
+  margin: 12px 0 8px 0;
 }
 
 .compact-divider :deep(.el-divider__text) {
@@ -4189,27 +4297,19 @@ onUnmounted(() => {
 }
 
 .strategy-card:hover {
-  background-color: #f8fafc;
-  border-color: #cbd5e1;
+  border-color: var(--el-color-primary-light-5);
+  background-color: var(--el-color-primary-light-9);
 }
 
 .strategy-card.active {
-  background-color: #f0f9ff;
-  border-color: #3b82f6;
+  border-color: var(--el-color-primary);
+  background-color: var(--el-color-primary-light-9);
+  box-shadow: 0 0 0 1px var(--el-color-primary) inset;
 }
 
-.strategy-card-title {
-  font-weight: 500;
-  color: #1e293b;
-  font-size: 14px;
-  line-height: 1.2;
-}
-
-.strategy-card-desc {
-  font-size: 11px;
-  color: #64748b;
-  line-height: 1.3;
-  margin-top: 2px;
+.strategy-card.active .strategy-card-icon {
+  background: var(--el-color-primary-light-8);
+  color: var(--el-color-primary);
 }
 
 /* NTLM 接管：非 cookie 策略卡片置灰禁点 */
@@ -4218,10 +4318,14 @@ onUnmounted(() => {
   cursor: not-allowed;
 }
 
+.strategy-card.locked:hover {
+  border-color: var(--el-border-color);
+  background: var(--el-fill-color-blank);
+}
+
 .strategy-lock-icon {
-  margin-left: 4px;
-  color: #3b82f6;
-  vertical-align: -2px;
+  color: var(--el-color-primary);
+  font-size: 14px;
 }
 
 .ntlm-switch-control {

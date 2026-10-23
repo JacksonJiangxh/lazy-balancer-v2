@@ -3,6 +3,7 @@ package services
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -17,16 +18,19 @@ import (
 	"lazy-balancer-v2/internal/models"
 )
 
-// isolateMetricsState 隔离包级状态转换 map，测试间互不串扰。
+// isolateMetricsState 隔离包级状态转换 map（含 FIFO 键序），测试间互不串扰。
 func isolateMetricsState(t *testing.T) {
 	t.Helper()
 	metricsStateMu.Lock()
 	saved := metricsStateFailed
+	savedOrder := metricsStateOrder
 	metricsStateFailed = map[string]bool{}
+	metricsStateOrder = nil
 	metricsStateMu.Unlock()
 	t.Cleanup(func() {
 		metricsStateMu.Lock()
 		metricsStateFailed = saved
+		metricsStateOrder = savedOrder
 		metricsStateMu.Unlock()
 	})
 }
@@ -910,5 +914,68 @@ func TestRefreshDBOverviewMetrics_usesAtomicHandle(t *testing.T) {
 	// Then：保持前值（句柄不可用即不刷新）——读到 3 说明走了同步侧 db.DB
 	if got := service.GetOverview(); got.ActiveRules != 2 || got.TotalRules != 2 {
 		t.Fatalf("overview=%+v，刷新读了未注册的 db.DB（必须走 db.GetDB）", got)
+	}
+}
+
+// Given 静态族（metrics 采集 collect）已记为失败，随后动态族
+// （rulelog-tail-cap-<规则 id>）新增超过上限的键。
+// When 越过 metricsStateEvictCap。
+// Then 只淘汰动态族自身的旧键——静态族的状态记忆必须保留（整表重置会让
+// 持久故障族重新各打一条 warn），且 map 始终有界。
+func TestLogStateTransition_familyScopedEviction(t *testing.T) {
+	isolateMetricsState(t)
+	if got := logStateTransition("collect", true); got != "warn" {
+		t.Fatalf("首报=%q, want warn", got)
+	}
+	for i := range metricsStateEvictCap + 8 {
+		logStateTransition(fmt.Sprintf("rulelog-tail-cap-%d", i), true)
+	}
+	if got := logStateTransition("collect", true); got != "" {
+		t.Fatalf("跨族状态被清空：collect 重新记 %q（上限淘汰必须按族进行）", got)
+	}
+	if got := logStateTransition("rulelog-tail-cap-0", true); got != "warn" {
+		t.Fatalf("同族最旧键未淘汰：重新失败=%q, want warn", got)
+	}
+	metricsStateMu.Lock()
+	size := len(metricsStateFailed)
+	metricsStateMu.Unlock()
+	if size > metricsStateEvictCap {
+		t.Fatalf("状态 map 键数=%d，超出上限 %d", size, metricsStateEvictCap)
+	}
+}
+
+// 标签定位必须名精确 + 值内 `}` 安全：子串宽容会在标签后缀/值形态变化时
+// 静默取错分值。
+func TestPrometheusLabelParsing_nameBoundaryAndQuotedBrace(t *testing.T) {
+	line := `caddy_http_request_duration_seconds_count{role="admin",le="0.1",status_code="500",msg="a}b"} 42`
+
+	if got, ok := prometheusLabelValue(line, "le"); !ok || got != "0.1" {
+		t.Fatalf(`le=%q ok=%v, want "0.1"（不得命中 role="...le="）`, got, ok)
+	}
+	if got, ok := prometheusLabelValue(line, "code"); ok {
+		t.Fatalf(`code=%q ok=%v, want 不命中（只有 status_code）`, got, ok)
+	}
+	if got, ok := prometheusLabelValue(line, "status_code"); !ok || got != "500" {
+		t.Fatalf(`status_code=%q ok=%v, want "500"`, got, ok)
+	}
+	if got, ok := prometheusSampleValue(line); !ok || got != "42" {
+		t.Fatalf(`sample=%q ok=%v, want "42"（值内 } 不得截断标签块）`, got, ok)
+	}
+}
+
+// Stop 之后不得再启动清理 goroutine（stopCh 与 24h ticker 同时就绪时的
+// select 竞态）：Start 返回即代表清理已退出。
+func TestMetricsService_startHistoryCleanupAfterStopDoesNotRun(t *testing.T) {
+	service := NewMetricsService("http://127.0.0.1:1/metrics", 30)
+	var ran atomic.Int32
+	oldHook := metricsCleanupHook
+	metricsCleanupHook = func() { ran.Add(1) }
+	t.Cleanup(func() { metricsCleanupHook = oldHook })
+
+	service.Stop()
+	service.startHistoryCleanup()
+	time.Sleep(50 * time.Millisecond)
+	if got := ran.Load(); got != 0 {
+		t.Fatalf("Stop 后仍执行了 %d 轮历史清理（关停竞态）", got)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -53,7 +54,8 @@ func ValidateClusterAccessURL(value string) error {
 }
 
 // NormalizeClusterNodeName 节点名落库侧单源归一：去首尾空白、
-// 剥离控制字符、按 schema VARCHAR(100) 上限截断到合法 UTF-8 边界。HTTP 入口
+// 剥离控制字符与 Unicode 格式字符（Cf，保留 ZWJ）、按 schema VARCHAR(100)
+// 上限截断到合法 UTF-8 边界。HTTP 入口
 // 由 binding max=100 拦截；服务层直调与旧客户端仍需同一兜底（SQLite 不强制
 // VARCHAR 长度），否则 16KB 注册体可把超长/带换行的名字写进 nodes 并回显。
 func NormalizeClusterNodeName(name string) string {
@@ -62,6 +64,13 @@ func NormalizeClusterNodeName(name string) string {
 		// C0、DEL 与 C1（0x80-0x9F）均为控制字符；旧实现漏 C1，注释口径
 		// 与行为不一致。
 		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+			return -1
+		}
+		// Unicode Cf（格式字符）：双向覆盖/重排（U+202A-202E、U+2066-2069）、
+		// 零宽与方向标记、BOM 等。节点名进入集群列表与审计详情，格式字符
+		// 可让显示名视觉重排、与真实节点名混淆（「哪个是主节点」被污染）。
+		// ZWJ（U+200D）保留——emoji 组合的合法组成，删除会破坏名称显示。
+		if r != '\u200d' && unicode.Is(unicode.Cf, r) {
 			return -1
 		}
 		return r

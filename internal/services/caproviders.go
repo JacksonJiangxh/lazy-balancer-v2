@@ -263,7 +263,9 @@ func (s *CAProviderService) UpdateCAProvider(id int, req models.UpdateCAProvider
 	// old 保持 SELECT 读到的原值供调用方做审计比对。
 	old := existing
 	if req.Name != nil {
-		existing.Name = *req.Name
+		// 与证书配置名称归一化同口径：纯空白名会被当作合法名称落库，
+		// 列表/选择器出现无法辨识的行；API 可绕过前端 trim，必须在写入口归一。
+		existing.Name = strings.TrimSpace(*req.Name)
 	}
 	if req.Provider != nil {
 		existing.Provider = *req.Provider
@@ -421,7 +423,9 @@ func AutoProvisionZeroSSLEAB(ctx context.Context, provider *models.CAProvider) e
 		}
 	}
 	if creds.EABKID != "" && creds.EABHMACKey != "" {
-		Logf("warn", "AutoProvisionZeroSSLEAB: provider %d already has EAB credentials, skipping", provider.ID)
+		// 正常态：ZeroSSL 首次成功获取 EAB 后每次签发/测试预检都会走到这里，
+		// warn 会按签发频率持续刷屏并淹没真正的 EAB/凭据异常。
+		Logf("info", "AutoProvisionZeroSSLEAB: provider %d already has EAB credentials, skipping", provider.ID)
 		return nil
 	}
 	Logf("info", "AutoProvisionZeroSSLEAB: provider %d missing EAB, auto-fetching", provider.ID)

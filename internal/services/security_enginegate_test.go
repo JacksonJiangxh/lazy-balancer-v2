@@ -317,6 +317,10 @@ func TestEngineGate_precheckGeoIPTrustContinuationExemptsTrustedIP(t *testing.T)
 func TestEngineGate_trustOnlyOffAndCustomOnlyDoNotEmitIdleWAF(t *testing.T) {
 	trust := json.RawMessage(`["203.0.113.9"]`)
 	enabledCustom := json.RawMessage(`[{"id":1,"name":"r","enabled":true,"action":"block","score":5,"conditions":[{"target":"uri","operator":"contains","pattern":"/x"}]}]`)
+	// 启用但发射侧必跳过（空条件）：摘要按 customRuleEmittable 判 false，
+	// 发射侧必须同判据——否则引擎为一条永不发射的规则而开（且摘要少报
+	// 引擎实际承载的信任规则能力）。
+	unemittableCustom := json.RawMessage(`[{"id":55,"name":"bad","enabled":true,"action":"block","score":5,"conditions":[]}]`)
 	cases := []struct {
 		name       string
 		policy     *models.SecurityPolicy
@@ -325,6 +329,7 @@ func TestEngineGate_trustOnlyOffAndCustomOnlyDoNotEmitIdleWAF(t *testing.T) {
 		{name: "off trust only", policy: &models.SecurityPolicy{Mode: "off", IPWhitelistEnabled: true, IPWhitelist: trust}},
 		{name: "custom only trust only", policy: &models.SecurityPolicy{Mode: "custom_only", IPWhitelistEnabled: true, IPWhitelist: trust}},
 		{name: "custom only trust and custom", policy: &models.SecurityPolicy{Mode: "custom_only", IPWhitelistEnabled: true, IPWhitelist: trust, CustomRules: enabledCustom}, wantEngine: true},
+		{name: "custom only trust and unemittable custom", policy: &models.SecurityPolicy{Mode: "custom_only", IPWhitelistEnabled: true, IPWhitelist: trust, CustomRules: unemittableCustom}},
 		{name: "off trust and ACL", policy: &models.SecurityPolicy{Mode: "off", IPWhitelistEnabled: true, IPWhitelist: trust, IPACLEnabled: true, IPACLMode: "deny", IPACLList: `["198.51.100.7"]`}, wantEngine: true},
 		{name: "off trust and parked custom", policy: &models.SecurityPolicy{Mode: "off", IPWhitelistEnabled: true, IPWhitelist: trust, CustomRules: enabledCustom}},
 		{name: "stage0 trust", policy: &models.SecurityPolicy{Mode: "off", PolicyType: models.PolicyTypeStage0, IPWhitelistEnabled: true, IPWhitelist: trust}},
@@ -342,5 +347,112 @@ func TestEngineGate_trustOnlyOffAndCustomOnlyDoNotEmitIdleWAF(t *testing.T) {
 				compileForEngineGate(t, directives)
 			}
 		})
+	}
+}
+
+// crsRemovalTouchesInfra 报告一条 SecRuleRemoveById 目标是否触及基础设施组
+// （901 初始化 / 949 请求评估 / 959 响应评估）——引擎行为断言之外的形状门。
+func crsRemovalTouchesInfra(target string) bool {
+	lo, hi, ok := crsNumericIDRange(strings.TrimSpace(target))
+	if !ok {
+		return false
+	}
+	for _, infra := range []struct{ lo, hi int }{
+		{901000, 901999}, {949000, 949999}, {959000, 959999},
+	} {
+		if lo <= infra.hi && hi >= infra.lo {
+			return true
+		}
+	}
+	return false
+}
+
+// 基础设施组（901/949/959）缺失即静默失效：blocking 策略的 CRS 排除面不得
+// 摘除评估组，否则评分永不评估、全部命中退化为 logged。验证终点=引擎级：
+// 渲染产物里不得出现触及基础设施段的 SecRuleRemoveById，且真实事务仍被
+// 949110 拦截（负对照证明「摘除后确实不再拦截」，即该守卫不是纸面规则）。
+func TestEngineGate_infraCRSExclusionsCannotDisableBlocking(t *testing.T) {
+	dir := t.TempDir()
+	rulesDir := filepath.Join(dir, "rules")
+	if err := os.MkdirAll(rulesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{
+		"REQUEST-901-INITIALIZATION.conf",
+		"REQUEST-949-BLOCKING-EVALUATION.conf",
+		"RESPONSE-959-BLOCKING-EVALUATION.conf",
+		"REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+	} {
+		if err := os.WriteFile(filepath.Join(rulesDir, name), []byte("# stub"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	useCRSDirectivesDir(t, dir)
+
+	removalLines := func(directives string) []string {
+		var out []string
+		for _, line := range strings.Split(directives, "\n") {
+			if strings.HasPrefix(line, "SecRuleRemoveById ") {
+				out = append(out, strings.TrimSpace(strings.TrimPrefix(line, "SecRuleRemoveById ")))
+			}
+		}
+		return out
+	}
+
+	infraTargets := []string{
+		"01", "49", "59",
+		"901100", "949110", "959100",
+		"REQUEST-901-INITIALIZATION.conf",
+		"REQUEST-949-BLOCKING-EVALUATION.conf",
+		"RESPONSE-959-BLOCKING-EVALUATION.conf",
+		"900000-902000", "948000-950000", "959500-960000",
+	}
+	for _, target := range infraTargets {
+		t.Run("skip-"+target, func(t *testing.T) {
+			raw, err := json.Marshal([]map[string]string{{"target": target, "scope": "all"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			p := &models.SecurityPolicy{ID: 7, AnomalyThreshold: 5, Mode: "blocking", CRSExcludedRules: raw}
+			directives := mustDirectives(BuildCorazaDirectives(p, nil, "", false, 0, "lb_test"))
+			for _, removed := range removalLines(directives) {
+				if crsRemovalTouchesInfra(removed) {
+					t.Fatalf("基础设施组排除不得发射 SecRuleRemoveById %s（blocking 会静默退化为仅记录）:\n%s", removed, directives)
+				}
+			}
+			compileForEngineGate(t, directives)
+		})
+	}
+
+	// 非基础设施排除照常发射（回归形状）。
+	t.Run("keep-942", func(t *testing.T) {
+		raw, _ := json.Marshal([]map[string]string{{"target": "942100", "scope": "all"}})
+		p := &models.SecurityPolicy{ID: 7, AnomalyThreshold: 5, Mode: "blocking", CRSExcludedRules: raw}
+		directives := mustDirectives(BuildCorazaDirectives(p, nil, "", false, 0, "lb_test"))
+		if !strings.Contains(directives, "SecRuleRemoveById 942100") {
+			t.Fatalf("非基础设施排除必须照常发射:\n%s", directives)
+		}
+		compileForEngineGate(t, directives)
+	})
+
+	// 引擎行为：949110 在场时事务被拦截；显式摘除后不再拦截（负对照）。
+	stub := "SecRuleEngine On\n" +
+		`SecRule REQUEST_URI "@rx .*" "id:949110,phase:1,deny,log"` + "\n"
+	interrupts := func(directives string) bool {
+		waf, err := coraza.NewWAF(coraza.NewWAFConfig().WithDirectives(directives))
+		if err != nil {
+			t.Fatalf("engine rejected directives: %v\n%s", err, directives)
+		}
+		tx := waf.NewTransaction()
+		defer func() { _ = tx.Close() }()
+		tx.ProcessConnection("203.0.113.9", 5555, "127.0.0.1", 80)
+		tx.ProcessURI("/anything", "GET", "HTTP/1.1")
+		return tx.ProcessRequestHeaders() != nil
+	}
+	if !interrupts(stub) {
+		t.Fatal("基线：949110 deny 必须拦截（否则断言无意义）")
+	}
+	if interrupts(stub + "SecRuleRemoveById 949110\n") {
+		t.Fatal("负对照：显式摘除 949110 后必须不再拦截（证明基础设施排除确实会废掉 blocking）")
 	}
 }

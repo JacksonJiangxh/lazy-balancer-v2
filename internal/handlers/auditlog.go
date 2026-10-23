@@ -362,22 +362,24 @@ func buildAuditLogFilters(c *gin.Context, loc *time.Location) (string, []interfa
 const auditLogDeepPageLimit = 500
 
 func (h *Handlers) GetAuditLogs(c *gin.Context) {
-	// 与 GetAuditLogOptions 同口径的 nil 守卫。降级形态与正常路径同键集：
-	// total_stale=true（计数不可信）+ partial=true，消费方无需按状态切换解码。
-	if db.AuditDB == nil {
-		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "审计库未就绪",
-			Data: auditLogListPayload([]map[string]any{}, 0, true, true, 1, 20)})
-		return
-	}
 	// 分页参数统一解析（与安全事件/证书任务同口径）：非整数 400；<1 回默认；
 	// page_size 超上限钳到 100（此前静默回默认 20——传 500 只拿到 20 条且无
 	// 任何信号）。page 超阈值仍显式 400（深 OFFSET 退化，见下）。
+	// 解析必须先于 nil 守卫：降级响应也按请求分页回显，否则 ?page=3&page_size=50
+	// 在审计库未就绪时拿到第 1 页 20 条，按文档生成的分页器会跳回首页。
 	page, ok := parsePaginationParam(c, "page", 1, math.MaxInt)
 	if !ok {
 		return
 	}
 	pageSize, ok := parsePaginationParam(c, "page_size", 20, 100)
 	if !ok {
+		return
+	}
+	// 与 GetAuditLogOptions 同口径的 nil 守卫。降级形态与正常路径同键集：
+	// total_stale=true（计数不可信）+ partial=true，消费方无需按状态切换解码。
+	if db.AuditDB == nil {
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "审计库未就绪",
+			Data: auditLogListPayload([]map[string]any{}, 0, true, true, page, pageSize)})
 		return
 	}
 	// 深翻页折中：页码分页保留（可跳页、有总页数），但超过阈值显式 400 并给出
@@ -473,6 +475,9 @@ func (h *Handlers) GetAuditLogs(c *gin.Context) {
 	if logs == nil {
 		logs = []AuditLogEntry{}
 	}
+	// display_name 富化失败同样置 partial=true：列表已静默退化为 username，
+	// 消费方必须能感知「部分降级」（与文档 partial 语义一致）。
+	displayNameDegraded := false
 	if len(usernames) > 0 {
 		args := make([]interface{}, 0, len(usernames))
 		placeholders := make([]string, 0, len(usernames))
@@ -482,21 +487,25 @@ func (h *Handlers) GetAuditLogs(c *gin.Context) {
 		}
 		userRows, err := db.DB.QueryContext(c.Request.Context(), "SELECT username, COALESCE(NULLIF(TRIM(display_name), ''), username) FROM users WHERE username IN ("+strings.Join(placeholders, ",")+")", args...)
 		if err != nil {
+			displayNameDegraded = true
 			services.Logf("error", "GetAuditLogs: failed to enrich usernames, using usernames: %v", err)
 		} else {
 			displayNames := map[string]string{}
 			for userRows.Next() {
 				var username, displayName string
 				if err := userRows.Scan(&username, &displayName); err != nil {
+					displayNameDegraded = true
 					services.Logf("error", "GetAuditLogs: failed to scan username enrichment, using usernames: %v", err)
 					break
 				}
 				displayNames[username] = displayName
 			}
 			if err := userRows.Err(); err != nil {
+				displayNameDegraded = true
 				services.Logf("error", "GetAuditLogs: failed to iterate username enrichment, using available names: %v", err)
 			}
 			if err := userRows.Close(); err != nil {
+				displayNameDegraded = true
 				services.Logf("error", "GetAuditLogs: failed to close username enrichment rows: %v", err)
 			}
 			for i := range logs {
@@ -507,5 +516,5 @@ func (h *Handlers) GetAuditLogs(c *gin.Context) {
 		}
 	}
 
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: auditLogListPayload(logs, total, totalStale, false, page, pageSize)})
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: auditLogListPayload(logs, total, totalStale, displayNameDegraded, page, pageSize)})
 }

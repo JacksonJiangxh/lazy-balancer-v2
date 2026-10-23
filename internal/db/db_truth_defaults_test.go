@@ -49,6 +49,16 @@ func TestFreshSchemaDefaults_MatchGovernedConstants(t *testing.T) {
 		{"security_policies", "anomaly_threshold", fmt.Sprint(DefaultAnomalyThreshold), 0},
 		// 时区：fresh DDL DEFAULT 与读侧兜底单源（空串非法库值，启动归一收敛）。
 		{"global_config", "timezone", "'" + DefaultTimezone + "'", 0},
+		// 任务级排程：fresh DDL DEFAULT 与 services 读失败兜底同源。
+		{"security_crs_version", "schedule_days", "'" + DefaultScheduleDays + "'", 1},
+		{"security_crs_version", "schedule_time", "'" + DefaultScheduleTime + "'", 1},
+		{"security_ip2region_version", "schedule_days", "'" + DefaultScheduleDays + "'", 1},
+		{"security_ip2region_version", "schedule_time", "'" + DefaultScheduleTime + "'", 1},
+		// 日志体量/保留期：fresh DDL DEFAULT 与读侧 COALESCE 绑定参数同源。
+		{"global_config", "task_log_size_mb", fmt.Sprint(DefaultTaskLogSizeMB), 0},
+		{"global_config", "audit_log_size_mb", fmt.Sprint(DefaultAuditLogSizeMB), 0},
+		{"global_config", "runtime_log_size_mb", fmt.Sprint(DefaultRuntimeLogSizeMB), 0},
+		{"global_config", "audit_retention_months", fmt.Sprint(DefaultAuditRetentionMonths), 0},
 	}
 	for _, tc := range cases {
 		var dflt *string
@@ -90,6 +100,11 @@ func TestRunMigrationsColumnDefaults_MatchGovernedConstants(t *testing.T) {
 		{"security_events_row_cap", fmt.Sprint(DefaultSecurityEventsRowCap), 1},
 		{"threat_traffic_sample_n", fmt.Sprint(DefaultThreatTrafficSampleN), 1},
 		{"threat_screen_mode", "'" + DefaultThreatScreenMode + "'", 1},
+		// 威胁/爬虫任务级排程（newColumns 补列）：DDL DEFAULT 与 services 兜底同源。
+		{"threat_schedule_days", "'" + DefaultScheduleDays + "'", 1},
+		{"threat_schedule_time", "'" + DefaultScheduleTime + "'", 1},
+		{"crawler_schedule_days", "'" + DefaultScheduleDays + "'", 1},
+		{"crawler_schedule_time", "'" + DefaultScheduleTime + "'", 1},
 	}
 	for _, tc := range cases {
 		var dflt *string

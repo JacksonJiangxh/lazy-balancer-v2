@@ -166,24 +166,108 @@ func TestLbbakImport_successDiscardsWafSnapshot(t *testing.T) {
 	}
 }
 
-// 失败提示必须区分「已回退」与「回退失败/未回退」——分叉可见性不得回退到
-// 固定文案。
+// 失败提示必须区分三态：确定回滚+已回退 / 确定回滚+回退失败或未回退 /
+// 提交结果不确定（文件保持导入后状态）。分叉可见性不得回退到固定文案，也不得
+// 在不确定态断言「一致」。
 func TestLbbakWafRollbackWarning_distinguishesRestoredFromSplit(t *testing.T) {
-	if got := lbbakWafRollbackWarning(false, false, nil); got != "" {
+	if got := lbbakWafRollbackWarning(false, false, nil, false); got != "" {
 		t.Fatalf("no landed file must produce no warning, got %q", got)
 	}
-	restored := lbbakWafRollbackWarning(true, true, nil)
+	restored := lbbakWafRollbackWarning(true, true, nil, false)
 	if !strings.Contains(restored, "已回退到导入前状态") || strings.Contains(restored, "可能分裂") {
 		t.Fatalf("restored warning=%q, want rollback confirmed without split claim", restored)
 	}
-	split := lbbakWafRollbackWarning(true, true, errors.New("boom"))
+	split := lbbakWafRollbackWarning(true, true, errors.New("boom"), false)
 	if !strings.Contains(split, "回退失败") || !strings.Contains(split, "可能分裂") {
 		t.Fatalf("failed rollback warning=%q, must expose the split", split)
 	}
-	legacy := lbbakWafRollbackWarning(true, false, nil)
+	legacy := lbbakWafRollbackWarning(true, false, nil, false)
 	if !strings.Contains(legacy, "可能分裂") {
 		t.Fatalf("unattempted rollback warning=%q, must expose the split", legacy)
 	}
+	// 提交结果不确定：不断言一致、不断言已回退，给人工核对指引。
+	indeterminate := lbbakWafRollbackWarning(true, false, nil, true)
+	for _, want := range []string{"提交结果不确定", "未回退", "核对"} {
+		if !strings.Contains(indeterminate, want) {
+			t.Fatalf("indeterminate warning=%q, must contain %q", indeterminate, want)
+		}
+	}
+	for _, forbidden := range []string{"已回退到导入前状态", "（文件与版本记录一致）"} {
+		if strings.Contains(indeterminate, forbidden) {
+			t.Fatalf("indeterminate warning=%q, must not claim %q（结论不得超出可断言范围）", indeterminate, forbidden)
+		}
+	}
+	// 提交不确定但文件未落盘：无文件面结论可言（库侧不确定由正文阶段描述承担）。
+	if got := lbbakWafRollbackWarning(false, false, nil, true); got != "" {
+		t.Fatalf("indeterminate commit without landed files must produce no file warning, got %q", got)
+	}
+}
+
+// 提交结果不确定（tx.Commit 报错）时文件回退必须不执行：文件保持导入后状态，
+// 快照丢弃，结论由响应/审计按不确定态给出。对照形态（确定回滚）仍逐字节回退。
+func TestLbbakImport_indeterminateCommitKeepsWafFiles(t *testing.T) {
+	t.Run("indeterminate_commit_keeps_imported_files", func(t *testing.T) {
+		h := newBackupTestHandlers(t)
+		crsDir, _ := overrideTestWafPaths(t)
+		rulePath := filepath.Join(crsDir, "rules", "crs-setup.conf")
+		preImport := []byte("# pre-import-crs\n")
+		if err := os.WriteFile(rulePath, preImport, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		snapshot, err := snapshotLbbakWafTargets(&lbbakPayload{CRSTarGz: []byte("x")}, false)
+		if err != nil || snapshot == nil {
+			t.Fatalf("snapshot: %v (nil=%v)", err, snapshot == nil)
+		}
+		snapshotRoot := snapshot.root
+		// 导入落盘后的现场（事务提交前）。
+		imported := []byte("# imported-crs\n")
+		if err := os.WriteFile(rulePath, imported, 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		session := &configImportSession{h: h, wafSnapshot: snapshot, commitIndeterminate: true}
+		_ = session.abort(errors.New("数据库提交结果不确定：disk I/O error"))
+
+		// Then 文件未被回退（不确定态禁止制造确定分叉），快照已丢弃。
+		assertFileBytes(t, rulePath, imported)
+		if session.wafRestoreAttempted {
+			t.Fatal("提交结果不确定时不得执行文件回退（回退只在确定回滚时执行）")
+		}
+		if _, err := os.Stat(snapshotRoot); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("快照目录必须被丢弃, stat err=%v", err)
+		}
+		if got := lbbakWafRollbackWarning(true, session.wafRestoreAttempted, session.wafRestoreErr, session.commitIndeterminate); !strings.Contains(got, "提交结果不确定") {
+			t.Fatalf("失败响应文件面提示=%q, want 不确定态", got)
+		}
+	})
+
+	t.Run("determinate_failure_restores_pre_import_files", func(t *testing.T) {
+		h := newBackupTestHandlers(t)
+		crsDir, _ := overrideTestWafPaths(t)
+		rulePath := filepath.Join(crsDir, "rules", "crs-setup.conf")
+		preImport := []byte("# pre-import-crs\n")
+		if err := os.WriteFile(rulePath, preImport, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		snapshot, err := snapshotLbbakWafTargets(&lbbakPayload{CRSTarGz: []byte("x")}, false)
+		if err != nil || snapshot == nil {
+			t.Fatalf("snapshot: %v (nil=%v)", err, snapshot == nil)
+		}
+		if err := os.WriteFile(rulePath, []byte("# imported-crs\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		session := &configImportSession{h: h, wafSnapshot: snapshot}
+		_ = session.abort(errors.New("caddy 校验失败"))
+
+		assertFileBytes(t, rulePath, preImport)
+		if !session.wafRestoreAttempted || session.wafRestoreErr != nil {
+			t.Fatalf("确定回滚必须执行文件回退（attempted=%v err=%v）", session.wafRestoreAttempted, session.wafRestoreErr)
+		}
+		if got := lbbakWafRollbackWarning(true, session.wafRestoreAttempted, session.wafRestoreErr, session.commitIndeterminate); !strings.Contains(got, "已回退到导入前状态") {
+			t.Fatalf("确定回滚+回退成功的文件面提示=%q, want 一致态", got)
+		}
+	})
 }
 
 // assertFileBytes 逐字节断言文件内容（真文件比对）。

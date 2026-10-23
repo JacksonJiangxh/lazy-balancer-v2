@@ -40,6 +40,12 @@ func AppendThreatUpdateLog(level, stage, message string) {
 	writeUpdateLog("threat", level, stage, message)
 }
 
+// WriteCrawlerUpdateLog 爬虫地址库更新流水（统一到 tasks/crawlerbot-update.log）。
+// 错误行同样必须走本入口——直接 TeeTaskLogTime 会绕过时间戳/级别口径单源。
+func WriteCrawlerUpdateLog(level, stage, message string) {
+	writeUpdateLog(CrawlerTaskID, level, stage, message)
+}
+
 // 任务日志大小配置缓存（缓存机制单源 dbValueCache——此前与审计
 // 侧各有一套实现，任务侧还把读库失败的回退值写进缓存）。TTL 5 分钟：设置保存
 // 经 InvalidateTaskLogSizeCache 立刻生效，TTL 只覆盖带外改库。

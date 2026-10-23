@@ -909,6 +909,24 @@ func RouteIDBelongsToRule(routeID, ruleID string) bool {
 	return false
 }
 
+// RuleIDNamespaceConflict 报告 ruleID 与 ids 中另一条规则 ID 是否撞入生成式
+// 子路由 @id 命名空间（<ruleID>_path_<n> / <ruleID>_geoip / <ruleID>_redirect）。
+// 子路由 @id 由字符串拼接产生，同形规则 ID 会让 Caddy 在 /load 以 duplicate ID
+// 拒绝整份配置（400 + 回滚）；写/导入/集群应用侧提前点名冲突的两条规则，
+// 用户得到字段级中文错误而非引擎的配置路径报错。判定复用运行配置归属函数
+// RouteIDBelongsToRule，两侧命名空间口径保持同源。无冲突返回空串。
+func RuleIDNamespaceConflict(ruleID string, ids []string) string {
+	for _, other := range ids {
+		if other == ruleID {
+			continue
+		}
+		if RouteIDBelongsToRule(ruleID, other) {
+			return other
+		}
+	}
+	return ""
+}
+
 // GetConfig gets current Caddy configuration
 func (s *CaddyService) GetConfig() (map[string]interface{}, error) {
 	resp, err := s.client.Get(s.adminURL + "/config/")

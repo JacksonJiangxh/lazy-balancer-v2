@@ -48,6 +48,10 @@ type mockIdP struct {
 	prefUsername string
 	// claimName:覆盖 id_token 的 name
 	claimName atomic.Value
+	// emailVerifiedMode 控制 id_token 的 email_verified 声明形态：
+	// 缺省（未设置）="true"；"false"=显式 false；"absent"=不返回该声明。
+	// 域白名单要求已验证邮箱，测试据此覆盖三种形态。
+	emailVerifiedMode atomic.Value
 	// nonceByChallenge:PKCE challenge → nonce——并发双登录各自 authorize 后,
 	// 令牌交换按 code_verifier 派生 challenge 回查本登录的 nonce(单登录场景
 	// lastNonce 兜底同值)。
@@ -142,11 +146,20 @@ func newMockIdP(t *testing.T) *mockIdP {
 		}
 		now := time.Now()
 		name, _ := m.claimName.Load().(string)
-		tok := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
+		idClaims := jwt.MapClaims{
 			"iss": m.issuer, "aud": "test-client", "sub": "user-sub-1",
 			"email": "oidc@example.com", "preferred_username": pref, "name": name,
 			"nonce": nonce, "iat": now.Unix(), "exp": now.Add(time.Hour).Unix(),
-		})
+		}
+		switch mode, _ := m.emailVerifiedMode.Load().(string); mode {
+		case "absent":
+			// 不返回 email_verified（部分 IdP 形态）
+		case "false":
+			idClaims["email_verified"] = false
+		default:
+			idClaims["email_verified"] = true
+		}
+		tok := jwt.NewWithClaims(jwt.SigningMethodRS256, idClaims)
 		signed, _ := tok.SignedString(key)
 		json.NewEncoder(w).Encode(map[string]any{
 			"access_token": "at", "token_type": "Bearer",
@@ -1050,5 +1063,79 @@ func TestOIDCSettings_auditFieldDelta(t *testing.T) {
 	}
 	if strings.Contains(deleteDetail, "secret-after") {
 		t.Fatalf("delete audit leaks secret: %q", deleteDetail)
+	}
+}
+
+// 冷缓存并发 discovery 必须合并（per-issuer singleflight）：登录风暴/公开端点
+// 打点不得逐请求放大出站连接。
+func TestOIDCProvider_coalescesConcurrentDiscovery(t *testing.T) {
+	var hits atomic.Int32
+	var issuer string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/.well-known/openid-configuration" {
+			http.NotFound(w, r)
+			return
+		}
+		hits.Add(1)
+		time.Sleep(200 * time.Millisecond)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"issuer":                                issuer,
+			"authorization_endpoint":                issuer + "/authorize",
+			"token_endpoint":                        issuer + "/token",
+			"jwks_uri":                              issuer + "/jwks.json",
+			"response_types_supported":              []string{"code"},
+			"subject_types_supported":               []string{"public"},
+			"id_token_signing_alg_values_supported": []string{"RS256"},
+		})
+	}))
+	defer server.Close()
+	issuer = server.URL
+	oidcProvMu.Lock()
+	delete(oidcProvCach, issuer)
+	oidcProvMu.Unlock()
+
+	const callers = 6
+	var wg sync.WaitGroup
+	errs := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := oidcProvider(issuer); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("并发 discovery 失败: %v", err)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("discovery 命中 %d 次, want 1（并发请求必须合并为一次出站）", got)
+	}
+}
+
+// 库内 issuer 不合规时公开状态端点按未启用呈现（fail-closed），但降级必须
+// 60s 节流留痕——管理员可修复的配置错误不能只靠手工 GET 端点发现。
+func TestOIDCStatus_invalidStoredIssuerLogsAndDisables(t *testing.T) {
+	idp := newMockIdP(t)
+	router, _ := setupOIDCTest(t, idp)
+	if _, err := db.DB.Exec(`UPDATE global_config SET oidc_config=? WHERE id=1`,
+		`{"enabled":true,"issuer":"ftp://bad.example","client_id":"c","client_secret":"s"}`); err != nil {
+		t.Fatal(err)
+	}
+	oidcStatusIssuerLog.Lock()
+	oidcStatusIssuerLog.at = time.Time{}
+	oidcStatusIssuerLog.Unlock()
+	logs := captureLog(t)
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/auth/oidc/status", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"enabled":false`) {
+		t.Fatalf("status=%d body=%s, want 200 disabled", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(logs.String(), "issuer 不合规") {
+		t.Fatalf("降级必须留痕, logs=%q", logs.String())
 	}
 }

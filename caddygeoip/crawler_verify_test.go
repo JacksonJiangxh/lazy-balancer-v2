@@ -815,3 +815,100 @@ func TestCrawlerIPRangeSnapshot_aggregatesSortedDisjoint(t *testing.T) {
 		}
 	}
 }
+
+// 快照「不可用」必须可观测：缺失（冷启动正常形态）保持静默，但权限/目录等
+// 读错误与内容不可解析（空文件/半截 JSON/非对象 JSON）都是 360 豁免静默失效
+// 的真实形态，必须留痕（本模块自订「不可用必须可见」不变量）。
+func TestCrawlerIPRangeSnapshot_unavailableReasonsAreLogged(t *testing.T) {
+	oldFile := crawlerIPListFile
+	oldRead := crawlerReadBoundedFile
+	oldInterval := crawlerSnapshotLogInterval
+	t.Cleanup(func() {
+		crawlerIPListFile = oldFile
+		crawlerReadBoundedFile = oldRead
+		crawlerSnapshotLogInterval = oldInterval
+		resetCrawlerIPRangeCacheForTest()
+		resetCrawlerSnapshotLogThrottleForTest()
+	})
+	crawlerIPListFile = filepath.Join(t.TempDir(), "crawler-ip-lists.json")
+	// 非零节流间隔：记录「路径|原因」键，用例据此区分三类不可用原因。
+	crawlerSnapshotLogInterval = time.Hour
+
+	cases := []struct {
+		name   string
+		read   func(string, int64) ([]byte, os.FileInfo, error)
+		reason string
+	}{
+		{
+			name: "read-error",
+			read: func(string, int64) ([]byte, os.FileInfo, error) {
+				return nil, nil, os.ErrPermission
+			},
+			reason: "read",
+		},
+		{
+			name: "empty",
+			read: func(string, int64) ([]byte, os.FileInfo, error) {
+				info, err := os.Stat(crawlerIPListFile)
+				if err != nil {
+					if werr := os.WriteFile(crawlerIPListFile, nil, 0o600); werr != nil {
+						t.Fatal(werr)
+					}
+					info, err = os.Stat(crawlerIPListFile)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				return []byte{}, info, nil
+			},
+			reason: "empty",
+		},
+		{
+			name: "invalid-json",
+			read: func(string, int64) ([]byte, os.FileInfo, error) {
+				if err := os.WriteFile(crawlerIPListFile, []byte(`[]`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				info, err := os.Stat(crawlerIPListFile)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return []byte(`[]`), info, nil
+			},
+			reason: "parse",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			crawlerReadBoundedFile = tc.read
+			resetCrawlerIPRangeCacheForTest()
+			resetCrawlerSnapshotLogThrottleForTest()
+			snap := loadCrawlerIPRangeSnapshot()
+			if snap.ok {
+				t.Fatalf("%s：不可用快照必须 fail-closed", tc.name)
+			}
+			if got := crawlerSnapshotLogCallsForTest.Load(); got != 1 {
+				t.Fatalf("%s：不可用原因必须留痕，告警 %d 条, want 1", tc.name, got)
+			}
+			crawlerSnapshotLogMu.Lock()
+			_, logged := crawlerSnapshotLogLast[crawlerIPListFile+"|"+tc.reason]
+			crawlerSnapshotLogMu.Unlock()
+			if !logged {
+				t.Fatalf("%s：告警原因须为 %q，实际记录 %v", tc.name, tc.reason, crawlerSnapshotLogLast)
+			}
+		})
+	}
+
+	// 冷启动缺失形态保持静默：Caddy 可能先于根服务生成快照。
+	crawlerReadBoundedFile = func(string, int64) ([]byte, os.FileInfo, error) {
+		return nil, nil, os.ErrNotExist
+	}
+	resetCrawlerIPRangeCacheForTest()
+	resetCrawlerSnapshotLogThrottleForTest()
+	if snap := loadCrawlerIPRangeSnapshot(); snap.ok {
+		t.Fatal("缺失快照必须 fail-closed")
+	}
+	if got := crawlerSnapshotLogCallsForTest.Load(); got != 0 {
+		t.Fatalf("冷启动缺失形态不得告警，实际 %d 条", got)
+	}
+}

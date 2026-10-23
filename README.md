@@ -46,7 +46,7 @@ docker run -d --name lazy-balancer \
 
 > 镜像标签:`latest` 指向最近一次**稳定版**(无通道后缀);测试版标签带 `-beta` 后缀(形如 `:v2.3.8-beta`),需要尝鲜或复现问题时请显式指定该标签。
 
-挂载说明:`/app/data` 数据库与配置(必选)、`/app/certs` 证书与私钥(必选)、`/app/backup` 自动备份落盘目录(必选——不挂载则容器重建后备份文件丢失)、`/app/logs` 日志(推荐)、`/app/waf` 规则库与 GeoIP(推荐)。
+挂载说明:`/app/data` 数据库、配置与 IP 归属地库(必选——IP2Region xdb 实际位于 `/app/data/ip2region.xdb`,随数据卷持久化)、`/app/certs` 证书与私钥(必选)、`/app/backup` 自动备份落盘目录(必选——不挂载则容器重建后备份文件丢失)、`/app/logs` 日志(推荐)、`/app/waf` WAF/CRS 规则库(推荐)。
 
 > host 网络模式仅推荐在 Linux 宿主使用。Docker Desktop 的 host 网络支持依版本/设置而异，请用上面的 `-p` 命令，并将 `/app/data` 放在 named volume(`lb-data`)；bind mount 经 FUSE 共享层有 SQLite WAL 丢页风险(Linux 宿主 bind mount 无此问题)。仓库 `docker-compose.yml` 的主节点固定 host 网络，仅适用于 Linux 开发/部署场景。
 

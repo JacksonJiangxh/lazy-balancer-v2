@@ -155,6 +155,11 @@ type configImportSession struct {
 	// 落盘发生在事务提交之前：abort 回滚数据库后必须把文件同批回退，
 	// commit 成功则丢弃。nil=本次导入未写任何 WAF 文件。
 	wafSnapshot *lbbakWafFileSnapshot
+	// commitIndeterminate 标记 tx.Commit() 报错：数据库/sql 在 Commit 报错时
+	// 无法区分「未提交」与「已提交但确认丢失」，此时文件回退会把「可能已提交
+	// 的新代」换成旧代——不确定态禁止回退（只在确定回滚时执行），响应与审计
+	// 必须显式给人工核对指引。
+	commitIndeterminate bool
 	// wafRestoreAttempted/wafRestoreErr 记录 abort 时的文件回退结论，
 	// 失败响应据此显性告知文件是否与数据库分叉（不得静默）。
 	wafRestoreAttempted bool
@@ -175,6 +180,11 @@ var errImportTaskDrainIncomplete = errors.New("在途任务未排空，请稍后
 // fail-closed 拒绝导入（部分 Run 体不消费取消信号），恢复调度并留失败审计，
 // 不再让旧任务与全量替换并发。
 var importInFlightDrainTimeout = 30 * time.Second
+
+// importCleanupBudget 提交后清理（消失规则产物/孤儿任务行）的独立预算：
+// 该段已与请求生命周期解耦（context.WithoutCancel——前端超时/关页不得让
+// 私钥残留），因此必须自带时间上界，避免无界后台写拖住导入收尾。
+const importCleanupBudget = 60 * time.Second
 
 // configImportBeginMu 串行化整个导入会话
 // Pause/Resume 是单布尔位，若两个导入都先 Pause 再抢 caddyOpMu，先结束者
@@ -381,19 +391,31 @@ func (session *configImportSession) abort(importErr error) error {
 	// 恢复的规则树进行。回退失败必须显性告警+审计，不得静默。
 	if snapshot := session.wafSnapshot; snapshot != nil {
 		session.wafSnapshot = nil
-		session.wafRestoreAttempted = true
-		session.wafRestoreWarnings, session.wafRestoreErr = snapshot.restore()
-		session.wafRestoreWarnings = append(append([]string{}, snapshot.warnings...), session.wafRestoreWarnings...)
-		snapshot.discard()
-		if session.wafRestoreErr != nil {
-			detail := "规则库文件回退失败（文件与数据库可能分叉）: " + session.wafRestoreErr.Error()
+		if session.commitIndeterminate {
+			// 提交结果不可判定：文件回退只在确定回滚时执行。此时把可能已提交的
+			// 新代覆盖回旧代=制造确定分叉，故保持导入后状态、丢弃快照，并以
+			// 审计留痕要求人工核对（响应侧文案由 lbbakWafRollbackWarning 的
+			// 不确定态给出）。
+			snapshot.discard()
+			detail := "数据库提交结果不确定：规则库文件保持导入后状态（未回退）——若提交实际未落地则文件与版本记录分叉，请核对规则库页版本后重新导入或触发规则库更新收敛"
+			session.wafRestoreWarnings = append([]string{}, snapshot.warnings...)
 			services.Logf("error", "配置%s警告: %s", session.actionLabel(), detail)
-			// 会话上下文不携带用户身份（abort 各调用点自行审计），系统身份
-			// 留痕保证警告必达审计库而非只进响应。
 			services.RecordAuditLog("system", session.actionLabel()+"警告", "配置备份", detail, "")
-		}
-		for _, warning := range session.wafRestoreWarnings {
-			services.RecordAuditLog("system", session.actionLabel()+"警告", "配置备份", warning, "")
+		} else {
+			session.wafRestoreAttempted = true
+			session.wafRestoreWarnings, session.wafRestoreErr = snapshot.restore()
+			session.wafRestoreWarnings = append(append([]string{}, snapshot.warnings...), session.wafRestoreWarnings...)
+			snapshot.discard()
+			if session.wafRestoreErr != nil {
+				detail := "规则库文件回退失败（文件与数据库可能分叉）: " + session.wafRestoreErr.Error()
+				services.Logf("error", "配置%s警告: %s", session.actionLabel(), detail)
+				// 会话上下文不携带用户身份（abort 各调用点自行审计），系统身份
+				// 留痕保证警告必达审计库而非只进响应。
+				services.RecordAuditLog("system", session.actionLabel()+"警告", "配置备份", detail, "")
+			}
+			for _, warning := range session.wafRestoreWarnings {
+				services.RecordAuditLog("system", session.actionLabel()+"警告", "配置备份", warning, "")
+			}
 		}
 	}
 	// 会话内 CLI 预检/强制应用等渲染已按未提交导入内容
@@ -421,6 +443,16 @@ func (session *configImportSession) abort(importErr error) error {
 		}
 		if restoreErr := session.h.restoreImportRuntime(*session.runtime); restoreErr != nil {
 			importErr = errors.Join(importErr, fmt.Errorf("恢复运行配置失败: %w", restoreErr))
+		}
+		// 运行配置回弹经 ApplyConfig(persistLastGood=true)：若请求前运行配置
+		// 带外漂移（快照≠运行配置），回弹会把该形态写进 LKG，而重启兜底
+		// 只应回放「最后一次已提交且已下发」的配置。回弹后把 LKG 钉回已提交
+		// 库视图（零 /load）。钉回失败不代表运行配置恢复失败，故独立留痕而
+		// 不并入 importErr（避免横幅被误标成「运行配置状态未知」）。
+		if pinErr := session.h.pinLastGoodAfterCompensation(); pinErr != nil {
+			detail := "导入未生效回弹后把 last-known-good 钉回已提交视图失败（LKG 可能仍为请求前运行配置）: " + pinErr.Error()
+			services.Logf("warn", "%s", detail)
+			services.RecordAuditLog("system", session.actionLabel()+"警告", "配置备份", detail, "")
 		}
 	}
 	session.finished = true
@@ -459,6 +491,9 @@ func (session *configImportSession) commit(affectedRuleIDs []string, certificate
 		return &importCoordinatorError{phase: importPhaseVersion, err: session.abort(err), action: session.action}
 	}
 	if err := session.tx.Commit(); err != nil {
+		// Commit 报错=结果不可判定（可能已落地但确认丢失）：先标记再 abort，
+		// 文件面据此跳过回退（回退只在确定回滚时执行）。
+		session.commitIndeterminate = true
 		return &importCoordinatorError{phase: importPhaseCommit, err: session.abort(err), action: session.action}
 	}
 	// 数据库已提交：WAF 文件保持导入后的状态，快照只服务回滚，丢弃。
@@ -507,7 +542,14 @@ func (session *configImportSession) cleanupDisappearedRuleArtifacts() {
 	if !session.replaceRuleArtifacts {
 		return
 	}
-	currentIDs, err := currentRuleIDs(session.ctx)
+	// 提交已落地 → 清理不再受客户端生命周期左右。请求 ctx 在前端超时/关页/
+	// 网关断连时被取消，旧实现据此在 currentRuleIDs 处早退，整段清理（含
+	// 已不在库内的规则私钥、指标、规则/证书日志、孤儿 cert_jobs）一次不执行
+	// ——数据卷里保留着管理员以为已随规则删除的 ACME 私钥。WithoutCancel
+	// 保留 ctx 值（日志/审计归因）并叠加有界超时，避免无界后台写。
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(session.ctx), importCleanupBudget)
+	defer cancel()
+	currentIDs, err := currentRuleIDs(ctx)
 	if err != nil {
 		services.Logf("error", "导入清理：读取当前规则失败（跳过孤儿清理）: %v", err)
 		services.RecordAuditLog("system", "清理失败", "证书产物", fmt.Sprintf("导入后清理消失规则产物失败（读取规则集）：%v", err), "")
@@ -532,7 +574,7 @@ func (session *configImportSession) cleanupDisappearedRuleArtifacts() {
 				services.Logf("warn", "导入清理：删除消失规则 %s 的证书文件失败: %v", id, err)
 			}
 			if db.MetricsDB != nil {
-				if _, err := db.MetricsDB.ExecContext(session.ctx, "DELETE FROM metrics_history WHERE rule_id=?", id); err != nil {
+				if _, err := db.MetricsDB.ExecContext(ctx, "DELETE FROM metrics_history WHERE rule_id=?", id); err != nil {
 					services.Logf("error", "导入清理：删除消失规则 %s 的指标失败: %v", id, err)
 				}
 			}
@@ -548,7 +590,7 @@ func (session *configImportSession) cleanupDisappearedRuleArtifacts() {
 	}
 	// 与 v2 导入事务内的孤儿清理同语句（幂等重复无害）；覆盖 v1 路径与
 	// 理论上的绕过路径。
-	if _, err := db.DB.ExecContext(session.ctx,
+	if _, err := db.DB.ExecContext(ctx,
 		`DELETE FROM cert_jobs WHERE NOT EXISTS (SELECT 1 FROM lb_rules WHERE lb_rules.caddy_id = cert_jobs.rule_id)`); err != nil {
 		services.Logf("error", "导入清理：删除孤儿证书任务失败: %v", err)
 		services.RecordAuditLog("system", "清理失败", "证书任务", fmt.Sprintf("导入后清理孤儿证书任务失败：%v", err), "")
@@ -556,7 +598,7 @@ func (session *configImportSession) cleanupDisappearedRuleArtifacts() {
 	}
 	// 规则存在但已非 ACME 自动签发态的失效任务行——与
 	// v2 导入事务内同谓词清理；覆盖 v1 路径与理论绕过路径。
-	if _, err := db.DB.ExecContext(session.ctx,
+	if _, err := db.DB.ExecContext(ctx,
 		`DELETE FROM cert_jobs WHERE rule_id IN (SELECT caddy_id FROM lb_rules WHERE NOT (enable_tls=1 AND tls_source='acme_dns'))`); err != nil {
 		services.Logf("error", "导入清理：删除失效证书任务失败: %v", err)
 		services.RecordAuditLog("system", "清理失败", "证书任务", fmt.Sprintf("导入后清理失效证书任务失败：%v", err), "")
@@ -567,7 +609,7 @@ func (session *configImportSession) cleanupDisappearedRuleArtifacts() {
 	// 数据卷（与 DeleteRule/orphanACME「失去材料即删私钥」约定不对称，
 	// 卷读权限者可恢复管理员以为已丢弃的密钥）。按同一约定 best-effort 清理：
 	// 失败仅 warn+审计，不否决已提交的导入。
-	if cleaned := cleanupRulesWithoutUsableCertMaterial(session.ctx); cleaned > 0 {
+	if cleaned := cleanupRulesWithoutUsableCertMaterial(ctx); cleaned > 0 {
 		services.RecordAuditLog("system", "清理", "证书产物", fmt.Sprintf("导入后 %d 条规则已无任何可用证书材料，其残留证书文件已清理", cleaned), "")
 	}
 	if len(disappeared) > 0 {

@@ -129,6 +129,10 @@ func (h *SecurityBlockedCounter) ServeHTTP(w http.ResponseWriter, r *http.Reques
 		// 国名只取 geoip handler 写入的 Caddy 服务端变量。无 GeoIP handler
 		// 时变量缺席即跳过，客户端自带的同名请求头永不可信。
 		country, _ := caddyhttp.GetVar(r.Context(), "geoip.country_name").(string)
+		// 归一一次并把归一值同时用于「是否国内」门与两个记录函数（二者保留
+		// 自身归一作幂等防御）：用未归一键比较会让脏形态下省门与外发键不一致
+		// （country=「 中国」时省被丢、计数桶却正常）。
+		country = normalizeTrafficCountryKey(country)
 		trafficRecord(country, isSecurityBlock)
 		if !isSecurityBlock && country != "" {
 			province, _ := caddyhttp.GetVar(r.Context(), "geoip.province").(string)

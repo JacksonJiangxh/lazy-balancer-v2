@@ -26,6 +26,8 @@ const STATUS_LABELS: Record<string, string> = {
   idle: '已最新',
   cancelled: '已取消',
   disabled: '已关闭',
+  // 零源多源库（威胁/爬虫）的占位行状态：与卡头健康标签「未配置」同词。
+  'not-configured': '未配置',
 }
 
 export const libraryStatusLabel = (status: string): string =>

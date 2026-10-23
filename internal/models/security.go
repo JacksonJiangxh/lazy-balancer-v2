@@ -295,10 +295,10 @@ type SecurityEventFeedItem struct {
 	AttackType string `json:"attack_type"`
 	// v2.3.8 大屏攻击弹框：event_type 保留原始事件类别，阶段权威=trigger_type；
 	// 处理耗时（μs→ms）/异常分（危险等级真实数据源：≥12 高危、6-11 中危、<6 低危）
-	EventType    string `json:"event_type"`
-	DurationUs   int64  `json:"duration_us"`
-	AnomalyScore int    `json:"anomaly_score"`
-	RuleTrigged  string `json:"rule_triggered"`
+	EventType     string `json:"event_type"`
+	DurationUs    int64  `json:"duration_us"`
+	AnomalyScore  int    `json:"anomaly_score"`
+	RuleTriggered string `json:"rule_triggered"`
 	// TriggerType 触发类型显示语义（爬虫Bot/地域拦截/限流/IP 访问控制/WAF/请求体异常）
 	TriggerType string `json:"trigger_type"`
 }
@@ -482,7 +482,7 @@ type SecurityBlockPage struct {
 	Description string `json:"description"`
 	Content     string `json:"content"`
 	// ContentType 拦截响应的内容类型，可配置（2026-09-25 用户裁定）；
-	// 白名单见 BlockPageContentTypes，空值按 DefaultBlockPageContentType 归一。
+	// 白名单见 BlockPageContentTypeWhitelist，空值按 DefaultBlockPageContentType 归一。
 	ContentType string `json:"content_type"`
 	IsDefault   bool   `json:"is_default"`
 	IsBuiltin   bool   `json:"is_builtin"`
@@ -498,12 +498,25 @@ type SecurityBlockPage struct {
 // DefaultBlockPageContentType 拦截页默认 （内置三页同此）。
 const DefaultBlockPageContentType = "text/html; charset=utf-8"
 
-// BlockPageContentTypes 可选白名单（含编码；创建/更新写侧校验）。
-var BlockPageContentTypes = []string{
-	DefaultBlockPageContentType,
-	"application/json; charset=utf-8",
-	"application/xml; charset=utf-8",
-	"text/plain; charset=utf-8",
+// 拦截页可选内容类型白名单（含编码；创建/更新写侧校验）。
+//
+// 白名单以常量声明而不是导出可变切片：切片形态下任意包都能
+// append/改写，ValidBlockPageContentType 的封闭性随之失效且无测试会红。
+const (
+	BlockPageContentTypeJSON  = "application/json; charset=utf-8"
+	BlockPageContentTypeXML   = "application/xml; charset=utf-8"
+	BlockPageContentTypePlain = "text/plain; charset=utf-8"
+)
+
+// BlockPageContentTypeWhitelist 返回白名单副本（调用方可遍历/对表，
+// 但无法经返回值改写白名单本身）。
+func BlockPageContentTypeWhitelist() []string {
+	return []string{
+		DefaultBlockPageContentType,
+		BlockPageContentTypeJSON,
+		BlockPageContentTypeXML,
+		BlockPageContentTypePlain,
+	}
 }
 
 // ValidBlockPageContentType 报告 contentType 是否在白名单内（空串视为默认合法）。
@@ -511,10 +524,9 @@ func ValidBlockPageContentType(contentType string) bool {
 	if contentType == "" {
 		return true
 	}
-	for _, t := range BlockPageContentTypes {
-		if contentType == t {
-			return true
-		}
+	switch contentType {
+	case DefaultBlockPageContentType, BlockPageContentTypeJSON, BlockPageContentTypeXML, BlockPageContentTypePlain:
+		return true
 	}
 	return false
 }

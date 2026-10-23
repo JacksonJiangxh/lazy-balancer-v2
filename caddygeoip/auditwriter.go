@@ -1648,6 +1648,12 @@ func (p *auditPipeline) flush() {
 // 无条件丢失全部在队行。
 const auditShutdownDrainWait = 3 * time.Second
 
+// auditFlushCoalescedDrainWait 是合并窗口内（非首个）Cleanup 的小额有界
+// 排空时间：全体管线共享一次等待（drain 单消费者并发处理，总代价与管线数
+// 无关），把「窗口内紧跟进程停止」的丢失面从「全部在队行」收敛到窗口内
+// 未处理的行（队列上限 2048，正常流量下 200ms 足够排空）。
+const auditFlushCoalescedDrainWait = 200 * time.Millisecond
+
 // auditFlushCoalesceWindow 是 FlushAuditPipelines 的合并窗口：一次 Caddy
 // reload/优雅停机会让**每个规则**的 SecurityBlockedCounter 各调一次 Cleanup
 // （实例数 = 规则数）。持续审计流量下 pending 很难为 0，每个实例都等满
@@ -1657,15 +1663,23 @@ const auditShutdownDrainWait = 3 * time.Second
 // reload 的间隔，且 500ms 周期刷盘兜底尾部行。var 供测试收窄。
 var auditFlushCoalesceWindow = auditShutdownDrainWait
 
-// auditLastFlushNano 是最近一次领到冲刷资格的时刻（UnixNano；0=从未冲刷）。
-// CAS 领取保证并发 Cleanup 只有一个走等待路径。
+// auditLastFlushNano 是最近一次领到冲刷资格的时刻（单调读数，基线见
+// auditFlushClockBase；0=从未冲刷）。CAS 领取保证并发 Cleanup 只有一个走
+// 等待路径。旧实现存挂钟 UnixNano：NTP/手动回拨使 n-last 为负 → 判定「窗口
+// 内」→ 整个回拨期间所有 Cleanup 都跳过排空（与 wafiplist 的单调读数修复
+// 同口径）。
 var auditLastFlushNano atomic.Int64
 
+// auditFlushClockBase 是单调时钟基线（包加载时取一次）。
+var auditFlushClockBase = time.Now()
+
+func auditMonotonicNowNano() int64 { return int64(time.Since(auditFlushClockBase)) }
+
 // claimAuditFlush 在合并窗口内领取一次冲刷资格；窗口内返回 false（本次
-// Cleanup 跳过排空等待，但仍须刷盘——见 FlushAuditPipelines）。无锁 CAS：
-// 并发调用者同刻到达时只有一个成功。
-func claimAuditFlush(now time.Time) bool {
-	n := now.UnixNano()
+// Cleanup 走小额有界排空，见 FlushAuditPipelines）。无锁 CAS：并发调用者
+// 同刻到达时只有一个成功。
+func claimAuditFlush() bool {
+	n := auditMonotonicNowNano()
 	for {
 		last := auditLastFlushNano.Load()
 		if last != 0 && n-last < int64(auditFlushCoalesceWindow) {
@@ -1698,23 +1712,41 @@ func (p *auditPipeline) flushQuiesced() {
 // 只刷盘不关闭：管线是进程级单例，fd/drain 的生命周期与进程一致。
 //
 // 合并窗口（claimAuditFlush）：一次 reload 会按规则数调用 N 次本函数，
-// 只有窗口内首个调用付出排空等待，其余只做一次 bufio 刷盘（零等待）——
-// 收尾成本与实例数解耦，不再是「规则数 × 3s」。**省掉的只能是排空等待**：
-// 窗口内若紧跟进程停止，这次 Cleanup 就是唯一收尾机会，bufio 残留（≤64KiB
-// / ≤500ms 周期）必须落盘，否则停机前最后一批审计行静默丢失。
+// 只有窗口内首个调用付出完整排空等待（auditShutdownDrainWait），其余走
+// 小额有界排空（auditFlushCoalescedDrainWait，全体管线共享一次等待）——
+// 收尾成本与实例数解耦。窗口内若紧跟进程停止，这次 Cleanup 就是唯一收尾
+// 机会：**省掉的只能是等待时长**，bufio 残留与已在队/在途行都要尽量落盘
+// （旧实现窗口分支只 flush bufio，队列里最多 2048 行随进程退出静默丢失且
+// 侧车 dropped/io_errors 不统计该类丢失）。
 func FlushAuditPipelines() {
-	quiesce := claimAuditFlush(time.Now())
+	quiesce := claimAuditFlush()
 	auditPipelinesMu.Lock()
 	pipelines := make([]*auditPipeline, 0, len(auditPipelines))
 	for _, p := range auditPipelines {
 		pipelines = append(pipelines, p)
 	}
 	auditPipelinesMu.Unlock()
-	for _, p := range pipelines {
-		if quiesce {
+	if quiesce {
+		for _, p := range pipelines {
 			p.flushQuiesced()
-			continue
 		}
+		return
+	}
+	deadline := time.Now().Add(auditFlushCoalescedDrainWait)
+	for time.Now().Before(deadline) {
+		pending := false
+		for _, p := range pipelines {
+			if p.pending.Load() != 0 {
+				pending = true
+				break
+			}
+		}
+		if !pending {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	for _, p := range pipelines {
 		p.flush()
 	}
 }

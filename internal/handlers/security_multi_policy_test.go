@@ -1077,3 +1077,53 @@ func TestSetRuleSecurityPolicies_auditUsesDeduplicatedSet(t *testing.T) {
 		t.Fatalf("audit detail=%q, want containing %s", detail, want)
 	}
 }
+
+// 无变更的解绑不得写「已解除」审计（审计真实性）：重复/并发解绑保持 200
+// 幂等，但 changed=false、不落审计、不触发配置应用。
+func TestUnbindRuleFromPolicy_noChangeSkipsAudit(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newMultiPolicyRouter(t)
+	seedHTTPRule(t, "lb_mp_unbind_nochange")
+	policyA := createMultiPolicy(t, router, "策略A")
+	if r := putMultiJSON(t, router, "/security/rules/lb_mp_unbind_nochange/policies", map[string]any{"policy_ids": []int{policyA}}); r.Code != http.StatusOK {
+		t.Fatalf("PUT status=%d body=%s", r.Code, r.Body.String())
+	}
+	unbindAudits := func() int {
+		t.Helper()
+		var n int
+		if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE detail LIKE '%解除规则%'`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	path := "/security/policies/" + strconv.Itoa(policyA) + "/bind/lb_mp_unbind_nochange"
+
+	before := unbindAudits()
+	if rec := deleteRequest(t, router, path); rec.Code != http.StatusOK {
+		t.Fatalf("首次解绑 status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	afterFirst := unbindAudits()
+	if afterFirst != before+1 {
+		t.Fatalf("真实变更必须写审计，before=%d after=%d", before, afterFirst)
+	}
+
+	rec := deleteRequest(t, router, path)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("重复解绑须保持 200 幂等，status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Code int `json:"code"`
+		Data struct {
+			Changed bool `json:"changed"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse response %s: %v", rec.Body.String(), err)
+	}
+	if resp.Data.Changed {
+		t.Fatalf("无变更时 changed 必须为 false: %s", rec.Body.String())
+	}
+	if got := unbindAudits(); got != afterFirst {
+		t.Fatalf("无变更不得写「已解除」审计，before=%d after=%d", afterFirst, got)
+	}
+}

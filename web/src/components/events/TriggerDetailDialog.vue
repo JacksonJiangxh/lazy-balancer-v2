@@ -26,8 +26,8 @@
         </div>
         <div class="trg-hero-policy">
           <span class="trg-hero-policy-name">{{ policy?.name ?? (loading ? '加载中…' : noPolicyAttribution ? '（本次事件无策略归属）' : policyMissing ? '（策略已删除）' : '（策略信息不可用）') }}</span>
-          <el-tag size="small" :type="policy?.enabled ? 'success' : 'info'" effect="plain">
-            {{ loading ? '…' : policy?.enabled ? '已启用' : '已禁用' }}
+          <el-tag size="small" :type="policyStatusTag.type" effect="plain">
+            {{ policyStatusTag.label }}
           </el-tag>
         </div>
         <div class="trg-hero-hit">{{ heroHitSource }}</div>
@@ -333,6 +333,19 @@ const loadError = ref(false)
 // policy_id<=0 是后端归因的合法「无策略归属」态（规则未绑定策略时
 // securityevents.go 返回 (0, "")），不是「策略已删除」——文案分离。
 const noPolicyAttribution = computed(() => (props.row?.policy_id ?? 0) <= 0)
+// hero 状态标签四态：加载/无归属/已删除/加载失败 不得都显示「已禁用」
+// （「已禁用」会被读成「策略存在但关闭」，与同屏「策略已删除/信息不可用」矛盾）。
+const policyStatusTag = computed<{ label: string; type: 'success' | 'info' }>(() => {
+  if (loading.value) return { label: '…', type: 'info' }
+  if (!policy.value) {
+    if (noPolicyAttribution.value) return { label: '—', type: 'info' }
+    if (policyMissing.value) return { label: '策略已删除', type: 'info' }
+    return { label: '状态未知', type: 'info' }
+  }
+  return policy.value.enabled
+    ? { label: '已启用', type: 'success' }
+    : { label: '已禁用', type: 'info' }
+})
 // 弹框会话序号：快速关开换行时丢弃在途响应（同文件 crsDialogSeq
 // / IPLocationAction loadPoliciesSeq 同仓模式）
 let loadSeq = 0
@@ -549,7 +562,7 @@ const ipHitScan = computed(() => {
     sysAclHit: false,
     exemptingPolicy: null as string | null,
   }
-  if (!p || !ip) return empty
+  if (!ip) return empty
   const matcher = createIpMatcher(ip)
   const hitById = new Map<number, boolean>()
   const listHit = (id: number): boolean => {
@@ -559,13 +572,16 @@ const ipHitScan = computed(() => {
     hitById.set(id, hit)
     return hit
   }
-  const aclRefs = parseRefIds(p.ip_acl_list_refs)
-  const trustRefs = parseRefIds(p.ip_whitelist_refs)
-  const aclHit = lists.value.filter((l) => aclRefs.includes(l.id) && listHit(l.id))
-  const trustHit = lists.value.filter((l) => trustRefs.includes(l.id) && listHit(l.id))
-  const inlineAcl = parseIPList(p.ip_acl_list).some(matcher)
+  // 属主策略详情可能缺失（已删除/瞬时失败）：命中明细退化为空，但跨策略豁免
+  // 归因仍须基于已取回的启用策略集给出——故不做 `!p` 早退（否则历史事件只剩
+  // 「已记录」而丢失「为何不拦」）。
+  const aclRefs = p ? parseRefIds(p.ip_acl_list_refs) : []
+  const trustRefs = p ? parseRefIds(p.ip_whitelist_refs) : []
+  const aclHit = p ? lists.value.filter((l) => aclRefs.includes(l.id) && listHit(l.id)) : []
+  const trustHit = p ? lists.value.filter((l) => trustRefs.includes(l.id) && listHit(l.id)) : []
+  const inlineAcl = p ? parseIPList(p.ip_acl_list).some(matcher) : false
   // 信任已关闭时条目不生效（trustDead 同口径）
-  const ownerTrust = p.ip_whitelist_enabled === false
+  const ownerTrust = !p || p.ip_whitelist_enabled === false
     ? false
     : parseIPList(p.ip_whitelist).some(matcher) || trustRefs.some((id) => listHit(id))
   // 跨策略信任豁免归因：策略详情端点不过滤 enabled——属主策略可能事后被禁用，

@@ -340,8 +340,8 @@ func TestDeploymentFailed_atCapKeepsDeployableState(t *testing.T) {
 	}
 }
 
-// 读侧补上界钳制（写侧 0-90 / 1-10，导入 1-90 / 1-10）——带外直写
-// 大值不得造成续签风暴/超限重试。
+// 读侧补上界钳制（写侧 0-CertRenewalDaysMax / 1-10，导入 0-CertRenewalDaysMax / 1-10）
+// ——带外直写大值不得造成续签风暴/超限重试。
 func TestCertRenewalConfigReadSideClampsUpperBounds(t *testing.T) {
 	_, database := newClusterTestService(t)
 	if _, err := database.Exec(`UPDATE global_config SET cert_renewal_days=365, cert_renewal_attempts=100 WHERE id=1`); err != nil {

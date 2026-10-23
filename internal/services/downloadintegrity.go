@@ -70,9 +70,10 @@ func recordDownloadIntegrity(source, destPath, resource string) error {
 		return err
 	}
 	downloadIntegrityMu.Lock()
-	records, audits, err := loadDownloadIntegrityRecords()
+	records, audits, logs, err := loadDownloadIntegrityRecords()
 	if err != nil {
 		downloadIntegrityMu.Unlock()
+		logDownloadIntegrityMessages(logs)
 		recordDownloadIntegrityAudits(audits)
 		return err
 	}
@@ -97,8 +98,16 @@ func recordDownloadIntegrity(source, destPath, resource string) error {
 	records[source] = downloadIntegrityRecord{Size: info.Size(), SHA256: digest}
 	err = persistDownloadIntegrityRecords(records)
 	downloadIntegrityMu.Unlock()
+	logDownloadIntegrityMessages(logs)
 	recordDownloadIntegrityAudits(audits)
 	return err
+}
+
+// logDownloadIntegrityMessages 输出锁内构造的日志文案（调用方必须已解锁）。
+func logDownloadIntegrityMessages(logs []string) {
+	for _, msg := range logs {
+		Logf("error", "%s", msg)
+	}
 }
 
 func sha256File(path string) (string, error) {
@@ -115,14 +124,15 @@ func sha256File(path string) (string, error) {
 }
 
 // loadDownloadIntegrityRecords 读取记录文件（调用方须持有 downloadIntegrityMu）。
-// 损坏文件的隔离审计以返回值交给调用方在解锁后落库。
-func loadDownloadIntegrityRecords() (map[string]downloadIntegrityRecord, []downloadIntegrityAudit, error) {
+// 损坏文件的隔离审计与日志文案均以返回值交给调用方在解锁后落库/输出——
+// 锁内不得做日志 writer/审计库 I/O（本文件头 discipline）。
+func loadDownloadIntegrityRecords() (map[string]downloadIntegrityRecord, []downloadIntegrityAudit, []string, error) {
 	data, err := os.ReadFile(downloadIntegrityPath)
 	if errors.Is(err, os.ErrNotExist) {
-		return map[string]downloadIntegrityRecord{}, nil, nil
+		return map[string]downloadIntegrityRecord{}, nil, nil, nil
 	}
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	var records map[string]downloadIntegrityRecord
 	if err := json.Unmarshal(data, &records); err != nil {
@@ -133,24 +143,22 @@ func loadDownloadIntegrityRecords() (map[string]downloadIntegrityRecord, []downl
 		if err := os.Rename(downloadIntegrityPath, quarantined); err != nil {
 			// 隔离失败时如实记录：文件仍在原位，后续 persist（tmp+rename）会覆盖
 			// 重建，但取证副本缺失。
-			Logf("error", "download integrity: records file %s is corrupt, quarantine rename to %s failed: %v（原文件保留，直接重建基线）", downloadIntegrityPath, quarantined, err)
 			return map[string]downloadIntegrityRecord{}, []downloadIntegrityAudit{{
 				action:   "下载校验",
 				resource: "完整性记录",
 				detail:   FormatAuditDetail(fmt.Sprintf("记录文件 %s 解析失败，隔离为 %s 失败：%v", downloadIntegrityPath, quarantined, err)),
-			}}, nil
+			}}, []string{fmt.Sprintf("download integrity: records file %s is corrupt, quarantine rename to %s failed: %v（原文件保留，直接重建基线）", downloadIntegrityPath, quarantined, err)}, nil
 		}
-		Logf("error", "download integrity: records file %s is corrupt, quarantined to %s and baselines rebuilt", downloadIntegrityPath, quarantined)
 		return map[string]downloadIntegrityRecord{}, []downloadIntegrityAudit{{
 			action:   "下载校验",
 			resource: "完整性记录",
 			detail:   FormatAuditDetail(fmt.Sprintf("记录文件 %s 解析失败，已隔离为 %s 并重建基线", downloadIntegrityPath, quarantined)),
-		}}, nil
+		}}, []string{fmt.Sprintf("download integrity: records file %s is corrupt, quarantined to %s and baselines rebuilt", downloadIntegrityPath, quarantined)}, nil
 	}
 	if records == nil {
 		records = map[string]downloadIntegrityRecord{}
 	}
-	return records, nil, nil
+	return records, nil, nil, nil
 }
 
 func persistDownloadIntegrityRecords(records map[string]downloadIntegrityRecord) error {

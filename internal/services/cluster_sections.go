@@ -96,7 +96,7 @@ func sectionPayloadFor(key string, s *models.ClusterSnapshot) interface{} {
 	case "waf_files":
 		// 文件态哈希保持纯 ref 语义(2026-09-11 修正:版本行不进节哈希——
 		// 进哈希会让主从行状态强耦合,漂移判定不可收敛)。CRS/IP2Region 版本行
-		// 改经内容差分门控应用(cluster_apply.go versionRowsDiffer),随
+		// 改经内容差分门控应用(cluster_apply.go snapshotSecurityVersionRowsDiffer),随
 		// 安全防护开关;版本行变化的版本 bump 由 security_crs_version
 		// 触发器驱动(已排除 last_checked 读路径写)。本 case 三分类合并后
 		// 仅供 wafFilesSectionHash/wafFilesNullRefHash(文件漂移比对,哈希域
@@ -153,7 +153,7 @@ func sanitizeAPIKeysForHash(keys []models.ClusterAPIKey) []models.ClusterAPIKey 
 	return out
 }
 
-// SyncSwitches 是节点本地同步开关集(读取见 readSyncSwitches,:此前注释引用不存在的 LoadSyncSwitches 且口径写错)。
+// SyncSwitches 是节点本地同步开关集（读取见 readSyncSwitches）。
 // 三分类合并后仅剩 users(恒 true)/rules/security 三开关。
 type SyncSwitches struct {
 	Users    bool
@@ -161,7 +161,9 @@ type SyncSwitches struct {
 	Security bool
 }
 
-// sectionEnabled maps a section key to its switch state.
+// sectionEnabled maps a section key to its switch state. 未知键（含拼写错误）
+// 一律拒绝：默认 true 会让「新增节但忘记加开关映射」的节被静默同步/放行，
+// 与「开关是门、默认不放行」的语义相反；syncSections 是键的唯一真相源。
 func (sw SyncSwitches) sectionEnabled(key string) bool {
 	switch key {
 	case "users":
@@ -171,7 +173,7 @@ func (sw SyncSwitches) sectionEnabled(key string) bool {
 	case "security":
 		return sw.Security
 	}
-	return true
+	return false
 }
 
 // readSyncSwitches reads the node-local sync switches (defaults all-on for
@@ -271,7 +273,18 @@ func readAppliedSectionHashes(ctx context.Context, dbh *sql.DB) map[string]strin
 // 配置(basic+caddy)——节点本地记账列不在 BasicSettings 结构内,重建口径
 // 与主端一致(同一装载函数);waf_files 为文件态记账节(哈希域=纯 ref),
 // 由 wafFilesDrifted 专用通道比对,不纳入表级守卫。
-var driftGuardSections = []string{"rules", "users", "security"}
+// 键表由 syncSections 派生（单源）：新增/改名一节只改 syncSections，漂移
+// 守卫范围自动跟随，避免历史上「快照列与差分行不同步」的漏节事故。
+var driftGuardSections = syncSectionKeys()
+
+// syncSectionKeys 返回全部同步节键（顺序与 syncSections 一致）。
+func syncSectionKeys() []string {
+	keys := make([]string, 0, len(syncSections))
+	for _, sec := range syncSections {
+		keys = append(keys, sec.Key)
+	}
+	return keys
+}
 
 func computeSectionSkips(ctx context.Context, dbh *sql.DB, snapshot models.ClusterSnapshot, switches SyncSwitches, localHashes map[string]string) *sectionSkips {
 	sk := &sectionSkips{disabled: map[string]bool{}, unchanged: map[string]bool{}}

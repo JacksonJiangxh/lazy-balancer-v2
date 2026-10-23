@@ -36,11 +36,8 @@ test('规则健康查询在途时记录新版本需求并在收尾补跑', () =>
   assert.match(page, /let ruleHealthInFlight = false/)
   assert.doesNotMatch(page, /isFetchingRuleHealth/, '布尔门已退役')
   const fetchHealth = section(page, 'const fetchRuleHealth = async', 'const controlCaddy')
-  assert.doesNotMatch(
-    fetchHealth.split('\n')[1] ?? '',
-    /isFetchingRuleHealth/,
-    '入口不得再以在途标记直接丢弃需求',
-  )
+  // 全页负断言（上方 doesNotMatch(page, /isFetchingRuleHealth/)）已蕴含「入口
+  // 不再以在途标记丢弃需求」；此处按行号取第二行的写法脆弱且零增量，已删除。
   assert.match(fetchHealth, /if \(ruleHealthInFlight\) \{/, '在途分支必须显式处理新需求')
   assert.match(fetchHealth, /pendingRuleHealth = \{ rules: currentRules, version \}/, '只保留最新需求')
   assert.match(fetchHealth, /pendingRuleHealth\.version < version/, '更旧的需求不得覆盖更新版本')

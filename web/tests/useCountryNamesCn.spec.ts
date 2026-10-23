@@ -7,7 +7,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { registerModuleHooks } from './_helpers.ts'
+import { registerModuleHooks, source } from './_helpers.ts'
 import { STUB_API } from './_stubs.ts'
 
 interface GetCall {
@@ -44,7 +44,11 @@ test('失败回退原名且不闩死：下一次调用重试并落地中文映�
   const zh = useCountryNamesCn()
   await tick()
   assert.deepEqual(zh.value, {})
-  assert.equal(countryLabel(zh.value, '美国'), '美国', '映射缺失时回退原名')
+  // 鉴别力：映射值与键不同，才能区分「命中映射」与「回退原名」——此前用
+  // 映射外的键 + 恒等映射，两态输出相同（断言恒真）。
+  assert.equal(countryLabel({ 美国: '美国(US)' }, '美国'), '美国(US)', '命中映射必须用映射值')
+  assert.equal(countryLabel({ 美国: '美国(US)' }, '德国'), '德国', '映射缺失时回退原名')
+  assert.equal(countryLabel(zh.value, '美国'), '美国', '空映射回退原名')
 
   // 第二次（成功）：失败未缓存，下一次调用必须重试
   mode = 'ok'
@@ -71,4 +75,12 @@ test('countryLabel 是纯翻译：哨兵/省份/省市联值原样返回', () =>
   assert.equal(countryLabel(zh, '中国·广东省'), '中国·广东省', '联值不拆分（拆分由消费方负责）')
   assert.equal(countryLabel(zh, ''), '')
   assert.equal(countryLabel({}, '德国'), '德国')
+})
+
+// 消费侧接线钉：createLazyLoader 的唯一生产消费点（省名懒加载）。
+// 改用直接 fetch 会让「首次国家名未加载时省名即触发请求」的回退失效。
+test('createLazyLoader 接线：省名映射经 lazyOnce 单源懒加载', () => {
+  const composable = source('src/composables/useCountryNamesCn.ts')
+  assert.match(composable, /import \{ createLazyLoader \} from '@\/utils\/lazyOnce'/, '必须复用 lazyOnce')
+  assert.match(composable, /createLazyLoader\(/, '省名加载必须经 createLazyLoader')
 })

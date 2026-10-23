@@ -52,6 +52,39 @@ func EnsureSetupAdminFlag(ctx context.Context, ex setupAdminExecer) error {
 	return nil
 }
 
+// setupAdminFlagWriteProbe 判定启动期标记归一是否可能改写任何行：三条 UPDATE
+// 互为前置（前一条的结果影响后一条），无法逐条穷举，故一次只读探测取三条件
+// 的并集——S1 陈旧标记（带标记但非启用管理员）、S2 多标记并存、S3 无标记需
+// 补标。稳态（恰有一个启用管理员带标记）恒 false，收敛库启动零写。只读查询
+// 不取写锁（_txlock=immediate 下写语句才是立即写事务）。
+const setupAdminFlagWriteProbe = `SELECT EXISTS(
+	SELECT 1 FROM users WHERE COALESCE(is_setup_admin,0)=1 AND NOT (role='admin' AND is_enabled=1)
+	UNION ALL
+	SELECT 1 FROM users WHERE COALESCE(is_setup_admin,0)=1 AND role='admin' AND is_enabled=1
+	  AND id <> (SELECT id FROM users WHERE role='admin' AND is_enabled=1 ORDER BY id LIMIT 1)
+	  AND (SELECT COUNT(*) FROM users WHERE COALESCE(is_setup_admin,0)=1 AND role='admin' AND is_enabled=1) > 1
+	UNION ALL
+	SELECT 1 FROM users
+	  WHERE id=(SELECT id FROM users WHERE role='admin' AND is_enabled=1 ORDER BY id LIMIT 1)
+	  AND NOT EXISTS (SELECT 1 FROM users WHERE COALESCE(is_setup_admin,0)=1 AND role='admin' AND is_enabled=1)
+)`
+
+// ensureSetupAdminFlagAtStartup 是启动迁移对 EnsureSetupAdminFlag 的入口：
+// 先只读探测，命中才在一个写事务内完成三条归一（口径纳入
+// startupMigrationWriteTx，二次启动收敛库零写）。
+func ensureSetupAdminFlagAtStartup() error {
+	var needed bool
+	if err := DB.QueryRow(setupAdminFlagWriteProbe).Scan(&needed); err != nil {
+		return err
+	}
+	if !needed {
+		return nil
+	}
+	return withWriteTx("setup admin flag normalization", func(tx *sql.Tx) error {
+		return EnsureSetupAdminFlag(context.Background(), tx)
+	})
+}
+
 // IsSetupAdmin 判定用户是否为受保护的 break-glass 管理入口。
 // 标记缺失（任何行都未标记——旧库尚未跑迁移/直连旧测试库）时回落到
 // SetupAdminFallbackUserID，保持升级窗口内的保护面不塌陷。

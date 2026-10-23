@@ -43,7 +43,7 @@ export function coordsForSiteLocation(key: string): { lat: number; lon: number }
 }
 
 /** 近似球面距离（km）；仅用于回显最近地点，不参与业务判定。 */
-export function siteDistanceKm(aLat: number, aLon: number, bLat: number, bLon: number): number {
+function siteDistanceKm(aLat: number, aLon: number, bLat: number, bLon: number): number {
   const rad = Math.PI / 180
   const dLat = (bLat - aLat) * rad
   const dLon = (bLon - aLon) * rad

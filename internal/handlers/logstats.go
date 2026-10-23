@@ -257,6 +257,19 @@ type dirStats struct {
 	RotCount int
 }
 
+// logStatsFileSize 读取日志/库文件体量并接入统一留痕契约：失败（非不存在）
+// 按路径首报 warn、恢复 info——「没有日志」与「读不到日志」不得混为一谈
+// （同函数内目录枚举已用同一契约）。
+func logStatsFileSize(path string) (int64, bool) {
+	st, err := os.Stat(path)
+	if err != nil {
+		logStatsVolumeReadFailure("logstats-stat-"+path, err)
+		return 0, false
+	}
+	logStatsVolumeReadRecovered("logstats-stat-" + path)
+	return st.Size(), true
+}
+
 // aggregateDirStats 单次目录枚举归并匹配文件的活跃/轮转体量与归档份数
 // （替代「逐目录项 dirBytes → 其内部再 ReadDir」的 O(N²) 形态；
 // 聚合累加 RotatedCount，且.gz 归档不再冒充活跃）。
@@ -673,8 +686,8 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 				info.RowsUnavailable = true
 			}
 		}
-		if st, err := os.Stat(filepath.Join(dataDir, db.AuditDBFilename)); err == nil {
-			byKey("audit").SizeBytes = st.Size()
+		if size, ok := logStatsFileSize(filepath.Join(dataDir, db.AuditDBFilename)); ok {
+			byKey("audit").SizeBytes = size
 		}
 	}
 	if want("security_events") {
@@ -687,8 +700,8 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 				info.RowsUnavailable = true
 			}
 		}
-		if st, err := os.Stat(filepath.Join(dataDir, db.MetricsDBFilename)); err == nil {
-			sz := st.Size()
+		if size, ok := logStatsFileSize(filepath.Join(dataDir, db.MetricsDBFilename)); ok {
+			sz := size
 			byKey("security_events").DBBytes = &sz
 		}
 		// SizeBytes=真实审计日志文件(2026-09-14 用户裁定:不再用 metrics.db 库文件
@@ -741,8 +754,35 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 	if tasksDir == "" {
 		tasksDir = filepath.Join(filepath.Dir(runtimePath), "tasks")
 	}
+	// 任务目录枚举缓存（含失败形态）：同一 tasks 目录在一次全量请求里被四类
+	// 已知行 + 逐任务行共享，失败窗口不得退化为每任务一次 syscall（见
+	// readTaskDir 的 (ok) 语义）。
+	type taskDirEntriesCache struct {
+		entries []os.DirEntry
+		ok      bool
+	}
+	taskDirEntries := map[string]taskDirEntriesCache{}
+	readTaskDir := func(dir string) []os.DirEntry {
+		if cached, seen := taskDirEntries[dir]; seen {
+			if !cached.ok {
+				// 失败形态返回空非 nil 切片：aggregateDirStatsWithEntries 的
+				// 「nil=未提供」哨兵会触发重读，失败窗口内每个任务重付 syscall。
+				return []os.DirEntry{}
+			}
+			return cached.entries
+		}
+		entries, err := logStatsReadDir(dir)
+		if err != nil {
+			logStatsVolumeReadFailure("logstats-taskdir-"+dir, err)
+			taskDirEntries[dir] = taskDirEntriesCache{ok: false}
+			return []os.DirEntry{}
+		}
+		logStatsVolumeReadRecovered("logstats-taskdir-" + dir)
+		taskDirEntries[dir] = taskDirEntriesCache{entries: entries, ok: true}
+		return entries
+	}
 	taskFileBytes := func(id string) (int64, int64, int) {
-		return dirBytes(filepath.Join(tasksDir, id+".log"))
+		return dirBytesWithEntries(filepath.Join(tasksDir, id+".log"), readTaskDir(tasksDir))
 	}
 	if want("crs_update") {
 		if info := byKey("crs_update"); info != nil {
@@ -780,18 +820,6 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		}
 	}
 	var taskLogPath systemTaskLogPathResolver
-	taskDirEntries := map[string][]os.DirEntry{}
-	readTaskDir := func(dir string) []os.DirEntry {
-		if entries, ok := taskDirEntries[dir]; ok {
-			return entries
-		}
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			entries = nil
-		}
-		taskDirEntries[dir] = entries
-		return entries
-	}
 	if wantsPerTaskRows {
 		var taskRows []services.TaskInfo
 		// 清单截断位由 /system/tasks 端点负责披露（任务监控页消费）；本端点

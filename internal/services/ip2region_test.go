@@ -270,6 +270,33 @@ func Test_InitIP2Region_copies_distribution_xdb_when_live_missing(t *testing.T) 
 	}
 }
 
+// 从节点（is_master=0）+ live 可装载：派生缓存（省份列表/地域树）同样不得
+// 落盘——「文件/版本行/派生缓存一律不落盘」是从节点只读不变量的显式契约，
+// 不能只在 readOnlyDist（live 缺失/损坏）分支成立。查询仍必须可用
+// （内存重建）。
+func Test_InitIP2Region_slaveWithValidLiveWritesNoDerivedCaches(t *testing.T) {
+	setupSecurityEnumTestDB(t)
+	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
+		t.Fatalf("set slave role: %v", err)
+	}
+	dir := t.TempDir()
+	live := filepath.Join(dir, "ip2region.xdb")
+	writeTestXDB(t, live, testSegments)
+	withIP2RegionPaths(t, live, filepath.Join(dir, "waf.dist", "ip2region.xdb"))
+
+	InitIP2Region()
+
+	if got := Lookup("1.2.3.1"); got != "US" {
+		t.Fatalf("Lookup after slave init=%q, want US", got)
+	}
+	if _, err := os.Stat(live + ".provinces.json"); !os.IsNotExist(err) {
+		t.Fatalf("从节点不得写省份派生缓存（stat err=%v）", err)
+	}
+	if _, err := os.Stat(live + ".regions.json"); !os.IsNotExist(err) {
+		t.Fatalf("从节点不得写地域树派生缓存（stat err=%v）", err)
+	}
+}
+
 // 从节点（is_master=0）遇到损坏 live 库：不得以 dist 覆盖（文件/版本行/
 // sidecar 由集群同步治理），但必须只读装载镜像库供本地查询——否则面板归属地
 // 全空且地域拦截静默失效。
@@ -638,5 +665,67 @@ func TestCheckIP2RegionXDBStructure(t *testing.T) {
 	}
 	if err := checkIP2RegionXDBStructure(badPtr); err == nil {
 		t.Fatal("段索引指针越界须被结构门拒绝")
+	}
+}
+
+// writeCorruptProbeSegmentXDB 造「结构自检通过、探针搜索越界」的 xdb：只改写
+// 114.114 向量条目（非零起点 + 巨大终点），头内段索引指针保持原值。
+func writeCorruptProbeSegmentXDB(t *testing.T, path string) {
+	t.Helper()
+	writeTestXDB(t, path, testSegments)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const vectorEntryOff = 256 + (114*256+114)*8
+	binary.LittleEndian.PutUint32(data[vectorEntryOff:], 524544)
+	binary.LittleEndian.PutUint32(data[vectorEntryOff+4:], 0x7FFFFF00)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// 导入校验入口必须与更新路径同强度：结构门通过但段指针越界的文件会在真实
+// 搜索时 panic，落盘后请求期 Search 直接 500/启动期采样崩溃。
+func TestValidateIP2RegionFile_rejectsProbePanicOnCorruptSegment(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "corrupt.xdb")
+	writeCorruptProbeSegmentXDB(t, path)
+	if err := ValidateIP2RegionFile(path); err == nil {
+		t.Fatal("段指针损坏的 xdb 必须被导入校验拒绝（探针搜索 + recover）")
+	}
+}
+
+// Reload 是文件进入 live 热路径的第二入口：坏文件不得装载为在役 searcher。
+func TestReload_rejectsProbePanicOnCorruptSegment(t *testing.T) {
+	dir := t.TempDir()
+	live := filepath.Join(dir, "ip2region.xdb")
+	writeCorruptProbeSegmentXDB(t, live)
+	withIP2RegionPaths(t, live, filepath.Join(dir, "missing-dist.xdb"))
+
+	if err := Reload(); err == nil {
+		t.Fatal("Reload 必须拒绝段指针损坏的 xdb（不得装载为在役 searcher）")
+	}
+	ip2regionMu.RLock()
+	installed := ip2regionSearcher != nil
+	ip2regionMu.RUnlock()
+	if installed {
+		t.Fatal("被拒绝的 xdb 不得装载为在役 searcher")
+	}
+}
+
+// 启动入口同强度：损坏 live 库 + 无镜像回退时不得装载，也不得在省份采样期
+// panic（main 无 recover，启动期 panic=进程退出）。
+func TestInitIP2Region_rejectsProbePanicOnCorruptSegment(t *testing.T) {
+	dir := t.TempDir()
+	live := filepath.Join(dir, "ip2region.xdb")
+	writeCorruptProbeSegmentXDB(t, live)
+	withIP2RegionPaths(t, live, filepath.Join(dir, "missing-dist.xdb"))
+
+	InitIP2Region()
+	ip2regionMu.RLock()
+	installed := ip2regionSearcher != nil
+	ip2regionMu.RUnlock()
+	if installed {
+		t.Fatal("启动装载必须与导入/Reload 同强度拒绝损坏 xdb")
 	}
 }

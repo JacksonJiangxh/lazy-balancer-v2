@@ -113,3 +113,13 @@ test('被动模式下隐藏的超时字段越界时保存前钳到合法值', ()
   assert.ok(timeoutRuleAt > clampAt, '钳制必须先于 timeout>=interval 校验（否则仍被拦下）')
   assert.match(submit.slice(clampAt, timeoutRuleAt), /wizardForm\.health_check_timeout = clampedTimeout\.timeout/)
 })
+
+test('零启用上游的启用态规则在健康列显示「未发布」信息态徽标', () => {
+  // 渲染层对零启用上游的规则跳过发布（warn+跳过），列表若与「已禁用」同显示「-」，
+  // 用户无法区分「未生效」与「已关闭」。徽标与健康 popover 互斥（v-else-if），
+  // 判据复用既有 getEnabledUpstreams（启用≠false，与后端 Enabled 同口径）。
+  const healthColumn = section(page, '<el-table-column label="健康"', '<el-table-column label="更新者"')
+  assert.match(healthColumn, /v-if="row\.enabled && Array\.isArray\(row\.upstreams\) && getEnabledUpstreams\(row\)\.length === 0"/)
+  assert.match(healthColumn, /未发布/)
+  assert.match(healthColumn, /<el-popover v-else-if="row\.enabled && healthStatus\[row\.caddy_id\]"/, '徽标与健康 popover 必须互斥')
+})

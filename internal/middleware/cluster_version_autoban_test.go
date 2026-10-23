@@ -9,7 +9,7 @@ import "testing"
 
 func TestClusterVersionTrigger_autobanSettingsBump(t *testing.T) {
 	database := newClusterVersionTestDB(t)
-	if err := installClusterVersionTriggers(database); err != nil {
+	if err := InstallClusterVersionTriggers(database); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := database.Exec("UPDATE global_config SET is_master=1,cluster_version=0 WHERE id=1"); err != nil {

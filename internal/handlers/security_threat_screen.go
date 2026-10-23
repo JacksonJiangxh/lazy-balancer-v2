@@ -41,12 +41,18 @@ const threatRollupRewindWindowHours = 24 * 7
 // threatActiveSourceWindow 活跃攻击源窗口（设计定稿）：近 10 分钟去重 client_ip。
 const threatActiveSourceWindow = 10 * time.Minute
 
-// describeThreatRuleName 把「命中规则」维度的原始 SecRule id 翻译为可读标签。
-// 大屏直接展示本标签：事件里的 rule_triggered 是 coraza SecRule id，裸数字
-// 对用户无意义（阶段 1 预检为合成 id、CRS 为 9xxxxx、自定义规则为 DB id+10000、
-// 限流固定 429）。解析失败时回退「可读类别 + 原始 id」，绝不静默丢 id——
-// 排障需要 id 才能对回规则文件。
-func describeThreatRuleName(key string) string {
+// threatRuleNamePointQueriesForTest 仅测试观测「自定义规则名单键点查主库」
+// 的次数：大屏标签解析必须走批量预取（生产零消费，仅原子自增）。
+var threatRuleNamePointQueriesForTest atomic.Int64
+
+// describeThreatRuleNameWithNames 把「命中规则」维度的原始 SecRule id 翻译为可读
+// 标签；customNames 非 nil 时自定义规则名一律取预取结果（不再逐键点查主库）
+// ——nil 键表示该 id 在 security_custom_rules 中不存在（回退
+// 「自定义规则（#id）」）。大屏直接展示本标签：事件里的 rule_triggered 是
+// coraza SecRule id，裸数字对用户无意义（阶段 1 预检为合成 id、CRS 为 9xxxxx、
+// 自定义规则为 DB id+10000、限流固定 429）。解析失败时回退「可读类别 + 原始
+// id」，绝不静默丢 id——排障需要 id 才能对回规则文件。
+func describeThreatRuleNameWithNames(key string, customNames map[int]string) string {
 	if key == "" {
 		return ""
 	}
@@ -106,7 +112,16 @@ func describeThreatRuleName(key string) string {
 		// 下界用 >=（与 triggerTypeForRule 同口径）：10000 是段起点，当前发射
 		// 侧不可达（crID≥1），但两处口径分叉会让同一 id 在大屏「命中规则」榜
 		// 与事件列表 trigger_type 上显示不同分类。
+		if customNames != nil {
+			if name, ok := customNames[n-10000]; ok {
+				if trimmed := strings.TrimSpace(name); trimmed != "" {
+					return fmt.Sprintf("%s（#%s）", trimmed, key)
+				}
+			}
+			return "自定义规则（#" + key + "）"
+		}
 		if db.DB != nil {
+			threatRuleNamePointQueriesForTest.Add(1)
 			var name string
 			if err := db.DB.QueryRow(`SELECT name FROM security_custom_rules WHERE id=?`, n-10000).Scan(&name); err == nil {
 				if trimmed := strings.TrimSpace(name); trimmed != "" {
@@ -120,13 +135,61 @@ func describeThreatRuleName(key string) string {
 }
 
 // labeledThreatRuleCounts 把规则 id 维度计数换成可读标签维度（同标签合并计数），
-// 供大屏 Top 榜直接展示。
+// 供大屏 Top 榜直接展示。自定义规则名一次分块 IN 预取（宽窗口下 distinct 规则
+// 键可达自定义规则总量 200，逐键点查会在缓存 miss 时引入 ~200 次串行主库查询）。
 func labeledThreatRuleCounts(counts map[string]int) map[string]int {
+	customNames := loadThreatCustomRuleNames(counts)
 	labeled := make(map[string]int, len(counts))
 	for key, value := range counts {
-		labeled[describeThreatRuleName(key)] += value
+		labeled[describeThreatRuleNameWithNames(key, customNames)] += value
 	}
 	return labeled
+}
+
+// loadThreatCustomRuleNames 预取计数键里自定义规则段（emit id = DB id+10000）
+// 的规则名：一次分块 IN（≤500/批，与 validateIPListRefsExistence 同口径）。
+// 无自定义规则键返回 nil（describe 走单键路径，行为与旧实现一致）。
+func loadThreatCustomRuleNames(counts map[string]int) map[int]string {
+	if db.DB == nil || len(counts) == 0 {
+		return nil
+	}
+	ids := make([]int64, 0, len(counts))
+	for key := range counts {
+		n, err := strconv.Atoi(key)
+		if err != nil || n < 10000 || n >= services.GeoIPPrecheckSegmentBase {
+			continue
+		}
+		ids = append(ids, int64(n-10000))
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	names := make(map[int]string, len(ids))
+	for _, chunk := range chunkIDs(ids, 500) {
+		rows, err := db.DB.Query("SELECT id, name FROM security_custom_rules WHERE id IN ("+chunk.placeholders+")", chunk.args...)
+		if err != nil {
+			// 预取失败回退逐键路径（DB 故障时同样返回不可读标签，不扩大影响面）。
+			services.Logf("warn", "大屏规则名批量预取失败，回退逐键解析: %v", err)
+			return nil
+		}
+		for rows.Next() {
+			var id int
+			var name string
+			if err := rows.Scan(&id, &name); err != nil {
+				rows.Close()
+				services.Logf("warn", "大屏规则名批量预取扫描失败，回退逐键解析: %v", err)
+				return nil
+			}
+			names[id] = name
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			services.Logf("warn", "大屏规则名批量预取迭代失败，回退逐键解析: %v", err)
+			return nil
+		}
+		rows.Close()
+	}
+	return names
 }
 
 // topThreatEntries 计数 map → 前 n 条（值降序；同值按名称升序——确定性输出，
@@ -340,13 +403,35 @@ func threatRollupRewindToInLock(minute time.Time) {
 	if !lastFixed.After(target) {
 		return // 该分钟尚未被固化，无需回退
 	}
-	if _, err := database.Exec(`INSERT INTO metrics_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
-		threatRollupWatermarkKey, target.Format("2006-01-02 15:04")); err != nil {
+	// 回退区间的分钟高水位键必须同批删除：改判（logged→blocked）是对原始行
+	// 原地 UPDATE，id 不变，而增量重固只重扫 id > previousMaxID——不删键时
+	// 该分钟会被判成「无新增（deltaTotal==0）」早退，rollup 的 action 维度永久
+	// 停在改判前的值（大屏/总览与事件列表自相矛盾）。删键后下一次固化
+	// previousMaxID=0 → 走全量重建分支，按当前行重算全部维度。
+	const minuteLayout = "2006-01-02 15:04"
+	tx, err := database.Begin()
+	if err != nil {
+		services.Logf("warn", "threat rollup rewind: begin transaction failed: %v", err)
+		return
+	}
+	defer func() { _ = tx.Rollback() }() // 已 Commit 后为 no-op
+	if _, err := tx.Exec(`DELETE FROM metrics_state WHERE key > ? AND key <= ?`,
+		services.ThreatRollupEventHighwaterPrefix+target.Format(minuteLayout),
+		services.ThreatRollupEventHighwaterPrefix+lastFixed.UTC().Truncate(time.Minute).Format(minuteLayout)); err != nil {
+		services.Logf("warn", "threat rollup rewind: drop event highwater failed: %v", err)
+		return
+	}
+	if _, err := tx.Exec(`INSERT INTO metrics_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+		threatRollupWatermarkKey, target.Format(minuteLayout)); err != nil {
 		services.Logf("warn", "threat rollup rewind: write watermark failed: %v", err)
 		return
 	}
-	services.Logf("info", "threat rollup rewind: 摄取补齐历史分钟 %s，覆盖水位回退为 %s（下一次固化重算）",
-		minute.UTC().Truncate(time.Minute).Format("2006-01-02 15:04"), target.Format("2006-01-02 15:04"))
+	if err := tx.Commit(); err != nil {
+		services.Logf("warn", "threat rollup rewind: commit failed: %v", err)
+		return
+	}
+	services.Logf("info", "threat rollup rewind: 摄取补齐历史分钟 %s，覆盖水位回退为 %s（下一次固化全量重算该段）",
+		minute.UTC().Truncate(time.Minute).Format(minuteLayout), target.Format(minuteLayout))
 }
 
 // ensureThreatRollup 按需固化 rollup（幂等、自愈、可跨请求续做）：
@@ -1210,6 +1295,13 @@ func (h *Handlers) ControlThreatScreenCollector(c *gin.Context) {
 	}
 	if collectorReq.LeaseID == "" && c.Request.Method == http.MethodDelete {
 		collectorReq.LeaseID = c.Query("lease_id")
+		// query 回退必须一并转发：Caddy 侧 DELETE 无 body 时读 query，
+		// 不转发会让 admin 收到空 lease_id → releaseTrafficLease("") no-op →
+		// 本地已释放而 Caddy 租约残留到 TTL 过期（响应 enabled=true 与本地
+		// 状态矛盾）。与 GetThreatScreenFlowEvents 的 RawQuery 转发同形。
+		if raw := c.Request.URL.RawQuery; raw != "" {
+			target += "?" + raw
+		}
 	}
 	req, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, target, bytes.NewReader(body))
 	if err != nil {
@@ -1410,7 +1502,15 @@ func threatHourlyBuckets(hours int, now time.Time, loc *time.Location) ([]time.T
 		for i := range n {
 			tb := windowStart.AddDate(0, 0, i)
 			bucketStarts = append(bucketStarts, tb)
-			bucketNames = append(bucketNames, tb.AddDate(0, 0, 1).Format("01-02"))
+			// 标签=槽终点但不得越过当前时刻：hours 非 24 整数倍时末槽终点
+			// 会落到未来（如 30h → 窗口起点+2d = now+18h），柱状图末柱标签
+			// 显示未来日期会被误读为时间轴越界。数据分桶由 threatBucketIndex
+			// 末端钳制保证不错桶，此处只钳展示标签。
+			labelEnd := tb.AddDate(0, 0, 1)
+			if labelEnd.After(nowLocal) {
+				labelEnd = nowLocal
+			}
+			bucketNames = append(bucketNames, labelEnd.Format("01-02"))
 		}
 	}
 	hourly := make([]models.SecurityAttackType, len(bucketNames))
@@ -1780,7 +1880,11 @@ func (h *Handlers) GetSecurityEventToastSummary(c *gin.Context) {
 		return
 	}
 	if sinceID > maxID {
-		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: empty(0)})
+		// 指标库重建/恢复导致 id 回退（客户端持有旧游标）：重新基线到当前
+		// 库尾——返回 next_id=0 会让下一次轮询以 since_id=0 走全量增量扫描，
+		// 把最多 1200 条历史事件当「新事件」弹框回放。与 baseline=1 的
+		// 「只给游标不回放」语义对齐。
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: empty(maxID)})
 		return
 	}
 	if sinceID == maxID {
@@ -1962,7 +2066,7 @@ func (h *Handlers) GetSecurityEventFeed(c *gin.Context) {
 				continue
 			}
 			e.AttackType = categorizeAttack(ruleTriggered, ruleMsg)
-			e.RuleTrigged = ruleTriggered
+			e.RuleTriggered = ruleTriggered
 			e.TriggerType = triggerTypeForRule(ruleTriggered)
 			events = append(events, e)
 		}

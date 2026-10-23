@@ -52,7 +52,7 @@ func TestRecordDownloadIntegrity_concurrentSourcesNoLostUpdate(t *testing.T) {
 	wg.Wait()
 
 	// Then：两条基线都在、文件可解析（无丢失更新、无撕裂）
-	records, audits, err := loadDownloadIntegrityRecords()
+	records, audits, _, err := loadDownloadIntegrityRecords()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +95,7 @@ func TestRecordDownloadIntegrity_quarantinesCorruptRecordsFile(t *testing.T) {
 	if err != nil || len(matches) != 1 {
 		t.Fatalf("corrupt quarantine files=%v err=%v, want exactly 1", matches, err)
 	}
-	records, audits, err := loadDownloadIntegrityRecords()
+	records, audits, _, err := loadDownloadIntegrityRecords()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,11 +213,37 @@ func TestRecordDownloadIntegrity_releasesLockBeforeAuditIO(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("recordDownloadIntegrity 未返回")
 	}
-	records, _, err := loadDownloadIntegrityRecords()
+	records, _, _, err := loadDownloadIntegrityRecords()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := records["https://src/m"]; got.SHA256 == "" || got.Size != int64(len("v1")) {
 		t.Fatalf("mismatch 必须保留旧基线, got %+v", got)
+	}
+}
+
+// TestLoadDownloadIntegrityRecords_corruptReturnsLogForLockFreeEmit 损坏分支的
+// 日志文案随返回值交调用方在解锁后输出——锁内不得执行日志 writer I/O。
+func TestLoadDownloadIntegrityRecords_corruptReturnsLogForLockFreeEmit(t *testing.T) {
+	dir := t.TempDir()
+	oldPath := downloadIntegrityPath
+	downloadIntegrityPath = filepath.Join(dir, ".download-integrity.json")
+	t.Cleanup(func() { downloadIntegrityPath = oldPath })
+	if err := os.WriteFile(downloadIntegrityPath, []byte(`{"broken": `), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	records, audits, logs, err := loadDownloadIntegrityRecords()
+	if err != nil {
+		t.Fatalf("损坏记录文件应隔离并重建而非返回错误: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("基线应清空重建, got %#v", records)
+	}
+	if len(audits) != 1 {
+		t.Fatalf("审计载荷=1, got %#v", audits)
+	}
+	if len(logs) != 1 || !strings.Contains(logs[0], "quarantined") {
+		t.Fatalf("损坏分支必须返回一条待输出日志, got %#v", logs)
 	}
 }

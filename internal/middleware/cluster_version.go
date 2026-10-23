@@ -13,7 +13,11 @@ import (
 )
 
 func clusterVersionMiddleware(database *sql.DB) gin.HandlerFunc {
-	installErr := installClusterVersionTriggers(database)
+	// 幂等重装：生产启动路径已在任务引擎之前完成安装（安装失败即拒绝启动），
+	// 此处重装是防御刷新并保持测试/嵌入形态自足。若仍失败（装配后 DDL 被外部
+	// 破坏的窗口），HTTP 写面按 fail-closed 500 处理——注意后台周期任务不经本
+	// 中间件，它们与触发器的关系由启动门保证。
+	installErr := InstallClusterVersionTriggers(database)
 	// 装配期 DDL 失败后所有同步写与主端登录恒 500，此前只把错误塞进
 	// gin 上下文（无日志落点）——系统日志看不到根因。此处一次性留痕，响应与
 	// fail-closed 语义不变。
@@ -26,16 +30,16 @@ func clusterVersionMiddleware(database *sql.DB) gin.HandlerFunc {
 			return
 		}
 		if installErr != nil {
-			// users 表写路径的 fail-closed 仅主节点语义——users 触发器
-			// WHEN COALESCE(is_master,1)=1，从节点上这些写入本就不会 bump，
-			// fail-closed 在从端零保护收益、只截断登录/开户/改 MFA 可用性
-			// （与票据登录被排除出 fail-closed 面的口径一致）。角色读失败按
-			// 写闸同语义 fail-closed 落入 500（不猜测放行）。
-			if isUsersTableWritePath(c.Request.Method, c.FullPath()) {
-				if isMaster, err := services.RoleOf(c.Request.Context(), database); err == nil && !isMaster {
-					c.Next()
-					return
-				}
+			// fail-closed 只对主节点有意义：触发器 WHEN COALESCE(is_master,1)=1，
+			// 从节点上的写本就不会 bump——降级态在从端零保护收益，500 只会把
+			// 「该去主节点操作」误导成「主节点有故障」（与本包「角色真因优先于
+			// 后续 428/500」的口径一致）。因此所有分类写路径统一先读角色：
+			// 从端交给下游守卫（readOnlyGuard 给 403，/cluster/* 由 handler 的
+			// 角色门兜底）。角色读失败按写闸同语义 fail-closed 落入 500（不猜测
+			// 放行）。此前只有 users 表路径做了这层分流。
+			if isMaster, err := services.RoleOf(c.Request.Context(), database); err == nil && !isMaster {
+				c.Next()
+				return
 			}
 			_ = c.Error(installErr) // 请求日志尾部列输出（requestLogFormatter 消费 ErrorMessage）
 			c.AbortWithStatusJSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "集群版本触发器不可用"})
@@ -100,8 +104,74 @@ type clusterSyncedTable struct {
 // 更新本清单与 clusterSyncedColumnExclusions（有意不同步的列携理由）——
 // 漏登记列时仅写该列的 UPDATE 不 bump cluster_version，从节点经 304 门永久
 // 滞留旧值（钉测见 cluster_synced_columns_test.go 的逐表 schema 对账）。
+// lb_rules 的触发器 OF 列按语义分组：55 列单行字符串在 diff 中表现为整行
+// 替换，新增/删除一列无法 review；分组后增量落到「一组内一行一处」。
+// 组顺序即 OF 串顺序（与 schema 对账测试无关，但 CREATE TRIGGER 的 OF 语义
+// 只认列集合）。历史教训：NTLM 两列曾整组漏列，靠人工补钉测才发现。
+var (
+	lbRuleBaseColumns = []string{
+		"caddy_id", "name", "description", "protocol", "domain", "listen_port",
+		"strategy", "dynamic_dns", "enable_dns_server", "dns_server", "dns_family",
+	}
+	lbRuleHealthCheckColumns = []string{
+		"health_check_path", "health_check_interval", "health_check_timeout",
+		"health_check_unhealthy_threshold", "health_check_healthy_threshold",
+		"enable_active_health_check",
+	}
+	lbRuleTCPColumns = []string{
+		"tcp_health_check_port", "tcp_proxy_protocol", "tcp_try_duration", "tcp_try_interval",
+	}
+	lbRuleRequestAndUpstreamColumns = []string{
+		"request_body_max_size_mb", "upstream_keepalive_timeout", "server_tokens_hidden",
+		"ntlm_compatible", "upstream_force_http1", "host_header", "health_check_host",
+		"custom_routes_enabled",
+	}
+	lbRuleProxyTimeoutColumns = []string{
+		"proxy_dial_timeout", "proxy_response_header_timeout", "proxy_read_timeout",
+		"proxy_write_timeout", "proxy_stream_timeout", "proxy_flush_interval",
+		"proxy_stream_close_delay",
+	}
+	lbRuleTLSColumns = []string{
+		"enable_tls", "tls_source", "acme_config_id", "ca_provider_id",
+		"tls_cert", "tls_key", "tls_http_redirect",
+	}
+	lbRuleCompressColumns  = []string{"enable_compress", "compress_types"}
+	lbRuleLifecycleColumns = []string{
+		"enabled", "log_enabled", "created_by", "created_at", "updated_at", "updated_by",
+	}
+	lbRuleStagePageColumns = []string{
+		"block_page_stage1_id", "block_page_stage1_status",
+		"block_page_stage3_id", "block_page_stage3_status",
+	}
+)
+
+// lbRuleSnapshotColumns 由分组拼接生成（OF 串单源）。
+var lbRuleSnapshotColumns = joinColumnGroups(
+	lbRuleBaseColumns,
+	lbRuleHealthCheckColumns,
+	lbRuleTCPColumns,
+	lbRuleRequestAndUpstreamColumns,
+	lbRuleProxyTimeoutColumns,
+	lbRuleTLSColumns,
+	lbRuleCompressColumns,
+	lbRuleLifecycleColumns,
+	lbRuleStagePageColumns,
+)
+
+func joinColumnGroups(groups ...[]string) string {
+	total := 0
+	for _, group := range groups {
+		total += len(group)
+	}
+	columns := make([]string, 0, total)
+	for _, group := range groups {
+		columns = append(columns, group...)
+	}
+	return strings.Join(columns, ",")
+}
+
 var clusterSyncedTables = []clusterSyncedTable{
-	{name: "lb_rules", snapshotColumns: "caddy_id,name,description,protocol,domain,listen_port,strategy,dynamic_dns,enable_dns_server,dns_server,dns_family,health_check_path,health_check_interval,health_check_timeout,health_check_unhealthy_threshold,health_check_healthy_threshold,enable_active_health_check,tcp_health_check_port,tcp_proxy_protocol,tcp_try_duration,tcp_try_interval,request_body_max_size_mb,upstream_keepalive_timeout,server_tokens_hidden,ntlm_compatible,upstream_force_http1,host_header,health_check_host,custom_routes_enabled,proxy_dial_timeout,proxy_response_header_timeout,proxy_read_timeout,proxy_write_timeout,proxy_stream_timeout,proxy_flush_interval,proxy_stream_close_delay,enable_tls,tls_source,acme_config_id,ca_provider_id,tls_cert,tls_key,tls_http_redirect,enable_compress,compress_types,enabled,log_enabled,created_by,created_at,updated_at,updated_by,block_page_stage1_id,block_page_stage1_status,block_page_stage3_id,block_page_stage3_status"},
+	{name: "lb_rules", snapshotColumns: lbRuleSnapshotColumns},
 	{name: "upstreams", snapshotColumns: "id,rule_id,host,port,weight,dynamic_dns,enabled,protocol,max_connections,origin_domain"},
 	{name: "path_rules", snapshotColumns: "id,rule_id,sort_order,match_type,path,upstream_path,upstreams_json,response_mode,response_status,response_body,response_content_type,redirect_to"},
 	// users 触发器 OF 列表补 v2.1.8 的 MFA 权威列——此前不在列表内，
@@ -180,7 +250,36 @@ var clusterVersionRuntimeColumns = map[string]map[string]bool{
 	),
 }
 
-func installClusterVersionTriggers(database *sql.DB) error {
+// InstallClusterVersionTriggers 安装/替换全部集群版本触发器（幂等 DDL：
+// DROP IF EXISTS + CREATE IF NOT EXISTS）。
+//
+// 启动期必须在任务引擎之前调用（cmd/server 的启动门）：触发器是同步正确性的
+// 结构性前提，而 HTTP 侧的 fail-closed 只覆盖请求链——引擎内的周期任务
+// （CRS/IP2Region/威胁/爬虫/cert-renewal/autoban）直接经主库句柄写同步表，
+// 触发器缺失时这些写不 bump cluster_version：从节点 304 门恒定命中旧指纹，
+// 主端稳态变更永不传播，任务日志却全绿（「fail-closed 假象」）。
+// 装配期 clusterVersionMiddleware 也调用本函数（幂等），保持测试与嵌入形态
+// 自足；生产启动路径已在前置就绪门完成安装，此处重装只是一次防御刷新。
+func InstallClusterVersionTriggers(database *sql.DB) error {
+	// nil 句柄（库未装配）必须显式报错而不是 nil deref——本函数已进入生产
+	// 启动门，panic 会以栈崩形态出现、掩盖真实原因。
+	if database == nil {
+		return fmt.Errorf("install cluster version triggers: database not initialized")
+	}
+	// DDL 整体包进一个事务：每条 DROP/CREATE 各自独立提交时存在「旧触发器
+	// 已删、新触发器未建」的窗口（毫秒级，但每次启动都有一次机会；期间后台
+	// 写者的同步表写不会 bump cluster_version）。SQLite 的 DDL 可事务化：
+	// 提交前读者仍见旧触发器，失败则整体回滚——降级面比逐语句更小。
+	tx, err := database.Begin()
+	if err != nil {
+		return fmt.Errorf("install cluster version triggers: begin transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
 	// 逐表逐语句安装触发器（清单=包级单源，对账测试共用）。
 	tables := clusterSyncedTables
 	const newCertificateMember = "NEW.status<>'disabled' AND COALESCE(NEW.cert_pem,'')<>'' AND COALESCE(NEW.key_pem,'')<>'' AND datetime(NEW.expires_at)>datetime('now')"
@@ -188,7 +287,7 @@ func installClusterVersionTriggers(database *sql.DB) error {
 	for _, table := range tables {
 		for _, operation := range []string{"INSERT", "UPDATE", "DELETE"} {
 			triggerName := fmt.Sprintf("cluster_version_%s_%s", table.name, strings.ToLower(operation))
-			if _, err := database.Exec("DROP TRIGGER IF EXISTS " + triggerName); err != nil {
+			if _, err := tx.Exec("DROP TRIGGER IF EXISTS " + triggerName); err != nil {
 				return fmt.Errorf("replace cluster version trigger for %s %s: %w", operation, table.name, err)
 			}
 			operationClause := operation
@@ -296,15 +395,15 @@ func installClusterVersionTriggers(database *sql.DB) error {
 				BEGIN
 					UPDATE global_config SET cluster_version=COALESCE(cluster_version,0)+1 WHERE id=1;
 				END`, table.name, strings.ToLower(operation), operationClause, table.name, whenClause)
-			if _, err := database.Exec(statement); err != nil {
+			if _, err := tx.Exec(statement); err != nil {
 				return fmt.Errorf("install cluster version trigger for %s %s: %w", operation, table.name, err)
 			}
 		}
 	}
-	if _, err := database.Exec("DROP TRIGGER IF EXISTS cluster_version_cert_jobs_status_update"); err != nil {
+	if _, err := tx.Exec("DROP TRIGGER IF EXISTS cluster_version_cert_jobs_status_update"); err != nil {
 		return fmt.Errorf("replace cluster version trigger for cert_jobs status UPDATE: %w", err)
 	}
-	if _, err := database.Exec("DROP TRIGGER IF EXISTS cluster_version_global_config_update"); err != nil {
+	if _, err := tx.Exec("DROP TRIGGER IF EXISTS cluster_version_global_config_update"); err != nil {
 		return fmt.Errorf("replace cluster version trigger for global_config UPDATE: %w", err)
 	}
 	// COALESCE(NEW.is_master,1) 同上——与写闸 NULL 语义一致。
@@ -321,7 +420,7 @@ func installClusterVersionTriggers(database *sql.DB) error {
 	// dry_run 六列入 OF(同先例)——主端 PUT /security/autoban 保存即下发;
 	// 不在 OF 内则稳态变更经 304 门滞留主节点,从端恒默认值、升主后按陈旧配置
 	// 静默运行(名单传播而配置不传播)。
-	if _, err := database.Exec(fmt.Sprintf(`CREATE TRIGGER cluster_version_global_config_update
+	if _, err := tx.Exec(fmt.Sprintf(`CREATE TRIGGER cluster_version_global_config_update
 		AFTER UPDATE OF %s
 		ON global_config
 		WHEN OLD.cluster_version IS NEW.cluster_version AND COALESCE(NEW.is_master,1)=1
@@ -330,6 +429,10 @@ func installClusterVersionTriggers(database *sql.DB) error {
 		END`, strings.Join(globalConfigSyncedColumns, ","))); err != nil {
 		return fmt.Errorf("install cluster version trigger for global_config UPDATE: %w", err)
 	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("install cluster version triggers: commit: %w", err)
+	}
+	committed = true
 	return nil
 }
 

@@ -42,7 +42,7 @@ func TestCreateRuleToolForwardsBodyAndAPIKey(t *testing.T) {
 	}))
 	defer rest.Close()
 
-	handler := New(rest.URL+"/api/v1", rest.Client())
+	handler := NewForTest(rest.URL+"/api/v1", rest.Client())
 	body := []byte(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"create_rule","arguments":{"name":"MCP rule","protocol":"http","listen_port":8080,"upstreams":[{"host":"127.0.0.1","port":9000}]}}}`)
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/mcp", bytes.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
@@ -268,14 +268,7 @@ func TestToolsListBatchRequestRejectedByProtocol(t *testing.T) {
 
 func TestResolveAPIKeyReadOnly_returnsPersistedPermission(t *testing.T) {
 	// Given
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatalf("initialize database: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := db.Close(); err != nil {
-			t.Errorf("close database: %v", err)
-		}
-	})
+	withIsolatedMCPDatabase(t)
 	apiKey := "lb_sk_persisted-read-only"
 	hash := sha256.Sum256([]byte(apiKey))
 	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (91,'mcp-read-only','x','admin',1)`); err != nil {
@@ -296,14 +289,7 @@ func TestResolveAPIKeyReadOnly_returnsPersistedPermission(t *testing.T) {
 
 func TestResolveAPIKeyReadOnly_requiresMatchingIndexedPrefix(t *testing.T) {
 	// Given：正确 hash 但错误 prefix 的带外脏行；修复前单列 hash 查询会误命中。
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatalf("initialize database: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := db.Close(); err != nil {
-			t.Errorf("close database: %v", err)
-		}
-	})
+	withIsolatedMCPDatabase(t)
 	apiKey := "lb_sk_indexed-read-only"
 	hash := sha256.Sum256([]byte(apiKey))
 	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (94,'mcp-indexed','x','admin',1)`); err != nil {
@@ -334,14 +320,7 @@ func TestResolveAPIKeyReadOnly_requiresMatchingIndexedPrefix(t *testing.T) {
 
 func TestResolveAPIKeyReadOnly_treatsDisabledOwnerAsNotReadOnly(t *testing.T) {
 	// Given
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatalf("initialize database: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := db.Close(); err != nil {
-			t.Errorf("close database: %v", err)
-		}
-	})
+	withIsolatedMCPDatabase(t)
 	apiKey := "lb_sk_disabled-owner"
 	hash := sha256.Sum256([]byte(apiKey))
 	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (92,'disabled-owner','x','admin',0)`); err != nil {
@@ -365,14 +344,7 @@ func TestResolveAPIKeyReadOnly_treatsDisabledOwnerAsNotReadOnly(t *testing.T) {
 
 func TestResolveAPIKeyReadOnly_rejectsExpiredKey(t *testing.T) {
 	// Given
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatalf("initialize database: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := db.Close(); err != nil {
-			t.Errorf("close database: %v", err)
-		}
-	})
+	withIsolatedMCPDatabase(t)
 	apiKey := "lb_sk_expired-key"
 	hash := sha256.Sum256([]byte(apiKey))
 	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (93,'expired-owner','x','admin',1)`); err != nil {
@@ -405,7 +377,7 @@ func TestForwardPropagatesClientIPFromContext(t *testing.T) {
 	}))
 	defer rest.Close()
 
-	handler := New(rest.URL+"/api/v1", rest.Client())
+	handler := NewForTest(rest.URL+"/api/v1", rest.Client())
 	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_rules","arguments":{}}}`)
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/mcp", bytes.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
@@ -433,7 +405,7 @@ func TestForwardOmitsClientIPHeaderWithoutContextInjection(t *testing.T) {
 	}))
 	defer rest.Close()
 
-	result := callTool(t, New(rest.URL+"/api/v1", rest.Client()), "list_rules", `{}`)
+	result := callTool(t, NewForTest(rest.URL+"/api/v1", rest.Client()), "list_rules", `{}`)
 	// MCP 信封内层 JSON 文本被转义（\"code\":0），按转义形态匹配
 	if !strings.Contains(result, `\"code\":0`) {
 		t.Fatalf("result=%q", result)
@@ -471,7 +443,7 @@ func TestRedirectedPOSTPreservesMethodAndBody(t *testing.T) {
 	}))
 	defer rest.Close()
 
-	result := callTool(t, New(rest.URL+"/api/v1", rest.Client()), "issue_certificate", wantBody)
+	result := callTool(t, NewForTest(rest.URL+"/api/v1", rest.Client()), "issue_certificate", wantBody)
 	if requests != 2 || !strings.Contains(result, "ok") {
 		t.Fatalf("requests=%d result=%q", requests, result)
 	}
@@ -499,7 +471,7 @@ func TestRedirect302PreservesMethodAndBody(t *testing.T) {
 	}))
 	defer rest.Close()
 
-	result := callTool(t, New(rest.URL+"/api/v1", rest.Client()), "issue_certificate", wantBody)
+	result := callTool(t, NewForTest(rest.URL+"/api/v1", rest.Client()), "issue_certificate", wantBody)
 	if requests != 2 || !strings.Contains(result, "ok") {
 		t.Fatalf("requests=%d result=%q（302 须与 301 同口径重放）", requests, result)
 	}
@@ -513,7 +485,7 @@ func TestSecond302RedirectReturnsError(t *testing.T) {
 	}))
 	defer rest.Close()
 
-	result := callTool(t, New(rest.URL+"/api/v1", rest.Client()), "issue_certificate", `{}`)
+	result := callTool(t, NewForTest(rest.URL+"/api/v1", rest.Client()), "issue_certificate", `{}`)
 	if !strings.Contains(result, "重定向次数超过限制") {
 		t.Fatalf("result=%q", result)
 	}
@@ -526,7 +498,7 @@ func TestSecondRedirectReturnsError(t *testing.T) {
 	}))
 	defer rest.Close()
 
-	result := callTool(t, New(rest.URL+"/api/v1", rest.Client()), "issue_certificate", `{}`)
+	result := callTool(t, NewForTest(rest.URL+"/api/v1", rest.Client()), "issue_certificate", `{}`)
 	if !strings.Contains(result, "重定向次数超过限制") {
 		t.Fatalf("result=%q", result)
 	}
@@ -542,7 +514,7 @@ func TestExternalRedirectDoesNotSendAPIKey(t *testing.T) {
 		return nil, nil
 	})}
 
-	result := callTool(t, New("http://localhost:8000/api/v1", client), "issue_certificate", `{}`)
+	result := callTool(t, NewForTest("http://localhost:8000/api/v1", client), "issue_certificate", `{}`)
 	if externalRequests != 0 || !strings.Contains(result, "拒绝非回环") {
 		t.Fatalf("externalRequests=%d result=%q", externalRequests, result)
 	}
@@ -559,7 +531,7 @@ func TestRelativeRedirectIsResolved(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"ok":true}`)), Header: make(http.Header), Request: r}, nil
 	})}
 
-	result := callTool(t, New("http://localhost:8000/api/v1", client), "issue_certificate", `{}`)
+	result := callTool(t, NewForTest("http://localhost:8000/api/v1", client), "issue_certificate", `{}`)
 	if redirectedPath != "/api/v1/certificates/next" || !strings.Contains(result, "ok") {
 		t.Fatalf("path=%q result=%q", redirectedPath, result)
 	}
@@ -571,7 +543,7 @@ func TestOversizedResponseReturnsToolError(t *testing.T) {
 	}))
 	defer rest.Close()
 
-	result := callTool(t, New(rest.URL+"/api/v1", rest.Client()), "issue_certificate", `{}`)
+	result := callTool(t, NewForTest(rest.URL+"/api/v1", rest.Client()), "issue_certificate", `{}`)
 	if !strings.Contains(result, "超过 4 MiB 上限") || !strings.Contains(result, `"isError":true`) {
 		t.Fatalf("result=%q", result)
 	}
@@ -604,7 +576,7 @@ func TestResetUserPasswordToolInjectsRandomPassword(t *testing.T) {
 	defer rest.Close()
 
 	// When
-	result := callTool(t, New(rest.URL+"/api/v1", rest.Client()), "reset_user_password", `{"id":7}`)
+	result := callTool(t, NewForTest(rest.URL+"/api/v1", rest.Client()), "reset_user_password", `{"id":7}`)
 
 	// Then
 	if !strings.Contains(result, "密码重置成功") {
@@ -631,7 +603,7 @@ func TestResetUserPasswordToolDoesNotEchoPasswordOnFailure(t *testing.T) {
 	defer rest.Close()
 
 	// When
-	result := callTool(t, New(rest.URL+"/api/v1", rest.Client()), "reset_user_password", `{"id":404}`)
+	result := callTool(t, NewForTest(rest.URL+"/api/v1", rest.Client()), "reset_user_password", `{"id":404}`)
 
 	// Then
 	if !strings.Contains(result, "用户不存在") || !strings.Contains(result, `"isError":true`) {
@@ -684,7 +656,7 @@ func TestUpdateRuleToolInjectsDefaultUpstreamEnabled(t *testing.T) {
 	}))
 	defer rest.Close()
 
-	handler := New(rest.URL+"/api/v1", rest.Client())
+	handler := NewForTest(rest.URL+"/api/v1", rest.Client())
 
 	// When
 	response := callTool(t, handler, "update_rule", `{"caddy_id":"lb_upsert","upstreams":[{"host":"127.0.0.1","port":9000},{"host":"127.0.0.2","port":9001,"enabled":false}]}`)
@@ -725,7 +697,7 @@ func TestForwardFormatsLargeIntegerPathArgumentsWithoutExponent(t *testing.T) {
 	defer rest.Close()
 
 	// When：以数值 1000000 作路径参数调用 retry_cert_job
-	callTool(t, New(rest.URL+"/api/v1", rest.Client()), "retry_cert_job", `{"id":1000000}`)
+	callTool(t, NewForTest(rest.URL+"/api/v1", rest.Client()), "retry_cert_job", `{"id":1000000}`)
 
 	// Then：转发 URL 含 /1000000/ 而非 /1e+06/
 	if forwardedPath != "/api/v1/certificates/jobs/1000000/retry" {
@@ -743,7 +715,7 @@ func TestGetRuleMetricsHistoryForwardsRangeQuery(t *testing.T) {
 		_, _ = w.Write([]byte(`{"code":0,"data":{}}`))
 	}))
 	defer rest.Close()
-	handler := New(rest.URL+"/api/v1", rest.Client())
+	handler := NewForTest(rest.URL+"/api/v1", rest.Client())
 
 	// When：带 range=7d 与不带 range 各调用一次
 	callTool(t, handler, "get_rule_metrics_history", `{"caddy_id":"lb_metrics","range":"7d"}`)
@@ -768,7 +740,7 @@ func TestOversizedResponseMessageDistinguishesExportConfig(t *testing.T) {
 		_, _ = w.Write(bytes.Repeat([]byte("x"), maxResponseSize+1))
 	}))
 	defer rest.Close()
-	handler := New(rest.URL+"/api/v1", rest.Client())
+	handler := NewForTest(rest.URL+"/api/v1", rest.Client())
 
 	// When
 	exportResult := callTool(t, handler, "export_config", `{}`)
@@ -817,7 +789,7 @@ func TestAddIPToListToolForwardsValue(t *testing.T) {
 	defer rest.Close()
 
 	// When
-	callTool(t, New(rest.URL+"/api/v1", rest.Client()), "add_ip_to_list", `{"id":9,"value":"203.0.113.7"}`)
+	callTool(t, NewForTest(rest.URL+"/api/v1", rest.Client()), "add_ip_to_list", `{"id":9,"value":"203.0.113.7"}`)
 
 	// Then
 	if receivedMethod != http.MethodPost || receivedPath != "/api/v1/security/ip-lists/9/ips" {
@@ -855,7 +827,7 @@ func TestGetIPListToolForwardsID(t *testing.T) {
 	}
 
 	// When
-	result := callTool(t, New(rest.URL+"/api/v1", rest.Client()), "get_ip_list", `{"id":9}`)
+	result := callTool(t, NewForTest(rest.URL+"/api/v1", rest.Client()), "get_ip_list", `{"id":9}`)
 
 	// Then：转发到 GET /api/v1/security/ip-lists/9，响应原文含 entries
 	if receivedMethod != http.MethodGet || receivedPath != "/api/v1/security/ip-lists/9" {
@@ -876,7 +848,7 @@ func TestForgetClusterPinsToolForwardsEmptyBody(t *testing.T) {
 	}))
 	defer rest.Close()
 
-	callTool(t, New(rest.URL+"/api/v1", rest.Client()), "forget_cluster_pins", `{}`)
+	callTool(t, NewForTest(rest.URL+"/api/v1", rest.Client()), "forget_cluster_pins", `{}`)
 
 	if receivedMethod != http.MethodPost || receivedPath != "/api/v1/cluster/forget-pins" {
 		t.Fatalf("request=%s %s", receivedMethod, receivedPath)
@@ -893,7 +865,7 @@ func TestForgetClusterNodePinToolForwardsPathID(t *testing.T) {
 	}))
 	defer rest.Close()
 
-	callTool(t, New(rest.URL+"/api/v1", rest.Client()), "forget_cluster_node_pin", `{"id":7}`)
+	callTool(t, NewForTest(rest.URL+"/api/v1", rest.Client()), "forget_cluster_node_pin", `{"id":7}`)
 
 	if receivedMethod != http.MethodPost || receivedPath != "/api/v1/cluster/nodes/7/forget-pin" {
 		t.Fatalf("request=%s %s", receivedMethod, receivedPath)
@@ -914,7 +886,7 @@ func TestControlClusterNodeServiceToolForwardsAction(t *testing.T) {
 	defer rest.Close()
 
 	// When
-	callTool(t, New(rest.URL+"/api/v1", rest.Client()), "control_cluster_node_service", `{"id":7,"action":"restart_caddy"}`)
+	callTool(t, NewForTest(rest.URL+"/api/v1", rest.Client()), "control_cluster_node_service", `{"id":7,"action":"restart_caddy"}`)
 
 	// Then
 	if receivedMethod != http.MethodPost || receivedPath != "/api/v1/cluster/nodes/7/service" {
@@ -939,7 +911,7 @@ func TestResetUserMFAToolForwardsCode(t *testing.T) {
 	defer rest.Close()
 
 	// When
-	callTool(t, New(rest.URL+"/api/v1", rest.Client()), "reset_user_mfa", `{"id":7,"code":"123456"}`)
+	callTool(t, NewForTest(rest.URL+"/api/v1", rest.Client()), "reset_user_mfa", `{"id":7,"code":"123456"}`)
 
 	// Then
 	if receivedMethod != http.MethodPost || receivedPath != "/api/v1/users/7/mfa/reset" {
@@ -960,7 +932,7 @@ func TestGetCRSRuleIndexToolForwardsReadOnly(t *testing.T) {
 	}))
 	defer rest.Close()
 
-	callTool(t, New(rest.URL+"/api/v1", rest.Client()), "get_crs_rule_index", `{}`)
+	callTool(t, NewForTest(rest.URL+"/api/v1", rest.Client()), "get_crs_rule_index", `{}`)
 
 	if receivedMethod != http.MethodGet || receivedPath != "/api/v1/security/crs/rule-index" || receivedQuery != "" {
 		t.Fatalf("request=%s %s query=%q", receivedMethod, receivedPath, receivedQuery)
@@ -979,7 +951,7 @@ func TestExportConfigToolRejectsNonJSONContentType(t *testing.T) {
 		_, _ = w.Write([]byte{0x1f, 0x8b, 0x08, 0x00, 'b', 'i', 'n', 0x03})
 	}))
 	defer rest.Close()
-	handler := New(rest.URL+"/api/v1", rest.Client())
+	handler := NewForTest(rest.URL+"/api/v1", rest.Client())
 
 	// When
 	result := callTool(t, handler, "export_config", `{}`)
@@ -1256,7 +1228,7 @@ func TestRemoveIPFromListToolForwardsIDAndValue(t *testing.T) {
 	defer rest.Close()
 
 	// When
-	result := callTool(t, New(rest.URL+"/api/v1", rest.Client()), "remove_ip_from_list", `{"id":9,"value":"203.0.113.7"}`)
+	result := callTool(t, NewForTest(rest.URL+"/api/v1", rest.Client()), "remove_ip_from_list", `{"id":9,"value":"203.0.113.7"}`)
 
 	// Then
 	if receivedMethod != http.MethodPost || receivedPath != "/api/v1/security/ip-lists/9/remove-ip" {
@@ -1278,7 +1250,7 @@ func TestForward_callLayerErrorsReturnIsErrorResults(t *testing.T) {
 		_, _ = w.Write([]byte(`{"code":0}`))
 	}))
 	defer rest.Close()
-	handler := New(rest.URL+"/api/v1", rest.Client())
+	handler := NewForTest(rest.URL+"/api/v1", rest.Client())
 
 	// 缺路径参数
 	result := callTool(t, handler, "get_rule", `{}`)
@@ -1304,7 +1276,7 @@ func TestForward_callLayerErrorsReturnIsErrorResults(t *testing.T) {
 	}
 
 	// 传输失败（连接拒绝）
-	down := New("http://127.0.0.1:1/api/v1", &http.Client{Timeout: 2 * time.Second})
+	down := NewForTest("http://127.0.0.1:1/api/v1", &http.Client{Timeout: 2 * time.Second})
 	result = callTool(t, down, "list_rules", `{}`)
 	if !strings.Contains(result, `"isError":true`) || strings.Contains(result, "-32603") {
 		t.Fatalf("transport failure result=%s, want IsError tool result", result)
@@ -1321,7 +1293,7 @@ func TestOversizedResponseMessageGuidesNonPaginatedGetTools(t *testing.T) {
 		_, _ = w.Write(bytes.Repeat([]byte("x"), maxResponseSize+1))
 	}))
 	defer rest.Close()
-	handler := New(rest.URL+"/api/v1", rest.Client())
+	handler := NewForTest(rest.URL+"/api/v1", rest.Client())
 
 	noPagination := callTool(t, handler, "list_ip_lists", `{}`)
 	if !strings.Contains(noPagination, "无分页参数") || strings.Contains(noPagination, "请改用分页或专用导出工具") {
@@ -1346,4 +1318,22 @@ func TestOversizedResponseMessageGuidesNonPaginatedGetTools(t *testing.T) {
 			t.Errorf("%s result=%s, want 含可执行收敛路径 %q", tool, result, want)
 		}
 	}
+}
+
+// withIsolatedMCPDatabase 替换三句柄并在清理时经保存值恢复：只还原 db.DB 会把
+// 已关闭/已删临时目录的 MetricsDB/AuditDB 留给后续用例（-shuffle 下出现
+// 「database is closed」类顺序依赖假红）。
+func withIsolatedMCPDatabase(t *testing.T) {
+	t.Helper()
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
+	if err := db.Initialize(t.TempDir()); err != nil {
+		t.Fatalf("initialize database: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		db.SetDB(oldDB)
+	})
 }

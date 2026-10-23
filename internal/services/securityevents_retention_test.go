@@ -194,7 +194,7 @@ func TestSecurityEventsRetentionCleanup_stopsPromptlyWhenContextCanceled(t *test
 	deleted := -1
 	go func() {
 		defer close(done)
-		deleted, _ = securityEventsRetentionCleanup(ctx)
+		deleted, _ = SecurityEventsRetentionCleanupCtxErr(ctx)
 	}()
 
 	// Then: 清理迅速返回且仅完成一个批次（未删净），证明中途被取消而非跑完
@@ -241,7 +241,7 @@ func TestSecurityEventsRetentionCleanup_batchesAgeDelete(t *testing.T) {
 	}
 
 	// When
-	deleted, _ := securityEventsRetentionCleanup(context.Background())
+	deleted, _ := SecurityEventsRetentionCleanupCtxErr(context.Background())
 
 	// Then：全部过期事件被分批删除，近期事件保留
 	if got := countSecurityEventsByType(t, "expired"); got != 0 {
@@ -339,7 +339,7 @@ func TestSecurityEventsRetentionCleanup_trimsOldestWhenRowCapExceeded(t *testing
 	}
 
 	// When
-	deleted, _ := securityEventsRetentionCleanup(context.Background())
+	deleted, _ := SecurityEventsRetentionCleanupCtxErr(context.Background())
 
 	// Then 行数收敛到 cap，且删的是最旧两行（不是随机/最新）
 	var count int
@@ -392,6 +392,45 @@ func TestSecurityEventsRetentionCleanup_prunesRollupHighwaterKeys(t *testing.T) 
 	}
 	if recentCount != 1 {
 		t.Fatalf("近期高水位键被误删（count=%d）", recentCount)
+	}
+}
+
+// 任务日志必须能看到聚合/高水位删除量：停摆后首次清理可能只删旧 rollup 与
+// 高水位键（事件表无过期行），旧返回口径只报事件数 → 任务监控显示「删除 0 条」，
+// 运维误判保留策略未生效。
+func TestSecurityEventsRetentionCleanupDetail_reportsAggregateDeletions(t *testing.T) {
+	setupSecurityEventsRetentionTestDB(t)
+	if _, err := db.DB.Exec(`UPDATE global_config SET security_events_retention_days=30 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	oldMinute := time.Now().UTC().AddDate(0, 0, -40).Format("2006-01-02 15:04")
+	if _, err := db.MetricsDB.Exec(`INSERT INTO security_event_rollup (minute, country, family, rule, action, count) VALUES (?, '中国', 'waf', 'r', 'blocked', 3)`, oldMinute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.MetricsDB.Exec(`INSERT INTO security_event_target_rollup (minute, rule_caddy_id, count) VALUES (?, 'lb_example', 2)`, oldMinute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.MetricsDB.Exec(`INSERT INTO metrics_state (key, value) VALUES (?, '5')`, ThreatRollupEventHighwaterPrefix+oldMinute); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := SecurityEventsRetentionCleanupDetail(context.Background())
+	if err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if res.Events != 0 {
+		t.Fatalf("events deleted = %d, want 0（事件表无过期行）", res.Events)
+	}
+	if res.Rollup == 0 || res.TargetRollup == 0 || res.Highwater == 0 {
+		t.Fatalf("detail = %+v, want non-zero rollup/target/highwater deletions", res)
+	}
+	if res.Aggregates() != res.Rollup+res.TargetRollup+res.Highwater {
+		t.Fatalf("Aggregates()=%d, want sum of the three buckets", res.Aggregates())
+	}
+	// 兼容入口仍按事件数返回
+	events, err := SecurityEventsRetentionCleanupCtxErr(context.Background())
+	if err != nil || events != 0 {
+		t.Fatalf("compat wrapper events=%d err=%v, want 0/nil", events, err)
 	}
 }
 

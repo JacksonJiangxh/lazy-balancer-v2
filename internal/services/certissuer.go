@@ -214,7 +214,8 @@ var ErrCertificateDeploymentRetryBusy = errors.New("证书部署重试回调仍�
 // RetryCertificateDeploymentNow 手动重试入口：把 downloaded
 // 任务的部署重试立即重排（取消挂起的退避 timer 并在当前时刻执行一次部署）。
 // 返回 nil 表示 timer 已登记；服务停止返回 ErrCertificateQueueInactive，旧回调
-// 未退出返回 ErrCertificateDeploymentRetryBusy。deployment_available_after
+// 未退出返回 ErrCertificateDeploymentRetryBusy，规则处于补偿屏障返回
+// ErrCertificateDeploymentRetryBlocked。deployment_available_after
 // 已由调用方推到 now，启动恢复/周期补扫仍会接手，不会丢失。
 func RetryCertificateDeploymentNow(jobID int, ruleID string) error {
 	certificateServiceMu.Lock()
@@ -223,6 +224,12 @@ func RetryCertificateDeploymentNow(jobID int, ruleID string) error {
 	if service == nil {
 		Logf("warn", "证书服务未运行：任务 %d 的部署重试将在服务启动/补扫时执行", jobID)
 		return ErrCertificateQueueInactive
+	}
+	// 与包级调度入口/30s 补扫同一判据：规则补偿屏障期（删除/更新/禁用的补偿
+	// 租约内）一律不登记部署 timer，否则手动「立即部署」会破例空转一次，
+	// 与「屏障期不调度」的不变量分叉。
+	if err := service.deploymentRetrySchedulable(ruleID); err != nil {
+		return err
 	}
 	return service.scheduleDeploymentRetry(jobID, ruleID, 0)
 }
@@ -656,6 +663,7 @@ func (s *CertIssuer) redeployDownloadedInLock(ctx context.Context, jobID int, ma
 		}
 		if err := transitionJob(db.DB, jobID, []string{"downloaded", "issued"}, "issued", map[string]any{
 			"message":                    "证书已部署，无需重新部署",
+			"expires_at":                 material.notAfter,
 			"deployment_attempts":        0,
 			"deployment_available_after": nil,
 		}); err != nil {
@@ -707,6 +715,7 @@ func (s *CertIssuer) redeployDownloadedInLock(ctx context.Context, jobID int, ma
 	// 不匹配状态 → 自愈路径断裂（job 保持 issued、磁盘永远错）。
 	err := transitionJob(db.DB, jobID, []string{"downloaded", "issued"}, "issued", map[string]any{
 		"message":                    "证书文件重新部署成功",
+		"expires_at":                 material.notAfter,
 		"deployment_attempts":        0,
 		"deployment_available_after": nil,
 	})

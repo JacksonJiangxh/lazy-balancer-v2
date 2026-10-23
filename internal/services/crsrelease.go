@@ -190,9 +190,20 @@ func extractCRSTarball(tarballPath, destDir string) error {
 				return fmt.Errorf("写入 %s: %w", rel, err)
 			}
 			_, copyErr := io.Copy(out, tr)
+			// 落盘耐久性与 writeFileAtomicSynced 同口径：解压树随后被
+			// moveTree 换入 live，掉电/容器强杀窗口内未 fsync 的页可能留下
+			// 0 字节或截断规则文件——crsRulesTreeIntact 只查探针文件存在，
+			// 残缺树会被装载并静默削弱 WAF。
+			syncErr := error(nil)
+			if copyErr == nil {
+				syncErr = out.Sync()
+			}
 			closeErr := out.Close()
 			if copyErr != nil {
 				return fmt.Errorf("写入 %s: %w", rel, copyErr)
+			}
+			if syncErr != nil {
+				return fmt.Errorf("同步 %s: %w", rel, syncErr)
 			}
 			if closeErr != nil {
 				return fmt.Errorf("写入 %s: %w", rel, closeErr)

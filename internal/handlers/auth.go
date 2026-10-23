@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -295,6 +296,32 @@ func loginExpireMinutes() int {
 // 用于构造「签发失败」分支（验证失败路径不推进 last_login）。
 var jwtJTIReader = rand.Read
 
+// lastLoginTouchFailing 登录成功记账的连续失败状态：首条失败升级为 error 级
+// 留痕（持久故障可见），后续失败降回 warn，成功后复位——登录热路径不得刷屏。
+var lastLoginTouchFailing atomic.Bool
+
+// touchLastLogin 登录成功后的 last_login 记账（单源：密码登录与 OIDC 回调
+// 共用同一顺序与错误策略）。
+//
+// 顺序口径（两条路径统一）：签发成功 → 审计「登录成功」 → last_login 尽力
+// 更新。last_login 是账号活动证据而非授权前提：记账失败不得撤销已签发的
+// 会话（旧密码路径 500 丢令牌、旧 OIDC 路径 warn 放行，两条路径的审计与
+// 活动证据因此可能互相矛盾）。失败必须留痕：连续失败的首条升级为 error 级。
+func touchLastLogin(userID int, username, clientIP string) (time.Time, bool) {
+	lastLogin := time.Now().UTC()
+	_, err := db.DB.Exec("UPDATE users SET last_login = ? WHERE id = ?", lastLogin, userID)
+	if err == nil {
+		lastLoginTouchFailing.Store(false)
+		return lastLogin, true
+	}
+	level := "warn"
+	if !lastLoginTouchFailing.Swap(true) {
+		level = "error"
+	}
+	services.Logf(level, "登录成功更新 last_login 失败（user_id=%d username=%s client_ip=%s）: %v", userID, username, clientIP, err)
+	return lastLogin, false
+}
+
 // respondLoginWithMFA 携带 mfa_ts 声明签发（0=未验证/不写入——非 MFA 用户登录、
 // MFA 首次签发在 verify 成功时传 now；票据登录暂传 0）。isLogin=false 时跳过
 // 登录审计与 last_login 更新（verify-step 的 step-up 场景， D-新6）。
@@ -352,17 +379,14 @@ func (h *Handlers) respondLoginWithMFA(c *gin.Context, user models.User, passwor
 		return
 	}
 	if isLogin {
-		// last_login 在签发成功之后才推进：签发失败（随机源异常/JWTSecret
-		// 未装配）分支不得留下「最后登录时间已更新 + 审计记登录失败」的
-		// 状态分叉——账号活动证据必须与审计口径一致。
-		lastLogin := time.Now().UTC()
-		if _, err := db.DB.Exec("UPDATE users SET last_login = ? WHERE id = ?", lastLogin, user.ID); err != nil {
-			services.RecordAuditLog(user.Username, "登录失败", "用户认证", services.AuditResultPart("internal_error"), c.ClientIP())
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新登录时间失败"})
-			return
-		}
-		user.LastLogin = sql.NullTime{Time: lastLogin, Valid: true}
+		// 与 OIDC 回调同序同源（touchLastLogin 单源）：先落「登录成功」审计
+		// （身份已由签发结果确认），再尽力推进 last_login。旧实现把 last_login
+		// 写失败当 500 并丢弃已签发令牌，与 OIDC 路径（warn 放行）分叉——
+		// 取证时两条路径的「最后活动时间」与审计可信度不一致。
 		services.RecordAuditLog(user.Username, "登录成功", "用户认证", services.FormatAuditDetail(services.AuditUserPart(user.ID, user.Username), services.AuditResultPart("success")), c.ClientIP())
+		if lastLogin, ok := touchLastLogin(user.ID, user.Username, c.ClientIP()); ok {
+			user.LastLogin = sql.NullTime{Time: lastLogin, Valid: true}
+		}
 	}
 
 	// 登录/step-up 响应必须携带 mfa_enabled——此前所有登录路径的

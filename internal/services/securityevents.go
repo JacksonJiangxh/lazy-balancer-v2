@@ -162,23 +162,50 @@ func securityEventsRawIsChainStarter(raw string) bool {
 // 多条件 block/pass 规则的 setvar 在链尾，审计 raw 只有起始条 → 摄入侧评分恒 0。
 // 发射 id = DB id + 10000（合成 id 1000000+ 不带评分），[10001,799999] 是自定义
 // 规则独占段（IP 族 1-14 / GeoIP 800000-899999 / CRS 9xxxxx 均不重叠）。
-func securityEventsChainedCustomRuleScore(ruleTriggered string, policyByID map[int]*models.SecurityPolicy) int {
+//
+// 取值顺序保证确定性：优先归因策略（attributedPolicyID，事件实际归属的策略），
+// 未命中再按 policy_id 升序扫（同一规则被多策略内嵌引用且分数不同时，取最小
+// policy_id 的分——与归因「最小 policy_id」口径一致）。不按 map 迭代序取值：
+// 同一事件在不同 tick/重放会得到不同 anomaly_score（评分列/大屏分档抖动）。
+func securityEventsChainedCustomRuleScore(ruleTriggered string, policyByID map[int]*models.SecurityPolicy, attributedPolicyID int) int {
 	n, err := strconv.Atoi(ruleTriggered)
 	if err != nil || n <= 10000 || n >= 800000 {
 		return 0
 	}
 	ruleID := n - 10000
-	for _, p := range policyByID {
-		if p == nil {
+	if p := policyByID[attributedPolicyID]; p != nil {
+		if score, ok := chainedCustomRuleScoreInPolicy(p, ruleID); ok {
+			return score
+		}
+	}
+	ids := make([]int, 0, len(policyByID))
+	for id := range policyByID {
+		if id == attributedPolicyID {
 			continue
 		}
-		for _, cr := range policyCustomRulesCached(p, nil) {
-			if cr.ID == ruleID && cr.Enabled {
-				return cr.Score
-			}
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+	for _, id := range ids {
+		if score, ok := chainedCustomRuleScoreInPolicy(policyByID[id], ruleID); ok {
+			return score
 		}
 	}
 	return 0
+}
+
+// chainedCustomRuleScoreInPolicy 在单策略的自定义规则引用里找该 DB id 的启用
+// 规则分（内嵌对象形态的 score 来自载荷，ID 数组形态来自 security_custom_rules）。
+func chainedCustomRuleScoreInPolicy(p *models.SecurityPolicy, ruleID int) (int, bool) {
+	if p == nil {
+		return 0, false
+	}
+	for _, cr := range policyCustomRulesCached(p, nil) {
+		if cr.ID == ruleID && cr.Enabled {
+			return cr.Score, true
+		}
+	}
+	return 0, false
 }
 
 // errSecurityEventsEmptyID 标记无 transaction_id 的事务：去重唯一索引是部分索引
@@ -313,9 +340,12 @@ func securityEventsHostWithoutPort(hostport string) string {
 const (
 	securityEventsHeadersCap = 65536 // 64KB(2026-09-28 用户裁定:service mesh 用户携带大量 x-b3/x-envoy 等追踪头,8KB 截断影响调试体验;此上限仅约束事件详情弹框存储,不影响请求本身)
 	securityEventsBodyCap    = 65536
-	// securityEventsDroppedHeadersKey 是写侧合成的丢弃计数键；客户端同名头
-	// 一律剥离，避免伪造字段被展示层当作真实丢弃数。
-	securityEventsDroppedHeadersKey  = "_lb_dropped_headers"
+	// SecurityEventsDroppedHeadersKey 是写侧合成的 64KB 采集裁剪丢弃计数键；
+	// 客户端同名头一律剥离，避免伪造字段被展示层当作真实丢弃数。导出供
+	// handlers 列表侧裁剪原样保留该键（跨包字符串契约，禁止各包再写字面量）。
+	SecurityEventsDroppedHeadersKey = "_lb_dropped_headers"
+	// securityEventsDroppedHeadersKey 是包内别名（写侧多处引用保持简短）。
+	securityEventsDroppedHeadersKey  = SecurityEventsDroppedHeadersKey
 	securityEventsB64Prefix          = "base64:"
 	securityEventsB64TruncatedPrefix = "base64-truncated:"
 	securityEventsTextPrefix         = "utf8:"
@@ -714,7 +744,7 @@ func securityEventsCRSExclusionTargetMatches(target, ruleID string) bool {
 
 func securityEventsCRSExclusionRemovesRule(set securityEventsPolicyCRSExclusions, ruleID, clientIP string) bool {
 	for _, entry := range set.entries {
-		if CRSExclusionTargetRemovesInit(entry.Target) {
+		if CRSExclusionTargetRemovesInfra(entry.Target) {
 			continue
 		}
 		if entry.Scope == "ip" || entry.Scope == "list" {
@@ -1558,6 +1588,12 @@ const (
 	// securityEventsDedupeMaxEntries 限制常驻去重表规模（每条约数十字节，
 	// 26 万条约 10MB）：超限后新键不再登记（既有键照常归并），记忆退化为
 	// 「新请求不漏、旧键不淘汰」——淘汰旧键会把后续同键事件重新入库。
+	// 代价（已知边界）：同一请求的两个引擎事务若落在不同批次/pass 且键未
+	// 登记，会各插一行并各喂一次自动封禁（事件列表成对重复、阈值按引擎数
+	// 提前达成——攻击源更早被封，共享 NAT/代理后的正常用户也可能被提前
+	// 误封）。触发需持续 >4.4k 事件/秒 60s 以上才把表占满；方向不是安全
+	// 削弱，故不做 LRU（会牺牲「旧键不淘汰」这一归并保证），改为在告警中
+	// 显式披露后果。
 	securityEventsDedupeMaxEntries = 1 << 18
 	// securityEventsDedupeSweepEvery 是过期清扫的插入间隔（摊销 O(表长)）。
 	securityEventsDedupeSweepEvery = 4096
@@ -1574,7 +1610,21 @@ type securityEventsDedupeEntry struct {
 	rank uint8
 	// atSec 是该行 event_time 的 Unix 秒（过期清扫与分钟回退通知用）。
 	atSec int64
+	// autobanAction 是该请求实际喂入自动封禁的动作（autobanFed* 常量）：
+	// 跨 pass 改判时据此决定是否补喂 blocked——不变量「一请求只计一次」：
+	// blocked 已计；logged 在 scope=all 已计、scope=blocked 未计；被信任豁免的
+	// logged 从未计数。空值=重放行（喂入历史不可知），按「logged 未豁免」处理。
+	autobanAction string
 }
+
+// 自动封禁喂入动作标记（securityEventsDedupeEntry.autobanAction 的取值域）。
+const (
+	// autobanFedUnknown 重放行：该 transaction_id 已在库（本表无喂入记录），
+	// 喂入历史不可知——保守按「logged 未豁免」处理（scope=all 视为已计）。
+	autobanFedUnknown = ""
+	// autobanFedLoggedExempt 喂入的 logged 被 rule 级信任豁免（未计数）。
+	autobanFedLoggedExempt = "logged-exempt"
+)
 
 // securityEventsRequestDeduper 是跨 pass 复用的请求级去重表（tailer 级：
 // 轮转/停等导致同一请求的引擎事务落到不同 pass 时仍能归并）。不是并发安全
@@ -1610,7 +1660,7 @@ func (d *securityEventsRequestDeduper) record(key uint64, entry securityEventsDe
 	if _, exists := d.entries[key]; !exists && len(d.entries) >= securityEventsDedupeMaxEntries {
 		if !d.capWarned {
 			d.capWarned = true
-			Logf("warn", "security events ingestion: request dedupe table reached %d entries, new keys are no longer tracked", securityEventsDedupeMaxEntries)
+			Logf("warn", "security events ingestion: request dedupe table reached %d entries, new keys are no longer tracked（后果：后续跨批多引擎事务会按引擎数重复入库并计数；既有键照常归并）", securityEventsDedupeMaxEntries)
 		}
 		return
 	}
@@ -1674,6 +1724,10 @@ type securityEventsTailer struct {
 	// 用）：失败 pass的下一 tick 必须重跑——停摆限流告警与
 	// DB 重试都依赖 2s 周期持续转动，不得被空闲跳过吞掉。
 	lastPassClean bool
+	// passBoundHit 上一次 pass 是否因取消或单轮上限提前收尾：此时「无新增
+	// 字节 + 上次干净」并不意味着已读到 EOF（还有未摄取内容），空闲 tick
+	// 的提前返回必须让位给续跑。
+	passBoundHit bool
 	// lastIngested 上一 pass 摄取事件数（SecurityEventsPollOnce 消费后清零——
 	// SPEC §6.5 业务摘要行：有事件才写任务日志）。
 	lastIngested int
@@ -1686,6 +1740,11 @@ type securityEventsTailer struct {
 	// 1 表示本次 tick 未触发。
 	failOffset  int64
 	archivePass bool
+	// tailConsumedTo 是归档 pass 主动放弃（不可恢复尾部）时的文件末尾偏移：
+	// pass 返回的 offset 停在最后一条成功解码文档末尾，无法区分「等待写入的
+	// 半条事务」与「已知不可恢复、整段跳过」——轮转截断判据需要该区分，否则
+	// 畸形尾部会让活文件永不截断。0 表示本 pass 未放弃任何尾部字节。
+	tailConsumedTo int64
 	// 停摆告警限流——上次 warn 的畸形区偏移与时间，偏移不变时每分钟
 	// 最多一条 warn，偏移前进即重置立即告警。
 	lastWarnOffset int64
@@ -1700,6 +1759,17 @@ type securityEventsTailer struct {
 	dedupe securityEventsRequestDeduper
 }
 
+// securityEventsLiveDedupe 返回 live tailer 的请求级去重表（共享同一 map）。
+// 无锁契约：补采路径只在 securityEventsPollOnce 持有 securityEventsPollState
+// 且同一 goroutine 内（经 rotateAuditLogIfNeeded）被调用；其它调用方（测试）
+// 拿不到 live tailer 时返回空表。
+func securityEventsLiveDedupe() securityEventsRequestDeduper {
+	if securityEventsPollState.tailer == nil {
+		return securityEventsRequestDeduper{}
+	}
+	return securityEventsPollState.tailer.dedupe
+}
+
 func securityEventsNewTailer(logPath, offsetPath string) *securityEventsTailer {
 	return &securityEventsTailer{
 		logPath:        logPath,
@@ -1711,6 +1781,13 @@ func securityEventsNewTailer(logPath, offsetPath string) *securityEventsTailer {
 
 // securityEventsTick runs one ingest pass over the audit log.
 func (t *securityEventsTailer) securityEventsTick() error {
+	return t.securityEventsTickContext(context.Background())
+}
+
+// securityEventsTickContext 是带取消的 tick：ctx 取消时 pass 在已提交批次边界
+// 收尾返回（偏移持久化、剩余量留下轮），让引擎 Stop/容器停机不被长积压拖过
+// 宽限期。无取消语义的调用方（手动兜底轮转、补采）走 context.Background。
+func (t *securityEventsTailer) securityEventsTickContext(ctx context.Context) error {
 	info, err := os.Stat(t.logPath)
 	if errors.Is(err, os.ErrNotExist) {
 		created, cerr := os.OpenFile(t.logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
@@ -1751,14 +1828,15 @@ func (t *securityEventsTailer) securityEventsTick() error {
 		if err := securityEventsWriteOffset(t.offsetPath, 0); err != nil {
 			return fmt.Errorf("security events: persist reset offset: %w", err)
 		}
-	} else if t.lastPassClean && t.lastInfo != nil && info.Size() == t.lastInfo.Size() {
+	} else if t.lastPassClean && !t.passBoundHit && t.lastInfo != nil && info.Size() == t.lastInfo.Size() {
 		// 空闲 tick 提前返回——与上一 tick 相比无新增字节且上次
 		// pass 干净结束。按上一 tick 的 size 而非 offset 判定：Coraza pretty
 		// 格式文件尾恒有 "\n"，稳态 offset = size-1，与 offset 比较永不成立。
 		// 跳过省去每 2s 一次的映射加载（3 条主库查询 + 逐行 IDNA）与文件
 		// open/seek/残空白解码。lastInfo 照常更新，下一 tick 的截断/轮转判定
 		// （size<offset / os.SameFile）不受影响；失败 pass（lastPassClean=false）
-		// 不满足条件，重试与限流告警照常。
+		// 不满足条件，重试与限流告警照常；因取消/单轮上限提前收尾的 pass
+		// （passBoundHit=true）同样不满足——它没读到 EOF，必须下一 tick 续跑。
 		t.lastInfo = info
 		return nil
 	}
@@ -1771,7 +1849,7 @@ func (t *securityEventsTailer) securityEventsTick() error {
 		return fmt.Errorf("security events: open audit log: %w", err)
 	}
 	defer f.Close()
-	newOffset, passErr := t.securityEventsProcessPass(f, offset, rules, bindings, policyByID)
+	newOffset, passErr := t.securityEventsProcessPass(ctx, f, offset, rules, bindings, policyByID)
 	if newOffset != offset {
 		if werr := securityEventsWriteOffset(t.offsetPath, newOffset); werr != nil {
 			passErr = errors.Join(passErr, fmt.Errorf("security events: persist offset: %w", werr))
@@ -1801,14 +1879,29 @@ func securityEventsRollbackLeakedTx(database *sql.DB) {
 	}
 }
 
-// securityEventsProcessPass decodes and inserts every complete transaction
-// from offset to EOF, returning the furthest offset safe to persist. A
-// database error stops the pass so the next tick retries the same offset; a
-// malformed transaction is logged and skipped without aborting the pass.
-func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int64, rules map[string]securityEventsRuleRef, bindings map[string][]int, policyByID map[int]*models.SecurityPolicy) (int64, error) {
+// 单 pass 处理上限（活文件摄取；var 供测试收窄）。长积压（停摆恢复/容器长时间
+// 停更）按每 2s 一拍分摊到多轮：一次 tick 占用时间有界，引擎 Stop 不被大
+// pass 拖过停机宽限（SIGKILL 会跳过 db.Close/WAL 落盘），轮转也不必等到整个
+// 积压清空才发生。archived 补采（.1 / 活文件尾部截断前）**不受**此上限——归档
+// 补采失败或部分完成会让轮转侧删除 pending 标记，截断后剩余事件永久丢失。
+var (
+	securityEventsPassMaxEvents = 50000
+	securityEventsPassMaxBytes  = 32 << 20
+)
+
+// securityEventsProcessPass decodes and inserts complete transactions from
+// offset to EOF, returning the furthest offset safe to persist. A database
+// error stops the pass so the next tick retries the same offset; a malformed
+// transaction is logged and skipped without aborting the pass. ctx 取消时在
+// 当前批次提交后收尾返回（已提交边界随返回值持久化，剩余量留给下一 tick）；
+// 活文件 pass 另受单轮事件数/字节数上限约束（archived pass 无界——见上）。
+func (t *securityEventsTailer) securityEventsProcessPass(ctx context.Context, f *os.File, offset int64, rules map[string]securityEventsRuleRef, bindings map[string][]int, policyByID map[int]*models.SecurityPolicy) (int64, error) {
 	// 每个 pass 开始时重置停摆偏移：只有本 pass 实际停摆才会重新赋值，
 	// 避免同偏移的新停摆被上一轮 warn 的限流状态吞掉。
 	t.failOffset = -1
+	// 尾部放弃标记同样按 pass 重置（见 tailConsumedTo）。
+	t.tailConsumedTo = 0
+	t.passBoundHit = false
 	// 每 pass 一次从 host→ref 派生 caddy_id→ref 索引，供 X-LB-Rule-ID
 	// 注入头优先归因（O(规则数) 一次性，避免逐事件反查）。
 	rulesByID := make(map[string]securityEventsRuleRef, len(rules))
@@ -1861,6 +1954,8 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 	// 同一事务重复行/轮转补采重叠/offset 重放的 INSERT OR IGNORE 忽略行
 	// 不计入，与自动封禁喂入口径同源。
 	passInsertedTotal := 0
+	// passBytesTotal 本 pass 已解码的请求头+体字节（单轮上限判据之二）。
+	passBytesTotal := 0
 	// batchInserted 当前未提交事务内实际插入数；仅在 commit 成功后并入
 	// passInsertedTotal。回滚/提交失败的行不得计入任务日志。
 	batchInserted := 0
@@ -1884,8 +1979,35 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 		}
 		return t.dedupe.lookup(key, atSec)
 	}
+	// crossPassUpgradeNeedsBlockedFeed 判定跨 pass 改判是否需要补喂 blocked
+	// （本批缓冲里没有该请求的条目=上一 pass 已提交）。不变量「一请求只计
+	// 一次」：已喂 blocked 不再补；被信任豁免的 logged 从未计数必须补；其余
+	// logged 只在 scope=blocked 下未计（scope=all 已计 1，补则双计）。口径
+	// 每 pass 只读一次库（升级是罕见形态，仍避免逐事件 SELECT）。
+	crossPassAutobanScopeLoaded := false
+	crossPassAutobanScope := ""
+	crossPassUpgradeNeedsBlockedFeed := func(prevAction string) bool {
+		switch prevAction {
+		case "blocked":
+			return false
+		case autobanFedLoggedExempt:
+			return true
+		}
+		if !crossPassAutobanScopeLoaded {
+			cfg := GetAutobanConfig()
+			if cfg.Enabled {
+				crossPassAutobanScope = cfg.Scope
+			}
+			crossPassAutobanScopeLoaded = true
+		}
+		return crossPassAutobanScope == "blocked"
+	}
 	// 攻击流光流批次：与日志事务提交点对齐，回滚路径不喂。
 	var attackFlowBatch []threatScreenAttackFlowItem
+	// 本批光流条目按请求去重键的索引：改判（logged→blocked）时同批条目
+	// 必须原地换 action/规则——否则大屏光流显示「检测」而事件列表显示
+	// 「拦截」。跨批形态已在原 pass 提交，无法回改（见改判分支注释）。
+	attackFlowIndex := map[uint64]int{}
 	// 本批实际插入事件的最旧分钟（UTC）——提交成功后通知 rollup
 	// 回退钩子（积压事件落在已覆盖分钟区间时重固，防止大屏永久少计）。
 	var batchOldestMinute time.Time
@@ -1908,11 +2030,22 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 		autobanIndex = map[uint64]int{}
 		threatScreenAttackFlowRecordBatch(attackFlowBatch)
 		attackFlowBatch = nil
+		attackFlowIndex = map[uint64]int{}
 		notifySecurityEventsRollupRewrite(batchOldestMinute)
 		batchOldestMinute = time.Time{}
 		return nil
 	}
 	for {
+		// 取消门在每个文档边界：已解码未提交的批次先提交（offset 随返回值
+		// 持久化），剩余文档留给下一轮——停机宽限内可停，且不产生半批丢失。
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			stmt.Close()
+			if cerr := commit(); cerr != nil {
+				return committedOffset, fmt.Errorf("security events: commit inserts: %w", cerr)
+			}
+			t.passBoundHit = true
+			return offset, nil
+		}
 		var raw json.RawMessage
 		err := decoder.Decode(&raw)
 		if errors.Is(err, io.EOF) {
@@ -1974,6 +2107,9 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 						malformedStart := decoderStart + decoder.InputOffset()
 						securityEventsRecordSkips(info.Size()-offset, 1)
 						Logf("error", "security events ingestion: unrecoverable unreadable audit data at offset %d in archive, ending pass", malformedStart)
+						// 尾部整段放弃：这些字节不会再被摄取，轮转截断判据按
+						// 「已处理到文件末尾」计（否则畸形尾部让活文件永不截断）。
+						t.tailConsumedTo = info.Size()
 						return offset, nil
 					}
 					securityEventsRecordSkips(next-offset, 1)
@@ -2074,7 +2210,7 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 			// 链式自定义规则起始条的 raw 不含评分字面量，按发射 id 补分
 			//（否则事件日志评分列/大屏危险等级显示 0=非评分事件）。
 			if rec.AnomalyScore == 0 && rec.chainedCustomRule {
-				rec.AnomalyScore = securityEventsChainedCustomRuleScore(rec.RuleTriggered, policyByID)
+				rec.AnomalyScore = securityEventsChainedCustomRuleScore(rec.RuleTriggered, policyByID, policyID)
 			}
 			dedupeKey, dedupeable := securityEventsRequestDedupeKey(rec)
 			atSec := securityEventsRecordSecond(rec)
@@ -2093,7 +2229,9 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 						_ = tx.Rollback()
 						return committedOffset, uerr
 					}
+					prevAutobanAction := prev.autobanAction
 					prev.rank = securityEventsActionRank(rec.Action)
+					prev.autobanAction = rec.Action
 					pendingDedupe[dedupeKey] = prev
 					// 本批已缓冲的自动封禁条目同步改判（不追加第二条——
 					// 一请求只喂一次，否则阈值放大依旧）。
@@ -2101,6 +2239,27 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 						autobanBatch[idx].Action = rec.Action
 						autobanBatch[idx].RuleTriggered = rec.RuleTriggered
 						autobanBatch[idx].TrustExempt = false
+					} else if crossPassUpgradeNeedsBlockedFeed(prevAutobanAction) {
+						// 跨 pass 改判：原 pass 的 feed 早已提交，不在本批缓冲里。
+						// 首轮 logged 在 scope=blocked 下未计数（或被信任豁免而
+						// 从未计数）时补喂一条 blocked，否则该请求永远达不到阈值
+						// ——库内已是 blocked 而计数为 0，UI 无迹可查。
+						autobanBatch = append(autobanBatch, autobanFeedItem{
+							IP:            rec.ClientIP,
+							Action:        rec.Action,
+							RuleTriggered: rec.RuleTriggered,
+							At:            time.Unix(prev.atSec, 0).UTC(),
+							TrustExempt:   false,
+						})
+					}
+					// 同批光流条目同步改判：大屏光流按 action 着色/计拦截，
+					// 保留首次写入的 logged 会让同一请求在光流显示「检测」而
+					// 事件行显示「拦截」。跨批形态原条目已在上一 pass 落入
+					// 环形缓冲（无法回改）——该边界下光流保留首次结论，属已知
+					// 展示差异，不影响库内事件与自动封禁计数。
+					if idx, ok := attackFlowIndex[dedupeKey]; ok {
+						attackFlowBatch[idx].action = rec.Action
+						attackFlowBatch[idx].ruleTriggered = rec.RuleTriggered
 					}
 					// 该分钟 rollup 可能已按 logged 固化：重固让 action/rule
 					// 维度与改判后的行一致。
@@ -2129,11 +2288,14 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 					_ = tx.Rollback()
 					return committedOffset, fmt.Errorf("security events: insert result: %w", aerr)
 				}
+				// entryAutobanAction 记录本行实际喂入的动作（跨 pass 改判决策依据）。
+				entryAutobanAction := autobanFedUnknown
 				if affected == 1 {
 					eventAt, _ := time.ParseInLocation("2006-01-02 15:04:05", rec.EventTime, time.UTC)
 					if eventAt.IsZero() {
 						eventAt = time.Now().UTC()
 					}
+					trustExempt := rec.Action == "logged" && trustMatcher.trusted(rule.caddyID, rec.ClientIP)
 					if dedupeable {
 						autobanIndex[dedupeKey] = len(autobanBatch)
 					}
@@ -2142,9 +2304,20 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 						Action:        rec.Action,
 						RuleTriggered: rec.RuleTriggered,
 						At:            eventAt,
-						TrustExempt:   rec.Action == "logged" && trustMatcher.trusted(rule.caddyID, rec.ClientIP),
+						TrustExempt:   trustExempt,
 					})
-					if threatScreenAttackFlowSampleN.Load() > 0 {
+					entryAutobanAction = rec.Action
+					if trustExempt {
+						entryAutobanAction = autobanFedLoggedExempt
+					}
+					// 光流环只收「计入攻击」的事件：爬虫豁免是 pass,log
+					// 放行（每个已验证爬虫请求都是一条 logged 事件），不过滤
+					// 会把 Googlebot/Bingbot 画成攻击弹道，与同屏 feed/总量/
+					// 拦截率（均已按同谓词排除）口径分叉。
+					if threatScreenAttackFlowSampleN.Load() > 0 && SecurityEventCountsAsAttack(rec.Action, rec.RuleTriggered) {
+						if dedupeable {
+							attackFlowIndex[dedupeKey] = len(attackFlowBatch)
+						}
 						attackFlowBatch = append(attackFlowBatch, threatScreenAttackFlowItem{
 							at:            eventAt,
 							clientIP:      rec.ClientIP,
@@ -2169,17 +2342,26 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 						transactionID: rec.TransactionID,
 						rank:          securityEventsActionRank(rec.Action),
 						atSec:         atSec,
+						autobanAction: entryAutobanAction,
 					}
 				}
 			}
 			batchCount++
 			batchBytes += len(rec.RequestHeaders) + len(rec.RequestBody)
+			passBytesTotal += len(rec.RequestHeaders) + len(rec.RequestBody)
 			if batchCount >= batchSize || batchBytes >= batchByteCap {
 				stmt.Close()
 				if cerr := commit(); cerr != nil {
 					return committedOffset, fmt.Errorf("security events: commit batch: %w", cerr)
 				}
 				committedOffset = docEnd
+				// 单轮上限（仅活文件 pass）：已达上限即收尾，剩余量留下轮
+				// ——offset 已推进、行幂等，续跑无重复。失败/取消优先于上限
+				// 判定（上面已返回）。
+				if !t.archivePass && (passInsertedTotal >= securityEventsPassMaxEvents || passBytesTotal >= securityEventsPassMaxBytes) {
+					t.passBoundHit = true
+					return docEnd, nil
+				}
 				tx, err = metricsDB.Begin()
 				if err != nil {
 					return committedOffset, fmt.Errorf("security events: begin batch transaction: %w", err)
@@ -2245,7 +2427,8 @@ func securityEventsIngestRotatedDelta(persistedOffset int64) (int, error) {
 	if info.Size() <= persistedOffset {
 		return 0, nil // 归档未包含超出已摄取偏移的内容
 	}
-	return securityEventsIngestDeltaFrom(archive, persistedOffset, true)
+	n, _, err := securityEventsIngestDeltaFrom(archive, persistedOffset, true)
+	return n, err
 }
 
 // securityEventsIngestDepsReady 报告补采所需的数据库句柄是否就绪。
@@ -2262,26 +2445,42 @@ func securityEventsIngestDepsReady() bool {
 // copy 完成后 truncate 前的活文件尾部（rotateAuditLogIfNeeded）共用此路径。
 // archive=true 表示归档补采（.1 / pending 重试）：文件大小有界且不再增长，
 // 畸形区走 scan-to-EOF 恢复而非报错（见 securityEventsProcessPass）。
-// 返回实际插入条数。
-func securityEventsIngestDeltaFrom(path string, from int64, archive bool) (int, error) {
+// 返回实际插入条数与摄取到达偏移 reached：reached 是本 pass 已提交文档的末尾
+// （归档 pass 判定不可恢复而跳过的尾部按文件末尾计），轮转截断判据以它为
+// 「已摄取到哪里」的唯一基准——不得改用调用前后的文件大小比较（持续写入下
+// 会把「已摄取但文件变大」误判为「还有未摄取字节」）。
+func securityEventsIngestDeltaFrom(path string, from int64, archive bool) (int, int64, error) {
 	if db.DB == nil || db.MetricsDB == nil {
-		return 0, nil
+		return 0, from, nil
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return 0, fmt.Errorf("security events: open delta source: %w", err)
+		return 0, from, fmt.Errorf("security events: open delta source: %w", err)
 	}
 	defer f.Close()
 	// 补采路径的耗时随审计行内嵌 lb_timing 字段自带（侧车退役，
 	// 的「补采也需加载侧车」前置不再需要）。
 	rules, bindings, policyByID, err := securityEventsLoadMappings()
 	if err != nil {
-		return 0, err
+		return 0, from, err
 	}
 	t := securityEventsNewTailer(auditLogPath, securityEventsOffsetPath)
 	t.archivePass = archive
-	_, passErr := t.securityEventsProcessPass(f, from, rules, bindings, policyByID)
-	return t.lastIngested, passErr
+	// 去重记忆跨路径共享：补采区间（.1 / truncate 前尾部）与 live tick 可能
+	// 切开同一请求的两个引擎事务（预检在 live、WAF 在轮转边界后）——各自空表
+	// 时第二条会以自身 transaction_id 再插一行（唯一索引不冲突），一次请求落
+	// 两行事件且 blocked/logged 结论并存。直接复用 live tailer 的去重表：
+	// 补采仅经 securityEventsPollOnce 持 securityEventsPollState 的同一
+	// goroutine（rotateAuditLogIfNeeded）触发，故无并发写；独立调用（测试/
+	// 无 live tailer）回退空表保持旧语义。
+	t.dedupe = securityEventsLiveDedupe()
+	// 补采（归档有界）不接收调用方取消语义：部分摄取会让轮转侧按成功删除
+	// pending 标记/截断活文件，剩余事件永久丢失——必须跑到存档末尾。
+	reached, passErr := t.securityEventsProcessPass(context.Background(), f, from, rules, bindings, policyByID)
+	if t.tailConsumedTo > reached {
+		reached = t.tailConsumedTo
+	}
+	return t.lastIngested, reached, passErr
 }
 
 // securityEventsRateLimitedWarn 输出 tick 失败告警并对停摆错误（畸形区）
@@ -2764,7 +2963,13 @@ func SecurityEventsSetIngestionHealthForTest(status SecurityEventsIngestionStatu
 // SecurityEventsPollOnce 单轮摄取（先采集后轮转——引擎 2s 节拍调用）。
 // 返回本轮摄取条数与轮转错误（采集 tick 错误经限流 warn+健康快照记账，
 // 不随返回值暴露）；任务日志只由 ingestion daemon 自己写，其他调用方不得越权。
+// 无取消语义的调用方（手动兜底轮转）用本入口；daemon 走 securityEventsPollOnce
+// 传入引擎 ctx，让停机时 pass 在批次边界收尾。
 func SecurityEventsPollOnce() (int, error) {
+	return securityEventsPollOnce(context.Background())
+}
+
+func securityEventsPollOnce(ctx context.Context) (int, error) {
 	securityEventsPollState.Lock()
 	defer securityEventsPollState.Unlock()
 	// 审计写侧计数（插件侧车）每轮先观测：即使本轮无新事件，写侧失败也必须
@@ -2778,7 +2983,7 @@ func SecurityEventsPollOnce() (int, error) {
 		securityEventsPollState.inited = true
 		Logf("info", "security events ingestion(engine) started: audit_log=%s", auditLogPath)
 	}
-	tickErr := securityEventsPollState.tailer.securityEventsTick()
+	tickErr := securityEventsPollState.tailer.securityEventsTickContext(ctx)
 	if tickErr != nil {
 		securityEventsPollState.tailer.securityEventsRateLimitedWarn(tickErr)
 	}
@@ -2815,7 +3020,7 @@ func runIngestionLoop(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			ingested, rotErr := SecurityEventsPollOnce()
+			ingested, rotErr := securityEventsPollOnce(ctx)
 			if ingested > 0 {
 				TaskLogf("security-events-ingestion", "ingest", "摄取 %d 条安全事件", ingested)
 			}

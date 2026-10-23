@@ -111,7 +111,10 @@ test('C3 分片响应：无退化时保持末片文案；空输入返回 undefin
   assert.deepEqual(mergeBulkResults([{ message: 'a' }, { message: 'b' }]), { message: 'b' })
   assert.equal(mergeBulkResults([]), undefined)
   assert.equal(mergeBulkResults([undefined, undefined]), undefined)
-  assert.ok(!(mergeBulkResults([{ message: 'ok' }])?.message ?? '').includes(CADDY_APPLY_FAILED_MARKER))
+  // 单响应语义先钉死再判标记：`?? ''` 会让「返回 undefined」同样通过，
+  // 而单响应必须原样返回该响应。
+  assert.deepEqual(mergeBulkResults([{ message: 'ok' }]), { message: 'ok' })
+  assert.ok(!mergeBulkResults([{ message: 'ok' }])!.message!.includes(CADDY_APPLY_FAILED_MARKER))
 })
 
 // 上限不得钉字面量：后端常量调整后前端镜像必须同批跟随，否则 UI 放行 9 条、

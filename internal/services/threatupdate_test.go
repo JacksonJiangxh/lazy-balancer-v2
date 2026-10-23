@@ -314,7 +314,7 @@ func seedThreatPolicyRefForSource(t *testing.T, policyID int, source string) {
 // ——引用面判据只会再犯同类漏判）；结构级比对证实零发射面变化 → 零重载
 // （未被引用的变化同样收敛为「无发射面 → 零重载」）；刷新失败/未证实收敛才
 // 回退 /load（fail-safe）。
-func TestThreatUpdate_refreshesOnlyWhenChangedListReferenced(t *testing.T) {
+func TestThreatUpdate_refreshesOnAnyContentChange_zeroReload(t *testing.T) {
 	overrideWafDirForTest(t)
 	newClusterTestService(t)
 	setupThreatTest(t, nil, nil, nil)

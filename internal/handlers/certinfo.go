@@ -109,10 +109,9 @@ func (h *Handlers) GetRulesCertInfo(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "批量读取签发证书失败"})
 			return
 		}
-		// 装载阶段预解析一次，选择与过期回退共用同一 Leaf。
-		if candidate.Status != "disabled" {
-			candidate.Leaf = services.ParseCertificateLeaf(candidate.CertPEM, candidate.KeyPEM)
-		}
+		// 候选查询已由 CertJobMaterialPredicateSQL 排除 disabled 行，
+		// 此处无需再判状态——装载阶段预解析一次，选择与过期回退共用同一 Leaf。
+		candidate.Leaf = services.ParseCertificateLeaf(candidate.CertPEM, candidate.KeyPEM)
 		candidates[id] = append(candidates[id], candidate)
 	}
 	if err := jobRows.Err(); err != nil {

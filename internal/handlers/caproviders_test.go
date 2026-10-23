@@ -151,3 +151,50 @@ func TestUpdateCAProvider_keyOrderOnlyChangeIsNotAuditedAsCredentialChange(t *te
 		t.Fatalf("audit detail=%q, want 无修改（键序重排不是凭证变更）", detail)
 	}
 }
+
+// 名称与 DNS 配置同口径归一：首尾空白落库前剥离；纯空白名按空名 400，
+// 不得形成列表/选择器里无法辨识的行（API 可绕过前端 trim）。
+func TestUpdateCAProvider_trimsName(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	h.caProviderService = services.NewCAProviderService()
+	res, err := db.DB.Exec(`INSERT INTO ca_providers (name,provider,directory_url,credentials,max_concurrent,min_interval_ms,enabled)
+		VALUES ('LE-trim','letsencrypt','https://acme-v02.api.letsencrypt.org/directory','',1,2000,1)`)
+	if err != nil {
+		t.Fatalf("seed CA provider: %v", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := gin.New()
+	router.PUT("/ca-providers/:id", h.UpdateCAProvider)
+	putName := func(name string) *httptest.ResponseRecorder {
+		response := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPut, fmt.Sprintf("/ca-providers/%d", id), strings.NewReader(fmt.Sprintf(`{"name":%q}`, name)))
+		request.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(response, request)
+		return response
+	}
+
+	if response := putName("  trimmed-name  "); response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	var stored string
+	if err := db.DB.QueryRow(`SELECT name FROM ca_providers WHERE id=?`, id).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored != "trimmed-name" {
+		t.Fatalf("name=%q, want trimmed-name（写入口必须 trim）", stored)
+	}
+
+	response := putName("   ")
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "名称不能为空") {
+		t.Fatalf("status=%d body=%s, want 400 名称不能为空（纯空白必须拒绝）", response.Code, response.Body.String())
+	}
+	if err := db.DB.QueryRow(`SELECT name FROM ca_providers WHERE id=?`, id).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored != "trimmed-name" {
+		t.Fatalf("name=%q, want 保留原名称（纯空白不得落库）", stored)
+	}
+}

@@ -491,8 +491,11 @@ func TestGetRuleCaddyConfig_unsupportedProtocolReturnsError(t *testing.T) {
 	router.GET("/rules/:caddy_id/caddy-config", handler.GetRuleCaddyConfig)
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/rules/lb_bad_protocol/caddy-config", nil))
-	if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), "unsupported protocol") {
-		t.Fatalf("status=%d body=%s, want 500 unsupported protocol", response.Code, response.Body.String())
+	if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), "生成规则 Caddy 配置失败") {
+		t.Fatalf("status=%d body=%s, want 500 固定文案（内部错误只进日志）", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "unsupported protocol") {
+		t.Fatalf("500 body 泄露内部错误文本: %s", response.Body.String())
 	}
 }
 

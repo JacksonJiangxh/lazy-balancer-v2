@@ -20,9 +20,28 @@ type systemTaskLogPathResolver struct {
 	certJobsLoaded bool
 }
 
+// parseCertJobTaskID 解析 cert-job:<id> 形态：批量 resolver 与单条入口共用，
+// 保证 "007"/"+7"/"abc" 等形态在两条路径结论一致（此前批量按原始字符串查
+// map、单条 Atoi 归一，同任务会一边有日志一边为空）。
+func parseCertJobTaskID(taskID string) (int64, bool) {
+	raw, ok := strings.CutPrefix(taskID, "cert-job:")
+	if !ok {
+		return 0, false
+	}
+	id, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if err != nil || id <= 0 {
+		return 0, false
+	}
+	return id, true
+}
+
 func (r *systemTaskLogPathResolver) resolve(taskID string) (string, error) {
 	if !strings.HasPrefix(taskID, "cert-job:") {
 		return taskengine.TaskLogPath(taskID), nil
+	}
+	jobID, ok := parseCertJobTaskID(taskID)
+	if !ok {
+		return "", nil
 	}
 	if !r.certJobsLoaded {
 		if db.DB == nil {
@@ -52,7 +71,7 @@ func (r *systemTaskLogPathResolver) resolve(taskID string) (string, error) {
 			r.certJobsLoaded = true
 		}
 	}
-	ruleID := r.certJobRuleIDs[strings.TrimPrefix(taskID, "cert-job:")]
+	ruleID := r.certJobRuleIDs[strconv.FormatInt(jobID, 10)]
 	if ruleID == "" {
 		return "", nil
 	}
@@ -70,12 +89,12 @@ func systemTaskLogPath(taskID string) (string, error) {
 	if db.DB == nil {
 		return "", nil
 	}
-	jobID, err := strconv.Atoi(strings.TrimPrefix(taskID, "cert-job:"))
-	if err != nil || jobID <= 0 {
+	jobID, ok := parseCertJobTaskID(taskID)
+	if !ok {
 		return "", nil
 	}
 	var ruleID string
-	err = db.DB.QueryRow(`SELECT rule_id FROM cert_jobs WHERE id=?`, jobID).Scan(&ruleID)
+	err := db.DB.QueryRow(`SELECT rule_id FROM cert_jobs WHERE id=?`, jobID).Scan(&ruleID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", nil

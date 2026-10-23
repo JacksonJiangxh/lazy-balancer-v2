@@ -639,7 +639,20 @@ export const buildStageModel = (
     const base = { key: binding.policy_id, order: index + 1, name: binding.name, enabled: binding.enabled }
 
     const s0rows = buildStage0Rows(policy, ipLists)
-    if (s0rows.length > 0) stage0Groups.push({ ...base, rows: s0rows })
+    if (s0rows.length > 0) {
+      stage0Groups.push({ ...base, rows: s0rows })
+    } else if (policy && inferPolicyType(policy) === 'stage0') {
+      // 阶段 0 启用判定=「绑定链上存在阶段 0 策略」（binding 口径，与阶段 1/2/3
+      // 对齐）：名单为空的阶段 0 策略只能经 API/带外导入形成，内容门会把它判成
+      // 「未启用」，与「绑定链上存在该策略」矛盾。仍出灰态行，不虚报信任面。
+      stage0Groups.push({
+        ...base,
+        rows: [
+          { label: '信任名单', detail: '未配置' },
+          { label: '模式', detail: trustHitMode(policy.policy_type, policy.trust_detection) === 'detection' ? '保留检测记录（事件动作=检测）' : '直通上游（不产生安全事件）' },
+        ],
+      })
+    }
 
     const s1rows = buildStage1Rows(policy, ipLists, blockPages, stagePages)
     if (s1rows.length > 0) stage1Groups.push({ ...base, rows: s1rows })

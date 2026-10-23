@@ -1,6 +1,7 @@
 package handlers
 
-//   归一 off，旧 `mode!='off'` 口径使纯 stage1/2 部署显示 0。
+// 契约：特征口径（active_policies/总量披露）在模式归一为 off 后必须仍按
+// 真实特征计数——旧 `mode!='off'` 口径使纯 stage1/2 部署显示 0。
 
 import (
 	"encoding/json"

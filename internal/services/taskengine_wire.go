@@ -274,7 +274,14 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	_ = te.RecoverOrphans()
 	// 持久化「更新中」态同样属于上次进程的生命周期——启动期归一为 failed，
 	// 否则规则库页与任务视图恒显更新中（运行/取消按钮失效）。
-	normalizeInterruptedUpdateStatuses()
+	// 仅主节点：本函数语义是「上次**本进程**执行被中断」，从节点从不运行这些
+	// 任务（RunsOn=RoleMasterOnly），其版本行是主端镜像——本地改写会把主端
+	// 仍在进行中的状态伪造成「失败（进程重启回收）」，且版本行不进节哈希，
+	// 假 failed 会保持到下一次真实快照应用才被纠正。角色读失败(roleMaster=
+	// false)同样跳过，与 fail-closed 从节点种子一致。
+	if roleMaster {
+		normalizeInterruptedUpdateStatuses()
+	}
 
 	// ============ 循环（10）============
 
@@ -355,14 +362,16 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		Run: func(rc taskengine.RunContext) error {
 			// 传任务 ctx——Stop(cancel) 可在大批量首遍中途生效。
 			// 清理失败必须让 task_runs 落 failed，不得恒成功。
-			deleted, err := SecurityEventsRetentionCleanupCtxErr(rc.Ctx)
+			retention, err := SecurityEventsRetentionCleanupDetail(rc.Ctx)
 			// 失败轮不得写「清理完成」——task_runs 已落
 			// failed，任务日志称完成会把排障方向带偏。
 			if err != nil {
-				TaskLogfWarn("security-events-retention", "cleanup", "安全事件保留清理失败：本轮已删除 %d 条后中止（保留期与条数上限），错误：%v", deleted, err)
+				TaskLogfWarn("security-events-retention", "cleanup", "安全事件保留清理失败：本轮已删除事件 %d 条 · 聚合/高水位 %d 行后中止（保留期与条数上限），错误：%v", retention.Events, retention.Aggregates(), err)
 				return err
 			}
-			TaskLogf("security-events-retention", "cleanup", "安全事件保留清理完成：删除 %d 条（保留期与条数上限，无过期为 0）", deleted)
+			// 按构成披露：聚合/高水位删除不计入事件数时，仅报「删除 N 条事件」
+			// 会让停摆后首次清理显示 0（运维误判保留策略未生效）。
+			TaskLogf("security-events-retention", "cleanup", "安全事件保留清理完成：删除事件 %d 条 · 聚合 %d 行 · 被攻击目标聚合 %d 行 · 高水位键 %d 个（保留期与条数上限，无过期为 0）", retention.Events, retention.Rollup, retention.TargetRollup, retention.Highwater)
 			return nil
 		},
 	})
@@ -1083,6 +1092,11 @@ func armSecurityLibraryFirstSlots() {
 // ArmThreatFirstSlots 威胁源首槽武装：开启业务或逐源启用时，空 next_update
 // 的启用源写入威胁排程槽，避免 NextSlotFn 永不到期。
 func ArmThreatFirstSlots() {
+	if db.DB == nil {
+		// 同族 DB 入口的 nil 守卫：装配缺失时静默返回（无调度可武装），
+		// 不得 panic 到调用方（handlers/security_threat、services/threatupdate）。
+		return
+	}
 	if !ThreatAutoUpdateEnabled() {
 		return
 	}

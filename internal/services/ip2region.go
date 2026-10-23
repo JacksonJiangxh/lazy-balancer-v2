@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -88,7 +89,7 @@ func InitIP2Region() {
 		if !writesAllowed {
 			// live 由集群同步治理，本地补齐会与主端声明打架并延长整库漂移
 			// 重拉——只读装载镜像库供本地查询，文件/版本行/派生缓存一律不写。
-			s, oErr := openIP2RegionSearcher(ip2regionDistPath)
+			s, oErr := openValidatedIP2RegionSearcher(ip2regionDistPath)
 			if oErr != nil {
 				Logf("error", "ip2region: live 库缺失且非主节点，镜像内置库只读装载失败: %v", oErr)
 				return
@@ -103,7 +104,7 @@ func InitIP2Region() {
 		}
 	}
 	if searcher == nil {
-		loaded, err := openIP2RegionSearcher(ip2regionLivePath)
+		loaded, err := openValidatedIP2RegionSearcher(ip2regionLivePath)
 		if err != nil {
 			Logf("error", "ip2region: failed to load %s: %v", ip2regionLivePath, err)
 			// live 存在但不可装载（掉电半写/带外损坏）：旧行为直接放弃——
@@ -115,7 +116,7 @@ func InitIP2Region() {
 			if _, distErr := os.Stat(ip2regionDistPath); distErr == nil {
 				if !writesAllowed {
 					// 从节点同样不覆盖 live（集群同步自愈），只读装载镜像库。
-					if fallback, oErr := openIP2RegionSearcher(ip2regionDistPath); oErr != nil {
+					if fallback, oErr := openValidatedIP2RegionSearcher(ip2regionDistPath); oErr != nil {
 						Logf("error", "ip2region: 损坏 live 库且非主节点，镜像内置库只读装载失败: %v", oErr)
 					} else {
 						searcher = fallback
@@ -125,7 +126,7 @@ func InitIP2Region() {
 					}
 				} else if cErr := copyFile(ip2regionDistPath, ip2regionLivePath); cErr != nil {
 					Logf("error", "ip2region: 损坏 live 库的 dist 回退拷贝失败: %v", cErr)
-				} else if fallback, oErr := openIP2RegionSearcher(ip2regionLivePath); oErr != nil {
+				} else if fallback, oErr := openValidatedIP2RegionSearcher(ip2regionLivePath); oErr != nil {
 					Logf("error", "ip2region: dist 回退库装载失败: %v", oErr)
 				} else {
 					searcher = fallback
@@ -191,20 +192,28 @@ func InitIP2Region() {
 		}
 	}
 
-	cachePath := ip2regionLivePath + ".provinces.json"
-	if _, err := os.Stat(cachePath); err != nil {
-		provinces := GetIP2RegionProvinces()
-		if data, mErr := json.Marshal(provinces); mErr == nil {
-			if err := writeProvincesCache(cachePath, data); err != nil {
-				Logf("warn", "ip2region: 省份列表缓存落盘失败（下次启动重建）: %v", err)
+	// 派生缓存（省份列表/省→市树）同属写入门：从节点上它们由本地 live 推导，
+	// 内容无正确性风险，但「文件/版本行/派生缓存一律不落盘」是本节点只读不变量
+	// 的显式契约（见 ip2RegionStartupRepairWritesAllowed）——只在 readOnlyDist
+	// 分支跳过会让「从节点 + live 可装载」形态成为契约例外，且本地派生文件会被
+	// 排障误判为与主端不一致的本地状态。缺缓存时由 GetIP2RegionProvinces /
+	// regionTreeFromXDB 在内存重建（进程内记忆化，成本一次性）。
+	if writesAllowed {
+		cachePath := ip2regionLivePath + ".provinces.json"
+		if _, err := os.Stat(cachePath); err != nil {
+			provinces := GetIP2RegionProvinces()
+			if data, mErr := json.Marshal(provinces); mErr == nil {
+				if err := writeProvincesCache(cachePath, data); err != nil {
+					Logf("warn", "ip2region: 省份列表缓存落盘失败（下次启动重建）: %v", err)
+				}
 			}
 		}
-	}
-	// 省→市树缓存（首次装载或缺失时全量扫描重建）。
-	// 缓存含 ASCII 城市/省名（拼音规范化前的旧产物）也视为过期
-	// 重建——升级部署后旧缓存不会自动消失。
-	if staleRegionTreeCache(ip2RegionLivePathForTreeCache()) {
-		writeRegionTreeCache(regionTreeFromXDB(ip2regionLivePath))
+		// 省→市树缓存（首次装载或缺失时全量扫描重建）。
+		// 缓存含 ASCII 城市/省名（拼音规范化前的旧产物）也视为过期
+		// 重建——升级部署后旧缓存不会自动消失。
+		if staleRegionTreeCache(ip2RegionLivePathForTreeCache()) {
+			writeRegionTreeCache(regionTreeFromXDB(ip2regionLivePath))
+		}
 	}
 	Logf("info", "ip2region: loaded %s", ip2regionLivePath)
 }
@@ -215,7 +224,7 @@ func InitIP2Region() {
 // hot-swap as a failed install/restore level instead of silently diverging
 // memory from disk.
 func Reload() error {
-	searcher, err := openIP2RegionSearcher(ip2regionLivePath)
+	searcher, err := openValidatedIP2RegionSearcher(ip2regionLivePath)
 	if err != nil {
 		Logf("error", "ip2region: reload failed: %v (keeping current searcher)", err)
 		return err
@@ -396,6 +405,38 @@ func openIP2RegionSearcher(path string) (*ip2regionService.Ip2Region, error) {
 	return ip2regionService.NewIp2Region(config, nil)
 }
 
+// ip2regionProbeIP 是装载校验的探针地址：114 段在真实库中必然存在，且损坏
+// 夹具（段指针越界）的注入点正在该向量条目上。
+const ip2regionProbeIP = "114.114.114.114"
+
+// openValidatedIP2RegionSearcher 是 xdb「可装载」的唯一校验入口：结构自检 +
+// 探针搜索 + panic 收敛。结构自检只覆盖已知布局（头 + 段索引指针边界），
+// 绑定库对内容缓冲区其余无边界切片（段数据 dataPtr 带外等）仍以 panic
+// 呈现——导入校验/Reload/启动装载三入口必须同强度，否则「结构合法、段指针
+// 越界」的文件会经弱门进入 live，随后请求期 Search panic（请求 500）或启动
+// 期省份采样 panic（main 无 recover=进程退出）。
+func openValidatedIP2RegionSearcher(path string) (searcher *ip2regionService.Ip2Region, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if searcher != nil {
+				searcher.Close()
+				searcher = nil
+			}
+			Logf("error", "ip2region: probe search panicked on %s: %v\n%s", path, r, debug.Stack())
+			err = fmt.Errorf("探针搜索触发内部异常（文件损坏）: %v", r)
+		}
+	}()
+	searcher, err = openIP2RegionSearcher(path)
+	if err != nil {
+		return nil, err
+	}
+	if _, serr := searcher.Search(ip2regionProbeIP); serr != nil {
+		searcher.Close()
+		return nil, fmt.Errorf("探针搜索失败: %w", serr)
+	}
+	return searcher, nil
+}
+
 func GetIP2RegionEntryCount() int {
 	ip2regionMu.RLock()
 	defer ip2regionMu.RUnlock()
@@ -425,11 +466,16 @@ func GetIP2RegionEntryCount() int {
 
 // GetIP2RegionProvinces returns the province list from the live searcher, or
 // ["海外"] when no database is loaded.
+// 契约：返回的是记忆化缓存/注入切片的**共享内部视图**（同一底层数组），
+// 调用方只读——就地排序/追加/截断会跨请求污染全局缓存（并影响校验端的
+// known 集合）。需要修改时先自行 clone。
 // ip2RegionLiveProvincesOverride 仅供测试注入「live 已装载」形态（模拟 xdb
 // 在位），生产代码不设置。nil 时走真实 searcher 路径。
 var ip2RegionLiveProvincesOverride []string
 
 // SetIP2RegionLiveProvincesForTest 注入/清除测试用 live 省份列表。
+// 注入的切片按引用保存（不清洗/不拷贝）——调用方注入后不得再改其内容或
+// 依赖 GetIP2RegionProvinces 的返回值可写；清除传 nil。
 func SetIP2RegionLiveProvincesForTest(provinces []string) {
 	ip2RegionLiveProvincesOverride = provinces
 }
@@ -714,6 +760,9 @@ func regionTreeFromXDB(path string) *IP2RegionRegionTree {
 // 键未变即返回上次扫描结果；带外替换 xdb 改变 stat 键、触发重扫，保留
 // 替换可见性（regions.json 缓存无法做到这一点，故不直接改用它）。扫描
 // 失败（文件损坏/替换中）不记忆化，回退文件缓存，与原语义一致。
+// 契约：返回值是记忆化/文件缓存共享的同一 *IP2RegionRegionTree（含
+// Provinces/Cities/Countries 可变字段），调用方只读——就地修改会跨请求
+// 污染全局预览/校验源（消费侧目前均为只读或浅拷贝后序列化）。
 func GetIP2RegionRegionTree() *IP2RegionRegionTree {
 	fi, err := os.Stat(ip2regionLivePath)
 	if err != nil {

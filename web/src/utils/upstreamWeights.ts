@@ -8,6 +8,11 @@ export const MAX_UPSTREAM_ROWS = 100
 const minimumWeight = (item: WeightedItem): number => item.enabled === false ? 0 : 1
 const normalizedWeight = (item: WeightedItem): number => Math.max(minimumWeight(item), Math.round(item.weight || 0))
 
+// ⚠ 变异契约：participatingItems 及依赖它的函数（normalizeWeights /
+// redistributeWeight）会**就地改写** items[].weight——仅禁用行被写 0（超出
+// MAX_UPSTREAM_ROWS 的行保留原权重并继续参与分配：该常量只是编辑器新增按钮的
+// 上限，后端无条数上限）。当前调用方(编辑器草稿态)依赖此行为;未来在只读场景
+// 复用时须先剥离副作用。
 const participatingItems = <Item extends WeightedItem>(items: Item[]): Item[] => {
   // 只清零禁用行；MAX_UPSTREAM_ROWS 仅是编辑器的「添加上游」按钮上限，
   // 后端对上游条数无上限（API/导入可写入更多）。此前把超限行权重写 0，
@@ -73,12 +78,8 @@ export const redistributeWeight = <Item extends WeightedItem>(items: Item[], cha
   distributeWeight(otherItems, budget - changed.weight)
 }
 
-// ⚠ 变异契约:participatingItems 及依赖它的函数会
-// **就地改写** items[].weight——仅禁用行被写 0（超出 MAX_UPSTREAM_ROWS 的行
-// 保留原权重并继续参与分配：该常量只是编辑器新增按钮的上限，后端无条数上限）。
-// 当前调用方(编辑器草稿态)依赖此行为;未来在只读场景复用时须先剥离副作用。
-// weightPercent 权重百分比展示( 收敛——原 RuleFlowDialog/Rules 两份
-// 同口径复刻)。签名:(upstreams, row)→0-100 整数;禁用行 0;总和≤0 时 0。
+// weightPercent 权重百分比展示（已收敛——原 RuleFlowDialog/Rules 两份
+// 同口径复刻）。签名:(upstreams, row)→0-100 整数;禁用行 0;总和≤0 时 0。
 export const weightPercent = (
   upstreams: ReadonlyArray<{ weight?: number; enabled?: boolean }> | undefined,
   row: { weight?: number; enabled?: boolean }

@@ -4,15 +4,14 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { source } from './_helpers.ts'
+import { member, source } from './_helpers.ts'
 
 const authSrc = source('src/stores/auth.ts')
 
 test('成功拉取配置后排下一轮全站角色刷新', () => {
-  const fetchStart = authSrc.indexOf('async function fetchConfig')
-  const fetchEnd = authSrc.indexOf('interface LoginResult', fetchStart)
-  assert.ok(fetchStart >= 0 && fetchEnd > fetchStart, 'fetchConfig 边界必须存在')
-  const fetchBody = authSrc.slice(fetchStart, fetchEnd)
+  // 结构边界：花括号配对取函数体（不再用远处的 interface 声明作终点——那样
+  // fetchConfig 之后新增的函数会落进切片，让断言被相邻函数满足）。
+  const fetchBody = member(authSrc, 'async function fetchConfig')
   const successStart = fetchBody.indexOf('if (res.data) {')
   const successEnd = fetchBody.indexOf('} else {', successStart)
   assert.ok(successStart >= 0 && successEnd > successStart, 'fetchConfig 成功分支边界必须存在')
@@ -28,18 +27,18 @@ test('成功拉取配置后排下一轮全站角色刷新', () => {
 })
 
 test('配置补查在途门：fetchConfig 一轮在飞时新触发直接跳过', () => {
-  const fetchStart = authSrc.indexOf('async function fetchConfig')
-  const fetchEnd = authSrc.indexOf('interface LoginResult', fetchStart)
-  const fetchBody = authSrc.slice(fetchStart, fetchEnd)
+  // 结构边界：花括号配对取函数体（不再用远处的 interface 声明作终点——那样
+  // fetchConfig 之后新增的函数会落进切片，让断言被相邻函数满足）。
+  const fetchBody = member(authSrc, 'async function fetchConfig')
   assert.match(fetchBody, /\|\| configFetchInFlight\) return/, 'visibilitychange 补查与 15s 轮询可能同时点火，须在途门防双发')
   assert.match(fetchBody, /configFetchInFlight = true/)
   assert.match(fetchBody, /finally \{\s*configFetchInFlight = false\s*\}/, '在途标记必须 finally 复位（含失败路径）')
 })
 
 test('mfa_write_guard 随 /config 投影单源：Users 页不再单独整取 GET /config', () => {
-  const fetchStart = authSrc.indexOf('async function fetchConfig')
-  const fetchEnd = authSrc.indexOf('interface LoginResult', fetchStart)
-  const fetchBody = authSrc.slice(fetchStart, fetchEnd)
+  // 结构边界：花括号配对取函数体（不再用远处的 interface 声明作终点——那样
+  // fetchConfig 之后新增的函数会落进切片，让断言被相邻函数满足）。
+  const fetchBody = member(authSrc, 'async function fetchConfig')
   // /config 投影复用 GlobalConfigData 声明（Pick），mfa_write_guard 键由该接口提供
   assert.match(authSrc, /Pick<GlobalConfigData, 'timezone' \| 'cert_renewal_days' \| 'mfa_write_guard'>/, '/config 投影必须 Pick GlobalConfigData（单一事实源）')
   assert.match(fetchBody, /mfaWriteGuard\.value = res\.data\.mfa_write_guard === true/)

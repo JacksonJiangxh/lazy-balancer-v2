@@ -1,18 +1,23 @@
 package main
 
 import (
+	"bytes"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"log"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // 启动协调协议的两个标记路径各有多份字面量：entrypoint 的 shell 变量与
-// handlers 包的包级 var（pause 另有 main 包的 const）。任一侧改路径都不会
+// handlers 包的包级 var（pause 另有 main 包的包级 var）。任一侧改路径都不会
 // 编译失败——只会在运行期表现为「标记永不出现/永不消除」，故用测试机械比对。
 //
 // handlers 不得反向依赖 main（包边界），测试侧只能读源码常量：AST 读 var 值 +
@@ -109,5 +114,102 @@ func TestCaddyStartupReplayMarkerMatchesEntrypoint(t *testing.T) {
 	want := handlersStringVar(t, handlersCaddySource(t), "caddyStartupReplayMarkerFile")
 	if got := entrypointAssignment(t, "CADDY_STARTUP_REPLAY_DONE"); got != want {
 		t.Fatalf("entrypoint CADDY_STARTUP_REPLAY_DONE=%q 与 handlers caddyStartupReplayMarkerFile=%q 不一致", got, want)
+	}
+}
+
+// 停机 pause 标记的三条行为语义（此前只有「路径三方同值」一层保护，
+// 分支行为回归不会被任何门禁捕获——pause 语义失效的症状出现在容器编排层）。
+func withTempPausePath(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "caddy-paused")
+	previous := caddyPauseFilePath
+	caddyPauseFilePath = path
+	t.Cleanup(func() { caddyPauseFilePath = previous })
+	return path
+}
+
+func TestWriteDrainPauseFile_createsWhenMissing(t *testing.T) {
+	path := withTempPausePath(t)
+
+	writeDrainPauseFile()
+
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("暂停标记未创建: %v", err)
+	}
+}
+
+// 已存在的标记不覆盖：它可能是 stopCaddy（用户意图停机）写入的在场标记，
+// 覆盖会改变监督器对本次停机的归因。
+func TestWriteDrainPauseFile_keepsExistingMarker(t *testing.T) {
+	path := withTempPausePath(t)
+	if err := os.WriteFile(path, []byte("user-stop"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	writeDrainPauseFile()
+
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "user-stop" {
+		t.Fatalf("已存在标记被覆盖为 %q", string(body))
+	}
+}
+
+// 写失败必须留痕：pause 语义失效时监督器按崩溃重拉（抢绑 80/443 + 伪
+// CRASHES），现象在监督器侧，app 侧零线索则排查无门。
+func TestWriteDrainPauseFile_logsWriteFailure(t *testing.T) {
+	var logs bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	previousPath := caddyPauseFilePath
+	caddyPauseFilePath = filepath.Join(t.TempDir(), "missing-dir", "caddy-paused")
+	t.Cleanup(func() { caddyPauseFilePath = previousPath })
+
+	writeDrainPauseFile()
+
+	if !strings.Contains(logs.String(), "pause 标记") || !strings.Contains(logs.String(), "写入失败") {
+		t.Fatalf("写入失败必须告警，got %q", logs.String())
+	}
+}
+
+// 预算耗尽仍要写标记：否则排水窗口内监督器按崩溃重拉，正是本机制要消除的
+// 伪 Crash 噪音；只是跳过 POST /stop。
+func TestDrainCaddy_writesMarkerEvenWhenBudgetExhausted(t *testing.T) {
+	path := withTempPausePath(t)
+
+	drainCaddy("http://127.0.0.1:1", 0)
+
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("预算耗尽时仍必须写 pause 标记: %v", err)
+	}
+}
+
+// admin 可达：POST {admin}/stop 必须发出（末尾斜杠归一）。
+func TestDrainCaddy_postsStop(t *testing.T) {
+	path := withTempPausePath(t)
+	stopCalled := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/stop" {
+			select {
+			case stopCalled <- struct{}{}:
+			default:
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+
+	drainCaddy(server.URL+"/", time.Second)
+
+	select {
+	case <-stopCalled:
+	default:
+		t.Fatal("未收到 POST /stop")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("排水前必须写 pause 标记: %v", err)
 	}
 }

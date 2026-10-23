@@ -245,3 +245,49 @@ func TestGetCRSRuleIndex_endpoint(t *testing.T) {
 		t.Fatalf("msg not parsed: %+v", resp.Data.Rules)
 	}
 }
+
+// 基础设施组（901 初始化 / 949 请求评估 / 959 响应评估）不可排除：排除评估组
+// 会让 blocking 策略静默退化为仅记录，与 crs_rule_groups 的剥离口径必须一致。
+// 双格式同门：legacy []string 与对象格式都在保存侧 400。
+func TestValidateCRSExcludedRulesPayload_rejectsInfraGroups(t *testing.T) {
+	targets := []string{
+		"01", "49", "59",
+		"901100", "949110", "959100",
+		"REQUEST-901-INITIALIZATION.conf",
+		"REQUEST-949-BLOCKING-EVALUATION.conf",
+		"RESPONSE-959-BLOCKING-EVALUATION.conf",
+		"900000-902000", "948000-950000", "959500-960000",
+	}
+	for _, target := range targets {
+		t.Run("object-"+target, func(t *testing.T) {
+			raw, err := json.Marshal([]map[string]string{{"target": target, "scope": "all"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload := string(raw)
+			if err := validateCRSExcludedRulesPayload(&payload, false); err == nil {
+				t.Fatalf("对象格式排除 %q 必须被拒绝（基础设施组不可排除）", target)
+			}
+		})
+		t.Run("legacy-"+target, func(t *testing.T) {
+			raw, err := json.Marshal([]string{target})
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload := string(raw)
+			if err := validateCRSExcludedRulesPayload(&payload, false); err == nil {
+				t.Fatalf("legacy 格式排除 %q 必须被拒绝（基础设施组不可排除）", target)
+			}
+		})
+	}
+
+	// 回归形状：非基础设施排除照常接受（双格式）。
+	objectPayload := `[{"target":"942100","scope":"all"}]`
+	if err := validateCRSExcludedRulesPayload(&objectPayload, false); err != nil {
+		t.Fatalf("非基础设施对象排除不得误拒: %v", err)
+	}
+	legacyPayload := `["942100"]`
+	if err := validateCRSExcludedRulesPayload(&legacyPayload, false); err != nil {
+		t.Fatalf("非基础设施 legacy 排除不得误拒: %v", err)
+	}
+}

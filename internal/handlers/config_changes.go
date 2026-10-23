@@ -83,15 +83,17 @@ func loadConfigSnapshot() (configSnapshot, error) {
 		COALESCE(proxy_dial_timeout,0), COALESCE(proxy_response_header_timeout,0), COALESCE(proxy_read_timeout,0), COALESCE(proxy_write_timeout,0), COALESCE(proxy_stream_timeout,0), COALESCE(proxy_flush_interval,0), COALESCE(proxy_stream_close_delay,0),
 		COALESCE(server_tokens_hidden,FALSE),
 		COALESCE(access_log_json,TRUE), COALESCE(access_log_format,''),
-		COALESCE(task_log_size_mb,10), COALESCE(audit_log_size_mb,10), COALESCE(runtime_log_size_mb,100), COALESCE(audit_retention_months,3),
-		COALESCE(jwt_expire_minutes,20),
+		COALESCE(task_log_size_mb,?), COALESCE(audit_log_size_mb,?), COALESCE(runtime_log_size_mb,?), COALESCE(audit_retention_months,?),
+		COALESCE(jwt_expire_minutes,?),
 		COALESCE(github_proxy_url,'https://v4.gh-proxy.org/'),
 		COALESCE(github_token,''),
 		COALESCE(mfa_write_guard,0),
 		COALESCE(mfa_lockout_enabled,0),
 		COALESCE(trusted_proxy_enabled,0), COALESCE(trusted_proxy_ranges,'[]'), COALESCE(trusted_proxy_range_refs,'[]'), COALESCE(trusted_proxy_headers,'[]'), COALESCE(trusted_proxy_strict,1),
 		COALESCE(server_map_lat,0), COALESCE(server_map_lon,0), COALESCE(threat_screen_mode,?), COALESCE(threat_traffic_sample_n,?), COALESCE(security_events_retention_days,?), COALESCE(security_events_row_cap,?)
-		FROM global_config WHERE id=1`, db.DefaultCertExpiryDays, db.DefaultCertRenewalDays, db.DefaultCertRenewalAttempts, db.DefaultTimezone, db.DefaultThreatScreenMode, db.DefaultThreatTrafficSampleN, db.DefaultSecurityEventsRetentionDays, db.DefaultSecurityEventsRowCap).Scan(
+		FROM global_config WHERE id=1`, db.DefaultCertExpiryDays, db.DefaultCertRenewalDays, db.DefaultCertRenewalAttempts, db.DefaultTimezone,
+		db.DefaultTaskLogSizeMB, db.DefaultAuditLogSizeMB, db.DefaultRuntimeLogSizeMB, db.DefaultAuditRetentionMonths, db.DefaultJWTExpireMinutes,
+		db.DefaultThreatScreenMode, db.DefaultThreatTrafficSampleN, db.DefaultSecurityEventsRetentionDays, db.DefaultSecurityEventsRowCap).Scan(
 		&old.ACMEEmail, &old.DNSProvider,
 		&old.CertExpiryDays, &old.CertRenewalDays, &old.CertRenewalAttempts,
 		&old.DefaultCAProviderID, &old.LogLevel,
@@ -110,27 +112,34 @@ func loadConfigSnapshot() (configSnapshot, error) {
 	return old, err
 }
 
+// appendConfigChange 追加一条字段级变更：去重键是 (section,label)——同段内
+// 多字段共用 label（大屏本站坐标 lat/lon）只列一次；跨段复用同一 label（如
+// 两处「日志大小」）必须各自保留归因，否则第二个字段的变更会从清单消失且
+// 字段级审计指向错误卡片。
+func appendConfigChange(plan *configChangePlan, seen map[string]bool, field, label string) {
+	section := services.GetConfigSection(field)
+	key := section + "\x00" + label
+	if seen[key] {
+		return
+	}
+	seen[key] = true
+	plan.Changes = append(plan.Changes, label)
+	plan.SectionChanges[section] = append(plan.SectionChanges[section], label)
+}
+
 func planConfigChanges(req models.UpdateConfigRequest, old configSnapshot) configChangePlan {
 	plan := configChangePlan{
 		Section:        services.GetConfigSourceSection(req.Source),
 		Changes:        []string{},
 		SectionChanges: map[string][]string{},
 	}
+	seen := map[string]bool{}
 	add := func(field, label string, changed bool) {
 		if !changed {
 			return
 		}
 		plan.Changed = true
-		// 同 label 的多字段（大屏本站坐标 lat/lon 共用「大屏本站坐标」）
-		// 只列一次——变更清单/审计预览不重复；Changed 真值保持（任一字段变更即 true）。
-		for _, existing := range plan.Changes {
-			if existing == label {
-				return
-			}
-		}
-		plan.Changes = append(plan.Changes, label)
-		section := services.GetConfigSection(field)
-		plan.SectionChanges[section] = append(plan.SectionChanges[section], label)
+		appendConfigChange(&plan, seen, field, label)
 	}
 
 	add("acme_email", "ACME邮箱", req.ACMEEmail != nil && *req.ACMEEmail != old.ACMEEmail)

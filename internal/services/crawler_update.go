@@ -82,7 +82,7 @@ type CrawlerUpdateManager struct{}
 //     地址空间覆盖率口径，不再是「任一更具体条目命中」；阈值依据见函数内
 //     360 官方页实测）——截断页/仅一条官方段内 IP 的错误页、以及「每段一个
 //     单 IP」的占位形状都不得整体替换豁免名单（与 crawler_seed_parity_test.go
-//     的「⊆ + 覆盖」双条件同口径）。
+//     复用同一覆盖率判定，注释所称「同口径」即同一函数）。
 //
 // 引擎未声明官方段时无可对照口径，原样放行（收缩门 crawlerSnapshotShrinkGuard
 // 与扩张门 crawlerSnapshotGrowthGuard 仍兜底条数塌缩/膨胀）。
@@ -220,7 +220,7 @@ func crawlerSnapshotShrinkGuard(engineID string, newCount int, set *crawlerBasel
 		return nil
 	}
 	if baseline >= 2 && newCount*2 < baseline {
-		return fmt.Errorf("解析条数 %d 较当前快照 %d 收缩超过一半（疑似错误页/劫持），保留上次快照", newCount, baseline)
+		return fmt.Errorf("解析条数 %d 较当前快照 %d 收缩超过一半（疑似错误页/劫持），保留上次快照；如确认上游名单合法重构，需人工清理基线后重试", newCount, baseline)
 	}
 	return nil
 }
@@ -258,7 +258,7 @@ func crawlerSnapshotGrowthGuard(engineID string, newCount int, set *crawlerBasel
 		return fmt.Errorf("读取爬虫名单基线失败: %w", err)
 	}
 	if known && baseline > 0 && newCount > baseline*2 {
-		return fmt.Errorf("解析条数 %d 较当前快照 %d 膨胀超过一倍（疑似劫持/污染），拒绝写入（保留上次快照）", newCount, baseline)
+		return fmt.Errorf("解析条数 %d 较当前快照 %d 膨胀超过一倍（疑似劫持/污染），拒绝写入（保留上次快照）；如确认上游名单合法扩张，需人工清理基线后重试", newCount, baseline)
 	}
 	return nil
 }
@@ -306,6 +306,10 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 			RecordAuditLog(operator, "更新失败", "爬虫地址库", detail, "")
 		case "cancelled":
 			RecordAuditLog(operator, "取消", "爬虫地址库", detail, "")
+		case "skipped":
+			// 动作标签必须与终态同义：此前 skipped 落 default 记「更新」而
+			// 详情写「跳过」，审计中心动作/详情自相矛盾。
+			RecordAuditLog(operator, "跳过", "爬虫地址库", detail, "")
 		default:
 			RecordAuditLog(operator, "更新", "爬虫地址库", detail, "")
 		}
@@ -339,8 +343,11 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 		return err
 	}
 	if len(sources) == 0 {
+		// 与威胁族口径一致：无到期源按成功轮处理（task_runs 不记 skip），
+		// 任务日志只留一条 INFO 业务摘要——此前写 skipped 级行与 task_runs
+		// success 分叉。
 		outcome = "skipped"
-		TaskLogf("crawlerbot-update", "skipped", "没有启用或到期的爬虫源")
+		TaskLogf("crawlerbot-update", "checking", "没有启用或到期的爬虫源，本轮无更新")
 		return nil
 	}
 	TaskLogf("crawlerbot-update", "checking", "开始更新爬虫地址库（%d 个启用源）", len(sources))
@@ -376,7 +383,7 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 				firstErr = fmt.Errorf("源 %s 标记运行失败: %w", src.Name, err)
 			}
 			failedCount++
-			taskengine.TeeTaskLogTime("crawlerbot-update", "ERROR", "failed", fmt.Sprintf("源 %s 标记运行失败: %v", src.Name, err))
+			WriteCrawlerUpdateLog("ERROR", "failed", fmt.Sprintf("源 %s 标记运行失败: %v", src.Name, err))
 			continue
 		}
 		TaskLogf("crawlerbot-update", "downloading", "下载 %s（%s）", src.Name, src.URL)
@@ -411,7 +418,7 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 			}
 			failedCount++
 			markCrawlerSourceFailed(src.Name, rc.Trigger)
-			taskengine.TeeTaskLogTime("crawlerbot-update", "ERROR", "failed", fmt.Sprintf("源 %s 更新失败: %v", src.Name, err))
+			WriteCrawlerUpdateLog("ERROR", "failed", fmt.Sprintf("源 %s 更新失败: %v", src.Name, err))
 			continue
 		}
 		// 按源声明格式解析（json 源的非 JSON 响应=错误页 → 失败并
@@ -438,7 +445,7 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 			}
 			failedCount++
 			markCrawlerSourceFailed(src.Name, rc.Trigger)
-			taskengine.TeeTaskLogTime("crawlerbot-update", "ERROR", "failed", fmt.Sprintf("源 %s 更新失败: %v", src.Name, perr))
+			WriteCrawlerUpdateLog("ERROR", "failed", fmt.Sprintf("源 %s 更新失败: %v", src.Name, perr))
 			continue
 		}
 		// 成功写路径前复核（与威胁族同一写门 updateRunWriteGate）：下载/解析
@@ -474,7 +481,7 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 			}
 			failedCount++
 			markCrawlerSourceFailed(src.Name, rc.Trigger)
-			taskengine.TeeTaskLogTime("crawlerbot-update", "ERROR", "failed", fmt.Sprintf("源 %s 更新失败: %v", src.Name, err))
+			WriteCrawlerUpdateLog("ERROR", "failed", fmt.Sprintf("源 %s 更新失败: %v", src.Name, err))
 			continue
 		}
 		if changed {
@@ -487,7 +494,7 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 				firstErr = fmt.Errorf("源 %s 写成功态失败: %w", src.Name, merr)
 			}
 			failedCount++
-			taskengine.TeeTaskLogTime("crawlerbot-update", "ERROR", "failed", fmt.Sprintf("源 %s 写成功态失败: %v", src.Name, merr))
+			WriteCrawlerUpdateLog("ERROR", "failed", fmt.Sprintf("源 %s 写成功态失败: %v", src.Name, merr))
 			continue
 		}
 		successCount++
@@ -563,12 +570,14 @@ func markCrawlerSourceRunning(name, trigger, started string) error {
 	return err
 }
 
-// crawlerSlotAdvanceSQL 爬虫源族排程槽推进门：与威胁源族
-// 同一谓词（schedule.go slotAdvanceGateSQL 单源）——仅 auto 触发且现存槽
-// 空/过期才推进。手动触发不动预约、未来槽不回拨（2026-10-11 排程槽生命周期
-// 裁定；crawlerbot 新族此前无条件改写 next_update：手动轮可静默吞掉当天自动
-// 轮，手动失败也推进槽抑制自动重试）。
+// crawlerSlotAdvanceSQL 爬虫源族失败落的推进门：仅 auto 触发且现存槽空/过期
+// 才推进——手动失败不动预约（引擎按退避重投同一槽，业务抢先推进会把该自动槽
+// 静默吃掉）。成功落见 crawlerSlotSuccessSQL（auto/manual 同权）。
 const crawlerSlotAdvanceSQL = `next_update=IIF(` + slotAdvanceGateSQL + `, ?, next_update)`
+
+// crawlerSlotSuccessSQL 爬虫源族成功落的推进门：auto/manual 同权（仅空/过期
+// 槽），失败落仍走 crawlerSlotAdvanceSQL（仅 auto）。
+const crawlerSlotSuccessSQL = `next_update=IIF(` + slotSuccessGateSQL + `, ?, next_update)`
 
 // markCrawlerSourceSuccess 源成功态：entry_count 更新 + version=成功日期 +
 // consecutive_failures 清零 + next_update 按排程槽推进门更新。返回落库错误
@@ -576,8 +585,8 @@ const crawlerSlotAdvanceSQL = `next_update=IIF(` + slotAdvanceGateSQL + `, ?, ne
 // running、next_update 不推进——任务日志与源状态机互相矛盾。
 func markCrawlerSourceSuccess(name, trigger string, entryCount int) error {
 	next := crawlerNextSlot(time.Now().UTC())
-	_, err := db.DB.Exec(`UPDATE security_crawler_sources SET entry_count=?, version=?, update_status='success', message='', consecutive_failures=0, `+crawlerSlotAdvanceSQL+`, finished_at=datetime('now') WHERE name=?`,
-		entryCount, time.Now().UTC().Format("2006.01.02"), trigger, next, name)
+	_, err := db.DB.Exec(`UPDATE security_crawler_sources SET entry_count=?, version=?, update_status='success', message='', consecutive_failures=0, `+crawlerSlotSuccessSQL+`, finished_at=datetime('now') WHERE name=?`,
+		entryCount, time.Now().UTC().Format("2006.01.02"), trigger, trigger, next, name)
 	if err != nil {
 		Logf("error", "crawlerbot-update: 源 %s 写成功态失败: %v", name, err)
 	}

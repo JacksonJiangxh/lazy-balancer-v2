@@ -3,10 +3,11 @@
 // 「采集失败」而非 0——否则 CPU 单点故障时用户看到「内存 0 B / 磁盘 0%」，
 // 排障窗口反而误判。
 
-export const SYSTEM_METRIC_PARTS = ['cpu', 'memory', 'disk'] as const
-export type SystemMetricPart = (typeof SYSTEM_METRIC_PARTS)[number]
+/** 已知分项（顺序即文案顺序）；仅模块内使用，导出面只留消费函数。 */
+const SYSTEM_METRIC_PARTS = ['cpu', 'memory', 'disk'] as const
+type SystemMetricPart = (typeof SYSTEM_METRIC_PARTS)[number]
 
-export const SYSTEM_METRIC_LABELS: Record<SystemMetricPart, string> = {
+const SYSTEM_METRIC_LABELS: Record<SystemMetricPart, string> = {
   cpu: 'CPU',
   memory: '内存',
   disk: '磁盘',

@@ -13,7 +13,7 @@ import (
 	"lazy-balancer-v2/internal/models"
 )
 
-// doWithTLSUpgradeRedirect 同契约——从节点启用管理 HTTPS 后明文端口整体 301，
+// DoWithSameHostTLSUpgradeRedirect 同契约——从节点启用管理 HTTPS 后明文端口整体 301，
 // 服务控制调用必须对「同主机名 + 升级为 https」的 Location 按原方法重放一次，
 // 否则票据调用在 301 上空 body 解析失败、服务控制全线不可用。
 func TestCallClusterServiceControl_followsSameHostTLSUpgradeRedirect(t *testing.T) {

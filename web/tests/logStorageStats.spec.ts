@@ -11,7 +11,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { nextTick, ref } from 'vue'
 
-import { registerModuleHooks } from './_helpers.ts'
+import { registerModuleHooks, repoSource, section, source } from './_helpers.ts'
 import { STUB_API } from './_stubs.ts'
 
 interface GetRecord {
@@ -140,4 +140,41 @@ test('迟到响应不写回：换行后上一行的慢响应被丢弃', async ()
   slow.resolve(statsOf('runtime', '运行日志'))
   await flush()
   assert.equal(info.value?.name, '操作日志', '旧行迟到响应不得覆盖当前行')
+})
+
+test('日志统计条消费 rows_unavailable：保持条数口径并标注不可用', () => {
+  // 主题归属：日志统计条用例放在日志统计 spec 中（此前混在管理 TLS 证书
+  // spec 里，查日志条不会想到那个文件）。
+  const bar = source('src/components/LogStorageBar.vue')
+  // 响应类型声明在取数层组合子（LogStorageBar 只消费其 info）。
+  assert.match(source('src/composables/useLogStorageStats.ts'), /rows_unavailable\?: boolean/, '响应字段类型必须声明')
+  // 出现判定必须真正消费该 flag：后端改为「保留上次行数 + flag=true」时，陈旧
+  // 行数不得被当有效值（仅用 rows == null 推导会让 flag 成为死字段）。
+  // 该判定是单表达式箭头体（无块体可配对），按行切片。
+  const rowsUnavailable = section(bar, 'const rowsUnavailable = computed', '\n')
+  assert.match(rowsUnavailable, /rows_unavailable === true/, 'rows_unavailable 必须驱动不可用判定')
+  assert.match(rowsUnavailable, /rows == null/, '行数缺席同样按不可用呈现')
+  assert.doesNotMatch(rowsUnavailable, /rows != null/, '不得反转为「有行数即可用」')
+  const sizeText = section(bar, 'const sizeText = computed(', '\n})\n')
+  assert.match(sizeText, /计数暂不可用 \/ /, '行数缺席时保持条数口径文案')
+  assert.match(sizeText, /rowsUnavailable\.value/, '文案必须取统一不可用判定（flag 与 null 同口径）')
+  assert.doesNotMatch(
+    section(bar, 'const sizeText = computed(', '\n})\n'),
+    /if \(i\.limit_rows && i\.rows != null\)/,
+    '不得在行数缺席时滑回字节口径',
+  )
+  const noteText = section(bar, 'const noteText = computed(', '\n})\n')
+  assert.match(noteText, /行数暂不可用/, '附注必须披露计数不可用')
+})
+
+// rows_unavailable 的跨栈对表：前端响应类型与后端 json tag 必须同名字段
+// （后端改名时前端类型不会报错，只会静默读 undefined）。
+test('rows_unavailable 与后端 logstats.go 的 json tag 同源（跨栈钉）', () => {
+  const go = repoSource('internal/handlers/logstats.go')
+  assert.match(go, /RowsUnavailable bool\s+`json:"rows_unavailable,omitempty"`/, '后端 json tag 漂移')
+  assert.match(
+    source('src/composables/useLogStorageStats.ts'),
+    /rows_unavailable\?: boolean/,
+    '前端类型必须声明同名可选字段',
+  )
 })

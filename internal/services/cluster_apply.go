@@ -126,6 +126,12 @@ func (s *SyncService) applySnapshotBrandingChecked(cfg *config.Config, content s
 var rebuildCrawlerSnapshotForSync = RebuildCrawlerIPListSnapshot
 
 func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.ClusterSnapshot) error {
+	// 与 s.caddy == nil 同型的 fail-visible 守卫：NewSyncService 恒注入
+	// cluster，但独立构造/未来新调用方会解引用 panic；给出「不可判定」错误
+	// 而不是崩溃。
+	if s.cluster == nil {
+		return errors.New("集群服务未初始化")
+	}
 	// (2026-09-10 审计):ACME 状态校验由 Pull 侧 verifiedSnapshotIntegrity 统一
 	// 执行(验签后、apply 前单点);此处重复执行已删——applySnapshot 唯一生产
 	// 调用方即 Pull,两次结果必然相同。
@@ -456,8 +462,6 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 			// 从端补偿标记只在从端语境有意义：提交与重载之间完成升主的节点
 			// 不得把「同步重载失败」写回主节点（Promote 已清空该列）。
 			Logf("info", "集群同步重载失败标记跳过：本节点已升为主节点")
-		} else if rows != 1 {
-			Logf("error", "集群同步重载失败标记写入异常（影响 %d 行）：自愈通道失效，请检查数据库", rows)
 		}
 	} else if mustReload {
 		// 重载成功即清除本来源的失败面记录（含 304 补偿重拉成功形态——
@@ -768,7 +772,18 @@ func replaceSnapshotTx(ctx context.Context, tx *sql.Tx, snapshot models.ClusterS
 			if cert.SourceStatus != "" {
 				message += "，源任务状态：" + cert.SourceStatus
 			}
-			if _, err := tx.ExecContext(ctx, `INSERT INTO cert_jobs (rule_id,domain,status,message,expires_at,cert_pem,key_pem,ca_provider_id,renewal_attempts,ca_available_after,last_error_code,created_at,updated_at) SELECT ?,COALESCE(NULLIF(?,''),domain),'issued',?,?,?,?,?,?,?,?,COALESCE(NULLIF(?,''),CURRENT_TIMESTAMP),NULLIF(?,'') FROM lb_rules WHERE caddy_id=? AND tls_source='acme_dns'`, cert.RuleID, cert.Domain, message, nullableString(cert.ExpiresAt), cert.CertPEM, cert.KeyPEM, cert.CAProviderID, cert.RenewalAttempts, nullableTimeFlat(cert.CAAvailableAfter.NullTime), nullableString(cert.LastErrorCode), cert.CreatedAt, cert.UpdatedAt, cert.RuleID); err != nil {
+			// 到期口径收敛：源值优先；源值缺失（旧主节点/旧备份行）时从
+			// 证书材料派生并回填 expires_at。否则本地行 expires_at 恒 NULL，
+			// 而聚合消费面（节点健康 certs_expiring_30d）以该列为门，会漏报
+			// 真正临期的证书；/certificates 与 /certificates/jobs 也会对同一行
+			// 给出「空/有」两种结论。
+			expiresAt := cert.ExpiresAt
+			if expiresAt == "" && cert.CertPEM != "" {
+				if notAfter, ok := CertNotAfterFromPEM(cert.CertPEM); ok {
+					expiresAt = notAfter.UTC().Format(crsTimeLayout)
+				}
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO cert_jobs (rule_id,domain,status,message,expires_at,cert_pem,key_pem,ca_provider_id,renewal_attempts,ca_available_after,last_error_code,created_at,updated_at) SELECT ?,COALESCE(NULLIF(?,''),domain),'issued',?,?,?,?,?,?,?,?,COALESCE(NULLIF(?,''),CURRENT_TIMESTAMP),NULLIF(?,'') FROM lb_rules WHERE caddy_id=? AND tls_source='acme_dns'`, cert.RuleID, cert.Domain, message, nullableString(expiresAt), cert.CertPEM, cert.KeyPEM, cert.CAProviderID, cert.RenewalAttempts, nullableTimeFlat(cert.CAAvailableAfter.NullTime), nullableString(cert.LastErrorCode), cert.CreatedAt, cert.UpdatedAt, cert.RuleID); err != nil {
 				return fmt.Errorf("写入快照证书 %s: %w", cert.RuleID, err)
 			}
 		}
@@ -1103,8 +1118,9 @@ func applySecurityTables(ctx context.Context, tx *sql.Tx, snapshot models.Cluste
 			}
 		}
 		for _, row := range threatSources {
+			updateStatus, message := normalizeSnapshotUpdateStatus(row["update_status"], row["message"])
 			if _, err := tx.ExecContext(ctx, `INSERT INTO security_threat_sources (id,name,display_name,url,format,update_enabled,apply_enabled,entry_count,version,update_status,message,last_checked,next_update,trigger,started_at,finished_at,consecutive_failures,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-				row["id"], row["name"], row["display_name"], row["url"], row["format"], row["update_enabled"], row["apply_enabled"], row["entry_count"], row["version"], row["update_status"], row["message"],
+				row["id"], row["name"], row["display_name"], row["url"], row["format"], row["update_enabled"], row["apply_enabled"], row["entry_count"], row["version"], updateStatus, message,
 				snapshotNullableDatetime(row["last_checked"]), snapshotNullableDatetime(row["next_update"]), row["trigger"],
 				snapshotNullableDatetime(row["started_at"]), snapshotNullableDatetime(row["finished_at"]),
 				row["consecutive_failures"], row["created_at"], row["updated_at"]); err != nil {
@@ -1125,8 +1141,9 @@ func applySecurityTables(ctx context.Context, tx *sql.Tx, snapshot models.Cluste
 			}
 		}
 		for _, row := range crawlerSources {
+			updateStatus, message := normalizeSnapshotUpdateStatus(row["update_status"], row["message"])
 			if _, err := tx.ExecContext(ctx, `INSERT INTO security_crawler_sources (id,name,display_name,url,format,update_enabled,entry_count,version,update_status,message,last_checked,next_update,trigger,started_at,finished_at,consecutive_failures,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-				row["id"], row["name"], row["display_name"], row["url"], row["format"], row["update_enabled"], row["entry_count"], row["version"], row["update_status"], row["message"],
+				row["id"], row["name"], row["display_name"], row["url"], row["format"], row["update_enabled"], row["entry_count"], row["version"], updateStatus, message,
 				snapshotNullableDatetime(row["last_checked"]), snapshotNullableDatetime(row["next_update"]), row["trigger"],
 				snapshotNullableDatetime(row["started_at"]), snapshotNullableDatetime(row["finished_at"]),
 				row["consecutive_failures"], row["created_at"], row["updated_at"]); err != nil {
@@ -1352,14 +1369,47 @@ func applySecurityBlockPages(ctx context.Context, tx *sql.Tx, pages []models.Sec
 // 表名由调用方白名单传入（仅两张固定表）。
 const clusterRuleLibVersionInsertSQL = `INSERT INTO %s (id,version,updated_at,auto_update,update_status,message,last_checked,next_update,trigger,started_at,finished_at,schedule_days,schedule_time) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
 
+// snapshotActiveUpdateStatusMessage 是快照搬运来的活动态在从端的归一文案：
+// 从节点不可能执行该类任务（RunsOn=RoleMasterOnly），保留「更新中」是假
+// 运行态，按 failed + 本句解释归一（与启动期「进程重启回收」同族但归属不同）。
+const snapshotActiveUpdateStatusMessage = "来自主节点快照的进行中状态，本节点不执行该任务"
+
+// snapshotActiveUpdateStatus 判定快照载荷里的状态是否属于「进行中」活动态。
+// 覆盖三族词表：CRS/IP2Region（checking/downloading/installing/reloading）
+// 与威胁源/爬虫源（running）。活动态只属于执行该任务的进程；从节点收到
+// 后若不归一，主端以「已是最新/失败」收尾时只写运行态列、不 bump 版本，
+// 从端行会长期滞留活动态且无任何收敛通道。
+func snapshotActiveUpdateStatus(status string) bool {
+	return IsActiveCRSStatus(status) || IsActiveIP2RegionStatus(status) || status == "running"
+}
+
+// normalizeSnapshotUpdateStatus 把 JSON 行载荷中的活动态归一为 failed，
+// 非活动态原样返回（保持源值优先）。
+func normalizeSnapshotUpdateStatus(status, message any) (any, any) {
+	text, _ := status.(string)
+	if !snapshotActiveUpdateStatus(text) {
+		return status, message
+	}
+	return "failed", snapshotActiveUpdateStatusMessage
+}
+
 // applyRuleLibVersionRows 全量替换写入一张版本表（先清后插由调用方负责）。
 func applyRuleLibVersionRows(ctx context.Context, tx *sql.Tx, table string, rows []clusterRuleLibVersionRow) error {
 	statement := fmt.Sprintf(clusterRuleLibVersionInsertSQL, table)
 	for _, row := range rows {
+		// 活动态（checking/downloading/installing/reloading）只属于执行该
+		// 任务的进程；从节点不运行该任务，落到本地的活动态是主端镜像且
+		// 永不收敛 → 归一并解释来源。
+		updateStatus := row.UpdateStatus
+		message := row.Message
+		if snapshotActiveUpdateStatus(updateStatus) {
+			updateStatus = "failed"
+			message = snapshotActiveUpdateStatusMessage
+		}
 		// schedule_days/schedule_time 随版本行全量替换
 		// 落库（升主即生效）；空串来源=旧主端快照缺列，读取端 normalizeScheduleRow
 		// 回落默认，与 NOT NULL 约束兼容。
-		if _, err := tx.ExecContext(ctx, statement, row.ID, row.Version, nullableString(row.UpdatedAt), row.AutoUpdate, row.UpdateStatus, row.Message,
+		if _, err := tx.ExecContext(ctx, statement, row.ID, row.Version, nullableString(row.UpdatedAt), row.AutoUpdate, updateStatus, message,
 			nullableString(row.LastChecked), nullableString(row.NextUpdate), nullableString(row.Trigger), nullableString(row.StartedAt), nullableString(row.FinishedAt),
 			row.ScheduleDays, row.ScheduleTime); err != nil {
 			return fmt.Errorf("写入快照 %s 版本 %d: %w", table, row.ID, err)
@@ -1461,6 +1511,19 @@ func validateSnapshotACMEState(snapshot models.ClusterSnapshot) error {
 }
 
 func insertSnapshotRules(ctx context.Context, tx *sql.Tx, rules []models.LbRule) error {
+	// 生成式子路由 @id 命名空间保留（与 v2 导入同门）：主端快照若含
+	// <规则ID>_path_<n>/_geoip/_redirect 形态的第二条规则，从端渲染同样会被
+	// Caddy 以 duplicate ID 拒绝；在落库前点名，避免整节应用失败只留下引擎级
+	// 配置路径错误。
+	ruleIDs := make([]string, 0, len(rules))
+	for _, rule := range rules {
+		ruleIDs = append(ruleIDs, rule.CaddyID)
+	}
+	for _, rule := range rules {
+		if conflict := RuleIDNamespaceConflict(rule.CaddyID, ruleIDs); conflict != "" {
+			return fmt.Errorf("快照规则 %q 与规则 %q 的子路由 @id 命名空间冲突", rule.CaddyID, conflict)
+		}
+	}
 	// INSERT 列清单与值投影走唯一事实源（rule_write_columns.go），
 	// 全量列（含 id 与审计四列）——从端镜像必须保留主端主键与审计值。
 	columns := LbRuleInsertColumns()

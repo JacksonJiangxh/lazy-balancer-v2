@@ -69,7 +69,37 @@ func TestGetSecurityThreatScreen_topRulesUseReadableNames(t *testing.T) {
 		}
 	}
 	// 第 4 名被 Top3 截断，改用解析器直测 CRS 回退标签（索引目录在测试环境为空）
-	if got := describeThreatRuleName("930130"); got != "CRS 规则（#930130）" {
+	if got := describeThreatRuleNameWithNames("930130", nil); got != "CRS 规则（#930130）" {
 		t.Errorf("CRS 未命中索引时应回退可读标签，got=%q", got)
+	}
+}
+
+// 宽窗口下自定义规则键可达 200：标签解析必须一次分块 IN 预取，而不是逐键
+// 点查主库（缓存 miss 时的串行查询热点）。
+func TestLabeledThreatRuleCounts_prefetchesCustomNames(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	for id, name := range map[int]string{42: "规则甲", 43: "规则乙"} {
+		if _, err := db.DB.Exec(`INSERT INTO security_custom_rules (id, name, conditions, action, enabled) VALUES (?, ?, '[]', 'block', 1)`, id, name); err != nil {
+			t.Fatalf("seed custom rule %d: %v", id, err)
+		}
+	}
+	labeled := labeledThreatRuleCounts(map[string]int{"10042": 3, "10043": 1, "942100": 2, "10099": 4})
+	want := map[string]int{
+		"规则甲（#10042）":   3,
+		"规则乙（#10043）":   1,
+		"自定义规则（#10099）": 4,
+	}
+	for name, count := range want {
+		if labeled[name] != count {
+			t.Fatalf("labeled[%q]=%d, want %d（all=%+v）", name, labeled[name], count, labeled)
+		}
+	}
+	// 非自定义段键仍走原解析（CRS 索引在测试环境为空 → 回退可读类别标签）
+	if labeled["CRS 规则（#942100）"] != 2 {
+		t.Fatalf("CRS 回退标签丢失: %+v", labeled)
+	}
+	// 批量路径不得逐键点查主库（宽窗口 200 键 = 200 次串行查询热点）
+	if got := threatRuleNamePointQueriesForTest.Load(); got != 0 {
+		t.Fatalf("批量标签解析发起点查 %d 次, want 0", got)
 	}
 }

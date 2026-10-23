@@ -750,7 +750,9 @@ func threatWriteGateAbort(source string, gerr error) (bool, bool) {
 }
 
 // markSourceSuccess 源成功状态落库（版本/条数/退避清零/下一窗口 + 原始字节哈希）。
-// 排程槽生命周期（2026-10-11 用户裁定）：仅 auto 且现存槽空/过期才推进——手动不动预约。
+// 排程槽生命周期：仅现存槽空/过期才推进（未来槽不回拨）；成功轮 auto 与 manual
+// 同权——引擎成功后会消费过期槽，手动成功不推进会让引擎水位与业务槽单边分叉
+// （该族自动更新永久静默停摆）。
 // rawHash 缺省=兼容旧调用形态【不写】raw_hash 列（无条件覆写
 // 空串曾使快路径自我失效——缺省时动态剔除该列，保留上次慢路径哈希）。
 // 返回成功状态落库错误（吞错会让任务终态 success 掩盖状态机不闭环）。
@@ -766,16 +768,16 @@ func markSourceSuccess(id int, entryCount int, finished string, trigger string, 
 		entrySet, entryArgs = "", nil
 	}
 	if len(rawHash) > 0 {
-		args := append(append([]any{}, entryArgs...), version, finished, trigger, next, rawHash[0], id)
-		if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_status='success', message='', `+entrySet+`version=?, finished_at=?, `+threatSlotAdvanceSQL+`, consecutive_failures=0, raw_hash=?, updated_at=datetime('now') WHERE id=?`,
+		args := append(append([]any{}, entryArgs...), version, finished, trigger, trigger, next, rawHash[0], id)
+		if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_status='success', message='', `+entrySet+`version=?, finished_at=?, `+threatSlotSuccessSQL+`, consecutive_failures=0, raw_hash=?, updated_at=datetime('now') WHERE id=?`,
 			args...); err != nil {
 			Logf("error", "威胁情报库: 更新源成功状态失败: %v", err)
 			return err
 		}
 	} else {
 		// raw_hash 缺省（快路径内容未变）不覆写该列。
-		args := append(append([]any{}, entryArgs...), version, finished, trigger, next, id)
-		if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_status='success', message='', `+entrySet+`version=?, finished_at=?, `+threatSlotAdvanceSQL+`, consecutive_failures=0, updated_at=datetime('now') WHERE id=?`,
+		args := append(append([]any{}, entryArgs...), version, finished, trigger, trigger, next, id)
+		if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_status='success', message='', `+entrySet+`version=?, finished_at=?, `+threatSlotSuccessSQL+`, consecutive_failures=0, updated_at=datetime('now') WHERE id=?`,
 			args...); err != nil {
 			Logf("error", "威胁情报库: 更新源成功状态失败: %v", err)
 			return err

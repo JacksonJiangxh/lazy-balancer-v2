@@ -402,9 +402,15 @@ func threatRawCoverageStart(database *sql.DB) (string, error) {
 // tooltip 按该字段切换两种口径文案消歧。
 type securityOverviewResponse struct {
 	models.SecurityOverview
-	RawCoverageFrom    string `json:"raw_coverage_from"`
-	BackfillIncomplete bool   `json:"backfill_incomplete"`
-	IncludesReserved   bool   `json:"includes_reserved"`
+	RawCoverageFrom string `json:"raw_coverage_from"`
+	// BackfillIncomplete 是历史字段名，语义 =「原始表最早事件晚于 7 天窗口
+	// 起点 → 更早区间不可重建」。与威胁大屏的同名字段（rollup 覆盖未完成）
+	// 同名异义——保留仅为前端兼容，新消费者一律读 RawCoverageLimited。
+	BackfillIncomplete bool `json:"backfill_incomplete"`
+	// RawCoverageLimited 与威胁大屏同名同义（原始表保留期限制导致明细不全，
+	// 与 rollup 回填状态无关），总览/大屏跨端点口径统一。
+	RawCoverageLimited bool `json:"raw_coverage_limited"`
+	IncludesReserved   bool `json:"includes_reserved"`
 	// Ingestion 与事件列表同源（services 快照）：总览/事件页必须看到同一
 	// 采集健康位（任务已停/连续失败/审计写侧降级），不得各自推断。
 	Ingestion services.SecurityEventsIngestionStatus `json:"ingestion"`

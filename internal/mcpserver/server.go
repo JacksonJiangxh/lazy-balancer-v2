@@ -390,7 +390,7 @@ const updateRuleSchema = `{"type":"object","required":["caddy_id"],"properties":
 // 空 body（全量重签）不再放行——批量必须显式 all:true（enum 锁死 true，防
 // all:false 静默变空批量）；定向签发仍走 caddy_id（domain 可选）。
 const issueCertificateSchema = `{"type":"object","properties":{"caddy_id":{"type":"string"},"domain":{"type":"string"},"all":{"type":"boolean","enum":[true]}},"oneOf":[{"required":["all"]},{"required":["caddy_id"]}],"additionalProperties":false}`
-const auditLogsSchema = `{"type":"object","properties":{"page":{"type":"integer","minimum":1,"default":1},"page_size":{"type":"integer","minimum":1,"maximum":100,"default":20},"username":{"type":"string","description":"操作人模糊筛选"},"action":{"type":"string","description":"操作模糊筛选"},"resource":{"type":"string","description":"对象模糊筛选"},"ip":{"type":"string","description":"IP 模糊筛选"},"keyword":{"type":"string","description":"详情关键词"},"start_time":{"type":"string","description":"开始时间（配置时区，YYYY-MM-DD[ HH:MM:SS]）"},"end_time":{"type":"string","description":"结束时间（配置时区，YYYY-MM-DD[ HH:MM:SS]）"}},"additionalProperties":false}`
+const auditLogsSchema = `{"type":"object","properties":{"page":{"type":"integer","minimum":1,"maximum":500,"default":1,"description":"页码；超过 500 页 REST 直接 400（深 OFFSET 全表扫描），请用时间/用户/动作筛选缩小范围"},"page_size":{"type":"integer","minimum":1,"maximum":100,"default":20},"username":{"type":"string","description":"操作人模糊筛选"},"action":{"type":"string","description":"操作模糊筛选"},"resource":{"type":"string","description":"对象模糊筛选"},"ip":{"type":"string","description":"IP 模糊筛选"},"keyword":{"type":"string","description":"详情关键词"},"start_time":{"type":"string","description":"开始时间（配置时区，YYYY-MM-DD[ HH:MM:SS]）"},"end_time":{"type":"string","description":"结束时间（配置时区，YYYY-MM-DD[ HH:MM:SS]）"}},"additionalProperties":false}`
 
 // schema 必须覆盖 queryArgs 声明的全部
 // 参数——运行时未启用 WithInputSchemaValidation（mcp-go v0.58.0 实证：不启用
@@ -400,9 +400,9 @@ const auditLogsSchema = `{"type":"object","properties":{"page":{"type":"integer"
 // 不启用运行时校验——启用会把 schema 文档缺口升级为硬失败面，是否启用另行裁定。
 // 边界与 REST clamp 对齐（ListCRSRules page_size≤50 默认 50——REST 侧钳位；cert jobs
 // page≤1000000、page_size≤200 默认 50——见 ListCertJobs maxCertJobPage）。
-const listCRSRulesSchema = `{"type":"object","properties":{"search":{"type":"string","description":"搜索关键词"},"page":{"type":"integer","minimum":1,"default":1},"page_size":{"type":"integer","minimum":1,"maximum":50,"default":50}},"additionalProperties":false}`
+const listCRSRulesSchema = `{"type":"object","properties":{"search":{"type":"string","description":"搜索关键词"},"page":{"type":"integer","minimum":1,"maximum":100000,"default":1},"page_size":{"type":"integer","minimum":1,"maximum":50,"default":50}},"additionalProperties":false}`
 const listCertJobsSchema = `{"type":"object","properties":{"rule_id":{"type":"string","description":"按规则 ID 过滤"},"page":{"type":"integer","minimum":1,"maximum":1000000,"default":1},"page_size":{"type":"integer","minimum":1,"maximum":200,"default":50}},"additionalProperties":false}`
-const securityEventsSchema = `{"type":"object","properties":{"page":{"type":"integer","minimum":1,"default":1},"page_size":{"type":"integer","minimum":1,"maximum":100,"default":20},"action":{"type":"string"},"ip":{"type":"string"},"rule_caddy_id":{"type":"string"},"rule_name":{"type":"string","description":"按负载规则名称过滤（子串）"},"policy_name":{"type":"string","description":"按安全策略名称过滤（子串）"},"rule_triggered":{"type":"string","description":"按触发规则过滤（类别：IP 访问控制/地域拦截/WAF 规则（CRS）含全部 6 位规则 ID/自定义规则；也可输细标签（评分拦截/协议异常/协议攻击）或 CRS 规则 ID/消息关键词）"},"rule_triggered_exclude":{"type":"string","description":"按触发规则反向过滤（同 rule_triggered 的类别/细标签/ID，整体取反——筛掉该类型看其余）"},"uri":{"type":"string","description":"按请求 URI 过滤（子串）"},"start_time":{"type":"string","description":"开始时间（配置时区，YYYY-MM-DD[ HH:MM:SS]）"},"end_time":{"type":"string","description":"结束时间（配置时区，YYYY-MM-DD[ HH:MM:SS]）"}},"additionalProperties":false}`
+const securityEventsSchema = `{"type":"object","properties":{"page":{"type":"integer","minimum":1,"maximum":1000,"default":1,"description":"页码；REST 侧超过 1000 会静默钳位（深 OFFSET 保护），更深历史请用筛选条件"},"page_size":{"type":"integer","minimum":1,"maximum":100,"default":20},"action":{"type":"string"},"ip":{"type":"string"},"rule_caddy_id":{"type":"string"},"rule_name":{"type":"string","description":"按负载规则名称过滤（子串）"},"policy_name":{"type":"string","description":"按安全策略名称过滤（子串）"},"rule_triggered":{"type":"string","description":"按触发规则过滤（类别：IP 访问控制/地域拦截/WAF 规则（CRS）含全部 6 位规则 ID/自定义规则；也可输细标签（评分拦截/协议异常/协议攻击）或 CRS 规则 ID/消息关键词）"},"rule_triggered_exclude":{"type":"string","description":"按触发规则反向过滤（同 rule_triggered 的类别/细标签/ID，整体取反——筛掉该类型看其余）"},"uri":{"type":"string","description":"按请求 URI 过滤（子串）"},"start_time":{"type":"string","description":"开始时间（配置时区，YYYY-MM-DD[ HH:MM:SS]）"},"end_time":{"type":"string","description":"结束时间（配置时区，YYYY-MM-DD[ HH:MM:SS]）"}},"additionalProperties":false}`
 const caddyLogsSchema = `{"type":"object","properties":{"type":{"type":"string","enum":["runtime","server","proxy","tls"]}},"additionalProperties":false}`
 const metricsHistorySchema = `{"type":"object","properties":{"rule_id":{"type":"string","description":"可选规则 ID（Caddy ID），省略时返回全局聚合趋势"},"interval":{"type":"string","description":"时间范围（如 1h、24h、7d），默认 1h"}},"additionalProperties":false}`
 
@@ -429,10 +429,11 @@ var updateConfigSchema = strings.NewReplacer(
 	fmt.Sprintf(`"security_events_row_cap":{"type":"integer","minimum":1,"maximum":%[1]d,"description":"安全事件最大行数（1-%[1]d）"}`, db.MaxSecurityEventsRowCap),
 ).Replace(updateConfigSchemaTemplate)
 
-// New 无内部鉴权密钥的装配入口
-// 仅供测试夹具使用——生产装配唯一走 NewWithInternalAuth（网关注入内部
-// 鉴权密钥），生产代码不得改用本入口。
-func New(baseURL string, client *http.Client) http.Handler {
+// NewForTest 无内部鉴权密钥的装配入口，仅供测试夹具使用。
+// 生产装配唯一走 NewWithInternalAuth（网关注入内部鉴权密钥）。名字显式带
+// Test 后缀：旧名 New 看起来像生产入口，无编译期约束阻止误用；缺内部头时
+// 接收端不采信客户端 IP 头（真实兜底仍在），但误接入生产会丢掉审计源 IP。
+func NewForTest(baseURL string, client *http.Client) http.Handler {
 	return NewWithInternalAuth(baseURL, client, "")
 }
 

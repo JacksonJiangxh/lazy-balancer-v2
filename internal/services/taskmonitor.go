@@ -292,7 +292,13 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 			}
 		} else {
 			ti.Status = TaskStatusIdle
-			if latestRun != nil {
+			if m.Running {
+				// 本进程确有在途执行但 task_runs 无 running 行（行插入失败仅
+				// WARN、或 RunSyncQuiet 显式静默轮）：状态列必须反映真实在途，
+				// 否则显示 idle 而「运行」被 IsTaskInFlight 拒为 409，视图与
+				// 真实执行自相矛盾。staleRunning 的前提是 !m.Running，不受影响。
+				ti.Status = TaskStatusRunning
+			} else if latestRun != nil {
 				switch latestRun.Status {
 				case "failed":
 					ti.Status = TaskStatusFailed
@@ -300,7 +306,13 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 					// running 只在引擎确有在途执行时成立：终态 UPDATE 失败会
 					// 把行永久留在 running，此时进程内已无该任务的执行——
 					// 直通会让状态列恒显「运行中」并禁用「运行」按钮。
+					// 但行快照（RunOverview）与内存快照（DescribeAll）是两次
+					// 独立取数：两次快照之间刚完成的轮次会呈现「行 running、
+					// 内存已空闲」的瞬态，立即判 failed 会误报一次失败/中断。
+					// 年龄门只覆盖「刚写入」的行，终态写失败的行一定会变老。
 					if m.Running {
+						ti.Status = TaskStatusRunning
+					} else if startedAt, ok := taskRunWallClockStartedAt(latestRun.StartedAt); ok && time.Since(startedAt) < staleRunningGrace {
 						ti.Status = TaskStatusRunning
 					} else {
 						ti.Status = TaskStatusFailed
@@ -364,6 +376,25 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 	return out
 }
 
+// staleRunningGrace 是「残留 running 行」判定的年龄门：行快照与内存快照
+// 两次独立取数，刚写入的行可能在两次快照之间完成（呈现「行 running、内存
+// 空闲」），立即判失败会在安全运维页面误报一次失败/中断。终态 UPDATE 失败
+// 的残留行一定会变老，短宽限不影响识别；不可解析的时间戳维持旧口径（失败）。
+const staleRunningGrace = 30 * time.Second
+
+// taskRunWallClockStartedAt 解析 task_runs.started_at——引擎按配置时区以
+// 墙面时间串写入（"2006-01-02 15:04:05"），故按 CurrentLocation 解析。
+func taskRunWallClockStartedAt(ts string) (time.Time, bool) {
+	if ts == "" {
+		return time.Time{}, false
+	}
+	t, err := time.ParseInLocation("2006-01-02 15:04:05", ts, CurrentLocation())
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
 func humanInterval(sec int) string {
 	switch {
 	case sec%86400 == 0:
@@ -379,18 +410,6 @@ func humanInterval(sec int) string {
 	default:
 		return fmt.Sprintf("%d 秒", sec)
 	}
-}
-
-// localDisplayUTC 把 DB datetime('now')/crsTimeLayout 的 UTC 时间串转为
-// 配置时区展示（引擎 task_runs 已按配置时区写入——勿二次转换）。
-func localDisplayUTC(ts string) string {
-	if ts == "" {
-		return ts
-	}
-	if t := parseUTCSlot(ts); !t.IsZero() {
-		return t.In(CurrentLocation()).Format("2006-01-02 15:04:05")
-	}
-	return ts
 }
 
 // CertJobRunTimes 把 cert_jobs 行的时间戳映射为执行时间视图（单源）：

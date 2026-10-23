@@ -278,7 +278,7 @@ func buildWafFileRefLockedChecked() (*models.ClusterWafFilesRef, error) {
 	sig, sigErr := wafRefStatSignature()
 	if sigErr == nil {
 		wafFileRefCache.mu.Lock()
-		if wafFileRefCache.valid && wafFileRefCache.sig == sig {
+		if wafFileRefCache.valid && wafFileRefCache.sig == sig && time.Since(wafFileRefCache.validatedAt) < wafFileRefCacheTTL {
 			ref := cloneWafFilesRef(wafFileRefCache.ref)
 			wafFileRefCache.mu.Unlock()
 			return ref, nil
@@ -294,19 +294,28 @@ func buildWafFileRefLockedChecked() (*models.ClusterWafFilesRef, error) {
 		wafFileRefCache.sig = sig
 		wafFileRefCache.ref = cloneWafFilesRef(ref)
 		wafFileRefCache.valid = true
+		wafFileRefCache.validatedAt = time.Now()
 		wafFileRefCache.mu.Unlock()
 	}
 	return ref, nil
 }
 
-// wafFileRefCache 缓存「廉价文件签名 → 已构建引用」。命中条件只有签名相等，
-// 不做额外失效（签名本身由文件系统元数据派生，任何写者落盘都会改变签名）。
+// wafFileRefCache 缓存「廉价文件签名 → 已构建引用」。命中条件=签名相等
+// ∧ 距上次全量构建未超 wafFileRefCacheTTL：签名由 size/mtime/mode 派生，
+// 「等长同 mtime 原地改写」（rsync -t / install -p / 备份还原保留时间戳）
+// 不变签名——单靠签名会让旧 ref 与旧 bundle 无限期命中（主端发旧字节给
+// 从端=静默分叉，或用旧哈希标注新字节=从端整包拒绝且不自愈）。TTL 把该
+// 形态的陈旧窗口收敛到定值内（到期后全量重建读到真实内容）。
 var wafFileRefCache struct {
-	mu    sync.Mutex
-	valid bool
-	sig   string
-	ref   *models.ClusterWafFilesRef
+	mu          sync.Mutex
+	valid       bool
+	sig         string
+	ref         *models.ClusterWafFilesRef
+	validatedAt time.Time
 }
+
+// wafFileRefCacheTTL 是廉价签名缓存的最长复用时间（var 供测试收窄）。
+var wafFileRefCacheTTL = 30 * time.Second
 
 // wafFileRefFullBuilds 仅用于测试钉住「签名未变不重建」（生产零消费）。
 var wafFileRefFullBuilds atomic.Int64
@@ -879,6 +888,12 @@ func writeTarEntries(dir string, tw *tar.Writer) error {
 // 拦截；正常 CRS 树远低于该值，超限必为损坏/篡改包。
 const maxWafSyncExtractFiles = 2000 // 2000 文件数上限
 
+// maxWafSyncExtractDirs 是解包目录条目数上限。tar 目录头固定 512B，64MB
+// 压缩包可携带十余万条目录条目——无门时会在 staging 建出同等数量目录
+// （元数据/inode 写放大）并让失败路径的 RemoveAll 遍历删除；正常 CRS 树目录
+// 数远低于文件数，故取 2× 文件上限。
+const maxWafSyncExtractDirs = 2 * maxWafSyncExtractFiles
+
 // maxWafSyncExtractBytes 256MB 解包字节上限。var 以便测试缩小预算构造
 // 恰好用尽的边界包，生产路径不修改。
 var maxWafSyncExtractBytes int64 = 256 << 20
@@ -903,6 +918,7 @@ func untarGzTo(data []byte, destDir string, expectSum string) error {
 	defer os.RemoveAll(staging)
 	var writtenBytes int64
 	writtenFiles := 0
+	dirEntries := 0
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -910,6 +926,15 @@ func untarGzTo(data []byte, destDir string, expectSum string) error {
 		}
 		if err != nil {
 			return err
+		}
+		// 目录条目在路径归一之前计数：带 "/" 结尾的名字会被下方 continue
+		// 跳过（父目录由文件的 MkdirAll 创建），但恶意包仍可用不带 "/" 的
+		// TypeDir 条目触发逐条 MkdirAll——写放大必须在落盘前拦截。
+		if hdr.Typeflag == tar.TypeDir {
+			dirEntries++
+			if dirEntries > maxWafSyncExtractDirs {
+				return fmt.Errorf("同步规则集目录条目数超过上限（%d 个），已拒绝落盘", maxWafSyncExtractDirs)
+			}
 		}
 		rel := filepath.ToSlash(hdr.Name)
 		if filepath.IsAbs(rel) || strings.HasPrefix(rel, "../") || strings.Contains(rel, "/../") || rel == ".." {

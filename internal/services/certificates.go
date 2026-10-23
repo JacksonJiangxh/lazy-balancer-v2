@@ -349,11 +349,6 @@ func loadCertJobStatesTx(ctx context.Context, tx *sql.Tx, ruleID string) ([]cert
 	return states, nil
 }
 
-// certJobStateAdvancedSinceSnapshot 判定当前行是否承载了快照之后才产生的签发/
-// 部署成果：证书材料与快照不同（新签发/续期写入了新 PEM），或材料
-// 相同但已推进到 issued（快照后完成了部署提交）。命中即不回滚该行——否则刚完成
-// 的续期/部署会被旧快照抹掉，磁盘/Caddy 与 DB 分叉。无材料的行恒不视为推进：
-// 状态/重试次数的变化正是本函数要修的 UPSERT 覆写形态。
 // certJobRowPreservedOnRestore 判定当前行是否必须在恢复中保留（不回滚）：
 // ①行级 epoch（快照后完成签发/部署）；②规则已退出「启用 ACME」且当前行是
 // disabled——禁用/改来源写点发生在快照之后，恢复成快照状态会让已禁用规则的
@@ -366,6 +361,11 @@ func certJobRowPreservedOnRestore(current certJobState, snapshot certJobSnapshot
 	return !ruleACMEActive && current.status == "disabled"
 }
 
+// certJobStateAdvancedSinceSnapshot 判定当前行是否承载了快照之后才产生的签发/
+// 部署成果：证书材料与快照不同（新签发/续期写入了新 PEM），或材料
+// 相同但已推进到 issued（快照后完成了部署提交）。命中即不回滚该行——否则刚完成
+// 的续期/部署会被旧快照抹掉，磁盘/Caddy 与 DB 分叉。无材料的行恒不视为推进：
+// 状态/重试次数的变化正是本函数要修的 UPSERT 覆写形态。
 func certJobStateAdvancedSinceSnapshot(current certJobState, snapshot certJobSnapshot) bool {
 	currentCert := strings.TrimSpace(current.certPEM)
 	currentKey := strings.TrimSpace(current.keyPEM)
@@ -751,6 +751,11 @@ func (s *CertificateService) scheduleDeploymentRetry(jobID int, ruleID string, d
 					delete(s.deploymentCallbacks, jobID)
 				}
 				s.timerMu.Unlock()
+				// 一次性重试正常结束后必须自行 cancel：子 ctx 挂在 s.ctx 的
+				// children 表上直到父 ctx 取消，持续部署失败的任务每 30 分钟
+				// 重试一次会无界累积（服务停止才释放）。与 caQueue.execute 的
+				// defer cancel 同口径。
+				entry.cancel()
 				close(entry.done)
 			}()
 			if stopping {
@@ -1183,6 +1188,60 @@ func certReconcileWriteGate(ctx context.Context) error {
 	return nil
 }
 
+// backfillIssuedCertExpiry 一次性回填「issued + 材料在库 + expires_at IS NULL」
+// 行的到期时间（PEM 派生）。集群聚合端以 expires_at 为门，同证两套到期口径会
+// 让已签发证书被误报为缺失/临期。幂等：只碰 NULL 行，写前复核角色。
+func backfillIssuedCertExpiry(ctx context.Context) (int, error) {
+	rows, err := db.DB.QueryContext(ctx, `SELECT id, COALESCE(cert_pem,'') FROM cert_jobs
+		WHERE status='issued' AND expires_at IS NULL AND `+CertJobMaterialPredicateSQL(""))
+	if err != nil {
+		return 0, fmt.Errorf("查询待回填到期时间的证书任务: %w", err)
+	}
+	type pendingBackfill struct {
+		id       int
+		notAfter time.Time
+	}
+	var updates []pendingBackfill
+	for rows.Next() {
+		var id int
+		var certPEM string
+		if err := rows.Scan(&id, &certPEM); err != nil {
+			_ = rows.Close()
+			return 0, fmt.Errorf("读取待回填到期时间的证书任务: %w", err)
+		}
+		notAfter, ok := CertNotAfterFromPEM(certPEM)
+		if !ok {
+			Logf("warn", "证书任务 %d：expires_at 缺失且 PEM 无法解析，跳过到期回填", id)
+			continue
+		}
+		updates = append(updates, pendingBackfill{id: id, notAfter: notAfter})
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, fmt.Errorf("遍历待回填到期时间的证书任务: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, fmt.Errorf("关闭待回填到期时间的证书任务结果: %w", err)
+	}
+	if len(updates) == 0 {
+		return 0, nil
+	}
+	if gateErr := certReconcileWriteGate(ctx); gateErr != nil {
+		return 0, gateErr
+	}
+	filled := 0
+	for _, update := range updates {
+		result, err := db.DB.Exec(`UPDATE cert_jobs SET expires_at=? WHERE id=? AND status='issued' AND expires_at IS NULL`, update.notAfter, update.id)
+		if err != nil {
+			return filled, fmt.Errorf("回填证书任务 %d 的到期时间: %w", update.id, err)
+		}
+		if affected, affectedErr := result.RowsAffected(); affectedErr == nil && affected > 0 {
+			filled++
+		}
+	}
+	return filled, nil
+}
+
 // CertReconcileOnce 状态对账（缺失证书文件/孤儿任务清理/缺失任务补建）。
 // 对账读失败必须上抛（Run 返回 error → task_runs 失败终态），且失败轮
 // 摘要不得写「完成」——此前查询失败只 Logf + 摘要仍报「状态对账完成 0」，
@@ -1192,6 +1251,7 @@ func certReconcileWriteGate(ctx context.Context) error {
 // 写前经 certReconcileWriteGate 复核——长轮次内节点降级不得继续写库。
 func CertReconcileOnce(ctx context.Context) error {
 	rebuilt, reconcileErr := reconcileMissingCertFiles(ctx, db.DB)
+	filledExpiry, expiryErr := backfillIssuedCertExpiry(ctx)
 	swept, sweepErr := sweepOrphanedCertJobs(ctx)
 	// 兜底：6h 对账同时补建「启用 ACME 但无任务行」的规则——覆盖
 	// 提升窗口之外的行丢失（快照整树替换后残留的中间态）。
@@ -1199,7 +1259,7 @@ func CertReconcileOnce(ctx context.Context) error {
 	if backfillErr != nil {
 		Logf("warn", "证书任务对账补建失败: %v", backfillErr)
 	}
-	if err := errors.Join(reconcileErr, sweepErr, backfillErr); err != nil {
+	if err := errors.Join(reconcileErr, expiryErr, sweepErr, backfillErr); err != nil {
 		// 降级跳过/调度取消不是故障——但轮次未完成，摘要必须如实说明
 		// 中止而非「完成」（部分计数不可信）。ctx 已取消同样按中止：
 		// 驱动层可能返回自己的取消包装错误（errors.Is 不可达）。
@@ -1207,13 +1267,13 @@ func CertReconcileOnce(ctx context.Context) error {
 			errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
 			(ctx != nil && ctx.Err() != nil)
 		if aborted {
-			TaskLogf("cert-reconcile", "skipped", "状态对账中止：%v（已收敛 %d 个断链、%d 个孤儿、%d 个补建——均为部分计数，恢复后下一周期重做）", err, rebuilt, swept, created)
+			TaskLogf("cert-reconcile", "skipped", "状态对账中止：%v（已收敛 %d 个断链、%d 个到期回填、%d 个孤儿、%d 个补建——均为部分计数，恢复后下一周期重做）", err, rebuilt, filledExpiry, swept, created)
 			return err
 		}
-		TaskLogf("cert-reconcile", "reconcile", "状态对账失败：%v（失败轮结果不可信，下一周期重试；已收敛 %d 个断链、%d 个孤儿——均为部分计数）", err, rebuilt, swept)
+		TaskLogf("cert-reconcile", "reconcile", "状态对账失败：%v（失败轮结果不可信，下一周期重试；已收敛 %d 个断链、%d 个到期回填、%d 个孤儿——均为部分计数）", err, rebuilt, filledExpiry, swept)
 		return err
 	}
-	TaskLogf("cert-reconcile", "reconcile", "状态对账完成：断链重建 %d 个、孤儿清理 %d 个、任务补建 %d 个（一致时为 0）", rebuilt, swept, created)
+	TaskLogf("cert-reconcile", "reconcile", "状态对账完成：断链重建 %d 个、到期回填 %d 个、孤儿清理 %d 个、任务补建 %d 个（一致时为 0）", rebuilt, filledExpiry, swept, created)
 	return nil
 }
 
@@ -2120,12 +2180,9 @@ var manualCertExpiryCheckMu sync.Mutex
 // 依赖队列/服务实例，停止「证书签发」调度不应让 10 分钟一次的巡检失去去重。
 var manualCertExpiryFallbackGate = newManualCertExpiryAlertGate()
 
-func (s *CertificateService) checkManualCertExpiration() error {
-	return runManualCertExpiryCheck(s.expiryAlertGate)
-}
-
 // runManualCertExpiryCheck 是手动证书到期巡检的包级实现：只读 lb_rules 的
-// 手动证书并用告警门去重，与 CA 队列/证书服务实例无关。
+// 手动证书并用告警门去重，与 CA 队列/证书服务实例无关。生产入口是
+// CertManualCheckOnce；实例方法形态仅存在于测试夹具（certificates_test.go）。
 func runManualCertExpiryCheck(gate *manualCertExpiryAlertGate) error {
 	manualCertExpiryCheckMu.Lock()
 	defer manualCertExpiryCheckMu.Unlock()
@@ -2181,6 +2238,10 @@ func runManualCertExpiryCheck(gate *manualCertExpiryAlertGate) error {
 
 	now := time.Now()
 	var expiredCount, expiringSoonCount, parseFailCount int
+	// alerted 表示本轮有告警真正越过去重门（首次/加深）——任务日志摘要必须与
+	// 应用日志同门：异常持续期每 10 分钟一轮的重复摘要会把同任务的事件行挤掉
+	// （任务日志只保留 5 代），而告警本身已按日去重。
+	alerted := false
 
 	// （读取失败不静默）+ （非正回退）收敛于既有 helper；
 	// 告警级别随 helper 统一为 error（原内联 warn 级漂移）。
@@ -2208,12 +2269,14 @@ func runManualCertExpiryCheck(gate *manualCertExpiryAlertGate) error {
 			// 同一证书同日同档只告一次(10min 扫描周期去重);
 			// 计数不受门禁影响,汇总如实反映当前状态。
 			if gate.shouldAlert(c.caddyID, manualCertExpiryLevelExpired, now) {
+				alerted = true
 				Logf("error", "⚠️ 问题: TLS certificate expired for rule '%s' (domain: %s, caddy_id: %s). Expired on %s",
 					c.name, c.domain, c.caddyID, cert.NotAfter.Format("2006-01-02"))
 			}
 			expiredCount++
 		case "expiring":
 			if gate.shouldAlert(c.caddyID, manualCertExpiryLevelExpiringSoon, now) {
+				alerted = true
 				Logf("warn", "cert expiration check: TLS certificate expiring soon for rule '%s' (domain: %s, caddy_id: %s). Expires in %d days (%s)",
 					c.name, c.domain, c.caddyID, daysUntilExpiry, cert.NotAfter.Format("2006-01-02"))
 			}
@@ -2227,11 +2290,11 @@ func runManualCertExpiryCheck(gate *manualCertExpiryAlertGate) error {
 	if parseFailCount > 0 {
 		skippedNote = fmt.Sprintf("（另 %d 行解析失败已跳过）", parseFailCount)
 	}
-	if expiredCount > 0 || expiringSoonCount > 0 {
+	if (expiredCount > 0 || expiringSoonCount > 0) && alerted {
 		Logf("info", "TLS Certificate Check: %d expired, %d expiring within %d days", expiredCount, expiringSoonCount, warnDays)
-		// SPEC §6.5：业务结论镜像到任务日志。收敛
-		// 仅异常轮（过期或临期>0）记行，全正常轮零日志（原「无过期无临期」
-		// 摘要行删除——「日志只记真实执行」延伸）。
+		// SPEC §6.5：业务结论镜像到任务日志。收敛与告警同一去重门——异常
+		// 持续期只在首次/加深轮留一行，全正常轮与重复轮零日志（原「每 10
+		// 分钟一条摘要」会把任务日志真正的事件行挤掉）。
 		TaskLogf("cert-manual-poll", "check", "手动证书到期检查：%d 张已过期、%d 张临期（阈值 %d 天）%s", expiredCount, expiringSoonCount, warnDays, skippedNote)
 	} else if parseFailCount > 0 {
 		// 纯解析失败轮同属异常轮（证书到期状态未判读），必须留一行而非静默。
@@ -2250,8 +2313,9 @@ const certRenewalGuaranteedGrace = 7 * 24 * time.Hour
 // 窗口 ≥ 寿命意味着证书一签发出来就落进续签窗口：唯一的去抖门（选中证书
 // NotAfter 晚于 now+days）在成功签发后恒假，每次扫描都重新入队，形成每轮
 // 重签循环；CA 侧重复证书限流后任务落 failed（只能手动重试），约一个寿命周期
-// 后证书到期、TLS 中断。写侧上界 0-90 与 90 天证书寿命重合是常态，故防线放在
-// 扫描侧（不改写侧 API 契约）。剩余 ≤ 保护区时放行续签。
+// 后证书到期、TLS 中断。写侧/导入已收敛到安全上限（CertRenewalDaysMax），但
+// CA 实际签发的寿命可能短于 90 天规划值（CA 策略变更/自定义 CA），扫描侧仍以
+// 证书真实寿命做纵深防线。剩余 ≤ 保护区时放行续签。
 func certRenewalWindowCoversLifetime(window time.Duration, leaf *x509.Certificate, now time.Time) bool {
 	if leaf == nil || window <= 0 {
 		return false
@@ -2312,7 +2376,8 @@ const certRenewalMinInterval = 24 * time.Hour
 // 间隔退化到小时级，每轮扫描都入队 → 每日甚至亚日级完整重签，命中 CA 重复
 // 证书限流后落 waiting_ca/failed，约一个寿命周期后证书到期中断。因此要求
 // 「距上次签发 ≥ max(24h, L−W)」。剩余 ≤ 保护区（7 天）一律放行，避免配置
-// 越界演变成到期中断。
+// 越界演变成到期中断。issuedAt 为证书自身的 NotBefore（签发时刻的权威来源），
+// 不得用任务行的 updated_at 代理——任何簿记写都会把它推到「现在」。
 func certRenewalHysteresisActive(window time.Duration, leaf *x509.Certificate, issuedAt, now time.Time) bool {
 	if leaf == nil || issuedAt.IsZero() {
 		return false
@@ -2329,17 +2394,6 @@ func certRenewalHysteresisActive(window time.Duration, leaf *x509.Certificate, i
 		interval = certRenewalMinInterval
 	}
 	return now.Sub(issuedAt) < interval
-}
-
-// julianDayToTime 把 SQLite julianday 值（CertificateCandidate.UpdatedAt 的
-// 原始形态）转成 UTC 时间；0/非正值=未知（返回零值，调用方按无迟滞处理）。
-func julianDayToTime(jd float64) time.Time {
-	if jd <= 0 {
-		return time.Time{}
-	}
-	const unixEpochJulianDay = 2440587.5 // 1970-01-01T00:00:00Z
-	seconds := (jd - unixEpochJulianDay) * 86400
-	return time.Unix(0, int64(seconds*float64(time.Second))).UTC()
 }
 
 // warnRenewalHysteresis 限频留痕：迟滞跳过不是静默行为——运维需要知道「配置
@@ -2416,7 +2470,10 @@ func scanRenewalCandidates(rows *sql.Rows, days int, warnPrefix string) (jobs []
 				}
 				// 成功侧迟滞：窗口接近寿命时间隔 L−W 会退化到小时级，须以
 				// max(24h, L−W) 兜住（见 certRenewalHysteresisActive）。
-				if certRenewalHysteresisActive(window, selection.Certificate, julianDayToTime(selection.Candidate.UpdatedAt), now) {
+				// 「上次签发时刻」取证书自身 NotBefore，不用 cert_jobs.updated_at
+				// 代理——后者被导入/集群应用/任何簿记写推进，会把续签推迟到
+				// 保护区边缘；证书有效期起点就是签发时刻（CA 可能小幅回拨）。
+				if certRenewalHysteresisActive(window, selection.Certificate, selection.Certificate.NotBefore, now) {
 					warnRenewalHysteresis(j.RuleID, days, selection.Certificate, now)
 					continue
 				}

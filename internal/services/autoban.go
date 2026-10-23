@@ -248,6 +248,13 @@ func SetAutobanConfig(cfg AutobanConfig) error {
 	}
 	if prev.WindowMinutes != cfg.WindowMinutes || prev.Scope != cfg.Scope {
 		ResetAutobanCounters()
+	} else if prev.Threshold != cfg.Threshold {
+		// 阈值变更保留计数桶（窗口内证据不丢），但 Reached 是按「feed 当时的
+		// 阈值」单向置真的读口径——不重算会让 /status「达阈值 M 个」与过期
+		// 摘要滞后到下一个窗口：调低阈值后已达标 IP 仍不计入（用户误以为
+		// 调低无效），调高则短期多报。封禁候选评估本就用实时
+		// Count>=threshold，不受该标记影响。
+		autobanRecomputeReached(cfg.Threshold)
 	}
 	if !cfg.Enabled {
 		AutobanDisableFlush()
@@ -1331,6 +1338,17 @@ func autobanTrackedCount() int {
 	autobanMu.Lock()
 	defer autobanMu.Unlock()
 	return len(autobanWindows)
+}
+
+// autobanRecomputeReached 按当前阈值重算全部计数桶的达标标记（阈值变更时
+// 调用；O(键数)，10 万键上限下为毫秒级）。Reached 只服务展示/过期摘要，
+// 封禁判定用实时 Count>=threshold。
+func autobanRecomputeReached(threshold int) {
+	autobanMu.Lock()
+	for _, w := range autobanWindows {
+		w.Reached = threshold > 0 && w.Count >= threshold
+	}
+	autobanMu.Unlock()
 }
 
 // autobanReachedCount 当前窗口内已达到过封禁阈值的 IP 数（每轮摘要行

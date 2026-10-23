@@ -16,7 +16,7 @@ import (
 
 func TestBlockPageContentType_normalizesNonWhitelist(t *testing.T) {
 	// Given：白名单四型原样保留
-	for _, ok := range models.BlockPageContentTypes {
+	for _, ok := range models.BlockPageContentTypeWhitelist() {
 		if got := blockPageContentType(ok); got != ok {
 			t.Fatalf("合法 content_type=%q 被改为 %q, want 原样保留", ok, got)
 		}

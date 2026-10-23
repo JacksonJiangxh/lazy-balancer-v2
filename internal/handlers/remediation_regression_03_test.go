@@ -1,6 +1,7 @@
 package handlers
 
-// block_page_id=0，与 stage2 可配拦截页口径（2026-09-25 用户裁定）不一致
+// 契约：stage2 子策略拆分时必须继承原策略的可配拦截页（block_page_id=0
+// 与 stage2 可配拦截页口径（2026-09-25 用户裁定）不一致
 // ——G0+G2 组合 mixed 拆分时限流页丢失。修复后 stage2 子策略继承原策略
 // block_page_id（block_status_code 保持归一 0，阶段 2 恒 429 自动语义）。
 

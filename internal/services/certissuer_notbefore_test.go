@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"database/sql"
 	"encoding/pem"
 	"math/big"
 	"testing"
@@ -186,7 +187,10 @@ func TestCertIssuer_Issue_fastPathFutureNotBeforeRegistersDelayedReload(t *testi
 			notAfter := notBefore.Add(90 * 24 * time.Hour)
 			certPEM := testCertificatePEMWithWindow(t, notBefore, notAfter)
 			const keyPEM = "key-pem"
-			if _, err := db.DB.Exec("UPDATE cert_jobs SET cert_pem=?, key_pem=?, expires_at=? WHERE id=?", certPEM, keyPEM, notAfter, jobID); err != nil {
+			// expires_at 留 NULL：快速重部署的两个成功出口都必须按材料回填，
+			// 否则同一张证在任务行是「无到期」，聚合端（cluster_report 以
+			// expires_at 为门）与续期扫描两套口径分叉。
+			if _, err := db.DB.Exec("UPDATE cert_jobs SET cert_pem=?, key_pem=?, expires_at=NULL WHERE id=?", certPEM, keyPEM, jobID); err != nil {
 				t.Fatalf("seed job material: %v", err)
 			}
 			if tc.predeploy {
@@ -218,6 +222,14 @@ func TestCertIssuer_Issue_fastPathFutureNotBeforeRegistersDelayedReload(t *testi
 				}
 			case <-time.After(2 * time.Second):
 				t.Fatal("快速重部署成功出口未登记生效后延迟重载")
+			}
+			// And：expires_at 已按材料回填（与 NotAfter 一致，秒级误差内）。
+			var expiresAt sql.NullTime
+			if err := db.DB.QueryRow("SELECT expires_at FROM cert_jobs WHERE id=?", jobID).Scan(&expiresAt); err != nil {
+				t.Fatalf("read backfilled expires_at: %v", err)
+			}
+			if !expiresAt.Valid || expiresAt.Time.Sub(notAfter).Abs() > time.Minute {
+				t.Fatalf("expires_at=%v valid=%v, want ≈%v（快速路径必须回填）", expiresAt.Time, expiresAt.Valid, notAfter)
 			}
 		})
 	}

@@ -605,9 +605,9 @@ const resetPassword = async (id: number) => {
   if ((isReadOnly.value && !isSelfReset) || submittingUserId.value === id || operatingUserIds.value.has(id) || switchingIds.value.has(id)) return
   operatingUserIds.value.add(id)
   const isSelf = id === authStore.user?.id
-  // 2026-09-19 用户裁定:重置密码为管理员专属(经用户管理端点重置任意用户含
-  // 本人,不验当前密码——重置语义);非管理员的密码修改只走右上角个人资料
-  // 弹框(AppLayout,当前密码确认),本页对其只读。
+  // 2026-09-19 用户裁定:重置密码语义经用户管理端点重置(不验当前密码,重置后
+  // 吊销全部会话);权限=adminOrSelf——管理员可重置任意用户,非管理员仅本人
+  // (其他行的重置入口已按 isSelfRow && !isAdmin 隐藏)。
   try {
     let newPassword = ''
     const username = users.value.find((u) => u.id === id)?.username ?? ''

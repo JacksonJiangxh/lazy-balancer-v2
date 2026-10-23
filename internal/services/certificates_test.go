@@ -33,6 +33,139 @@ func resetCertificateServiceForTest(t *testing.T) {
 	})
 }
 
+// Given 一张 20 天后过期的手动证书（异常持续期）与同一告警门。
+// When 连续两轮手动证书巡检。
+// Then 任务日志只留一条摘要行（与按日去重门同源），不把同任务的事件行挤掉。
+func TestRunManualCertExpiryCheck_taskLogSummaryDeduped(t *testing.T) {
+	_, database := newClusterTestService(t)
+	newTaskLogDir(t)
+	certPEM, _ := expiredShapeCertAndKey(t, "manual-dedupe.test", time.Now().Add(20*24*time.Hour))
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source,tls_cert)
+		VALUES ('lb_manual_dedupe','manual-dedupe','manual-dedupe.test','http',8080,1,1,'manual',?)`, certPEM); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec("UPDATE global_config SET cert_expiry_days=30 WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	gate := newManualCertExpiryAlertGate()
+	for round := range 2 {
+		if err := runManualCertExpiryCheck(gate); err != nil {
+			t.Fatalf("round %d: %v", round, err)
+		}
+	}
+	logContent := readTaskLog(t, "cert-manual-poll")
+	if got := strings.Count(logContent, "手动证书到期检查"); got != 1 {
+		t.Fatalf("摘要行出现 %d 次, want 1（重复轮必须与告警去重门同源）:\n%s", got, logContent)
+	}
+}
+
+// Given issued 任务材料在库但 expires_at 缺失（历史/导入遗留）。
+// When 6h 对账的到期回填执行。
+// Then 按 PEM 派生回填 NotAfter，且幂等（第二轮回填 0 条）。
+func TestBackfillIssuedCertExpiry_fillsMissingExpiry(t *testing.T) {
+	_, database := newClusterTestService(t)
+	notAfter := time.Now().Add(60 * 24 * time.Hour).UTC().Truncate(time.Second)
+	certPEM, keyPEM := expiredShapeCertAndKey(t, "backfill.test", notAfter)
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source)
+		VALUES ('lb_backfill_expiry','backfill','backfill.test','http',8443,1,1,'acme_dns')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,cert_pem,key_pem,expires_at,updated_at)
+		VALUES ('lb_backfill_expiry','backfill.test','issued',?,?,NULL,datetime('now','-2 days'))`, certPEM, keyPEM); err != nil {
+		t.Fatal(err)
+	}
+
+	filled, err := backfillIssuedCertExpiry(context.Background())
+	if err != nil {
+		t.Fatalf("backfill: %v", err)
+	}
+	if filled != 1 {
+		t.Fatalf("filled=%d, want 1", filled)
+	}
+	var expiresAt sql.NullTime
+	if err := database.QueryRow("SELECT expires_at FROM cert_jobs WHERE rule_id='lb_backfill_expiry'").Scan(&expiresAt); err != nil {
+		t.Fatal(err)
+	}
+	if !expiresAt.Valid || expiresAt.Time.Sub(notAfter).Abs() > time.Minute {
+		t.Fatalf("expires_at=%v valid=%v, want ≈%v（PEM 派生回填）", expiresAt.Time, expiresAt.Valid, notAfter)
+	}
+
+	filled, err = backfillIssuedCertExpiry(context.Background())
+	if err != nil {
+		t.Fatalf("second backfill: %v", err)
+	}
+	if filled != 0 {
+		t.Fatalf("second filled=%d, want 0（幂等：只碰 NULL 行）", filled)
+	}
+}
+
+// checkManualCertExpiration 是测试夹具（生产入口为 CertManualCheckOnce →
+// runManualCertExpiryCheck）：保留实例方法形态，让用例能断言实例的
+// expiryAlertGate 参与去重。生产代码不得调用。
+func (s *CertificateService) checkManualCertExpiration() error {
+	return runManualCertExpiryCheck(s.expiryAlertGate)
+}
+
+// Given 一次性部署重试正常执行完毕。
+// When 回调收尾。
+// Then 该登记的子 context 必须已取消（否则每 30 分钟一次的重试会让
+// s.ctx.children 无界累积到服务停止）。
+func TestCertificateService_deploymentRetryCallbackCancelsChildContext(t *testing.T) {
+	service := NewCertificateService()
+	resetCertificateServiceForTest(t)
+	t.Cleanup(service.pauseDeploymentRetries)
+	ctxCh := make(chan context.Context, 1)
+	service.retryDeployment = func(ctx context.Context, _ int) error {
+		ctxCh <- ctx
+		return nil
+	}
+	if err := service.scheduleDeploymentRetry(7, "lb_ctx", 0); err != nil {
+		t.Fatalf("schedule deployment retry: %v", err)
+	}
+	var callbackCtx context.Context
+	select {
+	case callbackCtx = <-ctxCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("部署回调未执行")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for callbackCtx.Err() == nil && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if callbackCtx.Err() == nil {
+		t.Fatal("部署回调结束后子 context 未取消（父 ctx children 将持续累积）")
+	}
+}
+
+// Given 规则处于补偿屏障（BlockJobsForRule 租约期内）。
+// When 手动「立即部署」（RetryCertificateDeploymentNow）。
+// Then 与包级入口/补扫同判据：拒绝登记并返回 ErrCertificateDeploymentRetryBlocked，
+// 不创建 timer（屏障期不调度）。
+func TestRetryCertificateDeploymentNow_respectsRuleBarrier(t *testing.T) {
+	newClusterTestService(t)
+	service := NewCertificateService()
+	resetCertificateServiceForTest(t)
+	t.Cleanup(service.pauseDeploymentRetries)
+	ResetCAQueueManagerForTest()
+	t.Cleanup(ResetCAQueueManagerForTest)
+	InitCAQueueManager(func() error { return nil }, t.TempDir())
+	manager := GetCAQueueManager()
+	manager.Start()
+	token := manager.BlockJobsForRule("lb_barrier")
+	t.Cleanup(func() { manager.UnblockJobsForRule("lb_barrier", token) })
+
+	err := RetryCertificateDeploymentNow(7, "lb_barrier")
+	if !errors.Is(err, ErrCertificateDeploymentRetryBlocked) {
+		t.Fatalf("err=%v, want ErrCertificateDeploymentRetryBlocked（屏障期不得登记部署）", err)
+	}
+	service.timerMu.Lock()
+	_, hasTimer := service.deploymentTimers[7]
+	service.timerMu.Unlock()
+	if hasTimer {
+		t.Fatal("屏障期不得为手动部署创建 timer")
+	}
+}
+
 func TestCanonicalACMEDomains_rejectsTrailingDot(t *testing.T) {
 	// The audit's trailing-dot example is not a valid alternate canonical form:
 	// the single-source helper rejects it just like the SQL revival gate does.

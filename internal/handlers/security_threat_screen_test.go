@@ -2345,3 +2345,91 @@ func TestGetSecurityThreatScreen_degradedTopTargetsShape(t *testing.T) {
 		t.Fatalf("零值面板 top_targets 长度=%d, want 0", len(targets))
 	}
 }
+
+// 改判（logged→blocked）是对原始行原地 UPDATE：事件 id 不变。回退钩子若只回退
+// 覆盖水位而保留分钟事件高水位键，增量重固只重扫 id > previousMaxID —— 该分钟
+// 被判成「无新增」早退，rollup 的 action 维度永久停在改判前的 logged（大屏拦截
+// 数少计、与事件列表自相矛盾）。回退必须同批删除回退区间的高水位键，让下一次
+// 固化走全量重建。
+func TestThreatRollup_rewindDropsMinuteHighwaterForInPlaceUpgrade(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	m := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	minute := m.Format("2006-01-02 15:04")
+	seedThreatScreenEvent(t, m.Add(5*time.Second).Format("2006-01-02 15:04:05"),
+		"93.184.216.7", "942100", "SQL Injection", "logged")
+
+	fixMinute := func() {
+		t.Helper()
+		tx, err := db.MetricsDB.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := threatFixMinuteWithMode(tx, m, false); err != nil {
+			_ = tx.Rollback()
+			t.Fatalf("fix minute: %v", err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rollupActions := func() map[string]int {
+		t.Helper()
+		rows, err := db.MetricsDB.Query(`SELECT action, SUM(count) FROM security_event_rollup WHERE minute=? GROUP BY action`, minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		out := map[string]int{}
+		for rows.Next() {
+			var action string
+			var count int
+			if err := rows.Scan(&action, &count); err != nil {
+				t.Fatal(err)
+			}
+			out[action] = count
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	highwaterRows := func() int {
+		t.Helper()
+		var count int
+		database := db.MetricsDB
+		if err := database.QueryRow(`SELECT COUNT(*) FROM metrics_state WHERE key=?`,
+			services.ThreatRollupEventHighwaterPrefix+minute).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		return count
+	}
+
+	// Given 该分钟已按 logged 固化（首固=全量重建 → 写入事件高水位）。
+	fixMinute()
+	if got := rollupActions(); got["logged"] != 1 || got["blocked"] != 0 {
+		t.Fatalf("首固 rollup=%v, want logged=1", got)
+	}
+	if highwaterRows() != 1 {
+		t.Fatal("首固必须先落分钟事件高水位（增量重固的前提）")
+	}
+	// 且覆盖水位已推进到该分钟（回退钩子的「lastFixed > target」前提）。
+	if _, err := db.MetricsDB.Exec(`INSERT INTO metrics_state (key, value) VALUES (?, ?)
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value`, threatRollupWatermarkKey, minute); err != nil {
+		t.Fatal(err)
+	}
+
+	// When 同一请求在后续 pass 被改判为拦截（行原地更新，id 不变）后回退水位。
+	if _, err := db.MetricsDB.Exec(`UPDATE security_events SET action='blocked', rule_triggered='949110', rule_msg='Inbound Anomaly Score Exceeded' WHERE client_ip='93.184.216.7'`); err != nil {
+		t.Fatal(err)
+	}
+	ThreatRollupRewindTo(m)
+
+	// Then 分钟事件高水位被删除 → 下一次固化全量重建，action 维度跟随改判。
+	if highwaterRows() != 0 {
+		t.Fatal("回退必须删除回退区间的分钟事件高水位（否则增量重固看不到原地改判的行）")
+	}
+	fixMinute()
+	if got := rollupActions(); got["blocked"] != 1 || got["logged"] != 0 {
+		t.Fatalf("改判后 rollup=%v, want blocked=1（永久停在 logged = 大屏与事件列表矛盾）", got)
+	}
+}

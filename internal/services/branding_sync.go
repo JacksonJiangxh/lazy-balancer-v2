@@ -47,8 +47,17 @@ func RefreshBrandingMirrorDB(database *sql.DB, dataDir string) (changed bool, er
 		if content != "" {
 			var object map[string]any
 			if err := json.Unmarshal([]byte(content), &object); err != nil || object == nil {
-				Logf("warn", "品牌配置文件不是有效对象(半截写?),跳过镜像: %s", dataDir)
+				// 该函数在每个从节点的每次 Pull（默认 60s）都会执行：主节点
+				// 品牌文件处于半截写/损坏态期间，N 个从节点会产生 N 条/分钟
+				// 同一条 warn，淹没取证面。按状态转换限频（首报 warn、恢复
+				// 一条 info、持续损坏静默），与同包坏快照行/节点健康解析同族。
+				if level := logStateTransition("cluster-branding-mirror-invalid", true); level != "" {
+					Logf(level, "品牌配置文件不是有效对象(半截写?),跳过镜像: %s", dataDir)
+				}
 				return false, nil
+			}
+			if level := logStateTransition("cluster-branding-mirror-invalid", false); level != "" {
+				Logf(level, "品牌配置文件已恢复为有效对象，继续镜像: %s", dataDir)
 			}
 		}
 	} else if !os.IsNotExist(rerr) {

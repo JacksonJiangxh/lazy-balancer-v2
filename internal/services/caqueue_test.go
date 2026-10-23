@@ -201,7 +201,7 @@ func TestCAQueueManager_CancelJob_cancels_enqueue_admitted_during_cancel(t *test
 	}
 	enqueueDone := make(chan error, 1)
 	go func() {
-		enqueueDone <- manager.Enqueue(1, 42, "lb_cancel_race", "example.com")
+		enqueueDone <- manager.EnqueueForTest(1, 42, "lb_cancel_race", "example.com")
 	}()
 	<-entered
 	cancelDone := make(chan struct{})
@@ -564,7 +564,7 @@ func TestCAQueueManager_Stop_waits_for_in_progress_enqueue(t *testing.T) {
 	}
 	enqueueDone := make(chan error, 1)
 	go func() {
-		enqueueDone <- manager.Enqueue(1, 42, "lb_enqueue_stop", "example.com")
+		enqueueDone <- manager.EnqueueForTest(1, 42, "lb_enqueue_stop", "example.com")
 	}()
 	<-entered
 	stopDone := make(chan struct{})
@@ -723,11 +723,11 @@ func TestCAQueueManager_PauseAndDrain_rejects_until_resume(t *testing.T) {
 
 	// Then
 	<-finished
-	if err := manager.Enqueue(1, 43, "lb_paused", "paused.example.com"); err == nil {
+	if err := manager.EnqueueForTest(1, 43, "lb_paused", "paused.example.com"); err == nil {
 		t.Fatal("enqueue succeeded while manager was paused")
 	}
 	manager.Resume()
-	if err := manager.Enqueue(1, 43, "lb_paused", "paused.example.com"); err != nil {
+	if err := manager.EnqueueForTest(1, 43, "lb_paused", "paused.example.com"); err != nil {
 		t.Fatalf("enqueue after resume: %v", err)
 	}
 	manager.Stop()
@@ -747,7 +747,7 @@ func TestCAQueueManager_Enqueue_has_no_database_side_effects_when_paused(t *test
 	manager := &CAQueueManager{queues: make(map[int]*caQueue), active: false}
 
 	// When
-	err = manager.Enqueue(999, int(jobID), "lb_paused_enqueue", "example.com")
+	err = manager.EnqueueForTest(999, int(jobID), "lb_paused_enqueue", "example.com")
 
 	// Then
 	if err == nil {

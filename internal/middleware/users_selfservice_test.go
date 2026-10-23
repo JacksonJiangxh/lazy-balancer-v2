@@ -141,9 +141,8 @@ func TestAdminOrSelfParam_stringUserIDForm(t *testing.T) {
 }
 
 // 夹具自检：db.Close 内部会 SetDB(nil)，夹具只还原包级变量会让
-// db.GetDB()（mfaStepUpGuard 消费）与 db.DB（readonly/cluster_version 守卫
-// 装配期捕获）分叉——复位序列必须显式 SetDB 回填（单源
-// restoreTestDBHandles）。
+// db.GetDB()（后台刷新循环等原子句柄消费方）与 db.DB（守卫装配期捕获）分叉
+// ——复位序列必须显式 SetDB 回填（单源 restoreTestDBHandles）。
 func TestDatabaseHandleParityAfterFixtureRestore(t *testing.T) {
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	var previous *sql.DB

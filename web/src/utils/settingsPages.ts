@@ -23,6 +23,18 @@ export const SETTINGS_TAB_DESCS: Record<SettingsTabId, string> = {
   tasks: '全部定时与后台任务的运行监控、手动触发与取消',
 }
 
+/**
+ * 分页是否消费 `/config`：基础设置（日志/大屏/安全事件/GitHub）与免费证书
+ * （ACME 邮箱、证书天数、CA 提供商）两卡表单来自该端点；集群管理/任务监控/
+ * API 密钥不读它。`configLoadFailed` 横幅的「保存已暂停」只在这些分页成立，
+ * 否则会让人误判本页保存也失败。
+ */
+export const SETTINGS_TABS_CONSUMING_CONFIG: readonly SettingsTabId[] = ['basic', 'certificates']
+
+/** 分页是否消费 `/config`（决定配置加载失败横幅是否相关） */
+export const settingsTabConsumesConfig = (tab: SettingsTabId): boolean =>
+  SETTINGS_TABS_CONSUMING_CONFIG.includes(tab)
+
 /** 侧边栏/路由页键 → 分页 id；非系统设置页返回 null */
 export const settingsTabOfPage = (page: string): SettingsTabId | null => {
   const prefix = 'settings-'

@@ -736,3 +736,31 @@ func TestGetAutobanStatus_genericErrorText(t *testing.T) {
 		t.Fatalf("响应体泄漏内部错误原文: %s", body)
 	}
 }
+
+// DB 写失败必须映射 500 + 泛化文案：与校验失败（400）分出口，不把存储层
+// 原文（表/列/SQL 片段）回传给调用方。
+func TestAutobanConfig_putDBFailureMapsTo500(t *testing.T) {
+	router := newAutobanTestEnv(t)
+	if _, err := db.DB.Exec(`CREATE TRIGGER test_fail_autoban_update BEFORE UPDATE ON global_config BEGIN SELECT RAISE(ABORT, 'simulated io failure'); END`); err != nil {
+		t.Fatalf("install failure trigger: %v", err)
+	}
+	body := map[string]any{"threshold": 100, "window_minutes": 5, "duration": "1h", "scope": "all", "dry_run": true}
+	rec := putJSON(t, router, "/security/autoban", body)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("DB 写失败须 500，status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "simulated") || strings.Contains(rec.Body.String(), "global_config") {
+		t.Fatalf("响应不得回传存储层原文: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "保存自动封禁配置失败") {
+		t.Fatalf("500 文案应为泛化失败提示: %s", rec.Body.String())
+	}
+
+	// 故障解除后正常保存（回归：分出口不得把合法请求挡掉）。
+	if _, err := db.DB.Exec(`DROP TRIGGER test_fail_autoban_update`); err != nil {
+		t.Fatalf("drop failure trigger: %v", err)
+	}
+	if rec := putJSON(t, router, "/security/autoban", body); rec.Code != http.StatusOK {
+		t.Fatalf("故障解除后保存 status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}

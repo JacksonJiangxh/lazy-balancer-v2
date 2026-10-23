@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"lazy-balancer-v2/wafiplist"
 )
@@ -154,5 +155,46 @@ func TestSecurityEventsWriteOffset_AtomicRoundTrip(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0].Name() != "audit.offset" {
 		t.Fatalf("leftover temp files: %v", entries)
+	}
+}
+
+// 回滚只重写内容不同的投影：同内容文件不得被触碰（mtime/身份保持），否则
+// 失败路径会改写全部投影 inode，运行中 Caddy 的 @ipListFast stat 缓存对全部
+// 名单重建（读盘放大 + 统计形态全变）。
+func TestRestoreIPListProjections_skipsIdenticalFiles(t *testing.T) {
+	dir := t.TempDir()
+	oldDir := IPListDataDir
+	IPListDataDir = dir
+	t.Cleanup(func() { IPListDataDir = oldDir })
+	unchanged := filepath.Join(dir, "p1-acl.txt")
+	changed := filepath.Join(dir, "p2-acl.txt")
+	if err := os.WriteFile(unchanged, []byte("same\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(changed, []byte("old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := SnapshotIPListProjections()
+	oldTime := time.Unix(1600000000, 0)
+	if err := os.Chtimes(unchanged, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(changed, []byte("new-render\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := RestoreIPListProjections(snapshot); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+
+	info, err := os.Stat(unchanged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.ModTime().Equal(oldTime) {
+		t.Fatalf("同内容投影被重写（mtime=%v, want %v）——回滚不得触碰未变文件", info.ModTime(), oldTime)
+	}
+	if raw, err := os.ReadFile(changed); err != nil || string(raw) != "old\n" {
+		t.Fatalf("变化投影未回滚: %q err=%v", raw, err)
 	}
 }

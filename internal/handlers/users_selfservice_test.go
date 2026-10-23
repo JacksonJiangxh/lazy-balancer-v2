@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"golang.org/x/crypto/bcrypt"
 
 	"lazy-balancer-v2/internal/db"
 )
@@ -93,5 +94,27 @@ func TestResetUserPassword_selfServiceWithoutCurrentPassword(t *testing.T) {
 	}
 	if challenges != 0 {
 		t.Fatalf("mfa_challenges=%d, want 0", challenges)
+	}
+}
+
+// 自助重置＝重置语义（用户裁定：维持现状，不补当前密码门）：非管理员对本人
+// 调用 POST /users/:id/reset-password 只提交 new_password 即成功，且新密码真实
+// 生效。该路径从不读取 current_password——与 PATCH /users/me 的当前密码确认门
+// 是两套语义，改动本契约须先改裁定与 API 文档。
+func TestResetUserPassword_selfServiceContractResetSemantics(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	seedUserAuditTest(t, 1, "admin", "admin", true)
+	seedUserAuditTest(t, 6, "self-reset", "user", true)
+
+	rec := serveUserMutationAs(h, http.MethodPost, "/users/6/reset-password", `{"new_password":"Abc12345"}`, 6, "user", h.ResetUserPassword)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s（自助重置不得要求 current_password）", rec.Code, rec.Body.String())
+	}
+	var hash string
+	if err := db.DB.QueryRow(`SELECT password_hash FROM users WHERE id=6`).Scan(&hash); err != nil {
+		t.Fatal(err)
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte("Abc12345")); err != nil {
+		t.Fatalf("自助重置后新密码必须生效: %v", err)
 	}
 }

@@ -315,10 +315,12 @@ func (m *CRSUpdateManager) setStage(status CRSUpdateStatus, message string) {
 // recordLatestSkip 记录「已是最新版本」终态（DB 行与内存状态单点实现）。
 func (m *CRSUpdateManager) recordLatestSkip(trigger string) {
 	if _, err := db.DB.Exec(
-		"UPDATE security_crs_version SET update_status='success', message='已是最新版本', finished_at=datetime('now'), consecutive_failures=0, "+versionTableSlotAdvanceSQL+" WHERE id=1",
-		trigger, versionTableNextSlot("security_crs_version", time.Now().UTC()),
+		"UPDATE security_crs_version SET update_status='success', message='已是最新版本', finished_at=datetime('now'), consecutive_failures=0, "+versionTableSlotSuccessSQL+" WHERE id=1",
+		trigger, trigger, versionTableNextSlot("security_crs_version", time.Now().UTC()),
 	); err != nil {
-		Logf("warn", "crs update: failed to record latest-version skip: %v", err)
+		// 成功轮的排程槽推进写失败 = 引擎成功轮已消费过期槽而业务槽停滞
+		// （四族自动更新会静默停摆直到下次成功写），日志级别须与后果匹配。
+		Logf("error", "crs update: failed to record latest-version skip（排程槽可能未推进）: %v", err)
 	}
 	m.mu.Lock()
 	m.state.status = CRSStatusSuccess
@@ -395,8 +397,9 @@ func (m *CRSUpdateManager) runWithContext(runCtx context.Context, trigger string
 		m.advanceSlotIfAuto(trigger)
 		return
 	} else if !isMaster {
-		// 从节点中止是正常跳过语义，对齐威胁族——
-		// 落 skipped 终态、审计「更新跳过」，不再记「更新失败」。
+		// 从节点中止是正常跳过语义，对齐威胁族——内存终态 + 更新日志/审计
+		// 留痕（「更新跳过」），不写版本表（从节点只读不变量：版本行由集群
+		// 同步治理），因此进程重启后 StatusSnapshot 会回退为存储行的 idle。
 		m.syncInstalledVersionToState()
 		m.setStage(CRSStatusSkipped, "当前节点为从节点，终止 CRS 更新")
 		return
@@ -479,9 +482,7 @@ func (m *CRSUpdateManager) runWithContext(runCtx context.Context, trigger string
 	m.mu.Unlock()
 
 	var installErr error
-	installAttempted := false
 	installRetErr := runWithInTaskRetry(runCtx, func() error {
-		installAttempted = true
 		installErr = m.downloadAndInstall(runCtx, tag)
 		// crsReloadError=安装成功但重载失败（restore 编舞已执行）——非瞬断，不重试
 		// （errIP2RegionReload 同型先例）。
@@ -510,16 +511,16 @@ func (m *CRSUpdateManager) runWithContext(runCtx context.Context, trigger string
 			return
 		}
 		if runCtx.Err() != nil {
-			m.cancel(installErr, installAttempted, trigger, runCtx)
+			m.cancel(installErr, m.crsRestorePointCreated(), trigger, runCtx)
 			return
 		}
-		m.fail(installErr, true)
+		m.fail(installErr, m.crsRestorePointCreated())
 		m.advanceSlotIfAuto(trigger)
 		return
 	}
 	if _, err := db.DB.Exec(
-		"UPDATE security_crs_version SET version=?, updated_at=datetime('now'), update_status='success', message='', finished_at=datetime('now'), consecutive_failures=0, "+versionTableSlotAdvanceSQL+" WHERE id=1",
-		tag, trigger, versionTableNextSlot("security_crs_version", time.Now().UTC()),
+		"UPDATE security_crs_version SET version=?, updated_at=datetime('now'), update_status='success', message='', finished_at=datetime('now'), consecutive_failures=0, "+versionTableSlotSuccessSQL+" WHERE id=1",
+		tag, trigger, trigger, versionTableNextSlot("security_crs_version", time.Now().UTC()),
 	); err != nil {
 		Logf("error", "crs update: failed to record success: %v", err)
 	}
@@ -534,9 +535,10 @@ func (m *CRSUpdateManager) runWithContext(runCtx context.Context, trigger string
 	m.cleanupLegacyCRSTransient()
 }
 
-// advanceSlotIfAuto 落定推进排程槽（排程槽生命周期，2026-10-11 用户裁定）：
-// ①仅 auto 触发——手动触发不得改变下一次预约执行时间；②仅当现存槽为空或
-// 已过期——未来槽（配置变更/自定义槽）不被回拨污染。
+// advanceSlotIfAuto 落定推进排程槽（失败/取消路径）：①仅 auto 触发——手动轮
+// 失败时引擎按退避重投同一槽，业务抢先推进会把该自动槽静默吃掉（手动**成功**
+// 按 schedule.go 的成功门推进，不经过本函数）；②仅当现存槽为空或已过期——
+// 未来槽（配置变更/自定义槽）不被回拨污染。
 // 此前失败不推进：过期槽经 NextSlotFn 步进（coveredSlotStepPast）每 tick 重算
 // 永远领先 now 一步，due 判定窗口零宽，排程永久停摆（10-06 失败后停摆 5 天实证）。
 func (m *CRSUpdateManager) advanceSlotIfAuto(trigger string) {
@@ -554,7 +556,10 @@ func advanceVersionSlotIfDue(table string) {
 		return
 	}
 	if cur != "" {
-		if t, err := time.ParseInLocation(crsTimeLayout, cur, time.UTC); err == nil && t.After(time.Now().UTC()) {
+		// 双布局（crsTimeLayout + RFC3339）单源解析：单布局会把旧备份/快照
+		// 带入的 RFC3339 未来槽解析失败并按「过期」覆写；同族读取面
+		// （versionTableNextUpdate/earliestEnabledSourceUpdate）均能正确解析。
+		if t := parseUTCSlot(cur); !t.IsZero() && t.After(time.Now().UTC()) {
 			return // 未来槽不污染
 		}
 	}
@@ -562,6 +567,16 @@ func advanceVersionSlotIfDue(table string) {
 		versionTableNextSlot(table, time.Now().UTC())); err != nil {
 		Logf("warn", "推进排程槽失败（%s）: %v", table, err)
 	}
+}
+
+// crsRestorePointCreated 报告本运行是否真的动过 live 树——restoreBackup 的
+// 消费门与 reload 的必要性都由它决定。download/extract/validate/完整性校验
+// 任一步失败时树尚未触碰（备份点在第一份备份拷贝成功后才置位），此时既不
+// 需还原也无需重载（reload 要取 CaddyOpLock 并跑一轮渲染；失败重试场景会
+// 把它放大成每轮一次）。installAttempted 旧语义是「进入安装循环」，
+// 与「树已变更」不等价。
+func (m *CRSUpdateManager) crsRestorePointCreated() bool {
+	return m.rulesBakCreated || m.setupBakCreated || m.stockBakCreated || m.overridesBakCreated
 }
 
 func (m *CRSUpdateManager) restoreAfterInstallError(restore bool) {

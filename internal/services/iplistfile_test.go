@@ -453,3 +453,20 @@ func TestWriteIPListFile_rejectsNewlineInEntry(t *testing.T) {
 		t.Fatalf("empty set must still write: %v", err)
 	}
 }
+
+// 投影写权限必须与回滚路径（writeFileAtomicSynced 0644）一致：CreateTemp 默认
+// 0600 会让正常渲染产出 0600、回滚后变 0644——跨进程读文件协议在 Caddy 换 uid
+// 部署时会表现为名单读不到（fail-stale/空集）。
+func TestWriteIPListFile_fileModeMatchesRollbackPath(t *testing.T) {
+	path, err := writeIPListFile("u-mode", []string{"203.0.113.11"})
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o644 {
+		t.Fatalf("投影文件权限=%o, want 644（与回滚路径同口径）", perm)
+	}
+}

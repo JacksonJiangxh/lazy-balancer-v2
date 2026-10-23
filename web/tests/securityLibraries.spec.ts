@@ -192,3 +192,10 @@ test('定时更新校验：空时间拒绝保存，不静默代填 04:00', () =>
   assert.equal(libraryScheduleError([1, 3], '04:00'), null)
   assert.equal(libraryScheduleError([7], '23:59'), null)
 })
+
+test('零源多源库占位行状态：未配置（与卡头健康标签同词）', () => {
+  assert.equal(libraryStatusLabel('not-configured'), '未配置')
+  assert.equal(libraryStatusTagType('not-configured'), 'info')
+  // 空串仍是空文案（调用方以 v-if 守卫，不渲染空标签）
+  assert.equal(libraryStatusLabel(''), '')
+})

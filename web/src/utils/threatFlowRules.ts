@@ -37,7 +37,7 @@ export function nextFlowCursor(previous: number, data: { enabled?: boolean; next
  * 1→4 高于 180、4→1 低于 120；4→8 高于 720、8→4 低于 480。
  * 上下阈值留滞回带，避免在边界附近来回抖动。
  */
-export const ADAPTIVE_SAMPLE_THRESHOLDS = {
+const ADAPTIVE_SAMPLE_THRESHOLDS = {
   upTo4: 180,
   downTo1: 120,
   upTo8: 720,
@@ -45,9 +45,9 @@ export const ADAPTIVE_SAMPLE_THRESHOLDS = {
 } as const
 
 /** 连续多少次采样同向才允许换档（配合 1s 轮询）。 */
-export const ADAPTIVE_SAMPLE_CONFIRM_SAMPLES = 2
+const ADAPTIVE_SAMPLE_CONFIRM_SAMPLES = 2
 /** 两次换档之间的最小间隔（毫秒）。 */
-export const ADAPTIVE_SAMPLE_MIN_SWITCH_INTERVAL_MS = 4000
+const ADAPTIVE_SAMPLE_MIN_SWITCH_INTERVAL_MS = 4000
 
 /** 用服务端回报的采样因子还原真实事件速率（events 已被按 sample_n 缩小）。 */
 export function reconstructObservedRate(eventCount: number, sampleN: number, fallbackSampleN = 1): number {
@@ -56,7 +56,7 @@ export function reconstructObservedRate(eventCount: number, sampleN: number, fal
 }
 
 /** 自适应目标档位（含滞回带）：仅返回 1/4/8。 */
-export function nextAdaptiveSampleN(current: number, observedRate: number): number {
+function nextAdaptiveSampleN(current: number, observedRate: number): number {
   if (current === 8) return observedRate < ADAPTIVE_SAMPLE_THRESHOLDS.downTo4 ? 4 : 8
   if (current === 4) {
     if (observedRate > ADAPTIVE_SAMPLE_THRESHOLDS.upTo8) return 8
@@ -103,8 +103,8 @@ export function stepAdaptiveSample(state: AdaptiveSampleState, observedRate: num
   return { active: state.active, stable, pendingTarget: target, lastSwitch: state.lastSwitch, changed: false }
 }
 
-/** 单轮最多新增光流数；正常流与攻击流共用同一预算。 */
-export const FLOW_MAX_ARCS_PER_FLUSH = 12
+/** 单轮最多新增光流数；正常流与攻击流共用同一预算（模块内默认值）。 */
+const FLOW_MAX_ARCS_PER_FLUSH = 12
 
 export interface FlowArcPlan {
   /** 分组键（地区|时间桶）。 */

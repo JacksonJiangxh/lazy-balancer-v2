@@ -58,6 +58,15 @@ func TestImportBackup_oidcConfigConvergesWhenAbsent(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "OIDC") {
 		t.Fatalf("import result must mention OIDC convergence, body=%s", rec.Body.String()[:400])
 	}
+	// 审计双通道：收敛清空改变了运行态（OIDC 登出），操作审计必须留痕——
+	// 此前只有响应 warnings，事后无法从审计追溯。
+	var oidcAudits int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='导入警告' AND resource='配置备份' AND detail LIKE '%OIDC%'`).Scan(&oidcAudits); err != nil {
+		t.Fatalf("read audit log: %v", err)
+	}
+	if oidcAudits != 1 {
+		t.Fatalf("OIDC convergence audit rows=%d, want 1（响应与审计双通道）", oidcAudits)
+	}
 }
 
 func TestImportBackup_oidcConfigPreservedWhenPresent(t *testing.T) {
@@ -98,5 +107,13 @@ func TestImportBackup_oidcConfigPreservedWhenPresent(t *testing.T) {
 	}
 	if !strings.Contains(oidcConfig, "idp2.example.com") {
 		t.Fatalf("oidc_config from backup must be applied (got %q)", oidcConfig)
+	}
+	// 未发生收敛不得留「已清空」审计（否则事后取证会误判为配置被丢弃）。
+	var oidcAudits int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE detail LIKE '%OIDC 配置已随备份收敛清空%'`).Scan(&oidcAudits); err != nil {
+		t.Fatalf("read audit log: %v", err)
+	}
+	if oidcAudits != 0 {
+		t.Fatalf("OIDC convergence audit rows=%d, want 0 when backup carries oidc_config", oidcAudits)
 	}
 }

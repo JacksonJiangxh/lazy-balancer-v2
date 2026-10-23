@@ -12,6 +12,7 @@ import {
   SETTINGS_TAB_DESCS,
   SETTINGS_TAB_IDS,
   SETTINGS_TAB_TITLES,
+  settingsTabConsumesConfig,
   settingsTabOfPage,
 } from '../src/utils/settingsPages.ts'
 import { source } from './_helpers.ts'
@@ -57,4 +58,16 @@ test('分页清单：两处消费方共用单源，不再自带第二份映射',
   assert.match(layout, /from '@\/utils\/settingsPages'/)
   assert.match(layout, /SETTINGS_TAB_IDS\.map\(\(tab\) => \[`settings-\$\{tab\}`, `\$\{SETTINGS_BREADCRUMB_PARENT\} \/ \$\{SETTINGS_TAB_TITLES\[tab\]\}`\]\)/)
   assert.doesNotMatch(layout, /'settings-basic': '系统设置 \/ 基础设置'/)
+})
+
+test('分页是否消费 /config：仅基础设置与免费证书（配置失败横幅只在这两页有意义）', () => {
+  assert.equal(settingsTabConsumesConfig('basic'), true)
+  assert.equal(settingsTabConsumesConfig('certificates'), true)
+  for (const tab of ['cluster', 'apikeys', 'tasks'] as const) {
+    assert.equal(settingsTabConsumesConfig(tab), false, `${tab} 不读 /config`)
+  }
+  // 接线：Settings.vue 的失败横幅由该判据门控，不是无条件渲染
+  const settings = source('src/views/Settings.vue')
+  assert.match(settings, /configBannerVisible = computed\(\(\) => configLoadFailed\.value && settingsTabConsumesConfig\(activeTab\.value\)\)/)
+  assert.match(settings, /<el-alert v-if="configBannerVisible"/)
 })

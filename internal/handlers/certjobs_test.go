@@ -558,6 +558,16 @@ func TestDeleteCertJob_restores_downloaded_job_with_material_when_delete_fails(t
 	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
 	services.GetCAQueueManager().Start()
 	t.Cleanup(services.ResetCAQueueManagerForTest)
+	// 删除路径先 cancelCertJob 取消挂起的部署 timer——恢复必须重新登记立即
+	// 部署重试，否则只能等 6h 续期扫描/启动恢复接手。
+	oldRegistrar := certJobDeploymentRetryRegistrar
+	var registered []string
+	registrarErr := error(nil)
+	certJobDeploymentRetryRegistrar = func(jobID int, ruleID string) error {
+		registered = append(registered, fmt.Sprintf("%d:%s", jobID, ruleID))
+		return registrarErr
+	}
+	t.Cleanup(func() { certJobDeploymentRetryRegistrar = oldRegistrar })
 	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,cert_pem,key_pem) VALUES ('lb_dl','dl.example.test','downloaded','pem-material','key-material');
 		CREATE TRIGGER fail_downloaded_job_delete BEFORE DELETE ON cert_jobs BEGIN SELECT RAISE(ABORT,'delete failed'); END`); err != nil {
 		t.Fatalf("seed downloaded job and trigger: %v", err)
@@ -578,10 +588,30 @@ func TestDeleteCertJob_restores_downloaded_job_with_material_when_delete_fails(t
 		t.Fatalf("status=%q, want downloaded（带证书材料的任务不得转 queued/failed）", status)
 	}
 	if !availableAfter.Valid {
-		t.Fatal("deployment_available_after 未推到 now（Resume 补扫无法重新调度部署）")
+		t.Fatal("deployment_available_after 未推到 now（部署重排无法重新调度）")
 	}
 	if services.GetCAQueueManager().IsJobActive(1) {
 		t.Fatal("downloaded 任务删除失败恢复后不得进入签发队列")
+	}
+	if len(registered) != 1 || registered[0] != "1:lb_dl" {
+		t.Fatalf("deployment retry registrations=%v, want [1:lb_dl]（恢复后必须重新登记部署）", registered)
+	}
+
+	// 证书服务不可用（登记失败）时窗口推进保留（周期补扫接手），删除失败仍 500。
+	registrarErr = services.ErrCertificateQueueInactive
+	response = httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodDelete, "/jobs/1", nil))
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s, want 500 when delete still fails", response.Code, response.Body.String())
+	}
+	if len(registered) != 2 {
+		t.Fatalf("deployment retry registrations=%v, want 2（登记失败也须尝试并留痕）", registered)
+	}
+	if err := db.DB.QueryRow("SELECT status, deployment_available_after FROM cert_jobs WHERE id=1").Scan(&status, &availableAfter); err != nil {
+		t.Fatal(err)
+	}
+	if status != "downloaded" || !availableAfter.Valid {
+		t.Fatalf("status=%q window_valid=%v, want downloaded/valid（登记失败不得回滚窗口）", status, availableAfter.Valid)
 	}
 }
 
@@ -764,7 +794,7 @@ func TestRetryCertJob_active_job_returns_queue_busy_message(t *testing.T) {
 	if _, err := db.DB.Exec("UPDATE global_config SET acme_email='acme@example.test' WHERE id=1"); err != nil {
 		t.Fatalf("set ACME email: %v", err)
 	}
-	if err := qm.Enqueue(0, 20, "lb_blocker", "blocker.example.test"); err != nil {
+	if err := qm.EnqueueForTest(0, 20, "lb_blocker", "blocker.example.test"); err != nil {
 		t.Fatalf("enqueue blocker job: %v", err)
 	}
 	select {
@@ -772,7 +802,7 @@ func TestRetryCertJob_active_job_returns_queue_busy_message(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("blocker execution did not reach the ACME mock")
 	}
-	if err := qm.Enqueue(0, 21, "lb_active", "active.example.test"); err != nil {
+	if err := qm.EnqueueForTest(0, 21, "lb_active", "active.example.test"); err != nil {
 		t.Fatalf("enqueue active job: %v", err)
 	}
 
@@ -902,6 +932,45 @@ func TestGetCertJobLogs_capsTotalResponseBytes(t *testing.T) {
 	}
 	if !strings.Contains(body.Data.Content, "仅显示最近") {
 		t.Fatal("截断响应必须带提示行")
+	}
+}
+
+// 读取预算：从最新文件累计到响应上限即停止读更旧轮转（更旧内容必然落在
+// 尾窗之外）。夹具给当前 + .1 + .2 + .3 各 1KB，预算 2KB ⇒ 只读当前与 .1。
+func TestReadCertJobLogTail_stopsAtByteBudget(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "certjob-budget.log")
+	lineFor := func(tag string) string {
+		return tag + strings.Repeat("x", 1024-len(tag)-1) + "\n"
+	}
+	for _, name := range []string{"base", ".1", ".2", ".3"} {
+		path := base
+		if name != "base" {
+			path = base + name
+		}
+		if err := os.WriteFile(path, []byte(lineFor(name)), 0644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	content, truncated := readCertJobLogTail(base, 5, 2<<10)
+	if want := lineFor(".1") + lineFor("base"); content != want {
+		t.Fatalf("content=%q, want 最新的两份（.1 + 当前）", content)
+	}
+	if !truncated {
+		t.Fatal("存在未读取的更旧备份时必须标记 truncated")
+	}
+	if strings.Contains(content, ".2") || strings.Contains(content, ".3") {
+		t.Fatalf("预算耗尽后不得读取更旧备份: %q", content)
+	}
+
+	// 正向对照：预算充足时全量按旧→新拼接且不标记截断。
+	content, truncated = readCertJobLogTail(base, 5, 16<<10)
+	if want := lineFor(".3") + lineFor(".2") + lineFor(".1") + lineFor("base"); content != want {
+		t.Fatalf("content=%q, want 全部轮转按旧→新拼接", content)
+	}
+	if truncated {
+		t.Fatal("预算充足时不得标记截断")
 	}
 }
 

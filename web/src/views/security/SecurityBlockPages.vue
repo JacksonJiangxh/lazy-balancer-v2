@@ -178,7 +178,7 @@ const contentSizes = computed(() => {
 })
 const form = ref({ name: '', description: '', content: '', content_type: 'text/html; charset=utf-8' })
 
-// 可选内容类型（与后端 models.BlockPageContentTypes 白名单同口径）
+// 可选内容类型（与后端 models.BlockPageContentTypeWhitelist 白名单同口径）
 const CONTENT_TYPE_OPTIONS = [
   { value: 'text/html; charset=utf-8', label: 'HTML 页面（text/html）' },
   { value: 'application/json; charset=utf-8', label: 'JSON（application/json）' },

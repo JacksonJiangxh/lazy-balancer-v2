@@ -1,13 +1,43 @@
 // anomaly_score 危险等级分档单源：威胁大屏事件定级与事件列表评分着色共用。
 //
 // 列表原用 ≥15/≥5、大屏用 ≥12/≥6——同一评分两页结论打架。统一为大屏口径
-//（2026-10-17 用户裁定：≥12 高 / ≥6 中 / <6 低，检测模式降一级由消费方处理）。
+//（2026-10-17 用户裁定：≥12 高 / ≥6 中 / <6 低）。
+//
+// 检测模式（未拦截）整体降一级与 0 分行回退族同在本模块：两段都是用户可见的
+// 严重度着色，集中在此保证大屏定级与事件列表共用同一口径。
 
 export const ANOMALY_SCORE_HIGH = 12
 export const ANOMALY_SCORE_MID = 6
 
 export type AnomalySeverity = 'high' | 'mid' | 'low'
 
-/** 评分 → 三档定级（不含检测模式降级——降级是动作语义，由消费方叠加）。 */
+/** 评分 → 三档定级（不含检测模式降级——降级是动作语义，见 overlayDetectionGrade）。 */
 export const anomalySeverity = (score: number): AnomalySeverity =>
   score >= ANOMALY_SCORE_HIGH ? 'high' : score >= ANOMALY_SCORE_MID ? 'mid' : 'low'
+
+/**
+ * 检测模式降级叠加：未拦截事件整体降一级（高→中、中→低、低保持），
+ * 已拦截事件按基础档原样返回。
+ */
+export const overlayDetectionGrade = (base: AnomalySeverity, action: string): AnomalySeverity =>
+  action === 'blocked' ? base : base === 'high' ? 'mid' : 'low'
+
+/**
+ * 0 分行（存量行）回退：现代引擎一律带评分，只有历史行落在这里。定性口径与
+ * 后端入库补分（services/securityevents.go）一致——IP 名单/信任/威胁情报/
+ * 爬虫伪装/预检=12（高），普通 GeoIP（rule_triggered 为 8 或 8xxxxx）=6（中），
+ * 其余按动作给中/低。
+ *
+ * 检测模式只把高危族降为中危（存量行是粗粒度定性，不做中→低的二次下调，
+ * 与评分分支的整档下移不同）。限流 429 不产生安全事件行（caddy-ratelimit 直接
+ * 返回、无审计行），故不参与本回退。481-484 是渲染器发射的 HTTP 阻断状态码，
+ * 不是 rule_triggered 值，落入兜底分支。
+ */
+export const zeroScoreSeverity = (ruleTriggered: string, action: string): AnomalySeverity => {
+  const blocked = action === 'blocked'
+  if (ruleTriggered === '2' || ruleTriggered === '3' || ruleTriggered === '12' || ruleTriggered === '14') {
+    return blocked ? 'high' : 'mid'
+  }
+  if (ruleTriggered === '8' || /^8\d{5}$/.test(ruleTriggered)) return 'mid'
+  return blocked ? 'mid' : 'low'
+}

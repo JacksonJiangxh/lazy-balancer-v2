@@ -15,7 +15,8 @@ import type { APIResponse } from '@/types'
 //      系统名单在快捷处置中零暴露、不作为动作目标）→ 自动创建
 //      「{策略名}{后缀}」（category=custom，建单即带该 IP 条目）→ 关联到策略
 //      对应 refs 字段，两步完成「创建并加入」——中途失败不会留下已被策略引用
-//      的空名单；同名（ASCII 大小写折叠）既有名单优先复用；历史起 deny/allow/
+//      的空名单；同名（ASCII 大小写折叠）且未被其它引用面引用的既有名单
+//      优先复用，被占用时以「{策略名}{后缀}#{策略 id}」新建；历史起 deny/allow/
 //      trust 三侧全部接线此出口；
 //   3) 移除 = 从引用列表 remove-ip（关联保留，仅移除条目）。
 // 信任侧未启用（ip_whitelist_enabled=false）时不阻断操作，仅提示「暂不生效」。
@@ -66,6 +67,41 @@ interface TrustListRef {
   entry_count?: number
   /** system=内置威胁名单（只读）——两种组件来源的类型宽窄不一，故此处放宽 */
   system?: number | boolean
+  /** 引用本名单的策略（GET /security/ip-lists 的 ref_policies）。 */
+  ref_policies?: Array<{ id: number; name: string }>
+  /** 被 Caddy 全局「受信代理网段」引用（后端已并入 ref_count 展示口径）。 */
+  trusted_proxy_referenced?: boolean
+}
+
+// 名单名唯一性口径（后端 CreateIPList 的 LOWER(name)=LOWER(?)）：只折叠
+// ASCII 大小写（非 ASCII 变体后端视为不同名单）。
+const ipListNameKey = (name: string): string => name.replace(/[A-Z]/g, (c) => c.toLowerCase())
+
+// 自动名单复用判据：只允许「未被其它策略、未被受信代理网段引用」的名单承接
+// 本次处置——写入别人的名单会改动对方的拦截/放行面。引用视图缺失（旧载荷）
+// 说明无法证明未被引用，按不可复用处理。
+const isAutoListReusable = (list: TrustListRef, policyId: number): boolean => {
+  if (!Array.isArray(list.ref_policies)) return false
+  if (list.ref_policies.some((ref) => ref.id !== policyId)) return false
+  return list.trusted_proxy_referenced !== true
+}
+
+// 自动名已被占用时换本策略限定名：名单名全局唯一（后端 LOWER(name)=LOWER(?)
+// 命中即 409），而后缀策略 id 让「同名策略」与「超长截断后同前缀」的两个策略
+// 各自落到不同名单；仅在与用户自建名单重名的极少数情况下继续递增。
+const LIST_NAME_ATTEMPT_LIMIT = 20
+const resolveScopedListName = (
+  policyName: string,
+  suffix: string,
+  policyId: number,
+  isTaken: (name: string) => boolean,
+): string => {
+  for (let attempt = 0; attempt < LIST_NAME_ATTEMPT_LIMIT; attempt++) {
+    const scoped = attempt === 0 ? `${suffix}#${policyId}` : `${suffix}#${policyId}-${attempt + 1}`
+    const candidate = fitAutoListName(policyName, scoped).name
+    if (!isTaken(candidate)) return candidate
+  }
+  return fitAutoListName(policyName, `${suffix}#${policyId}`).name
 }
 
 export const useTrustAssociation = (options: {
@@ -113,6 +149,14 @@ export const useTrustAssociation = (options: {
     // 否则确认后创建必然 400，动作无法在当前弹框内完成。
     const auto = fitAutoListName(policy.name, cfg.suffix)
     const truncatedNote = auto.truncated ? '（策略名过长，名单名已截断至 50 字符上限）' : ''
+    const refs = parseRefIds(policy[cfg.refField])
+    const listNow = options.getList()
+    const isNameTaken = (name: string): boolean => listNow.some((l) => ipListNameKey(l.name) === ipListNameKey(name))
+    // 同名列表只在「未被其它引用面引用」时可复用（category 无关）；判据与后端
+    // 唯一性口径同源（ASCII 大小写折叠）。被占用则换策略限定名走新建。
+    const sameName = listNow.find((l) => !l.system && ipListNameKey(l.name) === ipListNameKey(auto.name))
+    const reuseTarget = sameName && isAutoListReusable(sameName, policy.id) ? sameName : null
+    const createName = isNameTaken(auto.name) ? resolveScopedListName(policy.name, cfg.suffix, policy.id, isNameTaken) : auto.name
     // 确认框弹出前即占位——双击不再叠两个确认框/重复创建
     // （原 creating 在 confirm 之后才置位）。
     if (creating.value) return
@@ -120,27 +164,23 @@ export const useTrustAssociation = (options: {
     try {
       try {
         await ElMessageBox.confirm(
-          `${lead}，将创建「${auto.name}」${truncatedNote}并把 ${ip} 加入${tip}。是否继续？`,
-          `创建列表并${cfg.verb}`,
+          reuseTarget
+            ? `将把 ${ip} 加入既有地址列表「${reuseTarget.name}」${tip}。是否继续？`
+            : `${lead}，将创建「${createName}」${truncatedNote}并把 ${ip} 加入${tip}。是否继续？`,
+          reuseTarget ? `加入${cfg.verb}用列表` : `创建列表并${cfg.verb}`,
           { confirmButtonText: '确定', cancelButtonText: '取消', type: 'info' },
         )
       } catch {
         return
       }
-      // 同侧已有同名未引用列表时复用而非重复创建——按名称在现有列表中查找
-      // （category 无关）；判据与后端唯一性口径同源（ASCII 大小写折叠）。
-      const wantName = auto.name
-      const wantKey = wantName.replace(/[A-Z]/g, (c) => c.toLowerCase())
-      const sameName = options.getList().find((l) => !l.system && l.name.replace(/[A-Z]/g, (c) => c.toLowerCase()) === wantKey)
-      const refs = parseRefIds(policy[cfg.refField])
-      if (sameName) {
-        if (!refs.includes(sameName.id)) {
-          const assocRes = await request.put(`/security/policies/${policy.id}`, { [cfg.refField]: JSON.stringify([...refs, sameName.id]) })
+      if (reuseTarget) {
+        if (!refs.includes(reuseTarget.id)) {
+          const assocRes = await request.put(`/security/policies/${policy.id}`, { [cfg.refField]: JSON.stringify([...refs, reuseTarget.id]) })
           // 关联中间跳的退化后缀（Caddy 应用失败但 DB 已提交）不可静默
           if (assocRes.message?.includes(CADDY_APPLY_FAILED_MARKER)) showSaveResult(assocRes, '')
         }
-        const added = await request.post<APIResponse<{ added: boolean }>>(`/security/ip-lists/${sameName.id}/ips`, { value: ip })
-        showSaveResult(added as unknown as { message?: string }, `已关联既有「${auto.name}」并加入 ${ip}`)
+        const added = await request.post<APIResponse<{ added: boolean }>>(`/security/ip-lists/${reuseTarget.id}/ips`, { value: ip })
+        showSaveResult(added as unknown as { message?: string }, `已关联既有「${reuseTarget.name}」并加入 ${ip}`)
         await options.onChanged?.()
         return
       }
@@ -148,7 +188,7 @@ export const useTrustAssociation = (options: {
       // 「创建（含 IP）→ 关联 refs」。原先是 创建空名单 → 关联 → 加入 IP：加入
       // 失败时策略已引用一个空名单，用户只看到一条错误提示，且多一次往返。
       const created = await request.post<APIResponse<{ id: number }>>('/security/ip-lists', {
-        name: wantName,
+        name: createName,
         category: 'custom',
         entries: JSON.stringify([{ value: ip, remark: '' }]),
       })
@@ -156,14 +196,14 @@ export const useTrustAssociation = (options: {
       if (created.message?.includes(CADDY_APPLY_FAILED_MARKER)) showSaveResult(created, '')
       const newId = created.data?.id
       if (!newId) {
-        ElMessage.error(`列表「${wantName}」创建响应异常，请重试`)
+        ElMessage.error(`列表「${createName}」创建响应异常，请重试`)
         return
       }
       const assocRes = await request.put(`/security/policies/${policy.id}`, { [cfg.refField]: JSON.stringify([...refs, newId]) })
       // 关联是最后一步：退化后缀弹警告，正常成功用动作口径文案（响应 message 是
       // 策略更新的通用文案，不能拿来当本次动作的反馈）。
       if (assocRes.message?.includes(CADDY_APPLY_FAILED_MARKER)) showSaveResult(assocRes, '')
-      else mfaAwareSuccess(`已创建「${auto.name}」并加入 ${ip}`)
+      else mfaAwareSuccess(`已创建「${createName}」并加入 ${ip}`)
       await options.onChanged?.()
     } catch {
       // 失败提示由全局拦截器弹出

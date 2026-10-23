@@ -29,7 +29,7 @@ func TestRateLimitBlocksParse_aggregatesPerHostByCode429(t *testing.T) {
 	// Given metrics text mixing codes, handlers, methods, servers, and sibling histogram series
 	// When the counters are parsed——仅按 code="429" 过滤（handler 标签自 自此恒为
 	// 主路由链首 headers，不可作区分维度；上游自返 429 如实纳入计数，卡片已标注口径）
-	counts := parseRateLimit429Counts(rateLimit429MetricsFixture)
+	counts := rateLimit429HostCounts(parseRateLimit429CountsByServer(rateLimit429MetricsFixture))
 
 	// Then all code="429" count series contribute, summed per host
 	if len(counts) != 2 {
@@ -51,7 +51,7 @@ caddy_http_request_duration_seconds_count{code="429",handler="rate_limit",host="
 caddy_http_request_duration_seconds_count{code="429",handler="rate_limit",host="ok.example.com",method="GET",server="http_443"} 1.5
 `
 	// When the counters are parsed
-	counts := parseRateLimit429Counts(body)
+	counts := rateLimit429HostCounts(parseRateLimit429CountsByServer(body))
 
 	// Then only the valid line is counted
 	if len(counts) != 1 || counts["ok.example.com"] != 1.5 {
@@ -62,7 +62,7 @@ caddy_http_request_duration_seconds_count{code="429",handler="rate_limit",host="
 func TestRateLimitBlocksParse_emptyBodyYieldsEmpty(t *testing.T) {
 	// Given an empty metrics body
 	// When parsed
-	counts := parseRateLimit429Counts("")
+	counts := rateLimit429HostCounts(parseRateLimit429CountsByServer(""))
 
 	// Then the result is empty
 	if len(counts) != 0 {

@@ -213,8 +213,17 @@ func buildCrawlerUAPrefilter() *regexp.Regexp {
 	return regexp.MustCompile("(?i)" + strings.Join(patterns, "|"))
 }
 
+// crawlerUAMaxLen 是参与引擎匹配的 UA 长度上限：真实 UA 远小于此（注册表
+// 全部样例 <200B），超长 UA 只可能是攻击者在启用爬虫豁免的规则上灌入的
+// ~1MB 头部——合并交替正则是 O(len) 线性扫描，每请求成本随头部线性放大。
+// 超限一律判未命中（不豁免、不判伪装；安全方向=不因爬虫标记放行）。
+const crawlerUAMaxLen = 512
+
 // MatchCrawlerEngine UA → 引擎 ID（未命中返回空串）。
 func MatchCrawlerEngine(userAgent string) string {
+	if len(userAgent) > crawlerUAMaxLen {
+		return ""
+	}
 	// 预筛：绝大多数流量不是爬虫，单次合并匹配即可判定未命中。
 	if !crawlerUAPrefilter.MatchString(userAgent) {
 		return ""

@@ -101,6 +101,15 @@ func TestCrawlerLib_listLookupFailureReturns500(t *testing.T) {
 	if resp.Code != http.StatusInternalServerError {
 		t.Fatalf("list lookup failure must not return a partial 200: status=%d body=%s", resp.Code, resp.Body.String())
 	}
+	// 固定文案 + 服务端留痕：business 组任意登录用户可读，底层 SQL/表名
+	// 不得拼进响应（把 err.Error() 拼回是同类重构的常见回退）。
+	body := resp.Body.String()
+	if !strings.Contains(body, "读取爬虫源失败") {
+		t.Fatalf("body=%s, want 固定文案", body)
+	}
+	if strings.Contains(body, "no such table") || strings.Contains(body, "security_ip_lists") || strings.Contains(body, "sql:") {
+		t.Fatalf("响应泄漏内部结构: %s", body)
+	}
 }
 
 func TestCrawlerLibFlags_updateAndNotFound(t *testing.T) {

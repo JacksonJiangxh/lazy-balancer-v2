@@ -177,7 +177,12 @@ func (w *RotatingFileWriter) Close() error {
 	if w.file == nil {
 		return nil
 	}
-	return w.file.Close()
+	err := w.file.Close()
+	// 关停顺序/热切换中 Close 可能先于最后几条日志：不弃句柄时后续 Write
+	// 命中 file already closed 且标准 log 会丢弃该错误（静默丢日志），也不自愈。
+	// 置 nil 让 Write 走 open() 重开（与 rotateLocked 同口径）。
+	w.file = nil
+	return err
 }
 
 // appLogEntryInfo 是应用日志副本元数据采集的注入点（测试可注入失败形态；

@@ -224,6 +224,15 @@ func TestCRSExcludedEntryEffective_numericSegmentsAreNotFilenames(t *testing.T) 
 	if !CRSExcludedEntryEffective("REQUEST-942-APPLICATION-ATTACK-SQLI.conf") {
 		t.Fatal("真实 CRS 文件名形态必须保持合法")
 	}
+	// 两位组号在发射侧被映射为 9xx000-9xx999（可发射）——保存门必须同源，
+	// 否则 legacy []string 形态的组号条目「保存 400 但已在生效」（新对象格式
+	// 走 IsCRSGroupCode 分支，两形态语义分裂）。
+	if !CRSExcludedEntryEffective("42") {
+		t.Fatal("两位组号必须合法（发射为 942000-942999）")
+	}
+	if CRSExcludedEntryEffective("4a") {
+		t.Fatal("非数字两位记号不得合法")
+	}
 }
 
 // 响应侧规则 ID + waf_check_response=off：选择零效果，渲染必须跳过

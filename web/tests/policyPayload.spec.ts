@@ -95,17 +95,22 @@ test('数组字段按 JSON 文本下发（名单/引用/组/排除/自定义/区
   assert.equal(payload.geoip_crawler_engines, '["googlebot"]')
 })
 
-test('ACL 关闭 = 释放引用但保留内联名单（关闭再打开不丢数据）', () => {
+test('ACL 关闭保留引用与内联名单（关闭再打开不丢数据）', () => {
   const payload = buildPolicyPayload(base({ ipAclEnabled: false, ipAclList: ['1.2.3.4'], ipAclListRefs: [3] }))
   assert.equal(payload.ip_acl_list, '["1.2.3.4"]')
-  assert.equal(payload.ip_acl_list_refs, '[]')
+  assert.equal(payload.ip_acl_list_refs, '[3]', '关闭开关不得静默释放引用')
 })
 
-test('信任开关三态：关闭释放引用且不生效；开启保留引用', () => {
+test('ACL 引用仅在用户显式清空后释放', () => {
+  const cleared = buildPolicyPayload(base({ ipAclEnabled: false, ipAclListRefs: [] }))
+  assert.equal(cleared.ip_acl_list_refs, '[]')
+})
+
+test('信任开关三态：关闭不生效但保留引用；开启保留引用', () => {
   const off = buildPolicyPayload(base({ ipWhitelistEnabled: false, ipWhitelist: ['9.9.9.9'], ipWhitelistRefs: [2] }))
   assert.equal(off.ip_whitelist_enabled, false)
   assert.equal(off.ip_whitelist, '["9.9.9.9"]')
-  assert.equal(off.ip_whitelist_refs, '[]')
+  assert.equal(off.ip_whitelist_refs, '[2]', '关闭开关不得静默释放引用')
   const on = buildPolicyPayload(base({ ipWhitelistEnabled: true, ipWhitelistRefs: [2] }))
   assert.equal(on.ip_whitelist_enabled, true)
   assert.equal(on.ip_whitelist_refs, '[2]')

@@ -382,11 +382,12 @@ func crsRuleIndexVersion() string {
 	return version
 }
 
-// crsRuleIndexCacheKey 计算（键, 是否可解析目录）。键 = 版本 + 目录路径 +
-// 文件聚合 stat（数量 + 最大 mtime + 总 size）。目录路径必须在键内——同
-// 统计量的不同目录（测试夹具/多目录场景）不得命中同一缓存。注意边界：
-// 「同大小内容替换且 mtime 不变」不改键（tar 解包保留 mtime 时理论可达），
-// 文件内容的逐字节变化不在键的覆盖范围内——键是代际判别器而非内容指纹。
+// crsRuleIndexCacheKey 计算索引缓存键（单返回值；目录不可解析时以 "-" 结尾
+// 参与键）：键 = 版本 + 目录路径 + 文件聚合 stat（数量 + 最大 mtime + 总
+// size）。目录路径必须在键内——同统计量的不同目录（测试夹具/多目录场景）
+// 不得命中同一缓存。注意边界：「同大小内容替换且 mtime 不变」不改键
+// （tar 解包保留 mtime 时理论可达），文件内容的逐字节变化不在键的覆盖范围
+// 内——键是代际判别器而非内容指纹。
 // crsRuleIndexKeyEvals 是测试可观察的指纹键求值计数（生产零消费，仅原子
 // 自增）：钉住「生成上下文级索引令牌 → 每轮渲染只求值一次」。
 var crsRuleIndexKeyEvals atomic.Int64
@@ -475,12 +476,12 @@ func GetCRSRuleIndex() *CRSRuleIndex {
 	return index
 }
 
-// lazyCRSRuleIndex返回链级惰性索引取值闭包：单次配置生成内
-// BuildCorazaDirectives 的三个消费点（crsCoveredInfraGroupCodes /
-// emitCRSRuleGroupSelection / emitScopedCRSExclusions）各自直调 GetCRSRuleIndex
-// 会各付一次缓存键计算（ReadDir + 全量 stat + DB 查询），200 规则全量生成时
-// 数百次纯浪费且全程持 CaddyService 写锁；闭包首次调用才取值，同链共享同一
-// 实例（零 WAF 选组/无作用域排除时不触发）。
+// lazyCRSRuleIndex 返回链级惰性索引取值闭包：单次配置生成内
+// BuildCorazaDirectives 的索引消费点（emitScopedCRSExclusions 一次取值；
+// emitCRSRuleGroupSelection 的 HasGroup 校验与 id 选组各一次取值）各自直调
+// GetCRSRuleIndex 会各付一次缓存键计算（ReadDir + 全量 stat + DB 查询），
+// 200 规则全量生成时数百次纯浪费且全程持 CaddyService 写锁；闭包首次调用
+// 才取值，同链共享同一实例（零 WAF 选组/无作用域排除时不触发）。
 func lazyCRSRuleIndex() func() *CRSRuleIndex {
 	return sync.OnceValue(GetCRSRuleIndex)
 }

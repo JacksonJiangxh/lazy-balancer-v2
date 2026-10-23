@@ -1,6 +1,7 @@
 package handlers
 
-// disabled 永久拒绝状态码、批量零目标文案。
+// 证书任务恢复链回归：disabled 任务行的永久拒绝状态码、批量签发的零目标
+// 文案，以及 downloaded 部署重排（含 DB 侧窗口/材料断言）与服务停止 409。
 
 import (
 	"database/sql"

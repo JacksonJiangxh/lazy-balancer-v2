@@ -496,3 +496,63 @@ func TestGetLogStats_singleRowRequestSkipsUnrelatedConfigReads(t *testing.T) {
 		t.Errorf("全量请求 audit_retention_months 读取 %d 次, want 1", count)
 	}
 }
+
+// 全量请求对同一 tasks 目录只枚举一次（四类已知任务行 + 逐任务行共享缓存）；
+// 失败形态同样只尝试一次——此前每个任务都重读，故障窗口退化为 O(N) 次失败
+// syscall，且失败零留痕。
+func TestGetLogStats_taskDirEnumeratedOncePerRequest(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		failDir bool
+	}{
+		{name: "success"},
+		{name: "read failure", failDir: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetLogStatsVolumeStateForTest()
+			h := newBackupTestHandlers(t)
+			base := t.TempDir()
+			tasksDir := filepath.Join(base, "tasks")
+			oldLogDir := taskengine.LogDir()
+			taskengine.SetLogDir(tasksDir)
+			t.Cleanup(func() { taskengine.SetLogDir(oldLogDir) })
+			if err := os.MkdirAll(tasksDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []string{"crs.log", "ip2region.log", "threat.log", "crawlerbot-update.log"} {
+				if err := os.WriteFile(filepath.Join(tasksDir, name), []byte("x"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			var tasksDirReads int
+			oldReadDir := logStatsReadDir
+			logStatsReadDir = func(dir string) ([]os.DirEntry, error) {
+				if filepath.Clean(dir) != filepath.Clean(tasksDir) {
+					return os.ReadDir(dir)
+				}
+				tasksDirReads++
+				if tc.failDir {
+					return nil, os.ErrPermission
+				}
+				return os.ReadDir(dir)
+			}
+			t.Cleanup(func() { logStatsReadDir = oldReadDir })
+			logs := captureLog(t)
+
+			router := gin.New()
+			router.GET("/logs/stats", h.GetLogStats)
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/logs/stats", nil))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			if tasksDirReads != 1 {
+				t.Fatalf("tasks 目录枚举次数=%d, want 1（四类已知行与逐任务行必须共享缓存）", tasksDirReads)
+			}
+			if tc.failDir && !strings.Contains(logs.String(), "日志体量读取失败") {
+				t.Fatalf("目录读失败必须留痕, logs=%q", logs.String())
+			}
+		})
+	}
+}

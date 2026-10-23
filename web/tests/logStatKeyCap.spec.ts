@@ -3,6 +3,11 @@
 //
 // 判定方式为行为求值：直接调用 utils/logStatCap 的纯函数构造满表/敌意键形态，
 // 不断言「函数文本里出现某常量」——等价重构（Map/动态桶）不应变红。
+//
+// 例外：容器必须是**无原型普通对象**。这不是实现细节而是安全不变量——键来自
+// 攻击者可控的 IP/UA/URI，原型链上的 `__proto__`/`constructor` 会侵蚀计数或
+// 污染全局原型。因此保留 `Object.getPrototypeOf(buckets.x) === null` 断言；
+// 若未来换 Map，应同步改写为「敌意键作为普通键计数」的行为断言，而不是放宽本用例。
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'

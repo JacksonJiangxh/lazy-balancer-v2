@@ -110,7 +110,7 @@ export function polysBounds(polys: number[][][]): PolysBounds {
  * 从 239 国全表压到个位数。地图侧原已实现，地球侧仍逐点全表扫描——两引擎
  * 首开耗时不对称的根因，抽到共享层单源。
  */
-export const COUNTRY_GRID_DEG = 5
+const COUNTRY_GRID_DEG = 5
 const COUNTRY_GRID_MAX_X = 71
 const COUNTRY_GRID_MAX_Y = 35
 

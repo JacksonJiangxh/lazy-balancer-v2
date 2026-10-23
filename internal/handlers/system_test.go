@@ -103,3 +103,38 @@ func TestGetSystemInfo_nodeModeUnknownWhenRoleUnavailable(t *testing.T) {
 		t.Fatalf("node_mode=%q, want unknown（查询失败不得冒充 master）", payload.Data.NodeMode)
 	}
 }
+
+// /system/logs 只读常规文件：FIFO/设备节点/目录必须 500 拒绝（open(2) 对无
+// 写端 FIFO 会无超时阻塞），且固定文案不得回显路径。
+func TestGetAppLogs_rejectsNonRegularFile(t *testing.T) {
+	dir := t.TempDir() // 目录本身即非常规目标
+	handler := &Handlers{cfg: &config.Config{LogFile: dir}}
+	router := gin.New()
+	router.GET("/system/logs", handler.GetAppLogs)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/system/logs", nil))
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s, want 500（非常规文件不得被打开）", recorder.Code, recorder.Body.String())
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, "读取日志失败") {
+		t.Fatalf("body=%s, want 固定文案", body)
+	}
+	if strings.Contains(body, dir) || strings.Contains(body, "is a directory") {
+		t.Fatalf("响应泄漏内部结构: %s", body)
+	}
+}
+
+// 「固定文案 + 服务端留痕」500 装配器的响应面回归钉：底层错误（路径/SQL/
+// errno）只能进日志，不得拼进 message。
+func TestInternalError_doesNotLeakCause(t *testing.T) {
+	cause := fmt.Errorf("open /app/secret/admin_tls.key: permission denied")
+	resp := systemInternalFailure("读取系统指标失败", cause)
+	if resp.Code != http.StatusInternalServerError || resp.Message != "读取系统指标失败" {
+		t.Fatalf("resp=%+v, want 固定文案 500", resp)
+	}
+	if strings.Contains(resp.Message, "/app/") || strings.Contains(resp.Message, "permission") {
+		t.Fatalf("响应泄漏底层错误: %q", resp.Message)
+	}
+}

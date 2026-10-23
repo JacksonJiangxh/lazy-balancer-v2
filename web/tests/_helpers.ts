@@ -36,6 +36,19 @@ export const source = (relative: string): string => readCached(new URL(relative,
 export const repoSource = (relative: string): string => readCached(new URL(`../${relative}`, webRoot))
 
 /**
+ * 剥注释视图的源文件读取。**代码存在性**正断言（`assert.match`/`includes` 找
+ * 符号、调用、分支）应默认走本函数：注释掉实现是常见的临时手段，raw 视图下
+ * 断言仍绿（假绿）。文案/模板文字断言（用户可见字符串）保留 raw。
+ *
+ * 例外只允许「文档钉」——断言的对象本就是注释文字时，用例名必须显式标注
+ * 「文档钉」，避免被误认为行为覆盖。
+ */
+export const code = (relative: string): string => stripComments(source(relative))
+
+/** 同 code，但读取相对仓库根的路径（跨栈 Go 源码存在性断言用）。 */
+export const repoCode = (relative: string): string => stripComments(repoSource(relative))
+
+/**
  * 从 startMarker 切到其后的 endMarker（endMarker 必须在 startMarker 之后）。
  * 缺任一 marker 或顺序倒置 → 抛错（而非返回空/倒置切片）；这是「限段钉」的统一边界。
  */
@@ -150,6 +163,82 @@ export const stripComments = (text: string): string => {
 }
 
 /**
+ * 成员体起点：marker 之后首个 `{` + 换行。
+ *
+ * 单表达式成员（`const h = () => ({ a: 1 })`）没有块体，`{\n` 会顺延到**下一个
+ * 成员**的块体，切片因此越界（match 可被邻接代码满足=假绿，doesNotMatch 假红）。
+ * 声明在候选 `{` 之前已结束——顶层 `;`，或行尾（顶层）`)`/`}`——一律硬失败：
+ * 说明该 marker 指向的不是块体成员，唯一正确的修法是换一个可切片的成员。
+ */
+const memberBlockOpen = (text: string, start: number, marker: string): number => {
+  const open = text.indexOf('{\n', start)
+  if (open < 0) throw new Error(`member has no body: ${marker}`)
+  type Mode = 'code' | 'line' | 'block' | 'single' | 'double' | 'template'
+  let mode: Mode = 'code'
+  let paren = 0
+  let bracket = 0
+  // 声明头里的顶层 `{...}` 只可能是类型/对象字面量（真正的函数体从 `{\n` 起算，
+  // 不在扫描范围内）——其内的 `;`（返回类型对象的属性分隔）不构成声明结束。
+  let typeBraces = 0
+  let lastSignificant = ''
+  for (let i = start; i < open; i++) {
+    const ch = text[i]
+    const next = text[i + 1]
+    if (mode === 'line') {
+      if (ch === '\n') mode = 'code'
+      continue
+    }
+    if (mode === 'block') {
+      if (ch === '*' && next === '/') { mode = 'code'; i++ }
+      continue
+    }
+    if (mode === 'single' || mode === 'double') {
+      const quote = mode === 'single' ? "'" : '"'
+      if (ch === '\\') i++
+      else if (ch === quote) mode = 'code'
+      continue
+    }
+    if (mode === 'template') {
+      if (ch === '\\') i++
+      else if (ch === '`') mode = 'code'
+      continue
+    }
+    if (ch === '/' && next === '/') { mode = 'line'; i++; continue }
+    if (ch === '/' && next === '*') { mode = 'block'; i++; continue }
+    if (ch === '"') { mode = 'double'; lastSignificant = ch; continue }
+    if (ch === "'") { mode = 'single'; lastSignificant = ch; continue }
+    if (ch === '`') { mode = 'template'; lastSignificant = ch; continue }
+    if (ch === '(') { paren++; lastSignificant = ch; continue }
+    if (ch === ')') { paren--; lastSignificant = ch; continue }
+    if (ch === '[') { bracket++; lastSignificant = ch; continue }
+    if (ch === ']') { bracket--; lastSignificant = ch; continue }
+    if (ch === '{') {
+      if (paren <= 0 && bracket <= 0) typeBraces++
+      lastSignificant = ch
+      continue
+    }
+    if (ch === '}') {
+      if (paren <= 0 && bracket <= 0 && typeBraces > 0) typeBraces--
+      lastSignificant = ch
+      continue
+    }
+    if (ch === '\n') {
+      // 顶层行尾落在 `)`/`}` = 声明已结束（单表达式箭头体 / 对象字面量成员）；
+      // 缩进内的续行（参数表/类型注解）不在此列。
+      if (paren <= 0 && bracket <= 0 && typeBraces === 0 && (lastSignificant === ')' || lastSignificant === '}')) {
+        throw new Error(`member has no block body: ${marker}`)
+      }
+      continue
+    }
+    if (ch === ';' && paren <= 0 && bracket <= 0 && typeBraces === 0) {
+      throw new Error(`member has no block body: ${marker}`)
+    }
+    if (!/\s/.test(ch)) lastSignificant = ch
+  }
+  return open
+}
+
+/**
  * 截取成员体：从 marker 处的函数/方法声明花括号配对到收尾。
  *
  * 必须按花括号配对——固定缩进启发式（找第一个 `\n    }`）会在函数内第一个内层
@@ -165,8 +254,7 @@ export const stripComments = (text: string): string => {
 export const member = (text: string, marker: string): string => {
   const start = text.indexOf(marker)
   if (start < 0) throw new Error(`missing member: ${marker}`)
-  const open = text.indexOf('{\n', start)
-  if (open < 0) throw new Error(`member has no body: ${marker}`)
+  const open = memberBlockOpen(text, start, marker)
   type Mode = 'code' | 'line' | 'block' | 'single' | 'double' | 'template'
   let mode: Mode = 'code'
   let depth = 0
@@ -270,12 +358,20 @@ const srcRoot = new URL('../src/', import.meta.url)
  * 必须在 `await import(...)` 之前调用——静态 import 先于本模块代码执行。
  * replacement 为函数时按次求值（可表达「首次失败、重试成功」）。
  */
+// 模块解析钩子：`@/x` → src/x.ts。仅当 specifier 没有扩展名时补 `.ts`——
+// 无条件拼接会把 `@/views/X.vue` 解析成 `X.vue.ts` 而失败。钩子是进程级、
+// 只能累积（registerHooks 无注销面）：单个 spec 文件只注册一次、不支持 .vue
+// 装载（模板级行为测试需另行方案，见 viewsCore 的静态 import 自检守卫）。
 export const registerModuleHooks = (replacements: Record<string, string | (() => string)> = {}): void => {
   registerHooks({
     resolve(specifier, context, nextResolve) {
       const replacement = replacements[specifier]
       if (replacement) return { url: typeof replacement === 'function' ? replacement() : replacement, shortCircuit: true }
-      if (specifier.startsWith('@/')) return nextResolve(new URL(`${specifier.slice(2)}.ts`, srcRoot).href, context)
+      if (specifier.startsWith('@/')) {
+        const target = specifier.slice(2)
+        const withExtension = /\.[a-z0-9]+$/i.test(target) ? target : `${target}.ts`
+        return nextResolve(new URL(withExtension, srcRoot).href, context)
+      }
       return nextResolve(specifier, context)
     },
   })

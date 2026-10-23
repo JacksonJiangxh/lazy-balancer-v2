@@ -437,6 +437,20 @@ func parseMetricsInterval(interval string) (modifier string, seconds int64) {
 // 样本，桶数恒 ≤720，与 GetMetricsHistory 的窗口函数范式一致）。
 const metricsHistoryBuckets = 720
 
+// bucketSecondsFor 由窗口秒数派生桶宽（两个历史端点共用的单源派生）：
+// 上取整保证 720×bucket ≥ 窗口，窗口全覆盖。向下取整会静默丢弃最旧
+// window mod 720 秒（30m 窗口丢 360s=20%，且响应无覆盖起点披露）。
+func bucketSecondsFor(windowSeconds int64) int64 {
+	if windowSeconds <= 0 {
+		return 1
+	}
+	bucket := (windowSeconds + int64(metricsHistoryBuckets) - 1) / int64(metricsHistoryBuckets)
+	if bucket < 1 {
+		bucket = 1
+	}
+	return bucket
+}
+
 // metricsHistoryRange 把规则历史端点的 range 参数解析为 (SQLite modifier,
 // 桶宽秒数, 桶数)。桶宽由 parseMetricsInterval 的窗口秒数单源派生
 // （窗口秒数/桶数）——7d 曾与 GetMetricsHistory 各写一份桶宽
@@ -450,11 +464,7 @@ func metricsHistoryRange(value string) (string, int, int) {
 		normalized = "24h"
 	}
 	modifier, seconds := parseMetricsInterval(normalized)
-	bucketSeconds := int(seconds / metricsHistoryBuckets)
-	if bucketSeconds < 1 {
-		bucketSeconds = 1
-	}
-	return modifier, bucketSeconds, metricsHistoryBuckets
+	return modifier, int(bucketSecondsFor(seconds)), metricsHistoryBuckets
 }
 
 // GetRuleMetricsHistory returns cumulative history rows for one HTTP rule
@@ -546,11 +556,9 @@ func (h *Handlers) GetMetricsHistory(c *gin.Context) {
 	// 分桶上限——镜像 get_rule_metrics_history 的窗口
 	// 函数范式（每桶取末行样本，桶数 ≤720）。此前无上限无分桶：默认配置
 	// 7 天窗 30s 间隔可达 ~2 万行 ≈2.5MB 一次性返回（5s 间隔可达 12 万行）。
-	metricsHistoryMaxBuckets := int64(metricsHistoryBuckets)
-	bucketSeconds := intervalSeconds / metricsHistoryMaxBuckets
-	if bucketSeconds < 1 {
-		bucketSeconds = 1
-	}
+	// 桶宽上取整（单源 bucketSecondsFor）：窗口含分钟级取值时必须全覆盖，
+	// 720 桶 × 向下取整桶宽会静默丢弃最旧一段。
+	bucketSeconds := bucketSecondsFor(intervalSeconds)
 
 	var rows *sql.Rows
 	var err error
@@ -578,7 +586,7 @@ func (h *Handlers) GetMetricsHistory(c *gin.Context) {
 			       requests_4xx, requests_5xx, bytes_in, bytes_out
 			FROM (SELECT bucket, requests_total, requests_2xx, requests_3xx, requests_4xx, requests_5xx, bytes_in, bytes_out
 			      FROM ranked WHERE sample_rank = 1 ORDER BY bucket DESC LIMIT ?) ORDER BY bucket
-		`, bucketSeconds, bucketSeconds, ruleID, interval, bucketSeconds, metricsHistoryMaxBuckets)
+		`, bucketSeconds, bucketSeconds, ruleID, interval, bucketSeconds, metricsHistoryBuckets)
 	} else {
 		rows, err = db.MetricsDB.Query(`
 			WITH per_ts AS (
@@ -601,7 +609,7 @@ func (h *Handlers) GetMetricsHistory(c *gin.Context) {
 			       requests_4xx, requests_5xx, bytes_in, bytes_out
 			FROM (SELECT bucket, requests_total, requests_2xx, requests_3xx, requests_4xx, requests_5xx, bytes_in, bytes_out
 			      FROM ranked WHERE sample_rank = 1 ORDER BY bucket DESC LIMIT ?) ORDER BY bucket
-		`, interval, bucketSeconds, bucketSeconds, bucketSeconds, metricsHistoryMaxBuckets)
+		`, interval, bucketSeconds, bucketSeconds, bucketSeconds, metricsHistoryBuckets)
 	}
 
 	if err != nil {

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"lazy-balancer-v2/internal/db"
@@ -85,6 +86,19 @@ func TestBatchRuleBlockPages_sameValueZeroWrite(t *testing.T) {
 	var status int
 	if err := db.DB.QueryRow(`SELECT block_page_stage1_status FROM lb_rules WHERE caddy_id='lb_b1'`).Scan(&status); err != nil || status != 404 {
 		t.Fatalf("变更未落库：status=%d err=%v, want 404", status, err)
+	}
+}
+
+// 本端点有独立 1MB 请求体上限：条数门（≤500）在解析之后才生效，沿用全局
+// 128MB/4096MB 上限会让认证用户放大解析期内存与 CPU。
+func TestBatchRuleBlockPages_rejectsOversizedBody(t *testing.T) {
+	handler, _ := newStageBatchTestHandlers(t)
+	seedStageBatchRules(t)
+	router := stageBatchRouter(handler)
+	body := `{"rule_ids":["lb_b1"],"padding":"` + strings.Repeat("x", 1<<20) + `"}`
+	response := postStageJSON(t, router, "/rules/batch-block-pages", body)
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status=%d body=%s, want 413（独立 1MB 上限）", response.Code, response.Body.String())
 	}
 }
 

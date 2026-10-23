@@ -926,7 +926,8 @@ export function createThreatGlobe(container: HTMLElement, opts?: ThreatSceneOpti
 
   function drawFlowOverlay(now: number, delta = 0): void {
     if (!flowCtx) return
-    syncFlowSize()
+    // 尺寸只在 syncSize（ResizeObserver/window resize/启动同步）里更新：
+    // 帧内读 clientWidth/clientHeight 会强制布局，同帧写 style 时尤为明显。
     const ctx = flowCtx
     ctx.setTransform(flowDpr, 0, 0, flowDpr, 0, 0)
     ctx.clearRect(0, 0, flowW, flowH)

@@ -107,7 +107,7 @@ const lastPolicyFilter = moduleRef<number | 'all'>('all')
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { request } from '@/utils/api'
+import { request, mfaAwareSuccess } from '@/utils/api'
 import { showSaveResult } from '@/utils/saveResult'
 import { useAuthStore } from '@/stores/auth'
 import { useTrustAssociation } from '@/composables/useTrustAssociation'
@@ -700,7 +700,7 @@ const cancelTrustAll = async (row: RowView): Promise<void> => {
     if (residualTrustSources.length > 0) {
       ElMessage.warning(`已移除 ${trimmedIp.value} 的可移除信任条目；但该 IP 仍由${residualTrustSources.join('、')}提供信任，拦截尚未恢复`)
     } else {
-      ElMessage.success(`已取消 ${trimmedIp.value} 对「${row.policy.name}」的信任`)
+      mfaAwareSuccess(`已取消 ${trimmedIp.value} 对「${row.policy.name}」的信任`)
     }
     invalidateSharedEntriesCache()
     await loadPolicies()

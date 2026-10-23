@@ -173,6 +173,14 @@ const rateLimitBucketCapacity = 1024
 // 每源 IP 建桶——约 147 个源 IP 就能把 1024 容量填成全匿名桶，回退全表 LRU
 // 时最旧的 ip|login / ip|register 被淘汰 = 爆破/审计放大窗口被重置且可循环。
 // 受保护桶仅在「表内只剩受保护桶」时才可能被淘汰（仍保证新键必建桶）。
+//
+// 残留风险（如实化）：表被受保护桶填满时（攻击者以 ≥1024 个源 IP 建立
+// login/register 桶），victim 的受保护桶仍会被淘汰——该键当窗计数归零，
+// 等效窗口被外部重置。这是「内存有界 + 新键必建桶」与「受保护窗口不可重置」
+// 之间的取舍：拒绝新键会让合法新来源在表满时被永久限流（DoS 面更大）。
+// 淘汰只发生在攻击者已能制造 1024 个受保护键的前提下，故不改变 tier 次序。
+// 跨实例在途释放不需要额外身份校验：release 持有 reserve 返回的桶指针，
+// 淘汰后重建的是新对象，旧指针的 count-- 只作用于已脱表实例。
 // 调用方须持有 loginRateBuckets.Lock。
 func evictLeastRecentlyUsedRateLimitBucketLocked() {
 	victim := lruVictimLocked(rateLimitEvictCredentialOnly)
@@ -639,7 +647,7 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 			// adminOnly 先于 mfaStepUpGuard——非管理员打 admin 端点
 			// 先见 403 角色真因；step-up 仍在 readOnlyGuard 之前（从节点
 			// 403 先于 428 的守卫内短路口径不变）。
-			adminGroup.Use(adminOnly(), mfaStepUpGuard(), readOnlyGuard(db.DB))
+			adminGroup.Use(adminOnly(), mfaStepUpGuard(db.DB), readOnlyGuard(db.DB))
 			admin := recordingRouterGroup{RouterGroup: adminGroup, recorded: make(map[string]struct{})}
 			{
 				admin.POST("/users", h.CreateUser)
@@ -769,7 +777,7 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 			// step-up 在前，验码重试后才见 403，与 admin 组已修的误导链同型）。
 			// 自助路径经 isSelfServicePath 放行后照常进 step-up（428 链不变）；
 			// 从节点 403 先于 428 由只读门直接达成。
-			business.Use(readOnlyGuard(db.DB), mfaStepUpGuard())
+			business.Use(readOnlyGuard(db.DB), mfaStepUpGuard(db.DB))
 			{
 				// 任务监控聚合视图（全员可见；从节点经 readOnlyGuard 只读可用）
 				business.GET("/system/tasks", h.ListSystemTasks)
@@ -1325,7 +1333,11 @@ func apiKeyReadOnlyGuard() gin.HandlerFunc {
 // JWT 重试。API Key/MCP 认证豁免（机器身份无 MFA 概念）。（2026-09 审计）
 // GET /config/export 与写操作同级（导出含全部用户/密钥哈希的完整备份），一并
 // 纳入 step-up 覆盖。
-func mfaStepUpGuard() gin.HandlerFunc {
+//
+// database 由装配期捕获（与 readOnlyGuard/clusterVersionMiddleware 同口径）：
+// 此前后备角色读取走包级 db.GetDB()，成为本包唯一「句柄来源第三态」——测试
+// 注入/多库形态下与同请求上的只读门可能读到不同库（一处 403、一处 428/放行）。
+func mfaStepUpGuard(database *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		path := c.FullPath()
 		if path == "" {
@@ -1379,7 +1391,6 @@ func mfaStepUpGuard() gin.HandlerFunc {
 		// 查询失败与只读门同语义 fail-closed 500。verify-step/logout 已在上游
 		// 豁免，本判定影响本将收到 428 的写请求与敏感 GET 导出（从节点敏感 GET 导出现同此短路，直收 403，不再先 428——注释勘正）。
 		var isMaster bool
-		database := db.GetDB()
 		if database == nil {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"code": 500, "message": "节点角色查询失败"})
 			return

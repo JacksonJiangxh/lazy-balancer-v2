@@ -46,8 +46,9 @@ func run() error {
 	initDB := flag.Bool("init", false, "Initialize database")
 	flag.Parse()
 
-	// Load configuration
-	cfg := config.Load(*configPath)
+	// Load configuration。启动期告警先收集（此刻日志尚未接入运行日志文件与
+	// 级别门，直接打印只到容器 stdout），日志装配完成后统一重放。
+	cfg, cfgWarnings := config.LoadCollectWarnings(*configPath)
 
 	// 信号注册前置到 run() 开头、一切阻塞装配
 	// （DB/日志/InitTaskEngine 内含 BootSync：配置载入/证书物化/Caddy 应用，
@@ -83,15 +84,18 @@ func run() error {
 	if err := db.Initialize(cfg.DataDir); err != nil {
 		return fmt.Errorf("initialize database: %w", err)
 	}
-	// 运行日志大小刷新 worker 在库就绪后启动：首次刷新即读真实库值
-	//（此前包 init 自启，首刷必撞 nil 库空转，启动 30s 内按兜底 100MB）。
-	services.StartLogRotate(context.Background())
 	defer func() {
 		if err := db.Close(); err != nil {
 			services.Logf("error", "close databases during shutdown: %v", err)
 		}
 	}()
 	services.ApplyLogLevel()
+	// 配置载入期告警重放：此刻运行日志文件写端与级别门都已装配，误配信号
+	// （未知键/类型错误/弱 JWT 密钥/caddy_admin_url 失联/APP_VERSION 未注入）
+	// 才进入统一日志链——此前只到容器 stdout，只采集日志文件的部署看不到。
+	for _, warning := range cfgWarnings {
+		services.Logf("warn", "%s", warning)
+	}
 	// 独立 module 边界包（acme/ownership 不得回依赖 services）的
 	// 日志接缝在此装配——装配后其告警进入统一日志级别链（services.Logf）。
 	acme.SetLogf(services.Logf)
@@ -116,6 +120,17 @@ func run() error {
 		return nil
 	}
 
+	// 集群版本触发器就绪门（先于任务引擎与一切后台写者）。
+	// HTTP 侧的 fail-closed 只覆盖请求链；引擎内的周期任务（CRS/IP2Region/
+	// 威胁/爬虫/cert-renewal/autoban）直接经主库句柄写同步表，触发器缺失时
+	// 这些写不 bump cluster_version——面板看起来「同步写 500，保护到位」，实际
+	// 后台写者照常落库且不 bump：从节点 304 门恒定命中旧指纹，主端稳态变更
+	// 永不传播，任务日志全绿。触发器是同步正确性的结构性前提，安装失败即拒绝
+	// 启动（容器重启策略接管），不得带病运行。
+	if err := middleware.InstallClusterVersionTriggers(db.GetDB()); err != nil {
+		return fmt.Errorf("install cluster version triggers before task engine start: %w", err)
+	}
+
 	var tz string
 	// 默认时区单源 db.DefaultTimezone（DDL DEFAULT 与迁移归一同一常量）——
 	// 启动期读侧写死字面量会与库默认值分叉：DDL 改动后进程时区仍取旧值，
@@ -129,15 +144,26 @@ func run() error {
 		tz = loaded
 	}
 	if tz != "" {
-		if err := os.Setenv("TZ", tz); err != nil {
-			services.Logf("error", "failed to set TZ environment: %v", err)
-		} else if loc, err := services.ConfigureLocation(tz); err != nil {
+		// 正确性由 ConfigureLocation 决定（面板/任务/审计/tzLogWriter 的展示
+		// 时区单源，atomic 指针）。time.Local 只影响第三方库的默认格式化，
+		// 但必须在本进程任何 worker 启动之前赋值——logrotate 的 time.Now()
+		// 会读它（裸写与后台读构成数据竞争）。因此本段排在 StartLogRotate 前。
+		if loc, err := services.ConfigureLocation(tz); err != nil {
 			services.Logf("error", "failed to load timezone %s: %v", tz, err)
 		} else {
 			time.Local = loc
 			log.Printf("Timezone set to %s", tz)
 		}
+		// TZ 只影响后续 os/exec 子进程（caddy CLI 校验）的环境；与
+		// ConfigureLocation 互不相关，失败不得阻断主路径（此前 else-if 把
+		// 两条串行，setenv 失败会让面板时区静默不生效）。
+		if err := os.Setenv("TZ", tz); err != nil {
+			services.Logf("error", "failed to set TZ environment（仅影响 caddy CLI 等子进程）: %v", err)
+		}
 	}
+	// 运行日志大小刷新 worker 在库就绪且时区生效后启动：首次刷新即读真实库值
+	//（此前包 init 自启，首刷必撞 nil 库空转，启动 30s 内按兜底 100MB）。
+	services.StartLogRotate(context.Background())
 
 	// Initialize services
 	caddyService := services.NewCaddyServiceWithMetricsURL(cfg.CaddyAdminURL, cfg.CaddyMetricsURL)
@@ -168,7 +194,7 @@ func run() error {
 	services.InitIP2RegionUpdateManager(services.TrackBackgroundReload(services.BackgroundApplyIP2Region, caddyReloader))
 	metricsService := services.NewMetricsService(cfg.CaddyMetricsURL, cfg.MetricsInterval)
 	syncService := services.NewSyncService(db.DB, cfg, caddyService)
-	lifecycle := newRuntimeLifecycle(syncService, func() certificateWorker {
+	lifecycle := newRuntimeLifecycle(syncService, func() lifecycleWorker {
 		return services.NewCertificateService()
 	})
 	clusterService := services.NewClusterService(db.DB, cfg.DataDir)
@@ -306,6 +332,13 @@ func run() error {
 	// cleanup defer 的引擎排空/ACME 收尾共用同一 deadline（惰性起算）。
 	shutdown := newShutdownBudget()
 	defer func() {
+		// 进入关停收尾的第一件事：停止向 quit 转发信号。此后第二次
+		// SIGTERM/SIGINT 走默认动作，可强制结束卡在收尾段的进程——此前只有
+		// quit/restart 分支显式 Stop，serverErrors 异常退出与早退路径在收尾
+		// 窗口（最坏 25s）内第二次信号会被缓冲丢弃，恰是最需要「第二击」的
+		// 场景没有逃生门。signal.Stop 幂等，与 waitForServerStop 内的显式调用
+		// 并存安全。
+		signal.Stop(quit)
 		cancelThreatRollupWarmer()
 		// warmer 只在轮次之间检查 ctx：在途固化批不会被打断，可能继续读写到
 		// db.Close 之后（"database is closed" 告警 + 该批回滚）。与同层 worker
@@ -436,9 +469,19 @@ func newRestartSignal() (<-chan struct{}, func()) {
 // Go 侧改为单一总预算 25s（留 5s 余量给日志 flush/进程退出），
 // 各段从共享 deadline 派生并钳制：
 //
-//	HTTP ≤10s，Caddy 排水 ≤2s，引擎排空 = 剩余−收尾段预留，
-//	metrics/时区/日志轮转等待 ≤2s/1s/1s，ACME 收尾 ≤5s
-//	→ 最坏 10+2+4+2+1+1+5=25s ≤ 30s grace。
+// 实际 defer 顺序（与 cleanup defer 体逐行对应）：
+//
+//	HTTP ≤10s → Caddy 排水 ≤2s → 威胁大屏 warmer ≤2s
+//	→ 引擎排空 = 剩余 − trailingStopReserve
+//	→ 引擎句柄清理 = min(≤5s, 剩余 − trailingStopReserve)
+//	→ metrics 清理等待 = min(≤3s, 剩余 − trailingStopReserve)
+//	→ metrics 采集 ≤2s → 时区 ≤1s → 日志轮转 ≤1s → ACME 收尾 ≤5s
+//
+// 最坏 10+2+2+2+0+0+2+1+1+5 = 25s ≤ 30s grace（引擎吃满时两处
+// segmentReserving 段按设计归 0）。deadline 之外还有 engineHandleSwapGrace
+// (50ms) 与各 select 定时器的调度余量。唯一事实源是
+// shutdown_budget_test.go 的 fake-clock 最坏路径断言——本注释只是导读；
+// 新增收尾段必须同时加常量、更新 trailingStopReserve 与测试。
 const (
 	processShutdownBudget  = 25 * time.Second
 	httpShutdownSegmentMax = 10 * time.Second
@@ -638,8 +681,8 @@ func waitForServerStop(server *http.Server, signals serverStopSignals) error {
 	// 此前仅 quit 分支停通道：restart 分支的关停窗口内第二个信号会被通道
 	// 缓冲，随后被 run() 返回后的 defer signal.Stop 冲刷丢弃，无法触发默认
 	// 终止（用户第二次 / SIGTERM 应能强制结束卡顿的关停）。
-	// serverErrors 分支直接返回：服务已异常、进程随即退出，由 run() 的
-	// defer signal.Stop 收尾。
+	// serverErrors 分支直接返回：服务已异常，由 run() 的关停收尾 defer 首行
+	// signal.Stop 收尾（同样关闭第二次信号的逃生门）。
 	signal.Stop(signals.quit)
 
 	log.Println("Shutting down...")
@@ -666,11 +709,16 @@ func waitForServerStop(server *http.Server, signals serverStopSignals) error {
 	return nil
 }
 
-// caddyPauseFilePath 与 handlers 包的 caddyPauseFile（internal/handlers/caddy.go）
+// caddyPauseFileDefaultPath 与 handlers 包的 caddyPauseFile（internal/handlers/caddy.go）
 // 及 docker-entrypoint.sh 的 CADDY_PAUSE_FILE 同值 "/tmp/lazy-balancer-caddy-paused"
-// ——main 包不 import handlers 的未导出变量，自持常量并以注释互指；任一侧
-// 改路径须三处同步（handlers 侧为测试注入缝用 var，本侧停机路径无注入需求用 const）。
-const caddyPauseFilePath = "/tmp/lazy-balancer-caddy-paused"
+// ——main 包不 import handlers 的未导出变量，自持路径并以注释互指；任一侧
+// 改路径须三处同步。
+const caddyPauseFileDefaultPath = "/tmp/lazy-balancer-caddy-paused"
+
+// caddyPauseFilePath 是停机路径的 pause 标记路径（包级变量而非常量：
+// 测试需要注入临时目录验证「不存在则建/已存在不覆盖/写失败留痕」三条语义；
+// 与 handlers 侧同形态）。
+var caddyPauseFilePath = caddyPauseFileDefaultPath
 
 // writeDrainPauseFile：排水前建 pause 标记，让监督器把
 // 本次优雅停机按「admin 停止」分支处理（docker-entrypoint.sh 见文件不重启、
@@ -689,7 +737,12 @@ func writeDrainPauseFile() {
 	if _, err := os.Stat(caddyPauseFilePath); err == nil {
 		return
 	}
-	_ = os.WriteFile(caddyPauseFilePath, nil, 0o644)
+	// 写失败必须可见：pause 语义失效时监督器按崩溃重拉（排水窗口内抢绑
+	// 80/443 + 伪 CRASHES 计数），现象在 Caddy/监督器侧，app 侧零线索则
+	// 排查无门。行为保持 best-effort：仍继续排水请求。
+	if err := os.WriteFile(caddyPauseFilePath, nil, 0o644); err != nil {
+		services.Logf("warn", "Caddy pause 标记 %s 写入失败（监督器将按崩溃重拉）: %v", caddyPauseFilePath, err)
+	}
 }
 
 // drainCaddy best-effort 请求 Caddy admin /stop（timeout 上限，错误只记日志）。
@@ -724,9 +777,17 @@ type tzLogWriter struct {
 // Write 必须按 io.Writer 契约返回 len(p)——向下写的是 prefix+p，直接转交
 // 底层返回值会报告 n > len(p)。当前唯一消费者（log.Logger）忽略 n，但一旦
 // 日志链路引入缓冲/io.Copy/短写校验，越界 n 会被当成合法字节数使用。
+//
+// 前缀与正文分两次写而不是 append 拼接：日志每行都走本函数
+// （任务/审计/安全事件密集时每秒数百行），拼接会为每行新分配
+// len(prefix)+len(p) 字节的短命切片。两次写的原子性由上游保证：
+// log.Logger.Output 在调用 Write 期间持自身互斥（本 writer 无第二写者）。
 func (t *tzLogWriter) Write(p []byte) (int, error) {
 	prefix := time.Now().In(services.CurrentLocation()).Format("2006/01/02 15:04:05 ")
-	if _, err := t.w.Write(append([]byte(prefix), p...)); err != nil {
+	if _, err := t.w.Write([]byte(prefix)); err != nil {
+		return 0, err
+	}
+	if _, err := t.w.Write(p); err != nil {
 		return 0, err
 	}
 	return len(p), nil

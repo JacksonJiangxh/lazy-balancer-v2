@@ -2,9 +2,11 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -270,5 +272,28 @@ func TestCrawlerRunUpdate_inflatedSourceKeepsPreviousSnapshot(t *testing.T) {
 	logText := readTaskLog(t, "crawlerbot-update")
 	if !strings.Contains(logText, "超过系统名单上限") {
 		t.Fatalf("任务日志缺少扩张门拒绝原因:\n%s", logText)
+	}
+}
+
+// 快照比对与 DB 条目比对必须同一多重集口径：长度 + 成员包含会把
+// got=[A,B] / entries=[A,A] 判为一致（多出的 B 被保留，fail-open 方向）。
+func TestCrawlerSnapshotMatchesEngine_usesMultisetNotMembership(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "crawler-ip-lists.json")
+	restore := SetCrawlerIPListFileForTest(path)
+	t.Cleanup(restore)
+	payload, err := json.Marshal(map[string][]string{"googlebot": {"1.1.1.0/24", "2.2.2.0/24"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if crawlerSnapshotMatchesEngine("googlebot", []string{"1.1.1.0/24", "1.1.1.0/24"}) {
+		t.Fatal("快照 [A,B] 与期望 [A,A] 长度相同、A 命中——多重集口径必须判为不一致")
+	}
+	if !crawlerSnapshotMatchesEngine("googlebot", []string{"2.2.2.0/24", "1.1.1.0/24"}) {
+		t.Fatal("同值不同序必须判为一致（顺序无关）")
 	}
 }

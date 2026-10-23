@@ -23,22 +23,14 @@ test('只有已启用信任命中才抑制新增信任', () => {
 test('引用列表仅精确条目可移除，removed=false 不得报成功', () => {
   const text = source('src/views/security/IPLocationAction.vue')
   assert.match(text, /const ipExactListIds = computed/)
-  // 原正则 /removableTrustRefLists[\s\S]*?\.map\(...\)/ 的惰性
-  // 终点仍可跨语句——信任侧 .map 被重构掉时会延伸到 ACL 赋值（同形 .map），
-  // 由 ACL 的精确条目过滤让断言通过。改为「语句级限段（到下一个行首注释）+
-  // 各自 refs 过滤谓词」：两个赋值必须各自按本侧 refs + 精确条目双重过滤。
-  const statementBlock = (head: string): string => {
-    const start = text.indexOf(head)
-    assert.ok(start >= 0, `${head} 未找到`)
-    const end = text.indexOf('\n  //', start)
-    assert.ok(end > start, `${head} 语句块缺终止边界`)
-    return text.slice(start, end)
-  }
-  const trustBlock = statementBlock('view.removableTrustRefLists = ipLists.value')
+  // 语句级限段用**下一条语句声明**作终点（结构边界），不再用行首注释——
+  // 语句内插入一行注释就会提前截断（假红）。两个赋值必须各自按本侧 refs +
+  // 精确条目双重过滤。
+  const trustBlock = section(text, 'view.removableTrustRefLists = ipLists.value', '\n  const aclRefIds')
   assert.match(trustBlock, /trustRefIds\.includes\(l\.id\)/, '信任引用移除列表必须按信任 refs 过滤')
   assert.match(trustBlock, /ipExactListIds\.value\.has\(l\.id\)/, '信任引用移除列表必须过滤为精确条目命中')
   assert.match(trustBlock, /\.map\(\(l\) => \(\{ id: l\.id, name: l\.name \}\)\)/)
-  const aclBlock = statementBlock('view.removableRefLists = ipLists.value')
+  const aclBlock = section(text, 'view.removableRefLists = ipLists.value', '\n  const { detectionOwner')
   assert.match(aclBlock, /ip_acl_list_refs\)\.includes\(l\.id\)/, 'ACL 引用移除列表必须按 ACL refs 过滤')
   assert.match(aclBlock, /ipExactListIds\.value\.has\(l\.id\)/, 'ACL 引用移除列表必须过滤为精确条目命中')
   assert.match(aclBlock, /\.map\(\(l\) => \(\{ id: l\.id, name: l\.name \}\)\)/)
@@ -523,7 +515,8 @@ test('CRS 规则文件加载失败任何形态都给可见错误态（旧数据�
 test('大屏分级回退不含限流 429（限流不进安全事件表）', () => {
   const sev = stripComments(member(source('src/views/security/ThreatScreen.vue'), 'function sevOf('))
   assert.doesNotMatch(sev, /'429'/, '429 不进事件表，回退分支不可达')
-  assert.match(sev, /if \(rt === '8' \|\| \/\^8\\d\{5\}\$\/\.test\(rt\)\) return down\('mid'\)/)
+  assert.match(sev, /zeroScoreSeverity\(ev\.rule_triggered/, '0 分行回退必须走 severityScale 单源')
+  assert.doesNotMatch(sev, /\^8\\d\{5\}\$/, '回退族不得回流视图')
 })
 
 test('名单条目镜像只在缓存确有新增时重建，跨策略并集/Set 不随增删重算', () => {

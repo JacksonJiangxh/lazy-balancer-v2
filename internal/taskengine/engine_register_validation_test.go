@@ -147,3 +147,34 @@ func TestEngineRegister_rejectsCancelHookWithoutCancelable(t *testing.T) {
 		t.Fatalf("Cancelable+CancelHook 合法组合不得误拒: %v", err)
 	}
 }
+
+// 常驻族不支持取消：Cancel 只按 Cancelable 路由，被取消的 daemon 走「非异常
+// 退出」（abnormal=false、pendingRestart=false），loop_on 保持 true 而
+// running=false、监控判 idle——常驻采集/签发/同步永久停摆且无任何信号。
+// 守卫与 Daemon∧EnabledFn 同范式：注册期响亮拒绝（启停用 StartLoop/StopLoop）。
+func TestEngineRegister_rejectsCancelableDaemon(t *testing.T) {
+	e := NewEngine(Options{})
+	t.Cleanup(e.Stop)
+	d := validRegisterDescriptor()
+	d.Kind = KindDaemon
+	d.IntervalFn = nil
+	d.Cancelable = true
+	if err := e.Register(d); err == nil {
+		t.Fatal("KindDaemon∧Cancelable 必须响亮拒绝（取消即永久停止且无异常信号）")
+	}
+	// 对照形状：非常驻族 Cancelable 合法。
+	d2 := validRegisterDescriptor()
+	d2.ID = "valid-cancelable"
+	d2.Cancelable = true
+	if err := e.Register(d2); err != nil {
+		t.Fatalf("非常驻族 Cancelable 合法组合不得误拒: %v", err)
+	}
+	// 对照形状：非常驻 Daemon（无 Cancelable）合法。
+	d3 := validRegisterDescriptor()
+	d3.ID = "valid-daemon"
+	d3.Kind = KindDaemon
+	d3.IntervalFn = nil
+	if err := e.Register(d3); err != nil {
+		t.Fatalf("常驻族未声明 Cancelable 不得误拒: %v", err)
+	}
+}

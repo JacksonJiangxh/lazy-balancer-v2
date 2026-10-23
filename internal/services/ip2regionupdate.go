@@ -286,8 +286,9 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 		m.advanceSlotIfAuto(trigger)
 		return
 	} else if !isMaster {
-		// 从节点中止是正常跳过语义，镜像 CRS——
-		// 落 skipped 终态、审计「更新跳过」，不再记「更新失败」。
+		// 从节点中止是正常跳过语义，镜像 CRS——内存终态 + 更新日志/审计
+		// 留痕（「更新跳过」），不写版本表（从节点只读不变量：版本行由集群
+		// 同步治理），因此进程重启后 StatusSnapshot 会回退为存储行的 idle。
 		m.syncInstalledVersionToState()
 		m.setStage(IP2RegionStatusSkipped, "当前节点为从节点，终止 IP2Region 更新")
 		return
@@ -360,11 +361,14 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 		}
 		WriteIP2RegionUpdateLog("INFO", string(IP2RegionStatusSuccess), "已是最新版本，无需更新")
 		if _, err := db.DB.Exec(
-			// 排程槽生命周期（2026-10-11 用户裁定）：仅 auto 且现存槽空/过期才推进——手动触发不动预约、未来槽不回拨。
-			"UPDATE security_ip2region_version SET update_status='success', message='已是最新版本', finished_at=datetime('now'), consecutive_failures=0, "+versionTableSlotAdvanceSQL+" WHERE id=1",
-			trigger, versionTableNextSlot("security_ip2region_version", time.Now().UTC()),
+			// 排程槽：成功轮 auto/manual 同权、仅现存槽空/过期才推进——未来槽不回拨
+			// （手动成功必须推进过期槽，否则引擎已消费而业务槽停滞，四族自动更新停摆）。
+			"UPDATE security_ip2region_version SET update_status='success', message='已是最新版本', finished_at=datetime('now'), consecutive_failures=0, "+versionTableSlotSuccessSQL+" WHERE id=1",
+			trigger, trigger, versionTableNextSlot("security_ip2region_version", time.Now().UTC()),
 		); err != nil {
-			Logf("warn", "ip2region update: failed to record latest-version skip: %v", err)
+			// 成功轮排程槽推进写失败=引擎已消费过期槽而业务槽停滞（静默停摆），
+			// 级别与后果匹配。
+			Logf("error", "ip2region update: failed to record latest-version skip（排程槽可能未推进）: %v", err)
 		}
 		m.mu.Lock()
 		m.state.status = IP2RegionStatusSuccess
@@ -526,8 +530,8 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 	}
 
 	if _, err := db.DB.Exec(
-		"UPDATE security_ip2region_version SET version=?, updated_at=datetime('now'), update_status='success', message='', finished_at=datetime('now'), consecutive_failures=0, "+versionTableSlotAdvanceSQL+" WHERE id=1",
-		tag, trigger, versionTableNextSlot("security_ip2region_version", time.Now().UTC()),
+		"UPDATE security_ip2region_version SET version=?, updated_at=datetime('now'), update_status='success', message='', finished_at=datetime('now'), consecutive_failures=0, "+versionTableSlotSuccessSQL+" WHERE id=1",
+		tag, trigger, trigger, versionTableNextSlot("security_ip2region_version", time.Now().UTC()),
 	); err != nil {
 		Logf("error", "ip2region update: failed to record success: %v", err)
 	}
@@ -548,9 +552,10 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 	WriteIP2RegionUpdateLog("INFO", string(IP2RegionStatusSuccess), fmt.Sprintf("ip2region 已更新到 %s", tag))
 }
 
-// advanceSlotIfAuto 落定推进排程槽（排程槽生命周期，2026-10-11 用户裁定）：
-// 仅 auto 触发且现存槽空/过期才推进（委托 advanceVersionSlotIfDue 的「未来槽
-// 不污染」门）——手动触发不动预约槽。
+// advanceSlotIfAuto 落定推进排程槽（失败/取消路径）：仅 auto 触发且现存槽
+// 空/过期才推进（委托 advanceVersionSlotIfDue 的「未来槽不污染」门）——手动轮
+// 失败由引擎退避重投同一槽，业务不抢先推进（手动**成功**按 schedule.go 成功门
+// 推进，不经过本函数）。
 func (m *IP2RegionUpdateManager) advanceSlotIfAuto(trigger string) {
 	if trigger != "auto" {
 		return
@@ -963,9 +968,11 @@ func (m *IP2RegionUpdateManager) successAfterReloadFailOpen(tag string, reloadEr
 		}
 		warn += "内存 searcher 未切换，重启后生效"
 	}
+	// 触发来源单次快照：成功门两次绑定同一值（两次读取间不得出现翻转）。
+	trigger := m.currentTrigger()
 	if _, err := db.DB.Exec(
-		"UPDATE security_ip2region_version SET version=?, updated_at=datetime('now'), update_status='success', message=?, finished_at=datetime('now'), consecutive_failures=0, "+versionTableSlotAdvanceSQL+" WHERE id=1",
-		tag, warn, m.currentTrigger(), versionTableNextSlot("security_ip2region_version", time.Now().UTC()),
+		"UPDATE security_ip2region_version SET version=?, updated_at=datetime('now'), update_status='success', message=?, finished_at=datetime('now'), consecutive_failures=0, "+versionTableSlotSuccessSQL+" WHERE id=1",
+		tag, warn, trigger, trigger, versionTableNextSlot("security_ip2region_version", time.Now().UTC()),
 	); err != nil {
 		Logf("error", "ip2region update: failed to record fail-open success: %v", err)
 	}
@@ -987,20 +994,9 @@ func (m *IP2RegionUpdateManager) successAfterReloadFailOpen(tag string, reloadEr
 // recover 兜底：结构自检门只覆盖已知布局（头/向量索引/段索引指针），绑定库
 // 对内容缓冲区的其余无边界切片（段数据 dataPtr 带外等）仍以 panic 呈现
 // ——校验必须把 panic 转成错误并留堆栈，绝不让待安装工件崩溃进程。
-func validateIP2RegionXDB(path string) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			Logf("error", "ip2region update: probe search panicked on staged xdb %s: %v\n%s", path, r, debug.Stack())
-			err = fmt.Errorf("校验 ip2region xdb: 探针搜索触发内部异常（文件损坏）: %v", r)
-		}
-	}()
-	searcher, err := openIP2RegionSearcher(path)
-	if err != nil {
+func validateIP2RegionXDB(path string) error {
+	if _, err := openValidatedIP2RegionSearcher(path); err != nil {
 		return fmt.Errorf("校验 ip2region xdb: %w", err)
-	}
-	defer searcher.Close()
-	if _, err := searcher.Search("114.114.114.114"); err != nil {
-		return fmt.Errorf("校验 ip2region xdb 搜索失败: %w", err)
 	}
 	return nil
 }

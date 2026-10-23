@@ -230,7 +230,7 @@ func TestSecurityEventsArchiveSkipBytes_coversWholeDiscardedTail(t *testing.T) {
 	if err := os.WriteFile(logPath, payload, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := securityEventsIngestDeltaFrom(logPath, 0, true); err != nil {
+	if _, _, err := securityEventsIngestDeltaFrom(logPath, 0, true); err != nil {
 		t.Fatalf("archive pass: %v", err)
 	}
 	if !stallHasEvent(t, "tx-stall-a") {

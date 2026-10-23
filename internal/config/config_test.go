@@ -494,3 +494,132 @@ func TestLoad_portBoundsBeforeConversion(t *testing.T) {
 		})
 	}
 }
+
+// 启动期配置告警必须能交回调用方重放：LoadCollectWarnings 不直接打印，
+// 由 main 在运行日志装配完成后经统一日志级别门重放——否则只采集日志文件的
+// 部署看不到未知键/类型错误/弱密钥/APP_VERSION 未注入等误配信号。
+func TestLoadCollectWarnings_defersWarningsToCaller(t *testing.T) {
+	t.Setenv("JWT_SECRET", "test-secret")
+	t.Setenv("APP_VERSION", "")
+	var logBuf bytes.Buffer
+	origOut := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(origOut) })
+
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(configPath, []byte(`{"port":"not-a-number","bogus_key":1}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, warnings := LoadCollectWarnings(configPath)
+
+	if logBuf.Len() != 0 {
+		t.Fatalf("收集模式不得直接打印告警，got %q", logBuf.String())
+	}
+	if loaded.Port != 8000 {
+		t.Fatalf("port=%d, want 默认 8000（类型错误沿用默认值）", loaded.Port)
+	}
+	joined := strings.Join(warnings, "\n")
+	for _, want := range []string{
+		`invalid type for key "port"`,
+		`ignoring unsupported config key "bogus_key"`,
+		"APP_VERSION 未注入",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("告警缺失 %q，got %q", want, joined)
+		}
+	}
+
+	// 对照：Load 仍直接打印（既有调用面/测试捕获口径不变）。
+	logBuf.Reset()
+	Load("")
+	if !strings.Contains(logBuf.String(), "APP_VERSION 未注入") {
+		t.Fatalf("Load 必须保持直接打印告警，got %q", logBuf.String())
+	}
+}
+
+// configFileKeys 是配置键的唯一登记表：类型校验与应用都由同一登记项驱动。
+// 本用例逐键机械对表——正确类型必须生效且零类型告警，错误类型必须告警且
+// 不改默认值。新增键漏写 apply（"支持但静默不生效"）会在此变红。
+func TestConfigFileKeys_everyKeyAppliesAndValidates(t *testing.T) {
+	t.Setenv("JWT_SECRET", "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a3928")
+	cases := []struct {
+		key      string
+		goodJSON string
+		check    func(t *testing.T, cfg *Config)
+	}{
+		{key: "data_dir", goodJSON: `"/tmp/lb-data-dir"`, check: func(t *testing.T, cfg *Config) {
+			if cfg.DataDir != "/tmp/lb-data-dir" {
+				t.Fatalf("data_dir=%q", cfg.DataDir)
+			}
+		}},
+		{key: "static_dir", goodJSON: `"/tmp/lb-static"`, check: func(t *testing.T, cfg *Config) {
+			if cfg.StaticDir != "/tmp/lb-static" {
+				t.Fatalf("static_dir=%q", cfg.StaticDir)
+			}
+		}},
+		{key: "port", goodJSON: `18081`, check: func(t *testing.T, cfg *Config) {
+			if cfg.Port != 18081 {
+				t.Fatalf("port=%d", cfg.Port)
+			}
+		}},
+		{key: "caddy_admin_url", goodJSON: `"http://127.0.0.1:12019"`, check: func(t *testing.T, cfg *Config) {
+			if cfg.CaddyAdminURL != "http://127.0.0.1:12019" {
+				t.Fatalf("caddy_admin_url=%q", cfg.CaddyAdminURL)
+			}
+		}},
+		{key: "caddy_metrics_url", goodJSON: `"http://127.0.0.1:12019/metrics"`, check: func(t *testing.T, cfg *Config) {
+			if cfg.CaddyMetricsURL != "http://127.0.0.1:12019/metrics" {
+				t.Fatalf("caddy_metrics_url=%q", cfg.CaddyMetricsURL)
+			}
+		}},
+		{key: "metrics_interval", goodJSON: `17`, check: func(t *testing.T, cfg *Config) {
+			if cfg.MetricsInterval != 17 {
+				t.Fatalf("metrics_interval=%d", cfg.MetricsInterval)
+			}
+		}},
+	}
+	if len(cases) != len(configFileKeys) {
+		t.Fatalf("用例 %d 个，configFileKeys %d 个——新增键必须同步补对表用例", len(cases), len(configFileKeys))
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.key, func(t *testing.T) {
+			spec, ok := configFileKeys[tc.key]
+			if !ok {
+				t.Fatalf("configFileKeys 缺键 %q", tc.key)
+			}
+			path := filepath.Join(t.TempDir(), "config.json")
+			if err := os.WriteFile(path, []byte(`{"`+tc.key+`":`+tc.goodJSON+`}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, warnings := LoadCollectWarnings(path)
+			for _, w := range warnings {
+				if strings.Contains(w, "invalid type") || strings.Contains(w, "unsupported") {
+					t.Fatalf("正确类型不得告警: %q", w)
+				}
+			}
+			tc.check(t, cfg)
+
+			// 畸形形状：类型不符必须告警且沿用默认值。
+			// 反类型：字符串键喂数字、数值键喂字符串（类型不符必须告警）。
+			badJSON := `123`
+			if spec.kind == configNumberValue {
+				badJSON = `"7"`
+			}
+			if err := os.WriteFile(path, []byte(`{"`+tc.key+`":`+badJSON+`}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			_, warnings = LoadCollectWarnings(path)
+			found := false
+			for _, w := range warnings {
+				if strings.Contains(w, `invalid type for key "`+tc.key+`"`) {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("错误类型必须告警，got %q", warnings)
+			}
+		})
+	}
+}

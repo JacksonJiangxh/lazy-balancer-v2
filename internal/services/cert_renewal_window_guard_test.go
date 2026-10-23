@@ -28,16 +28,19 @@ func seedRenewalWindowJob(t *testing.T, database *sql.DB, ruleID, domain string,
 // 续签窗口覆盖证书寿命时（days*24h >= NotAfter-NotBefore）不得每轮重签：
 // 此时「选中证书 NotAfter 晚于 now+days」的去抖门在成功签发后恒假，6h 扫描
 // 会把刚签下的证书反复入队；CA 重复证书限流后任务落 failed（只能手动重试），
-// 约一个寿命周期后证书到期、TLS 中断。写侧 0-90 与 90 天证书寿命重合是常态，
-// 因此防线在扫描侧，且剩余 ≤ 7 天的保护区必须放行续签。
+// 约一个寿命周期后证书到期、TLS 中断。写侧/导入已收敛到安全上限
+// （CertRenewalDaysMax），但 CA 实际签发的寿命可能短于规划值，因此扫描侧仍
+// 保留覆盖守卫，且剩余 ≤ 7 天的保护区必须放行续签。
 func TestCheckExpiration_skipsRenewalWindowCoveringCertificateLifetime(t *testing.T) {
 	now := time.Now()
 
-	t.Run("90 day lifetime with 90 day window", func(t *testing.T) {
+	t.Run("max window covering shorter certificate lifetime", func(t *testing.T) {
 		_, database := newClusterTestService(t)
-		setRenewalDays(t, database, 90)
+		// 90 是旧契约值，读侧按安全上限 88 生效；证书实际寿命 88 天
+		// （CA 缩短寿命）→ 窗口覆盖寿命，刚签发也不得再入队。
+		setRenewalDays(t, database, CertRenewalLifetimeDays)
 		seedRenewalWindowJob(t, database, "lb_window_90", "window90.example.com",
-			now.Add(-time.Hour), now.Add(89*24*time.Hour+23*time.Hour))
+			now.Add(-time.Hour), now.Add(88*24*time.Hour-time.Hour))
 
 		jobs, _, err := NewCertificateService().CheckExpiration()
 		if err != nil {
@@ -86,8 +89,11 @@ func TestCheckExpiration_skipsRenewalWindowCoveringCertificateLifetime(t *testin
 		_, database := newClusterTestService(t)
 		setRenewalDays(t, database, 90)
 		notAfter := now.Add(certRenewalGuaranteedGrace + time.Hour)
+		// 寿命 80 天 < 生效窗口 88 天 ⇒ 走「窗口覆盖整张寿命」守卫；剩余
+		// 7 天 + 1h 在保护区之外必须跳过（边界排他）。寿命取 90 天会让窗口
+		// 不覆盖寿命，落到成功侧迟滞守卫，测不到本判据的边界。
 		seedRenewalWindowJob(t, database, "lb_window_grace_in", "windowgracein.example.com",
-			notAfter.Add(-90*24*time.Hour), notAfter)
+			notAfter.Add(-80*24*time.Hour), notAfter)
 
 		jobs, _, err := NewCertificateService().CheckExpiration()
 		if err != nil {

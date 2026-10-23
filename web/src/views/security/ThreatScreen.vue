@@ -298,7 +298,7 @@ import { createVisibilityIntervals } from '@/composables/useVisibilityIntervals'
 import { useCountUp } from '@/composables/useCountUp'
 import { formatDate } from '@/utils/date'
 import { trafficDelta, formatRecentRate, hourlyBucketLabel, type TrafficBaseline } from '@/utils/threatScreenMetrics'
-import { anomalySeverity } from '@/utils/severityScale'
+import { anomalySeverity, overlayDetectionGrade, zeroScoreSeverity, type AnomalySeverity } from '@/utils/severityScale'
 import { displayThreatScreenMode } from '@/utils/configValues'
 import { flowTimestamp, normalizeTrafficSampleN, reconstructObservedRate, stepAdaptiveSample, nextFlowCursor, planFlowEvents, FLOW_REALTIME_MAX_AGE_MS } from '@/utils/threatFlowRules'
 import type { ThreatScene, ThreatSceneOptions } from '@/utils/threatScene'
@@ -614,33 +614,15 @@ const attackPoints = computed((): string => sparkPoints(attackWindow.value))
 const normalFillPoints = computed((): string => (normalPoints.value ? `0,40 ${normalPoints.value} 100,40` : ''))
 
 // ============ 事件等级筛选（高危=拦截 高危族 / 中危=限流 / 低危=检测） ============
-type Sev = 'high' | 'mid' | 'low'
-/** 危险等级（v2.3.8 评分优先，用户裁定 2026-10-17）：事件日志评分列的
- * anomaly_score 对全部阶段事件均有效（含限流/IP 名单/GeoIP）——评分>0 时
- * 直接驱动分级（≥12 高 / 6-11 中 / <6 低，检测模式降一级）；仅 0 分回落
- * 阶段定性映射，口径与后端入库补分（services/securityevents.go）一致：
- * IP 名单/信任/威胁情报/爬虫伪装/预检=12（高），普通 GeoIP（id 8 或 8xxxxx）
- * =6（中）。8xxxxx 段内爬虫两族在后端有独立分（豁免 0/伪装 12），
- * 前端无解码器——仅作为历史 0 分行的粗粒度回退，新行一律走评分。 */
+type Sev = AnomalySeverity
+/** 危险等级（v2.3.8 评分优先，用户裁定 2026-10-17）：评分>0 时由评分分档 +
+ * 检测模式降级得级；仅 0 分回落阶段定性映射。两段语义都在
+ * utils/severityScale（与事件列表评分着色同源），视图只做取值。 */
 function sevOf(ev: FeedEvent): Sev {
   const score = ev.anomaly_score ?? 0
-  const down = (base: Sev): Sev => (ev.action !== 'blocked' && base === 'high' ? 'mid' : base)
-  if (score > 0) {
-    // 分级本体单源 utils/severityScale（与事件列表评分着色同一函数）；检测模式
-    // 整体降一级（高→中、中→低）只在此处叠加。
-    const base = anomalySeverity(score)
-    if (ev.action === 'blocked') return base
-    return base === 'high' ? 'mid' : 'low'
-  }
-  const rt = ev.rule_triggered ?? ''
-  // 481-484 是渲染器发射的 HTTP 阻断状态码（caddy_multi_policy/caddy 测试），
-  // 不是 rule_triggered 值——原 /^48[123]$/ 分支永不命中，已删。
-  if (rt === '2' || rt === '3' || rt === '12' || rt === '14') return down('high')
-  // '8' 与 8xxxxx 仅存量 0 分行可达（现代引擎一律带评分，走上方评分分支）。
-  // 限流 429 不产生安全事件行（caddy-ratelimit 直接返回、无审计行），事件
-  // feed 与 /security/events 同源，故 '429' 不参与本回退。
-  if (rt === '8' || /^8\d{5}$/.test(rt)) return down('mid')
-  return ev.action === 'blocked' ? 'mid' : 'low'
+  return score > 0
+    ? overlayDetectionGrade(anomalySeverity(score), ev.action)
+    : zeroScoreSeverity(ev.rule_triggered ?? '', ev.action)
 }
 function sevLabel(ev: FeedEvent): string {
   const s = sevOf(ev)
@@ -909,7 +891,7 @@ const flowTask = usePollingTask(async ({ signal, isCurrent }) => {
   if (flowSampleN.value === -1 && activeSampleN.value > 0) {
     // events.length 已被当前采样因子缩小，先用服务端回报的 sample_n 还原真实
     // 速率（1/8 下 125 条不得被误判为低速）；换档需连续 2 次采样同向且距
-    // 上次换档 ≥4s（滞回阈值见 ADAPTIVE_SAMPLE_THRESHOLDS）。
+    // 上次换档 ≥4s（滞回阈值在 utils/threatFlowRules 的自适应切换门内）。
     const observedRate = reconstructObservedRate(events.length, data.sample_n ?? 0, activeSampleN.value)
     const outcome = stepAdaptiveSample(
       { active: activeSampleN.value, stable: adaptiveStable, lastSwitch: adaptiveLastSwitch, pendingTarget: adaptivePendingTarget },

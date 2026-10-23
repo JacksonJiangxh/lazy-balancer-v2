@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -125,5 +126,16 @@ func TestValidateEnabledStoredRuleConfigs_normalizesTCPNTLM(t *testing.T) {
 	err := validateEnabledStoredRuleConfigs(context.Background())
 	if err != nil {
 		t.Fatalf("aggregate validation must normalize tcp+ntlm rule, got: %v", err)
+	}
+}
+
+// 启用预校验的「规则不存在」必须带哨兵：首读后规则被并发删除属冲突
+// （handler 409），不得折成 500「预校验规则配置失败」并携带内部错误文本。
+func TestValidateStoredRuleConfig_missingRuleUsesConflictSentinel(t *testing.T) {
+	initializeRuleFeatureTestDB(t)
+
+	err := validateStoredRuleConfig(context.Background(), "lb_missing_concurrent_delete")
+	if !errors.Is(err, errStoredRuleMissing) {
+		t.Fatalf("err=%v, want errStoredRuleMissing（并发删除必须可被 409 分支识别）", err)
 	}
 }

@@ -537,3 +537,15 @@ func TestSetThreatSchedule_rollsBackWhenRearmFails(t *testing.T) {
 		t.Fatalf("回滚后排程=(%q,%q), want (1,03:00)——曾非事务两步写留中间态", days, hhmm)
 	}
 }
+
+// global_config 行被带外删除/导入异常缺失时，保存任务级排程必须显式报错：
+// 此前 UPDATE 命中 0 行仍返回成功（排程列未落库、重排也无效，零错误信号）。
+func TestSetThreatSchedule_missingGlobalConfigRowFails(t *testing.T) {
+	newClusterTestService(t)
+	if _, err := db.DB.Exec(`DELETE FROM global_config WHERE id=1`); err != nil {
+		t.Fatalf("delete global_config: %v", err)
+	}
+	if err := SetThreatSchedule([]int{3}, "05:00"); err == nil {
+		t.Fatal("global_config 行缺失时必须报错，不得静默成功")
+	}
+}

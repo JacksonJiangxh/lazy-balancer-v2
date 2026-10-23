@@ -489,7 +489,8 @@ import { degradedMetricLabels, degradedMetricParts } from '@/utils/systemMetrics
 const authStore = useAuthStore()
 
 const formatUptime = (seconds?: number): string => {
-  if (!seconds || seconds < 0) return '-'
+  // 0 秒是合法运行时长（刚启动）：仅缺失/负数才显示「-」，否则会被读成「无数据」。
+  if (seconds == null || seconds < 0) return '-'
   const d = Math.floor(seconds / 86400)
   const h = Math.floor((seconds % 86400) / 3600)
   const m = Math.floor((seconds % 3600) / 60)
@@ -1151,8 +1152,6 @@ onUnmounted(() => {
 
 <style scoped>
 .dashboard { max-width: 1500px; margin: 0 auto; }
-
-
 
 .card-header {
   display: flex;

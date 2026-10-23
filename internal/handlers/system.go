@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -37,6 +38,11 @@ func restartProcess() {
 // restart policy brings the service back up (used to apply process-level
 // settings such as the Caddy log timezone).
 func (h *Handlers) RestartService(c *gin.Context) {
+	// 与同族写端点同口径：导入窗口内重启会终止提交前已落盘的 WAF 文件/证书
+	// 回退路径（abort 只存在于进程内），比任何被 409 拦下的写操作更重。
+	if rejectWriteDuringImport(c, "执行服务重启（配置导入进行中）") {
+		return
+	}
 	recordAudit(c, "重启", "系统", "用户触发服务重启")
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "服务正在重启"})
 	restartProcess()
@@ -83,8 +89,7 @@ func (h *Handlers) GetSystemInfo(c *gin.Context) {
 // （os/gopsutil 路径、命令输出）只进运行日志——/system 指标与运行日志端点
 // 属 business 组，任意登录用户可读，不得把文件布局/内部结构透给客户端。
 func systemInternalFailure(message string, err error) models.APIResponse {
-	services.Logf("error", "系统信息: %s: %v", message, err)
-	return models.APIResponse{Code: http.StatusInternalServerError, Message: message}
+	return internalError("系统信息", message, err)
 }
 
 func (h *Handlers) GetSystemMetrics(c *gin.Context) {
@@ -131,6 +136,13 @@ func (h *Handlers) GetAppLogs(c *gin.Context) {
 		return
 	}
 	startOffset := int64(0)
+	// 只读常规文件：Stat 与 os.Open 之间目标被替换为 FIFO/设备节点时，open(2)
+	// 对无写端 FIFO 会无超时阻塞（每请求永久占一个 goroutine/连接，任意登录
+	// 用户可低成本耗尽资源）。/system/logs 读侧必须显式拒绝非常规文件。
+	if !info.Mode().IsRegular() {
+		c.JSON(http.StatusInternalServerError, systemInternalFailure("读取日志失败", fmt.Errorf("非常规文件: %s mode=%v", logPath, info.Mode())))
+		return
+	}
 	if info.Size() > maxBytes {
 		startOffset = info.Size() - maxBytes
 	}

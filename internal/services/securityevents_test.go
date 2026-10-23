@@ -5,6 +5,7 @@ package services
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -3684,10 +3685,16 @@ func TestSecurityEventsAttribution_CRSExcludedRulesSkipFirstBinding(t *testing.T
 		second     bool
 		wantPolicy int
 	}{
-		{name: "949 exact", rule: "949110", excluded: `["949110"]`, second: true, wantPolicy: 2},
-		{name: "949 group", rule: "949110", excluded: `[{"target":"49","scope":"all"}]`, second: true, wantPolicy: 2},
+		// 非基础设施排除：命中排除的策略不再认领该规则，改归下一条绑定。
+		{name: "942 exact", rule: "942100", excluded: `["942100"]`, second: true, wantPolicy: 2},
+		{name: "942 group", rule: "942100", excluded: `[{"target":"42","scope":"all"}]`, second: true, wantPolicy: 2},
+		{name: "942 regression no exclusion", rule: "942100", excluded: `[]`, second: true, wantPolicy: 1},
+		// 基础设施组（949 请求评估 / 959 响应评估）的排除在发射面被跳过，
+		// 归因面同样不认领：评估规则仍由首绑定的强制 Include 执行。
+		{name: "949 exact ignored", rule: "949110", excluded: `["949110"]`, second: true, wantPolicy: 1},
+		{name: "949 group ignored", rule: "949110", excluded: `[{"target":"49","scope":"all"}]`, second: true, wantPolicy: 1},
 		{name: "949 regression no exclusion", rule: "949110", excluded: `[]`, second: true, wantPolicy: 1},
-		{name: "959 exact", rule: "959100", excluded: `["959100"]`, wafCheck: 1, second: true, wantPolicy: 2},
+		{name: "959 exact ignored", rule: "959100", excluded: `["959100"]`, wafCheck: 1, second: true, wantPolicy: 1},
 		{name: "959 sibling still owned", rule: "959110", excluded: `["959100"]`, wafCheck: 1, second: true, wantPolicy: 1},
 		{name: "excluded only binding keeps attribution", rule: "949110", excluded: `["949110"]`, wantPolicy: 1},
 	}
@@ -3713,7 +3720,8 @@ func TestSecurityEventsAttribution_CRSExcludedRulesSkipFirstBinding(t *testing.T
 
 // Given 排除条目的作用域/目标形态矩阵。
 // When 判定事件规则是否被排除。
-// Then 只排除真实发射面：ip/list 精确命中、组号/ID/文件名/区间，901 与畸形目标不生效。
+// Then 只排除真实发射面：ip/list 精确命中、组号/ID/文件名/区间；基础设施组
+// （901/949/959）与畸形目标不生效（发射面已跳过，归因不得认领）。
 func TestSecurityEventsCRSExclusionMatcher_shapes(t *testing.T) {
 	build := func(raw string, lists map[int64][]string) securityEventsPolicyCRSExclusions {
 		return securityEventsPolicyCRSExclusions{entries: ParseCRSExcludedRules(raw), lists: lists}
@@ -3725,18 +3733,25 @@ func TestSecurityEventsCRSExclusionMatcher_shapes(t *testing.T) {
 		ip      string
 		removed bool
 	}{
-		{name: "ip scope hit", set: build(`[{"target":"949110","scope":"ip","ips":"198.51.100.9"}]`, nil), rule: "949110", ip: "198.51.100.9", removed: true},
-		{name: "ip scope miss", set: build(`[{"target":"949110","scope":"ip","ips":"198.51.100.9"}]`, nil), rule: "949110", ip: "198.51.100.10"},
-		{name: "list scope hit", set: build(`[{"target":"949110","scope":"list","listRefs":[7]}]`, map[int64][]string{7: {"203.0.113.0/24"}}), rule: "949110", ip: "203.0.113.7", removed: true},
-		{name: "list scope miss", set: build(`[{"target":"949110","scope":"list","listRefs":[7]}]`, map[int64][]string{7: {"203.0.113.0/24"}}), rule: "949110", ip: "198.51.100.7"},
+		{name: "ip scope hit", set: build(`[{"target":"942100","scope":"ip","ips":"198.51.100.9"}]`, nil), rule: "942100", ip: "198.51.100.9", removed: true},
+		{name: "ip scope miss", set: build(`[{"target":"942100","scope":"ip","ips":"198.51.100.9"}]`, nil), rule: "942100", ip: "198.51.100.10"},
+		{name: "list scope hit", set: build(`[{"target":"942100","scope":"list","listRefs":[7]}]`, map[int64][]string{7: {"203.0.113.0/24"}}), rule: "942100", ip: "203.0.113.7", removed: true},
+		{name: "list scope miss", set: build(`[{"target":"942100","scope":"list","listRefs":[7]}]`, map[int64][]string{7: {"203.0.113.0/24"}}), rule: "942100", ip: "198.51.100.7"},
 		{name: "scoped file target ignored", set: build(`[{"target":"REQUEST-942-APPLICATION-ATTACK-SQLI.conf","scope":"ip","ips":"198.51.100.9"}]`, nil), rule: "942100", ip: "198.51.100.9"},
-		{name: "group", set: build(`[{"target":"49","scope":"all"}]`, nil), rule: "949110", removed: true},
+		{name: "group", set: build(`[{"target":"42","scope":"all"}]`, nil), rule: "942100", removed: true},
 		{name: "filename range", set: build(`["REQUEST-942-APPLICATION-ATTACK-SQLI.conf"]`, nil), rule: "942100", removed: true},
 		{name: "numeric range", set: build(`["941000-941999"]`, nil), rule: "941100", removed: true},
 		{name: "range miss", set: build(`["941000-941999"]`, nil), rule: "942100"},
+		// 基础设施组（901 初始化 / 949 请求评估 / 959 响应评估）的排除条目
+		// 在发射面被跳过（强制 Include 不可摘除），归因面同样不得认领，
+		// 否则事件会被从真实拦截策略上摘走。
 		{name: "901 init skipped", set: build(`["901100"]`, nil), rule: "901100"},
+		{name: "949 exact skipped", set: build(`["949110"]`, nil), rule: "949110"},
+		{name: "949 group skipped", set: build(`[{"target":"49","scope":"all"}]`, nil), rule: "949110"},
+		{name: "949 scoped skipped", set: build(`[{"target":"949110","scope":"ip","ips":"198.51.100.9"}]`, nil), rule: "949110", ip: "198.51.100.9"},
+		{name: "959 exact skipped", set: build(`["959100"]`, nil), rule: "959100"},
 		{name: "invalid target", set: build(`["999999999"]`, nil), rule: "942100"},
-		{name: "unknown scope not claimed", set: build(`[{"target":"949110","scope":"bogus"}]`, nil), rule: "949110"},
+		{name: "unknown scope not claimed", set: build(`[{"target":"942100","scope":"bogus"}]`, nil), rule: "942100"},
 		{name: "non CRS rule", set: build(`["949110"]`, nil), rule: "10003"},
 	}
 	for _, tc := range cases {
@@ -4307,5 +4322,80 @@ func TestSecurityEventsTick_memoizesHostMappingWithinPass(t *testing.T) {
 	}
 	if n != 3 {
 		t.Fatalf("attributed events=%d, want 3（记忆化不得改变归因结果）", n)
+	}
+}
+
+// securityEventsRowCountForTest 读 metrics 库已落事件行数。
+func securityEventsRowCountForTest(t *testing.T) int {
+	t.Helper()
+	var n int
+	if err := db.MetricsDB.QueryRow(`SELECT COUNT(*) FROM security_events`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// 单 pass 有界：长积压必须分摊到多轮（每轮在已提交批次边界返回），否则首个
+// tick 独占停机宽限/轮转窗口；offset 已推进，下一轮续跑且无重复（INSERT OR
+// IGNORE 幂等）。
+func TestSecurityEventsTick_boundedPassResumesNextTick(t *testing.T) {
+	oldMax := securityEventsPassMaxEvents
+	securityEventsPassMaxEvents = 500
+	t.Cleanup(func() { securityEventsPassMaxEvents = oldMax })
+
+	logPath, offsetPath := seedSecurityEventsDedupeDB(t)
+	docs := make([]string, 0, 1200)
+	for i := range 1200 {
+		docs = append(docs, securityEventsDedupeNowFixture(fmt.Sprintf("tx-bounded-%d", i), fmt.Sprintf("%016x", i+1), "/bounded", "blocked", 949110))
+	}
+	writeSecurityEventsDedupeLog(t, logPath, docs...)
+
+	tailer := securityEventsNewTailer(logPath, offsetPath)
+	runSecurityEventsDedupeTick(t, tailer)
+	if got := securityEventsRowCountForTest(t); got != 500 {
+		t.Fatalf("首轮行数=%d, want 500（单轮上限）", got)
+	}
+	runSecurityEventsDedupeTick(t, tailer)
+	if got := securityEventsRowCountForTest(t); got != 1000 {
+		t.Fatalf("第二轮行数=%d, want 1000（续跑）", got)
+	}
+	runSecurityEventsDedupeTick(t, tailer)
+	if got := securityEventsRowCountForTest(t); got != 1200 {
+		t.Fatalf("第三轮行数=%d, want 1200（全部收敛且无重复）", got)
+	}
+}
+
+// 摄取 pass 必须响应取消：ctx 已取消时不得开始新一轮提交（停机宽限内可停），
+// 取消不吞数据——下一次正常 tick 照常续读。
+func TestSecurityEventsTickContext_cancelStopsPassWithoutLosingEvents(t *testing.T) {
+	oldMax := securityEventsPassMaxEvents
+	securityEventsPassMaxEvents = 500
+	t.Cleanup(func() { securityEventsPassMaxEvents = oldMax })
+
+	logPath, offsetPath := seedSecurityEventsDedupeDB(t)
+	docs := make([]string, 0, 1200)
+	for i := range 1200 {
+		docs = append(docs, securityEventsDedupeNowFixture(fmt.Sprintf("tx-cancel-%d", i), fmt.Sprintf("%016x", i+9001), "/cancel", "blocked", 949110))
+	}
+	writeSecurityEventsDedupeLog(t, logPath, docs...)
+
+	tailer := securityEventsNewTailer(logPath, offsetPath)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := tailer.securityEventsTickContext(ctx); err != nil {
+		t.Fatalf("取消必须优雅返回: %v", err)
+	}
+	if got := securityEventsRowCountForTest(t); got != 0 {
+		t.Fatalf("已取消的 pass 不得提交事件，行数=%d", got)
+	}
+
+	// 取消不吞数据：正常 tick 从原偏移续读（有界，500/轮）。
+	for i := range 3 {
+		if err := tailer.securityEventsTick(); err != nil {
+			t.Fatalf("第 %d 轮恢复 tick: %v", i+1, err)
+		}
+	}
+	if got := securityEventsRowCountForTest(t); got != 1200 {
+		t.Fatalf("恢复后行数=%d, want 1200（取消不得丢事件）", got)
 	}
 }

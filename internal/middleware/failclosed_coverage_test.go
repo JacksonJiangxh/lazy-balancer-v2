@@ -80,7 +80,7 @@ func TestMFAStepUpGuard_roleReadFailureIsInternalError(t *testing.T) {
 		c.Set("role", "admin")
 		c.Next()
 	})
-	router.Use(mfaStepUpGuard())
+	router.Use(mfaStepUpGuard(database))
 	router.POST("/api/v1/rules", func(c *gin.Context) { c.Status(http.StatusNoContent) })
 
 	response := httptest.NewRecorder()
@@ -180,5 +180,60 @@ func TestClusterTokenAuth_unapprovedNodeRejected(t *testing.T) {
 
 	if response.Code != http.StatusUnauthorized {
 		t.Fatalf("status=%d body=%q, want 401", response.Code, response.Body.String())
+	}
+}
+
+// Given 装配期注入句柄（从节点库）与进程级原子句柄（主节点库）指向不同库。
+// When 启用 MFA 的用户发起需 step-up 的写请求。
+// Then 从节点短路必须读注入句柄（与 readOnlyGuard/clusterVersionMiddleware
+// 同源）→ 403；旧实现读包级 db.GetDB()（主节点）→ 428，同一请求上两守卫
+// 结论相反。句柄来源第三态（注入与进程句柄不同库）是本用例钉住的唯一形态。
+func TestMFAStepUpGuard_roleReadsInjectedHandle(t *testing.T) {
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
+	if err := db.Initialize(t.TempDir()); err != nil {
+		t.Fatalf("initialize database: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+		restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB)
+	})
+	database := db.DB
+	if _, err := database.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled,mfa_enabled) VALUES (91,'injected','x','admin',1,1)`); err != nil {
+		t.Fatalf("seed mfa user: %v", err)
+	}
+	if _, err := database.Exec(`UPDATE global_config SET mfa_write_guard=1, is_master=1 WHERE id=1`); err != nil {
+		t.Fatalf("enable mfa write guard: %v", err)
+	}
+
+	// 独立从节点库：守卫只从中读 global_config.is_master。
+	slaveDB, err := sql.Open("sqlite", t.TempDir()+"/injected-slave.db")
+	if err != nil {
+		t.Fatalf("open injected db: %v", err)
+	}
+	t.Cleanup(func() { _ = slaveDB.Close() })
+	if _, err := slaveDB.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, is_master INTEGER); INSERT INTO global_config (id,is_master) VALUES (1,0)`); err != nil {
+		t.Fatalf("seed injected slave db: %v", err)
+	}
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("auth_type", "jwt")
+		c.Set("auth_method", "password")
+		c.Set("user_id", 91)
+		c.Set("role", "admin")
+		c.Next()
+	})
+	router.Use(mfaStepUpGuard(slaveDB))
+	router.POST("/api/v1/rules", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/rules", nil))
+
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("status=%d body=%s, want 403（角色必须读装配期注入句柄，进程级句柄是主节点）", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "从节点只读") {
+		t.Fatalf("body=%s, want 含「从节点只读」", response.Body.String())
 	}
 }

@@ -38,6 +38,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/oauth2"
+	"golang.org/x/sync/singleflight"
 
 	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
@@ -59,6 +60,10 @@ type OIDCConfig struct {
 	// 不静默放行。登录每次回调都判定（IdP 侧变更即时生效），不止首登 JIT。
 	AllowedEmailDomains []string `json:"allowed_email_domains,omitempty"`
 	AllowedGroups       []string `json:"allowed_groups,omitempty"`
+	// rawIssuer 是库中 issuer 的原值（loadOIDCConfig 归一前的形态），不参与
+	// JSON 序列化。仅用于历史身份行兼容查询：JIT 行按 (auth_issuer,auth_subject)
+	// 建键，归一后直接查会 miss 并重复开户（带外写入的带尾斜杠 issuer）。
+	rawIssuer string
 }
 
 // oidcStateEntry 登录跳转与回调之间的一次性状态(state 防 CSRF,nonce 防
@@ -78,6 +83,9 @@ var (
 	// 每个唯一 issuer 永久占位。满员淘汰任一条目，
 	// 下个请求按需重新 discovery。
 	oidcProvCacheMax = 64
+	// oidcProvFlight 合并同 issuer 的在途 discovery（冷缓存下的并发登录风暴/
+	// 公开端点打点不得逐请求放大出站）。失败负缓存仍由 leader 写入下表。
+	oidcProvFlight singleflight.Group
 	// oidcStateCount 在册 state 条目计数（未认证泛洪封顶,计数与
 	// Store/Delete/TTL 清理同点维护)
 	oidcStateCount atomic.Int32
@@ -135,6 +143,12 @@ func reserveOIDCStateSlot() bool {
 // 读失败/JSON 损坏必须与「未配置」区分——旧实现把
 // 两者折叠为 false，更新端点据此以零值整体回写，会把 issuer/client_id/secret
 // 清空（fail-open 破坏性写）。现在：未配置=(零值, nil)，读取失败=(零值, err)。
+//
+// issuer 在读侧归一是单点收口：库里可由配置导入、自动备份还原、集群快照或
+// 带外改库带入未归一值（写侧校验只覆盖面板保存路径）。归一放读侧后，
+// 登录/回调/状态/探测与 provider 缓存键全部使用同一形态——否则「测试通过、
+// 真实登录必然失败」（Entra issuer 缺 /v2.0 时 discovery 恒失败，错误文案还会
+// 被归一为「服务不可达」而误导排障）。原值保留在 rawIssuer 供历史身份行兼容。
 func loadOIDCConfig() (OIDCConfig, error) {
 	var raw string
 	if err := db.DB.QueryRow("SELECT COALESCE(oidc_config,'') FROM global_config WHERE id=1").Scan(&raw); err != nil {
@@ -150,6 +164,8 @@ func loadOIDCConfig() (OIDCConfig, error) {
 	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
 		return OIDCConfig{}, fmt.Errorf("OIDC 配置损坏: %w", err)
 	}
+	cfg.rawIssuer = cfg.Issuer
+	cfg.Issuer = normalizeOIDCIssuer(cfg.Issuer)
 	return cfg, nil
 }
 
@@ -173,19 +189,40 @@ func saveOIDCConfig(cfg OIDCConfig) error {
 	return nil
 }
 
+// oidcAccessClaims 是访问白名单判定的输入（claims 解析后单源传递）。
+type oidcAccessClaims struct {
+	Email string
+	// EmailVerified/EmailVerifiedSeen 来自 email_verified 声明：缺失或非布尔
+	// 形态时 Seen=false（配置了域名单即 fail-visible 拒登）。
+	EmailVerified     bool
+	EmailVerifiedSeen bool
+	Groups            []string
+}
+
 // oidcAccessAllowed 访问白名单判定（单源，OIDC 回调每次登录调用）。
 // 两项名单均空=不限制（历史行为）。配置了 email 域名单 → email 声明必须
-// 存在且其域（@ 后部分，大小写不敏感）在名单内；配置了组名单 → groups
-// 声明必须存在且交集非空。IdP 不返回对应声明 = fail-visible 拒登，
-// 不静默放行。返回 (false, reason) 时 reason 供审计留痕。
-func oidcAccessAllowed(cfg OIDCConfig, email string, groups []string) (bool, string) {
+// 存在、email_verified 必须为 true 且其域（@ 后部分，大小写不敏感）在名单内；
+// 配置了组名单 → groups 声明必须存在且交集非空。IdP 不返回对应声明 = fail-visible
+// 拒登，不静默放行。
+//
+// 域名单必须叠加 email_verified：白名单是面板侧唯一收口，若 IdP 允许用户
+// 自定义邮箱且不做验证（自建 Keycloak/Authentik 的常见配置），任何可登录该
+// IdP 的人把邮箱改成 someone@被允许域即通过域比对。返回 (false, reason) 时
+// reason 供审计留痕。
+func oidcAccessAllowed(cfg OIDCConfig, claims oidcAccessClaims) (bool, string) {
 	if len(cfg.AllowedEmailDomains) > 0 {
-		if strings.TrimSpace(email) == "" {
+		if strings.TrimSpace(claims.Email) == "" {
 			return false, "IdP 未返回 email 声明（已配置域名单）"
 		}
+		if !claims.EmailVerifiedSeen {
+			return false, "IdP 未返回 email_verified 声明（已配置域名单）"
+		}
+		if !claims.EmailVerified {
+			return false, "email 未经 IdP 验证（email_verified=false）"
+		}
 		domain := ""
-		if at := strings.LastIndex(email, "@"); at >= 0 {
-			domain = strings.ToLower(strings.TrimSpace(email[at+1:]))
+		if at := strings.LastIndex(claims.Email, "@"); at >= 0 {
+			domain = strings.ToLower(strings.TrimSpace(claims.Email[at+1:]))
 		}
 		matched := false
 		for _, d := range cfg.AllowedEmailDomains {
@@ -202,12 +239,12 @@ func oidcAccessAllowed(cfg OIDCConfig, email string, groups []string) (bool, str
 		}
 	}
 	if len(cfg.AllowedGroups) > 0 {
-		if len(groups) == 0 {
+		if len(claims.Groups) == 0 {
 			return false, "IdP 未返回 groups 声明（已配置组名单）"
 		}
 		matched := false
 		for _, want := range cfg.AllowedGroups {
-			for _, got := range groups {
+			for _, got := range claims.Groups {
 				if got == want {
 					matched = true
 					break
@@ -222,6 +259,28 @@ func oidcAccessAllowed(cfg OIDCConfig, email string, groups []string) (bool, str
 		}
 	}
 	return true, ""
+}
+
+// oidcEmailVerified 解析 email_verified 声明：布尔或 "true"/"false" 字符串
+// （部分 IdP 以字符串返回）；缺失/null/其他形态=未知（known=false）。
+func oidcEmailVerified(raw json.RawMessage) (verified, known bool) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return false, false
+	}
+	var b bool
+	if err := json.Unmarshal(raw, &b); err == nil {
+		return b, true
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		switch strings.ToLower(strings.TrimSpace(s)) {
+		case "true":
+			return true, true
+		case "false":
+			return false, true
+		}
+	}
+	return false, false
 }
 
 // oidcAllowedDomainRe 允许的 email 域条目形态（小写字母/数字/点/连字符，
@@ -303,19 +362,41 @@ func oidcProvider(issuer string) (*oidc.Provider, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
-	// 出站客户端注入（discovery 与其后的 JWKS 验签同源）：初始 issuer 校验之外，
-	// 重定向也必须逐跳通过 scheme 策略。
-	p, err := oidc.NewProvider(oidc.ClientContext(ctx, oidcOutboundClient), issuer)
-	oidcProvMu.Lock()
-	if err != nil {
-		werr := fmt.Errorf("OIDC 发现失败(检查服务地址可达性与 .well-known 配置): %w", err)
-		oidcProvCachePutLocked(issuer, oidcProvEntry{err: werr, failedAt: time.Now()})
+	// per-issuer singleflight：冷缓存/IdP 恢复后的登录风暴（或公开登录端点的
+	// 并发打点）此前各自发起 discovery（8s + 完整 JWKS 拉取），可被用于放大
+	// 出站连接。合并同 issuer 的在途请求；结果（含失败负缓存）由 leader 写入
+	// 缓存，等待者在 flight 内复用。
+	value, err, _ := oidcProvFlight.Do(issuer, func() (any, error) {
+		// leader 复核缓存：等待期间其他请求可能已填充（含失败负缓存）。
+		oidcProvMu.Lock()
+		entry, cached := oidcProvCach[issuer]
 		oidcProvMu.Unlock()
-		return nil, werr
+		if cached {
+			if entry.provider != nil {
+				return entry.provider, nil
+			}
+			if time.Since(entry.failedAt) < oidcNegCacheTTL {
+				return nil, entry.err
+			}
+		}
+		// 出站客户端注入（discovery 与其后的 JWKS 验签同源）：初始 issuer 校验
+		// 之外，重定向也必须逐跳通过 scheme 策略。
+		p, derr := oidc.NewProvider(oidc.ClientContext(ctx, oidcOutboundClient), issuer)
+		oidcProvMu.Lock()
+		if derr != nil {
+			werr := fmt.Errorf("OIDC 发现失败(检查服务地址可达性与 .well-known 配置): %w", derr)
+			oidcProvCachePutLocked(issuer, oidcProvEntry{err: werr, failedAt: time.Now()})
+			oidcProvMu.Unlock()
+			return nil, werr
+		}
+		oidcProvCachePutLocked(issuer, oidcProvEntry{provider: p})
+		oidcProvMu.Unlock()
+		return p, nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	oidcProvCachePutLocked(issuer, oidcProvEntry{provider: p})
-	oidcProvMu.Unlock()
-	return p, nil
+	return value.(*oidc.Provider), nil
 }
 
 // oidcProvCachePutLocked 写入缓存并维持容量上限；调用方须持有 oidcProvMu。
@@ -366,6 +447,25 @@ func logOIDCStatusFailure(err error) {
 	services.Logf("warn", "读取 OIDC 状态失败: %v", err)
 }
 
+// logOIDCStatusIssuerInvalid 记录「库内 issuer 不合规」的公开端点降级：
+// 与读失败同一防放大思路（60s 节流），独立状态窗口（两类故障不互相吞没）。
+var oidcStatusIssuerLog = struct {
+	sync.Mutex
+	at time.Time
+}{}
+
+func logOIDCStatusIssuerInvalid(err error) {
+	now := time.Now()
+	oidcStatusIssuerLog.Lock()
+	if !oidcStatusIssuerLog.at.IsZero() && now.Sub(oidcStatusIssuerLog.at) < oidcStatusFailureLogWindow {
+		oidcStatusIssuerLog.Unlock()
+		return
+	}
+	oidcStatusIssuerLog.at = now
+	oidcStatusIssuerLog.Unlock()
+	services.Logf("warn", "库内 OIDC issuer 不合规，登录页按未启用呈现（需管理员修正配置）: %v", err)
+}
+
 // OIDCStatus GET /auth/oidc/status(公开):登录页按钮显隐与展示名。
 func (h *Handlers) OIDCStatus(c *gin.Context) {
 	cfg, cfgErr := loadOIDCConfig()
@@ -380,8 +480,10 @@ func (h *Handlers) OIDCStatus(c *gin.Context) {
 	}
 	// 库中 issuer 可能由导入/自动备份还原/集群快照带入（写侧校验只覆盖面板
 	// 保存路径），不合规的地址必然登录失败——未认证端点不得宣告一个恒失败的
-	// 登录按钮，按未启用呈现（与读失败同口径 fail-closed）。
+	// 登录按钮，按未启用呈现（与读失败同口径 fail-closed）。降级必须留痕：
+	// 管理员可修复的配置错误不应只能靠手工 GET 端点发现（60s 节流防放大）。
 	if err := validateOIDCIssuerURL(cfg.Issuer); err != nil {
+		logOIDCStatusIssuerInvalid(err)
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"enabled": false}})
 		return
 	}
@@ -662,6 +764,18 @@ func lookupOIDCIdentity(issuer, subject string) (oidcIdentity, error) {
 	return ident, err
 }
 
+// lookupOIDCIdentityCompat 读侧归一后的身份查询：库中原值可能与归一值不同
+// （带外写入的 Entra issuer 缺 /v2.0、带尾斜杠的 issuer），历史 JIT 行按原值
+// 建键——只查归一值会 miss 并重复开户。归一值未命中且原值不同时回退原值查询。
+// 命中后不再改写该行（身份键保持为开户时的事实，避免两行竞争）。
+func lookupOIDCIdentityCompat(cfg OIDCConfig, subject string) (oidcIdentity, error) {
+	ident, err := lookupOIDCIdentity(cfg.Issuer, subject)
+	if err == nil || !errors.Is(err, sql.ErrNoRows) || cfg.rawIssuer == "" || cfg.rawIssuer == cfg.Issuer {
+		return ident, err
+	}
+	return lookupOIDCIdentity(cfg.rawIssuer, subject)
+}
+
 // oidcCandidateUsername 选择未被占用的 JIT 用户名。无冲突保持一次唯一索引
 // 点查；base 已占用时一次批量载入相关候选，在内存中选择首个空档，查询数不随
 // 冲突数增长。并发写入者的唯一冲突仍由 createOIDCUserWithRetry 兜底重试。
@@ -866,12 +980,13 @@ func (h *Handlers) OIDCCallback(c *gin.Context) {
 		return
 	}
 	var claims struct {
-		Sub               string   `json:"sub"`
-		Nonce             string   `json:"nonce"`
-		Email             string   `json:"email"`
-		PreferredUsername string   `json:"preferred_username"`
-		Name              string   `json:"name"`
-		Groups            []string `json:"groups"`
+		Sub               string          `json:"sub"`
+		Nonce             string          `json:"nonce"`
+		Email             string          `json:"email"`
+		EmailVerified     json.RawMessage `json:"email_verified"`
+		PreferredUsername string          `json:"preferred_username"`
+		Name              string          `json:"name"`
+		Groups            []string        `json:"groups"`
 	}
 	if err := idToken.Claims(&claims); err != nil {
 		fail("解析用户信息失败", "OIDC claims 解析失败")
@@ -889,7 +1004,15 @@ func (h *Handlers) OIDCCallback(c *gin.Context) {
 	}
 	// 访问白名单（可选，缺省空=不限制）：每次回调都判定（IdP 侧变更即时
 	// 生效），先于身份命中/JIT——不在名单内的主体连 JIT 开户都不发生。
-	if allowed, reason := oidcAccessAllowed(cfg, claims.Email, claims.Groups); !allowed {
+	// 域名单叠加 email_verified（缺失/false 一律拒登）：域白名单信任的是
+	// 「IdP 已验证该邮箱归属」，未验证的自定义邮箱声明可被任何人指向允许域。
+	emailVerified, emailVerifiedSeen := oidcEmailVerified(claims.EmailVerified)
+	if allowed, reason := oidcAccessAllowed(cfg, oidcAccessClaims{
+		Email:             claims.Email,
+		EmailVerified:     emailVerified,
+		EmailVerifiedSeen: emailVerifiedSeen,
+		Groups:            claims.Groups,
+	}); !allowed {
 		fail("账号不在允许登录的范围，请联系管理员", "OIDC 白名单拒绝："+reason)
 		return
 	}
@@ -897,7 +1020,7 @@ func (h *Handlers) OIDCCallback(c *gin.Context) {
 	// 用户命中:OIDC 用户独立行(不绑定本地账号),按 (issuer, subject) 定位。
 	// 同查 password_version——OIDC JWT 携带 pwd_ver,与本地会话同构,
 	// 配置导入的版本递增不再把 OIDC 会话打入永久 401 死循环。
-	ident, err := lookupOIDCIdentity(cfg.Issuer, claims.Sub)
+	ident, err := lookupOIDCIdentityCompat(cfg, claims.Sub)
 	switch {
 	case err == nil:
 		if ident.isEnabled != 1 {
@@ -968,11 +1091,10 @@ func (h *Handlers) OIDCCallback(c *gin.Context) {
 		return
 	}
 	services.RecordAuditLog(username, "登录成功", "用户认证", services.FormatAuditDetail(fmt.Sprintf("OIDC 登录 %s", services.AuditUserPart(userID, username)), services.AuditResultPart("success")), c.ClientIP())
-	// last_login 记账失败不撤销已签发登录（不 500）——与密码登录「清零失败
-	// 计数失败仅 warn 留痕」同族口径；但错误必须留痕，不得静默吞掉。
-	if _, err := db.DB.Exec("UPDATE users SET last_login=datetime('now') WHERE id=?", userID); err != nil {
-		services.Logf("warn", "OIDC 登录成功更新 last_login 失败: user_id=%d: %v", userID, err)
-	}
+	// 与密码登录同序同源（touchLastLogin 单源）：成功审计已在上方落库，
+	// last_login 尽力更新。记账失败不撤销已签发登录（不 500/不改 302），
+	// 但必须留痕（连续失败首条升级 error 级）。
+	touchLastLogin(userID, username, c.ClientIP())
 
 	// 回跳前端:令牌走 URL fragment(不发给服务器),前端路由接收后入会话。
 	returnTo := entry.returnTo

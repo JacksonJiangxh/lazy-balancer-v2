@@ -155,3 +155,65 @@ func TestScheduleReaders_logReadFailure(t *testing.T) {
 		t.Fatalf("nil 库版本表排程应回落默认, got %q", hhmm)
 	}
 }
+
+// Given 同步侧句柄（db.DB）持有非默认排程，后台原子句柄（db.GetDB）被摘除。
+// When tick/后台读侧入口（EnabledFn/NextSlotFn 的数据源）读取。
+// Then 全部按「库不可读」fail-safe 返回（默认排程 / 空槽 / 未知状态）——
+// 读侧不得回落同步句柄：两来源分裂时后台循环会读到另一个库（静默空转或
+// 排程错位）。本用例以「摘除原子句柄后返回值翻转」为判据。
+func TestScheduleReadPathsUseAtomicHandle(t *testing.T) {
+	initScheduleTestDB(t)
+	if _, err := db.DB.Exec(`INSERT OR IGNORE INTO security_crs_version (id, version, auto_update) VALUES (1,'v-test',1)`); err != nil {
+		t.Fatalf("seed version row: %v", err)
+	}
+	if _, err := db.DB.Exec(`UPDATE security_crs_version SET schedule_days='1', schedule_time='09:30', next_update='2999-01-01 00:00:00' WHERE id=1`); err != nil {
+		t.Fatalf("seed version schedule: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO security_threat_sources (name, update_enabled, next_update) VALUES ('src-atomic',1,'2999-01-02 00:00:00')`); err != nil {
+		t.Fatalf("seed threat source: %v", err)
+	}
+
+	// 夹具前提：未摘句柄时读侧返回库中非默认值（否则下方的翻转断言无区分力）。
+	if days, hhmm := CRSSchedule(); len(days) != 1 || days[0] != 1 || hhmm != "09:30" {
+		t.Fatalf("夹具前提不成立：CRSSchedule=%v/%q", days, hhmm)
+	}
+	if got := versionTableNextUpdate("security_crs_version"); got != "2999-01-01 00:00:00" {
+		t.Fatalf("夹具前提不成立：next_update=%q", got)
+	}
+	if got := earliestThreatNextUpdate(); got != "2999-01-02 00:00:00" {
+		t.Fatalf("夹具前提不成立：earliest threat=%q", got)
+	}
+
+	// When 后台句柄被摘除（同步句柄仍完整可读）
+	db.SetDB(nil)
+
+	// Then 读侧一律 fail-safe，且不得回落到同步句柄
+	if days, hhmm := CRSSchedule(); len(days) != 7 || hhmm != "04:00" {
+		t.Fatalf("CRSSchedule=%v/%q，want 默认排程（读侧必须走原子句柄）", days, hhmm)
+	}
+	if days, hhmm := ThreatSchedule(); len(days) != 7 || hhmm != "04:00" {
+		t.Fatalf("ThreatSchedule=%v/%q，want 默认排程", days, hhmm)
+	}
+	if got := versionTableNextUpdate("security_crs_version"); got != "" {
+		t.Fatalf("versionTableNextUpdate=%q，want 空槽（原子句柄缺失按未排程处理）", got)
+	}
+	if enabled, known := versionTableAutoUpdateState("security_crs_version"); enabled || known {
+		t.Fatalf("versionTableAutoUpdateState=(%v,%v)，want (false,false)", enabled, known)
+	}
+	if got := earliestThreatNextUpdate(); got != "" {
+		t.Fatalf("earliestThreatNextUpdate=%q，want 空", got)
+	}
+
+	// 时区重排同样不得写同步句柄：原子句柄缺失时整段 no-op。
+	if _, err := db.DB.Exec(`UPDATE security_crs_version SET next_update='2999-01-03 00:00:00' WHERE id=1`); err != nil {
+		t.Fatalf("reset version next_update: %v", err)
+	}
+	RearmScheduleSlotsAfterTimezoneChange()
+	var after string
+	if err := db.DB.QueryRow(`SELECT COALESCE(next_update,'') FROM security_crs_version WHERE id=1`).Scan(&after); err != nil {
+		t.Fatalf("read next_update: %v", err)
+	}
+	if after != "2999-01-03 00:00:00" {
+		t.Fatalf("时区重排写入了同步句柄（next_update=%q），应整段 no-op", after)
+	}
+}

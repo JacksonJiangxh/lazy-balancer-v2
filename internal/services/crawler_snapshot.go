@@ -123,8 +123,14 @@ func (m *CrawlerUpdateManager) Prime() error {
 			all[src.Name] = append([]string(nil), seed...)
 		}
 	}
+	// 名单名迁移单轮一次（与 RunUpdate 同原则）：逐引擎 upsert 各自重跑
+	// 迁移等于每引擎 N 条 UPDATE。
+	if err := crawlerIPListMigrate(); err != nil {
+		return err
+	}
 	for engineID, entries := range all {
-		if err := upsertCrawlerIPList(engineID, entries); err != nil {
+		// 内层 upsert 返回「是否实变」，Prime 只关心错误——全量快照写在下游。
+		if _, err := upsertCrawlerIPListChangedInner(engineID, entries); err != nil {
 			// 部分 upsert 失败时不写全量快照（保留上一份，避免快照缩小），
 			// 由调用方错误日志告警后下次启动继续补种。
 			return err
@@ -225,17 +231,28 @@ func crawlerSnapshotMatchesEngine(engineID string, entries []string) bool {
 		return false
 	}
 	got, ok := all[engineID]
-	if !ok || len(got) != len(entries) {
+	if !ok {
 		return false
 	}
-	seen := make(map[string]struct{}, len(got))
-	for _, v := range got {
-		seen[v] = struct{}{}
+	// 多重集比较（与 crawlerEntriesUnchanged 同口径）：长度 + 成员包含
+	// 会把 [A,B] 与 [A,A] 判为一致，快照多出的条目会被保留（fail-open 方向）。
+	return crawlerSameStringMultiset(got, entries)
+}
+
+// crawlerSameStringMultiset 报告两组字符串是否同值多重集（顺序无关）。
+func crawlerSameStringMultiset(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
 	}
-	for _, v := range entries {
-		if _, ok := seen[v]; !ok {
+	counts := make(map[string]int, len(a))
+	for _, v := range a {
+		counts[v]++
+	}
+	for _, v := range b {
+		if counts[v] == 0 {
 			return false
 		}
+		counts[v]--
 	}
 	return true
 }
@@ -251,17 +268,11 @@ func crawlerEntriesUnchanged(existingJSON string, entries []string) bool {
 	if len(stored) != len(entries) {
 		return false
 	}
-	counts := make(map[string]int, len(entries))
-	for _, e := range entries {
-		counts[e]++
-	}
+	storedValues := make([]string, 0, len(stored))
 	for _, e := range stored {
-		if counts[e.Value] == 0 {
-			return false
-		}
-		counts[e.Value]--
+		storedValues = append(storedValues, e.Value)
 	}
-	return true
+	return crawlerSameStringMultiset(storedValues, entries)
 }
 
 // writeCrawlerIPListSnapshotAll 全量快照：写 map[engine][]string JSON

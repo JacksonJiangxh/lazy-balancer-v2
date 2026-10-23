@@ -110,6 +110,15 @@ test('保留天数展示：0/缺省落 90，正值原样（不再 SFC 内联第�
   assert.equal(displaySecurityEventsRetentionDays(null), 90)
   assert.equal(displaySecurityEventsRetentionDays(undefined), 90)
   const vue = source('src/views/settings/BasicSettings.vue')
-  assert.match(vue, /seRetentionDays\.value = displaySecurityEventsRetentionDays\(d\)/, 'BasicSettings 必须复用单源 helper')
+  assert.match(
+    vue,
+    /get: \(\) => displaySecurityEventsRetentionDays\(settings\.value\.security_events_retention_days\)/,
+    'BasicSettings 必须复用单源 helper',
+  )
+  assert.match(
+    vue,
+    /get: \(\) => displaySecurityEventsRowCap\(settings\.value\.security_events_row_cap\)/,
+    'BasicSettings 必须复用单源 helper',
+  )
   assert.doesNotMatch(vue, /d && d > 0 \? d : 90/, 'SFC 内联第二实现必须退役')
 })

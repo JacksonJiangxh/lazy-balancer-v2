@@ -12,8 +12,8 @@
     <el-form label-width="120px" class="settings-form" :disabled="readOnly">
       <el-form-item v-for="item in syncSwitchItems" :key="item.key" :label="item.label">
         <el-switch
-          :model-value="item.key === 'sync_users' ? true : status[item.key]"
-          :disabled="item.key === 'sync_users'"
+          :model-value="item.locked ? true : status[item.key]"
+          :disabled="item.locked === true"
           :loading="settingsLoading"
           @change="(v: string | number | boolean) => handleSwitchChange(item.key, v)"
         />

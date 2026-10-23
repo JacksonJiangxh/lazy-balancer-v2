@@ -964,7 +964,8 @@ import type { APIResponse, UserListItem } from '@/types'
 import SecurityBindingEditor from '@/components/SecurityBindingEditor.vue'
 import DialogHeader from '@/components/DialogHeader.vue'
 import { POLICY_TYPE_LABELS, POLICY_TYPE_SHORT_LABELS, STAGE_BLOCK_STATUS_OPTIONS, blockPageMissing, blockPageStageCanIntercept, buildStageModel, chunkForBulk, entriesIntersect, ensureSharedEntries, formatAclModeDetail, hasGeoIPControl, hasIPACLControl, hasStage3Features, hasTrustEntries, inferPolicyType, mergeIpEntryCount, mergeIpEntryValues, parseCrsFilename, parseIPList, parseRefIds, parseUnknownIds, parseUnknownStrings, sharedEntriesCache, subscribeSharedEntriesCache, trustHitMode, IP_LIST_CATEGORIES, MAX_POLICIES_PER_RULE, SECURITY_BULK_LIMITS, resolveBlockPageAttribution, type BlockPageAttribution, type BlockPageStage } from '@/utils/securityStages'
-import type { RuleStageModel, SecurityPolicyType, SecurityStagePolicy } from '@/utils/securityStages'
+import type { RuleStageModel, SecurityPolicyType, SecurityStagePolicy, CrsRuleFileOption } from '@/utils/securityStages'
+import { fetchAllCrsRuleFiles } from '@/utils/crsRuleFiles'
 import { updaterName } from '@/utils/updaterName'
 import { DEEP_LINK_PARAMS, pageUrl } from '@/utils/deepLink'
 import { buildPolicyPayload, crawlerExemptionNeedsEngines } from '@/utils/policyPayload'
@@ -981,7 +982,6 @@ interface CustomRuleRef { id: number; action: string }
 interface ChainEntry { policyId: number | null; name: string; enabled: boolean; isSelf: boolean; blockPageId?: number; blockStatusCode?: number }
 interface BlockPageNote { kind: 'active' | 'disabled' | 'warning' | 'info'; text: string }
 interface BoundRuleRow { caddyId: string; name: string; domain: string; listenPort: number; chain: ChainEntry[]; blockPageNotes: BlockPageNote[]; mergedCount: number; showPerfTip: boolean; hints: string[]; infoHints: string[] }
-interface CRSRuleOption { filename: string; category: string }
 interface BlockPage { id: number; name: string; content?: string }
 
 const blockPages = ref<BlockPage[]>([])
@@ -1049,7 +1049,7 @@ const users = ref<UserListItem[]>([])
 // 更新者显示名走 utils/updaterName 单源
 const getUpdaterName = (userId?: number) => updaterName(users.value, userId)
 
-const crsRuleOptions = ref<CRSRuleOption[]>([])
+const crsRuleOptions = ref<CrsRuleFileOption[]>([])
 // CRS 规则索引（约 832 条，id/msg/file/category）：规则组/排除目标级联的规则叶与
 // 预览 hover 明细共用；对话框打开时取一次（同会话缓存，openSeq 过期守卫见 useCrsRuleIndex）
 const { loaded: crsIndexLoaded, byId: crsIndexById, options: crsIndexOptions, ensureForDialog: ensureCrsRuleIndex } = useCrsRuleIndex()
@@ -1721,7 +1721,7 @@ const fetchData = async (): Promise<boolean> => {
     const [polRes, ruleRes, crsRes, bpRes, crRes, bindRes, userRes, ipListRes] = await Promise.allSettled([
       request.get<APIResponse<PolicySummary[]>>('/security/policies'),
       request.get<APIResponse<Rule[]>>('/rules'),
-      request.get<APIResponse<{ rules: CRSRuleOption[] }>>('/security/crs/rules?page_size=50'),
+      fetchAllCrsRuleFiles(),
       request.get<APIResponse<BlockPage[]>>('/security/block-pages'),
       request.get<APIResponse<Array<{ id: number; name: string; action?: string; enabled?: boolean }>>>('/security/custom-rules'),
       request.get<APIResponse<Record<string, BindingInfo[]>>>('/security/bindings'),
@@ -1741,7 +1741,7 @@ const fetchData = async (): Promise<boolean> => {
     const failures: string[] = []
     if (ruleRes.status === 'fulfilled') allRules.value = ruleRes.value.data || []
     else failures.push('规则列表')
-    if (crsRes.status === 'fulfilled') crsRuleOptions.value = crsRes.value.data?.rules || []
+    if (crsRes.status === 'fulfilled') crsRuleOptions.value = crsRes.value || []
     else failures.push('CRS 规则选项')
     if (bpRes.status === 'fulfilled') { blockPages.value = bpRes.value.data || []; blockPagesLoaded.value = true }
     else failures.push('拦截页面')

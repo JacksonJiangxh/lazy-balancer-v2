@@ -6,7 +6,6 @@ import {
   COUNTRY_SITE_CHOICES,
   coordsForSiteLocation,
   nearestSiteLocation,
-  siteDistanceKm,
 } from '../src/utils/siteLocation.ts'
 
 test('中国省份选择覆盖 34 个省级条目且坐标顺序为 [lon,lat]→lat/lon', () => {
@@ -35,5 +34,8 @@ test('已有坐标回显最近省份，零坐标回显未设置', () => {
   assert.equal(nearestSiteLocation(0, 0), '')
   assert.equal(nearestSiteLocation(23.13, 113.27), 'cn:广东')
   assert.equal(nearestSiteLocation(31.23, 121.47), 'cn:上海')
-  assert.ok(siteDistanceKm(23.13, 113.27, 23.13, 113.27) < 0.001)
+  // 质心坐标原样回显到同一选项（最近距离≈0 的可观测形态；距离函数是模块内部实现）
+  const jp = coordsForSiteLocation('country:日本')
+  assert.ok(jp)
+  assert.equal(nearestSiteLocation(jp!.lat, jp!.lon), 'country:日本')
 })

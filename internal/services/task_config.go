@@ -14,6 +14,12 @@ import (
 // 0 行仍返回 nil——开关响应成功、库中无记录、EnabledFn 读 ErrNoRows fail-closed
 // 致调度面永不投递（三方不一致且任务监控全绿）。
 func setGlobalTaskAutoUpdate(prefix string, enabled bool) error {
+	// 同族 DB 入口（engine History/RunOverview、taskmonitor collectCertJobRows、
+	// taskrun.taskRunStartedAt）一律先判 nil：装配缺失/测试构造下降级为错误，
+	// 而不是 nil 指针 panic。
+	if db.DB == nil {
+		return fmt.Errorf("更新规则库自动更新开关: 数据库未初始化")
+	}
 	tx, err := db.DB.Begin()
 	if err != nil {
 		return fmt.Errorf("更新规则库自动更新开关: %w", err)

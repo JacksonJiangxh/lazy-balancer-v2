@@ -3,9 +3,7 @@ package handlers
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,7 +15,6 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"lazy-balancer-v2/internal/db"
-	"lazy-balancer-v2/internal/models"
 	"lazy-balancer-v2/internal/services"
 	"lazy-balancer-v2/internal/taskengine"
 )
@@ -407,8 +404,8 @@ func TestCollectImportCertificatesSkipsTCP(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows := []map[string]any{
-		{"caddy_id": "lb_tcp", "name": "tcp", "protocol": "tcp", "domain": "tcp.example.com", "tls_cert": certPEM, "tls_key": keyPEM},
-		{"caddy_id": "lb_http", "name": "http", "protocol": "http", "domain": "tcp.example.com", "tls_cert": certPEM, "tls_key": keyPEM},
+		{"caddy_id": "lb_tcp", "name": "tcp", "protocol": "tcp", "domain": "tcp.example.com", "enable_tls": true, "tls_cert": certPEM, "tls_key": keyPEM},
+		{"caddy_id": "lb_http", "name": "http", "protocol": "http", "domain": "tcp.example.com", "enable_tls": true, "tls_cert": certPEM, "tls_key": keyPEM},
 	}
 	certs, warnings := collectImportCertificates(rows)
 	if len(certs) != 1 || certs[0].ruleID != "lb_http" {
@@ -579,10 +576,3 @@ func TestLibraryUpdateEndpointsRejectPausedBefore200(t *testing.T) {
 		})
 	}
 }
-
-// ---------- 编译基准：确保 sql/gin/models 使用（防止无用导入） ----------
-
-var _ = sql.ErrNoRows
-var _ = gin.Mode
-var _ = fmt.Sprintf
-var _ = models.APIResponse{}

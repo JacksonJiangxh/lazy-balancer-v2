@@ -8,7 +8,7 @@
   },
   "scripts": {
     "dev": "vite",
-    "test": "node --test \"tests/*.spec.ts\"",
+    "test": "node --test \"tests/**/*.spec.ts\"",
     "typecheck:src": "vue-tsc -p tsconfig.json --noEmit",
     "typecheck:test": "vue-tsc -p tsconfig.test.json --noEmit && tsc -p tsconfig.node.json",
     "build:vite": "vite build",

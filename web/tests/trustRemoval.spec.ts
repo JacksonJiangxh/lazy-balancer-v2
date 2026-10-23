@@ -129,15 +129,11 @@ test('IPv6 残余信任：精确条目移除后覆盖它的 IPv6 CIDR 必须报�
 // 策略可能事后被禁用，禁用策略不渲染、不可能放行，不得参与「由某策略信任名单
 // 放行」的归因。语义按 trustHitMode：非阶段 0 存量信任引擎恒 DetectionOnly，
 // 即使 trust_detection=false 也可解释 logged 事件。
-test('豁免候选：禁用/信任关闭不参与；非阶段 0 存量信任参与归因', () => {
-  assert.equal(isTrustExemptionCandidate({ enabled: true, ip_whitelist_enabled: true, policy_type: 'stage0', trust_detection: true }), true)
-  assert.equal(isTrustExemptionCandidate({ enabled: false, ip_whitelist_enabled: true, policy_type: 'stage0', trust_detection: true }), false)
+// 谓词归属 securityStages.ts，基础语义（stage0 直通不参与 / 非阶段 0 存量恒参与
+// / 禁用策略不参与）由 securityStagesModel.spec.ts 完整覆盖；本文件只保留本模块
+// 独有的增量形状：ip_whitelist_enabled=false、stage1 存量、类型缺省。
+test('豁免候选的增量形状：信任开关关闭、stage1 存量、类型缺省', () => {
   assert.equal(isTrustExemptionCandidate({ enabled: true, ip_whitelist_enabled: false, policy_type: 'stage0', trust_detection: true }), false)
-  // 阶段 0 直通不产生后续阶段事件 → 不参与
-  assert.equal(isTrustExemptionCandidate({ enabled: true, ip_whitelist_enabled: true, policy_type: 'stage0', trust_detection: false }), false)
-  // 非阶段 0（mixed/stage1 存量）：引擎恒 DetectionOnly，与 trust_detection 无关
-  assert.equal(isTrustExemptionCandidate({ enabled: true, ip_whitelist_enabled: true, policy_type: 'mixed', trust_detection: false }), true)
   assert.equal(isTrustExemptionCandidate({ enabled: true, ip_whitelist_enabled: true, policy_type: 'stage1', trust_detection: false }), true)
-  // 类型缺省回落旧口径
   assert.equal(isTrustExemptionCandidate({ enabled: true, ip_whitelist_enabled: true }), false)
 })

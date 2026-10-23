@@ -53,7 +53,7 @@ func (w *countingSyncWorker) Stop()  { w.stops.Add(1) }
 // daemon 换代并发时，已 teardown 的同步循环不得被重新拉起。
 func TestRuntimeLifecycle_ShutdownGatesLaterStarts(t *testing.T) {
 	worker := &countingSyncWorker{}
-	lifecycle := newRuntimeLifecycle(worker, func() certificateWorker {
+	lifecycle := newRuntimeLifecycle(worker, func() lifecycleWorker {
 		return &blockingCertificateWorker{stop: make(chan struct{}), exited: make(chan struct{})}
 	})
 	lifecycle.StartSync()
@@ -77,7 +77,7 @@ func TestRuntimeLifecycle_ShutdownGatesLaterStarts(t *testing.T) {
 func TestRuntimeLifecycle_StopACME_waitsForWorkerExit(t *testing.T) {
 	// Given
 	worker := &blockingCertificateWorker{stop: make(chan struct{}), exited: make(chan struct{})}
-	lifecycle := newRuntimeLifecycle(idleSyncWorker{}, func() certificateWorker { return worker })
+	lifecycle := newRuntimeLifecycle(idleSyncWorker{}, func() lifecycleWorker { return worker })
 	lifecycle.StartACME()
 
 	// When
@@ -110,7 +110,7 @@ func (w *blockedStopCertificateWorker) Stop() { <-w.release }
 func TestRuntimeLifecycle_ShutdownWithTimeoutBoundsBlockingStop(t *testing.T) {
 	worker := &blockedStopCertificateWorker{release: make(chan struct{}), started: make(chan struct{})}
 	t.Cleanup(func() { close(worker.release) })
-	lifecycle := newRuntimeLifecycle(idleSyncWorker{}, func() certificateWorker { return worker })
+	lifecycle := newRuntimeLifecycle(idleSyncWorker{}, func() lifecycleWorker { return worker })
 	lifecycle.StartACME()
 	<-worker.started
 
@@ -160,7 +160,7 @@ func TestRuntimeLifecycle_StopACME_clearsActiveCertificateService(t *testing.T) 
 	log.SetOutput(&buf)
 	t.Cleanup(func() { log.SetOutput(oldWriter) })
 
-	lifecycle := newRuntimeLifecycle(idleSyncWorker{}, func() certificateWorker { return services.NewCertificateService() })
+	lifecycle := newRuntimeLifecycle(idleSyncWorker{}, func() lifecycleWorker { return services.NewCertificateService() })
 	lifecycle.StartACME()
 
 	// 观察口：CertRenewalScanOnce 依赖活动证书服务实例（缺失即返回
@@ -204,4 +204,85 @@ func expiredManualCertPEM(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+}
+
+// blockingStopSyncWorker 是生产形态的同步停止：SyncService.Stop 取消 ctx 后
+// 无 deadline 地等 pullWG（在途拉取客户端 30s + apply 的 DB 写），关停期完全
+// 可能超过整个 compose grace。
+type blockingStopSyncWorker struct {
+	release     chan struct{}
+	entered     chan struct{}
+	enterOnce   sync.Once
+	releaseOnce sync.Once
+	stops       atomic.Int32
+}
+
+func (w *blockingStopSyncWorker) Start() {}
+func (w *blockingStopSyncWorker) Stop() {
+	w.stops.Add(1)
+	w.enterOnce.Do(func() { close(w.entered) })
+	<-w.release
+}
+
+// releaseNow 放行阻塞中的 Stop（幂等：清理与用例内放行可同时注册）。
+func (w *blockingStopSyncWorker) releaseNow() { w.releaseOnce.Do(func() { close(w.release) }) }
+
+// Given 从节点同步停止阻塞（在途 pull 未返回）。
+// When ShutdownWithTimeout 以 50ms 预算调用。
+// Then 必须在预算内返回——同步段的无预算等待不得排在有预算段之前并吃掉整个
+// 关停窗口（旧实现 Shutdown 内直调 StopSync，`<-done` 无界）。
+func TestRuntimeLifecycle_ShutdownWithTimeoutBoundsBlockingSyncStop(t *testing.T) {
+	worker := &blockingStopSyncWorker{release: make(chan struct{}), entered: make(chan struct{})}
+	t.Cleanup(worker.releaseNow)
+	lifecycle := newRuntimeLifecycle(worker, func() lifecycleWorker {
+		return &blockedStopCertificateWorker{release: make(chan struct{}), started: make(chan struct{})}
+	})
+	lifecycle.StartSync()
+
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		lifecycle.ShutdownWithTimeout(50 * time.Millisecond)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ShutdownWithTimeout 未在预算内返回（同步停止仍是无预算等待）")
+	}
+}
+
+// Given 引擎排空路径（daemon defer）已发起同步停止且仍在途（弃留 goroutine）。
+// When 进程关停路径再次进入 ShutdownWithTimeout。
+// Then 只允许一次 syncService.Stop（单飞），且关停按预算返回——旧实现在
+// l.mu 上等同一个 `<-done`，与其后弃留的 daemon goroutine 互相卡死。
+func TestRuntimeLifecycle_ShutdownSyncStopIsSingleFlight(t *testing.T) {
+	worker := &blockingStopSyncWorker{release: make(chan struct{}), entered: make(chan struct{})}
+	t.Cleanup(worker.releaseNow)
+	lifecycle := newRuntimeLifecycle(worker, func() lifecycleWorker {
+		return &blockedStopCertificateWorker{release: make(chan struct{}), started: make(chan struct{})}
+	})
+	lifecycle.StartSync()
+
+	daemonDone := make(chan struct{})
+	go func() {
+		defer close(daemonDone)
+		lifecycle.StopSync() // 弃留的 daemon 收尾
+	}()
+	<-worker.entered
+
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		lifecycle.ShutdownWithTimeout(50 * time.Millisecond)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ShutdownWithTimeout 未在预算内返回（与在途同步停止争锁）")
+	}
+	if got := worker.stops.Load(); got != 1 {
+		t.Fatalf("syncService.Stop 调用 %d 次，want 1（单飞：不得二次进入停止）", got)
+	}
+	worker.releaseNow() // 放行后弃留的 daemon 收尾才会返回
+	<-daemonDone
 }

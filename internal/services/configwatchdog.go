@@ -35,6 +35,10 @@ var (
 	configDriftHeartbeatSkipped int  // 自上次心跳以来的跳过轮数：仅用于心跳文案，与状态字段窗口分离。
 	configDriftQueryWarned      bool // 规则数据读取失败首报留痕
 	configDriftReadWarned       bool // 运行配置读取失败首报留痕
+	// configDriftGeneration 每次 ResetConfigDrift 自增：取消轮的回滚快照携带
+	// 代际，代际变化说明期间发生过角色复位，回滚必须放弃——否则降级前捕获的
+	// 漂移态会被在途轮写回，从节点常亮陈旧横幅。
+	configDriftGeneration uint64
 	// configWatchdogMu/Cancel/Done 三个引擎化前残留
 	// 死变量已删（StartConfigWatchdog/StopConfigWatchdog 随退役，零消费方）。
 )
@@ -51,6 +55,7 @@ func ResetConfigDrift() {
 	configDriftHeartbeatSkipped = 0
 	configDriftQueryWarned = false
 	configDriftReadWarned = false
+	configDriftGeneration++
 }
 
 // CurrentConfigDrift 返回看门狗当前状态（GetCaddyStatus 等展示路径消费）。
@@ -65,8 +70,9 @@ func CurrentConfigDrift() ConfigDriftStatus {
 
 // configDriftSnapshot 单轮比对前的漂移状态快照（取消轮回滚用）。
 type configDriftSnapshot struct {
-	status ConfigDriftStatus
-	streak int
+	status     ConfigDriftStatus
+	streak     int
+	generation uint64
 }
 
 // snapshotConfigDrift 拷贝当前漂移状态与防抖计数（取消轮回滚基线）。
@@ -76,16 +82,38 @@ func snapshotConfigDrift() configDriftSnapshot {
 	status := configDriftStatus
 	status.Missing = append([]string(nil), configDriftStatus.Missing...)
 	status.Extra = append([]string(nil), configDriftStatus.Extra...)
-	return configDriftSnapshot{status: status, streak: configDriftStreak}
+	return configDriftSnapshot{status: status, streak: configDriftStreak, generation: configDriftGeneration}
 }
 
 // restoreConfigDriftSnapshot 把漂移状态回滚到本轮之前——降级/停机取消的在途
-// 轮不得把检查内部的状态转移（streak++/确认漂移）留在进程里。
+// 轮不得把检查内部的状态转移（streak++/确认漂移）留在进程里。代际不一致说明
+// 期间执行过 ResetConfigDrift（降级复位先于取消在途轮），回滚会覆写复位态，
+// 此时必须放弃回滚。
 func restoreConfigDriftSnapshot(snapshot configDriftSnapshot) {
 	configDriftMu.Lock()
+	defer configDriftMu.Unlock()
+	if configDriftGeneration != snapshot.generation {
+		// 轮中发生过降级复位：本轮在其后写入的簿记同样属于已失效的主节点
+		// 视角，必须一并丢弃（只跳过回滚会留下本轮自己的 streak/漂移结论）。
+		configDriftStatus = ConfigDriftStatus{Consistent: true}
+		configDriftStreak = 0
+		configDriftCleanRounds = 0
+		configDriftSkipped = 0
+		configDriftHeartbeatSkipped = 0
+		return
+	}
 	configDriftStatus = snapshot.status
 	configDriftStreak = snapshot.streak
-	configDriftMu.Unlock()
+}
+
+// recordUndeterminedRoundLocked 记录一轮「未判定」簿记（调用方须持
+// configDriftMu）：跳过计数 + 严格连续窗口打断。角色读取失败与比对跳过两条
+// 路径必须同源——跳过轮不含任何证据，否则「漂移→跳过→漂移」会被当成两轮
+// 连续证据而确认漂移。
+func recordUndeterminedRoundLocked() {
+	configDriftSkipped++
+	configDriftHeartbeatSkipped++
+	configDriftStreak = 0
 }
 
 // 配置一致性看门狗：主节点每 60s 比对「应渲染规则」与 Caddy 运行配置：不一致时
@@ -140,8 +168,7 @@ func WatchdogCheckOnce(ctx context.Context) (runErr error) {
 			Logf(lvl, "配置看门狗: 角色读取失败，本轮跳过: %v", roleErr)
 		}
 		configDriftMu.Lock()
-		configDriftSkipped++
-		configDriftHeartbeatSkipped++
+		recordUndeterminedRoundLocked()
 		configDriftMu.Unlock()
 		TaskLogfWarn("config-watchdog", "skipped", "配置检查未完成：角色读取失败（%v），本轮未判定，不计入一致轮", roleErr)
 		return fmt.Errorf("角色读取失败: %w", roleErr)
@@ -181,11 +208,9 @@ func WatchdogCheckOnce(ctx context.Context) (runErr error) {
 	driftInProgress := configDriftStreak > 0
 	switch {
 	case !checked:
-		configDriftSkipped++
-		configDriftHeartbeatSkipped++
 		// 严格「连续两轮」语义：跳过轮不含任何证据，必须打断连续窗口——
 		// 否则「漂移→跳过→漂移」会被当作两轮连续证据而确认漂移。
-		configDriftStreak = 0
+		recordUndeterminedRoundLocked()
 	case driftInProgress && configDriftStatus.Consistent:
 		// 防抖轮（streak=1，状态仍为 Consistent）已观测到一轮不一致：
 		// 它既不是「一致」证据，也必须清空本窗口——旧实现只是不计入

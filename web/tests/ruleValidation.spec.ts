@@ -8,7 +8,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { pathDuplicateKey, validatePathRules } from '../src/utils/ruleValidation.ts'
-import { repoSource } from './_helpers.ts'
+import { repoSource, section } from './_helpers.ts'
 import { hostPortKey } from '../src/utils/upstreamKeys.ts'
 
 type Upstream = {
@@ -135,8 +135,16 @@ test('权重门跨栈同口径：前端 <1 拒绝与后端路径池/主池一致
   // 渲染层虽归一为 1，落库 0 会让「权重 0=停用」直觉落空。钉住两侧门槛。
   const frontend = String(validatePathRules([rule({ upstreams: [upstream({ weight: 0 })] })]))
   assert.match(frontend, /权重必须大于 0/, '前端必须拒绝 weight=0')
-  const goPath = repoSource('internal/handlers/rule_features.go')
-  assert.ok(goPath.includes('if upstream.Weight < 1 {'), '后端路径池权重门必须为 <1（与前端同口径）')
-  const goMain = repoSource('internal/handlers/handlers.go')
-  assert.ok(goMain.includes('if u.Weight < 1 {'), '后端主池权重门必须为 <1')
+  // 限段到各自校验函数后断言门表达式，并计「文件内该判据只出现一次」——
+  // 全文 includes 在全文件别处新增第二条门时无感（多处门只对表一处）。
+  const goPath = section(repoSource('internal/handlers/rule_features.go'), 'func validateRuleFeatures(', '\nfunc ')
+  assert.match(goPath, /if upstream\.Weight < 1 \{/, '后端路径池权重门必须为 <1（与前端同口径）')
+  assert.equal(
+    (goPath.match(/upstream\.Weight < 1/g) ?? []).length,
+    1,
+    '路径池权重判据在 validateRuleFeatures 内只允许一处',
+  )
+  const goMain = section(repoSource('internal/handlers/handlers.go'), 'func validateRuleUpstreams(', '\nfunc ')
+  assert.match(goMain, /if u\.Weight < 1 \{/, '后端主池权重门必须为 <1')
+  assert.equal((goMain.match(/u\.Weight < 1/g) ?? []).length, 1, '主池权重判据在 validateRuleUpstreams 内只允许一处')
 })

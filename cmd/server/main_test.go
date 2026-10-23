@@ -81,7 +81,9 @@ func TestMain_exitsNonZero_whenHTTPListenFails(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte(configJSON), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	// 60s：helper 会跑完整启动链（DB 初始化/服务装配）；并行跑全仓测试时
+	// 20s 会在高负载下假失败（超时与「未按预期退出」不可区分）。
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	command := exec.CommandContext(ctx, os.Args[0], "-test.run=TestMainHelperProcess")
 	command.Env = append(os.Environ(), "LAZY_BALANCER_MAIN_HELPER=1", "LAZY_BALANCER_TEST_CONFIG="+configPath)

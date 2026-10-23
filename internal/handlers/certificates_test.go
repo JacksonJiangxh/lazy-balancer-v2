@@ -141,6 +141,100 @@ func TestUpdateCertificateConfig_legacyEmptyCredentialsAllowNonCredentialUpdates
 	})
 }
 
+// 前端编辑遗留空凭据配置时按表单形态提交（未编辑任何字段 → 空对象）：
+// 空对象与省略等价，不得让「改名/禁用」被旧空值阻断；只含认证方式而无任何
+// 凭证值的载荷仍必须过 provider 校验（不得放宽为任意 auth_mode-only 放行）。
+func TestUpdateCertificateConfig_legacyEmptyCredentialsEmptyObjectPayload(t *testing.T) {
+	put := func(h *Handlers, id int64, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		router := gin.New()
+		router.PUT("/certificate-configs/:id", h.UpdateCertificateConfig)
+		response := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPut, "/certificate-configs/"+strconv.FormatInt(id, 10), strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(response, request)
+		return response
+	}
+	seed := func(t *testing.T, credentials any) (*Handlers, int64) {
+		t.Helper()
+		h := newBackupTestHandlers(t)
+		result, err := db.DB.Exec(`INSERT INTO certificate_configs (name,dns_provider,dns_credentials,enabled) VALUES ('legacy','dnspod',?,1)`, credentials)
+		if err != nil {
+			t.Fatalf("seed legacy config: %v", err)
+		}
+		id, err := result.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return h, id
+	}
+	readCredentials := func(t *testing.T, id int64) string {
+		t.Helper()
+		var credentials string
+		if err := db.DB.QueryRow(`SELECT COALESCE(dns_credentials,'') FROM certificate_configs WHERE id=?`, id).Scan(&credentials); err != nil {
+			t.Fatal(err)
+		}
+		return credentials
+	}
+
+	for _, stored := range []struct {
+		name  string
+		value any
+	}{{"NULL", nil}, {"empty string", ""}} {
+		t.Run(stored.name+" rename with empty object", func(t *testing.T) {
+			h, id := seed(t, stored.value)
+			response := put(h, id, `{"name":"renamed","dns_credentials":{}}`)
+			if response.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s, want rename 200", response.Code, response.Body.String())
+			}
+			var name string
+			if err := db.DB.QueryRow(`SELECT name FROM certificate_configs WHERE id=?`, id).Scan(&name); err != nil {
+				t.Fatal(err)
+			}
+			if name != "renamed" || readCredentials(t, id) != "" {
+				t.Fatalf("row name=%q credentials=%q, want renamed/empty", name, readCredentials(t, id))
+			}
+		})
+	}
+
+	t.Run("empty object disable", func(t *testing.T) {
+		h, id := seed(t, "")
+		response := put(h, id, `{"enabled":false,"dns_credentials":{}}`)
+		if response.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s, want disable 200", response.Code, response.Body.String())
+		}
+		var enabled int
+		if err := db.DB.QueryRow(`SELECT COALESCE(enabled,1) FROM certificate_configs WHERE id=?`, id).Scan(&enabled); err != nil {
+			t.Fatal(err)
+		}
+		if enabled != 0 {
+			t.Fatalf("enabled=%d, want 0", enabled)
+		}
+	})
+
+	t.Run("auth_mode-only payload still rejected", func(t *testing.T) {
+		h, id := seed(t, "")
+		response := put(h, id, `{"name":"renamed","dns_credentials":{"auth_mode":"dnspod"}}`)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("status=%d body=%s, want provider validation 400", response.Code, response.Body.String())
+		}
+		if credentials := readCredentials(t, id); credentials != "" {
+			t.Fatalf("credentials=%q, want unchanged empty（被拒载荷不得落库）", credentials)
+		}
+	})
+
+	t.Run("empty object cannot enable", func(t *testing.T) {
+		h, id := seed(t, "")
+		if _, err := db.DB.Exec(`UPDATE certificate_configs SET enabled=0 WHERE id=?`, id); err != nil {
+			t.Fatal(err)
+		}
+		response := put(h, id, `{"enabled":true,"dns_credentials":{}}`)
+		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "请选择认证方式") {
+			t.Fatalf("status=%d body=%s, want provider validation 400", response.Code, response.Body.String())
+		}
+	})
+}
+
 func TestCertificateConfigReferenceGuards_formatListedReferencesConsistently(t *testing.T) {
 	seed := func(t *testing.T) *Handlers {
 		t.Helper()

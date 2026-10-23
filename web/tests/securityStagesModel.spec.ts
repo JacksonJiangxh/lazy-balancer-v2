@@ -385,3 +385,96 @@ test('禁用规则：阶段模型携带 ruleDisabled 且不影响阶段内容', 
   // 缺省（未知态）不得宣称已禁用
   assert.equal(buildStageModel([binding], [policy], [], []).ruleDisabled, false)
 })
+
+test('阶段 0：绑定链存在阶段 0 策略即启用，名单空出灰态行（内容门不得冒充未启用）', () => {
+  // 只能经 API/带外导入形成「阶段 0 策略 + 空信任名单」：原实现按内容门过滤，
+  // 流程弹框/锁摘要会显示「阶段 0 未启用」，与绑定链事实相反。
+  const emptyTrust = policyOf({ policy_type: 'stage0', ip_whitelist: '[]', ip_whitelist_refs: '[]' })
+  const model = buildStageModel([bindingOf()], [emptyTrust], [], [])
+  assert.equal(model.stages[0].enabled, true)
+  assert.deepEqual(model.stages[0].groups[0]?.rows.map((row) => [row.label, row.detail]), [
+    ['信任名单', '未配置'],
+    ['模式', '直通上游（不产生安全事件）'],
+  ])
+  // 无阶段 0 策略绑定时不得虚增阶段 0 组（默认策略推断为 stage3）
+  assert.equal(buildStageModel([bindingOf()], [policyOf()], [], []).stages[0].groups.length, 0)
+})
+
+// 规则级阶段拦截页覆盖与多策略绑定链的多组排布：生产主路径
+// （Rules.vue 传 stagePages + ruleEnabled）此前只有纯函数级钉，集成层零覆盖，
+// 且既有助手固定取 groups[0]——第二组起的标签/顺序缺陷永远隐身。
+test('规则级阶段 1 拦截页覆盖：命中/失效/未配三种措辞', () => {
+  const pages = [{ id: 5, name: '自定义 403 页', content: '<p>x</p>' }]
+  const policy = policyOf({ has_ip_control: true, ip_acl_enabled: true, ip_acl_list: '["10.0.0.0/8"]' })
+
+  const configured = buildStageModel([bindingOf()], [policy], [], pages, {
+    block_page_stage1_id: 5,
+    block_page_stage1_status: 404,
+  })
+  assert.deepEqual(configured.stages[1].override, { pageId: 5, pageName: '自定义 403 页', status: 404, broken: false })
+  assert.deepEqual(configured.stages[1].groups[0].rows.find((row) => row.label === '拦截页'), {
+    label: '拦截页',
+    detail: '规则覆盖：自定义 403 页（状态码 404）',
+  })
+
+  // 页已删/内容空：override.broken + 失效文案（回落跟随策略）
+  const broken = buildStageModel([bindingOf()], [policy], [], pages, { block_page_stage1_id: 99 })
+  assert.equal(broken.stages[1].override?.broken, true)
+  assert.equal(broken.stages[1].override?.pageName, '页面 #99')
+  assert.deepEqual(broken.stages[1].groups[0].rows.find((row) => row.label === '拦截页'), {
+    label: '拦截页',
+    detail: '已失效（回落跟随策略）',
+  })
+
+  // 未配：默认状态码 403 的「未配置」口径
+  const unset = buildStageModel([bindingOf()], [policy], [], pages, null)
+  assert.equal(unset.stages[1].override, null)
+  assert.deepEqual(unset.stages[1].groups[0].rows.find((row) => row.label === '拦截页'), {
+    label: '拦截页',
+    detail: '未配置（跟随绑定链首个有效页，无则默认 403）',
+  })
+})
+
+test('规则级阶段 3 覆盖与策略级页并存：规则覆盖行在前、策略页行在后', () => {
+  const pages = [
+    { id: 7, name: '规则覆盖页', content: '<p>rule</p>' },
+    { id: 8, name: '策略页', content: '<p>policy</p>' },
+  ]
+  const policy = policyOf({ mode: 'blocking' })
+  const model = buildStageModel([bindingOf({ block_page_id: 8 })], [policy], [], pages, {
+    block_page_stage3_id: 7,
+  })
+  const rows = model.stages[3].groups[0].rows
+  const overrideRow = rows.find((row) => row.label === '拦截页（规则覆盖）')
+  const policyRow = rows.find((row) => row.label === '拦截页（策略页）')
+  assert.deepEqual(overrideRow, { label: '拦截页（规则覆盖）', detail: '规则覆盖页（状态码 403）' })
+  assert.deepEqual(policyRow, { label: '拦截页（策略页）', detail: '策略页（状态码 403）' })
+  assert.ok(rows.indexOf(overrideRow!) < rows.indexOf(policyRow!), '规则覆盖行必须在策略页行之前（覆盖优先语义）')
+})
+
+test('多策略绑定链：同阶段两条策略出两组且按绑定顺序编号', () => {
+  const acl = (id: number, name: string): SecurityStagePolicy =>
+    policyOf({ id, name, has_ip_control: true, ip_acl_enabled: true, ip_acl_list: '["10.0.0.0/8"]' })
+  const bindings = [bindingOf({ policy_id: 1, name: '策略 A' }), bindingOf({ policy_id: 2, name: '策略 B' })]
+  const model = buildStageModel(bindings, [acl(1, '策略 A'), acl(2, '策略 B')], [], [])
+
+  assert.equal(model.stages[1].groups.length, 2, '同阶段两条策略必须各出一组')
+  assert.deepEqual(
+    model.stages[1].groups.map((group) => ({ key: group.key, order: group.order, name: group.name })),
+    [
+      { key: 1, order: 1, name: '策略 A' },
+      { key: 2, order: 2, name: '策略 B' },
+    ],
+    '组顺序=绑定链顺序（policy_id ASC），且序号为 1-based',
+  )
+  // 阶段 0 不在评估链内：无 override 概念，且无阶段 0 策略时为空组集合
+  assert.equal(model.stages[0].override, null)
+  assert.equal(model.stages[0].enabled, false)
+})
+
+test('规则禁用态透传 ruleEnabled=false（不得宣称已启用）', () => {
+  const model = buildStageModel([bindingOf()], [policyOf({ mode: 'blocking' })], [], [], null, false)
+  assert.equal(model.ruleDisabled, true)
+  const enabled = buildStageModel([bindingOf()], [policyOf({ mode: 'blocking' })], [], [], null, true)
+  assert.equal(enabled.ruleDisabled, false)
+})

@@ -14,11 +14,13 @@
 package caddygeoip
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"net"
 	"net/netip"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -421,14 +423,30 @@ func loadCrawlerIPRangeSnapshot() *crawlerIPRangeSnapshot {
 		crawlerSnapshotLogfThrottled(next.filePath, "rewrite",
 			"crawler ip list snapshot %s was rewritten while being read; treating as unavailable",
 			next.filePath)
+	case errors.Is(readErr, os.ErrNotExist):
+		// 缺失：fail-closed 空快照，不告警——首启时 Caddy 先于根服务生成
+		// 快照属正常形态，重试间隔内自愈。
 	case readErr != nil:
-		// 缺失/不可读：fail-closed 空快照，不告警——首启时 Caddy 先于根服务
-		// 生成快照属正常形态，重试间隔内自愈。
+		// 存在但不可读（权限/目录误挂/IO 故障）：与「尚未生成」不同——重试
+		// 间隔内的静默形态会让 360 豁免持续失效且零痕迹，必须可见。
+		crawlerSnapshotLogfThrottled(next.filePath, "read",
+			"crawler ip list snapshot %s is unreadable: %v; treating as unavailable",
+			next.filePath, readErr)
 	default:
 		if next.parsePayload(raw) {
 			// 代际元数据取自读取所用的同一 inode（见 ReadBoundedFile）。
 			next.ok, next.modTime, next.size = true, info.ModTime(), info.Size()
 			clearCrawlerSnapshotLogs(next.filePath)
+		} else if len(bytes.TrimSpace(raw)) == 0 {
+			// 空文件（写侧崩溃残留/误 truncate）：与内容损坏区分原因，便于
+			// 判断是生成链路还是磁盘问题。
+			crawlerSnapshotLogfThrottled(next.filePath, "empty",
+				"crawler ip list snapshot %s is empty; treating as unavailable",
+				next.filePath)
+		} else {
+			crawlerSnapshotLogfThrottled(next.filePath, "parse",
+				"crawler ip list snapshot %s is not valid JSON; treating as unavailable",
+				next.filePath)
 		}
 	}
 	return commitCrawlerIPRangeSnapshot(next)

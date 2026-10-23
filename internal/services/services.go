@@ -37,7 +37,11 @@ type MetricsService struct {
 	// cleanupWG 让 Start/Stop 有界等待清理 goroutine 收尾，避免拆除后继续
 	// 访问已关闭的指标库。
 	cleanupRunning atomic.Bool
-	cleanupWG      sync.WaitGroup
+	// stopped 在 Stop 置位：ticker 分支与 startHistoryCleanup 必须先看到它，
+	// 否则 stopCh 与 24h ticker 同时就绪时 select 可随机选中 ticker，在
+	// Start 返回/库关闭之后再启动清理 goroutine（Wait 已观察到 0 计数）。
+	stopped   atomic.Bool
+	cleanupWG sync.WaitGroup
 }
 
 func NewMetricsService(metricsURL string, interval int) *MetricsService {
@@ -71,6 +75,9 @@ func (m *MetricsService) Start() {
 		case <-ticker.C:
 			m.collect()
 		case <-cleanupTicker.C:
+			if m.stopped.Load() {
+				return
+			}
 			m.startHistoryCleanup()
 		case <-m.stopCh:
 			// 等待在途清理收尾（有界），Start 返回即代表清理 goroutine 已退出。
@@ -89,6 +96,10 @@ func (m *MetricsService) startHistoryCleanup() {
 	// 而提前返回，清理 goroutine 随后才启动并访问即将关闭的库。CAS 失败时
 	// 归还计数，维持单飞语义。
 	m.cleanupWG.Add(1)
+	if m.stopped.Load() {
+		m.cleanupWG.Done()
+		return
+	}
 	if !m.cleanupRunning.CompareAndSwap(false, true) {
 		m.cleanupWG.Done()
 		return
@@ -106,6 +117,9 @@ func (m *MetricsService) startHistoryCleanup() {
 const cleanupStopWait = 3 * time.Second
 
 func (m *MetricsService) Stop() {
+	// 先置 stopped 再关 stopCh：startHistoryCleanup 在任何 Add 之后复核
+	// stopped，Stop 之后新发起的清理不会启动 goroutine（Add/Wait 竞态的口径）。
+	m.stopped.Store(true)
 	m.stopOnce.Do(func() { close(m.stopCh) })
 	// 有界等待清理 goroutine：测试/嵌入形态下拆除后不得继续访问已关闭的库。
 	done := make(chan struct{})
@@ -125,24 +139,71 @@ func (m *MetricsService) Stop() {
 // tick 裸记日志约 2880 行/天同一消息。改为状态转换口径：ok→fail 记一次
 // （warn）、fail→ok 恢复记一次（info）、持续同一状态静默。状态按失败类别
 // （key）独立跟踪：前置类别失败（如 Get 失败）不评估后续类别，其恢复标记
-// 只在后续 tick 实际通过该检查时才落，避免「仍失败却记恢复」。map 有界：
-// 生产类别集固定 8 个（含 body 中段读取失败与规则级解析失败两个独立类别），
-// 清扫上限仅为防御动态键场景——超上限整体重置，各类别至多重复放行一条，
-// 无数据影响。
+// 只在后续 tick 实际通过该检查时才落，避免「仍失败却记恢复」。
+//
+// 键空间是静态族 + 动态族的混合体：静态族（metrics 采集 8 类、时区/日志轮转/
+// 排程读取/集群上报/自动备份/任务监控等固定前缀）总量随功能增长；动态族
+// （rulelog-tail-cap-<规则 id>、status-mirror-<任务 id>、config-read-<列>、
+// system-metrics-<部件>）按实体无界增长。因此上限淘汰必须按族进行——
+// 整表重置会清掉其他族的「已失败」记忆，让持久故障族重新各打一条 warn。
 var (
 	metricsStateMu     sync.Mutex
 	metricsStateFailed = map[string]bool{}
+	// metricsStateOrder 是键的 FIFO 序（与 map 同步维护）：上限淘汰按「同族
+	// 最旧键」取值。外部直接删键（测试隔离）留下的陈旧序项在淘汰时顺手清理。
+	metricsStateOrder []string
 )
 
-// metricsStateEvictCap 是状态 map 的防御性键数上限（见 logMetricsStateTransition）。
+// metricsStateEvictCap 是状态 map 的防御性键数上限（见 logStateTransition）。
 const metricsStateEvictCap = 64
+
+// stateTransitionFamily 返回状态键的族（首段前缀）。动态键按实体追加后缀，
+// 按族淘汰因此只会清掉同一调用方的状态，其他族不受影响。
+func stateTransitionFamily(key string) string {
+	if i := strings.IndexByte(key, '-'); i > 0 {
+		return key[:i]
+	}
+	return key
+}
+
+// evictStateTransitionLocked 在上限超出时按键淘汰（调用方须持 metricsStateMu）。
+// 优先清理同族最旧键（动态族无界增长的主要来源）；同族只有新键自身时退化为
+// 全局最旧键，保证 map 始终有界。
+func evictStateTransitionLocked(newKey string) {
+	family := stateTransitionFamily(newKey)
+	for len(metricsStateFailed) > metricsStateEvictCap {
+		victim := -1
+		for i, k := range metricsStateOrder {
+			if _, alive := metricsStateFailed[k]; !alive {
+				victim = i // 陈旧序项（键已被外部删除）
+				break
+			}
+			if victim < 0 && k != newKey && stateTransitionFamily(k) == family {
+				victim = i
+			}
+		}
+		if victim < 0 {
+			for i, k := range metricsStateOrder {
+				if _, alive := metricsStateFailed[k]; alive && k != newKey {
+					victim = i
+					break
+				}
+			}
+		}
+		if victim < 0 {
+			return // 无可淘汰对象（序项不足，理论上不可达）
+		}
+		delete(metricsStateFailed, metricsStateOrder[victim])
+		metricsStateOrder = append(metricsStateOrder[:victim], metricsStateOrder[victim+1:]...)
+	}
+}
 
 // logStateTransition 是状态转换日志的通用状态机（同一 key 独立跟踪）：
 // ok→fail="warn"、fail→ok="info"、持续同态=""。初始状态视为 ok：首次失败记
 // 一次 warn，首次成功静默（无恢复可记）。metrics 采集族与低频巡检循环
 // （时区刷新/运行日志尺寸刷新/排程读取）共用——持久失败在 30s tick 下不再
 // 各打 2880 行/天同一消息；键空间按调用方前缀隔离。map 有界
-// （metricsStateEvictCap）：超上限整体重置，各类别至多重复放行一条，无数据影响。
+// （metricsStateEvictCap）：超上限按族淘汰最旧键，各族的状态记忆互不牵连。
 func logStateTransition(key string, failed bool) string {
 	metricsStateMu.Lock()
 	defer metricsStateMu.Unlock()
@@ -153,10 +214,11 @@ func logStateTransition(key string, failed bool) string {
 	if !seen && !failed {
 		return ""
 	}
-	metricsStateFailed[key] = failed
-	if len(metricsStateFailed) > metricsStateEvictCap {
-		metricsStateFailed = map[string]bool{key: failed}
+	if !seen {
+		metricsStateOrder = append(metricsStateOrder, key)
 	}
+	metricsStateFailed[key] = failed
+	evictStateTransitionLocked(key)
 	if failed {
 		return "warn"
 	}
@@ -353,10 +415,35 @@ type prometheusScanResult struct {
 	rulesErr  error
 }
 
+// prometheusLabelBlockEnd 返回标签块 `}` 的下标：按引号状态扫描，
+// 引号内的 `}`（标签值合法可含该字符）不算块尾。缺失块/引号未闭合返回 -1。
+func prometheusLabelBlockEnd(line string) int {
+	open := strings.IndexByte(line, '{')
+	if open < 0 {
+		return -1
+	}
+	inQuote := false
+	for i := open + 1; i < len(line); i++ {
+		switch line[i] {
+		case '\\':
+			if inQuote {
+				i++ // 跳过转义字符（\" 与 \\ 不得改变引号状态）
+			}
+		case '"':
+			inQuote = !inQuote
+		case '}':
+			if !inQuote {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
 // prometheusSampleValue 取单行 exposition 样本值：标签块 `}` 后的首个 token
-// （与旧正则 `\}\s+(\S+)` 同语义；缺失标签块/值返回 false，该行按非样本跳过）。
+// （缺失标签块/值返回 false，该行按非样本跳过）。
 func prometheusSampleValue(line string) (string, bool) {
-	idx := strings.IndexByte(line, '}')
+	idx := prometheusLabelBlockEnd(line)
 	if idx < 0 {
 		return "", false
 	}
@@ -370,20 +457,33 @@ func prometheusSampleValue(line string) (string, bool) {
 	return rest, true
 }
 
-// prometheusLabelValue 取标签块内 name="value" 的值（与旧正则 `name="([^"]+)"`
-// 同语义，含同样的「标签名后缀误命中」宽容度）。
+// prometheusLabelValue 取标签块内 name="value" 的值。标签名必须从 `{` 或 `,`
+// 之后开始（允许空白）——子串定位会让 `le="` 命中 `role="`、`code="` 命中
+// `status_code="`，标签形态变化时静默取错值。
 func prometheusLabelValue(line, name string) (string, bool) {
 	needle := name + `="`
-	idx := strings.Index(line, needle)
-	if idx < 0 {
-		return "", false
+	off := 0
+	for {
+		idx := strings.Index(line[off:], needle)
+		if idx < 0 {
+			return "", false
+		}
+		idx += off
+		// 左边界：向前跳过空白，要求是 `{` 或 `,`。
+		prev := idx - 1
+		for prev >= 0 && (line[prev] == ' ' || line[prev] == '\t') {
+			prev--
+		}
+		if prev >= 0 && (line[prev] == '{' || line[prev] == ',') {
+			start := idx + len(needle)
+			end := strings.IndexByte(line[start:], '"')
+			if end < 0 {
+				return "", false
+			}
+			return line[start : start+end], true
+		}
+		off = idx + 1
 	}
-	start := idx + len(needle)
-	end := strings.IndexByte(line[start:], '"')
-	if end < 0 {
-		return "", false
-	}
-	return line[start : start+end], true
 }
 
 // aggregatePrometheusText 单趟遍历 exposition 文本，按指标名前缀分派到各族
@@ -896,6 +996,10 @@ func (m *MetricsService) refreshDBOverviewMetrics() {
 	m.mu.Unlock()
 }
 
+// updateOverview 是**测试/独立调用专用**的整包入口（test-only：生产采集链
+// 不得调用）：DB 派生三项 + 流量样本一次覆盖。生产链走 collect →
+// refreshDBOverviewMetrics + applyTrafficSample（每周期只刷新一次）。复用本
+// 入口会把旧形态「每周期两次 DB 刷新」（6 条 COUNT/周期）重新拉回。
 func (m *MetricsService) updateOverview(metrics parsedMetrics) {
 	// 兼容直接调用方（测试/非 collect 路径）：DB 派生三项在覆盖流量样本前刷新。
 	// collect 不走上层入口（它已在周期开始刷新一次并调 applyTrafficSample）——

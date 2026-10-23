@@ -398,7 +398,7 @@ func (h *Handlers) GetConfig(c *gin.Context) {
 		&cfg.IsMaster, &cfg.MasterURL, &cfg.SyncInterval, &cfg.LastSync, &cfg.UpdatedAt)
 
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "获取全局配置失败: " + err.Error()})
+		writeInternalError(c, http.StatusInternalServerError, "获取全局配置失败", err)
 		return
 	}
 	// 展示口径与运行时 clamp 对齐(<10 → 60)。
@@ -491,8 +491,13 @@ func validateUpdateConfigRequest(req *models.UpdateConfigRequest) error {
 		}
 	}
 
-	if req.CertRenewalDays != nil && (*req.CertRenewalDays < 0 || *req.CertRenewalDays > 90) {
-		return errors.New("cert_renewal_days 必须在 0-90 之间")
+	// 上界取 services.CertRenewalDaysMax（安全上限）而非旧的 90=证书寿命：
+	// 窗口 ≥ 寿命-24h 时窗口门与成功侧迟滞数学等价，证书一签发就落进窗口，
+	// 每次扫描整轮重签 → CA 重复证书限流后任务 failed → 约一个寿命后到期中断。
+	// 写侧拒绝、导入钳制与读侧生效窗口共用该单源。
+	if req.CertRenewalDays != nil && (*req.CertRenewalDays < 0 || *req.CertRenewalDays > services.CertRenewalDaysMax) {
+		return fmt.Errorf("cert_renewal_days 必须在 0-%d 之间（证书寿命 %d 天，续签窗口需比寿命小一整天以上，否则会在每次扫描时重新签发并触发 CA 重复证书限流）",
+			services.CertRenewalDaysMax, services.CertRenewalLifetimeDays)
 	}
 
 	if req.CertRenewalAttempts != nil && (*req.CertRenewalAttempts < 1 || *req.CertRenewalAttempts > 10) {
@@ -709,7 +714,7 @@ func isPureConfigValidationError(err error) bool {
 func writeConfigValidationFailure(c *gin.Context, err error) {
 	var validationErr *configValidationError
 	if !errors.As(err, &validationErr) {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "预校验规则配置失败: " + err.Error()})
+		writeInternalError(c, http.StatusInternalServerError, "预校验规则配置失败", err)
 		return
 	}
 	if !isPureConfigValidationError(err) {
@@ -931,9 +936,14 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 		// 该内容写入 LKG；commit 失败统一走已提交视图恢复（回滚事务 + 重渲染
 		// /load + 回退 LKG——恢复 /load 失败时仍把已提交字节写回 LKG）。
 		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
+		// 真实 /load 已在 commit 之前发生——「触发重载必须留痕」不因随后失败
+		// 而豁免（同规则族 commit 失败分支）。
+		reloadNote.auditReload()
+		// 横幅两态：恢复失败=「运行配置状态未知」，恢复成功=「旧配置已保留」。
+		// recordCaddyApplyResult 恒以 nil 恢复参数落盘，会把恢复失败误报成
+		// 「旧配置已保留」——提交失败分支必须走带 restoreErr 的写点。
+		h.recordPostCommitRestoreFailure(err, restoreErr)
 		err = errors.Join(err, restoreErr)
-		// 提交失败后的回弹同样可能失败——持久化横幅（事务已回滚）。
-		h.recordCaddyApplyResult(err)
 		recordAudit(c, "更新失败", "全局配置", services.FormatAuditDetail(commitUncertainLabel+"："+err.Error(), services.AuditResultPart("failure")))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + "：" + err.Error()})
 		return
@@ -1397,8 +1407,13 @@ func (h *Handlers) PutCaddyConfig(c *gin.Context) {
 		// /load + 回退 LKG/投影/证书物化——恢复 /load 失败时仍把已提交字节
 		// 写回 LKG，运行配置不停留在一次性逃生口载荷上）。
 		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
+		// loaded=true 表示 apply 已真实 /load——提交失败不豁免「重载」留痕。
+		if loaded {
+			recordAudit(c, "重载", "Caddy服务", "保存配置后自动重载")
+		}
+		// 横幅两态（恢复成功=旧配置已保留 / 失败=运行配置状态未知）。
+		h.recordPostCommitRestoreFailure(err, restoreErr)
 		err = errors.Join(err, restoreErr)
-		h.recordCaddyApplyResult(err)
 		recordAudit(c, "更新失败", "Caddy配置", services.FormatAuditDetail(commitUncertainLabel, err.Error(), services.AuditResultPart("failure")))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + ": " + err.Error()})
 		return

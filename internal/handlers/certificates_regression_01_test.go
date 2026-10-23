@@ -1,10 +1,9 @@
 package handlers
 
-//
+// 手工签发入口必须与规则写/删除/改域共用 caddyOpMu 临界区：
 // caddyOpMu——与 UpdateRule 改域迁移（rules.go 2380-2428）/DeleteRule 排空
 // 交错时，迁移已把任务行改到新域后本次仍按旧域 INSERT 新行并入队，对旧域
 // 实际发起 CA 签发（部署期域不匹配拒绝，job 滞留 downloaded 至 6h sweep）。
-// 手工签发入口必须与规则写/删除/改域共用 caddyOpMu 临界区。
 
 import (
 	"net/http"

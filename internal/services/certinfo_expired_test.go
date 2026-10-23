@@ -71,6 +71,37 @@ func TestGetRuleCertInfo_reportsExpiredACMECert(t *testing.T) {
 	}
 }
 
+// Given 规则已改域（new.test），cert_jobs 只剩改域前旧域的已过期证书行。
+// When 读取规则证书信息。
+// Then 旧域证书不得被当作本规则证书呈现（与正常选择/对账/物化同口径），
+// 回落「尚未签发」而不是把旧证书标成 expired。
+func TestGetRuleCertInfo_fallbackSkipsCertFromPreviousDomain(t *testing.T) {
+	_, database := newClusterTestService(t)
+	certPEM, keyPEM := expiredShapeCertAndKey(t, "old-domain.test", time.Now().Add(-24*time.Hour))
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source)
+		VALUES ('lb_domain_shift','domain-shift','new-domain.test','http',8080,1,1,'acme_dns')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, cert_pem, key_pem, updated_at)
+		VALUES ('lb_domain_shift', 'old-domain.test', 'issued', ?, ?, datetime('now'))`, certPEM, keyPEM); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := GetRuleCertInfo("lb_domain_shift")
+	if err != nil {
+		t.Fatalf("GetRuleCertInfo: %v", err)
+	}
+	if info == nil {
+		t.Fatal("info is nil")
+	}
+	if info.Status == "expired" || strings.Contains(info.Error, "已过期") {
+		t.Fatalf("旧域证书被呈现为本规则证书: status=%q error=%q", info.Status, info.Error)
+	}
+	if info.Status != "unknown" || !strings.Contains(info.Error, "尚未签发") {
+		t.Fatalf("status=%q error=%q, want 尚未签发（旧域证书必须被域名适用性过滤）", info.Status, info.Error)
+	}
+}
+
 // ---- 回归钉 ----
 
 // GetRuleCertInfo 的读故障必须上抛（handler 500），不得折叠成

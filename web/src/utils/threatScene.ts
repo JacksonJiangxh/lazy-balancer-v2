@@ -250,12 +250,24 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
     path.closePath()
   }
   interface Dot { lon: number; lat: number; key: string }
-  function inCountryBbox(i: number, lon: number, lat: number): boolean {
-    const b = bboxOf(i)
-    if (lat < b.minLat || lat > b.maxLat) return false
-    // bbox 跨日界线（如俄/美）时 minLon>maxLon 不可能（当前聚合取原始值），
-    // 宽 bbox 只损失预筛收益，不会误杀。
-    return lon >= b.minLon && lon <= b.maxLon
+
+  /**
+   * 国家命中测试（hover/click 单源）：先用构建期缓存的共享 bbox 网格取候选，
+   * 再对候选国做 bbox + 多边形射线。点击曾对全部国家逐条射线，与 hover 的
+   * 预筛分叉——多环国家（俄/美/加）上点击反馈可感知停顿。网格候选按国家
+   * 索引升序（构建顺序），因此「首个命中」与全表扫描同结果。
+   */
+  function countryHitIndex(lon: number, lat: number, exclude?: string): number {
+    const candidates = sharedCountryGrid.grid.get(countryGridCell(lon, lat)) ?? []
+    for (const ci of candidates) {
+      const b = bboxOf(ci)
+      // bbox 跨日界线（如俄/美）时 minLon>maxLon 不可能（当前聚合取原始值），
+      // 宽 bbox 只损失预筛收益，不会误杀。
+      if (lon < b.minLon || lon > b.maxLon || lat < b.minLat || lat > b.maxLat) continue
+      if (exclude && normalizeCountryName(THREAT_COUNTRIES[ci].name) === exclude) continue
+      if (pointInPolys(lon, lat, THREAT_COUNTRIES[ci].polys)) return ci
+    }
+    return -1
   }
 
   let worldDots: Dot[] | null = null
@@ -597,8 +609,9 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
     }
     const p = canvasPoint(event)
     const geo = screenToLonLat(p.x, p.y, cam)
-    for (const country of THREAT_COUNTRIES) {
-      if (!pointInPolys(geo.lon, geo.lat, country.polys)) continue
+    const hit = countryHitIndex(geo.lon, geo.lat)
+    if (hit >= 0) {
+      const country = THREAT_COUNTRIES[hit]
       const intent = drillClickIntent(normalizeCountryName(country.name), drillLayerCountry || null)
       // 'stay'：下钻态单击当前下钻国自身 = 保持（与地球引擎「本省保持」同语义）。
       // 缺这行时每次单击国境都会重钻：清 hover、全量重建省点阵、把用户拖动后
@@ -1080,25 +1093,17 @@ export function createThreatScene(container: HTMLElement, opts?: ThreatSceneOpti
           }
         }
         if (!hoverName) {
-          for (let ci = 0; ci < THREAT_COUNTRIES.length; ci++) {
-            const country = THREAT_COUNTRIES[ci]
-            const normalized = normalizeCountryName(country.name)
-            if (normalized === drillLayerCountry) continue
-            if (inCountryBbox(ci, geo.lon, geo.lat) && pointInPolys(geo.lon, geo.lat, country.polys)) {
-              hoverName = normalized
-              hoverTip.textContent = `${hoverName} ${countryCounts.get(hoverName) ?? 0}`
-              break
-            }
+          const ci = countryHitIndex(geo.lon, geo.lat, drillLayerCountry)
+          if (ci >= 0) {
+            hoverName = normalizeCountryName(THREAT_COUNTRIES[ci].name)
+            hoverTip.textContent = `${hoverName} ${countryCounts.get(hoverName) ?? 0}`
           }
         }
       } else {
-        for (let ci = 0; ci < THREAT_COUNTRIES.length; ci++) {
-          const country = THREAT_COUNTRIES[ci]
-          if (inCountryBbox(ci, geo.lon, geo.lat) && pointInPolys(geo.lon, geo.lat, country.polys)) {
-            hoverName = normalizeCountryName(country.name)
-            hoverTip.textContent = `${hoverName} ${countryCounts.get(hoverName) ?? 0}`
-            break
-          }
+        const ci = countryHitIndex(geo.lon, geo.lat)
+        if (ci >= 0) {
+          hoverName = normalizeCountryName(THREAT_COUNTRIES[ci].name)
+          hoverTip.textContent = `${hoverName} ${countryCounts.get(hoverName) ?? 0}`
         }
       }
       canvas.style.cursor = hoverName ? 'pointer' : 'grab'

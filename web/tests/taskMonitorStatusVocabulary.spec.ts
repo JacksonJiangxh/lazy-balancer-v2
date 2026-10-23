@@ -34,10 +34,15 @@ test('文件内不存在按行渲染证书状态标签的 helper（certJobLabel/
 })
 
 test('服务端 TaskStatus 枚举收敛三态（无 queued/disabled 扩展值）', () => {
-  // 锚定 TaskStatus 常量块本身（而非通用 const ( 首块）——其他常量块先行
-  // 出现时旧锚点会切错段，负断言空转。
-  const enumBlock = section(svc, 'TaskStatusRunning TaskStatus = "running"', '\n)')
-  assert.doesNotMatch(enumBlock, /TaskStatusQueued|TaskStatusDisabled/, 'TaskStatus 枚举不得再含 queued/disabled')
+  // 全文件扫描 `X TaskStatus = "..."` 声明集合并与期望集**正向**比对：
+  // 负断言只覆盖切片内，枚举若以块外独立声明回流（或挪到 type 前后）会静默
+  // 通过；正向集合比较对「换声明位置」免疫。
+  const declared = [...svc.matchAll(/\b(TaskStatus\w+)\s+TaskStatus\s*=/g)].map((match) => match[1])
+  assert.deepEqual(
+    [...new Set(declared)].sort(),
+    ['TaskStatusFailed', 'TaskStatusIdle', 'TaskStatusRunning'],
+    'TaskStatus 枚举只允许 running/idle/failed 三态',
+  )
   assert.match(svc, /case "issued", "downloaded", "disabled":/)
   assert.match(svc, /ti\.Status = TaskStatusRunning/)
 })

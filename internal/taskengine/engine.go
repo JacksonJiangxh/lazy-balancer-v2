@@ -631,6 +631,13 @@ func (e *Engine) Register(d Descriptor) error {
 	if d.RestartOnRoleFlip && d.Kind != KindDaemon {
 		return fmt.Errorf("taskengine: %s 声明 RestartOnRoleFlip 但 Kind=%s（仅常驻族消费角色翻转换代，声明即静默忽略）", d.ID, d.Kind)
 	}
+	// 常驻族不支持取消：Cancel 只按 Cancelable 路由，被取消的 daemon 走
+	// 「非异常退出」分支——loop_on 保持 true 而 running=false，监控判 idle，
+	// 常驻采集/签发/同步永久停摆且无任何信号（启停应走 StartLoop/StopLoop）。
+	// 与 Daemon∧EnabledFn 同范式：声明即不可达/死态的组注册期响亮拒绝。
+	if d.Kind == KindDaemon && d.Cancelable {
+		return fmt.Errorf("taskengine: %s 为常驻任务，不支持 Cancelable（取消会永久停止且无异常信号，启停请用 StartLoop/StopLoop）", d.ID)
+	}
 	// CancelHook 仅在 Cancelable=true 时可达（Cancel 先按 Cancelable 短路）——
 	// 未置 Cancelable 的 CancelHook 永不触达，注册期响亮拒绝。
 	if d.CancelHook != nil && !d.Cancelable {
@@ -1581,14 +1588,14 @@ func (e *Engine) executeRun(res *runReservation, id, trigger, operator string) (
 	// 零重触发窗口），再回锁一次性落 running/cancel/槽缓存。若新槽仍为过去
 	// （业务失败未推进等），running 标志在 CAS 前防重入，此处值供下 tick 判定。
 	var nextSlot time.Time
-	hasSlotFn := r.desc.Kind == KindScheduled && r.desc.NextSlotFn != nil
-	if hasSlotFn {
+	if r.desc.Kind == KindScheduled && r.desc.NextSlotFn != nil {
 		// 与 tick/Lookup/DescribeAll 同口径的
 		// panic 隔离——NextSlotFn 是装配方闭包（生产为 DB 直读），裸调
 		// panic 会经 runNow 上抛给调用方（tick goroutine/手动触发链）。
+		// 求值在锁外是刻意的（NextSlotFn 含 DB 查询）：求值期间 running
+		// 仍=true，tick 自然跳过本轮，零重触发窗口；随后回锁一次性落
+		// running/cancel/槽缓存。
 		nextSlot = safeSlot(id+".NextSlotFn", r.desc.NextSlotFn)
-	}
-	if hasSlotFn {
 		r.mu.Lock()
 		prevSlot := r.nextScheduledTime
 		r.nextScheduledTime = nextSlot
@@ -1625,10 +1632,12 @@ func (e *Engine) executeRun(res *runReservation, id, trigger, operator string) (
 			if status == "success" && !nextSlot.IsZero() && !time.Now().Before(nextSlot) {
 				// 同一槽只执行一次：成功落定后重读槽仍已到期（业务未把槽
 				// 推进到未来）——消费本槽，tick 不再按「槽过期」重投（含
-				// 手动触发轮：手动成功同样消费过期槽；「手动不改预约」只约束
-				// 未来槽不被回拨，已过期槽不得再驱动一次重复执行）。失败轮
-				// 不进本分支（由退避兜底重投）；skipped/cancelled 的消费语义
-				// 见 schedDoneSlot 字段注释。
+				// 手动触发轮：手动成功同样消费过期槽）。业务侧成功轮
+				// （auto/manual 同权）会自行推进空/过期槽，正常形态下本分支
+				// 不触发；走到这里说明业务槽推进写失败（或业务未按契约推进），
+				// 消费可避免每 tick 重复整轮执行——人工成功轮重新推进槽后仍能
+				// 自愈到下一排程槽。失败轮不进本分支（由退避兜底重投）；
+				// skipped/cancelled 的消费语义见 schedDoneSlot 字段注释。
 				if nextSlot.After(r.schedDoneSlot) {
 					r.schedDoneSlot = nextSlot
 				}
@@ -2573,7 +2582,9 @@ func (e *Engine) RunOverview() (map[string]*RunRecord, map[string]TaskRunsStats)
 		if level := noteTaskOverviewFailure("latest", false); level != "" {
 			log.Printf("INFO: taskengine: 最近运行批量查询恢复，任务视图恢复运行记录")
 		}
-		noteTaskOverviewFailure("latest-scan", false)
+		if level := noteTaskOverviewFailure("latest-scan", false); level != "" {
+			log.Printf("%s: taskengine: 最近运行批量行扫描恢复，全部任务记录已可解析", level)
+		}
 	}
 	// 24h 统计：与 Stats24h 同窗口/同口径（started_at > now-1day，配置时区墙钟）。
 	statFailed := false
@@ -2608,7 +2619,9 @@ func (e *Engine) RunOverview() (map[string]*RunRecord, map[string]TaskRunsStats)
 		if level := noteTaskOverviewFailure("stats", false); level != "" {
 			log.Printf("INFO: taskengine: 24h 统计批量查询恢复")
 		}
-		noteTaskOverviewFailure("stats-scan", false)
+		if level := noteTaskOverviewFailure("stats-scan", false); level != "" {
+			log.Printf("%s: taskengine: 24h 统计批量行扫描恢复，全部任务计数已可解析", level)
+		}
 	}
 	return latest, stats
 }

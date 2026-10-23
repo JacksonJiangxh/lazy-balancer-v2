@@ -327,6 +327,10 @@ const caProvidersError = ref(false)
 const loadError = computed(() => configsError.value || providersError.value || caProvidersError.value)
 const dialogVisible = ref(false)
 const editingId = ref<number | null>(null)
+// 存量遗留配置的凭据列为空（NULL/''，导入保留的「尚未配置」形态）。
+// 这类配置在用户未编辑任何凭证字段时，保存载荷省略 dns_credentials——否则
+// 后端会把表单形态的空对象当作新提交的凭证校验，改名/禁用被旧空值阻断。
+const legacyEmptyCredentials = ref(false)
 const testingId = ref<number | null>(null)
 const deletingId = ref<number | null>(null)
 const form = ref<{
@@ -560,21 +564,28 @@ const openConfigDialog = (config?: CertConfig) => {
     } else {
       parsedCreds = { ...rawCreds }
     }
-    if (!parsedCreds.auth_mode) {
-      if (parsedCreds.secret_id && parsedCreds.secret_key) {
-        parsedCreds.auth_mode = 'tencent_cloud'
-      } else {
-        parsedCreds.auth_mode = 'dnspod'
-      }
-    }
+    // 库值原样回填，不按 provider 名或凭证形态推断认证方式：「原始凭证 → 规范
+    // 凭证」的唯一实现是后端 dnsprovider.CanonicalCredentials（保存前验证与签发
+    // 链共用），缺失 auth_mode 的存量形态由它归一；前端复刻该推断会给新增
+    // provider 注入无关键并随保存原样落库。
+    // 遗留空凭据（NULL/''）：保存时省略凭证，交由后端按「未提交」处理。
+    legacyEmptyCredentials.value = Object.keys(parsedCreds).length === 0
+    // 回填后与写路径同跑一次隐藏键清理：历史切换过认证方式的配置可能同时留有
+    // 两套互斥凭证，隐藏的一半否则会以不可见字段随保存原样落库并随备份传播。
+    // 仅当全部 select 字段都有值时清理——缺 auth_mode 的存量凭证由后端
+    // CanonicalCredentials 归一，前端无法判断归属，按空值清理会误删另一套凭证。
+    const providerFields = providers.value.find((p) => p.code === config.dns_provider)?.credential_fields ?? []
+    const selects = providerFields.filter((f) => f.type === 'select' && (f.options?.length ?? 0) > 0)
+    const canPruneHidden = selects.length > 0 && selects.every((f) => (parsedCreds[f.name] ?? '') !== '')
     form.value = {
       name: config.name,
       dns_provider: config.dns_provider,
-      dns_credentials: parsedCreds,
+      dns_credentials: canPruneHidden ? applyCredentialFieldChange(providerFields, parsedCreds) : parsedCreds,
       enabled: config.enabled,
     }
   } else {
     editingId.value = null
+    legacyEmptyCredentials.value = false
     form.value = {
       name: '',
       dns_provider: providers.value[0]?.code || 'dnspod',
@@ -598,11 +609,22 @@ const saveConfig = async () => {
   // 写动作函数级守卫
   if (isReadOnly.value || savingConfig.value) return
   const targetId = editingId.value
-  const payload = {
+  // 遗留空凭据且用户未填任何凭证值 → 视为「未提交凭证」：载荷省略该字段，
+  // 保存前测试也无需执行（没有凭证可测）。后端对省略形态按非凭证更新放行。
+  const credentialsUnsubmitted = legacyEmptyCredentials.value
+    && !Object.values(form.value.dns_credentials).some(value => String(value ?? '').trim() !== '')
+  const payload: {
+    name: string
+    dns_provider: string
+    enabled: boolean
+    dns_credentials?: Record<string, string>
+  } = {
     name: form.value.name,
     dns_provider: form.value.dns_provider,
-    dns_credentials: { ...form.value.dns_credentials },
     enabled: form.value.enabled,
+  }
+  if (!credentialsUnsubmitted) {
+    payload.dns_credentials = { ...form.value.dns_credentials }
   }
   if (!payload.name || !payload.dns_provider) {
     ElMessage.warning('请填写配置名称和 DNS 提供商')
@@ -610,28 +632,30 @@ const saveConfig = async () => {
   }
   savingConfig.value = true
 
-  const domain = await promptTestDomain(true)
-  if (!domain) {
-    savingConfig.value = false
-    return
-  }
+  if (!credentialsUnsubmitted) {
+    const domain = await promptTestDomain(true)
+    if (!domain) {
+      savingConfig.value = false
+      return
+    }
 
-  try {
-    // 编辑保存前测试：表单凭证含全掩码 ***（非 admin GET 回显、用户未改）时仍测
-    // DB 存量（:id/test）；用户实际改过凭证（无 ***）则内联新凭证走无 id 的 /test
-    // 当前面板恒 admin JWT（GET 回显明文）且只读用户打不开本弹框，
-    // 掩码回传分支在 UI 内不可达——保留作为非 UI 客户端（API Key/只读通道拿到
-    // 掩码值直接回传）的防御路径；该分支只验证库中原值，不验证表单改动。
-    const hasMaskedCred = Object.values(payload.dns_credentials).some(v => v === '***')
-    const url = targetId && hasMaskedCred
-      ? `/certificate-configs/${targetId}/test`
-      : '/certificate-configs/test'
-    await request.post(url, { ...payload, domain })
-  } catch (caught: unknown) {
-    // Error toast is already shown by the global axios interceptor.
-    console.error('Failed to verify DNS credentials:', caught)
-    savingConfig.value = false
-    return
+    try {
+      // 编辑保存前测试：表单凭证含全掩码 ***（非 admin GET 回显、用户未改）时仍测
+      // DB 存量（:id/test）；用户实际改过凭证（无 ***）则内联新凭证走无 id 的 /test
+      // 当前面板恒 admin JWT（GET 回显明文）且只读用户打不开本弹框，
+      // 掩码回传分支在 UI 内不可达——保留作为非 UI 客户端（API Key/只读通道拿到
+      // 掩码值直接回传）的防御路径；该分支只验证库中原值，不验证表单改动。
+      const hasMaskedCred = Object.values(payload.dns_credentials ?? {}).some(v => v === '***')
+      const url = targetId && hasMaskedCred
+        ? `/certificate-configs/${targetId}/test`
+        : '/certificate-configs/test'
+      await request.post(url, { ...payload, domain })
+    } catch (caught: unknown) {
+      // Error toast is already shown by the global axios interceptor.
+      console.error('Failed to verify DNS credentials:', caught)
+      savingConfig.value = false
+      return
+    }
   }
 
   try {

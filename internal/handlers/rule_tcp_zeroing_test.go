@@ -596,3 +596,67 @@ func TestUpdateRule_tcpEditClearsHTTPOnlyAndTLSResidue(t *testing.T) {
 		t.Fatalf("TCP 编辑未清上游回源域名: %q", originDomain)
 	}
 }
+
+// 同族：DuplicateRule 复制 TCP 源行时不得放大 upstreams.origin_domain——
+// 该字段仅 HTTP 规则支持，残留会让复制命中保存门 400 死端（用户看不到字段、
+// 无自救路径）并随快照/导出放大。
+func TestDuplicateRule_tcpCopyDropsUpstreamOriginDomain(t *testing.T) {
+	handler := newRuleFeatureTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/rules/:caddy_id/duplicate", handler.DuplicateRule)
+
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,description,protocol,domain,listen_port,strategy,enabled)
+		VALUES ('lb_tcporigin','tcp-origin','','tcp','',18841,'weighted_round_robin',1)`); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol,origin_domain)
+		VALUES ('lb_tcporigin','up.test',9000,1,1,'tcp','origin.example')`); err != nil {
+		t.Fatalf("seed upstream: %v", err)
+	}
+
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/rules/lb_tcporigin/duplicate", nil))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s, want 201（复制不得因 TCP 残留回源域名 400）", response.Code, response.Body.String())
+	}
+	var originDomain string
+	if err := db.DB.QueryRow(`SELECT COALESCE(origin_domain,'') FROM upstreams
+		WHERE rule_id=(SELECT caddy_id FROM lb_rules WHERE name='tcp-origin（副本）')`).Scan(&originDomain); err != nil {
+		t.Fatalf("read copied upstream: %v", err)
+	}
+	if originDomain != "" {
+		t.Fatalf("副本上游回源域名=%q, want 空（TCP 零消费字段不得复制）", originDomain)
+	}
+}
+
+// 同族：EnableRule 启用 TCP 规则时清零 upstreams.origin_domain，避免启用成功
+// 却把死配置留在库中随导出/备份/集群快照放大。
+func TestEnableRule_tcpClearsUpstreamOriginDomain(t *testing.T) {
+	handler := newRuleFeatureTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/rules/:caddy_id/enable", handler.EnableRule)
+
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,description,protocol,domain,listen_port,strategy,enabled)
+		VALUES ('lb_tcporigin_en','tcp-origin-en','','tcp','',18842,'weighted_round_robin',0)`); err != nil {
+		t.Fatalf("seed rule: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol,origin_domain)
+		VALUES ('lb_tcporigin_en','up.test',9000,1,1,'tcp','origin.example')`); err != nil {
+		t.Fatalf("seed upstream: %v", err)
+	}
+
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/rules/lb_tcporigin_en/enable", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	var originDomain string
+	if err := db.DB.QueryRow(`SELECT COALESCE(origin_domain,'') FROM upstreams WHERE rule_id='lb_tcporigin_en'`).Scan(&originDomain); err != nil {
+		t.Fatalf("read upstream: %v", err)
+	}
+	if originDomain != "" {
+		t.Fatalf("启用后上游回源域名=%q, want 空", originDomain)
+	}
+}

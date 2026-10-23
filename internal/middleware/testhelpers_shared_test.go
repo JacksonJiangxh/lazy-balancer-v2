@@ -10,9 +10,9 @@ import (
 // restoreTestDBHandles 复位夹具数据库句柄（夹具清理的单源序列）。
 //
 // db.Close() 内部会 SetDB(nil)，只还原 db.DB/MetricsDB/AuditDB 三个包级变量
-// 会让 db.GetDB()（mfaStepUpGuard 消费）与 db.DB（readonly/cluster_version
-// 守卫装配期捕获）在测试间分叉——两守卫可能读到不同库。任何夹具清理都必须
-// 走本函数，钉测见 TestDatabaseHandleParityAfterFixtureRestore。
+// 会让 db.GetDB()（后台刷新循环等原子句柄消费方）与 db.DB（守卫装配期捕获）
+// 在测试间分叉——两条读取路径可能读到不同库。任何夹具清理都必须走本函数，
+// 钉测见 TestDatabaseHandleParityAfterFixtureRestore。
 func restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB *sql.DB) {
 	db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
 	db.SetDB(oldDB)

@@ -21,7 +21,7 @@ func TestMetricsDashboardToolForwardsReadOnlyRequest(t *testing.T) {
 	defer rest.Close()
 
 	// When
-	result := callTool(t, New(rest.URL+"/api/v1", rest.Client()), "get_metrics_dashboard", `{}`)
+	result := callTool(t, NewForTest(rest.URL+"/api/v1", rest.Client()), "get_metrics_dashboard", `{}`)
 
 	// Then
 	if !received || !strings.Contains(result, "rules") {

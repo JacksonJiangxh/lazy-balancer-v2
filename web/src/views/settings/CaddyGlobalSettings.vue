@@ -107,7 +107,8 @@
           >
             <el-option v-for="l in customIpLists" :key="l.id" :label="`${l.name}（${l.entry_count} 条）`" :value="l.id" />
           </el-select>
-          <div class="form-tip-line">引用「规则集 → IP 地址列表」中的可复用列表，条目与上方内联网段合并生效（合计 {{ trustedRangesTotalCount }} 条，上限 {{ IP_LIST_MAX_ENTRIES }}）</div>
+          <div v-if="trustedTotalError" class="form-tip-line trusted-ranges-error">{{ trustedTotalError }}</div>
+          <div class="form-tip-line">引用「规则集 → IP 地址列表」中的可复用列表，条目与上方内联网段合并生效（合计 {{ trustedRangesTotalCount }} 条，上限 {{ TRUSTED_PROXY_MAX_TOTAL_ENTRIES }}）</div>
         </el-form-item>
         <el-form-item label="请求头">
           <el-select
@@ -120,6 +121,7 @@
             placeholder="留空 = 仅 X-Forwarded-For"
             class="trusted-field"
           />
+          <div v-if="trustedHeadersError" class="form-tip-line trusted-ranges-error">{{ trustedHeadersError }}</div>
           <div class="form-tip-line">按顺序优先取：把该 CDN 保证覆盖的权威头放最前。{{ trustedPresetNote }}</div>
         </el-form-item>
         <el-form-item label="预设填充">
@@ -243,12 +245,11 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { RefreshRight, Setting, Tickets, View } from '@element-plus/icons-vue'
 import { useAuthStore } from '@/stores/auth'
 import { useLogTailPolling } from '@/composables/useLogTailPolling'
-import { IP_LIST_MAX_ENTRIES } from '@/utils/ipListSaveGuard'
 import { ansiToHtml } from '@/utils/ansi'
 import { request, mfaAwareSuccess } from '@/utils/api'
 import { CDN_PRESETS, DEFAULT_ACCESS_LOG_FORMAT } from '@/utils/caddyDefaults'
 import { buildCaddyConfigPayload } from '@/utils/caddyConfigPayload'
-import { trustedProxyRangesError } from '@/utils/trustedProxyRanges'
+import { TRUSTED_PROXY_MAX_TOTAL_ENTRIES, trustedProxyHeadersError, trustedProxyRangesError, trustedProxyTotalError } from '@/utils/trustedProxyRanges'
 import { IP_LIST_CATEGORIES, parseIPList, parseRefIds } from '@/utils/securityStages'
 import type { APIResponse, ProxyTimeoutConfig } from '@/types'
 import ProxyTimeoutFields from '@/components/rules/ProxyTimeoutFields.vue'
@@ -382,6 +383,10 @@ const trustedRangesTotalCount = computed(() => trustedRanges.value.length + refe
 // 与后端 services.TrustedProxy* / normalizeTrustedProxyRanges 对表）——
 // 原实现只在预览/PUT 时被整组拒绝，用户只拿到一次 toast 且无法定位是哪一条。
 const trustedRangesError = computed(() => trustedProxyRangesError(trustedRanges.value))
+// 请求头与总量同源判据：条数 ≤8 / 字符集（后端去重前判定）与「内联 + 引用展开」
+// ≤2000。合计的引用面来自名单 entry_count 缓存——未知按 0 计，只在已知超限时拦。
+const trustedHeadersError = computed(() => trustedProxyHeadersError(trustedHeaders.value))
+const trustedTotalError = computed(() => trustedProxyTotalError(trustedRanges.value.length, referencedEntryCount.value))
 
 // —— 存为列表：内联网段一键建名单并转为引用（镜像策略侧「提取为列表」） ——
 const saveListDialogVisible = ref(false)
@@ -472,6 +477,15 @@ const handleSave = async (): Promise<void> => {
   // 非法/过宽网段在表单内即拦下（后端 PUT/preview 同样拒绝，但不点名具体条目）
   if (trustedRangesError.value) {
     ElMessage.warning(trustedRangesError.value)
+    return
+  }
+  // 请求头（条数/字符集）与「内联 + 引用展开」总量同源同门
+  if (trustedHeadersError.value) {
+    ElMessage.warning(trustedHeadersError.value)
+    return
+  }
+  if (trustedTotalError.value) {
+    ElMessage.warning(trustedTotalError.value)
     return
   }
   saving.value = true

@@ -225,17 +225,16 @@ onMounted(() => {
 .polling-error-alert { margin-bottom: 16px; }
 .filter-actions { display: flex; gap: 0; margin-left: 8px; }
 .filter-actions .el-button + .el-button { margin-left: 8px; }
-</style>
 
-<style>
-.audit-filter-date-range.el-date-editor {
+/* 日期范围选择器宽度：类名落在子组件根元素上，scoped 的 data-v 会随
+   inheritAttrs 一并落到根节点，故仍用 :global 以免依赖该细节。 */
+:global(.audit-filter-date-range.el-date-editor) {
   --el-date-editor-width: 360px;
   width: 360px;
   flex: 0 0 auto;
 }
-</style>
 
-<style>
-.log-overflow-popper { max-width: 420px; word-break: break-all; }
-.log-overflow-popper .el-tooltip__popper { max-width: 420px; }
+/* tooltip 弹层被 teleport 到 body，scoped 选择器无法命中 */
+:global(.log-overflow-popper) { max-width: 420px; word-break: break-all; }
+:global(.log-overflow-popper .el-tooltip__popper) { max-width: 420px; }
 </style>

@@ -15,32 +15,6 @@ func TestCertJobs_rejectsNullStatus(t *testing.T) {
 	}
 }
 
-func TestClusterVersionTriggers_bumpWhenCertificateStatusTransitionsToIssued(t *testing.T) {
-	// Given
-	database := newClusterVersionTestDB(t)
-	certPEM, keyPEM := clusterVersionCertificatePair(t)
-	if _, err := database.Exec("UPDATE global_config SET is_master=1, cluster_version=0 WHERE id=1"); err != nil {
-		t.Fatalf("seed master: %v", err)
-	}
-	if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,cert_pem,key_pem,expires_at) VALUES ('pending_rule','example.com','pending',?,?,datetime('now','+30 days'))`, certPEM, keyPEM); err != nil {
-		t.Fatalf("seed pending certificate: %v", err)
-	}
-	if err := installClusterVersionTriggers(database); err != nil {
-		t.Fatalf("install triggers: %v", err)
-	}
-
-	// When
-	if _, err := database.Exec("UPDATE cert_jobs SET status='issued' WHERE rule_id='pending_rule'"); err != nil {
-		t.Fatalf("transition pending status to issued: %v", err)
-	}
-
-	// Then：status 移出语义列,纯状态迁移不再 bump;
-	// 材料 bump 由 INSERT 触发器(种子 INSERT 已含 cert_pem/key_pem)负责
-	if got := clusterVersion(t, database); got != 0 {
-		t.Fatalf("version after pending to issued=%d, want 0 (status-only, 历史问题)", got)
-	}
-}
-
 // cert_jobs UPDATE 触发器簿记抖动守卫——
 // 签发/续期阶段写(message/attempts/updated_at 等簿记列)不 bump 集群版本;
 // 语义列(rule_id/domain/cert_pem/key_pem/expires_at/ca_provider_id——
@@ -55,7 +29,7 @@ func TestClusterVersionTriggers_certJobsBookkeepingDoesNotBump(t *testing.T) {
 	if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,cert_pem,key_pem,expires_at) VALUES ('book_rule','example.com','issued',?,?,datetime('now','+30 days'))`, certPEM, keyPEM); err != nil {
 		t.Fatalf("seed issued certificate: %v", err)
 	}
-	if err := installClusterVersionTriggers(database); err != nil {
+	if err := InstallClusterVersionTriggers(database); err != nil {
 		t.Fatalf("install triggers: %v", err)
 	}
 
@@ -91,7 +65,7 @@ func TestClusterVersionTriggers_certJobsStatusTransitionDoesNotBump(t *testing.T
 	if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,cert_pem,key_pem,expires_at) VALUES ('renew_rule','example.com','issued',?,?,datetime('now','+30 days'))`, certPEM, keyPEM); err != nil {
 		t.Fatalf("seed issued certificate: %v", err)
 	}
-	if err := installClusterVersionTriggers(database); err != nil {
+	if err := InstallClusterVersionTriggers(database); err != nil {
 		t.Fatalf("install triggers: %v", err)
 	}
 
@@ -126,7 +100,7 @@ func TestClusterVersionTriggers_certJobsReenableFromDisabledBumps(t *testing.T) 
 	if _, err := database.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,cert_pem,key_pem,expires_at) VALUES ('reenable_rule','example.com','disabled',?,?,datetime('now','+30 days'))`, certPEM, keyPEM); err != nil {
 		t.Fatalf("seed disabled certificate: %v", err)
 	}
-	if err := installClusterVersionTriggers(database); err != nil {
+	if err := InstallClusterVersionTriggers(database); err != nil {
 		t.Fatalf("install triggers: %v", err)
 	}
 

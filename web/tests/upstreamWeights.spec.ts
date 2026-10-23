@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { normalizeWeights, payloadWeight, redistributeWeight, weightPercent } from '../src/utils/upstreamWeights.ts'
-import { source } from './_helpers.ts'
+import { section, source } from './_helpers.ts'
 
 test('重新启用上游至少分配 1，UI 不再显示 0%', () => {
   const rows = [
@@ -80,7 +80,9 @@ test('超限行改权重时预算随行数抬升（每行仍 ≥1，可正常保
 
 test('编辑器超限提示显性化（可调权重 / 需删至上限或走 API）', () => {
   const editor = source('src/components/rules/PathRulesEditor.vue')
-  assert.match(editor, /rule\.upstreams\.length > MAX_UPSTREAM_ROWS[\s\S]{0,200}?保存前请删至/, '超限必须给出可操作提示')
+  const overLimitHint = section(editor, '<el-text v-if="rule.upstreams.length > MAX_UPSTREAM_ROWS"', '</el-text>')
+  assert.match(overLimitHint, /保存前请删至 \{\{ MAX_UPSTREAM_ROWS \}\} 个以内/, '超限必须给出可操作提示')
+  assert.match(overLimitHint, /或通过 API 维护/, '超限提示必须给出替代通道')
   assert.doesNotMatch(editor, /item\.weight = 0|weight = 0/, '组件不得自行清零权重')
 })
 

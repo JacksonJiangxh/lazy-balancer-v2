@@ -3,11 +3,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
-  ADAPTIVE_SAMPLE_CONFIRM_SAMPLES,
-  ADAPTIVE_SAMPLE_MIN_SWITCH_INTERVAL_MS,
-  FLOW_MAX_ARCS_PER_FLUSH,
   flowTimestamp,
-  nextAdaptiveSampleN,
   nextFlowCursor,
   planFlowArcs,
   planFlowEvents,
@@ -26,20 +22,25 @@ test('流量采样配置：仅保留 -1/0，全量与固定 2-64 归一为自适
 })
 
 test('自适应档位滞回阈值：1↔4 用 180/120，4↔8 用 720/480（边界值不切换）', () => {
+  // 档位选择是模块内部实现：经状态机两次同向确认（4s 门已过）观察换档结果。
+  const switched = (active: number, observedRate: number): number => {
+    const first = stepAdaptiveSample({ active, stable: 0, lastSwitch: 0 }, observedRate, 100_000)
+    return stepAdaptiveSample(first, observedRate, 101_000).active
+  }
   // 1 → 4：高于 180 才升档
-  assert.equal(nextAdaptiveSampleN(1, 180), 1)
-  assert.equal(nextAdaptiveSampleN(1, 181), 4)
+  assert.equal(switched(1, 180), 1)
+  assert.equal(switched(1, 181), 4)
   // 4 → 1：低于 120 才降档
-  assert.equal(nextAdaptiveSampleN(4, 120), 4)
-  assert.equal(nextAdaptiveSampleN(4, 119), 1)
+  assert.equal(switched(4, 120), 4)
+  assert.equal(switched(4, 119), 1)
   // 4 → 8：高于 720 才升档
-  assert.equal(nextAdaptiveSampleN(4, 720), 4)
-  assert.equal(nextAdaptiveSampleN(4, 721), 8)
+  assert.equal(switched(4, 720), 4)
+  assert.equal(switched(4, 721), 8)
   // 8 → 4：低于 480 才降档
-  assert.equal(nextAdaptiveSampleN(8, 480), 8)
-  assert.equal(nextAdaptiveSampleN(8, 479), 4)
+  assert.equal(switched(8, 480), 8)
+  assert.equal(switched(8, 479), 4)
   // 8 不再升档（最高档即 1/8）
-  assert.equal(nextAdaptiveSampleN(8, 1e9), 8)
+  assert.equal(switched(8, 1e9), 8)
 })
 
 test('自适应切换：连续 2 次采样同向才换档，单次尖峰不生效', () => {
@@ -55,7 +56,7 @@ test('自适应切换：连续 2 次采样同向才换档，单次尖峰不生�
   assert.deepEqual(outcome, { active: 4, stable: 0, pendingTarget: 0, lastSwitch: 0, changed: false })
 })
 
-test('自适应切换：两次换档间隔必须 ≥4s（回摆同样受限）', () => {
+test('自适应切换：两次换档间隔必须 ≥4000ms（回摆同样受限）', () => {
   const lastSwitch = 20_000
   // 距上次换档不足 4s：即使连续确认也不换
   let outcome = stepAdaptiveSample({ active: 4, stable: 0, lastSwitch }, 900, lastSwitch + 1000)
@@ -63,10 +64,13 @@ test('自适应切换：两次换档间隔必须 ≥4s（回摆同样受限）',
   assert.equal(outcome.stable, 1)
   outcome = stepAdaptiveSample(outcome, 900, lastSwitch + 2000)
   assert.equal(outcome.changed, false, '间隔 2s 未达 4s 门')
-  assert.equal(outcome.stable, ADAPTIVE_SAMPLE_CONFIRM_SAMPLES)
+  assert.equal(outcome.stable, 2, '连续两次同向确认')
+  const almost = stepAdaptiveSample(outcome, 900, lastSwitch + 3999)
+  assert.equal(almost.changed, false, '间隔 3999ms 仍不足')
+  assert.equal(almost.active, 4)
   // 达到 4s 门 → 允许换到 1/8
-  outcome = stepAdaptiveSample(outcome, 900, lastSwitch + ADAPTIVE_SAMPLE_MIN_SWITCH_INTERVAL_MS)
-  assert.deepEqual(outcome, { active: 8, stable: 0, pendingTarget: 0, lastSwitch: lastSwitch + 4000, changed: true })
+  const switched = stepAdaptiveSample(almost, 900, lastSwitch + 4000)
+  assert.deepEqual(switched, { active: 8, stable: 0, pendingTarget: 0, lastSwitch: lastSwitch + 4000, changed: true })
 })
 
 test('自适应切换：档位与目标一致时清空确认计数但保留上次换档时刻', () => {
@@ -148,7 +152,9 @@ test('正常/攻击共用出弧计划：1-3 逐条细、4-8 合并中粗、>8 �
     { key: 'd|1', region: 'd', weight: 1, tier: 'thin' },
     { key: 'd|1', region: 'd', weight: 1, tier: 'thin' },
   ])
-  assert.equal(FLOW_MAX_ARCS_PER_FLUSH, 12)
+  // 默认单轮预算（不传 maxArcs）=12 条：20 个独立组只出 12 条
+  const many = Array.from({ length: 20 }, (_, i) => ({ key: `${i}|1`, region: `r${i}`, count: 1 }))
+  assert.equal(planFlowArcs(many).length, 12, '默认单轮出弧预算必须为 12')
 })
 
 test('出弧预算超限时扩大时间桶而不是直接丢组', () => {

@@ -191,8 +191,7 @@ func NewClusterControlHTTPClient(dataDir string, database *sql.DB) *http.Client 
 	return client
 }
 
-// DoWithSameHostTLSUpgradeRedirect 处理同主机 http→https 301/302/307/308，与集群同步
-// （cluster_sync.go doWithTLSUpgradeRedirect）同一契约：节点启用管理 HTTPS 后
+// DoWithSameHostTLSUpgradeRedirect 处理同主机 http→https 301/302/307/308：节点启用管理 HTTPS 后
 // 明文端口整体 301/302（TCP 嗅探层，早于路由），而集群各客户端
 // CheckRedirect=ErrUseLastResponse 会让调用方拿到空 body 走 JSON 解析且无自愈
 // 路径（2026-09-18 实测）。仅当 Location 与原请求**同主机名**且升级为 https

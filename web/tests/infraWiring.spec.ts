@@ -73,9 +73,10 @@ test('轮询诊断 API 与生产守卫分离（无消费面必须标注用途）
   assert.match(requestBlock, /诊断\/测试用[\s\S]*isInflight/)
 })
 
-test('useVisibilityIntervals：无 window 时不启动间隔（注释与实现一致）', () => {
+test('useVisibilityIntervals：无 window 时不启动间隔', () => {
   const vis = source('src/composables/useVisibilityIntervals.ts')
-  assert.match(vis, /无 window 时（node\/SSR）不启动任何\s*\n?\s*\*?\s*间隔/, '注释必须如实描述退化行为')
+  // 不再断言注释措辞（注释改写即红且不守护行为）；退化行为由下方实现断言独立
+  // 成立：缺 window 直接返回、不登记定时器。
   const startTimers = member(vis, 'const startTimers')
   assert.match(startTimers, /win === undefined\) return/, '缺 window 必须直接返回（不得空转登记定时器）')
 })
@@ -100,14 +101,20 @@ test('阶段 0 副标题：空 groups 不得误报「保留检测记录」', () 
 })
 
 test('CRS 规则清单分页取全量（超 50 文件不再静默回退裸组码）', () => {
-  const dialog = source('src/components/RuleFlowDialog.vue')
-  const fetcher = member(dialog, 'const fetchAllCrsRuleFiles')
+  // 取全量实现单源在 utils/crsRuleFiles：流程弹框与策略页两处消费
+  // （策略页原只取第 1 页，>50 文件时组会被误判「已无此规则组」）。
+  const fetcher = source('src/utils/crsRuleFiles.ts')
   assert.match(fetcher, /page_size=\$\{CRS_RULE_PAGE_SIZE\}&page=\$\{page\}/, '必须带 page 参数循环')
   assert.match(fetcher, /rules\.length < CRS_RULE_PAGE_SIZE\) break/, '不足一页即收敛')
   assert.match(fetcher, /all\.length >= total\) break/, '按 total 收敛')
+  const dialog = source('src/components/RuleFlowDialog.vue')
+  assert.match(dialog, /import \{ fetchAllCrsRuleFiles \} from '@\/utils\/crsRuleFiles'/)
   const details = section(dialog, 'const ensureDetails', 'const togglePolicyDetail')
   assert.match(details, /fetchAllCrsRuleFiles\(\)/)
   assert.doesNotMatch(details, /\/security\/crs\/rules\?page_size=50`/, '不得再单页硬编码')
+  const policies = source('src/views/security/SecurityPolicies.vue')
+  assert.match(policies, /import \{ fetchAllCrsRuleFiles \} from '@\/utils\/crsRuleFiles'/)
+  assert.doesNotMatch(policies, /\/security\/crs\/rules\?page_size=50/, '策略页不得再只取第一页')
 })
 
 test('语法高亮：首帧转义文本 + 停顿后高亮（与 CodeEditor 同策略）', () => {

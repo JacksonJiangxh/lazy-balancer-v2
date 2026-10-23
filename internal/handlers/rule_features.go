@@ -1074,6 +1074,30 @@ func loadUpstreamsBatch(ctx context.Context, ruleIDs []string) (map[string][]mod
 	return result, nil
 }
 
+// enabledUpstreamRuleIDs 返回 ids 中「至少一个启用上游」的规则集合。与渲染层
+// 和域名冲突门同源（services.UpstreamEnabledSQLValue 单源，NULL 视禁用）：
+// 全部上游被禁用的规则不产生 host 路由，不作为域名占用方。批量复用
+// loadUpstreamsBatch 的分块读取，避免逐规则 N 次往返。
+func enabledUpstreamRuleIDs(ctx context.Context, ruleIDs []string) (map[string]bool, error) {
+	owned := make(map[string]bool, len(ruleIDs))
+	if len(ruleIDs) == 0 {
+		return owned, nil
+	}
+	upstreams, err := loadUpstreamsBatch(ctx, ruleIDs)
+	if err != nil {
+		return nil, err
+	}
+	for ruleID, list := range upstreams {
+		for _, u := range list {
+			if u.Enabled {
+				owned[ruleID] = true
+				break
+			}
+		}
+	}
+	return owned, nil
+}
+
 func loadPathRulesBatch(ctx context.Context, ruleIDs []string) (map[string][]models.PathRule, error) {
 	result := make(map[string][]models.PathRule, len(ruleIDs))
 	loadChunk := func(batch []string) error {
@@ -1332,13 +1356,17 @@ func validateStoredRuleProtocolFields(rule models.LbRule, includeMixedPool bool)
 	return nil
 }
 
+// errStoredRuleMissing 标记启用预校验按 caddy_id 重读时规则已不存在——
+// 首读与校验读之间的并发删除属冲突（409），不是服务端故障（500）。
+var errStoredRuleMissing = errors.New("规则不存在（可能已被并发删除）")
+
 func validateStoredRuleConfig(ctx context.Context, caddyID string) error {
 	rules, err := loadRulesForConfigValidation(ctx, " WHERE caddy_id = ?", caddyID)
 	if err != nil {
 		return err
 	}
 	if len(rules) != 1 {
-		return fmt.Errorf("规则不存在")
+		return errStoredRuleMissing
 	}
 	rule := rules[0]
 	// 与 validateRuleFeatures 同口径，兜住历史存量/导入的 80 端口 + TLS 跳转自环规则。
@@ -1455,13 +1483,25 @@ func validateEnabledStoredRuleConfigs(ctx context.Context) error {
 	//（导入链另由 disableV2RuleConflicts 冲突矩阵置禁用）。渲染层同 server 内
 	// 两条 host matcher + terminal 路由时，按 rowid 先出现者吃掉全部流量，后者
 	// 成为永不命中的死规则且面板仍显示「已启用」——必须点名而非静默。
+	// 占用方口径与冲突门/渲染层同源：零启用上游的规则不产生 host 路由，
+	// 不参与归组（否则把运行时无冲突的组合判为硬错，管理员无法保存配置）。
 	type httpDomainSlot struct {
 		port   int
 		domain string
 	}
+	httpRuleIDs := make([]string, 0, len(rules))
+	for _, rule := range rules {
+		if rule.Protocol == "http" && rule.Enabled {
+			httpRuleIDs = append(httpRuleIDs, rule.CaddyID)
+		}
+	}
+	httpDomainOwners, ownerErr := enabledUpstreamRuleIDs(ctx, httpRuleIDs)
+	if ownerErr != nil {
+		return fmt.Errorf("读取域名占用规则的启用上游失败: %w", ownerErr)
+	}
 	domainOwners := make(map[httpDomainSlot][]string)
 	for _, rule := range rules {
-		if rule.Protocol != "http" || !rule.Enabled {
+		if rule.Protocol != "http" || !rule.Enabled || !httpDomainOwners[rule.CaddyID] {
 			continue
 		}
 		for _, domain := range normalizedRuleDomains(rule.Domain) {

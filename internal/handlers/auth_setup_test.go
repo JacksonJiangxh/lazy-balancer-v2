@@ -1,10 +1,13 @@
 package handlers
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -188,7 +191,12 @@ func TestLogin_clamps_excessive_jwt_expiration(t *testing.T) {
 	}
 }
 
-func TestLogin_returns_error_when_last_login_update_fails(t *testing.T) {
+// 登录成功后的 last_login 记账写失败不得撤销已签发的会话：审计与活动证据
+// 的单源顺序是「签发 → 登录成功审计 → last_login 尽力更新」。旧密码路径在
+// 记账失败时 500 并丢弃令牌，而 OIDC 回调路径 warn 放行——两条路径口径分叉，
+// 取证时「最后活动时间」与审计可信度不一致。本用例与 OIDC 侧
+// TestOIDCCallback_lastLoginWriteFailureLoggedButLoginSucceeds 对称。
+func TestLogin_last_login_failure_keeps_session_and_logs(t *testing.T) {
 	// Given
 	database := setupAuthTestDB(t)
 	if _, err := database.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, is_master BOOLEAN, jwt_expire_minutes INTEGER, mfa_lockout_enabled BOOLEAN); INSERT INTO global_config VALUES (1,1,20,1)`); err != nil {
@@ -201,6 +209,27 @@ func TestLogin_returns_error_when_last_login_update_fails(t *testing.T) {
 	if _, err := database.Exec(`INSERT INTO users (username,password_hash,role,is_enabled) VALUES ('root',?,'admin',1); CREATE TRIGGER fail_last_login BEFORE UPDATE OF last_login ON users BEGIN SELECT RAISE(ABORT,'last login failed'); END`, string(hash)); err != nil {
 		t.Fatalf("seed user and trigger: %v", err)
 	}
+	var logBuf bytes.Buffer
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	// 审计落点：夹具库不含 audit_log，单独给一个最小审计库（与本用例的
+	// 「审计口径」断言配对）。
+	auditDB, err := sql.Open("sqlite", t.TempDir()+"/audit.db")
+	if err != nil {
+		t.Fatalf("open audit db: %v", err)
+	}
+	if _, err := auditDB.Exec(`CREATE TABLE audit_log (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		username TEXT, action TEXT, resource TEXT, detail TEXT, ip_address TEXT,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatalf("create audit table: %v", err)
+	}
+	oldAuditDB := db.AuditDB
+	db.AuditDB = auditDB
+	t.Cleanup(func() {
+		db.AuditDB = oldAuditDB
+		_ = auditDB.Close()
+	})
 	h := &Handlers{cfg: &config.Config{JWTSecret: "test-secret"}}
 	router := gin.New()
 	router.POST("/auth/login", h.Login)
@@ -211,9 +240,33 @@ func TestLogin_returns_error_when_last_login_update_fails(t *testing.T) {
 	// When
 	router.ServeHTTP(response, request)
 
-	// Then
-	if response.Code != http.StatusInternalServerError {
-		t.Fatalf("login status=%d body=%s, want 500", response.Code, response.Body.String())
+	// Then ① 登录仍成功并返回 token（记账失败不是授权前提）
+	if response.Code != http.StatusOK {
+		t.Fatalf("login status=%d body=%s, want 200（last_login 记账失败不得撤销已签发会话）", response.Code, response.Body.String())
+	}
+	var body struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode login response: %v", err)
+	}
+	if body.Token == "" {
+		t.Fatal("登录响应必须携带 token")
+	}
+	// Then ② 审计口径与 OIDC 路径一致：记「登录成功」而非「登录失败」
+	var successAudits, failAudits int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='登录成功'`).Scan(&successAudits); err != nil {
+		t.Fatalf("count success audits: %v", err)
+	}
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='登录失败'`).Scan(&failAudits); err != nil {
+		t.Fatalf("count failure audits: %v", err)
+	}
+	if successAudits != 1 || failAudits != 0 {
+		t.Fatalf("audits success=%d failure=%d, want 1/0（记账失败不得把登录记成失败）", successAudits, failAudits)
+	}
+	// Then ③ 必须留痕（连续失败首条升级 error 级）
+	if !strings.Contains(logBuf.String(), "last_login") {
+		t.Fatalf("last_login 写失败必须留痕, captured log=%q", logBuf.String())
 	}
 }
 

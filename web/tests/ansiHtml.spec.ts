@@ -4,7 +4,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { registerModuleHooks } from './_helpers.ts'
+import { registerModuleHooks, source } from './_helpers.ts'
 
 // ansi.ts 经 `@/utils/escape` 别名取共享转义实现，node 不认别名——先注册解析钩子。
 // 静态 import 会先于钩子注册执行，故此处必须动态 import。
@@ -74,4 +74,18 @@ test('未知码位丢弃序列本身但不吞正文', () => {
 
 test('空参数等价 0（复位）', () => {
   assert.equal(ansiToHtml(`${ESC}[31ma${ESC}[mb`), `${color('#ef4444')}a</span>b`)
+})
+
+// 转义即安全边界：日志内容含请求路径/UA 等外部输入，v-html 只能接
+// ansiToHtml 的产出；回退成原始日志直出会从「不着色」升级为注入面。
+test('日志消费面：v-html 只接 ansiToHtml 结果，禁止直出原始日志', () => {
+  const caddy = source('src/views/settings/CaddyGlobalSettings.vue')
+  assert.match(caddy, /const logHtml = computed\(\(\) => ansiToHtml\(logContent\.value\)\)/)
+  assert.match(caddy, /v-html="logHtml"/)
+  assert.doesNotMatch(caddy, /v-html="logContent"/, '原始日志不得直出（转义缺失即注入面）')
+
+  const rules = source('src/views/Rules.vue')
+  assert.match(rules, /const ruleLogHtml = computed\(\(\) => ansiToHtml\(/)
+  assert.match(rules, /v-html="ruleLogHtml"/)
+  assert.doesNotMatch(rules, /v-html="ruleLogContent"/, '原始日志不得直出（转义缺失即注入面）')
 })

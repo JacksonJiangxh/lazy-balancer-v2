@@ -391,6 +391,8 @@ func TestCategorizeAttack_familyMapping(t *testing.T) {
 		{"geoip segment upper bound", "809999", "", "地域拦截"},
 		{"crawler segment lower bound", "810016", "", "爬虫Bot"},
 		{"crawler segment upper bound", "899999", "", "爬虫Bot"},
+		// 限流：429 精确（与事件列表「限流」族/筛选同源）
+		{"ratelimit 429", "429", "", "限流"},
 		{"empty input", "", "", "其他"},
 		{"custom rule six-digit id", "123456", "something else", "自定义规则"},
 		// 收敛前语义钉：未列名 3 位前缀的 9xxxxx（CRS 保留段

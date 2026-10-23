@@ -489,8 +489,7 @@ func nearestSnapshotCertificateExpiry(certificates []models.ClusterCertificate, 
 			continue
 		}
 		expiresAt, err := parseSnapshotExpiry(certificate.ExpiresAt)
-		// （两路审计独立确认，提交信息曾声称已修但从未落盘——
-		// 第 3 次同类失误）：解析失败视同缺失——唯一 ACME 证书 expires_at 非空
+		// 解析失败视同缺失——唯一 ACME 证书 expires_at 非空
 		// 不可解析时 nearest 保持零 → 缓存快照永不按时间过期 → ACME 续期不传播
 		// 到副本。给最小重建窗口（ACME 域才计，避免非 ACME 误触发）。
 		if err != nil {
@@ -1319,6 +1318,12 @@ func (s *ClusterService) snapshotAPIKeys(ctx context.Context, store snapshotStor
 }
 
 func (s *ClusterService) snapshotCertificates(ctx context.Context, store snapshotStore) ([]models.ClusterCertificate, error) {
+	// 手工证书轴镜像全部 enable_tls=1 的 manual 行，不按 r.enabled 过滤——
+	// 与下方 ACME 轴（仅启用规则）刻意不对称：lb_rules 快照载荷本身（
+	// insertSnapshotRules）就携带全部规则的 tls_cert/tls_key，禁用规则的手工
+	// 证书落到从端只是多一份与表内一致的材料，且主从渲染对禁用规则不建 TLS
+	// 连接策略，不构成额外暴露。若未来把证书文件轴定义为「纯运行材料」，需
+	// 改为按 enabled 过滤（数据面语义变更，需裁定）。
 	rows, err := store.QueryContext(ctx, `SELECT caddy_id, tls_cert, tls_key FROM lb_rules WHERE enable_tls=1 AND tls_source='manual' AND COALESCE(tls_cert,'')<>'' AND COALESCE(tls_key,'')<>'' ORDER BY caddy_id`)
 	if err != nil {
 		return nil, fmt.Errorf("读取快照证书: %w", err)

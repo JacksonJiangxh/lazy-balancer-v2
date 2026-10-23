@@ -83,7 +83,7 @@
               <span class="picker-rule-name">{{ rule.name }}</span>
               <span class="picker-rule-meta">{{ rule.domain || '-' }}:{{ rule.listen_port }}</span>
             </el-checkbox>
-            <el-tooltip v-if="pickerWouldExceed(rule)" :content="`该规则已绑定 ${MAX_POLICIES_PER_RULE} 条策略（上限），需先解绑`" placement="top">
+            <el-tooltip v-if="pickerWouldExceed(rule)" :content="pickerBlockReason(rule)" placement="top">
               <el-icon class="picker-cap-icon"><WarningFilled /></el-icon>
             </el-tooltip>
           </div>
@@ -274,14 +274,30 @@ watch(pickerSearch, () => {
   pickerPage.value = 1
 })
 
-// 已达绑定上限且未绑定本策略的规则不可再选
-const pickerWouldExceed = (rule: BindingEditorRule): boolean => {
-  if (props.mode !== 'policy' || props.policyId == null) return false
+// 当前策略的阶段类型（策略侧批量绑定的后端判据需要它：阶段 2 限流每规则仅一条）
+const currentPolicyType = computed<SecurityPolicyType | null>(() => {
+  if (props.policyId == null) return null
+  return policyTypeById.value.get(props.policyId) ?? null
+})
+
+// 规则不可选原因（空串=可选）。判据与后端 bulk 校验同源：批量提交整批拒绝，
+// 故凡后端必然拒绝的形态都在选择阶段置灰，避免「全选→保存→整片不生效」。
+// ①阶段 2（限流）策略：该规则已绑定其它限流策略；②每规则策略总数已达上限。
+const pickerBlockReason = (rule: BindingEditorRule): string => {
+  if (props.mode !== 'policy' || props.policyId == null) return ''
   const current = props.bindings[rule.caddy_id] || []
-  if (current.some((b) => b.policy_id === props.policyId)) return false
-  if (pickerSelected.value.includes(rule.caddy_id)) return false
-  return current.length >= MAX_POLICIES_PER_RULE
+  if (current.some((b) => b.policy_id === props.policyId)) return ''
+  if (pickerSelected.value.includes(rule.caddy_id)) return ''
+  if (currentPolicyType.value === 'stage2'
+    && current.some((b) => policyTypeById.value.get(b.policy_id) === 'stage2')) {
+    return '该规则已绑定其它限流策略（每规则仅一条），需先解绑'
+  }
+  if (current.length >= MAX_POLICIES_PER_RULE) {
+    return `该规则已绑定 ${MAX_POLICIES_PER_RULE} 条策略（上限），需先解绑`
+  }
+  return ''
 }
+const pickerWouldExceed = (rule: BindingEditorRule): boolean => pickerBlockReason(rule) !== ''
 
 const pickerSelectableRules = computed(() => pickerFilteredRules.value.filter((rule) => !pickerWouldExceed(rule)))
 const pickerAllChecked = computed(() =>

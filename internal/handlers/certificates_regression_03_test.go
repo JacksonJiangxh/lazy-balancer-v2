@@ -5,6 +5,7 @@ package handlers
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -570,4 +571,220 @@ func TestIssueCertificate_batchSkipsWaitingCACooling(t *testing.T) {
 		t.Fatalf("status=%q window=%v, want waiting_ca 且退避窗口保留", status, availableAfter)
 	}
 	assertLatestCertificateAudit(t, "范围：全部 ACME 规则", "已跳过")
+}
+
+// Given 批量目标中一条处于 CA 冷却（force 越过）、一条域名非法（必然失败）。
+// When all=true 且 force=true。
+// Then 200 partial，且审计留痕「手动越过 CA 冷却」——批量各出口都必须携带
+// 越权痕迹，不能只存在于全成功出口。
+func TestIssueCertificate_batchForcePartialKeepsOverrideAudit(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	initIssueQueue(t)
+	seedIssueRule(t, "lb_force_partial", "force-partial.example")
+	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,ca_available_after,updated_at)
+		VALUES ('lb_force_partial','force-partial.example','waiting_ca',datetime('now','+1 hour'),datetime('now','-2 hours'))`); err != nil {
+		t.Fatalf("seed cooling job: %v", err)
+	}
+	seedIssueRule(t, "lb_force_bad_domain", "bad domain.example")
+	router := gin.New()
+	router.POST("/certificates/issue", h.IssueCertificate)
+
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/certificates/issue?force=true", strings.NewReader(`{"all":true}`)))
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200 partial", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), `"queued":1`) || !strings.Contains(response.Body.String(), `"failed":1`) {
+		t.Fatalf("body=%s, want queued=1 + failed=1（partial）", response.Body.String())
+	}
+	assertLatestCertificateAudit(t, "范围：全部 ACME 规则", "手动越过 CA 冷却")
+}
+
+// Given 规则仍启用但证书任务行已 disabled（历史残留/脏快照）。
+// When 批量 all=true / 定向重新签发。
+// Then 批量按「已退役任务」单列（不得混入冷却计数），定向 409 给出可执行指引。
+func TestIssueCertificate_disabledJobClassifiedAsRetired(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	initIssueQueue(t)
+	seedIssueRule(t, "lb_retired", "retired.example")
+	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,updated_at)
+		VALUES ('lb_retired','retired.example','disabled',datetime('now','-2 hours'))`); err != nil {
+		t.Fatalf("seed retired job: %v", err)
+	}
+	router := gin.New()
+	router.POST("/certificates/issue", h.IssueCertificate)
+
+	batch := httptest.NewRecorder()
+	router.ServeHTTP(batch, httptest.NewRequest(http.MethodPost, "/certificates/issue", strings.NewReader(`{"all":true}`)))
+	if batch.Code != http.StatusConflict {
+		t.Fatalf("batch status=%d body=%s, want 409（全部跳过）", batch.Code, batch.Body.String())
+	}
+	if !strings.Contains(batch.Body.String(), `"skipped_retired":1`) || !strings.Contains(batch.Body.String(), "已退役任务 1 个") {
+		t.Fatalf("batch body=%s, want skipped_retired=1 + 已退役任务文案", batch.Body.String())
+	}
+	if strings.Contains(batch.Body.String(), "冷却跳过") {
+		t.Fatalf("batch body=%s, 永久退役条件不得混入冷却计数", batch.Body.String())
+	}
+
+	directed := httptest.NewRecorder()
+	router.ServeHTTP(directed, httptest.NewRequest(http.MethodPost, "/certificates/issue", strings.NewReader(`{"caddy_id":"lb_retired"}`)))
+	if directed.Code != http.StatusConflict {
+		t.Fatalf("directed status=%d body=%s, want 409", directed.Code, directed.Body.String())
+	}
+	if !strings.Contains(directed.Body.String(), "已退役的证书任务不能重试") || !strings.Contains(directed.Body.String(), "禁用再启用") {
+		t.Fatalf("directed body=%s, want 不可重试 + 禁用再启用指引", directed.Body.String())
+	}
+}
+
+// Given 批量快照已取（锁外），随后目标规则在取锁前被并发删除。
+// When all=true 落到 upsert 的规则当前态闸。
+// Then 全部失败且均为规则状态冲突 → 409「刷新后重试」（与定向同口径），
+// 不得折成 500 服务器故障。
+func TestIssueCertificate_batchAllConflictReturns409(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	initIssueQueue(t)
+	seedIssueRule(t, "lb_conflict_batch", "conflict-batch.example")
+	router := gin.New()
+	router.POST("/certificates/issue", h.IssueCertificate)
+
+	// 先持全局写锁：请求完成批量快照后阻塞在取锁处。
+	h.caddyOpMu.Lock()
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/certificates/issue", strings.NewReader(`{"all":true}`)))
+		done <- rec
+	}()
+	// 让快照查询跑完并抵达锁（比对窗口内无其他状态依赖）。
+	time.Sleep(200 * time.Millisecond)
+	if _, err := db.DB.Exec("DELETE FROM lb_rules WHERE caddy_id='lb_conflict_batch'"); err != nil {
+		h.caddyOpMu.Unlock()
+		t.Fatalf("delete rule in lock window: %v", err)
+	}
+	h.caddyOpMu.Unlock()
+
+	var response *httptest.ResponseRecorder
+	select {
+	case response = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("批量签发请求未返回")
+	}
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s, want 409（全部规则状态冲突）", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "规则状态已变更") || !strings.Contains(response.Body.String(), "刷新后重试") {
+		t.Fatalf("body=%s, want 可行动冲突文案", response.Body.String())
+	}
+}
+
+// seedDownloadedJobWithMaterial 播种部署生命周期 + 材料在库的任务行
+// （updated_at 回拨 3 分钟避开 2 分钟重试冷却）。
+func seedDownloadedJobWithMaterial(t *testing.T, ruleID, domain, status string) int64 {
+	t.Helper()
+	result, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,cert_pem,key_pem,expires_at,updated_at)
+		VALUES (?,?,?,'CERT-PEM-MATERIAL','KEY-PEM-MATERIAL',datetime('now','+80 days'),datetime('now','-3 minutes'))`, ruleID, domain, status)
+	if err != nil {
+		t.Fatalf("seed downloaded job for %s: %v", ruleID, err)
+	}
+	jobID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return jobID
+}
+
+// stubDeploymentRegistrar 注入部署重试登记缝（生产=RetryCertificateDeploymentNow），
+// 记录 (jobID, ruleID) 且不真正执行部署，便于断言「只重排部署」。
+func stubDeploymentRegistrar(t *testing.T) *[]string {
+	t.Helper()
+	old := certJobDeploymentRetryRegistrar
+	registered := make([]string, 0, 2)
+	certJobDeploymentRetryRegistrar = func(jobID int, ruleID string) error {
+		registered = append(registered, fmt.Sprintf("%d:%s", jobID, ruleID))
+		return nil
+	}
+	t.Cleanup(func() { certJobDeploymentRetryRegistrar = old })
+	return &registered
+}
+
+// Given 目标处于部署生命周期（downloaded）且材料在库、规则启用。
+// When 定向「重新签发」。
+// Then 只触发重新部署（不重新签发）：任务状态保持 downloaded、部署窗口前移、
+// 登记缝收到该任务——与证书任务重试入口同源（整轮重签会丢弃已签发证书）。
+func TestIssueCertificate_downloadedJobTriggersRedeployNotReissue(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	initIssueQueue(t)
+	seedIssueRule(t, "lb_redeploy", "redeploy.example")
+	jobID := seedDownloadedJobWithMaterial(t, "lb_redeploy", "redeploy.example", "downloaded")
+	registered := stubDeploymentRegistrar(t)
+	router := gin.New()
+	router.POST("/certificates/issue", h.IssueCertificate)
+
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/certificates/issue", strings.NewReader(`{"caddy_id":"lb_redeploy"}`)))
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "已触发重新部署（不重新签发）") || !strings.Contains(response.Body.String(), `"redeployed":true`) {
+		t.Fatalf("body=%s, want 重新部署响应", response.Body.String())
+	}
+	var status string
+	var availableAfter sql.NullTime
+	if err := db.DB.QueryRow("SELECT status, deployment_available_after FROM cert_jobs WHERE id=?", jobID).Scan(&status, &availableAfter); err != nil {
+		t.Fatal(err)
+	}
+	if status != "downloaded" {
+		t.Fatalf("status=%q, want downloaded（不得转 queued 重签）", status)
+	}
+	if !availableAfter.Valid {
+		t.Fatal("deployment_available_after 未前移（未登记立即部署）")
+	}
+	if want := fmt.Sprintf("%d:lb_redeploy", jobID); len(*registered) != 1 || (*registered)[0] != want {
+		t.Fatalf("registrations=%v, want [%s]", *registered, want)
+	}
+	assertLatestCertificateAudit(t, "规则：lb_redeploy", "等待恢复部署")
+}
+
+// Given 批量目标全部处于部署生命周期且材料在库。
+// When all=true。
+// Then 全部只重排部署：响应单列 redeployed、任务保持 downloaded、审计同源。
+func TestIssueCertificate_batchDownloadedJobsTriggerRedeploy(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	initIssueQueue(t)
+	seedIssueRule(t, "lb_redeploy_a", "redeploy-a.example")
+	seedIssueRule(t, "lb_redeploy_b", "redeploy-b.example")
+	jobA := seedDownloadedJobWithMaterial(t, "lb_redeploy_a", "redeploy-a.example", "cleanup_dns")
+	jobB := seedDownloadedJobWithMaterial(t, "lb_redeploy_b", "redeploy-b.example", "cleanup_warning")
+	registered := stubDeploymentRegistrar(t)
+	router := gin.New()
+	router.POST("/certificates/issue", h.IssueCertificate)
+
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/certificates/issue", strings.NewReader(`{"all":true}`)))
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), `"redeployed":2`) || !strings.Contains(response.Body.String(), "已触发重新部署 2 个（不重新签发）") {
+		t.Fatalf("body=%s, want redeployed=2 + 不重新签发文案", response.Body.String())
+	}
+	if len(*registered) != 2 {
+		t.Fatalf("registrations=%v, want 2", *registered)
+	}
+	for _, jobID := range []int64{jobA, jobB} {
+		var status string
+		var availableAfter sql.NullTime
+		if err := db.DB.QueryRow("SELECT status, deployment_available_after FROM cert_jobs WHERE id=?", jobID).Scan(&status, &availableAfter); err != nil {
+			t.Fatal(err)
+		}
+		if status != "downloaded" && status != "cleanup_dns" && status != "cleanup_warning" {
+			t.Fatalf("job %d status=%q, want 保持部署生命周期", jobID, status)
+		}
+		if !availableAfter.Valid {
+			t.Fatalf("job %d deployment_available_after 未前移", jobID)
+		}
+	}
+	assertLatestCertificateAudit(t, "范围：全部 ACME 规则", "等待恢复部署")
 }

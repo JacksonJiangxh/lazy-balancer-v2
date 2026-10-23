@@ -15,44 +15,66 @@ import (
 )
 
 func TestSyncService_Pull_masterUnauthorizedIsTerminalFailure(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		status int
-	}{
-		{"unauthorized", http.StatusUnauthorized},
-		{"forbidden", http.StatusForbidden},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			// Given：主节点对本节点的快照拉取持续返回 401/403（令牌已被撤销）
-			_, database := newClusterTestService(t)
-			master := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
-				response.WriteHeader(tc.status)
-			}))
-			defer master.Close()
-			if _, err := database.Exec("UPDATE global_config SET is_master=0, master_url=?, cluster_token='cluster-token' WHERE id=1", master.URL); err != nil {
-				t.Fatal(err)
-			}
-			service := NewSyncService(database, &config.Config{DataDir: t.TempDir()}, nil)
+	// Given：主节点对本节点的快照拉取持续返回 401（clusterTokenAuth 的凭据拒绝）
+	_, database := newClusterTestService(t)
+	master := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer master.Close()
+	if _, err := database.Exec("UPDATE global_config SET is_master=0, master_url=?, cluster_token='cluster-token' WHERE id=1", master.URL); err != nil {
+		t.Fatal(err)
+	}
+	service := NewSyncService(database, &config.Config{DataDir: t.TempDir()}, nil)
 
-			// When
-			_, pullErr := service.Pull(context.Background())
-			var stored string
-			if err := database.QueryRow("SELECT COALESCE(last_sync_error,'') FROM global_config WHERE id=1").Scan(&stored); err != nil {
-				t.Fatal(err)
-			}
-			message, code := decodeSyncError(stored)
+	// When
+	_, pullErr := service.Pull(context.Background())
+	var stored string
+	if err := database.QueryRow("SELECT COALESCE(last_sync_error,'') FROM global_config WHERE id=1").Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	message, code := decodeSyncError(stored)
 
-			// Then：返回终止类错误并持久化明确的原因与错误码
-			if !errors.Is(pullErr, errSyncTokenRevoked) {
-				t.Fatalf("pull error=%v, want token-revoked terminal failure", pullErr)
-			}
-			if !strings.Contains(message, "集群令牌已被主节点撤销") {
-				t.Fatalf("stored message=%q, want revocation guidance", message)
-			}
-			if code != models.SyncErrorCodeValidationFailed {
-				t.Fatalf("stored code=%q, want %q", code, models.SyncErrorCodeValidationFailed)
-			}
-		})
+	// Then：返回终止类错误并持久化明确的原因与错误码
+	if !errors.Is(pullErr, errSyncTokenRevoked) {
+		t.Fatalf("pull error=%v, want token-revoked terminal failure", pullErr)
+	}
+	if !strings.Contains(message, "集群令牌已被主节点撤销") {
+		t.Fatalf("stored message=%q, want revocation guidance", message)
+	}
+	if code != models.SyncErrorCodeValidationFailed {
+		t.Fatalf("stored code=%q, want %q", code, models.SyncErrorCodeValidationFailed)
+	}
+}
+
+func TestSyncService_Pull_bareForbiddenIsRetryableProxyRejection(t *testing.T) {
+	// Given：前置代理/网关对快照端点返回裸 403（无 master_required 码）
+	_, database := newClusterTestService(t)
+	master := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.WriteHeader(http.StatusForbidden)
+	}))
+	defer master.Close()
+	if _, err := database.Exec("UPDATE global_config SET is_master=0, master_url=?, cluster_token='cluster-token' WHERE id=1", master.URL); err != nil {
+		t.Fatal(err)
+	}
+	service := NewSyncService(database, &config.Config{DataDir: t.TempDir()}, nil)
+
+	// When
+	_, pullErr := service.Pull(context.Background())
+	var stored string
+	if err := database.QueryRow("SELECT COALESCE(last_sync_error,'') FROM global_config WHERE id=1").Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	message, code := decodeSyncError(stored)
+
+	// Then：非终止（不得据此判定令牌撤销），文案区分「代理拒绝」
+	if errors.Is(pullErr, errSyncTokenRevoked) {
+		t.Fatalf("pull error=%v, want non-terminal retryable failure", pullErr)
+	}
+	if !strings.Contains(message, "非令牌撤销") {
+		t.Fatalf("stored message=%q, want proxy-rejection wording", message)
+	}
+	if code != models.SyncErrorCodeTransportError {
+		t.Fatalf("stored code=%q, want %q", code, models.SyncErrorCodeTransportError)
 	}
 }
 

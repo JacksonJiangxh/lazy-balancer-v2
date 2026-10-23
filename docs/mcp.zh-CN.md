@@ -103,8 +103,7 @@ lazy-balancer://docs/ops-playbook
 | 自动封禁 | `GET /security/autoban`、`PUT /security/autoban` | 自动封禁阈值/窗口/时长/作用域/演练模式配置 |
 | 威胁情报库 | `PUT /security/threat-lib/auto-update`、`PUT /security/threat-lib/schedule`、各源开关 | 库开关与排程 |
 | 爬虫地址库 | `PUT /security/crawler-lib/auto-update`、`PUT /security/crawler-lib/schedule` | 库开关与排程 |
-| CRS / IP 库开关与排程 | `PUT /security/crs/auto-update`、`PUT /security/crs/schedule`、`PUT /security/ip2region/auto-update`、`PUT /security/ip2region/schedule` | 库开关与排程 |
+| CRS / IP 库排程 | `PUT /security/crs/schedule`、`PUT /security/ip2region/schedule` | 排程设置（开关有 `toggle_crs_auto_update` / `toggle_ip2region_auto_update` 工具） |
 | 安全策略与规则 | `POST /security/policies/batch-bind`、`POST /rules/batch-block-pages` | 策略批量绑定、规则批量指定拦截页 |
-| 系统任务 | `POST /system/tasks/:id/{toggle,control}` | 任务调度启停（引擎元数据驱动） |
 
-完整豁免清单以 MCP 工具与 REST 路由的一致性测试（parity）和 `GET /api/v1/openapi.yaml` 为准——两份清单任一变更都会被机械对账拦下。
+完整豁免清单以 MCP 工具与 REST 路由的一致性测试（parity）和 `GET /api/v1/openapi.yaml` 为准——两份清单任一变更都会被机械对账拦下。上表本身也由测试机械校验：表内端点一旦被某个工具覆盖，测试即失败（避免本表随工具增长而腐化）。

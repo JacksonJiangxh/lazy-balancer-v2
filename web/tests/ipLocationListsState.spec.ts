@@ -29,6 +29,18 @@ test('名单加载失败不得静默：catch 置 listsError 并清空名单，�
   assert.ok(flagged > cleared, '名单接口失败必须置错误态（清空之后）')
 })
 
+test('「重新加载」串接名单重取：loadPolicies 在策略就位后 await loadIpLists', () => {
+  const loadPolicies = section(page, 'const loadPolicies = async', '\n}\n')
+  const policiesAssigned = loadPolicies.indexOf('policies.value = ')
+  const listsLoaded = loadPolicies.indexOf('await loadIpLists()')
+  assert.ok(policiesAssigned > 0, 'loadPolicies 必须先取回策略列表')
+  // 名单条目按需拉取依赖本轮策略的引用清单，必须排在 policies 赋值之后
+  assert.ok(listsLoaded > policiesAssigned, 'loadIpLists 必须在（而非早于）policies 就位后串接')
+  assert.ok(listsLoaded < loadPolicies.indexOf('} catch {'), '串接必须在 try 内，失败由同一 catch 收口')
+  // 反向：重试入口只重取策略——少了这行串接，listsError 永不复位、整区动作永久禁用
+  assert.match(page, /const retryLists = \(\): void => \{ void loadPolicies\(\) \}/)
+})
+
 test('失败态有横幅与重试入口，处置动作在失败态禁用', () => {
   assert.match(page, /<div v-if="listsError" class="info-note-bar">/)
   assert.match(page, /@click="retryLists">重新加载<\/el-button>/)

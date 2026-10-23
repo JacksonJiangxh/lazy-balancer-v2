@@ -31,10 +31,15 @@ test('用户组：组名内部空格必须保留（不得按空白切碎）', ()
   assert.deepEqual(parseGroupAllowList('  A  B  '), ['A  B'])
 })
 
+test('用户组：顿号不是分隔符（组名可含顿号，只按逗号/分号/换行切分）', () => {
+  assert.deepEqual(parseGroupAllowList('Ops、SRE'), ['Ops、SRE'])
+  assert.deepEqual(parseGroupAllowList('Ops、SRE, Dev'), ['Ops、SRE', 'Dev'])
+})
+
 test('用户组：去重保序、空串/纯分隔符得到空数组', () => {
   assert.deepEqual(parseGroupAllowList('ops,ops,dev'), ['ops', 'dev'])
   assert.deepEqual(parseGroupAllowList(''), [])
-  assert.deepEqual(parseGroupAllowList(' , ; ， 、 '), [])
+  assert.deepEqual(parseGroupAllowList(' , ; ， '), [])
 })
 
 test('文本↔数组往返幂等（组名含空格同样无损）', () => {

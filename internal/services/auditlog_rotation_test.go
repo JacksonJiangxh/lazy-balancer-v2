@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"lazy-balancer-v2/internal/db"
@@ -349,5 +350,134 @@ func TestRotateAuditLog_keepsPendingMarkerWhenIngestDepsUnavailable(t *testing.T
 	// Then：补采完成，标记删除
 	if _, serr := os.Stat(marker); !os.IsNotExist(serr) {
 		t.Fatalf("补采成功后标记必须删除, stat err=%v", serr)
+	}
+}
+
+// 持续写入下轮转仍须截断：截断判据是「摄取到达偏移」，不是本轮补采前的文件
+// 大小。审计日志每事务追写，copy 之后与每次 stat→ingest 窗口内随时有新字节；
+// 旧实现拿每轮补采前的 stat 与全部补采后的 stat 比较，只要窗口内到达一条
+// 事件条件即恒真——每 2s 全量复制并移位归档却永不 truncate，活文件无界增长、
+// 磁盘放大 ~6×，且 rotErr 恒 nil、健康位与任务日志零痕迹。
+func TestRotateAuditLog_continuousWritesStillTruncate(t *testing.T) {
+	// Given：小阈值 + 已超阈的活文件 + 可用的安全事件库
+	dataDir := t.TempDir()
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InitializeMetricsDB(dataDir); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	offsetPath := filepath.Join(dir, "security_events.offset")
+	oldLogPath, oldOffsetPath, oldSizeBytes := auditLogPath, securityEventsOffsetPath, auditLogSizeBytes
+	oldCopyFile, oldIngestHook := auditLogCopyFile, auditLogRotationBeforeTailIngest
+	auditLogPath, securityEventsOffsetPath = logPath, offsetPath
+	auditLogSizeBytes = func() int64 { return 1 }
+	t.Cleanup(func() {
+		auditLogPath, securityEventsOffsetPath, auditLogSizeBytes = oldLogPath, oldOffsetPath, oldSizeBytes
+		auditLogCopyFile, auditLogRotationBeforeTailIngest = oldCopyFile, oldIngestHook
+	})
+
+	seq := 0
+	appendDoc := func() {
+		seq++
+		doc := strings.Replace(securityEventsFixtureClean, "tx-clean-1", fmt.Sprintf("tx-stream-%d", seq), 1) + "\n"
+		f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.WriteString(doc); err != nil {
+			_ = f.Close()
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	docLen := int64(len(securityEventsFixtureClean) + 1)
+	for range 4 {
+		appendDoc()
+	}
+	tailer := securityEventsNewTailer(logPath, offsetPath)
+	if err := tailer.securityEventsTick(); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+
+	// Coraza 在 copy 完成后追写（照旧必须在 .1 之外），以及在本轮 stat→补采
+	// 窗口内追写——两个窗口正是持续写入必然命中的位置。
+	auditLogCopyFile = func(src, dst string) error {
+		if err := copyAuditLogTo(src, dst); err != nil {
+			return err
+		}
+		appendDoc()
+		return nil
+	}
+	ingestWindowAppends := 0
+	auditLogRotationBeforeTailIngest = func() {
+		appendDoc()
+		ingestWindowAppends++
+	}
+
+	// When：连续 30 个 tick，每 tick 活文件都有新写入
+	const ticks = 30
+	truncated := 0
+	var archiveFinal int64
+	for tick := range ticks {
+		appendDoc()
+		if _, err := rotateAuditLogIfNeeded(); err != nil {
+			t.Fatalf("tick %d: %v（持续写入不得让轮转报错/停摆）", tick, err)
+		}
+		live, err := os.Stat(logPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if live.Size() == 0 {
+			truncated++
+		}
+		if archiveInfo, aerr := os.Stat(logPath + ".1"); aerr == nil {
+			archiveFinal = archiveInfo.Size()
+		}
+	}
+
+	// Then：活文件确实被截断；.1 尺寸与单次轮转窗口同量级、不随 tick 累积
+	if truncated == 0 {
+		t.Fatal("30 个 tick 内活文件从未被截断：持续写入把「已摄取」误判成「仍有未摄取字节」")
+	}
+	if want := 8 * docLen; archiveFinal > want {
+		t.Fatalf(".1 size=%d, want ≤%d（归档不得随 tick 数累积增长）", archiveFinal, want)
+	}
+	// 截断不得丢事件：轮转前与 copy 后的追写每 tick 各一条，补采窗口内的追写
+	// 按实际轮数计——全部必须已入库（窗口内追写若被误判为「未摄取」而残留，
+	// 下一轮拷贝会重复解析，行数随即偏离）。
+	var rows int
+	if err := db.MetricsDB.QueryRow(`SELECT COUNT(*) FROM security_events WHERE transaction_id LIKE 'tx-stream-%'`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if want := 4 + ticks*2 + ingestWindowAppends; rows != want {
+		t.Fatalf("rows=%d, want %d（截断前必须已摄取窗口内追写）", rows, want)
+	}
+}
+
+// TestPendingDeltaArchiveReplaced_sizeGuard 标记里的归档大小必须是活字段：
+// 当前 .1 小于记录窗口说明归档被外部替换/截短，旧 Offset 补采已无意义。
+func TestPendingDeltaArchiveReplaced_sizeGuard(t *testing.T) {
+	dir := t.TempDir()
+	archive := filepath.Join(dir, "audit.log.1")
+	if err := os.WriteFile(archive, []byte("12345"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if pendingDeltaArchiveReplaced(&securityEventsPendingDelta{Path: archive, Offset: 0, Size: 5}) {
+		t.Fatal("同尺寸归档不得判为被替换")
+	}
+	if !pendingDeltaArchiveReplaced(&securityEventsPendingDelta{Path: archive, Offset: 4, Size: 9}) {
+		t.Fatal("归档小于记录窗口必须判为被替换（旧偏移无意义）")
+	}
+	if pendingDeltaArchiveReplaced(&securityEventsPendingDelta{Path: archive, Offset: 4}) {
+		t.Fatal("Size=0 为旧版标记，不做判定")
+	}
+	if pendingDeltaArchiveReplaced(nil) {
+		t.Fatal("nil 标记不得判为被替换")
 	}
 }

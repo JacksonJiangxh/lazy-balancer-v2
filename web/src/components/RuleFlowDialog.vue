@@ -380,6 +380,7 @@ import type { RuleFlowPathRule } from '@/types/rules'
 import { hostPortKey } from '@/utils/upstreamKeys'
 import { weightPercent } from '@/utils/upstreamWeights'
 import { STAGE_TITLES, attachStageDetails, formatDurationUs, inferPolicyType, mergeIpEntries, parseIPList, parseRefIds, stage1FootnoteText, stageSubLabel, trustHitMode } from '@/utils/securityStages'
+import { fetchAllCrsRuleFiles } from '@/utils/crsRuleFiles'
 import { useCountryNamesCn, countryLabel } from '@/composables/useCountryNamesCn'
 import type {
   CrsRuleFileOption,
@@ -532,27 +533,7 @@ const groupHasDetails = (group: StagePolicyGroup): boolean => {
     || (d.crsGroups?.length ?? 0) > 0
 }
 
-// CRS 文件清单全量分页：接口 page_size 上限 50（后端 clamp），超页宽时组名
-// 映射会静默回退裸组码（明细里看到「942」而非分类名）。循环取全量；40 页
-// 防御性上限（2000 文件）防后端 total 异常时无限翻页。
-const CRS_RULE_PAGE_SIZE = 50
-const CRS_RULE_MAX_PAGES = 40
-const fetchAllCrsRuleFiles = async (): Promise<CrsRuleFileOption[]> => {
-  const all: CrsRuleFileOption[] = []
-  for (let page = 1; page <= CRS_RULE_MAX_PAGES; page++) {
-    const res = await request.get<APIResponse<{ rules: CrsRuleFileOption[]; total?: number }>>(
-      `/security/crs/rules?page_size=${CRS_RULE_PAGE_SIZE}&page=${page}`,
-      { silent: true },
-    )
-    const rules = res.data?.rules ?? []
-    all.push(...rules)
-    const total = res.data?.total
-    if (rules.length < CRS_RULE_PAGE_SIZE) break
-    if (typeof total === 'number' && all.length >= total) break
-  }
-  return all
-}
-
+// CRS 文件清单全量分页取回走 utils/crsRuleFiles 单源（策略页同实现）。
 const ensureDetails = async (force = false): Promise<void> => {
   // force=用户点「重试」：即使已附着（部分源失败）也重拉；在途请求不叠加。
   if (detailLoading.value) return
@@ -751,8 +732,14 @@ const flowNodes = computed<FlowNode[]>(() => {
 // securityStages.stage1FootnoteText 单源给出（信任 DetectionOnly → 黑名单 →
 // 遗留黑名单 → 白名单外拒绝 → 爬虫校验 → 地域拦截）；原实现漏列遗留黑名单
 // （id:4 仍由 security.go 发射）与 v2.3.8 爬虫校验。
-const stage1Footnote = computed(() =>
-  stage1FootnoteText(props.policies.some((p) => p.policy_type === 'stage0' && p.enabled && p.ip_whitelist_enabled && p.trust_detection === true)))
+const stage1Footnote = computed(() => {
+  // 按本规则实际绑定链判定（model.stages[0] 的 group 键 = 绑定策略 id）：
+  // 按全部策略判定会在「本规则未绑 stage0、但别处存在保留检测策略」时误称
+  // 本规则存在检测降级路径。
+  const boundIds = new Set(props.model?.stages.find((stage) => stage.stage === 0)?.groups.map((group) => group.key) ?? [])
+  return stage1FootnoteText(props.policies.some((p) =>
+    boundIds.has(p.id) && p.policy_type === 'stage0' && p.enabled && p.ip_whitelist_enabled && p.trust_detection === true))
+})
 
 const stageSub = (stage: 1 | 2 | 3): string => stageSubLabel(stage)
 

@@ -113,3 +113,46 @@ func TestUpdateAPIKeyStatus_privilegeChangePassesWhenGuardOff(t *testing.T) {
 		t.Fatalf("audit detail=%q, want 含「只读：开→关」（boolOnOff 同族口径，非 %%t）", detail)
 	}
 }
+
+// 重新启用「启用后具备写/MCP 能力」的 Key 与「收回只读」对称，同走 step-up：
+// 禁用→启用会恢复可写/MCP 可达性，属授予动作。
+func TestUpdateAPIKeyStatus_enablingPrivilegedKeyRequiresStepUp(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	if _, err := db.DB.Exec("INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES (1,'admin','x','admin',1)"); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	// 两条禁用态 Key：可写（启用=授予）与只读（启用不构成特权变更）。
+	if _, err := db.DB.Exec("INSERT INTO api_keys (id,name,key_hash,key_prefix,created_by,is_enabled,read_only,mcp_enabled) VALUES (11,'w','h11','p',1,0,0,0)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec("INSERT INTO api_keys (id,name,key_hash,key_prefix,created_by,is_enabled,read_only,mcp_enabled) VALUES (12,'r','h12','p',1,0,1,0)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec("UPDATE users SET mfa_enabled=1, mfa_secret='JBSWY3DPEHPK3PXP' WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec("UPDATE global_config SET mfa_write_guard=1 WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = db.DB.Exec("UPDATE global_config SET mfa_write_guard=0 WHERE id=1") })
+
+	if rec := serveAPIKeyStatusUpdate(h, "11", `{"is_enabled":true}`); rec.Code != http.StatusPreconditionRequired {
+		t.Fatalf("启用可写 Key 必须要求 step-up: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := serveAPIKeyStatusUpdate(h, "12", `{"is_enabled":true}`); rec.Code == http.StatusPreconditionRequired {
+		t.Fatalf("启用只读 Key 不构成特权变更（不得 428）: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// 列表入口与创建/更新/删除三入口同形：缺认证上下文的调用必须 401，
+// 不得退化为 created_by=0 的孤儿行查询。
+func TestListCurrentUserAPIKeys_rejectsMissingAuthContext(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/v1/users/me/api-keys", nil)
+	h.ListCurrentUserAPIKeys(ctx)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s, want 401", rec.Code, rec.Body.String())
+	}
+}

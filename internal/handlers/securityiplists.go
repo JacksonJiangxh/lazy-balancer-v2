@@ -1408,6 +1408,10 @@ func (h *Handlers) tryIPListHotPathApply(c *gin.Context, tx *sql.Tx, listID int6
 			// + caddy_apply_error 标记 + 200 带告警（与 finishTxApply 同口径）。
 			if err := commitIPListTx(tx); err != nil {
 				restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
+				// 恢复失败=运行配置可能停留候选且 DB 已回滚——横幅必须落盘
+				// （看门狗只比对路由 @id，名单/证书变化不触发漂移->分叉不可见）。
+				// 本条 apply 已失败，不得补「重载」审计。
+				h.recordPostCommitRestoreFailure(err, restoreErr)
 				joined := errors.Join(err, restoreErr)
 				recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail(commitUncertainLabel, joined.Error(), services.AuditResultPart("failure")))
 				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + "：" + joined.Error()})
@@ -1429,6 +1433,9 @@ func (h *Handlers) tryIPListHotPathApply(c *gin.Context, tx *sql.Tx, listID int6
 		}
 		if err := commitIPListTx(tx); err != nil {
 			restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
+			// 强制 /load 已真实成功——「触发重载必须留痕」不因 commit 失败豁免。
+			recordAudit(c, "重载", "Caddy服务", services.FormatAuditDetail("IP 名单热路径证书物化，强制重载收敛", services.AuditResultPart("success")))
+			h.recordPostCommitRestoreFailure(err, restoreErr)
 			joined := errors.Join(err, restoreErr)
 			recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail(commitUncertainLabel, joined.Error(), services.AuditResultPart("failure")))
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + "：" + joined.Error()})

@@ -873,9 +873,11 @@ func (m *CAQueueManager) releaseZombieJob(jobID int, done <-chan struct{}) {
 	m.mu.Unlock()
 }
 
-// Enqueue 是测试夹具（仅测试使用）：生产入队一律走 EnqueueIfActive
-// （在途守卫 + 状态迁移）或内部 enqueueLocked。保留导出形态避免平行测试脚手架。
-func (m *CAQueueManager) Enqueue(providerID int, jobID int, ruleID, domains string) error {
+// EnqueueForTest 是测试夹具（名字即「生产禁止调用」）：生产入队一律走
+// EnqueueIfActive（在途守卫 + 状态迁移）或内部 enqueueLocked。注意本夹具
+// **不做** isJobActiveLocked 在途守卫（测试需要重复入队同一 jobID 构造场景），
+// 因此更不能被生产路径复用。
+func (m *CAQueueManager) EnqueueForTest(providerID int, jobID int, ruleID, domains string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if !m.active {
@@ -1230,6 +1232,10 @@ func (q *caQueue) tick() {
 	}
 
 	providerID := q.provider.ID
+	// 仅真实派发窗口查一次库（闸门已在上方用缓存快照判定，空队列/限流/并发满
+	// 都不查库）。此处不能移到锁外：派发与 pending 处置必须在同一临界区内完成，
+	// 移出后需以 CAS 复核 provider 版本与 running 计数，收益（单查询/次派发）
+	// 不抵并发不变量风险。
 	provider, err := loadCAProvider(providerID)
 	if err != nil || provider.ID != providerID {
 		pending := q.pending

@@ -48,7 +48,8 @@
           <template #default="{ row }">
             <!-- 失败 hover 长文案已撤（2026-09-25 用户裁定）：用户直接看更新日志，
                  状态标签自身已表达失败态 -->
-            <el-tag :type="libraryStatusTagType(row.status)" size="small" effect="light">{{ libraryStatusLabel(row.status) }}</el-tag>
+            <el-tag v-if="row.status" :type="libraryStatusTagType(row.status)" size="small" effect="light">{{ libraryStatusLabel(row.status) }}</el-tag>
+            <span v-else class="text-secondary">—</span>
           </template>
         </el-table-column>
         <el-table-column label="自动更新" width="90" align="center">
@@ -775,8 +776,11 @@ const libRows = computed<LibRow[]>(() => {
   // 威胁情报库与爬虫地址库共用「多源聚合成一行」单源
   // 与安全总览同一实现（utils/securityLibraries），空源/无版本为 never（未更新），
   // 不再折叠为 idle「已最新」。
+  // 零源也出占位行（状态「未配置」）：卡头健康标签已显示未配置，缺行会让用户
+  // 找不到该库的更新详情/排程入口（行消失=入口消失）。首次响应未落地前不出行。
   const summarize = (srcs: ThreatSource[]) => summarizeLibrarySources(srcs, formatDate)
-  if (threatLibError.value || threatSources.value.length > 0) {
+  if (threatLibError.value || threatLibLoaded.value) {
+    const configured = threatSources.value.length > 0
     const summary = threatLibError.value
       ? { totalEntries: 0, latestVersion: '', status: 'failed', lastChecked: '—', nextUpdate: '—' }
       : summarize(threatSources.value)
@@ -784,16 +788,17 @@ const libRows = computed<LibRow[]>(() => {
       key: 'threat', icon: Aim, iconClass: 'lib-icon--threat',
       name: '威胁情报库',
       sub: 'IP 威胁名单，可被黑名单策略引用',
-      version: summary.latestVersion || '未更新',
-      count: summary.totalEntries > 0 ? summary.totalEntries.toLocaleString() + ' 条' : '—',
-      status: summary.status,
+      version: configured ? (summary.latestVersion || '未更新') : '—',
+      count: configured && summary.totalEntries > 0 ? summary.totalEntries.toLocaleString() + ' 条' : '—',
+      status: threatLibError.value ? 'failed' : configured ? summary.status : 'not-configured',
       autoUpdate: threatAutoUpdate.value,
       autoUpdateKnown: threatLibLoaded.value && !threatLibError.value,
-      lastChecked: summary.lastChecked,
-      nextUpdate: summary.nextUpdate,
+      lastChecked: configured ? summary.lastChecked : '—',
+      nextUpdate: configured ? summary.nextUpdate : '—',
     })
   }
-  if (crawlerLibError.value || crawlerSources.value.length > 0) {
+  if (crawlerLibError.value || crawlerLibLoaded.value) {
+    const configured = crawlerSources.value.length > 0
     const summary = crawlerLibError.value
       ? { totalEntries: 0, latestVersion: '', status: 'failed', lastChecked: '—', nextUpdate: '—' }
       : summarize(crawlerSources.value)
@@ -801,13 +806,13 @@ const libRows = computed<LibRow[]>(() => {
       key: 'crawler', icon: Link, iconClass: 'lib-icon--crawler',
       name: '爬虫地址库',
       sub: 'Google/OpenAI/Bing/360 官方爬虫 IP 段',
-      version: summary.latestVersion || '未更新',
-      count: summary.totalEntries > 0 ? summary.totalEntries.toLocaleString() + ' 条' : '—',
-      status: summary.status,
+      version: configured ? (summary.latestVersion || '未更新') : '—',
+      count: configured && summary.totalEntries > 0 ? summary.totalEntries.toLocaleString() + ' 条' : '—',
+      status: crawlerLibError.value ? 'failed' : configured ? summary.status : 'not-configured',
       autoUpdate: crawlerAutoUpdate.value,
       autoUpdateKnown: crawlerLibLoaded.value && !crawlerLibError.value,
-      lastChecked: summary.lastChecked,
-      nextUpdate: summary.nextUpdate,
+      lastChecked: configured ? summary.lastChecked : '—',
+      nextUpdate: configured ? summary.nextUpdate : '—',
     })
   }
   return rows
@@ -1290,7 +1295,7 @@ const importEntriesFromText = (text: string): void => {
       : '文件中未解析到合法的 IP/CIDR 条目，已取消导入')
     return
   }
-  ElMessage.success(`导入完成：成功 ${success} 条，跳过 ${invalid + duplicate} 条（非法 ${invalid} / 重复 ${duplicate}）${tooLongNote}`)
+  mfaAwareSuccess(`导入完成：成功 ${success} 条，跳过 ${invalid + duplicate} 条（非法 ${invalid} / 重复 ${duplicate}）${tooLongNote}`)
 }
 
 const exportIpListEntries = (): void => {
@@ -1407,7 +1412,25 @@ const isValidRegex = (pattern: string): boolean => {
   return buildJSRegex(pattern).valid
 }
 
+// 正则预览编译结果按 pattern 记忆化：模板对同一条件同时求 class/text/isValid
+// （输入事件触发高频重渲染），原实现每次都做三段试编译。上限 50 条防长会话
+// 无界增长；编译只产出 i/m/s flag（无 g/y），RegExp 复用无 lastIndex 状态。
+const REGEX_PREVIEW_CACHE_LIMIT = 50
+const regexPreviewCache = new Map<string, { re: RegExp | null; valid: boolean }>()
+
 function buildJSRegex(pattern: string): { re: RegExp | null; valid: boolean } {
+  const cached = regexPreviewCache.get(pattern)
+  if (cached) return cached
+  const compiled = compileJSRegex(pattern)
+  if (regexPreviewCache.size >= REGEX_PREVIEW_CACHE_LIMIT) {
+    const oldest = regexPreviewCache.keys().next().value
+    if (oldest !== undefined) regexPreviewCache.delete(oldest)
+  }
+  regexPreviewCache.set(pattern, compiled)
+  return compiled
+}
+
+function compileJSRegex(pattern: string): { re: RegExp | null; valid: boolean } {
 	// +:合法性以后端 RE2(coraza)为准。
 	// RE2 支持:组合内联 flag(?im)/中置 flag(a(?i)b)/flag 组((?i:...))/
 	// 命名组((?P<name>))/flag 取反((?-i));不支持 lookaround/反向引用。

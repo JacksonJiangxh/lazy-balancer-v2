@@ -7,7 +7,6 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
-  SYSTEM_METRIC_LABELS,
   degradedMetricLabels,
   degradedMetricParts,
 } from '../src/utils/systemMetrics.ts'
@@ -19,7 +18,7 @@ test('降级分项解析：已知值成集、未知值忽略、顺序稳定', ()
   assert.deepEqual([...degradedMetricParts(['disk', 'cpu'])], ['disk', 'cpu'])
   assert.deepEqual([...degradedMetricParts(['cpu', 'gpu', 'cpu'])], ['cpu'], '未知分项忽略且去重')
   assert.deepEqual(degradedMetricLabels(['disk', 'memory']), ['内存', '磁盘'], '文案顺序固定为 cpu→memory→disk')
-  assert.deepEqual(degradedMetricLabels(['cpu']), [SYSTEM_METRIC_LABELS.cpu])
+  assert.deepEqual(degradedMetricLabels(['cpu']), ['CPU'])
 })
 
 test('分项成集语义：缺失/空=可用，CPU 失败不牵连内存/磁盘', () => {

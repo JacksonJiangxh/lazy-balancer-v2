@@ -532,3 +532,39 @@ func TestReadBoundedFile_boundedGenerationRead(t *testing.T) {
 		}
 	})
 }
+
+// 缓存被淘汰 + 文件消失（上次 reload 失败、运行配置仍旧）时 Evaluate 按未命中
+// 处理——黑名单方向 fail-open，且旧实现完全静默。该形态必须按路径节流上报，
+// 否则静默放行直到 reload 成功无任何痕迹。
+func TestIPListFast_reportsUnavailableWhenCacheEvictedAndFileGone(t *testing.T) {
+	disableStatThrottle(t)
+	dir := useAllowedDir(t)
+	path := writeListFile(t, dir, "unavailable.txt", []string{"203.0.113.7"})
+	op := newOp(t, path)
+	if !op.Evaluate(nil, "203.0.113.7") {
+		t.Fatal("初始加载判定错误")
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	EvictIPListCache(path)
+
+	var calls int
+	oldHook, oldInterval := OnListUnavailableServe, StaleServeLogInterval
+	OnListUnavailableServe = func(string, error) { calls++ }
+	StaleServeLogInterval = time.Minute
+	t.Cleanup(func() {
+		OnListUnavailableServe, StaleServeLogInterval = oldHook, oldInterval
+		clearStaleReport(path)
+	})
+
+	if op.Evaluate(nil, "203.0.113.7") {
+		t.Fatal("无缓存且文件消失必须按未命中（fail-open 方向）")
+	}
+	if op.Evaluate(nil, "203.0.113.7") {
+		t.Fatal("第二次判定仍按未命中")
+	}
+	if calls != 1 {
+		t.Fatalf("不可读告警次数=%d, want 1（按路径节流，不逐请求刷屏）", calls)
+	}
+}

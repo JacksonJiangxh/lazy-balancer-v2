@@ -737,22 +737,28 @@ func (snapshot *lbbakWafFileSnapshot) discard() {
 	}
 }
 
-// lbbakWafRollbackWarning 生成失败响应里的文件面提示。回退成功=明确告知文件
-// 已回到导入前状态；回退失败/未回退=显性告知文件与版本记录可能分裂，不得
-// 静默（空串=无需提示）。
-func lbbakWafRollbackWarning(filesLanded, restoreAttempted bool, restoreErr error) string {
+// lbbakWafRollbackWarning 生成失败响应里的文件面提示（三态判决，结论不得超出
+// 可断言范围）：
+//   - 确定回滚 + 文件已回退成功 → 明确告知文件与数据库一致；
+//   - 确定回滚 + 回退失败/未回退 → 显性告知文件与版本记录可能分裂（含原因）；
+//   - 数据库提交结果不确定（Commit 报错）→ 文件保持导入后状态（不回退）：既
+//     不断言一致也不断言分裂，给人工核对与收敛指引。
+//
+// 空串=无需提示（文件未落盘）。
+func lbbakWafRollbackWarning(filesLanded, restoreAttempted bool, restoreErr error, commitIndeterminate bool) string {
+	if !filesLanded {
+		return ""
+	}
+	if commitIndeterminate {
+		return "规则库文件已按备份落盘且保持导入后状态（未回退）——数据库提交结果不确定：若提交实际成功则文件与数据库一致，若实际未提交则文件与版本记录分叉，请核对规则库页版本后重新导入或触发规则库更新收敛"
+	}
 	switch {
 	case restoreAttempted && restoreErr != nil:
 		return "规则库文件已按备份落盘，数据库已回滚，但规则库文件回退失败: " + restoreErr.Error() + "——文件与版本记录可能分裂，请重新导入或触发规则库更新以收敛"
 	case restoreAttempted:
-		if !filesLanded {
-			return ""
-		}
 		return "规则库文件已按备份落盘，数据库已回滚——规则库文件已回退到导入前状态（文件与版本记录一致）"
-	case filesLanded:
-		return "规则库文件已按备份落盘，但数据库已回滚——文件与版本记录可能分裂，请重新导入或触发规则库更新以收敛"
 	}
-	return ""
+	return "规则库文件已按备份落盘，但数据库已回滚——文件与版本记录可能分裂，请重新导入或触发规则库更新以收敛"
 }
 
 // listLbbakThreatFiles 列出 WAF 目录内的威胁名单文件（threat-*.iplist 与其

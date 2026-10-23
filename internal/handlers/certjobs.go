@@ -415,20 +415,22 @@ func (h *Handlers) retryCertJobByID(c *gin.Context, id int) {
 	// 改为把部署窗口推到 now 并立即重排部署重试；仅「无材料」的此类任务
 	// （脏行）才回落重新签发。
 	if rescheduled, err := rescheduleDownloadedCertJobDeployment(id, ruleID, domain); err != nil {
-		if errors.Is(err, services.ErrCertificateDeploymentRetryBusy) {
-			c.JSON(http.StatusConflict, models.APIResponse{Code: http.StatusConflict, Message: "上一次部署回调仍在退出中，已登记自动部署，稍后自动执行"})
-			return
+		// 屏障/服务停止时窗口已推进：DB 文案必须如实描述「等待自动部署」，
+		// 与响应对齐；busy 不动文案（旧回调仍在跑，任务行保持原消息）。
+		if !errors.Is(err, services.ErrCertificateDeploymentRetryBusy) {
+			message := "手动重试未触发，等待自动部署"
+			if errors.Is(err, services.ErrCertificateDeploymentRetryBlocked) {
+				message = "手动重试未触发：规则证书操作被屏障阻塞，等待自动部署"
+			}
+			if _, updateErr := db.DB.Exec(`UPDATE cert_jobs SET message=?, updated_at=datetime('now') WHERE id=? AND status IN ('downloaded','cleanup_dns','cleanup_warning')`, message, id); updateErr != nil {
+				services.Logf("error", "Manual deployment retry message update failed for job %d: %v", id, updateErr)
+			}
 		}
-		if errors.Is(err, services.ErrCertificateQueueInactive) {
-			status, message := certEnqueueErrorResponse("部署重试未触发", err)
-			// 失败响应必须点明 DB 真实状态——部署窗口已
-			// 推进到 now，服务恢复后补扫会自动部署（不是「什么都没发生」）。
-			message += "；已登记自动部署，恢复后自动执行"
-			c.JSON(status, models.APIResponse{Code: status, Message: message})
-			return
+		statusCode, message := deploymentRetryFailureResponse(err)
+		if statusCode >= http.StatusInternalServerError {
+			services.Logf("error", "Manual deployment retry failed for job %d: %v", id, err)
 		}
-		services.Logf("error", "Manual deployment retry failed for job %d: %v", id, err)
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to enqueue retry; 已登记自动部署，稍后自动执行"})
+		c.JSON(statusCode, models.APIResponse{Code: statusCode, Message: message})
 		return
 	} else if rescheduled {
 		recordAudit(c, "重试", "证书任务", services.FormatAuditDetail(services.AuditJobPart(id), services.AuditRulePart(ruleID), domain, fmt.Sprintf("原状态：%s", status), services.AuditResultPart("deployment_retry")))
@@ -517,6 +519,22 @@ func (h *Handlers) retryCertJobByID(c *gin.Context, id int) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "Retry triggered"})
 }
 
+// deploymentRetryFailureResponse 把「手动触发部署重试」登记失败映射为
+// HTTP 状态与文案：busy/blocked/inactive 都是可行动冲突（窗口已推进、自动
+// 部署会接手），其余为 500。签发端点与证书任务重试端点共用本映射。
+func deploymentRetryFailureResponse(err error) (int, string) {
+	switch {
+	case errors.Is(err, services.ErrCertificateDeploymentRetryBusy):
+		return http.StatusConflict, "上一次部署回调仍在退出中，已登记自动部署，稍后自动执行"
+	case errors.Is(err, services.ErrCertificateDeploymentRetryBlocked):
+		return http.StatusConflict, "规则证书操作被屏障阻塞（规则正在删除或更新），已登记自动部署，请稍后重试"
+	case errors.Is(err, services.ErrCertificateQueueInactive):
+		status, message := certEnqueueErrorResponse("部署重试未触发", err)
+		return status, message + "；已登记自动部署，恢复后自动执行"
+	}
+	return http.StatusInternalServerError, "触发重新部署失败；已登记自动部署，稍后自动执行"
+}
+
 // rescheduleDownloadedCertJobDeployment 处理「证书材料已落库、只差部署」任务的
 // 部署重排快速路径：任务处于部署生命周期（JobLifecycle=downloaded，即
 // downloaded/cleanup_dns/cleanup_warning，与 requeueCanceledJob、启动恢复
@@ -534,7 +552,7 @@ func (h *Handlers) retryCertJobByID(c *gin.Context, id int) {
 func rescheduleDownloadedCertJobDeployment(id int, ruleID, domain string) (bool, error) {
 	reversedDomain := reversedCertJobDomain(domain)
 	result, err := db.DB.Exec(`UPDATE cert_jobs
-		SET deployment_available_after=datetime('now'), message='手动重试：等待恢复部署', updated_at=datetime('now')
+		SET deployment_available_after=datetime('now'), message='等待重新部署', updated_at=datetime('now')
 		WHERE id=? AND status IN ('downloaded','cleanup_dns','cleanup_warning')
 		  AND `+services.CertJobMaterialPredicateSQL("")+`
 		  AND EXISTS (
@@ -553,12 +571,14 @@ func rescheduleDownloadedCertJobDeployment(id int, ruleID, domain string) (bool,
 	}
 	// deployment_available_after=now 仍可供服务恢复后的补扫接管；但只有实际
 	// 登记了立即 timer 才允许上层报告「已触发」，停止/忙状态必须返回 409。
-	if err := services.RetryCertificateDeploymentNow(id, ruleID); err != nil {
+	// 经 certJobDeploymentRetryRegistrar 单点（生产=RetryCertificateDeploymentNow，
+	// 测试注入）——签发/重试/删除恢复三个入口共用同一登记缝。
+	if err := certJobDeploymentRetryRegistrar(id, ruleID); err != nil {
 		// 立即 timer 登记失败时上方 UPDATE 已把消息写成
 		// 「手动重试：等待恢复部署」，与 409/500 响应矛盾（报文说失败、DB 说
 		// 已重排）。窗口推进保留（启动恢复/周期补扫会接手，可用性收益不变），
 		// 文案改为如实描述自动接管；响应侧同步点明「已登记自动部署」。
-		if _, updateErr := db.DB.Exec(`UPDATE cert_jobs SET message=?, updated_at=datetime('now') WHERE id=? AND status IN ('downloaded','cleanup_dns','cleanup_warning')`, "手动重试未触发，等待自动部署", id); updateErr != nil {
+		if _, updateErr := db.DB.Exec(`UPDATE cert_jobs SET message=?, updated_at=datetime('now') WHERE id=? AND status IN ('downloaded','cleanup_dns','cleanup_warning')`, "部署重试未触发，等待自动部署", id); updateErr != nil {
 			return true, errors.Join(err, updateErr)
 		}
 		return true, err
@@ -588,8 +608,10 @@ func certJobRetryCooldown(status string) (time.Duration, bool) {
 func certJobRetryBlocked(status string, updatedAt, createdAt sql.NullTime, now time.Time) (bool, int, string) {
 	cooldown, retryable := certJobRetryCooldown(status)
 	if !retryable {
-		// 永久条件不得用 429（SDK/前端会按限流退避轮询）。
-		return true, http.StatusConflict, "已退役的证书任务不能重试"
+		// 永久条件不得用 429（SDK/前端会按限流退避轮询）。规则仍启用但任务行
+		// 已退役（历史残留/脏快照）时，唯一恢复路径是让规则重新解析证书任务：
+		// 文案必须给出可执行指引，而不是让用户以为需要等冷却。
+		return true, http.StatusConflict, "已退役的证书任务不能重试；请先禁用再启用该规则以重新创建签发任务"
 	}
 	// cert_jobs.updated_at 在 DDL 中可空（行/带外插入可
 	// 为 NULL），此前 NULL 直接放行冷却门（fail-open）——连点可连续绕过 15/5
@@ -637,6 +659,11 @@ func certJobCAcooldownMessage(availableAfter time.Time) string {
 func reversedCertJobDomain(domain string) string {
 	return services.ReversedCertJobDomain(domain)
 }
+
+// certJobDeploymentRetryRegistrar 是「登记立即部署重试」的入口。生产恒为
+// services.RetryCertificateDeploymentNow；测试缝用于断言删除失败恢复路径
+// 确实重新登记了部署（删除路径已取消挂起的 timer）。
+var certJobDeploymentRetryRegistrar = services.RetryCertificateDeploymentNow
 
 // certJobDeleteGuard 返回该状态任务在关联规则仍处自动签发状态时是否受 409
 // 守卫及对应文案。disabled 是已退出自动签发链的唯一可删除状态；其余状态
@@ -791,6 +818,7 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 	}
 	h.caddyOpMu.Unlock()
 	cancelCertJob(id)
+	deploymentRegistrationPending := false
 	if err != nil {
 		deleteErr := err
 		// 失败恢复重取 caddyOpMu：恢复写与 EnableRule 的 EnableCertJobCreate
@@ -817,14 +845,17 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 			// （downloaded/cleanup_dns/cleanup_warning）+ 证书材料的任务停在部署
 			// 窗口——转 'queued' 会丢弃已签发证书并触发整轮重签（Issue 快速路径
 			// 只认 issued/downloaded）。原地恢复 'downloaded' 并把重试窗口推到
-			// now，Resume 的 rescanDroppedDeploymentRetries 会统一重新调度部署
-			//（cleanup_* 归一为 downloaded 与补偿重排队同一取向）。
+			// now；删除路径的 cancelCertJob 已取消挂起的部署 timer，恢复成功后
+			// 必须显式重新登记立即部署（见下方 deploymentRegistrationPending），
+			// 登记失败由启动恢复/周期补扫兜底。
 			// 恢复带 status='disabled' 守卫——行在删除窗口
 			// 内被并发移离 disabled 时不得覆写其新状态；命中 0 行并入 deleteErr。
 			if res, restoreErr := db.DB.Exec("UPDATE cert_jobs SET status='downloaded', deployment_available_after=datetime('now'), message='删除失败，等待恢复部署', updated_at=datetime('now') WHERE id=? AND status='disabled'", id); restoreErr != nil {
 				deleteErr = errors.Join(deleteErr, restoreErr)
 			} else if n, _ := res.RowsAffected(); n == 0 {
 				deleteErr = errors.Join(deleteErr, fmt.Errorf("任务 %d 已被并发移离 disabled，恢复已跳过", id))
+			} else {
+				deploymentRegistrationPending = true
 			}
 		} else if status == "issued" || status == "failed" {
 			// 同上方守卫口径。
@@ -879,8 +910,16 @@ func (h *Handlers) DeleteCertJob(c *gin.Context) {
 				services.WakeCertWaitingCAForEnqueuedJob()
 			}
 		}
-		services.Logf("error", "DeleteCertJob failed for job %d: %v", id, deleteErr)
 		h.caddyOpMu.Unlock()
+		// 登记在 caddyOpMu 之外执行：scheduleDeploymentRetry 可能对在途部署
+		// 回调做有界等待，持全局锁会拖住规则/配置写与 Caddy 启停。
+		if deploymentRegistrationPending {
+			if retryErr := certJobDeploymentRetryRegistrar(id, ruleID); retryErr != nil {
+				// 窗口已推进，启动恢复/周期补扫会接手；留痕并如实并入 500 明细。
+				deleteErr = errors.Join(deleteErr, fmt.Errorf("自动部署登记失败（窗口已推进，周期补扫将接手）: %w", retryErr))
+			}
+		}
+		services.Logf("error", "DeleteCertJob failed for job %d: %v", id, deleteErr)
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to delete job"})
 		return
 	}
@@ -926,15 +965,13 @@ func (h *Handlers) GetCertJobLogs(c *gin.Context) {
 	}
 
 	logPath := certJobLogPathForRule(ruleID)
-	// （2026-09-05 证书域审计裁定）：按旧→新拼接全部轮转备份再加当前文件
-	//（.5 最旧 → .1 最新，对齐写侧 maxRotatedFiles=5），每文件保留 128KB/500 行
-	// 截断；缺失的备份序号按空跳过。
-	content := prependTaskLogRotations(logPath, readCertJobLogFile(logPath), certJobLogMaxRotatedBackups)
+	// 按旧→新拼接轮转备份与当前文件（.5 最旧 → .1 最新，对齐写侧
+	// maxRotatedFiles=5），每文件保留 128KB/500 行截断；但读取预算收敛到
+	// 响应上限：从最新文件开始累计，达到 256KB 即停止读更旧文件（更旧内容
+	// 必然落在尾窗之外，读了也会被裁掉）。此前 6 次读 ≈768KB/请求，100 个
+	// 失败任务刷新一轮即 ~600 次读、~76MB IO。
+	content, truncated := readCertJobLogTail(logPath, certJobLogMaxRotatedBackups, certJobLogsMaxResponseBytes)
 
-	// 单响应硬上限（尾窗）：6 份 × 128KB ≈ 768KB 会让「100 个失败任务刷一轮」
-	// 产生 ~76MB 出流量与 600 次文件读。保留最近 256KB 并显式标注 truncated，
-	// 前端据此提示「仅显示最近部分」。写侧轮转保留份数不变（写侧契约）。
-	truncated := false
 	if len(content) > certJobLogsMaxResponseBytes {
 		content = content[len(content)-certJobLogsMaxResponseBytes:]
 		// 丢弃首个残行：截断点落在行中间时首个片段不是完整日志行。
@@ -942,10 +979,45 @@ func (h *Handlers) GetCertJobLogs(c *gin.Context) {
 			content = content[idx+1:]
 		}
 		truncated = true
+	}
+	if truncated {
 		content = "[日志过长，仅显示最近 256KB]\n" + content
 	}
 
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]interface{}{"content": content, "truncated": truncated}})
+}
+
+// readCertJobLogTail 从最新（活动文件 → .1 → .2 …）逐份读取，累计达到
+// budget 后停止——更旧的轮转内容只可能落在响应尾窗之外。返回值按最旧→最新
+// 顺序拼接；truncated 表示确有更旧内容未读取（存在被跳过的备份文件）。
+func readCertJobLogTail(path string, maxBackups, budget int) (string, bool) {
+	newestFirst := make([]string, 0, maxBackups+1)
+	newestFirst = append(newestFirst, readCertJobLogFile(path))
+	total := len(newestFirst[0])
+	truncated := false
+	for i := 1; i <= maxBackups; i++ {
+		if total >= budget {
+			for j := i; j <= maxBackups; j++ {
+				if _, err := os.Stat(fmt.Sprintf("%s.%d", path, j)); err == nil {
+					truncated = true
+					break
+				}
+			}
+			break
+		}
+		backup := readCertJobLogFile(fmt.Sprintf("%s.%d", path, i))
+		if backup == "" {
+			continue
+		}
+		newestFirst = append(newestFirst, backup)
+		total += len(backup)
+	}
+	var builder strings.Builder
+	builder.Grow(total)
+	for i := len(newestFirst) - 1; i >= 0; i-- {
+		builder.WriteString(newestFirst[i])
+	}
+	return builder.String(), truncated
 }
 
 // prependTaskLogRotations 按 maxBackups 把 .1～.N 逐代前置到活动日志

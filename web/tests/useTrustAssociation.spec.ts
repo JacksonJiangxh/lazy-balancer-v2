@@ -76,6 +76,13 @@ const reset = (): { posts: PostRecord[]; puts: PutRecord[]; confirmArgs: unknown
 
 const callsOf = (fn: string): RecordedCall[] => g.__calls.filter((call) => call.fn === fn)
 
+/** 新建载荷中的名单名（载荷形状不符即硬失败，避免断言空转）。 */
+const assertCreatedListName = (post: PostRecord | undefined): string => {
+  assert.ok(post, '必须发起创建请求')
+  assert.ok(post.body && typeof post.body === 'object' && 'name' in post.body, '创建载荷必须带 name')
+  return String(post.body.name)
+}
+
 test('同侧列表解析：按引用逐列表返回、排除系统内置名单、缺失计数归零', () => {
   reset()
   const { resolveSideLists } = useTrustAssociation({ getList: () => lists })
@@ -189,7 +196,7 @@ test('新建路径关联失败：名单已带 IP、未被引用，不留「被�
 
 test('同名未引用列表复用而非重复创建（仍关联并加入）', async () => {
   const { posts, puts } = reset()
-  const sameName = [...lists, { id: 77, name: '策略 A-信任' }]
+  const sameName = [...lists, { id: 77, name: '策略 A-信任', ref_policies: [] }]
   const { ensureListAndJoin } = useTrustAssociation({ getList: () => sameName })
   await ensureListAndJoin({ id: 5, name: '策略 A', ip_whitelist_refs: '' }, '203.0.113.9', 'trust')
   assert.deepEqual(posts, [{ url: '/security/ip-lists/77/ips', body: { value: '203.0.113.9' } }], '不得重复创建同名列表')
@@ -202,12 +209,81 @@ test('同名未引用列表复用而非重复创建（仍关联并加入）', as
 // 换来一条 409 且本次加入不发生（弹框一次性，无改用既有名单的出口）。
 test('同名判据与后端同口径：仅 ASCII 大小写不同也复用既有名单', async () => {
   const { posts, puts } = reset()
-  const existing = [...lists, { id: 77, name: 'demo-白名单' }]
+  const existing = [...lists, { id: 77, name: 'demo-白名单', ref_policies: [] }]
   const { ensureListAndJoin } = useTrustAssociation({ getList: () => existing })
   await ensureListAndJoin({ id: 5, name: 'DEMO', ip_acl_list_refs: '' }, '203.0.113.9', 'allow')
   assert.equal(posts.filter((post) => post.url === '/security/ip-lists').length, 0, '不得再创建（后端会 409）')
   assert.deepEqual(posts, [{ url: '/security/ip-lists/77/ips', body: { value: '203.0.113.9' } }])
   assert.deepEqual(puts, [{ url: '/security/policies/5', body: { ip_acl_list_refs: '[77]' } }])
+})
+
+// 策略名可重复（后端无唯一约束）且超长策略名截断后可能投影到同一自动名——
+// 按名字直接复用会让两个策略共享同一份名单：B 的处置改写 A 的拦截/放行面，
+// A 后续增删条目又反向影响 B。复用范围收敛为「未被其它引用面引用」。
+test('同名名单已被其它策略引用：不复用，改为创建本策略限定名的名单', async () => {
+  const { posts, puts, confirmArgs } = reset()
+  const existing = [
+    ...lists,
+    { id: 77, name: '策略 A-信任', ref_policies: [{ id: 9, name: '同名策略' }] },
+  ]
+  const { ensureListAndJoin } = useTrustAssociation({ getList: () => existing })
+  await ensureListAndJoin({ id: 5, name: '策略 A', ip_whitelist_refs: '' }, '203.0.113.9', 'trust')
+  assert.equal(
+    posts.filter((post) => post.url === '/security/ip-lists/77/ips').length,
+    0,
+    '不得把本策略的条目写进其它策略引用的名单',
+  )
+  const created = posts.find((post) => post.url === '/security/ip-lists')
+  assert.equal(assertCreatedListName(created), '策略 A-信任#5', '限定名以策略 id 区分同名策略')
+  assert.match(String(confirmArgs[0][0]), /策略 A-信任#5/, '确认文案必须与实际创建的名单名一致')
+  assert.deepEqual(puts, [{ url: '/security/policies/5', body: { ip_whitelist_refs: '[42]' } }])
+})
+
+test('同名名单仅被本策略引用：仍然复用（补关联并加入）', async () => {
+  const { posts, puts } = reset()
+  const existing = [
+    ...lists,
+    { id: 77, name: '策略 A-信任', ref_policies: [{ id: 5, name: '策略 A' }] },
+  ]
+  const { ensureListAndJoin } = useTrustAssociation({ getList: () => existing })
+  await ensureListAndJoin({ id: 5, name: '策略 A', ip_whitelist_refs: '' }, '203.0.113.9', 'trust')
+  assert.deepEqual(posts, [{ url: '/security/ip-lists/77/ips', body: { value: '203.0.113.9' } }])
+  assert.deepEqual(puts, [{ url: '/security/policies/5', body: { ip_whitelist_refs: '[77]' } }])
+})
+
+test('同名名单被受信代理网段引用：不复用（写入会改全局代理信任范围）', async () => {
+  const { posts } = reset()
+  const existing = [
+    ...lists,
+    { id: 77, name: '策略 A-信任', ref_policies: [], trusted_proxy_referenced: true },
+  ]
+  const { ensureListAndJoin } = useTrustAssociation({ getList: () => existing })
+  await ensureListAndJoin({ id: 5, name: '策略 A', ip_whitelist_refs: '' }, '203.0.113.9', 'trust')
+  assert.equal(posts.filter((post) => post.url === '/security/ip-lists/77/ips').length, 0)
+  const created = posts.find((post) => post.url === '/security/ip-lists')
+  assert.equal(assertCreatedListName(created), '策略 A-信任#5')
+})
+
+test('引用视图缺失时不得假设「未被引用」：按不可复用处理', async () => {
+  const { posts } = reset()
+  const existing = [...lists, { id: 77, name: '策略 A-信任' }]
+  const { ensureListAndJoin } = useTrustAssociation({ getList: () => existing })
+  await ensureListAndJoin({ id: 5, name: '策略 A', ip_whitelist_refs: '' }, '203.0.113.9', 'trust')
+  const created = posts.find((post) => post.url === '/security/ip-lists')
+  assert.equal(assertCreatedListName(created), '策略 A-信任#5')
+})
+
+test('限定名同样被占用：继续递增直到可用', async () => {
+  const { posts } = reset()
+  const existing = [
+    ...lists,
+    { id: 77, name: '策略 A-信任', ref_policies: [{ id: 9, name: '同名策略' }] },
+    { id: 78, name: '策略 A-信任#5', ref_policies: [{ id: 10, name: '另一策略' }] },
+  ]
+  const { ensureListAndJoin } = useTrustAssociation({ getList: () => existing })
+  await ensureListAndJoin({ id: 5, name: '策略 A', ip_whitelist_refs: '' }, '203.0.113.9', 'trust')
+  const created = posts.find((post) => post.url === '/security/ip-lists')
+  assert.equal(assertCreatedListName(created), '策略 A-信任#5-2')
 })
 
 test('非 ASCII 大小写仍视为不同名单（SQLite LOWER 只折叠 ASCII）', async () => {

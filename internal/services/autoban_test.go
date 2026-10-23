@@ -418,6 +418,34 @@ func TestAutobanSetConfig_resetsCountersOnWindowOrScopeChange(t *testing.T) {
 	}
 }
 
+// 仅改阈值：保留计数桶，但 Reached 标记必须按新阈值重算——否则调低阈值后
+// 一个窗口内 /status「达阈值 M 个」与过期摘要仍按旧阈值（观察模式下用户
+// 误以为调低无效）。
+func TestAutobanSetConfig_recomputesReachedOnThresholdChange(t *testing.T) {
+	installAutobanFixture(t, "2026-10-14 10:00:00")
+	setAutobanConfigRaw(t, true, 5, 5, "1h", "all", true)
+	for range 3 {
+		autobanObserveEvent("203.0.113.9", "blocked", "942100")
+	}
+	if got := autobanReachedCount(); got != 0 {
+		t.Fatalf("reached=%d, want 0（3 次 < 阈值 5）", got)
+	}
+	// 调低阈值到 2：既有计数桶不丢，Reached 立即按新阈值成立
+	if err := SetAutobanConfig(AutobanConfig{Enabled: true, Threshold: 2, WindowMinutes: 5, Duration: "1h", Scope: "all", DryRun: true}); err != nil {
+		t.Fatalf("SetAutobanConfig: %v", err)
+	}
+	if got := autobanReachedCount(); got != 1 {
+		t.Fatalf("reached=%d, want 1（调低阈值后已达标 IP 必须立即计入）", got)
+	}
+	// 调高阈值到 10：同一计数桶回落到未达标
+	if err := SetAutobanConfig(AutobanConfig{Enabled: true, Threshold: 10, WindowMinutes: 5, Duration: "1h", Scope: "all", DryRun: true}); err != nil {
+		t.Fatalf("SetAutobanConfig raise: %v", err)
+	}
+	if got := autobanReachedCount(); got != 0 {
+		t.Fatalf("reached=%d, want 0（调高阈值后不得继续多报）", got)
+	}
+}
+
 func TestAutobanSetConfig_syncsEngineLoop(t *testing.T) {
 	// Given：autoban 业务关闭、调度关闭。
 	te := newWireTestEngine(t)

@@ -90,9 +90,11 @@ func TestClusterVersionMiddleware_loginFailClosedIsMasterOnly(t *testing.T) {
 			t.Fatalf("从节点 %s status=%d body=%q, want 204（从端 fail-closed 无保护收益）", path, code, body)
 		}
 	}
-	// 回归：从端其他同步写仍 fail-closed 500（触发器降级保护面不缩）
-	if code, body := serveStatus(router, http.MethodPost, "/api/v1/rules"); code != http.StatusInternalServerError {
-		t.Fatalf("从节点 rules 同步写 status=%d body=%q, want fail-closed 500", code, body)
+	// 从端其他同步写交给下游守卫，不再由本中间件 500：降级态在从端零保护
+	// 收益（触发器 WHEN 仅主节点），500 会遮蔽「从节点只读」真因。本测试的
+	// 链上没有 readOnlyGuard，故表现为放行到 handler（真实链路由其给 403）。
+	if code, body := serveStatus(router, http.MethodPost, "/api/v1/rules"); code != http.StatusNoContent {
+		t.Fatalf("从节点 rules 同步写 status=%d body=%q, want 204（交下游角色守卫）", code, body)
 	}
 
 	// Given 主节点

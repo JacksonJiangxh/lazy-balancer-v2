@@ -718,3 +718,32 @@ func TestRuntimeLogCleanupOnce_countsAppMetadataFailures(t *testing.T) {
 		t.Fatalf("无法判定过期的副本不得被删除: %v", err)
 	}
 }
+
+// Close 必须弃句柄：关停顺序/热切换中 Close 先于最后几条日志时，后续 Write
+// 不得命中 file already closed（标准 log 会丢该错误 → 静默丢日志），须自愈重开。
+func TestRotatingFileWriter_Write_reopensAfterExplicitClose(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "runtime.log")
+	writer, err := NewRotatingFileWriter(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = writer.Close() })
+	oldSizeMB := runtimeLogSizeMB.Load()
+	runtimeLogSizeMB.Store(100)
+	t.Cleanup(func() { runtimeLogSizeMB.Store(oldSizeMB) })
+
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	n, err := writer.Write([]byte("after-close\n"))
+	if err != nil || n != len("after-close\n") {
+		t.Fatalf("Close 后 Write n=%d err=%v, want 自愈重开", n, err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "after-close\n") {
+		t.Fatalf("log content=%q, want after-close entry", data)
+	}
+}

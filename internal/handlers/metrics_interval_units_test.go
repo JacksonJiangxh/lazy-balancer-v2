@@ -89,4 +89,10 @@ func TestGetMetricsHistory_miniteWindowKeepsRecentData(t *testing.T) {
 	if time.Since(last) > 60*time.Second {
 		t.Fatalf("最新桶 %v 距 now %v——30m 窗口不得静默丢弃最近数据（最旧 720 桶形态）", last, time.Since(last))
 	}
+	// 窗口覆盖门：桶宽向下取整（1800/720=2）会只覆盖 1440s，最旧段静默缺失
+	// 20%。上取整（3s）后最旧桶起点必须落在 now-30m 的一个桶宽内。
+	windowStart := time.Now().UTC().Add(-30 * time.Minute)
+	if delta := resp.Data[0].Timestamp.Sub(windowStart); delta < -5*time.Second || delta > 5*time.Second {
+		t.Fatalf("最旧桶 %v 距窗口起点 %v 偏差 %v——非 720 整除窗口必须覆盖全程", resp.Data[0].Timestamp, windowStart, delta)
+	}
 }

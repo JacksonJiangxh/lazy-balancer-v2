@@ -169,6 +169,7 @@
       >
         <template #title>
           <span>{{ applyErrorBanner }}</span>
+          <div v-if="backgroundApplyErrorBanner" class="polling-error-meta error-banner-meta">另有后台重载失败：{{ backgroundApplyErrorBanner }}</div>
         </template>
       </el-alert>
 
@@ -281,6 +282,7 @@ const configDriftSince = ref('')
 // 「快照已提交但运行配置未收敛」分叉的唯一全局信号）。此前两者都只在
 // 仪表盘以标签呈现，非仪表盘页面与从节点完全不可见。
 const applyErrorBanner = ref('')
+const backgroundApplyErrorBanner = ref('')
 const applyErrorBannerKind = ref<'error' | 'warning'>('error')
 const restarting = ref(false)
 let disposed = false
@@ -296,6 +298,9 @@ const fetchDriftStatus = async () => {
     const applyErr = res.data?.apply_error || ''
     const bgErr = res.data?.background_apply_error || ''
     applyErrorBanner.value = applyErr || bgErr
+    // 两者触发源不同且 apply_error 仅在下一次成功保存时清空：并存时后台失败
+    // 必须单独成行，否则在 apply_error 清空前完全不可见（从节点同步重载失败即此类）。
+    backgroundApplyErrorBanner.value = applyErr ? bgErr : ''
     applyErrorBannerKind.value = applyErr ? 'error' : 'warning'
   } catch {
     // 状态查询失败静默——网络层错误已有全局处理

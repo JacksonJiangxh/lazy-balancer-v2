@@ -16,12 +16,16 @@ import (
 func TestRefreshLocation_updates_current_location_without_mutating_timeLocal(t *testing.T) {
 	// Given
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
+	oldCurrent := db.GetDB()
 	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatalf("initialize database: %v", err)
 	}
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		// 后台刷新链读 currentDB（db.GetDB），Close 已置 nil——只恢复 db.DB 会
+		// 让时区 worker 在 nil 句柄上空转（与 initServicesDB 同构）。
+		db.SetDB(oldCurrent)
 	})
 	if _, err := db.DB.Exec("UPDATE global_config SET timezone='UTC' WHERE id=1"); err != nil {
 		t.Fatalf("set timezone: %v", err)
@@ -198,12 +202,16 @@ func TestApplyLogLevel_refreshesTimezoneImmediately(t *testing.T) {
 		StartTimezoneRefresh(context.Background())
 	})
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
+	oldCurrent := db.GetDB()
 	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatalf("initialize database: %v", err)
 	}
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		// 后台刷新链读 currentDB（db.GetDB），Close 已置 nil——只恢复 db.DB 会
+		// 让时区 worker 在 nil 句柄上空转（与 initServicesDB 同构）。
+		db.SetDB(oldCurrent)
 	})
 	if _, err := db.DB.Exec("UPDATE global_config SET timezone='America/New_York' WHERE id=1"); err != nil {
 		t.Fatalf("set timezone: %v", err)
@@ -384,12 +392,16 @@ func TestApplyLogLevel_logsReadFailureOnceAndRecovers(t *testing.T) {
 		_ = ConfigureLogLevel("info")
 	})
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
+	oldCurrent := db.GetDB()
 	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatalf("initialize database: %v", err)
 	}
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		// 后台刷新链读 currentDB（db.GetDB），Close 已置 nil——只恢复 db.DB 会
+		// 让时区 worker 在 nil 句柄上空转（与 initServicesDB 同构）。
+		db.SetDB(oldCurrent)
 	})
 	metricsStateMu.Lock()
 	metricsStateFailed = map[string]bool{}

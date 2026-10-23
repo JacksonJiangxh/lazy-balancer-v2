@@ -61,7 +61,13 @@ test('证书队列拉取接入轮询 AbortSignal', () => {
 test('任务详情历史与日志加载失败显性化', () => {
   const text = source('src/views/settings/TaskMonitor.vue')
   // 消费点：失败态必须真的渲染出来（原断言只查符号出现——删掉模板分支仍绿）
-  assert.match(text, /<el-alert v-if="detailHistoryError" type="error"[\s\S]{0,120}?title="运行历史加载失败/)
+  // 单标签元素（自闭合）：用「标签内属性」结构边界（[^>]* 不会跨出标签），
+  // 不再用定长 [\s\S]{0,120} 窗口——模板改个属性顺序即假红。
+  assert.match(
+    text,
+    /<el-alert v-if="detailHistoryError"[^>]*type="error"[^>]*title="运行历史加载失败/,
+    '运行历史失败必须是带标题的 error 级告警',
+  )
   assert.match(text, /<span v-if="logsLoadError"[^>]*>日志加载失败，自动重试中<\/span>/)
   // 置位路径：详情历史只在最新详情序号下置位，日志失败由轮询 onError 置位
   const detail = section(text, 'const openDetail', '// ===== 日志抽屉')
@@ -378,7 +384,9 @@ test('/admin-tls 读取失败显性化并提供重试', () => {
   const load = section(page, 'const loadAdminTls = async', 'const retryLoadAdminTls')
   assert.match(load, /catch \{\n    adminTlsLoadFailed\.value = true/)
   assert.match(page, /const retryLoadAdminTls = \(\): void => \{ void loadAdminTls\(\) \}/)
-  assert.match(page, /v-else-if="adminTlsLoadFailed"[\s\S]{0,400}retryLoadAdminTls/, '开关旁必须有错误文案与重试入口')
+  const failedBlock = section(page, '<template v-else-if="adminTlsLoadFailed">', '</template>')
+  assert.match(failedBlock, /TLS 配置读取失败/, '开关旁必须有错误文案')
+  assert.match(failedBlock, /@click="retryLoadAdminTls"/, '开关旁必须有重试入口')
 })
 
 test('兜底提醒不承诺不会发生的自动跳转', () => {

@@ -95,38 +95,61 @@ var OnStaleServe = func(path string, err error) {
 	log.Printf("WARNING: IP 名单 %q 重建失败，继续按最近一次成功加载的集合判定（fail-stale）: %v", path, err)
 }
 
-// StaleServeLogInterval 是同一路径 fail-stale 上报的最小间隔（默认 1 分钟；
+// OnListUnavailableServe 是「名单不可读且无缓存集合」的观测钩子：Evaluate
+// 在该形态返回未命中（黑名单方向=放行、信任面=无来源），唯一可见性就是本
+// 告警。与 fail-stale 分开：文案不得声称「继续按旧集合判定」（此时没有旧集合）。
+var OnListUnavailableServe = func(path string, err error) {
+	log.Printf("WARNING: IP 名单 %q 不可读且无缓存集合，本次判定按未命中处理（等待文件恢复或重载）: %v", path, err)
+}
+
+// StaleServeLogInterval 是同一路径同类上报的最小间隔（默认 1 分钟；
 // 0=不节流，测试用）。恢复成功后清除节流记录——再次故障即时上报。
 var StaleServeLogInterval = time.Minute
 
+// staleReports.last 的键是 "kind|path"：fail-stale 与「无缓存不可读」各自
+// 独立节流（同路径可能先不可读后回退到旧集合）。
 var staleReports = struct {
 	sync.Mutex
-	last map[string]int64 // path → 上次上报的单调读数（monotonicNowNano）
+	last map[string]int64 // kind|path → 上次上报的单调读数（monotonicNowNano）
 }{last: make(map[string]int64)}
 
-// reportStaleServe 按路径节流后调用 OnStaleServe。
-func reportStaleServe(path string, err error) {
-	hook := OnStaleServe
+// reportServeThrottled 按（种类, 路径）节流后调用对应钩子。
+func reportServeThrottled(kind, path string, err error, hook func(string, error)) {
 	if hook == nil {
 		return
 	}
+	key := kind + "|" + path
 	if StaleServeLogInterval > 0 {
 		now := monotonicNowNano()
 		staleReports.Lock()
-		if last, ok := staleReports.last[path]; ok && time.Duration(now-last) < StaleServeLogInterval {
+		if last, ok := staleReports.last[key]; ok && time.Duration(now-last) < StaleServeLogInterval {
 			staleReports.Unlock()
 			return
 		}
-		staleReports.last[path] = now
+		staleReports.last[key] = now
 		staleReports.Unlock()
 	}
 	hook(path, err)
 }
 
-// clearStaleReport 清除路径的节流记录（成功加载后调用）。
+// reportStaleServe 按路径节流后调用 OnStaleServe。
+func reportStaleServe(path string, err error) {
+	reportServeThrottled("stale", path, err, OnStaleServe)
+}
+
+// reportListUnavailableServe 按路径节流后调用 OnListUnavailableServe。
+func reportListUnavailableServe(path string, err error) {
+	reportServeThrottled("unavailable", path, err, OnListUnavailableServe)
+}
+
+// clearStaleReport 清除路径的全部节流记录（成功加载后调用）。
 func clearStaleReport(path string) {
 	staleReports.Lock()
-	delete(staleReports.last, path)
+	for key := range staleReports.last {
+		if strings.HasSuffix(key, "|"+path) {
+			delete(staleReports.last, key)
+		}
+	}
 	staleReports.Unlock()
 }
 
@@ -539,7 +562,12 @@ func (op *ipListFastOperator) Evaluate(_ plugintypes.TransactionState, value str
 	addr = addr.Unmap()
 	state, err := resolveIPListFile(op.path)
 	if err != nil {
-		return false // 从未成功加载过（理论上构建期已拦截）——按未命中
+		// 从未成功加载过（构建期本应拦截）——按未命中处理，但该分支方向是
+		// fail-open（黑名单=放行）且旧实现完全静默：缓存被淘汰 + 文件消失
+		// （Reload 失败的窗口）下每次判定都会静默放行。按路径节流上报，
+		// 把「构建期已拦截」的假设变成可观测断言。
+		reportListUnavailableServe(op.path, err)
+		return false
 	}
 	set := state.v4
 	if addr.Is6() {

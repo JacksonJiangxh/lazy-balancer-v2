@@ -159,13 +159,16 @@ for module in "${modules[@]}"; do
   (cd "$module" && go test ./... -count=1)
 done
 
-# 镜像构建等价性冒烟：镜像内是 CGO_ENABLED=0 GOOS=linux 交叉编译，与本地
-# go test 的构建参数不同（平台/cgo 相关代码路径不进测试面）。四个嵌套模块由
-# xcaddy 在镜像内以同一组参数编译插件，其 linux-only 编译错误（构建标签/
-# syscall/cgo 分支）此前只在发版构建暴露——按模块清单逐个交叉编译。
+# 交叉编译等价性（不是「镜像构建等价性」）：验证 GOOS=linux CGO_ENABLED=0
+# 这组构建参数下代码可编译——平台/cgo 相关代码路径不进本地测试面，四个嵌套
+# 模块由 xcaddy 在镜像内以同一组参数编译插件，其 linux-only 编译错误（构建
+# 标签/syscall/cgo 分支）此前只在发版构建暴露。
+# 注意工具链版本面未被本门覆盖：镜像基础阶段是 golang:1.26.9-alpine +
+# GOTOOLCHAIN=local，本门用宿主 go（可能更新）。误用新版 stdlib API 只会在
+# 发版构建暴露——发版前置步骤须以镜像工具链跑一次 go build（见发布流程）。
 # 根模块是 main 包，产物丢 /dev/null；嵌套模块用 go install 配临时 GOBIN，
 # 不落仓库（库模块本不产二进制，未来出现 main 包也不会污染工作树）。
-echo "== image-build equivalence (GOOS=linux CGO_ENABLED=0 go build) =="
+echo "== cross-build equivalence (GOOS=linux CGO_ENABLED=0 go build) =="
 cross_bin="$(mktemp -d "${TMPDIR:-/tmp}/lb-crossbuild.XXXXXX")"
 for module in "${modules[@]}"; do
   case "$module" in
@@ -175,6 +178,18 @@ for module in "${modules[@]}"; do
 done
 rm -rf "$cross_bin"
 
+# 模块图一致性：go.mod/go.sum 必须与实际 import 集合一致（只读，-diff 不写盘）。
+# 注意 go.mod 有两处本地 replace（./wafiplist、./geoipnames），本地模块不在
+# 模块缓存中，`go mod verify` 对本仓恒报 missing ziphash——不要把它加进门禁，
+# tidy -diff 才是等价且可用的检查。
+# caddydeps 刻意排除：该模块不提供功能代码，其 go.mod 的注释块记录 MVS floor
+# 理由，tidy 会把注释整块剥掉（差异恒存在且无害，不代表依赖漂移）。
+echo "== go mod tidy -diff (module graph consistency) =="
+go mod tidy -diff
+for module in caddygeoip geoipnames wafiplist; do
+  (cd "$module" && go mod tidy -diff)
+done
+
 # 竞态门：并发核心（任务引擎 + 中间件限流/白名单缓存 + 进程内 Caddy 协作/
 # 监督器探测）此前只在本地手工跑 -race，且 middleware 不在覆盖内——限流桶
 # （双层锁 + 换代计数）、API Key 白名单缓存、认证审计限流、MCP 响应缓冲都在
@@ -183,7 +198,11 @@ echo "== go test -race (concurrency cores) =="
 go test -race -count=1 ./internal/taskengine ./internal/middleware ./cmd/...
 
 echo "== frontend tests/typecheck/build =="
-# vue-tsc 看不到模板编译期错误，发布契约要求真实 vite build
-(cd web && npm test && npm run typecheck:test && npm run build:vite)
+# 单一入口 npm run build = test + typecheck:src + typecheck:test + vite build。
+# 此前拆跑 npm test + typecheck:test + build:vite，漏掉更严的 typecheck:src
+# （src 基线 tsconfig.json 与测试基线的 lib 阈值不同：用 ES2021+ lib API 时
+# 本门绿、npm run build 红）。vue-tsc 看不到模板编译期错误，发布契约要求
+# 真实 vite build，故整条 build 链都在门内。
+(cd web && npm run build)
 
 echo "all verification gates passed"

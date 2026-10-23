@@ -106,3 +106,29 @@ func TestSystemTaskLogPathResolver_retriesCertJobLoadAfterFailure(t *testing.T) 
 		t.Fatalf("cert_jobs query attempts=%d after cache hit, want 2", attemptsAfterCache)
 	}
 }
+
+// cert-job 任务 ID 形态在批量 resolver 与单条入口之间必须同结论：
+// "007"/"+7" 归一为同一 job（此前批量按原始串查 map、单条 Atoi，同任务一边
+// 有日志一边为空）。
+func TestParseCertJobTaskID_shapesUnified(t *testing.T) {
+	cases := []struct {
+		taskID string
+		want   int64
+		ok     bool
+	}{
+		{"cert-job:7", 7, true},
+		{"cert-job:007", 7, true},
+		{"cert-job:+7", 7, true},
+		{"cert-job: 7", 7, true},
+		{"cert-job:abc", 0, false},
+		{"cert-job:0", 0, false},
+		{"cert-job:-3", 0, false},
+		{"crawlerbot-update", 0, false},
+	}
+	for _, tc := range cases {
+		got, ok := parseCertJobTaskID(tc.taskID)
+		if got != tc.want || ok != tc.ok {
+			t.Errorf("parseCertJobTaskID(%q)=(%d,%v), want (%d,%v)", tc.taskID, got, ok, tc.want, tc.ok)
+		}
+	}
+}

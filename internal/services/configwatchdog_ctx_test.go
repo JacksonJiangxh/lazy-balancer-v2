@@ -190,6 +190,96 @@ func TestWatchdogCheckOnce_roleReadCancelSkipsBookkeeping(t *testing.T) {
 	}
 }
 
+// Given 已观测一轮不一致（streak=1）的主节点，随后角色读取失败一轮。
+// When 该轮按「未判定」结束。
+// Then 连续窗口必须被打断（streak=0）——否则「漂移→跳过→漂移」会被当作
+// 两轮连续证据而误确认漂移；跳过计数照常累加。
+func TestWatchdogCheckOnce_roleReadFailureBreaksStreak(t *testing.T) {
+	_, _ = newClusterTestService(t)
+	resetConfigWatchdogForTest(t)
+	newTaskLogDir(t)
+	configDriftMu.Lock()
+	configDriftStreak = 1
+	configDriftMu.Unlock()
+	swapBrokenDB(t)
+
+	if err := WatchdogCheckOnce(context.Background()); err == nil {
+		t.Fatal("角色读取失败轮必须返回错误（任务面留痕）")
+	}
+	configDriftMu.RLock()
+	streak, skipped := configDriftStreak, configDriftSkipped
+	configDriftMu.RUnlock()
+	if streak != 0 {
+		t.Fatalf("角色读取失败轮必须打断连续窗口: streak=%d, want 0", streak)
+	}
+	if skipped != 1 {
+		t.Fatalf("角色读取失败轮必须计入跳过簿记: skipped=%d, want 1", skipped)
+	}
+}
+
+// Given 降级前已确认漂移的主节点 + 在途比较轮（快照已携带漂移态）。
+// When 降级复位（ResetConfigDrift）先于取消在途轮发生。
+// Then 取消轮不得把旧漂移快照写回（代际变化 → 放弃回滚），从节点保持复位态。
+func TestWatchdogCheckOnce_resetDuringCancelledRoundKeepsResetState(t *testing.T) {
+	_, database := newClusterTestService(t)
+	seedGenerationRule(t, database, "lb_watchdog_reset_cancel", false)
+	resetConfigWatchdogForTest(t)
+	newTaskLogDir(t)
+	configDriftMu.Lock()
+	configDriftStatus = ConfigDriftStatus{
+		Consistent: false,
+		Missing:    []string{"lb_stale"},
+		Since:      time.Now().UTC().Format("2006-01-02 15:04:05"),
+	}
+	configDriftStreak = 1
+	configDriftMu.Unlock()
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(emptyCaddyConfig))
+	}))
+	defer server.Close()
+	watchdogAdminURLValue = server.URL
+	t.Cleanup(func() { watchdogAdminURLValue = "" })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- WatchdogCheckOnce(ctx) }()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		cancel()
+		close(release)
+		t.Fatal("看门狗未抵达比对窗口（假 admin 未被请求）")
+	}
+	ResetConfigDrift()
+	cancel()
+	close(release)
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("取消轮必须返回取消错误: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("取消后的看门狗轮未返回")
+	}
+	if drift := CurrentConfigDrift(); !drift.Consistent || len(drift.Missing) != 0 || len(drift.Extra) != 0 {
+		t.Fatalf("取消轮覆写了降级复位态: %+v", drift)
+	}
+	configDriftMu.RLock()
+	streak := configDriftStreak
+	configDriftMu.RUnlock()
+	if streak != 0 {
+		t.Fatalf("取消轮回滚不得恢复复位前的 streak: %d", streak)
+	}
+}
+
 // roleCancelConnector 假驱动：查询阻塞到 ctx 取消后返回 ctx.Err()——把取消
 // 精确落进 RoleOf 的查询窗口。
 type roleCancelConnector struct {

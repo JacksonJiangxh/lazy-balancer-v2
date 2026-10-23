@@ -44,6 +44,12 @@ func (b *BaseProvider) Validate(ctx context.Context, creds map[string]string, te
 var registry = map[string]Provider{}
 
 func Register(p Provider) {
+	// init 期注册：Code 是注册表键与前端/凭据字段的定位口径。重复 Code
+	// （复制粘贴漏改）此前静默覆盖——List 少一项、CredentialFields 与 Validate
+	// 可能来自不同实现。注册期快速失败，冲突在启动即暴露。
+	if _, exists := registry[p.Code()]; exists {
+		panic("dnsproviders: duplicate provider code " + p.Code())
+	}
 	registry[p.Code()] = p
 }
 

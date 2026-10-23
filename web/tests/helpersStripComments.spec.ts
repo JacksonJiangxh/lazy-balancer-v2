@@ -24,6 +24,23 @@ test('member：缺 marker / 无函数体 / 括号不平衡一律抛错', () => {
   assert.throws(() => member('function f() {\n  if (x) {\n', 'function f'), /unbalanced braces/)
 })
 
+test('member：单表达式箭头体不得顺延到下一个成员（越界切片）', () => {
+  const src = 'const h = () => ({ a: 1 })\nconst k = () => {\n  return 9\n}\n'
+  // 切片若顺延到 const k，match 可被邻接成员满足（假绿）、doesNotMatch 假红
+  assert.throws(() => member(src, 'const h = '), /member has no block body/)
+  // 块体成员仍正常切到自身收尾
+  const k = member(src, 'const k = ')
+  assert.match(k, /return 9/)
+  assert.doesNotMatch(k, /const h/, '切片不得回吞前一个成员')
+})
+
+test('member：模板量 ${} 内嵌对象既不提前收尾也不越界', () => {
+  const src = 'const f = () => {\n  const s = `a${ { b: 1 } }c`\n  return s\n}\nconst g = () => {\n  return 2\n}\n'
+  const slice = member(src, 'const f = ')
+  assert.match(slice, /return s/)
+  assert.doesNotMatch(slice, /return 2/, '切片不得吞下下一个成员')
+})
+
 test('行注释与块注释被剥离，字符串字面量保留', () => {
   const src = "const a = 1 // trailing\n/* block */ const b = '// not comment'\nconst c = `/* tpl */`"
   const out = stripComments(src)

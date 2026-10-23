@@ -208,20 +208,6 @@ func (s *SyncService) do(req *http.Request) (*http.Response, error) {
 			return nil, err
 		}
 	}
-	return s.doWithTLSUpgradeRedirect(req)
-}
-
-// doWithTLSUpgradeRedirect 处理同主机 http→https 301/302/307/308:主节点启用管理
-// HTTPS 后明文端口整体 301/302(TCP 嗅探层,早于路由),而本客户端
-// CheckRedirect=ErrUseLastResponse 会让从节点拿到空 body 走 JSON 解析,
-// 报「解析集群快照: unexpected end of JSON input」且无自愈路径(2026-09-18
-// 实测)。仅当 Location 与原请求**同主机名**且升级为 https 时按原方法重放
-// (凭证不出原主机;TOFU transport 对自签证书自动钉扎);跨主机重定向一律
-// 不跟随(凭证外泄防护,见 doesNotFollowHTTPRedirect 契约测试)。
-func (s *SyncService) doWithTLSUpgradeRedirect(req *http.Request) (*http.Response, error) {
-	// 合并:委托导出函数(原两份近乎逐字重复的实现——方法版与
-	// cluster_control.go 函数版;合并后单一事实源,行为取方法版的合成空响应
-	// 语义——函数版原实现有「已 Close 的 body 返回调用方」缺陷)
 	return DoWithSameHostTLSUpgradeRedirect(s.client, req)
 }
 
@@ -732,7 +718,7 @@ func (s *SyncService) RegisterWithMaster(ctx context.Context, masterURL string, 
 	}
 	defer resp.Body.Close()
 	// 未跟随的 3xx(跨主机/反代重定向)在读 body 前拦截——
-	// 同主机 https 升级已由 doWithTLSUpgradeRedirect 重放,残留 3xx 的空 body
+	// 同主机 https 升级已由 DoWithSameHostTLSUpgradeRedirect 重放,残留 3xx 的空 body
 	// 落进 JSON 解析只会报「unexpected end of JSON input」;给与 Pull 3xx
 	// 分支同款的可行动指引。
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
@@ -1014,9 +1000,20 @@ func (s *SyncService) Pull(ctx context.Context) (result SyncResult, err error) {
 			return SyncResult{}, newSyncFailure(models.SyncErrorCodeTransportError,
 				fmt.Errorf("目标主节点已降级为从节点(%d): %s", resp.StatusCode, strings.TrimSpace(string(body))))
 		}
-		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		if resp.StatusCode == http.StatusUnauthorized {
+			// 401 是本服务集群凭据拒绝的唯一响应（clusterTokenAuth 对无效/
+			// 已撤销令牌），语义即「令牌被撤销」：重试不可能自愈，终止等待
+			// 人工重新注册或提升为主节点。
 			return SyncResult{}, newSyncFailure(models.SyncErrorCodeValidationFailed,
 				fmt.Errorf("主节点拒绝本节点访问(%d): %w", resp.StatusCode, errSyncTokenRevoked))
+		}
+		if resp.StatusCode == http.StatusForbidden {
+			// 裸 403 不停留在本服务内：requireMaster 的 403 恒带
+			// X-LB-Error-Code=master_required（已在上分支按「目标降级」自愈）。
+			// 因此无码 403 只可能来自前置代理/网关维护页——它不代表令牌撤销，
+			// 终止会让从节点停摆到人工介入，故保持可重试并给出区分文案。
+			return SyncResult{}, newSyncFailure(models.SyncErrorCodeTransportError,
+				fmt.Errorf("主节点或其前置代理拒绝快照请求(%d，非令牌撤销，稍后自动重试): %s", resp.StatusCode, strings.TrimSpace(string(body))))
 		}
 		return SyncResult{}, newSyncFailure(models.SyncErrorCodeTransportError, fmt.Errorf("主节点快照请求失败(%d): %s", resp.StatusCode, strings.TrimSpace(string(body))))
 	}
@@ -1057,9 +1054,8 @@ func (s *SyncService) Pull(ctx context.Context) (result SyncResult, err error) {
 	s.pullAdmissionMu.Unlock()
 	if pullsStopped {
 		s.pullApplyMu.Unlock()
-		// （两路独立确认，提交信息曾声称已修但从未落盘——
-		// 第 3 次同类失误）：复用 errSyncPullStopped 哨兵包装——errors.Is(pullErr,
-		// errSyncPullStopped) 依赖哨兵识别停机而非普通 validation 失败；此前以
+		// 复用 errSyncPullStopped 哨兵包装：errors.Is(pullErr, errSyncPullStopped)
+		// 依赖哨兵识别停机而非普通 validation 失败；此前以
 		// ValidationFailed 落库会覆盖 apply_ok_reload_failed 标记（标记必须跨停机
 		// 存活才能触发 304 补偿重拉）。
 		return SyncResult{}, newSyncFailure(models.SyncErrorCodeValidationFailed, errSyncPullStopped)
@@ -1499,6 +1495,24 @@ func (s *SyncService) persistSyncError(ctx context.Context, message string, code
 	}
 }
 
+// updateSlaveConfig 是从端专有 global_config 记账（注册/确认/同步错误）的唯一
+// 写入口：统一附加从端角色谓词。Promote 会一次性清空这些列，而从端 daemon 的
+// Stop 取消是异步的、驱动对已进入执行的语句是否响应 ctx 取消并无保证，因此在途
+// 写可能在升主提交后落库；无谓词就会把旧集群令牌与明文注册密钥写回新主节点，
+// 而全仓没有第二处清空点。返回 applied=false 表示本节点已升主，属预期 no-op。
+// setClause 只允许包内常量（不做参数化拼接）。
+func (s *SyncService) updateSlaveConfig(ctx context.Context, setClause string, args ...any) (bool, error) {
+	result, err := s.db.ExecContext(ctx, "UPDATE global_config SET "+setClause+" WHERE id=1 AND "+slaveRoleConditionSQL, args...)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
 func (s *SyncService) recordSyncError(ctx context.Context, pullErr, reportErr error) {
 	msg := ""
 	code := models.SyncErrorCode("")
@@ -1911,8 +1925,11 @@ func (s *SyncService) pollRegistration(ctx context.Context) {
 			// 达到上限后落终止文案并清 registration_*（退出循环），运维提示与
 			// confirm 路径一致。1-4 次期间 last_sync_error 持续显示可行动文案
 			// （combineOrReplaceSyncError 幂等覆盖），审计留痕收敛到终止时一条。
-			s.bumpRegistrationConfirmFailure(ctx, "", fmt.Sprintf("注册状态轮询被主节点拒绝（HTTP %d）", resp.StatusCode))
+			// 写序与 confirm 路径一致：先落通用文案再累计——第 5 次时 bump 的
+			// 终止文案（含连续失败次数与人工介入指引）覆盖通用文案；反向顺序
+			// 会让终止文案被通用文案冲掉。
 			s.combineOrReplaceSyncError(ctx, message, models.SyncErrorCodeValidationFailed)
+			s.bumpRegistrationConfirmFailure(ctx, "", fmt.Sprintf("注册状态轮询被主节点拒绝（HTTP %d）", resp.StatusCode))
 			return
 		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
@@ -1947,8 +1964,10 @@ func (s *SyncService) pollRegistration(ctx context.Context) {
 		// 事务 SELECT 前节点行被删」的交错窗口（单发瞬态，下一轮即 401 走
 		// 终止轨道）。显式处理消除该轮的无痕迹轮询并给出准确文案（否则 401 轨道
 		// 的文案会误报为「HTTP 401 被拒绝」）。
-		s.bumpRegistrationConfirmFailure(ctx, "", "主节点已拒绝该注册（节点记录不存在）")
+		// 先落通用文案再累计（与 401/404/410 分支同序）：第 5 次时 bump 的
+		// 终止文案覆盖通用文案，否则「已停止自动重试」提示会被冲掉。
 		s.combineOrReplaceSyncError(ctx, "注册已被主节点拒绝，请重新注册或提升为主节点", models.SyncErrorCodeValidationFailed)
+		s.bumpRegistrationConfirmFailure(ctx, "", "主节点已拒绝该注册（节点记录不存在）")
 		return
 	}
 	if envelope.Data.Status == "approved" && envelope.Data.ClusterToken != "" {
@@ -1965,8 +1984,14 @@ func (s *SyncService) pollRegistration(ctx context.Context) {
 		// 「连续 5 次失败止环」轨道（bumpRegistrationConfirmFailure）在 confirm 轴上
 		// 不可达（计数至多 1）。保留后每同步周期重试一次（令牌已落库的轮次由
 		// retryPendingRegistrationConfirm 承担），5 次即成环。
-		if _, err := s.db.ExecContext(ctx, "UPDATE global_config SET cluster_token=? WHERE id=1", envelope.Data.ClusterToken); err != nil {
+		applied, err := s.updateSlaveConfig(ctx, "cluster_token=?", envelope.Data.ClusterToken)
+		if err != nil {
 			Logf("error", "保存集群令牌失败（下周期重试状态轮询）: %v", err)
+			return
+		}
+		if !applied {
+			// 本节点已升主：令牌是从端专有状态，Promote 已清空该列，在途轮询
+			// 不得把旧主凭据写回，也不得继续走 confirm。
 			return
 		}
 		s.redeemRegistrationConfirm(ctx, masterURL, envelope.Data.ClusterToken)
@@ -2020,7 +2045,7 @@ func (s *SyncService) redeemRegistrationConfirm(ctx context.Context, masterURL, 
 	// confirm 成功即离开注册循环：主节点已消费 secret，本地保留会让后续轮次
 	// 持续命中 401 终止轨道。清空失败时留痕（下轮走 401 终止轨道，集群令牌
 	// 仍有效，同步不受影响）。
-	if _, err := s.db.ExecContext(ctx, "UPDATE global_config SET registration_secret='' WHERE id=1"); err != nil {
+	if _, err := s.updateSlaveConfig(ctx, "registration_secret=''"); err != nil {
 		Logf("warn", "集群注册确认成功后清理本地注册密钥失败（下轮状态轮询将走 401 终止轨道）: %v", err)
 	}
 	return false
@@ -2115,14 +2140,18 @@ func registrationConfirmTerminal(status int) bool {
 // bumpRegistrationConfirmFailure 累计 confirm 失败次数。达到上限后清除 registration_secret，
 // 让从节点脱离注册状态，并通过 persistSyncError 提示运维人工介入。
 func (s *SyncService) bumpRegistrationConfirmFailure(ctx context.Context, clusterToken, reason string) {
-	_, err := s.db.ExecContext(ctx,
-		"UPDATE global_config SET registration_confirm_failures = COALESCE(registration_confirm_failures, 0) + 1 WHERE id=1")
+	_, err := s.updateSlaveConfig(ctx, "registration_confirm_failures = COALESCE(registration_confirm_failures, 0) + 1")
 	if err != nil {
 		Logf("warn", "bumpRegistrationConfirmFailure: update failed: %v", err)
 	}
 	var failures int
 	if qerr := s.db.QueryRowContext(ctx, "SELECT COALESCE(registration_confirm_failures, 0) FROM global_config WHERE id=1").Scan(&failures); qerr != nil {
-		failures = registrationConfirmMaxFailures
+		// 计数读失败是暂时性故障（SQLITE_BUSY/连接重建），不得据此推进终止
+		// 轨道：按「已达上限」处理会清空 registration_secret/registration_id/
+		// cluster_token，把一次瞬时 DB 错误升级为需要人工重新注册的数据破坏。
+		// 本周期只留痕，下一周期（计数自增已落库）按真实值判定。
+		Logf("warn", "bumpRegistrationConfirmFailure: 读取失败计数失败，本轮不推进终止轨道（下周期重试）: %v", qerr)
+		return
 	}
 	if failures >= registrationConfirmMaxFailures {
 		message := fmt.Sprintf("集群注册确认连续失败 %d 次（最后一次：%s）。已停止自动重试，请在“集群管理”页面重新注册，或使用“提升为主节点”脱离集群",
@@ -2132,11 +2161,11 @@ func (s *SyncService) bumpRegistrationConfirmFailure(ctx context.Context, cluste
 		s.combineOrReplaceSyncError(ctx, message, models.SyncErrorCodeValidationFailed)
 		RecordAuditLog("system", "注册失败", "集群节点", message, "")
 		// 清除 registration_secret 触发从节点退出注册循环；clusterToken 已存入 global_config 但因 confirm 未成功，主节点未真正确认
-		if _, derr := s.db.ExecContext(ctx, "UPDATE global_config SET registration_secret='', registration_id=NULL, registration_confirm_failures=0 WHERE id=1"); derr != nil {
+		if _, derr := s.updateSlaveConfig(ctx, "registration_secret='', registration_id=NULL, registration_confirm_failures=0"); derr != nil {
 			Logf("warn", "bumpRegistrationConfirmFailure: clear registration state failed: %v", derr)
 		}
 		if clusterToken != "" {
-			_, _ = s.db.ExecContext(ctx, "UPDATE global_config SET cluster_token='' WHERE id=1")
+			_, _ = s.updateSlaveConfig(ctx, "cluster_token=''")
 		}
 	} else {
 		Logf("error", "集群注册确认失败 %d/%d：%s", failures, registrationConfirmMaxFailures, reason)
@@ -2145,7 +2174,7 @@ func (s *SyncService) bumpRegistrationConfirmFailure(ctx context.Context, cluste
 
 // resetRegistrationConfirmFailure 在 confirm 成功后清零失败计数。
 func (s *SyncService) resetRegistrationConfirmFailure(ctx context.Context) {
-	_, _ = s.db.ExecContext(ctx, "UPDATE global_config SET registration_confirm_failures=0 WHERE id=1")
+	_, _ = s.updateSlaveConfig(ctx, "registration_confirm_failures=0")
 }
 
 // clusterSyncFailureSummary 拼接同步轮失败的业务摘要行。

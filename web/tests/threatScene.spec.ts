@@ -124,13 +124,27 @@ test('④下钻口径：统一倍率=9、主环取景中心为 bbox 中心、南
         if (lat < minLat) minLat = lat
         if (lat > maxLat) maxLat = lat
       }
-      return { minLat, maxLat, area: (maxLon - minLon) * (maxLat - minLat) }
+      return { minLon, maxLon, minLat, maxLat, area: (maxLon - minLon) * (maxLat - minLat) }
     }))
     const largest = ringBoxes.reduce((a, x) => (x.area > a.area ? x : a))
     assert.equal(b.minLat, largest.minLat, `${name} 取景 bbox 纬度南界不是最大环`)
     assert.equal(b.maxLat, largest.maxLat, `${name} 取景 bbox 纬度北界不是最大环`)
     // ±180 unwrap 契约：经度跨度必须收敛（海外属地跨日界线时不得报全宽）
     assert.ok(b.maxLon - b.minLon <= 180, `${name} 取景 bbox 经度跨度 ${b.maxLon - b.minLon} 超过 180（unwrap 失效）`)
+    // 经度边界必须与最大环的经度边界同余（差值是 360 的整数倍）——unwrap 选中
+    // 错平移窗（例如把俄罗斯主环中心放到 -180 附近）在此变红。
+    const normalizeLon = (value: number): number => ((value + 540) % 360) - 180
+    assert.ok(
+      Math.abs(normalizeLon(b.minLon) - normalizeLon(largest.minLon)) < 1e-9,
+      `${name} 取景经度西界 ${b.minLon} 与最大环 ${largest.minLon} 不同余`,
+    )
+    assert.ok(
+      Math.abs(normalizeLon(b.maxLon) - normalizeLon(largest.maxLon)) < 1e-9,
+      `${name} 取景经度东界 ${b.maxLon} 与最大环 ${largest.maxLon} 不同余`,
+    )
+    // 取景中心（经度）必须落在同一 unwrap 窗内 —— 跨日界线环不得把中心甩到对侧。
+    const centerLon = (b.minLon + b.maxLon) / 2
+    assert.ok(centerLon >= b.minLon && centerLon <= b.maxLon, `${name} 取景中心不在取景 bbox 内`)
   }
   // 南界：投影域裁到 -55（南极洲无业务流量）——世界高与相机纵向钳制同源。
   // 总览 zoom 下可视高 ≥ 世界高 → 相机恒居中；下钻倍率下越界拖动被钳在

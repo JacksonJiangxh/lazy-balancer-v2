@@ -139,7 +139,7 @@ func TestImportConfigBackup_warnsDanglingLiveCertJobProvider(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("import status=%d body=%s", response.Code, response.Body.String())
 	}
-	if warnings := decodeImportWarnings(t, response); !warningsContain(warnings, "证书任务的 CA 提供商已禁用或不存在") {
+	if warnings := decodeImportWarnings(t, response); !warningsContain(warnings, "证书任务的 CA 提供商已禁用") {
 		t.Fatalf("warnings=%v, want 含证书任务 provider 悬挂提示", warnings)
 	}
 	var auditCount int

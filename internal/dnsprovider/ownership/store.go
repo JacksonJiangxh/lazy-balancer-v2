@@ -382,7 +382,10 @@ func (s *Store) save(current state) error {
 		retired := 0
 		kept := current.Records[:0]
 		for _, record := range current.Records {
-			if record.Stale(now) && now.Sub(record.CreatedAt) > OwnershipRetention {
+			// 保留期（30d）远大于 StaleOwnershipAge（75min），Stale 判定已被
+			// 保留期蕴含；legacy 条目（CreatedAt 零值）必须显式保留——零值时间
+			// 与 now 的差值无意义。
+			if !record.CreatedAt.IsZero() && now.Sub(record.CreatedAt) > OwnershipRetention {
 				retired++
 				continue
 			}

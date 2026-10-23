@@ -1864,14 +1864,14 @@ func TestAuditFlushCoalescing_claimWindow(t *testing.T) {
 	})
 	auditLastFlushNano.Store(0)
 
-	if !claimAuditFlush(time.Now()) {
+	if !claimAuditFlush() {
 		t.Fatal("首次领取必须成功")
 	}
-	if claimAuditFlush(time.Now()) {
+	if claimAuditFlush() {
 		t.Fatal("窗口内重复领取必须快进")
 	}
 	time.Sleep(30 * time.Millisecond)
-	if !claimAuditFlush(time.Now()) {
+	if !claimAuditFlush() {
 		t.Fatal("窗口过后必须可再次领取")
 	}
 }
@@ -1957,7 +1957,7 @@ func TestFlushAuditPipelines_coalescedStillFlushes(t *testing.T) {
 
 	// Given 一次 reload 已领到冲刷资格，随后有行落在 bufio 里（500ms 周期
 	// 刷盘尚未到来）
-	if !claimAuditFlush(time.Now()) {
+	if !claimAuditFlush() {
 		t.Fatal("首个冲刷资格必须领取成功（前置条件）")
 	}
 	p.ioMu.Lock()
@@ -1981,6 +1981,60 @@ func TestFlushAuditPipelines_coalescedStillFlushes(t *testing.T) {
 	}
 	if !strings.Contains(string(data), `{"tail":1}`) {
 		t.Fatalf("审计文件=%q；窗口内快进的 Cleanup 必须刷盘", data)
+	}
+}
+
+// 合并窗口内被快进的 Cleanup 仍须小额有界排空：旧实现只刷 bufio，队列/在途
+// 行（≤2048）随紧随其后的进程停止静默丢失。本用例钉「窗口内 Cleanup 等到
+// 在途行落盘再返回」。
+func TestFlushAuditPipelines_coalescedDrainsInFlightRows(t *testing.T) {
+	oldWindow := auditFlushCoalesceWindow
+	auditFlushCoalesceWindow = time.Minute
+	t.Cleanup(func() {
+		auditFlushCoalesceWindow = oldWindow
+		auditLastFlushNano.Store(0)
+	})
+	auditLastFlushNano.Store(0)
+	useTestAuditPipeline(t)
+
+	target := filepath.Join(t.TempDir(), "audit.log")
+	w := &lbAuditWriter{}
+	if err := w.Init(plugintypesConfigFor(t, target)); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	fmtr := &gatedFormatter{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+		body:    []byte(`{"coalesced-drain":"YES"}`),
+	}
+	var releaseOnce sync.Once
+	releaseGate := func() { releaseOnce.Do(func() { close(fmtr.release) }) }
+	t.Cleanup(releaseGate)
+	w.pipeline.enqueue(lbAuditItem{snap: &auditSnapshot{}, formatter: fmtr})
+	select {
+	case <-fmtr.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("drain 未进入在途处理")
+	}
+
+	// Given 上一次 reload 已领到冲刷资格（本次 Cleanup 落在合并窗口内）
+	if !claimAuditFlush() {
+		t.Fatal("首个冲刷资格必须领取成功（前置条件）")
+	}
+	// 在途行 50ms 后处理完：窗口内 Cleanup 的有界排空必须等到它
+	time.AfterFunc(50*time.Millisecond, releaseGate)
+
+	start := time.Now()
+	FlushAuditPipelines()
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("窗口内 Cleanup 等待 %v；有界排空必须 ≤%v", elapsed, auditFlushCoalescedDrainWait)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read audit file: %v", err)
+	}
+	if !strings.Contains(string(data), `{"coalesced-drain":"YES"}`) {
+		t.Fatalf("审计文件=%q；窗口内 Cleanup 必须在有界窗口内排空在途行并刷盘", data)
 	}
 }
 

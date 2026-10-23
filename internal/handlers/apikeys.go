@@ -105,6 +105,12 @@ func queryAPIKeys(where string, args ...any) (*sql.Rows, error) {
 
 func (h *Handlers) ListCurrentUserAPIKeys(c *gin.Context) {
 	userID := int(contextUserID(c))
+	// 与创建/更新/删除三入口同形的认证上下文门：缺身份时不得退化为
+	// created_by=0 的孤儿行查询（会话异常的前端应重登而非拿 200 空列表）。
+	if userID <= 0 {
+		c.JSON(http.StatusUnauthorized, models.APIResponse{Code: 401, Message: "认证上下文缺失"})
+		return
+	}
 	rows, err := queryAPIKeys("WHERE k.created_by = ?", userID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "数据库错误"})
@@ -443,7 +449,13 @@ func updateAPIKeyStatus(c *gin.Context, currentUserOnly bool) {
 		afterMCPEnabled = *req.MCPEnabled
 	}
 	whitelistChanged := req.MCPIPWhitelist != nil && whitelistJSON != nil && *whitelistJSON != beforeWhitelist
-	privilegeEscalation := (req.ReadOnly != nil && !*req.ReadOnly && beforeReadOnly == 1) ||
+	// 重新启用特权 Key（禁用→启用且启用后具备写/MCP 能力）与「收回只读」
+	// 对称：启用=恢复可写/MCP 可达性，属授予动作。只读 Key 的启用不构成
+	// 特权变更（仍不可写）。
+	enablePrivileged := req.IsEnabled != nil && *req.IsEnabled && beforeEnabled != 1 &&
+		(beforeReadOnly == 0 || afterMCPEnabled)
+	privilegeEscalation := enablePrivileged ||
+		(req.ReadOnly != nil && !*req.ReadOnly && beforeReadOnly == 1) ||
 		(req.MCPEnabled != nil && *req.MCPEnabled && beforeMCPEnabled != 1) ||
 		(whitelistChanged && afterMCPEnabled)
 	if privilegeEscalation {

@@ -44,8 +44,16 @@ func (h *Handlers) UpdateAutobanConfig(c *gin.Context) {
 	if !requireMasterNode(c) {
 		return
 	}
-	if err := services.SetAutobanConfig(req); err != nil {
+	// 校验与持久化分出口：SetAutobanConfig 的 400 判定只覆盖纯校验（阈值/
+	// 窗口/枚举），DB 写失败（写锁冲突/IO 故障）必须 500 + 泛化文案——与同域
+	// 其它写端点同口径。旧实现把两者压成 400 并回传存储层原文，真实故障被
+	// 报成「请求参数无效」，调用方停止重试且响应泄露表/列名。
+	if err := services.ValidateAutobanConfig(req); err != nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
+		return
+	}
+	if err := services.SetAutobanConfig(req); err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: serverErrMsg("保存自动封禁配置失败", err)})
 		return
 	}
 	recordAudit(c, "更新", "自动封禁", fmt.Sprintf("启用：%s；调度：%s；阈值：%d 次/%d 分钟；时长：%s；口径：%s；模式：%s",

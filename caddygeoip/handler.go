@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -100,6 +101,47 @@ var (
 	geoipSharedSearchers = map[string]*geoipSharedSearcher{}
 )
 
+// geoipWarnLogInterval 是同一（路径+原因）告警的最小间隔：一次 reload 会为
+// 每条地域规则各调一次 sharedGeoIPSearcher，文件不可 stat/重建失败会按规则数
+// 放大重复 WARN（稀释真实告警）。恢复成功后清除记录——再次故障即时上报。
+var geoipWarnLogInterval = time.Minute
+
+// geoipWarnSeen 是节流记录：键 = reason|path。
+var geoipWarnSeen = struct {
+	sync.Mutex
+	last map[string]time.Time
+}{last: make(map[string]time.Time)}
+
+// geoipWarnCallsForTest 仅测试观测「实际写日志次数」（节流生效的机器断言）。
+var geoipWarnCallsForTest atomic.Int64
+
+// geoipWarnThrottled 按（原因|路径）节流后写 WARN。
+func geoipWarnThrottled(reason, path, msg string, fields ...zap.Field) {
+	key := reason + "|" + path
+	now := time.Now()
+	geoipWarnSeen.Lock()
+	if last, ok := geoipWarnSeen.last[key]; ok && now.Sub(last) < geoipWarnLogInterval {
+		geoipWarnSeen.Unlock()
+		return
+	}
+	geoipWarnSeen.last[key] = now
+	geoipWarnSeen.Unlock()
+	geoipWarnCallsForTest.Add(1)
+	caddy.Log().Named("geoip2region").Warn(msg, fields...)
+}
+
+// clearGeoIPWarnLogs 清除路径的节流记录（成功重建/命中后调用：恢复后再次
+// 故障必须立即上报）。
+func clearGeoIPWarnLogs(path string) {
+	geoipWarnSeen.Lock()
+	for key := range geoipWarnSeen.last {
+		if strings.HasSuffix(key, "|"+path) {
+			delete(geoipWarnSeen.last, key)
+		}
+	}
+	geoipWarnSeen.Unlock()
+}
+
 // geoipOldInstanceCloseDelay 换库重建后旧实例的延迟关闭窗口：重载窗口内旧
 // 配置的 handler 仍可能持旧实例在途查询（BorrowSearcher 落空会判「海外」
 // 误拦——恰是要修的问题），故不立即关闭；但旧实例也不再「保留至进程
@@ -137,7 +179,7 @@ func sharedGeoIPSearcher(path string) (*service.Ip2Region, error) {
 		if !ok {
 			return nil, err
 		}
-		caddy.Log().Named("geoip2region").Warn("ip2region database is not stat-able, serving the previous database instance and rebuilding on the next reload",
+		geoipWarnThrottled("stat", path, "ip2region database is not stat-able, serving the previous database instance and rebuilding on the next reload",
 			zap.String("xdb_path", path), zap.Error(err))
 		return cached.searcher, nil
 	}
@@ -145,6 +187,7 @@ func sharedGeoIPSearcher(path string) (*service.Ip2Region, error) {
 	defer geoipSharedMu.Unlock()
 	if cached, ok := geoipSharedSearchers[path]; ok && !cached.needsRebuild &&
 		cached.modTime.Equal(st.ModTime()) && cached.size == st.Size() {
+		clearGeoIPWarnLogs(path)
 		return cached.searcher, nil
 	}
 	searcher, err := service.NewIp2RegionWithPath(path, "")
@@ -156,7 +199,7 @@ func sharedGeoIPSearcher(path string) (*service.Ip2Region, error) {
 		// 带外损坏：保留旧实例继续服务（fail-stale），文件修复后的下一次
 		// Provision/reload 再重建。缓存条目保持旧形态，不驱逐。
 		if cached, ok := geoipSharedSearchers[path]; ok {
-			caddy.Log().Named("geoip2region").Warn("ip2region rebuild failed, serving the previous database instance",
+			geoipWarnThrottled("rebuild", path, "ip2region rebuild failed, serving the previous database instance",
 				zap.String("xdb_path", path), zap.Error(err))
 			return cached.searcher, nil
 		}
@@ -167,6 +210,7 @@ func sharedGeoIPSearcher(path string) (*service.Ip2Region, error) {
 		time.AfterFunc(geoipOldInstanceCloseDelay, func() { old.Close() })
 	}
 	geoipSharedSearchers[path] = &geoipSharedSearcher{searcher: searcher, modTime: st.ModTime(), size: st.Size()}
+	clearGeoIPWarnLogs(path)
 	return searcher, nil
 }
 

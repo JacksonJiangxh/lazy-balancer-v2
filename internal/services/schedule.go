@@ -24,27 +24,49 @@ import (
 // 日志记「第 x 次，共 x 次」；重试耗尽后任务落定 failed，下一运行=下一排程槽。
 
 const (
-	defaultScheduleDays = "1,2,3,4,5,6,7"
-	defaultScheduleTime = "04:00"
+	// 治理默认单源在 db（fresh DDL DEFAULT / 迁移补列同源，钉测见
+	// db_truth_defaults_test）；services 读失败兜底直接引用，不另写字面量。
+	defaultScheduleDays = db.DefaultScheduleDays
+	defaultScheduleTime = db.DefaultScheduleTime
 )
 
-// 排程槽推进门共享 SQL 片段：仅 auto 触发且现存
-// 槽空/过期才推进——手动触发不动预约、未来槽不回拨。此前同一谓词在
-// CRS/IP2Region/威胁情报三族 8 处内联重复（同型漏同步两起），此处收敛
-// 为单一事实源；参数序恒为「触发来源（?='auto'）、下一槽值（?）」。
+// 排程槽推进门共享 SQL 片段：现存槽空/过期才推进（未来槽不回拨）。此前同一
+// 谓词在 CRS/IP2Region/威胁/爬虫四族多处内联重复（同型漏同步两起），此处收敛
+// 为单一事实源；参数序恒为「触发来源（auto 门 1 个 / 成功门 2 个）、下一槽值（?）」。
 // 分族前缀：版本表族（CRS/IP2Region）在谓词前叠加 auto_update=1 门；
-// 威胁源族无 auto_update 列（启用门走 WHERE update_enabled=1 重排，见
+// 威胁/爬虫源族无 auto_update 列（启用门走 WHERE update_enabled=1 重排，见
 // scheduleThreatSources），不加该前缀。advanceVersionSlotIfDue 的
 // IIF(auto_update=1, ?, next_update) 是另一形态（触发门由调用方
 // advanceSlotIfAuto 前置，此处只判 auto_update），刻意不并入。
+//
+// 触发门分两态（引擎侧 success/failed/cancelled 的消费语义不同）：
+//   - 失败/取消：仅 auto 推进——手动轮失败时引擎按退避重投同一槽，业务若抢先
+//     推进会把该自动槽静默吃掉。
+//   - 成功：auto 推进空/过期槽；manual 只推进**已过期**槽。引擎成功轮（含
+//     手动轮）会消费过期槽，业务侧不推进则水位与业务槽单边分叉：tick 的
+//     「槽 > 已消费水位」门永不成立，四族自动更新永久静默停摆（人工反复
+//     「立即更新」只会反复加固）。空槽不在 manual 范围：零值槽不会进入引擎的
+//     消费分支（无停摆面），且「手动成功不得替空槽建立预约」是既有裁定——
+//     预约只由排程保存/启用/启动武装路径建立。
 const (
-	// slotAdvanceGateSQL 推进门核心谓词（两族共用）。
-	slotAdvanceGateSQL = `?='auto' AND (COALESCE(next_update,'')='' OR next_update<=datetime('now'))`
-	// versionTableSlotAdvanceSQL 版本表族（security_crs_version/
-	// security_ip2region_version）的 next_update 赋值片段。
-	versionTableSlotAdvanceSQL = `next_update=IIF(auto_update=1 AND ` + slotAdvanceGateSQL + `, ?, next_update)`
-	// threatSlotAdvanceSQL 威胁源族（security_threat_sources）的
+	// slotExpiredSQL 现存槽非空且已过期。比较两侧都过 datetime()：裸
+	// TEXT 字典序会把 RFC3339 形态（'T'=0x54 > ' '=0x20）的过期槽判成未来，
+	// 与 parseUTCSlot 的双布局容错口径分叉（旧备份/快照带入的 RFC3339 槽）。
+	// 非空但不可解析 → datetime() 为 NULL → 比较为 NULL（按未来处理，不推进）。
+	slotExpiredSQL = `COALESCE(next_update,'')<>'' AND datetime(next_update)<=datetime('now')`
+	// slotEmptyOrExpiredSQL 现存槽空或已过期。
+	slotEmptyOrExpiredSQL = `(COALESCE(next_update,'')='' OR datetime(next_update)<=datetime('now'))`
+	// slotAdvanceGateSQL 失败/取消路径的推进门：仅 auto 触发。
+	slotAdvanceGateSQL = `?='auto' AND ` + slotEmptyOrExpiredSQL
+	// slotSuccessGateSQL 成功路径的推进门：auto 空/过期 + manual 仅过期。
+	slotSuccessGateSQL = `(?='auto' AND ` + slotEmptyOrExpiredSQL + `) OR (?='manual' AND ` + slotExpiredSQL + `)`
+	// versionTableSlotSuccessSQL 版本表族（security_crs_version/
+	// security_ip2region_version）成功落的 next_update 赋值片段。
+	versionTableSlotSuccessSQL = `next_update=IIF(auto_update=1 AND (` + slotSuccessGateSQL + `), ?, next_update)`
+	// threatSlotSuccessSQL 威胁源族（security_threat_sources）成功落的
 	// next_update 赋值片段。
+	threatSlotSuccessSQL = `next_update=IIF(` + slotSuccessGateSQL + `, ?, next_update)`
+	// threatSlotAdvanceSQL 威胁源族失败落（仅 auto 推进）。
 	threatSlotAdvanceSQL = `next_update=IIF(` + slotAdvanceGateSQL + `, ?, next_update)`
 )
 
@@ -67,7 +89,12 @@ func advanceSourceSlotsAfterUserCancel(table, trigger string, slotOf func(time.T
 		// 手动轮不改变预约（引擎侧同样不消费手动轮的槽）。
 		return
 	}
-	if _, err := db.DB.Exec(`UPDATE `+table+` SET next_update=IIF(`+slotAdvanceGateSQL+`, ?, next_update) WHERE update_enabled=1`,
+	// 引擎运行体内（后台）写路径：与读侧同源走原子句柄。
+	database := db.GetDB()
+	if database == nil {
+		return
+	}
+	if _, err := database.Exec(`UPDATE `+table+` SET next_update=IIF(`+slotAdvanceGateSQL+`, ?, next_update) WHERE update_enabled=1`,
 		trigger, slotOf(time.Now().UTC())); err != nil {
 		Logf("warn", "用户取消后推进排程槽失败（%s）: %v", table, err)
 	}
@@ -159,13 +186,16 @@ func ParseUTCTimeDual(s string) (time.Time, bool) {
 // 调用前必须已完成 ConfigureLocation（CurrentLocation 已是新时区）。
 // 自动备份族无落库槽（NextSlotFn 按设置实时计算），天然随新时区生效。
 func RearmScheduleSlotsAfterTimezoneChange() {
-	if db.DB == nil {
+	// 后台/时区重排路径统一走原子句柄（本包口径见 logrotate/tz）：同步侧
+	// db.DB 与后台 db.GetDB() 分裂时，重排会写一个库、调度器读另一个库。
+	database := db.GetDB()
+	if database == nil {
 		return
 	}
 	now := time.Now().UTC()
 	for _, table := range []string{"security_crs_version", "security_ip2region_version"} {
 		var nextUpdate string
-		if err := db.DB.QueryRow(`SELECT COALESCE(next_update,'') FROM ` + table + ` WHERE id=1`).Scan(&nextUpdate); err != nil {
+		if err := database.QueryRow(`SELECT COALESCE(next_update,'') FROM ` + table + ` WHERE id=1`).Scan(&nextUpdate); err != nil {
 			Logf("warn", "时区变更重排：读取 %s 排程失败: %v", table, err)
 			continue
 		}
@@ -179,7 +209,7 @@ func RearmScheduleSlotsAfterTimezoneChange() {
 		if slot := parseUTCSlot(nextUpdate); slot.IsZero() || !slot.After(now) {
 			continue // 过期槽保留（补跑）；非法串由首槽武装/保存路径自愈
 		}
-		if _, err := db.DB.Exec(`UPDATE `+table+` SET next_update=? WHERE id=1`, versionTableNextSlot(table, now)); err != nil {
+		if _, err := database.Exec(`UPDATE `+table+` SET next_update=? WHERE id=1`, versionTableNextSlot(table, now)); err != nil {
 			Logf("warn", "时区变更重排：%s 写入 next_update 失败: %v", table, err)
 		}
 	}
@@ -192,7 +222,7 @@ func RearmScheduleSlotsAfterTimezoneChange() {
 		{"security_threat_sources", "id", threatNextSlot},
 		{"security_crawler_sources", "name", crawlerNextSlot},
 	} {
-		rows, err := db.DB.Query(`SELECT ` + st.keyCol + `, COALESCE(next_update,'') FROM ` + st.table + ` WHERE update_enabled=1 AND COALESCE(next_update,'')<>''`)
+		rows, err := database.Query(`SELECT ` + st.keyCol + `, COALESCE(next_update,'') FROM ` + st.table + ` WHERE update_enabled=1 AND COALESCE(next_update,'')<>''`)
 		if err != nil {
 			Logf("warn", "时区变更重排：读取 %s 排程失败: %v", st.table, err)
 			continue
@@ -218,7 +248,7 @@ func RearmScheduleSlotsAfterTimezoneChange() {
 		}
 		rows.Close()
 		for _, ra := range rearms {
-			if _, err := db.DB.Exec(`UPDATE `+st.table+` SET next_update=? WHERE `+st.keyCol+`=?`, ra.slot, ra.key); err != nil {
+			if _, err := database.Exec(`UPDATE `+st.table+` SET next_update=? WHERE `+st.keyCol+`=?`, ra.slot, ra.key); err != nil {
 				Logf("warn", "时区变更重排：%s(%s=%s) 写入 next_update 失败: %v", st.table, st.keyCol, ra.key, err)
 			}
 		}
@@ -333,11 +363,13 @@ func normalizeScheduleRow(daysRaw, hhmm string) ([]int, string) {
 
 // versionTableSchedule 读版本表（CRS/IP2Region）排程两列。
 func versionTableSchedule(table string) ([]int, string) {
-	if db.DB == nil {
+	// 引擎 tick 读侧（EnabledFn/NextSlotFn）消费原子句柄：与 tz/logrotate 同源。
+	database := db.GetDB()
+	if database == nil {
 		return normalizeScheduleRow(defaultScheduleDays, defaultScheduleTime)
 	}
 	var daysRaw, hhmm string
-	if err := db.DB.QueryRow(`SELECT COALESCE(schedule_days,''), COALESCE(schedule_time,'') FROM `+table+` WHERE id=1`).Scan(&daysRaw, &hhmm); err != nil {
+	if err := database.QueryRow(`SELECT COALESCE(schedule_days,''), COALESCE(schedule_time,'') FROM `+table+` WHERE id=1`).Scan(&daysRaw, &hhmm); err != nil {
 		logScheduleReadFailure("schedule-read-"+table, err)
 		return normalizeScheduleRow(defaultScheduleDays, defaultScheduleTime)
 	}
@@ -371,12 +403,13 @@ func LogConfigReadRecovered(key string)          { logScheduleReadRecovered(key)
 // versionTableNextUpdate 读版本表当前排程槽（空串=未排程）——同批，
 // 引擎 NextSlotFn 的 DB 直读数据源（不经管理器实例）。
 func versionTableNextUpdate(table string) string {
-	// nil 库守卫——NextSlotFn fail-closed（零值槽）。
-	if db.DB == nil {
+	// nil 库守卫——NextSlotFn fail-closed（零值槽）；句柄走原子读取。
+	database := db.GetDB()
+	if database == nil {
 		return ""
 	}
 	var s string
-	if err := db.DB.QueryRow(`SELECT COALESCE(next_update,'') FROM ` + table + ` WHERE id=1`).Scan(&s); err != nil {
+	if err := database.QueryRow(`SELECT COALESCE(next_update,'') FROM ` + table + ` WHERE id=1`).Scan(&s); err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			logScheduleReadFailure("schedule-next-update-"+table, err)
 		}
@@ -416,11 +449,12 @@ func versionTableAutoUpdateEnabled(table string) bool {
 // known=true 落 StartLoop/StopLoop——读失败保持上一次生效的调度态并等待
 // 周期性重试（否则一次读失败会被固化为调度关闭，读恢复后也不再自救）。
 func versionTableAutoUpdateState(table string) (enabled, known bool) {
-	if db.DB == nil {
+	database := db.GetDB()
+	if database == nil {
 		return false, false
 	}
 	var v int
-	if err := db.DB.QueryRow(`SELECT COALESCE(auto_update,1) FROM ` + table + ` WHERE id=1`).Scan(&v); err != nil {
+	if err := database.QueryRow(`SELECT COALESCE(auto_update,1) FROM ` + table + ` WHERE id=1`).Scan(&v); err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			logScheduleReadFailure("schedule-auto-update-"+table, err)
 		}
@@ -439,13 +473,15 @@ func IP2RegionSchedule() ([]int, string) { return versionTableSchedule("security
 // globalTaskSchedule 读任务级排程（global_config 两列；threat/crawler 共用
 // 同一读取与归一逻辑，列前缀隔离配置）。
 func globalTaskSchedule(prefix string) ([]int, string) {
-	// nil 库守卫与 versionTableNextUpdate/versionTableAutoUpdateEnabled 同口径。
-	if db.DB == nil {
+	// nil 库守卫与 versionTableNextUpdate/versionTableAutoUpdateState 同口径；
+	// 读取走原子句柄（引擎 tick 读侧）。
+	database := db.GetDB()
+	if database == nil {
 		return normalizeScheduleRow(defaultScheduleDays, defaultScheduleTime)
 	}
 	var daysRaw, hhmm string
 	query := `SELECT COALESCE(` + prefix + `_schedule_days,''), COALESCE(` + prefix + `_schedule_time,'') FROM global_config WHERE id=1`
-	if err := db.DB.QueryRow(query).Scan(&daysRaw, &hhmm); err != nil {
+	if err := database.QueryRow(query).Scan(&daysRaw, &hhmm); err != nil {
 		logScheduleReadFailure("schedule-read-"+prefix, err)
 		return normalizeScheduleRow(defaultScheduleDays, defaultScheduleTime)
 	}
@@ -482,11 +518,12 @@ func crawlerNextSlot(now time.Time) string {
 // datetime() 同时把两种形态转成同一 UTC 形态，返回值即归一为 crsTimeLayout；
 // 非法串 datetime()=NULL 被排除（旧实现对垃圾串会直接选中垃圾串）。
 func earliestEnabledSourceUpdate(sourceTable string) string {
-	if db.DB == nil {
+	database := db.GetDB()
+	if database == nil {
 		return ""
 	}
 	var next string
-	if err := db.DB.QueryRow(`SELECT datetime(next_update) FROM ` + sourceTable + `
+	if err := database.QueryRow(`SELECT datetime(next_update) FROM ` + sourceTable + `
 		WHERE update_enabled=1
 		  AND NULLIF(next_update,'') IS NOT NULL
 		  AND datetime(next_update) IS NOT NULL
@@ -568,8 +605,16 @@ func setGlobalTaskSchedule(prefix, sourceTable string, days []int, hhmm string) 
 	}
 	defer func() { _ = tx.Rollback() }() // 已 Commit 后为 no-op
 	query := `UPDATE global_config SET ` + prefix + `_schedule_days=?, ` + prefix + `_schedule_time=?, updated_at=datetime('now') WHERE id=1`
-	if _, err := tx.Exec(query, FormatScheduleDays(norm), hhmm); err != nil {
+	res, err := tx.Exec(query, FormatScheduleDays(norm), hhmm)
+	if err != nil {
 		return fmt.Errorf("保存定时更新设置: %w", err)
+	}
+	// global_config 行被带外删除/导入异常缺失时，UPDATE 命中 0 行不得静默
+	// 返回成功（排程列未落库、第二句重排也无效，零错误信号）。
+	if affected, aerr := res.RowsAffected(); aerr != nil {
+		return fmt.Errorf("确认定时更新设置写入结果: %w", aerr)
+	} else if affected != 1 {
+		return fmt.Errorf("保存定时更新设置失败: global_config 配置行缺失（命中 %d 行）", affected)
 	}
 	if _, err := tx.Exec(`UPDATE `+sourceTable+` SET next_update=? WHERE update_enabled=1`, next); err != nil {
 		return fmt.Errorf("重排规则库源更新计划: %w", err)

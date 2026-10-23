@@ -99,6 +99,18 @@ func GetCertExpiryThreshold() int {
 	return days
 }
 
+// CertRenewalLifetimeDays 是 ACME 证书的规划寿命（Let's Encrypt/ZeroSSL 均签发
+// 90 天证书），用作续签窗口安全上限的基准。
+const CertRenewalLifetimeDays = 90
+
+// CertRenewalDaysMax 是安全续签窗口上限（整数天）：窗口必须比证书寿命至少小
+// 一整天。窗口 ≥ 寿命-24h 时窗口门与成功侧迟滞数学等价——证书刚签发就落在
+// 窗口内，每次扫描都整轮重签（日级），约 5-7 天即触发 CA 重复证书限流、任务落
+// failed 后自动续签链终止，再约一个寿命后证书到期、HTTPS 规则 fail-closed。
+// 写侧校验（handlers.UpdateConfig）、导入钳制与读侧生效窗口共用本单源；存量
+// 越界值不静默改写库（读侧按上限生效并显性告警）。
+const CertRenewalDaysMax = CertRenewalLifetimeDays - 2
+
 // GetCertRenewalDays returns the configured certificate renewal window in days.
 // cert_renewal_days 读取收敛到本 helper（原四处内联
 // certificates.go 启动恢复/续签巡检/首发失败重试 + certissuer.go 快速路径）。
@@ -127,12 +139,19 @@ func GetCertRenewalDays() int {
 		Logf("error", "GetCertRenewalDays: cert_renewal_days 库值无效（%d <0）——疑似带外直写/旧导入；本轮降级默认 %d 留痕", days, db.DefaultCertRenewalDays)
 		return db.DefaultCertRenewalDays
 	}
-	// 读侧上界与写侧（handlers.UpdateConfig 0-90）/导入钳制（1-90）
+	// 读侧上界与写侧（handlers.UpdateConfig 0-CertRenewalDaysMax）/导入钳制
 	// 对齐——带外直写 365 会让 90 天证书整年处于续签窗口，每 6h 触发一次签发
 	// 风暴耗尽 CA 配额。与 <=0 同形态：error 级留痕后降级治理默认。
 	if days > 90 {
-		Logf("error", "GetCertRenewalDays: cert_renewal_days 库值超上界（%d >90）——写侧 0-90/导入 1-90 之外，疑似带外直写/旧备份恢复（续签风暴风险）；本轮降级默认 %d 留痕", days, db.DefaultCertRenewalDays)
+		Logf("error", "GetCertRenewalDays: cert_renewal_days 库值超上界（%d >90）——写侧校验/导入钳制之外，疑似带外直写/旧备份恢复（续签风暴风险）；本轮降级默认 %d 留痕", days, db.DefaultCertRenewalDays)
 		return db.DefaultCertRenewalDays
+	}
+	// 存量/旧备份遗留的 89/90 仍在旧契约内，但会让窗口门与迟滞等价（日级整轮
+	// 重签）。不得静默改写库值：库保持原样，本轮按安全上限生效并显性告警，
+	// 让运维从续签节奏与日志两侧看到真实原因。
+	if days > CertRenewalDaysMax {
+		Logf("error", "GetCertRenewalDays: cert_renewal_days=%d 超过安全上限 %d（证书寿命 %d 天，窗口 ≥ 寿命-24h 会与窗口门等价导致日级整轮重签并触发 CA 重复证书限流）——疑似旧版本/备份导入遗留；库值保留、本轮按 %d 生效，请调小续签时间", days, CertRenewalDaysMax, CertRenewalLifetimeDays, CertRenewalDaysMax)
+		return CertRenewalDaysMax
 	}
 	return days
 }
@@ -325,10 +344,9 @@ func getACMECertInfo(caddyID, ruleDomain string) (*models.RuleCertInfo, error) {
 			Logf("error", "GetRuleCertInfo: failed to scan ACME certificate for %s: %v", caddyID, err)
 			return nil, fmt.Errorf("解析规则 %s 的 ACME 证书行: %w", caddyID, err)
 		}
-		// 预解析一次，供 SelectRuleCertificate 与过期回退共用。
-		if candidate.Status != "disabled" {
-			candidate.Leaf = ParseCertificateLeaf(candidate.CertPEM, candidate.KeyPEM)
-		}
+		// 候选查询已由 CertJobMaterialPredicateSQL 排除 disabled 行，
+		// 此处无需再判状态——预解析一次供选择与过期回退共用。
+		candidate.Leaf = ParseCertificateLeaf(candidate.CertPEM, candidate.KeyPEM)
 		candidates = append(candidates, candidate)
 	}
 	if err := rows.Err(); err != nil {
@@ -358,6 +376,12 @@ func getACMECertInfo(caddyID, ruleDomain string) (*models.RuleCertInfo, error) {
 func ExpiredACMECertInfoFallback(candidates []CertificateCandidate, caddyID, ruleDomain string, expiryDays int, now time.Time) *models.RuleCertInfo {
 	for _, candidate := range candidates {
 		if strings.TrimSpace(candidate.CertPEM) == "" || candidate.Status == "disabled" {
+			continue
+		}
+		// 域名适用性过滤与对账/物化同源：规则改域后旧域的 issued 行属终态、
+		// 不被 sweep 回收，若在此不过滤，本规则证书卡会展示换域前的旧证书
+		// （文案「ACME 证书已过期」），与正常选择路径 VerifyHostname 的口径分叉。
+		if !certJobRuleApplicable(true, ruleDomain, candidate.Domain) {
 			continue
 		}
 		info := formatRuleCertInfo(candidate.CertPEM, candidate.Leaf, "acme_dns", ruleDomain, caddyID, expiryDays, now)

@@ -46,7 +46,7 @@ var auditVocabDynamicAllowlist = map[string]map[int][]string{
 	"middleware/middleware.go":         {1: {"auditMiddleware"}, 2: {"auditMiddleware"}},
 	"handlers/caddy.go":                {2: {"UpdateConfig"}},
 	"handlers/cluster_registration.go": {1: {"clusterNodeAction"}},
-	"handlers/config_backup.go":        {1: {"importConfigBackupCore"}},
+	"handlers/config_backup.go":        {1: {"importConfigBackupCore", "failImportTx"}},
 	// config_import_coordinator abort：WAF 文件回退失败/说明性告警必须系统身份
 	// 留痕，动作取 actionLabel()+"警告"（取值仅 导入警告/还原警告，均 ≤4 词），
 	// 对象固定「配置备份」。会话上下文不携带用户身份，故在 abort 内直写。

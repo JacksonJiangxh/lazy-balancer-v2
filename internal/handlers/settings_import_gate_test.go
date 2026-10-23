@@ -31,6 +31,7 @@ func TestSettingsWrites409DuringImport(t *testing.T) {
 	router.PUT("/security/crawler-lib/auto-update", h.UpdateCrawlerAutoUpdate)
 	router.PUT("/security/crawler-lib/:id/flags", h.UpdateCrawlerLibFlags)
 	router.PUT("/security/autoban", h.UpdateAutobanConfig)
+	router.POST("/system/restart", h.RestartService)
 
 	// 落库侧快照：409 必须是「未落库」而不是「落库后报错」。
 	if _, err := db.DB.Exec(`INSERT OR IGNORE INTO security_crawler_sources
@@ -64,6 +65,7 @@ func TestSettingsWrites409DuringImport(t *testing.T) {
 		{"PUT", "/security/crawler-lib/auto-update", `{"auto_update":true}`},
 		{"PUT", "/security/crawler-lib/1/flags", `{"update_enabled":true}`},
 		{"PUT", "/security/autoban", `{"enabled":true}`},
+		{"POST", "/system/restart", ""},
 	}
 	for _, call := range calls {
 		recorder := httptest.NewRecorder()

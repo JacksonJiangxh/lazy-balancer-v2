@@ -449,3 +449,36 @@ func TestGetAuditLogOptions_queryFailureLogsAndMarksPartial(t *testing.T) {
 		t.Fatalf("日志缺少「查询失败」留痕: %q", logs.String())
 	}
 }
+
+// 审计库未就绪的降级响应必须回显请求分页参数（此前固定在解析前返回
+// page=1/page_size=20，按文档生成的分页器会跳回首页）。
+func TestGetAuditLogs_degradedResponseEchoesRequestedPagination(t *testing.T) {
+	old := db.AuditDB
+	db.AuditDB = nil
+	t.Cleanup(func() { db.AuditDB = old })
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/audit-logs?page=3&page_size=50", nil)
+	(&Handlers{}).GetAuditLogs(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var resp struct {
+		Data struct {
+			Page     int  `json:"page"`
+			PageSize int  `json:"page_size"`
+			Partial  bool `json:"partial"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Data.Page != 3 || resp.Data.PageSize != 50 {
+		t.Fatalf("page=%d page_size=%d, want 3/50（降级响应须回显请求分页）", resp.Data.Page, resp.Data.PageSize)
+	}
+	if !resp.Data.Partial {
+		t.Fatal("降级响应必须 partial=true")
+	}
+}

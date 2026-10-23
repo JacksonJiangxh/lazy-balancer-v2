@@ -243,14 +243,13 @@ func TestAPIKeyLogout_returnsNotFoundInsteadOf500(t *testing.T) {
 
 func TestJWTAuth_splitsExpiredVsInvalidMessages(t *testing.T) {
 	cfg := &config.Config{JWTSecret: "split-message-secret"}
-	oldDB := db.DB
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatalf("init database: %v", err)
 	}
 	t.Cleanup(func() {
 		_ = db.Close()
-		db.DB = oldDB
-		db.SetDB(oldDB)
+		restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB)
 	})
 	router := gin.New()
 	router.Use(jwtAuth(cfg))
@@ -317,15 +316,14 @@ func TestJWTAuth_rejects_username_mismatch_for_same_user_id(t *testing.T) {
 
 func TestJWTAuth_rejects_first_token_after_two_same_second_password_changes(t *testing.T) {
 	cfg := &config.Config{JWTSecret: "password-version-secret"}
-	oldDB := db.DB
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatalf("init database: %v", err)
 	}
 	ensurePasswordVersionColumn(t)
 	t.Cleanup(func() {
 		_ = db.Close()
-		db.DB = oldDB
-		db.SetDB(oldDB)
+		restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB)
 	})
 	hash, err := bcrypt.GenerateFromPassword([]byte("initial-secret"), bcrypt.MinCost)
 	if err != nil {
@@ -397,15 +395,14 @@ func TestJWTAuth_rejects_first_token_after_two_same_second_password_changes(t *t
 
 func TestResetUserPassword_revokes_target_users_existing_token(t *testing.T) {
 	cfg := &config.Config{JWTSecret: "reset-secret"}
-	oldDB := db.DB
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatalf("init database: %v", err)
 	}
 	ensurePasswordVersionColumn(t)
 	t.Cleanup(func() {
 		_ = db.Close()
-		db.DB = oldDB
-		db.SetDB(oldDB)
+		restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB)
 	})
 	if _, err := db.DB.Exec("INSERT INTO users (id,username,password_hash,role,is_enabled,password_version) VALUES (9,'target','hash','user',1,0)"); err != nil {
 		t.Fatalf("seed user: %v", err)
@@ -447,15 +444,14 @@ func TestResetUserPassword_revokes_target_users_existing_token(t *testing.T) {
 
 func TestJWTAuth_allows_legacy_token_only_for_password_version_zero(t *testing.T) {
 	cfg := &config.Config{JWTSecret: "legacy-secret"}
-	oldDB := db.DB
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatalf("init database: %v", err)
 	}
 	ensurePasswordVersionColumn(t)
 	t.Cleanup(func() {
 		_ = db.Close()
-		db.DB = oldDB
-		db.SetDB(oldDB)
+		restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB)
 	})
 	if _, err := db.DB.Exec("INSERT INTO users (id,username,password_hash,role,is_enabled,password_version) VALUES (8,'legacy','hash','user',1,0)"); err != nil {
 		t.Fatalf("seed user: %v", err)
@@ -606,14 +602,16 @@ func TestReadOnlyGuard_blocks_non_admin_jwt_after_authentication(t *testing.T) {
 		t.Fatalf("seed database: %v", err)
 	}
 	cfg := &config.Config{JWTSecret: "test-secret"}
-	oldDB := db.DB
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatalf("init database: %v", err)
 	}
 	ensurePasswordVersionColumn(t)
+	// 三句柄一律经单源恢复（只还原 db.DB 会把已关闭/已删目录的
+	// MetricsDB/AuditDB 留给后续用例，-shuffle 下表现为随机假红）。
 	t.Cleanup(func() {
-		db.DB = oldDB
-		db.SetDB(oldDB)
+		_ = db.Close()
+		restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB)
 	})
 	if _, err := db.DB.Exec("INSERT INTO users (id, username, password_hash, role, is_enabled) VALUES (7, 'viewer', 'x', 'user', 1)"); err != nil {
 		t.Fatalf("seed user: %v", err)
@@ -790,23 +788,12 @@ func TestReadOnlyGuard_writeRouteClassificationIsIndependentFromAuditPolicy(t *t
 	}
 }
 
-// 从节点 MCP 写工具调用→403 实际接线回归钉（曾仅守卫级
-// 通用测试，无「POST /mcp 经守卫组」端到端形状——v1.POST("/mcp") 注册于
-// adminOnly/readOnlyGuard 组之外，写保护依赖 loopback 转发重入间接达成）。
-// MCP 写工具转发目标路由在从节点被 readOnlyGuard 拒绝（中间件级）。
+// 从节点 MCP 写工具的保护是「loopback 转发重入目标写路由 → readOnlyGuard
+// 403」，中间件级形态由 TestReadOnlyGuard_preserves_slave_write_rejection 覆盖，
 // 端到端形态（真实 listener + 完整 router + 管理员 mcp Key）见
-// TestMCPEndpoint_slaveWriteToolRejectedByInnerReadOnlyGuard。
-func TestReadOnlyGuard_slaveRejectsMcpForwardTargetWriteRoute(t *testing.T) {
-	router := newReadOnlyGuardTestRouter(t, false, "admin")
-	body := `{"jsonrpc":"2.0","method":"tools/call","params":{"name":"create_rule","arguments":{}}}`
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/rules", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, req)
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("从节点 MCP 转发目标写路由应 403, got %d body=%s", w.Code, w.Body.String())
-	}
-}
+// TestMCPEndpoint_slaveWriteToolRejectedByInnerReadOnlyGuard（mcp_test.go）。
+// 不再单列「名实不符」的转发目标用例：它只发普通 POST /rules、JSON-RPC body
+// 是死数据，与上述两例重复，却让人误以为 MCP 从端写保护有独立回归钉。
 
 // 证书配置「测试」两条路由已移出只读白名单
 // ——它们会经 dnsproviders.Validate 真实 Present+CleanUp DNS TXT 记录（非纯读

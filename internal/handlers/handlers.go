@@ -158,14 +158,14 @@ func (h *Handlers) recordCaddyApplyResult(err error) {
 			}
 			if db.DB != nil {
 				if _, err := db.DB.Exec(`UPDATE global_config SET caddy_apply_error=? WHERE id=1`, degraded); err != nil {
-					services.Logf("warn", "D3: 持久化渲染降级横幅失败: %v", err)
+					services.Logf("warn", "caddy_apply_banner_persist_failed: 持久化渲染降级横幅失败: %v", err)
 				}
 			}
 			return
 		}
 		if db.DB != nil {
 			if _, err := db.DB.Exec(`UPDATE global_config SET caddy_apply_error='' WHERE id=1 AND caddy_apply_error<>''`); err != nil {
-				services.Logf("warn", "RH-2: 清除 caddy_apply_error 失败(陈旧失败横幅可能滞留): %v", err)
+				services.Logf("warn", "caddy_apply_error_clear_failed: 清除 caddy_apply_error 失败(陈旧失败横幅可能滞留): %v", err)
 			}
 		}
 		return
@@ -183,7 +183,7 @@ func (h *Handlers) recordCaddyApplyFailure(err, restoreErr error) {
 	services.RecordAuditLog("system", "应用失败", "Caddy配置", wrapped, "")
 	if db.DB != nil {
 		if _, derr := db.DB.Exec(`UPDATE global_config SET caddy_apply_error=? WHERE id=1`, wrapped); derr != nil {
-			services.Logf("warn", "RH-2: 持久化 caddy_apply_error 失败(重启后真实失败不可见): %v", derr)
+			services.Logf("warn", "caddy_apply_error_persist_failed: 持久化 caddy_apply_error 失败(重启后真实失败不可见): %v", derr)
 		}
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"lazy-balancer-v2/internal/db"
 )
@@ -133,7 +134,7 @@ func TestSecurityEventsTick_mergesMultiEngineTransactionsPerRequest(t *testing.T
 	}
 
 	// 重放同一份日志（offset 归零）=幂等：不新增行、不改判出第二条。
-	if _, err := securityEventsIngestDeltaFrom(logPath, 0, true); err != nil {
+	if _, _, err := securityEventsIngestDeltaFrom(logPath, 0, true); err != nil {
 		t.Fatalf("replay: %v", err)
 	}
 	if rows := readSecurityEventsRows(t); len(rows) != 1 {
@@ -218,5 +219,149 @@ func TestSecurityEventsTick_keepsLegacyTransactionsWithoutTimingHeader(t *testin
 	rows := readSecurityEventsRows(t)
 	if len(rows) != 3 {
 		t.Fatalf("rows=%d, want 3（无请求级键不得归并）: %+v", len(rows), rows)
+	}
+}
+
+// securityEventsDedupeNowFixture 同 dedupe 夹具，但事件时间取当前时钟——
+// 自动封禁只统计当前窗口内的事件（积压回放不计），旧固定时间戳会被窗口门
+// 拒绝，断言恒 0。
+func securityEventsDedupeNowFixture(txID, timingID, uri, action string, ruleID int) string {
+	now := time.Now().UTC().UnixNano()
+	return strings.Replace(securityEventsDedupeFixture(txID, timingID, uri, action, ruleID), "1786447017841320426", fmt.Sprintf("%d", now), 1)
+}
+
+// installDedupeAutobanFixture 打开主节点门并清空计数器（真 metrics/主库由
+// seedSecurityEventsDedupeDB 建好）。
+func installDedupeAutobanFixture(t *testing.T) {
+	t.Helper()
+	oldMaster := autobanIsMaster
+	autobanIsMaster = func() bool { return true }
+	resetAutobanStateForTest()
+	t.Cleanup(func() {
+		autobanIsMaster = oldMaster
+		resetAutobanStateForTest()
+	})
+}
+
+// appendDedupeLogDoc 追加一条审计事务并跑一轮 tick（模拟跨 pass 形态）。
+func appendDedupeLogDoc(t *testing.T, logPath string, tailer *securityEventsTailer, doc string) {
+	t.Helper()
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(doc + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	runSecurityEventsDedupeTick(t, tailer)
+}
+
+// 跨 pass 改判必须喂自动封禁：scope=blocked 下首轮的 logged 不计入，若改判
+// 不补喂，攻击请求永远达不到阈值（库内事件显示 blocked，计数却为 0）。
+func TestSecurityEventsTick_crossPassUpgradeFeedsAutobanUnderBlockedScope(t *testing.T) {
+	logPath, offsetPath := seedSecurityEventsDedupeDB(t)
+	installDedupeAutobanFixture(t)
+	setAutobanConfigRaw(t, true, 1, 60, "1h", "blocked", false)
+
+	writeSecurityEventsDedupeLog(t, logPath,
+		securityEventsDedupeNowFixture("tx-pass-a", "0011aabbccddeeff", "/split", "logged", 942100))
+	tailer := securityEventsNewTailer(logPath, offsetPath)
+	runSecurityEventsDedupeTick(t, tailer)
+	if got := autobanCountForTest("203.0.113.9"); got != 0 {
+		t.Fatalf("logged 不计入 scope=blocked，首轮 count=%d, want 0", got)
+	}
+
+	appendDedupeLogDoc(t, logPath, tailer, securityEventsDedupeNowFixture("tx-pass-b", "0011aabbccddeeff", "/split", "blocked", 949110))
+	if got := autobanCountForTest("203.0.113.9"); got != 1 {
+		t.Fatalf("跨 pass 改判 blocked 必须喂一次自动封禁，count=%d, want 1", got)
+	}
+}
+
+// scope=all 下首轮 logged 已计 1：跨 pass 改判不得再喂第二条（一请求一次）。
+func TestSecurityEventsTick_crossPassUpgradeDoesNotDoubleCountUnderAllScope(t *testing.T) {
+	logPath, offsetPath := seedSecurityEventsDedupeDB(t)
+	installDedupeAutobanFixture(t)
+	setAutobanConfigRaw(t, true, 1, 60, "1h", "all", false)
+
+	writeSecurityEventsDedupeLog(t, logPath,
+		securityEventsDedupeNowFixture("tx-all-a", "0022aabbccddeeff", "/split", "logged", 942100))
+	tailer := securityEventsNewTailer(logPath, offsetPath)
+	runSecurityEventsDedupeTick(t, tailer)
+	if got := autobanCountForTest("203.0.113.9"); got != 1 {
+		t.Fatalf("首轮 logged count=%d, want 1", got)
+	}
+
+	appendDedupeLogDoc(t, logPath, tailer, securityEventsDedupeNowFixture("tx-all-b", "0022aabbccddeeff", "/split", "blocked", 949110))
+	if got := autobanCountForTest("203.0.113.9"); got != 1 {
+		t.Fatalf("跨 pass 改判不得重复计数，count=%d, want 1", got)
+	}
+}
+
+// 受信 IP 的 logged 被豁免（未计数）：随后非信任的 blocked 改判必须补喂
+// （scope=all 下同样如此——此前被豁免 ≠ 已计数）。
+func TestSecurityEventsTick_crossPassUpgradeFeedsBlockedAfterTrustExemptLogged(t *testing.T) {
+	logPath, offsetPath := seedSecurityEventsDedupeDB(t)
+	installDedupeAutobanFixture(t)
+	setAutobanConfigRaw(t, true, 1, 60, "1h", "all", false)
+	if _, err := db.DB.Exec(`UPDATE security_policies SET ip_whitelist_enabled=1, ip_whitelist='["203.0.113.9"]' WHERE id=7`); err != nil {
+		t.Fatal(err)
+	}
+
+	writeSecurityEventsDedupeLog(t, logPath,
+		securityEventsDedupeNowFixture("tx-trust-a", "0033aabbccddeeff", "/split", "logged", 942100))
+	tailer := securityEventsNewTailer(logPath, offsetPath)
+	runSecurityEventsDedupeTick(t, tailer)
+	if got := autobanCountForTest("203.0.113.9"); got != 0 {
+		t.Fatalf("信任豁免的 logged count=%d, want 0", got)
+	}
+
+	appendDedupeLogDoc(t, logPath, tailer, securityEventsDedupeNowFixture("tx-trust-b", "0033aabbccddeeff", "/split", "blocked", 949110))
+	if got := autobanCountForTest("203.0.113.9"); got != 1 {
+		t.Fatalf("被豁免的 logged 之后的 blocked 改判必须计数，count=%d, want 1", got)
+	}
+}
+
+// 同批改判必须同步攻击光流条目：大屏光流按 action 着色/计拦截，保留首次写入
+// 的 logged 会让同一请求在光流显示「检测」而事件列表显示「拦截」。
+func TestSecurityEventsTick_samePassUpgradeUpdatesAttackFlowAction(t *testing.T) {
+	logPath, offsetPath := seedSecurityEventsDedupeDB(t)
+	enableAttackFlowSampling(t)
+	writeSecurityEventsDedupeLog(t, logPath,
+		securityEventsDedupeNowFixture("tx-flow-a", "0055aabbccddeeff", "/flow-upgrade", "logged", 942100),
+		securityEventsDedupeNowFixture("tx-flow-b", "0055aabbccddeeff", "/flow-upgrade", "blocked", 949110))
+	runSecurityEventsDedupeTick(t, securityEventsNewTailer(logPath, offsetPath))
+
+	events, _ := ThreatScreenAttackFlowSnapshot(0, 0)
+	var matched []string
+	for _, ev := range events {
+		if ev.ClientIP == "203.0.113.9" {
+			matched = append(matched, ev.Action+"|"+ev.RuleTriggered)
+		}
+	}
+	if len(matched) != 1 {
+		t.Fatalf("同批改判后光流条目数=%d, want 1: %v", len(matched), matched)
+	}
+	if matched[0] != "blocked|949110" {
+		t.Fatalf("光流条目=%q, want blocked|949110（与事件行/库内改判一致）", matched[0])
+	}
+}
+
+func TestSecurityEventsTick_samePassUpgradeFeedsAutobanOnce(t *testing.T) {
+	for _, scope := range []string{"all", "blocked"} {
+		t.Run(scope, func(t *testing.T) {
+			logPath, offsetPath := seedSecurityEventsDedupeDB(t)
+			installDedupeAutobanFixture(t)
+			setAutobanConfigRaw(t, true, 1, 60, "1h", scope, false)
+			writeSecurityEventsDedupeLog(t, logPath,
+				securityEventsDedupeNowFixture("tx-same-a", "0044aabbccddeeff", "/same", "logged", 942100),
+				securityEventsDedupeNowFixture("tx-same-b", "0044aabbccddeeff", "/same", "blocked", 949110))
+			runSecurityEventsDedupeTick(t, securityEventsNewTailer(logPath, offsetPath))
+			if got := autobanCountForTest("203.0.113.9"); got != 1 {
+				t.Fatalf("scope=%s 同批改判 count=%d, want 1", scope, got)
+			}
+		})
 	}
 }

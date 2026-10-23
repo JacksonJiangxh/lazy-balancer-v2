@@ -258,8 +258,8 @@ func tokenHash(token string) string {
 	return hex.EncodeToString(hash[:])
 }
 
-// masterRoleConditionSQL 是节点簿记写语句的 SQL 级角色条件
-// handler 的 requireMaster 与本次写之间没有共享锁，BecomeSlave 可在窗口内
+// masterRoleConditionSQL 是节点簿记写语句的 SQL 级角色条件。
+// 原因：handler 的 requireMaster 与本次写之间没有共享锁，BecomeSlave 可在窗口内
 // 提交 is_master=0——带该条件的写语句在降级后恒 0 行，消除「降级后仍审批/
 // 上报/改访问地址」的 TOCTOU 类别。
 const masterRoleConditionSQL = `(SELECT COALESCE(is_master,1) FROM global_config WHERE id=1)=1`
@@ -792,9 +792,8 @@ func (s *ClusterService) Promote(ctx context.Context) error {
 	// 本节点降级后再提升时，旧 nodes 行即刻恢复权威，旧从节点持有的令牌
 	// 仍然有效，经手工 Resume/重新注册即可复活上报与同步——这是有意设计
 	// （主库清零后可凭从库副本恢复集群拓扑），不是令牌泄漏缺口。
-	// (a)：last_sync 与 applied_version 同语义——旧集群的同步时间对
-	// 新主节点无意义；此前漏置 NULL 让 Status() 继续格式化旧集群时间（与
-	// BecomeSlave 的对称缺失）。
+	// last_sync 与 applied_version 同语义：旧集群的同步时间对新主节点无意义；
+	// 此前漏置 NULL 让 Status() 继续格式化旧集群时间（与 BecomeSlave 的对称缺失）。
 	result, err := tx.ExecContext(ctx, `UPDATE global_config SET is_master=1, master_url='', cluster_token='', registration_id=0, registration_secret='', applied_version=0, sync_fingerprint='', last_sync_error='', registration_confirm_failures=0, last_sync=NULL, applied_waf_ref_hash='', applied_waf_ref_version=0 WHERE id=1`)
 	if err != nil {
 		return fmt.Errorf("重置主节点状态: %w", err)

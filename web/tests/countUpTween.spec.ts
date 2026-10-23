@@ -9,7 +9,7 @@ import assert from 'node:assert/strict'
 import { nextTick, ref } from 'vue'
 
 import { useCountUp } from '../src/composables/useCountUp.ts'
-import { FakeDocument, mountForLifecycle } from './_helpers.ts'
+import { FakeDocument, mountForLifecycle, source } from './_helpers.ts'
 
 class FakeFrames {
   private nextId = 1
@@ -155,4 +155,13 @@ test('卸载时摘除可见性监听并取消在途补间帧', async () => {
   } finally {
     h.dispose()
   }
+})
+
+// 消费侧接线钉：大屏四个 KPI 必须经 useCountUp 滚动（绕过时表现为数字不再
+// 补间，纯函数用例不会红）。
+test('ThreatScreen 接线：四个 KPI 均经 useCountUp', () => {
+  const screen = source('src/views/security/ThreatScreen.vue')
+  const calls = screen.match(/useCountUp\(/g) ?? []
+  assert.equal(calls.length, 4, `ThreatScreen 的 useCountUp 调用点应为 4 处，实际 ${calls.length}`)
+  assert.match(screen, /import \{ useCountUp \} from '@\/composables\/useCountUp'/)
 })
