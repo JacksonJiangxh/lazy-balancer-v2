@@ -1,7 +1,7 @@
-# 上游合并清单：v2.3.4 → v2.3.6
+# 上游合并清单：v2.3.4 → v2.3.8
 
 > 逐节记录历次追平：§一~七 = `v2.3.4 → v2.3.5`（含 v2.3.6-beta）；
-> §八 = `v2.3.5 → v2.3.6` 正式版（2026-10-13）。
+> §八 = `v2.3.5 → v2.3.6` 正式版（2026-10-13）；§九 = `v2.3.6 → v2.3.8` 正式版（2026-10-23）。
 
 > 本文件是「我们维护的代码」与「上游原作者发布版本」之间的对账记录。
 > 每次上游发版，按本文件的流程走一遍，并把新版本追加成一节。
@@ -396,3 +396,90 @@ lb_rules.ip_acl_mode / lb_rules.ip_acl_list
 - 版本口径八处统一 `v2.3.6`（`Dockerfile` ARG、`internal/config` 默认值、
   `docker-compose` `args.VERSION`、`branding.ts` 回退值、`.cnb/web_trigger.yml`
   构建按钮、`.cnb.yml` `BASELINE_TAG`、README 中英基线声明与变更日志）。
+
+---
+
+## 九、v2.3.6 → v2.3.8（2026-10-23 · 追平正式版）
+
+> 本节承接上文。上游在 `v2.3.6`（`9c759716`）之后连发两版：`v2.3.7`（2026-10-15）
+> 与 `v2.3.8`（2026-10-20），中间还有 `v2.3.7-beta` / `v2.3.8-beta` 两个预发标签。
+
+### 9.1 状态速览（实测）
+
+| 项 | 值 |
+|---|---|
+| 分叉点（共同祖先） | `9c759716`（我们的 v2.3.6 基线） |
+| 上游新增 | **90** 个提交（`v2.3.6...v2.3.8`），300 个文件 |
+| 上游 tag tip | `d65578fc`（v2.3.8 正式版） |
+| 上游 master 额外提交 | 2 个（`第92轮审计修复全量落地` 等）——**本轮不追**，tag 才是发布验证点 |
+| 我们侧相对基线 | 以业务代码（`internal/` `caddygeoip/` `web/` 等）整体保留为准 |
+
+> 与 v2.3.5→v2.3.6 那轮（23 提交 / 7 冲突）相比量级翻四倍，且**多组功能两边各做了一遍**
+> （典型：WAF 触发自动封禁——我们只有设计归档 `docs/behavioral-autoban-design.zh-CN.md`，
+> 上游这一版才真正实现并落地），因此本轮不是「机械吸收」，必须按功能归属逐个定归属。
+
+### 9.2 合并手法（与上两轮不同，记录在案）
+
+上两轮用 `git merge-tree` 直接三方合并；本轮体量太大且我们侧改动面覆盖上层语义
+（自动封禁、安全事件、爬虫豁免、威胁大屏），改用**快照 + 反向应用**：
+
+1. 取 `v2.3.8` tag 的**精确快照**作为骨（不取 master tip）；
+2. 把「我们的基线 → 我们的 main」差异反向应用到快照上，得到混入体；
+3. 按文件域**逐块替换**：
+   - **业务代码域**（`internal/` `cmd/` `web/` `caddychain/` `config/`）→ 取我们侧完整实现；
+   - **可独立升级的子模块**（`caddygeoip/` `wafiplist/` `geoipnames/`）→ 取上游为骨，
+     因为上游在这一版对它们做了**内部重构**（耗时侧车退役、爬虫验证、`.fast` 预编译），
+     局部保留我们的版本会直接编译不过；
+   - **构建/CI/文档域**（`Dockerfile` `.dockerignore` `docker-compose.yml` `.gitignore`）→ 取上游为骨，
+     再补回我们独有的部分。
+
+> 之所以不硬做三方合并：本轮冲突块会落在「同一函数被两边重写」的粒度上，人工逐块
+> 判断成本远高于按域定归属，且后者结论可复核（每个域一条判据）。
+
+### 9.3 构建/CI 域：取上游为骨 + 补回我们独有三项
+
+| 文件 | 上游带来了什么 | 我们补回什么 |
+|---|---|---|
+| `Dockerfile` | 层序重排（CRS/xdb 外网层前移）、`--platform=$BUILDPLATFORM` 交叉编译、显式 COPY 清单、构建期依赖版本断言（含 coraza 区间断言） | ① `caddychain/` 的 `COPY` + `--with`（缺则 xcaddy 报 `replacement directory does not exist`）；② **前端构建阶段**（`node:22-alpine` → `npm ci` → `npm run build` → `COPY --from=web-builder`），上游依赖宿主机预构建的 `web/dist`，而我们的 CI 里没有这一步 |
+| `.dockerignore` | 排除前端源码（上游不需要） | 放行 `web/src`、`package.json` 等（否则 web-builder 阶段拿不到源）；只排除 `web/node_modules` 与本地 `web/dist` |
+| `docker-compose.yml` | `start_period: 90s`（与镜像 HEALTHCHECK 对齐）、从节点 `extra_hosts: host.docker.internal:host-gateway` | 自维护镜像地址、主从端口换位段、`VERSION: v2.3.8` |
+| `.gitignore` | 精简版 | 我们的 `# >>> audit-artifact patterns` 块原样补回——**该块与 `scripts/check-no-audit-artifacts.sh` 的模式表双向强一致**，缺一行守卫即红（本轮实测踩到） |
+
+### 9.4 子模块取上游为骨的原因（重要，下次别再试局部保留）
+
+- **`caddygeoip`**：上游把「安全处理耗时侧车文件」整体退役，改为**审计行内嵌
+  `lb_timing` 字段** + 进程内注册表。我们侧仍是侧车实现（`AppendSecurityTiming` /
+  `securityTimingWriterAcquire`）。局部保留直接出现：
+  `undefined: isValidSecurityTimingID`、`undefined: AppendSecurityTiming`。
+  → 取上游整套（`auditwriter.go` / `security_timing*.go` / `blocked_counter.go` 同批替换）。
+- **`wafiplist` / `geoipnames`**：上游新增 `SnapshotGeneration`、`StaleSnapshotGeneration`、
+  `CrawlerEngineVerifyMethod`、`CrawlerVerifyIPRange`、`NormalizeCountry` 等符号，
+  且 `geoipnames` 新增 `crawler-ip-lists.seed.json`（`go:embed` 依赖，缺文件即编译失败）。
+  → 连同 embed 资产一起取上游。
+
+### 9.5 验证
+
+- **冲突标记门**：全仓 `<<<<<<<` / `=======` / `>>>>>>>` 零命中。
+- **后端**：`go build ./...` ✅、`go vet ./...` ✅；五个子模块各自 `go build ./...` ✅。
+- **前端**：`npx vue-tsc --noEmit` ✅、`npm run build` ✅。
+- **单元测试**：`go test ./internal/... ./cmd/...`，与**上游 v2.3.8 原始检出**逐包比对失败集合：
+  - 共有（基线噪声，非本轮引入）：`internal/services` 的 CRS 更新族 8 项——根因是沙箱
+    到 `github.com` 的下载被判积分/长度校验拦截（`download integrity mismatch`），
+    上游检出同样失败；`internal/dnsprovider/{dnspod,tencent}` 的
+    `ownershipAddAndRollbackFailure` 两项——根因是 **root 用户下 chmod 不生效**
+    （以非 root 用户复跑即通过）。
+  - **我们侧独有：0 项**。
+- **Dockerfile 清单门**：`bash scripts/check-dockerfile-copy-manifest.sh` ✅（13 sources）。
+- **版本口径**：`Dockerfile` ARG、`docker-compose` `args.VERSION`、`internal/config` 默认值、
+  `web/src/utils/branding.ts` 回退值、`.cnb/web_trigger.yml` 构建按钮默认值、
+  README 中英基线声明与构建示例——统一 `v2.3.8`。
+
+### 9.6 自维护三项能力（圈层 D）：保留未动
+
+- 链式回退 `chain_fallback`：`caddychain/` 模块 + `internal/services/caddy.go` 渲染链，
+  代码整体保留；`go build` / `go vet` 通过。
+- 引用型证书 `tls_source=file` 摄取入库：`internal/services/certstore.go` 等整体保留。
+- 默认端口换位：`internal/services/default_ports.go` 与相关单测保留。
+
+> 说明：本轮**未**逐条跑这三项的功能钉测（沙箱无 Caddy 运行态），只做编译/静态验证；
+> 行为级回归请以 CI 与真机为准。

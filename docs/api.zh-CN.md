@@ -7,12 +7,14 @@
 - **Swagger UI**（交互调试）：`http://<host>:8000/api/v1/docs`
 - **OpenAPI 规范**：`http://<host>:8000/api/v1/openapi.yaml`
 
+> **鉴权提示**：`/api/v1/openapi.yaml` 需登录鉴权——请求须携带 `Authorization: Bearer <JWT>`（或已登录面板的登录态），匿名直接访问返回 `401`。`/api/v1/docs` 页面本身公开，但页面内加载规格同样依赖已登录浏览器（从 localStorage 取令牌注入请求头）；未登录时页面会提示改用带令牌的请求。
+
 ## 认证
 
 | 方式 | Header | 说明 |
 |---|---|---|
 | JWT | `Authorization: Bearer <token>` | 登录 `/api/v1/auth/login` 获取 |
-| API Key | `X-API-Key: lb_sk_...` | 管理面板创建；非管理员 Key 强制只读 |
+| API Key | `X-API-Key: lb_sk_...` | 管理面板创建；非管理员 Key 默认只读（自助写除外：`PATCH /users/me`、`/users/me/api-keys` 系列） |
 
 ## 端点概览
 
@@ -52,4 +54,4 @@
 
 > **限流/锁定的节点本地性**：429 背后的登录/IP 限流桶与账户级登录锁定均为面板实例**本地状态**（内存/本地库），多节点部署时不共享——同一来源在 N 个节点各有一份独立预算与独立锁定判定（仅活跃锁 `locked_until` 随用户快照单向同步到从节点）。见部署指南「面板访问与安全语义」一节。
 
-> **口径约定**：上表通用错误码对各端点全局适用；动态端点文档（`/api/v1/docs`）的每行 `errors` 仅登记该端点**业务特有**的错误形态（如 400 port_or_domain_conflict 域名/端口冲突、428 MFA 验证），通用码不逐行重复列出。
+> **口径约定**：上表通用错误码对各端点全局适用；动态端点文档（`/api/v1/docs`）的每行 `errors` 仅登记该端点**业务特有**的错误形态（如 400 source_rule_invalid 源规则字段校验失败、409 cert_job_running 证书任务运行中、428 MFA 验证），通用码不逐行重复列出。

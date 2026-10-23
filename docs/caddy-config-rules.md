@@ -1,9 +1,12 @@
 # Caddy 配置与规则管理
 
-> 机制现状(2026-09-12 同步,SR11-F4):Caddy 层校验走 `caddy validate` CLI
-> (真 validate-only)+ 事务内 `ApplyConfigFromTx` 终门;字段级校验
+> 机制现状(2026-09-12 同步):Caddy 层校验走 `caddy validate` CLI
+> (语义=完整 provision，仅跳过 Start——见「关键函数说明」)+ 事务内
+> `ApplyConfigFromTx` 终门;字段级校验
 > (`validateRulePayloadBeforeSave`/`validateRuleFeatures`)仍活跃。v2.2.5 时代的
 > 探针/合并校验函数已撤除(见「关键函数说明」)。
+>
+> 口径说明：本文是工程标准文档（不在 README 用户文档索引内），用于工程实现与裁定溯源；面向用户/官网的文案不得引用内部流程口径。
 
 # Caddy 配置管理规范
 
@@ -19,13 +22,12 @@
 ### 端口范围限制
 - 端口必须在 1-65535 范围内
 - 8000、2019 端口保留给 admin 接口；创建/更新规则还会按部署实际配置拦截
-  管理面板监听口（`PANEL_PORT` env 或 config 文件 `port`，admin TLS 与面板同口）
-  与 Caddy admin 端口（`caddy_admin_url` 解析），自定义部署不再只依赖硬编码默认值
-- `HTTP_PORT` / `HTTPS_PORT`（出厂 80/443）是 HTTP/HTTPS 保留端口：TCP 规则不得
-  抢占；HTTP 默认口还承担「TLS 跳转自环」与「跳转遮蔽」判定（改口后判定基准随动）
+  管理面板监听口（config 文件 `port`，admin TLS 与面板同口）与 Caddy admin
+  端口（`caddy_admin_url` 解析），自定义部署不再只依赖硬编码默认值
 
 ### 协议冲突检测
 - **HTTP/HTTPS 规则**：可以与其他 HTTP/HTTPS 规则共用端口（同协议）
+- **TLS/明文混布**：同一端口不能同时存在 `enable_tls=1` 与 `enable_tls=0` 的启用 HTTP 规则（监听器形态二选一）
 - **TCP 规则**：独占端口，不能与 HTTP/HTTPS 规则共用端口
 
 ```
@@ -103,6 +105,8 @@ TCP规则A(port=8080) + TCP规则B(port=8080) → 冲突（TCP 端口独占；�
 
 ## 系统启动流程
 
+> 现行入口协议：监督器先等待 Caddy API 就绪并回放 last-known-good，再写入回放标记；应用侧 `waitStartupReplayDone()` 等待该标记（上限 30s）后才应用数据库渲染配置。排障时不要只看 `/config/` 就绪。
+
 ```
 1. 等待 Caddy API 就绪
    └── 轮询 http://localhost:2019/config/ 直到返回非500状态
@@ -158,7 +162,7 @@ for i, d := range domainHosts {
 
 ```json
 {
-  "@id": "lb_xxxxxxxxxxxx",
+  "@id": "lb_xxxxxxxxxx",
   "match": [{
     "host": ["abc.com", "def.com"]
   }],
@@ -166,16 +170,25 @@ for i, d := range domainHosts {
 }
 ```
 
-### Handle Chain 顺序
+### Handle Chain 关键顺序
+
+GeoIP 打标不在主路由的 `handle` 链内。任一绑定策略启用地域拦截时，渲染器在主路由前追加同 Host 的独立兄弟 pass 路由，以 `geoip2region` 设置 `{http.vars.geoip.*}` 占位符和 `X-LB-GeoIP-*` 请求头（伪造头先剥后设），供后续 IP 预检与 WAF 消费。
+
+主路由按配置条件发射以下关键处理器：
+
 1. **headers**（X-LB-Rule-ID 注入）：HTTP 规则绑定安全策略时链首注入归因头（供预检与 coraza 事务消费，reverse_proxy 前无条件剥离，不直达上游）
-2. **geoip2region 标签层**：规则任意绑定策略启用地域拦截时，先于 IP 预检为每请求标注 `X-LB-GeoIP-Loc` 归属地头（供 GeoIP 预检链第二段匹配；伪造头先剥后设）
-3. **IP 预检**：多策略绑定时合并全部绑定策略 deny 侧 IP 控制的极简 coraza 预检查器（先于全部 rate_limit/waf）——链序：信任（id:3/12 DetectionOnly）→ deny 并集（id:2）→ 遗留黑名单（id:4）→ allow 交集外拒绝（id:7）→ allow 命中豁免 GeoIP（id:13，第 58 轮裁定）→ 逐策略 GeoIP 链（800000+policyID）
-4. **阶段 0 信任直通包裹**：绑定含 stage0 直通策略（trust_detection=0）且命中信任 IP 时，以 subroute 短路后续全部安全阶段（不产生事件）；保留检测（td=1）不包裹——走 DetectionOnly 全评估不拦但全记录
-5. **encode**（压缩）：如果启用压缩且有 gzip/zstd——位于全部 waf 处理器之外侧（SR11-F3 同步：R1 裁定，coraza 响应拦截器需包在 encode 内侧）
-6. **request_body**：配置了请求体上限时——先于全部 waf 处理器（新-1 裁定，body 解析需在 WAF 前）
-7. **rate_limit / waf**：按绑定策略 policy_id ASC 依次编入各策略的处理器组（限流先于 WAF）
-8. **headers**（Server 头隐藏）：server_tokens_hidden 时 deferred 删除 Server 响应头（须推迟到上游响应写入之后）。2026-09-06 裁定（T-3）：规则级 `server_tokens_hidden`（0=随全局 / 1=隐藏 / 2=显示）为 **API/MCP 预留字段，无 UI 入口、不作为产品功能维护**；管理面板仅提供全局开关（基础设置），UI 规则编辑仅透传保留 API 已设值
-9. **reverse_proxy**（反向代理）：主要处理逻辑；HostHeader 折入 reverse_proxy 的 request.headers（set Host），不再单独发射 headers 处理器
+2. **lb_rule_metrics**：全 HTTP 规则的流量指标收点，位于安全处理器之前
+3. **lb_security_blocked_counter**：安全库可用且绑定策略时发射，包装后续安全段并统计拦截
+4. **安全段**：存在阶段 0 直通策略（`trust_detection=0`）时，整段包入 `not client_ip` 的 subroute；命中信任并集的请求跳过本段，不产生安全事件。保留检测（`trust_detection=1`）不包裹，信任 IP 走 DetectionOnly 全评估不拦但全记录。段内依次为：
+   - **IP 预检**：多策略绑定时合并全部绑定策略 deny 侧 IP 控制的极简 coraza 预检查器——信任（id:3/12 DetectionOnly）→ deny 并集（id:2）→ 遗留黑名单（id:4）→ allow 交集外拒绝（id:7）→ allow 命中豁免 GeoIP（id:13）→ 逐策略 GeoIP 链（800000+policyID）
+   - **lb_security_timing_pre**：预检之后、请求体处理与策略评估之前的分段计时收点
+   - **encode**（压缩）：启用压缩且包含 gzip/zstd 时发射，位于全部 waf 处理器外侧
+   - **request_body**：先于全部 waf 处理器限制请求体
+   - **rate_limit / waf**：全部启用策略的限流先集中发射，再按 policy_id ASC 发射各策略 WAF
+   - **lb_security_timing_end**：安全段末尾的计时收点
+5. **headers**（Server 头隐藏）：server_tokens_hidden 时 deferred 删除 Server 响应头（须推迟到上游响应写入之后）。规则级 `server_tokens_hidden`（0=随全局 / 1=隐藏 / 2=显示）为 **API/MCP 预留字段，无 UI 入口、不作为产品功能维护**；管理面板仅提供全局开关（基础设置），UI 规则编辑仅透传保留 API 已设值
+6. **map**（逐上游回源域名）：静态上游配置 origin_domain 时，在 reverse_proxy 前发射 dial→origin_domain 映射，晚绑定生成 Host/SNI 占位符
+7. **reverse_proxy**（反向代理）：主要处理逻辑；HostHeader 折入 reverse_proxy 的 request.headers（set Host），不再单独发射 headers 处理器
 
 ### 上游服务器配置
 
@@ -232,7 +245,7 @@ for i, d := range domainHosts {
 
 使用 `@id` 实现精确路由管理：
 
-- 每个规则有唯一的 `caddy_id`（13位随机字符串）
+- 每个规则有唯一的 `caddy_id`（`lb_` + 10 位随机字符，总长 13）
 - 路由对象通过 `@id` 标识
 - `@id` 用于在完整配置中稳定标识规则及关联运行数据
 - 创建、更新、启用、禁用和删除均由数据库状态驱动全量配置重建
@@ -247,14 +260,14 @@ for i, d := range domainHosts {
   "handler": "static_response",
   "body": "Lazy Balancer V2 is running!"
   # ↑ 默认文案;可经 data/branding.json 的 landing_text 覆盖(见
-  # docs/deployment.zh-CN.md 品牌定制段——主节点修改经集群「全局配置」通道
-  # 自动分发到从节点)。
+  # docs/deployment.zh-CN.md 品牌定制段——主节点修改随集群恒同步的
+  # 「系统数据」节自动分发到从节点)。
 }
 ```
 
 ## 配置验证
 
-`POST /config/validate`(handlers/caddy.go):真 validate-only——2026-09-06 裁定 ④' 后主径为 **`caddy validate` CLI**(provision 不运行、不绑端口、零运行时扰动),CLI 不可用回退 R69 C-N3-c 的 load+回弹口径(校验后恢复原配置)。此前经 Caddy admin `/load?validate=true` 的探针已撤除——v2.11.4 的 handleLoad 无视 validate 参数,成功即真实加载。
+`POST /config/validate`(handlers/caddy.go):2026-09-06 裁定 ④' 后主径为 **`caddy validate` CLI**。语义如实：`caddy validate` 会执行**完整 provision**（加载全部模块、初始化证书加载器/provider 等），只在完成后跳过 Start——即不绑端口、不启动服务、不触碰运行中的 Caddy 实例，但并非「零副作用」（例如可能加载证书/触发 provider 初始化）。CLI 不可用回退 load+回弹口径(校验后恢复原配置)。此前经 Caddy admin `/load?validate=true` 的探针已撤除——v2.11.4 的 handleLoad 无视 validate 参数,成功即真实加载。
 
 写路径(创建/更新/启用规则等)的四道关卡:前端表单校验 → 后端字段校验(`validateRuleFeatures`/`validateRulePayloadBeforeSave`)→ 事务内 CLI 校验(`ValidateTxRenderViaCLI`,输入=事务视图最终渲染)→ 事务内 `ApplyConfigFromTx` 终门(拒绝即回滚,DB 零变更)。
 

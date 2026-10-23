@@ -19,7 +19,7 @@ x-common-healthcheck: &common-healthcheck
   interval: 30s
   timeout: 5s
   retries: 3
-  start_period: 30s
+  start_period: 90s
 
 services:
   # 主从两个容器共用同一镜像。
@@ -41,7 +41,7 @@ services:
         # FE-8/INFRA-4（第 73 轮登记）：版本号三处硬编码之一（另两处
         # Dockerfile ARG VERSION、web/src/utils/branding.ts appVersion 回退值）。
         # 发版检查单已固化进 lazy-balancer-release 技能步骤 2——仅登记防漏 bump。
-        VERSION: v2.3.6
+        VERSION: v2.3.8
     container_name: lazy-balancer
     network_mode: host
     # Port mapping is not used with host network; Caddy binds directly to host ports.
@@ -77,6 +77,9 @@ services:
     image: docker.cnb.cool/xzydm/mirrors/lazy-balancer-v2:latest
     logging: *common-logging
     container_name: lazy-balancer-slave
+    # host.docker.internal 在 Linux 上不由 Docker 自动注入，显式经 host-gateway 映射
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "8001:8000"
     volumes:

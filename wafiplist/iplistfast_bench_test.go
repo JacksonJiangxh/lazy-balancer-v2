@@ -143,13 +143,9 @@ func BenchmarkParseIPListFile_200000(b *testing.B) {
 	if err := os.WriteFile(path, []byte(strings.Join(entries, "\n")+"\n"), 0o644); err != nil {
 		b.Fatal(err)
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		b.Fatal(err)
-	}
 	b.ReportAllocs()
 	for b.Loop() {
-		if _, err := parseIPListFile(path, info); err != nil {
+		if _, err := parseIPListFile(path); err != nil {
 			b.Fatal(err)
 		}
 	}

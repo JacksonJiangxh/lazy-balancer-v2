@@ -44,7 +44,7 @@ fs.file-max = 2097152
 
 每个连接消耗一个 fd（含 TLS/日志/证书文件）。容器内进程上限由 compose
 `ulimits` 控制（仓库已配置），宿主机 systemd 单元如需放宽：
-`/etc/systemd/docker.service.d/override.conf` 设 `LimitNOFILE=1048576`。
+`/etc/systemd/system/docker.service.d/override.conf` 设 `LimitNOFILE=1048576`。
 
 ### HTTP/3 端口
 
@@ -66,10 +66,14 @@ docker logs lazy-balancer 2>&1 | grep -c "receive buffer"  # 重启后应为 0
 
 ### 2.1 上游连接复用（收益最大的单项优化）
 
-到上游默认每请求新建 TCP 连接；开启 keepalive 后空闲连接复用，省去每请求的
-TCP 握手 + 慢启动。高 QPS 场景延迟与上游负载双降。
+到上游默认继承 Caddy/Go Transport 的空闲连接复用（空闲超时 2 分钟），并非每请求
+新建 TCP 连接；复用省去重复的 TCP 握手 + 慢启动。高 QPS 场景延迟与上游负载双降。
 
-- **全局默认**：设置 → Caddy 设置 → 上游 KeepAlive 空闲超时（`upstream_keepalive_timeout`）
+该字段是**空闲超时**而非「开启/关闭复用」的开关：0 = 不改写默认（继承 Caddy/Go
+Transport 的 2 分钟），>0 时渲染为 reverse_proxy transport 的
+`keep_alive.idle_timeout`，只调整复用窗口长短。
+
+- **全局默认**：设置 → Caddy 设置 → 上游 KeepAlive 空闲超时（`upstream_keepalive_timeout`，0 = 继承默认）
 - **规则级覆盖**：规则编辑 → 传输设置（规则值 >0 时覆盖全局）
 - **建议值**：60–120 秒（小于上游服务器自身的空闲超时，避免复用已被上游关闭的连接）
 - 上游为 HTTPS 时复用同时省 TLS 握手，收益更大
@@ -110,7 +114,7 @@ TCP 握手 + 慢启动。高 QPS 场景延迟与上游负载双降。
   reverse_proxy `max_requests`）防止单一上游被打穿。
 - **版本隐藏**：全局开关（基础设置，`server_tokens_hidden`，渲染为 deferred
   headers 处理器隐藏 Server 头）。注：规则级 `server_tokens_hidden` 为
-  API/MCP 预留字段（2026-09-06 起，无 UI 入口），取值 0=随全局 / **1=隐藏** /
+  API/MCP 预留字段（无 UI 入口），取值 0=随全局 / **1=隐藏** /
   **2=显示**——与 v2.2.5 前文档所述「2=完全隐藏」相反，以实现为准。
 
 ---
@@ -123,12 +127,18 @@ TCP 握手 + 慢启动。高 QPS 场景延迟与上游负载双降。
 off → detection（观察 3–7 天，事件日志零误报确认） → blocking
 ```
 
-detection 模式仅记录不拦截；切换 blocking 前用安全事件页确认误报率，
+> WAF 模式共四态：关闭 / 仅自定义（custom_only）/ 检测 / 拦截。上面的箭头链是
+> 「CRS 从观察到拦截」的标准路径；**仅自定义**不在该链上——它让 CRS 不生效、
+> 只按自定义规则自身的动作执行，适合「先上自定义规则、暂不启用 CRS」的场景，
+> 可直接从关闭切到仅自定义，或从仅自定义切到检测。四态语义以
+> security.zh-CN.md 的模式表为准。
+
+detection 模式 CRS 仅记录不拦截（自定义规则仍按规则内动作执行）；切换 blocking 前用安全事件页确认误报率，
 误报处理优先用「CRS 排除规则」或自定义放行规则，而非调低阈值。
 
 ### 3.2 CRS 规则组裁剪
 
-> 阶段化模型（2026-09-20 起）：CRS 规则组属于**阶段 3 · WAF 类型策略**（与限流
+> 阶段化模型：CRS 规则组属于**阶段 3 · WAF 类型策略**（与限流
 > 等其它阶段分属不同策略实体）；下文的规则组裁剪在 WAF 类型策略的编辑页操作。
 
 只启用业务相关的规则组（策略编辑 → CRS 规则组），降低每请求的规则评估开销

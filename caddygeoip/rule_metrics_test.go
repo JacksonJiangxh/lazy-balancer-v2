@@ -76,3 +76,21 @@ func TestRuleMetricsHandler_nilMetricsDegrades(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// Provision 预解析标签句柄钉：Rule 是渲染期静态值，句柄在 Provision 期
+// 一次解析，热路径只做 Inc/Add；退回每请求 WithLabelValues（vec map 读锁
+// 查找）时本钉的句柄字段将不复存在（编译期失败）。
+func TestRuleMetricsHandler_provisionResolvesHandles(t *testing.T) {
+	h := newTestRuleMetricsHandler(t, "lb_handles_pin")
+	if h.reqCounter == nil || h.inFlight == nil || h.bytesIn == nil || h.bytesOut == nil {
+		t.Fatal("Provision must pre-resolve counter/gauge label handles")
+	}
+	for _, class := range statusClasses {
+		if h.statusByClass[class] == nil {
+			t.Fatalf("statusByClass[%s] unresolved at Provision", class)
+		}
+	}
+	if got := testutil.ToFloat64(h.reqCounter); got != 0 {
+		t.Fatalf("reqCounter=%v, want 0 (fresh series)", got)
+	}
+}
