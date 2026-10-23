@@ -241,9 +241,10 @@
         </el-table-column>
       </el-table>
 
-      <div style="margin-top: 16px; display: flex; align-items: center; flex-wrap: wrap; row-gap: 8px;">
-        <LogStorageBar log-key="security_events" :refresh-key="logStorageRefreshKey" style="margin-right: auto" />
+      <div class="events-footer">
+        <LogStorageBar log-key="security_events" :refresh-key="logStorageRefreshKey" class="events-storage" />
         <el-pagination
+          class="events-pagination"
           v-model:current-page="page"
           v-model:page-size="pageSize"
           :total="total"
@@ -990,4 +991,9 @@ const refreshPage = (): void => {
 :global(.autoban-confirm-box .el-message-box__container) { padding: 0 24px; }
 :global(.autoban-confirm-box .el-message-box__message) { display: block; padding: 4px 0 0; }
 :global(.autoban-confirm-box .el-message-box__btns) { padding: 18px 24px 20px 0; }
+
+/* 日志统计与分页固定同一行：统计占满剩余宽度并在内部省略，分页不换行、不被挤压。 */
+.events-footer { margin-top: 16px; display: flex; align-items: center; gap: 16px; flex-wrap: nowrap; }
+.events-storage { flex: 1 1 auto; min-width: 0; }
+.events-pagination { flex: 0 0 auto; white-space: nowrap; }
 </style>

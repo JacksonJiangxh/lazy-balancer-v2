@@ -99,10 +99,10 @@ const sizeText = computed(() => {
 const noteText = computed(() => {
   const i = info.value
   if (!i) return ''
-  // 条数上限形态(安全事件)
+  // 条数上限形态(安全事件)：行内只保留清理策略，保留期/行宽/理论体积等
+  // 细节放在 hover tooltip（retention_note），避免长文案挤压分页。
   if (i.limit_rows) {
-    const note = `超限后每日清理按最旧优先裁剪${i.retention_note ? '，' + i.retention_note : ''}`
-    return rowsUnavailable.value ? `行数暂不可用（稍后自动重试）；${note}` : note
+    return rowsUnavailable.value ? '行数暂不可用；超限按最旧优先清理' : '超限按最旧优先清理'
   }
   const parts: string[] = []
   if (i.limit_bytes) parts.push(`满 ${humanSize(i.limit_bytes)} 轮转`)
@@ -118,7 +118,7 @@ const noteText = computed(() => {
   return parts.join('，')
 })
 
-const tooltipContent = computed(() => `${info.value?.config_source || ''}${info.value?.retention_note ? ' · ' + info.value.retention_note : ''}`)
+const tooltipContent = computed(() => `${info.value?.config_source || ''}${info.value?.retention_note ? ' · ' + info.value.retention_note : ''}${info.value?.limit_rows ? ' · 超出上限时按最旧优先清理' : ''}`)
 
 let loadStatsSeq = 0
 const loadStats = async (): Promise<void> => {
@@ -145,9 +145,9 @@ watch(() => props.refreshKey, () => { void loadStats() }, { immediate: true })
    全部五处父级(事件日志/操作日志/规则日志弹窗/规则集更新弹窗/证书任务弹窗)
    共用同一 flex+margin-right:auto 模式,组件级一处修复全覆盖。 */
 .log-storage-bar { font-size: 12px; color: #6b7280; min-width: 0; }
-.bar-body { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.bar-body { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1 1 auto; }
 .name { white-space: nowrap; }
 .sizes { white-space: nowrap; color: #374151; }
 .bar { width: 90px; flex-shrink: 0; }
-.note { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.note { flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 </style>

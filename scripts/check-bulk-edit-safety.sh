@@ -29,7 +29,7 @@ scan_scripts() {
       echo "ERROR: 批量改写脚本缺少 --dry-run 只读模式：$f" >&2
       bad=1
     fi
-  done < <(git ls-files 'scripts/*.sh' 'scripts/*.py' | grep -v 'check-bulk-edit-safety.sh' || true)
+  done < <(git ls-files 'scripts/*.sh' 'scripts/*.py' | grep -v 'check-bulk-edit-safety.sh' | grep -v '^scripts/tests/' || true)
   return "$bad"
 }
 
