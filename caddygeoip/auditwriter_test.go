@@ -18,6 +18,7 @@ import (
 	"github.com/corazawaf/coraza/v3"
 	"github.com/corazawaf/coraza/v3/experimental/plugins"
 	"github.com/corazawaf/coraza/v3/experimental/plugins/plugintypes"
+	"github.com/corazawaf/coraza/v3/types"
 )
 
 // plugintypesConfigFor 构造指向 path 的审计写插件配置（JSON 格式）。
@@ -1924,5 +1925,184 @@ func TestSecurityBlockedCounter_cleanupCoalescedAcrossInstances(t *testing.T) {
 	case <-firstDone:
 	case <-time.After(2 * time.Second):
 		t.Fatal("首个 Cleanup 未在排空后返回")
+	}
+}
+
+// 合并窗口内被快进（不排空等待）的 Cleanup 仍必须把 bufio 残留刷盘：reload
+// 领到冲刷资格后窗口内进程停止时，停机那次 Cleanup 是唯一收尾机会——省掉的
+// 只能是等待，不能是刷盘，否则最后一批审计行随进程退出静默丢失。
+func TestFlushAuditPipelines_coalescedStillFlushes(t *testing.T) {
+	oldWindow := auditFlushCoalesceWindow
+	auditFlushCoalesceWindow = time.Minute
+	t.Cleanup(func() {
+		auditFlushCoalesceWindow = oldWindow
+		auditLastFlushNano.Store(0)
+	})
+	auditLastFlushNano.Store(0)
+
+	target := filepath.Join(t.TempDir(), "audit.log")
+	p := &auditPipeline{target: target, mode: 0o644}
+	if err := p.openFile(0o644); err != nil {
+		t.Fatalf("openFile: %v", err)
+	}
+	auditPipelinesMu.Lock()
+	auditPipelines[target] = p
+	auditPipelinesMu.Unlock()
+	t.Cleanup(func() {
+		auditPipelinesMu.Lock()
+		delete(auditPipelines, target)
+		auditPipelinesMu.Unlock()
+		p.closeFile()
+	})
+
+	// Given 一次 reload 已领到冲刷资格，随后有行落在 bufio 里（500ms 周期
+	// 刷盘尚未到来）
+	if !claimAuditFlush(time.Now()) {
+		t.Fatal("首个冲刷资格必须领取成功（前置条件）")
+	}
+	p.ioMu.Lock()
+	if _, err := p.bw.WriteString("{\"tail\":1}\n"); err != nil {
+		p.ioMu.Unlock()
+		t.Fatalf("write bufio: %v", err)
+	}
+	p.ioMu.Unlock()
+
+	// When 窗口内的停机 Cleanup
+	start := time.Now()
+	FlushAuditPipelines()
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("窗口内 Cleanup 等待 %v；快进分支不得做排空等待", elapsed)
+	}
+
+	// Then 已刷盘（旧实现直接 return，行随进程退出丢弃）
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read audit file: %v", err)
+	}
+	if !strings.Contains(string(data), `{"tail":1}`) {
+		t.Fatalf("审计文件=%q；窗口内快进的 Cleanup 必须刷盘", data)
+	}
+}
+
+// estimateTestMessage 与 coraza 内置 Message 同形（导出字段进 JSON），用于
+// 钉「估算 >= 实际序列化字节」。
+type estimateTestMessage struct {
+	Actionset_    string                   `json:"actionset"`
+	Message_      string                   `json:"message"`
+	ErrorMessage_ string                   `json:"error_message"`
+	Data_         *estimateTestMessageData `json:"data"`
+}
+
+func (m estimateTestMessage) Actionset() string    { return m.Actionset_ }
+func (m estimateTestMessage) Message() string      { return m.Message_ }
+func (m estimateTestMessage) ErrorMessage() string { return m.ErrorMessage_ }
+func (m estimateTestMessage) Data() plugintypes.AuditLogMessageData {
+	return m.Data_
+}
+
+type estimateTestMessageData struct {
+	File_     string   `json:"file"`
+	Line_     int      `json:"line"`
+	ID_       int      `json:"id"`
+	Rev_      string   `json:"rev"`
+	Msg_      string   `json:"msg"`
+	Data_     string   `json:"data"`
+	Severity_ int      `json:"severity"`
+	Ver_      string   `json:"ver"`
+	Maturity_ int      `json:"maturity"`
+	Accuracy_ int      `json:"accuracy"`
+	Tags_     []string `json:"tags"`
+	Raw_      string   `json:"raw"`
+}
+
+func (d *estimateTestMessageData) File() string   { return d.File_ }
+func (d *estimateTestMessageData) Line() int      { return d.Line_ }
+func (d *estimateTestMessageData) ID() int        { return d.ID_ }
+func (d *estimateTestMessageData) Rev() string    { return d.Rev_ }
+func (d *estimateTestMessageData) Msg() string    { return d.Msg_ }
+func (d *estimateTestMessageData) Data() string   { return d.Data_ }
+func (d *estimateTestMessageData) Ver() string    { return d.Ver_ }
+func (d *estimateTestMessageData) Maturity() int  { return d.Maturity_ }
+func (d *estimateTestMessageData) Accuracy() int  { return d.Accuracy_ }
+func (d *estimateTestMessageData) Tags() []string { return d.Tags_ }
+func (d *estimateTestMessageData) Raw() string    { return d.Raw_ }
+func (d *estimateTestMessageData) Severity() types.RuleSeverity {
+	return types.RuleSeverity(d.Severity_)
+}
+
+// 估算必须不低于实际序列化字节：enqueue 按估算执法字节预算，低估即意味着
+// 实际驻留可突破 auditQueueByteBudget 数倍（header 洪峰是主要放大器）。
+func TestEstimateAuditSnapshotBytes_isUpperBound(t *testing.T) {
+	mkMsg := func(pad int) estimateTestMessage {
+		return estimateTestMessage{
+			Actionset_: "block",
+			Message_:   "SQL Injection Attack",
+			Data_: &estimateTestMessageData{
+				File_: "REQUEST-942-APPLICATION-ATTACK-SQLI.conf", Line_: 61,
+				ID_: 942100, Rev_: "4", Msg_: "SQLi", Data_: strings.Repeat("x", pad),
+				Severity_: 2, Ver_: "1.0", Maturity_: 4, Accuracy_: 8,
+				Tags_: []string{"application-multi", "language-multi", "attack-sqli"},
+				Raw_:  "SecRule REQUEST_COOKIES|!REQUEST_COOKIES:/__utm/ \"@detectSQLi\"",
+			},
+		}
+	}
+	envelope := func() auditSnapshot {
+		return auditSnapshot{
+			Transaction_: auditSnapshotTransaction{
+				Timestamp_: "23/Oct/2026:10:00:00 +0800", UnixTimestamp_: 1790000000,
+				ID_: "abcdefghijklmnop", ClientIP_: "203.0.113.7", ClientPort_: 51234,
+				HostIP_: "10.0.0.2", HostPort_: 443, ServerID_: "srv-1",
+				Request_: &auditSnapshotRequest{
+					Method_: "GET", Protocol_: "HTTP/1.1", URI_: "/admin",
+					HTTPVersion_: "HTTP/1.1", Length_: 0,
+					Headers_: map[string][]string{"host": {"example.com"}},
+				},
+				Response_: &auditSnapshotResponse{
+					Protocol_: "HTTP/1.1", Status_: 403,
+					Headers_: map[string][]string{"content-type": {"text/html"}},
+				},
+				Producer_: &auditSnapshotProducer{
+					Connector_: "caddy", Version_: "v3.8.1", Server_: "coraza",
+					RuleEngine_: "On", Stopwatch_: "total=1ms",
+					Rulesets_: []string{"crs"},
+				},
+				HighestSeverity_: "CRITICAL", IsInterrupted_: true,
+			},
+		}
+	}
+
+	headerHeavy := envelope()
+	for i := 0; i < 1000; i++ {
+		headerHeavy.Transaction_.Request_.Headers_[fmt.Sprintf("h%d", i)] = []string{"v"}
+	}
+	filesCase := envelope()
+	for i := 0; i < 200; i++ {
+		filesCase.Transaction_.Request_.Files_ = append(filesCase.Transaction_.Request_.Files_,
+			auditSnapshotFile{Name_: "upload.bin", Size_: 1024, Mime_: "application/octet-stream"})
+	}
+	messagesCase := envelope()
+	for i := 0; i < 50; i++ {
+		messagesCase.Messages_ = append(messagesCase.Messages_, mkMsg(64))
+	}
+
+	cases := []struct {
+		name string
+		snap *auditSnapshot
+	}{
+		{"header 密集", &headerHeavy},
+		{"上传文件", &filesCase},
+		{"多 messages", &messagesCase},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			serialized, err := json.Marshal(tc.snap)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			got := estimateAuditSnapshotBytes(tc.snap)
+			if got < int64(len(serialized)) {
+				t.Fatalf("估算 %d < 序列化 %d：预算按估算执法，低估即实际驻留可突破上限", got, len(serialized))
+			}
+		})
 	}
 }

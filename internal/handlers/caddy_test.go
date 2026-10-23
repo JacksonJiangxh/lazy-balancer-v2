@@ -930,6 +930,51 @@ func TestValidateConfig_restoreFailurePersistsApplyBanner(t *testing.T) {
 	}
 }
 
+// 校验回退路径的系统故障分流：admin 对 /load?validate=true 返回 5xx 时，
+// 必须映射 500「配置校验请求失败（运行配置已恢复）」而不是 400「配置验证
+// 失败」——基础设施故障不得被表述成用户配置错误（4xx 才是候选配置被拒）。
+func TestValidateConfig_adminSystemFailureMapsTo500(t *testing.T) {
+	newBackupTestHandlers(t)
+	var restoreLoads atomic.Int32
+	fakeCaddy := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/config/":
+			_, _ = response.Write([]byte(`{}`))
+		case request.Method == http.MethodPost && request.URL.Path == "/load" && request.URL.Query().Get("validate") == "true":
+			response.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = response.Write([]byte(`{"error":"provision panic"}`))
+		case request.Method == http.MethodPost && request.URL.Path == "/load":
+			restoreLoads.Add(1)
+			_, _ = response.Write([]byte(`{}`))
+		default:
+			response.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(fakeCaddy.Close)
+	h := &Handlers{
+		cfg:          &config.Config{CaddyAdminURL: fakeCaddy.URL},
+		caddyService: services.NewCaddyService(fakeCaddy.URL),
+	}
+	h.caddyService.SetCLIValidatorForTest(func([]byte) error { return services.ErrCLIValidatorUnavailable })
+	router := gin.New()
+	router.POST("/config/validate", h.ValidateConfig)
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/config/validate", strings.NewReader(`{"apps":{"http":{}}}`))
+	request.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s, want 500（系统故障不得伪装成配置无效）", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "配置校验请求失败（运行配置已恢复）") {
+		t.Fatalf("message=%s, want 系统故障文案", response.Body.String())
+	}
+	if restoreLoads.Load() == 0 {
+		t.Fatal("失败后必须回弹权威配置（/load）")
+	}
+}
+
 // pause 生命周期（与 entrypoint 监督器协议）：stopCaddy 先建 pause 抑制
 // 监督器重启，停止失败必须回滚删除——否则监督器被永久抑制，Caddy 停摆。
 func TestStopCaddy_failureRemovesPauseFile(t *testing.T) {

@@ -25,9 +25,16 @@ var clusterProcessStartedAt = time.Now()
 func (s *SyncService) Report(ctx context.Context) error {
 	var masterURL, token, storedSyncError string
 	var appliedVersion int
+	var isMaster bool
 	var lastSync sql.NullTime
-	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(master_url,''), COALESCE(cluster_token,''), COALESCE(applied_version,0), last_sync, COALESCE(last_sync_error,'') FROM global_config WHERE id=1`).Scan(&masterURL, &token, &appliedVersion, &lastSync, &storedSyncError); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(master_url,''), COALESCE(cluster_token,''), COALESCE(applied_version,0), last_sync, COALESCE(last_sync_error,''), COALESCE(is_master,1) FROM global_config WHERE id=1`).Scan(&masterURL, &token, &appliedVersion, &lastSync, &storedSyncError, &isMaster); err != nil {
 		return fmt.Errorf("读取上报状态: %w", err)
+	}
+	// 升主后本节点已无上报对象：master_url 被清空，继续构造只会必然失败并让
+	// 调用方把「状态上报失败: …」交给 recordSyncError。写侧虽有从端角色谓词兜底，
+	// 这里仍 fail-early——避免无意义请求与错误文案进入日志/审计。
+	if isMaster {
+		return nil
 	}
 	lastSyncError, reportSyncErrorCode := decodeSyncError(storedSyncError)
 	lastSyncAt := ""

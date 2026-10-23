@@ -58,6 +58,15 @@ func (err *importCoordinatorError) actionLabel() string {
 func (err *importCoordinatorError) Error() string { return importFailureAuditDescription(err) }
 func (err *importCoordinatorError) Unwrap() error { return err.err }
 
+// actionLabel 返回会话的动作词（「导入」/「还原」）；空值按「导入」处理，
+// 文案与审计动作不得出现空动作词。
+func (session *configImportSession) actionLabel() string {
+	if session.action == "" {
+		return "导入"
+	}
+	return session.action
+}
+
 // importFailurePhaseDescription 返回与动作词无关的阶段判定（审计 detail、
 // HTTP 文案共用单源）。空串=未知阶段。
 //
@@ -142,6 +151,17 @@ type configImportSession struct {
 	// 仅此情形才允许清理「消失规则」与「失效证书任务」——users-only 等
 	// 分类导入必须对 live 的 cert_jobs/证书文件零触碰。
 	replaceRuleArtifacts bool
+	// wafSnapshot 是导入落盘前的 WAF 文件快照（CRS 整树/xdb/威胁名单）。
+	// 落盘发生在事务提交之前：abort 回滚数据库后必须把文件同批回退，
+	// commit 成功则丢弃。nil=本次导入未写任何 WAF 文件。
+	wafSnapshot *lbbakWafFileSnapshot
+	// wafRestoreAttempted/wafRestoreErr 记录 abort 时的文件回退结论，
+	// 失败响应据此显性告知文件是否与数据库分叉（不得静默）。
+	wafRestoreAttempted bool
+	wafRestoreErr       error
+	// wafRestoreWarnings 是回退成功但运行时面需重启收敛等说明，随失败响应
+	// 一并透出。
+	wafRestoreWarnings []string
 }
 
 // errCertQueueDrainIncomplete 证书队列排空未完成：PauseAndDrain
@@ -356,6 +376,26 @@ func (session *configImportSession) abort(importErr error) error {
 	if session.finished {
 		return importErr
 	}
+	// 文件面先回退：WAF 落盘发生在事务提交之前，事务回滚后文件必须回到导入
+	// 前状态，否则版本记录与文件分叉。先于下方投影回滚——投影重渲染应按已
+	// 恢复的规则树进行。回退失败必须显性告警+审计，不得静默。
+	if snapshot := session.wafSnapshot; snapshot != nil {
+		session.wafSnapshot = nil
+		session.wafRestoreAttempted = true
+		session.wafRestoreWarnings, session.wafRestoreErr = snapshot.restore()
+		session.wafRestoreWarnings = append(append([]string{}, snapshot.warnings...), session.wafRestoreWarnings...)
+		snapshot.discard()
+		if session.wafRestoreErr != nil {
+			detail := "规则库文件回退失败（文件与数据库可能分叉）: " + session.wafRestoreErr.Error()
+			services.Logf("error", "配置%s警告: %s", session.actionLabel(), detail)
+			// 会话上下文不携带用户身份（abort 各调用点自行审计），系统身份
+			// 留痕保证警告必达审计库而非只进响应。
+			services.RecordAuditLog("system", session.actionLabel()+"警告", "配置备份", detail, "")
+		}
+		for _, warning := range session.wafRestoreWarnings {
+			services.RecordAuditLog("system", session.actionLabel()+"警告", "配置备份", warning, "")
+		}
+	}
 	// 会话内 CLI 预检/强制应用等渲染已按未提交导入内容
 	// 重写投影文件——abort 必回滚 tx，磁盘同步回退到已提交态（零 /load；
 	// 快照阶段失败等未渲染形态为同字节 no-op）。已持 caddyOpMu（begin 起）。
@@ -420,6 +460,11 @@ func (session *configImportSession) commit(affectedRuleIDs []string, certificate
 	}
 	if err := session.tx.Commit(); err != nil {
 		return &importCoordinatorError{phase: importPhaseCommit, err: session.abort(err), action: session.action}
+	}
+	// 数据库已提交：WAF 文件保持导入后的状态，快照只服务回滚，丢弃。
+	if snapshot := session.wafSnapshot; snapshot != nil {
+		session.wafSnapshot = nil
+		snapshot.discard()
 	}
 	// commit 成功后才落 last-known-good（事务内 apply 有意不写），字节即
 	// 刚被 Caddy 接受的候选——导入的 LKG 因此恒为已提交视图。
@@ -491,7 +536,10 @@ func (session *configImportSession) cleanupDisappearedRuleArtifacts() {
 					services.Logf("error", "导入清理：删除消失规则 %s 的指标失败: %v", id, err)
 				}
 			}
-			removeImportRuleLogFiles(id)
+			if err := removeImportRuleLogFiles(id); err != nil {
+				services.Logf("error", "导入清理：删除消失规则 %s 的规则日志失败: %v", id, err)
+				services.RecordAuditLog("system", "清理失败", "规则日志", fmt.Sprintf("导入后清理规则 %s 的规则日志失败：%v", id, err), "")
+			}
 			if err := removeImportCertJobLogFiles(id); err != nil {
 				services.Logf("error", "导入清理：删除消失规则 %s 的证书日志失败: %v", id, err)
 				services.RecordAuditLog("system", "清理失败", "证书日志", fmt.Sprintf("导入后清理规则 %s 的证书日志失败：%v", id, err), "")

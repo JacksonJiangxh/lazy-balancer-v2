@@ -17,7 +17,7 @@ import { copyRuleHostHeader, newRuleWizardStageOverrides, stageBlockPageOverride
 import { buildAuditLogParams } from '../src/utils/auditLogFilters.ts'
 import { normalizeCidr, serializeWhitelist } from '../src/utils/apiKeyWhitelist.ts'
 import { useClampedPagination } from '../src/composables/useClampedPagination.ts'
-import { section, source, stripComments } from './_helpers.ts'
+import { repoSource, section, source, stripComments } from './_helpers.ts'
 
 const rules = source('src/views/Rules.vue')
 const dashboard = source('src/views/Dashboard.vue')
@@ -260,6 +260,29 @@ test('审计筛选参数——空值不上送、空白剥离、时间半开区�
     username: 'admin',
     resource: '规则',
   })
+})
+
+test('审计筛选参数——时间半开区间两端各自独立上送', () => {
+  const empty = { username: '', action: '', resource: '', ip: '', keyword: '' }
+  // 仅 end：半开区间的右端必须能单独上送（后端对空端不加条件）
+  assert.deepEqual(buildAuditLogParams({ ...empty, timeRange: ['', '2026-02-01 00:00:00'] }, 1, 20), {
+    page: 1,
+    page_size: 20,
+    end_time: '2026-02-01 00:00:00',
+  })
+  // 两端都填：逐字上送
+  assert.deepEqual(
+    buildAuditLogParams({ ...empty, timeRange: ['2026-01-01 00:00:00', '2026-01-31 23:59:59'] }, 1, 20),
+    { page: 1, page_size: 20, start_time: '2026-01-01 00:00:00', end_time: '2026-01-31 23:59:59' },
+  )
+  // 时间串不做前端 trim：空白/畸形值由后端解析层统一 TrimSpace 后归空或 400
+  // （「静默丢弃时间条件」已在后端按畸形输入改 400 收敛）——前端另加一套 trim 只会
+  // 形成第二份边界语义。
+  assert.match(
+    repoSource('internal/handlers/auditlog.go'),
+    /parseBoundary := func\(raw, endOfDay string\)[\s\S]*?raw = strings\.TrimSpace\(raw\)/,
+    '时间边界的前端免 trim 前提是后端解析层自行 TrimSpace——该前提消失则本用例与前端实现都要重估',
+  )
 })
 
 test('白名单 CIDR 归一（IPv4→/32、IPv6→/128、已带前缀保留）', () => {

@@ -903,7 +903,7 @@ func TestThreatFixMinute_groupsByRuleIdentityColumns(t *testing.T) {
 	}
 }
 
-// 历史 A 域： ----
+// ---- 威胁大屏时钟与水位夹具 ----
 
 func installThreatClock(t *testing.T, now time.Time) {
 	t.Helper()
@@ -1331,33 +1331,57 @@ func TestGetSecurityThreatScreen_topTargets(t *testing.T) {
 	}
 }
 
-// 升级/裁剪后原始事件只覆盖窗口尾部时，即使 rollup 把空分钟固化为 0，
-// 也必须披露原始覆盖起点并标记回填不完整（不可把少计当完整窗口）。
-func TestGetSecurityThreatScreen_disclosesRawCoverageGap(t *testing.T) {
+// 原始表被保留期/行帽裁剪 ≠ 窗口不可重建：窗口聚合来自分钟 rollup，其保留
+// 期与事件保留期解耦。此时必须披露原始覆盖起点并给出信息标记，但不得把
+// 窗口标成「回填未完成」（否则高攻击站点常驻少计告警），也不得因此禁用
+// 30s 聚合缓存（每次轮询重跑全窗口聚合）。
+func TestGetSecurityThreatScreen_rawCoverageLimitedDoesNotMarkBackfillIncomplete(t *testing.T) {
 	setupSecurityPolicyTestDB(t)
 	t.Cleanup(resetThreatScreenCachesForTest)
 	resetThreatRollupWarmerForTest()
 	router := newThreatScreenRouter(t, newThreatMetricsServer(t).URL)
+	// 原始表只剩最近 1 分钟的事件（模拟保留期/行帽裁剪），而窗口是 1 小时。
 	seedThreatScreenEvent(t, utcStringAgo(time.Minute), "93.184.216.7", "942100", "SQL Injection", "blocked")
 
-	recorder := getRequest(t, router, "/security/overview/threat-screen?hours=168")
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	readStats := func(t *testing.T) struct {
+		BackfillIncomplete bool   `json:"backfill_incomplete"`
+		RawCoverageLimited bool   `json:"raw_coverage_limited"`
+		RawCoverageFrom    string `json:"raw_coverage_from"`
+		TotalEvents        int    `json:"total_events"`
+	} {
+		t.Helper()
+		recorder := getRequest(t, router, "/security/overview/threat-screen?hours=1")
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+		var payload struct {
+			Data struct {
+				BackfillIncomplete bool   `json:"backfill_incomplete"`
+				RawCoverageLimited bool   `json:"raw_coverage_limited"`
+				RawCoverageFrom    string `json:"raw_coverage_from"`
+				TotalEvents        int    `json:"total_events"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		return payload.Data
 	}
-	var payload struct {
-		Data struct {
-			BackfillIncomplete bool   `json:"backfill_incomplete"`
-			RawCoverageFrom    string `json:"raw_coverage_from"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
-		t.Fatal(err)
-	}
-	if payload.Data.RawCoverageFrom == "" {
+
+	first := readStats(t)
+	if first.RawCoverageFrom == "" {
 		t.Fatal("raw_coverage_from 必须披露原始事件最早时间")
 	}
-	if !payload.Data.BackfillIncomplete {
-		t.Fatalf("原始覆盖起点晚于窗口起点时必须标记回填不完整: %+v", payload.Data)
+	if !first.RawCoverageLimited {
+		t.Fatalf("原始覆盖起点晚于窗口起点时必须披露 raw_coverage_limited: %+v", first)
+	}
+	if first.BackfillIncomplete {
+		t.Fatalf("rollup 已覆盖窗口时不得因原始表裁剪标记回填未完成: %+v", first)
+	}
+	// 该标记是聚合缓存的唯一开关（cacheable=!backfill_incomplete）：原始表
+	// 裁剪不再禁用缓存，高攻击站点不会每次轮询都重跑全窗口聚合。
+	if first.TotalEvents == 0 {
+		t.Fatalf("窗口内事件必须计入总量: %+v", first)
 	}
 }
 

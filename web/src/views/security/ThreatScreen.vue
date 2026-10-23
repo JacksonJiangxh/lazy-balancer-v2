@@ -51,7 +51,11 @@
           <span class="info-note-desc">{{ ingestionWarning }}</span>
         </div>
         <div v-if="stats?.backfill_incomplete" class="error-banner site-unset">
-          {{ rawCoverageGap ? `原始事件仅保留自 ${stats?.raw_coverage_from}，更早区间无法重建，当前窗口总量可能少计` : '历史统计回填尚未完成，当前窗口总量可能少计，稍后将继续补齐' }}
+          历史统计回填尚未完成，当前窗口总量可能少计，稍后将继续补齐
+        </div>
+        <!-- 原始表覆盖受限只作信息提示：窗口聚合来自分钟 rollup，完整性不受影响 -->
+        <div v-if="stats?.raw_coverage_limited && !stats?.backfill_incomplete" class="info-note-bar">
+          <span class="info-note-desc">原始事件仅保留自 {{ stats?.raw_coverage_from }}，更早明细无法逐条查询；窗口统计来自预聚合，不受影响</span>
         </div>
         <div v-if="stats?.rollup_stale" class="error-banner site-unset">统计汇总更新延迟，当前窗口数据可能不是最新</div>
         <div v-if="engineError" class="error-banner">
@@ -266,7 +270,7 @@
       <div class="panel hud">
         <div class="panel-head">
           <h2>请求流量 <span class="en">TRAFFIC · 90s</span></h2>
-          <span class="meta" title="仅统计经过 GeoIP 处理器规则的请求；正常桶含上游透传，不等于 2xx">正常 <b>{{ normalQps }}</b>/s · 攻击 <b class="attack-qps">{{ attackQps }}</b>/s · 累计 正常 {{ normalTotalText }} / 攻击 {{ attackTotalText }}<template v-if="trafficSampled"> · 抽样估算</template></span>
+          <span class="meta" title="仅统计经过 GeoIP 处理器规则的请求；正常桶含上游透传，不等于 2xx">正常 <b>{{ normalQps }}</b>/s · 攻击 <b class="attack-qps">{{ attackQps }}</b>/s · 累计 正常 {{ normalTotalText }} / 攻击 {{ attackTotalText }}<template v-if="trafficSampled"> · 抽样估算</template><template v-if="trafficFrozen"> · 采集租约未生效，累计已冻结</template></span>
         </div>
         <div class="chart-box">
           <svg class="normal-spark" viewBox="0 0 100 40" preserveAspectRatio="none">
@@ -324,6 +328,8 @@ interface ThreatScreenStats {
   recent_rate: number
   window_start?: string
   raw_coverage_from?: string
+  // 原始表覆盖受限（保留期/行帽裁剪）：信息提示，不表示窗口少计
+  raw_coverage_limited?: boolean
   backfill_incomplete?: boolean
   rollup_stale?: boolean
   // ingestion：与事件列表同源的采集健康位（见 utils/ingestionHealth）
@@ -421,13 +427,6 @@ const peakSlot = computed(() => hourlyHist.value.reduce(
   { name: '—', value: 0 },
 ))
 const activeHourCount = computed(() => hourlyHist.value.filter((slot) => slot.value > 0).length)
-// 原始表最早事件晚于窗口起点 = 窗口前段已被保留期/行帽裁剪，rollup 的 0
-// 不是「无事件」而是「不可重建」；与普通回填进行中区分文案。
-const rawCoverageGap = computed(() => {
-  const raw = stats.value?.raw_coverage_from
-  const start = stats.value?.window_start
-  return !!raw && !!start && raw > start
-})
 const attackTypeShare = computed(() => stats.value?.attack_type_share ?? [])
 const displayRecentRateX10 = useCountUp(computed(() => Math.round((stats.value?.recent_rate ?? 0) * 10)), 500)
 const displayRecentRate = computed(() => formatRecentRate(displayRecentRateX10.value / 10))
@@ -621,7 +620,7 @@ type Sev = 'high' | 'mid' | 'low'
  * 直接驱动分级（≥12 高 / 6-11 中 / <6 低，检测模式降一级）；仅 0 分回落
  * 阶段定性映射，口径与后端入库补分（services/securityevents.go）一致：
  * IP 名单/信任/威胁情报/爬虫伪装/预检=12（高），普通 GeoIP（id 8 或 8xxxxx）
- * 与限流 429=6（中）。8xxxxx 段内爬虫两族在后端有独立分（豁免 0/伪装 12），
+ * =6（中）。8xxxxx 段内爬虫两族在后端有独立分（豁免 0/伪装 12），
  * 前端无解码器——仅作为历史 0 分行的粗粒度回退，新行一律走评分。 */
 function sevOf(ev: FeedEvent): Sev {
   const score = ev.anomaly_score ?? 0
@@ -638,7 +637,9 @@ function sevOf(ev: FeedEvent): Sev {
   // 不是 rule_triggered 值——原 /^48[123]$/ 分支永不命中，已删。
   if (rt === '2' || rt === '3' || rt === '12' || rt === '14') return down('high')
   // '8' 与 8xxxxx 仅存量 0 分行可达（现代引擎一律带评分，走上方评分分支）。
-  if (rt === '429' || rt === '8' || /^8\d{5}$/.test(rt)) return down('mid')
+  // 限流 429 不产生安全事件行（caddy-ratelimit 直接返回、无审计行），事件
+  // feed 与 /security/events 同源，故 '429' 不参与本回退。
+  if (rt === '8' || /^8\d{5}$/.test(rt)) return down('mid')
   return ev.action === 'blocked' ? 'mid' : 'low'
 }
 function sevLabel(ev: FeedEvent): string {
@@ -680,11 +681,15 @@ const filteredFeed = computed(() =>
 let trafficBaseline: TrafficBaseline | null = null
 const trafficError = ref(false)
 const trafficSampled = ref(false)
+// collecting=false 表示 Caddy 侧采集租约未生效（累计计数冻结）：此时不得把
+// 冻结的累计当作实时流量，也不推进「累计」展示。
+const trafficFrozen = ref(false)
 const trafficTask = usePollingTask(async ({ signal, isCurrent }) => {
   const res = await request.get<APIResponse<{
     countries: Record<string, { attack: number; normal: number }>
     available?: boolean
     sample_n?: number
+    collecting?: boolean
   }>>('/security/overview/threat-screen/traffic', { silent: true, signal })
   if (!isCurrent()) return
   if (res.data?.available === false) {
@@ -695,6 +700,9 @@ const trafficTask = usePollingTask(async ({ signal, isCurrent }) => {
   trafficError.value = false
   const sampleN = res.data?.sample_n ?? 1
   trafficSampled.value = sampleN > 1
+  // 缺字段按「未冻结」处理（旧版 Caddy 插件无该字段）：可用时行为不变。
+  const collecting = res.data?.collecting !== false
+  trafficFrozen.value = !collecting
   const countries = res.data?.countries ?? {}
   const now = Date.now()
   const sample = trafficDelta(trafficBaseline, countries, now, sampleN)
@@ -711,6 +719,10 @@ const trafficTask = usePollingTask(async ({ signal, isCurrent }) => {
       normalWindow.value = []
       attackWindow.value = []
     }
+    return
+  }
+  if (!collecting) {
+    // 采集冻结：计数器不推进，累计与曲线保持上一帧（避免把 0 增量画成断流）。
     return
   }
   // 采样关闭时用累计计数器生成地区聚合正常光流；开启逐请求事件流后，

@@ -15,10 +15,9 @@ import (
 // 本测试的独立价值=「DB 列→渲染」端到端形状钉。
 func TestGetSecurityPolicyForRule_LoadsWafCheckResponse(t *testing.T) {
 	dir := t.TempDir()
-	if err := db.Initialize(dir); err != nil {
+	if err := initSecurityEventsTestDB(t, dir); err != nil {
 		t.Fatalf("init db: %v", err)
 	}
-	t.Cleanup(func() { db.DB.Close(); db.DB = nil })
 
 	if _, err := db.DB.Exec(`INSERT INTO security_policies (name, mode, waf_check_response, enabled) VALUES ('resp-off', 'blocking', 0, 1)`); err != nil {
 		t.Fatalf("seed policy: %v", err)

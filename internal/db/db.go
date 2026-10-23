@@ -1499,6 +1499,12 @@ func runMigrations() error {
 		updateWhere("global_config", "autoban_duration='1h'", "autoban_duration IS NULL OR autoban_duration NOT IN ('10m','30m','1h','6h','12h','24h','permanent')"),
 		updateWhere("global_config", "autoban_scope='all'", "autoban_scope IS NULL OR autoban_scope NOT IN ('blocked','logged','all')"),
 		updateWhere("global_config", "autoban_dry_run=1", "autoban_dry_run IS NULL OR autoban_dry_run NOT IN (0,1)"),
+		// 安全事件保留两列的**上界**每启动收敛（与写入侧/导入钳制/从端 apply
+		// 同一上界常量）。下界（<=0）由一次性 marker 迁移处理——marker 置位后
+		// 运行期显式 0 不得被重启改写（既有裁定），故此处只判越上界：带外直写
+		// 或旧版本写入的超大值在下次启动归默认，避免保留窗口长期超出治理范围。
+		updateWhere("global_config", fmt.Sprintf("security_events_retention_days=%d", DefaultSecurityEventsRetentionDays), fmt.Sprintf("security_events_retention_days IS NULL OR security_events_retention_days>%d", MaxSecurityEventsRetentionDays)),
+		updateWhere("global_config", fmt.Sprintf("security_events_row_cap=%d", DefaultSecurityEventsRowCap), fmt.Sprintf("security_events_row_cap IS NULL OR security_events_row_cap>%d", MaxSecurityEventsRowCap)),
 	}
 	for _, entry := range defaultUpdates {
 		// 先只读探测再写：收敛库上这批回填全部零命中，探测门让二次启动
@@ -1640,6 +1646,10 @@ func runMigrations() error {
 	}
 
 	if err := migrateLegacyDNSCredentials(); err != nil {
+		return err
+	}
+	// 全局配置同族遗留列：读/写路径均已收口后清空存量值（见函数注释）。
+	if err := migrateLegacyGlobalDNSCredentials(); err != nil {
 		return err
 	}
 
@@ -3929,6 +3939,32 @@ func migrateLegacyDNSCredentials() error {
 		return nil
 	}); err != nil {
 		return err
+	}
+	return nil
+}
+
+// migrateLegacyGlobalDNSCredentials 清除 global_config.dns_credentials 的存量值。
+// 该列是遗留字段：签发链唯一凭证来源是 certificate_configs，读取面早已不回显、
+// UpdateConfig 的写分支已移除，仅剩「库中不可见但随备份外带」的残余面。
+// 每次启动幂等执行（有值才写），顺带覆盖「旧备份导入把该列写回」的路径。
+func migrateLegacyGlobalDNSCredentials() error {
+	// 逐列探测（只读，不取写锁）：遗留/精简夹具可能没有 global_config
+	// 或没有该列（表不存在时 pragma_table_info 返回空集）——无条件 UPDATE
+	// 会让这类库在迁移期硬失败。
+	var hasColumn bool
+	if err := DB.QueryRow(`SELECT EXISTS(SELECT 1 FROM pragma_table_info('global_config') WHERE name='dns_credentials')`).Scan(&hasColumn); err != nil {
+		return fmt.Errorf("failed to check legacy global_config.dns_credentials column: %w", err)
+	}
+	if !hasColumn {
+		return nil
+	}
+	res, err := DB.Exec(`UPDATE global_config SET dns_credentials = NULL
+		WHERE dns_credentials IS NOT NULL AND dns_credentials <> ''`)
+	if err != nil {
+		return fmt.Errorf("failed to clear legacy global_config.dns_credentials: %w", err)
+	}
+	if affected, rowsErr := res.RowsAffected(); rowsErr == nil && affected > 0 {
+		log.Printf("Cleared legacy global_config.dns_credentials (%d row(s))", affected)
 	}
 	return nil
 }

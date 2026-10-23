@@ -1,8 +1,10 @@
 package services
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -10,6 +12,9 @@ import (
 // 经 recordCaddyApplyResult 清，后台数据类重载（证书/CRS/IP 库/威胁库/自动封禁）
 // 成功后面板横幅仍挂在一次早已被后续配置覆盖的失败上。
 func TestForcedReloadClearsStaleApplyBanner(t *testing.T) {
+	// 进程级渲染降级状态隔离：本用例依赖「无降级」，不得受执行顺序影响。
+	setLastRenderDegradation("")
+	t.Cleanup(func() { setLastRenderDegradation("") })
 	_, database := newClusterTestService(t)
 	if _, err := database.Exec(`UPDATE global_config SET caddy_apply_error='上一次写路径失败：旧横幅' WHERE id=1`); err != nil {
 		t.Fatalf("seed stale banner: %v", err)
@@ -38,8 +43,14 @@ func TestForcedReloadClearsStaleApplyBanner(t *testing.T) {
 	if banner != "" {
 		t.Fatalf("后台强制重载成功后陈旧横幅未清除: %q", banner)
 	}
-	// 横幅不再显示：状态接口的失败面为空（后台失败面无登记）。
+	// 后台失败面：先清空，再登记一次失败确认横幅随登记出现（恒真的「清空后
+	// 为空」断言无法拦住登记逻辑回归），最后清除恢复空态。
 	resetBackgroundApplyFailures(t)
+	RecordBackgroundApplyFailure(BackgroundApplyCRS, errors.New("crs reload failed"))
+	if got := BackgroundApplyFailureBanner(); !strings.Contains(got, "crs reload failed") {
+		t.Fatalf("后台失败横幅未随登记出现: %q", got)
+	}
+	ClearBackgroundApplyFailure(BackgroundApplyCRS)
 	if got := BackgroundApplyFailureBanner(); got != "" {
 		t.Fatalf("后台失败横幅=%q, want 空", got)
 	}

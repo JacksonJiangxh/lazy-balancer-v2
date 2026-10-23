@@ -70,6 +70,62 @@ func TestRateLimitBlocksParse_emptyBodyYieldsEmpty(t *testing.T) {
 	}
 }
 
+func TestRateLimitBlocksParse_keepsServerDimensionForSingleRuleChips(t *testing.T) {
+	// Given：同域两个端口的 429 计数（server 标签区分监听端口）
+	// When：按 (host, server) 解析
+	counts := parseRateLimit429CountsByServer(rateLimit429MetricsFixture)
+
+	// Then：端口维度保留（站点级视图仍按 host 求和，二者同源）
+	if got := counts[rateLimitHostServerKey{host: "api.example.com", server: "http_443"}]; got != 3 {
+		t.Errorf("api.example.com/http_443=%v, want 3", got)
+	}
+	if got := counts[rateLimitHostServerKey{host: "api.example.com", server: "http_80"}]; got != 4 {
+		t.Errorf("api.example.com/http_80=%v, want 4", got)
+	}
+	if got := counts[rateLimitHostServerKey{host: "go029.com", server: "http_443"}]; got != 14 {
+		t.Errorf("go029.com/http_443=%v, want 14 (同端口 method 序列求和)", got)
+	}
+}
+
+func TestScrapeRateLimitBlocksByHostServer_sharesFetchWithHostView(t *testing.T) {
+	// Given：一个计数抓取次数的 Caddy 指标桩
+	var hits atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write([]byte(rateLimit429MetricsFixture))
+	}))
+	t.Cleanup(server.Close)
+	resetOverviewMetricsCacheForTest()
+	t.Cleanup(resetOverviewMetricsCacheForTest)
+
+	// When：两个视图各取一次（5s 缓存窗口内）
+	blocks, err := ScrapeRateLimitBlocks(server.URL)
+	if err != nil {
+		t.Fatalf("host view: %v", err)
+	}
+	byServer, err := ScrapeRateLimitBlocksByHostServer(server.URL)
+	if err != nil {
+		t.Fatalf("host+server view: %v", err)
+	}
+
+	// Then：只抓取一次，两个视图内容同源
+	if hits.Load() != 1 {
+		t.Errorf("metrics fetches=%d, want 1（两个消费端点共享缓存/单飞）", hits.Load())
+	}
+	if len(blocks) != 2 || len(byServer) != 3 {
+		t.Fatalf("blocks=%v byServer=%v", blocks, byServer)
+	}
+	// 返回副本：改动调用方切片不得污染缓存
+	blocks[0].Count = -1
+	again, err := ScrapeRateLimitBlocks(server.URL)
+	if err != nil {
+		t.Fatalf("re-read: %v", err)
+	}
+	if again[0].Count < 0 {
+		t.Fatalf("cached result mutated through returned slice: %+v", again)
+	}
+}
+
 func TestScrapeRateLimitBlocks_returnsSortedPerHostCounts(t *testing.T) {
 	// Given a Caddy metrics endpoint serving 429 rate_limit counters
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

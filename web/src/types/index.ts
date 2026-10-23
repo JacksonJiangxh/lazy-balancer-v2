@@ -217,6 +217,9 @@ export interface CertJobListItem {
   ca_available_after?: string | null
   last_error_code?: string
   expires_at?: string | null
+  // 后端派生的真实到期时刻（expires_at 缺失时按 PEM 解析），UI 的有效期/
+  // 重签时间以它为门——只判 expires_at 会让导入/集群回插的行显示「-」。
+  not_after?: string | null
   created_at?: string
   updated_at?: string | null
   retry_cooldown_seconds: number | null

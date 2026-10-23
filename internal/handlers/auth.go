@@ -253,6 +253,11 @@ func (h *Handlers) Login(c *gin.Context) {
 		// 未启用 MFA 则密码即完整登录，清零计数。
 		mfaToken, ierr := services.MFAIssueChallenge(user.ID)
 		if ierr != nil {
+			// 基础设施故障（挑战表损坏/写库失败）必须留痕：与同函数其余 500
+			// 分支及 MFAVerifyLogin 的三处故障留痕同口径，否则「密码正确却
+			// 拿不到挑战」在审计里完全不可见。
+			services.Logf("error", "登录: 签发 MFA 挑战失败: user_id=%d: %v", user.ID, ierr)
+			services.RecordAuditLog(user.Username, "登录失败", "用户认证", services.AuditResultPart("internal_error"), c.ClientIP())
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "签发 MFA 挑战失败"})
 			return
 		}
@@ -286,20 +291,14 @@ func loginExpireMinutes() int {
 	return expireMinutes
 }
 
+// jwtJTIReader 生成 jti 的随机源（生产恒 crypto/rand.Read）。仅测试替换，
+// 用于构造「签发失败」分支（验证失败路径不推进 last_login）。
+var jwtJTIReader = rand.Read
+
 // respondLoginWithMFA 携带 mfa_ts 声明签发（0=未验证/不写入——非 MFA 用户登录、
 // MFA 首次签发在 verify 成功时传 now；票据登录暂传 0）。isLogin=false 时跳过
 // 登录审计与 last_login 更新（verify-step 的 step-up 场景， D-新6）。
 func (h *Handlers) respondLoginWithMFA(c *gin.Context, user models.User, passwordVersion int64, mfaTs int64, isLogin bool) {
-	if isLogin {
-		lastLogin := time.Now().UTC()
-		if _, err := db.DB.Exec("UPDATE users SET last_login = ? WHERE id = ?", lastLogin, user.ID); err != nil {
-			services.RecordAuditLog(user.Username, "登录失败", "用户认证", services.AuditResultPart("internal_error"), c.ClientIP())
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新登录时间失败"})
-			return
-		}
-		user.LastLogin = sql.NullTime{Time: lastLogin, Valid: true}
-	}
-
 	// node_mode 仅用于登录响应体的展示字段（JWT claim 已删除——
 	// jwtAuth 不消费，客户端声明无意义；响应体 NodeMode 保留）。
 	// 三态化：角色查询失败/库未装配不得静默呈现 master——写闸与 /system/info
@@ -321,7 +320,7 @@ func (h *Handlers) respondLoginWithMFA(c *gin.Context, user models.User, passwor
 	expireDuration := time.Duration(expireMinutes) * time.Minute
 	now := time.Now()
 	jtiBytes := make([]byte, 32)
-	if _, err := rand.Read(jtiBytes); err != nil {
+	if _, err := jwtJTIReader(jtiBytes); err != nil {
 		services.RecordAuditLog(user.Username, "登录失败", "用户认证", services.AuditResultPart("internal_error"), c.ClientIP())
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "签发登录令牌失败"})
 		return
@@ -353,6 +352,16 @@ func (h *Handlers) respondLoginWithMFA(c *gin.Context, user models.User, passwor
 		return
 	}
 	if isLogin {
+		// last_login 在签发成功之后才推进：签发失败（随机源异常/JWTSecret
+		// 未装配）分支不得留下「最后登录时间已更新 + 审计记登录失败」的
+		// 状态分叉——账号活动证据必须与审计口径一致。
+		lastLogin := time.Now().UTC()
+		if _, err := db.DB.Exec("UPDATE users SET last_login = ? WHERE id = ?", lastLogin, user.ID); err != nil {
+			services.RecordAuditLog(user.Username, "登录失败", "用户认证", services.AuditResultPart("internal_error"), c.ClientIP())
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新登录时间失败"})
+			return
+		}
+		user.LastLogin = sql.NullTime{Time: lastLogin, Valid: true}
 		services.RecordAuditLog(user.Username, "登录成功", "用户认证", services.FormatAuditDetail(services.AuditUserPart(user.ID, user.Username), services.AuditResultPart("success")), c.ClientIP())
 	}
 

@@ -22,30 +22,18 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
-import { request, formatBytes } from '@/utils/api'
-
-interface LogStorageInfo {
-  key: string
-  name: string
-  size_bytes: number
-  rotated_bytes: number
-  rotated_count: number
-  limit_bytes?: number | null
-  limit_rows?: number | null
-  db_bytes?: number | null
-  keep_count: number
-  rows?: number | null
-  // 行数读取失败披露：为真时保持条数口径并标注「计数暂不可用」，不再静默
-  // 退回字节口径（口径切换会让用户以为统计规则被改）。
-  rows_unavailable?: boolean
-  retention_note: string
-  config_source: string
-}
+import { computed } from 'vue'
+import { formatBytes } from '@/utils/api'
+import { useLogStorageStats } from '@/composables/useLogStorageStats'
 
 const props = defineProps<{ logKey: string; caddyId?: string; refreshKey?: number }>()
 
-const info = ref<LogStorageInfo | null>(null)
+// 取数（含换行清空 / 换行重取 / 刷新号重取）在组合子内自洽：logKey 或 caddyId
+// 变化即重新取数并先清空旧行，调用方不必再靠 :key 重挂组件。
+const { info } = useLogStorageStats({
+  target: () => ({ logKey: props.logKey, caddyId: props.caddyId }),
+  refreshKey: () => props.refreshKey,
+})
 
 // 复用 api.ts 的 formatBytes（站内字节格式化单一事实源，原私有
 // humanSize 与 Dashboard 精度不一致）
@@ -119,23 +107,6 @@ const noteText = computed(() => {
 })
 
 const tooltipContent = computed(() => `${info.value?.config_source || ''}${info.value?.retention_note ? ' · ' + info.value.retention_note : ''}${info.value?.limit_rows ? ' · 超出上限时按最旧优先清理' : ''}`)
-
-let loadStatsSeq = 0
-const loadStats = async (): Promise<void> => {
-  const seq = ++loadStatsSeq
-  try {
-    // 服务端按 key 收窄（只统计所看那一行）；缺省全量会为每个弹框
-    // 做全部 DB 计数与目录统计。
-    const params: Record<string, string> = { key: props.logKey }
-    if (props.caddyId) params.caddy_id = props.caddyId
-    const res = await request.get<{ data?: { logs?: LogStorageInfo[] } }>('/logs/stats', { params })
-    if (seq === loadStatsSeq) info.value = res.data?.logs?.find((l) => l.key === props.logKey) || null
-  } catch (e) {
-    if (seq === loadStatsSeq) console.error('Failed to load log stats:', e)
-  }
-}
-// 保留/清理会改变日志占用；父级刷新业务列表时递增 refreshKey，同步刷新统计。
-watch(() => props.refreshKey, () => { void loadStats() }, { immediate: true })
 </script>
 
 <style scoped>

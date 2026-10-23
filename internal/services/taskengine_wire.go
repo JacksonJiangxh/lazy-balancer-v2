@@ -192,6 +192,45 @@ func mustRegisterTask(te *taskengine.Engine, d taskengine.Descriptor) {
 // （coveredSlotStepPast/slotCoveredByRun/crsNextSlotAware/ip2regionNextSlotAware 已退役——
 // 排程槽生命周期 2026-10-11：失败落定落库推进，NextSlotFn 纯读库。）
 
+// interruptedUpdateStatusFamilies 持久化「更新中」活动态的两族（活动词表
+// 判定复用状态镜像同一 helper）。表名只接受包内常量。
+var interruptedUpdateStatusFamilies = []struct {
+	table  string
+	taskID string
+	active func(string) bool
+}{
+	{table: "security_crs_version", taskID: "crs", active: IsActiveCRSStatus},
+	{table: "security_ip2region_version", taskID: "ip2region", active: IsActiveIP2RegionStatus},
+}
+
+// normalizeInterruptedUpdateStatuses 把上次进程退出时残留的活动态归一为
+// failed：活动态只在本进程更新运行期间成立，进程重建后它既无真实执行也无
+// 终态——不归一则规则库页与任务视图恒显「更新中」（运行/取消按钮失效），
+// 直到下一个排程槽才自愈。UPDATE 带旧值条件，避免与并发终态写相互覆盖。
+func normalizeInterruptedUpdateStatuses() {
+	if db.DB == nil {
+		return
+	}
+	for _, family := range interruptedUpdateStatusFamilies {
+		row, ok, err := versionTableStatusRowOf(family.table)
+		if err != nil || !ok || !family.active(row.status) {
+			continue
+		}
+		res, err := db.DB.Exec(`UPDATE `+family.table+
+			` SET update_status='failed', message='（进程重启回收）', finished_at=datetime('now') WHERE id=1 AND update_status=?`,
+			row.status)
+		if err != nil {
+			Logf("warn", "任务状态归一失败（%s 残留活动态 %s）: %v", family.taskID, row.status, err)
+			continue
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			continue
+		}
+		TaskLogfWarn(family.taskID, "failed", "上次更新在进程退出时中断（残留状态 %s），已归一为 failed", row.status)
+		Logf("warn", "任务状态归一: %s 残留活动态 %s 已归一为 failed（进程重启回收）", family.taskID, row.status)
+	}
+}
+
 // InitTaskEngine 建引擎、恢复孤儿运行、注册全部 19 任务并启动默认循环。
 // 非幂等——调用方保证单次装配；重复调用前须先
 // StopTaskEngine（否则旧 scheduleLoop goroutine 泄漏、双引擎双写 task_runs）。
@@ -233,6 +272,9 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		te.SetRole(roleMaster)
 	}
 	_ = te.RecoverOrphans()
+	// 持久化「更新中」态同样属于上次进程的生命周期——启动期归一为 failed，
+	// 否则规则库页与任务视图恒显更新中（运行/取消按钮失效）。
+	normalizeInterruptedUpdateStatuses()
 
 	// ============ 循环（10）============
 
@@ -570,7 +612,9 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		EnabledFn: func() bool { return versionTableAutoUpdateEnabled("security_crs_version") },
 		StatusFn: func() string {
 			m := GetCRSUpdateManager()
-			if m == nil {
+			if m == nil || !m.IsRunning() {
+				// 只采纳本进程真实在途状态：持久化活动态（进程崩溃残留/
+				// 集群快照回放）不属于本进程的运行，采纳即伪造「运行中」死态。
 				return ""
 			}
 			// 仅在途阶段映射 running——failed/skipped
@@ -631,12 +675,20 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		// 读库失败 fail-closed（helper 同源，与 crs/threat 同口径）。
 		EnabledFn: func() bool { return versionTableAutoUpdateEnabled("security_ip2region_version") },
 		StatusFn: func() string {
+			// 只采纳本进程真实在途状态：DB 残留活动态（进程崩溃/快照回放）
+			// 不属于本进程的运行。
+			m := GetIP2RegionUpdateManager()
+			if m == nil || !m.IsRunning() {
+				return ""
+			}
 			// nil 库守卫——空状态 fail-closed。
 			if db.DB == nil {
 				return ""
 			}
 			var status string
-			_ = db.DB.QueryRow("SELECT COALESCE(update_status,'') FROM security_ip2region_version WHERE id=1").Scan(&status)
+			if err := db.DB.QueryRow("SELECT COALESCE(update_status,'') FROM security_ip2region_version WHERE id=1").Scan(&status); err != nil {
+				return ""
+			}
 			// 同 CRS——仅在途阶段映射 running，
 			// failed/skipped 持久终态不再失真为「运行中」。
 			if IsActiveIP2RegionStatus(status) {
@@ -733,7 +785,9 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 			// caddy-restart=Caddy 崩溃自愈 watcher 经引擎调度
 			// （曾 watcher 直调执行体绕过引擎——task_runs/单飞/日志双行）。
 			if rc.Trigger != "manual" && rc.Trigger != "startup" && rc.Trigger != "caddy-restart" {
-				return nil
+				// 未知触发来源必须响亮失败：静默 return nil 会落一条 success
+				// 行却零动作（silent success），与装配缺陷可观测口径相反。
+				return fmt.Errorf("未知触发来源 %q", rc.Trigger)
 			}
 			if configLoadRerun == nil {
 				return errors.New("配置重载未接线")
@@ -825,6 +879,9 @@ func startRoleReconciler(te *taskengine.Engine) <-chan struct{} {
 					return
 				}
 				reconcileTaskEngineRoleFor(te)
+				// 业务驱动调度对齐的读失败重试：复用 60s 对账周期，
+				// 读恢复即把上一次保持的调度态收敛到业务实态。
+				retryPendingBusinessTaskDrivers()
 			}
 		}
 	}()
@@ -843,23 +900,48 @@ func roleReconcilerDoneFor(te *taskengine.Engine) <-chan struct{} {
 
 // businessTaskDriver 业务开关与引擎调度同步的唯一任务清单。
 // 启动装配与任务监控只读门共用，禁止在 handler 另维护第二份 ID 列表。
+// stateFn 返回 (enabled, known)：known=false=启用状态不可判定（读库失败）——
+// 对齐必须保持上一次生效的调度态，不得把一次读失败固化为调度关闭。
 var businessTaskDrivers = []struct {
-	id        string
-	enabledFn func() bool
+	id      string
+	stateFn func() (enabled, known bool)
 }{
-	{id: "threat", enabledFn: ThreatAutoUpdateEnabled},
-	{id: "crs", enabledFn: func() bool { return versionTableAutoUpdateEnabled("security_crs_version") }},
-	{id: "ip2region", enabledFn: func() bool { return versionTableAutoUpdateEnabled("security_ip2region_version") }},
-	{id: "crawlerbot-update", enabledFn: CrawlerAutoUpdateEnabled},
-	{id: "auto-backup", enabledFn: AutoBackupEnabled},
-	{id: AutobanTaskID, enabledFn: AutobanEnabled},
+	{id: "threat", stateFn: func() (bool, bool) { return globalTaskAutoUpdateState("threat") }},
+	{id: "crs", stateFn: func() (bool, bool) { return versionTableAutoUpdateState("security_crs_version") }},
+	{id: "ip2region", stateFn: func() (bool, bool) { return versionTableAutoUpdateState("security_ip2region_version") }},
+	{id: "crawlerbot-update", stateFn: func() (bool, bool) { return globalTaskAutoUpdateState("crawler") }},
+	{id: "auto-backup", stateFn: AutoBackupEnabledState},
+	{id: AutobanTaskID, stateFn: autobanEnabledState},
 }
 
+// businessDriverSyncPending 上一次对齐存在不可判定的读取（未落任何调度
+// 动作）——由 60s 角色对账周期重试，读恢复即收敛到业务实态。无待重试时
+// 周期对账不重复对齐（避免每 60s 无意义地重写调度开关）。
+var businessDriverSyncPending atomic.Bool
+
 // SyncBusinessTaskDrivers 按当前 DB 实态统一对齐六个业务驱动任务调度。
-// 启动装配、配置导入与 Promote 共用，避免只恢复其中一族。
+// 启动装配、配置导入、无待重试时的周期对账与 Promote 共用，避免只恢复其中
+// 一族。读失败（known=false）的任务保持现有调度态并登记重试：tick 侧
+// EnabledFn 本身 fail-closed（本轮不跑、下轮重新求值），无需在对齐层
+// 再写一个持续到重启的关闭态。
 func SyncBusinessTaskDrivers() {
+	pending := false
 	for _, driver := range businessTaskDrivers {
-		syncTaskLoop(driver.id, driver.enabledFn())
+		enabled, known := driver.stateFn()
+		if !known {
+			pending = true
+			continue
+		}
+		syncTaskLoop(driver.id, enabled)
+	}
+	businessDriverSyncPending.Store(pending)
+}
+
+// retryPendingBusinessTaskDrivers 周期对账入口：仅在上一次对齐有读失败时
+// 重新对齐（读恢复即把调度态收敛到业务实态）。
+func retryPendingBusinessTaskDrivers() {
+	if businessDriverSyncPending.Load() {
+		SyncBusinessTaskDrivers()
 	}
 }
 

@@ -74,7 +74,7 @@ func TestNodeBookkeepingWrites_RejectAfterDemotion(t *testing.T) {
 
 	_, regErr := service.RegisterNode(context.Background(), models.ClusterRegisterRequest{
 		Token: token, Name: "node-2", IPAddress: "10.0.0.9", Port: 8000,
-	}, now)
+	}, "10.0.0.9", now)
 	if !errors.Is(regErr, ErrNotMasterNode) {
 		t.Fatalf("RegisterNode err=%v, want ErrNotMasterNode", regErr)
 	}
@@ -131,6 +131,7 @@ func TestSnapshot_SingleConnPoolDoesNotDeadlock(t *testing.T) {
 
 func TestReport_NilCaddyServiceDegrades(t *testing.T) {
 	_, database := newClusterTestService(t)
+	setNodeMasterRole(t, database, false) // Report 只属于从节点语境
 	reports := make(chan models.ClusterReport, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)

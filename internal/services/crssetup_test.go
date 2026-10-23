@@ -219,7 +219,7 @@ func TestRestoreBackup_restoreFailureKeepsOverridesBak(t *testing.T) {
 
 	// Then the failed overrides restore keeps the only recovery copy
 	if _, err := os.Stat(crsTransientPath(m.crsDir, "zz-user-overrides.conf.bak")); err != nil {
-		t.Fatal("zz-user-overrides.conf.bak 不得在还原失败时被删除（历史问题 三-1）")
+		t.Fatal("zz-user-overrides.conf.bak 不得在还原失败时被删除")
 	}
 	// And the independent setup/rules restore still completes
 	setup, _ := os.ReadFile(filepath.Join(m.crsDir, "crs-setup.conf"))
@@ -252,7 +252,7 @@ func TestRestoreBackup_emptyMarkerRemoveFailureKeepsMarker(t *testing.T) {
 
 	// Then the empty marker survives so a later restore can retry
 	if _, err := os.Stat(crsTransientPath(m.crsDir, "zz-user-overrides.conf.bak")); err != nil {
-		t.Fatal("空标记不得在移除失败时被消费（历史问题 三-1）")
+		t.Fatal("空标记不得在移除失败时被消费")
 	}
 }
 
@@ -300,7 +300,7 @@ func TestCRSUpdateRun_staleOverridesBakNotConsumedOnEmptyDiffFailure(t *testing.
 	// 替代 「运行开始即清理」——该清理会毁掉三-1 保全的唯一恢复副本。
 	bakData, err := os.ReadFile(crsTransientPath(m.crsDir, "zz-user-overrides.conf.bak"))
 	if err != nil || string(bakData) != "# 两版本前的 overrides\nSecRuleARCustom 1" {
-		t.Fatalf("stale zz-user-overrides.conf.bak=%q,%v, want preserved（历史问题 1.1）", bakData, err)
+		t.Fatalf("stale zz-user-overrides.conf.bak=%q,%v, want preserved", bakData, err)
 	}
 }
 
@@ -324,7 +324,7 @@ func TestRestoreBackup_degenerateRulesBakSkipped(t *testing.T) {
 
 	// Then live 规则树未被退化 bak 替换，退化 bak 留在原地（未消费）
 	if _, err := os.Stat(filepath.Join(m.crsDir, "rules", "REQUEST-OLD.conf")); err != nil {
-		t.Fatal("live rules must be untouched when rules.bak is degenerate (历史问题)")
+		t.Fatal("live rules must be untouched when rules.bak is degenerate")
 	}
 	if _, err := os.Stat(crsTransientPath(m.crsDir, "rules.bak")); err != nil {
 		t.Fatal("degenerate rules.bak should be left in place (not consumed)")

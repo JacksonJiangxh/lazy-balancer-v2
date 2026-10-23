@@ -108,6 +108,13 @@ func isReadOnlyTool(spec toolSpec) bool {
 
 // serveWithToolVisibility 按 Key 属主属性过滤 tools/list。
 //
+// 请求形态边界：只识别**顶层单体** JSON-RPC 对象（`method=="tools/list"`）。
+// JSON-RPC 批处理数组不经过滤，但也不会泄露未过滤列表——mcp-go v0.58.0 的
+// Streamable HTTP 传输把请求体按单体对象解析，数组体直接返回 PARSE_ERROR
+// （HTTP 400），协议层不接受批处理。该假设由
+// TestToolsListBatchRequestRejectedByProtocol 钉住：升级 mcp-go 后若开始接受
+// 批处理，该测试会红，届时本过滤需按「响应侧重建」而非请求形态识别。
+//
 // 定位（重要）：工具目录本身不是机密面——`GET /api/v1/mcp/tools` 与
 // `/api/v1/openapi.yaml` 对任何已认证身份都全量暴露同一批工具/路由。本过滤
 // 只做 UX 与能力口径一致（不呈现调用必然 403 的工具），**不是访问控制**：

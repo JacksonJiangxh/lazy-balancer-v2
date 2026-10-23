@@ -137,19 +137,12 @@ var (
 // metricsStateEvictCap 是状态 map 的防御性键数上限（见 logMetricsStateTransition）。
 const metricsStateEvictCap = 64
 
-// logMetricsStateTransition 报告 key 类别的失败状态转换：
-// ok→fail 返回 "warn"；fail→ok 返回 "info"；状态不变返回 ""。
-// 初始状态视为 ok：首次失败记一次 warn，首次成功静默（无恢复可记）。
-//
-// 状态机本体已是通用实现（logStateTransition），metrics 采集族与
-// 低频巡检循环（时区刷新/运行日志尺寸刷新）共用——持久失败的下行 SQL 在
-// 30s tick 下不再各打 2880 行/天同一消息。键空间按调用方前缀隔离。
-func logMetricsStateTransition(key string, failed bool) string {
-	return logStateTransition(key, failed)
-}
-
 // logStateTransition 是状态转换日志的通用状态机（同一 key 独立跟踪）：
-// ok→fail="warn"、fail→ok="info"、持续同态=""。
+// ok→fail="warn"、fail→ok="info"、持续同态=""。初始状态视为 ok：首次失败记
+// 一次 warn，首次成功静默（无恢复可记）。metrics 采集族与低频巡检循环
+// （时区刷新/运行日志尺寸刷新/排程读取）共用——持久失败在 30s tick 下不再
+// 各打 2880 行/天同一消息；键空间按调用方前缀隔离。map 有界
+// （metricsStateEvictCap）：超上限整体重置，各类别至多重复放行一条，无数据影响。
 func logStateTransition(key string, failed bool) string {
 	metricsStateMu.Lock()
 	defer metricsStateMu.Unlock()
@@ -179,7 +172,7 @@ const (
 	metricsFailureParse        = "parse"
 	metricsFailureParseRules   = "parse-rules"
 	metricsFailureStore        = "store"
-	metricsFailureStorePerHost = "store-per-host"
+	metricsFailureStorePerRule = "store-per-rule"
 )
 
 // geoipPassSeriesMarker geoip 透传路由（buildGeoipPassRoute）的 Prometheus
@@ -194,22 +187,22 @@ func (m *MetricsService) collect() {
 
 	resp, err := m.client.Get(m.metricsURL)
 	if err != nil {
-		if logMetricsStateTransition(metricsFailureCollect, true) != "" {
+		if logStateTransition(metricsFailureCollect, true) != "" {
 			Logf("warn", "Failed to collect metrics: %v", err)
 		}
 		return
 	}
-	if lvl := logMetricsStateTransition(metricsFailureCollect, false); lvl != "" {
+	if lvl := logStateTransition(metricsFailureCollect, false); lvl != "" {
 		Logf("info", "metrics collection recovered")
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		if logMetricsStateTransition(metricsFailureEndpoint, true) != "" {
+		if logStateTransition(metricsFailureEndpoint, true) != "" {
 			Logf("warn", "Metrics endpoint returned status %d, skipping sample", resp.StatusCode)
 		}
 		return
 	}
-	if lvl := logMetricsStateTransition(metricsFailureEndpoint, false); lvl != "" {
+	if lvl := logStateTransition(metricsFailureEndpoint, false); lvl != "" {
 		Logf("info", "metrics endpoint recovered")
 	}
 
@@ -220,21 +213,21 @@ func (m *MetricsService) collect() {
 	if err != nil {
 		// body 中段读取错误此前裸 return——失败族中唯一零信号成员
 		// （52fdb0f7 枚举未覆盖）。现与其他类别同口径走状态转换日志。
-		if logMetricsStateTransition(metricsFailureRead, true) != "" {
+		if logStateTransition(metricsFailureRead, true) != "" {
 			Logf("warn", "Failed to read metrics body: %v", err)
 		}
 		return
 	}
-	if lvl := logMetricsStateTransition(metricsFailureRead, false); lvl != "" {
+	if lvl := logStateTransition(metricsFailureRead, false); lvl != "" {
 		Logf("info", "metrics body read recovered")
 	}
 	if len(body) > 16<<20 {
-		if logMetricsStateTransition(metricsFailureBodyCap, true) != "" {
+		if logStateTransition(metricsFailureBodyCap, true) != "" {
 			Logf("warn", "Metrics endpoint body exceeded 16MB cap, skipping sample")
 		}
 		return
 	}
-	if lvl := logMetricsStateTransition(metricsFailureBodyCap, false); lvl != "" {
+	if lvl := logStateTransition(metricsFailureBodyCap, false); lvl != "" {
 		Logf("info", "metrics endpoint body back under 16MB cap")
 	}
 
@@ -250,38 +243,38 @@ func (m *MetricsService) collect() {
 	scan := aggregatePrometheusText(text, prometheusScanGlobal|prometheusScanRules)
 	metrics := scan.global
 	if scan.globalErr != nil {
-		if logMetricsStateTransition(metricsFailureParse, true) != "" {
+		if logStateTransition(metricsFailureParse, true) != "" {
 			Logf("warn", "Failed to parse metrics: %v", scan.globalErr)
 		}
 		return
 	}
-	if lvl := logMetricsStateTransition(metricsFailureParse, false); lvl != "" {
+	if lvl := logStateTransition(metricsFailureParse, false); lvl != "" {
 		Logf("info", "metrics parse recovered")
 	}
 	if scan.rulesErr != nil {
-		if logMetricsStateTransition(metricsFailureParseRules, true) != "" {
+		if logStateTransition(metricsFailureParseRules, true) != "" {
 			Logf("warn", "Failed to parse per-rule metrics: %v", scan.rulesErr)
 		}
-	} else if lvl := logMetricsStateTransition(metricsFailureParseRules, false); lvl != "" {
+	} else if lvl := logStateTransition(metricsFailureParseRules, false); lvl != "" {
 		Logf("info", "per-rule metrics parse recovered")
 	}
 	if err := m.storeMetrics(metrics); err != nil {
-		if logMetricsStateTransition(metricsFailureStore, true) != "" {
+		if logStateTransition(metricsFailureStore, true) != "" {
 			Logf("warn", "Failed to store metrics: %v, values: %d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
 				err, metrics.requestsTotal, metrics.requests2xx, metrics.requests3xx,
 				metrics.requests4xx, metrics.requests5xx, metrics.bytesIn, metrics.bytesOut,
 				metrics.latencyP50, metrics.latencyP95, metrics.latencyP99)
 		}
-	} else if lvl := logMetricsStateTransition(metricsFailureStore, false); lvl != "" {
+	} else if lvl := logStateTransition(metricsFailureStore, false); lvl != "" {
 		Logf("info", "metrics store recovered")
 	}
 	if scan.rulesErr == nil {
 		if err := m.storePerRuleMetrics(scan.rules); err != nil {
-			if logMetricsStateTransition(metricsFailureStorePerHost, true) != "" {
-				Logf("warn", "Failed to store per-host metrics: %v", err)
+			if logStateTransition(metricsFailureStorePerRule, true) != "" {
+				Logf("warn", "Failed to store per-rule metrics: %v", err)
 			}
-		} else if lvl := logMetricsStateTransition(metricsFailureStorePerHost, false); lvl != "" {
-			Logf("info", "metrics per-host store recovered")
+		} else if lvl := logStateTransition(metricsFailureStorePerRule, false); lvl != "" {
+			Logf("info", "metrics per-rule store recovered")
 		}
 	}
 	m.applyTrafficSample(metrics)
@@ -730,12 +723,12 @@ func parseRuleLabelMetrics(text string) (map[string]*ruleLabelAggregate, error) 
 	return res.rules, nil
 }
 
-// storePerHostMetrics 按 rule label(lazybalancer_*)写规则级历史行——
+// storeRuleMetricsText 按 rule label(lazybalancer_*)写规则级历史行——
 // 2026-09-15 用户裁定:caddy_id 直接匹配替代域名/host 匹配(通配符/大小写/
 // IDNA/多域名/空域名全部天然正确,且不再有静默 continue 失配)。
 // TCP 规则无行(caddy-l4 无规则级流量计数器)。文本入口保留给测试/独立调用，
 // 采集主路径持有已聚合结果，直接走 storePerRuleMetrics（免二次解析）。
-func (m *MetricsService) storePerHostMetrics(text string) error {
+func (m *MetricsService) storeRuleMetricsText(text string) error {
 	byRule, err := parseRuleLabelMetrics(text)
 	if err != nil {
 		return err
@@ -841,7 +834,11 @@ func (m *MetricsService) refreshDBOverviewMetrics() {
 	if overviewRefreshHook != nil {
 		overviewRefreshHook()
 	}
-	database := db.DB
+	// 后台 goroutine 统一走 db.GetDB()（atomic 句柄，与
+	// tz/logrotate 刷新链同源）；db.DB 只归同步调用方。两来源并存时后台
+	// 循环可能选中未随 Initialize/Close 同步维护的那一个，表征是「指标永久
+	// 不生效且零日志」。
+	database := db.GetDB()
 	if database == nil {
 		return
 	}

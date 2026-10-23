@@ -36,6 +36,33 @@ func TestClusterAccessURLTargetsNode(t *testing.T) {
 	}
 }
 
+// access_url 的信任锚必须是 IP 字面量来源地址：非 IP（主机名/空串/非法串）
+// 不构成可比锚，一律判不一致——曾以请求体自述值传入，双方同源等于未校验。
+func TestClusterAccessURLHostMatchesIP(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		url     string
+		ip      string
+		matches bool
+	}{
+		{name: "empty url is not a claim", url: "", ip: "10.0.0.5", matches: true},
+		{name: "same IPv4", url: "https://10.0.0.5:8443", ip: "10.0.0.5", matches: true},
+		{name: "same IPv6", url: "https://[2001:db8::1]:8443", ip: "2001:db8::1", matches: true},
+		{name: "different IP", url: "https://10.0.0.6:8443", ip: "10.0.0.5", matches: false},
+		{name: "hostname is never trusted", url: "https://attacker.example", ip: "attacker.example", matches: false},
+		{name: "hostname host is not an IP", url: "https://edge.example:8443", ip: "10.0.0.5", matches: false},
+		{name: "empty source address is not an anchor", url: "https://10.0.0.5:8443", ip: "", matches: false},
+		{name: "malformed source address is not an anchor", url: "https://10.0.0.5:8443", ip: "10.0.0.500", matches: false},
+		{name: "unparsable url", url: "://bad", ip: "10.0.0.5", matches: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ClusterAccessURLHostMatchesIP(tc.url, tc.ip); got != tc.matches {
+				t.Fatalf("ClusterAccessURLHostMatchesIP(%q,%q)=%v, want %v", tc.url, tc.ip, got, tc.matches)
+			}
+		})
+	}
+}
+
 func TestGlobalConfig_serializes_DNS_credentials(t *testing.T) {
 	// Given
 	config := GlobalConfig{DNSCredentials: "id,token"}

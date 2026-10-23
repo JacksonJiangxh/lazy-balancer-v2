@@ -223,6 +223,13 @@ func TestGetConnectionStats_returns_netstat_error(t *testing.T) {
 
 // generateTestCert creates a test certificate and key pair
 func generateTestCert(domain string, notBefore, notAfter time.Time) (certPEM, keyPEM string, err error) {
+	return generateTestCertWithNames(domain, []string{domain}, notBefore, notAfter)
+}
+
+// generateTestCertWithNames 生成 CN 与 SAN 可分离的证书。域名展示口径是
+// 「SAN[0] 优先、CN 兜底」，夹具若把两者设成同值，删掉 SAN 覆盖分支也测不出，
+// 故必须能构造 CN≠SAN（或只有 CN 无 SAN）的证书。
+func generateTestCertWithNames(commonName string, dnsNames []string, notBefore, notAfter time.Time) (certPEM, keyPEM string, err error) {
 	// Generate RSA key
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -233,9 +240,9 @@ func generateTestCert(domain string, notBefore, notAfter time.Time) (certPEM, ke
 	template := x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject: pkix.Name{
-			CommonName: domain,
+			CommonName: commonName,
 		},
-		DNSNames:              []string{domain},
+		DNSNames:              dnsNames,
 		NotBefore:             notBefore,
 		NotAfter:              notAfter,
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
@@ -503,7 +510,10 @@ func TestParseTLSCertificate(t *testing.T) {
 
 func TestParseTLSCertificate_ExtractsSANs(t *testing.T) {
 	now := time.Now()
-	certPEM, keyPEM, err := generateTestCert("san.example.com", now.Add(-1*time.Hour), now.Add(24*time.Hour))
+	// CN 与 SAN 必须不同值：同值时「SAN 优先」与「CN 兜底」两种实现都绿，
+	// 该分支删掉也测不出来。
+	const sanDomain = "san.example.com"
+	certPEM, keyPEM, err := generateTestCertWithNames("cn-only.example.com", []string{sanDomain}, now.Add(-1*time.Hour), now.Add(24*time.Hour))
 	if err != nil {
 		t.Fatalf("failed to generate test cert: %v", err)
 	}
@@ -513,8 +523,27 @@ func TestParseTLSCertificate_ExtractsSANs(t *testing.T) {
 		t.Fatalf("parseTLSCertificate() error = %v", err)
 	}
 
-	if info.Domain != "san.example.com" {
-		t.Errorf("parseTLSCertificate() Domain = %v, want san.example.com", info.Domain)
+	if info.Domain != sanDomain {
+		t.Errorf("parseTLSCertificate() Domain = %v, want %v（SAN[0] 优先于 CN）", info.Domain, sanDomain)
+	}
+}
+
+// 无 SAN 只有 CN 时回落 CN——覆盖「SAN 优先」的另一方向，保证两者都不丢。
+func TestParseTLSCertificate_fallsBackToCommonNameWithoutSAN(t *testing.T) {
+	now := time.Now()
+	const cnDomain = "cn-fallback.example.com"
+	certPEM, keyPEM, err := generateTestCertWithNames(cnDomain, nil, now.Add(-1*time.Hour), now.Add(24*time.Hour))
+	if err != nil {
+		t.Fatalf("failed to generate test cert: %v", err)
+	}
+
+	info, err := parseTLSCertificate(certPEM, keyPEM)
+	if err != nil {
+		t.Fatalf("parseTLSCertificate() error = %v", err)
+	}
+
+	if info.Domain != cnDomain {
+		t.Errorf("parseTLSCertificate() Domain = %v, want %v（无 SAN 时回落 CN）", info.Domain, cnDomain)
 	}
 }
 

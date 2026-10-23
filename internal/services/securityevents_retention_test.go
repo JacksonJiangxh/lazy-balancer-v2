@@ -256,7 +256,7 @@ func TestSecurityEventsRetentionCleanup_batchesAgeDelete(t *testing.T) {
 	}
 }
 
-// 历史 A 域：----
+// ---- 保留策略辅助：按分钟截断统计 ----
 
 func countRollupRowsBefore(t *testing.T, cutoff string) int {
 	t.Helper()

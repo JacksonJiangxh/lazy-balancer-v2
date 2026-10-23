@@ -110,3 +110,55 @@ func TestGetSecurityThreatScreen_partialMinuteScopeIsExplicit(t *testing.T) {
 			payload.Data.TotalEvents, payload.Data.BlockedEvents)
 	}
 }
+
+// 聚合缓存只在窗口覆盖完整时生效（handler 传入 cacheable=!backfill_incomplete）：
+// 原始表被保留期/行帽裁剪不再禁用缓存——否则高攻击站点每次 30s 轮询都要重跑
+// 窗口内两条聚合（维度 GROUP BY + 逐分钟 GROUP BY），与摄取/固化抢 CPU/IO。
+func TestThreatRollupDimAggregateQuery_cachesOnlyWhenWindowCovered(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	t.Cleanup(resetThreatScreenCachesForTest)
+	since := time.Now().UTC().Add(-time.Hour).Truncate(time.Minute)
+	sinceStr := since.Format("2006-01-02 15:04")
+	bucketStarts := []time.Time{since}
+	coverage := sinceStr
+	seed := func(at time.Time, count int) {
+		t.Helper()
+		if _, err := db.MetricsDB.Exec(`INSERT INTO security_event_rollup (minute,country,province,family,rule,action,count) VALUES (?,?,?,?,?,?,?)`,
+			at.Format("2006-01-02 15:04"), "美国", "", "SQL注入", "942100", "blocked", count); err != nil {
+			t.Fatalf("seed rollup: %v", err)
+		}
+	}
+	query := func(cacheable bool) int {
+		t.Helper()
+		agg, err := threatRollupDimAggregateQuery(db.MetricsDB, sinceStr, bucketStarts, coverage, cacheable)
+		if err != nil {
+			t.Fatalf("aggregate: %v", err)
+		}
+		return agg.total
+	}
+
+	seed(since.Add(time.Minute), 1)
+	if got := query(true); got != 1 {
+		t.Fatalf("total=%d, want 1", got)
+	}
+	// 覆盖完整（cacheable=true）：TTL 内命中缓存，行内容变化不影响同键结果。
+	seed(since.Add(2*time.Minute), 1)
+	if got := query(true); got != 1 {
+		t.Fatalf("total=%d, want 1（窗口覆盖完整时同键命中缓存）", got)
+	}
+	// 覆盖不足（cacheable=false）：既不读也不写缓存——回填中的少计结果不得
+	// 被锁在 30s 缓存里，本次查询必须反映全部已固化行。
+	seed(since.Add(3*time.Minute), 1)
+	if got := query(false); got != 3 {
+		t.Fatalf("total=%d, want 3（覆盖不足时不得命中缓存）", got)
+	}
+	// cacheable=false 不写缓存：此前缓存的旧条目仍在 TTL 内，故覆盖完整的查询
+	// 依旧看到旧值，清缓存后才读到全部行。
+	if got := query(true); got != 1 {
+		t.Fatalf("total=%d, want 1（cacheable=false 不得覆写缓存条目）", got)
+	}
+	resetThreatScreenCachesForTest()
+	if got := query(true); got != 3 {
+		t.Fatalf("total=%d, want 3（清缓存后读到全部已固化行）", got)
+	}
+}

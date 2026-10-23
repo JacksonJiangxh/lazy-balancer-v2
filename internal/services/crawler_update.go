@@ -287,6 +287,16 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 		operator = "system"
 	}
 	outcome := "success"
+	// 用户取消自动轮=显式放弃本槽（与失败同源）：把全部到期/空源槽推进到
+	// 下一排程槽。引擎侧取消时已消费本槽，而未处理的到期源仍留在被消费的
+	// 槽值上（引擎排程槽=启用源最早 next_update）——不推进则爬虫地址库自动
+	// 更新永久静默停摆（含「取消落在开跑前、零源行写入」形态）。
+	// demote/导入排空/进程停止的取消不推进（引擎侧同样不消费槽，恢复后补跑）。
+	defer func() {
+		if outcome == "cancelled" && userCancelledRun(ctx) {
+			advanceSourceSlotsAfterUserCancel("security_crawler_sources", rc.Trigger, crawlerNextSlot)
+		}
+	}()
 	defer func() {
 		detail := fmt.Sprintf("更新%s（触发：%s）", map[string]string{
 			"success": "成功", "failed": "失败", "cancelled": "已取消", "skipped": "跳过",
@@ -575,7 +585,9 @@ func markCrawlerSourceSuccess(name, trigger string, entryCount int) error {
 }
 
 // markCrawlerSourceCancelled 用户取消终态：保留上次快照、版本与失败计数，
-// 不推进排程槽。返回落库错误（取消轮本身已记终态，调用方仅留痕）。
+// 源行自身不推进排程槽——用户取消自动轮时由 RunUpdate 的收口统一推进全部
+// 到期源槽（advanceSourceSlotsAfterUserCancel），demote/导入排空/进程停止的
+// 取消则两者都不推进。返回落库错误（取消轮本身已记终态，调用方仅留痕）。
 func markCrawlerSourceCancelled(name string) error {
 	_, err := db.DB.Exec(`UPDATE security_crawler_sources SET update_status='cancelled', message='已手动取消（保留上次快照）', finished_at=datetime('now') WHERE name=?`, name)
 	if err != nil {

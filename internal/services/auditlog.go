@@ -21,7 +21,6 @@ var ConfigFieldSections = map[string]string{
 	"cert_renewal_attempts":  "ACME配置",
 	"default_ca_provider_id": "ACME配置",
 	"dns_provider":           "ACME配置",
-	"dns_credentials":        "ACME配置",
 
 	"caddy_log_level":               "Caddy配置",
 	"caddy_log_size_mb":             "Caddy配置",
@@ -211,11 +210,13 @@ func CleanupAuditLogs() (int, error) {
 		res, err := db.AuditDB.Exec("DELETE FROM audit_log WHERE id IN (SELECT id FROM audit_log WHERE created_at < ? LIMIT ?)", cutoff, auditCleanupBatchSize)
 		if err != nil {
 			Logf("warn", "audit log cleanup failed: %v", err)
-			return 0, err
+			// 已删除批次不可逆——失败路径必须返回真实部分计数，摘要才能如实
+			// 反映「已删除 N 条后中止」（与 security-events-retention 同口径）。
+			return total, err
 		}
 		n, err := res.RowsAffected()
 		if err != nil {
-			return 0, fmt.Errorf("读取审计日志删除条数失败: %w", err)
+			return total, fmt.Errorf("读取审计日志删除条数失败: %w", err)
 		}
 		total += int(n)
 		if int(n) < auditCleanupBatchSize {
@@ -234,10 +235,7 @@ func CleanupAuditLogs() (int, error) {
 // 新增路由的审计分工：handler 显式记录 → 入 auditRoutePolicies 为 Explicit；
 // 由中间件记录 → 入 Generic 并在本函数补映射 + TestAuditGenericRoutesExactlyOnce
 // 登记表同步。契约绊线见 TestAuditExplicitRoutesMappingEmpty / TestAuditPolicyListsEqual。
-func FormatAuditAction(method, path string) (action, resource, detail string) {
-	p := path
-	detail = p
-
+func FormatAuditAction(path string) (action, resource, detail string) {
 	switch {
 	// /api/v1/config 为 Explicit（handler 记录，HasExplicitAuditEvent
 	// 前置短路）；/config/reload 为 Generic 且由 handler（ReloadCaddy）显式记录，
@@ -245,12 +243,12 @@ func FormatAuditAction(method, path string) (action, resource, detail string) {
 	// 注意勿为 reload 补映射：Generic + handler 记录 + 非空映射 = 单次动作双条
 	//（缺陷形态，TestAuditGenericRoutesExactlyOnce 钉住）。
 
-	case strings.Contains(p, "/caddy/start"):
-		return "启动", "Caddy服务", p
-	case strings.Contains(p, "/caddy/stop"):
-		return "停止", "Caddy服务", p
-	case strings.Contains(p, "/caddy/restart"):
-		return "重启", "Caddy服务", p
+	case strings.Contains(path, "/caddy/start"):
+		return "启动", "Caddy服务", path
+	case strings.Contains(path, "/caddy/stop"):
+		return "停止", "Caddy服务", path
+	case strings.Contains(path, "/caddy/restart"):
+		return "重启", "Caddy服务", path
 	}
 
 	return "", "", ""

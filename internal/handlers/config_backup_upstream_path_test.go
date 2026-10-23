@@ -47,13 +47,22 @@ func TestImportConfigBackup_legacyBackupWithoutUpstreamPath_restoresEmptyDefault
 	if err := json.Unmarshal(unpackExportBody(t, exportResponse.Body.Bytes()), &exportPayload); err != nil {
 		t.Fatalf("decode export: %v", err)
 	}
-	tables := exportPayload["tables"].(map[string]any)
-	pathRows := tables["path_rules"].([]any)
+	tables, ok := exportPayload["tables"].(map[string]any)
+	if !ok {
+		t.Fatalf("export tables 形态异常: %T", exportPayload["tables"])
+	}
+	pathRows, ok := tables["path_rules"].([]any)
+	if !ok {
+		t.Fatalf("export path_rules 形态异常: %T", tables["path_rules"])
+	}
 	if len(pathRows) != 1 {
 		t.Fatalf("export path_rules rows=%d, want 1", len(pathRows))
 	}
 	// 旧版本备份形态：首行剥掉 upstream_path 键，再造一行显式 null
-	firstRow := pathRows[0].(map[string]any)
+	firstRow, ok := pathRows[0].(map[string]any)
+	if !ok {
+		t.Fatalf("export path_rules 行形态异常: %T", pathRows[0])
+	}
 	delete(firstRow, "upstream_path")
 	pathRows = append(pathRows, map[string]any{
 		"rule_id": "lb_uplegacy", "sort_order": 1, "match_type": "exact", "path": "/health", "upstream_path": nil,

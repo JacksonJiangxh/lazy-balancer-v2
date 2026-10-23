@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -279,7 +280,7 @@ func TestCommittedThreatStateWouldPassNameOnlyRollbackAssertion(t *testing.T) {
 	}
 }
 
-func TestSentinelFailureReturnsWafSplitWarning(t *testing.T) {
+func TestSentinelFailureRollsBackWafFilesWithNotice(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	seedLiveAdminShared(t)
 	dir := t.TempDir()
@@ -310,8 +311,8 @@ func TestSentinelFailureReturnsWafSplitWarning(t *testing.T) {
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status=%d body=%s, want injected sentinel failure", rec.Code, rec.Body.String())
 	}
-	if _, err := os.Stat(filepath.Join(dir, "threat-ustc.iplist")); err != nil {
-		t.Fatalf("threat file must really have landed before sentinel failure: %v", err)
+	if _, err := os.Stat(filepath.Join(dir, "threat-ustc.iplist")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("threat file must be rolled back to pre-import (absent), err=%v", err)
 	}
 	var response struct {
 		Data struct {
@@ -323,10 +324,10 @@ func TestSentinelFailureReturnsWafSplitWarning(t *testing.T) {
 	}
 	found := false
 	for _, warning := range response.Data.Warnings {
-		found = found || (strings.Contains(warning, "数据库已回滚") && strings.Contains(warning, "文件"))
+		found = found || (strings.Contains(warning, "数据库已回滚") && strings.Contains(warning, "已回退到导入前状态"))
 	}
 	if !found {
-		t.Fatalf("warnings=%v, want landed-file/rolled-back-DB split warning; body=%s", response.Data.Warnings, rec.Body.String())
+		t.Fatalf("warnings=%v, want explicit file rollback notice; body=%s", response.Data.Warnings, rec.Body.String())
 	}
 	var localID int
 	var localName, localDisplayName string

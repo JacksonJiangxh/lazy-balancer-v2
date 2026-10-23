@@ -7,7 +7,12 @@
 #      仅跳过 .gitignore 已忽略者与构建/运行产物目录；
 #   2) 内容：注释行与测试声明行里的审计编号/轮次元数据——覆盖 Go/TS/Vue/JS/CSS/
 #      Markdown/Shell/YAML/SQL/go.mod/Dockerfile/docker-entrypoint.sh/
-#      .dockerignore/Caddyfile。轮次引用按「审计动作共现」判定：裸轮次＋审计
+#      .dockerignore/Caddyfile。JSON/HTML/TOML/conf 同样入面（夹具字符串与
+#      模板文案里可能混入审计编号），其中 JSON/HTML 按「全文」扫描而非仅注释行
+#      ——JSON 字符串值与 HTML 文本节点没有注释前缀，只扫注释行等于留通道。
+#      刻意例外：web/package-lock.json（npm 生成物，integrity 为混合大小写
+#      base64、随依赖升级整份重写，人工审计标注不进该文件）不入内容面。
+#      轮次引用按「审计动作共现」判定：裸轮次＋审计
 #      动作（N 轮修复）、斜杠并列（第 N/N 轮审计）、无「第」的中文数字归属、
 #      注释头被编辑截断的残骸（// N 轮）：…）都命中；循环轮次表述（每 N 轮
 #      落行、连续 N 轮共识、第 N/N 轮打点）不按裸数字判罚；
@@ -19,8 +24,8 @@
 #
 # 误报收窄：白名单只锚定“审计编号形态”，不按裸数字判罚。百分位 P50/P95/P99、
 # 版本串 v2.3.x、sha256/十六进制摘要、HTTP/3、TLS 1.3、PID1、X509、ED25519、
-# HS256、LBF1 文件魔数等产品 token 不触发（见内嵌扫描器的 SHIELD 与纯十六进制
-# 令牌过滤）。
+# HS256、LBF1 文件魔数、时间格式骨架（YYYY-MM-DD / HH-mm-ss / HH:mm:ss）等
+# 产品 token 不触发（见内嵌扫描器的 SHIELD 与纯十六进制令牌过滤）。
 #
 # 用法：bash scripts/check-no-audit-artifacts.sh [--self-test]
 set -euo pipefail
@@ -90,10 +95,19 @@ fi
 
 actual_ignore="$(awk -v b="$begin_marker" -v e="$end_marker" '$0==b{f=1;next} $0==e{f=0} f' .gitignore | sed '/^[[:space:]]*$/d')"
 expected_ignore="$(printf '%s' "$ignore_expected" | sed '/^[[:space:]]*$/d')"
-if [[ "$(printf '%s\n' "$actual_ignore" | LC_ALL=C sort -u)" != "$(printf '%s\n' "$expected_ignore" | LC_ALL=C sort -u)" ]]; then
+# 去重口径不得用于比较：重复模式行对 git 行为无害，但破坏「逐行一致」契约
+# （重复行被 sort -u 折叠后两侧相等 → 门禁给绿，之后删掉其中一行仍判一致）。
+# 故先单独拒绝重复行，再按排序后全量（保留重复）比较。
+duplicate_ignore="$(printf '%s\n' "$actual_ignore" | LC_ALL=C sort | uniq -d)"
+if [[ -n "$duplicate_ignore" ]]; then
+  echo "ERROR: .gitignore 审计排除块存在重复模式行（逐行一致契约不成立）：" >&2
+  printf '%s\n' "$duplicate_ignore" | sed 's/^/  /' >&2
+  exit 1
+fi
+if [[ "$(printf '%s\n' "$actual_ignore" | LC_ALL=C sort)" != "$(printf '%s\n' "$expected_ignore" | LC_ALL=C sort)" ]]; then
   echo "ERROR: .gitignore 审计排除块与本脚本模式表不一致（两侧模式集必须一一对应）：" >&2
-  diff <(printf '%s\n' "$expected_ignore" | LC_ALL=C sort -u) \
-       <(printf '%s\n' "$actual_ignore" | LC_ALL=C sort -u) | sed 's/^/  /' >&2 || true
+  diff <(printf '%s\n' "$expected_ignore" | LC_ALL=C sort) \
+       <(printf '%s\n' "$actual_ignore" | LC_ALL=C sort) | sed 's/^/  /' >&2 || true
   exit 1
 fi
 
@@ -116,10 +130,15 @@ if [[ ${#content_exempt_paths[@]} -ne 1 ]]; then
 fi
 content_exempt="^$(printf '%s' "${content_exempt_paths[0]}" | sed 's/[.]/\\./g')$"
 
+# 内容面豁免：npm 生成物（integrity 为 base64，且随依赖升级整份重写）——
+# 只豁免该单一路径，业务 JSON 夹具/种子仍须扫描。
+content_scan_exempt_re='(^|/)package-lock\.json$'
+
 scan_targets="$(printf '%s\n' "$controlled" \
   | grep -v -E "$skip_re" \
   | grep -v -E "$content_exempt" \
-  | grep -Ei '\.(go|ts|vue|js|css|md|markdown|txt|sh|yml|yaml|sql|mod)$|(^|/)(Dockerfile[^/]*|docker-entrypoint\.sh|\.dockerignore|Caddyfile)$' \
+  | grep -v -E "$content_scan_exempt_re" \
+  | grep -Ei '\.(go|ts|vue|js|css|md|markdown|txt|sh|yml|yaml|sql|mod|json|html|htm|toml|conf)$|(^|/)(Dockerfile[^/]*|docker-entrypoint\.sh|\.dockerignore|Caddyfile)$' \
   | while IFS= read -r f; do [[ -f "$f" ]] && printf '%s\n' "$f"; done || true)"
 
 if [[ -n "$scan_targets" ]]; then
@@ -151,6 +170,9 @@ my $shield = join '|',
   q{P[0-9]{2}(-P?[0-9]{2})?},            # P50/P95/P99 与 P50-P99 百分位
   q{v[0-9]+\.[0-9]+(?:\.[0-9x*]+)*(?:-[A-Za-z0-9.]+)?},  # 版本串 v2.3.x / v2.3.8-beta
   q{YYYY-MM-DD}, q{NOT-NULL}, q{NULL-[a-z]+},
+  # 时间格式骨架（日志文件名/时间戳布局注释里的 HH-mm-ss、HH:mm:ss）：
+  # 两字母+分隔的三段形态不是审计编号，属产品口径 token。
+  q{[Hh]{2}[-:][Mm]{2}[-:][Ss]{2}},
   q{BY-DESIGN}, q{TOP-LEVEL}, q{HTTP-only}, q{TCP-only}, q{HTTP-date},
   q{TLS-enabled}, q{TLS-only}, q{VERSION-only}, q{JSON-[A-Za-z]*},
   q{IP-control}, q{IP-level}, q{ACME-issued}, q{UPSERT-overwritten},
@@ -263,7 +285,10 @@ while (my $f = <$lf>) {
     $hits++;
     next;
   }
-  my $is_doc = ($f =~ /\.(?:md|markdown|txt)$/i);
+  # 文档/结构化文本按全文扫描：Markdown 与纯文本整篇都是可读文案；JSON 的
+  # 字符串值、HTML 的文本节点没有注释前缀，只扫注释行等于给编号留通道
+  # （夹具/种子 JSON、模板文案是真实混入面）。
+  my $is_doc = ($f =~ /\.(?:md|markdown|txt|html|htm|json)$/i);
 
   $text =~ s/(?:$shield)//g;
 

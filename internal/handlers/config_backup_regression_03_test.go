@@ -92,6 +92,25 @@ func TestImportBackup_emptyUsersSectionDoesNotBumpOrWarn(t *testing.T) {
 	if strings.Contains(rec.Body.String(), "系统数据") {
 		t.Fatalf("absent users table must not warn operator replaced / sessions revoked, body=%s", rec.Body.String())
 	}
+	// 未选分类零落库：分类导入的对外承诺是「只覆盖所选分类」。若 sections→table
+	// 映射或过滤顺序回归，用户以「只恢复账号」的意图操作会整体覆盖线上负载
+	// 规则（数据级不可逆），而上面两条断言全绿。
+	countRows := func(table string) int {
+		t.Helper()
+		var count int
+		if err := db.DB.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&count); err != nil {
+			t.Fatalf("count %s: %v", table, err)
+		}
+		return count
+	}
+	if got := countRows("lb_rules"); got != 0 {
+		t.Fatalf("lb_rules rows=%d, want 0（未选 rules 分类不得写入任何规则）", got)
+	}
+	for _, table := range []string{"upstreams", "path_rules", "security_policies", "security_policy_bindings"} {
+		if got := countRows(table); got != 0 {
+			t.Fatalf("%s rows=%d, want 0（未选分类的表不得被触碰）", table, got)
+		}
+	}
 }
 
 func TestExportConfigBackup_sectionsTrailingCommaAccepted(t *testing.T) {

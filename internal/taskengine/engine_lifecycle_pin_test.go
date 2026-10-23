@@ -288,3 +288,43 @@ func countSkippedRuns(t *testing.T, id string) int {
 	}
 	return n
 }
+
+// Given 注册一个触发类（Oneshot）任务。
+// When StartLoop 与 RearmLoop（含 hasWork 绕过形态）。
+// Then LoopOn 保持 false——触发类无调度语义（标准 §4：显示禁用开关）。引擎侧
+// 必须在 handler 门之外自持纵深守卫：任何调用路径都不得产出「调度开」假信号，
+// 也不得触发 ResetScheduleProgress/lastCheck 等无效副作用。
+func TestEngine_LoopEntriesRejectOneshot(t *testing.T) {
+	e := newTestEngine(t)
+	const id = "t-oneshot-loop"
+	var runs atomic.Int32
+	if err := e.Register(Descriptor{ID: id, Family: "t", Name: "触发类任务", Kind: KindOneshot,
+		Run: func(RunContext) error { runs.Add(1); return nil }}); err != nil {
+		t.Fatal(err)
+	}
+	e.SetRole(true)
+	loopOn := func() bool {
+		m, ok := e.Lookup(id)
+		if !ok {
+			t.Fatalf("%s 未注册", id)
+		}
+		return m.LoopOn
+	}
+
+	e.StartLoop(id)
+	if loopOn() {
+		t.Fatal("Oneshot 任务 StartLoop 后 LoopOn=true——触发类不得被打开调度")
+	}
+	e.RearmLoop(id)
+	if loopOn() {
+		t.Fatal("Oneshot 任务 RearmLoop 后 LoopOn=true")
+	}
+	e.RearmLoop(id, true)
+	if loopOn() {
+		t.Fatal("Oneshot 任务 RearmLoop(hasWork) 后 LoopOn=true")
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := runs.Load(); got != 0 {
+		t.Fatalf("Oneshot 任务调度入口触发了 %d 轮执行, want 0（触发类不进调度面）", got)
+	}
+}

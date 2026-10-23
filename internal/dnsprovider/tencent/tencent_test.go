@@ -16,10 +16,24 @@ import (
 	"lazy-balancer-v2/internal/dnsprovider/ownership"
 )
 
+// createRecordRequest 是 SDK 发出的 CreateRecord 请求体（字段名与腾讯云
+// API 一致，JSON 解码不区分大小写）。fake 留档这些参数，供断言挑战记录
+// 落在正确的 domain/sub_domain/type/line/ttl 上。
+type createRecordRequest struct {
+	Domain     string
+	SubDomain  string
+	RecordType string
+	RecordLine string
+	Value      string
+	TTL        uint64
+}
+
 type recordTransport struct {
 	mu      sync.Mutex
 	records map[uint64]string
 	nextID  uint64
+	creates []createRecordRequest
+	deletes []uint64
 }
 
 func (transport *recordTransport) RoundTrip(request *http.Request) (*http.Response, error) {
@@ -31,9 +45,17 @@ func (transport *recordTransport) RoundTrip(request *http.Request) (*http.Respon
 	transport.mu.Lock()
 	switch request.Header.Get("X-TC-Action") {
 	case "CreateRecord":
+		var payload createRecordRequest
+		if err := json.Unmarshal(body, &payload); err != nil {
+			transport.mu.Unlock()
+			return nil, err
+		}
 		transport.nextID++
 		recordID := 199 + transport.nextID
-		transport.records[recordID] = "owned"
+		// 保存真实 value：按值清理若删错记录，只有断言「幸存记录的 value」
+		// 才能发现（仅数记录条数时删 alpha 留 beta 与删 beta 留 alpha 同形）。
+		transport.records[recordID] = payload.Value
+		transport.creates = append(transport.creates, payload)
 		responseBody = fmt.Sprintf(`{"Response":{"RecordId":%d,"RequestId":"test"}}`, recordID)
 	case "DeleteRecord":
 		var payload struct {
@@ -43,6 +65,7 @@ func (transport *recordTransport) RoundTrip(request *http.Request) (*http.Respon
 			transport.mu.Unlock()
 			return nil, err
 		}
+		transport.deletes = append(transport.deletes, payload.RecordID)
 		delete(transport.records, payload.RecordID)
 	}
 	transport.mu.Unlock()
@@ -292,12 +315,17 @@ func TestProvider_CleanUpValue_deletes_only_own_record(t *testing.T) {
 		t.Fatalf("clean up alpha: %v", err)
 	}
 
-	// Then: only alpha's record was deleted; beta's record survives
+	// Then: only alpha's record was deleted; beta's record survives with its
+	// own value (仅数条数时「删 beta 留 alpha」同样通过)
 	transport.mu.Lock()
-	remaining := len(transport.records)
+	remaining := transport.records
+	deleted := append([]uint64(nil), transport.deletes...)
 	transport.mu.Unlock()
-	if remaining != 1 {
-		t.Fatalf("remaining records=%d, want 1 (beta)", remaining)
+	if len(remaining) != 1 || remaining[201] != "beta" {
+		t.Fatalf("remaining records=%v, want only beta's record (id 201)", remaining)
+	}
+	if len(deleted) != 1 || deleted[0] != 200 {
+		t.Fatalf("deleted record IDs=%v, want [200]（alpha）——按值清理不得删除并发签发的 beta", deleted)
 	}
 }
 
@@ -322,11 +350,53 @@ func TestProvider_CleanUpValue_memory_mode_tracks_values(t *testing.T) {
 		t.Fatalf("clean up beta: %v", err)
 	}
 
-	// Then: alpha's record survives
+	// Then: alpha's record survives with its own value
 	transport.mu.Lock()
 	defer transport.mu.Unlock()
-	if len(transport.records) != 1 {
-		t.Fatalf("remaining records=%v, want only alpha's record", transport.records)
+	if len(transport.records) != 1 || transport.records[200] != "alpha" {
+		t.Fatalf("remaining records=%v, want only alpha's record (id 200)", transport.records)
+	}
+	if len(transport.deletes) != 1 || transport.deletes[0] != 201 {
+		t.Fatalf("deleted record IDs=%v, want [201]（beta）", transport.deletes)
+	}
+}
+
+// Present 的核心契约是把挑战写进 _acme-challenge.<domain> 之下：domain/
+// sub_domain 派生错位会把 TXT 写到别的名字，ACME 验证失败白烧订单配额；
+// record_type/record_line/ttl 写错会被 API 拒绝或落到错误线路。
+func TestProvider_Present_sendsExpectedChallengeRecordFields(t *testing.T) {
+	transport := &recordTransport{records: map[uint64]string{}}
+	provider, err := New("secret-id", "secret-key")
+	if err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
+	provider.client.WithHttpTransport(transport)
+
+	cases := []struct {
+		zone, tokenFQDN, value, wantSubDomain string
+	}{
+		{"example.com.", "_acme-challenge.example.com.", "apex-value", "_acme-challenge"},
+		{"example.com.", "_acme-challenge.www.example.com.", "www-value", "_acme-challenge.www"},
+	}
+	for _, tc := range cases {
+		if err := provider.Present(t.Context(), tc.zone, tc.tokenFQDN, tc.value, 600); err != nil {
+			t.Fatalf("present %s: %v", tc.tokenFQDN, err)
+		}
+	}
+
+	transport.mu.Lock()
+	defer transport.mu.Unlock()
+	if len(transport.creates) != len(cases) {
+		t.Fatalf("CreateRecord calls=%d, want %d", len(transport.creates), len(cases))
+	}
+	for i, tc := range cases {
+		want := createRecordRequest{
+			Domain: "example.com", SubDomain: tc.wantSubDomain, RecordType: "TXT",
+			RecordLine: "默认", Value: tc.value, TTL: 600,
+		}
+		if transport.creates[i] != want {
+			t.Fatalf("CreateRecord[%d]=%+v, want %+v", i, transport.creates[i], want)
+		}
 	}
 }
 
@@ -668,5 +738,150 @@ func TestProvider_CleanUp_memoryModeFailedValueRetriedByCleanUpValue(t *testing.
 	provider.mu.Unlock()
 	if len(left) != 0 {
 		t.Fatalf("owned entries=%+v, want drained after successful retry", left)
+	}
+}
+
+// codedDeleteErrorTransport 让 DeleteRecord 返回指定错误码的 API 错误包络，
+// 用于覆盖 isRecordNotFound 的精确码分支（只测 ResourceNotFound 前缀时，
+// 删掉精确码分支会让记录 ID 失效场景的清理变成非幂等失败而测试仍绿）。
+type codedDeleteErrorTransport struct {
+	recordTransport
+	code string
+}
+
+func (transport *codedDeleteErrorTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request.Header.Get("X-TC-Action") == "DeleteRecord" {
+		if request.Body != nil {
+			_, _ = io.Copy(io.Discard, request.Body)
+			_ = request.Body.Close()
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(fmt.Sprintf(`{"Response":{"Error":{"Code":%q,"Message":"record id invalid"},"RequestId":"test"}}`, transport.code))),
+			Request:    request,
+		}, nil
+	}
+	return transport.recordTransport.RoundTrip(request)
+}
+
+// 记录 ID 失效类错误码必须与「记录不存在」同语义（幂等清理），否则换账户/
+// 手工删除后 ownership 条目永远删不掉、TXT 追踪链断裂。
+func TestProvider_CleanUp_treatsInvalidRecordIDCodesAsSuccess(t *testing.T) {
+	for _, code := range []string{"InvalidParameter.RecordIdInvalid", "InvalidRecord.Id"} {
+		t.Run(code, func(t *testing.T) {
+			provider, err := New("secret-id", "secret-key")
+			if err != nil {
+				t.Fatalf("create provider: %v", err)
+			}
+			transport := &codedDeleteErrorTransport{code: code}
+			transport.records = map[uint64]string{}
+			provider.client.WithHttpTransport(transport)
+			if err := provider.Present(t.Context(), "example.com", "_acme-challenge.example.com.", "value", 600); err != nil {
+				t.Fatalf("present: %v", err)
+			}
+
+			if err := provider.CleanUp(t.Context(), "example.com", "_acme-challenge.example.com."); err != nil {
+				t.Fatalf("clean up with %s: %v（记录 ID 失效必须按删除成功处理）", code, err)
+			}
+		})
+	}
+}
+
+// missingRecordIDTransport 对 CreateRecord 返回成功但缺 RecordId。
+type missingRecordIDTransport struct {
+	recordTransport
+}
+
+func (transport *missingRecordIDTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request.Header.Get("X-TC-Action") == "CreateRecord" {
+		if request.Body != nil {
+			_, _ = io.Copy(io.Discard, request.Body)
+			_ = request.Body.Close()
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"Response":{"RequestId":"test"}}`)),
+			Request:    request,
+		}, nil
+	}
+	return transport.recordTransport.RoundTrip(request)
+}
+
+// CreateRecord 未返回记录 ID = TXT 已落 DNS 却不可追踪（清理只能靠 stale 兜底
+// 或永久残留）。必须报错，且不得把该记录计入 owned。
+func TestProvider_Present_createWithoutRecordIDFails(t *testing.T) {
+	transport := &missingRecordIDTransport{}
+	transport.records = map[uint64]string{}
+	provider, err := New("secret-id", "secret-key")
+	if err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
+	provider.client.WithHttpTransport(transport)
+
+	err = provider.Present(t.Context(), "example.com", "_acme-challenge.example.com.", "value", 600)
+
+	if err == nil || !strings.Contains(err.Error(), "no record ID") {
+		t.Fatalf("err=%v, want CreateRecord returned no record ID", err)
+	}
+	provider.mu.Lock()
+	owned := 0
+	for _, entries := range provider.owned {
+		owned += len(entries)
+	}
+	provider.mu.Unlock()
+	if owned != 0 {
+		t.Fatalf("owned records=%d, want 0（无 ID 记录不得登记为已归属）", owned)
+	}
+}
+
+// scriptedDefaultTransport 作为 http.DefaultTransport 的替身：按脚本返回
+// 状态码，用于观察 New 的 retry.Transport 是否真的接在 SDK 客户端上
+// （所有用例都用 WithHttpTransport 覆盖时，生产装配的重试层无守护）。
+type scriptedDefaultTransport struct {
+	mu       sync.Mutex
+	statuses []int
+	calls    int
+}
+
+func (transport *scriptedDefaultTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request.Body != nil {
+		_, _ = io.Copy(io.Discard, request.Body)
+		_ = request.Body.Close()
+	}
+	transport.mu.Lock()
+	status := http.StatusOK
+	if transport.calls < len(transport.statuses) {
+		status = transport.statuses[transport.calls]
+	}
+	transport.calls++
+	transport.mu.Unlock()
+	return &http.Response{
+		StatusCode: status,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(`{"Response":{"RecordId":201,"RequestId":"test"}}`)),
+		Request:    request,
+	}, nil
+}
+
+func TestNew_wires_retrying_transport(t *testing.T) {
+	oldDefault := http.DefaultTransport
+	base := &scriptedDefaultTransport{statuses: []int{http.StatusTooManyRequests}}
+	http.DefaultTransport = base
+	t.Cleanup(func() { http.DefaultTransport = oldDefault })
+
+	provider, err := New("secret-id", "secret-key")
+	if err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
+	if err := provider.Present(t.Context(), "example.com", "_acme-challenge.example.com.", "value", 600); err != nil {
+		t.Fatalf("present through production wiring: %v", err)
+	}
+	base.mu.Lock()
+	calls := base.calls
+	base.mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("http calls=%d, want 2（New 必须装配 429 重试层）", calls)
 	}
 }

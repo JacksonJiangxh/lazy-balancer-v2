@@ -1,6 +1,7 @@
 package services
 
 import (
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"os"
@@ -61,6 +62,11 @@ func ConfigureWafDirs(dataDir string) {
 	// 爬虫运行快照（root 写、插件读的交换文件）同属数据卷
 	// 派生面——默认 /app/data/crawler-ip-lists.json 与容器形态逐字节一致。
 	crawlerIPListFile = filepath.Join(dataDir, "crawler-ip-lists.json")
+	// 下载 TOFU 完整性基线同属数据卷派生面（与 ip2region.xdb、
+	// security_events.offset 同域）。此前硬编码 /app/data：自定义 data_dir
+	// 的非容器部署下基线持久化恒失败，且失败只降级为错误日志——每次下载都被
+	// 当作「首次下载」重新定基线，代理投毒的内容不一致阻断分支永不触发。
+	downloadIntegrityPath = filepath.Join(dataDir, ".download-integrity.json")
 	// Coraza 审计日志与摄取 offset 同属「随 data_dir
 	// 落数据卷/日志根」的路径域，必须与上列路径同批派生——此前硬编码 /app：
 	// 自定义 data_dir 的非容器部署会继续读写 /app（常不可写）→ 摄取持续失败、
@@ -74,6 +80,11 @@ func ConfigureWafDirs(dataDir string) {
 // 的规则文件读取测试缝以空值表示「按本函数派生」，避免同一条路径出现第二处
 // 硬编码真源。
 func CRSLiveDir() string { return crsLiveDir }
+
+// IP2RegionLivePath 返回 ip2region.xdb 活库路径（ConfigureWafDirs 派生后的
+// 当前值），与 CRSLiveDir 同源——备份导入的文件快照/回退必须与落盘侧读写
+// 同一条路径，不得在 handlers 侧另派生。
+func IP2RegionLivePath() string { return ip2regionLivePath }
 
 // EnsureIPListDir 启动期建目录（0755）。
 func EnsureIPListDir() error {
@@ -248,28 +259,48 @@ func SnapshotIPListProjections() IPListProjectionSnapshot {
 	return snapshot
 }
 
-// RestoreIPListProjections 删除渲染新增的 .txt 并回写快照内容。
-func RestoreIPListProjections(snapshot IPListProjectionSnapshot) {
+// RestoreIPListProjections 删除渲染新增的 .txt 并回写快照内容，返回回滚失败
+// 明细（nil=完整回滚）。
+//
+// 回滚失败不得静默：预检失败后投影目录若停留在「新内容」状态，稳定命名 +
+// 热路径设计会让运行中的 Caddy 在 ≤1s 内感知到未提交的名单内容；同时被删
+// 文件的 wafiplist 运行期缓存必须与 GC 路径同口径淘汰（fail-stale 下继续
+// 用已删集合判定）。调用方据此留痕（caddy CLI 预检回滚路径写 error 日志）。
+func RestoreIPListProjections(snapshot IPListProjectionSnapshot) error {
 	// 回滚直接重写/删除投影文件——备忘的落盘态记录随之失效，清空防陈旧
 	// 命中跳过必要重写。
 	ipListProjectionMemoMu.Lock()
 	ipListProjectionMemo = map[string]ipListProjectionMemoEntry{}
 	ipListProjectionMemoMu.Unlock()
+	var errs []error
+	var deleted []string
 	entries, err := os.ReadDir(IPListDataDir)
-	if err == nil {
+	if err != nil {
+		errs = append(errs, fmt.Errorf("读取投影目录 %s: %w", IPListDataDir, err))
+	} else {
 		for _, entry := range entries {
 			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".txt") {
 				continue
 			}
 			path := filepath.Join(IPListDataDir, entry.Name())
 			if _, keep := snapshot[path]; !keep {
-				_ = os.Remove(path)
+				if rerr := os.Remove(path); rerr != nil {
+					errs = append(errs, fmt.Errorf("删除投影 %s: %w", path, rerr))
+				} else {
+					deleted = append(deleted, path)
+				}
 			}
 		}
 	}
 	for path, data := range snapshot {
-		_ = writeFileAtomicSynced(path, data, 0o644)
+		if werr := writeFileAtomicSynced(path, data, 0o644); werr != nil {
+			errs = append(errs, fmt.Errorf("回写投影 %s: %w", path, werr))
+		}
 	}
+	if len(deleted) > 0 {
+		wafiplist.EvictIPListCache(deleted...)
+	}
+	return errors.Join(errs...)
 }
 
 // @ipListFast 投影文件 + 运行期缓存 GC ----------
@@ -331,6 +362,18 @@ func noteIPListRenderRef(path string) {
 func forgetIPListRenderRefForTest(path string) {
 	ipListRenderRefs.Lock()
 	delete(ipListRenderRefs.lastRef, path)
+	ipListRenderRefs.Unlock()
+}
+
+// ResetIPListProjectionStateForTest 清空进程级投影状态（投影备忘 + 渲染引用
+// 集），等价于进程重启后的首轮渲染起点：生产重启天然是空表，同进程用例必须
+// 显式清空，否则备忘快路可能掩盖「文件与库不一致 → 必须重写」的重写路径。
+func ResetIPListProjectionStateForTest() {
+	ipListProjectionMemoMu.Lock()
+	ipListProjectionMemo = map[string]ipListProjectionMemoEntry{}
+	ipListProjectionMemoMu.Unlock()
+	ipListRenderRefs.Lock()
+	ipListRenderRefs.lastRef = make(map[string]time.Time)
 	ipListRenderRefs.Unlock()
 }
 

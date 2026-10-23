@@ -1,9 +1,9 @@
 package services
 
-// wire EnabledFn 读库失败方向统一 fail-closed——
-// crs/ip2region 曾 err→true（读库失败显示「启用」，实际调度面读不到开关
-// 状态）；auto-backup 曾 err!=nil||enabled（同向 fail-open）。读错时应
-// 显示「已停止」（LoopOn=false），与 threat 既有 fail-closed 口径一致。
+// 业务驱动任务的调度对齐：读失败（库不可读/未初始化）不得把一次读失败固化
+// 为一个独立于业务开关的「调度关闭」态——保持上一次生效态并登记周期重试，
+// 读恢复即收敛到库实态。tick 侧 EnabledFn 自身仍 fail-closed（本轮不跑、
+// 下轮重新求值）。
 
 import (
 	"context"
@@ -39,22 +39,24 @@ func (queryFailingConn) Close() error { return nil }
 
 func (queryFailingConn) Begin() (driver.Tx, error) { return nil, errors.New("no tx") }
 
-// swapBrokenDB 把 db.DB 换成恒失败驱动（LIFO：本清理先于夹具清理跑，
-// 恢复真实 DB 后再 StopTaskEngine/db.Close）。
+// swapBrokenDB 把 db.DB 与后台句柄（db.SetDB）一起换成恒失败驱动——后台
+// 循环按契约只读 atomic 句柄，只换 db.DB 的用例不会命中故障路径。
+// （LIFO：本清理先于夹具清理跑，恢复真实 DB 后再 StopTaskEngine/db.Close）。
 func swapBrokenDB(t *testing.T) {
 	t.Helper()
 	broken := sql.OpenDB(queryFailingConnector{})
 	t.Cleanup(func() { _ = broken.Close() })
-	orig := db.DB
+	orig, origCurrent := db.DB, db.GetDB()
 	db.DB = broken
-	t.Cleanup(func() { db.DB = orig })
+	db.SetDB(broken)
+	t.Cleanup(func() {
+		db.DB = orig
+		db.SetDB(origCurrent)
+	})
 }
 
-func enabledOf(t *testing.T, te *taskengine.Engine, id string) bool {
+func loopOnOf(t *testing.T, te *taskengine.Engine, id string) bool {
 	t.Helper()
-	// 元数据不再为展示冗余求值 EnabledFn；按生产写侧同一入口把业务
-	// 开关对齐到真实调度，再断言 LoopOn。
-	SyncBusinessTaskDrivers()
 	m, ok := te.Lookup(id)
 	if !ok {
 		t.Fatalf("task %s 未注册", id)
@@ -62,53 +64,90 @@ func enabledOf(t *testing.T, te *taskengine.Engine, id string) bool {
 	return m.LoopOn
 }
 
-// wire Fn 闭包族 db.DB 直读无 nil 守卫（生产不可达——引擎
-// wire 晚于 db.Initialize；测试/降级形态可触达）。EnabledFn/NextSlotFn/StatusFn
-// 读 nil 库必须 fail-closed（LoopOn=false/零值槽/空状态），不得 panic——
-// SyncBusinessTaskDrivers 对齐四族业务门，Lookup 同时驱动槽/状态闭包（含
-// threat 委托的 ThreatAutoUpdateEnabled 与 auto-backup 委托的
-// loadAutoBackupSettings）。
-func TestTaskEngineWire_nilDBFnsFailClosedEverywhere(t *testing.T) {
+// Given 业务驱动任务的一次读失败（查询恒失败）。
+// When 调度对齐。
+// Then 上一次生效的调度态保持不变，并登记待重试——不得把读失败固化为关闭。
+func TestTaskEngineWire_driverReadFailureKeepsPreviousLoopState(t *testing.T) {
 	te := newWireTestEngine(t)
+	t.Cleanup(func() { businessDriverSyncPending.Store(false) })
+	ids := []string{"threat", "crs", "ip2region", "auto-backup"}
+	SyncBusinessTaskDrivers()
+	before := map[string]bool{}
+	for _, id := range ids {
+		before[id] = loopOnOf(t, te, id)
+	}
+
+	swapBrokenDB(t)
+	SyncBusinessTaskDrivers()
+	for _, id := range ids {
+		if got := loopOnOf(t, te, id); got != before[id] {
+			t.Fatalf("%s 读失败改写了调度态：%v → %v（应保留上一次生效态）", id, before[id], got)
+		}
+	}
+	if !businessDriverSyncPending.Load() {
+		t.Fatal("读失败后应登记待重试（周期对账据此收敛）")
+	}
+}
+
+// Given 一次读失败后库恢复，且故障期间业务开关改为关闭。
+// When 周期重试入口再次对齐。
+// Then 调度态收敛到库实态，待重试标记清除。
+func TestTaskEngineWire_driverReadRecoveryConverges(t *testing.T) {
+	te := newWireTestEngine(t)
+	t.Cleanup(func() { businessDriverSyncPending.Store(false) })
+	SyncBusinessTaskDrivers()
+	if !loopOnOf(t, te, "crs") {
+		t.Fatal("前置：crs 默认开启自动更新")
+	}
+
+	orig, origCurrent := db.DB, db.GetDB()
+	broken := sql.OpenDB(queryFailingConnector{})
+	db.DB = broken
+	db.SetDB(broken)
+	SyncBusinessTaskDrivers()
+	if !businessDriverSyncPending.Load() {
+		t.Fatal("读失败后应登记待重试")
+	}
+	// 恢复真实库（故障期间的业务写入由其中一行体现）。
+	db.DB = orig
+	db.SetDB(origCurrent)
+	_ = broken.Close()
+	if _, err := db.DB.Exec(`UPDATE security_crs_version SET auto_update=0 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+
+	retryPendingBusinessTaskDrivers()
+	if loopOnOf(t, te, "crs") {
+		t.Fatal("读恢复后应把调度态收敛到 auto_update=0（停止）")
+	}
+	if businessDriverSyncPending.Load() {
+		t.Fatal("全部读取恢复后应清除待重试标记")
+	}
+}
+
+// Given db.DB 未初始化（半初始化/降级形态）。
+// When 调度对齐与元数据读取。
+// Then 不 panic，且调度态保持原值（读不到 ≠ 确认关闭）。
+func TestTaskEngineWire_nilDBKeepsLoopState(t *testing.T) {
+	te := newWireTestEngine(t)
+	t.Cleanup(func() { businessDriverSyncPending.Store(false) })
+	ids := []string{"threat", "crs", "ip2region", "auto-backup"}
+	SyncBusinessTaskDrivers()
+	before := map[string]bool{}
+	for _, id := range ids {
+		before[id] = loopOnOf(t, te, id)
+	}
+
 	orig := db.DB
 	db.DB = nil
 	t.Cleanup(func() { db.DB = orig })
-	for _, id := range []string{"threat", "crs", "ip2region", "auto-backup"} {
-		if enabledOf(t, te, id) {
-			t.Fatalf("%s Fn 族读 nil 库应 fail-closed（LoopOn=false），得到 true", id)
+	SyncBusinessTaskDrivers()
+	for _, id := range ids {
+		if got := loopOnOf(t, te, id); got != before[id] {
+			t.Fatalf("%s nil 库时调度态被改写：%v → %v", id, before[id], got)
 		}
 	}
-}
-
-// Given crs EnabledFn 的 DB 读失败。
-// When 查询任务元数据。
-// Then LoopOn=false（状态列「已停止」）——读库失败不得误报启用（fail-closed）。
-func TestTaskEngineWire_CRSEnabledFnFailsClosedOnDBError(t *testing.T) {
-	te := newWireTestEngine(t)
-	swapBrokenDB(t)
-	if enabledOf(t, te, "crs") {
-		t.Fatal("crs EnabledFn 读库失败应 fail-closed（LoopOn=false/已停止），得到 true")
-	}
-}
-
-// Given ip2region EnabledFn 的 DB 读失败。
-// When 查询任务元数据。
-// Then LoopOn=false（fail-closed，与 crs/threat 同口径）。
-func TestTaskEngineWire_IP2RegionEnabledFnFailsClosedOnDBError(t *testing.T) {
-	te := newWireTestEngine(t)
-	swapBrokenDB(t)
-	if enabledOf(t, te, "ip2region") {
-		t.Fatal("ip2region EnabledFn 读库失败应 fail-closed（LoopOn=false/已停止），得到 true")
-	}
-}
-
-// Given auto-backup loadAutoBackupSettings 读失败。
-// When 查询任务元数据。
-// Then LoopOn=false（fail-closed）——曾 err!=nil||enabled 把读错当启用。
-func TestTaskEngineWire_AutoBackupEnabledFnFailsClosedOnDBError(t *testing.T) {
-	te := newWireTestEngine(t)
-	swapBrokenDB(t)
-	if enabledOf(t, te, "auto-backup") {
-		t.Fatal("auto-backup EnabledFn 读库失败应 fail-closed（LoopOn=false/已停止），得到 true")
+	if !businessDriverSyncPending.Load() {
+		t.Fatal("nil 库应登记待重试")
 	}
 }

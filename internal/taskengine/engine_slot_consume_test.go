@@ -133,6 +133,171 @@ func TestEngine_ScheduledUserCancelConsumesSlot(t *testing.T) {
 	}
 }
 
+// Given Scheduled 任务用户取消在途自动轮（引擎消费本槽、业务侧推进排程槽——
+// 四个规则库取消路径的语义）。
+// When 业务把槽推进到下一槽。
+// Then 新槽到点正常投递——取消不会把该任务锁死在已消费水位。
+func TestEngine_UserCancelAdvanceDeliversNextSlot(t *testing.T) {
+	e := newTestEngine(t)
+	shrinkSlotEvalFloor(t, 20*time.Millisecond)
+	var current atomic.Value
+	current.Store(time.Now().Add(-time.Minute))
+	var runs atomic.Int32
+	if err := e.Register(Descriptor{ID: "t-cancel-next", Family: "t", Name: "取消后下一槽", Kind: KindScheduled,
+		Cancelable: true,
+		NextSlotFn: func() time.Time { return current.Load().(time.Time) },
+		Run: func(rc RunContext) error {
+			if runs.Add(1) == 1 {
+				<-rc.Ctx.Done()
+				return rc.Ctx.Err()
+			}
+			return nil
+		}}); err != nil {
+		t.Fatal(err)
+	}
+	e.SetRole(true)
+	e.StartLoop("t-cancel-next")
+	waitForEngine(t, "首轮启动", 2*time.Second, func() bool { return runs.Load() == 1 })
+	if !e.Cancel("t-cancel-next") {
+		t.Fatal("在途可取消任务 Cancel 应返回 true")
+	}
+	waitForEngine(t, "取消落定", 2*time.Second, func() bool {
+		lr := e.LatestRun("t-cancel-next")
+		return lr != nil && lr.Status == "cancelled"
+	})
+	// 业务侧取消收口推进到紧邻下一槽（此处压缩为 30ms 后到点）。
+	current.Store(time.Now().Add(30 * time.Millisecond))
+	waitForEngine(t, "下一槽投递", 2*time.Second, func() bool { return runs.Load() == 2 })
+}
+
+// Given 用户取消（Cancel 通道）与系统性中止（demote 角色翻转）两种取消。
+// Then 只有用户取消的运行上下文带 ErrUserCancelled 取消原因——业务侧据此
+// 区分「显式放弃本槽」与「恢复后到期轮补跑」。
+func TestEngine_UserCancelMarksCancellationCause(t *testing.T) {
+	e := newTestEngine(t)
+	shrinkSlotEvalFloor(t, 20*time.Millisecond)
+	started := make(chan context.Context, 4)
+	var slot atomic.Value
+	slot.Store(time.Now().Add(-time.Minute))
+	var causesMu sync.Mutex
+	var causes []error
+	if err := e.Register(Descriptor{ID: "t-cause", Family: "t", Name: "取消原因", Kind: KindScheduled,
+		Cancelable: true, RunsOn: RoleMasterOnly,
+		NextSlotFn: func() time.Time { return slot.Load().(time.Time) },
+		Run: func(rc RunContext) error {
+			select {
+			case started <- rc.Ctx:
+			default:
+			}
+			<-rc.Ctx.Done()
+			causesMu.Lock()
+			causes = append(causes, context.Cause(rc.Ctx))
+			causesMu.Unlock()
+			return rc.Ctx.Err()
+		}}); err != nil {
+		t.Fatal(err)
+	}
+	e.SetRole(true)
+	e.StartLoop("t-cause")
+	var firstCtx context.Context
+	select {
+	case firstCtx = <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("首轮未启动")
+	}
+	if !e.Cancel("t-cause") {
+		t.Fatal("Cancel 应返回 true")
+	}
+	waitForEngine(t, "用户取消落定", 2*time.Second, func() bool {
+		lr := e.LatestRun("t-cause")
+		return lr != nil && lr.Status == "cancelled"
+	})
+	if cause := context.Cause(firstCtx); !errors.Is(cause, ErrUserCancelled) {
+		t.Fatalf("用户取消的运行 ctx 原因=%v, want ErrUserCancelled", cause)
+	}
+
+	// demote 中止：ctx 取消不带 ErrUserCancelled（业务侧不得推进槽）。
+	e.SetRole(false)
+	e.SetRole(true)
+	slot.Store(time.Now().Add(-time.Minute)) // 业务推进到新的到期槽（本槽已被消费）
+	e.StartLoop("t-cause")
+	var secondCtx context.Context
+	select {
+	case secondCtx = <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("demote 场景的自动轮未启动")
+	}
+	e.SetRole(false)
+	select {
+	case <-secondCtx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("demote 未取消在途轮")
+	}
+	if cause := context.Cause(secondCtx); errors.Is(cause, ErrUserCancelled) {
+		t.Fatalf("demote 中止的 ctx 原因=%v, 不得为用户取消", cause)
+	}
+}
+
+// Given 用户取消手动轮（trigger=manual）与 demote 中止。
+// Then 两者都不消费槽（手动不改变预约；demote 保留补跑语义）。
+func TestEngine_ManualAndDemoteCancelKeepDueSlot(t *testing.T) {
+	e := newTestEngine(t)
+	slot := time.Now().Add(-time.Minute)
+	started := make(chan struct{}, 4)
+	if err := e.Register(Descriptor{ID: "t-keep", Family: "t", Name: "保留槽", Kind: KindScheduled,
+		Cancelable: true, RunsOn: RoleMasterOnly,
+		NextSlotFn: func() time.Time { return slot },
+		Run: func(rc RunContext) error {
+			started <- struct{}{}
+			<-rc.Ctx.Done()
+			return rc.Ctx.Err()
+		}}); err != nil {
+		t.Fatal(err)
+	}
+	e.SetRole(true)
+	// 手动轮在途取消：槽不消费。
+	manualDone := make(chan error, 1)
+	go func() { manualDone <- e.Trigger("t-keep", "manual", "") }()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("手动轮未启动")
+	}
+	if !e.Cancel("t-keep") {
+		t.Fatal("Cancel 应返回 true")
+	}
+	select {
+	case <-manualDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("手动轮取消后未退出")
+	}
+	waitForEngine(t, "手动轮取消落定", 2*time.Second, func() bool {
+		lr := e.LatestRun("t-keep")
+		return lr != nil && lr.Status == "cancelled"
+	})
+	// demote 中止：同样不消费槽。
+	e.StartLoop("t-keep")
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("自动轮未启动")
+	}
+	e.SetRole(false)
+	waitForEngine(t, "demote 中止落定", 2*time.Second, func() bool {
+		lr := e.LatestRun("t-keep")
+		return lr != nil && (lr.Status == "skipped" || lr.Status == "cancelled")
+	})
+	e.mu.RLock()
+	r := e.regs["t-keep"]
+	e.mu.RUnlock()
+	r.mu.Lock()
+	done := r.schedDoneSlot
+	r.mu.Unlock()
+	if !done.IsZero() {
+		t.Fatalf("schedDoneSlot=%v, want 零值（手动轮/demote 中止不得消费槽）", done)
+	}
+}
+
 // Given Scheduled 槽远期（+1h）/临近（+10s，前导窗内）。
 // When 手动驱动 tick。
 // Then 远期槽仅首 tick 求值（之后零闭包求值零 DB 读）；前导窗内每 tick

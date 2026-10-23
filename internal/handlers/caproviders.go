@@ -1,11 +1,9 @@
 package handlers
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
-	"reflect"
 	"strconv"
 	"strings"
 
@@ -74,19 +72,11 @@ func credentialAuditStateFor(newCredentials, oldCredentials string) credentialAu
 	return credentialChanged
 }
 
-// credentialsSemanticallyEqual 报告两段凭证 JSON 语义相等（键序/空白无关）：
-// 解析后按规范化形态比较，避免前端重排键序被误记为「凭证变更」。
-// 任一侧不是合法 JSON 时退化为字符串比较（判别本身不吞错——合法 JSON 门
-// 由服务层负责）。
+// credentialsSemanticallyEqual 报告两段凭证 JSON 语义相等（键序/空白无关）。
+// 实现单源在 services.CredentialsSemanticallyEqual（DNS 配置写路径共用同一
+// 判定，两侧不得各自解释「凭证变更」）。
 func credentialsSemanticallyEqual(a, b string) bool {
-	var left, right any
-	if err := json.Unmarshal([]byte(a), &left); err != nil {
-		return a == b
-	}
-	if err := json.Unmarshal([]byte(b), &right); err != nil {
-		return a == b
-	}
-	return reflect.DeepEqual(left, right)
+	return services.CredentialsSemanticallyEqual(a, b)
 }
 
 func (h *Handlers) UpdateCAProvider(c *gin.Context) {

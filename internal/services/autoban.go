@@ -285,9 +285,9 @@ type autobanCounter struct {
 	WindowStart time.Time
 	// LastSeen 窗口内末次命中（feed 更新点记录；建议列表「首末时间」数据源）。
 	LastSeen time.Time
-	// Reached 本窗口内已达到过封禁阈值（计数分级日志的判据：threshold 行
-	// 仅由 Run 的评估/修剪路径产生，热路径喂入恒不写该行；窗口过期清零时
-	// 若为真落 expire 行）。
+	// Reached 本窗口内已达到过封禁阈值（窗口过期清零时用于 expire 汇总行
+	// 的「达阈值」明细与 /status 的达阈值 IP 计数；热路径喂入不写任何分级
+	// 日志——每轮只有 Run 的汇总行「活跃 M 个 IP」）。
 	Reached bool
 }
 
@@ -1064,15 +1064,9 @@ func AutobanDisableFlush() {
 		// 禁用收尾 candidates=nil 仍可触发挤出（带外写入致 kept 超限），
 		// 挤出条目同解封语义清桶——与 Run 轮同口径，防重新启用后旧计数重封。
 		AutobanForgetIPs(out.EvictedIPs)
-		if out.Evicted > 0 || out.DroppedNew > 0 {
-			// 容量收敛可观测（与 Run 轮同款留痕）：禁用收尾的挤出此前零留痕——
-			// 被挤者无 WARN/审计可核对（是否需手动加白/调容量无从判定）。
-			suffix := autobanEvictedIdentitySuffix(out.EvictedIPs)
-			TaskLogfWarn(AutobanTaskID, "capacity", "自动封禁名单容量收敛（禁用收尾）：挤出 %d、丢弃 %d（上限 %d）%s",
-				out.Evicted, out.DroppedNew, AutobanListEntryCap, suffix)
-			RecordAuditLog("system", "容量收敛", "IP 地址列表",
-				fmt.Sprintf("自动封禁容量收敛（禁用收尾）：挤出 %d、丢弃 %d（上限 %d）%s", out.Evicted, out.DroppedNew, AutobanListEntryCap, suffix), "")
-		}
+		// 容量收敛可观测（与 Run 轮同款留痕）：禁用收尾的挤出此前零留痕——
+		// 被挤者无 WARN/审计可核对（是否需手动加白/调容量无从判定）。
+		autobanReportCapacityOutcome("（禁用收尾）", out)
 		if out.Changed {
 			autobanAuditExpiredUnban(out.Expired)
 			autobanConvergeLocked("自动封禁禁用收尾", out.ListID)
@@ -1233,6 +1227,10 @@ func RunAutobanCycle(rc taskengine.RunContext) error {
 		return err
 	}
 	autobanSetSuggestions(nil)
+	// 容量收敛留痕不在 Changed 门内、也不在审计写门后：满容量丢弃新封时名单
+	// 内容不变（Changed=false），丢弃仍是真实发生的安全事件，必须留痕；降级
+	// 窗口内同样留（说明丢弃已发生，避免排障时把「未达标」误当「无异常」）。
+	autobanReportCapacityOutcome("", out)
 	if out.Changed {
 		// 审计写面前复核：merge/收敛已落定（名单变化是事实，终态仍按本轮
 		// 成功计）——但降级/取消窗口内不再写逐 IP 审计（审计归因会失真为
@@ -1250,21 +1248,28 @@ func RunAutobanCycle(rc taskengine.RunContext) error {
 					AuditResultPart("success")), "")
 		}
 		autobanAuditExpiredUnban(out.Expired)
-		if out.Evicted > 0 || out.DroppedNew > 0 {
-			// 容量收敛可观测（2026-10-14 用户裁定）：发生挤出/丢弃的那轮落
-			// WARN 级任务日志行（含计数）+ 系统操作者审计行。补充挤出
-			// 条目身份（截断前 10 个+「等 N 个」）——点名被挤者便于核对清桶
-			// 与判定是否需要手动加白/调容量。
-			suffix := autobanEvictedIdentitySuffix(out.EvictedIPs)
-			TaskLogfWarn(AutobanTaskID, "capacity", "自动封禁名单容量收敛：挤出 %d、丢弃 %d（上限 %d）%s",
-				out.Evicted, out.DroppedNew, AutobanListEntryCap, suffix)
-			RecordAuditLog("system", "容量收敛", "IP 地址列表",
-				fmt.Sprintf("自动封禁容量收敛：挤出 %d、丢弃 %d（上限 %d）%s", out.Evicted, out.DroppedNew, AutobanListEntryCap, suffix), "")
-		}
 	}
 	TaskLogf(AutobanTaskID, "cycle", "本轮：计数 %d IP / 活跃 %d 个 IP / 候选 %d / 新封 %d / 到期解封 %d / 名单 %d 条%s%s",
 		autobanTrackedCount(), autobanReachedCount(), len(candidates), len(out.Banned), len(out.Expired), out.Total, reloadNote(out.Changed, reloadState), feedNote)
 	return nil
+}
+
+// autobanReportCapacityOutcome 容量收敛留痕（Run 轮与禁用收尾共用单一实现）：
+// WARN 级任务日志行（含计数与挤出条目身份）+ 系统操作者审计行。
+// 判据只看本轮是否发生挤出/丢弃，不看 Changed——kept 全为手动条目且满容量时
+// 新封被整批丢弃而名单内容不变（Changed=false），留痕仍必须落（否则管理员
+// 无法区分「未达标」与「满容量丢弃」，攻击流量静默未被封禁）。
+func autobanReportCapacityOutcome(scope string, out autobanMergeOutcome) {
+	if out.Evicted == 0 && out.DroppedNew == 0 {
+		return
+	}
+	// 补充挤出条目身份（截断前 10 个+「等 N 个」）——点名被挤者便于核对清桶
+	// 与判定是否需要手动加白/调容量。
+	suffix := autobanEvictedIdentitySuffix(out.EvictedIPs)
+	TaskLogfWarn(AutobanTaskID, "capacity", "自动封禁名单容量收敛%s：挤出 %d、丢弃 %d（上限 %d）%s",
+		scope, out.Evicted, out.DroppedNew, AutobanListEntryCap, suffix)
+	RecordAuditLog("system", "容量收敛", "IP 地址列表",
+		fmt.Sprintf("自动封禁容量收敛%s：挤出 %d、丢弃 %d（上限 %d）%s", scope, out.Evicted, out.DroppedNew, AutobanListEntryCap, suffix), "")
 }
 
 // autobanAuditExpiredUnban 到期自动解封审计（Run 轮与禁用收尾共用单一实现，

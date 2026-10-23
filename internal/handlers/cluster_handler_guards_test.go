@@ -75,11 +75,15 @@ func TestGetClusterWafFiles_409DuringImportWindow(t *testing.T) {
 		t.Fatalf("导入窗口内 status=%d body=%s, want 409", busyRecorder.Code, busyRecorder.Body.String())
 	}
 
-	// 窗口外放行（无 WAF 文件时为 404「主节点无安全数据」，关键是不得 409）。
+	// 窗口外放行：具体落点必须是 404「主节点无安全数据」（无文件形态），
+	// 只断言「不是 409」会让 500/503 同样通过——装配缺失或打包故障会静默混过。
 	freeRecorder := httptest.NewRecorder()
 	h.GetClusterWafFiles(ginTestContext(freeRecorder))
-	if freeRecorder.Code == http.StatusConflict {
-		t.Fatalf("导入窗口外仍 409: body=%s", freeRecorder.Body.String())
+	if freeRecorder.Code != http.StatusNotFound {
+		t.Fatalf("导入窗口外 status=%d body=%s, want 404（主节点无安全数据）", freeRecorder.Code, freeRecorder.Body.String())
+	}
+	if !strings.Contains(freeRecorder.Body.String(), "主节点无安全数据") {
+		t.Fatalf("导入窗口外 body=%s, want 点名无安全数据", freeRecorder.Body.String())
 	}
 }
 

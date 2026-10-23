@@ -69,20 +69,25 @@ func certJobOperationLock(id int) *sync.Mutex {
 // 不外发）——详情与列表字段同源，新消费方（如任务监控详情）不会踩空
 // 「列表有、详情无」的字段分叉。
 type certJobListItem struct {
-	ID                   int                 `json:"id"`
-	RuleID               string              `json:"rule_id"`
-	Domain               string              `json:"domain"`
-	CAProviderID         int                 `json:"ca_provider_id"`
-	CAProviderName       string              `json:"ca_provider_name,omitempty"`
-	Status               string              `json:"status"`
-	Message              string              `json:"message"`
-	Issuer               string              `json:"issuer"`
-	DaysRemaining        int                 `json:"days_remaining"`
-	CertificateStatus    string              `json:"certificate_status"`
-	RenewalAttempts      int                 `json:"renewal_attempts,omitempty"`
-	CAAvailableAfter     models.JSONNullTime `json:"ca_available_after,omitempty"`
-	LastErrorCode        string              `json:"last_error_code,omitempty"`
-	ExpiresAt            models.JSONNullTime `json:"expires_at"`
+	ID                int                 `json:"id"`
+	RuleID            string              `json:"rule_id"`
+	Domain            string              `json:"domain"`
+	CAProviderID      int                 `json:"ca_provider_id"`
+	CAProviderName    string              `json:"ca_provider_name,omitempty"`
+	Status            string              `json:"status"`
+	Message           string              `json:"message"`
+	Issuer            string              `json:"issuer"`
+	DaysRemaining     int                 `json:"days_remaining"`
+	CertificateStatus string              `json:"certificate_status"`
+	RenewalAttempts   int                 `json:"renewal_attempts,omitempty"`
+	CAAvailableAfter  models.JSONNullTime `json:"ca_available_after,omitempty"`
+	LastErrorCode     string              `json:"last_error_code,omitempty"`
+	ExpiresAt         models.JSONNullTime `json:"expires_at"`
+	// NotAfter 是证书真实到期时刻的派生值：优先库值 expires_at，缺失时由
+	// PEM 解析回退。UI 的「有效期/自动重签时间」只认该字段——判 expires_at
+	// 会让导入/集群回插的 NULL 有效期行两侧显示分叉（后端已算 days_remaining
+	// 却渲染「-」）。
+	NotAfter             models.JSONNullTime `json:"not_after"`
 	CreatedAt            time.Time           `json:"created_at"`
 	UpdatedAt            models.JSONNullTime `json:"updated_at"`
 	RetryCooldownSeconds *int64              `json:"retry_cooldown_seconds"`
@@ -126,6 +131,7 @@ func (j *certJobListItem) scanFrom(scanner certJobScanner, now time.Time, expiry
 		notAfter = derived
 	}
 	if !notAfter.IsZero() {
+		j.NotAfter = models.JSONNullTime{NullTime: sql.NullTime{Time: notAfter, Valid: true}}
 		j.DaysRemaining = services.CertDaysRemaining(notAfter, now)
 		j.CertificateStatus = services.CertificateExpiryStatus(notAfter, now, expiryDays)
 	}
@@ -396,11 +402,10 @@ func (h *Handlers) retryCertJobByID(c *gin.Context, id int) {
 	// 冷却是否真的未到期——429 判定与「手动越过 CA 冷却」审计片段共用同一
 	// 布尔：冷却已自然到期时带 force 的重试并未越过任何东西，记入会让越权
 	// 留痕被稀释。
-	cooldownActive := status == "waiting_ca" && caAvailableAfter.Valid && time.Now().Before(caAvailableAfter.Time)
+	cooldownActive := certJobCAcooldownActive(status, caAvailableAfter, time.Now())
 	if cooldownActive && !forceRetry {
-		remaining := time.Until(caAvailableAfter.Time).Round(time.Second)
 		c.JSON(http.StatusTooManyRequests, models.APIResponse{Code: http.StatusTooManyRequests,
-			Message: fmt.Sprintf("CA 限流冷却未到期（剩余约 %s）。冷却到期后将自动重排；确需立即重签请确认后强制重试（可能再次被 CA 拒绝）", remaining)})
+			Message: certJobCAcooldownMessage(caAvailableAfter.Time)})
 		return
 	}
 
@@ -608,6 +613,21 @@ func certJobRetryBlocked(status string, updatedAt, createdAt sql.NullTime, now t
 		message = "证书已下载完成，正在等待部署生效；稍后可重试以立即重新部署（不会重新签发）"
 	}
 	return true, http.StatusTooManyRequests, message
+}
+
+// certJobCAcooldownActive 报告任务是否仍处于 CA 限流退避窗口（waiting_ca 且
+// ca_available_after 未到期）。「任务重试」与「手动触发签发」两个入口必须共用
+// 本判据：同状态同语义却一个要求 force、另一个直接重排，会让规则列表的
+// 「重新签发」静默越过冷却、清空 ca_available_after 并继续消耗 CA 配额。
+func certJobCAcooldownActive(status string, caAvailableAfter sql.NullTime, now time.Time) bool {
+	return status == "waiting_ca" && caAvailableAfter.Valid && now.Before(caAvailableAfter.Time)
+}
+
+// certJobCAcooldownMessage 是 CA 冷却拦截的统一文案（availableAfter=冷却到期
+// 时刻），两个入口的 429 文案必须一致，避免用户以为只有任务重试受限。
+func certJobCAcooldownMessage(availableAfter time.Time) string {
+	remaining := time.Until(availableAfter).Round(time.Second)
+	return fmt.Sprintf("CA 限流冷却未到期（剩余约 %s）。冷却到期后将自动重排；确需立即重签请确认后强制重试（可能再次被 CA 拒绝）", remaining)
 }
 
 // reversedCertJobDomain 交换双域名任务的域名顺序：cert_jobs.domain 存排序
@@ -967,7 +987,7 @@ func readCertJobLogFile(path string) string {
 		return ""
 	}
 
-	data = tailLogWindow(data, startOffset)
+	data = tailLogWindow(f, data, startOffset)
 
 	const maxLines = 500
 	lines := strings.Split(string(data), "\n")

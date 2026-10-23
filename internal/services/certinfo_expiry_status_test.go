@@ -6,7 +6,6 @@ package services
 // 本族钉住 CertificateExpiryStatus 的天粒度单源，并逐消费点核对一致。
 
 import (
-	"log"
 	"strings"
 	"testing"
 	"time"
@@ -50,21 +49,27 @@ func TestCertificateExpiryStatus_dayGranularityBoundaries(t *testing.T) {
 func TestFormatRuleCertInfo_matchesCertificateExpiryStatus(t *testing.T) {
 	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
 	const threshold = 30
-	for _, offset := range []time.Duration{
-		30*24*time.Hour - time.Minute,
-		30 * 24 * time.Hour,
-		30*24*time.Hour + time.Minute,
-		31 * 24 * time.Hour,
-		-time.Hour,
-	} {
-		certPEM, _ := expiredShapeCertAndKey(t, "single-source.test", now.Add(offset))
+	// 期望值必须显式列出：用 CertificateExpiryStatus(...) 现算 want 与被测函数
+	// 委托同一单源，阈值数学错误时两侧同步出错、测试恒绿。
+	cases := []struct {
+		offset     time.Duration
+		wantStatus string
+		wantDays   int
+	}{
+		{30*24*time.Hour - time.Minute, "expiring", 29},
+		{30 * 24 * time.Hour, "expiring", 30},
+		{30*24*time.Hour + time.Minute, "expiring", 30},
+		{31 * 24 * time.Hour, "valid", 31},
+		{-time.Hour, "expired", 0},
+	}
+	for _, tc := range cases {
+		certPEM, _ := expiredShapeCertAndKey(t, "single-source.test", now.Add(tc.offset))
 		info := FormatRuleCertInfo(certPEM, "manual", "single-source.test", "", threshold, now)
-		want := CertificateExpiryStatus(now.Add(offset), now, threshold)
-		if info.Status != want {
-			t.Fatalf("offset=%v: FormatRuleCertInfo status=%q, want %q (单源)", offset, info.Status, want)
+		if info.Status != tc.wantStatus {
+			t.Fatalf("offset=%v: FormatRuleCertInfo status=%q, want %q", tc.offset, info.Status, tc.wantStatus)
 		}
-		if info.DaysRemaining != CertDaysRemaining(now.Add(offset), now) {
-			t.Fatalf("offset=%v: days=%d, want %d", offset, info.DaysRemaining, CertDaysRemaining(now.Add(offset), now))
+		if info.DaysRemaining != tc.wantDays {
+			t.Fatalf("offset=%v: days=%d, want %d", tc.offset, info.DaysRemaining, tc.wantDays)
 		}
 	}
 }
@@ -81,15 +86,12 @@ func TestCheckManualCertExpiration_matchesCertificateExpiryStatus(t *testing.T) 
 	if _, err := database.Exec("UPDATE global_config SET cert_expiry_days=30 WHERE id=1"); err != nil {
 		t.Fatal(err)
 	}
-	var buf strings.Builder
-	oldWriter := log.Writer()
-	log.SetOutput(&buf)
-	t.Cleanup(func() { log.SetOutput(oldWriter) })
+	logs := captureApplicationLogs(t)
 	resetCertificateServiceForTest(t)
 
 	NewCertificateService().checkManualCertExpiration()
 
-	if !strings.Contains(buf.String(), "TLS Certificate Check: 0 expired, 1 expiring within 30 days") {
-		t.Fatalf("log=%q, want 30 天 +1 分钟按天粒度判为临期（与单源一致）", buf.String())
+	if !strings.Contains(logs.String(), "TLS Certificate Check: 0 expired, 1 expiring within 30 days") {
+		t.Fatalf("log=%q, want 30 天 +1 分钟按天粒度判为临期（与单源一致）", logs.String())
 	}
 }

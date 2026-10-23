@@ -258,10 +258,59 @@ func retryCertificateDeployment(ctx context.Context, jobID int, reloader func() 
 	return NewCertIssuer(reloader).deployIssuedCertificate(ctx, jobID, material)
 }
 
+// deploymentFailureWriteback 是部署失败状态回写的测试缝（默认 transitionJob），
+// 用于覆盖「状态回写本身失败」的形态。
+var deploymentFailureWriteback = transitionJob
+
+// deploymentFailureFromStatuses 返回部署失败回写允许的源状态集合：常规部署链为
+// deploymentLifecycleJobStatuses；快速重部署链额外允许 issued——该链先以
+// issued→downloaded 的进度写进入部署生命周期，若这次进度写本身因瞬时 DB 故障
+// 未落库，失败回写若仍拒绝 issued 就只剩 WARN，行会停在 issued 而磁盘是旧材料
+// （文件对账只补缺失文件、不比对内容），只有重启/升主才能收敛。
+func deploymentFailureFromStatuses(includeIssued bool) []string {
+	if !includeIssued {
+		return deploymentLifecycleJobStatuses
+	}
+	statuses := make([]string, 0, len(deploymentLifecycleJobStatuses)+1)
+	statuses = append(statuses, deploymentLifecycleJobStatuses...)
+	statuses = append(statuses, "issued")
+	return statuses
+}
+
+// advanceCertificateDeploymentWindow 在状态回写失败后独立推进部署重试的簿记列
+// （message/attempts/窗口），不依赖状态 CAS：30s 补扫的 downloaded 分支只收
+// 非 NULL 窗口，窗口停在 NULL 会让该行失去全部周期通道，直到进程重启/升主。
+// 状态谓词固定为部署生命周期（不含 issued）：补扫只收 downloaded/cleanup_*，
+// 对 issued 行写簿记既不会被任何通道消费，还会让并发胜者已提交的成功任务
+// 背上「部署失败」文案。
+func advanceCertificateDeploymentWindow(jobID, attempt int, message, availableAfter string) {
+	if db.DB == nil {
+		return
+	}
+	from := deploymentLifecycleJobStatuses
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(from)), ",")
+	args := []any{message, attempt, availableAfter, jobID}
+	for _, status := range from {
+		args = append(args, status)
+	}
+	if _, err := db.DB.Exec("UPDATE cert_jobs SET message=?, deployment_attempts=?, deployment_available_after=?, updated_at=datetime('now') WHERE id=? AND status IN ("+placeholders+")", args...); err != nil {
+		Logf("warn", "cert job %d: advance deployment retry window failed (补扫/重启恢复接管): %v", jobID, err)
+	}
+}
+
 func (s *CertIssuer) deploymentFailed(jobID int, material issuedCertificate, message string, err error) error {
+	return s.deploymentFailedFrom(jobID, material, message, err, deploymentLifecycleJobStatuses)
+}
+
+func (s *CertIssuer) deploymentFailedFrom(jobID int, material issuedCertificate, message string, err error, from []string) error {
 	var previousAttempt int
 	// 使用 QueryRowContext 以响应 worker 取消信号（此处函数无 ctx，用 Background 兜底）。
-	if queryErr := db.DB.QueryRowContext(context.Background(), "SELECT COALESCE(deployment_attempts,0) FROM cert_jobs WHERE id=? AND status IN ('issued','downloaded','cleanup_dns','cleanup_warning')", jobID).Scan(&previousAttempt); queryErr != nil {
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(from)), ",")
+	args := []any{jobID}
+	for _, status := range from {
+		args = append(args, status)
+	}
+	if queryErr := db.DB.QueryRowContext(context.Background(), "SELECT COALESCE(deployment_attempts,0) FROM cert_jobs WHERE id=? AND status IN ("+placeholders+")", args...).Scan(&previousAttempt); queryErr != nil {
 		return &certificateDeploymentError{err: errors.Join(err, queryErr)}
 	}
 	if material.deploymentAttempt > previousAttempt {
@@ -301,7 +350,7 @@ func (s *CertIssuer) deploymentFailed(jobID int, material issuedCertificate, mes
 		fields["expires_at"] = material.notAfter
 		fields["ca_provider_id"] = material.providerID
 	}
-	updateErr := transitionJob(db.DB, jobID, deploymentLifecycleJobStatuses, "downloaded", fields)
+	updateErr := deploymentFailureWriteback(db.DB, jobID, from, "downloaded", fields)
 	// 部署失败必须落 certjob-*.log（此前部署链零 WriteCertJobLog，
 	// 磁盘日志只剩签发阶段，排障需反查 DB）。ERROR 行业务行恒写；状态回写失败
 	// （CAS 冲突/DB 故障）补 WARN 行，且不改变部署失败语义与签发结果。
@@ -309,8 +358,15 @@ func (s *CertIssuer) deploymentFailed(jobID int, material issuedCertificate, mes
 	if updateErr != nil {
 		Logf("warn", "cert job %d deployment status writeback failed (status=downloaded, attempt=%d): %v", jobID, attempt, updateErr)
 		WriteCertJobLog(jobID, "WARN", "deployment_status_update_failed", fmt.Sprintf("部署失败状态回写失败 [attempt=%d/%d]: %v", attempt, maxCertificateDeploymentAttempts, updateErr))
+		// 状态回写失败不得让窗口列停在 NULL：补扫只收非 NULL 窗口，独立簿记
+		// UPDATE（无状态 CAS）让周期通道仍然可达。
+		advanceCertificateDeploymentWindow(jobID, attempt, storedMessage, availableAfter)
+		RecordAuditLog("system", "部署失败", "证书任务", FormatAuditDetail(AuditJobPart(jobID), AuditResultPart("status_writeback_failed")), "")
 	}
-	if updateErr == nil && s.deploymentRetry != nil {
+	// 内存重试调度与 DB 状态解耦：状态回写失败也必须登记 timer——回调会重读
+	// 行状态，行已被并发胜者推进到 issued 时 SELECT 不到而自然 no-op，不会
+	// 重复部署；反之只有 WARN 不留 timer 时该行再无任何周期通道。
+	if s.deploymentRetry != nil {
 		material.deploymentAttempt = attempt
 		// 异步再调度。此处常在部署回调 goroutine 内被同步调用——
 		// 若同步进入 scheduleDeploymentRetry，会命中 的在途回调
@@ -606,6 +662,9 @@ func (s *CertIssuer) redeployDownloadedInLock(ctx context.Context, jobID int, ma
 			return fmt.Errorf("finalize already deployed certificate: %w", err)
 		}
 		RecordAuditLog("system", "签发成功", "证书任务", fmt.Sprintf("规则 %s 证书已部署，无需重新部署", ruleID), "")
+		// 与主部署路径同口径：未来生效证书即使本次无需重写文件，也要登记
+		// 生效点重载（否则首次部署写盘后失败的收敛路径会缺这一次补充重载）。
+		s.noteFutureNotBefore(jobID, material)
 		return nil
 	}
 	// 快速路径的进度迁移确实需要 issued→downloaded（任务已签发、材料在库），
@@ -613,15 +672,19 @@ func (s *CertIssuer) redeployDownloadedInLock(ctx context.Context, jobID int, ma
 	// nonTerminalJobStatuses 静态防线。
 	logger.from = []string{"issued", "downloaded"}
 	logger.Log("downloaded", "检测到已签发的有效证书，直接重新部署文件")
+	// 本链的失败回写必须同时接受 issued：上面的进度写可能因瞬时 DB 故障未落库，
+	// 此时行仍是 issued，若失败回写拒绝 issued 就会停在「issued + 磁盘旧材料」
+	// 这一无周期通道的形态。
+	redeployFailureStatuses := deploymentFailureFromStatuses(true)
 	snapshot, snapshotErr := SnapshotCertFiles([]string{ruleID})
 	if snapshotErr != nil {
-		return s.deploymentFailed(jobID, material, "读取现有证书文件失败: "+snapshotErr.Error(), fmt.Errorf("snapshot existing certificate files: %w", snapshotErr))
+		return s.deploymentFailedFrom(jobID, material, "读取现有证书文件失败: "+snapshotErr.Error(), fmt.Errorf("snapshot existing certificate files: %w", snapshotErr), redeployFailureStatuses)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if err := WriteCertFiles(ruleID, existingCert, existingKey); err != nil {
-		return s.deploymentFailed(jobID, material, "已有证书重新部署失败: "+err.Error(), fmt.Errorf("redeploy existing certificate: %w", err))
+		return s.deploymentFailedFrom(jobID, material, "已有证书重新部署失败: "+err.Error(), fmt.Errorf("redeploy existing certificate: %w", err), redeployFailureStatuses)
 	}
 	if err := ctx.Err(); err != nil {
 		return errors.Join(err, restoreCertificateDeployment(snapshot, s.caddyReloader))
@@ -631,7 +694,7 @@ func (s *CertIssuer) redeployDownloadedInLock(ctx context.Context, jobID int, ma
 		// 2026-09-07 裁定：fast-path 重载与主路径（536/:539）统一留痕。
 		s.auditFastPathReload(jobID, material, err)
 		if err != nil {
-			return s.deploymentFailed(jobID, material, "重新部署后重载 Caddy 失败: "+err.Error(), fmt.Errorf("reload Caddy after certificate redeploy: %w", err))
+			return s.deploymentFailedFrom(jobID, material, "重新部署后重载 Caddy 失败: "+err.Error(), fmt.Errorf("reload Caddy after certificate redeploy: %w", err), redeployFailureStatuses)
 		}
 	}
 	if err := ctx.Err(); err != nil {
@@ -651,6 +714,9 @@ func (s *CertIssuer) redeployDownloadedInLock(ctx context.Context, jobID int, ma
 		return errors.Join(fmt.Errorf("finalize certificate redeploy: %w", err), restoreCertificateDeployment(snapshot, s.caddyReloader))
 	}
 	RecordAuditLog("system", "签发成功", "证书任务", fmt.Sprintf("规则 %s 证书重新部署成功", ruleID), "")
+	// 与主部署路径同口径登记生效点重载（noteFutureNotBefore 幂等，非未来
+	// 生效时不产生任何登记）。
+	s.noteFutureNotBefore(jobID, material)
 	return nil
 }
 

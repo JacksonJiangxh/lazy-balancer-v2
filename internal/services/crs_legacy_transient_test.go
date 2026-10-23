@@ -49,8 +49,17 @@ func TestCleanupLegacyCRSTransient_removesOnlyLegacyTransientArtifacts(t *testin
 	m := newCRSUpdateManager(func() error { return nil })
 	m.crsDir = dir
 	var logBuf bytes.Buffer
+	oldWriter, oldLevel := log.Writer(), CurrentLogLevel()
 	log.SetOutput(&logBuf)
-	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	t.Cleanup(func() {
+		log.SetOutput(oldWriter)
+		// 级别是全局状态：只还原 writer 不够，任何前序用例把级别降到 warn
+		// 都会让本用例（info 行）假红。
+		_ = ConfigureLogLevel(oldLevel)
+	})
+	if err := ConfigureLogLevel("info"); err != nil {
+		t.Fatal(err)
+	}
 	m.cleanupLegacyCRSTransient()
 
 	// Then：瞬态目标全删（目录整树消失）
@@ -68,9 +77,10 @@ func TestCleanupLegacyCRSTransient_removesOnlyLegacyTransientArtifacts(t *testin
 			t.Fatalf("%s must be kept: %v", keep, err)
 		}
 	}
-	// And：清理动作留痕——审计日志行点名删除数量（本用例恰为 7 个目标）
-	if out := logBuf.String(); !strings.Contains(out, "cleaned 7 legacy transient artifacts") {
-		t.Fatalf("expected cleanup audit log line, got %q", out)
+	// And：清理动作留痕——审计日志行点名删除数量（本用例恰为 7 个目标）。
+	// 只钉「动作 + 数量」两个语义片段，不钉整句（文案打磨不应让守卫假红）。
+	if out := logBuf.String(); !strings.Contains(out, "cleaned 7") {
+		t.Fatalf("expected cleanup audit log line with count 7, got %q", out)
 	}
 }
 
@@ -81,8 +91,9 @@ func TestCleanupLegacyCRSTransient_missingDirIsSilentNoop(t *testing.T) {
 
 	// When：执行遗留清理
 	var logBuf bytes.Buffer
+	oldWriter := log.Writer()
 	log.SetOutput(&logBuf)
-	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	t.Cleanup(func() { log.SetOutput(oldWriter) })
 	m.cleanupLegacyCRSTransient() // 不得 panic
 
 	// Then：静默无操作，不输出清理日志

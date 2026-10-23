@@ -77,3 +77,44 @@ func TestStore_saveLogsRetiredEntryCount(t *testing.T) {
 		t.Fatalf("退役日志级别应为 info: %q", joined)
 	}
 }
+
+// 保留期边界精度：只测「超期 1h」时把 `>` 改成 `>=`、或把阈值写成 30 天 ±
+// 数小时都不会红。这里以「保留期 -1 分钟」与「保留期 +1 分钟」夹住阈值，
+// 并同时确认零 CreatedAt 的 legacy 条目（无法证明年龄）继续保留。
+func TestStore_saveRetiresOnlyBeyondRetentionBoundary(t *testing.T) {
+	dir := t.TempDir()
+	store, err := New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	within := time.Now().Add(-OwnershipRetention + time.Minute).UTC().Format(time.RFC3339)
+	beyond := time.Now().Add(-OwnershipRetention - time.Minute).UTC().Format(time.RFC3339)
+	snapshot := `{"version":1,"records":[
+		{"provider":"dnspod","zone":"example.com","fqdn":"_acme-challenge.example.com","value":"within","record_id":"1","created_at":"` + within + `"},
+		{"provider":"dnspod","zone":"example.com","fqdn":"_acme-challenge.example.com","value":"beyond","record_id":"2","created_at":"` + beyond + `"},
+		{"provider":"dnspod","zone":"example.com","fqdn":"_acme-challenge.example.com","value":"legacy","record_id":"3"}
+	]}`
+	if err := Replace(dir, []byte(snapshot)); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.Add(Record{Provider: "dnspod", Zone: "example.com", FQDN: "_acme-challenge.example.com", Value: "fresh", RecordID: "4"}); err != nil {
+		t.Fatal(err)
+	}
+	matching, err := store.Matching("dnspod", "example.com", "_acme-challenge.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, rec := range matching {
+		seen[rec.Value] = true
+	}
+	if seen["beyond"] {
+		t.Fatal("超过保留期 1 分钟的条目应退役")
+	}
+	for _, want := range []string{"within", "legacy", "fresh"} {
+		if !seen[want] {
+			t.Fatalf("条目 %s 不应被退役（seen=%v）", want, seen)
+		}
+	}
+}

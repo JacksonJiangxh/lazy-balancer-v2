@@ -7,7 +7,6 @@ package services
 // 给 -2）；过期判定不以返回值 ≤0 兼判（-1h→0）。
 
 import (
-	"log"
 	"strings"
 	"testing"
 	"time"
@@ -61,10 +60,7 @@ func TestGetCertExpiryThreshold_rejectsStoredValuesAbove365(t *testing.T) {
 // 分支必须同口径显性留痕（值 + 降级结果），再取治理默认 30。
 func TestGetCertRenewalDays_logsNonPositiveStoredValue(t *testing.T) {
 	_, database := newClusterTestService(t)
-	var buf strings.Builder
-	oldWriter := log.Writer()
-	log.SetOutput(&buf)
-	t.Cleanup(func() { log.SetOutput(oldWriter) })
+	buf := captureApplicationLogs(t)
 
 	// 0=默认 30（合法语义，不告警）；负值=异常，必须 error 留痕。
 	buf.Reset()

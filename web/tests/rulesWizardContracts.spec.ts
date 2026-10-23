@@ -10,25 +10,12 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { section, source } from './_helpers.ts'
-import { STRATEGY_CARD_OPTIONS, strategyCardsForProtocol, strategyValuesForProtocol } from '../src/utils/strategyLabels.ts'
 import { RULE_NUMERIC_LIMITS } from '../src/utils/ruleValidation.ts'
 
 const page = source('src/views/Rules.vue')
 
-test('A 策略卡片集与提交白名单同源：含 random/first，TCP 无 cookie', () => {
-  const http = strategyValuesForProtocol('http')
-  const tcp = strategyValuesForProtocol('tcp')
-  assert.deepEqual([...http].sort(), ['cookie', 'first', 'ip_hash', 'least_conn', 'random', 'weighted_round_robin'])
-  assert.ok(!tcp.includes('cookie'), 'cookie 仅 HTTP')
-  assert.ok(tcp.includes('random') && tcp.includes('first'), '后端 tcpStrategies 放行 random/first')
-  assert.deepEqual([...tcp].sort(), [...http.filter((v) => v !== 'cookie')].sort())
-  // 每张卡片都有展示文案（value/title/desc 一一对应，避免空卡）
-  for (const card of STRATEGY_CARD_OPTIONS) {
-    assert.ok(card.title.length > 0 && card.desc.length > 0, `${card.value} 缺文案`)
-  }
-  assert.equal(strategyCardsForProtocol('tcp').length, tcp.length)
-})
-
+// 策略枚举/卡片集的行为与跨栈对表归 strategyLabels.spec（键集由后端双 map 派生）；
+// 本文件只钉「向导不另造第二份字面量」——同一不变量不重复断言。
 test('A 向导不再自带第二份策略字面量，卡片与白名单均由共享常量派生', () => {
   assert.match(page, /strategyCardsForProtocol\(wizardForm\.protocol\)/)
   assert.match(page, /strategyValuesForProtocol\(wizardForm\.protocol\)/)

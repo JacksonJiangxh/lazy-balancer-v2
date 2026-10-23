@@ -138,18 +138,22 @@ func TestBuildIPPrecheckDirectives_denyPrecedesAllowDeny(t *testing.T) {
 		IPACLEnabled: true,
 		IPACLMode:    "allow",
 		IPACLList:    `["203.0.113.10"]`,
+		// 遗留黑名单字段（非热路径）与 ACL 并存——夹具必须真实产出 id:4，
+		// 否则下方「黑名单并集先于 allow 交集外拒绝」的顺序契约无法验证
+		//（黑名单为空时 id:4 受内容门控不发射）。
+		IPBlacklist: json.RawMessage(`["198.51.100.66"]`),
 	}
 	directives := mustDirectives(buildIPPrecheckDirectives([]*models.SecurityPolicy{denyPolicy, allowPolicy}, 0, "lb_test"))
 	idxDeny := strings.Index(directives, `id:2,phase:1,deny`)
 	idxBlacklist := strings.Index(directives, `id:4,phase:1,deny`)
 	idxAllow := strings.Index(directives, `id:7,phase:1,deny`)
-	if idxDeny < 0 || idxAllow < 0 {
-		t.Fatalf("missing anchor rules (deny=%d allow=%d):\n%s", idxDeny, idxAllow, directives)
+	if idxDeny < 0 || idxBlacklist < 0 || idxAllow < 0 {
+		t.Fatalf("missing anchor rules (deny=%d blacklist=%d allow=%d):\n%s", idxDeny, idxBlacklist, idxAllow, directives)
 	}
-	if idxDeny > idxAllow {
-		t.Fatalf("deny 并集须先于 allow 交集外拒绝发射（deny=%d allow=%d）:\n%s", idxDeny, idxAllow, directives)
+	if idxDeny > idxBlacklist || idxBlacklist > idxAllow {
+		t.Fatalf("顺序须为 deny 并集(id:2) → 黑名单并集(id:4) → allow 交集外拒绝(id:7)，got %d/%d/%d:\n%s",
+			idxDeny, idxBlacklist, idxAllow, directives)
 	}
-	_ = idxBlacklist
 }
 
 // 阶段 1 抬码形态（denyStatus=481——id:2/4 带 status:481）

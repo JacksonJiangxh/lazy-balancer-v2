@@ -142,6 +142,7 @@ const stageGroup = (stage: 0 | 1 | 2 | 3, groups: StagePolicyGroup[]): StageGrou
 
 test('attachStageDetails：按策略 id 附着明细，缺策略的组不附着（不改其余字段）', () => {
   const model: RuleStageModel = {
+    ruleDisabled: false,
     hasAnyPolicy: true,
     stages: [
       stageGroup(0, [

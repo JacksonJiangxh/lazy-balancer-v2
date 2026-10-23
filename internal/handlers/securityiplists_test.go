@@ -662,7 +662,7 @@ func TestCreateIPList_configuredBodyLimit413(t *testing.T) {
 	}
 }
 
-// 历史 A 域：----
+// ---- 策略载荷构造（内联/引用名单变体）----
 
 func policyPayloadAllow(name string, inline string, refIDs ...int64) map[string]any {
 	refs := "[]"

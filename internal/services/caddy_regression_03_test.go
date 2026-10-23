@@ -43,6 +43,38 @@ func TestCaddyErrorBodyTruncation(t *testing.T) {
 	assertBoundedErrorBody(t, "ValidateConfig", validateErr.Error())
 }
 
+// ValidateConfig 的状态码分类必须与 applyConfigWithOptions 同构：4xx=候选
+// 配置被拒（ConfigRejectedError → handler 400），5xx=admin 系统故障（普通
+// 错误 → handler 500）。把 5xx 归为「配置被拒」会让基础设施故障被表述成
+// 用户配置错误，操作员会反复改一份本身正确的配置。
+func TestValidateConfig_classifiesRejectionVsSystemFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		status     int
+		wantReject bool
+	}{
+		{name: "4xx rejection", status: http.StatusBadRequest, wantReject: true},
+		{name: "5xx system failure", status: http.StatusServiceUnavailable, wantReject: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(`{"error":"boom"}`))
+			}))
+			t.Cleanup(server.Close)
+			service := NewCaddyService(server.URL)
+
+			err := service.ValidateConfig(map[string]interface{}{})
+			if err == nil {
+				t.Fatalf("ValidateConfig succeeded despite %d", tc.status)
+			}
+			if got := IsConfigRejected(err); got != tc.wantReject {
+				t.Fatalf("IsConfigRejected(%d)=%v, want %v (err=%v)", tc.status, got, tc.wantReject, err)
+			}
+		})
+	}
+}
+
 func assertBoundedErrorBody(t *testing.T, call, message string) {
 	t.Helper()
 	if !utf8.ValidString(message) {

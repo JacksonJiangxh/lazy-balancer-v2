@@ -30,6 +30,7 @@ import (
 	"go/printer"
 	"go/token"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -58,7 +59,12 @@ var antiFallbackScanTargets = map[string][]string{
 		"buildAccessLogEncoder",
 		"accessLogEncoderFields",
 		"trustedProxyServerFields",
+		"mergeTrustedProxyServerFields",
 		"expandTrustedProxyRanges",
+		"insertUpstreamPathRewrites",
+		"upstreamPathRewriteHandlers",
+		"blockPageContentType",
+		"decodePathUpstreams",
 	},
 	"security.go": {
 		"BuildCorazaDirectives",
@@ -68,6 +74,7 @@ var antiFallbackScanTargets = map[string][]string{
 		"emitCustomRules",
 		"emitCRSRuleGroupSelection",
 		"emitScopedCRSExclusions",
+		"ParseCRSExcludedRules",
 	},
 	// 展示层：证书卡/规则证书字段的占位文案（非配置投影，但同属「无效库值 →
 	// 写死常量」可见面，纳入扫描以防新增渲染文案绕过机制）。
@@ -138,6 +145,13 @@ var antiFallbackAllowlist = map[string]map[string]string{
 	},
 	"buildIPPrecheckDirectives": {
 		"denyStatus = 403": "阶段 1 预检 denyStatus=0→403：类型②省略型（0=规则未配阶段 1 拦截页，stage1BlockStatus 契约的未设置态；coraza deny 必须显式状态码，省略以默认 403 替换实现，保持 403 兜底归因边界）——批 3 Ruling 披露",
+	},
+	// 可达性扫描登记（调用图内辅助函数的赋值形态兜底）：
+	"decodePathUpstreams": {
+		`protocol = "http"`: "路径规则上游存储投影缺省协议→http：类型②省略型（写侧允许空并在渲染层替换为具体值，否则引擎收到空协议）——可达性 Ruling 披露",
+	},
+	"ParseCRSExcludedRules": {
+		`entry.Scope = "all"`: "CRS 排除项 scope 缺省→all：旧格式/缺字段（集群同步、带外改库、降级版本写入）的防御归一到全局限定，属类型②省略型归一而非无效库值兜底——可达性 Ruling 披露",
 	},
 }
 
@@ -211,6 +225,10 @@ func TestRenderLayer_hasNoHardcodedZeroFallbacks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("glob package sources: %v", err)
 	}
+	// 调用图（同包内函数名 → 被调函数名），供方向四可达性判定。
+	callGraph := map[string][]string{}
+	defined := map[string]bool{}
+	funcDecls := map[string]*ast.FuncDecl{}
 	for _, path := range goFiles {
 		if strings.HasSuffix(path, "_test.go") {
 			continue
@@ -221,7 +239,27 @@ func TestRenderLayer_hasNoHardcodedZeroFallbacks(t *testing.T) {
 		}
 		for _, decl := range file.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Body == nil || !isRenderFamilyFunction(fn.Name.Name) {
+			if !ok || fn.Body == nil {
+				continue
+			}
+			defined[fn.Name.Name] = true
+			funcDecls[fn.Name.Name] = fn
+			var callees []string
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				switch fun := call.Fun.(type) {
+				case *ast.Ident:
+					callees = append(callees, fun.Name)
+				case *ast.SelectorExpr:
+					callees = append(callees, fun.Sel.Name)
+				}
+				return true
+			})
+			callGraph[fn.Name.Name] = callees
+			if !isRenderFamilyFunction(fn.Name.Name) {
 				continue
 			}
 			if listed[path+"|"+fn.Name.Name] {
@@ -230,6 +268,48 @@ func TestRenderLayer_hasNoHardcodedZeroFallbacks(t *testing.T) {
 			for assign, positions := range fallbackAssignmentsInFunction(fset, fn) {
 				t.Errorf("渲染族函数 %s（%s）含兜底 %q（%v）但未登记 antiFallbackScanTargets——新增渲染函数必须纳入扫描面或携 Ruling 说明非渲染用途", fn.Name.Name, path, assign, positions)
 			}
+		}
+	}
+
+	// 方向四：调用图可达性——仅靠命名启发式时，merge*/insert*/block* 这类
+	// 名字会逃逸（如 mergeTrustedProxyServerFields）。从已登记入口出发做传递
+	// 闭包，可达函数出现兜底形态必须登记（或移出渲染调用图）。
+	listedByName := map[string]bool{}
+	for _, functions := range antiFallbackScanTargets {
+		for _, name := range functions {
+			listedByName[name] = true
+		}
+	}
+	reachable := map[string]bool{}
+	queue := make([]string, 0, len(listedByName))
+	for name := range listedByName {
+		queue = append(queue, name)
+	}
+	for len(queue) > 0 {
+		name := queue[0]
+		queue = queue[1:]
+		if reachable[name] {
+			continue
+		}
+		reachable[name] = true
+		for _, callee := range callGraph[name] {
+			if defined[callee] && !reachable[callee] {
+				queue = append(queue, callee)
+			}
+		}
+	}
+	for name := range reachable {
+		if listedByName[name] || funcDecls[name] == nil {
+			continue
+		}
+		for assign, positions := range fallbackAssignmentsInFunction(fset, funcDecls[name]) {
+			// 可达性面只收「赋值形态」兜底：守卫分支内的 return 字面量在
+			// 非渲染辅助函数里大量是校验错误文案/哨兵返回（如 return "空条件"），
+			// 全量纳入会产生不可收敛的误报；显式登记的渲染函数仍按完整命中面扫描。
+			if strings.HasPrefix(assign, "return ") {
+				continue
+			}
+			t.Errorf("渲染入口可达函数 %s 含兜底 %q（%v）但未登记 antiFallbackScanTargets——命名启发式可被绕过的调用链同样必须纳入扫描面", name, assign, positions)
 		}
 	}
 }
@@ -423,6 +503,35 @@ func guardBranchOf(cond ast.Expr) guardBranch {
 				return guardFallbackElse
 			}
 		}
+	case token.FLOAT:
+		// 浮点域同形（`x <= 0.0` / `x > 0.0` / `x != 0.0`）——原命中面只认
+		// INT，写死兜底的浮点守卫可静默绕过机制。
+		value, parseErr := strconv.ParseFloat(lit.Value, 64)
+		if parseErr != nil {
+			return guardNone
+		}
+		switch bin.Op {
+		case token.EQL, token.LEQ:
+			if value == 0 {
+				return guardFallbackBody
+			}
+		case token.LSS:
+			if value == 0 || value == 1 {
+				return guardFallbackBody
+			}
+		case token.NEQ:
+			if value == 0 {
+				return guardFallbackElse
+			}
+		case token.GTR:
+			if value == 0 {
+				return guardFallbackBoth
+			}
+		case token.GEQ:
+			if value == 1 {
+				return guardFallbackElse
+			}
+		}
 	}
 	return guardNone
 }
@@ -451,17 +560,17 @@ func flippedComparison(bin *ast.BinaryExpr) *ast.BinaryExpr {
 
 func isLiteralOperand(expr ast.Expr) bool {
 	lit, ok := expr.(*ast.BasicLit)
-	return ok && (lit.Kind == token.INT || lit.Kind == token.STRING)
+	return ok && (lit.Kind == token.INT || lit.Kind == token.FLOAT || lit.Kind == token.STRING)
 }
 
-// isLiteralDefault 报告赋值右值是否为写死字面量默认值（INT/STRING 字面量、
+// isLiteralDefault 报告赋值右值是否为写死字面量默认值（INT/FLOAT/STRING 字面量、
 // 非空命名/匿名结构的复合字面量或非空切片字面量）。排除：
 //   - map 字面量（`m["k"] = map[string]interface{}{...}` 是结构装配，不是库值兜底）；
 //   - 空复合字面量（`struct{}{}` 集合插入惯用法、`[]string{}` 非 nil 空切片 flag）。
 func isLiteralDefault(rhs ast.Expr) bool {
 	switch value := rhs.(type) {
 	case *ast.BasicLit:
-		return value.Kind == token.INT || value.Kind == token.STRING
+		return value.Kind == token.INT || value.Kind == token.FLOAT || value.Kind == token.STRING
 	case *ast.CompositeLit:
 		if _, isMap := value.Type.(*ast.MapType); isMap {
 			return false
@@ -560,6 +669,14 @@ func TestFallbackScan_detectsEquivalentGuardShapes(t *testing.T) {
 		{
 			name:   "literal-return-in-guard",
 			source: "package p\nfunc f(x int) string { if x == 0 { return \"d\" }; return \"z\" }\n",
+		},
+		{
+			name:   "float-zero-guard",
+			source: "package p\nfunc f(x float64) float64 { if x <= 0.0 { x = 5.0 }; return x }\n",
+		},
+		{
+			name:   "float-reversed-zero-guard",
+			source: "package p\nfunc f(x float64) float64 { if 0.0 == x { x = 2.5 }; return x }\n",
 		},
 	}
 	for _, fixture := range fixtures {

@@ -17,10 +17,16 @@ import (
 func mfaTestEnv(t *testing.T) {
 	t.Helper()
 	oldDB := db.DB
+	oldCurrent := db.GetDB()
 	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatalf("init test db: %v", err)
 	}
-	t.Cleanup(func() { _ = db.Close(); db.DB = oldDB })
+	t.Cleanup(func() {
+		_ = db.Close()
+		db.DB = oldDB
+		// 后台循环句柄（db.GetDB）随 Close 置 nil，必须一并还原。
+		db.SetDB(oldCurrent)
+	})
 	// Initialize 已种 global_config id=1（caddy_config '{}'）
 }
 

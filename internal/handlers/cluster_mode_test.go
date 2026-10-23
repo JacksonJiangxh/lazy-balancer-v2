@@ -248,6 +248,20 @@ func TestUpdateClusterSettings_sync_interval_range_validation(t *testing.T) {
 			if tc.wantBody != "" && !strings.Contains(response.Body.String(), tc.wantBody) {
 				t.Fatalf("body=%s, want to contain %q", response.Body.String(), tc.wantBody)
 			}
+			// 合法区间必须真正落库（只断 200 时写入退化也全绿）。
+			if tc.wantStatus == http.StatusOK {
+				var stored int
+				if err := db.DB.QueryRow(`SELECT COALESCE(sync_interval,0) FROM global_config WHERE id=1`).Scan(&stored); err != nil {
+					t.Fatal(err)
+				}
+				var want int
+				if _, err := fmt.Sscanf(tc.payload, `{"sync_interval":%d}`, &want); err != nil {
+					t.Fatalf("parse payload %q: %v", tc.payload, err)
+				}
+				if stored != want {
+					t.Fatalf("global_config.sync_interval=%d, want %d（合法值必须落库）", stored, want)
+				}
+			}
 		})
 	}
 }
@@ -394,5 +408,44 @@ func TestSwitchAudit_recordsTargetState(t *testing.T) {
 	put(false)
 	if detail := latest(); !strings.Contains(detail, "关闭") {
 		t.Fatalf("关闭审计未记录目标状态: %q", detail)
+	}
+}
+
+// 重新注册成功的唯一出口：BecomeSlave 后必须调用 syncService.Resume()——
+// Halted（令牌撤销/schema 不匹配）态下 Start() 是 no-op，删除该行会让从节点
+// 重新注册后静默永久脱同步。Resume 对非 Halted 态是幂等的唤醒，故以调用
+// 计数（测试缝）而非循环状态断言。
+func TestSetClusterMode_successInvokesSyncResume(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	master := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"registration_id":11,"registration_secret":"secret"}}`))
+	}))
+	defer master.Close()
+	parsed, err := url.Parse(master.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(parsed.Port())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.cfg.NodeName = "node-resume"
+	h.cfg.Port = port + 1 // 与主节点端口不同，避免自注册拒绝
+	h.syncService = services.NewSyncService(db.DB, h.cfg, services.NewCaddyService("http://127.0.0.1:1"))
+
+	router := gin.New()
+	router.POST("/cluster/mode", h.SetClusterMode)
+	before := services.SyncResumeCallsForTest()
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/cluster/mode", strings.NewReader(`{"mode":"slave","master_url":"`+master.URL+`","register_token":"one-time"}`))
+	request.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	if got := services.SyncResumeCallsForTest(); got != before+1 {
+		t.Fatalf("Resume 调用次数=%d, want %d（重新注册后必须调用唯一复活点）", got, before+1)
 	}
 }

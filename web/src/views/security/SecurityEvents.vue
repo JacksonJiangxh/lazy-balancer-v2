@@ -176,6 +176,15 @@
         </div>
       </div>
 
+      <el-alert v-if="eventsLoadError" type="error" :closable="false" show-icon class="error-banner mb-5">
+        <template #title>
+          <div class="polling-error-title">
+            <span>{{ events.length > 0 ? '安全事件加载失败：当前显示的是上次成功结果（与筛选/分页条件不符）' : '安全事件加载失败：表格为空不代表没有事件' }}</span>
+            <el-button link type="danger" :loading="loading" @click="fetchEvents">立即重试</el-button>
+          </div>
+        </template>
+      </el-alert>
+
       <el-table :data="events" v-loading="loading" stripe :header-cell-style="{ background: '#f9fafb' }" empty-text="">
         <template #empty><el-empty description="暂无安全事件" :image-size="60" /></template>
         <el-table-column prop="event_time" label="时间" width="190" :formatter="(row: SecurityEvent) => formatDate(row.event_time)" />
@@ -391,7 +400,7 @@ import { request } from '@/utils/api'
 import { useAuthStore } from '@/stores/auth'
 import LogStorageBar from '@/components/LogStorageBar.vue'
 import TriggerDetailDialog from '@/components/events/TriggerDetailDialog.vue'
-import { formatDurationUs, triggerStageFamily } from '@/utils/securityStages'
+import { formatDurationUs, isWafDurationFamily, triggerStageFamily } from '@/utils/securityStages'
 import { TRIGGERED_CATEGORIES, serializeTriggeredFilter, CRAWLER_FAMILY_LABEL } from '@/utils/triggeredFilter'
 import { ANOMALY_SCORE_HIGH, ANOMALY_SCORE_MID } from '@/utils/severityScale'
 import { DEEP_LINK_PARAMS, pageUrl } from '@/utils/deepLink'
@@ -619,14 +628,12 @@ const toggleAutobanEnabled = async (): Promise<void> => {
 // ——链接门 `isIpAclFamily || stageCategory==='trust'` 等价于 stageCategory ∈
 // {acl,trust}），删除谓词，统一走 stageCategory 单一事实源。
 
-// ctx 弹框耗时展示按族判定——仅 WAF 族（wafCrs/wafCustom/
-// body）经 WAF 段独立测量用加和式（duration_us=WAF 段，拦截/记录两形态同为
-// 纯段口径）；预检族 duration_us≡precheck_us 单值展示（预检决策耗时，拦截与
-// 放行同口径——历史起预检拦在决策后、403 写出前记录，不再混入链首全程）。
-const ctxWafFamily = computed(() => {
-  const t = ctxEvent.value?.rule_triggered ?? ''
-  return ['wafCrs', 'wafCustom', 'body'].includes(triggerStageFamily(t))
-})
+// ctx 弹框耗时展示按族判定——仅 WAF 族（wafCrs/wafCustom/body）经 WAF 段独立
+// 测量用加和式（duration_us=WAF 段，拦截/记录两形态同为纯段口径）；预检族
+// duration_us≡precheck_us 单值展示（预检决策耗时，拦截与放行同口径——历史起
+// 预检拦在决策后、403 写出前记录，不再混入链首全程）。族谓词单源
+// securityStages.isWafDurationFamily（与触发详情弹框同一实现）。
+const ctxWafFamily = computed(() => isWafDurationFamily(triggerStageFamily(ctxEvent.value?.rule_triggered ?? '')))
 
 // stageCategory 改由共享 triggerStageFamily 投影（securityStages 唯一
 // 实现，原双实现并存欠账）——本视图五桶 = 细粒度族的合并投影
@@ -678,6 +685,9 @@ const openTriggerDetail = (row: SecurityEvent): void => {
 
 
 const loading = ref(false)
+// 列表加载失败：保留末次成功数据的同时必须有页内可见错误态——筛选/翻页失败
+// 后分页器与筛选框已是新条件，旧列表不得在无提示下冒充当前结果。
+const eventsLoadError = ref(false)
 const events = ref<SecurityEvent[]>([])
 const ingestionStatus = ref<IngestionHealth>({ observed: false, healthy: false, consecutive_failures: 0 })
 // 采集健康位提示（任务已停/连续失败/审计写侧降级）——判据与文案与总览/大屏同源。
@@ -871,11 +881,15 @@ const fetchEvents = async () => {
     events.value = res.data?.events || []
     total.value = res.data?.total || 0
     if (res.data?.ingestion) ingestionStatus.value = res.data.ingestion
+    eventsLoadError.value = false
     logStorageRefreshKey.value++
   } catch {
     // 瞬态失败保留末次成功数据（对齐 AuditLog 口径）——此前清空列表
     // 却保留陈旧 total，空态文案「暂无安全事件」在排障窗口内误导为「无攻击」。
-    // 全局拦截器已弹失败 toast。
+    // 但保留数据必须配可见错误条（分页/筛选条件已变，旧结果不得冒充当前结果）；
+    // 全局拦截器只 toast 一次，过期请求的失败不污染当前态。
+    if (requestSeq !== fetchEventsSeq) return
+    eventsLoadError.value = true
   } finally {
     if (requestSeq === fetchEventsSeq) loading.value = false
   }

@@ -14,6 +14,8 @@ import (
 	"database/sql"
 	"sync"
 	"time"
+
+	"lazy-balancer-v2/internal/services"
 )
 
 // securityPolicy24hCountsCacheTTL 缓存有效期（测试可缩短）。
@@ -64,7 +66,10 @@ func loadSecurityPolicy24hCounts(metricsDB *sql.DB, now time.Time) (securityPoli
 	counts := securityPolicy24hCounts{blocked: map[int]int{}, trigger: map[int]int{}}
 	// 走 idx_security_events_action_time 索引范围（action 等值 + event_time 范围），
 	// 单趟扫描；blocked 仅计 blocked，trigger 计 blocked+logged（「24h 触发」列口径）。
-	rows, err := metricsDB.Query(`SELECT policy_id, SUM(action='blocked'), COUNT(*) FROM security_events WHERE action IN ('blocked','logged') AND policy_id>0 AND event_time >= datetime('now','-1 day') GROUP BY policy_id`)
+	// 攻击口径谓词与总览/大屏/活跃源同源（services.AttackEventSQLPredicate）——
+	// 不套谓词时爬虫放行族的 logged 事件会在策略列表计「触发」，而同一事件在
+	// 总览「今日检测」为 0，同一屏幕上出现互相矛盾的数值。
+	rows, err := metricsDB.Query(`SELECT policy_id, SUM(action='blocked'), COUNT(*) FROM security_events WHERE action IN ('blocked','logged') AND policy_id>0 AND event_time >= datetime('now','-1 day') AND ` + services.AttackEventSQLPredicate("rule_triggered", "action") + ` GROUP BY policy_id`)
 	if err != nil {
 		return counts, err
 	}

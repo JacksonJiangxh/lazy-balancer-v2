@@ -10,14 +10,18 @@ import assert from 'node:assert/strict'
 
 import {
   aclAssociateSides,
+  attachStageDetails,
   blockPageStageCanIntercept,
   buildStageModel,
   entryMatchesIp,
   eventDetailRefIds,
+  extractCrsRuleSnippet,
   formatAclModeDetail,
   hasIPACLControl,
   inferPolicyType,
   isTrustExemptionCandidate,
+  isWafDurationFamily,
+  triggerStageFamily,
   trustHitMode,
   type SecurityStageBinding,
   type SecurityStageBlockPage,
@@ -269,3 +273,115 @@ test('事件详情预取按类别/动作收窄：WAF 已拦截事件不取 ACL/�
   assert.deepEqual(eventDetailRefIds(own, others, { ownerAcl: false, ownerTrust: true, otherTrust: true }), [3, 4])
 })
 
+// 阶段 1 明细 vs 摘要对账：摘要对非 deny 模式提示「独立黑名单 N 条仍生效」，
+// 明细模型必须同时给出这些条目，否则排障时摘要报数、明细无据可查。
+test('阶段 1 明细：独立黑名单逐条可对账，且不受 ACL 开关门控', () => {
+  // non-deny 模式：摘要强调「独立黑名单 N 条仍生效」，明细必须给出同一批条目
+  const policy = policyOf({
+    policy_type: 'stage1',
+    has_ip_control: true,
+    ip_acl_enabled: true,
+    ip_acl_mode: 'allow',
+    ip_acl_list: '["10.0.0.0/8"]',
+    ip_blacklist: '["1.2.3.4"," 5.6.7.8 "]',
+  })
+  assert.match(formatAclModeDetail([], policy), /；独立黑名单 2 条仍生效/)
+  const details = attachStageDetails(
+    buildStageModel([bindingOf()], [policy], [], []),
+    { policies: [policy], ipLists: [] },
+  ).stages[1].groups[0]?.details
+  assert.deepEqual(details?.blacklistEntries, ['1.2.3.4', '5.6.7.8'], '独立黑名单必须去重去空后逐条进入明细')
+  assert.equal(details?.aclInlineCount, 1)
+
+  // ACL 关闭（保留名单）：内联 ACL 明细按开关门省略，独立黑名单不受该门控
+  const disabled = policyOf({
+    policy_type: 'stage1',
+    has_ip_control: true,
+    ip_acl_enabled: false,
+    ip_acl_mode: '绕过',
+    ip_acl_list: '["10.0.0.0/8"]',
+    ip_blacklist: '["1.2.3.4","5.6.7.8"]',
+  })
+  assert.match(formatAclModeDetail([], disabled), /；独立黑名单 2 条仍生效/)
+  const disabledDetails = attachStageDetails(
+    buildStageModel([bindingOf()], [disabled], [], []),
+    { policies: [disabled], ipLists: [] },
+  ).stages[1].groups[0]?.details
+  assert.deepEqual(disabledDetails?.blacklistEntries, ['1.2.3.4', '5.6.7.8'])
+  assert.equal(disabledDetails?.aclInlineCount, undefined)
+
+  // deny 模式：黑名单计入生效集，明细同样逐条（不因模式变化而丢失）
+  const deny = policyOf({
+    policy_type: 'stage1',
+    has_ip_control: true,
+    ip_acl_enabled: true,
+    ip_acl_mode: 'deny',
+    ip_acl_list: '["10.0.0.0/8"]',
+    ip_blacklist: '["1.2.3.4"]',
+  })
+  const denyDetails = attachStageDetails(
+    buildStageModel([bindingOf()], [deny], [], []),
+    { policies: [deny], ipLists: [] },
+  ).stages[1].groups[0]?.details
+  assert.deepEqual(denyDetails?.blacklistEntries, ['1.2.3.4'])
+  assert.equal(denyDetails?.aclInlineCount, 1)
+})
+
+// WAF 耗时族：加和式（duration_us + precheck_us）只对 WAF 段独立计时的族成立；
+// 预检族 duration_us 恒等于 precheck_us，加和会翻倍。全仓单源谓词。
+test('WAF 耗时族谓词：wafCrs/wafCustom/body 加和，预检族与未知不入族', () => {
+  for (const id of ['942100', '959999', '100123', '1500000', '11']) {
+    assert.equal(isWafDurationFamily(triggerStageFamily(id)), true, `id ${id} 应属 WAF 耗时族`)
+  }
+  for (const id of ['2', '3', '4', '7', '12', '14', '800123', '850123', '810123', '', 'not-a-rule']) {
+    assert.equal(isWafDurationFamily(triggerStageFamily(id)), false, `id ${id} 不应属 WAF 耗时族`)
+  }
+  // 与检测模式归因族的集合差异：body 加和但不由检测模式解释
+  assert.equal(isWafDurationFamily('body'), true)
+})
+
+// CRS 源码片段定位：`id:942100` 是 `id:9421000` 的子串，纯 includes 会把片段
+// 中心落到更长的 ID 行。边界匹配后片段必须落在精确 ID 行。
+test('CRS 源码片段按 ID 边界定位（短 ID 不命中更长的 ID 行）', () => {
+  const content = [
+    'SecRule ARGS "@rx a" "id:9421000,phase:2,deny"',
+    'SecRule ARGS "@rx b" "id:942100,phase:2,deny"', // 目标行（idx 1）
+    'SecRule ARGS "@rx c" "id:942101,phase:2,deny"',
+  ].join('\n')
+  assert.equal(
+    extractCrsRuleSnippet(content, '942100', 0),
+    'SecRule ARGS "@rx b" "id:942100,phase:2,deny"',
+  )
+  // 上下文窗口 ±1 行
+  assert.equal(extractCrsRuleSnippet(content, '942100', 1).split('\n').length, 3)
+  // 引号/空格形态同样命中
+  assert.equal(extractCrsRuleSnippet(`id:'942102'`, '942102', 0), `id:'942102'`)
+  assert.equal(extractCrsRuleSnippet('id:"942103"', '942103', 0), 'id:"942103"')
+  assert.equal(extractCrsRuleSnippet('id: 942104', '942104', 0), 'id: 942104')
+  // 孤儿前缀（仅更长的 ID 存在）不得误命中
+  assert.equal(extractCrsRuleSnippet('id:9421000', '942100', 0), '')
+  // 非法/空输入
+  assert.equal(extractCrsRuleSnippet(content, '', 0), '')
+  assert.equal(extractCrsRuleSnippet('', '942100', 0), '')
+})
+
+
+// 禁用规则的锁摘要/流程必须显式降级：enabled=0 时控制面不渲染任何路由，
+// 安全链不进入运行配置——阶段模型必须携带 ruleDisabled，消费方据此灰锁 +
+// 顶部禁用横幅（否则巡检得到「四阶段在位」的高估结论）。
+test('禁用规则：阶段模型携带 ruleDisabled 且不影响阶段内容', () => {
+  const policy = policyOf({ policy_type: 'stage1', has_ip_control: true, ip_acl_enabled: true, ip_acl_list: '["10.0.0.0/8"]' })
+  const binding = bindingOf()
+  const enabledModel = buildStageModel([binding], [policy], [], [], null, true)
+  assert.equal(enabledModel.ruleDisabled, false)
+  const disabledModel = buildStageModel([binding], [policy], [], [], null, false)
+  assert.equal(disabledModel.ruleDisabled, true)
+  // 绑定与阶段页保留：阶段内容不因禁用而消失（启用后生效的「保留配置」口径）
+  assert.equal(disabledModel.hasAnyPolicy, true)
+  assert.deepEqual(
+    disabledModel.stages.map((stage) => stage.groups.length),
+    enabledModel.stages.map((stage) => stage.groups.length),
+  )
+  // 缺省（未知态）不得宣称已禁用
+  assert.equal(buildStageModel([binding], [policy], [], []).ruleDisabled, false)
+})

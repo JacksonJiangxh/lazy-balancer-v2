@@ -9,7 +9,6 @@ import (
 	"lazy-balancer-v2/internal/taskengine"
 	"log"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -32,11 +31,13 @@ const (
 	logLevelError
 )
 
-var timezoneRefresh struct {
-	sync.Mutex
-	cancel context.CancelFunc
-	done   chan struct{}
-}
+var timezoneRefresh backgroundWorker
+
+// timezoneRefreshRestartWaitMax 是重启路径等待旧 worker 退出的预算（与关停
+// 路径同量级）。旧 worker 卡在 DB busy_timeout 时不得无界挂起刷新链启动。
+const timezoneRefreshRestartWaitMax = 1 * time.Second
+
+const timezoneRefreshLogLabel = "timezone refresh"
 
 func init() {
 	currentLocation.Store(time.FixedZone("CST", 8*3600))
@@ -45,16 +46,7 @@ func init() {
 }
 
 func StartTimezoneRefresh(ctx context.Context) <-chan struct{} {
-	timezoneRefresh.Lock()
-	defer timezoneRefresh.Unlock()
-	if timezoneRefresh.cancel != nil {
-		timezoneRefresh.cancel()
-		<-timezoneRefresh.done
-	}
-	workerCtx, cancel := context.WithCancel(ctx)
-	done := make(chan struct{})
-	timezoneRefresh.cancel = cancel
-	timezoneRefresh.done = done
+	workerCtx, done := timezoneRefresh.replace(ctx, timezoneRefreshRestartWaitMax, timezoneRefreshLogLabel)
 	go func() {
 		defer close(done)
 		// 30s tick 下持久失败逐轮同消息（最坏 2880 行/天）——改状态
@@ -87,7 +79,7 @@ func StartTimezoneRefresh(ctx context.Context) <-chan struct{} {
 }
 
 func StopTimezoneRefresh() {
-	StopTimezoneRefreshWithin(0)
+	timezoneRefresh.stop(timezoneRefreshLogLabel)
 }
 
 // StopTimezoneRefreshWithin 有界停止时区刷新 worker：cancel 后最多等待 within
@@ -96,25 +88,7 @@ func StopTimezoneRefresh() {
 // 最终退出后可再次调用完成清零（可重启语义不变）。返回 true=worker 已退出
 // 且状态清零。
 func StopTimezoneRefreshWithin(within time.Duration) bool {
-	timezoneRefresh.Lock()
-	defer timezoneRefresh.Unlock()
-	if timezoneRefresh.cancel == nil {
-		return true
-	}
-	timezoneRefresh.cancel()
-	if within <= 0 {
-		<-timezoneRefresh.done
-	} else {
-		select {
-		case <-timezoneRefresh.done:
-		case <-time.After(within):
-			Logf("warn", "timezone refresh worker 未在关停预算 %s 内退出，放弃等待（进程继续退出）", within)
-			return false
-		}
-	}
-	timezoneRefresh.cancel = nil
-	timezoneRefresh.done = nil
-	return true
+	return timezoneRefresh.stopWithin(within, timezoneRefreshLogLabel)
 }
 
 func refreshLocation() error {
@@ -209,7 +183,7 @@ func CurrentLogLevel() string {
 	}
 }
 
-func ShouldLog(level string) bool {
+func shouldLog(level string) bool {
 	var candidate int32
 	switch level {
 	case "debug":
@@ -227,7 +201,7 @@ func ShouldLog(level string) bool {
 }
 
 func Logf(level, format string, args ...any) {
-	if !ShouldLog(level) {
+	if !shouldLog(level) {
 		return
 	}
 	switch level {

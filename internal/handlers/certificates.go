@@ -404,7 +404,9 @@ func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 			req.DNSCredentials = nil
 		} else {
 			credsJSON, _ := json.Marshal(req.DNSCredentials)
-			if string(credsJSON) != oldCredentials {
+			// 语义比较（键序/空白无关），与 CA 提供商写路径共用同一判定：
+			// 带外写入的非规范 JSON 或前端重排键序不得被记成「凭证变更」。
+			if !services.CredentialsSemanticallyEqual(string(credsJSON), oldCredentials) {
 				query += "dns_credentials = ?, "
 				args = append(args, string(credsJSON))
 				changed = append(changed, "凭证")
@@ -729,23 +731,68 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "证书签发队列已暂停，无法创建签发任务"})
 		return
 	}
-	// 手工签发的 规则当前态读取→冷却门→upsert/入队
+	// 手动签发的 规则当前态读取→冷却门→upsert/入队
 	// 全程与规则写/删除/改域共用 caddyOpMu 临界区——此前无锁读取后与
 	// UpdateRule 改域迁移（任务行已改到新域）交错，本次仍按旧域 INSERT
 	// 新行并入队，对旧域实际发起 CA 签发（部署期域不匹配拒绝，job 滞留
 	// downloaded 至 6h sweep）；与 DeleteRule 交错可留孤儿任务行。
 	// 请求体已在锁外绑定（bind-before-lock 序）；EnqueueIfActive 只取队列
 	// 叶锁（m.mu/q.mu），execute 在锁外 goroutine 运行，无反向锁序。
+	//
+	// 批量目标快照刻意留在锁外：{"all":true} 的查询/遍历是 O(规则数)，
+	// 持全局锁做只会让所有规则写与 Caddy 应用随批量规模线性排队。快照只决定
+	// 候选集合，逐目标的当前态复核与 upsert 仍在锁内——已删除/禁用/改域的
+	// 规则由 upsert 落库闸按冲突拒绝（ErrCertRuleStateConflict → failed）。
+	type certTarget struct {
+		ruleID string
+		domain string
+	}
+	var batchTargets []certTarget
+	if req.CaddyID == "" && req.All {
+		rows, err := db.DB.Query("SELECT caddy_id, COALESCE(domain,'') FROM lb_rules WHERE enabled=1 AND enable_tls=1 AND tls_source='acme_dns' AND protocol='http' AND COALESCE(domain,'') != ''")
+		if err != nil {
+			auditFailure("failed", "查询 ACME 规则失败: "+err.Error())
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "查询 ACME 规则失败"})
+			return
+		}
+		for rows.Next() {
+			var ruleID, domain string
+			if err := rows.Scan(&ruleID, &domain); err != nil {
+				err = errors.Join(err, rows.Close())
+				auditFailure("failed", "读取 ACME 规则失败: "+err.Error())
+				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取 ACME 规则失败: " + err.Error()})
+				return
+			}
+			batchTargets = append(batchTargets, certTarget{ruleID: ruleID, domain: domain})
+		}
+		if err := rows.Err(); err != nil {
+			err = errors.Join(err, rows.Close())
+			auditFailure("failed", "遍历 ACME 规则失败: "+err.Error())
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "遍历 ACME 规则失败: " + err.Error()})
+			return
+		}
+		if err := rows.Close(); err != nil {
+			auditFailure("failed", "关闭 ACME 规则结果失败: "+err.Error())
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "关闭 ACME 规则结果失败: " + err.Error()})
+			return
+		}
+	}
 	h.caddyOpMu.Lock()
 	defer h.caddyOpMu.Unlock()
 	queued := 0
 	// 批量路径套用与定向签发同款冷却门，冷却中
 	// 任务跳过并单列计数（仅批量分支产生非零值）。
 	skippedCooldown := 0
+	// waiting_ca 冷却中的目标单列（批量分支）；语义同冷却跳过，计入文案合计
+	// 但响应里可分辨「CA 退避」与「失败/在途冷却」。
+	skippedWaitingCA := 0
 	// 其余 changed=false 出口的归因计数（仅批量分支产生非零值）。
 	skippedInFlight := 0
 	skippedBlocked := 0
 	skippedUnsupported := 0
+	// force=true 显式越过 CA 冷却（与任务重试同一契约），仅在实际越过时留痕。
+	forceCAOverride := false
+	forceIssue := c.Query("force") == "true"
 	if req.CaddyID != "" {
 		// 规则删除/迁移屏障期按冲突语义 409 点名（EnqueueIfActive 内部
 		// 同判据兜底，此处给出可读原因）。
@@ -788,13 +835,25 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 			}
 		}
 		var jobStatus string
-		var jobUpdatedAt, jobCreatedAt sql.NullTime
-		err = db.DB.QueryRow("SELECT status, updated_at, created_at FROM cert_jobs WHERE rule_id=? AND domain=?", req.CaddyID, canonicalRuleDomain).Scan(&jobStatus, &jobUpdatedAt, &jobCreatedAt)
+		var jobUpdatedAt, jobCreatedAt, jobCAAvailableAfter sql.NullTime
+		err = db.DB.QueryRow("SELECT status, updated_at, created_at, ca_available_after FROM cert_jobs WHERE rule_id=? AND domain=?", req.CaddyID, canonicalRuleDomain).Scan(&jobStatus, &jobUpdatedAt, &jobCreatedAt, &jobCAAvailableAfter)
 		if err == nil {
 			if blocked, statusCode, message := certJobRetryBlocked(jobStatus, jobUpdatedAt, jobCreatedAt, time.Now()); blocked {
 				auditFailure("blocked", message)
 				c.JSON(statusCode, models.APIResponse{Code: statusCode, Message: message})
 				return
+			}
+			// waiting_ca 的 CA 退避窗口与任务重试共用同一契约：未到期且未
+			// force 时 429 并给出剩余时长，否则手动「重新签发」会把退避窗口
+			// 静默清零、立即再次撞上 CA 限流并继续消耗配额。
+			if certJobCAcooldownActive(jobStatus, jobCAAvailableAfter, time.Now()) {
+				if !forceIssue {
+					message := certJobCAcooldownMessage(jobCAAvailableAfter.Time)
+					auditFailure("blocked", message)
+					c.JSON(http.StatusTooManyRequests, models.APIResponse{Code: http.StatusTooManyRequests, Message: message})
+					return
+				}
+				forceCAOverride = true
 			}
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			auditFailure("failed", "读取证书任务失败: "+err.Error())
@@ -841,41 +900,10 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "批量签发需要显式确认：请求体须包含 {\"all\": true}（定向签发请提供 caddy_id）"})
 			return
 		}
-		rows, err := db.DB.Query("SELECT caddy_id, COALESCE(domain,'') FROM lb_rules WHERE enabled=1 AND enable_tls=1 AND tls_source='acme_dns' AND protocol='http' AND COALESCE(domain,'') != ''")
-		if err != nil {
-			auditFailure("failed", "查询 ACME 规则失败: "+err.Error())
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "查询 ACME 规则失败"})
-			return
-		}
 		var failed []string
 		// 批量循环中队列被并发暂停（不可再入队）的显式信号。
 		pausedMidBatch := false
-		type certTarget struct {
-			ruleID string
-			domain string
-		}
-		var targets []certTarget
-		for rows.Next() {
-			var ruleID, domain string
-			if err := rows.Scan(&ruleID, &domain); err != nil {
-				err = errors.Join(err, rows.Close())
-				auditFailure("failed", "读取 ACME 规则失败: "+err.Error())
-				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取 ACME 规则失败: " + err.Error()})
-				return
-			}
-			targets = append(targets, certTarget{ruleID: ruleID, domain: domain})
-		}
-		if err := rows.Err(); err != nil {
-			err = errors.Join(err, rows.Close())
-			auditFailure("failed", "遍历 ACME 规则失败: "+err.Error())
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "遍历 ACME 规则失败: " + err.Error()})
-			return
-		}
-		if err := rows.Close(); err != nil {
-			auditFailure("failed", "关闭 ACME 规则结果失败: "+err.Error())
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "关闭 ACME 规则结果失败: " + err.Error()})
-			return
-		}
+		targets := batchTargets
 		for _, target := range targets {
 			if !qm.IsActive() {
 				// 循环中队列被并发暂停——不再当失败项累积，统一 409。
@@ -895,13 +923,21 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 			// （certJobRetryBlocked）——失败 5 分钟内/执行中的任务跳过，不再
 			// 被批量重签静默重排队、反复消耗 CA 配额；跳过数单列响应计数。
 			var jobStatus string
-			var jobUpdatedAt, jobCreatedAt sql.NullTime
-			jobErr := db.DB.QueryRow("SELECT status, updated_at, created_at FROM cert_jobs WHERE rule_id=? AND domain=?", target.ruleID, canonicalDomain).Scan(&jobStatus, &jobUpdatedAt, &jobCreatedAt)
+			var jobUpdatedAt, jobCreatedAt, jobCAAvailableAfter sql.NullTime
+			jobErr := db.DB.QueryRow("SELECT status, updated_at, created_at, ca_available_after FROM cert_jobs WHERE rule_id=? AND domain=?", target.ruleID, canonicalDomain).Scan(&jobStatus, &jobUpdatedAt, &jobCreatedAt, &jobCAAvailableAfter)
 			switch {
 			case jobErr == nil:
 				if blocked, _, _ := certJobRetryBlocked(jobStatus, jobUpdatedAt, jobCreatedAt, time.Now()); blocked {
 					skippedCooldown++
 					continue
+				}
+				// CA 退避窗口未到期：与定向签发/任务重试同一门（force 才越过）。
+				if certJobCAcooldownActive(jobStatus, jobCAAvailableAfter, time.Now()) {
+					if !forceIssue {
+						skippedWaitingCA++
+						continue
+					}
+					forceCAOverride = true
 				}
 			case !errors.Is(jobErr, sql.ErrNoRows):
 				failed = append(failed, fmt.Sprintf("%s(%v)", target.domain, jobErr))
@@ -928,29 +964,30 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 			}
 			queued++
 		}
-		skippedTotal := skippedCooldown + skippedBlocked + skippedInFlight + skippedUnsupported
+		skippedTotal := skippedCooldown + skippedWaitingCA + skippedBlocked + skippedInFlight + skippedUnsupported
 		if pausedMidBatch && queued == 0 {
-			auditFailure("skipped", formulaSkippedNote(skippedCooldown, skippedInFlight, skippedBlocked, skippedUnsupported), "证书签发队列已暂停")
+			auditFailure("skipped", formulaSkippedNote(skippedCooldown+skippedWaitingCA, skippedInFlight, skippedBlocked, skippedUnsupported), "证书签发队列已暂停")
 			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "证书签发队列已暂停，无法创建签发任务"})
 			return
 		}
 		if pausedMidBatch && queued > 0 {
 			// 已入队 N>0 后队列被并发暂停：按部分成功返回，不能 409 谎报全失败
 			// 剩余目标留给下次触发。
-			skipNote := formulaSkippedNote(skippedCooldown, skippedInFlight, skippedBlocked, skippedUnsupported)
+			skipNote := formulaSkippedNote(skippedCooldown+skippedWaitingCA, skippedInFlight, skippedBlocked, skippedUnsupported)
 			message := fmt.Sprintf("已创建 %d 个签发任务；证书签发队列被暂停，剩余目标未处理", queued)
 			if skipNote != "" {
 				message += "（" + skipNote + "）"
 			}
 			recordAudit(c, "触发签发", "证书", services.FormatAuditDetail(scope, message, services.AuditResultPart("partial")))
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: message, Data: gin.H{
-				"queued":            queued,
-				"failed":            len(failed),
-				"skipped_cooldown":  skippedCooldown,
-				"skipped_in_flight": skippedInFlight,
-				"skipped_blocked":   skippedBlocked,
-				"skipped_other":     skippedUnsupported,
-				"paused_mid_batch":  true,
+				"queued":             queued,
+				"failed":             len(failed),
+				"skipped_cooldown":   skippedCooldown,
+				"skipped_waiting_ca": skippedWaitingCA,
+				"skipped_in_flight":  skippedInFlight,
+				"skipped_blocked":    skippedBlocked,
+				"skipped_other":      skippedUnsupported,
+				"paused_mid_batch":   true,
 			}})
 			return
 		}
@@ -963,23 +1000,24 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 			// 批量全部跳过（冷却/在途/屏障/状态不支持）→ 409，不得 200 假成功。
 			// 零目标（尚无启用中的 ACME 规则）时 skipNote 为空，
 			// 不能返回以冒号结尾的空原因——单列文案。
-			skipNote := formulaSkippedNote(skippedCooldown, skippedInFlight, skippedBlocked, skippedUnsupported)
+			skipNote := formulaSkippedNote(skippedCooldown+skippedWaitingCA, skippedInFlight, skippedBlocked, skippedUnsupported)
 			if skipNote == "" {
 				skipNote = "当前没有处于启用状态的 ACME 签发规则"
 			}
 			auditFailure("skipped", skipNote)
 			c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "未创建任何签发任务：" + skipNote, Data: gin.H{
-				"queued":            0,
-				"failed":            len(failed),
-				"skipped_cooldown":  skippedCooldown,
-				"skipped_in_flight": skippedInFlight,
-				"skipped_blocked":   skippedBlocked,
-				"skipped_other":     skippedUnsupported,
+				"queued":             0,
+				"failed":             len(failed),
+				"skipped_cooldown":   skippedCooldown,
+				"skipped_waiting_ca": skippedWaitingCA,
+				"skipped_in_flight":  skippedInFlight,
+				"skipped_blocked":    skippedBlocked,
+				"skipped_other":      skippedUnsupported,
 			}})
 			return
 		}
 		if len(failed) > 0 || skippedTotal > 0 {
-			skipNote := formulaSkippedNote(skippedCooldown, skippedInFlight, skippedBlocked, skippedUnsupported)
+			skipNote := formulaSkippedNote(skippedCooldown+skippedWaitingCA, skippedInFlight, skippedBlocked, skippedUnsupported)
 			format := "入队 %d 个任务"
 			message := fmt.Sprintf("已创建 %d 个签发任务", queued)
 			if len(failed) > 0 {
@@ -996,22 +1034,27 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 			}
 			recordAudit(c, "触发签发", "证书", services.FormatAuditDetail(scope, fmt.Sprintf(format, args...), services.AuditResultPart("partial")))
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: message, Data: gin.H{
-				"queued":            queued,
-				"failed":            len(failed),
-				"skipped_cooldown":  skippedCooldown,
-				"skipped_in_flight": skippedInFlight,
-				"skipped_blocked":   skippedBlocked,
-				"skipped_other":     skippedUnsupported,
+				"queued":             queued,
+				"failed":             len(failed),
+				"skipped_cooldown":   skippedCooldown,
+				"skipped_waiting_ca": skippedWaitingCA,
+				"skipped_in_flight":  skippedInFlight,
+				"skipped_blocked":    skippedBlocked,
+				"skipped_other":      skippedUnsupported,
 			}})
 			return
 		}
 
 	}
 	cooldownNote := ""
-	if skippedCooldown > 0 {
-		cooldownNote = fmt.Sprintf("，%d 个任务处于冷却期已跳过", skippedCooldown)
+	if skippedCooldown+skippedWaitingCA > 0 {
+		cooldownNote = fmt.Sprintf("，%d 个任务处于冷却期已跳过", skippedCooldown+skippedWaitingCA)
 	}
-	recordAudit(c, "触发签发", "证书", services.FormatAuditDetail(scope, fmt.Sprintf("入队 %d 个任务%s", queued, cooldownNote), services.AuditResultPart("requested")))
+	forceNote := ""
+	if forceCAOverride {
+		forceNote = "，手动越过 CA 冷却"
+	}
+	recordAudit(c, "触发签发", "证书", services.FormatAuditDetail(scope, fmt.Sprintf("入队 %d 个任务%s%s", queued, cooldownNote, forceNote), services.AuditResultPart("requested")))
 	// 入队后渲染输入零变化——签发完成由 worker 链路自行应用，去掉强制重载
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: fmt.Sprintf("已创建 %d 个签发任务", queued), Data: gin.H{"queued": queued, "skipped_cooldown": skippedCooldown}})
 }

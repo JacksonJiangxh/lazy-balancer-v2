@@ -6,18 +6,27 @@ import (
 	"compress/gzip"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 )
 
 // buildCRSTarball builds an in-memory tar.gz mimicking a GitHub release
 // tarball: every entry is prefixed with a single root directory.
+// 条目按名字排序写入——map 迭代顺序随机会让同输入的字节（size/digest）逐次
+// 不同，TOFU 基线与尺寸类断言不可复现。
 func buildCRSTarball(t *testing.T, files map[string]string) []byte {
 	t.Helper()
 	var buf bytes.Buffer
 	gw := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gw)
-	for name, content := range files {
+	names := make([]string, 0, len(files))
+	for name := range files {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		content := files[name]
 		hdr := &tar.Header{Name: name, Mode: 0644, Size: int64(len(content))}
 		if err := tw.WriteHeader(hdr); err != nil {
 			t.Fatalf("WriteHeader(%s): %v", name, err)
@@ -205,5 +214,58 @@ func TestExtractCRSTarball_rejectsPathTraversal(t *testing.T) {
 	// Then it fails instead of escaping dest
 	if err := extractCRSTarball(src, t.TempDir()); err == nil {
 		t.Fatal("extractCRSTarball()=nil, want error for path traversal entry")
+	}
+}
+
+// 绝对路径条目必须被 stripTarRoot 显性拒绝（不得依赖后续 Join 前缀兜底——
+// IsAbs 门是与「相对路径前缀」分离的第一道契约）。
+func TestStripTarRoot_rejectsAbsoluteEntry(t *testing.T) {
+	if _, err := stripTarRoot("/etc/passwd"); err == nil || !strings.Contains(err.Error(), "绝对路径") {
+		t.Fatalf("绝对路径条目必须被拒绝, err=%v", err)
+	}
+	if _, err := stripTarRoot("root/rules/ok.conf"); err != nil {
+		t.Fatalf("合法条目被拒: %v", err)
+	}
+}
+
+// 非 TypeReg/TypeDir 条目（符号链接等）被静默跳过——不得把链接目标当普通
+// 文件写入，也不得因跳过而中断整包解压。
+func TestExtractCRSTarball_skipsNonRegularEntries(t *testing.T) {
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gw)
+	writeHeader := func(hdr *tar.Header) {
+		t.Helper()
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeHeader(&tar.Header{Name: "root/", Typeflag: tar.TypeDir, Mode: 0755})
+	writeHeader(&tar.Header{Name: "root/link.conf", Typeflag: tar.TypeSymlink, Linkname: "/etc/passwd", Mode: 0777})
+	content := []byte("SecRule ok")
+	writeHeader(&tar.Header{Name: "root/rules/ok.conf", Typeflag: tar.TypeReg, Mode: 0644, Size: int64(len(content))})
+	if _, err := tw.Write(content); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(t.TempDir(), "crs.tar.gz")
+	if err := os.WriteFile(src, buf.Bytes(), 0644); err != nil {
+		t.Fatal(err)
+	}
+	dest := t.TempDir()
+
+	if err := extractCRSTarball(src, dest); err != nil {
+		t.Fatalf("非普通条目应被跳过而非中断解压: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(dest, "link.conf")); !os.IsNotExist(err) {
+		t.Fatalf("符号链接条目必须被跳过, err=%v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(dest, "rules", "ok.conf")); err != nil || string(got) != "SecRule ok" {
+		t.Fatalf("普通文件应正常落盘: %q err=%v", got, err)
 	}
 }

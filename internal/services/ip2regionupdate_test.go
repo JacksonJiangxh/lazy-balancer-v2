@@ -15,9 +15,9 @@ import (
 
 func newTestIP2RegionManager(t *testing.T) *IP2RegionUpdateManager {
 	stubUpdateRetrySleep(t) // 任务内重试等待即时化（同 newTestCRSManager）
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
+	// 与 CRS 更新族同口径：TOFU 基线与快照路径重定向到临时目录，DB 句柄
+	// 保存/还原——更新族测试不得触碰真实数据卷或串用例。
+	redirectUpdateTestGlobals(t)
 
 	dir := t.TempDir()
 	live := filepath.Join(dir, "ip2region.xdb")
@@ -387,13 +387,13 @@ func TestIP2RegionUpdateRun_staleBakNotConsumedByRollback(t *testing.T) {
 	}
 	version, status, _, _, _, _, _ := ip2RegionVersionRow(t)
 	if status != "success" {
-		t.Fatalf("update_status=%q, want success (历史问题 fail-open)", status)
+		t.Fatalf("update_status=%q, want success (fail-open)", status)
 	}
 	if version != "v3.1.0" {
 		t.Fatalf("version=%q, want v3.1.0 (fail-open 记录新 tag)", version)
 	}
 	if reloads != 2 {
-		t.Fatalf("reloads=%d, want 2 (历史问题：fail-open 落库前补一次 reloader 重试)", reloads)
+		t.Fatalf("reloads=%d, want 2 (fail-open 落库前补一次 reloader 重试)", reloads)
 	}
 }
 
@@ -485,7 +485,7 @@ func TestIP2RegionUpdateRun_reloadFailureFailOpenWhenNoBaseline(t *testing.T) {
 		t.Fatalf("live xdb missing: %v", err)
 	}
 	if reloads != 2 {
-		t.Fatalf("reloads=%d, want 2 (历史问题：fail-open 落库前补一次 reloader 重试)", reloads)
+		t.Fatalf("reloads=%d, want 2 (fail-open 落库前补一次 reloader 重试)", reloads)
 	}
 }
 
@@ -815,7 +815,7 @@ func TestIP2RegionUpdateRun_rollbackDistCopySuccessReloadFailKeepsBaseline(t *te
 		t.Fatalf("update_status=%q, want failed (dist copy 成功后 fail-open 前提不成立)", status)
 	}
 	if version != "bundled" {
-		t.Fatalf("version=%q, want bundled (历史问题: dist 回退不得冒称 prevVersion)", version)
+		t.Fatalf("version=%q, want bundled (dist 回退不得冒称 prevVersion)", version)
 	}
 	if !strings.Contains(message, "重载 ip2region 内存索引失败") {
 		t.Fatalf("message=%q, want 保留热换失败注记", message)
@@ -943,9 +943,7 @@ func TestIP2RegionUpdateRun_rollbackAllBaselinesFailOpenRejected(t *testing.T) {
 	if data, err := os.ReadFile(ip2regionLivePath + ".bak"); err != nil || string(data) != oldLive {
 		t.Fatalf(".bak should be preserved untouched when all restore attempts fail: %q, %v", data, err)
 	}
-	if _, err := os.Stat(ip2regionLivePath + ".tmp"); !os.IsNotExist(err) {
-		t.Fatal("copyFile tmp residue should be cleaned up after failed restore")
-	}
+	assertNoTempResidue(t, filepath.Dir(ip2regionLivePath))
 	if reloads != 1 {
 		t.Fatalf("reloads=%d, want 1 (fail-open rejected; no retry reloader)", reloads)
 	}

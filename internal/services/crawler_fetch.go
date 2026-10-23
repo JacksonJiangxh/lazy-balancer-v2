@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -100,8 +101,16 @@ func parseCrawlerCIDRsForFormat(body, format string) ([]string, error) {
 	}
 	isJSON := strings.EqualFold(strings.TrimSpace(format), "json")
 	// 1) 结构化字段（JSON 对象/数组递归；ipv4Prefix/ipv6Prefix 大小写不敏感）。
+	// 解码直读 Reader 而非 []byte(body)：避免解析前再整量复制一份响应体
+	// 同时保留 json.Unmarshal 的严格语义（尾部多余数据即失败）。
 	var parsed any
-	jsonErr := json.Unmarshal([]byte(body), &parsed)
+	dec := json.NewDecoder(strings.NewReader(body))
+	jsonErr := dec.Decode(&parsed)
+	if jsonErr == nil {
+		if _, terr := dec.Token(); !errors.Is(terr, io.EOF) {
+			jsonErr = errors.New("JSON 尾部存在多余数据")
+		}
+	}
 	if jsonErr == nil {
 		structuredBefore := len(out)
 		collectCrawlerPrefixFields(parsed, add)
@@ -170,7 +179,19 @@ func normalizeCrawlerPrefixToken(tok string) (string, bool) {
 	return netip.PrefixFrom(addr, bits).String(), true
 }
 
-// crawlerFetchBody 下载源文本（ctx 取消可断；body 上限 16MB）。
+// crawlerBodyCap 是 HTML/纯文本源的响应体上限（16MB）。
+const crawlerBodyCap int64 = 16 << 20
+
+// crawlerJSONBodyCap 是 JSON 源的响应体上限。JSON 源走结构化解码（解进
+// any 树后递归遍历），结构放大远高于文本：16MiB 微小对象数组解码后峰值可达
+// 150~250MB，与「16MB 上限防 OOM」的初衷相悖。三个官方 JSON 源实测体积
+// （2026-10-23）：Google common-crawlers.json 21.8KB、OpenAI gptbot.json
+// 977B、Bing bingbot.json 1.6KB——2MiB 有 90 倍以上余量，条目数另有
+// CrawlerIPListEntryCap 兜底。
+const crawlerJSONBodyCap int64 = 2 << 20
+
+// crawlerFetchBody 下载源文本（ctx 取消可断；body 上限按源格式：JSON 2MB、
+// HTML/纯文本 16MB）。
 func crawlerFetchBody(ctx context.Context, src crawlerSource) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -190,16 +211,19 @@ func crawlerFetchBody(ctx context.Context, src crawlerSource) (string, error) {
 	// 与 threatupdate 同口径——超限提前失败；读取
 	// cap+1 后显式拒绝截断文本（旧实现把截断内容当合法文本返回，可能残留
 	// 部分 CIDR 而「看似成功」，覆盖上次快照）。
-	const crawlerBodyCap = 16 << 20
-	if resp.ContentLength > crawlerBodyCap {
-		return "", fmt.Errorf("响应体 %d 字节超过上限 %d", resp.ContentLength, crawlerBodyCap)
+	bodyCap := crawlerBodyCap
+	if strings.EqualFold(strings.TrimSpace(src.Format), "json") {
+		bodyCap = crawlerJSONBodyCap
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, crawlerBodyCap+1))
+	if resp.ContentLength > bodyCap {
+		return "", fmt.Errorf("响应体 %d 字节超过上限 %d", resp.ContentLength, bodyCap)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, bodyCap+1))
 	if err != nil {
 		return "", err
 	}
-	if len(body) > crawlerBodyCap {
-		return "", fmt.Errorf("响应体超过上限 %d 字节，已拒绝（保留上次快照）", crawlerBodyCap)
+	if int64(len(body)) > bodyCap {
+		return "", fmt.Errorf("响应体超过上限 %d 字节，已拒绝（保留上次快照）", bodyCap)
 	}
 	return string(body), nil
 }

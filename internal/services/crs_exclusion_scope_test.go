@@ -16,6 +16,7 @@ import (
 	"strings"
 	"testing"
 
+	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 )
 
@@ -208,6 +209,13 @@ func TestBuildCorazaDirectives_scopedExclusionExpandsGroupPerID(t *testing.T) {
 		}
 		last = idx
 	}
+	// 顺序不变量：作用域排除 ctl 必须在 Include 之前（运行时 ctl 在
+	// phase:1 序列中先于被禁规则执行；排在 Include 之后＝排除静默失效）。
+	// 编译门禁对指令顺序不敏感，故必须显式钉位置。
+	if includeIdx := strings.Index(directives, "Include /app/waf/crs/"); includeIdx < 0 || last > includeIdx {
+		t.Fatalf("ctl:ruleRemoveById must precede the CRS Include (ctlIdx=%d includeIdx=%d):\n%s", last, includeIdx, directives)
+	}
+	compileForEngineGate(t, directives)
 	if got := readRenderedIPList(t, directives, "-crsxc-"); got != "1.1.1.1/32\n2.2.2.2/32\n" {
 		t.Fatalf("匹配集投影文件=%q, want 两条聚合排序条目", got)
 	}
@@ -277,6 +285,10 @@ func jsonInt(v int64) string {
 
 func TestBuildCorazaDirectives_scopedExclusionStaleTargetsSkipped(t *testing.T) {
 	scopedExclusionFixture(t)
+	// 前置显式化：测试名的「db.DB 未初始化」形态不再依赖前序用例残留句柄。
+	oldDB := db.DB
+	db.DB = nil
+	t.Cleanup(func() { db.DB = oldDB })
 	policy := &models.SecurityPolicy{
 		AnomalyThreshold: 5,
 		Mode:             "blocking",
@@ -638,7 +650,7 @@ func TestCRSXCScope_hashNamingIsContentIdentity(t *testing.T) {
 	}
 
 	// 基线：条目 A(ips=1.1.1.1)、B(ips=2.2.2.2)。
-	base, baseDirectives := render(`[
+	base, _ := render(`[
 		{"target":"942100","scope":"ip","ips":"1.1.1.1"},
 		{"target":"942550","scope":"ip","ips":"2.2.2.2"}
 	]`)
@@ -694,9 +706,15 @@ func TestCRSXCScope_hashNamingIsContentIdentity(t *testing.T) {
 	if len(withRefs) != 1 || len(refsReordered) != 1 {
 		t.Fatalf("listRefs 形态应各一份投影: %v / %v", withRefs, refsReordered)
 	}
-	for name := range withRefs {
-		if _, ok := refsReordered[name]; !ok {
+	for name, content := range withRefs {
+		got, ok := refsReordered[name]
+		if !ok {
 			t.Fatalf("listRefs 排序无关被破坏: %q 不在 %v", name, refsReordered)
+		}
+		// 同名必同内容：重排后复用同名文件时匹配集必须逐字节一致（只校验
+		// 名字集合会让「同名承载另一份匹配集」的回归静默通过）。
+		if got != content {
+			t.Fatalf("重排后同名投影 %q 内容漂移: %q != %q", name, got, content)
 		}
 	}
 	// ④ 同名必同内容：基线内 A/B 名不同且内容互不串染（哈希碰撞面=12hex，
@@ -710,5 +728,4 @@ func TestCRSXCScope_hashNamingIsContentIdentity(t *testing.T) {
 			t.Fatalf("投影 %q 内容=%q, want %q（同名必同内容）", name, content, want)
 		}
 	}
-	_ = baseDirectives
 }

@@ -248,7 +248,7 @@ func TestLoadSecurityPolicyContext_toleratesAllNullColumns(t *testing.T) {
 	// Then：不得 scan 失败（任一 COALESCE 缺失即在此暴露）；
 	// 字段归一化到 schema 默认值
 	if err != nil {
-		t.Fatalf("loadSecurityPolicyContext 不得因全 NULL 列报错（历史问题）: %v", err)
+		t.Fatalf("loadSecurityPolicyContext 不得因全 NULL 列报错: %v", err)
 	}
 	policies := ctx.policyByRule["lb_all_null"]
 	if len(policies) != 1 {
@@ -354,7 +354,7 @@ func TestLoadSecurityPolicyContext_toleratesNullBlockPageContent(t *testing.T) {
 	// Then：不得 scan 失败（COALESCE 缺失即在此暴露）；
 	// 拦截页内容归一化为 ''
 	if err != nil {
-		t.Fatalf("loadSecurityPolicyContext 不得因 NULL content 报错（历史问题）: %v", err)
+		t.Fatalf("loadSecurityPolicyContext 不得因 NULL content 报错: %v", err)
 	}
 	if content, ok := ctx.blockPageByID[90]; !ok {
 		t.Fatalf("block page 90 missing from context")

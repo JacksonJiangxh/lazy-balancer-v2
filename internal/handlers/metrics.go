@@ -169,11 +169,15 @@ func loadCaddyMetricsSnapshot(ctx context.Context, url string, cacheFailure bool
 		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), caddyMetricsFetchTimeout)
 		defer cancel()
 		body, err := metricsDashboardFetch(fetchCtx, url)
+		// TTL 从抓取**完成**时刻起算：抓取耗时可能接近甚至超过 TTL（16MB 文本
+		// 上限 + 15s 自有超时本就允许长抓取），以开始时刻为基准会让条目出生即
+		// 过期——最需要共享的慢抓取场景反而每次重新拉取，三端点轮询叠加成
+		// 「越慢越抓」。
 		switch {
 		case err == nil:
-			storeCaddyMetricsSnapshot(url, body, nil, now)
+			storeCaddyMetricsSnapshot(url, body, nil, time.Now())
 		case cacheFailure && fetchCtx.Err() == nil:
-			storeCaddyMetricsSnapshot(url, nil, err, now)
+			storeCaddyMetricsSnapshot(url, nil, err, time.Now())
 		}
 		return snapshotResult{body: body, err: err}, nil
 	})

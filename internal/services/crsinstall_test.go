@@ -20,6 +20,21 @@ func forceRenameFailure(t *testing.T) {
 	t.Cleanup(func() { osRename = old })
 }
 
+// assertNoTempResidue 断言目录内无原子写临时文件残留。
+// writeFileAtomicSynced / copyFile 的临时名为 .<base>-<rand>.tmp（CreateTemp
+// 模板），固定名 <dst>.tmp 从不存在——按固定名断言恒真、对临时文件泄漏完全
+// 无感，故按目录 glob 断言。
+func assertNoTempResidue(t *testing.T, dir string) {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(dir, ".*.tmp"))
+	if err != nil {
+		t.Fatalf("glob tmp residue: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("原子写临时文件残留: %v", matches)
+	}
+}
+
 func TestCopyFile_atomicWriteNoTmpResidue(t *testing.T) {
 	// Given：copyFile 原子落盘（自此为同目录唯一临时名
 	// .<base>-<rand>.tmp + fsync；成功后只留目标文件）
@@ -38,9 +53,7 @@ func TestCopyFile_atomicWriteNoTmpResidue(t *testing.T) {
 	if err != nil || string(data) != "full-new-content" {
 		t.Fatalf("dst content=%q,%v", data, err)
 	}
-	if _, err := os.Stat(dst + ".tmp"); !os.IsNotExist(err) {
-		t.Fatal("tmp file should be renamed away after successful copy")
-	}
+	assertNoTempResidue(t, filepath.Dir(dst))
 }
 
 func TestCopyFile_sourceErrorLeavesDstUntouched(t *testing.T) {
@@ -60,9 +73,7 @@ func TestCopyFile_sourceErrorLeavesDstUntouched(t *testing.T) {
 	if err != nil || string(data) != "old-content" {
 		t.Fatalf("dst should be untouched on source error: %q,%v", data, err)
 	}
-	if _, err := os.Stat(dst + ".tmp"); !os.IsNotExist(err) {
-		t.Fatal("tmp file should not exist after failed copy")
-	}
+	assertNoTempResidue(t, filepath.Dir(dst))
 }
 
 func TestMoveTree_renameSucceeds(t *testing.T) {
@@ -109,6 +120,54 @@ func TestMoveTree_fallsBackToCopyWhenRenameFails(t *testing.T) {
 	}
 	if _, err := os.Stat(src); !os.IsNotExist(err) {
 		t.Fatal("src should be removed after copy fallback")
+	}
+}
+
+// TOFU 完整性门：同一 tag 的发布包内容变化（上游同 tag 被替换/中间人）必须
+// 阻断安装——live 规则树与 setup 保持上次成功产物，且不引入新文件。此前
+// 更新族测试未隔离基线文件：/app/data 可写时首次用例写基线、第二次同 tag
+// 不同字节即误红；不可写时该门恒不被断言（假绿）。
+func TestCRSUpdateRun_sameTagContentChangeIsBlockedByTOFU(t *testing.T) {
+	m := newTestCRSManager(t)
+	seedCRSVersionRow(t, "v4.14.0", true)
+	writeTestFile(t, filepath.Join(m.crsDir, "rules", "REQUEST-OLD.conf"), "SecRule old")
+
+	first := map[string]string{
+		"coreruleset-4.15.0/crs-setup.conf.example":     "# setup-v1",
+		"coreruleset-4.15.0/rules/" + crsRulesProbeFile: "# init probe\n",
+		"coreruleset-4.15.0/rules/REQUEST-901.conf":     "SecRule first\n",
+	}
+	m.downloadTarball = fakeCRSDownload(t, first)
+	if err := m.downloadAndInstall(context.Background(), "v4.15.0"); err != nil {
+		t.Fatalf("首次安装应成功: %v", err)
+	}
+	liveSetup := filepath.Join(m.crsDir, "crs-setup.conf")
+	before, err := os.ReadFile(liveSetup)
+	if err != nil {
+		t.Fatalf("读取首次安装产物: %v", err)
+	}
+
+	// 同 tag 内容变化
+	second := map[string]string{
+		"coreruleset-4.15.0/crs-setup.conf.example":     "# setup-v2",
+		"coreruleset-4.15.0/rules/" + crsRulesProbeFile: "# init probe\n",
+		"coreruleset-4.15.0/rules/REQUEST-901.conf":     "SecRule second\n",
+		"coreruleset-4.15.0/rules/REQUEST-902.conf":     "SecRule injected\n",
+	}
+	m.downloadTarball = fakeCRSDownload(t, second)
+	err = m.downloadAndInstall(context.Background(), "v4.15.0")
+	if !errors.Is(err, errDownloadIntegrityMismatch) {
+		t.Fatalf("同 tag 内容变化必须被 TOFU 门阻断，err=%v", err)
+	}
+	after, rerr := os.ReadFile(liveSetup)
+	if rerr != nil {
+		t.Fatalf("读取 live setup: %v", rerr)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("live crs-setup.conf 被替换（TOFU 门未在替换前阻断）: %q → %q", before, after)
+	}
+	if _, statErr := os.Stat(filepath.Join(m.crsDir, "rules", "REQUEST-902.conf")); !os.IsNotExist(statErr) {
+		t.Fatal("被阻断的发布包不得留下新规则文件")
 	}
 }
 
@@ -180,7 +239,7 @@ func TestCRSUpdateRun_backupCopyFailureLeavesNoPartialRulesBak(t *testing.T) {
 		t.Fatalf("message=%q, want the backup failure cause", message)
 	}
 	if _, err := os.Stat(crsTransientPath(m.crsDir, "rules.bak")); !os.IsNotExist(err) {
-		t.Fatal("partial rules.bak must not exist after a failed backup copy (历史问题)")
+		t.Fatal("partial rules.bak must not exist after a failed backup copy")
 	}
 	if _, err := os.Stat(crsTransientPath(m.crsDir, "rules.bak.tmp")); !os.IsNotExist(err) {
 		t.Fatal("rules.bak.tmp staging must be cleaned up after a failed backup copy")
@@ -189,7 +248,7 @@ func TestCRSUpdateRun_backupCopyFailureLeavesNoPartialRulesBak(t *testing.T) {
 		t.Fatal("live rules tree must be untouched")
 	}
 	if _, err := os.Lstat(filepath.Join(m.crsDir, "rules", "REQUEST-901.conf")); err != nil {
-		t.Fatal("live rules tree must stay complete: a partial bak must not replace it (历史问题)")
+		t.Fatal("live rules tree must stay complete: a partial bak must not replace it")
 	}
 }
 

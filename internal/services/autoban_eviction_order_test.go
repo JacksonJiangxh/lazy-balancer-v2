@@ -104,6 +104,12 @@ func TestAutobanMerge_evictionPrecomputedOrderAndParseBound(t *testing.T) {
 
 	// 复杂度：时间解析次数与条目数线性相关（旧实现每挤出一个全表重解析，
 	// 本例约 70 次挤出 × 平均 55 条 ≈ 4000 次）。
+	// 下界是断言的另一半：计数缝若被删除/自增点丢失，parses=0 会让「≤ 上界」
+	// 恒过；期望实现至少对每条种入条目解析一次（到期清点 1 次/条 + 挤出序
+	// 预计算 2 次/自动条），故线性下界取 len(seeded)。
+	if parses < int64(len(seeded)) {
+		t.Fatalf("time.Parse 次数=%d, 低于每条目至少一次的下界 %d（计数缝失效或条目未经时间解析）", parses, len(seeded))
+	}
 	upperBound := int64(3 * (len(seeded) + newBanned + 8))
 	if parses > upperBound {
 		t.Fatalf("time.Parse 次数=%d, 超过线性上界 %d（挤出仍为 O(n²) 逐次重解析）", parses, upperBound)

@@ -29,6 +29,16 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
+// adminAuthForTest 注入管理员认证上下文：UpdateUser 的管理语义门按
+// 「role != admin」fail-closed，handler 级用例必须显式模拟已过认证中间件的
+// 管理员请求，否则会命中非管理员自助限制。
+func adminAuthForTest(router *gin.Engine) {
+	router.Use(func(c *gin.Context) {
+		c.Set("user_id", "99")
+		c.Set("role", "admin")
+	})
+}
+
 func TestUpdateUser_rejects_invalid_id_and_body(t *testing.T) {
 	tests := []struct {
 		name string
@@ -46,6 +56,7 @@ func TestUpdateUser_rejects_invalid_id_and_body(t *testing.T) {
 				t.Fatalf("seed user: %v", err)
 			}
 			router := gin.New()
+			adminAuthForTest(router)
 			router.PUT("/users/:id", h.UpdateUser)
 			request := httptest.NewRequest(http.MethodPut, tt.path, strings.NewReader(tt.body))
 			request.Header.Set("Content-Type", "application/json")
@@ -70,6 +81,7 @@ func TestUpdateUser_preserves_omitted_display_name(t *testing.T) {
 		t.Fatalf("seed user: %v", err)
 	}
 	router := gin.New()
+	adminAuthForTest(router)
 	router.PUT("/users/:id", h.UpdateUser)
 	request := httptest.NewRequest(http.MethodPut, "/users/2", strings.NewReader(`{"role":"user"}`))
 	request.Header.Set("Content-Type", "application/json")
@@ -93,6 +105,7 @@ func TestUpdateUser_preserves_all_fields_when_password_rejected(t *testing.T) {
 		t.Fatalf("seed user: %v", err)
 	}
 	router := gin.New()
+	adminAuthForTest(router)
 	router.PUT("/users/:id", h.UpdateUser)
 	body := `{"username":"changed","role":"user","display_name":"Changed Name","password":"` + strings.Repeat("p", 73) + `"}`
 	request := httptest.NewRequest(http.MethodPut, "/users/1", strings.NewReader(body))
@@ -122,6 +135,7 @@ func TestUpdateUser_preserves_all_fields_when_update_fails(t *testing.T) {
 		t.Fatalf("create update failure trigger: %v", err)
 	}
 	router := gin.New()
+	adminAuthForTest(router)
 	router.PUT("/users/:id", h.UpdateUser)
 	request := httptest.NewRequest(http.MethodPut, "/users/2", strings.NewReader(`{"username":"changed","role":"user","display_name":"Changed Name"}`))
 	request.Header.Set("Content-Type", "application/json")
@@ -177,22 +191,6 @@ func newBackupTestHandlers(t *testing.T) *Handlers {
 		caddyService:   services.NewCaddyService(fakeCaddy.URL),
 		clusterService: services.NewClusterService(db.DB, ""),
 	}
-}
-
-// validateV2Backup 是历史测试夹具的整包兼容包装；生产导入/预览必须按
-// 「完整性 → sections 过滤 → 软跳过 → 行级门」分别调用，不消费本测试缝。
-func validateV2Backup(backup configBackup) (bool, error) {
-	usedLegacy, err := verifyBackupIntegrity(backup)
-	if err != nil {
-		return false, err
-	}
-	if err := validateV2BackupRows(context.Background(), db.DB, backup); err != nil {
-		return false, err
-	}
-	if err := validateV2BackupCertJobStatuses(backup.Tables); err != nil {
-		return false, err
-	}
-	return usedLegacy, nil
 }
 
 func TestImportConfigBackup_rejects_backup_without_enabled_admin_and_preserves_current_admin(t *testing.T) {
@@ -703,12 +701,17 @@ func TestConfigBackup_export_preserves_sensitive_columns(t *testing.T) {
 	if seededCA == nil {
 		t.Fatal("seeded ca_providers row not found in export")
 	}
+	// global_config.dns_credentials 是遗留列：读路径不回显、写路径已移除、
+	// 存量由启动迁移置空——导出必须剔除（旧备份导入时同样跳过），否则
+	// 不可见凭证会随每次备份外带。
+	if _, present := backup.Config["dns_credentials"]; present {
+		t.Fatal("export 携带遗留 global_config.dns_credentials（应剔除）")
+	}
 	intactChecks := []struct {
 		got  string
 		want string
 		name string
 	}{
-		{backupString(backup.Config["dns_credentials"]), "dns-secret", "global_config.dns_credentials"},
 		{backupString(backup.Config["admin_tls_cert"]), "admin-cert", "global_config.admin_tls_cert"},
 		{backupString(backup.Config["admin_tls_key"]), "admin-key", "global_config.admin_tls_key"},
 		{backupString(seededCA["credentials"]), `{"eab_kid":"ca-cred"}`, "ca_providers.credentials"},
@@ -1046,6 +1049,20 @@ func TestImportConfigBackup_accepts_historical_v1_core_tables(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s, want historical v1 import success", response.Code, response.Body.String())
 	}
+	// 落库终态（200 只证明请求被接受）：管理员行必须生效，空表不产生行。
+	var admins, rules, keys int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM users WHERE username='admin' AND role='admin' AND COALESCE(is_enabled,0)=1`).Scan(&admins); err != nil {
+		t.Fatal(err)
+	}
+	if admins != 1 {
+		t.Fatalf("v1 导入后启用管理员数=%d, want 1", admins)
+	}
+	if err := db.DB.QueryRow(`SELECT (SELECT COUNT(*) FROM lb_rules), (SELECT COUNT(*) FROM api_keys)`).Scan(&rules, &keys); err != nil {
+		t.Fatal(err)
+	}
+	if rules != 0 || keys != 0 {
+		t.Fatalf("v1 空表导入不得产生规则/密钥行: rules=%d keys=%d", rules, keys)
+	}
 }
 
 func TestImportConfigBackup_requeues_imported_non_terminal_certificate_jobs(t *testing.T) {
@@ -1279,7 +1296,7 @@ func TestConfigBackup_import_rejects_invalid_file(t *testing.T) {
 
 // v2BackupBody 构造指定 meta/tables/config 的 v2 备份体并按 {tables,config}
 // 重算 checksum（此前子例 body 缺 exported_at/checksum，全部在
-// validateV2Backup 首段早退，断言只看到「非 true」而未命中目标错误文案）。
+// 完整性校验门首段早退，断言只看到「非 true」而未命中目标错误文案）。
 func v2BackupBody(t *testing.T, version int, tables map[string][]map[string]any, cfg map[string]any) string {
 	t.Helper()
 	backup := configBackup{
@@ -1400,15 +1417,15 @@ func TestValidateV2Backup_credentials_must_be_json_object(t *testing.T) {
 				t.Fatalf("unmarshal backup: %v", err)
 			}
 
-			_, err := validateV2Backup(b)
+			_, err := validateImportBackupChain(context.Background(), importValidationDeps{}, &b, importValidationOptions{})
 			if tt.wantErrText != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErrText) {
-					t.Fatalf("validateV2Backup err=%v, want contains %q", err, tt.wantErrText)
+					t.Fatalf("校验链 err=%v, want contains %q", err, tt.wantErrText)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("validateV2Backup unexpected error: %v", err)
+				t.Fatalf("校验链 unexpected error: %v", err)
 			}
 		})
 	}
@@ -1454,7 +1471,7 @@ func TestValidateV2Backup_caProviderLimitsAndDNSProviderContracts(t *testing.T) 
 			if err := json.Unmarshal([]byte(backup), &b); err != nil {
 				t.Fatal(err)
 			}
-			_, err := validateV2Backup(b)
+			_, err := validateImportBackupChain(context.Background(), importValidationDeps{}, &b, importValidationOptions{})
 			if tt.wantErrText == "" && err != nil {
 				t.Fatalf("valid backup rejected: %v", err)
 			}
@@ -1477,7 +1494,7 @@ func TestValidateV2Backup_legacyEmptyProviderRowsAllowed(t *testing.T) {
 	if err := json.Unmarshal([]byte(backup), &b); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := validateV2Backup(b); err != nil {
+	if _, err := validateImportBackupChain(context.Background(), importValidationDeps{}, &b, importValidationOptions{}); err != nil {
 		t.Fatalf("legacy empty provider rows rejected: %v", err)
 	}
 }
@@ -1515,16 +1532,8 @@ func TestValidateV2Backup_rejects_self_loop_80_tls_redirect_rule(t *testing.T) {
 			if err := json.Unmarshal([]byte(backup), &b); err != nil {
 				t.Fatalf("unmarshal backup: %v", err)
 			}
-			// 拆分后：逐行校验在 validateV2BackupRules（handler 在
-			// skipEmptyDomainHTTPRules 之后调用）；直测时组合两者保持原语义。
-			// TLS 形态校验在 validateV2BackupTLSShape，一并串联。
-			_, err := validateV2Backup(b)
-			if err == nil {
-				err = validateV2BackupRules(b.Tables)
-			}
-			if err == nil {
-				err = validateV2BackupTLSShape(b.Tables)
-			}
+			// 逐行/端口/特性门与 TLS 形态校验都在生产链内，无需测试侧串联。
+			_, err := validateImportBackupChain(context.Background(), importValidationDeps{}, &b, importValidationOptions{})
 			if tt.wantErrText != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErrText) {
 					t.Fatalf("validateV2Backup err=%v, want contains %q", err, tt.wantErrText)
@@ -2869,7 +2878,7 @@ func TestImportConfigBackup_toleratesTopLevelStringCustomRules(t *testing.T) {
 	router := gin.New()
 	router.POST("/config/import", h.ImportConfigBackup)
 
-	// 旧夹具缺 meta.app，在 validateV2Backup 首行 400 早退，只断言
+	// 旧夹具缺 meta.app，在完整性校验门首行 400 早退，只断言
 	// 「非 500」等于没测。改用完整 v2 夹具注入顶层字符串 custom_rules，断言
 	// 200 且策略行真实落库（若转红即暴露真实归一缺口）。
 	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Tables: map[string][]map[string]any{

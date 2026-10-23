@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"lazy-balancer-v2/internal/config"
+	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 )
 
@@ -814,5 +815,42 @@ func TestLogSyncSwitchGuards_newVersionHashesAndAdvancesDedup(t *testing.T) {
 	}
 	if applied != 8 {
 		t.Fatalf("applied_waf_ref_version=%d, want 8（新版本必须走到文件比对并推进去重）", applied)
+	}
+}
+
+// Caddy 全局数值设置（body 上限 / 三类 HTTP 超时 / 日志尺寸）的归一必须由
+// 主端装载与从端 apply 共用：单边归一会让 users 节哈希主从恒不等，每次版本
+// 递增都多一轮「配置无变化但本地数据不一致」的全量重拉 + 强制重载。
+func TestSnapshotUsersSection_hashParityWithCaddyNumericClamp(t *testing.T) {
+	masterService, masterDB := newClusterTestService(t)
+	// 带外写入的越界值（写侧校验拦不住直改库/同步快照）：apply 侧会归一后落库，
+	// 主端装载侧必须同口径，否则两侧哈希分叉。
+	if _, err := masterDB.Exec(`UPDATE global_config SET request_body_max_size_mb=8192, http_read_timeout=0,
+		http_write_timeout=-3, http_idle_timeout=0, caddy_log_size_mb=0 WHERE id=1`); err != nil {
+		t.Fatalf("seed out-of-range caddy settings: %v", err)
+	}
+	masterSnapshot, err := masterService.clusterSnapshotBypassingCache(context.Background())
+	if err != nil {
+		t.Fatalf("build master snapshot: %v", err)
+	}
+	masterHash := masterSnapshot.SectionHashes["users"]
+	if masterHash == "" {
+		t.Fatal("主端快照缺少 users 节哈希")
+	}
+	if settings := masterSnapshot.BasicSettings; settings.RequestBodyMaxSizeMB == nil || *settings.RequestBodyMaxSizeMB != 4096 ||
+		settings.HTTPReadTimeout == nil || *settings.HTTPReadTimeout != db.DefaultHTTPReadTimeout {
+		t.Fatalf("主端装载侧未归一越界值：body=%v read=%v", settings.RequestBodyMaxSizeMB, settings.HTTPReadTimeout)
+	}
+
+	slaveService, slaveDB := newClusterTestService(t)
+	if err := replaceSnapshotDB(context.Background(), slaveDB, masterSnapshot); err != nil {
+		t.Fatalf("从端应用快照: %v", err)
+	}
+	slaveHashes, err := slaveService.driftGuardSectionHashes(context.Background())
+	if err != nil {
+		t.Fatalf("从端重建节哈希: %v", err)
+	}
+	if masterHash != slaveHashes["users"] {
+		t.Fatalf("主端 users 节哈希 %s ≠ 从端重建 %s——数值归一仅单边生效", masterHash[:16], slaveHashes["users"][:16])
 	}
 }

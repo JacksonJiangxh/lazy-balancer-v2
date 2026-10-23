@@ -270,7 +270,7 @@ func TestClusterService_RegisterNode_upsertClearsSectionReport(t *testing.T) {
 	}
 	if _, err := service.RegisterNode(context.Background(), models.ClusterRegisterRequest{
 		Token: token, Name: "slave-reregister", IPAddress: "127.0.0.1", Port: 8000,
-	}, now); err != nil {
+	}, "127.0.0.1", now); err != nil {
 		t.Fatalf("re-register: %v", err)
 	}
 	service.sectionMu.Lock()

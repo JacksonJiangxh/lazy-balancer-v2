@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"database/sql"
 	"errors"
 	"flag"
 	"fmt"
@@ -116,12 +117,18 @@ func run() error {
 	}
 
 	var tz string
-	if err := db.DB.QueryRow("SELECT COALESCE(timezone,'Asia/Shanghai') FROM global_config WHERE id=1").Scan(&tz); err != nil {
+	// 默认时区单源 db.DefaultTimezone（DDL DEFAULT 与迁移归一同一常量）——
+	// 启动期读侧写死字面量会与库默认值分叉：DDL 改动后进程时区仍取旧值，
+	// 运行期时间轴与面板展示时间轴静默不一致。
+	if loaded, err := startupTimezone(db.DB); err != nil {
 		// 时区读取失败不得静默——此前整库读错误直接落
 		// 「按进程默认时区运行」，所有墙面时间（任务排程/task_runs/审计）
 		// 与实际配置时区分叉且无任何信号。
 		services.Logf("error", "failed to read timezone from global_config (falling back to process default): %v", err)
-	} else if tz != "" {
+	} else {
+		tz = loaded
+	}
+	if tz != "" {
 		if err := os.Setenv("TZ", tz); err != nil {
 			services.Logf("error", "failed to set TZ environment: %v", err)
 		} else if loc, err := services.ConfigureLocation(tz); err != nil {
@@ -300,22 +307,29 @@ func run() error {
 	shutdown := newShutdownBudget()
 	defer func() {
 		cancelThreatRollupWarmer()
+		// warmer 只在轮次之间检查 ctx：在途固化批不会被打断，可能继续读写到
+		// db.Close 之后（"database is closed" 告警 + 该批回滚）。与同层 worker
+		// 一致按剩余预算有界等待，且不动收尾段预留。
+		if !handlers.WaitThreatRollupWarmer(shutdown.segmentReserving(threatWarmerStopSegmentMax, trailingStopReserve)) {
+			services.Logf("warn", "威胁大屏 rollup warmer 未在关停预算内退出，放弃等待（进程继续退出）")
+		}
 		// 事件摄入与其余 worker 同生命周期——db.Close 前 cancel，
 		// 否则退出窗口内每 2s 对已关闭 MetricsDB 刷 "database is closed" 告警。
 		// 引擎排空按剩余预算派生（为 ACME 收尾预留），不再使用
 		// StopTaskEngine 的 30s 默认——30s 本身已超 compose stop_grace_period。
 		stopTaskEngineWithin(shutdown) // M2:引擎统一收尾(摄取/看门狗/清理)
-		// 以下三处等待全部从关停预算派生有界——旧形态
+		// 以下等待全部从关停预算派生有界——旧形态
 		// <-metricsDone / StopX 的无界 <-done 在 collect/refresh 阻塞
 		// （http.Client 10s、DB busy_timeout 30s）时可把进程拖过 compose
 		// grace 被 SIGKILL。超时放弃等待并 warn：进程继续退出，残留
 		// goroutine 随进程消亡，比拖过 grace 被强杀（WAL 写中段断）安全。
-		metricsService.Stop()
+		// metricsService.Stop 内部的清理等待（固定 3s）同样不可预算：有界执行
+		// 且不侵占收尾段预留（此前它无条件吃掉 3s，ACME 段可被钳成 0）。
+		runWithin("metrics 清理等待", shutdown.segmentReserving(metricsCleanupSegmentMax, trailingStopReserve), metricsService.Stop)
 		awaitChannelWithin("metrics 采集循环", metricsDone, shutdown.segment(metricsStopSegmentMax))
 		services.StopTimezoneRefreshWithin(shutdown.segment(tzStopSegmentMax))
 		services.StopLogRotateWithin(shutdown.segment(logRotateStopSegmentMax))
-		// 证书 worker 的 <-done 有界（此前无界等待可把进程拖过
-		// grace 后被 SIGKILL）。
+		// 证书 worker 的等待有界（此前 Stop 自身无界阻塞、超时 select 不可达）。
 		lifecycle.ShutdownWithTimeout(shutdown.segment(acmeStopSegmentMax))
 	}()
 
@@ -368,6 +382,26 @@ func run() error {
 	return nil
 }
 
+// startupTimezone 读取启动期进程时区（global_config.id=1）。
+// NULL/缺行落到 db.DefaultTimezone 单源；读错误原样上抛，由调用方留痕并退回
+// 进程默认时区（与其余时区读侧同口径）。独立成函数以便钉住「默认值单源 +
+// NULL/缺行」两种形状。
+func startupTimezone(database *sql.DB) (string, error) {
+	var tz string
+	if err := database.QueryRow("SELECT COALESCE(timezone, ?) FROM global_config WHERE id=1", db.DefaultTimezone).Scan(&tz); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// 无配置行（全新库/初始化中断）：落到治理默认值——「未配置」不是
+			// 读失败，不该退回进程默认时区。
+			return db.DefaultTimezone, nil
+		}
+		return "", err
+	}
+	if tz == "" {
+		return db.DefaultTimezone, nil
+	}
+	return tz, nil
+}
+
 // newAdminHTTPServer 统一面板 HTTP 超时。请求头仍保持 10s 慢头护栏；
 // 大体积备份导入/导出（上限由 handlers.maxConfigImportBytes 定义，不在本文件
 // 重复数字）与含 CRS/IP2Region 的大备份下载需要分钟级正文读写预算，不再沿用
@@ -418,6 +452,17 @@ const (
 	metricsStopSegmentMax   = 2 * time.Second
 	tzStopSegmentMax        = 1 * time.Second
 	logRotateStopSegmentMax = 1 * time.Second
+	// 关停链中三处「不可预算的同步收尾」的等待上限——对应实现内部的固定
+	// 上界（引擎全局句柄清理的角色对账 5s、metrics 停止清理 3s、威胁大屏
+	// warmer 在途批 2s）。这些调用不接受 deadline，必须由本层按预算有界执行；
+	// 它们只允许花「引擎排空后尚未用完的预算」，不得侵占下方
+	// trailingStopReserve（见 segmentReserving）。
+	engineHandleStopSegmentMax = 5 * time.Second
+	metricsCleanupSegmentMax   = 3 * time.Second
+	threatWarmerStopSegmentMax = 2 * time.Second
+	// engineHandleSwapGrace 预算耗尽时等待「摘除引擎句柄」的极小窗口：<0.2%
+	// grace，可观测上不改变关停总壁钟，但不允许已停引擎的句柄活过 db.Close。
+	engineHandleSwapGrace = 50 * time.Millisecond
 	// trailingStopReserve 引擎排空必须为后续收尾段预留的预算。
 	trailingStopReserve = metricsStopSegmentMax + tzStopSegmentMax + logRotateStopSegmentMax + acmeStopSegmentMax
 )
@@ -458,6 +503,24 @@ func (b *shutdownBudget) segment(max time.Duration) time.Duration {
 	return max
 }
 
+// segmentReserving 段上限 = min(段自身上限, 剩余预算 − reserveAfter)，
+// 预算已不足以留下后续预留时返回 0（调用方据此放弃等待）。
+//
+// 用于插在收尾段之前、自身又不可预算的同步收尾（引擎句柄清理/metrics 清理
+// 等待/威胁大屏 warmer）：它们只能花「还没被用完的预算」，不得把
+// trailingStopReserve 挤成 0——否则其后的 ACME/metrics 段按剩余钳制后归 0，
+// 收尾直接放弃等待。
+func (b *shutdownBudget) segmentReserving(max, reserveAfter time.Duration) time.Duration {
+	r := b.remaining() - reserveAfter
+	if r <= 0 {
+		return 0
+	}
+	if r < max {
+		return r
+	}
+	return max
+}
+
 // engineDrain 引擎排空上限 = 剩余预算 − 收尾段预留（metrics/时区/日志轮转
 // 等待 + ACME 收尾）。
 //
@@ -475,13 +538,53 @@ func (b *shutdownBudget) engineDrain() time.Duration {
 // stopTaskEngineWithin 引擎排空按关停预算执行，再清全局句柄。
 // services.StopTaskEngine 内部的 Stop()=30s 默认会超出 compose grace，生产
 // 退出路径必须走本函数（测试/服务包的既有直调入口不受影响）。
+//
+// 排空本身走 StopWithTimeout；随后的全局句柄清理（services.StopTaskEngine）
+// 内部还有一段固定上界的角色对账等待（对账 goroutine 卡在 DB 读时最长 5s），
+// 不接受调用方 deadline——按「引擎排空后尚未用完的预算」有界执行，绝不侵占
+// 收尾段预留（ACME 段曾被这两处等待挤成 0）。
 func stopTaskEngineWithin(b *shutdownBudget) {
 	te := services.TaskEngine()
 	if te == nil {
 		return
 	}
 	te.StopWithTimeout(b.engineDrain())
-	services.StopTaskEngine() // 幂等：已停止时仅清全局句柄（既有收尾语义不变）
+	// 全局句柄清理（摘除句柄 + 停引擎 + 等角色对账 ≤5s）。摘除在函数入口
+	// 即完成，后台读取方立即看到 nil；等待部分不可预算，因此总是发起清理，
+	// 只按「引擎排空后尚未用完的预算」决定等多久——不再无条件吃掉 3~5s。
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		services.StopTaskEngine()
+	}()
+	wait := b.segmentReserving(engineHandleStopSegmentMax, trailingStopReserve)
+	if wait <= 0 {
+		// 预算不足以留出收尾段预留：只等一个摘除句柄的极小窗口（<0.2% grace），
+		// 之后不再等待——已停引擎的句柄绝不留到 db.Close 之后。
+		select {
+		case <-done:
+		case <-time.After(engineHandleSwapGrace):
+			services.Logf("warn", "关停预算已不足以等待 任务引擎全局句柄清理 收尾，只发起清理不等待（进程继续退出）")
+		}
+		return
+	}
+	awaitChannelWithin("任务引擎全局句柄清理", done, wait)
+}
+
+// runWithin 关停期的有界单次调用：fn 放进 goroutine，等待由预算派生；超时
+// （或预算已耗尽）放弃等待并 warn——进程继续退出，残留 goroutine 随进程
+// 消亡。d<=0 表示预算不足以留出后续预留，直接不等待。
+func runWithin(what string, d time.Duration, fn func()) bool {
+	if d <= 0 {
+		services.Logf("warn", "关停预算已不足以等待 %s 收尾，跳过等待（进程继续退出）", what)
+		return false
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fn()
+	}()
+	return awaitChannelWithin(what, done, d)
 }
 
 // awaitChannelWithin 关停收尾的预算派生有界等待：ch 在 d
@@ -618,7 +721,13 @@ type tzLogWriter struct {
 	w io.Writer
 }
 
+// Write 必须按 io.Writer 契约返回 len(p)——向下写的是 prefix+p，直接转交
+// 底层返回值会报告 n > len(p)。当前唯一消费者（log.Logger）忽略 n，但一旦
+// 日志链路引入缓冲/io.Copy/短写校验，越界 n 会被当成合法字节数使用。
 func (t *tzLogWriter) Write(p []byte) (int, error) {
 	prefix := time.Now().In(services.CurrentLocation()).Format("2006/01/02 15:04:05 ")
-	return t.w.Write(append([]byte(prefix), p...))
+	if _, err := t.w.Write(append([]byte(prefix), p...)); err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }

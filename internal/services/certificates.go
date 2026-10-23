@@ -886,8 +886,16 @@ func (s *CertificateService) resumeDeploymentRetries() {
 	s.rescanDroppedDeploymentRetries()
 }
 
+// deploymentWindowNullSettle：downloaded 行重试窗口为 NULL 时的沉降阈值。
+// 窗口为 NULL 的正常形态是「部署正在主路径上执行」（persist downloaded 会先
+// 把窗口置空），沉降阈值避免补扫与主部署路径抢同一任务；超过阈值仍为 NULL
+// 则说明部署失败的状态回写本身没落库（瞬时 DB 故障/服务暂停期），必须由补扫
+// 接管——否则该行没有任何周期通道（补扫只收非 NULL 窗口、对账只补缺失文件）。
+const deploymentWindowNullSettle = 10 * time.Minute
+
 // rescanDroppedDeploymentRetries 重新调度暂停期间被丢弃、或部署失败状态回写
-// 失败而未登记 timer 的部署重试：`downloaded` 需已有 available_after；`cleanup_*`
+// 失败而未登记 timer 的部署重试：`downloaded` 需已有 available_after（或窗口
+// 为 NULL 且已过沉降阈值）；`cleanup_*`
 // 的失败写回可能连窗口列都没更新，仍须由周期补扫拾起。
 // 返回本轮实际重排的部署重试数（供 30s 补扫节拍的动作计数摘要）。
 // 返回（重排数, error）：读失败必须上抛（30s 补扫任务的失败终态），否则长期读
@@ -897,17 +905,20 @@ func (s *CertificateService) rescanDroppedDeploymentRetries() (rescheduled int, 
 	if db.DB == nil {
 		return 0, nil
 	}
+	settleMinutes := int(deploymentWindowNullSettle / time.Minute)
 	rows, err := db.DB.Query(`
 		SELECT j.id, COALESCE(j.rule_id,''), COALESCE(j.domain,''), COALESCE(j.ca_provider_id,0), COALESCE(j.deployment_attempts,0),
 		       COALESCE(r.domain,''),
 		       CASE WHEN r.caddy_id IS NOT NULL AND r.enabled=1 AND r.enable_tls=1 AND r.tls_source='acme_dns' THEN 1 ELSE 0 END,
-		       CASE WHEN ` + CertJobMaterialPredicateSQL("j") + ` THEN 1 ELSE 0 END,
+		       CASE WHEN `+CertJobMaterialPredicateSQL("j")+` THEN 1 ELSE 0 END,
 		       COALESCE(j.deployment_available_after,'')
 		FROM cert_jobs j
 		LEFT JOIN lb_rules r ON r.caddy_id=j.rule_id
 		WHERE (j.status='downloaded' AND j.deployment_available_after IS NOT NULL)
+		   OR (j.status='downloaded' AND j.deployment_available_after IS NULL
+		       AND datetime(COALESCE(j.updated_at,j.created_at)) <= datetime('now', '-' || ? || ' minutes'))
 		   OR j.status IN ('cleanup_dns','cleanup_warning')
-	`)
+	`, settleMinutes)
 	if err != nil {
 		Logf("error", "resume deployment retries: scan failed: %v", err)
 		return 0, fmt.Errorf("扫描断链部署重试: %w", err)
@@ -961,7 +972,10 @@ func (s *CertificateService) rescanDroppedDeploymentRetries() (rescheduled int, 
 			continue
 		}
 		delay := time.Duration(0)
-		if t, err := time.Parse("2006-01-02 15:04:05", job.availableAfter); err == nil {
+		if job.availableAfter == "" {
+			// 窗口列为 NULL：失败回写未落库（已过沉降阈值，见查询门）。
+			// 这是已知形态而非格式漂移，按立即重试处理且不刷 warn。
+		} else if t, err := time.Parse("2006-01-02 15:04:05", job.availableAfter); err == nil {
 			if remaining := time.Until(t); remaining > 0 {
 				delay = remaining
 			}
@@ -2253,28 +2267,94 @@ func certRenewalWindowCoversLifetime(window time.Duration, leaf *x509.Certificat
 // 最短 6h，但手动触发/多规则场景不应刷屏。
 const certRenewalWindowWarnInterval = time.Hour
 
-var certRenewalWindowWarnGate struct {
+// renewalWarnGate 是按规则限频的告警闸门（窗口告警与迟滞告警各自一个实例：
+// 共用一张表会让先到的告警压掉另一类，运维看不到后者的原因）。
+type renewalWarnGate struct {
 	mu   sync.Mutex
 	last map[string]time.Time
 }
 
+// due 报告该规则本轮是否允许告警（并记录本次时刻）。
+func (g *renewalWarnGate) due(ruleID string, now time.Time) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.last == nil {
+		g.last = make(map[string]time.Time)
+	}
+	if last, ok := g.last[ruleID]; ok && now.Sub(last) < certRenewalWindowWarnInterval {
+		return false
+	}
+	g.last[ruleID] = now
+	return true
+}
+
+var certRenewalWindowWarnGate renewalWarnGate
+
+var certRenewalHysteresisWarnGate renewalWarnGate
+
 func warnRenewalWindowCoversLifetime(ruleID string, windowDays int, leaf *x509.Certificate) {
-	if leaf == nil {
+	if leaf == nil || !certRenewalWindowWarnGate.due(ruleID, time.Now()) {
 		return
 	}
 	now := time.Now()
-	certRenewalWindowWarnGate.mu.Lock()
-	if certRenewalWindowWarnGate.last == nil {
-		certRenewalWindowWarnGate.last = make(map[string]time.Time)
-	}
-	if last, ok := certRenewalWindowWarnGate.last[ruleID]; ok && now.Sub(last) < certRenewalWindowWarnInterval {
-		certRenewalWindowWarnGate.mu.Unlock()
-		return
-	}
-	certRenewalWindowWarnGate.last[ruleID] = now
-	certRenewalWindowWarnGate.mu.Unlock()
 	Logf("warn", "证书规则 %s：自动续签时间 %d 天 ≥ 证书寿命 %s（剩余 %s），本轮跳过续签以免每轮重签；请把续签时间调到小于证书寿命",
 		ruleID, windowDays, leaf.NotAfter.Sub(leaf.NotBefore).Truncate(time.Hour), leaf.NotAfter.Sub(now).Truncate(time.Hour))
+}
+
+// certRenewalMinInterval 是两次自动续签之间的最小间隔（成功侧迟滞的下限）。
+const certRenewalMinInterval = 24 * time.Hour
+
+// certRenewalHysteresisActive 报告选中证书是否仍处于「刚签发，不允许再次自动
+// 续签」的迟滞窗口。
+//
+// 窗口只决定首次触发：一次成功续签后剩余寿命回到 L，下一次入队的时刻自然间隔
+// L−W。W 接近 L（88/89 天窗口 + 90 天证书，或 CA 实际寿命略长于 90 天）时该
+// 间隔退化到小时级，每轮扫描都入队 → 每日甚至亚日级完整重签，命中 CA 重复
+// 证书限流后落 waiting_ca/failed，约一个寿命周期后证书到期中断。因此要求
+// 「距上次签发 ≥ max(24h, L−W)」。剩余 ≤ 保护区（7 天）一律放行，避免配置
+// 越界演变成到期中断。
+func certRenewalHysteresisActive(window time.Duration, leaf *x509.Certificate, issuedAt, now time.Time) bool {
+	if leaf == nil || issuedAt.IsZero() {
+		return false
+	}
+	if leaf.NotAfter.Sub(now) <= certRenewalGuaranteedGrace {
+		return false
+	}
+	lifetime := leaf.NotAfter.Sub(leaf.NotBefore)
+	if lifetime <= 0 {
+		return false
+	}
+	interval := lifetime - window
+	if interval < certRenewalMinInterval {
+		interval = certRenewalMinInterval
+	}
+	return now.Sub(issuedAt) < interval
+}
+
+// julianDayToTime 把 SQLite julianday 值（CertificateCandidate.UpdatedAt 的
+// 原始形态）转成 UTC 时间；0/非正值=未知（返回零值，调用方按无迟滞处理）。
+func julianDayToTime(jd float64) time.Time {
+	if jd <= 0 {
+		return time.Time{}
+	}
+	const unixEpochJulianDay = 2440587.5 // 1970-01-01T00:00:00Z
+	seconds := (jd - unixEpochJulianDay) * 86400
+	return time.Unix(0, int64(seconds*float64(time.Second))).UTC()
+}
+
+// warnRenewalHysteresis 限频留痕：迟滞跳过不是静默行为——运维需要知道「配置
+// 的窗口接近寿命时续签不会更频繁地发生」。
+func warnRenewalHysteresis(ruleID string, windowDays int, leaf *x509.Certificate, now time.Time) {
+	if leaf == nil || !certRenewalHysteresisWarnGate.due(ruleID, now) {
+		return
+	}
+	lifetime := leaf.NotAfter.Sub(leaf.NotBefore)
+	interval := lifetime - time.Duration(windowDays)*24*time.Hour
+	if interval < certRenewalMinInterval {
+		interval = certRenewalMinInterval
+	}
+	Logf("warn", "证书规则 %s：距上次签发不足 %s（证书寿命 %s，续签窗口 %d 天，最小间隔 24h），本轮跳过续签以免密集重签；如确需更早续签请调小续签时间",
+		ruleID, interval.Truncate(time.Minute), lifetime.Truncate(time.Hour), windowDays)
 }
 
 // scanRenewalCandidates：CheckExpiration 与
@@ -2311,6 +2391,9 @@ func scanRenewalCandidates(rows *sql.Rows, days int, warnPrefix string) (jobs []
 			selection, selected, err = selectStoredRuleCertificate(context.Background(), j.RuleID, ruleDomain, now)
 			selectionLoaded[j.RuleID] = true
 			if err != nil {
+				// 与相邻 Scan 失败同口径计数：读失败的行被移出候选集后，
+				// 巡检摘要必须体现「有行未扫描」，不得只报「扫描完成：无临期证书」。
+				scanSkipped++
 				Logf("error", "Failed to select current certificate for rule %s: %v", j.RuleID, err)
 				continue
 			}
@@ -2329,6 +2412,12 @@ func scanRenewalCandidates(rows *sql.Rows, days int, warnPrefix string) (jobs []
 				// 会每轮重签。保护区（剩余 ≤ 7 天）放行。
 				if certRenewalWindowCoversLifetime(window, selection.Certificate, now) {
 					warnRenewalWindowCoversLifetime(j.RuleID, days, selection.Certificate)
+					continue
+				}
+				// 成功侧迟滞：窗口接近寿命时间隔 L−W 会退化到小时级，须以
+				// max(24h, L−W) 兜住（见 certRenewalHysteresisActive）。
+				if certRenewalHysteresisActive(window, selection.Certificate, julianDayToTime(selection.Candidate.UpdatedAt), now) {
+					warnRenewalHysteresis(j.RuleID, days, selection.Certificate, now)
 					continue
 				}
 			}

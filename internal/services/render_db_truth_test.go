@@ -14,6 +14,7 @@ package services
 // 反兜底机制钉测见 render_anti_fallback_scan_test.go。
 
 import (
+	"fmt"
 	"log"
 	"strings"
 	"testing"
@@ -91,6 +92,11 @@ func TestRenderDBTruth_TryIntervalSentinelPassThrough(t *testing.T) {
 	if lb["try_interval"] != "777ms" {
 		t.Fatalf("HTTP try_interval=%v, want 777ms (库值直读)", lb["try_interval"])
 	}
+	// td>0 必须按值发射窗口——白名单披露的合法性（「存量 HTTP 行恒 0」）依赖
+	// 「非零值确实直读」这一前提，缺失断言时恒发 5s 也不会变红。
+	if lb["try_duration"] != "3000ms" {
+		t.Fatalf("HTTP try_duration=%v, want 3000ms (库值直读)", lb["try_duration"])
+	}
 
 	rule.Protocol = "tcp"
 	tcpServer, err := buildTCPServer(rule)
@@ -103,6 +109,30 @@ func TestRenderDBTruth_TryIntervalSentinelPassThrough(t *testing.T) {
 	tcpLB := handle["load_balancing"].(map[string]interface{})
 	if tcpLB["try_interval"] != "777ms" {
 		t.Fatalf("TCP try_interval=%v, want 777ms (库值直读)", tcpLB["try_interval"])
+	}
+}
+
+// 上游权重哨兵：权重直读（7/3 经 gcd 约分仍为 7/3），对冲 allowlist 的
+// `weight = 1` 条目——集合层归一若回归为「恒 1」，本用例必红。
+func TestRenderDBTruth_UpstreamWeightsDirectRead(t *testing.T) {
+	rule := truthRule("lb-truth-weight")
+	rule.Upstreams = []UpstreamConfig{
+		{Host: "10.0.9.10", Port: 9000, Weight: 7, Protocol: "http", Enabled: true},
+		{Host: "10.0.9.11", Port: 9000, Weight: 3, Protocol: "http", Enabled: true},
+	}
+	_, mainRoute, err := generateHTTPRouteObjects(rule)
+	if err != nil {
+		t.Fatalf("generateHTTPRouteObjects: %v", err)
+	}
+	proxy := findHandlerInChain(t, mainRoute, "reverse_proxy")
+	lb, _ := proxy["load_balancing"].(map[string]interface{})
+	selectionPolicy, _ := lb["selection_policy"].(map[string]interface{})
+	if got := fmt.Sprint(selectionPolicy["weights"]); got != "[7 3]" {
+		t.Fatalf("weights=%s, want [7 3]（库值直读 + gcd 约分）", got)
+	}
+	upstreams, _ := proxy["upstreams"].([]interface{})
+	if len(upstreams) != 2 {
+		t.Fatalf("upstreams=%d, want 2", len(upstreams))
 	}
 }
 

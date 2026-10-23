@@ -110,8 +110,10 @@ func TestConfigBackup_oldBackupWithoutNodesPreservesLocalTopology(t *testing.T) 
 func TestImportNodes_preservesLiveTokenForMatchingIdentity(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	seedAdminShared(t)
+	// 本地审批态与备份值刻意不同（本地 0 / 备份 1）：同值形态下「保留本地审批态」
+	// 与「按备份覆盖」不可判别。
 	if _, err := db.DB.Exec(`INSERT INTO nodes (name,mode,ip_address,port,protocol,is_approved,sync_interval,status,cluster_token_hash,cluster_token_delivered)
-		VALUES ('live-name','slave','10.0.0.2',8000,'http',1,60,'online','live-token',1)`); err != nil {
+		VALUES ('live-name','slave','10.0.0.2',8000,'http',0,60,'online','live-token',1)`); err != nil {
 		t.Fatal(err)
 	}
 	body := buildBackup(t, backupFixtureOptions{Sections: []string{"cluster"}, Tables: map[string][]map[string]any{
@@ -141,8 +143,8 @@ func TestImportNodes_preservesLiveTokenForMatchingIdentity(t *testing.T) {
 	if tokenHash != "live-token" {
 		t.Fatalf("cluster_token_hash=%q, want 保留本地令牌 live-token", tokenHash)
 	}
-	if approved != 1 {
-		t.Fatalf("is_approved=%d, want 保留本地审批态", approved)
+	if approved != 0 {
+		t.Fatalf("is_approved=%d, want 保留本地审批态 0（备份值 1 不得覆盖）", approved)
 	}
 }
 

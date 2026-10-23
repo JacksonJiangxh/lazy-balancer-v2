@@ -76,11 +76,11 @@ func TestFormatAuditActionAuthAndNodeRegistration(t *testing.T) {
 	// 原断言 /nodes/register 映射——该路由实际注册为 /cluster/register，
 	// 映射从未可达（死映射）；/auth/login 为 Explicit（handler 记录 登录成功/失败）。
 	// 两者现均须为空。
-	action, resource, _ := FormatAuditAction("POST", "/api/v1/auth/login")
+	action, resource, _ := FormatAuditAction("/api/v1/auth/login")
 	if action != "" || resource != "" {
 		t.Fatalf("login mapping = (%q, %q), want 空", action, resource)
 	}
-	action, resource, _ = FormatAuditAction("POST", "/api/v1/nodes/register")
+	action, resource, _ = FormatAuditAction("/api/v1/nodes/register")
 	if action != "" || resource != "" {
 		t.Fatalf("node registration mapping = (%q,%q), want 空（原为指向不存在路由的死映射）", action, resource)
 	}
@@ -248,6 +248,70 @@ func TestCleanupAuditLogs_deletesInBatches(t *testing.T) {
 	}
 	if remaining != 1 {
 		t.Fatalf("剩余行=%d, want 1（保留期内行不得被删）", remaining)
+	}
+}
+
+// 中途失败必须返回已删除的真实条数：前几批删除不可逆，摘要若恒报 0 会
+// 误导排障（与 security-events-retention 同口径）。
+func TestCleanupAuditLogs_reportsPartialCountOnMidwayFailure(t *testing.T) {
+	oldDB, oldAuditDB := db.DB, db.AuditDB
+	mainDB, err := sql.Open("sqlite", t.TempDir()+"/main.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	auditDB, err := sql.Open("sqlite", t.TempDir()+"/audit.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.DB, db.AuditDB = mainDB, auditDB
+	t.Cleanup(func() {
+		db.DB, db.AuditDB = oldDB, oldAuditDB
+		mainDB.Close()
+		auditDB.Close()
+	})
+	if _, err := mainDB.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY CHECK (id = 1), audit_retention_months INTEGER DEFAULT 3)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mainDB.Exec(`INSERT INTO global_config (id, audit_retention_months) VALUES (1, 3)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := auditDB.Exec(`CREATE TABLE audit_log (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		username VARCHAR(100), action VARCHAR(50) NOT NULL, resource VARCHAR(100),
+		detail TEXT, ip_address VARCHAR(45), created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := auditDB.Exec(`INSERT INTO audit_log (username, action, resource, created_at)
+		WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < 8)
+		SELECT 'u', '登录', '认证', '2020-01-01 00:00:00' FROM seq`); err != nil {
+		t.Fatal(err)
+	}
+	// 第 5 条删除时注入失败（前 4 条已被永久删除）。
+	if _, err := auditDB.Exec(`CREATE TRIGGER block_delete BEFORE DELETE ON audit_log
+		WHEN OLD.id = 5 BEGIN SELECT RAISE(ABORT, 'injected'); END`); err != nil {
+		t.Fatal(err)
+	}
+	oldBatch := auditCleanupBatchSize
+	auditCleanupBatchSize = 1
+	t.Cleanup(func() { auditCleanupBatchSize = oldBatch })
+
+	// When
+	n, err := CleanupAuditLogs()
+
+	// Then：错误上抛且返回真实部分计数（不是 0）
+	if err == nil {
+		t.Fatal("DELETE 失败必须上抛")
+	}
+	if n != 4 {
+		t.Fatalf("CleanupAuditLogs()=%d, want 4（已删除批次必须计入）", n)
+	}
+	var remaining int
+	if err := auditDB.QueryRow(`SELECT COUNT(*) FROM audit_log`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 4 {
+		t.Fatalf("剩余行=%d, want 4（失败点及其后保留）", remaining)
 	}
 }
 

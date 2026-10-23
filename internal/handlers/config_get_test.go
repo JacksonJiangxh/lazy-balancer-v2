@@ -98,6 +98,37 @@ func TestGetConfig_noGovernedDefaultLiterals(t *testing.T) {
 	}
 }
 
+// 带外写入 0（重启回填前窗口）时读侧必须原样下发：面板值与渲染层
+// fail-visible 同源（resolveRuleOverrides 对 <=0 显性报错），不得展示一个
+// 「已生效」的默认 128——按面板值排查会得出与运行态相反的结论。
+func TestGetConfig_zeroRequestBodyMaxSizeIsVisible(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	if _, err := db.DB.Exec(`UPDATE global_config SET request_body_max_size_mb=0 WHERE id=1`); err != nil {
+		t.Fatalf("seed out-of-band zero: %v", err)
+	}
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/config", h.GetConfig)
+
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/config", nil))
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	var body struct {
+		Data struct {
+			RequestBodyMaxSizeMB int `json:"request_body_max_size_mb"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode config response: %v", err)
+	}
+	if body.Data.RequestBodyMaxSizeMB != 0 {
+		t.Fatalf("request_body_max_size_mb=%d, want 0（读侧不得隐藏带外无效值）", body.Data.RequestBodyMaxSizeMB)
+	}
+}
+
 // 行为钉：cert_expiry_days（fresh DDL 可空列）NULL 形态读路径回退
 // db.DefaultCertExpiryDays 常量，不 500 不零值。批 1+2 值型列（request_body/
 // http_*/caddy_log_size_mb）fresh DDL NOT NULL+启动回填报证 NULL 不可达，

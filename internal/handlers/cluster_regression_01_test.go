@@ -113,8 +113,10 @@ func TestGenerateClusterLoginTicket_offlineNodeReturns409(t *testing.T) {
 	if offline.Code != http.StatusConflict {
 		t.Fatalf("offline node status=%d body=%s, want 409", offline.Code, offline.Body.String())
 	}
-	if !strings.Contains(offline.Body.String(), "尚未上报") && !strings.Contains(offline.Body.String(), "离线") {
-		t.Fatalf("offline node body=%s, want actionable offline wording", offline.Body.String())
+	// 生产单一常量（ErrNodeOffline 文案），不接受近似措辞——双接受会让文案退化
+	// 依然全绿。
+	if !strings.Contains(offline.Body.String(), "节点尚未上报或已离线") {
+		t.Fatalf("offline node body=%s, want %s", offline.Body.String(), services.ErrNodeOffline.Error())
 	}
 
 	unapproved := httptest.NewRecorder()

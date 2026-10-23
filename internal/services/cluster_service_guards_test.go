@@ -39,7 +39,7 @@ func TestClusterService_RegisterNode_bumpsVersionAndPublishesNodeSite(t *testing
 	// When：新节点注册（目标形状）。
 	registration, err := service.RegisterNode(context.Background(), models.ClusterRegisterRequest{
 		Token: token, Name: "slave-a", IPAddress: "10.0.0.2", Port: 8000,
-	}, now)
+	}, "10.0.0.2", now)
 	if err != nil {
 		t.Fatalf("register node: %v", err)
 	}
@@ -74,7 +74,7 @@ func TestClusterService_RegisterNode_bumpsVersionAndPublishesNodeSite(t *testing
 	}
 	if _, err := service.RegisterNode(context.Background(), models.ClusterRegisterRequest{
 		Token: token2, Name: "slave-a2", IPAddress: "10.0.0.2", Port: 8000,
-	}, now.Add(time.Minute)); err != nil {
+	}, "10.0.0.2", now.Add(time.Minute)); err != nil {
 		t.Fatalf("re-register node: %v", err)
 	}
 	if err := database.QueryRow(`SELECT cluster_version FROM global_config WHERE id=1`).Scan(&version); err != nil {

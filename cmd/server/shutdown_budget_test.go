@@ -48,9 +48,12 @@ func composeStopGracePeriod(t *testing.T) time.Duration {
 }
 
 // Given 关停预算（fake clock）。
-// When 按真实顺序消耗各段（HTTP → Caddy 排水 → 引擎排空 → metrics/时区/
-// 日志轮转等待 → ACME 收尾）。
-// Then 各段钳制正确、总和 ≤ processShutdownBudget（且 < compose grace）。
+// When 按真实调用顺序消耗各段（HTTP → Caddy 排水 → 威胁大屏 warmer 等待 →
+// 引擎排空 → 引擎句柄清理 → metrics 清理等待 → metrics/时区/日志轮转等待 →
+// ACME 收尾）。
+// Then 各段钳制正确、总和 ≤ processShutdownBudget（且 < compose grace），
+// 且 ACME 段必须 > 0——三处不可预算的同步收尾（warmer/引擎句柄/metrics
+// 清理）只允许花未用完的预算，不得把收尾段预留挤成 0。
 func TestShutdownBudgetWorstCaseFitsComposeGrace(t *testing.T) {
 	composeGrace := composeStopGracePeriod(t)
 	if processShutdownBudget >= composeGrace {
@@ -63,8 +66,14 @@ func TestShutdownBudgetWorstCaseFitsComposeGrace(t *testing.T) {
 	now = now.Add(httpSeg)
 	caddySeg := b.segment(caddyDrainSegmentMax)
 	now = now.Add(caddySeg)
+	warmerSeg := b.segmentReserving(threatWarmerStopSegmentMax, trailingStopReserve)
+	now = now.Add(warmerSeg)
 	engineSeg := b.engineDrain()
 	now = now.Add(engineSeg)
+	engineHandleStopSeg := b.segmentReserving(engineHandleStopSegmentMax, trailingStopReserve)
+	now = now.Add(engineHandleStopSeg)
+	metricsCleanupSeg := b.segmentReserving(metricsCleanupSegmentMax, trailingStopReserve)
+	now = now.Add(metricsCleanupSeg)
 	metricsSeg := b.segment(metricsStopSegmentMax)
 	now = now.Add(metricsSeg)
 	tzSeg := b.segment(tzStopSegmentMax)
@@ -80,10 +89,20 @@ func TestShutdownBudgetWorstCaseFitsComposeGrace(t *testing.T) {
 	if caddySeg != caddyDrainSegmentMax {
 		t.Fatalf("Caddy 排水段=%s, want %s", caddySeg, caddyDrainSegmentMax)
 	}
-	trailingReserve := metricsStopSegmentMax + tzStopSegmentMax + logRotateStopSegmentMax + acmeStopSegmentMax
-	wantEngine := processShutdownBudget - httpShutdownSegmentMax - caddyDrainSegmentMax - trailingReserve
+	if warmerSeg != threatWarmerStopSegmentMax {
+		t.Fatalf("warmer 等待段=%s, want %s", warmerSeg, threatWarmerStopSegmentMax)
+	}
+	// 引擎排空在 warmer 用满后仍须为收尾段（含 metrics/时区/日志/ACME）预留。
+	wantEngine := processShutdownBudget - httpShutdownSegmentMax - caddyDrainSegmentMax - threatWarmerStopSegmentMax - trailingStopReserve
 	if engineSeg != wantEngine {
 		t.Fatalf("引擎排空=剩余−收尾段预留=%s, got %s", wantEngine, engineSeg)
+	}
+	// 最坏路径下引擎已吃满排空段：后两处不可预算等待只能拿到 0（不得侵占预留）。
+	if engineHandleStopSeg != 0 {
+		t.Fatalf("引擎句柄清理等待段=%s, want 0（不得侵占收尾段预留）", engineHandleStopSeg)
+	}
+	if metricsCleanupSeg != 0 {
+		t.Fatalf("metrics 清理等待段=%s, want 0（不得侵占收尾段预留）", metricsCleanupSeg)
 	}
 	if metricsSeg != metricsStopSegmentMax {
 		t.Fatalf("metrics 等待段=%s, want %s", metricsSeg, metricsStopSegmentMax)
@@ -95,9 +114,9 @@ func TestShutdownBudgetWorstCaseFitsComposeGrace(t *testing.T) {
 		t.Fatalf("日志轮转等待段=%s, want %s", logRotateSeg, logRotateStopSegmentMax)
 	}
 	if acmeSeg != acmeStopSegmentMax {
-		t.Fatalf("ACME 段=%s, want %s", acmeSeg, acmeStopSegmentMax)
+		t.Fatalf("ACME 段=%s, want %s（收尾段预留不得被前方等待挤成 0）", acmeSeg, acmeStopSegmentMax)
 	}
-	total := httpSeg + caddySeg + engineSeg + metricsSeg + tzSeg + logRotateSeg + acmeSeg
+	total := httpSeg + caddySeg + warmerSeg + engineSeg + engineHandleStopSeg + metricsCleanupSeg + metricsSeg + tzSeg + logRotateSeg + acmeSeg
 	if total > processShutdownBudget {
 		t.Fatalf("最坏路径总和 %s 超出总预算 %s", total, processShutdownBudget)
 	}
@@ -105,11 +124,30 @@ func TestShutdownBudgetWorstCaseFitsComposeGrace(t *testing.T) {
 		t.Fatalf("最坏路径总和 %s 不得达到 compose grace %s（须留退出余量）", total, composeGrace)
 	}
 
+	// 引擎排空提前结束（生产常态）：剩余预算充裕，两处固定等待可用满自身上限。
+	b = &shutdownBudget{now: func() time.Time { return now }}
+	now = now.Add(httpShutdownSegmentMax)
+	now = now.Add(caddyDrainSegmentMax)
+	now = now.Add(b.segmentReserving(threatWarmerStopSegmentMax, trailingStopReserve))
+	if got := b.segmentReserving(engineHandleStopSegmentMax, trailingStopReserve); got != engineHandleStopSegmentMax {
+		t.Fatalf("预算充裕时引擎句柄清理等待段=%s, want %s", got, engineHandleStopSegmentMax)
+	}
+	now = now.Add(engineHandleStopSegmentMax)
+	if got := b.segmentReserving(metricsCleanupSegmentMax, trailingStopReserve); got != metricsCleanupSegmentMax {
+		t.Fatalf("预算充裕时 metrics 清理等待段=%s, want %s", got, metricsCleanupSegmentMax)
+	}
+	now = now.Add(metricsCleanupSegmentMax)
+
 	// 预算耗尽：各段归零，引擎排空不得回落引擎默认 30s（0 会被引擎当作未指定）。
-	if got := b.segment(caddyDrainSegmentMax); got != 0 {
+	exhaustedNow := now.Add(processShutdownBudget)
+	exhausted := &shutdownBudget{now: func() time.Time { return exhaustedNow }, deadline: exhaustedNow.Add(-time.Second)}
+	if got := exhausted.segment(caddyDrainSegmentMax); got != 0 {
 		t.Fatalf("预算耗尽后段上限=%s, want 0", got)
 	}
-	if got := b.engineDrain(); got <= 0 || got > time.Millisecond {
+	if got := exhausted.segmentReserving(engineHandleStopSegmentMax, trailingStopReserve); got != 0 {
+		t.Fatalf("预算耗尽后不可预算等待段=%s, want 0（调用方须跳过等待）", got)
+	}
+	if got := exhausted.engineDrain(); got <= 0 || got > time.Millisecond {
 		t.Fatalf("预算耗尽后引擎排空=%s, want 极小正值（1ms 语义）", got)
 	}
 }

@@ -6,6 +6,8 @@ package services
 
 import (
 	"context"
+	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/taskengine"
 )
 
@@ -47,15 +50,19 @@ func TestWatchdogCheckOnce_cancelledCtxAbortsWithoutTouchingDriftState(t *testin
 }
 
 // 中段取消（检查已开始、簿记未落）：在途轮照样不得落写——用可阻塞的
-// admin 把取消精确落进比对窗口，钉住比对出口的第二复核点。
-// 披露：检查函数内部的漂移状态转移（updateConfigDrift）在出口复核之前完成，
-// 本用例保护的是「每轮簿记」（干净轮/跳过轮/心跳/任务日志）与「漂移确认」，
-// 不宣称回滚检查内部已写入的单轮状态。
+// admin 把取消精确落进比对窗口，钉住比对出口的第二复核点。前置 streak=1
+// 使断言具备证伪力：取消轮若把 checkConfigConsistency 内部的第二轮防抖转移
+// 留在进程里，状态会被确认为漂移（而该轮从未完成判定）。
 func TestWatchdogCheckOnce_cancelAfterCheckSkipsBookkeeping(t *testing.T) {
 	_, database := newClusterTestService(t)
 	seedGenerationRule(t, database, "lb_watchdog_midround_cancel", false)
 	resetConfigWatchdogForTest(t)
 	newTaskLogDir(t)
+	// 上一轮真实检查已观测一轮不一致（防抖窗口 streak=1），尚未确认漂移。
+	configDriftMu.Lock()
+	configDriftStreak = 1
+	configDriftStatus.CheckedAt = time.Now().UTC().Format("2006-01-02 15:04:05")
+	configDriftMu.Unlock()
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -97,13 +104,21 @@ func TestWatchdogCheckOnce_cancelAfterCheckSkipsBookkeeping(t *testing.T) {
 		t.Fatalf("中段取消轮不得确认漂移: %+v", drift)
 	}
 	configDriftMu.RLock()
-	clean, skipped, heartbeatSkipped := configDriftCleanRounds, configDriftSkipped, configDriftHeartbeatSkipped
+	clean, skipped, heartbeatSkipped, streak := configDriftCleanRounds, configDriftSkipped, configDriftHeartbeatSkipped, configDriftStreak
 	configDriftMu.RUnlock()
 	if clean != 0 || skipped != 0 || heartbeatSkipped != 0 {
 		t.Fatalf("中段取消轮不得累积簿记: clean=%d skipped=%d heartbeatSkipped=%d", clean, skipped, heartbeatSkipped)
 	}
+	// 取消轮必须把检查内部的 streak 转移回滚（1 → 2 会把防抖门推过，
+	// 等于用一轮从未完成的判定确认了漂移）。
+	if streak != 1 {
+		t.Fatalf("中段取消轮必须回滚 streak：得到 %d，want 1", streak)
+	}
 	if data, readErr := os.ReadFile(taskengine.TaskLogPath("config-watchdog")); readErr == nil && len(data) != 0 {
 		t.Fatalf("中段取消轮不得写任务日志: %q", string(data))
+	}
+	if data, readErr := os.ReadFile(taskengine.TaskLogPath("config-watchdog")); readErr == nil && strings.Contains(string(data), "配置漂移") {
+		t.Fatalf("中段取消轮不得输出漂移结论: %q", string(data))
 	}
 }
 
@@ -122,9 +137,100 @@ func TestWatchdogCheckOnce_liveCtxChecksNormally(t *testing.T) {
 	if drift := CurrentConfigDrift(); drift.Consistent {
 		t.Fatal("活 ctx 主节点轮应照常检查（两轮不一致置漂移态）")
 	}
-	if data, err := os.ReadFile(taskengine.TaskLogPath("config-watchdog")); err == nil && strings.Contains(string(data), "配置漂移") {
-		// 漂移行可见性不回退（第二轮起逐轮漂移行照旧）
-	} else if err != nil {
+	if data, err := os.ReadFile(taskengine.TaskLogPath("config-watchdog")); err != nil {
 		t.Fatalf("read task log: %v", err)
+	} else if !strings.Contains(string(data), "配置漂移") {
+		t.Fatalf("确认漂移轮必须输出漂移结论行: %q", string(data))
 	}
+}
+
+// 角色读取（RoleOf）查询窗口内的取消不是「角色读取失败」：降级/停机取消
+// 不得计入跳过轮、不得写任务日志、不得把角色状态机翻到 failed——与同文件
+// 「降级窗口零簿记」承诺一致。
+func TestWatchdogCheckOnce_roleReadCancelSkipsBookkeeping(t *testing.T) {
+	_, _ = newClusterTestService(t)
+	resetConfigWatchdogForTest(t)
+	newTaskLogDir(t)
+	previous := db.DB
+	started := make(chan struct{}, 1)
+	fake := sql.OpenDB(roleCancelConnector{started: started})
+	db.DB = fake
+	t.Cleanup(func() {
+		_ = fake.Close()
+		db.DB = previous
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- WatchdogCheckOnce(ctx) }()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("看门狗未抵达角色读取查询（假驱动未被调用）")
+	}
+	cancel()
+	var err error
+	select {
+	case err = <-errCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("角色读取取消后看门狗轮未返回")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("取消轮必须返回取消错误: %v", err)
+	}
+	configDriftMu.RLock()
+	skipped, heartbeatSkipped := configDriftSkipped, configDriftHeartbeatSkipped
+	configDriftMu.RUnlock()
+	if skipped != 0 || heartbeatSkipped != 0 {
+		t.Fatalf("角色读取取消不得计入跳过轮: skipped=%d heartbeatSkipped=%d", skipped, heartbeatSkipped)
+	}
+	if data, readErr := os.ReadFile(taskengine.TaskLogPath("config-watchdog")); readErr == nil && len(data) != 0 {
+		t.Fatalf("角色读取取消不得写任务日志: %q", string(data))
+	}
+}
+
+// roleCancelConnector 假驱动：查询阻塞到 ctx 取消后返回 ctx.Err()——把取消
+// 精确落进 RoleOf 的查询窗口。
+type roleCancelConnector struct {
+	started chan struct{}
+}
+
+func (c roleCancelConnector) Connect(context.Context) (driver.Conn, error) {
+	return &roleCancelConn{started: c.started}, nil
+}
+
+func (c roleCancelConnector) Driver() driver.Driver { return roleCancelDriver{started: c.started} }
+
+type roleCancelDriver struct {
+	started chan struct{}
+}
+
+func (d roleCancelDriver) Open(string) (driver.Conn, error) {
+	return &roleCancelConn{started: d.started}, nil
+}
+
+type roleCancelConn struct {
+	started chan struct{}
+}
+
+func (c *roleCancelConn) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("prepare unsupported")
+}
+
+func (c *roleCancelConn) Close() error { return nil }
+
+func (c *roleCancelConn) Begin() (driver.Tx, error) {
+	return nil, errors.New("transactions unsupported")
+}
+
+func (c *roleCancelConn) QueryContext(ctx context.Context, _ string, _ []driver.NamedValue) (driver.Rows, error) {
+	if c.started != nil {
+		select {
+		case c.started <- struct{}{}:
+		default:
+		}
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
 }

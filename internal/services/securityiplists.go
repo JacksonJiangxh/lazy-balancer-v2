@@ -460,11 +460,12 @@ func danglingIPListRefs(p *models.SecurityPolicy, listsByID map[int64][]string, 
 }
 
 // ResolvePolicyIPListRefsForSummary 供摘要/列表路径批量解析引用 IP 名单。
-// 摘要只需要「引用的名单是否有条目」这一判定（SecurityPolicyHasIPControl 与
-// 发射面同式），不需要合并集内容——列表端点按秒级轮询，全量装载最坏
+// 摘要只需要「引用的名单是否有生效条目」这一判定（SecurityPolicyHasIPControl
+// 与发射面同式），不需要合并集内容——列表端点按秒级轮询，全量装载最坏
 // 64 refs × 2000 条目/请求（每秒 MB 级 JSON 解析 + 主库读）纯属浪费。
-// 因此走 loadIPListRefPresenceVia：SQL 侧只回 id/条数，威胁库文件型名单仍
-// 读文件（失败判定必须与渲染一致）。
+// 因此走 loadIPListRefPresenceVia：只回引用名单的生效条目存在性（自定义名单
+// 解析 entries 后按未到期过滤，威胁库文件型名单仍读文件——失败判定与渲染
+// 一致）。
 // 语义与渲染路径对齐：装载失败（威胁库文件缺失/自定义 entries 畸形）→
 // IPRefMissing（摘要不得在策略会被跳过渲染时宣称已启用 IP 控制）；列表已
 // 删除 → 仅日志 warn（合并集退化 inline-only，与渲染同向）。
@@ -547,13 +548,14 @@ func ResolvePolicyIPListRefsForSummary(policies []*models.SecurityPolicy) {
 	}
 }
 
-// loadIPListRefPresenceVia 是摘要路径的轻量装载：只判定「引用名单是否有条目」
-// 与「装载是否失败」，不把 entries 内容搬进内存。
+// loadIPListRefPresenceVia 是摘要路径的轻量装载：只判定「引用名单是否有生效
+// 条目」与「装载是否失败」，不构造合并集。
 // 失败判定与 loadIPListEntriesVia 同语义：威胁库（system=1 且名字映射到威胁
 // 源）读 .iplist/.fast 文件，读取失败即失败；自定义名单 entries 畸形（非 JSON
 // 数组）即失败；查询/迭代失败按 chunk 全失败处理。
-// 条数口径：json_array_length（写侧 validateIPListShape 拒绝空值/非法条目，
-// 自动封禁名单只允许 deny 引用、不参与信任非空判定）。
+// 条数口径：与渲染生效面同源——解析 entries 后只数「值非空且未到期」的条目
+// （autobanEntryExpired 单一判据）。按原始条数判定会让「引用名单的条目全部
+// 到期」时摘要宣称 IP 控制生效，而渲染合并集为空（摘要与发射面不同判定）。
 func loadIPListRefPresenceVia(store caddyConfigStore, ids []int64) (map[int64]bool, map[int64]bool) {
 	presence := make(map[int64]bool, len(ids))
 	failed := make(map[int64]bool)
@@ -569,10 +571,7 @@ func loadIPListRefPresenceVia(store caddyConfigStore, ids []int64) (map[int64]bo
 		for i, id := range chunk {
 			args[i] = id
 		}
-		rows, err := store.Query(`SELECT id, COALESCE(system,0), COALESCE(name,''),
-			CASE WHEN json_valid(COALESCE(entries,'[]'))=0 THEN -1
-			     WHEN json_type(COALESCE(entries,'[]')) <> 'array' THEN -1
-			     ELSE json_array_length(COALESCE(entries,'[]')) END
+		rows, err := store.Query(`SELECT id, COALESCE(system,0), COALESCE(name,''), COALESCE(entries,'[]')
 			FROM security_ip_lists WHERE id IN (`+placeholders+`)`, args...)
 		if err != nil {
 			Logf("error", "摘要: security_ip_lists 存在性查询失败（本块 %d 个列表按装载失败处理）: %v", len(chunk), err)
@@ -583,9 +582,9 @@ func loadIPListRefPresenceVia(store caddyConfigStore, ids []int64) (map[int64]bo
 		}
 		for rows.Next() {
 			var id int64
-			var system, entryCount int
-			var name string
-			if err := rows.Scan(&id, &system, &name, &entryCount); err != nil {
+			var system int
+			var name, raw string
+			if err := rows.Scan(&id, &system, &name, &raw); err != nil {
 				Logf("warn", "摘要: security_ip_lists 行扫描失败（该行丢弃）: %v", err)
 				failed[id] = true
 				continue
@@ -600,12 +599,22 @@ func loadIPListRefPresenceVia(store caddyConfigStore, ids []int64) (map[int64]bo
 				presence[id] = len(vals) > 0
 				continue
 			}
-			if entryCount < 0 {
+			var list []models.IPListEntry
+			if err := json.Unmarshal([]byte(raw), &list); err != nil || (list == nil && strings.TrimSpace(raw) != "[]") {
 				Logf("error", "摘要: 自定义 IP 列表(id=%d) entries 畸形（引用策略按装载失败处理）", id)
 				failed[id] = true
 				continue
 			}
-			presence[id] = entryCount > 0
+			// 与渲染同源：值非空且未到期的条目才构成发射面。
+			now := autobanNow()
+			effective := 0
+			for _, e := range list {
+				if strings.TrimSpace(e.Value) == "" || autobanEntryExpired(e, now) {
+					continue
+				}
+				effective++
+			}
+			presence[id] = effective > 0
 		}
 		if err := rows.Err(); err != nil {
 			Logf("error", "摘要: security_ip_lists 迭代失败（本块 %d 个列表按装载失败处理）: %v", len(chunk), err)

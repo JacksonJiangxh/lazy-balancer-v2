@@ -45,16 +45,24 @@ func SetAutoBackupExecutor(fn func(ctx context.Context, trigger, operator string
 // 完全同形（零执行、零失败行、零日志）。状态转换口径（首报 warn + 恢复 info）
 // 与同族排程读取单源。
 func AutoBackupEnabled() bool {
+	enabled, known := AutoBackupEnabledState()
+	return known && enabled
+}
+
+// AutoBackupEnabledState 三态读取自动备份开关：known=false 表示不可判定
+// （库不可读/未初始化）。调度对齐只对 known=true 落动作——读失败保持上一次
+// 生效的调度态，等周期性重试收敛；tick 侧 EnabledFn 仍用二态 fail-closed。
+func AutoBackupEnabledState() (enabled, known bool) {
 	if db.DB == nil {
-		return false
+		return false, false
 	}
-	var enabled int
-	if err := db.DB.QueryRow(`SELECT COALESCE(auto_backup_enabled,0) FROM global_config WHERE id=1`).Scan(&enabled); err != nil {
+	var v int
+	if err := db.DB.QueryRow(`SELECT COALESCE(auto_backup_enabled,0) FROM global_config WHERE id=1`).Scan(&v); err != nil {
 		logScheduleReadFailure("schedule-read-auto-backup-enabled", err)
-		return false
+		return false, false
 	}
 	logScheduleReadRecovered("schedule-read-auto-backup-enabled")
-	return enabled == 1
+	return v == 1, true
 }
 
 // autoBackupConfigWriter 是 *sql.DB / *sql.Tx 的最小写面（开关写入单源）。
@@ -258,7 +266,16 @@ func nextAutoBackupSlot(now time.Time) (time.Time, bool) {
 	loc := CurrentLocation()
 	due, ok := autoBackupDueSlot(now.In(loc), row.freq, row.hhmm, row.day, loc)
 	if !ok {
+		// 参数非法（本版本不认识的频率，或非两位补零的时刻形态）此前直接零槽：
+		// 任务监控全绿、无失败行、无日志，自动备份永久停摆。按状态转换留痕一次，
+		// 恢复合法值后记恢复。
+		if lvl := logStateTransition("schedule-auto-backup-invalid", true); lvl != "" {
+			Logf(lvl, "自动备份排程参数非法（frequency=%q time=%q day=%d），自动备份不会执行；请改为 daily/weekly/monthly 与两位补零的 HH:MM", row.freq, row.hhmm, row.day)
+		}
 		return time.Time{}, false
+	}
+	if lvl := logStateTransition("schedule-auto-backup-invalid", false); lvl != "" {
+		Logf(lvl, "自动备份排程参数已恢复合法")
 	}
 	if !due.After(now.In(loc)) {
 		// 漏跑追补：最近过去的槽未被 last_run 覆盖 → 返回该槽（≤now——

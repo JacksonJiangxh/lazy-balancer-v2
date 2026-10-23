@@ -188,6 +188,9 @@ func (h *Handlers) callClusterServiceControl(ctx context.Context, baseURL, actio
 // （start/stop/restart Caddy、重启应用），全部路径记录从节点审计，
 // 票据正文不落任何日志。
 func (h *Handlers) ClusterServiceControl(c *gin.Context) {
+	if !h.requireClusterService(c) {
+		return
+	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, clusterServiceControlMaxBytes)
 	var req models.ClusterServiceControlRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -295,7 +298,8 @@ func recordClusterServiceControlAudit(c *gin.Context, action, result string) {
 }
 
 // recordClusterServiceControlAuditBy 带 operator 版——从节点审计记录主节点侧
-// 实际操作人(经票据保护的转发链传递);空串回退「主节点」(兼容旧主节点)。
+// 操作人。已知边界：operator 是持票方自述字段（不在票据签名载荷内），只影响
+// 审计归属文案、不改变可执行动作；空串回退「主节点」（兼容旧主节点）。
 func recordClusterServiceControlAuditBy(c *gin.Context, action, result, operator string) {
 	// action/operator 来自请求体，须先经 registerAuditField
 	// 清洗（去控制字符、截断 128B）再拼接，防伪造换行/超长注入审计详情。

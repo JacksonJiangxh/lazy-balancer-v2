@@ -43,7 +43,7 @@ func newLoginFailClosedTestRouter(t *testing.T) (*gin.Engine, func()) {
 	database := db.DB
 	cleanup := func() {
 		_ = db.Close()
-		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB)
 	}
 	if _, err := database.Exec("DROP TABLE users"); err != nil {
 		cleanup()

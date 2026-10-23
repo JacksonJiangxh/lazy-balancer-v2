@@ -918,6 +918,11 @@ func contextUserID(c *gin.Context) int64 {
 	return int64(id)
 }
 
+// ContextUserID 是 contextUserID 的跨包出口（middleware 的只读门自助判定与
+// 管理员/本人参数门共用同一解析），使 user_id 的类型归一在包内仍只有一份
+// 实现。缺失/未知类型返回 0——调用方一律按「非本人/无身份」处理。
+func ContextUserID(c *gin.Context) int64 { return contextUserID(c) }
+
 // 列表查询不加载 tls_cert/tls_key 正文，减少大字段 I/O。
 // 由完整投影派生两个空占位，列顺序与 lbRuleColumns 恒一致，scanLbRules 无需修改。
 // 列表投影派生断言：派生依赖「证书列字样必须命中」——字样改名/重排时 strings.Replace

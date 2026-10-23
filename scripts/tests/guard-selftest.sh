@@ -3,12 +3,14 @@
 #
 # 在临时 git 夹具仓里逐形态验证守卫的命中面与误报边界：
 #   • 命中面：未跟踪文件、受控文件、各扩展名（Go/TS/MD/SH/YML/SQL/go.mod/
-#     Dockerfile/docker-entrypoint.sh/.dockerignore/Caddyfile）、扩展名大小写、
+#     Dockerfile/docker-entrypoint.sh/.dockerignore/Caddyfile、JSON/HTML/conf 的
+#     字符串与文本节点）、扩展名大小写、
 #     含 NUL 字节的文本文件（报错而非整文件跳过）、下划线/小写/
-#     连写形态、审计产物文件名、.gitignore 双向校验、轮次引用的各书写形态
-#     （裸轮次＋审计动作、斜杠并列、中文数字归属、注释头截断残骸、跨行拆字含
-#     续行注释前缀）；
-#   • 误报面：百分位、版本串、十六进制摘要/哈希算法名、协议与产品 token、
+#     连写形态、审计产物文件名、.gitignore 双向校验（含重复模式行）、轮次引用的
+#     各书写形态（裸轮次＋审计动作、斜杠并列、中文数字归属、注释头截断残骸、
+#     跨行拆字含续行注释前缀）；
+#   • 误报面：npm 生成物（package-lock.json 内容面豁免）、百分位、版本串、
+#     十六进制摘要/哈希算法名、协议与产品 token、
 #     容量边界常量、合法测试函数名、中文“轮播/轮询”、循环轮次表述（心跳/共识/
 #     降频/区间/并列打点）、IPv6-only 等网络口径、日志轮转文件名骨架、
 #     Windows-1252/Chrome-120 等产品词。
@@ -313,6 +315,49 @@ printf '正常首行\n\x00\n版本号硬编码点之一（FE-8）\n' >"$tmp_root
 git -C "$tmp_root" add -f docs/payload.md
 assert_bad "NUL-containing text file is not skipped" "NUL"
 
+# 13d) JSON/HTML/conf 内容面：夹具字符串与模板文案里的审计编号必须命中
+# （JSON 字符串值没有注释前缀——内容面按全文扫描，否则这里会假绿）。
+reset_fixture
+mkdir_in web/src/fixtures/cases.json
+cat >"$tmp_root/web/src/fixtures/cases.json" <<'EOF'
+{
+  "note": "第 83 轮修复：夹具口径"
+}
+EOF
+assert_bad "json fixture string scanned" "cases.json"
+
+reset_fixture
+mkdir_in web/src/components/notice.html
+cat >"$tmp_root/web/src/components/notice.html" <<'EOF'
+<!-- 组件说明 -->
+<p>第 83 轮修复说明</p>
+EOF
+assert_bad "html text node scanned" "notice.html"
+
+reset_fixture
+mkdir_in deploy/site.conf
+cat >"$tmp_root/deploy/site.conf" <<'EOF'
+# 第 83 轮修复：监听口径
+listen 443 ssl;
+EOF
+assert_bad "conf comment scanned" "deploy/site.conf"
+
+# 13e) npm 生成物豁免：package-lock.json 的 integrity 是混合大小写 base64，
+# 全量入面会产生噪声且人工审计标注不会写进生成物——内容面显式豁免该单一路径。
+reset_fixture
+mkdir_in web/package-lock.json
+cat >"$tmp_root/web/package-lock.json" <<'EOF'
+{
+  "name": "lazy-balancer-web",
+  "packages": {
+    "node_modules/example": {
+      "integrity": "sha512-AbCdEf0123GhIjKlMnOpQrStUvWxYz+/0123456789ABCDEF=="
+    }
+  }
+}
+EOF
+assert_good "package-lock.json content exempt"
+
 # 14) .gitignore 双向校验：少一行 / 多一行都失败
 reset_fixture
 grep -v '^\*\*/r\[0-9\]\*_test\.go$' "$tmp_root/.gitignore" >"$tmp_root/.gitignore.tmp"
@@ -323,6 +368,13 @@ reset_fixture
 sed -i.bak 's|^\*\*/audit\[0-9\]\*_test\.go$|**/audit[0-9]*_test.go\n**/legacy[0-9]*_test.go|' "$tmp_root/.gitignore"
 rm -f "$tmp_root/.gitignore.bak"
 assert_bad "gitignore extra pattern" "模式表不一致"
+
+# 14b) 重复同一模式行必须失败：比较口径不得先去重（sort -u 会把重复行折叠，
+# 两侧相等后「逐行一致」契约失效）。
+reset_fixture
+sed -i.bak 's|^\*\*/audit\[0-9\]\*_test\.go$|**/audit[0-9]*_test.go\n**/audit[0-9]*_test.go|' "$tmp_root/.gitignore"
+rm -f "$tmp_root/.gitignore.bak"
+assert_bad "gitignore duplicate pattern" "重复模式行"
 
 # ===========================================================================
 # 误报对照
@@ -365,6 +417,18 @@ package x
 func noop() {}
 EOF
 assert_good "protocol and product tokens"
+
+# 4b) 时间格式骨架（日志文件名/时间戳布局注释）不误判
+reset_fixture
+mkdir_in internal/services/rotation.go
+cat >"$tmp_root/internal/services/rotation.go" <<'EOF'
+package services
+
+// 轮转副本尾部形态 `-<yyyyMMdd>T<HH-mm-ss>.<毫秒>-size.log`；
+// 展示口径 HH:mm:ss，导出文件名 yyyyMMdd-HHmmss（时间格式骨架，非编号）。
+func noop() {}
+EOF
+assert_good "time format skeleton"
 
 # 5) 合法测试函数名（不含编号形态）
 reset_fixture

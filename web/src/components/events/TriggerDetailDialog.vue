@@ -152,7 +152,7 @@ import { ArrowRight } from '@element-plus/icons-vue'
 import SyntaxHighlight from '@/components/SyntaxHighlight.vue'
 import { request } from '@/utils/api'
 import { formatDate } from '@/utils/date'
-import { parseIPList, parseRefIds, createIpMatcher, triggerStageFamily, sharedEntriesCache, subscribeSharedEntriesCache, ensureSharedEntries, formatDurationUs, eventDetailRefIds, detectionModeExplains, isTrustExemptionCandidate, trustHitMode } from '@/utils/securityStages'
+import { parseIPList, parseRefIds, createIpMatcher, triggerStageFamily, sharedEntriesCache, subscribeSharedEntriesCache, ensureSharedEntries, formatDurationUs, eventDetailRefIds, detectionModeExplains, isTrustExemptionCandidate, trustHitMode, isWafDurationFamily, extractCrsRuleSnippet } from '@/utils/securityStages'
 import { issueCrsIndexSession, useCrsRuleIndex } from '@/composables/useCrsRuleIndex'
 import { useCountryNamesCn, countryLabel } from '@/composables/useCountryNamesCn'
 import type { APIResponse } from '@/types'
@@ -209,8 +209,9 @@ const kind = computed<Kind>(() => {
 
 // （2026-10-03）：加和式仅 WAF 族——预检族（IP ACL/信任/
 // GeoIP/威胁）duration_us≡precheck_us 同值（securityevents.go:202），加和
-// 会翻倍并误标 WAF 段。
-const isWafFamily = computed(() => ['waf-crs', 'waf-custom', 'body'].includes(kind.value))
+// 会翻倍并误标 WAF 段。族谓词单源 securityStages.isWafDurationFamily
+//（与事件列表请求上下文弹框同一实现）。
+const isWafFamily = computed(() => isWafDurationFamily(triggerStageFamily(props.row?.rule_triggered ?? '')))
 
 const categoryLabel = computed(() => {
   switch (kind.value) {
@@ -658,14 +659,6 @@ const crsSnippetFetched = ref(false)
 const crsSnippetError = ref(false)
 // 弹框会话序号：关闭/重开丢弃在途的索引与源码返回
 
-const extractRuleSnippet = (content: string, ruleId: string): string => {
-  const needles = [`id:${ruleId}`, `id: ${ruleId}`, `id:'${ruleId}'`, `id:"${ruleId}"`]
-  const lines = content.split('\n')
-  const idx = lines.findIndex((line) => needles.some((n) => line.includes(n)))
-  if (idx === -1) return ''
-  return lines.slice(Math.max(0, idx - 10), Math.min(lines.length, idx + 11)).join('\n')
-}
-
 const toggleCrsSnippet = async (): Promise<void> => {
   crsSnippetExpanded.value = !crsSnippetExpanded.value
   const ev = props.row
@@ -678,7 +671,7 @@ const toggleCrsSnippet = async (): Promise<void> => {
   try {
     const res = await request.get<APIResponse<{ content: string }>>(`/security/crs/rules/${encodeURIComponent(entry.file)}`)
     if (seq !== crsDialogSeq) return
-    crsSnippet.value = extractRuleSnippet(res.data?.content || '', ev.rule_triggered)
+    crsSnippet.value = extractCrsRuleSnippet(res.data?.content || '', ev.rule_triggered)
   } catch {
     if (seq !== crsDialogSeq) return
     crsSnippet.value = ''

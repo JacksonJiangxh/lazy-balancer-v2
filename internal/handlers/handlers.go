@@ -242,16 +242,50 @@ func (h *Handlers) caddyApplyNoteLocked() string {
 	return ""
 }
 
+// txApplyNote 事务内应用的收尾句柄（重载发生在 Commit 之前，审计只能等
+// Commit 成功后才落盘）。两段式：
+//   - auditReload()：只落「重载」审计（幂等）。提交后的失败分支也必须调用
+//     ——真实 /load 已经发生，「触发重载必须留痕」不因随后失败而豁免。
+//   - finalize()：成功收尾（LKG 补写 → 清横幅 → 重载审计 → 计时）。
+//     失败分支**不得**调用：它会清掉失败横幅并（在补偿回滚场景下）把候选
+//     字节写进 LKG，制造假恢复信号。
+type txApplyNote struct {
+	audited bool
+	audit   func()
+	finish  func()
+}
+
+// auditReload 落一次「重载」审计（重复调用无副作用）。nil 句柄（应用失败）
+// 安全跳过。
+func (n *txApplyNote) auditReload() {
+	if n == nil || n.audited || n.audit == nil {
+		return
+	}
+	n.audited = true
+	n.audit()
+}
+
+// finalize 成功收尾。顺序与拆分前一致（LKG → 清横幅 → 审计 → 计时）。
+func (n *txApplyNote) finalize() {
+	if n == nil {
+		return
+	}
+	if n.finish != nil {
+		n.finish()
+	}
+	n.auditReload()
+}
+
 // applyFromTxNote 是事务内应用通道的统一入口（ApplyConfigFromTx，
 // 应用失败即回滚，DB 与运行配置不分叉）。重载发生在 Commit 之前，而提交
 // 失败会回滚并恢复运行配置快照——审计必须等 Commit 成功后才落盘，否则会
 // 留下从未真正生效的「重载」行。因此这里把「应用」与「审计登记」绑定在
-// 同一次调用里，返回提交成功后必须调用的 note：漏调即 unused variable
-// 编译错误，69d809b4 式的静默删行在此形态下不再可能。归因明细由调用点
-// 提供（txReloadDetail 或固定文案）。
+// 同一次调用里，返回提交成功后必须调用 finalize 的句柄：漏调后变量未使用
+// 即 compile error，69d809b4 式的静默删行在此形态下不再可能。归因明细由
+// 调用点提供（txReloadDetail 或固定文案）。
 // rulesWrittenInTx：事务是否写过 lb_rules（ACME 谓词 miss 补查门控——
 // 规则写路径 true；UpdateConfig/名单/策略等不触碰 lb_rules 的路径 false）。
-func (h *Handlers) applyFromTxNote(c *gin.Context, tx *sql.Tx, reloadDetail string, rulesWrittenInTx bool) (func(), error) {
+func (h *Handlers) applyFromTxNote(c *gin.Context, tx *sql.Tx, reloadDetail string, rulesWrittenInTx bool) (*txApplyNote, error) {
 	// 裁定 ④'：Caddy CLI 层预检（真 validate-only，零运行时副作用）——校验
 	// 输入即事务视图的最终渲染。校验器不可用时放行（记日志），事务内应用
 	// 仍是最终门控。
@@ -271,7 +305,7 @@ func (h *Handlers) applyFromTxNote(c *gin.Context, tx *sql.Tx, reloadDetail stri
 		// 审计真实性裁定（2026-09-25 用户裁定）：同字节短路=未发生真实重载——
 		// 按成功收尾但 note 不落「重载」审计（否则出现从未发生的重载记录）。
 		if services.IsSameConfig(err) {
-			return func() { h.recordCaddyApplyResult(nil) }, nil
+			return &txApplyNote{finish: func() { h.recordCaddyApplyResult(nil) }}, nil
 		}
 		// 乱填保障（2026-09-06 补充裁定）：应用失败且配置未经任何 Caddy 级
 		// 校验（CLI 不可用 + 传输失败同时发生）——无法排除坏配置，标记为
@@ -281,18 +315,22 @@ func (h *Handlers) applyFromTxNote(c *gin.Context, tx *sql.Tx, reloadDetail stri
 		}
 		return nil, err
 	}
-	return func() {
-		// commit 成功后才写 last-known-good（事务内 apply 有意不落盘）：
-		// 本闭包在全部调用点都只在 tx.Commit() 成功返回后执行——LKG 的语义
-		// 因此恒为「已提交且已下发」的配置，进程中断窗口不再把从未提交的
-		// 候选固化成启动兜底。
-		h.caddyService.PersistLastGoodBytesInLock(appliedConfig)
-		// 2026-09-07：成功重载后清除既往失败标记（对齐 finishTxApply
-		// 成功分支与 UpdateConfig/PutCaddyConfig 的口径——规则×5 不清
-		// 陈旧 caddy_apply_error 会导致横幅长亮）。
-		h.recordCaddyApplyResult(nil)
-		recordAudit(c, "重载", "Caddy服务", reloadDetail)
-		services.Logf("info", "保存链计时: apply_total=%dms（含渲染+Caddy 重载）", time.Since(applyStart).Milliseconds())
+	return &txApplyNote{
+		audit: func() {
+			recordAudit(c, "重载", "Caddy服务", reloadDetail)
+		},
+		finish: func() {
+			// commit 成功后才写 last-known-good（事务内 apply 有意不落盘）：
+			// 本闭包在全部调用点都只在 tx.Commit() 成功返回后执行——LKG 的语义
+			// 因此恒为「已提交且已下发」的配置，进程中断窗口不再把从未提交的
+			// 候选固化成启动兜底。
+			h.caddyService.PersistLastGoodBytesInLock(appliedConfig)
+			// 2026-09-07：成功重载后清除既往失败标记（对齐 finishTxApply
+			// 成功分支与 UpdateConfig/PutCaddyConfig 的口径——规则×5 不清
+			// 陈旧 caddy_apply_error 会导致横幅长亮）。
+			h.recordCaddyApplyResult(nil)
+			services.Logf("info", "保存链计时: apply_total=%dms（含渲染+Caddy 重载）", time.Since(applyStart).Milliseconds())
+		},
 	}, nil
 }
 
@@ -351,6 +389,9 @@ func (h *Handlers) finishTxApply(c *gin.Context, tx *sql.Tx, f txApplyFinish) {
 			// commit 失败必须把运行配置/LKG/投影/证书统一回退到已提交视图。
 			restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
 			joined := errors.Join(err, restoreErr)
+			// 真实 /load 已发生（重载审计）+ 恢复失败时的分叉横幅。
+			reloadNote.auditReload()
+			h.recordPostCommitRestoreFailure(err, restoreErr)
 			recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail(commitUncertainLabel, joined.Error(), services.AuditResultPart("failure")))
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + ": " + joined.Error()})
 			return
@@ -359,7 +400,7 @@ func (h *Handlers) finishTxApply(c *gin.Context, tx *sql.Tx, f txApplyFinish) {
 		// 重载审计与失败横幅清除的唯一收口（此前上方已先清一次、
 		// 此处 reloadNote 内又清一次 = 同请求重复 UPDATE global_config；
 		// 同字节短路形态也由 note 覆盖）。
-		reloadNote()
+		reloadNote.finalize()
 		c.JSON(status, models.APIResponse{Code: 0, Message: f.SuccessMsg, Data: f.Data})
 		return
 	}
@@ -400,6 +441,10 @@ func (h *Handlers) finishTxApply(c *gin.Context, tx *sql.Tx, f txApplyFinish) {
 		// 传输失败前 /load 已生效）留下运行配置分叉——与成功分支同一收口。
 		restoreErr := h.recoverCommittedViewAfterCommitFailure(tx)
 		joined := errors.Join(err, restoreErr)
+		// apply 失败（applyErr != nil）时 reloadNote 为 nil——auditReload 安全
+		// 跳过；恢复失败仍须落横幅（提交结果不确定 + 运行态可能滞留候选）。
+		reloadNote.auditReload()
+		h.recordPostCommitRestoreFailure(err, restoreErr)
 		recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail(commitUncertainLabel, joined.Error(), services.AuditResultPart("failure")))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + ": " + joined.Error()})
 		return
@@ -1065,6 +1110,23 @@ func (h *Handlers) caddyRestartWatcherOnce(triggerFile string, processStart time
 	_ = os.Remove(triggerFile)
 }
 
+// startupUsersLookupFailedLabel 是「启动守卫的用户计数查询失败」留痕前缀
+// （测试按此断言；守卫本轮失明属可查事实，不得静默）。
+const startupUsersLookupFailedLabel = "启动守卫：用户计数查询失败（本次无法判定实例是否已初始化）"
+
+// countStartupUsers 读取用户数，作为「实例是否已初始化」的证据。查询失败时
+// 留痕 warn 并返回 ok=false——调用方按「无正向证据」保持原有放行取舍（与
+// 「外来路由探测失败即放行」同口径，启动可用性不回退），但守卫失明必须可查：
+// 此前失败与 userCount>0 合并在同一 case，守卫静默失效零留痕。
+func countStartupUsers(database *sql.DB) (int, bool) {
+	var userCount int
+	if err := database.QueryRow("SELECT COUNT(*) FROM users").Scan(&userCount); err != nil {
+		services.Logf("warn", "问题: %s: %v", startupUsersLookupFailedLabel, err)
+		return 0, false
+	}
+	return userCount, true
+}
+
 // ApplyConfigOnStartup 系统配置载入（startup:config-load Run 体唯一执行通道：
 // BootSync 启动传空 operator、手动重载经 wire 传操作者）。
 // operator 非空=手动触发，载入审计归因操作者；空=system。
@@ -1149,9 +1211,11 @@ func (h *Handlers) ApplyConfigOnStartup(operator string) error {
 	// 探测失败（admin 不可达等）按无正向证据放行。已初始化实例（≥1 用户）
 	// 的 0 规则状态视为管理意图（规则删除时即已即时应用收敛），不在此守卫
 	// 范围——否则「删光规则后重启」永远无法收敛到空配置（评审截获的陷阱）。
+	// 用户计数查询失败（库损坏/未建表/锁）时 countStartupUsers 留痕 warn 并
+	// 按「无法判定」放行——守卫本轮失明，但不因此阻断启动可用性。
 	if count == 0 {
-		var userCount int
-		if err := db.DB.QueryRow("SELECT COUNT(*) FROM users").Scan(&userCount); err == nil && userCount == 0 {
+		userCount, usersKnown := countStartupUsers(db.DB)
+		if usersKnown && userCount == 0 {
 			if hasRoutes, probeErr := services.RunningConfigHasRuleRoutes(h.cfg.CaddyAdminURL); probeErr == nil && hasRoutes {
 				wrapped := "启动守卫：未初始化实例（无用户、无启用规则），但 Caddy 运行配置仍含规则路由——跳过本次启动应用（疑似数据目录或 Caddy Admin 地址误配），运行配置保持原样；漂移状态由看门狗持续上报"
 				services.Logf("error", "问题: %s", wrapped)
@@ -1165,6 +1229,18 @@ func (h *Handlers) ApplyConfigOnStartup(operator string) error {
 		}
 	}
 	services.Logf("info", "Applying Caddy config on startup (enabled rules: %d)", count)
+	// 崩溃窗口收敛点：IP 名单投影（tp.txt / u-* / p*）是渲染的磁盘副作用，
+	// 写路径在事务提交前落盘——进程在「投影已写、事务未提交」之间被杀会留下
+	// 未提交内容。本次启动渲染以已提交库值为唯一真相源，逐 scope 重写在役
+	// 投影（内容不一致→原子换内容），因此渲染成功即在役投影=已提交视图，
+	// 无需额外回滚动作。
+	// 窗口上界与跳过形态：①渲染成功前，监督器回放的 last-known-good 配置可能
+	// 仍引用崩溃窗口写入的投影（上界=「回放→标记→应用」之间的秒级时长，应用
+	// 完成即收敛）；②已提交视图渲染失败（库数据损坏）时没有可收敛目标——按
+	// 下方裁定回退 last-known-good，投影部分维持原状（需「崩溃窗口+数据损坏」
+	// 双故障才可达）；③未初始化实例的启动守卫跳过整轮应用，该形态不可能产生
+	// 本实例的名单写入（写名单需认证用户），无待收敛窗口。已提交视图不再引用
+	// 的孤儿投影（策略解绑/规则删除后的旧 scope）不被重写，由 24h GC 回收。
 	if err := h.applyCaddyConfigE(); err != nil {
 		// 2026-09-06 裁定 ③：DB 渲染被拒时回退最后已知正确配置——负载均衡
 		// 可用性优先。caddy_apply_error 标记已由 applyCaddyConfigE 落下，
@@ -1338,5 +1414,28 @@ func validateSingleDnsAddress(server string) error {
 	if !strings.Contains(host, ".") || !isValidHost(host) {
 		return fmt.Errorf("DNS 服务器地址须为 IP 或完整域名: %s", server)
 	}
+	// 全数字点分但 netip 解析失败（999.1.1.1、1.2.3.256、1.2.3.4.5）：上面
+	// 的标签字母表校验会放行，落库后渲染进 resolver.addresses——Caddy 接受
+	// 地址但不做可达性校验，动态上游解析静默失败（规则 502），保存时零提示。
+	// 只拒绝「每个标签都纯数字」的形态，dns1.example.com 这类含数字域名不受影响。
+	if allNumericLabels(host) {
+		return fmt.Errorf("DNS 服务器地址须为 IP 或完整域名: %s", server)
+	}
 	return nil
+}
+
+// allNumericLabels 报告点分串的每个标签是否都只由数字组成（999.1.1.1 形态）。
+// 用于把「看似 IPv4 的非法地址」挡在含义更宽的主机名校验之外。
+func allNumericLabels(host string) bool {
+	for _, label := range strings.Split(host, ".") {
+		if label == "" {
+			return false
+		}
+		for _, c := range label {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+	}
+	return true
 }

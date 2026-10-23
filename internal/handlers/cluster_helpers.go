@@ -32,12 +32,20 @@ func requireMasterResult(c *gin.Context, isMaster bool, err error, options maste
 	return true
 }
 
-func (h *Handlers) requireMaster(c *gin.Context) bool {
-	// 装配缺失 fail-closed：同族端点（Pull/ForgetPins/mode/sync）对未初始化的
-	// 集群服务统一 503；此处单点守卫覆盖全部 requireMaster 调用方，避免 nil
-	// 解引用走 Gin recovery 变成空体 500（无法与真实内部故障区分）。
+// requireClusterService 是装配缺失的单点守卫：未注入 ClusterService 时统一
+// 503「集群服务未初始化」，避免 nil 解引用走 Gin recovery 变成空体 500
+// （无法区分未装配与真实内部故障）。requireMaster 与不经角色门的端点
+// （角色变更面/机器面/只读状态）共用本函数。
+func (h *Handlers) requireClusterService(c *gin.Context) bool {
 	if h.clusterService == nil {
 		clusterError(c, http.StatusServiceUnavailable, "集群服务未初始化", nil)
+		return false
+	}
+	return true
+}
+
+func (h *Handlers) requireMaster(c *gin.Context) bool {
+	if !h.requireClusterService(c) {
 		return false
 	}
 	isMaster, err := h.clusterService.IsMaster(c.Request.Context())

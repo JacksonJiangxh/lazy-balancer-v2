@@ -1,7 +1,6 @@
 package services
 
 import (
-	"strings"
 	"testing"
 	"time"
 )
@@ -33,11 +32,16 @@ func TestGetRuleCertInfo_prefersExactDomainMatchOnExpiryTie(t *testing.T) {
 		t.Fatalf("GetRuleCertInfo: %v", err)
 	}
 
-	// Then: 同过期时精确域名匹配优先（updated_at 更新不得压过精确匹配）
+	// Then: 同过期时精确域名匹配优先（updated_at 更新不得压过精确匹配）。
+	// 必须同时断言解析成功：仅凭「不含 api.tie」在候选选择整体失效、回退到
+	// missing 文案（Domains=规则域名、Status=unknown）时同样成立。
 	if info == nil {
 		t.Fatal("info is nil")
 	}
-	if strings.Contains(info.Domains, "api.tie.example.test") {
-		t.Fatalf("domains=%q, want 精确匹配任务的证书（不含 api.tie.example.test）", info.Domains)
+	if info.Status != "valid" {
+		t.Fatalf("status=%q, want valid（选择失败会回退 missing 形态 status=unknown）", info.Status)
+	}
+	if info.Domains != "tie.example.test" {
+		t.Fatalf("domains=%q, want 精确匹配任务的证书域名（api.tie.example.test 为超集候选）", info.Domains)
 	}
 }

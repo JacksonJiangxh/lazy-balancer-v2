@@ -137,13 +137,13 @@ func (h *Handlers) GetAutobanStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: resp})
 }
 
-// autobanPresetListState 是一次请求内预置名单的单一读取结果：id 缺失/查询
-// 故障（err 非空）与条目快照一并传入两个黄条判据，避免同一状态端点三次
-// 查同一行。err/id 丢失时两判据均 fail-closed=true。
+// autobanPresetListState 是一次请求内预置名单的单一读取结果：id 与条目快照
+// 一并传入两个黄条判据，避免同一状态端点三次查同一行。读取故障在
+// GetAutobanStatus 已 500 返回（见上方 AutobanListEntries 错误分支），故本结构
+// 不携带 err；id<=0 仅为构造不变量的 fail-closed 兜底（两判据均按 true）。
 type autobanPresetListState struct {
 	id      int64
 	entries []models.IPListEntry
-	err     error
 }
 
 // autobanListReferenced 启用中的策略是否引用预置名单（黄条判据）。引用面判定
@@ -154,7 +154,7 @@ type autobanPresetListState struct {
 // 写路径」）。查询失败 fail-closed（按已引用处理——不弹黄条，避免误报「未
 // 生效」），与单源内部口径一致。
 func (h *Handlers) autobanListReferenced(preset autobanPresetListState) bool {
-	if preset.err != nil || preset.id <= 0 {
+	if preset.id <= 0 {
 		return true
 	}
 	return services.IPListsReferencedByEnabledPolicy([]int{int(preset.id)})
@@ -173,7 +173,7 @@ func (h *Handlers) autobanListReferenced(preset autobanPresetListState) bool {
 // 证书就绪后自动重载，黄条在窗口内可能短暂假阴性。
 // 查询失败 fail-closed（返回 true，不弹误导性黄条——与 list_referenced 同口径）。
 func (h *Handlers) autobanBanEffective(preset autobanPresetListState) bool {
-	if preset.err != nil || preset.id <= 0 {
+	if preset.id <= 0 {
 		return true
 	}
 	entries := preset.entries

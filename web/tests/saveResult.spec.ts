@@ -5,13 +5,15 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { calls, resetCalls } from './_stubs.ts'
+import { STUB_SAVE_RESULT_DEPS, calls, resetCalls } from './_stubs.ts'
 import { registerModuleHooks } from './_helpers.ts'
 
-const stubUrl = new URL('./_stubs.ts', import.meta.url).href
+// 替身把调用写进宿主提供的记录面（与断言共享同一数组）。
+const host = globalThis as unknown as { __calls: unknown[] }
+host.__calls = calls
 // 静态 import 会先于钩子注册执行，故被测模块只能动态 import（钩子必须先装）。
 // `@/utils/bulkApplyResult` 走真实实现——退化标记必须与真实常量同源。
-registerModuleHooks({ 'element-plus': stubUrl, '@/utils/api': stubUrl })
+registerModuleHooks({ 'element-plus': STUB_SAVE_RESULT_DEPS, '@/utils/api': STUB_SAVE_RESULT_DEPS })
 const { showSaveResult } = await import('../src/utils/saveResult.ts')
 const { CADDY_APPLY_FAILED_MARKER } = await import('../src/utils/bulkApplyResult.ts')
 

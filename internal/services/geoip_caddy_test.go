@@ -347,10 +347,14 @@ func TestGenerateSingleRuleCaddyConfig_geoip_previewIncludesPassRoute(t *testing
 }
 
 // TestGenerateCaddyConfig_geoip_blockPageServesConfiguredStatus：拦截页归因后，
-// geoip 策略分得合成中断码 483（阶段码 481/482 固定后平移）——策略引擎段 deny
-// 中断经 483 归因路由按 block_status_code 渲染本策略拦截页；403 兜底路由
-// （host 限定）继续承接无法归因的中断（预检 GeoIP/IP ACL 合并段与无页策略），
-// 同页同码。
+// geoip 策略分得合成中断码 483（阶段码 481/482 固定后按策略平移）——本用例
+// 断言的 483 归因路由在 geoip-only（mode=off、无自定义规则/ACL/黑名单）形态
+// 下**不可达**：策略引擎段不发射（BuildCorazaDirectives 返回空串），阶段 1
+// 预检只产出 481。用户可见行为由 403 兜底路由承接（同页同码）；483 路由的
+// 真实可达性由 security_block_status_test.go 的
+// TestEngineTransaction_customOnlyBlockRuleLiftsInterruptionTo483 覆盖。
+// 403 兜底路由（host 限定）继续承接无法归因的中断（预检 GeoIP/IP ACL 合并段
+// 与无页策略），同页同码。
 func TestGenerateCaddyConfig_geoip_blockPageServesConfiguredStatus(t *testing.T) {
 	useTemporaryCertDir(t)
 	_, database := newClusterTestService(t)
@@ -385,7 +389,8 @@ func TestGenerateCaddyConfig_geoip_blockPageServesConfiguredStatus(t *testing.T)
 	fallbackHandler := firstHandler(t, fallback)
 	assertEqual(t, fallbackHandler["status_code"], 451)
 	assertEqual(t, fallbackHandler["body"], "<html>geoip-block</html>")
-	// 归因：483 子句、无 host 键，策略段 deny（已抬码 483）实际命中此路由
+	// 归因：483 子句、无 host 键——路由形状在此形态下不可达（无引擎段抬码，
+	// 见上方用例注释），此处只钉路由存在性与渲染内容。
 	if _, hasHost := routeMatcher(t, attribution)["host"]; hasHost {
 		t.Fatalf("attribution route must not carry host matcher: %#v", routeMatcher(t, attribution))
 	}

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -28,19 +29,32 @@ func TestRegionTreeFromXDB_ptrOverflowTerminates(t *testing.T) {
 	if err := f.Truncate(0x100000010); err != nil {
 		t.Fatal(err)
 	}
+	// 稀疏支持探测：不支持稀疏分配的文件系统会把 Truncate 落成真实 4GiB
+	// 占用（慢机/CI 卷可能被吃满）。已分配块超过阈值即跳过而非硬跑。
+	if fi, statErr := f.Stat(); statErr == nil {
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok && st.Blocks*512 > 64<<20 {
+			_ = f.Close()
+			t.Skipf("文件系统未对 Truncate 稀疏分配（已占用 %d bytes），跳过 4GiB 假 xdb 用例", st.Blocks*512)
+		}
+	}
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
 
 	// When：扫描（旧 uint32 实现在 ptr += 14 回绕后永不返回）
-	done := make(chan struct{})
+	type result struct{ tree *IP2RegionRegionTree }
+	done := make(chan result, 1)
 	go func() {
-		regionTreeFromXDB(path)
-		close(done)
+		done <- result{tree: regionTreeFromXDB(path)}
 	}()
 	select {
-	case <-done:
-		// Then：终止即契约（钳制后仅 3 次迭代即越界停止）
+	case got := <-done:
+		// Then：钳制后段区终点收敛到文件实际末尾，header 声明的 4GB 高位
+		// 段区不含可解析段 → 无任何省份（nil），而非把 header/向量零字节
+		// 当段解析出幽灵省份。
+		if got.tree != nil {
+			t.Fatalf("钳制后不应解析出地域树, got %+v", got.tree)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("regionTreeFromXDB 未在 5s 内返回——uint32 ptr 回绕致扫描不终止")
 	}

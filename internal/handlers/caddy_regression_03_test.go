@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -16,7 +17,8 @@ func TestValidateV2Backup_v2StrippedExportedAt_rejected(t *testing.T) {
 	}
 
 	// When
-	usedLegacy, err := validateV2Backup(b)
+	result, err := validateImportBackupChain(context.Background(), importValidationDeps{}, &b, importValidationOptions{})
+	usedLegacy := result.UsedLegacyChecksum
 
 	// Then 拒绝且不标记旧格式回退
 	if err == nil {
@@ -40,11 +42,12 @@ func TestValidateV2Backup_v2StrippedChecksum_rejected(t *testing.T) {
 	b.Meta.Checksum = ""
 
 	// When
-	usedLegacy, err := validateV2Backup(b)
+	result, err := validateImportBackupChain(context.Background(), importValidationDeps{}, &b, importValidationOptions{})
+	usedLegacy := result.UsedLegacyChecksum
 
 	// Then 拒绝
 	if err == nil || !strings.Contains(err.Error(), "校验和") {
-		t.Fatalf("validateV2Backup err=%v, want 缺少校验和拒绝", err)
+		t.Fatalf("校验链 err=%v, want 缺少校验和拒绝", err)
 	}
 	if usedLegacy {
 		t.Fatal("剥 checksum 的 v2 备份不得标记为旧格式校验和路径")

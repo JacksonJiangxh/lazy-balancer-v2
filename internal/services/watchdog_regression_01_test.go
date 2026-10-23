@@ -139,6 +139,45 @@ func TestWatchdogMatchesTLSCertificateRenderGate(t *testing.T) {
 	runRound("certificate removed")
 }
 
+// 形状补齐：manual 源但证书/私钥为空（带外坏行）——渲染门 fail-closed 跳过,
+// 看门狗必须同判据（同一发布谓词 + certReady），不得把它判为「缺失」。
+func TestWatchdogSkipsManualTLSRuleWithoutMaterial(t *testing.T) {
+	newClusterTestService(t)
+	ResetConfigDrift()
+	t.Cleanup(ResetConfigDrift)
+
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,description,protocol,domain,listen_port,strategy,enabled,
+		enable_tls,tls_source,tls_cert,tls_key,health_check_interval,health_check_timeout,health_check_unhealthy_threshold,health_check_healthy_threshold)
+		VALUES ('lb_l7manual','l7-manual','','http','manual-watch.example.test',18444,'weighted_round_robin',1,1,'manual','','',10,2,3,2)`); err != nil {
+		t.Fatalf("seed manual rule: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol)
+		VALUES ('lb_l7manual','127.0.0.1',9000,1,1,'http')`); err != nil {
+		t.Fatalf("seed manual upstream: %v", err)
+	}
+
+	expected, err := expectedRenderedRules()
+	if err != nil {
+		t.Fatalf("expectedRenderedRules: %v", err)
+	}
+	if _, ok := expected["lb_l7manual"]; ok {
+		t.Fatalf("manual 空材料规则不得进入期望集: %v", expected)
+	}
+
+	var adminConfig atomic.Value
+	adminConfig.Store(`{"apps":{"http":{"servers":{}}}}`)
+	admin := watchAdminServer(t, &adminConfig)
+	for i := range 2 {
+		checked, checkErr := checkConfigConsistency(admin.URL)
+		if checkErr != nil || !checked {
+			t.Fatalf("round %d: checked=%v err=%v", i+1, checked, checkErr)
+		}
+		if status := CurrentConfigDrift(); !status.Consistent {
+			t.Fatalf("round %d: manual 空材料规则不得造成漂移: %+v", i+1, status)
+		}
+	}
+}
+
 // 保证 emptyConfig/routedConfig 是合法 JSON（防手误拼写使读取分支静默跳过）。
 func TestWatchdogFixturesAreValidJSON(t *testing.T) {
 	for _, shape := range []string{

@@ -12,8 +12,12 @@ package services
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -119,5 +123,217 @@ func TestSyncService_applySnapshot_skipsReloadWhenOnlyBookkeepingChanges(t *test
 	// Then 规则变化仍重载（回归钉）。
 	if got := loadCount(); got != 3 {
 		t.Fatalf("规则变化后 /load 次数=%d, want 3（渲染输入变化必须重载）", got)
+	}
+}
+
+// reloadFactorFixture 为条件重载因子矩阵搭建「主节点文件树 + 从端文件树 +
+// 可计数的 Caddy /load 计数」环境：从端每次 apply 都走真实 WAF 落盘与证书
+// 物化路径，因子变化只能来自被测分量。
+type reloadFactorFixture struct {
+	t        *testing.T
+	database *sql.DB
+	service  *SyncService
+	slaveCRS string
+	slaveXdb string
+	slaveWaf string
+	base     models.ClusterSnapshot
+	wafRef   *models.ClusterWafFilesRef
+	bundle   WafFileBundle
+	server   *httptest.Server
+	mu       sync.Mutex
+	loads    int
+	version  int
+}
+
+func newReloadFactorFixture(t *testing.T) *reloadFactorFixture {
+	t.Helper()
+	fixture := &reloadFactorFixture{t: t}
+	clusterService, database := newClusterTestService(t)
+	fixture.database = database
+	if _, err := database.Exec("UPDATE global_config SET is_master=0 WHERE id=1"); err != nil {
+		t.Fatalf("set slave mode: %v", err)
+	}
+
+	// 主节点文件树：CRS 规则树 + VERSION、IP2Region 库、单个威胁源 .fast。
+	masterTree := t.TempDir()
+	masterCRS := filepath.Join(masterTree, "crs")
+	masterXdb := filepath.Join(masterTree, "ip2region.xdb")
+	masterWaf := filepath.Join(masterTree, "waf")
+	if err := os.MkdirAll(filepath.Join(masterCRS, "rules"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(masterWaf, 0755); err != nil {
+		t.Fatal(err)
+	}
+	for path, payload := range map[string]string{
+		filepath.Join(masterCRS, "rules", "a.conf"):         "SecRule ARGS 1",
+		filepath.Join(masterCRS, "VERSION"):                 "v4.0.0\n",
+		masterXdb:                                           "XDB-MASTER-1",
+		filepath.Join(masterWaf, "threat-ustc.iplist.fast"): "MASTER-FAST-1",
+	} {
+		if err := os.WriteFile(path, []byte(payload), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	restoreMasterPaths := OverrideWafLivePathsForTest(masterCRS, masterXdb)
+	restoreMasterWaf := OverrideThreatWafDirForTest(masterWaf)
+	bundle := BuildWafFileBundle()
+	ref := BuildWafFileRef()
+	restoreMasterWaf()
+	restoreMasterPaths()
+	if bundle == nil || ref == nil {
+		t.Fatal("主节点 WAF bundle/ref 构建失败")
+	}
+	fixture.bundle, fixture.wafRef = *bundle, ref
+
+	// 从端文件树：空 CRS / 空 xdb / 空威胁目录。
+	slaveTree := t.TempDir()
+	fixture.slaveCRS = filepath.Join(slaveTree, "crs")
+	fixture.slaveXdb = filepath.Join(slaveTree, "ip2region.xdb")
+	fixture.slaveWaf = filepath.Join(slaveTree, "waf")
+	if err := os.MkdirAll(fixture.slaveCRS, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(fixture.slaveWaf, 0755); err != nil {
+		t.Fatal(err)
+	}
+	restoreSlavePaths := OverrideWafLivePathsForTest(fixture.slaveCRS, fixture.slaveXdb)
+	restoreSlaveWaf := OverrideThreatWafDirForTest(fixture.slaveWaf)
+	restoreCertDir := SetCertDirForTest(filepath.Join(slaveTree, "certs"))
+	t.Cleanup(func() {
+		restoreCertDir()
+		restoreSlaveWaf()
+		restoreSlavePaths()
+	})
+
+	fixture.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/cluster/sync/waf-files" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"data": fixture.bundle})
+	}))
+	t.Cleanup(fixture.server.Close)
+	if _, err := database.Exec("UPDATE global_config SET master_url=?, cluster_token=? WHERE id=1", fixture.server.URL, "probe-token"); err != nil {
+		t.Fatalf("seed master endpoint: %v", err)
+	}
+
+	caddyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/load" {
+			fixture.mu.Lock()
+			fixture.loads++
+			fixture.mu.Unlock()
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(caddyServer.Close)
+	fixture.service = NewSyncService(database, &config.Config{CaddyAdminURL: caddyServer.URL}, NewCaddyService(caddyServer.URL))
+
+	base, err := clusterService.clusterSnapshotBypassingCache(context.Background())
+	if err != nil {
+		t.Fatalf("build canonical snapshot: %v", err)
+	}
+	base.WafFiles = ref
+	fixture.base = base
+	return fixture
+}
+
+func (fixture *reloadFactorFixture) loadCount() int {
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	return fixture.loads
+}
+
+// apply 以递增版本重放快照；mutate 用于只改动被测分量。
+func (fixture *reloadFactorFixture) apply(mutate func(*models.ClusterSnapshot)) {
+	fixture.t.Helper()
+	fixture.version++
+	snapshot := fixture.base
+	snapshot.Version = fixture.version
+	snapshot.WafFiles = fixture.wafRef
+	if mutate != nil {
+		mutate(&snapshot)
+	}
+	if err := fixture.service.applySnapshot(context.Background(), snapshot); err != nil {
+		fixture.t.Fatalf("apply v%d: %v", fixture.version, err)
+	}
+}
+
+// 条件重载的每个 OR 因子都必须有「仅该因子变化 → /load+1」的独立用例：
+// 此前只覆盖 renderInputsChanged 与 reloadCompensation，删除证书轴与
+// CRS/xdb/威胁库四条文件态因子后其余 apply 用例全绿——回归会让证书轮换或
+// 安全数据更新后 Caddy 继续使用旧文件。
+func TestSyncService_applySnapshot_reloadsOnEachConditionalFactor(t *testing.T) {
+	fixture := newReloadFactorFixture(t)
+
+	// 首轮全节首次应用必须重载。
+	fixture.apply(nil)
+	if got := fixture.loadCount(); got != 1 {
+		t.Fatalf("首轮 apply 后 /load=%d, want 1", got)
+	}
+	// 全因子无变化：不重载。
+	fixture.apply(nil)
+	if got := fixture.loadCount(); got != 1 {
+		t.Fatalf("全因子无变化的 apply 后 /load=%d, want 1", got)
+	}
+
+	// 因子：CRS 数据文件变化（JSON 节载荷不变）。
+	if err := os.WriteFile(filepath.Join(fixture.slaveCRS, "rules", "a.conf"), []byte("TAMPERED"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	fixture.apply(nil)
+	if got := fixture.loadCount(); got != 2 {
+		t.Fatalf("CRS 文件变化后 /load=%d, want 2（crsChanged 是条件重载因子）", got)
+	}
+
+	// 因子：IP2Region 数据文件变化。
+	if err := os.WriteFile(fixture.slaveXdb, []byte("XDB-TAMPERED"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	fixture.apply(nil)
+	if got := fixture.loadCount(); got != 3 {
+		t.Fatalf("IP2Region 文件变化后 /load=%d, want 3（xdbChanged 是条件重载因子）", got)
+	}
+
+	// 因子：威胁库名单文件变化。
+	if err := os.WriteFile(filepath.Join(fixture.slaveWaf, "threat-ustc.iplist.fast"), []byte("TAMPERED-FAST"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	fixture.apply(nil)
+	if got := fixture.loadCount(); got != 4 {
+		t.Fatalf("威胁库文件变化后 /load=%d, want 4（threatChanged 是条件重载因子）", got)
+	}
+}
+
+// 证书轴单独一条用例：证书文件路径确定性意味着内容轮换时渲染 JSON 字节不变，
+// certsChanged 是唯一信号（删除该因子后其余 apply 用例全绿，证书过期不会重载）。
+func TestSyncService_applySnapshot_reloadsOnCertAxisChanges(t *testing.T) {
+	fixture := newReloadFactorFixture(t)
+	certPEM := func(marker string) models.ClusterCertificate {
+		return models.ClusterCertificate{
+			RuleID:  "lb_factor_cert",
+			Domain:  "factor.example.com",
+			CertPEM: "-----BEGIN CERTIFICATE-----\n" + marker + "\n-----END CERTIFICATE-----\n",
+			KeyPEM:  "KEY-A-" + marker + "\n",
+		}
+	}
+	fixture.apply(nil)
+	if got := fixture.loadCount(); got != 1 {
+		t.Fatalf("首轮 apply 后 /load=%d, want 1", got)
+	}
+	// 新增证书（生效面从无到有）。
+	fixture.apply(func(snapshot *models.ClusterSnapshot) {
+		snapshot.Certs = []models.ClusterCertificate{certPEM("CERT-A")}
+	})
+	if got := fixture.loadCount(); got != 2 {
+		t.Fatalf("证书新增后 /load=%d, want 2（证书轴是条件重载因子）", got)
+	}
+	// 证书内容轮换（路径不变、JSON 不变）。
+	fixture.apply(func(snapshot *models.ClusterSnapshot) {
+		snapshot.Certs = []models.ClusterCertificate{certPEM("CERT-B")}
+	})
+	if got := fixture.loadCount(); got != 3 {
+		t.Fatalf("证书内容变更后 /load=%d, want 3（内容轮换必须强制重载）", got)
 	}
 }

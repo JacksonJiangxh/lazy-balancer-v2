@@ -1088,7 +1088,7 @@ func TestEngine_StartDaemonStoppedRollsBackRegistration(t *testing.T) {
 	e.mu.RLock()
 	r := e.regs["t-stopped-register"]
 	e.mu.RUnlock()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancelCause(context.Background())
 	r.running = true
 	r.cancel = cancel
 	e.Stop()

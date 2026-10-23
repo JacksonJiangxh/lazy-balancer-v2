@@ -315,10 +315,10 @@ func TestBuildIPPrecheckDirectives_mergedAllowIntersection(t *testing.T) {
 	// 合并集 [198.51.100.1 203.0.113.5] ∩ 合并集 [203.0.113.5] = [203.0.113.5]
 	intersection := readRenderedIPList(t, directives, "u-allow")
 	if intersection != "203.0.113.5/32\n" {
-		t.Fatalf("intersection must be merged(历史问题) ∩ merged(历史问题) = [203.0.113.5/32]: %q", intersection)
+		t.Fatalf("intersection must be merged(allow list A) ∩ merged(allow list B) = [203.0.113.5/32]: %q", intersection)
 	}
 	if strings.Contains(intersection, "198.51.100.1") {
-		t.Fatalf("198.51.100.1 only in 历史问题 must not survive the allow intersection: %q", intersection)
+		t.Fatalf("198.51.100.1 only in one side must not survive the allow intersection: %q", intersection)
 	}
 }
 

@@ -609,9 +609,11 @@ type UpdateRuleRequest struct {
 }
 
 type UpdateConfigRequest struct {
-	Source                     string  `json:"source"`
-	DNSProvider                *string `json:"dns_provider"`
-	DNSCredentials             *string `json:"dns_credentials"`
+	Source      string  `json:"source"`
+	DNSProvider *string `json:"dns_provider"`
+	// 遗留 global_config.dns_credentials 不再有写入口：签发链唯一凭证来源是
+	// certificate_configs（DNS 凭证在证书配置页维护），该列读路径亦不回显，
+	// 请求体携带本键不产生任何写入。
 	ACMEEmail                  *string `json:"acme_email"`
 	CertExpiryDays             *int    `json:"cert_expiry_days"`
 	CertRenewalDays            *int    `json:"cert_renewal_days"`

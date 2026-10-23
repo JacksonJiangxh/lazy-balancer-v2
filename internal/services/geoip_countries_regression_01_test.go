@@ -75,12 +75,16 @@ func TestRegionTree_countriesCacheJSON(t *testing.T) {
 	if _, ok := roundTrip["countries"]; !ok {
 		t.Fatalf("tree JSON missing countries key: %s", data)
 	}
-	// 缓存文件同序列化链（writeRegionTreeCache → regions.json）。
+	// 缓存文件同序列化链（writeRegionTreeCache → regions.json）。GetIP2RegionRegionTree
+	// 只扫描/记忆化、不写缓存——必须显式触发写点，否则本断言恒跳过
+	// （用例名声称的「缓存序列化携带 countries」从未验证）。
+	writeRegionTreeCache(tree)
 	cache, err := os.ReadFile(live + ".regions.json")
-	if err == nil {
-		if !strings.Contains(string(cache), `"countries"`) {
-			t.Fatalf("regions.json cache missing countries key: %s", cache)
-		}
+	if err != nil {
+		t.Fatalf("regions.json cache 未写出: %v", err)
+	}
+	if !strings.Contains(string(cache), `"countries"`) {
+		t.Fatalf("regions.json cache missing countries key: %s", cache)
 	}
 }
 

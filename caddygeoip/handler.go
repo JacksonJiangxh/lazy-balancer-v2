@@ -89,6 +89,10 @@ type geoipSharedSearcher struct {
 	searcher *service.Ip2Region
 	modTime  time.Time
 	size     int64
+	// needsRebuild 标记「文件形态曾不可 stat」：下一次 Provision 即使 stat
+	// 形态与缓存一致也必须重建（rsync -a 保留 mtime+size 的重铺形态），
+	// 防被删 inode 的旧库被无限期当有效数据服务。重建成功后由新条目清除。
+	needsRebuild bool
 }
 
 var (
@@ -103,7 +107,8 @@ var (
 // 收敛。测试可缩短。
 var geoipOldInstanceCloseDelay = 60 * time.Second
 
-// sharedGeoIPSearcher 返回按路径共享的单例：文件形态未变时命中缓存，变化时重建。
+// sharedGeoIPSearcher 返回按路径共享的单例：文件形态未变时命中缓存，变化时重建；
+// 曾因不可 stat 被标记的条目（needsRebuild）即使形态未变也重建。
 // 被替换的旧实例经 geoipOldInstanceCloseDelay 延迟关闭——新实例先接管（下方
 // 缓存替换完成后 Provision 返回，新配置随之重载），旧实例在窗口内继续服务
 // 在途查询，窗口过后由定时器 Close（Ip2Region.Close 等待借出的 searcher
@@ -111,23 +116,34 @@ var geoipOldInstanceCloseDelay = 60 * time.Second
 func sharedGeoIPSearcher(path string) (*service.Ip2Region, error) {
 	st, err := os.Stat(path)
 	if err != nil {
-		// stat 失败（xdb 更新 rename 窗口/文件被删）且
-		// 缓存持有该路径条目时驱逐之——旧实例走既有 AfterFunc 延迟关闭
-		// （在途查询保护与换库路径一致）。不驱逐则旧 inode 实例永久占据
-		// 缓存槽：文件以「同 modtime+size」形态恢复（rsync -a 保时间戳重铺）
-		// 时缓存命中判定通过，被删 inode 的旧库被无限期当有效数据服务。
+		// stat 失败（xdb 更新 rename 窗口/文件被删）且缓存持有该路径条目时
+		// **本次仍返回该实例**（fail-stale），并把条目标为「必须重建」：
+		//   - 返回 error 会让 Provision 降级 pass-through → 该次 reload 之后
+		//     全部客户端判「海外」→ allow 模式的 geoip 规则等价全量拦截
+		//     （deny 海外同样全量命中），唯一痕迹只有一条 Warn；而 stat 瞬时
+		//     失败（挂载抖动、权限瞬变、rm+cp 交错）并不等于数据库已不可用。
+		//   - 标记而不删条目：一次 reload 里每个 geoip 规则各调一次本函数，
+		//     删掉条目会让第二个及之后的实例拿不到缓存而再次降级（只有首个
+		//     规则免于全量拦截，同一份配置内部行为不一致）。
+		//   - 标记保证下一次 Provision 必然重读重建（不复用旧 inode）：文件以
+		//     「同 modtime+size」形态恢复（rsync -a 保时间戳重铺）时缓存命中
+		//     判定不会把被删 inode 的旧库当有效数据继续服务。
 		geoipSharedMu.Lock()
-		if cached, ok := geoipSharedSearchers[path]; ok {
-			old := cached.searcher
-			delete(geoipSharedSearchers, path)
-			time.AfterFunc(geoipOldInstanceCloseDelay, func() { old.Close() })
+		cached, ok := geoipSharedSearchers[path]
+		if ok {
+			cached.needsRebuild = true
 		}
 		geoipSharedMu.Unlock()
-		return nil, err
+		if !ok {
+			return nil, err
+		}
+		caddy.Log().Named("geoip2region").Warn("ip2region database is not stat-able, serving the previous database instance and rebuilding on the next reload",
+			zap.String("xdb_path", path), zap.Error(err))
+		return cached.searcher, nil
 	}
 	geoipSharedMu.Lock()
 	defer geoipSharedMu.Unlock()
-	if cached, ok := geoipSharedSearchers[path]; ok &&
+	if cached, ok := geoipSharedSearchers[path]; ok && !cached.needsRebuild &&
 		cached.modTime.Equal(st.ModTime()) && cached.size == st.Size() {
 		return cached.searcher, nil
 	}
@@ -156,8 +172,11 @@ func sharedGeoIPSearcher(path string) (*service.Ip2Region, error) {
 
 // geoipCorazaHeaders lists the request headers this module owns. v2.2.0 地域
 // 拦截改走 coraza（BuildCorazaDirectives 的 GeoIP SecRule 在 phase:1 读取
-// X-LB-GeoIP-Loc），这些头是 geoip.* 变量的镜像；客户端伪造的同名头在
-// ServeHTTP 入口无条件删除（先删后设，防伪造绕过/误伤）。
+// X-LB-GeoIP-Loc），其中 X-LB-GeoIP-Loc 是 geoip.* 变量的镜像；其余同名头
+// 只做剥离、不再发射（X-LB-GeoIP-Country-Code 的发射已删除，
+// geoip.country_code 变量与测试均按「不发布」钉住）。客户端伪造的同名头在
+// ServeHTTP 入口无条件删除（先删后设，防伪造绕过/误伤）——不要按「镜像」
+// 语义把已删的发射加回来。
 var geoipCorazaHeaders = []string{
 	"X-LB-GeoIP-Country", "X-LB-GeoIP-Country-Code", "X-LB-GeoIP-Region",
 	"X-LB-GeoIP-Province", "X-LB-GeoIP-City", "X-LB-GeoIP-Loc",

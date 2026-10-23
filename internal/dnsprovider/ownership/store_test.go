@@ -522,7 +522,7 @@ func TestReplace_sharesStoreLockAndPreservesStateOnInvalidSnapshot(t *testing.T)
 	if err != nil {
 		t.Fatalf("read committed replacement: %v", err)
 	}
-	for _, invalid := range [][]byte{[]byte(`{"version":`), []byte(`{"version":2,"records":[]}`)} {
+	for _, invalid := range [][]byte{[]byte(`{"version":`), []byte(`{"version":2,"records":[]}`), []byte(`{"version":1}`)} {
 		if err := Replace(dir, invalid); err == nil {
 			t.Fatalf("Replace accepted invalid snapshot %q", invalid)
 		}
@@ -658,5 +658,13 @@ func TestStore_RemoveMany(t *testing.T) {
 	// 空输入快速返回
 	if err := store.RemoveMany(nil); err != nil {
 		t.Fatalf("empty remove many: %v", err)
+	}
+}
+
+// 空 dataDir 必须显式拒绝：静默使用当前目录会把账本写进进程工作目录
+// （容器里可能是 /app，随镜像重建丢失所有权追踪）。
+func TestNew_rejectsEmptyDataDir(t *testing.T) {
+	if _, err := New(""); err == nil {
+		t.Fatal("New(\"\") 必须报错")
 	}
 }

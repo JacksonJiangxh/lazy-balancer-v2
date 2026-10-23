@@ -95,6 +95,11 @@ func (h *Handlers) TicketLogin(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求格式错误"})
 		return
 	}
+	// 装配缺失 fail-closed 必须晚于体积/格式门：公开端点的 413 预检是请求
+	// 语义的前置契约（先拦超大体积，再判服务可用性），与 login 端点同序。
+	if !h.requireClusterService(c) {
+		return
+	}
 	claims, user, passwordVersion, err := h.clusterService.ValidateLoginTicket(c.Request.Context(), req.Ticket, time.Now())
 	if err != nil {
 		status := http.StatusInternalServerError

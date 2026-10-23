@@ -9,7 +9,7 @@ import assert from 'node:assert/strict'
 import { nextTick, ref } from 'vue'
 
 import { useCountUp } from '../src/composables/useCountUp.ts'
-import { FakeDocument } from './_helpers.ts'
+import { FakeDocument, mountForLifecycle } from './_helpers.ts'
 
 class FakeFrames {
   private nextId = 1
@@ -117,7 +117,7 @@ test('页签隐藏即停帧，隐藏期源值直接落值，恢复可见落到�
   }
 })
 
-test('飞行中恢复可见直接落到源值（无积压补间），并摘除监听', async () => {
+test('飞行中恢复可见直接落到源值（无积压补间）', async () => {
   const h = makeHarness()
   try {
     const source = ref(0)
@@ -129,6 +129,29 @@ test('飞行中恢复可见直接落到源值（无积压补间），并摘除�
     h.doc.dispatch()
     assert.equal(display.value, 800, '可见事件把显示值对到源值')
     assert.equal(h.frames.size, 0, '对值后不得残留补间帧')
+  } finally {
+    h.dispose()
+  }
+})
+
+// 卸载清理（页面切换/大屏退出）：onUnmounted 里摘监听 + 停帧。组件实例由
+// mountForLifecycle 提供（SSR 不执行卸载钩子，覆盖不到该路径）。
+test('卸载时摘除可见性监听并取消在途补间帧', async () => {
+  const h = makeHarness()
+  try {
+    const source = ref(0)
+    const mounted = mountForLifecycle(() => {
+      useCountUp(source, 1000)
+    })
+    assert.equal(h.doc.listenerCount, 1, '挂载后应有一个 visibilitychange 监听')
+
+    source.value = 500
+    await nextTick()
+    assert.equal(h.frames.size, 1, '前置：补间帧在途')
+
+    mounted.unmount()
+    assert.equal(h.doc.listenerCount, 0, '卸载必须摘除 visibilitychange 监听（否则重进页面叠加监听→多倍补间）')
+    assert.equal(h.frames.size, 0, '卸载必须取消在途帧（否则销毁后仍继续排帧）')
   } finally {
     h.dispose()
   }

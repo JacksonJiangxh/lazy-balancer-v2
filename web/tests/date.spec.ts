@@ -15,13 +15,12 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { registerModuleHooks } from './_helpers.ts'
+import { dataModule } from './_stubs.ts'
 
 type Harness = { __tz: string; __formatCalls: number }
 const g = globalThis as unknown as Harness
 g.__tz = 'Asia/Shanghai'
 g.__formatCalls = 0
-
-const dataModule = (code: string): string => `data:text/javascript,${encodeURIComponent(code)}`
 
 const stubAuth = dataModule(`
 export const useAuthStore = () => ({ timezone: globalThis.__tz })

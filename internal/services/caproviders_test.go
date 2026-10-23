@@ -628,3 +628,59 @@ func TestAutoProvisionZeroSSLEAB_bumps_provider_config_version(t *testing.T) {
 		t.Fatalf("credentials=%q, want persisted EAB", credentials)
 	}
 }
+
+// 凭证列不得被整行 UPDATE 无条件重写：TestCAProvider / 签发预检会在不持
+// caddyOpMu 的情况下自动申请并写入 ZeroSSL EAB，而前端「测试成功 → 用陈旧
+// 表单保存」或并发请求提交的凭证可能与库值语义相同（键序/空白差异）或更旧。
+// 请求值与事务内旧值语义相等时完全不触碰该列，真实修改（含清空）照常落库。
+func TestCAProviderService_UpdateCAProvider_preservesCredentialsWhenSemanticallyUnchanged(t *testing.T) {
+	// Given：库中凭证是带外写入的非规范 JSON（键序与请求不同）
+	_, database := newClusterTestService(t)
+	if _, err := database.Exec("DELETE FROM ca_providers"); err != nil {
+		t.Fatalf("clear CA providers: %v", err)
+	}
+	const storedCredentials = `{ "eab_hmac_key" : "fresh-key", "eab_kid" : "fresh-kid" }`
+	result, err := database.Exec(`INSERT INTO ca_providers (name,provider,directory_url,credentials,max_concurrent,min_interval_ms,enabled)
+		VALUES ('eab','zerossl',?,?,1,1000,1)`, ZeroSSLDirectoryURL, storedCredentials)
+	if err != nil {
+		t.Fatalf("seed provider: %v", err)
+	}
+	providerID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("read provider id: %v", err)
+	}
+	service := NewCAProviderService()
+	newName := "renamed"
+	sameCredentials := `{"eab_kid":"fresh-kid","eab_hmac_key":"fresh-key"}`
+
+	// When：只改名称，凭证原样回传（语义相同、字节不同）
+	if _, err := service.UpdateCAProvider(int(providerID), models.UpdateCAProviderRequest{Name: &newName, Credentials: &sameCredentials}); err != nil {
+		t.Fatalf("update provider: %v", err)
+	}
+
+	// Then：凭证列保持原样（未被整行 UPDATE 重写），名称已更新
+	var stored, name string
+	if err := database.QueryRow("SELECT COALESCE(credentials,''), name FROM ca_providers WHERE id=?", providerID).Scan(&stored, &name); err != nil {
+		t.Fatalf("read provider: %v", err)
+	}
+	if stored != storedCredentials {
+		t.Fatalf("credentials=%q, want untouched %q（语义未变不得重写该列）", stored, storedCredentials)
+	}
+	if name != "renamed" {
+		t.Fatalf("name=%q, want renamed", name)
+	}
+
+	// When：真实修改 EAB（下一次测试/签发自动申请到的是新值）
+	nextCredentials := `{"eab_kid":"next-kid","eab_hmac_key":"next-key"}`
+	if _, err := service.UpdateCAProvider(int(providerID), models.UpdateCAProviderRequest{Credentials: &nextCredentials}); err != nil {
+		t.Fatalf("update credentials: %v", err)
+	}
+
+	// Then：真实修改必须落库（凭证列不能被门控成只读）
+	if err := database.QueryRow("SELECT COALESCE(credentials,'') FROM ca_providers WHERE id=?", providerID).Scan(&stored); err != nil {
+		t.Fatalf("read credentials: %v", err)
+	}
+	if stored != nextCredentials {
+		t.Fatalf("credentials=%q, want %q", stored, nextCredentials)
+	}
+}

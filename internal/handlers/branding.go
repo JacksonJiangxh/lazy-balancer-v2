@@ -126,8 +126,8 @@ func loadBrandingConfig(dataDir string) brandingConfig {
 	brandingStore.mu.RUnlock()
 
 	brandingStore.mu.Lock()
-	defer brandingStore.mu.Unlock()
 	if unchanged() { // double-check:并发竞争下的另一个加载者已完成
+		brandingStore.mu.Unlock()
 		return brandingStore.cfg
 	}
 	prevLoaded := brandingStore.loaded
@@ -148,18 +148,22 @@ func loadBrandingConfig(dataDir string) brandingConfig {
 				services.Logf("warn", "branding: 文件暂不可解析(半截写/缺失),保留上一份有效配置: %s", path)
 			}
 		}
+		brandingStore.mu.Unlock()
 		return prev
 	}
 	if !ok && readErr != nil && !prevLoaded {
 		// boot 首载（无前值）：一次性留痕（不是每请求路径）。
 		services.Logf("error", "branding: 载入品牌配置失败，使用默认值: %s: %v", path, readErr)
 	}
+	// 热重载留痕(2026-09-11 裁定):仅实际变更记,内容未变(touch)与
+	// boot 首载不记。系统日志+操作日志同口径。
+	// 留痕本身（尤其审计的同步 INSERT）必须在解锁后执行：本函数是进程级
+	// 单写锁，锁内做 DB 写会让公开 GET /branding 在审计库慢写时阻塞全部
+	// branding 读者（/system/info、拦截页播种同族）。锁内只做
+	// stat+读文件+解析+替换快照，锁外写留痕。
+	reloadDetail := ""
 	if prevLoaded && cfg != prev {
-		// 热重载留痕(2026-09-11 裁定):仅实际变更记,内容未变(touch)与
-		// boot 首载不记。系统日志+操作日志同口径。
-		detail := brandingReloadDetail(prev, cfg)
-		services.Logf("info", "品牌配置已热重载（%s）", detail)
-		services.RecordAuditLog("system", "重载", "品牌配置", detail, "")
+		reloadDetail = brandingReloadDetail(prev, cfg)
 	}
 	brandingStore.cfg = cfg
 	brandingStore.loaded = true
@@ -175,8 +179,21 @@ func loadBrandingConfig(dataDir string) brandingConfig {
 		brandingStore.modTime = time.Time{}
 		brandingStore.size = -1
 	}
+	brandingStore.mu.Unlock()
+
+	if reloadDetail != "" {
+		if brandingReloadAuditHook != nil {
+			brandingReloadAuditHook()
+		}
+		services.Logf("info", "品牌配置已热重载（%s）", reloadDetail)
+		services.RecordAuditLog("system", "重载", "品牌配置", reloadDetail, "")
+	}
 	return cfg
 }
+
+// brandingReloadAuditHook 测试屏障（生产恒 nil）：在热重载留痕（锁外）开始
+// 处触发，供并发测试证明审计写不持有 brandingStore 写锁。
+var brandingReloadAuditHook func()
 
 // brandingReloadDetail 生成热重载审计的逐字段旧→新摘要(仅列变化字段)。
 func brandingReloadDetail(prev, next brandingConfig) string {
@@ -402,7 +419,11 @@ func (h *Handlers) GetBranding(c *gin.Context) {
 	// 每请求 ~7 条 SQL 是公开无鉴权端点的残余放大面；门内跳过同步/种子/镜像
 	// （branding.json 为手工编辑的文档化用法，无管理写路径，带外手工编辑
 	// 最坏经门内采样延迟 60s 可见，与上方门语义一致）。
-	if brandingSyncGateAllow(h.cfg.DataDir) {
+	// 配置导入窗口内跳过本轮同步/播种/镜像：三者都写 global_config 与
+	// security_block_pages（导入的全量替代表），事务持写锁时会排队至
+	// busy_timeout(30s) 后失败，且结果会被导入覆盖。指纹不消费，窗口结束后
+	// 下一次访问按原门控（≥60s 采样）重试。
+	if !configImportBusy() && brandingSyncGateAllow(h.cfg.DataDir) {
 		needApply := false
 		syncFailed := false
 		if changed, err := SyncDefaultLandingText(h.cfg.DataDir); err != nil {

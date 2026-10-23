@@ -133,10 +133,12 @@ func TestClient_RegisterAccount_keeps_rotated_predecessor_key(t *testing.T) {
 
 }
 
-// EAB HMAC 轮换后，旧 HMAC 代密钥可能仍被在途签发任务使用（其内存 key
-// 不受影响，但磁盘文件被删会导致重试/重启后重新生成、对同一账户反复换 key）。
-// 元数据 mtime=最近使用时间，1h 内被使用的前代密钥不得清理。
-func TestClient_RegisterAccount_keeps_recently_used_predecessor_key(t *testing.T) {
+// EAB HMAC 轮换后旧代的账户密钥必须保留：它是不同账户身份（目录/邮箱/KID 相同
+// 但 HMAC 摘要不同），删掉会让旧账户身份无法恢复。这里断言的是「身份不同即
+// 保留」，与 mtime 无关——清理删除分支（metadata==want 且 keyPath!=当前路径）
+// 在当前路径公式下不可达，是路径公式变更时的迁移钩子（见
+// removeStaleAccountKeys 注释），因此不能用 mtime 断言它的行为。
+func TestClient_RegisterAccount_keeps_predecessor_identity_key(t *testing.T) {
 	// Given
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -167,15 +169,15 @@ func TestClient_RegisterAccount_keeps_recently_used_predecessor_key(t *testing.T
 		t.Fatalf("create rotated EAB client: %v", err)
 	}
 
-	// When：旧密钥刚被写入（mtime 新鲜，视同并发任务在途使用）
+	// When：以轮换后的 HMAC 完成注册（旧代密钥是不同账户身份）
 	if err := client.RegisterAccount(t.Context()); err != nil {
 		t.Fatalf("register rotated EAB account: %v", err)
 	}
 
-	// Then：前代密钥及其元数据均保留
+	// Then：前代身份密钥及其元数据均保留
 	for _, path := range []string{oldKeyPath, oldKeyPath + ".json"} {
 		if _, err := os.Stat(path); err != nil {
-			t.Fatalf("recently used predecessor key %s was removed: %v", path, err)
+			t.Fatalf("predecessor identity key %s was removed: %v", path, err)
 		}
 	}
 }
@@ -309,6 +311,7 @@ func TestClient_RegisterAccount_rejects_mask_hit_when_key_holds_no_account(t *te
 func TestClient_RegisterAccount_reuses_when_mask_hit_and_key_holds_account(t *testing.T) {
 	// Given
 	var server *httptest.Server
+	probeSeen := 0
 	server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Replay-Nonce", "test-nonce")
 		writer.Header().Set("Content-Type", "application/json")
@@ -319,6 +322,7 @@ func TestClient_RegisterAccount_reuses_when_mask_hit_and_key_holds_account(t *te
 			writer.WriteHeader(http.StatusOK)
 		case "/account":
 			if strings.Contains(decodeACMERequestPayload(t, request), "onlyReturnExisting") {
+				probeSeen++
 				writer.Header().Set("Location", server.URL+"/account/1")
 				writer.WriteHeader(http.StatusOK)
 				_, _ = writer.Write([]byte(`{"status":"valid"}`))
@@ -345,6 +349,11 @@ func TestClient_RegisterAccount_reuses_when_mask_hit_and_key_holds_account(t *te
 	// Then
 	if err != nil {
 		t.Fatalf("verified reuse must succeed, got: %v", err)
+	}
+	// 只断言 err==nil 时，跳过 onlyReturnExisting 探测直接把 400 当成功也会通过
+	// ——后续签名请求会 403 accountDoesNotExist。
+	if probeSeen != 1 {
+		t.Fatalf("onlyReturnExisting probes=%d, want 1（复用前必须验证本密钥持有该账户）", probeSeen)
 	}
 }
 

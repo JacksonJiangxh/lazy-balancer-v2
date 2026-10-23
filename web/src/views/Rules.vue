@@ -97,10 +97,15 @@
                 popper-class="rule-lock-popper"
               >
                 <template #reference>
-                  <el-icon :size="14" class="acl-lock-icon" :class="ruleStageModel(row).hasAnyPolicy ? 'is-allow' : 'is-unbound'" tabindex="0"><Lock /></el-icon>
+                  <el-icon :size="14" class="acl-lock-icon" :class="ruleStageModel(row).ruleDisabled ? 'is-unbound' : ruleStageModel(row).hasAnyPolicy ? 'is-allow' : 'is-unbound'" tabindex="0"><Lock /></el-icon>
                 </template>
                 <div class="lock-summary">
                   <div class="lock-summary-title">安全防护 · 阶段摘要</div>
+                  <!-- 禁用规则的安全链不进入运行配置（零 listener 路由）——
+                       摘要顶部必须点名，否则从锁图标巡检会高估防护 -->
+                  <div v-if="ruleStageModel(row).ruleDisabled" class="lock-summary-hint">
+                    规则已禁用——安全链未进入运行配置（绑定与阶段页保留，启用后生效）
+                  </div>
                   <template v-for="stage in ruleStageModel(row).stages" :key="stage.stage">
                     <div class="lock-stage">
                       <div class="lock-stage-head" :class="`lock-stage-head--s${stage.stage}`">{{ stage.title }}</div>
@@ -1508,7 +1513,7 @@ const openFlowFromLock = (rule: Rule): void => {
 }
 
 const ruleStageModel = (rule: Rule): RuleStageModel =>
-  ruleStageModelMap.value.get(rule.caddy_id) ?? buildStageModel([], securityPolicies.value, ipLists.value, blockPages.value, rule)
+  ruleStageModelMap.value.get(rule.caddy_id) ?? buildStageModel([], securityPolicies.value, ipLists.value, blockPages.value, rule, rule.enabled)
 
 const searchQuery = ref('')
 const currentPage = ref(1)
@@ -1553,6 +1558,7 @@ const ruleStageModelMap = computed<Map<string, RuleStageModel>>(() => {
       ipLists.value,
       blockPages.value,
       rule,
+      rule.enabled,
     ))
   }
   return map

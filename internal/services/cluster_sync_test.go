@@ -346,11 +346,16 @@ func TestSyncService_Pull_persistsEveryFailure(t *testing.T) {
 	if pullErr == nil || !strings.Contains(stored, pullErr.Error()) {
 		t.Fatalf("pull error=%v stored=%q", pullErr, stored)
 	}
+	// 未完成审批属客户端可修正的校验类失败（错误码随上报下发给主节点）。
+	if code := syncErrorCode(pullErr); code != models.SyncErrorCodeValidationFailed {
+		t.Fatalf("code=%q, want validation_failed", code)
+	}
 }
 
 func TestSyncService_Pull_persistsFailureAfterParentContextCanceled(t *testing.T) {
 	// Given
 	_, database := newClusterTestService(t)
+	setNodeMasterRole(t, database, false) // Pull 只属于从节点语境
 	service := NewSyncService(database, &config.Config{DataDir: t.TempDir()}, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -365,6 +370,10 @@ func TestSyncService_Pull_persistsFailureAfterParentContextCanceled(t *testing.T
 	// Then
 	if pullErr == nil || !strings.Contains(stored, pullErr.Error()) {
 		t.Fatalf("pull error=%v stored=%q", pullErr, stored)
+	}
+	// 父 ctx 取消使同步状态读取失败 → 传输域（自愈类，保留后置副作用标记）。
+	if code := syncErrorCode(pullErr); code != models.SyncErrorCodeTransportError {
+		t.Fatalf("code=%q, want transport_error（父 ctx 取消形态）", code)
 	}
 }
 
@@ -930,7 +939,12 @@ func TestSyncService_Pull_manualSuccessClearsHigherSchemaTerminalError(t *testin
 	higherSchema.Store(true)
 	master := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
 		if higherSchema.Load() {
-			_ = json.NewEncoder(response).Encode(map[string]any{"data": models.ClusterSnapshot{SchemaVersion: CurrentSnapshotSchema + 1}})
+			// 必须签名（canonical 与签名自洽）：未签名快照会先命中「缺少签名」，
+			// 终止 schema 分支从未被验证——删掉该分支测试仍绿。
+			terminal := signedTestSnapshot(1, token)
+			terminal.MinReaderVersion = CurrentSnapshotSchema + 1
+			terminal = signTestSnapshot(terminal, token)
+			_ = json.NewEncoder(response).Encode(map[string]any{"data": terminal})
 			return
 		}
 		_ = json.NewEncoder(response).Encode(map[string]any{"data": signedTestSnapshot(1, token)})
@@ -944,6 +958,11 @@ func TestSyncService_Pull_manualSuccessClearsHigherSchemaTerminalError(t *testin
 	service := NewSyncService(database, &config.Config{DataDir: t.TempDir()}, NewCaddyService(caddy.URL))
 	if _, err := service.Pull(context.Background()); err == nil {
 		t.Fatal("higher schema pull unexpectedly succeeded")
+	} else {
+		var schemaTooNew *SnapshotSchemaTooNewError
+		if !errors.As(err, &schemaTooNew) {
+			t.Fatalf("err=%v, want SnapshotSchemaTooNewError（终止类语义）", err)
+		}
 	}
 	higherSchema.Store(false)
 
@@ -1587,13 +1606,12 @@ func TestSyncService_Pull_wafRepullPersistentFailureBackoffAndRecovery(t *testin
 	defer caddyServer.Close()
 	service := NewSyncService(database, &config.Config{DataDir: t.TempDir(), CaddyAdminURL: caddyServer.URL}, NewCaddyService(caddyServer.URL))
 
-	lastSyncError := func() string {
+	lastSyncError := func() (string, models.SyncErrorCode) {
 		var stored string
 		if err := database.QueryRow("SELECT COALESCE(last_sync_error,'') FROM global_config WHERE id=1").Scan(&stored); err != nil {
 			t.Fatal(err)
 		}
-		msg, _ := decodeSyncError(stored)
-		return msg
+		return decodeSyncError(stored)
 	}
 	pullRound := func(round int, wantRepull bool) {
 		t.Helper()
@@ -1627,15 +1645,17 @@ func TestSyncService_Pull_wafRepullPersistentFailureBackoffAndRecovery(t *testin
 		}
 		pullRound(round, true)
 	}
-	if msg := lastSyncError(); !strings.Contains(msg, "安全数据持续同步失败") || !strings.Contains(msg, fmt.Sprintf("已连续 %d 轮未收敛", wafRepullMaxFailures)) {
+	if msg, code := lastSyncError(); !strings.Contains(msg, "安全数据持续同步失败") || !strings.Contains(msg, fmt.Sprintf("已连续 %d 轮未收敛", wafRepullMaxFailures)) {
 		t.Fatalf("last_sync_error=%q, want 持续失败文案（已连续 %d 轮未收敛）", msg, wafRepullMaxFailures)
+	} else if code != models.SyncErrorCodeTransportError {
+		t.Fatalf("code=%q, want transport_error（持续失败属自愈类，须保留后置副作用标记）", code)
 	}
 
 	// 降频期：兜底重拉被跳过，每轮只有一次 304 请求，持续失败消息保持可见。
 	for service.wafRepullFailures.Load() < wafRepullEvery-1 {
 		round++
 		pullRound(round, false)
-		if msg := lastSyncError(); !strings.Contains(msg, "安全数据持续同步失败") {
+		if msg, _ := lastSyncError(); !strings.Contains(msg, "安全数据持续同步失败") {
 			t.Fatalf("round %d last_sync_error=%q, want 持续失败文案保持可见", round, msg)
 		}
 	}
@@ -1643,7 +1663,7 @@ func TestSyncService_Pull_wafRepullPersistentFailureBackoffAndRecovery(t *testin
 	// 下一轮：计数器达到 wafRepullEvery，重拉一次并刷新计数文案。
 	round++
 	pullRound(round, true)
-	if msg := lastSyncError(); !strings.Contains(msg, fmt.Sprintf("已连续 %d 轮未收敛", wafRepullEvery)) {
+	if msg, _ := lastSyncError(); !strings.Contains(msg, fmt.Sprintf("已连续 %d 轮未收敛", wafRepullEvery)) {
 		t.Fatalf("last_sync_error=%q, want 已连续 %d 轮未收敛", msg, wafRepullEvery)
 	}
 
@@ -1662,7 +1682,7 @@ func TestSyncService_Pull_wafRepullPersistentFailureBackoffAndRecovery(t *testin
 	if service.wafRepullFailures.Load() != 0 {
 		t.Fatalf("wafRepullFailures=%d after convergence, want 0", service.wafRepullFailures.Load())
 	}
-	if msg := lastSyncError(); msg != "" {
+	if msg, _ := lastSyncError(); msg != "" {
 		t.Fatalf("last_sync_error=%q after convergence, want cleared", msg)
 	}
 	if got, err := os.ReadFile(filepath.Join(crsLiveDir, "rules", "a.conf")); err != nil || string(got) != "SecRule X 1" {

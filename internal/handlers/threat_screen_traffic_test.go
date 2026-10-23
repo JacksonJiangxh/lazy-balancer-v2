@@ -35,7 +35,7 @@ func TestGetThreatScreenTraffic_proxiesAndTranslates(t *testing.T) {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		_, _ = w.Write([]byte(`{"countries":{"United States":{"attack":12,"normal":345},"中国":{"attack":0,"normal":88},"Reserved":{"attack":1,"normal":0},"0":{"attack":2,"normal":3}},"sample_n":1}`))
+		_, _ = w.Write([]byte(`{"countries":{"United States":{"attack":12,"normal":345},"中国":{"attack":0,"normal":88},"Reserved":{"attack":1,"normal":0},"0":{"attack":2,"normal":3}},"sample_n":1,"collecting":false}`))
 	}))
 	t.Cleanup(admin.Close)
 	router := newTrafficProxyRouter(t, admin.URL)
@@ -64,7 +64,8 @@ func TestGetThreatScreenTraffic_proxiesAndTranslates(t *testing.T) {
 				Attack uint64 `json:"attack"`
 				Normal uint64 `json:"normal"`
 			} `json:"countries"`
-			Available bool `json:"available"`
+			Available  bool `json:"available"`
+			Collecting bool `json:"collecting"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
@@ -78,6 +79,10 @@ func TestGetThreatScreenTraffic_proxiesAndTranslates(t *testing.T) {
 	}
 	if got := len(payload.Data.Countries); got != 2 {
 		t.Fatalf("countries=%+v, want only 美国 and 中国", payload.Data.Countries)
+	}
+	// 采集租约状态原样透传：无租约时累计冻结，前端不得把冻结值当实时流量
+	if payload.Data.Collecting {
+		t.Fatalf("collecting 必须透传 admin 快照的 false: %+v", payload.Data)
 	}
 }
 
@@ -98,6 +103,10 @@ func TestGetThreatScreenTraffic_adminUnavailableDegrades(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `"countries":{}`) {
 		t.Fatalf("body=%s, want 空 countries", rec.Body.String())
+	}
+	// 降级响应同样披露 collecting=false（冻结/不可达都不得当作实时流量）
+	if !strings.Contains(rec.Body.String(), `"collecting":false`) {
+		t.Fatalf("body=%s, want collecting=false", rec.Body.String())
 	}
 }
 

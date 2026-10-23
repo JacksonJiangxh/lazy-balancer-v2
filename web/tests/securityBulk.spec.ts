@@ -14,7 +14,7 @@ import {
   entriesIntersect,
 } from '../src/utils/securityStages.ts'
 import { CADDY_APPLY_FAILED_MARKER, mergeBulkResults } from '../src/utils/bulkApplyResult.ts'
-import { repoSource, source } from './_helpers.ts'
+import { repoSource, section, source } from './_helpers.ts'
 
 test('A1 分片：按上限切分且保持原顺序（策略绑定 100 / 批量拦截页 500）', () => {
   const bindings = Array.from({ length: 250 }, (_, i) => `lb_${i}`)
@@ -36,6 +36,40 @@ test('A2 分片：单次合计不超过后端上限（每片 ≤100 才满足 bi
 test('A3 分片：空输入/非法上限不产生请求', () => {
   assert.deepEqual(chunkForBulk([], 100), [])
   assert.deepEqual(chunkForBulk(['a'], 0), [])
+})
+
+// 后端整批门是 `len(bindIDs)+len(unbindIDs) > 100 → 400`（security.go）：
+// 只有「bind、unbind 各自成片提交」才让每片 ≤100 等价于合计 ≤100。把两向合并成
+// 一次请求（各 100、合计 200）看起来更省往返，后端整批 400 —— 断言钉住分片策略
+// 本身，而不只是单片上限。
+test('A4 分片请求按方向独立提交：每片对向数组为空且两向各一片', () => {
+  const consumers = [
+    {
+      file: 'src/components/SecurityBindingEditor.vue',
+      start: 'const responses: Array<APIResponse<unknown> | undefined> = []',
+      end: 'showSaveResult(mergeBulkResults(responses)',
+    },
+    {
+      file: 'src/views/security/SecurityPolicies.vue',
+      start: 'const bindResponses: Array<{ message?: string } | undefined> = []',
+      end: 'const mergedBind = mergeBulkResults(bindResponses)',
+    },
+  ] as const
+  for (const { file, start, end } of consumers) {
+    const body = section(source(file), start, end)
+    const requests = [...body.matchAll(/bind: ([^,}\n]+),\s*unbind: ([^,}\n]+)/g)]
+    assert.equal(requests.length, 2, `${file}: 必须恰好两处批量请求（bind 一片源、unbind 一片源）`)
+    for (const match of requests) {
+      const bind = match[1].trim()
+      const unbind = match[2].trim()
+      assert.ok(bind === '[]' || unbind === '[]', `${file}: 单次请求不得同时携带 bind 与 unbind（合计会超后端上限）`)
+    }
+    assert.deepEqual(
+      requests.map((match) => [match[1].trim(), match[2].trim()]),
+      [['ids', '[]'], ['[]', 'ids']],
+      `${file}: 两片必须一正一反（先 bind 全量、再 unbind 全量）`,
+    )
+  }
 })
 
 test('B1 求交：与 filter+includes 结果一致（保序、去重），Set 查表不改变语义', () => {

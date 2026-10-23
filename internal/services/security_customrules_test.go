@@ -12,10 +12,7 @@ import (
 )
 
 func TestResolvePolicyCustomRules_idsLoadFromDB(t *testing.T) {
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
+	initServicesDB(t)
 	if _, err := db.DB.Exec(`INSERT INTO security_custom_rules (name, description, conditions, action, score, enabled) VALUES ('链式验证规则','', '[{"target":"uri","operator":"contains","pattern":"/admin"}]', 'block', 5, 1)`); err != nil {
 		t.Fatal(err)
 	}
@@ -36,10 +33,7 @@ func TestResolvePolicyCustomRules_legacyEmbeddedObjects(t *testing.T) {
 // 不再整查询超限失败导致 WAF 自定义规则静默丢失。
 func TestResolvePolicyCustomRules_chunkedIDsAcrossBatches(t *testing.T) {
 	// Given
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
+	initServicesDB(t)
 	oldChunk := policyCustomRuleChunkSize
 	policyCustomRuleChunkSize = 2
 	t.Cleanup(func() { policyCustomRuleChunkSize = oldChunk })
@@ -68,10 +62,7 @@ func TestResolvePolicyCustomRules_chunkedIDsAcrossBatches(t *testing.T) {
 // 失败块单独留痕，悬空口径只统计查询成功分块。
 func TestResolvePolicyCustomRules_chunkFailureDoesNotInflateDanglingLog(t *testing.T) {
 	// Given
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
+	initServicesDB(t)
 	oldChunk := policyCustomRuleChunkSize
 	policyCustomRuleChunkSize = 2
 	t.Cleanup(func() { policyCustomRuleChunkSize = oldChunk })
@@ -101,10 +92,7 @@ func TestResolvePolicyCustomRules_chunkFailureDoesNotInflateDanglingLog(t *testi
 }
 
 func TestResolvePolicyCustomRules_logsRowScanFailure(t *testing.T) {
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
+	initServicesDB(t)
 	// SQLite 接受 INTEGER 列中的文本；扫描到 int 时注入真实转换失败。
 	if _, err := db.DB.Exec(`INSERT INTO security_custom_rules (id,name,conditions,action,score,enabled) VALUES (91,'坏行','[]','block','not-an-integer',1)`); err != nil {
 		t.Fatal(err)

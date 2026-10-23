@@ -47,6 +47,9 @@ func TestFailJobTruncatesMessage(t *testing.T) {
 func TestDeploymentFailedTruncatesMessage(t *testing.T) {
 	jobID, ruleID := seedCertificateJob(t, "downloaded")
 	issuer := NewCertIssuer(func() error { return errors.New("reload failed") })
+	// 真实 deploymentRetry 会登记异步重试定时器（跨用例存活）；本用例只钉
+	// message 截断，重试登记不参与断言。
+	issuer.deploymentRetry = func(int, issuedCertificate, time.Duration) error { return nil }
 	material := issuedCertificate{
 		ruleID: ruleID, certPEM: "new-cert", keyPEM: "new-key",
 		notAfter: time.Now().Add(90 * 24 * time.Hour), providerID: 1,

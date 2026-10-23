@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -124,48 +125,51 @@ func TestSeedCRSRules_partialLiveTreeIsReseeded(t *testing.T) {
 }
 
 // TestIP2RegionUpdateRun_failOpenMessageCarriesRollbackCause 验证
-// 回滚升级链全部失败走 fail-open 时，DB message 必须携带回滚失败根因——
-// 仅进组件日志会让运维把磁盘/DB 状态误判为纯重载问题。
+// 回滚升级链全部失败走 fail-open 时，DB message 必须携带回滚失败根因
+// （「回滚旧库失败」）——仅进组件日志会让运维把磁盘/DB 状态误判为纯重载问题。
+// 形态：reloader 持续失败 + 本运行备份被移走 + dist 源为目录（copy 级必败）
+// → live 仍是本次已验证的新工件（fail-open 前提成立）但回滚报错。
 func TestIP2RegionUpdateRun_failOpenMessageCarriesRollbackCause(t *testing.T) {
-	// Given 全部回滚基线失败：reloader 首次失败时将 live 换成目录，此后
-	// rename/copy/dist 回退全部失败（镜像 rollbackAllBaselinesFailFailOpen 布景）
 	m := newTestIP2RegionManager(t)
 	seedIP2RegionVersionRow(t, "v3.0.0", true)
 	if err := os.WriteFile(ip2regionLivePath, []byte("old-live-content"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	dir := filepath.Dir(ip2regionLivePath)
+	// dist 用目录形态：rollback 的 dist 级 copyFile 必然失败，而 live 保持
+	// 新工件（rename/copy 级因备份缺失同样失败）。
 	dist := filepath.Join(dir, "waf.dist", "ip2region.xdb")
-	if err := os.MkdirAll(filepath.Dir(dist), 0755); err != nil {
+	if err := os.MkdirAll(dist, 0755); err != nil {
 		t.Fatal(err)
 	}
-	writeTestXDB(t, dist, testSegments)
 	withIP2RegionPaths(t, ip2regionLivePath, dist)
 
 	m.fetchLatestTag = func(context.Context) (string, error) { return "v3.1.0", nil }
 	m.downloadXDB = fakeIP2RegionDownload(t, true)
 	m.reloader = func() error {
-		if info, err := os.Stat(ip2regionLivePath); err == nil && !info.IsDir() {
-			if err := os.Remove(ip2regionLivePath); err != nil {
-				t.Errorf("remove live for dir swap: %v", err)
-			}
-			if err := os.Mkdir(ip2regionLivePath, 0755); err != nil {
-				t.Errorf("replace live with dir: %v", err)
-			}
+		// 移走本运行备份：rename/copy 还原级必败，dist 级（目录）也必败 →
+		// rollbackXDB 返回错误而 live 仍是已验证的新工件。
+		if err := os.Remove(ip2regionLivePath + ".bak"); err != nil && !os.IsNotExist(err) {
+			t.Errorf("remove bak for rollback failure: %v", err)
 		}
 		return errors.New("reload boom")
 	}
 
-	// When 安装成功但 reloader 持续失败、且全部回滚基线均失败
+	// When 安装成功、reloader 持续失败、回滚链全败但 live 仍是新工件
 	m.run("manual", nil)
 
-	// Then live 被换成目录（非新工件普通文件）→ 被拒绝，
-	// 落 failed+旧版本；不得把未验证的目录形态认成「已生效」。
-	_, status, message, _, _, _, _ := ip2RegionVersionRow(t)
-	if status != "failed" {
-		t.Fatalf("update_status=%q, want failed (fail-open precondition holds only for the validated new artifact)", status)
+	// Then fail-open 按成功落库，且 message 携带回滚失败根因。
+	version, status, message, _, _, _, _ := ip2RegionVersionRow(t)
+	if status != "success" {
+		t.Fatalf("update_status=%q (%s), want success (live 已是验证过的新工件)", status, message)
 	}
-	if message == "" {
-		t.Fatal("failed status must carry the reload failure message")
+	if version != "v3.1.0" {
+		t.Fatalf("version=%q, want v3.1.0", version)
+	}
+	if !strings.Contains(message, "回滚旧库失败") {
+		t.Fatalf("fail-open message 必须携带回滚失败根因，got %q", message)
+	}
+	if !strings.Contains(message, "重载 Caddy 配置失败") {
+		t.Fatalf("fail-open message 必须保留 reloader 失败原因，got %q", message)
 	}
 }

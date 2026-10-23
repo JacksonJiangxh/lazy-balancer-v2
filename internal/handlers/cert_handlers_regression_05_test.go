@@ -271,6 +271,7 @@ func TestListCertJobs_derivesExpiryFromPEMWhenExpiresAtNull(t *testing.T) {
 				DaysRemaining     int    `json:"days_remaining"`
 				CertificateStatus string `json:"certificate_status"`
 				ExpiresAt         any    `json:"expires_at"`
+				NotAfter          string `json:"not_after"`
 			} `json:"list"`
 		} `json:"data"`
 	}
@@ -291,6 +292,14 @@ func TestListCertJobs_derivesExpiryFromPEMWhenExpiresAtNull(t *testing.T) {
 		}
 		if job.DaysRemaining < 89 || job.DaysRemaining > 90 {
 			t.Fatalf("days_remaining=%d, want ≈90（PEM NotAfter 派生）", job.DaysRemaining)
+		}
+		// 派生的到期时刻必须下发给 UI——「有效期/自动重签时间」两列只认该字段，
+		// 否则后端算了天数、前端仍按 expires_at 渲染「-」。
+		if job.NotAfter == "" {
+			t.Fatal("not_after empty, want derived RFC3339 expiry")
+		}
+		if _, err := time.Parse(time.RFC3339, job.NotAfter); err != nil {
+			t.Fatalf("not_after=%q, want RFC3339: %v", job.NotAfter, err)
 		}
 	}
 	if !found {

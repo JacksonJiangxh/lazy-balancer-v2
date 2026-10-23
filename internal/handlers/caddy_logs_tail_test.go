@@ -8,6 +8,7 @@ package handlers
 // 统一口径：起点非零丢弃首行残段；窗口内无 '\n'（整窗为同一巨行中段）输出为空。
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -19,16 +20,34 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// tailLogWindow 三形状钉：起点 0 原样 / 含换行丢弃首行残段 / 无换行整窗为空。
+// tailLogWindow 形状钉：起点 0 原样 / 行中段含换行丢弃首行残段 / 行中段无换行
+// 整窗为空 / 起点恰为行首（前一字节 '\n'）首行完整保留。
 func TestTailLogWindow_shapes(t *testing.T) {
-	if got := tailLogWindow([]byte("abc\ndef"), 0); string(got) != "abc\ndef" {
+	if got := tailLogWindow(nil, []byte("abc\ndef"), 0); string(got) != "abc\ndef" {
 		t.Fatalf("startOffset=0 应原样返回, got %q", got)
 	}
-	if got := tailLogWindow([]byte("残段abc\n完整行\n"), 100); string(got) != "完整行\n" {
-		t.Fatalf("含换行应丢弃首行残段, got %q", got)
+
+	fragmentWindow := []byte("残段abc\n完整行\n")
+	fragmentFull := append([]byte("PREVROW"), fragmentWindow...)
+	if got := tailLogWindow(bytes.NewReader(fragmentFull), fragmentWindow, int64(len("PREVROW"))); string(got) != "完整行\n" {
+		t.Fatalf("行中段应丢弃首行残段, got %q", got)
 	}
-	if got := tailLogWindow([]byte("巨行中段无换行"), 100); got != nil {
-		t.Fatalf("无换行应返回空（整窗为同一巨行中段）, got %q", got)
+
+	giantWindow := []byte("巨行中段无换行")
+	giantFull := append([]byte("PREVROW"), giantWindow...)
+	if got := tailLogWindow(bytes.NewReader(giantFull), giantWindow, int64(len("PREVROW"))); got != nil {
+		t.Fatalf("行中段无换行应返回空（整窗为同一巨行中段）, got %q", got)
+	}
+
+	lineStartWindow := []byte("完整行\n完整行2\n")
+	lineStartFull := append([]byte("PREVROW\n"), lineStartWindow...)
+	if got := tailLogWindow(bytes.NewReader(lineStartFull), lineStartWindow, int64(len("PREVROW\n"))); string(got) != string(lineStartWindow) {
+		t.Fatalf("起点恰为行首时应完整保留首行, got %q want %q", got, lineStartWindow)
+	}
+
+	// 读不到前一个字节（窗口起点超出 src 长度）时保守丢弃首行残段。
+	if got := tailLogWindow(bytes.NewReader([]byte("短")), fragmentWindow, 100); string(got) != "完整行\n" {
+		t.Fatalf("无法判定边界时应保守丢弃首行, got %q", got)
 	}
 }
 
@@ -236,5 +255,58 @@ func TestGetCaddyLogs_unknownTypeRejectedWithValidValues(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("body=%s, want 点名可选值 %q", body, want)
 		}
+	}
+}
+
+// GetCaddyLogs 行首形状：startOffset 恰落在行首（前一字节为 '\n'）时窗口首行
+// 是完整行，不得按「残段」丢弃——此前一律丢到首个 '\n' 之后，每 avgLineLen
+// 分之一概率让尾读面板少显示一行（极端形态整窗只有该行时显示「无日志」）。
+func TestGetCaddyLogs_tailWindowKeepsFirstLineAtLineStart(t *testing.T) {
+	// Given：文件总长 = 行首偏移 + 窗口上限，窗口起点恰在 '\n' 之后
+	const maxBytes = 128 * 1024
+	const firstLine = "FIRST-LINE-KEPT"
+	pad := strings.Repeat("h", 200) + "\n" // 201 字节，末字节为 '\n'
+	fillerLen := maxBytes - len(firstLine) - 1
+	if fillerLen <= 0 {
+		t.Fatalf("夹具构造错误: fillerLen=%d", fillerLen)
+	}
+	filler := strings.Repeat("w", fillerLen) // 单行无换行，行数远小于 500
+	content := pad + firstLine + "\n" + filler
+
+	h := newBackupTestHandlers(t)
+	logPath := filepath.Join(t.TempDir(), "caddy.log")
+	if err := os.WriteFile(logPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	if size := int64(len(content)); size-int64(len(pad)) != maxBytes {
+		t.Fatalf("夹具构造错误: 窗口起点偏移=%d, want %d", size-maxBytes, len(pad))
+	}
+	oldPaths := caddyLogPaths
+	caddyLogPaths = map[string]string{"runtime": logPath}
+	t.Cleanup(func() { caddyLogPaths = oldPaths })
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/caddy/logs", h.GetCaddyLogs)
+	response := httptest.NewRecorder()
+
+	// When
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/caddy/logs?type=runtime", nil))
+
+	// Then：起点在行首时首行完整保留
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	var envelope struct {
+		Data struct {
+			Content string `json:"content"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !strings.Contains(envelope.Data.Content, firstLine) {
+		t.Fatalf("起点在行首时首行被丢弃（窗口首 %q）, content 前 64 字符: %q",
+			firstLine, logContentPreview(envelope.Data.Content, 64))
 	}
 }

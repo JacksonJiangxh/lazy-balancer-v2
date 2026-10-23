@@ -185,6 +185,7 @@ func TestSyncService_applySnapshot_brandingFailureMarksRetryAndClearsOnSuccess(t
 	if err != nil {
 		t.Fatal(err)
 	}
+	setNodeMasterRole(t, database, false) // applySnapshot 是纯从端路径，后置标记只在从端语境落库
 	dataDir := t.TempDir()
 	// 注入落盘失败：branding.json 位置被目录占用（os.WriteFile → EISDIR）。
 	if err := os.Mkdir(filepath.Join(dataDir, "branding.json"), 0o755); err != nil {
@@ -494,8 +495,11 @@ func TestClusterService_Promote_drainsPostAdmissionApply(t *testing.T) {
 	if !isMaster || appliedVersion != 0 {
 		t.Fatalf("promoted state is_master=%v applied_version=%d, want master with reset version", isMaster, appliedVersion)
 	}
-	if _, err := syncService.Pull(context.Background()); err == nil {
-		t.Fatal("new pull was accepted after promotion drained the sync service")
+	// 排干后必须拒绝新拉取：停机哨兵或「主节点不能从其他节点同步」都成立
+	// （Promote 已翻转角色，两条拒绝路径任一命中即证明拉取未被准入）。
+	if _, err := syncService.Pull(context.Background()); err == nil ||
+		(!errors.Is(err, errSyncPullStopped) && !errors.Is(err, errSyncMasterNoPull)) {
+		t.Fatalf("pull after promotion error=%v, want 排干/角色拒绝", err)
 	}
 }
 
@@ -584,7 +588,7 @@ func TestClusterService_RegisterNode_reportsOverwrittenApprovedNode(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := service.RegisterNode(context.Background(), request(firstToken, "first-name"), now)
+	first, err := service.RegisterNode(context.Background(), request(firstToken, "first-name"), "10.0.0.5", now)
 	if err != nil {
 		t.Fatalf("first registration: %v", err)
 	}
@@ -602,7 +606,7 @@ func TestClusterService_RegisterNode_reportsOverwrittenApprovedNode(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := service.RegisterNode(context.Background(), request(secondToken, "second-name"), now)
+	second, err := service.RegisterNode(context.Background(), request(secondToken, "second-name"), "10.0.0.5", now)
 	if err != nil {
 		t.Fatalf("duplicate registration: %v", err)
 	}

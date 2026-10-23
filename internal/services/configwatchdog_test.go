@@ -546,6 +546,46 @@ func TestConfigWatchdog_heartbeatSkippedWindowRestartsAtDriftObservation(t *test
 	}
 }
 
+// 非 lb_ 前缀的合法 caddy_id（v2 导入字母表允许，如 web1）必须与渲染口径
+// 恒等：看门狗比对不得按前缀过滤运行配置 @id，否则导入规则后每轮都误报
+// 「缺失」并常亮全局漂移横幅（重启也不会恢复）。
+func TestConfigWatchdog_nonLbPrefixedRuleNotFlaggedAsDrift(t *testing.T) {
+	newClusterTestService(t)
+	ResetConfigDrift()
+	t.Cleanup(ResetConfigDrift)
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,description,protocol,domain,listen_port,strategy,enabled,
+		health_check_interval,health_check_timeout,health_check_unhealthy_threshold,health_check_healthy_threshold)
+		VALUES ('web1','web1','','http','web1.example.test',18081,'weighted_round_robin',1,10,2,3,2)`); err != nil {
+		t.Fatalf("seed non-prefixed rule: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol)
+		VALUES ('web1','127.0.0.1',9000,1,1,'http')`); err != nil {
+		t.Fatalf("seed upstream: %v", err)
+	}
+	server := fakeCaddyWithRoutes(t, `{"apps":{"http":{"servers":{"http_18081":{"routes":[{"@id":"web1","handle":[]}]}}}}}`)
+
+	for i := range 2 {
+		checked, err := checkConfigConsistency(server.URL)
+		if err != nil || !checked {
+			t.Fatalf("round %d: checked=%v err=%v", i+1, checked, err)
+		}
+		if status := CurrentConfigDrift(); !status.Consistent {
+			t.Fatalf("round %d: 非 lb_ 前缀规则被误报漂移: %+v", i+1, status)
+		}
+	}
+	// 启动守卫的启发式面保持不变：非 lb_ @id 不进入外来路由告警。
+	foreign, err := ForeignRunningRuleRoutes(server.URL, map[string]bool{"web1": true})
+	if err != nil {
+		t.Fatalf("ForeignRunningRuleRoutes: %v", err)
+	}
+	if len(foreign) != 0 {
+		t.Fatalf("非 lb_ 前缀路由不得被判为外来: %v", foreign)
+	}
+	if hasRoutes, err := RunningConfigHasRuleRoutes(server.URL); err != nil || hasRoutes {
+		t.Fatalf("启动守卫只认 lb_ 前缀: hasRoutes=%v err=%v", hasRoutes, err)
+	}
+}
+
 // 畸形运行配置形状不得 panic，且合法路由照常提取。
 func TestRunningRuleRouteIDs_toleratesMalformedShapes(t *testing.T) {
 	server := fakeCaddyWithRoutes(t, `{"apps":{"http":{"servers":{"s":{"routes":["str",{"@id":"lb_x"},{"@id":123},null]}},"other":"not-a-map"},"layer4":"bad"}}`)

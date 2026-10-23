@@ -18,6 +18,33 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
+// auditOptionRow 下拉选项的一行（值 + 频次）。
+type auditOptionRow struct {
+	Value string `json:"value"`
+	Count int64  `json:"count"`
+}
+
+// auditOptionsPayload 是下拉选项响应的唯一构造点：正常/降级/故障三种状态
+// 共用同一键集（usernames/actions/resources/partial），避免消费方按状态
+// 切换解码分支。nil 值按空数组下发（JSON null 会让前端 spread 失败）。
+func auditOptionsPayload(usernames, actions, resources []auditOptionRow, partial bool) map[string]interface{} {
+	if usernames == nil {
+		usernames = []auditOptionRow{}
+	}
+	if actions == nil {
+		actions = []auditOptionRow{}
+	}
+	if resources == nil {
+		resources = []auditOptionRow{}
+	}
+	return map[string]interface{}{
+		"usernames": usernames,
+		"actions":   actions,
+		"resources": resources,
+		"partial":   partial,
+	}
+}
+
 // GetAuditLogOptions 返回筛选下拉的可选值：操作人/操作取自审计库去重
 // auditOptionsCache:options 三条 GROUP BY 的进程内缓存(60s)——
 // 下拉选项对实时性不敏感,深审计库每次筛选面板打开都做三趟全表 GROUP BY
@@ -41,9 +68,10 @@ func resetAuditOptionsCacheForTest() {
 func (h *Handlers) GetAuditLogOptions(c *gin.Context) {
 	// 审计库未装配时降级为空结果——同包日志统计
 	// （GetLogStats）与审计写路径都有 nil 守卫，此处此前裸解引用会把生命周期
-	// 边界形态变成 panic/500。
+	// 边界形态变成 panic/500。降级形态与正常路径同键集（三列为空数组 +
+	// partial=true），消费方无需按状态切换解码分支。
 	if db.AuditDB == nil {
-		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]interface{}{}})
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: auditOptionsPayload(nil, nil, nil, true)})
 		return
 	}
 	// 缓存命中直返；并发 miss 经 single-flight 只跑一趟三条 GROUP BY（其余
@@ -63,13 +91,11 @@ func (h *Handlers) GetAuditLogOptions(c *gin.Context) {
 		defer cancel()
 		payload, fetchErr := auditOptionsFetch(ctx)
 		// 任一 fetchDistinct 出错即跳过本轮缓存写入——空结果是故障形态,
-		// 缓存它会让一次瞬态错误在 60s 窗口内持续喂空下拉。
-		// 故障轮响应携带可选 partial=true（旧字段原样保留，前端/JSON
-		// 消费方兼容），让「部分下拉」与「真空库」可区分。
+		// 缓存它会让一次瞬态错误在 60s 窗口内持续喂空下拉。故障轮载荷已由
+		// fetchAuditLogOptions 置 partial=true（与降级形态同键集），让
+		// 「部分下拉」与「真空库」可区分。
 		if fetchErr == nil {
 			storeAuditOptionsCache(payload, time.Now())
-		} else {
-			payload["partial"] = true
 		}
 		return payload, nil
 	})
@@ -177,12 +203,10 @@ func cachedAuditLogTotal(ctx context.Context, database *sql.DB, where string, ar
 }
 
 // fetchAuditLogOptions 执行三条去重聚合（调用方保证同一时刻只跑一趟）。
+// 返回载荷与降级形态同键集：partial 仅在本轮任一列查询/扫描/迭代失败时为
+// true（故障轮载荷不得写入缓存，由调用方按 fetchErr 判定）。
 func fetchAuditLogOptions(ctx context.Context) (map[string]interface{}, error) {
-	type optionRow struct {
-		Value string `json:"value"`
-		Count int64  `json:"count"`
-	}
-	fetchDistinct := func(column string, limit int) ([]optionRow, error) {
+	fetchDistinct := func(column string, limit int) ([]auditOptionRow, error) {
 		rows, err := db.AuditDB.QueryContext(ctx, `
 			SELECT `+column+`, COUNT(*) AS cnt FROM audit_log
 			WHERE `+column+` != ''
@@ -193,13 +217,13 @@ func fetchAuditLogOptions(ctx context.Context) (map[string]interface{}, error) {
 			// 查询失败曾零日志（恒 200 空/部分下拉，运维无信号）——
 			// 首错处 warn 留痕，响应携带 partial 标记。
 			services.Logf("warn", "审计日志下拉选项（%s）查询失败: %v", column, err)
-			return []optionRow{}, err
+			return []auditOptionRow{}, err
 		}
 		defer rows.Close()
-		out := []optionRow{}
+		out := []auditOptionRow{}
 		var scanErr error
 		for rows.Next() {
-			var o optionRow
+			var o auditOptionRow
 			if err := rows.Scan(&o.Value, &o.Count); err != nil {
 				// 单行 Scan 失败须留痕——静默丢行让下拉
 				// 缺项零信号（主查询 500 口径在此分裂为静默）。
@@ -226,19 +250,35 @@ func fetchAuditLogOptions(ctx context.Context) (map[string]interface{}, error) {
 		return out, nil
 	}
 	var fetchErr error
-	collect := func(column string, limit int) []optionRow {
+	collect := func(column string, limit int) []auditOptionRow {
 		rows, err := fetchDistinct(column, limit)
 		if err != nil && fetchErr == nil {
 			fetchErr = err
 		}
 		return rows
 	}
-	payload := map[string]interface{}{
-		"usernames": collect("COALESCE(username,'')", 100),
-		"actions":   collect("action", 100),
-		"resources": collect("COALESCE(resource,'')", 50),
+	usernames := collect("COALESCE(username,'')", 100)
+	actions := collect("action", 100)
+	resources := collect("COALESCE(resource,'')", 50)
+	return auditOptionsPayload(usernames, actions, resources, fetchErr != nil), fetchErr
+}
+
+// auditLogListPayload 是审计列表响应的唯一构造点：正常/降级两种状态共用
+// 同一键集（list/total/total_stale/partial/page/page_size），消费方无需按
+// 状态切换解码分支。list 的静态类型随调用方（降级为空切片、正常为条目
+// 切片），键集与空值语义在此收口。
+func auditLogListPayload(list any, total int64, totalStale, partial bool, page, pageSize int) map[string]interface{} {
+	if list == nil {
+		list = []any{}
 	}
-	return payload, fetchErr
+	return map[string]interface{}{
+		"list":        list,
+		"total":       total,
+		"total_stale": totalStale,
+		"partial":     partial,
+		"page":        page,
+		"page_size":   pageSize,
+	}
 }
 
 // buildAuditLogFilters 组装列筛选 WHERE 子句。时间参数按配置时区解析后
@@ -322,11 +362,11 @@ func buildAuditLogFilters(c *gin.Context, loc *time.Location) (string, []interfa
 const auditLogDeepPageLimit = 500
 
 func (h *Handlers) GetAuditLogs(c *gin.Context) {
-	// 与 GetAuditLogOptions 同口径的 nil 守卫。
+	// 与 GetAuditLogOptions 同口径的 nil 守卫。降级形态与正常路径同键集：
+	// total_stale=true（计数不可信）+ partial=true，消费方无需按状态切换解码。
 	if db.AuditDB == nil {
-		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "审计库未就绪", Data: map[string]interface{}{
-			"list": []map[string]any{}, "total": 0, "page": 1, "page_size": 20, "partial": true,
-		}})
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "审计库未就绪",
+			Data: auditLogListPayload([]map[string]any{}, 0, true, true, 1, 20)})
 		return
 	}
 	// 分页参数统一解析（与安全事件/证书任务同口径）：非整数 400；<1 回默认；
@@ -467,11 +507,5 @@ func (h *Handlers) GetAuditLogs(c *gin.Context) {
 		}
 	}
 
-	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]interface{}{
-		"list":        logs,
-		"total":       total,
-		"total_stale": totalStale,
-		"page":        page,
-		"page_size":   pageSize,
-	}})
+	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: auditLogListPayload(logs, total, totalStale, false, page, pageSize)})
 }

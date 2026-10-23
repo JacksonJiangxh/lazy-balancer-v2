@@ -213,6 +213,7 @@
           </el-radio-group>
         </el-form-item>
         <template v-if="adminTlsForm.mode === 'upload'">
+          <div v-if="adminTlsReuseSaved" class="info-note-bar"><span class="info-note-desc">库内已有可用的上传证书：不选择新文件即沿用该证书，无需重新上传</span></div>
           <el-form-item label="证书文件">
             <div class="tls-file-field">
               <el-button size="small" @click="pickTlsFile('cert')">选择文件</el-button>
@@ -242,7 +243,7 @@
       </el-form>
       <template #footer>
         <el-button @click="adminTlsDialogVisible = false">取消</el-button>
-        <el-button type="primary" :disabled="adminTlsForm.mode === 'upload' && (!adminTlsForm.certInfo || adminTlsForm.certInfo.days_left <= 0)" @click="confirmAdminTls">确定</el-button>
+        <el-button type="primary" :disabled="adminTlsConfirmBlocked" @click="confirmAdminTls">确定</el-button>
       </template>
     </el-dialog>
     <!-- 隐藏文件选择器（弹框 destroy-on-close 会销毁内部 input——置于弹框外，
@@ -496,6 +497,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { request, mfaAwareSuccess, formatBytes } from '@/utils/api'
 import { useLogTailPolling } from '@/composables/useLogTailPolling'
 import { restartServiceWithFeedback } from '@/utils/restart'
+import { adminTlsConfirmDisabled, adminTlsReusesSavedCert } from '@/utils/adminTlsGate'
 import { formatDate } from '@/utils/date'
 import { normalizeTrafficSampleN } from '@/utils/threatFlowRules'
 import { shouldToastQuietPollError } from '@/utils/pollErrorToast'
@@ -1340,6 +1342,16 @@ const pickTlsFile = (kind: 'cert' | 'key'): void => {
 // 存量 upload 证书损坏（含带外改库/旧版本导入形态）：以已保存的 mode 判定，
 // 不受弹框内未提交的切换影响。
 const adminTlsCertBroken = computed(() => adminTlsSaved.value.mode === 'upload' && adminTlsCertError.value !== '')
+// 确认门判据单源 utils/adminTlsGate：已保存的上传证书可沿用（后端在未携带
+// cert_file/key_file 时保留库内材料），保存成功后 staged 证书清空不得导致
+// 「关闭强制加密 → 再开启」必须重传文件。
+const adminTlsStoredCertState = computed(() => ({
+  savedMode: adminTlsSaved.value.mode,
+  hasSavedCert: adminTlsHasCert.value,
+  certError: adminTlsCertError.value,
+}))
+const adminTlsReuseSaved = computed(() => adminTlsReusesSavedCert(adminTlsStoredCertState.value, adminTlsForm.value))
+const adminTlsConfirmBlocked = computed(() => adminTlsConfirmDisabled(adminTlsStoredCertState.value, adminTlsForm.value))
 const adminTlsDirty = computed(() => {
   if (adminTls.value.enabled !== adminTlsSaved.value.enabled) return true
   if (!adminTls.value.enabled) return false
@@ -1483,10 +1495,11 @@ const notifyTlsRestarting = (toHttps: boolean) => {
 
 // 弹窗「确定」仅暂存证书选择，不发请求；随底部「保存」统一提交
 const confirmAdminTls = () => {
+  if (adminTlsConfirmBlocked.value) return
   const { mode, certFile, keyFile, certInfo } = adminTlsForm.value
-  if (mode === 'upload' && (!certFile || !keyFile || !certInfo || certInfo.days_left <= 0)) return
   tlsDialogFromToggle = false
   adminTls.value.mode = mode
+  // 沿用库内证书时保持 null：保存载荷只发 enabled+mode，证书材料由后端保留
   stagedAdminTlsCert.value = mode === 'upload' && certFile && keyFile && certInfo
     ? { certFile, keyFile, certInfo }
     : null
@@ -1587,24 +1600,39 @@ const handleSave = async () => {
     seRowCapDirty.value = false
     // 保存成功后立即刷新全局配置，让 timezone 在 authStore 中立竿见影（date.ts formatDate 展示侧即时生效）；
     // silent：保存已成功，随后的 GET /config 刷新失败不应再弹误导性错误 toast
-    await authStore.fetchConfig(true)
+    try {
+      await authStore.fetchConfig(true)
+    } catch (refreshError) {
+      // 刷新失败不等于保存失败——/config 已落库
+      console.error('Failed to refresh global config after save:', refreshError)
+    }
+    // 父级刷新先于 TLS 段：两段写无跨表事务，TLS 段失败不得让基础设置
+    // 看起来整单未生效（用户只需重试 TLS 段）。
+    emit('save')
     if (tlsPending) {
-      const fd = formDataOf({ enabled: String(adminTls.value.enabled), mode: adminTls.value.mode })
-      const staged = stagedAdminTlsCert.value
-      if (adminTls.value.enabled && adminTls.value.mode === 'upload' && staged) {
-        fd.append('cert_file', staged.certFile)
-        fd.append('key_file', staged.keyFile)
+      try {
+        const fd = formDataOf({ enabled: String(adminTls.value.enabled), mode: adminTls.value.mode })
+        const staged = stagedAdminTlsCert.value
+        if (adminTls.value.enabled && adminTls.value.mode === 'upload' && staged) {
+          fd.append('cert_file', staged.certFile)
+          fd.append('key_file', staged.keyFile)
+        }
+        // silent：失败文案由本段自报（全局「保存失败」会被读成整单未生效）
+        await request.put('/admin-tls', fd, { silent: true })
+        adminTlsSaved.value = { ...adminTls.value }
+        adminTlsHasCert.value = adminTlsHasCert.value || adminTls.value.enabled
+        stagedAdminTlsCert.value = null
+        notifyTlsRestarting(adminTls.value.enabled)
+      } catch (tlsError) {
+        // 部分成功必须显性披露：基础键已落库，证书与重启语义未生效
+        console.error('Failed to save admin TLS config:', tlsError)
+        const reason = tlsError instanceof Error && tlsError.message ? tlsError.message : '未知错误'
+        ElMessage.error(`基础设置已保存；HTTPS 配置保存失败：${reason}。证书未变更，可再次保存以仅重试 HTTPS 段`)
       }
-      await request.put('/admin-tls', fd)
-      adminTlsSaved.value = { ...adminTls.value }
-      adminTlsHasCert.value = adminTlsHasCert.value || adminTls.value.enabled
-      stagedAdminTlsCert.value = null
-      notifyTlsRestarting(adminTls.value.enabled)
     } else {
       const message = (saveResp as unknown as { message?: string }).message ?? ''
       mfaAwareSuccess(message.includes('配置无变化') ? message : '保存成功')
     }
-    emit('save')
   } catch (error) {
     // MessageBox 仅以 'cancel'/'close' 字符串 reject（用户取消），静默短路；
     // 其余错误（HTTP 等）已由全局拦截器 toast，此处仅记录。

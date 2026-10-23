@@ -12,7 +12,8 @@ import (
 )
 
 // 新发现#1 公共夹具：构造带有效校验和的 configBackup 结构体（直测
-// validateV2Backup，不走 HTTP 反序列化，布尔值可按任意 Go 类型注入）。
+// 校验链（validateImportBackupChain），不走 HTTP 反序列化，布尔值可按任意
+// Go 类型注入）。
 func ruleTableBuildBackup(t *testing.T, tables map[string][]map[string]any, cfg map[string]any) configBackup {
 	t.Helper()
 	completeTables := make(map[string][]map[string]any, len(configBackupTables))
@@ -50,17 +51,17 @@ func TestValidateV2Backup_rejects_non_boolean_typed_boolean_columns(t *testing.T
 	}{
 		{
 			name:      "lb_rules.enabled 字符串被拒绝",
-			tables:    map[string][]map[string]any{"lb_rules": {{"caddy_id": "lb_enabled_probe", "name": "enabled-probe", "protocol": "http", "listen_port": 8481, "enabled": "1"}}},
+			tables:    map[string][]map[string]any{"lb_rules": {{"caddy_id": "lb_enabled_probe", "name": "enabled-probe", "protocol": "http", "domain": "probe.test", "listen_port": 8481, "enabled": "1"}}},
 			wantParts: []string{"lb_rules", "第 1 行", "enabled"},
 		},
 		{
 			name:      "lb_rules.enable_tls 字符串被拒绝",
-			tables:    map[string][]map[string]any{"lb_rules": {{"caddy_id": "lb_enabled_probe", "name": "enabled-probe", "protocol": "http", "listen_port": 8481, "enabled": 1, "enable_tls": "true"}}},
+			tables:    map[string][]map[string]any{"lb_rules": {{"caddy_id": "lb_enabled_probe", "name": "enabled-probe", "protocol": "http", "domain": "probe.test", "listen_port": 8481, "enabled": 1, "enable_tls": "true"}}},
 			wantParts: []string{"lb_rules", "enable_tls"},
 		},
 		{
 			name:      "lb_rules 布尔列数值 2 被拒绝",
-			tables:    map[string][]map[string]any{"lb_rules": {{"caddy_id": "lb_enabled_probe", "name": "enabled-probe", "protocol": "http", "listen_port": 8481, "enabled": 2}}},
+			tables:    map[string][]map[string]any{"lb_rules": {{"caddy_id": "lb_enabled_probe", "name": "enabled-probe", "protocol": "http", "domain": "probe.test", "listen_port": 8481, "enabled": 2}}},
 			wantParts: []string{"lb_rules", "enabled"},
 		},
 		{
@@ -70,7 +71,7 @@ func TestValidateV2Backup_rejects_non_boolean_typed_boolean_columns(t *testing.T
 		},
 		{
 			name:      "upstreams.enabled 字符串被拒绝",
-			tables:    map[string][]map[string]any{"lb_rules": {{"caddy_id": "lb_enabled_probe", "name": "enabled-probe", "protocol": "http", "listen_port": 8481, "enabled": 1}}, "upstreams": {{"rule_id": "lb_enabled_probe", "host": "127.0.0.1", "port": 9001, "enabled": "0"}}},
+			tables:    map[string][]map[string]any{"lb_rules": {{"caddy_id": "lb_enabled_probe", "name": "enabled-probe", "protocol": "http", "domain": "probe.test", "listen_port": 8481, "enabled": 1}}, "upstreams": {{"rule_id": "lb_enabled_probe", "host": "127.0.0.1", "port": 9001, "enabled": "0"}}},
 			wantParts: []string{"upstreams", "enabled"},
 		},
 		{
@@ -96,11 +97,11 @@ func TestValidateV2Backup_rejects_non_boolean_typed_boolean_columns(t *testing.T
 			backup := ruleTableBuildBackup(t, tt.tables, tt.config)
 
 			// When
-			_, err := validateV2Backup(backup)
+			_, err := validateImportBackupChain(context.Background(), importValidationDeps{DB: db.DB}, &backup, importValidationOptions{})
 
 			// Then
 			if err == nil {
-				t.Fatalf("validateV2Backup 放行了非布尔类型的布尔列（want 拒绝并点名 %v）", tt.wantParts)
+				t.Fatalf("校验链放行了非布尔类型的布尔列（want 拒绝并点名 %v）", tt.wantParts)
 			}
 			for _, part := range tt.wantParts {
 				if !strings.Contains(err.Error(), part) {
@@ -121,29 +122,29 @@ func TestValidateV2Backup_accepts_canonical_boolean_values(t *testing.T) {
 	}{
 		{
 			name:   "JSON 布尔 true/false 放行",
-			tables: map[string][]map[string]any{"lb_rules": {{"caddy_id": "lb_enabled_probe", "name": "enabled-probe", "protocol": "http", "listen_port": 8481, "enabled": true, "enable_tls": false, "custom_routes_enabled": true}}},
+			tables: map[string][]map[string]any{"lb_rules": {{"caddy_id": "lb_enabled_probe", "name": "enabled-probe", "protocol": "http", "domain": "probe.test", "listen_port": 8481, "enabled": true, "enable_tls": false, "custom_routes_enabled": true}}, "upstreams": {{"rule_id": "lb_enabled_probe", "host": "127.0.0.1", "port": 9001, "enabled": 1}}},
 			config: map[string]any{"admin_tls_enabled": false, "access_log_json": true},
 		},
 		{
 			name:   "0/1 数值放行",
-			tables: map[string][]map[string]any{"lb_rules": {{"caddy_id": "lb_enabled_probe", "name": "enabled-probe", "protocol": "http", "listen_port": 8481, "enabled": 1, "enable_tls": 0}}},
+			tables: map[string][]map[string]any{"lb_rules": {{"caddy_id": "lb_enabled_probe", "name": "enabled-probe", "protocol": "http", "domain": "probe.test", "listen_port": 8481, "enabled": 1, "enable_tls": 0}}, "upstreams": {{"rule_id": "lb_enabled_probe", "host": "127.0.0.1", "port": 9001, "enabled": 1}}},
 			config: map[string]any{"admin_tls_enabled": 0},
 		},
 		{
 			name:   "float64 0/1（JSON 反序列化形态）放行",
-			tables: map[string][]map[string]any{"lb_rules": {{"caddy_id": "lb_enabled_probe", "name": "enabled-probe", "protocol": "http", "listen_port": 8481, "enabled": float64(1)}}},
+			tables: map[string][]map[string]any{"lb_rules": {{"caddy_id": "lb_enabled_probe", "name": "enabled-probe", "protocol": "http", "domain": "probe.test", "listen_port": 8481, "enabled": float64(1)}}, "upstreams": {{"rule_id": "lb_enabled_probe", "host": "127.0.0.1", "port": 9001, "enabled": 1}}},
 		},
 		{
 			name:   "NULL 放行（由 normalizeBackupBooleanNulls 归一）",
-			tables: map[string][]map[string]any{"lb_rules": {{"caddy_id": "lb_enabled_probe", "name": "enabled-probe", "protocol": "http", "listen_port": 8481, "enabled": nil}}},
+			tables: map[string][]map[string]any{"lb_rules": {{"caddy_id": "lb_enabled_probe", "name": "enabled-probe", "protocol": "http", "domain": "probe.test", "listen_port": 8481, "enabled": nil}}, "upstreams": {{"rule_id": "lb_enabled_probe", "host": "127.0.0.1", "port": 9001, "enabled": 1}}},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			newBackupTestHandlers(t)
 			backup := ruleTableBuildBackup(t, tt.tables, tt.config)
-			if _, err := validateV2Backup(backup); err != nil {
-				t.Fatalf("validateV2Backup 误伤规范布尔形态: %v", err)
+			if _, err := validateImportBackupChain(context.Background(), importValidationDeps{DB: db.DB}, &backup, importValidationOptions{}); err != nil {
+				t.Fatalf("校验链误伤规范布尔形态: %v", err)
 			}
 		})
 	}

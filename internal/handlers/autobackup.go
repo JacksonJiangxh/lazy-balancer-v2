@@ -632,6 +632,10 @@ func (h *Handlers) AutoBackupSettings(c *gin.Context) {
 	}})
 }
 
+// autoBackupSettingsBodyLimit 自动备份设置请求体上限：设置项固定五字段 +
+// 分类数组，16 KiB 足够；超限按 413 归因（与 JSON 语法错误区分）。
+const autoBackupSettingsBodyLimit = 16 << 10
+
 // UpdateAutoBackupSettings PUT /api/v1/settings/auto-backup：全量保存设置。
 // 校验：freq∈{daily,weekly,monthly}；time 为 HH:MM；keep 1-30(2026-09-19
 // 追加裁定:上限 100→30)；day weekly 1-7 / monthly 1-28；sections 为已知
@@ -649,7 +653,7 @@ func (h *Handlers) UpdateAutoBackupSettings(c *gin.Context) {
 	if !h.requireAutoBackupMaster(c) {
 		return
 	}
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 16<<10)
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, autoBackupSettingsBodyLimit)
 	var req struct {
 		Enabled   *bool    `json:"enabled"`
 		Frequency *string  `json:"frequency"`
@@ -659,11 +663,18 @@ func (h *Handlers) UpdateAutoBackupSettings(c *gin.Context) {
 		Sections  []string `json:"sections"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
+		// 体积超限单独归因 413：此前与 JSON 语法错误同为 400「请求格式不正确」，
+		// 用户会去排查格式而不是体积（与同族端点 413 口径不一致）。
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: "请求体超过 16 KiB 上限"})
+			return
+		}
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求格式不正确"})
 		return
 	}
 	if req.Enabled == nil || req.Frequency == nil || req.Time == nil || req.Day == nil || req.Keep == nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "缺少必填字段（enabled/frequency/time/day/keep/sections）"})
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "缺少必填字段（enabled/frequency/time/day/keep）"})
 		return
 	}
 	switch *req.Frequency {

@@ -356,9 +356,9 @@ func TestTrafficSnapshotJSON_toleratesInvalidUTF8CountryKey(t *testing.T) {
 }
 
 // 快照形状契约：consumers（internal/handlers 的 trafficSnapshot）只解码
-// countries/sample_n；采集是否活跃由 app 侧 available 布尔表达（按 admin
-// 可达性合成），插件再发射 enabled 是零消费的死字段——发而不用的字段会
-// 误导调用方以为该端点是开关状态源。
+// countries/sample_n/collecting；admin 可达性由 app 侧 available 合成，插件
+// 不发射 enabled（开关真源是租约端点）。collecting=采集租约当前是否有效——
+// 无租约时累计计数冻结，缺该字段会让「累计不变」被误读为「无流量」。
 func TestTrafficSnapshotJSON_omitsUnconsumedEnabledField(t *testing.T) {
 	resetTrafficState(t)
 	trafficRecord("China", false)
@@ -367,7 +367,46 @@ func TestTrafficSnapshotJSON_omitsUnconsumedEnabledField(t *testing.T) {
 	if strings.Contains(raw, `"enabled"`) {
 		t.Fatalf("traffic snapshot must not emit the unconsumed enabled field: %s", raw)
 	}
-	if !strings.Contains(raw, `"countries"`) || !strings.Contains(raw, `"sample_n"`) {
+	if !strings.Contains(raw, `"countries"`) || !strings.Contains(raw, `"sample_n"`) || !strings.Contains(raw, `"collecting"`) {
 		t.Fatalf("snapshot lost its contract fields: %s", raw)
+	}
+}
+
+// 采集租约状态是快照的一等字段：无租约期间计数冻结，快照必须如实披露
+// collecting=false（否则「累计不变」与「无流量」不可区分）。
+func TestTrafficSnapshotJSON_collectorStateFollowsLease(t *testing.T) {
+	resetTrafficState(t)
+	// Given：无租约（采集关闭）
+	trafficCollectorEnabled.Store(false)
+
+	readCollecting := func(t *testing.T) bool {
+		t.Helper()
+		var payload struct {
+			Collecting bool `json:"collecting"`
+		}
+		if err := json.Unmarshal(trafficSnapshotJSON(), &payload); err != nil {
+			t.Fatalf("decode snapshot: %v", err)
+		}
+		return payload.Collecting
+	}
+	if readCollecting(t) {
+		t.Fatal("无租约时 collecting 必须为 false")
+	}
+
+	// When：申请租约
+	if err := acquireTrafficLease("snapshot-lease", time.Second, 1); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { releaseTrafficLease("snapshot-lease") })
+	// Then：collecting=true
+	if !readCollecting(t) {
+		t.Fatal("持有租约时 collecting 必须为 true")
+	}
+
+	// When：释放租约
+	releaseTrafficLease("snapshot-lease")
+	// Then：回落 false
+	if readCollecting(t) {
+		t.Fatal("释放租约后 collecting 必须回落 false")
 	}
 }

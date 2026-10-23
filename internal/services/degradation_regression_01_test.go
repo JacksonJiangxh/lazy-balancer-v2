@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -94,6 +95,82 @@ func TestTrustedProxyDegradation_bannerRecordsOnApply(t *testing.T) {
 	}
 	if bannerAfterClean != "" {
 		t.Fatalf("干净强制应用必须清除 caddy_apply_error，实际残留 %q", bannerAfterClean)
+	}
+}
+
+// TestTrustedProxyDegradation_shortCircuitStillRecordsBanner：启用特性但本轮
+// 渲染降级、产物又与运行配置同字节（短路出口）时，降级横幅/状态同样必须落
+// ——否则「保存成功、面板显示已启用、实际未生效且零横幅」可观测性缺陷复发。
+func TestTrustedProxyDegradation_shortCircuitStillRecordsBanner(t *testing.T) {
+	stubSecurityLibsAvailable(t)
+	_, database := newClusterTestService(t)
+	seedGenerationRule(t, database, "lb-d3-short", false)
+	setLastRenderDegradation("")
+	t.Cleanup(func() { setLastRenderDegradation("") })
+
+	var mu sync.Mutex
+	running := []byte(`{}`)
+	loads := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/config/" {
+			mu.Lock()
+			body := append([]byte(nil), running...)
+			mu.Unlock()
+			_, _ = w.Write(body)
+			return
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/load" {
+			body, err := io.ReadAll(io.LimitReader(r.Body, 32<<20))
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			running = body
+			loads++
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(server.Close)
+	service := NewCaddyService(server.URL)
+
+	// 先下发干净渲染（强制）建立「运行配置=当前字节」基线。
+	if err := service.ApplyConfigForce(GenerateCaddyConfig()); err != nil {
+		t.Fatalf("clean forced apply: %v", err)
+	}
+	mu.Lock()
+	baselineLoads := loads
+	mu.Unlock()
+
+	// 启用受信代理 + 畸形网段 → 渲染降级（按未启用渲染）且与基线同字节。
+	if _, err := database.Exec(`UPDATE global_config SET trusted_proxy_enabled=1, trusted_proxy_ranges='{bad'`); err != nil {
+		t.Fatalf("seed degraded trusted proxy: %v", err)
+	}
+	loaded, err := service.ApplyConfigReporting(GenerateCaddyConfig())
+	if err != nil {
+		t.Fatalf("short-circuit apply: %v", err)
+	}
+	if loaded {
+		t.Fatal("降级产物与运行配置同字节时必须走短路出口（不发生 /load）")
+	}
+	mu.Lock()
+	gotLoads := loads
+	mu.Unlock()
+	if gotLoads != baselineLoads {
+		t.Fatalf("/load 次数=%d, want %d（短路出口不得发请求）", gotLoads, baselineLoads)
+	}
+	if got := LastRenderDegradation(); !strings.Contains(got, "受信代理") {
+		t.Fatalf("短路出口必须收敛降级状态，got %q", got)
+	}
+	var banner string
+	if err := database.QueryRow(`SELECT COALESCE(caddy_apply_error,'') FROM global_config WHERE id=1`).Scan(&banner); err != nil {
+		t.Fatalf("read banner: %v", err)
+	}
+	if !strings.Contains(banner, "受信代理") {
+		t.Fatalf("短路出口必须持久化降级横幅，got %q", banner)
 	}
 }
 

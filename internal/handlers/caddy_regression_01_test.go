@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -219,9 +220,10 @@ func TestValidateV2Backup_legacyChecksumFallback_gatedOnLegacyMarker(t *testing.
 		if err := json.Unmarshal([]byte(legacyChecksummedBackup(t, 2, "2026-08-19T00:00:00Z", true)), &b); err != nil {
 			t.Fatalf("unmarshal backup: %v", err)
 		}
-		usedLegacy, err := validateV2Backup(b)
+		result, err := validateImportBackupChain(context.Background(), importValidationDeps{}, &b, importValidationOptions{})
+		usedLegacy := result.UsedLegacyChecksum
 		if err == nil || !strings.Contains(err.Error(), "v2.1.1 或更早版本导出") {
-			t.Fatalf("validateV2Backup err=%v, want v2.1.1 兼容性提示", err)
+			t.Fatalf("校验链 err=%v, want v2.1.1 兼容性提示", err)
 		}
 		if strings.Contains(err.Error(), "篡改") {
 			t.Fatalf("v2.1.1 合法备份不得误报篡改: %v", err)
@@ -236,9 +238,10 @@ func TestValidateV2Backup_legacyChecksumFallback_gatedOnLegacyMarker(t *testing.
 		if err := json.Unmarshal([]byte(legacyChecksummedBackup(t, 1, "", true)), &b); err != nil {
 			t.Fatalf("unmarshal backup: %v", err)
 		}
-		usedLegacy, err := validateV2Backup(b)
+		result, err := validateImportBackupChain(context.Background(), importValidationDeps{}, &b, importValidationOptions{})
+		usedLegacy := result.UsedLegacyChecksum
 		if err != nil {
-			t.Fatalf("validateV2Backup unexpected error: %v", err)
+			t.Fatalf("校验链 unexpected error: %v", err)
 		}
 		if !usedLegacy {
 			t.Fatal("旧格式 tables 校验和命中时 usedLegacyChecksum 应为 true")
@@ -250,9 +253,10 @@ func TestValidateV2Backup_legacyChecksumFallback_gatedOnLegacyMarker(t *testing.
 		if err := json.Unmarshal([]byte(legacyChecksummedBackup(t, 2, "2026-08-19T00:00:00Z", false)), &b); err != nil {
 			t.Fatalf("unmarshal backup: %v", err)
 		}
-		usedLegacy, err := validateV2Backup(b)
+		result, err := validateImportBackupChain(context.Background(), importValidationDeps{}, &b, importValidationOptions{})
+		usedLegacy := result.UsedLegacyChecksum
 		if err != nil {
-			t.Fatalf("validateV2Backup unexpected error: %v", err)
+			t.Fatalf("校验链 unexpected error: %v", err)
 		}
 		if usedLegacy {
 			t.Fatal("新格式校验和匹配时 usedLegacyChecksum 应为 false")

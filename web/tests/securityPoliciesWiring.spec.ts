@@ -32,9 +32,9 @@ test('CRS 文件名解析单源：四位解析点全部改引 parseCrsFilename',
   assert.equal(parseCrsFilename('not-a-crs-file.conf'), null)
 
   for (const name of ['crsOptionCode', 'crsOptionPhase', 'crsGroupCodeOfFile', 'normalizeCrsGroups']) {
-    const at = page.indexOf(`const ${name} = `)
-    assert.ok(at > 0, `missing ${name}`)
-    const body = page.slice(at, at + 400)
+    // 声明级限段（切到下一个顶层 `const`）：定长窗口会被增长后的函数挤出
+    // （假红），也会越过单行箭头函数把相邻声明纳入检查面（假绿）。
+    const body = section(page, `const ${name} = `, '\nconst ')
     assert.match(body, /parseCrsFilename\(/, `${name} 未走单源解析`)
     assert.doesNotMatch(stripComments(body), /REQUEST\|RESPONSE/, `${name} 仍内联文件名正则`)
   }

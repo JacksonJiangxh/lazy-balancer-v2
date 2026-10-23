@@ -9,7 +9,6 @@ import (
 type configSnapshot struct {
 	ACMEEmail                  string
 	DNSProvider                string
-	DNSCredentials             string
 	CertExpiryDays             int
 	CertRenewalDays            int
 	CertRenewalAttempts        int
@@ -74,7 +73,7 @@ func loadConfigSnapshot() (configSnapshot, error) {
 	var old configSnapshot
 	// 证书到期/续签天数/重试次数三列兜底统一绑定 db.Default*（caddy.go 与
 	// 集群快照同口径）；缺行仍整体报错（预览面拒绝「以零值快照误报全字段变更」）。
-	err := db.DB.QueryRow(`SELECT COALESCE(acme_email,''), COALESCE(dns_provider,'dnspod'), COALESCE(dns_credentials,''),
+	err := db.DB.QueryRow(`SELECT COALESCE(acme_email,''), COALESCE(dns_provider,'dnspod'),
 		COALESCE(cert_expiry_days,?), COALESCE(cert_renewal_days,?), COALESCE(cert_renewal_attempts,?),
 		COALESCE(default_ca_provider_id,0), COALESCE(log_level,'info'),
 		COALESCE(timezone,?),
@@ -93,7 +92,7 @@ func loadConfigSnapshot() (configSnapshot, error) {
 		COALESCE(trusted_proxy_enabled,0), COALESCE(trusted_proxy_ranges,'[]'), COALESCE(trusted_proxy_range_refs,'[]'), COALESCE(trusted_proxy_headers,'[]'), COALESCE(trusted_proxy_strict,1),
 		COALESCE(server_map_lat,0), COALESCE(server_map_lon,0), COALESCE(threat_screen_mode,?), COALESCE(threat_traffic_sample_n,?), COALESCE(security_events_retention_days,?), COALESCE(security_events_row_cap,?)
 		FROM global_config WHERE id=1`, db.DefaultCertExpiryDays, db.DefaultCertRenewalDays, db.DefaultCertRenewalAttempts, db.DefaultTimezone, db.DefaultThreatScreenMode, db.DefaultThreatTrafficSampleN, db.DefaultSecurityEventsRetentionDays, db.DefaultSecurityEventsRowCap).Scan(
-		&old.ACMEEmail, &old.DNSProvider, &old.DNSCredentials,
+		&old.ACMEEmail, &old.DNSProvider,
 		&old.CertExpiryDays, &old.CertRenewalDays, &old.CertRenewalAttempts,
 		&old.DefaultCAProviderID, &old.LogLevel,
 		&old.Timezone,
@@ -136,7 +135,9 @@ func planConfigChanges(req models.UpdateConfigRequest, old configSnapshot) confi
 
 	add("acme_email", "ACME邮箱", req.ACMEEmail != nil && *req.ACMEEmail != old.ACMEEmail)
 	add("dns_provider", "DNS提供商", req.DNSProvider != nil && *req.DNSProvider != old.DNSProvider)
-	add("dns_credentials", "DNS凭证", req.DNSCredentials != nil && *req.DNSCredentials != old.DNSCredentials)
+	// global_config.dns_credentials 为遗留列：读路径不回显、写路径已移除，
+	// 不再参与变更清单/字段级审计归因（签发凭证的唯一来源是
+	// certificate_configs.dns_credentials）。
 	add("cert_expiry_days", "过期提醒天数", req.CertExpiryDays != nil && *req.CertExpiryDays != old.CertExpiryDays)
 	add("default_ca_provider_id", "CA提供商", req.DefaultCAProviderID != nil && *req.DefaultCAProviderID != old.DefaultCAProviderID)
 	add("cert_renewal_days", "续签天数", req.CertRenewalDays != nil && *req.CertRenewalDays != old.CertRenewalDays)

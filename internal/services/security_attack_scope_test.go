@@ -44,6 +44,25 @@ func TestCrawlerExemptAttackScopeSQLMatchesGo(t *testing.T) {
 		}
 	}
 
+	// 边界语义显式期望（不依赖 Go↔SQL 等值自证——两侧同时引入同一 off-by-one
+	// 时等值断言仍绿）：豁免段 = [810016, 849999]（base+16 起、伪装段起点前），
+	// 且只对 logged 生效。
+	for _, tc := range []struct {
+		rule, action string
+		wantAttack   bool
+	}{
+		{"810015", SecurityEventActionLogged, true},  // 豁免段前最后一格
+		{"810016", SecurityEventActionLogged, false}, // 豁免段首
+		{"810031", SecurityEventActionLogged, false}, // 段内（旧 15 引擎末槽之后仍在段内）
+		{"849999", SecurityEventActionLogged, false}, // 豁免段尾
+		{"850000", SecurityEventActionLogged, true},  // 伪装段起点（实际 deny，计入攻击）
+		{"810031", SecurityEventActionBlocked, true}, // blocked 恒计入攻击
+	} {
+		if got := SecurityEventCountsAsAttack(tc.action, tc.rule); got != tc.wantAttack {
+			t.Fatalf("CountsAsAttack(%q,%q)=%v, want %v", tc.action, tc.rule, got, tc.wantAttack)
+		}
+	}
+
 	// 段界全覆盖：普通 GeoIP 段尾、豁免段内起始前一格、段首、段内首个
 	// 合法 id、段尾、伪装段起点、CRS 段首。
 	for _, rule := range []string{

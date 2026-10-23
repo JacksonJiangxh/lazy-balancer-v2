@@ -10,6 +10,7 @@ import assert from 'node:assert/strict'
 
 import { heatEntriesEqual, heatCss, DOT_LAND, arcEndpoints, POINTY_TOP_HEX_VERTICES, drillCountryAllowed, arcOriginForLocation, normalizeCountryName, adminShortName, aggregateCountryCounts, hasProvinceStats, drillCommitAllowed, buildCountryCellGrid, countryGridCell } from '../src/utils/threatShared.ts'
 import { FALLBACK_CENTROID } from '../src/utils/countryCentroids.ts'
+import { member, repoSource, source } from './_helpers.ts'
 
 test('六边形点阵：pointy-top 六顶点且上下尖角', () => {
   assert.equal(POINTY_TOP_HEX_VERTICES.length, 6)
@@ -95,7 +96,7 @@ test('计数合并：台湾计数并入中国，其他键保持独立（热力/h
   assert.equal(merged.size, 2)
 })
 
-test('省短名：34 省后缀逐条剥离，非行政后缀不动（与后端 ip2RegionShortenName 同口径）', () => {
+test('省短名代表形态：长后缀优先匹配，非行政后缀不动', () => {
   assert.equal(adminShortName('广西壮族自治区'), '广西')
   assert.equal(adminShortName('宁夏回族自治区'), '宁夏')
   assert.equal(adminShortName('新疆维吾尔自治区'), '新疆')
@@ -106,6 +107,27 @@ test('省短名：34 省后缀逐条剥离，非行政后缀不动（与后端 i
   // 无后缀/后缀即全名时不得截成空串
   assert.equal(adminShortName('California'), 'California')
   assert.equal(adminShortName('省'), '省')
+})
+
+test('省短名单源：34 省数据的 short 必须等于剥后缀函数输出', () => {
+  for (const province of CHINA_PROVINCES) {
+    assert.equal(
+      province.short,
+      adminShortName(province.name),
+      `${province.name} 的省短名与 adminShortName 分叉——地球标签/下钻查找用的是数据侧 short，点阵键用的是函数`,
+    )
+  }
+})
+
+test('剥后缀表与后端 ip2RegionDisplaySuffixes 逐项相等（长后缀优先序一致）', () => {
+  const body = member(source('src/utils/threatShared.ts'), 'export function adminShortName(')
+  const frontTable = /const suffixes = \[([^\]]*)\]/.exec(body)?.[1]
+  assert.ok(frontTable, 'adminShortName 的 suffixes 表被改形——本对表钉需同步')
+  const front = [...frontTable.matchAll(/'([^']+)'/g)].map((match) => match[1])
+  const goTable = /var ip2RegionDisplaySuffixes = \[\]string\{([^}]*)\}/.exec(repoSource('internal/handlers/security.go'))?.[1]
+  assert.ok(goTable, 'security.go 缺 ip2RegionDisplaySuffixes 声明')
+  const go = [...goTable.matchAll(/"([^"]+)"/g)].map((match) => match[1])
+  assert.deepEqual(front, go, '两端后缀表必须同集同序——后端事件 province 短名与前端点阵键靠它对齐')
 })
 
 test('省级统计边界：仅中国有省级数据源，海外下钻必须显示「无省级统计」', () => {

@@ -24,7 +24,11 @@ func useCertSweepTickTestEnv(t *testing.T) {
 	oldDir := taskengine.LogDir()
 	taskengine.SetLogDir(filepath.Join(t.TempDir(), "logs", "tasks"))
 	t.Cleanup(func() {
+		// 指针还原前先关掉本用例初始化的库：只还原指针会让每个用例泄漏
+		// 一个 sqlite 句柄与临时目录（同 newClusterTestService 的收尾口径）。
+		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		db.SetDB(oldDB)
 		taskengine.SetLogDir(oldDir)
 		SetActiveCertificateService(nil)
 		lastCertServiceMissing.Store(false)

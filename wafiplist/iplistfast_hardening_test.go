@@ -1,9 +1,12 @@
 package wafiplist
 
 import (
+	"errors"
 	"fmt"
 	"net/netip"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -441,4 +444,91 @@ func TestParseIPListFile_stampsGenerationFromReadContent(t *testing.T) {
 		t.Fatalf("state.mtime=%v, want %v (读取内容的 mtime，而非 pre-stat 的 %v)",
 			state.mtime, newInfo.ModTime(), oldInfo.ModTime())
 	}
+}
+
+// staleStatSource 模拟「stat 与读之间文件被原位改写」：第一次 Stat 返回改写
+// 前的小尺寸形态，Read 从真实 inode 流式读（因此可读到改写后的内容），
+// 第二次 Stat 返回当前真实形态——boundedReadSource 的替身注入点。
+type staleStatSource struct {
+	file  *os.File
+	stale os.FileInfo
+	stats int
+	read  int64
+}
+
+func (s *staleStatSource) Stat() (os.FileInfo, error) {
+	s.stats++
+	if s.stats == 1 {
+		return s.stale, nil
+	}
+	return s.file.Stat()
+}
+
+func (s *staleStatSource) Read(p []byte) (int, error) {
+	n, err := s.file.Read(p)
+	s.read += int64(n)
+	return n, err
+}
+
+// 有界代际读（名单加载器与爬虫段快照加载器共用同一原语）：
+//   - 定长读以 pre-stat 尺寸为准，stat 与读之间被原位追加不得放大读入量；
+//   - 读后复核同一 inode，形态变化（追加/截断/同尺寸改写）必须放弃本次
+//     加载——混合字节不能当作一代内容落定。
+func TestReadBoundedFile_boundedGenerationRead(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "list.txt")
+	if err := os.WriteFile(path, []byte("203.0.113.7\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("追加不放大读入量且拒绝混合代际", func(t *testing.T) {
+		fd, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer fd.Close()
+		before, err := fd.Stat()
+		if err != nil {
+			t.Fatal(err)
+		}
+		appendFd, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := appendFd.WriteString(strings.Repeat("# pad\n", 4096)); err != nil {
+			appendFd.Close()
+			t.Fatal(err)
+		}
+		if err := appendFd.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		src := &staleStatSource{file: fd, stale: before}
+		raw, _, err := readBoundedFrom(src, path, 1<<20)
+		if !errors.Is(err, ErrFileRewriteDuringRead) {
+			t.Fatalf("err=%v, want ErrFileRewriteDuringRead（读后形态变化必须拒绝）", err)
+		}
+		if raw != nil {
+			t.Fatal("拒绝的读取不得返回内容")
+		}
+		if src.read != before.Size() {
+			t.Fatalf("实际读入 %d 字节, want %d（定长读不得被追加放大）", src.read, before.Size())
+		}
+	})
+
+	t.Run("未改写读取成功且形态取自同一 inode", func(t *testing.T) {
+		raw, info, err := ReadBoundedFile(path, 1<<20)
+		if err != nil {
+			t.Fatalf("readBoundedFile: %v", err)
+		}
+		if int64(len(raw)) != info.Size() {
+			t.Fatalf("读入 %d 字节, stat %d 字节（同一代际）", len(raw), info.Size())
+		}
+	})
+
+	t.Run("超限拒绝", func(t *testing.T) {
+		if _, _, err := ReadBoundedFile(path, 4); !errors.Is(err, ErrFileSizeLimit) {
+			t.Fatalf("err=%v, want ErrFileSizeLimit", err)
+		}
+	})
 }

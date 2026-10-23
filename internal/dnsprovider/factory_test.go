@@ -1,6 +1,7 @@
 package dnsprovider
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -123,5 +124,69 @@ func TestNewProviderFromCredentials_uiFieldsOverrideStaleAPIToken(t *testing.T) 
 	}
 	if dnspodProvider.LoginToken() != "123,abc" {
 		t.Fatalf("login token=%q, want 123,abc（app_id/app_token 优先）", dnspodProvider.LoginToken())
+	}
+}
+
+// stubProvider 只记录调用形态，用于验证能力分派（不含 DNS 网络行为）。
+type stubProvider struct {
+	presentCalls int
+	cleanupCalls int
+	valueCalls   int
+}
+
+func (p *stubProvider) Present(context.Context, string, string, string, int) error {
+	p.presentCalls++
+	return nil
+}
+
+func (p *stubProvider) CleanUp(context.Context, string, string) error {
+	p.cleanupCalls++
+	return nil
+}
+
+// valueStubProvider 在 stubProvider 上叠加 ValueCleaner/CleanupCounter 能力。
+type valueStubProvider struct {
+	stubProvider
+	count int
+}
+
+func (p *valueStubProvider) CleanUpValue(context.Context, string, string, string) error {
+	p.valueCalls++
+	return nil
+}
+
+func (p *valueStubProvider) CountCleanupRecords(string, string, string) int { return p.count }
+
+// 按值清理的能力分派：具备 ValueCleaner 走按值清理，否则回落按名清理
+// （两条分支都无测试时，类型断言写反/漏判不会有任何红灯）。
+func TestCleanUpChallenge_dispatchesToValueCleanerWhenAvailable(t *testing.T) {
+	plain := &stubProvider{}
+	if err := CleanUpChallenge(context.Background(), plain, "example.com", "_acme-challenge.example.com.", "v"); err != nil {
+		t.Fatalf("clean up plain provider: %v", err)
+	}
+	if plain.cleanupCalls != 1 || plain.valueCalls != 0 {
+		t.Fatalf("plain calls cleanup=%d value=%d, want 1/0", plain.cleanupCalls, plain.valueCalls)
+	}
+
+	aware := &valueStubProvider{}
+	if err := CleanUpChallenge(context.Background(), aware, "example.com", "_acme-challenge.example.com.", "v"); err != nil {
+		t.Fatalf("clean up value-aware provider: %v", err)
+	}
+	if aware.valueCalls != 1 || aware.cleanupCalls != 0 {
+		t.Fatalf("value-aware calls cleanup=%d value=%d, want 0/1", aware.cleanupCalls, aware.valueCalls)
+	}
+}
+
+// 清理预算是「宁大勿小」：无计数能力的 provider 与计数为 0 的 provider 都必须
+// 按 1 条计（读失败 = 0 不得把预算算成 0 而直接跳过清理）。
+func TestCountChallengeCleanupRecords_fallsBackToAtLeastOne(t *testing.T) {
+	if got := CountChallengeCleanupRecords(&stubProvider{}, "example.com", "_acme-challenge.example.com.", "v"); got != 1 {
+		t.Fatalf("count without capability=%d, want 1", got)
+	}
+	if got := CountChallengeCleanupRecords(&valueStubProvider{count: 0}, "example.com", "_acme-challenge.example.com.", "v"); got != 1 {
+		t.Fatalf("count with zero report=%d, want 1（读失败/零条目按至少 1 条）", got)
+	}
+	if got := CountChallengeCleanupRecords(&valueStubProvider{count: 3}, "example.com", "_acme-challenge.example.com.", "v"); got != 3 {
+		t.Fatalf("count with report=%d, want 3", got)
 	}
 }

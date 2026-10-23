@@ -16,18 +16,19 @@ package caddygeoip
 import (
 	"context"
 	"encoding/json"
-	"io"
+	"errors"
 	"net"
 	"net/netip"
-
-	"lazy-balancer-v2/wafiplist"
-	"os"
+	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
 
 	"lazy-balancer-v2/geoipnames"
+	"lazy-balancer-v2/wafiplist"
 )
 
 // crawlerDNSResolver 解析器接口（测试替身注入点）。
@@ -290,8 +291,9 @@ func setCrawlerIPListFilePath(path string) {
 }
 
 // crawlerIPRangeSnapshot 预编译快照：引擎 ID → 已解析前缀列表。加载时一次性
-// ParsePrefix，判定热路径零解析/零分配。ok=false 表示读取/解析失败
-// 的空快照——只按短重试间隔节流，成功快照按完整重载间隔缓存。
+// ParsePrefix 并聚合为「升序不相交」集合（判定期二分，零解析/零分配）。
+// ok=false 表示读取/解析失败的空快照——只按短重试间隔节流，成功快照按完整
+// 重载间隔缓存。
 type crawlerIPRangeSnapshot struct {
 	prefixes map[string][]netip.Prefix
 	// filePath 标识本次读取所属的路径代际；配置切换后在途旧路径读取不得
@@ -322,10 +324,53 @@ const crawlerIPListReloadInterval = 10 * time.Minute
 // 异常/损坏文件不得整体读入内存放大驻留。
 const crawlerIPListMaxBytes = 4 << 20
 
-// crawlerSnapshotLogf 快照加载异常告警（体积门/坏条目）。日志而非静默：
-// 豁免段静默缩水会让真爬虫被判伪装、产生误报事件，必须可观测。
+// crawlerSnapshotLogf 快照加载异常告警（体积门/坏条目/读取期改写）。日志而非
+// 静默：豁免段静默缩水会让真爬虫被判伪装、产生误报事件，必须可观测。
 func crawlerSnapshotLogf(format string, args ...any) {
+	crawlerSnapshotLogCallsForTest.Add(1)
 	caddy.Log().Named("geoip2region.crawler").Sugar().Warnf(format, args...)
+}
+
+// crawlerSnapshotLogInterval 是同路径同原因告警的最小间隔（对齐 wafiplist
+// StaleServeLogInterval 口径；0=不节流，测试用）。失败快照按
+// crawlerIPListRetryInterval（10s）重读，持久异常形态（超限文件、磁盘满、
+// 半截快照）不节流时约 8.6k 行/天，会稀释真实告警。原因变化立即上报
+// （状态迁移必须可见）；成功快照落定后清除记录——再次故障立即可见。
+var crawlerSnapshotLogInterval = time.Minute
+
+var (
+	crawlerSnapshotLogMu   sync.Mutex
+	crawlerSnapshotLogLast = map[string]time.Time{} // "path|reason" → 上次上报时刻
+	// crawlerSnapshotLogCallsForTest 记录实际发射的告警条数（节流后）。
+	crawlerSnapshotLogCallsForTest atomic.Int64
+)
+
+// crawlerSnapshotLogfThrottled 按「路径+原因」节流告警。
+func crawlerSnapshotLogfThrottled(path, reason, format string, args ...any) {
+	if crawlerSnapshotLogInterval > 0 {
+		key := path + "|" + reason
+		now := time.Now()
+		crawlerSnapshotLogMu.Lock()
+		if last, ok := crawlerSnapshotLogLast[key]; ok && now.Sub(last) < crawlerSnapshotLogInterval {
+			crawlerSnapshotLogMu.Unlock()
+			return
+		}
+		crawlerSnapshotLogLast[key] = now
+		crawlerSnapshotLogMu.Unlock()
+	}
+	crawlerSnapshotLogf(format, args...)
+}
+
+// clearCrawlerSnapshotLogs 清除该路径的节流记录（成功快照落定后调用）。
+func clearCrawlerSnapshotLogs(path string) {
+	prefix := path + "|"
+	crawlerSnapshotLogMu.Lock()
+	for key := range crawlerSnapshotLogLast {
+		if strings.HasPrefix(key, prefix) {
+			delete(crawlerSnapshotLogLast, key)
+		}
+	}
+	crawlerSnapshotLogMu.Unlock()
 }
 
 // crawlerIPListRetryInterval 是失败/坏快照的重试间隔：Caddy 可能先于根服务
@@ -333,6 +378,11 @@ func crawlerSnapshotLogf(format string, args ...any) {
 // 360 引擎豁免会 fail-closed 最长 10 分钟（伪装判定）；10s 既避免每次判定
 // 读盘，又让文件出现后迅速收敛。var 供测试收窄。
 var crawlerIPListRetryInterval = 10 * time.Second
+
+// crawlerReadBoundedFile 是快照读盘唯一入口：有界代际读（体积门 + 定长读 +
+// 读后同 inode 复核）与 wafiplist 名单加载器共用同一原语。var 供测试注入
+// 「读期间被改写」等形态，生产恒为 wafiplist.ReadBoundedFile。
+var crawlerReadBoundedFile = wafiplist.ReadBoundedFile
 
 // loadCrawlerIPRangeSnapshot 返回当前快照（成功快照超过 10min、失败快照超过
 // 重试间隔时重读）。读盘与解析在锁外完成（双检 + 原子快照替换 + 内容代际
@@ -357,45 +407,60 @@ func loadCrawlerIPRangeSnapshot() *crawlerIPRangeSnapshot {
 	crawlerFileCacheMu.Unlock()
 
 	next := &crawlerIPRangeSnapshot{prefixes: map[string][]netip.Prefix{}, loadedAt: now, filePath: crawlerIPListFilePath()}
-	if file, err := os.Open(next.filePath); err == nil {
-		// stat 与读取针对同一已打开 inode：rename 换文件后旧 fd 读到的仍是
-		// 旧代际内容，st 因此如实标识所读内容（不能读后按路径再 stat）。
-		if st, statErr := file.Stat(); statErr == nil {
-			if st.Size() > crawlerIPListMaxBytes {
-				// 体积门（与 wafiplist.MaxFileBytes/MaxFastFileBytes 同口径）：
-				// 异常/损坏文件不得整体读入内存；fail-closed 消费空快照。
-				crawlerSnapshotLogf("crawler ip list snapshot %s exceeds %d bytes (size %d); treating as unavailable",
-					next.filePath, crawlerIPListMaxBytes, st.Size())
-			} else if data, readErr := io.ReadAll(file); readErr == nil {
-				var all map[string][]string
-				if err := json.Unmarshal(data, &all); err == nil {
-					next.ok = true
-					next.modTime, next.size = st.ModTime(), st.Size()
-					badCIDRs := 0
-					for engine, cidrs := range all {
-						prefixes := make([]netip.Prefix, 0, len(cidrs))
-						for _, cidr := range cidrs {
-							if p, err := netip.ParsePrefix(cidr); err == nil {
-								prefixes = append(prefixes, p)
-							} else {
-								badCIDRs++
-							}
-						}
-						next.prefixes[engine] = prefixes
-					}
-					// 坏条目不 fail-closed 整份（单条损坏不应放大成「全部爬虫
-					// 判伪装」的误报面），但必须可见：豁免段静默缩水是安全侧
-					// 误报的直接来源。
-					if badCIDRs > 0 {
-						crawlerSnapshotLogf("crawler ip list snapshot %s has %d unparsable CIDR entries; snapshot still cached (fail-open on those entries, engines affected may over-report)",
-							next.filePath, badCIDRs)
-					}
-				}
-			}
+	raw, info, readErr := crawlerReadBoundedFile(next.filePath, crawlerIPListMaxBytes)
+	switch {
+	case errors.Is(readErr, wafiplist.ErrFileSizeLimit):
+		// 体积门（与 wafiplist.MaxFileBytes/MaxFastFileBytes 同口径）：异常/
+		// 损坏文件不得整体读入内存；fail-closed 消费空快照。
+		crawlerSnapshotLogfThrottled(next.filePath, "oversized",
+			"crawler ip list snapshot %s exceeds %d bytes (size %d); treating as unavailable",
+			next.filePath, crawlerIPListMaxBytes, info.Size())
+	case errors.Is(readErr, wafiplist.ErrFileRewriteDuringRead):
+		// 读期间被原地改写（追加/截断/同尺寸改写）：读到的只是混合字节，
+		// 不当作一代内容落定；fail-closed 等下一轮重读。
+		crawlerSnapshotLogfThrottled(next.filePath, "rewrite",
+			"crawler ip list snapshot %s was rewritten while being read; treating as unavailable",
+			next.filePath)
+	case readErr != nil:
+		// 缺失/不可读：fail-closed 空快照，不告警——首启时 Caddy 先于根服务
+		// 生成快照属正常形态，重试间隔内自愈。
+	default:
+		if next.parsePayload(raw) {
+			// 代际元数据取自读取所用的同一 inode（见 ReadBoundedFile）。
+			next.ok, next.modTime, next.size = true, info.ModTime(), info.Size()
+			clearCrawlerSnapshotLogs(next.filePath)
 		}
-		_ = file.Close()
 	}
 	return commitCrawlerIPRangeSnapshot(next)
+}
+
+// parsePayload 解析 JSON 段集，并按引擎聚合为「升序不相交」前缀集——判定
+// 期二分查找的正确性依赖该不变量（与 @ipListFast 共用聚合原语）。坏条目逐条
+// 跳过（单条损坏不得放大成整份豁免失效、产生误报事件），但必须可见。
+// 返回 false = 内容不可用（fail-closed）。
+func (s *crawlerIPRangeSnapshot) parsePayload(raw []byte) bool {
+	var all map[string][]string
+	if err := json.Unmarshal(raw, &all); err != nil {
+		return false
+	}
+	badCIDRs := 0
+	for engine, cidrs := range all {
+		prefixes := make([]netip.Prefix, 0, len(cidrs))
+		for _, cidr := range cidrs {
+			if p, err := netip.ParsePrefix(cidr); err == nil {
+				prefixes = append(prefixes, p)
+			} else {
+				badCIDRs++
+			}
+		}
+		s.prefixes[engine] = wafiplist.AggregateParsedPrefixes(prefixes)
+	}
+	if badCIDRs > 0 {
+		crawlerSnapshotLogfThrottled(s.filePath, "bad-cidr",
+			"crawler ip list snapshot %s has %d unparsable CIDR entries; snapshot still cached (fail-open on those entries, engines affected may over-report)",
+			s.filePath, badCIDRs)
+	}
+	return true
 }
 
 // commitCrawlerIPRangeSnapshot 在锁内落定快照，并拒绝旧代际/陈旧失败覆盖：
@@ -447,17 +512,18 @@ func verifyCrawlerIPRangeVerdict(ipStr, engineID string) CrawlerVerdict {
 	}
 	// 畸形地址不得 panic（MustParseAddr 旧实现可直接崩进程）——
 	// 解析失败即确定为非该引擎出口。
-	// 带 zone 拒绝 + 4in6 映射形态 Unmap 归一——netip 的 v4
-	// 前缀不含 4in6 地址，不归一则映射形态的真爬虫恒不命中（误判为伪装）。
+	// 带 zone 拒绝 + 4in6 映射形态 Unmap 归一——netip 的 v4 前缀不含 4in6
+	// 地址，不归一则映射形态的真爬虫恒不命中（误判为伪装）。
 	ip, err := netip.ParseAddr(ipStr)
 	if err != nil || ip.Zone() != "" {
 		return CrawlerVerdictSpoof
 	}
 	ip = ip.Unmap()
-	for _, prefix := range entries {
-		if prefix.Contains(ip) {
-			return CrawlerVerdictVerified
-		}
+	// 加载期已聚合为升序不相交集合：含目标的前缀必为最后一个 start <= 目标
+	// 的前缀（与 @ipListFast 同构，O(log n)）。
+	i := sort.Search(len(entries), func(i int) bool { return entries[i].Addr().Compare(ip) > 0 }) - 1
+	if i >= 0 && entries[i].Contains(ip) {
+		return CrawlerVerdictVerified
 	}
 	return CrawlerVerdictSpoof
 }

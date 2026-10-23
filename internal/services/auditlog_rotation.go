@@ -202,6 +202,12 @@ func rotateAuditLogIfNeeded() (total int, rotErr error) {
 			// digit key 归一为 #。消息内容保持原样。
 			throttledAuditFailureLogf("audit log rotation: pending delta archive %s missing, dropping marker", pending.Path)
 			_ = os.Remove(securityEventsPendingDeltaPath())
+		} else if !securityEventsIngestDepsReady() {
+			// 补采依赖不可用时 securityEventsIngestDeltaFrom 返回 (0, nil)——
+			// 「未补采」不得被当作「补采成功」：删除标记会让该轮转窗口的事件
+			// 永久丢失。保留标记并中止本轮（下轮依赖恢复后先重试补采）。
+			throttledAuditFailureLogf("audit log rotation: pending delta ingest deferred (security events database unavailable)")
+			return total, fmt.Errorf("pending delta ingest deferred: security events database unavailable")
 		} else if n, err := securityEventsIngestDeltaFrom(pending.Path, pending.Offset, true); err != nil {
 			throttledAuditFailureLogf("audit log rotation: pending delta ingest retry failed (rotation deferred): %v", err)
 			return total, fmt.Errorf("pending delta ingest retry (rotation deferred): %w", err)
@@ -302,6 +308,12 @@ func rotateAuditLogIfNeeded() (total int, rotErr error) {
 		if terr != nil || tailInfo.Size() <= archSize {
 			break
 		}
+		// 依赖不可用时补采是 no-op——不得据此推进 archSize 并截断活文件：
+		// 尾部事件只在活文件里，截断即永久丢失。保留现场，下轮依赖恢复后续采。
+		if !securityEventsIngestDepsReady() {
+			throttledAuditFailureLogf("audit log rotation: live tail ingest deferred (security events database unavailable, not truncating)")
+			return total, fmt.Errorf("live tail ingest deferred (not truncating): security events database unavailable")
+		}
 		ingestFrom, berr := securityEventsBackscanDocumentStart(auditLogPath, archSize)
 		if berr != nil {
 			throttledAuditFailureLogf("audit log rotation: backscan live tail failed (not truncating): %v", berr)
@@ -350,7 +362,12 @@ func rotateAuditLogIfNeeded() (total int, rotErr error) {
 	Logf("info", "audit log rotation: rotated %s (%d bytes → %s.1)", auditLogPath, info.Size(), base)
 	// 补采轮转窗口：归档大小可能因复制期间的新写入大于 stat 时的 size，
 	// 因此以 .1 实际大小作为窗口终点，覆盖复制竞态。
-	if n, err := securityEventsIngestRotatedDelta(persistedOffset); err != nil {
+	if !securityEventsIngestDepsReady() {
+		// 补采依赖不可用时不得把「未补采」当成功删除 pending 安全网：
+		// 保留标记（下轮 shift 前先重试，事件仍在 .1），按失败留痕。
+		throttledAuditFailureLogf("audit log rotation: ingest rotated delta deferred (security events database unavailable)")
+		noteErr(fmt.Errorf("ingest rotated delta deferred: security events database unavailable"))
+	} else if n, err := securityEventsIngestRotatedDelta(persistedOffset); err != nil {
 		throttledAuditFailureLogf("audit log rotation: ingest rotated delta failed (events in %s.1 may be lost): %v", base, err)
 		noteErr(fmt.Errorf("ingest rotated delta failed: %w", err))
 		// 标记保留（truncate 前已落盘）：事件只在 .1，下次轮转 shift 前先重试，

@@ -7,9 +7,10 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { registerModuleHooks } from './_helpers.ts'
+import { dataModule } from './_stubs.ts'
 
-const failStub = `data:text/javascript,${encodeURIComponent("throw new Error('省界数据加载失败')")}`
-const okStub = `data:text/javascript,${encodeURIComponent("export const ADMIN1_PROVINCES = { 测试省: [{ name: '测试市' }] }")}`
+const failStub = dataModule("throw new Error('省界数据加载失败')")
+const okStub = dataModule("export const ADMIN1_PROVINCES = { 测试省: [{ name: '测试市' }] }")
 
 let resolutions = 0
 let nextStub = failStub

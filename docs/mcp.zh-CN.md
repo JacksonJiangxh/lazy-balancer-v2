@@ -32,6 +32,8 @@ curl -s http://localhost:8000/api/v1/mcp \
 | 非管理员用户 Key | 仅查询类工具与上述读探测 POST；负载规则/证书配置/证书签发/集群与系统管理等写工具对该 Key 一律 403，`tools/list` 不会列出这些工具 |
 | IP 白名单 Key | 请求来源 IP 必须命中白名单（MCP 内部转发不受影响） |
 
+请求体必须是**单条 JSON-RPC 对象**：服务器不接受 JSON-RPC 批处理数组（返回 HTTP 400 + `PARSE_ERROR`）。客户端请逐条发送请求；`tools/list` 的按 Key 过滤也按单条请求生效。
+
 ## 工具分组（节选）
 
 | 分组 | 工具 |

@@ -165,13 +165,16 @@ func TestCertJobFileLogger_rotation_failure_is_surfaced(t *testing.T) {
 }
 
 // 并发守护：每次写日志都新建实例（Issue 的 jobLogger / WriteCertJobLog* 是
-// 真实调用形态），8 实例并发写同 ruleID、阈值 1 字节使每次写都触发轮转。锁定后
-// check-rotate-append 原子化；断言全部落盘行完整无撕裂、代际集合不越界。
+// 真实调用形态），8 实例并发写同 ruleID。阈值取约 60 行/代——200 行只跨约
+// 3 次轮转，全部行都应落在 current + .1-.5 的保留面内；锁定后
+// check-rotate-append 原子化，故断言「每行完整无撕裂」+「200 条消息各出现
+// 恰一次」+「代际不越界」。轮转互斥失效时两实例会 rename 覆盖同一代，整代
+// 消失仍能产生完整行，只有集合等价断言能发现。
 // 注：并发交错本身概率性，本测试为回归守护（配合 -race），确定性红由
 // rotation_failure_is_surfaced 承担。
 func TestCertJobFileLogger_concurrent_writers_keep_lines_intact(t *testing.T) {
 	// Given
-	useCertJobLogTestEnv(t, 1)
+	useCertJobLogTestEnv(t, 3000)
 	const writers, writesPerWriter = 8, 25
 	var wg sync.WaitGroup
 	for w := 0; w < writers; w++ {
@@ -186,10 +189,10 @@ func TestCertJobFileLogger_concurrent_writers_keep_lines_intact(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Then：current + .1-.5 全部存在的代际文件中，每行都是完整日志行
+	// Then：current + .1-.5 代际内每行完整，且消息集合恰为全部写入
 	base := CertJobLogPath("lb_concurrent")
-	linePattern := regexp.MustCompile(`^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} \[INFO\] stage - writer-\d+-msg-\d+$`)
-	complete := 0
+	linePattern := regexp.MustCompile(`^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} \[INFO\] stage - (writer-\d+-msg-\d+)$`)
+	seen := make(map[string]int, writers*writesPerWriter)
 	for i := 0; i <= maxRotatedFiles; i++ {
 		path := base
 		if i > 0 {
@@ -206,14 +209,26 @@ func TestCertJobFileLogger_concurrent_writers_keep_lines_intact(t *testing.T) {
 			if line == "" {
 				continue
 			}
-			if !linePattern.MatchString(line) {
+			match := linePattern.FindStringSubmatch(line)
+			if match == nil {
 				t.Fatalf("torn/foreign line %q in %s", line, path)
 			}
-			complete++
+			seen[match[1]]++
 		}
 	}
-	if complete == 0 {
-		t.Fatal("no complete log lines survived concurrent writes")
+	if _, err := os.Stat(fmt.Sprintf("%s.%d", base, maxRotatedFiles+1)); !os.IsNotExist(err) {
+		t.Fatalf("rotation beyond retention window: stat .%d err=%v", maxRotatedFiles+1, err)
+	}
+	for w := range writers {
+		for i := range writesPerWriter {
+			msg := fmt.Sprintf("writer-%d-msg-%d", w, i)
+			if seen[msg] != 1 {
+				t.Fatalf("message %q appears %d time(s), want exactly 1（整代被覆盖或重复写入）", msg, seen[msg])
+			}
+		}
+	}
+	if len(seen) != writers*writesPerWriter {
+		t.Fatalf("distinct messages=%d, want %d", len(seen), writers*writesPerWriter)
 	}
 }
 

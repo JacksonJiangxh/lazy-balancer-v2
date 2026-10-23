@@ -118,9 +118,13 @@ func TestAutobanDisableFlush_capacityEvictionLeavesWarnAndAudit(t *testing.T) {
 	if !strings.Contains(logText, "容量收敛") {
 		t.Fatalf("禁用收尾挤出缺 WARN 任务日志行:\n%s", logText)
 	}
-	// 挤出身份后缀（被挤者点名——与 Run 轮同款）。
-	if !strings.Contains(logText, "198.51.100.") {
-		t.Fatalf("WARN 行缺挤出身份后缀:\n%s", logText)
+	// 挤出身份后缀（被挤者点名）：三条候选同前缀 .1/.2/.3，只有 .1（最早
+	// 创建、稳定序首个）被挤——点名断言必须区分具体条值，否则前缀命中即绿。
+	if !strings.Contains(logText, "挤出 IP 198.51.100.1") {
+		t.Fatalf("WARN 行必须点名被挤条目 198.51.100.1（最早创建者）:\n%s", logText)
+	}
+	if strings.Contains(logText, "198.51.100.2") || strings.Contains(logText, "198.51.100.3") {
+		t.Fatalf("未挤出条目不得出现在容量收敛身份后缀:\n%s", logText)
 	}
 	var auditCount int
 	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='容量收敛' AND detail LIKE '%禁用收尾%'`).Scan(&auditCount); err != nil {

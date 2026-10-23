@@ -8,26 +8,30 @@
 // globalThis.__calls / __gets / __get / __post / __put / __confirm。
 
 export interface StubCall {
-  fn: 'ElMessage' | 'mfaAwareSuccess'
-  arg: unknown
+  fn: string
+  arg?: unknown
+  args?: unknown[]
 }
 
+/** 调用记录面（由 data: 模块替身经 `globalThis.__calls` 写入，宿主指向同一数组）。 */
 export const calls: StubCall[] = []
 
 export const resetCalls = (): void => {
   calls.length = 0
 }
 
-export const ElMessage = (arg: unknown): void => {
-  calls.push({ fn: 'ElMessage', arg })
-}
-
-export const mfaAwareSuccess = (message: string): void => {
-  calls.push({ fn: 'mfaAwareSuccess', arg: message })
-}
-
 /** data: 模块源码包装（node 直接求值，不落盘）。 */
 export const dataModule = (code: string): string => `data:text/javascript,${encodeURIComponent(code)}`
+
+/**
+ * saveResult 的两个依赖替身（element-plus 的 ElMessage + api 的 mfaAwareSuccess）。
+ * 必须与真实调用面同形：ElMessage 是「可调用对象」，记录入参与 STUB_ELEMENT 一致
+ * （宿主 `globalThis.__calls` 指向 calls 数组）。
+ */
+export const STUB_SAVE_RESULT_DEPS = dataModule(`
+export const ElMessage = (arg) => globalThis.__calls.push({ fn: 'ElMessage', arg })
+export const mfaAwareSuccess = (message) => globalThis.__calls.push({ fn: 'mfaAwareSuccess', arg: message })
+`)
 
 /** element-plus 替身：ElMessage 的 info/error/success 与 MessageBox.confirm 均记录调用。 */
 export const STUB_ELEMENT = dataModule(`

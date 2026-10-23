@@ -116,7 +116,7 @@ func TestCertReconcileOnce_cancelledContextStopsWrites(t *testing.T) {
 	if got := countCertJobsByRule(t, "lb_gate_cancel"); got != 0 {
 		t.Fatalf("取消后补建 %d 行, want 0", got)
 	}
-	if log := readCertReconcileLog(t); strings.Contains(log, "状态对账完成") {
-		t.Fatalf("取消轮摘要谎报完成: %q", log)
+	if log := readCertReconcileLog(t); !strings.Contains(log, "状态对账中止") || strings.Contains(log, "状态对账完成") {
+		t.Fatalf("取消轮摘要必须归因「状态对账中止」且不得报完成: %q", log)
 	}
 }

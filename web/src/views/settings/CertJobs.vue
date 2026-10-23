@@ -48,9 +48,12 @@
     <el-table-column label="证书有效期" min-width="155">
       <template #default="{ row }">
         <!-- 过期时间与剩余天数合并一列：列内只留日期，精确时间（配置时区）进 tooltip。
-             过期证书不渲染裸负数——色弱/黑白场景下「-1 天」无文字语义。 -->
-        <el-tooltip v-if="row.status === 'issued' && row.expires_at" :content="formatDate(row.expires_at)">
-          <span :class="['cert-days', certificateStatus(row)]">{{ formatDateShort(row.expires_at) }} · {{ certificateStatus(row) === 'expired' ? `已过期 ${Math.abs(row.days_remaining)} 天` : `剩 ${row.days_remaining} 天` }}</span>
+             过期证书不渲染裸负数——色弱/黑白场景下「-1 天」无文字语义。
+             门用后端派生的 not_after（expires_at 缺失时按 PEM 解析）：只判
+             expires_at 会让导入/集群回插的 NULL 有效期行显示「-」，而规则页
+             同一证书显示「剩 N 天」。 -->
+        <el-tooltip v-if="row.status === 'issued' && effectiveNotAfter(row)" :content="formatDate(effectiveNotAfter(row))">
+          <span :class="['cert-days', certificateStatus(row)]">{{ formatDateShort(effectiveNotAfter(row)) }} · {{ certificateStatus(row) === 'expired' ? `已过期 ${Math.abs(row.days_remaining)} 天` : `剩 ${row.days_remaining} 天` }}</span>
         </el-tooltip>
         <span v-else class="cell-empty">-</span>
       </template>
@@ -149,6 +152,7 @@ import { useAuthStore } from '@/stores/auth'
 import type { APIResponse, CertJobsPage, CertJobListItem } from '@/types'
 import { certJobStatusLabel, certJobStatusTone, certJobRetryReady } from '@/utils/certJobStatus'
 import type { CertJobStatus } from '@/utils/certJobStatus'
+import { certJobEffectiveNotAfter, certJobRenewalAt } from '@/utils/certJobExpiry'
 import { usePollingTask } from '@/composables/usePollingTask'
 import { usePollingErrorState } from '@/composables/usePollingErrorState'
 
@@ -245,14 +249,14 @@ const retryDisabledReason = (row: CertJob): string => {
   return `当前状态需等待 ${Math.ceil(row.retry_cooldown_seconds / 60)} 分钟后重签`
 }
 
+// 证书真实到期时刻：后端派生 not_after 优先（库值 expires_at 缺失时按 PEM
+// 解析），expires_at 仅作旧版响应回退。两列（有效期/自动重签时间）共用本口径，
+// 避免同一行一个显示天数、另一个显示「-」（实现单源 utils/certJobExpiry）。
+const effectiveNotAfter = (row: CertJob): string => certJobEffectiveNotAfter(row)
+
 // 自动重签时间 = 证书到期前 certRenewalDays 天；返回 ISO 原值，列内紧凑格式
 // 与 tooltip 完整格式各自取用，不在 helper 里预先格式化（避免双口径）。
-const renewalAt = (row: CertJob): string => {
-  if (!row.expires_at) return ''
-  const expiry = new Date(row.expires_at)
-  if (isNaN(expiry.getTime())) return ''
-  return new Date(expiry.getTime() - certRenewalDays.value * 24 * 60 * 60 * 1000).toISOString()
-}
+const renewalAt = (row: CertJob): string => certJobRenewalAt(row, certRenewalDays.value)
 
 const certificateStatus = (row: CertJob): CertificateStatus => row.certificate_status
 

@@ -145,7 +145,7 @@ func TestLbbakImport_threatCompileFailurePreservesLiveIplist(t *testing.T) {
 	}
 }
 
-func TestLbbakImport_threatOnlyCommitFailureWarnsFileLanded(t *testing.T) {
+func TestLbbakImport_threatOnlyCommitFailureRollsBackFile(t *testing.T) {
 	// Given a threat-only lbbak whose DB commit will be rejected by Caddy.
 	h := newBackupTestHandlers(t)
 	g := newBackupSectionRouter(h)
@@ -160,19 +160,19 @@ func TestLbbakImport_threatOnlyCommitFailureWarnsFileLanded(t *testing.T) {
 
 		[]byte("203.0.113.7\n"))
 
-	// When the files land but the transaction fails.
+	// When the file lands but the transaction fails.
 	response := postLbbakImport(g, t, body, "")
 
-	// Then the file/DB split is explicitly reported, not silent.
+	// Then the file is rolled back to the pre-import state (absent) and the
+	// response says so explicitly — no silent split, no false split warning.
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("import status=%d body=%s, want 400", response.Code, response.Body.String())
 	}
-	if !strings.Contains(response.Body.String(), "文件已按备份落盘") {
-		t.Fatalf("threat-only landed file must produce split warning: %s", response.Body.String())
+	if !strings.Contains(response.Body.String(), "已回退到导入前状态") {
+		t.Fatalf("rolled-back file must be reported: %s", response.Body.String())
 	}
-	raw, err := os.ReadFile(filepath.Join(wafDir, "threat-ustc.iplist"))
-	if err != nil || !strings.Contains(string(raw), "203.0.113.7") {
-		t.Fatalf("threat file did not land: raw=%q err=%v", raw, err)
+	if _, err := os.Stat(filepath.Join(wafDir, "threat-ustc.iplist")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("threat file must be rolled back after commit failure, err=%v", err)
 	}
 }
 

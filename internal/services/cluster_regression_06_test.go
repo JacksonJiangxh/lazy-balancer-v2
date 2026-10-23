@@ -65,6 +65,11 @@ func TestSyncService_run_fiveHundredHugeBody_lastSyncErrorBounded(t *testing.T) 
 	if strings.Contains(msg, "中") {
 		t.Fatalf("message=%q contains truncated multi-byte char tail, want valid UTF-8 boundary rollback", msg)
 	}
+	// 前缀保留：只做否定断言时「截断写成返回空串」同样通过，取证面静默失效。
+	prefix := "A" + strings.Repeat("A", 198)
+	if !strings.Contains(msg, prefix) {
+		t.Fatalf("message=%q, want 保留截断线内的 199 个 'A' 前缀", msg)
+	}
 }
 
 // bumpRegistrationConfirmFailure 的终止类写点改经 combineOrReplaceSyncError
@@ -73,6 +78,7 @@ func TestSyncService_run_fiveHundredHugeBody_lastSyncErrorBounded(t *testing.T) 
 func TestSyncService_bumpRegistrationConfirmFailure_terminalWriteViaHelper(t *testing.T) {
 	// Given：已连续失败 4 次（本次为第 5 次触发上限）；重载失败标记已存在
 	_, database := newClusterTestService(t)
+	setNodeMasterRole(t, database, false) // 注册确认与同步状态写只属于从节点语境
 	if _, err := database.Exec("UPDATE global_config SET registration_confirm_failures=4, cluster_token='approved-token', last_sync_error=? WHERE id=1",
 		encodeSyncError("apply_ok_reload_failed: caddy down", models.SyncErrorCodeApplyFailed)); err != nil {
 		t.Fatal(err)

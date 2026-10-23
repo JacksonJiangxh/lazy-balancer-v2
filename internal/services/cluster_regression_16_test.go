@@ -25,9 +25,9 @@ func TestRegisterWithMaster_rejectsMalformedRegistrationPayload(t *testing.T) {
 	// When
 	_, err := service.RegisterWithMaster(context.Background(), master.URL, models.ClusterRegisterRequest{})
 
-	// Then：显式报错而非静默成功
-	if err == nil || !strings.Contains(err.Error(), "注册") {
-		t.Fatalf("error=%v, want 畸形注册载荷显式报错", err)
+	// Then：显式报错而非静默成功，且点名缺失项（不靠宽泛子串通过）
+	if err == nil || !strings.Contains(err.Error(), "注册编号或注册密钥缺失") {
+		t.Fatalf("error=%v, want 畸形注册载荷显式点名缺失字段", err)
 	}
 }
 

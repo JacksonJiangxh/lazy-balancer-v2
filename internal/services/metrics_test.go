@@ -31,35 +31,35 @@ func isolateMetricsState(t *testing.T) {
 	})
 }
 
-func TestLogMetricsStateTransition_fail_ok_fail_emits_warn_info_warn(t *testing.T) {
+func TestLogStateTransition_fail_ok_fail_emits_warn_info_warn(t *testing.T) {
 	// Given
 	isolateMetricsState(t)
 
 	// When/Then：fail→ok→fail 恰好 warn、info、warn 各一次；
 	// 持续同一状态（仍失败/仍正常）静默；初始状态视为 ok（首次成功静默）。
-	if lvl := logMetricsStateTransition("collect", true); lvl != "warn" {
+	if lvl := logStateTransition("collect", true); lvl != "warn" {
 		t.Fatalf("first failure level=%q, want warn", lvl)
 	}
-	if lvl := logMetricsStateTransition("collect", true); lvl != "" {
+	if lvl := logStateTransition("collect", true); lvl != "" {
 		t.Fatalf("persistent failure level=%q, want silent", lvl)
 	}
-	if lvl := logMetricsStateTransition("collect", false); lvl != "info" {
+	if lvl := logStateTransition("collect", false); lvl != "info" {
 		t.Fatalf("recovery level=%q, want info", lvl)
 	}
-	if lvl := logMetricsStateTransition("collect", false); lvl != "" {
+	if lvl := logStateTransition("collect", false); lvl != "" {
 		t.Fatalf("persistent ok level=%q, want silent", lvl)
 	}
-	if lvl := logMetricsStateTransition("collect", true); lvl != "warn" {
+	if lvl := logStateTransition("collect", true); lvl != "warn" {
 		t.Fatalf("second failure level=%q, want warn", lvl)
 	}
-	if lvl := logMetricsStateTransition("endpoint", false); lvl != "" {
+	if lvl := logStateTransition("endpoint", false); lvl != "" {
 		t.Fatalf("first success of unseen key level=%q, want silent", lvl)
 	}
 	// 类别间状态独立
-	if lvl := logMetricsStateTransition("parse", true); lvl != "warn" {
+	if lvl := logStateTransition("parse", true); lvl != "warn" {
 		t.Fatalf("independent key failure level=%q, want warn", lvl)
 	}
-	if lvl := logMetricsStateTransition("collect", false); lvl != "info" {
+	if lvl := logStateTransition("collect", false); lvl != "info" {
 		t.Fatalf("collect recovery after independent key failure level=%q, want info", lvl)
 	}
 }
@@ -339,7 +339,7 @@ func TestMetricsService_parsePrometheusMetrics_aggregates_histograms_across_host
 	}
 }
 
-func TestMetricsService_storePerHostMetrics_ruleLabelAggregation(t *testing.T) {
+func TestMetricsService_storeRuleMetricsText_ruleLabelAggregation(t *testing.T) {
 	// 2026-09-15:rule label(lazybalancer_*)聚合——请求/状态码/字节/blocked
 	// 按 rule 正确归集,写同一 metrics_history 行。
 	// Given
@@ -358,7 +358,7 @@ lazybalancer_bytes_total{direction="out",rule="lb_rl1"} 2048
 lazybalancer_security_blocked_total{rule="lb_rl1"} 5`
 
 	// When
-	err := service.storePerHostMetrics(text)
+	err := service.storeRuleMetricsText(text)
 
 	// Then
 	if err != nil {
@@ -373,7 +373,7 @@ lazybalancer_security_blocked_total{rule="lb_rl1"} 5`
 	}
 }
 
-func TestMetricsService_storePerHostMetrics_multipleRulesIndependent(t *testing.T) {
+func TestMetricsService_storeRuleMetricsText_multipleRulesIndependent(t *testing.T) {
 	// 多规则独立归集(不串)
 	// Given
 	_, database := newClusterTestService(t)
@@ -387,7 +387,7 @@ func TestMetricsService_storePerHostMetrics_multipleRulesIndependent(t *testing.
 lazybalancer_requests_total{rule="lb_rl3"} 200`
 
 	// When
-	err := service.storePerHostMetrics(text)
+	err := service.storeRuleMetricsText(text)
 
 	// Then
 	if err != nil {
@@ -405,14 +405,14 @@ lazybalancer_requests_total{rule="lb_rl3"} 200`
 	}
 }
 
-func TestMetricsService_storePerHostMetrics_emptyTextNoRows(t *testing.T) {
+func TestMetricsService_storeRuleMetricsText_emptyTextNoRows(t *testing.T) {
 	// 空 text 无行
 	_, database := newClusterTestService(t)
 	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled) VALUES ('lb_rl4','rl4','a.example.com','http',8080,1)`); err != nil {
 		t.Fatalf("seed rule: %v", err)
 	}
 	service := &MetricsService{}
-	if err := service.storePerHostMetrics(""); err != nil {
+	if err := service.storeRuleMetricsText(""); err != nil {
 		t.Fatalf("empty text must not error: %v", err)
 	}
 	var count int
@@ -440,7 +440,7 @@ func TestMetricsService_updateOverview_keepsPreviousCountsOnQueryFailure(t *test
 		t.Fatalf("baseline overview=%+v, want ActiveRules=2 TotalRules=3", got)
 	}
 
-	// Stub COUNT 失败：关闭规则库（与 storePerHostMetrics 错误测试同模式）
+	// Stub COUNT 失败：关闭规则库（与 storeRuleMetricsText 错误测试同模式）
 	if err := db.DB.Close(); err != nil {
 		t.Fatalf("close rule database: %v", err)
 	}
@@ -553,7 +553,7 @@ func TestMetricsServiceCleanupHistory_stillCleansWhenGlobalConfigDropped(t *test
 // 正则标签顺序与真实 exposition 一致——
 // client_golang 字典序(class/direction 在前,rule 在后)。fixture 必须
 // 真实形态。
-func TestMetricsService_storePerHostMetrics_realExpositionOrder(t *testing.T) {
+func TestMetricsService_storeRuleMetricsText_realExpositionOrder(t *testing.T) {
 	_, database := newClusterTestService(t)
 	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled) VALUES ('lb_rl5','rl5','a.example.com','http',8080,1)`); err != nil {
 		t.Fatalf("seed rule: %v", err)
@@ -566,7 +566,7 @@ lazybalancer_request_status_total{class="4xx",rule="lb_rl5"} 20
 lazybalancer_bytes_total{direction="in",rule="lb_rl5"} 1024
 lazybalancer_bytes_total{direction="out",rule="lb_rl5"} 2048`
 
-	if err := service.storePerHostMetrics(text); err != nil {
+	if err := service.storeRuleMetricsText(text); err != nil {
 		t.Fatalf("store: %v", err)
 	}
 	var requests, s2xx, s4xx, bytesIn, bytesOut int64
@@ -879,5 +879,36 @@ func TestMetricsService_startHistoryCleanup_casMissReleasesWaitCount(t *testing.
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("CAS 失败后未归还 WaitGroup 计数（Wait 永久阻塞）")
+	}
+}
+
+// 后台采集刷新必须读 db.GetDB()（atomic 句柄）而非同步侧 db.DB：两个来源
+// 分裂时后台循环会静默空转或读到另一个库，指标永久不生效且零日志。
+func TestRefreshDBOverviewMetrics_usesAtomicHandle(t *testing.T) {
+	initServicesDB(t)
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled) VALUES
+		('lb_h1','h1','a.example.com','http',8080,1),
+		('lb_h2','h2','b.example.com','http',8081,1)`); err != nil {
+		t.Fatal(err)
+	}
+	service := &MetricsService{}
+	service.refreshDBOverviewMetrics()
+	if got := service.GetOverview(); got.ActiveRules != 2 || got.TotalRules != 2 {
+		t.Fatalf("overview=%+v, want 2/2", got)
+	}
+
+	// Given：后台句柄被摘除（db.DB 仍有效并新增一条规则）
+	db.SetDB(nil)
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled)
+		VALUES ('lb_h3','h3','c.example.com','http',8082,1)`); err != nil {
+		t.Fatal(err)
+	}
+
+	// When
+	service.refreshDBOverviewMetrics()
+
+	// Then：保持前值（句柄不可用即不刷新）——读到 3 说明走了同步侧 db.DB
+	if got := service.GetOverview(); got.ActiveRules != 2 || got.TotalRules != 2 {
+		t.Fatalf("overview=%+v，刷新读了未注册的 db.DB（必须走 db.GetDB）", got)
 	}
 }

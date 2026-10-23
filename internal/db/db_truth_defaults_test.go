@@ -680,6 +680,13 @@ func TestGovernedDefaultLiteralsBoundInConsumers(t *testing.T) {
 			forbidden: []string{`COALESCE(timezone,'Asia/Shanghai')`},
 			required:  []string{"db.DefaultTimezone"},
 		},
+		// 启动期时区读侧（进程时区基准）同属消费侧：漏登记时 DDL 默认值变更
+		// 后运行期时间轴与面板展示时间轴静默分叉。
+		{
+			file:      "../../cmd/server/main.go",
+			forbidden: []string{`COALESCE(timezone,'Asia/Shanghai')`},
+			required:  []string{"db.DefaultTimezone"},
+		},
 		{
 			file:      "../handlers/config_backup.go",
 			forbidden: []string{`"anomaly_threshold": int64(5)`, `policy["anomaly_threshold"] = int64(5)`},

@@ -1,6 +1,6 @@
 import { ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { request } from '@/utils/api'
+import { mfaAwareSuccess, request } from '@/utils/api'
 import { showSaveResult } from '@/utils/saveResult'
 import { CADDY_APPLY_FAILED_MARKER } from '@/utils/bulkApplyResult'
 import { parseRefIds } from '@/utils/securityStages'
@@ -13,9 +13,10 @@ import type { APIResponse } from '@/types'
 //      复用 useIpListAdd，与事件处置入口同一链路）；
 //   2) 策略无同侧非系统列表（未关联，或仅关联系统内置名单——历史裁定
 //      系统名单在快捷处置中零暴露、不作为动作目标）→ 自动创建
-//      「{策略名}{后缀}」（category=custom、空条目）→ 关联到策略对应 refs
-//      字段 → 加入 IP，一步完成「创建并加入」；历史起 deny/allow/trust
-//      三侧全部接线此出口；
+//      「{策略名}{后缀}」（category=custom，建单即带该 IP 条目）→ 关联到策略
+//      对应 refs 字段，两步完成「创建并加入」——中途失败不会留下已被策略引用
+//      的空名单；同名（ASCII 大小写折叠）既有名单优先复用；历史起 deny/allow/
+//      trust 三侧全部接线此出口；
 //   3) 移除 = 从引用列表 remove-ip（关联保留，仅移除条目）。
 // 信任侧未启用（ip_whitelist_enabled=false）时不阻断操作，仅提示「暂不生效」。
 type ListSide = 'deny' | 'allow' | 'trust'
@@ -41,6 +42,13 @@ export const fitAutoListName = (policyName: string, suffix: string): { name: str
   if (chars.length <= room) return { name: policyName + suffix, truncated: false }
   return { name: chars.slice(0, Math.max(0, room)).join('') + suffix, truncated: true }
 }
+
+// 名单名唯一性判据与后端同口径：创建时按 SQLite
+// `LOWER(name)=LOWER(?)` 去重（ASCII 大小写折叠），命中即 409。前端复用既有
+// 名单的查找如果按大小写敏感比较，`Web-白名单` 已存在时会错过、转而再次创建，
+// 换来一条 409 且本次「加入 IP」不发生（弹框一次性，用户没有改用既有名单的
+// 出口）。此处只折叠 ASCII（与 SQLite 内置 LOWER 一致）：非 ASCII 大小写变体
+// 后端视为不同名单，前端不得提前合并。
 
 interface TrustPolicyLike {
   id: number
@@ -119,33 +127,43 @@ export const useTrustAssociation = (options: {
       } catch {
         return
       }
-      // 同侧已有同名未引用列表时复用而非
-      // 重复创建——按名称在现有列表中查找（category 无关，仅看名字精确相等）。
+      // 同侧已有同名未引用列表时复用而非重复创建——按名称在现有列表中查找
+      // （category 无关）；判据与后端唯一性口径同源（ASCII 大小写折叠）。
       const wantName = auto.name
-      const sameName = options.getList().find((l) => l.name === wantName && !l.system)
-      let newId: number | undefined = sameName?.id
-      if (!newId) {
-        const created = await request.post<APIResponse<{ id: number }>>('/security/ip-lists', {
-          name: wantName,
-          category: 'custom',
-          entries: '[]',
-        })
-        // 中间跳退化 200+后缀（Caddy 应用失败但 DB 已提交）也须可见——有后缀才弹
-        if (created.message?.includes(CADDY_APPLY_FAILED_MARKER)) showSaveResult(created, '')
-        newId = created.data?.id
+      const wantKey = wantName.replace(/[A-Z]/g, (c) => c.toLowerCase())
+      const sameName = options.getList().find((l) => !l.system && l.name.replace(/[A-Z]/g, (c) => c.toLowerCase()) === wantKey)
+      const refs = parseRefIds(policy[cfg.refField])
+      if (sameName) {
+        if (!refs.includes(sameName.id)) {
+          const assocRes = await request.put(`/security/policies/${policy.id}`, { [cfg.refField]: JSON.stringify([...refs, sameName.id]) })
+          // 关联中间跳的退化后缀（Caddy 应用失败但 DB 已提交）不可静默
+          if (assocRes.message?.includes(CADDY_APPLY_FAILED_MARKER)) showSaveResult(assocRes, '')
+        }
+        const added = await request.post<APIResponse<{ added: boolean }>>(`/security/ip-lists/${sameName.id}/ips`, { value: ip })
+        showSaveResult(added as unknown as { message?: string }, `已关联既有「${auto.name}」并加入 ${ip}`)
+        await options.onChanged?.()
+        return
       }
+      // 新建路径：建单即播种条目（后端 CreateIPListRequest.entries 支持），写序为
+      // 「创建（含 IP）→ 关联 refs」。原先是 创建空名单 → 关联 → 加入 IP：加入
+      // 失败时策略已引用一个空名单，用户只看到一条错误提示，且多一次往返。
+      const created = await request.post<APIResponse<{ id: number }>>('/security/ip-lists', {
+        name: wantName,
+        category: 'custom',
+        entries: JSON.stringify([{ value: ip, remark: '' }]),
+      })
+      // 中间跳退化 200+后缀（Caddy 应用失败但 DB 已提交）也须可见——有后缀才弹
+      if (created.message?.includes(CADDY_APPLY_FAILED_MARKER)) showSaveResult(created, '')
+      const newId = created.data?.id
       if (!newId) {
         ElMessage.error(`列表「${wantName}」创建响应异常，请重试`)
         return
       }
-      const refs = parseRefIds(policy[cfg.refField])
-      if (!refs.includes(newId)) {
-        const assocRes = await request.put(`/security/policies/${policy.id}`, { [cfg.refField]: JSON.stringify([...refs, newId]) })
-        // 同上：关联中间跳的退化后缀不可静默
-        if (assocRes.message?.includes(CADDY_APPLY_FAILED_MARKER)) showSaveResult(assocRes, '')
-      }
-      const added = await request.post<APIResponse<{ added: boolean }>>(`/security/ip-lists/${newId}/ips`, { value: ip })
-      showSaveResult(added as unknown as { message?: string }, `已${sameName ? '关联既有' : '创建'}「${auto.name}」并加入 ${ip}`)
+      const assocRes = await request.put(`/security/policies/${policy.id}`, { [cfg.refField]: JSON.stringify([...refs, newId]) })
+      // 关联是最后一步：退化后缀弹警告，正常成功用动作口径文案（响应 message 是
+      // 策略更新的通用文案，不能拿来当本次动作的反馈）。
+      if (assocRes.message?.includes(CADDY_APPLY_FAILED_MARKER)) showSaveResult(assocRes, '')
+      else mfaAwareSuccess(`已创建「${auto.name}」并加入 ${ip}`)
       await options.onChanged?.()
     } catch {
       // 失败提示由全局拦截器弹出

@@ -324,3 +324,106 @@ func TestAfter_parses_retry_after_header(t *testing.T) {
 		t.Fatalf("After(empty)=%v, want 0", got)
 	}
 }
+
+// 退避必须指数增长：全部用例用 1ms 且只数尝试次数时，`backoff *= 2` 改成
+// 常量退避（甚至删掉）仍全绿，而真实 API 限流下会把 3 次重试压在毫秒内打完。
+// 用下界断言（负载只会拉长耗时，不会缩短）：常量退避总等待 2×初始值，
+// 指数退避为 1×+2×，下界取两者之间。
+func TestTransport_backoff_doubles_between_attempts(t *testing.T) {
+	// Given：初始 20ms、上限 1s，两次 429 后再 200（等待 20ms + 40ms）
+	base := &countingTransport{statuses: []int{http.StatusTooManyRequests, http.StatusTooManyRequests}}
+	transport := &Transport{Base: base, InitialBackoff: 20 * time.Millisecond, MaxBackoff: time.Second}
+
+	start := time.Now()
+	resp, err := transport.RoundTrip(newRequestPath(t, "https://dns.example/Record.List", "value=abc"))
+	elapsed := time.Since(start)
+
+	// Then
+	if err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	defer resp.Body.Close()
+	if base.attempts != 3 {
+		t.Fatalf("attempts=%d, want 3", base.attempts)
+	}
+	if elapsed < 60*time.Millisecond {
+		t.Fatalf("elapsed=%v, want ≥ 20ms+40ms（退避未逐次加倍）", elapsed)
+	}
+}
+
+// Attempts 字段此前从未被设置：把它改成常量 3 或用错字段都不会红。
+func TestTransport_attempts_field_controls_total_attempts(t *testing.T) {
+	base := &countingTransport{statuses: []int{
+		http.StatusTooManyRequests, http.StatusTooManyRequests, http.StatusTooManyRequests,
+		http.StatusTooManyRequests, http.StatusTooManyRequests,
+	}}
+	transport := &Transport{Base: base, Attempts: 5, InitialBackoff: time.Millisecond}
+
+	resp, err := transport.RoundTrip(newRequestPath(t, "https://dns.example/Record.List", "value=abc"))
+	if err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	defer resp.Body.Close()
+	if base.attempts != 5 {
+		t.Fatalf("attempts=%d, want 5（Attempts 字段必须生效）", base.attempts)
+	}
+}
+
+// erroringTransport 永远返回传输错误。
+type erroringTransport struct{ calls int }
+
+func (t *erroringTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	t.calls++
+	return nil, errors.New("connection reset")
+}
+
+// 传输错误不得重试（连接已断时重放既无意义也可能重复创建）：错误原样上抛。
+func TestTransport_transport_errors_are_not_retried(t *testing.T) {
+	base := &erroringTransport{}
+	transport := &Transport{Base: base, InitialBackoff: time.Millisecond}
+
+	resp, err := transport.RoundTrip(newRequestPath(t, "https://dns.example/Record.List", "value=abc"))
+	if err == nil {
+		resp.Body.Close()
+		t.Fatal("round trip succeeded, want transport error")
+	}
+	if base.calls != 1 {
+		t.Fatalf("calls=%d, want 1（传输错误不重试）", base.calls)
+	}
+}
+
+// failingCloser 的 Close 返回错误，模拟连接已半关闭。
+type failingCloser struct{}
+
+func (failingCloser) Read([]byte) (int, error) { return 0, io.EOF }
+func (failingCloser) Close() error             { return errors.New("broken pipe") }
+
+// failingBodyTransport 首次返回 429 + 无法关闭的 body。
+type failingBodyTransport struct{ attempts int }
+
+func (t *failingBodyTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	t.attempts++
+	return &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header:     make(http.Header),
+		Body:       failingCloser{},
+		Request:    request,
+	}, nil
+}
+
+// body 关闭失败时立即返回该响应（不再重试），避免在半关闭连接上继续等待。
+func TestTransport_body_close_failure_stops_retrying(t *testing.T) {
+	base := &failingBodyTransport{}
+	transport := &Transport{Base: base, InitialBackoff: time.Millisecond}
+
+	resp, err := transport.RoundTrip(newRequestPath(t, "https://dns.example/Record.List", "value=abc"))
+	if err != nil {
+		t.Fatalf("round trip: %v", err)
+	}
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status=%d, want 429 原样返回", resp.StatusCode)
+	}
+	if base.attempts != 1 {
+		t.Fatalf("attempts=%d, want 1（body 关闭失败不得重试）", base.attempts)
+	}
+}

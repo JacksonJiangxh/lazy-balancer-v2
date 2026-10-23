@@ -30,6 +30,14 @@ test('无变更保存判定为 no-op（直接关闭，不发 PUT 不 bump）', (
   assert.equal(nodeSiteCoordsChanged({ lat: 31.23, lon: 121.47 }, { lat: 0, lon: 0 }), true)
 })
 
+// 消费侧接线：helper 被删/绕过后继承坐标被固化为显式坐标（原 bug 回归），
+// 纯函数用例照样绿——故把两个调用点也钉住。
+test('节点配置弹框用 helper 还原初值与判定变更', () => {
+  const dialog = source('src/views/settings/cluster/ClusterNodeConfigDialog.vue')
+  assert.match(dialog, /const initial = initialNodeSiteForm\(node\)/, '初值必须经 helper 还原（继承坐标不得预填为可保存值）')
+  assert.match(dialog, /const siteChanged = nodeSiteCoordsChanged\(baseline, form\)/, '无变更判定必须走 helper')
+})
+
 // 主节点地址与节点访问地址在后端共用 models.ValidateClusterAccessURL
 // （scheme∈{http,https}、host 非空、无 userinfo/query/fragment）。前端曾两份实现
 // ——主节点地址只校验 scheme，带凭证/query 的地址到提交时才被后端拒绝（晚失败）。
@@ -43,6 +51,7 @@ test('主节点地址与访问地址共用校验器（后端 ValidateClusterAcce
     'parsed.Scheme != "http" && parsed.Scheme != "https"',
     'parsed.Host == ""',
     'parsed.User != nil',
+    'parsed.Opaque != ""',
     'parsed.RawQuery != ""',
     'parsed.Fragment != ""',
   ]) {
@@ -53,9 +62,16 @@ test('主节点地址与访问地址共用校验器（后端 ValidateClusterAcce
   assert.equal(validateClusterUrl('', { label: '主节点地址', emptyMessage: '请输入主节点地址' }), '请输入主节点地址')
   assert.equal(url('https://master.example.com:8000'), null)
   assert.equal(url('http://127.0.0.1:8001/'), null)
+  assert.equal(url('HTTP://Master.example.com'), null, 'scheme/host 大小写不敏感（与后端同一地址）')
+  // WHATWG 解析会把这三种残缺形态补全成带主机的地址，后端 url.Parse 得到
+  // opaque 段或空 Host——前端必须同样拒绝（否则字段级校验失效、提交才 400）。
+  assert.equal(url('http:example.com'), '访问地址格式不正确', '缺 // 是 opaque 形态，后端必然 400')
+  assert.equal(url('http:/example.com'), '访问地址格式不正确', '缺一条斜杠时后端 Host 为空')
+  assert.equal(url('https:///example.com'), '访问地址格式不正确', 'authority 为空时后端 Host 为空')
   assert.equal(url('ftp://master:21'), '访问地址必须使用 HTTP 或 HTTPS')
   assert.equal(url('not a url'), '访问地址格式不正确')
   assert.equal(url('https://user:pass@master:8000'), '访问地址不能包含用户名或密码')
+  assert.equal(url('http://@master:8000'), '访问地址不能包含用户名或密码', '空 userinfo 在后端同样 User != nil')
   assert.equal(url('https://master:8000/?x=1'), '访问地址不能包含查询参数')
   assert.equal(url('https://master:8000/#frag'), '访问地址不能包含片段')
   assert.equal(validateClusterUrl('https://user@master', { label: '主节点地址' }), '主节点地址不能包含用户名或密码')

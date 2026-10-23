@@ -27,8 +27,8 @@
           <el-input-number v-model="global.cert_expiry_days" :min="1" :max="365" />
         </el-form-item>
         <el-form-item label="自动续签时间">
-          <el-input-number v-model="global.cert_renewal_days" :min="1" :max="90" />
-          <span class="form-tip-inline">证书到期前多少天自动尝试重签；0 = 默认 30 天（仅 API 直写/备份导入可达，本控件下限为 1）</span>
+          <el-input-number v-model="global.cert_renewal_days" :min="1" :max="60" />
+          <span class="form-tip-inline">证书到期前多少天自动尝试重签；建议不超过 60——窗口接近证书寿命（90 天）时，刚签发的证书仍落在窗口内，会反复重签并被 CA 限流。0 = 默认 30 天（仅 API 直写/备份导入可达，本控件下限为 1）</span>
         </el-form-item>
         <el-form-item label="续签重试次数">
           <el-input-number v-model="global.cert_renewal_attempts" :min="1" :max="10" />
@@ -155,7 +155,7 @@
                 v-if="field.type === 'select'"
                 v-model="form.dns_credentials[field.name]"
                 style="width: 100%"
-                @change="onAuthModeChange"
+                @change="onCredentialFieldChange"
               >
                 <el-option
                   v-for="opt in field.options"
@@ -246,7 +246,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Check, Connection, Document, OfficeBuilding, Plus, Postcard, Setting } from '@element-plus/icons-vue'
 import CertJobs from './CertJobs.vue'
 import DialogHeader from '@/components/DialogHeader.vue'
-import { credentialFieldVisible, credentialOptionLabel, defaultCredentialsFor, type CredentialFieldMeta } from '@/utils/dnsProviderFields'
+import { applyCredentialFieldChange, credentialFieldVisible, credentialOptionLabel, defaultCredentialsFor, type CredentialFieldMeta } from '@/utils/dnsProviderFields'
 import { selectableReferencedOptions, referencedOptionLabel } from '@/utils/caProviderOptions'
 import type { APIResponse } from '@/types'
 
@@ -368,7 +368,6 @@ const caCreds = reactive<CAProviderCredentials>({
 const defaultCAProviderOptions = computed(() => selectableReferencedOptions(caProviders.value, global.value.default_ca_provider_id))
 
 const selectedProvider = computed(() => providers.value.find(p => p.code === form.value.dns_provider))
-const authMode = computed(() => form.value.dns_credentials['auth_mode'] || '')
 
 // 可见性完全由后端元数据（visible_when）决定——新增 provider 的字段
 // 不会被隐藏，也不再依赖 dnspod 的字段名。
@@ -378,11 +377,13 @@ const onProviderChange = () => {
   form.value.dns_credentials = defaultCredentialsFor(selectedProvider.value?.credential_fields ?? [])
 }
 
-// 选择类字段（当前仅 auth_mode）变更即重置凭证——不同模式的字段集互斥，旧值
-// 保留会以隐藏字段的形式随保存载荷提交。
-const onAuthModeChange = () => {
-  if (!authMode.value) return
-  form.value.dns_credentials = { auth_mode: authMode.value }
+// 选择类字段变更后只清理被 visible_when 隐藏的键（不同模式的字段集互斥，隐藏值
+// 保留会以不可见字段的形式随保存载荷提交），其它 select 与文本字段的值保留。
+const onCredentialFieldChange = () => {
+  form.value.dns_credentials = applyCredentialFieldChange(
+    selectedProvider.value?.credential_fields ?? [],
+    form.value.dns_credentials,
+  )
 }
 
 const fetchConfigs = async () => {
@@ -524,6 +525,10 @@ const testCAProvider = async (p: CAProvider) => {
   try {
     const res = await request.post<APIResponse>(`/ca-providers/${p.id}/test`)
     mfaAwareSuccess(res.message || 'CA 提供商测试通过')
+    // 测试可能写入测试前不存在的 ZeroSSL EAB：列表必须刷新，否则随后用陈旧
+    // 表单保存会把刚申请到的 EAB 覆盖回空值（后端凭证列虽已按语义比较跳过
+    // 未变更的写入，这里仍以最新凭证为编辑基线）。
+    await fetchCAProviders()
   } catch (error: unknown) {
     // Error toast is already shown by the global axios interceptor.
     console.error('Failed to test CA provider:', error)

@@ -236,11 +236,11 @@ func TestUpdateAdminTLSJSONBody_rejectsMismatchedPairWithoutSaving(t *testing.T)
 	}
 }
 
-// 2 MiB MaxBytesReader 上限超限 body 须 413（原恒 400，与规则域
+// 整体 body 上限（4 MiB）超限须 413（原恒 400，与规则域
 // 413 口径不一致）。JSON 通道两入口（保存/预检）同门。
 func TestAdminTLSOversizedBodyReturns413(t *testing.T) {
-	// Given：超过 2 MiB 的 JSON 体（cert_file 承载超长 PEM 串）
-	body := `{"mode":"selfsigned","cert_file":"` + strings.Repeat("a", (2<<20)+64) + `"}`
+	// Given：超过整体上限的 JSON 体（cert_file 承载超长 PEM 串）
+	body := `{"mode":"selfsigned","cert_file":"` + strings.Repeat("a", maxAdminTLSBodyBytes+64) + `"}`
 	newRouter := func(handler gin.HandlerFunc, method, path string) *gin.Engine {
 		router := gin.New()
 		router.Handle(method, path, handler)
@@ -352,6 +352,15 @@ func TestUpdateAdminTLS_auditDetailRecordsCertificateReplacement(t *testing.T) {
 		if strings.Contains(detail, "已更换") {
 			t.Fatalf("audit detail=%q, want 不应声称证书更换（本次仅切换启用态）", detail)
 		}
+		// 「未更换」不能只靠文案：库内证书材料必须逐字节保持原值（合并逻辑
+		// 若用零值参与比较/写回，文案仍会写「未更换」而材料已被清空）。
+		var storedCert, storedKey string
+		if err := db.DB.QueryRow(`SELECT admin_tls_cert, admin_tls_key FROM global_config WHERE id=1`).Scan(&storedCert, &storedKey); err != nil {
+			t.Fatalf("read admin TLS material: %v", err)
+		}
+		if storedCert != certPEM || storedKey != keyPEM {
+			t.Fatalf("仅切换启用态改写了证书材料: certLen=%d/%d keyLen=%d/%d", len(storedCert), len(certPEM), len(storedKey), len(keyPEM))
+		}
 		select {
 		case <-exited:
 		case <-time.After(time.Second):
@@ -404,12 +413,32 @@ func TestUpdateAdminTLS_switchingToSelfsignedClearsUploadedMaterial(t *testing.T
 
 // 值未变更时 PUT /admin-tls 此前仍写库并触发进程重启
 // （设置页重复保存=无谓停机）。未变更 → 200「未变更」、不写库、不重启。
+// 「不写库」必须查 DB 终态：同值 UPDATE 也会刷新 updated_at，进而打断集群
+// 版本/快照指纹的「无变化」判定链——仅断言响应文案与不重启无法发现退化。
 func TestUpdateAdminTLS_unchangedConfigSkipsWriteAndRestart(t *testing.T) {
 	initializeRuleFeatureTestDB(t)
 	if _, err := db.DB.Exec(`UPDATE global_config SET admin_tls_enabled=1,admin_tls_mode='selfsigned',
-		admin_tls_cert='',admin_tls_key='' WHERE id=1`); err != nil {
+		admin_tls_cert='',admin_tls_key='',updated_at='2000-01-01 00:00:00' WHERE id=1`); err != nil {
 		t.Fatalf("seed admin TLS config: %v", err)
 	}
+	type adminTLSRow struct {
+		enabled   bool
+		mode      string
+		cert      string
+		key       string
+		updatedAt string
+	}
+	readRow := func() adminTLSRow {
+		t.Helper()
+		var row adminTLSRow
+		if err := db.DB.QueryRow(`SELECT admin_tls_enabled,admin_tls_mode,admin_tls_cert,admin_tls_key,
+			COALESCE(updated_at,'') FROM global_config WHERE id=1`).
+			Scan(&row.enabled, &row.mode, &row.cert, &row.key, &row.updatedAt); err != nil {
+			t.Fatalf("read admin TLS config: %v", err)
+		}
+		return row
+	}
+	before := readRow()
 	oldExit := exitProcess
 	exited := make(chan struct{}, 1)
 	exitProcess = func(int) { exited <- struct{}{} }
@@ -429,6 +458,9 @@ func TestUpdateAdminTLS_unchangedConfigSkipsWriteAndRestart(t *testing.T) {
 	}
 	if !strings.Contains(response.Body.String(), "未变更") {
 		t.Fatalf("body=%s, want 未变更提示", response.Body.String())
+	}
+	if after := readRow(); after != before {
+		t.Fatalf("未变更提交改写了库内终态: before=%+v after=%+v（同值 UPDATE 也会刷新 updated_at）", before, after)
 	}
 	select {
 	case <-exited:
@@ -649,7 +681,7 @@ func TestUpdateAdminTLS_failuresAreAudited(t *testing.T) {
 	}
 }
 
-// 413 口径此前只测 JSON 通道——multipart 超 2 MiB 未覆盖，
+// 413 口径此前只测 JSON 通道——multipart 超整体体上限未覆盖，
 // 表单解析错误须同样映射 413（respondAdminTLSBodyError 的 *http.MaxBytesError
 // 分支）。两入口（保存/预检）同门。
 func TestAdminTLSOversizedMultipartBodyReturns413(t *testing.T) {
@@ -659,7 +691,7 @@ func TestAdminTLSOversizedMultipartBodyReturns413(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := filePart.Write(bytes.Repeat([]byte("a"), (2<<20)+64)); err != nil {
+	if _, err := filePart.Write(bytes.Repeat([]byte("a"), maxAdminTLSBodyBytes+64)); err != nil {
 		t.Fatal(err)
 	}
 	if err := writer.WriteField("mode", "selfsigned"); err != nil {

@@ -175,12 +175,12 @@ const rateLimitBucketCapacity = 1024
 // 受保护桶仅在「表内只剩受保护桶」时才可能被淘汰（仍保证新键必建桶）。
 // 调用方须持有 loginRateBuckets.Lock。
 func evictLeastRecentlyUsedRateLimitBucketLocked() {
-	victim, _ := lruVictimLocked(rateLimitEvictCredentialOnly)
+	victim := lruVictimLocked(rateLimitEvictCredentialOnly)
 	if victim == "" {
-		victim, _ = lruVictimLocked(rateLimitEvictUnprotected)
+		victim = lruVictimLocked(rateLimitEvictUnprotected)
 	}
 	if victim == "" {
-		victim, _ = lruVictimLocked(rateLimitEvictAny)
+		victim = lruVictimLocked(rateLimitEvictAny)
 	}
 	if victim != "" {
 		delete(loginRateBuckets.entries, victim)
@@ -205,7 +205,9 @@ func isProtectedRateLimitKey(key string) bool {
 	return strings.HasSuffix(key, "|login") || strings.HasSuffix(key, "|register")
 }
 
-func lruVictimLocked(tier rateLimitEvictTier) (string, int64) {
+// lruVictimLocked 返回该档位下最久未命中的键（无候选返回空串）。年龄只用于
+// 比较，调用方只需键名——不返回最老时间戳，避免第二个事实源。
+func lruVictimLocked(tier rateLimitEvictTier) string {
 	var victim string
 	oldest := int64(1<<63 - 1)
 	for key, bucket := range loginRateBuckets.entries {
@@ -224,7 +226,7 @@ func lruVictimLocked(tier rateLimitEvictTier) (string, int64) {
 			victim = key
 		}
 	}
-	return victim, oldest
+	return victim
 }
 
 var loginRateBuckets = struct {
@@ -591,7 +593,11 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 		// callback 匿名可达且失败分支会写审计行；独立桶限流（不消耗登录
 		// 额度），防止伪造回调线速灌审计库。
 		v1.GET("/auth/oidc/callback", clusterRateLimit("oidc-callback", 60, "OIDC 回调请求过于频繁，请稍后再试"), h.OIDCCallback)
-		v1.GET("/branding", h.GetBranding)
+		// 品牌配置公开读取：每请求至少 1 次 stat+序列化，指纹变化后的首个
+		// 通过门控请求还会同步做多次 DB 写——匿名方无限速刷会把「每分钟一次」
+		// 的门控放大成并发写尝试。挂独立宽桶（120/min/IP，前端首屏只读一次，
+		// 不受影响），与 oidc 两条公开端点同口径。
+		v1.GET("/branding", clusterRateLimit("branding", 120, "品牌配置查询过于频繁，请稍后再试"), h.GetBranding)
 		v1.POST("/cluster/register", clusterRegisterRateLimit(), h.RegisterClusterNode)
 		v1.GET("/cluster/register/:id/status", clusterMachineRateLimit("registration-status", clusterCredentialFromRegistration), registrationAuth(db.DB), h.GetClusterRegistrationStatus)
 		v1.GET("/cluster/sync/snapshot", clusterMachineRateLimit("sync-snapshot", clusterCredentialFromToken), clusterTokenAuth(db.DB), h.GetClusterSnapshot)
@@ -960,7 +966,7 @@ func auditMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		action, resource, detail := services.FormatAuditAction(c.Request.Method, path)
+		action, resource, detail := services.FormatAuditAction(path)
 		if action == "" {
 			return
 		}
@@ -1431,15 +1437,10 @@ func adminOrSelfParam() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		var actor int
-		switch v := c.Value("user_id").(type) {
-		case int:
-			actor = v
-		case int64:
-			actor = int(v)
-		case float64:
-			actor = int(v)
-		}
+		// user_id 类型归一单源（handlers.ContextUserID）：jwtAuth 存 float64、
+		// apiKeyAuth 存 int、MCP 内部转发可能存 string 数字——包内自写 switch
+		// 会让后一种形态归零，自助写一律 403（功能回归）。
+		actor := int(handlers.ContextUserID(c))
 		if actor <= 0 || actor != target {
 			recordAuthenticationRejection(c, "admin_required")
 			c.JSON(http.StatusForbidden, gin.H{"code": 403, "message": "需要管理员权限"})

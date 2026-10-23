@@ -335,7 +335,7 @@ func (h *Handlers) GetConfig(c *gin.Context) {
 
 		       COALESCE(caddy_log_level,'info') as caddy_log_level,
 		       COALESCE(caddy_log_size_mb,?) as caddy_log_size_mb,
-		       CASE WHEN COALESCE(request_body_max_size_mb,0)>0 THEN request_body_max_size_mb ELSE ? END as request_body_max_size_mb,
+		       COALESCE(request_body_max_size_mb,?) as request_body_max_size_mb,
 		       COALESCE(http_read_timeout,?) as http_read_timeout,
 		       COALESCE(http_write_timeout,?) as http_write_timeout,
 		       COALESCE(http_idle_timeout,?) as http_idle_timeout,
@@ -800,13 +800,15 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 			}
 		}
 	}()
-	// 可空列（dns_credentials/acme_email/access_log_format/default_ca_provider_id）需支持
+	// 可空列（acme_email/access_log_format/default_ca_provider_id）需支持
 	// 清空：传空值即置 NULL（COALESCE 无法区分“未传”与“清空”）。其余列保留 COALESCE 语义
 	// —— 未传(nil) 保持原值。CASE WHEN ? IS NULL 用于区分 nil 与空字符串。
+	// global_config.dns_credentials 为遗留列（签发链唯一凭证来源是
+	// certificate_configs）：读路径早已不回显，这里同步收口写分支——不可见的
+	// 凭证不再可被写入，存量值由启动迁移置空。
 	res, err := tx.Exec(`
 			UPDATE global_config SET
 				dns_provider = COALESCE(?, dns_provider),
-				dns_credentials = CASE WHEN ? IS NULL THEN dns_credentials ELSE NULLIF(?, '') END,
 				acme_email = CASE WHEN ? IS NULL THEN acme_email ELSE NULLIF(?, '') END,
 				cert_expiry_days = COALESCE(?, cert_expiry_days),
 				cert_renewal_days = COALESCE(?, cert_renewal_days),
@@ -853,7 +855,7 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 				security_events_row_cap = COALESCE(?, security_events_row_cap),
 				updated_at = datetime('now')
 			WHERE id = 1
-		`, req.DNSProvider, req.DNSCredentials, req.DNSCredentials, req.ACMEEmail, req.ACMEEmail, req.CertExpiryDays, req.CertRenewalDays, req.CertRenewalAttempts, req.DefaultCAProviderID, req.DefaultCAProviderID, req.LogLevel,
+		`, req.DNSProvider, req.ACMEEmail, req.ACMEEmail, req.CertExpiryDays, req.CertRenewalDays, req.CertRenewalAttempts, req.DefaultCAProviderID, req.DefaultCAProviderID, req.LogLevel,
 		req.CaddyLogLevel, req.CaddyLogSizeMB,
 		req.RequestBodyMaxSizeMB, req.HTTPReadTimeout, req.HTTPWriteTimeout, req.HTTPIdleTimeout,
 		req.UpstreamKeepaliveTimeout, req.ProxyDialTimeout, req.ProxyResponseHeaderTimeout, req.ProxyReadTimeout, req.ProxyWriteTimeout, req.ProxyStreamTimeout, req.ProxyFlushInterval, req.ProxyStreamCloseDelay,
@@ -964,7 +966,7 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 		}
 	}
 
-	reloadNote()
+	reloadNote.finalize()
 
 	message := "配置已更新并应用"
 	if formatCleared {
@@ -1146,7 +1148,9 @@ func (h *Handlers) GetCaddyConfig(c *gin.Context) {
 	// localhost:2019，自定义 admin 地址的部署读到的是错误端点。
 	resp, err := caddyAdminGet(c.Request.Context(), h.cfg.CaddyAdminURL, "/config/", 5*time.Second)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "连接 Caddy 失败: " + err.Error()})
+		// admin 不可达=上游/网关级故障（与 GetRuleCaddyConfig、GetUpstreamHealth
+		// 同口径的 502）；500 留给「读到的字节解析失败/超限」这类面板侧失败。
+		c.JSON(http.StatusBadGateway, models.APIResponse{Code: 502, Message: "连接 Caddy 失败: " + err.Error()})
 		return
 	}
 	defer resp.Body.Close()
@@ -1242,7 +1246,7 @@ func (h *Handlers) GetCaddyLogs(c *gin.Context) {
 	// 尾窗首行残段截断统一走 tailLogWindow
 	// 口径——窗口内无 '\n' 时整窗为同一巨行中段，输出为空；此前此处分叉
 	// 返回原始中段，多字节 rune 切断处 U+FFFD 污染）。
-	data = tailLogWindow(data, startOffset)
+	data = tailLogWindow(f, data, startOffset)
 
 	lines := strings.Split(string(data), "\n")
 	if len(lines) > maxLines {

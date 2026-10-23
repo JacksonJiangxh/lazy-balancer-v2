@@ -135,7 +135,8 @@ type adminTLSInput struct {
 }
 
 // decodeAdminTLSInput 解析请求入参：为 multipart 表单时走原
-// multipart 路径（含 2 MiB 上限与原错误文案）；否则嗅探 body 为 JSON 对象
+// multipart 路径（解析器内存阈值 2 MiB，超出部分落临时文件；整体体积由调用方
+// MaxBytesReader 把关，错误文案维持原样）；否则嗅探 body 为 JSON 对象
 // （含显式 application/json）时走 JSON 路径；其余请求回落 multipart 解析，
 // 行为与仅支持表单时一致。
 func decodeAdminTLSInput(c *gin.Context) (*adminTLSInput, error) {
@@ -261,13 +262,12 @@ func (in *adminTLSInput) certificatePair() (string, string, error) {
 }
 
 // respondAdminTLSBodyError 把入参解析错误映射为响应：*http.MaxBytesError
-// （2 MiB MaxBytesReader 上限）→ 413，其余 → 400。UpdateAdminTLS 与
-// InspectAdminTLSCert 共用（原超限 body 恒 400，与规则域 413 口径
-// 不一致）。
+// （整体 body 上限）→ 413，其余 → 400。UpdateAdminTLS 与 InspectAdminTLSCert
+// 共用（原超限 body 恒 400，与规则域 413 口径不一致）。
 func respondAdminTLSBodyError(c *gin.Context, err error) {
 	var maxBytesErr *http.MaxBytesError
 	if errors.As(err, &maxBytesErr) {
-		c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: "请求体超过 2 MiB 上限"})
+		c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: "请求体超过 4 MiB 上限"})
 		return
 	}
 	c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
@@ -276,7 +276,7 @@ func respondAdminTLSBodyError(c *gin.Context, err error) {
 // InspectAdminTLSCert parses uploaded cert/key files without saving, so the
 // UI can show what will be installed before the user confirms.
 func (h *Handlers) InspectAdminTLSCert(c *gin.Context) {
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 2<<20)
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxAdminTLSBodyBytes)
 	input, err := decodeAdminTLSInput(c)
 	if err != nil {
 		respondAdminTLSBodyError(c, err)
@@ -304,8 +304,14 @@ func (h *Handlers) InspectAdminTLSCert(c *gin.Context) {
 }
 
 // maxAdminTLSFileBytes 证书/私钥单文件（multipart）与单字段（JSON）的共用
-// 上限（整体 body 上限 2 MiB 见调用方的 MaxBytesReader）。
+// 上限。整体 body 上限见 maxAdminTLSBodyBytes。
 const maxAdminTLSFileBytes = 1 << 20
+
+// maxAdminTLSBodyBytes 整体请求体上限：须容纳「证书 + 私钥各取满单字段
+// 上限」的净内容（2×1 MiB）再计 multipart 边界/头与 JSON 转义开销——沿用
+// 2 MiB 会让两条对外契约（单文件 1 MiB / 整体 2 MiB）在同一次提交里互相
+// 否定，用户收到的是「整体超限」而非单字段归因。
+const maxAdminTLSBodyBytes = 4 << 20
 
 func readAdminTLSFiles(c *gin.Context) (string, string, error) {
 	// limit+1 探测：超限必须显式 400——静默截断后的 PEM 进入
@@ -376,7 +382,7 @@ func (h *Handlers) UpdateAdminTLS(c *gin.Context) {
 	if rejectWriteDuringImport(c, "保存管理面板 HTTPS 配置（配置导入进行中）") {
 		return
 	}
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 2<<20)
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxAdminTLSBodyBytes)
 	input, err := decodeAdminTLSInput(c)
 	if err != nil {
 		auditAdminTLSFailure(c, "请求体无法解析")

@@ -39,6 +39,11 @@ func registerAuditField(s string) string {
 }
 
 func (h *Handlers) GenerateClusterRegisterToken(c *gin.Context) {
+	// 与同族写端点同口径：导入窗口内写事务持库锁，此处写入会等满
+	// busy_timeout 后 500（语义应为 409）。
+	if rejectNodeWriteDuringImport(c) {
+		return
+	}
 	if !h.requireMaster(c) {
 		return
 	}
@@ -69,7 +74,10 @@ func (h *Handlers) RegisterClusterNode(c *gin.Context) {
 		clusterError(c, http.StatusBadRequest, "注册请求格式错误", err)
 		return
 	}
-	registration, err := h.clusterService.RegisterNode(c.Request.Context(), req, time.Now())
+	// access_url 的信任锚=服务端观测到的连接来源地址（路由器
+	// SetTrustedProxies(nil)，c.ClientIP() 即直连对端，不采信转发头）——请求体
+	// 自述 ip_address 只用于展示/连通性，不参与该判定。
+	registration, err := h.clusterService.RegisterNode(c.Request.Context(), req, c.ClientIP(), time.Now())
 	if err != nil {
 		if errors.Is(err, services.ErrInvalidRegisterToken) {
 			// 无效令牌路径不携带攻击者输入，详情与响应均用通用文案

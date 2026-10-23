@@ -25,6 +25,9 @@ func TestSyncService_applySnapshot_reloadFailure_marks_apply_ok_reload_failed(t 
 	if err != nil {
 		t.Fatal(err)
 	}
+	// applySnapshot 是纯从端路径（生产只经 Pull 到达），补偿标记也只在从端
+	// 语境落库——主节点快照构建完成后把节点置为从节点再应用。
+	setNodeMasterRole(t, database, false)
 	caddyServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
 		response.WriteHeader(http.StatusInternalServerError)
 		_, _ = response.Write([]byte("caddy boom"))
@@ -336,6 +339,7 @@ func TestSyncService_run_reloadFailureMarker_survivesCycleEndAndTriggersRepull(t
 func TestSyncService_recordSyncError_preservesReloadFailureMarkerOnTransportError(t *testing.T) {
 	// Given：last_sync_error 携带重载失败标记；本轮拉取遇到传输层错误
 	_, database := newClusterTestService(t)
+	setNodeMasterRole(t, database, false) // 同步状态写只属于从节点语境
 	if _, err := database.Exec("UPDATE global_config SET last_sync_error=?", encodeSyncError("apply_ok_reload_failed: caddy down", models.SyncErrorCodeApplyFailed)); err != nil {
 		t.Fatal(err)
 	}

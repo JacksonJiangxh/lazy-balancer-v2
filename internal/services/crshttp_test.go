@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/taskengine"
 	"log"
 	"net/http"
@@ -426,5 +427,91 @@ func TestGitHubAPIToken_readFailureLogsWarn(t *testing.T) {
 	// Then：warn 级留痕（对齐 getGitHubProxyURL 口径）
 	if !strings.Contains(buf.String(), "WARNING:") || !strings.Contains(buf.String(), "GitHub API 令牌") {
 		t.Fatalf("读库失败须 warn 留痕, log:\n%s", buf.String())
+	}
+}
+
+// 401（令牌失效）与 5xx（传输/服务端故障）都必须经代理 releases/latest 回退；
+// 404/400 等确定性 4xx 不回退（重试只会放大延迟）。
+func TestFetchCRSLatestTag_apiFailureFallbackMatrix(t *testing.T) {
+	cases := []struct {
+		name         string
+		status       int
+		wantFallback bool
+	}{
+		{"401_unauthorized_falls_back", http.StatusUnauthorized, true},
+		{"500_server_error_falls_back", http.StatusInternalServerError, true},
+		{"404_not_found_no_fallback", http.StatusNotFound, false},
+		{"400_bad_request_no_fallback", http.StatusBadRequest, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			proxyHits := 0
+			proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				proxyHits++
+				w.Header().Set("Location", "https://github.com/coreruleset/coreruleset/releases/tag/v4.14.0")
+				w.WriteHeader(http.StatusFound)
+			}))
+			defer proxy.Close()
+			withGHFastProxy(t, proxy.URL+"/")
+
+			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, "failure", tc.status)
+			}))
+			defer api.Close()
+			withCRSLatestAPIURL(t, api.URL)
+
+			tag, err := defaultFetchCRSLatestTag(context.Background())
+			if tc.wantFallback {
+				if err != nil || tag != "v4.14.0" {
+					t.Fatalf("status %d 必须回退代理: tag=%q err=%v", tc.status, tag, err)
+				}
+				if proxyHits == 0 {
+					t.Fatalf("status %d 未触发代理回退", tc.status)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("status %d 不得回退代理（err=nil）", tc.status)
+			}
+			if proxyHits != 0 {
+				t.Fatalf("status %d 不得请求代理, hits=%d", tc.status, proxyHits)
+			}
+		})
+	}
+}
+
+// GitHub API 令牌仅随 api.github.com 直连发送：代理收到 5xx 后的回退请求
+// 必须不带 Authorization（第三方代理不可见凭据）。
+func TestFetchCRSLatestTag_tokenNeverSentToProxy(t *testing.T) {
+	initServicesDB(t)
+	if _, err := db.DB.Exec(`UPDATE global_config SET github_token='ghp_secret_token' WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	proxyAuth := make(chan string, 1)
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyAuth <- r.Header.Get("Authorization")
+		w.Header().Set("Location", "https://github.com/coreruleset/coreruleset/releases/tag/v4.20.0")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer proxy.Close()
+	withGHFastProxy(t, proxy.URL+"/")
+
+	apiAuth := make(chan string, 1)
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		apiAuth <- r.Header.Get("Authorization")
+		http.Error(w, "server error", http.StatusInternalServerError)
+	}))
+	defer api.Close()
+	withCRSLatestAPIURL(t, api.URL)
+
+	tag, err := defaultFetchCRSLatestTag(context.Background())
+	if err != nil || tag != "v4.20.0" {
+		t.Fatalf("500 回退应成功: tag=%q err=%v", tag, err)
+	}
+	if got := <-apiAuth; got != "Bearer ghp_secret_token" {
+		t.Fatalf("直连 API Authorization=%q, want Bearer 令牌", got)
+	}
+	if got := <-proxyAuth; got != "" {
+		t.Fatalf("代理请求携带 Authorization=%q——令牌不得发往第三方代理", got)
 	}
 }

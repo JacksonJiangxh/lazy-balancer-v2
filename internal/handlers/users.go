@@ -205,7 +205,11 @@ func (h *Handlers) UpdateUser(c *gin.Context) {
 	displayNameChanged := req.DisplayName != nil && *req.DisplayName != oldDisplayName
 	// 非管理员本人自助（用户管理页）只允许改显示名与重置密码；用户名/角色是
 	// 管理语义，自助路径一律拒绝（防提权/身份漂移）。管理员不受此门限制。
-	if c.GetString("role") == "user" {
+	// 判据必须与守卫链同口径「非管理员 = role != 'admin'」：users.role 无
+	// CHECK 约束，遗留/带外数据可产生 admin/user 之外的取值（旧备份、直接改
+	// 库）。此前用 == "user" 判定，脏角色值会同时绕过只读门的 admin 分支与
+	// 本自助锁，把 role 改成 admin 提权。
+	if c.GetString("role") != "admin" {
 		if usernameChanged {
 			c.JSON(http.StatusForbidden, models.APIResponse{Code: 403, Message: "非管理员不能修改用户名"})
 			return

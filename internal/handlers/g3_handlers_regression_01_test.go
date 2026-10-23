@@ -104,7 +104,7 @@ func TestImportConfigBackup_acceptsPreLateTableEraFullBackups(t *testing.T) {
 }
 
 // 预览路径确认:ValidateConfigImport(config_import_v1.go:577)
-// 与导入同走 validateV2Backup 必需表门——一处修复双路径生效,预览不得再误报
+// 与导入同走校验链的完整性校验门——一处修复双路径生效,预览不得再误报
 // 「备份缺少必需的数据表」。
 func TestValidateConfigImport_acceptsV220EraFullBackup(t *testing.T) {
 	// Given v2.2.0 十四表形态备份(缺 security_ip_lists)

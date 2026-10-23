@@ -34,7 +34,7 @@ func TestEngineGate_precheckGeoipPolicyIDGuard(t *testing.T) {
 	compileForEngineGate(t, dOK)
 }
 
-// 历史 A 域： ----
+// ---- 指令产物解析帮手 ----
 
 func precheckRuleIDList(directives string) []int {
 	var out []int

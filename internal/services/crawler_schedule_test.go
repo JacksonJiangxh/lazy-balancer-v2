@@ -165,3 +165,49 @@ func TestInitTaskEngine_nonExemptTasksLoopOn(t *testing.T) {
 		}
 	}
 }
+
+// 到期判定必须与同族「双布局单源解析」同口径：库内 RFC3339 形态的未来槽
+// 不得被单布局解析失败误判为「已到期」而提前下载。
+func TestCrawlerDueSources_parsesRFC3339Slots(t *testing.T) {
+	// Given：一个到期源（平面串）+ 一个未来源（RFC3339）
+	newClusterTestService(t)
+	if err := ensureCrawlerSources(); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().UTC().Add(48 * time.Hour).Format(time.RFC3339)
+	if _, err := db.DB.Exec(`UPDATE security_crawler_sources SET next_update=CASE name
+		WHEN 'googlebot' THEN '2000-01-01T00:00:00Z'
+		WHEN 'bingbot' THEN ?
+		ELSE '2099-01-01 00:00:00' END`, future); err != nil {
+		t.Fatal(err)
+	}
+
+	// When
+	autoSources, err := crawlerDueSources("auto")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Then：RFC3339 未来槽的 bingbot 不得进入到期集
+	for _, src := range autoSources {
+		if src.Name == "bingbot" {
+			t.Fatalf("RFC3339 未来槽被误判为到期: %+v", autoSources)
+		}
+	}
+	if len(autoSources) != 1 || autoSources[0].Name != "googlebot" {
+		t.Fatalf("auto sources=%+v, want only googlebot", autoSources)
+	}
+
+	// 单一启用源的混合格式槽在「最早槽」读取侧与到期判定同口径：RFC3339
+	// 未来槽归一为平面串返回（不得因格式而漏掉）。
+	if _, err := db.DB.Exec(`UPDATE security_crawler_sources SET update_enabled=CASE name WHEN 'bingbot' THEN 1 ELSE 0 END`); err != nil {
+		t.Fatal(err)
+	}
+	wantEarliest := future
+	if parsed, ok := ParseUTCTimeDual(future); ok {
+		wantEarliest = parsed.UTC().Format(crsTimeLayout)
+	}
+	if got := earliestCrawlerNextUpdate(); got != wantEarliest {
+		t.Fatalf("earliestCrawlerNextUpdate=%q, want %q", got, wantEarliest)
+	}
+}

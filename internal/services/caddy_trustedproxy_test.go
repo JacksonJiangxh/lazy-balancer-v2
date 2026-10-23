@@ -15,6 +15,14 @@ func TestTrustedProxyRender_serversInjectedWhenEnabled(t *testing.T) {
 	// Given
 	_, database := newClusterTestService(t)
 	seedHTTPRuleForGeneration(t, database, "lb_tp", "tp.example.test", 8080)
+	// layer4 负断言需要真实 layer4 servers 才具备证伪力（无 TCP 规则时循环零次，
+	// 「不注入」断言恒真）。
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,listen_port,strategy,enabled) VALUES ('lb_tp_tcp','lb_tp_tcp','tcp',19000,'weighted_round_robin',1)`); err != nil {
+		t.Fatalf("seed tcp rule: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb_tp_tcp','127.0.0.1',9000,1,1,'tcp')`); err != nil {
+		t.Fatalf("seed tcp upstream: %v", err)
+	}
 	if _, err := database.Exec(`UPDATE global_config SET trusted_proxy_enabled=1, trusted_proxy_ranges='["203.0.113.0/24","198.51.100.7/32"]', trusted_proxy_headers='["CF-Connecting-IP","X-Forwarded-For"]', trusted_proxy_strict=1 WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
@@ -66,11 +74,17 @@ func TestTrustedProxyRender_serversInjectedWhenEnabled(t *testing.T) {
 		}
 	}
 	// layer4/admin 不注入
-	if l4, ok := apps["layer4"]; ok {
-		for name, srv := range l4.(map[string]interface{})["servers"].(map[string]interface{}) {
-			if _, has := srv.(map[string]interface{})["trusted_proxies"]; has {
-				t.Fatalf("layer4 server %s must not carry trusted_proxies", name)
-			}
+	l4, ok := apps["layer4"]
+	if !ok {
+		t.Fatal("layer4 app missing——负断言的前置面为空")
+	}
+	l4Servers, ok := l4.(map[string]interface{})["servers"].(map[string]interface{})
+	if !ok || len(l4Servers) == 0 {
+		t.Fatalf("layer4 servers missing/empty——负断言的前置面为空: %#v", l4)
+	}
+	for name, srv := range l4Servers {
+		if _, has := srv.(map[string]interface{})["trusted_proxies"]; has {
+			t.Fatalf("layer4 server %s must not carry trusted_proxies", name)
 		}
 	}
 	if _, has := generated["admin"].(map[string]interface{})["trusted_proxies"]; has {

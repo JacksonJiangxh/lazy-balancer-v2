@@ -79,4 +79,38 @@ func TestCheckExpiration_skipsRenewalWindowCoveringCertificateLifetime(t *testin
 			t.Fatalf("candidates=%d, want 1（剩余 ≤7 天保护区必须续签）", len(jobs))
 		}
 	})
+
+	// 保护区边界是排他的：剩余恰 7 天不放行（否则边界上每轮都会重签），
+	// 不足 7 天才放行。只测「剩 24h / 剩 19d」无法发现边界改成 >= 的回归。
+	t.Run("grace boundary is exclusive", func(t *testing.T) {
+		_, database := newClusterTestService(t)
+		setRenewalDays(t, database, 90)
+		notAfter := now.Add(certRenewalGuaranteedGrace + time.Hour)
+		seedRenewalWindowJob(t, database, "lb_window_grace_in", "windowgracein.example.com",
+			notAfter.Add(-90*24*time.Hour), notAfter)
+
+		jobs, _, err := NewCertificateService().CheckExpiration()
+		if err != nil {
+			t.Fatalf("check expiration: %v", err)
+		}
+		if len(jobs) != 0 {
+			t.Fatalf("candidates=%d, want 0（剩余 7 天 + 1h 仍在保护区之外）", len(jobs))
+		}
+	})
+
+	t.Run("grace boundary inside renews", func(t *testing.T) {
+		_, database := newClusterTestService(t)
+		setRenewalDays(t, database, 90)
+		notAfter := now.Add(certRenewalGuaranteedGrace - time.Hour)
+		seedRenewalWindowJob(t, database, "lb_window_grace_out", "windowgraceout.example.com",
+			notAfter.Add(-90*24*time.Hour), notAfter)
+
+		jobs, _, err := NewCertificateService().CheckExpiration()
+		if err != nil {
+			t.Fatalf("check expiration: %v", err)
+		}
+		if len(jobs) != 1 {
+			t.Fatalf("candidates=%d, want 1（剩余 7 天 - 1h 已进入保护区）", len(jobs))
+		}
+	})
 }

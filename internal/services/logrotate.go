@@ -17,11 +17,9 @@ import (
 
 var runtimeLogSizeMB atomic.Int64
 
-var runtimeLogSizeRefresh struct {
-	sync.Mutex
-	cancel context.CancelFunc
-	done   chan struct{}
-}
+var runtimeLogSizeRefresh backgroundWorker
+
+const runtimeLogSizeRefreshLogLabel = "logrotate refresh"
 
 // init 只落兜底阈值（100MB）。worker 不再随包初始化自启
 // init 先于 main 的 db.Initialize，首次 refresh 必撞 nil 库空转，启动后
@@ -41,22 +39,7 @@ const logRotateRestartWaitMax = 1 * time.Second
 // 不返回 done 通道：唯一生产调用方（main 启动链）与测试都不消费——关停同步
 // 语义由 StopLogRotateWithin 承担，返回一个无人读取的通道只会诱导误用。
 func StartLogRotate(ctx context.Context) {
-	runtimeLogSizeRefresh.Lock()
-	defer runtimeLogSizeRefresh.Unlock()
-	if runtimeLogSizeRefresh.cancel != nil {
-		runtimeLogSizeRefresh.cancel()
-		// 重启路径同样有界（与 StopLogRotateWithin 同语义）：旧 worker 卡在
-		// DB busy_timeout 时不再无界挂起启动；超时放弃等待并 warn。
-		select {
-		case <-runtimeLogSizeRefresh.done:
-		case <-time.After(logRotateRestartWaitMax):
-			Logf("warn", "logrotate refresh worker 未在重启预算 %s 内退出，放弃等待旧实例（启动新实例继续）", logRotateRestartWaitMax)
-		}
-	}
-	workerCtx, cancel := context.WithCancel(ctx)
-	done := make(chan struct{})
-	runtimeLogSizeRefresh.cancel = cancel
-	runtimeLogSizeRefresh.done = done
+	workerCtx, done := runtimeLogSizeRefresh.replace(ctx, logRotateRestartWaitMax, runtimeLogSizeRefreshLogLabel)
 	go func() {
 		defer close(done)
 		refresh := func() {
@@ -94,7 +77,7 @@ func StartLogRotate(ctx context.Context) {
 }
 
 func StopLogRotate() {
-	StopLogRotateWithin(0)
+	runtimeLogSizeRefresh.stop(runtimeLogSizeRefreshLogLabel)
 }
 
 // StopLogRotateWithin 有界停止日志尺寸刷新 worker：cancel 后最多等待 within
@@ -103,25 +86,7 @@ func StopLogRotate() {
 // 退出后可再次调用完成清零（可重启语义不变）。返回 true=worker 已退出且
 // 状态清零。
 func StopLogRotateWithin(within time.Duration) bool {
-	runtimeLogSizeRefresh.Lock()
-	defer runtimeLogSizeRefresh.Unlock()
-	if runtimeLogSizeRefresh.cancel == nil {
-		return true
-	}
-	runtimeLogSizeRefresh.cancel()
-	if within <= 0 {
-		<-runtimeLogSizeRefresh.done
-	} else {
-		select {
-		case <-runtimeLogSizeRefresh.done:
-		case <-time.After(within):
-			Logf("warn", "logrotate refresh worker 未在关停预算 %s 内退出，放弃等待（进程继续退出）", within)
-			return false
-		}
-	}
-	runtimeLogSizeRefresh.cancel = nil
-	runtimeLogSizeRefresh.done = nil
-	return true
+	return runtimeLogSizeRefresh.stopWithin(within, runtimeLogSizeRefreshLogLabel)
 }
 
 // RotatingFileWriter writes to a log file and rotates it once it exceeds the
@@ -215,6 +180,10 @@ func (w *RotatingFileWriter) Close() error {
 	return w.file.Close()
 }
 
+// appLogEntryInfo 是应用日志副本元数据采集的注入点（测试可注入失败形态；
+// 与 auditLogCopyFile 同款测试缝）。默认即 os.DirEntry.Info。
+var appLogEntryInfo = func(entry os.DirEntry) (os.FileInfo, error) { return entry.Info() }
+
 // RuntimeCleanupResult 单轮运行日志清理结果（log-cleanup 任务日志展示明细——
 // 2026-10-01 用户裁定：清理了哪个文件必须可见；单轮执行体=
 // RuntimeLogCleanupOnce，由任务引擎 log-cleanup 族按 24h 节拍驱动）。
@@ -227,6 +196,10 @@ type RuntimeCleanupResult struct {
 	// AppRemoveFailed 应用日志副本单文件删除失败数（权限/占用/IO）。
 	// 曾只打应用日志、不进结果——摘要行仍称「删除 N 个」而实际残留。
 	AppRemoveFailed int
+	// AppInfoFailed 应用日志副本元数据读取失败数（无法判定是否过期，本轮
+	// 未删除）。与任务日志侧 TaskLogHousekeepingResult.InfoFailed 同口径——
+	// 此前静默跳过，失败数与正常「无过期副本」不可区分。
+	AppInfoFailed int
 	// RetentionMonths 本轮生效的保留月数（单一来源 auditRetentionMonths 回填，
 	// 任务日志摘要行直接展示本字段——此前 wire 处自行查库复算，
 	// 同值两实现会在默认值/钳位逻辑变更时与实际清理口径分裂）。
@@ -257,6 +230,9 @@ func (r RuntimeCleanupResult) Err() error {
 	}
 	if r.AppRemoveFailed > 0 {
 		errs = append(errs, fmt.Errorf("应用日志副本删除失败 %d 个", r.AppRemoveFailed))
+	}
+	if r.AppInfoFailed > 0 {
+		errs = append(errs, fmt.Errorf("应用日志副本元数据读取失败 %d 个", r.AppInfoFailed))
 	}
 	if r.TaskLogs.RemoveFailed > 0 {
 		errs = append(errs, fmt.Errorf("任务日志删除失败 %d 个", r.TaskLogs.RemoveFailed))
@@ -361,8 +337,12 @@ func RuntimeLogCleanupOnce(logFile string) RuntimeCleanupResult {
 		if e.IsDir() || !strings.HasPrefix(e.Name(), base) {
 			continue
 		}
-		info, err := e.Info()
+		info, err := appLogEntryInfo(e)
 		if err != nil {
+			// 元数据不可读＝无法判定是否过期，本轮未删除；必须可见（与任务
+			// 日志侧 InfoFailed 同口径），否则与「无过期副本」同形。
+			Logf("warn", "应用日志副本清理：读取 %s 元数据失败（本轮未删除）: %v", e.Name(), err)
+			result.AppInfoFailed++
 			continue
 		}
 		if info.ModTime().Before(cutoff) {
@@ -432,8 +412,15 @@ func logCleanupDetail(res RuntimeCleanupResult) string {
 	case res.AppCleanupError != "":
 		// 目录不可读不得呈现为「删除 0 个」——任务日志必须留痕失败原因。
 		appPart = fmt.Sprintf("应用日志副本未清理（保留 %d 月）：读取目录失败 %s", res.RetentionMonths, res.AppCleanupError)
-	case res.AppRemoveFailed > 0:
-		appPart = fmt.Sprintf("应用日志副本删除 %d 个、删除失败 %d 个（保留 %d 月）", res.AppRemoved, res.AppRemoveFailed, res.RetentionMonths)
+	case res.AppRemoveFailed > 0 || res.AppInfoFailed > 0:
+		failures := make([]string, 0, 2)
+		if res.AppRemoveFailed > 0 {
+			failures = append(failures, fmt.Sprintf("删除失败 %d 个", res.AppRemoveFailed))
+		}
+		if res.AppInfoFailed > 0 {
+			failures = append(failures, fmt.Sprintf("元数据读取失败 %d 个", res.AppInfoFailed))
+		}
+		appPart = fmt.Sprintf("应用日志副本删除 %d 个、%s（保留 %d 月）", res.AppRemoved, strings.Join(failures, "、"), res.RetentionMonths)
 	default:
 		appPart = fmt.Sprintf("应用日志副本删除 %d 个（保留 %d 月，无过期为 0）", res.AppRemoved, res.RetentionMonths)
 	}

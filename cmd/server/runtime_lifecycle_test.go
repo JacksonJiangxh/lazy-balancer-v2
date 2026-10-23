@@ -91,6 +91,49 @@ func TestRuntimeLifecycle_StopACME_waitsForWorkerExit(t *testing.T) {
 	}
 }
 
+// blockedStopCertificateWorker 是生产形态的 Stop：Start 虽已进入等待轮询，
+// Stop 自身还要做不可预算的收尾（services.CertificateService.Stop 末尾
+// <-s.done），在收尾被长时间占用时永远不返回。
+type blockedStopCertificateWorker struct {
+	release chan struct{}
+	started chan struct{}
+}
+
+func (w *blockedStopCertificateWorker) Start() { close(w.started) }
+
+func (w *blockedStopCertificateWorker) Stop() { <-w.release }
+
+// Given 证书 worker 的 Stop 自身阻塞（生产形态：Stop 内部等待 Start 退出）。
+// When ShutdownWithTimeout 以 50ms 预算调用。
+// Then 必须在预算内返回——Stop 的等待不得落在超时 select 之前，也不得持锁
+// 拖住换代钩子（旧实现先调 Stop 再无界等待，超时分支永不可达）。
+func TestRuntimeLifecycle_ShutdownWithTimeoutBoundsBlockingStop(t *testing.T) {
+	worker := &blockedStopCertificateWorker{release: make(chan struct{}), started: make(chan struct{})}
+	t.Cleanup(func() { close(worker.release) })
+	lifecycle := newRuntimeLifecycle(idleSyncWorker{}, func() certificateWorker { return worker })
+	lifecycle.StartACME()
+	<-worker.started
+
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		lifecycle.ShutdownWithTimeout(50 * time.Millisecond)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ShutdownWithTimeout 未在超时预算内返回（Stop 的阻塞落在超时等待之前）")
+	}
+
+	// 停止已放弃等待，但启动门仍生效：后续 StartSync/StartACME 不得拉起新代。
+	var syncs countingSyncWorker
+	lifecycle.syncService = &syncs
+	lifecycle.StartSync()
+	if got := syncs.starts.Load(); got != 0 {
+		t.Fatalf("Shutdown 后 StartSync 启动了 %d 次，want 0", got)
+	}
+}
+
 // StopACME 必须与 StartACME 的注入对称，
 // 清除 services 侧 active 指针——否则 demote/停机后任务引擎证书单轮体
 // （cert-manual-poll 等）继续驱动已停服务（重复到期日志/无角色门补扫）。

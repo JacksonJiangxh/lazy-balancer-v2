@@ -244,7 +244,7 @@ func TestBuildCorazaDirectives_multiPolicyDenySelfTrustExclusion(t *testing.T) {
 	directives := mustDirectives(BuildCorazaDirectives(p, nil, "", true, 0, "lb_test"))
 	// Then:id:2 以链式自排除形态存在(非抑制删除、非平原形态)
 	if !strings.Contains(directives, "id:2,phase:1,deny,status:403,log,msg:'IP 黑名单拒绝',skipAfter:SECURITY_RULES_END,chain") {
-		t.Fatalf("multi-policy deny must emit chain-starter id:2 with deny in head (历史问题), got:\n%s", directives)
+		t.Fatalf("multi-policy deny must emit chain-starter id:2 with deny in head, got:\n%s", directives)
 	}
 	// 链续段信任集经 @ipListFast 文件投影（p0-trust scope，内容=本策略信任名单）
 	if !strings.Contains(directives, "!@ipListFast ") {
@@ -290,7 +290,7 @@ func TestBuildCorazaDirectives_multiPolicyBlacklistSelfTrustExclusion(t *testing
 	directives := mustDirectives(BuildCorazaDirectives(p, nil, "", true, 0, "lb_test"))
 	// Then:id:4 链式自排除
 	if !strings.Contains(directives, "id:4,phase:1,deny,status:403,log,msg:'IP 黑名单',skipAfter:SECURITY_RULES_END,chain") {
-		t.Fatalf("multi-policy blacklist must emit chain-starter id:4 with deny in head (历史问题), got:\n%s", directives)
+		t.Fatalf("multi-policy blacklist must emit chain-starter id:4 with deny in head, got:\n%s", directives)
 	}
 }
 
@@ -301,7 +301,7 @@ func TestBuildCorazaDirectives_multiPolicyAllowSelfTrustExclusion(t *testing.T) 
 	directives := mustDirectives(BuildCorazaDirectives(p, nil, "", true, 0, "lb_test"))
 	// Then:id:2 链式(!@ipListFast allow AND !@ipListFast trust → deny)
 	if !strings.Contains(directives, "id:2,phase:1,deny,status:403,log,msg:'IP 白名单拒绝',skipAfter:SECURITY_RULES_END,chain") {
-		t.Fatalf("multi-policy allow must emit chain-starter id:2 with deny in head (历史问题), got:\n%s", directives)
+		t.Fatalf("multi-policy allow must emit chain-starter id:2 with deny in head, got:\n%s", directives)
 	}
 	if !strings.Contains(directives, "!@ipListFast ") {
 		t.Fatalf("allow chain must exclude own trust list via file operand, got:\n%s", directives)

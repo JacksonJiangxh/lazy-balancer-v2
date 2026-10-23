@@ -199,8 +199,11 @@ var (
 	// auditTimingOrder 是建条顺序的 FIFO：清扫只从队首弹出 TTL 已过期条目，
 	// 摊销 O(过期数)。旧实现每 64 次建条全表扫描（O(n)，n≈TTL×RPS），
 	// 每次请求摊销 O(n/64) 次 map 迭代且持全局锁 ⇒ CPU 随 RPS² 增长。
-	// 不变量：队列内 created 单调不减（time.Now 的单调读数），且每条目只
-	// 入队一次（id 为进程内唯一随机值，不会重建）。
+	// 不变量：队列内 created 单调不减（time.Now 的单调读数）。**同一条目可
+	// 重建并再次入队**：条目已被 TTL 清扫后终态迟到时，retained-pre 回填
+	// 路径会为同一 id 新建条目并再 append 一个 FIFO 项——所以「每条目只入队
+	// 一次」不成立；清扫以 created 相等判定弹出项是否属于当前那次建条，
+	// 重建条目的旧队列项不会误删新条目。
 	auditTimingOrder []auditTimingQueueEntry
 	// auditTimingHead 是队首游标：已弹出的前缀留在切片里，达到一定规模后
 	// 整体压缩（摊销 O(1)）。
@@ -1341,8 +1344,28 @@ func (p *auditPipeline) openFile(mode os.FileMode) error {
 	return nil
 }
 
-// estimateAuditSnapshotBytes 估算快照驻留字节：只做 len() 求和（常数级
-// 开销，请求路径可付），是预算防线的保守上界而非精确计量。
+// 快照字节估算的固定开销项：估算 = 内容字节（len 求和，常数级、零分配）
+// + JSON 语法与容器驻留开销。各项按上界取整（map/slice 桶头 + 引号/冒号/
+// 括号/逗号），使 header 密集、多文件、多 messages 形态的估算不低于实际
+// 序列化字节——enqueue 按估算执法字节预算，低估即意味着实际驻留可突破
+// auditQueueByteBudget 数倍（旧实现只累加 len()）。
+const (
+	// 每个 header 键：map 桶驻留头（≈40B）+ `"k":[` 与条目逗号。
+	auditHeaderKeyOverhead = 48
+	// 每个 header 值：slice 元素头 + `"v",`。
+	auditHeaderValueOverhead = 16
+	// 每个上传文件条目：`{"name":"…","size":N,"mime":"…"},` + 结构体驻留。
+	auditFileEntryOverhead = 96
+	// 每条 message：键名/数字字段/tags 语法 + slice 元素与 RuleMatch 驻留；
+	// 内容串（actionset/message/error_message/data 各字段）另按 len 计入。
+	auditMessageOverhead = 512
+	// 快照骨架：transaction/request/response/producer 的固定键名与 envelope。
+	auditSnapshotFixedBytes = 512
+)
+
+// estimateAuditSnapshotBytes 估算快照驻留字节（请求路径可付：只做 len 求和
+// 与固定开销累加，无分配、无序列化）。口径见上方常量：内容 + 语法/容器
+// 固定开销，对 header/文件/messages 条目数是保守上界。
 func estimateAuditSnapshotBytes(s *auditSnapshot) int64 {
 	if s == nil {
 		return 0
@@ -1350,20 +1373,27 @@ func estimateAuditSnapshotBytes(s *auditSnapshot) int64 {
 	headerBytes := func(hs map[string][]string) int64 {
 		var n int64
 		for k, vs := range hs {
-			n += int64(len(k))
+			n += int64(len(k)) + auditHeaderKeyOverhead
 			for _, v := range vs {
-				n += int64(len(v))
+				n += int64(len(v)) + auditHeaderValueOverhead
 			}
 		}
 		return n
 	}
-	n := int64(512) // 结构/固定字段包底
+	n := int64(auditSnapshotFixedBytes)
 	t := &s.Transaction_
 	n += int64(len(t.Timestamp_) + len(t.ID_) + len(t.ClientIP_) + len(t.HostIP_) +
 		len(t.ServerID_) + len(t.HighestSeverity_))
 	if r := t.Request_; r != nil {
 		n += int64(len(r.Method_) + len(r.Protocol_) + len(r.URI_) + len(r.HTTPVersion_) + len(r.Body_))
 		n += headerBytes(r.Headers_)
+		for _, f := range r.Files_ {
+			n += auditFileEntryOverhead
+			if isNilInterface(f) {
+				continue
+			}
+			n += int64(len(f.Name()) + len(f.Mime()))
+		}
 	}
 	if q := t.Response_; q != nil {
 		n += int64(len(q.Protocol_) + len(q.Body_))
@@ -1379,7 +1409,22 @@ func estimateAuditSnapshotBytes(s *auditSnapshot) int64 {
 		if isNilInterface(m) {
 			continue
 		}
-		n += int64(len(m.Actionset())+len(m.Message())) + 256 // 规则数据段包底
+		n += int64(len(m.Actionset())+len(m.Message())) + auditMessageOverhead
+		// error_message 不在 plugintypes.AuditLogMessage 接口上，但内置 JSON
+		// formatter 直接序列化具体值（coraza 的 Message 带该导出字段）。
+		if em, ok := m.(interface{ ErrorMessage() string }); ok {
+			n += int64(len(em.ErrorMessage()))
+		}
+		// 规则数据段（file/line/id/rev/msg/data/severity/ver/maturity/
+		// accuracy/tags/raw）同样进 JSON；Data() 可能是 typed-nil，取任何
+		// 访问器前必须走 isNilInterface。
+		if d := m.Data(); !isNilInterface(d) {
+			n += int64(len(d.File()) + len(d.Rev()) + len(d.Msg()) + len(d.Data()) +
+				len(d.Ver()) + len(d.Raw()))
+			for _, tag := range d.Tags() {
+				n += int64(len(tag)) + auditHeaderValueOverhead
+			}
+		}
 	}
 	return n
 }
@@ -1607,9 +1652,9 @@ const auditShutdownDrainWait = 3 * time.Second
 // reload/优雅停机会让**每个规则**的 SecurityBlockedCounter 各调一次 Cleanup
 // （实例数 = 规则数）。持续审计流量下 pending 很难为 0，每个实例都等满
 // auditShutdownDrainWait，收尾成本即「规则数 × 3s」（管理面 /load 卡顿）。
-// 窗口内的重复调用直接跳过——首个调用已把同一批管线排空，其后的等待纯属
-// 叠加；窗口远小于两次 reload 的间隔，且 500ms 周期刷盘兜底尾部行。var 供
-// 测试收窄。
+// 窗口内的重复调用跳过排空等待（首个调用已把同一批管线排空，其后的等待纯属
+// 叠加），但**不跳过刷盘本身**——见 FlushAuditPipelines。窗口远小于两次
+// reload 的间隔，且 500ms 周期刷盘兜底尾部行。var 供测试收窄。
 var auditFlushCoalesceWindow = auditShutdownDrainWait
 
 // auditLastFlushNano 是最近一次领到冲刷资格的时刻（UnixNano；0=从未冲刷）。
@@ -1617,7 +1662,8 @@ var auditFlushCoalesceWindow = auditShutdownDrainWait
 var auditLastFlushNano atomic.Int64
 
 // claimAuditFlush 在合并窗口内领取一次冲刷资格；窗口内返回 false（本次
-// Cleanup 直接快进）。无锁 CAS：并发调用者同刻到达时只有一个成功。
+// Cleanup 跳过排空等待，但仍须刷盘——见 FlushAuditPipelines）。无锁 CAS：
+// 并发调用者同刻到达时只有一个成功。
 func claimAuditFlush(now time.Time) bool {
 	n := now.UnixNano()
 	for {
@@ -1652,12 +1698,12 @@ func (p *auditPipeline) flushQuiesced() {
 // 只刷盘不关闭：管线是进程级单例，fd/drain 的生命周期与进程一致。
 //
 // 合并窗口（claimAuditFlush）：一次 reload 会按规则数调用 N 次本函数，
-// 只有窗口内首个调用付出排空等待，其余直接返回——收尾成本与实例数解耦，
-// 不再是「规则数 × 3s」。
+// 只有窗口内首个调用付出排空等待，其余只做一次 bufio 刷盘（零等待）——
+// 收尾成本与实例数解耦，不再是「规则数 × 3s」。**省掉的只能是排空等待**：
+// 窗口内若紧跟进程停止，这次 Cleanup 就是唯一收尾机会，bufio 残留（≤64KiB
+// / ≤500ms 周期）必须落盘，否则停机前最后一批审计行静默丢失。
 func FlushAuditPipelines() {
-	if !claimAuditFlush(time.Now()) {
-		return
-	}
+	quiesce := claimAuditFlush(time.Now())
 	auditPipelinesMu.Lock()
 	pipelines := make([]*auditPipeline, 0, len(auditPipelines))
 	for _, p := range auditPipelines {
@@ -1665,7 +1711,11 @@ func FlushAuditPipelines() {
 	}
 	auditPipelinesMu.Unlock()
 	for _, p := range pipelines {
-		p.flushQuiesced()
+		if quiesce {
+			p.flushQuiesced()
+			continue
+		}
+		p.flush()
 	}
 }
 

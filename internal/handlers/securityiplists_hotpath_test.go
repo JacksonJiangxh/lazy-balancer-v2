@@ -37,9 +37,16 @@ type hotPathIPListFixture struct {
 	lastBody []byte
 	// rejectNextLoads >0 时接下来 N 次 /load 返回 400（拒绝分支测试注入）。
 	rejectNextLoads int
-	h               *Handlers
-	router          *gin.Engine
-	dir             string
+	// failNextLoads/failStatus：接下来 N 次 /load 返回任意状态码
+	// （500=系统/传输失败形态；400 形态统一走 rejectLoads）。
+	failNextLoads int
+	failStatus    int
+	// loadBodies 记录每次成功的 /load 载荷（按到达顺序）——用例据此证明
+	// 「事务内 apply 确实按候选视图下发过」，避免回退断言的恒真形态。
+	loadBodies [][]byte
+	h          *Handlers
+	router     *gin.Engine
+	dir        string
 }
 
 func newHotPathIPListFixture(t *testing.T) *hotPathIPListFixture {
@@ -54,6 +61,12 @@ func newHotPathIPListFixture(t *testing.T) *hotPathIPListFixture {
 			_, _ = w.Write(append(f.lastBody, '\n'))
 		case r.Method == http.MethodPost && r.URL.Path == "/load":
 			f.posts++
+			if f.failNextLoads > 0 {
+				f.failNextLoads--
+				w.WriteHeader(f.failStatus)
+				_, _ = w.Write([]byte("injected failure"))
+				return
+			}
 			if f.rejectNextLoads > 0 {
 				f.rejectNextLoads--
 				w.WriteHeader(http.StatusBadRequest)
@@ -61,6 +74,7 @@ func newHotPathIPListFixture(t *testing.T) *hotPathIPListFixture {
 				return
 			}
 			f.lastBody, _ = io.ReadAll(r.Body)
+			f.loadBodies = append(f.loadBodies, f.lastBody)
 			w.WriteHeader(http.StatusOK)
 		default:
 			w.WriteHeader(http.StatusOK)
@@ -113,6 +127,29 @@ func (f *hotPathIPListFixture) rejectLoads(n int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.rejectNextLoads = n
+}
+
+// failNextLoadsStatus 注入接下来 n 次 /load 的非 4xx 失败（500=系统/传输
+// 失败形态：Caddy 存活但内部错误、请求未完成——与 ConfigRejectedError 区分）。
+func (f *hotPathIPListFixture) failNextLoadsStatus(status, n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failNextLoads = n
+	f.failStatus = status
+}
+
+// anyLoadBodyContains 报告是否有成功下发的 /load 载荷包含 needle（候选视图
+// 已真实下发的证据）。调用方通常在断言回退内容之前使用——若候选从未下发，
+// 「回退到已提交内容」会退化成恒真断言。
+func (f *hotPathIPListFixture) anyLoadBodyContains(needle string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, body := range f.loadBodies {
+		if strings.Contains(string(body), needle) {
+			return true
+		}
+	}
+	return false
 }
 
 // seed 名单+规则+deny ACL 策略（仅引用名单）+绑定，返回（名单 id, 策略 id）。

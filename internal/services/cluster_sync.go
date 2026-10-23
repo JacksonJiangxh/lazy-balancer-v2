@@ -71,7 +71,6 @@ type syncLifecycleState uint32
 const (
 	syncStateStopped syncLifecycleState = iota
 	syncStateRunning
-	syncStateDegraded
 	syncStateHalted
 )
 
@@ -346,10 +345,10 @@ func (s *SyncService) clusterPinPath(host string) (string, error) {
 // 一致，抽出供 ForgetPins 整目录清理复用）。
 func clusterPinDirectory(dataDir string, database *sql.DB) (string, error) {
 	if dataDir == "" && database != nil {
-		var sequence int
-		var name, databasePath string
-		if err := database.QueryRow("PRAGMA database_list").Scan(&sequence, &name, &databasePath); err == nil && databasePath != "" {
-			dataDir = filepath.Dir(databasePath)
+		// 目录推导单源：与快照装载/apply 共用 clusterSnapshotDataDir
+		// （*sql.DB 天然满足 snapshotStore），不另写第二份 PRAGMA 推导。
+		if derived, err := clusterSnapshotDataDir(context.Background(), database); err == nil {
+			dataDir = derived
 		}
 	}
 	if dataDir == "" {
@@ -484,7 +483,15 @@ func (s *SyncService) Start() {
 	s.startLocked(false)
 }
 
+// syncResumeCalls 记录 Resume 调用次数（仅测试观测「角色切换后唯一复活点」
+// ——Halted 态重新注册后循环永不重启的回归面；生产零消费）。
+var syncResumeCalls atomic.Int64
+
+// SyncResumeCallsForTest 返回 Resume 调用次数（仅测试使用）。
+func SyncResumeCallsForTest() int64 { return syncResumeCalls.Load() }
+
 func (s *SyncService) Resume() {
+	syncResumeCalls.Add(1)
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 	if syncLifecycleState(s.state.Load()) != syncStateHalted {
@@ -631,29 +638,16 @@ func (s *SyncService) Stop() {
 }
 
 // syncDrainers 按数据库句柄登记同步服务实例，供 ClusterService.Promote 在
-// 角色翻转前显式排干在途拉取。用 *sql.DB 作键隔离测试实例
-// （每个夹具独立库），避免全局单例被跨测试覆盖。
-// 按库保留全部实例（与 clusterServices 对称）——
-// 原「后注册覆盖」在测试或同库重建服务时只排干最后一个实例，其余在途 apply
-// 不受 drain 保护；同时提供 unregister 与死句柄回收，避免全局表无限累积。
-var (
-	syncDrainersMu sync.Mutex
-	syncDrainers   = map[*sql.DB][]*SyncService{}
-)
+// 角色翻转前显式排干在途拉取。与集群服务表共用 clusterHandleRegistry：
+// 按库保留全部实例（原「后注册覆盖」在测试或同库重建服务时只排干最后一个
+// 实例，其余在途 apply 不受 drain 保护），显式注销与死句柄兜底回收同源。
+var syncDrainerRegistry = clusterHandleRegistry[*SyncService]{}
 
 func registerSyncDrainer(service *SyncService) {
-	if service == nil || service.db == nil {
+	if service == nil {
 		return
 	}
-	syncDrainersMu.Lock()
-	for _, existing := range syncDrainers[service.db] {
-		if existing == service {
-			syncDrainersMu.Unlock()
-			return
-		}
-	}
-	syncDrainers[service.db] = append(syncDrainers[service.db], service)
-	syncDrainersMu.Unlock()
+	syncDrainerRegistry.register(service.db, service)
 }
 
 // unregisterSyncDrainer 移除单个实例：测试 teardown 与显式释放
@@ -662,19 +656,7 @@ func unregisterSyncDrainer(service *SyncService) {
 	if service == nil || service.db == nil {
 		return
 	}
-	syncDrainersMu.Lock()
-	remaining := syncDrainers[service.db][:0]
-	for _, candidate := range syncDrainers[service.db] {
-		if candidate != service {
-			remaining = append(remaining, candidate)
-		}
-	}
-	if len(remaining) == 0 {
-		delete(syncDrainers, service.db)
-	} else {
-		syncDrainers[service.db] = remaining
-	}
-	syncDrainersMu.Unlock()
+	syncDrainerRegistry.unregister(service.db, service)
 	// NewSyncService 内建并登记一个 ClusterService（service.cluster）：
 	// 只注销排干登记会让该内建实例连同其快照缓存继续驻留全局表——
 	// 同步服务 teardown 时一并注销（unregisterClusterService 幂等，
@@ -687,36 +669,9 @@ func unregisterSyncDrainer(service *SyncService) {
 // syncDrainersFor 返回该库登记的全部同步服务实例：Promote/BecomeSlave 必须
 // 逐个排干（DrainPulls 幂等且可重入），不能只处理最后注册的一个。
 func syncDrainersFor(database *sql.DB) []*SyncService {
-	if database == nil {
-		return nil
-	}
-	// Ping 在锁外执行（同 clusterServicesFor）：死句柄探活最长 1s，
-	// 持锁等待会阻塞全部排干查表。
-	syncDrainersMu.Lock()
-	registered := syncDrainers[database]
-	services := make([]*SyncService, 0, len(registered))
-	for _, service := range registered {
-		if service != nil {
-			services = append(services, service)
-		}
-	}
-	if len(services) == 0 {
-		delete(syncDrainers, database)
-		syncDrainersMu.Unlock()
-		return nil
-	}
-	syncDrainersMu.Unlock()
-	// 死句柄兜底回收（同 clusterServicesFor），但只在确定性关闭时剔除：
-	// 1s 探活超时（长写事务/GC 停顿）保留登记项——否则 Promote/BecomeSlave 的
-	// syncDrainersFor 返回空，在途 Pull 不再排干（升主提交后旧从快照继续写库）。
-	if probeClusterDBHandle(database) == clusterHandleClosed {
-		syncDrainersMu.Lock()
-		delete(syncDrainers, database)
-		syncDrainersMu.Unlock()
-		resetClusterHandleStrikes(database)
-		return nil
-	}
-	return services
+	// 死句柄只在确定性关闭时剔除：1s 探活超时（长写事务/GC 停顿）保留登记项——
+	// 否则本函数返回空，在途 Pull 不再排干（升主提交后旧从快照继续写库）。
+	return syncDrainerRegistry.list(database)
 }
 
 // brandingDirectory 返回品牌配置文件所在数据目录（cfg 可能为 nil——构造契约
@@ -1038,7 +993,9 @@ func (s *SyncService) Pull(ctx context.Context) (result SyncResult, err error) {
 	// 未跟随的重定向(跨主机):给可行动错误,而非让空 body 落进 JSON 解析报
 	//「unexpected end of JSON input」(2026-09-18 用户实测踩坑)
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
-		return SyncResult{}, newSyncFailure(models.SyncErrorCodeValidationFailed,
+		// 自愈类错误：运维改回主节点地址即恢复，必须保留后置副作用标记
+		// （304 补偿重拉的唯一触发器）。
+		return SyncResult{}, newSyncFailure(models.SyncErrorCodeTransportError,
 			fmt.Errorf("主节点返回 %d 重定向(%s)——主节点启用 HTTPS 后请将主节点地址改为 https:// 并重新注册", resp.StatusCode, resp.Header.Get("Location")))
 	}
 	if resp.StatusCode >= http.StatusBadRequest {
@@ -1053,7 +1010,8 @@ func (s *SyncService) Pull(ctx context.Context) (result SyncResult, err error) {
 		// 例外：目标节点已降级为从节点时 requireMaster 同返 403，但令牌仍有效；
 		// 这不是撤销，必须保持可重试，待对方重新升主后自动恢复。
 		if resp.StatusCode == http.StatusForbidden && (resp.Header.Get("X-LB-Error-Code") == "master_required" || strings.Contains(string(body), "该操作仅允许在主节点执行")) {
-			return SyncResult{}, newSyncFailure(models.SyncErrorCodeValidationFailed,
+			// 自愈类错误：对方重新升主即恢复，保留后置副作用标记（304 补偿触发器）。
+			return SyncResult{}, newSyncFailure(models.SyncErrorCodeTransportError,
 				fmt.Errorf("目标主节点已降级为从节点(%d): %s", resp.StatusCode, strings.TrimSpace(string(body))))
 		}
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
@@ -1064,7 +1022,9 @@ func (s *SyncService) Pull(ctx context.Context) (result SyncResult, err error) {
 	}
 	snapshot, err := decodeSnapshotEnvelope(resp.Body)
 	if err != nil {
-		return SyncResult{}, newSyncFailure(models.SyncErrorCodeValidationFailed, fmt.Errorf("解析集群快照: %w", err))
+		// 反代错误页/响应截断/网关维护页：下一周期自然恢复，保留后置副作用
+		// 标记（304 补偿重拉的唯一触发器）。
+		return SyncResult{}, newSyncFailure(models.SyncErrorCodeTransportError, fmt.Errorf("解析集群快照: %w", err))
 	}
 	var currentMasterURL, currentToken string
 	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(is_master,1), COALESCE(master_url,''), COALESCE(cluster_token,''), COALESCE(applied_version,0) FROM global_config WHERE id=1`).Scan(&isMaster, &currentMasterURL, &currentToken, &appliedVersion); err != nil {
@@ -1428,7 +1388,7 @@ func MarkStartupFallbackPending(ctx context.Context, database *sql.DB) error {
 	}
 	markerCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer cancel()
-	_, err := database.ExecContext(markerCtx, "UPDATE global_config SET last_sync_error=? WHERE id=1",
+	_, err := database.ExecContext(markerCtx, "UPDATE global_config SET last_sync_error=? WHERE id=1 AND "+slaveRoleConditionSQL,
 		encodeSyncError("apply_ok_reload_failed: 启动时数据库渲染被拒，已回退 last-known-good（运行配置与数据库分叉，已排队补偿重拉）", models.SyncErrorCodeApplyFailed))
 	return err
 }
@@ -1445,7 +1405,7 @@ func MarkStartupFallbackFailed(ctx context.Context, database *sql.DB, cause erro
 	}
 	markerCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer cancel()
-	_, err := database.ExecContext(markerCtx, "UPDATE global_config SET last_sync_error=? WHERE id=1",
+	_, err := database.ExecContext(markerCtx, "UPDATE global_config SET last_sync_error=? WHERE id=1 AND "+slaveRoleConditionSQL,
 		encodeSyncError(fmt.Sprintf("apply_ok_reload_failed: 启动时数据库渲染被拒且 last-known-good 回退失败（运行配置与数据库分叉，已排队补偿重拉）: %v", cause), models.SyncErrorCodeApplyFailed))
 	return err
 }
@@ -1526,10 +1486,15 @@ func (s *SyncService) syncPostCommitFailureMarkerPresent(ctx context.Context) bo
 	return false
 }
 
+// persistSyncError 是从端同步状态的唯一写入口（写入错误与成功清空同口）。
+// UPDATE 带从端角色谓词：升主后主节点不得再出现从端同步错误——在途 Report/
+// Pull 的失败回调可能在 Promote 提交后落库（WithoutCancel 正是为跨 Stop 取消
+// 存活而设），无谓词就会把「状态上报失败」写回刚被清空的行，而全仓没有第二处
+// 清空点。命中 0 行=本节点已升主，属预期 no-op。
 func (s *SyncService) persistSyncError(ctx context.Context, message string, code models.SyncErrorCode) {
 	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer cancel()
-	if _, err := s.db.ExecContext(persistCtx, "UPDATE global_config SET last_sync_error=? WHERE id=1", encodeSyncError(message, code)); err != nil {
+	if _, err := s.db.ExecContext(persistCtx, "UPDATE global_config SET last_sync_error=? WHERE id=1 AND "+slaveRoleConditionSQL, encodeSyncError(message, code)); err != nil {
 		Logf("error", "cluster sync error persistence failed: %v", err)
 	}
 }
@@ -1612,7 +1577,9 @@ func (s *SyncService) combineOrReplaceSyncError(ctx context.Context, message str
 // 无标记即返回 no-change，DB=新版本而 Caddy=旧运行配置的分叉将静默存活到下次
 // 真实变更；应用失败经 combineSyncErrorWithMarker 组合（首个失败原因+计数），
 // 补偿重拉成功后照常清除。需人工介入或语义已定的错误（schema 过新需本节点
-// 升级、令牌撤销、校验失败）仍允许覆盖。审计 旧注释「终止类让 run 循环
+// 升级、令牌撤销、校验失败）仍允许覆盖。快照读取/解析失败、未跟随的重定向
+// （主节点启用管理 HTTPS）与对端已降级三类均属可自愈面，统一归 TransportError
+// 以复用本条保留语义，不得落成 ValidationFailed。审计 旧注释「终止类让 run 循环
 // halt 等待人工介入」的依据在后不再成立——SchemaTooOld/SignatureInvalid
 // 降级重试不 halt，覆盖标记将丢失 304 全量重拉补偿。
 func syncErrorPreservesReloadMarker(code models.SyncErrorCode) bool {
@@ -1796,7 +1763,6 @@ func (s *SyncService) run(ctx context.Context) {
 				return
 			}
 			message := "读取同步状态失败: " + err.Error()
-			s.state.Store(uint32(syncStateDegraded))
 			Logf("error", "cluster sync state read failed; retrying: %v", err)
 			// 瞬时 DB 读错（SQLITE_BUSY 等）属可恢复类：直接覆盖会抹掉
 			// apply_ok_reload_failed 标记（304 全量重拉补偿的唯一触发器），
@@ -1819,6 +1785,10 @@ func (s *SyncService) run(ctx context.Context) {
 		pullFailed := false
 		if token == "" {
 			s.pollRegistration(ctx)
+		} else if s.retryPendingRegistrationConfirm(ctx) {
+			// 注册确认终止轨道已清空集群令牌：本轮不再按失效令牌拉取，
+			// 下一轮 loadState 按未注册态处理（终止文案不被覆盖）。
+			token = ""
 		} else {
 			// 304「配置无变化」是稳态事件，不留审计（曾按周期刷屏，移除）；
 			// 有意义的状态跃迁（漂移自愈、失败）仍在各自路径留痕。
@@ -1854,7 +1824,6 @@ func (s *SyncService) run(ctx context.Context) {
 				return
 			}
 			if pullErr != nil || reportErr != nil {
-				s.state.Store(uint32(syncStateDegraded))
 				prevRoundFailed = true
 				pullFailed = pullErr != nil
 				if pullErr == nil {
@@ -1992,58 +1961,86 @@ func (s *SyncService) pollRegistration(ctx context.Context) {
 		// 审批时刻即有效（Pull 鉴权只查 cluster_token_hash），confirm 仅是冗余
 		// 交付确认（首个签名快照亦会清 secret），前置无安全影响。
 		// registration_secret 必须保留到 confirm 成功：此前在同一条 UPDATE 里清空，
-		// 一旦 confirm 网络/4xx 失败，下轮 pollRegistration 因 secret=="" 早退，
-		// confirm 永不重试且「连续 5 次失败止环」轨道（bumpRegistrationConfirmFailure）
-		// 在 confirm 轴上不可达（计数至多 1）。保留后每 10s 重试一次，5 次即成环。
+		// 一旦 confirm 网络/4xx 失败，下轮因 secret=="" 早退，confirm 永不重试且
+		// 「连续 5 次失败止环」轨道（bumpRegistrationConfirmFailure）在 confirm 轴上
+		// 不可达（计数至多 1）。保留后每同步周期重试一次（令牌已落库的轮次由
+		// retryPendingRegistrationConfirm 承担），5 次即成环。
 		if _, err := s.db.ExecContext(ctx, "UPDATE global_config SET cluster_token=? WHERE id=1", envelope.Data.ClusterToken); err != nil {
 			Logf("error", "保存集群令牌失败（下周期重试状态轮询）: %v", err)
 			return
 		}
-		confirm, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(masterURL, "/")+"/api/v1/cluster/registration/confirm", nil)
-		if err != nil {
-			return
-		}
-		confirm.Header.Set("X-Cluster-Token", envelope.Data.ClusterToken)
-		confirmed, err := s.do(confirm)
-		if err != nil {
-			// 网络错误是暂时性故障：可重试、不得推进终止计数、不得清注册态。
-			// 终止轨道只服务于凭证类拒绝（主节点明确不认这份令牌/节点行），
-			// 否则主节点瞬时不可达就会摧毁仍然有效的集群令牌。
-			s.combineOrReplaceSyncError(ctx, "集群注册确认暂时失败（网络错误），稍后自动重试: "+err.Error(), models.SyncErrorCodeTransportError)
-			return
-		}
-		defer confirmed.Body.Close()
-		// 历史 移除 404/405 fallback 兼容（v2.0.9+ 主节点均支持 confirm 端点）。
-		// 只有凭证类拒绝（401 令牌无效/404 节点不存在/410 节点已移除）才推进
-		// 5 连败终止轨道；403（目标降级）、409（导入窗口）、5xx（主节点暂时
-		// 不可用）与网络错误一律可重试且不清任何注册态——confirm 仅是冗余交付
-		// 确认（令牌在审批时刻即有效），暂时性拒绝不应具备摧毁注册态的能力。
-		if confirmed.StatusCode >= http.StatusBadRequest {
-			// 与模式一致——200B 截断 + UTF-8 边界回退，
-			// 确保 confirm 失败原因落入 last_sync_error 后不超过 512B 有界设计。
-			body, _ := io.ReadAll(io.LimitReader(confirmed.Body, 200))
-			body = truncateValidUTF8Tail(body)
-			if !registrationConfirmTerminal(confirmed.StatusCode) {
-				message := fmt.Sprintf("集群注册确认暂时受阻（HTTP %d）：%s。主节点可能正在导入配置或角色翻转，稍后自动重试",
-					confirmed.StatusCode, strings.TrimSpace(string(body)))
-				s.combineOrReplaceSyncError(ctx, message, models.SyncErrorCodeTransportError)
-				return
-			}
-			reason := fmt.Sprintf("confirm 端点返回 %d（%s）。主节点可能版本过旧或 confirm 端点异常，请在集群管理页面重新注册或提升为主节点",
-				confirmed.StatusCode, strings.TrimSpace(string(body)))
-			// 先落可行动文案再累计——第 5 次时 bump 的终止文案覆盖本条。
-			s.combineOrReplaceSyncError(ctx, "集群注册确认被主节点拒绝（HTTP "+strconv.Itoa(confirmed.StatusCode)+"），请重新注册或提升为主节点", models.SyncErrorCodeValidationFailed)
-			s.bumpRegistrationConfirmFailure(ctx, envelope.Data.ClusterToken, reason)
-			return
-		}
-		s.resetRegistrationConfirmFailure(ctx)
-		// confirm 成功即离开注册循环：主节点已消费 secret，本地保留会让下轮状态
-		// 轮询命中 401 终止轨道。清空失败时留痕（下轮走 401 终止轨道，集群令牌
-		// 仍有效，同步不受影响）。
-		if _, err := s.db.ExecContext(ctx, "UPDATE global_config SET registration_secret='' WHERE id=1"); err != nil {
-			Logf("warn", "集群注册确认成功后清理本地注册密钥失败（下轮状态轮询将走 401 终止轨道）: %v", err)
-		}
+		s.redeemRegistrationConfirm(ctx, masterURL, envelope.Data.ClusterToken)
 	}
+}
+
+// redeemRegistrationConfirm 发起（或重试）冗余的注册确认：主节点 confirm 成功
+// 即消费其侧 registration_secret，本地在成功后才清空同名副本。网络错误与
+// 暂时性拒绝（403 目标降级/409 导入窗口/5xx）一律可重试且不清任何注册态——
+// 令牌在审批时刻即有效（Pull 鉴权只查 cluster_token_hash），暂时性拒绝不应
+// 具备摧毁注册态的能力。只有凭证类拒绝（401/404/410）推进 5 连败终止轨道。
+// 返回 true 表示终止轨道已清空集群令牌，调用方本周期不得再按令牌拉取。
+func (s *SyncService) redeemRegistrationConfirm(ctx context.Context, masterURL, clusterToken string) bool {
+	confirm, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(masterURL, "/")+"/api/v1/cluster/registration/confirm", nil)
+	if err != nil {
+		return false
+	}
+	confirm.Header.Set("X-Cluster-Token", clusterToken)
+	confirmed, err := s.do(confirm)
+	if err != nil {
+		s.combineOrReplaceSyncError(ctx, "集群注册确认暂时失败（网络错误），稍后自动重试: "+err.Error(), models.SyncErrorCodeTransportError)
+		return false
+	}
+	defer confirmed.Body.Close()
+	// 历史 移除 404/405 fallback 兼容（v2.0.9+ 主节点均支持 confirm 端点）。
+	if confirmed.StatusCode >= http.StatusBadRequest {
+		// 与同族错误路径一致——200B 截断 + UTF-8 边界回退，确保 confirm 失败
+		// 原因落入 last_sync_error 后不超过 512B 有界设计。
+		body, _ := io.ReadAll(io.LimitReader(confirmed.Body, 200))
+		body = truncateValidUTF8Tail(body)
+		if !registrationConfirmTerminal(confirmed.StatusCode) {
+			message := fmt.Sprintf("集群注册确认暂时受阻（HTTP %d）：%s。主节点可能正在导入配置或角色翻转，稍后自动重试",
+				confirmed.StatusCode, strings.TrimSpace(string(body)))
+			s.combineOrReplaceSyncError(ctx, message, models.SyncErrorCodeTransportError)
+			return false
+		}
+		reason := fmt.Sprintf("confirm 端点返回 %d（%s）。主节点可能版本过旧或 confirm 端点异常，请在集群管理页面重新注册或提升为主节点",
+			confirmed.StatusCode, strings.TrimSpace(string(body)))
+		// 先落可行动文案再累计——第 5 次时 bump 的终止文案覆盖本条。
+		s.combineOrReplaceSyncError(ctx, "集群注册确认被主节点拒绝（HTTP "+strconv.Itoa(confirmed.StatusCode)+"），请重新注册或提升为主节点", models.SyncErrorCodeValidationFailed)
+		s.bumpRegistrationConfirmFailure(ctx, clusterToken, reason)
+		// 终止轨道清空了集群令牌：回读确认，避免调用方用已失效令牌继续拉取
+		// 并以「尚未完成集群审批」覆盖终止文案。
+		var remaining string
+		if qerr := s.db.QueryRowContext(ctx, "SELECT COALESCE(cluster_token,'') FROM global_config WHERE id=1").Scan(&remaining); qerr != nil {
+			return false
+		}
+		return remaining == ""
+	}
+	s.resetRegistrationConfirmFailure(ctx)
+	// confirm 成功即离开注册循环：主节点已消费 secret，本地保留会让后续轮次
+	// 持续命中 401 终止轨道。清空失败时留痕（下轮走 401 终止轨道，集群令牌
+	// 仍有效，同步不受影响）。
+	if _, err := s.db.ExecContext(ctx, "UPDATE global_config SET registration_secret='' WHERE id=1"); err != nil {
+		Logf("warn", "集群注册确认成功后清理本地注册密钥失败（下轮状态轮询将走 401 终止轨道）: %v", err)
+	}
+	return false
+}
+
+// retryPendingRegistrationConfirm 处理「集群令牌已落库、注册确认尚未成功」的
+// 残留状态：run 循环只在 cluster_token 为空时轮询注册，confirm 失败后令牌已
+// 落库 → 永不再进轮询分支，终止轨道不可达、「稍后自动重试」的文案落空、本地
+// 明文 registration_secret 无限期滞留。此处补齐该轨道：secret 存在即重试
+// confirm，确认完成（secret 被清）后返回 false，调用方本周期照常拉取。
+func (s *SyncService) retryPendingRegistrationConfirm(ctx context.Context) bool {
+	var masterURL, secret, token string
+	if err := s.db.QueryRowContext(ctx, "SELECT COALESCE(master_url,''), COALESCE(registration_secret,''), COALESCE(cluster_token,'') FROM global_config WHERE id=1").Scan(&masterURL, &secret, &token); err != nil {
+		Logf("error", "注册确认重试：读取 global_config 失败，本周期跳过: %v", err)
+		return false
+	}
+	if masterURL == "" || secret == "" || token == "" {
+		return false
+	}
+	return s.redeemRegistrationConfirm(ctx, masterURL, token)
 }
 
 // ForgetClusterPins 清空内存 TOFU pin 缓存。提升为主节点时

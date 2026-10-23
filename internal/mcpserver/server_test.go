@@ -228,6 +228,44 @@ func TestToolsListHidesWriteTools_forReadOnlyAPIKey(t *testing.T) {
 	}
 }
 
+// 工具可见性过滤只认「顶层单体 JSON-RPC 对象」——mcp-go v0.58.0 的 Streamable
+// HTTP 传输按单体对象解析请求体，批处理数组返回 PARSE_ERROR（HTTP 400），因此
+// 批处理无法绕过过滤拿到全量工具列表。本用例把该上游假设钉成回归：升级 mcp-go
+// 后若开始接受批处理，这里先红（届时过滤需改为响应侧重建）。
+func TestToolsListBatchRequestRejectedByProtocol(t *testing.T) {
+	previous := nonAdminForbiddenRoutePaths.Load()
+	SetNonAdminForbiddenRoutes(nil)
+	t.Cleanup(func() { nonAdminForbiddenRoutePaths.Store(previous) })
+	resolver := func(apiKey string) (apiKeyVisibility, error) {
+		return apiKeyVisibility{readOnly: true}, nil
+	}
+	handler := newWithVisibilityResolver("http://127.0.0.1/api/v1", http.DefaultClient, "", resolver)
+
+	// Given：JSON-RPC 批处理数组（两条 tools/list）。
+	body := `[{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}},{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}]`
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/mcp", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json, text/event-stream")
+	request.Header.Set("X-API-Key", "lb_sk_read-only")
+	response := httptest.NewRecorder()
+
+	// When
+	handler.ServeHTTP(response, request)
+
+	// Then：协议层拒绝（400 + PARSE_ERROR），不得回退成未过滤的工具列表。
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("batch status=%d body=%q, want 400（mcp-go 不接受批处理）", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "-32700") {
+		t.Fatalf("batch body=%q, want PARSE_ERROR(-32700)", response.Body.String())
+	}
+	for _, name := range []string{"create_rule", "export_config", "get_caddy_config"} {
+		if strings.Contains(response.Body.String(), name) {
+			t.Fatalf("batch response leaks tool %s: %s", name, response.Body.String())
+		}
+	}
+}
+
 func TestResolveAPIKeyReadOnly_returnsPersistedPermission(t *testing.T) {
 	// Given
 	if err := db.Initialize(t.TempDir()); err != nil {
@@ -735,10 +773,12 @@ func TestOversizedResponseMessageDistinguishesExportConfig(t *testing.T) {
 	// When
 	exportResult := callTool(t, handler, "export_config", `{}`)
 	caddyConfigResult := callTool(t, handler, "get_caddy_config", `{}`)
-	otherResult := callTool(t, handler, "issue_certificate", `{}`)
+	postNoPaginationResult := callTool(t, handler, "issue_certificate", `{}`)
+	previewResult := callTool(t, handler, "preview_config", `{}`)
+	ruleLogsResult := callTool(t, handler, "get_rule_logs", `{"caddy_id":"lb_x"}`)
 
 	// Then：export_config 得面板/REST 指引，get_caddy_config 得按规则查询指引，
-	// 其余工具维持通用分页指引
+	// 其余无分页工具（含 POST）得「无分页参数」指引，不得落进通用分页文案。
 	if !strings.Contains(exportResult, "配置过大") || !strings.Contains(exportResult, "/config/export") {
 		t.Fatalf("export_config result=%s, want dedicated oversized-backup message", exportResult)
 	}
@@ -753,8 +793,14 @@ func TestOversizedResponseMessageDistinguishesExportConfig(t *testing.T) {
 			t.Fatalf("get_caddy_config result=%s, want actionable guidance containing %q", caddyConfigResult, fragment)
 		}
 	}
-	if !strings.Contains(otherResult, "请改用分页或专用导出工具") {
-		t.Fatalf("other tool result=%s, want generic oversized message retained", otherResult)
+	if !strings.Contains(postNoPaginationResult, "无分页参数") || strings.Contains(postNoPaginationResult, "请改用分页或专用导出工具") {
+		t.Fatalf("POST 无分页工具 result=%s, want 「无分页参数」指引而非通用分页文案", postNoPaginationResult)
+	}
+	if !strings.Contains(previewResult, "source") || strings.Contains(previewResult, "请改用分页或专用导出工具") {
+		t.Fatalf("preview_config result=%s, want 拆小 source 的可执行指引", previewResult)
+	}
+	if !strings.Contains(ruleLogsResult, "log-stream") || strings.Contains(ruleLogsResult, "请改用对应的单条查询工具") {
+		t.Fatalf("get_rule_logs result=%s, want REST log-stream 增益续读指引（不得指向自身）", ruleLogsResult)
 	}
 }
 
@@ -1265,10 +1311,11 @@ func TestForward_callLayerErrorsReturnIsErrorResults(t *testing.T) {
 	}
 }
 
-// 无分页参数的整份返回 GET 工具（list_rules/list_ip_lists/get_config 等）超限时
+// 无分页参数的整份返回工具（list_rules/list_ip_lists/get_config 等）超限时
 // 通用「改用分页」指引是死路——必须给单条查询/管理面板的可执行路径；
 // 有分页参数的工具维持通用分页指引。判据= schema 是否声明 page/page_size，
-// 不是 queryArgs 是否为空：get_metrics_history/get_caddy_logs 有过滤维度但无分页。
+// 不是 queryArgs 是否为空、也不是 HTTP 方法：get_metrics_history/get_caddy_logs
+// 有过滤维度但无分页；POST 整份返回工具同样无分页。
 func TestOversizedResponseMessageGuidesNonPaginatedGetTools(t *testing.T) {
 	rest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write(bytes.Repeat([]byte("x"), maxResponseSize+1))

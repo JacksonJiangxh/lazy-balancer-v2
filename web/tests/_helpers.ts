@@ -12,6 +12,7 @@
 
 import { readFileSync } from 'node:fs'
 import { registerHooks } from 'node:module'
+import { createRenderer } from 'vue'
 
 const webRoot = new URL('../', import.meta.url)
 
@@ -235,6 +236,28 @@ export class FakeWindow {
   clearInterval(id: number): void { this.timers.delete(id) }
   fire(): void { for (const callback of [...this.timers.values()]) callback() }
   get size(): number { return this.timers.size }
+}
+
+/**
+ * 无 DOM 的组件宿主：`setup()` 在真实组件实例内执行，`unmount()` 触发
+ * `onUnmounted`。SSR 渲染（renderToString）不执行卸载钩子——卸载清理（停定时器/
+ * 取消帧/摘监听）只能用真实 mount + unmount 覆盖，否则钩子被删也全绿。
+ */
+export const mountForLifecycle = (setup: () => void): { unmount: () => void } => {
+  const app = createRenderer<object, object>({
+    createElement: (): object => ({}),
+    createText: (): object => ({}),
+    createComment: (): object => ({}),
+    setText: (): void => {},
+    setElementText: (): void => {},
+    insert: (): void => {},
+    remove: (): void => {},
+    parentNode: (): null => null,
+    nextSibling: (): null => null,
+    patchProp: (): void => {},
+  }).createApp({ setup, render: () => null })
+  app.mount({})
+  return { unmount: () => app.unmount() }
 }
 
 const srcRoot = new URL('../src/', import.meta.url)

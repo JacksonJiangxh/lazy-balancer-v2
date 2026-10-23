@@ -34,24 +34,38 @@ func TestDecideCRSSeedSource(t *testing.T) {
 }
 
 func TestSeedCRSRules_liveRulesPresentIsNoOp(t *testing.T) {
-	// Given a live CRS dir that already has rules
+	// Given a live CRS dir that already has a complete rules tree, plus a dist
+	// with a distinguishable tree and auxiliary files.
 	root := t.TempDir()
 	liveDir := filepath.Join(root, "waf", "crs")
 	snapshotDir := filepath.Join(root, "data", "crs")
 	distDir := filepath.Join(root, "waf.dist", "crs")
 	writeTestFile(t, filepath.Join(liveDir, "rules", "REQUEST-900.conf"), "SecRule live")
 	writeTestFile(t, filepath.Join(liveDir, "rules", crsRulesProbeFile), "SecRule init")
+	writeTestFile(t, filepath.Join(distDir, "rules", "REQUEST-900.conf"), "SecRule dist")
+	writeTestFile(t, filepath.Join(distDir, "rules", "REQUEST-950.conf"), "SecRule dist-only")
+	writeTestFile(t, filepath.Join(distDir, "crs-setup.conf"), "# dist setup")
 
 	// When seeding
 	seedCRSRulesFrom(liveDir, snapshotDir, distDir)
 
-	// Then the live tree is untouched
+	// Then the live rules tree is untouched（不得用 dist 树替换），且 dist
+	// 独有的规则文件不得出现——旧断言未声明 dist fixture，copyFile 因源缺失
+	// 静默失败，无法区分「正确跳过树复制」与「写失败」。
 	data, err := os.ReadFile(filepath.Join(liveDir, "rules", "REQUEST-900.conf"))
 	if err != nil || string(data) != "SecRule live" {
 		t.Fatalf("live rules=%q,%v, want untouched", data, err)
 	}
-	if _, err := os.Stat(filepath.Join(liveDir, "crs-setup.conf")); !os.IsNotExist(err) {
-		t.Fatal("no crs-setup.conf should appear when rules already exist")
+	if _, err := os.Stat(filepath.Join(liveDir, "rules", "REQUEST-950.conf")); !os.IsNotExist(err) {
+		t.Fatal("完整 rules 树不得被 dist 树覆盖（dist-only 规则出现在 live）")
+	}
+	// 辅助文件仍按「缺失才补种」语义补种（存在不覆盖）。
+	if setup, err := os.ReadFile(filepath.Join(liveDir, "crs-setup.conf")); err != nil || string(setup) != "# dist setup" {
+		t.Fatalf("缺失的 crs-setup.conf 应从 dist 补种: %q, %v", setup, err)
+	}
+	// 树完整时不写 VERSION 标记（仅播种路径写）。
+	if _, err := os.Stat(filepath.Join(liveDir, crsVersionFile)); !os.IsNotExist(err) {
+		t.Fatal("完整 rules 树路径不得写版本标记（版本只由播种/更新落盘）")
 	}
 }
 
@@ -336,9 +350,28 @@ func TestReconcileCRSState_nilDatabaseIsNoOp(t *testing.T) {
 	oldDB := db.DB
 	db.DB = nil
 	t.Cleanup(func() { db.DB = oldDB })
+	root := t.TempDir()
+	oldLive, oldSnapshot := crsLiveDir, crsSnapshotDir
+	crsLiveDir = filepath.Join(root, "waf", "crs")
+	crsSnapshotDir = filepath.Join(root, "data", "crs")
+	t.Cleanup(func() { crsLiveDir, crsSnapshotDir = oldLive, oldSnapshot })
+	// 健康 live 树 + 缺失快照是「自愈会创建快照」的可观察形态：角色读取失败
+	// 后若仍继续对账，快照目录会被建出来。
+	writeTestFile(t, filepath.Join(crsLiveDir, "rules", crsRulesProbeFile), "SecRule live")
+	writeTestFile(t, filepath.Join(crsLiveDir, crsVersionFile), "v4.15.0\n")
 
-	// When/Then: reconciliation returns without dereferencing a nil *sql.DB.
+	// When
 	ReconcileCRSState()
+
+	// Then: reconciliation returns without dereferencing a nil *sql.DB and
+	// leaves the filesystem untouched.
+	if _, err := os.Stat(crsSnapshotDir); !os.IsNotExist(err) {
+		t.Fatalf("nil DB 对账不得触碰文件系统（快照目录被创建/已存在: err=%v）", err)
+	}
+	got, err := os.ReadFile(filepath.Join(crsLiveDir, crsVersionFile))
+	if err != nil || string(got) != "v4.15.0\n" {
+		t.Fatalf("live 版本标记被改写: %q err=%v", got, err)
+	}
 }
 
 func TestReconcileCRSState_blocksWhileWafFileLockHeld(t *testing.T) {

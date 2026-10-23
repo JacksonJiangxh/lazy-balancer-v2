@@ -137,7 +137,10 @@ func sanitizeUsersForHash(users []models.ClusterUser) []models.ClusterUser {
 }
 
 // sanitizeAPIKeysForHash 同理清零 api_keys 的 last_used（使用时间）：清零仅为哈希稳定（避免从端
-// 本地调用触发漂移重拉）；apply 侧 api_keys 节重放会以主端值覆盖从端显示（全量镜像语义）。
+// 本地调用触发漂移重拉）。last_used 属节点本地记账——v3 下从端唯一应用的是
+// 已清零该字段的 canonical 载荷，apply 后由 restoreLocalAPIKeyLastUsed 回写
+// 「本地与快照中较晚者」，主端值不会到达从端（从端 Keys 页显示的是本节点
+// 使用时间，仅在主端使用过的 Key 恒为空）。
 func sanitizeAPIKeysForHash(keys []models.ClusterAPIKey) []models.ClusterAPIKey {
 	if len(keys) == 0 {
 		return keys

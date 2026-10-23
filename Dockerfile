@@ -141,22 +141,12 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 # Final image
 FROM alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
-# 版本号硬编码点：本文件 ARG VERSION、docker-compose.yml 两处 image tag 与
-# build.args.VERSION、README 两版 docker build 示例（--build-arg VERSION 与
-# 镜像 tag）、web/src/utils/branding.ts 的 appVersion 回退值；发布时另需
-# buildx --build-arg 显式传参。以上各处须同步递增（config.go 的 APP_VERSION
-# 未注入时显示 unknown，不参与硬编码）。
-#
-# 双轨口径（有意设计，非分叉）：`VERSION`
-# 恒为**正式版本号**（如 v2.3.8，面板/`/api/v1/branding` 展示口径）；镜像
-# 正式版 tag 与 VERSION 相同；beta 通道才给 tag 加 `-beta` 后缀。二者刻意不同，
-# 发布时的判定口径是「tag 去掉通道后缀 == APP_VERSION」。改此约定需同时改
-# README 两版示例、docker-compose.yml、branding/config 回退与发布检查单。
-ARG VERSION=v2.3.8
+# 版本号注入（ARG VERSION + ENV APP_VERSION）刻意放在下方 CRS/xdb 下载层之后
+# ——见该层前的层序说明。此处不得放 ENV：版本号每次发版必变，提前注入会让
+# 之后所有外网下载层缓存失效。
 # 构建机网络受限时经 --build-arg HTTP(S)_PROXY 透传给本阶段下载步骤
 # （CRS/ip2region 钉版下载）：Docker 预定义代理参数传入后自动注入 RUN 环境，
 # 无需 ARG 声明；未传参时为空值，行为不变。
-ENV APP_VERSION=${VERSION}
 # 安全修复：显式钉版 openssl=3.5.9-r0（CVE 修复版）——openssl 经 curl 的
 # libssl3/libcrypto3 依赖隐式装入，钉版保证镜像可复现且不携带旧版；
 # 升级源超出此版本时构建会失败提示，届时同步更新钉版值。
@@ -231,6 +221,24 @@ RUN crs_version=v4.28.0; \
 # 数据文件移入 geoipnames 包并随包嵌入二进制（同一份字节
 # 同时是镜像资产与 services 的离线回退），此处 COPY 必须指向嵌入路径。
 COPY geoipnames/crawler-ip-lists.seed.json /app/waf.dist/crawler-ip-lists.seed.json
+
+# 版本号硬编码点：本文件 ARG VERSION、docker-compose.yml 两处 image tag 与
+# build.args.VERSION、README 两版 docker build 示例（--build-arg VERSION 与
+# 镜像 tag）、web/src/utils/branding.ts 的 appVersion 回退值；发布时另需
+# buildx --build-arg 显式传参。以上各处须同步递增（config.go 的 APP_VERSION
+# 未注入时显示 unknown，不参与硬编码）。
+#
+# 双轨口径（有意设计，非分叉）：`VERSION`
+# 恒为**正式版本号**（如 v2.3.8，面板/`/api/v1/branding` 展示口径）；镜像
+# 正式版 tag 与 VERSION 相同；beta 通道才给 tag 加 `-beta` 后缀。二者刻意不同，
+# 发布时的判定口径是「tag 去掉通道后缀 == APP_VERSION」。改此约定需同时改
+# README 两版示例、docker-compose.yml、branding/config 回退与发布检查单。
+#
+# 位置约束：ARG/ENV 必须停在上方 CRS/xdb 下载层之后。VERSION 每次发版必变，
+# 提前注入会让 apk 与三条外网下载全部缓存失效（见上方层序说明）——移动前
+# 先确认没有更早的层消费它（当前仅 ENV 自身与运行期二进制消费）。
+ARG VERSION=v2.3.8
+ENV APP_VERSION=${VERSION}
 
 # 以下各层只随各自产物变化：CRS/xdb 层已在上方固化，不受影响。
 COPY --from=xcaddy-builder /app/caddy /usr/local/bin/caddy

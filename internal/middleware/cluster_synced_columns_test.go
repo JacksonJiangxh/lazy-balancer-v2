@@ -71,7 +71,7 @@ func syncedSchemaTestDB(t *testing.T) func() {
 	}
 	return func() {
 		_ = db.Close()
-		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB)
 	}
 }
 

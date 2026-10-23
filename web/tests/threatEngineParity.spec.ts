@@ -143,10 +143,5 @@ test('帧率脚手架已删（两档恒等常量与交互时间窗不再伪装�
   assert.match(globeSrc, /const FRAME_INTERVAL = 1000 \/ 60/)
 })
 
-test('拦截页回落文案不得断言「默认 403/429」（真实回落取绑定链首个有效页）', () => {
-  const stages = source('src/utils/securityStages.ts')
-  assert.doesNotMatch(stages, /回落默认 403|跟随默认 403|已失效（回落首策略）/,
-    '多策略绑定下「默认 403」是错误断言')
-  assert.match(stages, /未配置（跟随绑定链首个有效页，无则默认 403）/)
-  assert.match(stages, /已失效（回落绑定链首个有效页）/)
-})
+// 拦截页回落文案归 securityStagesModel.spec（按 buildStageModel 行为断言，比源码文本
+// 钉更强），且与「双引擎对齐」主题无关，此处不再重复。

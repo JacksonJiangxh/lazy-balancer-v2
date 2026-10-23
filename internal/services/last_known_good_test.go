@@ -175,6 +175,7 @@ func TestCaddyService_ApplyLastKnownGood_blocks_while_caddy_op_lock_held(t *test
 // 静默窗口（主节点长期静态时从节点不再卡旧配置直到人工干预）。
 func TestMarkStartupFallbackPending_writesCompensationMarker(t *testing.T) {
 	_, database := newClusterTestService(t)
+	setNodeMasterRole(t, database, false) // 标记只在从端语境落库（304 补偿只发生在从端 Pull）
 	if err := MarkStartupFallbackPending(context.Background(), database); err != nil {
 		t.Fatalf("mark: %v", err)
 	}
@@ -196,6 +197,7 @@ func TestMarkStartupFallbackPending_writesCompensationMarker(t *testing.T) {
 // 识别（全量重拉机制本身由既有集群重拉测试覆盖）。
 func TestMarkStartupFallbackFailed_writesCompensationMarker(t *testing.T) {
 	_, database := newClusterTestService(t)
+	setNodeMasterRole(t, database, false) // 标记只在从端语境落库（304 补偿只发生在从端 Pull）
 	cause := errors.New("apply last-known-good config failed: connection refused")
 	if err := MarkStartupFallbackFailed(context.Background(), database, cause); err != nil {
 		t.Fatalf("mark: %v", err)

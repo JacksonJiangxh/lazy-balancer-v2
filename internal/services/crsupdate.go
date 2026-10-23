@@ -97,8 +97,9 @@ type CRSUpdateManager struct {
 	stockBakCreated bool
 
 	reloader func() error
-	// runCancel 取消当前运行中的下载阶段（任务监控手动取消，v2.3.4）。
-	runCancel       context.CancelFunc
+	// runCancel 取消当前运行中的下载阶段（任务监控手动取消，v2.3.4）：
+	// 用户取消路径携带 ErrUserCancelled 原因，取消终态据此推进排程槽。
+	runCancel       context.CancelCauseFunc
 	fetchLatestTag  func(ctx context.Context) (string, error)
 	downloadTarball func(ctx context.Context, tag, destPath string, progress downloadProgressFunc) error
 	crsDir          string
@@ -181,6 +182,9 @@ func (m *CRSUpdateManager) RefreshLatestAsync() {
 	}
 	m.latestRefreshing = true
 	m.latestMu.Unlock()
+	// 句柄在派发时捕获：后台续体不得再读全局 db.DB——测试/关闭序列会把
+	// 全局句柄换成新库或 nil，迟到写入会串库或空指针。
+	handle := db.DB
 
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -194,8 +198,11 @@ func (m *CRSUpdateManager) RefreshLatestAsync() {
 			m.latestKnown = true
 		}
 		m.latestMu.Unlock()
-		if isMaster, qerr := RoleOf(context.Background(), db.DB); qerr == nil && isMaster {
-			if _, dbErr := db.DB.Exec("UPDATE security_crs_version SET last_checked=datetime('now') WHERE id=1"); dbErr != nil {
+		if handle == nil {
+			return
+		}
+		if isMaster, qerr := RoleOf(context.Background(), handle); qerr == nil && isMaster {
+			if _, dbErr := handle.Exec("UPDATE security_crs_version SET last_checked=datetime('now') WHERE id=1"); dbErr != nil {
 				Logf("error", "crs update: failed to record last_checked: %v", dbErr)
 			}
 		}
@@ -260,14 +267,14 @@ func (m *CRSUpdateManager) StartUpdate(trigger string, rc *taskengine.RunContext
 	// 可取消 ctx 与 running 在同一临界区登记——StartUpdate 返回后
 	// 立刻 CancelRunning（任务引擎 CancelHook／前端连点／自动化脚本）必须命中，
 	// 不得因 run goroutine 尚未执行而读到 runCancel==nil 静默返回 false。
-	runCtx, runCancel := context.WithCancel(updateRunBaseContext(rc))
+	runCtx, runCancel := context.WithCancelCause(updateRunBaseContext(rc))
 	m.runCancel = runCancel
 	done := m.runDone
 	m.mu.Unlock()
 
 	go func() {
 		defer close(done)
-		defer runCancel()
+		defer runCancel(nil)
 		m.runWithContext(runCtx, trigger, rc)
 	}()
 	return done, nil
@@ -325,8 +332,8 @@ func (m *CRSUpdateManager) recordLatestSkip(trigger string) {
 // runCancel；生产入口经 StartUpdate 预建 ctx（——取消能力不得晚于
 // StartUpdate 返回才就绪）。
 func (m *CRSUpdateManager) run(trigger string, rc *taskengine.RunContext) {
-	runCtx, runCancel := context.WithCancel(updateRunBaseContext(rc))
-	defer runCancel()
+	runCtx, runCancel := context.WithCancelCause(updateRunBaseContext(rc))
+	defer runCancel(nil)
 	m.mu.Lock()
 	m.runCancel = runCancel
 	m.mu.Unlock()
@@ -427,7 +434,7 @@ func (m *CRSUpdateManager) runWithContext(runCtx context.Context, trigger string
 			return
 		}
 		if runCtx.Err() != nil {
-			m.cancel(err, false)
+			m.cancel(err, false, trigger, runCtx)
 			return
 		}
 		m.fail(err, false)
@@ -503,7 +510,7 @@ func (m *CRSUpdateManager) runWithContext(runCtx context.Context, trigger string
 			return
 		}
 		if runCtx.Err() != nil {
-			m.cancel(installErr, installAttempted)
+			m.cancel(installErr, installAttempted, trigger, runCtx)
 			return
 		}
 		m.fail(installErr, true)
@@ -571,7 +578,7 @@ func (m *CRSUpdateManager) restoreAfterInstallError(restore bool) {
 	}
 }
 
-// cancel 记录用户主动取消：安装段已发生树变更时沿用失败路径的回滚/重载
+// cancel 记录取消终态：安装段已发生树变更时沿用失败路径的回滚/重载
 // 安全编舞，但终态不是 failed，连续失败计数不增加。
 // 若取消发生在树交换之后，downloadAndInstall 已在返回前走
 // rollbackAfterReloadFailure 同代回滚（树+VERSION 标记+DB 版本行）——此处
@@ -581,6 +588,11 @@ func (m *CRSUpdateManager) restoreAfterInstallError(restore bool) {
 // 已安装版本：run 在安装前就把 state.version 写成远端 tag，
 // 失败/取消后不复位会让 status 端点把「尝试安装但未安装」的版本当作当前版本
 // 返回（DB 版本行与磁盘仍是旧版本）。读失败留空并留痕，不猜测。
+//
+// 排程槽：**用户取消自动轮**与失败同源——本槽显式放弃，预约推进到紧邻下一
+// 排程槽（引擎侧取消时已消费本槽，业务不推进则 tick 的「槽 > 已消费水位」门
+// 永远不成立，该库自动更新从此静默停摆）。demote/导入排空/进程停止的取消
+// 不推进（引擎侧同样不消费槽，恢复后到期轮补跑）。
 func (m *CRSUpdateManager) syncInstalledVersionToState() {
 	installed, err := crsCurrentVersionForRun()
 	if err != nil {
@@ -592,13 +604,18 @@ func (m *CRSUpdateManager) syncInstalledVersionToState() {
 	m.mu.Unlock()
 }
 
-func (m *CRSUpdateManager) cancel(cause error, restore bool) {
+func (m *CRSUpdateManager) cancel(cause error, restore bool, trigger string, runCtx context.Context) {
 	m.restoreAfterInstallError(restore)
 	if _, err := db.DB.Exec(
 		"UPDATE security_crs_version SET update_status='cancelled', message=?, finished_at=datetime('now') WHERE id=1",
 		cause.Error(),
 	); err != nil {
 		Logf("error", "crs update: failed to record cancellation: %v", err)
+	}
+	if userCancelledRun(runCtx) {
+		// 用户取消=显式放弃本槽（与失败同源）；advanceSlotIfAuto 自带
+		// 「仅 auto、仅空/过期槽」门，手动取消与未来槽不动。
+		m.advanceSlotIfAuto(trigger)
 	}
 	m.syncInstalledVersionToState()
 	m.mu.Lock()
@@ -645,6 +662,8 @@ func (m *CRSUpdateManager) downloadTarballLogged(ctx context.Context, tag, destP
 }
 
 // CancelRunning 取消当前运行中的更新（下载阶段中断）。无运行中任务返回 false。
+// 调用方只有用户取消通道（引擎 CancelHook／前端取消入口）——取消原因标记为
+// ErrUserCancelled，取消终态据此把排程槽推进到下一槽。
 func (m *CRSUpdateManager) CancelRunning() bool {
 	m.mu.Lock()
 	cancel := m.runCancel
@@ -653,7 +672,7 @@ func (m *CRSUpdateManager) CancelRunning() bool {
 	if cancel == nil || !running {
 		return false
 	}
-	cancel()
+	cancel(taskengine.ErrUserCancelled)
 	return true
 }
 

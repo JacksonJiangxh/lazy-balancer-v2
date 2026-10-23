@@ -101,8 +101,11 @@ func describeThreatRuleName(key string) string {
 			}
 		}
 		return "CRS 规则（#" + key + "）"
-	case n > 10000 && n < services.GeoIPPrecheckSegmentBase:
+	case n >= 10000 && n < services.GeoIPPrecheckSegmentBase:
 		// 自定义规则 emit id = DB id + 10000（emit 侧对 DB id ≥790000 有守卫）。
+		// 下界用 >=（与 triggerTypeForRule 同口径）：10000 是段起点，当前发射
+		// 侧不可达（crID≥1），但两处口径分叉会让同一 id 在大屏「命中规则」榜
+		// 与事件列表 trigger_type 上显示不同分类。
 		if db.DB != nil {
 			var name string
 			if err := db.DB.QueryRow(`SELECT name FROM security_custom_rules WHERE id=?`, n-10000).Scan(&name); err == nil {
@@ -780,6 +783,28 @@ func threatRollupCoverageReaches(hours int) bool {
 	return !coveredFrom.After(horizon)
 }
 
+// WaitThreatRollupWarmer 有界等待 warmer 协程退出（关停链在 db.Close 之前
+// 调用，与同层 worker 同口径）：warmer 只在轮次之间检查 ctx，在途
+// ensureThreatRollup 的批推进不会被打断——不等待就会让该批读写落在关闭后的
+// 库上（"database is closed" 告警 + 批事务回滚）。d<=0 或超时返回 false，
+// 调用方如实记录后继续退出（残留协程随进程消亡）。
+func WaitThreatRollupWarmer(d time.Duration) bool {
+	if d <= 0 {
+		return false
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		threatRollupWarmerWg.Wait()
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
+	}
+}
+
 // StartThreatRollupWarmer 启动 rollup 后台固化协程（幂等：CAS 标志，重复
 // 调用为空操作）：启动时立即 ensureThreatRollup(7d)，之后每 60s 一轮；
 // ctx 取消即退出。单轮失败仅告警，下一轮自愈（固化本身幂等）。
@@ -1137,21 +1162,34 @@ type trafficCountry struct {
 type trafficSnapshot struct {
 	Countries map[string]trafficCountry `json:"countries"`
 	SampleN   uint32                    `json:"sample_n"`
+	// Collecting 是采集租约当前是否有效：无租约期间累计计数冻结，
+	// 「数值不变」不等于「无流量」。
+	Collecting bool `json:"collecting"`
 }
 
 // threatTrafficEmptyDegrade admin 不可达/抓取失败时的降级响应（200 空数据，
-// available=false）——大屏 1-2s 轮询容忍瞬时不可达，不 500。
+// available=false）——大屏 1-2s 轮询容忍瞬时不可达，不 500。collecting=false
+// 与「可达但无租约」同形：两种情况都不得把冻结的累计当作实时流量。
 func threatTrafficEmptyDegrade() gin.H {
-	return gin.H{"countries": map[string]trafficCountry{}, "available": false, "sample_n": 1}
+	return gin.H{"countries": map[string]trafficCountry{}, "available": false, "sample_n": 1, "collecting": false}
 }
 
 // ControlThreatScreenCollector POST/DELETE /security/overview/threat-screen/collector
 // 代理 Caddy admin 的流量采集租约：大屏打开时申请/续租，关闭时释放；
 // 插件在无租约时跳过所有流量采集热路径（安全日志不受影响）。
 func (h *Handlers) ControlThreatScreenCollector(c *gin.Context) {
-	body, err := io.ReadAll(io.LimitReader(c.Request.Body, 4096))
+	// 请求体上限 4096：超限显式 413（LimitReader 静默截断会把半截 JSON 原样
+	// 转发给 admin，admin 侧 400 会把错误归因指向 admin，本地还拿不到
+	// lease_id → 租约不登记/不释放）。空体（DELETE 走 query 回退）合法，
+	// 非空非法 JSON 显式 400——不与「无字段」混淆。
+	const collectorBodyLimit = 4096
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, collectorBodyLimit+1))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求体读取失败"})
+		return
+	}
+	if len(body) > collectorBodyLimit {
+		c.JSON(http.StatusRequestEntityTooLarge, models.APIResponse{Code: 413, Message: "采集控制请求体超过 4KB 上限"})
 		return
 	}
 	target := strings.TrimRight(h.cfg.CaddyAdminURL, "/") + "/lb/traffic-collector"
@@ -1164,7 +1202,12 @@ func (h *Handlers) ControlThreatScreenCollector(c *gin.Context) {
 		TTLMs   *int64 `json:"ttl_ms"`
 		SampleN *int   `json:"sample_n"`
 	}
-	_ = json.Unmarshal(body, &collectorReq)
+	if len(bytes.TrimSpace(body)) > 0 {
+		if err := json.Unmarshal(body, &collectorReq); err != nil {
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "采集控制请求体格式无效"})
+			return
+		}
+	}
 	if collectorReq.LeaseID == "" && c.Request.Method == http.MethodDelete {
 		collectorReq.LeaseID = c.Query("lease_id")
 	}
@@ -1320,6 +1363,9 @@ func fetchThreatTrafficSnapshot(adminURL string) (gin.H, bool) {
 		"countries": out,
 		"available": true,
 		"sample_n":  snap.SampleN,
+		// 采集租约状态原样透传：无租约时计数冻结，前端据此提示而非把
+		// 冻结的累计当作实时流量。
+		"collecting": snap.Collecting,
 	}, true
 }
 
@@ -1402,6 +1448,7 @@ func threatScreenZeroPayload(hours int, now time.Time, loc *time.Location) gin.H
 		"rollup_last_success":  "",
 		"rollup_coverage_from": "",
 		"raw_coverage_from":    "",
+		"raw_coverage_limited": false,
 		"backfill_incomplete":  false,
 		"total_events":         0,
 		"blocked_events":       0,
@@ -1471,9 +1518,12 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 	needsSync := !threatRollupWarmerStarted.Load() || threatRollupStale() ||
 		(hours > 24 && !threatRollupCoverageReaches(hours))
 	if needsSync {
+		// 同步固化可能提交了部分批（错误路径同样会提交），聚合缓存必须失效：
+		// 否则本次响应仍返回固化前的窗口数据。
 		if err := ensureThreatRollup(hours); err != nil {
 			trackErr(err)
 		}
+		invalidateThreatRollupDimAggregateCache()
 	}
 	// 宽窗口首轮只回填有界批数（threatRollupMaxBatchesPerCall），
 	// 最近成功固化不代表窗口头部已覆盖——必须披露部分聚合，避免把少计的
@@ -1491,16 +1541,21 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 	} else {
 		backfillIncomplete = true
 	}
-	// 原始事件已被保留期/行帽裁剪时，缺失分钟的固化只能写 0；此刻
-	// coveredFrom 可能已推进到窗口起点，单看覆盖无法发现「不可重建」。
-	// 披露原始表最早事件，并把窗口前段标为不完整。
+	// 原始事件已被保留期/行帽裁剪时，缺失分钟的固化只能写 0——这是原始表的
+	// 正常运维形态（保留天数 1..3650、行帽默认 100 万），与「rollup 可重建性」
+	// 是两件事：rollup 行的保留期与事件保留期解耦且 ≥31 天，窗口数据完整。
+	// 因此原始表最早事件只作信息提示（raw_coverage_limited），不参与
+	// backfill_incomplete 判定，也不参与 30s 聚合缓存的可用性——把两个保留
+	// 策略耦合会让高攻击站点（或短保留期部署）常驻「少计」告警并每次轮询
+	// 重跑全窗口聚合。
 	rawCoverageFrom := ""
+	rawCoverageLimited := false
 	if raw, err := threatRawCoverageStart(db.MetricsDB); err != nil {
 		trackErr(err)
 	} else {
 		rawCoverageFrom = raw
 		if rawCoverageFrom != "" && rawCoverageFrom > windowStartMinute.Format("2006-01-02 15:04:05") {
-			backfillIncomplete = true
+			rawCoverageLimited = true
 			if coverageFrom == "" {
 				coverageFrom = rawCoverageFrom[:16]
 			}
@@ -1610,6 +1665,9 @@ func (h *Handlers) GetSecurityThreatScreen(c *gin.Context) {
 		// [rollup_coverage_from, now]，宽窗口回填仍在进行（后续轮询补齐）。
 		"rollup_coverage_from": coverageFrom,
 		"raw_coverage_from":    rawCoverageFrom,
+		// 原始表覆盖受限（保留期/行帽裁剪）只作信息提示：窗口聚合来自 rollup，
+		// 完整性与该标记无关（不参与 backfill_incomplete 与聚合缓存）。
+		"raw_coverage_limited": rawCoverageLimited,
 		"backfill_incomplete":  backfillIncomplete,
 		"total_events":         total,
 		"blocked_events":       blocked,

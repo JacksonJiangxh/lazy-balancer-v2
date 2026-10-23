@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/taskengine"
 )
 
 // 规则库定时调度（v2.3.x）：CRS/IP2Region/威胁情报库三个更新任务的排程从固定
@@ -46,6 +48,31 @@ const (
 	threatSlotAdvanceSQL = `next_update=IIF(` + slotAdvanceGateSQL + `, ?, next_update)`
 )
 
+// userCancelledRun 本轮是否由用户显式取消（任务监控「取消」/前端取消入口）。
+// 引擎在用户取消路径给运行 ctx 标记 ErrUserCancelled 取消原因；demote 中止/
+// 导入排空/进程停止走普通取消（context.Canceled）——三者保留「恢复后到期轮
+// 补跑」语义，只有用户取消需要把排程槽当作显式放弃推进到下一槽（与失败
+// 同源），否则引擎已消费本槽而业务槽恒过期 → 自动更新永久静默停摆。
+func userCancelledRun(ctx context.Context) bool {
+	return ctx != nil && errors.Is(context.Cause(ctx), taskengine.ErrUserCancelled)
+}
+
+// advanceSourceSlotsAfterUserCancel 源表族（威胁情报/爬虫地址）用户取消
+// 自动轮后的槽推进：单源取消只覆盖在途那一行，循环中止后其余到期源的槽
+// 仍是旧值——而引擎的排程槽=启用源最早 next_update，任一源留在被消费的槽值
+// 上即可永久压住整个任务。故按同一推进门处理全部启用行（到期/空槽才写，
+// 未来槽不回拨），语义=「本槽放弃，预约下一槽」。
+func advanceSourceSlotsAfterUserCancel(table, trigger string, slotOf func(time.Time) string) {
+	if trigger != "auto" {
+		// 手动轮不改变预约（引擎侧同样不消费手动轮的槽）。
+		return
+	}
+	if _, err := db.DB.Exec(`UPDATE `+table+` SET next_update=IIF(`+slotAdvanceGateSQL+`, ?, next_update) WHERE update_enabled=1`,
+		trigger, slotOf(time.Now().UTC())); err != nil {
+		Logf("warn", "用户取消后推进排程槽失败（%s）: %v", table, err)
+	}
+}
+
 // setVersionTableAutoUpdate 版本表族（CRS/IP2Region）自动更新开关的单源写侧：
 // 行缺失先按 seed 播种（INSERT OR IGNORE），再写标志与排程槽，最后联动任务
 // 调度。两族此前三句 SQL 逐字同构（含「失败退避撤除」裁定），任一处改动都
@@ -55,7 +82,16 @@ const (
 // 推进；此处开关动作立即重排程——开启写下一槽、关闭无条件清空（2026-09-25
 // 用户裁定：失败退避机制撤除）。
 func setVersionTableAutoUpdate(table, label, seed, taskID string, enabled bool) error {
-	if _, err := db.DB.Exec(
+	// 两步写事务化（与同文件 setVersionTableSchedule 同构）：INSERT 成功而
+	// UPDATE 失败会留「行已建、排程未生效、next_update 为空」的中间态——开关
+	// 显示已开、任务永不触发，且失败只经一次 handler 错误响应留痕，之后无人
+	// 复查。
+	tx, err := db.DB.Begin()
+	if err != nil {
+		return fmt.Errorf("开启 %s 自动更新事务: %w", label, err)
+	}
+	defer func() { _ = tx.Rollback() }() // 已 Commit 后为 no-op
+	if _, err := tx.Exec(
 		"INSERT OR IGNORE INTO "+table+" (id, version, auto_update) VALUES (1, ?, ?)",
 		seed, enabled,
 	); err != nil {
@@ -63,10 +99,19 @@ func setVersionTableAutoUpdate(table, label, seed, taskID string, enabled bool) 
 	}
 	nextUpdate := ""
 	if enabled {
-		nextUpdate = versionTableNextSlot(table, time.Now().UTC())
+		// 事务内读排程两列（事务外读看不到刚建的行）——与 versionTableNextSlot
+		// 同一槽计算单源。
+		days, hhmm, serr := versionTableScheduleTx(tx, table)
+		if serr != nil {
+			return fmt.Errorf("读取 %s 排程: %w", label, serr)
+		}
+		nextUpdate = NextScheduledSlot(time.Now().UTC(), days, hhmm, CurrentLocation()).UTC().Format(crsTimeLayout)
 	}
-	if _, err := db.DB.Exec("UPDATE "+table+" SET auto_update=?, next_update=CASE WHEN ? THEN ? ELSE '' END WHERE id=1", enabled, enabled, nextUpdate); err != nil {
+	if _, err := tx.Exec("UPDATE "+table+" SET auto_update=?, next_update=CASE WHEN ? THEN ? ELSE '' END WHERE id=1", enabled, enabled, nextUpdate); err != nil {
 		return fmt.Errorf("更新 %s 自动更新开关: %w", label, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交 %s 自动更新事务: %w", label, err)
 	}
 	syncTaskLoop(taskID, enabled)
 	return nil
@@ -347,20 +392,42 @@ func versionTableNextSlot(table string, now time.Time) string {
 	return NextScheduledSlot(now, days, hhmm, CurrentLocation()).UTC().Format(crsTimeLayout)
 }
 
-// versionTableAutoUpdateEnabled 读版本表自动更新开关（读错 fail-closed）。
-func versionTableAutoUpdateEnabled(table string) bool {
-	if db.DB == nil {
-		return false
+// versionTableScheduleTx 事务内读取版本表排程两列并归一（与 versionTableSchedule
+// 同一归一实现）。供「先建行再算槽」的写事务使用——事务内新建的行在事务外的
+// db.DB 连接上不可见。
+func versionTableScheduleTx(tx *sql.Tx, table string) ([]int, string, error) {
+	var daysRaw, hhmm string
+	if err := tx.QueryRow(`SELECT COALESCE(schedule_days,''), COALESCE(schedule_time,'') FROM `+table+` WHERE id=1`).Scan(&daysRaw, &hhmm); err != nil {
+		return nil, "", err
 	}
-	var enabled int
-	if err := db.DB.QueryRow(`SELECT COALESCE(auto_update,1) FROM ` + table + ` WHERE id=1`).Scan(&enabled); err != nil {
+	days, normHHMM := normalizeScheduleRow(daysRaw, hhmm)
+	return days, normHHMM, nil
+}
+
+// versionTableAutoUpdateEnabled 读版本表自动更新开关（读错 fail-closed）。
+// 调度门（tick 侧 EnabledFn/NextSlotFn）使用本二态口径——读错只影响本轮。
+func versionTableAutoUpdateEnabled(table string) bool {
+	enabled, known := versionTableAutoUpdateState(table)
+	return known && enabled
+}
+
+// versionTableAutoUpdateState 三态读取版本表自动更新开关：known=false 表示
+// 启用状态不可判定（库不可读/行缺失）。业务驱动任务的调度对齐只对
+// known=true 落 StartLoop/StopLoop——读失败保持上一次生效的调度态并等待
+// 周期性重试（否则一次读失败会被固化为调度关闭，读恢复后也不再自救）。
+func versionTableAutoUpdateState(table string) (enabled, known bool) {
+	if db.DB == nil {
+		return false, false
+	}
+	var v int
+	if err := db.DB.QueryRow(`SELECT COALESCE(auto_update,1) FROM ` + table + ` WHERE id=1`).Scan(&v); err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			logScheduleReadFailure("schedule-auto-update-"+table, err)
 		}
-		return false
+		return false, false
 	}
 	logScheduleReadRecovered("schedule-auto-update-" + table)
-	return enabled == 1
+	return v == 1, true
 }
 
 // CRSSchedule 返回 CRS 更新任务排程（GET 载荷）。

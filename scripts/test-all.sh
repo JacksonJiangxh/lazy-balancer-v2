@@ -8,11 +8,12 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# 守卫本体 + 守卫自检（自检在临时夹具仓里验证命中面与误报边界——守卫的
-# 模式退化必须在这里先红，而不是等到审计产物真的混进公网仓库）。
+# 守卫本体 + 守卫自检（审计产物/批量编辑两个守卫的自检在临时夹具仓里验证命中面
+# 与误报边界——守卫的模式退化必须在这里先红，而不是等到审计产物真的混进公网仓库）。
 ./scripts/check-no-audit-artifacts.sh
 ./scripts/check-bulk-edit-safety.sh
 ./scripts/tests/guard-selftest.sh
+./scripts/tests/bulk-edit-safety-selftest.sh
 
 # 启动链工件语法：docker-entrypoint.sh 是每次部署的唯一入口（语法错误 = 面板
 # 不可用，且只在容器启动时暴露，此前无任何门禁触碰它）；scripts/ 全部按 bash

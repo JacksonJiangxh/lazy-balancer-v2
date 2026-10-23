@@ -645,158 +645,24 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: "备份文件格式不正确: " + err.Error()}})
 			return
 		}
-		// validateV2Backup 会回填缺失表(校验均匀性),快照真实携带
-		// 表集——缺席还原与反向悬挂降级口径都依赖「备份原本是否携带」。
-		exportedTables := map[string]bool{}
-		for table := range backup.Tables {
-			exportedTables[table] = true
-		}
-		backupCarriedCertTables := exportedTables["certificate_configs"] || exportedTables["ca_providers"]
-		// 与导入同序——完整性先于 sections 过滤，行级门在过滤之后。
-		if _, err := verifyBackupIntegrity(backup); err != nil {
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
+		// 与 ImportConfigBackup 共用 importValidationSteps 单一门序：完整性 →
+		// 分类选择/过滤 → 软跳过 → 行级门 → 规则库元数据剔除 → 零导入判据 →
+		// 形态/引用/任务/全局配置门。预览不再自行编排子集门，新增校验自然
+		// 双路径同序（此前两条路径各写一遍，增删门时静默分叉）。
+		chain, chainErr := validateImportBackupChain(c.Request.Context(), importValidationDeps{
+			DB:                     db.DB,
+			ValidateRuleListenPort: h.validateRuleListenPortForSave,
+		}, &backup, importValidationOptions{LbbakPayload: lbbakPayloadFromCtx(c), RequestedSections: c.Query("sections")})
+		if chainErr != nil {
+			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: chainErr.Error()}})
 			return
 		}
-		// 有效分类选择单源（与 ImportConfigBackup 共用
-		// resolveImportSectionSelection）：lbbak 的 ?sections= 与体内 sections
-		// 取交集而非替换，纯 JSON 以体内 sections 为准；交集为空与导入同文案
-		// valid=false（此前预览替换后可能「可导入」而导入 400）。
-		// 须在完整性校验之后——v3 校验和覆盖体内 sections（还原范围）。
-		if err := resolveImportSectionSelection(&backup, c.Query("sections")); err != nil {
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
-			return
-		}
-		// 与 ImportConfigBackup 同序——还原「缺席」语义,回填表不得
-		// 被当作「清空本地表」参与校验/汇总。
-		for table := range backup.Tables {
-			if !exportedTables[table] {
-				delete(backup.Tables, table)
-			}
-		}
-		// 与 ImportConfigBackup 同序——sections 过滤前置到全部形态/
-		// 任务校验之前:①未选分类的坏行预览不误报;②ACME 引用「备份有表按
-		// 备份行、缺表按 live」自动等于「过滤后导入表∪live 保留表」正确口径;
-		// 未选系统数据时全局配置区不参与校验。
-		sectionTables, includeGlobal, sectionsOK := configBackupSectionTables(backup.Sections)
-		if !sectionsOK {
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: "未知的配置分类"}})
-			return
-		}
-		for table := range backup.Tables {
-			if !sectionTables[table] {
-				delete(backup.Tables, table)
-			}
-		}
-		if !includeGlobal {
-			backup.Config = nil
-		}
-		// 零导入交集门（与 ImportConfigBackup 共用 assertImportScopeHasContent）：
-		// 过滤后既无表、也未选全局配置时 valid=false，文案与导入 400 完全一致
-		// （此前预览对同形态返回 valid=true，管理员点了导入才 400）。
-		if err := assertImportScopeHasContent(backup.Tables, includeGlobal, backup.Sections, importScopeFiltered); err != nil {
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
-			return
-		}
-		// 与导入共用准备序列：纯 JSON 威胁源保留本地、空域名规则/空内容页软跳过，
-		// 然后才执行行级结构门，保证预览摘要/告警与实际导入一致。
-		skipWarnings, prepErr := prepareV2BackupSkips(&backup, lbbakPayloadFromCtx(c), sectionTables)
-		if prepErr != nil {
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: prepErr.Error()}})
-			return
-		}
-		// 版本/源表 update_status 归一与导入同序同文案：导入门把词表外值收敛为
-		// idle 并告警，预览此前跳过该步，导致同一备份的 warnings 双路径不同。
-		skipWarnings = append(skipWarnings, normalizeImportedVersionUpdateStatuses(backup.Tables)...)
-		// 行级门在 sections 过滤与软跳过之后（与导入同序）。
-		if err := validateV2BackupRows(c.Request.Context(), db.DB, backup); err != nil {
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
-			return
-		}
-		// users 键存在且为空数组——预览与导入
-		// 同位硬拒（同文案），此前预览显示「用户 0 个」仍 valid=true。
-		if rows, ok := backup.Tables["users"]; ok && len(rows) == 0 {
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: "备份 users 表为空，导入将清空全部账户，已拒绝"}})
-			return
-		}
-		if err := validateV2BackupCertJobStatuses(backup.Tables); err != nil {
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
-			return
-		}
-		// 与 ImportConfigBackup 同序——content_type 白名单值域收敛
-		// 也进预览，「导入/预览双路径同序」不变量补齐（预览不回显该值，无可观察
-		// 面分叉，纯不变量对齐）。
-		normalizeBlockPageContentTypes(backup.Tables)
-		// 与 ImportConfigBackup 同序——域名归一 + 冲突置禁用前移到
-		// 逐行校验之前（冲突可自愈备份不得在预览误报不可导入）。
-		canonicalizeBackupRuleDomains(backup.Tables["lb_rules"])
-		disabledConflicts := disableV2RuleConflicts(backup.Tables["lb_rules"])
-		// 与 ImportConfigBackup 同序——skip 之后、逐行校验之前校验
-		// upstreams/path_rules 引用存在性，预览结果与实际导入一致（否则悬挂引用
-		// 备份在预览显示可导入、实际导入才 400）。
-		if err := validateBackupRuleReferences(backup.Tables); err != nil {
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
-			return
-		}
-		if err := validateV2BackupRules(backup.Tables, h.validateRuleListenPortForSave); err != nil {
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
-			return
-		}
-		// 与 ImportConfigBackup 同序：安全策略 CRS 字段校验也须进预览，否则坏
-		// 组号备份在预览显示可导入、实际导入才 400。
-		// 本次导入同时替换 CRS 规则树时，存在性基准
-		// 不是 live 索引——降级为形状校验并进预览警告（与导入侧同判据）。
-		previewLbbak := lbbakPayloadFromCtx(c)
-		crsTreeReplaced := sectionTables["security_crs_version"] && previewLbbak != nil && previewLbbak.CRSTarGz != nil
-		if err := validateV2BackupSecurityPolicies(backup.Tables, crsTreeReplaced); err != nil {
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
-			return
-		}
-		// 与 ImportConfigBackup 同序——TLS 形态校验在冲突置禁用之后
-		// 执行，预览结果与实际导入一致（冲突可自愈备份不得在预览误报不可导入）。
-		// 与 ImportConfigBackup 同序——「导规则不导 cert 配置且备份
-		// 从未携带 cert 表」方向按 live 解析失败的 ACME 引用降级为悬挂警告。
-		softLiveACMERefs := sectionTables["lb_rules"] &&
-			!sectionTables["certificate_configs"] && !sectionTables["ca_providers"] &&
-			!backupCarriedCertTables
-		acmeDanglingImported, tlsShapeErr := validateV2BackupTLSShapeSoft(backup.Tables, softLiveACMERefs)
-		if tlsShapeErr != nil {
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: tlsShapeErr.Error()}})
-			return
-		}
-		// 与 ImportConfigBackup 同序——任务不变量在冲突置禁用之后
-		// 执行，预览结果与实际导入一致（冲突可自愈备份不得在预览误报不可导入）。
-		certJobProviderWarnings, certJobsErr := validateV2BackupCertJobs(backup.Tables)
-		if certJobsErr != nil {
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: certJobsErr.Error()}})
-			return
-		}
-		// 与 ImportConfigBackup 同序——坏 admin_tls_* 形态预览即报
-		// 不可导入，不得预览通过、导入才 400。
-		if err := validateV2BackupAdminTLS(backup.Config); err != nil {
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
-			return
-		}
-		// 自动封禁六列与受信代理三 TEXT 列导入门——
-		// 与 ImportConfigBackup 同序，畸形载荷预览即报不可导入（归一写回在
-		// 预览无可观察面，纯不变量对齐）。
-		if _, err := validateV2BackupAutobanConfig(backup.Config); err != nil {
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
-			return
-		}
-		if err := validateV2BackupTrustedProxyConfig(backup.Config, backup.Tables); err != nil {
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
-			return
-		}
-		// 与 ImportConfigBackup 同序——运行期设置门与自动
-		// 备份设置组门。预览侧归一写回无可观察面（纯不变量对齐）。
-		if err := validateV2BackupRuntimeSettings(backup.Config, backup.Tables); err != nil {
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
-			return
-		}
-		if err := validateV2BackupAutoBackupConfig(backup.Config); err != nil {
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
-			return
-		}
+		sectionTables := chain.SectionTables
+		skipWarnings := chain.SkipWarnings
+		disabledConflicts := chain.DisabledConflicts
+		crsTreeReplaced := chain.CRSTreeReplaced
+		acmeDanglingImported := chain.ACMEDanglingImported
+		certJobProviderWarnings := chain.CertJobProviderWarnings
 		// 2026-09-18 用户裁定:操作者缺席不再阻断——降级为预览 warning(分类
 		// 未选系统数据时操作者不受影响;选了也尊重用户选择)。
 		// 同序后 sections 已知——未选系统数据/备份 users 缺席不再误告
@@ -842,39 +708,17 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 				validateWarnings = append(validateWarnings, warning)
 			}
 		}
-		// 本剔除步与导入侧（ImportConfigBackup 的版本表剔除）相对次序一致：
-		// 两侧都是「行级校验 → 版本表剔除」。行级校验器
-		//（validateV2BackupRows → validateV2BackupBooleanTypes）已登记并消费
-		// security_crs_version / security_ip2region_version 的 auto_update 列，
-		// 因此剔除前移会先删表、双路径都静默放过坏值——它必须留在校验之后；
-		// 未来若确需调整次序，预览与导入必须同步改并保持这一相对关系。
-		// 镜像导入侧单侧文件缺失建模——
-		// 单侧缺失剔对应版本表并告警（此前仅建模双侧缺失，单侧形态预览计数
-		// 含两表且无警告，与导入实际落库分叉）；双侧缺失语义保持
-		// 「只有元数据=不导入」）。文案与导入侧共用常量。
-		if sectionTables["security_crs_version"] {
-			previewPayload := lbbakPayloadFromCtx(c)
-			crsMissing := previewPayload == nil || previewPayload.CRSTarGz == nil
-			xdbMissing := previewPayload == nil || previewPayload.Xdb == nil
-			switch {
-			case crsMissing && xdbMissing:
-				for _, t := range []string{"security_crs_version", "security_ip2region_version"} {
-					delete(backup.Tables, t)
-				}
-				validateWarnings = append(validateWarnings, warningWafMetadataSkipped)
-			case crsMissing:
-				delete(backup.Tables, "security_crs_version")
-				validateWarnings = append(validateWarnings, warningWafCRSMetadataSkipped)
-			case xdbMissing:
-				delete(backup.Tables, "security_ip2region_version")
-				validateWarnings = append(validateWarnings, warningWafXdbMetadataSkipped)
-			}
+		// 版本表随文件缺失的剔除及其零导入判据已在链内按导入同序完成
+		// （行级校验 → 版本表剔除 → 剔除后判据），此处只把同一事实呈现为
+		// 响应 warning，文案与导入侧共用常量。
+		if chain.WAFMetadataSkipped {
+			validateWarnings = append(validateWarnings, warningWafMetadataSkipped)
 		}
-		// 软跳过/剔除步之后的零导入判据（与 ImportConfigBackup 同位同文案）：
-		// 剔除后无表且未选全局配置时 valid=false，不再出现「摘要为空但可导入」。
-		if err := assertImportScopeHasContent(backup.Tables, includeGlobal, backup.Sections, importScopeSkipped); err != nil {
-			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: err.Error()}})
-			return
+		if chain.WAFCRSMetadataSkipped {
+			validateWarnings = append(validateWarnings, warningWafCRSMetadataSkipped)
+		}
+		if chain.WAFXdbMetadataSkipped {
+			validateWarnings = append(validateWarnings, warningWafXdbMetadataSkipped)
 		}
 		summary := map[string]int{}
 		for table, rows := range backup.Tables {

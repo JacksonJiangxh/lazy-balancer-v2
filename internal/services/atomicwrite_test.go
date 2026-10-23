@@ -3,7 +3,10 @@ package services
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"lazy-balancer-v2/wafiplist"
 )
 
 // 单源原子落盘 helper：写入内容/权限、覆盖既有文件、失败清理。
@@ -76,7 +79,9 @@ func TestRestoreIPListProjections_restoresRealFilesWithoutTempArtifacts(t *testi
 	}
 
 	// When CLI validation fails and the projection snapshot is restored.
-	RestoreIPListProjections(snapshot)
+	if err := RestoreIPListProjections(snapshot); err != nil {
+		t.Fatalf("restore must report clean rollback: %v", err)
+	}
 
 	// Then original bytes return, the new projection disappears, and atomic
 	// writes leave no temporary artifacts.
@@ -92,6 +97,44 @@ func TestRestoreIPListProjections_restoresRealFilesWithoutTempArtifacts(t *testi
 	}
 	if len(entries) != 1 || entries[0].Name() != "p1-acl.txt" {
 		t.Fatalf("restore left unexpected files: %v", entries)
+	}
+}
+
+// 回滚失败必须可上报（调用方写 error 日志），且被删投影必须同步淘汰
+// wafiplist 运行期缓存（与 GC 路径同口径：fail-stale 不得继续服务已删集合）。
+func TestRestoreIPListProjections_reportsFailuresAndEvictsCache(t *testing.T) {
+	dir := t.TempDir()
+	oldDir, oldPrefix := IPListDataDir, wafiplist.AllowedPathPrefix
+	IPListDataDir = dir
+	wafiplist.AllowedPathPrefix = dir + string(filepath.Separator)
+	t.Cleanup(func() { IPListDataDir, wafiplist.AllowedPathPrefix = oldDir, oldPrefix })
+
+	// Given：一个已渲染写入并进入运行期缓存的投影文件
+	path := filepath.Join(dir, "p1-acl.txt")
+	if err := os.WriteFile(path, []byte("10.0.0.0/8\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wafiplist.LoadPrefixesFresh(path); err != nil {
+		t.Fatalf("warm cache: %v", err)
+	}
+	// 快照不含该文件（渲染新增→回滚删除），另含一个父目录不存在的路径（回写失败）
+	snapshot := IPListProjectionSnapshot{
+		filepath.Join(dir, "missing", "p2-acl.txt"): []byte("192.0.2.0/24\n"),
+	}
+
+	// When
+	err := RestoreIPListProjections(snapshot)
+
+	// Then：失败可上报且指名失败路径
+	if err == nil || !strings.Contains(err.Error(), "p2-acl.txt") {
+		t.Fatalf("err=%v，回写失败必须返回带路径的错误", err)
+	}
+	if _, serr := os.Stat(path); !os.IsNotExist(serr) {
+		t.Fatalf("渲染新增的投影必须删除, stat err=%v", serr)
+	}
+	// 缓存已淘汰：解析不再 fail-stale 返回旧集合，而是显式失败（fail-closed）。
+	if _, rerr := wafiplist.ResolvePrefixesNormalized(path); rerr == nil {
+		t.Fatal("已删投影的运行期缓存未淘汰——fail-stale 会继续用旧集合判定")
 	}
 }
 

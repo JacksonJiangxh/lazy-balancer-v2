@@ -307,3 +307,36 @@ func TestGetMetricsDashboard_dbReadFailureIsLogged(t *testing.T) {
 		t.Fatalf("日志未留痕 DB 读失败, log=%q", logBuf.String())
 	}
 }
+
+// 快照 TTL 以「抓取完成」时刻起算：抓取耗时 ≥ TTL 时条目不得出生即过期
+// （否则最需要共享的慢抓取场景反而每次都重新抓取，面板/规则/主机三端点的
+// 轮询叠加成「越慢越抓」）。
+func TestLoadCaddyMetricsSnapshot_ttlAnchoredAtFetchCompletion(t *testing.T) {
+	resetCaddyMetricsSnapshotCacheForTest()
+	t.Cleanup(resetCaddyMetricsSnapshotCacheForTest)
+	oldTTL := caddyMetricsSnapshotTTL
+	caddyMetricsSnapshotTTL = 60 * time.Millisecond
+	t.Cleanup(func() { caddyMetricsSnapshotTTL = oldTTL })
+
+	var calls atomic.Int32
+	overrideDashboardFetch(t, func(context.Context, string) ([]byte, error) {
+		calls.Add(1)
+		time.Sleep(80 * time.Millisecond) // 抓取耗时 > TTL
+		return []byte("ok 1\n"), nil
+	})
+
+	const url = "http://snap.slow/metrics"
+	if _, err := loadCaddyMetricsSnapshot(context.Background(), url, true); err != nil {
+		t.Fatalf("首次抓取 err = %v", err)
+	}
+	// When：抓取刚完成，TTL 内第二次读取
+	body, err := loadCaddyMetricsSnapshot(context.Background(), url, true)
+	if err != nil || string(body) != "ok 1\n" {
+		t.Fatalf("第二次 body=%q err=%v, want 共享快照", string(body), err)
+	}
+
+	// Then：仍是一次抓取（TTL 从抓取完成时刻起算）
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("抓取 %d 次, want 1（TTL 以抓取开始时刻为基准时，慢抓取条目出生即过期）", got)
+	}
+}

@@ -35,7 +35,8 @@ test('设置页消费 cert_info_error 并渲染错误条', () => {
 
 test('日志统计条消费 rows_unavailable：保持条数口径并标注不可用', () => {
   const bar = source('src/components/LogStorageBar.vue')
-  assert.match(bar, /rows_unavailable\?: boolean/, '响应字段类型必须声明')
+  // 响应类型声明在取数层组合子（LogStorageBar 只消费其 info）。
+  assert.match(source('src/composables/useLogStorageStats.ts'), /rows_unavailable\?: boolean/, '响应字段类型必须声明')
   // 出现判定必须真正消费该 flag：后端改为「保留上次行数 + flag=true」时，陈旧
   // 行数不得被当有效值（仅用 rows == null 推导会让 flag 成为死字段）。
   const rowsUnavailable = member(bar, 'const rowsUnavailable = computed')

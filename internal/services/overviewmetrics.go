@@ -29,7 +29,10 @@ var overviewMetricsCacheTTL = 5 * time.Second
 type overviewMetricsCall struct {
 	done   chan struct{}
 	blocks []RateLimitHostBlocks
-	err    error
+	// hostServer 是同一份抓取的 (host, server) 维度视图（同域多端口限流
+	// chip 区分端口）。
+	hostServer []RateLimitHostServerBlocks
+	err        error
 }
 
 var overviewMetricsCache struct {
@@ -39,8 +42,9 @@ var overviewMetricsCache struct {
 }
 
 type overviewMetricsCacheEntry struct {
-	blocks    []RateLimitHostBlocks
-	expiresAt time.Time
+	blocks     []RateLimitHostBlocks
+	hostServer []RateLimitHostServerBlocks
+	expiresAt  time.Time
 }
 
 // resetOverviewMetricsCacheForTest 仅供测试隔离。
@@ -58,19 +62,36 @@ func resetOverviewMetricsCacheForTest() {
 // 5s TTL 进程内缓存 + 同 URL 单飞——失败轮不写缓存（下一请求重试），
 // 返回副本避免调用方改动共享切片。
 func ScrapeRateLimitBlocks(metricsURL string) ([]RateLimitHostBlocks, error) {
+	blocks, _, err := scrapeOverviewMetrics(metricsURL)
+	return blocks, err
+}
+
+// ScrapeRateLimitBlocksByHostServer 与 ScrapeRateLimitBlocks 同源同缓存，但保留
+// Caddy 的 server 标签（http_<port>）：同域名多端口部署下，按 host 求和会把各
+// 端口的限流计数累加到每条规则的 chip 上（单规则口径被放大成多条之和）。
+// 返回副本；排序=计数降序、host/server 升序。
+func ScrapeRateLimitBlocksByHostServer(metricsURL string) ([]RateLimitHostServerBlocks, error) {
+	_, byServer, err := scrapeOverviewMetrics(metricsURL)
+	return byServer, err
+}
+
+// scrapeOverviewMetrics 抓取一次 /metrics 并产出两个维度视图（host 与
+// host+server）：两个消费端点共享同一份 5s 缓存与单飞，不对 Caddy 放大抓取。
+func scrapeOverviewMetrics(metricsURL string) ([]RateLimitHostBlocks, []RateLimitHostServerBlocks, error) {
 	overviewMetricsCache.Lock()
 	if entry, ok := overviewMetricsCache.entries[metricsURL]; ok && time.Now().Before(entry.expiresAt) {
 		blocks := cloneRateLimitBlocks(entry.blocks)
+		byServer := cloneRateLimitHostServerBlocks(entry.hostServer)
 		overviewMetricsCache.Unlock()
-		return blocks, nil
+		return blocks, byServer, nil
 	}
 	if call, ok := overviewMetricsCache.inflight[metricsURL]; ok {
 		overviewMetricsCache.Unlock()
 		<-call.done
 		if call.err != nil {
-			return nil, call.err
+			return nil, nil, call.err
 		}
-		return cloneRateLimitBlocks(call.blocks), nil
+		return cloneRateLimitBlocks(call.blocks), cloneRateLimitHostServerBlocks(call.hostServer), nil
 	}
 	if overviewMetricsCache.inflight == nil {
 		overviewMetricsCache.inflight = map[string]*overviewMetricsCall{}
@@ -94,26 +115,27 @@ func ScrapeRateLimitBlocks(metricsURL string) ([]RateLimitHostBlocks, error) {
 		}
 	}()
 
-	blocks, err := scrapeRateLimitBlocksUncached(metricsURL)
+	blocks, byServer, err := scrapeRateLimitBlocksUncached(metricsURL)
 
 	overviewMetricsCache.Lock()
-	call.blocks, call.err = blocks, err
+	call.blocks, call.hostServer, call.err = blocks, byServer, err
 	delete(overviewMetricsCache.inflight, metricsURL)
 	if err == nil {
 		if overviewMetricsCache.entries == nil {
 			overviewMetricsCache.entries = map[string]overviewMetricsCacheEntry{}
 		}
 		overviewMetricsCache.entries[metricsURL] = overviewMetricsCacheEntry{
-			blocks:    blocks,
-			expiresAt: time.Now().Add(overviewMetricsCacheTTL),
+			blocks:     blocks,
+			hostServer: byServer,
+			expiresAt:  time.Now().Add(overviewMetricsCacheTTL),
 		}
 	}
 	overviewMetricsCache.Unlock()
 	close(call.done)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return cloneRateLimitBlocks(blocks), nil
+	return cloneRateLimitBlocks(blocks), cloneRateLimitHostServerBlocks(byServer), nil
 }
 
 // cloneRateLimitBlocks 复制并按非 nil 空切片返回：JSON 序列化空结果为 []，
@@ -124,10 +146,32 @@ func cloneRateLimitBlocks(src []RateLimitHostBlocks) []RateLimitHostBlocks {
 	return out
 }
 
+// cloneRateLimitHostServerBlocks 同 cloneRateLimitBlocks（host+server 视图）。
+func cloneRateLimitHostServerBlocks(src []RateLimitHostServerBlocks) []RateLimitHostServerBlocks {
+	out := make([]RateLimitHostServerBlocks, len(src))
+	copy(out, src)
+	return out
+}
+
 // RateLimitHostBlocks 单个站点的限流拦截累计次数。
 type RateLimitHostBlocks struct {
 	Host  string  `json:"host"`
 	Count float64 `json:"count"`
+}
+
+// RateLimitHostServerBlocks 单站点单监听端口的限流拦截累计次数。
+// Server 是 Caddy 的 server 分组名（本系统恒为 http_<listen_port>）：同域名
+// 多端口部署下按 host 求和会把各端口计数累加到每条规则上。
+type RateLimitHostServerBlocks struct {
+	Host   string  `json:"host"`
+	Server string  `json:"server"`
+	Count  float64 `json:"count"`
+}
+
+// rateLimitHostServerKey 是解析期的聚合键（未导出的中间形态）。
+type rateLimitHostServerKey struct {
+	host   string
+	server string
 }
 
 // overviewMetricsReadLimit 是 Caddy /metrics 响应体的读取上限：指标基数异常膨胀
@@ -135,28 +179,33 @@ type RateLimitHostBlocks struct {
 const overviewMetricsReadLimit = int64(16 << 20)
 
 // scrapeRateLimitBlocksUncached 抓取 Caddy admin /metrics 并按站点聚合 429 限流
-// 拦截计数（缓存/单飞外壳见 ScrapeRateLimitBlocks）。计数自最近一次 Caddy 配置
+// 拦截计数（缓存/单飞外壳见 scrapeOverviewMetrics）。计数自最近一次 Caddy 配置
 // 重载以来累计（/load 重建 registry 即归零；进程重启同），非按天口径。任何
 // 抓取/解析失败都返回 error，由调用方决定降级策略，绝不静默返回空列表。
-func scrapeRateLimitBlocksUncached(metricsURL string) ([]RateLimitHostBlocks, error) {
+// 同一份响应解析出 host 与 host+server 两个视图（两个消费端点各取所需）。
+func scrapeRateLimitBlocksUncached(metricsURL string) ([]RateLimitHostBlocks, []RateLimitHostServerBlocks, error) {
 	resp, err := overviewMetricsHTTPClient.Get(metricsURL)
 	if err != nil {
-		return nil, fmt.Errorf("采集 Caddy 限流指标失败: %w", err)
+		return nil, nil, fmt.Errorf("采集 Caddy 限流指标失败: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("Caddy 指标接口返回状态码 %d", resp.StatusCode)
+		return nil, nil, fmt.Errorf("Caddy 指标接口返回状态码 %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, overviewMetricsReadLimit+1))
 	if err != nil {
-		return nil, fmt.Errorf("读取 Caddy 指标响应失败: %w", err)
+		return nil, nil, fmt.Errorf("读取 Caddy 指标响应失败: %w", err)
 	}
 	if int64(len(body)) > overviewMetricsReadLimit {
-		return nil, fmt.Errorf("Caddy 指标响应超过 %d 字节上限", overviewMetricsReadLimit)
+		return nil, nil, fmt.Errorf("Caddy 指标响应超过 %d 字节上限", overviewMetricsReadLimit)
 	}
-	counts := parseRateLimit429Counts(string(body))
-	blocks := make([]RateLimitHostBlocks, 0, len(counts))
-	for host, count := range counts {
+	byServer := parseRateLimit429CountsByServer(string(body))
+	hostCounts := map[string]float64{}
+	for key, count := range byServer {
+		hostCounts[key.host] += count
+	}
+	blocks := make([]RateLimitHostBlocks, 0, len(hostCounts))
+	for host, count := range hostCounts {
 		blocks = append(blocks, RateLimitHostBlocks{Host: host, Count: count})
 	}
 	sort.Slice(blocks, func(i, j int) bool {
@@ -165,14 +214,28 @@ func scrapeRateLimitBlocksUncached(metricsURL string) ([]RateLimitHostBlocks, er
 		}
 		return blocks[i].Host < blocks[j].Host
 	})
-	return blocks, nil
+	serverBlocks := make([]RateLimitHostServerBlocks, 0, len(byServer))
+	for key, count := range byServer {
+		serverBlocks = append(serverBlocks, RateLimitHostServerBlocks{Host: key.host, Server: key.server, Count: count})
+	}
+	sort.Slice(serverBlocks, func(i, j int) bool {
+		if serverBlocks[i].Count != serverBlocks[j].Count {
+			return serverBlocks[i].Count > serverBlocks[j].Count
+		}
+		if serverBlocks[i].Host != serverBlocks[j].Host {
+			return serverBlocks[i].Host < serverBlocks[j].Host
+		}
+		return serverBlocks[i].Server < serverBlocks[j].Server
+	})
+	return blocks, serverBlocks, nil
 }
 
 // parseRateLimit429Counts 从 Prometheus 文本中挑出
 // caddy_http_request_duration_seconds_count{code="429",host=...} 序列并按 host
-// 累加（同一 host 的不同 method/server 序列求和）。口径：仅按 code=429 过滤、
-// 含上游自返 429，handler 标签恒不命中（见下方内联注释）；抓取失败由调用方
-// 返回 500。
+// 累加（同一 host 的不同 method/server 序列求和）——站点级卡片的口径。
+// 单规则流程抽屉需要端口维度，见 parseRateLimit429CountsByServer。
+// 口径：仅按 code=429 过滤、含上游自返 429，handler 标签恒不命中（见下方内联
+// 注释）；抓取失败由调用方返回 500。
 // 注释行、其他指标、_bucket/_sum 序列、缺 host 标签或数值非法的行一律跳过。
 // NormalizeMetricsHost 统一 host 标签归一：Caddy metrics 的 host
 // 标签是原文 r.Host（可能含 :8080 / [::1]:8443），而 lb_rules.domain 不带端口
@@ -187,8 +250,12 @@ func NormalizeMetricsHost(host string) string {
 	return h
 }
 
-func parseRateLimit429Counts(body string) map[string]float64 {
-	counts := map[string]float64{}
+// parseRateLimit429CountsByServer 按 (host, server) 聚合：server 是 Caddy 的
+// 监听端口分组名（本系统恒为 http_<listen_port>），同域多端口部署下必须与
+// host 一起作为键——只按 host 求和会让每条规则的限流 chip 拿到同域全部端口
+// 的合计（各自被放大）。
+func parseRateLimit429CountsByServer(body string) map[rateLimitHostServerKey]float64 {
+	counts := map[rateLimitHostServerKey]float64{}
 	for line := range strings.Lines(body) {
 		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(line, rateLimit429CountMetric) {
@@ -219,7 +286,17 @@ func parseRateLimit429Counts(body string) map[string]float64 {
 		if err != nil {
 			continue
 		}
-		counts[host] += value
+		counts[rateLimitHostServerKey{host: host, server: labels["server"]}] += value
+	}
+	return counts
+}
+
+// parseRateLimit429Counts 是站点级视图（host 求和），复用 host+server 解析器保证
+// 两个口径同源（过滤规则、归一、数值解析只有一份实现）。
+func parseRateLimit429Counts(body string) map[string]float64 {
+	counts := map[string]float64{}
+	for key, value := range parseRateLimit429CountsByServer(body) {
+		counts[key.host] += value
 	}
 	return counts
 }

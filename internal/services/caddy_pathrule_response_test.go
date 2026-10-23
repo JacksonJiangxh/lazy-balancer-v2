@@ -113,6 +113,11 @@ func TestPathRuleRoute_staticModeEmitsStaticResponse(t *testing.T) {
 	if len(handle) != 2 {
 		t.Fatalf("static route must be [lb_rule_metrics, static_response], got %d handlers", len(handle))
 	}
+	// terminal=true 是正确性前提：缺省时 static 响应会 fallthrough 到主路由，
+	// 造成重复 WriteHeader/响应头污染。生产渲染必须显式置位。
+	if terminal, ok := route["terminal"].(bool); !ok || !terminal {
+		t.Fatalf("static route must be terminal: %#v", route["terminal"])
+	}
 }
 
 // Given: redirect 模式路径规则
@@ -144,6 +149,10 @@ func TestPathRuleRoute_redirectModeEmits301Location(t *testing.T) {
 	}
 	if _, hasBody := h["body"]; hasBody && h["body"] != "" {
 		t.Fatalf("redirect must not carry body, got %#v", h["body"])
+	}
+	// 同上：redirect 路由必须 terminal，否则 301 之后继续走主路由。
+	if terminal, ok := route["terminal"].(bool); !ok || !terminal {
+		t.Fatalf("redirect route must be terminal: %#v", route["terminal"])
 	}
 }
 

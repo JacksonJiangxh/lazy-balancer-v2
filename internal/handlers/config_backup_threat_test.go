@@ -17,7 +17,9 @@ import (
 
 // 威胁情报库备份接入（v2.3.x）：security_threat_sources 随「安全防护」节
 // 导出；导入拒绝伪造源（name 不在三源种子集合内 → 400，防伪造 URL 源）；
-// 开关值经导入往返保持。威胁文件本体不进备份（还原后由更新任务补齐）。
+// 开关值经导入往返保持。威胁名单原文自 v2.3.4 起恒随 lbbak 导出与还原
+// （条目名见 config_backup_lbbak.go 的 lbbakEntryThreatPrefix，锁内快照后随包）；
+// 仅纯 JSON 旧格式走「保留本地、由更新任务补齐」的告警通道。
 func TestConfigBackup_threatSourcesExportAndRoundtrip(t *testing.T) {
 	// Given
 	h := newBackupTestHandlers(t)
@@ -141,4 +143,62 @@ func TestThreatReconcileDistinguishesAbsenceReasons(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(wafDir, "threat-gptbot.iplist")); !os.IsNotExist(err) {
 		t.Fatalf("未成功下载源的本地文件同样按记录清空（DB 与执行面一致）")
 	}
+}
+
+// 生产导出路径的威胁名单证据（不经测试专用组包捷径）：真实 seed 三源
+// .iplist(.fast) → GET /config/export → parseLbbak 必须携带 threat/*.iplist
+// 条目、内容一致且无未登记条目。此前导出侧无任何此类断言——若
+// BuildWafFileBundleInLockChecked 不再返回 ThreatFiles，恢复侧会按「备份未
+// 携带该源」删除本地名单，运行态静默少拦。
+func TestConfigBackup_exportShipsThreatIplistEntries(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	wafDir := t.TempDir()
+	restore := services.OverrideThreatWafDirForTest(wafDir)
+	defer restore()
+
+	sources := map[string]string{
+		// 编译 .fast 时裸 IP 规范化为 /32（导出原文取自编译产物），期望值
+		// 必须同口径。
+		"ustc":           "192.0.2.0/24\n198.51.100.7/32\n",
+		"firehol_l1":     "203.0.113.0/24\n",
+		"et_compromised": "198.18.0.0/15\n",
+	}
+	for source, content := range sources {
+		path := filepath.Join(wafDir, "threat-"+source+".iplist")
+		if err := services.WriteThreatIplistCompiled(path, []byte(content)); err != nil {
+			t.Fatalf("seed threat source %s: %v", source, err)
+		}
+	}
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/config/export", h.ExportConfigBackup)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/config/export?sections=security", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("export status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	payload, err := parseLbbak(rec.Body.Bytes())
+	if err != nil {
+		t.Fatalf("parse lbbak: %v", err)
+	}
+	if len(payload.ThreatIplists) != len(sources) {
+		t.Fatalf("导出威胁条目=%v, want 三源", payload.ThreatIplists)
+	}
+	for source, want := range sources {
+		got, ok := payload.ThreatIplists[source]
+		if !ok {
+			t.Fatalf("导出包缺少 threat/%s.iplist（源=%s）", source, source)
+		}
+		if normalizeIplistText(string(got)) != normalizeIplistText(want) {
+			t.Fatalf("threat/%s.iplist 内容=%q, want %q", source, got, want)
+		}
+	}
+	if len(payload.UnregisteredThreatEntries) != 0 {
+		t.Fatalf("导出不得产生未登记威胁条目: %v", payload.UnregisteredThreatEntries)
+	}
+}
+
+func normalizeIplistText(s string) string {
+	return strings.Join(strings.Fields(s), "\n")
 }

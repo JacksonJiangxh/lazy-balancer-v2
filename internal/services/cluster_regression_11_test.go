@@ -2,11 +2,7 @@ package services
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -18,83 +14,9 @@ import (
 	"lazy-balancer-v2/internal/models"
 )
 
-func readSnapshotAsV2(response *http.Response, token string) error {
-	defer response.Body.Close()
-	var envelope struct {
-		Data snapshotV2Fixture `json:"data"`
-	}
-	if err := json.NewDecoder(response.Body).Decode(&envelope); err != nil {
-		return fmt.Errorf("解析 v2 快照响应: %w", err)
-	}
-	snapshot := envelope.Data
-	if snapshot.MinReaderVersion > snapshotSchemaV2 {
-		return fmt.Errorf("要求 schema v%d，当前支持 v%d", snapshot.MinReaderVersion, snapshotSchemaV2)
-	}
-	mac := hmac.New(sha256.New, []byte(token))
-	_, _ = mac.Write(snapshot.CanonicalPayload)
-	expected := hex.EncodeToString(mac.Sum(nil))
-	if !hmac.Equal([]byte(expected), []byte(snapshot.Signature)) {
-		return fmt.Errorf("v2 快照签名校验失败")
-	}
-	return nil
-}
-
-func TestSnapshotV2ReaderFixture_verifiesOriginalCanonicalBytes(t *testing.T) {
-	// Given
-	const token = "cluster-token"
-	snapshot := signedSnapshotV2Fixture(1, token)
-	snapshot.CanonicalPayload = json.RawMessage(`{"certs":[],"basic_settings":{},"api_keys":[],"users":[],"rules":[],"fingerprint":"","version":1,"schema_version":2,"min_reader_version":2}`)
-	hash := sha256.Sum256(snapshot.CanonicalPayload)
-	snapshot.Fingerprint = hex.EncodeToString(hash[:])
-	mac := hmac.New(sha256.New, []byte(token))
-	_, _ = mac.Write(snapshot.CanonicalPayload)
-	snapshot.Signature = hex.EncodeToString(mac.Sum(nil))
-	master := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(response).Encode(map[string]any{"data": snapshot})
-	}))
-	defer master.Close()
-
-	// When
-	response, err := master.Client().Get(master.URL + "/api/v1/cluster/sync/snapshot")
-	if err != nil {
-		t.Fatal(err)
-	}
-	readErr := readSnapshotAsV2(response, token)
-
-	// Then
-	if readErr != nil {
-		t.Fatalf("v2 reader rejected raw signed canonical payload: %v", readErr)
-	}
-}
-
-func TestSnapshotV2ReaderFixture_rejectsCurrentV3PublisherResponse(t *testing.T) {
-	// Given
-	const token = "cluster-token"
-	publisher, _ := newClusterTestService(t)
-	master := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		snapshot, _, err := publisher.Snapshot(request.Context(), 0, "", token)
-		if err != nil {
-			t.Errorf("publish snapshot: %v", err)
-			response.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		_ = json.NewEncoder(response).Encode(models.APIResponse{Code: 0, Data: snapshot})
-	}))
-	defer master.Close()
-
-	// When
-	response, err := master.Client().Get(master.URL + "/api/v1/cluster/sync/snapshot")
-	if err != nil {
-		t.Fatal(err)
-	}
-	readErr := readSnapshotAsV2(response, token)
-
-	// Then
-	if readErr == nil || !strings.Contains(readErr.Error(), "要求 schema v3，当前支持 v2") {
-		t.Fatalf("v2 reader error=%v", readErr)
-	}
-}
-
+// v2 快照读取器的独立夹具（快照结构 + 签发）在 testhelpers_shared_test.go，
+// 仅用于构造「主节点仍是 schema v2」的历史形态；其自身正确性不由产品测试
+// 负责——本文件只断言产品代码对 v2 载荷的行为。
 func TestSyncService_Pull_rejectsValidV2PublisherFixture(t *testing.T) {
 	// Given
 	const token = "cluster-token"

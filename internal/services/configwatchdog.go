@@ -63,6 +63,31 @@ func CurrentConfigDrift() ConfigDriftStatus {
 	return status
 }
 
+// configDriftSnapshot 单轮比对前的漂移状态快照（取消轮回滚用）。
+type configDriftSnapshot struct {
+	status ConfigDriftStatus
+	streak int
+}
+
+// snapshotConfigDrift 拷贝当前漂移状态与防抖计数（取消轮回滚基线）。
+func snapshotConfigDrift() configDriftSnapshot {
+	configDriftMu.RLock()
+	defer configDriftMu.RUnlock()
+	status := configDriftStatus
+	status.Missing = append([]string(nil), configDriftStatus.Missing...)
+	status.Extra = append([]string(nil), configDriftStatus.Extra...)
+	return configDriftSnapshot{status: status, streak: configDriftStreak}
+}
+
+// restoreConfigDriftSnapshot 把漂移状态回滚到本轮之前——降级/停机取消的在途
+// 轮不得把检查内部的状态转移（streak++/确认漂移）留在进程里。
+func restoreConfigDriftSnapshot(snapshot configDriftSnapshot) {
+	configDriftMu.Lock()
+	configDriftStatus = snapshot.status
+	configDriftStreak = snapshot.streak
+	configDriftMu.Unlock()
+}
+
 // 配置一致性看门狗：主节点每 60s 比对「应渲染规则」与 Caddy 运行配置：不一致时
 // 经系统日志 + 操作日志 + GetCaddyStatus（前端全局横幅）三通道告知，连续两轮不一致
 // 才置状态（防配置应用窗口的瞬时误报）。从节点不运行——同步链路已有 drift 检测与
@@ -100,6 +125,12 @@ func WatchdogCheckOnce(ctx context.Context) (runErr error) {
 	}
 	isMaster, roleErr := RoleOf(roleCtx, db.DB)
 	if roleErr != nil {
+		// 降级/停机取消（BecomeSlave 的 SetRole(false) 取消在途轮）：取消不是
+		// 角色读取失败——零簿记、零任务日志，与比对出口复核同口径，避免
+		// 每次角色切换都留一条伪失败 task_run 与「角色读取已恢复」噪音。
+		if ctx != nil && ctx.Err() != nil {
+			return roleErr
+		}
 		// 看门狗角色读失败留痕：角色读失败=本轮未判定——计入跳过轮簿记（不宣称一致、
 		// 不发假心跳，与下方 !checked 跳轮同口径），留痕并以错误返回，
 		// 让 task_runs/任务监控可见（此前 return nil → 恒 success 掩盖 DB 异常）。
@@ -129,10 +160,15 @@ func WatchdogCheckOnce(ctx context.Context) (runErr error) {
 			runErr = fmt.Errorf("配置一致性检查 panic: %v", r)
 		}
 	}()
+	driftSnapshot := snapshotConfigDrift()
 	checked, checkErr := checkConfigConsistency(watchdogAdminURLValue)
 	// 比对出口复核：比对窗口期内降级/停机的在途轮不得落写簿记（防覆写
-	// 复位态——入口复核只覆盖轮次开始前已取消的形态）。
+	// 复位态——入口复核只覆盖轮次开始前已取消的形态）。checkConfigConsistency
+	// 内部会更新漂移状态（含防抖 streak 与确认转移），因此这里还必须把状态
+	// 回滚到本轮之前：只跳过后续簿记不足以阻止「取消轮把 streak 推过防抖门
+	// 从而确认漂移」。
 	if ctx != nil && ctx.Err() != nil {
+		restoreConfigDriftSnapshot(driftSnapshot)
 		return ctx.Err()
 	}
 	// 日志收敛（2026-10-03 裁定，「日志只记真实执行」延伸）：一致轮
@@ -393,8 +429,13 @@ func expectedRenderedRules() (map[string]string, error) {
 // 「配置一致」心跳。
 const configWatchdogHeartbeatRounds = 60
 
-// runningRuleRouteIDs 从 Caddy 运行配置收集规则路由 @id（lb_ 前缀），
-// 覆盖 http 与 layer4 两类服务器。
+// runningRuleRouteIDs 从 Caddy 运行配置收集全部顶层路由 @id（http 与 layer4
+// 两类服务器）。**不过滤前缀**：比对口径必须与渲染口径恒等——渲染侧
+// `@id = rule.CaddyID` 无前缀假定，导入门也只要求字母表（[a-z0-9_-]），
+// 非 lb_ 前缀的合法规则（如 web1）同样会出现在运行配置里；在此过滤会让
+// 看门狗把它们永久判为「缺失」并常亮漂移横幅。lb_ 前缀仅保留给
+// RunningConfigHasRuleRoutes/ForeignRunningRuleRoutes 的「疑似本产品路由」
+// 启发式（它们在调用侧自行过滤）。
 // 读取/上限/状态分类统一委托 ReadAdminConfigBody（caddy.go）——
 // 32MB+1 超限探测、非 2xx 显式错误、超限返回 errCaddyAdminConfigTooLarge，
 // 与 GetConfig/getRunningConfigBytes 同源；裸 LimitReader 会让「超限」与
@@ -440,7 +481,7 @@ func runningRuleRouteIDs(adminURL string) (map[string]bool, error) {
 				if !ok {
 					continue
 				}
-				if id, ok := routeObj["@id"].(string); ok && strings.HasPrefix(id, "lb_") {
+				if id, ok := routeObj["@id"].(string); ok && id != "" {
 					ids[id] = true
 				}
 			}
@@ -466,7 +507,15 @@ func RunningConfigHasRuleRoutes(adminURL string) (has bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	return len(ids) > 0, nil
+	// 本守卫只关心「疑似本产品规则路由」：历史数据与误指实例探针均以
+	// lb_ 前缀识别（非 lb_ 的 @id 可能来自其他 Caddy 写入方，不构成
+	// 「本实例曾应用规则」的证据）。
+	for id := range ids {
+		if strings.HasPrefix(id, "lb_") {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // ForeignRunningRuleRoutes 返回运行配置中不被本库规则认领的规则路由 @id
@@ -493,6 +542,13 @@ func ForeignRunningRuleRoutes(adminURL string, ownIDs map[string]bool) (foreign 
 	}
 	claimed := claimedRoutePrefixes(own)
 	for routeID := range running {
+		// 只把 lb_ 前缀 @id 视为「规则路由」（外来实例误指探针的启发式面）：
+		// 非 lb_ 的 @id 既可能是导入的非前缀规则（本库 caddy_id 可合法不带
+		// 前缀），也可能来自其他 Caddy 写入方——两类都不构成外来实例证据，
+		// 在此一律跳过，避免导入合法规则后每次启动都响亮误报。
+		if !strings.HasPrefix(routeID, "lb_") {
+			continue
+		}
 		if !routeClaimedByAny(routeID, claimed) {
 			foreign = append(foreign, routeID)
 		}

@@ -47,6 +47,10 @@ var auditVocabDynamicAllowlist = map[string]map[int][]string{
 	"handlers/caddy.go":                {2: {"UpdateConfig"}},
 	"handlers/cluster_registration.go": {1: {"clusterNodeAction"}},
 	"handlers/config_backup.go":        {1: {"importConfigBackupCore"}},
+	// config_import_coordinator abort：WAF 文件回退失败/说明性告警必须系统身份
+	// 留痕，动作取 actionLabel()+"警告"（取值仅 导入警告/还原警告，均 ≤4 词），
+	// 对象固定「配置备份」。会话上下文不携带用户身份，故在 abort 内直写。
+	"handlers/config_import_coordinator.go": {1: {"abort"}},
 	// applyLbbakWafFilesInLock：动作透传 core 的 action（取值仅 导入/还原——历史
 	// 修复还原路径归因漂移），词汇均在标准动作集内。warn 是同一 action 的
 	// 逐文件失败包装（action+"警告" ∈ 导入警告/还原警告，均 ≤4 词）。

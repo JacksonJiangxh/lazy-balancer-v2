@@ -53,7 +53,7 @@ func TestMFAStepUpGuard_roleReadFailureIsInternalError(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		_ = db.Close()
-		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB)
 	})
 	database := db.DB
 	if _, err := database.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled,mfa_enabled) VALUES (77,'stepup','x','admin',1,1)`); err != nil {

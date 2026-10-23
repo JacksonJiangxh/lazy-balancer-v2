@@ -21,7 +21,7 @@ func TestRegistrationStatus_DemotionDoesNotDeliverUnpersistedToken(t *testing.T)
 	}
 	registration, err := service.RegisterNode(context.Background(), models.ClusterRegisterRequest{
 		Token: registerToken, Name: "slave-race", IPAddress: "10.0.0.31", Port: 8000,
-	}, now)
+	}, "10.0.0.31", now)
 	if err != nil {
 		t.Fatalf("register node: %v", err)
 	}

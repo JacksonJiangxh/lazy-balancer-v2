@@ -7,6 +7,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { isAutobanIneffective } from '../src/utils/autobanStatus.ts'
+import { source } from './_helpers.ts'
 
 test('启用且 ban_effective === false 时展示黄条', () => {
   assert.equal(isAutobanIneffective({ enabled: true, ban_effective: false }), true)
@@ -28,4 +29,15 @@ test('未启用时不提示（黄条仅针对已启用但未生效）', () => {
 
 test('fail-closed 默认：成功响应前 ban_effective 缺省不弹黄条', () => {
   assert.equal(isAutobanIneffective({ enabled: true }), false)
+})
+
+// 消费侧接线：纯函数用例拦不住「黄条绑定被删」——告警静默消失，用户以为封禁在生效。
+test('事件页黄条由该判据派生（绑定与计算属性都在）', () => {
+  const page = source('src/views/security/SecurityEvents.vue')
+  assert.match(
+    page,
+    /const autobanIneffective = computed\(\(\) => isAutobanIneffective\(autobanStatus\.value\)\)/,
+    '黄条判据必须来自共享纯函数',
+  )
+  assert.match(page, /v-if="autobanIneffective"/, '模板必须渲染该判据驱动的提示条')
 })

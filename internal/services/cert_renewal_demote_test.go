@@ -79,4 +79,16 @@ func TestCertRenewalScan_demoteMidLoopLandsSkipped(t *testing.T) {
 	if !strings.Contains(string(data), "从节点") {
 		t.Fatalf("demote 中止必须留痕: %q", string(data))
 	}
+	// 中止点必须落在「第二个任务入队之前」：摘要点名剩余未入队数量，且两行
+	// 都保持 issued（若实现先入队再复核，第一行会被改写为 queued/failed）。
+	if !strings.Contains(string(data), "剩余 1 个任务本轮未入队") {
+		t.Fatalf("中止轮摘要未点明剩余未入队数量: %q", string(data))
+	}
+	var issued int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM cert_jobs WHERE rule_id IN ('lb_demote_skip_a','lb_demote_skip_b') AND status='issued'`).Scan(&issued); err != nil {
+		t.Fatalf("count issued jobs: %v", err)
+	}
+	if issued != 2 {
+		t.Fatalf("issued jobs=%d, want 2（降级中止后两行都不得被入队改写）", issued)
+	}
 }

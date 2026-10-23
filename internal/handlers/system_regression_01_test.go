@@ -399,8 +399,8 @@ func TestFinishTxApplyCommitFailureBranchesRestoreCommittedView(t *testing.T) {
 	if got := strings.Count(body, "recordCaddyApplyResult(nil)"); got != 0 {
 		t.Errorf("finishTxApply 内重复清除 caddy_apply_error %d 处（reloadNote 已覆盖成功/同字节两形态）", got)
 	}
-	if !strings.Contains(body, "reloadNote()") {
-		t.Error("finishTxApply 成功链缺少 reloadNote()（重载审计/横幅清除的唯一收口）")
+	if !strings.Contains(body, "reloadNote.finalize()") {
+		t.Error("finishTxApply 成功链缺少 reloadNote.finalize()（重载审计/横幅清除的唯一收口）")
 	}
 }
 

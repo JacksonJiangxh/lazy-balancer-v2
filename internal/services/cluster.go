@@ -61,24 +61,95 @@ func NewClusterService(database *sql.DB, dataDir string) *ClusterService {
 	return service
 }
 
-// clusterServices 按数据库句柄登记集群服务实例（与 syncDrainers 同模式），
-// 供主节点巡检周期（masterSyncServingRound，无 ClusterService 接收者的自由
-// 函数）触达提升后 pin 清理重试。用 *sql.DB 作键隔离测试实例；
-// 同一库可能登记多个实例（NewSyncService 内部也构造一个 ClusterService），
-// 而 pending pin 状态是实例本地的——因此按库保留全部实例、逐个重试，
-// 不依赖构造顺序决定谁是「当前」实例。
-var (
-	clusterServicesMu sync.Mutex
-	clusterServices   = map[*sql.DB][]*ClusterService{}
-)
+// clusterHandleRegistry 是按数据库句柄登记同类集群实例的通用表：
+// 用 *sql.DB 作键隔离测试实例（每个夹具独立库）；同一库可登记多个实例
+// （逐个处理而不依赖构造顺序）；显式注销优先，残留的死句柄条目由
+// probeClusterDBHandle 在查表路径兜底剔除（库已 Close/连接已丢），探活超时
+// 或瞬时错误只保留条目——误删会让排干面/pin 清理链静默断裂。
+// 集群服务表与同步排干器表结构性相同，共用本实现，避免两份回收逻辑各自
+// 演化（新增回收钩子时只改一处）。
+type clusterHandleRegistry[T comparable] struct {
+	mu   sync.Mutex
+	byDB map[*sql.DB][]T
+}
 
-func registerClusterService(service *ClusterService) {
-	if service == nil || service.db == nil {
+func (r *clusterHandleRegistry[T]) register(database *sql.DB, item T) {
+	if database == nil {
 		return
 	}
-	clusterServicesMu.Lock()
-	clusterServices[service.db] = append(clusterServices[service.db], service)
-	clusterServicesMu.Unlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, existing := range r.byDB[database] {
+		if existing == item {
+			return
+		}
+	}
+	if r.byDB == nil {
+		r.byDB = map[*sql.DB][]T{}
+	}
+	r.byDB[database] = append(r.byDB[database], item)
+}
+
+func (r *clusterHandleRegistry[T]) unregister(database *sql.DB, item T) {
+	if database == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	registered := r.byDB[database]
+	if len(registered) == 0 {
+		return
+	}
+	remaining := registered[:0]
+	for _, candidate := range registered {
+		if candidate != item {
+			remaining = append(remaining, candidate)
+		}
+	}
+	if len(remaining) == 0 {
+		delete(r.byDB, database)
+		return
+	}
+	r.byDB[database] = remaining
+}
+
+// list 返回该库登记的全部实例。Ping 在锁外执行：死/卡句柄的探活最长 1s，
+// 持锁等待会阻塞全部查表与角色翻转排干。锁内只拷贝列表，锁外探活，回锁再删。
+func (r *clusterHandleRegistry[T]) list(database *sql.DB) []T {
+	if database == nil {
+		return nil
+	}
+	r.mu.Lock()
+	registered := r.byDB[database]
+	items := make([]T, 0, len(registered))
+	items = append(items, registered...)
+	if len(items) == 0 {
+		delete(r.byDB, database)
+		r.mu.Unlock()
+		return nil
+	}
+	r.mu.Unlock()
+	if probeClusterDBHandle(database) == clusterHandleClosed {
+		r.mu.Lock()
+		delete(r.byDB, database)
+		r.mu.Unlock()
+		resetClusterHandleStrikes(database)
+		return nil
+	}
+	return items
+}
+
+// clusterServices 按数据库句柄登记集群服务实例，供主节点巡检周期
+// （masterSyncServingRound，无 ClusterService 接收者的自由函数）触达提升后
+// pin 清理重试。pending pin 状态是实例本地的，因此按库保留全部实例、逐个
+// 重试，不依赖构造顺序决定谁是「当前」实例。
+var clusterServiceRegistry = clusterHandleRegistry[*ClusterService]{}
+
+func registerClusterService(service *ClusterService) {
+	if service == nil {
+		return
+	}
+	clusterServiceRegistry.register(service.db, service)
 }
 
 // unregisterClusterService 移除单个实例：全局表以 *sql.DB 为键
@@ -88,19 +159,7 @@ func unregisterClusterService(service *ClusterService) {
 	if service == nil || service.db == nil {
 		return
 	}
-	clusterServicesMu.Lock()
-	remaining := clusterServices[service.db][:0]
-	for _, candidate := range clusterServices[service.db] {
-		if candidate != service {
-			remaining = append(remaining, candidate)
-		}
-	}
-	if len(remaining) == 0 {
-		delete(clusterServices, service.db)
-	} else {
-		clusterServices[service.db] = remaining
-	}
-	clusterServicesMu.Unlock()
+	clusterServiceRegistry.unregister(service.db, service)
 	// 句柄已由调用方显式注销：探活计数一并丢弃（避免全局表残留已 Close 句柄键）。
 	resetClusterHandleStrikes(service.db)
 	// 同族句柄回收：三节哈希缓存以库句柄为键，注销即释放（防全局缓存强引用
@@ -180,36 +239,10 @@ func probeClusterDBHandle(database *sql.DB) clusterHandleState {
 }
 
 func clusterServicesFor(database *sql.DB) []*ClusterService {
-	if database == nil {
-		return nil
-	}
-	// Ping 在锁外执行（与 pruneDeadClusterSectionHashCacheEntries 同范式）：
-	// 死/卡句柄的 Ping 最长 1s，持锁等待会阻塞全部查表与 Promote/BecomeSlave
-	// 排干。锁内只拷贝列表，锁外探活，回锁再删。
-	clusterServicesMu.Lock()
-	registered := clusterServices[database]
-	services := make([]*ClusterService, 0, len(registered))
-	for _, service := range registered {
-		if service != nil {
-			services = append(services, service)
-		}
-	}
-	if len(services) == 0 {
-		delete(clusterServices, database)
-		clusterServicesMu.Unlock()
-		return nil
-	}
-	clusterServicesMu.Unlock()
-	// 只在确定性关闭时剔除；探活超时/瞬时错误保留登记项（见 probeClusterDBHandle），
-	// 否则 Promote/BecomeSlave 的排干面与 pin 清理重试链会在一次停顿后静默断裂。
-	if probeClusterDBHandle(database) == clusterHandleClosed {
-		clusterServicesMu.Lock()
-		delete(clusterServices, database)
-		clusterServicesMu.Unlock()
-		resetClusterHandleStrikes(database)
-		return nil
-	}
-	return services
+	// 只在确定性关闭时剔除；探活超时/瞬时错误保留登记项（见
+	// probeClusterDBHandle），否则 Promote/BecomeSlave 的排干面与 pin 清理重试链
+	// 会在一次停顿后静默断裂（语义单源于 clusterHandleRegistry.list）。
+	return clusterServiceRegistry.list(database)
 }
 
 func randomHex(byteCount int) (string, error) {
@@ -230,6 +263,12 @@ func tokenHash(token string) string {
 // 提交 is_master=0——带该条件的写语句在降级后恒 0 行，消除「降级后仍审批/
 // 上报/改访问地址」的 TOCTOU 类别。
 const masterRoleConditionSQL = `(SELECT COALESCE(is_master,1) FROM global_config WHERE id=1)=1`
+
+// slaveRoleConditionSQL 是 masterRoleConditionSQL 的逆谓词：从端专有状态
+// （同步错误、补偿标记）只能在从节点语境落库。升主会清空这些列，若在途的
+// 从端写（persistSyncError 走 WithoutCancel 以跨 Stop 取消存活）不带该条件，
+// 升主提交后会被旧从端写回，而全仓没有第二处清空点（只剩降级/导入）。
+const slaveRoleConditionSQL = `(SELECT COALESCE(is_master,1) FROM global_config WHERE id=1)=0`
 
 // masterScopeMissError 在带 SQL 角色条件的读写命中 0 行后复核角色：
 // 已降级统一返回 403 哨兵；主节点下的 0 行由调用方提供 NotFound/内部错误语义。
@@ -301,7 +340,10 @@ func (s *ClusterService) GenerateRegisterToken(ctx context.Context, createdBy in
 	return token, expiresAt, nil
 }
 
-func (s *ClusterService) RegisterNode(ctx context.Context, req models.ClusterRegisterRequest, now time.Time) (models.ClusterRegistration, error) {
+// RegisterNode 处理从节点注册。sourceIP 是服务端观测到的注册来源地址
+// （HTTP 入口=连接对端地址），自述 access_url 只在主机与其一致时落库——
+// 请求体 ip_address 是自述值，不得充当该判定的信任锚。
+func (s *ClusterService) RegisterNode(ctx context.Context, req models.ClusterRegisterRequest, sourceIP string, now time.Time) (models.ClusterRegistration, error) {
 	if err := models.ValidateClusterAccessURL(req.AccessURL); err != nil {
 		return models.ClusterRegistration{}, err
 	}
@@ -311,14 +353,14 @@ func (s *ClusterService) RegisterNode(ctx context.Context, req models.ClusterReg
 	if req.Name == "" {
 		return models.ClusterRegistration{}, models.ErrInvalidClusterNodeName
 	}
-	// 自述 access_url 只在主机即注册来源 IP 时落库。该值随后被用作
+	// 自述 access_url 只在主机即**注册来源地址**时落库。该值随后被用作
 	// 服务控制/登录票据（Bearer 能力凭证）的投递地址——未校验时持有注册令牌
 	// 的一方可把票据引向任意第三方主机。不一致时按「未携带」处理：既有行的
 	// 管理员配置值由 COALESCE(NULLIF(?,''),access_url) 保留，新行留空回退
 	// protocol://ip:port。
 	accessURL := req.AccessURL
 	accessURLIgnored := false
-	if accessURL != "" && !models.ClusterAccessURLHostMatchesIP(accessURL, req.IPAddress) {
+	if accessURL != "" && !models.ClusterAccessURLHostMatchesIP(accessURL, sourceIP) {
 		accessURL = ""
 		accessURLIgnored = true
 	}

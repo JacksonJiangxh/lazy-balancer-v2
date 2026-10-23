@@ -202,6 +202,17 @@ func TestImportConfigBackup_rulesOnlyBackupDefaultSectionsLiveDanglingRejected(t
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d body=%s, want 400（默认全选不降级）", response.Code, response.Body.String())
 	}
+	// 点名来源：只断 400 会让其它门（如端口/引用形状）的回归同样通过。
+	if body := response.Body.String(); !strings.Contains(body, "DNS 提供商配置不存在或已禁用") {
+		t.Fatalf("body=%s, want 点名 DNS 提供商引用悬挂", body)
+	}
+	var rules int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM lb_rules WHERE caddy_id='lb_bak_acme'`).Scan(&rules); err != nil {
+		t.Fatal(err)
+	}
+	if rules != 0 {
+		t.Fatalf("被拒绝的导入不得落库规则行, count=%d", rules)
+	}
 }
 
 // 形状⑥a:预览与导入同序——未选分类的坏行不得误报不可导入。

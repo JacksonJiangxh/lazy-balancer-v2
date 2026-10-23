@@ -143,7 +143,10 @@ func Test_parseCountryCode_returns_alpha2_from_fifth_field(t *testing.T) {
 }
 
 func Test_Lookup_returns_empty_without_loaded_database(t *testing.T) {
-	// Given the singleton never loaded (paths point at nonexistent files)
+	// Given the singleton is explicitly reset and the paths point at nonexistent
+	// files（不依赖前序用例的清理——单跑/-shuffle 下断言对象同样成立）
+	dir := t.TempDir()
+	withIP2RegionPaths(t, filepath.Join(dir, "missing.xdb"), filepath.Join(dir, "missing-dist.xdb"))
 
 	// When / Then
 	if got := Lookup("1.2.3.4"); got != "" {
@@ -357,8 +360,9 @@ func Test_GetSetIP2RegionVersion_roundtrip(t *testing.T) {
 // GetIP2RegionRegionTree 按 xdb stat 键记忆化——稳态调用返回
 // 同一树（免 ~220ms 全量扫描），stat 键变化（带外替换/触摸）触发重扫。
 func Test_GetIP2RegionRegionTree_memoizes_until_xdb_stat_changes(t *testing.T) {
-	// Given：双段 fixture xdb（单段会使 header Start/End 指针相等、树扫描
-	// 判空返回 nil），记忆化状态清零（隔离前序测试）
+	// Given：双段 fixture xdb（树扫描判空只认 maxPtr < minPtr，单段
+	// Start==End 会正常迭代一次并产出有效树——这里用双段只为额外覆盖多段
+	// 拼接），记忆化状态清零（隔离前序测试）
 	dir := t.TempDir()
 	live := filepath.Join(dir, "ip2region.xdb")
 	writeTestXDB(t, live, []xdbSegment{
@@ -462,20 +466,15 @@ func TestGetIP2RegionEntryCount_readsHeaderBounds(t *testing.T) {
 // INFO「已重建」成功行（日志谎报）。修复后失败写 WARN「重建落盘失败」且
 // 无 INFO 成功行；writeProvincesCache 错误沿返回值上抛给调用点留痕。
 func TestWriteRegionTreeCache_writeFailureLogsWarn(t *testing.T) {
-	// Given：只读目录中的 live 路径——树缓存落盘必失败
+	// Given：live 路径的父级是一个普通文件——原子落盘的 CreateTemp 返回
+	// ENOTDIR，失败与运行用户/文件系统权限无关（容器内 root 下 chmod 0555
+	// 仍可写，权限注入不可移植）。
 	dir := t.TempDir()
-	roDir := filepath.Join(dir, "ro")
-	if err := os.MkdirAll(roDir, 0o755); err != nil {
+	notADir := filepath.Join(dir, "not-a-dir")
+	if err := os.WriteFile(notADir, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	live := filepath.Join(roDir, "ip2region.xdb")
-	if err := os.WriteFile(live, []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(roDir, 0o555); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.Chmod(roDir, 0o755) })
+	live := filepath.Join(notADir, "ip2region.xdb")
 	old := ip2regionLivePath
 	ip2regionLivePath = live
 	t.Cleanup(func() { ip2regionLivePath = old })
@@ -501,6 +500,10 @@ func TestWriteRegionTreeCache_writeFailureLogsWarn(t *testing.T) {
 	}
 	if strings.Contains(appLog.String(), "地域树缓存已重建") {
 		t.Fatalf("落盘失败不得写成功行（谎报）: %s", appLog.String())
+	}
+	// And：省份缓存写失败沿返回值上抛给调用点（writeProvincesCache 不再吞错）。
+	if err := writeProvincesCache(ip2regionLivePath+".provinces.json", []byte("[]")); err == nil {
+		t.Fatal("writeProvincesCache 必须返回落盘错误（调用点据此留痕）")
 	}
 }
 

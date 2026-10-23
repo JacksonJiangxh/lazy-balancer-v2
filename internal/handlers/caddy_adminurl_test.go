@@ -54,6 +54,26 @@ func TestGetCaddyConfig_dialsConfiguredAdminURL(t *testing.T) {
 	}
 }
 
+// admin 不可达的端点契约：GetCaddyConfig 与 GetRuleCaddyConfig/GetUpstreamHealth
+// 同口径返回 502（网关/上游不可达），500 留给「读到的字节解析失败/超限」。
+// 同一故障两套状态语义会让按 502 判定上游不可达的重试/熔断策略失效。
+func TestGetCaddyConfig_unreachableAdminReturnsBadGateway(t *testing.T) {
+	h := &Handlers{cfg: &config.Config{CaddyAdminURL: "http://127.0.0.1:1"}}
+	router := gin.New()
+	router.Use(func(c *gin.Context) { c.Set("role", "admin"); c.Next() })
+	router.GET("/config", h.GetCaddyConfig)
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/config", nil))
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d body=%s, want 502", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "连接 Caddy 失败") {
+		t.Fatalf("message must name Caddy: %s", rec.Body.String())
+	}
+}
+
 // GetCaddyConfig 的 admin 响应体上限（32MB+1 探测，与 services 家族同口径）：
 // 超限必须报「超过 32MB 上限」的显式读取错误，而非静默截断后误报「解析失败」。
 func TestGetCaddyConfig_oversizeBodyReportedAsLimitNotParseFailure(t *testing.T) {

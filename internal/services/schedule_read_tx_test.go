@@ -12,12 +12,15 @@ import (
 func initScheduleTestDB(t *testing.T) {
 	t.Helper()
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
+	oldCurrent := db.GetDB()
 	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatalf("initialize database: %v", err)
 	}
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		// 后台循环句柄（db.GetDB）同样复位——Close 只置 nil，不还原旧值。
+		db.SetDB(oldCurrent)
 	})
 	isolateMetricsState(t)
 }
@@ -64,6 +67,51 @@ func TestSetVersionTableSchedule_isAtomicOnUpdateFailure(t *testing.T) {
 	}
 	if hhmm != "04:30" {
 		t.Fatalf("schedule_time=%q, want 04:30", hhmm)
+	}
+}
+
+// 自动更新开关的两步写必须事务化（与排程保存同构）：INSERT 成功而 UPDATE
+// 失败会留「行已建、auto_update=1、next_update 空」的中间态——开关显示已开、
+// 任务永不触发，且失败只经一次 handler 响应留痕。
+func TestSetVersionTableAutoUpdate_rollsBackOnUpdateFailure(t *testing.T) {
+	initScheduleTestDB(t)
+	useShanghaiLocation(t)
+	if _, err := db.DB.Exec(`CREATE TRIGGER reject_crs_auto_update BEFORE UPDATE ON security_crs_version
+		BEGIN SELECT RAISE(ABORT, 'boom'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+	if _, err := db.DB.Exec(`DELETE FROM security_crs_version`); err != nil {
+		t.Fatalf("clear version row: %v", err)
+	}
+
+	// When：UPDATE 被触发器拒绝
+	err := SetCRSAutoUpdate(true)
+
+	// Then：报错且初始化行随事务回滚（不得留空 next_update 的中间态）
+	if err == nil {
+		t.Fatal("SetCRSAutoUpdate error=nil, want 触发器拒绝后报错")
+	}
+	var count int
+	if qerr := db.DB.QueryRow("SELECT COUNT(*) FROM security_crs_version").Scan(&count); qerr != nil {
+		t.Fatalf("count rows: %v", qerr)
+	}
+	if count != 0 {
+		t.Fatalf("version rows=%d, want 0（INSERT 必须随事务回滚）", count)
+	}
+
+	// 回归形状：去掉触发器后同一调用成功且槽位已武装。
+	if _, err := db.DB.Exec("DROP TRIGGER reject_crs_auto_update"); err != nil {
+		t.Fatalf("drop trigger: %v", err)
+	}
+	if err := SetCRSAutoUpdate(true); err != nil {
+		t.Fatalf("SetCRSAutoUpdate: %v", err)
+	}
+	var next string
+	if err := db.DB.QueryRow("SELECT COALESCE(next_update,'') FROM security_crs_version WHERE id=1").Scan(&next); err != nil {
+		t.Fatalf("read next_update: %v", err)
+	}
+	if next == "" {
+		t.Fatal("开启自动更新后 next_update 必须已落槽（空槽=任务永不触发）")
 	}
 }
 

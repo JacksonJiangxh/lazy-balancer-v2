@@ -292,9 +292,14 @@ func TestAutoBackupScheduled_execsAndAdvancesLastRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("last_run 非 RFC3339 形态 %q: %v", lastRun, err)
 	}
-	// 最近槽=测试运行当日 03:00（UTC）——只需断言形态与时点结构
-	if got.Hour() != 3 || got.Minute() != 0 {
-		t.Fatalf("last_run=%v, want 当日 03:00 槽", got)
+	// 最近槽=当日 03:00（配置时区）——断言完整日期，写错日期（重复跑/漏跑类
+	// 缺陷）不得被「时点结构正确」掩盖。
+	expectedSlot, ok := autoBackupDueSlot(time.Now(), "daily", "03:00", 1, CurrentLocation())
+	if !ok {
+		t.Fatal("前置：基准槽计算失败")
+	}
+	if !got.Equal(expectedSlot) {
+		t.Fatalf("last_run=%v, want 当日 03:00 槽 %v", got, expectedSlot)
 	}
 }
 
@@ -371,6 +376,14 @@ func TestAutoBackupScheduled_advancesLastRunEvenWhenExecutorFails(t *testing.T) 
 	}
 	if got, _ := time.Parse(time.RFC3339, lastRun); got.IsZero() || got.Hour() != 3 {
 		t.Fatalf("last_run=%s, want 当日 03:00 槽(失败也推进)", lastRun)
+	}
+	// 日期同样必须正确（水位线写错日期会让下一轮重跑或错过整个周期）。
+	expectedSlot, ok := autoBackupDueSlot(time.Now(), "daily", "03:00", 1, CurrentLocation())
+	if !ok {
+		t.Fatal("前置：基准槽计算失败")
+	}
+	if got, _ := time.Parse(time.RFC3339, lastRun); !got.Equal(expectedSlot) {
+		t.Fatalf("last_run=%v, want 当日 03:00 槽 %v", got, expectedSlot)
 	}
 }
 
@@ -534,7 +547,9 @@ func TestAutoBackupEnabled_logsReadFailureOnceAndRecovers(t *testing.T) {
 	t.Cleanup(func() { log.SetOutput(originalWriter) })
 
 	// When：主库查询恒失败 ×2
+	healthy := db.DB
 	swapBrokenDB(t)
+	broken := db.DB
 	if AutoBackupEnabled() {
 		t.Fatal("读失败必须 fail-closed（视为关）")
 	}
@@ -545,11 +560,31 @@ func TestAutoBackupEnabled_logsReadFailureOnceAndRecovers(t *testing.T) {
 	globalTaskAutoUpdateEnabled("threat")
 
 	// Then：每类只首报一次（状态转换口径，30s×2880 行/天的历史形态）
-	if count := strings.Count(logs.String(), "schedule-read-auto-backup-enabled"); count != 1 {
+	if count := strings.Count(logs.String(), "读取任务排程失败（schedule-read-auto-backup-enabled）"); count != 1 {
 		t.Fatalf("auto-backup 开关读失败日志次数=%d, want 1（状态转换去重）: %s", count, logs.String())
 	}
-	if count := strings.Count(logs.String(), "schedule-read-threat-auto-update"); count != 1 {
+	if count := strings.Count(logs.String(), "读取任务排程失败（schedule-read-threat-auto-update）"); count != 1 {
 		t.Fatalf("threat 总闸读失败日志次数=%d, want 1: %s", count, logs.String())
+	}
+
+	// When：库恢复。Then：恢复分支留一条 info，稳定期零噪音。
+	db.DB = healthy
+	AutoBackupEnabled()
+	globalTaskAutoUpdateEnabled("threat")
+	AutoBackupEnabled()
+	globalTaskAutoUpdateEnabled("threat")
+	if count := strings.Count(logs.String(), "读取任务排程已恢复（schedule-read-auto-backup-enabled）"); count != 1 {
+		t.Fatalf("恢复日志次数=%d, want 1: %s", count, logs.String())
+	}
+	if count := strings.Count(logs.String(), "读取任务排程已恢复（schedule-read-threat-auto-update）"); count != 1 {
+		t.Fatalf("threat 恢复日志次数=%d, want 1: %s", count, logs.String())
+	}
+
+	// When：恢复后再次失败。Then：去重状态机复位，必须重新首报一次。
+	db.DB = broken
+	AutoBackupEnabled()
+	if count := strings.Count(logs.String(), "读取任务排程失败（schedule-read-auto-backup-enabled）"); count != 2 {
+		t.Fatalf("再次失败后告警次数=%d, want 2（恢复后必须重新首报）: %s", count, logs.String())
 	}
 }
 
@@ -583,5 +618,50 @@ func TestAutoBackupScheduled_failsWhenWatermarkUpdateFails(t *testing.T) {
 	}
 	if lastRun != nil {
 		t.Fatalf("last_run=%q, want 未推进（UPDATE 失败）", *lastRun)
+	}
+}
+
+// 排程参数非法（本版本不认识的频率、非两位补零的时刻）此前零槽零日志：
+// 任务监控全绿、无失败行、无告警，自动备份永久停摆。必须按状态转换留痕一次
+// （首报 warn、重复不刷屏），恢复合法值后记一条 info。
+func TestNextAutoBackupSlot_invalidScheduleParamsLeaveTrace(t *testing.T) {
+	setupAutoBackupTestDB(t)
+	isolateMetricsState(t)
+	now := time.Date(2026, 9, 22, 15, 0, 0, 0, time.UTC)
+	logs := captureLogf(t)
+
+	// 不认识的频率：零槽 + 首报一次。
+	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_enabled=1, auto_backup_frequency='hourly',
+		auto_backup_time='03:00', auto_backup_last_run=NULL WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	if slot, ok := nextAutoBackupSlot(now); ok {
+		t.Fatalf("非法频率必须零槽（不执行），got %v", slot)
+	}
+	nextAutoBackupSlot(now)
+	if count := strings.Count(logs.String(), "自动备份排程参数非法"); count != 1 {
+		t.Fatalf("非法频率告警次数=%d, want 1（状态转换去重）: %s", count, logs.String())
+	}
+
+	// 非两位补零的时刻同样非法，且不重复刷屏。
+	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_frequency='daily', auto_backup_time='3:00' WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := nextAutoBackupSlot(now); ok {
+		t.Fatal("非两位补零时刻必须零槽")
+	}
+	if count := strings.Count(logs.String(), "自动备份排程参数非法"); count != 1 {
+		t.Fatalf("同类非法参数告警次数=%d, want 1（不得每轮刷屏）: %s", count, logs.String())
+	}
+
+	// 恢复合法值：有槽 + 一条恢复 info。
+	if _, err := db.DB.Exec(`UPDATE global_config SET auto_backup_time='03:00' WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	if slot, ok := nextAutoBackupSlot(now); !ok || slot.IsZero() {
+		t.Fatalf("恢复合法参数后必须有槽，got %v ok=%v", slot, ok)
+	}
+	if count := strings.Count(logs.String(), "自动备份排程参数已恢复合法"); count != 1 {
+		t.Fatalf("恢复日志次数=%d, want 1: %s", count, logs.String())
 	}
 }

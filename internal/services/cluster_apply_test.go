@@ -281,8 +281,17 @@ func TestSyncService_materializeSnapshotDNSOwnership_usesSharedOwnershipLock(t *
 func TestSyncService_applySnapshot_rollsBackWhenDNSOwnershipWriteFails(t *testing.T) {
 	// Given：从端应用快照，但 ownership 目标路径被目录占据，原子替换必败。
 	_, database := newClusterTestService(t)
-	if _, err := database.Exec("UPDATE global_config SET is_master=0, applied_version=0 WHERE id=1"); err != nil {
+	// applied_version 种为非零：只有「已写数据被真正回滚」才可能观察到它不变；
+	// 从 0 起算时「提交前就已中止」同样给出 0，断言不可判别。
+	if _, err := database.Exec("UPDATE global_config SET is_master=0, applied_version=5 WHERE id=1"); err != nil {
 		t.Fatalf("seed slave role: %v", err)
+	}
+	// 种子本地数据：快照事务若未整体回滚，这些行会被快照内容替换。
+	if _, err := database.Exec("INSERT INTO users (id, username, password_hash, role, is_enabled) VALUES (1,'local-only','hash','admin',1)"); err != nil {
+		t.Fatalf("seed local user: %v", err)
+	}
+	if _, err := database.Exec("INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled) VALUES ('lb_local','local','http','local.example.com',80,1)"); err != nil {
+		t.Fatalf("seed local rule: %v", err)
 	}
 	dataDir := t.TempDir()
 	if err := os.Mkdir(filepath.Join(dataDir, "acme_dns_ownership.json"), 0700); err != nil {
@@ -293,13 +302,20 @@ func TestSyncService_applySnapshot_rollsBackWhenDNSOwnershipWriteFails(t *testin
 	}))
 	defer caddyServer.Close()
 	service := NewSyncService(database, &config.Config{DataDir: dataDir, CaddyAdminURL: caddyServer.URL}, NewCaddyService(caddyServer.URL))
-	snapshot := v3SnapshotWithACMESection(models.ClusterSnapshot{Version: 10})
+	snapshot := v3SnapshotWithACMESection(models.ClusterSnapshot{
+		Version: 10,
+		Users:   []models.ClusterUser{{ID: 99, Username: "incoming", PasswordHash: "hash", Role: "admin", IsEnabled: true}},
+		Rules: []models.LbRule{{
+			CaddyID: "lb_incoming", Name: "incoming", Protocol: "http", Domain: "incoming.example.com", ListenPort: 8080, Enabled: true,
+		}},
+		BasicSettings: models.ClusterBasicSettings{LogLevel: new("info"), Timezone: new("Asia/Shanghai")},
+	})
 	snapshot.SectionHashes = ComputeSnapshotSectionHashes(&snapshot)
 
 	// When
 	err := service.applySnapshot(context.Background(), snapshot)
 
-	// Then：错误不得被吞，快照事务整体回滚（applied_version 不前进）。
+	// Then：错误不得被吞，快照事务整体回滚（已写数据保留、版本不前进）。
 	if err == nil || !strings.Contains(err.Error(), "DNS 所有权") {
 		t.Fatalf("apply error=%v, want DNS ownership failure", err)
 	}
@@ -307,8 +323,22 @@ func TestSyncService_applySnapshot_rollsBackWhenDNSOwnershipWriteFails(t *testin
 	if err := database.QueryRow("SELECT COALESCE(applied_version,0) FROM global_config WHERE id=1").Scan(&appliedVersion); err != nil {
 		t.Fatalf("read applied version: %v", err)
 	}
-	if appliedVersion != 0 {
-		t.Fatalf("applied_version=%d, want rollback to 0", appliedVersion)
+	if appliedVersion != 5 {
+		t.Fatalf("applied_version=%d, want 5（回滚后保持原值）", appliedVersion)
+	}
+	var localUsers, incomingUsers, localRules, incomingRules int
+	if err := database.QueryRow(`SELECT
+		(SELECT COUNT(*) FROM users WHERE username='local-only'),
+		(SELECT COUNT(*) FROM users WHERE username='incoming'),
+		(SELECT COUNT(*) FROM lb_rules WHERE caddy_id='lb_local'),
+		(SELECT COUNT(*) FROM lb_rules WHERE caddy_id='lb_incoming')`).Scan(&localUsers, &incomingUsers, &localRules, &incomingRules); err != nil {
+		t.Fatalf("read rollback state: %v", err)
+	}
+	if localUsers != 1 || localRules != 1 {
+		t.Fatalf("本地数据未保留: users=%d rules=%d（事务未整体回滚）", localUsers, localRules)
+	}
+	if incomingUsers != 0 || incomingRules != 0 {
+		t.Fatalf("快照数据已落库: users=%d rules=%d（回滚失效）", incomingUsers, incomingRules)
 	}
 }
 

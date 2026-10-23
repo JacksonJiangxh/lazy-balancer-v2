@@ -8,6 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"lazy-balancer-v2/internal/handlers"
 	"lazy-balancer-v2/internal/models"
 	"lazy-balancer-v2/internal/services"
 )
@@ -96,15 +97,9 @@ func isSelfServiceUserWrite(c *gin.Context) bool {
 	if err != nil || target <= 0 {
 		return false
 	}
-	var actor int
-	switch v := c.Value("user_id").(type) {
-	case int:
-		actor = v
-	case int64:
-		actor = int(v)
-	case float64:
-		actor = int(v)
-	}
+	// user_id 类型归一单源（handlers.ContextUserID）——与 adminOrSelfParam 及
+	// handlers 自助锁同解析，避免包内第二份 switch 漏形态。
+	actor := int(handlers.ContextUserID(c))
 	return actor > 0 && actor == target
 }
 

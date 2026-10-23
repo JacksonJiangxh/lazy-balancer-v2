@@ -2,8 +2,13 @@ package middleware
 
 import (
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"github.com/gin-gonic/gin"
+
+	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/services"
 )
 
@@ -76,4 +81,62 @@ func TestSetupRouter_writeRoutesHaveExplicitAuditClassification(t *testing.T) {
 			t.Errorf("write route has default audit classification: %s", key)
 		}
 	}
+}
+
+// auditMiddleware 本体行为：成功写 → 落一条审计；4xx 跳过；5xx 追加
+// 「结果：失败」。此前全包无直接断言（分类表/拒绝留痕/MCP 集成都不覆盖
+// 本体），删掉任一分支测试仍绿。
+func TestAuditMiddleware_recordsGenericWriteRoute(t *testing.T) {
+	newRouter := newMiddlewareTestRouter // 复用其 DB 初始化/清理
+	cases := []struct {
+		name       string
+		status     int
+		wantRows   int
+		wantFailed bool
+	}{
+		{"成功写", http.StatusOK, 1, false},
+		{"4xx 跳过", http.StatusBadRequest, 0, false},
+		{"5xx 追加失败标记", http.StatusInternalServerError, 1, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_ = newRouter(t)
+			before := auditLogRows(t)
+			engine := gin.New()
+			engine.Use(func(c *gin.Context) {
+				c.Set("username", "auditor")
+				c.Set("auth_type", "jwt")
+				c.Next()
+			})
+			engine.Use(auditMiddleware())
+			engine.POST("/api/v1/caddy/restart", func(c *gin.Context) { c.Status(tc.status) })
+
+			rec := httptest.NewRecorder()
+			engine.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/caddy/restart", nil))
+
+			if got := auditLogRows(t) - before; got != tc.wantRows {
+				t.Fatalf("审计行增量=%d, want %d", got, tc.wantRows)
+			}
+			if tc.wantRows == 0 {
+				return
+			}
+			var detail string
+			if err := db.AuditDB.QueryRow("SELECT detail FROM audit_log ORDER BY id DESC LIMIT 1").Scan(&detail); err != nil {
+				t.Fatal(err)
+			}
+			hasFailed := strings.Contains(detail, "结果：失败")
+			if hasFailed != tc.wantFailed {
+				t.Fatalf("detail=%q 含失败标记=%v, want %v", detail, hasFailed, tc.wantFailed)
+			}
+		})
+	}
+}
+
+func auditLogRows(t *testing.T) int {
+	t.Helper()
+	var count int
+	if err := db.AuditDB.QueryRow("SELECT COUNT(*) FROM audit_log").Scan(&count); err != nil {
+		t.Fatalf("count audit_log: %v", err)
+	}
+	return count
 }

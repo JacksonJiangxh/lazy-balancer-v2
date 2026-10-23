@@ -88,7 +88,11 @@ func newServingTestEnv(t *testing.T) {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
 	})
+	// 日志目录是包级状态：用例结束必须还原，否则后续用例把任务日志写进已
+	// 删除的临时目录（同包 cert_renewal_demote_test 的既有范式）。
+	oldLogDir := taskengine.LogDir()
 	taskengine.SetLogDir(t.TempDir() + "/tasks")
+	t.Cleanup(func() { taskengine.SetLogDir(oldLogDir) })
 	_ = os.MkdirAll(taskengine.LogDir(), 0755)
 }
 

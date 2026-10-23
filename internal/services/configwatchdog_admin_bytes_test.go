@@ -30,8 +30,10 @@ func TestRunningRuleRouteIDs_configAbove4MBStillDecoded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runningRuleRouteIDs on >4MB config: %v", err)
 	}
-	if len(ids) != 1 || !ids["lb_probe"] {
-		t.Fatalf("ids=%v, want exactly {lb_probe}", ids)
+	// 采集面=全部顶层 @id（比对口径与渲染恒等，前缀过滤只在启动守卫/外来路由
+	// 入口）；旧断言 {lb_probe} 编码的是「采集时按 lb_ 前缀过滤」的旧口径。
+	if len(ids) != 2 || !ids["lb_probe"] || !ids["other"] {
+		t.Fatalf("ids=%v, want exactly {lb_probe, other}", ids)
 	}
 }
 

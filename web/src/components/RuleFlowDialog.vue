@@ -16,6 +16,10 @@
     </template>
 
     <div v-if="target" class="flow-body">
+      <div v-if="model?.ruleDisabled" class="info-note-bar info-note-bar--inset">
+        <span class="info-note-desc">规则已禁用——安全链未进入运行配置</span>
+        <span class="info-note-sub">绑定与阶段页保留，启用后生效；当前该规则不产生任何 listener 路由，下方阶段按「保留配置」展示。</span>
+      </div>
       <div v-if="isTcp" class="info-note-bar info-note-bar--inset">
         <span class="info-note-desc">TCP 规则无 HTTP 安全链</span>
         <span class="info-note-sub">TCP（L4）流量不经信任名单、IP 访问控制、限流与 WAF 阶段，接入后直接转发至上游。</span>
@@ -210,6 +214,14 @@
                           <div v-for="list in group.details.aclLists" :key="`acl-list:${list.name}`" class="flow-detail-entry">
                             <span class="flow-detail-value">{{ list.name }}</span>
                             <span class="flow-detail-meta">{{ list.count }} 条</span>
+                          </div>
+                        </template>
+                        <template v-if="group.details.blacklistEntries && group.details.blacklistEntries.length > 0">
+                          <!-- 遗留独立黑名单：摘要对非 deny 模式明示「N 条仍生效」，
+                               明细逐条对账（不受 ACL 开关门控） -->
+                          <div class="flow-detail-block-title">独立黑名单（{{ group.details.blacklistEntries.length }} 条{{ group.details.blacklistEntries.length > 200 ? '，仅显示前 200 条' : '' }}）</div>
+                          <div v-for="entry in group.details.blacklistEntries.slice(0, 200)" :key="`bl:${entry}`" class="flow-detail-entry">
+                            <span class="flow-detail-value">{{ entry }}</span>
                           </div>
                         </template>
                         <template v-if="group.details.trustEntries">
@@ -512,6 +524,7 @@ const groupHasDetails = (group: StagePolicyGroup): boolean => {
   const d = group.details
   if (!d) return false
   return (d.aclInlineCount ?? 0) > 0 || (d.aclLists?.length ?? 0) > 0
+    || (d.blacklistEntries?.length ?? 0) > 0
     || (d.trustEntries?.length ?? 0) > 0
     || (d.geoipRegions?.length ?? 0) > 0
     || d.rateLimit !== undefined
@@ -670,7 +683,7 @@ const stageChip = (stage: 1 | 2 | 3): { chip?: string; caption?: string } => {
   if (!props.target?.caddyId || isTcp.value || !statsSettled.value) return {}
   if (!stats.value) return { chip: '—' }
   if (stage === 1) return { chip: `24h 拦截 ${stats.value.stage1_blocked_24h}` }
-  if (stage === 2) return { chip: `429 拦截 ${stats.value.ratelimit_blocks_reload}`, caption: '自最近重载' }
+  if (stage === 2) return { chip: `429 拦截 ${stats.value.ratelimit_blocks_reload}`, caption: '自最近重载 · 本端口' }
   return { chip: `24h 拦截 ${stats.value.stage3_blocked_24h}` }
 }
 
@@ -678,7 +691,7 @@ const stageChip = (stage: 1 | 2 | 3): { chip?: string; caption?: string } => {
 const stageStatsText = (stage: 0 | 1 | 2 | 3): string => {
   if (stage === 0 || !props.target?.caddyId || isTcp.value || !statsSettled.value || !stats.value) return ''
   if (stage === 1) return `近 24 小时本阶段拦截 ${stats.value.stage1_blocked_24h} 次${stageTimingText(1)}`
-  if (stage === 2) return `自最近重载以来限流拦截 ${stats.value.ratelimit_blocks_reload} 次（恒 429）`
+  if (stage === 2) return `自最近重载以来本规则监听端口的限流拦截 ${stats.value.ratelimit_blocks_reload} 次（恒 429，含上游自返）`
   return `近 24 小时本阶段拦截 ${stats.value.stage3_blocked_24h} 次${stageTimingText(3)}`
 }
 

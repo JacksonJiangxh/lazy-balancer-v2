@@ -115,6 +115,9 @@ export interface StagePolicyDetails {
   // aclInlineCount=内联去重条数。两者替代原逐条 aclEntries。
   aclLists?: Array<{ name: string; count: number }>
   aclInlineCount?: number
+  // 遗留独立黑名单（ip_blacklist）条目：与 ACL 开关无关、恒参与阶段 1 拒绝
+  // 判定；摘要「独立黑名单 N 条仍生效」必须能在明细则对账。
+  blacklistEntries?: string[]
   trustEntries?: StageDetailEntry[]
   geoipRegions?: string[]
   rateLimit?: StageRateLimitDetail
@@ -137,6 +140,26 @@ export const parseCrsFilename = (filename: string): CrsFilenameInfo | null => {
   const match = /^(REQUEST|RESPONSE)-9(\d{2})-/i.exec(filename)
   if (!match) return null
   return { phase: match[1].toUpperCase() === 'RESPONSE' ? '响应' : '请求', code: match[2] }
+}
+
+/**
+ * CRS 规则源码片段定位（只读排障展示）：按 `id:<ruleId>` 精确 ID 边界匹配，
+ * 取命中行上下文 ±contextLines 行；未命中返回空串。
+ *
+ * 边界为何必须：`id:942100` 是 `id:9421000` 的子串，纯 includes 会把片段中心
+ * 落到更长的 ID 行上（CRS 短 ID 与长 ID 混存时展示的不是触发规则）。ID 后
+ * 不得再接数字——可选引号先吞掉再判边界，兼容 `id:942100,` / `id:'942100'` /
+ * `id:"942100"` 三种写法。
+ */
+export const extractCrsRuleSnippet = (content: string, ruleId: string, contextLines = 10): string => {
+  const id = (ruleId ?? '').trim()
+  if (id === '' || content === '') return ''
+  const escaped = id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const pattern = new RegExp(`\\bid\\s*:\\s*["']?${escaped}["']?(?!\\d)`)
+  const lines = content.split('\n')
+  const idx = lines.findIndex((line) => pattern.test(line))
+  if (idx === -1) return ''
+  return lines.slice(Math.max(0, idx - contextLines), Math.min(lines.length, idx + contextLines + 1)).join('\n')
 }
 
 // GET /security/rules/:caddy_id/policy 直接序列化 models.SecurityPolicy——json.RawMessage
@@ -181,6 +204,10 @@ export interface StageGroup {
 
 export interface RuleStageModel {
   hasAnyPolicy: boolean
+  // 规则已禁用：控制面不为 enabled=0 的规则渲染任何路由（安全链不进入运行
+  // 配置），锁摘要/流程弹框必须显式降级——否则巡检得到「四阶段在位」的结论
+  // 而实际该域名零 listener（误判方向是高估防护）。
+  ruleDisabled: boolean
   stages: [StageGroup, StageGroup, StageGroup, StageGroup]
 }
 
@@ -591,13 +618,16 @@ const buildStage3Rows = (
   return rows
 }
 
-// 三阶段分组投影：bindings 顺序（policy_id ASC）即执行顺序；禁用策略保留显示（灰态由消费方渲染）
+// 三阶段分组投影：bindings 顺序（policy_id ASC）即执行顺序；禁用策略保留显示（灰态由消费方渲染）。
+// ruleEnabled：规则自身的启用态（false=控制面不渲染任何路由，安全链未进入
+// 运行配置）。缺省视为启用——未知态不得宣称「已禁用」。
 export const buildStageModel = (
   bindings: readonly SecurityStageBinding[],
   policies: readonly SecurityStagePolicy[],
   ipLists: readonly SecurityStageIPList[],
   blockPages: readonly SecurityStageBlockPage[],
   stagePages?: RuleStagePages | null,
+  ruleEnabled?: boolean,
 ): RuleStageModel => {
   const stage0Groups: StagePolicyGroup[] = []
   const stage1Groups: StagePolicyGroup[] = []
@@ -639,6 +669,7 @@ export const buildStageModel = (
 
   return {
     hasAnyPolicy: bindings.length > 0,
+    ruleDisabled: ruleEnabled === false,
     stages: [
       {
         stage: 0,
@@ -770,6 +801,10 @@ const buildGroupDetails = (
       })
       if (lists.length > 0) details.aclLists = lists
     }
+    // 遗留独立黑名单：不受 ip_acl_enabled 门控（ip_blacklist 恒参与阶段 1 拒绝
+    // 判定），摘要对非 deny 模式提示的「独立黑名单 N 条仍生效」在此对账。
+    const blacklist = [...new Set(parseIPList(policy.ip_blacklist).map((v) => v.trim()).filter((v) => v !== ''))]
+    if (blacklist.length > 0) details.blacklistEntries = blacklist
     const regions = parseIPList(policy.geoip_countries)
     if (policy.has_geoip || regions.length > 0) details.geoipRegions = regions
     return details
@@ -1300,6 +1335,17 @@ export const triggerStageFamily = (ruleTriggered: string): TriggerStageFamily =>
  * 信任族事件本身不展示该说明（kind='trust' 由调用方先短路）。
  */
 export const detectionModeExplains = (kind: string): boolean => kind === 'waf-crs' || kind === 'waf-custom'
+
+/**
+ * WAF 族「耗时加和」判定（事件列表请求上下文弹框 / 触发详情弹框共用）：
+ * WAF 段独立计时，事件行 duration_us = WAF 段耗时，precheck_us = 预检耗时，
+ * 展示时二者加和并分解；预检族（IP ACL/信任/地域/威胁/爬虫）duration_us
+ * ≡ precheck_us 单值，加和会翻倍。
+ * 与 detectionModeExplains 的集合有意不同（后者不含 body——请求体异常不归因
+ * 检测模式），两处集合差异必须各自命名，不得合并。
+ */
+export const isWafDurationFamily = (family: TriggerStageFamily): boolean =>
+  family === 'wafCrs' || family === 'wafCustom' || family === 'body'
 
 /**
  * 跨策略信任豁免判定的候选策略：事件详情端点不过滤 enabled，属主

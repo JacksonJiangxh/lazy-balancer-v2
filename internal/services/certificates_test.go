@@ -726,8 +726,16 @@ func TestCertificateService_periodic_scans_do_not_mutate_jobs_while_queue_paused
 	resetCertificateServiceForTest(t)
 
 	// When
-	service.renewExpiringCertificates()
-	service.requeueWaitingCAJobs()
+	// 返回值必须断言：角色读失败/查询崩溃同样「状态未变」，只看状态无法
+	// 区分「暂停门生效」与「扫描整体失败」。
+	if err := service.renewExpiringCertificates(); err != nil {
+		t.Fatalf("续期扫描在队列暂停时不得失败: %v", err)
+	}
+	if requeued, disabled, err := service.requeueWaitingCAJobs(); err != nil {
+		t.Fatalf("waiting_ca 重排在队列暂停时不得失败: %v", err)
+	} else if requeued != 0 || disabled != 0 {
+		t.Fatalf("requeued=%d disabled=%d, want 0/0（暂停门必须拦住全部重排）", requeued, disabled)
+	}
 
 	// Then
 	for ruleID, wantStatus := range map[string]string{"lb_paused_renewal": "issued", "lb_paused_waiting": "waiting_ca"} {
@@ -937,6 +945,35 @@ func TestCertificateService_renewExpiringCertificates_summaryTiersCappedJobs(t *
 	want := "检测到 2 个临期/待重试证书任务（其中 1 个已达重试上限，仅手动重签可达）"
 	if !strings.Contains(string(data), want) {
 		t.Fatalf("摘要未分档: %q", string(data))
+	}
+	// 摘要行在入队循环之前输出——只比对文案时「该入队的不入队/该跳过的不
+	// 跳过」仍为绿。这里补 DB 侧调度结果：已达上限的任务保持 issued 且预算
+	// 不变；未达上限的任务必须真正离开 issued（入队由 worker 继续推进）。
+	var cappedStatus string
+	var cappedAttempts int
+	if err := database.QueryRow("SELECT status, COALESCE(renewal_attempts,0) FROM cert_jobs WHERE rule_id='lb_sum_capped'").Scan(&cappedStatus, &cappedAttempts); err != nil {
+		t.Fatalf("read capped job: %v", err)
+	}
+	if cappedStatus != "issued" || cappedAttempts != maxAttempts {
+		t.Fatalf("capped job status=%q attempts=%d, want issued/%d（已达上限不得入队）", cappedStatus, cappedAttempts, maxAttempts)
+	}
+	var normalJobID int
+	if err := database.QueryRow("SELECT id FROM cert_jobs WHERE rule_id='lb_sum_normal'").Scan(&normalJobID); err != nil {
+		t.Fatalf("read normal job: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var status string
+		if err := database.QueryRow("SELECT status FROM cert_jobs WHERE id=?", normalJobID).Scan(&status); err != nil {
+			t.Fatalf("read normal job status: %v", err)
+		}
+		if status != "issued" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("未达上限的临期任务仍为 issued：扫描未真正入队重试")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

@@ -4,8 +4,14 @@ package services
 // 任务体）钉测试。
 
 import (
+	"context"
 	"database/sql"
+	"database/sql/driver"
+	"strings"
+	"sync"
 	"testing"
+
+	sqlitedriver "github.com/glebarez/go-sqlite"
 
 	"lazy-balancer-v2/internal/db"
 )
@@ -96,6 +102,116 @@ func TestPurgeOrphanMetricsHistory_boundedPerRun(t *testing.T) {
 	}
 	if got := countMetricsHistory(t, "rule_id IS NOT NULL"); got != 0 {
 		t.Fatalf("孤儿行残留=%d, want 0", got)
+	}
+}
+
+// Given 单条孤儿规则的行数超过单条 DELETE 行预算。
+// When 执行孤儿清理。
+// Then 删除按 rowid 分批执行（语句数 >1），全部行仍被清空，存活/全局行不受
+// 影响——批大小只限制单事务行数，不改变收敛结果。
+func TestPurgeOrphanMetricsHistory_batchesRowsPerDelete(t *testing.T) {
+	_, _ = newClusterTestService(t)
+	const rows = 12
+	for range rows {
+		seedMetricsHistory(t, "lb_big_orphan", 1)
+	}
+	seedMetricsHistory(t, nil, 9)
+	previousBatch := metricsOrphanPurgeRowsPerBatch
+	metricsOrphanPurgeRowsPerBatch = 5
+	t.Cleanup(func() { metricsOrphanPurgeRowsPerBatch = previousBatch })
+
+	counter, restore := wrapMetricsDBWithDeleteCounter(t)
+	t.Cleanup(restore)
+
+	deletedRules, err := PurgeOrphanMetricsHistory(t.Context())
+	if err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	if deletedRules != 1 {
+		t.Fatalf("deletedRules=%d, want 1", deletedRules)
+	}
+	if got := countMetricsHistory(t, "rule_id='lb_big_orphan'"); got != 0 {
+		t.Fatalf("孤儿行残留=%d, want 0（分批必须收敛）", got)
+	}
+	if got := countMetricsHistory(t, "rule_id IS NULL"); got != 1 {
+		t.Fatalf("全局(NULL)行=%d, want 1（不得误删）", got)
+	}
+	// 12 行 / 批大小 5 = 3 条 DELETE（单条 IN 形态只有 1 条 → RED）。
+	if got := counter.count(); got < 3 {
+		t.Fatalf("DELETE 语句数=%d, want >=3（必须按行分批，单条大事务会阻塞指标写入）", got)
+	}
+}
+
+// deleteCountingProbe 统计 metrics_history DELETE 语句数（Prepare 面覆盖
+// ExecContext 回退路径：包装 conn 只暴露 driver.Conn 基础接口）。
+type deleteCountingProbe struct {
+	mu      sync.Mutex
+	deletes int
+}
+
+func (p *deleteCountingProbe) record(query string) {
+	if !strings.Contains(strings.ToLower(query), "delete from metrics_history") {
+		return
+	}
+	p.mu.Lock()
+	p.deletes++
+	p.mu.Unlock()
+}
+
+func (p *deleteCountingProbe) count() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.deletes
+}
+
+type deleteCountingConnector struct {
+	dsn   string
+	inner driver.Driver
+	probe *deleteCountingProbe
+}
+
+func (c deleteCountingConnector) Connect(context.Context) (driver.Conn, error) {
+	conn, err := c.inner.Open(c.dsn)
+	if err != nil {
+		return nil, err
+	}
+	return &deleteCountingConn{Conn: conn, probe: c.probe}, nil
+}
+
+func (c deleteCountingConnector) Driver() driver.Driver { return c.inner }
+
+type deleteCountingConn struct {
+	driver.Conn
+	probe *deleteCountingProbe
+}
+
+func (c *deleteCountingConn) Prepare(query string) (driver.Stmt, error) {
+	c.probe.record(query)
+	return c.Conn.Prepare(query)
+}
+
+// wrapMetricsDBWithDeleteCounter 用同一 metrics 库文件挂计数包装句柄。
+func wrapMetricsDBWithDeleteCounter(t *testing.T) (*deleteCountingProbe, func()) {
+	t.Helper()
+	var seq int
+	var name, file string
+	if err := db.MetricsDB.QueryRow("PRAGMA database_list").Scan(&seq, &name, &file); err != nil {
+		t.Fatalf("read metrics db path: %v", err)
+	}
+	if file == "" {
+		t.Fatal("metrics 测试库不是文件库，无法附加计数句柄")
+	}
+	previous := db.MetricsDB
+	probe := &deleteCountingProbe{}
+	wrapped := sql.OpenDB(deleteCountingConnector{
+		dsn:   file + "?_pragma=busy_timeout(30000)",
+		inner: &sqlitedriver.Driver{},
+		probe: probe,
+	})
+	db.MetricsDB = wrapped
+	return probe, func() {
+		_ = wrapped.Close()
+		db.MetricsDB = previous
 	}
 }
 

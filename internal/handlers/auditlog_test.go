@@ -124,8 +124,12 @@ func TestGetAuditLogs_falls_back_to_username_when_user_lookup_fails(t *testing.T
 }
 
 // newAuditLogTestRouter 构建带主/审计双库的 GetAuditLogs 测试环境，返回 router。
+// total 的 5s 进程缓存按筛选签名分桶且不区分库实例：交换 db.AuditDB 时必须
+// 重置，否则「无筛选」请求会读到上一夹具库的计数（跨用例假绿/顺序依赖）。
 func newAuditLogTestRouter(t *testing.T, rows string) *gin.Engine {
 	t.Helper()
+	resetAuditLogCountCacheForTest()
+	t.Cleanup(resetAuditLogCountCacheForTest)
 	oldDB, oldAuditDB := db.DB, db.AuditDB
 	mainDB, err := sql.Open("sqlite", t.TempDir()+"/main.db")
 	if err != nil {
@@ -224,6 +228,82 @@ func assertAuditRows(t *testing.T, resp *httptest.ResponseRecorder, want int) {
 	}
 	if len(body.Data.List) != want || body.Data.Total != int64(want) {
 		t.Fatalf("rows=%d total=%d, want %d", len(body.Data.List), body.Data.Total, want)
+	}
+}
+
+// 降级形态（审计库未装配）的响应键集必须与健康路径/文档示例一致：同端点
+// 在两种状态下键集不同，按示例生成的客户端读取就绪标志会拿到 null，并把
+// 未文档化的 partial 当未知字段。
+func TestAuditLogResponses_degradedShapeMatchesDocumentedKeys(t *testing.T) {
+	oldAuditDB := db.AuditDB
+	db.AuditDB = nil
+	t.Cleanup(func() { db.AuditDB = oldAuditDB })
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	h := &Handlers{}
+	router.GET("/audit-logs", h.GetAuditLogs)
+	router.GET("/audit-logs/options", h.GetAuditLogOptions)
+
+	decodeData := func(path string) map[string]any {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("%s status=%d body=%s", path, recorder.Code, recorder.Body.String())
+		}
+		var body struct {
+			Data map[string]any `json:"data"`
+		}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+			t.Fatalf("%s parse: %v", path, err)
+		}
+		return body.Data
+	}
+
+	logs := decodeData("/audit-logs")
+	if logs["total_stale"] != true {
+		t.Errorf("降级列表 total_stale=%v, want true（键与健康路径同集）: %v", logs["total_stale"], logs)
+	}
+	if logs["partial"] != true {
+		t.Errorf("降级列表 partial=%v, want true: %v", logs["partial"], logs)
+	}
+	assertKeySetsEqual(t, "GET /audit-logs 降级形态", mapKeysOf(docResponseExample(t, "GET /audit-logs")), mapKeysOf(logs))
+
+	options := decodeData("/audit-logs/options")
+	for _, key := range []string{"usernames", "actions", "resources"} {
+		items, ok := options[key].([]any)
+		if !ok || len(items) != 0 {
+			t.Errorf("降级下拉 %s=%v, want 空数组", key, options[key])
+		}
+	}
+	if options["partial"] != true {
+		t.Errorf("降级下拉 partial=%v, want true: %v", options["partial"], options)
+	}
+	assertKeySetsEqual(t, "GET /audit-logs/options 降级形态", mapKeysOf(docResponseExample(t, "GET /audit-logs/options")), mapKeysOf(options))
+}
+
+// total 的 5s 进程缓存按筛选条件签名分桶，键不区分审计库实例——测试交换
+// db.AuditDB 后必须重置，否则无筛选请求会读到上一夹具库的计数。
+func TestAuditLogTotalCache_isolatedAcrossRouters(t *testing.T) {
+	first := newAuditLogTestRouter(t, "INSERT INTO audit_log (username, action, created_at) VALUES ('admin','更新','2026-08-01 00:00:00')")
+	recorder := httptest.NewRecorder()
+	first.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/audit-logs", nil))
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"total":1`) {
+		t.Fatalf("first router status=%d body=%s, want total=1", recorder.Code, recorder.Body.String())
+	}
+
+	second := newAuditLogTestRouter(t, "")
+	recorder = httptest.NewRecorder()
+	second.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/audit-logs", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("second router status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), `"total":1`) {
+		t.Fatalf("body=%s, 换了空库仍读到上一夹具的计数（缓存未随夹具重置）", recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"total":0`) {
+		t.Fatalf("body=%s, want total=0", recorder.Body.String())
 	}
 }
 

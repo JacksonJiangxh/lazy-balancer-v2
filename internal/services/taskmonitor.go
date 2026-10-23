@@ -44,11 +44,15 @@ type TaskInfo struct {
 	StartedAt      string          `json:"started_at,omitempty"` // 常驻族启动时刻；其他类型空
 	LoopOn         bool            `json:"loop_on"`              // 调度开关当前态（定时/循环/常驻调度列绑定值；用户显式启停持久化于 task_loop_prefs，无记录走默认启动清单）
 	BusinessDriven bool            `json:"business_driven"`      // 仅由业务页驱动调度（任务监控 toggle 只读）
-	LastRun        *TaskRunInfo    `json:"last_run,omitempty"`
-	NextRunAt      string          `json:"next_run_at,omitempty"`
-	Runs24h        int             `json:"runs_24h"`
-	Success24h     int             `json:"success_24h"`
-	Fail24h        int             `json:"fail_24h"`
+	// RoleApplicable 本节点角色是否允许该任务运行（服务端派生，不暴露原始
+	// 角色值）。从节点上 master-only 族的 LoopOn/NextRunAt 仍是主节点语义的
+	// 值——视图据此标注「仅主节点运行」并解释调度开关不可用。
+	RoleApplicable bool         `json:"role_applicable"`
+	LastRun        *TaskRunInfo `json:"last_run,omitempty"`
+	NextRunAt      string       `json:"next_run_at,omitempty"`
+	Runs24h        int          `json:"runs_24h"`
+	Success24h     int          `json:"success_24h"`
+	Fail24h        int          `json:"fail_24h"`
 }
 
 // TaskRunInfo 最近一次运行。
@@ -113,7 +117,7 @@ func collectCertJobRows() ([]TaskInfo, bool) {
 		isMaster = 0
 	}
 	readFailed := false
-	rows, err := db.DB.Query(`SELECT id, rule_id, domain, status, COALESCE(message,''), COALESCE(updated_at,created_at)
+	rows, err := db.DB.Query(`SELECT id, rule_id, domain, status, COALESCE(message,''), COALESCE(created_at,''), COALESCE(updated_at,created_at)
 		FROM cert_jobs
 		WHERE ?=1 OR COALESCE(message,'') NOT LIKE '从主节点同步%'
 		ORDER BY COALESCE(updated_at,created_at) DESC LIMIT ?`, isMaster, certJobRowsLimit+1)
@@ -129,8 +133,8 @@ func collectCertJobRows() ([]TaskInfo, bool) {
 	var out []TaskInfo
 	for rows.Next() {
 		var id int
-		var ruleID, domain, status, message, updatedAt string
-		if err := rows.Scan(&id, &ruleID, &domain, &status, &message, &updatedAt); err != nil {
+		var ruleID, domain, status, message, createdAt, updatedAt string
+		if err := rows.Scan(&id, &ruleID, &domain, &status, &message, &createdAt, &updatedAt); err != nil {
 			// 任务行读失败留痕：单行扫描失败留痕后跳过该行（此前静默 continue）。
 			readFailed = true
 			if lvl := logStateTransition(taskMonitorCertJobsLogKey, true); lvl != "" {
@@ -151,6 +155,9 @@ func collectCertJobRows() ([]TaskInfo, bool) {
 			}
 		}
 		runs24h := success + fail
+		// 执行时间口径与历史端点同源（started=created_at/finished=updated_at/
+		// duration=差），不得各自映射。
+		startedAt, finishedAt, durationMs := CertJobRunTimes(createdAt, updatedAt)
 		ti := TaskInfo{
 			ID:       fmt.Sprintf("cert-job:%d", id),
 			Name:     "ACME 签发 · " + domain,
@@ -162,7 +169,10 @@ func collectCertJobRows() ([]TaskInfo, bool) {
 			// disabled 为恒终态退役行——重试门对其恒 429，
 			// Triggerable=false 让按钮呈现禁用态（点击必 429 是交互噪音）。
 			Triggerable: status != "disabled",
-			LastRun: &TaskRunInfo{StartedAt: localDisplayUTC(updatedAt), FinishedAt: localDisplayUTC(updatedAt),
+			// 证书签发工作项只由主节点消费（从节点禁签发）——角色读取失败
+			// 时按主节点处理（与上方行可见性判据同向）。
+			RoleApplicable: isMaster == 1,
+			LastRun: &TaskRunInfo{StartedAt: startedAt, FinishedAt: finishedAt, DurationMs: durationMs,
 				Trigger: "queue", Result: status, Message: message},
 		}
 		ti.Runs24h, ti.Success24h, ti.Fail24h = runs24h, success, fail
@@ -207,6 +217,10 @@ const certJobRowsLimit = 100
 // 避免 5s 轮询在库故障期间刷 WARNING 洪峰）。
 const taskMonitorCertJobsLogKey = "task-monitor-cert-jobs"
 
+// taskMonitorWaitingCALogKey cert-waiting-ca 下次可用时间查询失败态转换键
+// （同族节流口径：首报警告、恢复补一条）。
+const taskMonitorWaitingCALogKey = "task-monitor-waiting-ca"
+
 // collectEngineFamilies 引擎注册族统一视图（终态：零特化零收集器——
 // 元数据/开关/下一槽/状态镜像全来自 DescribeAll，最近运行与 24h 统计
 // 来自 task_runs，下次时间兜底 last+interval）。
@@ -221,6 +235,7 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 			Category: m.Category, Kind: m.Kind,
 			Controllable: m.Controllable, Cancellable: m.Cancelable, Triggerable: m.CanTrigger,
 			LoopOn: m.LoopOn, BusinessDriven: IsBusinessDrivenTask(m.ID),
+			RoleApplicable: m.RoleApplicable,
 		}
 		// 节奏：循环=间隔，定时=排程槽，常驻=自管理，触发=手动
 		switch m.Kind {
@@ -241,6 +256,9 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 		// LatestRun 单次查询复用（曾每任务两查）；全部任务
 		// 合并为两条批量查询（RunOverview）。
 		latestRun := latestRuns[m.ID]
+		// staleRunning 标记「task_runs 仍是 running 但进程内已无在途执行」的
+		// 残留行（终态 UPDATE 失败）——最近运行结果按中断呈现。
+		staleRunning := false
 		// 状态分流（方案 A，2026-10-12 用户裁定）：状态列只承载执行语义
 		// （运行中/空闲/失败；cert-job 退役行「已禁用」走 cert-job 行集）。
 		// 调度语义全部归开关列——调度语义只由 loop_on 表达；business_driven
@@ -279,7 +297,15 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 				case "failed":
 					ti.Status = TaskStatusFailed
 				case "running":
-					ti.Status = TaskStatusRunning
+					// running 只在引擎确有在途执行时成立：终态 UPDATE 失败会
+					// 把行永久留在 running，此时进程内已无该任务的执行——
+					// 直通会让状态列恒显「运行中」并禁用「运行」按钮。
+					if m.Running {
+						ti.Status = TaskStatusRunning
+					} else {
+						ti.Status = TaskStatusFailed
+						staleRunning = true
+					}
 				}
 			}
 		}
@@ -289,7 +315,16 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 			// 仅展示「下次 CA 可用时间」，不参与 Periodic 调度；Descriptor 不再携带
 			// Scheduled 专用 NextSlotFn。
 			var at string
-			if err := db.DB.QueryRow(`SELECT COALESCE(MIN(NULLIF(ca_available_after,'')),'') FROM cert_jobs WHERE status='waiting_ca'`).Scan(&at); err == nil {
+			if err := db.DB.QueryRow(`SELECT COALESCE(MIN(NULLIF(ca_available_after,'')),'') FROM cert_jobs WHERE status='waiting_ca'`).Scan(&at); err != nil {
+				// 查询失败不得静默丢弃（否则页面「—」与「无 waiting_ca 任务」
+				// 不可区分）：按失败态转换留痕（首报 WARNING，恢复补 INFO）。
+				if lvl := logStateTransition(taskMonitorWaitingCALogKey, true); lvl != "" {
+					Logf(lvl, "cert 等待 CA 下次可用时间查询失败: %v", err)
+				}
+			} else {
+				if lvl := logStateTransition(taskMonitorWaitingCALogKey, false); lvl != "" {
+					Logf(lvl, "cert 等待 CA 下次可用时间查询恢复")
+				}
 				if slot := parseUTCSlot(at); !slot.IsZero() {
 					ti.NextRunAt = slot.In(CurrentLocation()).Format("2006-01-02 15:04:05")
 				}
@@ -299,6 +334,14 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 			ti.LastRun = &TaskRunInfo{StartedAt: latestRun.StartedAt, FinishedAt: latestRun.FinishedAt,
 				DurationMs: latestRun.DurationMs, Trigger: latestRun.Trigger, Operator: latestRun.Operator,
 				Result: latestRun.Status, Message: latestRun.Message}
+			if staleRunning {
+				// 库行仍为 running，但该次执行在本进程已结束——结果按中断
+				// 呈现（与进程重启回收的 interrupted 同语义）。
+				ti.LastRun.Result = "interrupted"
+				if ti.LastRun.Message == "" {
+					ti.LastRun.Message = "运行终态未落库（已按异常结束处理）"
+				}
+			}
 			if ti.NextRunAt == "" && m.IntervalSec > 0 && m.LoopOn && m.Kind == taskengine.KindPeriodic {
 				if t, err := time.ParseInLocation("2006-01-02 15:04:05", latestRun.StartedAt, CurrentLocation()); err == nil {
 					ti.NextRunAt = t.Add(time.Duration(m.IntervalSec) * time.Second).Format("2006-01-02 15:04:05")
@@ -348,4 +391,26 @@ func localDisplayUTC(ts string) string {
 		return t.In(CurrentLocation()).Format("2006-01-02 15:04:05")
 	}
 	return ts
+}
+
+// CertJobRunTimes 把 cert_jobs 行的时间戳映射为执行时间视图（单源）：
+// started=created_at、finished=updated_at、duration=两者差；缺失或不可解析
+// 保持零值（空串/0）。任务监控列表（collectCertJobRows）与历史
+// （handlers.certJobRunHistory）共用，防止两处口径漂移——曾列表把
+// updated_at 同时当开始/结束时间且 DurationMs 恒 0，同一行在列表与历史
+// 呈现互相矛盾的时间语义。
+func CertJobRunTimes(createdAt, updatedAt string) (startedAt, finishedAt string, durationMs int64) {
+	started, startedOK := ParseUTCTimeDual(createdAt)
+	finished, finishedOK := ParseUTCTimeDual(updatedAt)
+	loc := CurrentLocation()
+	if startedOK {
+		startedAt = started.In(loc).Format("2006-01-02 15:04:05")
+	}
+	if finishedOK {
+		finishedAt = finished.In(loc).Format("2006-01-02 15:04:05")
+	}
+	if startedOK && finishedOK && finished.After(started) {
+		durationMs = finished.Sub(started).Milliseconds()
+	}
+	return startedAt, finishedAt, durationMs
 }

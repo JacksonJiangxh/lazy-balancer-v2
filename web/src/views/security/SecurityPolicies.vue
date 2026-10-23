@@ -1507,13 +1507,16 @@ const unregisterIpListEntries = subscribeSharedEntriesCache(() => {
 onUnmounted(unregisterIpListEntries)
 
 // 按需补齐引用名单条目（只对未缓存 id 发请求；代际守卫保证写动作后在途响应
-// 不会把失效前的旧条目回填）。
+// 不会把失效前的旧条目回填）。镜像只在缓存确有新增时重建：命中原缓存仍重建会
+// 让全部依赖 ipListEntries 的 computed（跨策略名单并集/Set、本策略合并计数）
+// 在每次名单增删时全量重算——万级名单 × N 条启用策略的代价落在下拉增删上。
 const ensureIpListEntries = async (ids: number[]): Promise<void> => {
+  const cachedBefore = Object.keys(sharedEntriesCache).length
   await ensureSharedEntries(ids, async (id) => {
     const res = await request.get<APIResponse<{ id: number; entries?: Array<{ value: string }> }>>(`/security/ip-lists/${id}`)
     return (res.data?.entries || []).map((e) => e.value.trim()).filter((v) => v !== '')
   })
-  ipListEntries.value = { ...sharedEntriesCache }
+  if (Object.keys(sharedEntriesCache).length !== cachedBefore) ipListEntries.value = { ...sharedEntriesCache }
 }
 
 const fetchIpLists = async (seq?: number): Promise<void> => {
@@ -2588,6 +2591,11 @@ const computeBindingConflicts = (chain: ConflictPolicyView[]): string[] => {
 // 直接由 policies.value 同步派生（computed），随列表刷新自动更新，无逐策略详情 GET。
 
 interface PeerPolicyView { id: number; name: string; mode: string; crsGroups: string[]; allowEntries: string[]; denyEntries: string[]; allowSet: ReadonlySet<string>; denySet: ReadonlySet<string> }
+// 响应式依赖只有策略列表与引用名单条目镜像（ipListEntries 仅在缓存确有新增时
+// 重建）——编辑态输入（ipACLList/ipWhitelist/ipBlacklistSelf/form）不在依赖
+// 面内，故并集与 Set 只在策略或条目镜像变化时重建，不随名单增删重算；实时
+// 警告随输入重算的部分仅是本策略侧条目与已建 Set 的求交（O(本策略条目)）。
+// 新增编辑输入依赖会让 N 个启用策略 × 万级条目在每次增删时全量重跑。
 const peerPolicyViews = computed<PeerPolicyView[]>(() =>
   policies.value
     .filter((p) => p.enabled && p.id !== editingId.value)

@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
+
+	"lazy-balancer-v2/wafiplist"
 )
 
 // fakeResolver 可编程 DNS 替身：PTR 与正向结果按表返回。
@@ -664,5 +666,152 @@ func TestVerifyCrawlerIPRange_snapshotUnavailableIsTransient(t *testing.T) {
 	}
 	if got := VerifyCrawler("42.236.16.1", "so360spider"); got != CrawlerVerdictSpoof {
 		t.Fatalf("outside official range verdict=%v, want spoof", got)
+	}
+}
+
+// resetCrawlerSnapshotLogThrottleForTest 复位告警节流状态与发射计数。
+func resetCrawlerSnapshotLogThrottleForTest() {
+	crawlerSnapshotLogMu.Lock()
+	crawlerSnapshotLogLast = map[string]time.Time{}
+	crawlerSnapshotLogMu.Unlock()
+	crawlerSnapshotLogCallsForTest.Store(0)
+}
+
+// 读侧有界代际读（与 wafiplist 名单加载器共用同一原语）：stat 与读之间的
+// 原位改写（追加/截断/同尺寸改写）读到的是混合字节，不得当作一代快照落定。
+func TestCrawlerIPRangeSnapshot_rewriteDuringReadFailsClosed(t *testing.T) {
+	oldFile := crawlerIPListFile
+	oldRead := crawlerReadBoundedFile
+	oldInterval := crawlerSnapshotLogInterval
+	t.Cleanup(func() {
+		crawlerIPListFile = oldFile
+		crawlerReadBoundedFile = oldRead
+		crawlerSnapshotLogInterval = oldInterval
+		resetCrawlerIPRangeCacheForTest()
+		resetCrawlerSnapshotLogThrottleForTest()
+	})
+	crawlerIPListFile = filepath.Join(t.TempDir(), "crawler-ip-lists.json")
+	crawlerSnapshotLogInterval = 0
+	resetCrawlerIPRangeCacheForTest()
+	resetCrawlerSnapshotLogThrottleForTest()
+
+	crawlerReadBoundedFile = func(string, int64) ([]byte, os.FileInfo, error) {
+		return nil, nil, wafiplist.ErrFileRewriteDuringRead
+	}
+	snap := loadCrawlerIPRangeSnapshot()
+	if snap.ok {
+		t.Fatal("读期间被改写必须 fail-closed（混合字节不得当作一代内容）")
+	}
+	if len(snap.prefixes) != 0 {
+		t.Fatalf("被拒绝的读取不得产出豁免段: %v", snap.prefixes)
+	}
+	if got := crawlerSnapshotLogCallsForTest.Load(); got != 1 {
+		t.Fatalf("改写告警 %d 条, want 1（必须可见）", got)
+	}
+}
+
+// 持久异常形态（超限文件等）按「路径+原因」节流；成功快照落定后清除记录，
+// 再次故障立即可见——不能把日志洪峰当天，也不能把复发故障静默吞掉。
+func TestCrawlerIPRangeSnapshot_anomalyLogThrottled(t *testing.T) {
+	oldFile := crawlerIPListFile
+	oldRetry := crawlerIPListRetryInterval
+	oldInterval := crawlerSnapshotLogInterval
+	t.Cleanup(func() {
+		crawlerIPListFile = oldFile
+		crawlerIPListRetryInterval = oldRetry
+		crawlerSnapshotLogInterval = oldInterval
+		resetCrawlerIPRangeCacheForTest()
+		resetCrawlerSnapshotLogThrottleForTest()
+	})
+	crawlerIPListFile = filepath.Join(t.TempDir(), "crawler-ip-lists.json")
+	crawlerIPListRetryInterval = 0 // 失败快照每轮重读（模拟 10s 重试的放大形态）
+	crawlerSnapshotLogInterval = time.Minute
+	resetCrawlerIPRangeCacheForTest()
+	resetCrawlerSnapshotLogThrottleForTest()
+
+	oversized := `{"so360spider":["42.236.8.0/21"]}` + strings.Repeat(" ", crawlerIPListMaxBytes)
+	writeSnapshot := func(payload string) {
+		t.Helper()
+		if err := os.WriteFile(crawlerIPListFile, []byte(payload), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeSnapshot(oversized)
+	for i := 0; i < 3; i++ {
+		if loadCrawlerIPRangeSnapshot().ok {
+			t.Fatal("超限快照必须 fail-closed")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := crawlerSnapshotLogCallsForTest.Load(); got != 1 {
+		t.Fatalf("超限告警 %d 条, want 1（同路径同原因按时间窗节流）", got)
+	}
+
+	// 恢复合法快照 → 清除节流记录
+	writeSnapshot(`{"so360spider":["42.236.8.0/21"]}`)
+	if !loadCrawlerIPRangeSnapshot().ok {
+		t.Fatal("合法快照应可用（前置条件）")
+	}
+	// 再次超限（强制越过成功快照的完整重载间隔）
+	writeSnapshot(oversized)
+	crawlerFileCacheMu.Lock()
+	crawlerFileCacheSnap.loadedAt = time.Now().Add(-time.Hour)
+	crawlerFileCacheMu.Unlock()
+	if loadCrawlerIPRangeSnapshot().ok {
+		t.Fatal("再次超限必须 fail-closed")
+	}
+	if got := crawlerSnapshotLogCallsForTest.Load(); got != 2 {
+		t.Fatalf("恢复后再次故障必须立即重新告警, got %d want 2", got)
+	}
+}
+
+// 加载期聚合为「升序不相交」前缀集：判定期二分查找（与 @ipListFast 同构）
+// 的正确性依赖该不变量；未聚合的线性扫描在大段集下是每请求 O(n)。
+func TestCrawlerIPRangeSnapshot_aggregatesSortedDisjoint(t *testing.T) {
+	oldFile := crawlerIPListFile
+	t.Cleanup(func() {
+		crawlerIPListFile = oldFile
+		resetCrawlerIPRangeCacheForTest()
+	})
+	crawlerIPListFile = filepath.Join(t.TempDir(), "crawler-ip-lists.json")
+	payload := `{"so360spider":["42.236.9.0/24","42.236.8.0/24","42.236.8.0/22","2408:4000:8000::/33","2408:4000::/33"]}`
+	if err := os.WriteFile(crawlerIPListFile, []byte(payload), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resetCrawlerIPRangeCacheForTest()
+
+	snap := loadCrawlerIPRangeSnapshot()
+	if !snap.ok {
+		t.Fatal("合法快照应可用")
+	}
+	entries := snap.prefixes["so360spider"]
+	// 兄弟段归并 + 被更宽段覆盖剔除：同一并集收敛为两条。
+	want := []string{"42.236.8.0/22", "2408:4000::/32"}
+	if len(entries) != len(want) {
+		t.Fatalf("聚合结果=%v, want %v", entries, want)
+	}
+	for i := range want {
+		if entries[i].String() != want[i] {
+			t.Fatalf("聚合结果[%d]=%s, want %s（全量: %v）", i, entries[i], want[i], entries)
+		}
+	}
+	for i := 1; i < len(entries); i++ {
+		if entries[i-1].Addr().Compare(entries[i].Addr()) >= 0 {
+			t.Fatalf("前缀集未升序: %v", entries)
+		}
+		if entries[i-1].Contains(entries[i].Addr()) || entries[i].Contains(entries[i-1].Addr()) {
+			t.Fatalf("前缀集存在嵌套/重叠（二分失效）: %v", entries)
+		}
+	}
+	// 二分命中面：并集语义不变（归并只合并兄弟段，不放大覆盖）
+	for _, hit := range []string{"42.236.8.1", "42.236.9.77", "2408:4000:8000::1"} {
+		if !ipRangeVerified(hit, "so360spider") {
+			t.Fatalf("%s 应命中官方段", hit)
+		}
+	}
+	for _, miss := range []string{"42.236.16.1", "2408:4001::1"} {
+		if ipRangeVerified(miss, "so360spider") {
+			t.Fatalf("%s 在段外不得命中", miss)
+		}
 	}
 }

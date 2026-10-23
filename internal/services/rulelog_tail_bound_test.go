@@ -85,9 +85,10 @@ func TestRemoveRuleLogFiles_siblingRuleRotationsUntouched(t *testing.T) {
 	t.Cleanup(func() { ruleLogDir = origDir })
 
 	for _, name := range []string{
-		"lb_abc.log", "lb_abc-extra.log",
+		"lb_abc.log", "lb_abc-extra.log", "lb_abc-1.log",
 		"lb_abc-20260910T15-04-05.123-size.log",
 		"lb_abc-extra-20260910T15-04-05.123-size.log",
+		"lb_abc-1-20260910T15-04-05.123-size.log",
 	} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0644); err != nil {
 			t.Fatal(err)
@@ -107,6 +108,14 @@ func TestRemoveRuleLogFiles_siblingRuleRotationsUntouched(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "lb_abc-extra.log")); err != nil {
 		t.Fatalf("兄弟规则活文件被误删: %v", err)
+	}
+	// 数字开头的兄弟规则（lb_abc-1）：旧守卫只判「stem 后首字符是数字」，
+	// 会把 "-1-<ts>-size.log" 误认为本规则轮转副本。
+	if _, err := os.Stat(filepath.Join(dir, "lb_abc-1-20260910T15-04-05.123-size.log")); err != nil {
+		t.Fatalf("数字兄弟规则轮转副本被误删: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "lb_abc-1.log")); err != nil {
+		t.Fatalf("数字兄弟规则活文件被误删: %v", err)
 	}
 }
 

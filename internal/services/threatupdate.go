@@ -61,7 +61,7 @@ const (
 type ThreatUpdateManager struct {
 	mu        sync.Mutex
 	running   bool
-	runCancel context.CancelFunc
+	runCancel context.CancelCauseFunc
 	// lastTrigger/lastFinishedAt 为任务级状态（status 端点 + 弹框展示）。
 	lastTrigger     string
 	lastStartedAt   string
@@ -181,14 +181,14 @@ func (m *ThreatUpdateManager) StartUpdate(trigger string, rc *taskengine.RunCont
 	// CancelHook／前端连点／自动化脚本）必须命中，不得因 run goroutine 尚未
 	// 执行而读到 runCancel==nil（首次）或上一轮的陈旧 cancel（非首次）静默
 	// 失效/取消错轮。CRS/IP2Region 已同形收敛。
-	runCtx, runCancel := context.WithCancel(updateRunBaseContext(rc))
+	runCtx, runCancel := context.WithCancelCause(updateRunBaseContext(rc))
 	m.runCancel = runCancel
 	done := make(chan struct{})
 	m.mu.Unlock()
 
 	go func() {
 		defer close(done)
-		defer runCancel()
+		defer runCancel(nil)
 		// 自建 goroutine 不被引擎 runGuarded 覆盖——未捕获 panic=整个
 		// admin 进程退出（与 ip2region/CRS 族同形护栏）。正常路径由
 		// runWithContext 内部 recover 先行落定 failed 终态，此处仅兜底。
@@ -221,11 +221,11 @@ func (m *ThreatUpdateManager) RunUpdate(trigger string, rc *taskengine.RunContex
 	// 即本函数，解锁到管线执行之间不得留下「取消读不到本轮 ctx」的窗口
 	//（首次读到 nil=判不可取消；非首次读到上一轮陈旧 cancel=取消错轮）。
 	// StartUpdate（异步入口）同形。
-	runCtx, runCancel := context.WithCancel(updateRunBaseContext(rc))
+	runCtx, runCancel := context.WithCancelCause(updateRunBaseContext(rc))
 	m.runCancel = runCancel
 	m.mu.Unlock()
 	defer func() {
-		runCancel()
+		runCancel(nil)
 		m.mu.Lock()
 		m.running = false
 		m.runCancel = nil
@@ -299,16 +299,15 @@ func threatDueSources(trigger string) ([]threatSourceRow, error) {
 	return sources, rows.Err()
 }
 
-// threatListEmpty 报告源是否「未装载」（排程到期判定用）。
+// threatListEmpty 报告源是否「未装载」（排程到期判定用）。语义名，判据实现在
+// threatFilesUnusable 单源（.iplist 缺失或 .fast 不可用），到期判定与哈希快路径
+// /writeThreatSystemList 跳过判定必须逐点相等。
 // v2.3.4 RDB 文件化（稳态修复）：system 列表条目已迁至文件，DB entries=”
 // 是**正常态**而非空信号——若按 DB 判空则每个调度 tick 都视为到期，主节点
 // 每分钟空转更新（USTC 内容逐请求漂移 → .fast 每轮变化 → 从节点每轮
 // 「已同步」刷屏）。判据改为文件物化状态：.iplist 缺失 = 未装载。
 func threatListEmpty(source string) bool {
-	// .iplist 或.fast 任一缺失都视为未装载——fast 是运行消费面，
-	// 只补文本不补 fast 会让新从节点/崩溃窗口永远缺加速文件。
-	// .fast 存在但损坏同样视为未装载（可读性校验，stat 不算数）。
-	return threatIplistMissing(source) || threatFastUnusable(source)
+	return threatFilesUnusable(source)
 }
 
 // runWithContext 是更新管线本体，runCtx 由调用方创建（StartUpdate 或
@@ -441,6 +440,14 @@ func (m *ThreatUpdateManager) runWithContext(runCtx context.Context, trigger str
 		default:
 			cancelled = true
 		}
+	}
+	// 用户取消自动轮=显式放弃本槽（与失败同源）：把全部到期/空源槽推进到
+	// 下一排程槽。引擎侧取消时已消费本槽，而未处理的到期源仍留在被消费的
+	// 槽值上（引擎排程槽=启用源最早 next_update）——不推进则整个威胁库自动
+	// 更新永久静默停摆。demote/导入排空/进程停止的取消不推进（引擎侧同样不
+	// 消费槽，恢复后到期轮补跑）。
+	if cancelled && userCancelledRun(runCtx) {
+		advanceSourceSlotsAfterUserCancel("security_threat_sources", trigger, threatNextSlot)
 	}
 	m.mu.Lock()
 	m.lastFinishedAt = time.Now().UTC().Format(crsTimeLayout)
@@ -876,8 +883,10 @@ func threatListDescription(source string) string {
 	return ""
 }
 
-// cancelSourceRow 用户取消落库：保留上次快照与连续失败计数，排程槽不推进，
-// 使配置导入等暂停解除后到期轮仍可补跑。
+// cancelSourceRow 用户取消落库：保留上次快照与连续失败计数，源行自身不
+// 推进排程槽——用户取消自动轮时由 run 级收口统一推进全部到期源槽
+// （advanceSourceSlotsAfterUserCancel，见 runWithContext），demote/导入排空/
+// 进程停止的取消则两者都不推进（引擎侧同样不消费槽，恢复后补跑）。
 func cancelSourceRow(id int, finished string, cause error) {
 	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_status='cancelled', message=?, finished_at=?, updated_at=datetime('now') WHERE id=?`,
 		cause.Error(), finished, id); err != nil {
@@ -1144,6 +1153,8 @@ func (m *ThreatUpdateManager) CancelRunning() bool {
 	if cancel == nil || !running {
 		return false
 	}
-	cancel()
+	// 调用方只有用户取消通道（引擎 CancelHook／前端取消入口）——取消原因
+	// 标记为 ErrUserCancelled，取消终态据此推进各源排程槽。
+	cancel(taskengine.ErrUserCancelled)
 	return true
 }

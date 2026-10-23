@@ -18,10 +18,23 @@ import (
 	"lazy-balancer-v2/internal/dnsprovider/ownership"
 )
 
+// dnsPodCreateRequest 是 Record.Create 请求参数留档（domain_id 正常路径也
+// 从不断言，而它决定 TXT 落在哪个域）。
+type dnsPodCreateRequest struct {
+	DomainID   string
+	SubDomain  string
+	RecordType string
+	RecordLine string
+	Value      string
+	TTL        string
+}
+
 type dnsPodRecordTransport struct {
 	mu      sync.Mutex
 	records map[string]string
 	nextID  int
+	creates []dnsPodCreateRequest
+	removes []string
 }
 
 func (transport *dnsPodRecordTransport) RoundTrip(request *http.Request) (*http.Response, error) {
@@ -42,8 +55,17 @@ func (transport *dnsPodRecordTransport) RoundTrip(request *http.Request) (*http.
 		transport.nextID++
 		recordID := strconv.Itoa(199 + transport.nextID)
 		transport.records[recordID] = params.Get("value")
+		transport.creates = append(transport.creates, dnsPodCreateRequest{
+			DomainID:   params.Get("domain_id"),
+			SubDomain:  params.Get("sub_domain"),
+			RecordType: params.Get("record_type"),
+			RecordLine: params.Get("record_line"),
+			Value:      params.Get("value"),
+			TTL:        params.Get("ttl"),
+		})
 		responseBody = fmt.Sprintf(`{"status":{"code":"1","message":"ok"},"record":{"id":%q}}`, recordID)
 	case strings.HasSuffix(request.URL.Path, "Record.Remove"):
+		transport.removes = append(transport.removes, params.Get("record_id"))
 		delete(transport.records, params.Get("record_id"))
 	}
 	transport.mu.Unlock()
@@ -75,6 +97,42 @@ func TestProvider_CleanUp_deletes_only_record_created_by_provider(t *testing.T) 
 	defer transport.mu.Unlock()
 	if len(transport.records) != 1 || transport.records["100"] != "another-task" {
 		t.Fatalf("remaining records=%v, want only unrelated record", transport.records)
+	}
+}
+
+// Present 的核心契约是把挑战写进 _acme-challenge.<domain> 之下：domain_id/
+// sub_domain 派生错位会把 TXT 写到别的名字，ACME 验证失败白烧订单配额；
+// record_type/record_line/ttl 写错会被 API 拒绝或落到错误线路。
+func TestProvider_Present_sendsExpectedChallengeRecordFields(t *testing.T) {
+	transport := &dnsPodRecordTransport{records: map[string]string{}}
+	provider := New("id,token")
+	provider.client.Transport = transport
+
+	cases := []struct {
+		zone, tokenFQDN, value, wantSubDomain string
+	}{
+		{"example.com.", "_acme-challenge.example.com.", "apex-value", "_acme-challenge"},
+		{"example.com.", "_acme-challenge.www.example.com.", "www-value", "_acme-challenge.www"},
+	}
+	for _, tc := range cases {
+		if err := provider.Present(t.Context(), tc.zone, tc.tokenFQDN, tc.value, 600); err != nil {
+			t.Fatalf("present %s: %v", tc.tokenFQDN, err)
+		}
+	}
+
+	transport.mu.Lock()
+	defer transport.mu.Unlock()
+	if len(transport.creates) != len(cases) {
+		t.Fatalf("Record.Create calls=%d, want %d", len(transport.creates), len(cases))
+	}
+	for i, tc := range cases {
+		want := dnsPodCreateRequest{
+			DomainID: "1", SubDomain: tc.wantSubDomain, RecordType: "TXT",
+			RecordLine: "默认", Value: tc.value, TTL: "600",
+		}
+		if transport.creates[i] != want {
+			t.Fatalf("Record.Create[%d]=%+v, want %+v", i, transport.creates[i], want)
+		}
 	}
 }
 
@@ -248,6 +306,15 @@ type flakyTransport struct {
 	failCount  int
 	failPath   string
 	attempts   int
+	// actionAttempts 按动作（路径末段）计数：跨动作共享一个计数器时，
+	// 前置 Domain.List 的调用会提前耗尽 Record.Create 的失败注入额度，
+	// 「重试确实发生」的断言就可能靠无关调用的次数凑够。
+	actionAttempts map[string]int
+}
+
+func (transport *flakyTransport) actionOf(request *http.Request) string {
+	path := request.URL.Path
+	return path[strings.LastIndex(path, "/")+1:]
 }
 
 func (transport *flakyTransport) RoundTrip(request *http.Request) (*http.Response, error) {
@@ -259,10 +326,15 @@ func (transport *flakyTransport) RoundTrip(request *http.Request) (*http.Respons
 	}
 	transport.mu.Lock()
 	transport.attempts++
+	if transport.actionAttempts == nil {
+		transport.actionAttempts = make(map[string]int)
+	}
+	action := transport.actionOf(request)
+	transport.actionAttempts[action]++
 	// 失败注入限定 failPath 动作——创建类 5xx 不再重放（见
 	// TestProvider_Present_does_not_replay_create_on_5xx），接线本意
 	// 「瞬时故障重试」由非创建动作承载。
-	failing := transport.attempts <= transport.failCount && strings.HasSuffix(request.URL.Path, transport.failPath)
+	failing := transport.actionAttempts[action] <= transport.failCount && strings.HasSuffix(request.URL.Path, transport.failPath)
 	status := transport.failStatus
 	transport.mu.Unlock()
 
@@ -320,8 +392,14 @@ func TestProvider_apiCall_retries_transient_failures(t *testing.T) {
 			}
 			transport.mu.Lock()
 			defer transport.mu.Unlock()
-			if transport.attempts < len(testCase.statuses)+1 {
-				t.Fatalf("attempts=%d, want at least %d (failures retried)", transport.attempts, len(testCase.statuses)+1)
+			// 按动作精确计数：Domain.List 恰为「失败次数 + 1」次；Record.Create
+			// 每次 Present 只 1 次。只看全局至少 N 次时，多一次 Domain.List 分页
+			// 或创建重放都能凑够次数。
+			if got := transport.actionAttempts["Domain.List"]; got != len(testCase.statuses)+1 {
+				t.Fatalf("Domain.List attempts=%d, want %d（瞬时故障必须重试到成功）", got, len(testCase.statuses)+1)
+			}
+			if got := transport.actionAttempts["Record.Create"]; got != 1 {
+				t.Fatalf("Record.Create attempts=%d, want 1（创建类不得重放）", got)
 			}
 		})
 	}
@@ -990,5 +1068,74 @@ func TestProvider_CleanUp_memoryModeFailedValueRetriedByCleanUpValue(t *testing.
 	provider.mu.Unlock()
 	if len(left) != 0 {
 		t.Fatalf("owned entries=%+v, want drained after successful retry", left)
+	}
+}
+
+// missingRecordIDTransport 对 Record.Create 返回成功但缺 record.id。
+type missingRecordIDTransport struct {
+	dnsPodRecordTransport
+}
+
+func (transport *missingRecordIDTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if strings.HasSuffix(request.URL.Path, "Record.Create") {
+		if request.Body != nil {
+			_, _ = io.Copy(io.Discard, request.Body)
+			_ = request.Body.Close()
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"status":{"code":"1","message":"ok"},"record":{}}`)),
+			Request:    request,
+		}, nil
+	}
+	return transport.dnsPodRecordTransport.RoundTrip(request)
+}
+
+// Record.Create 未返回记录 ID = TXT 已落 DNS 却不可追踪（清理只能等 stale
+// 兜底或永久残留）。必须报错，且不得登记为已归属。
+func TestProvider_Present_createWithoutRecordIDFails(t *testing.T) {
+	transport := &missingRecordIDTransport{}
+	transport.records = map[string]string{}
+	provider := New("id,token")
+	provider.client.Transport = transport
+
+	err := provider.Present(t.Context(), "example.com", "_acme-challenge.example.com.", "value", 600)
+
+	if err == nil || !strings.Contains(err.Error(), "no record ID") {
+		t.Fatalf("err=%v, want Record.Create returned no record ID", err)
+	}
+	provider.mu.Lock()
+	owned := 0
+	for _, entries := range provider.owned {
+		owned += len(entries)
+	}
+	provider.mu.Unlock()
+	if owned != 0 {
+		t.Fatalf("owned records=%d, want 0（无 ID 记录不得登记为已归属）", owned)
+	}
+}
+
+// CountCleanupRecords 决定 deferred 清理预算（acme/issuer 用它排定预算）：
+// 内存模式只数本挑战值；空 value 退化为按名计数；他值不参与。
+func TestProvider_CountCleanupRecords_countsOnlyOwnValue(t *testing.T) {
+	transport := &dnsPodRecordTransport{records: map[string]string{}}
+	provider := New("id,token")
+	provider.client.Transport = transport
+	if err := provider.Present(t.Context(), "example.com", "_acme-challenge.example.com.", "alpha", 600); err != nil {
+		t.Fatalf("present alpha: %v", err)
+	}
+	if err := provider.Present(t.Context(), "example.com", "_acme-challenge.example.com.", "beta", 600); err != nil {
+		t.Fatalf("present beta: %v", err)
+	}
+
+	if got := provider.CountCleanupRecords("example.com", "_acme-challenge.example.com.", "alpha"); got != 1 {
+		t.Fatalf("count(alpha)=%d, want 1（只数本挑战值）", got)
+	}
+	if got := provider.CountCleanupRecords("example.com", "_acme-challenge.example.com.", ""); got != 2 {
+		t.Fatalf("count(empty)=%d, want 2（空值为按名计数）", got)
+	}
+	if got := provider.CountCleanupRecords("example.com", "_acme-challenge.other.example.com.", "alpha"); got != 0 {
+		t.Fatalf("count(other name)=%d, want 0", got)
 	}
 }

@@ -397,3 +397,122 @@ func TestCrawlerUpsert_changeDetectionIgnoresOrder(t *testing.T) {
 		t.Fatalf("内容变化 changed=%v err=%v, want true/nil", changed, err)
 	}
 }
+
+// Prime 的播种判据必须是逐引擎缺项：库内已有其它引擎时，缺失引擎仍要补种
+// 内置首版；已有引擎的名单内容不得被内置首版覆盖。
+func TestPrimeCrawlerIPLists_seedsOnlyMissingEngines(t *testing.T) {
+	_, database := newClusterTestService(t)
+	oldFile := crawlerIPListFile
+	crawlerIPListFile = filepath.Join(t.TempDir(), "crawler-ip-lists.json")
+	defer func() { crawlerIPListFile = oldFile }()
+
+	// Given：库内只有 bingbot，且内容是被上游更新过的自定义集合
+	if _, err := database.Exec(`DELETE FROM security_ip_lists WHERE category='搜索引擎爬虫'`); err != nil {
+		t.Fatal(err)
+	}
+	const customBing = "203.0.113.0/24"
+	if err := upsertCrawlerIPList("bingbot", []string{customBing}); err != nil {
+		t.Fatal(err)
+	}
+	for _, engine := range []string{"googlebot", "gptbot", "so360spider"} {
+		if _, err := database.Exec(`DELETE FROM security_ip_lists WHERE name=? AND system=1`, CrawlerIPListName(engine)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// When
+	if err := GetCrawlerUpdateManager().Prime(); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+
+	// Then：四个引擎名单齐全（缺失的三个被内置首版补种），已有引擎内容不变
+	all, err := loadCrawlerIPListsFromDB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, src := range crawlerBotSources {
+		if len(all[src.Name]) == 0 {
+			t.Errorf("引擎 %s 名单缺失——部分播种失败后重启不再补种", src.Name)
+		}
+	}
+	if len(all["bingbot"]) != 1 || all["bingbot"][0] != customBing {
+		t.Fatalf("已有引擎名单被内置首版覆盖: %+v", all["bingbot"])
+	}
+	data, err := os.ReadFile(crawlerIPListFile)
+	if err != nil {
+		t.Fatalf("snapshot file missing: %v", err)
+	}
+	var snapshot map[string][]string
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		t.Fatalf("invalid snapshot JSON: %v (%s)", err, data)
+	}
+	for _, src := range crawlerBotSources {
+		if len(snapshot[src.Name]) == 0 {
+			t.Errorf("运行快照缺少引擎 %s（快照缩水=插件读取侧豁免失效）", src.Name)
+		}
+	}
+}
+
+// 播种中途失败时不得写全量快照（保留上一份），恢复后下一次 Prime 继续补种
+// 并重建完整快照。
+func TestPrimeCrawlerIPLists_partialFailureKeepsSnapshotAndHeals(t *testing.T) {
+	_, database := newClusterTestService(t)
+	dir := t.TempDir()
+	oldFile := crawlerIPListFile
+	crawlerIPListFile = filepath.Join(dir, "crawler-ip-lists.json")
+	defer func() { crawlerIPListFile = oldFile }()
+
+	// Given：一次成功的 Prime 产生四引擎快照
+	if err := GetCrawlerUpdateManager().Prime(); err != nil {
+		t.Fatalf("initial prime: %v", err)
+	}
+	before, err := os.ReadFile(crawlerIPListFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 删除一个引擎名单行，并把快照目录设为不可写（模拟播种/落盘失败）
+	if _, err := database.Exec(`DELETE FROM security_ip_lists WHERE name=? AND system=1`, CrawlerIPListName("googlebot")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+
+	// When：快照写失败
+	if err := GetCrawlerUpdateManager().Prime(); err == nil {
+		t.Fatal("快照写失败必须上抛（不得静默把部分集合当成功）")
+	}
+
+	// Then：上一份快照原样保留（不得缩水为缺引擎的集合）
+	after, err := os.ReadFile(crawlerIPListFile)
+	if err != nil {
+		t.Fatalf("previous snapshot vanished: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("失败轮改写了快照:\n before=%s\n after=%s", before, after)
+	}
+
+	// When：目录恢复可写后再次启动
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := GetCrawlerUpdateManager().Prime(); err != nil {
+		t.Fatalf("retry prime: %v", err)
+	}
+
+	// Then：快照重新包含全部引擎
+	data, err := os.ReadFile(crawlerIPListFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snapshot map[string][]string
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		t.Fatalf("invalid snapshot JSON: %v (%s)", err, data)
+	}
+	for _, src := range crawlerBotSources {
+		if len(snapshot[src.Name]) == 0 {
+			t.Errorf("恢复后快照仍缺引擎 %s", src.Name)
+		}
+	}
+}

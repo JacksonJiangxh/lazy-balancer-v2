@@ -3,6 +3,7 @@ package handlers
 // disabled 永久拒绝状态码、批量零目标文案。
 
 import (
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -91,10 +92,37 @@ func TestRetryCertJob_downloadedJobWithoutMaterialStillRequeues(t *testing.T) {
 	if !strings.Contains(response.Body.String(), "Retry triggered") {
 		t.Fatalf("body=%s, want 重新入队语义", response.Body.String())
 	}
-	// 已知覆盖缺口：不校验 DB 终态——队列管理器可能在响应后毫秒级消费任务并
-	// 推进/打回（与 task_certjob_trigger 测试同口径）。「未走部署快速路径」仅由
-	// 响应文案（Retry triggered 而非 Deployment retry triggered）确定；DB 侧
-	// 断言由 acme_regression_01 的队列执行用例与 certjobs 部署生命周期用例承载。
+	// DB 侧独立证据（不依赖响应文案）：重新入队路径不写
+	// deployment_available_after（部署快速路径会把部署窗口推到 now），也不写
+	// 部署口径 message。仅比对响应文案时，「无材料任务被误送部署快速路径」
+	// 只要响应仍含 Retry triggered 就保持绿。
+	var deploymentWindow sql.NullTime
+	var message string
+	if err := db.DB.QueryRow("SELECT deployment_available_after, COALESCE(message,'') FROM cert_jobs WHERE id=1").Scan(&deploymentWindow, &message); err != nil {
+		t.Fatalf("read job after retry: %v", err)
+	}
+	if deploymentWindow.Valid {
+		t.Fatalf("deployment_available_after=%v, want 空（部署快速路径才会写部署窗口）", deploymentWindow)
+	}
+	if strings.Contains(message, "部署") {
+		t.Fatalf("message=%q, want 重新排队口径（不得写成部署重排）", message)
+	}
+	// 队列活跃时 worker 会异步消费任务——轮询到离开 downloaded 为止；部署快速
+	// 路径会永久停在 downloaded，超时即失败。
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var status string
+		if err := db.DB.QueryRow("SELECT status FROM cert_jobs WHERE id=1").Scan(&status); err != nil {
+			t.Fatalf("read job status: %v", err)
+		}
+		if status != "downloaded" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("任务重试后仍停在 downloaded：无材料任务必须重新排队签发，不得走部署快速路径")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // Given：证书服务已停止，downloaded 任务仍满足部署重排的 DB 条件。

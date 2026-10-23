@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/models"
 )
 
 // testCertificatePEMWithWindow 生成指定生效窗口的自签测试证书。
@@ -156,5 +157,68 @@ func TestScheduleDelayedReload_firesReloadUnderCaddyOpLock(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("延迟重载回调未在到期后触发")
+	}
+}
+
+// 快速重部署路径（Issue 快速路径 → redeployDownloadedInLock）的两个成功出口也
+// 必须登记生效点重载：首次部署写盘后失败、随后由补扫/手动重试收敛时，若证书
+// NotBefore 在未来，缺登记就让「生效点补充重载」这条收敛路径断链。
+func TestCertIssuer_Issue_fastPathFutureNotBeforeRegistersDelayedReload(t *testing.T) {
+	cases := []struct {
+		name string
+		// predeploy=true 命中「文件已一致，无需重新部署」出口，false 命中重写盘出口。
+		predeploy bool
+	}{
+		{name: "文件已一致的出口", predeploy: true},
+		{name: "重新写盘的出口", predeploy: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given：downloaded 任务材料两小时后才生效（且远离续签窗口）。
+			// 规则显式绑定与任务相同的提供商：快速路径的「提供商未切换」判定按
+			// 解析后的 ID 比较，跟随默认时依赖播种默认值，容易随夹具漂移。
+			jobID, ruleID := seedCertificateJob(t, "downloaded")
+			useTemporaryCertDir(t)
+			if _, err := db.DB.Exec("UPDATE lb_rules SET ca_provider_id=1 WHERE caddy_id=?", ruleID); err != nil {
+				t.Fatalf("bind rule CA provider: %v", err)
+			}
+			notBefore := time.Now().Add(2 * time.Hour)
+			notAfter := notBefore.Add(90 * 24 * time.Hour)
+			certPEM := testCertificatePEMWithWindow(t, notBefore, notAfter)
+			const keyPEM = "key-pem"
+			if _, err := db.DB.Exec("UPDATE cert_jobs SET cert_pem=?, key_pem=?, expires_at=? WHERE id=?", certPEM, keyPEM, notAfter, jobID); err != nil {
+				t.Fatalf("seed job material: %v", err)
+			}
+			if tc.predeploy {
+				if err := WriteCertFiles(ruleID, certPEM, keyPEM); err != nil {
+					t.Fatalf("predeploy files: %v", err)
+				}
+			}
+			scheduled := make(chan time.Duration, 1)
+			oldScheduler := notBeforeReloadScheduler
+			notBeforeReloadScheduler = func(gotJobID int, gotRuleID string, delay time.Duration) {
+				if gotJobID != jobID || gotRuleID != ruleID {
+					t.Errorf("reload schedule target=(%d,%q), want (%d,%q)", gotJobID, gotRuleID, jobID, ruleID)
+				}
+				scheduled <- delay
+			}
+			t.Cleanup(func() { notBeforeReloadScheduler = oldScheduler })
+			issuer := NewCertIssuer(func() error { return nil })
+
+			// When
+			if err := issuer.Issue(context.Background(), jobID, ruleID, "example.com", models.CAProvider{ID: 1}); err != nil {
+				t.Fatalf("issue via fast path: %v", err)
+			}
+
+			// Then：登记时刻≈NotBefore+余量
+			select {
+			case delay := <-scheduled:
+				if delay < time.Hour || delay > 3*time.Hour {
+					t.Fatalf("delay=%v, want ≈NotBefore+余量（约 1h59m）", delay)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("快速重部署成功出口未登记生效后延迟重载")
+			}
+		})
 	}
 }

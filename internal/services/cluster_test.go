@@ -96,11 +96,11 @@ func TestClusterService_RegisterToken_regeneration_invalidates_previous_unused_t
 	// Then：旧令牌被作废，新令牌可用，令牌表仅剩新令牌
 	req := models.ClusterRegisterRequest{Name: "slave-a", IPAddress: "10.0.0.2", Port: 8000}
 	req.Token = first
-	if _, err := service.RegisterNode(context.Background(), req, now); !errors.Is(err, ErrInvalidRegisterToken) {
+	if _, err := service.RegisterNode(context.Background(), req, req.IPAddress, now); !errors.Is(err, ErrInvalidRegisterToken) {
 		t.Fatalf("register with stale token error=%v, want invalid token", err)
 	}
 	req.Token = second
-	if _, err := service.RegisterNode(context.Background(), req, now); err != nil {
+	if _, err := service.RegisterNode(context.Background(), req, req.IPAddress, now); err != nil {
 		t.Fatalf("register with fresh token: %v", err)
 	}
 	var tokenCount int
@@ -123,15 +123,15 @@ func TestClusterService_RegisterToken_is_one_time(t *testing.T) {
 	req := models.ClusterRegisterRequest{Token: token, Name: "slave-a", IPAddress: "10.0.0.2", Port: 8000}
 
 	// When
-	_, err = service.RegisterNode(context.Background(), req, now)
+	_, err = service.RegisterNode(context.Background(), req, req.IPAddress, now)
 	if err != nil {
 		t.Fatalf("first registration: %v", err)
 	}
-	_, secondErr := service.RegisterNode(context.Background(), req, now)
+	_, secondErr := service.RegisterNode(context.Background(), req, req.IPAddress, now)
 
 	// Then
-	if secondErr == nil {
-		t.Fatal("second registration succeeded with a consumed token")
+	if !errors.Is(secondErr, ErrInvalidRegisterToken) {
+		t.Fatalf("second registration error=%v, want ErrInvalidRegisterToken（已消费令牌）", secondErr)
 	}
 	var plaintextCount int
 	if err := database.QueryRow("SELECT COUNT(*) FROM cluster_register_tokens WHERE token_hash=?", token).Scan(&plaintextCount); err != nil {
@@ -151,7 +151,7 @@ func TestClusterService_RegisterNodeStoresAndUpdatesAccessURL(t *testing.T) {
 	}
 	registration, err := service.RegisterNode(context.Background(), models.ClusterRegisterRequest{
 		Token: token, Name: "slave-a", IPAddress: "172.18.0.2", Port: 8000, AccessURL: "http://172.18.0.2:8001",
-	}, now)
+	}, "172.18.0.2", now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,6 +170,56 @@ func TestClusterService_RegisterNodeStoresAndUpdatesAccessURL(t *testing.T) {
 	}
 	if accessURL != "https://node.example:8443" {
 		t.Fatalf("updated access_url=%q", accessURL)
+	}
+}
+
+// 自述 access_url 的唯一防护（主机必须与注册来源地址一致）：该值随后被用作
+// 登录/服务控制能力票据的投递地址，未校验时持有注册令牌的一方可把票据引向
+// 第三方主机。缺测试会让这道防护在重构中静默消失。
+func TestClusterService_RegisterNode_ignoresAccessURLFromForeignHost(t *testing.T) {
+	service, database := newClusterTestService(t)
+	now := time.Date(2026, 7, 31, 12, 0, 0, 0, time.UTC)
+	register := func(name, ipAddress, accessURL, sourceIP string, port int) models.ClusterRegistration {
+		t.Helper()
+		token, _, err := service.GenerateRegisterToken(context.Background(), 1, now)
+		if err != nil {
+			t.Fatalf("generate token: %v", err)
+		}
+		registration, err := service.RegisterNode(context.Background(), models.ClusterRegisterRequest{
+			Token: token, Name: name, IPAddress: ipAddress, Port: port, AccessURL: accessURL,
+		}, sourceIP, now)
+		if err != nil {
+			t.Fatalf("register %s: %v", name, err)
+		}
+		return registration
+	}
+	storedAccessURL := func(registrationID int) string {
+		t.Helper()
+		var accessURL sql.NullString
+		if err := database.QueryRow("SELECT access_url FROM nodes WHERE id=?", registrationID).Scan(&accessURL); err != nil {
+			t.Fatalf("read access_url: %v", err)
+		}
+		return accessURL.String
+	}
+
+	// When：自述地址指向第三方主机。
+	foreign := register("slave-foreign", "10.0.0.9", "http://10.9.9.9:8001", "10.0.0.9", 8000)
+
+	// Then：显式标记忽略且不落库（不落库才是防护生效的证据）。
+	if !foreign.AccessURLIgnored {
+		t.Fatal("跨主机自述 access_url 必须标记忽略")
+	}
+	if stored := storedAccessURL(foreign.RegistrationID); stored != "" {
+		t.Fatalf("access_url=%q, want 空（防护失效会把能力票据引向第三方主机）", stored)
+	}
+
+	// 对照：同主机自述地址照常落库（防止把防护写成「一律忽略」）。
+	same := register("slave-same", "10.0.0.10", "https://10.0.0.10:8443", "10.0.0.10", 8001)
+	if same.AccessURLIgnored {
+		t.Fatal("同主机自述 access_url 不得标记忽略")
+	}
+	if stored := storedAccessURL(same.RegistrationID); stored != "https://10.0.0.10:8443" {
+		t.Fatalf("access_url=%q, want 同主机地址落库", stored)
 	}
 }
 
@@ -200,11 +250,11 @@ func TestClusterService_RegisterToken_rejects_expired_token(t *testing.T) {
 	// When
 	_, registerErr := service.RegisterNode(context.Background(), models.ClusterRegisterRequest{
 		Token: token, Name: "slave-a", IPAddress: "10.0.0.2", Port: 8000,
-	}, issuedAt.Add(31*time.Minute))
+	}, "10.0.0.2", issuedAt.Add(31*time.Minute))
 
 	// Then
-	if registerErr == nil {
-		t.Fatal("registration succeeded with an expired token")
+	if !errors.Is(registerErr, ErrInvalidRegisterToken) {
+		t.Fatalf("registration error=%v, want ErrInvalidRegisterToken（过期令牌）", registerErr)
 	}
 }
 
@@ -218,7 +268,7 @@ func TestClusterService_ApproveNode_redelivers_cluster_token_until_confirmed(t *
 	}
 	registration, err := service.RegisterNode(context.Background(), models.ClusterRegisterRequest{
 		Token: registerToken, Name: "slave-a", IPAddress: "10.0.0.2", Port: 8000,
-	}, now)
+	}, "10.0.0.2", now)
 	if err != nil {
 		t.Fatalf("register node: %v", err)
 	}
@@ -281,7 +331,7 @@ func TestClusterService_RegistrationStatus_rejects_expired_secret(t *testing.T) 
 	}
 	registration, err := service.RegisterNode(context.Background(), models.ClusterRegisterRequest{
 		Token: registerToken, Name: "slave-expired", IPAddress: "10.0.0.3", Port: 8000,
-	}, now)
+	}, "10.0.0.3", now)
 	if err != nil {
 		t.Fatalf("register node: %v", err)
 	}
@@ -407,6 +457,7 @@ func TestSyncService_finishRun_doesNotClearNewerRun(t *testing.T) {
 func TestSyncService_run_retries_transient_state_read_failure(t *testing.T) {
 	// Given
 	_, database := newClusterTestService(t)
+	setNodeMasterRole(t, database, false) // run 循环的同步状态写只属于从节点语境
 	attempts := 0
 	retryReached := make(chan struct{})
 	service := &SyncService{db: database}
@@ -1509,7 +1560,7 @@ func TestClusterService_ReRegisterPreservesAccessURL(t *testing.T) {
 	}
 	registration, err := service.RegisterNode(context.Background(), models.ClusterRegisterRequest{
 		Token: token, Name: "slave-a", IPAddress: "172.18.0.2", Port: 8000, AccessURL: "http://127.0.0.1:8001",
-	}, now)
+	}, "172.18.0.2", now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1525,7 +1576,7 @@ func TestClusterService_ReRegisterPreservesAccessURL(t *testing.T) {
 	}
 	if _, err := service.RegisterNode(context.Background(), models.ClusterRegisterRequest{
 		Token: token2, Name: "slave-a", IPAddress: "172.18.0.2", Port: 8000,
-	}, now); err != nil {
+	}, "172.18.0.2", now); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1617,7 +1668,7 @@ func TestGenerateRegisterToken_invalidationAndInsertAreAtomic(t *testing.T) {
 		t.Fatalf("生成失败后令牌数=%d, want 1（作废必须随生成失败回滚）", tokenCount)
 	}
 	req := models.ClusterRegisterRequest{Token: first, Name: "slave-atomic", IPAddress: "10.0.0.2", Port: 8000}
-	if _, err := service.RegisterNode(ctx, req, now); err != nil {
+	if _, err := service.RegisterNode(ctx, req, req.IPAddress, now); err != nil {
 		t.Fatalf("旧令牌必须仍可用（作废被回滚）: %v", err)
 	}
 }
@@ -1669,7 +1720,7 @@ func TestApproveNode_expiryUsesInjectedNow(t *testing.T) {
 	}
 	registration, err := service.RegisterNode(ctx, models.ClusterRegisterRequest{
 		Token: token, Name: "slave-expiry", IPAddress: "10.0.0.21", Port: 8000,
-	}, now)
+	}, "10.0.0.21", now)
 	if err != nil {
 		t.Fatalf("register node: %v", err)
 	}
@@ -1765,6 +1816,62 @@ func TestSyncService_pollRegistration_retriesConfirmAndStopsAfterConsecutiveFail
 	syncService.pollRegistration(context.Background())
 	if confirmHits != registrationConfirmMaxFailures {
 		t.Fatalf("终止后仍在重试 confirm: attempts=%d", confirmHits)
+	}
+}
+
+// 生产 run 循环中「令牌已落库、confirm 未成功」的轮次必须重试 confirm：
+// run 此前只在 cluster_token 为空时进注册轮询，approved 分支落库令牌后永不再
+// 轮询 → confirm 的「连续 5 次终止」与「稍后自动重试」文案都不可达，本地明文
+// registration_secret 无限期滞留。本用例走 run 循环（非直调 pollRegistration），
+// 断言连续轮次都在重试 confirm。
+func TestSyncService_run_retriesPendingRegistrationConfirmAfterTokenStored(t *testing.T) {
+	_, database := newClusterTestService(t)
+	var confirmHits int
+	master := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/api/v1/cluster/register/7/status":
+			response.Header().Set("Content-Type", "application/json")
+			_, _ = response.Write([]byte(`{"code":0,"data":{"status":"approved","cluster_token":"lb_cluster_approved"}}`))
+		case request.Method == http.MethodPost && request.URL.Path == "/api/v1/cluster/registration/confirm":
+			confirmHits++
+			// 5xx 属暂时性：可重试、不清注册态（409 导入窗口同族）。
+			response.WriteHeader(http.StatusInternalServerError)
+		case request.URL.Path == "/api/v1/cluster/sync/snapshot":
+			response.WriteHeader(http.StatusNotModified)
+		default:
+			response.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer master.Close()
+	seedApprovedRegistration(t, database, master.URL)
+	syncService := NewSyncService(database, &config.Config{DataDir: t.TempDir()}, nil)
+	rounds := 0
+	syncService.waitRunDelay = func(context.Context, time.Duration) bool {
+		rounds++
+		return rounds < 3
+	}
+
+	syncService.run(context.Background())
+
+	// 3 个周期：首轮状态轮询 + confirm，随后两轮令牌已在库、仍须重试 confirm。
+	if confirmHits != 3 {
+		t.Fatalf("confirm attempts=%d over 3 run cycles, want 3（令牌落库后 confirm 重试不可达）", confirmHits)
+	}
+	var failures int
+	var secret, stored string
+	if err := database.QueryRow("SELECT COALESCE(registration_confirm_failures,0), COALESCE(registration_secret,''), COALESCE(cluster_token,'') FROM global_config WHERE id=1").Scan(&failures, &secret, &stored); err != nil {
+		t.Fatalf("read registration state: %v", err)
+	}
+	// 5xx 属暂时性：只重试、不清注册态、不推进 5 连败终止计数（终止计数只服务
+	// 凭证类拒绝）。
+	if failures != 0 {
+		t.Fatalf("registration_confirm_failures=%d, want 0（暂时性失败不得推进终止轨道）", failures)
+	}
+	if secret != "temporary-secret" {
+		t.Fatalf("registration_secret=%q, want 保留（暂时性失败不得清注册态）", secret)
+	}
+	if stored != "lb_cluster_approved" {
+		t.Fatalf("cluster_token=%q, want 已落库令牌保留", stored)
 	}
 }
 

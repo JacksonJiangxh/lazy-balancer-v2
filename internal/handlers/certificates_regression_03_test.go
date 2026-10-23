@@ -3,6 +3,7 @@ package handlers
 // （签发未入队不得伪装成功）。
 
 import (
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -474,6 +475,99 @@ func TestIssueCertificate_batchAllSkippedReturns409(t *testing.T) {
 	}
 	if !strings.Contains(response.Body.String(), `"queued":0`) || !strings.Contains(response.Body.String(), `"skipped_in_flight":1`) {
 		t.Fatalf("body=%s, want queued=0 + skipped_in_flight=1", response.Body.String())
+	}
+	assertLatestCertificateAudit(t, "范围：全部 ACME 规则", "已跳过")
+}
+
+// Given 任务的 CA 限流退避窗口未到期（waiting_ca + ca_available_after=+1h）。
+// When 从规则列表「重新签发」（定向触发）。
+// Then 与任务重试同一契约：429 + 剩余时长，任务状态与退避窗口原样保留；
+// force=true 显式越过并留「手动越过 CA 冷却」审计。
+func TestIssueCertificate_waitingCACoolingRequiresForce(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	initIssueQueue(t)
+	seedIssueRule(t, "lb_ca_cooling", "ca-cooling.example")
+	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,renewal_attempts,ca_available_after,updated_at)
+		VALUES ('lb_ca_cooling','ca-cooling.example','waiting_ca',2,datetime('now','+1 hour'),datetime('now','-2 hours'))`); err != nil {
+		t.Fatalf("seed cooling job: %v", err)
+	}
+	router := gin.New()
+	router.POST("/certificates/issue", h.IssueCertificate)
+
+	// When：未带 force
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/certificates/issue", strings.NewReader(`{"caddy_id":"lb_ca_cooling"}`)))
+
+	// Then：429 + 剩余时长；冷却窗口与重试预算均不得被触碰
+	if response.Code != http.StatusTooManyRequests || !strings.Contains(response.Body.String(), "冷却未到期") {
+		t.Fatalf("status=%d body=%s, want 429 冷却未到期", response.Code, response.Body.String())
+	}
+	var status string
+	var attempts int
+	var availableAfter sql.NullTime
+	if err := db.DB.QueryRow("SELECT status, COALESCE(renewal_attempts,0), ca_available_after FROM cert_jobs WHERE rule_id=?", "lb_ca_cooling").
+		Scan(&status, &attempts, &availableAfter); err != nil {
+		t.Fatalf("read cooling job: %v", err)
+	}
+	if status != "waiting_ca" || attempts != 2 || !availableAfter.Valid {
+		t.Fatalf("status=%q attempts=%d window=%v, want waiting_ca/2/未清空（不得静默重排）", status, attempts, availableAfter)
+	}
+	assertLatestCertificateAudit(t, "规则：lb_ca_cooling", "重试被阻止")
+
+	// When：force=true（用户确认越过）
+	response = httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/certificates/issue?force=true", strings.NewReader(`{"caddy_id":"lb_ca_cooling"}`)))
+
+	// Then：受理 + 越过冷却留痕
+	if response.Code != http.StatusOK {
+		t.Fatalf("force issue status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	var detail string
+	if err := db.AuditDB.QueryRow("SELECT detail FROM audit_log WHERE action='触发签发' ORDER BY id DESC LIMIT 1").Scan(&detail); err != nil {
+		t.Fatalf("read issue audit: %v", err)
+	}
+	if !strings.Contains(detail, "手动越过 CA 冷却") {
+		t.Fatalf("audit detail=%q, want 手动越过 CA 冷却留痕", detail)
+	}
+	var cleared sql.NullTime
+	if err := db.DB.QueryRow("SELECT ca_available_after FROM cert_jobs WHERE rule_id=?", "lb_ca_cooling").Scan(&cleared); err != nil {
+		t.Fatalf("read cleared window: %v", err)
+	}
+	if cleared.Valid {
+		t.Fatalf("ca_available_after=%v, want 清空（重排后重新计时）", cleared)
+	}
+}
+
+// Given 批量签发中唯一目标处于 CA 限流退避窗口。
+// When all=true（未带 force）。
+// Then 409 且如实给出 skipped_waiting_ca 计数，任务不被重排。
+func TestIssueCertificate_batchSkipsWaitingCACooling(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	initIssueQueue(t)
+	seedIssueRule(t, "lb_ca_batch", "ca-batch.example")
+	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id,domain,status,ca_available_after,updated_at)
+		VALUES ('lb_ca_batch','ca-batch.example','waiting_ca',datetime('now','+1 hour'),datetime('now','-2 hours'))`); err != nil {
+		t.Fatalf("seed batch cooling job: %v", err)
+	}
+	router := gin.New()
+	router.POST("/certificates/issue", h.IssueCertificate)
+
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/certificates/issue", strings.NewReader(`{"all":true}`)))
+
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s, want 409（全部因 CA 冷却跳过）", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), `"skipped_waiting_ca":1`) || !strings.Contains(response.Body.String(), "冷却跳过 1 个") {
+		t.Fatalf("body=%s, want skipped_waiting_ca=1 + 冷却跳过文案", response.Body.String())
+	}
+	var status string
+	var availableAfter sql.NullTime
+	if err := db.DB.QueryRow("SELECT status, ca_available_after FROM cert_jobs WHERE rule_id=?", "lb_ca_batch").Scan(&status, &availableAfter); err != nil {
+		t.Fatalf("read batch job: %v", err)
+	}
+	if status != "waiting_ca" || !availableAfter.Valid {
+		t.Fatalf("status=%q window=%v, want waiting_ca 且退避窗口保留", status, availableAfter)
 	}
 	assertLatestCertificateAudit(t, "范围：全部 ACME 规则", "已跳过")
 }

@@ -718,7 +718,11 @@ func (s *CaddyService) ValidateTxRenderViaCLI(tx *sql.Tx, rulesWrittenInTx bool)
 	applied := false
 	defer func() {
 		if !applied {
-			RestoreIPListProjections(projectionSnapshot)
+			if rerr := RestoreIPListProjections(projectionSnapshot); rerr != nil {
+				// 回滚不完整=投影目录可能残留未提交的名单内容（稳定命名热路径
+				// ≤1s 会被在役配置感知），必须留痕供排障。
+				Logf("error", "caddy CLI 预检失败后的 IP 名单投影回滚不完整: %v", rerr)
+			}
 		}
 	}()
 	config := generateCaddyConfigWithCertSource(tx, db.DB, rulesWrittenInTx)
@@ -843,9 +847,14 @@ func (s *CaddyService) ValidateConfig(config map[string]interface{}) (err error)
 
 	if resp.StatusCode >= 400 {
 		// admin 4xx=候选配置被拒（可安全的 400 映射），
-		// 传输/超时=系统故障（须 500 且仍需回弹权威配置）——用既有
-		// ConfigRejectedError 单源分类，调用侧 IsConfigRejected 判定。
-		return &ConfigRejectedError{Err: fmt.Errorf("validation failed: %s", string(readCaddyErrorBody(resp.Body)))}
+		// 5xx=admin 内部故障（Caddy 存活但 provision/资源失败），与
+		// applyConfigWithOptions 同构：只有 <500 归 ConfigRejectedError，
+		// 调用侧 IsConfigRejected 才能把系统故障如实映射为 500。
+		inner := fmt.Errorf("validation failed: %s", string(readCaddyErrorBody(resp.Body)))
+		if resp.StatusCode < 500 {
+			return &ConfigRejectedError{Err: inner}
+		}
+		return inner
 	}
 
 	return nil

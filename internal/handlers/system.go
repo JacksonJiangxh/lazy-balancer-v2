@@ -79,10 +79,18 @@ func (h *Handlers) GetSystemInfo(c *gin.Context) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: info})
 }
 
+// systemInternalFailure 500 统一装配：固定中文文案回客户端，底层错误
+// （os/gopsutil 路径、命令输出）只进运行日志——/system 指标与运行日志端点
+// 属 business 组，任意登录用户可读，不得把文件布局/内部结构透给客户端。
+func systemInternalFailure(message string, err error) models.APIResponse {
+	services.Logf("error", "系统信息: %s: %v", message, err)
+	return models.APIResponse{Code: http.StatusInternalServerError, Message: message}
+}
+
 func (h *Handlers) GetSystemMetrics(c *gin.Context) {
 	metrics, err := getSystemMetrics()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
+		c.JSON(http.StatusInternalServerError, systemInternalFailure("读取系统指标失败", err))
 		return
 	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: metrics})
@@ -91,7 +99,7 @@ func (h *Handlers) GetSystemMetrics(c *gin.Context) {
 func (h *Handlers) GetRealtimeTraffic(c *gin.Context) {
 	traffic, err := getRealtimeTraffic()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
+		c.JSON(http.StatusInternalServerError, systemInternalFailure("读取实时流量失败", err))
 		return
 	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: traffic})
@@ -100,7 +108,7 @@ func (h *Handlers) GetRealtimeTraffic(c *gin.Context) {
 func (h *Handlers) GetConnectionStats(c *gin.Context) {
 	stats, err := getConnectionStats()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: err.Error()})
+		c.JSON(http.StatusInternalServerError, systemInternalFailure("读取连接统计失败", err))
 		return
 	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: stats})
@@ -119,7 +127,7 @@ func (h *Handlers) GetAppLogs(c *gin.Context) {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: map[string]string{"content": ""}})
 			return
 		}
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "日志文件不可读: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, systemInternalFailure("日志文件不可读", err))
 		return
 	}
 	startOffset := int64(0)
@@ -128,12 +136,12 @@ func (h *Handlers) GetAppLogs(c *gin.Context) {
 	}
 	f, err := os.Open(logPath)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "打开日志文件失败: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, systemInternalFailure("打开日志文件失败", err))
 		return
 	}
 	defer f.Close()
 	if _, err := f.Seek(startOffset, io.SeekStart); err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取日志失败: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, systemInternalFailure("读取日志失败", err))
 		return
 	}
 	// Stat 与读取之间日志增长/文件被替换为 FIFO 时，
@@ -141,13 +149,13 @@ func (h *Handlers) GetAppLogs(c *gin.Context) {
 	// 尾读同口径加上限（窗口本身 ≤128KB）。
 	data, err := io.ReadAll(io.LimitReader(f, maxBytes))
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取日志失败: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, systemInternalFailure("读取日志失败", err))
 		return
 	}
 	// 窗口起点可能落在某行中段——切在多字节
 	// UTF-8 rune 中间时首行残段带无效字节,JSON 编码后以 U+FFFD 污染输出。
 	// 统一口径抽享 tailLogWindow（GetCaddyLogs 同 helper）。
-	data = tailLogWindow(data, startOffset)
+	data = tailLogWindow(f, data, startOffset)
 	lines := strings.Split(string(data), "\n")
 	if len(lines) > maxLines {
 		lines = lines[len(lines)-maxLines:]

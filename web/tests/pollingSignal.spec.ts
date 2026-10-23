@@ -12,7 +12,7 @@ import { createSSRApp, h } from 'vue'
 import { renderToString } from 'vue/server-renderer'
 
 import { usePollingTask, type PollingTask } from '../src/composables/usePollingTask.ts'
-import { FakeDocument, source } from './_helpers.ts'
+import { FakeDocument, mountForLifecycle, source } from './_helpers.ts'
 
 // onUnmounted 在无组件实例时会打印 Vue 警告——pause 用例在 finally 里恢复
 // console.warn；stop/onError/可见性用例经 SSR 渲染提供真实组件实例，不触碰该警告。
@@ -154,6 +154,39 @@ test('usePollingTask：document.hidden 停摆定时轮询，恢复可见立即�
     assert.equal(doc.listenerCount, 0, 'stop 必须摘除 visibilitychange 监听')
   } finally {
     polling?.stop()
+    mock.timers.reset()
+    delete host.document
+  }
+})
+
+// 卸载清理：页面切换（Dashboard/ClusterSettings/CertJobs/Rules 四个消费页）时必须
+// stop——否则定时器继续打后端、visibilitychange 监听残留（重进页面叠加→多倍轮询）。
+// SSR 不执行 onUnmounted，必须用真实组件实例 mount 再 unmount。
+test('usePollingTask 随组件卸载停止轮询并摘除监听', async () => {
+  const doc = new FakeDocument()
+  const host = globalThis as { document?: unknown }
+  host.document = doc
+  let calls = 0
+  let polling!: PollingTask
+  mock.timers.enable({ apis: ['setInterval'] })
+  const flush = (): Promise<void> => new Promise<void>((resolve) => setTimeout(resolve, 0))
+  try {
+    const mounted = mountForLifecycle(() => {
+      polling = usePollingTask(async () => { calls++ }, { interval: 50 })
+      polling.start()
+    })
+    mock.timers.tick(50)
+    await flush()
+    assert.equal(calls, 1, '前置：定时轮询在跑')
+    assert.equal(doc.listenerCount, 1, '前置：挂载后有一个 visibilitychange 监听')
+
+    mounted.unmount()
+    assert.equal(polling.isDisposed(), true, '卸载必须 stop 轮询（永久终止）')
+    assert.equal(doc.listenerCount, 0, '卸载必须摘除 visibilitychange 监听')
+    mock.timers.tick(200)
+    await flush()
+    assert.equal(calls, 1, '卸载后不得再发起轮次')
+  } finally {
     mock.timers.reset()
     delete host.document
   }

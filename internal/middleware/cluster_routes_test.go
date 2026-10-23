@@ -33,7 +33,7 @@ func newMiddlewareTestRouterAtPort(t *testing.T, port int) *gin.Engine {
 	}
 	t.Cleanup(func() {
 		_ = db.Close()
-		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB)
 	})
 	cfg := &config.Config{
 		Port: port, StaticDir: t.TempDir(), CaddyAdminURL: "http://127.0.0.1:1",

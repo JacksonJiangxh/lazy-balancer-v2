@@ -120,7 +120,11 @@ func crawlerDueSources(trigger string) ([]crawlerSource, error) {
 			return nil, err
 		}
 		if trigger != "manual" && nextUpdate != "" {
-			if due, err := time.Parse(crsTimeLayout, nextUpdate); err == nil && now.Before(due) {
+			// 到期判定与 crawlerNextSlot/earliestEnabledSourceUpdate 同口径：
+			// 库内允许平面串与 RFC3339 混格式，单布局 time.Parse 失败会被当作
+			// 「已到期」→ 未到期的源被同轮提前下载。无法解析=按到期处理
+			// （保持 fail-safe：只会多跑不会漏跑）。
+			if due, ok := ParseUTCTimeDual(nextUpdate); ok && now.Before(due) {
 				continue
 			}
 		}

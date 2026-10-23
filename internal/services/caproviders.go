@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strings"
 	"time"
 
@@ -26,6 +27,23 @@ const (
 	ZeroSSLDirectoryURL     = "https://acme.zerossl.com/v2/DV90"
 	caProviderColumns       = "id, name, provider, directory_url, COALESCE(credentials,''), max_concurrent, min_interval_ms, enabled, created_at, updated_at"
 )
+
+// CredentialsSemanticallyEqual 报告两段凭证 JSON 语义相等（键序/空白无关）：
+// 解析后按规范化形态比较。
+// CA 提供商与 DNS 配置两处写路径必须共用本判定——同一次「只改名保存」在两个
+// 页面若口径不同，会让审计记出「凭证变更」噪声，并额外重写 dns_credentials。
+// 任一侧不是合法 JSON 时退化为字符串比较（判别本身不吞错——合法 JSON 门
+// 由服务层写侧负责）。
+func CredentialsSemanticallyEqual(a, b string) bool {
+	var left, right any
+	if err := json.Unmarshal([]byte(a), &left); err != nil {
+		return a == b
+	}
+	if err := json.Unmarshal([]byte(b), &right); err != nil {
+		return a == b
+	}
+	return reflect.DeepEqual(left, right)
+}
 
 // zerosslEABURL 是包级变量以便测试注入伪 ZeroSSL 端点。
 var zerosslEABURL = "https://api.zerossl.com/acme/eab-credentials-email"
@@ -338,11 +356,21 @@ func (s *CAProviderService) UpdateCAProvider(id int, req models.UpdateCAProvider
 			return models.CAProvider{}, &CAProviderInUseError{Rules: references, Total: total}
 		}
 	}
-	query := `
-		UPDATE ca_providers SET name=?, provider=?, directory_url=?, credentials=?, max_concurrent=?, min_interval_ms=?, enabled=?, updated_at=datetime('now')
-		WHERE id=?
-	`
-	args := []any{existing.Name, existing.Provider, existing.DirectoryURL, existing.Credentials, existing.MaxConcurrent, existing.MinIntervalMS, existing.Enabled, id}
+	// 凭证列只在「请求值与事务内旧行语义不等」时写（动态 SET，与 DNS 配置更新
+	// 同型）：TestCAProvider / 签发预检会在不持 caddyOpMu 的情况下自动申请并写入
+	// ZeroSSL EAB，整行 UPDATE 会把它静默回滚——①前端「测试成功→编辑陈旧表单→
+	// 保存」提交的是测试前的空 EAB；②并发路径请求在旧行读取后、UPDATE 前提交了
+	// EAB。不写该列即两个路径都无损失，而真实修改（含切 CA 时的空值归一）照常落库。
+	credentialsChanged := !CredentialsSemanticallyEqual(existing.Credentials, old.Credentials)
+	setClauses := []string{"name=?", "provider=?", "directory_url=?"}
+	args := []any{existing.Name, existing.Provider, existing.DirectoryURL}
+	if credentialsChanged {
+		setClauses = append(setClauses, "credentials=?")
+		args = append(args, existing.Credentials)
+	}
+	setClauses = append(setClauses, "max_concurrent=?", "min_interval_ms=?", "enabled=?", "updated_at=datetime('now')")
+	args = append(args, existing.MaxConcurrent, existing.MinIntervalMS, existing.Enabled, id)
+	query := `UPDATE ca_providers SET ` + strings.Join(setClauses, ", ") + ` WHERE id=?`
 	if disabling {
 		query += ` AND enabled=1 AND (SELECT COUNT(*) FROM ca_providers WHERE enabled=1 AND id != ?) >= 1`
 		args = append(args, id)

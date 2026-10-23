@@ -204,7 +204,10 @@ func TestImportV1Config_cleansDisappearedRuleMetricsAndLogs(t *testing.T) {
 	}
 	oldRuleCleanup, oldCertCleanup := removeImportRuleLogFiles, removeImportCertJobLogFiles
 	var ruleLogIDs, certLogIDs []string
-	removeImportRuleLogFiles = func(ruleID string) { ruleLogIDs = append(ruleLogIDs, ruleID) }
+	removeImportRuleLogFiles = func(ruleID string) error {
+		ruleLogIDs = append(ruleLogIDs, ruleID)
+		return nil
+	}
 	removeImportCertJobLogFiles = func(ruleID string) error {
 		certLogIDs = append(certLogIDs, ruleID)
 		return nil

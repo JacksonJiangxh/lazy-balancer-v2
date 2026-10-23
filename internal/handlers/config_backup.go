@@ -42,7 +42,7 @@ const importVersionSeedSentinel = "__lazy_balancer_import_seed__"
 //
 // v2.1.2-v2.1.9(12 表)与 v2.1.10-v2.2.13(14 表)全量备份是合法 Version=2
 // 文件,必需表门不得因缺迟到表硬拒;缺席表由导入链「缺席=保留本地」语义承接
-// (validateV2Backup 内补空表仅供校验均匀性,importConfigBackupCore 将未实际
+// (校验链完整性校验门内补空表仅供校验均匀性,importConfigBackupCore 将未实际
 // 导出的表还原为缺席,restore 跳过未携带表)。v2.1.1 及更早的文件在完整性
 // 校验和门已被拒,与本清单无关。
 var configBackupLateTables = map[string]struct{}{
@@ -291,6 +291,10 @@ var configBackupProtectedConfigKeys = map[string]bool{
 	// db.go:2285/2346 启动迁移 Scan int）——同口径纳入保护。
 	"threat_traffic_sample_unified_migrated": true,
 	"security_events_retention_migrated":     true,
+	// global_config.dns_credentials 为遗留列（读路径不回显、写路径已移除、
+	// 存量由启动迁移置空）：导出剔除 + 导入跳过，避免旧备份把不可见凭证
+	// 写回并被后续备份继续外带。
+	"dns_credentials": true,
 }
 
 // 规则库跳过警告统一文案(审计侧与响应侧共用,全角括号口径)。
@@ -2235,8 +2239,24 @@ func backupIndexColumns(indexName string) ([]string, error) {
 	return columns, nil
 }
 
+// backupUniqueNumericKey 把整数形字符串编成与数值同域的键：INTEGER 亲和性
+// 会把 "5" 与 5 落成同一存储值，键值分域会让该形态逃过预检、直到直插时以
+// 500「写入表 …」整体回滚——预检的声明目标正是把键冲突降到可修正的 400。
+func backupUniqueNumericKey(value string) (string, bool) {
+	if value == "" || strings.TrimSpace(value) != value {
+		return "", false
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return "", false
+	}
+	return "n:" + strconv.FormatInt(parsed, 10), true
+}
+
 // backupUniqueKeyValue 生成唯一性比对键：任一列 NULL/缺列即返回 false
 // （SQLite 唯一索引对含 NULL 的行不作约束）；未知形态交给类型门，不猜。
+// 整数形字符串与整数/整数值浮点统一编入数值域（"5" 与 5 在库中同值）；
+// 布尔独立域（JSON true/false 与整数 1/0 的语义不同，交给类型门判断）。
 func backupUniqueKeyValue(row map[string]any, columns []string) (string, bool) {
 	parts := make([]string, len(columns))
 	for index, column := range columns {
@@ -2246,6 +2266,10 @@ func backupUniqueKeyValue(row map[string]any, columns []string) (string, bool) {
 		}
 		switch typed := value.(type) {
 		case string:
+			if numeric, ok := backupUniqueNumericKey(typed); ok {
+				parts[index] = numeric
+				continue
+			}
 			parts[index] = "s:" + typed
 		case bool:
 			if typed {
@@ -2254,11 +2278,15 @@ func backupUniqueKeyValue(row map[string]any, columns []string) (string, bool) {
 				parts[index] = "b:0"
 			}
 		case float64:
+			if typed == math.Trunc(typed) && typed >= math.MinInt64 && typed <= math.MaxInt64 {
+				parts[index] = "n:" + strconv.FormatInt(int64(typed), 10)
+				continue
+			}
 			parts[index] = "f:" + strconv.FormatFloat(typed, 'g', -1, 64)
 		case int:
-			parts[index] = "i:" + strconv.Itoa(typed)
+			parts[index] = "n:" + strconv.Itoa(typed)
 		case int64:
-			parts[index] = "i:" + strconv.FormatInt(typed, 10)
+			parts[index] = "n:" + strconv.FormatInt(typed, 10)
 		default:
 			return "", false
 		}
@@ -5139,7 +5167,6 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 			c.Request.Body = io.NopCloser(bytes.NewReader(data))
 		}
 	}
-	exportedTables := map[string]bool{}
 	var backup configBackup
 	if err := c.ShouldBindJSON(&backup); err != nil {
 		if isRequestBodyTooLarge(err) {
@@ -5149,216 +5176,40 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "备份文件格式不正确"})
 		return
 	}
-	for table := range backup.Tables {
-		exportedTables[table] = true
-	}
-	// 完整性（checksum/结构/必需表/管理员门）先于 sections 过滤；行级门
-	// （布尔/白名单/cert 状态/凭证）在过滤之后执行，未选分类的坏行不误拒整包。
-	usedLegacyChecksum, err := verifyBackupIntegrity(backup)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
+	// 完整性 → 分类选择/过滤 → 软跳过 → 行级门 → 形态/引用/任务/全局配置门
+	// 全部由 importValidationSteps 单源编排，与预览端点、测试用例同一条链。
+	chain, chainErr := validateImportBackupChain(c.Request.Context(), importValidationDeps{
+		DB:                     db.DB,
+		ValidateRuleListenPort: h.validateRuleListenPortForSave,
+	}, &backup, importValidationOptions{LbbakPayload: lbbakFiles, RequestedSections: c.Query("sections")})
+	if chainErr != nil {
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: chainErr.Error()})
 		return
 	}
-	// 有效分类选择单源（与预览共用 resolveImportSectionSelection）：
-	// lbbak 通道的 ?sections= 与体内 sections 取交集，纯 JSON 通道以体内
-	// sections 为准；交集为空显式 400 点名双方选择。
-	// 必须在完整性校验之后解析——v3 校验和覆盖体内 sections（还原范围），
-	// 用请求交集覆盖后再校验会把合法的子集导入误判为篡改。
-	if err := resolveImportSectionSelection(&backup, c.Query("sections")); err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
-		return
-	}
-	// validateV2Backup 会把缺失表回填为空切片(校验均匀性),此处还原「缺席」
-	// 语义——分类导出不含的表不得被当作「清空本地表」应用
-	for table := range backup.Tables {
-		if !exportedTables[table] {
-			delete(backup.Tables, table)
-		}
-	}
-	if usedLegacyChecksum {
+	sectionTables := chain.SectionTables
+	skipWarnings := chain.SkipWarnings
+	disabledConflicts := chain.DisabledConflicts
+	crsTreeReplaced := chain.CRSTreeReplaced
+	acmeDanglingImported := chain.ACMEDanglingImported
+	certJobProviderWarnings := chain.CertJobProviderWarnings
+	autobanClampNotes := chain.AutobanClampNotes
+	wafMetadataSkipped := chain.WAFMetadataSkipped
+	wafCRSMetadataSkipped := chain.WAFCRSMetadataSkipped
+	wafXdbMetadataSkipped := chain.WAFXdbMetadataSkipped
+	if chain.UsedLegacyChecksum {
 		// 旧格式校验和仅覆盖数据表、不含全局配置区，完整性保障较弱，
 		// 显式记审计警告以便追溯（预览端点只读不落审计，避免 UI 选择文件即刷屏）。
 		recordAudit(c, action+"警告", "配置备份", "使用旧格式校验和（仅覆盖数据表，不含全局配置）验证备份完整性，建议升级后重新导出备份")
 	}
-	// sections 过滤前置到全部形态/任务
-	// 校验之前——过滤后 backup.Tables 只剩实际导入表:
-	// ①未选分类的坏行不再误拒整包(此前 validateV2BackupRules 等对全量表执行);
-	// ②acmeImportRefIndex.validate「备份有表按备份行、缺表按 live」自动等于
-	//   「过滤后导入表∪live 保留表」正确口径——备份带 certificate_configs 但用户
-	//   未勾系统数据时,不再按将被丢弃的备份行误放行;
-	// ③全局配置区同理:仅 includeGlobal 时参与校验/钳制(未选系统数据时
-	//   backup.Config=nil,validateV2BackupAdminTLS/钳制链自然短路)。
-	// 校验和仍验整包(上方 validateV2Backup),未选分类的表与全局配置保持现状。
-	// (导入/预览双路径同序,见 ValidateConfigImport。)
-	// backupCarriedCertTables:备份是否原本携带 cert 表——下方反向悬挂降级
-	// 仅对「从未携带」开放;携带却被分类丢弃时维持硬拒绝(误放行关闭)。
-	backupCarriedCertTables := false
-	if _, ok := backup.Tables["certificate_configs"]; ok {
-		backupCarriedCertTables = true
+	// 版本表随文件缺失剔除的审计留痕（预览侧同一事实以响应 warning 呈现）。
+	if wafMetadataSkipped {
+		recordAudit(c, action+"警告", "配置备份", warningWafMetadataSkipped)
 	}
-	if _, ok := backup.Tables["ca_providers"]; ok {
-		backupCarriedCertTables = true
+	if wafCRSMetadataSkipped {
+		recordAudit(c, action+"警告", "配置备份", warningWafCRSMetadataSkipped)
 	}
-	sectionTables, includeGlobal, sectionsOK := configBackupSectionTables(backup.Sections)
-	if !sectionsOK {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "未知的配置分类"})
-		return
-	}
-	for table := range backup.Tables {
-		if !sectionTables[table] {
-			delete(backup.Tables, table)
-		}
-	}
-	if !includeGlobal {
-		backup.Config = nil
-	}
-	// 分类过滤后的零导入判据（与预览共用 assertImportScopeHasContent）：
-	// 选择与备份内容无交集（过滤后既无表、也未选系统数据）时显式 400 点名，
-	// 杜绝「什么都没导入但提示成功」。软跳过之后的二次判据在同序位置。
-	if err := assertImportScopeHasContent(backup.Tables, includeGlobal, backup.Sections, importScopeFiltered); err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
-		return
-	}
-	// 纯 JSON 威胁源与软跳过行在结构门之前收敛（预览共用同一准备序列）。
-	skipWarnings, prepErr := prepareV2BackupSkips(&backup, lbbakFiles, sectionTables)
-	if prepErr != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: prepErr.Error()})
-		return
-	}
-	// 版本表 update_status 属于运行态词表列（前端状态徽标/轮询判定直读，渲染层
-	// 零兜底）：带外直写或旧备份可携带词表外值（如历史业务态混入），导入门
-	// 归一为 idle 并留警告——不硬拒（旧备份兼容优先于严格性，与策略枚举归一
-	// 同哲学）。
-	skipWarnings = append(skipWarnings, normalizeImportedVersionUpdateStatuses(backup.Tables)...)
-	// 行级门在 sections 过滤与软跳过之后（未选/已跳分类的坏行不误拒整包）。
-	if err := validateV2BackupRows(c.Request.Context(), db.DB, backup); err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
-		return
-	}
-	// users 键存在且为空数组=导入将清空全部账户
-	// （合法导出恒携带 ≥1 启用管理员；键缺席的分类导出已在上方缺席还原时删除，
-	// 不受影响）——校验期硬拒，文案与预览端一致（事务内管理员守卫在 restore
-	// 之后才兜底，错误口径不点名真实原因）。
-	if rows, ok := backup.Tables["users"]; ok && len(rows) == 0 {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "备份 users 表为空，导入将清空全部账户，已拒绝"})
-		return
-	}
-	// 规则库数据库分类要求文件本体(lbbak):分类选择流(显式携带 sections)
-	// 中无文件却勾选该分类 → 剔除其表并警告,防记录与文件分叉(2026-09-18
-	// 用户裁定)。旧式全量 JSON 导入(无 sections 字段)保持原语义不动。
-	// 规则库版本记录与文件必须同批落库:纯 JSON 备份(非 lbbak)不可能携带
-	// 数据文件,版本表恒跳过——否则记录与本地文件分叉(2026-09-18 用户裁定:
-	// 只有元数据=该类配置不应导入)。lbbak 无 waf 条目同理。
-	// 与过滤的相对顺序固定为「先剔除未选表,再按文件缺失跳过版本表」。
-	wafMetadataSkipped := false
-	wafCRSMetadataSkipped := false
-	wafXdbMetadataSkipped := false
-	if sectionTables["security_crs_version"] {
-		crsMissing := lbbakFiles == nil || lbbakFiles.CRSTarGz == nil
-		xdbMissing := lbbakFiles == nil || lbbakFiles.Xdb == nil
-		switch {
-		case crsMissing && xdbMissing:
-			for _, t := range []string{"security_crs_version", "security_ip2region_version"} {
-				delete(backup.Tables, t)
-			}
-			wafMetadataSkipped = true
-			recordAudit(c, action+"警告", "配置备份", warningWafMetadataSkipped)
-		case crsMissing:
-			// 单侧文件缺失→仅跳过对应版本表(记录与文件同批落地)。
-			delete(backup.Tables, "security_crs_version")
-			wafCRSMetadataSkipped = true
-			recordAudit(c, action+"警告", "配置备份", warningWafCRSMetadataSkipped)
-		case xdbMissing:
-			delete(backup.Tables, "security_ip2region_version")
-			wafXdbMetadataSkipped = true
-			recordAudit(c, action+"警告", "配置备份", warningWafXdbMetadataSkipped)
-		}
-	}
-	if err := validateV2BackupCertJobStatuses(backup.Tables); err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
-		return
-	}
-	// 软跳过/剔除步之后的零导入判据（与预览同序同位）：软跳过清空表集后
-	// 继续提交会 200 报「成功」但实际零写入——此处以与预览一致的文案 400。
-	if err := assertImportScopeHasContent(backup.Tables, includeGlobal, backup.Sections, importScopeSkipped); err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
-		return
-	}
-	// content_type 白名单值域收敛（带外通道门，渲染侧另有双保险）。
-	normalizeBlockPageContentTypes(backup.Tables)
-	// 冲突置禁用前移到逐行校验之前——将被自动禁用的规则不投入运行，
-	// 其 enabled-only 违规（80+TLS+跳转自环、http/https 上游混布等）不应整包
-	// 400 阻断自愈。冲突键依赖规范化域名，故先做与 validateV2BackupRules 同
-	// 口径的域名归一（该步在此处幂等）。
-	canonicalizeBackupRuleDomains(backup.Tables["lb_rules"])
-	disabledConflicts := disableV2RuleConflicts(backup.Tables["lb_rules"])
-	if err := validateBackupRuleReferences(backup.Tables); err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
-		return
-	}
-	if err := validateV2BackupRules(backup.Tables, h.validateRuleListenPortForSave); err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
-		return
-	}
-	// 本次导入同时替换 CRS 规则树时，组号/规则 ID 的
-	// 存在性以导入后规则树为准，live 索引不是同一代——降级为形状校验并在
-	// 响应/审计侧告警（crstreeReplacedWarning）。
-	crsTreeReplaced := sectionTables["security_crs_version"] && lbbakFiles != nil && lbbakFiles.CRSTarGz != nil
-	if err := validateV2BackupSecurityPolicies(backup.Tables, crsTreeReplaced); err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
-		return
-	}
-	// TLS 形态校验与任务不变量同在冲突置禁用之后执行——将自动禁用
-	// 的规则不投入运行，不参与运行态形态/不变量校验（导入/预览双路径同序，
-	// 见 ValidateConfigImport）。
-	// 反向悬挂预检:「导规则不导 cert 配置」且备份从未携带 cert 表时,
-	// live 配置被保留,启用 ACME 规则引用 live 缺失降级为悬挂警告(与下方
-	// 预检对称,不阻断,进 responseWarnings+审计);备份携带 cert 表却被
-	// 分类过滤丢弃时维持硬拒绝(误放行关闭)。
-	softLiveACMERefs := sectionTables["lb_rules"] &&
-		!sectionTables["certificate_configs"] && !sectionTables["ca_providers"] &&
-		!backupCarriedCertTables
-	acmeDanglingImported, tlsShapeErr := validateV2BackupTLSShapeSoft(backup.Tables, softLiveACMERefs)
-	if tlsShapeErr != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: tlsShapeErr.Error()})
-		return
-	}
-	// 任务不变量在冲突置禁用之后执行——将自动禁用的规则不投入
-	// 运行，不参与运行态不变量（导入/预览双路径同序，见 ValidateConfigImport）。
-	// cert_jobs 的 CA 提供商悬挂/禁用引用在本处归一为跟随默认并产出警告。
-	certJobProviderWarnings, certJobsErr := validateV2BackupCertJobs(backup.Tables)
-	if certJobsErr != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: certJobsErr.Error()})
-		return
-	}
-	// 写全局配置前按 UpdateAdminTLS 同口径校验 admin_tls_*——坏配置
-	// 会使下次启动进程退出（崩溃循环），整包 400 保持零写入语义。
-	// 仅 includeGlobal 时全局配置区参与校验/钳制(未选系统数据时
-	// backup.Config 已置 nil,本校验与下方钳制链自然短路)。
-	if err := validateV2BackupAdminTLS(backup.Config); err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
-		return
-	}
-	// 自动封禁六列与受信代理三 TEXT 列导入门（导入/
-	// 预览双路径同序；归一写回供下方 UPDATE 直写，库恒有效）。
-	autobanClampNotes, err := validateV2BackupAutobanConfig(backup.Config)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
-		return
-	}
-	if err := validateV2BackupTrustedProxyConfig(backup.Config, backup.Tables); err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
-		return
-	}
-	// 运行期设置门（timezone/坐标/枚举/超时/default_ca 存在性）。
-	if err := validateV2BackupRuntimeSettings(backup.Config, backup.Tables); err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
-		return
-	}
-	// 自动备份设置组门（frequency/HH:MM/day/keep/sections）。
-	if err := validateV2BackupAutoBackupConfig(backup.Config); err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
-		return
+	if wafXdbMetadataSkipped {
+		recordAudit(c, action+"警告", "配置备份", warningWafXdbMetadataSkipped)
 	}
 	// 六个整型钳制键收敛为单表单循环（审计留痕随钳制产生）。
 	configClampNotes := clampBackupConfigInts(backup.Config)
@@ -5455,6 +5306,11 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	// lb_rules 同批替换时跳过预检。预检必须读加锁后的事务视图
 	// 锁外读会在「读→取得 caddyOpMu」窗口与规则更新竞态。
 	acmeDanglingRules := 0
+	// off→custom_only 归一条数（旧语义兼容）：导入把「WAF 关闭 + 挂启用自定义
+	// 规则」的策略静默归一为 custom_only（自定义规则从全关变生效）——行为与
+	// 启动迁移一致，但必须在响应 warnings 与审计里可见，否则运维只能翻
+	// stdout 才能解释业务误拦。
+	customOnlyNormalized := int64(0)
 	// 导入前快照自动备份开关——提交后仅在 off→on 转换时重置水位线。
 	// known=false 表示该列读取失败（未知）——off→on 判定不可信，
 	// 跳过水位重置。
@@ -5520,6 +5376,32 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	}
 	if acmeDanglingRules > 0 {
 		recordAudit(c, action+"警告", "配置备份", fmt.Sprintf(action+"后 %d 条启用 ACME 规则的提供商引用悬挂——下一次签发/续签将失败,请补齐 DNS 提供商配置", acmeDanglingRules))
+	}
+	// 「系统数据」替换 CA 提供商（或证书配置）而证书任务未随包时，live
+	// cert_jobs 的显式 provider 引用不重验：备份里同 id 提供商可为 disabled
+	// （或该 id 在备份中缺失），导入后该任务按显式 provider 解析失败 →
+	// failed 终态（不在续签/补扫通道内，只能手工重试），证书到期无自动接管。
+	// 规则侧同条件已有悬挂告警（上方 acmeDanglingRules），此处补齐任务侧的
+	// 可观测性：只告警不阻断（「缺席=保留本地」语义不变；id 缺失由 caqueue
+	// 回落首个启用提供商自愈，禁用则是真实失败面）。
+	certJobDanglingProviders := 0
+	if _, certJobsCarried := backup.Tables["cert_jobs"]; !certJobsCarried &&
+		(sectionTables["ca_providers"] || sectionTables["certificate_configs"]) {
+		if rows, qerr := tx.QueryContext(ctx, `SELECT COALESCE(ca_provider_id,0) FROM cert_jobs WHERE COALESCE(ca_provider_id,0) <> 0`); qerr == nil {
+			for rows.Next() {
+				var providerID int
+				if rows.Scan(&providerID) != nil {
+					continue
+				}
+				if !acmeRefResolvablePostImport(backup.Tables, "ca_providers", providerID) {
+					certJobDanglingProviders++
+				}
+			}
+			rows.Close()
+		}
+	}
+	if certJobDanglingProviders > 0 {
+		recordAudit(c, action+"警告", "配置备份", fmt.Sprintf(action+"后 %d 个证书任务的 CA 提供商已禁用或不存在——续签将失败（任务转 failed 终态），请补齐 CA 提供商或在证书页手工重试", certJobDanglingProviders))
 	}
 	// 初检读取 live 的三项合并校验在锁内重跑（任何写之前）。
 	if err := revalidateImportLiveDependencies(ctx, tx, &backup, sectionTables); err != nil {
@@ -5758,7 +5640,11 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: action + "失败，已回滚: " + err.Error()})
 			return
 		} else if n, _ := result.RowsAffected(); n > 0 {
+			customOnlyNormalized = n
 			services.Logf("info", "配置导入：%d 个 mode=off 且挂启用自定义规则的策略已归一为 custom_only（旧语义兼容）", n)
+			// 注释承诺的「留审计提示」在此落地：归一改变运行态语义（自定义
+			// 规则从全关变生效），必须在操作审计与响应 warnings 双通道可见。
+			recordAudit(c, action+"警告", "配置备份", fmt.Sprintf(action+"后 %d 个 WAF 模式为 off 且挂启用自定义规则的策略已按旧语义归一为 custom_only（自定义规则开始生效）", n))
 		}
 	}
 	// 备份可能携带 ≥2 个 is_default=1 的拦截页。restoreTable
@@ -5947,12 +5833,29 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	respondAfterWafFailure := func(status int, message string) {
 		failureWarnings := append([]string{}, skipWarnings...)
 		failureWarnings = append(failureWarnings, wafApply.Warnings...)
-		if wafApply.FilesLanded {
-			failureWarnings = append(failureWarnings, "规则库文件已按备份落盘，但数据库已回滚——文件与版本记录可能分裂，请重新导入或触发规则库更新以收敛")
+		// 文件面提示按 abort 的实际回退结论生成：已回退=明示一致；
+		// 回退失败=显性告知可能分裂（不得沿用固定文案谎报）。
+		if warning := lbbakWafRollbackWarning(wafApply.FilesLanded, session.wafRestoreAttempted, session.wafRestoreErr); warning != "" {
+			failureWarnings = append(failureWarnings, warning)
 		}
+		failureWarnings = append(failureWarnings, session.wafRestoreWarnings...)
 		c.JSON(status, models.APIResponse{Code: status, Message: message, Data: gin.H{
 			"summary": counts, "disabled_conflicts": disabledConflicts, "warnings": failureWarnings,
 		}})
+	}
+	// 落盘前快照将被修改的 WAF 路径（CRS 整树/xdb+版本标记/全部威胁名单
+	// 文件）：落盘先于事务提交，提交或校验失败回滚数据库时文件必须同批回退。
+	// 快照失败即中止——此时尚未写入任何字节，fail-closed 无副作用。
+	if wafFilePhase {
+		threatFilesSnapshotted := lbbakFiles != nil && (len(lbbakFiles.ThreatIplists) > 0 || threatFileReconcile)
+		snapshot, snapshotErr := snapshotLbbakWafTargets(lbbakFiles, threatFilesSnapshotted)
+		if snapshotErr != nil {
+			err = session.abort(fmt.Errorf("快照规则库文件失败: %w", snapshotErr))
+			recordAudit(c, action+"失败", "配置备份", "快照规则库文件失败（未写入任何文件）: "+snapshotErr.Error())
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: action + "失败，已回滚: " + err.Error()})
+			return
+		}
+		session.wafSnapshot = snapshot
 	}
 	if lbbakFiles != nil && sectionTables["security_crs_version"] {
 		wafApply = applyLbbakWafFilesInLock(c, action, lbbakFiles, services.SanitizeBundleVersion(ip2regionTagFromBackup(backup.Tables)))
@@ -6234,6 +6137,12 @@ func (h *Handlers) importConfigBackupCore(c *gin.Context, data []byte, dataOK bo
 	}
 	if prunedBindings > 0 {
 		responseWarnings = append(append([]string{}, responseWarnings...), fmt.Sprintf("已按导入后的规则与策略视图清理 %d 条悬挂安全策略绑定", prunedBindings))
+	}
+	if customOnlyNormalized > 0 {
+		responseWarnings = append(append([]string{}, responseWarnings...), fmt.Sprintf("%d 个 WAF 模式为 off 且挂启用自定义规则的策略已按旧语义归一为 custom_only（自定义规则开始生效）", customOnlyNormalized))
+	}
+	if certJobDanglingProviders > 0 {
+		responseWarnings = append(append([]string{}, responseWarnings...), fmt.Sprintf("%d 个证书任务的 CA 提供商已禁用或不存在——续签将失败（任务转 failed 终态），请补齐 CA 提供商或在证书页手工重试", certJobDanglingProviders))
 	}
 	if droppedTCPBindings > 0 {
 		responseWarnings = append(append([]string{}, responseWarnings...), fmt.Sprintf("已解除 %d 条 TCP 规则的安全策略绑定（TCP 不参与策略渲染）", droppedTCPBindings))

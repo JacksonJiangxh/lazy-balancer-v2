@@ -293,6 +293,46 @@ func TestUpdateAutoBackupSettings_validationMatrix(t *testing.T) {
 	}
 }
 
+// 超 16 KiB 请求体必须按 413 归因：此前 ShouldBindJSON 任一错误统一 400
+// 「请求格式不正确」，把体积问题伪装成 JSON 语法问题（与同族端点 413 口径
+// 分裂，客户端无法统一按「请求过大」处理）。
+func TestUpdateAutoBackupSettings_oversizedBodyReturns413(t *testing.T) {
+	h := newAutoBackupTestHandlers(t)
+	// 填充必须落在 JSON 值内部：尾部空白在解析完对象后不再读取，不会触发
+	// 体积上限。
+	body := `{"enabled":true,"frequency":"daily","time":"03:00","day":1,"keep":5,"sections":["users"],"pad":"` +
+		strings.Repeat("A", 17<<10) + `"}`
+	response := serveAutoBackupJSON(t, h, http.MethodPut, "/settings/auto-backup", "/settings/auto-backup", body, h.UpdateAutoBackupSettings)
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status=%d body=%s, want 413", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "16 KiB") {
+		t.Fatalf("body=%s, want 点名 16 KiB 上限", response.Body.String())
+	}
+}
+
+// 「缺少必填字段」文案必须与实际的 nil 判断一致：sections 非指针、缺键即空
+// 切片，走独立的「备份范围不能为空」归因——把它写进必填清单会让客户端按文案
+// 排查错方向。
+func TestUpdateAutoBackupSettings_missingFieldMessagesAttributeCorrectly(t *testing.T) {
+	h := newAutoBackupTestHandlers(t)
+	missingSections := `{"enabled":true,"frequency":"daily","time":"03:00","day":1,"keep":5}`
+	response := serveAutoBackupJSON(t, h, http.MethodPut, "/settings/auto-backup", "/settings/auto-backup", missingSections, h.UpdateAutoBackupSettings)
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "备份范围不能为空") {
+		t.Fatalf("status=%d body=%s, want 400 备份范围不能为空", response.Code, response.Body.String())
+	}
+
+	h2 := newAutoBackupTestHandlers(t)
+	missingKeep := `{"enabled":true,"frequency":"daily","time":"03:00","day":1,"sections":["users"]}`
+	response = serveAutoBackupJSON(t, h2, http.MethodPut, "/settings/auto-backup", "/settings/auto-backup", missingKeep, h2.UpdateAutoBackupSettings)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s, want 400", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "sections") {
+		t.Fatalf("body=%s, 缺少必填字段文案不得把 sections 计入（缺键走另一条归因）", response.Body.String())
+	}
+}
+
 // 保留份数上限收紧为 30 后,升级前保存的越界存量值(31-100)读侧必须回退
 // 安全默认 7——prune 消费回退值,不得沿用越界保留。
 func TestLoadAutoBackupKeepSetting_outOfRangeFallsBack(t *testing.T) {

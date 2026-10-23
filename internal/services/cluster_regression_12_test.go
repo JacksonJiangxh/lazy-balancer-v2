@@ -8,9 +8,11 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"lazy-balancer-v2/internal/models"
 )
@@ -28,6 +30,11 @@ func TestApplyWafFileBundle_rejectsHashWithoutContent(t *testing.T) {
 	t.Cleanup(OverrideWafLivePathsForTest(crsDir, xdbPath))
 	// 预置 live 内容,断言拒绝后 live 树未动
 	writeTestFile(t, xdbPath, "LOCAL-XDB")
+	crsRulePath := filepath.Join(crsDir, "rules", "a.conf")
+	if err := os.MkdirAll(filepath.Dir(crsRulePath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, crsRulePath, "LOCAL-CRS")
 
 	bundle := &WafFileBundle{IP2RegionSha: "deadbeef", IP2RegionTag: "v1"}
 	if _, _, _, err := ApplyWafFileBundle(bundle); err == nil || !strings.Contains(err.Error(), "未携带内容") {
@@ -42,7 +49,10 @@ func TestApplyWafFileBundle_rejectsHashWithoutContent(t *testing.T) {
 	if _, _, _, err := ApplyWafFileBundle(crsBundle); err == nil || !strings.Contains(err.Error(), "未携带内容") {
 		t.Fatalf("crs hash-without-content must be rejected, got %v", err)
 	}
-	_ = crsDir
+	// 拒绝路径不得动本地 CRS 树（注释声称「CRS 路径未动」必须由断言承担）。
+	if got, err := osReadFileForTest(t, crsRulePath); err != nil || got != "LOCAL-CRS" {
+		t.Fatalf("CRS 树在拒绝路径被改动: %q err=%v", got, err)
+	}
 }
 
 // 口径对齐,health_json 里的长错误不再撑大 nodes 行)。
@@ -61,6 +71,14 @@ func TestReportNode_truncatesLastSyncError(t *testing.T) {
 	}
 	if len(stored) > 512 {
 		t.Fatalf("last_sync_error len=%d, want ≤512", len(stored))
+	}
+	// 截断必须保留前缀与合法 UTF-8 边界：只断长度时「返回空串」也能通过，
+	// 运维取证面（节点页/上报）会静默失效。
+	if !utf8.Valid(stored) {
+		t.Fatal("截断后不是合法 UTF-8（多字节字符被拦腰截断）")
+	}
+	if len(stored) == 0 || !strings.HasPrefix(string(stored), "错错") {
+		t.Fatalf("stored=%q, want 保留原消息前缀", string(stored))
 	}
 }
 

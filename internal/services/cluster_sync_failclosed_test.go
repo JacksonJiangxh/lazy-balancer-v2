@@ -5,10 +5,13 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 
+	"lazy-balancer-v2/internal/config"
 	"lazy-balancer-v2/internal/models"
 )
 
@@ -101,6 +104,7 @@ func TestSyncMarkerPresent_readFailureTreatedAsPresent(t *testing.T) {
 // 计数递增且首个失败原因不变。
 func TestRecordSyncError_realDBPreservesMarkerAndCombinesRecoverableError(t *testing.T) {
 	_, database := newClusterTestService(t)
+	setNodeMasterRole(t, database, false) // 同步状态写只属于从节点语境
 	syncService := &SyncService{db: database}
 	ctx := context.Background()
 
@@ -126,5 +130,74 @@ func TestRecordSyncError_realDBPreservesMarkerAndCombinesRecoverableError(t *tes
 	}
 	if !strings.Contains(msg, "已连续 1 次") {
 		t.Fatalf("组合消息必须携带失败计数，got %q", msg)
+	}
+}
+
+// 可自愈类拉取错误不得覆盖 apply_ok_reload_failed 标记：标记是 304 全量重拉
+// 补偿的唯一触发器，覆盖后主节点恢复（反代正常/地址改回/对方重新升主）的
+// 每个周期都是 304，无标记、无漂移即返回 no-change——库=新版本而 Caddy 停在
+// 旧运行配置，直到下次真实变更或进程重启。
+func TestSyncService_Pull_transientFetchErrorsPreserveReloadMarker(t *testing.T) {
+	cases := []struct {
+		name    string
+		respond http.HandlerFunc
+	}{
+		{
+			// 反代错误页/响应截断：下一周期自然恢复。
+			name: "快照体截断",
+			respond: func(response http.ResponseWriter, _ *http.Request) {
+				response.Header().Set("Content-Type", "application/json")
+				_, _ = response.Write([]byte(`{"code":0,"data":`))
+			},
+		},
+		{
+			// 目标主节点已降级：对方重新升主即恢复。
+			name: "主节点已降级",
+			respond: func(response http.ResponseWriter, _ *http.Request) {
+				response.Header().Set("X-LB-Error-Code", "master_required")
+				response.WriteHeader(http.StatusForbidden)
+				_, _ = response.Write([]byte("该操作仅允许在主节点执行"))
+			},
+		},
+		{
+			// 未跟随的跨主机重定向：运维改回主节点地址即恢复。
+			name: "跨主机重定向",
+			respond: func(response http.ResponseWriter, _ *http.Request) {
+				response.Header().Set("Location", "http://elsewhere.invalid/api/v1/cluster/sync/snapshot")
+				response.WriteHeader(http.StatusFound)
+			},
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			_, database := newClusterTestService(t)
+			master := httptest.NewServer(testCase.respond)
+			defer master.Close()
+			if _, err := database.Exec("UPDATE global_config SET is_master=0, master_url=?, cluster_token='token', applied_version=7, sync_fingerprint='fp', last_sync_error=? WHERE id=1",
+				master.URL, encodeSyncError("apply_ok_reload_failed: Caddy /load 失败", models.SyncErrorCodeApplyFailed)); err != nil {
+				t.Fatal(err)
+			}
+			syncService := NewSyncService(database, &config.Config{DataDir: t.TempDir()}, nil)
+
+			_, err := syncService.Pull(context.Background())
+			if err == nil {
+				t.Fatal("want 拉取失败")
+			}
+			if code := syncErrorCode(err); code != models.SyncErrorCodeTransportError {
+				t.Fatalf("code=%q, want transport_error（自愈类错误必须归传输域）", code)
+			}
+			var stored string
+			if err := database.QueryRow("SELECT COALESCE(last_sync_error,'') FROM global_config WHERE id=1").Scan(&stored); err != nil {
+				t.Fatal(err)
+			}
+			msg, _ := decodeSyncError(stored)
+			if !strings.HasPrefix(msg, syncReloadFailureMarkerPrefix) {
+				t.Fatalf("last_sync_error=%q, want 以重载失败标记开头（304 补偿通道已失明）", msg)
+			}
+			if !strings.Contains(msg, testCase.name) && !strings.Contains(msg, "解析集群快照") &&
+				!strings.Contains(msg, "已降级为从节点") && !strings.Contains(msg, "重定向") {
+				t.Fatalf("last_sync_error=%q, want 携带本次失败原因", msg)
+			}
+		})
 	}
 }

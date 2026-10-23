@@ -74,8 +74,9 @@ type IP2RegionUpdateManager struct {
 
 	reloader       func() error
 	fetchLatestTag func(ctx context.Context) (tag string, err error)
-	// runCancel 取消当前运行中的下载阶段（任务监控手动取消，v2.3.4）。
-	runCancel   context.CancelFunc
+	// runCancel 取消当前运行中的下载阶段（任务监控手动取消，v2.3.4）：
+	// 用户取消路径携带 ErrUserCancelled 原因，取消终态据此推进排程槽。
+	runCancel   context.CancelCauseFunc
 	downloadXDB func(ctx context.Context, tag, destPath string, progress downloadProgressFunc) error
 }
 
@@ -157,14 +158,14 @@ func (m *IP2RegionUpdateManager) StartUpdate(trigger string, rc *taskengine.RunC
 	m.state = ip2RegionTaskState{status: IP2RegionStatusChecking, trigger: trigger, startedAt: time.Now().UTC()}
 	// 可取消 ctx 与 running 同临界区登记（镜像 CRS）——StartUpdate
 	// 返回后立刻 CancelRunning 必须命中，不得读到未登记的 runCancel 静默放行。
-	runCtx, runCancel := context.WithCancel(updateRunBaseContext(rc))
+	runCtx, runCancel := context.WithCancelCause(updateRunBaseContext(rc))
 	m.runCancel = runCancel
 	done := m.runDone
 	m.mu.Unlock()
 
 	go func() {
 		defer close(done)
-		defer runCancel()
+		defer runCancel(nil)
 		// 自建 goroutine 不被引擎 runGuarded 覆盖——未捕获 panic=整个
 		// admin 进程退出。正常路径由 runWithContext 内部 recover 先行落定
 		// failed 终态（审计同口径），此处仅兜底（defer 自身 panic 等）。
@@ -204,8 +205,8 @@ func (m *IP2RegionUpdateManager) setStage(status IP2RegionUpdateStatus, message 
 // run 同步执行一次更新（测试/内部直调路径）：自建可取消 ctx 并登记
 // runCancel（镜像 CRS 的  形态）。
 func (m *IP2RegionUpdateManager) run(trigger string, rc *taskengine.RunContext) {
-	runCtx, runCancel := context.WithCancel(updateRunBaseContext(rc))
-	defer runCancel()
+	runCtx, runCancel := context.WithCancelCause(updateRunBaseContext(rc))
+	defer runCancel(nil)
 	m.mu.Lock()
 	m.runCancel = runCancel
 	m.mu.Unlock()
@@ -327,7 +328,7 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 			return
 		}
 		if runCtx.Err() != nil {
-			m.cancel(err)
+			m.cancel(err, trigger, runCtx)
 			return
 		}
 		m.fail(err)
@@ -409,7 +410,7 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 		}
 		if runCtx.Err() != nil {
 			m.rollbackAfterCancel()
-			m.cancel(installErr)
+			m.cancel(installErr, trigger, runCtx)
 			return
 		}
 		m.fail(fmt.Errorf("安装 ip2region xdb 失败: %w", installErr))
@@ -421,7 +422,7 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 	// 不得让磁盘/版本行停在新库而任务显示已取消（Caddy 仍按旧库执行）。
 	if runCtx.Err() != nil {
 		m.rollbackAfterCancel()
-		m.cancel(runCtx.Err())
+		m.cancel(runCtx.Err(), trigger, runCtx)
 		return
 	}
 
@@ -468,9 +469,8 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 			return
 		case restored && distRestore:
 			// dist 基线不是「更新前版本」——不得冒称 prevVersion。
-			// writeDistRollbackMarkers 写保守标识 bundled（=镜像内置基线哨兵，
-			// 下次更新不被「已是最新」短路；不是 unknown）。
-			m.writeDistRollbackMarkers()
+			// rollbackXDB 已在同一 wafFileMu 临界区写保守标识 bundled
+			//（=镜像内置基线哨兵，下次更新不被「已是最新」短路；不是 unknown）。
 			if m.reloader != nil {
 				rErr := m.reloader()
 				recordSystemReloadAudit("ip2region_update", rErr)
@@ -483,20 +483,10 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 			return
 		case restored:
 			// 磁盘已还原旧 xdb——安装段（锁内）写入的新版本行与
-			// sidecar 必须同步回滚到 prevVersion，否则「磁盘旧/行新」三方分叉
-			// （导出侧读新 tag 配旧 xdb）。回滚失败仅记日志：fail() 落 failed
-			// 状态行，下次成功更新/启动对账自愈。
-			if m.prevVersion != "" {
-				if _, err := db.DB.Exec(
-					"UPDATE security_ip2region_version SET version=?, updated_at=datetime('now') WHERE id=1",
-					m.prevVersion,
-				); err != nil {
-					Logf("error", "ip2region update: 回滚版本行失败（下次成功更新自愈）: %v", err)
-				}
-				if err := rewriteVersionIfMissingOrStale(ip2regionLivePath+".version", m.prevVersion); err != nil {
-					Logf("error", "ip2region update: 回滚 .version sidecar 失败（下次成功更新自愈）: %v", err)
-				}
-			}
+			// sidecar 由 rollbackXDB 在同一 wafFileMu 临界区回滚到
+			// prevVersion，否则「磁盘旧/行新」三方分叉（导出侧读新 tag
+			// 配旧 xdb）。回滚失败仅记日志：fail() 落 failed 状态行，
+			// 下次成功更新/启动对账自愈。
 			// nil reloader 守卫——镜像本函数上方
 			if m.reloader != nil {
 				rErr := m.reloader()
@@ -611,24 +601,27 @@ func (m *IP2RegionUpdateManager) rollbackAfterCancel() {
 		return
 	}
 	m.installCommitted = false
-	restored, distRestore, err := m.rollbackXDB()
-	switch {
-	case err != nil:
+	// rollbackXDB 在同一 wafFileMu 临界区内完成文件还原 + 版本行/sidecar
+	// 回写（restored→prevVersion，dist 回退→bundled 哨兵）。
+	if _, _, err := m.rollbackXDB(); err != nil {
 		Logf("error", "ip2region update: 取消后回滚 xdb 失败（下次成功更新自愈）: %v", err)
-	case distRestore:
-		m.writeDistRollbackMarkers()
-	case restored:
-		m.restorePreviousVersionRow()
 	}
 }
 
-// cancel 记录用户主动取消：保留既有工件/快照，不增加连续失败计数。
-func (m *IP2RegionUpdateManager) cancel(cause error) {
+// cancel 记录取消终态：保留既有工件/快照，不增加连续失败计数。
+// 排程槽：**用户取消自动轮**与失败同源——本槽显式放弃，预约推进到紧邻下一
+// 排程槽（引擎侧取消时已消费本槽，业务不推进则该库自动更新静默停摆）。
+// demote/导入排空/进程停止的取消不推进（引擎侧同样不消费槽，恢复后补跑）。
+func (m *IP2RegionUpdateManager) cancel(cause error, trigger string, runCtx context.Context) {
 	if _, err := db.DB.Exec(
 		"UPDATE security_ip2region_version SET update_status='cancelled', message=?, finished_at=datetime('now') WHERE id=1",
 		cause.Error(),
 	); err != nil {
 		Logf("error", "ip2region update: failed to record cancellation: %v", err)
+	}
+	if userCancelledRun(runCtx) {
+		// advanceSlotIfAuto 自带「仅 auto、仅空/过期槽」门：手动取消不动预约。
+		m.advanceSlotIfAuto(trigger)
 	}
 	m.syncInstalledVersionToState()
 	m.mu.Lock()
@@ -811,18 +804,41 @@ func (m *IP2RegionUpdateManager) downloadXDBLogged(ctx context.Context, tag, des
 // 热换失败同样 warn + restored=true；仅 dist copy 本身失败（磁盘未动、仍
 // 是新库）才返回 error，由调用方走 fail-open。
 func (m *IP2RegionUpdateManager) rollbackXDB() (restored bool, distRestore bool, err error) {
+	// 回滚三件套（文件还原 + 版本行/sidecar 回写）收在同一 wafFileMu 临界区内，
+	// 与安装段同构：读相位（BuildWafFileRef/BuildWafFileBundle）只看到旧代或
+	// 新代，不会打出「xdb 旧/行新」或「xdb 新/sidecar 旧」的混合代沿
+	// lbbak/集群通道扩散。内存热换（reloadIP2RegionSearcher）与调用方的
+	// reloader 一律留在锁外。
+	wafFileMu.Lock()
+	restored, distRestore, err = m.rollbackFilesLocked()
+	if err == nil {
+		switch {
+		case distRestore:
+			m.writeDistRollbackMarkersLocked()
+		case restored:
+			m.restorePreviousVersionRowLocked()
+		}
+	}
+	wafFileMu.Unlock()
+	if restored || distRestore {
+		if rErr := reloadIP2RegionSearcher(); rErr != nil {
+			// 磁盘已是基线，热换失败不得反转回滚结论：Reload 失败时旧
+			// searcher 保持服役；若安装阶段热换曾成功，内存 searcher 以新数据
+			// 滞后，在下次更新安装或重启后收敛（无周期性 reload；Caddy 侧
+			// geoip 随 reloader 重试收敛）。
+			Logf("error", "ip2region update: reload after rollback failed (%v); disk baseline restored; if the install-time hot-swap succeeded, the in-memory searcher lags until the next update install or restart (Caddy-side geoip converges with the reloader)", rErr)
+		}
+	}
+	return restored, distRestore, err
+}
+
+// rollbackFilesLocked 文件级回滚（调用方须持 wafFileMu）：.bak 的
+// rename/copy 两级与 dist 回退三级升级链。
+func (m *IP2RegionUpdateManager) rollbackFilesLocked() (restored bool, distRestore bool, err error) {
 	if m.bakCreated {
 		bak := ip2regionLivePath + ".bak"
 		if _, err := os.Stat(bak); err == nil {
 			if renameErr := osRename(bak, ip2regionLivePath); renameErr == nil {
-				if rErr := reloadIP2RegionSearcher(); rErr != nil {
-					// 磁盘已还原为更新前基线，热换失败不得升级——
-					// .bak 已被 rename 消费，升级后 copy 必然失败、dist 必然
-					// 执行，镜像捆绑的旧版会覆盖正确基线（磁盘≠DB 分叉+基线
-					// 丢失）。磁盘已是基线；若安装阶段热换曾成功，内存
-					// searcher 滞后至下次更新安装或重启收敛。
-					Logf("error", "ip2region update: reload after rename restore failed (%v); disk baseline restored; if the install-time hot-swap succeeded, the in-memory searcher lags until the next update install or restart (Caddy-side geoip converges with the reloader)", rErr)
-				}
 				return true, false, nil
 			} else {
 				Logf("error", "ip2region update: rename bak to live failed (%v), trying copy restore (permission-class failures will fall through to dist)", renameErr)
@@ -832,11 +848,6 @@ func (m *IP2RegionUpdateManager) rollbackXDB() (restored bool, distRestore bool,
 				// 义对齐，避免残留陈旧副本干扰后续运行判断。
 				if rErr := os.Remove(bak); rErr != nil {
 					Logf("error", "ip2region update: failed to remove bak after copy restore: %v", rErr)
-				}
-				if rErr := reloadIP2RegionSearcher(); rErr != nil {
-					// 同 rename 级——磁盘已是正确基线，热换失败仅
-					// 记 warn，不得升级到 dist 覆盖基线（滞后收敛口径同上）。
-					Logf("error", "ip2region update: reload after copy restore failed (%v); disk baseline restored; if the install-time hot-swap succeeded, the in-memory searcher lags until the next update install or restart (Caddy-side geoip converges with the reloader)", rErr)
 				}
 				return true, false, nil
 			} else {
@@ -855,13 +866,6 @@ func (m *IP2RegionUpdateManager) rollbackXDB() (restored bool, distRestore bool,
 	}
 	if err := copyFile(ip2regionDistPath, ip2regionLivePath); err != nil {
 		return false, false, fmt.Errorf("回退到发行版 ip2region xdb: %w", err)
-	}
-	if err := reloadIP2RegionSearcher(); err != nil {
-		// dist copy 已成功、磁盘=dist 基线，前提「磁盘已
-		// 是新库」不成立——与 rename/copy 级同口径记 warn 并返回
-		// restored=true，由 run() 记 failed+旧版本（磁盘/DB 一致）；仅 dist
-		// copy 本身失败（上方，磁盘未动、仍是新库）才返回 error 走 fail-open。
-		Logf("error", "ip2region update: reload after dist restore failed (%v); disk restored to dist baseline; if the install-time hot-swap succeeded, the in-memory searcher lags until the next update install or restart (Caddy-side geoip converges with the reloader)", err)
 	}
 	return true, true, nil
 }
@@ -884,7 +888,15 @@ func (m *IP2RegionUpdateManager) failOpenPreconditionHolds() bool {
 }
 
 // restorePreviousVersionRow 回写事件前版本行与 sidecar（失败仅日志）。
+// 行与 sidecar 在同一 wafFileMu 临界区内完成——读相位不会看到「文件旧/标签新」。
 func (m *IP2RegionUpdateManager) restorePreviousVersionRow() {
+	wafFileMu.Lock()
+	defer wafFileMu.Unlock()
+	m.restorePreviousVersionRowLocked()
+}
+
+// restorePreviousVersionRowLocked 是调用方已持 wafFileMu 的实现。
+func (m *IP2RegionUpdateManager) restorePreviousVersionRowLocked() {
 	if m.prevVersion == "" {
 		return
 	}
@@ -898,7 +910,15 @@ func (m *IP2RegionUpdateManager) restorePreviousVersionRow() {
 
 // writeDistRollbackMarkers dist 回退后写保守标识 bundled（已装载内置库，
 // 版本不可知；不得冒称 prevVersion），下次远端数值 tag 可建立基线。
+// 行与 sidecar 同 wafFileMu 临界区，与 restorePreviousVersionRow 同构。
 func (m *IP2RegionUpdateManager) writeDistRollbackMarkers() {
+	wafFileMu.Lock()
+	defer wafFileMu.Unlock()
+	m.writeDistRollbackMarkersLocked()
+}
+
+// writeDistRollbackMarkersLocked 是调用方已持 wafFileMu 的实现。
+func (m *IP2RegionUpdateManager) writeDistRollbackMarkersLocked() {
 	if _, err := db.DB.Exec("UPDATE security_ip2region_version SET version='bundled', updated_at=datetime('now') WHERE id=1"); err != nil {
 		Logf("error", "ip2region update: 写入 dist 回退标识失败: %v", err)
 	}
@@ -986,6 +1006,8 @@ func validateIP2RegionXDB(path string) (err error) {
 }
 
 // CancelRunning 取消当前运行中的更新（下载阶段中断）。无运行中任务返回 false。
+// 调用方只有用户取消通道（引擎 CancelHook／前端取消入口）——取消原因标记为
+// ErrUserCancelled，取消终态据此把排程槽推进到下一槽。
 func (m *IP2RegionUpdateManager) CancelRunning() bool {
 	m.mu.Lock()
 	cancel := m.runCancel
@@ -994,6 +1016,6 @@ func (m *IP2RegionUpdateManager) CancelRunning() bool {
 	if cancel == nil || !running {
 		return false
 	}
-	cancel()
+	cancel(taskengine.ErrUserCancelled)
 	return true
 }

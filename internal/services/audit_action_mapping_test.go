@@ -365,7 +365,7 @@ func TestAuditGenericRoutesExactlyOnce(t *testing.T) {
 	}
 	for _, route := range genericRouteRegistry {
 		t.Run(route.path, func(t *testing.T) {
-			action, _, _ := FormatAuditAction(http.MethodPost, route.path)
+			action, _, _ := FormatAuditAction(route.path)
 			if route.handlerMustRecord && action != "" {
 				t.Fatalf("FormatAuditAction 映射非空 %q——handler %s 已显式记录，会双条", action, route.handlerFunc)
 			}
@@ -395,11 +395,11 @@ func TestAuditExplicitRoutesMappingEmpty(t *testing.T) {
 		if policy != AuditPolicyExplicit {
 			continue
 		}
-		method, path, ok := strings.Cut(route, " ")
+		_, path, ok := strings.Cut(route, " ")
 		if !ok {
 			t.Fatalf("策略键格式异常: %q", route)
 		}
-		if action, _, _ := FormatAuditAction(method, path); action != "" {
+		if action, _, _ := FormatAuditAction(path); action != "" {
 			t.Errorf("Explicit 路由 %s 的 FormatAuditAction 映射非空（%q）——handler 已显式记录，双条风险", route, action)
 		}
 	}

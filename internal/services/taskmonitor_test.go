@@ -105,3 +105,39 @@ func TestCollectCertJobRows_throttlesReadFailureLogs(t *testing.T) {
 		t.Fatalf("失败日志行数=%d, want 1（状态未翻转不得重复告警）:\n%s", got, buf.String())
 	}
 }
+
+// Given cert_jobs 不可读（锁/迁移窗口形态：表被重命名）。
+// When 连续两轮聚合引擎任务族视图。
+// Then cert-waiting-ca「下次执行」查询失败按状态转换留痕（首报一条、持续静默），
+// 表恢复后补一条恢复日志——此前错误分支零留痕，页面「—」与「无 waiting_ca
+// 任务」不可区分，读取故障无处排障。
+func TestCollectEngineFamilies_logsWaitingCAQueryFailure(t *testing.T) {
+	te := newWireTestEngine(t)
+	if _, ok := te.Lookup("cert-waiting-ca"); !ok {
+		t.Fatal("cert-waiting-ca 未注册")
+	}
+	buf := captureServiceLog(t)
+	resetLogStateTransitionForTest(taskMonitorWaitingCALogKey)
+	t.Cleanup(func() { resetLogStateTransitionForTest(taskMonitorWaitingCALogKey) })
+	if _, err := db.DB.Exec(`ALTER TABLE cert_jobs RENAME TO cert_jobs_bak`); err != nil {
+		t.Fatalf("rename cert_jobs: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.DB.Exec(`ALTER TABLE cert_jobs_bak RENAME TO cert_jobs`)
+	})
+
+	collectEngineFamilies(te)
+	collectEngineFamilies(te)
+	if got := countLogLines(buf, "等待 CA 下次可用时间查询失败"); got != 1 {
+		t.Fatalf("失败日志行数=%d, want 1（状态未翻转不得重复告警）:\n%s", got, buf.String())
+	}
+
+	if _, err := db.DB.Exec(`ALTER TABLE cert_jobs_bak RENAME TO cert_jobs`); err != nil {
+		t.Fatalf("restore cert_jobs: %v", err)
+	}
+	buf.Reset()
+	collectEngineFamilies(te)
+	if got := countLogLines(buf, "等待 CA 下次可用时间查询恢复"); got != 1 {
+		t.Fatalf("恢复日志行数=%d, want 1:\n%s", got, buf.String())
+	}
+}

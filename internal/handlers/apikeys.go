@@ -22,6 +22,35 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
+// requireAPIKeyStepUp 装配 API Key 特权授予的 step-up 决策与响应（创建/更新
+// 两条路径共用单源）：开关读失败/状态查询失败一律 500 中断；已验证时回写
+// X-Mfa-Verified-Seconds-Ago 供前端提示，未验证返回 428 + MFA_STEP_UP_REQUIRED。
+// 返回 true 表示已写响应，调用方必须立即 return。
+//
+// 判定单源：与 mfaStepUpGuard 共用 DecideMFAStepUp——OIDC 会话短路、只读
+// 语义豁免等条件只有一份，不再各自漂移；本层仅保留「特权授予」覆盖面语义
+// 与 fail-closed 口径（守卫按裁定 fail-open）。
+func requireAPIKeyStepUp(c *gin.Context) bool {
+	decision, derr := DecideMFAStepUp(c, true, services.MFAUserEnabled)
+	if derr != nil {
+		if errors.Is(derr, ErrMFAStepUpGuardUnreadable) {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "MFA 写操作验证开关读取失败"})
+			return true
+		}
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "MFA 状态查询失败"})
+		return true
+	}
+	if !decision.Applies {
+		return false
+	}
+	if decision.Verified {
+		c.Header("X-Mfa-Verified-Seconds-Ago", strconv.FormatInt(decision.SecondsAgo, 10))
+		return false
+	}
+	c.JSON(http.StatusPreconditionRequired, gin.H{"code": 428, "message": "MFA_STEP_UP_REQUIRED", "detail": "此操作需要 MFA 验证"})
+	return true
+}
+
 // apiKeyMaxPerUser 每用户 API Key 数量配额。
 const apiKeyMaxPerUser = 50
 
@@ -235,26 +264,10 @@ func createAPIKeyForUser(c *gin.Context, userID int) {
 	// 开启且创建者为启用 MFA 的 JWT 用户时，特权 Key 创建按 mfaStepUpGuard 同
 	// 语义要求 60 秒内 MFA 验证（428 → 全局弹码 → 携新 JWT 重试）；API Key
 	// 机器身份豁免（与路由级守卫一致），未启用 MFA 直通。
-	// 判定单源：与 mfaStepUpGuard 共用 DecideMFAStepUp——OIDC 会话短路、只读
-	// 语义豁免等条件只有一份，不再各自漂移；本层仅保留「特权授予」覆盖面语义
-	// 与 fail-closed 口径（守卫按裁定 fail-open）。
+	// 判定与响应装配单源 requireAPIKeyStepUp（与更新侧共用）。
 	if !req.ReadOnly || req.MCPEnabled {
-		decision, derr := DecideMFAStepUp(c, true, services.MFAUserEnabled)
-		if derr != nil {
-			if errors.Is(derr, ErrMFAStepUpGuardUnreadable) {
-				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "MFA 写操作验证开关读取失败"})
-				return
-			}
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "MFA 状态查询失败"})
+		if requireAPIKeyStepUp(c) {
 			return
-		}
-		if decision.Applies {
-			if decision.Verified {
-				c.Header("X-Mfa-Verified-Seconds-Ago", strconv.FormatInt(decision.SecondsAgo, 10))
-			} else {
-				c.JSON(http.StatusPreconditionRequired, gin.H{"code": 428, "message": "MFA_STEP_UP_REQUIRED", "detail": "此操作需要 MFA 验证"})
-				return
-			}
 		}
 	}
 	whitelist, err := services.NormalizeCIDRs(req.MCPIPWhitelist)
@@ -421,9 +434,7 @@ func updateAPIKeyStatus(c *gin.Context, currentUserOnly bool) {
 		return
 	}
 	// 特权变更（收回只读/开启 MCP/放宽已启用 MCP 的白名单）与创建侧同构
-	// 走 MFA step-up 判定——开关/状态读失败 fail-closed 500（创建侧同口径），
-	// 守卫开启且操作者启用 MFA 时 428；判定单源 DecideMFAStepUp（与创建侧/
-	// 路由守卫共用）。
+	// 走 requireAPIKeyStepUp（判定/响应单源）。
 	// 白名单变更仅在更新后该 Key 仍启用 MCP 时算特权变更（禁用态的遗留在册
 	// 白名单不产生可达面）；路由级守卫在开启时本已覆盖该请求，此集合是
 	// 「守卫开关读失败」场景下的纵深防御口径。
@@ -436,22 +447,8 @@ func updateAPIKeyStatus(c *gin.Context, currentUserOnly bool) {
 		(req.MCPEnabled != nil && *req.MCPEnabled && beforeMCPEnabled != 1) ||
 		(whitelistChanged && afterMCPEnabled)
 	if privilegeEscalation {
-		decision, derr := DecideMFAStepUp(c, true, services.MFAUserEnabled)
-		if derr != nil {
-			if errors.Is(derr, ErrMFAStepUpGuardUnreadable) {
-				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "MFA 写操作验证开关读取失败"})
-				return
-			}
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "MFA 状态查询失败"})
+		if requireAPIKeyStepUp(c) {
 			return
-		}
-		if decision.Applies {
-			if decision.Verified {
-				c.Header("X-Mfa-Verified-Seconds-Ago", strconv.FormatInt(decision.SecondsAgo, 10))
-			} else {
-				c.JSON(http.StatusPreconditionRequired, gin.H{"code": 428, "message": "MFA_STEP_UP_REQUIRED", "detail": "此操作需要 MFA 验证"})
-				return
-			}
 		}
 	}
 	setClauses := make([]string, 0, 4)

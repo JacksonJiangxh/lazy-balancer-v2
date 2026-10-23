@@ -141,6 +141,7 @@ func TestUpdateUser_passwordLengthRejectedByPolicyWithFriendlyMessage(t *testing
 		t.Fatalf("seed user: %v", err)
 	}
 	router := gin.New()
+	adminAuthForTest(router)
 	router.PUT("/users/:id", h.UpdateUser)
 	request := httptest.NewRequest(http.MethodPut, "/users/1", strings.NewReader(`{"password":"`+strings.Repeat("a", 25)+`"}`))
 	request.Header.Set("Content-Type", "application/json")

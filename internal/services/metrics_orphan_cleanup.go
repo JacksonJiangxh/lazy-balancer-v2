@@ -15,7 +15,6 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strings"
 
 	"lazy-balancer-v2/internal/db"
 )
@@ -24,6 +23,12 @@ import (
 // 「有界」落点：积压超限时下一轮继续，不在一轮内无限放大删除事务）。
 // 变量形态便于测试收窄。
 var metricsOrphanPurgeRulesPerRun = 500
+
+// metricsOrphanPurgeRowsPerBatch 单条 DELETE 的行数上限。保留期 7 天 × 30s
+// 采样 ⇒ 单规则最多约 2 万行；积压 500 条时一次性 DELETE 可达千万行，长写
+// 事务会阻塞 30s 节拍的 metrics 写入。按 rowid 分批删除、批间复核 ctx
+// （让出写锁并支持任务取消）。
+var metricsOrphanPurgeRowsPerBatch = 5000
 
 // PurgeOrphanMetricsHistory 清理 metrics 库中已删除规则的残留历史指标，
 // 返回本轮删除的规则数。调用方（taskengine metrics-orphan-cleanup）按错误
@@ -59,13 +64,30 @@ func PurgeOrphanMetricsHistory(ctx context.Context) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	placeholders := strings.TrimSuffix(strings.Repeat("?, ", len(pending)), ", ")
-	args := make([]any, len(pending))
-	for i, ruleID := range pending {
-		args[i] = ruleID
+	batch := metricsOrphanPurgeRowsPerBatch
+	if batch <= 0 {
+		batch = 5000
 	}
-	if _, err := db.MetricsDB.ExecContext(ctx, `DELETE FROM metrics_history WHERE rule_id IN (`+placeholders+`)`, args...); err != nil {
-		return 0, fmt.Errorf("删除孤儿规则指标: %w", err)
+	for _, ruleID := range pending {
+		for {
+			result, execErr := db.MetricsDB.ExecContext(ctx,
+				`DELETE FROM metrics_history WHERE rowid IN (SELECT rowid FROM metrics_history WHERE rule_id = ? LIMIT ?)`,
+				ruleID, batch)
+			if execErr != nil {
+				return 0, fmt.Errorf("删除孤儿规则指标: %w", execErr)
+			}
+			deleted, rowErr := result.RowsAffected()
+			if rowErr != nil {
+				return 0, fmt.Errorf("删除孤儿规则指标: 读取影响行数: %w", rowErr)
+			}
+			// 本批未打满=该规则已清空，处理下一条。
+			if deleted < int64(batch) {
+				break
+			}
+			if err := ctx.Err(); err != nil {
+				return 0, err
+			}
+		}
 	}
 	return len(pending), nil
 }

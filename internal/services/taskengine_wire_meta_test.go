@@ -248,8 +248,11 @@ func TestTaskEngineWire_MasterSyncShowsServing(t *testing.T) {
 	t.Fatal("cluster-sync 未注册")
 }
 
-// wire 元数据钉：9 Periodic 精确间隔、5 Scheduled、3 Daemon、1 Oneshot 全集。
-// 缺口形态：删除/错改任一生产 Fn 或误增未验收任务都会直接失败。
+// wire 元数据钉：10 Periodic 精确间隔、5 Scheduled、3 Daemon、1 Oneshot。
+// 注册全集以白名单（wantKindByID 及各 want* 表）为准——不写死总条数：
+// 新增任务时逐 ID 验收（多一个/少一个/类型变更都指向具体 ID），而非在
+// 「总数=19」上与标准要表达的逐 ID 验收相悖。缺口形态：删除/错改任一生产
+// Fn 或误增未验收任务都会直接失败。
 func TestTaskEngineWire_PeriodicIntervalAndScheduledSlotPresent(t *testing.T) {
 	te := newWireTestEngine(t)
 	metas := te.DescribeAll()
@@ -265,9 +268,24 @@ func TestTaskEngineWire_PeriodicIntervalAndScheduledSlotPresent(t *testing.T) {
 	}
 	wantScheduled := map[string]bool{"threat": true, "crs": true, "ip2region": true, "crawlerbot-update": true, "auto-backup": true}
 	wantDaemon := map[string]bool{"security-events-ingestion": true, "cert-issuance": true, "cluster-sync": true}
-	seen := 0
+	wantOneshot := map[string]bool{"startup:config-load": true}
+	// 白名单键集=验收全集（上面四表即唯一事实源）。
+	wantKindByID := map[string]taskengine.Kind{}
+	for id := range wantPeriodic {
+		wantKindByID[id] = taskengine.KindPeriodic
+	}
+	for id := range wantScheduled {
+		wantKindByID[id] = taskengine.KindScheduled
+	}
+	for id := range wantDaemon {
+		wantKindByID[id] = taskengine.KindDaemon
+	}
+	for id := range wantOneshot {
+		wantKindByID[id] = taskengine.KindOneshot
+	}
+	seen := map[string]bool{}
 	for _, m := range metas {
-		seen++
+		seen[m.ID] = true
 		switch m.Kind {
 		case taskengine.KindPeriodic:
 			want, ok := wantPeriodic[m.ID]
@@ -292,15 +310,24 @@ func TestTaskEngineWire_PeriodicIntervalAndScheduledSlotPresent(t *testing.T) {
 				t.Errorf("未验收 Daemon 任务 %s", m.ID)
 			}
 		case taskengine.KindOneshot:
-			if m.ID != "startup:config-load" {
+			if !wantOneshot[m.ID] {
 				t.Errorf("未验收 Oneshot 任务 %s", m.ID)
 			}
 		default:
 			t.Errorf("%s 非法 Kind %q", m.ID, m.Kind)
 		}
 	}
-	if seen != 19 {
-		t.Fatalf("注册任务总数=%d, want 19", seen)
+	// 集合双向断言：多一个（未验收）少一个（漏注册/被删）都红，报错指向 ID
+	// 而非裸条数。
+	for _, m := range metas {
+		if _, ok := wantKindByID[m.ID]; !ok {
+			t.Errorf("未验收任务 %s（Kind=%s）——新增任务须在验收白名单登记", m.ID, m.Kind)
+		}
+	}
+	for id := range wantKindByID {
+		if !seen[id] {
+			t.Errorf("白名单任务 %s 未注册（漏注册或 Kind 变更）", id)
+		}
 	}
 }
 
@@ -350,5 +377,26 @@ func TestClusterSyncDaemonRun_nilEngineReturnsWithoutPanic(t *testing.T) {
 	t.Cleanup(func() { SetTaskEngineForTest(old) })
 	if err := clusterSyncDaemonRun(taskengine.RunContext{Ctx: context.Background()}); err != nil {
 		t.Fatalf("引擎已置 nil（关机窄窗）时集群同步 Run 必须安全退出, got err=%v", err)
+	}
+}
+
+// Given 触发类任务 startup:config-load。
+// When 以未知触发来源（非 manual/startup/caddy-restart）同步调度。
+// Then 响亮失败——不得静默 return nil 落一条 success 行却零动作（silent
+// success 会把装配缺陷伪装成正常执行）；task_runs 末行必须为 failed。
+func TestTaskEngineWire_configLoadRejectsUnknownTrigger(t *testing.T) {
+	te := newWireTestEngine(t)
+	if _, err := te.RunSync("startup:config-load", "auto", ""); err == nil || !strings.Contains(err.Error(), "未知触发来源") {
+		t.Fatalf("未知触发来源应返回错误，得到 err=%v", err)
+	}
+	runs := te.History("startup:config-load", 1)
+	if len(runs) != 1 {
+		t.Fatalf("startup:config-load 运行历史行数=%d, want 1", len(runs))
+	}
+	if runs[0].Status != "failed" {
+		t.Fatalf("未知触发来源轮终态=%q, want failed（不得静默成功）", runs[0].Status)
+	}
+	if !strings.Contains(runs[0].Message, "未知触发来源") {
+		t.Fatalf("失败行消息应说明未知触发来源, got %q", runs[0].Message)
 	}
 }

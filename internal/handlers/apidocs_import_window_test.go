@@ -49,6 +49,36 @@ func TestAPIDocRoutes_userAndAPIKeyWritesDocumentImportWindow(t *testing.T) {
 	}
 }
 
+// 设置类写端点同样受导入窗口拒绝（rejectWriteDuringImport 先于解析/落库），
+// 文档必须登记同一 409——否则按规格生成的客户端会把 409 当未知错误重试。
+// 名单只覆盖本单元端点：其余写族由各自单元登记。
+func TestAPIDocRoutes_settingsWritesDocumentImportWindow(t *testing.T) {
+	want := []string{
+		"PUT /admin-tls",
+		"PUT /settings/auto-backup",
+	}
+	index := map[string]apiDocRoute{}
+	for _, route := range apiDocRoutes {
+		index[route.Method+" "+route.Path] = route
+	}
+	for _, key := range want {
+		route, ok := index[key]
+		if !ok {
+			t.Fatalf("文档缺少路由 %s", key)
+		}
+		documented := false
+		for _, entry := range route.Errors {
+			if strings.Contains(entry, "import_in_progress") {
+				documented = true
+				break
+			}
+		}
+		if !documented {
+			t.Errorf("%s 文档未登记 409 import_in_progress（实际受导入窗口拒绝）errors=%v", key, route.Errors)
+		}
+	}
+}
+
 func TestAPIDocRoutes_currentPasswordConfirmationContract(t *testing.T) {
 	var route *apiDocRoute
 	for i := range apiDocRoutes {

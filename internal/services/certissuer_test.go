@@ -166,6 +166,186 @@ func TestConfirmCertificateDeployment_accepts_equivalent_normalized_domain_set(t
 	}
 }
 
+// 落盘前四道 fail-closed 门（规则启用 / 主节点角色 / 任务与规则域名一致 /
+// 状态可部署）各自必须有负例：任一门被放宽（例如去掉 SQL 的 enabled=1 或
+// is_master 条件、去掉域名比对、把状态集合扩大），部署链会把证书写到已禁用
+// 规则或从节点的磁盘上，与主节点渲染面分叉。
+func TestConfirmCertificateDeployment_rejects_roleDisabledDomainAndStatusGates(t *testing.T) {
+	cases := map[string]struct {
+		status    string
+		prepare   func(t *testing.T, jobID int, ruleID string)
+		wantNoRow bool
+		wantText  string
+	}{
+		"rule disabled": {
+			status: "downloaded",
+			prepare: func(t *testing.T, _ int, ruleID string) {
+				if _, err := db.DB.Exec("UPDATE lb_rules SET enabled=0 WHERE caddy_id=?", ruleID); err != nil {
+					t.Fatalf("disable rule: %v", err)
+				}
+			},
+			wantNoRow: true,
+		},
+		"slave node": {
+			status: "downloaded",
+			prepare: func(t *testing.T, _ int, _ string) {
+				if _, err := db.DB.Exec("UPDATE global_config SET is_master=0 WHERE id=1"); err != nil {
+					t.Fatalf("demote node: %v", err)
+				}
+			},
+			wantNoRow: true,
+		},
+		"job domains diverged from rule": {
+			status: "downloaded",
+			prepare: func(t *testing.T, jobID int, _ string) {
+				if _, err := db.DB.Exec("UPDATE cert_jobs SET domain='other.example.com' WHERE id=?", jobID); err != nil {
+					t.Fatalf("diverge job domains: %v", err)
+				}
+			},
+			wantText: "no longer match rule",
+		},
+		"status queued is not deployable": {
+			status:   "queued",
+			prepare:  func(*testing.T, int, string) {},
+			wantText: "no longer deployable",
+		},
+		"status issued is not deployable for new material": {
+			status:   "issued",
+			prepare:  func(*testing.T, int, string) {},
+			wantText: "no longer deployable",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			jobID, ruleID := seedCertificateJob(t, tc.status)
+			tc.prepare(t, jobID, ruleID)
+
+			err := confirmCertificateDeployment(context.Background(), jobID, issuedCertificate{ruleID: ruleID}, false)
+
+			if err == nil {
+				t.Fatal("confirmCertificateDeployment accepted a deployment the gate must reject")
+			}
+			if tc.wantNoRow && !errors.Is(err, sql.ErrNoRows) {
+				t.Fatalf("error=%v, want sql.ErrNoRows（规则/角色门由 JOIN 条件把关）", err)
+			}
+			if tc.wantText != "" && !strings.Contains(err.Error(), tc.wantText) {
+				t.Fatalf("error=%v, want contains %q", err, tc.wantText)
+			}
+		})
+	}
+}
+
+// 门拒绝时不得触碰磁盘：已禁用规则的证书目录必须保持上一次部署内容。
+func TestCertIssuer_deployIssuedCertificate_disabledRuleKeepsDiskUnchanged(t *testing.T) {
+	jobID, ruleID := seedCertificateJob(t, "downloaded")
+	useTemporaryCertDir(t)
+	if err := WriteCertFiles(ruleID, "old-cert", "old-key"); err != nil {
+		t.Fatalf("write previous certificate pair: %v", err)
+	}
+	if _, err := db.DB.Exec("UPDATE lb_rules SET enabled=0 WHERE caddy_id=?", ruleID); err != nil {
+		t.Fatalf("disable rule: %v", err)
+	}
+	reloads := 0
+	issuer := NewCertIssuer(func() error { reloads++; return nil })
+	material := issuedCertificate{
+		ruleID: ruleID, certPEM: "new-cert", keyPEM: "new-key",
+		notAfter: time.Now().Add(90 * 24 * time.Hour), providerID: 1,
+	}
+
+	err := issuer.deployIssuedCertificate(context.Background(), jobID, material)
+
+	if err == nil {
+		t.Fatal("部署必须被已禁用规则拒绝")
+	}
+	certPath, keyPath := CertFilePaths(ruleID)
+	if data, readErr := os.ReadFile(certPath); readErr != nil || string(data) != "old-cert" {
+		t.Fatalf("cert file=%q err=%v, want 上一次部署内容（旧 %q）", string(data), readErr, "old-cert")
+	}
+	if data, readErr := os.ReadFile(keyPath); readErr != nil || string(data) != "old-key" {
+		t.Fatalf("key file=%q err=%v, want 上一次部署内容（旧 %q）", string(data), readErr, "old-key")
+	}
+	if reloads != 0 {
+		t.Fatalf("reloads=%d, want 0（被拒的部署不得触发 Caddy 重载）", reloads)
+	}
+}
+
+// 快速路径的年龄门：库内材料已进入续签窗口（NotAfter 距现在 < cert_renewal_days）
+// 时必须回落完整签发——否则任务被反复「重部署旧证书」，证书临期却不换新，
+// 到期后 HTTPS 中断，而续签扫描仍认为链路正常（任务状态被重部署刷新）。
+func TestCertIssuer_Issue_fastPathSkipsMaterialInsideRenewalWindow(t *testing.T) {
+	// Given：downloaded 任务的材料只剩 1 天有效期（默认续签窗口 30 天）
+	jobID, ruleID := seedCertificateJob(t, "downloaded")
+	useTemporaryCertDir(t)
+	oldLogDir := taskengine.LogDir()
+	taskengine.SetLogDir(t.TempDir())
+	t.Cleanup(func() { taskengine.SetLogDir(oldLogDir) })
+	// 指向本机不可达目录的专用提供商：完整签发在预检即失败，且不触碰真实 CA
+	// （播种的默认提供商是真实 ZeroSSL/Let's Encrypt 端点）。
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		http.Error(response, "no acme here", http.StatusInternalServerError)
+	}))
+	t.Cleanup(server.Close)
+	result, err := db.DB.Exec(`INSERT INTO ca_providers (name,provider,directory_url,credentials,max_concurrent,min_interval_ms,enabled)
+		VALUES ('unreachable CA','letsencrypt',?,'{}',1,0,1)`, server.URL+"/directory")
+	if err != nil {
+		t.Fatalf("seed CA provider: %v", err)
+	}
+	providerID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("read CA provider ID: %v", err)
+	}
+	if _, err := db.DB.Exec("UPDATE lb_rules SET ca_provider_id=? WHERE caddy_id=?", providerID, ruleID); err != nil {
+		t.Fatalf("bind rule CA provider: %v", err)
+	}
+	if _, err := db.DB.Exec("UPDATE cert_jobs SET ca_provider_id=? WHERE id=?", providerID, jobID); err != nil {
+		t.Fatalf("bind job CA provider: %v", err)
+	}
+	if _, err := db.DB.Exec("UPDATE global_config SET acme_email='admin@example.com' WHERE id=1"); err != nil {
+		t.Fatalf("seed ACME email: %v", err)
+	}
+	now := time.Now()
+	certPEM, keyPEM := certificatePairForDomains(t, now.Add(-2*time.Hour), now.Add(24*time.Hour), "example.com")
+	if _, err := db.DB.Exec("UPDATE cert_jobs SET cert_pem=?, key_pem=? WHERE id=?", certPEM, keyPEM, jobID); err != nil {
+		t.Fatalf("seed expiring material: %v", err)
+	}
+	issuer := NewCertIssuer(func() error { return nil })
+	redeployed := make(chan struct{}, 1)
+	issuer.deploymentRetry = func(int, issuedCertificate, time.Duration) error {
+		redeployed <- struct{}{}
+		return nil
+	}
+
+	// When：完整签发进入 CA 预检并以失败告终
+	err = issuer.Issue(context.Background(), jobID, ruleID, "example.com", models.CAProvider{ID: int(providerID)})
+
+	// Then：必须走 CA 签发链，而不是重部署临期材料
+	if err == nil {
+		t.Fatal("续签窗口内的材料必须回落完整签发（快速路径会重部署旧证书并返回 nil）")
+	}
+	select {
+	case <-redeployed:
+		t.Fatal("续签窗口内的材料不得登记部署重试")
+	default:
+	}
+	var status string
+	if err := db.DB.QueryRow("SELECT status FROM cert_jobs WHERE id=?", jobID).Scan(&status); err != nil {
+		t.Fatalf("read job status: %v", err)
+	}
+	if status != "failed" {
+		t.Fatalf("status=%q, want failed（完整签发在 CA 预检失败）", status)
+	}
+	logData, readErr := os.ReadFile(CertJobLogPath(ruleID))
+	if readErr != nil {
+		t.Fatalf("read cert job log: %v", readErr)
+	}
+	if !strings.Contains(string(logData), "测试 CA 提供商") {
+		t.Fatalf("job log=%q, want 完整签发链的预检记录", string(logData))
+	}
+	if strings.Contains(string(logData), "重新部署") {
+		t.Fatalf("job log=%q, 快速路径重部署不应出现在续签窗口分支", string(logData))
+	}
+}
+
 func TestCertIssuer_deployIssuedCertificate_restores_files_when_job_disabled_before_finalize(t *testing.T) {
 	// Given
 	jobID, ruleID := seedCertificateJob(t, "downloaded")
@@ -999,8 +1179,9 @@ func TestCertIssuer_Issue_fastPathMaterialReadFailure_defersDeployment(t *testin
 	// Given
 	jobID, ruleID := seedCertificateJob(t, "downloaded")
 	useTemporaryCertDir(t)
+	oldLogDir := taskengine.LogDir()
 	taskengine.SetLogDir(t.TempDir())
-	t.Cleanup(func() { taskengine.SetLogDir("") })
+	t.Cleanup(func() { taskengine.SetLogDir(oldLogDir) })
 	issuer := NewCertIssuer(func() error { return nil })
 	retried := make(chan struct{}, 1)
 	issuer.deploymentRetry = func(int, issuedCertificate, time.Duration) error { retried <- struct{}{}; return nil }
@@ -1074,11 +1255,15 @@ func TestCertIssuer_deployIssuedCertificate_serializes_rollback_by_rule(t *testi
 		<-releaseOldReload
 		return errors.New("old reload failed")
 	})
+	// 未打桩的 deploymentRetry=scheduleCertificateDeploymentRetry 会注册真实
+	// 定时器（首个 1s 退避即可在用例退出后触发、写跨用例的 DB/磁盘状态）。
+	oldIssuer.deploymentRetry = func(int, issuedCertificate, time.Duration) error { return nil }
 	newReloadEntered := make(chan struct{})
 	newIssuer := NewCertIssuer(func() error {
 		close(newReloadEntered)
 		return nil
 	})
+	newIssuer.deploymentRetry = func(int, issuedCertificate, time.Duration) error { return nil }
 	oldDone := make(chan error, 1)
 	newDone := make(chan error, 1)
 	go func() {
@@ -1527,8 +1712,9 @@ func TestCertIssuer_Issue_zerosslRegistersAccountOnce(t *testing.T) {
 func TestCertIssuer_Issue_fastPathMaterialReadFailure_issuedStaysIssued(t *testing.T) {
 	jobID, ruleID := seedCertificateJob(t, "issued")
 	useTemporaryCertDir(t)
+	oldLogDir := taskengine.LogDir()
 	taskengine.SetLogDir(t.TempDir())
-	t.Cleanup(func() { taskengine.SetLogDir("") })
+	t.Cleanup(func() { taskengine.SetLogDir(oldLogDir) })
 	issuer := NewCertIssuer(func() error { return nil })
 	retried := make(chan struct{}, 1)
 	issuer.deploymentRetry = func(int, issuedCertificate, time.Duration) error { retried <- struct{}{}; return nil }
@@ -1559,8 +1745,11 @@ func TestCertIssuer_Issue_fastPathMaterialReadFailure_issuedStaysIssued(t *testi
 	if status != "issued" || attempts != 0 || after.Valid {
 		t.Fatalf("status=%q attempts=%d window=%v, want issued/0/空（保持已部署终态）", status, attempts, after.Valid)
 	}
-	logData, readErr := os.ReadFile(taskengine.TaskLogPath(fmt.Sprintf("certjob-%d", jobID)))
-	if readErr == nil && !strings.Contains(string(logData), "保持 issued") {
+	logData, readErr := os.ReadFile(CertJobLogPath(ruleID))
+	if readErr != nil {
+		t.Fatalf("读取证书任务日志 %s: %v", CertJobLogPath(ruleID), readErr)
+	}
+	if !strings.Contains(string(logData), "保持 issued") {
 		t.Fatalf("任务日志未如实说明接管通道: %q", string(logData))
 	}
 }

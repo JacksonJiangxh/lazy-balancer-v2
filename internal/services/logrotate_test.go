@@ -675,3 +675,46 @@ func TestLogCleanupRound_emptyLogFileStillRunsWafFallback(t *testing.T) {
 		t.Fatalf("摘要必须包含兜底动作: %q", line)
 	}
 }
+
+// 应用日志副本的元数据读取失败必须进结果错误面与摘要（与任务日志侧
+// InfoFailed 同口径）：无法判定是否过期与「无过期副本」不得同形。
+func TestRuntimeLogCleanupOnce_countsAppMetadataFailures(t *testing.T) {
+	initServicesDB(t)
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "app.log")
+	if err := os.WriteFile(logFile, []byte("current\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stale := logFile + ".2020-01-01"
+	if err := os.WriteFile(stale, []byte("old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldTime := time.Now().AddDate(0, -13, 0)
+	if err := os.Chtimes(stale, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+	// Given：副本的元数据采集恒失败
+	oldInfo := appLogEntryInfo
+	appLogEntryInfo = func(os.DirEntry) (os.FileInfo, error) { return nil, errors.New("injected stat failure") }
+	t.Cleanup(func() { appLogEntryInfo = oldInfo })
+
+	// When
+	res := RuntimeLogCleanupOnce(logFile)
+
+	// Then：失败计数、错误面、摘要三处可见，且本轮未删除
+	if res.AppInfoFailed != 1 {
+		t.Fatalf("AppInfoFailed=%d, want 1", res.AppInfoFailed)
+	}
+	if res.AppRemoved != 0 {
+		t.Fatalf("AppRemoved=%d, want 0（无法判定过期不得删除）", res.AppRemoved)
+	}
+	if err := res.Err(); err == nil || !strings.Contains(err.Error(), "应用日志副本元数据读取失败 1 个") {
+		t.Fatalf("Err()=%v，元数据读取失败必须聚合进错误面", err)
+	}
+	if detail := logCleanupDetail(res); !strings.Contains(detail, "元数据读取失败 1 个") {
+		t.Fatalf("摘要必须披露元数据读取失败: %q", detail)
+	}
+	if _, err := os.Stat(stale); err != nil {
+		t.Fatalf("无法判定过期的副本不得被删除: %v", err)
+	}
+}

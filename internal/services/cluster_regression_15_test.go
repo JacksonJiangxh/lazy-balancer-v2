@@ -279,7 +279,7 @@ func TestClusterService_RegisterNode_normalizesName(t *testing.T) {
 	name := "edge\n" + strings.Repeat("x", 150)
 	registration, err := service.RegisterNode(context.Background(), models.ClusterRegisterRequest{
 		Token: token, Name: name, IPAddress: "10.0.0.9", Port: 8000,
-	}, now)
+	}, "10.0.0.9", now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -304,7 +304,7 @@ func TestClusterService_RegisterNode_rejectsBlankName(t *testing.T) {
 	}
 	_, err = service.RegisterNode(context.Background(), models.ClusterRegisterRequest{
 		Token: token, Name: "   ", IPAddress: "10.0.0.10", Port: 8000,
-	}, now)
+	}, "10.0.0.10", now)
 	if err == nil {
 		t.Fatal("blank node name must be rejected")
 	}
@@ -322,7 +322,7 @@ func TestClusterService_RegisterNode_ignoresForeignAccessURL(t *testing.T) {
 	registration, err := service.RegisterNode(context.Background(), models.ClusterRegisterRequest{
 		Token: token, Name: "edge-a", IPAddress: "10.0.0.11", Port: 8000,
 		AccessURL: "https://attacker.example/collect",
-	}, now)
+	}, "10.0.0.11", now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -348,7 +348,7 @@ func TestClusterService_RegisterNode_acceptsMatchingAccessURL(t *testing.T) {
 	registration, err := service.RegisterNode(context.Background(), models.ClusterRegisterRequest{
 		Token: token, Name: "edge-b", IPAddress: "10.0.0.12", Port: 8000,
 		AccessURL: "https://10.0.0.12:8443",
-	}, now)
+	}, "10.0.0.12", now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -361,6 +361,35 @@ func TestClusterService_RegisterNode_acceptsMatchingAccessURL(t *testing.T) {
 	}
 	if registration.AccessURLIgnored {
 		t.Fatal("matching access_url must not be flagged as ignored")
+	}
+}
+
+// Given 自述 ip_address 与 access_url 主机自洽，但连接来源地址不同。
+// Then 服务层必须以来源地址为信任锚丢弃自述地址——请求体自述值不得充当
+// 该判定的一方（曾两者同源，判定恒真）。
+func TestClusterService_RegisterNode_usesObservedSourceIPAsAnchor(t *testing.T) {
+	service, database := newClusterTestService(t)
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	token, _, err := service.GenerateRegisterToken(context.Background(), 1, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registration, err := service.RegisterNode(context.Background(), models.ClusterRegisterRequest{
+		Token: token, Name: "edge-c", IPAddress: "10.0.0.13", Port: 8000,
+		AccessURL: "https://10.0.0.13:8443",
+	}, "198.51.100.7", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var accessURL string
+	if err := database.QueryRow("SELECT COALESCE(access_url,'') FROM nodes WHERE id=?", registration.RegistrationID).Scan(&accessURL); err != nil {
+		t.Fatal(err)
+	}
+	if accessURL != "" {
+		t.Fatalf("access_url matching only the self-declared ip must be dropped, got %q", accessURL)
+	}
+	if !registration.AccessURLIgnored {
+		t.Fatal("registration must report the ignored self-declared address")
 	}
 }
 

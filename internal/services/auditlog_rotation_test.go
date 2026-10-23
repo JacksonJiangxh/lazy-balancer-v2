@@ -1,6 +1,7 @@
 package services
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -139,10 +140,9 @@ func TestRotateAuditLog_copyFailureKeepsArchiveGenerations(t *testing.T) {
 // 成功路径：当前日志先落暂存，随后归档移位、暂存提升为 .1——新 .1 是新归档，
 // 旧 .1 让位到 .2，暂存不留残。
 func TestRotateAuditLog_promotesStagedArchiveAfterShift(t *testing.T) {
-	// Given：活文件超阈、既有 .1 一代
-	oldDB, oldMetrics, oldAudit := db.DB, db.MetricsDB, db.AuditDB
-	db.DB, db.MetricsDB, db.AuditDB = nil, nil, nil
-	t.Cleanup(func() { db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetrics, oldAudit })
+	// 真实库：归档补采依赖安全事件库句柄，依赖缺失时轮转按「补采未完成」
+	// 留痕（pending 标记保留），本用例钉的是完整成功路径。
+	initServicesDB(t)
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "audit.log")
 	oldLogPath, oldOffsetPath, oldSizeBytes, oldCopy := auditLogPath, securityEventsOffsetPath, auditLogSizeBytes, auditLogCopyFile
@@ -283,17 +283,71 @@ func TestRotateAuditLog_corruptPendingMarkerQuarantinedAfterThreshold(t *testing
 			t.Fatalf("第 %d 轮不得提前隔离标记: %v", round, err)
 		}
 	}
-	// 第 N 轮：标记被隔离，轮转继续推进（后续偏移写入可能因测试环境目录
+	// 第 N 轮：损坏标记被隔离，轮转继续推进（后续偏移写入可能因测试环境目录
 	// 只读失败——隔离动作本身必须已发生，归档必须已生成）。
 	_, err := rotateAuditLogIfNeeded()
-	if _, serr := os.Stat(marker); !os.IsNotExist(serr) {
-		t.Fatalf("连续 %d 轮损坏后标记必须已隔离, stat err=%v (rotate err=%v)", pendingDeltaCorruptQuarantineRounds, serr, err)
-	}
 	quarantined, _ := filepath.Glob(marker + ".corrupt-*")
 	if len(quarantined) != 1 {
-		t.Fatalf("隔离文件=%v, want 恰一个 .corrupt-<ts>", quarantined)
+		t.Fatalf("隔离文件=%v, want 恰一个 .corrupt-<ts>（连续 %d 轮损坏后必须隔离, rotate err=%v）", quarantined, pendingDeltaCorruptQuarantineRounds, err)
+	}
+	// 本轮轮转可能重新写出**合法**的待补采标记（补采依赖不可用时按设计保留，
+	// 供下轮重试）——若存在，其载荷必须可解析且指向归档，不得残留损坏字节。
+	if raw, rerr := os.ReadFile(marker); rerr == nil {
+		var pending securityEventsPendingDelta
+		if jerr := json.Unmarshal(raw, &pending); jerr != nil || pending.Path == "" {
+			t.Fatalf("轮转后残留的标记必须是合法待补采载荷: %q (err=%v)", raw, jerr)
+		}
 	}
 	if _, serr := os.Stat(logPath + ".1"); serr != nil {
 		t.Fatalf("隔离后轮转必须继续（.1 归档应存在）: %v (rotate err=%v)", serr, err)
+	}
+}
+
+// 补采依赖（安全事件库句柄）不可用时，补采是 no-op——不得把「未补采」当
+// 「补采成功」删除 pending 安全网：该轮转窗口的事件只在 .1，标记一旦删除即
+// 永久丢失。依赖恢复后下一轮重试补采并删除标记。
+func TestRotateAuditLog_keepsPendingMarkerWhenIngestDepsUnavailable(t *testing.T) {
+	initServicesDB(t)
+	dir := t.TempDir()
+	oldLogPath, oldOffsetPath := auditLogPath, securityEventsOffsetPath
+	auditLogPath = filepath.Join(dir, "audit.log")
+	securityEventsOffsetPath = filepath.Join(dir, "security_events.offset")
+	t.Cleanup(func() { auditLogPath, securityEventsOffsetPath = oldLogPath, oldOffsetPath })
+	resetPendingDeltaCorruptStreakForTest()
+	t.Cleanup(resetPendingDeltaCorruptStreakForTest)
+
+	// Given：.1 归档 + 指向它的待补采标记
+	archive := auditLogPath + ".1"
+	if err := os.WriteFile(archive, []byte(`{"transaction_id":"a"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := securityEventsWritePendingDelta(securityEventsPendingDelta{Path: archive, Offset: 0, Size: 25}); err != nil {
+		t.Fatal(err)
+	}
+	marker := securityEventsPendingDeltaPath()
+	// 指标库句柄缺失＝补采依赖不可用（补采函数此时返回 0,nil）
+	readyMetrics := db.MetricsDB
+	db.MetricsDB = nil
+	t.Cleanup(func() { db.MetricsDB = readyMetrics })
+
+	// When
+	if _, err := rotateAuditLogIfNeeded(); err == nil {
+		t.Fatal("补采未完成必须返回错误（不得当作成功继续轮转）")
+	}
+
+	// Then：安全网保留
+	if _, serr := os.Stat(marker); serr != nil {
+		t.Fatalf("补采未完成时 pending 标记不得删除: %v", serr)
+	}
+
+	// When：依赖恢复后再跑一轮
+	db.MetricsDB = readyMetrics
+	if _, err := rotateAuditLogIfNeeded(); err != nil {
+		t.Fatalf("依赖恢复后补采应成功: %v", err)
+	}
+
+	// Then：补采完成，标记删除
+	if _, serr := os.Stat(marker); !os.IsNotExist(serr) {
+		t.Fatalf("补采成功后标记必须删除, stat err=%v", serr)
 	}
 }

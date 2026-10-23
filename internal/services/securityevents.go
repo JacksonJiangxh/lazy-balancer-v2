@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net"
 	"net/netip"
@@ -66,6 +67,10 @@ type securityEventRecord struct {
 	// 结尾）——把 setvar 迁到链尾后，该形态的 raw 不含评分字面量，
 	// AnomalyScore 需按发射 id 回查 cr.Score 补齐。
 	chainedCustomRule bool
+	// requestKey 是请求级去重键：链首注入的 X-Lb-Security-Timing-Id 头值
+	// （同一请求的全部引擎事务共享）。为空（旧版本审计行/注入失败）表示该行
+	// 没有请求级自然键，按原样逐条入库、不参与归并。不落库，仅用于摄取期去重。
+	requestKey string
 }
 
 // securityEventsAuditMessage 是一条审计消息：message 为宏展开后的规则 msg，
@@ -216,6 +221,9 @@ func securityEventsParseTransaction(raw json.RawMessage) (*securityEventRecord, 
 		Action:        "logged",
 	}
 	rec.AttributionRuleID = securityEventsFirstHeader(tx.Request.Headers, "x-lb-rule-id")
+	// 请求级去重键：链首（lb_security_blocked_counter）为每个请求注入，
+	// 预检与全部绑定策略的引擎事务都携带同一值（见 securityEventsRequestDeduper）。
+	rec.requestKey = securityEventsFirstHeader(tx.Request.Headers, "x-lb-security-timing-id")
 	rec.RequestHeaders = securityEventsSerializeHeaders(tx.Request.Headers)
 	rec.RequestBody = securityEventsEncodeBody(tx.Request.Body)
 	if tx.IsInterrupted {
@@ -536,13 +544,13 @@ func securityEventsLoadMappings() (map[string]securityEventsRuleRef, map[string]
 		return nil, nil, nil, errors.New("security events: database not initialized")
 	}
 	rules := make(map[string]securityEventsRuleRef)
-	// 显式 ORDER BY id ASC——同域名多规则（如 http/https
-	// 双规则）的纯域名键覆盖序此前依赖 SQLite 未定义返回序，注释却宣称「后
-	// 创建规则覆盖(创建序)」。id 升序 + 顺序赋值 = 较高 id（较新创建）最终覆盖；
+	// 显式排序键——同域名多规则（如 http/https 双规则）的纯域名键覆盖序此前
+	// 依赖 SQLite 未定义返回序。不得消费 lb_rules.id（主键迁移前历史列，新行
+	// 恒 NULL、镜像行为 0，ORDER BY 下旧行反而最后赋值）：排序键用
+	// created_at 升序把「后创建覆盖」显式化，caddy_id 兜底确定序（同秒创建也
+	// 可复现）；enabled 升序让启用规则最后赋值（覆盖禁用重名规则）。
 	// MapHost 对 host:port 精确键仍优先。
-	// enabled 升序让启用规则最后赋值（覆盖禁用重名规则），再按 id 升序保留
-	// 「较新创建覆盖」的既有口径。
-	rows, err := db.DB.Query(`SELECT caddy_id, COALESCE(domain,''), COALESCE(name,''), listen_port FROM lb_rules WHERE protocol='http' AND COALESCE(domain,'') != '' ORDER BY COALESCE(enabled,0) ASC, id ASC`)
+	rows, err := db.DB.Query(`SELECT caddy_id, COALESCE(domain,''), COALESCE(name,''), listen_port FROM lb_rules WHERE protocol='http' AND COALESCE(domain,'') != '' ORDER BY COALESCE(enabled,0) ASC, COALESCE(created_at,'') ASC, caddy_id ASC`)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("security events: load rules: %w", err)
 	}
@@ -792,7 +800,10 @@ func securityEventsPolicyCustomEmitIDs(policy *models.SecurityPolicy) (map[int]s
 	return nil, false
 }
 
-// securityEventsPolicyContainsRule reports whether the given rule id belongs to
+// securityEventsPolicyContainsRuleWithExclusions 归属判定的单一生产实现
+// （无排除快照的测试包装在 securityevents_test.go）。
+//
+// reports whether the given rule id belongs to
 // the policy's active rule set. 自定义规则（10000+，且 <800000）：查 custom_rules
 // JSON（兼容 ID 数组与内嵌对象数组两种形状）。注意 ID 空间：custom_rules JSON
 // 存的是 security_custom_rules 的 DB 主键 id，而 audit 的 rule_triggered 是
@@ -812,12 +823,9 @@ func securityEventsPolicyCustomEmitIDs(policy *models.SecurityPolicy) (map[int]s
 // 同一读法）。事件源 IP 不在任何名单＝名单在发射后被编辑的漂移形状，contains
 // 让位、由 fallback 能力首选层归属（绝不归零）。clientIP 为空（调用形状/
 // 记录缺 IP）保持既有「名单非空即认领」口径。
-func securityEventsPolicyContainsRule(policy *models.SecurityPolicy, ruleTriggered, clientIP string) bool {
-	return securityEventsPolicyContainsRuleWithExclusions(policy, ruleTriggered, clientIP, securityEventsPolicyCRSExclusions{})
-}
-
-// securityEventsPolicyContainsRuleWithExclusions 在归属判定中加入配置期/运行时
-// CRS 排除快照：被本策略删除的规则不可能是其发射面。
+// crsExclusions 为配置期/运行时 CRS 排除快照：被本策略删除的规则不可能是其
+// 发射面（生产归因链一律走本函数；无排除快照的测试包装在
+// securityevents_test.go）。
 func securityEventsPolicyContainsRuleWithExclusions(policy *models.SecurityPolicy, ruleTriggered, clientIP string, crsExclusions securityEventsPolicyCRSExclusions) bool {
 	if policy == nil || ruleTriggered == "" {
 		return false
@@ -842,7 +850,8 @@ func securityEventsPolicyContainsRuleWithExclusions(policy *models.SecurityPolic
 	case n == 8:
 		// GeoIP 拦截（遗留共享 id:8，策略引擎时代的历史事件）：所有权与发射门
 		// （PolicyHasGeoIP）同口径——mode!='off' 且名单非空。off 态名单仅为
-		// 保留数据（不发射 id:8），不得抢走真实发射策略的归因（审计 		// off+保留名单的首绑定策略曾错夺 id:8 归因）。
+		// 保留数据（不发射 id:8），不得抢走真实发射策略的归因（mode=off 但
+		// 名单非空的首绑定策略不得凭候选顺序认领 id:8 事件）。
 		if policy.GeoIPMode == "off" {
 			return false
 		}
@@ -1142,8 +1151,11 @@ func securityEventsIPFamilyEventSurface(p *models.SecurityPolicy, action, ruleTr
 }
 
 // securityEventsIPInList 报告事件源 IP 是否命中名单条目（精确或 CIDR 包含）。
-// 条目解析失败按不命中跳过（与渲染端 @ipMatch 的宽松容忍一致——坏条目在
-// 生成期告警，不在此重复报）。归一后比较。
+// 条目解析走引擎侧单一事实源 wafiplist.ParseIPEntry（4in6 归一 / zone 拒绝
+// 与 @ipListFast 完全同口径）——此前裸 netip.ParsePrefix 不归一 4in6 条目，
+// 写侧允许的 ::ffff:a.b.c.d/120 在引擎侧命中、此处判不命中，导致 id:2/4 归因
+// 与 CRS 排除 scope 判定与引擎匹配口径分叉。解析失败按不命中跳过（与渲染端
+// @ipMatch 的宽松容忍一致——坏条目在生成期告警，不在此重复报）。
 func securityEventsIPInList(ip string, list []string) bool {
 	addr, err := netip.ParseAddr(ip)
 	if err != nil {
@@ -1155,16 +1167,7 @@ func securityEventsIPInList(ip string, list []string) bool {
 		if entry == "" {
 			continue
 		}
-		if entry == ip {
-			return true
-		}
-		if prefix, perr := netip.ParsePrefix(entry); perr == nil {
-			if prefix.Contains(addr) {
-				return true
-			}
-			continue
-		}
-		if entryAddr, aerr := netip.ParseAddr(entry); aerr == nil && entryAddr.Unmap() == addr {
+		if prefix, perr := wafiplist.ParseIPEntry(entry); perr == nil && prefix.Contains(addr) {
 			return true
 		}
 	}
@@ -1377,6 +1380,9 @@ func (t *securityEventsTailer) securityEventsGenerationGuard(offset int64) (int6
 		// 不随库重置——不重置则窗口内事件被二次计数，阈值提前达成误封。
 		// 重置后由重放按事件时间重建窗口计数，净效果=恰好一次。
 		ResetAutobanCounters()
+		// 去重表与会话绑定：新库为空，整份审计日志重放必须逐条重新落库——
+		// 旧库时代的去重记忆会把重放事件当重复丢弃（新库永远缺这些行）。
+		t.dedupe = securityEventsRequestDeduper{}
 		if err := securityEventsWriteOffset(t.offsetPath, 0); err != nil {
 			return offset, fmt.Errorf("security events: persist offset reset for new library generation: %w", err)
 		}
@@ -1533,6 +1539,131 @@ func notifySecurityEventsRollupRewrite(minute time.Time) {
 // 之外的字节触发钉测；生产为单调计数器，无消费方）。
 var securityEventsIngestCommits atomic.Int64
 
+// 请求级事件去重：多策略绑定下同一请求会被每个绑定策略的 coraza 实例各写
+// 一条审计事务（coraza-caddy 为每次 ServeHTTP 生成独立 transaction_id），
+// 逐条入库会让事件列表成对重复、策略/总览/大屏计数与自动封禁阈值按引擎数
+// 放大（N 个重叠策略=N 倍）。安全链首（lb_security_blocked_counter）为每个
+// 请求注入 X-Lb-Security-Timing-Id，审计行 request.headers 天然收录——同一
+// 请求的全部引擎事务共享该值，是请求级自然键。
+//
+// 归并语义：同一请求只落一条事件；后到的「拦截」覆盖先到的「检测」
+// （检测引擎先写 logged、后续引擎才裁决拦截时，对外结论必须是拦截），触发
+// 规则/评分/策略归因随之改判为拦截引擎的值（谁拦的必须自洽）；其余重复
+// 一律丢弃。缺请求级计时头的审计行（旧版本日志）没有请求级自然键，逐条
+// 入库——绝不按「秒+四元组」指纹猜测归并（会把独立请求误并为一条）。
+const (
+	// securityEventsDedupeWindow 是去重记忆窗口：同一请求的各引擎事务在写侧
+	// 相邻（毫秒~秒级），窗口只需覆盖跨秒/跨 pass 的迟到事务。
+	securityEventsDedupeWindow = 60 * time.Second
+	// securityEventsDedupeMaxEntries 限制常驻去重表规模（每条约数十字节，
+	// 26 万条约 10MB）：超限后新键不再登记（既有键照常归并），记忆退化为
+	// 「新请求不漏、旧键不淘汰」——淘汰旧键会把后续同键事件重新入库。
+	securityEventsDedupeMaxEntries = 1 << 18
+	// securityEventsDedupeSweepEvery 是过期清扫的插入间隔（摊销 O(表长)）。
+	securityEventsDedupeSweepEvery = 4096
+)
+
+// securityEventsDedupeWindowSec 是去重窗口的秒数（记忆键按秒级 event_time 存储）。
+const securityEventsDedupeWindowSec = int64(securityEventsDedupeWindow / time.Second)
+
+// securityEventsDedupeEntry 记一条已落库事件的归并状态。
+type securityEventsDedupeEntry struct {
+	// transactionID 是首次落库行的幂等键（升级改判按它定位）。
+	transactionID string
+	// rank 是该行当前的结论强度（securityEventsActionRank）。
+	rank uint8
+	// atSec 是该行 event_time 的 Unix 秒（过期清扫与分钟回退通知用）。
+	atSec int64
+}
+
+// securityEventsRequestDeduper 是跨 pass 复用的请求级去重表（tailer 级：
+// 轮转/停等导致同一请求的引擎事务落到不同 pass 时仍能归并）。不是并发安全
+// 的——摄取按 tick 串行调用。
+type securityEventsRequestDeduper struct {
+	entries    map[uint64]securityEventsDedupeEntry
+	maxSec     int64
+	sinceSweep int
+	capWarned  bool
+}
+
+// lookup 返回该键在窗口内的既有登记；过期项按未登记处理（旧键不阻塞新请求）。
+func (d *securityEventsRequestDeduper) lookup(key uint64, atSec int64) (securityEventsDedupeEntry, bool) {
+	entry, ok := d.entries[key]
+	if !ok || entry.atSec < atSec-securityEventsDedupeWindowSec {
+		return securityEventsDedupeEntry{}, false
+	}
+	return entry, true
+}
+
+// record 登记/更新一条归并状态（窗口外条目按周期清扫）。
+func (d *securityEventsRequestDeduper) record(key uint64, entry securityEventsDedupeEntry) {
+	if d.entries == nil {
+		d.entries = make(map[uint64]securityEventsDedupeEntry)
+	}
+	if entry.atSec > d.maxSec {
+		d.maxSec = entry.atSec
+	}
+	d.sinceSweep++
+	if d.sinceSweep >= securityEventsDedupeSweepEvery {
+		d.sweep()
+	}
+	if _, exists := d.entries[key]; !exists && len(d.entries) >= securityEventsDedupeMaxEntries {
+		if !d.capWarned {
+			d.capWarned = true
+			Logf("warn", "security events ingestion: request dedupe table reached %d entries, new keys are no longer tracked", securityEventsDedupeMaxEntries)
+		}
+		return
+	}
+	d.entries[key] = entry
+}
+
+// sweep 丢弃窗口外的陈旧条目（否则长跑进程的去重表按事件量无界增长）。
+func (d *securityEventsRequestDeduper) sweep() {
+	d.sinceSweep = 0
+	cutoff := d.maxSec - securityEventsDedupeWindowSec
+	for key, entry := range d.entries {
+		if entry.atSec < cutoff {
+			delete(d.entries, key)
+		}
+	}
+}
+
+// securityEventsRequestDedupeKey 返回请求级去重键：仅 X-Lb-Security-Timing-Id
+// 存在时可用（ok=false 表示该审计行没有请求级自然键——旧版本日志或注入失败，
+// 按原样逐条入库）。绝不退化为「秒+客户端 IP+方法+URI+规则」指纹：同一秒同源
+// 同 URI 同规则的独立请求会被误并为一条（真实洪峰/扫描器复访形态），宁可
+// 旧日志不去重，也不丢新事件。
+func securityEventsRequestDedupeKey(rec *securityEventRecord) (uint64, bool) {
+	if rec.requestKey == "" {
+		return 0, false
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(rec.requestKey))
+	return h.Sum64(), true
+}
+
+// securityEventsActionRank 是结论强度排序：拦截 > 检测 > 其他（未知动作
+// 不覆盖既有结论）。
+func securityEventsActionRank(action string) uint8 {
+	switch action {
+	case "blocked":
+		return 2
+	case "logged":
+		return 1
+	default:
+		return 0
+	}
+}
+
+// securityEventsRecordSecond 取记录 event_time 的 Unix 秒（解析失败回落当前
+// 时刻——仅影响去重窗口定位，不影响落库值）。
+func securityEventsRecordSecond(rec *securityEventRecord) int64 {
+	if t, err := time.ParseInLocation("2006-01-02 15:04:05", rec.EventTime, time.UTC); err == nil {
+		return t.Unix()
+	}
+	return time.Now().UTC().Unix()
+}
+
 // securityEventsTailer streams new audit transactions from the log file,
 // persisting its byte offset between passes so restarts resume in place.
 type securityEventsTailer struct {
@@ -1564,6 +1695,9 @@ type securityEventsTailer struct {
 	generation       string
 	generationLoaded bool
 	generationPath   string
+	// dedupe 是请求级事件去重表（跨 pass 复用：同一请求的引擎事务被轮转/
+	// 停等拆到不同 pass 时仍归并为一条）。
+	dedupe securityEventsRequestDeduper
 }
 
 func securityEventsNewTailer(logPath, offsetPath string) *securityEventsTailer {
@@ -1736,7 +1870,20 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 	// 自动封禁喂入：本事务批次内成功解析的 WAF 事件随「提交点」喂计数器
 	// ——commit 成功后才喂（回滚路径不喂，重试不重复计数）；feedBatch 为 nil
 	// 时 autobanObserveBatch 零动作（未启用/从节点等门在函数内收敛）。
+	// 按请求级去重键聚合：同一请求的多个引擎事务只喂一条；被批内改判的行
+	// 用 autobanIndex 定位并替换原条目（不能一请求喂两次，否则阈值仍被放大）。
 	var autobanBatch []autobanFeedItem
+	autobanIndex := map[uint64]int{}
+	// pendingDedupe 是本事务内已落库/已改判的归并状态——只在 commit 成功后
+	// 并入 tailer 的去重表。批次回滚/提交失败时同一偏移会重试，提前登记会把
+	// 重试的行当重复丢弃（事件永久丢失）。
+	pendingDedupe := map[uint64]securityEventsDedupeEntry{}
+	lookupDedupe := func(key uint64, atSec int64) (securityEventsDedupeEntry, bool) {
+		if entry, ok := pendingDedupe[key]; ok && entry.atSec >= atSec-securityEventsDedupeWindowSec {
+			return entry, true
+		}
+		return t.dedupe.lookup(key, atSec)
+	}
 	// 攻击流光流批次：与日志事务提交点对齐，回滚路径不喂。
 	var attackFlowBatch []threatScreenAttackFlowItem
 	// 本批实际插入事件的最旧分钟（UTC）——提交成功后通知 rollup
@@ -1752,8 +1899,13 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 		securityEventsIngestCommits.Add(1)
 		passInsertedTotal += batchInserted
 		batchInserted = 0
+		for key, entry := range pendingDedupe {
+			t.dedupe.record(key, entry)
+		}
+		pendingDedupe = map[uint64]securityEventsDedupeEntry{}
 		autobanObserveBatch(autobanBatch)
 		autobanBatch = nil
+		autobanIndex = map[uint64]int{}
 		threatScreenAttackFlowRecordBatch(attackFlowBatch)
 		attackFlowBatch = nil
 		notifySecurityEventsRollupRewrite(batchOldestMinute)
@@ -1924,52 +2076,99 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 			if rec.AnomalyScore == 0 && rec.chainedCustomRule {
 				rec.AnomalyScore = securityEventsChainedCustomRuleScore(rec.RuleTriggered, policyByID)
 			}
-			res, ierr := stmt.Exec(rec.EventTime, rule.caddyID, policyID, rec.ClientIP, rec.Method, rec.URI,
-				rec.EventType, rec.RuleTriggered, rec.RuleMsg, rec.Action, rec.AnomalyScore,
-				rule.name, policyName, rec.TransactionID, rec.DurationUs, rec.PrecheckUs, rec.RequestHeaders, rec.RequestBody)
-			if ierr != nil {
-				_ = stmt.Close()
-				_ = tx.Rollback()
-				return committedOffset, fmt.Errorf("security events: insert event: %w", ierr)
+			dedupeKey, dedupeable := securityEventsRequestDedupeKey(rec)
+			atSec := securityEventsRecordSecond(rec)
+			var prev securityEventsDedupeEntry
+			duplicate := false
+			if dedupeable {
+				prev, duplicate = lookupDedupe(dedupeKey, atSec)
 			}
-			// INSERT OR IGNORE 对重复 transaction_id 静默跳过——必须取
-			// RowsAffected 区分「实际插入」与「忽略」，否则轮转补采/offset 重放
-			// 把同一事件重复喂自动封禁计数器（阈值提前达成）。RowsAffected 失败
-			// 属于未知写入结果：回滚本批、偏移不推进，下个 tick 以同一偏移重试
-			// （保留批次重试语义，不猜测结果）。
-			affected, aerr := res.RowsAffected()
-			if aerr != nil {
-				_ = stmt.Close()
-				_ = tx.Rollback()
-				return committedOffset, fmt.Errorf("security events: insert result: %w", aerr)
-			}
-			if affected == 1 {
-				eventAt, _ := time.ParseInLocation("2006-01-02 15:04:05", rec.EventTime, time.UTC)
-				if eventAt.IsZero() {
-					eventAt = time.Now().UTC()
-				}
-				autobanBatch = append(autobanBatch, autobanFeedItem{
-					IP:            rec.ClientIP,
-					Action:        rec.Action,
-					RuleTriggered: rec.RuleTriggered,
-					At:            eventAt,
-					TrustExempt:   rec.Action == "logged" && trustMatcher.trusted(rule.caddyID, rec.ClientIP),
-				})
-				if threatScreenAttackFlowSampleN.Load() > 0 {
-					attackFlowBatch = append(attackFlowBatch, threatScreenAttackFlowItem{
-						at:            eventAt,
-						clientIP:      rec.ClientIP,
-						action:        rec.Action,
-						ruleTriggered: rec.RuleTriggered,
-					})
-				}
-				batchInserted++
-				// 记录本批最旧插入分钟（event_time 恒 UTC 墙钟串；
-				// 解析失败跳过——仅影响回退精度，不影响摄取）。
-				if et, terr := time.ParseInLocation("2006-01-02 15:04:05", rec.EventTime, time.UTC); terr == nil {
-					m := et.Truncate(time.Minute)
+			if duplicate {
+				// 同一请求的后续引擎事务：不再落第二条事件。后到的拦截结论
+				// 覆盖先到的检测行（谁拦的、按什么规则、多少分同步改判）；
+				// 其余重复（同结论/更弱结论）直接丢弃。
+				if securityEventsActionRank(rec.Action) > prev.rank {
+					if uerr := securityEventsUpgradeDedupedEvent(tx, prev.transactionID, rec, rule, policyID, policyName); uerr != nil {
+						_ = stmt.Close()
+						_ = tx.Rollback()
+						return committedOffset, uerr
+					}
+					prev.rank = securityEventsActionRank(rec.Action)
+					pendingDedupe[dedupeKey] = prev
+					// 本批已缓冲的自动封禁条目同步改判（不追加第二条——
+					// 一请求只喂一次，否则阈值放大依旧）。
+					if idx, ok := autobanIndex[dedupeKey]; ok {
+						autobanBatch[idx].Action = rec.Action
+						autobanBatch[idx].RuleTriggered = rec.RuleTriggered
+						autobanBatch[idx].TrustExempt = false
+					}
+					// 该分钟 rollup 可能已按 logged 固化：重固让 action/rule
+					// 维度与改判后的行一致。
+					m := time.Unix(prev.atSec, 0).UTC().Truncate(time.Minute)
 					if batchOldestMinute.IsZero() || m.Before(batchOldestMinute) {
 						batchOldestMinute = m
+					}
+				}
+			} else {
+				res, ierr := stmt.Exec(rec.EventTime, rule.caddyID, policyID, rec.ClientIP, rec.Method, rec.URI,
+					rec.EventType, rec.RuleTriggered, rec.RuleMsg, rec.Action, rec.AnomalyScore,
+					rule.name, policyName, rec.TransactionID, rec.DurationUs, rec.PrecheckUs, rec.RequestHeaders, rec.RequestBody)
+				if ierr != nil {
+					_ = stmt.Close()
+					_ = tx.Rollback()
+					return committedOffset, fmt.Errorf("security events: insert event: %w", ierr)
+				}
+				// INSERT OR IGNORE 对重复 transaction_id 静默跳过——必须取
+				// RowsAffected 区分「实际插入」与「忽略」，否则轮转补采/offset 重放
+				// 把同一事件重复喂自动封禁计数器（阈值提前达成）。RowsAffected 失败
+				// 属于未知写入结果：回滚本批、偏移不推进，下个 tick 以同一偏移重试
+				// （保留批次重试语义，不猜测结果）。
+				affected, aerr := res.RowsAffected()
+				if aerr != nil {
+					_ = stmt.Close()
+					_ = tx.Rollback()
+					return committedOffset, fmt.Errorf("security events: insert result: %w", aerr)
+				}
+				if affected == 1 {
+					eventAt, _ := time.ParseInLocation("2006-01-02 15:04:05", rec.EventTime, time.UTC)
+					if eventAt.IsZero() {
+						eventAt = time.Now().UTC()
+					}
+					if dedupeable {
+						autobanIndex[dedupeKey] = len(autobanBatch)
+					}
+					autobanBatch = append(autobanBatch, autobanFeedItem{
+						IP:            rec.ClientIP,
+						Action:        rec.Action,
+						RuleTriggered: rec.RuleTriggered,
+						At:            eventAt,
+						TrustExempt:   rec.Action == "logged" && trustMatcher.trusted(rule.caddyID, rec.ClientIP),
+					})
+					if threatScreenAttackFlowSampleN.Load() > 0 {
+						attackFlowBatch = append(attackFlowBatch, threatScreenAttackFlowItem{
+							at:            eventAt,
+							clientIP:      rec.ClientIP,
+							action:        rec.Action,
+							ruleTriggered: rec.RuleTriggered,
+						})
+					}
+					batchInserted++
+					// 记录本批最旧插入分钟（event_time 恒 UTC 墙钟串；
+					// 解析失败跳过——仅影响回退精度，不影响摄取）。
+					if et, terr := time.ParseInLocation("2006-01-02 15:04:05", rec.EventTime, time.UTC); terr == nil {
+						m := et.Truncate(time.Minute)
+						if batchOldestMinute.IsZero() || m.Before(batchOldestMinute) {
+							batchOldestMinute = m
+						}
+					}
+				}
+				// 登记归并状态（忽略行=重放，行已在库，同样登记以便同请求的
+				// 后续引擎事务丢弃/改判）；commit 成功才并入 tailer 的去重表。
+				if dedupeable {
+					pendingDedupe[dedupeKey] = securityEventsDedupeEntry{
+						transactionID: rec.TransactionID,
+						rank:          securityEventsActionRank(rec.Action),
+						atSec:         atSec,
 					}
 				}
 			}
@@ -1998,6 +2197,20 @@ func (t *securityEventsTailer) securityEventsProcessPass(f *os.File, offset int6
 		}
 		offset = docEnd
 	}
+}
+
+// securityEventsUpgradeDedupedEvent 把同一请求已落库的检测行改判为拦截
+// 结论：action/评分/触发规则/策略归因整体替换为拦截引擎的值（展示必须自洽
+// ——谁拦的、按什么规则、多少分）。请求头与请求体保留首次落库的快照：后续
+// 引擎未开请求体记录时不该把已有请求体清空。幂等（重放时重复执行同样值）。
+func securityEventsUpgradeDedupedEvent(tx *sql.Tx, transactionID string, rec *securityEventRecord, rule securityEventsRuleRef, policyID int, policyName string) error {
+	if _, err := tx.Exec(`UPDATE security_events
+		SET action=?, anomaly_score=?, rule_caddy_id=?, rule_triggered=?, rule_msg=?, rule_name=?, policy_id=?, policy_name=?, duration_us=?, precheck_us=?
+		WHERE transaction_id=?`,
+		rec.Action, rec.AnomalyScore, rule.caddyID, rec.RuleTriggered, rec.RuleMsg, rule.name, policyID, policyName, rec.DurationUs, rec.PrecheckUs, transactionID); err != nil {
+		return fmt.Errorf("security events: upgrade merged event: %w", err)
+	}
+	return nil
 }
 
 // securityEventsTransactionID extracts the id for skip logging on a best-effort
@@ -2033,6 +2246,14 @@ func securityEventsIngestRotatedDelta(persistedOffset int64) (int, error) {
 		return 0, nil // 归档未包含超出已摄取偏移的内容
 	}
 	return securityEventsIngestDeltaFrom(archive, persistedOffset, true)
+}
+
+// securityEventsIngestDepsReady 报告补采所需的数据库句柄是否就绪。
+// securityEventsIngestDeltaFrom 在依赖缺失时返回 (0, nil)——「未补采」不得被
+// 当作「补采成功」：轮转侧据此删除 pending 安全网会让该窗口的事件永久丢失，
+// 故删除标记前必须先问本函数。
+func securityEventsIngestDepsReady() bool {
+	return db.DB != nil && db.MetricsDB != nil
 }
 
 // securityEventsIngestDeltaFrom 从 path 的 from 偏移补采到 EOF 的安全事件：

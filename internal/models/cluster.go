@@ -73,13 +73,21 @@ func NormalizeClusterNodeName(name string) string {
 	return name
 }
 
-// ClusterAccessURLHostMatchesIP 判定自述访问地址的主机是否即注册来源 IP
-// access_url 是能力票据（服务控制/登录票据）的投递
-// 地址，注册方自述值只在与来源 IP 一致时可信；其余必须由管理员经节点访问
-// 地址端点显式配置，避免已发注册令牌把票据引向任意第三方主机。
+// ClusterAccessURLHostMatchesIP 判定自述访问地址的主机是否即注册来源 IP。
+// access_url 是能力票据（服务控制/登录票据）的投递地址，注册方自述值只在与
+// **服务端观测到的来源地址**一致时可信；其余必须由管理员经节点访问地址端点
+// 显式配置，避免已发注册令牌把票据引向任意第三方主机。
+//
+// ipAddress 必须是 IP 字面量：主机名/空串/非法串不构成可比的信任锚（曾以
+// 请求体自述 ip_address 传入，比较双方同源等于未校验；主机名分支还会让
+// 「URL 主机 == 自述主机名」这类同源比较成立，故整条按不可信处理）。
 func ClusterAccessURLHostMatchesIP(accessURL, ipAddress string) bool {
 	if accessURL == "" {
 		return true
+	}
+	sourceIP := net.ParseIP(strings.TrimSpace(ipAddress))
+	if sourceIP == nil {
+		return false
 	}
 	parsed, err := url.Parse(accessURL)
 	if err != nil {
@@ -89,11 +97,8 @@ func ClusterAccessURLHostMatchesIP(accessURL, ipAddress string) bool {
 	if host == "" {
 		return false
 	}
-	if strings.EqualFold(host, ipAddress) {
-		return true
-	}
 	parsedIP := net.ParseIP(host)
-	return parsedIP != nil && parsedIP.Equal(net.ParseIP(ipAddress))
+	return parsedIP != nil && parsedIP.Equal(sourceIP)
 }
 
 // ClusterAccessURLTargetsNode 尽力识别主节点地址是否指向本机监听端口。
@@ -168,8 +173,10 @@ type ClusterNodeServiceRequest struct {
 type ClusterServiceControlRequest struct {
 	Action string `json:"action" binding:"required"`
 	Ticket string `json:"ticket" binding:"required"`
-	// Operator 是主节点侧实际操作人用户名(经票据保护的转发链传递,从节点
-	// 审计记录真实操作人而非「system」;空串回退「主节点」)。
+	// Operator 是主节点侧实际操作人用户名。已知边界：该字段不在签名载荷内
+	// （票据只绑定 node/action/jti/expiry），属持票方可自述的未认证字段——
+	// 从节点审计据此显示操作人，不改变可执行动作；TLS/TOFU 通道下无外部
+	// 伪造面。空串回退「主节点」。
 	Operator string `json:"operator,omitempty"`
 }
 

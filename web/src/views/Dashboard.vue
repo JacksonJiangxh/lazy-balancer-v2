@@ -104,7 +104,7 @@
                 </div>
                 <div class="stat-content">
                   <div class="stat-value">{{ caddyMetricsUnavailable ? '采集失败' : caddyMetrics ? caddyMetrics.requests_total.toLocaleString() : '-' }}</div>
-                  <div class="stat-label">总请求数</div>
+                  <div class="stat-label" :title="METRIC_RELOAD_RESET_NOTE">总请求数</div>
                 </div>
               </div>
             </el-col>
@@ -352,10 +352,12 @@
               </template>
             </el-table-column>
             <!-- 初版 310 过宽（用户反馈）→ 260：常见量级（万级以内）
-                 四 badge 单行 ~230px 舒适；极端大数字（百万级）由 flex-wrap 换行
-                 兜底（badge 自身 nowrap，不出现数字内折）。
+                 五 badge（2xx/3xx/4xx/5xx/Block）单行 ~290px 舒适；计数升到
+                 百万级时由 .status-codes 的 flex-wrap 换行兜底（badge 自身
+                 nowrap，不出现数字内折）——不得改回 nowrap + overflow:hidden：
+                 那会把末尾 Block 静默裁掉，让「有拦截」看起来是「无拦截」。
                  历史（用户反馈）：入站/出站流量列 90→100（字节量级数字易被截），
-                 差额从状态码列 380→360 划出（badge 单行 ~230px 仍有充足余量）。 -->
+                 差额从状态码列 380→360 划出。 -->
             <el-table-column label="状态码" width="360">
               <template #default="{ row }">
                 <span v-if="isRuleDisabled(row)" class="text-secondary">已禁用</span>
@@ -480,7 +482,7 @@ import { Monitor, Cpu, Document, Loading, CircleCheck, Odometer, TrendCharts, Da
 import type { APIResponse, SystemInfo, SystemMetrics, CaddyMetrics, Rule, RuleMetrics, HostMetrics, MetricsOverview } from '@/types'
 import { usePollingTask } from '@/composables/usePollingTask'
 import { httpStatusColors } from '@/utils/chartTheme'
-import { buildRuleMetricsUnavailable, ruleMetricCellTitle } from '@/utils/dashboardMetrics'
+import { buildRuleMetricsUnavailable, METRIC_RELOAD_RESET_NOTE, ruleMetricCellTitle } from '@/utils/dashboardMetrics'
 import { degradedMetricLabels, degradedMetricParts } from '@/utils/systemMetrics'
 
 
@@ -852,7 +854,11 @@ let statusRefreshTimer: number | null = null
 let statusConfirmTimer: number | null = null
 let disposed = false
 let fetchAllDataPromise: Promise<void> | null = null
-let isFetchingRuleHealth = false
+let ruleHealthInFlight = false
+// 在途期间到达的新版本需求：收尾补跑。原布尔门直接丢弃新需求，而旧响应又因
+// 版本守卫被丢弃 → 新规则集整轮拿不到健康结论（健康列按 caddy_id 沿用上一版本
+// 映射，且无陈旧提示）。只保留最新一次需求（同版本重复无意义）。
+let pendingRuleHealth: { readonly rules: Rule[]; readonly version: number } | null = null
 let rulesVersion = 0
 
 // 慢车道（15s，与规则页健康列同口径）：/rules 是全量规则 + upstreams hydrate，
@@ -995,8 +1001,13 @@ const fetchAllData = (roundSignal?: AbortSignal): Promise<void> => {
 }
 
 const fetchRuleHealth = async (currentRules: Rule[], version: number, roundSignal?: AbortSignal) => {
-  if (disposed || currentRules.length === 0 || isFetchingRuleHealth) return
-  isFetchingRuleHealth = true
+  if (disposed || currentRules.length === 0) return
+  if (ruleHealthInFlight) {
+    // 在途：记下更新的版本供收尾补跑（旧版本已被取代，不排队）
+    if (!pendingRuleHealth || pendingRuleHealth.version < version) pendingRuleHealth = { rules: currentRules, version }
+    return
+  }
+  ruleHealthInFlight = true
   try {
     const res = await request.get<APIResponse<HealthResponse>>('/config/health', { signal: roundSignal ?? dashboardPolling.signal, silent: true })
     if (disposed || version !== rulesVersion) return
@@ -1052,7 +1063,14 @@ const fetchRuleHealth = async (currentRules: Rule[], version: number, roundSigna
       console.error('Failed to fetch rule health:', e)
     }
   } finally {
-    isFetchingRuleHealth = false
+    ruleHealthInFlight = false
+    const pending = pendingRuleHealth
+    pendingRuleHealth = null
+    // 同一版本无需重跑（在途那轮已覆盖该版本）；补跑不携旧轮次的 signal——
+    // 上一轮可能已被 pause/stop 或后续轮次 abort，回落页级永久 signal。
+    if (pending && !disposed && pending.version !== version) {
+      await fetchRuleHealth(pending.rules, pending.version)
+    }
   }
 }
 
@@ -1242,10 +1260,9 @@ onUnmounted(() => {
 
 .status-codes {
   display: flex;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   justify-content: flex-start;
   gap: 4px;
-  overflow: hidden;
 }
 .status-code {
   font-size: 10px;

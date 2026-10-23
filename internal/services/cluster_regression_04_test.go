@@ -15,6 +15,7 @@ import (
 func TestSyncService_recordSyncError_repeatedTransportFailures_boundedMessageWithCount(t *testing.T) {
 	// Given：重载失败标记已存在；之后连续 200 次传输层失败（错误内容固定）
 	_, database := newClusterTestService(t)
+	setNodeMasterRole(t, database, false) // 同步状态写只属于从节点语境
 	if _, err := database.Exec("UPDATE global_config SET last_sync_error=?", encodeSyncError("apply_ok_reload_failed: caddy down", models.SyncErrorCodeApplyFailed)); err != nil {
 		t.Fatal(err)
 	}
@@ -54,6 +55,7 @@ func TestSyncService_recordSyncError_repeatedTransportFailures_boundedMessageWit
 func TestSyncService_recordSyncError_pinMismatchPreservesMarker_terminalOverwrites(t *testing.T) {
 	// Given：重载失败标记已存在
 	_, database := newClusterTestService(t)
+	setNodeMasterRole(t, database, false) // 同步状态写只属于从节点语境
 	if _, err := database.Exec("UPDATE global_config SET last_sync_error=?", encodeSyncError("apply_ok_reload_failed: caddy down", models.SyncErrorCodeApplyFailed)); err != nil {
 		t.Fatal(err)
 	}
@@ -106,6 +108,7 @@ func TestSyncService_recordSyncError_schemaTooOldAndSignatureInvalidPreserveMark
 		t.Run(testCase.name, func(t *testing.T) {
 			// Given：重载失败标记已存在
 			_, database := newClusterTestService(t)
+			setNodeMasterRole(t, database, false) // 同步状态写只属于从节点语境
 			if _, err := database.Exec("UPDATE global_config SET last_sync_error=?", encodeSyncError("apply_ok_reload_failed: caddy down", models.SyncErrorCodeApplyFailed)); err != nil {
 				t.Fatal(err)
 			}

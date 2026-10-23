@@ -9,6 +9,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -553,8 +556,64 @@ func TestUpdateRule_auditsEnqueueFailureWhenQueueInactive(t *testing.T) {
 	}
 }
 
+// 提交后失败审计 行为钉：提交已成功、ACME 阶段读取证书任务失败 → 500 +
+// 「更新失败」审计（含规则 id）。该分支此前只回滚不落审计，Explicit 策略下
+// 整个「曾提交并已回滚」的事实完全缺席。
+func TestUpdateRule_auditsCertJobReadFailureAfterCommit(t *testing.T) {
+	handler, _, _ := newAuditRuleHandlers(t, 0)
+	seedAuditRule(t, "lb_acme_read_fail", "acmereadfail", "acmereadfail.example.test", 18007, true, "acme_dns", true)
+	seedAuditUpstream(t, "lb_acme_read_fail")
+	var providerID int
+	if err := db.DB.QueryRow("SELECT id FROM ca_providers WHERE enabled=1 ORDER BY id LIMIT 1").Scan(&providerID); err != nil {
+		t.Fatalf("read CA provider: %v", err)
+	}
+	if _, err := db.DB.Exec("UPDATE lb_rules SET acme_config_id=?,ca_provider_id=? WHERE caddy_id='lb_acme_read_fail'",
+		seedR52CertificateConfig(t), providerID); err != nil {
+		t.Fatalf("bind ACME references: %v", err)
+	}
+
+	probe := &prepareProbe{fail: func(query string, _ bool) error {
+		if strings.Contains(query, "SELECT id,status,expires_at,COALESCE(ca_provider_id,0) FROM cert_jobs") {
+			return errors.New("injected cert_jobs read failure")
+		}
+		return nil
+	}}
+	wrapHandlerDBWithProbe(t, probe)
+
+	router := gin.New()
+	router.PUT("/rules/:caddy_id", handler.UpdateRule)
+	request := httptest.NewRequest(http.MethodPut, "/rules/lb_acme_read_fail",
+		strings.NewReader(`{"name":"acmereadfail-renamed"}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), "读取证书任务失败") {
+		t.Fatalf("status=%d body=%s, want 500 读取证书任务失败", response.Code, response.Body.String())
+	}
+	var auditCount int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log
+		WHERE action='更新失败' AND resource='负载规则' AND detail LIKE '%读取证书任务失败%'`).Scan(&auditCount); err != nil {
+		t.Fatalf("read update failure audit: %v", err)
+	}
+	if auditCount != 1 {
+		t.Fatalf("提交后读取证书任务失败必须恰落 1 条「更新失败」审计，实际 %d", auditCount)
+	}
+	var detail string
+	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log
+		WHERE action='更新失败' AND resource='负载规则' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
+		t.Fatalf("read audit detail: %v", err)
+	}
+	if !strings.Contains(detail, "lb_acme_read_fail") {
+		t.Fatalf("审计明细必须点名规则 id: %q", detail)
+	}
+}
+
 // 提交后失败审计 结构钉：五端点提交后失败分支的审计留痕数量下限（提交失败/入队
-// 失败路径无法在 handler 层注入 DB commit 故障，按源码分支计数）
+// 失败路径无法在 handler 层注入 DB commit 故障，按源码分支计数）。
+// 注意：这是「最低数量」而非充分条件——新增/漏记分支可能不在计数覆盖面内，
+// 分支集合等价由 TestRulePostCommitFailureBranches_allAudited 承担。
 func TestRuleFailurePathAudits_pinAllPostCommitBranches(t *testing.T) {
 	src, err := os.ReadFile("rules.go")
 	if err != nil {
@@ -576,6 +635,129 @@ func TestRuleFailurePathAudits_pinAllPostCommitBranches(t *testing.T) {
 		if got := strings.Count(window, `recordAudit(c, "`+tc.action+`"`); got < tc.min {
 			t.Fatalf("%s 失败审计 %s 次数=%d, want >= %d", tc.fn, tc.action, got, tc.min)
 		}
+	}
+}
+
+// 提交后失败审计 分支集合等价门（替代「数量下限」的充分性）：
+// 枚举五端点函数体内每个包含补偿调用（restoreACMEState / restoreEnabledState /
+// recoverCommittedViewAfterCommitFailure）的 if 块，断言块内存在留痕调用
+// ——直接 recordAudit，或经 fail* 闭包（闭包本体含 recordAudit）。
+// 任何新增补偿分支若无留痕立即变红，不依赖计数阈值。
+func TestRulePostCommitFailureBranches_allAudited(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "rules.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse rules.go: %v", err)
+	}
+	compensators := map[string]bool{
+		"restoreACMEState":                       true,
+		"restoreEnabledState":                    true,
+		"recoverCommittedViewAfterCommitFailure": true,
+	}
+	calledNames := func(node ast.Node) []string {
+		var names []string
+		ast.Inspect(node, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			switch fun := call.Fun.(type) {
+			case *ast.Ident:
+				names = append(names, fun.Name)
+			case *ast.SelectorExpr:
+				names = append(names, fun.Sel.Name)
+			}
+			return true
+		})
+		return names
+	}
+	handlerFuncs := map[string]bool{
+		"CreateRule": true, "UpdateRule": true, "DeleteRule": true,
+		"DisableRule": true, "EnableRule": true,
+	}
+	audited := 0
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Body == nil || !handlerFuncs[fn.Name.Name] {
+			continue
+		}
+		// 本函数内定义的闭包（failEnableWithStatus/failEnable/failUpdateWithStatus 等）
+		// 供「块内只调了 fail* 名字」时下钻验证：留痕必须真实存在于闭包链上。
+		closureBodies := map[string]*ast.BlockStmt{}
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			assign, ok := n.(*ast.AssignStmt)
+			if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
+				return true
+			}
+			ident, ok := assign.Lhs[0].(*ast.Ident)
+			if !ok {
+				return true
+			}
+			lit, ok := assign.Rhs[0].(*ast.FuncLit)
+			if !ok {
+				return true
+			}
+			closureBodies[ident.Name] = lit.Body
+			return true
+		})
+		var closureAudits func(name string, seen map[string]bool) bool
+		closureAudits = func(name string, seen map[string]bool) bool {
+			body, ok := closureBodies[name]
+			if !ok || seen[name] {
+				return false
+			}
+			seen[name] = true
+			for _, called := range calledNames(body) {
+				if called == "recordAudit" || closureAudits(called, seen) {
+					return true
+				}
+			}
+			return false
+		}
+		// 闭包链上是否执行补偿（failEnable → failEnableWithStatus → restoreEnabledState
+		// / failUpdateWithStatus → restoreACMEState 等）。
+		var closureCompensates func(name string, seen map[string]bool) bool
+		closureCompensates = func(name string, seen map[string]bool) bool {
+			body, ok := closureBodies[name]
+			if !ok || seen[name] {
+				return false
+			}
+			seen[name] = true
+			for _, called := range calledNames(body) {
+				if compensators[called] || closureCompensates(called, seen) {
+					return true
+				}
+			}
+			return false
+		}
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			ifStmt, ok := n.(*ast.IfStmt)
+			if !ok || ifStmt.Body == nil {
+				return true
+			}
+			hasCompensation := false
+			for _, name := range calledNames(ifStmt.Body) {
+				if compensators[name] || (strings.HasPrefix(name, "fail") && closureCompensates(name, map[string]bool{})) {
+					hasCompensation = true
+					break
+				}
+			}
+			if !hasCompensation {
+				return true
+			}
+			audited++
+			for _, name := range calledNames(ifStmt.Body) {
+				if name == "recordAudit" || closureAudits(name, map[string]bool{}) {
+					return true
+				}
+			}
+			t.Errorf("%s: 补偿分支缺少留痕（块内无 recordAudit，且 fail* 闭包链上也未落审计）@ %s",
+				fn.Name.Name, fset.Position(ifStmt.Pos()))
+			return true
+		})
+	}
+	if audited == 0 {
+		t.Fatal("未枚举到任何补偿分支——AST 锚点漂移（分支集合等价门失效）")
 	}
 }
 

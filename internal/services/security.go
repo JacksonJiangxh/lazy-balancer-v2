@@ -1118,9 +1118,9 @@ func SecurityPolicyHasIPControl(p *models.SecurityPolicy) bool {
 // policyWhitelistHasEntries 报告信任名单在发射面是否非空（与 mergedWhitelist
 // 同判定，另支持摘要的轻量路径）。
 //   - 渲染路径：MergedWhitelist 已携带「inline ∪ 引用条目」的合并集，直接判空；
-//   - 摘要路径：引用的名单只做了「是否含条目」判定（IPWhitelistRefsNonEmpty），
-//     未装载内容——此时 inline 与引用非空判定取并集，避免为一次列表请求做
-//     全量条目 JSON 解析。
+//   - 摘要路径：引用的名单只做了「是否含未到期条目」判定（
+//     IPWhitelistRefsNonEmpty，由 loadIPListRefPresenceVia 按 autobanEntryExpired
+//     同源过滤），不搬条目内容——此时 inline 与引用非空判定取并集。
 func policyWhitelistHasEntries(p *models.SecurityPolicy) bool {
 	if p.MergedWhitelist != nil {
 		return len(p.MergedWhitelist) > 0
@@ -1906,7 +1906,9 @@ func buildIPPrecheckDirectives(policies []*models.SecurityPolicy, denyStatus int
 		// - geoip_mode 非枚举值：geoipLocOperator 的 allowMode=false 默认分支
 		//   会把脏值按 deny 方向静默执行（与 UI 宣称可能相反）——按关闭处理
 		//   +60s 限流 WARN（可用性优先，启动归一将把枚举外全集收敛为 deny）。
-		//   空串为历史兼容形态（启动归一 ''→deny），保持原行为不拦。
+		//   空串为历史兼容形态：启动归一 ''→deny 与下方分支一致，即空串 +
+		//   非空名单**会拦截**（PolicyHasGeoIP 对 mode!='off' 且名单非空返回
+		//   true，链首发射 !@ipMatch deny）。
 		// - allow+空名单：PolicyHasGeoIP 为 false 时整链不发射=全放行
 		//   （fail-open，最危险方向）——fail-visible 拒绝生成。
 		switch p.GeoIPMode {
@@ -2096,7 +2098,10 @@ func resolvePolicyCustomRules(raw json.RawMessage, store caddyConfigStore) []mod
 			for i, id := range chunk {
 				args[i] = id
 			}
-			rows, err := effective.Query("SELECT id, name, COALESCE(conditions,'[]'), COALESCE(action,'block'), COALESCE(score,5), COALESCE(enabled,1) FROM security_custom_rules WHERE id IN ("+placeholders+")", args...)
+			// ORDER BY id：跨分块的追加顺序此前依赖 SQLite 未定义返回序，
+			// 而发射顺序决定 coraza 的执行顺序（skipAfter/链语义）——显式
+			// 排序让「同载荷必得同产物」成为契约，测试也才有稳定期望。
+			rows, err := effective.Query("SELECT id, name, COALESCE(conditions,'[]'), COALESCE(action,'block'), COALESCE(score,5), COALESCE(enabled,1) FROM security_custom_rules WHERE id IN ("+placeholders+") ORDER BY id ASC", args...)
 			if err != nil {
 				// 历史 G: 单块失败只丢该块并留痕，其余块照常解析；
 				// 此前整查询失败静默返回 nil，WAF 规则全部丢失且无日志。

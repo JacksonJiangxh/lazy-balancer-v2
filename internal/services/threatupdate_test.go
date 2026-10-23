@@ -761,7 +761,7 @@ func TestThreatUpdate_reloadPendingMarkerRetired(t *testing.T) {
 		t.Fatalf("run3: %v", err)
 	}
 	if reloads != 2 || refreshes != 2 {
-		t.Fatalf("run3 内容未变不再收敛（历史问题 标记已退役）: reloads=%d refreshes=%d", reloads, refreshes)
+		t.Fatalf("run3 内容未变不再收敛（pending 标记已退役）: reloads=%d refreshes=%d", reloads, refreshes)
 	}
 }
 

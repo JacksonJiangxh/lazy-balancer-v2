@@ -164,8 +164,10 @@ test('大屏显性披露回填未完成与汇总陈旧', () => {
     /v-if="stats\?\.rollup_stale"[\s\S]{0,200}?统计汇总更新延迟/,
     '汇总陈旧必须渲染独立横幅（不得与回填提示合并或静默）',
   )
-  // 原始事件覆盖不足时披露覆盖起点（不得泛化成同一条「回填未完成」）
-  assert.match(text, /rawCoverageGap[\s\S]{0,200}?raw_coverage_from/)
+  // 原始表覆盖受限是独立信号（不参与回填/缓存判定）：走自己的信息提示并披露
+  // 覆盖起点，不得泛化成同一条「回填未完成」告警。
+  assert.match(text, /v-if="stats\?\.raw_coverage_limited[\s\S]{0,300}?raw_coverage_from/)
+  assert.doesNotMatch(text, /rawCoverageGap/, '原始覆盖受限必须与回填未完成彻底解耦')
 })
 
 test('Vite 开发代理默认 HTTP，仅显式环境开关使用 HTTPS', () => {
@@ -488,4 +490,84 @@ test('计分动作模板分支已删除（后端合法动作仅 block/log/pass�
   for (const file of all) {
     assert.equal(stripComments(source(file)).includes("action === 'score'"), false, `${file} 仍有不可达分支`)
   }
+})
+
+// ---- 安全域前端可观测性批次：动作门控 / 失败态 / 明细对账 / 单源谓词 ----
+
+test('ACL 未启用的策略卡仍按模式给出名单动作（动作门先于地域文案分支）', () => {
+  const text = source('src/views/security/IPLocationAction.vue')
+  const block = section(text, 'if (!policy.ip_acl_enabled) {', '// 生效名单 = 内联 ∪ 引用列表条目')
+  const sides = block.indexOf('const sides = aclAssociateSides(policy.ip_acl_mode)')
+  const geo = block.indexOf('if (geoActive) {')
+  assert.ok(sides > 0, 'ACL 未启用分支必须按 ip_acl_mode 计算动作集合')
+  assert.ok(geo > sides, '动作门控必须先于地域分支（地域分支只负责状态文案）')
+  assert.match(block, /view\.canAssociate = sides\.deny/)
+  assert.match(block, /view\.canAssociateAllow = sides\.allow/)
+  // 未启用态动作带「加入后暂不拦截/暂不放行」tip（按模式二分）
+  assert.match(text, /该策略 IP 访问控制未启用：加入后暂不拦截，启用后生效/)
+  assert.match(text, /该策略 IP 访问控制未启用：加入白名单后暂不放行，启用后生效/)
+})
+
+test('CRS 规则文件加载失败任何形态都给可见错误态（旧数据标注为上次结果）', () => {
+  const text = source('src/views/security/SecurityRules.vue')
+  const fetch = member(text, 'const fetchRules = async () => {')
+  const catchIdx = fetch.indexOf('} catch {')
+  assert.ok(catchIdx > 0, 'fetchRules 必须保留 catch 分支')
+  const handler = fetch.slice(catchIdx)
+  assert.match(handler, /if \(requestSeq !== rulesRequestSeq\) return/, '过期请求的失败不得污染当前态')
+  assert.match(handler, /rulesLoadError\.value = true/)
+  assert.doesNotMatch(handler, /rules\.value\.length === 0/, '失败不得按「已有数据」静默跳过错误态')
+  assert.match(text, /rules\.length === 0 \? 'CRS 规则文件加载失败，「暂无规则文件」不代表真实状态' : 'CRS 规则文件加载失败：当前显示的是上次成功结果（与分页\/搜索条件不符）'/)
+})
+
+test('大屏分级回退不含限流 429（限流不进安全事件表）', () => {
+  const sev = stripComments(member(source('src/views/security/ThreatScreen.vue'), 'function sevOf('))
+  assert.doesNotMatch(sev, /'429'/, '429 不进事件表，回退分支不可达')
+  assert.match(sev, /if \(rt === '8' \|\| \/\^8\\d\{5\}\$\/\.test\(rt\)\) return down\('mid'\)/)
+})
+
+test('名单条目镜像只在缓存确有新增时重建，跨策略并集/Set 不随增删重算', () => {
+  const text = source('src/views/security/SecurityPolicies.vue')
+  // 根因：补齐步骤此前无条件重建镜像 → 新对象身份使全部依赖 ipListEntries 的
+  // computed 失效（含 N 个启用策略 × 万级条目的并集/Set），而每次下拉增删都会
+  // 触发该 watcher。镜像重建必须有条件。
+  const ensure = section(text, 'const ensureIpListEntries', '\n}\n')
+  const assigns = [...ensure.matchAll(/(if \(Object\.keys\(sharedEntriesCache\)\.length !== cachedBefore\) )?ipListEntries\.value = \{ \.\.\.sharedEntriesCache \}/g)]
+  assert.equal(assigns.length, 1, 'ensure 内镜像赋值应只有一处')
+  assert.ok(assigns[0]?.[1], '镜像重建必须以「缓存确有新增」为前提')
+  assert.match(ensure, /const cachedBefore = Object\.keys\(sharedEntriesCache\)\.length/)
+
+  // 双保险：编辑态输入不得进入 peer 视图的依赖面
+  const peer = member(text, 'const peerPolicyViews = computed')
+  assert.doesNotMatch(peer, /ipACLList\.value|ipWhitelist\.value|form\.value|ipBlacklistSelf/)
+  assert.match(peer, /new Set\(sides\.allow\)/)
+  assert.match(peer, /new Set\(sides\.deny\)/)
+})
+
+test('安全事件列表加载失败必须有页内错误条（旧数据标注为上次结果）', () => {
+  const text = source('src/views/security/SecurityEvents.vue')
+  assert.match(text, /const eventsLoadError = ref\(false\)/)
+  const fetch = member(text, 'const fetchEvents = async () => {')
+  assert.match(fetch, /eventsLoadError\.value = false/)
+  assert.match(fetch, /if \(requestSeq !== fetchEventsSeq\) return\n\s+eventsLoadError\.value = true/)
+  assert.match(text, /<el-alert v-if="eventsLoadError" type="error"/)
+  assert.match(text, /当前显示的是上次成功结果（与筛选\/分页条件不符）/)
+})
+
+test('WAF 耗时族谓词单源（请求上下文弹框与触发详情共用 isWafDurationFamily）', () => {
+  assert.match(source('src/utils/securityStages.ts'), /export const isWafDurationFamily = \(family: TriggerStageFamily\): boolean =>/)
+  const events = source('src/views/security/SecurityEvents.vue')
+  assert.match(events, /isWafDurationFamily\(triggerStageFamily\(ctxEvent\.value\?\.rule_triggered \?\? ''\)\)/)
+  const trigger = source('src/components/events/TriggerDetailDialog.vue')
+  assert.match(trigger, /isWafDurationFamily\(triggerStageFamily\(props\.row\?\.rule_triggered \?\? ''\)\)/)
+  for (const [name, text] of [['SecurityEvents', events], ['TriggerDetailDialog', trigger]] as const) {
+    assert.doesNotMatch(text, /\['wafCrs', 'wafCustom', 'body'\]|\['waf-crs', 'waf-custom', 'body'\]/, `${name} 仍各自硬编码 WAF 耗时族`)
+  }
+})
+
+test('CRS 源码片段定位单源在 securityStages（本地子串匹配实现退役）', () => {
+  assert.match(source('src/utils/securityStages.ts'), /export const extractCrsRuleSnippet = /)
+  const trigger = source('src/components/events/TriggerDetailDialog.vue')
+  assert.match(trigger, /extractCrsRuleSnippet\(res\.data\?\.content \|\| '', ev\.rule_triggered\)/)
+  assert.doesNotMatch(trigger, /const extractRuleSnippet = /)
 })

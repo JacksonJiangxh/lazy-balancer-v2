@@ -14,11 +14,32 @@ import (
 	"lazy-balancer-v2/internal/taskengine"
 )
 
-func newTestCRSManager(t *testing.T) *CRSUpdateManager {
-	stubUpdateRetrySleep(t) // 任务内重试等待即时化（30s/60s 真睡会拖垮失败路径测试）
+// redirectUpdateTestGlobals 把更新族测试的落盘路径与 DB 句柄隔离：
+//   - crsSnapshotDir / downloadIntegrityPath 重定向到临时目录——否则在
+//     /app/data 可写的环境（开发容器/镜像内跑测试）会污染真实数据卷：
+//     同 tag 的测试 tarball 字节各不相同会触发 TOFU mismatch 假红，测试假树
+//     还会覆盖真实 CRS 快照；
+//   - db 三句柄保存/还原（-shuffle 单跑或跨用例也不拿到已关闭/外来库）。
+func redirectUpdateTestGlobals(t *testing.T) {
+	t.Helper()
+	oldSnapshot, oldIntegrity := crsSnapshotDir, downloadIntegrityPath
+	testRoot := t.TempDir()
+	crsSnapshotDir = filepath.Join(testRoot, "crs-snapshot")
+	downloadIntegrityPath = filepath.Join(testRoot, ".download-integrity.json")
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
 	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		_ = db.Close()
+		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		crsSnapshotDir, downloadIntegrityPath = oldSnapshot, oldIntegrity
+	})
+}
+
+func newTestCRSManager(t *testing.T) *CRSUpdateManager {
+	stubUpdateRetrySleep(t) // 任务内重试等待即时化（30s/60s 真睡会拖垮失败路径测试）
+	redirectUpdateTestGlobals(t)
 
 	root := t.TempDir()
 	m := newCRSUpdateManager(func() error { return nil })
@@ -405,8 +426,9 @@ func TestSetCRSAutoUpdate_preservesVersion(t *testing.T) {
 		t.Fatal("auto_update should be false")
 	}
 
-	// And toggling on an empty table seeds the bundled version
-	if err := db.Initialize(t.TempDir()); err != nil {
+	// And toggling on an empty table seeds the bundled version（清表等价于空库，
+	// 不替换包级 db 句柄——嵌套 Initialize 会让清理顺序关闭错误句柄）
+	if _, err := db.DB.Exec("DELETE FROM security_crs_version"); err != nil {
 		t.Fatal(err)
 	}
 	if err := SetCRSAutoUpdate(true); err != nil {
@@ -476,6 +498,51 @@ func TestCRSRun_manualSuccessKeepsNextUpdate(t *testing.T) {
 	_, _, _, _, _, nextUpdate, _ = crsVersionRow(t)
 	if nextUpdate != "" {
 		t.Fatalf("auto_update=0 时成功不应写 next_update（got %q）", nextUpdate)
+	}
+}
+
+// 安装成功分支（tag != currentVersion，走完整下载→校验→换树→写版本行）的
+// 排程槽语义与「已是最新」短路不同：后者只走 recordLatestSkip，从不经过
+// versionTableSlotAdvanceSQL。本用例覆盖手动触发不补写空槽、auto 触发推进
+// 空槽两条真实安装路径。
+func TestCRSRun_installSuccessSlotSemantics(t *testing.T) {
+	m := newTestCRSManager(t)
+	seedCRSVersionRow(t, "v4.14.0", true)
+	files := map[string]string{
+		"coreruleset-4.15.0/crs-setup.conf.example":     "# setup",
+		"coreruleset-4.15.0/rules/" + crsRulesProbeFile: "# init probe\n",
+		"coreruleset-4.15.0/rules/REQUEST-901.conf":     "SecRule init\n",
+	}
+	m.downloadTarball = fakeCRSDownload(t, files)
+	m.fetchLatestTag = func(context.Context) (string, error) { return "v4.15.0", nil }
+
+	// 手动触发：安装成功但空槽不得补写（预约由排程保存/启动武装建立）。
+	done, err := m.StartUpdate("manual", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	version, status, _, _, _, nextUpdate, _ := crsVersionRow(t)
+	if status != "success" || version != "v4.15.0" {
+		t.Fatalf("version=%q status=%q, want v4.15.0/success（必须走完整安装分支）", version, status)
+	}
+	if nextUpdate != "" {
+		t.Fatalf("手动安装成功不得写 next_update（got %q）", nextUpdate)
+	}
+
+	// auto 触发：把当前版本拨回旧值后同一发布包再次安装成功 → 空槽被推进。
+	seedCRSVersionRow(t, "v4.14.0", true)
+	done, err = m.StartUpdate("auto", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	version, status, _, _, _, nextUpdate, _ = crsVersionRow(t)
+	if status != "success" || version != "v4.15.0" {
+		t.Fatalf("auto 安装 version=%q status=%q, want v4.15.0/success", version, status)
+	}
+	if nextUpdate == "" {
+		t.Fatal("auto 触发安装成功必须推进空排程槽（下次预约不可为空）")
 	}
 }
 
@@ -584,9 +651,7 @@ func TestStartUpdate_registersCancelBeforeReturn(t *testing.T) {
 
 // /：版本读取区分「行缺失→bundled」与「读失败→错误」。
 func TestReadCurrentCRSVersion_rowMissingFallsBackToBundled(t *testing.T) {
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
+	initServicesDB(t)
 	if _, err := db.DB.Exec("DELETE FROM security_crs_version"); err != nil {
 		t.Fatal(err)
 	}
@@ -600,9 +665,7 @@ func TestReadCurrentCRSVersion_rowMissingFallsBackToBundled(t *testing.T) {
 }
 
 func TestReadCurrentCRSVersion_readErrorSurfaces(t *testing.T) {
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
+	initServicesDB(t)
 	if _, err := db.DB.Exec("DROP TABLE security_crs_version"); err != nil {
 		t.Fatal(err)
 	}

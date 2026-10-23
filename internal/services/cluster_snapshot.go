@@ -554,6 +554,34 @@ func parseSnapshotExpiry(value string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("无法解析证书过期时间 %q", value)
 }
 
+// normalizeSnapshotCaddyNumericSettings 归一快照携带的 Caddy 全局数值设置
+// （request_body_max_size_mb / 三类 HTTP 超时 / caddy_log_size_mb）。
+// 主端装载侧（loadSnapshotGlobalSettings）与从端 apply 侧
+// （updateSnapshotSettings）必须共用本函数：仅在场但非法的值被归一，nil 保持
+// nil（旧主端缺席语义）；单边归一会让 users 节哈希主从恒不等，每次版本递增
+// 多一轮「配置无变化但本地数据不一致」的全量重拉与重载。
+func normalizeSnapshotCaddyNumericSettings(settings *models.ClusterBasicSettings) {
+	if settings.RequestBodyMaxSizeMB != nil {
+		normalized := *settings.RequestBodyMaxSizeMB
+		if normalized <= 0 {
+			normalized = db.DefaultRequestBodyMaxSizeMB
+		} else if normalized > 4096 {
+			normalized = 4096
+		}
+		settings.RequestBodyMaxSizeMB = &normalized
+	}
+	normalizePositive := func(field **int, fallback int) {
+		if *field == nil || **field > 0 {
+			return
+		}
+		*field = new(fallback)
+	}
+	normalizePositive(&settings.HTTPReadTimeout, db.DefaultHTTPReadTimeout)
+	normalizePositive(&settings.HTTPWriteTimeout, db.DefaultHTTPWriteTimeout)
+	normalizePositive(&settings.HTTPIdleTimeout, db.DefaultHTTPIdleTimeout)
+	normalizePositive(&settings.CaddyLogSizeMB, db.DefaultCaddyLogSizeMB)
+}
+
 // loadSnapshotGlobalSettings 装载快照的全局配置区(BasicSettings+
 // CaddyConfig,含 branding 镜像与 Caddy 全局列)——buildSnapshot(全量快照)
 // 与 driftGuardSectionHashes(漂移守卫三节重建)共用同一装载函数:三分类
@@ -620,6 +648,9 @@ func (s *ClusterService) loadSnapshotGlobalSettings(ctx context.Context, store s
 		&snapshot.BasicSettings.TrustedProxyEnabled, &snapshot.BasicSettings.TrustedProxyRanges, &snapshot.BasicSettings.TrustedProxyRangeRefs, &snapshot.BasicSettings.TrustedProxyHeaders, &snapshot.BasicSettings.TrustedProxyStrict); err != nil {
 		return fmt.Errorf("读取 Caddy 全局设置: %w", err)
 	}
+	// 主端装载侧与从端 apply 侧共用同一归一：任一侧单边归一都会让 users 节
+	// 哈希主从恒不等（每次版本递增多一轮漂移补偿全量重拉 + 一条自愈审计）。
+	normalizeSnapshotCaddyNumericSettings(&snapshot.BasicSettings)
 	// 自动备份六设置列随 users 节同步。指针形态装载,
 	// COALESCE 兜底使主端快照恒携带(非 nil);last_run 为节点本地运行态,
 	// 刻意不在此装载(调度器每轮推进,参与哈希会让 users 节每轮抖动)。

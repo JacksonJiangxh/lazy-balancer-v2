@@ -21,9 +21,13 @@ func validateV2BackupTLSShape(tables map[string][]map[string]any) error {
 	return err
 }
 
-// buildLbbakPayload 组包便捷入口：威胁名单在缺省快照时即时读取（仅测试/独立
-// 调用形态）。生产导出必须经 buildLbbakPayloadWithThreatIplists 传入
-// WafFileLock 内的内存快照（长持锁以外的稳定代）。
+// buildLbbakPayload 组包便捷入口（历史用例兼容壳）：威胁名单原文按生产同款
+// 快照函数从磁盘构造后传给正式入口——正式入口不再提供「锁外直读」回退，
+// 缺件一律显式失败（与生产导出同一语义）。
 func buildLbbakPayload(backupJSON []byte, bundle *services.WafFileBundle) ([]byte, error) {
-	return buildLbbakPayloadWithThreatIplists(backupJSON, bundle, nil)
+	threatSnapshot, err := snapshotLbbakThreatIplists(bundle)
+	if err != nil {
+		return nil, err
+	}
+	return buildLbbakPayloadWithThreatIplists(backupJSON, bundle, threatSnapshot)
 }

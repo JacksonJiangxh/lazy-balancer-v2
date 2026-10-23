@@ -697,6 +697,11 @@ func (h *Handlers) GetIPList(c *gin.Context) {
 }
 
 func (h *Handlers) CreateIPList(c *gin.Context) {
+	// 导入窗口 fast-fail：security_ip_lists 在导入全量替换清单内，排队到导入
+	// 提交后再写会改写刚恢复的名单（放行/拦截集合被静默改回）。
+	if rejectWriteDuringImport(c, "执行 IP 名单写操作") {
+		return
+	}
 	var req models.CreateIPListRequest
 	if !guardConfiguredJSONBody(c) {
 		return
@@ -763,6 +768,9 @@ func (h *Handlers) CreateIPList(c *gin.Context) {
 }
 
 func (h *Handlers) UpdateIPList(c *gin.Context) {
+	if rejectWriteDuringImport(c, "执行 IP 名单写操作") {
+		return
+	}
 	id := c.Param("id")
 	listID, idOK := parsePositiveNumericID(id)
 	if !idOK {
@@ -917,7 +925,7 @@ func (h *Handlers) UpdateIPList(c *gin.Context) {
 			services.AutobanForgetIPs(removed)
 		}
 	}
-	if h.tryIPListHotPathApply(c, tx, id, oldEntriesJSON != entriesJSON, txApplyFinish{
+	if h.tryIPListHotPathApply(c, tx, listID, oldEntriesJSON != entriesJSON, txApplyFinish{
 		Resource: "IP 地址列表", AuditAction: "更新",
 		AuditDetail: fmt.Sprintf("名称：%s（#%s，%d 条）", name, id, len(entries)),
 		SuccessMsg:  "IP 地址列表已更新",
@@ -932,6 +940,11 @@ func (h *Handlers) UpdateIPList(c *gin.Context) {
 }
 
 func (h *Handlers) DeleteIPList(c *gin.Context) {
+	// 门必须先于取锁：导入全程持 caddyOpMu，排队到提交后按陈旧 id 删除会
+	// 删掉刚由导入恢复的名单。
+	if rejectWriteDuringImport(c, "执行 IP 名单写操作") {
+		return
+	}
 	h.caddyOpMu.Lock()
 	defer h.caddyOpMu.Unlock()
 
@@ -1068,8 +1081,12 @@ func (h *Handlers) DeleteIPList(c *gin.Context) {
 }
 
 func (h *Handlers) AddIPToList(c *gin.Context) {
+	if rejectWriteDuringImport(c, "执行 IP 名单写操作") {
+		return
+	}
 	id := c.Param("id")
-	if _, ok := parsePositiveNumericID(id); !ok {
+	listID, idOK := parsePositiveNumericID(id)
+	if !idOK {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的列表 ID"})
 		return
 	}
@@ -1169,7 +1186,7 @@ func (h *Handlers) AddIPToList(c *gin.Context) {
 	if !added {
 		actionLabel = "覆盖已到期条目"
 	}
-	if h.tryIPListHotPathApply(c, tx, id, true, txApplyFinish{
+	if h.tryIPListHotPathApply(c, tx, listID, true, txApplyFinish{
 		Resource: "IP 地址列表", AuditAction: "写入",
 		AuditDetail: fmt.Sprintf("名称：%s（#%s）追加 IP %s（%s，现共 %d 条）", listName, id, req.Value, actionLabel, len(entries)),
 		SuccessMsg:  "已追加",
@@ -1191,8 +1208,12 @@ func (h *Handlers) AddIPToList(c *gin.Context) {
 // 无害）；成功移除 200 {removed:true}。移除/追加经 finishTxApply 同链触发
 // 引用策略重载。
 func (h *Handlers) RemoveIPFromList(c *gin.Context) {
+	if rejectWriteDuringImport(c, "执行 IP 名单写操作") {
+		return
+	}
 	id := c.Param("id")
-	if _, ok := parsePositiveNumericID(id); !ok {
+	listID, idOK := parsePositiveNumericID(id)
+	if !idOK {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的列表 ID"})
 		return
 	}
@@ -1267,11 +1288,6 @@ func (h *Handlers) RemoveIPFromList(c *gin.Context) {
 	// 判据必须用**过滤到期后**的有效集合——导入/带外
 	// 名单可含 expires_at，移除最后一个未到期条目后仅剩过期条目，原始 len>0
 	// 会绕过守卫；渲染侧（AutobanActiveEntries）的生效集合已为空。
-	listID, idErr := strconv.ParseInt(id, 10, 64)
-	if idErr != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的列表 id"})
-		return
-	}
 	keptValues := make([]string, 0, len(kept))
 	for _, entry := range services.AutobanActiveEntries(kept) {
 		if entry.Value != "" {
@@ -1306,7 +1322,7 @@ func (h *Handlers) RemoveIPFromList(c *gin.Context) {
 	if listName == services.AutobanPresetListName {
 		services.AutobanForgetIPs([]string{req.Value})
 	}
-	if h.tryIPListHotPathApply(c, tx, id, true, txApplyFinish{
+	if h.tryIPListHotPathApply(c, tx, listID, true, txApplyFinish{
 		Resource: "IP 地址列表", AuditAction: "写入",
 		AuditDetail: fmt.Sprintf("名称：%s（#%s）移除 IP %s（现共 %d 条）", listName, id, req.Value, len(kept)),
 		SuccessMsg:  "已移除",
@@ -1350,12 +1366,11 @@ func commitIPListTx(tx *sql.Tx) error {
 //
 // 已持 caddyOpMu（=CaddyOpLock，调用方写路径临界区），渲染与 /load 永不交错。
 // 返回 true = 请求已终结（调用方立即 return）。
-func (h *Handlers) tryIPListHotPathApply(c *gin.Context, tx *sql.Tx, id string, entriesChanged bool, f txApplyFinish) bool {
+func (h *Handlers) tryIPListHotPathApply(c *gin.Context, tx *sql.Tx, listID int64, entriesChanged bool, f txApplyFinish) bool {
 	if !entriesChanged {
 		return false // 元数据-only 变更零发射面影响，维持既有全量链（同字节短路）
 	}
-	listID, perr := strconv.ParseInt(id, 10, 64)
-	if perr != nil || listID <= 0 {
+	if listID <= 0 {
 		return false
 	}
 	if !services.IPListsReferencedByEnabledPolicy([]int{int(listID)}) {
@@ -1404,7 +1419,7 @@ func (h *Handlers) tryIPListHotPathApply(c *gin.Context, tx *sql.Tx, id string, 
 			h.recordCaddyApplySavedNotLive(applyErr)
 			recordAudit(c, f.AuditAction, f.Resource, f.AuditDetail)
 			recordAudit(c, "重载失败", "Caddy服务", applyErr.Error())
-			services.Logf("warn", "IP 名单热路径：%s（#%s）投影已重写，证书物化触发的强制重载失败: %v", f.Resource, id, applyErr)
+			services.Logf("warn", "IP 名单热路径：%s（#%d）投影已重写，证书物化触发的强制重载失败: %v", f.Resource, listID, applyErr)
 			status := f.SuccessStatus
 			if status == 0 {
 				status = http.StatusOK
@@ -1423,7 +1438,7 @@ func (h *Handlers) tryIPListHotPathApply(c *gin.Context, tx *sql.Tx, id string, 
 		h.recordCaddyApplyResult(nil)
 		recordAudit(c, f.AuditAction, f.Resource, f.AuditDetail)
 		recordAudit(c, "重载", "Caddy服务", services.FormatAuditDetail("IP 名单热路径证书物化，强制重载收敛", services.AuditResultPart("success")))
-		services.Logf("info", "IP 名单热路径：%s（#%s）投影文件已重写；本轮渲染物化了证书文件，已强制重载收敛", f.Resource, id)
+		services.Logf("info", "IP 名单热路径：%s（#%d）投影文件已重写；本轮渲染物化了证书文件，已强制重载收敛", f.Resource, listID)
 		status := f.SuccessStatus
 		if status == 0 {
 			status = http.StatusOK
@@ -1447,7 +1462,7 @@ func (h *Handlers) tryIPListHotPathApply(c *gin.Context, tx *sql.Tx, id string, 
 	}
 	h.recordCaddyApplyResult(nil) // 比对证实运行配置=已提交 DB 视图，清除既往失败标记
 	recordAudit(c, f.AuditAction, f.Resource, f.AuditDetail)
-	services.Logf("info", "IP 名单热路径：%s（#%s）投影文件已重写，零 Caddy 重载（匹配器 ≤1s 热感知生效）", f.Resource, id)
+	services.Logf("info", "IP 名单热路径：%s（#%d）投影文件已重写，零 Caddy 重载（匹配器 ≤1s 热感知生效）", f.Resource, listID)
 	status := f.SuccessStatus
 	if status == 0 {
 		status = http.StatusOK

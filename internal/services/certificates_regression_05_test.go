@@ -1,7 +1,6 @@
 package services
 
 import (
-	"log"
 	"strings"
 	"testing"
 )
@@ -19,10 +18,7 @@ func TestCheckManualCertExpiration_ExpiryReadFailureLogsAtErrorLevel(t *testing.
 			t.Errorf("restore global_config: %v", err)
 		}
 	})
-	var buf strings.Builder
-	oldWriter := log.Writer()
-	log.SetOutput(&buf)
-	t.Cleanup(func() { log.SetOutput(oldWriter) })
+	buf := captureApplicationLogs(t)
 
 	// When
 	resetCertificateServiceForTest(t)
@@ -64,10 +60,7 @@ func TestGetCertRenewalDays_contract(t *testing.T) {
 			t.Errorf("restore global_config: %v", err)
 		}
 	})
-	var buf strings.Builder
-	oldWriter := log.Writer()
-	log.SetOutput(&buf)
-	t.Cleanup(func() { log.SetOutput(oldWriter) })
+	buf := captureApplicationLogs(t)
 	if got := GetCertRenewalDays(); got != 30 {
 		t.Fatalf("GetCertRenewalDays()=%d, want 30 on read failure", got)
 	}

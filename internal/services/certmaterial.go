@@ -18,16 +18,26 @@ import "strings"
 // CertJobMaterialPredicateSQL 返回「持有可服务证书材料」的 SQL 谓词。alias 为
 // 列前缀（如 "j"），空串=裸列名。所有涉及材料可用性的 SQL 必须复用本函数，
 // 不得另写条件组合。
+//
+// 判空必须是 trim 后的判空：只比较 ” 会把 ' ' 这类空白材料当作「有材料」，
+// 而 Go 侧 CertJobMaterialUsable（TrimSpace）判为无材料——同一行在 SQL 扫描
+// 链路（渲染/物化/补扫）与 Go 判定链路（补偿/失败降级）结论相反，补扫会把
+// 空白材料写盘。trim 字符集与 Go 侧 ASCII 空白对齐（空格/制表/换行/回车/
+// 垂直制表/换页）；非 ASCII 空白的带外写入仍属两侧差异，PEM 实际不会出现。
 func CertJobMaterialPredicateSQL(alias string) string {
 	prefix := ""
 	if alias != "" {
 		prefix = alias + "."
 	}
-	return "COALESCE(" + prefix + "cert_pem,'') <> '' AND COALESCE(" + prefix + "key_pem,'') <> '' AND COALESCE(" + prefix + "status,'') <> 'disabled'"
+	const sqlWhitespace = "' '||char(9)||char(10)||char(11)||char(12)||char(13)"
+	nonBlank := func(column string) string {
+		return "TRIM(" + prefix + column + ", " + sqlWhitespace + ") <> ''"
+	}
+	return nonBlank("cert_pem") + " AND " + nonBlank("key_pem") + " AND COALESCE(" + prefix + "status,'') <> 'disabled'"
 }
 
 // CertJobMaterialUsable 是 CertJobMaterialPredicateSQL 的 Go 侧等价判定，供
-// 内存中的行（已是查询结果）复用同一语义。
+// 内存中的行（已是查询结果）复用同一语义（含 trim 口径，见上）。
 func CertJobMaterialUsable(status, certPEM, keyPEM string) bool {
 	return strings.TrimSpace(certPEM) != "" && strings.TrimSpace(keyPEM) != "" && status != "disabled"
 }

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -19,7 +20,8 @@ func TestValidateV2Backup_v211Shape_reportsCompatibilityNotTamper(t *testing.T) 
 		t.Fatalf("unmarshal backup: %v", err)
 	}
 
-	usedLegacy, err := validateV2Backup(b)
+	result, err := validateImportBackupChain(context.Background(), importValidationDeps{}, &b, importValidationOptions{})
+	usedLegacy := result.UsedLegacyChecksum
 
 	if err == nil {
 		t.Fatal("v2.1.1 备份 Config 区不受旧校验和保护，不得放行导入")
@@ -44,11 +46,12 @@ func TestValidateV2Backup_tamperedNewFormat_stillRejectedAsTampered(t *testing.T
 	b.Config["dns_credentials"] = "attacker-controlled"
 
 	// When
-	usedLegacy, err := validateV2Backup(b)
+	result, err := validateImportBackupChain(context.Background(), importValidationDeps{}, &b, importValidationOptions{})
+	usedLegacy := result.UsedLegacyChecksum
 
 	// Then 两种校验和均不匹配 → 维持篡改指控
 	if err == nil || !strings.Contains(err.Error(), "备份校验和不匹配，文件可能已被篡改或损坏") {
-		t.Fatalf("validateV2Backup err=%v, want 篡改拒绝", err)
+		t.Fatalf("校验链 err=%v, want 篡改拒绝", err)
 	}
 	if usedLegacy {
 		t.Fatal("篡改的新格式文件不得标记为旧格式校验和路径")

@@ -48,6 +48,22 @@ test('B 空条目确认：仅已有名单触发（新建空名单是合法操作
   assert.equal(needsEmptyListConfirm(null, 0), false)
 })
 
+// 消费侧接线：守卫被删后纯函数用例仍全绿——详情加载中/失败时保存可点，
+// entries 为空 → 全量 PUT 清空既有名单。
+test('A/B 守卫接到规则页：保存禁用绑定与空条目二次确认', () => {
+  const rules = source('src/views/security/SecurityRules.vue')
+  assert.match(
+    rules,
+    /:disabled="!canSaveIpList\(\s*loadingIpListDetail,\s*ipListDetailFailed\s*\)"/,
+    '保存按钮必须绑定 canSaveIpList（否则加载中/失败可保存并清空名单）',
+  )
+  assert.match(
+    rules,
+    /if \(needsEmptyListConfirm\(\s*editingIpListId\.value,\s*entries\.length\s*\)\)/,
+    '既有名单清空必须走二次确认',
+  )
+})
+
 test('C1 CSV 往返：备注含逗号/引号逐字相等', () => {
   const value = '10.0.0.1'
   const remark = '备注,含逗号"和引号"'

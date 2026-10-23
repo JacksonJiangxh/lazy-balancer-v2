@@ -985,9 +985,9 @@ func (h *Handlers) OIDCCallback(c *gin.Context) {
 
 // issueOIDCJWT 与密码登录的令牌同构(auth.go respondLoginWithMFA 口径),
 // 附加 auth_method=oidc 与 pwd_ver（jwtAuth 对缺 pwd_ver 且 DB 版本
-// ≠0 的令牌恒拒——无该声明的 OIDC 会话在导入 bump 后永久 401)。
-// 唯一语义差异:node_mode 的判定错误路径——本函数单测分支查询失败按零值判
-// slave,respondLoginWithMFA 查询失败保持 master。
+// ≠0 的令牌恒拒——无该声明的 OIDC 会话在导入 bump 后永久 401）。
+// node_mode 不在令牌内（仅登录响应体的展示字段，由各自处理器填充），
+// 本函数与 respondLoginWithMFA 的声明集合逐键一致。
 func (h *Handlers) issueOIDCJWT(userID int, username, role string, passwordVersion int64) (string, time.Time, error) {
 	expireMinutes := loginExpireMinutes() // SYS-3：与密码登录共用单源钳制（auth.go）
 	now := time.Now()
@@ -995,7 +995,10 @@ func (h *Handlers) issueOIDCJWT(userID int, username, role string, passwordVersi
 	if _, err := rand.Read(jtiBytes); err != nil {
 		return "", time.Time{}, err
 	}
-	tokenClaims := map[string]interface{}{
+	// 原 mfaTs 参数与 mfa_ts claim 分支已删——v2.3.0 裁定
+	// OIDC 会话与本地 MFA 解耦（mfaStepUpGuard 对 auth_method=oidc 短路），唯一
+	// 调用点此前恒传 0，分支永不执行。
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"user_id":     userID,
 		"username":    username,
 		"role":        role,
@@ -1004,14 +1007,7 @@ func (h *Handlers) issueOIDCJWT(userID int, username, role string, passwordVersi
 		"jti":         hex.EncodeToString(jtiBytes),
 		"iat":         now.Unix(),
 		"exp":         now.Add(time.Duration(expireMinutes) * time.Minute).Unix(),
-	}
-	// 原 mfaTs 参数与 mfa_ts claim 分支已删——v2.3.0 裁定
-	// OIDC 会话与本地 MFA 解耦（mfaStepUpGuard 对 auth_method=oidc 短路），唯一
-	// 调用点此前恒传 0，分支永不执行。
-	b, _ := json.Marshal(tokenClaims)
-	var cm jwt.MapClaims
-	_ = json.Unmarshal(b, &cm)
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, cm)
+	})
 	tokenString, err := token.SignedString([]byte(h.cfg.JWTSecret))
 	if err != nil {
 		return "", time.Time{}, err
@@ -1107,11 +1103,11 @@ func (h *Handlers) OIDCSettingsUpdate(c *gin.Context) {
 	}
 	if req.Issuer != nil {
 		issuer := normalizeOIDCIssuer(*req.Issuer)
-		// url.Parse + scheme 白名单——HasPrefix("http") 放行
-		// 「httpxy://…」类伪 scheme。空 issuer 保留清除语义。
-		if *req.Issuer != "" {
-			// url.Parse + scheme 白名单单源——
-			// HasPrefix("http") 放行「httpxy://…」类伪 scheme；空 issuer 保留清除语义。
+		// url.Parse + scheme 白名单单源——HasPrefix("http") 放行
+		// 「httpxy://…」类伪 scheme。判空用归一后的值：纯空白与空串同义
+		//（清除语义），否则输入框残留空格会得到「地址须为 https URL」的
+		// 误导报错。
+		if issuer != "" {
 			if err := validateOIDCIssuerURL(issuer); err != nil {
 				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 				return

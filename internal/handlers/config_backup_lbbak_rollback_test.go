@@ -1,0 +1,199 @@
+package handlers
+
+import (
+	"errors"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/services"
+)
+
+// lbbak 导入在事务提交前落盘 CRS 整树/xdb/威胁名单；提交（或提交内的 Caddy
+// 校验）失败时数据库回滚，文件必须同批回到导入前状态——判据是真文件逐字节
+// 比对，不是响应文案。
+func TestLbbakImport_commitFailureRestoresWafFilesToPreImportBytes(t *testing.T) {
+	// Given 一份可落盘的 CRS/xdb/威胁名单备份，与一份内容不同的导入前现场。
+	h := newBackupTestHandlers(t)
+	seedAdminShared(t)
+	g := newBackupSectionRouter(h)
+	t.Cleanup(services.ResetIP2RegionSearcherForTest)
+	crsDir, xdbPath := overrideTestWafPaths(t)
+	wafDir := t.TempDir()
+	t.Cleanup(services.OverrideThreatWafDirForTest(wafDir))
+
+	backupVERSION := []byte("v4.29.0\n")
+	if err := os.WriteFile(filepath.Join(crsDir, "VERSION"), backupVERSION, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(crsDir, "rules", "crs-setup.conf"), []byte("# backup-crs\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(xdbPath, validXdbBytes(t), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wafDir, "threat-ustc.iplist"), []byte("203.0.113.7\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wafDir, "threat-ustc.iplist.fast"), []byte("BACKUP-FAST\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bundle := services.BuildWafFileBundle()
+	if bundle == nil || len(bundle.CRSTarGz) == 0 || len(bundle.Xdb) == 0 || len(bundle.ThreatFiles) == 0 {
+		t.Fatalf("夹具必须携带 CRS/xdb/威胁名单三面: %+v", bundle)
+	}
+	backup := buildBackup(t, backupFixtureOptions{FillAll: true, Sections: []string{"security"}, Tables: map[string][]map[string]any{
+		"security_crs_version":       {{"id": 1, "version": "v4.29.0", "auto_update": 1}},
+		"security_ip2region_version": {{"id": 1, "version": "xdb-backup", "auto_update": 1}},
+		"security_threat_sources":    {{"name": "ustc", "display_name": "USTC", "url": "https://blackip.ustc.edu.cn/list.php?txt", "format": "plain", "update_enabled": 1, "apply_enabled": 1}},
+	}, EmptyConfigIfNil: true})
+	payload, err := buildLbbakPayload([]byte(backup), bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 导入前现场：CRS 内容不同且多一个只属于本地的文件；xdb 不存在；
+	// 威胁名单文本与编译产物都与备份不同。
+	preImportCRS := []byte("# pre-import-crs\n")
+	preImportThreat := []byte("198.51.100.250/32\n")
+	preImportFast := []byte("PRE-IMPORT-FAST\n")
+	localOnlyContent := []byte("keep-me\n")
+	localOnlyPath := filepath.Join(crsDir, "rules", "local-only.conf")
+	if err := os.WriteFile(filepath.Join(crsDir, "rules", "crs-setup.conf"), preImportCRS, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(localOnlyPath, localOnlyContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(xdbPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wafDir, "threat-ustc.iplist"), preImportThreat, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wafDir, "threat-ustc.iplist.fast"), preImportFast, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Caddy 预检拒绝：WAF 文件已落盘、事务尚未提交。
+	h.caddyService.SetCLIValidatorForTest(func([]byte) error { return errors.New("cli: reject import") })
+	versionRowCountsBefore := map[string]int{}
+	for _, table := range []string{"security_crs_version", "security_ip2region_version"} {
+		var count int
+		if err := db.DB.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		versionRowCountsBefore[table] = count
+	}
+
+	// When
+	response := postLbbakImport(g, t, payload, "")
+
+	// Then 响应显式说明文件已回退（不得谎报分裂，也不得静默）。
+	if response.Code == http.StatusOK {
+		t.Fatalf("import must fail, got 200 %s", response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "已回退到导入前状态") {
+		t.Fatalf("failure response must state the file rollback: %s", response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "可能分裂") {
+		t.Fatalf("rollback succeeded, response must not claim split: %s", response.Body.String())
+	}
+	// CRS 整树逐字节回到导入前（含仅存在于导入前的本地文件与不同内容）。
+	assertFileBytes(t, filepath.Join(crsDir, "rules", "crs-setup.conf"), preImportCRS)
+	assertFileBytes(t, localOnlyPath, localOnlyContent)
+	assertFileBytes(t, filepath.Join(crsDir, "VERSION"), backupVERSION)
+	// 导入前不存在的 xdb 与其版本标记必须被删除回「不存在」。
+	if _, err := os.Stat(xdbPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("xdb must be absent again after rollback, err=%v", err)
+	}
+	if _, err := os.Stat(xdbPath + ".version"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("xdb .version must be absent again after rollback, err=%v", err)
+	}
+	// 威胁名单文本与编译产物逐字节回到导入前。
+	assertFileBytes(t, filepath.Join(wafDir, "threat-ustc.iplist"), preImportThreat)
+	assertFileBytes(t, filepath.Join(wafDir, "threat-ustc.iplist.fast"), preImportFast)
+	// 数据库同样已回滚：版本表行数与导入前一致（不残留导入行，也不丢本地行）。
+	for _, table := range []string{"security_crs_version", "security_ip2region_version"} {
+		var count int
+		if err := db.DB.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != versionRowCountsBefore[table] {
+			t.Fatalf("%s rows=%d after rollback, want pre-import %d", table, count, versionRowCountsBefore[table])
+		}
+	}
+}
+
+// 导入成功后快照必须被丢弃：临时快照目录不得残留（含字节副本）。
+func TestLbbakImport_successDiscardsWafSnapshot(t *testing.T) {
+	// Given 一个可成功导入的 xdb 备份与可观测的快照目录。
+	h := newBackupTestHandlers(t)
+	g := newBackupSectionRouter(h)
+	t.Cleanup(services.ResetIP2RegionSearcherForTest)
+	_, xdbPath := overrideTestWafPaths(t)
+	snapshotRoot := t.TempDir()
+	previous := newLbbakWafFileSnapshotDir
+	newLbbakWafFileSnapshotDir = func() (string, error) { return os.MkdirTemp(snapshotRoot, "snapshot-") }
+	t.Cleanup(func() { newLbbakWafFileSnapshotDir = previous })
+
+	payload := buildTestLbbak(t, completeBackupJSON(t, map[string][]map[string]any{
+		"security_ip2region_version": {{"id": 1, "version": "good-xdb", "auto_update": 1}},
+	}), validXdbBytes(t))
+
+	// When
+	response := postLbbakImport(g, t, payload, "")
+
+	// Then 导入成功、xdb 落盘，且快照目录已被清理。
+	if response.Code != http.StatusOK {
+		t.Fatalf("import status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	if _, err := os.Stat(xdbPath); err != nil {
+		t.Fatalf("xdb must land on success: %v", err)
+	}
+	entries, err := os.ReadDir(snapshotRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		names := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			names = append(names, entry.Name())
+		}
+		t.Fatalf("snapshot dirs left after successful import: %v", names)
+	}
+}
+
+// 失败提示必须区分「已回退」与「回退失败/未回退」——分叉可见性不得回退到
+// 固定文案。
+func TestLbbakWafRollbackWarning_distinguishesRestoredFromSplit(t *testing.T) {
+	if got := lbbakWafRollbackWarning(false, false, nil); got != "" {
+		t.Fatalf("no landed file must produce no warning, got %q", got)
+	}
+	restored := lbbakWafRollbackWarning(true, true, nil)
+	if !strings.Contains(restored, "已回退到导入前状态") || strings.Contains(restored, "可能分裂") {
+		t.Fatalf("restored warning=%q, want rollback confirmed without split claim", restored)
+	}
+	split := lbbakWafRollbackWarning(true, true, errors.New("boom"))
+	if !strings.Contains(split, "回退失败") || !strings.Contains(split, "可能分裂") {
+		t.Fatalf("failed rollback warning=%q, must expose the split", split)
+	}
+	legacy := lbbakWafRollbackWarning(true, false, nil)
+	if !strings.Contains(legacy, "可能分裂") {
+		t.Fatalf("unattempted rollback warning=%q, must expose the split", legacy)
+	}
+}
+
+// assertFileBytes 逐字节断言文件内容（真文件比对）。
+func assertFileBytes(t *testing.T, path string, want []byte) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("%s bytes=%q, want %q", path, got, want)
+	}
+}

@@ -58,7 +58,7 @@ test('B2 省层数据非空且首项含多边形（归一后仍是真实数据�
   }
 })
 
-test('C 别名表：10 个历史英文/旧名分组 + 巴勒斯坦双源；台湾/南极洲死数据已清', () => {
+test('C 别名表：历史英文/旧名分组 + 巴勒斯坦双源；台湾/南极洲死数据已清', () => {
   const hasRows = (key: string): boolean => Array.isArray(ADMIN1_PROVINCES[key]) && ADMIN1_PROVINCES[key].length > 0
   const expected: Record<string, string> = {
     Turkey: '土耳其',
@@ -72,8 +72,13 @@ test('C 别名表：10 个历史英文/旧名分组 + 巴勒斯坦双源；台�
     Brunei: '文莱',
     Swaziland: '斯威士兰',
   }
-  // 标题口径与实际校验面一致（标题曾写 11 个而表只有 10 个）
-  assert.equal(Object.keys(expected).length, 10)
+  // 别名表 ←→ 清单双向核对：产品表新增/减少历史别名时必须同步本清单
+  // （原先只断言本地 expected 的长度=10，产品数据变化无人守护）。
+  assert.deepEqual(
+    Object.fromEntries(Object.entries(COUNTRY_ALIAS).filter(([, target]) => target !== '巴勒斯坦')),
+    expected,
+    '历史英文/旧名别名必须与用例清单逐项相等（巴勒斯坦双源单列于下）',
+  )
   for (const [alias, target] of Object.entries(expected)) {
     assert.equal(COUNTRY_ALIAS[alias], target, `别名 ${alias} 目标漂移`)
     assert.ok(hasRows(alias), `别名源键 ${alias} 在 ADMIN1_PROVINCES 缺失`)

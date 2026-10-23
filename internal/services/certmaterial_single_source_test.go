@@ -55,6 +55,32 @@ func assertNoInlineMaterialPredicate(t *testing.T, path string) {
 				path, lineNo+1, strings.TrimSpace(line))
 		}
 	}
+	// 行级扫描可被字符串拼接绕过（`cert_pem,'') <> "` + `"''` 两行各不含完整
+	// 谓词）。这里去掉引号/加号/全部空白后按列名就近查比较运算符：拼接后的
+	// 谓词必然在同一段连续文本里。
+	squashed := strings.Join(strings.Fields(string(data)), "")
+	squashed = strings.NewReplacer(`"`, "", "`", "", "+", "").Replace(squashed)
+	for _, marker := range []string{"CertJobMaterialPredicateSQL", "CertJobMaterialUsable"} {
+		squashed = strings.ReplaceAll(squashed, marker, "")
+	}
+	for _, column := range []string{"cert_pem", "key_pem"} {
+		for offset := 0; ; {
+			index := strings.Index(squashed[offset:], column)
+			if index < 0 {
+				break
+			}
+			position := offset + index
+			tail := squashed[position:]
+			if len(tail) > 48 {
+				tail = tail[:48]
+			}
+			if strings.Contains(tail, "<>''") || strings.Contains(tail, "!=''") {
+				t.Errorf("%s: 跨行拼接的内联材料谓词（squashed: %q），必须复用单源判定", path, tail)
+				break
+			}
+			offset = position + len(column)
+		}
+	}
 }
 
 // 空白 PEM 必须与单源 Go 判据同结论（无材料）：trim 口径分叉会让补偿路径把

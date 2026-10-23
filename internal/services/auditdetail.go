@@ -47,6 +47,9 @@ var auditResultTextMap = map[string]string{
 	"io_error":             "文件写入失败",
 	"query_failed":         "查询失败",
 	"warning":              "警告",
+	// 部署失败的状态回写本身失败（瞬时 DB 故障/CAS 冲突）：任务转入簿记
+	// 补写 + 重试登记，审计必须能读懂这个结果码。
+	"status_writeback_failed": "状态回写失败",
 	// 证书任务「重试被阻止」终态（certificates.go 经局部
 	// auditFailure 闭包以动态实参传入，字面量扫描钉测覆盖不到——本码曾因此
 	// 渲染成英文 blocked）。

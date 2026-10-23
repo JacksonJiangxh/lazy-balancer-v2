@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildRuleMetricsUnavailable, ruleMetricCellTitle, TCP_UPSTREAM_GRANULARITY_NOTE } from '../src/utils/dashboardMetrics.ts'
+import { buildRuleMetricsUnavailable, METRIC_RELOAD_RESET_NOTE, ruleMetricCellTitle, TCP_UPSTREAM_GRANULARITY_NOTE } from '../src/utils/dashboardMetrics.ts'
 
 const rules = [
   { caddy_id: 'lb_enabled', enabled: true },
@@ -31,8 +31,10 @@ test('TCP 行指标 title 明示上游地址口径，HTTP 行/禁用/采集失�
   const tcpTitle = ruleMetricCellTitle({ disabled: false, unavailable: false, tcp: true, value: '1,234' })
   assert.ok(tcpTitle.includes(TCP_UPSTREAM_GRANULARITY_NOTE))
   assert.ok(tcpTitle.includes('1,234'))
-  // HTTP 行：仅值（插件按 caddy_id 精确归集）
-  assert.equal(ruleMetricCellTitle({ disabled: false, unavailable: false, tcp: false, value: '56' }), '56')
+  // HTTP 行：值 + 重载归零口径（Caddy registry 每次 /load 重建）
+  const httpTitle = ruleMetricCellTitle({ disabled: false, unavailable: false, tcp: false, value: '56' })
+  assert.ok(httpTitle.startsWith('56'))
+  assert.ok(httpTitle.includes(METRIC_RELOAD_RESET_NOTE))
   // 禁用/采集失败优先于口径明示
   assert.equal(ruleMetricCellTitle({ disabled: true, unavailable: false, tcp: true, value: '1' }), '已禁用')
   assert.equal(ruleMetricCellTitle({ disabled: false, unavailable: true, tcp: true, value: '-' }), '采集失败')

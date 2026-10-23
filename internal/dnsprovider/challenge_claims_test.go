@@ -57,19 +57,35 @@ func TestChallengeClaim_expiredClaimDoesNotBlockForever(t *testing.T) {
 	t.Cleanup(ResetChallengeClaimsForTest)
 
 	claim, _ := ClaimChallengeValue("example.com", "_acme-challenge.example.com.", "v1")
-	// 模拟「异常退出未注销」：把登记时间推到 TTL 之外，登记不得永久压制清理。
+	// 另一条不同挑战值的在途登记：只应影响 v1 的过期判定，不得被一并改写。
+	if _, first := ClaimChallengeValue("example.com", "_acme-challenge.example.com.", "v2"); !first {
+		t.Fatal("不同挑战值的首次登记必须 first=true")
+	}
+	// 模拟「异常退出未注销」：只把 v1 的登记时间推到 TTL 之外（此前用例把全部
+	// key 的所有 owner 都改成过期，误伤范围无法被发现），登记不得永久压制清理。
+	targetKey := challengeClaimKeyOf("example.com", "_acme-challenge.example.com.", "v1")
 	challengeClaims.mu.Lock()
-	for key, owners := range challengeClaims.owners {
-		for owner := range owners {
-			owners[owner] = challengeClaimRecord{claimedAt: time.Now().Add(-2 * challengeClaimTTL)}
-		}
-		challengeClaims.owners[key] = owners
+	owners := challengeClaims.owners[targetKey]
+	for owner := range owners {
+		owners[owner] = challengeClaimRecord{claimedAt: time.Now().Add(-2 * challengeClaimTTL)}
 	}
 	challengeClaims.mu.Unlock()
 	if _, first := ClaimChallengeValue("example.com", "_acme-challenge.example.com.", "v1"); !first {
 		t.Fatal("过期登记必须被清理，不得永久压制同值清理")
 	}
+	if _, first := ClaimChallengeValue("example.com", "_acme-challenge.example.com.", "v2"); first {
+		t.Fatal("v2 的在途登记未过期，必须继续压制其同值清理")
+	}
 	if claim.Release() {
 		t.Fatal("过期登记已被剔除，旧句柄注销不得再拿到判定权")
+	}
+}
+
+// nil 接收者必须返回 true（=调用方可以清理）：deferred 清理在未登记/降级路径
+// 上会拿到 nil 句柄，返回 false 会让清理被永久跳过。
+func TestChallengeClaim_nilReceiverAllowsCleanup(t *testing.T) {
+	var claim *ChallengeClaim
+	if !claim.Release() {
+		t.Fatal("nil 句柄的 Release 必须返回 true（无在途登记 → 允许清理）")
 	}
 }

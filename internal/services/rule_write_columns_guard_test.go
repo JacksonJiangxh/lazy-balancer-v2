@@ -18,13 +18,14 @@ import (
 	"testing"
 )
 
-// handwrittenRuleInsertPattern 匹配「手写 lb_rules INSERT」的归一化形态。
+// handwrittenRuleInsertPattern 匹配「手写 lb_rules 全行写」的归一化形态。
 // 原判定 strings.Contains(query, "INSERT INTO lb_rules (")
 // 是字面量、单空格、必须同串——`INSERT INTO lb_rules\n(…`、`INSERT OR REPLACE INTO
 // lb_rules`、`INSERT INTO "lb_rules"` 全部静默绕过单源门。归一化（空白折叠 +
 // 去引号/方括号）后按表名边界判定；列清单不再是必要条件——无列清单的
 // `INSERT INTO lb_rules VALUES (…)` 是隐式列序清单，同属单源禁区。
-var handwrittenRuleInsertPattern = regexp.MustCompile(`(?i)\binsert(?:\s+or\s+(?:replace|ignore))?\s+into\s+lb_rules\b`)
+// `REPLACE INTO lb_rules`（SQLite 的 delete+insert 全行形态）同属第二份列清单。
+var handwrittenRuleInsertPattern = regexp.MustCompile(`(?i)\b(?:insert(?:\s+or\s+(?:replace|ignore))?\s+into|replace\s+into)\s+lb_rules\b`)
 
 // isHandwrittenRuleInsert 报告 SQL 文本是否是手写规则 INSERT。
 func isHandwrittenRuleInsert(query string) bool {
@@ -131,6 +132,8 @@ func TestHandwrittenRuleInsertMatcher_normalizesFormattingVariants(t *testing.T)
 		{name: "quoted table", query: `INSERT INTO "lb_rules" (caddy_id) VALUES (?)`, want: true},
 		{name: "or replace", query: "INSERT OR REPLACE INTO lb_rules (caddy_id) VALUES (?)", want: true},
 		{name: "or ignore lowercase", query: "insert or ignore into lb_rules(caddy_id) values (?)", want: true},
+		{name: "plain replace into", query: "REPLACE INTO lb_rules (caddy_id) VALUES (?)", want: true},
+		{name: "replace into quoted table", query: `REPLACE INTO "lb_rules" VALUES (?)`, want: true},
 		{name: "other table", query: "INSERT INTO lb_rules_backup (caddy_id) VALUES (?)", want: false},
 		{name: "plain select", query: "SELECT * FROM lb_rules WHERE id = ?", want: false},
 		{name: "other insert", query: "INSERT INTO upstreams (rule_id) VALUES (?)", want: false},
@@ -200,5 +203,56 @@ var testOnly = "INSERT INTO lb_rules VALUES (9)"
 	}
 	if isHandwrittenRuleInsert("SELECT * FROM lb_rules WHERE id = ?") {
 		t.Fatal("非 INSERT 语句误报")
+	}
+}
+
+// UpdateRule 编辑保存的 SET 列清单必须与单源（lbRuleColumnSpecs）等价：
+// specs 派生 INSERT/快照投影，编辑路径的手写 UPDATE 是第四份列清单——新增列
+// 时只改 specs，编辑保存会静默不写该列（新建/复制/快照/集群应用均正常），
+// 正是单源机制要防的形态。这里对 SET 列集合做双向集合等价断言。
+func TestUpdateRuleSetColumns_matchSingleSource(t *testing.T) {
+	src, err := os.ReadFile(filepath.Join("..", "handlers", "rules.go"))
+	if err != nil {
+		t.Fatalf("read rules.go: %v", err)
+	}
+	body := string(src)
+	const anchor = `query := "UPDATE lb_rules SET "`
+	start := strings.Index(body, anchor)
+	if start < 0 {
+		t.Fatalf("UpdateRule 的 UPDATE lb_rules SET 构造未命中（锚点被改名？）: %q", anchor)
+	}
+	const tail = "updated_at = datetime('now'), updated_by = ?"
+	window := body[start:]
+	end := strings.Index(window, tail)
+	if end < 0 {
+		t.Fatalf("UpdateRule SET 尾部锚点未命中: %q", tail)
+	}
+	window = window[:end+len(tail)]
+
+	written := map[string]bool{}
+	for _, match := range regexp.MustCompile(`query \+= "([a-z_0-9]+) = \?`).FindAllStringSubmatch(window, -1) {
+		written[match[1]] = true
+	}
+	written["updated_at"] = true
+	written["updated_by"] = true
+
+	// 编辑不写主键/外键与创建审计列（id 自增、caddy_id 为 WHERE 键、
+	// created_* 由创建路径落库）。
+	excluded := map[string]bool{"id": true, "caddy_id": true, "created_by": true, "created_at": true}
+	expected := map[string]bool{}
+	for _, spec := range lbRuleColumnSpecs {
+		if !excluded[spec.name] {
+			expected[spec.name] = true
+		}
+	}
+	for column := range expected {
+		if !written[column] {
+			t.Errorf("UpdateRule SET 清单缺少列 %q——编辑保存会静默不写该列（新建/复制/快照仍正常）", column)
+		}
+	}
+	for column := range written {
+		if !expected[column] {
+			t.Errorf("UpdateRule SET 含规格外/不该更新的列 %q——写入单一事实源漂移", column)
+		}
 	}
 }

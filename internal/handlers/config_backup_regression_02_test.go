@@ -16,6 +16,7 @@ package handlers
 //   cert_renewal_days 导入下界 1
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -170,7 +171,7 @@ func TestValidateV2Backup_newlyEnumeratedBooleanColumnsRejectStrings(t *testing.
 			if err := json.Unmarshal([]byte(legacyBackupJSON(t, map[string][]map[string]any{tc.table: {row}}, nil, nil)), &backup); err != nil {
 				t.Fatalf("unmarshal: %v", err)
 			}
-			_, err := validateV2Backup(backup)
+			_, err := validateImportBackupChain(context.Background(), importValidationDeps{}, &backup, importValidationOptions{})
 			if err == nil || !strings.Contains(err.Error(), tc.column) {
 				t.Fatalf("err=%v, want 点名 %s", err, tc.column)
 			}
@@ -181,7 +182,7 @@ func TestValidateV2Backup_newlyEnumeratedBooleanColumnsRejectStrings(t *testing.
 		if err := json.Unmarshal([]byte(legacyBackupJSON(t, nil, map[string]any{"auto_backup_enabled": "true"}, nil)), &backup); err != nil {
 			t.Fatalf("unmarshal: %v", err)
 		}
-		_, err := validateV2Backup(backup)
+		_, err := validateImportBackupChain(context.Background(), importValidationDeps{}, &backup, importValidationOptions{})
 		if err == nil || !strings.Contains(err.Error(), "auto_backup_enabled") {
 			t.Fatalf("err=%v, want 点名 auto_backup_enabled", err)
 		}
@@ -444,7 +445,9 @@ func TestValidateV2Backup_legacyStillRunsPostGates(t *testing.T) {
 		return backup
 	}
 	t.Run("合法 legacy 仍通过并标记旧校验和", func(t *testing.T) {
-		usedLegacy, err := validateV2Backup(parse(t, legacyBackupShared(t, nil)))
+		candidate := parse(t, legacyBackupShared(t, nil))
+		result, err := validateImportBackupChain(context.Background(), importValidationDeps{}, &candidate, importValidationOptions{})
+		usedLegacy := result.UsedLegacyChecksum
 		if err != nil {
 			t.Fatalf("合法 legacy 备份不得拒绝: %v", err)
 		}
@@ -456,7 +459,8 @@ func TestValidateV2Backup_legacyStillRunsPostGates(t *testing.T) {
 		body := legacyBackupShared(t, func(tables map[string][]map[string]any) {
 			tables["ca_providers"] = []map[string]any{{"id": 1, "provider": "evil-ca", "credentials": "{}"}}
 		})
-		if _, err := validateV2Backup(parse(t, body)); err == nil || !strings.Contains(err.Error(), "无效的 CA 提供商") {
+		candidate := parse(t, body)
+		if _, err := validateImportBackupChain(context.Background(), importValidationDeps{}, &candidate, importValidationOptions{}); err == nil || !strings.Contains(err.Error(), "无效的 CA 提供商") {
 			t.Fatalf("err=%v, want CA provider 白名单拒绝", err)
 		}
 	})
@@ -465,7 +469,7 @@ func TestValidateV2Backup_legacyStillRunsPostGates(t *testing.T) {
 			tables["ca_providers"] = []map[string]any{{"id": 1, "provider": "letsencrypt", "credentials": "{}", "directory_url": "https://evil.example/acme"}}
 		})
 		backup := parse(t, body)
-		if _, err := validateV2Backup(backup); err != nil {
+		if _, err := validateImportBackupChain(context.Background(), importValidationDeps{}, &backup, importValidationOptions{}); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if got := backup.Tables["ca_providers"][0]["directory_url"]; got != services.LetsEncryptDirectoryURL {
@@ -476,7 +480,8 @@ func TestValidateV2Backup_legacyStillRunsPostGates(t *testing.T) {
 		body := legacyBackupShared(t, func(tables map[string][]map[string]any) {
 			tables["ca_providers"] = []map[string]any{{"id": 1, "provider": "letsencrypt", "credentials": "not-json"}}
 		})
-		if _, err := validateV2Backup(parse(t, body)); err == nil || !strings.Contains(err.Error(), "凭证格式") {
+		candidate := parse(t, body)
+		if _, err := validateImportBackupChain(context.Background(), importValidationDeps{}, &candidate, importValidationOptions{}); err == nil || !strings.Contains(err.Error(), "凭证格式") {
 			t.Fatalf("err=%v, want 凭证格式拒绝", err)
 		}
 	})
@@ -484,7 +489,8 @@ func TestValidateV2Backup_legacyStillRunsPostGates(t *testing.T) {
 		body := legacyBackupShared(t, func(tables map[string][]map[string]any) {
 			tables["cert_jobs"] = []map[string]any{{"rule_id": "x", "status": "bogus"}}
 		})
-		if _, err := validateV2Backup(parse(t, body)); err == nil || !strings.Contains(err.Error(), "无效的证书任务状态") {
+		candidate := parse(t, body)
+		if _, err := validateImportBackupChain(context.Background(), importValidationDeps{}, &candidate, importValidationOptions{}); err == nil || !strings.Contains(err.Error(), "无效的证书任务状态") {
 			t.Fatalf("err=%v, want 证书任务状态拒绝", err)
 		}
 	})
@@ -492,7 +498,8 @@ func TestValidateV2Backup_legacyStillRunsPostGates(t *testing.T) {
 		body := legacyBackupShared(t, func(tables map[string][]map[string]any) {
 			tables["users"] = []map[string]any{{"id": 1, "username": "legacy-admin", "password_hash": "hash", "role": "admin", "is_enabled": "1"}}
 		})
-		if _, err := validateV2Backup(parse(t, body)); err == nil || !strings.Contains(err.Error(), "is_enabled") {
+		candidate := parse(t, body)
+		if _, err := validateImportBackupChain(context.Background(), importValidationDeps{}, &candidate, importValidationOptions{}); err == nil || !strings.Contains(err.Error(), "is_enabled") {
 			t.Fatalf("err=%v, want 布尔类型门拒绝", err)
 		}
 	})
@@ -500,7 +507,8 @@ func TestValidateV2Backup_legacyStillRunsPostGates(t *testing.T) {
 		body := legacyBackupShared(t, func(tables map[string][]map[string]any) {
 			tables["users"] = []map[string]any{{"id": 1, "username": "legacy-admin", "password_hash": "hash", "role": "admin", "is_enabled": 0}}
 		})
-		if _, err := validateV2Backup(parse(t, body)); err == nil || !strings.Contains(err.Error(), "管理员") {
+		candidate := parse(t, body)
+		if _, err := validateImportBackupChain(context.Background(), importValidationDeps{}, &candidate, importValidationOptions{}); err == nil || !strings.Contains(err.Error(), "管理员") {
 			t.Fatalf("err=%v, want 管理员门拒绝", err)
 		}
 	})
@@ -641,12 +649,18 @@ func TestLbbakImport_threatSourceFailureWarnsAndKeepsLocal(t *testing.T) {
 	restore := services.OverrideThreatWafDirForTest(wafDir)
 	defer restore()
 
-	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET last_updated='2020-01-01 00:00:00' WHERE name='ustc'`); err != nil {
-		// 老库可能无 last_updated 列；忽略（回退到 updated_at 断言）
-		_, _ = db.DB.Exec(`UPDATE security_threat_sources SET updated_at='2020-01-01 00:00:00' WHERE name='ustc'`)
+	// 本地快照基线：先写可判别的旧值（updated_at 为 schema 既有列，不依赖
+	// last_updated 的可选性），失败源回滚后必须仍等于该快照。
+	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET updated_at='2020-01-01 00:00:00' WHERE name='ustc'`); err != nil {
+		t.Fatal(err)
 	}
 	var beforeRow string
-	_ = db.DB.QueryRow(`SELECT COALESCE(updated_at,'') FROM security_threat_sources WHERE name='ustc'`).Scan(&beforeRow)
+	if err := db.DB.QueryRow(`SELECT COALESCE(updated_at,'') FROM security_threat_sources WHERE name='ustc'`).Scan(&beforeRow); err != nil {
+		t.Fatalf("读取本地快照: %v", err)
+	}
+	if beforeRow != "2020-01-01 00:00:00" {
+		t.Fatalf("本地快照播种失败: updated_at=%q", beforeRow)
+	}
 
 	body := buildLbbakWithExtraThreatEntry(t, completeBackupJSON(t, map[string][]map[string]any{
 		"security_threat_sources": {{"name": "ustc", "display_name": "USTC", "url": "https://x", "update_enabled": 1, "apply_enabled": 1, "updated_at": "2030-01-01 00:00:00"}},
@@ -659,10 +673,17 @@ func TestLbbakImport_threatSourceFailureWarnsAndKeepsLocal(t *testing.T) {
 		t.Fatalf("逐源失败必须进 responseWarnings: %s", rec.Body.String())
 	}
 	var afterRow string
-	_ = db.DB.QueryRow(`SELECT COALESCE(updated_at,'') FROM security_threat_sources WHERE name='ustc'`).Scan(&afterRow)
-	// 失败源：本地行必须仍在（未被删除成缺行），且未被备份值覆盖。
-	if afterRow == "" || afterRow == "2030-01-01 00:00:00" {
-		t.Fatalf("失败源必须整行回滚为本地快照: updated_at=%q（本地=%q，备份=2030）", afterRow, beforeRow)
+	if err := db.DB.QueryRow(`SELECT COALESCE(updated_at,'') FROM security_threat_sources WHERE name='ustc'`).Scan(&afterRow); err != nil {
+		t.Fatalf("失败源行必须仍在（未被删除成缺行）: %v", err)
+	}
+	// 失败源：整行回滚为本地快照——以「同一天同一时刻」比较（SQLite 回写
+	// 快照会带 +00:00 后缀，逐字比较会假红；afterRow=="" 则会把本地空串
+	// 误判为失败态），并额外排除备份值。
+	if !strings.HasPrefix(afterRow, "2020-01-01 00:00:00") {
+		t.Fatalf("失败源必须整行回滚为本地快照: updated_at=%q（本地=%q）", afterRow, beforeRow)
+	}
+	if afterRow == "2030-01-01 00:00:00" {
+		t.Fatalf("失败源不得被备份值覆盖: updated_at=%q", afterRow)
 	}
 }
 
@@ -806,15 +827,6 @@ func TestImportConfigBackup_clampsZeroCertRenewalDays(t *testing.T) {
 	if stored != 0 {
 		t.Fatalf("cert_renewal_days=%d, want 0（0=默认 30，导入不再钳到 1）", stored)
 	}
-}
-
-func countAuditLike78(t *testing.T, fragment string) int {
-	t.Helper()
-	var n int
-	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE detail LIKE ?`, "%"+fragment+"%").Scan(&n); err != nil {
-		t.Fatalf("query audit: %v", err)
-	}
-	return n
 }
 
 // ──：导入后四族规则库首槽武装（DescribeAll NextSlot 非空的行为侧） ──
@@ -1052,7 +1064,7 @@ func TestValidateV2Backup_rejectsMalformedTimestamps(t *testing.T) {
 		if err := json.Unmarshal([]byte(body), &backup); err != nil {
 			t.Fatalf("unmarshal (%v): %v", bad, err)
 		}
-		if _, err := validateV2Backup(backup); err == nil || !strings.Contains(err.Error(), "created_at") {
+		if _, err := validateImportBackupChain(context.Background(), importValidationDeps{DB: db.DB}, &backup, importValidationOptions{}); err == nil || !strings.Contains(err.Error(), "created_at") {
 			t.Fatalf("created_at=%#v err=%v, want 点名 created_at 拒绝", bad, err)
 		}
 		response := postValidateBytes(t, h, []byte(body))
@@ -1067,7 +1079,7 @@ func TestValidateV2Backup_rejectsMalformedTimestamps(t *testing.T) {
 		if err := json.Unmarshal([]byte(body), &backup); err != nil {
 			t.Fatalf("unmarshal (%v): %v", good, err)
 		}
-		if _, err := validateV2Backup(backup); err != nil {
+		if _, err := validateImportBackupChain(context.Background(), importValidationDeps{DB: db.DB}, &backup, importValidationOptions{}); err != nil {
 			t.Fatalf("created_at=%#v err=%v, want accepted", good, err)
 		}
 		if response := postValidateBytes(t, h, []byte(body)); !response.Valid {

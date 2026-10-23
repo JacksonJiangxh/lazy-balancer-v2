@@ -279,7 +279,10 @@ const InternalAuthHeader = "X-Lazy-Balancer-Internal-MCP-Auth"
 //   - get_caddy_config：Caddy 完整 JSON，单条规则片段有 get_rule_caddy_config；
 //   - get_metrics_history / get_rule_metrics_history：可选 queryArgs 只收窄维度
 //     （rule_id/interval/range），没有 page/page_size，收敛范围靠选窗与单规则过滤；
-//   - get_caddy_logs：可选 queryArgs 只有 type，尾部日志超限只能换专用读通道。
+//   - get_caddy_logs：可选 queryArgs 只有 type，尾部日志超限只能换专用读通道；
+//   - preview_config：POST 整份预览（source 为配置分区），无分页参数；
+//   - get_rule_logs：GET 尾读最近 1000 行，无分页参数——它本身就是该类单条工具，
+//     通用文案「改用对应的单条查询工具」对它指向自己，只能给 REST 增量读通道。
 //
 // 新增此类工具时必须在此登记，否则会退回不可执行的通用文案。
 var noPaginationToolHints = map[string]string{
@@ -288,11 +291,15 @@ var noPaginationToolHints = map[string]string{
 	"get_metrics_history":      "历史指标超过 MCP 通道 4 MiB 上限：本工具无分页参数——请传 rule_id 收窄到单条规则（或改用 get_rule_metrics_history 的 range 选窗），或经管理面板查看趋势",
 	"get_rule_metrics_history": "规则历史指标超过 MCP 通道 4 MiB 上限：本工具无分页参数——请缩短 range（1h/6h）后重试，或经管理面板查看趋势",
 	"get_caddy_logs":           "Caddy 日志超过 MCP 通道 4 MiB 上限：本工具无分页参数——请改用 get_rule_logs 按规则查看（尾读最近 1000 行），或经管理面板查看完整日志",
+	"preview_config":           "预览结果超过 MCP 通道 4 MiB 上限：本工具无分页参数——请拆小 source（按配置分区分批预览），或经管理面板预览完整差异",
+	"get_rule_logs":            "规则日志超过 MCP 通道 4 MiB 上限：本工具无分页参数（尾读最近 1000 行）——请经 REST /rules/{caddy_id}/log-stream 增量续读，或经管理面板查看完整日志",
 }
 
 // schemaDeclaresPagination 报告工具的 input_schema 是否声明 page/page_size。
 // 超大响应指引按「真实分页能力」判定——queryArgs 非空不代表有分页
 // （get_caddy_logs 只有 type、get_metrics_history 只有 rule_id/interval）。
+// 判据不看 HTTP 方法：POST 整份返回工具（preview_config/validate_config/
+// issue_certificate 等）同样没有分页参数，「改用分页」对它们一律是死路。
 func schemaDeclaresPagination(spec toolSpec) bool {
 	var shape struct {
 		Properties map[string]json.RawMessage `json:"properties"`
@@ -305,14 +312,14 @@ func schemaDeclaresPagination(spec toolSpec) bool {
 	return hasPage || hasPageSize
 }
 
-// oversizedResponseMessage 选择超大响应的处置指引：专用 hint 优先；其余只读工具
-// 按「schema 是否声明 page/page_size」分流——无分页能力的整份返回工具给单条查询/
-// 管理面板路径（「改用分页」对它们是死路），有分页的维持通用分页指引。
+// oversizedResponseMessage 选择超大响应的处置指引：专用 hint 优先；其余工具
+// 按「schema 是否声明 page/page_size」分流——无分页能力的整份返回工具给单条
+// 查询/管理面板路径（「改用分页」对它们是死路），有分页的维持通用分页指引。
 func oversizedResponseMessage(spec toolSpec) string {
 	if hint, ok := noPaginationToolHints[spec.name]; ok {
 		return hint
 	}
-	if spec.method == http.MethodGet && !schemaDeclaresPagination(spec) {
+	if !schemaDeclaresPagination(spec) {
 		return "内部 API 响应超过 4 MiB 上限；本工具无分页参数——请改用对应的单条查询工具（get_* 系列）缩小范围，或经管理面板查看/导出"
 	}
 	return "内部 API 响应超过 4 MiB 上限，请改用分页或专用导出工具"

@@ -158,6 +158,21 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	// 本地重建哈希用于漂移检测：记录哈希与主节点一致但本地数据不符时，
 	// 哈希跳过让位于强制重放，避免数据丢失被永久掩盖。
 	skip := computeSectionSkips(ctx, s.db, snapshot, switches, previous.SectionHashes)
+	// 规则日志清理基线：lb_rules 全量替换会删掉主节点已删除的规则，但访问
+	// 日志是每节点本地文件（Caddy 按 log_enabled 在各节点独立写
+	// /app/logs/rules），快照替换只动表行与证书文件——不在此清理则从节点
+	// 磁盘永久残留（UI/看门狗/日志统计都按存活规则过滤，无人可见）。地址
+	// 必须在事务前读（事务内 lb_rules 已被清空重写）。读失败仅 warn 跳过
+	// 清理：残留是派生数据，不能因此阻断同步。
+	var localRuleIDsBeforeApply []string
+	if switches.Rules {
+		ids, idsErr := loadLocalRuleIDs(ctx, s.db)
+		if idsErr != nil {
+			Logf("warn", "集群同步：读取本地规则清单失败，跳过消失规则的访问日志清理: %v", idsErr)
+		} else {
+			localRuleIDsBeforeApply = ids
+		}
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("开始快照事务: %w", err)
@@ -236,6 +251,33 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 			fmt.Errorf("提交快照事务: %w", err),
 			s.restoreSnapshotArtifacts(previous, snapshot),
 		)
+	}
+	// 规则日志清理（快照已提交）：与证书轴同层同门——rules 节应用后按
+	// 「上一版有、快照没有」的差集删除本地访问日志。失败仅 warn/审计，
+	// 不阻断同步（快照已提交，日志是派生数据）。
+	if switches.Rules && len(localRuleIDsBeforeApply) > 0 {
+		kept := make(map[string]bool, len(snapshot.Rules))
+		for _, rule := range snapshot.Rules {
+			kept[rule.CaddyID] = true
+		}
+		removedLogs, logFailures := 0, 0
+		for _, id := range localRuleIDsBeforeApply {
+			if kept[id] {
+				continue
+			}
+			removedLogs++
+			if err := RemoveRuleLogFiles(id); err != nil {
+				logFailures++
+				Logf("warn", "集群同步：删除消失规则 %s 的访问日志失败（残留仅在本地磁盘）: %v", id, err)
+			}
+		}
+		if removedLogs > 0 {
+			detail := fmt.Sprintf("清理消失规则的访问日志：%d 条", removedLogs)
+			if logFailures > 0 {
+				detail += fmt.Sprintf("，失败 %d 条（见应用日志）", logFailures)
+			}
+			RecordAuditLog("system", "清理", "规则日志", detail, "")
+		}
 	}
 	// log_level 随快照落库后热生效——必须在事务提交后调用（ApplyLogLevel
 	// 从 db.DB 读全局配置，提交前读到的仍是旧值）。三分类合并后全局配置随
@@ -405,11 +447,17 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 		marker := fmt.Sprintf(syncReloadFailureMarkerPrefix+": %v", err)
 		markerCtx, markerCancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 		defer markerCancel()
-		result, werr := s.db.ExecContext(markerCtx, "UPDATE global_config SET last_sync_error=? WHERE id=1", encodeSyncError(marker, models.SyncErrorCodeApplyFailed))
+		result, werr := s.db.ExecContext(markerCtx, "UPDATE global_config SET last_sync_error=? WHERE id=1 AND "+slaveRoleConditionSQL, encodeSyncError(marker, models.SyncErrorCodeApplyFailed))
 		if werr != nil {
 			Logf("error", "集群同步重载失败标记写入失败: %v", werr)
-		} else if rows, raerr := result.RowsAffected(); raerr != nil || rows != 1 {
-			Logf("error", "集群同步重载失败标记写入异常（影响 %d 行，错误 %v）：自愈通道失效，请检查数据库", rows, raerr)
+		} else if rows, raerr := result.RowsAffected(); raerr != nil {
+			Logf("error", "集群同步重载失败标记写入异常（读取影响行数失败，错误 %v）：自愈通道可能失效，请检查数据库", raerr)
+		} else if rows == 0 {
+			// 从端补偿标记只在从端语境有意义：提交与重载之间完成升主的节点
+			// 不得把「同步重载失败」写回主节点（Promote 已清空该列）。
+			Logf("info", "集群同步重载失败标记跳过：本节点已升为主节点")
+		} else if rows != 1 {
+			Logf("error", "集群同步重载失败标记写入异常（影响 %d 行）：自愈通道失效，请检查数据库", rows)
 		}
 	} else if mustReload {
 		// 重载成功即清除本来源的失败面记录（含 304 补偿重拉成功形态——
@@ -588,6 +636,25 @@ func snapshotCertsDiffer(previous, current []models.ClusterCertificate) bool {
 		}
 	}
 	return false
+}
+
+// loadLocalRuleIDs 读取当前库内全部规则 id（集群 apply 的「上一版规则」基线，
+// 供消失规则的访问日志清理做差集）。
+func loadLocalRuleIDs(ctx context.Context, database *sql.DB) ([]string, error) {
+	rows, err := database.QueryContext(ctx, `SELECT caddy_id FROM lb_rules`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 func removeMissingSnapshotCerts(previous, current []models.ClusterCertificate) error {
@@ -1533,26 +1600,10 @@ func updateSnapshotSettings(ctx context.Context, tx *sql.Tx, snapshot models.Clu
 	}
 	if snapshot.CaddyConfig != nil {
 		addBase("caddy_config", *snapshot.CaddyConfig)
-		// 仅归一「在场但非法」的值；nil 是旧主端缺席，跳过而非补默认。
-		if settings.RequestBodyMaxSizeMB != nil {
-			normalized := *settings.RequestBodyMaxSizeMB
-			if normalized <= 0 {
-				normalized = db.DefaultRequestBodyMaxSizeMB
-			} else if normalized > 4096 {
-				normalized = 4096
-			}
-			settings.RequestBodyMaxSizeMB = new(normalized)
-		}
-		normalizePositive := func(field **int, fallback int) {
-			if *field == nil || **field > 0 {
-				return
-			}
-			*field = new(fallback)
-		}
-		normalizePositive(&settings.HTTPReadTimeout, db.DefaultHTTPReadTimeout)
-		normalizePositive(&settings.HTTPWriteTimeout, db.DefaultHTTPWriteTimeout)
-		normalizePositive(&settings.HTTPIdleTimeout, db.DefaultHTTPIdleTimeout)
-		normalizePositive(&settings.CaddyLogSizeMB, db.DefaultCaddyLogSizeMB)
+		// 与主端装载侧共用同一归一（同族 sync_interval/jwt_expire_minutes/
+		// cert_expiry_days/threat_screen_mode 的既有做法）：仅归一「在场但非法」
+		// 的值；nil 是旧主端缺席，跳过而非补默认。
+		normalizeSnapshotCaddyNumericSettings(&settings)
 		if settings.AccessLogJSON != nil {
 			addBase("access_log_json", *settings.AccessLogJSON)
 		}

@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -181,6 +182,44 @@ func TestBuildCorazaDirectives_blockStatusCRSLiftGatedOn949File(t *testing.T) {
 	}
 }
 
+// 483 归因路由的可达性实证：geoip-only + mode=off 策略没有任何引擎段能产出
+// 归因码（该路由存在但不可达，见
+// TestGenerateCaddyConfig_geoip_blockPageServesConfiguredStatus 的注释）；真实
+// 可达形状是策略引擎段的 deny——这里用 custom_only + 启用 block 自定义规则跑
+// 真实 coraza 事务，断言 interruption.Status == 归因路由 matcher 的 483。
+func TestEngineTransaction_customOnlyBlockRuleLiftsInterruptionTo483(t *testing.T) {
+	policy := &models.SecurityPolicy{
+		AnomalyThreshold: 5,
+		Mode:             "custom_only",
+		CustomRules:      json.RawMessage(`[{"id":11,"name":"拒绝规则","enabled":true,"action":"block","score":5,"conditions":[{"target":"uri","operator":"contains","pattern":"/admin"}]}]`),
+	}
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 483, "lb_test"))
+	var kept []string
+	for _, line := range strings.Split(directives, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "SecAuditLog ") || strings.HasPrefix(trimmed, "SecAuditLogType ") ||
+			strings.HasPrefix(trimmed, "Include ") || strings.HasPrefix(trimmed, "SecRuleUpdateActionById ") {
+			continue // 环境依赖行（同 compileForEngineGate 的过滤口径）
+		}
+		kept = append(kept, line)
+	}
+	waf, err := coraza.NewWAF(coraza.NewWAFConfig().WithDirectives(strings.Join(kept, "\n")))
+	if err != nil {
+		t.Fatalf("engine rejected rendered directives: %v\n%s", err, strings.Join(kept, "\n"))
+	}
+	tx := waf.NewTransaction()
+	defer func() { _ = tx.Close() }()
+	tx.ProcessConnection("10.0.0.1", 5555, "127.0.0.1", 80)
+	tx.ProcessURI("/admin/x", "GET", "HTTP/1.1")
+	it := tx.ProcessRequestHeaders()
+	if it == nil {
+		t.Fatalf("expected interruption from custom block rule:\n%s", strings.Join(kept, "\n"))
+	}
+	if it.Status != 483 {
+		t.Fatalf("interruption status=%d, want 483（策略段 deny 必须携带合成码，483 归因路由才可达）", it.Status)
+	}
+}
+
 // ---------- 步骤 1.1：policySynthetic 按策略身份分配（RED）----------
 
 // 全部被任一规则绑定的启用策略中 BlockPageID>0 且页内容非空者，按 policy_id ASC
@@ -237,14 +276,27 @@ func TestLoadSecurityPolicyContext_policySyntheticCappedAt599(t *testing.T) {
 		t.Fatalf("loadSecurityPolicyContext: %v", err)
 	}
 
-	// Then：恰好 117 条策略获码（483..599），无越界码
+	// Then：恰好 117 条策略获码，且按 policy_id 升序依次得 483..599（顺序
+	// 必须钉住——合成码随 map 迭代顺序漂移会让路由/配置字节不稳定，破坏
+	// errSameConfig 短路；仅断言条数与区间的写法对去排序完全无感）。
 	if len(ctx.policySynthetic) != 117 {
 		t.Fatalf("synthetic entries=%d, want 117 (483..599)", len(ctx.policySynthetic))
 	}
-	for id, code := range ctx.policySynthetic {
-		if code < 483 || code > 599 {
-			t.Fatalf("policy %d synthetic=%d out of legal range", id, code)
+	ids := make([]int, 0, len(ctx.policySynthetic))
+	for id := range ctx.policySynthetic {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+	for i, id := range ids {
+		if got, want := ctx.policySynthetic[id], blockPageSyntheticBase+i; got != want {
+			t.Fatalf("第 %d 个 policy_id=%d 合成码=%d, want %d（必须按 policy_id ASC 依次分配）", i+1, id, got, want)
 		}
+	}
+	if ctx.policySynthetic[ids[len(ids)-1]] != blockPageSyntheticMax {
+		t.Fatalf("末位合成码=%d, want 上限 %d", ctx.policySynthetic[ids[len(ids)-1]], blockPageSyntheticMax)
+	}
+	if _, ok := ctx.policySynthetic[ids[len(ids)-1]+1]; ok {
+		t.Fatal("第 118 个策略不得获码（上限 599 后回落不抬码）")
 	}
 }
 

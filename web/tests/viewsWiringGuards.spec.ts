@@ -184,14 +184,8 @@ test('威胁地图 canvas 注册/注销 pointerleave 清理悬停态', () => {
   assert.match(section(text, 'function onPointerLeave', '\n  }'), /hoverName = null/, '离开画布必须复位悬停名')
 })
 
-test('悬停高亮路径按世界坐标缓存（不再随相机逐帧重建）', () => {
-  const text = source('src/utils/threatScene.ts')
-  const body = section(text, 'function drawHoverHighlight', '// ---- 主循环 ----')
-  assert.match(body, /ensureWorldDotPaths\(\)/, '悬停必须复用按国世界路径缓存')
-  assert.doesNotMatch(body, /new Path2D\(/, '悬停绘制不得逐帧重建 Path2D')
-  const cache = section(text, 'function ensureWorldDotPaths', '// ---- 静态层 ----')
-  assert.match(cache, /if \(worldDotPathByKey\) return worldDotPathByKey/, '世界路径必须构建一次后复用')
-})
+// 悬停高亮的世界路径缓存不变量归 threatHotPathCaching.spec（变换/裁剪/等价性更强
+// 口径）与 threatEngineParity.spec（构建一次）；此处不重复断言。
 
 test('指标采集失败时规则表空态报「采集失败」', () => {
   assert.match(section(source('src/views/Dashboard.vue'), 'const rulesEmptyText', 'const hasRuleRequests'), /caddyMetricsUnavailable/)
@@ -265,16 +259,20 @@ test('死代码清理（灰 tone/死 CSS/死字段/解析器单源）', () => {
   assert.match(source('src/utils/securityStages.ts'), /export const parseUnknownIds|export function parseUnknownIds/)
 })
 
-test('build 门禁先跑测试与测试类型检查', () => {
+test('build 门禁：先跑测试、再跑 src 基线与 tests 类型检查', () => {
   const pkg = JSON.parse(source('package.json')) as { scripts: Record<string, string> }
   assert.ok(
-    pkg.scripts.build.startsWith('npm test && npm run typecheck:test &&'),
-    `build 必须先执行 npm test 与 typecheck:test，实际: ${pkg.scripts.build}`,
+    pkg.scripts.build.startsWith('npm test && npm run typecheck:src && npm run typecheck:test &&'),
+    `build 必须先执行 npm test、typecheck:src 与 typecheck:test，实际: ${pkg.scripts.build}`,
   )
-  // tsconfig.test.json extends 根 include（含全部 src/**/*.vue），
-  // typecheck:test 已是 src+tests 的超集——再跑 `vue-tsc --noEmit` 只是把全量 SFC
-  // 类型检查重复一遍（构建期约 2× 时间）。
-  assert.doesNotMatch(pkg.scripts.build, /(^|&& )vue-tsc --noEmit/, `build 不得重复全量类型检查: ${pkg.scripts.build}`)
+  // src 基线门（lib ES2020）与 tests 门（lib ES2024）必须是两个 project：
+  // tsconfig.test.json 抬高 lib 是为了 tests 的 Promise.withResolvers 等 API，
+  // 若只跑它，src 也只在 ES2024 的 API 面下被检查——等于放宽浏览器兼容基线
+  // （restart.ts 明确回避 Promise.withResolvers，旧 Safari 会首屏白屏）。
+  assert.equal(pkg.scripts['typecheck:src'], 'vue-tsc -p tsconfig.json --noEmit')
+  assert.match(source('tsconfig.json'), /"lib": \["ES2020", "DOM", "DOM\.Iterable"\]/, 'src 基线 lib 不得抬高')
+  assert.match(source('tsconfig.test.json'), /"lib": \["ES2024", "DOM", "DOM\.Iterable"\]/, 'tests 需要 ES2024 API')
+  assert.doesNotMatch(pkg.scripts.build, /(^|&& )vue-tsc --noEmit/, `build 不得跑无 project 的全量检查: ${pkg.scripts.build}`)
 })
 
 test('证书卡：ACME 证书卡接入 configLoaded 双重门控（与 Basic/Caddy 同契约）', () => {
@@ -341,8 +339,16 @@ test('节点审批/拒绝/删除在确认弹框之前取得占位', () => {
   assert.ok(takePlaceholder >= 0 && confirm > takePlaceholder, '占位必须先于 confirmAction')
   assert.match(block, /pendingNodeId\.value !== null/, '第二请求必须被显式拒绝而非静默丢弃')
   const page = source('src/views/settings/ClusterSettings.vue')
-  assert.match(page, /const approveNode = \(node: ClusterNode\): Promise<void> =>\n  confirmAndRunNodeAction\(/)
-  assert.match(page, /const removeNode = \(node: ClusterNode\): Promise<void> =>\n  confirmAndRunNodeAction\(/)
+  // 箭头体必须直接委托 confirmAndRunNodeAction——不要求换行/缩进形态
+  // （纯格式化把调用提到 `=>` 同行时不得假红）；中间也不允许夹别的判断。
+  for (const name of ['approveNode', 'removeNode']) {
+    const at = page.indexOf(`const ${name} = (node: ClusterNode): Promise<void> =>`)
+    assert.ok(at > 0, `${name} 的委托形态被改（本钉需同步）`)
+    const rest = page.slice(at)
+    const callAt = rest.indexOf('confirmAndRunNodeAction(')
+    assert.ok(callAt > 0, `${name} 必须走确认+执行单源`)
+    assert.match(rest.slice(0, callAt), /=>\s*$/, `${name} 的箭头体必须直接委托，不得在中间插入判断`)
+  }
 })
 
 test('服务控制/同步/同步设置/清钉同样在确认前占位', () => {
@@ -589,4 +595,15 @@ test('OIDC 设置卡：访问白名单字段（email 域 / 用户组）读回显
   // 表单区可见（步骤 4）
   assert.match(page, /v-model="form\.allowedEmailDomains"/)
   assert.match(page, /v-model="form\.allowedGroups"/)
+})
+
+test('CA 提供商测试成功后刷新列表（陈旧凭证表单不得覆盖刚申请的 EAB）', () => {
+  // testCAProvider 会触发 ZeroSSL EAB 自动申请并写库；列表不刷新时后续
+  // 「编辑 → 保存」提交的是测试前的空 EAB 快照，会把刚拿到的凭证覆盖为空。
+  const page = source('src/views/settings/FreeCertificates.vue')
+  const body = section(page, 'const testCAProvider', 'const openConfigDialog')
+  const requestAt = body.indexOf('await request.post')
+  assert.ok(requestAt > 0, '缺测试请求')
+  const refetchAt = body.indexOf('await fetchCAProviders()')
+  assert.ok(refetchAt > requestAt, '测试成功后必须重新拉取 CA 提供商列表')
 })

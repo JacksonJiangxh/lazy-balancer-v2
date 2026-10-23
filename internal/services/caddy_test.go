@@ -1103,6 +1103,11 @@ func TestGenerateRouteObject_placesWafHandlerFirst_whenBlockingPolicyBound(t *te
 	// 新-1:request_body 限额前移至 waf 之前(coraza 读体无界)
 	bodyIndex := indexOfHandler(names, "request_body")
 	wafIndex := indexOfHandler(names, "waf")
+	// 两个 handler 都在场是顺序断言的前提：request_body 整体消失时
+	// 「-1 > wafIndex」恒假，顺序断言会静默通过（性质主体消失反而变绿）。
+	if bodyIndex < 0 || wafIndex < 0 {
+		t.Fatalf("request_body/waf 必须同时在链中: chain %v", names)
+	}
 	if bodyIndex > wafIndex {
 		t.Fatalf("request_body must precede waf (coraza read-body DoS guard): chain %v", names)
 	}
@@ -1137,6 +1142,8 @@ func TestGenerateRouteObject_rendersWafDetectionOnlyDirectives_whenDetectionPoli
 }
 
 func TestGenerateRouteObject_omitsWafHandler_whenBoundPolicyDisabled(t *testing.T) {
+	// 缺库降级下任何策略都不会发射 waf——不桩库时本用例对门控零保护。
+	stubSecurityLibsAvailable(t)
 	// Given
 	_, database := newClusterTestService(t)
 	seedWafRuleRow(t, database, "rule-http", "http")
@@ -1156,6 +1163,8 @@ func TestGenerateRouteObject_omitsWafHandler_whenBoundPolicyDisabled(t *testing.
 }
 
 func TestGenerateRouteObject_omitsWafHandler_whenRuleHasNoPolicyBinding(t *testing.T) {
+	// 缺库降级下 waf 恒缺席，桩库后本用例才真正验证「无绑定不发射」。
+	stubSecurityLibsAvailable(t)
 	// Given
 	_, database := newClusterTestService(t)
 	seedWafRuleRow(t, database, "rule-http", "http")
@@ -1177,6 +1186,8 @@ func TestGenerateRouteObject_omitsWafHandler_whenRuleHasNoPolicyBinding(t *testi
 }
 
 func TestGenerateSingleRuleCaddyConfig_omitsWafHandler_whenRuleIsTCP(t *testing.T) {
+	// 缺库降级下 waf 恒缺席；桩库后「TCP 链不发射 waf」才具备证伪力。
+	stubSecurityLibsAvailable(t)
 	// Given
 	_, database := newClusterTestService(t)
 	seedWafRuleRow(t, database, "rule-tcp", "tcp")
@@ -1202,8 +1213,11 @@ func TestGenerateSingleRuleCaddyConfig_omitsWafHandler_whenRuleIsTCP(t *testing.
 }
 
 // TestGenerateSingleRuleCaddyConfig_parityWithProductionBuilders asserts that
-// GenerateSingleRuleCaddyConfig delegates to the production builders so its
-// per-rule routes are byte-identical to generateHTTPRouteObjects / buildTCPServer.
+// GenerateSingleRuleCaddyConfig delegates to the production builders and that
+// its per-rule routes carry independent, hand-written expectations (selection
+// policy / weights / health checks) plus a full-render (DB → generateCaddyConfig)
+// byte comparison. The pure delegation comparison alone can only detect the
+// delegation link being removed——两侧同源同参时任何渲染回归都同步漂移仍绿。
 func TestGenerateSingleRuleCaddyConfig_parityWithProductionBuilders(t *testing.T) {
 	strategies := []string{"weighted_round_robin", "least_conn", "ip_hash", "cookie", "random", "first"}
 
@@ -1238,6 +1252,35 @@ func TestGenerateSingleRuleCaddyConfig_parityWithProductionBuilders(t *testing.T
 						want[i] = r
 					}
 					assertEqual(t, gotRoutes, want)
+
+					// 独立期望（不经过生成器）：策略直映射、权重 gcd 约分、
+					// 被动熔断窗口 = 间隔×3、主动检查路径直读。
+					proxy := findChainHandler(t, ruleMainRoute(t, gotRoutes, rule.CaddyID), "reverse_proxy")
+					if proxy == nil {
+						t.Fatalf("reverse_proxy handler missing for rule route: %v", gotRoutes)
+					}
+					loadBalancing := mustMap(t, proxy["load_balancing"], "load_balancing")
+					selectionPolicy := mustMap(t, loadBalancing["selection_policy"], "selection_policy")
+					if got := selectionPolicy["policy"]; got != strategy {
+						t.Fatalf("selection policy=%v, want %s", got, strategy)
+					}
+					if strategy == "weighted_round_robin" {
+						// 上游权重 2/4 → gcd 约分 1/2。
+						if got := fmt.Sprint(selectionPolicy["weights"]); got != "[1 2]" {
+							t.Fatalf("weights=%s, want [1 2]（gcd 约分）", got)
+						}
+					}
+					healthChecks := mustMap(t, proxy["health_checks"], "health_checks")
+					passive := mustMap(t, healthChecks["passive"], "passive")
+					if got, wantDuration := passive["fail_duration"], fmt.Sprintf("%ds", rule.HealthCheckInterval*3); got != wantDuration {
+						t.Fatalf("passive fail_duration=%v, want %s", got, wantDuration)
+					}
+					if withExtras {
+						active := mustMap(t, healthChecks["active"], "active")
+						if got := active["uri"]; got != rule.HealthCheckPath {
+							t.Fatalf("active health check uri=%v, want %s", got, rule.HealthCheckPath)
+						}
+					}
 				})
 			}
 		}
@@ -1249,7 +1292,10 @@ func TestGenerateSingleRuleCaddyConfig_parityWithProductionBuilders(t *testing.T
 				HealthCheckTimeout:            2,
 				HealthCheckUnhealthyThreshold: 3,
 				HealthCheckHealthyThreshold:   2,
-				Upstreams:                     []UpstreamConfig{{Host: "10.0.0.10", Port: 3306, Weight: 2, Enabled: true}},
+				Upstreams: []UpstreamConfig{
+					{Host: "10.0.0.10", Port: 3306, Weight: 2, Enabled: true},
+					{Host: "10.0.0.11", Port: 3306, Weight: 1, Enabled: true},
+				},
 			}
 			config := GenerateSingleRuleCaddyConfig(rule)
 			apps := mustMap(t, config["apps"], "apps")
@@ -1260,8 +1306,78 @@ func TestGenerateSingleRuleCaddyConfig_parityWithProductionBuilders(t *testing.T
 				t.Fatalf("buildTCPServer: %v", serverErr)
 			}
 			assertEqual(t, servers["tcp_3306"], wantServer)
+			// 独立期望：TCP 选择策略同样直映射。
+			routes, ok := mustMap(t, servers["tcp_3306"], "tcp server")["routes"].([]interface{})
+			if !ok || len(routes) == 0 {
+				t.Fatalf("tcp server routes missing: %#v", servers["tcp_3306"])
+			}
+			proxy := findChainHandler(t, routes[0], "proxy")
+			if proxy == nil {
+				t.Fatalf("layer4 proxy handler missing: %#v", routes[0])
+			}
+			loadBalancing := mustMap(t, proxy["load_balancing"], "load_balancing")
+			selection := mustMap(t, loadBalancing["selection"], "selection")
+			wantPolicy := strategy
+			if strategy == "cookie" {
+				// layer4 无 cookie 策略：渲染回落 weighted_round_robin（如实映射）。
+				wantPolicy = "weighted_round_robin"
+			}
+			if got := selection["policy"]; got != wantPolicy {
+				t.Fatalf("tcp selection policy=%v, want %s", got, wantPolicy)
+			}
 		})
 	}
+
+	// 全量渲染路径（DB → generateCaddyConfigFromStore）与单规则预览的字节对照：
+	// 覆盖委托比较看不到的组装差异（服务选择/发布集/证书门）。
+	t.Run("full render parity", func(t *testing.T) {
+		_, database := newClusterTestService(t)
+		rule := baseHTTPRule()
+		rule.Strategy = "least_conn"
+		rule.ListenPort = 8099
+		if _, err := database.Exec(`INSERT INTO lb_rules
+			(caddy_id, name, protocol, domain, listen_port, strategy, enabled,
+			 health_check_interval, health_check_timeout, health_check_unhealthy_threshold, health_check_healthy_threshold)
+			VALUES (?, ?, 'http', ?, ?, 'least_conn', 1, 10, 2, 3, 2)`,
+			rule.CaddyID, rule.CaddyID, rule.Domain, rule.ListenPort); err != nil {
+			t.Fatalf("seed rule: %v", err)
+		}
+		for _, upstream := range rule.Upstreams {
+			if _, err := database.Exec(`INSERT INTO upstreams (rule_id, host, port, weight, enabled, protocol) VALUES (?, ?, ?, ?, 1, 'http')`,
+				rule.CaddyID, upstream.Host, upstream.Port, upstream.Weight); err != nil {
+				t.Fatalf("seed upstream: %v", err)
+			}
+		}
+		full := generateCaddyConfigFromStore(database)
+		var filtered []interface{}
+		for _, routeValue := range httpRoutesFromServer(t, full, "http_8099") {
+			id, _ := mustMap(t, routeValue, "route")["@id"].(string)
+			if RouteIDBelongsToRule(id, rule.CaddyID) {
+				filtered = append(filtered, routeValue)
+			}
+		}
+		if len(filtered) == 0 {
+			t.Fatal("全量渲染未生成该规则路由——对照面为空")
+		}
+		single := httpRoutesFromServer(t, GenerateSingleRuleCaddyConfig(rule), "http_8099")
+		assertEqual(t, filtered, single)
+	})
+}
+
+// ruleMainRoute 在路由列表中按 @id 精确取主规则路由（规则路由可能伴随
+// 跳转/路径/归因兄弟路由）。
+func ruleMainRoute(t *testing.T, routes []interface{}, ruleID string) interface{} {
+	t.Helper()
+	ids := make([]string, 0, len(routes))
+	for _, routeValue := range routes {
+		id, _ := mustMap(t, routeValue, "route")["@id"].(string)
+		ids = append(ids, id)
+		if id == ruleID {
+			return routeValue
+		}
+	}
+	t.Fatalf("route %q not found: %v", ruleID, ids)
+	return nil
 }
 
 func TestBuildWafHandler_nilMatrix(t *testing.T) {

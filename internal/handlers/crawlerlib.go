@@ -15,6 +15,14 @@ import (
 	"lazy-balancer-v2/internal/taskengine"
 )
 
+// crawlerLibInternalError 500 统一装配：固定中文文案回客户端，底层错误
+// （SQL 文本/表列名等内部结构）只进运行日志——crawler-lib 端点属 business
+// 组，任意登录用户可读，与认证域「固定文案 + 服务端留痕」同口径。
+func crawlerLibInternalError(message string, err error) models.APIResponse {
+	services.Logf("error", "爬虫地址库: %s: %v", message, err)
+	return models.APIResponse{Code: http.StatusInternalServerError, Message: message}
+}
+
 // crawlerSourceDTO 爬虫源行（与 threatSourceDTO 同构字段，便于规则库卡片复用渲染）。
 type crawlerSourceDTO struct {
 	ID            int    `json:"id"`
@@ -40,7 +48,7 @@ func (h *Handlers) GetCrawlerLib(c *gin.Context) {
 		entry_count, version, update_status, COALESCE(message,''), COALESCE(last_checked,''), COALESCE(next_update,'')
 		FROM security_crawler_sources ORDER BY id`)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取爬虫源失败: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, crawlerLibInternalError("读取爬虫源失败", err))
 		return
 	}
 	defer rows.Close()
@@ -50,19 +58,19 @@ func (h *Handlers) GetCrawlerLib(c *gin.Context) {
 		var s crawlerSourceDTO
 		if err := rows.Scan(&s.ID, &s.Name, &s.DisplayName, &s.URL, &s.Format, &s.UpdateEnabled,
 			&s.EntryCount, &s.Version, &s.UpdateStatus, &s.Message, &s.LastChecked, &s.NextUpdate); err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取爬虫源失败: " + err.Error()})
+			c.JSON(http.StatusInternalServerError, crawlerLibInternalError("读取爬虫源失败", err))
 			return
 		}
 		sources = append(sources, s)
 		total += s.EntryCount
 	}
 	if err := rows.Err(); err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取爬虫源失败: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, crawlerLibInternalError("读取爬虫源失败", err))
 		return
 	}
 	listIDs, err := loadSystemListIDs()
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取爬虫源失败: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, crawlerLibInternalError("读取爬虫源失败", err))
 		return
 	}
 	for i := range sources {
@@ -195,7 +203,7 @@ func (h *Handlers) UpdateCrawlerLibFlags(c *gin.Context) {
 		if errors.Is(err, sql.ErrNoRows) {
 			c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "爬虫源不存在"})
 		} else {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取爬虫源失败: " + err.Error()})
+			c.JSON(http.StatusInternalServerError, crawlerLibInternalError("读取爬虫源失败", err))
 		}
 		return
 	}
@@ -208,7 +216,7 @@ func (h *Handlers) UpdateCrawlerLibFlags(c *gin.Context) {
 			query = `UPDATE security_crawler_sources SET update_enabled=1, update_status='idle', message='', consecutive_failures=0, updated_at=datetime('now') WHERE id=?`
 		}
 		if _, err := db.DB.Exec(query, id); err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新失败: " + err.Error()})
+			c.JSON(http.StatusInternalServerError, crawlerLibInternalError("更新失败", err))
 			return
 		}
 	} else {
@@ -217,7 +225,7 @@ func (h *Handlers) UpdateCrawlerLibFlags(c *gin.Context) {
 		// consecutive_failures 同步清零（与威胁库同口径，经集群快照在节点间
 		// 复制的失败计数不得跨禁用期陈旧）。
 		if _, err := db.DB.Exec(`UPDATE security_crawler_sources SET update_enabled=0, update_status='idle', message='已关闭自动更新', next_update=NULL, consecutive_failures=0, updated_at=datetime('now') WHERE id=?`, id); err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新失败: " + err.Error()})
+			c.JSON(http.StatusInternalServerError, crawlerLibInternalError("更新失败", err))
 			return
 		}
 	}

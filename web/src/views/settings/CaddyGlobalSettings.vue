@@ -89,6 +89,7 @@
               @click="openSaveListDialog"
             >存为列表</el-button>
           </div>
+          <div v-if="trustedRangesError" class="form-tip-line trusted-ranges-error">{{ trustedRangesError }}</div>
           <div class="form-tip-line">仅这些网段发来的请求头会被采信；未配对网段时所有头一律被忽略（最小 /8 与 /29）。{{ trustedPresetRangesDoc }}</div>
         </el-form-item>
         <div v-if="ipListsLoadError" class="info-note-bar">
@@ -247,6 +248,7 @@ import { ansiToHtml } from '@/utils/ansi'
 import { request, mfaAwareSuccess } from '@/utils/api'
 import { CDN_PRESETS, DEFAULT_ACCESS_LOG_FORMAT } from '@/utils/caddyDefaults'
 import { buildCaddyConfigPayload } from '@/utils/caddyConfigPayload'
+import { trustedProxyRangesError } from '@/utils/trustedProxyRanges'
 import { IP_LIST_CATEGORIES, parseIPList, parseRefIds } from '@/utils/securityStages'
 import type { APIResponse, ProxyTimeoutConfig } from '@/types'
 import ProxyTimeoutFields from '@/components/rules/ProxyTimeoutFields.vue'
@@ -376,6 +378,10 @@ onMounted(() => { void fetchIpLists() })
 // 空警告与合计：引用侧条数按选项缓存 entry_count 汇总（与后端展开上限同口径）
 const referencedEntryCount = computed(() => trustedRangeRefs.value.reduce((sum, id) => sum + (ipLists.value.find((l) => l.id === id)?.entry_count ?? 0), 0))
 const trustedRangesTotalCount = computed(() => trustedRanges.value.length + referencedEntryCount.value)
+// 行内校验：非法/过宽条目进入表单即标红（判据单源 utils/trustedProxyRanges，
+// 与后端 services.TrustedProxy* / normalizeTrustedProxyRanges 对表）——
+// 原实现只在预览/PUT 时被整组拒绝，用户只拿到一次 toast 且无法定位是哪一条。
+const trustedRangesError = computed(() => trustedProxyRangesError(trustedRanges.value))
 
 // —— 存为列表：内联网段一键建名单并转为引用（镜像策略侧「提取为列表」） ——
 const saveListDialogVisible = ref(false)
@@ -463,6 +469,11 @@ const handleSave = async (): Promise<void> => {
     return
   }
   if (isReadOnly.value || saving.value) return
+  // 非法/过宽网段在表单内即拦下（后端 PUT/preview 同样拒绝，但不点名具体条目）
+  if (trustedRangesError.value) {
+    ElMessage.warning(trustedRangesError.value)
+    return
+  }
   saving.value = true
   try {
     // 显式白名单：settings 是与 BasicSettings 共享的同一对象，全量展开会把
@@ -551,6 +562,8 @@ onUnmounted(() => logTail.stop())
 .trusted-inline-row .trusted-field { flex: 1; max-width: none; }
 .trusted-save-list-btn { flex-shrink: 0; margin-top: 4px; }
 .trusted-preset-field { width: 260px; }
+/* 行内校验提示：复用全局 form-tip-line 排版，仅追加危险色（不重定义全局类） */
+.trusted-ranges-error { color: var(--el-color-danger, #f56c6c); }
 .trusted-toggle { display: flex; flex-direction: column; align-items: flex-start; }
 /* 单行描述(2026-09-19 图片报障):只加 nowrap,不做溢出裁切(窄屏容忍伸出) */
 .tip-nowrap { white-space: nowrap; }

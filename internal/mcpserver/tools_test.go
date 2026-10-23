@@ -536,7 +536,8 @@ func TestSchemaDeclaresPaginationFollowsSchema(t *testing.T) {
 }
 
 // 超大响应指引分流以「schema 是否声明 page/page_size」为准：仅声明过滤维度
-// （queryArgs 非空）的工具不得落进「改用分页」（无可传参数）。
+// （queryArgs 非空）的工具不得落进「改用分页」（无可传参数）；判据不看 HTTP
+// 方法——POST 整份返回工具同样没有分页参数。
 func TestOversizedResponseMessageFollowsPaginationCapability(t *testing.T) {
 	filterOnly := toolSpec{
 		name:      "synthetic_filter_only",
@@ -547,6 +548,14 @@ func TestOversizedResponseMessageFollowsPaginationCapability(t *testing.T) {
 	message := oversizedResponseMessage(filterOnly)
 	if strings.Contains(message, "请改用分页或专用导出工具") || !strings.Contains(message, "无分页参数") {
 		t.Errorf("filter-only 工具 message=%q, want 无分页参数指引", message)
+	}
+	postNoPagination := toolSpec{
+		name:   "synthetic_post_no_pagination",
+		method: http.MethodPost,
+		schema: `{"type":"object","properties":{"source":{"type":"string"}}}`,
+	}
+	if message := oversizedResponseMessage(postNoPagination); !strings.Contains(message, "无分页参数") || strings.Contains(message, "请改用分页或专用导出工具") {
+		t.Errorf("POST 无分页工具 message=%q, want 无分页参数指引（分页文案对 POST 整份返回是死路）", message)
 	}
 	paginated := toolSpec{
 		name:      "synthetic_paginated",
@@ -560,5 +569,18 @@ func TestOversizedResponseMessageFollowsPaginationCapability(t *testing.T) {
 	hinted := toolSpec{name: "get_caddy_logs", method: http.MethodGet, queryArgs: []string{"type"}, schema: caddyLogsSchema}
 	if message := oversizedResponseMessage(hinted); !strings.Contains(message, "get_rule_logs") {
 		t.Errorf("hint 工具 message=%q, want 专用指引", message)
+	}
+	// 每个登记的工具都必须回专用 hint（不得落进通用分支）。
+	for name, want := range map[string]string{
+		"preview_config": "source",
+		"get_rule_logs":  "log-stream",
+	} {
+		message := oversizedResponseMessage(toolSpecsByName[name])
+		if !strings.Contains(message, want) {
+			t.Errorf("%s message=%q, want 含可执行路径 %q", name, message, want)
+		}
+		if strings.Contains(message, "请改用分页或专用导出工具") {
+			t.Errorf("%s message=%q, 不得落进通用分页文案", name, message)
+		}
 	}
 }

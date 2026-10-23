@@ -34,7 +34,7 @@
       <el-col :xs="12" :md="6">
         <el-card class="tm-kpi">
           <div class="tm-kpi-num" :class="{ 'tm-kpi-bad': fail24h > 0 }">{{ fail24h }}</div>
-          <div class="tm-kpi-label">24h 失败 <el-icon v-if="readOnly" class="tm-kpi-lock"><Lock /></el-icon></div>
+          <div class="tm-kpi-label">24h 失败</div>
         </el-card>
       </el-col>
     </el-row>
@@ -164,7 +164,12 @@
                  状态列不再用 disabled 表达 -->
             <!-- cert-waiting-ca 默认调度关闭、续期扫描入队
                  唤醒——开关上加 tooltip 说明自动唤醒语义（页内既有 tooltip 范式） -->
-            <el-tooltip v-if="row.id === 'cert-waiting-ca'" content="有证书任务入队时自动唤醒" placement="top" :offset="8" :show-after="150" :show-arrow="false">
+            <!-- 角色不适用（从节点上的 master-only 族）：调度开关在本节点
+                 不可用——显性标注原因，避免把「永不投递」误读为开关故障 -->
+            <el-tooltip v-if="row.role_applicable === false" content="仅主节点生效：从节点不调度此任务，调度开关仅在主节点可用" placement="top" :offset="8" :show-after="150" :show-arrow="false">
+              <el-tag size="small" type="info" effect="plain">仅主节点</el-tag>
+            </el-tooltip>
+            <el-tooltip v-else-if="row.id === 'cert-waiting-ca'" content="有证书任务入队时自动唤醒" placement="top" :offset="8" :show-after="150" :show-arrow="false">
               <el-switch :model-value="!!row.loop_on" :disabled="!canOperate" @change="(v: string | number | boolean) => onToggle(row, !!v)" />
             </el-tooltip>
             <el-tooltip v-else-if="row.kind !== 'oneshot'" :content="isBusinessDrivenTask(row) ? '由对应业务页自动更新控制' : '停止/恢复调度'" placement="top" :offset="8" :show-after="150" :show-arrow="false">
@@ -196,7 +201,7 @@
         </el-table-column>
         <el-table-column label="下次执行" width="180">
           <template #default="{ row }">
-            <span v-if="row.next_run_at && row.loop_on && row.kind !== 'daemon'">{{ row.next_run_at }}</span>
+            <span v-if="row.next_run_at && row.loop_on && row.kind !== 'daemon' && row.role_applicable !== false">{{ row.next_run_at }}</span>
             <span v-else class="tm-dim">—</span>
           </template>
         </el-table-column>
@@ -260,15 +265,20 @@
         <div v-if="detailTask.description" class="tm-detail-desc">{{ detailTask.description }}</div>
         <el-descriptions :column="2" border size="small" class="tm-detail-descs">
           <el-descriptions-item label="运行节奏">{{ detailTask.cadence || '—' }}</el-descriptions-item>
+          <el-descriptions-item label="角色适用性">
+            <el-tag v-if="detailTask.role_applicable === false" size="small" type="info" effect="plain">仅主节点运行（本节点不调度）</el-tag>
+            <el-tag v-else size="small" type="success" effect="plain">本节点可运行</el-tag>
+          </el-descriptions-item>
           <el-descriptions-item label="调度开关">
             <el-tooltip content="引擎调度投递开关（列表「调度」列同源）" placement="top" :offset="8" :show-after="150" :show-arrow="false">
-              <el-tag v-if="detailTask.kind !== 'oneshot'" size="small" :type="detailTask.loop_on ? 'success' : 'warning'" effect="plain">{{ detailTask.loop_on ? '开启' : '关闭' }}</el-tag>
+              <el-tag v-if="detailTask.role_applicable === false" size="small" type="info" effect="plain">仅主节点生效</el-tag>
+              <el-tag v-else-if="detailTask.kind !== 'oneshot'" size="small" :type="detailTask.loop_on ? 'success' : 'warning'" effect="plain">{{ detailTask.loop_on ? '开启' : '关闭' }}</el-tag>
               <el-tag v-else size="small" type="info" effect="plain">不可调度</el-tag>
             </el-tooltip>
           </el-descriptions-item>
-          <!-- 与列表「下次执行」列同门（loop_on 且非常驻）——停用任务的
-               排程槽是陈旧预约值，详情无条件显示会与列表「—」口径分叉 -->
-          <el-descriptions-item label="下次执行">{{ (detailTask.next_run_at && detailTask.loop_on && detailTask.kind !== 'daemon') ? detailTask.next_run_at : '—' }}</el-descriptions-item>
+          <!-- 与列表「下次执行」列同门（loop_on 且非常驻且角色适用）——停用
+               任务的排程槽是陈旧预约值，详情无条件显示会与列表「—」口径分叉 -->
+          <el-descriptions-item label="下次执行">{{ (detailTask.next_run_at && detailTask.loop_on && detailTask.kind !== 'daemon' && detailTask.role_applicable !== false) ? detailTask.next_run_at : '—' }}</el-descriptions-item>
           <el-descriptions-item label="24h 成功 / 失败">
             <span class="tm-ok">{{ detailTask.success_24h }}</span> / <span :class="{ 'tm-bad': detailTask.fail_24h > 0 }">{{ detailTask.fail_24h }}</span>
           </el-descriptions-item>
@@ -362,6 +372,7 @@ interface TaskInfo {
   status: string; cancellable: boolean; controllable?: boolean; triggerable?: boolean
   last_run?: TaskRunInfo; next_run_at?: string; runs_24h: number; success_24h: number; fail_24h: number
   loop_on?: boolean; started_at?: string; business_driven?: boolean // 常驻族：循环启停态/引擎启动时刻
+  role_applicable?: boolean // 本节点角色是否允许该任务运行（false=仅主节点，从节点视图标注）
 }
 interface RunRecord {
   id: number; task_id: string; family: string; trigger: string; operator?: string; status: string
@@ -823,8 +834,7 @@ const fmtDuration = (ms?: number) => {
 .tm-kpi-num { font-size: 30px; font-weight: 800; color: #111827; line-height: 1.1; }
 .tm-kpi-run { color: #3b82f6; }
 .tm-kpi-bad { color: #f87171; }
-.tm-kpi-label { font-size: 12.5px; color: #6b7280; margin-top: 6px; display: flex; align-items: center; justify-content: center; gap: 4px; }
-.tm-kpi-lock { font-size: 12px; color: #b45309; }
+.tm-kpi-label { font-size: 12.5px; color: #6b7280; margin-top: 6px; }
 
 /* 队列横幅 */
 .tm-cq-banner :deep(.el-card__body) { padding: 12px 20px; }

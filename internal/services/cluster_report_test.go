@@ -213,6 +213,7 @@ func TestReport_certExpiryWarnOnlyOnStateTransition(t *testing.T) {
 	})
 
 	_, database := newClusterTestService(t)
+	setNodeMasterRole(t, database, false) // Report 只属于从节点语境
 	sync := NewSyncService(database, &config.Config{DataDir: t.TempDir()}, nil)
 	t.Cleanup(func() { unregisterSyncDrainer(sync) })
 	ctx := context.Background()

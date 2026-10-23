@@ -15,12 +15,12 @@ func saveWafPathVars(t *testing.T) {
 		wafDir, wafDistDir, ipListDir, allowedPrefix               string
 		crsLive, crsDirectives, crsRuleIndex, crsSnapshot, crsDist string
 		xdbLive, xdbDist, crawlerSeed, crawlerLive                 string
-		auditLog, eventsOffset                                     string
+		auditLog, eventsOffset, downloadIntegrity                  string
 	}{
 		wafDir, wafDistDir, IPListDataDir, wafiplist.AllowedPathPrefix,
 		crsLiveDir, crsDirectivesDir, CRSRuleIndexDir, crsSnapshotDir, crsDistDir,
 		ip2regionLivePath, ip2regionDistPath, crawlerDistSeedFile, crawlerIPListFile,
-		auditLogPath, securityEventsOffsetPath,
+		auditLogPath, securityEventsOffsetPath, downloadIntegrityPath,
 	}
 	t.Cleanup(func() {
 		wafDir, wafDistDir, IPListDataDir, wafiplist.AllowedPathPrefix =
@@ -30,6 +30,7 @@ func saveWafPathVars(t *testing.T) {
 		ip2regionLivePath, ip2regionDistPath, crawlerDistSeedFile, crawlerIPListFile =
 			old.xdbLive, old.xdbDist, old.crawlerSeed, old.crawlerLive
 		auditLogPath, securityEventsOffsetPath = old.auditLog, old.eventsOffset
+		downloadIntegrityPath = old.downloadIntegrity
 	})
 }
 
@@ -79,6 +80,9 @@ func TestConfigureWafDirs_derivesAllWafPaths(t *testing.T) {
 		// 审计日志与摄取 offset 同属派生面（此前硬编码 /app）。
 		{"auditLogPath", auditLogPath, filepath.Join(parent, "logs", "waf-audit", "audit.log")},
 		{"securityEventsOffsetPath", securityEventsOffsetPath, filepath.Join(dataDir, "security_events.offset")},
+		// 下载 TOFU 完整性基线同属数据卷派生面（此前硬编码 /app/data，
+		// 自定义 data_dir 下基线持久化恒失败 → 代理投毒阻断静默失效）。
+		{"downloadIntegrityPath", downloadIntegrityPath, filepath.Join(dataDir, ".download-integrity.json")},
 	}
 	for _, c := range cases {
 		if c.got != c.want {
@@ -105,5 +109,9 @@ func TestConfigureWafDirs_containerDefaultKeepsAppPaths(t *testing.T) {
 	// 容器默认形态爬虫运行快照保持 /app/data 常量逐字节一致。
 	if crawlerIPListFile != "/app/data/crawler-ip-lists.json" {
 		t.Fatalf("容器默认爬虫快照路径被改写: %q", crawlerIPListFile)
+	}
+	// TOFU 完整性基线在容器默认形态同样保持 /app/data 常量。
+	if downloadIntegrityPath != "/app/data/.download-integrity.json" {
+		t.Fatalf("容器默认完整性基线路径被改写: %q", downloadIntegrityPath)
 	}
 }

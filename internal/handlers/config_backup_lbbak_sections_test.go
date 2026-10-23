@@ -202,13 +202,15 @@ func TestParseLbbak_entryAndTotalCaps(t *testing.T) {
 }
 
 // 含 xdb 的 lbbak 导入(字节未变)不得删除.version 伴生文件——
-// 版本 tag 从备份表区传入。
+// 版本 tag 从备份表区传入。夹具必须是真实可装载 xdb（此前 "XDB-BYTES"
+// 在装载校验即被拒、FailedXdb=true → ApplyWafFileBundle 根本不触碰 .version，
+// 「字节未变保留 sidecar」分支零覆盖）。
 func TestLbbakImport_preservesXdbVersionSidecar(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	g := newBackupSectionRouter(h)
 	_, xdbPath := overrideTestWafPaths(t)
 
-	xdb := []byte("XDB-BYTES")
+	xdb := validXdbBytes(t)
 	if err := os.WriteFile(xdbPath, xdb, 0o644); err != nil {
 		t.Fatal(err)
 	}

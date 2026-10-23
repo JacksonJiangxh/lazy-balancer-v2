@@ -31,7 +31,14 @@ func TestBuildGeoipHandler_derivedPathsEmitted(t *testing.T) {
 // handler 字节形态与修复前逐字节一致（loadConfig 同字节短路不变量依赖之，
 // 防止默认部署因新增键触发无意义重载）。
 func TestBuildGeoipHandler_defaultPathsOmitted(t *testing.T) {
-	// Given：容器默认形态（未派生，包级路径变量保持出厂默认）
+	// Given：容器默认形态——显式设置并先行断言出厂默认值（不依赖其他用例
+	// 的 saveWafPathVars 清理；「默认 ⇒ 省略键」的期望值由此显式成立）
+	saveWafPathVars(t)
+	ip2regionLivePath = defaultIP2RegionLivePath
+	crawlerIPListFile = defaultCrawlerIPListFile
+	if ip2regionLivePath != "/app/data/ip2region.xdb" || crawlerIPListFile != "/app/data/crawler-ip-lists.json" {
+		t.Fatalf("默认路径常量漂移: xdb=%q crawler=%q", ip2regionLivePath, crawlerIPListFile)
+	}
 
 	// When：渲染 geoip handler
 	h := buildGeoipHandler(true)

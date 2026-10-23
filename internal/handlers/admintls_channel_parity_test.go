@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -20,11 +22,48 @@ import (
 // 同一请求两处来源冲突、JSON 数值形态、单字段上限——三者都是「通道各写
 // 一套语义」时最容易漂移的边界。
 
-func newAdminTLSTestRouter() (*gin.Engine, *Handlers) {
-	handler := &Handlers{cfg: &config.Config{Port: 8000}}
+// newAdminTLSTestRouter 的 cfg.DataDir 必须指向隔离目录：启用态 selfsigned
+// 探针会生成并落盘自签名证书对（admin_tls.crt/admin_tls.key），空 DataDir
+// 等于把私钥写进测试进程的工作目录（包源码树）。
+func newAdminTLSTestRouter(t *testing.T) (*gin.Engine, *Handlers) {
+	t.Helper()
+	handler := &Handlers{cfg: &config.Config{Port: 8000, DataDir: t.TempDir()}}
 	router := gin.New()
 	router.POST("/admin-tls", handler.UpdateAdminTLS)
 	return router, handler
+}
+
+// 自签名证书对的落点必须是 cfg.DataDir——测试夹具给空目录时探针会把材料写进
+// 源码树（曾被 git add -A 扫进仓库）。
+func TestUpdateAdminTLS_selfSignedProbeStaysInDataDir(t *testing.T) {
+	initializeRuleFeatureTestDB(t)
+	oldExit := exitProcess
+	exited := make(chan struct{}, 1)
+	exitProcess = func(int) { exited <- struct{}{} }
+	t.Cleanup(func() { exitProcess = oldExit })
+
+	router, handler := newAdminTLSTestRouter(t)
+	if handler.cfg.DataDir == "" {
+		t.Fatal("测试夹具 DataDir 为空：探针会把自签名证书与私钥写进源码目录")
+	}
+	request := httptest.NewRequest(http.MethodPost, "/admin-tls", strings.NewReader(`{"enabled":true,"mode":"selfsigned"}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	for _, name := range []string{"admin_tls.crt", "admin_tls.key"} {
+		if _, err := os.Stat(filepath.Join(handler.cfg.DataDir, name)); err != nil {
+			t.Fatalf("%s 未生成在 DataDir: %v", name, err)
+		}
+	}
+	select {
+	case <-exited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("restart was not scheduled")
+	}
 }
 
 // multipart 通道只消费请求体：URL query 同名参数不得静默覆盖 enabled/mode，
@@ -48,7 +87,7 @@ func TestUpdateAdminTLS_multipartFieldsIgnoreURLQuery(t *testing.T) {
 	if err := writer.Close(); err != nil {
 		t.Fatalf("close multipart writer: %v", err)
 	}
-	router, _ := newAdminTLSTestRouter()
+	router, _ := newAdminTLSTestRouter(t)
 	request := httptest.NewRequest(http.MethodPost, "/admin-tls?enabled=false&mode=upload", strings.NewReader(body.String()))
 	request.Header.Set("Content-Type", writer.FormDataContentType())
 	response := httptest.NewRecorder()
@@ -104,7 +143,7 @@ func TestUpdateAdminTLS_JSONNumericEnabledValues(t *testing.T) {
 			exited := make(chan struct{}, 1)
 			exitProcess = func(int) { exited <- struct{}{} }
 			t.Cleanup(func() { exitProcess = oldExit })
-			router, _ := newAdminTLSTestRouter()
+			router, _ := newAdminTLSTestRouter(t)
 			request := httptest.NewRequest(http.MethodPost, "/admin-tls", strings.NewReader(tt.body))
 			request.Header.Set("Content-Type", "application/json")
 			response := httptest.NewRecorder()
@@ -161,7 +200,7 @@ func TestUpdateAdminTLS_JSONPerFieldSizeCap(t *testing.T) {
 			if err != nil {
 				t.Fatalf("marshal body: %v", err)
 			}
-			router, _ := newAdminTLSTestRouter()
+			router, _ := newAdminTLSTestRouter(t)
 			request := httptest.NewRequest(http.MethodPost, "/admin-tls", strings.NewReader(string(body)))
 			request.Header.Set("Content-Type", "application/json")
 			response := httptest.NewRecorder()
@@ -219,7 +258,7 @@ func TestUpdateAdminTLS_multipartQueryConflictBodyWinsBothDirections(t *testing.
 	if err := writer.Close(); err != nil {
 		t.Fatalf("close multipart writer: %v", err)
 	}
-	router, _ := newAdminTLSTestRouter()
+	router, _ := newAdminTLSTestRouter(t)
 	query := url.Values{"enabled": {"false"}, "mode": {"selfsigned"}}.Encode()
 	request := httptest.NewRequest(http.MethodPost, "/admin-tls?"+query, strings.NewReader(body.String()))
 	request.Header.Set("Content-Type", writer.FormDataContentType())

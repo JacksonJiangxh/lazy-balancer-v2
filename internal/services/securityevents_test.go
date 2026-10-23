@@ -24,6 +24,13 @@ import (
 	"lazy-balancer-v2/internal/taskengine"
 )
 
+// securityEventsPolicyContainsRule 无排除快照的归属判定（仅测试使用：
+// 生产归因链一律调用 securityEventsPolicyContainsRuleWithExclusions，本包装
+// 留在测试文件避免产品文件出现测试专用入口）。
+func securityEventsPolicyContainsRule(policy *models.SecurityPolicy, ruleTriggered, clientIP string) bool {
+	return securityEventsPolicyContainsRuleWithExclusions(policy, ruleTriggered, clientIP, securityEventsPolicyCRSExclusions{})
+}
+
 // syncBuffer is a bytes.Buffer guarded by a mutex for concurrent write/poll.
 type syncBuffer struct {
 	mu  sync.Mutex
@@ -2101,7 +2108,7 @@ func TestSecurityEventsAttribution_ModeOffPolicyDoesNotClaimCRSEvents(t *testing
 		{id: 5, name: "policy-blocking", enabled: 1, mode: "blocking", customJSON: `[]`, crsJSON: `[]`},
 	})
 	if pid != 5 || pname != "policy-blocking" {
-		t.Fatalf("attribution=(%d,%q), want (5,policy-blocking) — mode=off 策略不得认领 CRS 事件（历史问题 off 门）", pid, pname)
+		t.Fatalf("attribution=(%d,%q), want (5,policy-blocking) — mode=off 策略不得认领 CRS 事件（off 门）", pid, pname)
 	}
 }
 
@@ -2156,7 +2163,7 @@ func TestSecurityEventsAttribution_UnboundReturnsZeroValue(t *testing.T) {
 	}
 }
 
-// 问题 遗留 ip_blacklist 拒绝（rule_triggered="4"）必须归因到拥有黑名单的策略。
+// 遗留 ip_blacklist 拒绝（rule_triggered="4"）必须归因到拥有黑名单的策略。
 // Given：lb_rule1 绑定 [policy-A(id1, 无任何 IP 控制), policy-B(id3, ip_blacklist
 // '["10.0.0.1"]')]，绑定顺序 policy_id ASC。
 // When：归因 audit rule_triggered="4"（BuildCorazaDirectives 对非空 ip_blacklist
@@ -2189,7 +2196,7 @@ func TestSecurityEventsAttribution_LegacyBlacklistDenyPicksOwnerPolicy(t *testin
 	}
 }
 
-// 问题 IP ACL 黑名单模式拒绝（rule_triggered="2"）必须归因到拥有该 ACL 的策略。
+// IP ACL 黑名单模式拒绝（rule_triggered="2"）必须归因到拥有该 ACL 的策略。
 // Given：lb_rule1 绑定 [policy-A(id1, 无任何 IP 控制), policy-C(id4,
 // ip_acl_enabled=1, ip_acl_mode='deny', ip_acl_list '["1.2.3.4"]')]。
 // When：归因 audit rule_triggered="2"（enabled+deny+名单非空时发射 id:2）。
@@ -2221,7 +2228,7 @@ func TestSecurityEventsAttribution_IPACLDenyPicksOwnerPolicy(t *testing.T) {
 	}
 }
 
-// 问题 回退守恒：rule_triggered="4" 但没有任何绑定策略配置黑名单时，
+// 回退守恒：rule_triggered="4" 但没有任何绑定策略配置黑名单时，
 // 仍回退到第一个 ENABLED 绑定策略（发射现实：必有策略发出了该 id，只是当前
 // 配置已变更），禁止回归为零值或报错。
 func TestSecurityEventsAttribution_BlacklistDenyFallsBackToFirstEnabledWhenNoOwner(t *testing.T) {
@@ -2248,7 +2255,7 @@ func TestSecurityEventsAttribution_BlacklistDenyFallsBackToFirstEnabledWhenNoOwn
 	}
 }
 
-// 问题 边界：allow（白名单）模式的 IP ACL 不拥有 rule_triggered="2" 的归属
+// 边界：allow（白名单）模式的 IP ACL 不拥有 rule_triggered="2" 的归属
 // （归属口径仅认 deny 黑名单模式，与审计规格一致）；事件回退到第一个启用绑定。
 func TestSecurityEventsAttribution_IPACLAllowModeDoesNotOwnDenyEvent(t *testing.T) {
 	dataDir := t.TempDir()
@@ -3767,7 +3774,7 @@ func TestSecurityEventsPolicyContainsRule_leadingZeroRuleIDGroupDecode(t *testin
 	_ = securityEventsPolicyContainsRule(g21Policy, "0942100", "198.51.100.9") // 断言不 panic
 }
 
-// 历史 A 域：----
+// ---- 摄取事务夹具（自动封禁喂入与归因回归共用）----
 
 // securityEvents历史Fixture 生成一条可摄取事务（rule 942100 非中断形态，
 // 足以通过自动封禁喂入门：rule_triggered 非空 + action=blocked）。
@@ -4072,24 +4079,25 @@ func TestSecurityEventsIngest_insertedCountExcludesIgnoredRows(t *testing.T) {
 	}
 }
 
-// 纯域名键的覆盖序必须由显式 ORDER BY id 定义，不得
-// 依赖 SQLite 未定义的返回序。构造「插入序与 id 序相反」的双规则：id=5 先插入、
-// id=3 后插入。无 ORDER BY 时后者（id=3）覆盖纯域名键；显式 id ASC 后由
-// 较高 id（较新创建）id=5 覆盖——与注释契约「后创建规则覆盖(创建序)」一致。
+// 纯域名键的覆盖序必须由显式 ORDER BY 定义，不得依赖 SQLite 未定义的返回序，
+// 也不得消费已退役的历史列 lb_rules.id（新行恒 NULL、镜像行为 0——ORDER BY id
+// 下旧行反而最后赋值，「后创建覆盖」在现网形态失效）。构造「插入序与创建序
+// 相反」的双规则（都不写 id，模拟生产写入形态）：较早插入但 created_at 更新者
+// 必须最终覆盖纯域名键。
 func TestSecurityEventsLoadMappings_plainDomainOverrideDeterministic(t *testing.T) {
 	_, database := newClusterTestService(t)
-	if _, err := database.Exec(`INSERT INTO lb_rules (id,caddy_id,name,domain,protocol,listen_port,enabled) VALUES
-		(5,'lb_newer','newer-rule','dup.example.com','http',443,1),
-		(3,'lb_older','older-rule','dup.example.com','http',8443,1)`); err != nil {
+	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,created_at) VALUES
+		('lb_newer','newer-rule','dup.example.com','http',443,1,'2026-01-02 00:00:00'),
+		('lb_older','older-rule','dup.example.com','http',8443,1,'2025-01-01 00:00:00')`); err != nil {
 		t.Fatal(err)
 	}
 	rules, _, _, err := securityEventsLoadMappings()
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 纯域名键：id 较大（较新创建）者胜
+	// 纯域名键：created_at 较新者胜（与插入序相反——依赖返回序时此处必红）
 	if got := securityEventsMapHost("dup.example.com", rules); got.caddyID != "lb_newer" {
-		t.Fatalf("plain-domain override=%q, want lb_newer（ORDER BY id ASC 较高 id 覆盖；无 ORDER BY 时为插入序故此处必红）", got.caddyID)
+		t.Fatalf("plain-domain override=%q, want lb_newer（ORDER BY created_at ASC 后创建覆盖）", got.caddyID)
 	}
 	// host:port 精确键两侧仍各自可达
 	if got := securityEventsMapHost("dup.example.com:443", rules); got.caddyID != "lb_newer" {

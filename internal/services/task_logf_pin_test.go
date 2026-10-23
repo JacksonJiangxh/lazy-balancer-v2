@@ -184,7 +184,7 @@ func TestTaskLogf_CertManualPoll_parseFailureCountedInSummary(t *testing.T) {
 
 // Given v2.0 四类型标准全量注册。
 // When DescribeAll。
-// Then Kind 映射：定时 5（threat/crs/ip2region/crawlerbot-update/auto-backup）、循环 9、
+// Then Kind 映射：定时 5（threat/crs/ip2region/crawlerbot-update/auto-backup）、循环 10、
 // 常驻 3（ingestion/cert-issuance/cluster-sync）、触发 1（startup:config-load）；
 // cert-waiting-ca 默认 LoopOn=false（调度关闭——续期扫描唤醒）。
 func TestTaskEngineWire_KindMapping(t *testing.T) {

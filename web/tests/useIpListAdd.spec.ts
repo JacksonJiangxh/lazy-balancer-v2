@@ -110,6 +110,20 @@ test('取消确认不写库，也不提示成功', async () => {
   assert.equal(callsOf('showSaveResult').length, 0)
 })
 
+// 写入口失败（reject）路径：锁复位全靠 finally——若被挪进成功分支，网络抖动后
+// 按钮会永久灰死（只能刷新页面），而成功/取消用例仍全绿。
+test('POST 失败（reject）：返回 false、释放重入锁、不谎报成功', async () => {
+  reset()
+  g.__post = async () => {
+    throw new Error('boom')
+  }
+  const { adding, addIpToList } = useIpListAdd()
+  assert.equal(await addIpToList('1.2.3.4', list), false, '写入失败不得回报完成')
+  assert.equal(adding.value, false, '失败分支必须释放占位')
+  assert.equal(callsOf('showSaveResult').length, 0, '失败不得报成功')
+  assert.equal(callsOf('ElMessage.info').length, 0, '失败不得走「已存在」提示')
+})
+
 test('写入在途时重入直接拒绝（双击只产生一次 POST）', async () => {
   reset()
   const { promise, resolve } = Promise.withResolvers<unknown>()

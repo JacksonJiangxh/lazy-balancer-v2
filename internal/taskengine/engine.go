@@ -6,6 +6,7 @@ package taskengine
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log"
@@ -129,6 +130,13 @@ var ErrNotFound = errors.New("taskengine: 任务未注册")
 var ErrEngineStopped = errors.New("taskengine: 引擎已停止")
 var ErrNotMaster = errors.New("taskengine: 该操作仅允许在主节点执行")
 
+// ErrUserCancelled 用户显式取消的取消原因（Cancel/CancelHook 通道）。
+// 执行侧用 context.Cause(rc.Ctx) 区分「用户取消」与系统性中止
+// （demote/导入排空/进程停止）——前者=显式放弃本槽，业务侧据此把排程槽
+// 与失败同源推进到下一槽；后者保留「恢复后到期轮补跑」语义，业务侧不动槽
+// （引擎侧同样不消费槽，两侧不得只做一半）。
+var ErrUserCancelled = errors.New("taskengine: 用户取消")
+
 // errDaemonManualUnsupported 常驻任务手动触发拒绝哨兵（唯一错误源）：
 // Trigger/RunSync 入口与 reserveRunInternal 第二道防线同口径——常驻任务仅
 // 引擎调度（StartLoop/StopLoop 启停即可），直跑会绕过 startDaemon 生命周期
@@ -152,7 +160,7 @@ type registration struct {
 
 	mu         sync.Mutex
 	running    bool
-	cancel     context.CancelFunc
+	cancel     context.CancelCauseFunc
 	runTrigger string // 在途轮的触发来源（manual/auto/startup/caddy-restart）
 	// runSeq 在途轮代际身份：每次成功占位（reserveRunInternal /
 	// tryStartDaemon）自增。取消路径以快照代际复核复锁——CancelHook 窗口内
@@ -187,8 +195,8 @@ type registration struct {
 	// 判定其归属不成立——曾无条件消费未来槽导致自动更新永久停摆）。
 	// failed 轮不消费槽（由上方退避兜底重投）；skipped（demote 中止）不消费
 	// ——promote 后到期槽补跑语义保留；导入排空取消（CancelInFlightRuns，
-	// 不经 Cancel）不消费——恢复后到期轮补跑（业务侧 cancelSourceRow 注释
-	// 契约）。
+	// 不经 Cancel）与进程停止不消费——恢复后到期轮补跑（这些系统性中止的
+	// ctx 取消原因不是 ErrUserCancelled，业务侧同样不推进排程槽）。
 	schedDoneSlot time.Time
 	// schedSlotEvalAt 槽闭包最近求值时刻（Scheduled 降频：槽远期/已消费时
 	// 不必每 tick 重读 DB，仅临近到期前导窗或重评地板周期到点才再求值）。
@@ -320,7 +328,9 @@ func (e *Engine) StopWithTimeout(timeout time.Duration) {
 	for _, r := range e.regs {
 		r.mu.Lock()
 		if r.cancel != nil {
-			r.cancel()
+			// 进程停止=系统性中止（非用户取消）：不带 ErrUserCancelled
+			// 原因——业务侧不得因此推进排程槽，重启后到期轮仍补跑。
+			r.cancel(nil)
 		}
 		r.mu.Unlock()
 	}
@@ -421,7 +431,7 @@ func (e *Engine) SetRole(isMaster bool) {
 				c := r.cancel
 				r.mu.Unlock()
 				if c != nil {
-					c()
+					c(nil) // demote 中止=系统性中止，非用户取消
 				}
 				continue
 			}
@@ -445,7 +455,7 @@ func (e *Engine) SetRole(isMaster bool) {
 				c := r.cancel
 				r.mu.Unlock()
 				if c != nil {
-					c()
+					c(nil) // demote 中止=系统性中止：不消费槽、业务侧不推进槽
 				}
 			}
 			continue
@@ -461,7 +471,7 @@ func (e *Engine) SetRole(isMaster bool) {
 					r.pendingRestart = true
 					c := r.cancel
 					r.mu.Unlock()
-					c()
+					c(nil) // 换代重启=系统性中止
 					continue
 				}
 				r.mu.Unlock()
@@ -475,7 +485,7 @@ func (e *Engine) SetRole(isMaster bool) {
 		c := r.cancel
 		r.mu.Unlock()
 		if c != nil {
-			c()
+			c(nil) // demote 中止=系统性中止
 		}
 	}
 }
@@ -547,7 +557,7 @@ func (e *Engine) tryStartDaemon(r *registration, restartIntent bool) {
 	// 不再有「running=true 但 cancel==nil」的首停信号丢失窗口。
 	r.running = true
 	r.runSeq++
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancelCause(context.Background())
 	r.cancel = cancel
 	r.mu.Unlock()
 	e.roleMu.RUnlock()
@@ -765,9 +775,11 @@ func (e *Engine) Cancel(id string) bool {
 		// manager 侧取消成功后同步取消引擎 ctx——Run 返回
 		// 时 terminalStatus 判 cancelled（曾 manager 取消路径引擎 ctx 不动，
 		// 终态落 failed，历史无法区分「用户取消」与「真失败」）。
+		// 取消原因=ErrUserCancelled：业务侧据此推进排程槽（与失败同源），
+		// 让下一槽正常投递而非永久停摆。
 		r.mu.Lock()
 		if c != nil && r.running && r.runSeq == seq && r.runTrigger == trigger {
-			c()
+			c(ErrUserCancelled)
 			consumeCancelledSlotLocked(r, trigger)
 		}
 		r.mu.Unlock()
@@ -778,7 +790,7 @@ func (e *Engine) Cancel(id string) bool {
 	}
 	r.mu.Lock()
 	if r.running && r.runSeq == seq {
-		c()
+		c(ErrUserCancelled)
 		consumeCancelledSlotLocked(r, trigger)
 	}
 	r.mu.Unlock()
@@ -834,7 +846,9 @@ func (e *Engine) CancelInFlightRuns() int {
 		running := r.running
 		r.mu.Unlock()
 		if c != nil && running {
-			c()
+			// 导入排空=系统性中止（非用户取消）：不带 ErrUserCancelled
+			// 原因——业务侧不推进排程槽，导入完成后到期轮补跑。
+			c(nil)
 			cancelled++
 		}
 	}
@@ -903,6 +917,12 @@ func (e *Engine) StartLoop(id string) {
 	if r == nil {
 		return
 	}
+	// 触发类无调度语义（标准 §4：显示禁用开关）——引擎侧纵深守卫：handler
+	// 门是唯一拒绝点时，任何代码路径（自动唤醒/测试装配/未来调用方）都能让
+	// loop_on 假开，并触发调度侧副作用（ResetScheduleProgress/lastCheck）。
+	if r.desc.Kind == KindOneshot {
+		return
+	}
 	r.mu.Lock()
 	wasOn := r.loopEnabled
 	r.loopEnabled = true
@@ -946,6 +966,10 @@ func (e *Engine) RearmLoop(id string, hasWork ...bool) {
 	r := e.regs[id]
 	e.mu.RUnlock()
 	if r == nil {
+		return
+	}
+	// 触发类无调度语义——纵深守卫，见 StartLoop 同位置注释。
+	if r.desc.Kind == KindOneshot {
 		return
 	}
 	绕过 := len(hasWork) > 0
@@ -1023,9 +1047,9 @@ func (e *Engine) StopLoop(id string) {
 	c := r.cancel
 	r.mu.Unlock()
 
-	// Daemon：取消 Run 的 ctx
+	// Daemon：取消 Run 的 ctx（启停管理=系统性中止，非用户取消）
 	if r.desc.Kind == KindDaemon && c != nil {
-		c()
+		c(nil)
 	}
 }
 
@@ -1050,11 +1074,11 @@ func (e *Engine) IsRunning(id string) bool {
 
 // ---- Daemon 生命周期 ----
 
-func (e *Engine) startDaemon(id string, r *registration, ctx context.Context, cancel context.CancelFunc) bool {
+func (e *Engine) startDaemon(id string, r *registration, ctx context.Context, cancel context.CancelCauseFunc) bool {
 	e.mu.RLock()
 	if e.stopped.Load() {
 		e.mu.RUnlock()
-		cancel()
+		cancel(nil)
 		r.mu.Lock()
 		r.running = false
 		r.cancel = nil
@@ -1342,7 +1366,7 @@ type runReservation struct {
 	engine *Engine
 	r      *registration
 	ctx    context.Context
-	cancel context.CancelFunc
+	cancel context.CancelCauseFunc
 	// suppressRunRow 为 true 时不落 task_runs 行（RunSyncQuiet 高频重试路径）。
 	suppressRunRow bool
 }
@@ -1353,7 +1377,7 @@ func (res *runReservation) release() {
 	res.r.cancel = nil
 	res.r.runTrigger = ""
 	res.r.mu.Unlock()
-	res.cancel()
+	res.cancel(nil) // 执行结束的资源回收，不携带取消原因
 	res.engine.inFlight.Add(-1)
 	res.engine.runWG.Done()
 }
@@ -1469,7 +1493,7 @@ func (e *Engine) reserveRunInternal(id, trigger string, admission Kind, beat tim
 	if admission == KindPeriodic {
 		r.lastCheck = beat
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancelCause(context.Background())
 	r.cancel = cancel
 	// Stop×runNow 竞态兜底——本临界区登记前 Stop() 可能
 	// 已完成 regs 的 cancel 遍历（未及本次登记）；临界区内复核 stopped，
@@ -1479,7 +1503,7 @@ func (e *Engine) reserveRunInternal(id, trigger string, admission Kind, beat tim
 	r.mu.Unlock()
 	e.roleMu.RUnlock()
 	if stopAfterRegister {
-		cancel()
+		cancel(nil) // 引擎停止=系统性中止，非用户取消
 	}
 	return &runReservation{engine: e, r: r, ctx: ctx, cancel: cancel}, nil
 }
@@ -2255,21 +2279,44 @@ func globalInsertRunAt(taskID, family, trigger, startedAt, operator string) int6
 // finishRunWithMessage / RecordRunFinish 三入口共用，避免 SQL/告警文案三份
 // 同形漂移）。nil 库与非法 runID 守卫内置；空 message 不写 message 列
 // （既有行语义：无消息=NULL，读侧 COALESCE 归一为空串）。
+//
+// 更新失败按有界退避重试（SQLITE_BUSY/瞬断）——无条件放弃会让该行滞留
+// running 直到进程重启被 RecoverOrphans 回收，任务视图在此期间恒显
+// 「运行中」且「运行」按钮被禁用（无失败行、无告警）。重试用尽仍失败只记
+// WARNING（兜底归启动回收），不阻塞执行主流程。
+const (
+	terminalWriteAttempts   = 3
+	terminalWriteRetryDelay = 150 * time.Millisecond
+)
+
+// taskRunTerminalExec 终态 UPDATE 的执行缝（生产恒等 db.DB.Exec）：
+// 重试语义（瞬时失败后成功）需要可注入的首轮失败才能验证，与同包其他
+// 故障注入缝同模式。
+var taskRunTerminalExec = func(query string, args ...any) (sql.Result, error) {
+	return db.DB.Exec(query, args...)
+}
+
 func updateTaskRunTerminal(runID int64, status string, durMs int64, message string) {
 	if runID <= 0 || db.DB == nil {
 		return
 	}
-	// 终态更新失败留痕——否则该行滞留 running 终态，
-	// 只能等进程重启被 RecoverOrphans 回收成 interrupted（失真）。
+	// finished_at 在首次尝试前定值：重试不改变实际结束时刻。
+	finishedAt := engineNowStr()
 	var err error
-	if message != "" {
-		_, err = db.DB.Exec(`UPDATE task_runs SET status=?, finished_at=?, duration_ms=?, message=? WHERE id=?`, status, engineNowStr(), durMs, message, runID)
-	} else {
-		_, err = db.DB.Exec(`UPDATE task_runs SET status=?, finished_at=?, duration_ms=? WHERE id=?`, status, engineNowStr(), durMs, runID)
+	for attempt := 1; attempt <= terminalWriteAttempts; attempt++ {
+		if message != "" {
+			_, err = taskRunTerminalExec(`UPDATE task_runs SET status=?, finished_at=?, duration_ms=?, message=? WHERE id=?`, status, finishedAt, durMs, message, runID)
+		} else {
+			_, err = taskRunTerminalExec(`UPDATE task_runs SET status=?, finished_at=?, duration_ms=? WHERE id=?`, status, finishedAt, durMs, runID)
+		}
+		if err == nil {
+			return
+		}
+		if attempt < terminalWriteAttempts {
+			time.Sleep(terminalWriteRetryDelay * time.Duration(attempt))
+		}
 	}
-	if err != nil {
-		log.Printf("WARNING: taskengine: task_runs 终态更新失败（run=%d 滞留 running，目标=%s）: %v", runID, status, err)
-	}
+	log.Printf("WARNING: taskengine: task_runs 终态更新失败（run=%d 滞留 running，目标=%s，已重试 %d 次）: %v", runID, status, terminalWriteAttempts, err)
 }
 
 func (e *Engine) finishRun(runID int64, status string, durMs int64) {
@@ -2312,6 +2359,10 @@ type TaskMeta struct {
 	// 与用户主动停止同形——监控据此把永久停摆呈现为 failed）。
 	RestartExhausted bool `json:"restart_exhausted,omitempty"`
 	CanTrigger       bool `json:"can_trigger"`
+	// RoleApplicable 本节点角色是否允许该任务运行（RunsOn 派生的只读结论）。
+	// 从节点上 master-only 族的 LoopOn/NextSlot 仍是主节点语义的值，视图
+	// 据此标注「仅主节点运行」并解释调度开关不可用——不暴露原始角色取值。
+	RoleApplicable bool `json:"role_applicable"`
 }
 
 // Lookup 单任务元数据（handler 为取单字段跑全量 DescribeAll
@@ -2347,6 +2398,7 @@ func buildTaskMeta(id string, d Descriptor, loopOn, running, exhausted, roleAllo
 		Running:          running,
 		Controllable:     d.Kind == KindDaemon, // 常驻族可启停（真实生命周期挂钩）
 		RestartExhausted: exhausted,
+		RoleApplicable:   roleAllows,
 	}
 	if d.Kind == KindPeriodic && d.IntervalFn != nil {
 		m.IntervalSec = int(safeInterval(id+".IntervalFn", d.IntervalFn).Seconds())

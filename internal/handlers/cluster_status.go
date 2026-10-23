@@ -17,6 +17,9 @@ import (
 const clusterReportMaxBytes = 64 << 10
 
 func (h *Handlers) GetClusterStatus(c *gin.Context) {
+	if !h.requireClusterService(c) {
+		return
+	}
 	status, err := h.clusterService.Status(c.Request.Context())
 	if err != nil {
 		clusterError(c, http.StatusInternalServerError, "读取集群状态失败", err)

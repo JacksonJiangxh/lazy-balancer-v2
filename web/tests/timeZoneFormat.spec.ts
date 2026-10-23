@@ -7,6 +7,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { DEFAULT_TZ, createTzFormatter, formatDateParts, parseDbDateMs } from '../src/utils/timeZoneFormat.ts'
+import { repoSource } from './_helpers.ts'
 
 const formatInTz = (d: Date, timeZone: string, withTime = true): string =>
   formatDateParts(d, createTzFormatter(timeZone, withTime), withTime)
@@ -32,7 +33,9 @@ test('日期段与时间段时间基准一致（00:00:00 与当日日期同属�
 })
 
 test('默认时区常量与后端 db.go 的 DefaultTimezone 同源（跨栈钉）', () => {
-  assert.equal(DEFAULT_TZ, 'Asia/Shanghai')
+  const declared = /DefaultTimezone\s*=\s*"([^"]+)"/.exec(repoSource('internal/db/db.go'))?.[1]
+  assert.ok(declared, 'db.go 缺 DefaultTimezone 常量声明')
+  assert.equal(DEFAULT_TZ, declared, '配置落地前的回退时区必须与后端治理默认同值，否则时间显示错区')
 })
 
 test('DB 墙钟串（空格分隔）按 UTC 解析——裸 new Date 在 Safari 返回 NaN 的守卫', () => {

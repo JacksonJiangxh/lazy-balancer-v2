@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -1385,9 +1386,19 @@ func parseRuleMetricsFromPrometheus(body, domain string, listenPort int, enableT
 // system.go，caddy.go 漏网）：startOffset 非零时窗口首字节可能落在某行中段
 // （切在多字节 rune 中间时残段带无效字节，JSON 编码后以 U+FFFD 污染输出），
 // 丢弃到下一 '\n' 为止；窗口内无 '\n' 则整窗是同一巨行的中段，返回空。
-func tailLogWindow(data []byte, startOffset int64) []byte {
+//
+// 起点也可能恰为行首（调用方按 size-窗口 取任意字节偏移）：此时首行是完整行，
+// 不得丢弃。边界只能回读 src 的 startOffset-1 字节判定（窗口数据自身看不出），
+// 读不到时按行中段保守丢弃——宁丢一行残段，不输出半行。
+func tailLogWindow(src io.ReaderAt, data []byte, startOffset int64) []byte {
 	if startOffset <= 0 {
 		return data
+	}
+	if src != nil {
+		var prev [1]byte
+		if _, err := src.ReadAt(prev[:], startOffset-1); err == nil && prev[0] == '\n' {
+			return data
+		}
 	}
 	if idx := bytes.IndexByte(data, '\n'); idx >= 0 {
 		return data[idx+1:]

@@ -164,3 +164,80 @@ func TestGetSystemTaskHistory_certJobFlatUTCLayout(t *testing.T) {
 		t.Fatalf("duration_ms=%d, want 5000", run.DurationMs)
 	}
 }
+
+// Given 同一 cert_jobs 行（created_at/updated_at 均存在）；引擎已装配以便取列表。
+// When 分别请求任务列表与 cert-job 历史。
+// Then 三个时间字段逐字段相等（列表=历史同源映射）。此前列表把 updated_at
+// 当开始时间且 DurationMs 恒 0，同一行在列表与历史呈现互相矛盾的时间语义。
+func TestCertJobTimes_listMatchesHistory(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	initTaskEngineForTest(t)
+	if _, err := services.ConfigureLocation("Asia/Shanghai"); err != nil {
+		t.Fatalf("configure location: %v", err)
+	}
+	t.Cleanup(func() { _, _ = services.ConfigureLocation("Asia/Shanghai") })
+
+	result, err := db.DB.Exec(`INSERT INTO cert_jobs (rule_id, domain, status, message, created_at, updated_at)
+		VALUES ('lb_t3','t3.example.test','issued','签发完成','2026-10-20T04:00:00Z','2026-10-20T04:00:05Z')`)
+	if err != nil {
+		t.Fatalf("seed cert job: %v", err)
+	}
+	jobID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskID := "cert-job:" + strconv.FormatInt(jobID, 10)
+
+	recorder, history := getTaskHistory(t, h.GetSystemTaskHistory, taskID)
+	if recorder.Code != http.StatusOK || len(history.Data.Runs) != 1 {
+		t.Fatalf("历史 status=%d runs=%d, want 200/1", recorder.Code, len(history.Data.Runs))
+	}
+	run := history.Data.Runs[0]
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/system/tasks", h.ListSystemTasks)
+	listRecorder := httptest.NewRecorder()
+	router.ServeHTTP(listRecorder, httptest.NewRequest(http.MethodGet, "/system/tasks", nil))
+	if listRecorder.Code != http.StatusOK {
+		t.Fatalf("列表 status=%d body=%s", listRecorder.Code, listRecorder.Body.String())
+	}
+	var payload struct {
+		Data struct {
+			Tasks []struct {
+				ID      string `json:"id"`
+				LastRun *struct {
+					StartedAt  string `json:"started_at"`
+					FinishedAt string `json:"finished_at"`
+					DurationMs int64  `json:"duration_ms"`
+				} `json:"last_run"`
+			} `json:"tasks"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(listRecorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	var lastRun *struct {
+		StartedAt  string `json:"started_at"`
+		FinishedAt string `json:"finished_at"`
+		DurationMs int64  `json:"duration_ms"`
+	}
+	for _, tk := range payload.Data.Tasks {
+		if tk.ID == taskID {
+			lastRun = tk.LastRun
+			break
+		}
+	}
+	if lastRun == nil {
+		t.Fatalf("列表缺少 %s 行", taskID)
+	}
+	if lastRun.StartedAt != run.StartedAt || lastRun.FinishedAt != run.FinishedAt || lastRun.DurationMs != run.DurationMs {
+		t.Fatalf("列表时间=(%q,%q,%d) 与历史=(%q,%q,%d) 不一致（须同源映射）",
+			lastRun.StartedAt, lastRun.FinishedAt, lastRun.DurationMs,
+			run.StartedAt, run.FinishedAt, run.DurationMs)
+	}
+	if run.StartedAt != "2026-10-20 12:00:00" || run.FinishedAt != "2026-10-20 12:00:05" || run.DurationMs != 5000 {
+		t.Fatalf("时间口径=(%q,%q,%d), want started=created_at/finished=updated_at/duration=5000",
+			run.StartedAt, run.FinishedAt, run.DurationMs)
+	}
+}

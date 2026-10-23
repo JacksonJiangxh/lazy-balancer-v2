@@ -108,6 +108,91 @@ func TestEnsureSetupAdminFlag_noEnabledAdminIsNoop(t *testing.T) {
 	}
 }
 
+// 多名启用管理员同时带标记（导入带外改过的备份/集群快照逐行写列的形态）必须
+// 收敛为单条；否则补标分支（要求「没有任何启用管理员带标记」）不命中，标记永久
+// 滞留——被标记的账号在 handlers 里都判为「初始管理员不可删除/禁用/降级」。
+func TestEnsureSetupAdminFlag_collapsesDuplicateMarkers(t *testing.T) {
+	database := seedSetupAdminFixture(t, `INSERT INTO users (id,username,password_hash,role,is_enabled,is_setup_admin) VALUES
+		(3,'admin-enabled','h','admin',1,0),
+		(7,'admin-flagged-a','h','admin',1,1),
+		(9,'admin-flagged-b','h','admin',1,1)`)
+
+	if err := EnsureSetupAdminFlag(context.Background(), database); err != nil {
+		t.Fatalf("ensure flag: %v", err)
+	}
+	flags := setupAdminFlags(t, database)
+	if flags[3] != 1 || flags[7] != 0 || flags[9] != 0 {
+		t.Fatalf("flags=%v, want 仅最低 id 的启用管理员(3) 带标记", flags)
+	}
+
+	// 最低 id 已带标记、更高 id 也带标记：只清多余，不动最低 id。
+	second := seedSetupAdminFixture(t, `INSERT INTO users (id,username,password_hash,role,is_enabled,is_setup_admin) VALUES
+		(4,'admin-flagged-low','h','admin',1,1),
+		(8,'admin-flagged-high','h','admin',1,1)`)
+	if err := EnsureSetupAdminFlag(context.Background(), second); err != nil {
+		t.Fatalf("ensure flag: %v", err)
+	}
+	if flags := setupAdminFlags(t, second); flags[4] != 1 || flags[8] != 0 {
+		t.Fatalf("flags=%v, want 4 保持标记且 8 清零", flags)
+	}
+}
+
+// recordingSetupAdminExecer 统计「实际改动了行的语句数」——稳态（恰一个启用
+// 管理员带标记）归一的语义是零行改写，重启不得反复重写标记列。
+type recordingSetupAdminExecer struct {
+	*sql.DB
+	changedRows int
+}
+
+func (r *recordingSetupAdminExecer) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	result, err := r.DB.ExecContext(ctx, query, args...)
+	if err != nil {
+		return result, err
+	}
+	if affected, err := result.RowsAffected(); err == nil && affected > 0 {
+		r.changedRows++
+	}
+	return result, nil
+}
+
+func TestEnsureSetupAdminFlag_steadyStateWritesNoRows(t *testing.T) {
+	database := seedSetupAdminFixture(t, `INSERT INTO users (id,username,password_hash,role,is_enabled,is_setup_admin) VALUES
+		(2,'plain-user','h','user',1,0),
+		(5,'admin-entry','h','admin',1,1),
+		(6,'admin-other','h','admin',1,0)`)
+
+	recorder := &recordingSetupAdminExecer{DB: database}
+	if err := EnsureSetupAdminFlag(context.Background(), recorder); err != nil {
+		t.Fatalf("ensure flag: %v", err)
+	}
+	if recorder.changedRows != 0 {
+		t.Fatalf("changed rows=%d, want 0（稳态零行改写）", recorder.changedRows)
+	}
+	if flags := setupAdminFlags(t, database); flags[5] != 1 || flags[2] != 0 || flags[6] != 0 {
+		t.Fatalf("flags=%v, want 标记保持 5", flags)
+	}
+}
+
+// 单标记不迁移：集群快照/备份载荷显式把标记落在非最低 id 的管理员上（id=4，
+// 最低启用管理员是 id=1）时，归一无权改写——载荷即主端事实，清零后再补标到
+// 最低 id 等于篡改还原结果。
+func TestEnsureSetupAdminFlag_keepsSingleExplicitMarkerOffLowestID(t *testing.T) {
+	database := seedSetupAdminFixture(t, `INSERT INTO users (id,username,password_hash,role,is_enabled,is_setup_admin) VALUES
+		(1,'plain-admin','h','admin',1,0),
+		(4,'setup-admin','h','admin',1,1)`)
+
+	recorder := &recordingSetupAdminExecer{DB: database}
+	if err := EnsureSetupAdminFlag(context.Background(), recorder); err != nil {
+		t.Fatalf("ensure flag: %v", err)
+	}
+	if flags := setupAdminFlags(t, database); flags[4] != 1 || flags[1] != 0 {
+		t.Fatalf("flags=%v, want 显式标记保持 4（不得迁移到最低 id 1）", flags)
+	}
+	if recorder.changedRows != 0 {
+		t.Fatalf("changed rows=%d, want 0（单标记稳态零行改写）", recorder.changedRows)
+	}
+}
+
 func TestIsSetupAdmin_fallsBackWhenNoMarker(t *testing.T) {
 	database := seedSetupAdminFixture(t, `INSERT INTO users (id,username,password_hash,role,is_enabled) VALUES
 		(1,'first-admin','h','admin',1),

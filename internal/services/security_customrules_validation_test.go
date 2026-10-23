@@ -136,6 +136,68 @@ func TestValidateCustomRulePattern_operatorAwareTrailingBackslashMessage(t *test
 	}
 }
 
+// customRuleEmissionIssue 的三条发射守卫（单条坏规则不得拖垮整站）：
+// 负 id（与引擎 body processor id 冲突/负 SecRule id）、规则名控制字符/双引号
+// （提前闭合 msg 动作）、非 regex 运算符的 %{...} 宏（语义静默动态化且畸形宏
+// 使整份配置编译失败）。每条同时钉 direct 判定与渲染级跳过（产物仍可编译）。
+func TestCustomRuleEmissionIssue_guards(t *testing.T) {
+	cases := []struct {
+		name    string
+		rule    models.CustomRule
+		wantSub string
+	}{
+		{
+			name:    "负 id",
+			rule:    models.CustomRule{ID: -9990, Name: "坏id", Enabled: true, Action: "block", Score: 5, Conditions: []models.CustomRuleCondition{{Target: "uri", Operator: "contains", Pattern: "/x"}}},
+			wantSub: "规则 id 为负数",
+		},
+		{
+			name:    "规则名双引号",
+			rule:    models.CustomRule{ID: 7, Name: `闭合"攻击`, Enabled: true, Action: "block", Score: 5, Conditions: []models.CustomRuleCondition{{Target: "uri", Operator: "contains", Pattern: "/x"}}},
+			wantSub: "规则名称含控制字符或双引号",
+		},
+		{
+			name:    "规则名控制字符",
+			rule:    models.CustomRule{ID: 8, Name: "换行\n注入", Enabled: true, Action: "block", Score: 5, Conditions: []models.CustomRuleCondition{{Target: "uri", Operator: "contains", Pattern: "/x"}}},
+			wantSub: "规则名称含控制字符或双引号",
+		},
+		{
+			name:    "非 regex 宏",
+			rule:    models.CustomRule{ID: 9, Name: "宏规则", Enabled: true, Action: "block", Score: 5, Conditions: []models.CustomRuleCondition{{Target: "uri", Operator: "contains", Pattern: "%{tx.var}"}}},
+			wantSub: "该运算符不支持 %{...} 宏语法",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if issue := customRuleEmissionIssue(tc.rule); !strings.Contains(issue, tc.wantSub) {
+				t.Fatalf("customRuleEmissionIssue=%q, want 含 %q", issue, tc.wantSub)
+			}
+		})
+	}
+
+	// 渲染级：坏规则不得进入发射产物，且（合法规则存在时）产物仍被引擎接受。
+	policy := &models.SecurityPolicy{
+		AnomalyThreshold: 5,
+		Mode:             "custom_only",
+		CustomRules: json.RawMessage(`[
+			{"id":-9990,"name":"负id","enabled":true,"action":"block","score":5,"conditions":[{"target":"uri","operator":"contains","pattern":"/neg"}]},
+			{"id":8,"name":"闭合\"注入","enabled":true,"action":"block","score":5,"conditions":[{"target":"uri","operator":"contains","pattern":"/quote"}]},
+			{"id":9,"name":"宏规则","enabled":true,"action":"block","score":5,"conditions":[{"target":"uri","operator":"contains","pattern":"%{tx.var}"}]},
+			{"id":10,"name":"合法规则","enabled":true,"action":"block","score":5,"conditions":[{"target":"uri","operator":"contains","pattern":"/ok"}]}
+		]`),
+	}
+	directives := mustDirectives(BuildCorazaDirectives(policy, nil, "", false, 0, "lb_test"))
+	for _, forbidden := range []string{"负id", `闭合"注入`, "宏规则"} {
+		if strings.Contains(directives, forbidden) {
+			t.Fatalf("坏规则不得发射（%q 泄漏进产物）:\n%s", forbidden, directives)
+		}
+	}
+	if !strings.Contains(directives, "id:10010,") {
+		t.Fatalf("合法规则必须发射（emit id=DB id+10000）:\n%s", directives)
+	}
+	compileForEngineGate(t, directives)
+}
+
 func TestValidateCustomRulesJSON_rejectsPlaceholderEntry(t *testing.T) {
 	err := ValidateCustomRulesJSON(`[{"id":1,"name":"占位","enabled":true}]`)
 	if err == nil || !strings.Contains(err.Error(), "至少需要一个匹配条件") {

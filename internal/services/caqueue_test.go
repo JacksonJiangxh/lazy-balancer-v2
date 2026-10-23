@@ -648,7 +648,6 @@ func TestCAQueueManager_PauseAndDrain_cancels_pending_and_waits_for_running(t *t
 	started := make(chan struct{})
 	finished := make(chan struct{})
 	queue := newCAQueue(models.CAProvider{ID: 1, MaxConcurrent: 1}, nil)
-	go queue.loop()
 	queue.executeFn = func(ctx context.Context, _ queueItem, _ models.CAProvider) error {
 		close(started)
 		<-ctx.Done()
@@ -663,6 +662,10 @@ func TestCAQueueManager_PauseAndDrain_cancels_pending_and_waits_for_running(t *t
 	if !ok {
 		t.Fatal("pending execution was not prepared")
 	}
+	// loop 必须在 prepare 之后启动：loop 先行会抢先消费 pending 首项，
+	// 使上面的 prepare 落空（断言随机失败）；此时 running 已占满配额，
+	// loop 只负责后续调度，不再抢走第二项。
+	go queue.loop()
 	go queue.execute(execution)
 	<-started
 	manager := &CAQueueManager{queues: map[int]*caQueue{1: queue}, active: true}
@@ -696,7 +699,6 @@ func TestCAQueueManager_PauseAndDrain_rejects_until_resume(t *testing.T) {
 	started := make(chan struct{})
 	finished := make(chan struct{})
 	queue := newCAQueue(models.CAProvider{ID: 1, MaxConcurrent: 1}, nil)
-	go queue.loop()
 	queue.executeFn = func(ctx context.Context, _ queueItem, _ models.CAProvider) error {
 		close(started)
 		<-ctx.Done()
@@ -710,6 +712,8 @@ func TestCAQueueManager_PauseAndDrain_rejects_until_resume(t *testing.T) {
 	if !ok {
 		t.Fatal("pending execution was not prepared")
 	}
+	// 先 prepare 再启动 loop：loop 先行会抢走唯一 pending 项。
+	go queue.loop()
 	go queue.execute(execution)
 	<-started
 	manager := &CAQueueManager{queues: map[int]*caQueue{1: queue}, active: true}
@@ -984,7 +988,6 @@ func TestCAQueue_execute_requeues_job_when_lifecycle_is_canceled(t *testing.T) {
 	}
 	started := make(chan struct{})
 	queue := newCAQueue(models.CAProvider{ID: 1, MaxConcurrent: 1}, nil)
-	go queue.loop()
 	queue.executeFn = func(ctx context.Context, _ queueItem, _ models.CAProvider) error {
 		close(started)
 		<-ctx.Done()
@@ -997,6 +1000,8 @@ func TestCAQueue_execute_requeues_job_when_lifecycle_is_canceled(t *testing.T) {
 	if !ok {
 		t.Fatal("pending execution was not prepared")
 	}
+	// 先 prepare 再启动 loop：loop 先行会抢走唯一 pending 项。
+	go queue.loop()
 	go queue.execute(execution)
 	<-started
 	manager := &CAQueueManager{queues: map[int]*caQueue{1: queue}, active: true}
@@ -1041,7 +1046,6 @@ func TestCAQueueManager_PauseAndDrain_timeout_straggler_not_double_executed(t *t
 	release := make(chan struct{})
 	var executionCount atomic.Int32
 	queue := newCAQueue(models.CAProvider{ID: 7, MaxConcurrent: 1}, nil)
-	go queue.loop()
 	queue.executeFn = func(ctx context.Context, _ queueItem, _ models.CAProvider) error {
 		executionCount.Add(1)
 		startedOnce.Do(func() { close(started) })
@@ -1055,6 +1059,8 @@ func TestCAQueueManager_PauseAndDrain_timeout_straggler_not_double_executed(t *t
 	if !ok {
 		t.Fatal("pending execution was not prepared")
 	}
+	// 先 prepare 再启动 loop：loop 先行会抢走唯一 pending 项。
+	go queue.loop()
 	go queue.execute(execution)
 	<-started
 	manager := &CAQueueManager{queues: map[int]*caQueue{7: queue}, active: true}

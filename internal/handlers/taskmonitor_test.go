@@ -5,8 +5,10 @@ package handlers
 // 此处测 handler 内的门与映射）。
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -389,6 +391,78 @@ func TestSystemTaskLogPath_certJobAndFallbackShapes(t *testing.T) {
 	t.Cleanup(func() { db.DB = oldDB; db.SetDB(oldDB) })
 	if got, err := systemTaskLogPath(fmt.Sprintf("cert-job:%d", validJobID)); err != nil || got != "" {
 		t.Fatalf("nil DB path=%q err=%v, want empty path", got, err)
+	}
+}
+
+// Given cert_jobs 不可读（路径解析失败）与日志目录不可搜索（stat 失败）两种内部故障。
+// When 请求任务日志端点（业务读面：全部登录用户可读）。
+// Then 500 + 固定文案；响应体不得回显驱动/schema/路径细节，原始错误只进应用日志。
+func TestGetSystemTaskLogs_hidesInternalErrorDetails(t *testing.T) {
+	var applogs bytes.Buffer
+	oldWriter := log.Writer()
+	log.SetOutput(&applogs)
+	t.Cleanup(func() { log.SetOutput(oldWriter) })
+
+	newBackupTestHandlers(t)
+	router := gin.New()
+	h := &Handlers{}
+	router.GET("/system/tasks/:id/logs", h.GetSystemTaskLogs)
+	request := func(taskID string) *httptest.ResponseRecorder {
+		t.Helper()
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/system/tasks/"+taskID+"/logs", nil))
+		return response
+	}
+
+	// ① 路径解析失败：cert_jobs 查询错误（驱动原文含 schema 信息）。
+	if _, err := db.DB.Exec(`ALTER TABLE cert_jobs RENAME TO cert_jobs_bak`); err != nil {
+		t.Fatalf("rename cert_jobs: %v", err)
+	}
+	response := request("cert-job:1")
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("路径解析失败 status=%d body=%s, want 500", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	if !strings.Contains(body, "任务日志路径解析失败") {
+		t.Fatalf("响应文案=%s, want 固定文案「任务日志路径解析失败」", body)
+	}
+	for _, leaked := range []string{"no such table", "SQLITE", "cert_jobs", ".db"} {
+		if strings.Contains(body, leaked) {
+			t.Fatalf("响应体回显内部细节 %q: %s", leaked, body)
+		}
+	}
+	if !strings.Contains(applogs.String(), "任务日志路径解析失败（cert-job:1）") {
+		t.Fatalf("原始错误未进应用日志: %s", applogs.String())
+	}
+	if _, err := db.DB.Exec(`ALTER TABLE cert_jobs_bak RENAME TO cert_jobs`); err != nil {
+		t.Fatalf("restore cert_jobs: %v", err)
+	}
+
+	// ② 读取失败：日志目录不可搜索（stat 报权限错误）。
+	dir := t.TempDir()
+	oldLogDir := taskengine.LogDir()
+	taskengine.SetLogDir(dir)
+	t.Cleanup(func() { taskengine.SetLogDir(oldLogDir) })
+	if err := os.Chmod(dir, 0); err != nil {
+		t.Fatalf("chmod log dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0755) })
+	applogs.Reset()
+	response = request("crs")
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("读取失败 status=%d body=%s, want 500", response.Code, response.Body.String())
+	}
+	body = response.Body.String()
+	if !strings.Contains(body, "任务日志读取失败") {
+		t.Fatalf("响应文案=%s, want 固定文案「任务日志读取失败」", body)
+	}
+	for _, leaked := range []string{"permission denied", "no such file", dir} {
+		if strings.Contains(body, leaked) {
+			t.Fatalf("响应体回显内部细节 %q: %s", leaked, body)
+		}
+	}
+	if !strings.Contains(applogs.String(), "任务日志读取失败（crs, stat）") {
+		t.Fatalf("原始错误未进应用日志: %s", applogs.String())
 	}
 }
 

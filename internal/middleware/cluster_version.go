@@ -144,6 +144,42 @@ var clusterSyncedTables = []clusterSyncedTable{
 	{name: "security_crawler_sources", snapshotColumns: "id,name,display_name,url,format,update_enabled,entry_count,version,update_status,message,last_checked,next_update,trigger,started_at,finished_at,consecutive_failures"},
 }
 
+// columnSet 构造列名集合（只读查找表，避免调用方按字符串比较）。
+func columnSet(cols ...string) map[string]bool {
+	set := make(map[string]bool, len(cols))
+	for _, col := range cols {
+		set[col] = true
+	}
+	return set
+}
+
+// clusterVersionRuntimeColumns 是「每轮例行检查都会写」的运行态/展示态簿记
+// 列单源，按表登记：这些列参与 bump 判定时，库已是最新版本的常态轮（开始
+// 标记 + 无变化终态）也会让 cluster_version 逐轮 +1 → 全集群 304 门失效、
+// 从节点反复拉取整包快照并重写两表。判定改为「语义列值真实变化」后，运行态
+// 列变化不 bump：从端展示陈旧至下次语义变化（快照 dump 恒携带最新值，自愈），
+// 与威胁/爬虫源已达成的口径一致。
+// users/cert_jobs 的同类守卫例外形态不同（登录热路径、证书成员条件），仍内联
+// 在原处；本清单仅覆盖「例行检查写簿记列」这一族。
+var clusterVersionRuntimeColumns = map[string]map[string]bool{
+	"security_crs_version": columnSet(
+		"update_status", "message", "last_checked", "next_update",
+		"trigger", "started_at", "finished_at",
+	),
+	"security_ip2region_version": columnSet(
+		"update_status", "message", "last_checked", "next_update",
+		"trigger", "started_at", "finished_at",
+	),
+	"security_threat_sources": columnSet(
+		"last_checked", "update_status", "message", "next_update",
+		"trigger", "started_at", "finished_at", "consecutive_failures",
+	),
+	"security_crawler_sources": columnSet(
+		"last_checked", "update_status", "message", "next_update",
+		"trigger", "started_at", "finished_at", "consecutive_failures",
+	),
+}
+
 func installClusterVersionTriggers(database *sql.DB) error {
 	// 逐表逐语句安装触发器（清单=包级单源，对账测试共用）。
 	tables := clusterSyncedTables
@@ -194,20 +230,16 @@ func installClusterVersionTriggers(database *sql.DB) error {
 				}
 				whenClause += " AND (" + strings.Join(valueChange, " OR ") + ")"
 			}
-			// 威胁/爬虫源表的运行态簿记列（update_status/message/
+			// 规则库/威胁库/爬虫库的运行态簿记列（update_status/message/
 			// started_at/finished_at/last_checked/next_update/trigger/
-			// consecutive_failures）每轮更新都会写，SQLite 的 UPDATE OF 只要列
-			// 出现在 SET 即触发（无论值是否变化）——源持续不可达时每轮失败写都
-			// 会 bump cluster_version，304 门失效、从节点反复全量重放。改为「语义
-			// 列值真实变化」守卫（同 users 口径）：version/entry_count/url/format/
-			// 开关等影响从端行为与数据的列变化照常 bump；纯运行态/展示态列
-			// 变化不 bump（从端展示陈旧至下次语义变化，快照 dump 恒携带最新值）。
-			if (table.name == "security_threat_sources" || table.name == "security_crawler_sources") && operation == "UPDATE" {
-				runtimeCols := map[string]bool{
-					"last_checked": true, "update_status": true, "message": true,
-					"next_update": true, "trigger": true, "started_at": true,
-					"finished_at": true, "consecutive_failures": true,
-				}
+			// consecutive_failures）每轮例行检查都会写，SQLite 的 UPDATE OF 只要
+			// 列出现在 SET 即触发（无论值是否变化）——「已是最新版本」的常态轮
+			// 与持续失败轮都会 bump cluster_version，304 门失效、从节点反复全量
+			// 重放。改为「语义列值真实变化」守卫（同 users 口径）：version/
+			// updated_at/auto_update/schedule_days/schedule_time/entry_count/url/
+			// format/开关等影响从端行为与数据的列变化照常 bump；纯运行态/展示态
+			// 列变化不 bump（从端展示陈旧至下次语义变化，快照 dump 恒携带最新值）。
+			if runtimeCols := clusterVersionRuntimeColumns[table.name]; runtimeCols != nil && operation == "UPDATE" {
 				cols := strings.Split(table.snapshotColumns, ",")
 				valueChange := make([]string, 0, len(cols))
 				for _, col := range cols {

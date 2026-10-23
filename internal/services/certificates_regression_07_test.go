@@ -1,7 +1,6 @@
 package services
 
 import (
-	"log"
 	"strings"
 	"testing"
 	"time"
@@ -16,10 +15,7 @@ func TestCheckManualCertExpiration_floorsNonPositiveWarnDays(t *testing.T) {
 	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,domain,protocol,listen_port,enabled,enable_tls,tls_source,tls_cert) VALUES ('lb_manual44','manual44','manual44.test','http',8080,1,1,'manual',?)`, certPEM); err != nil {
 		t.Fatal(err)
 	}
-	var buf strings.Builder
-	oldWriter := log.Writer()
-	log.SetOutput(&buf)
-	t.Cleanup(func() { log.SetOutput(oldWriter) })
+	buf := captureApplicationLogs(t)
 	resetCertificateServiceForTest(t)
 
 	for _, days := range []int{0, -5} {

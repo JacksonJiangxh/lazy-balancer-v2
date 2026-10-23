@@ -188,6 +188,9 @@ const securityBlockPageMaxGlobalCount = 200
 var createSecurityCustomRulePreLockHook func()
 
 func (h *Handlers) CreateSecurityCustomRule(c *gin.Context) {
+	if rejectWriteDuringImport(c, "执行自定义规则写操作") {
+		return
+	}
 	var req models.CreateCustomRuleRequest
 	if !guardConfiguredJSONBody(c) {
 		return
@@ -251,6 +254,9 @@ func (h *Handlers) CreateSecurityCustomRule(c *gin.Context) {
 }
 
 func (h *Handlers) UpdateSecurityCustomRule(c *gin.Context) {
+	if rejectWriteDuringImport(c, "执行自定义规则写操作") {
+		return
+	}
 	id := c.Param("id")
 	if _, ok := parsePositiveNumericID(id); !ok {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "规则 ID 无效"})
@@ -349,6 +355,9 @@ func (h *Handlers) UpdateSecurityCustomRule(c *gin.Context) {
 }
 
 func (h *Handlers) DeleteSecurityCustomRule(c *gin.Context) {
+	if rejectWriteDuringImport(c, "执行自定义规则写操作") {
+		return
+	}
 	// 非规范数字 id 一律 400：SQLite 数值亲和使 '5.0' 等
 	// 形态仍命中 id=5 行——Atoi 失败若放行会跳过下方引用检查后照常删除
 	// （与 DeleteIPList 的 ParseInt 门同族口径）。
@@ -424,8 +433,8 @@ func (h *Handlers) DeleteSecurityCustomRule(c *gin.Context) {
 }
 
 func (h *Handlers) ListSecurityBlockPages(c *gin.Context) {
-	// 引用计数与 DeleteSecurityBlockPage 门同口径（有意设计，历史
-	// 问题 裁定保留）：策略侧仅计启用（禁用策略的配页是休眠配置，删除后
+	// 引用计数与 DeleteSecurityBlockPage 门同口径（有意设计，两种口径的
+	// 取舍已裁定保留）：策略侧仅计启用（禁用策略的配页是休眠配置，删除后
 	// 运行期 JOIN 容忍悬挂）；规则侧阶段页引用全量计（禁用规则重新启用即
 	// 生效，静默丢失引用伤害更大）——两侧口径不同但与删除门逐一对应。
 	rows, err := db.DB.Query(`SELECT bp.id, bp.name, COALESCE(bp.description,''), COALESCE(bp.content,''), COALESCE(bp.content_type,'text/html; charset=utf-8'), COALESCE(bp.is_default,0), COALESCE(bp.is_builtin,0), COALESCE(bp.created_by,0), COALESCE(bp.created_at,''), COALESCE(bp.updated_by,0), COALESCE(bp.updated_at,''),
@@ -461,6 +470,9 @@ func (h *Handlers) ListSecurityBlockPages(c *gin.Context) {
 }
 
 func (h *Handlers) CreateSecurityBlockPage(c *gin.Context) {
+	if rejectWriteDuringImport(c, "执行拦截页写操作") {
+		return
+	}
 	var req models.SecurityBlockPage
 	if !guardConfiguredJSONBody(c) {
 		return
@@ -515,6 +527,9 @@ func (h *Handlers) CreateSecurityBlockPage(c *gin.Context) {
 }
 
 func (h *Handlers) UpdateSecurityBlockPage(c *gin.Context) {
+	if rejectWriteDuringImport(c, "执行拦截页写操作") {
+		return
+	}
 	id := c.Param("id")
 	if _, ok := parsePositiveNumericID(id); !ok {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的拦截页面 ID"})
@@ -603,6 +618,9 @@ func (h *Handlers) UpdateSecurityBlockPage(c *gin.Context) {
 }
 
 func (h *Handlers) DeleteSecurityBlockPage(c *gin.Context) {
+	if rejectWriteDuringImport(c, "执行拦截页写操作") {
+		return
+	}
 	if _, ok := parsePositiveNumericID(c.Param("id")); !ok {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的拦截页面 ID"})
 		return
@@ -1069,6 +1087,9 @@ func validatePolicyReferenceExistence(q policyQueryRower, blockPageID int, custo
 }
 
 func (h *Handlers) CreateSecurityPolicy(c *gin.Context) {
+	if rejectWriteDuringImport(c, "执行安全策略写操作") {
+		return
+	}
 	var req models.CreateSecurityPolicyRequest
 	if !guardConfiguredJSONBody(c) {
 		return
@@ -1579,6 +1600,12 @@ func crsExcludedListRefs(payload string) []int64 {
 }
 
 func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
+	// 导入窗口 fast-fail：security_policies 在导入全量替换清单内，且 Update
+	// 取 caddyOpMu 只串行不 fast-fail——排队到导入提交后会按陈旧 id 把刚恢复
+	// 的策略覆盖成本请求的旧表单（CRS 组/排除规则/限流/名单引用被静默弱化）。
+	if rejectWriteDuringImport(c, "执行安全策略写操作") {
+		return
+	}
 	id := c.Param("id")
 	if _, ok := parsePositiveNumericID(id); !ok {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "策略 ID 无效"})
@@ -2212,7 +2239,22 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 	if req.PolicyType == nil {
 		var merged models.SecurityPolicy
 		if err := scanSecurityPolicyRow(tx.QueryRowContext(c.Request.Context(), `SELECT `+securityPolicySelectColumns+` FROM security_policies WHERE id=?`, id), &merged); err == nil {
-			if inferred := models.InferPolicyType(&merged); inferred != merged.PolicyType {
+			inferred := models.InferPolicyType(&merged)
+			// 单职策略的「顺手加别的阶段」部分更新（如给 stage1 再开限流/
+			// WAF）会把类型静默升格为 mixed，随即锁死「可绑定新规则」资格
+			// （mixed 仅支持更新迁移）——与 Create 侧同口径在落库前拒绝，
+			// 而不是先写后改。mixed 与 ''（待推断存量态，mixed 语义）不拦：
+			// 重推断对它们只做归一。此处尚未提交（失败即回滚），无中间态。
+			if inferred == models.PolicyTypeMixed && merged.PolicyType != models.PolicyTypeMixed && merged.PolicyType != "" {
+				// 存量内容本就跨阶段（旧的脏行/导入残留）时，重推断只是把类型
+				// 归一到内容实际形态，不构成本次请求引入的漂移——放行（否则
+				// 这类行永远只能靠整表单迁移修）。
+				if !storedFound || models.InferPolicyType(&stored) != models.PolicyTypeMixed {
+					c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "策略内容跨多个阶段，请显式按阶段类型（信任名单/IP 访问控制/限流/WAF）分别创建；如需合并能力请使用现有混合策略的更新迁移或拆分"})
+					return
+				}
+			}
+			if inferred != merged.PolicyType {
 				if _, err := tx.ExecContext(c.Request.Context(), "UPDATE security_policies SET policy_type=? WHERE id=?", inferred, id); err != nil {
 					c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "更新策略类型失败"})
 					return
@@ -2386,6 +2428,9 @@ func (h *Handlers) UpdateSecurityPolicy(c *gin.Context) {
 }
 
 func (h *Handlers) DeleteSecurityPolicy(c *gin.Context) {
+	if rejectWriteDuringImport(c, "执行安全策略写操作") {
+		return
+	}
 	if _, ok := parsePositiveNumericID(c.Param("id")); !ok {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的策略 ID"})
 		return
@@ -2440,6 +2485,9 @@ const maxBindingsPerRule = 8
 const maxBatchBindRules = 100
 
 func (h *Handlers) BindRuleToPolicy(c *gin.Context) {
+	if rejectWriteDuringImport(c, "执行安全策略绑定操作") {
+		return
+	}
 	policyID := c.Param("id")
 	// 规范数字 ID 门（同族删除/名单写路径一致）：SQLite INTEGER 亲和会让
 	// "5.0" 命中行 5，而 Atoi("5.0") 失败得到 0 使 mixed 门禁失效。
@@ -2569,6 +2617,9 @@ func (h *Handlers) BindRuleToPolicy(c *gin.Context) {
 // 原子替换一规则的全部策略绑定。校验与替换核心在 setRulePoliciesInTx
 // （与批量端点 /security/rules/policies/batch 同源——单实现）。
 func (h *Handlers) SetRuleSecurityPolicies(c *gin.Context) {
+	if rejectWriteDuringImport(c, "执行安全策略绑定操作") {
+		return
+	}
 	ruleCaddyID := c.Param("caddy_id")
 	var req struct {
 		PolicyIDs []int `json:"policy_ids"`
@@ -2737,6 +2788,9 @@ func normalizeRuleIDs(ids []string) []string {
 // bind 侧与单条 bind/batch-bind 端点同源两道规则级门：maxBindingsPerRule 上限、
 // stage2 唯一绑定。
 func (h *Handlers) BulkUpdatePolicyBindings(c *gin.Context) {
+	if rejectWriteDuringImport(c, "执行安全策略绑定操作") {
+		return
+	}
 	policyID, err := strconv.Atoi(c.Param("id"))
 	if err != nil || policyID <= 0 {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的策略 ID"})
@@ -2954,6 +3008,9 @@ func (h *Handlers) BulkUpdatePolicyBindings(c *gin.Context) {
 // 历史 rule_ids 归一后上限 maxBatchBindRules（100），超限 400
 // 整体拒绝——同族 BulkUpdatePolicyBindings / batch-block-pages 均有上限。
 func (h *Handlers) BatchBindSecurityPolicies(c *gin.Context) {
+	if rejectWriteDuringImport(c, "执行安全策略绑定操作") {
+		return
+	}
 	var req struct {
 		RuleIDs   []string `json:"rule_ids"`
 		PolicyIDs []int    `json:"policy_ids"`
@@ -3170,6 +3227,9 @@ func (h *Handlers) BatchBindSecurityPolicies(c *gin.Context) {
 // 标记）。单事务一次
 // finishTxApply（单渲染）。
 func (h *Handlers) SplitSecurityPolicy(c *gin.Context) {
+	if rejectWriteDuringImport(c, "执行安全策略写操作") {
+		return
+	}
 	// 非规范数字 ID 家族门——SQLite INTEGER 亲和会让
 	// "5.0" 命中行 5，使本端点绕过同族一致的输入门（Delete/Unbind/更新端点
 	// 均在此 400）。
@@ -3451,6 +3511,9 @@ func (h *Handlers) SplitSecurityPolicy(c *gin.Context) {
 }
 
 func (h *Handlers) UnbindRuleFromPolicy(c *gin.Context) {
+	if rejectWriteDuringImport(c, "执行安全策略绑定操作") {
+		return
+	}
 	policyID := c.Param("id")
 	if _, ok := parsePositiveNumericID(policyID); !ok {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "策略 ID 无效"})
@@ -4702,7 +4765,7 @@ func (h *Handlers) GetCRSInfo(c *gin.Context) {
 		autoUpdate                                                                  bool
 	}
 	err := db.DB.QueryRow(`SELECT version, COALESCE(updated_at,''), COALESCE(update_status,'idle'),
-		COALESCE(message,''), COALESCE(next_update,''), COALESCE(last_checked,''), COALESCE(trigger,''), auto_update
+		COALESCE(message,''), COALESCE(next_update,''), COALESCE(last_checked,''), COALESCE(trigger,''), COALESCE(auto_update,1)
 		FROM security_crs_version WHERE id=1`).
 		Scan(&stored.version, &stored.updatedAt, &stored.updateStatus, &stored.message,
 			&stored.nextUpdate, &stored.lastChecked, &stored.trigger, &stored.autoUpdate)
@@ -4982,7 +5045,7 @@ func (h *Handlers) GetIP2RegionInfo(c *gin.Context) {
 		AutoUpdate:   true,
 		UpdateStatus: "idle",
 	}
-	err := db.DB.QueryRow(`SELECT COALESCE(updated_at,''), COALESCE(update_status,'idle'), COALESCE(message,''), COALESCE(trigger,''), COALESCE(last_checked,''), COALESCE(next_update,''), auto_update
+	err := db.DB.QueryRow(`SELECT COALESCE(updated_at,''), COALESCE(update_status,'idle'), COALESCE(message,''), COALESCE(trigger,''), COALESCE(last_checked,''), COALESCE(next_update,''), COALESCE(auto_update,1)
 		FROM security_ip2region_version WHERE id=1`).
 		Scan(&info.UpdatedAt, &info.UpdateStatus, &info.Message, &info.Trigger, &info.LastChecked, &info.NextUpdate, &info.AutoUpdate)
 	// 同 GetCRSInfo——真实 DB 故障 500,仅缺行回落。

@@ -13,7 +13,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -343,34 +342,20 @@ func (h *Handlers) certJobRunHistory(c *gin.Context, taskID string) {
 		Scan(&status, &message, &createdAt, &updatedAt); dbQueryNotFound(c, err, "任务不存在", "certJobRunHistory query job") {
 		return
 	}
-	loc := services.CurrentLocation()
-	parseUTC := func(raw sql.NullString) (time.Time, bool) {
-		if !raw.Valid || strings.TrimSpace(raw.String) == "" {
-			return time.Time{}, false
-		}
-		// 双布局解析单源（services.ParseUTCTimeDual：crsTimeLayout 平面串 +
-		// RFC3339）——仅 RFC3339 的单布局解析在列表达式/驱动形态变化时
-		// 静默归零（时间列空 + duration=0）。解析失败视为不可用，不阻断响应。
-		return services.ParseUTCTimeDual(raw.String)
-	}
-	started, startedOK := parseUTC(createdAt)
-	finished, finishedOK := parseUTC(updatedAt)
+	// 时间口径与任务监控列表同源（services.CertJobRunTimes）：started=created_at、
+	// finished=updated_at、duration=两者差；缺失或不可解析保持零值（不得在
+	// 本层另写一份映射——列表与历史曾各自映射导致同一行时间语义冲突）。
+	startedAt, finishedAt, durationMs := services.CertJobRunTimes(createdAt.String, updatedAt.String)
 	run := taskengine.RunRecord{
-		ID:      int64(jobID),
-		TaskID:  taskID,
-		Family:  "cert-job",
-		Trigger: "queue",
-		Status:  status,
-		Message: message,
-	}
-	if startedOK {
-		run.StartedAt = started.In(loc).Format("2006-01-02 15:04:05")
-	}
-	if finishedOK {
-		run.FinishedAt = finished.In(loc).Format("2006-01-02 15:04:05")
-	}
-	if startedOK && finishedOK && finished.After(started) {
-		run.DurationMs = finished.Sub(started).Milliseconds()
+		ID:         int64(jobID),
+		TaskID:     taskID,
+		Family:     "cert-job",
+		Trigger:    "queue",
+		Status:     status,
+		Message:    message,
+		StartedAt:  startedAt,
+		FinishedAt: finishedAt,
+		DurationMs: durationMs,
 	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"runs": []taskengine.RunRecord{run}}})
 }
@@ -391,7 +376,10 @@ func (h *Handlers) GetSystemTaskLogs(c *gin.Context) {
 	id := c.Param("id")
 	path, err := systemTaskLogPath(id)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "任务日志路径解析失败: " + err.Error()})
+		// 本路由属业务读面（全部登录用户可读）——原始 DB/驱动错误只入库内
+		// 日志，对外保持 500 + 固定文案（不泄露 schema/驱动/挂载路径）。
+		services.Logf("error", "任务日志路径解析失败（%s）: %v", id, err)
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "任务日志路径解析失败"})
 		return
 	}
 	if path == "" {
@@ -402,6 +390,13 @@ func (h *Handlers) GetSystemTaskLogs(c *gin.Context) {
 	// 不把最大 1GB 的任务日志整文件读入内存。
 	const tail = 256 << 10
 	var data []byte
+	// 原始文件系统错误只入库内日志（业务读面对全部登录用户可见，不泄露
+	// 挂载路径/权限细节），对外固定文案 + 保留 500 语义（不改为 404/200，
+	// 避免与「任务不存在」混淆）。
+	failRead := func(stage string, err error) {
+		services.Logf("error", "任务日志读取失败（%s, %s）: %v", id, stage, err)
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "任务日志读取失败"})
+	}
 	info, statErr := os.Stat(path)
 	switch {
 	case statErr == nil:
@@ -411,25 +406,25 @@ func (h *Handlers) GetSystemTaskLogs(c *gin.Context) {
 		}
 		file, err := os.Open(path)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "任务日志读取失败: " + err.Error()})
+			failRead("open", err)
 			return
 		}
 		defer file.Close()
 		if _, err := file.Seek(startOffset, io.SeekStart); err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "任务日志读取失败: " + err.Error()})
+			failRead("seek", err)
 			return
 		}
 		data, err = io.ReadAll(io.LimitReader(file, int64(tail)))
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "任务日志读取失败: " + err.Error()})
+			failRead("read", err)
 			return
 		}
-		data = tailLogWindow(data, startOffset)
+		data = tailLogWindow(file, data, startOffset)
 	case errors.Is(statErr, os.ErrNotExist):
 		// 活动文件缺失（外部删除，或轮转 rename 完成后写入失败）不得直接
 		// 返回空——轮转副本（.1…）可能仍有内容，落入下方统一拼接。
 	default:
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "任务日志读取失败: " + statErr.Error()})
+		failRead("stat", statErr)
 		return
 	}
 	keep := 1 // 普通任务写侧 RotateTaskLogBeforeWrite(..., 1)

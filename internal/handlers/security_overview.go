@@ -41,17 +41,52 @@ func (h *Handlers) GetSecurityRateLimitBlocks(c *gin.Context) {
 	}})
 }
 
+// securityRuleHostMatches 判断指标 host 是否属于规则域名：精确匹配，或规则为
+// *.example.com 通配时匹配其子域（Caddy 通配域不覆盖裸域，与渲染语义一致；
+// 不展开通配会让泛域名规则的限流 chip 恒 0）。
+func securityRuleHostMatches(ruleHost, metricHost string) bool {
+	if ruleHost == "" || metricHost == "" {
+		return false
+	}
+	if ruleHost == metricHost {
+		return true
+	}
+	if rest, ok := strings.CutPrefix(ruleHost, "*."); ok {
+		return strings.HasSuffix(metricHost, "."+rest)
+	}
+	return false
+}
+
 // GetRuleStageStats 返回单规则的三阶段计数（流程抽屉计数 chip）：
 //   - stage1_blocked_24h / stage3_blocked_24h：近 24h 该规则 blocked 安全事件
 //     按 rule_triggered id 形状分桶——阶段 1（IP 访问控制+威胁情报库+地域拦截预检）=
 //     {2,4,7,8,14} ∪ [800000,900000)，其余（CRS 9xxxxx/自定义/合成 id）归阶段 3；
 //   - ratelimit_blocks_reload：Caddy /metrics 429 计数（重载口径，自最近一次
-//     配置重载以来累计）按规则 domain 映射回规则求和——规则域名与 host 标签
-//     不匹配的部署（泛域名/CNAME）显示 0 而非报错（已声明口径，不新造时序）。
+//     配置重载以来累计）按规则 domain + 监听端口映射回规则求和。端口维度不可
+//     省：同域多端口部署下按 host 求和会把各端口规则的计数累加到每条规则上。
+//     域名匹配支持 *.example.com 通配（匹配其子域）；CNAME 等不可见的 host
+//     映射仍显示 0 而非报错（已声明口径，不新造时序）。
 //
 // 429 抓取失败返回 500（与 GetSecurityRateLimitBlocks 同口径：指标不可达与
 // 暂无限流拦截必须可区分，前端 chip 显示「暂无计数」）。
 func (h *Handlers) GetRuleStageStats(c *gin.Context) {
+	ruleCaddyID := c.Param("caddy_id")
+	// 规则存在性判定先于 MetricsDB 分支——零值面板与成功路径同口径
+	// （未知规则一律 404，不得因 metrics 未装配而对任意 caddy_id 返回 200）。
+	var domain string
+	var listenPort int
+	if err := db.DB.QueryRow(`SELECT COALESCE(domain,''), COALESCE(listen_port,0) FROM lb_rules WHERE caddy_id=?`, ruleCaddyID).Scan(&domain, &listenPort); err != nil {
+		// ErrNoRows（规则不存在）与真实 DB 故障分判——前者归 404
+		// not_found，后者保持 500 且 message 归位查询失败（不再借「规则不存在」
+		// 文案）。前端对非 200 一律 stats=null，404 化不改变前端表现。
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "规则不存在"})
+			return
+		}
+		services.Logf("error", "stage-stats read rule domain failed for %s: %v", ruleCaddyID, err)
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "阶段统计查询失败"})
+		return
+	}
 	if db.MetricsDB == nil {
 		// MetricsDB 未装配：与成功路径同键的零统计而非 panic。
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{
@@ -66,7 +101,6 @@ func (h *Handlers) GetRuleStageStats(c *gin.Context) {
 		}})
 		return
 	}
-	ruleCaddyID := c.Param("caddy_id")
 	// 24h 分桶 + 分段耗时经 30s 缓存（规则流程抽屉按秒级轮询/多页签并存，
 	// 单规则 24h 全窗口两次聚合在高事件量下达数百 ms）——与策略 24h 计数
 	// 缓存（security_policy_counts_cache.go）同范式；失败不缓存。
@@ -77,36 +111,34 @@ func (h *Handlers) GetRuleStageStats(c *gin.Context) {
 		return
 	}
 
-	var domain string
-	if err := db.DB.QueryRow(`SELECT COALESCE(domain,'') FROM lb_rules WHERE caddy_id=?`, ruleCaddyID).Scan(&domain); err != nil {
-		// ErrNoRows（规则不存在）与真实 DB 故障分判——前者归 404
-		// not_found，后者保持 500 且 message 归位查询失败（不再借「规则不存在」
-		// 文案）。前端对非 200 一律 stats=null，404 化不改变前端表现。
-		if errors.Is(err, sql.ErrNoRows) {
-			c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "规则不存在"})
-			return
-		}
-		services.Logf("error", "stage-stats read rule domain failed for %s: %v", ruleCaddyID, err)
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "阶段统计查询失败"})
-		return
-	}
 	var ratelimit float64
 	if domain != "" {
-		blocks, err := services.ScrapeRateLimitBlocks(h.cfg.CaddyMetricsURL)
+		// 端口维度：规则只认自己监听端口的 server 分组（http_<listen_port>）。
+		// 同域多端口部署下按 host 求和会把 80/443 两条规则的计数累加到每条
+		// 规则上（chip 被放大成两条之和）。
+		blocks, err := services.ScrapeRateLimitBlocksByHostServer(h.cfg.CaddyMetricsURL)
 		if err != nil {
 			services.Logf("error", "stage-stats scrape rate-limit blocks failed: %v", err)
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "限流拦截数据不可用"})
 			return
 		}
-		ruleHosts := make(map[string]struct{})
+		serverName := fmt.Sprintf("http_%d", listenPort)
+		ruleHosts := make([]string, 0, 2)
 		for _, host := range strings.Split(domain, ",") {
 			if trimmed := services.NormalizeMetricsHost(host); trimmed != "" {
-				ruleHosts[trimmed] = struct{}{}
+				ruleHosts = append(ruleHosts, trimmed)
 			}
 		}
 		for _, block := range blocks {
-			if _, ok := ruleHosts[services.NormalizeMetricsHost(block.Host)]; ok {
-				ratelimit += block.Count
+			if block.Server != serverName {
+				continue
+			}
+			host := services.NormalizeMetricsHost(block.Host)
+			for _, ruleHost := range ruleHosts {
+				if securityRuleHostMatches(ruleHost, host) {
+					ratelimit += block.Count
+					break
+				}
 			}
 		}
 	}
@@ -175,7 +207,10 @@ func loadRuleStageStats(metricsDB *sql.DB, ruleCaddyID string, now time.Time) (r
 	}
 
 	var snapshot ruleStageStatsSnapshot
-	rows, err := metricsDB.Query(`SELECT rule_triggered, COUNT(*) FROM security_events WHERE rule_caddy_id=? AND action='blocked' AND event_time >= datetime('now','-1 day') GROUP BY rule_triggered`, ruleCaddyID)
+	// rule_triggered 列可空（schema 无 NOT NULL，带外/旧快照/集群写入可留 NULL）：
+	// 裸列 Scan 到 string 会让整个端点 500，而事件列表/feed/rollup 同列均已
+	// COALESCE——此处分组与投影同口径收敛 NULL 为空串（归「未归因」桶）。
+	rows, err := metricsDB.Query(`SELECT COALESCE(rule_triggered,''), COUNT(*) FROM security_events WHERE rule_caddy_id=? AND action='blocked' AND event_time >= datetime('now','-1 day') GROUP BY COALESCE(rule_triggered,'')`, ruleCaddyID)
 	if err != nil {
 		return snapshot, err
 	}

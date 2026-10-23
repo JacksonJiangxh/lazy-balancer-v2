@@ -227,3 +227,52 @@ func TestMFAStepUpGuard_slaveWhitelistedClusterRemedyGets428(t *testing.T) {
 		t.Fatalf("slave whitelisted remedy write: got %d, want 428（从节点集群补救通道须保持弹码链可达）", rec.Code)
 	}
 }
+
+// 敏感导出 GET 与写操作同门：covered 的 GET 分支（sensitiveExportGetRoutes）
+// 删掉后此前的用例全绿——只读 API Key 侧有 403 钉测，step-up 侧无。
+// 形态=MFA 用户 + 过期 mfa_ts 请求 GET /config/export → 428；新鲜 mfa_ts
+// 放行（不 428）。
+func TestMFAStepUpGuard_sensitiveExportGetChallenged(t *testing.T) {
+	router := newMiddlewareTestRouter(t)
+
+	username := fmt.Sprintf("export%d", time.Now().UnixNano())
+	res, err := db.DB.Exec("INSERT INTO users (username,password_hash,role,is_enabled,password_version,mfa_enabled) VALUES (?,?,'admin',1,0,1)", username, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := res.LastInsertId()
+	if _, err := db.DB.Exec("UPDATE global_config SET mfa_write_guard=1 WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = db.DB.Exec("UPDATE global_config SET mfa_write_guard=0 WHERE id=1") })
+
+	sign := func(claims jwt.MapClaims) string {
+		t.Helper()
+		claims["user_id"] = float64(id)
+		claims["username"] = username
+		claims["pwd_ver"] = float64(0)
+		claims["jti"] = fmt.Sprintf("e%d", time.Now().UnixNano())
+		claims["exp"] = time.Now().Add(time.Hour).Unix()
+		token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte("test-secret"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return token
+	}
+	getExport := func(token string) int {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/config/export", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	stale := sign(jwt.MapClaims{})
+	if code := getExport(stale); code != http.StatusPreconditionRequired {
+		t.Fatalf("MFA 用户导出配置（过期 mfa_ts）: got %d, want 428（敏感 GET 必须纳入 step-up）", code)
+	}
+	fresh := sign(jwt.MapClaims{"mfa_ts": float64(time.Now().Unix())})
+	if code := getExport(fresh); code == http.StatusPreconditionRequired {
+		t.Fatal("新鲜 mfa_ts 的敏感 GET 不应被弹码")
+	}
+}

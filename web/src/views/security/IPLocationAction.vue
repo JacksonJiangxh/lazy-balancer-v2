@@ -557,22 +557,27 @@ const rowView = (policy: PolicyRow): RowView => {
   view.geoRegions = regionCount > 0 ? regions.map((r) => countryLabel(zh, r)).join('、') : ''
   if (!policy.ip_acl_enabled) {
     // ACL 未启用：如地域拦截在用则明示「地域拦截在用（本事件可来自地域）」；
-    // 关联地址列表动作仍可用（关联后随 ACL 启用生效）。黑白共用
-    // ip_acl_list_refs，动作必须按当前 ip_acl_mode 门控——同时给「拦截」「放行」
-    // 会把条目写进同一字段，ACL 启用后按模式生效，用户意图被反转。
+    // 关联地址列表动作仍可用（条目落库后随 ACL 启用生效），且启用/未启用两态
+    // 动作门控一致。黑白共用 ip_acl_list_refs，动作必须按当前 ip_acl_mode
+    // 门控——同时给「拦截」「放行」会把条目写进同一字段，ACL 启用后按模式
+    // 生效，用户意图被反转。
+    const sides = aclAssociateSides(policy.ip_acl_mode)
+    view.canAssociate = sides.deny
+    view.canAssociateAllow = sides.allow
+    // 模式如实展示：动作集合被模式门控（绕过/空模式不给动作），用户需要
+    // 知道当前生效语义，才不会把「放行/拦截」理解成对两种模式都成立。
+    const modeLabel = policy.ip_acl_mode === 'deny' ? ' · 黑名单模式'
+      : policy.ip_acl_mode === 'allow' ? ' · 白名单模式'
+        : policy.ip_acl_mode === '绕过' ? ' · 免检测模式'
+          : ' · 模式未配置'
     if (geoActive) {
       view.tagType = 'warning'
       view.tagLabel = '地域拦截'
-      // 模式如实展示：动作集合被模式门控（绕过/空模式不给动作），用户需要
-      // 知道当前生效语义，才不会把「放行/拦截」理解成对两种模式都成立。
-      const modeLabel = policy.ip_acl_mode === 'deny' ? ' · 黑名单模式'
-        : policy.ip_acl_mode === 'allow' ? ' · 白名单模式'
-          : policy.ip_acl_mode === '绕过' ? ' · 免检测模式'
-            : ' · 模式未配置'
       view.statusLabel = `地域拦截已启用 · 拦截区域：${view.geoRegions}（IP ACL 未启用${modeLabel}）`
-      const sides = aclAssociateSides(policy.ip_acl_mode)
-      view.canAssociate = sides.deny
-      view.canAssociateAllow = sides.allow
+    } else if (sides.deny || sides.allow) {
+      // 动作在场时状态行带模式，指明条目会写入哪一侧；无动作（绕过/空模式）
+      // 保持默认「IP ACL 未启用」文案
+      view.statusLabel = `IP ACL 未启用${modeLabel}`
     }
     return view
   }

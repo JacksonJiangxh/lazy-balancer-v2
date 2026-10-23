@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -43,14 +44,17 @@ func TestPlanConfigChangesGroupsChangedFields(t *testing.T) {
 	}
 }
 
-func TestPlanConfigChangesEqualDNSCredentials(t *testing.T) {
-	credentials := "id,token"
-	req := models.UpdateConfigRequest{DNSCredentials: &credentials, Source: "acme"}
-	old := configSnapshot{DNSCredentials: credentials}
-
-	plan := planConfigChanges(req, old)
+// 遗留 global_config.dns_credentials：请求体携带该键不再产生变更清单条目
+// （写路径已移除，预览面不得对「不会发生的变化」报变更）。
+func TestPlanConfigChanges_ignoresLegacyDNSCredentials(t *testing.T) {
+	body := `{"source":"acme","dns_provider":"dnspod","dns_credentials":"legacy-id,legacy-token"}`
+	var req models.UpdateConfigRequest
+	if err := json.Unmarshal([]byte(body), &req); err != nil {
+		t.Fatalf("decode request: %v", err)
+	}
+	plan := planConfigChanges(req, configSnapshot{DNSProvider: "dnspod"})
 	if plan.Changed {
-		t.Fatalf("equal DNS credentials marked changed: %#v", plan.SectionChanges)
+		t.Fatalf("legacy dns_provider 未变化时报了变更: %#v", plan.SectionChanges)
 	}
 }
 

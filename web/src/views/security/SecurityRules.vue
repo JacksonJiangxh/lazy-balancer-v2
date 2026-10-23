@@ -79,7 +79,7 @@
     <el-alert v-if="rulesLoadError" type="error" :closable="false" show-icon class="error-banner mb-5">
       <template #title>
         <div class="polling-error-title">
-          <span>CRS 规则文件加载失败，「暂无规则文件」不代表真实状态</span>
+          <span>{{ rules.length === 0 ? 'CRS 规则文件加载失败，「暂无规则文件」不代表真实状态' : 'CRS 规则文件加载失败：当前显示的是上次成功结果（与分页/搜索条件不符）' }}</span>
           <el-button link type="danger" :loading="loadingRules" @click="fetchRules">立即重试</el-button>
         </div>
       </template>
@@ -1507,9 +1507,11 @@ const fetchRules = async () => {
     total.value = res.data?.total || 0
     rulesLoadError.value = false
   } catch {
-    // 失败保留上一页数据（全局拦截器已 toast）；首拉失败时显式横幅，
-    // 不得把失败渲染成「暂无规则文件」。
-    if (rules.value.length === 0) rulesLoadError.value = true
+    // 失败一律进入可见错误态（全局拦截器只 toast 一次）：已有数据时保留上一页
+    // 结果，但横幅明示「当前显示的是上次成功结果」——分页器/搜索框已切到新
+    // 条件而内容仍是旧页时，不再无提示地错配。过期请求的失败不污染当前态。
+    if (requestSeq !== rulesRequestSeq) return
+    rulesLoadError.value = true
   } finally {
     if (requestSeq === rulesRequestSeq) loadingRules.value = false
   }

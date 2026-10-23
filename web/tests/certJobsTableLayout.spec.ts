@@ -92,11 +92,11 @@ test('证书有效期合并单列：日期 + 剩余/已过期天数，精确时�
   assert.doesNotMatch(tableBody, /label="剩余天数"/)
   const body = columnBody('证书有效期')
   assert.match(body, new RegExp(`\\bmin-width="${CERT_JOB_COLUMN_WIDTHS.validity}"`))
-  assert.match(body, /formatDateShort\(row\.expires_at\)/)
+  assert.match(body, /formatDateShort\(effectiveNotAfter\(row\)\)/)
   assert.ok(body.includes('剩 ${row.days_remaining} 天'), '缺少「剩 N 天」分支')
   assert.ok(body.includes('已过期 ${Math.abs(row.days_remaining)} 天'), '缺少「已过期 N 天」分支')
   assert.match(body, /certificateStatus\(row\) === 'expired'/, '过期判据必须复用 certificateStatus')
-  assert.match(body, /<el-tooltip[^>]*:content="formatDate\(row\.expires_at\)"/, '精确过期时间必须进 tooltip')
+  assert.match(body, /<el-tooltip[^>]*:content="formatDate\(effectiveNotAfter\(row\)\)"/, '精确过期时间必须进 tooltip')
   assert.match(body, /class="cell-empty"/, '非 issued/缺失必须沿用 cell-empty 占位')
 })
 

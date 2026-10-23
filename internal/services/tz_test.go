@@ -114,6 +114,44 @@ func TestStopTimezoneRefreshWithin_fastPathDoesNotConsumeBudget(t *testing.T) {
 	}
 }
 
+// 重启路径必须有界（与运行日志尺寸刷新同构）：旧 worker 卡在 DB
+// busy_timeout 时不得无界挂起刷新链启动——超时放弃等待并 warn，新实例接续。
+func TestStartTimezoneRefresh_abandonsStuckWorkerWithinBudget(t *testing.T) {
+	StopTimezoneRefresh() // 停掉 init 启动的真实 worker
+	t.Cleanup(func() {
+		StopTimezoneRefresh()
+		StartTimezoneRefresh(context.Background())
+	})
+
+	stuck := make(chan struct{}) // 永不关闭＝旧 worker 卡在 DB busy_timeout
+	timezoneRefresh.Lock()
+	timezoneRefresh.cancel = func() {}
+	timezoneRefresh.done = stuck
+	timezoneRefresh.Unlock()
+	logs := captureServiceLog(t)
+
+	// When
+	begin := time.Now()
+	StartTimezoneRefresh(context.Background())
+	elapsed := time.Since(begin)
+
+	// Then：等待被预算截断，且有恰一条放弃 warn
+	if elapsed > 3*time.Second {
+		t.Fatalf("重启等待耗时 %s，超出有界预算（%s）", elapsed, timezoneRefreshRestartWaitMax)
+	}
+	if elapsed < timezoneRefreshRestartWaitMax/2 {
+		t.Fatalf("重启等待耗时 %s，未等待预算即放弃（%s）", elapsed, timezoneRefreshRestartWaitMax)
+	}
+	if warns := countLogLines(logs, "未在重启预算"); warns != 1 {
+		t.Fatalf("放弃等待 warn lines=%d, want 1; logs=%s", warns, logs.String())
+	}
+
+	// Then：新实例已接管（旧 worker 的永不退出形态不得被沿用）
+	if !StopTimezoneRefreshWithin(2 * time.Second) {
+		t.Fatal("重启后的 worker 必须在预算内退出")
+	}
+}
+
 func TestApplicationLogWriterFiltersRawStandardLogsAtConfiguredThreshold(t *testing.T) {
 	tests := []struct {
 		name    string

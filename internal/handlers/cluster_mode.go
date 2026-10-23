@@ -20,6 +20,9 @@ func (h *Handlers) SetClusterMode(c *gin.Context) {
 	if rejectNodeWriteDuringImport(c) {
 		return
 	}
+	if !h.requireClusterService(c) {
+		return
+	}
 	if h.syncService == nil {
 		clusterError(c, http.StatusServiceUnavailable, "同步服务未初始化", nil)
 		return
@@ -122,6 +125,9 @@ func (h *Handlers) PromoteClusterNode(c *gin.Context) {
 	if rejectNodeWriteDuringImport(c) {
 		return
 	}
+	if !h.requireClusterService(c) {
+		return
+	}
 	// syncService 缺失判定前置——此前 Promote 已生效才报
 	// 503,调用方见到失败但角色已提升,重试撞 ErrAlreadyMaster。
 	if h.syncService == nil {
@@ -152,6 +158,9 @@ func (h *Handlers) UpdateClusterSettings(c *gin.Context) {
 	// 同步开关与间隔写 global_config，导入窗口内的写入
 	// 会被全量替换覆盖（静默丢失）——与节点写端点同族 fast-fail。
 	if rejectNodeWriteDuringImport(c) {
+		return
+	}
+	if !h.requireClusterService(c) {
 		return
 	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 16<<10)

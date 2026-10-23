@@ -224,6 +224,15 @@ func threatTrafficSnapshot(adminURL string) (gin.H, bool) {
 	return data, ok
 }
 
+// invalidateThreatRollupDimAggregateCache 清空聚合缓存。请求路径刚完成同步固化
+// 后必须调用：固化会改写窗口内分钟行（最新分钟/重固窗口），而缓存键只含
+// sinceMinute/槽界/coverage——不清会让本次响应返回固化前的数据，直到 TTL 过期。
+func invalidateThreatRollupDimAggregateCache() {
+	threatRollupDimAggregateCacheMu.Lock()
+	threatRollupDimAggregateCache = map[threatRollupDimAggregateKey]threatRollupDimAggregateEntry{}
+	threatRollupDimAggregateCacheMu.Unlock()
+}
+
 // resetThreatScreenCachesForTest 测试缝：清空大屏进程内缓存（生产不调用）。
 func resetThreatScreenCachesForTest() {
 	topTargetsCacheMu.Lock()
@@ -258,8 +267,9 @@ type threatRollupDimAggregateKey struct {
 	metrics *sql.DB
 	// sinceMinute 是窗口下界（分钟锚点）：每分钟前移即换键。
 	sinceMinute string
-	// bucketLayout 是槽界签名（首槽 UnixNano + 槽数）：槽界由请求时刻（秒级）
-	// 推导，同分钟内两次请求的槽界可能不同，必须进键，否则落桶错位。
+	// bucketLayout 是槽界签名（首槽 UnixNano + 槽数），槽界在入库前已按分钟
+	// 锚定（threatRollupMinuteAnchoredBuckets）——同分钟内两次请求同键，跨
+	// 分钟/槽数变化即失效，保证落桶与缓存内容一一对应。
 	bucketLayout string
 	// coverage 是固化覆盖水位（coveredFrom）：宽窗口头部回填推进会使同一
 	// 窗口的聚合内容变化——不参与键会把回填中的空/少计结果锁在 30s 缓存里
@@ -285,6 +295,20 @@ func threatRollupBucketLayout(bucketStarts []time.Time) string {
 	return strconv.FormatInt(bucketStarts[0].UnixNano(), 10) + "|" + strconv.Itoa(len(bucketStarts))
 }
 
+// threatRollupMinuteAnchoredBuckets 把槽界归一化到分钟（保留长度与顺序）：
+// 槽界由纳秒精度时钟推导，不归一则缓存键逐请求不同（永不命中）且同一分钟
+// 内两次请求的落桶边界漂移。分钟锚定后查询分桶与缓存键同源。
+func threatRollupMinuteAnchoredBuckets(bucketStarts []time.Time) []time.Time {
+	if len(bucketStarts) == 0 {
+		return bucketStarts
+	}
+	anchored := make([]time.Time, len(bucketStarts))
+	for i, start := range bucketStarts {
+		anchored[i] = start.Truncate(time.Minute)
+	}
+	return anchored
+}
+
 // threatRollupDimAggregateQuery 聚合窗口内 rollup：
 //   - 维度聚合走 SQL GROUP BY——传输行数从「分钟数 × 维度基数」压到「维度
 //     组合数」（30 天 × 每分钟数十~数百行 → 数百~数千行），Go 侧不再逐行 Scan；
@@ -305,6 +329,11 @@ func threatRollupDimAggregateQuery(database *sql.DB, sinceMinute string, bucketS
 	if database == nil {
 		return agg, errors.New("database unavailable")
 	}
+	// 槽界归一化到分钟——槽界由纳秒精度请求时刻推导，逐请求的秒级差异会同时
+	// 漂移聚合分桶与缓存键（键含纳秒级槽界 → 30s 缓存永不命中，与「同屏
+	// 轮询复用一次聚合」的设计承诺相反）。按分钟锚定后同一分钟内两次轮询
+	// 命中同一键且分桶与键同源；槽标签为 HH:MM/MM-DD，分钟锚定不改变可见语义。
+	bucketStarts = threatRollupMinuteAnchoredBuckets(bucketStarts)
 	key := threatRollupDimAggregateKey{
 		metrics:      database,
 		sinceMinute:  sinceMinute,

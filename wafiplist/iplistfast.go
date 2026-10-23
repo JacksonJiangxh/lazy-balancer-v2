@@ -20,6 +20,7 @@ package wafiplist
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -400,6 +401,63 @@ func ipListGenerationChanged(before os.FileInfo, after os.FileInfo, statErr erro
 	return after.Size() != before.Size() || !after.ModTime().Equal(before.ModTime())
 }
 
+// ReadBoundedFile 的可判别失败：调用方按各自语境包装（名单加载器的中文
+// 文案 / 爬虫快照的告警与 fail-closed）。
+var (
+	// ErrFileSizeLimit 文件尺寸超过调用方给定的硬上限。
+	ErrFileSizeLimit = errors.New("file exceeds size limit")
+	// ErrFileRewriteDuringRead 文件在「Stat → 定长读」窗口内被原位改写
+	// （追加/截断/同尺寸改写）：读到的是某一瞬间的前缀或混合字节，不能
+	// 当作完整代际。
+	ErrFileRewriteDuringRead = errors.New("file rewritten during read")
+)
+
+// boundedReadSource 是「可 stat 的读者」：生产恒为 *os.File；测试以替身
+// 注入「stat 形态与读到的内容分属两代」的确定性窗口（无需在 helper 里留
+// 钩子）。
+type boundedReadSource interface {
+	io.Reader
+	Stat() (os.FileInfo, error)
+}
+
+// ReadBoundedFile 按体积上限读取一份可能被并发替换的文件，返回内容与该
+// 内容所属代际的 inode 形态（mtime/size）。名单加载器与爬虫段快照加载器
+// 共用（两处 fail-closed 语义一致，避免第三份实现）。
+//
+// 三条不变量：
+//   - stat 与读针对同一个 fd：rename 换的是路径，fd 指向的 inode 不变，
+//     读到的恒是该 stat 描述的 inode（不能读后按路径再 stat）；
+//   - 定长读：缓冲容量=stat 尺寸，stat 与读之间的追加不会放大实际读入
+//     （只按 stat 判限不构成硬上限）；
+//   - 读后复核同 inode：原位追加/截断/同尺寸原位改写使内容与 (mtime,size)
+//     不再对应一代，返回 ErrFileRewriteDuringRead 让调用方放弃本次加载。
+func ReadBoundedFile(path string, maxBytes int64) ([]byte, os.FileInfo, error) {
+	fd, err := os.Open(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer fd.Close()
+	return readBoundedFrom(fd, path, maxBytes)
+}
+
+func readBoundedFrom(src boundedReadSource, name string, maxBytes int64) ([]byte, os.FileInfo, error) {
+	info, err := src.Stat()
+	if err != nil {
+		return nil, nil, err
+	}
+	if info.Size() > maxBytes {
+		return nil, info, fmt.Errorf("%w: %s (size %d > %d)", ErrFileSizeLimit, name, info.Size(), maxBytes)
+	}
+	raw := make([]byte, info.Size())
+	if _, err := io.ReadFull(src, raw); err != nil {
+		return nil, info, err
+	}
+	if after, statErr := src.Stat(); ipListGenerationChanged(info, after, statErr) {
+		return nil, info, ErrFileRewriteDuringRead
+	}
+	return raw, info, nil
+}
+
 // parseIPListFile 读盘+严格解析+防御性归并（写入侧已聚合，加载侧再跑一次
 // 保证「排序+去重+不相交」检索不变式——二分正确性依赖不相交）。逐条目
 // **只解析一次**（此前「逐行校验解析 → AggregatePrefixes 再解析」
@@ -412,30 +470,16 @@ func ipListGenerationChanged(before os.FileInfo, after os.FileInfo, statErr erro
 // 与 (mtime,size) 必属同一代际，缓存命中判据不会把上一代的 stat 形态贴到新内容上。
 func parseIPListFile(path string) (*ipListFileState, error) {
 	parseCountForTest.Add(1)
-	fd, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("IP 名单读取失败 %q: %w", path, err)
-	}
-	defer fd.Close()
-	info, err := fd.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("IP 名单读取失败 %q: %w", path, err)
-	}
-	if info.Size() > MaxFileBytes {
+	raw, info, err := ReadBoundedFile(path, MaxFileBytes)
+	switch {
+	case errors.Is(err, ErrFileSizeLimit):
 		return nil, fmt.Errorf("IP 名单 %q 超过体积上限 %dMB", path, MaxFileBytes>>20)
-	}
-	// 定长读（容量=stat 尺寸，不放大）：rename 换掉的是路径而非本 fd 指向的
-	// inode，所以读到的恒是该 stat 描述的完整一代内容。
-	raw := make([]byte, info.Size())
-	if _, err := io.ReadFull(fd, raw); err != nil {
-		return nil, fmt.Errorf("IP 名单读取失败 %q: %w", path, err)
-	}
-	// 读后复核同一 inode：若被原位追加/截断/同尺寸原位改写（非 tmp+rename
-	// 的写入方式），读到的只是某一瞬间的前缀或混合字节，不能当作完整代际
-	// ——本次放弃，下次复查重建。只比 size 不够：同尺寸原位改写 size 不变，
-	// 必须同时复核 mtime。
-	if after, statErr := fd.Stat(); ipListGenerationChanged(info, after, statErr) {
+	case errors.Is(err, ErrFileRewriteDuringRead):
+		// 只比 size 不够：同尺寸原位改写 size 不变，必须同时复核 mtime
+		// （ipListGenerationChanged）——本次放弃，下次复查重建。
 		return nil, fmt.Errorf("IP 名单 %q 在读取期间被改写，本次加载放弃", path)
+	case err != nil:
+		return nil, fmt.Errorf("IP 名单读取失败 %q: %w", path, err)
 	}
 	// 容量预估：平均每条约 12 字节，封顶 MaxEntries+1（超限在追加处拦截）。
 	capHint := len(raw)/12 + 1

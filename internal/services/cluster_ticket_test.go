@@ -137,3 +137,80 @@ func TestGenerateLoginTicketRejectsStaleApprovedNode(t *testing.T) {
 		t.Fatalf("fresh node rejected: %v", err)
 	}
 }
+
+// used_login_tickets 的存储契约此前零覆盖（无测试读取 jti_hash 行，也无测试
+// 覆盖过期清理）：票据表无清理会让行数无限增长；清理范围写错（清掉未过期行）
+// 则重放窗口重新打开。三面同时钉住：成功消费落 hex(sha256(jti)) 行、
+// expires_at<=now 的行在下次消费时删除、未过期行不受影响。
+func TestConsumeClusterTicketJTI_storageContract(t *testing.T) {
+	_, database := newClusterTestService(t)
+	ctx := context.Background()
+	now := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
+
+	consume := func(jti string, expiresAt time.Time) bool {
+		t.Helper()
+		tx, err := database.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatalf("begin tx: %v", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+		ok, err := consumeClusterTicketJTI(ctx, tx, jti, now, expiresAt)
+		if err != nil {
+			t.Fatalf("consume %s: %v", jti, err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("commit %s: %v", jti, err)
+		}
+		return ok
+	}
+	jtiHash := func(jti string) string {
+		sum := sha256.Sum256([]byte(jti))
+		return hex.EncodeToString(sum[:])
+	}
+	countRows := func() int {
+		t.Helper()
+		var count int
+		if err := database.QueryRow("SELECT COUNT(*) FROM used_login_tickets").Scan(&count); err != nil {
+			t.Fatalf("count rows: %v", err)
+		}
+		return count
+	}
+	hasRow := func(jti string) bool {
+		t.Helper()
+		var exists int
+		if err := database.QueryRow("SELECT COUNT(*) FROM used_login_tickets WHERE jti_hash=?", jtiHash(jti)).Scan(&exists); err != nil {
+			t.Fatalf("probe row: %v", err)
+		}
+		return exists == 1
+	}
+
+	// (a) 成功消费落 hex(sha256(jti)) 行，重放被拒。
+	if !consume("live-jti", now.Add(5*time.Minute)) {
+		t.Fatal("首次消费必须成功")
+	}
+	if !hasRow("live-jti") {
+		t.Fatal("消费后必须存在 hex(sha256(jti)) 行（重放防护的唯一持久事实）")
+	}
+	if consume("live-jti", now.Add(5*time.Minute)) {
+		t.Fatal("同一 jti 二次消费必须被判为重放")
+	}
+
+	// (b) 过期行在下次消费时被清理。
+	if !consume("stale-jti", now.Add(-time.Minute)) {
+		t.Fatal("前置：过期形态行插入应成功（清理发生在插入之前）")
+	}
+	if !hasRow("stale-jti") {
+		t.Fatal("前置：过期行应先落库（否则本条不构成清理证据）")
+	}
+	if !consume("fresh-consume", now.Add(5*time.Minute)) {
+		t.Fatal("新票据消费应成功")
+	}
+	if hasRow("stale-jti") {
+		t.Fatal("expires_at<=now 的过期行必须在下一次消费时删除（否则行数无限增长）")
+	}
+
+	// (c) 未过期行不受清理影响（重放窗口不得被误开）。
+	if !hasRow("live-jti") || !hasRow("fresh-consume") {
+		t.Fatalf("未过期行被误删（剩余行数=%d）——重放窗口重新打开", countRows())
+	}
+}

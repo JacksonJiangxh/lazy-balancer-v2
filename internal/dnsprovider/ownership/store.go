@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -178,6 +179,16 @@ func Replace(dataDir string, data []byte) error {
 	return store.writeAtomic(data)
 }
 
+// normalizeRecordName 归一 DNS 名（大小写不敏感、尾点可省略），与挑战登记
+// （challenge_claims 的 challengeClaimKeyOf）同口径。账本比较若不归一，同一
+// 挑战以两种书写形态分别 Present/CleanUp（例如新的调用方或手工验证路径）时
+// 命中失败——该 TXT 既不按 ID 删除也不会被 MatchingValue 选中，只能等
+// StaleOwnershipAge 兜底，条目本身还要留到 OwnershipRetention。
+// 存量条目在比较侧同样归一，旧文件无需迁移。
+func normalizeRecordName(name string) string {
+	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(name), "."))
+}
+
 func (s *Store) Add(record Record) error {
 	fileMu.Lock()
 	defer fileMu.Unlock()
@@ -188,6 +199,9 @@ func (s *Store) Add(record Record) error {
 	if record.CreatedAt.IsZero() {
 		record.CreatedAt = time.Now()
 	}
+	// 落账即归一：后续所有匹配（含并发清理）都按同一形态比较。
+	record.Zone = normalizeRecordName(record.Zone)
+	record.FQDN = normalizeRecordName(record.FQDN)
 	current.Records = append(current.Records, record)
 	return s.save(current)
 }
@@ -203,9 +217,11 @@ func (s *Store) Matching(provider, zone, fqdn string) ([]Record, error) {
 	if err != nil {
 		return nil, err
 	}
+	zone = normalizeRecordName(zone)
+	fqdn = normalizeRecordName(fqdn)
 	matching := make([]Record, 0)
 	for _, record := range current.Records {
-		if record.Provider == provider && record.Zone == zone && record.FQDN == fqdn {
+		if record.Provider == provider && normalizeRecordName(record.Zone) == zone && normalizeRecordName(record.FQDN) == fqdn {
 			matching = append(matching, record)
 		}
 	}
@@ -229,9 +245,11 @@ func (s *Store) MatchingValue(provider, zone, fqdn, value string) ([]Record, err
 		return nil, err
 	}
 	now := time.Now()
+	zone = normalizeRecordName(zone)
+	fqdn = normalizeRecordName(fqdn)
 	matching := make([]Record, 0)
 	for _, record := range current.Records {
-		if record.Provider != provider || record.Zone != zone || record.FQDN != fqdn {
+		if record.Provider != provider || normalizeRecordName(record.Zone) != zone || normalizeRecordName(record.FQDN) != fqdn {
 			continue
 		}
 		legacy := record.Value == ""
@@ -255,7 +273,10 @@ func sameRecord(a, b Record) bool {
 	// Account 纳入相等判定：同一 name/value/record_id 但
 	// 账户不同的两条记录（换凭据后的历史残留 vs 当前账户条目）必须各自可
 	// 独立 Remove，否则丢弃他账户条目会连带删掉本账户的在途条目。
-	return a.Provider == b.Provider && a.Zone == b.Zone && a.FQDN == b.FQDN &&
+	// 名称按 DNS 等价归一比较：调用方可能持有 Present 时的原始书写形态
+	//（带尾点/大写），而账本落盘已归一。
+	return a.Provider == b.Provider && normalizeRecordName(a.Zone) == normalizeRecordName(b.Zone) &&
+		normalizeRecordName(a.FQDN) == normalizeRecordName(b.FQDN) &&
 		a.Value == b.Value && a.RecordID == b.RecordID && a.Account == b.Account &&
 		a.CreatedAt.Equal(b.CreatedAt)
 }

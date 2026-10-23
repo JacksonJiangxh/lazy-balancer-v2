@@ -23,6 +23,10 @@ type runtimeLifecycle struct {
 	certFactory func() certificateWorker
 	certService certificateWorker
 	certDone    chan struct{}
+	// acmeOpsMu 串行化证书侧启停（StartACME vs stopACMEWithin）：停止在途时
+	// 不得拉起新一代，否则在途的 queue.Stop() 会关掉新一代队列。它只覆盖
+	// 串行化，不覆盖等待——等待一律在锁外按调用方预算有界执行。
+	acmeOpsMu sync.Mutex
 	// stopped 是 Shutdown 后的启动门：进程退出路径与 taskengine daemon
 	// 换代（角色翻转/快速重启）并发时，已 teardown 的 worker 不得被重新拉起
 	// （生命周期互斥域对称化：启动/停止两侧同门）。
@@ -34,6 +38,10 @@ func newRuntimeLifecycle(syncService syncWorker, certFactory func() certificateW
 }
 
 func (l *runtimeLifecycle) StartACME() {
+	// 与在途停止串行化（见 acmeOpsMu）；停止自身的有界等待在这里体现为
+	// 「启动最多被推迟一个停止预算」，不会成为无界阻塞点。
+	l.acmeOpsMu.Lock()
+	defer l.acmeOpsMu.Unlock()
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.stopped || l.certService != nil {
@@ -57,15 +65,22 @@ func (l *runtimeLifecycle) StartACME() {
 
 func (l *runtimeLifecycle) StopACME() { l.stopACMEWithin(acmeStopSegmentMax) }
 
-// stopACMEWithin 与 StopACME 同语义，但 <-done 等待有界：
-// 证书 worker 的 Stop 只是发取消，Start 主体可能在长跑签发/等待轮询里不
-// 及时退出——无界等待会把进程拖过容器 stop_grace_period 后被 SIGKILL，
-// 反而丢失收尾。超时记录 error 后放弃等待，worker goroutine 随进程回收。
+// stopACMEWithin 与 StopACME 同语义，但等待有界：
+// 生产证书 worker 的 Stop 会阻塞到 Start 返回（services.CertificateService.Stop
+// 末尾 <-s.done），而 Start 的退出路径上 recoverJobs 是纯 DB 工作、不消费
+// 取消信号；CA 队列的 Stop 同样内含不可预算的补偿/排空等待。这些调用放在
+// l.mu 内会让「超时 select」永不可达（先无界阻塞在 Stop），且换代钩子
+// （StartSync/StopSync）被一起拖住。
+//
+// 因此本函数把等待逐层移出锁外：锁内只摘指针/清 active 注入，Stop 与
+// Start 退出统一放进一个 goroutine，由调用方预算有界等待——超时记录 error
+// 后放弃（残留 goroutine 随进程回收），绝不让进程越过容器 stop_grace_period。
 func (l *runtimeLifecycle) stopACMEWithin(timeout time.Duration) {
+	l.acmeOpsMu.Lock()
+	defer l.acmeOpsMu.Unlock()
+
 	l.mu.Lock()
-	if queue := services.GetCAQueueManager(); queue != nil {
-		queue.Stop()
-	}
+	queue := services.GetCAQueueManager()
 	worker := l.certService
 	done := l.certDone
 	l.certService = nil
@@ -74,24 +89,35 @@ func (l *runtimeLifecycle) stopACMEWithin(timeout time.Duration) {
 	// 单轮体消费的 active 指针，否则 demote/停机后 cert-manual-poll 等循环
 	// 继续驱动已停服务（重复到期日志/无角色门补扫）。
 	services.SetActiveCertificateService(nil)
-	if worker != nil {
-		worker.Stop()
-	}
 	l.mu.Unlock()
-	if done == nil {
+
+	if queue == nil && worker == nil && done == nil {
 		return
 	}
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		if queue != nil {
+			queue.Stop()
+		}
+		if worker != nil {
+			worker.Stop()
+		}
+		if done != nil {
+			<-done
+		}
+	}()
 	if timeout <= 0 {
 		// 预算耗尽：不再等待，但如实报告未收尾（非阻塞检查，进程必须按时退出）。
 		select {
-		case <-done:
+		case <-finished:
 		default:
 			services.Logf("error", "证书服务停止等待超时（关停预算已耗尽），放弃等待继续退出")
 		}
 		return
 	}
 	select {
-	case <-done:
+	case <-finished:
 	case <-time.After(timeout):
 		services.Logf("error", "证书服务停止等待超时（%s），放弃等待继续退出（worker goroutine 随进程回收）", timeout)
 	}

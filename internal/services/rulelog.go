@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -252,39 +253,65 @@ func ReadRuleLogTail(ruleID string, maxLines int) (content string, offset int64,
 	return string(buf[cut:]), size - int64(len(buf)-cut), nil
 }
 
-func RemoveRuleLogFiles(ruleID string) {
+// RemoveRuleLogFiles 删除规则的访问日志与全部轮转副本（基层 + `.<n>` +
+// timberjack 时间戳副本）。返回聚合错误：文件不存在视为成功（幂等重试），
+// 其余失败（权限/只读挂载/IO）必须回报——删除失败即磁盘残留，与
+// RemoveCertJobLogFiles 同口径，调用方据此审计「清理失败」。首项失败不早退：
+// 三个形态各自尝试，错误一并返回，避免「修好第一项就以为收敛」。
+func RemoveRuleLogFiles(ruleID string) error {
 	base := RuleLogPath(ruleID)
-	os.Remove(base)
-	for i := 1; i <= 5; i++ {
-		os.Remove(fmt.Sprintf("%s.%d", base, i))
+	var errs []error
+	remove := func(path string) {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, fmt.Errorf("删除规则日志 %s: %w", path, err))
+		}
 	}
-	// (2026-09-10 审计):timberjack 时间戳副本(<id>-<ts>-size.log,至多
-	// roll_keep=5 份)此前永久残留——按前缀+后缀清扫。
-	removeTimberjackRotations(base)
+	remove(base)
+	for i := 1; i <= 5; i++ {
+		remove(fmt.Sprintf("%s.%d", base, i))
+	}
+	// timberjack 时间戳副本(<id>-<ts>-size.log,至多 roll_keep=5 份)此前
+	// 永久残留——按前缀+后缀清扫。
+	if err := removeTimberjackRotations(base); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
+// timberjackRotationSuffix 匹配 timberjack 轮转副本的固定尾部形态：
+// `-<yyyyMMdd>T<HH-mm-ss>.<毫秒>-size.log`。只认完整时间戳形状——仅判
+// 「stem 后首字符是数字」会让兄弟规则（如 lb_abc 与 lb_abc-1）的轮转副本
+// 被本规则清扫误删（rest 为 "-1-2026…" 时首字符恰是数字）。
+var timberjackRotationSuffix = regexp.MustCompile(`^-\d{8}T\d{2}-\d{2}-\d{2}\.\d{1,9}-size\.log$`)
+
 // removeTimberjackRotations 删除 base 同目录下 <base去扩展名>-<ts>-size.log 形态
-// 的 timberjack 轮转副本。
-func removeTimberjackRotations(base string) {
+// 的 timberjack 轮转副本。目录不存在=无副本（nil）；读目录/删除失败聚合返回。
+func removeTimberjackRotations(base string) error {
 	dir := filepath.Dir(base)
 	stem := strings.TrimSuffix(filepath.Base(base), filepath.Ext(base))
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("读取规则日志目录 %s: %w", dir, err)
 	}
+	var errs []error
 	for _, e := range entries {
 		name := e.Name()
 		if !strings.HasPrefix(name, stem+"-") || !strings.HasSuffix(name, "-size.log") {
 			continue
 		}
-		// 数字边界守卫(logstats.go 同族
-		// 先例)——stem 后 '-<ts>' 段首字符必须为数字(timberjack 时间戳恒以
-		// 数字开头);否则兄弟规则(caddy_id 以本 stem 为前缀,如 lb_abc 与
-		// lb_abc-extra)的轮转副本会被本清扫误删。
-		rest := name[len(stem):]
-		if len(rest) < 2 || rest[1] < '0' || rest[1] > '9' {
+		// 时间戳形状守卫：只有完整 <ts>-size.log 尾部才是本规则的轮转副本；
+		// 兄弟规则（caddy_id 以本 stem 为前缀，如 lb_abc 与 lb_abc-1/
+		// lb_abc-extra）的副本尾部不匹配 -> 保留。
+		if !timberjackRotationSuffix.MatchString(name[len(stem):]) {
 			continue
 		}
-		os.Remove(filepath.Join(dir, name))
+		path := filepath.Join(dir, name)
+		if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
+			errs = append(errs, fmt.Errorf("删除规则日志 %s: %w", path, rmErr))
+		}
 	}
+	return errors.Join(errs...)
 }

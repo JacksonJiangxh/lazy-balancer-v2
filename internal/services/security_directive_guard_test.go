@@ -54,6 +54,14 @@ func TestDirectiveLineLength_assertHelper(t *testing.T) {
 	if err := assertDirectiveLines("SecRule REMOTE_ADDR \"@streq x\" \"id:1,phase:1,deny\"\n"); err != nil {
 		t.Fatalf("短行不得触发护栏: %v", err)
 	}
+	// 精确边界：恰 48KiB 通过、48KiB+1 拒绝。`>` 改 `>=` 会让所有含 48KiB
+	// 行的配置保存失败，而 49KiB 夹具仍然报错——只有精确边界能钉住翻转。
+	if err := assertDirectiveLines(strings.Repeat("a", 48*1024)); err != nil {
+		t.Fatalf("恰 48KiB 行必须通过护栏（边界为 >）: %v", err)
+	}
+	if err := assertDirectiveLines(strings.Repeat("a", 48*1024+1)); err == nil || !strings.Contains(err.Error(), "48KiB") {
+		t.Fatalf("48KiB+1 必须触发护栏, err=%v", err)
+	}
 }
 
 func TestDirectiveLineLength_engineGuardViaGiantCustomPattern(t *testing.T) {

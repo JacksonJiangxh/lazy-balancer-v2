@@ -339,22 +339,19 @@ func TestAutobanStatus_banEffectiveTruthTable(t *testing.T) {
 	})
 }
 
-// autobanListReferenced / autobanBanEffective 的查询失败
-// fail-closed 分支此前无测试——预置名单查询失败时必须按「已引用/已生效」处理
-// （不弹误导性黄条）。status 端点在名单表缺失时更早的 AutobanListEntries 已
-// 500，故直接钉两个判据 helper 的失败分支。
+// autobanListReferenced / autobanBanEffective 的 fail-closed 构造不变量：
+// 未携带名单 id 的状态（构造缺失）必须按「已引用/已生效」处理，不弹误导性
+// 黄条。读取故障在 GetAutobanStatus 更早的 AutobanListEntries 已 500 返回，
+// 且单源引用判定自身的库故障语义由其内部契约负责，此处只钉构造不变量。
 func TestAutobanStatus_listReferencedFailClosed(t *testing.T) {
 	newAutobanTestEnv(t)
-	if _, err := db.DB.Exec(`DROP TABLE security_ip_lists`); err != nil {
-		t.Fatal(err)
-	}
 	h := &Handlers{}
-	state := autobanPresetListState{err: fmt.Errorf("injected preset lookup failure")}
-	if !h.autobanListReferenced(state) {
-		t.Fatal("list_referenced 查询失败必须 fail-closed 返回 true（不弹黄条）")
+	unset := autobanPresetListState{}
+	if !h.autobanListReferenced(unset) {
+		t.Fatal("id 缺失必须 fail-closed 返回 true（不弹黄条）")
 	}
-	if !h.autobanBanEffective(state) {
-		t.Fatal("ban_effective 查询失败必须 fail-closed 返回 true（不弹黄条）")
+	if !h.autobanBanEffective(unset) {
+		t.Fatal("id 缺失必须 fail-closed 返回 true（不弹黄条）")
 	}
 }
 

@@ -90,8 +90,14 @@ func loadCrawlerBundledSeed() map[string][]string {
 	return geoipnames.BuiltinCrawlerIPLists()
 }
 
-// Prime 启动预载：DB 为空时优先使用镜像内置种子，随后以 DB 为唯一真相
-// 重建运行快照（root 服务与插件的唯一交换面）。
+// Prime 启动预载：DB 缺少任一内置引擎名单时按引擎补种内置首版，随后以 DB
+// 为唯一真相重建运行快照（root 服务与插件的唯一交换面）。
+//
+// 判据必须是「逐引擎缺项」而非「全库为空」：播种中途失败（DB busy/磁盘
+// 错误/快照目录异常）会留下部分引擎行，第二次启动若按全库判据就永不再补种
+// ——缺失引擎的内置首版豁免从此消失（so360spider 在 geoipnames 走 iprange
+// 验证且无 PTR 兜底，名单缺失即该引擎豁免彻底失效），且末尾全量快照会把
+// 缺失引擎条目一并删掉。
 func (m *CrawlerUpdateManager) Prime() error {
 	if err := ensureCrawlerSources(); err != nil {
 		return err
@@ -108,11 +114,19 @@ func (m *CrawlerUpdateManager) Prime() error {
 	if err != nil {
 		return err
 	}
-	if len(all) == 0 {
-		all = loadCrawlerBundledSeed()
+	bundled := loadCrawlerBundledSeed()
+	for _, src := range crawlerBotSources {
+		if _, ok := all[src.Name]; ok {
+			continue
+		}
+		if seed, ok := bundled[src.Name]; ok && len(seed) > 0 {
+			all[src.Name] = append([]string(nil), seed...)
+		}
 	}
 	for engineID, entries := range all {
 		if err := upsertCrawlerIPList(engineID, entries); err != nil {
+			// 部分 upsert 失败时不写全量快照（保留上一份，避免快照缩小），
+			// 由调用方错误日志告警后下次启动继续补种。
 			return err
 		}
 	}

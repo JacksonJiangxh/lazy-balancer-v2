@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/services"
 )
 
 // TicketLogin 的 500 分支（DB/内部故障）曾复用「登录
@@ -87,8 +88,8 @@ func TestRecordTicketLoginFailureAuditsSanitizedReasons(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	context, _ := gin.CreateTestContext(httptest.NewRecorder())
 	context.Request = httptest.NewRequest("POST", "/api/v1/auth/ticket-login", nil)
-	const ticket = "secret-ticket-body"
-	for _, reason := range []string{"invalid_request", "invalid_signature", "expired", "replay", "user_unavailable", "database_error"} {
+	reasons := []string{"invalid_request", "invalid_signature", "expired", "replay", "user_unavailable", "database_error"}
+	for _, reason := range reasons {
 		recordTicketLoginFailure(context, "alice", reason)
 	}
 	rows, err := db.AuditDB.Query("SELECT detail FROM audit_log WHERE resource='登录票据' ORDER BY id")
@@ -96,21 +97,59 @@ func TestRecordTicketLoginFailureAuditsSanitizedReasons(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer rows.Close()
-	count := 0
+	var got []string
 	for rows.Next() {
 		var detail string
 		if err := rows.Scan(&detail); err != nil {
 			t.Fatal(err)
 		}
-		if strings.Contains(detail, ticket) {
-			t.Fatalf("audit detail leaked ticket: %q", detail)
-		}
-		count++
+		got = append(got, detail)
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
-	if count != 6 {
-		t.Fatalf("ticket failure audit count=%d, want 6", count)
+	if len(got) != len(reasons) {
+		t.Fatalf("ticket failure audit count=%d, want %d: %v", len(got), len(reasons), got)
+	}
+	// 断言单一来源映射：每条落库详情必须等于「结果：<映射文案>」，且映射
+	// 不得回退为原始英文码——漏映射会让审计面出现内部标识（此前的
+	// 「详情不含 ticket 常量」恒真：票据原文从不进入该函数）。
+	for i, reason := range reasons {
+		text := services.AuditResultText(reason)
+		if text == reason {
+			t.Fatalf("审计结果码 %q 缺少中文映射（落库将暴露内部标识）", reason)
+		}
+		if want := "结果：" + text; got[i] != want {
+			t.Fatalf("audit detail[%d]=%q, want %q", i, got[i], want)
+		}
+	}
+}
+
+// 端点级取证边界：提交的票据原文不得进入审计详情（审计只记归因文案）。
+func TestTicketLogin_auditDoesNotLeakSubmittedTicket(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0, cluster_token='lb_cluster_leak_test' WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/auth/ticket-login", h.TicketLogin)
+	const ticket = "leaky-secret-ticket-zzz"
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/auth/ticket-login", strings.NewReader(`{"ticket":"`+ticket+`"}`))
+	request.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d body=%s, want 401", response.Code, response.Body.String())
+	}
+	var detail string
+	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='登录失败' AND resource='登录票据' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
+		t.Fatalf("query ticket failure audit: %v", err)
+	}
+	if strings.Contains(detail, ticket) {
+		t.Fatalf("audit detail leaked submitted ticket: %q", detail)
+	}
+	if !strings.Contains(detail, "登录票据") {
+		t.Fatalf("audit detail=%q, want 归因文案", detail)
 	}
 }

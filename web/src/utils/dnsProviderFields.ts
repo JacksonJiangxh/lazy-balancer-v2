@@ -49,3 +49,25 @@ export const defaultCredentialsFor = (
   }
   return credentials
 }
+
+/**
+ * select 字段变更后的凭证集合：只清理被 `visible_when` 隐藏的字段，仍可见的
+ * 值（含其它 select 与文本字段）保留。
+ *
+ * 原实现把整个 `dns_credentials` 重置为 `{ auth_mode: 新值 }`——假定唯一 select
+ * 名为 `auth_mode`，而契约是「字段由后端元数据驱动」。若新增含两个 select 的
+ * provider（如「区域 + 认证模式」），改第二个 select 会把第一个 select 的取值与
+ * 全部文本字段一并清空。可见性求值用同一快照，结果与字段顺序无关；变更字段的
+ * 新值此时已由 v-model 写入 credentials，故无需单独传参。
+ */
+export const applyCredentialFieldChange = (
+  fields: readonly CredentialFieldMeta[],
+  credentials: Readonly<Record<string, string>>,
+): Record<string, string> => {
+  const snapshot = { ...credentials }
+  const next: Record<string, string> = { ...snapshot }
+  for (const field of fields) {
+    if (!credentialFieldVisible(field, snapshot)) delete next[field.name]
+  }
+  return next
+}

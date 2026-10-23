@@ -90,11 +90,18 @@ test('下钻衬底=低透明度世界点阵，hover 他国只提亮点，且不�
 })
 
 test('首帧双 RAF 无条件应用图层（两帧内下钻不得残留世界点阵）', () => {
-  assert.doesNotMatch(globeSrc, /if \(!drilledName\) applyLayer\(\)/)
-  const start = globeSrc.indexOf('两个 RAF')
+  // 锚点用代码 token（嵌套 requestAnimationFrame）而非注释文本——注释改写不该假红。
+  const start = globeSrc.indexOf('requestAnimationFrame(() => requestAnimationFrame(')
   const end = globeSrc.indexOf('let rafId = requestAnimationFrame(frame)')
-  assert.ok(start >= 0 && end > start, '双 RAF 首帧块缺失')
-  assert.match(globeSrc.slice(start, end), /^\s*applyLayer\(\)$/m, '双 RAF 回调必须无条件 applyLayer()')
+  assert.ok(start >= 0 && end > start, '首帧双 RAF 块缺失（单层 RAF 会在球体尺寸就绪前建点阵）')
+  const block = globeSrc.slice(start, end)
+  // ① 嵌套形状：两个 RAF 才保证首帧已上屏再建点阵
+  assert.match(block, /requestAnimationFrame\(\(\) => requestAnimationFrame\(\(\) => \{/, '首帧必须嵌套两层 RAF')
+  // ② 卸载守卫：回调可能在卸载后执行，必须直接返回
+  assert.match(block, /if \(disposed\) return/, '双 RAF 回调必须复查卸载态（否则对已销毁引擎建点阵）')
+  // ③ 应用图层无条件：两帧内已下钻时 applyLayer 不得被 !drilledName 之类的旧守卫拦下
+  assert.doesNotMatch(globeSrc, /if \(!drilledName\) applyLayer\(\)/)
+  assert.match(block, /^\s*applyLayer\(\)$/m, '双 RAF 回调必须无条件 applyLayer()')
 })
 
 test('海外下钻浮签显示「无省级统计」而不是 0', () => {

@@ -940,7 +940,7 @@ func TestGetAllSecurityBindings_toleratesNullMode(t *testing.T) {
 
 	// Then 绑定照常返回，mode 归一化为 'off'
 	if len(entries) != 1 {
-		t.Fatalf("NULL mode 不得静默丢绑定（历史问题）: bindings=%+v, want 1 entry", entries)
+		t.Fatalf("NULL mode 不得静默丢绑定: bindings=%+v, want 1 entry", entries)
 	}
 	if entries[0].PolicyID != int(policyID) || entries[0].Mode != "off" {
 		t.Fatalf("entries[0]=%+v, want policy_id=%d mode=off", entries[0], policyID)
@@ -970,7 +970,7 @@ func TestGetAllSecurityBindings_toleratesNullRateLimitEnabled(t *testing.T) {
 
 	// Then 绑定照常返回，rate_limit_enabled 归一化为 false
 	if len(entries) != 1 {
-		t.Fatalf("NULL rate_limit_enabled 不得静默丢绑定（历史问题）: bindings=%+v, want 1 entry", entries)
+		t.Fatalf("NULL rate_limit_enabled 不得静默丢绑定: bindings=%+v, want 1 entry", entries)
 	}
 	if entries[0].PolicyID != int(policyID) || entries[0].RateLimit {
 		t.Fatalf("entries[0]=%+v, want policy_id=%d rate_limit_enabled=false", entries[0], policyID)
@@ -1000,7 +1000,7 @@ func TestGetAllSecurityBindings_nullEnabledReadsDisabled(t *testing.T) {
 
 	// Then 绑定照常返回，enabled 归一化为 false（与生成口径一致）
 	if len(entries) != 1 {
-		t.Fatalf("NULL enabled 不得静默丢绑定（历史问题）: bindings=%+v, want 1 entry", entries)
+		t.Fatalf("NULL enabled 不得静默丢绑定: bindings=%+v, want 1 entry", entries)
 	}
 	if entries[0].PolicyID != int(policyID) || entries[0].Enabled {
 		t.Fatalf("entries[0]=%+v, want policy_id=%d enabled=false（NULL 按禁用呈现）", entries[0], policyID)

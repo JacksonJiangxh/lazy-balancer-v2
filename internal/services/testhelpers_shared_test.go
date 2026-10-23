@@ -74,12 +74,16 @@ func (r *spaceFillReader) Read(p []byte) (int, error) {
 func initServicesDB(t *testing.T) {
 	t.Helper()
 	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
+	oldCurrent := db.GetDB()
 	if err := db.Initialize(t.TempDir()); err != nil {
 		t.Fatalf("initialize test database: %v", err)
 	}
 	t.Cleanup(func() {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		// 后台循环读的是 currentDB 句柄（db.GetDB），Close 已置 nil——只恢复
+		// db.DB 会让后续用例的刷新链在 nil 句柄上空转。
+		db.SetDB(oldCurrent)
 	})
 }
 

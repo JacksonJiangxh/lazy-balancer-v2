@@ -39,10 +39,10 @@ func TestRunAutobanCycle_invalidConfigRefusesExecution(t *testing.T) {
 		scope      string
 		wantSubstr string
 	}{
-		{"threshold=0 拒绝执行", 0, 5, "1h", "all", "配置无效"},
-		{"window=0 拒绝执行", 100, 0, "1h", "all", "配置无效"},
-		{"duration 非法拒绝执行（不得落永久封禁）", 1, 5, "bogus", "all", "配置无效"},
-		{"scope 非法拒绝执行", 1, 5, "1h", "bogus", "配置无效"},
+		{"threshold=0 拒绝执行", 0, 5, "1h", "all", "阈值须在 1-10000 之间"},
+		{"window=0 拒绝执行", 100, 0, "1h", "all", "统计窗口须在 1-60 分钟之间"},
+		{"duration 非法拒绝执行（不得落永久封禁）", 1, 5, "bogus", "all", "封禁时长取值无效"},
+		{"scope 非法拒绝执行", 1, 5, "1h", "bogus", "统计口径取值无效"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

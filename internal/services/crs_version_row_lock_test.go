@@ -37,16 +37,30 @@ func TestCRSUpdateManager_swap_writes_version_row_inside_waf_file_lock(t *testin
 		prevTag string
 		err     error
 	}
+	started := make(chan struct{})
 	done := make(chan swapResult, 1)
 	go func() {
+		close(started)
 		prev, err := m.swapCRSTreeFromStaging(staging, setupPath, nil, "v4.15.0")
 		done <- swapResult{prev, err}
 	}()
+	// 探针真正启动后才计时——固定 300ms 会把 goroutine 调度延迟误判为「已阻塞」。
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		WafFileLock().Unlock()
+		t.Fatal("交换段探针未在 5s 内启动")
+	}
 	select {
 	case res := <-done:
 		WafFileLock().Unlock()
 		t.Fatalf("交换段在 wafFileMu 被预持期间完成（树交换/版本行未入锁）, res=%+v", res)
 	case <-time.After(300 * time.Millisecond):
+	}
+	// 锁仍被预持：版本行必须仍是旧值——若 UPDATE 在取锁之前执行，此刻已变新值。
+	if version, _, _, _, _, _, _ := crsVersionRow(t); version != "v4.14.0" {
+		WafFileLock().Unlock()
+		t.Fatalf("版本行在锁外被改写（%q），必须与树交换同互斥区落库", version)
 	}
 	WafFileLock().Unlock()
 	var res swapResult

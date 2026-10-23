@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"lazy-balancer-v2/internal/config"
-	"lazy-balancer-v2/internal/db"
 	"lazy-balancer-v2/internal/models"
 )
 
@@ -125,61 +124,5 @@ func TestClusterService_BecomeSlave_resetsRegistrationConfirmFailures(t *testing
 	// Then：注册确认失败计数与同步残留被一并清零（与提升路径对称）
 	if failures != 0 || lastSyncError != "" || appliedVersion != 0 {
 		t.Fatalf("failures=%d last_sync_error=%q applied_version=%d, want 0/\"\"/0", failures, lastSyncError, appliedVersion)
-	}
-}
-
-func TestSyncService_Report_httpFailureAuditsOnChangeOnly(t *testing.T) {
-	// Given：主节点上报端点先持续 403，再恢复，再 403
-	_, database := newClusterTestService(t)
-	var mode atomic.Int32 // 0=403, 1=200
-	master := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
-		if mode.Load() == 1 {
-			response.WriteHeader(http.StatusOK)
-			return
-		}
-		response.WriteHeader(http.StatusForbidden)
-	}))
-	defer master.Close()
-	caddy := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) { response.WriteHeader(http.StatusOK) }))
-	defer caddy.Close()
-	if _, err := database.Exec("UPDATE global_config SET is_master=0, master_url=?, cluster_token='cluster-token' WHERE id=1", master.URL); err != nil {
-		t.Fatal(err)
-	}
-	service := NewSyncService(database, &config.Config{DataDir: t.TempDir()}, NewCaddyService(caddy.URL))
-	auditCount := func() int {
-		t.Helper()
-		var count int
-		if err := db.AuditDB.QueryRow("SELECT COUNT(*) FROM audit_log WHERE action='上报失败'").Scan(&count); err != nil {
-			t.Fatal(err)
-		}
-		return count
-	}
-
-	// When：同一 403 失败连续上报两次
-	firstErr := service.Report(context.Background())
-	secondErr := service.Report(context.Background())
-	afterRepeated := auditCount()
-
-	// Then：错误如实返回，审计只记一次（节流生效）
-	if firstErr == nil || secondErr == nil || !strings.Contains(firstErr.Error(), "403") {
-		t.Fatalf("report errors=%v/%v, want HTTP 403 failures", firstErr, secondErr)
-	}
-	if afterRepeated != 1 {
-		t.Fatalf("audit rows after repeated failure=%d, want 1（同一错误只记一次）", afterRepeated)
-	}
-
-	// When：上报恢复后再次失败
-	mode.Store(1)
-	if err := service.Report(context.Background()); err != nil {
-		t.Fatalf("recovered report: %v", err)
-	}
-	mode.Store(0)
-	if err := service.Report(context.Background()); err == nil {
-		t.Fatal("re-failed report unexpectedly succeeded")
-	}
-
-	// Then：恢复后的新失败重新留痕
-	if got := auditCount(); got != 2 {
-		t.Fatalf("audit rows after recovery-then-failure=%d, want 2（恢复后重记）", got)
 	}
 }

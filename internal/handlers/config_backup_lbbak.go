@@ -104,18 +104,14 @@ func buildLbbakPayloadWithThreatIplists(backupJSON []byte, bundle *services.WafF
 			entries[lbbakEntryXdb] = bundle.Xdb
 		}
 	}
-	// RDB: 威胁库 .iplist 源文件
+	// RDB: 威胁库 .iplist 源文件。名单原文一律由调用方在 WafFileLock 内快照后
+	// 传入；此处在锁外直读会与「先 WAF 锁、后组包」的锁序契约相反，且缺件
+	// 静默少条目会让还原删除本地名单（运行态少拦）。
 	if bundle != nil {
 		for _, tf := range bundle.ThreatFiles {
 			data, ok := threatSnapshot[tf.Name]
-			if threatSnapshot == nil {
-				var err error
-				data, err = services.ReadThreatIplistBySource(tf.Name)
-				if err != nil {
-					return nil, fmt.Errorf("读取威胁名单 %s: %w", tf.Name, err)
-				}
-			} else if !ok {
-				continue
+			if !ok {
+				return nil, fmt.Errorf("威胁名单 %s 缺少内存快照（导出必须携带全部威胁文件原文）", tf.Name)
 			}
 			if len(data) > 0 {
 				entries[lbbakEntryThreatPrefix+tf.Name+".iplist"] = data
@@ -538,6 +534,370 @@ func applyLbbakWafFilesInLock(c *gin.Context, action string, payload *lbbakPaylo
 		}
 	}
 	return result
+}
+
+// lbbakWafFileSnapshot 是 lbbak 导入落盘前的 WAF 文件快照。
+//
+// 导入必须在数据库事务提交之前把 CRS 整树/ip2region.xdb/威胁名单写到磁盘
+// （commit 内的 Caddy 应用要读到新规则树）。导入失败或事务回滚时数据库回到
+// 导入前状态，而文件不会自动回退——版本记录与文件分叉（记录指向旧库、磁盘
+// 是新库，或反之）。快照在首次写入之前把将被修改的路径复制到临时目录，
+// 回滚时逐项覆盖回导入前字节；导入成功即丢弃。
+type lbbakWafFileSnapshot struct {
+	// root 是临时快照根；空串=未创建或已丢弃。
+	root string
+	// CRS 整树：ApplyWafFileBundle 整树替换（含删除新包缺失的旧文件），
+	// 因此只记录导入前是否存在，整树副本在 root/crs。
+	crs        bool
+	crsExisted bool
+	// xdb 及其 .version 伴生标记：落盘会改写两者。存在但非普通文件（目录/
+	// 设备等）时无法快照——ApplyWafFileBundle 对同形态的写入自身会显式
+	// 失败，文件不会被替换，故记入告警并跳过回退，不中止导入。
+	xdb                   bool
+	xdbExisted            bool
+	xdbSnapshotted        bool
+	xdbVersionExists      bool
+	xdbVersionSnapshotted bool
+	// warnings 是快照阶段的显性说明（不可快照的现场等），随回退结论透出。
+	warnings []string
+	// 威胁名单 threat-<source>.iplist 与其 .fast：导入会写入成功源，并删除
+	// 空/缺席/已删源的本地旧文件（落盘失败源保留本地）。回滚必须同时覆盖
+	// 「旧文件被改」与「本次新增文件要删」两侧。
+	threatNames map[string]struct{}
+}
+
+// newLbbakWafFileSnapshotDir 创建快照临时目录（测试注入已知目录）。
+var newLbbakWafFileSnapshotDir = func() (string, error) {
+	return os.MkdirTemp("", "lbbak-waf-snapshot-")
+}
+
+// snapshotLbbakWafTargets 在任何文件写入之前快照本次导入可能修改的 WAF 路径；
+// 调用方必须已持 WafFileLock。payload 为 nil 表示本次导入不落 lbbak WAF 文件，
+// threatFiles 标记威胁名单收敛是否会发生。返回 nil 表示无需回退（未写任何
+// 文件）。快照失败必须中止导入——此时零写入，fail-closed 无副作用。
+func snapshotLbbakWafTargets(payload *lbbakPayload, threatFiles bool) (*lbbakWafFileSnapshot, error) {
+	snapshot := &lbbakWafFileSnapshot{
+		crs:         payload != nil && payload.CRSTarGz != nil,
+		xdb:         payload != nil && payload.Xdb != nil,
+		threatNames: nil,
+	}
+	if threatFiles {
+		snapshot.threatNames = map[string]struct{}{}
+	}
+	if !snapshot.crs && !snapshot.xdb && !threatFiles {
+		return nil, nil
+	}
+	root, err := newLbbakWafFileSnapshotDir()
+	if err != nil {
+		return nil, fmt.Errorf("创建规则库文件快照目录: %w", err)
+	}
+	snapshot.root = root
+	fail := func(err error) (*lbbakWafFileSnapshot, error) {
+		snapshot.discard()
+		return nil, err
+	}
+	if snapshot.crs {
+		liveCRS := services.CRSLiveDir()
+		switch _, statErr := os.Stat(liveCRS); {
+		case statErr == nil:
+			snapshot.crsExisted = true
+			if err := copyWafTree(liveCRS, filepath.Join(root, "crs")); err != nil {
+				return fail(fmt.Errorf("快照 CRS 规则树: %w", err))
+			}
+		case !errors.Is(statErr, os.ErrNotExist):
+			return fail(fmt.Errorf("检查 CRS 规则树: %w", statErr))
+		}
+	}
+	if snapshot.xdb {
+		liveXdb := services.IP2RegionLivePath()
+		existed, snapshotted, err := copyWafFileIfExists(liveXdb, filepath.Join(root, "ip2region.xdb"))
+		if err != nil {
+			return fail(fmt.Errorf("快照 IP2Region 数据文件: %w", err))
+		}
+		snapshot.xdbExisted, snapshot.xdbSnapshotted = existed, snapshotted
+		if existed && !snapshotted {
+			snapshot.warnings = append(snapshot.warnings, "导入前 IP2Region 数据文件路径不是普通文件，未纳入回退（该路径的写入本身会失败）")
+		}
+		versionExisted, versionSnapshotted, err := copyWafFileIfExists(liveXdb+".version", filepath.Join(root, "ip2region.xdb.version"))
+		if err != nil {
+			return fail(fmt.Errorf("快照 IP2Region 版本标记: %w", err))
+		}
+		snapshot.xdbVersionExists, snapshot.xdbVersionSnapshotted = versionExisted, versionSnapshotted
+		if versionExisted && !versionSnapshotted {
+			snapshot.warnings = append(snapshot.warnings, "导入前 IP2Region 版本标记路径不是普通文件，未纳入回退")
+		}
+	}
+	if snapshot.threatNames != nil {
+		wafDir := services.WafDir()
+		names, notDir, err := listLbbakThreatFiles(wafDir)
+		if err != nil {
+			return fail(fmt.Errorf("扫描威胁名单目录: %w", err))
+		}
+		if notDir {
+			snapshot.warnings = append(snapshot.warnings, "威胁名单目录路径不是目录，威胁名单未纳入回退（该路径下的写入本身会失败）")
+		}
+		if len(names) > 0 {
+			if err := os.MkdirAll(filepath.Join(root, "threat"), 0o700); err != nil {
+				return fail(fmt.Errorf("创建威胁名单快照目录: %w", err))
+			}
+		}
+		for _, name := range names {
+			if err := copyWafFilePlain(filepath.Join(wafDir, name), filepath.Join(root, "threat", name)); err != nil {
+				return fail(fmt.Errorf("快照威胁名单 %s: %w", name, err))
+			}
+			snapshot.threatNames[name] = struct{}{}
+		}
+	}
+	return snapshot, nil
+}
+
+// restore 把快照逐项覆盖回 WAF 活动路径。调用方必须已持 WafFileLock，且与
+// 落盘同处 caddyOpMu 临界区（导入 abort 路径满足）。逐项尝试不因首错放弃
+// （恢复面越完整越好）；err 非 nil=文件回退失败（文件与数据库可能分叉），
+// warnings 承载「文件已回退但运行时内存面须重启收敛」等说明。
+func (snapshot *lbbakWafFileSnapshot) restore() (warnings []string, err error) {
+	if snapshot == nil || snapshot.root == "" {
+		return nil, nil
+	}
+	var errs []error
+	if snapshot.crs {
+		// 先整树清空再复制快照：ApplyWafFileBundle 是整树替换语义（新包
+		// 缺失的旧文件已被删），只覆盖同名文件会留下导入产物。
+		liveCRS := services.CRSLiveDir()
+		if err := os.RemoveAll(liveCRS); err != nil {
+			errs = append(errs, fmt.Errorf("清空 CRS 规则树: %w", err))
+		} else if snapshot.crsExisted {
+			if err := copyWafTree(filepath.Join(snapshot.root, "crs"), liveCRS); err != nil {
+				errs = append(errs, fmt.Errorf("恢复 CRS 规则树: %w", err))
+			}
+		}
+		services.InvalidateCRSRuleCount()
+	}
+	if snapshot.xdb {
+		liveXdb := services.IP2RegionLivePath()
+		errs = append(errs,
+			restoreWafFileFromSnapshot(filepath.Join(snapshot.root, "ip2region.xdb"), liveXdb, snapshot.xdbExisted, snapshot.xdbSnapshotted),
+			restoreWafFileFromSnapshot(filepath.Join(snapshot.root, "ip2region.xdb.version"), liveXdb+".version", snapshot.xdbVersionExists, snapshot.xdbVersionSnapshotted),
+		)
+		// 落盘时已热换内存缓存；文件回退后必须同批回退内存，否则磁盘与
+		// 运行时分裂（重启才收敛）。
+		switch {
+		case snapshot.xdbExisted && !snapshot.xdbSnapshotted:
+			// 现场不可快照（非普通文件）：导入对该路径的写入本身失败，文件
+			// 未被替换，内存也未被热换——无需回退，快照阶段已留告警。
+		case !snapshot.xdbExisted:
+			// 导入前无数据库：磁盘已回到「不存在」，但运行时无法卸载已装载
+			// 的库——只能显性告知重启收敛，不能当作静默成功。
+			warnings = append(warnings, "IP2Region 数据文件已回退为导入前的不存在状态——运行时内存缓存无法卸载导入的数据库，重启后与磁盘收敛")
+		default:
+			if err := services.Reload(); err != nil {
+				errs = append(errs, fmt.Errorf("回退后热换 IP2Region 内存缓存失败（重启后生效）: %w", err))
+			} else {
+				services.RebuildRegionTreeCacheForSync()
+			}
+		}
+	}
+	if snapshot.threatNames != nil {
+		wafDir := services.WafDir()
+		current, notDir, err := listLbbakThreatFiles(wafDir)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("扫描威胁名单目录: %w", err))
+		}
+		if notDir {
+			// 路径不是目录：导入对该路径的写入本身失败，无导入产物可删、
+			// 也无处写回快照；快照阶段已留告警。
+			return warnings, errors.Join(errs...)
+		}
+		for _, name := range current {
+			if _, existed := snapshot.threatNames[name]; existed {
+				continue
+			}
+			// 本次导入新建的名单文件在导入前不存在——回滚即删除。
+			if err := os.Remove(filepath.Join(wafDir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				errs = append(errs, fmt.Errorf("删除导入新增的威胁名单 %s: %w", name, err))
+			}
+		}
+		for name := range snapshot.threatNames {
+			// 快照内的威胁名单恒为普通文件（快照时复制成功才入集合）。
+			errs = append(errs, restoreWafFileFromSnapshot(filepath.Join(snapshot.root, "threat", name), filepath.Join(wafDir, name), true, true))
+		}
+	}
+	return warnings, errors.Join(errs...)
+}
+
+// discard 丢弃快照（导入成功后调用）。清理失败不改导入结论，仅留 warn。
+func (snapshot *lbbakWafFileSnapshot) discard() {
+	if snapshot == nil || snapshot.root == "" {
+		return
+	}
+	root := snapshot.root
+	snapshot.root = ""
+	if err := os.RemoveAll(root); err != nil {
+		services.Logf("warn", "lbbak 导入: 清理规则库文件快照失败（可手工删除 %s）: %v", root, err)
+	}
+}
+
+// lbbakWafRollbackWarning 生成失败响应里的文件面提示。回退成功=明确告知文件
+// 已回到导入前状态；回退失败/未回退=显性告知文件与版本记录可能分裂，不得
+// 静默（空串=无需提示）。
+func lbbakWafRollbackWarning(filesLanded, restoreAttempted bool, restoreErr error) string {
+	switch {
+	case restoreAttempted && restoreErr != nil:
+		return "规则库文件已按备份落盘，数据库已回滚，但规则库文件回退失败: " + restoreErr.Error() + "——文件与版本记录可能分裂，请重新导入或触发规则库更新以收敛"
+	case restoreAttempted:
+		if !filesLanded {
+			return ""
+		}
+		return "规则库文件已按备份落盘，数据库已回滚——规则库文件已回退到导入前状态（文件与版本记录一致）"
+	case filesLanded:
+		return "规则库文件已按备份落盘，但数据库已回滚——文件与版本记录可能分裂，请重新导入或触发规则库更新以收敛"
+	}
+	return ""
+}
+
+// listLbbakThreatFiles 列出 WAF 目录内的威胁名单文件（threat-*.iplist 与其
+// .fast），与 reconcileImportedThreatFiles 同一前缀口径。目录不存在=无文件。
+// notDir=true 表示该路径不是目录（损坏部署/夹具把 WAF 路径建成文件）：调用方
+// 按「无文件可快照/收敛」降级并显式告警——该路径下的写入本身必然失败，不能
+// 因此中止导入。
+func listLbbakThreatFiles(dir string) (names []string, notDir bool, err error) {
+	entries, readErr := os.ReadDir(dir)
+	if readErr == nil {
+		names = make([]string, 0, len(entries))
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasPrefix(entry.Name(), "threat-") {
+				continue
+			}
+			names = append(names, entry.Name())
+		}
+		sort.Strings(names)
+		return names, false, nil
+	}
+	if errors.Is(readErr, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	// 目录可 stat 但读失败=真实错误（权限/IO）；路径本身不是目录（含中间
+	// 组件是文件）按不可操作降级。
+	if info, statErr := os.Stat(dir); statErr == nil && info.IsDir() {
+		return nil, false, readErr
+	}
+	return nil, true, nil
+}
+
+// restoreWafFileFromSnapshot 把快照字节原子写回 dst。existed=false 表示导入前
+// 该路径不存在（恢复即删除导入产物）；existed=true 且 snapshotted=false 表示
+// 导入前现场不是普通文件、未纳入快照（跳过，快照阶段已留告警）。
+func restoreWafFileFromSnapshot(src, dst string, existed, snapshotted bool) error {
+	if !existed {
+		if err := os.Remove(dst); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("删除导入新增文件 %s: %w", dst, err)
+		}
+		return nil
+	}
+	if !snapshotted {
+		return nil
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return fmt.Errorf("读取快照 %s: %w", src, err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(dst), ".lbbak-waf-restore-*")
+	if err != nil {
+		return fmt.Errorf("写回 %s: %w", dst, err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("写回 %s: %w", dst, err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("写回 %s: %w", dst, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("写回 %s: %w", dst, err)
+	}
+	if err := os.Chmod(tmpPath, 0o644); err != nil {
+		return fmt.Errorf("写回 %s: %w", dst, err)
+	}
+	if err := os.Rename(tmpPath, dst); err != nil {
+		return fmt.Errorf("恢复文件 %s: %w", dst, err)
+	}
+	return nil
+}
+
+// copyWafFileIfExists 复制普通文件，返回（是否存在、是否成功快照）。
+// 存在但不是普通文件（目录/设备等）不是错误：调用方记告警并在回退时跳过——
+// ApplyWafFileBundle 对同形态的写入自身会显式失败，文件不会被替换。
+func copyWafFileIfExists(src, dst string) (existed, snapshotted bool, err error) {
+	info, err := os.Stat(src)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, err
+	}
+	if !info.Mode().IsRegular() {
+		return true, false, nil
+	}
+	return true, true, copyWafFilePlain(src, dst)
+}
+
+// copyWafFilePlain 复制普通文件内容与权限位。
+func copyWafFilePlain(src, dst string) error {
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, info.Mode().Perm())
+}
+
+// copyWafTree 递归复制目录树（普通文件与目录）。符号链接/特殊文件显式拒绝：
+// CRS 活树只应有普通文件，异常形态让快照失败而非静默丢文件。
+func copyWafTree(src, dst string) error {
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s 不是目录", src)
+	}
+	if err := os.MkdirAll(dst, info.Mode().Perm()); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		srcPath := filepath.Join(src, entry.Name())
+		dstPath := filepath.Join(dst, entry.Name())
+		// os.Stat 跟随符号链接：CRS 树内容可能被部署成链接形态，复制的是
+		// 目标字节（与 services.copyDir 同口径）；设备/管道等不可快照形态
+		// 显式失败而不是静默丢文件。
+		entryInfo, err := os.Stat(srcPath)
+		if err != nil {
+			return err
+		}
+		switch {
+		case entryInfo.IsDir():
+			if err := copyWafTree(srcPath, dstPath); err != nil {
+				return err
+			}
+		case entryInfo.Mode().IsRegular():
+			if err := copyWafFilePlain(srcPath, dstPath); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("规则库快照不支持的文件类型: %s", srcPath)
+		}
+	}
+	return nil
 }
 
 // isLbbakBytes 按魔数识别 tar.gz 备份(gzip 0x1f 0x8b)。

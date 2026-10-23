@@ -10,6 +10,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,7 +27,16 @@ func TestSyncService_applySnapshot_reload_blocks_while_caddy_op_lock_held(t *tes
 	if _, err := database.Exec("UPDATE global_config SET is_master=0 WHERE id=1"); err != nil {
 		t.Fatalf("set slave mode: %v", err)
 	}
-	caddyServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+	var loadMu sync.Mutex
+	loads := 0
+	caddyServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		// 按路径计数：只证明「取到了 CaddyOpLock」不够——ApplyConfigForce 退化为
+		// no-op（不 POST /load）时本条仍会绿。锁语义必须与真实重载请求绑定。
+		if request.Method == http.MethodPost && request.URL.Path == "/load" {
+			loadMu.Lock()
+			loads++
+			loadMu.Unlock()
+		}
 		response.WriteHeader(http.StatusOK)
 	}))
 	defer caddyServer.Close()
@@ -56,5 +66,12 @@ func TestSyncService_applySnapshot_reload_blocks_while_caddy_op_lock_held(t *tes
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("锁释放后 applySnapshot 10s 内未完成")
+	}
+	// 真实 POST /load 必须发生且恰一次：锁内路径退化为空操作时本条变红。
+	loadMu.Lock()
+	finalLoads := loads
+	loadMu.Unlock()
+	if finalLoads != 1 {
+		t.Fatalf("Caddy /load 次数=%d, want 1（重载请求必须真实发出）", finalLoads)
 	}
 }

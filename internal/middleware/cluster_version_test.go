@@ -125,7 +125,7 @@ func TestClusterVersionMiddleware_bumps_on_synchronized_statement(t *testing.T) 
 	database := db.DB
 	t.Cleanup(func() {
 		_ = db.Close()
-		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB)
 	})
 	if _, err := database.Exec("UPDATE global_config SET is_master=1, cluster_version=0 WHERE id=1"); err != nil {
 		t.Fatalf("seed master: %v", err)
@@ -169,7 +169,7 @@ func TestClusterVersionMiddleware_statement_rolls_back_when_version_bump_fails(t
 	database := db.DB
 	t.Cleanup(func() {
 		_ = db.Close()
-		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB)
 	})
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
@@ -218,7 +218,7 @@ func TestClusterVersionMiddleware_statementLevelAtomicityWithoutExplicitTx(t *te
 	database := db.DB
 	t.Cleanup(func() {
 		_ = db.Close()
-		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB)
 	})
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
@@ -394,9 +394,12 @@ func TestClusterVersionTriggers_bump_for_security_tables(t *testing.T) {
 			insert: `INSERT INTO security_block_pages (id,name,content) VALUES (7,'matrix page','<html>blocked</html>')`,
 			update: `UPDATE security_block_pages SET content='<html>v2</html>' WHERE id=7`,
 			delete: `DELETE FROM security_block_pages WHERE id=7`},
+		// UPDATE 用例写语义列（version）：update_status/message 等运行态簿记列
+		// 已按「值真实变化」守卫排除出 bump 判定（见
+		// TestClusterVersionTrigger_runtimeBookkeepingExcluded）。
 		{name: "security_crs_version",
 			insert: `INSERT INTO security_crs_version (id,version) VALUES (1,'v4.14.0')`,
-			update: `UPDATE security_crs_version SET update_status='success',message='done' WHERE id=1`,
+			update: `UPDATE security_crs_version SET version='v4.15.0' WHERE id=1`,
 			delete: `DELETE FROM security_crs_version WHERE id=1`},
 	}
 	for _, test := range tests {
@@ -896,7 +899,7 @@ func newClusterVersionTestDB(t *testing.T) *sql.DB {
 	database := db.DB
 	t.Cleanup(func() {
 		_ = db.Close()
-		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
+		restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB)
 	})
 	return database
 }
@@ -950,6 +953,60 @@ func TestClusterVersionTrigger_lastCheckedExcluded(t *testing.T) {
 	}
 	if v := readV(); v != base+1 {
 		t.Errorf("version update should bump cluster_version to %d, got %d", base+1, v)
+	}
+}
+
+// 规则库版本表的运行态簿记列不参与 bump 判定——生产常态轮只写这些列
+// （每轮开始标记 + 「已是最新版本」终态 + 失败/取消终态），若照常 bump，
+// 默认排程下 CRS/IP2Region 每日各两轮常态检查即让 cluster_version 逐轮 +1，
+// 全部从节点 304 门失效并拉取整包快照重写两表。语义列（version/updated_at/
+// auto_update/排程）值真实变化照常 bump。
+func TestClusterVersionTrigger_runtimeBookkeepingExcluded(t *testing.T) {
+	database := newClusterVersionTestDB(t)
+	if err := installClusterVersionTriggers(database); err != nil {
+		t.Fatal(err)
+	}
+	for _, seed := range []string{
+		`INSERT OR IGNORE INTO security_crs_version (id, version) VALUES (1, '4.28.0')`,
+		`INSERT OR IGNORE INTO security_ip2region_version (id, version) VALUES (1, 'v3.17.0')`,
+	} {
+		if _, err := database.Exec(seed); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := database.Exec("UPDATE global_config SET is_master=1,cluster_version=0 WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+
+	runtimeWrites := []struct{ name, stmt string }{
+		{"crs 每轮开始", `UPDATE security_crs_version SET trigger='schedule', started_at=datetime('now'), last_checked=datetime('now'), finished_at=NULL WHERE id=1`},
+		{"crs 已是最新", `UPDATE security_crs_version SET update_status='success', message='已是最新版本', finished_at=datetime('now'), next_update='2026-10-24 04:00:00' WHERE id=1`},
+		{"crs 失败终态", `UPDATE security_crs_version SET update_status='failed', message='下载失败', finished_at=datetime('now'), next_update='2026-10-24 04:00:00' WHERE id=1`},
+		{"ip2region 每轮开始", `UPDATE security_ip2region_version SET trigger='schedule', started_at=datetime('now'), last_checked=datetime('now'), finished_at=NULL WHERE id=1`},
+		{"ip2region 已是最新", `UPDATE security_ip2region_version SET update_status='success', message='已是最新版本', finished_at=datetime('now'), next_update='2026-10-24 04:00:00' WHERE id=1`},
+		{"ip2region 取消终态", `UPDATE security_ip2region_version SET update_status='cancelled', message='已取消', finished_at=datetime('now') WHERE id=1`},
+	}
+	for _, write := range runtimeWrites {
+		if _, err := database.Exec(write.stmt); err != nil {
+			t.Fatalf("%s: %v", write.name, err)
+		}
+		if got := clusterVersion(t, database); got != 0 {
+			t.Fatalf("%s 写入后 cluster_version=%d, want 0（运行态簿记列不得 bump）", write.name, got)
+		}
+	}
+
+	semanticWrites := []struct{ name, stmt string }{
+		{"crs 版本变化", `UPDATE security_crs_version SET version='4.29.0', updated_at=datetime('now') WHERE id=1`},
+		{"ip2region 自动更新开关", `UPDATE security_ip2region_version SET auto_update=0 WHERE id=1`},
+		{"ip2region 版本变化", `UPDATE security_ip2region_version SET version='v3.18.0' WHERE id=1`},
+	}
+	for i, write := range semanticWrites {
+		if _, err := database.Exec(write.stmt); err != nil {
+			t.Fatalf("%s: %v", write.name, err)
+		}
+		if got := clusterVersion(t, database); got != i+1 {
+			t.Fatalf("%s 写入后 cluster_version=%d, want %d（语义列变化须 bump）", write.name, got, i+1)
+		}
 	}
 }
 

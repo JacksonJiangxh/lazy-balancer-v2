@@ -253,9 +253,12 @@ func TestEngineGate_blockStatusSyntheticShapes(t *testing.T) {
 		}
 		compileForEngineGate(t, directives)
 	})
-	// ③ CRS 抬码指令形状（949 夹具文件存在 → 发射；门禁过滤该指令行——
-	// Include 被过滤后 949110 不存在，编译必然报错是环境产物非被测形状）
-	t.Run("crs-949-lift-emitted-and-compilable", func(t *testing.T) {
+	// ③ CRS 抬码指令发射形状（949 夹具文件存在 → 发射）。该子用例只断言
+	// 指令行存在：门禁把 SecRuleUpdateActionById 行过滤掉（Include 被过滤后
+	// 949110 不存在，送编译必然报环境错误），因此这里不构成「抬码指令可编译」
+	// 证据——真实抬码行为由 security_block_status_test.go 的桩规则事务覆盖，
+	// 抬码对象存在性由本文件 TestEngineGate_crsFixtureTreeCompiles 覆盖。
+	t.Run("crs-949-lift-emitted", func(t *testing.T) {
 		dir := t.TempDir()
 		if err := os.MkdirAll(filepath.Join(dir, "rules"), 0o755); err != nil {
 			t.Fatal(err)

@@ -1009,7 +1009,7 @@ func TestListSecurityEvents_triggerTypePopulated(t *testing.T) {
 			continue
 		}
 		if e.TriggerType == "" {
-			t.Fatalf("rule %s trigger_type empty（历史问题 接线缺失）", e.RuleTriggered)
+			t.Fatalf("rule %s trigger_type empty（接线缺失）", e.RuleTriggered)
 		}
 		if e.TriggerType != want {
 			t.Fatalf("rule %s trigger_type=%q, want %q", e.RuleTriggered, e.TriggerType, want)

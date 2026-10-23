@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -87,5 +88,62 @@ func TestGenerateClusterLoginTicket_auditCarriesNodeName(t *testing.T) {
 	}
 	if !strings.Contains(detail, "节点 7（slave-01）") {
 		t.Fatalf("audit detail=%q, want 含「节点 7（slave-01）」", detail)
+	}
+}
+
+// 登录票据的 MFA 三态门（端点级）：未启用 → 403 引导绑定；读状态失败 →
+// 500 fail-closed（不得放行发票）；已启用但无近期验证 → 428 step-up；
+// 已启用且验证窗口内 → 通过 MFA 门（落到节点不存在的 404，证明未提前短路）。
+func TestGenerateClusterLoginTicket_mfaThreeStateGates(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled,mfa_enabled) VALUES (1,'alice','hash','admin',1,0)`); err != nil {
+		t.Fatal(err)
+	}
+	h.clusterService = services.NewClusterService(db.DB, "")
+	gin.SetMode(gin.TestMode)
+	routerWith := func(mfaTs any) *gin.Engine {
+		router := gin.New()
+		router.POST("/cluster/nodes/:id/login-ticket", func(c *gin.Context) {
+			c.Set("user_id", 1)
+			c.Set("username", "alice")
+			c.Set("auth_method", "password")
+			c.Set("auth_type", "jwt")
+			if mfaTs != nil {
+				c.Set("mfa_ts", mfaTs)
+			}
+			h.GenerateClusterLoginTicket(c)
+		})
+		return router
+	}
+	call := func(mfaTs any) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		routerWith(mfaTs).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/cluster/nodes/999/login-ticket", nil))
+		return rec
+	}
+
+	// 未启用 MFA → 403 引导
+	if rec := call(nil); rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "需先启用 MFA") {
+		t.Fatalf("未启用 MFA status=%d body=%s, want 403", rec.Code, rec.Body.String())
+	}
+
+	// 已启用但本轮未验证 → 428 step-up
+	if _, err := db.DB.Exec(`UPDATE users SET mfa_enabled=1 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	if rec := call(nil); rec.Code != http.StatusPreconditionRequired || !strings.Contains(rec.Body.String(), "MFA_STEP_UP_REQUIRED") {
+		t.Fatalf("缺 mfa_ts status=%d body=%s, want 428 step-up", rec.Code, rec.Body.String())
+	}
+
+	// 已启用且 60s 内验证过 → MFA 门放行（节点不存在 → 404）
+	if rec := call(float64(time.Now().Unix())); rec.Code != http.StatusNotFound {
+		t.Fatalf("有效 mfa_ts status=%d body=%s, want 404（MFA 门应放行）", rec.Code, rec.Body.String())
+	}
+
+	// 读 MFA 状态失败 → 500 fail-closed（无法证明已启用=拒绝）
+	if _, err := db.DB.Exec(`DROP TABLE users`); err != nil {
+		t.Fatal(err)
+	}
+	if rec := call(nil); rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), "读取 MFA 状态失败") {
+		t.Fatalf("MFA 读失败 status=%d body=%s, want 500 fail-closed", rec.Code, rec.Body.String())
 	}
 }

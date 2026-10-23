@@ -2,7 +2,7 @@ package handlers
 
 // （users 空表拒绝）、（预览单侧缺失
 // 建模）、（CRS 日志时序）、（未登记威胁条目告警）、
-// handlers 侧探针（applyLbbakWafFiles 文件相位入 wafFileMu）。
+// lbbak 导入/导出的文件相位与 WAF/Caddy 锁序（生产链用例）。
 
 import (
 	"archive/tar"
@@ -93,52 +93,10 @@ func decodeValidateResponse(t *testing.T, rec *httptest.ResponseRecorder) import
 	return envelope.Data
 }
 
-// applyLbbakWafFiles 是本测试文件的锁序探针缝；生产导入只消费 InLock 变体。
-func applyLbbakWafFiles(c *gin.Context, action string, payload *lbbakPayload, ip2regionTag string) lbbakWafApplyResult {
-	if payload.CRSTarGz == nil && payload.Xdb == nil && len(payload.ThreatIplists) == 0 {
-		return lbbakWafApplyResult{}
-	}
-	services.WafFileLock().Lock()
-	defer services.WafFileLock().Unlock()
-	return applyLbbakWafFilesInLock(c, action, payload, ip2regionTag)
-}
-
-// ── handlers 侧：applyLbbakWafFiles 文件相位必须受 wafFileMu 互斥 ──
-
-// Given wafFileMu 被预持（模拟并发的三库更新器文件相位）。
-// When applyLbbakWafFiles 执行威胁库 .iplist 落盘+编译文件相位。
-// Then 必须阻塞至锁释放。
-func TestApplyLbbakWafFiles_blocks_while_waf_file_lock_held(t *testing.T) {
-	_ = newBackupTestHandlers(t) // 初始化 db.AuditDB（recordAudit 落审计）与 caddy stub
-	dir := t.TempDir()
-	restore := services.OverrideThreatWafDirForTest(dir)
-	defer restore()
-	taskengine.SetLogDir(t.TempDir())
-	t.Cleanup(func() { taskengine.SetLogDir("") })
-
-	c, _ := gin.CreateTestContext(httptest.NewRecorder())
-	c.Request = httptest.NewRequest(http.MethodPost, "/config/import", nil)
-
-	payload := &lbbakPayload{ThreatIplists: map[string][]byte{"ustc": []byte("1.2.3.4\n")}}
-	services.WafFileLock().Lock()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		_ = applyLbbakWafFiles(c, "导入", payload, "test-tag")
-	}()
-	select {
-	case <-done:
-		services.WafFileLock().Unlock()
-		t.Fatal("applyLbbakWafFiles 在 wafFileMu 被预持期间完成——lbbak 文件相位未入锁")
-	case <-time.After(300 * time.Millisecond):
-	}
-	services.WafFileLock().Unlock()
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("锁释放后 applyLbbakWafFiles 10s 内未完成")
-	}
-}
+// 锁序不变量由生产链用例 TestLbbakImport_acquiresWafLockBeforeCaddyOpLock 承担
+// （预持 CaddyOpLock + WafFileLock().TryLock() 探针 + 真实导出包导入）；此前这里
+// 另定义了一个测试专属包装（自行加锁后调 InLock 变体）来「证明」阻塞，只能
+// 证明测试包装加了锁，属自证，已删除。
 
 // ──：lbbak 导出侧 BuildWafFileBundle 读相位必须受 wafFileMu 互斥 ──
 
