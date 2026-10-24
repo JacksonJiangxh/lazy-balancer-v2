@@ -276,12 +276,20 @@ test('死代码清理（灰 tone/死 CSS/死字段/解析器单源）', () => {
   assert.match(code('src/utils/securityStages.ts'), /export const parseUnknownIds|export function parseUnknownIds/)
 })
 
-test('build 门禁：先跑测试、再跑 src 基线与 tests 类型检查', () => {
+test('build 门禁：先跑测试与覆盖率门限、再跑 src 基线与 tests 类型检查', () => {
   const pkg = JSON.parse(code('package.json')) as { scripts: Record<string, string> }
   assert.ok(
-    pkg.scripts.build.startsWith('npm test && npm run typecheck:src && npm run typecheck:test &&'),
-    `build 必须先执行 npm test、typecheck:src 与 typecheck:test，实际: ${pkg.scripts.build}`,
+    pkg.scripts.build.startsWith('npm run test:coverage && npm run typecheck:src && npm run typecheck:test &&'),
+    `build 必须先执行覆盖率门限下的测试、typecheck:src 与 typecheck:test，实际: ${pkg.scripts.build}`,
   )
+  // 覆盖率必须带阈值：只开 --experimental-test-coverage 会打报告但不拦下滑，
+  // 与「可见口径无门禁」等价。三项阈值（行/分支/函数）缺一即弱点。
+  const coverage = pkg.scripts['test:coverage']
+  for (const flag of ['--experimental-test-coverage', '--test-coverage-lines=', '--test-coverage-branches=', '--test-coverage-functions=']) {
+    assert.ok(coverage.includes(flag), `test:coverage 缺少 ${flag}: ${coverage}`)
+  }
+  // 反向：build 不得退回无覆盖率门限的裸 npm test（快速环仍保留 npm test）。
+  assert.doesNotMatch(pkg.scripts.build, /(^|&& )npm test( |$)/, `build 不得退回裸 npm test: ${pkg.scripts.build}`)
   // src 基线门（lib ES2020）与 tests 门（lib ES2024）必须是两个 project：
   // tsconfig.test.json 抬高 lib 是为了 tests 的 Promise.withResolvers 等 API，
   // 若只跑它，src 也只在 ES2024 的 API 面下被检查——等于放宽浏览器兼容基线

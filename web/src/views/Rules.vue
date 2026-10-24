@@ -2071,6 +2071,9 @@ let certValidationSessionSeq = 0
 const tlsDetailError = ref(false)
 const tlsDetailLoading = ref(false)
 const tlsDetailRuleId = ref('')
+// 证书详情重试的会话序号：关闭向导/换表单即失效，在途响应不得把旧规则的
+// 证书与私钥写进新表单（与 openWizard 的 wizardOpenSeq 同范式）。
+let tlsDetailSeq = 0
 
 function markTlsDetailFailed(caddyId: string): void {
   tlsDetailError.value = true
@@ -2082,9 +2085,19 @@ function markTlsDetailFailed(caddyId: string): void {
 async function retryTlsDetail(): Promise<void> {
   const caddyId = tlsDetailRuleId.value
   if (!caddyId || tlsDetailLoading.value) return
+  // 会话快照：响应回填前三者必须仍一致，否则说明向导已关闭或已换到另一表单，
+  // 回填会把旧规则的证书材料写进新规则（manual 私钥校验还会被 tlsKeySet 放行）。
+  const sessionSeq = ++tlsDetailSeq
+  const openSeq = wizardOpenSeq
+  const sessionAlive = (): boolean =>
+    sessionSeq === tlsDetailSeq &&
+    openSeq === wizardOpenSeq &&
+    wizardVisible.value &&
+    editingRule.value?.caddy_id === caddyId
   tlsDetailLoading.value = true
   try {
     const resp = await request.get<APIResponse<Rule>>(`/rules/${encodeURIComponent(caddyId)}`)
+    if (!sessionAlive()) return
     if (resp.code !== 0 || !resp.data) {
       ElMessage.warning('证书详情仍不可用，请稍后重试')
       return
@@ -2096,10 +2109,12 @@ async function retryTlsDetail(): Promise<void> {
     tlsDetailError.value = false
     ElMessage.success('证书详情已重新加载')
   } catch (error: unknown) {
+    if (!sessionAlive()) return
     console.warn('[retryTlsDetail] failed', error)
     ElMessage.warning('证书详情加载失败，请稍后重试')
   } finally {
-    tlsDetailLoading.value = false
+    // 仅当前会话负责收尾 loading；会话已被新一代接管时由新一代自行管理
+    if (sessionSeq === tlsDetailSeq) tlsDetailLoading.value = false
   }
 }
 
@@ -2243,6 +2258,12 @@ watch(() => wizardForm.protocol, (newVal, oldVal) => {
     wizardForm.custom_routes_enabled = false
     wizardForm.health_check_host = ''
     wizardForm.path_rules = []
+    // 动态上游与 DNS 服务发现同为 HTTP 语义：TCP 下这两组控件整段不渲染，
+    // 但载荷仍无条件上送——残留值会被后端「TCP 规则不支持…」门恒拒，
+    // 且用户没有可见控件可关闭（与上方 HTTP-only 字段同族清理）。
+    wizardForm.dynamic_dns = false
+    wizardForm.enable_dns_server = false
+    wizardForm.dns_server = ''
     wizardForm.upstreams.forEach(u => {
       // 回源域名是 HTTP-only 语义——切换即弃置，
       // 否则隐藏残留字段被后端「回源域名仅 HTTP 规则支持」门恒拒，卡死保存
@@ -2338,6 +2359,11 @@ const portWarning = computed(() => {
     }
     if (tcpPorts.includes(wizardForm.listen_port)) {
       return `端口已被 TCP 规则占用`
+    }
+    // 80 端口 + TLS 跳转自环（跳转目标 https://host:80 与来源同端口）：
+    // 后端保存门同判据，前端先拦并在端口行内提示。
+    if (wizardForm.listen_port === 80 && wizardForm.enable_tls && wizardForm.tls_http_redirect) {
+      return '80 端口开启 TLS 跳转无意义（目标与来源相同端口），请改用 443 端口或关闭跳转'
     }
   } else if (wizardForm.protocol === 'tcp') {
     // TCP rules cannot use admin ports, 80/443, or share a port with any other rule.
@@ -2644,6 +2670,10 @@ const openWizard = async (rule?: Rule) => {
   resetCertInfo()
   wizardForm.tlsKeySet = false // 掩码态随向导重置
   tlsDetailError.value = false
+  // 证书详情重试会话换新：在途响应随旧会话失效
+  tlsDetailSeq++
+  tlsDetailLoading.value = false
+  tlsDetailRuleId.value = ''
   upstreamTouched.value = []
   isCopyMode.value = false
   copySourceRuleId.value = null
@@ -2749,6 +2779,10 @@ const resetWizard = () => {
   certValidationSeq++
   resetCertInfo()
   wizardForm.tlsKeySet = false // 掩码态随向导重置
+  // 关闭即作废证书详情重试会话（在途响应不得回填下一次打开的表单）
+  tlsDetailSeq++
+  tlsDetailLoading.value = false
+  tlsDetailRuleId.value = ''
   // 关闭向导即清空私钥/证书明文（对齐 MFA secret 关闭即清先例）——
   // 两次打开之间不留明文于响应式状态/DevTools。
   wizardForm.tls_cert = ''
@@ -3519,6 +3553,10 @@ const openCopyWizard = async (rule: Rule) => {
   resetCertInfo()
   wizardForm.tlsKeySet = false // 掩码态随向导重置
   tlsDetailError.value = false
+  // 证书详情重试会话换新：在途响应随旧会话失效
+  tlsDetailSeq++
+  tlsDetailLoading.value = false
+  tlsDetailRuleId.value = ''
   upstreamTouched.value = []
   isCopyMode.value = true
   copySourceRuleId.value = rule.caddy_id

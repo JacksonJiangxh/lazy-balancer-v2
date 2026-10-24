@@ -66,14 +66,21 @@ func (h *Handlers) SetClusterMode(c *gin.Context) {
 		recordAudit(c, "警告", "集群模式", services.FormatAuditDetail("目标：从节点", "使用明文 HTTP 注册，证书私钥将明文传输，建议改用 HTTPS"))
 	}
 	outboundIP, outboundIPOK := dialOutboundIP()
-	if models.ClusterAccessURLTargetsNode(req.MasterURL, outboundIP, h.cfg.Port) {
+	// 探测失败时不得把回环地址当机器地址上报：多台无默认路由的从节点会命中
+	// 主节点 UNIQUE(ip_address,port) 互相覆盖（后注册者重置前者的审批与令牌）。
+	// 上报空串，由主节点按注册来源地址落库（同 getOutboundIP 的口径）。
+	registrationIP := outboundIP
+	if !outboundIPOK {
+		registrationIP = ""
+	}
+	if outboundIPOK && models.ClusterAccessURLTargetsNode(req.MasterURL, outboundIP, h.cfg.Port) {
 		const message = "不能将本节点注册为自己的从节点，请填写另一主节点的地址，或使用提升接口保持主节点角色"
 		recordAudit(c, "切换失败", "集群模式", services.FormatAuditDetail("目标："+masterAuditURL, message))
 		clusterError(c, http.StatusBadRequest, message, nil)
 		return
 	}
 	registration, err := h.syncService.RegisterWithMaster(c.Request.Context(), req.MasterURL, models.ClusterRegisterRequest{
-		Token: req.RegisterToken, Name: name, IPAddress: outboundIP, Port: h.cfg.Port, Protocol: requestProtocol(c),
+		Token: req.RegisterToken, Name: name, IPAddress: registrationIP, Port: h.cfg.Port, Protocol: requestProtocol(c),
 	})
 	if err != nil {
 		recordAudit(c, "切换失败", "集群模式", services.FormatAuditDetail("目标：从节点", err.Error()))
@@ -201,11 +208,11 @@ func (h *Handlers) UpdateClusterSettings(c *gin.Context) {
 }
 
 // switchToSlaveAuditDetail 构建切换从节点的审计详情;出口 IP 探测失败
-// 时追加点名,坏地址对运维可见。
+// 时追加点名——上报地址为空、由主节点按注册来源地址落库，运维可见。
 func switchToSlaveAuditDetail(masterURL string, outboundIPOK bool) string {
 	parts := []string{"主节点 → 从节点", masterURL, "等待审批"}
 	if !outboundIPOK {
-		parts = append(parts, "出口 IP 探测失败，已登记 127.0.0.1，请稍后在节点设置中修正访问地址")
+		parts = append(parts, "出口 IP 探测失败，已按注册来源地址登记，请稍后在节点设置中确认访问地址")
 	}
 	return services.FormatAuditDetail(parts...)
 }

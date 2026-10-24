@@ -1,5 +1,5 @@
 <template>
-  <el-popover v-if="canManage" ref="popoverRef" :width="400" trigger="click" popper-class="ip-location-popper" :popper-options="popperViewportSafe" @before-enter="onPopoverShow">
+  <el-popover v-if="canManage" :width="400" trigger="click" popper-class="ip-location-popper" :popper-options="popperViewportSafe" @before-enter="onPopoverShow">
     <template #reference>
       <span
         class="ip-cell ip-clickable"
@@ -7,8 +7,6 @@
         tabindex="0"
         :aria-label="`IP 处置：${ip}`"
         :title="location ? `${ip} · ${location}` : ip"
-        @keydown.enter.prevent="openPopover"
-        @keydown.space.prevent="openPopover"
       >
         <span class="ip-text">{{ ip }}</span>
         <span v-if="location" class="ip-loc" :title="location">{{ compactLocation }}</span>
@@ -206,16 +204,6 @@ const loadEventCount = async (): Promise<void> => {
 }
 
 const onPopoverShow = (): void => { void loadPolicies(); void loadEventCount() }
-
-// 键盘激活：Enter/Space 不仅要预取数据，还须真正打开弹层——
-// trigger=click 的 el-popover 在非原生 button 上不合成 click，须持 ref 调 open。
-// 中置二次导入并入文件头:79 的 `import { computed, ref }`。
-const popoverRef = ref<{ open: () => void } | null>(null)
-const openPopover = (): void => {
-  // 预取由 el-popover 的 before-enter 统一触发（onPopoverShow）——此处再显式
-  // 调用会让键盘 Enter 打开路径拉取两轮。
-  popoverRef.value?.open()
-}
 
 // —— 信任直接动作（统一模型）：与触发详情弹框共享实现。
 // 信任此 IP 不再依赖顶部列表选择：策略已有信任用途列表→直接加入；

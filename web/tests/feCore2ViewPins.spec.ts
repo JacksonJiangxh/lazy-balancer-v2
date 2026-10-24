@@ -10,10 +10,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { section, source } from './_helpers.ts'
+import { section, code } from './_helpers.ts'
 
 test('状态码列超高时换行，不裁掉 Block badge', () => {
-  const page = source('src/views/Dashboard.vue')
+  const page = code('src/views/Dashboard.vue')
   const rules = section(page, '.status-codes {', '}')
   assert.match(rules, /flex-wrap: wrap/, '必须与列注释承诺的换行兜底一致')
   assert.doesNotMatch(rules, /nowrap/, 'nowrap 会让 flex-shrink:0 的 badge 溢出')
@@ -22,7 +22,7 @@ test('状态码列超高时换行，不裁掉 Block badge', () => {
 })
 
 test('24h 失败 KPI 不再挂只读锁图标', () => {
-  const page = source('src/views/settings/TaskMonitor.vue')
+  const page = code('src/views/settings/TaskMonitor.vue')
   const label = section(page, '<div class="tm-kpi-num" :class="{ \'tm-kpi-bad\': fail24h > 0 }">', '</el-card>')
   assert.doesNotMatch(label, /Lock/, '只读语义由操作列禁用与错误横幅承载，不在单个 KPI 上暗示数据受限')
   assert.doesNotMatch(page, /tm-kpi-lock/, '配套样式属死样式')
@@ -32,7 +32,7 @@ test('24h 失败 KPI 不再挂只读锁图标', () => {
 })
 
 test('规则健康查询在途时记录新版本需求并在收尾补跑', () => {
-  const page = source('src/views/Dashboard.vue')
+  const page = code('src/views/Dashboard.vue')
   assert.match(page, /let ruleHealthInFlight = false/)
   assert.doesNotMatch(page, /isFetchingRuleHealth/, '布尔门已退役')
   const fetchHealth = section(page, 'const fetchRuleHealth = async', 'const controlCaddy')

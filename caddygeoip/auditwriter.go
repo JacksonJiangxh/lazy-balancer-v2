@@ -330,12 +330,17 @@ func auditTimingSweepLocked(now time.Time) {
 			// drain 可能已经取出条目指针并正在等待 closed。删除前先置终态，
 			// 否则后续 close 查表必 miss，等待方只能逐行轮询到超时。
 			e.mu.Lock()
+			// 置位前终态：已被 auditTimingClose 标记的条目其分段已全部消费，
+			// pre 不再有迟到终态需要回填——若一并转入保留区，它们会与真正的
+			// 长请求公平竞争并基本占满上限（高 rps 下保留区≈13.7 条/s 的
+			// 稳态容量被已终态条目吃光，慢请求 pre 反而永远保留不下来）。
+			wasClosed := e.closed
 			e.closed = true
 			preUs, preSet := e.preUs, e.preSet
 			e.mu.Unlock()
 			// 长请求跨 TTL：pre 是链入口分段，转入独立保留区等待终态迟到时
 			// 回填（整条丢弃会让审计行 pre_us 永久「—」）。
-			if preSet {
+			if preSet && !wasClosed {
 				auditRetainPreLocked(item.id, preUs, now)
 			}
 			delete(auditTimingEntries, item.id)

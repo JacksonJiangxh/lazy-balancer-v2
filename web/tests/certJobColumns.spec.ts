@@ -10,16 +10,17 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { code, member, section, source } from './_helpers.ts'
+import { code, member, section } from './_helpers.ts'
 import {
   CERT_JOB_COLUMNS,
   CERT_JOB_COLUMNS_MIN_WIDTH,
+  CERT_JOB_COLUMNS_TOTAL_WIDTH,
   CERT_JOB_COLUMN_WIDTHS,
   certJobColumnsWidth,
   pickVisibleCertJobColumns,
 } from '../src/utils/certJobColumns.ts'
 
-const page = source('src/views/settings/CertJobs.vue')
+const page = code('src/views/settings/CertJobs.vue')
 const tableBody = section(page, 'class="cert-jobs-table"', '</el-table>')
 
 test('模板列宽必须取自单源表（列数与总宽基线由表布局用例承担）', () => {
@@ -37,33 +38,36 @@ test('模板列宽必须取自单源表（列数与总宽基线由表布局用�
 })
 
 test('贪心让位：容器不足时按优先级隐藏，且隐藏后合计不超过容器', () => {
-  // 让位顺序：冷却 → 颁发者 → 自动重签 → 更新时间 → 规则 ID（主键最后让位）
-  const cases: Array<{ width: number; hidden: string[] }> = [
-    { width: 1268, hidden: [] },
-    { width: 1209, hidden: [] },
-    { width: 1140, hidden: ['cooling'] },
-    { width: 1066, hidden: ['cooling', 'issuer'] },
-    { width: 980, hidden: ['cooling', 'issuer', 'renewal'] },
-    { width: 860, hidden: ['cooling', 'issuer', 'renewal', 'updated'] },
-    { width: 600, hidden: ['cooling', 'issuer', 'renewal', 'updated', 'rule_id'] },
-  ]
-  for (const { width, hidden } of cases) {
+  // 让位顺序：冷却 → 颁发者 → 自动重签 → 更新时间 → 规则 ID（主键最后让位）。
+  // 边界宽一律由单源宽度表推出（hidden=k 时「刚好装下」的宽 = 可见列合计）：
+  // 手抄 1268/1209/1140… 这类字面量在合法调宽后会拦住实现与常量表（假红）。
+  const hideOrder = ['cooling', 'issuer', 'renewal', 'updated', 'rule_id'] as const
+  const permanent = ['domain', 'status', 'validity', 'attempts', 'actions'] as const
+  for (let k = 0; k <= hideOrder.length; k++) {
+    const hidden = hideOrder.slice(0, k)
+    const hiddenSet = new Set<string>(hidden)
+    const width = certJobColumnsWidth(CERT_JOB_COLUMNS.filter((id) => !hiddenSet.has(id)))
     const visible = pickVisibleCertJobColumns(width)
-    for (const id of hidden) assert.equal(visible.has(id as never), false, `${width}px 应隐藏 ${id}`)
-    for (const id of ['domain', 'status', 'validity', 'attempts', 'actions'] as const) {
-      assert.equal(visible.has(id), true, `${width}px 不得隐藏 ${id}`)
-    }
+    for (const id of hidden) assert.equal(visible.has(id), false, `${width}px 应隐藏 ${id}`)
+    for (const id of permanent) assert.equal(visible.has(id), true, `${width}px 不得隐藏 ${id}`)
     const total = certJobColumnsWidth(visible)
-    if (hidden.length < 5) {
+    if (k < hideOrder.length) {
       assert.ok(total <= width, `${width}px 可见列合计 ${total} 仍超出容器`)
+      assert.equal(visible.size, CERT_JOB_COLUMNS.length - k, `${width}px 恰好让位 ${k} 列（不多不少）`)
+      // 边界下方 1px 必须再让一列——顺序与边界同时钉住
+      const tighter = pickVisibleCertJobColumns(width - 1)
+      assert.equal(tighter.has(hideOrder[k]), false, `${width - 1}px 必须让位 ${hideOrder[k]}`)
+      assert.ok(certJobColumnsWidth(tighter) <= width - 1, `${width - 1}px 让位后仍超宽`)
     } else {
-      // 让位耗尽后仍可能超宽：不可让位列合计 619px > 600px 容器——此时由消费方
-      // 切 .cert-jobs-wrap--scroll 横向滚动（见下方用例），该超宽是显式口径而
-      // 非断言豁免。
-      assert.ok(total > width, `${width}px 让位耗尽后合计 ${total} 应仍超宽（下限 619px）`)
+      // 让位耗尽后仍可能超宽：不可让位列合计 619px 已是下限——此时由消费方切
+      // .cert-jobs-wrap--scroll 横向滚动（见下方用例），该超宽是显式口径而非
+      // 断言豁免。
       assert.equal(total, CERT_JOB_COLUMNS_MIN_WIDTH)
+      assert.ok(total > width - 1, `${width - 1}px 让位耗尽后合计 ${total} 应仍超宽（下限 ${CERT_JOB_COLUMNS_MIN_WIDTH}px）`)
     }
   }
+  // 容器宽于总宽：不得隐藏任何列
+  assert.equal(pickVisibleCertJobColumns(CERT_JOB_COLUMNS_TOTAL_WIDTH + 59).size, CERT_JOB_COLUMNS.length)
 })
 
 test('容器宽度未知（未测量）时按全列渲染，不闪列', () => {

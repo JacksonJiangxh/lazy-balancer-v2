@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -147,15 +148,19 @@ func TestPurgeOrphanMetricsHistory_batchesRowsPerDelete(t *testing.T) {
 type deleteCountingProbe struct {
 	mu      sync.Mutex
 	deletes int
+	// failAfter >0 时第 failAfter+1 条 DELETE 起注入错误（钉失败路径的
+	// 部分计数：已完整清空的规则数必须如实返回）。
+	failAfter int
 }
 
-func (p *deleteCountingProbe) record(query string) {
+func (p *deleteCountingProbe) record(query string) int {
 	if !strings.Contains(strings.ToLower(query), "delete from metrics_history") {
-		return
+		return 0
 	}
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.deletes++
-	p.mu.Unlock()
+	return p.deletes
 }
 
 func (p *deleteCountingProbe) count() int {
@@ -186,7 +191,10 @@ type deleteCountingConn struct {
 }
 
 func (c *deleteCountingConn) Prepare(query string) (driver.Stmt, error) {
-	c.probe.record(query)
+	n := c.probe.record(query)
+	if n > 0 && c.probe.failAfter > 0 && n > c.probe.failAfter {
+		return nil, errors.New("injected delete failure")
+	}
 	return c.Conn.Prepare(query)
 }
 
@@ -233,5 +241,32 @@ func TestPurgeOrphanMetricsHistory_surfacesMetricsDBError(t *testing.T) {
 
 	if _, err := PurgeOrphanMetricsHistory(t.Context()); err == nil {
 		t.Fatal("metrics 库不可用时必须返回错误（task_runs 落 failed），不得静默成功")
+	}
+}
+
+// Given 两条孤儿规则、第二条规则的 DELETE 注入失败。When 执行清理。
+// Then 错误上抛且返回真实的部分计数（1 条规则已完整清空）——任务日志的
+// 「本轮已清理 N 个规则后中止」必须反映实际进度，否则失败轮无法区分「反复
+// 失败原地打转」与「在推进」（与审计保留清理的部分计数同口径）。
+func TestPurgeOrphanMetricsHistory_failureReturnsPartialCount(t *testing.T) {
+	_, _ = newClusterTestService(t)
+	seedMetricsHistory(t, "lb_partial_1", 1)
+	seedMetricsHistory(t, "lb_partial_2", 1)
+	counter, restore := wrapMetricsDBWithDeleteCounter(t)
+	t.Cleanup(restore)
+	counter.failAfter = 1
+
+	deletedRules, err := PurgeOrphanMetricsHistory(t.Context())
+	if err == nil {
+		t.Fatal("DELETE 失败必须上抛（不得当作清理完成）")
+	}
+	if deletedRules != 1 {
+		t.Fatalf("deletedRules=%d, want 1（失败路径必须返回真实部分计数）", deletedRules)
+	}
+	if got := countMetricsHistory(t, "rule_id='lb_partial_1'"); got != 0 {
+		t.Fatalf("已清空规则残留=%d, want 0", got)
+	}
+	if got := countMetricsHistory(t, "rule_id='lb_partial_2'"); got != 1 {
+		t.Fatalf("失败规则行=%d, want 1（删除失败不得报告已清理）", got)
 	}
 }

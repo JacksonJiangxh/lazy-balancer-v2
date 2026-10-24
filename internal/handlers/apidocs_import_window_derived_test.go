@@ -12,7 +12,6 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
-	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -97,17 +96,12 @@ func derivedImportWindowGatedRoutes(t *testing.T) map[string]string {
 	// apiDocRoutes 的相对路径。注册形态有两种：`("path", h.X)` 与
 	// `("path", someMiddleware(), h.X)`（内联中间件，如限流/认证）——handler
 	// 恒为最后一个参数，取实参区里最后一个 `h.<Name>`。
-	routePattern := regexp.MustCompile(`(?m)^\s*\w+\.(GET|POST|PUT|PATCH|DELETE)\("([^"]+)",(.*)\)`)
-	handlerPattern := regexp.MustCompile(`h\.(\w+)`)
+	// 用 AST 而非逐行正则：多行注册（实参分列、内联闭包）不会被行尾截断整体
+	// 跳过——那类端点会同时逃过派生集合与手工清单两边校验，形成假绿。
 	derived := map[string]string{}
-	for _, match := range routePattern.FindAllStringSubmatch(string(middleware), -1) {
-		handlers := handlerPattern.FindAllStringSubmatch(match[3], -1)
-		if len(handlers) == 0 {
-			continue
-		}
-		handler := handlers[len(handlers)-1][1]
-		if gated[handler] {
-			derived[match[1]+" "+match[2]] = handler
+	for key, registration := range middlewareRouteRegistrations(t, middleware) {
+		if registration.handler != "" && gated[registration.handler] {
+			derived[key] = registration.handler
 		}
 	}
 	return derived

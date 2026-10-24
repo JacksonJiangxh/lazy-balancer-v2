@@ -34,6 +34,12 @@ import (
 const CurrentSnapshotSchema = 3
 
 type clusterSnapshotCache struct {
+	// buildMu 串行化「构建」（只读事务 + 全树 WAF ref + X.509 解析 + 发布）；
+	// mu 只保护字段读写（微秒级）。此前单锁覆盖整段构建：导入/CRS 交换长持
+	// wafFileMu 时，首个 Pull 会阻塞在构建里，其余从端 Pull 全部排在 mu 后
+	// （集群面瞬间停顿）。拆开后等锁期间到达的请求会在拿到 buildMu 后做
+	// 「双检」命中刚发布的缓存，不再各自重建。
+	buildMu     sync.Mutex
 	mu          sync.Mutex
 	initialized bool
 	version     int
@@ -180,8 +186,10 @@ func (s *ClusterService) ConfirmRegistration(ctx context.Context, token string) 
 func (s *ClusterService) cachedSnapshot(ctx context.Context) (models.ClusterSnapshot, json.RawMessage, string, error) {
 	value, _ := clusterSnapshotCaches.LoadOrStore(s.db, &clusterSnapshotCache{})
 	cache := value.(*clusterSnapshotCache)
-	cache.mu.Lock()
-	defer cache.mu.Unlock()
+	// 构建锁（非发布锁）：同一 DB 只允许一个构建在飞，其余请求在获得锁后
+	// 走下方双检直接命中缓存——它们是「等一次构建」而不是「各建一份」。
+	cache.buildMu.Lock()
+	defer cache.buildMu.Unlock()
 
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
@@ -217,8 +225,13 @@ func (s *ClusterService) cachedSnapshot(ctx context.Context) (models.ClusterSnap
 		return models.ClusterSnapshot{}, nil, "", fmt.Errorf("读取同步开关: %w", err)
 	}
 	switchesKey := fmt.Sprintf("%t%t%t", switches.Users, switches.Rules, switches.Security)
-	if cache.initialized && cache.version == version && cache.ownership == ownershipHash && cache.switches == switchesKey && (cache.expiresAt.IsZero() || now.Before(cache.expiresAt)) {
-		return cache.snapshot, cache.canonical, cache.fingerprint, nil
+	// 双检：读字段用 mu（构建已在 buildMu 内串行化，此处只防并发读的撕裂）。
+	cache.mu.Lock()
+	hit := cache.initialized && cache.version == version && cache.ownership == ownershipHash && cache.switches == switchesKey && (cache.expiresAt.IsZero() || now.Before(cache.expiresAt))
+	cachedSnapshot, cachedCanonical, cachedFingerprint := cache.snapshot, cache.canonical, cache.fingerprint
+	cache.mu.Unlock()
+	if hit {
+		return cachedSnapshot, cachedCanonical, cachedFingerprint, nil
 	}
 	snapshot, err := s.buildFullSnapshot(ctx, tx)
 	if err != nil {
@@ -241,6 +254,7 @@ func (s *ClusterService) cachedSnapshot(ctx context.Context) (models.ClusterSnap
 	if err := tx.Commit(); err != nil {
 		return models.ClusterSnapshot{}, nil, "", fmt.Errorf("提交集群快照事务: %w", err)
 	}
+	cache.mu.Lock()
 	cache.initialized = true
 	cache.version = snapshot.Version
 	cache.snapshot = snapshot
@@ -249,6 +263,7 @@ func (s *ClusterService) cachedSnapshot(ctx context.Context) (models.ClusterSnap
 	cache.ownership = ownershipHash
 	cache.switches = switchesKey
 	cache.expiresAt = nearestSnapshotCertificateExpiry(snapshot.Certs, now)
+	cache.mu.Unlock()
 	return snapshot, canonical, fingerprint, nil
 }
 
@@ -1347,8 +1362,8 @@ func (s *ClusterService) snapshotCertificates(ctx context.Context, store snapsho
 		COALESCE(j.renewal_attempts,0),j.ca_available_after,COALESCE(j.last_error_code,''),COALESCE(julianday(COALESCE(j.updated_at,j.created_at)),0),j.id,
 		COALESCE(j.created_at,''),COALESCE(j.updated_at,'')
 		FROM lb_rules r JOIN cert_jobs j ON j.rule_id=r.caddy_id
-		WHERE r.enabled=1 AND r.enable_tls=1 AND r.tls_source='acme_dns' AND j.status<>'disabled'
-		AND COALESCE(j.cert_pem,'')<>'' AND COALESCE(j.key_pem,'')<>''
+		WHERE r.enabled=1 AND r.enable_tls=1 AND r.tls_source='acme_dns'
+		AND `+CertJobMaterialPredicateSQL("j")+`
 		ORDER BY r.caddy_id`)
 	if err != nil {
 		return nil, fmt.Errorf("读取快照 ACME 证书: %w", err)

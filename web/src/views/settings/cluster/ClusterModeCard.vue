@@ -38,6 +38,8 @@
       width="min(560px, 92vw)"
       top="5vh"
       :close-on-click-modal="false"
+      :close-on-press-escape="!loading"
+      :show-close="!loading"
       append-to-body
       destroy-on-close
     >
@@ -62,7 +64,7 @@
           <div class="form-tip-line">在主节点「集群管理」页面生成</div>
         </el-form-item>
         <el-form-item label="节点名称" prop="node_name">
-          <el-input v-model="form.node_name" placeholder="选填，例如：上海从节点" />
+          <el-input v-model="form.node_name" placeholder="选填，例如：上海从节点" maxlength="100" show-word-limit />
         </el-form-item>
       </el-form>
       <template #footer>

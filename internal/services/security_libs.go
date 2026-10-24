@@ -34,8 +34,9 @@ func SecurityLibrariesAvailable() bool {
 }
 
 // securityLibrariesMissingDesc 供告警日志的缺失描述（如「CRS 规则库」）。
-func securityLibrariesMissingDesc() string {
-	crsOK, ip2regionOK := SecurityLibraryStatus()
+// 接收已探测结果——调用方刚做过 SecurityLibraryStatus（rules 树 WalkDir +
+// xdb stat），不得在描述里再探一轮。
+func securityLibrariesMissingDesc(crsOK, ip2regionOK bool) string {
 	missing := ""
 	if !crsOK {
 		missing = "CRS 规则库"
@@ -56,15 +57,35 @@ func securityLibrariesMissingDesc() string {
 // 降级/弱化配置（窗口为百毫秒级，调用方重试即可）。
 var errCRSTreeSwapInFlight = errors.New("CRS 规则树正在更新（树交换中），本轮配置生成已中止；请稍后重试")
 
-// crsTreeSwapInFlight 标记树交换窗口（swapCRSTreeFromStaging 的
-// RemoveAll→moveTree→setup 落盘段）。渲染侧不持 wafFileMu——渲染/重载在
-// CaddyOpLock 临界区内，而全局锁序为导入=排空→wafFileMu→CaddyOpLock，
-// 持 CaddyOpLock 再取 wafFileMu 即反向嵌套（AB-BA），故以代际标记代替加锁：
-// 窗口内生成直接失败，窗口结束后由调用方重试。
-var crsTreeSwapInFlight atomic.Bool
+// crsTreeSwapDepth 是树交换窗口的嵌套深度（>0=有树搬移正在进行）。所有会
+// 搬移 live rules 树的路径都必须进入窗口：swapCRSTreeFromStaging 的
+// RemoveAll→moveTree→setup 落盘段、restoreRulesBackup 的
+// live→rules.old→bak 搬移、replaceDirFrom（快照恢复/播种）的
+// RemoveAll→rename 段，以及 seed 的残缺树清除段。渲染侧不持 wafFileMu——
+// 渲染/重载在 CaddyOpLock 临界区内，而全局锁序为导入=排空→wafFileMu→
+// CaddyOpLock，持 CaddyOpLock 再取 wafFileMu 即反向嵌套（AB-BA），故以
+// 代际标记代替加锁：窗口内生成直接失败，窗口结束后由调用方重试。
+// 用计数而非布尔：内层窗口（swap 段的恢复路径、seed 内的 replaceDirFrom）
+// 退出时不得清除外层仍在进行的标记。
+var crsTreeSwapDepth atomic.Int32
 
 // crsTreeSwapInFlightNow 报告是否处于 CRS 树交换窗口（生成期互斥探针）。
-func crsTreeSwapInFlightNow() bool { return crsTreeSwapInFlight.Load() }
+func crsTreeSwapInFlightNow() bool { return crsTreeSwapDepth.Load() > 0 }
+
+// enterCRSTreeSwapWindow 进入树交换窗口并返回退出函数。窗口可嵌套（同一
+// 时刻只有一个持 wafFileMu 的树搬移在跑，内层只是外层调用的收窄段）。
+func enterCRSTreeSwapWindow() (leave func()) {
+	crsTreeSwapDepth.Add(1)
+	return func() { crsTreeSwapDepth.Add(-1) }
+}
+
+// withTreeSwapWindow 在 fn 执行期间置位树交换窗口标记（含 panic/早退的
+// 对称清除）。
+func withTreeSwapWindow(fn func() error) error {
+	leave := enterCRSTreeSwapWindow()
+	defer leave()
+	return fn()
+}
 
 // SetSecurityLibsDirsForTest 注入 CRS/IP2Region 库路径（handlers 等跨包渲染类
 // 测试用——缺库形态安全链整体不渲染，名单投影/热路径无从谈起）。返回恢复函数。

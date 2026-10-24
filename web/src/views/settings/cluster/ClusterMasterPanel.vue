@@ -17,7 +17,7 @@
           :loading="settingsLoading"
           @change="(v: string | number | boolean) => handleSwitchChange(item.key, v)"
         />
-        <span class="form-tip-inline" :title="item.tip">{{ item.tip }}</span>
+        <span class="form-tip-inline switch-tip-nowrap" :title="item.tip">{{ item.tip }}</span>
         <FieldHelpIcon :content="syncSwitchFreezeHint" />
       </el-form-item>
     </el-form>
@@ -44,11 +44,11 @@
           <el-tooltip v-if="versionIncompatibilityError(row)" :content="versionIncompatibilityError(row)" placement="top">
             <el-tag type="danger" size="small">版本不兼容</el-tag>
           </el-tooltip>
-          <!-- v2.3.0:状态 hover 展示从节点规则库版本(跟随主节点同步,用户裁定) -->
-          <el-tooltip v-else-if="row.health?.crs_version || row.health?.ip2region_version" placement="top">
+          <!-- 状态 hover 展示从节点四个规则库版本（跟随主节点同步，名称与
+               规则库列表严格一致；缺失显示「—」） -->
+          <el-tooltip v-else-if="nodeLibraryVersions(row)" placement="top">
             <template #content>
-              <div>CRS：{{ row.health?.crs_version || '—' }}</div>
-              <div>IP2Region：{{ row.health?.ip2region_version || '—' }}</div>
+              <div v-for="item in nodeLibraryVersions(row)" :key="item.label">{{ item.label }}：{{ item.version }}</div>
             </template>
             <el-tag :type="statusType(row.status)" size="small">{{ statusLabel(row.status) }}</el-tag>
           </el-tooltip>
@@ -198,6 +198,23 @@ const healthSummary = (health: ClusterHealth): string => {
   return health.last_sync_error ? `${summary} · ${health.last_sync_error}` : summary
 }
 
+// 规则库版本行——名称与 SecurityRules 规则库列表严格一致（单源语义：
+// CRS 规则库 / IP 地理库 / 威胁情报库 / 爬虫地址库），缺失显示「—」。
+const NODE_LIBRARY_FIELDS = [
+  { label: 'CRS 规则库', key: 'crs_version' },
+  { label: 'IP 地理库', key: 'ip2region_version' },
+  { label: '威胁情报库', key: 'threat_version' },
+  { label: '爬虫地址库', key: 'crawler_version' },
+] as const satisfies readonly { readonly label: string; readonly key: keyof ClusterHealth }[]
+
+const nodeLibraryVersions = (node: ClusterNodeWithSyncError): { label: string; version: string }[] | null => {
+  const health = node.health
+  if (!health) return null
+  const rows = NODE_LIBRARY_FIELDS.map(({ label, key }) => ({ label, version: health[key] || '—' }))
+  // 四个版本全缺失时不挂 tooltip（与服务端未上报版本同形，避免空 tooltip）
+  return rows.some(row => row.version !== '—') ? rows : null
+}
+
 const offlineDuration = (lastSeen: string | null | undefined): string => {
   if (!lastSeen) return ''
   const last = new Date(lastSeen).getTime()
@@ -248,7 +265,8 @@ const versionIncompatibilityError = (node: ClusterNodeWithSyncError): string => 
 .card-tip { font-size: 12px; color: #9ca3af; white-space: nowrap; flex-shrink: 0; }
 .settings-form :deep(.el-form-item__label) { white-space: nowrap; }
 .settings-form :deep(.el-form-item__content) { flex-wrap: nowrap; }
-.settings-form .form-tip-inline { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+/* 不换行截断由本页专用修饰类承载——全局 .form-tip-inline 不得在 scoped 中重定义。 */
+.settings-form .switch-tip-nowrap { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
 .card-title { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; color: var(--text-primary); }
 .mono-value { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
 .version-cell { display: flex; align-items: center; gap: 6px; flex-wrap: nowrap; min-width: 0; }

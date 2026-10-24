@@ -301,7 +301,7 @@ func (m *CrawlerUpdateManager) RunUpdate(ctx context.Context, rc taskengine.RunC
 	// demote/导入排空/进程停止的取消不推进（引擎侧同样不消费槽，恢复后补跑）。
 	defer func() {
 		if outcome == "cancelled" && userCancelledRun(ctx) {
-			advanceSourceSlotsAfterUserCancel("security_crawler_sources", rc.Trigger, crawlerNextSlot)
+			advanceSourceSlotsAfterUserCancel("security_crawler_sources", rc.Trigger, nil, crawlerNextSlotStrict)
 		}
 	}()
 	defer func() {
@@ -602,14 +602,35 @@ const crawlerSlotAdvanceSQL = `next_update=IIF(` + slotAdvanceGateSQL + `, ?, ne
 // 槽），失败落仍走 crawlerSlotAdvanceSQL（仅 auto）。
 const crawlerSlotSuccessSQL = `next_update=IIF(` + slotSuccessGateSQL + `, ?, next_update)`
 
+// crawlerSlotSuccessAssign 爬虫源族成功落的赋值片段与参数（成功门 trigger
+// 两次 + 槽值）。排程不可读时返回 no-op 片段与零参数：状态照常落库、预约
+// 保持旧值——写路径不得用默认排程覆盖用户的星期/HH:MM。
+func crawlerSlotSuccessAssign(trigger string) (string, []any) {
+	slot, err := crawlerNextSlotStrict(time.Now().UTC())
+	if err != nil {
+		return noopSlotAssignSQL, nil
+	}
+	return crawlerSlotSuccessSQL, []any{trigger, trigger, slot}
+}
+
+// crawlerSlotAdvanceAssign 爬虫源族失败落的赋值片段与参数（仅 auto 推进）。
+func crawlerSlotAdvanceAssign(trigger string) (string, []any) {
+	slot, err := crawlerNextSlotStrict(time.Now().UTC())
+	if err != nil {
+		return noopSlotAssignSQL, nil
+	}
+	return crawlerSlotAdvanceSQL, []any{trigger, slot}
+}
+
 // markCrawlerSourceSuccess 源成功态：entry_count 更新 + version=成功日期 +
 // consecutive_failures 清零 + next_update 按排程槽推进门更新。返回落库错误
 // （与威胁族 markSourceSuccess 同口径）：吞错会让任务终态 success 而源行停留
 // running、next_update 不推进——任务日志与源状态机互相矛盾。
 func markCrawlerSourceSuccess(name, trigger string, entryCount int) error {
-	next := crawlerNextSlot(time.Now().UTC())
-	_, err := db.DB.Exec(`UPDATE security_crawler_sources SET entry_count=?, version=?, update_status='success', message='', consecutive_failures=0, `+crawlerSlotSuccessSQL+`, finished_at=datetime('now') WHERE name=?`,
-		entryCount, time.Now().UTC().Format("2006.01.02"), trigger, trigger, next, name)
+	slotSQL, slotArgs := crawlerSlotSuccessAssign(trigger)
+	args := append(append([]any{entryCount, time.Now().UTC().Format("2006.01.02")}, slotArgs...), name)
+	_, err := db.DB.Exec(`UPDATE security_crawler_sources SET entry_count=?, version=?, update_status='success', message='', consecutive_failures=0, `+slotSQL+`, finished_at=datetime('now') WHERE name=?`,
+		args...)
 	if err != nil {
 		Logf("error", "crawlerbot-update: 源 %s 写成功态失败: %v", name, err)
 	}
@@ -634,8 +655,9 @@ func markCrawlerSourceCancelled(name string) error {
 // 已更新而快照写失败」误述成「保留上次快照」。
 // 返回落库错误（同 markCrawlerSourceSuccess）。
 func markCrawlerSourceFailed(name, trigger, message string) error {
-	next := crawlerNextSlot(time.Now().UTC())
-	_, err := db.DB.Exec(`UPDATE security_crawler_sources SET update_status='failed', message=?, consecutive_failures=consecutive_failures+1, `+crawlerSlotAdvanceSQL+`, finished_at=datetime('now') WHERE name=?`, message, trigger, next, name)
+	slotSQL, slotArgs := crawlerSlotAdvanceAssign(trigger)
+	args := append(append([]any{message}, slotArgs...), name)
+	_, err := db.DB.Exec(`UPDATE security_crawler_sources SET update_status='failed', message=?, consecutive_failures=consecutive_failures+1, `+slotSQL+`, finished_at=datetime('now') WHERE name=?`, args...)
 	if err != nil {
 		Logf("error", "crawlerbot-update: 源 %s 写失败态失败: %v", name, err)
 	}

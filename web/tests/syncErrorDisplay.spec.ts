@@ -7,7 +7,7 @@ import assert from 'node:assert/strict'
 
 import { formatSyncErrorDisplay } from '../src/utils/syncErrorDisplay.ts'
 
-import { repoSource } from './_helpers.ts'
+import { repoCode } from './_helpers.ts'
 
 test('非 apply_failed 或空状态原样透出 last_sync_error', () => {
   assert.equal(formatSyncErrorDisplay(undefined), '')
@@ -65,8 +65,8 @@ test('后续失败段只贡献「第 N 次」，不混进原因', () => {
 test('机内标记与后端 cluster_sync.go / models 逐字对齐（跨栈钉）', () => {
   // 翻译依赖后端机内标记 apply_ok_reload_failed 与 sync_error_code=apply_failed——
   // 后端改标记/改码即静默退回原文透出。
-  const go = repoSource('internal/services/cluster_sync.go')
+  const go = repoCode('internal/services/cluster_sync.go')
   assert.ok(go.includes('"apply_ok_reload_failed"'), 'cluster_sync.go 不再产生 apply_ok_reload_failed 标记')
-  const models = repoSource('internal/models/cluster.go')
+  const models = repoCode('internal/models/cluster.go')
   assert.ok(models.includes('SyncErrorCodeApplyFailed      SyncErrorCode = "apply_failed"'), 'apply_failed 码漂移')
 })

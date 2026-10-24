@@ -10,7 +10,7 @@ import {
   degradedMetricLabels,
   degradedMetricParts,
 } from '../src/utils/systemMetrics.ts'
-import { source } from './_helpers.ts'
+import { code } from './_helpers.ts'
 
 test('降级分项解析：已知值成集、未知值忽略、顺序稳定', () => {
   assert.deepEqual([...degradedMetricParts(undefined)], [])
@@ -34,7 +34,7 @@ test('分项成集语义：缺失/空=可用，CPU 失败不牵连内存/磁盘'
 })
 
 test('Dashboard 系统资源卡按分项降级渲染（失败项显「采集失败」且不画进度）', () => {
-  const page = source('src/views/Dashboard.vue')
+  const page = code('src/views/Dashboard.vue')
   assert.match(page, /degradedMetricParts\(systemMetrics\.value\?\.degraded\)/)
   assert.match(page, /degradedMetricLabels\(systemMetrics\.value\?\.degraded\)/)
   // 分项提示复用全局 info-note-bar（不得局部新造样式）

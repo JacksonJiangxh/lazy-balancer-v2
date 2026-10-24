@@ -32,7 +32,7 @@ import {
 import { ADMIN1_PROVINCES } from '../src/utils/admin1Provinces.ts'
 import { CHINA_PROVINCES } from '../src/utils/chinaProvinces.ts'
 import { WORLD_COUNTRIES } from '../src/utils/worldBorders.ts'
-import { source, stripComments } from './_helpers.ts'
+import { code, stripComments } from './_helpers.ts'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = join(HERE, '..')
@@ -173,7 +173,7 @@ test('④c 已退役取景辅助零生产消费方（fitDrillZoom / zoomAt）', 
       if (!/\.(ts|vue)$/.test(entry.name)) continue
       // 先剥注释：注释里的历史说明不构成生产消费（否则维护者只能删说明或
       // 放宽扫描正则，两者都会削弱绊线）。
-      if (/\b(fitDrillZoom|zoomAt)\b/.test(stripComments(source(relative(ROOT, full))))) offenders.push(full)
+      if (/\b(fitDrillZoom|zoomAt)\b/.test(stripComments(code(relative(ROOT, full))))) offenders.push(full)
     }
   }
   walk(srcDir)
@@ -283,8 +283,8 @@ test('⑥b地球拾取：射线背向球面/未命中返回 null', () => {
 })
 
 test('⑦地图/地球引擎修复契约', () => {
-  const mapSrc = source('src/utils/threatScene.ts')
-  const globeSrc = source('src/utils/threatGlobe.ts')
+  const mapSrc = code('src/utils/threatScene.ts')
+  const globeSrc = code('src/utils/threatGlobe.ts')
   assert.match(mapSrc, /POINTY_TOP_HEX_VERTICES/, '地图点阵必须消费六边形顶点，而非圆弧')
   assert.doesNotMatch(mapSrc, /path\.arc\(x, y, r|ctx2\.arc\(x, y, r/)
   assert.match(mapSrc, /drillCountryAllowed\(opts\?\.drillCountries, country\)/, '地图必须执行下钻白名单')
@@ -417,7 +417,7 @@ test('③省板包含：10 国省级 bbox ⊆ 国家 bbox ±18°（拦截生成/
     ['src/utils/admin1Provinces.ts', /export const ADMIN1_PROVINCES: Record<string, Admin1Province\[\]> = \{/],
     ['src/utils/chinaProvinces.ts', /export const CHINA_PROVINCES: ChinaProvince\[\] = \[/],
   ] as const) {
-    const src = source(relative)
+    const src = code(relative)
     assert.match(src, exportPattern, `${relative} 必须导出静态字面量`)
     assert.doesNotMatch(src, /\bfetch\(|XMLHttpRequest/, `${relative} 不得运行时抓取数据`)
   }
@@ -447,7 +447,7 @@ test('⑤b 合成跨日界线环：principalBounds 的 ±180 unwrap 分支真正
   assert.equal((b.minLon + b.maxLon) / 2, 180)
 })
 test('2D 光流池满时拒绝新弧线，不淘汰已开始动画', () => {
-  const src = source('src/utils/threatScene.ts')
+  const src = code('src/utils/threatScene.ts')
   const start = src.indexOf('function spawnArc(')
   const end = src.indexOf('function spawnRipple(', start)
   assert.ok(start >= 0 && end > start, 'spawnArc 缺失')

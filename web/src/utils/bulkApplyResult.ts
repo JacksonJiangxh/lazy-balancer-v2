@@ -10,7 +10,7 @@
 /** 后端退化 200 的 message 标记（DB 已提交、Caddy 应用失败） */
 export const CADDY_APPLY_FAILED_MARKER = 'Caddy 配置应用失败'
 
-export interface BulkResponseLike {
+interface BulkResponseLike {
   message?: string
 }
 

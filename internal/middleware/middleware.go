@@ -325,7 +325,7 @@ const (
 )
 
 // isProtectedRateLimitKey 报告键是否承载登录/注册类爆破防护窗口：键形为
-// <ip>|login（登录/MFA/setup/OIDC 登录共桶）与 <ip>|register（公开注册端点）。
+// <ip>|login（登录/MFA/setup 建号/OIDC 登录共桶）与 <ip>|register（公开注册端点）。
 func isProtectedRateLimitKey(key string) bool {
 	return strings.HasSuffix(key, "|login") || strings.HasSuffix(key, "|register")
 }
@@ -360,10 +360,11 @@ var loginRateBuckets = struct {
 }{entries: make(map[string]*loginRateBucket)}
 
 // loginRateLimit 登录族端点限流（10/min/IP：login/ticket-login/mfa-verify/
-// setup×2/oidc-login 共用同一桶）。与 clusterRateLimit
+// setup 建号/oidc-login 共用同一桶）。与 clusterRateLimit
 // 桶机制收敛——共享 loginRateBuckets map、1024 容量上限、分钟窗、429 形态全同，
 // 差异仅键形（ip|scope）/限额/文案三个参数；五端点同 scope="login" 共桶语义
-// 不变（内存态无迁移面），oidc/setup 共桶钉测试为回归钉。
+// 不变（内存态无迁移面），oidc-login 共桶钉测试为回归钉。只读的 GET /auth/setup
+// 不在本桶（独立 setup-status 宽桶，见注册处注释）。
 func loginRateLimit() gin.HandlerFunc {
 	return clusterRateLimit("login", 10, "登录尝试过于频繁，请稍后再试")
 }
@@ -707,14 +708,37 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 			// 历史 把真实客户端 IP 注入 MCP 转发 context——内部
 			// 转发是本机回环自调用，不注入则 MCP 操作的审计源 IP 恒为
 			// 127.0.0.1（接收端 auditClientIP 凭内部认证密钥采信）。
-			c.Request = c.Request.WithContext(mcpserver.WithClientIP(c.Request.Context(), c.ClientIP()))
+			ctx := mcpserver.WithClientIP(c.Request.Context(), c.ClientIP())
+			// 请求体已在上方读完：顺手解析 JSON-RPC 定位字段（method/id）随 context
+			// 传入，tools/list 可见性过滤不再对同一 1 MiB 请求体做第二次读取+解析。
+			// 解析失败不注入 method（下游按非 tools/list 放行，MCP 协议层自会 400）。
+			var rpcMeta struct {
+				Method string          `json:"method"`
+				ID     json.RawMessage `json:"id"`
+			}
+			meta := mcpserver.RequestMeta{}
+			if json.Unmarshal(body, &rpcMeta) == nil {
+				meta = mcpserver.RequestMeta{Method: rpcMeta.Method, ID: rpcMeta.ID}
+			}
+			ctx = mcpserver.WithRequestMeta(ctx, meta)
+			// API Key 身份已在 apiKeyAuth 中解析（同一次 db.ResolveAPIKeyIdentity）：
+			// 属主属性随 context 复用，可见性判定不再重复点查。
+			if c.GetString("auth_type") == "api_key" {
+				ctx = mcpserver.WithAPIKeyVisibility(ctx, c.GetBool("api_key_read_only"), c.GetString("role") == "admin")
+			}
+			c.Request = c.Request.WithContext(ctx)
 			gin.WrapH(mcpHandler)(c)
 		})
 		v1.GET("/docs", h.GetAPIDocs)
 		v1.POST("/auth/login", loginRateLimit(), h.Login)
 		v1.POST("/auth/ticket-login", loginRateLimit(), h.TicketLogin)
 		v1.POST("/auth/mfa/verify", loginRateLimit(), h.MFAVerifyLogin)
-		v1.GET("/auth/setup", loginRateLimit(), h.GetSetupStatus)
+		// GET /auth/setup 是登录页挂载即调用的只读探测（登录页每次打开一次，
+		// 403 分支复探）——与登录写共用 10/min 桶会让同一出口 IP 打开 10 次
+		// 登录页就耗尽登录预算（企业 NAT/反代后共享地址场景），正常用户随即
+		// 收到「登录尝试过于频繁」。改为独立宽桶（与 oidc-status 同口径
+		// 60/min/IP），POST /auth/setup（真实建号=爆破相关面）仍留登录桶。
+		v1.GET("/auth/setup", clusterRateLimit("setup-status", 60, "初始化状态查询过于频繁，请稍后再试"), h.GetSetupStatus)
 		v1.POST("/auth/setup", loginRateLimit(), h.SetupAdmin)
 		// OIDC 公开链路(v2.3.0):status=登录页按钮显隐;login=跳转;
 		// callback=授权码回调(失败 302 回前端错误页)。均登录前可达,

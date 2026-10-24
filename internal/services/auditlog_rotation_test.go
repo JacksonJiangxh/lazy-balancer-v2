@@ -708,3 +708,88 @@ func TestRotateAuditLog_deferredDoesNotCopyOrShift(t *testing.T) {
 		t.Fatalf("rows=%d, want 2（A + 补完的事务）", rows)
 	}
 }
+
+// Given 摄取偏移落后活文件尾部（复制前闸门触发并追平）。When 轮转完成。
+// Then 归档（.1）补采起点抬到闸门的 reached——闸门刚解析提交的区间不得在
+// 轮转后从 .1 二次解析（每次固定多付一遍 ≤8MiB JSON 解码，去重只保证不重复
+// 成行，不省 CPU）。
+func TestRotateAuditLog_gateIngestAdvancesRotatedIngestStart(t *testing.T) {
+	// Given：可用事件库 + 已摄取到 EOF 的活文件 + 小阈值
+	dataDir := t.TempDir()
+	if err := initSecurityEventsTestDB(t, dataDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.InitializeMetricsDB(dataDir); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	offsetPath := filepath.Join(dir, "security_events.offset")
+	oldLogPath, oldOffsetPath, oldSizeBytes := auditLogPath, securityEventsOffsetPath, auditLogSizeBytes
+	oldHook := auditLogRotatedIngestFrom
+	auditLogPath, securityEventsOffsetPath = logPath, offsetPath
+	auditLogSizeBytes = func() int64 { return 1 }
+	t.Cleanup(func() {
+		auditLogPath, securityEventsOffsetPath, auditLogSizeBytes = oldLogPath, oldOffsetPath, oldSizeBytes
+		auditLogRotatedIngestFrom = oldHook
+	})
+
+	appendDoc := func(seq int) {
+		doc := strings.Replace(securityEventsFixtureClean, "tx-clean-1", fmt.Sprintf("tx-gate-%d", seq), 1) + "\n"
+		f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.WriteString(doc); err != nil {
+			_ = f.Close()
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for seq := range 2 {
+		appendDoc(seq)
+	}
+	tailer := securityEventsNewTailer(logPath, offsetPath)
+	if err := tailer.securityEventsTick(); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	offsetBefore, err := securityEventsReadOffset(offsetPath)
+	if err != nil {
+		t.Fatalf("read offset: %v", err)
+	}
+
+	// When：再追写两条（offset 落后 → 闸门需先补采），然后轮转
+	for seq := 2; seq < 4; seq++ {
+		appendDoc(seq)
+	}
+	liveInfo, err := os.Stat(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if liveInfo.Size() <= offsetBefore {
+		t.Fatalf("活文件 %d 字节未超过已摄取偏移 %d，闸门不会触发（断言失效）", liveInfo.Size(), offsetBefore)
+	}
+	var ingestFrom int64 = -1
+	auditLogRotatedIngestFrom = func(from int64) { ingestFrom = from }
+	if _, err := rotateAuditLogIfNeeded(); err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+
+	// Then：归档补采起点=闸门 reached（追平时的活文件大小），而非旧偏移
+	if ingestFrom < 0 {
+		t.Fatal("归档补采未执行（观测钩子未被调用）")
+	}
+	if ingestFrom <= offsetBefore {
+		t.Fatalf("归档补采起点=%d, want > %d（闸门已提交的区间不得二次解析）", ingestFrom, offsetBefore)
+	}
+	if ingestFrom != liveInfo.Size() {
+		// JSON 解码器停在最后一条文档末尾：闸门 reached 可能落在文档间空白
+		// （尾随换行）之前 —— 等价断言是「起点之后的剩余字节只有空白」。
+		// 活文件此时已被截断，同内容在 .1 归档里。
+		if ingestFrom > liveInfo.Size() || !auditLogTailOnlyWhitespace(logPath+".1", ingestFrom, liveInfo.Size()) {
+			t.Fatalf("归档补采起点=%d, want 闸门追平后的位置（活文件 %d 字节；剩余字节必须只有空白）", ingestFrom, liveInfo.Size())
+		}
+	}
+}

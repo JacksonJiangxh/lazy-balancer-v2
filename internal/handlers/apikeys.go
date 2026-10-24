@@ -89,8 +89,11 @@ func purgeAllAPIKeyWhitelistCache() {
 
 // apiKeyListColumns API Key 列表查询的列清单（单一事实源：两处
 // handler 共用，新增列只改一处）。布尔列一律 COALESCE：带外写入/历史数据
-// 的 NULL 扫进 bool 会整表 500，鉴权侧（db.ResolveAPIKeyIdentity）同口径
-// 已按缺省收敛（mcp_enabled=0/read_only=0/is_enabled=1）。
+// 的 NULL 扫进 bool 会整表 500。鉴权侧（db.ResolveAPIKeyIdentity）对
+// mcp_enabled/read_only 同口径 COALESCE，但 is_enabled **刻意保持裸比较**
+// （NULL 行鉴权 fail-closed 401）：此处列表按 COALESCE(is_enabled,1) 显示
+// 「启用」与鉴权结果不一致是已知的有意取舍——不得把鉴权侧改成 COALESCE
+// 放行 NULL 行，排障时以「列表显示启用但调用恒 401」记录该形态。
 const apiKeyListColumns = `k.id, k.name, k.key_prefix, k.created_by, k.last_used, k.expires_at,
 	COALESCE(k.is_enabled,1), COALESCE(k.mcp_enabled,0), COALESCE(k.read_only,0),
 	COALESCE(k.mcp_ip_whitelist,''), k.created_at, u.username`

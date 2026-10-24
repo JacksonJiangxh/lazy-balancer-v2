@@ -109,7 +109,7 @@ func (m *CRSUpdateManager) RuleCount() int {
 		return m.ruleCount
 	}
 	m.mu.Unlock()
-	count, err := countSecRules(filepath.Join(m.crsDir, "rules"))
+	count, err := countSecRules(filepath.Join(m.liveDir(), "rules"))
 	if err != nil {
 		Logf("error", "crs update: failed to count SecRules: %v", err)
 		return 0
@@ -127,7 +127,7 @@ func (m *CRSUpdateManager) RuleCount() int {
 }
 
 func (m *CRSUpdateManager) rescanRuleCount() {
-	count, err := countSecRules(filepath.Join(m.crsDir, "rules"))
+	count, err := countSecRules(filepath.Join(m.liveDir(), "rules"))
 	if err != nil {
 		Logf("error", "crs update: failed to rescan SecRules: %v", err)
 		return

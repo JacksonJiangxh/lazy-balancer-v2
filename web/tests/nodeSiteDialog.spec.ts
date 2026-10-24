@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 
 import { initialNodeSiteForm, nearestSiteLocation, nodeSiteCoordsChanged } from '../src/utils/siteLocation.ts'
 import { validateClusterUrl } from '../src/utils/clusterUrl.ts'
-import { repoSource, section, source } from './_helpers.ts'
+import { repoCode, section, code } from './_helpers.ts'
 
 // 问题：继承主节点默认坐标的节点（site_inherited=true，列表接口返回的
 // server_map_lat/lon 是主节点坐标副本），弹框初值必须还原为 0,0 + 空选择——
@@ -33,7 +33,7 @@ test('无变更保存判定为 no-op（直接关闭，不发 PUT 不 bump）', (
 // 消费侧接线：helper 被删/绕过后继承坐标被固化为显式坐标（原 bug 回归），
 // 纯函数用例照样绿——故把两个调用点也钉住。
 test('节点配置弹框用 helper 还原初值与判定变更', () => {
-  const dialog = source('src/views/settings/cluster/ClusterNodeConfigDialog.vue')
+  const dialog = code('src/views/settings/cluster/ClusterNodeConfigDialog.vue')
   assert.match(dialog, /const initial = initialNodeSiteForm\(node\)/, '初值必须经 helper 还原（继承坐标不得预填为可保存值）')
   assert.match(dialog, /const siteChanged = nodeSiteCoordsChanged\(baseline, form\)/, '无变更判定必须走 helper')
 })
@@ -46,7 +46,7 @@ test('主节点地址与访问地址共用校验器（后端 ValidateClusterAcce
   // 规则集机械对表：「后端仍拒绝这五类输入」是前端文案/行为的依据；Go 侧
   // 删改任一条件（而前端继续拒绝）即红。Go 未来新增条件无法机械推断前端
   // 等价实现，须人工同步并加到这里。
-  const go = section(repoSource('internal/models/cluster.go'), 'func ValidateClusterAccessURL(', '\n}\n')
+  const go = section(repoCode('internal/models/cluster.go'), 'func ValidateClusterAccessURL(', '\n}\n')
   for (const condition of [
     'parsed.Scheme != "http" && parsed.Scheme != "https"',
     'parsed.Host == ""',
@@ -76,8 +76,8 @@ test('主节点地址与访问地址共用校验器（后端 ValidateClusterAcce
   assert.equal(url('https://master:8000/#frag'), '访问地址不能包含片段')
   assert.equal(validateClusterUrl('https://user@master', { label: '主节点地址' }), '主节点地址不能包含用户名或密码')
 
-  const dialog = source('src/views/settings/cluster/ClusterNodeConfigDialog.vue')
-  const card = source('src/views/settings/cluster/ClusterModeCard.vue')
+  const dialog = code('src/views/settings/cluster/ClusterNodeConfigDialog.vue')
+  const card = code('src/views/settings/cluster/ClusterModeCard.vue')
   for (const vue of [dialog, card]) {
     assert.match(vue, /import \{ validateClusterUrl \} from '@\/utils\/clusterUrl'/)
   }

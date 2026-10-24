@@ -8,7 +8,7 @@
 // 在 expires_at 为 null 的行上没有任何消费方，页面显示「-」而规则页显示
 // 「剩 N 天」，运维会误判为未签发并重复触发签发。
 
-export interface CertJobExpiryFields {
+interface CertJobExpiryFields {
   expires_at?: string | null
   not_after?: string | null
 }

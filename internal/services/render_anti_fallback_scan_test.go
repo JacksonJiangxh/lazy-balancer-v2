@@ -459,12 +459,12 @@ const (
 // GTR 保留 if 体扫描：`if len(x) > 0 { … }` 体内的字面量赋值由旧扫描器纳入，
 // 收窄会让既有 allowlist 条目腐化——命中面只扩不收。
 func guardBranchOf(cond ast.Expr) guardBranch {
-	bin, isBinary := cond.(*ast.BinaryExpr)
+	bin, isBinary := unparenExpr(cond).(*ast.BinaryExpr)
 	if !isBinary {
 		return guardNone
 	}
 	bin = flippedComparison(bin)
-	lit, isLiteral := bin.Y.(*ast.BasicLit)
+	lit, isLiteral := unparenExpr(bin.Y).(*ast.BasicLit)
 	if !isLiteral {
 		return guardNone
 	}
@@ -559,8 +559,20 @@ func flippedComparison(bin *ast.BinaryExpr) *ast.BinaryExpr {
 }
 
 func isLiteralOperand(expr ast.Expr) bool {
-	lit, ok := expr.(*ast.BasicLit)
+	lit, ok := unparenExpr(expr).(*ast.BasicLit)
 	return ok && (lit.Kind == token.INT || lit.Kind == token.FLOAT || lit.Kind == token.STRING)
+}
+
+// unparenExpr 剥掉包裹表达式的外层括号：`(x == 0)` / `0 == (x)` 与无括号
+// 形态语义等价，不剥会让零值守卫整段逃出命中面。
+func unparenExpr(expr ast.Expr) ast.Expr {
+	for {
+		paren, ok := expr.(*ast.ParenExpr)
+		if !ok {
+			return expr
+		}
+		expr = paren.X
+	}
 }
 
 // isLiteralDefault 报告赋值右值是否为写死字面量默认值（INT/FLOAT/STRING 字面量、
@@ -576,9 +588,12 @@ func isLiteralDefault(rhs ast.Expr) bool {
 			return false
 		}
 		return len(value.Elts) > 0
+	case *ast.ParenExpr:
+		// 括号包裹的字面量（`(0)` / `(5)`）与无括号形态等价。
+		return isLiteralDefault(value.X)
 	case *ast.UnaryExpr:
-		// 负数字面量（-1）与一元取反同属字面量默认值。
-		return value.Op == token.SUB && isLiteralDefault(value.X)
+		// 带符号字面量（-1 / +5）与一元取反同属字面量默认值。
+		return (value.Op == token.SUB || value.Op == token.ADD) && isLiteralDefault(value.X)
 	}
 	return false
 }
@@ -622,7 +637,10 @@ func containsString(list []string, want string) bool {
 //   - `x < 1`（LSS 对比 1，整数域等价 x<=0）；
 //   - `x != 0 { … } else { x = 7 }`（NEQ 对比 0，兜底在 else 链）；
 //   - `switch { case x <= 0: x = 10 }`（switch/case 零值守卫）；
-//   - `if x == 0 { v = c{Timeout: 5} }`（复合字面量默认值）。
+//   - `if x == 0 { v = c{Timeout: 5} }`（复合字面量默认值）；
+//   - `if (x == 0) { … }` / `if x == (0)` / `if 0 == (x)`（括号包裹的等价形态，
+//     不剥括号会让整个守卫逃出命中面）；
+//   - `x = +5`（一元正号字面量）。
 //
 // 每个形态一个夹具：扫描器必须命中（否则「渲染层无写死兜底」第五链可被改写绕过）。
 func TestFallbackScan_detectsEquivalentGuardShapes(t *testing.T) {
@@ -677,6 +695,22 @@ func TestFallbackScan_detectsEquivalentGuardShapes(t *testing.T) {
 		{
 			name:   "float-reversed-zero-guard",
 			source: "package p\nfunc f(x float64) float64 { if 0.0 == x { x = 2.5 }; return x }\n",
+		},
+		{
+			name:   "parenthesized-condition",
+			source: "package p\nfunc f(x int) int { if (x == 0) { x = 5 }; return x }\n",
+		},
+		{
+			name:   "parenthesized-literal-operand",
+			source: "package p\nfunc f(x int) int { if x == (0) { x = 5 }; return x }\n",
+		},
+		{
+			name:   "parenthesized-reversed-guard",
+			source: "package p\nfunc f(x int) int { if 0 == (x) { x = 5 }; return x }\n",
+		},
+		{
+			name:   "unary-plus-literal-default",
+			source: "package p\nfunc f(x int) int { if x == 0 { x = +5 }; return x }\n",
 		},
 	}
 	for _, fixture := range fixtures {

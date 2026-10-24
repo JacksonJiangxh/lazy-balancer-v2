@@ -12,7 +12,7 @@
  */
 
 /** 失败处置的展示内容。 */
-export interface ImportFailureReport {
+interface ImportFailureReport {
   /** 主文案：后端 message（缺省时用调用方兜底文案）。 */
   readonly message: string
   /** 后端 data.warnings，按原顺序（已滤掉空串/非字符串）。 */

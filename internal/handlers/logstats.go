@@ -675,13 +675,13 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		taskLogLimit    *int64
 	)
 	if want("security_events") {
-		auditLogLimit = sizeLimitMB("audit_log_size_mb", 10)
+		auditLogLimit = sizeLimitMB("audit_log_size_mb", db.DefaultAuditLogSizeMB)
 	}
 	if want("runtime") {
-		runtimeLogLimit = sizeLimitMB("runtime_log_size_mb", 100)
+		runtimeLogLimit = sizeLimitMB("runtime_log_size_mb", db.DefaultRuntimeLogSizeMB)
 	}
 	if wantAny("caddy", "caddy_runtime", "caddy_tls", "caddy_server", "caddy_proxy", "rule_access") {
-		caddyLimit = sizeLimitMB("caddy_log_size_mb", 100)
+		caddyLimit = sizeLimitMB("caddy_log_size_mb", db.DefaultCaddyLogSizeMB)
 	}
 	wantsTaskRows := wantAny("certjob", "crs_update", "ip2region_update", "threat_update", "crawlerbot_update")
 	if !wantsTaskRows && requested != nil {
@@ -693,7 +693,7 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 		}
 	}
 	if wantsTaskRows {
-		taskLogLimit = sizeLimitMB("task_log_size_mb", 10)
+		taskLogLimit = sizeLimitMB("task_log_size_mb", db.DefaultTaskLogSizeMB)
 	}
 
 	infos := []LogStorageInfo{
@@ -726,7 +726,7 @@ func (h *Handlers) GetLogStats(c *gin.Context) {
 	}
 	// 保留口径与事件上限只在所请求行内读取（各一次点查）。
 	if info := byKey("audit"); info != nil && want("audit") {
-		info.RetentionNote = "每日清理 · 保留 " + strconv.FormatInt(globalConfigInt("audit_retention_months", 3), 10) + " 个月"
+		info.RetentionNote = "每日清理 · 保留 " + strconv.FormatInt(globalConfigInt("audit_retention_months", db.DefaultAuditRetentionMonths), 10) + " 个月"
 	}
 	if info := byKey("security_events"); info != nil && want("security_events") {
 		// 安全事件行文案/行帽由 services 单源生成（显式

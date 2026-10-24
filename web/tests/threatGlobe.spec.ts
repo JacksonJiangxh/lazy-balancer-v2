@@ -11,9 +11,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { member, source } from './_helpers.ts'
+import { member, code } from './_helpers.ts'
 
-const globeSrc = source('src/utils/threatGlobe.ts')
+const globeSrc = code('src/utils/threatGlobe.ts')
 
 // member() 的可判定前置：切片必须真的包含嵌套块。缩进启发式会在函数内第一个
 // 内层块收尾处截断，块内 banned 标记的 doesNotMatch 断言会假绿——这里先证明

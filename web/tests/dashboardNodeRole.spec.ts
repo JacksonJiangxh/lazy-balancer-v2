@@ -7,9 +7,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { section, source } from './_helpers.ts'
+import { section, code } from './_helpers.ts'
 
-const dashboard = source('src/views/Dashboard.vue')
+const dashboard = code('src/views/Dashboard.vue')
 
 test('角色未知分支位于配置正常/异常之前，且文案与 tag 形态复用既有样式', () => {
   const chain = section(dashboard, 'v-if="authStore.isSlaveNode"', 'configConsistent === \'false\'')

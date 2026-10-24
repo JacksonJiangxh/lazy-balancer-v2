@@ -1176,11 +1176,14 @@ type acmeReferenceInput struct {
 }
 
 // validateRuleACMEReferences 校验 enable_tls+acme_dns 规则的 ACME 引用可解析：
-// acme_config_id 非 0 且引用存在且启用（enabled=1）的 certificate_configs 行
-// （发现4：与 ca_provider 检查及签发侧 certissuer.go 的 AND enabled=1 口径对齐，
-// 引用禁用配置会在签发期查空单任务失败 + TLS 端口明文服务）；ca_provider_id 为
-// 0（系统默认）或引用存在且启用的 ca_providers 行。校验失败返回
-// *configValidationError（调用侧映射 400），查询失败返回普通错误（500）。
+// acme_config_id 非 0 且引用存在且启用（COALESCE(enabled,1)=1）的
+// certificate_configs 行（发现4：与 ca_provider 检查及签发侧 certissuer.go
+// 的同口径对齐，引用禁用配置会在签发期查空单任务失败 + TLS 端口明文服务）；
+// ca_provider_id 为 0（系统默认）或引用存在且启用的 ca_providers 行。校验失败
+// 返回 *configValidationError（调用侧映射 400），查询失败返回普通错误（500）。
+// enabled 的 NULL 按启用处理——与列表展示（COALESCE(enabled,1)）及编辑基线
+// 同一口径：展示「启用」的行必须能绑定，否则 UI 无法一键纠正（开关原值即启用
+// 时保存不写列，NULL 永久保留）。
 // 全部「把规则投入运行/复制引用」入口（Create/Update 写侧、EnableRule、启动与
 // UpdateConfig 聚合校验、DuplicateRule、v2 备份导入）共用本门或其备份行同口径
 // 变体（config_backup.go acmeImportRefIndex.validate），保证悬挂/禁用引用
@@ -1193,7 +1196,7 @@ func validateRuleACMEReferences(input acmeReferenceInput) error {
 		return &configValidationError{message: "使用 ACME 签发时必须选择 DNS 提供商配置"}
 	}
 	var configOK bool
-	if err := db.DB.QueryRow("SELECT EXISTS(SELECT 1 FROM certificate_configs WHERE id = ? AND enabled = 1)", input.ACMEConfigID).Scan(&configOK); err != nil {
+	if err := db.DB.QueryRow("SELECT EXISTS(SELECT 1 FROM certificate_configs WHERE id = ? AND COALESCE(enabled,1) = 1)", input.ACMEConfigID).Scan(&configOK); err != nil {
 		return fmt.Errorf("校验 DNS 提供商配置失败: %v", err)
 	}
 	if !configOK {
@@ -1295,6 +1298,8 @@ func mixedUpstreamPoolError(rule models.LbRule) error {
 
 // validateTCPTryWindowBounds 是重试窗口的单源值域门：保存族
 // （Create/Update/复制）与存量门（单规则启用、启动/UpdateConfig 聚合）共用。
+// 回填默认与渲染单位同源：tcp_try_interval 的 0 值由启动回填与传输归一回填为
+// db.DefaultTCPTryInterval（250 毫秒，渲染输出 "250ms"，见 models 字段注释）。
 // http 侧 tcp_try_duration ∈ [-1,60000]（-1=显式禁用重试，NTLM 接管态），
 // tcp 规则 ∈ [0,60000]（L4 无哨兵语义）；两协议同值上界 60000——越界值落库
 // 后 L4 proxy try_duration 溢出、http 侧亦为死值。duration>0 时 interval 必须

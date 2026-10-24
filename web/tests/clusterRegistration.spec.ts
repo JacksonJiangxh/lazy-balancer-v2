@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { shouldCloseRegistrationDialog } from '../src/utils/clusterRegistration.ts'
-import { section, source } from './_helpers.ts'
+import { section, code } from './_helpers.ts'
 
 test('仅首次注册发生 master→slave 跃迁时自动关闭', () => {
   assert.equal(shouldCloseRegistrationDialog(true, 'master', 'slave'), true)
@@ -20,14 +20,14 @@ test('未打开、未知来源与其它状态不触发跃迁关闭', () => {
 // 一次性注册令牌不得在 emit 后立即清空——父级二次确认/入口守卫才可能
 // 取消，取消后须能直接重试而不必重新粘贴。仅父级 POST 成功或弹框关闭时清空。
 test('提交后不即时清空令牌，确认成功/关闭弹框统一清理', () => {
-  const page = source('src/views/settings/cluster/ClusterModeCard.vue')
+  const page = code('src/views/settings/cluster/ClusterModeCard.vue')
   const submit = section(page, 'const submitRegistration = async', '</script>')
   assert.doesNotMatch(submit, /form\.register_token = ''/, '取消确认/入口守卫早退会丢失已粘贴令牌')
   // 成功受理（父级 POST 成功）后清空；关闭弹框兜底清理
   assert.match(page, /watch\(\(\) => props\.registrationSucceeded, \(\) => \{ form\.register_token = '' \}\)/)
   const watcher = section(page, 'watch(registrationOpen, (open) => {', 'const handleModeChange')
   assert.match(watcher, /if \(!open\)[\s\S]*form\.register_token = ''/)
-  const parent = source('src/views/settings/ClusterSettings.vue')
+  const parent = code('src/views/settings/ClusterSettings.vue')
   assert.match(parent, /:registration-succeeded="registrationSucceeded"/)
   assert.match(section(parent, 'const registerAsSlave = async', '\nconst promoteToMaster'), /registrationSucceeded\.value \+= 1/)
 })

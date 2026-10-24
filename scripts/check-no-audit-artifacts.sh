@@ -6,10 +6,13 @@
 #   1) 路径：审计报告目录与轮次测试文件名（Go/TS）——受控文件与未跟踪文件同扫，
 #      仅跳过 .gitignore 已忽略者与构建/运行产物目录；
 #   2) 内容：注释行与测试声明行里的审计编号/轮次元数据——覆盖 Go/TS/Vue/JS/CSS/
-#      Markdown/Shell/YAML/SQL/go.mod/Dockerfile/docker-entrypoint.sh/
-#      .dockerignore/Caddyfile。JSON/HTML/TOML/conf 同样入面（夹具字符串与
+#      Markdown/Shell/YAML/SQL/go.mod/Python/Dockerfile/docker-entrypoint.sh/
+#      .dockerignore/.gitignore/.gitattributes/Caddyfile。JSON/HTML/TOML/conf 同样入面（夹具字符串与
 #      模板文案里可能混入审计编号），其中 JSON/HTML 按「全文」扫描而非仅注释行
 #      ——JSON 字符串值与 HTML 文本节点没有注释前缀，只扫注释行等于留通道。
+#      作业面无扩展名约定文件（.gitignore/.gitattributes）与 Python 脚本同样在面内：
+#      批量脚本与忽略清单的注释块都是审计编号的真实混入面（扫描面声明见
+#      content_scan_exts / content_scan_basenames）。
 #      刻意例外：web/package-lock.json（npm 生成物，integrity 为混合大小写
 #      base64、随依赖升级整份重写，人工审计标注不进该文件）不入内容面。
 #      轮次引用按「审计动作共现」判定：裸轮次＋审计
@@ -136,11 +139,33 @@ content_exempt="^$(printf '%s' "${content_exempt_paths[0]}" | sed 's/[.]/\\./g')
 # 只豁免该单一路径，业务 JSON 夹具/种子仍须扫描。
 content_scan_exempt_re='(^|/)package-lock\.json$'
 
+# 内容扫描面（单一事实源）：可扫描的文本扩展名 + 无扩展名的约定文件。
+# 新增可写文本形态时只改这两个数组；自检按同一清单逐项造夹具断言确实入面
+# （漏登记即红）。py 与 check-bulk-edit-safety.sh 的 scripts/*.py 作业面同口径
+# ——一次性批量脚本写在 .py 里时，其注释同样可能夹带审计编号；.gitignore /
+# .gitattributes 没有扩展名，但注释块同样是可写入审计编号的地方。
+content_scan_exts=(go ts vue js css md markdown txt sh yml yaml sql mod json html htm toml conf py)
+content_scan_basenames=(Dockerfile docker-entrypoint.sh .dockerignore .gitignore .gitattributes Caddyfile)
+content_scan_ext_alt=""
+for ext in "${content_scan_exts[@]}"; do
+  content_scan_ext_alt+="${content_scan_ext_alt:+|}${ext}"
+done
+content_scan_name_alt=""
+for name in "${content_scan_basenames[@]}"; do
+  if [[ "$name" == "Dockerfile" ]]; then
+    # Dockerfile 派生文件（Dockerfile.dev 等）与主文件同族入面。
+    content_scan_name_alt+="${content_scan_name_alt:+|}(^|/)Dockerfile[^/]*"
+  else
+    content_scan_name_alt+="${content_scan_name_alt:+|}(^|/)${name//./[.]}"
+  fi
+done
+content_scan_re="\\.(${content_scan_ext_alt})$|${content_scan_name_alt}$"
+
 scan_targets="$(printf '%s\n' "$controlled" \
   | grep -v -E "$skip_re" \
   | grep -v -E "$content_exempt" \
   | grep -v -E "$content_scan_exempt_re" \
-  | grep -Ei '\.(go|ts|vue|js|css|md|markdown|txt|sh|yml|yaml|sql|mod|json|html|htm|toml|conf)$|(^|/)(Dockerfile[^/]*|docker-entrypoint\.sh|\.dockerignore|Caddyfile)$' \
+  | grep -Ei "$content_scan_re" \
   | while IFS= read -r f; do [[ -f "$f" ]] && printf '%s\n' "$f"; done || true)"
 
 if [[ -n "$scan_targets" ]]; then
@@ -236,6 +261,9 @@ my $legacy = join '|',
   '\xe5\xae\xa1\xe8\xae\xa1[ \t]*\xef\xbc\x88' . $cn_di
     . '[^\n]{1,8}?' . $cn_round,
   '\xe5\xae\xa1\xe8\xae\xa1[ \t]*[0-9]{2,3}(?![0-9])',
+  # 被历史清洗截断的注释残骸（「历史」+「问题」+冒号连写形态）——语义已被
+  # 剥离，只剩审计过程的痕迹；正常产品文案不会以该形态开头。
+  '\xe5\x8e\x86\xe5\x8f\xb2[ \t]*\xe9\x97\xae\xe9\xa2\x98[ \t]*[:\xef\xbc\x9a]',
   '(?i:\b(?:round|audit))[-_]?[0-9]{1,3}\b',
   '\b[Rr][0-9]{2}[a-z]?\b',
   '\bA[0-9]{2}[A-Za-z]?\b',

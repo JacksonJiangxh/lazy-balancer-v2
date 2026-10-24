@@ -12,7 +12,7 @@ import { createSSRApp, h } from 'vue'
 import { renderToString } from 'vue/server-renderer'
 
 import { usePollingTask, type PollingTask } from '../src/composables/usePollingTask.ts'
-import { FakeDocument, mountForLifecycle, source } from './_helpers.ts'
+import { FakeDocument, mountForLifecycle, code } from './_helpers.ts'
 
 // onUnmounted 在无组件实例时会打印 Vue 警告——pause 用例在 finally 里恢复
 // console.warn；stop/onError/可见性用例经 SSR 渲染提供真实组件实例，不触碰该警告。
@@ -193,22 +193,22 @@ test('usePollingTask 随组件卸载停止轮询并摘除监听', async () => {
 })
 
 test('轮询页接线：取数函数接收本轮 signal，永久 signal 只留给跨轮工作', () => {
-  const dashboard = source('src/views/Dashboard.vue')
+  const dashboard = code('src/views/Dashboard.vue')
   assert.match(dashboard, /const dashboardPolling = usePollingTask\(async \(task\) => fetchAllData\(task\.signal\)/)
   assert.match(dashboard, /const fetchAllData = \(roundSignal\?: AbortSignal\)/)
   assert.match(dashboard, /const fetchRuleHealth = async \(currentRules: Rule\[\], version: number, roundSignal\?: AbortSignal\)/)
   assert.match(dashboard, /signal: roundSignal \?\? dashboardPolling\.signal/, '轮次取本轮 signal；Caddy 操作后的补偿刷新回落永久 signal')
 
-  const cluster = source('src/views/settings/ClusterSettings.vue')
+  const cluster = code('src/views/settings/ClusterSettings.vue')
   assert.match(cluster, /await refreshCluster\(task\.signal\)/)
   assert.match(cluster, /const fetchStatus = async \(roundSignal\?: AbortSignal\)/)
   assert.match(cluster, /const fetchNodes = async \(roundSignal\?: AbortSignal\)/)
 
-  const certJobs = source('src/views/settings/CertJobs.vue')
+  const certJobs = code('src/views/settings/CertJobs.vue')
   assert.match(certJobs, /await fetchJobs\(task\.signal\)/)
   assert.match(certJobs, /const fetchJobs = async \(roundSignal\?: AbortSignal\)/)
 
-  const rules = source('src/views/Rules.vue')
+  const rules = code('src/views/Rules.vue')
   assert.match(rules, /await fetchHealthStatus\(task\.signal\)/)
   assert.match(rules, /await fetchCertJobs\(task\.signal\)/)
   assert.match(rules, /const fetchHealthStatus = async \(roundSignal\?: AbortSignal\)/)

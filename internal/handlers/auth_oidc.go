@@ -575,9 +575,11 @@ func oidcProvider(issuer string) (*oidc.Provider, error) {
 				return nil, entry.err
 			}
 		}
-		// 出站客户端注入（discovery 与其后的 JWKS 验签同源）：初始 issuer 校验
-		// 之外，重定向也必须逐跳通过 scheme 策略。
-		p, derr := oidc.NewProvider(oidc.ClientContext(ctx, oidcOutboundClient), issuer)
+		// 出站客户端注入（discovery 与其后的 JWKS 验签同源）：issuer 基准策略
+		// 编入客户端（go-oidc 的 RemoteKeySet 以 context.Background() 重建
+		// keyset，context 里的策略值会丢），同时随 context 注入供重定向复验。
+		policyCtx := oidcOutboundContext(ctx, issuer)
+		p, derr := oidc.NewProvider(oidc.ClientContext(policyCtx, newOIDCOutboundClient(issuer)), issuer)
 		oidcProvMu.Lock()
 		if derr != nil {
 			werr := fmt.Errorf("OIDC 发现失败(检查服务地址可达性与 .well-known 配置): %w", derr)
@@ -1081,6 +1083,27 @@ func createOIDCUserWithRetry(issuer, subject, base, displayName string) (oidcIde
 	return oidcIdentity{}, false, fmt.Errorf("OIDC JIT 用户创建冲突重试耗尽")
 }
 
+// oidcDisplayNameRefreshFailing 记录显示名刷新的连续失败状态（留痕分级用）。
+// 登录热路径不得刷屏：连续失败的首条升级 error 级，后续降回 warn，成功后复位
+// ——与 touchLastLogin 同一留痕口径。
+var oidcDisplayNameRefreshFailing atomic.Bool
+
+// refreshOIDCDisplayName 按 IdP 最新 claims 刷新展示名（best-effort）。
+// 显示名是 IdP 派生的展示属性而非授权前提：写失败不得中断登录（旧实现 302
+// 到「更新用户资料失败」，把排障方向引向认证而非存储），下次登录自愈。
+func refreshOIDCDisplayName(userID int, username, name string) {
+	_, err := db.DB.Exec("UPDATE users SET display_name=? WHERE id=? AND COALESCE(display_name,'')<>?", name, userID, name)
+	if err == nil {
+		oidcDisplayNameRefreshFailing.Store(false)
+		return
+	}
+	level := "warn"
+	if !oidcDisplayNameRefreshFailing.Swap(true) {
+		level = "error"
+	}
+	services.Logf(level, "OIDC 登录刷新显示名失败（非凭据问题，下次登录重试；user_id=%d username=%s）: %v", userID, username, err)
+}
+
 // OIDCCallback GET /auth/oidc/callback——授权码换令牌→ID Token 验签→
 // 用户命中/禁用检查/JIT 开户→签发本站 JWT(与密码登录同构,auth_method=oidc)。
 func (h *Handlers) OIDCCallback(c *gin.Context) {
@@ -1152,8 +1175,9 @@ func (h *Handlers) OIDCCallback(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
 	// 令牌交换同样走单源出站客户端（oauth2 消费 oidc.ClientContext 写入的同一
-	// context key）：token_endpoint 的重定向不得把 client_secret 带向非 https 地址。
-	ctx = oidc.ClientContext(ctx, oidcOutboundClient)
+	// context key）：token_endpoint 的重定向不得把 client_secret 带向非 https
+	// 地址；基准 issuer 一并注入，端点策略不接受「https issuer + 回环 http 端点」。
+	ctx = oidc.ClientContext(oidcOutboundContext(ctx, cfg.Issuer), oidcOutboundClient)
 	oauthCfg := oidcOAuthConfig(cfg, p, oidcCallbackURL(c))
 	oauth2Token, err := oauthCfg.Exchange(ctx, c.Query("code"),
 		oauth2.SetAuthURLParam("code_verifier", entry.verifier))
@@ -1231,11 +1255,11 @@ func (h *Handlers) OIDCCallback(c *gin.Context) {
 		// 永久停留在首次开户快照，而 UI 明示「由认证服务管理」）。role/
 		// is_enabled/username 仍由本地管理；username 刷新涉及唯一冲突与历史
 		// 链接，本轮保留本地值（报告裁定：单独策略）。
+		// 刷新失败不阻断登录（与 touchLastLogin 同口径）：显示名是派生展示
+		// 属性、非授权前提，瞬时写失败（WAL 长占/锁）不应把用户挡在认证之外，
+		// 下次登录自愈。
 		if name := truncateRunes(strings.TrimSpace(claims.Name), 50); name != "" {
-			if _, uerr := db.DB.Exec("UPDATE users SET display_name=? WHERE id=? AND COALESCE(display_name,'')<>?", name, ident.id, name); uerr != nil {
-				fail("更新用户资料失败", "OIDC 用户资料刷新失败")
-				return
-			}
+			refreshOIDCDisplayName(ident.id, ident.username, name)
 		}
 	case errors.Is(err, sql.ErrNoRows):
 		// JIT 开户:默认普通角色;用户名取 preferred_username→email 本地部分→sub,
@@ -1618,7 +1642,7 @@ func (h *Handlers) OIDCSettingsTest(c *gin.Context) {
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"ok": false, "error": "读取发现文档失败: " + err.Error()}})
 		return
 	}
-	jwksErr := probeOIDCJWKS(providerClaims.JWKSURI)
+	jwksErr := probeOIDCJWKS(providerClaims.JWKSURI, issuer)
 	name := providerClaims.Name
 	if name == "" {
 		if u, err := url.Parse(issuer); err == nil {
@@ -1646,7 +1670,7 @@ func (h *Handlers) OIDCSettingsTest(c *gin.Context) {
 			}
 		}
 	}
-	credentialsChecked, credErr := probeClientCredentials(p.Endpoint().TokenURL, clientID, clientSecret)
+	credentialsChecked, credErr := probeClientCredentials(p.Endpoint().TokenURL, clientID, clientSecret, issuer)
 	if credErr != nil {
 		recordAudit(c, "测试失败", "OIDC 配置", services.FormatAuditDetail(fmt.Sprintf("%s(%s)", name, issuer), services.AuditResultPart("failure")))
 		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"ok": false, "error": credErr.Error()}})
@@ -1684,15 +1708,20 @@ func oidcTestFailureText(err error) string {
 var oidcProbeClient = &http.Client{Timeout: 10 * time.Second, CheckRedirect: oidcCheckRedirect}
 
 // probeOIDCJWKS 探测 jwks_uri：HTTP 200 + 合法 JSON（keys 非空）才算通过。
-// 响应上限 1MB（密钥集远小于此），URL 与 discovery/token 同一 scheme 策略。
-func probeOIDCJWKS(jwksURI string) error {
+// 响应上限 1MB（密钥集远小于此），URL 与 discovery/token 同一端点策略——
+// issuer 一并传入：https issuer 的 jwks_uri 不得落在回环 http 豁免里。
+func probeOIDCJWKS(jwksURI, issuer string) error {
 	if jwksURI == "" {
 		return errors.New("发现文档缺少 jwks_uri")
 	}
-	if err := validateOIDCIssuerURL(jwksURI); err != nil {
+	if err := validateOIDCEndpointURL(jwksURI, issuer); err != nil {
 		return fmt.Errorf("jwks_uri 不合规: %w", err)
 	}
-	resp, err := oidcProbeClient.Get(jwksURI)
+	request, err := http.NewRequestWithContext(oidcOutboundContext(context.Background(), issuer), http.MethodGet, jwksURI, nil)
+	if err != nil {
+		return fmt.Errorf("请求构造失败: %w", err)
+	}
+	resp, err := oidcProbeClient.Do(request)
 	if err != nil {
 		return fmt.Errorf("请求失败: %w", err)
 	}
@@ -1722,15 +1751,17 @@ func probeOIDCJWKS(jwksURI string) error {
 //   - 其余错误(unsupported_grant_type/invalid_scope…):客户端认证未拒绝,
 //     该服务不支持离线凭证探测(checked=false,可达性仍算通过)
 //   - 网络/解析失败:返回 err(测试失败)
-func probeClientCredentials(tokenURL, clientID, clientSecret string) (bool, error) {
+func probeClientCredentials(tokenURL, clientID, clientSecret, issuer string) (bool, error) {
 	if clientID == "" || clientSecret == "" {
 		return false, nil // 无凭证可验(仅探测发现可达性)
 	}
-	// discovery 的 token_endpoint 同样受 scheme 策略约束——
-	// 不得把 client_secret 明文 POST 到非 https 的非回环地址。
-	if err := validateOIDCIssuerURL(tokenURL); err != nil {
+	// discovery 的 token_endpoint 同样受端点策略约束（基准 issuer 传入）——
+	// 不得把 client_secret 明文 POST 到非 https 的非回环地址，也不得借
+	// 「https issuer」的回环 http 豁免打到本机任意端口。
+	if err := validateOIDCEndpointURL(tokenURL, issuer); err != nil {
 		return false, fmt.Errorf("令牌端点地址不合规: %w", err)
 	}
+	ctx := oidcOutboundContext(context.Background(), issuer)
 	// scope 候选:①api://<client_id>/.default(Entra 等先验 scope 后验 secret 的
 	// 提供商——实测 openid 会被 AADSTS1002012 拒而漏检 invalid_client);②openid(常规)。
 	// 任一候选 invalid_client 即凭证错;全部非 invalid_client 错误=不支持离线探测。
@@ -1742,7 +1773,12 @@ func probeClientCredentials(tokenURL, clientID, clientSecret string) (bool, erro
 			"client_secret": {clientSecret},
 			"scope":         {scope},
 		}
-		resp, err := oidcProbeClient.PostForm(tokenURL, form)
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(form.Encode()))
+		if err != nil {
+			return false, fmt.Errorf("凭证探测请求构造失败: %w", err)
+		}
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		resp, err := oidcProbeClient.Do(request)
 		if err != nil {
 			return false, fmt.Errorf("凭证探测请求失败: %w", err)
 		}
@@ -1828,11 +1864,14 @@ func sanitizeOIDCReturnTo(raw string) string {
 	return raw
 }
 
-// validateOIDCIssuerURL 校验 OIDC 出站 URL 的 scheme/host 策略
+// validateOIDCIssuerURL 校验 OIDC issuer 的 scheme/host 策略
 // 收敛为单源）：仅允许 https；http 仅允许回环地址（127.0.0.0/8、::1）
 // 供本机 mock/测试。保存路径与「测试」探测路径（discovery/token/jwks）必须在
 // 任何出站请求前执行同一校验——此前测试端点绕过保存校验，管理员会话被借用时
 // 可探测内网或把 client_secret 明文 POST 到任指地址。
+//
+// 本函数只管 issuer 自身；issuer 宣告的端点（token/jwks/authorization）用
+// validateOIDCEndpointURL——回环 http 豁免不得外溢到发现文档里的任意地址。
 func validateOIDCIssuerURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" {
@@ -1851,32 +1890,82 @@ func validateOIDCIssuerURL(raw string) error {
 	}
 }
 
-// oidcCheckRedirect 出站重定向逐跳复验 scheme 策略（与 validateOIDCIssuerURL
+// oidcIssuerPolicyKey 把「本次出站的基准 issuer」随 context 传给共用出站
+// 客户端（令牌交换/重定向等仍用全局客户端）。端点策略需要区分「https issuer」
+// 与「本机 mock issuer」。discovery/JWKS 用 newOIDCOutboundClient 把 issuer
+// 绑进客户端本身——go-oidc 的 RemoteKeySet 以 context.Background() 重建
+// keyset，只保留 ctx 里的 http.Client，context 值到不了验签取钥请求。
+type oidcIssuerPolicyKey struct{}
+
+func oidcOutboundContext(ctx context.Context, issuer string) context.Context {
+	return context.WithValue(ctx, oidcIssuerPolicyKey{}, issuer)
+}
+
+func oidcOutboundIssuer(ctx context.Context) string {
+	issuer, _ := ctx.Value(oidcIssuerPolicyKey{}).(string)
+	return issuer
+}
+
+// validateOIDCEndpointURL 校验 issuer 宣告的端点是否落在该 issuer 的出站策略内。
+// 回环 http 豁免只对 issuer 自身成立（本机 mock IdP），不得被 IdP 宣告的
+// token_endpoint/jwks_uri/authorization_endpoint 继承：issuer 合规（https）时
+// 只要 discovery 把 token_endpoint 指向 http://127.0.0.1:<port>，面板就会把
+// client_id/client_secret 明文 POST 到本机任意 HTTP 服务（本机 SSRF + 凭据外泄）。
+// 规则：https issuer 下所有端点必须 https；http 回环 issuer（仅本机测试形态）
+// 下端点沿用回环 http 豁免；基准 issuer 缺失按最严处理（仅 https）。
+func validateOIDCEndpointURL(raw, issuer string) error {
+	if err := validateOIDCIssuerURL(raw); err != nil {
+		return err
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return errors.New("OIDC 端点地址无效")
+	}
+	if u.Scheme == "https" {
+		return nil
+	}
+	if base, err := url.Parse(issuer); err != nil || base.Scheme != "http" {
+		return errors.New("OIDC 端点须为 https（http 仅限 issuer 自身为本机回环的测试形态）")
+	}
+	return nil
+}
+
+// oidcCheckRedirect 出站重定向逐跳复验端点策略（与 validateOIDCEndpointURL
 // 单源）：初始 URL 合规不代表重定向目标合规——跟一次 302 到 http://内网 或任意
 // 主机就能绕过「仅 https（回环例外）」，token 交换还会把 client_secret 带过去。
-// 跳数封顶与 Go 默认一致（10 跳）。
+// 跳数封顶与 Go 默认一致（10 跳）。基准 issuer 取请求 context 注入值。
 func oidcCheckRedirect(req *http.Request, via []*http.Request) error {
+	return oidcCheckRedirectForIssuer(req, via, oidcOutboundIssuer(req.Context()))
+}
+
+func oidcCheckRedirectForIssuer(req *http.Request, via []*http.Request, issuer string) error {
 	if len(via) >= 10 {
 		return errors.New("OIDC 出站请求重定向次数过多")
 	}
-	if err := validateOIDCIssuerURL(req.URL.String()); err != nil {
+	if err := validateOIDCEndpointURL(req.URL.String(), issuer); err != nil {
 		return fmt.Errorf("重定向目标不合规: %w", err)
 	}
 	return nil
 }
 
-// oidcOutboundGuardTransport 出站请求逐一复验目标 URL 的 scheme 策略。
+// oidcOutboundGuardTransport 出站请求逐一复验目标 URL 的端点策略。
 // discovery 文档内容由 IdP 提供、不受本机控制：一个合规的 https issuer 完全
 // 可以把 token_endpoint / jwks_uri 指向内网主机或本机端口，go-oidc 不校验
 // endpoint 与 issuer 同源——只验 issuer 会让 client_secret 明文发往任意地址。
 // 因此在传输层对每次出站的初始 URL 复验同一策略（重定向另由
-// oidcCheckRedirect 逐跳复验）。
+// oidcCheckRedirect 逐跳复验）。基准 issuer 优先取传输层绑定值（per-issuer
+// 客户端），否则取请求 context 注入值，两者都缺失时按最严策略（仅 https）。
 type oidcOutboundGuardTransport struct {
-	base http.RoundTripper
+	base   http.RoundTripper
+	issuer string
 }
 
 func (t oidcOutboundGuardTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if err := validateOIDCIssuerURL(req.URL.String()); err != nil {
+	issuer := t.issuer
+	if issuer == "" {
+		issuer = oidcOutboundIssuer(req.Context())
+	}
+	if err := validateOIDCEndpointURL(req.URL.String(), issuer); err != nil {
 		return nil, fmt.Errorf("OIDC 出站地址不合规: %w", err)
 	}
 	base := t.base
@@ -1886,12 +1975,28 @@ func (t oidcOutboundGuardTransport) RoundTrip(req *http.Request) (*http.Response
 	return base.RoundTrip(req)
 }
 
-// oidcOutboundClient discovery/JWKS/令牌交换共用的出站客户端：有界超时 +
-// 初始地址策略复验 + 逐跳重定向复验。go-oidc 通过 oidc.ClientContext 注入
-// （同一 context key 也被 oauth2 的令牌交换消费），JWKS 验签复用 discovery
-// 时注入的客户端。
+// oidcOutboundClient discovery/令牌交换共用出站客户端：有界超时 + 初始地址
+// 策略复验 + 逐跳重定向复验。go-oidc 通过 oidc.ClientContext 注入（同一
+// context key 也被 oauth2 的令牌交换消费）；基准 issuer 随 context 注入
+// （oidcOutboundContext）。
 var oidcOutboundClient = &http.Client{
 	Timeout:       10 * time.Second,
 	CheckRedirect: oidcCheckRedirect,
 	Transport:     oidcOutboundGuardTransport{},
+}
+
+// newOIDCOutboundClient 构造绑定 issuer 基准策略的出站客户端，供 discovery 与
+// 其后的 JWKS 验签共用：go-oidc v3.21 的 Provider.remoteKeySet 以
+// context.Background() 重建 keyset（只保留 ctx 里的 http.Client），context
+// 里的策略值会在验签取钥时丢失——把 issuer 编进客户端本身，jwks_uri 依旧受
+// 端点策略约束。每个 provider 创建时构造一次（provider 有缓存 + singleflight），
+// 不做无界缓存。
+func newOIDCOutboundClient(issuer string) *http.Client {
+	return &http.Client{
+		Timeout: 10 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return oidcCheckRedirectForIssuer(req, via, issuer)
+		},
+		Transport: oidcOutboundGuardTransport{issuer: issuer},
+	}
 }

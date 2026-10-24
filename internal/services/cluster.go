@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -350,6 +351,18 @@ func (s *ClusterService) GenerateRegisterToken(ctx context.Context, createdBy in
 func (s *ClusterService) RegisterNode(ctx context.Context, req models.ClusterRegisterRequest, sourceIP string, now time.Time) (models.ClusterRegistration, error) {
 	if err := models.ValidateClusterAccessURL(req.AccessURL); err != nil {
 		return models.ClusterRegistration{}, err
+	}
+	// 自述地址缺失（从节点出口 IP 探测失败时按空串上报）→ 以服务端观测到的
+	// 注册来源地址落库。回退 127.0.0.1 会让「两台都探测失败的从节点」命中
+	// UNIQUE(ip_address,port) 互相覆盖（后注册者重置前者的审批与集群令牌，
+	// 前者 Pull 立即 401 并停止重试）。来源地址不可用时拒绝注册（可行动错误），
+	// 不写回环地址。
+	if strings.TrimSpace(req.IPAddress) == "" {
+		source := strings.TrimSpace(sourceIP)
+		if net.ParseIP(source) == nil {
+			return models.ClusterRegistration{}, models.ErrMissingClusterNodeIP
+		}
+		req.IPAddress = source
 	}
 	// 落库侧名字归一是最后一道闸（binding max=100 只覆盖 HTTP
 	// 入口；服务层直调/旧客户端仍可传入超长或带控制字符的名字）。

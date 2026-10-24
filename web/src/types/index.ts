@@ -239,6 +239,8 @@ export interface ClusterHealth {
   readonly uptime_sec: number
   readonly crs_version?: string
   readonly ip2region_version?: string
+  readonly threat_version?: string
+  readonly crawler_version?: string
 }
 
 interface ClusterSectionSync {

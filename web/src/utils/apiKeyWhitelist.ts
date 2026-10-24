@@ -11,7 +11,7 @@ export const normalizeCidr = (rawValue: string): string => {
   return value.includes(':') ? `${value}/128` : `${value}/32`
 }
 
-export interface SerializedWhitelist {
+interface SerializedWhitelist {
   readonly value: string[]
   readonly error: string
 }

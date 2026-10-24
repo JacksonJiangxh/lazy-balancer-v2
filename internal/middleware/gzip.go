@@ -14,6 +14,7 @@ package middleware
 import (
 	"compress/gzip"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -104,11 +105,49 @@ func (w *gzipResponseWriter) Flush() {
 	w.ResponseWriter.Flush()
 }
 
+// acceptsGzip 按 RFC 9110 §12.5.3 解析 Accept-Encoding：q=0 表示「不可接受」，
+// 显式 `gzip;q=0`（或 `gzip;q=0, *`）必须视为拒绝——只做子串包含会把 gzip
+// 回给明确声明不要 gzip 的客户端，其解不开 body。显式列出 gzip 时以它的 q 为准；
+// 未列出才回落到通配 `*` 的 q（同受 q=0 约束）。
+func acceptsGzip(header string) bool {
+	gzipQ, wildcardQ := -1.0, -1.0
+	for _, rawPart := range strings.Split(header, ",") {
+		fields := strings.Split(rawPart, ";")
+		coding := strings.ToLower(strings.TrimSpace(fields[0]))
+		if coding == "" {
+			continue
+		}
+		q := 1.0
+		for _, param := range fields[1:] {
+			name, value, found := strings.Cut(strings.TrimSpace(param), "=")
+			if !found || !strings.EqualFold(strings.TrimSpace(name), "q") {
+				continue
+			}
+			// 非法 q 值按「未声明」处理（宽松：默认接受）。
+			if parsed, err := strconv.ParseFloat(strings.TrimSpace(value), 64); err == nil {
+				q = parsed
+			}
+		}
+		switch coding {
+		case "gzip", "x-gzip": // RFC 9110：x-gzip 为 gzip 的别名
+			gzipQ = q
+		case "*":
+			if wildcardQ < 0 {
+				wildcardQ = q
+			}
+		}
+	}
+	if gzipQ >= 0 {
+		return gzipQ > 0
+	}
+	return wildcardQ > 0
+}
+
 // gzipMiddleware 按 Accept-Encoding 压缩响应；不接受的客户端原样透传。
 func gzipMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if (c.Request.Method == http.MethodHead) ||
-			!strings.Contains(c.Request.Header.Get("Accept-Encoding"), "gzip") {
+			!acceptsGzip(c.Request.Header.Get("Accept-Encoding")) {
 			c.Next()
 			return
 		}

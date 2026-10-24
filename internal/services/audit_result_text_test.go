@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"unicode"
 )
 
 // TestAuditResultText_literalArgsCovered：审计结果码渲染
@@ -131,7 +132,10 @@ func TestAuditResultText_dynamicCallSitesTripwire(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = 9
+	// 10 = 既有 9 处 + cluster_registration.go 节点操作的 auditFailure(code, reason)
+	// 闭包（结果码为变量、原因文本只进 detail；取值域 blocked/invalid_request/failed
+	// 均在 auditDynamicResultCodes 内，新增码仍受 TestAuditResultText_auditFailureLiteralsRegistered 与本表约束）。
+	const want = 10
 	if dynamic != want {
 		t.Fatalf("AuditResultPart 动态调用点=%d，want %d：新增动态入口必须审查取值域并更新本绊线", dynamic, want)
 	}
@@ -139,12 +143,34 @@ func TestAuditResultText_dynamicCallSitesTripwire(t *testing.T) {
 
 func TestAuditResultText_ticketFailureCodes(t *testing.T) {
 	for _, code := range []string{"invalid_ticket", "invalid_signature", "expired", "replay", "user_unavailable", "database_error"} {
-		if got := AuditResultText(code); got == code || got == "" {
-			t.Fatalf("ticket failure code %q must have a Chinese audit rendering, got %q", code, got)
-		}
+		assertChineseAuditRendering(t, code)
 	}
 	if got := AuditResultText("unknown_ticket_reason"); got != "unknown_ticket_reason" {
 		t.Fatalf("unknown codes must pass through unchanged, got %q", got)
+	}
+}
+
+// assertChineseAuditRendering 断言结果码渲染成中文且不回显内部码。
+// 「非空且不等于码」不够：映射成任意英文串（如 "ticket expired"）也算通过，
+// 审计详情仍是中英混杂——判据改为「含 CJK 且不含内部码」。
+func assertChineseAuditRendering(t *testing.T, code string) {
+	t.Helper()
+	got := AuditResultText(code)
+	if got == "" || got == code {
+		t.Fatalf("结果码 %q 缺中文映射（渲染为 %q）", code, got)
+	}
+	hasCJK := false
+	for _, r := range got {
+		if unicode.Is(unicode.Han, r) {
+			hasCJK = true
+			break
+		}
+	}
+	if !hasCJK {
+		t.Fatalf("结果码 %q 的渲染 %q 不含中文（审计详情中英混杂）", code, got)
+	}
+	if strings.Contains(got, code) {
+		t.Fatalf("结果码 %q 的渲染 %q 仍回显内部码", code, got)
 	}
 }
 
@@ -159,9 +185,7 @@ func TestAuditResultText_dynamicClosureCodes(t *testing.T) {
 		t.Fatal("动态结果码常量集为空——守护失效")
 	}
 	for _, code := range auditDynamicResultCodes {
-		if got := AuditResultText(code); got == code || got == "" {
-			t.Fatalf("动态结果码 %q 缺中文映射（渲染会落英文）", code)
-		}
+		assertChineseAuditRendering(t, code)
 	}
 	if got := AuditResultText("blocked"); got != "重试被阻止" {
 		t.Fatalf("blocked 渲染=%q，want 重试被阻止", got)

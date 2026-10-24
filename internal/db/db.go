@@ -124,12 +124,12 @@ const (
 	DefaultScheduleDays = "1,2,3,4,5,6,7"
 	DefaultScheduleTime = "04:00"
 	// 日志体量/保留期治理默认：fresh DDL DEFAULT、迁移补列与读侧 COALESCE
-	// 绑定参数同源。已绑定：config_changes 预览快照、services 任务日志阈值
-	// （getTaskLogSizeBytes）。其余读点（handlers 的 caddy/logstats/
-	// config_backup、services 的 logrotate/auditlog/auditlog_rotation/
-	// cluster_snapshot）尚未绑定本组常量——调整默认值时须一并收敛，不得据本
-	// 注释假设其与常量同步（字面量漂移由 db_truth_defaults 的 AST 门逐个登记
-	// 看守，登记即生效）。
+	// 绑定参数同源。消费侧绑定状态以 db_truth_defaults_test 的
+	// TestGovernedDefaultLiteralsBoundInConsumers 登记表为准（登记即看守；
+	// 未登记既不等于已绑定，也不等于可写死字面量）——调整默认值前必须先
+	// grep 全部读点（handlers 的 caddy/logstats/config_backup、services 的
+	// logrotate/auditlog/auditlog_rotation/cluster_snapshot）并一并收敛，不得
+	// 据本注释假设某读点已与常量同步。
 	DefaultTaskLogSizeMB        = 10
 	DefaultAuditLogSizeMB       = 10
 	DefaultRuntimeLogSizeMB     = 100
@@ -187,7 +187,9 @@ const TaskRunsLatestPerTaskQuery = `SELECT id, task_id, family, trigger, COALESC
 // TaskRunsLatestPerTaskQuery 同形——查询重构不再假红，表达式漂移仍由计划
 // 钉测拦截。排序键必须与索引表达式逐字一致（COALESCE(updated_at,created_at)
 // DESC）：updated_at 为 NULL 的行走 created_at 回落，改口径即改变展示顺序。
-const CertJobsMonitorRowsQuery = `SELECT id, rule_id, domain, status, COALESCE(message,''), COALESCE(created_at,''), COALESCE(updated_at,created_at)
+// 末列 ca_available_after 供任务监控行计算 retry_cooldown_seconds（与证书任务
+// 列表同口径：waiting_ca 取 CA 退避剩余秒），消费方不得另写一份查询。
+const CertJobsMonitorRowsQuery = `SELECT id, rule_id, domain, status, COALESCE(message,''), COALESCE(created_at,''), COALESCE(updated_at,created_at), COALESCE(ca_available_after,'')
 		FROM cert_jobs
 		WHERE ?=1 OR COALESCE(message,'') NOT LIKE '从主节点同步%'
 		ORDER BY COALESCE(updated_at,created_at) DESC LIMIT ?`
@@ -3595,6 +3597,20 @@ func withTableRebuild(ctx context.Context, label string, fn func(tx *sql.Tx) err
 	return nil
 }
 
+// dropRebuildResidue 在整表重建事务开头清理**升级前旧构建**崩溃留下的临时表。
+// 事务化只保证「本次 DDL 半失败整体回滚」：旧构建（裸 DB.Exec 逐语句自动提交）
+// 崩溃后残留的同名临时表会让本轮 CREATE TABLE 报 already exists —— 之后每次
+// 启动同样失败（启动死循环，只能人工 DROP）。幂等：正常库恒零命中。表名仅来自
+// 代码常量（拼接安全），且必须在事务内（回滚不改变残留状态，重跑仍清理）。
+func dropRebuildResidue(tx *sql.Tx, names ...string) error {
+	for _, name := range names {
+		if _, err := tx.Exec("DROP TABLE IF EXISTS " + name); err != nil {
+			return fmt.Errorf("清理重建残留表 %s: %w", name, err)
+		}
+	}
+	return nil
+}
+
 // dropColumnIfExists 幂等删除表列：列存在才 DROP，返回
 // 是否实际删除（调用方按需记日志）。table/column 仅来自代码常量，拼接安全。
 func dropColumnIfExists(table, column string) (bool, error) {
@@ -3623,6 +3639,9 @@ func migrateCrawlerSourcesID() error {
 		return nil
 	}
 	return withTableRebuild(context.Background(), "security_crawler_sources", func(tx *sql.Tx) error {
+		if err := dropRebuildResidue(tx, "security_crawler_sources_with_id"); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(`CREATE TABLE security_crawler_sources_with_id (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		name TEXT NOT NULL UNIQUE,
@@ -3662,6 +3681,9 @@ func migrateUsersIsEnabledNotNull() error {
 		return nil
 	}
 	return withTableRebuild(context.Background(), "users", func(tx *sql.Tx) error {
+		if err := dropRebuildResidue(tx, "users_not_null"); err != nil {
+			return err
+		}
 		// 本迁移可被直接调用（测试/历史路径）而未经 newColumns 补列：先确认
 		// is_setup_admin 在位，重建搬运语句才不会引用缺列。
 		var hasFlag int
@@ -3725,6 +3747,9 @@ func migrateSecurityPoliciesNullable() error {
 		return nil
 	}
 	if err := withTableRebuild(context.Background(), "security_policies", func(tx *sql.Tx) error {
+		if err := dropRebuildResidue(tx, "security_policies_new"); err != nil {
+			return err
+		}
 		// rebuild 必须与 fresh CREATE（含 refs 两列）同形状并搬运其数据——
 		// 陈旧 DDL 会把同一 runMigrations 早前 newColumns 刚加的列丢掉
 		//（窗口期库首启安全策略子系统整体 no such column）。
@@ -3784,6 +3809,45 @@ func migrateSecurityPoliciesNullable() error {
 	return nil
 }
 
+// queryDuplicateLbRulesCaddyIDs 返回重复 caddy_id 的字面清单（去重留痕用），
+// 顺序稳定便于审计对照；最多取 20 个以免单条审计详情失控（超出截断提示）。
+func queryDuplicateLbRulesCaddyIDs(ctx context.Context) ([]string, error) {
+	rows, err := DB.QueryContext(ctx, `SELECT COALESCE(caddy_id,'') FROM lb_rules
+		GROUP BY caddy_id HAVING COUNT(*) > 1 ORDER BY caddy_id LIMIT 20`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect duplicate lb_rules caddy_id before primary key migration: %w", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("failed to scan duplicate lb_rules caddy_id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate duplicate lb_rules caddy_id: %w", err)
+	}
+	return ids, nil
+}
+
+// lbRulesDedupeSQL 是 lb_rules 主键重建（id → caddy_id）前的去重语句：旧表
+// caddy_id 无唯一约束（仅重建后成为 PK），旧版本导入/手改/历史竞态都可能留下
+// 同 caddy_id 的多行——不先去重则 INSERT 主键冲突 → 回滚 → runMigrations 上抛
+// → **启动永久失败**（只能人工改库）。保留「最近更新 > 最大 id」一行：upstreams/
+// path_rules 以 caddy_id 关联，行级副本丢失不影响被引用关系，仅旧配置文本被
+// 较新版本取代。与同族 nodes/cert_jobs/IP 名单去重同口径（迁移前先去重）。
+const lbRulesDedupeSQL = `DELETE FROM lb_rules WHERE rowid NOT IN (
+	SELECT rowid FROM (
+		SELECT rowid, ROW_NUMBER() OVER (
+			PARTITION BY caddy_id
+			ORDER BY COALESCE(updated_at, created_at, '') DESC, COALESCE(id, 0) DESC
+		) AS rn
+		FROM lb_rules
+	) WHERE rn = 1
+)`
+
 // nodesDedupeSQL 是 nodes 整表重建前的去重语句。
 // 旧实现只保留 MIN(id)——若重复行里低 id 是旧的未批准行、被删的高 id 才是
 // 已批准/持 cluster_token_hash/registration_secret 的当前节点，升级后该节点
@@ -3807,14 +3871,23 @@ const nodesDedupeSQL = `DELETE FROM nodes WHERE id NOT IN (
 // dedupeNodesTx 在 nodes 重建事务内执行去重并返回删除条数（去重语句单源）。
 // 留痕归调用方在事务提交成功后统一执行（recordNodesDedupeAudit）——回滚的
 // 迁移不得留下「已删行」记录。
-func dedupeNodesTx(tx *sql.Tx) (int64, error) {
+// nodesDedupeExecer 是去重语句的最小执行面：*sql.Tx 与测试替身（构造
+// RowsAffected 失败形态）均满足——错误传播路径不借助驱动行为漂移才能自动化。
+type nodesDedupeExecer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+func dedupeNodesTx(tx nodesDedupeExecer) (int64, error) {
 	result, err := tx.Exec(nodesDedupeSQL)
 	if err != nil {
 		return 0, fmt.Errorf("dedupe nodes: %w", err)
 	}
 	removed, rowsErr := result.RowsAffected()
 	if rowsErr != nil {
-		return 0, nil
+		// 吞错会把「已删 N 行」伪装成「删了 0 行」——recordNodesDedupeAudit 在
+		// removed<=0 时直接 return，节点从注册表消失的原因就此在操作审计中缺失
+		//（该审计存在的理由）。同族其它 RowsAffected 均上抛错误。
+		return 0, fmt.Errorf("dedupe nodes: read rows affected: %w", rowsErr)
 	}
 	return removed, nil
 }
@@ -3853,6 +3926,9 @@ func migrateNodesDeadColumns() error {
 		// nodesRebuildCopySQL 单源——本路径与 migrateNodesDropMasterID 曾各自
 		// 手写一份并已文本分叉（cluster_token_delivered DEFAULT 0/FALSE），
 		// 未来给 nodes 加列只需改单源。
+		if err := dropRebuildResidue(tx, "nodes_without_legacy_sync"); err != nil {
+			return err
+		}
 		deduped, dedupeErr := dedupeNodesTx(tx)
 		if dedupeErr != nil {
 			return dedupeErr
@@ -3879,10 +3955,12 @@ func migrateNodesDeadColumns() error {
 // 杜绝「加列只改一处、另一条升级路径静默丢值」（丢过
 // server_map_lat/lon）。target 为迁移期临时表名。
 //
-// fresh CREATE（createTables）的列集合是本函数的超集前提：新增列须同时登记
-// newColumns（存量库补列）与本 DDL（重建保留），db_truth_defaults_test 的
-// nodes 全形 parity 钉测对 fresh/重建两种稳态逐列比对 name/type/notnull/
-// default/pk。
+// 列集合关系与 fresh CREATE（createTables）**不是**包含关系：本 DDL 携带
+// access_url 等「重建后新增列」，而 fresh 建表的初始列集不含它们——fresh 稳态
+// 靠 newColumns 补列补齐（旧注释「fresh 是超集」与事实相反）。真正的约束是
+// 双向覆盖：新增列须同时登记 newColumns（存量库补列）与本 DDL（重建保留），
+// 由 db_truth_defaults_test 的 nodes 全形 parity 钉测（fresh/重建两种稳态逐列
+// 比对 name/type/notnull/default/pk）与反方向 fresh→registry 门共同把守。
 func nodesRebuildDDL(target string) string {
 	return `CREATE TABLE ` + target + ` (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4167,7 +4245,23 @@ func migrateLbRulesPrimaryKey() error {
 
 	log.Println("Migrating lb_rules to use caddy_id as primary key...")
 
+	// 重复 caddy_id 的字面点名（去重前取，供提交后聚合留痕）。
+	duplicateCaddyIDs, err := queryDuplicateLbRulesCaddyIDs(context.Background())
+	if err != nil {
+		return err
+	}
+
 	if err := withTableRebuild(context.Background(), "lb_rules", func(tx *sql.Tx) error {
+		// 两条临时表同属本重建（lb_rules 与 upstreams）；旧构建残留的任一
+		// 同名表都会让 CREATE 报 already exists。
+		if err := dropRebuildResidue(tx, "lb_rules_new", "upstreams_new"); err != nil {
+			return err
+		}
+		// caddy_id 即将成为主键：先去重（否则 INSERT 主键冲突 → 回滚 →
+		// 启动永久失败）。RowsAffected 错误上抛，不静默归零。
+		if _, err := tx.Exec(lbRulesDedupeSQL); err != nil {
+			return fmt.Errorf("dedupe lb_rules before primary key rebuild: %w", err)
+		}
 		// Create new lb_rules table with caddy_id as primary key
 		_, err := tx.Exec(`
 		CREATE TABLE lb_rules_new (
@@ -4355,6 +4449,13 @@ origin_domain TEXT NOT NULL DEFAULT '',
 		log.Print("WARN: " + detail)
 		recordSystemAudit("启动迁移", "系统配置", detail)
 	}
+	if len(duplicateCaddyIDs) > 0 {
+		// 去重删行必须留痕：这些规则行连同其证书材料/阶段页引用一并消失，
+		// 「规则为何不见了」只能在操作审计里追溯。
+		detail := fmt.Sprintf("lb_rules 主键迁移去重：以下 caddy_id 存在重复行，已保留最近更新者并删除其余行 — %s", strings.Join(duplicateCaddyIDs, "、"))
+		log.Print("WARN: " + detail)
+		recordSystemAudit("启动迁移", "负载规则", detail)
+	}
 	log.Println("Successfully migrated lb_rules to use caddy_id as primary key")
 	return nil
 }
@@ -4447,6 +4548,11 @@ func migrateCertJobsStatusConstraint() error {
 	}
 
 	if err := withTableRebuild(context.Background(), "cert_jobs", func(tx *sql.Tx) error {
+		// 旧构建在 RENAME 之后崩溃会留下 cert_jobs_old，本轮 RENAME 即报
+		// already exists；先清残留（cert_jobs 本体存在性由事务提交语义保证）。
+		if err := dropRebuildResidue(tx, "cert_jobs_old"); err != nil {
+			return err
+		}
 		if _, err := tx.Exec("ALTER TABLE cert_jobs RENAME TO cert_jobs_old"); err != nil {
 			return fmt.Errorf("failed to rename cert_jobs: %w", err)
 		}
@@ -4601,6 +4707,9 @@ func migrateNodesDropMasterID() error {
 	err := withTableRebuild(context.Background(), "nodes master_id", func(tx *sql.Tx) error {
 		// DDL/拷贝 SELECT 与 migrateNodesDeadColumns
 		// 共用 nodesRebuildDDL/nodesRebuildCopySQL 单源。
+		if err := dropRebuildResidue(tx, "nodes_new"); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(`DROP INDEX IF EXISTS idx_nodes_master;`); err != nil {
 			return fmt.Errorf("drop legacy nodes index: %w", err)
 		}
@@ -4686,10 +4795,10 @@ func normalizeRuleTimestampsMigration() error {
 	for _, table := range []string{"lb_rules", "path_rules"} {
 		for _, col := range []string{"created_at", "updated_at"} {
 			// 探测门：全平面格式的收敛库零命中，四条 UPDATE 不取写锁。
+			// 谓词单源见 RuleTimestampNormalizePredicate（导入归一同源）。
 			if _, err := execMigrationWriteIfNeeded(updateWhere(table,
 				col+`=strftime('%Y-%m-%d %H:%M:%S', `+col+`)`,
-				col+` IS NOT NULL AND (`+col+` LIKE '%T%' OR `+col+` LIKE '%+%')
-				  AND strftime('%Y-%m-%d %H:%M:%S', `+col+`) IS NOT NULL`)); err != nil {
+				fmt.Sprintf(RuleTimestampNormalizePredicate, col))); err != nil {
 				return fmt.Errorf("failed to normalize %s.%s timestamp format: %w", table, col, err)
 			}
 		}
@@ -4737,6 +4846,35 @@ const TCPRuleDeadFieldsResetSQL = `UPDATE lb_rules SET
 		OR COALESCE(block_page_stage3_id,0)<>0 OR COALESCE(block_page_stage3_status,0)<>0
 		OR COALESCE(log_enabled,0)<>0
 	)`
+
+// RuleTimestampNormalizePredicate 是规则时间戳「非平面格式」的统一谓词模板
+// （%[1]s = 列名）。用「strftime 结果 ≠ 列值」而非 LIKE '%T%' OR '%+%' 启发式：
+// 导入校验接受的 'YYYY-MM-DD HH:MM'（分钟精度）与 'YYYY-MM-DD HH:MM:SS.999999999'
+// （小数秒）两种布局既无 T 也无 +，启发式会把它们判成「已规范」而跳过——落库
+// 长期非规范形态，未来任何严格 Parse 消费点即复现证书域 +00:00 同型事故。
+// 可解析性由 strftime(...) IS NOT NULL 单独把守（不可解析值不在此归一）。
+const RuleTimestampNormalizePredicate = `%[1]s IS NOT NULL
+	  AND strftime('%%Y-%%m-%%d %%H:%%M:%%S', %[1]s) IS NOT NULL
+	  AND strftime('%%Y-%%m-%%d %%H:%%M:%%S', %[1]s) <> %[1]s`
+
+// NormalizeRuleTimestamps 把 lb_rules/path_rules 的 created_at/updated_at 归一到
+// SQLite 平面格式 'YYYY-MM-DD HH:MM:SS'（UTC）。启动迁移（探测门版）与 handlers
+// 导入归一（事务内）共用本实现与上面的谓词——此前两侧各抄一份逐字 SQL，漏同步
+// 即口径分叉。幂等：平面格式行 strftime 后与自身相等，谓词不命中。
+func NormalizeRuleTimestamps(ctx context.Context, execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}) error {
+	for _, table := range []string{"lb_rules", "path_rules"} {
+		for _, col := range []string{"created_at", "updated_at"} {
+			statement := `UPDATE ` + table + ` SET ` + col + `=strftime('%Y-%m-%d %H:%M:%S', ` + col + `) WHERE ` +
+				fmt.Sprintf(RuleTimestampNormalizePredicate, col)
+			if _, err := execer.ExecContext(ctx, statement); err != nil {
+				return fmt.Errorf("failed to normalize %s.%s timestamp format: %w", table, col, err)
+			}
+		}
+	}
+	return nil
+}
 
 // TCPRulePathRulesResetSQL：TCP 规则残留路径规则清理——custom_routes_enabled
 // 归零后 path_rules 行成为孤儿（TCP 渲染零消费路径分支），随导出/备份导入

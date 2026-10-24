@@ -280,27 +280,36 @@ func loadFrontendAuditTone(t *testing.T) *frontendAuditTone {
 	return tone
 }
 
-// classify 按单源的判定顺序返回色调；未命中返回 info（与模块兜底一致）。
-func (f *frontendAuditTone) classify(action string) string {
+// mapped 判断动作是否会被前端归为非兜底色调（例外表精确命中，或含任一色调
+// 关键词）。这里只判「可分类性」，**不复制前端判定优先级**——顺序契约
+// （danger > warning > success）在前端自身用例 web/tests/auditActionTone.spec.ts
+// 单点钉住；在 Go 侧复刻一份顺序会在前端改序后继续按旧序断言（双绿）。
+func (f *frontendAuditTone) mapped(action string) bool {
+	if _, ok := f.exceptions[action]; ok {
+		return true
+	}
+	for _, words := range [][]string{f.danger, f.warning, f.success} {
+		for _, word := range words {
+			if strings.Contains(action, word) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// dangerMapped 判断动作在前端是否必定渲染为 danger：例外表精确命中优先
+// （命中非 danger 即否），否则含任一 danger 关键词即为 danger。
+func (f *frontendAuditTone) dangerMapped(action string) bool {
 	if color, ok := f.exceptions[action]; ok {
-		return color
+		return color == "danger"
 	}
 	for _, word := range f.danger {
 		if strings.Contains(action, word) {
-			return "danger"
+			return true
 		}
 	}
-	for _, word := range f.warning {
-		if strings.Contains(action, word) {
-			return "warning"
-		}
-	}
-	for _, word := range f.success {
-		if strings.Contains(action, word) {
-			return "success"
-		}
-	}
-	return "info"
+	return false
 }
 
 func TestAuditActionMapping_backendActionsAllMapped(t *testing.T) {
@@ -308,7 +317,7 @@ func TestAuditActionMapping_backendActionsAllMapped(t *testing.T) {
 	tone := loadFrontendAuditTone(t)
 	var missing []string
 	for action, evidence := range backend {
-		if tone.classify(action) == "info" {
+		if !tone.mapped(action) {
 			missing = append(missing, action+"（首见 "+evidence+"）")
 		}
 	}
@@ -327,8 +336,8 @@ func TestAuditActionMapping_dangerClassificationContract(t *testing.T) {
 		if !strings.HasSuffix(action, "失败") && !auditMappingDangerContract[action] {
 			continue
 		}
-		if color := tone.classify(action); color != "danger" {
-			violations = append(violations, action+"（首见 "+evidence+"，前端派生为 "+color+"）")
+		if !tone.dangerMapped(action) {
+			violations = append(violations, action+"（首见 "+evidence+"）")
 		}
 	}
 	if len(violations) > 0 {
@@ -432,15 +441,27 @@ func TestAuditGenericRoutesExhaustive(t *testing.T) {
 // 非空且含已知 Explicit 路由」的活性钉(防策略表被清空后 Explicit 全静默
 // 降级为 Generic)。
 func TestAuditPolicyListsEqual(t *testing.T) {
-	explicitCount := 0
-	for route, policy := range auditRoutePolicies {
-		if policy == AuditPolicyExplicit {
+	// 冻结的独立期望（按类计数）：只遍历策略表再断言自身派生结果属自指——
+	// 路由被降级/新增时计数两侧同步变化，测试仍绿。策略表变更必须同步本清单。
+	const (
+		wantExplicit = 102
+		wantGeneric  = 5
+		wantSkip     = 17
+	)
+	explicitCount, genericCount, skipCount := 0, 0, 0
+	for _, policy := range auditRoutePolicies {
+		switch policy {
+		case AuditPolicyExplicit:
 			explicitCount++
-			_ = route
+		case AuditPolicyGeneric:
+			genericCount++
+		case AuditPolicySkip:
+			skipCount++
 		}
 	}
-	if explicitCount < 10 {
-		t.Fatalf("auditRoutePolicies Explicit 条目=%d,期望 ≥10——策略表被清空/损坏将使 HasExplicitAuditEvent 恒 false", explicitCount)
+	if explicitCount != wantExplicit || genericCount != wantGeneric || skipCount != wantSkip {
+		t.Fatalf("auditRoutePolicies 分类计数漂移：explicit=%d generic=%d skip=%d, want %d/%d/%d（策略口径变更须同步本清单）",
+			explicitCount, genericCount, skipCount, wantExplicit, wantGeneric, wantSkip)
 	}
 	// 抽样验证已知 Explicit 路由
 	known := []string{"POST /api/v1/auth/login", "POST /api/v1/auth/logout"}

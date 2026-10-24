@@ -9,14 +9,14 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { buildPolicyPayload, crawlerExemptionNeedsEngines, type PolicyPayloadInput } from '../src/utils/policyPayload.ts'
-import { repoSource, section } from './_helpers.ts'
+import { repoCode, section } from './_helpers.ts'
 
 // 后端请求结构的 json 标签是字段名的唯一权威（UpdateSecurityPolicyRequest）。
 // 载荷键集必须与其中逐项对齐：前端新增/改名而 Go 未收 → 静默丢弃；Go 改名而
 // 前端未跟 → 字段永不生效。唯一有意缺口 = 遗留 ip_blacklist（编辑面只读，
 // 由导入/历史数据维护，不在保存载荷内）。
 const goRequest = section(
-  repoSource('internal/models/security.go'),
+  repoCode('internal/models/security.go'),
   'type UpdateSecurityPolicyRequest struct',
   '\n}\n',
 )
@@ -58,7 +58,7 @@ const base = (over: Partial<PolicyPayloadInput> = {}): PolicyPayloadInput => ({
 test('Create 与 Update 请求结构字段集一致（同一载荷双路径消费）', () => {
   // 前端 buildPolicyPayload 同时服务创建与编辑；后端两份结构字段集漂移
   // （如只在 Update 增字段）时，创建路径会静默丢弃该字段。
-  const go = repoSource('internal/models/security.go')
+  const go = repoCode('internal/models/security.go')
   const createRequest = section(go, 'type CreateSecurityPolicyRequest struct', '\n}\n')
   const createTags = [...createRequest.matchAll(/json:"([a-z_]+)"/g)].map((match) => match[1])
   assert.ok(createTags.length >= 28, `Create 字段解析不足: ${createTags.length}`)

@@ -1450,6 +1450,10 @@ type securityPolicyContext struct {
 	// CRS 树交换（RemoveAll→moveTree，不持 CaddyOpLock）与生成并发时逐规则
 	// 探测会让同一份配置前后规则得到不同的可用性结论（半链窗口）。
 	securityLibsOK bool
+	// crsLibOK/ip2regionLibOK 与 securityLibsOK 同一次探测的分解结果——缺失
+	// 告警描述直接复用，不再重探目录。
+	crsLibOK       bool
+	ip2regionLibOK bool
 	// securityLibsWarnOnce 库缺失 WARN 每次生成一条（替代逐规则一条）。
 	securityLibsWarnOnce sync.Once
 	// crsFingerprintOnce/crsFingerprint：CRS 池指纹的渲染批次级缓存——同一轮
@@ -1500,6 +1504,15 @@ func (ctx *securityPolicyContext) allowIntersectionCached(signature string, comp
 	return result
 }
 
+// securityLibsMissingDesc 返回本批次探测的库缺失描述（无缺失返回空串）。
+// 与 securityLibsOK 同源，不重探目录。
+func (ctx *securityPolicyContext) securityLibsMissingDesc() string {
+	if ctx == nil || ctx.securityLibsOK {
+		return ""
+	}
+	return securityLibrariesMissingDesc(ctx.crsLibOK, ctx.ip2regionLibOK)
+}
+
 // crsPoolFingerprintCached 返回本渲染批次的 CRS 池指纹（首次调用时求值并
 // 缓存）。仅批量预载上下文（全量渲染）使用；单规则/无上下文路径由调用方
 // 自行缓存（见 buildHTTPHandleChain 的 needFingerprint 闭包）。
@@ -1532,9 +1545,10 @@ func loadSecurityPolicyContext(store caddyConfigStore) (*securityPolicyContext, 
 		policySynthetic:   make(map[int]int),
 		store:             store,
 		scopedListCache:   make(scopedCRSListCache),
-		securityLibsOK:    SecurityLibrariesAvailable(),
 		crsIndexOnce:      lazyCRSRuleIndex(),
 	}
+	ctx.crsLibOK, ctx.ip2regionLibOK = SecurityLibraryStatus()
+	ctx.securityLibsOK = ctx.crsLibOK && ctx.ip2regionLibOK
 	bindingRows, err := store.Query(`SELECT rule_caddy_id, policy_id FROM security_policy_bindings ORDER BY rule_caddy_id, policy_id ASC`)
 	if err != nil {
 		return nil, err
@@ -3143,8 +3157,7 @@ func acmeCertCandidatesForRule(store caddyConfigStore, ruleID string) []Certific
 		       COALESCE(julianday(COALESCE(updated_at, created_at)), 0)
 		FROM cert_jobs
 		WHERE rule_id=?
-		  AND cert_pem IS NOT NULL AND cert_pem <> ''
-		  AND key_pem IS NOT NULL AND key_pem <> ''
+		  AND `+CertJobCandidatePredicateSQL("")+`
 		ORDER BY updated_at DESC, id DESC`, ruleID)
 	if err != nil {
 		Logf("warn", "ACME 证书候选查询失败（规则 %s，按无证书处理）: %v", ruleID, err)
@@ -3194,8 +3207,7 @@ func acmeCertAvailabilityForRules(store caddyConfigStore, ruleDomains map[string
 		       COALESCE(julianday(COALESCE(updated_at, created_at)), 0)
 		FROM cert_jobs
 		WHERE rule_id IN (`+strings.Join(ids, ",")+`)
-		  AND cert_pem IS NOT NULL AND cert_pem <> ''
-		  AND key_pem IS NOT NULL AND key_pem <> ''
+		  AND `+CertJobCandidatePredicateSQL("")+`
 		ORDER BY updated_at DESC, id DESC`, args...)
 	if err != nil {
 		Logf("warn", "ACME 证书候选批量查询失败（按无证书处理）: %v", err)
@@ -4406,11 +4418,22 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 	// 全部 coraza handler(IP 预检的 IP ACL/GeoIP 中断也在内),检测 coraza
 	// 中断(HandlerError 携 ID+4xx)按规则计数;限流 429 经 status==429
 	// 分支计入(424a400e 后;非 coraza tx.ID 但 caddyhttp.Error 生成 ID)。
-	securityLibsOK := SecurityLibrariesAvailable()
+	// 可用性与缺失描述必须复用同一次探测：SecurityLibraryStatus 含 rules 树
+	// WalkDir + xdb stat，此前无条件先探一次（批量路径随即用 ctx 结论覆盖，
+	// 白跑 N 次；单规则路径再经缺失描述重探 1~2 次）。
+	var securityLibsOK bool
+	var securityLibsMissing string
 	if ctx != nil {
 		// 批量路径：随生成上下文一次计算的结论（同一份配置内全部规则
 		// 共享同一可用性判定，消除逐规则重探与半链窗口）。
 		securityLibsOK = ctx.securityLibsOK
+		securityLibsMissing = ctx.securityLibsMissingDesc()
+	} else {
+		crsOK, ip2regionOK := SecurityLibraryStatus()
+		securityLibsOK = crsOK && ip2regionOK
+		if !securityLibsOK {
+			securityLibsMissing = securityLibrariesMissingDesc(crsOK, ip2regionOK)
+		}
 	}
 	// 补 securityLibsOK(与 timing_pre/end 同口径)——库缺失时
 	// 链上无 coraza 收点,counter 的 timing ID 注入与拦截计数均无意义。
@@ -4455,12 +4478,12 @@ func buildHTTPHandleChain(rule SingleRuleConfig, upstreams []UpstreamConfig, sec
 		}
 	} else if rule.Protocol == "http" && len(policies) >= 1 {
 		if ctx != nil {
-			// 每次生成一条（而非逐规则一条）：缺失描述经 sync.Once 重探一次。
+			// 每次生成一条（而非逐规则一条）：描述来自生成上下文的一次探测。
 			ctx.securityLibsWarnOnce.Do(func() {
-				Logf("warn", "安全规则库缺失（%s），本次生成的全部规则安全链不渲染", securityLibrariesMissingDesc())
+				Logf("warn", "安全规则库缺失（%s），本次生成的全部规则安全链不渲染", securityLibsMissing)
 			})
 		} else {
-			Logf("warn", "安全规则库缺失（%s），规则 %s 的所有安全规则本次渲染不生效", securityLibrariesMissingDesc(), rule.CaddyID)
+			Logf("warn", "安全规则库缺失（%s），规则 %s 的所有安全规则本次渲染不生效", securityLibsMissing, rule.CaddyID)
 		}
 	}
 	var securityChain []interface{}

@@ -5,7 +5,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { repoSource, section, source, stripComments } from './_helpers.ts'
+import { repoCode, section, code, stripComments } from './_helpers.ts'
 import {
   ANOMALY_SCORE_HIGH,
   ANOMALY_SCORE_MID,
@@ -28,7 +28,7 @@ test('分档阈值：≥12 高 / ≥6 中 / 其余低（2026-10-17 大屏裁定�
 })
 
 test('事件列表评分着色引用同一阈值（不得回流 15/5 双口径）', () => {
-  const events = source('src/views/security/SecurityEvents.vue')
+  const events = code('src/views/security/SecurityEvents.vue')
   const column = section(events, '<el-table-column label="评分"', '</el-table-column>')
   assert.match(column, /row\.anomaly_score >= ANOMALY_SCORE_HIGH/)
   assert.match(column, /row\.anomaly_score >= ANOMALY_SCORE_MID/)
@@ -84,7 +84,7 @@ test('0 分行回退族：2/3/12/14 高危，GeoIP 三族按段界分档，其�
 // 段界是跨栈契约：前端按段界分族，后端按同一编码发射 id。任一侧单改一侧
 // 会让大屏颜色与事件列表评分打架（899999 曾被当成普通 GeoIP 中危）。
 test('8xxxxx 三族段界与后端 encode/decode 及入库补分同源（跨栈钉）', () => {
-  const go = repoSource('internal/services/security.go')
+  const go = repoCode('internal/services/security.go')
   assert.match(go, /geoipPrecheckRuleBase\s*=\s*800000/, '普通 GeoIP 段基址漂移')
   assert.match(go, /geoipCrawlerRuleBase\s*=\s*810000/, '爬虫豁免段基址漂移')
   assert.match(go, /geoipCrawlerSpoofRuleBase\s*=\s*850000/, '爬虫伪装段基址漂移')
@@ -94,14 +94,14 @@ test('8xxxxx 三族段界与后端 encode/decode 及入库补分同源（跨栈�
   assert.equal(GEOIP_PRECHECK_LIMIT, 900000)
 
   // 入库补分：豁免=0（不计威胁）、伪装=12、普通 GeoIP=6
-  const events = repoSource('internal/services/securityevents.go')
+  const events = repoCode('internal/services/securityevents.go')
   assert.match(events, /case securityEventsIsCrawlerExemptRule\(rec\.RuleTriggered\):\s*rec\.AnomalyScore = 0/)
   assert.match(events, /case securityEventsIsCrawlerSpoofRule\(rec\.RuleTriggered\):\s*rec\.AnomalyScore = 12/)
   assert.match(events, /case securityEventsIsGeoIPScoringRule\(rec\.RuleTriggered\):\s*rec\.AnomalyScore = 6/)
 })
 
 test('大屏定级只做取值：视图不重写分档/降级语义', () => {
-  const screen = source('src/views/security/ThreatScreen.vue')
+  const screen = code('src/views/security/ThreatScreen.vue')
   const sevCode = stripComments(section(screen, 'function sevOf(', '\nfunction sevLabel'))
   assert.match(sevCode, /anomalySeverity\(score\)/, '分级本体必须走单源函数')
   assert.match(sevCode, /overlayDetectionGrade\(/, '检测模式降级必须走单源函数')

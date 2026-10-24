@@ -193,7 +193,12 @@ func TestServeHTTP_stripsSpoofedGeoIPHeaders_evenWithoutXdb(t *testing.T) {
 
 	repl := caddy.NewReplacer()
 	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
-	req = req.WithContext(context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl))
+	// caddyhttp.SetVar 只写入上下文里的 vars map（真实 Caddy 链恒有）：
+	// 测试需自备一份才能观察 geoip.* 变量形态。
+	vars := make(map[string]any)
+	ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+	ctx = context.WithValue(ctx, caddyhttp.VarsCtxKey, vars)
+	req = req.WithContext(ctx)
 	req.RemoteAddr = "114.114.114.114:53981"
 	for name, value := range map[string]string{
 		"X-LB-GeoIP-Country":      "中国",
@@ -219,6 +224,14 @@ func TestServeHTTP_stripsSpoofedGeoIPHeaders_evenWithoutXdb(t *testing.T) {
 		}
 		if got := downstream.Header.Get(name); got != "" {
 			t.Fatalf("spoofed header %s must be stripped without an xdb, got %q", name, got)
+		}
+	}
+	// 变量形态必须与「查询失败」分支同口径：4 个 geoip.* 变量全部置空串哨兵
+	// （只发 Loc 头会让流量统计桶读到未设置变量 → collecting=true 但恒零）。
+	for _, key := range []string{"geoip.country_name", "geoip.region", "geoip.province", "geoip.city"} {
+		v, ok := caddyhttp.GetVar(downstream.Context(), key).(string)
+		if !ok || v != "" {
+			t.Fatalf("%s must be set to the empty-string sentinel without an xdb, got %v (set=%v)", key, v, ok)
 		}
 	}
 }
@@ -366,11 +379,13 @@ func TestServeHTTP_overseasEmitsCountryName(t *testing.T) {
 	}
 }
 
-// TestGeoipLocFor_trimsChinaCountryColumn：国家列「中国」判定
-// TrimSpace 对称——树侧收集判定本就 Trim（ip2region.go），发射侧此前裸比较
-// （" 中国" 异形行走海外分支后 NormalizeCountry 折叠出「中国」串发射，匹配
-// 键恒不命中）。国内 → 省/省-市；海外 → 归一化国名；不可解析 → 哨兵。
-func TestGeoipLocFor_trimsChinaCountryColumn(t *testing.T) {
+// TestGeoipLocFor_usesNormalizedCountryColumn：Loc 只消费**已归一**的国家列
+// （归一是 normalizeTrafficCountryKey 单源，由 parseGeoIPRegion 前置完成）——
+// 本函数不再二次 TrimSpace/NormalizeCountry。历史形态（两处各自归一）在新增
+// 国家异体时单侧漏改会让 X-LB-GeoIP-Country 与 X-LB-GeoIP-Loc 口径分裂；
+// 本用例按发射侧同口径归一后验证三态（国内 → 省/省-市；海外 → 归一化国名；
+// 不可解析 → 哨兵）。
+func TestGeoipLocFor_usesNormalizedCountryColumn(t *testing.T) {
 	cases := []struct{ country, province, city, want string }{
 		{"中国", "广东省", "深圳市", "广东省/深圳市"},
 		{"中国", "广东省", "", "广东省"},
@@ -382,8 +397,8 @@ func TestGeoipLocFor_trimsChinaCountryColumn(t *testing.T) {
 		{"", "广东省", "", "海外"},
 	}
 	for _, tc := range cases {
-		if got := geoipLocFor(tc.country, tc.province, tc.city); got != tc.want {
-			t.Errorf("geoipLocFor(%q,%q,%q)=%q; want %q", tc.country, tc.province, tc.city, got, tc.want)
+		if got := geoipLocFor(normalizeTrafficCountryKey(tc.country), tc.province, tc.city); got != tc.want {
+			t.Errorf("geoipLocFor(normalize(%q),%q,%q)=%q; want %q", tc.country, tc.province, tc.city, got, tc.want)
 		}
 	}
 }

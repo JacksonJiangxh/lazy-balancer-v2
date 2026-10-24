@@ -8,10 +8,14 @@
         </h2>
         <p class="page-desc">管理系统用户、权限与登录认证（OIDC）</p>
       </div>
-      <el-button type="primary" :disabled="isReadOnly || submitting" @click="openCreateForm">
-        <el-icon><Plus /></el-icon>
-        新建用户
-      </el-button>
+      <el-tooltip :disabled="!isReadOnly" :content="readOnlyMessage">
+        <div>
+          <el-button type="primary" :disabled="isReadOnly || submitting" @click="openCreateForm">
+            <el-icon><Plus /></el-icon>
+            新建用户
+          </el-button>
+        </div>
+      </el-tooltip>
     </div>
 
     <el-alert v-if="loadError" type="error" :closable="false" show-icon class="polling-error-alert error-banner">
@@ -32,7 +36,7 @@
           </div>
         </div>
       </template>
-      <el-form :model="form" label-width="90px" :disabled="(isReadOnly && !editingSelf) || submitting">
+      <el-form :model="form" label-width="90px" :disabled="isReadOnly || submitting">
         <!-- 2026-09-19 用户裁定布局:左列 用户名/显示名称/角色;右列 密码组
              (编辑=新密码+确认新密码,创建=密码+确认密码);OIDC 用户右列示数据来源 -->
         <el-row :gutter="16">
@@ -121,6 +125,7 @@
               <div>
                 <el-switch
                   v-model="row.is_enabled"
+                  :aria-label="`用户 ${row.username} 的启用状态`"
                   :loading="switchingIds.has(row.id)"
                   :disabled="isReadOnly || switchingIds.has(row.id) || submittingUserId === row.id || row.id === authStore.user?.id"
                   @change="(val: boolean) => handleToggleStatus(row.id, val)"
@@ -146,17 +151,9 @@
         </el-table-column>
         <el-table-column label="MFA" width="110" align="center">
           <template #default="{ row }">
-            <!-- 每行只显示一个必要 MFA 操作——操作即状态（2026-09-21 用户裁定）：
-                 本人本地未启用 → 启用 MFA；其余 → 重置 MFA（禁用原因 hover 透出：
-                 OIDC 提供商管理 / 该用户未启用 / 只读） -->
-            <el-tooltip v-if="!row.mfa_enabled && isSelfRow(row) && row.auth_provider !== 'oidc'" :disabled="!selfServiceBlocked" :content="readOnlyMessage">
-              <div>
-                <el-button type="success" link size="small" :disabled="selfServiceBlocked || submitting" @click="openMfaBinding(row)">
-                  启用 MFA
-                </el-button>
-              </div>
-            </el-tooltip>
-            <el-tooltip v-else :disabled="!isReadOnly && row.auth_provider !== 'oidc' && row.mfa_enabled" :content="row.auth_provider === 'oidc' ? 'OIDC 用户的 MFA 由身份提供商管理' : (!row.mfa_enabled ? '该用户未启用 MFA' : readOnlyMessage)">
+            <!-- 用户页只做账户管理（重置 MFA）；启用/关闭/重置的个人自助在个人资料弹框。
+                 只读态保留操作位并禁用，不隐藏。 -->
+            <el-tooltip :disabled="!isReadOnly && row.auth_provider !== 'oidc' && row.mfa_enabled" :content="row.auth_provider === 'oidc' ? 'OIDC 用户的 MFA 由身份提供商管理' : (!row.mfa_enabled ? '该用户未启用 MFA' : readOnlyMessage)">
               <div>
                 <el-button type="warning" link size="small" :disabled="isReadOnly || row.auth_provider === 'oidc' || !row.mfa_enabled || submitting || submittingUserId === row.id || operatingUserIds.has(row.id) || switchingIds.has(row.id)" @click="resetMfa(row)">
                   重置 MFA
@@ -168,37 +165,23 @@
         <el-table-column label="操作" width="200" fixed="right" align="center">
           <template #default="{ row }">
             <div class="operation-buttons">
-            <el-tooltip v-if="isSelfRow(row) && !isAdmin" :disabled="!selfServiceBlocked" :content="readOnlyMessage">
-              <div>
-                <el-button type="primary" link size="small" :disabled="selfServiceBlocked || submitting" @click="editUser(row)">
-                  编辑
-                </el-button>
-              </div>
-            </el-tooltip>
-            <el-tooltip v-else :disabled="!isReadOnly" :content="readOnlyMessage">
+            <el-tooltip :disabled="!isReadOnly" :content="readOnlyMessage">
               <div>
                 <el-button type="primary" link size="small" :disabled="isReadOnly || submitting" @click="editUser(row)">
                   编辑
                 </el-button>
               </div>
             </el-tooltip>
-            <el-tooltip v-if="isSelfRow(row) && !isAdmin" :disabled="!selfServiceBlocked && row.auth_provider !== 'oidc'" :content="row.auth_provider === 'oidc' ? 'OIDC 用户的密码由身份提供商管理' : readOnlyMessage">
+            <el-tooltip :disabled="!isReadOnly && row.auth_provider !== 'oidc'" :content="row.auth_provider === 'oidc' ? 'OIDC 用户的密码由身份提供商管理' : readOnlyMessage">
               <div>
-                <el-button type="warning" link size="small" :disabled="selfServiceBlocked || row.auth_provider === 'oidc'" @click="resetPassword(row.id)">
-                  重置密码
-                </el-button>
-              </div>
-            </el-tooltip>
-            <el-tooltip v-else :disabled="!isReadOnly && row.auth_provider !== 'oidc'" :content="row.auth_provider === 'oidc' ? 'OIDC 用户的密码由身份提供商管理' : readOnlyMessage">
-              <div>
-                <el-button type="warning" link size="small" :disabled="isReadOnly || row.auth_provider === 'oidc' || submittingUserId === row.id || operatingUserIds.has(row.id) || switchingIds.has(row.id)" @click="resetPassword(row.id)">
+                <el-button type="warning" link size="small" :disabled="isReadOnly || row.auth_provider === 'oidc' || submittingUserId === row.id || operatingUserIds.has(row.id) || switchingIds.has(row.id)" @click="resetPassword(row)">
                   重置密码
                 </el-button>
               </div>
             </el-tooltip>
             <el-tooltip :disabled="!isReadOnly && row.id !== authStore.user?.id" :content="row.id === authStore.user?.id ? '不能删除当前登录账户' : readOnlyMessage">
               <div>
-                <el-button type="danger" link size="small" :disabled="isReadOnly || row.id === authStore.user?.id || submittingUserId === row.id || operatingUserIds.has(row.id) || switchingIds.has(row.id)" @click="deleteUser(row.id)">
+                <el-button type="danger" link size="small" :disabled="isReadOnly || row.id === authStore.user?.id || submittingUserId === row.id || operatingUserIds.has(row.id) || switchingIds.has(row.id)" @click="deleteUser(row)">
                   删除
                 </el-button>
               </div>
@@ -222,51 +205,6 @@
 
     <OIDCSettings v-model="oidcOpen" @status="onOIDCStatus" />
 
-    <!-- 调整（用户裁决）：MFA 绑定向导从基础设置卡片迁到用户管理——
-         点「启用 MFA」发起绑定：扫码 → 输码 → 恢复码。 -->
-    <el-dialog v-model="mfaBinding.visible" class="dialog-body-inset" width="min(520px, 92vw)" :close-on-click-modal="false" @closed="mfaBindingClosed">
-      <template #header>
-        <DialogHeader :icon="Lock" title="启用 MFA（两步验证）" subtitle="扫码绑定验证器 → 输码验证 → 保存恢复码" tone="primary" />
-      </template>
-      <el-steps :active="mfaBinding.step" simple style="margin-bottom: 18px">
-        <el-step title="扫码" />
-        <el-step title="验证" />
-        <el-step title="恢复码" />
-      </el-steps>
-      <div v-if="mfaBinding.step === 0" style="display: flex; flex-direction: column; align-items: center; gap: 10px">
-        <div style="background: #fff; padding: 8px; border: 1px solid var(--el-border-color-lighter); border-radius: 4px">
-          <canvas ref="mfaQrCanvas" width="220" height="220" />
-        </div>
-        <el-text type="info" size="small">无法扫码时手动输入密钥：</el-text>
-        <el-text size="small" selectable style="font-family: monospace; background: var(--el-fill-color-light); padding: 4px 10px; border-radius: 3px; letter-spacing: 1px">{{ mfaBinding.secret }}</el-text>
-        <el-text type="info" size="small">使用 Google/Microsoft Authenticator 等扫码</el-text>
-      </div>
-      <div v-else-if="mfaBinding.step === 1" style="display: flex; flex-direction: column; align-items: center; gap: 14px">
-        <el-input
-          v-model="mfaBinding.code"
-          placeholder="请输入 6 位验证码"
-          size="large"
-          maxlength="6"
-          style="width: 240px; text-align: center; font-size: 18px; letter-spacing: 6px"
-          @input="mfaBinding.code = mfaBinding.code.replace(/\D/g, '')"
-        />
-        <el-text type="info" size="small">为「{{ mfaBinding.username }}」绑定</el-text>
-      </div>
-      <div v-else style="display: flex; flex-direction: column; gap: 10px">
-        <div class="info-note-bar"><span class="info-note-desc">恢复代码仅此一次显示</span><span class="info-note-sub">每个恢复代码只能使用一次，请妥善保存。丢失验证器时用于登录。</span></div>
-        <div style="display: grid; grid-template-columns: repeat(2, 200px); gap: 8px 24px; margin-top: 6px">
-          <div v-for="code in mfaBinding.recoveryCodes" :key="code" style="font-family: monospace; font-size: 14px; background: var(--el-fill-color-light); padding: 6px 10px; border-radius: 3px; text-align: center; user-select: all">{{ code }}</div>
-        </div>
-      </div>
-      <template #footer>
-        <el-button v-if="mfaBinding.step === 0" @click="mfaBinding.visible = false">取消</el-button>
-        <el-button v-if="mfaBinding.step === 0" type="primary" @click="mfaBinding.step = 1">下一步</el-button>
-        <el-button v-if="mfaBinding.step === 1" @click="mfaBinding.step = 0">上一步</el-button>
-        <el-button v-if="mfaBinding.step === 1" type="primary" :loading="mfaBinding.loading" :disabled="mfaBinding.code.length !== 6" @click="activateMfa">验证并启用</el-button>
-        <el-button v-if="mfaBinding.step === 2" @click="copyMfaRecovery">复制全部</el-button>
-        <el-button v-if="mfaBinding.step === 2" type="primary" @click="mfaBinding.visible = false">我已保存</el-button>
-      </template>
-    </el-dialog>
     <!-- 统一确认/输入弹框:重置密码 / 修改密码 / 重置 MFA(替代 ElMessageBox,
          与全站 icon+标题+副标题弹框语言一致)。 -->
     <el-dialog v-model="lbDialog.visible" width="min(500px, 92vw)" :close-on-click-modal="false" @update:model-value="lbCancel()">
@@ -304,17 +242,15 @@
 
 <script setup lang="ts">
 import OIDCSettings from '@/views/settings/OIDCSettings.vue'
-import { computed, nextTick, reactive, ref, watch, onMounted } from 'vue'
+import { computed, reactive, ref, watch, onMounted } from 'vue'
 import { useAuthStore } from '@/stores/auth'
 import { request, ApiRequestError, mfaAwareSuccess, normalizeMfaCodeInput, validateMfaCodeInput } from '@/utils/api'
 import { formatDate } from '@/utils/date'
-import { copyText } from '@/utils/copy'
 import { ElMessageBox, ElMessage } from 'element-plus'
 import { UserFilled, User, Plus, Key, Lock, Warning } from '@element-plus/icons-vue'
 import DialogHeader from '@/components/DialogHeader.vue'
 import { useClampedPagination } from '@/composables/useClampedPagination'
 import { validatePassword, validateUsername } from '@/utils/credentials'
-import QRCode from 'qrcode'
 import type { APIResponse, UserListItem } from '@/types'
 const oidcOpen = ref(false)
 const oidcEnabled = ref(false)
@@ -343,9 +279,6 @@ const fetchOIDCStatus = async () => {
 
 const authStore = useAuthStore()
 const isReadOnly = computed(() => authStore.readOnlyReason !== null)
-const isAdmin = computed(() => authStore.user?.role === 'admin')
-const isSelfRow = (row: UserListItem): boolean => row.id === authStore.user?.id
-const selfServiceBlocked = computed(() => authStore.readOnlyReason === 'slave' || authStore.readOnlyReason === 'unknown')
 const users = ref<UserListItem[]>([])
 // 列表加载失败与真实空列表不可区分 → 显性错误态 + 重试
 const loadError = ref(false)
@@ -368,13 +301,13 @@ const pageSize = ref(10)
 const { pagedItems: paginatedUsers } = useClampedPagination(users, currentPage, pageSize)
 
 const openCreateForm = () => {
-  if (submitting.value) return
+  if (isReadOnly.value || submitting.value) return
   editingUser.value = null
   form.value = { username: '', password: '', password_confirm: '', display_name: '', role: 'user' }
   showForm.value = true
 }
 const editingIsOIDC = computed(() => editingUser.value?.auth_provider === 'oidc')
-const editingSelf = computed(() => editingUser.value !== null && editingUser.value.id === authStore.user?.id && !isAdmin.value)
+const editingSelf = computed(() => editingUser.value !== null && editingUser.value.id === authStore.user?.id)
 const editingUser = ref<UserListItem | null>(null)
 const switchingIds = ref(new Set<number>())
 let usersRequestSeq = 0
@@ -409,18 +342,15 @@ const fetchUsers = async () => {
 }
 
 const handleSubmit = async () => {
-  if ((isReadOnly.value && !editingSelf.value) || submitting.value) return
-  // 用户名前置校验（对齐后端 CreateUser/UpdateUser 的 min=3,max=50、
-  // 字符集 ^[a-z][a-z0-9]*$ 与 Login.vue setup 口径）——创建必填；编辑态按
-  // 后端 usernameChanged 口径（users.go：仅实际改名才过策略，OIDC 行由 IdP
-  // 管理整体豁免）——OIDC 用户名可含 . / _ / 大写，无条件校验会把 OIDC
-  // 用户的角色编辑永久拦死。
+  if (isReadOnly.value || submitting.value) return
+  // 用户名前置校验（对齐后端 CreateUser 的 min=3,max=50、字符集
+  // ^[a-z][a-z0-9]*$ 与 Login.vue setup 口径）——仅创建路径：编辑态用户名
+  // 输入恒禁用（后端支持改名，但 UI 不提供入口），不存在改名校验分支。
   if (!editingUser.value && !form.value.username) {
     ElMessage.warning('请输入用户名')
     return
   }
-  const usernameChanged = editingUser.value !== null && form.value.username !== editingUser.value.username
-  if (!editingUser.value || (usernameChanged && !editingIsOIDC.value)) {
+  if (!editingUser.value) {
     const usernameError = validateUsername(form.value.username)
     if (usernameError) {
       ElMessage.warning(usernameError)
@@ -486,9 +416,8 @@ const handleSubmit = async () => {
 
 
 const editUser = (user: UserListItem) => {
-  // 非管理员仅可编辑本人行（重置语义，不验当前密码）；他人行仍只读。
-  const isSelf = user.id === authStore.user?.id
-  if ((isReadOnly.value && !isSelf) || submitting.value) return
+  // 非管理员整页只读（个人自助在个人资料弹框）
+  if (isReadOnly.value || submitting.value) return
   // 复审回归修复：编辑必须置 editingUser，否则 handleSubmit 走 POST 误建用户
   editingUser.value = user
   form.value = {
@@ -508,12 +437,12 @@ const closeForm = () => {
   form.value = { username: '', password: '', password_confirm: '', display_name: '', role: 'user' }
 }
 
-const deleteUser = async (id: number) => {
-  const isSelfReset = id === authStore.user?.id
-  if ((isReadOnly.value && !isSelfReset) || submittingUserId.value === id || operatingUserIds.value.has(id) || switchingIds.value.has(id)) return
+const deleteUser = async (row: UserListItem) => {
+  const id = row.id
+  if (isReadOnly.value || submittingUserId.value === id || operatingUserIds.value.has(id) || switchingIds.value.has(id)) return
   operatingUserIds.value.add(id)
   try {
-    await ElMessageBox.confirm('确定要删除这个用户吗？', '警告', { type: 'warning' })
+    await ElMessageBox.confirm(`确定要删除用户「${row.username}」吗？删除后不可恢复。`, '警告', { type: 'warning' })
     await request.delete(`/users/${id}`)
     mfaAwareSuccess('删除成功')
     fetchUsers()
@@ -601,13 +530,11 @@ function lbConfirm() {
 }
 
 const resetPassword = async (id: number) => {
-  const isSelfReset = id === authStore.user?.id
-  if ((isReadOnly.value && !isSelfReset) || submittingUserId.value === id || operatingUserIds.value.has(id) || switchingIds.value.has(id)) return
+  if (isReadOnly.value || submittingUserId.value === id || operatingUserIds.value.has(id) || switchingIds.value.has(id)) return
   operatingUserIds.value.add(id)
   const isSelf = id === authStore.user?.id
-  // 2026-09-19 用户裁定:重置密码语义经用户管理端点重置(不验当前密码,重置后
-  // 吊销全部会话);权限=adminOrSelf——管理员可重置任意用户,非管理员仅本人
-  // (其他行的重置入口已按 isSelfRow && !isAdmin 隐藏)。
+  // 用户管理端点重置密码（不验当前密码，重置后吊销全部会话）；权限=admin——
+  // 非管理员整页只读，个人改密走个人资料弹框（需当前密码）。
   try {
     let newPassword = ''
     const username = users.value.find((u) => u.id === id)?.username ?? ''
@@ -701,75 +628,6 @@ const resetMfa = async (row: UserListItem): Promise<void> => {
   } finally {
     operatingUserIds.value.delete(row.id)
   }
-}
-
-// ============ MFA 绑定向导（用户管理操作列发起） ============
-const mfaQrCanvas = ref<HTMLCanvasElement | null>(null)
-const mfaBinding = ref({
-  visible: false,
-  step: 0,
-  username: '',
-  secret: '',
-  code: '',
-  recoveryCodes: [] as string[],
-  loading: false,
-})
-
-const mfaBindingClosed = () => {
-  mfaBinding.value.step = 0
-  mfaBinding.value.code = ''
-  // secret 一并清空——TOTP 种子不再滞留于关闭后的响应式状态。
-  mfaBinding.value.secret = ''
-  mfaBinding.value.recoveryCodes = []
-}
-
-const openMfaBinding = async (row: UserListItem): Promise<void> => {
-  // 与 resetMfa/resetPassword 同款函数级纵深守卫（按钮已禁用；此处防
-  // 后续调用方绕过）。是否向非管理员放行自助绑定属产品裁定（见 fix 报告）。
-  if (selfServiceBlocked.value || mfaBinding.value.loading) return
-  try {
-    const res = await request.post<APIResponse<{ secret: string; uri: string }>>('/auth/mfa/setup', {}, { silent: true })
-    if (!res.data) return
-    mfaBinding.value.username = row.username
-    mfaBinding.value.secret = res.data.secret
-    mfaBinding.value.code = ''
-    mfaBinding.value.recoveryCodes = []
-    mfaBinding.value.step = 0
-    mfaBinding.value.visible = true
-    await nextTick()
-    if (mfaQrCanvas.value) {
-      await QRCode.toCanvas(mfaQrCanvas.value, res.data.uri, { width: 220, margin: 1 })
-    }
-  } catch (error: unknown) {
-    ElMessage.error(error instanceof Error ? error.message : '生成 MFA 密钥失败')
-  }
-}
-
-const activateMfa = async (): Promise<void> => {
-  // 按钮已按 6 位禁用（原实现在不足 6 位时静默 no-op，用户以为页面卡住）；
-  // 函数内保留短路作为纵深兜底（脚本/键盘直触路径）。
-  if (selfServiceBlocked.value || mfaBinding.value.code.length !== 6 || mfaBinding.value.loading) return
-  mfaBinding.value.loading = true
-  try {
-    const res = await request.post<APIResponse<{ recovery_codes: string[] }>>('/auth/mfa/activate', { code: mfaBinding.value.code }, { silent: true })
-    if (!res.data) return
-    mfaBinding.value.recoveryCodes = res.data.recovery_codes
-    mfaBinding.value.step = 2
-    await fetchUsers()
-    mfaAwareSuccess('MFA 已启用')
-  } catch (error: unknown) {
-    ElMessage.error(error instanceof Error ? error.message : '验证失败')
-  } finally {
-    mfaBinding.value.loading = false
-  }
-}
-
-const copyMfaRecovery = async (): Promise<void> => {
-  // 走统一 copyText（clipboard API + textarea 降级）——面板默认
-  // HTTP 部署属非安全上下文，navigator.clipboard 不可用，原实现在该场景恒失败。
-  const ok = await copyText(mfaBinding.value.recoveryCodes.join('\n'))
-  if (ok) ElMessage.success('恢复代码已复制')
-  else ElMessage.warning('复制失败，请手动选择复制')
 }
 
 // /settings/oidc 挂在 admin 组（非管理员必 403）且 OIDC 入口仅管理员渲染——

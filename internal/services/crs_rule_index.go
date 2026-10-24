@@ -418,9 +418,11 @@ func crsRuleIndexCacheKey(version string) string {
 }
 
 // buildCRSRuleIndex 全量解析规则目录：文件名升序遍历（确定性），同 ID
-// 保留首见条目（keep first msg），最终按 id 升序输出。
-func buildCRSRuleIndex() *CRSRuleIndex {
-	index := &CRSRuleIndex{Version: crsRuleIndexVersion(), Rules: []CRSRuleIndexEntry{}, ids: map[string]struct{}{}}
+// 保留首见条目（keep first msg），最终按 id 升序输出。version 由调用方传入
+// ——键与产物必须同源（两次独立读取会在版本行/目录形态变化时把新代产物挂到
+// 旧键上，下一次调用再全量重建一次）。
+func buildCRSRuleIndex(version string) *CRSRuleIndex {
+	index := &CRSRuleIndex{Version: version, Rules: []CRSRuleIndexEntry{}, ids: map[string]struct{}{}}
 	entries, err := os.ReadDir(CRSRuleIndexDir)
 	if err != nil {
 		return index
@@ -465,13 +467,16 @@ func buildCRSRuleIndex() *CRSRuleIndex {
 // 在 CaddyOpLock 临界区内，而全局锁序为导入=排空→wafFileMu→CaddyOpLock——
 // 持 CaddyOpLock 再取 wafFileMu 即反向嵌套 = AB-BA 死锁。
 func GetCRSRuleIndex() *CRSRuleIndex {
-	key := crsRuleIndexCacheKey(crsRuleIndexVersion())
+	// 版本读取与键/产物同源单次：分开读会在两次读之间版本变化时把新代产物
+	// 挂到旧键上（下一次调用键不同→多一次全量重建）。
+	version := crsRuleIndexVersion()
+	key := crsRuleIndexCacheKey(version)
 	crsRuleIndexMu.Lock()
 	defer crsRuleIndexMu.Unlock()
 	if crsRuleIndexCache != nil && crsRuleIndexKey == key {
 		return crsRuleIndexCache
 	}
-	index := buildCRSRuleIndex()
+	index := buildCRSRuleIndex(version)
 	crsRuleIndexCache, crsRuleIndexKey = index, key
 	return index
 }

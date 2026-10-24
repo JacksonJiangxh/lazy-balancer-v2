@@ -12,10 +12,10 @@ import assert from 'node:assert/strict'
 
 import { drillClickIntent } from '../src/utils/threatShared.ts'
 import { LAT_TOP, LAT_BOTTOM, DOT_LAT_TOP, DOT_LAT_BOTTOM } from '../src/utils/threatProjection.ts'
-import { member, source } from './_helpers.ts'
+import { member, code } from './_helpers.ts'
 
-const sceneSrc = source('src/utils/threatScene.ts')
-const globeSrc = source('src/utils/threatGlobe.ts')
+const sceneSrc = code('src/utils/threatScene.ts')
+const globeSrc = code('src/utils/threatGlobe.ts')
 
 test('下钻点击手势：命中国=当前下钻国保持、他国切换、空白返回世界、总览态下钻', () => {
   // 下钻态
@@ -145,7 +145,7 @@ test('地球聚合标签与到站脉冲跟地图同色', () => {
 })
 
 test('缓动/涟漪/浮签字色四组跨引擎重复实现收敛到 threatTheme', () => {
-  const theme = source('src/utils/threatTheme.ts')
+  const theme = code('src/utils/threatTheme.ts')
   // 单源定义在本文件，两引擎只导入
   assert.match(theme, /export function easeOutCubic\(/)
   assert.match(theme, /export const FLOW_HOVER_TIP_COLOR = '#/)

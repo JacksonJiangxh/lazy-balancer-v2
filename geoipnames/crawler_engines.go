@@ -296,6 +296,11 @@ func ValidCrawlerEngineID(id string) bool {
 	return false
 }
 
-// DefaultCrawlerEngines 向导默认勾选（主流 SEO 场景：Google/Bing/百度）。
-// 只读：消费方只做 json.Marshal/遍历，禁止修改本切片（全局单份）。
-var DefaultCrawlerEngines = []string{"googlebot", "bingbot", "baiduspider"}
+// DefaultCrawlerEngines 返回向导默认勾选集（主流 SEO 场景：
+// Google/Bing/百度）的新副本——默认值不对外暴露可变切片，消费方就地排序/追加
+// 不会污染全局默认。
+func DefaultCrawlerEngines() []string {
+	return append([]string(nil), defaultCrawlerEngines...)
+}
+
+var defaultCrawlerEngines = []string{"googlebot", "bingbot", "baiduspider"}

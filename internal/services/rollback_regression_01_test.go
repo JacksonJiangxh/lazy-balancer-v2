@@ -47,6 +47,11 @@ func TestRollbackProjectionToCommittedInLock_restoresProjectionFiles(t *testing.
 	}
 
 	loadsBefore := admin.loadCount()
+	// 正向控制：首次应用必须真的产生过 /load，否则「回退不得 /load」在
+	// 计数恒零的空转基线上也通过，对回退路径零信息量。
+	if loadsBefore == 0 {
+		t.Fatal("前置失效：首次 GenerateAndApplyConfig 未发射 /load（loadCount=0），零 /load 断言无意义")
+	}
 	s.RollbackIPListProjectionsToCommittedInLock()
 	if got := admin.loadCount(); got != loadsBefore {
 		t.Fatalf("回退不得 /load: %d -> %d", loadsBefore, got)

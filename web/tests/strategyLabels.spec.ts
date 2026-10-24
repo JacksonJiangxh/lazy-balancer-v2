@@ -14,9 +14,9 @@ import {
   strategyCardsForProtocol,
   strategyValuesForProtocol,
 } from '../src/utils/strategyLabels.ts'
-import { repoSource, section } from './_helpers.ts'
+import { repoCode, section } from './_helpers.ts'
 
-const goSrc = repoSource('internal/handlers/rule_features.go')
+const goSrc = repoCode('internal/handlers/rule_features.go')
 const goFn = section(goSrc, 'func validateStrategyForProtocol(', '\n}\n')
 const goKeysOf = (declaration: string): string[] => {
   const block = section(goFn, declaration, '}')

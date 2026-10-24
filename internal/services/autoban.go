@@ -290,14 +290,20 @@ func AutobanEnabled() bool {
 // 口径；Run 体业务门必须区分「确认未启用」与「不可判定」——后者按失败落定
 // 且不得停环（瞬时读错误不得把已启用的任务永久停调度），与角色读取
 // （updateRunRole 三态）同口径。
+//
+// 读失败必须留痕（与 AutoBackupEnabledState/globalTaskAutoUpdateState 单源
+// 状态转换同口径）：此前静默 fail-closed 让「库故障」与「用户关闭」在调度面
+// 完全同形（零执行、零失败行、零日志）。
 func autobanEnabledState() (enabled, known bool) {
 	if db.DB == nil {
 		return false, false
 	}
 	var en int
 	if err := db.DB.QueryRow(`SELECT COALESCE(autoban_enabled,0) FROM global_config WHERE id=1`).Scan(&en); err != nil {
+		logScheduleReadFailure("schedule-read-autoban-enabled", err)
 		return false, false
 	}
+	logScheduleReadRecovered("schedule-read-autoban-enabled")
 	return en == 1, true
 }
 

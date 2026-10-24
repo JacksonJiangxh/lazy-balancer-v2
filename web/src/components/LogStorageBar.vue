@@ -21,20 +21,22 @@
       </div>
     </el-tooltip>
   </div>
-  <!-- 从未取到统计时不留空白：显式说明失败，而不是把整条进度条藏起来 -->
+  <!-- 从未取到统计时不留空白：先说明取数失败，再说明「请求成功但该日志无统计」
+       ——三者（有值/失败/无统计）都必须有可见归宿，否则整条统计会静默消失 -->
   <div v-else-if="error" class="form-tip-line">日志统计暂不可用</div>
+  <div v-else-if="unavailable" class="form-tip-line">该日志暂无统计数据</div>
 </template>
 
 <script setup lang="ts">
 import { computed } from 'vue'
-import { formatBytes } from '@/utils/api'
+import { formatBytes } from '@/utils/formatBytes'
 import { useLogStorageStats } from '@/composables/useLogStorageStats'
 
 const props = defineProps<{ logKey: string; caddyId?: string; refreshKey?: number }>()
 
 // 取数（含换行清空 / 换行重取 / 刷新号重取）在组合子内自洽：logKey 或 caddyId
 // 变化即重新取数并先清空旧行，调用方不必再靠 :key 重挂组件。
-const { info, error } = useLogStorageStats({
+const { info, error, unavailable } = useLogStorageStats({
   target: () => ({ logKey: props.logKey, caddyId: props.caddyId }),
   refreshKey: () => props.refreshKey,
 })

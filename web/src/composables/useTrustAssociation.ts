@@ -284,7 +284,9 @@ export const useTrustAssociation = (options: {
         await options.onChanged?.()
         return
       }
-      ElMessage.success(`已从「${list.name}」移除`)
+      // 移除是一次写事件（MFA step-up 覆盖）：与同文件「加入/创建」同口径经
+      // mfaAwareSuccess 发出——宽限窗内放行时提示必须带「免验证」前缀。
+      mfaAwareSuccess(`已从「${list.name}」移除`)
       await options.onChanged?.()
     } catch {
       // 全局拦截器已提示

@@ -1,12 +1,12 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { source, section } from './_helpers.ts'
+import { code, section } from './_helpers.ts'
 
 // 从节点任务视图：master-only 族在从节点永不投递，页面必须显性标注
 // 「仅主节点」并解释调度开关不可用，否则「下次执行」的未来时刻会被误读为
 // 即将运行（排障噪音）。
 
-const vue = source('src/views/settings/TaskMonitor.vue')
+const vue = code('src/views/settings/TaskMonitor.vue')
 const scheduleColumn = section(vue, '<el-table-column label="调度"', '</el-table-column>')
 const nextColumn = section(vue, '<el-table-column label="下次执行"', '</el-table-column>')
 

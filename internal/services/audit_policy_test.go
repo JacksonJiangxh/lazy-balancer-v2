@@ -122,13 +122,15 @@ func TestAuditResultText_translates_partial_result(t *testing.T) {
 // 集合漂移（新增可触发族未评估/自记机制撤销）会在这里当场失败。
 func TestTaskTriggerSelfRecordsAudit_familySplit(t *testing.T) {
 	// Given 6 个自记族（任务体 defer/执行器/载入审计，operator 经 RunContext 归人）
-	for _, id := range []string{"threat", "crs", "ip2region", "crawlerbot-update", "auto-backup", "startup:config-load"} {
+	selfRecorded := []string{"threat", "crs", "ip2region", "crawlerbot-update", "auto-backup", "startup:config-load"}
+	for _, id := range selfRecorded {
 		if !TaskTriggerSelfRecordsAudit(id) {
 			t.Fatalf("自记族 %s 应报告 true（handler 复记会双审计，违反单记口径）", id)
 		}
 	}
 	// When/Then 10 个非自记族报告 false（handler 显式补记「触发/任务监控」）
-	for _, id := range []string{"config-watchdog", "log-cleanup", "audit-retention", "security-events-retention", "metrics-orphan-cleanup", "cert-renewal-scan", "cert-reconcile", "cert-manual-poll", "cert-waiting-ca", "autoban"} {
+	handlerRecorded := []string{"config-watchdog", "log-cleanup", "audit-retention", "security-events-retention", "metrics-orphan-cleanup", "cert-renewal-scan", "cert-reconcile", "cert-manual-poll", "cert-waiting-ca", "autoban"}
+	for _, id := range handlerRecorded {
 		if TaskTriggerSelfRecordsAudit(id) {
 			t.Fatalf("非自记族 %s 应报告 false（任务体零审计，handler 不补记则手动触发无痕）", id)
 		}
@@ -136,5 +138,37 @@ func TestTaskTriggerSelfRecordsAudit_familySplit(t *testing.T) {
 	// 未知族按非自记处理（handler 补记——宁多记不遗漏）
 	if TaskTriggerSelfRecordsAudit("no-such-task") {
 		t.Fatal("未知族应报告 false")
+	}
+
+	// 反向对表：任务引擎注册的**全部可手动触发族**必须落在上面两张清单之一，
+	// 且生产分流结果与所在清单一一致。只在测试里手抄两张清单时，新增可触发族
+	// 不评估（既不进自记集也不进补记集）不会红；从注册表反查才能真正钉住。
+	in := func(list []string, id string) bool {
+		for _, v := range list {
+			if v == id {
+				return true
+			}
+		}
+		return false
+	}
+	te := newWireTestEngine(t)
+	checked := 0
+	for _, meta := range te.DescribeAll() {
+		if !meta.CanTrigger {
+			continue
+		}
+		checked++
+		self := in(selfRecorded, meta.ID)
+		switch {
+		case self && in(handlerRecorded, meta.ID):
+			t.Errorf("任务族 %s 同时出现在自记/补记清单——分流二义", meta.ID)
+		case !self && !in(handlerRecorded, meta.ID):
+			t.Errorf("可手动触发族 %s 未登记分流清单（任务体是否自记审计？新族必须评估并加入其一）", meta.ID)
+		case TaskTriggerSelfRecordsAudit(meta.ID) != self:
+			t.Errorf("任务族 %s 的生产分流=%v 与清单=%v 不一致", meta.ID, TaskTriggerSelfRecordsAudit(meta.ID), self)
+		}
+	}
+	if checked < 10 {
+		t.Fatalf("反向对表仅覆盖 %d 个可触发族（注册表未装载完整？），期望 ≥10", checked)
 	}
 }

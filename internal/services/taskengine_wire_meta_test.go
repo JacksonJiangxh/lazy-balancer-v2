@@ -27,38 +27,25 @@ func newWireTestEngine(t *testing.T) *taskengine.Engine {
 // runtimeLogFile（注入空串模拟「旋转写入器打开失败」形态）。
 func newWireTestEngineWithRuntimeLog(t *testing.T, runtimeLogFile string) *taskengine.Engine {
 	t.Helper()
-	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatalf("initialize test database: %v", err)
-	}
+	setupIsolatedDB(t)
 	// 注入空载 configLoadRerun——否则
 	// InitTaskEngine 尾部 BootSync（startup:config-load）因钩子 nil 恒落
 	// failed 启动行（「配置重载未接线」），每个夹具用例都携带一行假失败
 	// 残留。与 certJobsActiveFn 注入缝同模式：Cleanup 还原 nil。
 	SetConfigLoadRerun(func(operator string) error { return nil })
 	t.Cleanup(func() { SetConfigLoadRerun(nil) })
-	t.Cleanup(func() {
-		StopTaskEngine()
-		_ = db.Close()
-		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
-	})
+	// 后注册先执行：停引擎必须早于夹具的 db.Close。
+	t.Cleanup(func() { StopTaskEngine() })
 	return InitTaskEngine("", runtimeLogFile)
 }
 
 // 任务日志目录创建失败必须显式留痕，不能在只读/异常挂载下
 // 静默退化为零任务日志。
 func TestInitTaskEngine_logsTaskLogDirMkdirFailure(t *testing.T) {
-	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
+	setupIsolatedDB(t)
 	SetConfigLoadRerun(func(string) error { return nil })
-	t.Cleanup(func() {
-		StopTaskEngine()
-		SetConfigLoadRerun(nil)
-		_ = db.Close()
-		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
-	})
+	t.Cleanup(func() { SetConfigLoadRerun(nil) })
+	t.Cleanup(func() { StopTaskEngine() })
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "tasks"), []byte("not a directory"), 0644); err != nil {
 		t.Fatal(err)

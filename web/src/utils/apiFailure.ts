@@ -12,13 +12,13 @@
 import { isCurrentPasswordRejection } from './profileUpdate.ts'
 import { isMfaCredentialRejection } from './mfaErrors.ts'
 
-export type AuthFailureKind =
+type AuthFailureKind =
   | 'credential-rejection'
   | 'session-expired'
   | 'step-up'
   | 'generic'
 
-export interface AuthFailureInput {
+interface AuthFailureInput {
   readonly status?: number
   /** 响应体的业务码（data.code） */
   readonly dataCode?: number
@@ -48,7 +48,7 @@ export const classifyAuthFailure = (input: AuthFailureInput): AuthFailureKind =>
   return 'generic'
 }
 
-export interface MfaStepUpCoordinator {
+interface MfaStepUpCoordinator {
   /** 弹码（单飞）：在途时并发 428 共享同一 Promise，不连环弹窗。 */
   readonly prompt: () => Promise<string | null>
   /** 验证码刷新（单飞）：同一轮在途提供者共享同一次 verify-step（同码重放会被
@@ -105,11 +105,11 @@ export const createMfaStepUp = (openPrompt: () => Promise<string | null>): MfaSt
   }
 }
 
-export interface MfaGraceNoticeHandle {
+interface MfaGraceNoticeHandle {
   close: () => void
 }
 
-export interface MfaGraceTracker {
+interface MfaGraceTracker {
   /**
    * 响应携带宽限头（x-mfa-verified-seconds-ago）时记账。silent 请求（无页面级
    * 反馈）在 60s 节流内只发一条兜底提示；返回 true 表示本次真的发了。

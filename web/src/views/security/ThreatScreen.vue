@@ -26,14 +26,14 @@
       </transition>
 
       <!-- 攻击事件弹框：feed 新事件到达即弹（最多 3 条，4.5s 淡出） -->
-      <transition-group name="toast" tag="div" class="toasts">
-        <div v-for="t in attackToasts" :key="t.id" class="toast" :class="t.action === 'blocked' || t.action === 'mixed' ? 'sev-high' : 'sev-low'">
+      <transition-group name="toast" tag="div" class="toasts" role="status" aria-live="polite" aria-label="新攻击告警">
+        <div v-for="t in attackToasts" :key="t.id" class="toast" :class="t.action === 'blocked' ? 'sev-high' : 'sev-low'">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.5 4.5 5.4v6.1c0 4.6 3.2 8.6 7.5 9.9 4.3-1.3 7.5-5.3 7.5-9.9V5.4Z"/><path d="m9 12 2 2 4-4.5"/></svg>
           <b>{{ t.country }}</b>
           <span class="ip">{{ t.ip }}</span>
-          <span class="dim">{{ t.stage }} · {{ t.durationMs }}ms</span>
+          <span class="dim">{{ t.attackType }} · {{ t.durationMs }}ms</span>
           <span v-if="(t.count ?? 1) > 1" class="agg">×{{ t.count }}</span>
-          <span class="sev" :class="t.action === 'blocked' || t.action === 'mixed' ? 'sev-high' : 'sev-low'">{{ t.action === 'blocked' ? '已拦截' : t.action === 'mixed' ? '攻击' : '检测' }}</span>
+          <span class="sev" :class="t.action === 'blocked' ? 'sev-high' : 'sev-low'">{{ actionLabel(t.action) }}</span>
         </div>
       </transition-group>
 
@@ -44,7 +44,7 @@
       <transition name="fade">
         <div v-if="showEmptyState" class="empty-state">近 {{ windowHours }} 小时无安全事件</div>
       </transition>
-      <div class="error-stack">
+      <div class="error-stack" role="status" aria-live="polite">
         <div v-if="statsError" class="error-banner">大屏数据加载失败，正在重试…</div>
         <!-- 采集健康位（任务已停/连续失败/审计写侧降级）：判据与文案与事件列表/总览同源 -->
         <div v-if="ingestionWarning" class="info-note-bar">
@@ -68,7 +68,11 @@
           <span class="info-note-desc">事件流有空洞：{{ flowGap || attackFlowGap }} 条事件因缓冲溢出未送达，弹道不连续属正常现象</span>
         </div>
         <div v-if="collectorError" class="error-banner site-unset">大屏流量采集续租失败（Caddy 侧逐请求计数已中断），正在重试…</div>
-        <div v-if="!siteConfigured" class="error-banner site-unset">未配置站点坐标，本站信标与攻击弹道已隐藏</div>
+        <div v-if="configLoadFailed" class="error-banner site-unset">
+          大屏配置读取失败，暂用默认视图与未设置坐标
+          <button type="button" class="btn error-retry" @click="loadServerCentroid">重试</button>
+        </div>
+        <div v-else-if="!siteConfigured" class="error-banner site-unset">未配置站点坐标，本站信标与攻击弹道已隐藏</div>
       </div>
     </div>
 
@@ -76,7 +80,7 @@
     <aside class="panel panel-left hud" aria-label="实时威胁事件">
       <div class="panel-head">
         <h2>实时威胁事件 <span class="en">LIVE FEED</span></h2>
-        <span class="live-chip" :class="{ 'is-error': feedError }"><i></i>{{ feedError ? 'RETRY' : 'LIVE' }}</span>
+        <span class="live-chip" role="status" :class="{ 'is-error': feedError }"><i></i>{{ feedError ? 'RETRY' : 'LIVE' }}</span>
       </div>
       <div class="filters" role="group" aria-label="按危险等级筛选">
         <button v-for="f in sevFilters" :key="f.key" class="chip" type="button" :aria-pressed="sevFilter === f.key" @click="sevFilter = f.key">
@@ -153,16 +157,16 @@
       </div>
       <div class="stats">
         <div class="stat-section overview-section">
-          <div class="stat-title"><span>窗口概览</span></div>
+          <div class="stat-title"><span>窗口概览</span><em v-if="statsPending" class="ov-switch-hint" role="status">切换中…</em></div>
           <div class="overview-grid">
             <div class="ov-item"><span>事件总量</span><b>{{ stats?.total_events ?? 0 }}</b></div>
             <div class="ov-item"><span>拦截 / 检测</span><b>{{ stats?.blocked_events ?? 0 }} / {{ loggedEvents }}</b></div>
             <div class="ov-item">
-              <span>峰值时段</span>
+              <span>{{ bucketTerms.peakLabel }}</span>
               <b>{{ peakSlot.value > 0 ? peakSlot.name : '—' }}</b>
               <em v-if="peakSlot.value > 0">{{ peakSlot.value }} 次</em>
             </div>
-            <div class="ov-item"><span>有事件小时</span><b>{{ activeHourCount }}/{{ hourlyHist.length }}</b></div>
+            <div class="ov-item"><span>{{ bucketTerms.countLabel }}</span><b>{{ activeHourCount }}/{{ hourlyHist.length }}</b></div>
           </div>
         </div>
 
@@ -300,7 +304,7 @@ import { usePollingTask } from '@/composables/usePollingTask'
 import { createVisibilityIntervals } from '@/composables/useVisibilityIntervals'
 import { useCountUp } from '@/composables/useCountUp'
 import { formatDate } from '@/utils/date'
-import { trafficDelta, formatRecentRate, hourlyBucketLabel, type TrafficBaseline } from '@/utils/threatScreenMetrics'
+import { trafficDelta, formatRecentRate, hourlyBucketLabel, bucketTerminology, type TrafficBaseline } from '@/utils/threatScreenMetrics'
 import { anomalySeverity, overlayDetectionGrade, zeroScoreSeverity, type AnomalySeverity } from '@/utils/severityScale'
 import { displayThreatScreenMode } from '@/utils/configValues'
 import { flowTimestamp, normalizeTrafficSampleN, reconstructObservedRate, stepAdaptiveSample, nextFlowCursor, planFlowEvents, FLOW_REALTIME_MAX_AGE_MS } from '@/utils/threatFlowRules'
@@ -430,6 +434,11 @@ const peakSlot = computed(() => hourlyHist.value.reduce(
   { name: '—', value: 0 },
 ))
 const activeHourCount = computed(() => hourlyHist.value.filter((slot) => slot.value > 0).length)
+// 概览口径词随窗口派生（>24h 后端按日桶）——与趋势图 DAILY/HOURLY 同源
+const bucketTerms = computed(() => bucketTerminology(windowHours.value))
+// 已渲染的统计属于哪个窗口：切换窗口后旧帧保留但必须标注「切换中」，
+// 不得让上一窗口的数字冒充当前窗口。
+const statsPending = computed(() => stats.value !== null && stats.value.hours !== windowHours.value)
 const attackTypeShare = computed(() => stats.value?.attack_type_share ?? [])
 const displayRecentRateX10 = useCountUp(computed(() => Math.round((stats.value?.recent_rate ?? 0) * 10)), 500)
 const displayRecentRate = computed(() => formatRecentRate(displayRecentRateX10.value / 10))
@@ -536,7 +545,8 @@ interface AttackToast {
   id: number
   country: string
   ip: string
-  stage: string
+  /** 攻击类型（后端 summary 的 attack_type）——与事件列表的「触发类型」区分 */
+  attackType: string
   action: string
   durationMs: string
   /** >1 表示同一地区/秒聚合的请求数 */
@@ -569,7 +579,7 @@ function pushAttackToasts(groups: ToastSummaryGroup[]): void {
       id: group.last_id,
       country: (group.ip_location.split('·')[0] || '未知'),
       ip: group.client_ip,
-      stage: group.attack_type || '—',
+      attackType: group.attack_type || '—',
       action: group.action,
       durationMs: durMs >= 100 ? Math.round(durMs).toString() : durMs.toFixed(1),
       count: group.count,
@@ -722,7 +732,8 @@ const trafficTask = usePollingTask(async ({ signal, isCurrent }) => {
 function setWindow(hours: number): void {
   if (windowHours.value === hours) return
   windowHours.value = hours
-  stats.value = null
+  // 不把上一帧清成 null：全屏 KPI 瞬间归零会被误读为「无攻击/数据被清空」。
+  // 保留旧帧并由 statsPending 标「切换中」，新窗口响应到达后自动替换。
   statsError.value = false
   void statsTask.run()
 }
@@ -742,6 +753,9 @@ const flowSampleLabel = computed(() => {
 const isGlobeMode = computed(() => screenMode.value === 'globe')
 const serverLatLon: [number, number] = [0, 0]
 const siteConfigured = ref(false)
+// /config 读取失败是「未知」而非「未配置」：失败态必须与「未配置站点坐标」
+// 区分并给出重试，否则运维会按错误结论去核对本已配置的坐标。
+const configLoadFailed = ref(false)
 async function loadServerCentroid(): Promise<void> {
   try {
     const res = await request.get<APIResponse<{ server_map_lat?: number; server_map_lon?: number; threat_screen_mode?: string; threat_traffic_sample_n?: number }>>('/config?_ts=' + Date.now(), { silent: true })
@@ -753,6 +767,7 @@ async function loadServerCentroid(): Promise<void> {
     acquireCollector()
     serverLatLon[0] = res.data?.server_map_lat ?? 0
     serverLatLon[1] = res.data?.server_map_lon ?? 0
+    configLoadFailed.value = false
     siteConfigured.value = serverLatLon[0] !== 0 || serverLatLon[1] !== 0
     if (siteConfigured.value) {
       threatMap?.setServer([serverLatLon[1], serverLatLon[0]])
@@ -761,7 +776,8 @@ async function loadServerCentroid(): Promise<void> {
       tgtReadout.value = '--'
     }
   } catch {
-    /* 配置读取失败：保持缺省（地图模式、本站未配置） */
+    // 配置读取失败：保持缺省（地图模式、本站未配置），但显性化为「读取失败」
+    configLoadFailed.value = true
   }
 }
 
@@ -1476,6 +1492,7 @@ onBeforeUnmount(() => {
 .ov-item span { font-size: 11px; color: #8ea7d6; }
 .ov-item b { font-size: 16px; color: #e2ecff; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .ov-item em { font-style: normal; font-size: 10px; color: #56709f; }
+.ov-switch-hint { font-style: normal; font-size: 11px; color: #ffd166; letter-spacing: 0.04em; }
 
 .stat-tabs { display: flex; gap: 6px; margin-bottom: 7px; }
 .stat-tab {

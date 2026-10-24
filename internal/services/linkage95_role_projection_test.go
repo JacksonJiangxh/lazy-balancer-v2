@@ -7,6 +7,10 @@ import (
 	"testing"
 )
 
+// 从端投影的用户可见文案：期望值独立冻结（不取生产常量——那是回声，文案被
+// 改空/改成任意串仍绿）。文案变更须同步本行。
+const wantProjectedMessage = "来自主节点快照的进行中状态，本节点不执行该任务"
+
 func TestProjectActiveUpdateStatusForLocalRole(t *testing.T) {
 	_, database := newClusterTestService(t)
 
@@ -24,8 +28,8 @@ func TestProjectActiveUpdateStatusForLocalRole(t *testing.T) {
 	}
 	for _, active := range []string{"checking", "downloading", "installing", "reloading", "running"} {
 		status, message := ProjectActiveUpdateStatusForLocalRole(active, "旧文案")
-		if status != "failed" || message != snapshotActiveUpdateStatusMessage {
-			t.Fatalf("从节点投影(%s)=%q/%q，want failed/%q", active, status, message, snapshotActiveUpdateStatusMessage)
+		if status != "failed" || message != wantProjectedMessage {
+			t.Fatalf("从节点投影(%s)=%q/%q，want failed/%q", active, status, message, wantProjectedMessage)
 		}
 	}
 	// 终态不受影响
@@ -54,11 +58,11 @@ func TestStoredStatusSnapshotsProjectActiveStatusOnSlave(t *testing.T) {
 	}
 
 	crs := storedStatusSnapshot()
-	if crs.Status != "failed" || crs.Message != snapshotActiveUpdateStatusMessage {
+	if crs.Status != "failed" || crs.Message != wantProjectedMessage {
 		t.Fatalf("CRS 从端快照=%q/%q，want failed/归属文案", crs.Status, crs.Message)
 	}
 	ip2 := ip2RegionStoredStatusSnapshot()
-	if ip2.Status != "failed" || ip2.Message != snapshotActiveUpdateStatusMessage {
+	if ip2.Status != "failed" || ip2.Message != wantProjectedMessage {
 		t.Fatalf("IP2Region 从端快照=%q/%q，want failed/归属文案", ip2.Status, ip2.Message)
 	}
 

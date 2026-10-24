@@ -120,8 +120,10 @@ func (j *certJobListItem) scanFrom(scanner certJobScanner, now time.Time, expiry
 	); err != nil {
 		return err
 	}
-	if cooldown, retryable := certJobRetryCooldown(j.Status); retryable {
-		seconds := int64(cooldown / time.Second)
+	if cooldown, retryable := certJobRetryCooldownAt(j.Status, j.CAAvailableAfter.NullTime, now); retryable {
+		// 向上取整（0=「现在即可重试」的语义见 services.CertJobRetryCooldownSeconds）：
+		// 剩余不足 1 秒时下发 1 而非 0，避免把仍在冷却中的任务引导成必然 429 的重试。
+		seconds := services.CertJobRetryCooldownSeconds(cooldown)
 		j.RetryCooldownSeconds = &seconds
 	}
 	j.Issuer = certificateIssuerCached(certPEM)
@@ -618,21 +620,18 @@ func rescheduleDownloadedCertJobDeployment(id int, ruleID, domain string) (bool,
 	return true, registerDownloadedCertJobDeploymentRetry(id, ruleID)
 }
 
-// certJobRetryCooldown 是重试冷却的唯一策略源；列表 API 直接下发该值，
-// certJobRetryBlocked 复用同一判定执行服务端门禁。
+// certJobRetryCooldown 是重试冷却通用策略的 handlers 侧入口——策略单源在
+// services.CertJobRetryCooldown（任务监控证书行与证书任务列表必须同口径）。
 func certJobRetryCooldown(status string) (time.Duration, bool) {
-	switch status {
-	case "disabled":
-		return 0, false
-	case "issued", "waiting_ca":
-		return 0, true
-	case "queued":
-		return 15 * time.Minute, true
-	case "failed":
-		return 5 * time.Minute, true
-	default:
-		return 2 * time.Minute, true
-	}
+	return services.CertJobRetryCooldown(status)
+}
+
+// certJobRetryCooldownAt 返回「此刻该任务还剩多少冷却」：通用冷却之外并入
+// CA 限流退避窗口（waiting_ca ∧ ca_available_after 未到期，1–3h，远晚于
+// 通用冷却）。策略单源在 services.CertJobRetryCooldownAt——列表下发值、
+// 任务监控证书行与服务端门禁三处共用，不得各写一份。
+func certJobRetryCooldownAt(status string, caAvailableAfter sql.NullTime, now time.Time) (time.Duration, bool) {
+	return services.CertJobRetryCooldownAt(status, caAvailableAfter, now)
 }
 
 // certJobRetryBlocked 返回任务是否被重试门拦截，以及应返回的 HTTP 状态码。
@@ -673,8 +672,9 @@ func certJobRetryBlocked(status string, updatedAt, createdAt sql.NullTime, now t
 // ca_available_after 未到期）。「任务重试」与「手动触发签发」两个入口必须共用
 // 本判据：同状态同语义却一个要求 force、另一个直接重排，会让规则列表的
 // 「重新签发」静默越过冷却、清空 ca_available_after 并继续消耗 CA 配额。
+// 策略单源在 services.CertJobCAcooldownActive。
 func certJobCAcooldownActive(status string, caAvailableAfter sql.NullTime, now time.Time) bool {
-	return status == "waiting_ca" && caAvailableAfter.Valid && now.Before(caAvailableAfter.Time)
+	return services.CertJobCAcooldownActive(status, caAvailableAfter, now)
 }
 
 // certJobCAcooldownMessage 是 CA 冷却拦截的统一文案（availableAfter=冷却到期

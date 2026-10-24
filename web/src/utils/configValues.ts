@@ -43,7 +43,7 @@ export function displaySecurityEventsRowCap(value: number | null | undefined): n
  * 展示。原三处各自 `=== 'globe' ? 'globe' : 'map'`（设置父模型、基础设置
  * 响应式回填、大屏 /config 读取）属第二/三份实现。
  */
-export type ThreatScreenMode = 'map' | 'globe'
+type ThreatScreenMode = 'map' | 'globe'
 
 export function displayThreatScreenMode(value: string | null | undefined): ThreatScreenMode {
   return value === 'globe' ? 'globe' : 'map'

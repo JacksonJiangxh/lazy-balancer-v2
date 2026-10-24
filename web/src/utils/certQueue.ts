@@ -9,7 +9,7 @@
 /** 横幅最多列出的域名 chip 数（其余以「+N」折叠）。 */
 export const CERT_QUEUE_VISIBLE_JOBS = 4
 
-export interface CertQueueCounts {
+interface CertQueueCounts {
   readonly queued: number
   readonly running: number
   readonly waiting: number

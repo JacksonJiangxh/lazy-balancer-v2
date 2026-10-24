@@ -6,6 +6,7 @@
 package caddygeoip
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"os"
@@ -255,9 +256,11 @@ func (h *GeoIPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next ca
 		// xdb 缺失/损坏（Provision 降级 pass-through）：coraza 的地域规则读
 		// REQUEST_HEADERS:X-LB-GeoIP-Loc，缺失变量在 coraza 连取反算子都不产生
 		// 匹配（rule.go evaluate 按值循环）——不置哨兵则 deny/allow 两模式的
-		// id:8 恒不命中，地域拦截静默 fail-open。与查询失败同口径发「海外」，
-		// 恢复文档化 fail-closed 语义。
-		r.Header.Set("X-LB-GeoIP-Loc", "海外")
+		// id:8 恒不命中，地域拦截静默 fail-open。必须与查询失败分支同口径发射
+		// 全套哨兵（变量 + 头）：只发 Loc 头会让 geoip.* 变量消费方
+		// （流量统计桶/未来 CEL 规则）读到未设置变量，形成
+		// 「collecting=true 但恒零」的静默口径分裂。
+		setGeoIPSentinels(r.Context(), r)
 	}
 	h.applyCrawlerVerification(r)
 	return next.ServeHTTP(w, r)
@@ -333,6 +336,23 @@ func (h *GeoIPHandler) Cleanup() error {
 	return nil
 }
 
+// setGeoIPSentinels 发射 fail-closed 哨兵形态：4 个 geoip.* 变量与 4 个空串
+// 头哨兵 + X-LB-GeoIP-Loc=「海外」。已解析行随后覆盖（国内为省/省-市，海外
+// 为国名）。xdb 不可用与查询失败两条分支必须共用本实现——只发 Loc 头会让
+// geoip.* 变量消费方（流量统计桶、未来 CEL 规则）读到未设置变量，形成与
+// 「查询失败」不同的静默口径。
+func setGeoIPSentinels(ctx context.Context, r *http.Request) {
+	caddyhttp.SetVar(ctx, "geoip.country_name", "")
+	caddyhttp.SetVar(ctx, "geoip.region", "")
+	caddyhttp.SetVar(ctx, "geoip.province", "")
+	caddyhttp.SetVar(ctx, "geoip.city", "")
+	r.Header.Set("X-LB-GeoIP-Country", "")
+	r.Header.Set("X-LB-GeoIP-Region", "")
+	r.Header.Set("X-LB-GeoIP-Province", "")
+	r.Header.Set("X-LB-GeoIP-City", "")
+	r.Header.Set("X-LB-GeoIP-Loc", "海外")
+}
+
 // setGeoIPPlaceholders resolves the client IP against the database and
 // publishes the country fields on the request replacer. v2.2.0 起同值镜像为
 // X-LB-GeoIP-* 请求头（含 fail-closed 空串哨兵），供下游 coraza 的 GeoIP
@@ -348,15 +368,7 @@ func (h *GeoIPHandler) setGeoIPPlaceholders(r *http.Request) {
 	// 头镜像同语义：X-LB-GeoIP-Loc 先置「海外」哨兵（承载 fail-closed 海外裁决
 	// ——不可解析客户端保此值）；已解析行随后覆盖为国名（海外）或省/省-市（国内，
 	// 域 G 历史）。省/市空串对 coraza 锚定正则（^(?:...)$）恒不匹配。
-	caddyhttp.SetVar(ctx, "geoip.country_name", "")
-	caddyhttp.SetVar(ctx, "geoip.region", "")
-	caddyhttp.SetVar(ctx, "geoip.province", "")
-	caddyhttp.SetVar(ctx, "geoip.city", "")
-	r.Header.Set("X-LB-GeoIP-Country", "")
-	r.Header.Set("X-LB-GeoIP-Region", "")
-	r.Header.Set("X-LB-GeoIP-Province", "")
-	r.Header.Set("X-LB-GeoIP-City", "")
-	r.Header.Set("X-LB-GeoIP-Loc", "海外")
+	setGeoIPSentinels(ctx, r)
 	province, city := "", ""
 	ip := realClientIP(r)
 	if ip == "" {
@@ -433,25 +445,26 @@ func parseGeoIPRegion(region string) (geoIPRegionFields, bool) {
 	if out.Province == "" {
 		out.City = ""
 	}
-	// geoipLocFor 承载三态判定。
-	out.Loc = geoipLocFor(fields[0], out.Province, out.City)
+	// geoipLocFor 承载三态判定。传入已归一的国家列（out.Country）——归一
+	// 是单源（normalizeTrafficCountryKey），Loc 与 country_name 不得各自
+	// 归一（历史形态：两处逐案等价，加新别名时单侧漏改会让两个头的口径分裂）。
+	out.Loc = geoipLocFor(out.Country, out.Province, out.City)
 	return out, true
 }
 
-// geoipLocFor 由 xdb 国家列与规范化省/市列计算 X-LB-GeoIP-Loc 值：
-// 国内（国家列 TrimSpace 后为「中国」——TrimSpace 对称，树侧
-// 收集判定同口径）→ 省 或 省/市；海外 → 归一化国名（域 G，历史——已
-// 解析海外行细化到国家，与选项树 Countries 同源同归一）；国家列不可解析为
-// 国名（空/0/Reserved/中国空白异形经 NormalizeCountry 折叠空串）→「海外」
-// 哨兵，与 fail-closed 哨兵同口径（deny+海外仍拦此类客户端）。
-func geoipLocFor(rawCountry, province, city string) string {
-	if strings.TrimSpace(rawCountry) == "中国" {
+// geoipLocFor 由**已归一**的国家列与规范化省/市列计算 X-LB-GeoIP-Loc 值：
+// 国内（country == 中国）→ 省 或 省/市；海外 → 归一化国名（域 G，历史——
+// 已解析海外行细化到国家，与选项树 Countries 同源同归一）；国家列不可解析为
+// 国名（空/0/Reserved/中国空白异形经归一折叠空串）→「海外」哨兵，与
+// fail-closed 哨兵同口径（deny+海外仍拦此类客户端）。
+func geoipLocFor(country, province, city string) string {
+	if country == "中国" {
 		if city != "" {
 			return province + "/" + city
 		}
 		return province
 	}
-	if country := geoipnames.NormalizeCountry(rawCountry); country != "" {
+	if country != "" {
 		return country
 	}
 	return "海外"

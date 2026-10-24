@@ -2,6 +2,7 @@ package services
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -376,4 +378,168 @@ func removeTimberjackRotations(base string) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// ruleLogOrphanPurgePerRun 单轮最多清理的孤儿规则数（有界：首次上线/历史残留
+// 可能有大量规则目录条目，本轮清不完留下轮继续；与 metrics 孤儿清理同形）。
+var ruleLogOrphanPurgePerRun = 500
+
+// RuleLogHousekeepingResult 孤儿规则访问日志清理明细。
+type RuleLogHousekeepingResult struct {
+	// Purged 本轮已清理（活动文件 + 全部轮转副本）的规则 ID。
+	Purged []string
+	// RemoveFailed 删除失败数（权限/只读挂载/IO）——失败即残留，必须进结果
+	// 错误面，摘要不得称完成。
+	RemoveFailed int
+	// ScanError 目录读取/存活规则清单读取失败原因（非空=本轮未删除任何文件：
+	// 无法区分「规则已删除」与「清单读不出来」时删除会误删存活规则的日志）。
+	ScanError string
+	// Remaining 达单轮上限未处理的孤儿规则数（下轮继续，非失败）。
+	Remaining int
+}
+
+// Summary 一行明细摘要（空动作时「清理 0 个」）。
+func (r RuleLogHousekeepingResult) Summary() string {
+	list := func(names []string) string {
+		if len(names) == 0 {
+			return "无"
+		}
+		if len(names) > 5 {
+			return strings.Join(names[:5], "、") + fmt.Sprintf(" 等 %d 个", len(names))
+		}
+		return strings.Join(names, "、")
+	}
+	summary := fmt.Sprintf("规则访问日志：孤儿规则清理 %d 个[%s]", len(r.Purged), list(r.Purged))
+	var notes []string
+	if r.RemoveFailed > 0 {
+		notes = append(notes, fmt.Sprintf("删除失败 %d 个", r.RemoveFailed))
+	}
+	if r.ScanError != "" {
+		notes = append(notes, "目录/存活清单读取失败"+r.ScanError)
+	}
+	if r.Remaining > 0 {
+		notes = append(notes, fmt.Sprintf("本轮达上限，剩余 %d 个下轮继续", r.Remaining))
+	}
+	if len(notes) > 0 {
+		summary += "、" + strings.Join(notes, "、")
+	}
+	return summary
+}
+
+// purgedErr 删除失败/扫描失败的错误面（nil=本轮每个动作都成功或无事可做）。
+func (r RuleLogHousekeepingResult) purgedErr() error {
+	var errs []error
+	if r.ScanError != "" {
+		errs = append(errs, fmt.Errorf("规则日志孤儿扫描失败: %s", r.ScanError))
+	}
+	if r.RemoveFailed > 0 {
+		errs = append(errs, fmt.Errorf("规则日志删除失败 %d 个", r.RemoveFailed))
+	}
+	return errors.Join(errs...)
+}
+
+// PurgeOrphanRuleLogs 清理「规则已不存在」的规则访问日志（活动文件 + 移位/
+// 时间戳轮转副本）。规则日志此前只有三个事件型删除入口（删除规则 / 导入差集 /
+// 集群差集），任一路径失败即永久残留（单规则含副本上限约 6×caddy_log_size_mb），
+// 且无重试——本任务提供周期兜底（与 metrics 孤儿清理同构）。
+//
+// 判定域是 lb_rules.caddy_id：清单读取失败时一个文件都不删（否则会把存活规则
+// 的日志当孤儿清掉），按 ScanError 上抛。文件名还原失败的条目一律跳过——外来
+// 文件不属于本规则的日志族，不得误删。
+func PurgeOrphanRuleLogs() RuleLogHousekeepingResult {
+	result := RuleLogHousekeepingResult{}
+	entries, err := os.ReadDir(ruleLogDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return result // 尚无规则访问日志（首次运行/未启用）：正常空目录
+		}
+		result.ScanError = err.Error()
+		return result
+	}
+	liveIDs, err := liveRuleIDs(context.Background())
+	if err != nil {
+		result.ScanError = fmt.Sprintf("读取存活规则清单失败: %v", err)
+		return result
+	}
+	seen := map[string]bool{}
+	var orphans []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		component, ok := ruleLogComponentOf(e.Name())
+		if !ok {
+			continue
+		}
+		ruleID := decodeFileComponent(component)
+		if liveIDs[ruleID] || seen[ruleID] {
+			continue
+		}
+		seen[ruleID] = true
+		orphans = append(orphans, ruleID)
+	}
+	if len(orphans) == 0 {
+		return result
+	}
+	sort.Strings(orphans) // 确定性：同一积压跨轮次优先清理同一前缀
+	if limit := ruleLogOrphanPurgePerRun; limit > 0 && len(orphans) > limit {
+		result.Remaining = len(orphans) - limit
+		orphans = orphans[:limit]
+	}
+	for _, ruleID := range orphans {
+		if err := RemoveRuleLogFiles(ruleID); err != nil {
+			Logf("error", "规则日志孤儿清理失败（%s）: %v", ruleID, err)
+			result.RemoveFailed++
+			continue
+		}
+		result.Purged = append(result.Purged, ruleID)
+	}
+	return result
+}
+
+// ruleLogComponentOf 从规则日志文件名还原文件名主体（encodeFileComponent 的
+// 产物，decodeFileComponent 可逆还原为 caddy_id）。识别三形态：活动文件
+// <component>.log、移位副本 <component>.log.<n>（旧版本/外来 logrotate 残留）
+// 与 timberjack 时间戳副本 <component>-<ts>-<reason>[_N].log[.gz|.zst]；
+// 压缩后缀先剥。ok=false 表示不属于任何规则的日志族（外来文件不得被清理）。
+func ruleLogComponentOf(name string) (string, bool) {
+	core := name
+	for _, suffix := range []string{".gz", ".zst"} {
+		core = strings.TrimSuffix(core, suffix)
+	}
+	// 移位副本 <component>.log.<n>：只有剥掉数字段后仍以 .log 结尾才算，
+	// 基名本身不含 '.'（encodeFileComponent 的产物只用 [A-Za-z0-9_-%]）。
+	if dot := strings.LastIndexByte(core, '.'); dot > 0 && dot < len(core)-1 && ruleLogAllDigits(core[dot+1:]) {
+		if trimmed := core[:dot]; strings.HasSuffix(trimmed, ".log") {
+			core = trimmed
+		}
+	}
+	// timberjack 时间戳副本：从右往左找第一个构成完整副本尾部的 '-' 边界
+	// （基名允许含 "-<数字>"，按首个 '-' 切分会串到同前缀的兄弟规则）。
+	for i := len(core) - 1; i > 0; i-- {
+		if core[i] != '-' {
+			continue
+		}
+		if timberjackRotationSuffix.MatchString(core[i:]) {
+			return core[:i], core[:i] != ""
+		}
+	}
+	base, ok := strings.CutSuffix(core, ".log")
+	if !ok || base == "" || strings.Contains(base, ".") {
+		return "", false
+	}
+	return base, true
+}
+
+// ruleLogAllDigits 报告 s 是否全部为 ASCII 数字（非空）。
+func ruleLogAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }

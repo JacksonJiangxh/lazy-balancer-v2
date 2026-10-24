@@ -4,6 +4,8 @@
     width="min(640px, 94vw)"
     top="8vh"
     :close-on-click-modal="false"
+    :close-on-press-escape="!saving"
+    :show-close="!saving"
     @update:model-value="emit('update:modelValue', $event)"
     @open="onOpen"
   >
@@ -128,7 +130,7 @@
         </span>
         <span v-else class="bind-total">已选 {{ pickerSelected.length }} 条规则</span>
         <div class="bind-footer-buttons">
-          <el-button @click="emit('update:modelValue', false)">取消</el-button>
+          <el-button :disabled="saving" @click="emit('update:modelValue', false)">取消</el-button>
           <el-tooltip
             :disabled="!(mode === 'rule' && boundMixedPolicies.length > 0)"
             content="存在已绑定的混合策略（只读），请先在策略页对其执行「更新迁移」，再调整绑定"

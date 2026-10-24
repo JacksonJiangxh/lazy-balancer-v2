@@ -24,9 +24,9 @@ import (
 func TestLoadSecurityPolicyContext_rejectsGenerationDuringCRSTreeSwap(t *testing.T) {
 	_, database := newClusterTestService(t)
 
-	// Given 树交换窗口被标记（swapCRSTreeFromStaging 的 RemoveAll→moveTree 段）
-	crsTreeSwapInFlight.Store(true)
-	t.Cleanup(func() { crsTreeSwapInFlight.Store(false) })
+	// Given 树交换窗口被标记
+	leaveWindow := enterCRSTreeSwapWindow()
+	t.Cleanup(func() { crsTreeSwapDepth.Store(0) })
 
 	// When 生成期装载安全策略上下文
 	_, err := loadSecurityPolicyContext(database)
@@ -37,9 +37,93 @@ func TestLoadSecurityPolicyContext_rejectsGenerationDuringCRSTreeSwap(t *testing
 	}
 
 	// And 窗口结束后恢复可用
-	crsTreeSwapInFlight.Store(false)
+	leaveWindow()
 	if _, err := loadSecurityPolicyContext(database); err != nil {
 		t.Fatalf("窗口结束后 loadSecurityPolicyContext 必须恢复: %v", err)
+	}
+}
+
+// 树交换窗口的嵌套语义：内层退出不得清除外层仍在进行的标记——swap 段内的
+// 恢复路径与 seed 内的 replaceDirFrom 都是嵌套进入，内层提前清除会让外层
+// 窗口剩余时间里的并发生成读到缺失/部分规则树。
+func TestCRSTreeSwapWindow_nestsUntilOutermostExit(t *testing.T) {
+	if crsTreeSwapInFlightNow() {
+		t.Fatal("前置形态：窗口应关闭（其他用例泄漏了标记）")
+	}
+	leaveOuter := enterCRSTreeSwapWindow()
+	if !crsTreeSwapInFlightNow() {
+		t.Fatal("进入窗口后必须报告进行中")
+	}
+	leaveInner := enterCRSTreeSwapWindow()
+	leaveInner()
+	if !crsTreeSwapInFlightNow() {
+		t.Fatal("内层窗口退出后外层标记必须保持")
+	}
+	leaveOuter()
+	if crsTreeSwapInFlightNow() {
+		t.Fatalf("最外层退出后窗口必须关闭，depth=%d", crsTreeSwapDepth.Load())
+	}
+}
+
+// 生产者侧：树搬移必须在窗口内执行，且退出后不得残留标记（残留会让之后每次
+// 配置生成都失败）。搬移经 moveTree 的 osRename 缝观察窗口状态。
+func TestRestoreRulesBackup_runsInsideTreeSwapWindow(t *testing.T) {
+	root := t.TempDir()
+	rulesPath := filepath.Join(root, "crs", "rules")
+	bak := crsTransientPath(filepath.Join(root, "crs"), "rules.bak")
+	writeTestFile(t, filepath.Join(bak, crsRulesProbeFile), "SecRule bak")
+	writeTestFile(t, filepath.Join(rulesPath, "REQUEST-900.conf"), "SecRule live")
+
+	oldRename := osRename
+	moves := 0
+	osRename = func(src, dst string) error {
+		if !crsTreeSwapInFlightNow() {
+			t.Errorf("规则树搬移 %s→%s 未处于树交换窗口内（并发生成会读到缺失/部分树）", src, dst)
+		}
+		moves++
+		return os.Rename(src, dst)
+	}
+	t.Cleanup(func() { osRename = oldRename })
+
+	if !restoreRulesBackup(rulesPath, bak) {
+		t.Fatal("完整备份应被还原")
+	}
+	if moves == 0 {
+		t.Fatal("未观察到任何树搬移（用例形态失效）")
+	}
+	if crsTreeSwapInFlightNow() {
+		t.Fatalf("restoreRulesBackup 退出后不得残留窗口标记，depth=%d", crsTreeSwapDepth.Load())
+	}
+}
+
+// 同族：从节点 waf 包落盘（untarGzTo）替换 live 规则树时也必须在树交换窗口
+// 内——RemoveAll(destDir) 与 copyDir 之间 live 缺失/只有部分树，并发生成会
+// 发布无安全链或弱化配置。
+func TestUntarGzTo_replacesLiveTreeInsideSwapWindow(t *testing.T) {
+	destDir := filepath.Join(t.TempDir(), "crs")
+	payload := rawTarGz(t, []tarEntry{
+		{name: "rules/REQUEST-901.conf", body: []byte("SecRule new")},
+	})
+
+	oldRename := osRename
+	sawWindow := false
+	osRename = func(src, dst string) error {
+		if !crsTreeSwapInFlightNow() {
+			t.Errorf("规则树 rename %s→%s 未处于树交换窗口内", src, dst)
+		}
+		sawWindow = true
+		return os.Rename(src, dst)
+	}
+	t.Cleanup(func() { osRename = oldRename })
+
+	if err := untarGzTo(payload, destDir, ""); err != nil {
+		t.Fatalf("untar: %v", err)
+	}
+	if !sawWindow {
+		t.Fatal("未观察到 rename 路径（用例形态失效）")
+	}
+	if crsTreeSwapInFlightNow() {
+		t.Fatalf("untarGzTo 退出后不得残留窗口标记，depth=%d", crsTreeSwapDepth.Load())
 	}
 }
 

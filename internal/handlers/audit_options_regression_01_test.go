@@ -53,6 +53,12 @@ func TestAuditLogOptions_errorRoundDoesNotPoisonCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open broken audit db: %v", err)
 	}
+	// 复位先登记：get() 内的 t.Fatalf 会跳过其后的语句，残留已关闭的
+	// AuditDB 会让同包后续用例持续查询坏库（错误归因困难）。
+	t.Cleanup(func() {
+		db.AuditDB = healthy
+		_ = broken.Close()
+	})
 	db.AuditDB = broken
 	first := get()
 	db.AuditDB = healthy

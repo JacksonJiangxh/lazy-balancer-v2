@@ -12,7 +12,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { adminTlsConfirmDisabled, adminTlsReusesSavedCert } from '../src/utils/adminTlsGate.ts'
-import { repoSource, section, source } from './_helpers.ts'
+import { repoCode, section, code } from './_helpers.ts'
 
 const stored = (overrides: Partial<{ savedMode: string; hasSavedCert: boolean; certError: string }> = {}) => ({
   savedMode: 'upload',
@@ -66,7 +66,7 @@ test('自签模式不需要证书材料', () => {
 })
 
 test('组件接线：确定按钮与 confirmAdminTls 共用同一门', () => {
-  const page = source('src/views/settings/BasicSettings.vue')
+  const page = code('src/views/settings/BasicSettings.vue')
   assert.match(page, /:disabled="adminTlsConfirmBlocked"/, '按钮必须消费统一判据')
   const confirm = section(page, 'const confirmAdminTls = () => {', 'loadAdminTls()')
   assert.match(confirm, /if \(adminTlsConfirmBlocked\.value\) return/)
@@ -77,20 +77,20 @@ test('组件接线：确定按钮与 confirmAdminTls 共用同一门', () => {
 })
 
 test('沿用提示与全局样式类一致（无局部 hack）', () => {
-  const page = source('src/views/settings/BasicSettings.vue')
+  const page = code('src/views/settings/BasicSettings.vue')
   const reuseBar = section(page, 'v-if="adminTlsReuseSaved', '</div>')
   assert.match(reuseBar, /class="info-note-bar"/)
   assert.match(reuseBar, /info-note-desc/)
 })
 
 test('/admin-tls 保存语义：不带材料即保留库内证书（跨栈对照）', () => {
-  const go = repoSource('internal/handlers/admintls.go')
+  const go = repoCode('internal/handlers/admintls.go')
   assert.match(go, /cert, key := current\.Cert, current\.Key/, '默认沿用库内证书材料')
   assert.match(go, /if mode == "upload" && input\.hasUploadPayload\(\)/, '仅在带材料时才替换证书')
 })
 
 test('两段写：/config 已落库时 TLS 段失败须披露部分成功', () => {
-  const page = source('src/views/settings/BasicSettings.vue')
+  const page = code('src/views/settings/BasicSettings.vue')
   const save = section(page, 'const handleSave = async', 'const message = (saveResp')
   assert.ok(
     save.indexOf("emit('save')") < save.indexOf("'/admin-tls'"),

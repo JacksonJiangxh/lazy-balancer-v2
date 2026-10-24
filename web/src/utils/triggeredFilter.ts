@@ -18,7 +18,7 @@
 export const CRAWLER_FAMILY_LABEL = '爬虫Bot'
 
 export const TRIGGERED_CATEGORIES = [CRAWLER_FAMILY_LABEL, '地域拦截', 'IP 访问控制', '信任名单', '威胁情报库', '请求体异常', 'WAF·CRS', 'WAF·自定义'] as const
-export type TriggeredCategory = typeof TRIGGERED_CATEGORIES[number]
+type TriggeredCategory = typeof TRIGGERED_CATEGORIES[number]
 
 // 每类对应的 ruleTriggeredFamilyPrefixes 映射键（值=后端 family 键，与新
 // trigger_type 同语义）。

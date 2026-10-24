@@ -9,7 +9,8 @@ import (
 
 // （crsupdate.go）同口径——远端 tag 不新于当前版本（cmp<=0）即跳过，
 // 防止上游 release 回退/删除时把本地 xdb 静默降级为更旧版本；格式不可比
-// （cmpErr!=nil）保持「不等即更新」的既有行为。
+// （cmpErr!=nil）时显式失败（failed）——既不隐含更新（会静默替换本地库），
+// 也不假装已是最新（会掩盖上游 tag 命名变更）。
 func TestIP2RegionUpdateRun_versionComparisonGate(t *testing.T) {
 	cases := []struct {
 		name         string

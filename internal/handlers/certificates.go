@@ -119,15 +119,81 @@ func mergeMaskedDNSCredentials(submitted, stored map[string]string, preserveUnsu
 	return merged, nil
 }
 
+// hasMaskedDNSCredentialValue 报告提交值中是否含掩码占位（区别于
+// isMaskedDNSCredentials 的「全部为占位」）。库内凭证损坏时，只有「一个占位都
+// 没有」的完整新凭据才能整列覆写；含占位必须回库值取值，500 才是诚实的。
+func hasMaskedDNSCredentialValue(m map[string]string) bool {
+	for _, v := range m {
+		if v == maskedDNSCredentialsSentinel {
+			return true
+		}
+	}
+	return false
+}
+
+// dnsCredentialFamilyMode 归一凭证 map 的认证族：auth_mode（UI 形态）优先，
+// 兼容 canonical 形态的 mode；tencent_cloud 与 tencent 同族。无法判定返回空串。
+func dnsCredentialFamilyMode(m map[string]string) string {
+	mode := strings.ToLower(strings.TrimSpace(m["auth_mode"]))
+	if mode == "" {
+		mode = strings.ToLower(strings.TrimSpace(m["mode"]))
+	}
+	switch mode {
+	case "dnspod":
+		return "dnspod"
+	case "tencent", "tencent_cloud":
+		return "tencent"
+	}
+	return ""
+}
+
+// pruneSupersededDNSCredentialFamily 在维护请求把认证族从 stored 切到 creds 时
+// 删除旧族字段，返回被删除的键名（未切换返回 nil）。
+//
+// 合并语义（mergeMaskedDNSCredentials 的 preserveUnsubmitted）目标是「稀疏
+// PATCH 不抹掉未提交字段」，但认证族切换不是稀疏 PATCH：旧族密钥已无消费方
+// （Canonical 按 auth_mode 只取新族），遗留只会随集群快照/备份扩散，并在切回
+// 旧族时被再次启用。前端切换 auth_mode 已按 visible_when 删掉隐藏字段，后端
+// 若再从库值继承回来，等于把用户刚清掉的密钥写回去。
+func pruneSupersededDNSCredentialFamily(creds, stored map[string]string) []string {
+	storedMode, submittedMode := dnsCredentialFamilyMode(stored), dnsCredentialFamilyMode(creds)
+	if storedMode == "" || submittedMode == "" || storedMode == submittedMode {
+		return nil
+	}
+	var stale []string
+	switch submittedMode {
+	case "dnspod":
+		stale = []string{"secret_id", "secret_key"}
+	case "tencent":
+		stale = []string{"app_id", "app_token", "api_token"}
+	}
+	// 冗余的 legacy mode 与认证族同义：提交带 auth_mode 时由后者表达，删除
+	// 避免「auth_mode=新族、mode=旧族」的并存形态误导后续推断。
+	if strings.TrimSpace(creds["auth_mode"]) != "" {
+		stale = append(stale, "mode")
+	}
+	removed := make([]string, 0, len(stale))
+	for _, key := range stale {
+		if _, ok := creds[key]; !ok {
+			continue
+		}
+		delete(creds, key)
+		removed = append(removed, key)
+	}
+	return removed
+}
+
 // respondStoredDNSCredentialsCorrupted 处理「库内 dns_credentials 不是合法
 // JSON」的存储损坏形态（带外改库/旧版本遗留；导入通道已校验 JSON 对象，正常
 // 写入不会产生）：与保存前测试端点（TestCertificateConfig）的
 // storage_corrupted 口径同源——500 + 固定中文文案，解析错误只进运行日志。
 // 不得折成 400（「Invalid stored DNS credentials」/「凭证字段不能为掩码占位符」
 // 等请求类文案），否则运维会把存储损坏误判成自己的表单填写问题并反复重填。
+// 文案必须指向唯一可执行动作：提交完整新凭据即整列覆写（损坏行由此自愈），
+// 原「请重新保存配置」在省略/掩码载荷上仍会 500，用户照做只会反复失败。
 func respondStoredDNSCredentialsCorrupted(c *gin.Context, configID int, cause error) {
 	recordAudit(c, "更新失败", "DNS配置", services.FormatAuditDetail(fmt.Sprintf("配置 %d", configID), services.AuditResultPart("storage_corrupted")))
-	writeInternalError(c, http.StatusInternalServerError, "存储的 DNS 凭证已损坏，请重新保存配置", cause)
+	writeInternalError(c, http.StatusInternalServerError, "存储的 DNS 凭证已损坏，请重新填写完整凭证后保存", cause)
 }
 
 func (h *Handlers) ListCertificateConfigs(c *gin.Context) {
@@ -310,6 +376,9 @@ func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 		effectiveProvider = req.DNSProvider
 	}
 	effectiveCredentials := req.DNSCredentials
+	// 认证族切换时被清除的旧族字段（见 pruneSupersededDNSCredentialFamily），
+	// 供审计 detail 披露「这次保存删掉了哪些存量凭据」。
+	var prunedStaleCredentialFields []string
 	switch {
 	case effectiveCredentials == nil || len(effectiveCredentials) == 0:
 		// 省略或空对象（表单未编辑任何凭证字段）等价于「未提交」：以库值参与
@@ -338,19 +407,28 @@ func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 		// 部分掩码回传先逐字段合并——下方早期校验与最终落库都以
 		// 合并结果为准(掩码字段取库值),掩码串不得进入校验/落库。
 		stored := map[string]string{}
+		var storedCorruptErr error
 		if oldCredentials != "" {
 			if uerr := json.Unmarshal([]byte(oldCredentials), &stored); uerr != nil {
-				// 库值不是合法 JSON 是存储损坏（与上方两个分支同口径），不得
-				// 吞掉解析错误让合并失败被报成「凭证字段不能为掩码占位符」。
-				respondStoredDNSCredentialsCorrupted(c, id, uerr)
+				storedCorruptErr = uerr
+			}
+		}
+		if storedCorruptErr != nil {
+			// 完整新凭据（无掩码占位）是整列覆写，合并语义用不上库值——存储
+			// 损坏不构成阻断，否则损坏行永久不可编辑（名称/启用态/凭据都改
+			// 不了）。含掩码的载荷仍需库值逐字段取值，只能维持 500。
+			if hasMaskedDNSCredentialValue(effectiveCredentials) {
+				respondStoredDNSCredentialsCorrupted(c, id, storedCorruptErr)
 				return
 			}
+			stored = map[string]string{}
 		}
 		merged, merr := mergeMaskedDNSCredentials(effectiveCredentials, stored, effectiveProvider == oldProvider)
 		if merr != nil {
 			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: merr.Error()})
 			return
 		}
+		prunedStaleCredentialFields = pruneSupersededDNSCredentialFamily(merged, stored)
 		req.DNSCredentials = merged
 		effectiveCredentials = merged
 	}
@@ -461,6 +539,11 @@ func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 				changed = append(changed, "凭证")
 			}
 		}
+	}
+	if len(prunedStaleCredentialFields) > 0 {
+		// 切换认证方式会真删旧族凭据（不是「保留」）：必须在审计里点名删除
+		// 了哪些字段，否则事后只能看到一条「凭证」变更。
+		changed = append(changed, fmt.Sprintf("清除旧认证方式凭据（%s）", strings.Join(prunedStaleCredentialFields, "、")))
 	}
 	if req.Enabled != nil && *req.Enabled != oldEnabled {
 		query += "enabled = ?, "
@@ -643,7 +726,7 @@ func (h *Handlers) TestCertificateConfig(c *gin.Context) {
 		if credentials != "" {
 			if uerr := json.Unmarshal([]byte(credentials), &creds); uerr != nil {
 				recordAudit(c, "测试失败", "DNS配置", services.FormatAuditDetail(fmt.Sprintf("配置 %d", id), configName, provider, services.AuditResultPart("storage_corrupted")))
-				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "存储的 DNS 凭证已损坏，请重新保存配置"})
+				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "存储的 DNS 凭证已损坏，请重新填写完整凭证后保存"})
 				return
 			}
 		}

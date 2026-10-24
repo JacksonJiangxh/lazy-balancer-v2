@@ -8,10 +8,10 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { PAGE_IDS } from '../src/utils/pageIds.ts'
-import { section, source, member } from './_helpers.ts'
+import { code, codeSection, member, section } from './_helpers.ts'
 
 test('大屏全屏分支不进 AppLayout（侧栏顶栏不得渲染）', () => {
-  const app = source('src/App.vue')
+  const app = code('src/App.vue')
   // 终点用「顶层 template 收尾 + script 起点」而非首个 `</template>`——当前
   // App.vue 无嵌套 template，但模板一引入嵌套（el-table 插槽等）首标记即截断，
   // 断言对象会悄悄变短。
@@ -28,7 +28,7 @@ test('大屏全屏分支不进 AppLayout（侧栏顶栏不得渲染）', () => {
 
 // ---- 组件接线钉（间隔调度行为见 visibilityIntervals.spec.ts） ----
 test('ThreatScreen 经 createVisibilityIntervals 接管 hidden 停摆', () => {
-  const page = source('src/views/security/ThreatScreen.vue')
+  const page = code('src/views/security/ThreatScreen.vue')
   assert.match(page, /import \{ createVisibilityIntervals \} from '@\/composables\/useVisibilityIntervals'/)
   const loopBlock = section(page, 'const screenLoop = createVisibilityIntervals({', '})')
   // 时钟(1s, immediate)/采集租约心跳(immediate) 纳管；攻击光流由独立
@@ -57,7 +57,7 @@ test('ThreatScreen 经 createVisibilityIntervals 接管 hidden 停摆', () => {
 })
 
 test('威胁大屏死选择器清理与「被攻击目标」空态文案', () => {
-  const page = source('src/views/security/ThreatScreen.vue')
+  const page = code('src/views/security/ThreatScreen.vue')
   assert.doesNotMatch(page, /\.ev-icon svg/)
   assert.doesNotMatch(page, /\.scanline/)
   assert.doesNotMatch(page, /\.viewport-grid/)
@@ -65,14 +65,13 @@ test('威胁大屏死选择器清理与「被攻击目标」空态文案', () =>
 })
 
 test('统计响应窗口与当前窗口不一致时丢弃', () => {
-  const page = source('src/views/security/ThreatScreen.vue')
-  const statsTask = section(page, 'const statsTask = usePollingTask', '// ============ 逐请求正常流量事件流')
+  const statsTask = codeSection('src/views/security/ThreatScreen.vue', 'const statsTask = usePollingTask', '// ============ 逐请求正常流量事件流')
   assert.match(statsTask, /if \(res\.data\.hours !== windowHours\.value\) return/)
 })
 
 test('两条光流的空洞标记贯通到独立横幅（不与加载失败混报）', () => {
-  const page = source('src/views/security/ThreatScreen.vue')
-  const flowTask = section(page, 'const flowTask = usePollingTask', '// ============ 引擎装载')
+  const page = code('src/views/security/ThreatScreen.vue')
+  const flowTask = codeSection('src/views/security/ThreatScreen.vue', 'const flowTask = usePollingTask', '// ============ 引擎装载')
   assert.match(flowTask, /gap\?: boolean/)
   assert.match(flowTask, /gap_skipped\?: number/)
   // 空洞（环形缓冲溢出，事件永久丢失）≠ 加载失败：分别落到 flowGap/flowError。
@@ -86,7 +85,7 @@ test('两条光流的空洞标记贯通到独立横幅（不与加载失败混�
 })
 
 test('采集租约申请/续租失败独立横幅（不与光流失败混报）', () => {
-  const page = source('src/views/security/ThreatScreen.vue')
+  const page = code('src/views/security/ThreatScreen.vue')
   const acquire = member(page, 'function acquireCollector(): void')
   assert.ok(acquire.includes('.then(() => { collectorError.value = false })'))
   assert.ok(acquire.includes('.catch(() => { collectorError.value = true })'))

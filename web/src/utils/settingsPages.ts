@@ -29,7 +29,7 @@ export const SETTINGS_TAB_DESCS: Record<SettingsTabId, string> = {
  * API 密钥不读它。`configLoadFailed` 横幅的「保存已暂停」只在这些分页成立，
  * 否则会让人误判本页保存也失败。
  */
-export const SETTINGS_TABS_CONSUMING_CONFIG: readonly SettingsTabId[] = ['basic', 'certificates']
+const SETTINGS_TABS_CONSUMING_CONFIG: readonly SettingsTabId[] = ['basic', 'certificates']
 
 /** 分页是否消费 `/config`（决定配置加载失败横幅是否相关） */
 export const settingsTabConsumesConfig = (tab: SettingsTabId): boolean =>

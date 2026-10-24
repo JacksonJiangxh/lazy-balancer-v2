@@ -47,28 +47,10 @@
             <span class="form-tip-inline">分钟，登录令牌有效期</span>
           </el-form-item>
           <el-form-item label="时区">
-            <el-select v-model="settings.timezone" :disabled="isReadOnly" filterable class="compact-select">
-              <el-option label="Asia/Shanghai (UTC+8)" value="Asia/Shanghai" />
-              <el-option label="Asia/Hong_Kong (UTC+8)" value="Asia/Hong_Kong" />
-              <el-option label="Asia/Tokyo (UTC+9)" value="Asia/Tokyo" />
-              <el-option label="Asia/Singapore (UTC+8)" value="Asia/Singapore" />
-              <el-option label="Asia/Seoul (UTC+9)" value="Asia/Seoul" />
-              <el-option label="Asia/Bangkok (UTC+7)" value="Asia/Bangkok" />
-              <el-option label="Asia/Kolkata (UTC+5:30)" value="Asia/Kolkata" />
-              <el-option label="Asia/Dubai (UTC+4)" value="Asia/Dubai" />
-              <el-option label="Europe/London (UTC+0，夏令时 UTC+1)" value="Europe/London" />
-              <el-option label="Europe/Paris (UTC+1，夏令时 UTC+2)" value="Europe/Paris" />
-              <el-option label="Europe/Berlin (UTC+1，夏令时 UTC+2)" value="Europe/Berlin" />
-              <el-option label="Europe/Moscow (UTC+3)" value="Europe/Moscow" />
-              <el-option label="America/New_York (UTC-5，夏令时 UTC-4)" value="America/New_York" />
-              <el-option label="America/Chicago (UTC-6，夏令时 UTC-5)" value="America/Chicago" />
-              <el-option label="America/Denver (UTC-7，夏令时 UTC-6)" value="America/Denver" />
-              <el-option label="America/Los_Angeles (UTC-8，夏令时 UTC-7)" value="America/Los_Angeles" />
-              <el-option label="America/Sao_Paulo (UTC-3)" value="America/Sao_Paulo" />
-              <el-option label="Australia/Sydney (UTC+10，夏令时 UTC+11)" value="Australia/Sydney" />
-              <el-option label="UTC" value="UTC" />
+            <el-select v-model="settings.timezone" :disabled="isReadOnly" filterable allow-create default-first-option class="compact-select">
+              <el-option v-for="opt in timezoneOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
             </el-select>
-            <div class="form-tip-line">影响日志时间戳与证书时间；标注夏令时的时区会随夏令时自动偏移；仅 Caddy 日志需重启服务生效</div>
+            <div class="form-tip-line">影响日志时间戳与证书时间；标注夏令时的时区会随夏令时自动偏移；标注「自定义」的值为 API/备份写入、不在常用列表内的 IANA 时区（可继续使用或改选）；仅 Caddy 日志需重启服务生效</div>
           </el-form-item>
           <el-form-item label="大屏本站坐标">
             <el-select v-model="siteLocationKey" :disabled="isReadOnly" filterable clearable placeholder="选择省份或国家" style="width: 260px" @change="applySiteLocation">
@@ -500,7 +482,8 @@
 import { computed, h, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useAuthStore } from '@/stores/auth'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { request, mfaAwareSuccess, formatBytes } from '@/utils/api'
+import { request, mfaAwareSuccess } from '@/utils/api'
+import { formatBytes } from '@/utils/formatBytes'
 import { useLogTailPolling } from '@/composables/useLogTailPolling'
 import { useSettingsDraft, type AdminTlsCertInfo } from '@/composables/useSettingsDraft'
 import { restartServiceWithFeedback } from '@/utils/restart'
@@ -683,6 +666,12 @@ let lastAutoBackupErrorToastAt = 0
 const autoBackupSaving = ref(false)
 const autoBackupRunning = ref(false)
 const autoBackupForm = ref({ enabled: false, frequency: 'daily', time: '03:00', day: 1, keep: 7 })
+// 频率切换必须重归 day：周视图上限 7、月视图上限 28（后端写侧门同值）。
+// 月→周保留 20 会让下拉显示无匹配项的裸值，保存必 400「备份日期必须在 1-7 之间」。
+watch(() => autoBackupForm.value.frequency, (frequency) => {
+  const high = frequency === 'weekly' ? 7 : 28
+  autoBackupForm.value.day = Math.min(Math.max(1, autoBackupForm.value.day), high)
+})
 const autoBackupSections = ref<string[]>(BACKUP_SECTIONS.map((s) => s.key))
 const autoBackupRows = ref<AutoBackupRow[]>([])
 // 立即备份只认最近一次成功读取/保存的服务端范围；未保存表单编辑不参与门控。
@@ -1299,6 +1288,38 @@ const mfaScopeVisible = ref(false)
 // admin/business 组写路由逐族对齐；新增写端点族必须同步入列）。
 
 const settings = defineModel<BasicSettingsConfig>('settings', { required: true })
+// 时区选项目录（常用项）——写侧接受任意 IANA 时区名（后端 time.LoadLocation
+// 校验），因此「启用 ∪ 当前值」：API/备份写入的非枚举值以自定义项原值回显，
+// 否则下拉空白、用户一改选就无法再改回该值。
+const PRESET_TIMEZONES: readonly { label: string; value: string }[] = [
+  { label: 'Asia/Shanghai (UTC+8)', value: 'Asia/Shanghai' },
+  { label: 'Asia/Hong_Kong (UTC+8)', value: 'Asia/Hong_Kong' },
+  { label: 'Asia/Tokyo (UTC+9)', value: 'Asia/Tokyo' },
+  { label: 'Asia/Singapore (UTC+8)', value: 'Asia/Singapore' },
+  { label: 'Asia/Seoul (UTC+9)', value: 'Asia/Seoul' },
+  { label: 'Asia/Bangkok (UTC+7)', value: 'Asia/Bangkok' },
+  { label: 'Asia/Kolkata (UTC+5:30)', value: 'Asia/Kolkata' },
+  { label: 'Asia/Dubai (UTC+4)', value: 'Asia/Dubai' },
+  { label: 'Europe/London (UTC+0，夏令时 UTC+1)', value: 'Europe/London' },
+  { label: 'Europe/Paris (UTC+1，夏令时 UTC+2)', value: 'Europe/Paris' },
+  { label: 'Europe/Berlin (UTC+1，夏令时 UTC+2)', value: 'Europe/Berlin' },
+  { label: 'Europe/Moscow (UTC+3)', value: 'Europe/Moscow' },
+  { label: 'America/New_York (UTC-5，夏令时 UTC-4)', value: 'America/New_York' },
+  { label: 'America/Chicago (UTC-6，夏令时 UTC-5)', value: 'America/Chicago' },
+  { label: 'America/Denver (UTC-7，夏令时 UTC-6)', value: 'America/Denver' },
+  { label: 'America/Los_Angeles (UTC-8，夏令时 UTC-7)', value: 'America/Los_Angeles' },
+  { label: 'America/Sao_Paulo (UTC-3)', value: 'America/Sao_Paulo' },
+  { label: 'Australia/Sydney (UTC+10，夏令时 UTC+11)', value: 'Australia/Sydney' },
+  { label: 'UTC', value: 'UTC' },
+]
+const timezoneOptions = computed(() => {
+  const options = PRESET_TIMEZONES.map((item) => ({ ...item }))
+  const current = settings.value.timezone
+  if (current && !options.some((item) => item.value === current)) {
+    options.push({ label: `${current}（自定义）`, value: current })
+  }
+  return options
+})
 // 父级 /config 加载完成前禁止保存：表单此刻仍是默认值。
 const props = defineProps<{ configLoaded: boolean }>()
 const emit = defineEmits<{

@@ -13,11 +13,11 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { code, section, source } from './_helpers.ts'
+import { code, section } from './_helpers.ts'
 
 const file = 'src/components/events/TriggerDetailDialog.vue'
 const logic = code(file)
-const markup = source(file)
+const markup = code(file)
 
 test('名单条目失败不得静默：按 refIds 缺失显性置 entriesError', () => {
   assert.match(logic, /const entriesError = ref\(false\)/)

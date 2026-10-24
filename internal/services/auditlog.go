@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"lazy-balancer-v2/internal/db"
 )
@@ -126,7 +127,38 @@ func auditVocabWords(s string) int {
 	return words
 }
 
+// auditDetailMaxBytes 是审计详情的落库上限。详情可携带对端文本（集群主节点
+// 错误体、被攻陷主节点或明文链路 MITM 的响应），无界写入会膨胀审计库并让前端
+// 单行渲染卡顿；4KB 覆盖正常业务文案（最长者为配置差异清单的聚合行）。
+const auditDetailMaxBytes = 4 << 10
+
+// sanitizeAuditDetail 是审计详情的单源净化：剥离控制字符（C0 与 DEL，含换行
+// ——审计详情是单行文本，保留会让对端文本伪造「；结果：成功」之类段落）并按
+// 4KB 上限截断到合法 UTF-8 边界。调用点覆盖全部 20+ 写入方，避免下一处遗漏
+// 重演「同族两种处置」（此前 WAF 拉取路径单独截断 200B，集群切换/同步失败
+// 路径原样落库）。
+func sanitizeAuditDetail(detail string) string {
+	if detail == "" {
+		return detail
+	}
+	cleaned := strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, detail)
+	if len(cleaned) <= auditDetailMaxBytes {
+		return cleaned
+	}
+	cut := auditDetailMaxBytes
+	for cut > 0 && !utf8.ValidString(cleaned[:cut]) {
+		cut--
+	}
+	return cleaned[:cut]
+}
+
 func RecordAuditLog(username, action, resource, detail, ipAddress string) {
+	detail = sanitizeAuditDetail(detail)
 	if db.AuditDB == nil {
 		Logf("warn", "audit log write skipped: audit database is not initialized")
 		return
@@ -165,12 +197,12 @@ func AppendAPIKeyAuditDetail(detail string, keyID int, keyName string) string {
 // RuntimeLogCleanupOnce 回填的 RuntimeCleanupResult.RetentionMonths——仍在
 // 上述三消费点内，未新增第四份口径。
 func auditRetentionMonths() (int, error) {
-	const defaultMonths = 3
+	defaultMonths := db.DefaultAuditRetentionMonths
 	if db.DB == nil {
 		return defaultMonths, nil
 	}
 	var months int
-	if err := db.DB.QueryRow("SELECT COALESCE(audit_retention_months, 3) FROM global_config WHERE id=1").Scan(&months); err != nil {
+	if err := db.DB.QueryRow("SELECT COALESCE(audit_retention_months, ?) FROM global_config WHERE id=1", db.DefaultAuditRetentionMonths).Scan(&months); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			// 配置行缺失＝从未配置：默认值即用户口径，继续清理（仍留痕，
 			// 与「读取失败不得静默」口径一致）。

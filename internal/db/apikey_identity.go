@@ -43,6 +43,10 @@ func ResolveAPIKeyIdentity(database *sql.DB, plaintext string) (APIKeyIdentity, 
 		FROM api_keys k
 		JOIN users u ON u.id = k.created_by
 		WHERE k.key_prefix = ? AND k.key_hash = ?
+		  -- is_enabled 刻意用裸比较（NULL 行 fail-closed 拒绝）：写侧恒写值、
+		  -- 备份/快照导入按缺省 1 归一，NULL 仅带外改库可达。改 COALESCE 放行
+		  -- 会让历史 NULL 行静默获得鉴权；列表侧 COALESCE(is_enabled,1) 的
+		  -- 「启用」显示是有意接受的排障口径差异。
 		  AND k.is_enabled = 1
 		  AND u.is_enabled = 1
 		  AND (k.expires_at IS NULL OR datetime(k.expires_at) > datetime('now'))

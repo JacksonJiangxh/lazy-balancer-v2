@@ -7,7 +7,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { registerModuleHooks, source } from './_helpers.ts'
+import { registerModuleHooks, code, drainMicrotasks, waitForMicrotasks } from './_helpers.ts'
 import { STUB_API } from './_stubs.ts'
 
 interface GetCall {
@@ -23,15 +23,6 @@ g.__gets = []
 
 registerModuleHooks({ '@/utils/api': STUB_API })
 const { useCountryNamesCn, countryLabel } = await import('../src/composables/useCountryNamesCn.ts')
-
-const tick = async (): Promise<void> => {
-  for (let i = 0; i < 4; i++) {
-    const { promise, resolve } = Promise.withResolvers<void>()
-    setTimeout(resolve, 0)
-    await promise
-  }
-}
-
 test('失败回退原名且不闩死：下一次调用重试并落地中文映射', async () => {
   g.__gets = []
   let mode: 'fail' | 'ok' = 'fail'
@@ -42,7 +33,9 @@ test('失败回退原名且不闩死：下一次调用重试并落地中文映�
   }
   // 首次（失败）：不得抛出，映射为空 → 展示英文原名
   const zh = useCountryNamesCn()
-  await tick()
+  await waitForMicrotasks(() => g.__gets.length === 1, '首轮映射请求必须发出')
+  // 请求已发起后再推进链尾（catch/finally/返回共若干跳）：失败轮不得落地映射
+  await drainMicrotasks()
   assert.deepEqual(zh.value, {})
   // 鉴别力：映射值与键不同，才能区分「命中映射」与「回退原名」——此前用
   // 映射外的键 + 恒等映射，两态输出相同（断言恒真）。
@@ -50,10 +43,15 @@ test('失败回退原名且不闩死：下一次调用重试并落地中文映�
   assert.equal(countryLabel({ 美国: '美国(US)' }, '德国'), '德国', '映射缺失时回退原名')
   assert.equal(countryLabel(zh.value, '美国'), '美国', '空映射回退原名')
 
-  // 第二次（成功）：失败未缓存，下一次调用必须重试
+  // 第二次（成功）：失败未缓存，下一次调用必须重试。等待条件同时覆盖两条契约：
+  // 请求数涨到 2（失败未闩死）且映射落地——任一不成立都在预算内报错，不会把
+  // 未收敛的中间态当结果断言。
   mode = 'ok'
   useCountryNamesCn()
-  await tick()
+  await waitForMicrotasks(
+    () => g.__gets.length === 2 && Object.keys(zh.value).length === 2,
+    '失败未缓存：下一次调用必须重试并落地中文映射',
+  )
   assert.deepEqual(zh.value, { 美国: '美国', 德国: '德国' })
   assert.equal(countryLabel(zh.value, '德国'), '德国')
   assert.equal(countryLabel(zh.value, '法国'), '法国', '未收录国名回退原名')
@@ -61,7 +59,7 @@ test('失败回退原名且不闩死：下一次调用重试并落地中文映�
 
   // 第三次：加载成功即会话级缓存，不再请求
   useCountryNamesCn()
-  await tick()
+  await drainMicrotasks()
   assert.equal(g.__gets.length, 2, '成功后不得重复拉取')
   assert.deepEqual(g.__gets[0].config, { silent: true }, '映射拉取必须静默（不与全局拦截器双 toast）')
 })
@@ -80,7 +78,7 @@ test('countryLabel 是纯翻译：哨兵/省份/省市联值原样返回', () =>
 // 消费侧接线钉：createLazyLoader 的唯一生产消费点（省名懒加载）。
 // 改用直接 fetch 会让「首次国家名未加载时省名即触发请求」的回退失效。
 test('createLazyLoader 接线：省名映射经 lazyOnce 单源懒加载', () => {
-  const composable = source('src/composables/useCountryNamesCn.ts')
+  const composable = code('src/composables/useCountryNamesCn.ts')
   assert.match(composable, /import \{ createLazyLoader \} from '@\/utils\/lazyOnce'/, '必须复用 lazyOnce')
   assert.match(composable, /createLazyLoader\(/, '省名加载必须经 createLazyLoader')
 })

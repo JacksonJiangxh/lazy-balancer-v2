@@ -16,7 +16,7 @@
  * 被拒，而浏览器解析出的 username 为空）。
  */
 
-export interface ClusterUrlValidationOptions {
+interface ClusterUrlValidationOptions {
   /** 错误文案前缀，如「主节点地址」/「访问地址」。 */
   readonly label: string
   /** 空值错误文案；不传 = 空值合法（对应后端 AccessURL 允许空串）。 */

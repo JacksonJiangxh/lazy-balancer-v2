@@ -199,3 +199,13 @@ test('零源多源库占位行状态：未配置（与卡头健康标签同词�
   // 空串仍是空文案（调用方以 v-if 守卫，不渲染空标签）
   assert.equal(libraryStatusLabel(''), '')
 })
+
+// 状态词表是普通对象：直接下标会让 'constructor'/'toString' 取到原型链上的
+// 函数（真值）并当标签返回，状态列渲染出函数而非原文。
+test('原型链键不得冒充词表命中：返回状态原文而非函数', () => {
+  for (const status of ['constructor', 'toString', 'valueOf', 'hasOwnProperty', '__proto__']) {
+    const label: unknown = libraryStatusLabel(status)
+    assert.equal(typeof label, 'string', `${status} 不得返回函数`)
+    assert.equal(label, status, `${status} 未登记 → 原样回显`)
+  }
+})

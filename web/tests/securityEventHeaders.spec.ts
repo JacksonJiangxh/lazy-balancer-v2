@@ -8,24 +8,34 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { member, repoSource, source } from './_helpers.ts'
+import { code, member, repoCode } from './_helpers.ts'
 
 /** Go map 字面量里的头名（小写键）。 */
 const backendHeaders = (): string[] => {
-  const src = repoSource('internal/handlers/security.go')
+  // 剥注释视图：注释掉的条目不得计入名单（raw 视图下「注释缩减名单」双绿）。
+  const src = repoCode('internal/handlers/security.go')
   const body = member(src, 'securityEventSensitiveHeaderNames = map[string]struct{}{')
+  // 解析窗口边界钉：窗口必须起于 map 字面量、止于其闭括号，不得跨到后续声明。
+  assert.match(body, /^securityEventSensitiveHeaderNames = map\[string\]struct\{\}\{/, '解析窗口未从 map 字面量起始')
+  assert.match(body, /\}\s*$/, '解析窗口未止于 map 闭括号')
   return [...body.matchAll(/"([^"]+)":/g)].map((m) => m[1])
 }
 
 /** 前端 Set 字面量里的头名。 */
 const frontendHeaders = (): string[] => {
-  const src = source('src/views/security/SecurityEvents.vue')
-  const start = src.indexOf('const CTX_SENSITIVE_HEADERS = new Set([')
-  assert.notEqual(start, -1, '缺少 CTX_SENSITIVE_HEADERS')
-  const open = src.indexOf('[', start)
+  const src = code('src/views/security/SecurityEvents.vue')
+  const startMarker = 'const CTX_SENSITIVE_HEADERS = new Set(['
+  const start = src.indexOf(startMarker)
+  assert.notEqual(start, -1, '缺少 CTX_SENSITIVE_HEADERS（剥注释视图）')
+  const open = start + startMarker.length - 1
   const close = src.indexOf('])', open)
   assert.ok(close > open, 'CTX_SENSITIVE_HEADERS 数组边界异常')
-  return [...src.slice(open, close).matchAll(/'([^']+)'/g)].map((m) => m[1])
+  // 边界钉：窗口必须恰落在 new Set([ … ]) 内——越界会把后续语句里的字符串
+  // 当成名单条目（或反向漏掉闭括号前的条目）。
+  const window = src.slice(open, close + 2)
+  assert.ok(window.startsWith('[') && window.endsWith('])'), `CTX_SENSITIVE_HEADERS 解析窗口越界: ${window.slice(0, 80)}`)
+  assert.doesNotMatch(window, /\n\s*(?:const|function|export)\s/, '解析窗口越过 Set 字面量边界')
+  return [...window.matchAll(/'([^']+)'/g)].map((m) => m[1])
 }
 
 test('请求头掩码名单：前后端逐项一致（后端为权威口径）', () => {

@@ -9,12 +9,12 @@
 // 编辑器的 v-if 已随开关隐藏，用户无法就地清空；若照常携带存量值，保存会被
 // 400 拦在预览阶段。剔除后需要把「库中自定义格式将被清空」显性告知用户——
 // 判定与告知同源于本函数返回的 accessLogFormatCleared。
-export type CaddyAccessLogSettings = {
+type CaddyAccessLogSettings = {
   readonly access_log_json: boolean
   readonly access_log_format: string
 }
 
-export type CaddyConfigPayload<Settings, Key extends keyof Settings> = {
+type CaddyConfigPayload<Settings, Key extends keyof Settings> = {
   readonly payload: Partial<Pick<Settings, Key>>
   /** 关闭自定义 JSON 且存量格式非空：该键已从载荷剔除，库中映射将被清空。 */
   readonly accessLogFormatCleared: boolean

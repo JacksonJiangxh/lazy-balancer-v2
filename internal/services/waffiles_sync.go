@@ -564,6 +564,39 @@ func rewriteVersionIfMissingOrStale(path, tag string) error {
 	return writeFileAtomicSynced(path, []byte(tag), 0644)
 }
 
+// wafFilesRefVersionLabelsDiffer 是「同步开关关闭」告警专用轻量比对：只读
+// 两个小版本文件（CRS 的 VERSION / ip2region 的 .version），不打包整棵规则树。
+// 该告警只回答「主节点安全数据是否已更新」，主端 ref 的版本标签正取自同一对
+// 文件——整树 tar.gz+sha256 对此没有增量信息，且持 WafFileLock 数十至数百毫秒
+// 会与三库更新器/导入文件相位争锁。开关开启时的内容级漂移检测仍走
+// wafFilesRefDiffers 的哈希口径。
+func wafFilesRefVersionLabelsDiffer(r *models.ClusterWafFilesRef) bool {
+	if r == nil {
+		return false
+	}
+	WafFileLock().Lock()
+	defer WafFileLock().Unlock()
+	if r.CRSVersion != "" {
+		version := ""
+		if content, err := os.ReadFile(filepath.Join(crsLiveDir, "VERSION")); err == nil {
+			version = strings.TrimSpace(string(content))
+		}
+		if version != r.CRSVersion {
+			return true
+		}
+	}
+	if r.IP2RegionTag != "" {
+		tag := ""
+		if content, err := os.ReadFile(ip2regionLivePath + ".version"); err == nil {
+			tag = sanitizeBundleVersion(strings.TrimSpace(string(content)))
+		}
+		if tag != r.IP2RegionTag {
+			return true
+		}
+	}
+	return false
+}
+
 func wafFilesRefDiffers(r *models.ClusterWafFilesRef) bool {
 	if r == nil {
 		return false
@@ -918,16 +951,42 @@ func untarGzTo(data []byte, destDir string, expectSum string) error {
 	if err := os.RemoveAll(staging); err != nil {
 		Logf("warn", "waf sync: 清理同步暂存目录 %s 失败（残留可能与本轮解包合并，哈希门会拒绝落盘）: %v", staging, err)
 	}
-	// 入口残留自愈：上次进程在「清空 live 后复制」窗口（rename→EEXIST 的
-	// 主路径）被 SIGKILL 时会留下「部分新树 + .sync-bak」，此时 live 可能
-	// 缺失或为空。恢复方向安全——旧树优于半新树（缺规则文件=对应防护静默
-	// 失效），随后本轮照常替换。
-	if wafTreeEmptyOrMissing(destDir) {
-		if _, statErr := os.Stat(backup); statErr == nil {
-			if rErr := copyDir(backup, destDir); rErr != nil {
+	// 入口残留自愈：成功路径在末尾删除 .sync-bak，故备份在场即上一次 apply
+	// 没有走完（SIGKILL/掉电落在「备份→替换 live」窗口）。此时 live 可能缺失、
+	// 为空，也可能是「非空的部分新树」——只看 live 空/缺失会漏掉后者：本轮
+	// 随后把部分树覆盖成备份，好旧树被永久丢弃，失败恢复也只能恢复到部分树。
+	// 判据：备份在场且（live 缺失/为空，或带声明哈希而 live 哈希不符/不可读）
+	// → 按备份恢复旧树。声明哈希相符=上轮已完成、仅末尾清理失败，直接丢弃
+	// 备份，不得把已同步的新树回滚成旧树。恢复成功后清备份，避免下一轮把健康
+	// 树再次回滚（无声明哈希的调用方（测试/独立调用）保留「非空 live 不覆盖」
+	// 的旧口径）。
+	if _, statErr := os.Stat(backup); statErr == nil {
+		restoreNeeded := wafTreeEmptyOrMissing(destDir)
+		liveMatchesDeclared := false
+		if !restoreNeeded && expectSum != "" {
+			if sum, sumErr := tarGzDirSum(destDir); sumErr == nil && sum == expectSum {
+				liveMatchesDeclared = true
+			} else {
+				restoreNeeded = true
+			}
+		}
+		if restoreNeeded {
+			// 恢复同样整树清空+复制 live——必须处于树交换窗口内（旧树恢复期间
+			// live 可能为空/部分）。
+			if rErr := withTreeSwapWindow(func() error {
+				return restoreWafTreeFromBackup(backup, destDir)
+			}); rErr != nil {
 				return fmt.Errorf("按上次同步备份恢复崩溃窗口的规则树: %w", rErr)
 			}
-			Logf("warn", "waf sync: live 规则树缺失/为空（上次同步中断残留），已按备份 %s 恢复旧树后继续本轮 apply", backup)
+			if rmErr := os.RemoveAll(backup); rmErr != nil {
+				Logf("warn", "waf sync: 恢复旧树后清理备份 %s 失败（下轮入口会再次判定）: %v", backup, rmErr)
+			}
+			Logf("warn", "waf sync: 上次同步中断残留备份（live 可能为空/部分新树），已按备份 %s 恢复旧树后继续本轮 apply", backup)
+		} else if liveMatchesDeclared {
+			if rmErr := os.RemoveAll(backup); rmErr != nil {
+				Logf("warn", "waf sync: live 规则树已与声明哈希一致，但清理残留备份 %s 失败: %v", backup, rmErr)
+			}
+			Logf("warn", "waf sync: 上次同步已完成（live 哈希与声明一致），清理残留备份 %s 后继续本轮 apply", backup)
 		}
 	}
 	if err := os.MkdirAll(staging, 0755); err != nil {
@@ -1022,6 +1081,12 @@ func untarGzTo(data []byte, destDir string, expectSum string) error {
 	}
 	// Replace live tree: backup then swap (copy-based, overlayfs-safe like
 	// the CRS updater itself).
+	// 替换段（rename 尝试 / RemoveAll(destDir)+copyDir / 失败恢复）必须处于
+	// CRS 树交换窗口内：这段会短暂移除 live 规则树或留下部分新树，渲染侧不持
+	// wafFileMu（锁序禁止反取），只能靠窗口标记拒绝生成无安全链/弱规则集配置。
+	// 备份拷贝本身不动 live，故窗口从替换前一刻开始（解包可能数秒，不进窗口）。
+	leaveSwapWindow := enterCRSTreeSwapWindow()
+	defer leaveSwapWindow()
 	// 陈旧备份必须清掉：清理失败即放弃本轮，否则下方 copyDir(destDir, backup)
 	// 会把旧残骸合并进备份，失败恢复时把陈旧文件带回 live 树（破坏「纯旧树」
 	// 不变量）。
@@ -1090,11 +1155,15 @@ func restoreWafTreeFromBackup(backup, destDir string) error {
 // fetchWafFiles pulls the full file bundle from the master's on-demand
 // endpoint and verifies it against the snapshot reference before use.
 func (s *SyncService) fetchWafFiles(ctx context.Context, ref *models.ClusterWafFilesRef) (*WafFileBundle, error) {
+	// 64MB 规则包与快照同一条慢链路风险：客户端无总超时，本次拉取（含
+	// 读 body 与解包前的上限探测）由独立截止兜底，避免无限悬挂。
+	callCtx, cancel := newClusterTransferContext(ctx)
+	defer cancel()
 	var masterURL, token string
-	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(master_url,''), COALESCE(cluster_token,'') FROM global_config WHERE id=1`).Scan(&masterURL, &token); err != nil {
+	if err := s.db.QueryRowContext(callCtx, `SELECT COALESCE(master_url,''), COALESCE(cluster_token,'') FROM global_config WHERE id=1`).Scan(&masterURL, &token); err != nil {
 		return nil, fmt.Errorf("读取主节点地址: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(masterURL, "/")+"/api/v1/cluster/sync/waf-files", nil)
+	req, err := http.NewRequestWithContext(callCtx, http.MethodGet, strings.TrimRight(masterURL, "/")+"/api/v1/cluster/sync/waf-files", nil)
 	if err != nil {
 		return nil, err
 	}

@@ -83,7 +83,7 @@
       </div>
     </el-card>
 
-    <el-dialog v-model="dialogVisible" width="min(960px, 94vw)" top="3vh" class="dialog-body-inset">
+    <el-dialog v-model="dialogVisible" width="min(960px, 94vw)" top="3vh" class="dialog-body-inset" :close-on-click-modal="false" :close-on-press-escape="!saving" :show-close="!saving">
       <template #header>
         <DialogHeader :icon="Document" :title="dialogTitle" tone="warning"
           subtitle="命中拦截规则时返回给客户端的响应页面，支持自定义内容类型" />
@@ -112,8 +112,8 @@
         </el-form-item>
       </el-form>
       <template #footer>
-        <el-button @click="dialogVisible = false">取消</el-button>
-        <el-button v-if="!currentPage?.is_default && !currentPage?.is_builtin && !isReadOnly" type="primary" :loading="saving" @click="handleSave">保存</el-button>
+        <el-button :disabled="saving" @click="dialogVisible = false">取消</el-button>
+        <el-button v-if="!currentPage?.is_default && !currentPage?.is_builtin && !isReadOnly" type="primary" :loading="saving" :disabled="saving" @click="handleSave">保存</el-button>
       </template>
     </el-dialog>
 
@@ -127,7 +127,8 @@
 import { ref, onMounted, computed } from 'vue'
 import { Plus, Document } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { request, formatBytes } from '@/utils/api'
+import { request } from '@/utils/api'
+import { formatBytes } from '@/utils/formatBytes'
 import { useClampedPagination } from '@/composables/useClampedPagination'
 import { showSaveResult } from '@/utils/saveResult'
 import { escapeHtml } from '@/utils/escape'

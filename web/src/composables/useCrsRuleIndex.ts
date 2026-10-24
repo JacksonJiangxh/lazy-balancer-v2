@@ -12,8 +12,9 @@ export interface CrsRuleIndexEntry {
   readonly category: string
 }
 
+// 响应还带 version（CRS 规则集版本号），前端零消费（版本展示走 /security/crs/status
+// 的独立字段），故不在此声明——声明不消费的字段只会诱导调用方误以为有此数据源。
 interface CrsRuleIndexData {
-  version: string
   rules: CrsRuleIndexEntry[]
 }
 

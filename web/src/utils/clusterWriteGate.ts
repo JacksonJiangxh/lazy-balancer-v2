@@ -7,7 +7,7 @@
 //
 // 角色必须独立参与：非 admin 恒只读；节点模式未知（unknown）fail-closed；
 // 从节点 admin 仍可操作集群管理（既有契约，节点自身可提升为主节点）。
-export type ClusterWriteGateInput = {
+type ClusterWriteGateInput = {
   readonly readOnlyReason: 'slave' | 'non-admin' | 'unknown' | null
   readonly role: string | null | undefined
 }

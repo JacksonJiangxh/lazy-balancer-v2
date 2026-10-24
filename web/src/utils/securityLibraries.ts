@@ -10,7 +10,7 @@
 // downloading/installing/reloading/success/idle 与后端 update_status 同词。
 import { compareVersion } from './securityStages.ts'
 
-export type LibraryTagType = 'success' | 'warning' | 'danger' | 'info'
+type LibraryTagType = 'success' | 'warning' | 'danger' | 'info'
 
 const STATUS_LABELS: Record<string, string> = {
   missing: '缺失',
@@ -30,8 +30,10 @@ const STATUS_LABELS: Record<string, string> = {
   'not-configured': '未配置',
 }
 
+// 状态词表是普通对象：后端异常值（'constructor'/'toString' 等）直接下标会命中
+// 原型链上的函数，把函数当标签渲染。与 utils/logStatCap 同一具名守卫。
 export const libraryStatusLabel = (status: string): string =>
-  STATUS_LABELS[status] ?? status ?? ''
+  Object.prototype.hasOwnProperty.call(STATUS_LABELS, status) ? STATUS_LABELS[status] : status ?? ''
 
 export const libraryStatusTagType = (status: string): LibraryTagType => {
   if (!status) return 'info'
@@ -55,7 +57,7 @@ export interface LibrarySourceRow {
   readonly next_update?: string
 }
 
-export interface LibrarySummary {
+interface LibrarySummary {
   readonly latestVersion: string
   readonly totalEntries: number
   readonly status: 'running' | 'failed' | 'success' | 'never' | 'disabled'
@@ -97,7 +99,7 @@ export const summarizeLibrarySources = (
   }
 }
 
-export interface LibraryHealthTag {
+interface LibraryHealthTag {
   readonly label: string
   readonly type: LibraryTagType
 }

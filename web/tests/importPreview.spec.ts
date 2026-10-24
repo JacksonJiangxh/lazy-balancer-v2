@@ -123,7 +123,11 @@ test('非安全上下文（无 crypto.subtle）同样可得指纹：HTTP 访问�
     Object.defineProperty(globalThis, 'crypto', { value: {}, configurable: true, writable: true })
     assert.match(await importPreviewFingerprint(new Blob(['{"version":3}'])), /^fnv1a:/)
   } finally {
+    // 用例前无 crypto 时也必须把注入的属性删掉（只在 descriptor 存在时还原会让
+    // 假 crypto 残留在进程里，污染同进程后续用例的 WebCrypto 判定）。
     if (descriptor) Object.defineProperty(globalThis, 'crypto', descriptor)
+    else Reflect.deleteProperty(globalThis, 'crypto')
+    assert.equal(Object.getOwnPropertyDescriptor(globalThis, 'crypto')?.value, descriptor?.value, 'crypto 替身必须还原')
   }
 })
 
@@ -144,6 +148,28 @@ test('缓存超过上限后淘汰最旧键，最新结果仍命中（长会话�
   // 重新插入的 k0 排到最新，淘汰顺延到 k1
   assert.equal((await session.validate(['k1'])).cached, false)
   assert.equal(sends, 35)
+})
+
+test('缓存命中刷新热度（LRU）：反复勾选的备份不被一次性条目挤出', async () => {
+  // 缓存是模块级状态：查询串加载独立实例（上限 32 条）。
+  const fresh = (await import(`../src/utils/importPreview.ts?lru=${Date.now()}`)) as typeof ImportPreviewModule
+  const sends: string[] = []
+  const session = fresh.createImportPreviewSession<string>({
+    fingerprint: 'fp-lru',
+    send: async (sections) => {
+      sends.push(sections.join(','))
+      return sections.join(',')
+    },
+  })
+  // 填满 32 条：k0 最旧
+  for (let i = 0; i < 32; i++) {
+    assert.equal((await session.validate([`k${i}`])).cached, false)
+  }
+  // 再命中 k0（刷新其热度）→ 插入 k32 时被淘汰的应是最久未用的 k1
+  assert.equal((await session.validate(['k0'])).cached, true)
+  assert.equal((await session.validate(['k32'])).cached, false)
+  assert.equal((await session.validate(['k0'])).cached, true, '刚命中的热条目必须仍在缓存（FIFO 会先淘汰它）')
+  assert.equal((await session.validate(['k1'])).cached, false, '最久未用的 k1 必须已被淘汰')
 })
 
 test('组件接线：预览经会话复用，请求带 abort signal，关闭/换文件即取消', () => {

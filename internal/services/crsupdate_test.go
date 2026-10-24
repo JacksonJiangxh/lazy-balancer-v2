@@ -19,20 +19,16 @@ import (
 //     /app/data 可写的环境（开发容器/镜像内跑测试）会污染真实数据卷：
 //     同 tag 的测试 tarball 字节各不相同会触发 TOFU mismatch 假红，测试假树
 //     还会覆盖真实 CRS 快照；
-//   - db 三句柄保存/还原（-shuffle 单跑或跨用例也不拿到已关闭/外来库）。
+//   - db 句柄（含 db.SetDB 注册的原子句柄）在 Cleanup 中还原——-shuffle 单跑
+//     或跨用例也不拿到已关闭/外来库。
 func redirectUpdateTestGlobals(t *testing.T) {
 	t.Helper()
 	oldSnapshot, oldIntegrity := crsSnapshotDir, downloadIntegrityPath
 	testRoot := t.TempDir()
 	crsSnapshotDir = filepath.Join(testRoot, "crs-snapshot")
 	downloadIntegrityPath = filepath.Join(testRoot, ".download-integrity.json")
-	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
+	setupIsolatedDB(t)
 	t.Cleanup(func() {
-		_ = db.Close()
-		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
 		crsSnapshotDir, downloadIntegrityPath = oldSnapshot, oldIntegrity
 	})
 }

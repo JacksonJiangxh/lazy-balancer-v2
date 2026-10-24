@@ -79,7 +79,7 @@ export function adminShortName(name: string): string {
   return name
 }
 
-export interface PolysBounds {
+interface PolysBounds {
   minLon: number
   maxLon: number
   minLat: number
@@ -149,7 +149,7 @@ export function buildCountryCellGrid(
   return { grid, bounds: cellBounds }
 }
 
-export interface ProvinceGridDot {
+interface ProvinceGridDot {
   lat: number
   lng: number
   key: string

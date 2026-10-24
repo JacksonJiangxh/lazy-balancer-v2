@@ -8,7 +8,7 @@
  * 恒灰，用户只能重传文件或改用自签（后者会按后端语义清空上传证书材料）。
  */
 
-export interface AdminTlsStoredCertState {
+interface AdminTlsStoredCertState {
   /** GET /admin-tls 的 mode：库内已保存形态（不受弹框内未提交切换影响） */
   readonly savedMode: string
   /** 库内证书可解析（cert_info 非空）或 selfsigned（由渲染层自愈） */
@@ -17,7 +17,7 @@ export interface AdminTlsStoredCertState {
   readonly certError: string
 }
 
-export interface AdminTlsDialogCertState {
+interface AdminTlsDialogCertState {
   readonly mode: string
   readonly certFile: unknown
   readonly keyFile: unknown

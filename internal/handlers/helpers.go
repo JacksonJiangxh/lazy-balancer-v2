@@ -1340,10 +1340,10 @@ func parsePrometheusSamples(body string) ([]prometheusSample, error) {
 		}
 		// geoip 透传路由无 reverse_proxy：同一请求先过它、再过主/路径路由，
 		// 两条路由各自注入指标。本仓库的采集链按
-		// services.GeoIPPassSeriesMarker 整行剔除，实时指标解析必须同口径
-		// （共用同一常量），否则首页「总请求数/流量」在启用 GeoIP 的规则上
+		// services.IsGeoIPPassSeries 整行剔除，实时指标解析必须同口径
+		// （共用同一判据），否则首页「总请求数/流量」在启用 GeoIP 的规则上
 		// 恰好是真实值的两倍，且与同页采集链来源的速率卡互相矛盾。
-		if strings.Contains(line, services.GeoIPPassSeriesMarker) {
+		if services.IsGeoIPPassSeries(line) {
 			continue
 		}
 		fields := strings.Fields(line)

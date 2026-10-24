@@ -56,9 +56,13 @@ func TestTimezoneRefresh_stops_and_waits_when_context_is_canceled(t *testing.T) 
 	// When
 	cancel()
 
-	// Then: <-done 返回即证明循环已停止且等待闭合（阻塞则测试超时失败；
-	// 原 <-done 之后的 select-default 分支恒不可达，已删）。
-	<-done
+	// Then: 有界等待证明循环已停止且等待闭合（裸 <-done 在坏实现下会挂到
+	// 整包 10 分钟超时，失败的用例名与原因都丢失）。
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancel 后 StartTimezoneRefresh 未在 5s 内退出（<-done 无界等待）")
+	}
 
 	t.Cleanup(func() { StartTimezoneRefresh(context.Background()) })
 }

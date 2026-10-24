@@ -12,6 +12,7 @@ import {
   normalizeTrafficSampleN,
 } from '../src/utils/threatFlowRules.ts'
 import { flowArcTierWidth } from '../src/utils/threatTheme.ts'
+import { parseDbDateMs } from '../src/utils/timeZoneFormat.ts'
 
 test('流量采样配置：仅保留 -1/0，全量与固定 2-64 归一为自适应', () => {
   assert.equal(normalizeTrafficSampleN(-1), -1)
@@ -112,8 +113,15 @@ test('速率还原：events.length × 服务端 sample_n，sample_n 缺失时回
   assert.equal(reconstructObservedRate(0, 0, 0), 0)
 })
 
-test('时间解析：无时区 DB 时间按 UTC', () => {
+test('时间解析：无时区 DB 时间按 UTC，与 date.ts 同一内核（四形态 + 失败为 NaN）', () => {
   assert.equal(flowTimestamp('2026-10-18 00:00:00'), Date.parse('2026-10-18T00:00:00Z'))
+  // 省略秒 / 带 Z / 带偏移：与内核 parseDbDateMs 同结果（不得另有解析实现）
+  assert.equal(flowTimestamp('2026-10-18 00:00'), parseDbDateMs('2026-10-18 00:00'))
+  assert.equal(flowTimestamp('2026-10-18T00:00:00Z'), Date.UTC(2026, 9, 18))
+  assert.equal(flowTimestamp('2026-10-18T08:00:00+08:00'), Date.UTC(2026, 9, 18))
+  // 大屏对无效时间只丢弃（NaN），不抛
+  assert.ok(Number.isNaN(flowTimestamp('not-a-date')))
+  assert.ok(Number.isNaN(flowTimestamp('')))
 })
 
 test('采集租约重置后游标回零，正常递增与缺失值保持', () => {

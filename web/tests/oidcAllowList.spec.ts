@@ -9,7 +9,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { formatAllowList, parseDomainAllowList, parseGroupAllowList } from '../src/utils/oidcAllowList.ts'
-import { repoSource } from './_helpers.ts'
+import { repoCode } from './_helpers.ts'
 
 test('邮箱域：空白/半角与全角逗号分号/顿号/换行均作分隔符', () => {
   assert.deepEqual(parseDomainAllowList('a.com; b.com、c.com'), ['a.com', 'b.com', 'c.com'])
@@ -55,7 +55,7 @@ test('文本↔数组往返幂等（组名含空格同样无损）', () => {
 test('字段名与后端 auth_oidc.go 的 json tag 同源（跨栈钉）', () => {
   // 解析器输出直接进 PUT 载荷键；键名漂移会让白名单静默落空（后端按缺省 null
   // 处理=不动），管理员以为已收口却对 IdP 全量开放。
-  const go = repoSource('internal/handlers/auth_oidc.go')
+  const go = repoCode('internal/handlers/auth_oidc.go')
   assert.ok(go.includes('json:"allowed_email_domains"'), '后端字段 allowed_email_domains 缺失')
   assert.ok(go.includes('json:"allowed_groups"'), '后端字段 allowed_groups 缺失')
 })

@@ -1,6 +1,12 @@
 package services
 
-import "strings"
+import (
+	"database/sql"
+	"errors"
+	"strings"
+
+	"lazy-balancer-v2/internal/db"
+)
 
 // cert_jobs 的「可服务证书材料」判定必须单源：渲染候选、启动物化、文件对账、
 // 导入后产物清理、删除任务后的文件回收都依赖同一语义。曾有三套实现
@@ -15,9 +21,27 @@ import "strings"
 // 域名适用性（certJobRuleApplicable）与「证书是否仍在有效期」不属于本谓词：
 // 前者由各消费方按规则当前域名单独判定，后者只能解析证书后判定（SQL 表达不了）。
 
+// CertJobCandidatePredicateSQL 返回「持有非空证书材料」的 SQL 谓词（不判
+// status）。渲染候选装载故意保留 disabled 行（SelectCertificate 后置跳过，
+// 过期回退展示仍需该行；由 TestACMECertCandidatesForRule_preparses_leaf 钉住
+// 「候选数含 disabled」），但 PEM 判空口径必须与 Go 侧 CertJobMaterialUsable
+// 同源——渲染面把空白 PEM 当有材料会让物化把它写盘。
+func CertJobCandidatePredicateSQL(alias string) string {
+	prefix := ""
+	if alias != "" {
+		prefix = alias + "."
+	}
+	const sqlWhitespace = "' '||char(9)||char(10)||char(11)||char(12)||char(13)"
+	nonBlank := func(column string) string {
+		return "TRIM(" + prefix + column + ", " + sqlWhitespace + ") <> ''"
+	}
+	return nonBlank("cert_pem") + " AND " + nonBlank("key_pem")
+}
+
 // CertJobMaterialPredicateSQL 返回「持有可服务证书材料」的 SQL 谓词。alias 为
 // 列前缀（如 "j"），空串=裸列名。所有涉及材料可用性的 SQL 必须复用本函数，
-// 不得另写条件组合。
+// 不得另写条件组合；候选装载（需保留 disabled 行）复用其组成部分
+// CertJobCandidatePredicateSQL。
 //
 // 判空必须是 trim 后的判空：只比较 ” 会把 ' ' 这类空白材料当作「有材料」，
 // 而 Go 侧 CertJobMaterialUsable（TrimSpace）判为无材料——同一行在 SQL 扫描
@@ -29,11 +53,7 @@ func CertJobMaterialPredicateSQL(alias string) string {
 	if alias != "" {
 		prefix = alias + "."
 	}
-	const sqlWhitespace = "' '||char(9)||char(10)||char(11)||char(12)||char(13)"
-	nonBlank := func(column string) string {
-		return "TRIM(" + prefix + column + ", " + sqlWhitespace + ") <> ''"
-	}
-	return nonBlank("cert_pem") + " AND " + nonBlank("key_pem") + " AND COALESCE(" + prefix + "status,'') <> 'disabled'"
+	return CertJobCandidatePredicateSQL(alias) + " AND COALESCE(" + prefix + "status,'') <> 'disabled'"
 }
 
 // CertJobMissingMaterialPredicateSQL 是 CertJobMaterialPredicateSQL 的逻辑取反。
@@ -49,4 +69,23 @@ func CertJobMissingMaterialPredicateSQL(alias string) string {
 // 内存中的行（已是查询结果）复用同一语义（含 trim 口径，见上）。
 func CertJobMaterialUsable(status, certPEM, keyPEM string) bool {
 	return strings.TrimSpace(certPEM) != "" && strings.TrimSpace(keyPEM) != "" && status != "disabled"
+}
+
+// loadCertJobDeploymentState 读取任务行的状态与「材料是否可用」，供所有
+// 「部署生命周期 + 有材料」判定复用（补偿重排队 / CA provider 不可用降级 /
+// 生命周期取消重排队 / 失败终态降级）。这四处曾各写一份同构 SELECT 与同一
+// 布尔组合：材料口径或生命周期口径一变就容易漏改其余副本。
+// 错误语义由调用方决定——found=false 表示行不存在，err!=nil 表示读故障；
+// 本函数不替调用方选择 false-on-error / 上抛 / 跳过。
+func loadCertJobDeploymentState(jobID int) (status string, hasMaterial bool, found bool, err error) {
+	var certPEM, keyPEM string
+	err = db.DB.QueryRow("SELECT status, COALESCE(cert_pem,''), COALESCE(key_pem,'') FROM cert_jobs WHERE id=?", jobID).
+		Scan(&status, &certPEM, &keyPEM)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, false, nil
+	}
+	if err != nil {
+		return "", false, false, err
+	}
+	return status, CertJobMaterialUsable(status, certPEM, keyPEM), true, nil
 }

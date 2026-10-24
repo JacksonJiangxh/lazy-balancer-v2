@@ -55,32 +55,35 @@ type downloadIntegrityRecord struct {
 // I/O 失败仅记日志不阻断。
 var errDownloadIntegrityMismatch = errors.New("下载完整性校验失败：内容与基线不一致")
 
-// recordDownloadIntegrity 校验并记录一次成功下载的完整性快照：首次下载写入
-// 基线；同一来源再次下载且 size/digest 与基线不符时 Logf("error") + 审计并
-// 返回 errDownloadIntegrityMismatch 包装错误（阻断安装、保留旧基线）。必须在
-// 下载文件的格式验证成功之后调用——验证前的坏工件基线会让下次同源好下载
-// 误报。
-func recordDownloadIntegrity(source, destPath, resource string) error {
+// verifyDownloadIntegrity 在下载完成后立即比对既有 TOFU 基线（无基线时跳过
+// 比对，仅返回本次快照）：内容与基线不一致时 Logf("error") + 审计并返回
+// errDownloadIntegrityMismatch 包装错误。不做格式判定——格式门由调用方在解包/
+// 校验后再过，但基线比对必须先于任何解包，否则被劫持/损坏的工件会先展开到
+// 数据卷才被否决（磁盘/CPU 放大，且发现点远离真实原因）。
+// 必须在下载文件的格式验证成功之后调用（验证前的坏工件写入基线会让下次同源
+// 好下载误报）——调用方只在验证通过后调用 recordDownloadIntegrityRecord。
+func verifyDownloadIntegrity(source, destPath, resource string) (downloadIntegrityRecord, error) {
 	info, err := os.Stat(destPath)
 	if err != nil {
-		return err
+		return downloadIntegrityRecord{}, err
 	}
 	digest, err := sha256File(destPath)
 	if err != nil {
-		return err
+		return downloadIntegrityRecord{}, err
 	}
+	rec := downloadIntegrityRecord{Size: info.Size(), SHA256: digest}
 	downloadIntegrityMu.Lock()
 	records, audits, logs, err := loadDownloadIntegrityRecords()
 	if err != nil {
 		downloadIntegrityMu.Unlock()
 		logDownloadIntegrityMessages(logs)
 		recordDownloadIntegrityAudits(audits)
-		return err
+		return downloadIntegrityRecord{}, err
 	}
 	prev, existed := records[source]
 	// mismatch 阻断安装并保留旧基线——ghfast.top 类镜像
 	// 代理投毒时「仅告警+自动重定基线」无拦截力；内容变化必须经人工清理基线
-	// （删除记录文件中该来源条目）后重试。
+	//（删除记录文件中该来源条目）后重试。
 	if existed && (prev.Size != info.Size() || prev.SHA256 != digest) {
 		// 锁内只构造文案与错误，日志/审计在解锁后落库。
 		mismatchErr := fmt.Errorf("来源 %s 下载内容与上次完整性记录不一致（size %d→%d，sha256 %s→%s），已阻断安装；如确认上游更新合法，删除 %s 中该来源条目后重试: %w",
@@ -93,14 +96,45 @@ func recordDownloadIntegrity(source, destPath, resource string) error {
 		downloadIntegrityMu.Unlock()
 		Logf("error", "download integrity mismatch for %s: size %d→%d, sha256 %s→%s（与上次记录不一致，已阻断安装并保留旧基线；如确认上游更新合法，删除 %s 中该来源条目后重试）", source, prev.Size, info.Size(), prev.SHA256, digest, downloadIntegrityPath)
 		recordDownloadIntegrityAudits(audits)
-		return mismatchErr
+		return downloadIntegrityRecord{}, mismatchErr
 	}
-	records[source] = downloadIntegrityRecord{Size: info.Size(), SHA256: digest}
+	downloadIntegrityMu.Unlock()
+	logDownloadIntegrityMessages(logs)
+	recordDownloadIntegrityAudits(audits)
+	return rec, nil
+}
+
+// recordDownloadIntegrityRecord 记录一次已通过校验的下载快照（首次写入基线，
+// 已存在则刷新为同值）。接收 verifyDownloadIntegrity 的返回值，避免对大工件
+// 二次 stat+全文件哈希。
+func recordDownloadIntegrityRecord(source string, rec downloadIntegrityRecord) error {
+	downloadIntegrityMu.Lock()
+	records, audits, logs, err := loadDownloadIntegrityRecords()
+	if err != nil {
+		downloadIntegrityMu.Unlock()
+		logDownloadIntegrityMessages(logs)
+		recordDownloadIntegrityAudits(audits)
+		return err
+	}
+	records[source] = rec
 	err = persistDownloadIntegrityRecords(records)
 	downloadIntegrityMu.Unlock()
 	logDownloadIntegrityMessages(logs)
 	recordDownloadIntegrityAudits(audits)
 	return err
+}
+
+// recordDownloadIntegrity 校验并记录一次成功下载的完整性快照：首次下载写入
+// 基线；同一来源再次下载且 size/digest 与基线不符时返回
+// errDownloadIntegrityMismatch 包装错误（阻断安装、保留旧基线）。语义等价于
+// verifyDownloadIntegrity + recordDownloadIntegrityRecord 两步，供无需在
+// 两步之间插解包/校验的调用方使用。
+func recordDownloadIntegrity(source, destPath, resource string) error {
+	rec, err := verifyDownloadIntegrity(source, destPath, resource)
+	if err != nil {
+		return err
+	}
+	return recordDownloadIntegrityRecord(source, rec)
 }
 
 // logDownloadIntegrityMessages 输出锁内构造的日志文案（调用方必须已解锁）。

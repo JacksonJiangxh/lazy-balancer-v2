@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { normalizeRateLimitBlocks } from '../src/utils/rateLimitBlocks.ts'
-import { source } from './_helpers.ts'
+import { code } from './_helpers.ts'
 
 test('空数据：无主机、总数 0', () => {
   assert.deepEqual(normalizeRateLimitBlocks(null), { total: 0, hosts: [] })
@@ -36,7 +36,7 @@ test('畸形主机条目丢弃且不抛错', () => {
 // 消费侧接线：视图模板直接读 rateLimitBlocks.hosts.length——归一被删后 legacy
 // hosts:null 响应会在渲染期抛错（纯函数用例拦不住）。
 test('安全概览把接口响应经归一后落库（视图不直接消费原始载荷）', () => {
-  const overview = source('src/views/security/SecurityOverview.vue')
+  const overview = code('src/views/security/SecurityOverview.vue')
   assert.match(
     overview,
     /rateLimitBlocks\.value = normalizeRateLimitBlocks\(res\.data\)/,

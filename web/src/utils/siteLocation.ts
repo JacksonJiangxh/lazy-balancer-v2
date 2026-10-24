@@ -7,7 +7,7 @@ import { COUNTRY_CENTROIDS } from './countryCentroids.ts'
 const CHINA_SITE_PREFIX = 'cn:'
 const COUNTRY_SITE_PREFIX = 'country:'
 
-export interface SiteLocationChoice {
+interface SiteLocationChoice {
   key: string
   label: string
   lat: number
@@ -70,7 +70,7 @@ export function nearestSiteLocation(lat: number, lon: number): string {
   return best
 }
 
-export interface NodeSiteFormValue {
+interface NodeSiteFormValue {
   siteLocationKey: string
   lat: number
   lon: number

@@ -13,9 +13,7 @@ import (
 // url（空串表示保持列默认）。ghFastProxy 测试钩子确保归零，走 DB 读取路径。
 func setupGitHubProxyDB(t *testing.T, url string) {
 	t.Helper()
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
+	setupIsolatedDB(t)
 	oldHook := ghFastProxy
 	ghFastProxy = ""
 	t.Cleanup(func() { ghFastProxy = oldHook })

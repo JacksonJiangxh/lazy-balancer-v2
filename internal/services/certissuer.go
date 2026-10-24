@@ -336,7 +336,7 @@ func (s *CertIssuer) deploymentFailedFrom(jobID int, material issuedCertificate,
 	if capped {
 		delay = blockedDeploymentRetryDelay
 	}
-	storedMessage := fmt.Sprintf("部署失败 [attempt=%d/%d]: %s", attempt, maxCertificateDeploymentAttempts, message)
+	storedMessage := fmt.Sprintf("部署失败 [attempt=%d/%d]: %s", displayDeploymentAttempt(attempt), maxCertificateDeploymentAttempts, message)
 	if capped {
 		storedMessage += fmt.Sprintf("；证书材料已保留，转入 %d 分钟慢速重试（磁盘/重载恢复后自动收敛）", int(blockedDeploymentRetryDelay.Minutes()))
 	}
@@ -364,7 +364,7 @@ func (s *CertIssuer) deploymentFailedFrom(jobID int, material issuedCertificate,
 	WriteCertJobLog(jobID, "ERROR", "deployment_failed", storedMessage)
 	if updateErr != nil {
 		Logf("warn", "cert job %d deployment status writeback failed (status=downloaded, attempt=%d): %v", jobID, attempt, updateErr)
-		WriteCertJobLog(jobID, "WARN", "deployment_status_update_failed", fmt.Sprintf("部署失败状态回写失败 [attempt=%d/%d]: %v", attempt, maxCertificateDeploymentAttempts, updateErr))
+		WriteCertJobLog(jobID, "WARN", "deployment_status_update_failed", fmt.Sprintf("部署失败状态回写失败 [attempt=%d/%d]: %v", displayDeploymentAttempt(attempt), maxCertificateDeploymentAttempts, updateErr))
 		// 状态回写失败不得让窗口列停在 NULL：补扫只收非 NULL 窗口，独立簿记
 		// UPDATE（无状态 CAS）让周期通道仍然可达。
 		advanceCertificateDeploymentWindow(jobID, attempt, storedMessage, availableAfter)
@@ -397,6 +397,13 @@ func (s *CertIssuer) deploymentFailedFrom(jobID int, material issuedCertificate,
 		RecordAuditLog("system", "部署失败", "证书任务", FormatAuditDetail(AuditJobPart(jobID), AuditResultPart("slow_retry")), "")
 	}
 	return &certificateDeploymentError{err: errors.Join(err, updateErr)}
+}
+
+// displayDeploymentAttempt 钳制展示用的尝试次数：封顶后计数器仍随 30 分钟
+// 慢速重试累加（落库计数保留真实值，重试链需要它），但 `[attempt=57/10]`
+// 会让用户误以为「超出配额却仍在重试」。展示值不超过上限。
+func displayDeploymentAttempt(attempt int) int {
+	return min(attempt, maxCertificateDeploymentAttempts)
 }
 
 func certificateDeploymentBackoff(attempt int) time.Duration {
@@ -594,9 +601,13 @@ func (s *CertIssuer) Issue(ctx context.Context, jobID int, ruleID, domains strin
 	// ACME 邮箱由预检（phase=email）保证已配置——本路径不再重复读取/校验。
 
 	// Load DNS credentials from the rule's selected provider.
+	// enabled 的 NULL 语义与展示/编辑基线同源（COALESCE→启用）：列表
+	// （COALESCE(enabled,1)）与规则绑定门都把 NULL 视为启用，签发侧若按
+	// enabled=1 判则同一行「显示启用但不可签发」，且 UI 无法一键纠正
+	// （开关原值即启用时保存不写列，NULL 永久保留）。
 	var dnsCredentialsJSON string
 	if acmeConfigID > 0 {
-		err = db.DB.QueryRowContext(ctx, "SELECT COALESCE(dns_credentials,'') FROM certificate_configs WHERE id=? AND enabled=1", acmeConfigID).Scan(&dnsCredentialsJSON)
+		err = db.DB.QueryRowContext(ctx, "SELECT COALESCE(dns_credentials,'') FROM certificate_configs WHERE id=? AND COALESCE(enabled,1)=1", acmeConfigID).Scan(&dnsCredentialsJSON)
 		if err != nil && err != sql.ErrNoRows {
 			failJob(jobID, "读取 DNS 凭证配置失败")
 			return fmt.Errorf("read certificate config: %w", err)

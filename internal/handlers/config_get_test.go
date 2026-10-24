@@ -72,30 +72,51 @@ func TestGetConfig_noGovernedDefaultLiterals(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read caddy.go: %v", err)
 	}
-	start := strings.Index(string(src), "func (h *Handlers) GetConfig(")
-	if start < 0 {
-		t.Fatal("GetConfig not found")
+	body := scopedFunctionBody(t, string(src), "func (h *Handlers) GetConfig(")
+	cases := []struct {
+		pattern string
+		sample  string
+	}{
+		{`cert_expiry_days,` + "\r?`?\\s*" + `30`, "cert_expiry_days, 30"},
+		{`cert_renewal_days,` + "\r?`?\\s*" + `30`, "cert_renewal_days, 30"},
+		{`cert_renewal_attempts,` + "\r?`?\\s*" + `5`, "cert_renewal_attempts, 5"},
+		{`caddy_log_size_mb,` + "\r?`?\\s*" + `100`, "caddy_log_size_mb, 100"},
+		{`ELSE\s+128`, "ELSE 128"},
+		{`http_read_timeout,` + "\r?`?\\s*" + `60`, "http_read_timeout, 60"},
+		{`http_write_timeout,` + "\r?`?\\s*" + `60`, "http_write_timeout, 60"},
+		{`http_idle_timeout,` + "\r?`?\\s*" + `120`, "http_idle_timeout, 120"},
 	}
-	end := strings.Index(string(src)[start:], "\nfunc ")
-	if end < 0 {
-		t.Fatal("GetConfig end not found")
-	}
-	body := string(src)[start : start+end]
-	for _, pattern := range []string{
-		`cert_expiry_days,` + "\r?`?\\s*" + `30`,
-		`cert_renewal_days,` + "\r?`?\\s*" + `30`,
-		`cert_renewal_attempts,` + "\r?`?\\s*" + `5`,
-		`caddy_log_size_mb,` + "\r?`?\\s*" + `100`,
-		`ELSE\s+128`,
-		`http_read_timeout,` + "\r?`?\\s*" + `60`,
-		`http_write_timeout,` + "\r?`?\\s*" + `60`,
-		`http_idle_timeout,` + "\r?`?\\s*" + `120`,
-	} {
-		re := regexp.MustCompile(pattern)
+	for _, tc := range cases {
+		re := regexp.MustCompile(tc.pattern)
+		// 合成自检：模式必须能抓到典型字面量样本，否则扫描面对真实代码同样
+		// 永不命中（SQL 抽到 helper / 拼接形态变化后静默失效仍绿）。
+		if !re.MatchString(tc.sample) {
+			t.Fatalf("合成自检失败：模式 %q 抓不到样本 %q——扫描判据已失效", tc.pattern, tc.sample)
+		}
 		if re.MatchString(body) {
-			t.Errorf("GetConfig 治理默认值字面量回流 %q——改用 db.Default* 参数绑定（G4 单源）", pattern)
+			t.Errorf("GetConfig 治理默认值字面量回流 %q——改用 db.Default* 参数绑定（G4 单源）", tc.pattern)
 		}
 	}
+}
+
+// scopedFunctionBody 截取以 scope 起、到下一个 "\nfunc " 止的函数体，并做
+// 正向控制：失败或截取结果明显不可用时直接 fail——静默返回空串会让所有
+// 禁止模式永不命中（扫描空转变为全绿）。
+func scopedFunctionBody(t *testing.T, src, scope string) string {
+	t.Helper()
+	start := strings.Index(src, scope)
+	if start < 0 {
+		t.Fatalf("scope %q not found", scope)
+	}
+	end := strings.Index(src[start:], "\nfunc ")
+	if end < 0 {
+		t.Fatalf("scope %q end not found", scope)
+	}
+	body := src[start : start+end]
+	if len(body) < len(scope)+40 {
+		t.Fatalf("scope %q 截取结果过短（%d 字节）——函数边界判据失效", scope, len(body))
+	}
+	return body
 }
 
 // 带外写入 0（重启回填前窗口）时读侧必须原样下发：面板值与渲染层
@@ -183,6 +204,20 @@ func TestGovernedConfigDefaults_noDefaultLiteralsAcrossConsumers(t *testing.T) {
 		{"../services/cluster_snapshot.go", "func (s *ClusterService) loadSnapshotGlobalSettings(", []string{`COALESCE\(cert_expiry_days\s*,\s*30\)`}},
 		{"../services/certinfo.go", "func GetCertExpiryThreshold(", []string{`return\s+30\b`, `default 30`, `降级默认 30`}},
 	}
+	// 合成自检：每条禁止模式必须能抓到一条典型样本，否则该行的扫描是空转。
+	for _, sample := range []struct{ pattern, text string }{
+		{`COALESCE\(cert_expiry_days\s*,\s*30\)`, "COALESCE(cert_expiry_days, 30)"},
+		{`COALESCE\(cert_renewal_days\s*,\s*30\)`, "COALESCE(cert_renewal_days,30)"},
+		{`COALESCE\(cert_renewal_attempts\s*,\s*5\)`, "COALESCE(cert_renewal_attempts, 5)"},
+		{`expiryDays\s*:?=\s*30\b`, "expiryDays := 30"},
+		{`return\s+30\b`, "return 30"},
+		{`default 30`, "默认 default 30 天"},
+		{`降级默认 30`, "降级默认 30"},
+	} {
+		if !regexp.MustCompile(sample.pattern).MatchString(sample.text) {
+			t.Fatalf("合成自检失败：模式 %q 抓不到样本 %q", sample.pattern, sample.text)
+		}
+	}
 	for _, tc := range cases {
 		src, err := os.ReadFile(filepath.FromSlash(tc.file))
 		if err != nil {
@@ -190,15 +225,7 @@ func TestGovernedConfigDefaults_noDefaultLiteralsAcrossConsumers(t *testing.T) {
 		}
 		body := string(src)
 		if tc.scope != "" {
-			start := strings.Index(body, tc.scope)
-			if start < 0 {
-				t.Fatalf("%s: scope %q not found", tc.file, tc.scope)
-			}
-			end := strings.Index(body[start:], "\nfunc ")
-			if end < 0 {
-				t.Fatalf("%s: scope %q end not found", tc.file, tc.scope)
-			}
-			body = body[start : start+end]
+			body = scopedFunctionBody(t, body, tc.scope)
 		}
 		for _, pattern := range governedSQLPatterns {
 			if regexp.MustCompile(pattern).MatchString(body) {

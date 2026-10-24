@@ -360,11 +360,13 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 			Logf("error", "ip2region update: failed to refresh .version sidecar at latest: %v", err)
 		}
 		WriteIP2RegionUpdateLog("INFO", string(IP2RegionStatusSuccess), "已是最新版本，无需更新")
+		slotSQL, slotArgs := versionTableSlotSuccessAssign("security_ip2region_version", trigger)
 		if _, err := db.DB.Exec(
 			// 排程槽：成功轮 auto/manual 同权、仅现存槽空/过期才推进——未来槽不回拨
 			// （手动成功必须推进过期槽，否则引擎已消费而业务槽停滞，四族自动更新停摆）。
-			"UPDATE security_ip2region_version SET update_status='success', message='已是最新版本', finished_at=datetime('now'), consecutive_failures=0, "+versionTableSlotSuccessSQL+" WHERE id=1",
-			trigger, trigger, versionTableNextSlot("security_ip2region_version", time.Now().UTC()),
+			// 排程不可读时槽保持原值（读失败已由严格读单源留痕）。
+			"UPDATE security_ip2region_version SET update_status='success', message='已是最新版本', finished_at=datetime('now'), consecutive_failures=0, "+slotSQL+" WHERE id=1",
+			slotArgs...,
 		); err != nil {
 			// 成功轮排程槽推进写失败=引擎已消费过期槽而业务槽停滞（静默停摆），
 			// 级别与后果匹配。
@@ -529,9 +531,10 @@ func (m *IP2RegionUpdateManager) runWithContext(runCtx context.Context, trigger 
 		os.Remove(ip2regionLivePath + ".bak")
 	}
 
+	slotSQL, slotArgs := versionTableSlotSuccessAssign("security_ip2region_version", trigger)
 	if _, err := db.DB.Exec(
-		"UPDATE security_ip2region_version SET version=?, updated_at=datetime('now'), update_status='success', message='', finished_at=datetime('now'), consecutive_failures=0, "+versionTableSlotSuccessSQL+" WHERE id=1",
-		tag, trigger, trigger, versionTableNextSlot("security_ip2region_version", time.Now().UTC()),
+		"UPDATE security_ip2region_version SET version=?, updated_at=datetime('now'), update_status='success', message='', finished_at=datetime('now'), consecutive_failures=0, "+slotSQL+" WHERE id=1",
+		append([]any{tag}, slotArgs...)...,
 	); err != nil {
 		Logf("error", "ip2region update: failed to record success: %v", err)
 	}
@@ -970,9 +973,10 @@ func (m *IP2RegionUpdateManager) successAfterReloadFailOpen(tag string, reloadEr
 	}
 	// 触发来源单次快照：成功门两次绑定同一值（两次读取间不得出现翻转）。
 	trigger := m.currentTrigger()
+	slotSQL, slotArgs := versionTableSlotSuccessAssign("security_ip2region_version", trigger)
 	if _, err := db.DB.Exec(
-		"UPDATE security_ip2region_version SET version=?, updated_at=datetime('now'), update_status='success', message=?, finished_at=datetime('now'), consecutive_failures=0, "+versionTableSlotSuccessSQL+" WHERE id=1",
-		tag, warn, trigger, trigger, versionTableNextSlot("security_ip2region_version", time.Now().UTC()),
+		"UPDATE security_ip2region_version SET version=?, updated_at=datetime('now'), update_status='success', message=?, finished_at=datetime('now'), consecutive_failures=0, "+slotSQL+" WHERE id=1",
+		append([]any{tag, warn}, slotArgs...)...,
 	); err != nil {
 		Logf("error", "ip2region update: failed to record fail-open success: %v", err)
 	}

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { projectRuleFlowPath } from '../src/utils/ruleFlow.ts'
 import { stage1FootnoteText, stageSubLabel } from '../src/utils/securityStages.ts'
 import type { PathRule } from '../src/types/rules.ts'
-import { repoSource } from './_helpers.ts'
+import { repoCode } from './_helpers.ts'
 
 const base: PathRule = {
   match_type: 'prefix', path: '/api', upstream_path: '', sort_order: 0, upstreams: null,
@@ -58,7 +58,7 @@ test('阶段 1 文案：副标题与脚注含爬虫校验，脚注含遗留黑�
   // buildIPPrecheckDirectives 内的规则动作/消息（id:3 信任 → id:2 黑名单 →
   // id:4 遗留黑名单 → 白名单外拒绝 id:7 → 爬虫校验 → GeoIP 地域链）。Go
   // 单侧改序而脚注未同步、或脚注改序而发射未变，都会在此变红。
-  const goBlock = repoSource('internal/services/security.go')
+  const goBlock = repoCode('internal/services/security.go')
   const precheck = goBlock.slice(
     goBlock.indexOf('func buildIPPrecheckDirectives('),
     goBlock.indexOf('\nfunc ', goBlock.indexOf('func buildIPPrecheckDirectives(') + 1),

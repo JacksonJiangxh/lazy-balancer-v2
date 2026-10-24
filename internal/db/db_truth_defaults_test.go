@@ -656,6 +656,123 @@ func TestNewColumnsDualRegistered_matchFreshColumnShape(t *testing.T) {
 	t.Logf("双登记交集 %d 列全部通过相等门", dualRegistered)
 }
 
+// freshOriginalColumns 是「fresh CREATE 首发列（未登记进 newColumnsRegistry）」
+// 的冻结基线。反方向门的理由：`newColumnsRegistry` 只对登记过的列补列，fresh
+// DDL 单独新增而未登记的列在存量库上永不被补——升级安装启动即 no such column
+// （schedule_days 事故形态，旧门只有 registry→fresh 一个方向，漏掉的正是这个
+// 方向）。断言：fresh 每张表的每一列 ∈ newColumnsRegistry ∪ 本基线。
+// 新增列时二选一：加入 newColumnsRegistry（升级库需要补列，推荐）或加入本基线
+// 并在下方说明「首发即存在、无需迁移」。基线中登记而 fresh 已不存在的列同属
+// 漂移（陈旧基线），一并报错。
+var freshOriginalColumns = map[string][]string{
+	"api_keys":                   {"id", "name", "key_hash", "key_prefix", "created_by", "last_used", "expires_at", "created_at"},
+	"auto_backups":               {"id", "filename", "created_at", "status", "size_bytes", "sections", "trigger_type", "message"},
+	"ca_providers":               {"id", "name", "provider", "directory_url", "credentials", "max_concurrent", "min_interval_ms", "enabled", "created_at", "updated_at"},
+	"cert_jobs":                  {"id", "rule_id", "domain", "status", "message", "expires_at", "cert_pem", "key_pem", "created_at", "updated_at"},
+	"certificate_configs":        {"id", "name", "dns_provider", "dns_credentials", "enabled", "created_at", "updated_at"},
+	"cluster_register_tokens":    {"id", "token_hash", "expires_at", "used_at", "created_by", "created_at"},
+	"global_config":              {"id", "caddy_config", "dns_provider", "dns_credentials", "log_level", "is_master", "master_url", "sync_interval", "last_sync", "updated_at"},
+	"lb_rules":                   {"id", "name", "description", "protocol", "listen_port", "strategy", "enable_dns_server", "dns_server", "health_check_path", "health_check_interval", "health_check_timeout", "health_check_unhealthy_threshold", "health_check_healthy_threshold", "host_header", "enable_tls", "enable_compress", "compress_types", "enabled", "created_by", "created_at", "updated_at"},
+	"mfa_challenges":             {"token", "user_id", "expires_at", "consumed", "created_at"},
+	"nodes":                      {"id", "name", "mode", "ip_address", "port", "is_approved", "sync_interval", "status", "last_seen", "created_at"},
+	"path_rules":                 {"id", "rule_id", "sort_order", "match_type", "path", "upstreams_json", "created_at", "updated_at"},
+	"revoked_jti":                {"jti_hash", "expires_at"},
+	"security_block_pages":       {"id", "name", "description", "content", "is_default", "created_at", "updated_at"},
+	"security_crawler_sources":   {"id", "name", "display_name", "url", "format", "update_enabled", "entry_count", "version", "update_status", "message", "last_checked", "next_update", "trigger", "started_at", "finished_at", "consecutive_failures", "created_at", "updated_at"},
+	"security_crs_version":       {"id", "version", "updated_at", "auto_update"},
+	"security_custom_rules":      {"id", "name", "description", "conditions", "action", "score", "enabled", "created_at", "updated_at"},
+	"security_ip2region_version": {"id", "version", "updated_at", "auto_update"},
+	"security_ip_lists":          {"id", "name", "description", "category", "entries", "created_by", "created_at", "updated_by", "updated_at"},
+	"security_policies":          {"id", "name", "description", "mode", "anomaly_threshold", "ip_whitelist", "ip_blacklist", "rate_limit_enabled", "rate_limit_rps", "rate_limit_burst", "crs_rule_groups", "custom_rules", "enabled", "created_at", "updated_at"},
+	"security_policy_bindings":   {"rule_caddy_id", "policy_id"},
+	"security_threat_sources":    {"id", "name", "display_name", "url", "format", "update_enabled", "apply_enabled", "entry_count", "version", "update_status", "message", "last_checked", "next_update", "trigger", "started_at", "finished_at", "consecutive_failures", "created_at", "updated_at"},
+	"task_loop_prefs":            {"task_id", "enabled", "updated_at"},
+	"task_runs":                  {"id", "task_id", "family", "trigger", "status", "started_at", "finished_at", "duration_ms", "message"},
+	"upstreams":                  {"id", "rule_id", "host", "port", "weight", "dynamic_dns", "enabled", "protocol"},
+	"used_login_tickets":         {"jti_hash", "expires_at"},
+	"users":                      {"id", "username", "password_hash", "role", "created_at", "last_login"},
+}
+
+func TestFreshDDLColumns_registeredOrBaseline(t *testing.T) {
+	database := openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	registered := func(table, column string) bool {
+		_, ok := newColumnsRegistry[table+"."+column]
+		return ok
+	}
+	baselined := func(table, column string) bool {
+		for _, candidate := range freshOriginalColumns[table] {
+			if candidate == column {
+				return true
+			}
+		}
+		return false
+	}
+
+	tableRows, err := database.Query(`SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name`)
+	if err != nil {
+		t.Fatalf("list fresh tables: %v", err)
+	}
+	var tables []string
+	for tableRows.Next() {
+		var name string
+		if err := tableRows.Scan(&name); err != nil {
+			t.Fatalf("scan fresh table: %v", err)
+		}
+		tables = append(tables, name)
+	}
+	if err := tableRows.Err(); err != nil {
+		t.Fatalf("iterate fresh tables: %v", err)
+	}
+	tableRows.Close()
+
+	seen := map[string]map[string]bool{}
+	for _, table := range tables {
+		columnRows, err := database.Query(`SELECT name FROM pragma_table_info(?)`, table)
+		if err != nil {
+			t.Fatalf("list fresh columns of %s: %v", table, err)
+		}
+		columns := map[string]bool{}
+		for columnRows.Next() {
+			var column string
+			if err := columnRows.Scan(&column); err != nil {
+				t.Fatalf("scan fresh column of %s: %v", table, err)
+			}
+			columns[column] = true
+			if registered(table, column) || baselined(table, column) {
+				continue
+			}
+			t.Errorf("fresh DDL 列 %s.%s 既未登记 newColumnsRegistry（存量库不会补列）也未登记 freshOriginalColumns 基线——升级库将以 no such column 失败", table, column)
+		}
+		if err := columnRows.Err(); err != nil {
+			t.Fatalf("iterate fresh columns of %s: %v", table, err)
+		}
+		columnRows.Close()
+		seen[table] = columns
+	}
+
+	// 反向：基线陈旧登记（列已从 fresh DDL 删除或改名）。
+	baselineTables := make([]string, 0, len(freshOriginalColumns))
+	for table := range freshOriginalColumns {
+		baselineTables = append(baselineTables, table)
+	}
+	sort.Strings(baselineTables)
+	for _, table := range baselineTables {
+		columns, ok := seen[table]
+		if !ok {
+			t.Errorf("freshOriginalColumns 登记了不存在的表 %s（陈旧基线）", table)
+			continue
+		}
+		for _, column := range freshOriginalColumns[table] {
+			if !columns[column] {
+				t.Errorf("freshOriginalColumns 登记了 %s.%s，但 fresh DDL 已无该列（陈旧基线）", table, column)
+			}
+		}
+	}
+}
+
 // 治理默认值消费侧单源：时区/安全策略异常评分/健康检查与重试间隔的库读兜底
 // 必须绑定 db.Default* 常量。此前这些读侧 SQL 各写一份字面量，DDL DEFAULT 改
 // 值后消费侧静默分叉（request_body 同族事故形态）。本钉测按 AST 双向断言：
@@ -723,6 +840,36 @@ func TestGovernedDefaultLiteralsBoundInConsumers(t *testing.T) {
 			file:      "../services/tasklog.go",
 			forbidden: []string{`COALESCE(task_log_size_mb, 10)`, "sizeMB = 10", "10 * 1024 * 1024"},
 			required:  []string{"db.DefaultTaskLogSizeMB"},
+		},
+		{
+			// 审计保留月数（不可逆删除的截止口径）：读侧 COALESCE 兜底、
+			// 无配置行/migration 窗口的回退值必须与 DDL DEFAULT 同源。
+			file:      "../services/auditlog.go",
+			forbidden: []string{`COALESCE(audit_retention_months, 3)`},
+			required:  []string{"db.DefaultAuditRetentionMonths"},
+		},
+		{
+			// 审计日志轮转阈值（waf-audit 兜底/轮转判据同源）。
+			file:      "../services/auditlog_rotation.go",
+			forbidden: []string{`COALESCE(audit_log_size_mb, 10)`},
+			required:  []string{"db.DefaultAuditLogSizeMB"},
+		},
+		{
+			// 运行日志滚动阈值：init 兜底与 30s 刷新读侧同一默认值。
+			file:      "../services/logrotate.go",
+			forbidden: []string{`COALESCE(runtime_log_size_mb,100)`},
+			required:  []string{"db.DefaultRuntimeLogSizeMB"},
+		},
+		{
+			// 日志统计面板的阈值/保留月数展示：四个大小默认值 + 保留期默认值
+			// 按面板口径展示，必须与实际滚动/清理口径同源（此处读点是
+			// 列名+数字实参，AST 只扫字符串字面量，故以选择器引用为判据）。
+			file: "../handlers/logstats.go",
+			required: []string{
+				"db.DefaultAuditLogSizeMB", "db.DefaultRuntimeLogSizeMB",
+				"db.DefaultCaddyLogSizeMB", "db.DefaultTaskLogSizeMB",
+				"db.DefaultAuditRetentionMonths",
+			},
 		},
 	}
 	for _, tc := range cases {

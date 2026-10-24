@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { buildCaddyConfigPayload } from '../src/utils/caddyConfigPayload.ts'
-import { code, section, source, repoCode } from './_helpers.ts'
+import { code, section, repoCode } from './_helpers.ts'
 
 // 关闭「自定义 JSON」时后端的跨字段门（internal/handlers/caddy.go
 // resolveAccessLogFormatGate）：json=false 且请求显式携带非空格式 → 400；
@@ -56,7 +56,7 @@ test('白名单外的键不会泄露进载荷（兄弟卡片未保存编辑不�
 })
 
 test('视图消费单源：载荷经统一组装，清空语义进确认框且与开关提示同口径', () => {
-  const card = source('src/views/settings/CaddyGlobalSettings.vue')
+  const card = code('src/views/settings/CaddyGlobalSettings.vue')
   const save = section(code('src/views/settings/CaddyGlobalSettings.vue'), 'const handleSave = async', 'const handleReloadCaddy')
   assert.match(save, /buildCaddyConfigPayload\(settings\.value, CADDY_CONFIG_KEYS\)/)
   assert.doesNotMatch(save, /Object\.fromEntries\(CADDY_CONFIG_KEYS/, '不得保留第二处白名单展开')

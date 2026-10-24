@@ -10,7 +10,7 @@ import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
 import * as THREE from 'three'
 
-import { registerModuleHooks, member, source, stripComments } from './_helpers.ts'
+import { registerModuleHooks, member, code, stripComments } from './_helpers.ts'
 import {
   WORLD_W,
   WORLD_D,
@@ -57,8 +57,8 @@ const { hoverLayerTransform } = await import('../src/utils/threatScene.ts')
 const { makeDotGeometry, writeDotPositions, dotTextureState, acquireDotTexture, releaseDotTexture } =
   await import('../src/utils/threatGlobe.ts')
 
-const sceneSrc = source('src/utils/threatScene.ts')
-const globeSrc = source('src/utils/threatGlobe.ts')
+const sceneSrc = code('src/utils/threatScene.ts')
+const globeSrc = code('src/utils/threatGlobe.ts')
 
 // ---- ① 拾取矩形缓存 ----
 

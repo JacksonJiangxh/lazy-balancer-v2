@@ -7,9 +7,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { section, source } from './_helpers.ts'
+import { section, code } from './_helpers.ts'
 
-const page = source('src/views/security/SecurityPolicies.vue')
+const page = code('src/views/security/SecurityPolicies.vue')
 
 test('策略保存：同步条数并入唯一的成功提示，不再叠加第二条 toast', () => {
   const save = section(page, 'let pendingOverrides = pendingOverrideRules.value', 'const mergedBind = mergeBulkResults(')

@@ -110,7 +110,7 @@ func TestCrawlerEngines_registryInvariants(t *testing.T) {
 			t.Errorf("fixture %q 无对应引擎（注册表删引擎须同步删 fixture）", id)
 		}
 	}
-	for _, id := range DefaultCrawlerEngines {
+	for _, id := range DefaultCrawlerEngines() {
 		if !ValidCrawlerEngineID(id) {
 			t.Errorf("DefaultCrawlerEngines 含非法 ID %q", id)
 		}

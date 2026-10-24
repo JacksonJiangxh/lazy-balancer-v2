@@ -7,18 +7,18 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { code, member, repoSource, section, source } from './_helpers.ts'
+import { code, codeSection, member, repoCode, section, source } from './_helpers.ts'
 
 test('个人资料弹框不再保留无人消费的自动聚焦契约', () => {
-  const dialog = source('src/components/ProfileDialog.vue')
+  const dialog = code('src/components/ProfileDialog.vue')
   assert.doesNotMatch(dialog, /focusField/, 'focusField 全仓零消费方，属残留对外契约')
   assert.doesNotMatch(dialog, /passwordInput\.value\?\.focus\(\)|displayNameInput\.value\?\.focus\(\)/, '自动聚焦分支必须删除')
   // 唯一消费方只传 v-model
-  const layout = source('src/components/layout/AppLayout.vue')
+  const layout = code('src/components/layout/AppLayout.vue')
   assert.match(layout, /<ProfileDialog v-model="showProfile" \/>/)
 })
 
-test('表格标签居中的 flex 规则必须记录混合单元格省略号取舍', () => {
+test('文档钉：表格标签居中的 flex 规则必须记录混合单元格省略号取舍', () => {
   const css = source('src/styles/main.css')
   const rule = section(css, '.el-table .cell:has(.el-tag) {', '}')
   assert.match(rule, /display: inline-flex/, '标签居中形态保持不变')
@@ -27,21 +27,20 @@ test('表格标签居中的 flex 规则必须记录混合单元格省略号取�
   assert.match(comment, /tooltip/, '必须写明可发现性（tooltip）不受影响')
 })
 
-test('策略绑定写路径显式声明「最后写入生效」的并发口径', () => {
-  const editor = source('src/components/SecurityBindingEditor.vue')
-  const doc = section(editor, '// 绑定写路径的并发口径', 'const submit = async')
+test('文档钉：策略绑定写路径显式声明「最后写入生效」的并发口径', () => {
+  const doc = section(source('src/components/SecurityBindingEditor.vue'), '// 绑定写路径的并发口径', 'const submit = async')
   assert.match(doc, /最后写入生效|后写覆盖前写/, '必须声明无乐观并发护栏')
   assert.match(doc, /版本前置条件|409/, '必须写明根治需要后端前置条件')
   // 绑定端点不接受 expected_updated_at：不得悄悄发送一个后端会忽略的字段
-  const submit = section(editor, 'const submit = async', '\n}\n')
+  const submit = section(code('src/components/SecurityBindingEditor.vue'), 'const submit = async', '\n}\n')
   assert.doesNotMatch(submit, /expected_updated_at/, '绑定端点未实现版本前置条件，不得发无用字段')
 })
 
 test('表单上限与后端写侧门对齐（证书重签天数 / HTTP 超时）', () => {
-  const cert = source('src/views/settings/FreeCertificates.vue')
+  const cert = code('src/views/settings/FreeCertificates.vue')
   assert.match(cert, /cert_renewal_days" :min="1" :max="CERT_RENEWAL_DAYS_MAX"/, '控件上限必须引用单源常量')
   assert.doesNotMatch(cert, /cert_renewal_days[^>]*:max="60"/, '60 只是建议值，不得作为硬上限（会把 API/导入写入的 61-88 静默夹回）')
-  const configValues = source('src/utils/configValues.ts')
+  const configValues = code('src/utils/configValues.ts')
   assert.match(configValues, /export const CERT_RENEWAL_DAYS_MAX = 88/, '上限常量必须是写侧门同值')
   // 提示文案必须写清 84–88 天的真实后果：控制面已把上限提到写侧门，而扫描侧
   // 对「窗口 > 寿命 − 7 天」的配置会收敛为到期前 7 天并限频告警（旧文案描述的
@@ -49,11 +48,11 @@ test('表单上限与后端写侧门对齐（证书重签天数 / HTTP 超时）
   assert.match(cert, /到期前 7 天/, '提示必须写明 84–88 天被收敛为到期前 7 天')
   assert.doesNotMatch(cert, /反复重签/, '不得再用已删除的旧实现形态描述收敛行为')
   // 跨栈钉：后端上界 = 规划寿命 90 − 2
-  const certinfo = repoSource('internal/services/certinfo.go')
+  const certinfo = repoCode('internal/services/certinfo.go')
   assert.match(certinfo, /const CertRenewalLifetimeDays = 90/)
   assert.match(certinfo, /const CertRenewalDaysMax = CertRenewalLifetimeDays - 2/)
 
-  const caddy = source('src/views/settings/CaddyGlobalSettings.vue')
+  const caddy = code('src/views/settings/CaddyGlobalSettings.vue')
   for (const field of ['http_read_timeout', 'http_write_timeout', 'http_idle_timeout']) {
     const line = caddy.split('\n').find((l) => l.includes(`v-model="settings.${field}"`))
     assert.ok(line, `${field} 控件必须存在`)
@@ -73,23 +72,22 @@ test('Dashboard 慢车道健康查询不得阻塞整轮刷新', () => {
   assert.match(page, /await fetchRuleHealth\(pending\.rules, pending\.version\)/, '更新版本补跑必须保持串行')
 })
 
-test('时间戳两族的边界写在 formatDate 文档里', () => {
-  const date = source('src/utils/date.ts')
-  const doc = section(date, '/**\n * 站内时间戳有两族', 'export const formatDate')
+test('文档钉：时间戳两族的边界写在 formatDate 文档里', () => {
+  const doc = section(source('src/utils/date.ts'), '/**\n * 站内时间戳有两族', 'export const formatDate')
   assert.match(doc, /UTC 存储族/)
   assert.match(doc, /task_runs/, '必须点名禁止面（配置时区墙钟族）')
   assert.match(doc, /格式化为|不得混用|formatDate/, '必须写明入口归属')
 })
 
 test('策略向导拦截页步骤纳入引用条目懒加载门', () => {
-  const page = source('src/views/security/SecurityPolicies.vue')
+  const page = code('src/views/security/SecurityPolicies.vue')
   const gate = member(page, 'watch([currentStep, ipACLList, ipWhitelist, ipACLListRefs, ipWhitelistRefs], ')
   assert.match(gate, /step !== WIZARD_STEP\.BLOCK_PAGE/, '拦截页能力门消费合并条目数，必须预取引用条目')
 })
 
-test('信任侧冲突警告的门控位置与注释一致（computed 内）', () => {
-  const page = source('src/views/security/SecurityPolicies.vue')
-  const doc = section(page, '// 名单生效口径与保存语义对齐', 'const entrySourceSuffix')
+test('文档钉：信任侧冲突警告的门控位置与注释一致（computed 内）', () => {
+  const page = code('src/views/security/SecurityPolicies.vue')
+  const doc = section(source('src/views/security/SecurityPolicies.vue'), '// 名单生效口径与保存语义对齐', 'const entrySourceSuffix')
   assert.doesNotMatch(doc, /仅模板\s*$/m, '注释不得声称门控只在模板层')
   assert.match(doc, /门控在 computed 内/)
   const alert = section(page, 'const whitelistSectionAlert = computed<string>(', '  if (trust.length === 0)')
@@ -99,7 +97,7 @@ test('信任侧冲突警告的门控位置与注释一致（computed 内）', ()
 })
 
 test('IP 快捷弹框的隐藏谓词必须看信任侧命中', () => {
-  const page = source('src/views/security/IPLocationAction.vue')
+  const page = code('src/views/security/IPLocationAction.vue')
   const predicate = member(page, 'const aclRefsAllSystem = ')
   assert.match(predicate, /mergedTrustEntries\(p\)/, '被隐藏卡的信任侧命中会让「取消信任」无入口')
   assert.doesNotMatch(predicate, /if \(!p\.ip_whitelist_enabled\) return true/, '信任关闭时整卡隐藏会让「未生效」提示与清除入口不可达')
@@ -107,7 +105,7 @@ test('IP 快捷弹框的隐藏谓词必须看信任侧命中', () => {
 })
 
 test('威胁大屏：攻击弹框层级高于错误条堆叠，且错误条默认点击穿透', () => {
-  const page = source('src/views/security/ThreatScreen.vue')
+  const page = code('src/views/security/ThreatScreen.vue')
   const toastZ = Number(page.match(/\.toasts \{[^}]*z-index: (\d+)/)?.[1] ?? 0)
   const stackZ = Number(page.match(/\.error-stack \{[^}]*z-index: (\d+)/)?.[1] ?? 0)
   assert.ok(toastZ > stackZ, `攻击弹框必须在错误条之上（toasts=${toastZ}, error-stack=${stackZ}）`)
@@ -117,7 +115,7 @@ test('威胁大屏：攻击弹框层级高于错误条堆叠，且错误条默�
 })
 
 test('规则流程弹框会话打开即作废在途证书响应', () => {
-  const dialog = source('src/components/RuleFlowDialog.vue')
+  const dialog = code('src/components/RuleFlowDialog.vue')
   const open = member(dialog, 'const onDialogOpen = ')
   assert.match(open, /detailsSeq\+\+[\s\S]*?certSeq\+\+/, '打开时必须无条件自增证书序号（非 TLS 规则也要作废上一会话）')
   // 不钉换行/缩进形状：只要求两件事都在同一成员体内（各自独立断言）
@@ -134,8 +132,7 @@ test('fs96-01 流程弹框阶段 1 脚注降级判定与阶段 0 模式行同源
 })
 
 test('fs96-03 拦截页注记类型门先于 block_page_id 判定（阶段 0 无页面概念）', () => {
-  const page = source('src/views/security/SecurityPolicies.vue')
-  const notes = section(page, 'const blockPageNotes = ', '\n// Step 4 已关联规则的逐条视图')
+  const notes = codeSection('src/views/security/SecurityPolicies.vue', 'const blockPageNotes = ', '\n// Step 4 已关联规则的逐条视图')
   const typeGate = notes.indexOf('if (stages.length === 0) return []')
   const unsetGate = notes.indexOf('form.value.block_page_id <= 0')
   assert.ok(typeGate > 0 && unsetGate > 0, '两处门都必须存在')
@@ -144,7 +141,7 @@ test('fs96-03 拦截页注记类型门先于 block_page_id 判定（阶段 0 无
 })
 
 test('fs96-05 策略列表默认/保存/迁移后 tab 跟随实际类型', () => {
-  const page = source('src/views/security/SecurityPolicies.vue')
+  const page = code('src/views/security/SecurityPolicies.vue')
   const defaults = page.match(/activeTypeTab\.value = pickDefaultPolicyTab\(policyTypeCounts\.value\)/g) ?? []
   assert.equal(defaults.length, 2, '首屏与 tab 消失回落必须共用 pickDefaultPolicyTab')
   assert.match(page, /const savedType = editorPolicyType\.value[\s\S]*?activeTypeTab\.value = savedType/, '保存成功后切到本次保存类型')

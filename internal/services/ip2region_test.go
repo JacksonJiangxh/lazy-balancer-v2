@@ -368,9 +368,7 @@ func Test_Lookup_concurrent_with_Reload(t *testing.T) {
 
 func Test_GetSetIP2RegionVersion_roundtrip(t *testing.T) {
 	// Given a fresh database whose version row is seeded
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
+	setupIsolatedDB(t)
 	if got, err := GetIP2RegionVersion(); err != nil || got != "unknown" {
 		t.Fatalf("initial version=%q, want unknown", got)
 	}
@@ -598,9 +596,7 @@ func TestGetIP2RegionProvinces_memoizesByStatKey(t *testing.T) {
 // live 库存在但不可装载（掉电半写/带外损坏）时必须回退镜像内置库并留痕
 // （版本行 bundled），而不是放弃装载让归属地长期为空。
 func Test_InitIP2Region_fallsBackToDistWhenLiveUnreadable(t *testing.T) {
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
+	setupIsolatedDB(t)
 	dir := t.TempDir()
 	live := filepath.Join(dir, "ip2region.xdb")
 	dist := filepath.Join(dir, "waf.dist", "ip2region.xdb")

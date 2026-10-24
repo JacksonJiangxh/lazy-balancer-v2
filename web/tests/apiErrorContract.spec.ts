@@ -22,8 +22,12 @@ import { code, repoCode, section } from './_helpers.ts'
 /** 生产同一响应信封的目录（前端拦截器对两者一视同仁）。 */
 const SCAN_DIRS = ['internal/handlers', 'internal/middleware'] as const
 
-/** 目录内非测试 Go 文件（目录扫描，不手抄清单——新增文件自动纳入）。 */
-const goFiles = (dir: (typeof SCAN_DIRS)[number]): string[] => readdirSync(new URL(`../../${dir}/`, import.meta.url))
+/**
+ * 目录内非测试 Go 文件（递归扫描，不手抄清单——新增文件与子目录自动纳入；
+ * 单层 readdirSync 会让子目录里的新响应文件整体漏出扫描面）。
+ */
+const goFiles = (dir: (typeof SCAN_DIRS)[number]): string[] => (readdirSync(new URL(`../../${dir}/`, import.meta.url), { recursive: true }) as string[])
+  .map((name) => name.replace(/\\/g, '/'))
   .filter((name) => name.endsWith('.go') && !name.endsWith('_test.go'))
   .map((name) => `${dir}/${name}`)
 
@@ -64,6 +68,14 @@ const HTTP_STATUS: Record<string, number> = {
 // 响应方法含 `c.JSON` 与 `c.AbortWithStatusJSON`（middleware 惯用后者）；
 // `\s*` 跨换行：`models.APIResponse{\n\tCode: …` 是仓内惯用多行写法。
 const CALL_SITE = /\bc\.(?:JSON|AbortWithStatusJSON)\(\s*((?:http\.Status[A-Za-z]+)|[A-Za-z_][\w.]*)\s*,\s*/g
+
+/**
+ * 宽口径响应调用点计数（只认方法名，不看首实参形态）。CALL_SITE 只枚举
+ * 「http.StatusX / 标识符首实参」两形态——更复杂的首实参（类型转换、链式
+ * 表达式等）在两个集合里同时消失，`calls = pairs + registered` 恒等式仍成立。
+ * 宽窄计数必须相等，否则该文件存在未进面的响应站点（显式失败而非静默漏计）。
+ */
+const RESPONSE_CALL_SITE = /\bc\.(?:JSON|AbortWithStatusJSON)\(/g
 
 /** 载荷首 token 的信封形态（`Code:`/`"code":` 之后必须能解出业务码）。 */
 const ENVELOPE_LITERAL = /^(?:models\.APIResponse\{\s*Code:|gin\.H\{\s*"(?:code|Code)"\s*:)\s*((?:http\.Status[A-Za-z]+)|[A-Za-z_][\w.]*|\d+)/
@@ -194,8 +206,18 @@ const pairConsistent = (pair: Envelope): boolean | undefined => {
 test('前端业务码失败分支携带 HTTP status（api.ts 契约）', () => {
   const api = code('src/utils/api.ts')
   const branch = section(api, 'if (res.code !== undefined && res.code !== 0 && res.code !== 200) {', 'return res')
-  assert.match(branch, /new ApiRequestError\(res\.message \|\| '请求失败', response\.status\)/, '必须携带 response.status')
+  assert.match(branch, /new ApiRequestError\(res\.message \|\| '请求失败', response\.status(?:, res\.data)?\)/, '必须携带 response.status')
   assert.doesNotMatch(branch, /new ApiRequestError\([^)]*,\s*res\.code\)/, '不得改携带业务码（调用方按 status 分类）')
+  // 两类失败（HTTP 非 2xx / HTTP 2xx + code≠0）的错误对象必须同形：第三参数
+  // 携带响应体，否则消费方（importFailureReport 读 data.warnings）在业务码
+  // 信封上静默丢失事实披露。
+  assert.match(
+    branch,
+    /new ApiRequestError\(res\.message \|\| '请求失败', response\.status, res\.data\)/,
+    '业务码失败也必须携带响应体（与 HTTP 失败分支同形）',
+  )
+  // HTTP 失败分支已经是三参形态（两类失败同形的前提）
+  assert.match(api, /new ApiRequestError\(message, status, error\.response\?\.data\)/, 'HTTP 失败分支必须携带响应体')
 })
 
 test('扫描器形态自测：同行/多行、两种方法/信封、字面量/动态/变量载荷都命中', () => {
@@ -299,6 +321,7 @@ const enclosingFunc = (go: string, index: number): string => {
 test('后端信封：每条业务码与 HTTP 状态同义（handlers + middleware 全量）', () => {
   const mismatched: string[] = []
   const unknown: string[] = []
+  const unenumerated: string[] = []
   const usedWhitelist = new Set<string>()
   const siteBudget = new Map<string, number>()
   const perDir: Record<string, number> = {}
@@ -309,6 +332,11 @@ test('后端信封：每条业务码与 HTTP 状态同义（handlers + middlewar
     for (const file of goFiles(dir)) {
       const go = repoCode(file)
       const result = scan(go)
+      // 正向控制：宽口径响应调用点数必须等于已枚举数，任何形态未进面即红。
+      const broad = [...go.matchAll(RESPONSE_CALL_SITE)].length
+      if (broad !== result.calls) {
+        unenumerated.push(`${file}: 响应调用点 ${broad} 处，扫描器只枚举 ${result.calls} 处（首实参形态未进面）`)
+      }
       calls += result.calls
       pairs += result.pairs.length
       dirPairs += result.pairs.length
@@ -343,6 +371,7 @@ test('后端信封：每条业务码与 HTTP 状态同义（handlers + middlewar
   // 调用点对账：每条响应都必须「可验证信封」或「已登记非信封站点」，二者不可缺漏。
   const registered = [...siteBudget.values()].reduce((sum, count) => sum + count, 0)
   assert.equal(calls, pairs + registered, `调用点对账失败：${calls} 个调用点 = ${pairs} 条信封 + ${registered} 处登记站点`)
+  assert.deepEqual(unenumerated, [], '存在未进扫描面的响应调用点（宽口径计数 > 枚举数）')
   assert.deepEqual(unknown, [], '存在不可判定的信封或未登记的非信封站点——必须显式登记')
   assert.deepEqual(mismatched, [], '状态与业务码不同义——前端按 status 分类会误判')
   assert.deepEqual(

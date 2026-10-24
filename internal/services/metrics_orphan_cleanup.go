@@ -68,28 +68,34 @@ func PurgeOrphanMetricsHistory(ctx context.Context) (int, error) {
 	if batch <= 0 {
 		batch = 5000
 	}
+	// deletedRules 是本轮**已完整清空**的孤儿规则数：失败分支必须返回真实
+	// 部分计数（与 CleanupAuditLogs「已删除批次不可逆，失败返回真实部分计数」
+	// 同口径）——否则任务日志「本轮已清理 0 个规则后中止」与已删掉的前 N 条
+	// 无关，排障者无法区分「反复失败原地打转」与「在推进」。
+	deletedRules := 0
 	for _, ruleID := range pending {
 		for {
 			result, execErr := db.MetricsDB.ExecContext(ctx,
 				`DELETE FROM metrics_history WHERE rowid IN (SELECT rowid FROM metrics_history WHERE rule_id = ? LIMIT ?)`,
 				ruleID, batch)
 			if execErr != nil {
-				return 0, fmt.Errorf("删除孤儿规则指标: %w", execErr)
+				return deletedRules, fmt.Errorf("删除孤儿规则指标: %w", execErr)
 			}
 			deleted, rowErr := result.RowsAffected()
 			if rowErr != nil {
-				return 0, fmt.Errorf("删除孤儿规则指标: 读取影响行数: %w", rowErr)
+				return deletedRules, fmt.Errorf("删除孤儿规则指标: 读取影响行数: %w", rowErr)
 			}
 			// 本批未打满=该规则已清空，处理下一条。
 			if deleted < int64(batch) {
+				deletedRules++
 				break
 			}
 			if err := ctx.Err(); err != nil {
-				return 0, err
+				return deletedRules, err
 			}
 		}
 	}
-	return len(pending), nil
+	return deletedRules, nil
 }
 
 // liveRuleIDs 读取主库存活规则 caddy_id 集合。

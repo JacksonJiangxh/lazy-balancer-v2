@@ -14,7 +14,7 @@ import { ADMIN1_PROVINCES, COUNTRY_ALIAS } from '../src/utils/admin1Provinces.ts
 import { CHINA_PROVINCES } from '../src/utils/chinaProvinces.ts'
 import { normalizeCountryName, trafficOriginForCountry } from '../src/utils/threatShared.ts'
 import { COUNTRY_CENTROIDS } from '../src/utils/countryCentroids.ts'
-import { source } from './_helpers.ts'
+import { code } from './_helpers.ts'
 
 test('A 威胁国家表：排除南极洲且其余国家与 worldBorders 一致', () => {
   assert.equal(WORLD_COUNTRIES.length - THREAT_COUNTRIES.length, 1)
@@ -116,7 +116,7 @@ test('正常流光流起点：台湾/Taiwan 归一后与中国同点，两引擎
   assert.notDeepEqual(trafficOriginForCountry('不存在国'), COUNTRY_CENTROIDS['中国'])
   // 两引擎 setTraffic 都走共享 helper，禁止第三份查表实现
   for (const path of ['src/utils/threatScene.ts', 'src/utils/threatGlobe.ts']) {
-    const text = source(path)
+    const text = code(path)
     assert.match(text, /trafficOriginForCountry\(item\.key\)/, `${path} setTraffic 未归一`)
     assert.doesNotMatch(text, /spawnArc\(COUNTRY_CENTROIDS\[item\.key\]/, `${path} 裸查表不得回流`)
   }

@@ -68,14 +68,14 @@ export interface SecurityStageBinding {
 }
 
 // 规则级阶段拦截页覆盖（0 = 跟随策略）
-export interface RuleStagePages {
+interface RuleStagePages {
   block_page_stage1_id?: number
   block_page_stage1_status?: number
   block_page_stage3_id?: number
   block_page_stage3_status?: number
 }
 
-export interface StageRow { label: string; detail: string }
+interface StageRow { label: string; detail: string }
 
 export interface StagePolicyGroup {
   key: number
@@ -89,13 +89,13 @@ export interface StagePolicyGroup {
 
 // ── 明细懒加载模型（决策 C：现有只读端点前端拼装，不新增后端端点） ──
 
-export interface StageDetailEntry {
+interface StageDetailEntry {
   value: string
   remark?: string
   source?: string // '内联' | '列表：名称'
 }
 
-export interface StageCustomRuleDetail {
+interface StageCustomRuleDetail {
   id: number
   name: string
   action: string
@@ -110,7 +110,7 @@ interface StageRateLimitDetail {
   caption: string
 }
 
-export interface StagePolicyDetails {
+interface StagePolicyDetails {
   // aclLists=引用名单汇总（名称+条数，entry_count 口径，不拉条目值）；
   // aclInlineCount=内联去重条数。两者替代原逐条 aclEntries。
   aclLists?: Array<{ name: string; count: number }>
@@ -134,7 +134,7 @@ export interface CrsRuleFileOption { filename: string; category: string }
  * 文件名解析（组码/相位）在全仓只此一份——向导选项、级联叶、ghost 标签、
  * 阶段明细标签共用，避免外部命名契约变更时多点漏改。
  */
-export interface CrsFilenameInfo { readonly phase: '请求' | '响应'; readonly code: string }
+interface CrsFilenameInfo { readonly phase: '请求' | '响应'; readonly code: string }
 
 export const parseCrsFilename = (filename: string): CrsFilenameInfo | null => {
   const match = /^(REQUEST|RESPONSE)-9(\d{2})-/i.exec(filename)
@@ -186,7 +186,7 @@ export interface StageDetailSources {
 }
 
 // 规则阶段页覆盖徽标（页已删/内容空 = broken，渲染侧等同未配）
-export interface StageOverride {
+interface StageOverride {
   pageId: number
   pageName: string
   status: number
@@ -441,7 +441,7 @@ export const hasStage3Features = (mode: string, customRuleRefs: number): boolean
 // id:3），与 trust_detection 无关（该字段仅阶段 0 有语义）——展示与豁免归因必须
 // 共用本谓词，不得各自读取 trust_detection。
 // policyType 缺省（精简载荷/旧摘要）时回落 trust_detection 旧口径。
-export type TrustHitMode = 'passthrough' | 'detection'
+type TrustHitMode = 'passthrough' | 'detection'
 export const trustHitMode = (policyType: string | undefined, trustDetection: boolean | undefined): TrustHitMode => {
   if (policyType !== undefined && policyType !== '' && policyType !== 'stage0') return 'detection'
   return trustDetection === true ? 'detection' : 'passthrough'
@@ -1252,7 +1252,7 @@ export const invalidateSharedEntriesCache = (): void => {
  * ACL 条目零消费，属主策略引用威胁库时曾每次无谓下载数百 KB）。
  * 省略 scope = 全集（既有调用/测试口径不变）。
  */
-export interface EventDetailRefScope {
+interface EventDetailRefScope {
   /** 属主策略 ACL 引用（命中列表与内联判定，仅 kind∈{acl,geo,threat} 消费） */
   ownerAcl?: boolean
   /** 属主策略信任引用（信任命中展示 + 豁免归因） */
@@ -1424,7 +1424,7 @@ export const isTrustExemptionCandidate = (p: {
 //  - 阶段 2：429 错误路由取绑定链首个「有非空页」策略（且至少一条启用策略开启限流）。
 // 本函数把上述口径收敛为单源判定（前端只消费结果，不得另写第三份归因）。
 export type BlockPageStage = 1 | 2 | 3
-export type BlockPageEffective = 'self' | 'peer' | 'rule-override' | 'none'
+type BlockPageEffective = 'self' | 'peer' | 'rule-override' | 'none'
 
 export interface BlockPageChainPolicy {
   policyId: number | null
@@ -1465,7 +1465,7 @@ const chainHasValidPage = (p: BlockPageChainPolicy): boolean => (p.blockPageId ?
  *    block 时才阻断（CRS 在检测模式仅记录）。
  *  - 阶段 1：ACL（非绕过且有条目）/独立黑名单/地域任一成立才发射预检 deny。
  */
-export interface BlockPageStageCapability {
+interface BlockPageStageCapability {
   stage: BlockPageStage
   /** 阶段 3 WAF 模式（off/detection/blocking/custom_only） */
   mode?: string

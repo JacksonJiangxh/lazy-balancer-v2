@@ -68,6 +68,14 @@ const (
 	threatSlotSuccessSQL = `next_update=IIF(` + slotSuccessGateSQL + `, ?, next_update)`
 	// threatSlotAdvanceSQL 威胁源族失败落（仅 auto 推进）。
 	threatSlotAdvanceSQL = `next_update=IIF(` + slotAdvanceGateSQL + `, ?, next_update)`
+	// versionTableSlotAdvanceSQL 版本表族失败/取消落（仅 auto_update 开推进）。
+	versionTableSlotAdvanceSQL = `next_update=IIF(auto_update=1, ?, next_update)`
+	// noopSlotAssignSQL 是「排程不可读」时写路径的 next_update 赋值片段：
+	// 保持原值。写路径的读侧口径不是 fail-soft 的默认排程——一次瞬时读失败
+	// 若按默认「每天 04:00」算槽并落库，会把用户的「星期几 + HH:MM」覆盖成
+	// 未选择的日子（下一次越档执行后才自愈）。拿不到口径就不写预约，状态列
+	// 照常落库。
+	noopSlotAssignSQL = `next_update=next_update`
 )
 
 // userCancelledRun 本轮是否由用户显式取消（任务监控「取消」/前端取消入口）。
@@ -82,9 +90,14 @@ func userCancelledRun(ctx context.Context) bool {
 // advanceSourceSlotsAfterUserCancel 源表族（威胁情报/爬虫地址）用户取消
 // 自动轮后的槽推进：单源取消只覆盖在途那一行，循环中止后其余到期源的槽
 // 仍是旧值——而引擎的排程槽=启用源最早 next_update，任一源留在被消费的槽值
-// 上即可永久压住整个任务。故按同一推进门处理全部启用行（到期/空槽才写，
-// 未来槽不回拨），语义=「本槽放弃，预约下一槽」。
-func advanceSourceSlotsAfterUserCancel(table, trigger string, slotOf func(time.Time) string) {
+// 上即可永久压住整个任务。故按同一推进门处理全部到期/空槽行（未来槽不回拨），
+// 语义=「本槽放弃，预约下一槽」。
+//
+// names 是该族运行域（威胁族传注册表源名，爬虫族传 nil=全部启用行）：槽域
+// 必须 ⊆ 运行域，否则取消路径会把注册表外的惰性槽重新写回，与启动期清理、
+// 读侧寻槽、保存排程的收窄互相抵消。slotOf 取严格读形态——排程不可读时本轮
+// 不推进（失败已由严格读单源留痕），不得用默认排程覆盖用户的预约。
+func advanceSourceSlotsAfterUserCancel(table, trigger string, names []string, slotOf func(time.Time) (string, error)) {
 	if trigger != "auto" {
 		// 手动轮不改变预约（引擎侧同样不消费手动轮的槽）。
 		return
@@ -94,8 +107,13 @@ func advanceSourceSlotsAfterUserCancel(table, trigger string, slotOf func(time.T
 	if database == nil {
 		return
 	}
-	if _, err := database.Exec(`UPDATE `+table+` SET next_update=IIF(`+slotAdvanceGateSQL+`, ?, next_update) WHERE update_enabled=1`,
-		trigger, slotOf(time.Now().UTC())); err != nil {
+	slot, err := slotOf(time.Now().UTC())
+	if err != nil {
+		return
+	}
+	nameClause, nameArgs := sourceNameSetClause("name", names, false)
+	if _, err := database.Exec(`UPDATE `+table+` SET next_update=IIF(`+slotAdvanceGateSQL+`, ?, next_update) WHERE update_enabled=1`+nameClause,
+		append([]any{trigger, slot}, nameArgs...)...); err != nil {
 		Logf("warn", "用户取消后推进排程槽失败（%s）: %v", table, err)
 	}
 }
@@ -209,7 +227,13 @@ func RearmScheduleSlotsAfterTimezoneChange() {
 		if slot := parseUTCSlot(nextUpdate); slot.IsZero() || !slot.After(now) {
 			continue // 过期槽保留（补跑）；非法串由首槽武装/保存路径自愈
 		}
-		if _, err := database.Exec(`UPDATE `+table+` SET next_update=? WHERE id=1`, versionTableNextSlot(table, now)); err != nil {
+		slot, serr := versionTableNextSlotStrict(table, now)
+		if serr != nil {
+			// 排程不可读：不写（留痕已由严格读单源），旧槽保留——
+			// 用默认排程写回会把用户的星期/HH:MM 覆盖成未选择的日子。
+			continue
+		}
+		if _, err := database.Exec(`UPDATE `+table+` SET next_update=? WHERE id=1`, slot); err != nil {
 			Logf("warn", "时区变更重排：%s 写入 next_update 失败: %v", table, err)
 		}
 	}
@@ -388,6 +412,30 @@ func versionTableSchedule(table string) ([]int, string) {
 	return normalizeScheduleRow(daysRaw, hhmm)
 }
 
+// errScheduleUnavailable 排程不可读（库句柄未初始化）——写路径按「口径未知」
+// 处理：不推进槽，保留旧预约。
+var errScheduleUnavailable = errors.New("排程不可读（数据库未初始化）")
+
+// versionTableScheduleStrict 写路径的排程读取：失败返回 error，不做默认排程
+// 兜底。读侧 fail-soft（versionTableSchedule）服务展示与调度判定——其默认值
+// 若被写路径复用，一次瞬时读失败就会把用户的「星期几 + HH:MM」覆盖成默认
+// 「每天 04:00」的下一槽（未选择的日子真的执行一次后才自愈）。写路径拿不到
+// 口径就不写。
+func versionTableScheduleStrict(table string) ([]int, string, error) {
+	database := db.GetDB()
+	if database == nil {
+		return nil, "", errScheduleUnavailable
+	}
+	var daysRaw, hhmm string
+	if err := database.QueryRow(`SELECT COALESCE(schedule_days,''), COALESCE(schedule_time,'') FROM `+table+` WHERE id=1`).Scan(&daysRaw, &hhmm); err != nil {
+		logScheduleReadFailure("schedule-read-"+table, err)
+		return nil, "", err
+	}
+	logScheduleReadRecovered("schedule-read-" + table)
+	days, normHHMM := normalizeScheduleRow(daysRaw, hhmm)
+	return days, normHHMM, nil
+}
+
 // logScheduleReadFailure 排程读取失败的状态转换留痕。// 此前三处读取错误全部静默——库不可读/表缺失时威胁库、爬虫地址库、CRS、
 // IP2Region 自动更新「静默停摆」（auto_update 读成 false + 槽位空），排障
 // 零信号。按首报留痕（同 tz/logrotate 的 logStateTransition 口径），恢复时
@@ -411,6 +459,20 @@ func logScheduleReadRecovered(key string) {
 func LogConfigReadFailure(key string, err error) { logScheduleReadFailure(key, err) }
 func LogConfigReadRecovered(key string)          { logScheduleReadRecovered(key) }
 
+// ResetLogStateTransitionForTest 清空某 key 的状态转换记忆（同一 key 的状态
+// 跨用例共享，不复位会让「首次失败留痕」断言读到前一用例的残留态）。
+func ResetLogStateTransitionForTest(key string) {
+	metricsStateMu.Lock()
+	delete(metricsStateFailed, key)
+	for i, k := range metricsStateOrder {
+		if k == key {
+			metricsStateOrder = append(metricsStateOrder[:i], metricsStateOrder[i+1:]...)
+			break
+		}
+	}
+	metricsStateMu.Unlock()
+}
+
 // versionTableNextUpdate 读版本表当前排程槽（空串=未排程）——同批，
 // 引擎 NextSlotFn 的 DB 直读数据源（不经管理器实例）。
 func versionTableNextUpdate(table string) string {
@@ -430,10 +492,48 @@ func versionTableNextUpdate(table string) string {
 	return s
 }
 
-// versionTableNextSlot 版本表「重排时写什么」的统一答案（UTC 落库串）。
+// nextSlotFrom 是槽计算的单源（排程两列 + 基准时刻 → UTC 落库串）：读侧
+// fail-soft 与写路径严格读共用，两处不得各写一份 NextScheduledSlot 调用。
+func nextSlotFrom(days []int, hhmm string, now time.Time) string {
+	return NextScheduledSlot(now, days, hhmm, CurrentLocation()).UTC().Format(crsTimeLayout)
+}
+
+// versionTableNextSlot 版本表「重排时写什么」的读侧答案（UTC 落库串）；
+// 排程不可读时按默认排程兜底——仅供展示/调度判定，写路径必须用严格变体。
 func versionTableNextSlot(table string, now time.Time) string {
 	days, hhmm := versionTableSchedule(table)
-	return NextScheduledSlot(now, days, hhmm, CurrentLocation()).UTC().Format(crsTimeLayout)
+	return nextSlotFrom(days, hhmm, now)
+}
+
+// versionTableNextSlotStrict 写路径的槽计算：排程不可读返回 error，调用方
+// 据此放弃本次槽推进（保留旧预约）。
+func versionTableNextSlotStrict(table string, now time.Time) (string, error) {
+	days, hhmm, err := versionTableScheduleStrict(table)
+	if err != nil {
+		return "", err
+	}
+	return nextSlotFrom(days, hhmm, now), nil
+}
+
+// versionTableSlotSuccessAssign 版本表族成功落的 next_update 赋值片段与参数
+// （成功门 trigger 两次 + 槽值）。排程不可读时返回 no-op 片段与零参数：状态/
+// 版本列照常落库，预约保持旧值（读恢复后由下一次成功/失败落库路径自愈）。
+func versionTableSlotSuccessAssign(table, trigger string) (string, []any) {
+	slot, err := versionTableNextSlotStrict(table, time.Now().UTC())
+	if err != nil {
+		return noopSlotAssignSQL, nil
+	}
+	return versionTableSlotSuccessSQL, []any{trigger, trigger, slot}
+}
+
+// versionTableSlotAdvanceAssign 版本表族失败/取消落的赋值片段与参数
+// （IIF(auto_update=1, ?, next_update)：仅开自动更新的行才推进）。
+func versionTableSlotAdvanceAssign(table string) (string, []any) {
+	slot, err := versionTableNextSlotStrict(table, time.Now().UTC())
+	if err != nil {
+		return noopSlotAssignSQL, nil
+	}
+	return versionTableSlotAdvanceSQL, []any{slot}
 }
 
 // versionTableScheduleTx 事务内读取版本表排程两列并归一（与 versionTableSchedule
@@ -500,6 +600,24 @@ func globalTaskSchedule(prefix string) ([]int, string) {
 	return normalizeScheduleRow(daysRaw, hhmm)
 }
 
+// globalTaskScheduleStrict 写路径的任务级排程读取（失败返回 error，不做默认
+// 排程兜底）——理由见 versionTableScheduleStrict。
+func globalTaskScheduleStrict(prefix string) ([]int, string, error) {
+	database := db.GetDB()
+	if database == nil {
+		return nil, "", errScheduleUnavailable
+	}
+	var daysRaw, hhmm string
+	query := `SELECT COALESCE(` + prefix + `_schedule_days,''), COALESCE(` + prefix + `_schedule_time,'') FROM global_config WHERE id=1`
+	if err := database.QueryRow(query).Scan(&daysRaw, &hhmm); err != nil {
+		logScheduleReadFailure("schedule-read-"+prefix, err)
+		return nil, "", err
+	}
+	logScheduleReadRecovered("schedule-read-" + prefix)
+	days, normHHMM := normalizeScheduleRow(daysRaw, hhmm)
+	return days, normHHMM, nil
+}
+
 // ThreatSchedule 读威胁库任务级排程（global_config 两列；与 threat_auto_update
 // 同表先例——任务级设置不落逐源表）。
 func ThreatSchedule() ([]int, string) { return globalTaskSchedule("threat") }
@@ -507,16 +625,53 @@ func ThreatSchedule() ([]int, string) { return globalTaskSchedule("threat") }
 // CrawlerSchedule 读爬虫地址库独立排程（不共享 threat_* 配置）。
 func CrawlerSchedule() ([]int, string) { return globalTaskSchedule("crawler") }
 
-// threatNextSlot 威胁库任务级排程槽（UTC 落库串）。
+// threatNextSlot 威胁库任务级排程槽（UTC 落库串）；读侧 fail-soft 形态。
 func threatNextSlot(now time.Time) string {
 	days, hhmm := ThreatSchedule()
-	return NextScheduledSlot(now, days, hhmm, CurrentLocation()).UTC().Format(crsTimeLayout)
+	return nextSlotFrom(days, hhmm, now)
 }
 
-// crawlerNextSlot 爬虫地址库独立排程槽（UTC 落库串）。
+// threatNextSlotStrict 威胁库任务级排程槽的写路径形态（排程不可读返回 error）。
+func threatNextSlotStrict(now time.Time) (string, error) {
+	days, hhmm, err := globalTaskScheduleStrict("threat")
+	if err != nil {
+		return "", err
+	}
+	return nextSlotFrom(days, hhmm, now), nil
+}
+
+// crawlerNextSlot 爬虫地址库独立排程槽（UTC 落库串）；读侧 fail-soft 形态。
 func crawlerNextSlot(now time.Time) string {
 	days, hhmm := CrawlerSchedule()
-	return NextScheduledSlot(now, days, hhmm, CurrentLocation()).UTC().Format(crsTimeLayout)
+	return nextSlotFrom(days, hhmm, now)
+}
+
+// crawlerNextSlotStrict 爬虫地址库排程槽的写路径形态（排程不可读返回 error）。
+func crawlerNextSlotStrict(now time.Time) (string, error) {
+	days, hhmm, err := globalTaskScheduleStrict("crawler")
+	if err != nil {
+		return "", err
+	}
+	return nextSlotFrom(days, hhmm, now), nil
+}
+
+// threatSlotSuccessAssign 威胁源族成功落的赋值片段与参数（成功门 trigger
+// 两次 + 槽值）；排程不可读时返回 no-op 片段与零参数。
+func threatSlotSuccessAssign(trigger string) (string, []any) {
+	slot, err := threatNextSlotStrict(time.Now().UTC())
+	if err != nil {
+		return noopSlotAssignSQL, nil
+	}
+	return threatSlotSuccessSQL, []any{trigger, trigger, slot}
+}
+
+// threatSlotAdvanceAssign 威胁源族失败落（仅 auto 推进）。
+func threatSlotAdvanceAssign(trigger string) (string, []any) {
+	slot, err := threatNextSlotStrict(time.Now().UTC())
+	if err != nil {
+		return noopSlotAssignSQL, nil
+	}
+	return threatSlotAdvanceSQL, []any{trigger, slot}
 }
 
 // earliestEnabledSourceUpdate 返回启用源最早排程槽（空=无排程）。

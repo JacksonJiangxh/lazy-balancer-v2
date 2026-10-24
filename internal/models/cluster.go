@@ -18,15 +18,22 @@ var ErrInvalidClusterAccessURL = errors.New("访问地址必须是无凭证、�
 // 映射 400（客户端可修正），区别于服务端故障。
 var ErrInvalidClusterNodeName = errors.New("节点名不能为空")
 
+// ErrMissingClusterNodeIP 自述地址缺失且注册来源地址不可用（非 IP 字面量）——
+// 无法确定节点身份时拒绝注册，而不是写入回环地址与既有节点互相覆盖。
+var ErrMissingClusterNodeIP = errors.New("无法确定节点地址，请在节点设置中配置访问地址后重试")
+
 // ClusterNodeNameMaxLen 节点名长度上限（与 nodes.name VARCHAR(100) 一致）。
 // HTTP 入口由 binding max=100 拦截，服务层落库前经 NormalizeClusterNodeName
 // 再归一（控制字符剥离 + 截断），两侧共用同一上限。
 const ClusterNodeNameMaxLen = 100
 
 type ClusterRegisterRequest struct {
-	Token     string `json:"token" binding:"required"`
-	Name      string `json:"name" binding:"required,max=100"`
-	IPAddress string `json:"ip_address" binding:"required,ip"`
+	Token string `json:"token" binding:"required"`
+	Name  string `json:"name" binding:"required,max=100"`
+	// IPAddress 是自述机器地址：出口 IP 探测失败的从节点按空串上报，由主节点
+	// 以服务端观测到的注册来源地址落库（空值若被 binding 拒绝，两台无默认路由
+	// 的从节点只能回退 127.0.0.1，命中 UNIQUE(ip_address,port) 互相覆盖）。
+	IPAddress string `json:"ip_address" binding:"omitempty,ip"`
 	Port      int    `json:"port" binding:"omitempty,min=1,max=65535"`
 	Protocol  string `json:"protocol" binding:"omitempty,oneof=http https"`
 	AccessURL string `json:"access_url"`
@@ -298,6 +305,11 @@ type ClusterHealth struct {
 	// 管理节点列表状态列 hover 可见,替代登录从节点查看。
 	CRSVersion   string `json:"crs_version,omitempty"`
 	IP2RegionTag string `json:"ip2region_version,omitempty"`
+	// 多源规则库版本（威胁情报库 / 爬虫地址库）随上报上送：主节点集群列表
+	// hover 与从节点本地展示同口径——各源 version 取最近（日期/semver 通用），
+	// 空源或全部为空版本时为空串（前端按「未更新」显示）。
+	ThreatVersion  string `json:"threat_version,omitempty"`
+	CrawlerVersion string `json:"crawler_version,omitempty"`
 }
 
 type ClusterReport struct {

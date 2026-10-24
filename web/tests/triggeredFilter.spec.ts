@@ -13,7 +13,7 @@ import {
   TRIGGERED_FAMILY_SEGMENTS,
   serializeTriggeredFilter,
 } from '../src/utils/triggeredFilter.ts'
-import { repoSource, section } from './_helpers.ts'
+import { repoCode, section } from './_helpers.ts'
 
 test('空选 = 不过滤（不发 rule_triggered）', () => {
   assert.equal(serializeTriggeredFilter([]), null)
@@ -62,7 +62,7 @@ test('族段跨栈对表：前端段必须是后端 ruleTriggeredFamilyPrefixes 
   // 后端遇未知段落到消息回退分支（rule_triggered LIKE ? OR rule_msg LIKE ?）——
   // 段名打错一字筛选即从「该族全部事件」退化为「消息含该串的事件」，纯前端
   // 断言无法发现；必须读 Go 源对表。
-  const go = repoSource('internal/handlers/security.go')
+  const go = repoCode('internal/handlers/security.go')
   const block = section(go, 'var ruleTriggeredFamilyPrefixes = map[string][]string{', '\n}')
   const backendKeys = new Set([...block.matchAll(/"([^"]+)":\s*\{/g)].map((m) => m[1]))
   assert.ok(backendKeys.size >= 8, `后端 family 键解析异常（仅 ${backendKeys.size} 个）`)

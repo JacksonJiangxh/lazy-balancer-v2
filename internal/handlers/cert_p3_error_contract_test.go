@@ -150,7 +150,7 @@ func TestGetCurrentCertJobs_400BodyHidesJSONParserText(t *testing.T) {
 
 // Given 库内 dns_credentials 不是合法 JSON（带外改库/旧版本遗留）。
 // When 非 admin 表单部分掩码回传（触发合并分支）或未提交凭证仅改名。
-// Then 500「存储的 DNS 凭证已损坏，请重新保存配置」+ storage_corrupted 审计，
+// Then 500「存储的 DNS 凭证已损坏，请重新填写完整凭证后保存」+ storage_corrupted 审计，
 // 不得报 400「凭证字段不能为掩码占位符」/「Invalid stored DNS credentials」。
 func TestUpdateCertificateConfig_corruptedStoredCredentialsReturns500(t *testing.T) {
 	put := func(t *testing.T, h *Handlers, id int64, body string) *httptest.ResponseRecorder {

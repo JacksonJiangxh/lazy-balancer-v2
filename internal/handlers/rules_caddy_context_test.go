@@ -222,3 +222,53 @@ func TestBuildRuleCaddyContext_deterministicServerSelection(t *testing.T) {
 		}
 	}
 }
+
+// 配置查看框的 routes 跨 server 收集顺序必须确定（主路由 + 跳转路由分处两个
+// server 的常见形态）：map 序遍历会让同一份运行配置在两次请求间给出不同顺序。
+func TestRuleCaddyRoutes_deterministicAcrossServerIteration(t *testing.T) {
+	fullConfig := map[string]interface{}{
+		"apps": map[string]interface{}{
+			"http": map[string]interface{}{
+				"servers": map[string]interface{}{
+					"srv_redirect": map[string]interface{}{
+						"listen": []interface{}{":80"},
+						"routes": []interface{}{map[string]interface{}{"@id": "lb_order_redirect"}},
+					},
+					"srv_main": map[string]interface{}{
+						"listen": []interface{}{":443"},
+						"routes": []interface{}{
+							map[string]interface{}{"@id": "lb_order"},
+							map[string]interface{}{"@id": "lb_order_path_1"},
+						},
+					},
+				},
+			},
+		},
+	}
+	var baseline []interface{}
+	for i := range 30 {
+		main, routes := ruleCaddyRoutes(fullConfig, "lb_order")
+		if main == nil || main["@id"] != "lb_order" {
+			t.Fatalf("iteration %d: main route missing", i)
+		}
+		if len(routes) != 3 {
+			t.Fatalf("iteration %d: routes=%d, want 3", i, len(routes))
+		}
+		got := make([]string, 0, len(routes))
+		for _, raw := range routes {
+			route, _ := raw.(map[string]interface{})
+			got = append(got, fmt.Sprint(route["@id"]))
+		}
+		want := []string{"lb_order", "lb_order_path_1", "lb_order_redirect"}
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Fatalf("iteration %d: routes order=%v, want %v（server 名排序后逐个收集）", i, got, want)
+		}
+		if i == 0 {
+			baseline = routes
+			continue
+		}
+		if !reflect.DeepEqual(baseline, routes) {
+			t.Fatalf("iteration %d: routes 跨调用不一致（顺序漂移）", i)
+		}
+	}
+}

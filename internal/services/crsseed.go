@@ -43,7 +43,22 @@ func seedCRSRulesFrom(liveDir, snapshotDir, distDir string) {
 
 // seedCRSRulesFromInLock 的判定、辅助文件补种、树复制与快照自愈全程由调用方
 // 持 wafFileMu，和运行期 CRS 树交换保持同一代际边界。
+// 规则树需要在本次播种中重建（残缺树清除 / 从快照或 dist 复制）时，整段进入
+// 树交换窗口——清除与替换之间 live 可能缺失或只有部分树，窗口内渲染必须失败。
+// 规则树已完整（只补 setup/stock/overrides 等辅助文件）时不置窗口，避免启动
+// 期无谓地拒绝并发生成。
 func seedCRSRulesFromInLock(liveDir, snapshotDir, distDir string) {
+	if crsRulesTreeIntact(filepath.Join(liveDir, "rules")) {
+		seedCRSRulesFromInLockUnmarked(liveDir, snapshotDir, distDir)
+		return
+	}
+	_ = withTreeSwapWindow(func() error {
+		seedCRSRulesFromInLockUnmarked(liveDir, snapshotDir, distDir)
+		return nil
+	})
+}
+
+func seedCRSRulesFromInLockUnmarked(liveDir, snapshotDir, distDir string) {
 	rulesPath := filepath.Join(liveDir, "rules")
 	// rules 完整时不得直接 return——setup/stock/overrides 可能单独缺失
 	// （挂载卷只读残影/部分删除），旧实现让这些文件永久缺失而渲染侧 Include
@@ -190,8 +205,9 @@ const crsVersionFile = "VERSION"
 
 // crsProbeFile is a representative rules file present in every CRS release;
 // byte-comparing it between trees is a cheap content check for the bootstrap
-// path where no version marker exists yet.
-const crsProbeFile = "rules/REQUEST-901-INITIALIZATION.conf"
+// path where no version marker exists yet. 路径由安装契约常量派生（单源）——
+// 两处各写一遍会在上游结构变更时单侧漂移。
+const crsProbeFile = "rules/" + crsRulesProbeFile
 
 func crsTreeProbeMatches(a, b string) bool {
 	aData, aErr := os.ReadFile(filepath.Join(a, crsProbeFile))
@@ -309,7 +325,16 @@ func ReconcileCRSState() {
 	} else if !isMaster {
 		return
 	}
-	reconcileCRSStateFrom(crsLiveDir, crsSnapshotDir, currentCRSVersion())
+	// 版本读取必须取「错误可见」口径：本路径会写 VERSION 标记/恢复快照并
+	// 「校正」DB 版本行 + bump 集群版本——用展示容错值（读失败回落 bundled）
+	// 会在 DB 瞬断时把 bundled 当权威写坏标记/版本行。读失败按同函数内
+	// 「角色读取失败即跳过」的既有口径处理。
+	dbV, err := readCurrentCRSVersion()
+	if err != nil {
+		Logf("warn", "CRS 状态对账: 版本记录读取失败，本轮跳过（不写标记/不改版本行）: %v", err)
+		return
+	}
+	reconcileCRSStateFrom(crsLiveDir, crsSnapshotDir, dbV)
 }
 
 func reconcileCRSStateFrom(liveDir, snapshotDir, dbV string) {

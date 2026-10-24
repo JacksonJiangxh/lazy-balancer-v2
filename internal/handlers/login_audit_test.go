@@ -12,6 +12,7 @@ import (
 
 	"lazy-balancer-v2/internal/config"
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/services"
 )
 
 func setupLoginAuditDB(t *testing.T) {
@@ -35,6 +36,12 @@ func TestLogin_successAuditDetailContainsUsername(t *testing.T) {
 	if _, err := db.DB.Exec(`INSERT INTO users (username,password_hash,role,is_enabled,created_at) VALUES ('zhang',?,'admin',1,?)`, string(hash), createdAt); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
+	// 契约是「用户 N（username）」全形（services.AuditUserPart 单源）：只断用户名
+	// 标记会让丢失用户 ID 的实现照样通过。
+	var userID int
+	if err := db.DB.QueryRow(`SELECT id FROM users WHERE username='zhang'`).Scan(&userID); err != nil {
+		t.Fatalf("read seeded user id: %v", err)
+	}
 	h := &Handlers{cfg: &config.Config{JWTSecret: "test-secret"}}
 	router := gin.New()
 	router.POST("/auth/login", h.Login)
@@ -49,8 +56,8 @@ func TestLogin_successAuditDetailContainsUsername(t *testing.T) {
 	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='登录成功' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
 		t.Fatalf("query audit: %v", err)
 	}
-	if !strings.Contains(detail, "（zhang）") {
-		t.Errorf("login success detail=%q, want contains username marker （zhang）", detail)
+	if !strings.Contains(detail, services.AuditUserPart(userID, "zhang")) {
+		t.Errorf("login success detail=%q, want 完整用户标识 %q", detail, services.AuditUserPart(userID, "zhang"))
 	}
 }
 
@@ -65,6 +72,11 @@ func TestLogin_lockedAuditDetailContainsUsername(t *testing.T) {
 	if _, err := db.DB.Exec(`UPDATE users SET login_locked_until=datetime('now','+10 minutes') WHERE username='zhang'`); err != nil {
 		t.Fatalf("lock: %v", err)
 	}
+	// 锁定轮同样必须是「用户 N（zhang）」全形（services.AuditUserPart 单源）。
+	var userID int
+	if err := db.DB.QueryRow(`SELECT id FROM users WHERE username='zhang'`).Scan(&userID); err != nil {
+		t.Fatalf("read seeded user id: %v", err)
+	}
 	h := &Handlers{cfg: &config.Config{JWTSecret: "test-secret"}}
 	router := gin.New()
 	router.POST("/auth/login", h.Login)
@@ -76,7 +88,7 @@ func TestLogin_lockedAuditDetailContainsUsername(t *testing.T) {
 	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE detail LIKE '%已锁定%' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
 		t.Fatalf("query audit: %v", err)
 	}
-	if !strings.Contains(detail, "（zhang）") {
-		t.Errorf("locked detail=%q, want contains username marker （zhang）", detail)
+	if !strings.Contains(detail, services.AuditUserPart(userID, "zhang")) {
+		t.Errorf("locked detail=%q, want 完整用户标识 %q", detail, services.AuditUserPart(userID, "zhang"))
 	}
 }

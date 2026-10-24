@@ -51,6 +51,32 @@ func TestNormalizeRuleForTransport_httpCrossModeTLSResidue(t *testing.T) {
 	}
 }
 
+// TCP 传输归一的清零清单必须与保存族/迁移 SQL 同口径：domain /
+// log_enabled / dns_family 对 TCP 均零消费，带外脏行不得经快照带到从端。
+func TestNormalizeRuleForTransport_tcpClearsDomainLogAndDnsFamily(t *testing.T) {
+	rule := models.LbRule{
+		Protocol: "tcp", Domain: "stale.example.test", LogEnabled: true, DnsFamily: "ipv6",
+		Strategy: "weighted_round_robin",
+	}
+	normalizeRuleForTransport(&rule)
+	if rule.Domain != "" {
+		t.Fatalf("tcp domain=%q, want 清零", rule.Domain)
+	}
+	if rule.LogEnabled {
+		t.Fatal("tcp log_enabled 必须归 0")
+	}
+	if rule.DnsFamily != "ipv4" {
+		t.Fatalf("tcp dns_family=%q, want ipv4（与建库默认同形）", rule.DnsFamily)
+	}
+
+	// HTTP 行不受影响（三列均有消费语义）。
+	httpRule := models.LbRule{Protocol: "http", Domain: "keep.example.test", LogEnabled: true, DnsFamily: "ipv6"}
+	normalizeRuleForTransport(&httpRule)
+	if httpRule.Domain != "keep.example.test" || !httpRule.LogEnabled || httpRule.DnsFamily != "ipv6" {
+		t.Fatalf("http 行被误清: domain=%q log=%v dns=%q", httpRule.Domain, httpRule.LogEnabled, httpRule.DnsFamily)
+	}
+}
+
 // 三面同构的落库侧：从端插入快照上游前必须归零 TCP 回源域名。
 func TestInsertSnapshotRules_tcpUpstreamOriginCleared(t *testing.T) {
 	_, database := newClusterTestService(t)

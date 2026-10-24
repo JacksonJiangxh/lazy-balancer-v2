@@ -37,8 +37,8 @@ func (logger *captureProgressLogger) countContaining(sub string) int {
 	return n
 }
 
-// challenge 命中后转 valid——轮询节拍缩短到 5ms，9 轮内应只在第 0/6 轮打点
-// （2 条）；未修时每轮一条（9 条）。
+// challenge 命中后转 valid——轮询节拍缩短到 5ms，9 次轮询内应只在第 6 次打点
+// （1 条，且必须携带真实状态）；未修时每次一条（9 条），且首条为空状态行。
 func TestIssuer_waitForValidation_throttlesProgressLog(t *testing.T) {
 	oldInterval := validationPollInterval
 	validationPollInterval = 5 * time.Millisecond
@@ -86,8 +86,11 @@ func TestIssuer_waitForValidation_throttlesProgressLog(t *testing.T) {
 	iterations := chalHits
 	mu.Unlock()
 	progress := logger.countContaining("仍在等待")
-	if progress != 2 {
-		t.Fatalf("9 轮等待应只打 2 条进度日志（第 0/6 轮, iterations=%d）, got %d", iterations, progress)
+	if progress != 1 {
+		t.Fatalf("9 轮等待应只打 1 条进度日志（第 6 轮, iterations=%d）, got %d", iterations, progress)
+	}
+	if empty := logger.countContaining("(challenge: , 授权: )"); empty != 0 {
+		t.Fatalf("进度行不得以空状态输出, got %d 条", empty)
 	}
 }
 

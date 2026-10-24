@@ -38,7 +38,7 @@ import {
   type StageGroup,
   type StagePolicyGroup,
 } from '../src/utils/securityStages.ts'
-import { source } from './_helpers.ts'
+import { code, source, webFiles } from './_helpers.ts'
 
 const policy = (over: Partial<SecurityStagePolicy> = {}): SecurityStagePolicy => ({
   id: 1,
@@ -190,12 +190,21 @@ test('compareVersion：段数值比较，v 前缀与长短段等价', () => {
 // 不可达性机械钉：唯一消费方把各源 version 交给 compareVersion，版本来源为
 // 日期形态；一旦出现新消费方或预发布字面量，本用例先红。
 test('compareVersion 消费面与版本形态约束', () => {
-  const lib = source('src/utils/securityLibraries.ts')
+  const lib = code('src/utils/securityLibraries.ts')
   assert.match(lib, /\.sort\(compareVersion\)/, '唯一消费点是各源版本最大值')
-  const stages = source('src/utils/securityStages.ts')
-  assert.match(stages, /日期形态/, 'compareVersion 文档必须声明设计边界形态')
-  for (const file of ['src/utils/securityLibraries.ts']) {
-    assert.doesNotMatch(source(file), /-\s?(?:beta|rc)\b/, `${file} 不得出现预发布版本形态`)
+  // 文档钉（断言对象本就是注释文字）：compareVersion 的注释必须声明消费形态边界。
+  // 文档钉（断言对象是注释文字）：compareVersion 注释必须声明消费形态边界。
+  assert.match(source('src/utils/securityStages.ts'), /日期形态/, 'compareVersion 文档必须声明设计边界形态')
+  // 「唯一消费方」必须遍历全 src：只扫一个文件时，新消费方在别处静默出现仍绿。
+  const files = webFiles('src', ['.ts', '.vue'])
+  if (files.length < 50) {
+    assert.fail(`扫描面过小（src 下仅 ${files.length} 个源文件）——目录遍历失效`)
+  }
+  const definition = 'src/utils/securityStages.ts'
+  const consumers = files.filter((file) => file !== 'src/utils/securityLibraries.ts' && file !== definition && code(file).includes('compareVersion'))
+  assert.deepEqual(consumers, [], `compareVersion 出现新消费方（需重新评估预发布形态边界）：${consumers.join(', ')}`)
+  for (const file of files) {
+    assert.doesNotMatch(code(file), /-\s?(?:beta|rc)\b/, `${file} 不得出现预发布版本形态`)
   }
 })
 

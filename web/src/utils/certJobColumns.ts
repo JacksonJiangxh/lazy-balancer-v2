@@ -57,7 +57,7 @@ export const CERT_JOB_COLUMNS: readonly CertJobColumnId[] = [
  * 先让位低价值列：冷却时间（并入重试单元格 tooltip）、颁发者、自动重签时间、
  * 更新时间。域名/状态/有效期/重试/操作恒保留——没有它们表格失去意义。
  */
-export const CERT_JOB_COLUMN_HIDE_ORDER: readonly CertJobColumnId[] = [
+const CERT_JOB_COLUMN_HIDE_ORDER: readonly CertJobColumnId[] = [
   'cooling',
   'issuer',
   'renewal',

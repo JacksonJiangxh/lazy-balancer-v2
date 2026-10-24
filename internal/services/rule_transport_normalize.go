@@ -100,6 +100,13 @@ func normalizeRuleForTransport(rule *models.LbRule) {
 		rule.ProxyStreamCloseDelay = 0
 		rule.CustomRoutesEnabled = false
 		rule.DynamicDNS = false
+		// domain / log_enabled / dns_family 与保存族、迁移 SQL 同口径归零：
+		// 三者对 TCP 均零消费（domain 仅 HTTP 域名/证书，log_enabled 仅 HTTP
+		// logger_names，dns_family 仅动态上游解析）。带外直改库/外来写入的
+		// TCP 行此前会把死值经快照长期带到从端。
+		rule.Domain = ""
+		rule.LogEnabled = false
+		rule.DnsFamily = "ipv4"
 		if rule.Strategy == "cookie" {
 			rule.Strategy = "weighted_round_robin"
 		}

@@ -23,7 +23,7 @@ import {
   trustedProxyTotalError,
   trustedProxyTotalWarning,
 } from '../src/utils/trustedProxyRanges.ts'
-import { repoSource, section, source } from './_helpers.ts'
+import { repoCode, section, code } from './_helpers.ts'
 
 test('合法条目零报错（含裸 IP 与 IPv6 官方回源段）', () => {
   for (const value of ['203.0.113.0/24', '1.2.3.4', '  10.0.0.0/8  ', '2001:db8::/32', '2a06:98c0::/29']) {
@@ -61,7 +61,7 @@ test('汇总文案逐条点名非法值（用户可定位是哪一条）', () =>
 })
 
 test('跨栈对表：Go 侧判据与前端常量同值', () => {
-  const caddy = repoSource('internal/services/caddy.go')
+  const caddy = repoCode('internal/services/caddy.go')
   const minBits = section(caddy, 'func TrustedProxyMinPrefixBits', 'func TrustedProxyPrefixAllSpace')
   assert.match(minBits, /return 29/)
   assert.match(minBits, /return 8/)
@@ -69,10 +69,10 @@ test('跨栈对表：Go 侧判据与前端常量同值', () => {
   // 双向集合法（不是单向包含）：后端新增第 6 个全空间形态而前端不同步时，
   // 用户会在面板写入等同 0.0.0.0/0 的配置且前端零提示（保存后整组被拒）。
   const goForms = [...allSpace.matchAll(/"([^"]+)"/g)].map((match) => match[1]).sort()
-  const tsArray = section(source('src/utils/trustedProxyRanges.ts'), 'const ALL_SPACE_PREFIXES: readonly string[] = [', ']')
+  const tsArray = section(code('src/utils/trustedProxyRanges.ts'), 'const ALL_SPACE_PREFIXES: readonly string[] = [', ']')
   const tsForms = [...tsArray.matchAll(/'([^']+)'/g)].map((match) => match[1]).sort()
   assert.deepEqual(tsForms, goForms, '前端 ALL_SPACE_PREFIXES 必须与 Go case 列表逐值相等')
-  const handler = repoSource('internal/handlers/config_trustedproxy.go')
+  const handler = repoCode('internal/handlers/config_trustedproxy.go')
   assert.match(handler, /len\(entries\) > 64/, '内联网段条目上限须与常量对表')
   assert.equal(TRUSTED_PROXY_MIN_PREFIX_BITS.ipv4, 8)
   assert.equal(TRUSTED_PROXY_MIN_PREFIX_BITS.ipv6, 29)
@@ -80,7 +80,7 @@ test('跨栈对表：Go 侧判据与前端常量同值', () => {
 })
 
 test('组件接线：行内标红 + 保存门（不再等到 PUT 才被整组拒绝）', () => {
-  const card = source('src/views/settings/CaddyGlobalSettings.vue')
+  const card = code('src/views/settings/CaddyGlobalSettings.vue')
   assert.match(card, /const trustedRangesError = computed\(\(\) => trustedProxyRangesError\(trustedRanges\.value\)\)/)
   assert.match(card, /v-if="trustedRangesError"/, '非法条目必须就地呈现')
   const save = section(card, 'const handleSave = async', 'const preview = await request.post')
@@ -196,7 +196,7 @@ test('非法/空条目不计入并集（由网段判据逐条点名）', () => {
 })
 
 test('跨栈对表：请求头与总量判据与 Go 侧同值', () => {
-  const handler = repoSource('internal/handlers/config_trustedproxy.go')
+  const handler = repoCode('internal/handlers/config_trustedproxy.go')
   assert.match(handler, /len\(entries\) > 8/, '请求头条数上限须对表')
   assert.match(handler, /\^\[A-Za-z0-9-\]\{1,64\}\$/, '请求头字符集须对表')
   assert.match(handler, /trustedProxyMaxTotalCIDRs = 2000/, '总量上限须对表')
@@ -208,7 +208,7 @@ test('跨栈对表：请求头与总量判据与 Go 侧同值', () => {
 })
 
 test('组件接线：请求头与总量行内提示 + 保存门', () => {
-  const card = source('src/views/settings/CaddyGlobalSettings.vue')
+  const card = code('src/views/settings/CaddyGlobalSettings.vue')
   assert.match(card, /const trustedHeadersError = computed\(\(\) => trustedProxyHeadersError\(trustedHeaders\.value\)\)/)
   assert.match(card, /const trustedTotalError = computed\(\(\) => trustedProxyTotalError\(trustedRanges\.value, /)
   assert.match(card, /const trustedTotalWarning = computed\(\(\) => trustedProxyTotalWarning\(trustedRanges\.value, /, '估算越限提示须就地呈现')

@@ -18,7 +18,7 @@ import {
   createLogStatBuckets,
   incrementCappedStat,
 } from '../src/utils/logStatCap.ts'
-import { source } from './_helpers.ts'
+import { code } from './_helpers.ts'
 
 const keyOf = (i: number): string => `10.0.${Math.floor(i / 256)}.${i % 256}`
 
@@ -78,7 +78,7 @@ test('原型链敌意键不得侵蚀计数（容器原型安全）', () => {
 })
 
 test('规则日志视图消费单源容器（不得回流本地实现）', () => {
-  const rules = source('src/views/Rules.vue')
+  const rules = code('src/views/Rules.vue')
   assert.match(rules, /from '@\/utils\/logStatCap'/)
   assert.doesNotMatch(rules, /const incrementCappedStat = /, '本地实现必须退役')
   assert.doesNotMatch(rules, /keyCounts: \{ ip: 0, ua: 0, uri: 0 \}/, '本地桶构造必须退役')

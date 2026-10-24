@@ -123,7 +123,7 @@ function flyAltitudeFor(name: string): number {
 }
 
 /** 点阵坐标点（与引擎内部 WorldDot 同形；此处只需经纬度）。 */
-export interface DotLatLng {
+interface DotLatLng {
   lat: number
   lng: number
 }

@@ -8,7 +8,7 @@ import assert from 'node:assert/strict'
 
 import { isMfaCredentialRejection } from '../src/utils/mfaErrors.ts'
 import { MFA_SCOPE_GROUPS } from '../src/utils/mfaScopeGroups.ts'
-import { repoSource, section, source } from './_helpers.ts'
+import { repoCode, section, code } from './_helpers.ts'
 
 const SESSION_EXPIRED = '未登录或登录已过期'
 
@@ -26,7 +26,7 @@ test('验码/挑战错误 → 豁免会话失效（只传播文案供重试）',
 test('401 豁免白名单与后端 mfa.go 文案逐字对齐（跨栈钉）', () => {
   // 前端按后端中文字面量分类——后端润色文案（改字/加标点）会静默改变分类：
   // 真会话过期被当验码错误不弹重登，或反之误杀会话。逐字钉住 Go 侧出处。
-  const go = repoSource('internal/handlers/mfa.go')
+  const go = repoCode('internal/handlers/mfa.go')
   for (const msg of [
     '验证码错误',
     '验证码错误次数过多，绑定已作废，请重新开始绑定',
@@ -58,7 +58,7 @@ test('非 MFA 端点与其它状态码一律不豁免', () => {
 // DNS 凭证连通性测试 等族曾被漏列——用户对这些写操作被要求验码会感到意外（守卫
 // 仍生效，不构成绕过）。清单单源在 utils/mfaScopeGroups，测试直接 import。
 test('MFA「支持的操作」清单覆盖 middleware 各写端点族', () => {
-  const page = source('src/views/settings/BasicSettings.vue')
+  const page = code('src/views/settings/BasicSettings.vue')
   assert.match(page, /v-for="group in MFA_SCOPE_GROUPS"/, '弹框必须直接渲染单源清单')
   const flat = MFA_SCOPE_GROUPS.map((g) => `${g.title}｜${g.items.join('、')}`).join('\n')
   for (const anchor of ['任务监控 运行', '服务控制', '节点站点坐标', '指纹钉', '自动封禁', '爬虫库', 'IP 名单', 'DNS 凭证连通性测试']) {
@@ -74,8 +74,8 @@ test('MFA「支持的操作」清单覆盖 middleware 各写端点族', () => {
 // 不再靠人肉对齐。豁免面与守卫同一事实源：readOnlyWriteRoutes（只读语义写）
 // + /auth/mfa/ 自助端点。
 test('MFA 清单反查：middleware 全部写路由族均有清单锚点', () => {
-  const mw = repoSource('internal/middleware/middleware.go')
-  const policy = repoSource('internal/services/auditpolicy.go')
+  const mw = repoCode('internal/middleware/middleware.go')
+  const policy = repoCode('internal/services/auditpolicy.go')
   const flat = MFA_SCOPE_GROUPS.map((g) => `${g.title}｜${g.items.join('、')}`).join('\n')
 
   const exemptBlock = section(policy, 'var readOnlyWriteRoutes = map[string]struct{}{', '\n}')
@@ -99,7 +99,7 @@ test('MFA 清单反查：middleware 全部写路由族均有清单锚点', () =>
     ['/api/v1/admin-tls', '管理 TLS'],
     ['/api/v1/system/restart', '系统重启'],
     ['/api/v1/system/tasks/', '任务监控'],
-    ['/api/v1/caddy/config', 'Caddyfile 手动编辑'],
+    ['/api/v1/caddy/config', '原始 Caddy 配置覆写（JSON 逃生口）'],
     ['/api/v1/caddy/', 'Caddy 服务启动'],
     ['/api/v1/api-keys', 'API 密钥'],
     ['/api/v1/ca-providers/', 'CA 提供商'],

@@ -92,7 +92,21 @@ func sectionPayloadFor(key string, s *models.ClusterSnapshot) interface{} {
 			IPLists        json.RawMessage             `json:"ip_lists"`
 			ThreatSources  json.RawMessage             `json:"threat_sources"`
 			CrawlerSources json.RawMessage             `json:"crawler_sources"`
-		}{s.SecurityPolicies, s.SecurityBindings, s.SecurityCustomRules, s.SecurityBlockPages, s.SecurityIPLists, s.SecurityThreatSources, s.SecurityCrawlerSources}
+		}{
+			// 值归一单源（见 normalizeSnapshotPolicyRow/normalizeSnapshotSourceRow/
+			// normalizeSnapshotBlockPagesForHash）：apply 侧的落库归一不改变主端
+			// payload 字节，却会改变从端落库结果——哈希若照抄原始载荷，主端哈希
+			// 与从端 apply 后重建哈希长期不等（节点列表该节永久显示「滞后」，
+			// 且每次相关版本 bump 多一轮全量重放）。三面（下发值/哈希输入/从端
+			// 落库值）经同一组归一函数收敛后，稳态哈希一致。
+			canonicalizeSecurityPolicyRows(s.SecurityPolicies),
+			s.SecurityBindings,
+			s.SecurityCustomRules,
+			normalizeSnapshotBlockPagesForHash(s.SecurityBlockPages),
+			s.SecurityIPLists,
+			canonicalizeSnapshotSourceRows(s.SecurityThreatSources),
+			canonicalizeSnapshotSourceRows(s.SecurityCrawlerSources),
+		}
 	case "waf_files":
 		// 文件态哈希保持纯 ref 语义(2026-09-11 修正:版本行不进节哈希——
 		// 进哈希会让主从行状态强耦合,漂移判定不可收敛)。CRS/IP2Region 版本行
@@ -104,6 +118,77 @@ func sectionPayloadFor(key string, s *models.ClusterSnapshot) interface{} {
 		return s.WafFiles
 	}
 	return nil
+}
+
+// canonicalizeSecurityPolicyRows 把策略行载荷规范化为「从端落库后重建」形态：
+// 逐行经 normalizeSnapshotPolicyRow 归一（与 apply 写侧单源），再按
+// encoding/json 的确定键序重新序列化。两侧输入可以是「主端原始行（含待归一
+// 值）」或「从端已归一行」，归一幂等 + 键序确定 ⇒ 同一行的哈希字节一致。
+// 解包失败原样返回（与既有 fail-visible：apply 会在解析时报错，不允许哈希
+// 侧静默改写载荷）。
+func canonicalizeSecurityPolicyRows(raw json.RawMessage) json.RawMessage {
+	return canonicalizeSecurityRowMap(raw, normalizeSnapshotPolicyRow)
+}
+
+// canonicalizeSnapshotSourceRows 同 canonicalizeSecurityPolicyRows，用于威胁
+// 情报库/爬虫地址库源行（活动态任务三列归一）。
+func canonicalizeSnapshotSourceRows(raw json.RawMessage) json.RawMessage {
+	return canonicalizeSecurityRowMap(raw, normalizeSnapshotSourceRow)
+}
+
+// canonicalizeSecurityRowMap 是行 map 规范化的公共实现：解包 → 逐行 normalize
+// → 重新序列化（map 键按字典序，字节确定）。空/缺失载荷保持原形态（nil 仍按
+// null 参与哈希，与改造前一致）。
+func canonicalizeSecurityRowMap(raw json.RawMessage, normalize func(map[string]interface{})) json.RawMessage {
+	if len(raw) == 0 {
+		return raw
+	}
+	var rows []map[string]interface{}
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		return raw
+	}
+	for _, row := range rows {
+		if row == nil {
+			continue
+		}
+		normalize(row)
+	}
+	encoded, err := json.Marshal(rows)
+	if err != nil {
+		return raw
+	}
+	return encoded
+}
+
+// normalizeSnapshotBlockPagesForHash 复刻 applySecurityBlockPages 的默认页降级
+// （仅保留 MIN(id) 一个 is_default=1），在副本上执行——主端库里可能并存多个
+// 默认页，从端落库后只剩一个，哈希必须与落库形态一致。
+func normalizeSnapshotBlockPagesForHash(pages []models.SecurityBlockPage) []models.SecurityBlockPage {
+	if len(pages) == 0 {
+		return pages
+	}
+	keep := 0
+	for _, page := range pages {
+		if page.IsDefault && (keep == 0 || page.ID < keep) {
+			keep = page.ID
+		}
+	}
+	if keep == 0 {
+		return pages
+	}
+	out := make([]models.SecurityBlockPage, len(pages))
+	demoted := false
+	for i, page := range pages {
+		out[i] = page
+		if page.IsDefault && page.ID != keep {
+			out[i].IsDefault = false
+			demoted = true
+		}
+	}
+	if !demoted {
+		return pages
+	}
+	return out
 }
 
 // sanitizeUsersForHash 返回用于 users 节哈希计算的用户副本：清零 last_login（登录时间）
@@ -459,8 +544,8 @@ func logSyncSwitchGuards(dbh *sql.DB, snapshot models.ClusterSnapshot, sk *secti
 	// recordAppliedSectionHashes 不写该列,版本冻结在开关关闭前,每版本
 	// bump 至多刷一条告警审计)。
 	// 判定顺序「便宜门在前」：开关关闭 → 快照带引用 → 版本去重（一次点查）
-	// → 最后才 wafFilesRefDiffers（持 WafFileLock 做 CRS 全树打包 + xdb 全文件
-	// 哈希，数十至数百毫秒）。同版本重放（重载失败补偿重拉）本应被去重直接
+	// → 最后才 wafFilesRefVersionLabelsDiffer（只读两个小版本文件；不用
+	// wafFilesRefDiffers 的整树哈希，见该函数注释）。同版本重放（重载失败补偿重拉）本应被去重直接
 	// 跳过，若先算哈希会白付一次全树哈希并阻塞三库更新器与 lbbak 导入文件相位。
 	// 语义不变：三个条件仍同时成立才告警（AND）。
 	if !sk.disabled["security"] || snapshot.WafFiles == nil {
@@ -477,7 +562,9 @@ func logSyncSwitchGuards(dbh *sql.DB, snapshot models.ClusterSnapshot, sk *secti
 	if lastWarnVersion >= snapshot.Version {
 		return
 	}
-	if !wafFilesRefDiffers(snapshot.WafFiles) {
+	// 轻量比对（版本标签）替代整树哈希：本告警只回答「主节点安全数据是否
+	// 已更新」，开关开启时的内容级漂移检测仍由 wafFilesDrifted 的哈希口径承担。
+	if !wafFilesRefVersionLabelsDiffer(snapshot.WafFiles) {
 		return
 	}
 	RecordAuditLog("system", "同步警告", "集群同步", "检测到主节点 CRS/IP2Region 文件已更新（同步开关关闭），本地文件保持不变", "")

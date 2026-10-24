@@ -13,16 +13,19 @@ import (
 // CertJobMaterialPredicateSQL，内存行必须调用 CertJobMaterialUsable。
 //
 // 历史事故正是多套实现并存——渲染面把「有材料」判宽、导入清理判窄，结果把仍在
-// 对外服务的证书文件删掉。此扫描把「不许再长出内联谓词」变成机器判定：新增
-// 证书域生产文件时把文件名加进清单（或让扫描覆盖更宽），漏加只会让覆盖面变小，
-// 不会让本测试假红。
+// 对外服务的证书文件删掉。此扫描把「不许再长出内联谓词」变成机器判定：扫描
+// 整个 services 包（此前是手工文件清单，新增证书域生产文件时恰好漏扫，而且
+// 失败是静默的——测试仍绿）。扫描本身只是只读字符串匹配，代价可忽略。
 func TestCertJobMaterialPredicate_hasNoInlineCopies(t *testing.T) {
-	servicesFiles := []string{
-		"certificates.go", "certissuer.go", "certstore.go", "certinfo.go",
-		"certselector.go", "caqueue.go", "certjoblog.go",
+	servicesFiles, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("glob services sources: %v", err)
 	}
-	for _, name := range servicesFiles {
-		assertNoInlineMaterialPredicate(t, name)
+	for _, path := range servicesFiles {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		assertNoInlineMaterialPredicate(t, path)
 	}
 	handlerFiles, err := filepath.Glob(filepath.Join("..", "handlers", "cert*.go"))
 	if err != nil {
@@ -60,7 +63,7 @@ func assertNoInlineMaterialPredicate(t *testing.T, path string) {
 	// 谓词必然在同一段连续文本里。
 	squashed := strings.Join(strings.Fields(string(data)), "")
 	squashed = strings.NewReplacer(`"`, "", "`", "", "+", "").Replace(squashed)
-	for _, marker := range []string{"CertJobMaterialPredicateSQL", "CertJobMaterialUsable"} {
+	for _, marker := range []string{"CertJobCandidatePredicateSQL", "CertJobMaterialPredicateSQL", "CertJobMaterialUsable"} {
 		squashed = strings.ReplaceAll(squashed, marker, "")
 	}
 	for _, column := range []string{"cert_pem", "key_pem"} {

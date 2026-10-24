@@ -2,7 +2,7 @@
 // JSON 编码），直接读 hosts.length 会让整个安全总览渲染崩溃。这里把任何
 // 非数组形态收敛为空数组，total 保持数值语义。
 
-export interface RateLimitBlockHost {
+interface RateLimitBlockHost {
   host: string
   count: number
 }

@@ -5,7 +5,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
 
 import { member, section, stripComments } from './_helpers.ts'
 
@@ -160,4 +160,33 @@ test('脚本存在性断言文件禁止裸 source()/repoSource() 回流', () => 
     )
     assert.doesNotMatch(text, /(^|[^A-Za-z_.])(?:source|repoSource)\(/m, `${name} 仍有裸取源调用`)
   }
+
+  // 扫描面改为递归枚举 tests/ 下全部 spec（单层 glob 会让子目录里的新 spec
+  // 整体漏出守卫），只放行「raw 用于模板文案/注释文档钉」的文件清单。新增
+  // 裸 source/repoSource 使用必须在清单里显式登记并确认其断言对象是文案/注释。
+  const specFiles = (readdirSync(new URL('./', import.meta.url), { recursive: true }) as string[])
+    .map((name) => name.replace(/\\/g, '/'))
+    .filter((name) => name.endsWith('.spec.ts'))
+    .sort()
+  assert.ok(specFiles.length > 80, `扫描面过小（tests 下仅 ${specFiles.length} 个 spec）——递归枚举失效`)
+  const rawImport = /import \{[^}]*\b(?:source|repoSource)\b[^}]*\} from '\.\/_helpers\.ts'/
+  // 合成自检：判据必须能识别裸导入形态、且不误伤 code/repoCode 导入。
+  assert.ok(rawImport.test("import { source } from './_helpers.ts'"), '判据抓不到裸 source 导入')
+  assert.ok(rawImport.test("import { code, repoSource } from './_helpers.ts'"), '判据抓不到裸 repoSource 导入')
+  assert.doesNotMatch("import { code, repoCode } from './_helpers.ts'", rawImport, '判据误伤剥注释视图导入')
+  const readSpec = (name: string): string => readFileSync(new URL(`./${name}`, import.meta.url), 'utf8')
+  const allowedRaw = new Set([
+    // 全体断言为模板文案/文档注释钉（用例名标注「文档钉」）；代码存在性断言
+    // 一律走 code()/repoCode()，注释掉实现必须能红。
+    'feP3Wiring.spec.ts',
+    'infraWiring.spec.ts',
+    'securityStagesPure.spec.ts',
+    // 面板边界 marker 是 HTML 注释：先在 raw 上切片、再剥注释做代码断言。
+    'panelUiWiring.spec.ts',
+  ])
+  // 本文件自身含判据的合成样本字符串（非真实导入），排除自扫描。
+  const offenders = specFiles.filter((name) => name !== 'helpersStripComments.spec.ts' && rawImport.test(readSpec(name)) && !allowedRaw.has(name))
+  assert.deepEqual(offenders, [], '新增裸 source/repoSource 使用：断言对象是代码存在性时改 code()/repoCode()；确属文案/文档钉才登记进 allowedRaw')
+  const deadEntries = [...allowedRaw].filter((name) => !rawImport.test(readSpec(name)))
+  assert.deepEqual(deadEntries, [], 'allowedRaw 存在不再使用 raw 的文件——删除死条目')
 })

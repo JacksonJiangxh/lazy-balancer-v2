@@ -73,13 +73,15 @@ test('写侧计数不可用优先于降级（0 不等于无丢弃）', () => {
   assert.doesNotMatch(message, /累计丢弃/, '计数不可用时不得把 0 当成已确认无丢弃')
 })
 
-// 畸形区跳过与「曾丢失已恢复」两条文案此前零覆盖（含 humanBytes 三档与逐项归因）。
+// 畸形区跳过与「曾丢失已恢复」两条文案此前零覆盖（含字节档位与逐项归因）。
+// 字节精度断言按站内单源 formatBytes（1024 进制、最多两位小数去尾零）：
+// 2048 → 2 KB、3 MiB → 3 MB、2 GiB → 2 GB——与日志占用条/备份大小同精度。
 test('健康位异常 + 畸形区跳过：披露处数与体量（B/KB/MB/GB 各档）', () => {
   const base = { ...healthy, healthy: false, consecutive_failures: 0, skipped_regions: 3 }
   assert.match(ingestionWarningMessage({ ...base, skipped_bytes: 512 }), /跳过了 3 处畸形区（累计 512 B）/)
-  assert.match(ingestionWarningMessage({ ...base, skipped_bytes: 2048 }), /2\.0 KB/)
-  assert.match(ingestionWarningMessage({ ...base, skipped_bytes: 3 * 1024 * 1024 }), /3\.0 MB/)
-  assert.match(ingestionWarningMessage({ ...base, skipped_bytes: 2 * 1024 ** 3 }), /2\.0 GB/)
+  assert.match(ingestionWarningMessage({ ...base, skipped_bytes: 2048 }), /2 KB/)
+  assert.match(ingestionWarningMessage({ ...base, skipped_bytes: 3 * 1024 * 1024 }), /3 MB/)
+  assert.match(ingestionWarningMessage({ ...base, skipped_bytes: 2 * 1024 ** 3 }), /2 GB/)
   assert.match(
     ingestionWarningMessage({ ...base, skipped_bytes: 1024, last_skip_at: '2026-10-24T01:02:03Z' }),
     /最近 2026-10-24T01:02:03Z/,
@@ -103,7 +105,7 @@ test('data_loss 单独成立：逐项列出曾丢失来源并声明已恢复', (
   assert.match(message, /写盘错误 2 次/)
   assert.match(message, /格式化失败 1 次/)
   assert.match(message, /命中明细截断 5 条/)
-  assert.match(message, /跳过畸形区 1 处（1\.0 KB）/)
+  assert.match(message, /跳过畸形区 1 处（1 KB）/)
   assert.match(message, /当前已恢复/)
   // 无任何分项计数时不虚构数字
   assert.match(ingestionWarningMessage({ ...healthy, data_loss: true }), /计数不可用/)

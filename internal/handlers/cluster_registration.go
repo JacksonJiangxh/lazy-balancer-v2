@@ -53,6 +53,7 @@ func (h *Handlers) GenerateClusterRegisterToken(c *gin.Context) {
 			clusterMasterForbidden(c, err)
 			return
 		}
+		recordAudit(c, "生成", "注册令牌", services.FormatAuditDetail(services.AuditResultPart("failure"), err.Error()))
 		clusterError(c, http.StatusInternalServerError, "生成注册令牌失败", err)
 		return
 	}
@@ -97,6 +98,21 @@ func (h *Handlers) RegisterClusterNode(c *gin.Context) {
 			clusterError(c, http.StatusBadRequest, err.Error(), err)
 			return
 		}
+		if errors.Is(err, models.ErrMissingClusterNodeIP) {
+			// 自述地址缺失且来源地址不可用：客户端需显式配置访问地址后重试。
+			services.RecordAuditLog("system", "注册失败", "集群节点", services.FormatAuditDetail(registerAuditField(req.Name), err.Error()), c.ClientIP())
+			clusterError(c, http.StatusBadRequest, err.Error(), err)
+			return
+		}
+		if errors.Is(err, models.ErrInvalidClusterAccessURL) {
+			// 非法访问地址同属客户端可修正输入：落 500 会让从端 SetClusterMode
+			// 把它包成「向目标主节点注册失败」的 502，运维误判主节点故障。
+			// 与同族入口（UpdateClusterNodeAccessURL/SetClusterMode/v2 导入）的
+			// 400 口径一致；此处此前缺分支，与同文件注释矛盾。
+			services.RecordAuditLog("system", "注册失败", "集群节点", services.FormatAuditDetail(registerAuditField(req.Name), registerAuditField(req.IPAddress), err.Error()), c.ClientIP())
+			clusterError(c, http.StatusBadRequest, "访问地址无效", err)
+			return
+		}
 		services.RecordAuditLog("system", "注册失败", "集群节点", services.FormatAuditDetail(registerAuditField(req.Name), registerAuditField(req.IPAddress), err.Error()), c.ClientIP())
 		clusterError(c, http.StatusInternalServerError, "节点注册失败", err)
 		return
@@ -125,6 +141,13 @@ func (h *Handlers) GetClusterRegistrationStatus(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil || id <= 0 {
 		clusterError(c, http.StatusBadRequest, "注册编号无效", err)
+		return
+	}
+	// 导入窗口 fast-fail：本端点会写 nodes（交付集群令牌，条件 UPDATE），
+	// 与同族「GET 写 nodes」的 GetClusterSnapshot 及其余写端点同口径——
+	// 窗口内写入会撞导入事务的全量替换，阻塞至 busy_timeout 后落 500「查询
+	// 注册状态失败」（语义应为 409），或被覆盖丢失。
+	if rejectNodeWriteDuringImport(c) {
 		return
 	}
 	// 同族机器端点（register/confirm/snapshot/waf-files/report）均有
@@ -167,7 +190,11 @@ func (h *Handlers) ConfirmClusterRegistration(c *gin.Context) {
 		}
 		// 同 RegistrationStatus 分判。失败也留痕（与 register 一致）：注册
 		// 密钥被拒/重放尝试在审计面无记录时无法回溯。
-		if errors.Is(err, services.ErrInvalidClusterAuth) || errors.Is(err, services.ErrNodeNotFound) || errors.Is(err, services.ErrInvalidRegisterToken) {
+		// ConfirmRegistration 只产出 ErrNotMasterNode（已单独处理）、
+		// ErrInvalidClusterAuth 与包装后的 DB 错误——ErrNodeNotFound/
+		// ErrInvalidRegisterToken 两臂不可达，删除以免误导后续维护者以为
+		// 服务层会产这两个哨兵。
+		if errors.Is(err, services.ErrInvalidClusterAuth) {
 			services.RecordAuditLog("system", "确认失败", "集群节点", services.AuditResultPart("failure"), c.ClientIP())
 			clusterError(c, http.StatusUnauthorized, "确认集群注册失败", err)
 			return
@@ -270,14 +297,22 @@ func (h *Handlers) clusterNodeAction(c *gin.Context, action string, operation fu
 	if !h.requireMaster(c) {
 		return
 	}
+	// 失败留痕单源：审批/拒绝/删除/更新地址的每条失败面都必须进操作审计
+	// （与 ControlClusterNodeService 的 auditFailure 同构）。审计中间件对
+	// explicit 路由无条件早退（含 5xx），handler 不补记即取证缺口。
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil || id <= 0 {
+		recordAudit(c, action, "集群节点", services.FormatAuditDetail("节点编号无效（"+registerAuditField(c.Param("id"))+"）", services.AuditResultPart("failure")))
 		clusterError(c, http.StatusBadRequest, "节点编号无效", err)
 		return
+	}
+	auditFailure := func(code, reason string) {
+		recordAudit(c, action, "集群节点", services.FormatAuditDetail(fmt.Sprintf("节点 %d", id), reason, services.AuditResultPart(code)))
 	}
 	if err := operation(id); err != nil {
 		// 服务层降级竞态 403 与 requireMaster 门同源带头。
 		if errors.Is(err, services.ErrNotMasterNode) {
+			auditFailure("blocked", "节点角色已降级")
 			clusterMasterForbidden(c, err)
 			return
 		}
@@ -293,9 +328,11 @@ func (h *Handlers) clusterNodeAction(c *gin.Context, action string, operation fu
 		// 此前落默认 500「更新地址节点失败」，用户以为服务端故障且拿不到规则
 		// 说明（同族入口 RegisterClusterNode/SetClusterMode/v2 导入均已 400）。
 		if errors.Is(err, models.ErrInvalidClusterAccessURL) {
+			auditFailure("invalid_request", "访问地址无效")
 			clusterError(c, http.StatusBadRequest, "访问地址无效", err)
 			return
 		}
+		auditFailure("failed", err.Error())
 		clusterError(c, status, action+"节点失败", err)
 		return
 	}

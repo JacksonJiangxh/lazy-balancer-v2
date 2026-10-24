@@ -191,8 +191,17 @@ const fetchLogs = async () => {
   try {
     const res = await request.get<{ data?: { list?: AuditLogEntry[]; total?: number; total_stale?: boolean } }>('/audit-logs', { params: buildParams() })
     if (currentRequestSeq !== requestSeq || page.value !== targetPage || pageSize.value !== targetPageSize) return
+    // 总数收缩（保留期清理/他处删改）后夹紧当前页：否则停留在越界页会
+    // 看到「暂无操作日志」而分页器页码超界，必须手动回退。
+    const nextTotal = res.data?.total || 0
+    const maxPage = Math.max(1, Math.ceil(nextTotal / targetPageSize))
+    if (targetPage > maxPage) {
+      page.value = maxPage
+      void fetchLogs()
+      return
+    }
     logs.value = res.data?.list || []
-    total.value = res.data?.total || 0
+    total.value = nextTotal
     totalStale.value = res.data?.total_stale === true
     loadError.value = false
   } catch (e) {

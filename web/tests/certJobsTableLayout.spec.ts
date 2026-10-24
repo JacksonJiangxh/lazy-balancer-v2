@@ -7,7 +7,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { section, source } from './_helpers.ts'
+import { section, code } from './_helpers.ts'
 import {
   CERT_JOB_COLUMNS_MIN_WIDTH,
   CERT_JOB_COLUMN_WIDTHS,
@@ -15,7 +15,7 @@ import {
 } from '../src/utils/certJobColumns.ts'
 import type { CertJobColumnId } from '../src/utils/certJobColumns.ts'
 
-const page = source('src/views/settings/CertJobs.vue')
+const page = code('src/views/settings/CertJobs.vue')
 
 const tableBody = section(page, 'class="cert-jobs-table"', '</el-table>')
 

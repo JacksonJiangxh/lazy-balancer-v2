@@ -206,15 +206,30 @@ done
 # 监督器探测）此前只在本地手工跑 -race，且 middleware 不在覆盖内——限流桶
 # （双层锁 + 换代计数）、API Key 白名单缓存、认证审计限流、MCP 响应缓冲都在
 # 这个包里。全量 -race 会把门禁时长成倍拉长，故只覆盖并发密集入口。
+#
+# internal/services 同样纳入（并发密集面：单飞加载器、ip2region 100 goroutine
+# Reload、downloadintegrity 共享写入、全局句柄 seam 十余处），此前从未在竞态
+# 检测器下运行——数据竞争可在门禁内逃逸。
+#
+# 该包按 -run 定向取「并发面」而非全包：全包在 -race 下超过 20 分钟（数百个
+# 用例各自跑一遍 DB 迁移，与并发无关；TestRDBCompile_200kAggregates 的 20 万行
+# 编译基准更是纯算力），门禁时长不可接受。未进 -race 面的是「单线程夹具 + DB
+# 迁移」类用例，仍由上方全量非 -race 运行覆盖；新增并发用例请按同一口径加进
+# 本 -run 清单（前缀汇总，避免逐条漂移）。
 echo "== go test -race (concurrency cores) =="
 go test -race -count=1 ./internal/taskengine ./internal/middleware ./cmd/...
+go test -race -timeout=10m -count=1 -run 'Test_Lookup_concurrent_with_Reload|TestRecordDownloadIntegrity_|TestScrapeRateLimitBlocks_|TestTrustedProxyDegradation_|TestApplyConfigWithOptions_callsIPListGCOnlyAfterSuccessfulApply|TestInitTaskEngine_|TestStartRoleReconciler_|Test_GetSetIP2RegionVersion_roundtrip' ./internal/services
 
-echo "== frontend tests/typecheck/build =="
-# 单一入口 npm run build = test + typecheck:src + typecheck:test + vite build。
+echo "== frontend coverage/tests/typecheck/build =="
+# 单一入口 npm run build = test:coverage + typecheck:src + typecheck:test + vite build。
 # 此前拆跑 npm test + typecheck:test + build:vite，漏掉更严的 typecheck:src
 # （src 基线 tsconfig.json 与测试基线的 lib 阈值不同：用 ES2021+ lib API 时
 # 本门绿、npm run build 红）。vue-tsc 看不到模板编译期错误，发布契约要求
 # 真实 vite build，故整条 build 链都在门内。
+#
+# test:coverage 用 node 内建门限（实测水位 90.5/93.5/96.1 → 阈值 89/92/95，
+# 留出重组/新增分支的余量）：可见口径的覆盖率没有门限时只能靠人工审查发现
+# 静默下滑，前轮遗留的「无覆盖率门禁」由此收口。纯 `npm test` 仍保留为快速环。
 (cd web && npm run build)
 
 echo "all verification gates passed"

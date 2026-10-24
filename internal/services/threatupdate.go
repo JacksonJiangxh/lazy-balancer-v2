@@ -468,7 +468,7 @@ func (m *ThreatUpdateManager) runWithContext(runCtx context.Context, trigger str
 	// 更新永久静默停摆。demote/导入排空/进程停止的取消不推进（引擎侧同样不
 	// 消费槽，恢复后到期轮补跑）。
 	if cancelled && userCancelledRun(runCtx) {
-		advanceSourceSlotsAfterUserCancel("security_threat_sources", trigger, threatNextSlot)
+		advanceSourceSlotsAfterUserCancel("security_threat_sources", trigger, threatSourceRegistryNames(), threatNextSlotStrict)
 	}
 	m.mu.Lock()
 	m.lastFinishedAt = time.Now().UTC().Format(crsTimeLayout)
@@ -727,6 +727,13 @@ func (m *ThreatUpdateManager) updateOneSource(ctx context.Context, source threat
 	}
 	// 聚合归一后写内置名单（内容未变化零写入——不重载、不 bump 集群版本）。
 	merged := wafiplist.AggregateIPEntries(entries)
+	// 条数塌缩门先于写盘：解析率/上限只约束「合法行占比」与绝对值，无法发现
+	// 「每行都合法但整体只剩几十条」的自洽短名单替换（上游错页/劫持）。
+	if gerr := threatEntryShrinkGuard(source.id, len(merged)); gerr != nil {
+		failSourceRow(source.id, finished, gerr, trigger)
+		AppendThreatUpdateLog("ERROR", "failed", fmt.Sprintf("源 %s 更新失败: %v", source.name, gerr))
+		return false, true
+	}
 	changed, werr := writeThreatSystemList(source.name, merged)
 	if werr != nil {
 		failSourceRow(source.id, finished, fmt.Errorf("写入内置名单失败: %w", werr), trigger)
@@ -779,7 +786,8 @@ func threatWriteGateAbort(source string, gerr error) (bool, bool) {
 // 返回成功状态落库错误（吞错会让任务终态 success 掩盖状态机不闭环）。
 func markSourceSuccess(id int, entryCount int, finished string, trigger string, rawHash ...string) error {
 	version := time.Now().UTC().Format("2006.01.02")
-	next := threatNextSlot(time.Now().UTC())
+	// 排程不可读时槽片段为 no-op（保留旧预约），其余状态列照常落库。
+	slotSQL, slotArgs := threatSlotSuccessAssign(trigger)
 	// entry_count 的唯一口径是**聚合后**条数（writeThreatSystemList 的
 	// len(merged)，与内置名单 .iplist 行数一致）。entryCount<0 = 内容未变化
 	// 快路径：不覆写该列（源行已是上次聚合后值；用本次原始解析条数覆盖会让
@@ -788,17 +796,18 @@ func markSourceSuccess(id int, entryCount int, finished string, trigger string, 
 	if entryCount < 0 {
 		entrySet, entryArgs = "", nil
 	}
+	baseArgs := append(append([]any{}, entryArgs...), version, finished)
 	if len(rawHash) > 0 {
-		args := append(append([]any{}, entryArgs...), version, finished, trigger, trigger, next, rawHash[0], id)
-		if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_status='success', message='', `+entrySet+`version=?, finished_at=?, `+threatSlotSuccessSQL+`, consecutive_failures=0, raw_hash=?, updated_at=datetime('now') WHERE id=?`,
+		args := append(append(append([]any{}, baseArgs...), slotArgs...), rawHash[0], id)
+		if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_status='success', message='', `+entrySet+`version=?, finished_at=?, `+slotSQL+`, consecutive_failures=0, raw_hash=?, updated_at=datetime('now') WHERE id=?`,
 			args...); err != nil {
 			Logf("error", "威胁情报库: 更新源成功状态失败: %v", err)
 			return err
 		}
 	} else {
 		// raw_hash 缺省（快路径内容未变）不覆写该列。
-		args := append(append([]any{}, entryArgs...), version, finished, trigger, trigger, next, id)
-		if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_status='success', message='', `+entrySet+`version=?, finished_at=?, `+threatSlotSuccessSQL+`, consecutive_failures=0, updated_at=datetime('now') WHERE id=?`,
+		args := append(append(append([]any{}, baseArgs...), slotArgs...), id)
+		if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_status='success', message='', `+entrySet+`version=?, finished_at=?, `+slotSQL+`, consecutive_failures=0, updated_at=datetime('now') WHERE id=?`,
 			args...); err != nil {
 			Logf("error", "威胁情报库: 更新源成功状态失败: %v", err)
 			return err
@@ -816,6 +825,28 @@ func markSourceSuccess(id int, entryCount int, finished string, trigger string, 
 	} else {
 		Logf("info", "威胁情报库: 源 %s 更新成功（内容未变化，版本 %s）", name, version)
 		AppendThreatUpdateLog("INFO", "success", fmt.Sprintf("源 %s 更新成功（内容未变化，版本 %s）", name, version))
+	}
+	return nil
+}
+
+// threatEntryShrinkGuard 条数塌缩门（与爬虫快照收缩门同口径）：新聚合名单
+// 条数较当前快照收缩超过一半时拒绝写入、保留上次快照——解析率只保证「合法行
+// 占比」，一个每行都是合法 CIDR 但只剩数十条的短名单可通过全部门禁并把
+// 万余条内置威胁名单整体替换（静默削弱拦截）。
+// 基线=security_threat_sources.entry_count（聚合后口径，与内置名单 .iplist
+// 行数一致）；基线缺失或 <2（首装/升级引导）放行。基线读取失败按失败处理
+// （保留上次快照，方向安全）。
+func threatEntryShrinkGuard(sourceID int, newCount int) error {
+	var baseline int
+	err := db.DB.QueryRow(`SELECT COALESCE(entry_count,0) FROM security_threat_sources WHERE id=?`, sourceID).Scan(&baseline)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("读取威胁名单基线失败: %w", err)
+	}
+	if baseline >= 2 && newCount*2 < baseline {
+		return fmt.Errorf("解析条数 %d 较当前快照 %d 收缩超过一半（疑似错误页/劫持），保留上次快照；如确认上游名单合法重构，需人工清理该源的条数基线后重试", newCount, baseline)
 	}
 	return nil
 }
@@ -926,9 +957,10 @@ func failSourceRow(id int, finished string, cause error, trigger string) {
 	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET consecutive_failures=consecutive_failures+1 WHERE id=?`, id); err != nil {
 		Logf("error", "威胁情报库: 失败计数更新失败: %v", err)
 	}
-	next := threatNextSlot(time.Now().UTC())
-	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_status='failed', message=?, finished_at=?, `+threatSlotAdvanceSQL+`, updated_at=datetime('now') WHERE id=?`,
-		cause.Error(), finished, trigger, next, id); err != nil {
+	slotSQL, slotArgs := threatSlotAdvanceAssign(trigger)
+	args := append(append([]any{cause.Error(), finished}, slotArgs...), id)
+	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_status='failed', message=?, finished_at=?, `+slotSQL+`, updated_at=datetime('now') WHERE id=?`,
+		args...); err != nil {
 		Logf("error", "威胁情报库: 失败状态落库失败: %v", err)
 	}
 	Logf("warn", "威胁情报库: 源更新失败: %v", cause)

@@ -15,7 +15,7 @@ import {
   settingsTabConsumesConfig,
   settingsTabOfPage,
 } from '../src/utils/settingsPages.ts'
-import { code, source } from './_helpers.ts'
+import { code } from './_helpers.ts'
 
 test('分页清单：页键 ↔ 页头标题/描述一一对应（可见文案即契约）', () => {
   assert.deepEqual([...SETTINGS_TAB_IDS], ['basic', 'cluster', 'certificates', 'apikeys', 'tasks'])
@@ -67,7 +67,7 @@ test('分页是否消费 /config：仅基础设置与免费证书（配置失败
     assert.equal(settingsTabConsumesConfig(tab), false, `${tab} 不读 /config`)
   }
   // 接线：Settings.vue 的失败横幅由该判据门控，不是无条件渲染
-  const settings = source('src/views/Settings.vue')
+  const settings = code('src/views/Settings.vue')
   assert.match(settings, /configBannerVisible = computed\(\(\) => configLoadFailed\.value && settingsTabConsumesConfig\(activeTab\.value\)\)/)
   assert.match(settings, /<el-alert v-if="configBannerVisible"/)
 })

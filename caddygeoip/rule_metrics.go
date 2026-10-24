@@ -59,6 +59,11 @@ func (h *RuleMetricsHandler) Provision(ctx caddy.Context) error {
 	if reg == nil {
 		return nil
 	}
+	// 已知有界残留（不就地修）：label 子序列随规则删除/改名永久驻留
+	// （全仓无 DeleteLabelValues）——逐实例删除不可行：Cleanup 在 reload 时
+	// 对存活实例同样被调用，删除会把存活规则计数清零。根治需根服务按
+	// 「新配置规则集 − 旧集合」reconcile（跨 module，暂不立项）。残留规模有界
+	// （每规则 4+1+5 条序列），进程重启归零，按文档化残留接受。
 	h.requestsTotal = registerOrExisting(reg, prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "lazybalancer", Name: "requests_total",
 		Help: "Total requests per load balancer rule.",

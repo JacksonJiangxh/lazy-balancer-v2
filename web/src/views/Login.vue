@@ -246,6 +246,13 @@ watch([mfaStage, mfaUseRecovery], async ([stage, useRecovery]) => {
   }
 })
 
+// 通道切换（验证码 ⇄ 恢复代码）即清空上一通道的输入与错误：
+// 输错后输入框残留同一串错误码，用户回车会重复提交同一失败值。
+watch(mfaUseRecovery, () => {
+  mfaCode.value = ''
+  error.value = ''
+})
+
 const resetToPasswordStep = () => {
   mfaStage.value = false
   mfaToken.value = ''
@@ -265,6 +272,9 @@ const handleMfaVerify = async () => {
     // store 重入护栏命中（请求未发出）——显式提示而非静默无事发生。
     if (result.skipped) error.value = '登录请求进行中，请稍候'
   } catch (caught: unknown) {
+    // 失败即清空验证码（watch 已自动 refocus）：残留同一串错误码会让
+    // 用户回车重复提交同一失败值。
+    mfaCode.value = ''
     error.value = errorMessage(caught, '验证失败，请重试')
   } finally {
     loading.value = false
@@ -310,7 +320,10 @@ onMounted(async () => {
 })
 const goOIDCLogin = () => {
   oidcRedirecting.value = true
-  const returnTo = encodeURIComponent('/')
+  // 深链保持：登录前停留的页面键（首屏 ?page= 已由 auth store 消费进
+  // currentPage）随 return_to 回跳；后端只放行站内相对路径，App 侧再按
+  // isPageId 白名单兜底（未知值回 dashboard）。
+  const returnTo = encodeURIComponent(`/${authStore.currentPage}`)
   window.location.href = `/api/v1/auth/oidc/login?return_to=${returnTo}`
 }
 // IdP 侧「返回」经 bfcache 恢复时 JS 状态保留——复位跳转锁,防 SSO
@@ -369,12 +382,6 @@ const handleSetup = async () => {
         password: setupForm.password,
         display_name: setupForm.display_name,
       }, { silent: true })
-      const loginResult = await authStore.login(setupForm.username, setupForm.password)
-      // 管理员已创建但登录被重入护栏跳过（防御路径）——切回登录表单提示手动登录。
-      if (loginResult.skipped) {
-        setupMode.value = false
-        error.value = '管理员已创建，请登录'
-      }
     } catch (caught: unknown) {
       // 403 = 提交期间系统已被另一路径初始化——复探状态并切换
       // 登录表单（后端文案即指引），而非停在 setup 表单要求手动刷新。
@@ -391,6 +398,18 @@ const handleSetup = async () => {
       } else {
         error.value = errorMessage(caught, '创建管理员失败，请稍后重试')
       }
+      loading.value = false
+      return
+    }
+    // 创建已成功：后续自动登录是独立阶段，其失败不得报成「创建管理员失败」
+    // （管理员实际已创建，重填提交只会得到 403 并让用户重输密码）。
+    setupMode.value = false
+    try {
+      const loginResult = await authStore.login(setupForm.username, setupForm.password)
+      // 管理员已创建但登录被重入护栏跳过（防御路径）——切回登录表单提示手动登录。
+      if (loginResult.skipped) error.value = '管理员已创建，请登录'
+    } catch (caught: unknown) {
+      error.value = `管理员已创建，请手动登录（自动登录失败：${errorMessage(caught, '请重试')}）`
     } finally {
       loading.value = false
     }

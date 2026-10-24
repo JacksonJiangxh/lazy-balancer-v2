@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/services"
 
 	"github.com/gin-gonic/gin"
 )
@@ -109,6 +110,9 @@ func TestGuardConfiguredJSONBody_nilDBFallsBack(t *testing.T) {
 // 本用例只钉「值越界」这一此前完全静默的分支。
 func TestConfiguredRequestBodyBytes_outOfRangeFallbackIsLogged(t *testing.T) {
 	setupAuthTestDB(t)
+	const stateKey = "request-body-max-size-out-of-range"
+	services.ResetLogStateTransitionForTest(stateKey)
+	t.Cleanup(func() { services.ResetLogStateTransitionForTest(stateKey) })
 	if _, err := db.DB.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, request_body_max_size_mb INTEGER); INSERT INTO global_config VALUES (1, 99999)`); err != nil {
 		t.Fatalf("create global config: %v", err)
 	}
@@ -123,9 +127,10 @@ func TestConfiguredRequestBodyBytes_outOfRangeFallbackIsLogged(t *testing.T) {
 			t.Fatalf("越界回退=%d, want 128MB", got)
 		}
 	}
-	// Then：只首报一条（状态转换去重，不随轮询刷屏）。
-	if got := strings.Count(logs.String(), "request_body_max_size_mb=99999"); got > 1 {
-		t.Fatalf("越界留痕 %d 条, want ≤1（状态转换去重）: %q", got, logs.String())
+	// Then：恰首报一条（状态转换去重，不随轮询刷屏；0 条同样不合格——
+	// 「>1 才失败」的写法会让静默回退通过）。
+	if got := strings.Count(logs.String(), "request_body_max_size_mb=99999"); got != 1 {
+		t.Fatalf("越界留痕 %d 条, want 恰 1（状态转换去重）: %q", got, logs.String())
 	}
 
 	// When：配置恢复合法值。

@@ -13,7 +13,7 @@
 export const MAX_LOG_STAT_KEYS = 500
 export const OTHER_LOG_STAT_KEY = '其他'
 
-export type LogStatBucket = 'ip' | 'ua' | 'uri'
+type LogStatBucket = 'ip' | 'ua' | 'uri'
 
 export interface LogStatBuckets {
   ip: Record<string, number>

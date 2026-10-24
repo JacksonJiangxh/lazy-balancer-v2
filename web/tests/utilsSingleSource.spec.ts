@@ -10,17 +10,20 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { code, registerModuleHooks, repoSource, section, source } from './_helpers.ts'
+import { code, registerModuleHooks, repoCode, section } from './_helpers.ts'
+import type * as BrandingModule from '../src/utils/branding.ts'
 import { STUB_API } from './_stubs.ts'
 import { DEFAULT_ACCESS_LOG_FORMAT } from '../src/utils/caddyDefaults.ts'
 import { escapeHtml } from '../src/utils/escape.ts'
+import { formatBytes } from '../src/utils/formatBytes.ts'
+import { ingestionWarningMessage } from '../src/utils/ingestionHealth.ts'
 
 const g = globalThis as unknown as { __gets: unknown[]; __get: (url: string, config?: unknown) => Promise<unknown> }
 g.__gets = []
 registerModuleHooks({ '@/utils/api': STUB_API })
 
 test('默认访问日志格式末行与后端脱敏注入行逐字一致（跨栈钉）', () => {
-  const go = repoSource('internal/handlers/caddy.go')
+  const go = repoCode('internal/handlers/caddy.go')
   const constBlock = section(go, 'const accessLogRedactionLine', '\n')
   const match = constBlock.match(/accessLogRedactionLine = "([^"]+)"/)
   assert.ok(match, '后端 accessLogRedactionLine 常量缺失')
@@ -28,7 +31,7 @@ test('默认访问日志格式末行与后端脱敏注入行逐字一致（跨�
   assert.equal(lines[lines.length - 1], match[1], '模板末行必须等于后端强制注入的脱敏行')
   // db.go 迁移补齐同一行（既有格式升级路径同源）：迁移以「路径 + " -> delete"」
   // 组合出规范行，路径常量必须与模板末行同值。
-  const db = repoSource('internal/db/db.go')
+  const db = repoCode('internal/db/db.go')
   assert.match(db, /const apiKeyPath = "request>headers>X-API-Key"/, 'db.go 迁移的脱敏路径常量漂移')
   assert.match(db, /apiKeyPath\+\s*" -> delete"/, 'db.go 迁移必须追加 delete 动作（与模板末行同形）')
   // 第三处（匹配/移除侧）：normalizeAccessLogRedaction 用独立 `path` 常量决定
@@ -47,15 +50,24 @@ test('escapeHtml 覆盖五个 HTML 危险字符（含引号属性上下文）', 
 })
 
 test('highlight 的 Prism 异常兜底必须转义（注入面不得回退原文）', () => {
-  const highlight = source('src/utils/highlight.ts')
+  const highlight = code('src/utils/highlight.ts')
   const catchBlock = section(highlight, '} catch {', '\n  }\n}')
   assert.match(catchBlock, /return escapeHtml\(content\)/, '兜底必须走共享 escapeHtml，不得返回原文')
 })
 
+// 品牌状态（appName/footerText/footerUsesDefault）是模块单例：两个用例各自
+// 加载独立实例（查询串区分），否则「默认态」断言隐含依赖文件内用例执行顺序。
+const freshBranding = (tag: string): Promise<typeof BrandingModule> =>
+  import(`../src/utils/branding.ts?case=${tag}`)
+
+// 默认页脚文案以生产常量为准（含版权年份）——用例里再抄一份年份会随发版
+// 漂移，且抄来的年份与被测值同源即失去鉴别力。
+const brandingSource = code('src/utils/branding.ts')
+const defaultFooterText = brandingSource.match(/const footerText = ref\('([^']*)'\)/)?.[1]
+
 test('branding 预取失败：静默回落默认页脚与默认标题，不抛给调用方', async (t) => {
   // /branding 是装饰性预取：失败时页脚/标题保持默认（不得弹全局错误 toast）。
-  // 本用例先于成功路径执行，模块仍是初始状态（默认文案 + footerUsesDefault=true）。
-  const branding = await import('../src/utils/branding.ts')
+  const branding = await freshBranding('prefetch-fail')
   const host = globalThis as { document?: unknown }
   const previousDocument = host.document
   const documentStub = { title: '' }
@@ -71,8 +83,9 @@ test('branding 预取失败：静默回落默认页脚与默认标题，不抛�
   }
   await branding.loadBranding()
   assert.deepEqual(seenConfig, { silent: true }, '装饰性预取必须 silent——失败不得弹全局错误提示')
+  assert.ok(defaultFooterText, '生产默认页脚文案必须可从源码解析')
+  assert.ok(branding.footerHtml.value.startsWith(defaultFooterText), `失败后必须是默认页脚文案（期望以 ${defaultFooterText} 开头）`)
   assert.match(branding.footerHtml.value, /class="footer-link"/, '失败后仍是默认页脚（带仓库链接）')
-  assert.match(branding.footerHtml.value, /Copyright © 2026 XiaoBao/)
   assert.equal(branding.appName.value, 'Lazy Balancer', '失败后产品名保持默认')
   assert.equal(documentStub.title, 'Lazy Balancer V2', '失败后标题仍写默认产品名')
 })
@@ -93,7 +106,7 @@ test('displayThreatScreenMode：仅 globe 保留，其余（含缺失/未知库�
 test('branding.footerHtml：默认加 GitHub 链接、自定义仅转义文本', async (t) => {
   // 先加载模块（vue runtime-dom 在无 document 时初始化），再注入 host——先注入
   // 半成品 document 会让 runtime-dom 的探测代码调用不存在的 createElement。
-  const branding = await import('../src/utils/branding.ts')
+  const branding = await freshBranding('footer-branches')
   const host = globalThis as { document?: unknown }
   const previousDocument = host.document
   const documentStub = { title: '' }
@@ -118,4 +131,136 @@ test('branding.footerHtml：默认加 GitHub 链接、自定义仅转义文本',
   assert.equal(customHtml, '&lt;b&gt;x &amp; y&lt;/b&gt;')
   assert.doesNotMatch(customHtml, /footer-link/, '自定义页脚不得追加 GitHub 链接')
   assert.equal(documentStub.title, 'Corp V2')
+})
+
+// 字节格式化此前有两份实现：api.ts 的 formatBytes（两位小数、到 TB）与
+// ingestionHealth 的私有 humanBytes（一位小数、到 GB）——同一份 1,500,000
+// 字节在日志占用条与采集告警里显示 1.43 MB / 1.5 MB。实现下沉到零依赖
+// utils/formatBytes，所有展示点共用。
+test('字节格式化单源：精度/量级与跨调用点一致性', () => {
+  assert.equal(formatBytes(0), '0 B')
+  assert.equal(formatBytes(-1), '0 B', '负值/非法同零值口径')
+  assert.equal(formatBytes(Number.NaN), '0 B')
+  assert.equal(formatBytes(512), '512 B')
+  assert.equal(formatBytes(1024), '1 KB', '整值不补小数位（parseFloat 去尾零）')
+  assert.equal(formatBytes(1_500_000), '1.43 MB')
+  assert.equal(formatBytes(1024 ** 3), '1 GB')
+  assert.equal(formatBytes(1024 ** 4), '1 TB')
+  assert.equal(formatBytes(1024 ** 5), '1024 TB', '量级上限到 TB（不再自造更大单位）')
+
+  // 跨调用点：采集健康位的丢失体量必须与同一函数同精度（不得再有一份私有实现）
+  const skipped = ingestionWarningMessage({
+    observed: true,
+    healthy: false,
+    consecutive_failures: 0,
+    skipped_regions: 2,
+    skipped_bytes: 1_500_000,
+  })
+  assert.ok(skipped.includes(`累计 ${formatBytes(1_500_000)}`), '摄取告警必须复用 formatBytes 的精度')
+})
+
+test('字节格式化不得再有第二份实现（api.ts / ingestionHealth 只消费单源）', () => {
+  assert.doesNotMatch(code('src/utils/api.ts'), /function formatBytes/, 'api.ts 不再持有实现')
+  assert.doesNotMatch(code('src/utils/ingestionHealth.ts'), /function humanBytes/, '摄取健康位不再私有实现')
+  assert.match(code('src/utils/ingestionHealth.ts'), /import \{ formatBytes as humanBytes \} from '\.\/formatBytes\.ts'/)
+  // 视图/组件一律从 utils/formatBytes 取（api.ts 会拖入 axios/element-plus 依赖链）
+  for (const file of [
+    'src/components/LogStorageBar.vue',
+    'src/views/Dashboard.vue',
+    'src/views/settings/BasicSettings.vue',
+    'src/views/security/SecurityRules.vue',
+    'src/views/security/SecurityBlockPages.vue',
+  ]) {
+    assert.match(code(file), /import \{ formatBytes \} from '@\/utils\/formatBytes'/, `${file} 必须引用字节格式化单源`)
+    assert.doesNotMatch(code(file), /formatBytes[^,\n]*\}\s*from '@\/utils\/api'/, `${file} 不得再从 api.ts 取 formatBytes`)
+  }
+})
+
+// 导出面 = 消费面：只有定义处使用的常量/类型不得挂 export（零消费导出会诱导
+// 外部直接构造内部形状，且删改时误以为有契约）。此处把已收敛的清单钉成回归
+// 守卫——新增零消费导出由评审按同一口径处理，不由本清单自动扩展。
+test('零外部消费的符号不得再导出（导出面 = 消费面）', () => {
+  const cases: Array<[string, string]> = [
+    ['src/utils/settingsPages.ts', 'SETTINGS_TABS_CONSUMING_CONFIG'],
+    ['src/utils/certJobColumns.ts', 'CERT_JOB_COLUMN_HIDE_ORDER'],
+    ['src/utils/adminTlsGate.ts', 'AdminTlsStoredCertState'],
+    ['src/utils/adminTlsGate.ts', 'AdminTlsDialogCertState'],
+    ['src/utils/apiFailure.ts', 'AuthFailureKind'],
+    ['src/utils/apiFailure.ts', 'AuthFailureInput'],
+    ['src/utils/apiFailure.ts', 'MfaStepUpCoordinator'],
+    ['src/utils/apiFailure.ts', 'MfaGraceNoticeHandle'],
+    ['src/utils/apiFailure.ts', 'MfaGraceTracker'],
+    ['src/utils/apiKeyWhitelist.ts', 'SerializedWhitelist'],
+    ['src/utils/auditLogFilters.ts', 'AuditLogFilterState'],
+    ['src/utils/autobanStatus.ts', 'AutobanEffectivenessView'],
+    ['src/utils/bulkApplyResult.ts', 'BulkResponseLike'],
+    ['src/utils/caddyConfigPayload.ts', 'CaddyAccessLogSettings'],
+    ['src/utils/caddyConfigPayload.ts', 'CaddyConfigPayload'],
+    ['src/utils/certJobExpiry.ts', 'CertJobExpiryFields'],
+    ['src/utils/certQueue.ts', 'CertQueueCounts'],
+    ['src/utils/clusterSyncSwitches.ts', 'ClusterSyncSwitch'],
+    ['src/utils/clusterUrl.ts', 'ClusterUrlValidationOptions'],
+    ['src/utils/clusterWriteGate.ts', 'ClusterWriteGateInput'],
+    ['src/utils/configValues.ts', 'ThreatScreenMode'],
+    ['src/utils/importFailure.ts', 'ImportFailureReport'],
+    ['src/utils/importPreview.ts', 'ImportPreviewResult'],
+    ['src/utils/importPreview.ts', 'ImportPreviewSessionOptions'],
+    ['src/utils/lazyOnce.ts', 'LazyLoader'],
+    ['src/utils/logStatCap.ts', 'LogStatBucket'],
+    ['src/utils/policyPayload.ts', 'PolicyPayload'],
+    ['src/utils/rateLimitBlocks.ts', 'RateLimitBlockHost'],
+    ['src/utils/ruleWizard.ts', 'StageBlockPageOverrideState'],
+    ['src/utils/securityLibraries.ts', 'LibraryTagType'],
+    ['src/utils/securityLibraries.ts', 'LibrarySummary'],
+    ['src/utils/securityLibraries.ts', 'LibraryHealthTag'],
+    ['src/utils/securityStages.ts', 'RuleStagePages'],
+    ['src/utils/securityStages.ts', 'StageRow'],
+    ['src/utils/securityStages.ts', 'StageDetailEntry'],
+    ['src/utils/securityStages.ts', 'StageCustomRuleDetail'],
+    ['src/utils/securityStages.ts', 'StagePolicyDetails'],
+    ['src/utils/securityStages.ts', 'CrsFilenameInfo'],
+    ['src/utils/securityStages.ts', 'StageOverride'],
+    ['src/utils/securityStages.ts', 'TrustHitMode'],
+    ['src/utils/securityStages.ts', 'EventDetailRefScope'],
+    ['src/utils/securityStages.ts', 'BlockPageEffective'],
+    ['src/utils/securityStages.ts', 'BlockPageStageCapability'],
+    ['src/utils/sessionSingleFlight.ts', 'SessionSingleFlightOptions'],
+    ['src/utils/siteLocation.ts', 'SiteLocationChoice'],
+    ['src/utils/siteLocation.ts', 'NodeSiteFormValue'],
+    ['src/utils/strategyLabels.ts', 'StrategyCardOption'],
+    ['src/utils/threatFlowRules.ts', 'AdaptiveSampleState'],
+    ['src/utils/threatFlowRules.ts', 'AdaptiveSampleOutcome'],
+    ['src/utils/threatFlowRules.ts', 'FlowArcPlan'],
+    ['src/utils/threatFlowRules.ts', 'FlowArcGroupLike'],
+    ['src/utils/threatFlowRules.ts', 'FlowEventPlanInput'],
+    ['src/utils/threatGlobe.ts', 'DotLatLng'],
+    ['src/utils/threatProjection.ts', 'SpherePickCamera'],
+    ['src/utils/threatScene.ts', 'HoverLayerTransform'],
+    ['src/utils/threatScreenMetrics.ts', 'TrafficDeltaResult'],
+    ['src/utils/threatShared.ts', 'PolysBounds'],
+    ['src/utils/threatShared.ts', 'ProvinceGridDot'],
+    ['src/utils/triggeredFilter.ts', 'TriggeredCategory'],
+    ['src/utils/trustRemoval.ts', 'TrustRemovalList'],
+    ['src/utils/trustRemoval.ts', 'TrustRemovalPlan'],
+    ['src/utils/trustedProxyRanges.ts', 'TrustedProxyExpansion'],
+    ['src/utils/updaterName.ts', 'UpdaterUserLike'],
+  ]
+  for (const [file, symbol] of cases) {
+    const text = code(file)
+    assert.doesNotMatch(
+      text,
+      new RegExp(`export\\s+(?:const|type|interface)\\s+${symbol}\\b`),
+      `${file} 的 ${symbol} 零外部消费，不得对外导出`,
+    )
+    assert.match(text, new RegExp(`(?:^|\\n)(?:const|type|interface)\\s+${symbol}\\b`), `${symbol} 仍须在本模块内定义`)
+  }
+})
+
+// CRS 规则索引响应里后端还带 version，但前端零读：声明不消费的字段会诱导
+// 调用方以为这是版本数据源（版本展示走 /security/crs/status 的独立字段）。
+test('CRS 规则索引响应类型只声明消费面（version 不再声明）', () => {
+  const src = code('src/composables/useCrsRuleIndex.ts')
+  const data = section(src, 'interface CrsRuleIndexData {', '\n}')
+  assert.match(data, /rules: CrsRuleIndexEntry\[\]/)
+  assert.doesNotMatch(data, /\bversion\b/, '零消费字段不得留在响应类型里')
 })

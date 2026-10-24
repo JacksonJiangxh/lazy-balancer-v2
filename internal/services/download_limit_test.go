@@ -59,17 +59,22 @@ func TestWriteRuleSetDownload_limitsDownloadSize(t *testing.T) {
 
 // TestRuleSetDownloadSizeCap_isSet verifies the production cap constant is wired
 // to both download paths (a zero cap would reject every download).
+// 期望值硬编码：只断 >0 时上限被改成任意值（含误设成 1 字节）也通过。
 func TestRuleSetDownloadSizeCap_isSet(t *testing.T) {
-	if ruleSetDownloadSizeCap <= 0 {
-		t.Fatalf("ruleSetDownloadSizeCap = %d, want > 0", ruleSetDownloadSizeCap)
+	if got, want := ruleSetDownloadSizeCap, int64(2<<30); got != want {
+		t.Fatalf("ruleSetDownloadSizeCap = %d, want %d（2GiB 规则库 tarball 上限）", got, want)
 	}
 }
 
 // 爬虫源响应体上限按格式分档：JSON 源解进 any 树再递归遍历，结构放大远高于
 // 文本，故收在 2MiB；HTML/纯文本源保持 16MiB（不得误伤大页面）。
 func TestCrawlerFetchBody_formatAwareCaps(t *testing.T) {
-	if crawlerJSONBodyCap <= 0 || crawlerJSONBodyCap >= crawlerBodyCap {
-		t.Fatalf("JSON 上限=%d，必须 >0 且小于通用上限 %d", crawlerJSONBodyCap, crawlerBodyCap)
+	// 数值硬编码（序关系只保证「小 < 大」，两个上限同时被腰斩仍绿）。
+	if got, want := crawlerJSONBodyCap, int64(2<<20); got != want {
+		t.Fatalf("crawlerJSONBodyCap = %d, want %d（JSON 结构放大护栏）", got, want)
+	}
+	if got, want := crawlerBodyCap, int64(16<<20); got != want {
+		t.Fatalf("crawlerBodyCap = %d, want %d（HTML/纯文本通用上限）", got, want)
 	}
 	serve := func(body []byte) *httptest.Server {
 		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

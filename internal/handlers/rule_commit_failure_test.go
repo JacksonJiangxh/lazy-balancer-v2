@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -45,18 +46,51 @@ func TestRuleEndpoints_commitFailureBranchesRecordAudit(t *testing.T) {
 		if fn == nil {
 			t.Fatalf("rules.go 缺少函数 %s", funcName)
 		}
-		branches := txCommitFailureBranches(fset, fn)
+		branches := txCommitFailureBranches(fn)
 		if len(branches) != 1 {
 			t.Fatalf("%s 的 tx.Commit 失败分支=%d, want 1", funcName, len(branches))
 		}
 		branch := branches[0]
-		for _, want := range []string{"recordAudit(c,", `"` + verb + `"`, `"负载规则"`, "commitUncertainLabel"} {
-			if !strings.Contains(branch, want) {
-				t.Fatalf("%s 的提交失败分支缺少 %q（Explicit 策略下该场景将零审计）:\n%s", funcName, want, branch)
-			}
+		// 审计调用按 AST 实参归属断言：子串匹配会被注释里的同名片段或别处的
+		// 同名字面量满足（漏一处审计照样绿），实参位置则必须真的出现在这次
+		// recordAudit 调用里。
+		audits := branchCalls(branch, "recordAudit")
+		if len(audits) != 1 {
+			t.Fatalf("%s 的提交失败分支 recordAudit 调用=%d, want 1（Explicit 策略下该场景将零审计）", funcName, len(audits))
 		}
-		if !strings.Contains(branch, "services.Logf(") {
-			t.Fatalf("%s 的提交失败分支缺少服务端日志:\n%s", funcName, branch)
+		if got := len(audits[0].Args); got != 4 {
+			t.Fatalf("%s recordAudit 实参=%d, want 4（c/动词/资源/详情）:\n%s", funcName, got, exprText(fset, audits[0]))
+		}
+		if got := literalString(audits[0].Args[1]); got != verb {
+			t.Fatalf("%s recordAudit 动作实参=%q, want %q", funcName, got, verb)
+		}
+		if got := literalString(audits[0].Args[2]); got != "负载规则" {
+			t.Fatalf("%s recordAudit 资源实参=%q, want 负载规则", funcName, got)
+		}
+		// 详情必须点明「提交结果不确定」，否则事后判读会把已提交与未提交混为一谈。
+		// 两种写法都合法：直接引用单源标签，或经本分支局部变量中转（DeleteRule
+		// 收敛为 detail := 前缀 + 恢复失败补充）。
+		if detail := exprText(fset, audits[0].Args[3]); !detailMentionsCommitUncertain(fset, branch, detail) {
+			t.Fatalf("%s 审计详情既未引用 commitUncertainLabel，也未引用由其派生的局部变量:\n%s", funcName, detail)
+		}
+
+		logs := branchCalls(branch, "Logf")
+		if len(logs) == 0 {
+			t.Fatalf("%s 的提交失败分支缺少服务端日志", funcName)
+		}
+		// 日志级别与格式串都是实参：改级别、改成空格式都要被判红。
+		for _, call := range logs {
+			if len(call.Args) < 2 {
+				t.Fatalf("%s 的 Logf 实参不足:\n%s", funcName, exprText(fset, call))
+			}
+			switch level := literalString(call.Args[0]); level {
+			case "error", "warn", "info":
+			default:
+				t.Fatalf("%s 的 Logf 级别=%q, want error/warn/info", funcName, level)
+			}
+			if format := literalString(call.Args[1]); !strings.Contains(format, "commit") && !strings.Contains(format, "恢复") {
+				t.Fatalf("%s 的 Logf 格式串=%q 未点明提交/恢复失败", funcName, format)
+			}
 		}
 	}
 }
@@ -77,15 +111,21 @@ func TestCreateRule_commitFailureCertCleanupIsConditional(t *testing.T) {
 	if fn == nil {
 		t.Fatal("rules.go 缺少 CreateRule")
 	}
-	branches := txCommitFailureBranches(fset, fn)
+	branches := txCommitFailureBranches(fn)
 	if len(branches) != 1 {
 		t.Fatalf("CreateRule 的 tx.Commit 失败分支=%d, want 1", len(branches))
 	}
-	if !strings.Contains(branches[0], "cleanupUncommittedRuleCertsAfterCommitFailure") {
-		t.Fatalf("CreateRule 提交失败分支必须经存在性判定清理证书:\n%s", branches[0])
+	// 按 AST 调用归属断言：`services.RemoveCertFiles` 只出现在注释或字符串里也
+	// 必须判红/绿分明——这里看的是真实调用表达式。
+	cleanups := branchCalls(branches[0], "cleanupUncommittedRuleCertsAfterCommitFailure")
+	if len(cleanups) != 1 {
+		t.Fatalf("CreateRule 提交失败分支必须恰有一次存在性判定的证书清理调用, got %d:\n%s", len(cleanups), exprText(fset, branches[0]))
 	}
-	if strings.Contains(branches[0], "services.RemoveCertFiles") {
-		t.Fatalf("CreateRule 提交失败分支不得无条件删除证书文件:\n%s", branches[0])
+	if got := len(cleanups[0].Args); got != 1 {
+		t.Fatalf("证书清理调用实参=%d, want 1（caddyID）", got)
+	}
+	if len(branchCalls(branches[0], "RemoveCertFiles")) != 0 {
+		t.Fatalf("CreateRule 提交失败分支不得无条件删除证书文件:\n%s", exprText(fset, branches[0]))
 	}
 }
 
@@ -182,9 +222,9 @@ func findFuncDecl(file *ast.File, name string) *ast.FuncDecl {
 }
 
 // txCommitFailureBranches 返回函数体内全部 `tx.Commit(); err != nil` 分支体
-// 的源码文本（按出现顺序）。
-func txCommitFailureBranches(fset *token.FileSet, fn *ast.FuncDecl) []string {
-	var branches []string
+// （AST 块，按出现顺序）——实参归属断言直接读节点，不经过源码文本。
+func txCommitFailureBranches(fn *ast.FuncDecl) []*ast.BlockStmt {
+	var branches []*ast.BlockStmt
 	if fn.Body == nil {
 		return branches
 	}
@@ -193,14 +233,82 @@ func txCommitFailureBranches(fset *token.FileSet, fn *ast.FuncDecl) []string {
 		if !ok || !isTxCommitFailureIf(ifStmt) {
 			return true
 		}
-		var buf bytes.Buffer
-		if err := printer.Fprint(&buf, fset, ifStmt.Body); err != nil {
-			return true
-		}
-		branches = append(branches, buf.String())
+		branches = append(branches, ifStmt.Body)
 		return true
 	})
 	return branches
+}
+
+// branchCalls 返回函数体/语句块内对 name 的全部调用（`f(...)` 与 `pkg.f(...)`
+// 同计）。断言只看真实调用表达式：注释、字符串里的同名片段不构成调用。
+func branchCalls(node ast.Node, name string) []*ast.CallExpr {
+	var calls []*ast.CallExpr
+	ast.Inspect(node, func(candidate ast.Node) bool {
+		call, ok := candidate.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		switch fun := call.Fun.(type) {
+		case *ast.Ident:
+			if fun.Name == name {
+				calls = append(calls, call)
+			}
+		case *ast.SelectorExpr:
+			if fun.Sel.Name == name {
+				calls = append(calls, call)
+			}
+		}
+		return true
+	})
+	return calls
+}
+
+// detailMentionsCommitUncertain 报告审计详情是否直接或经本分支局部变量间接
+// 引用「提交结果不确定」单源标签。值流不做完整分析：只认 `x := …commitUncertainLabel…`
+// 形式的单赋值中转（DeleteRule 的 detail := 前缀 + 恢复失败补充即此形态）。
+func detailMentionsCommitUncertain(fset *token.FileSet, branch *ast.BlockStmt, detail string) bool {
+	if strings.Contains(detail, "commitUncertainLabel") {
+		return true
+	}
+	found := false
+	ast.Inspect(branch, func(node ast.Node) bool {
+		assign, ok := node.(*ast.AssignStmt)
+		if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
+			return true
+		}
+		source := exprText(fset, assign.Rhs[0])
+		if !strings.Contains(source, "commitUncertainLabel") {
+			return true
+		}
+		if ident, ok := assign.Lhs[0].(*ast.Ident); ok && strings.Contains(detail, ident.Name) {
+			found = true
+		}
+		return true
+	})
+	return found
+}
+
+// exprText 打印节点源码（错误信息用）。
+func exprText(fset *token.FileSet, node ast.Node) string {
+	var buf bytes.Buffer
+	if err := printer.Fprint(&buf, fset, node); err != nil {
+		return "<print error>"
+	}
+	return buf.String()
+}
+
+// literalString 返回字符串字面量实参的解码值；非字面量（变量/常量/表达式）
+// 返回空串——调用方据此判红，避免「实参是变量」被当成命中。
+func literalString(expr ast.Expr) string {
+	lit, ok := expr.(*ast.BasicLit)
+	if !ok || lit.Kind != token.STRING {
+		return ""
+	}
+	value, err := strconv.Unquote(lit.Value)
+	if err != nil {
+		return ""
+	}
+	return value
 }
 
 // isTxCommitFailureIf 报告 if 语句是否为 `tx.Commit()` 失败分支。两种等价形态：

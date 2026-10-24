@@ -7,16 +7,16 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { section, source } from './_helpers.ts'
+import { section, code } from './_helpers.ts'
 
 test('/admin-tls 响应类型声明 cert_info_error', () => {
-  const api = source('src/utils/api.ts')
+  const api = code('src/utils/api.ts')
   assert.match(api, /cert_info_error\?: string/, 'API 类型必须声明 fail-visible 字段')
 })
 
 test('设置页消费 cert_info_error 并渲染错误条', () => {
-  const page = source('src/views/settings/BasicSettings.vue')
-  const draft = source('src/composables/useSettingsDraft.ts')
+  const page = code('src/views/settings/BasicSettings.vue')
+  const draft = code('src/composables/useSettingsDraft.ts')
   // 暂存态（含损坏原因）由设置草稿持有——切分页重挂后横幅与确认门继续成立
   assert.match(draft, /const adminTlsCertError = ref\(''\)/)
   assert.match(page, /adminTlsCertError\.value = res\.data\.cert_info_error \|\| ''/, '读取时必须从响应取值')
@@ -36,7 +36,7 @@ test('设置页消费 cert_info_error 并渲染错误条', () => {
 })
 
 test('/admin-tls 保存成功后回读服务端状态：损坏横幅与复用门随新证书复位', () => {
-  const page = source('src/views/settings/BasicSettings.vue')
+  const page = code('src/views/settings/BasicSettings.vue')
   const tls = section(page, 'if (tlsPending) {', '} else {')
   // 成功态以唯一读路径回填：新证书可解析时后端不再下发 cert_info_error，
   // adminTlsCertBroken / adminTlsConfirmBlocked 随之复位。
@@ -52,7 +52,7 @@ test('/admin-tls 保存成功后回读服务端状态：损坏横幅与复用门
 })
 
 test('读取路径保留未保存的暂存态（切页重挂不回退）', () => {
-  const page = source('src/views/settings/BasicSettings.vue')
+  const page = code('src/views/settings/BasicSettings.vue')
   const load = section(page, 'const loadAdminTls = async () => {', 'const retryLoadAdminTls')
   assert.match(load, /const wasStaged = adminTlsDirty\.value/, '暂存判定必须在写入新 saved 之前取')
   assert.match(load, /if \(!wasStaged\) adminTls\.value = \{ \.\.\.saved \}/, '有暂存编辑时不得用服务端值覆盖表单')

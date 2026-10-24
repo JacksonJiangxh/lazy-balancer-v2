@@ -66,6 +66,33 @@ test('编辑态 0 原样携带（不夹紧）——写侧拒绝由后端负责�
 
 // Caddy 全局配置保存键集与后端审计归因映射必须同集——两侧此前仅靠人工
 // 核对（22 键），漂移会静默改变保存载荷覆盖面/审计归因段落。
+// 期望键集独立冻结：两侧都从生产声明派生时，单个键被删在左右两侧同时消失、
+// deepEqual 仍绿（整体删空的空集已由下面的长度下限挡住）。
+const FROZEN_CADDY_CONFIG_KEYS = [
+  'access_log_format',
+  'access_log_json',
+  'caddy_log_level',
+  'caddy_log_size_mb',
+  'http_idle_timeout',
+  'http_read_timeout',
+  'http_write_timeout',
+  'proxy_dial_timeout',
+  'proxy_flush_interval',
+  'proxy_read_timeout',
+  'proxy_response_header_timeout',
+  'proxy_stream_close_delay',
+  'proxy_stream_timeout',
+  'proxy_write_timeout',
+  'request_body_max_size_mb',
+  'server_tokens_hidden',
+  'trusted_proxy_enabled',
+  'trusted_proxy_headers',
+  'trusted_proxy_range_refs',
+  'trusted_proxy_ranges',
+  'trusted_proxy_strict',
+  'upstream_keepalive_timeout',
+] as const
+
 test('CADDY_CONFIG_KEYS ⇄ ConfigFieldSections「Caddy配置」键集一致', () => {
   const vue = code('src/views/settings/CaddyGlobalSettings.vue')
   const keysBlock = section(vue, 'const CADDY_CONFIG_KEYS = [', '] as const')
@@ -73,8 +100,8 @@ test('CADDY_CONFIG_KEYS ⇄ ConfigFieldSections「Caddy配置」键集一致', (
   const go = repoCode('internal/services/auditlog.go')
   const mapBlock = section(go, 'var ConfigFieldSections = map[string]string{', '\n}\n')
   const backend = [...mapBlock.matchAll(/"([a-z0-9_]+)":\s*"Caddy配置"/g)].map((m) => m[1])
-  assert.ok(frontend.length > 0 && backend.length > 0)
-  assert.deepEqual([...frontend].sort(), [...backend].sort(), 'Caddy 配置保存键集与审计归因映射漂移')
+  assert.deepEqual([...frontend].sort(), [...FROZEN_CADDY_CONFIG_KEYS], '前端保存键集漂移（冻结清单为独立期望）')
+  assert.deepEqual([...backend].sort(), [...FROZEN_CADDY_CONFIG_KEYS], '后端审计归因键集漂移（冻结清单为独立期望）')
 })
 
 test('展示默认值与后端 db.go 常量同源（跨栈钉）', () => {

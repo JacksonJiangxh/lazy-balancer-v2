@@ -70,6 +70,26 @@ func TestRateLimitBlocksParse_emptyBodyYieldsEmpty(t *testing.T) {
 	}
 }
 
+func TestRateLimitBlocksParse_skipsGeoipPassSeries(t *testing.T) {
+	// Given：同一 429 响应在被 geoip 透传路由与主路由各记一条时长计数序列
+	body := strings.Join([]string{
+		`caddy_http_request_duration_seconds_count{code="429",handler="headers",host="example.com",method="GET",server="http_443"} 7`,
+		`caddy_http_request_duration_seconds_count{code="429",handler="http.handlers.geoip2region",host="example.com",method="GET",server="http_443"} 7`,
+		`caddy_http_request_duration_seconds_count{code="429",handler="headers",host="plain.example.com",method="GET",server="http_443"} 3`,
+	}, "\n")
+
+	// When：按站点聚合
+	counts := rateLimit429HostCounts(parseRateLimit429CountsByServer(body))
+
+	// Then：透传序列整行剔除（与采集链/实时指标同口径），未启用 geoip 的站点不变
+	if counts["example.com"] != 7 {
+		t.Errorf("example.com=%v, want 7（透传序列不得重复计入）", counts["example.com"])
+	}
+	if counts["plain.example.com"] != 3 {
+		t.Errorf("plain.example.com=%v, want 3", counts["plain.example.com"])
+	}
+}
+
 func TestRateLimitBlocksParse_keepsServerDimensionForSingleRuleChips(t *testing.T) {
 	// Given：同域两个端口的 429 计数（server 标签区分监听端口）
 	// When：按 (host, server) 解析
@@ -250,18 +270,37 @@ func TestScrapeRateLimitBlocks_failureNotCached(t *testing.T) {
 }
 
 // 同 URL 并发单飞——在途请求共用一次抓取。
+// 缓存窗口置 0：只断言 hits==1 时，1 分钟 TTL 会让「串行/缓存命中」与
+// 「单飞合并」不可区分（单飞失效也能通过）；等 4 个等待方进入单飞等待后
+// 才放行响应，抓取次数=1 才是单飞的直接证据。
 func TestScrapeRateLimitBlocks_singleFlight(t *testing.T) {
 	resetOverviewMetricsCacheForTest()
 	oldTTL := overviewMetricsCacheTTL
-	overviewMetricsCacheTTL = time.Minute
+	overviewMetricsCacheTTL = 0
+	waiterCount := atomic.Int64{}
+	allWaiters := make(chan struct{})
+	var waiterOnce sync.Once
+	oldHook := overviewMetricsWaiterHook
+	overviewMetricsWaiterHook = func() {
+		if waiterCount.Add(1) == 4 {
+			waiterOnce.Do(func() { close(allWaiters) })
+		}
+	}
 	t.Cleanup(func() {
 		overviewMetricsCacheTTL = oldTTL
+		overviewMetricsWaiterHook = oldHook
 		resetOverviewMetricsCacheForTest()
 	})
+
 	var hits atomic.Int64
+	release := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		hits.Add(1)
-		time.Sleep(100 * time.Millisecond)
+		// 有界等待：单飞失效时其余请求也会到此，测试失败后不得把 Close 挂死。
+		select {
+		case <-release:
+		case <-time.After(2 * time.Second):
+		}
 		_, _ = w.Write([]byte(rateLimit429MetricsFixture))
 	}))
 	t.Cleanup(server.Close)
@@ -277,6 +316,9 @@ func TestScrapeRateLimitBlocks_singleFlight(t *testing.T) {
 			}
 		}()
 	}
+	waitForCond(t, 3*time.Second, func() bool { return hits.Load() == 1 })
+	waitForSignal(t, allWaiters, "等待方未全部进入单飞（单飞未合并并发请求）")
+	close(release)
 	wg.Wait()
 	close(errs)
 	for err := range errs {
@@ -310,6 +352,18 @@ func TestNormalizeMetricsHost(t *testing.T) {
 				t.Fatalf("NormalizeMetricsHost(%q)=%q, want %q", tc.in, got, tc.want)
 			}
 		})
+	}
+}
+
+// 同一 CaddyMetricsURL 的两条抓取链必须共用超时预算：预算分叉时慢实例上会
+// 出现「首页指标正常、限流卡片超时不可用」的同源不同可用性。
+func TestCaddyMetricsClientsShareScrapeBudget(t *testing.T) {
+	service := NewMetricsService("http://127.0.0.1:2019/metrics", 30)
+	if service.client.Timeout != caddyMetricsScrapeTimeout {
+		t.Fatalf("collect client timeout=%v, want %v", service.client.Timeout, caddyMetricsScrapeTimeout)
+	}
+	if got := overviewMetricsHTTPClient.Timeout; got != caddyMetricsScrapeTimeout {
+		t.Fatalf("overview client timeout=%v, want %v", got, caddyMetricsScrapeTimeout)
 	}
 }
 

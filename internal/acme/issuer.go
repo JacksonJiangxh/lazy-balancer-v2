@@ -470,12 +470,13 @@ func (i *Issuer) waitForValidation(ctx context.Context, authURL, chalURL string)
 			}
 		}
 
-		if tickerIterations%6 == 0 {
+		// 计数必须先自增再判定：从 0 起判定会让首轮（尚未等待任何 tick）
+		// 命中 %6==0，刷出一条状态仍为空串的进度行。同时以「至少已知一个
+		// 状态」为守卫——空状态行对排障无信息量。
+		tickerIterations++
+		if tickerIterations%6 == 0 && (lastChalStatus != "" || lastAuthStatus != "") {
 			log(fmt.Sprintf("仍在等待 CA 验证 (challenge: %s, 授权: %s)", lastChalStatus, lastAuthStatus))
 		}
-		// 此前计数恒零——%6 恒真，等待期每轮刷一条进度
-		// 日志（ZeroSSL 数分钟窗口即数百行）。按 6 轮节流。
-		tickerIterations++
 		select {
 		case <-ctx.Done():
 			if errors.Is(ctx.Err(), context.Canceled) {

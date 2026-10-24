@@ -6,6 +6,8 @@ package db
 // 消失（令牌与 last_seen 一并丢失，需重新注册/审批）。
 
 import (
+	"database/sql"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -183,5 +185,25 @@ func TestMigrateNodesDeadColumns_recordsDedupeAuditAfterCommit(t *testing.T) {
 	}
 	if entries := drainSystemAuditBuffer(); len(entries) != 0 {
 		t.Fatalf("收敛库重跑审计=%+v, want 空", entries)
+	}
+}
+
+// rowsAffectedFailure 是 RowsAffected 恒失败的 sql.Result 替身（驱动极少返回
+// 该错误，但去重删行数取不到时必须上抛而非伪装成「删了 0 行」——后者会让
+// 节点从注册表消失的原因在操作审计里彻底缺失）。
+type rowsAffectedFailure struct{}
+
+func (rowsAffectedFailure) LastInsertId() (int64, error) { return 0, errors.New("no last insert id") }
+func (rowsAffectedFailure) RowsAffected() (int64, error) {
+	return 0, errors.New("rows affected unavailable")
+}
+
+type failingExecer struct{}
+
+func (failingExecer) Exec(string, ...any) (sql.Result, error) { return rowsAffectedFailure{}, nil }
+
+func TestDedupeNodesTx_propagatesRowsAffectedError(t *testing.T) {
+	if _, err := dedupeNodesTx(failingExecer{}); err == nil {
+		t.Fatal("RowsAffected 失败必须上抛（否则删行数静默归零，去重审计缺失）")
 	}
 }

@@ -253,11 +253,18 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 		if err := removeMissingSnapshotCerts(previous.Certs, snapshot.Certs); err != nil {
 			return errors.Join(fmt.Errorf("删除本地旧证书: %w", err), s.restoreSnapshotArtifacts(previous, snapshot))
 		}
+		// 有意无条件物化（不按 certsChanged 门控）：这是「证书文件被带外删除/
+		// 权限被改错」的自愈通道；写放大由 writeCertPair 自身承担——内容一致
+		// 且权限正确时零写（只读比对，见 certstore.go）。DNS ownership 同理：
+		// ownership.Replace 对相同字节零写。certsChanged 仍是末段条件重载的
+		// 强制信号（路径确定性 ⇒ 内容变化不改变渲染字节）。
 		if err := materializeSnapshotCerts(snapshot.Certs); err != nil {
 			return errors.Join(fmt.Errorf("写入同步证书: %w", err), s.restoreSnapshotArtifacts(previous, snapshot))
 		}
 	}
 	if !skip.disabled["rules"] {
+		// 同证书轴：无条件物化 = ownership 文件被删/被改坏时的自愈；相同内容
+		// 零写（ownership.Replace 先做 bytes.Equal）。
 		if err := s.materializeSnapshotDNSOwnership(snapshot.ACME); err != nil {
 			return errors.Join(fmt.Errorf("写入同步 DNS 所有权状态: %w", err), s.restoreSnapshotArtifacts(previous, snapshot))
 		}
@@ -1026,11 +1033,17 @@ func policyWhitelistEnabled(p map[string]interface{}) bool {
 	if v, ok := p["ip_whitelist_enabled"]; ok {
 		// 快照 dump 的 INTEGER 列经 json.Unmarshal 落入 map 为 float64（0/1），
 		// bool 形态仅手工构造快照出现——两种都必须接受，否则 0 被误判为启用
-		//（主端关闭的信任名单在从端变更为启用，从端更宽松）。
+		//（主端关闭的信任名单在从端变更为启用，从端更宽松）。整数形态来自
+		// normalizeSnapshotPolicyRow 的归一结果（幂等：归一后的行再次判定须
+		// 得到同一答案）。
 		switch t := v.(type) {
 		case bool:
 			return t
 		case float64:
+			return t != 0
+		case int64:
+			return t != 0
+		case int:
 			return t != 0
 		}
 	}
@@ -1044,6 +1057,12 @@ func snapshotTrustDetection(p map[string]interface{}) interface{} {
 	case bool:
 		return v
 	case float64:
+		return v != 0
+	case int64:
+		// 归一后的行（normalizeSnapshotPolicyRow 写成 SQLite INTEGER 形态）：
+		// 再次判定必须得到同一布尔值，否则 apply 会把归一值写回 false。
+		return v != 0
+	case int:
 		return v != 0
 	}
 	return false
@@ -1156,11 +1175,11 @@ func applySecurityTables(ctx context.Context, tx *sql.Tx, snapshot models.Cluste
 			}
 		}
 		for _, row := range threatSources {
-			updateStatus, message, finishedAt := normalizeSnapshotTaskState(row["update_status"], row["message"], row["last_checked"], row["finished_at"])
+			normalizeSnapshotSourceRow(row)
 			if _, err := tx.ExecContext(ctx, `INSERT INTO security_threat_sources (id,name,display_name,url,format,update_enabled,apply_enabled,entry_count,version,update_status,message,last_checked,next_update,trigger,started_at,finished_at,consecutive_failures,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-				row["id"], row["name"], row["display_name"], row["url"], row["format"], row["update_enabled"], row["apply_enabled"], row["entry_count"], row["version"], updateStatus, message,
+				row["id"], row["name"], row["display_name"], row["url"], row["format"], row["update_enabled"], row["apply_enabled"], row["entry_count"], row["version"], row["update_status"], row["message"],
 				snapshotNullableDatetime(row["last_checked"]), snapshotNullableDatetime(row["next_update"]), row["trigger"],
-				snapshotNullableDatetime(row["started_at"]), snapshotNullableDatetime(finishedAt),
+				snapshotNullableDatetime(row["started_at"]), snapshotNullableDatetime(row["finished_at"]),
 				row["consecutive_failures"], row["created_at"], row["updated_at"]); err != nil {
 				return fmt.Errorf("写入威胁库源行: %w", err)
 			}
@@ -1179,11 +1198,11 @@ func applySecurityTables(ctx context.Context, tx *sql.Tx, snapshot models.Cluste
 			}
 		}
 		for _, row := range crawlerSources {
-			updateStatus, message, finishedAt := normalizeSnapshotTaskState(row["update_status"], row["message"], row["last_checked"], row["finished_at"])
+			normalizeSnapshotSourceRow(row)
 			if _, err := tx.ExecContext(ctx, `INSERT INTO security_crawler_sources (id,name,display_name,url,format,update_enabled,entry_count,version,update_status,message,last_checked,next_update,trigger,started_at,finished_at,consecutive_failures,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-				row["id"], row["name"], row["display_name"], row["url"], row["format"], row["update_enabled"], row["entry_count"], row["version"], updateStatus, message,
+				row["id"], row["name"], row["display_name"], row["url"], row["format"], row["update_enabled"], row["entry_count"], row["version"], row["update_status"], row["message"],
 				snapshotNullableDatetime(row["last_checked"]), snapshotNullableDatetime(row["next_update"]), row["trigger"],
-				snapshotNullableDatetime(row["started_at"]), snapshotNullableDatetime(finishedAt),
+				snapshotNullableDatetime(row["started_at"]), snapshotNullableDatetime(row["finished_at"]),
 				row["consecutive_failures"], row["created_at"], row["updated_at"]); err != nil {
 				return fmt.Errorf("写入爬虫地址库源行: %w", err)
 			}
@@ -1240,29 +1259,10 @@ func applySecurityTables(ctx context.Context, tx *sql.Tx, snapshot models.Cluste
 				Logf("warn", "快照携带 mode=off 且挂启用自定义规则的策略 %v(旧主节点语义):新版本 off=全关,该策略自定义规则暂不生效,请升级主节点后由其重发快照(或改用 custom_only)", p["name"])
 			}
 		}
-		// 库值唯一真相（批 3）：apply 门值列归一——旧主快照/带外脏值不得在
-		// 从节点复制渲染期静默漂移。anomaly_threshold<=0/nil→5（Create 侧默认，
-		// 与主节点启动回填同口径）；rate_limit_burst<0→0（类型②省略型规范值，
-		// 负值仅带外可达）；block_status_code 枚举外→403（默认拦截状态码，与
-		// 启动归一/导入门同口径）。rate_limit_rps 有意不归一：无默认可归，镜像
-		// 语义下主从渲染同报错（fail-visible，buildRateLimitHandler）。
-		if toFloat64(p["anomaly_threshold"]) <= 0 {
-			p["anomaly_threshold"] = int64(5)
-		}
-		if toFloat64(p["rate_limit_burst"]) < 0 {
-			p["rate_limit_burst"] = int64(0)
-		}
-		if !ValidBlockStatusCode(int(toFloat64(p["block_status_code"]))) {
-			p["block_status_code"] = int64(403)
-		}
-		// 旧主节点/手工快照缺爬虫两列时按 schema 默认归一；NOT NULL 新列
-		// 不得把兼容载荷变成整条 apply 失败，显式 false/[] 与值均原样保留。
-		if p["geoip_crawler_exempt"] == nil {
-			p["geoip_crawler_exempt"] = int64(0)
-		}
-		if p["geoip_crawler_engines"] == nil {
-			p["geoip_crawler_engines"] = "[]"
-		}
+		// 库值唯一真相（批 3）：apply 门值列归一（与 security 节哈希输入共用
+		// normalizeSnapshotPolicyRow 单源——两侧各写一份会让「主端哈希 ≠ 从端
+		// 落库后重建哈希」长期不等，节点列表该节永久显示滞后）。
+		normalizeSnapshotPolicyRow(p)
 		// JSON 文本列逐列序列化，任一失败即中止本条策略（fail-visible）：静默
 		// 落 NULL 会让读路径的 COALESCE 兜底掩盖形态错误——例如
 		// geoip_countries 变 NULL 时渲染按「无地域规则」降级（deny 模式静默削弱）。
@@ -1414,11 +1414,69 @@ const snapshotActiveUpdateStatusMessage = "来自主节点快照的进行中状�
 
 // snapshotActiveUpdateStatus 判定快照载荷里的状态是否属于「进行中」活动态。
 // 判据单源 IsActiveUpdateStatus（覆盖 CRS/IP2Region 四活动词与源表 running），
-// 快照通道与配置导入通道必须共用同一类判据。活动态只属于执行该任务的进程；
-// 从节点收到后若不归一，主端以「已是最新/失败」收尾时只写运行态列、不 bump
-// 版本，从端行会长期滞留活动态且无任何收敛通道。
+// 快照通道与配置导入通道必须共用同一类判据（保留本薄封装：跨包测试以它钉住
+// 判据口径，删除会让判据失去唯一直测入口）。
 func snapshotActiveUpdateStatus(status string) bool {
 	return IsActiveUpdateStatus(status)
+}
+
+// normalizeSnapshotPolicyRow 把快照策略行归一为「从端落库值」口径，单源供
+// apply 写侧与 security 节哈希输入共用：
+//   - anomaly_threshold<=0/nil→5（Create 侧默认，与主节点启动回填同口径）；
+//   - rate_limit_burst<0→0（省略型规范值，负值仅带外可达）；
+//   - block_status_code 枚举外→403（默认拦截状态码，与启动归一/导入门同口径）。
+//     rate_limit_rps 有意不归一：无默认可归，镜像语义下主从渲染同报错
+//     （fail-visible，buildRateLimitHandler）；
+//   - geoip_crawler_exempt/engines 缺列补 schema 默认（旧主节点/手工快照），
+//     NOT NULL 新列不得把兼容载荷变成整条 apply 失败；
+//   - 派生列 policy_type/trust_detection/ip_whitelist_enabled 按落库形态
+//     （字符串/INTEGER 0-1）写入行——apply 在 INSERT 时计算，哈希侧必须同形，
+//     否则同一行两侧字节不等。
+func normalizeSnapshotPolicyRow(p map[string]interface{}) {
+	if toFloat64(p["anomaly_threshold"]) <= 0 {
+		p["anomaly_threshold"] = int64(5)
+	}
+	if toFloat64(p["rate_limit_burst"]) < 0 {
+		p["rate_limit_burst"] = int64(0)
+	}
+	if !ValidBlockStatusCode(int(toFloat64(p["block_status_code"]))) {
+		p["block_status_code"] = int64(403)
+	}
+	if p["geoip_crawler_exempt"] == nil {
+		p["geoip_crawler_exempt"] = int64(0)
+	}
+	if p["geoip_crawler_engines"] == nil {
+		p["geoip_crawler_engines"] = "[]"
+	}
+	p["policy_type"] = InferSnapshotPolicyType(p)
+	p["trust_detection"] = boolToSnapshotInteger(snapshotTrustDetection(p))
+	if policyWhitelistEnabled(p) {
+		p["ip_whitelist_enabled"] = int64(1)
+	} else {
+		p["ip_whitelist_enabled"] = int64(0)
+	}
+}
+
+// boolToSnapshotInteger 把归一结果写成 SQLite INTEGER 列的快照字节形态
+// （dump 侧 0/1 数值），避免哈希输入出现 true/false 与 1/0 两种编码。
+func boolToSnapshotInteger(value interface{}) int64 {
+	switch v := value.(type) {
+	case bool:
+		if v {
+			return 1
+		}
+		return 0
+	}
+	return 0
+}
+
+// normalizeSnapshotSourceRow 归一源表行（威胁情报库/爬虫地址库）的活动态任务
+// 三列，写回行 map——apply 写侧与 security 节哈希输入共用。活动态只属于执行
+// 该任务的进程；从节点收到后若不归一，主端以「已是最新/失败」收尾时只写运行
+// 态列、不 bump 版本，从端行会长期滞留活动态且无任何收敛通道。
+func normalizeSnapshotSourceRow(row map[string]interface{}) {
+	updateStatus, message, finishedAt := normalizeSnapshotTaskState(row["update_status"], row["message"], row["last_checked"], row["finished_at"])
+	row["update_status"], row["message"], row["finished_at"] = updateStatus, message, finishedAt
 }
 
 // normalizeSnapshotTaskState 归一从主端快照搬运的活动态任务行：
@@ -1625,13 +1683,14 @@ func insertSnapshotPathRules(ctx context.Context, tx *sql.Tx, ruleID string, pat
 			}
 			upstreamsJSON = string(encoded)
 		}
-		var err error
+		// 单条 INSERT：id<=0 时传 NULL 交由 AUTOINCREMENT（SQLite 对
+		// INTEGER PRIMARY KEY 的 NULL 即自增）——此前 id 在/不在列清单的两条
+		// 逐字镜像语句，改列漏同步即静默写错行。
+		var idArg any
 		if pathRule.ID > 0 {
-			_, err = tx.ExecContext(ctx, `INSERT INTO path_rules (id,rule_id,sort_order,match_type,path,upstream_path,upstreams_json,response_mode,response_status,response_body,response_content_type,redirect_to,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, pathRule.ID, ruleID, pathRule.SortOrder, pathRule.MatchType, pathRule.Path, pathRule.UpstreamPath, upstreamsJSON, pathRule.ResponseMode, pathRule.ResponseStatus, pathRule.ResponseBody, pathRule.ResponseContentType, pathRule.RedirectTo, pathRule.CreatedAt.UTC().Format(crsTimeLayout), nullableTimeFlat(pathRule.UpdatedAt))
-		} else {
-			_, err = tx.ExecContext(ctx, `INSERT INTO path_rules (rule_id,sort_order,match_type,path,upstream_path,upstreams_json,response_mode,response_status,response_body,response_content_type,redirect_to,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`, ruleID, pathRule.SortOrder, pathRule.MatchType, pathRule.Path, pathRule.UpstreamPath, upstreamsJSON, pathRule.ResponseMode, pathRule.ResponseStatus, pathRule.ResponseBody, pathRule.ResponseContentType, pathRule.RedirectTo, pathRule.CreatedAt.UTC().Format(crsTimeLayout), nullableTimeFlat(pathRule.UpdatedAt))
+			idArg = pathRule.ID
 		}
-		if err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO path_rules (id,rule_id,sort_order,match_type,path,upstream_path,upstreams_json,response_mode,response_status,response_body,response_content_type,redirect_to,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, idArg, ruleID, pathRule.SortOrder, pathRule.MatchType, pathRule.Path, pathRule.UpstreamPath, upstreamsJSON, pathRule.ResponseMode, pathRule.ResponseStatus, pathRule.ResponseBody, pathRule.ResponseContentType, pathRule.RedirectTo, pathRule.CreatedAt.UTC().Format(crsTimeLayout), nullableTimeFlat(pathRule.UpdatedAt)); err != nil {
 			return fmt.Errorf("写入快照路径 %s: %w", pathRule.Path, err)
 		}
 	}

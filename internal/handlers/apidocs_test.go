@@ -416,24 +416,23 @@ func TestAPIDocRoutes_documentationContracts(t *testing.T) {
 	if strings.Contains(tools, "HTTP 语义只读") || strings.Contains(tools, "method==GET") {
 		t.Errorf("GET /mcp/tools description retains stale HTTP-semantics read_only: %q", tools)
 	}
-	readOnlyProbes := map[string]bool{
-		"parse_certificate": true, "validate_import": true, "preview_config": true,
-	}
-	// test_certificate_config 会写 DNS TXT 验证记录，
-	// 已移出只读探测集——对只读 Key 不可见（工具保留给管理员）。
-	// test_ca_provider 同理移出（ZeroSSL 缺 EAB 时
-	// 会真实写 ca_providers.credentials）。
+	// 读探测 POST 工具集取自生产单一事实源（mcpserver.ReadOnlyProbeTools），
+	// 不在测试里再手写一份——手写平行清单会与生产集合同步漂移（此前正是两份）。
+	// test_certificate_config 会写 DNS TXT 验证记录、test_ca_provider 会真实写
+	// ca_providers.credentials，两者都不在探测集内（工具保留给管理员）。
+	readOnlyProbes := mcpserver.ReadOnlyProbeTools
 	specs := mcpserver.ListToolSpecs()
 	if len(specs) == 0 {
 		t.Fatal("ListToolSpecs returned no tools")
 	}
+	if len(readOnlyProbes) == 0 {
+		t.Fatal("ReadOnlyProbeTools 为空——只读探测集守卫失效")
+	}
 	for _, spec := range specs {
 		// export_config 与 get_caddy_config 的 handler 首行拒绝只读 Key（403），
 		// 不计入「只读可用」——read_only 是能力语义，不是 HTTP 方法语义。
-		wantReadOnly := spec.Method == http.MethodGet && spec.Name != "export_config" && spec.Name != "get_caddy_config"
-		if readOnlyProbes[spec.Name] {
-			wantReadOnly = true
-		}
+		_, probe := readOnlyProbes[spec.Name]
+		wantReadOnly := probe || (spec.Method == http.MethodGet && spec.Name != "export_config" && spec.Name != "get_caddy_config")
 		if spec.ReadOnly != wantReadOnly {
 			t.Errorf("tool %s (%s) read_only=%v, want %v（只读 Key 可用性语义）", spec.Name, spec.Method, spec.ReadOnly, wantReadOnly)
 		}
@@ -457,6 +456,64 @@ func specsReadOnly(specs []mcpserver.ToolSpec, name string) bool {
 		}
 	}
 	return false
+}
+
+// GET /mcp/tools 的响应示例是用户文档里唯一的工具清单快照：示例与
+// mcpserver.ListToolSpecs 漂移（改名/改方法/改路径/read_only 翻转/用法文案）会让
+// 文档把错误的能力认知教给调用方，而文档测试此前只校验描述文字。
+func TestAPIDocRoutes_mcpToolsResponseExampleMatchesToolSpecs(t *testing.T) {
+	routes := make(map[string]apiDocRoute, len(apiDocRoutes))
+	for _, route := range apiDocRoutes {
+		routes[route.Method+" "+route.Path] = route
+	}
+	route, ok := routes["GET /mcp/tools"]
+	if !ok {
+		t.Fatal("apiDocRoutes 缺少 GET /mcp/tools")
+	}
+	var example struct {
+		Data []struct {
+			Name        string `json:"name"`
+			Description string `json:"description"`
+			Method      string `json:"method"`
+			Path        string `json:"path"`
+			ReadOnly    bool   `json:"read_only"`
+			Usage       string `json:"usage"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(route.Response), &example); err != nil {
+		t.Fatalf("parse /mcp/tools 示例响应: %v", err)
+	}
+	if len(example.Data) == 0 {
+		t.Fatal("/mcp/tools 示例响应必须至少含一个工具条目")
+	}
+	specs := mcpserver.ListToolSpecs()
+	for _, item := range example.Data {
+		var matched *mcpserver.ToolSpec
+		for i := range specs {
+			if specs[i].Name == item.Name {
+				matched = &specs[i]
+				break
+			}
+		}
+		if matched == nil {
+			t.Fatalf("示例工具 %q 不在 ListToolSpecs 中（文档在教不存在的工具）", item.Name)
+		}
+		if item.Description != matched.Description {
+			t.Errorf("%s 示例描述与工具注册表不一致:\n示例: %s\n注册表: %s", item.Name, item.Description, matched.Description)
+		}
+		if item.Method != matched.Method {
+			t.Errorf("%s 示例 method=%q, want %q", item.Name, item.Method, matched.Method)
+		}
+		if item.Path != matched.Path {
+			t.Errorf("%s 示例 path=%q, want %q", item.Name, item.Path, matched.Path)
+		}
+		if item.ReadOnly != matched.ReadOnly {
+			t.Errorf("%s 示例 read_only=%v, want %v", item.Name, item.ReadOnly, matched.ReadOnly)
+		}
+		if item.Usage != matched.Usage || item.Usage == "" {
+			t.Errorf("%s 示例 usage=%q, want %q（usage 恒返回）", item.Name, item.Usage, matched.Usage)
+		}
+	}
 }
 
 // 非 JSON 响应示例（二进制/TXT）必须登记 rawResponse 与
@@ -780,10 +837,19 @@ func TestBuildOpenAPIYAML_documents_oidc_public_lbbak_and_retry_contracts(t *tes
 			t.Errorf("C7: %s %s description=%q lacks retry contract", operation.method, operation.path, description)
 		}
 	}
-	// 回调错误表补 404 oidc_disabled/502 discovery;PUT 示例补 display_name。
+	// 回调是浏览器整页导航：成功与失败同为 302（错误经 URL fragment 携带），
+	// 文档不得登记 4xx/5xx——按规格生成的客户端会去等 JSON 错误体；唯一
+	// 例外是挂在该路由上的限流 429。
 	callback := routesEntry(t, "GET /auth/oidc/callback")
-	if !containsRouteError(callback.Errors, "404") || !containsRouteError(callback.Errors, "502") {
-		t.Errorf("C7: callback errors=%v, want 404 oidc_disabled and 502 discovery", callback.Errors)
+	if !strings.Contains(callback.Description, "302") || !strings.Contains(callback.Description, "fragment") {
+		t.Errorf("C7: callback description=%q, want 302 + URL fragment error contract", callback.Description)
+	}
+	for _, routeError := range callback.Errors {
+		status, _, _ := strings.Cut(routeError, " ")
+		if status != "429" {
+			t.Errorf("C7: callback errors=%v, want only 429（其余失败形态均为 302 fragment）", callback.Errors)
+			break
+		}
 	}
 	oidcUpdate := routesEntry(t, "PUT /settings/oidc")
 	if !strings.Contains(oidcUpdate.Request, "display_name") {
@@ -1066,6 +1132,15 @@ func TestAPIDocRoutes_mfaWriteEndpointsDocumentImportWindowAndOIDC(t *testing.T)
 	// 管理端重置已有 403 admin_required（同码去重）；OIDC 目标拒绝须进描述。
 	if !strings.Contains(routesEntry(t, "POST /users/:id/mfa/reset").Description, "OIDC") {
 		t.Errorf("POST /users/:id/mfa/reset description lacks OIDC 目标拒绝说明")
+	}
+	// 恢复码重生成没有凭据校验的 401，但鉴权与处理之间用户被并发删除时
+	// handler 仍返回 401（users 行 ErrNoRows）——文档不得宣称「无 401 路径」。
+	recovery := routesEntry(t, "POST /auth/mfa/recovery-codes")
+	if !containsRouteError(recovery.Errors, "401") {
+		t.Errorf("POST /auth/mfa/recovery-codes errors=%v, want 401（并发删除用户时 handler 返回 401）", recovery.Errors)
+	}
+	if strings.Contains(recovery.Description, "无 401 路径") {
+		t.Error("POST /auth/mfa/recovery-codes description 宣称「无 401 路径」，与 ErrNoRows→401 的实现矛盾")
 	}
 }
 

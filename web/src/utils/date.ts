@@ -1,7 +1,7 @@
 import { useAuthStore } from '@/stores/auth'
 // 与后端 COALESCE 默认一致的兜底时区与格式化器单源：抽到无依赖
 // 模块供 node 行为测试直测 h23 口径；本文件保留缓存/回退策略。
-import { DEFAULT_TZ, createTzFormatter, formatDateParts } from '@/utils/timeZoneFormat'
+import { DEFAULT_TZ, createTzFormatter, formatDateParts, normalizeDbWallClock, parseDbDateMs } from '@/utils/timeZoneFormat'
 
 let warnedInvalidTz = false
 
@@ -63,7 +63,7 @@ const parseDateValue = (date: unknown): Date | null => {
   // 对未知对象形状保持宽容防御，一律按空处理
   if (isRecord(date) || typeof date !== 'string') return null
   // DB datetimes ("2026-08-11 08:23:21") are stored in UTC; normalize to explicit UTC ISO
-  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?$/.test(date) ? date.replace(' ', 'T') + 'Z' : date
+  const normalized = normalizeDbWallClock(date)
   if (!isIsoLike(normalized)) return null
   const d = new Date(normalized)
   return isNaN(d.getTime()) ? null : d
@@ -96,11 +96,15 @@ export const formatDateShort = (date: unknown): string => {
 }
 
 // DB 墙钟串（"YYYY-MM-DD HH:mm:ss"，UTC 存储）→ epoch ms。
-// 必须经 parseDateValue 的 +Z 规范化——裸 new Date 对空格分隔格式在 Safari 返回
-// NaN（排序比较恒为 0 退化）；解析失败返回 null，调用方自行兜底。
+// 规范化与解析在内核 utils/timeZoneFormat.parseDbDateMs（单一实现）；此处只叠
+// isIsoLike 白名单——本入口的语义是「DB 时间串」，不是「任意 Date 可解析文本」，
+// 仅日期形态（"2026-08-11"）一律返回 null（对账/冷却判定的调用方按缺失兜底）。
+// 解析失败返回 null，调用方自行兜底。
 export const parseDbTimeMs = (date: unknown): number | null => {
-  const d = parseDateValue(date)
-  return d ? d.getTime() : null
+  if (!date || typeof date !== 'string') return null
+  const normalized = normalizeDbWallClock(date)
+  if (!isIsoLike(normalized)) return null
+  return parseDbDateMs(normalized)
 }
 
 // Dashboard 图表轴标签（HH:mm:ss），经 tzFormatter 受保护入口

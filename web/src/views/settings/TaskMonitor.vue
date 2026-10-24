@@ -16,13 +16,13 @@
       <el-col :xs="12" :md="6">
         <el-card class="tm-kpi">
           <div class="tm-kpi-num">{{ taskFamilyCount }}</div>
-          <div class="tm-kpi-label">任务族</div>
+          <div class="tm-kpi-label" title="仅统计引擎任务族，不含证书签发工作项（cert-job 动态行）">任务族<span class="tm-kpi-scope">（不含证书工作项）</span></div>
         </el-card>
       </el-col>
       <el-col :xs="12" :md="6">
         <el-card class="tm-kpi">
           <div class="tm-kpi-num tm-kpi-run">{{ runningCount }}</div>
-          <div class="tm-kpi-label">运行中</div>
+          <div class="tm-kpi-label" title="在途工作项：含证书签发工作项（排队/等待 CA 均计为运行中），可能大于任务族数">运行中<span class="tm-kpi-scope">（含证书工作项）</span></div>
         </el-card>
       </el-col>
       <el-col :xs="12" :md="6">
@@ -214,7 +214,7 @@
         </el-table-column>
         <el-table-column width="104">
           <template #header>
-            <el-tooltip content="近 24 小时成功 / 失败次数（完整统计见详情）" placement="top" :show-arrow="false">
+            <el-tooltip content="近 24 小时成功 / 失败次数；历史明细最多 50 条（见详情）" placement="top" :show-arrow="false">
               <span>成功/失败 ⓘ</span>
             </el-tooltip>
           </template>
@@ -224,11 +224,15 @@
         </el-table-column>
         <el-table-column label="操作" width="225" fixed="right">
           <template #default="{ row }">
-            <el-button
-              v-if="row.triggerable"
-              link type="primary" size="small" :disabled="!canOperate || row.status === 'running'"
-              @click="onTrigger(row)"
-            >运行</el-button>
+            <el-tooltip v-if="row.triggerable" :disabled="!runCooldownReason(row)" :content="runCooldownReason(row)">
+              <div>
+                <el-button
+                  link type="primary" size="small"
+                  :disabled="!canOperate || row.status === 'running' || Boolean(runCooldownReason(row))"
+                  @click="onTrigger(row)"
+                >运行</el-button>
+              </div>
+            </el-tooltip>
             <el-button
               v-if="row.cancellable && row.status === 'running'"
               link type="danger" size="small" :disabled="!canOperate"
@@ -384,6 +388,7 @@ interface TaskInfo {
   loop_on?: boolean; started_at?: string; business_driven?: boolean // 常驻族：循环启停态/引擎启动时刻
   schedule_stopped_reason?: string // 引擎自行停调来源（fail-streak=自动轮连续失败未推进排程槽）
   role_applicable?: boolean // 本节点角色是否允许该任务运行（false=仅主节点，从节点视图标注）
+  retry_cooldown_seconds?: number // 证书行剩余重试冷却（秒，0=可运行；其它行为 0）
 }
 interface RunRecord {
   id: number; task_id: string; family: string; trigger: string; operator?: string; status: string
@@ -467,7 +472,13 @@ const polling = usePollingTask(async ({ signal }) => {
 })
 const retryPolling = async (): Promise<void> => {
   pollingError.resetBackoff()
-  await polling.run()
+  // 重试按钮此前从不置 refreshing，点击后零反馈（勾着号/看不到在跑）
+  refreshing.value = true
+  try {
+    await polling.run()
+  } finally {
+    refreshing.value = false
+  }
 }
 // ===== 证书队列状态（独立卡——非任务族） =====
 interface CertJobRow { id: number; domain: string; status: string; updated_at?: string | null; ca_provider_name?: string }
@@ -649,6 +660,12 @@ async function runTaskAction(row: TaskInfo, options: TaskActionOptions): Promise
   } finally {
     if (taskActionPendingId.value === row.id) taskActionPendingId.value = null
   }
+}
+
+const runCooldownReason = (row: TaskInfo): string => {
+  const seconds = Number(row.retry_cooldown_seconds ?? 0)
+  if (!Number.isFinite(seconds) || seconds <= 0) return ''
+  return `冷却中，约 ${Math.ceil(seconds / 60)} 分钟后可运行`
 }
 
 const onTrigger = (row: TaskInfo): Promise<void> => runTaskAction(row, {
@@ -863,6 +880,7 @@ const fmtDuration = (ms?: number) => {
 .tm-kpi-run { color: #3b82f6; }
 .tm-kpi-bad { color: #f87171; }
 .tm-kpi-label { font-size: 12.5px; color: #6b7280; margin-top: 6px; }
+.tm-kpi-scope { display: block; font-size: 11px; color: #9ca3af; }
 
 /* 队列横幅 */
 .tm-cq-banner :deep(.el-card__body) { padding: 12px 20px; }

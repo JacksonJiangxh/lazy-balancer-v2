@@ -11,7 +11,9 @@
 #   - status: fixed | maintained | falsified | retired
 #   - fixed 必须有 evidence，多个用 ';' 分隔，支持：
 #       code:<path>:<line>:<token>   该行必须包含 token（token 可含空格）
-#       test:<TestName>              仓库内必须存在 func <TestName>(
+#       test:<TestName>              仓库内必须存在 func <TestName>( 或前端 test('<name>'
+#       ftest:<literal>              web/tests 内必须出现该字面量（describe/it 标题等）
+#       script:<path>                脚本必须存在（且可执行）
 #   - maintained / falsified / retired 必须写非空 reason
 #
 # --commit 会解析该提交 message 中的 "Fixes: ID[,ID...]" 行，要求每个 ID 在台账
@@ -151,6 +153,20 @@ while IFS='|' read -r id status evidence reason; do
             name="${item#test:}"
             if ! grep -RqsE --include='*_test.go' --include='*.spec.ts' "func[[:space:]]+${name}\(|test\(['\"]${name}" .; then
               echo "FAIL ${id}: 测试不存在: $name" >&2; fail=1
+            fi
+            ;;
+          ftest:*)
+            literal="${item#ftest:}"
+            if ! grep -RqsF --include='*.spec.ts' -- "$literal" web/tests; then
+              echo "FAIL ${id}: 前端用例不存在: $literal" >&2; fail=1
+            fi
+            ;;
+          script:*)
+            script="${item#script:}"
+            if [ ! -f "$script" ]; then
+              echo "FAIL ${id}: 脚本不存在: $script" >&2; fail=1
+            elif [ ! -x "$script" ]; then
+              echo "FAIL ${id}: 脚本不可执行: $script" >&2; fail=1
             fi
             ;;
           *)

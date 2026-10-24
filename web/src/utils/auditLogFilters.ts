@@ -6,7 +6,7 @@
 // - 时间范围两端各自独立，仅非空端上送（半开区间可用）；
 // - 筛选值两端空白剥离后再上送（后端另有 LIKE 转义）。
 
-export interface AuditLogFilterState {
+interface AuditLogFilterState {
   timeRange: readonly [string, string] | null
   username: string
   action: string

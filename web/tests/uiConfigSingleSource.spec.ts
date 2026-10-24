@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { code, member, section, source } from './_helpers.ts'
+import { code, member, section } from './_helpers.ts'
 
 // 设置/仪表盘配置面的「呈现与真实消费者一致」守卫：
 // - 全局 DNS 提供商是无消费者的死配置（签发链按证书配置行读 provider），
@@ -19,7 +19,7 @@ test('全局 DNS 提供商：表单入口与过度承诺文案已移除，键仍
 })
 
 test('Dashboard 规则卡：刷新失败且有缓存时明示陈旧，首轮失败仍报「采集失败」', () => {
-  const page = source('src/views/Dashboard.vue')
+  const page = code('src/views/Dashboard.vue')
   assert.match(page, /<el-tag v-if="rulesUnavailable && rules\.length > 0"[^>]*>规则列表刷新失败：展示上次结果<\/el-tag>/)
   const card = section(page, 'class="rules-card"', '</el-card>')
   const badgeAt = card.indexOf('规则列表刷新失败')
@@ -31,7 +31,7 @@ test('Dashboard 规则卡：刷新失败且有缓存时明示陈旧，首轮失�
 })
 
 test('OIDC 配置读取带请求序号守卫：成功回填、失败清空与状态通知都只落最新轮次', () => {
-  const page = source('src/views/settings/OIDCSettings.vue')
+  const page = code('src/views/settings/OIDCSettings.vue')
   const load = member(page, 'const load = async')
   assert.match(load, /const seq = \+\+loadSeq/, '每次 load 必须自增序号')
   assert.equal((load.match(/seq !== loadSeq/g) ?? []).length, 3, '成功/失败/notify 三处都必须比对')

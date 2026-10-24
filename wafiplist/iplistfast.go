@@ -513,6 +513,33 @@ func readBoundedFrom(src boundedReadSource, name string, maxBytes int64) ([]byte
 	return raw, info, nil
 }
 
+// ForEachIPListLine 按行遍历 .iplist 文本的有效条目行：空行与 #/; 开头的注释
+// 行跳过，行内容 TrimSpace 归一（CRLF 源与历史 Split 实现同口径）；lineNo 从
+// 1 起计数供错误文案。fn 返回 false 提前终止。
+//
+// 本函数是**跨模块**的行过滤单一事实源：wafiplist 的严格解析与
+// internal/services 的编译/渲染/UI/下载四处都转发到此处。此前两侧各持一份
+// 等价循环，前缀/空白归一规则演化时会静默分叉（坏行处置策略由调用方各自
+// 决定：本包严格报错，services 侧按场景跳过或计数）。
+func ForEachIPListLine(raw []byte, fn func(lineNo int, line string) bool) {
+	for lineNo, start := 1, 0; start <= len(raw); lineNo++ {
+		line := raw[start:]
+		if i := bytes.IndexByte(line, '\n'); i >= 0 {
+			line = line[:i]
+			start += i + 1
+		} else {
+			start = len(raw) + 1 // 末行（无换行）
+		}
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 || line[0] == '#' || line[0] == ';' {
+			continue
+		}
+		if !fn(lineNo, string(line)) {
+			return
+		}
+	}
+}
+
 // parseIPListFile 读盘+严格解析+防御性归并（写入侧已聚合，加载侧再跑一次
 // 保证「排序+去重+不相交」检索不变式——二分正确性依赖不相交）。逐条目
 // **只解析一次**（此前「逐行校验解析 → AggregatePrefixes 再解析」
@@ -542,30 +569,26 @@ func parseIPListFile(path string) (*ipListFileState, error) {
 		capHint = maxEntries + 1
 	}
 	prefixes := make([]netip.Prefix, 0, capHint)
-	// 直接在原始字节上按行迭代（bytes.IndexByte + TrimSpace），
-	// 不再整文件复制成 string（maxFileBytes 64MB 上限时 raw+string 双份常驻
-	// =2× 文件体积峰值）；仅实际条目行短生命周期转 string 供 ParseIPEntry，
-	// 空行/注释行零分配跳过。
-	for lineNo, start := 1, 0; start <= len(raw); lineNo++ {
-		line := raw[start:]
-		if i := bytes.IndexByte(line, '\n'); i >= 0 {
-			line = line[:i]
-			start += i + 1
-		} else {
-			start = len(raw) + 1 // 末行（无换行）
-		}
-		line = bytes.TrimSpace(line)
-		if len(line) == 0 || line[0] == '#' || line[0] == ';' {
-			continue
-		}
-		prefix, perr := ParseIPEntry(string(line))
+	// 直接在原始字节上按行迭代（共享 ForEachIPListLine：bytes.IndexByte +
+	// TrimSpace，不再整文件复制成 string（maxFileBytes 64MB 上限时
+	// raw+string 双份常驻=2× 文件体积峰值）；仅实际条目行短生命周期转 string
+	// 供 ParseIPEntry，空行/注释行零分配跳过。
+	var lineErr error
+	ForEachIPListLine(raw, func(lineNo int, line string) bool {
+		prefix, perr := ParseIPEntry(line)
 		if perr != nil {
-			return nil, fmt.Errorf("IP 名单 %q 第 %d 行不可解析: %q", path, lineNo, line)
+			lineErr = fmt.Errorf("IP 名单 %q 第 %d 行不可解析: %q", path, lineNo, line)
+			return false
 		}
 		prefixes = append(prefixes, prefix)
 		if len(prefixes) > maxEntries {
-			return nil, fmt.Errorf("IP 名单 %q 条目数超过上限 %d", path, maxEntries)
+			lineErr = fmt.Errorf("IP 名单 %q 条目数超过上限 %d", path, maxEntries)
+			return false
 		}
+		return true
+	})
+	if lineErr != nil {
+		return nil, lineErr
 	}
 	// 空文件合法（2026-10-15 始终发射收敛）：渲染层空名单投影 0 字节空文件，
 	// 空集=匹配器永不命中（与无规则语义等价）——空↔非空纯内容变化走热路径，

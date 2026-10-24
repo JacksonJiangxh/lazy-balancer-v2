@@ -7,6 +7,7 @@ package services
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"sync/atomic"
 	"time"
@@ -54,9 +55,16 @@ type TaskInfo struct {
 	ScheduleStoppedReason string       `json:"schedule_stopped_reason,omitempty"`
 	LastRun               *TaskRunInfo `json:"last_run,omitempty"`
 	NextRunAt             string       `json:"next_run_at,omitempty"`
-	Runs24h               int          `json:"runs_24h"`
-	Success24h            int          `json:"success_24h"`
-	Fail24h               int          `json:"fail_24h"`
+	// RetryCooldownSeconds 「运行/重试」按钮的剩余冷却秒数（无 omitempty：
+	// 0 是「现在即可重试」的语义，前端以本字段为唯一判据）。口径与证书任务
+	// 列表（/certificates/jobs 的 retry_cooldown_seconds）同源：
+	// services.CertJobRetryCooldownSecondsAt——证书行 waiting_ca 取 CA 退避
+	// 剩余秒、其余取任务退避（queued 15min/failed 5min/执行态 2min），缺失或
+	// 已到期为 0；非证书行恒 0（引擎族无证书重试冷却概念）。
+	RetryCooldownSeconds int64 `json:"retry_cooldown_seconds"`
+	Runs24h              int   `json:"runs_24h"`
+	Success24h           int   `json:"success_24h"`
+	Fail24h              int   `json:"fail_24h"`
 }
 
 // TaskRunInfo 最近一次运行。
@@ -137,8 +145,8 @@ func collectCertJobRows() ([]TaskInfo, bool) {
 	var out []TaskInfo
 	for rows.Next() {
 		var id int
-		var ruleID, domain, status, message, createdAt, updatedAt string
-		if err := rows.Scan(&id, &ruleID, &domain, &status, &message, &createdAt, &updatedAt); err != nil {
+		var ruleID, domain, status, message, createdAt, updatedAt, caAvailableAfter string
+		if err := rows.Scan(&id, &ruleID, &domain, &status, &message, &createdAt, &updatedAt, &caAvailableAfter); err != nil {
 			// 任务行读失败留痕：单行扫描失败留痕后跳过该行（此前静默 continue）。
 			readFailed = true
 			if lvl := logStateTransition(taskMonitorCertJobsLogKey, true); lvl != "" {
@@ -180,6 +188,14 @@ func collectCertJobRows() ([]TaskInfo, bool) {
 				Trigger: "queue", Result: status, Message: message},
 		}
 		ti.Runs24h, ti.Success24h, ti.Fail24h = runs24h, success, fail
+		// 「运行/重试」按钮的冷却：与证书任务列表同口径同源（0=无冷却）。
+		// waiting_ca 取 CA 退避剩余秒，其余取任务通用退避；ca_available_after
+		// 缺失/已到期自然得 0。双布局解析与槽解析单源。
+		var caWindow sql.NullTime
+		if t := parseUTCSlot(caAvailableAfter); !t.IsZero() {
+			caWindow = sql.NullTime{Time: t, Valid: true}
+		}
+		ti.RetryCooldownSeconds = CertJobRetryCooldownSecondsAt(status, caWindow, time.Now())
 		ti.Status = TaskStatusIdle
 		switch status {
 		case "failed":

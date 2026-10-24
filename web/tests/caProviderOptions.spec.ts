@@ -5,7 +5,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { source } from './_helpers.ts'
+import { code } from './_helpers.ts'
 import { referencedOptionLabel, selectableReferencedOptions } from '../src/utils/caProviderOptions.ts'
 
 const options = [
@@ -27,7 +27,7 @@ test('已禁用回显项标注「（已禁用）」', () => {
 
 test('消费视图均走共享 helper（不得各自 filter(x => x.enabled)）', () => {
   for (const path of ['src/views/Rules.vue', 'src/views/settings/FreeCertificates.vue']) {
-    const text = source(path)
+    const text = code(path)
     assert.match(text, /from '@\/utils\/caProviderOptions'/, `${path} 未接入单源`)
     assert.match(text, /referencedOptionLabel\(/)
     assert.match(text, /:disabled="!p\.enabled"/, `${path} 已禁用项必须不可新选`)
@@ -36,7 +36,7 @@ test('消费视图均走共享 helper（不得各自 filter(x => x.enabled)）',
 })
 
 test('向导的 DNS 配置下拉与 CA 下拉同口径（启用 ∪ 当前值 + 禁用标注）', () => {
-  const rules = source('src/views/Rules.vue')
+  const rules = code('src/views/Rules.vue')
   assert.match(rules, /selectableReferencedOptions\(certConfigs\.value, Number\(wizardForm\.acme_config_id \|\| 0\)\)/)
   assert.match(rules, /v-for="cfg in wizardCertConfigOptions"[\s\S]*?:disabled="!cfg\.enabled"/)
   assert.doesNotMatch(rules, /v-for="cfg in certConfigs"/, 'DNS 配置下拉不得回退为全量渲染')

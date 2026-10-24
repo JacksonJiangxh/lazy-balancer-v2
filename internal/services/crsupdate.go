@@ -102,7 +102,10 @@ type CRSUpdateManager struct {
 	runCancel       context.CancelCauseFunc
 	fetchLatestTag  func(ctx context.Context) (string, error)
 	downloadTarball func(ctx context.Context, tag, destPath string, progress downloadProgressFunc) error
-	crsDir          string
+	// crsDir 是测试注入的 live 目录覆盖；生产恒为空，取值为 liveDir() 的
+	// 晚绑定全局 crsLiveDir——ConfigureWafDirs（自定义 data_dir）可能在构造
+	// 之后再改全局，构造期快照会让更新写相位与渲染读相位分叉。
+	crsDir string
 
 	latestMu         sync.Mutex
 	latestTag        string
@@ -121,10 +124,19 @@ func newCRSUpdateManager(reloader func() error) *CRSUpdateManager {
 		reloader:        reloader,
 		fetchLatestTag:  defaultFetchCRSLatestTag,
 		downloadTarball: defaultDownloadCRSTarball,
-		crsDir:          crsLiveDir,
 		ruleCount:       -1,
 		state:           crsTaskState{status: CRSStatusIdle},
 	}
+}
+
+// liveDir 返回当前 live CRS 目录：测试注入覆盖优先，否则读全局 crsLiveDir
+// （ConfigureWafDirs 在构造之后运行，晚绑定才不会让更新写路径与渲染读路径
+// 分叉）。
+func (m *CRSUpdateManager) liveDir() string {
+	if m.crsDir != "" {
+		return m.crsDir
+	}
+	return crsLiveDir
 }
 
 // InitCRSUpdateManager initializes the singleton with the Caddy reloader.
@@ -314,9 +326,10 @@ func (m *CRSUpdateManager) setStage(status CRSUpdateStatus, message string) {
 
 // recordLatestSkip 记录「已是最新版本」终态（DB 行与内存状态单点实现）。
 func (m *CRSUpdateManager) recordLatestSkip(trigger string) {
+	slotSQL, slotArgs := versionTableSlotSuccessAssign("security_crs_version", trigger)
 	if _, err := db.DB.Exec(
-		"UPDATE security_crs_version SET update_status='success', message='已是最新版本', finished_at=datetime('now'), consecutive_failures=0, "+versionTableSlotSuccessSQL+" WHERE id=1",
-		trigger, trigger, versionTableNextSlot("security_crs_version", time.Now().UTC()),
+		"UPDATE security_crs_version SET update_status='success', message='已是最新版本', finished_at=datetime('now'), consecutive_failures=0, "+slotSQL+" WHERE id=1",
+		slotArgs...,
 	); err != nil {
 		// 成功轮的排程槽推进写失败 = 引擎成功轮已消费过期槽而业务槽停滞
 		// （四族自动更新会静默停摆直到下次成功写），日志级别须与后果匹配。
@@ -518,9 +531,10 @@ func (m *CRSUpdateManager) runWithContext(runCtx context.Context, trigger string
 		m.advanceSlotIfAuto(trigger)
 		return
 	}
+	slotSQL, slotArgs := versionTableSlotSuccessAssign("security_crs_version", trigger)
 	if _, err := db.DB.Exec(
-		"UPDATE security_crs_version SET version=?, updated_at=datetime('now'), update_status='success', message='', finished_at=datetime('now'), consecutive_failures=0, "+versionTableSlotSuccessSQL+" WHERE id=1",
-		tag, trigger, trigger, versionTableNextSlot("security_crs_version", time.Now().UTC()),
+		"UPDATE security_crs_version SET version=?, updated_at=datetime('now'), update_status='success', message='', finished_at=datetime('now'), consecutive_failures=0, "+slotSQL+" WHERE id=1",
+		append([]any{tag}, slotArgs...)...,
 	); err != nil {
 		Logf("error", "crs update: failed to record success: %v", err)
 	}
@@ -549,7 +563,8 @@ func (m *CRSUpdateManager) advanceSlotIfAuto(trigger string) {
 }
 
 // advanceVersionSlotIfDue 版本表槽推进共享实现（CRS/IP2Region 同构）：空或过期
-// 才写紧邻下一排程槽；auto_update=0 不动（IIF 兜底）。
+// 才写紧邻下一排程槽；auto_update=0 不动（IIF 兜底）。排程不可读时不写——写
+// 路径不得用默认排程覆盖用户的预约（失败已由严格读单源留痕）。
 func advanceVersionSlotIfDue(table string) {
 	var cur string
 	if err := db.DB.QueryRow(`SELECT COALESCE(next_update,'') FROM ` + table + ` WHERE id=1`).Scan(&cur); err != nil {
@@ -563,8 +578,8 @@ func advanceVersionSlotIfDue(table string) {
 			return // 未来槽不污染
 		}
 	}
-	if _, err := db.DB.Exec(`UPDATE `+table+` SET next_update=IIF(auto_update=1, ?, next_update) WHERE id=1`,
-		versionTableNextSlot(table, time.Now().UTC())); err != nil {
+	slotSQL, slotArgs := versionTableSlotAdvanceAssign(table)
+	if _, err := db.DB.Exec(`UPDATE `+table+` SET `+slotSQL+` WHERE id=1`, slotArgs...); err != nil {
 		Logf("warn", "推进排程槽失败（%s）: %v", table, err)
 	}
 }

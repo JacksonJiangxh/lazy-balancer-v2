@@ -2464,11 +2464,16 @@ func TestNormalizeRuleTimestampsMigration_preservesMalformedAndCanonicalizesVali
 		t.Fatalf("create tables: %v", err)
 	}
 	const malformed = "2026-13-45T99:99:99Z"
+	// 分钟精度与 9 位小数秒是导入校验明确接受的两种布局（backupTimeFormats），
+	// 既无 T 也无 +：LIKE '%T%' OR '%+%' 启发式会把它们判成「已规范」而跳过。
 	if _, err := database.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,listen_port,created_at,updated_at) VALUES
 		('lb_ts_valid','valid','http',8080,'2026-01-02T03:04:05Z','2026-01-02 03:04:05'),
-		('lb_ts_bad','bad','http',8081,'2026-13-45T99:99:99Z','2026-02-03T04:05:06Z');
+		('lb_ts_bad','bad','http',8081,'2026-13-45T99:99:99Z','2026-02-03T04:05:06Z'),
+		('lb_ts_minute','minute','http',8082,'2026-01-02 03:04','2026-01-02 03:04'),
+		('lb_ts_frac','frac','http',8083,'2026-01-02 03:04:05.123456789','2026-01-02 03:04:05.000000001');
 		INSERT INTO path_rules (rule_id,sort_order,match_type,path,created_at,updated_at)
-		VALUES ('lb_ts_valid',0,'prefix','/','2026-13-45T99:99:99Z',NULL)`); err != nil {
+		VALUES ('lb_ts_valid',0,'prefix','/','2026-13-45T99:99:99Z',NULL),
+		('lb_ts_minute',0,'prefix','/m','2026-01-02 03:04','2026-01-02 03:04')`); err != nil {
 		t.Fatalf("seed timestamp shapes: %v", err)
 	}
 
@@ -2495,6 +2500,14 @@ func TestNormalizeRuleTimestampsMigration_preservesMalformedAndCanonicalizesVali
 	assertText(`SELECT CAST(created_at AS TEXT) FROM lb_rules WHERE caddy_id='lb_ts_bad'`, malformed)
 	assertText(`SELECT CAST(updated_at AS TEXT) FROM lb_rules WHERE caddy_id='lb_ts_bad'`, "2026-02-03 04:05:06")
 	assertText(`SELECT CAST(created_at AS TEXT) FROM path_rules WHERE rule_id='lb_ts_valid'`, malformed)
+	// 分钟精度与小数秒必须归一到平面格式（否则未来严格 Parse 消费点复现
+	// 证书域 +00:00 同型事故）。
+	assertText(`SELECT CAST(created_at AS TEXT) FROM lb_rules WHERE caddy_id='lb_ts_minute'`, "2026-01-02 03:04:00")
+	assertText(`SELECT CAST(updated_at AS TEXT) FROM lb_rules WHERE caddy_id='lb_ts_minute'`, "2026-01-02 03:04:00")
+	assertText(`SELECT CAST(created_at AS TEXT) FROM path_rules WHERE rule_id='lb_ts_minute'`, "2026-01-02 03:04:00")
+	assertText(`SELECT CAST(updated_at AS TEXT) FROM path_rules WHERE rule_id='lb_ts_minute'`, "2026-01-02 03:04:00")
+	assertText(`SELECT CAST(created_at AS TEXT) FROM lb_rules WHERE caddy_id='lb_ts_frac'`, "2026-01-02 03:04:05")
+	assertText(`SELECT CAST(updated_at AS TEXT) FROM lb_rules WHERE caddy_id='lb_ts_frac'`, "2026-01-02 03:04:05")
 	var nullCount int
 	if err := database.QueryRow(`SELECT COUNT(*) FROM path_rules WHERE rule_id='lb_ts_valid' AND updated_at IS NULL`).Scan(&nullCount); err != nil {
 		t.Fatal(err)

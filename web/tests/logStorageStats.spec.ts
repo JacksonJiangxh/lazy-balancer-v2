@@ -11,7 +11,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { nextTick, ref } from 'vue'
 
-import { registerModuleHooks, repoSource, section, source } from './_helpers.ts'
+import { registerModuleHooks, repoCode, section, code } from './_helpers.ts'
 import { STUB_API } from './_stubs.ts'
 
 interface GetRecord {
@@ -224,18 +224,60 @@ test('换行同时清空错误位：新行取数期间不得继承上一行的�
 })
 
 test('组合子不导出取数函数（loadStats 无外部消费）', () => {
-  const src = source('src/composables/useLogStorageStats.ts')
-  assert.match(src, /return \{ info, error \}/, '返回值只含消费面（info/error）')
+  const src = code('src/composables/useLogStorageStats.ts')
+  assert.match(src, /return \{ info, error, unavailable \}/, '返回值只含消费面（info/error/unavailable）')
   assert.doesNotMatch(src, /return \{ info, loadStats \}/, 'loadStats 零外部消费，不得再作为对外契约')
-  assert.match(source('src/components/LogStorageBar.vue'), /const \{ info, error \} = useLogStorageStats\(/, '失败态必须被消费')
+  assert.match(code('src/components/LogStorageBar.vue'), /const \{ info, error, unavailable \} = useLogStorageStats\(/, '三态（有值/失败/无统计）都必须被消费')
+})
+
+// 请求成功但响应里没有所看那一行（后端 key 词表改名/该日志尚未注册）曾与
+// 「成功且有值」共用 info=null + error=null：模板的值/失败两分支都不渲染，
+// 整条统计静默消失，运维看不到「该日志无统计」这一事实。
+test('成功但无该 key：置 unavailable（统计条显式说明，而非整条消失）', async () => {
+  const target = ref({ logKey: 'runtime' })
+  const refreshKey = ref(0)
+  g.__gets = []
+  g.__get = async () => ({ data: { logs: [] } })
+  const { info, error, unavailable } = useLogStorageStats({ target: () => target.value, refreshKey: () => refreshKey.value })
+  await flush()
+  const missingInfo: unknown = info.value
+  assert.equal(missingInfo, null)
+  assert.equal(error.value, null, '缺行不是取数失败（不得进入可重试的失败口径）')
+  assert.equal(unavailable.value, true, '成功但无匹配行必须显式标记')
+
+  // 取到该行后标记清除（同一实例的第二轮）
+  g.__get = async () => statsOf('runtime', '运行日志')
+  refreshKey.value += 1
+  await nextTick()
+  await flush()
+  assert.equal(unavailable.value, false)
+  const hit: { name?: string } | null = info.value
+  assert.equal(hit?.name, '运行日志')
+
+  // 换行时旧行的「暂无统计」不得挂到新行上（取数在途期间回到无结论态）
+  const pending = deferred()
+  g.__get = async () => pending.promise
+  target.value = { logKey: 'audit' }
+  await nextTick()
+  assert.equal(unavailable.value, false, '换行后缺行标记必须立即清空')
+  pending.resolve(statsOf('audit', '操作日志'))
+  await flush()
+  assert.equal(unavailable.value, false)
+  const next: { name?: string } | null = info.value
+  assert.equal(next?.name, '操作日志')
+})
+
+test('无统计数据时渲染显式提示（不是把统计条藏起来）', () => {
+  const bar = code('src/components/LogStorageBar.vue')
+  assert.match(bar, /v-else-if="unavailable" class="form-tip-line">该日志暂无统计数据</, '缺行必须有可见归宿')
 })
 
 test('日志统计条消费 rows_unavailable：保持条数口径并标注不可用', () => {
   // 主题归属：日志统计条用例放在日志统计 spec 中（此前混在管理 TLS 证书
   // spec 里，查日志条不会想到那个文件）。
-  const bar = source('src/components/LogStorageBar.vue')
+  const bar = code('src/components/LogStorageBar.vue')
   // 响应类型声明在取数层组合子（LogStorageBar 只消费其 info）。
-  assert.match(source('src/composables/useLogStorageStats.ts'), /rows_unavailable\?: boolean/, '响应字段类型必须声明')
+  assert.match(code('src/composables/useLogStorageStats.ts'), /rows_unavailable\?: boolean/, '响应字段类型必须声明')
   // 出现判定必须真正消费该 flag：后端改为「保留上次行数 + flag=true」时，陈旧
   // 行数不得被当有效值（仅用 rows == null 推导会让 flag 成为死字段）。
   // 该判定是单表达式箭头体（无块体可配对），按行切片。
@@ -258,10 +300,10 @@ test('日志统计条消费 rows_unavailable：保持条数口径并标注不可
 // rows_unavailable 的跨栈对表：前端响应类型与后端 json tag 必须同名字段
 // （后端改名时前端类型不会报错，只会静默读 undefined）。
 test('rows_unavailable 与后端 logstats.go 的 json tag 同源（跨栈钉）', () => {
-  const go = repoSource('internal/handlers/logstats.go')
+  const go = repoCode('internal/handlers/logstats.go')
   assert.match(go, /RowsUnavailable bool\s+`json:"rows_unavailable,omitempty"`/, '后端 json tag 漂移')
   assert.match(
-    source('src/composables/useLogStorageStats.ts'),
+    code('src/composables/useLogStorageStats.ts'),
     /rows_unavailable\?: boolean/,
     '前端类型必须声明同名可选字段',
   )

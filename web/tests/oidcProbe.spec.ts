@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createOidcProbeGuard, isOidcProbeFresh, oidcProbeKey } from '../src/utils/oidcProbe.ts'
-import { section, source } from './_helpers.ts'
+import { section, code } from './_helpers.ts'
 
 const values = { issuer: ' https://idp.example ', clientId: ' client ', clientSecret: 'secret' }
 
@@ -29,7 +29,7 @@ test('已通过且值未变的探测结果可复用', () => {
   assert.equal(isOidcProbeFresh({ ok: true, key }, { ...values, clientSecret: 'changed' }), false)
   assert.equal(isOidcProbeFresh({ ok: false, key }, values), false)
   assert.equal(isOidcProbeFresh({ ok: true }, values), false, '无键=不可复用')
-  const page = source('src/views/settings/OIDCSettings.vue')
+  const page = code('src/views/settings/OIDCSettings.vue')
   assert.match(
     section(page, 'const probeOnBlur = () => {', '\n}'),
     /if \(isOidcProbeFresh\(probe, currentProbeValues\(\)\)\) return/,

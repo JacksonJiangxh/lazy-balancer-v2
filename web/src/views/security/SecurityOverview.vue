@@ -152,7 +152,7 @@
     </div>
 
     <el-row :gutter="20" class="mb-5">
-      <el-col :span="16">
+      <el-col :xs="24" :md="16">
         <el-card shadow="always">
           <template #header>
             <div class="card-header">
@@ -168,7 +168,7 @@
           </div>
         </el-card>
       </el-col>
-      <el-col :span="8">
+      <el-col :xs="24" :md="8">
         <el-card shadow="always">
           <template #header>
             <div class="card-header">
@@ -188,7 +188,7 @@
     </el-row>
 
     <el-row :gutter="20" class="mb-5 events-row">
-      <el-col :span="16">
+      <el-col :xs="24" :md="16">
         <el-card shadow="always">
           <template #header>
             <div class="card-header">
@@ -217,7 +217,7 @@
           </el-table>
         </el-card>
       </el-col>
-      <el-col :span="8">
+      <el-col :xs="24" :md="8">
         <el-card shadow="always">
           <template #header>
             <div class="card-header">

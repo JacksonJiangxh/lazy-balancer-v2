@@ -1,13 +1,15 @@
 // 威胁大屏光流/弹框聚合单源（纯函数，node:test 可覆盖）。
 // 口径：攻击类型不区分，只按地域；中国精确到省；同一地区同一秒为一桶。
 import { FLOW_AGGREGATE_THRESHOLD, type FlowArcTier } from './threatTheme.ts'
+import { parseDbDateMs } from './timeZoneFormat.ts'
 
-/** DB datetime 无时区时按 UTC 解析（与 utils/date.ts 同口径）。 */
+// DB 墙钟 → epoch 的规范化/解析内核在 timeZoneFormat（与 date.ts 同源）；
+// 本函数只把「解析失败」映射为 NaN（大屏按无效时间丢弃该事件，不抛）。
+// 无白名单：威胁事件时间戳只可能是 DB 墙钟或 RFC3339，不做「人读文本」区分。
+/** DB datetime 无时区时按 UTC 解析（与 utils/date.ts 同一内核，失败为 NaN）。 */
 export function flowTimestamp(value: string): number {
   if (!value) return NaN
-  const s = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?$/.test(value) ? `${value.replace(' ', 'T')}Z` : value
-  const t = Date.parse(s)
-  return Number.isFinite(t) ? t : NaN
+  return parseDbDateMs(value) ?? NaN
 }
 
 /** 增量批次动效（流光/弹框）的实时性上限：入库延迟/轮转回填会把
@@ -66,7 +68,7 @@ function nextAdaptiveSampleN(current: number, observedRate: number): number {
   return observedRate > ADAPTIVE_SAMPLE_THRESHOLDS.upTo4 ? 4 : 1
 }
 
-export interface AdaptiveSampleState {
+interface AdaptiveSampleState {
   /** 当前生效档位（1/4/8） */
   active: number
   /** 已连续确认的**同一目标**采样次数 */
@@ -77,7 +79,7 @@ export interface AdaptiveSampleState {
   pendingTarget?: number
 }
 
-export interface AdaptiveSampleOutcome extends AdaptiveSampleState {
+interface AdaptiveSampleOutcome extends AdaptiveSampleState {
   changed: boolean
 }
 
@@ -106,7 +108,7 @@ export function stepAdaptiveSample(state: AdaptiveSampleState, observedRate: num
 /** 单轮最多新增光流数；正常流与攻击流共用同一预算（模块内默认值）。 */
 const FLOW_MAX_ARCS_PER_FLUSH = 12
 
-export interface FlowArcPlan {
+interface FlowArcPlan {
   /** 分组键（地区|时间桶）。 */
   key: string
   /** 光流起点地区（中国精确到省；洪峰坍缩为国家）。 */
@@ -117,7 +119,7 @@ export interface FlowArcPlan {
   tier: FlowArcTier
 }
 
-export interface FlowArcGroupLike {
+interface FlowArcGroupLike {
   /** 聚合地域 key（地区+时间桶）。 */
   key: string
   /** 光流起点地区。 */
@@ -161,7 +163,7 @@ export function planFlowArcs(
   return plan
 }
 
-export interface FlowEventPlanInput {
+interface FlowEventPlanInput {
   country?: string
   province?: string
   at?: number

@@ -6,9 +6,9 @@ import (
 )
 
 // geoip 透传路由（无 reverse_proxy）与主/路径路由会为同一请求各记一条指标
-// 序列。采集链按 services.GeoIPPassSeriesMarker 整行剔除；实时指标解析此前
+// 序列。采集链按 services.IsGeoIPPassSeries 整行剔除；实时指标解析此前
 // 未剔除，导致首页「总请求数/流量/状态码分布」在启用 GeoIP 的规则上翻倍，
-// 并与同页采集链来源的速率卡矛盾。本用例钉住两条链同口径（共用同一常量）。
+// 并与同页采集链来源的速率卡矛盾。本用例钉住两条链同口径（共用同一判据）。
 func TestParsePrometheusMetrics_skipsGeoIPPassSeries(t *testing.T) {
 	body := strings.Join([]string{
 		`caddy_http_requests_total{handler="reverse_proxy",host="example.com"} 9`,

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // TestTrustedProxyDegradation_bannerRecordsOnApply：畸形网段 JSON + 启用态
@@ -64,7 +65,11 @@ func TestTrustedProxyDegradation_bannerRecordsOnApply(t *testing.T) {
 	if err := service.GenerateAndApplyConfig(); err != nil {
 		t.Fatalf("degraded render must still apply (不 fail-visible): %v", err)
 	}
-	<-applied
+	select {
+	case <-applied:
+	case <-time.After(5 * time.Second):
+		t.Fatal("apply 请求未在 5s 内到达 Caddy（挂起或接线丢失）")
+	}
 	var banner string
 	if err := database.QueryRow(`SELECT COALESCE(caddy_apply_error,'') FROM global_config WHERE id=1`).Scan(&banner); err != nil {
 		t.Fatalf("read banner: %v", err)

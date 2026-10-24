@@ -148,9 +148,19 @@ func TestCaddyService_ApplyLastKnownGood_blocks_while_caddy_op_lock_held(t *test
 	// When：持锁期间调用 ApplyLastKnownGood
 	CaddyOpLock.Lock()
 	done := make(chan error, 1)
+	started := make(chan struct{})
 	go func() {
+		close(started)
 		done <- svc.ApplyLastKnownGood()
 	}()
+	// 正向握手：必须确认 goroutine 已进入调用，再断言「未完成」——否则慢
+	// 调度下 300ms 窗口在零证据时空转通过（用例对锁语义零信息量）。
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		CaddyOpLock.Unlock()
+		t.Fatal("ApplyLastKnownGood goroutine 未启动")
+	}
 
 	// Then：必须阻塞至 CaddyOpLock 释放（持锁期间完成=未入锁）
 	select {

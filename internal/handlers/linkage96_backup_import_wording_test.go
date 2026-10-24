@@ -13,6 +13,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -51,34 +52,25 @@ func TestImportPartialSuccess_messageKeepsPhaseOnce(t *testing.T) {
 func TestCertJobProviderDangling_wordingHasSingleSource(t *testing.T) {
 	const (
 		disabledFragment = "个证书任务的 CA 提供商已禁用"
-		missingFragment  = "个证书任务引用的 CA 提供商不存在"
+		missingFragment  = "个证书任务引用的 CA 提供商已不存在"
 	)
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "config_backup.go", nil, 0)
+	// 扫描面=整个 handlers 包的非测试源文件（含 package 级 var/const）：
+	// 只解析 config_backup.go 的函数体时，文案被搬到预览/审计写点或抽成
+	// 包级常量都会漏扫（漂移无网）。
+	paths, err := filepath.Glob("*.go")
 	if err != nil {
-		t.Fatalf("parse config_backup.go: %v", err)
+		t.Fatal(err)
 	}
-	singleSource := ""
-	for _, decl := range file.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
-		if !ok {
-			continue
-		}
-		if fn.Name.Name == "certJobProviderDanglingWarnings" {
-			singleSource = fn.Name.Name
-		}
-	}
-	if singleSource == "" {
-		t.Fatal("证书任务悬挂文案单源函数缺失")
-	}
+	fset := token.NewFileSet()
+	singleSourceHits := 0
 	var offenders []string
-	for _, decl := range file.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
-		if !ok || fn.Body == nil || fn.Name.Name == singleSource {
-			continue
-		}
-		ast.Inspect(fn.Body, func(node ast.Node) bool {
-			lit, ok := node.(*ast.BasicLit)
+	scannedFiles := 0
+	isFragment := func(value string) bool {
+		return strings.Contains(value, disabledFragment) || strings.Contains(value, missingFragment)
+	}
+	inspectLiterals := func(label string, node ast.Node) {
+		ast.Inspect(node, func(n ast.Node) bool {
+			lit, ok := n.(*ast.BasicLit)
 			if !ok || lit.Kind != token.STRING {
 				return true
 			}
@@ -86,11 +78,54 @@ func TestCertJobProviderDangling_wordingHasSingleSource(t *testing.T) {
 			if unquoteErr != nil {
 				value = strings.Trim(lit.Value, `"`)
 			}
-			if strings.Contains(value, disabledFragment) || strings.Contains(value, missingFragment) {
-				offenders = append(offenders, fn.Name.Name+"："+value)
+			if isFragment(value) {
+				offenders = append(offenders, label+"："+value)
 			}
 			return true
 		})
+	}
+	for _, path := range paths {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		scannedFiles++
+		for _, decl := range file.Decls {
+			switch d := decl.(type) {
+			case *ast.FuncDecl:
+				if d.Body == nil {
+					continue
+				}
+				if d.Name.Name == "certJobProviderDanglingWarnings" {
+					// 正向控制：单源函数体内必须真的含两档文案，否则扫描面
+					// 命中数为零时负向断言（offenders 空）无意义。
+					ast.Inspect(d.Body, func(n ast.Node) bool {
+						lit, ok := n.(*ast.BasicLit)
+						if !ok || lit.Kind != token.STRING {
+							return true
+						}
+						value, _ := strconv.Unquote(lit.Value)
+						if isFragment(value) {
+							singleSourceHits++
+						}
+						return true
+					})
+					continue
+				}
+				inspectLiterals(path+" "+d.Name.Name, d.Body)
+			case *ast.GenDecl:
+				inspectLiterals(path+" "+d.Tok.String(), d)
+			}
+		}
+	}
+	if scannedFiles == 0 {
+		t.Fatal("扫描面为空（handlers 包源文件未读到）")
+	}
+	if singleSourceHits < 2 {
+		t.Fatalf("单源函数 certJobProviderDanglingWarnings 仅命中 %d 条文案（want ≥2，两档各一条）——判据或函数边界失效", singleSourceHits)
 	}
 	if len(offenders) > 0 {
 		t.Fatalf("悬挂文案在单源函数外重复出现（改措辞会漂移）:\n%s", strings.Join(offenders, "\n"))

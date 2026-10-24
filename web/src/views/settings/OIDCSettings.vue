@@ -114,7 +114,7 @@
 
     <template #footer>
       <div class="dialog-footer">
-        <el-button :loading="testing" :disabled="isReadOnly" @click="test">测试连接</el-button>
+        <el-button :loading="testing" :disabled="isReadOnly || saving" @click="test">测试连接</el-button>
         <el-button v-if="enabled" plain type="warning" :loading="saving" :disabled="isReadOnly" @click="toggleEnabled(false)">暂停使用</el-button>
         <el-button v-if="configured" plain type="danger" :disabled="saving || isReadOnly" @click="remove">删除配置</el-button>
         <el-button type="primary" :loading="saving" :disabled="isReadOnly" @click="save">{{ enabled ? '更新配置' : '保存并启用' }}</el-button>
@@ -337,26 +337,28 @@ const save = async () => {
   if (!form.issuer.trim()) { ElMessage.warning('请填写服务地址'); return }
   if (!form.clientId.trim()) { ElMessage.warning('请填写 Client ID'); return }
   if (!hasSecret.value && !form.clientSecret) { ElMessage.warning('请填写 Client Secret'); return }
-  // 保存门:以「当前表单值」测试通过才允许保存——防止改了凭证未测就落库
-  if (!isOidcProbeFresh(probe, currentProbeValues())) {
-    const ok = await runProbe()
-    if (!ok) { ElMessage.warning('测试连接未通过，请先修正配置再保存'); return }
-  }
-  if (configured.value) {
-    try {
-      await ElMessageBox.confirm(
-        enabled.value ? '确认更新 OIDC 配置？' : '确认保存并启用 OIDC 登录？',
-        enabled.value ? '更新配置' : '保存并启用',
-        { type: 'warning' },
-      )
-    } catch { return }
-  }
-  if (!probe.ok || probe.key !== oidcProbeKey(currentProbeValues())) {
-    ElMessage.warning('配置已变更，请重新测试连接后再保存')
-    return
-  }
+  // 在途门须先于探测与二次确认置位——discovery 常 0.2–2s，这段窗口内
+  // 按钮 loading 缺席会让连点叠出两个确认框与两条 PUT。
   saving.value = true
   try {
+    // 保存门:以「当前表单值」测试通过才允许保存——防止改了凭证未测就落库
+    if (!isOidcProbeFresh(probe, currentProbeValues())) {
+      const ok = await runProbe()
+      if (!ok) { ElMessage.warning('测试连接未通过，请先修正配置再保存'); return }
+    }
+    if (configured.value) {
+      try {
+        await ElMessageBox.confirm(
+          enabled.value ? '确认更新 OIDC 配置？' : '确认保存并启用 OIDC 登录？',
+          enabled.value ? '更新配置' : '保存并启用',
+          { type: 'warning' },
+        )
+      } catch { return }
+    }
+    if (!probe.ok || probe.key !== oidcProbeKey(currentProbeValues())) {
+      ElMessage.warning('配置已变更，请重新测试连接后再保存')
+      return
+    }
     const payload: Record<string, unknown> = {
       issuer: form.issuer,
       client_id: form.clientId,

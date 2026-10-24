@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strconv"
 
 	"lazy-balancer-v2/internal/db"
 )
@@ -65,10 +66,15 @@ func ValidBlockStatusCode(v int) bool {
 }
 
 // securityEnumRow 是归一前后对比所需的枚举列快照（含策略标识）。
+// rate_limit_enabled/rate_limit_rps 同为归一目标：rps 非法行会被关停
+// （保护面收窄），与 mode→off 同型，必须能逐策略留痕（只报总条数无法定位
+// 「哪条策略的限流被关」）。
 type securityEnumRow struct {
 	id                         int64
 	name                       string
 	ipACLMode, mode, geoIPMode string
+	rateLimitEnabled           int
+	rateLimitRPS               int
 }
 
 // securityEnumDirtyRows 选出枚举列非法或带首尾空白的策略行——谓词与
@@ -77,14 +83,16 @@ type securityEnumRow struct {
 // 规则；ip_acl_mode 空→deny 会突然开始按名单拦截），只报总条数无法定位
 // 「哪条策略、哪个字段、从什么值变成什么值」，故在变更前后各取一次快照。
 func securityEnumDirtyRows(ctx context.Context, tx *sql.Tx) ([]securityEnumRow, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT id, COALESCE(name,''), COALESCE(ip_acl_mode,''), COALESCE(mode,''), COALESCE(geoip_mode,'')
+	rows, err := tx.QueryContext(ctx, `SELECT id, COALESCE(name,''), COALESCE(ip_acl_mode,''), COALESCE(mode,''), COALESCE(geoip_mode,''),
+			COALESCE(rate_limit_enabled,0), COALESCE(rate_limit_rps,0)
 		FROM security_policies
 		WHERE (ip_acl_mode IS NOT NULL AND ip_acl_mode<>TRIM(ip_acl_mode))
 		   OR (mode IS NOT NULL AND mode<>TRIM(mode))
 		   OR (geoip_mode IS NOT NULL AND geoip_mode<>TRIM(geoip_mode))
 		   OR COALESCE(TRIM(ip_acl_mode),'') NOT IN ('allow','deny','绕过')
 		   OR COALESCE(TRIM(mode),'') NOT IN ('off','custom_only','detection','blocking')
-		   OR COALESCE(TRIM(geoip_mode),'') NOT IN ('off','allow','deny')`)
+		   OR COALESCE(TRIM(geoip_mode),'') NOT IN ('off','allow','deny')
+		   OR (COALESCE(rate_limit_enabled,0)=1 AND COALESCE(rate_limit_rps,0)<1)`)
 	if err != nil {
 		return nil, err
 	}
@@ -92,7 +100,7 @@ func securityEnumDirtyRows(ctx context.Context, tx *sql.Tx) ([]securityEnumRow, 
 	var out []securityEnumRow
 	for rows.Next() {
 		var r securityEnumRow
-		if err := rows.Scan(&r.id, &r.name, &r.ipACLMode, &r.mode, &r.geoIPMode); err != nil {
+		if err := rows.Scan(&r.id, &r.name, &r.ipACLMode, &r.mode, &r.geoIPMode, &r.rateLimitEnabled, &r.rateLimitRPS); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -113,8 +121,10 @@ func securityEnumNormalizedChanges(ctx context.Context, tx *sql.Tx, before []sec
 	var out []securityEnumChange
 	for _, b := range before {
 		var ipACLMode, mode, geoIPMode string
-		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(ip_acl_mode,''), COALESCE(mode,''), COALESCE(geoip_mode,'') FROM security_policies WHERE id=?`, b.id).
-			Scan(&ipACLMode, &mode, &geoIPMode); err != nil {
+		var rateLimitEnabled, rateLimitRPS int
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(ip_acl_mode,''), COALESCE(mode,''), COALESCE(geoip_mode,''),
+				COALESCE(rate_limit_enabled,0), COALESCE(rate_limit_rps,0) FROM security_policies WHERE id=?`, b.id).
+			Scan(&ipACLMode, &mode, &geoIPMode, &rateLimitEnabled, &rateLimitRPS); err != nil {
 			if err == sql.ErrNoRows {
 				continue
 			}
@@ -126,6 +136,8 @@ func securityEnumNormalizedChanges(ctx context.Context, tx *sql.Tx, before []sec
 			{"ip_acl_mode", b.ipACLMode, ipACLMode},
 			{"mode", b.mode, mode},
 			{"geoip_mode", b.geoIPMode, geoIPMode},
+			{"rate_limit_enabled", strconv.Itoa(b.rateLimitEnabled), strconv.Itoa(rateLimitEnabled)},
+			{"rate_limit_rps", strconv.Itoa(b.rateLimitRPS), strconv.Itoa(rateLimitRPS)},
 		} {
 			if f.from == f.to {
 				continue
@@ -137,17 +149,22 @@ func securityEnumNormalizedChanges(ctx context.Context, tx *sql.Tx, before []sec
 }
 
 // securityEnumReportNormalized 把逐字段变更写进日志，并对「保护语义收窄」
-// 的方向（mode 非 off → off，该策略的 CRS 与自定义规则全部停止发射）额外
-// 落一条系统审计——与渲染跳过/名单装载失败等安全面变更的留痕口径一致。
-// 归一本身不改变（对齐 Create 默认值族、避免整份配置生成失败）。
+// 的方向额外落一条系统审计——mode 非 off → off（该策略的 CRS 与自定义规则
+// 全部停止发射）与 rate_limit_enabled 1 → 0（rps 非法被关停，该策略不再
+// 限流）同属保护面收窄，处置口径必须一致（此前限流关停只有 INFO 计数，
+// 审计中心无法回答「哪条策略被关了」）。归一本身不改变（对齐 Create 默认值族、
+// 避免整份配置生成失败）。
 func securityEnumReportNormalized(changes []securityEnumChange) {
 	for _, ch := range changes {
 		Logf("warn", "security enum normalize: 策略 %q（#%d）%s 由 %q 归一为 %q", ch.name, ch.id, ch.field, ch.from, ch.to)
-		if ch.field != "mode" || ch.to != "off" || ch.from == "off" {
-			continue
+		switch {
+		case ch.field == "mode" && ch.to == "off" && ch.from != "off":
+			RecordAuditLog("system", "修改状态", "安全策略",
+				FormatAuditDetail(fmt.Sprintf("策略 %q（#%d）mode 由 %q 归一为 off（该策略规则停止发射）", ch.name, ch.id, ch.from), AuditResultPart("success")), "")
+		case ch.field == "rate_limit_enabled" && ch.from == "1" && ch.to == "0":
+			RecordAuditLog("system", "修改状态", "安全策略",
+				FormatAuditDetail(fmt.Sprintf("策略 %q（#%d）限流被启动归一关停（rate_limit_rps 非法 <1，该策略不再限流）", ch.name, ch.id), AuditResultPart("success")), "")
 		}
-		RecordAuditLog("system", "修改状态", "安全策略",
-			FormatAuditDetail(fmt.Sprintf("策略 %q（#%d）mode 由 %q 归一为 off（该策略规则停止发射）", ch.name, ch.id, ch.from), AuditResultPart("success")), "")
 	}
 }
 

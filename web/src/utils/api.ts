@@ -209,7 +209,12 @@ service.interceptors.response.use(
       // cluster_ticket/错误分支均如此）。未来若新增「HTTP 200 + code≠0」端点，
       // 按 status===409 分类的调用方（如 useLibUpdateDialog）将静默绕过分类与
       // 重试逻辑——此契约由 tests/apiErrorContract.spec.ts 钉住现状。
-      return Promise.reject(new ApiRequestError(res.message || '请求失败', response.status))
+      //
+      // 第三参数与 HTTP 失败分支同形（error.response.data）：失败分支的事实
+      // 披露（导入/还原的 data.warnings 等）只经 ApiRequestError.data 传递，
+      // 两类失败的错误对象形状必须一致，否则改走业务码信封的端点会让消费方
+      // （importFailureReport）静默丢失 warnings。
+      return Promise.reject(new ApiRequestError(res.message || '请求失败', response.status, res.data))
     }
     return res
   },
@@ -344,14 +349,6 @@ export const request: RequestClient = {
   delete<T = APIResponse<unknown>>(url: string, config?: AxiosRequestConfig): Promise<T> {
     return service.delete(url, config) as Promise<T>
   },
-}
-
-export function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
-  const k = 1024
-  const sizes = ['B', 'KB', 'MB', 'GB', 'TB']
-  const i = Math.min(Math.max(Math.floor(Math.log(bytes) / Math.log(k)), 0), sizes.length - 1)
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
 }
 
 export function isTokenExpired(token: string): boolean {

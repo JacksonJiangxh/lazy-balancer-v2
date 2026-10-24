@@ -60,16 +60,23 @@ const makeHarness = (): Harness => {
   // onUnmounted 无组件实例会打印 Vue 警告——本文件只验证可见性行为，静音
   const warn = console.warn
   console.warn = () => {}
+  const restore = (key: 'document' | 'requestAnimationFrame' | 'cancelAnimationFrame', value: unknown): void => {
+    // 用例前这些宿主属性可能根本不存在：写回 undefined 会留下一个自有属性，
+    // 让后续用例的 `'document' in globalThis` 判定失真——统一按删除还原。
+    if (value === undefined) Reflect.deleteProperty(g, key)
+    else (g as Record<string, unknown>)[key] = value
+  }
   return {
     doc,
     frames,
     clock,
     dispose: () => {
       console.warn = warn
-      g.document = previous.document
-      g.requestAnimationFrame = previous.raf
-      g.cancelAnimationFrame = previous.caf
+      restore('document', previous.document)
+      restore('requestAnimationFrame', previous.raf)
+      restore('cancelAnimationFrame', previous.caf)
       if (previous.performance) Object.defineProperty(globalThis, 'performance', previous.performance)
+      else Reflect.deleteProperty(globalThis, 'performance')
     },
   }
 }

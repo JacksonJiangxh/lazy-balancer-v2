@@ -177,6 +177,7 @@
               />
             </el-form-item>
           </template>
+          <div class="form-tip-line">切换认证方式会清除另一认证方式的已保存凭证，需重新填写</div>
         </template>
         <el-divider content-position="left" class="section-divider">状态</el-divider>
         <el-form-item label="启用">
@@ -190,7 +191,7 @@
       </template>
     </el-dialog>
 
-    <el-dialog v-model="caDialogVisible" width="min(560px, 92vw)" :before-close="beforeCADialogClose" class="ca-config-dialog" top="6vh">
+    <el-dialog v-model="caDialogVisible" width="min(560px, 92vw)" :close-on-click-modal="false" :before-close="beforeCADialogClose" class="ca-config-dialog" top="6vh">
       <template #header>
         <DialogHeader :icon="Postcard" title="编辑 CA 提供商" subtitle="证书签发机构对接参数：并发 / 间隔与 EAB 凭证（ZeroSSL）" tone="warning" />
       </template>
@@ -211,7 +212,7 @@
           <span class="form-tip-inline">同时进行的签发任务数</span>
         </el-form-item>
         <el-form-item label="最小间隔">
-          <el-input-number v-model="caForm.min_interval_ms" :min="1000" :max="60000" :step="1000" />
+          <el-input-number v-model="caForm.min_interval_ms" :min="1" :max="60000" :step="1000" />
           <span class="form-tip-inline">两次新签发之间的最小间隔（毫秒）</span>
         </el-form-item>
         <template v-if="caForm.provider === 'zerossl'">
@@ -792,6 +793,17 @@ const handleSave = async () => {
   }
   if (!global.value.default_ca_provider_id) {
     ElMessage.warning('请选择 CA 提供商')
+    return
+  }
+  // 默认 CA 被禁用/删除后，整卡任何保存都会被写侧门拒绝（英文 400）——
+  // 前置为可定位的中文提示，避免只改其它字段也无法保存。
+  const defaultCA = caProviders.value.find((p) => p.id === global.value.default_ca_provider_id)
+  if (!defaultCA) {
+    ElMessage.warning('默认 CA 提供商不存在，请重新选择')
+    return
+  }
+  if (!defaultCA.enabled) {
+    ElMessage.warning('默认 CA 提供商已被禁用：请先在 CA 提供商列表中启用它，或改选其他 CA')
     return
   }
   savingGlobal.value = true

@@ -99,7 +99,7 @@ func TestOIDCTokenExchange_rejectsDiscoveredNonCompliantTokenEndpoint(t *testing
 		t.Fatalf("discovery over compliant loopback issuer: %v", err)
 	}
 	oauthCfg := oidcOAuthConfig(OIDCConfig{ClientID: "cid", ClientSecret: "top-secret"}, p, "http://127.0.0.1:9/callback")
-	ctx := oidc.ClientContext(context.Background(), oidcOutboundClient)
+	ctx := oidc.ClientContext(oidcOutboundContext(context.Background(), discoveryURL), oidcOutboundClient)
 	_, err = oauthCfg.Exchange(ctx, "code", oauth2.SetAuthURLParam("code_verifier", "verifier"))
 	if err == nil {
 		t.Fatal("token 交换必须失败：discovery 的 token_endpoint 不合规")
@@ -109,6 +109,79 @@ func TestOIDCTokenExchange_rejectsDiscoveredNonCompliantTokenEndpoint(t *testing
 	}
 	if got := hits.Load(); got != 0 {
 		t.Fatalf("不合规 token_endpoint 收到 %d 次请求，want 0（client_secret 不得出站）", got)
+	}
+}
+
+// 回环 http 豁免只对 issuer 自身成立：合规 https issuer 的 discovery 把
+// token_endpoint/jwks_uri 指向本机 http 端口时，端点策略必须拒绝——否则
+// client_id/client_secret 会被明文 POST 到本机任意 HTTP 服务（本机 SSRF）。
+func TestOIDCEndpointPolicy_rejectsLoopbackHTTPUnderHTTPSIssuer(t *testing.T) {
+	cases := []struct {
+		name     string
+		endpoint string
+		issuer   string
+	}{
+		{"token_endpoint 回环 http", "http://127.0.0.1:8080/token", "https://idp.example.com"},
+		{"jwks_uri 回环 http", "http://127.0.0.1:8080/jwks", "https://idp.example.com"},
+		{"authorization_endpoint 回环 IPv6 http", "http://[::1]:9000/authorize", "https://idp.example.com"},
+		{"基准 issuer 缺失按最严", "http://127.0.0.1:8080/token", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateOIDCEndpointURL(tc.endpoint, tc.issuer); err == nil {
+				t.Fatalf("validateOIDCEndpointURL(%q, %q) = nil, want 拒绝（https issuer 下端点必须 https）", tc.endpoint, tc.issuer)
+			}
+		})
+	}
+	// 回归：本机 mock 形态（http 回环 issuer）仍放行回环 http 与任意 https。
+	for _, endpoint := range []string{"http://127.0.0.1:8080/token", "https://idp.example.com/token"} {
+		if err := validateOIDCEndpointURL(endpoint, "http://127.0.0.1:18080"); err != nil {
+			t.Fatalf("validateOIDCEndpointURL(%q, loopback issuer) = %v, want nil（本机测试形态不得误伤）", endpoint, err)
+		}
+	}
+}
+
+// 传输层同源：基准 issuer 为 https 时，指向回环 http 的请求必须零出站拒绝。
+func TestOIDCOutboundClient_rejectsLoopbackHTTPUnderHTTPSIssuer(t *testing.T) {
+	var hits atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+
+	ctx := oidcOutboundContext(context.Background(), "https://idp.example.com")
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, target.URL+"/token", strings.NewReader("client_secret=top-secret"))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	resp, err := oidcOutboundClient.Do(request)
+	if resp != nil {
+		resp.Body.Close()
+	}
+	if err == nil || !strings.Contains(err.Error(), "不合规") {
+		t.Fatalf("err=%v, want 传输层策略拒绝", err)
+	}
+	if got := hits.Load(); got != 0 {
+		t.Fatalf("回环 http 端点收到 %d 次请求，want 0（凭据不得出站）", got)
+	}
+}
+
+// 测试连接路径同源：https issuer 下 jwks_uri 指向回环 http 必须在探测前拒绝。
+func TestProbeOIDCJWKS_rejectsLoopbackHTTPUnderHTTPSIssuer(t *testing.T) {
+	var hits atomic.Int32
+	jwks := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write([]byte(`{"keys":[{"kty":"RSA"}]}`))
+	}))
+	defer jwks.Close()
+
+	err := probeOIDCJWKS(jwks.URL, "https://idp.example.com")
+	if err == nil || !strings.Contains(err.Error(), "不合规") {
+		t.Fatalf("probeOIDCJWKS err=%v, want 策略拒绝", err)
+	}
+	if got := hits.Load(); got != 0 {
+		t.Fatalf("回环 http jwks_uri 收到 %d 次请求，want 0", got)
 	}
 }
 

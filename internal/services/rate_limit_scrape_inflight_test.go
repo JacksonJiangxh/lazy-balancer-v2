@@ -5,6 +5,7 @@ package services
 // 重启）。panic 照常向上传播，等待方收到 error 而非挂死。
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -53,12 +54,25 @@ func TestScrapeRateLimitBlocks_panicClearsInflightForWaiters(t *testing.T) {
 	}()
 	waitForSignal(t, roundTripStarted, "抓取未开始")
 
+	waiterEntered := make(chan struct{})
+	var waiterOnce sync.Once
+	oldHook := overviewMetricsWaiterHook
+	overviewMetricsWaiterHook = func() { waiterOnce.Do(func() { close(waiterEntered) }) }
+	t.Cleanup(func() { overviewMetricsWaiterHook = oldHook })
+
 	waiterResult := make(chan error, 1)
 	go func() {
+		// 等待方若因单飞失效而自行抓取，注入 panic 会让整个测试二进制崩溃；
+		// 捕获后转成失败信息（同包其他用例得以保留）。
+		defer func() {
+			if r := recover(); r != nil {
+				waiterResult <- fmt.Errorf("waiter panicked（单飞未覆盖等待方）: %v", r)
+			}
+		}()
 		_, err := ScrapeRateLimitBlocks(metricsURL)
 		waiterResult <- err
 	}()
-	time.Sleep(50 * time.Millisecond) // 让等待方进入单飞等待
+	waitForSignal(t, waiterEntered, "等待方未进入单飞等待（单飞机制失效）")
 
 	// When 抓取 panic 向上传播。
 	close(allowPanic)

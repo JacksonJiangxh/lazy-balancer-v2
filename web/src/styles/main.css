@@ -188,10 +188,11 @@ body {
 .error-banner .error-banner-meta { display: block; font-size: 12px; margin-top: 0; line-height: 1.5; }
 
 /* 轮询错误横幅行内件：Rules/CertJobs/ClusterSettings/AppLayout
-   四处模板共用，此前三文件 scoped 逐字重复；.polling-error-alert 容器声明各异
-   （margin-bottom/align-self）保留在各文件本地。 */
+   四处模板共用；容器容器声明统一收敛到下方 .polling-error-alert（此前 7 处
+   页面引用该类却全仓无定义，间距靠各自 mb-5/本地 scoped 分叉）。 */
 .polling-error-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; }
 .polling-error-meta { font-size: 12px; }
+.polling-error-alert { margin-bottom: 16px; }
 
 /* 信息说明横幅统一模式（2026-09-25 用户裁定）：全站信息说明框同形——虚线边框
    浅灰底、12px 600 主文字、无图标；语义同 SecurityPolicies .stage-projection-bar */

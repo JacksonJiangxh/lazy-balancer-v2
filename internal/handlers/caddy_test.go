@@ -119,6 +119,24 @@ func TestCaddyProcessRunning_detectsLiveProcess(t *testing.T) {
 	}
 }
 
+// caddyLivePID 展示口径必须确定：监督器 churn 窗口内同时存在两个存活 caddy
+// 时，取最小 pid（而非 ReadDir 返回序首个）——否则仪表盘 pid 会在两次轮询间
+// 跳动。
+func TestCaddyLivePID_picksLowestLivePid(t *testing.T) {
+	root := t.TempDir()
+	seedProcStat(t, root, "900", "caddy", 'S')
+	seedProcStat(t, root, "400", "caddy", 'S')
+	seedProcStat(t, root, "100", "caddy", 'Z') // 僵尸更低 pid，不得入选
+	seedProcStat(t, root, "200", "lazy-balancer", 'S')
+	original := caddyProcRoot
+	caddyProcRoot = root
+	t.Cleanup(func() { caddyProcRoot = original })
+
+	if got := caddyLivePID(); got != 400 {
+		t.Fatalf("caddyLivePID()=%d, want 400（存活进程中的最小 pid）", got)
+	}
+}
+
 func TestCaddyProcessRunning_ignoresNonCaddyAndEmpty(t *testing.T) {
 	// Given 伪 /proc 只有其他进程与无 caddy 的空目录两种情况
 	root := t.TempDir()
@@ -1042,17 +1060,31 @@ func TestPutCaddyConfig_acceptsExactLimitRejectsOneByteOver(t *testing.T) {
 
 	const limit = 1 << 20
 	// 端点入参是 {"content":"<JSON 字符串>"}；content 本身须是对象。
-	// 外层固定 14 字节（{"content":" 与 "}），content 内 4 个引号各转义 +1。
+	// content 必须保留面板自管的 admin 端点（逃生口护栏拒绝 admin off / 改址），
+	// 因此先用空填充量定长，再按差额补 pad。
+	adminListen := strings.TrimPrefix(handler.cfg.CaddyAdminURL, "http://")
 	build := func(total int) string {
-		pad := total - 26
-		return `{"content":"{\"a\":\"` + strings.Repeat("b", pad) + `\"}"}`
+		makeBody := func(pad int) string {
+			content := `{"admin":{"listen":"` + adminListen + `"},"a":"` + strings.Repeat("b", pad) + `"}`
+			payload, err := json.Marshal(map[string]string{"content": content})
+			if err != nil {
+				t.Fatalf("marshal payload: %v", err)
+			}
+			return string(payload)
+		}
+		pad := total - len(makeBody(0))
+		if pad < 0 {
+			t.Fatalf("total=%d 小于固定开销 %d", total, len(makeBody(0)))
+		}
+		body := makeBody(pad)
+		if len(body) != total {
+			t.Fatalf("fixture length=%d, want %d", len(body), total)
+		}
+		return body
 	}
 
 	within := httptest.NewRecorder()
 	bodyWithin := build(limit)
-	if len(bodyWithin) != limit {
-		t.Fatalf("fixture length=%d, want %d", len(bodyWithin), limit)
-	}
 	request := httptest.NewRequest(http.MethodPut, "/caddy/config", strings.NewReader(bodyWithin))
 	request.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(within, request)

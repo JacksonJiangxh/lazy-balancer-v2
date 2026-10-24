@@ -560,8 +560,9 @@ type UpdateRuleRequest struct {
 	HealthCheckHealthyThreshold   *int  `json:"health_check_healthy_threshold"`
 	EnableActiveHealthCheck       *bool `json:"enable_active_health_check"`
 	// TCP 字段指针化——省略（nil）=保留原值。
-	// tcp_try_duration 0=不重试；tcp_try_interval 由启动回填默认 2（写侧
-	// <=0 拒绝），tcp_health_check_port 0=跟随上游端口。
+	// tcp_try_duration 0=不重试；tcp_try_interval 由启动回填默认 250
+	//（毫秒，单位与渲染输出 "250ms" 一致；DDL 与回填同取
+	// db.DefaultTCPTryInterval），tcp_health_check_port 0=跟随上游端口。
 	TCPHealthCheckPort       *int  `json:"tcp_health_check_port"`
 	TCPProxyProtocol         *bool `json:"tcp_proxy_protocol"`
 	TCPTryDuration           *int  `json:"tcp_try_duration"`
@@ -605,6 +606,9 @@ type UpdateRuleRequest struct {
 	// ExpectedUpdatedAt 是可选乐观并发前置条件：客户端回传打开编辑表单时
 	// 看到的 updated_at（RFC3339 或库内平面 UTC 形态）。省略/空串=不校验
 	// （API/MCP 向后兼容）；提供且与事务内读到的库值不一致 → 409。
+	// 保护粒度为秒（updated_at 写侧 datetime('now')，比较前截断到秒）：
+	// 同一秒内他人已提交时版本值不变，本前置条件无法识别——跨秒的并发提交
+	// 才保证拦截；需要秒内严格性时须改用独立版本列（另行设计，非当前契约）。
 	ExpectedUpdatedAt string `json:"expected_updated_at"`
 }
 

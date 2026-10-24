@@ -260,8 +260,9 @@
             </div>
           </template>
           <el-skeleton v-if="initialLoading" :rows="4" animated class="chart-skeleton" />
-          <div v-else-if="trafficUnavailable" class="chart-container collection-state">采集失败</div>
+          <div v-else-if="trafficUnavailable && trafficTimestamps.length === 0" class="chart-container collection-state">采集失败</div>
           <div v-else class="chart-container">
+            <div v-if="trafficUnavailable" class="chart-stale-hint">采集失败：展示上次结果</div>
             <v-chart :option="trafficChartOption" autoresize />
           </div>
         </el-card>
@@ -277,8 +278,9 @@
             </div>
           </template>
           <el-skeleton v-if="initialLoading" :rows="4" animated class="chart-skeleton" />
-          <div v-else-if="connectionsUnavailable" class="chart-container collection-state">采集失败</div>
+          <div v-else-if="connectionsUnavailable && connTimestamps.length === 0" class="chart-container collection-state">采集失败</div>
           <div v-else class="chart-container">
+            <div v-if="connectionsUnavailable" class="chart-stale-hint">采集失败：展示上次结果</div>
             <v-chart :option="connChartOption" autoresize />
           </div>
         </el-card>
@@ -302,7 +304,7 @@
                   <el-radio-button value="requests">按请求数</el-radio-button>
                   <el-radio-button value="bytes">按流量</el-radio-button>
                 </el-radio-group>
-                <span class="rules-count" title="规则数量">{{ rules.length }}</span>
+                <span class="rules-count" :title="`共 ${rules.length} 条规则；本卡展示请求数/流量前 10 条 + 指标采集失败行（零流量规则不进入排行）`">{{ rules.length }}</span>
               </div>
             </div>
           </template>
@@ -476,7 +478,8 @@ import '@/utils/echarts' // 统一注册（副作用，全站单点）
 import type { EChartsOption, LineSeriesOption, TooltipComponentFormatterCallbackParams } from 'echarts'
 import VChart from 'vue-echarts'
 import { useAuthStore } from '@/stores/auth'
-import { request, formatBytes, mfaAwareSuccess } from '@/utils/api'
+import { request, mfaAwareSuccess } from '@/utils/api'
+import { formatBytes } from '@/utils/formatBytes'
 import { ElMessageBox } from 'element-plus'
 import { Monitor, Cpu, Document, Loading, CircleCheck, Odometer, TrendCharts, DataLine, List } from '@element-plus/icons-vue'
 import type { APIResponse, SystemInfo, SystemMetrics, CaddyMetrics, Rule, RuleMetrics, HostMetrics, MetricsOverview } from '@/types'
@@ -1258,6 +1261,7 @@ onUnmounted(() => {
 .chart-container { height: 200px; }
 .chart-skeleton { height: 200px; }
 .collection-state { display: flex; align-items: center; justify-content: center; min-height: 80px; color: #909399; }
+.chart-stale-hint { margin-bottom: 6px; font-size: 12px; color: var(--el-color-warning); }
 
 .text-primary { color: #111827; }
 .text-secondary { color: #6b7280; }

@@ -2,6 +2,7 @@ package services
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -128,10 +129,35 @@ func TestIP2RegionRegionTree_scan(t *testing.T) {
 		}
 	}
 
-	// UEruemqi 段回收——新疆/乌鲁木齐市 必须在位（此前整段被丢）；
-	// revision 机制保证旧缓存自动重建。
-	if tree.Revision != treeCacheRevision {
-		t.Fatalf("tree revision=%q, want %q", tree.Revision, treeCacheRevision)
+	// revision 机制的实际契约：缓存文件的 revision 与当前树版本不一致 → 判过期
+	//（旧缓存自动重建）；revision 一致且条目规范 → 不判过期。只比较
+	// tree.Revision 与生产常量是恒真的（常量由被测扫描函数自己写入）。
+	stalePath := filepath.Join(t.TempDir(), "stale.regions.json")
+	oldData, err := json.Marshal(IP2RegionRegionTree{Revision: "v0-legacy", Provinces: []string{"广东省"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stalePath, oldData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !staleRegionTreeCache(stalePath) {
+		t.Fatal("旧 revision 缓存必须判过期（触发重建）")
+	}
+	freshPath := filepath.Join(t.TempDir(), "fresh.regions.json")
+	freshData, err := json.Marshal(IP2RegionRegionTree{
+		Revision:  treeCacheRevision,
+		Provinces: []string{"广东省", "海外"},
+		Cities:    map[string][]string{"广东省": {"深圳市"}},
+		Countries: []string{"日本"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(freshPath, freshData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if staleRegionTreeCache(freshPath) {
+		t.Fatal("当前 revision 且条目规范时不得判过期")
 	}
 	foundUrumqi := false
 	for _, c := range tree.Cities["新疆维吾尔自治区"] {

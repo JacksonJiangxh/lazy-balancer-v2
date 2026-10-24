@@ -10,7 +10,7 @@ import { readdirSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
 import { calls, resetCalls, EL_MESSAGE_METHODS, STUB_ELEMENT, STUB_SAVE_RESULT_DEPS, type StubCall } from './_stubs.ts'
-import { source } from './_helpers.ts'
+import { code } from './_helpers.ts'
 
 const webRoot = new URL('../', import.meta.url)
 
@@ -21,7 +21,7 @@ test('index.html 保留挂载点、入口脚本与首帧标题（否则运行期
   assert.match(html, /<html lang="zh-CN">/, '语言声明漂移（字体/断行与读屏口径）')
   // 首帧标题与 branding 的品牌化口径一致：`${appName} V2`。
   assert.match(html, /<title>Lazy Balancer V2<\/title>/)
-  const branding = source('src/utils/branding.ts')
+  const branding = code('src/utils/branding.ts')
   assert.match(branding, /export const appName = ref\('Lazy Balancer'\)/, '品牌默认名漂移（首帧标题与运行期标题会分叉）')
   assert.match(branding, /document\.title = `\$\{appName\.value\} V2`/, '运行期标题必须同形')
 })

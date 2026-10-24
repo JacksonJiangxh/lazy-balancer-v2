@@ -472,14 +472,18 @@ func TestUpdateRule_rejects_negative_health_check_thresholds(t *testing.T) {
 	}
 }
 
-// 定向预览与全量渲染同为 fail-visible；存量非法 protocol 不得
-// 被吞成 200 + 空 server_context。
-func TestGetRuleCaddyConfig_unsupportedProtocolReturnsError(t *testing.T) {
+// 配置查看框的 route/routes 与 server_context 必须同源（运行配置）。
+// 库态≠运行态（apply 失败/外部改动/集群未收敛）时，存量非法 protocol 或
+// 库内 TLS 就绪态都不得再把按库渲染的上下文混进响应——否则对话框里的
+// server/TLS 信息与运行中的路由互相矛盾。
+func TestGetRuleCaddyConfig_serverContextFollowsRunningConfig(t *testing.T) {
 	initializeRuleFeatureTestDB(t)
-	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,strategy,enabled)
-		VALUES ('lb_bad_protocol','bad','sctp','bad.example.test',8080,'weighted_round_robin',1)`); err != nil {
+	if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,strategy,enabled,enable_tls,tls_source)
+		VALUES ('lb_bad_protocol','bad','sctp','bad.example.test',8080,'weighted_round_robin',1,1,'manual')`); err != nil {
 		t.Fatal(err)
 	}
+	// 运行配置里该规则只有明文路由、无 TLS 策略——库内的 enable_tls=1
+	// 属未收敛状态，不得出现在 server_context 中。
 	runningConfig := `{"apps":{"http":{"servers":{"http_8080":{"listen":[":8080"],"routes":[{"@id":"lb_bad_protocol","handle":[]}]}}}}}`
 	fakeCaddy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -491,11 +495,27 @@ func TestGetRuleCaddyConfig_unsupportedProtocolReturnsError(t *testing.T) {
 	router.GET("/rules/:caddy_id/caddy-config", handler.GetRuleCaddyConfig)
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/rules/lb_bad_protocol/caddy-config", nil))
-	if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), "生成规则 Caddy 配置失败") {
-		t.Fatalf("status=%d body=%s, want 500 固定文案（内部错误只进日志）", response.Code, response.Body.String())
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200（运行配置可读即返回，库值不参与上下文构建）", response.Code, response.Body.String())
 	}
-	if strings.Contains(response.Body.String(), "unsupported protocol") {
-		t.Fatalf("500 body 泄露内部错误文本: %s", response.Body.String())
+	var body struct {
+		Data struct {
+			Config struct {
+				ServerContext struct {
+					ServerName string `json:"server_name"`
+				} `json:"server_context"`
+				TLSConnectionPolicies []interface{} `json:"tls_connection_policies"`
+			} `json:"config"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, response.Body.String())
+	}
+	if body.Data.Config.ServerContext.ServerName != "http_8080" {
+		t.Fatalf("server_context.server_name=%q, want http_8080（必须取自运行配置）", body.Data.Config.ServerContext.ServerName)
+	}
+	if len(body.Data.Config.TLSConnectionPolicies) != 0 {
+		t.Fatalf("tls_connection_policies=%v, want empty（运行配置无 TLS 策略，库内 enable_tls=1 不得混入）", body.Data.Config.TLSConnectionPolicies)
 	}
 }
 
@@ -506,7 +526,8 @@ func TestGetRuleCaddyConfig_unsupportedProtocolReturnsError(t *testing.T) {
 // 前端区分「未配置」与「已隐藏」。
 func TestGetRuleCaddyConfig_masksTLSKeyForNonPrivilegedIdentities(t *testing.T) {
 	initializeRuleFeatureTestDB(t)
-	runningConfig := `{"apps":{"http":{"servers":{"http_8443":{"listen":[":8443"],"routes":[{"@id":"lb_tlsview","handle":[]}]}}}}}`
+	runningConfig := `{"apps":{"http":{"servers":{"http_8443":{"listen":[":8443"],"routes":[{"@id":"lb_tlsview","handle":[]}]}}},` +
+		`"tls":{"certificates":{"load_files":[{"certificate":"/etc/lazy-balancer/certs/lb_tlsview.crt","key":"/etc/lazy-balancer/certs/lb_tlsview.key","tags":["lb_tlsview"]}]}}}}`
 	fakeCaddy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method == http.MethodGet && r.URL.Path == "/config/" {

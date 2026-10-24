@@ -13,7 +13,7 @@ import {
   resolveBlockPageAttribution,
   type BlockPageChainPolicy,
 } from '../src/utils/securityStages.ts'
-import { source, repoCode, section } from './_helpers.ts'
+import { code, repoCode, section } from './_helpers.ts'
 
 const peer = (over: Partial<BlockPageChainPolicy> = {}): BlockPageChainPolicy => ({
   policyId: 1,
@@ -167,7 +167,7 @@ test('跨栈对表：后端阶段码与归因分支仍与前端预测同口径',
 // ---- 接线钉：视图是否真的消费上面的单源实现（纯函数测试全绿但视图回退不会红）----
 
 test('接线：SecurityPolicies 逐阶段归因消费 resolveBlockPageAttribution', () => {
-  const text = source('src/views/security/SecurityPolicies.vue')
+  const text = code('src/views/security/SecurityPolicies.vue')
   assert.match(text, /import \{[^}]*resolveBlockPageAttribution[^}]*\} from '@\/utils\/securityStages'/)
   assert.match(text, /const results = stages\.map\(\(stage\) =>\s*resolveBlockPageAttribution\(/)
   // 旧恒绿表达式必须消失（enabled && block_page_id>0 即「生效中」）
@@ -178,7 +178,7 @@ test('接线：SecurityPolicies 逐阶段归因消费 resolveBlockPageAttributio
 })
 
 test('接线：拦截页缺失判定消费单源谓词且受加载门约束', () => {
-  const text = source('src/views/security/SecurityPolicies.vue')
+  const text = code('src/views/security/SecurityPolicies.vue')
   assert.match(text, /blockPageMissing\(e\.blockPageId \?\? 0, blockPages\.value, blockPagesLoaded\.value\)/)
   assert.match(text, /if \(bpRes\.status === 'fulfilled'\) \{ blockPages\.value = bpRes\.value\.data \|\| \[\]; blockPagesLoaded\.value = true \}/)
   // 归因侧同样不得在列表未落地时假设页面存在

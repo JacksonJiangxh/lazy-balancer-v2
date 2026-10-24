@@ -57,7 +57,7 @@
             <!-- 库状态读取失败/首次响应未落地时开关态不可信——显示「—」并禁用，
                  不得按本地默认 true 冒充「已开启」 -->
             <span v-if="!row.autoUpdateKnown" class="text-secondary" title="库状态未知（读取失败），开关态不可信">—</span>
-            <el-switch v-else :model-value="row.autoUpdate" :disabled="isReadOnly || isSlaveNode" @change="(v: boolean) => toggleLibAutoUpdate(row, v)" />
+            <el-switch v-else :model-value="row.autoUpdate" :loading="autoUpdateSaving.has(row.key)" :disabled="isReadOnly || isSlaveNode || autoUpdateSaving.has(row.key)" @change="(v: boolean) => toggleLibAutoUpdate(row, v)" />
           </template>
         </el-table-column>
         <el-table-column v-if="!isSlaveNode" label="上次更新" width="150">
@@ -244,7 +244,7 @@
       <div v-loading="loadingContent"><SyntaxHighlight :content="currentContent" language="apacheconf" /></div>
     </el-dialog>
 
-    <el-dialog v-model="ruleDialogVisible" width="min(760px, 94vw)" class="custom-rule-dialog" top="6vh">
+    <el-dialog v-model="ruleDialogVisible" width="min(760px, 94vw)" class="custom-rule-dialog" top="6vh" :close-on-click-modal="false" :close-on-press-escape="!savingRule" :show-close="!savingRule">
       <template #header>
         <DialogHeader :icon="Filter" :title="editingRuleId ? (isReadOnly ? '查看自定义规则' : '编辑自定义规则') : '新建自定义规则'"
           subtitle="按请求特征匹配并执行拦截 / 记录 / 计分动作，多条件为 AND 关系" tone="danger" />
@@ -338,12 +338,12 @@
         </el-form-item>
       </el-form>
       <template #footer>
-        <el-button @click="ruleDialogVisible = false">取消</el-button>
-        <el-button type="primary" :disabled="isReadOnly" :loading="savingRule" @click="saveCustomRule">保存</el-button>
+        <el-button :disabled="savingRule" @click="ruleDialogVisible = false">取消</el-button>
+        <el-button type="primary" :disabled="isReadOnly || savingRule" :loading="savingRule" @click="saveCustomRule">保存</el-button>
       </template>
     </el-dialog>
 
-    <el-dialog v-model="ipListDialogVisible" width="min(900px, 94vw)" class="ip-list-dialog" top="6vh">
+    <el-dialog v-model="ipListDialogVisible" width="min(900px, 94vw)" class="ip-list-dialog" top="6vh" :close-on-click-modal="false" :close-on-press-escape="!savingIpList" :show-close="!savingIpList">
       <template #header>
         <DialogHeader :icon="List" :title="editingIpListId ? (ipListDialogReadOnly ? '查看 IP 地址列表' : '编辑 IP 地址列表') : '新建 IP 地址列表'"
           subtitle="可复用 IP/CIDR 集合，供安全策略引用（黑白名单 / 信任名单）" />
@@ -431,10 +431,10 @@
       </el-form>
       <template #footer>
         <template v-if="ipListDialogReadOnly">
-          <el-button @click="ipListDialogVisible = false">关闭</el-button>
+          <el-button :disabled="savingIpList" @click="ipListDialogVisible = false">关闭</el-button>
         </template>
         <template v-else>
-          <el-button @click="ipListDialogVisible = false">取消</el-button>
+          <el-button :disabled="savingIpList" @click="ipListDialogVisible = false">取消</el-button>
           <el-tooltip v-if="ipListDetailFailed" content="名单条目加载失败：保存会以空条目覆盖列表，已禁用；请重试加载" placement="top">
             <span>
               <el-button type="primary" disabled>保存</el-button>
@@ -460,6 +460,7 @@
         :days="crsInfo.schedule_days"
         :time="crsInfo.schedule_time"
         :disabled="isReadOnly || isSlaveNode"
+        :unavailable-hint="crsScheduleHint"
         :saving="savingCRSSchedule"
         :tz="scheduleTz"
         @save="saveCRSSchedule"
@@ -492,6 +493,7 @@
         :days="ip2regionInfo.schedule_days"
         :time="ip2regionInfo.schedule_time"
         :disabled="isReadOnly || isSlaveNode"
+        :unavailable-hint="ip2regionScheduleHint"
         :saving="savingIP2RegionSchedule"
         :tz="scheduleTz"
         @save="saveIP2RegionSchedule"
@@ -553,6 +555,7 @@
         :days="threatSchedule.days"
         :time="threatSchedule.time"
         :disabled="isReadOnly || isSlaveNode"
+        :unavailable-hint="threatScheduleHint"
         :saving="savingThreatSchedule"
         :tz="scheduleTz"
         @save="saveThreatSchedule"
@@ -612,6 +615,7 @@
         :days="crawlerSchedule.days"
         :time="crawlerSchedule.time"
         :disabled="isReadOnly || isSlaveNode"
+        :unavailable-hint="crawlerScheduleHint"
         :saving="savingCrawlerSchedule"
         :tz="scheduleTz"
         @save="saveCrawlerSchedule"
@@ -644,7 +648,8 @@ import SyntaxHighlight from '@/components/SyntaxHighlight.vue'
 import RuleLibScheduleEditor from '@/components/RuleLibScheduleEditor.vue'
 import DialogHeader from '@/components/DialogHeader.vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { request, mfaAwareSuccess, formatBytes } from '@/utils/api'
+import { request, mfaAwareSuccess } from '@/utils/api'
+import { formatBytes } from '@/utils/formatBytes'
 import { showSaveResult } from '@/utils/saveResult'
 import { isValidCidr } from '@/utils/ruleValidation'
 import { IP_LIST_MAX_ENTRIES, canSaveIpList, needsEmptyListConfirm } from '@/utils/ipListSaveGuard'
@@ -654,6 +659,7 @@ import { useAuthStore } from '@/stores/auth'
 
 import { useClampedPagination } from '@/composables/useClampedPagination'
 import { useLibUpdateDialog } from '@/composables/useLibUpdateDialog'
+import { createVisibilityIntervals } from '@/composables/useVisibilityIntervals'
 import type { APIResponse, UserListItem } from '@/types'
 // —— 威胁情报库（v2.3.x 第二张规则来源卡）——
 interface ThreatSource {
@@ -842,43 +848,35 @@ const libHealthTags = computed(() => [
 ])
 const libSummaryWarn = computed(() => crsInfo.value.available === false || ip2regionInfo.value.available === false)
 
-// 自动更新开关：按行分发到三个库的既有端点（开关状态以服务端为准，
-// 失败由对应 fetch 回滚）。
-const toggleLibAutoUpdate = (row: LibRow, val: boolean) => {
-  if (row.key === 'crs') {
-    crsInfo.value.auto_update = val
-    toggleAutoUpdate(val)
-  } else if (row.key === 'ip2region') {
-    ip2regionInfo.value.auto_update = val
-    toggleIP2RegionAutoUpdate(val)
-  } else if (row.key === 'threat') {
-    // 父开关=任务级总闸（整任务启停）；逐源微调在更新弹框内（update_enabled
-    // 决定任务更新哪些源）——两者解耦，不再逐源循环写（曾连弹三次提示）。
-    toggleThreatAutoUpdate(val)
-  } else if (row.key === 'crawler') {
-    toggleCrawlerAutoUpdate(val)
-  }
+// 自动更新开关：按行分发到四个库的既有端点。统一乐观置值 + 在途标记
+// （此前威胁/爬虫要等响应才置值，点击后开关纹丝不动，用户会重复点击）。
+const autoUpdateSaving = ref(new Set<string>())
+const applyLibAutoUpdate = async (key: string, val: boolean): Promise<void> => {
+  if (key === 'crs') await request.put('/security/crs/auto-update', { auto_update: val })
+  else if (key === 'ip2region') await request.put('/security/ip2region/auto-update', { auto_update: val })
+  else if (key === 'threat') await request.put('/security/threat-lib/auto-update', { auto_update: val })
+  else if (key === 'crawler') await request.put('/security/crawler-lib/auto-update', { auto_update: val })
 }
-
-// 任务级总闸开关（单次写 + 单次提示）。
-const toggleThreatAutoUpdate = async (val: boolean) => {
+const toggleLibAutoUpdate = async (row: LibRow, val: boolean): Promise<void> => {
+  if (autoUpdateSaving.value.has(row.key)) return
+  autoUpdateSaving.value.add(row.key)
+  const previous = row.autoUpdate
+  setLibAutoUpdateShown(row.key, val)
   try {
-    await request.put('/security/threat-lib/auto-update', { auto_update: val })
-    threatAutoUpdate.value = val
+    await applyLibAutoUpdate(row.key, val)
     mfaAwareSuccess('已更新')
   } catch {
-    fetchThreatLib() // 失败回滚显示值
+    // 失败回滚显示值（服务端为准；各库 fetch 亦会回填）
+    setLibAutoUpdateShown(row.key, previous)
+  } finally {
+    autoUpdateSaving.value.delete(row.key)
   }
 }
-
-const toggleCrawlerAutoUpdate = async (val: boolean) => {
-  try {
-    await request.put('/security/crawler-lib/auto-update', { auto_update: val })
-    crawlerAutoUpdate.value = val
-    mfaAwareSuccess('已更新')
-  } catch {
-    fetchCrawlerLib() // 失败回滚显示值
-  }
+const setLibAutoUpdateShown = (key: string, val: boolean): void => {
+  if (key === 'crs') crsInfo.value.auto_update = val
+  else if (key === 'ip2region') ip2regionInfo.value.auto_update = val
+  else if (key === 'threat') threatAutoUpdate.value = val
+  else if (key === 'crawler') crawlerAutoUpdate.value = val
 }
 
 // 更新/日志按钮：打开对应库的更新弹框（autoStart=false 时仅查看日志）。
@@ -971,6 +969,13 @@ const crsInfoLoaded = ref(false)
 const ip2regionInfoLoaded = ref(false)
 const threatLibLoaded = ref(false)
 const crawlerLibLoaded = ref(false)
+// 库信息未落地/读取失败时排程未知：编辑器禁用并显性提示，
+// 不得用默认值（周一–周日 04:00）冒充库内排程被保存覆盖。
+const SCHEDULE_UNKNOWN_HINT = '排程未知：库信息读取失败，请关闭后重新加载'
+const crsScheduleHint = computed(() => (!crsInfoLoaded.value || crsInfoError.value) ? SCHEDULE_UNKNOWN_HINT : '')
+const ip2regionScheduleHint = computed(() => (!ip2regionInfoLoaded.value || ip2regionInfoError.value) ? SCHEDULE_UNKNOWN_HINT : '')
+const threatScheduleHint = computed(() => (!threatLibLoaded.value || threatLibError.value) ? SCHEDULE_UNKNOWN_HINT : '')
+const crawlerScheduleHint = computed(() => (!crawlerLibLoaded.value || crawlerLibError.value) ? SCHEDULE_UNKNOWN_HINT : '')
 const ip2regionVersionLabel = computed(() => {
   if (ip2regionInfo.value.version === 'bundled') return '内置版本（未更新）'
   return (ip2regionInfo.value.version && ip2regionInfo.value.version !== 'unknown') ? ip2regionInfo.value.version : '未安装'
@@ -1173,6 +1178,7 @@ const reloadIpListDetail = async (): Promise<void> => {
 }
 
 const saveIpList = async () => {
+  if (savingIpList.value) return
   const name = ipListForm.value.name.trim()
   if (!name) { ElMessage.warning('请输入列表名称'); return }
   if (name.length > 50) { ElMessage.warning('列表名称不能超过 50 字符'); return }
@@ -1592,7 +1598,6 @@ const openRuleContent = async (row: CRSRuleFile) => {
     if (requestSeq === ruleContentSeq) loadingContent.value = false
   }
 }
-const toggleAutoUpdate = async (val: boolean) => { try { await request.put('/security/crs/auto-update', { auto_update: val }); mfaAwareSuccess('已更新') } catch { crsInfo.value.auto_update = !val } }
 const fetchIP2RegionInfo = async () => {
   try {
     const res = await request.get<APIResponse<typeof ip2regionInfo.value>>('/security/ip2region')
@@ -1604,7 +1609,6 @@ const fetchIP2RegionInfo = async () => {
     ip2regionInfoLoaded.value = true
   }
 }
-const toggleIP2RegionAutoUpdate = async (val: boolean) => { try { await request.put('/security/ip2region/auto-update', { auto_update: val }); mfaAwareSuccess('已更新') } catch { ip2regionInfo.value.auto_update = !val } }
 
 // —— 定时更新排程（三库同构：星期多选 + 时间；保存即重排下次更新，时区遵循基础设置）——
 const scheduleTz = ref('')
@@ -1624,6 +1628,7 @@ const ensureScheduleTz = async () => {
 
 const savingCRSSchedule = ref(false)
 const saveCRSSchedule = async ({ days, time }: { days: number[]; time: string }) => {
+  if (crsScheduleHint.value) { ElMessage.warning(crsScheduleHint.value); return }
   savingCRSSchedule.value = true
   try {
     await request.put('/security/crs/schedule', { days, time })
@@ -1634,6 +1639,7 @@ const saveCRSSchedule = async ({ days, time }: { days: number[]; time: string })
 
 const savingIP2RegionSchedule = ref(false)
 const saveIP2RegionSchedule = async ({ days, time }: { days: number[]; time: string }) => {
+  if (ip2regionScheduleHint.value) { ElMessage.warning(ip2regionScheduleHint.value); return }
   savingIP2RegionSchedule.value = true
   try {
     await request.put('/security/ip2region/schedule', { days, time })
@@ -1644,6 +1650,7 @@ const saveIP2RegionSchedule = async ({ days, time }: { days: number[]; time: str
 
 const savingThreatSchedule = ref(false)
 const saveThreatSchedule = async ({ days, time }: { days: number[]; time: string }) => {
+  if (threatScheduleHint.value) { ElMessage.warning(threatScheduleHint.value); return }
   savingThreatSchedule.value = true
   try {
     await request.put('/security/threat-lib/schedule', { days, time })
@@ -1654,6 +1661,7 @@ const saveThreatSchedule = async ({ days, time }: { days: number[]; time: string
 
 const savingCrawlerSchedule = ref(false)
 const saveCrawlerSchedule = async ({ days, time }: { days: number[]; time: string }) => {
+  if (crawlerScheduleHint.value) { ElMessage.warning(crawlerScheduleHint.value); return }
   savingCrawlerSchedule.value = true
   try {
     await request.put('/security/crawler-lib/schedule', { days, time })
@@ -1724,6 +1732,7 @@ const openRuleDialog = (row?: CustomRule) => {
 }
 
 const saveCustomRule = async () => {
+  if (isReadOnly.value || savingRule.value) return
   if (!ruleForm.value.name.trim()) { ElMessage.warning('请输入规则名称'); return }
   if (!ruleForm.value.conditions.length) { ElMessage.warning('至少需要一个匹配条件'); return }
   for (const cond of ruleForm.value.conditions) {
@@ -1768,6 +1777,13 @@ const deleteCustomRule = (row: CustomRule) => {
 // WAF 文件大小：formatBytes 单一事实源
 const formatSize = (b: number) => formatBytes(b)
 
+// 四库信息低频回刷（60s）：后台定时更新完成后卡片不再停留旧版本/旧「已最新」，
+// 更新失败也能自行浮出；隐藏页停表、恢复可见立即补一轮（全站轮询同口径）。
+const refreshLibraryInfo = (): void => {
+  void fetchCRS(); void fetchIP2RegionInfo(); void fetchThreatLib(); void fetchCrawlerLib()
+}
+let libraryRefreshTimer: ReturnType<typeof createVisibilityIntervals> | null = null
+
 onMounted(() => {
   // 消费?tab= 后剥离(与 sp 口径一致,SecurityPolicies.vue
   // 先例)——视图切换走 authStore.currentPage 而非 hash 路由,replaceState 仅留
@@ -1779,10 +1795,14 @@ onMounted(() => {
   }
   if (query.has(DEEP_LINK_PARAMS.securityRulesTab)) window.history.replaceState(null, '', window.location.pathname)
   fetchCRS(); fetchIP2RegionInfo(); fetchRules(); fetchCustomRules(); fetchUsers(); fetchIpLists(); fetchThreatLib(); fetchCrawlerLib()
+  libraryRefreshTimer = createVisibilityIntervals({ intervals: [{ tick: refreshLibraryInfo, ms: 60_000 }] })
+  libraryRefreshTimer.start()
 })
 
 onUnmounted(() => {
   // 作废在途响应并暂停轮询（轮询终态清理由 usePollingTask 内置 onUnmounted 兜底）
+  libraryRefreshTimer?.stop()
+  libraryRefreshTimer = null
   crsDialog.dispose()
   ip2regionDialog.dispose()
   threatDialog.dispose() // 与两兄弟对齐（曾缺席）

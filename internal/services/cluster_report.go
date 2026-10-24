@@ -109,6 +109,11 @@ func (s *SyncService) Report(ctx context.Context) error {
 	// 版本读取(两个小文件),不再经 BuildWafFileRef 的 tarGzDirSum 全树哈希
 	// 与 xdb sha256(那是快照/漂移检测的口径,上报无需)。
 	report.Health.CRSVersion, report.Health.IP2RegionTag = reportWafFileVersions()
+	// 多源规则库（威胁情报库/爬虫地址库）版本：与前端
+	// utils/securityLibraries.summarizeLibrarySources 同口径聚合（各源
+	// version 取最近、空源为空串），供主节点集群列表展示。
+	// 热路径=两条小表全列扫描（每库 3-4 行），无哈希/文件 IO。
+	report.Health.ThreatVersion, report.Health.CrawlerVersion = reportSecurityLibraryVersions(ctx, s.db)
 	payload, err := json.Marshal(report)
 	if err != nil {
 		return fmt.Errorf("编码节点上报: %w", err)
@@ -187,6 +192,86 @@ func truncateValidUTF8Tail(data []byte) []byte {
 		data = data[:len(data)-1]
 	}
 	return data
+}
+
+// reportSecurityLibraryVersions 返回威胁情报库/爬虫地址库的「最近版本」。
+// 口径与前端 utils/securityLibraries.summarizeLibrarySources 对齐：latestVersion
+// = 各源 version 的最大值（compareLibraryVersion，日期与 semver 通用），
+// 空源/全部空版本 → 空串。读失败按空串上报（版本是展示面，不得因单表读失败
+// 中断整份上报；主节点显示「未更新」而非陈旧值）。
+func reportSecurityLibraryVersions(ctx context.Context, database *sql.DB) (string, string) {
+	return latestSourceVersion(ctx, database, "security_threat_sources"),
+		latestSourceVersion(ctx, database, "security_crawler_sources")
+}
+
+func latestSourceVersion(ctx context.Context, database *sql.DB, table string) string {
+	if database == nil {
+		return ""
+	}
+	rows, err := database.QueryContext(ctx, `SELECT COALESCE(version,'') FROM `+table)
+	if err != nil {
+		Logf("warn", "读取 %s 版本失败（上报按未更新处理）: %v", table, err)
+		return ""
+	}
+	defer rows.Close()
+	latest := ""
+	for rows.Next() {
+		var version string
+		if err := rows.Scan(&version); err != nil {
+			continue
+		}
+		version = strings.TrimSpace(version)
+		if version == "" {
+			continue
+		}
+		if latest == "" || compareLibraryVersion(version, latest) > 0 {
+			latest = version
+		}
+	}
+	return latest
+}
+
+// compareLibraryVersion 复刻前端 utils/securityStages.compareVersion 的宽松
+// 语义：按 `.`/`-` 分段，两侧均可解析为数字时数值比较，否则字典序兜底；
+// 缺段按 0（"2026.09" < "2026.09.24"）。两端聚合口径必须一致，否则同一库在
+// 主节点列表与从节点本地显示不同版本。
+func compareLibraryVersion(a, b string) int {
+	pa, pb := splitLibraryVersion(a), splitLibraryVersion(b)
+	for i := 0; i < len(pa) || i < len(pb); i++ {
+		sa, sb := "", ""
+		if i < len(pa) {
+			sa = pa[i]
+		}
+		if i < len(pb) {
+			sb = pb[i]
+		}
+		na, errA := strconv.Atoi(sa)
+		nb, errB := strconv.Atoi(sb)
+		if errA == nil && errB == nil {
+			if na != nb {
+				if na < nb {
+					return -1
+				}
+				return 1
+			}
+			continue
+		}
+		if sa != sb {
+			if sa < sb {
+				return -1
+			}
+			return 1
+		}
+	}
+	return 0
+}
+
+func splitLibraryVersion(version string) []string {
+	version = strings.TrimPrefix(strings.TrimSpace(version), "v")
+	if version == "" {
+		return nil
+	}
+	return strings.FieldsFunc(version, func(r rune) bool { return r == '.' || r == '-' })
 }
 
 // reportWafFileVersions 是 BuildWafFileRef 的轻量版本读取:只读

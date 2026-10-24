@@ -242,7 +242,13 @@ func (s *SyncService) initClusterClient() {
 		})
 		s.verifiedPins = make(map[string]string)
 		if s.client == nil {
-			s.client = &http.Client{Timeout: 30 * time.Second}
+			// 不设 http.Client.Timeout：该客户端同时承载 256MB 快照与 64MB
+			// 规则包拉取，30s 总超时（含读 body）与上限不相容（256MB/30s
+			// ≈68Mbps、64MB/30s≈17Mbps），慢链路/大配置下从端同步会**永久**
+			// 失败且无自愈路径。大体积传输仅由每次尝试的 ctx 截止兜底
+			// （clusterLargeTransferTimeout）；注册/上报等小请求各自带 10s ctx。
+			// 与 CRS 下载路径（crshttp.go 的 crsDownloadClient）同口径。
+			s.client = &http.Client{}
 		}
 		s.client.Transport = transport
 		s.client.CheckRedirect = func(*http.Request, []*http.Request) error {
@@ -753,6 +759,20 @@ func (s *SyncService) RegisterWithMaster(ctx context.Context, masterURL string, 
 	return registration, nil
 }
 
+// clusterLargeTransferTimeout 是单次大体积拉取（快照/规则包）attempt 的总时限。
+// http.Client 无总超时（见 initClusterClient），截止全部由每尝试 ctx 承担：
+// 既覆盖连接、首字节，也覆盖读 body（decodeSnapshotEnvelope/fetchWafFiles 在
+// 该 ctx 下完成解码）。10 分钟对应 256MB 约 3.4Mbps 的持续吞吐下限，仍能拦住
+// 无限悬挂的半开连接——慢但不死的链路可以拉完。
+// 变量而非常量：测试注入短预算验证「越界即 ctx 截止」，避免 30s 级实测等待。
+var clusterLargeTransferTimeout = 10 * time.Minute
+
+// newClusterTransferContext 是大体积拉取尝试 ctx 的单源构造点（Pull 快照与
+// WAF 规则包共用），测试经 clusterLargeTransferTimeout 覆盖预算。
+func newClusterTransferContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, clusterLargeTransferTimeout)
+}
+
 // maxSnapshotResponseBytes caps the Pull snapshot response body: 合法快照内嵌
 // 证书 PEM 与 WAF 引用，256MB 留足余量，同时约束恶意/异常膨胀主节点的内存
 // 占用（同链路 waf-files 端点为 64MB，仅承载规则包）。超限即解析失败。
@@ -882,9 +902,17 @@ func (s *SyncService) Pull(ctx context.Context) (result SyncResult, err error) {
 	// since_version=0 重拉一次全量快照，让应用路径强制重放漂移的节。
 	sinceVersion, sinceFingerprint := appliedVersion, fingerprint
 	var resp *http.Response
+	// 每次尝试一个总时限：http.Client 无总超时（大体积传输由尝试 ctx 兜底），
+	// 尝试 ctx 必须活到 body 解码结束（decodeSnapshotEnvelope 在循环外执行），
+	// 因此取消函数在下一轮/函数返回时才调用。
+	cancelAttempt := func() {}
+	defer func() { cancelAttempt() }()
 	for attempt := 0; ; attempt++ {
+		cancelAttempt()
+		attemptCtx, cancel := newClusterTransferContext(ctx)
+		cancelAttempt = cancel
 		endpoint := strings.TrimRight(masterURL, "/") + "/api/v1/cluster/sync/snapshot?since_version=" + strconv.Itoa(sinceVersion) + "&fingerprint=" + url.QueryEscape(sinceFingerprint)
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		req, err := http.NewRequestWithContext(attemptCtx, http.MethodGet, endpoint, nil)
 		if err != nil {
 			return SyncResult{}, newSyncFailure(models.SyncErrorCodeValidationFailed, fmt.Errorf("创建快照请求: %w", err))
 		}

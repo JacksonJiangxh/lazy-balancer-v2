@@ -387,7 +387,7 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		ID:          "log-cleanup",
 		Family:      "system",
 		Name:        "日志清理与轮转",
-		Description: "清理超保留期的应用日志轮转副本（app.log.*）；统一清理任务日志（tasks/*.log：仅保留期删除，尺寸滚动由写入侧统一执行）",
+		Description: "清理超保留期的应用日志轮转副本（app.log.*）；统一清理任务日志（tasks/*.log：仅保留期删除，尺寸滚动由写入侧统一执行）；并按存活规则清单清理已删除规则的访问日志（logs/rules/*，含轮转副本）",
 		Category:    "系统",
 		Kind:        taskengine.KindPeriodic,
 		IntervalFn:  func() time.Duration { return 24 * time.Hour },
@@ -928,6 +928,13 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 		}
 		te.StartLoop(id)
 	}
+	// 导入哨兵行崩溃窗口自愈必须先于首槽武装：导入事务提交后、提交后 CAS
+	// 清理前进程被 SIGKILL/OOM/驱逐时，哨兵行（version=哨兵串、auto_update=0）
+	// 会永久残留——版本页显示哨兵串，且 INSERT OR IGNORE 挡住补种、auto_update=0
+	// 挡住武装，该库自动更新永久停摆。启动是崩溃后唯一的恢复入口（进程已死），
+	// 故只在启动路径修复，不影响导入成功路径的「rearm 后 CAS 删除」顺序
+	//（那一步依赖哨兵形态未被改写）。
+	healSecurityVersionImportSentinels()
 	// 首槽武装先落默认源/版本行，随后的业务开关同步才能读到全新库的
 	// 默认启用态（否则 ErrNoRows 被 fail-closed 误译为关闭并 StopLoop）。
 	armSecurityLibraryFirstSlots()
@@ -1025,12 +1032,21 @@ var businessTaskDrivers = []struct {
 // 周期对账不重复对齐（避免每 60s 无意义地重写调度开关）。
 var businessDriverSyncPending atomic.Bool
 
+// businessDriverSyncMu 串行化整次对齐：pending 是「本次全量遍历的结论」，
+// 并发调用方（配置导入提交 / 60s 对账重试）交错时后写的 Store 会覆盖前者——
+// 一次全部读成功的对齐可以把另一方「某驱动读失败」置位的重试标记清除，该
+// 驱动的调度态从此停在旧值直到下次角色翻转/导入/重启。串行化后最后完成的一
+// 次遍历必然是完整的，其结论对整个驱动集成立。
+var businessDriverSyncMu sync.Mutex
+
 // SyncBusinessTaskDrivers 按当前 DB 实态统一对齐六个业务驱动任务调度。
 // 启动装配、配置导入、无待重试时的周期对账与 Promote 共用，避免只恢复其中
 // 一族。读失败（known=false）的任务保持现有调度态并登记重试：tick 侧
 // EnabledFn 本身 fail-closed（本轮不跑、下轮重新求值），无需在对齐层
 // 再写一个持续到重启的关闭态。
 func SyncBusinessTaskDrivers() {
+	businessDriverSyncMu.Lock()
+	defer businessDriverSyncMu.Unlock()
 	pending := false
 	for _, driver := range businessTaskDrivers {
 		enabled, known := driver.stateFn()
@@ -1146,6 +1162,29 @@ func RearmSecurityLibrarySlots() {
 	if te := TaskEngine(); te != nil {
 		for _, id := range []string{"threat", "crs", "ip2region", "crawlerbot-update"} {
 			te.ResetScheduleProgress(id)
+		}
+	}
+}
+
+// SecurityVersionImportSentinel 标记配置导入为「未导入版本表且导入前无行」
+// 临时插入的占位版本串。写侧在 handlers（导入事务插入 + 提交后 CAS 删除），
+// 读侧自愈在 armSecurityLibraryFirstSlots——单源常量，两侧不得各写一份字面量。
+const SecurityVersionImportSentinel = "__lazy_balancer_import_seed__"
+
+// healSecurityVersionImportSentinels 启动期修复导入哨兵行崩溃残留：把
+// version=SecurityVersionImportSentinel 的行改写为内置种子版本并重新打开
+// auto_update（与「未导入=零行，由 rearm 补真实种子」的终态一致）。幂等：
+// 非哨兵行零改动；读/写失败仅告警（下次启动重试，不阻断启动）。
+func healSecurityVersionImportSentinels() {
+	if db.DB == nil {
+		return
+	}
+	for _, tc := range []struct{ table, seedVersion string }{
+		{"security_crs_version", CRSBundledVersion},
+		{"security_ip2region_version", "unknown"},
+	} {
+		if _, err := db.DB.Exec(`UPDATE `+tc.table+` SET version=?, auto_update=TRUE WHERE id=1 AND version=?`, tc.seedVersion, SecurityVersionImportSentinel); err != nil {
+			Logf("warn", "启动自愈：%s 导入哨兵行改写失败: %v", tc.table, err)
 		}
 	}
 }

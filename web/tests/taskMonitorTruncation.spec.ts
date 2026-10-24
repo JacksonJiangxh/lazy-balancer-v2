@@ -54,3 +54,11 @@ test('截断时渲染提示条（复用全局 info-note-bar 样式，不写局�
   assert.match(match[2], new RegExp(`最近 ${limit} 条`))
   assert.doesNotMatch(page, /:deep\([^)]*\)\s*\{[^}]*info-note/)
 })
+
+test('证书行运行按钮按剩余冷却禁用并给出等待提示', () => {
+  // /system/tasks 对证书行下发剩余冷却秒数（0=可运行）；前端不得只靠后端 429。
+  assert.match(page, /retry_cooldown_seconds\?: number/, 'TaskInfo 必须声明冷却字段')
+  assert.match(page, /const runCooldownReason = \(row: TaskInfo\): string =>/, '必须单源计算冷却提示')
+  assert.match(page, /Math\.ceil\(seconds \/ 60\)/, '提示需换算为分钟')
+  assert.match(page, /Boolean\(runCooldownReason\(row\)\)/, '运行按钮 must 在冷却期禁用')
+})

@@ -18,7 +18,7 @@ export interface SessionSingleFlight {
   readonly isInflight: () => boolean
 }
 
-export interface SessionSingleFlightOptions<T> {
+interface SessionSingleFlightOptions<T> {
   readonly load: (session: number) => Promise<T>
   readonly apply: (value: T, session: number) => void
   readonly onError?: (error: unknown, session: number) => void

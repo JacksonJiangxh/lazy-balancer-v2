@@ -989,12 +989,11 @@ var errCAProviderUnavailable = errors.New("CA Provider 不可用")
 // 与 CA provider 可用性无关。读失败按普通签发任务处理（返回 false）——宁可
 // 维持既有 failJob 语义，也不因一次读故障把签发任务永久留在非终态。
 func certJobDeploymentOnly(jobID int) bool {
-	var status, certPEM, keyPEM string
-	if err := db.DB.QueryRow("SELECT status, COALESCE(cert_pem,''), COALESCE(key_pem,'') FROM cert_jobs WHERE id=?", jobID).
-		Scan(&status, &certPEM, &keyPEM); err != nil {
+	status, hasMaterial, found, err := loadCertJobDeploymentState(jobID)
+	if err != nil || !found {
 		return false
 	}
-	return JobLifecycle(status) == JobLifecycleDownloaded && CertJobMaterialUsable(status, certPEM, keyPEM)
+	return JobLifecycle(status) == JobLifecycleDownloaded && hasMaterial
 }
 
 // errCAQueueInactive 标记补偿重排队时队列未激活/已暂停。任务按分支语义保留：
@@ -1529,12 +1528,11 @@ func requeueCanceledJob(jobID int) {
 	// cleanup_* 不要求窗口到期，对 downloaded 按剩余 delay 重排）。
 	// 判据用 JobLifecycle 而非裸 status=='downloaded'——cleanup_* 同属
 	// 「材料已落库、只差部署」，漏收敛会把它们打回 queued 重签烧 CA 配额。
-	var status, certPEM, keyPEM string
-	if err := db.DB.QueryRow("SELECT status, COALESCE(cert_pem,''), COALESCE(key_pem,'') FROM cert_jobs WHERE id=?", jobID).Scan(&status, &certPEM, &keyPEM); err == nil {
-		if JobLifecycle(status) == JobLifecycleDownloaded && CertJobMaterialUsable(status, certPEM, keyPEM) {
+	if liveStatus, hasMaterial, found, err := loadCertJobDeploymentState(jobID); err == nil && found {
+		if JobLifecycle(liveStatus) == JobLifecycleDownloaded && hasMaterial {
 			// updated_at 与部署窗口同写：重试冷却门以 updated_at 为计时基准
 			// （同口径见 handlers/certjobs.go 的部署重排写点）。
-			if _, err := db.DB.Exec("UPDATE cert_jobs SET deployment_available_after=datetime('now'), message='节点生命周期切换，等待恢复部署', updated_at=datetime('now') WHERE id=? AND status=?", jobID, status); err != nil {
+			if _, err := db.DB.Exec("UPDATE cert_jobs SET deployment_available_after=datetime('now'), message='节点生命周期切换，等待恢复部署', updated_at=datetime('now') WHERE id=? AND status=?", jobID, liveStatus); err != nil {
 				Logf("error", "CA queue: failed to defer deployment retry for canceled job %d: %v", jobID, err)
 			}
 			return
@@ -1754,12 +1752,11 @@ func failJob(jobID int, message string) {
 // 重试语义处理，调用方不得再写 failed。读失败/状态不符返回 false（维持既有
 // failJob 语义，不因一次读故障把行留在非终态）。
 func deferDeploymentForMaterialBearingJob(jobID int, logCode, message string) bool {
-	var status, certPEM, keyPEM string
-	if err := db.DB.QueryRow("SELECT status, COALESCE(cert_pem,''), COALESCE(key_pem,'') FROM cert_jobs WHERE id=?", jobID).
-		Scan(&status, &certPEM, &keyPEM); err != nil {
+	status, hasMaterial, found, err := loadCertJobDeploymentState(jobID)
+	if err != nil || !found {
 		return false
 	}
-	if JobLifecycle(status) != JobLifecycleDownloaded || !CertJobMaterialUsable(status, certPEM, keyPEM) {
+	if JobLifecycle(status) != JobLifecycleDownloaded || !hasMaterial {
 		return false
 	}
 	message = truncateJobMessage(message)

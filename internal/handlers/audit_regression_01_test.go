@@ -345,7 +345,9 @@ func TestPutCaddyConfig_uses_service_load_and_preserves_database_when_Caddy_reje
 	h.caddyService = services.NewCaddyService(fakeCaddy.URL)
 	router := gin.New()
 	router.PUT("/caddy", h.PutCaddyConfig)
-	request := httptest.NewRequest(http.MethodPut, "/caddy", strings.NewReader(`{"content":"{\"new\":true}"}`))
+	// 载荷必须保留面板自管的 admin 端点（逃生口护栏拒绝 admin off / 改址）。
+	adminListen := strings.TrimPrefix(h.cfg.CaddyAdminURL, "http://")
+	request := httptest.NewRequest(http.MethodPut, "/caddy", strings.NewReader(`{"content":"{\"admin\":{\"listen\":\"`+adminListen+`\"},\"new\":true}"}`))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 

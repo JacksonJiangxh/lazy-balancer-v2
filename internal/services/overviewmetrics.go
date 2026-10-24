@@ -17,7 +17,10 @@ import (
 // （见 parseRateLimit429CountsByServer 内联说明）。
 const rateLimit429CountMetric = `caddy_http_request_duration_seconds_count{`
 
-var overviewMetricsHTTPClient = &http.Client{Timeout: 5 * time.Second}
+// overviewMetricsHTTPClient 与采集链共用 caddyMetricsScrapeTimeout：同一
+// CaddyMetricsURL、同一 16MB 正文上限，超时预算必须一致（理由见该常量）。
+// var 供测试注入桩 Transport。
+var overviewMetricsHTTPClient = &http.Client{Timeout: caddyMetricsScrapeTimeout}
 
 // overviewMetricsCacheTTL 概览指标抓取的进程内缓存窗口：仪表盘
 // 三个调用点（限流卡片/单规则 stage-stats）各自抓取一次是重复放大面；
@@ -61,6 +64,9 @@ func resetOverviewMetricsCacheForTest() {
 // 都返回 error，由调用方决定降级策略，绝不静默返回空列表。
 // 5s TTL 进程内缓存 + 同 URL 单飞——失败轮不写缓存（下一请求重试），
 // 返回副本避免调用方改动共享切片。
+// overviewMetricsWaiterHook 单飞等待方的测试观测缝（生产恒 nil）。
+var overviewMetricsWaiterHook func()
+
 func ScrapeRateLimitBlocks(metricsURL string) ([]RateLimitHostBlocks, error) {
 	blocks, _, err := scrapeOverviewMetrics(metricsURL)
 	return blocks, err
@@ -87,6 +93,12 @@ func scrapeOverviewMetrics(metricsURL string) ([]RateLimitHostBlocks, []RateLimi
 	}
 	if call, ok := overviewMetricsCache.inflight[metricsURL]; ok {
 		overviewMetricsCache.Unlock()
+		// overviewMetricsWaiterHook 测试缝：等待方已确定进入单飞等待（生产恒
+		// nil）。测试用它替代 `time.Sleep(50ms)` 猜等待方是否就位——sleep 在
+		// 慢调度下会让等待方自行发起抓取（单飞未覆盖），用例反而变脆。
+		if hook := overviewMetricsWaiterHook; hook != nil {
+			hook()
+		}
 		<-call.done
 		if call.err != nil {
 			return nil, nil, call.err
@@ -253,6 +265,13 @@ func parseRateLimit429CountsByServer(body string) map[rateLimitHostServerKey]flo
 	counts := map[rateLimitHostServerKey]float64{}
 	for line := range strings.Lines(body) {
 		line = strings.TrimSpace(line)
+		// geoip 透传路由与主/路径路由会为同一请求各注入一条
+		// caddy_http_request_duration_seconds_count 序列（含 code="429"）——
+		// 不跳过会让启用地域拦截的站点限流计数约 2 倍虚高，且与采集链/实时
+		// 指标（同口径已剔除）互相矛盾。
+		if IsGeoIPPassSeries(line) {
+			continue
+		}
 		if !strings.HasPrefix(line, rateLimit429CountMetric) {
 			continue
 		}

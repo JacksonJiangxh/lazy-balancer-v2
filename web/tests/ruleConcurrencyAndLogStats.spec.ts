@@ -3,10 +3,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { member, source, stripComments } from './_helpers.ts'
+import { member, code, stripComments } from './_helpers.ts'
 
-const page = source('src/views/Rules.vue')
-const types = source('src/types/rules.ts')
+const page = code('src/views/Rules.vue')
+const types = code('src/types/rules.ts')
 
 test('编辑向导记录打开时的 updated_at 并随保存回传 expected_updated_at', () => {
   assert.match(page, /const editingRuleVersion = ref\(''\)/)

@@ -3,8 +3,10 @@
 #
 # 在临时 git 夹具仓里逐形态验证守卫的命中面与误报边界：
 #   • 命中面：未跟踪文件、受控文件、各扩展名（Go/TS/MD/SH/YML/SQL/go.mod/
-#     Dockerfile/docker-entrypoint.sh/.dockerignore/Caddyfile、JSON/HTML/conf 的
-#     字符串与文本节点）、扩展名大小写、
+#     Python/Dockerfile/docker-entrypoint.sh/.dockerignore/Caddyfile、JSON/HTML/
+#     conf 的字符串与文本节点）、扩展名大小写、
+#     无扩展名约定文件（.gitignore/.gitattributes）的注释块、
+#     扫描面声明集合与期望集合的镜像断言（含逐扩展名/逐文件名的行为探针）、
 #     含 NUL 字节的文本文件（报错而非整文件跳过）、下划线/小写/
 #     连写形态、审计产物文件名（含 audit_96/audit-round-96/round-96 等分隔符
 #     型轮次命名）、.gitignore 双向校验（含重复模式行）、轮次引用的
@@ -306,6 +308,17 @@ func noop() {}
 EOF
 assert_bad "audit + chinese-numeral round" "internal/services/deny_attribution.go"
 
+# 13a) 被清洗截断的注释残骸：历史 问题:
+reset_fixture
+mkdir_in internal/handlers/residue.go
+cat >"$tmp_root/internal/handlers/residue.go" <<'EOF'
+package handlers
+
+// 历史 问题: 限制请求体大小防止 OOM。
+func noop() {}
+EOF
+assert_bad "truncated audit residue comment" "internal/handlers/residue.go"
+
 # 13b) 扩展名大小写：.MD / .Go 与 .md / .go 同等入扫描面
 reset_fixture
 mkdir_in docs/NOTES.MD
@@ -394,9 +407,88 @@ sed -i.bak 's|^\*\*/audit\[0-9\]\*_test\.go$|**/audit[0-9]*_test.go\n**/audit[0-
 rm -f "$tmp_root/.gitignore.bak"
 assert_bad "gitignore duplicate pattern" "重复模式行"
 
-# ===========================================================================
-# 误报对照
-# ===========================================================================
+# 14c) 作业面扩展：Python 批量脚本与无扩展名约定文件（.gitignore/.gitattributes）
+# 的注释块同样是审计编号的真实混入面（scripts/check-bulk-edit-safety.sh 已把
+# scripts/*.py 计为作业面，两条守卫口径必须一致）。
+reset_fixture
+mkdir_in scripts/oneoff_merge.py
+cat >"$tmp_root/scripts/oneoff_merge.py" <<'EOF'
+# 版本号硬编码点之一（FE-8）
+print("ok")
+EOF
+assert_bad "python script comment" "oneoff_merge.py"
+
+reset_fixture
+printf '\n# 版本号硬编码点之一（FE-8）\n' >>"$tmp_root/.gitignore"
+assert_bad "gitignore comment" ".gitignore"
+
+reset_fixture
+cat >"$tmp_root/.gitattributes" <<'EOF'
+# 版本号硬编码点之一（FE-8）
+* text=auto
+EOF
+assert_bad "gitattributes comment" ".gitattributes"
+
+# 14d) 扫描面正向集合：守卫声明的扩展名/无扩展名文件集合必须与自检期望集合
+# 互为镜像（漏登记或悄悄加面都红），并逐项造夹具证明真的入面——只比声明文本
+# 证明不了正则生效，只跑行为发现不了「声明加了、期望清单没跟」。
+expected_scan_exts=(go ts vue js css md markdown txt sh yml yaml sql mod json html htm toml conf py)
+expected_scan_names=(Dockerfile docker-entrypoint.sh .dockerignore .gitignore .gitattributes Caddyfile)
+decl_exts="$(sed -n 's/^content_scan_exts=(\(.*\))$/\1/p' "$guard")"
+decl_names="$(sed -n 's/^content_scan_basenames=(\(.*\))$/\1/p' "$guard")"
+if [[ -z "$decl_exts" || -z "$decl_names" ]]; then
+  echo "FAIL [scan surface declaration] 守卫未声明 content_scan_exts/content_scan_basenames" >&2
+  fail=$((fail + 1))
+else
+  read -r -a got_scan_exts <<<"$decl_exts"
+  read -r -a got_scan_names <<<"$decl_names"
+  if [[ "$(printf '%s\n' "${expected_scan_exts[@]}" | LC_ALL=C sort)" \
+      != "$(printf '%s\n' "${got_scan_exts[@]}" | LC_ALL=C sort)" ]]; then
+    echo "FAIL [scan surface exts] 声明集合与期望集合不一致：" >&2
+    diff <(printf '%s\n' "${expected_scan_exts[@]}" | LC_ALL=C sort) \
+         <(printf '%s\n' "${got_scan_exts[@]}" | LC_ALL=C sort) | sed 's/^/  /' >&2 || true
+    fail=$((fail + 1))
+  elif [[ "$(printf '%s\n' "${expected_scan_names[@]}" | LC_ALL=C sort)" \
+      != "$(printf '%s\n' "${got_scan_names[@]}" | LC_ALL=C sort)" ]]; then
+    echo "FAIL [scan surface names] 声明集合与期望集合不一致：" >&2
+    diff <(printf '%s\n' "${expected_scan_names[@]}" | LC_ALL=C sort) \
+         <(printf '%s\n' "${got_scan_names[@]}" | LC_ALL=C sort) | sed 's/^/  /' >&2 || true
+    fail=$((fail + 1))
+  else
+    echo "ok   [scan surface sets] declaration mirrors expectation"
+    pass=$((pass + 1))
+  fi
+fi
+
+# 逐项行为探针：每个声明形态都要真的把审计编号扫出来（按各自注释语法造样本；
+# 文档/JSON/HTML 走全文扫描，故直接写文本）。
+for ext in "${expected_scan_exts[@]}"; do
+  reset_fixture
+  mkdir_in "docs/probe_surface.$ext"
+  case "$ext" in
+    go|ts|vue|js|mod) probe_body="// 版本号硬编码点之一（FE-8）" ;;
+    css) probe_body="/* 版本号硬编码点之一（FE-8） */" ;;
+    sql) probe_body="-- 版本号硬编码点之一（FE-8）" ;;
+    md|markdown|txt|json|html|htm) probe_body="版本号硬编码点之一（FE-8）" ;;
+    *) probe_body="# 版本号硬编码点之一（FE-8）" ;;
+  esac
+  printf '%s\n' "$probe_body" >"$tmp_root/docs/probe_surface.$ext"
+  assert_bad "scan surface .$ext" "probe_surface.$ext"
+done
+
+for name in "${expected_scan_names[@]}"; do
+  reset_fixture
+  mkdir_in "probe/$name"
+  if [[ "$name" == "Dockerfile" ]]; then
+    # 派生文件名（Dockerfile.dev）与主文件同族入面。
+    printf '# 版本号硬编码点之一（FE-8）\nFROM scratch\n' >"$tmp_root/probe/Dockerfile.dev"
+    assert_bad "scan surface Dockerfile family" "Dockerfile.dev"
+  else
+    printf '# 版本号硬编码点之一（FE-8）\n' >"$tmp_root/probe/$name"
+    assert_bad "scan surface $name" "$name"
+  fi
+done
+
 
 # 1) 百分位
 reset_fixture

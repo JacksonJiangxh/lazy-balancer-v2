@@ -391,7 +391,12 @@ test('移除：removed=true 成功提示；removed=false 如实提示 CIDR 覆�
   })
   await removeFromSideRef({ id: 3, name: '办公网段' }, '203.0.113.9')
   assert.deepEqual(removed.posts, [{ url: '/security/ip-lists/3/remove-ip', body: { value: '203.0.113.9' } }])
-  assert.match(String(callsOf('ElMessage.success')[0].arg), /已从「办公网段」移除/)
+  // 移除是写事件（MFA step-up 覆盖）：成功提示必须与同文件「加入/创建」同口径
+  // 经 mfaAwareSuccess 发出，宽限窗内才会带「免验证」前缀。
+  const removeSaves = callsOf('mfaAwareSuccess')
+  assert.equal(removeSaves.length, 1, '移除成功必须走 mfaAwareSuccess（不得裸 ElMessage.success）')
+  assert.match(String(removeSaves[0].arg), /已从「办公网段」移除/)
+  assert.equal(callsOf('ElMessage.success').length, 0, '写成功提示不得绕过 MFA 装饰助手')
   assert.equal(changed, 1)
 
   const kept = reset()

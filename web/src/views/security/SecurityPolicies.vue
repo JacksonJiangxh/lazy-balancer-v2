@@ -118,7 +118,7 @@
       </div>
     </el-card>
     <!-- 混合策略更新迁移预演：确认前展示将创建的子策略/重映射范围/上限风险 -->
-    <el-dialog v-model="migrateVisible" class="dialog-body-inset" width="min(560px, 94vw)" top="10vh" :close-on-click-modal="false">
+    <el-dialog v-model="migrateVisible" class="dialog-body-inset" width="min(560px, 94vw)" top="10vh" :close-on-click-modal="false" :close-on-press-escape="!migrateSaving" :show-close="!migrateSaving">
       <template #header>
         <DialogHeader :icon="WarningFilled" title="更新迁移预演"
           :subtitle="`混合策略「${migratePolicy?.name}」将按阶段迁移为单职子策略（兼容组不再支持新建）`" />
@@ -150,8 +150,8 @@
         <div class="info-note-bar"><span class="info-note-desc">全部规则重映射成功后原策略将被删除；存在被跳过的规则时原策略保留（因仍在使用）</span></div>
       </div>
       <template #footer>
-        <el-button @click="migrateVisible = false">取消</el-button>
-        <el-button type="warning" :loading="migrateSaving" @click="submitMigrate">确认更新迁移</el-button>
+        <el-button :disabled="migrateSaving" @click="cancelMigrate">取消</el-button>
+        <el-button type="warning" :loading="migrateSaving" :disabled="migrateSaving" @click="submitMigrate">确认更新迁移</el-button>
       </template>
     </el-dialog>
 
@@ -225,10 +225,10 @@
               <el-tag :type="editorPolicyType === 'mixed' ? 'warning' : 'primary'" effect="plain">{{ POLICY_TYPE_LABELS[editorPolicyType] }}</el-tag>
             </el-form-item>
             <el-form-item label="名称" required>
-              <el-input v-model="form.name" placeholder="策略名称" />
+              <el-input v-model="form.name" placeholder="策略名称" maxlength="100" show-word-limit />
             </el-form-item>
             <el-form-item label="描述">
-              <el-input v-model="form.description" placeholder="策略描述" />
+              <el-input v-model="form.description" placeholder="策略描述" maxlength="500" show-word-limit />
             </el-form-item>
             <el-form-item label="启用状态">
               <el-switch v-model="form.enabled" />
@@ -647,10 +647,10 @@
             </el-form-item>
             <template v-if="form.rate_limit_enabled">
               <el-form-item label="速率上限">
-                <el-input-number v-model="form.rate_limit_rps" :min="1" style="width: 120px" />
+                <el-input-number v-model="form.rate_limit_rps" :min="1" :max="1_000_000_000" style="width: 120px" />
               </el-form-item>
               <el-form-item label="突发余量">
-                <el-input-number v-model="form.rate_limit_burst" :min="0" style="width: 120px" />
+                <el-input-number v-model="form.rate_limit_burst" :min="0" :max="1_000_000_000" style="width: 120px" />
                 <span class="form-tip-inline">次，短时允许超出速率上限的额外请求数</span>
               </el-form-item>
             </template>
@@ -1266,6 +1266,9 @@ interface MigratePolicyResult {
 }
 const migrateVisible = ref(false)
 const migrateSaving = ref(false)
+// 迁移弹框会话序号：关闭/换目标即失效——在途 split 响应不得关掉新打开的弹框
+// （split 本身不可逆，取消只关闭预演，不撤回已发出的请求）。
+let migrateSessionSeq = 0
 const migratePolicy = ref<PolicySummary | null>(null)
 
 // 预演子策略类型 = 特征组探测（与 inferPolicyType 同形状的阶段能力谓词；后端按同口径实际生成）
@@ -1308,17 +1311,26 @@ const migrateStage2SkipRisk = computed(() => {
 
 const openMigrateDialog = (row: PolicySummary): void => {
   if (isReadOnly.value) return
+  migrateSessionSeq++
   migratePolicy.value = row
   migrateVisible.value = true
+}
+
+const cancelMigrate = (): void => {
+  if (migrateSaving.value) return
+  migrateSessionSeq++
+  migrateVisible.value = false
 }
 
 const submitMigrate = async (): Promise<void> => {
   if (isReadOnly.value || migrateSaving.value) return
   const policy = migratePolicy.value
   if (!policy) return
+  const sessionSeq = migrateSessionSeq
   migrateSaving.value = true
   try {
     const res = await request.post<APIResponse<MigratePolicyResult>>(`/security/policies/${policy.id}/split`)
+    if (sessionSeq !== migrateSessionSeq) return
     const data = res.data
     const parts: string[] = []
     if (data && data.created.length > 0) parts.push(`已创建 ${data.created.length} 条子策略（${data.created.map((c) => c.name).join('、')}）`)
@@ -3198,7 +3210,7 @@ const handleSave = async () => {
   // 爬虫豁免开启但未勾选任何引擎 = 后端渲染器空集语义「全部引擎」
   // （crawlerEngineSelected: len==0 → true，为兼容存量不允许改），而 UI 复选框
   // 「全不选」的直觉语义是「不豁免任何引擎」——两者相反，必须阻止静默放宽。
-  if (crawlerExemptionNeedsEngines({ geoipEnabled: form.value.geoip_enabled, crawlerExempt: form.value.geoip_crawler_exempt, engines: form.value.geoip_crawler_engines })) {
+  if (typeAllowsStage(1) && crawlerExemptionNeedsEngines({ geoipEnabled: form.value.geoip_enabled, crawlerExempt: form.value.geoip_crawler_exempt, engines: form.value.geoip_crawler_engines })) {
     ElMessage.error('已开启爬虫豁免但未勾选任何引擎：空选等于豁免「全部引擎」。请至少勾选一个引擎，或关闭爬虫豁免')
     currentStep.value = WIZARD_STEP.IP_ACL
     return

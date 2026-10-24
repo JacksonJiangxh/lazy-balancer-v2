@@ -20,16 +20,16 @@ import {
   PASSWORD_LENGTH_MESSAGE,
   PASSWORD_CHARSET_MESSAGE,
 } from '../src/utils/credentials.ts'
-import { repoSource, section, source } from './_helpers.ts'
+import { repoCode, section, code } from './_helpers.ts'
 
 // 跨栈权威源：用户名/密码策略在后端是字面量（auth.go 的密码常量 + 用户名正则、
 // models.go 的 CreateUserRequest 长度标签）。下方行为断言的长度/字符集边界全部
 // 由 Go 源派生——前端手抄表与后端单侧漂移即红，不再依赖人工核对。
-const authGo = repoSource('internal/handlers/auth.go')
+const authGo = repoCode('internal/handlers/auth.go')
 const GO_PASSWORD_MIN = Number(/minPasswordLength = (\d+)/.exec(authGo)?.[1])
 const GO_PASSWORD_MAX = Number(/maxPasswordLength = (\d+)/.exec(authGo)?.[1])
 const GO_USERNAME_PATTERN = /usernamePolicyRe = regexp\.MustCompile\(`([^`]+)`\)/.exec(authGo)?.[1] ?? ''
-const createUserGo = section(repoSource('internal/models/models.go'), 'type CreateUserRequest struct', '\n}')
+const createUserGo = section(repoCode('internal/models/models.go'), 'type CreateUserRequest struct', '\n}')
 const GO_USERNAME_BINDING = /binding:"required,min=(\d+),max=(\d+)"/.exec(createUserGo)
 const GO_USERNAME_MIN = Number(GO_USERNAME_BINDING?.[1])
 const GO_USERNAME_MAX = Number(GO_USERNAME_BINDING?.[2])
@@ -71,10 +71,10 @@ test('A 密码字符集：Go 常量派生的长度区间 + 可打印 ASCII；汉
 })
 
 test('B 三处密码入口 + 两处用户名入口均消费 credentials 单源', () => {
-  const users = source('src/views/Users.vue')
+  const users = code('src/views/Users.vue')
   // 个人资料表单已抽成共享组件（顶栏入口使用）
-  const profile = source('src/components/ProfileDialog.vue')
-  const login = source('src/views/Login.vue')
+  const profile = code('src/components/ProfileDialog.vue')
+  const login = code('src/views/Login.vue')
   for (const [name, text] of [['Users', users], ['ProfileDialog', profile], ['Login', login]] as const) {
     assert.match(text, /from '@\/utils\/credentials'/, `${name} 必须导入共享校验`)
   }
@@ -92,21 +92,16 @@ test('B 三处密码入口 + 两处用户名入口均消费 credentials 单源',
   assert.doesNotMatch(users, /密码长度8-24位，仅限数字、大小写字母和特殊字符/, '本地密码文案必须退役')
 })
 
-// 编辑态用户名前置校验必须对齐后端 usernameChanged 口径（users.go：仅在用户名
-// 实际变更时过策略，OIDC 行整体豁免）——OIDC 用户名可含 . / _ / 大写，无条件
-// 校验会把 OIDC 用户的角色编辑在 UI 层永久拦死。
-test('编辑门控：用户名校验仅创建/实际改名且非 OIDC 行执行', () => {
-  const users = source('src/views/Users.vue')
+// 编辑态用户名输入恒禁用（后端支持改名，但 UI 不提供入口）——因此不存在
+// 「实际改名」分支；用户名校验只保留创建路径。
+test('编辑门控：用户名校验仅在创建路径执行', () => {
+  const users = code('src/views/Users.vue')
   const submit = section(users, 'const handleSubmit = async ()', 'closeForm()')
+  assert.doesNotMatch(users, /usernameChanged/, '编辑态用户名恒禁用，不得保留不可达的改名分支')
   assert.match(
     submit,
-    /const usernameChanged = editingUser\.value !== null && form\.value\.username !== editingUser\.value\.username/,
-    '须按后端 usernameChanged 口径计算用户名实际变更',
-  )
-  assert.match(
-    submit,
-    /!editingUser\.value \|\| \(usernameChanged && !editingIsOIDC\.value\)/,
-    '编辑态未改名或 OIDC 行不得执行用户名策略校验',
+    /if \(!editingUser\.value\) \{\n\s*const usernameError = validateUsername\(/,
+    '用户名策略校验只作用于创建路径',
   )
   // OIDC 行编辑提交仍不落 username/display_name/password（后端 400 守卫的前端镜像）
   assert.match(submit, /username: oidcTarget \? undefined : form\.value\.username/)

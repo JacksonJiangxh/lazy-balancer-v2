@@ -312,7 +312,16 @@ func threatTextParseRatioValue(vals []string) float64 {
 // .fast 同时存在时以 mtime 较新者为准——从节点只同步 .fast（零编译裁定），
 // 降级前遗留的文本可能是旧代；旧「文本优先」会让集群新同步的 .fast 被陈旧
 // 文本静默遮蔽（新威胁漏拦/已移除误拦）。同代（mtime 相等）保持文本优先
-// （主节点写入相位先落文本后落 fast，内容等价）。
+// （两侧内容等价，文本形态更易读）。
+//
+// 代际方向的事实依据（**禁止调整写侧 rename 顺序**）：主节点写相位是
+// 先 replace `.fast`、后 replace 文本（threatupdate.go 的
+// writeThreatIplistCompiled），rename 不改 mtime——稳态下 live `.fast` 的
+// mtime 恒不早于文本，故主节点实际读 `.fast`。若把顺序改回「先文本后 fast」
+// （与早前注释描述相反），陈旧文本会恒定更新而遮蔽新 fast，正是本判据当初要
+// 消灭的缺陷形态。
+// 本判据真正覆盖的形态：从节点遗留的旧文本 / 带外 touch 文本 / `.fast` 缺失
+// （此时文本代际更可靠）。
 // 两个文件都缺失返回文本侧错误（os.ErrNotExist 语义由调用方判定）。
 // .fast 较新但损坏/不可读时回退文本（在场时）
 // 并告警——旧实现直接失败，引用名单的 ACL/信任策略被渲染层整体跳过

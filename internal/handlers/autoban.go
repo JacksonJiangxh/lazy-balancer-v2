@@ -57,7 +57,7 @@ func (h *Handlers) UpdateAutobanConfig(c *gin.Context) {
 		return
 	}
 	recordAudit(c, "更新", "自动封禁", fmt.Sprintf("启用：%s；调度：%s；阈值：%d 次/%d 分钟；时长：%s；口径：%s；模式：%s",
-		boolOnOff(req.Enabled), map[bool]string{true: "已开启", false: "已停止"}[req.Enabled], req.Threshold, req.WindowMinutes,
+		boolOnOff(req.Enabled), enabledStateLabel(req.Enabled), req.Threshold, req.WindowMinutes,
 		services.AutobanDurationLabel(req.Duration), autobanScopeText(req.Scope),
 		map[bool]string{true: "观察", false: "正式"}[req.DryRun]))
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "自动封禁配置已更新", Data: services.GetAutobanConfig()})

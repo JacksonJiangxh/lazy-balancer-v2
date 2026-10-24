@@ -700,7 +700,7 @@ func regionTreeFromXDB(path string) *IP2RegionRegionTree {
 		}
 		if strings.TrimSpace(fields[0]) != "中国" {
 			// 域 G：海外行收集归一化国名（异体折叠/非国家值剔
-			// 除，见 geoipnames.OverseasCountries）；「海外」哨兵仍由 Provinces
+			// 除，见 geoipnames 包内 overseasCountries 表）；「海外」哨兵仍由 Provinces
 			// 末位承载（解析失败/库缺失兜底），已解析海外行发射国名。
 			if country := geoipnames.NormalizeCountry(fields[0]); country != "" {
 				countries[country] = true

@@ -506,17 +506,24 @@ const suggestionWindowSpan = (row: AutobanSuggestion): string => {
   return start.slice(0, 10) === end.slice(0, 10) ? `${start.slice(11)} ~ ${end.slice(11)}` : `${start} ~ ${end}`
 }
 
+// 自动封禁状态读取会话序号：仅最新一次可写状态/错误位——连点刷新时
+// 旧响应不得覆盖新状态（否则配置弹框按旧值回填、保存写回旧配置），
+// 迟到的瞬时失败也不得把已成功的最新状态锁成错误态。
+let autobanStatusSeq = 0
 const fetchAutobanStatus = async (): Promise<void> => {
+  const requestSeq = ++autobanStatusSeq
   autobanStatusLoading.value = true
   try {
     const res = await request.get<APIResponse<AutobanStatus>>('/security/autoban/status', { silent: true })
+    if (requestSeq !== autobanStatusSeq) return
     if (res.data) autobanStatus.value = res.data
     autobanStatusError.value = false
   } catch {
     // 显性错误态：不再退化为「未启用」默认值并放行写按钮
+    if (requestSeq !== autobanStatusSeq) return
     autobanStatusError.value = true
   }
-  finally { autobanStatusLoading.value = false }
+  finally { if (requestSeq === autobanStatusSeq) autobanStatusLoading.value = false }
 }
 
 // 配置弹框（七项=六项配置+口径变更提示）

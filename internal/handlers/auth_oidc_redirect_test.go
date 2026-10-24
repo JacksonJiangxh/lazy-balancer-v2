@@ -3,9 +3,11 @@ package handlers
 // OIDC 出站链路的两条契约：
 //  1. 回调配置读失败/未启用发生在浏览器整页导航上——一律 302 回前端错误页，
 //     不渲染裸 JSON（否则用户停在一个 JSON 页面）。
-//  2. discovery/JWKS/token 的初始 URL 通过 scheme 策略不代表重定向目标合规：
+//  2. discovery/JWKS/token 的初始 URL 通过端点策略不代表重定向目标合规：
 //     一次 302 就能把请求引到 http://非回环地址（token 交换还会带上
-//     client_secret）。三处共用同一 CheckRedirect，回环例外与既有策略一致。
+//     client_secret）。三处共用同一 CheckRedirect；回环 http 豁免按基准
+//     issuer 生效（issuer 为 http 回环的本机 mock 形态），https issuer 下
+//     重定向同样必须 https。
 
 import (
 	"context"
@@ -69,21 +71,24 @@ func TestOIDCCheckRedirect_revalidatesSchemePolicy(t *testing.T) {
 	cases := []struct {
 		name    string
 		target  string
+		issuer  string
 		hops    int
 		wantErr bool
 	}{
-		{name: "https 目标放行", target: "https://idp.example.com/token", hops: 1},
-		{name: "回环 http 放行（本机 mock）", target: "http://127.0.0.1:8443/jwks", hops: 1},
-		{name: "非回环 http 拒绝", target: "http://example.invalid/jwks", hops: 1, wantErr: true},
-		{name: "跳数封顶", target: "https://idp.example.com/token", hops: 10, wantErr: true},
+		{name: "https 目标放行", target: "https://idp.example.com/token", issuer: "https://idp.example.com", hops: 1},
+		{name: "回环 http 放行（本机 mock issuer）", target: "http://127.0.0.1:8443/jwks", issuer: "http://127.0.0.1:18080", hops: 1},
+		{name: "https issuer 下回环 http 重定向拒绝", target: "http://127.0.0.1:8443/jwks", issuer: "https://idp.example.com", hops: 1, wantErr: true},
+		{name: "非回环 http 拒绝", target: "http://example.invalid/jwks", issuer: "http://127.0.0.1:18080", hops: 1, wantErr: true},
+		{name: "跳数封顶", target: "https://idp.example.com/token", issuer: "https://idp.example.com", hops: 10, wantErr: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, tc.target, nil)
+			req = req.WithContext(oidcOutboundContext(req.Context(), tc.issuer))
 			via := make([]*http.Request, tc.hops)
 			err := oidcCheckRedirect(req, via)
 			if (err != nil) != tc.wantErr {
-				t.Fatalf("oidcCheckRedirect(%q, hops=%d) err=%v, wantErr=%v", tc.target, tc.hops, err, tc.wantErr)
+				t.Fatalf("oidcCheckRedirect(%q, issuer=%q, hops=%d) err=%v, wantErr=%v", tc.target, tc.issuer, tc.hops, err, tc.wantErr)
 			}
 		})
 	}
@@ -109,7 +114,7 @@ func TestProbeOIDCJWKS_rejectsRedirectOutsidePolicy(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	if err := probeOIDCJWKS(srv.URL); err == nil || !strings.Contains(err.Error(), "重定向目标不合规") {
+	if err := probeOIDCJWKS(srv.URL, srv.URL); err == nil || !strings.Contains(err.Error(), "重定向目标不合规") {
 		t.Fatalf("jwks 302 到非回环 http 必须被拒绝: %v", err)
 	}
 }
@@ -120,7 +125,7 @@ func TestProbeClientCredentials_rejectsRedirectOutsidePolicy(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	if _, err := probeClientCredentials(srv.URL, "client-id", "client-secret"); err == nil ||
+	if _, err := probeClientCredentials(srv.URL, "client-id", "client-secret", srv.URL); err == nil ||
 		!strings.Contains(err.Error(), "重定向目标不合规") {
 		t.Fatalf("token 端点 302 到非回环 http 必须被拒绝: %v", err)
 	}
@@ -138,7 +143,7 @@ func TestOIDCTokenExchange_rejectsRedirectOutsidePolicy(t *testing.T) {
 		Endpoint:     oauth2.Endpoint{TokenURL: srv.URL},
 		RedirectURL:  "http://127.0.0.1/callback",
 	}
-	ctx := oidc.ClientContext(context.Background(), oidcOutboundClient)
+	ctx := oidc.ClientContext(oidcOutboundContext(context.Background(), srv.URL), oidcOutboundClient)
 	if _, err := cfg.Exchange(ctx, "code"); err == nil || !strings.Contains(err.Error(), "重定向目标不合规") {
 		t.Fatalf("令牌交换 302 到非回环 http 必须被拒绝: %v", err)
 	}
@@ -156,7 +161,7 @@ func TestProbeOIDCJWKS_followsLoopbackRedirect(t *testing.T) {
 	}))
 	t.Cleanup(entry.Close)
 
-	if err := probeOIDCJWKS(entry.URL); err != nil {
+	if err := probeOIDCJWKS(entry.URL, entry.URL); err != nil {
 		t.Fatalf("回环 http 重定向必须放行: %v", err)
 	}
 }

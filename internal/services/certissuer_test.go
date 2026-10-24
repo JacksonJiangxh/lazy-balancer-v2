@@ -1451,6 +1451,51 @@ func TestDeploymentFailed_entersSlowRetryAtMaxAttempts(t *testing.T) {
 	}
 }
 
+// 封顶后的慢速重试会继续累加计数器（真实值落库，重试链依赖它），但展示值
+// 必须钳制在上限内——`[attempt=57/10]` 会让用户以为「超出配额却仍在重试」。
+func TestDeploymentFailed_capsDisplayedAttemptWhileCounterKeepsGrowing(t *testing.T) {
+	useCertJobLogTestEnv(t, 1<<20)
+	jobID, ruleID := seedCertificateJob(t, "downloaded")
+	const actualAttempts = maxCertificateDeploymentAttempts*5 + 6
+	if _, err := db.DB.Exec("UPDATE cert_jobs SET deployment_attempts=? WHERE id=?", actualAttempts, jobID); err != nil {
+		t.Fatalf("seed attempts: %v", err)
+	}
+	issuer := NewCertIssuer(nil)
+	material := issuedCertificate{
+		ruleID: ruleID, certPEM: "new-cert", keyPEM: "new-key",
+		notAfter: time.Now().Add(90 * 24 * time.Hour), providerID: 1,
+	}
+
+	_ = issuer.deploymentFailed(jobID, material, "重载 Caddy 失败: boom", errors.New("boom"))
+
+	data, err := os.ReadFile(CertJobLogPath(ruleID))
+	if err != nil {
+		t.Fatalf("read cert job log: %v", err)
+	}
+	logText := string(data)
+	if !strings.Contains(logText, "attempt=10/10") {
+		t.Fatalf("cert job log missing capped display attempt=10/10:\n%s", logText)
+	}
+	if strings.Contains(logText, "attempt=57/10") {
+		t.Fatalf("cert job log leaks out-of-range attempt ratio:\n%s", logText)
+	}
+
+	var message string
+	var attempts int
+	if err := db.DB.QueryRow("SELECT COALESCE(message,''), COALESCE(deployment_attempts,0) FROM cert_jobs WHERE id=?", jobID).Scan(&message, &attempts); err != nil {
+		t.Fatalf("read job row: %v", err)
+	}
+	if attempts != actualAttempts+1 {
+		t.Fatalf("deployment_attempts=%d, want %d（真实计数不得被展示钳制影响）", attempts, actualAttempts+1)
+	}
+	if strings.Contains(message, "attempt=57/10") || !strings.Contains(message, "attempt=10/10") {
+		t.Fatalf("job message=%q, want capped attempt ratio", message)
+	}
+	if !strings.Contains(message, "慢速重试") {
+		t.Fatalf("job message=%q, want slow-retry disclosure", message)
+	}
+}
+
 // 状态回写失败（CAS 冲突/DB 故障）不得静默——补 WARN 行留痕，返回值仍
 // 是部署失败（签发结果不变）。
 func TestDeploymentFailed_warnsWhenStatusWritebackFails(t *testing.T) {

@@ -1,0 +1,182 @@
+// 视图状态契约钉测：向导协议切换的隐藏字段清理、证书详情重试的会话守卫、
+// 规则库排程的未知态、弹框保存中三件套、集群库版本 tooltip、配置/统计的
+// 失败三态与只读边界。仅静态源码钉（node --test，无打包器）。
+//
+// 运行：cd web && npm test
+
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+
+import { code, section } from './_helpers.ts'
+
+test('规则向导切 TCP 清空动态上游与 DNS 字段（隐藏控件不得留下恒拒残留）', () => {
+  const rules = code('src/views/Rules.vue')
+  const branch = section(rules, "if (newVal === 'tcp') {", "} else if (newVal === 'http'")
+  assert.match(branch, /wizardForm\.dynamic_dns = false/, 'TCP 下动态上游整段不渲染，必须清残留')
+  assert.match(branch, /wizardForm\.enable_dns_server = false/)
+  assert.match(branch, /wizardForm\.dns_server = ''/)
+})
+
+test('证书详情重试按会话序号丢弃过期响应', () => {
+  const rules = code('src/views/Rules.vue')
+  assert.match(rules, /let tlsDetailSeq = 0/)
+  const retry = section(rules, 'async function retryTlsDetail', 'const resetCertInfo')
+  assert.match(retry, /const sessionSeq = \+\+tlsDetailSeq/)
+  assert.match(retry, /editingRule\.value\?\.caddy_id === caddyId/, '换表单后旧响应不得回填')
+  assert.match(retry, /if \(!sessionAlive\(\)\) return/)
+  const reset = section(rules, 'const resetWizard = ', 'const beforeWizardClose')
+  assert.match(reset, /tlsDetailSeq\+\+/, '关闭向导必须作废在途重试会话')
+})
+
+test('规则库排程在库信息未落地/读取失败时禁用并提示', () => {
+  const page = code('src/views/security/SecurityRules.vue')
+  assert.match(page, /const SCHEDULE_UNKNOWN_HINT = '排程未知/)
+  for (const hint of ['crsScheduleHint', 'ip2regionScheduleHint', 'threatScheduleHint', 'crawlerScheduleHint']) {
+    assert.match(page, new RegExp(`:unavailable-hint="${hint}"`), `${hint} 必须绑定到排程卡`)
+    assert.match(page, new RegExp(`if \\(${hint}\\.value\\)`), `${hint} 未落地时保存入口必须拦截`)
+  }
+  const editor = code('src/components/RuleLibScheduleEditor.vue')
+  assert.match(editor, /unavailableHint\?: string/)
+  assert.match(editor, /const controlsDisabled = computed\(\(\) => props\.disabled \|\| Boolean\(props\.unavailableHint\)\)/)
+})
+
+test('弹框保存中禁止关闭（遮罩/ESC/关闭按钮与取消一致）', () => {
+  const cases: readonly [string, string][] = [
+    ['src/views/security/SecurityBlockPages.vue', 'saving'],
+    ['src/components/SecurityBindingEditor.vue', 'saving'],
+    ['src/views/security/SecurityRules.vue', 'savingRule'],
+  ]
+  for (const [path, flag] of cases) {
+    const text = code(path)
+    assert.match(text, new RegExp(`:close-on-press-escape="!${flag}"`), `${path} 缺 ESC 门`)
+    assert.match(text, new RegExp(`:show-close="!${flag}"`), `${path} 缺关闭按钮门`)
+  }
+  const certs = code('src/views/settings/FreeCertificates.vue')
+  const caDialog = section(certs, 'v-model="caDialogVisible"', 'class="ca-config-dialog"')
+  assert.match(caDialog, /:close-on-click-modal="false"/, 'CA 弹框编辑中不得误点遮罩丢弃输入')
+})
+
+test('OIDC 保存在探测与二次确认前即进入在途态', () => {
+  const oidc = code('src/views/settings/OIDCSettings.vue')
+  const save = section(oidc, 'const save = async () => {', 'const toggleEnabled')
+  const savingAt = save.indexOf('saving.value = true')
+  const probeAt = save.indexOf('await runProbe()')
+  const confirmAt = save.indexOf('ElMessageBox.confirm')
+  assert.ok(savingAt > 0 && probeAt > savingAt && confirmAt > probeAt, '在途门必须早于探测与确认')
+})
+
+test('时区下拉：常用目录 ∪ 当前值，支持自定义 IANA 名', () => {
+  const page = code('src/views/settings/BasicSettings.vue')
+  assert.match(page, /allow-create default-first-option/)
+  assert.match(page, /const timezoneOptions = computed/)
+  assert.match(page, /（自定义）/, '非枚举存量值必须以自定义项回显')
+})
+
+test('自动备份频率切换把日期夹回该频率上界', () => {
+  const page = code('src/views/settings/BasicSettings.vue')
+  const watcher = section(page, "watch(() => autoBackupForm.value.frequency", 'const autoBackupSections')
+  assert.match(watcher, /frequency === 'weekly' \? 7 : 28/)
+  assert.match(watcher, /Math\.min\(Math\.max\(1, autoBackupForm\.value\.day\), high\)/)
+})
+
+test('受信代理关闭态：存量非法值显性可见且保存提示修复路径', () => {
+  const page = code('src/views/settings/CaddyGlobalSettings.vue')
+  assert.match(page, /const trustedProxyDisabledStaleError = computed/)
+  assert.match(page, /请临时开启「受信代理」修正/, '关闭态错误必须给出可修复路径')
+  assert.match(page, /若名单已被删除，保存会被拒绝/, '引用条目未加载的提示不得承诺「不影响保存」')
+  // 引用条目拉取限并发，且名单目录刷新时失效缓存
+  assert.match(page, /const REF_ENTRY_FETCH_CONCURRENCY = 2/)
+  assert.match(page, /invalidateRefListEntries\(\)/)
+})
+
+test('自动封禁状态读取仅最新一次可写状态/错误位', () => {
+  const page = code('src/views/security/SecurityEvents.vue')
+  assert.match(page, /let autobanStatusSeq = 0/)
+  const fetch = section(page, 'const fetchAutobanStatus = async', 'const autobanDialogVisible')
+  assert.match(fetch, /if \(requestSeq !== autobanStatusSeq\) return/g)
+})
+
+test('规则库信息低频回刷且自动更新开关乐观置值', () => {
+  const page = code('src/views/security/SecurityRules.vue')
+  assert.match(page, /createVisibilityIntervals\(\{ intervals: \[\{ tick: refreshLibraryInfo, ms: 60_000 \}\] \}\)/)
+  assert.match(page, /const autoUpdateSaving = ref\(new Set<string>\(\)\)/)
+  const toggle = section(page, 'const toggleLibAutoUpdate = async', 'const setLibAutoUpdateShown')
+  assert.match(toggle, /setLibAutoUpdateShown\(row\.key, val\)/, '点击即置值（不再等响应）')
+})
+
+test('大屏：窗口切换保留上一帧并标注切换中，配置读取失败区别于未配置', () => {
+  const screen = code('src/views/security/ThreatScreen.vue')
+  const setWindow = section(screen, 'function setWindow(hours: number)', 'const screenMode = ref')
+  assert.doesNotMatch(setWindow, /stats\.value = null/, '切换窗口不得清空统计（全屏 KPI 归零误读为无攻击）')
+  assert.match(screen, /const statsPending = computed/)
+  assert.match(screen, /切换中…/)
+  assert.match(screen, /const configLoadFailed = ref\(false\)/)
+  assert.match(screen, /大屏配置读取失败/, '读取失败不得渲染成「未配置站点坐标」')
+  assert.match(screen, /bucketTerminology\(windowHours\.value\)/, '概览口径词随窗口派生')
+  assert.match(screen, /role="status" aria-live="polite"/, '故障横幅与攻击弹框需要 live region')
+})
+
+test('登录：创建管理员与自动登录分阶段，OIDC 保持深链', () => {
+  const login = code('src/views/Login.vue')
+  const setup = section(login, 'const handleSetup = async', 'onMounted(async')
+  assert.match(setup, /管理员已创建，请手动登录/, '登录失败不得报「创建管理员失败」')
+  assert.match(login, /encodeURIComponent\(`\/\$\{authStore\.currentPage\}`\)/, 'OIDC return_to 必须携带当前页面键')
+  assert.match(login, /watch\(mfaUseRecovery, \(\) => \{[\s\S]{0,120}mfaCode\.value = ''/, '通道切换清空验证码')
+})
+
+test('集群节点 tooltip：四项库版本名称与规则库列表同源，缺失显示 —', () => {
+  const panel = code('src/views/settings/cluster/ClusterMasterPanel.vue')
+  for (const label of ['CRS 规则库', 'IP 地理库', '威胁情报库', '爬虫地址库']) {
+    assert.match(panel, new RegExp(`label: '${label}'`), `缺少 ${label}`)
+  }
+  for (const key of ['crs_version', 'ip2region_version', 'threat_version', 'crawler_version']) {
+    assert.match(panel, new RegExp(`key: '${key}'`), `缺少 ${key}`)
+  }
+  assert.match(panel, /health\[key\] \|\| '—'/)
+  const types = code('src/types/index.ts')
+  assert.match(types, /readonly threat_version\?: string/)
+  assert.match(types, /readonly crawler_version\?: string/)
+})
+
+test('审计日志分页在总数收缩后自动夹紧', () => {
+  const page = code('src/views/AuditLog.vue')
+  const fetch = section(page, 'const fetchLogs = async', 'onMounted')
+  assert.match(fetch, /const maxPage = Math\.max\(1, Math\.ceil\(nextTotal \/ targetPageSize\)\)/)
+  assert.match(fetch, /page\.value = maxPage[\s\S]{0,80}void fetchLogs\(\)/)
+})
+
+test('IP 快捷弹框不再调用不存在的 popover.open()', () => {
+  const page = code('src/views/security/IPLocationAction.vue')
+  assert.doesNotMatch(page, /openPopover|popoverRef/)
+})
+
+test('IP 地理快捷弹框的可点击单元保留键盘可达语义', () => {
+  const page = code('src/views/security/IPLocationAction.vue')
+  assert.match(page, /role="button"/)
+  assert.match(page, /tabindex="0"/)
+})
+
+test('视图口径与样式契约：端口门、CA 门、摘要披露、分页夹紧、样式单源', () => {
+  const rules = code('src/views/Rules.vue')
+  assert.match(rules, /80 端口开启 TLS 跳转无意义/, '80+TLS 跳转必须前端镜像后端门')
+  const certs = code('src/views/settings/FreeCertificates.vue')
+  assert.match(certs, /默认 CA 提供商已被禁用/, '默认 CA 被禁用必须前置中文提示')
+  assert.match(certs, /caForm\.min_interval_ms" :min="1"/, '最小间隔下限与写侧门（1..60000）同源')
+  const dash = code('src/views/Dashboard.vue')
+  assert.match(dash, /零流量规则不进入排行/, '规则卡必须披露截断口径')
+  assert.match(dash, /chart-stale-hint/, '采集失败保留曲线并标陈旧')
+  const screen = code('src/views/security/ThreatScreen.vue')
+  assert.doesNotMatch(screen, /'mixed'/, '动作分支仅 blocked/logged，mixed 不可达')
+  assert.match(screen, /actionLabel\(t\.action\)/, '弹框动作文案复用单源映射')
+  const overview = code('src/views/security/SecurityOverview.vue')
+  assert.doesNotMatch(overview, /<el-col :span="(16|8)"/, '下两行必须补响应式断点')
+  const css = code('src/styles/main.css')
+  assert.match(css, /^\.polling-error-alert \{ margin-bottom: 16px; \}$/m, '被 7 页引用的类必须有全局定义')
+  const cluster = code('src/views/settings/cluster/ClusterMasterPanel.vue')
+  assert.doesNotMatch(cluster, /\.settings-form \.form-tip-inline/, '全局类不得在 scoped 中重定义')
+  const task = code('src/views/settings/TaskMonitor.vue')
+  assert.match(task, /（不含证书工作项）/)
+  assert.match(task, /近 24 小时成功 \/ 失败次数；历史明细最多 50 条/)
+  const retry = section(task, 'const retryPolling = async', 'interface CertJobRow')
+  assert.match(retry, /refreshing\.value = true/)
+})

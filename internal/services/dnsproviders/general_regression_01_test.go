@@ -38,8 +38,19 @@ func TestDNSPod_BuildCredentialsJSON_acceptsCanonicalOutput(t *testing.T) {
 		if err != nil {
 			t.Fatalf("canonical %v must be accepted as input: %v", canonicalStrings, err)
 		}
-		if again["mode"] != canonical["mode"] {
-			t.Fatalf("round-trip mode=%v, want %v", again["mode"], canonical["mode"])
+		// 全字段比对（不只 mode）：secret_id/secret_key 等在 round-trip 中被丢掉的
+		// 凭证字段会让已入库配置改一次就静默失效，只比 mode 时无感。
+		if len(again) != len(canonicalStrings) {
+			t.Fatalf("round-trip 字段数=%d, want %d: got=%v want=%v", len(again), len(canonicalStrings), again, canonicalStrings)
+		}
+		for key, want := range canonicalStrings {
+			got, ok := again[key]
+			if !ok {
+				t.Fatalf("round-trip 丢失字段 %q（canonical=%v, got=%v）", key, canonicalStrings, again)
+			}
+			if got != want {
+				t.Fatalf("round-trip 字段 %q=%v, want %v", key, got, want)
+			}
 		}
 	}
 	// 纯 canonical（无 auth_mode）直传形态。

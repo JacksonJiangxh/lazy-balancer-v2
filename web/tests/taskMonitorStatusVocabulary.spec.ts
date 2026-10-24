@@ -1,16 +1,16 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { source, section, repoSource } from './_helpers.ts'
+import { code, codeSection, repoCode, section } from './_helpers.ts'
 
 // 任务监控=通用任务视图（2026-10-22 用户裁定）：任务列表只呈现通用字段——
 // 名称/分类/类型/状态（空闲·运行中·失败）/调度/执行时间/计数/操作。
 // 证书生命周期态（已签发/限流中/已禁用…）由免费证书页与规则 TLS 列维护，
 // 任务列表的任何列（名称列、状态列、状态词表、兜底）均不得引入业务词表。
 
-const vue = source('src/views/settings/TaskMonitor.vue')
+const vue = code('src/views/settings/TaskMonitor.vue')
 const statusColumn = section(vue, '<el-table-column label="状态"', '</el-table-column>')
 const taskColumn = section(vue, '<el-table-column label="任务"', '</el-table-column>')
-const svc = repoSource('internal/services/taskmonitor.go')
+const svc = repoCode('internal/services/taskmonitor.go')
 
 test('任务名称列只渲染任务名（无业务态子文本/徽标）', () => {
   assert.doesNotMatch(taskColumn, /tm-cert-sub|certJobLabel|certJobRawStatus/, '名称列不得出现证书生命周期态')
@@ -24,7 +24,7 @@ test('状态列只由引擎 status 渲染（三态，无业务态覆盖）', () 
 })
 
 test('statusLabel 兜底不引入证书生命周期词表', () => {
-  const fn = section(vue, 'const statusLabels', '// v2.0 四类型')
+  const fn = codeSection('src/views/settings/TaskMonitor.vue', 'const statusLabels', '// v2.0 四类型')
   assert.doesNotMatch(fn, /certJobStatusLabel/, 'statusLabel 兜底不得把 cert_jobs 状态词表渲染进状态列')
   assert.match(fn, /statusLabels\[s\] \|\| s/, '兜底只回显原值')
 })
@@ -52,7 +52,7 @@ test('服务端 TaskStatus 枚举收敛三态（无 queued/disabled 扩展值）
 // queued/disabled 消费分支、零产出分类「触发」与零产出触发值 slave-sync
 // 均不得残留（残留=死代码，且误导后续维护者以为仍有产出）。
 test('三态收敛后前端死分支清零', () => {
-  const theme = source('src/utils/chartTheme.ts')
+  const theme = code('src/utils/chartTheme.ts')
   const statusColors = section(theme, 'export const statusColor', '\n}')
   assert.doesNotMatch(statusColors, /queued|disabled/, 'statusColor 不得保留零产出键')
   assert.doesNotMatch(vue, /st === 'disabled'/, 'detailTone 不得保留 disabled 分支')

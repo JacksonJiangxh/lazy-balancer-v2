@@ -51,18 +51,10 @@ func v3SnapshotWithACMESection(snapshot models.ClusterSnapshot) models.ClusterSn
 
 func newClusterTestService(t *testing.T) (*ClusterService, *sql.DB) {
 	stubUpdateRetrySleep(t) // 任务内重试等待即时化（威胁库失败路径测试）
-	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
-	if err := db.Initialize(t.TempDir()); err != nil {
-		t.Fatalf("initialize test database: %v", err)
-	}
-	database := db.DB
+	database := setupIsolatedDB(t)
 	service := NewClusterService(database, "")
-	t.Cleanup(func() {
-		// 显式注销全局注册表条目（LIFO：先注销，再 Close/恢复）。
-		unregisterClusterService(service)
-		_ = db.Close()
-		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
-	})
+	// 显式注销全局注册表条目：Cleanup 后注册先执行，早于夹具的 Close/还原。
+	t.Cleanup(func() { unregisterClusterService(service) })
 	return service, database
 }
 

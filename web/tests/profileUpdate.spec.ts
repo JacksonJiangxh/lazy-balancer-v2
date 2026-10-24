@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { isCurrentPasswordRejection } from '../src/utils/profileUpdate.ts'
-import { repoSource } from './_helpers.ts'
+import { repoCode } from './_helpers.ts'
 
 test('仅当前密码错误的 PATCH /users/me 401 豁免会话失效', () => {
   assert.equal(isCurrentPasswordRejection('patch', '/api/v1/users/me', 401, '当前密码错误'), true)
@@ -11,7 +11,7 @@ test('仅当前密码错误的 PATCH /users/me 401 豁免会话失效', () => {
 test('「当前密码错误」与后端 auth.go 逐字对齐（跨栈钉）', () => {
   // 分类唯一判据是后端字面量——后端改文案即静默失配（真会话过期被误豁免/
   // 密码错误被误判会话失效）。
-  const go = repoSource('internal/handlers/auth.go')
+  const go = repoCode('internal/handlers/auth.go')
   assert.ok(go.includes('Message: "当前密码错误"'), 'auth.go 不再产生「当前密码错误」401——前端豁免失配')
 })
 

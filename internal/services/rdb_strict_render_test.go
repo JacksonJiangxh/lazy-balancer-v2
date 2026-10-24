@@ -186,4 +186,27 @@ func TestRDBStrictRender_slaveShape_fastOnlyRenders(t *testing.T) {
 	if !strings.Contains(string(dump), "GeoIP 区域拦截") {
 		t.Fatalf("从节点 .fast 回退：未受影响策略必须照常渲染")
 	}
+
+	// .fast 回退的实际契约是「回退展开的前缀集进入 ACL 匹配集」——只断言
+	// 旁路策略照常渲染时，回退展开成空集（ACL 静默收窄=fail-open/403 风暴）
+	// 仍绿。对照 .iplist 形态钉住 @ipListFast 与投影内容。
+	wafs := wafHandlers(t, mainRoute)
+	var precheck string
+	for _, waf := range wafs {
+		directives, _ := waf["directives"].(string)
+		if strings.Contains(directives, `"id:2,phase:1,deny`) {
+			precheck = directives
+			break
+		}
+	}
+	if precheck == "" {
+		t.Fatalf(".fast 回退必须发射 deny ACL 预检指令（id:2）: %#v", wafs)
+	}
+	if !strings.Contains(precheck, "@ipListFast ") {
+		t.Fatalf(".fast 回退的 deny ACL 必须经 @ipListFast 文件投影:\n%s", precheck)
+	}
+	projection := readRenderedIPList(t, precheck, "u-deny")
+	if !strings.Contains(projection, "192.0.2.0/24") {
+		t.Fatalf("u-deny 投影缺 .fast 前缀 192.0.2.0/24（回退展开丢失=fail-open 方向静默失效）: %q", projection)
+	}
 }

@@ -2,6 +2,10 @@
 // 事件列表 / 安全总览 / 威胁大屏三处同源消费：是否需要提示、提示什么文案
 // 只在此处定义，禁止各视图自造判据（口径分叉会让同一后端状态在不同页面
 // 呈现不同结论）。字段名与后端 JSON tag 逐字对应。
+//
+// 字节数人类可读走站内单源 formatBytes（与日志占用条/备份大小/仪表盘同精度）；
+// 本模块原持私有 humanBytes（一位小数、上限 GB），同一量级在两处显示不同精度。
+import { formatBytes as humanBytes } from './formatBytes.ts'
 
 export interface IngestionHealth {
   observed: boolean
@@ -27,14 +31,6 @@ export interface IngestionHealth {
   skipped_regions?: number
   last_skip_at?: string
   data_loss?: boolean
-}
-
-/** 字节数人类可读（跳过量级从几 KB 到 GB，原始字节数不可读）。 */
-function humanBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`
 }
 
 /** 丢失量归因分项（写侧丢弃/写盘错误/格式化失败/命中明细截断/畸形区跳过各自有则列出）。 */

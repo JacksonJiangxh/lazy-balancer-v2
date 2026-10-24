@@ -28,22 +28,23 @@ func validateCRSStaging(dir string) error {
 	return nil
 }
 
-// countSecRules counts SecRule directives across all *.conf files in dir.
+// countSecRules counts SecRule directives across all *.conf files in dir
+// (recursive, matching crsRulesTreeIntact's tree-wide .conf probe: a rule tree
+// with subdirectories must not report "library available, count 0").
 // Only lines whose first token is exactly "SecRule" count; comments and
 // lookalike directives (SecRuleUpdateTargetById, SecRuleRemoveById, ...) do not.
 func countSecRules(dir string) (int, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return 0, fmt.Errorf("读取规则目录: %w", err)
-	}
 	total := 0
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".conf") {
-			continue
-		}
-		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
-			return 0, fmt.Errorf("读取规则文件 %s: %w", entry.Name(), err)
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(d.Name(), ".conf") {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("读取规则文件 %s: %w", d.Name(), err)
 		}
 		for _, line := range strings.Split(string(data), "\n") {
 			trimmed := strings.TrimLeft(line, " \t")
@@ -51,6 +52,13 @@ func countSecRules(dir string) (int, error) {
 				total++
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		if _, statErr := os.Stat(dir); statErr != nil {
+			return 0, fmt.Errorf("读取规则目录: %w", statErr)
+		}
+		return 0, err
 	}
 	return total, nil
 }

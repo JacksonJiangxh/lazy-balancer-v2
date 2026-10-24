@@ -51,7 +51,7 @@ export interface PolicyPayloadInput {
   policyType: string
 }
 
-export interface PolicyPayload {
+interface PolicyPayload {
   name: string
   description: string
   enabled: boolean

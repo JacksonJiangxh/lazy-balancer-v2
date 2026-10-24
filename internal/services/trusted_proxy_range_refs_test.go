@@ -131,6 +131,7 @@ func TestTrustedProxyRender_missingRefListContributesZero(t *testing.T) {
 	apps := generated["apps"].(map[string]interface{})
 	httpApp := apps["http"].(map[string]interface{})
 	servers := httpApp["servers"].(map[string]interface{})
+	checkedServers := 0
 	for name, serverVal := range servers {
 		srv, ok := serverVal.(map[string]interface{})
 		if !ok {
@@ -146,6 +147,11 @@ func TestTrustedProxyRender_missingRefListContributesZero(t *testing.T) {
 		if path, _ := tp["path"].(string); path != tpPath {
 			t.Fatalf("server %s trusted_proxies.path=%v, want %s", name, tp["path"], tpPath)
 		}
+		checkedServers++
+	}
+	// 正向控制：渲染结果里必须有可检 server，集合为空时循环断言空转。
+	if checkedServers == 0 {
+		t.Fatalf("no servers rendered: servers=%v", servers)
 	}
 }
 

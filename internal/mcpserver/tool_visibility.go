@@ -123,26 +123,37 @@ func isReadOnlyTool(spec toolSpec) bool {
 // mfaStepUpGuard）在转发目标上执行。因此「过滤名单不完整」不构成越权；
 // 新增/改名工具时只需保持能力元数据（read_only）与过滤口径一致。
 func serveWithToolVisibility(writer http.ResponseWriter, request *http.Request, next http.Handler, resolver visibilityResolver) {
-	requestBody, err := io.ReadAll(request.Body)
-	if err != nil {
+	// 网关已持有请求体（1 MiB 上限读取）并解析出 method/id：直接复用，
+	// 不再对同一请求体做第二次全量读取 + JSON 解析（MCP 写工具常接近上限）。
+	// 未注入（mcpserver 单测/独立挂载）时回退到自行读取。
+	meta, fromGateway := RequestMetaFromContext(request.Context())
+	if !fromGateway {
+		requestBody, err := io.ReadAll(request.Body)
+		if err != nil {
+			next.ServeHTTP(writer, request)
+			return
+		}
+		request.Body = io.NopCloser(bytes.NewReader(requestBody))
+		var rpcRequest struct {
+			Method string          `json:"method"`
+			ID     json.RawMessage `json:"id"`
+		}
+		if json.Unmarshal(requestBody, &rpcRequest) != nil {
+			next.ServeHTTP(writer, request)
+			return
+		}
+		meta = RequestMeta{Method: rpcRequest.Method, ID: rpcRequest.ID}
+	}
+	if meta.Method != "tools/list" || resolver == nil {
 		next.ServeHTTP(writer, request)
 		return
 	}
-	request.Body = io.NopCloser(bytes.NewReader(requestBody))
-	var rpcRequest struct {
-		Method string          `json:"method"`
-		ID     json.RawMessage `json:"id"`
-	}
-	if json.Unmarshal(requestBody, &rpcRequest) != nil || rpcRequest.Method != "tools/list" || resolver == nil {
-		next.ServeHTTP(writer, request)
-		return
-	}
-	visibility, err := resolver(apikey.FromHeader(request.Header))
+	visibility, err := resolveVisibility(request, resolver)
 	if err != nil {
 		// fail-closed：无法判定 Key 属主时不再原样透传全量工具（旧行为），
 		// 改为空 tools 列表 + warn 日志——工具可见性必须由身份决定。
 		services.Logf("warn", "mcp tools/list 可见性判定失败，已按 fail-closed 拒绝下发工具列表: %v", err)
-		writeEmptyToolsList(writer, rpcRequest.ID)
+		writeEmptyToolsList(writer, meta.ID)
 		return
 	}
 	if visibility.unknown || (visibility.admin && !visibility.readOnly) {
@@ -170,7 +181,7 @@ func serveWithToolVisibility(writer http.ResponseWriter, request *http.Request, 
 		// 过滤失败同样 fail-closed：不得回退为未过滤原文（过滤器失效的
 		// 自然后果是工具全量泄露）。
 		services.Logf("warn", "mcp tools/list 过滤失败，已按 fail-closed 拒绝下发工具列表: %v", err)
-		writeEmptyToolsList(writer, rpcRequest.ID)
+		writeEmptyToolsList(writer, meta.ID)
 		return
 	}
 	for name, values := range recorder.header {
@@ -213,6 +224,16 @@ func resolveAPIKeyVisibility(apiKey string) (apiKeyVisibility, error) {
 		return apiKeyVisibility{}, err
 	}
 	return apiKeyVisibility{readOnly: identity.ReadOnly, admin: identity.IsAdmin()}, nil
+}
+
+// resolveVisibility 优先复用网关 apiKeyAuth 已解析的 Key 属主属性（context 注入，
+// 与认证共用同一次 db.ResolveAPIKeyIdentity 结果），缺失时回退到按请求头自查
+// （mcpserver 单测/独立挂载）。
+func resolveVisibility(request *http.Request, resolver visibilityResolver) (apiKeyVisibility, error) {
+	if readOnly, admin, ok := APIKeyVisibilityFromContext(request.Context()); ok {
+		return apiKeyVisibility{readOnly: readOnly, admin: admin}, nil
+	}
+	return resolver(apikey.FromHeader(request.Header))
 }
 
 func filterReadOnlyTools(response []byte) ([]byte, error) {

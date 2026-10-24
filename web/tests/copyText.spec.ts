@@ -5,7 +5,7 @@ import { readdirSync, readFileSync } from 'node:fs'
 import { copyText } from '../src/utils/copy.ts'
 import { scheduleEditUntouched } from '../src/utils/securityLibraries.ts'
 import { popperViewportSafe } from '../src/utils/popper.ts'
-import { member, section, source, stripComments } from './_helpers.ts'
+import { member, section, code, stripComments } from './_helpers.ts'
 
 // 零引用产品单元的覆盖补齐：
 // - copy.ts：Safari/内网非 HTTPS 必走的 textarea + execCommand 降级路径，
@@ -134,12 +134,12 @@ test('scheduleEditUntouched：未编辑才回填，编辑中不得覆盖用户�
 })
 
 test('ProxyTimeoutFields：字段集与 ProxyTimeoutConfig 同集同序，undefined 归一为 0', () => {
-  const types = source('src/types/rules.ts')
+  const types = code('src/types/rules.ts')
   const block = section(types, 'export interface ProxyTimeoutConfig {', '\n}')
   const typeKeys = [...block.matchAll(/^\s+(proxy_\w+):/gm)].map((m) => m[1])
   assert.ok(typeKeys.length >= 7, `ProxyTimeoutConfig 键解析失败（${typeKeys.length}）`)
 
-  const component = source('src/components/rules/ProxyTimeoutFields.vue')
+  const component = code('src/components/rules/ProxyTimeoutFields.vue')
   const fieldKeys = [...component.matchAll(/\{ key: '(proxy_\w+)'/g)].map((m) => m[1])
   assert.deepEqual(fieldKeys, typeKeys, '字段集/顺序必须与类型单源一致（漏字段即静默不可编辑）')
 
@@ -180,12 +180,12 @@ test('echarts 全站单一注册点：只有 utils/echarts 引内核，三页面
   }
   assert.deepEqual(offenders, [], '内核 import 只允许出现在 utils/echarts.ts（注册面随路由漂移会静默缺序列）')
 
-  const echarts = source('src/utils/echarts.ts')
+  const echarts = code('src/utils/echarts.ts')
   for (const symbol of ['CanvasRenderer', 'LineChart', 'PieChart', 'BarChart', 'GridComponent', 'TooltipComponent', 'LegendComponent']) {
     assert.match(echarts, new RegExp(`\\b${symbol}\\b`), `注册面缺少 ${symbol}`)
   }
   for (const page of ['src/views/Dashboard.vue', 'src/views/security/SecurityOverview.vue', 'src/views/settings/TaskMonitor.vue']) {
-    assert.match(stripComments(source(page)), /import '@\/utils\/echarts'/, `${page} 必须引统一注册模块`)
+    assert.match(stripComments(code(page)), /import '@\/utils\/echarts'/, `${page} 必须引统一注册模块`)
   }
 })
 
@@ -194,7 +194,7 @@ test('集群同步错误展示单源：两个面板都消费 formatSyncErrorDisp
     'src/views/settings/cluster/ClusterSlavePanel.vue',
     'src/views/settings/cluster/ClusterStatusCard.vue',
   ]) {
-    const text = stripComments(source(file))
+    const text = stripComments(code(file))
     assert.match(text, /formatSyncErrorDisplay\(props\.status\)/, `${file} 必须消费共享翻译`)
     assert.doesNotMatch(text, /apply_ok_reload_failed/, `${file} 不得复刻机内标记`)
   }

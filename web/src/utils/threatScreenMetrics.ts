@@ -13,7 +13,7 @@ export interface TrafficBaseline {
   readonly sampleN: number
 }
 
-export interface TrafficDeltaResult {
+interface TrafficDeltaResult {
   /** 本轮只建立/重建基线（不产生流量增量）。 */
   readonly baseline: boolean
   /** 计数器回退或抽样比变化——曲线应断开并重建基线。 */
@@ -90,4 +90,19 @@ export function formatRecentRate(raw: number): string {
  */
 export function hourlyBucketLabel(name: string): string {
   return typeof name === 'string' ? name : ''
+}
+
+/**
+ * 趋势桶粒度术语（与后端分桶口径对齐）：>24h 后端按「日」桶返回（标签 MM-DD），
+ * 否则按「小时」桶。概览里的「峰值时段 / 有事件小时」必须跟着窗口换词，
+ * 否则 7d 视图会把「有事件的天数」读成小时密度。
+ */
+export function bucketTerminology(windowHours: number): {
+  readonly unit: '小时' | '天'
+  readonly peakLabel: string
+  readonly countLabel: string
+} {
+  return windowHours > 24
+    ? { unit: '天', peakLabel: '峰值日期', countLabel: '有事件天' }
+    : { unit: '小时', peakLabel: '峰值时段', countLabel: '有事件小时' }
 }

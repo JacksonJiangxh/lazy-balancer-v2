@@ -39,7 +39,7 @@ export const invalidateImportPreviews = (): void => {
   previewCache.clear()
 }
 
-export interface ImportPreviewResult<T> {
+interface ImportPreviewResult<T> {
   readonly value: T
   /** true = 命中缓存（未发起请求）。 */
   readonly cached: boolean
@@ -52,7 +52,7 @@ export interface ImportPreviewSession<T> {
   dispose(): void
 }
 
-export interface ImportPreviewSessionOptions<T> {
+interface ImportPreviewSessionOptions<T> {
   /** 备份内容指纹（见 importPreviewFingerprint）；同指纹跨会话复用缓存。 */
   readonly fingerprint: string
   /** 发送一次预览校验；signal 在新选择到来或 dispose 时被 abort。 */
@@ -67,6 +67,11 @@ export const createImportPreviewSession = <T>(options: ImportPreviewSessionOptio
       const key = `${options.fingerprint}\u0000${[...new Set(sections)].sort().join(',')}`
       const cached = previewCache.get(key)
       if (cached && Date.now() - cached.at < PREVIEW_CACHE_TTL_MS) {
+        // LRU：命中即刷新到队尾。淘汰取的是插入序首项，命中不刷新等于 FIFO——
+        // 反复勾选的同一份备份会被后来的一次性条目挤出，反而多传一次整份备份
+        // （与 threatGlobe 省点阵缓存的 LRU 口径一致）。
+        previewCache.delete(key)
+        previewCache.set(key, cached)
         return { value: cached.value as T, cached: true }
       }
       if (cached) previewCache.delete(key)

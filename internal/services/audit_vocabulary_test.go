@@ -29,8 +29,9 @@ import (
 //   - handlers/cluster_registration.go clusterNodeAction 的动作形参实参仅有
 //     审批/拒绝/删除/更新地址；
 //   - handlers/config_backup.go importConfigBackupCore（HTTP 导入端点与自动
-//     备份还原共用）、failImportTx/failImportValidation（事务内/事务前失败
-//     收尾，动作取 action+"失败"）与 config_import_v1.go ImportV1Config 的
+//     备份还原共用）、failImportAbort/failImportValidation（事务内/事务前失败
+//     收尾，动作取 action+"失败"；failImportTx 已改为其薄封装，无独立动态
+//     调用点）与 config_import_v1.go ImportV1Config 的
 //     动作变量取值仅有导入/还原/导入失败/还原失败/部分失败；handlers/autobackup.go
 //     RunAutoBackupOnce 的动作变量取值仅有 自动备份/手动备份；
 //   - services/certificates.go renewExpiringCertificates 的动作变量取值仅有
@@ -47,7 +48,9 @@ var auditVocabDynamicAllowlist = map[string]map[int][]string{
 	"middleware/middleware.go":         {1: {"auditMiddleware"}, 2: {"auditMiddleware"}},
 	"handlers/caddy.go":                {2: {"UpdateConfig"}},
 	"handlers/cluster_registration.go": {1: {"clusterNodeAction"}},
-	"handlers/config_backup.go":        {1: {"importConfigBackupCore", "failImportTx", "failImportValidation"}},
+	// failImportAbort 是 failImportTx 与 29 处锁内复核分支共用的「回滚→失败
+	// 审计」收口（动作取 action+"失败"，取值仅 导入失败/还原失败）。
+	"handlers/config_backup.go": {1: {"importConfigBackupCore", "failImportAbort", "failImportValidation"}},
 	// config_import_coordinator abort：WAF 文件回退失败/说明性告警必须系统身份
 	// 留痕，动作取 actionLabel()+"警告"（取值仅 导入警告/还原警告，均 ≤4 词），
 	// 对象固定「配置备份」。会话上下文不携带用户身份，故在 abort 内直写。

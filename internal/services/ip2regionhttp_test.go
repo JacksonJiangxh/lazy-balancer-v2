@@ -128,8 +128,14 @@ func TestIP2RegionDownloadXDBLogged_startAndCompletionLines(t *testing.T) {
 	}
 
 	// Then 文件完整落盘
-	if info, err := os.Stat(dest); err != nil || info.Size() != int64(len(body)) {
-		t.Fatalf("downloaded file size=%d,%v, want %d", info.Size(), err, len(body))
+	// 分开断言：err != nil 时 info 为 nil，旧写法在 Fatalf 实参里再解引用
+	// info.Size() 直接 panic，掩盖「下载未落盘」的真实原因。
+	info, statErr := os.Stat(dest)
+	if statErr != nil {
+		t.Fatalf("下载文件未落盘: %v", statErr)
+	}
+	if info.Size() != int64(len(body)) {
+		t.Fatalf("downloaded file size=%d, want %d", info.Size(), len(body))
 	}
 
 	// And 更新日志包含：开始行（完整代理 URL+预计大小）与完成行（字节+耗时）

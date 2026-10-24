@@ -11,7 +11,7 @@ import assert from 'node:assert/strict'
 
 import { dnsConfigNeedsChallenge } from '../src/utils/dnsConfigChallenge.ts'
 import type { DnsConfigBaseline, DnsConfigDraft } from '../src/utils/dnsConfigChallenge.ts'
-import { section, source } from './_helpers.ts'
+import { section, code } from './_helpers.ts'
 
 const baseline = (overrides: Partial<DnsConfigBaseline> = {}): DnsConfigBaseline => ({
   dnsProvider: 'dnspod',
@@ -76,7 +76,7 @@ test('基线与表单同源裁剪：隐藏键不得进入基线键集', () => {
   const unstripped = baseline({ dnsCredentials: { ...pruned, stale_token: 'x' } })
   assert.equal(dnsConfigNeedsChallenge(unstripped, draft()), true, '键集差异按变更处理（该形态不得出现在组件基线里）')
 
-  const page = source('src/views/settings/FreeCertificates.vue')
+  const page = code('src/views/settings/FreeCertificates.vue')
   const open = section(page, 'const openConfigDialog = (config?: CertConfig) => {', '\nconst ')
   assert.match(
     open,
@@ -93,7 +93,7 @@ test('基线与表单同源裁剪：隐藏键不得进入基线键集', () => {
 })
 
 test('组件接线：挑战门由快照判定，弹框只在需要时出现', () => {
-  const page = source('src/views/settings/FreeCertificates.vue')
+  const page = code('src/views/settings/FreeCertificates.vue')
   assert.match(page, /const configBaseline = ref<DnsConfigBaseline \| null>\(null\)/)
   const save = section(page, 'const saveConfig = async', '\nconst ')
   assert.match(save, /dnsConfigNeedsChallenge\(configBaseline\.value, \{/, '保存前挑战必须以打开弹框时的快照判定')

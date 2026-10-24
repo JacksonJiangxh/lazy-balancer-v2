@@ -87,7 +87,7 @@ export function panBy(cam: Cam2D, dxPx: number, dyPx: number): { camX: number; c
 export const DRILL_UNIFIED_ZOOM = 9
 
 /** 球面相机基向量（正交归一；球心=原点、半径=radius 的世界坐标系）。 */
-export interface SpherePickCamera {
+interface SpherePickCamera {
   readonly origin: readonly [number, number, number]
   readonly dir: readonly [number, number, number]
   readonly right: readonly [number, number, number]

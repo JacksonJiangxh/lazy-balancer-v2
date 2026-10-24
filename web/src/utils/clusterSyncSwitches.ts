@@ -2,7 +2,7 @@
 // ClusterSettings 的变更确认文案（label）原各持一份「系统数据/负载均衡规则/
 // 安全防护」，改名/新增必漏一侧。此处收敛为唯一事实源，两侧只做取值。
 
-export interface ClusterSyncSwitch {
+interface ClusterSyncSwitch {
   readonly key: string
   readonly label: string
   readonly tip: string

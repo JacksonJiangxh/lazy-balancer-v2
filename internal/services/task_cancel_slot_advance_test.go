@@ -199,6 +199,64 @@ func TestThreatUpdate_userCancelAdvancesAllDueSourceSlots(t *testing.T) {
 	assertAllSourceSlotsFuture(t, "security_threat_sources")
 }
 
+// Given 威胁源表存在一个注册表外的启用行（旧版本/带外直写残留）。When 用户
+// 取消自动轮。Then 只有注册表源推进到下一槽，注册表外的惰性槽保持原值——
+// 槽域必须 ⊆ 运行域，否则启动期清理刚清空的槽会被取消动作写回（排障侧只会
+// 看到「清理无效」的循环告警）。
+func TestThreatUpdate_userCancelKeepsUnregisteredSourceSlot(t *testing.T) {
+	overrideWafDirForTest(t)
+	newClusterTestService(t)
+	setupThreatTest(t, nil, nil, nil)
+	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_enabled=1`); err != nil {
+		t.Fatal(err)
+	}
+	stale := expiredSlot()
+	if _, err := db.DB.Exec(`INSERT INTO security_threat_sources (name, url, update_enabled, next_update) VALUES ('legacy_extra', 'https://legacy.example/list.txt', 1, ?)`, stale); err != nil {
+		t.Fatal(err)
+	}
+
+	m := GetThreatUpdateManager()
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(taskengine.ErrUserCancelled)
+	if err := m.RunUpdate("auto", &taskengine.RunContext{Ctx: ctx, Trigger: "auto"}); err != nil {
+		t.Fatalf("RunUpdate: %v", err)
+	}
+	if outcome := m.StatusSnapshot().Outcome; outcome != "cancelled" {
+		t.Fatalf("outcome=%q, want cancelled", outcome)
+	}
+
+	var legacySlot string
+	if err := db.DB.QueryRow(`SELECT COALESCE(next_update,'') FROM security_threat_sources WHERE name='legacy_extra'`).Scan(&legacySlot); err != nil {
+		t.Fatal(err)
+	}
+	if legacySlot != stale {
+		t.Fatalf("注册表外源的惰性槽被写回：next_update=%q, want 保持 %q", legacySlot, stale)
+	}
+	// 注册表内的启用源必须全部推进（槽域=运行域：其余到期源不得压住排程）。
+	rows, err := db.DB.Query(`SELECT name, COALESCE(next_update,'') FROM security_threat_sources WHERE update_enabled=1 AND name<>'legacy_extra'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	checked := 0
+	for rows.Next() {
+		var name, slot string
+		if err := rows.Scan(&name, &slot); err != nil {
+			t.Fatal(err)
+		}
+		checked++
+		if parsed := parseUTCSlot(slot); parsed.IsZero() || !parsed.After(time.Now().UTC().Add(-time.Minute)) {
+			t.Fatalf("注册表源 %s 的槽未推进：next_update=%q", name, slot)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if checked == 0 {
+		t.Fatal("无注册表源行，断言失效")
+	}
+}
+
 // Given 威胁情报库 auto 轮在途。When 系统性中止（无 ErrUserCancelled）。
 // Then 源槽保持原值（恢复后到期轮补跑）。
 func TestThreatUpdate_systemAbortKeepsSourceSlots(t *testing.T) {

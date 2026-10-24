@@ -96,7 +96,8 @@ func TestPutCaddyConfig_applyFailurePinsLastKnownGoodToCommittedView(t *testing.
 	router := gin.New()
 	router.PUT("/config/raw", handler.PutCaddyConfig)
 
-	body := `{"content":"{\"apps\":{\"http\":{\"servers\":{\"s\":{\"routes\":[]}}}}}"}`
+	adminListen := strings.TrimPrefix(handler.cfg.CaddyAdminURL, "http://")
+	body := `{"content":"{\"admin\":{\"listen\":\"` + adminListen + `\"},\"apps\":{\"http\":{\"servers\":{\"s\":{\"routes\":[]}}}}}"}`
 	request := httptest.NewRequest(http.MethodPut, "/config/raw", strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()

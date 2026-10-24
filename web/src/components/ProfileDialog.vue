@@ -40,29 +40,76 @@
         <el-form-item label="当前密码">
           <el-input v-model="profileForm.currentPassword" :disabled="isReadOnly" type="password" maxlength="72" :placeholder="profileForm.password ? '修改密码时必填' : '填写新密码后需确认'" show-password />
         </el-form-item>
+        <el-form-item label="两步验证">
+          <div class="mfa-row">
+            <el-tag :type="mfaEnabled ? 'success' : 'info'" size="small" effect="plain">{{ mfaEnabled ? '已启用' : '未启用' }}</el-tag>
+            <el-button v-if="!mfaEnabled" size="small" type="primary" plain :disabled="isReadOnly" @click="startEnable">启用 MFA</el-button>
+            <template v-else>
+              <el-button size="small" :disabled="isReadOnly" @click="startMfaAction('disable')">关闭 MFA</el-button>
+              <el-button size="small" type="warning" plain :disabled="isReadOnly" @click="startMfaAction('reset')">重置 MFA</el-button>
+            </template>
+          </div>
+          <div class="form-tip-line">关闭或重置需输入当前动态验证码；重置会立即换绑新的验证器并重新生成恢复代码。</div>
+        </el-form-item>
       </template>
     </el-form>
     <template #footer>
       <el-button :disabled="saving" @click="closeProfile">取消</el-button>
       <el-button v-if="!isOIDCUser" type="primary" :loading="saving" :disabled="isReadOnly || saving" @click="saveProfile">保存</el-button>
     </template>
+    <!-- 关闭/重置 MFA 前的动态码确认：与全站 MFA 写操作同一验证语义 -->
+    <el-dialog
+      v-model="mfaCodeDialog"
+      append-to-body
+      width="min(420px, 92vw)"
+      :close-on-click-modal="false"
+      :title="mfaAction === 'reset' ? '重置 MFA' : '关闭 MFA'"
+    >
+      <div class="form-tip-line">{{ mfaAction === 'reset' ? '重置会立即换绑验证器，旧验证器与旧恢复代码全部失效。' : '关闭后登录不再需要动态验证码。' }}</div>
+      <el-input
+        v-model="mfaCode"
+        class="mfa-code-field"
+        placeholder="当前 6 位动态验证码"
+        maxlength="6"
+        aria-label="当前 6 位动态验证码"
+        @input="mfaCode = mfaCode.replace(/\D/g, '')"
+      />
+      <template #footer>
+        <el-button :disabled="mfaSubmitting" @click="mfaCodeDialog = false">取消</el-button>
+        <el-button type="primary" :loading="mfaSubmitting" :disabled="mfaCode.length !== 6" @click="confirmMfaAction">
+          {{ mfaAction === 'reset' ? '验证并重置' : '验证并关闭' }}
+        </el-button>
+      </template>
+    </el-dialog>
+    <MfaBindingWizard
+      :model-value="wizardVisible"
+      :secret="pendingSecret"
+      :uri="pendingUri"
+      :username="authStore.user?.username || ''"
+      @activated="onMfaActivated"
+      @update:model-value="(v: boolean) => { wizardVisible = v; if (!v) clearPendingSecret() }"
+    />
   </el-dialog>
 </template>
 
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
+import { ElMessage } from 'element-plus'
 import { User } from '@element-plus/icons-vue'
 import DialogHeader from '@/components/DialogHeader.vue'
+import MfaBindingWizard from '@/components/MfaBindingWizard.vue'
 import { request, mfaAwareSuccess, ApiRequestError } from '@/utils/api'
 import { isCurrentPasswordRejection } from '@/utils/profileUpdate'
 import { validatePassword } from '@/utils/credentials'
 import { useAuthStore } from '@/stores/auth'
+import type { APIResponse } from '@/types'
 
 const props = defineProps<{ modelValue: boolean }>()
 const emit = defineEmits<{ 'update:modelValue': [value: boolean] }>()
 const authStore = useAuthStore()
 const isOIDCUser = computed(() => authStore.user?.auth_provider === 'oidc')
 const isReadOnly = computed(() => authStore.readOnlyReason === 'slave' || authStore.readOnlyReason === 'unknown')
+const mfaEnabled = computed(() => authStore.user?.mfa_enabled === true)
 const saving = ref(false)
 const profileForm = ref({ username: '', display_name: '', password: '', passwordConfirm: '', currentPassword: '' })
 const syncProfileForm = () => {
@@ -78,8 +125,11 @@ const handleOpen = (): void => {
   syncProfileForm()
 }
 watch(() => props.modelValue, (visible) => { if (visible) syncProfileForm() })
-const beforeClose = (done: () => void): void => { if (!saving.value) done() }
-const closeProfile = (): void => { if (!saving.value) emit('update:modelValue', false) }
+const beforeClose = (done: () => void): void => {
+  // 关闭/重置 MFA 与绑定向导在途期间不得关闭个人资料弹框（向导为嵌套弹框）
+  if (!saving.value && !mfaSubmitting.value && !wizardVisible.value) done()
+}
+const closeProfile = (): void => { if (!saving.value && !mfaSubmitting.value && !wizardVisible.value) emit('update:modelValue', false) }
 const saveProfile = async () => {
   if (isReadOnly.value || saving.value) return
   const passwordError = validatePassword(profileForm.value.password)
@@ -111,6 +161,73 @@ const saveProfile = async () => {
     saving.value = false
   }
 }
+
+// ── 两步验证自助（启用 / 关闭 / 重置）──
+// 已启用时后端 setup 需当前动态码确认（换绑定验码门），故「重置」= 验码 →
+// setup 取新 secret → 绑定向导 → activate（等价换密钥 + 恢复码）。
+const wizardVisible = ref(false)
+const pendingSecret = ref('')
+const pendingUri = ref('')
+const mfaCodeDialog = ref(false)
+const mfaCode = ref('')
+const mfaAction = ref<'disable' | 'reset'>('disable')
+const mfaSubmitting = ref(false)
+
+const clearPendingSecret = (): void => {
+  pendingSecret.value = ''
+  pendingUri.value = ''
+}
+
+const startEnable = async (): Promise<void> => {
+  if (isReadOnly.value || mfaSubmitting.value) return
+  mfaSubmitting.value = true
+  try {
+    const res = await request.post<APIResponse<{ secret: string; uri: string }>>('/auth/mfa/setup', {}, { silent: true })
+    if (!res.data) return
+    pendingSecret.value = res.data.secret
+    pendingUri.value = res.data.uri
+    wizardVisible.value = true
+  } catch (error: unknown) {
+    ElMessage.error(error instanceof Error ? error.message : '生成 MFA 密钥失败')
+  } finally {
+    mfaSubmitting.value = false
+  }
+}
+
+const startMfaAction = (action: 'disable' | 'reset'): void => {
+  if (isReadOnly.value || mfaSubmitting.value) return
+  mfaAction.value = action
+  mfaCode.value = ''
+  mfaCodeDialog.value = true
+}
+
+const confirmMfaAction = async (): Promise<void> => {
+  if (mfaCode.value.length !== 6 || mfaSubmitting.value) return
+  mfaSubmitting.value = true
+  try {
+    if (mfaAction.value === 'disable') {
+      await request.post('/auth/mfa/disable', { code: mfaCode.value }, { silent: true })
+      mfaCodeDialog.value = false
+      mfaAwareSuccess('MFA 已关闭')
+      await authStore.fetchUser()
+      return
+    }
+    const res = await request.post<APIResponse<{ secret: string; uri: string }>>('/auth/mfa/setup', { code: mfaCode.value }, { silent: true })
+    if (!res.data) return
+    mfaCodeDialog.value = false
+    pendingSecret.value = res.data.secret
+    pendingUri.value = res.data.uri
+    wizardVisible.value = true
+  } catch (error: unknown) {
+    ElMessage.error(error instanceof Error ? error.message : '操作失败')
+  } finally {
+    mfaSubmitting.value = false
+  }
+}
+
+const onMfaActivated = async (): Promise<void> => {
+  await authStore.fetchUser()
+}
 </script>
 
 <style scoped>
@@ -118,6 +235,8 @@ const saveProfile = async () => {
 .profile-form :deep(.el-form-item) { margin-bottom: 20px; }
 .profile-form :deep(.el-form-item__label) { color: var(--el-text-color-regular); }
 .profile-readonly-note { margin: 0 28px 12px; }
+.mfa-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-height: 32px; }
+.mfa-code-field { margin-top: 4px; }
 .oidc-hint-block {
   width: 100%;
   padding: 8px 12px;

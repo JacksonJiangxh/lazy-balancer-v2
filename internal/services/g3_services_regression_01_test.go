@@ -25,7 +25,7 @@ func TestRotateLocked_neverOverwritesSameSecondCopies(t *testing.T) {
 	}
 	var expects []copyExpect
 	for _, ts := range []time.Time{now, now.Add(time.Second)} {
-		stamp := ts.Format("20060102-150405")
+		stamp := ts.Format(rotatedLogTimeLayout)
 		base := fmt.Sprintf("runtime.log.%s", stamp)
 		expects = append(expects, copyExpect{name: base, content: "base-copy-" + stamp})
 		for i := 0; i < 1000; i++ {

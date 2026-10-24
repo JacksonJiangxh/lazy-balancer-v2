@@ -7,11 +7,11 @@ import {
   importConfirmMessage,
   normalizeBackupSectionKeys,
 } from '../src/utils/backupSections.ts'
-import { code, repoCode, section, source } from './_helpers.ts'
+import { code, repoCode, section } from './_helpers.ts'
 
 // 设置页备份面回归守卫：导入入口/超大文件拒绝、lbbak Blob 直传、还原文案按分类、
 // 下次备份调度口径、立即备份的卸载收尾，以及备份四分类前后端单源一致性。
-const page = source('src/views/settings/BasicSettings.vue')
+const page = code('src/views/settings/BasicSettings.vue')
 
 test('新文件入口先清旧内容，超大拒绝不可回用旧备份', () => {
   // 终点用「下一个函数声明」而非注释文本——注释终点可能落在本函数内部，
@@ -128,7 +128,7 @@ test('legacy 分类键归一行为（映射/去重/保序/未知键透传）', (
 test('导出/自动备份默认全选四分类，恢复路径必经归一', () => {
   const allKeys = BACKUP_SECTIONS.map((s) => s.key)
   assert.deepEqual(normalizeBackupSectionKeys(allKeys), allKeys)
-  const page = source('src/views/settings/BasicSettings.vue')
+  const page = code('src/views/settings/BasicSettings.vue')
   // 默认全选两处（导出对话框 + 自动备份表单）
   assert.match(page, /const exportSections = ref<string\[\]>\(BACKUP_SECTIONS\.map\(\(s\) => s\.key\)\)/)
   assert.match(page, /const autoBackupSections = ref<string\[\]>\(BACKUP_SECTIONS\.map\(\(s\) => s\.key\)\)/)

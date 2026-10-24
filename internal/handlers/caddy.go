@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -185,13 +186,16 @@ func parseProcStat(line string) (comm string, state byte, ok bool) {
 	return line[open+1 : close], line[close+2], true
 }
 
-// caddyLivePID 返回首个存活（非 Z 状态）caddy 进程的 pid，无存活进程时返回 0。
-// 与 caddyProcessRunning 共用同一 /proc 遍历（仪表盘「运行中（pid）」展示）。
+// caddyLivePID 返回存活（非 Z 状态）caddy 进程中的最小 pid，无存活进程时
+// 返回 0。与 caddyProcessRunning 共用同一 /proc 遍历（仪表盘「运行中（pid）」
+// 展示）。取最小 pid 而非 ReadDir 序首个：监督器 churn 窗口内可能同时存在
+// 两个 caddy 进程，ReadDir 返回序不确定会让仪表盘 pid 在两次轮询间跳动。
 func caddyLivePID() int {
 	entries, err := os.ReadDir(caddyProcRoot)
 	if err != nil {
 		return 0
 	}
+	lowest := 0
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -204,13 +208,18 @@ func caddyLivePID() int {
 		if !ok || comm != "caddy" {
 			continue
 		}
-		if state != 'Z' {
-			if pid, err := strconv.Atoi(entry.Name()); err == nil {
-				return pid
-			}
+		if state == 'Z' {
+			continue
+		}
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		if lowest == 0 || pid < lowest {
+			lowest = pid
 		}
 	}
-	return 0
+	return lowest
 }
 
 func caddyAdminReady(adminURL string) bool {
@@ -727,7 +736,7 @@ func isPureConfigValidationError(err error) bool {
 	return errors.As(err, &validationErr)
 }
 
-// writeConfigValidationFailure 映射聚合预校验错误。新发现4：纯配置错误
+// writeConfigValidationFailure 映射聚合预校验错误。纯配置错误
 // 保持 400 且展示全部规则问题；一旦混入非配置类错误（DB 故障
 // 等），改映射 500 通用文案并记日志——否则 400 消息携带底层 DB 错误文本，
 // 客户端会把服务端故障误判为配置问题。
@@ -1006,8 +1015,10 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 	}
 
 	if len(plan.SectionChanges) > 0 {
-		for section, fields := range plan.SectionChanges {
-			recordAudit(c, "更新", section, fmt.Sprintf("修改了: %s", strings.Join(fields, ", ")))
+		// 按分区名排序遍历：多个分区同时变更时，审计行落库顺序必须稳定
+		// （map 序会让同一载荷两次提交的行序不同）。
+		for _, section := range sortedStringKeys(plan.SectionChanges) {
+			recordAudit(c, "更新", section, fmt.Sprintf("修改了: %s", strings.Join(plan.SectionChanges[section], ", ")))
 		}
 	}
 
@@ -1328,6 +1339,112 @@ func convertLogTimezone(content string) string {
 	return strings.Join(lines, "\n")
 }
 
+// errCaddyAdminLockout 是逃生口护栏的固定文案（不含底层地址细节，
+// 管理员排障需要地址时由审计明细携带）。
+const errCaddyAdminLockout = "配置中的 admin 段会让面板失去对 Caddy 的控制（admin 已关闭或监听地址与 caddy_admin_url 不一致），请保留面板自管的 admin 端点"
+
+// validateCaddyAdminSection 是原始配置逃生口的 admin 端点护栏。admin 是
+// 面板自管资源：/load、GetConfig、启停全部经它访问，一旦提交
+// {"admin":{"disabled":true}} 或把 listen 改到面板不可达的 host:port，本次
+// apply 会成功，随后面板所有配置写与 Caddy 生命周期操作全部失联，只能重启
+// 容器由引导 Caddyfile 恢复。护栏只拦「自锁」两种形态，其余 admin 选项
+// （origins/enforce_origin/远程管理地址）放行。
+//
+// admin 段在 Caddy JSON 中可为对象（listen/disabled）或字符串（监听地址，
+// "off" 表示关闭），省略时为默认 localhost:2019——三种形态都要归一比对。
+func validateCaddyAdminSection(configData map[string]interface{}, adminURL string) error {
+	expectedHost, expectedPort, ok := adminURLHostPort(adminURL)
+	if !ok {
+		// 畸形 caddy_admin_url 由连接层报错；此处不把逃生口锁死。
+		return nil
+	}
+	listen := "localhost:2019" // Caddy 默认 admin 端点
+	raw, present := configData["admin"]
+	if present {
+		switch admin := raw.(type) {
+		case string:
+			if strings.EqualFold(strings.TrimSpace(admin), "off") {
+				return fmt.Errorf("%s", errCaddyAdminLockout)
+			}
+			listen = strings.TrimSpace(admin)
+		case map[string]interface{}:
+			if disabled, _ := admin["disabled"].(bool); disabled {
+				return fmt.Errorf("%s", errCaddyAdminLockout)
+			}
+			if raw2, ok := admin["listen"]; ok {
+				value, isString := raw2.(string)
+				if !isString {
+					return fmt.Errorf("admin.listen 必须是字符串地址")
+				}
+				if trimmed := strings.TrimSpace(value); trimmed != "" {
+					listen = trimmed
+				}
+			}
+		case nil:
+			// 显式 null 等同省略（Caddy 回落默认 admin 端点）。
+		default:
+			return fmt.Errorf("admin 段必须是监听地址字符串或对象")
+		}
+	}
+	if !caddyAdminListenReachable(listen, expectedHost, expectedPort) {
+		return fmt.Errorf("%s（当前 admin.listen=%s，面板配置为 %s:%s）", errCaddyAdminLockout, listen, expectedHost, expectedPort)
+	}
+	return nil
+}
+
+// adminURLHostPort 解析 caddy_admin_url 的 host 与 port（缺端口按 scheme 默认）。
+func adminURLHostPort(rawURL string) (host, port string, ok bool) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Host == "" {
+		return "", "", false
+	}
+	host = parsed.Hostname()
+	port = parsed.Port()
+	if port == "" {
+		switch parsed.Scheme {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		default:
+			return "", "", false
+		}
+	}
+	return host, port, true
+}
+
+// caddyAdminListenReachable 判定配置中的 admin 监听地址是否仍能被面板
+// （期望 host:port）访问：端口必须一致，且监听主机为通配（覆盖回环）或与
+// 期望主机同属回环等价类（localhost/127.0.0.1/::1）。
+func caddyAdminListenReachable(listen, expectedHost, expectedPort string) bool {
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		// Caddy 也接受 ":2019" 这类省略主机的形态：只有「端口段」无法还原时
+		// 才判定不可达（宁可拒绝也不放行自锁形态）。
+		if strings.HasPrefix(listen, ":") {
+			host, port = "", strings.TrimPrefix(listen, ":")
+		} else {
+			return false
+		}
+	}
+	if port != expectedPort {
+		return false
+	}
+	switch strings.ToLower(host) {
+	case "", "0.0.0.0", "::":
+		return true
+	}
+	return adminHostsEquivalent(strings.ToLower(host), strings.ToLower(expectedHost))
+}
+
+func adminHostsEquivalent(a, b string) bool {
+	if a == b {
+		return true
+	}
+	loopback := map[string]bool{"localhost": true, "127.0.0.1": true, "::1": true}
+	return loopback[a] && loopback[b]
+}
+
 func (h *Handlers) PutCaddyConfig(c *gin.Context) {
 	// 导入窗口 fast-fail：原始配置逃生口写 global_config.caddy_config 并
 	// 立即应用；导入全量替换后排队重放会把「按导入前用户意图」的载荷写成
@@ -1367,6 +1484,15 @@ func (h *Handlers) PutCaddyConfig(c *gin.Context) {
 	if err := json.Unmarshal([]byte(req.Content), &configData); err != nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "无效的 JSON 配置"})
 		return
+	}
+	// admin 自锁护栏（CLI 校验/事务/apply 之前）：admin off 或监听地址改到
+	// 面板不可达的 host:port 会让本次 apply 成功后所有配置写与启停全部失联。
+	if h.cfg != nil {
+		if err := validateCaddyAdminSection(configData, h.cfg.CaddyAdminURL); err != nil {
+			recordAudit(c, "更新失败", "Caddy配置", services.FormatAuditDetail("Caddy 配置校验未通过", err.Error(), services.AuditResultPart("failure")))
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
+			return
+		}
 	}
 
 	// 2026-09-06 裁定 ④' 边界补齐：逃生口同样过 Caddy CLI 校验层——校验输入

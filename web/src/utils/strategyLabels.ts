@@ -20,7 +20,7 @@ export const getStrategyLabel = (strategy: string): string => strategyLabels[str
 // random/first（后端 httpStrategies/tcpStrategies 同放行），卡片却没有这两张
 // ——API/MCP/导入产生的 random/first 规则在向导内无高亮、点任意卡片即静默改写。
 // 键集与后端 validateStrategyForProtocol（rule_features.go）逐协议对齐。
-export interface StrategyCardOption {
+interface StrategyCardOption {
   readonly value: string
   readonly title: string
   readonly desc: string

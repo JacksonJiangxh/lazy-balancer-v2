@@ -116,7 +116,7 @@ export interface TrustedProxyReferencedEntries {
 }
 
 /** 展开规模（并集口径）。referenced 含与内联重叠的键，与后端错误文案同构。 */
-export interface TrustedProxyExpansion {
+interface TrustedProxyExpansion {
   /** 已解析网段的并集大小（可证事实；硬门只用这个与单份上限判定）。 */
   readonly resolvedUnion: number
   /** 估算合计 = resolvedUnion + unresolved（含无法去重的按条数累加项，仅供提示）。 */

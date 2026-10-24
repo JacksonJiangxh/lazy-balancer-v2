@@ -10,7 +10,7 @@ import assert from 'node:assert/strict'
 
 import { heatEntriesEqual, heatCss, DOT_LAND, arcEndpoints, POINTY_TOP_HEX_VERTICES, drillCountryAllowed, arcOriginForLocation, normalizeCountryName, adminShortName, aggregateCountryCounts, hasProvinceStats, drillCommitAllowed, buildCountryCellGrid, countryGridCell } from '../src/utils/threatShared.ts'
 import { FALLBACK_CENTROID } from '../src/utils/countryCentroids.ts'
-import { member, repoSource, source } from './_helpers.ts'
+import { member, repoCode, code } from './_helpers.ts'
 
 test('六边形点阵：pointy-top 六顶点且上下尖角', () => {
   assert.equal(POINTY_TOP_HEX_VERTICES.length, 6)
@@ -120,11 +120,11 @@ test('省短名单源：34 省数据的 short 必须等于剥后缀函数输出'
 })
 
 test('剥后缀表与后端 ip2RegionDisplaySuffixes 逐项相等（长后缀优先序一致）', () => {
-  const body = member(source('src/utils/threatShared.ts'), 'export function adminShortName(')
+  const body = member(code('src/utils/threatShared.ts'), 'export function adminShortName(')
   const frontTable = /const suffixes = \[([^\]]*)\]/.exec(body)?.[1]
   assert.ok(frontTable, 'adminShortName 的 suffixes 表被改形——本对表钉需同步')
   const front = [...frontTable.matchAll(/'([^']+)'/g)].map((match) => match[1])
-  const goTable = /var ip2RegionDisplaySuffixes = \[\]string\{([^}]*)\}/.exec(repoSource('internal/handlers/security.go'))?.[1]
+  const goTable = /var ip2RegionDisplaySuffixes = \[\]string\{([^}]*)\}/.exec(repoCode('internal/handlers/security.go'))?.[1]
   assert.ok(goTable, 'security.go 缺 ip2RegionDisplaySuffixes 声明')
   const go = [...goTable.matchAll(/"([^"]+)"/g)].map((match) => match[1])
   assert.deepEqual(front, go, '两端后缀表必须同集同序——后端事件 province 短名与前端点阵键靠它对齐')
@@ -270,7 +270,7 @@ test('国家网格：候选收敛、远海空集、键夹紧', () => {
 // 消费侧接线钉：parseIpLocation 的唯一生产消费点是威胁光流的地域键/
 // 端点省派生——被绕过时表现为「光流地域键与端点省漂移」，纯函数用例不会红。
 test('parseIpLocation 接线：threatShared 经它派生国家与省份', () => {
-  const shared = source('src/utils/threatShared.ts')
+  const shared = code('src/utils/threatShared.ts')
   assert.match(shared, /import \{ parseIpLocation \} from '\.\/ipLocationParts\.ts'/, '必须复用单源解析器')
   assert.match(shared, /parseIpLocation\(ipLocation\)/, '光流地域派生必须经 parseIpLocation')
 })

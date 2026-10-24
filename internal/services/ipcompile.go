@@ -21,31 +21,13 @@ import (
 //   - 容器重启时（ApplyConfigOnStartup → 渲染 → 编译）
 
 // iterIPListTextLines 遍历 .iplist 文本的有效条目行（空行与 #/; 注释行
-// 跳过）——渲染/UI/下载/编译四处行过滤口径的单一事实源（多处各自实现
-// 曾致「补注释行」行为漂移，靠专项钉测才发现分叉）。
-//
-// 回调形态避免为「边过滤边解析」的消费方额外线性分配；切分本身也按
-// bytes.IndexByte 原地扫描：不复制整份文本、不生成 []string 头数组，
-// 只有真正要交给回调的有效行才做一次 string 转换（注释/空行零分配）。
-// 20 万条量级的名单在编译/更新/集群落地时因此不再产生「全文副本 +
-// 每行 16 字节头」的 1~2 倍瞬时开销。行分隔沿用 \n，\r 由 TrimSpace 归一
-// （CRLF 源与历史 Split 实现同口径）。fn 返回 false 提前终止。
+// 跳过）——转发 wafiplist.ForEachIPListLine：行过滤口径跨模块单源（此前
+// services 与 wafiplist 各持一份等价循环，前缀/空白归一规则演化时会静默
+// 分叉）。本侧只保留「坏行由回调决定」的处置策略（严格报错的消费方在回调内
+// 自行决定）；切分按 bytes.IndexByte 原地扫描，不复制整份文本、不生成
+// []string 头数组，注释/空行零分配。fn 返回 false 提前终止。
 func iterIPListTextLines(raw []byte, fn func(line string) bool) {
-	for len(raw) > 0 {
-		var line []byte
-		if idx := bytes.IndexByte(raw, '\n'); idx >= 0 {
-			line, raw = raw[:idx], raw[idx+1:]
-		} else {
-			line, raw = raw, nil
-		}
-		line = bytes.TrimSpace(line)
-		if len(line) == 0 || line[0] == '#' || line[0] == ';' {
-			continue
-		}
-		if !fn(string(line)) {
-			return
-		}
-	}
+	wafiplist.ForEachIPListLine(raw, func(_ int, line string) bool { return fn(line) })
 }
 
 // CompileFromIplistFile 从 .iplist 纯文本源文件编译 .fast 二进制。

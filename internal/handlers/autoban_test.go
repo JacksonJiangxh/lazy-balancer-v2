@@ -128,23 +128,82 @@ func TestAutobanConfig_putValidRoundtrip(t *testing.T) {
 	if n := countAuditRows(t, "更新", "自动封禁"); n != 1 {
 		t.Fatalf("更新审计=%d, want 1", n)
 	}
+	// 审计详情是事后判读「这次点击把开关开成了什么」的唯一依据：只数行数会让
+	// 文案漂移（曾并存 已开启/已停止 与 开启/关闭 两套口径）无声通过。
+	var detail string
+	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='更新' AND resource='自动封禁' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
+		t.Fatalf("read audit detail: %v", err)
+	}
+	wantDetail := "启用：开；调度：开启；阈值：50 次/10 分钟；时长：6 小时；口径：仅拦截；模式：正式"
+	if detail != wantDetail {
+		t.Fatalf("审计详情=%q, want %q（开启/关闭 口径由 enabledStateLabel 单源提供）", detail, wantDetail)
+	}
 }
 
+// 写侧校验矩阵分两类，各自断言**具体归因文案**——只断 400 的矩阵无法区分
+// 「哪条校验在生效」：校验按固定顺序短路，缺 threshold 的载荷永远停在第一条，
+// 窗口/时长/口径三条边界从未被执行（overlay 删除后仍绿）。
 func TestAutobanConfig_putRejectsInvalid(t *testing.T) {
 	router := newAutobanTestEnv(t)
-	cases := []map[string]any{
-		{"threshold": 0},
-		{"threshold": 10001},
-		{"window_minutes": 0},
-		{"window_minutes": 61},
-		{"duration": "2h"},
-		{"scope": "deny"},
+
+	// 合法基线：每个非法用例只破坏一个字段，其余字段齐全，确保被测校验真正
+	// 被求值（而非被更早的规则短路）。
+	valid := func() map[string]any {
+		return map[string]any{"enabled": false, "threshold": 100, "window_minutes": 5, "duration": "1h", "scope": "all", "dry_run": true}
 	}
-	for _, body := range cases {
-		rec := putJSON(t, router, "/security/autoban", body)
-		if rec.Code != http.StatusBadRequest {
-			t.Fatalf("body=%v status=%d, want 400", body, rec.Code)
-		}
+
+	cases := []struct {
+		name    string
+		body    map[string]any
+		message string
+	}{
+		// 缺字段：threshold 零值先短路（这是绑定结构的既有语义，单独钉住）。
+		{name: "缺 threshold 停在首条校验", body: map[string]any{"window_minutes": 5, "duration": "1h", "scope": "all"}, message: "阈值须在 1-10000 之间"},
+		{name: "threshold 下界", body: map[string]any{"threshold": 0}, message: "阈值须在 1-10000 之间"},
+		{name: "threshold 上界", body: map[string]any{"threshold": 10001}, message: "阈值须在 1-10000 之间"},
+	}
+	for _, tc := range []struct {
+		name    string
+		mutate  func(map[string]any)
+		message string
+	}{
+		{name: "window_minutes 下界", mutate: func(m map[string]any) { m["window_minutes"] = 0 }, message: "统计窗口须在 1-60 分钟之间"},
+		{name: "window_minutes 上界", mutate: func(m map[string]any) { m["window_minutes"] = 61 }, message: "统计窗口须在 1-60 分钟之间"},
+		{name: "duration 枚举", mutate: func(m map[string]any) { m["duration"] = "2h" }, message: "封禁时长取值无效"},
+		{name: "scope 枚举", mutate: func(m map[string]any) { m["scope"] = "deny" }, message: "统计口径取值无效"},
+	} {
+		body := valid()
+		tc.mutate(body)
+		cases = append(cases, struct {
+			name    string
+			body    map[string]any
+			message string
+		}{name: tc.name, body: body, message: tc.message})
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := putJSON(t, router, "/security/autoban", tc.body)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("body=%v status=%d, want 400", tc.body, rec.Code)
+			}
+			var resp models.APIResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode: %v body=%s", err, rec.Body.String())
+			}
+			if !strings.Contains(resp.Message, tc.message) {
+				t.Fatalf("body=%v message=%q, want 含 %q", tc.body, resp.Message, tc.message)
+			}
+		})
+	}
+
+	// Then：非法配置不得落库（校验失败即早退，库中仍是默认值）。
+	var got services.AutobanConfig
+	if err := json.Unmarshal(getRequest(t, router, "/security/autoban").Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Threshold != 100 || got.WindowMinutes != 5 || got.Duration != "1h" || got.Scope != "all" {
+		t.Fatalf("非法配置写入了库: %+v", got)
 	}
 }
 
@@ -180,17 +239,6 @@ func TestAutobanConfig_putTogglesLoopScheduling(t *testing.T) {
 	}
 	if m, _ := te.Lookup(services.AutobanTaskID); m.LoopOn {
 		t.Fatal("enabled=false 保存应联动停止调度（StopLoop）")
-	}
-}
-
-// Given /security/autoban/run 端点已废除（前端无入口+手动执行语义收编进
-// 「启用后按配置调度」模型）。
-// When POST 该路径。
-// Then 404。
-func TestAutobanRun_endpointRemoved(t *testing.T) {
-	router := newAutobanTestEnv(t)
-	if rec := postJSON(t, router, "/security/autoban/run", map[string]any{}); rec.Code != http.StatusNotFound {
-		t.Fatalf("status=%d, want 404（端点已删除）", rec.Code)
 	}
 }
 

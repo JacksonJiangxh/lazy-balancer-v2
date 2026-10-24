@@ -475,7 +475,7 @@ func requeueCertJobsSnapshot(ctx context.Context, snapshot CertJobsSnapshot, man
 		liveStatus := job.status
 		hasMaterial := job.certPEM.Valid && job.keyPEM.Valid && CertJobMaterialUsable(job.status, job.certPEM.String, job.keyPEM.String)
 		if _, preserved := snapshot.preserved[job.id]; preserved {
-			if status, material, found, stateErr := certJobCurrentRequeueState(job.id); stateErr != nil {
+			if status, material, found, stateErr := loadCertJobDeploymentState(job.id); stateErr != nil {
 				Logf("warn", "证书任务补偿重排队：读取任务 %d 当前状态失败，按快照状态处理: %v", job.id, stateErr)
 			} else if !found {
 				// 行已不存在（并发删除/迁移）——没有可重排队的对象。
@@ -561,21 +561,6 @@ func requeueCertJobsSnapshot(ctx context.Context, snapshot CertJobsSnapshot, man
 		}
 	}
 	return nil
-}
-
-// certJobCurrentRequeueState 读取任务当前（restore 之后）的状态与材料形态，供
-// 补偿重排队做入队决策。found=false 表示行已不存在。读故障由调用方决定回退口径。
-func certJobCurrentRequeueState(jobID int) (status string, hasMaterial bool, found bool, err error) {
-	var certPEM, keyPEM string
-	err = db.DB.QueryRow("SELECT status, COALESCE(cert_pem,''), COALESCE(key_pem,'') FROM cert_jobs WHERE id=?", jobID).
-		Scan(&status, &certPEM, &keyPEM)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", false, false, nil
-	}
-	if err != nil {
-		return "", false, false, err
-	}
-	return status, CertJobMaterialUsable(status, certPEM, keyPEM), true, nil
 }
 
 func NewCertificateService() *CertificateService {

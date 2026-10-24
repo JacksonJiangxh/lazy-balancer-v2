@@ -16,6 +16,8 @@ import assert from 'node:assert/strict'
 
 import { registerModuleHooks } from './_helpers.ts'
 import { dataModule } from './_stubs.ts'
+// 真实内核（不经替身）：与 date.parseDbTimeMs 逐形态对表用。
+import { parseDbDateMs } from '../src/utils/timeZoneFormat.ts'
 
 type Harness = { __tz: string; __formatCalls: number }
 const g = globalThis as unknown as Harness
@@ -28,7 +30,12 @@ export const useAuthStore = () => ({ timezone: globalThis.__tz })
 
 // 与 utils/timeZoneFormat 等价的实现，额外统计 createTzFormatter 构造次数——
 // 用来验证 date.ts 的模块级 formatter 缓存（构造次数不随调用次数增长）。
+// DB 墙钟内核（normalizeDbWallClock/parseDbDateMs）不复制：直接回指真实模块，
+// 保证「date.parseDbTimeMs 与内核同源」这一契约在测试里也是同源（复刻一份就等于
+// 给单源开了第二个实现）。
+const tzKernelUrl = new URL('../src/utils/timeZoneFormat.ts', import.meta.url).href
 const countingFormat = dataModule(`
+export { normalizeDbWallClock, parseDbDateMs } from '${tzKernelUrl}'
 export const DEFAULT_TZ = 'Asia/Shanghai'
 export const createTzFormatter = (timeZone, withTime) => {
   globalThis.__formatCalls++
@@ -71,6 +78,27 @@ test('不可解析/非字符串一律 null（不猜、不抛）', () => {
   for (const value of [null, undefined, '', 'not-a-date', '2026-08-11', 123, {}, []]) {
     assert.equal(date.parseDbTimeMs(value), null, `${JSON.stringify(value)} 应解析失败`)
   }
+})
+
+// DB 墙钟解析曾有「三份实现 + 接受集合分叉」：内核（parseDbDateMs，任何 Date
+// 可解析串）、date.ts 的 parseDbTimeMs（叠 ISO 白名单）、threatFlowRules 的
+// flowTimestamp（另一份、失败为 NaN）。现在三者共用内核，差异只允许白名单这一层。
+test('DB 时间解析与内核同源：四形态逐项对表（差异仅 ISO 白名单）', () => {
+  const forms = [
+    { input: '2026-08-11 08:23:21', label: 'DB 墙钟（空格分隔）' },
+    { input: '2026-08-11 08:23', label: 'DB 墙钟（省略秒）' },
+    { input: '2026-08-11T08:23:21Z', label: '带 Z 的 RFC3339' },
+    { input: '2026-08-11T16:23:21+08:00', label: '带时区偏移' },
+    { input: 'not-a-date', label: '非法串' },
+    { input: '', label: '空串' },
+  ]
+  for (const { input, label } of forms) {
+    assert.equal(date.parseDbTimeMs(input), parseDbDateMs(input), `${label} 必须与内核同结果`)
+  }
+  // 唯一允许的差异：仅日期形态被白名单拒绝（内核不设白名单）。白名单只影响
+  // 「是否接受」，不影响已接受输入的解析结果——两者共用规范化与内核。
+  assert.equal(date.parseDbTimeMs('2026-08-11'), null)
+  assert.equal(parseDbDateMs('2026-08-11'), Date.UTC(2026, 7, 11))
 })
 
 test('formatDate：DB 墙钟串转配置时区；非 ISO 文本原样透传；空值返回空串', () => {

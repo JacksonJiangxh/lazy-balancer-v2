@@ -5,7 +5,7 @@
 //   - 成功后永久命中（会话级缓存）；
 //   - 失败不置加载态 → 下一次调用自然重试。
 
-export interface LazyLoader<T> {
+interface LazyLoader<T> {
   /** 确保已加载（并发单飞）；失败静默返回，下次调用可重试。 */
   readonly ensure: () => Promise<void>
   readonly get: () => T | null

@@ -26,7 +26,7 @@ const runtimeLogSizeRefreshLogLabel = "logrotate refresh"
 // 最长 30s 按兜底 100MB 滚动）——首次刷新由 main 在 db.Initialize 后
 // 显式 StartLogRotate 触发，首读即真实库值。
 func init() {
-	runtimeLogSizeMB.Store(100)
+	runtimeLogSizeMB.Store(db.DefaultRuntimeLogSizeMB)
 }
 
 // logRotateRestartWaitMax 是 StartLogRotate 重启路径等待旧 worker 退出的预算
@@ -48,7 +48,7 @@ func StartLogRotate(ctx context.Context) {
 				return
 			}
 			var mb int
-			if err := database.QueryRow("SELECT COALESCE(runtime_log_size_mb,100) FROM global_config WHERE id=1").Scan(&mb); err != nil {
+			if err := database.QueryRow("SELECT COALESCE(runtime_log_size_mb,?) FROM global_config WHERE id=1", db.DefaultRuntimeLogSizeMB).Scan(&mb); err != nil {
 				// 持久失败（如迁移窗口缺列）不再每 30s 一行 info。
 				if logStateTransition("runtime-log-size-refresh", true) != "" {
 					Logf("warn", "refresh runtime log size: %v", err)
@@ -141,13 +141,18 @@ func (w *RotatingFileWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// rotatedLogTimeLayout 是轮转副本文件名的时间戳布局。测试用同一常量预建「同
+// 秒碰撞」文件集——布局变更后若测试仍手抄旧布局，碰撞集与实际文件名不再重叠，
+// 「恰一个副本」的断言会静默失去意义。
+const rotatedLogTimeLayout = "20060102-150405"
+
 func (w *RotatingFileWriter) rotateLocked() error {
 	file := w.file
 	w.file = nil // Close 失败后运行时描述符也已关闭；下轮 Write 必须能重开。
 	if err := file.Close(); err != nil {
 		return err
 	}
-	stamp := time.Now().Format("20060102-150405")
+	stamp := time.Now().Format(rotatedLogTimeLayout)
 	rotated := fmt.Sprintf("%s.%s", w.path, stamp)
 	// 同秒多次轮转的碰撞后缀原为 UnixNano()%1000
 	// 随机数——撞上既有副本名时 os.Rename 静默覆盖,吞掉上一份轮转日志。
@@ -210,7 +215,11 @@ type RuntimeCleanupResult struct {
 	// 按更短默认执行。
 	RetentionError string
 	TaskLogs       TaskLogHousekeepingResult
-	WafAudit       []string // waf-audit 目录兜底动作明细（daemon 停机时的超阈轮转）
+	// RuleLogs 孤儿规则访问日志清理明细（规则已不存在的活动文件+轮转副本）。
+	// 不依赖保留期口径（按「规则是否还存活」判定），故保留月数读取失败时照常
+	// 执行——规则日志此前只有事件型删除入口，失败即永久残留。
+	RuleLogs RuleLogHousekeepingResult
+	WafAudit []string // waf-audit 目录兜底动作明细（daemon 停机时的超阈轮转）
 	// WafAuditError waf-audit 兜底轮转失败原因（空=正常）。曾完全丢弃
 	// SecurityEventsPollOnce 的轮转错误——daemon 停机时审计文件无界增长这一
 	// 兜底场景失效，任务日志仍称「日志清理完成」。
@@ -243,6 +252,9 @@ func (r RuntimeCleanupResult) Err() error {
 	}
 	if r.TaskLogs.InfoFailed > 0 {
 		errs = append(errs, fmt.Errorf("任务日志元数据读取失败 %d 个", r.TaskLogs.InfoFailed))
+	}
+	if r.RuleLogs.purgedErr() != nil {
+		errs = append(errs, r.RuleLogs.purgedErr())
 	}
 	if r.WafAuditError != "" {
 		errs = append(errs, fmt.Errorf("waf-audit 兜底轮转失败: %s", r.WafAuditError))
@@ -308,6 +320,9 @@ func RuntimeLogCleanupOnce(logFile string) RuntimeCleanupResult {
 	if wafErr != nil {
 		result.WafAuditError = wafErr.Error()
 	}
+	// 规则访问日志孤儿兜底同样不依赖保留期口径（按「规则是否还存活」判定），
+	// 先于保留期门执行——事件型删除失败后残留的规则日志不再永久占盘。
+	result.RuleLogs = PurgeOrphanRuleLogs()
 	// 库未初始化不再整体跳过——保留期单源
 	// auditRetentionMonths 自带 nil 库回退默认 3 月；此前 `months := 3` 后
 	// 直接 return 使应用日志副本清理被静默跳过（AppRemoved=0），与「清理不得
@@ -379,12 +394,18 @@ func logCleanupRound(logFile string) (RuntimeCleanupResult, string) {
 		if wafErr != nil {
 			res.WafAuditError = wafErr.Error()
 		}
+		// 规则访问日志孤儿兜底只需要规则日志目录与存活规则清单（与运行日志
+		// 目录无关），运行日志 writer 打开失败时照常执行。
+		res.RuleLogs = PurgeOrphanRuleLogs()
 		line := "日志清理未启用：运行日志文件未打开（应用日志副本清理与任务日志清理跳过）"
 		if len(res.WafAudit) > 0 {
 			line += "；waf-audit 兜底：" + strings.Join(res.WafAudit, "、")
 		}
-		if wafErr != nil {
-			return res, "日志清理未完成：" + line + "；错误：" + wafErr.Error()
+		if len(res.RuleLogs.Purged) > 0 || res.RuleLogs.RemoveFailed > 0 || res.RuleLogs.ScanError != "" || res.RuleLogs.Remaining > 0 {
+			line += "；" + res.RuleLogs.Summary()
+		}
+		if wafErr != nil || res.RuleLogs.purgedErr() != nil {
+			return res, "日志清理未完成：" + line + "；错误：" + res.Err().Error()
 		}
 		return res, line
 	}
@@ -419,6 +440,11 @@ func logCleanupDetail(res RuntimeCleanupResult) string {
 		appPart = fmt.Sprintf("应用日志副本删除 %d 个（保留 %d 月，无过期为 0）", res.AppRemoved, res.RetentionMonths)
 	}
 	summary := appPart + "；" + res.TaskLogs.Summary()
+	// 规则访问日志孤儿清理只在有动作/失败/积压时进摘要——每日零动作的轮次
+	// 不为此加一段噪音（与 waf-audit 兜底同口径）。
+	if len(res.RuleLogs.Purged) > 0 || res.RuleLogs.RemoveFailed > 0 || res.RuleLogs.ScanError != "" || res.RuleLogs.Remaining > 0 {
+		summary += "；" + res.RuleLogs.Summary()
+	}
 	// daemon 停机时的 waf-audit 兜底动作如实进
 	// 任务日志（2026-10-01 用户裁定：清理了哪个文件必须可见）；无动作时不加
 	// 尾段，日志行形态不变。

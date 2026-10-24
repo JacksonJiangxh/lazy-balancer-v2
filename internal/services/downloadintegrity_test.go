@@ -186,7 +186,9 @@ func TestRecordDownloadIntegrity_releasesLockBeforeAuditIO(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	time.Sleep(50 * time.Millisecond) // 让写侧推进到被阻塞的审计 INSERT
+	// 日志行在 Unlock 之后发出（生产顺序：判定 → Unlock → Logf → 审计），
+	// 故观察到 mismatch 日志即可无竞态地断言锁已释放；不再靠 sleep 猜写侧
+	// 是否推进到被阻塞的审计 INSERT（慢机下是假通过、快机下是偶发失败）。
 
 	// Then：downloadIntegrityMu 必须已释放（另一族调度器可立即进入）
 	acquired := make(chan struct{})

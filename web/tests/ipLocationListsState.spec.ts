@@ -9,9 +9,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { section, source } from './_helpers.ts'
+import { section, code } from './_helpers.ts'
 
-const page = source('src/views/security/IPLocationAction.vue')
+const page = code('src/views/security/IPLocationAction.vue')
 
 test('名单加载失败不得静默：catch 置 listsError 并清空名单，成功分支按缺失条目重算', () => {
   assert.match(page, /const listsError = ref\(false\)/)
@@ -43,12 +43,16 @@ test('「重新加载」串接名单重取：loadPolicies 在策略就位后 awa
 
 test('失败态有横幅与重试入口，处置动作在失败态禁用', () => {
   assert.match(page, /<div v-if="listsError" class="info-note-bar">/)
-  // 属性与文案分开断言：内联排版/换行变化不构成契约变化
-  assert.match(page, /@click="retryLists"/)
-  assert.ok(
-    (page.match(/重新加载/g) ?? []).length > 0,
-    '失败横幅必须提供「重新加载」入口',
-  )
+  // 重试入口的身份而非存在性：全文件只允许一个 @click="retryLists"，且「重新加载」
+  // 文案必须写在这个入口上（此前只数文案出现次数，按钮被换成别的处理函数仍绿）。
+  assert.equal((page.match(/@click="retryLists"/g) ?? []).length, 1, '重试入口必须唯一')
+  const retryAt = page.indexOf('重新加载')
+  assert.ok(retryAt > 0, '失败横幅必须提供「重新加载」入口')
+  const tagStart = page.lastIndexOf('<', retryAt)
+  const tagEnd = page.indexOf('>', retryAt)
+  assert.ok(tagStart >= 0 && tagEnd > tagStart, '「重新加载」必须位于某个标签内')
+  const retryTag = page.slice(tagStart, tagEnd + 1)
+  assert.match(retryTag, /@click="retryLists"/, `「重新加载」所在的控件必须绑定 retryLists，实际标签: ${retryTag}`)
   assert.match(page, /const retryLists = \(\): void => \{ void loadPolicies\(\) \}/)
   assert.match(page, /:disabled="act\.disabled"/, '动作按钮绑定禁用态')
   assert.match(page, /return listsError\.value \? acts\.map\(\(act\) => \(\{ \.\.\.act, disabled: true \}\)\) : acts/,

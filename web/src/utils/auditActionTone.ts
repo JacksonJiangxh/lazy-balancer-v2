@@ -106,7 +106,12 @@ const warnedUnknownActions = new Set<string>()
 
 /** 动作词 → el-tag 色调。例外表 → 关键词派生 → info（并告警一次）。 */
 export const actionTagType = (action: string): AuditActionTone => {
-  const exception = ACTION_TONE_EXCEPTIONS[action]
+  // 例外表是普通对象：直接下标会把原型链上的键（'constructor'/'toString'/
+  // '__proto__' 等后端词表异常值）当成命中，把函数当作色调返回。与
+  // utils/logStatCap 同一具名守卫（自有属性判定）。
+  const exception = Object.prototype.hasOwnProperty.call(ACTION_TONE_EXCEPTIONS, action)
+    ? ACTION_TONE_EXCEPTIONS[action]
+    : undefined
   if (exception) return exception
   for (const word of DANGER_WORDS) if (action.includes(word)) return 'danger'
   for (const word of WARNING_WORDS) if (action.includes(word)) return 'warning'

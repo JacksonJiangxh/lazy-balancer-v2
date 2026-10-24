@@ -10,7 +10,7 @@ export const dnsServerAfterToggle = (current: string, enabled: boolean, hydratin
  * `newRuleWizardStageOverrides()` 供「新建」路径清态，`stageBlockPageOverrides()`
  * 供编辑/复制路径回填，两侧口径同源，避免新建静默继承上一条规则的覆盖。
  */
-export interface StageBlockPageOverrideState {
+interface StageBlockPageOverrideState {
   block_page_stage1_id: number
   block_page_stage1_status: number
   block_page_stage3_id: number

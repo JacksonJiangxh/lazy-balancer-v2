@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 # check-bulk-edit-safety 自测：事故形态必红、正常形态必绿、无 dry-run 脚本必红。
+#
+# 诊断输出一律落在本次运行的 mktemp 目录内（${work}/bulk-*.out，随 trap 删除）：
+# 固定 /tmp 文件名在同机并行跑、或多工作树同时跑自检时互相覆盖——读到别轮或
+# 上一轮的旧文件会把错因指到错误的方向（旧文件残留还会让 grep 假命中）。
 set -euo pipefail
 src_script="$(cd "$(dirname "$0")/.." && pwd)/check-bulk-edit-safety.sh"
 work="$(mktemp -d "${TMPDIR:-/tmp}/bulk-guard.XXXXXX")"
@@ -24,8 +28,8 @@ python3 - <<'PY'
 s=open('a.go').read().replace('()','')
 open('a.go','w').write(s)
 PY
-if bash scripts/check-bulk-edit-safety.sh >/tmp/bulk1.out 2>&1; then
-  echo "SELFTEST FAIL: 事故形态未拦截"; cat /tmp/bulk1.out; exit 1
+if bash scripts/check-bulk-edit-safety.sh >"${work}/bulk1.out" 2>&1; then
+  echo "SELFTEST FAIL: 事故形态未拦截"; cat "${work}/bulk1.out"; exit 1
 fi
 
 # 2) 正常形态：少量新增/删除 -> 必须通过
@@ -33,8 +37,8 @@ mk_repo "$work/ok"
 printf 'package x\nfunc A() {}\n' > a.go
 git add -A && git commit -qm base
 printf 'package x\nfunc A() {}\nfunc B() {}\n' > a.go
-if ! bash scripts/check-bulk-edit-safety.sh >/tmp/bulk2.out 2>&1; then
-  echo "SELFTEST FAIL: 正常形态被拦截"; cat /tmp/bulk2.out; exit 1
+if ! bash scripts/check-bulk-edit-safety.sh >"${work}/bulk2.out" 2>&1; then
+  echo "SELFTEST FAIL: 正常形态被拦截"; cat "${work}/bulk2.out"; exit 1
 fi
 
 # 3) 无 dry-run 的遍历写盘脚本 -> 必须失败
@@ -48,8 +52,8 @@ for dp, _, fs in os.walk('.'):
             open(p,'w').write(re.sub(r'\\s+$','',open(p).read()))
 PY
 git add -A && git commit -qm base
-if bash scripts/check-bulk-edit-safety.sh >/tmp/bulk3.out 2>&1; then
-  echo "SELFTEST FAIL: 无 dry-run 脚本未拦截"; cat /tmp/bulk3.out; exit 1
+if bash scripts/check-bulk-edit-safety.sh >"${work}/bulk3.out" 2>&1; then
+  echo "SELFTEST FAIL: 无 dry-run 脚本未拦截"; cat "${work}/bulk3.out"; exit 1
 fi
 
 # 4) 写盘特征的非紧邻 -i 形态（sed -E -i / sed -e … -i / perl -pi -e /
@@ -61,11 +65,11 @@ expect_write_shape_blocked() {
   printf '%s\n' "$body" > scripts/rewrite.sh
   chmod +x scripts/rewrite.sh
   git add -A && git commit -qm base
-  if bash scripts/check-bulk-edit-safety.sh >/tmp/bulk-shape.out 2>&1; then
-    echo "SELFTEST FAIL: $label 形态未拦截"; cat /tmp/bulk-shape.out; exit 1
+  if bash scripts/check-bulk-edit-safety.sh >"${work}/bulk-shape.out" 2>&1; then
+    echo "SELFTEST FAIL: $label 形态未拦截"; cat "${work}/bulk-shape.out"; exit 1
   fi
-  if ! grep -q '缺少 --dry-run' /tmp/bulk-shape.out; then
-    echo "SELFTEST FAIL: $label 形态命中原因错误（应为缺 dry-run 的批量改写脚本）"; cat /tmp/bulk-shape.out; exit 1
+  if ! grep -q '缺少 --dry-run' "${work}/bulk-shape.out"; then
+    echo "SELFTEST FAIL: $label 形态命中原因错误（应为缺 dry-run 的批量改写脚本）"; cat "${work}/bulk-shape.out"; exit 1
   fi
 }
 
@@ -82,8 +86,13 @@ cat > scripts/rewrite.sh <<'SH'
 for f in *.go; do python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); p.write_text(p.read_text().rstrip())' "$f"; done
 SH
 git add -A && git commit -qm base
-if bash scripts/check-bulk-edit-safety.sh >/tmp/bulk-pyc.out 2>&1; then
-  echo "SELFTEST FAIL: python -c 批量写形态未拦截"; cat /tmp/bulk-pyc.out; exit 1
+if bash scripts/check-bulk-edit-safety.sh >"${work}/bulk-pyc.out" 2>&1; then
+  echo "SELFTEST FAIL: python -c 批量写形态未拦截"; cat "${work}/bulk-pyc.out"; exit 1
+fi
+# 与其余 7 种形态同口径断原因：只断 rc 时「因别的原因失败」（例如脚本根本没被
+# 识别为批量写）也算通过，无法区分拦截点。
+if ! grep -q '缺少 --dry-run' "${work}/bulk-pyc.out"; then
+  echo "SELFTEST FAIL: python -c 形态命中原因错误（应为缺 dry-run 的批量改写脚本）"; cat "${work}/bulk-pyc.out"; exit 1
 fi
 
 # 5) 同一批写盘形态但显式声明只读模式 -> 必须放行（收窄误报面）
@@ -98,8 +107,8 @@ for f in *.go; do
 done
 SH
 git add -A && git commit -qm base
-if ! bash scripts/check-bulk-edit-safety.sh >/tmp/bulk-dry.out 2>&1; then
-  echo "SELFTEST FAIL: 带 --dry-run 的批量脚本被误拦"; cat /tmp/bulk-dry.out; exit 1
+if ! bash scripts/check-bulk-edit-safety.sh >"${work}/bulk-dry.out" 2>&1; then
+  echo "SELFTEST FAIL: 带 --dry-run 的批量脚本被误拦"; cat "${work}/bulk-dry.out"; exit 1
 fi
 
 # 6) PATH 中无 python3：通道 B 必须 fail-closed（不得打印「变更形态正常」）。
@@ -118,17 +127,17 @@ if [[ -e "$bin/python3" ]]; then
   echo "SELFTEST FAIL: 夹具 PATH 仍含 python3"; exit 1
 fi
 set +e
-env -i PATH="$bin" HOME="${HOME:-/tmp}" /bin/bash scripts/check-bulk-edit-safety.sh >/tmp/bulk-nopy.out 2>&1
+env -i PATH="$bin" HOME="${HOME:-/tmp}" /bin/bash scripts/check-bulk-edit-safety.sh >"${work}/bulk-nopy.out" 2>&1
 rc=$?
 set -e
 if (( rc == 0 )); then
-  echo "SELFTEST FAIL: 缺 python3 时通道 B 静默放行（RC=0）"; cat /tmp/bulk-nopy.out; exit 1
+  echo "SELFTEST FAIL: 缺 python3 时通道 B 静默放行（RC=0）"; cat "${work}/bulk-nopy.out"; exit 1
 fi
-if ! grep -q 'python3' /tmp/bulk-nopy.out; then
-  echo "SELFTEST FAIL: 缺 python3 的失败原因未指明依赖"; cat /tmp/bulk-nopy.out; exit 1
+if ! grep -q 'python3' "${work}/bulk-nopy.out"; then
+  echo "SELFTEST FAIL: 缺 python3 的失败原因未指明依赖"; cat "${work}/bulk-nopy.out"; exit 1
 fi
-if grep -q '变更形态正常' /tmp/bulk-nopy.out; then
-  echo "SELFTEST FAIL: 缺 python3 时仍宣告「变更形态正常」"; cat /tmp/bulk-nopy.out; exit 1
+if grep -q '变更形态正常' "${work}/bulk-nopy.out"; then
+  echo "SELFTEST FAIL: 缺 python3 时仍宣告「变更形态正常」"; cat "${work}/bulk-nopy.out"; exit 1
 fi
 
 # 7) 部分暂存：暂存区有正常改动时，未暂存的事故形态仍必须被检查。
@@ -143,8 +152,8 @@ printf 'package x\nfunc A() {}\nfunc B() {}\n' > a.go
 git add a.go
 # 未暂存：b.go 的一次性批量删括号（事故形态）
 sed -e 's/()//g' b.go > b.go.tmp && mv b.go.tmp b.go
-if bash scripts/check-bulk-edit-safety.sh >/tmp/bulk-partial.out 2>&1; then
-  echo "SELFTEST FAIL: 部分暂存时未暂存事故形态未拦截"; cat /tmp/bulk-partial.out; exit 1
+if bash scripts/check-bulk-edit-safety.sh >"${work}/bulk-partial.out" 2>&1; then
+  echo "SELFTEST FAIL: 部分暂存时未暂存事故形态未拦截"; cat "${work}/bulk-partial.out"; exit 1
 fi
 
 # 8) 遍历特征不含 find/for 的等价事故写法：git ls-files | xargs + 写盘 -i
@@ -155,11 +164,11 @@ git ls-files -z '*.go' | xargs -0 perl -pi -e 's/\(\)//g'
 SH
 chmod +x scripts/rewrite.sh
 git add -A && git commit -qm base
-if bash scripts/check-bulk-edit-safety.sh >/tmp/bulk-lsfiles.out 2>&1; then
-  echo "SELFTEST FAIL: git ls-files | xargs 批量写形态未拦截"; cat /tmp/bulk-lsfiles.out; exit 1
+if bash scripts/check-bulk-edit-safety.sh >"${work}/bulk-lsfiles.out" 2>&1; then
+  echo "SELFTEST FAIL: git ls-files | xargs 批量写形态未拦截"; cat "${work}/bulk-lsfiles.out"; exit 1
 fi
-if ! grep -q '缺少 --dry-run' /tmp/bulk-lsfiles.out; then
-  echo "SELFTEST FAIL: git ls-files | xargs 形态命中原因错误"; cat /tmp/bulk-lsfiles.out; exit 1
+if ! grep -q '缺少 --dry-run' "${work}/bulk-lsfiles.out"; then
+  echo "SELFTEST FAIL: git ls-files | xargs 形态命中原因错误"; cat "${work}/bulk-lsfiles.out"; exit 1
 fi
 
 # 9) 多提交变更集：中段提交做批量删括号、末段提交只加注释。干净树默认只看
@@ -171,17 +180,17 @@ sed -e 's/()//g' a.go > a.go.tmp && mv a.go.tmp a.go
 git add -A && git commit -qm "batch delete parens"
 printf '// trailing comment\n' >> a.go
 git add -A && git commit -qm "comment only"
-if ! bash scripts/check-bulk-edit-safety.sh >/tmp/bulk-range-default.out 2>&1; then
-  echo "SELFTEST FAIL: 干净树默认只看末条提交时不应命中（夹具前提不成立）"; cat /tmp/bulk-range-default.out; exit 1
+if ! bash scripts/check-bulk-edit-safety.sh >"${work}/bulk-range-default.out" 2>&1; then
+  echo "SELFTEST FAIL: 干净树默认只看末条提交时不应命中（夹具前提不成立）"; cat "${work}/bulk-range-default.out"; exit 1
 fi
-if ! grep -q '仅检查最近一条提交' /tmp/bulk-range-default.out; then
-  echo "SELFTEST FAIL: 干净树未明示「仅检查最近一条提交」的边界"; cat /tmp/bulk-range-default.out; exit 1
+if ! grep -q '仅检查最近一条提交' "${work}/bulk-range-default.out"; then
+  echo "SELFTEST FAIL: 干净树未明示「仅检查最近一条提交」的边界"; cat "${work}/bulk-range-default.out"; exit 1
 fi
-if BULK_EDIT_RANGE=HEAD~2..HEAD bash scripts/check-bulk-edit-safety.sh >/tmp/bulk-range-out.out 2>&1; then
-  echo "SELFTEST FAIL: BULK_EDIT_RANGE 指定的中段批量删括号未拦截"; cat /tmp/bulk-range-out.out; exit 1
+if BULK_EDIT_RANGE=HEAD~2..HEAD bash scripts/check-bulk-edit-safety.sh >"${work}/bulk-range-out.out" 2>&1; then
+  echo "SELFTEST FAIL: BULK_EDIT_RANGE 指定的中段批量删括号未拦截"; cat "${work}/bulk-range-out.out"; exit 1
 fi
-if ! grep -q 'BULK_EDIT_RANGE 显式范围' /tmp/bulk-range-out.out; then
-  echo "SELFTEST FAIL: 显式范围命中原因未标注范围来源"; cat /tmp/bulk-range-out.out; exit 1
+if ! grep -q 'BULK_EDIT_RANGE 显式范围' "${work}/bulk-range-out.out"; then
+  echo "SELFTEST FAIL: 显式范围命中原因未标注范围来源"; cat "${work}/bulk-range-out.out"; exit 1
 fi
 
 # 10) 未跟踪的无 dry-run 批量脚本必须拦下：事故作业序是「写脚本 → 跑门禁 →
@@ -199,11 +208,11 @@ for dp, _, fs in os.walk('.'):
             open(p,'w').write(re.sub(r'\\s+$','',open(p).read()))
 PY
 # 刻意不 git add：脚本处于未跟踪状态
-if bash scripts/check-bulk-edit-safety.sh >/tmp/bulk-untracked.out 2>&1; then
-  echo "SELFTEST FAIL: 未跟踪的无 dry-run 脚本未拦截"; cat /tmp/bulk-untracked.out; exit 1
+if bash scripts/check-bulk-edit-safety.sh >"${work}/bulk-untracked.out" 2>&1; then
+  echo "SELFTEST FAIL: 未跟踪的无 dry-run 脚本未拦截"; cat "${work}/bulk-untracked.out"; exit 1
 fi
-if ! grep -q '缺少 --dry-run' /tmp/bulk-untracked.out; then
-  echo "SELFTEST FAIL: 未跟踪脚本命中原因错误（应为缺 dry-run）"; cat /tmp/bulk-untracked.out; exit 1
+if ! grep -q '缺少 --dry-run' "${work}/bulk-untracked.out"; then
+  echo "SELFTEST FAIL: 未跟踪脚本命中原因错误（应为缺 dry-run）"; cat "${work}/bulk-untracked.out"; exit 1
 fi
 
 echo "bulk-edit safety selftest: PASS"

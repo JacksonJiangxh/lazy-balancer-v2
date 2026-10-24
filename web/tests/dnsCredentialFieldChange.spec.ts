@@ -15,7 +15,7 @@ import {
   credentialFieldVisible,
   type CredentialFieldMeta,
 } from '../src/utils/dnsProviderFields.ts'
-import { source } from './_helpers.ts'
+import { code } from './_helpers.ts'
 
 const doubleSelectFields: readonly CredentialFieldMeta[] = [
   { name: 'region', label: '区域', type: 'select', required: true, options: ['cn', 'global'] },
@@ -93,7 +93,7 @@ test('求值不修改入参', () => {
 })
 
 test('组件接线：select 变更按字段求值，无 auth_mode 字面量重置', () => {
-  const page = source('src/views/settings/FreeCertificates.vue')
+  const page = code('src/views/settings/FreeCertificates.vue')
   assert.match(page, /@change="onCredentialFieldChange"/)
   // 参数顺序与同一调用：允许任意换行/缩进，只钉两个实参按序出现在同一次调用里
   assert.match(page, /applyCredentialFieldChange\([\s\S]{0,240}?selectedProvider\.value\?\.credential_fields \?\? \[\],[\s\S]{0,120}?form\.value\.dns_credentials,/)
@@ -112,7 +112,7 @@ test('编辑回填不按 provider 名推断认证方式（缺失键交后端 can
   // 库值 → 规范凭据的唯一实现是后端 dnsprovider.CanonicalCredentials（保存前
   // 验证与签发链共用）；前端复刻该推断会按 provider 名硬编码，第二个 provider
   // 即被注入无关的 auth_mode。回填只做 JSON 解析，不做任何凭证语义推断。
-  const page = source('src/views/settings/FreeCertificates.vue')
+  const page = code('src/views/settings/FreeCertificates.vue')
   // 结构边界取回填块（不依赖空行/缩进形状：格式化工具有引入即批量红）。
   const backfillStart = page.indexOf('if (config) {')
   const backfillEnd = page.indexOf('editingId.value = null', backfillStart)

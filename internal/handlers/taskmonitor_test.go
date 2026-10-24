@@ -118,10 +118,30 @@ func TestListSystemTasks_allFamiliesPresent(t *testing.T) {
 	for _, tk := range payload.Data.Tasks {
 		got[tk.ID] = tk.Category
 	}
-	want := []string{"threat", "crs", "ip2region", "auto-backup", "cluster-sync", "config-watchdog", "audit-retention", "security-events-ingestion", "log-cleanup", "cert-renewal-scan", "startup:config-load"}
-	for _, id := range want {
-		if _, ok := got[id]; !ok {
-			t.Fatalf("任务族 %s 缺失; got=%v", id, got)
+	// 期望集合由引擎注册表派生（DescribeAll 是视图的唯一事实源）：手抄清单是
+	// 子集断言——生产新增族不红，改名/漏列也不易被发现。数量、身份、分类三项
+	// 全对表；cert-job: 是 task_runs 派生的动态行，不属于注册表。
+	metas := services.TaskEngine().DescribeAll()
+	if len(metas) == 0 {
+		t.Fatal("引擎注册表为空——任务族对账失效")
+	}
+	registered := make(map[string]struct{}, len(metas))
+	for _, meta := range metas {
+		registered[meta.ID] = struct{}{}
+		category, ok := got[meta.ID]
+		if !ok {
+			t.Fatalf("任务族 %s 缺失; got=%v", meta.ID, got)
+		}
+		if category != meta.Category {
+			t.Fatalf("任务族 %s 分类=%q, want %q（引擎注册表口径）", meta.ID, category, meta.Category)
+		}
+	}
+	for id := range got {
+		if strings.HasPrefix(id, "cert-job:") {
+			continue
+		}
+		if _, ok := registered[id]; !ok {
+			t.Fatalf("响应含引擎未注册的任务 %q（视图与注册表分叉）; got=%v", id, got)
 		}
 	}
 	for _, tk := range payload.Data.Tasks {
@@ -131,9 +151,6 @@ func TestListSystemTasks_allFamiliesPresent(t *testing.T) {
 		if tk.ID == "config-watchdog" && tk.BusinessDriven {
 			t.Error("config-watchdog 不应标记 business_driven")
 		}
-	}
-	if got["threat"] != "安全防护" || got["cert-renewal-scan"] != "证书" || got["startup:config-load"] != "系统" {
-		t.Fatalf("分类错配: %v", got)
 	}
 }
 
@@ -439,6 +456,11 @@ func TestGetSystemTaskLogs_hidesInternalErrorDetails(t *testing.T) {
 	}
 
 	// ② 读取失败：日志目录不可搜索（stat 报权限错误）。
+	// root 不受文件权限位约束（容器 CI 常见）：chmod 0 后 stat 仍成功 → 用例
+	// 必红，且会被误读为产品回归。①的路径解析断言已在上面执行完。
+	if os.Geteuid() == 0 {
+		t.Skip("root 不受文件权限限制，无法构造 stat 失败")
+	}
 	dir := t.TempDir()
 	oldLogDir := taskengine.LogDir()
 	taskengine.SetLogDir(dir)
@@ -447,6 +469,11 @@ func TestGetSystemTaskLogs_hidesInternalErrorDetails(t *testing.T) {
 		t.Fatalf("chmod log dir: %v", err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(dir, 0755) })
+	// 权限位之外还可能被挂载选项/ACL 放宽（只读挂载、容器内 uid 映射）：
+	// 以「目录内路径 stat 是否真的失败」为夹具自检，不成立就跳过而不是误红。
+	if _, err := os.Stat(filepath.Join(dir, "probe")); err == nil {
+		t.Skip("当前环境不受目录权限位约束，stat 失败语义无法构造")
+	}
 	applogs.Reset()
 	response = request("crs")
 	if response.Code != http.StatusInternalServerError {
@@ -749,5 +776,81 @@ func TestTriggerSystemTask_triggerAuditMatchesManualRuns(t *testing.T) {
 			t.Fatalf("「触发」审计=%d 与实际 manual task_runs=%d 不一致（孤儿/缺失审计）", got, manualRuns)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// Given 一条 waiting_ca 证书任务（CA 退避窗口在未来 2 小时）与一条 issued
+// 证书任务（无冷却）。When GET /system/tasks。
+// Then 每行恒带 retry_cooldown_seconds（0=现在即可运行，无 omitempty）：
+// waiting_ca ≈7200（CA 剩余秒）、issued=0、非证书任务行=0——前端任务行
+// 「运行」按钮的冷却判定与证书任务列表（/certificates/jobs）同源。
+func TestListSystemTasks_exposesRetryCooldownSeconds(t *testing.T) {
+	newBackupTestHandlers(t)
+	initTaskEngineForTest(t)
+	caWindow := time.Now().UTC().Add(2 * time.Hour).Format("2006-01-02 15:04:05")
+	if _, err := db.DB.Exec(`INSERT INTO cert_jobs (id, rule_id, domain, status, message, ca_available_after, created_at, updated_at)
+		VALUES (1,'lb_ca','ca.example','waiting_ca','',?,datetime('now'),datetime('now')),
+		       (2,'lb_ok','ok.example','issued','',NULL,datetime('now'),datetime('now'))`, caWindow); err != nil {
+		t.Fatalf("seed cert jobs: %v", err)
+	}
+	r, _ := taskMonitorRouter()
+	resp := httptest.NewRecorder()
+	r.ServeHTTP(resp, httptest.NewRequest(http.MethodGet, "/system/tasks", nil))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Data struct {
+			Tasks []map[string]json.RawMessage `json:"tasks"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Data.Tasks) == 0 {
+		t.Fatal("任务列表为空，断言失效")
+	}
+	// 字段必须恒下发：前端用 0 判「无冷却」，omitempty 会让缺键与可运行同形
+	// 但解析侧拿到零值尚可，缺键在严格 schema/展示层会退化为「未知」。
+	for _, row := range payload.Data.Tasks {
+		rawID, ok := row["id"]
+		if !ok {
+			t.Fatal("任务行缺少 id")
+		}
+		var id string
+		if err := json.Unmarshal(rawID, &id); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := row["retry_cooldown_seconds"]; !ok {
+			t.Fatalf("任务行 %s 缺少 retry_cooldown_seconds（该字段不得 omitempty）", id)
+		}
+	}
+	cooldownOf := func(id string) int64 {
+		t.Helper()
+		for _, row := range payload.Data.Tasks {
+			var rowID string
+			if err := json.Unmarshal(row["id"], &rowID); err != nil {
+				t.Fatal(err)
+			}
+			if rowID != id {
+				continue
+			}
+			var seconds int64
+			if err := json.Unmarshal(row["retry_cooldown_seconds"], &seconds); err != nil {
+				t.Fatalf("任务行 %s retry_cooldown_seconds 解析失败: %v", id, err)
+			}
+			return seconds
+		}
+		t.Fatalf("任务行 %s 不存在", id)
+		return 0
+	}
+	if got := cooldownOf("cert-job:1"); got < 7100 || got > 7200 {
+		t.Fatalf("waiting_ca 行冷却=%d, want ≈7200（CA 退避剩余秒）", got)
+	}
+	if got := cooldownOf("cert-job:2"); got != 0 {
+		t.Fatalf("issued 行冷却=%d, want 0（无冷却）", got)
+	}
+	if got := cooldownOf("threat"); got != 0 {
+		t.Fatalf("非证书任务行冷却=%d, want 0", got)
 	}
 }

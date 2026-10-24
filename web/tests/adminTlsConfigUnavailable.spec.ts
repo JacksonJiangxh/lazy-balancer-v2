@@ -12,10 +12,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { repoCode, section, source } from './_helpers.ts'
+import { repoCode, section, code } from './_helpers.ts'
 
 test('/admin-tls 响应类型声明 config_unavailable（后端降级读标记）', () => {
-  const api = source('src/utils/api.ts')
+  const api = code('src/utils/api.ts')
   const decl = section(api, "get(url: '/admin-tls'", '>')
   assert.match(decl, /config_unavailable\?: boolean/, '类型必须声明后端降级读标记')
 })
@@ -27,8 +27,8 @@ test('后端契约：配置读取失败时置 config_unavailable=true 且仍返�
 })
 
 test('设置页消费 config_unavailable：提示不可信、开关不得视为已加载', () => {
-  const page = source('src/views/settings/BasicSettings.vue')
-  const draft = source('src/composables/useSettingsDraft.ts')
+  const page = code('src/views/settings/BasicSettings.vue')
+  const draft = code('src/composables/useSettingsDraft.ts')
 
   // 降级态属于服务端派生缓存：切分页重挂后提示继续成立
   assert.match(draft, /const adminTlsUnavailable = ref\(false\)/)
@@ -48,7 +48,7 @@ test('设置页消费 config_unavailable：提示不可信、开关不得视为�
 })
 
 test('降级态渲染：明确文案「显示的开关不可信」+ 重试入口', () => {
-  const page = source('src/views/settings/BasicSettings.vue')
+  const page = code('src/views/settings/BasicSettings.vue')
   const warn = section(page, 'v-if="adminTlsUnavailable"', '</template>')
   assert.match(warn, /配置读取失败，显示的开关不可信/, '不得以「已关闭」静默展示降级值')
   assert.match(warn, /retryLoadAdminTls/, '须给出重试入口')

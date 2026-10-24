@@ -10,7 +10,7 @@
 // 解析（tsconfig allowImportingTsExtensions 仅为类型层面放行）；仅经打包器
 // 消费的模块保持无扩展名风格。
 
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
 import { registerHooks } from 'node:module'
 import { createRenderer } from 'vue'
 
@@ -47,6 +47,36 @@ export const code = (relative: string): string => stripComments(source(relative)
 
 /** 同 code，但读取相对仓库根的路径（跨栈 Go 源码存在性断言用）。 */
 export const repoCode = (relative: string): string => stripComments(repoSource(relative))
+
+/**
+ * code() 视图的限段读取：先在 raw 文本上按 marker 切片（marker 常是注释分隔
+ * 行，剥注释后就找不到），再剥注释。断言落在代码上、边界仍用原始 marker。
+ */
+export const codeSection = (relative: string, startMarker: string, endMarker: string): string =>
+  stripComments(section(source(relative), startMarker, endMarker))
+
+/**
+ * 递归列出 `web/` 下某个目录的源文件（返回相对 `web/` 的正斜杠路径）。
+ * 「唯一消费方/全仓不得出现」类扫描必须遍历目录而非单文件：单文件判据在
+ * 新增消费方时静默失效（扫描面缺口）。
+ */
+export const webFiles = (relativeDir: string, extensions: readonly string[]): string[] => {
+  const base = new URL(relativeDir.endsWith('/') ? relativeDir : `${relativeDir}/`, webRoot)
+  const entries = readdirSync(base, { recursive: true, withFileTypes: true }) as Array<{
+    name: string
+    parentPath: string
+    isFile(): boolean
+  }>
+  const prefix = relativeDir.replace(/\/$/, '')
+  return entries
+    .filter((entry) => entry.isFile() && extensions.some((ext) => entry.name.endsWith(ext)))
+    .map((entry) => {
+      const rel = `${entry.parentPath}/${entry.name}`.replace(/\\/g, '/').replace(/\/{2,}/g, '/')
+      const at = rel.indexOf(prefix)
+      return at >= 0 ? rel.slice(at) : rel
+    })
+    .sort()
+}
 
 /** 注释内出现代码形态仍算「源码里存在」——切片误命中注释会让断言空转。 */
 const REGEX_PRECEDING_KEYWORDS: Record<string, true> = {
@@ -197,6 +227,32 @@ export const stripComments = (text: string): string => {
     at = end
   }
   return out + text.slice(at)
+}
+
+/**
+ * 推进 promise 作业队列 turns 次（纯微任务，不碰真实时钟）。用于「实现已发出
+ * 的异步链还会跑几跳」这类不可观测长度的收尾：固定次数的 `setTimeout` 是
+ * 猜作业队列长度且依赖真实时钟，单次 `await Promise.resolve()` 又常常不够。
+ */
+export const drainMicrotasks = async (turns = 64): Promise<void> => {
+  for (let i = 0; i < turns; i++) await Promise.resolve()
+}
+
+/**
+ * 有界条件等待（纯微任务）：直到 predicate 成立，或耗尽 turns 跳后以带原因的
+ * 断言失败收场。把「等异步实现收敛」从猜次数改成等状态——未收敛时给出可读
+ * 原因，而不是把中间态当结果断言（假绿）或挂到测试超时（挂起）。
+ */
+export const waitForMicrotasks = async (
+  predicate: () => boolean,
+  what: string,
+  turns = 64,
+): Promise<void> => {
+  for (let i = 0; i < turns; i++) {
+    if (predicate()) return
+    await Promise.resolve()
+  }
+  throw new Error(`微任务预算 ${turns} 跳内未满足：${what}`)
 }
 
 /** 续行运算符：命中则说明上一行的 `)`/`}` 只是表达式内部收尾，声明还没结束。 */

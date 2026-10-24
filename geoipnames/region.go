@@ -26,7 +26,7 @@ func invalidRegionValue(trimmed string) bool {
 // 台湾城市误置省列返回 ("", taiwanCity=true)；其余原样返回 trimmed
 // （known=false，由调用方按 tree/emit 策略处理）。
 func canonicalProvince(trimmed string) (name string, taiwanCity, known bool) {
-	if canonical, ok := ProvinceAliases[trimmed]; ok {
+	if canonical, ok := provinceAliases[trimmed]; ok {
 		return canonical, false, true
 	}
 	if TaiwanCities[trimmed] {
@@ -38,11 +38,11 @@ func canonicalProvince(trimmed string) (name string, taiwanCity, known bool) {
 // canonicalCity 表驱动城市列归一：拼音映射/自治州全称命中返回规范名
 // （known=true）；其余原样返回 trimmed。
 func canonicalCity(trimmed string) (name string, known bool) {
-	if fixed, ok := CityPinyinFixes[trimmed]; ok {
+	if fixed, ok := cityPinyinFixes[trimmed]; ok {
 		return fixed, true
 	}
 	// 少数民族自治州简称 → 全称。
-	if full, ok := AutonomousPrefectures[trimmed]; ok {
+	if full, ok := autonomousPrefectures[trimmed]; ok {
 		return full, true
 	}
 	return trimmed, false

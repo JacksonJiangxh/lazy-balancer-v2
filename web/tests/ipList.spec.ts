@@ -19,10 +19,10 @@ import {
   parseIPList,
   sharedEntriesCache,
 } from '../src/utils/securityStages.ts'
-import { code, member, repoCode, source } from './_helpers.ts'
+import { code, member, repoCode } from './_helpers.ts'
 
 test('IP 快捷处置：信任命中只全扫一次，GeoIP 区域只解析一次', () => {
-  const src = source('src/views/security/IPLocationAction.vue')
+  const src = code('src/views/security/IPLocationAction.vue')
   assert.match(src, /const trustHitSummary = computed/, '信任命中与豁免策略应共享一次计算')
   assert.doesNotMatch(src, /const td[01]Owner = policies\.value\.find/, '逐行不得再全策略扫描')
   assert.doesNotMatch(src, /JSON\.parse\(policy\.geoip_countries/, 'GeoIP 区域不得重复 JSON.parse')
@@ -30,7 +30,7 @@ test('IP 快捷处置：信任命中只全扫一次，GeoIP 区域只解析一�
 })
 
 test('规则流程只拉本规则阶段 0 策略的信任引用', () => {
-  const src = source('src/components/RuleFlowDialog.vue')
+  const src = code('src/components/RuleFlowDialog.vue')
   assert.match(src, /boundTrustPolicyIds/)
   assert.match(src, /if \(!boundTrustPolicyIds\.has\(pol\.id\)\) continue/)
 })
@@ -51,7 +51,7 @@ test('B 空条目确认：仅已有名单触发（新建空名单是合法操作
 // 消费侧接线：守卫被删后纯函数用例仍全绿——详情加载中/失败时保存可点，
 // entries 为空 → 全量 PUT 清空既有名单。
 test('A/B 守卫接到规则页：保存禁用绑定与空条目二次确认', () => {
-  const rules = source('src/views/security/SecurityRules.vue')
+  const rules = code('src/views/security/SecurityRules.vue')
   assert.match(
     rules,
     /:disabled="!canSaveIpList\(\s*loadingIpListDetail,\s*ipListDetailFailed\s*\)"/,
@@ -257,7 +257,7 @@ test('名单条目上限/备注长度与后端 securityiplists.go 同源（跨�
   // SFC 不得再硬编码条目上限字面量（双源会漂移）：只钉两个**语义形态**——
   // 校验比较与控件上限；不再用「全页任何 `= 2000`」的宽口径（未来合法超时/
   // 分页示例会假红）。
-  const rules = source('src/views/security/SecurityRules.vue')
+  const rules = code('src/views/security/SecurityRules.vue')
   assert.match(rules, /IP_LIST_MAX_ENTRIES/, 'SecurityRules 必须引用单源常量')
   // 上限按生效条目计（与后端 validateIPListShape / AutobanActiveEntries 同口径）：
   // 已到期条目保存时被剔除、不占名额，原始条数比较会把到期残留顶到上限。

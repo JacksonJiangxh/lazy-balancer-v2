@@ -4204,9 +4204,12 @@ func truncateEventListField(value string) string {
 // securityEventListHeadersTotalSQL 与 securityEventListFieldSQL 配套：只在
 // 该列超限且为合法 JSON 时数出全部键数（否则 0）。被切断的键数 = 总键数 −
 // Go 侧从前缀解出的键数——SQL 侧不传输键内容，只回一个整数。
+// 超限判定必须与截断同口径（字节）：length(TEXT) 是字符数，多字节头值
+// （非 ASCII 自定义头/未编码中文 Referer）会「字节超限而字符不超限」——
+// 用字符口径判定就返回 0，列表弹框丢弃被切断的成员却不写隐藏计数。
 func securityEventListHeadersTotalSQL(column string) string {
 	capText := strconv.Itoa(securityEventListFieldCap)
-	return "CASE WHEN length(COALESCE(" + column + ",'')) > " + capText +
+	return "CASE WHEN length(CAST(COALESCE(" + column + ",'') AS BLOB)) > " + capText +
 		" AND json_valid(" + column + ") THEN (SELECT COUNT(*) FROM json_each(" + column + ")) ELSE 0 END"
 }
 
@@ -5948,7 +5951,7 @@ func derefStr(p *string) string {
 // 前置完成，此处仅归一空值形态）。
 func crawlerEnginesJSON(raw string) string {
 	if strings.TrimSpace(raw) == "" {
-		b, _ := json.Marshal(geoipnames.DefaultCrawlerEngines)
+		b, _ := json.Marshal(geoipnames.DefaultCrawlerEngines())
 		return string(b)
 	}
 	return raw

@@ -13,7 +13,7 @@ import {
   upstreamPathRuleError,
   validatePathRules,
 } from '../src/utils/ruleValidation.ts'
-import { repoSource, section } from './_helpers.ts'
+import { repoCode, section } from './_helpers.ts'
 import { hostPortKey } from '../src/utils/upstreamKeys.ts'
 
 type Upstream = {
@@ -148,14 +148,14 @@ test('权重门跨栈同口径：前端 <1 拒绝与后端路径池/主池一致
   assert.match(frontend, /权重必须大于 0/, '前端必须拒绝 weight=0')
   // 限段到各自校验函数后断言门表达式，并计「文件内该判据只出现一次」——
   // 全文 includes 在全文件别处新增第二条门时无感（多处门只对表一处）。
-  const goPath = section(repoSource('internal/handlers/rule_features.go'), 'func validateRuleFeatures(', '\nfunc ')
+  const goPath = section(repoCode('internal/handlers/rule_features.go'), 'func validateRuleFeatures(', '\nfunc ')
   assert.match(goPath, /if upstream\.Weight < 1 \{/, '后端路径池权重门必须为 <1（与前端同口径）')
   assert.equal(
     (goPath.match(/upstream\.Weight < 1/g) ?? []).length,
     1,
     '路径池权重判据在 validateRuleFeatures 内只允许一处',
   )
-  const goMain = section(repoSource('internal/handlers/handlers.go'), 'func validateRuleUpstreams(', '\nfunc ')
+  const goMain = section(repoCode('internal/handlers/handlers.go'), 'func validateRuleUpstreams(', '\nfunc ')
   assert.match(goMain, /if u\.Weight < 1 \{/, '后端主池权重门必须为 <1')
   assert.equal((goMain.match(/u\.Weight < 1/g) ?? []).length, 1, '主池权重判据在 validateRuleUpstreams 内只允许一处')
 })
@@ -180,7 +180,7 @@ test('上游路径改写：空串放行，非空须以 / 开头且不含空格 ?
 
 test('直接返回：状态码白名单与后端同集，响应内容按码点计 64 界值', () => {
   // 前端数组 = 后端 map 键集（双向相等，非抽样）：任一侧增删一个码即红。
-  const goBlock = section(repoSource('internal/handlers/rule_features.go'), 'var validStaticResponseStatuses = map[int]bool{', '}')
+  const goBlock = section(repoCode('internal/handlers/rule_features.go'), 'var validStaticResponseStatuses = map[int]bool{', '}')
   const goCodes = [...goBlock.matchAll(/(\d{3}):\s*true/g)].map((m) => Number(m[1])).sort((a, b) => a - b)
   assert.deepEqual(
     [...STATIC_RESPONSE_STATUSES].sort((a, b) => a - b),

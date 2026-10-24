@@ -110,7 +110,7 @@
           <div v-if="trustedTotalError" class="form-tip-line trusted-ranges-error">{{ trustedTotalError }}</div>
           <div v-else-if="trustedTotalWarning" class="form-tip-line">{{ trustedTotalWarning }}</div>
           <div v-if="refListEntriesRetryIds.length" class="info-note-bar">
-            <span class="info-note-desc">{{ refListEntriesRetryIds.length }} 个引用列表的条目未加载成功，「合计」条数按名单记录数估算（重叠网段未去重）；不影响保存，服务端以去重后结果为准</span>
+            <span class="info-note-desc">{{ refListEntriesRetryIds.length }} 个引用列表的条目未加载成功，「合计」条数按名单记录数估算（重叠网段未去重）；若名单已被删除，保存会被拒绝；服务端以去重后结果为准</span>
             <el-button size="small" type="primary" plain @click="retryRefListEntries">重新加载名单条目</el-button>
           </div>
           <div class="form-tip-line">引用「规则集 → IP 地址列表」中的可复用列表，条目与上方内联网段合并生效（合计 {{ trustedRangesTotalCount }} 条，上限 {{ TRUSTED_PROXY_MAX_TOTAL_ENTRIES }}）</div>
@@ -149,6 +149,13 @@
           </el-tooltip>
         </el-form-item>
       </template>
+
+      <!-- 关闭态：隐藏字段仍参与后端写侧校验（与开关无关），非法存量值
+           必须可见且给出可修复路径——否则用户看不到控件也无法定位。 -->
+      <el-form-item v-else-if="trustedProxyDisabledStaleError" label="受信代理">
+        <div class="form-tip-line trusted-ranges-error">{{ trustedProxyDisabledStaleError }}</div>
+        <div class="form-tip-line">受信代理已关闭，但存量配置仍会被写侧校验：请临时开启「受信代理」修正上述条目后再关闭，否则保存会被拒绝。</div>
+      </el-form-item>
 
       <el-divider content-position="left">访问日志</el-divider>
       <el-form-item label="自定义格式">
@@ -373,6 +380,8 @@ const fetchIpLists = async (): Promise<void> => {
     const res = await request.get<APIResponse<TrustedIpListOption[]>>('/security/ip-lists', { silent: true })
     ipLists.value = res.data || []
     ipListsLoadError.value = false
+    // 名单目录刷新成功 → 条目缓存一并失效（名单可能已被他处编辑）
+    invalidateRefListEntries()
   } catch {
     ipLists.value = []
     ipListsLoadError.value = true
@@ -393,6 +402,14 @@ const refListEntries = ref<Record<number, string[] | null>>({})
 const refListEntriesFailed = ref<Record<number, boolean>>({})
 // 拉取在途集合（占位 null 之外的独立标记：失败后可随下次选择重试）
 const refListEntriesLoading = new Set<number>()
+// 会话内缓存失效：名单可能在别处被编辑/删除，重新拉取名单目录成功时
+// 一并清空条目缓存并重排当前引用（否则「合计」用旧条目直到整页刷新）。
+const invalidateRefListEntries = (): void => {
+  refListEntries.value = {}
+  refListEntriesFailed.value = {}
+  refEntryQueue.length = 0
+  for (const id of trustedRangeRefs.value) scheduleRefListEntries(id)
+}
 const fetchRefListEntries = async (id: number): Promise<void> => {
   if (id in refListEntries.value || refListEntriesLoading.has(id)) return
   refListEntriesLoading.add(id)
@@ -414,20 +431,41 @@ const fetchRefListEntries = async (id: number): Promise<void> => {
     refListEntriesLoading.delete(id)
   }
 }
+// 引用条目无上限并行 fan-out 会在进入设置页时同时打 N 个详情请求
+// （每份最多数千条），限并发 2 并去重排队。
+const REF_ENTRY_FETCH_CONCURRENCY = 2
+const refEntryQueue: number[] = []
+let refEntryActive = 0
+const drainRefEntryQueue = (): void => {
+  while (refEntryActive < REF_ENTRY_FETCH_CONCURRENCY && refEntryQueue.length > 0) {
+    const id = refEntryQueue.shift() as number
+    if (id in refListEntries.value || refListEntriesLoading.has(id)) continue
+    refEntryActive++
+    void fetchRefListEntries(id).finally(() => {
+      refEntryActive--
+      drainRefEntryQueue()
+    })
+  }
+}
+const scheduleRefListEntries = (id: number): void => {
+  if (id in refListEntries.value || refListEntriesLoading.has(id) || refEntryQueue.includes(id)) return
+  refEntryQueue.push(id)
+  drainRefEntryQueue()
+}
 watch(trustedRangeRefs, (ids) => {
-  for (const id of ids) void fetchRefListEntries(id)
+  for (const id of ids) scheduleRefListEntries(id)
 }, { immediate: true })
 
 /** 条目未加载成功的引用 id（用于提示与重试入口）。 */
 const refListEntriesRetryIds = computed(() => trustedRangeRefs.value.filter((id) => refListEntriesFailed.value[id]))
-const retryRefListEntries = async (): Promise<void> => {
+const retryRefListEntries = (): void => {
   const ids = refListEntriesRetryIds.value
   for (const id of ids) {
     const next = { ...refListEntriesFailed.value }
     delete next[id]
     refListEntriesFailed.value = next
   }
-  await Promise.all(ids.map((id) => fetchRefListEntries(id)))
+  for (const id of ids) scheduleRefListEntries(id)
 }
 
 const referencedLists = computed<TrustedProxyReferencedEntries[]>(() => trustedRangeRefs.value.map((id) => ({
@@ -448,6 +486,11 @@ const trustedTotalError = computed(() => trustedProxyTotalError(trustedRanges.va
 // 非阻断提示：估算合计越限但无法证明真实并集超限（含未加载条目时重叠无法去重）
 // ——不拦保存，由后端按去重后的网段集合兜底判定。
 const trustedTotalWarning = computed(() => trustedProxyTotalWarning(trustedRanges.value, referencedLists.value))
+// 关闭态存量非法值：开关关闭不影响后端写侧校验，错误必须显性可见
+const trustedProxyDisabledStaleError = computed(() =>
+  settings.value.trusted_proxy_enabled
+    ? ''
+    : [trustedRangesError.value, trustedHeadersError.value, trustedTotalError.value].filter(Boolean).join('；'))
 
 // —— 存为列表：内联网段一键建名单并转为引用（镜像策略侧「提取为列表」） ——
 const saveListDialogVisible = ref(false)
@@ -535,18 +578,22 @@ const handleSave = async (): Promise<void> => {
     return
   }
   if (isReadOnly.value || saving.value) return
+  // 关闭态同样被后端写侧校验（开关不影响 validateTrustedProxyFields）：
+  // 提示中给出「临时开启后修正」的修复路径，而不是让用户对着隐藏字段无计可施。
+  const trustedGateMessage = (error: string): string =>
+    settings.value.trusted_proxy_enabled ? error : `${error}（受信代理已关闭：请临时开启后修正）`
   // 非法/过宽网段在表单内即拦下（后端 PUT/preview 同样拒绝，但不点名具体条目）
   if (trustedRangesError.value) {
-    ElMessage.warning(trustedRangesError.value)
+    ElMessage.warning(trustedGateMessage(trustedRangesError.value))
     return
   }
   // 请求头（条数/字符集）与「内联 + 引用展开」总量同源同门
   if (trustedHeadersError.value) {
-    ElMessage.warning(trustedHeadersError.value)
+    ElMessage.warning(trustedGateMessage(trustedHeadersError.value))
     return
   }
   if (trustedTotalError.value) {
-    ElMessage.warning(trustedTotalError.value)
+    ElMessage.warning(trustedGateMessage(trustedTotalError.value))
     return
   }
   // 估算合计越限但无法证明真实并集超限（引用条目未加载，重叠未去重）：

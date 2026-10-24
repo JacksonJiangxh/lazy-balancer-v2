@@ -91,8 +91,14 @@ func TestListCertJobs_exposesBackendRetryCooldowns(t *testing.T) {
 		(103,'lb_cooldown','disabled.example','disabled',datetime('now')),
 		(104,'lb_cooldown','issued.example','issued',datetime('now')),
 		(105,'lb_cooldown','waiting.example','waiting_ca',datetime('now')),
-		(106,'lb_cooldown','downloaded.example','downloaded',datetime('now'))`); err != nil {
+		(106,'lb_cooldown','downloaded.example','downloaded',datetime('now')),
+		(107,'lb_cooldown','waiting-open.example','waiting_ca',datetime('now'))`); err != nil {
 		t.Fatalf("seed cooldown jobs: %v", err)
+	}
+	// CA 限流退避（waiting_ca ∧ ca_available_after 未到期）比通用冷却晚得多：
+	// 列表下发值不并入它，就会出现「字段说现在可重试、服务端回 429」的分叉。
+	if _, err := db.DB.Exec(`UPDATE cert_jobs SET ca_available_after=datetime('now','+2 hours') WHERE id=105`); err != nil {
+		t.Fatalf("seed CA cooldown window: %v", err)
 	}
 	router := gin.New()
 	router.GET("/jobs", h.ListCertJobs)
@@ -108,6 +114,7 @@ func TestListCertJobs_exposesBackendRetryCooldowns(t *testing.T) {
 	var payload struct {
 		Data struct {
 			List []struct {
+				ID                   int64  `json:"id"`
 				Status               string `json:"status"`
 				RetryCooldownSeconds *int64 `json:"retry_cooldown_seconds"`
 			} `json:"list"`
@@ -116,26 +123,31 @@ func TestListCertJobs_exposesBackendRetryCooldowns(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode list response: %v", err)
 	}
-	want := map[string]int64{"queued": 900, "failed": 300, "issued": 0, "waiting_ca": 0, "downloaded": 120}
-	seen := make(map[string]bool)
+	want := map[int64]int64{101: 900, 102: 300, 104: 0, 106: 120, 107: 0}
+	seen := make(map[int64]bool)
 	for _, job := range payload.Data.List {
-		seen[job.Status] = true
-		if job.Status == "disabled" {
+		seen[job.ID] = true
+		switch job.ID {
+		case 103: // disabled 用 null 与零冷却区分。
 			if job.RetryCooldownSeconds != nil {
 				t.Fatalf("disabled cooldown=%d, want null", *job.RetryCooldownSeconds)
 			}
-			continue
-		}
-		if job.RetryCooldownSeconds == nil || *job.RetryCooldownSeconds != want[job.Status] {
-			t.Fatalf("status=%q cooldown=%v, want %d", job.Status, job.RetryCooldownSeconds, want[job.Status])
+		case 105: // waiting_ca 处于 CA 退避窗口：下发剩余秒数而非通用冷却的 0。
+			if job.RetryCooldownSeconds == nil || *job.RetryCooldownSeconds < 7100 || *job.RetryCooldownSeconds > 7200 {
+				t.Fatalf("waiting_ca with CA window cooldown=%v, want ~7200", job.RetryCooldownSeconds)
+			}
+		default:
+			if job.RetryCooldownSeconds == nil || *job.RetryCooldownSeconds != want[job.ID] {
+				t.Fatalf("id=%d status=%q cooldown=%v, want %d", job.ID, job.Status, job.RetryCooldownSeconds, want[job.ID])
+			}
 		}
 	}
-	for status := range want {
-		if !seen[status] {
-			t.Fatalf("status %q missing from list response", status)
+	for id := range want {
+		if !seen[id] {
+			t.Fatalf("cert job %d missing from list response", id)
 		}
 	}
-	if !seen["disabled"] {
+	if !seen[103] {
 		t.Fatal("disabled job missing from list response")
 	}
 }

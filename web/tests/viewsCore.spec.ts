@@ -17,14 +17,14 @@ import { copyRuleHostHeader, newRuleWizardStageOverrides, stageBlockPageOverride
 import { buildAuditLogParams } from '../src/utils/auditLogFilters.ts'
 import { normalizeCidr, serializeWhitelist } from '../src/utils/apiKeyWhitelist.ts'
 import { useClampedPagination } from '../src/composables/useClampedPagination.ts'
-import { repoSource, section, source, stripComments } from './_helpers.ts'
+import { repoCode, section, code, stripComments, codeSection } from './_helpers.ts'
 
-const rules = source('src/views/Rules.vue')
-const dashboard = source('src/views/Dashboard.vue')
-const auditLog = source('src/views/AuditLog.vue')
-const caddyConfig = source('src/views/CaddyConfig.vue')
-const users = source('src/views/Users.vue')
-const keys = source('src/views/Keys.vue')
+const rules = code('src/views/Rules.vue')
+const dashboard = code('src/views/Dashboard.vue')
+const auditLog = code('src/views/AuditLog.vue')
+const caddyConfig = code('src/views/CaddyConfig.vue')
+const users = code('src/views/Users.vue')
+const keys = code('src/views/Keys.vue')
 
 // ============ 阶段拦截页覆盖的共享键集 ============
 
@@ -121,7 +121,7 @@ test('复制向导从源规则取值，仅复制分支把 host_header 编入载�
 // ============ 关闭规则日志弹框即停定时器 ============
 
 test('onRuleLogDialogClosed 停本地轮询定时器（不再 5s 空转）', () => {
-  const closed = section(rules, 'const onRuleLogDialogClosed = () => {', '// 日志尾轮询收敛')
+  const closed = codeSection('src/views/Rules.vue', 'const onRuleLogDialogClosed = () => {', '// 日志尾轮询收敛')
   assert.match(closed, /stopRuleLogPolling\(\)/)
   assert.match(closed, /ruleLogTail\.stop\(\)/)
 })
@@ -196,7 +196,7 @@ test('部分下拉（partial）与整体失败都有可见提示与重试', () =
 // .filter-date-range 但宽度不同（360/320），非 scoped 块互相覆盖，渲染结果
 // 取决于导航顺序。Ruling：按页前缀改名（宽度不一，不上提 main.css 统一）。
 test('日期范围筛选全局类按页前缀命名（同名全局类冲突清零）', () => {
-  const events = source('src/views/security/SecurityEvents.vue')
+  const events = code('src/views/security/SecurityEvents.vue')
   assert.match(auditLog, /class="audit-filter-date-range"/)
   assert.match(auditLog, /\.audit-filter-date-range\.el-date-editor/)
   assert.match(events, /class="events-filter-date-range"/)
@@ -218,19 +218,33 @@ test('非管理员渲染权限空态且不发请求（深链同样覆盖）', ()
   assert.match(caddyConfig, /watch\(canViewConfig, \(allowed\) =>/)
 })
 
-// ============ 用户页 MFA 与死分支 ============
+// ============ 用户页职责边界与 MFA 自助归属 ============
 
-test('MFA 激活按钮按 6 位禁用（不再静默 no-op）', () => {
-  assert.match(users, /:disabled="mfaBinding\.code\.length !== 6"/)
-  const activate = section(users, 'const activateMfa = async', 'const copyMfaRecovery')
-  assert.match(activate, /selfServiceBlocked\.value \|\| mfaBinding\.value\.code\.length !== 6/)
+test('用户页：非管理员只读——操作位保留仅禁用，个人自助迁出', () => {
+  assert.doesNotMatch(users, /openMfaBinding|mfaBinding|isSelfRow|selfServiceBlocked/, '个人自助与本人行特例已迁出用户页')
+  // 只读语义=可见但禁用，不是隐藏：操作列常驻，按钮门为 isReadOnly。
+  assert.match(users, /<el-table-column label="操作" width="200"/, '操作列必须常驻')
+  assert.match(users, /:disabled="isReadOnly \|\| submitting"[\s\S]{0,120}>\s*编辑/, '编辑按钮只读禁用')
+  assert.match(users, /:disabled="isReadOnly \|\| row\.auth_provider === 'oidc' \|\| !row\.mfa_enabled/, 'MFA 按钮只读/不可用态禁用')
+  assert.doesNotMatch(users, /v-if="isAdmin"/, '不得用隐藏替代只读')
+  assert.match(users, /\/users\/\$\{row\.id\}\/mfa\/reset/, '管理员重置 MFA 仍走用户管理端点')
 })
 
-test('MFA 两个入口补函数级只读守卫（纵深防御）', () => {
-  const open = section(users, 'const openMfaBinding = async', 'const activateMfa')
-  assert.match(open, /if \(selfServiceBlocked\.value \|\| mfaBinding\.value\.loading\) return/)
-  const activate = section(users, 'const activateMfa = async', 'const copyMfaRecovery')
-  assert.match(activate, /selfServiceBlocked\.value/)
+test('MFA 绑定向导：6 位门、在途禁关、恢复码关闭确认', () => {
+  const wizard = code('src/components/MfaBindingWizard.vue')
+  assert.match(wizard, /:disabled="code\.length !== 6"/)
+  assert.match(wizard, /if \(code\.value\.length !== 6 \|\| loading\.value\) return/)
+  assert.match(wizard, /if \(loading\.value\) return/, '在途提交期间禁止关闭')
+  assert.match(wizard, /恢复代码仅此一次显示/, '恢复码步关闭必须确认已保存')
+  assert.match(wizard, /:before-close="beforeClose"/)
+})
+
+test('个人资料：MFA 自助（启用/关闭/重置）走 /auth/mfa 端点', () => {
+  const profile = code('src/components/ProfileDialog.vue')
+  assert.match(profile, /\/auth\/mfa\/setup/)
+  assert.match(profile, /\/auth\/mfa\/disable/)
+  assert.match(profile, /const mfaEnabled = computed/)
+  assert.match(profile, /:disabled="isReadOnly"/, '从节点/未知态保持只读')
 })
 
 test('resetPassword 删除 lbOpen 时代残留的 cancel/close 分支', () => {
@@ -279,7 +293,7 @@ test('审计筛选参数——时间半开区间两端各自独立上送', () =>
   // （「静默丢弃时间条件」已在后端按畸形输入改 400 收敛）——前端另加一套 trim 只会
   // 形成第二份边界语义。
   assert.match(
-    repoSource('internal/handlers/auditlog.go'),
+    repoCode('internal/handlers/auditlog.go'),
     /parseBoundary := func\(raw, endOfDay string\)[\s\S]*?raw = strings\.TrimSpace\(raw\)/,
     '时间边界的前端免 trim 前提是后端解析层自行 TrimSpace——该前提消失则本用例与前端实现都要重估',
   )
@@ -323,6 +337,27 @@ test('分页越界自动回夹（用户列表改用共享 composable）', async 
   assert.doesNotMatch(users, /users\.value\.slice\(start, start \+ pageSize\.value\)/, '不得保留手写切片')
 })
 
+test('分页边界双向夹紧：page<1 不回落到列表尾部', async () => {
+  const items = ref(Array.from({ length: 25 }, (_, index) => ({ id: index + 1 })))
+  const pageSize = ref(10)
+  // page=-1 在只做上界夹紧的实现里会让 slice 的负下标算出倒数第二页（静默错行），
+  // page=0 则是负下标 + 空切片（看似「没数据」）。
+  for (const initial of [0, -1, -99]) {
+    const page = ref(initial)
+    const { pagedItems } = useClampedPagination(items, page, pageSize)
+    assert.equal(page.value, 1, `初始 page=${initial} 必须夹到 1`)
+    assert.deepEqual(pagedItems.value.map((row) => row.id), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], `page=${initial} 必须返回首页切片`)
+  }
+  // 运行时写入越界（外部把 page 置 0/-1）同样立即回夹
+  const page = ref(2)
+  const { pagedItems } = useClampedPagination(items, page, pageSize)
+  assert.deepEqual(pagedItems.value.map((row) => row.id), [11, 12, 13, 14, 15, 16, 17, 18, 19, 20])
+  page.value = -1
+  await nextTick()
+  assert.equal(page.value, 1)
+  assert.equal(pagedItems.value[0].id, 1, '越界写入后切片必须回到首页，不得落到尾部')
+})
+
 test('白名单逻辑单源（视图不再内联实现）', () => {
   assert.match(keys, /import \{ serializeWhitelist \} from '@\/utils\/apiKeyWhitelist'/)
   assert.doesNotMatch(keys, /const serializeWhitelist = /)
@@ -335,7 +370,19 @@ test('白名单逻辑单源（视图不再内联实现）', () => {
 // 只读 Key 的可见工具集与后端单一事实源（3 个读探测）一致：写语义的
 // test_ca_provider / test_certificate_config 不得再被宣称为可用。
 test('只读 Key 工具清单与后端只读探测集一致', () => {
-  assert.match(keys, /3 个读探测 POST 工具（parse_certificate \/ validate_import \/ preview_config/)
+  // 权威集合 = internal/mcpserver/tool_visibility.go 的 ReadOnlyProbeTools
+  // （读探测 POST 白名单）。此前只钉 Keys.vue 自己的文案（模板文本与自身一致），
+  // 后端增删探测工具时文案零感知——这里逐名对表 + 数量对表。
+  const visibility = repoCode('internal/mcpserver/tool_visibility.go')
+  const block = section(visibility, 'var ReadOnlyProbeTools = map[string]struct{}{', '\n}')
+  const probeTools = [...block.matchAll(/"([a-z0-9_]+)":\s*\{\},/g)].map((match) => match[1]).sort()
+  assert.ok(probeTools.length > 0, '后端只读探测集必须可解析（marker 漂移会让守卫静默失效）')
+  const claim = keys.match(/(\d+) 个读探测 POST 工具（([^）]*)）/)
+  assert.ok(claim, 'Keys.vue 必须声明只读探测 POST 工具清单')
+  // 括号内先以「；」接说明（写语义工具不在此列），清单本体在其前。
+  const claimed = claim[2].split('；')[0].split(' / ').map((name) => name.trim()).sort()
+  assert.deepEqual(claimed, probeTools, '文案清单必须与后端只读探测集逐一相同')
+  assert.equal(Number(claim[1]), probeTools.length, '文案数量必须等于后端集合成员数')
   assert.doesNotMatch(keys, /5 个读探测 POST 工具/)
 })
 

@@ -11,12 +11,12 @@
 // - hasRemovable：是否存在可移除条目（false = 本弹窗无可执行动作）
 import { entryMatchesIp, parseIPList, parseRefIds } from './securityStages.ts'
 
-export interface TrustRemovalList {
+interface TrustRemovalList {
   readonly id: number
   readonly name: string
 }
 
-export interface TrustRemovalPlan {
+interface TrustRemovalPlan {
   readonly inlineExact: boolean
   readonly exactRefListIds: readonly number[]
   readonly residualSources: readonly string[]

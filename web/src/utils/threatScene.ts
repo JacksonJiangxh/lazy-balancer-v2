@@ -126,7 +126,7 @@ function pointInPolys(lon: number, lat: number, polys: number[][][]): boolean {
  *  三份世界拷贝（±360°×zoom）覆盖环绕显示；裁剪窗宽=360°×zoom、居中于相机
  *  经度，保证每个点只在「最近副本」上出现一次（与旧逐点 wrapDeg 定位等价，
  *  且在画布宽于一个世界时不会重复提亮）。 */
-export interface HoverLayerTransform {
+interface HoverLayerTransform {
   /** 世界单位 → CSS 像素。 */
   scale: number
   /** 世界拷贝 0（路径坐标直接落屏）的屏幕平移。 */

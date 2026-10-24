@@ -42,7 +42,9 @@ export interface LogStorageTarget {
  * 取数序号保证迟到响应不写回（换行后上一行的慢响应被丢弃）。
  *
  * 失败不静默：`error` 置位且保留上一次 `info`，由消费方显性呈现——失败时
- * 整条统计消失与站内「读取失败要显性」口径不一致。
+ * 整条统计消失与站内「读取失败要显性」口径不一致。**成功但无该 key** 是第三种
+ * 事实（`info=null` + `unavailable=true`）：同样不得让统计条整条消失，消费方
+ * 须渲染「该日志暂无统计数据」。
  */
 export const useLogStorageStats = (options: {
   target: () => LogStorageTarget
@@ -50,6 +52,10 @@ export const useLogStorageStats = (options: {
 }) => {
   const info = ref<LogStorageInfo | null>(null)
   const error = ref<string | null>(null)
+  // 「请求成功但没有所看那一行」：与取数失败（error）分开——失败可重试、
+  // 缺行是事实（后端 key 词表与前端不一致 / 该日志尚未注册统计）。两者都不许
+  // 让整条统计静默消失：消费方须显式呈现「暂无统计数据」。
+  const unavailable = ref<boolean>(false)
   let loadStatsSeq = 0
   let lastTargetKey: string | null = null
 
@@ -65,12 +71,17 @@ export const useLogStorageStats = (options: {
       if (caddyId) params.caddy_id = caddyId
       const res = await request.get<{ data?: { logs?: LogStorageInfo[] } }>('/logs/stats', { params })
       if (seq === loadStatsSeq) {
-        info.value = res.data?.logs?.find((l) => l.key === logKey) || null
+        const matched = res.data?.logs?.find((l) => l.key === logKey) ?? null
+        info.value = matched
+        unavailable.value = matched === null
         error.value = null
       }
     } catch (e) {
       if (seq === loadStatsSeq) {
         error.value = e instanceof Error ? e.message : '日志统计取数失败'
+        // 失败是「本轮结果」，缺行标记随之作废：消费方按 error 呈现重试口径，
+        // 不得同时挂「暂无统计数据」（两者含义不同）。
+        unavailable.value = false
         console.error('Failed to load log stats:', e)
       }
     }
@@ -86,11 +97,12 @@ export const useLogStorageStats = (options: {
         // （失败位原本只在成功/失败回包时改写）。
         info.value = null
         error.value = null
+        unavailable.value = false
       }
       void loadStats()
     },
     { immediate: true },
   )
 
-  return { info, error }
+  return { info, error, unavailable }
 }

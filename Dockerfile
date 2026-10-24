@@ -75,9 +75,13 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 #  分段归属依赖 coraza tx.ID 长度=16，MVS 抬升次版本可能静默改变该假设，故按
 #  [v3.8.1, v3.9) 区间断言（ge(v,"v3.8.1") && !ge(v,"v3.9.0")）——此处刻意设
 #  上限，升级需同步复核 blocked_counter.go 的 len(ID)==16 判定与本断言。
+#  归因：模块表由 BEGIN 段一次登记（改阈值只改这一处），END 段逐项打印
+#  「>>> 依赖下限不满足: <模块> 需要 <阈值>（实际 <版本>）」到 stderr 后再非零
+#  退出——构建日志直接指出失败项，无需人工解析阈值表；模块整体从依赖图消失
+#  时实际值报「未出现在依赖图中」（同样判失败）。
 RUN go version -m /app/caddy | tee /tmp/caddy-mods.txt && \
     grep -q 'go1.26.10' /tmp/caddy-mods.txt || { echo ">>> Caddy 未使用 go1.26.10 构建" >&2; exit 1; }; \
-    awk -F'\t' 'function ge(v, f,  a, b, av, bv, i) { split(substr(v, 2), a, "."); split(substr(f, 2), b, "."); for (i = 1; i <= 3; i++) { av = a[i] + 0; bv = b[i] + 0; if (av > bv) return 1; if (av < bv) return 0 } return 1 } { for (i = 1; i < NF; i++) { if ($i == "google.golang.org/grpc") ok1 = ge($(i+1), "v1.83.2"); else if ($i == "go.opentelemetry.io/otel") ok2 = ge($(i+1), "v1.45.0"); else if ($i == "golang.org/x/net") ok3 = ge($(i+1), "v0.58.0"); else if ($i == "golang.org/x/crypto") ok4 = ge($(i+1), "v0.56.0"); else if ($i == "cel.dev/cel-go") ok5 = ge($(i+1), "v0.32.0"); else if ($i == "github.com/corazawaf/coraza/v3") ok6 = (ge($(i+1), "v3.8.1") && !ge($(i+1), "v3.9.0")); else if ($i == "github.com/go-chi/chi/v5") ok7 = ge($(i+1), "v5.4.0") } } END { exit (ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7) ? 0 : 1 }' /tmp/caddy-mods.txt
+    awk -F'\t' 'function ge(v, f,  a, b, av, bv, i) { split(substr(v, 2), a, "."); split(substr(f, 2), b, "."); for (i = 1; i <= 3; i++) { av = a[i] + 0; bv = b[i] + 0; if (av > bv) return 1; if (av < bv) return 0 } return 1 } BEGIN { n = split("google.golang.org/grpc v1.83.2;go.opentelemetry.io/otel v1.45.0;golang.org/x/net v0.58.0;golang.org/x/crypto v0.56.0;cel.dev/cel-go v0.32.0;github.com/corazawaf/coraza/v3 v3.8.1;github.com/go-chi/chi/v5 v5.4.0", spec, ";"); for (k = 1; k <= n; k++) { split(spec[k], pair, " "); mods[k] = pair[1]; floor[mods[k]] = pair[2] } } { for (i = 1; i < NF; i++) { if (floor[$i] != "") { ver[$i] = $(i+1); ok[$i] = ge($(i+1), floor[$i]); if ($i == "github.com/corazawaf/coraza/v3" && ge($(i+1), "v3.9.0")) ok[$i] = 0 } } } END { rc = 0; for (k = 1; k <= n; k++) { m = mods[k]; if (ok[m] != 1) { rc = 1; want = ">= " floor[m]; if (m == "github.com/corazawaf/coraza/v3") want = want " 且 < v3.9.0"; actual = (ver[m] == "") ? "未出现在依赖图中" : ver[m]; print ">>> 依赖下限不满足: " m " 需要 " want "（实际 " actual "）" > "/dev/stderr" } } exit rc }' /tmp/caddy-mods.txt
 
 # Build Go backend
 # 与 xcaddy-builder 阶段同理：编译在构建机架构执行，产物平台由 GOOS/GOARCH 指定。

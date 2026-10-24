@@ -1,15 +1,15 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { code, member, section, source, stripComments } from './_helpers.ts'
+import { code, member, section, stripComments, source, codeSection } from './_helpers.ts'
 
 test('当前密码错误在页面本地 toast，拦截器复用精确分类', () => {
-  const profile = source('src/components/ProfileDialog.vue')
+  const profile = code('src/components/ProfileDialog.vue')
   assert.match(profile, /isCurrentPasswordRejection\('patch', '\/users\/me', error\.status, error\.message\)/)
   assert.match(profile, /authStore\.showToast\('error', error\.message\)/)
-  assert.match(source('src/utils/api.ts'), /classifyAuthFailure\(/)
+  assert.match(code('src/utils/api.ts'), /classifyAuthFailure\(/)
   // 401 分类判据单源在 utils/apiFailure（拦截器只做处置分派）
-  assert.match(source('src/utils/apiFailure.ts'), /isCurrentPasswordRejection\(/)
+  assert.match(code('src/utils/apiFailure.ts'), /isCurrentPasswordRejection\(/)
 })
 
 test('只有已启用信任命中才抑制新增信任', () => {
@@ -21,7 +21,7 @@ test('只有已启用信任命中才抑制新增信任', () => {
 })
 
 test('引用列表仅精确条目可移除，removed=false 不得报成功', () => {
-  const text = source('src/views/security/IPLocationAction.vue')
+  const text = code('src/views/security/IPLocationAction.vue')
   assert.match(text, /const ipExactListIds = computed/)
   // 语句级限段用**下一条语句声明**作终点（结构边界），不再用行首注释——
   // 语句内插入一行注释就会提前截断（假红）。两个赋值必须各自按本侧 refs +
@@ -34,11 +34,11 @@ test('引用列表仅精确条目可移除，removed=false 不得报成功', () 
   assert.match(aclBlock, /ip_acl_list_refs\)\.includes\(l\.id\)/, 'ACL 引用移除列表必须按 ACL refs 过滤')
   assert.match(aclBlock, /ipExactListIds\.value\.has\(l\.id\)/, 'ACL 引用移除列表必须过滤为精确条目命中')
   assert.match(aclBlock, /\.map\(\(l\) => \(\{ id: l\.id, name: l\.name \}\)\)/)
-  assert.match(source('src/composables/useTrustAssociation.ts'), /res\.data\?\.removed !== true/)
+  assert.match(code('src/composables/useTrustAssociation.ts'), /res\.data\?\.removed !== true/)
 })
 
 test('注册弹框记录打开时节点模式，并在关闭时清空', () => {
-  const text = source('src/views/settings/cluster/ClusterModeCard.vue')
+  const text = code('src/views/settings/cluster/ClusterModeCard.vue')
   // 两处打开路径（外部注册请求 / 手动切换到从节点）都必须捕获打开时模式：
   // 删掉任一捕获后「首次注册 master→slave 自动关闭」永久失效，而纯函数
   // clusterRegistration.spec 仍全绿——这里钉的是接线。
@@ -53,13 +53,13 @@ test('注册弹框记录打开时节点模式，并在关闭时清空', () => {
 })
 
 test('OIDC 保存门与响应落地都校验当前探测快照', () => {
-  const text = source('src/views/settings/OIDCSettings.vue')
+  const text = code('src/views/settings/OIDCSettings.vue')
   assert.match(text, /probeGuard\.isCurrent\(/)
   assert.match(text, /probe\.key !== oidcProbeKey\(currentProbeValues\(\)\)/)
 })
 
 test('流量游标使用回退检测并在 visibility 恢复时归零', () => {
-  const text = source('src/views/security/ThreatScreen.vue')
+  const text = code('src/views/security/ThreatScreen.vue')
   assert.match(text, /flowSince = nextFlowCursor\(flowSince, data\)/)
   // visible 恢复语义纳管在 screenLoop.onVisible（原 onVisibilityChange）。
   assert.match(section(text, 'onVisible: () => {', '\n})'), /flowSince = 0/)
@@ -68,7 +68,7 @@ test('流量游标使用回退检测并在 visibility 恢复时归零', () => {
 })
 
 test('Dashboard 所有落地路径统一重建逐规则失败映射', () => {
-  const text = source('src/views/Dashboard.vue')
+  const text = code('src/views/Dashboard.vue')
   // 原断言只数 helper 调用次数 >=4——不证明「所有落地路径」，
   // 原 bug 恰是某一路径绕过 helper 直接赋值且计数仍够。改为反向断言：任何
   // ruleMetricsUnavailable 赋值都必须经 helper（绕过即红），且至少四条落地路径。
@@ -89,7 +89,7 @@ test('混合策略只读视图复用独立黑名单生效谓词', () => {
   // 展示口径改为「ip_acl_enabled 开启 或 内容门命中」——
   // 后端 SecurityPolicyHasIPControl 对开启 flag 即算有 AC 管控面，含信任的
   // has_ip_control 摘要标志不得用于本列（会把纯信任策略说成 ACL 生效）。
-  assert.match(source('src/views/security/SecurityPolicies.vue'), /ip_acl_enabled === true \|\| hasIPACLControl\(d\) \? formatAclModeDetail\(ipLists\.value, d\) : '未启用'/)
+  assert.match(code('src/views/security/SecurityPolicies.vue'), /ip_acl_enabled === true \|\| hasIPACLControl\(d\) \? formatAclModeDetail\(ipLists\.value, d\) : '未启用'/)
 })
 
 test('只读态隐藏迁移入口并保留函数级守卫', () => {
@@ -100,14 +100,14 @@ test('只读态隐藏迁移入口并保留函数级守卫', () => {
 })
 
 test('关联规则与预览步骤同样补齐引用名单条目', () => {
-  const watcher = section(source('src/views/security/SecurityPolicies.vue'), 'watch([currentStep, ipACLList', 'const hasContent')
+  const watcher = section(code('src/views/security/SecurityPolicies.vue'), 'watch([currentStep, ipACLList', 'const hasContent')
   for (const step of ['IP_ACL', 'TRUST', 'BINDINGS', 'PREVIEW']) {
     assert.match(watcher, new RegExp(`WIZARD_STEP\\.${step}`))
   }
 })
 
 test('事件名称搜索命中后自动切换到策略所在 tab', () => {
-  assert.match(source('src/views/security/SecurityPolicies.vue'), /activeTypeTab\.value = policyTypeOf\(matched\)/)
+  assert.match(code('src/views/security/SecurityPolicies.vue'), /activeTypeTab\.value = policyTypeOf\(matched\)/)
 })
 
 test('自动封禁卡片主体恢复配置点击入口', () => {
@@ -133,13 +133,13 @@ test('自动封禁卡片主体与函数入口统一受只读和节点门控', ()
 })
 
 test('默认上游分支不得显示无启用上游', () => {
-  const text = source('src/components/RuleFlowDialog.vue')
+  const text = code('src/components/RuleFlowDialog.vue')
   assert.match(text, /v-else-if="pr\.upstreams === null"/)
   assert.match(text, /跟随主路由上游/)
 })
 
 test('关闭向导时复位 DNS 开关与服务器', () => {
-  const reset = section(source('src/views/Rules.vue'), 'const resetWizard = () =>', 'const beforeWizardClose')
+  const reset = section(code('src/views/Rules.vue'), 'const resetWizard = () =>', 'const beforeWizardClose')
   assert.match(reset, /wizardForm\.enable_dns_server = false/)
   assert.match(reset, /wizardForm\.dns_server = ''/)
 })
@@ -147,7 +147,7 @@ test('关闭向导时复位 DNS 开关与服务器', () => {
 test('大屏显性披露回填未完成与汇总陈旧', () => {
   // 原断言只钉 `?: boolean` 类型声明（类型契约由 vue-tsc 承担）。
   // 改为钉渲染接线：两个标志各自绑定独立横幅且文案区分（回填未完成 vs 汇总延迟）。
-  const text = source('src/views/security/ThreatScreen.vue')
+  const text = code('src/views/security/ThreatScreen.vue')
   assert.match(
     text,
     /v-if="stats\?\.backfill_incomplete"[\s\S]{0,400}?历史统计回填尚未完成/,
@@ -165,7 +165,7 @@ test('大屏显性披露回填未完成与汇总陈旧', () => {
 })
 
 test('Vite 开发代理默认 HTTP，仅显式环境开关使用 HTTPS', () => {
-  const text = source('vite.config.ts')
+  const text = code('vite.config.ts')
   // 按「臂结构」断言：条件=显式开关、默认臂（: 之后）=HTTP、开关臂（? 之后）
   // =HTTPS。不钉整段文本/缩进/换行——交换两臂或改写条件都会红，等价重构不会。
   const targetExpr = section(text, 'const devBackendTarget =', '\nexport default')
@@ -185,7 +185,7 @@ test('Vite 开发代理默认 HTTP，仅显式环境开关使用 HTTPS', () => {
 //      各 spec 做行为求值，此处只钉「视图是否真的接了实现」）----
 
 test('库计数列文案与「数量 / 大小」列义', () => {
-  const text = source('src/views/security/SecurityRules.vue')
+  const text = code('src/views/security/SecurityRules.vue')
   assert.match(text, /crsRuleCountLabel\(crsInfo\.value\.rule_count\)/)
   assert.doesNotMatch(text, /个文件/)
   assert.match(text, /label="数量 \/ 大小"/)
@@ -194,15 +194,15 @@ test('库计数列文案与「数量 / 大小」列义', () => {
 })
 
 test('爬虫豁免空引擎保存守卫（单源谓词）', () => {
-  const text = source('src/views/security/SecurityPolicies.vue')
-  assert.match(text, /if \(crawlerExemptionNeedsEngines\(\{ geoipEnabled: form\.value\.geoip_enabled, crawlerExempt: form\.value\.geoip_crawler_exempt, engines: form\.value\.geoip_crawler_engines \}\)\)/)
+  const text = code('src/views/security/SecurityPolicies.vue')
+  assert.match(text, /if \(typeAllowsStage\(1\) && crawlerExemptionNeedsEngines\(\{ geoipEnabled: form\.value\.geoip_enabled, crawlerExempt: form\.value\.geoip_crawler_exempt, engines: form\.value\.geoip_crawler_engines \}\)\)/)
   assert.match(text, /空选等于豁免「全部引擎」/)
   // 空选时的行内提示（用户不必点保存才知道语义）
   assert.match(text, /v-if="form\.geoip_crawler_engines\.length === 0"/)
 })
 
 test('主列表失败可辨识（错误态 + 横幅重试 + 空态文案切换）', () => {
-  const text = source('src/views/security/SecurityPolicies.vue')
+  const text = code('src/views/security/SecurityPolicies.vue')
   assert.match(text, /const policiesLoadError = ref\(false\)/)
   assert.match(text, /v-if="policiesLoadError" type="error"/)
   assert.match(text, /:loading="loading" @click="fetchData">立即重试/)
@@ -216,13 +216,13 @@ test('主列表失败可辨识（错误态 + 横幅重试 + 空态文案切换�
 })
 
 test('自动封禁口径文案不再自缩为「WAF 事件」', () => {
-  const events = source('src/views/security/SecurityEvents.vue')
+  const events = code('src/views/security/SecurityEvents.vue')
   assert.doesNotMatch(events, /WAF 事件固定窗口计数/)
   assert.match(events, /安全事件（IP 访问控制\/地域\/WAF\/威胁情报，已验证爬虫豁免除外）固定窗口计数/)
 })
 
 test('IP 快捷弹框全流程使用 trim 后的地址（无裸 props.ip 消费）', () => {
-  const text = source('src/views/security/IPLocationAction.vue')
+  const text = code('src/views/security/IPLocationAction.vue')
   assert.match(text, /const trimmedIp = computed\(\(\) => props\.ip\.trim\(\)\)/)
   // 裸 props.ip 的鉴别力要求「消费点」而非「出现次数」：剥注释后除归一化
   // 读取（props.ip.trim()）外不得再有任何读取——新增合法读取/注释不再误红。
@@ -238,7 +238,7 @@ test('IP 快捷弹框全流程使用 trim 后的地址（无裸 props.ip 消费�
 })
 
 test('拦截页删除重入守卫（确认前占位、finally 释放）', () => {
-  const text = source('src/views/security/SecurityBlockPages.vue')
+  const text = code('src/views/security/SecurityBlockPages.vue')
   const guard = text.indexOf('if (deletingId.value !== null) return')
   const confirm = text.indexOf('ElMessageBox.confirm(`确定删除拦截页面')
   const release = text.indexOf('deletingId.value = null')
@@ -261,7 +261,7 @@ test('阶段页覆盖写入按 skipped 归集后再回写（不谎报已覆盖�
 })
 
 test('名单详情 GET 静默，避免与全局拦截器双 toast', () => {
-  const text = source('src/views/security/SecurityRules.vue')
+  const text = code('src/views/security/SecurityRules.vue')
   const silentGets = text.match(/security\/ip-lists\/\$\{[^}]+\}`, \{ silent: true \}\)/g) ?? []
   assert.equal(silentGets.length, 2, `详情与重试两处请求都应 silent，实际 ${silentGets.length}`)
   // 本地提示保留（带「已禁用保存」动作信息）
@@ -269,7 +269,7 @@ test('名单详情 GET 静默，避免与全局拦截器双 toast', () => {
 })
 
 test('库状态未知时自动更新开关显示「—」而非默认开', () => {
-  const text = source('src/views/security/SecurityRules.vue')
+  const text = code('src/views/security/SecurityRules.vue')
   assert.match(text, /autoUpdateKnown: !crsInfoError\.value && crsInfoLoaded\.value/)
   assert.match(text, /autoUpdateKnown: threatLibLoaded\.value && !threatLibError\.value/)
   assert.match(text, /v-if="!row\.autoUpdateKnown"/)
@@ -278,7 +278,7 @@ test('库状态未知时自动更新开关显示「—」而非默认开', () =>
 
 // ---- 前端展示/契约批次：单源化与首轮误标 ----
 test('分页器形态收敛 main.css，四个视图不得再本地重定义', () => {
-  const main = source('src/styles/main.css')
+  const main = code('src/styles/main.css')
   // 选择器块内逐条匹配（不依赖单行排版：引入格式化工具不应批量假红）
   const rule = section(main, '.rules-pagination {', '}')
   assert.match(rule, /display:\s*flex/)
@@ -290,14 +290,14 @@ test('分页器形态收敛 main.css，四个视图不得再本地重定义', ()
 })
 
 test('SecurityRules 条件列用专用 class-name，不再页级 :deep 覆盖全局表格单元格', () => {
-  const text = source('src/views/security/SecurityRules.vue')
+  const text = code('src/views/security/SecurityRules.vue')
   assert.match(text, /<el-table-column label="条件" min-width="250" class-name="rule-cond-cell">/)
   assert.doesNotMatch(text, /:deep\(\.el-table \.cell:has\(\.el-tag\)\)/, '页级全局覆盖必须退役')
   assert.match(text, /\.el-table \.rule-cond-cell \.cell:has\(\.el-tag\) \{ flex-wrap: wrap; row-gap: 4px; \}/)
 })
 
 test('BasicSettings 两处 radio 行回归 el-form-item（自管标签行族已退役）', () => {
-  const text = source('src/views/settings/BasicSettings.vue')
+  const text = code('src/views/settings/BasicSettings.vue')
   assert.doesNotMatch(text, /class="form-radio-row"/, '自管标签行标记必须退役')
   assert.doesNotMatch(text, /^\.form-radio-row/m, '自管标签行样式必须退役')
   assert.match(text, /<el-form-item label="证书来源">/)
@@ -305,12 +305,12 @@ test('BasicSettings 两处 radio 行回归 el-form-item（自管标签行族已�
 })
 
 test('BasicSettings 不再局部重复定义全局 .settings-form（main.css 单源）', () => {
-  const text = source('src/views/settings/BasicSettings.vue')
+  const text = code('src/views/settings/BasicSettings.vue')
   assert.doesNotMatch(text, /\.settings-form \{/, 'main.css 已有同名规则，局部重定义必须退役')
 })
 
 test('SecurityBindingEditor 先声明 props/emits 再派生 computed', () => {
-  const text = source('src/components/SecurityBindingEditor.vue')
+  const text = code('src/components/SecurityBindingEditor.vue')
   const propsIdx = text.indexOf('const props = defineProps')
   const emitIdx = text.indexOf('const emit = defineEmits')
   const subtitleIdx = text.indexOf('const bindSubtitle = computed')
@@ -319,24 +319,24 @@ test('SecurityBindingEditor 先声明 props/emits 再派生 computed', () => {
 })
 
 test('总览总量卡片按 includes_reserved 切换口径 tooltip（含/不含私网双文案）', () => {
-  const text = source('src/views/security/SecurityOverview.vue')
+  const text = code('src/views/security/SecurityOverview.vue')
   assert.ok([...text.matchAll(/overview\.includes_reserved \? '总量含私网\/保留地址事件/g)].length >= 2, '今日拦截与今日检测两处都须按 includes_reserved 切换口径 tooltip')
   assert.ok([...text.matchAll(/与大屏同口径（分钟汇总）：不含私网\/保留地址事件/g)].length >= 2, 'rollup 口径（不含私网）文案两处都须存在')
 })
 
 test('自动封禁预置名单条目数标注含已到期条目', () => {
-  const text = source('src/views/security/SecurityRules.vue')
+  const text = code('src/views/security/SecurityRules.vue')
   assert.match(text, /v-if="row\.preset_autoban"[^>]*content="含已到期条目/, '预置名单条数须 tooltip 消歧')
 })
 
 test('useLibUpdateDialog 409 路径不得重复立即轮询', () => {
-  const text = source('src/composables/useLibUpdateDialog.ts')
+  const text = code('src/composables/useLibUpdateDialog.ts')
   assert.match(text, /const startPolling = \(\) => \{ polling\.start\(\) \}/, '起轮询只挂定时器（refreshStatus 已拉过本轮）')
   assert.doesNotMatch(text, /startPolling = \(\) => \{ polling\.resume\(\) \}/, 'resume 会立即 run，409/onOpened 路径产生重复请求')
 })
 
 test('大屏光流可用性位/恢复基线/重装复位（L8 前端三项）', () => {
-  const text = source('src/views/security/ThreatScreen.vue')
+  const text = code('src/views/security/ThreatScreen.vue')
   assert.match(text, /<div v-if="flowError || attackFlowError" class="error-banner site-unset">光流数据加载失败，正在重试…<\/div>/, '光流端点失败必须显性横幅')
   assert.match(text, /interval: ATTACK_FLOW_POLL_MS, onError: \(\) => \{ attackFlowError\.value = true \}/)
   assert.match(text, /interval: 1000, onError: \(\) => \{ flowError\.value = true \}/)
@@ -361,7 +361,7 @@ test('大屏光流可用性位/恢复基线/重装复位（L8 前端三项）', 
 // ============ 安全策略拦截页注记 / 阶段页覆盖写路径 / 预取面 ============
 
 test('拦截页注记必须过阶段能力门（stage3 off / stage1 无能力不得恒绿）', () => {
-  const text = source('src/views/security/SecurityPolicies.vue')
+  const text = code('src/views/security/SecurityPolicies.vue')
   assert.match(text, /blockPageStageCanIntercept/)
   assert.match(text, /当前配置不会产生该阶段拦截，页面不会被使用/)
   // 能力门必须参与「生效中」收集：capableResults 而非全部 results
@@ -373,7 +373,7 @@ test('拦截页注记必须过阶段能力门（stage3 off / stage1 无能力不
 })
 
 test('阶段页覆盖写前重读库值（未编辑阶段取最新，不旧快照回写）', () => {
-  const text = source('src/views/security/SecurityPolicies.vue')
+  const text = code('src/views/security/SecurityPolicies.vue')
   const reread = text.indexOf("request.get<APIResponse<Rule[]>>('/rules'")
   const batch = text.indexOf("'/rules/batch-block-pages'")
   assert.ok(reread > 0 && batch > reread, '批量写入前必须重读 /rules')
@@ -384,20 +384,20 @@ test('阶段页覆盖写前重读库值（未编辑阶段取最新，不旧快�
 })
 
 test('阶段 0 预览信任名单恒启用（与保存侧 trustEnabledForPolicyType 同口径）', () => {
-  const text = source('src/views/security/SecurityPolicies.vue')
+  const text = code('src/views/security/SecurityPolicies.vue')
   assert.match(text, /const trustEnabledInEditor = computed\(\(\) => trustEnabledForPolicyType\(editorPolicyType\.value, ipWhitelistEnabled\.value\)\)/)
   assert.match(text, /ip_whitelist_enabled: trustEnabledInEditor\.value/)
 })
 
 test('改回原值后「待重试」标记消失', () => {
-  const text = source('src/views/security/SecurityPolicies.vue')
+  const text = code('src/views/security/SecurityPolicies.vue')
   const change = member(text, 'const onStageOverrideChange = (')
   assert.match(change, /!pendingStageOverride\(caddyId, 1\) && !pendingStageOverride\(caddyId, 3\)/)
   assert.match(change, /delete nextFailed\[caddyId\]/)
 })
 
 test('掩码私钥不得误报「请提供私钥」', () => {
-  const text = source('src/views/Rules.vue')
+  const text = code('src/views/Rules.vue')
   const validate = member(text, 'const validateCertificate = async (')
   const keyEmpty = validate.indexOf('if (!keyPEM) {')
   assert.ok(keyEmpty > 0)
@@ -407,20 +407,20 @@ test('掩码私钥不得误报「请提供私钥」', () => {
 })
 
 test('信任语义单源：快捷弹框/事件详情/流程副标题共用 trustHitMode', () => {
-  const ipAction = source('src/views/security/IPLocationAction.vue')
+  const ipAction = code('src/views/security/IPLocationAction.vue')
   assert.match(ipAction, /trustHitMode\(policy\.policy_type, policy\.trust_detection\) === 'detection'\) detectionOwner/)
   assert.match(ipAction, /trustDetectionLabel: trustHitMode\(policy\.policy_type, policy\.trust_detection\)/)
 
-  const trigger = source('src/components/events/TriggerDetailDialog.vue')
+  const trigger = code('src/components/events/TriggerDetailDialog.vue')
   assert.match(trigger, /const trustModeText = computed\(\(\) => trustHitMode\(policy\.value\?\.policy_type, policy\.value\?\.trust_detection\)/)
   assert.doesNotMatch(trigger, /policy\?\.trust_detection === true \? '保留检测/)
 
-  const flow = source('src/components/RuleFlowDialog.vue')
+  const flow = code('src/components/RuleFlowDialog.vue')
   assert.match(flow, /trustHitMode\(policy\?\.policy_type, policy\?\.trust_detection\) === 'detection'/)
 })
 
 test('引擎装载失败暂停两条光流（不再每秒重复拉 backlog）', () => {
-  const text = source('src/views/security/ThreatScreen.vue')
+  const text = code('src/views/security/ThreatScreen.vue')
   const mount = member(text, 'async function mountEngine(')
   const fail = mount.indexOf('engineError.value = true')
   assert.ok(fail > 0)
@@ -436,7 +436,7 @@ test('引擎装载失败暂停两条光流（不再每秒重复拉 backlog）', 
 })
 
 test('辅助端点部分失败必须有可见横幅', () => {
-  const text = source('src/views/security/SecurityPolicies.vue')
+  const text = code('src/views/security/SecurityPolicies.vue')
   assert.match(text, /const auxLoadFailures = ref<string\[\]>\(\[\]\)/)
   assert.match(text, /部分辅助数据加载失败（\{\{ auxLoadFailures\.join\('、'\) \}\}）/)
   assert.match(text, /<el-button link type="warning"[^>]*@click="fetchData">重新加载<\/el-button>/)
@@ -446,13 +446,13 @@ test('辅助端点部分失败必须有可见横幅', () => {
 })
 
 test('阶段 2 拦截页文案按 429 语义分支', () => {
-  const text = source('src/views/security/SecurityPolicies.vue')
+  const text = code('src/views/security/SecurityPolicies.vue')
   assert.match(text, /editorPolicyType === 'stage2' \? '不使用自定义页面（429 空响应体）'/)
   assert.match(text, /d\.rate_limit_enabled[\s\S]{0,120}限流 429 返回空响应体/)
 })
 
 test('安全规则预设项可键盘操作（折叠头 button + 标签/模板键盘语义）', () => {
-  const text = source('src/views/security/SecurityRules.vue')
+  const text = code('src/views/security/SecurityRules.vue')
   assert.match(text, /<button type="button" class="preset-header" :aria-expanded="!uaCollapsed\[idx\]"/)
   assert.match(text, /<button type="button" class="preset-header" :aria-expanded="!regexCollapsed\[idx\]"/)
   assert.match(text, /class="preset-tag" role="button" tabindex="0" @click="cond\.pattern = t\.value" @keydown\.enter\.prevent="cond\.pattern = t\.value" @keydown\.space\.prevent="cond\.pattern = t\.value"/)
@@ -461,11 +461,11 @@ test('安全规则预设项可键盘操作（折叠头 button + 标签/模板键
 })
 
 test('两引擎共享国家点阵空间网格', () => {
-  const shared = source('src/utils/threatShared.ts')
+  const shared = code('src/utils/threatShared.ts')
   assert.match(shared, /export const countryGridCell = /)
   assert.match(shared, /export function buildCountryCellGrid\(/)
   for (const file of ['src/utils/threatScene.ts', 'src/utils/threatGlobe.ts']) {
-    const text = source(file)
+    const text = code(file)
     assert.match(text, /buildCountryCellGrid\(THREAT_COUNTRIES\)/, `${file} 必须走共享网格`)
     assert.match(text, /\.get\(countryGridCell\(lon, lat\)\) \?\? \[\]/, `${file} 候选必须按共享网格单元取`)
     assert.doesNotMatch(text, /for \(let ci = 0; ci < THREAT_COUNTRIES\.length; ci\+\+\) \{\n\s+const b = /, `${file} 不得逐点全表扫描`)
@@ -473,7 +473,7 @@ test('两引擎共享国家点阵空间网格', () => {
 })
 
 test('触发详情按类别/动作收敛预取面（WAF 拦截不下载 ACL 条目）', () => {
-  const text = source('src/components/events/TriggerDetailDialog.vue')
+  const text = code('src/components/events/TriggerDetailDialog.vue')
   assert.match(text, /const needExemption = row\.action !== 'blocked'/)
   assert.match(text, /const needAclEntries = kind\.value === 'acl' \|\| kind\.value === 'geo' \|\| kind\.value === 'threat'/)
   assert.match(text, /needExemption\s*\n?\s*\? request\.get<APIResponse<PolicyRow\[\]>>\('\/security\/policies\?enabled=true'/)
@@ -483,13 +483,15 @@ test('触发详情按类别/动作收敛预取面（WAF 拦截不下载 ACL 条�
 })
 
 test('明细失败位脱离展开区且按钮恒可见（可按类别重试）', () => {
-  const text = source('src/components/RuleFlowDialog.vue')
+  const text = code('src/components/RuleFlowDialog.vue')
   // 名册式：阶段 0 面板与阶段 1/2/3 面板各自必须齐备失败位/重试入口/解耦按钮
-  // （计数式 `>= 2` 无法定位「两处中少一处」）。
-  const stageZero = section(text, '<!-- 阶段 0 · 信任名单面板 -->', '<!-- 阶段 1/2/3 面板 -->')
-  const stagePanelsStart = text.indexOf('<!-- 阶段 1/2/3 面板 -->')
-  assert.ok(stagePanelsStart >= 0, '阶段 1/2/3 面板 marker 缺失')
-  const stagePanels = text.slice(stagePanelsStart)
+  // （计数式 `>= 2` 无法定位「两处中少一处」）。面板边界由 HTML 注释标记，
+  // 先在 raw 视图切片，再剥注释做代码断言。
+  const raw = source('src/components/RuleFlowDialog.vue')
+  const stageZero = stripComments(section(raw, '<!-- 阶段 0 · 信任名单面板 -->', '<!-- 阶段 1/2/3 面板 -->'))
+  const rawPanelsStart = raw.indexOf('<!-- 阶段 1/2/3 面板 -->')
+  assert.ok(rawPanelsStart >= 0, '阶段 1/2/3 面板 marker 缺失')
+  const stagePanels = stripComments(raw.slice(rawPanelsStart))
   for (const [label, panel] of [['阶段 0', stageZero], ['阶段 1/2/3', stagePanels]] as const) {
     assert.match(panel, /v-if="detailFailedSources\.length > 0" class="flow-detail-line"/, `${label} 失败位必须在面板级`)
     assert.match(panel, /@click="ensureDetails\(true\)"/, `${label} 必须有重试入口`)
@@ -506,15 +508,15 @@ test('明细失败位脱离展开区且按钮恒可见（可按类别重试）',
 test('计分动作模板分支已删除（后端合法动作仅 block/log/pass）', () => {
   const all = ['src/components/events/TriggerDetailDialog.vue', 'src/views/security/SecurityEvents.vue']
   for (const file of all) {
-    assert.equal(stripComments(source(file)).includes("action === 'score'"), false, `${file} 仍有不可达分支`)
+    assert.equal(stripComments(code(file)).includes("action === 'score'"), false, `${file} 仍有不可达分支`)
   }
 })
 
 // ---- 安全域前端可观测性批次：动作门控 / 失败态 / 明细对账 / 单源谓词 ----
 
 test('ACL 未启用的策略卡仍按模式给出名单动作（动作门先于地域文案分支）', () => {
-  const text = source('src/views/security/IPLocationAction.vue')
-  const block = section(text, 'if (!policy.ip_acl_enabled) {', '// 生效名单 = 内联 ∪ 引用列表条目')
+  const text = code('src/views/security/IPLocationAction.vue')
+  const block = codeSection('src/views/security/IPLocationAction.vue', 'if (!policy.ip_acl_enabled) {', '// 生效名单 = 内联 ∪ 引用列表条目')
   const sides = block.indexOf('const sides = aclAssociateSides(policy.ip_acl_mode)')
   const geo = block.indexOf('if (geoActive) {')
   assert.ok(sides > 0, 'ACL 未启用分支必须按 ip_acl_mode 计算动作集合')
@@ -527,7 +529,7 @@ test('ACL 未启用的策略卡仍按模式给出名单动作（动作门先于�
 })
 
 test('CRS 规则文件加载失败任何形态都给可见错误态（旧数据标注为上次结果）', () => {
-  const text = source('src/views/security/SecurityRules.vue')
+  const text = code('src/views/security/SecurityRules.vue')
   const fetch = member(text, 'const fetchRules = async () => {')
   const catchIdx = fetch.indexOf('} catch {')
   assert.ok(catchIdx > 0, 'fetchRules 必须保留 catch 分支')
@@ -539,14 +541,14 @@ test('CRS 规则文件加载失败任何形态都给可见错误态（旧数据�
 })
 
 test('大屏分级回退不含限流 429（限流不进安全事件表）', () => {
-  const sev = stripComments(member(source('src/views/security/ThreatScreen.vue'), 'function sevOf('))
+  const sev = stripComments(member(code('src/views/security/ThreatScreen.vue'), 'function sevOf('))
   assert.doesNotMatch(sev, /'429'/, '429 不进事件表，回退分支不可达')
   assert.match(sev, /zeroScoreSeverity\(ev\.rule_triggered/, '0 分行回退必须走 severityScale 单源')
   assert.doesNotMatch(sev, /\^8\\d\{5\}\$/, '回退族不得回流视图')
 })
 
 test('名单条目镜像只在缓存确有新增时重建，跨策略并集/Set 不随增删重算', () => {
-  const text = source('src/views/security/SecurityPolicies.vue')
+  const text = code('src/views/security/SecurityPolicies.vue')
   // 根因：补齐步骤此前无条件重建镜像 → 新对象身份使全部依赖 ipListEntries 的
   // computed 失效（含 N 个启用策略 × 万级条目的并集/Set），而每次下拉增删都会
   // 触发该 watcher。镜像重建必须有条件。
@@ -564,7 +566,7 @@ test('名单条目镜像只在缓存确有新增时重建，跨策略并集/Set 
 })
 
 test('安全事件列表加载失败必须有页内错误条（旧数据标注为上次结果）', () => {
-  const text = source('src/views/security/SecurityEvents.vue')
+  const text = code('src/views/security/SecurityEvents.vue')
   assert.match(text, /const eventsLoadError = ref\(false\)/)
   const fetch = member(text, 'const fetchEvents = async () => {')
   assert.match(fetch, /eventsLoadError\.value = false/)
@@ -574,10 +576,10 @@ test('安全事件列表加载失败必须有页内错误条（旧数据标注�
 })
 
 test('WAF 耗时族谓词单源（请求上下文弹框与触发详情共用 isWafDurationFamily）', () => {
-  assert.match(source('src/utils/securityStages.ts'), /export const isWafDurationFamily = \(family: TriggerStageFamily\): boolean =>/)
-  const events = source('src/views/security/SecurityEvents.vue')
+  assert.match(code('src/utils/securityStages.ts'), /export const isWafDurationFamily = \(family: TriggerStageFamily\): boolean =>/)
+  const events = code('src/views/security/SecurityEvents.vue')
   assert.match(events, /isWafDurationFamily\(triggerStageFamily\(ctxEvent\.value\?\.rule_triggered \?\? ''\)\)/)
-  const trigger = source('src/components/events/TriggerDetailDialog.vue')
+  const trigger = code('src/components/events/TriggerDetailDialog.vue')
   assert.match(trigger, /isWafDurationFamily\(triggerStageFamily\(props\.row\?\.rule_triggered \?\? ''\)\)/)
   for (const [name, text] of [['SecurityEvents', events], ['TriggerDetailDialog', trigger]] as const) {
     assert.doesNotMatch(text, /\['wafCrs', 'wafCustom', 'body'\]|\['waf-crs', 'waf-custom', 'body'\]/, `${name} 仍各自硬编码 WAF 耗时族`)
@@ -585,8 +587,8 @@ test('WAF 耗时族谓词单源（请求上下文弹框与触发详情共用 isW
 })
 
 test('CRS 源码片段定位单源在 securityStages（本地子串匹配实现退役）', () => {
-  assert.match(source('src/utils/securityStages.ts'), /export const extractCrsRuleSnippet = /)
-  const trigger = source('src/components/events/TriggerDetailDialog.vue')
+  assert.match(code('src/utils/securityStages.ts'), /export const extractCrsRuleSnippet = /)
+  const trigger = code('src/components/events/TriggerDetailDialog.vue')
   assert.match(trigger, /extractCrsRuleSnippet\(res\.data\?\.content \|\| '', ev\.rule_triggered\)/)
   assert.doesNotMatch(trigger, /const extractRuleSnippet = /)
 })

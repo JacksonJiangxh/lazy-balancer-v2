@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { clusterWriteBlocked } from '../src/utils/clusterWriteGate.ts'
-import { section, source } from './_helpers.ts'
+import { section, code } from './_helpers.ts'
 
 // stores/auth 的 readOnlyReason 先判节点模式（slave 优先于角色短路）：
 // 从节点上任何角色都只会得到 'slave'。旧实现只认 non-admin/unknown，
@@ -35,7 +35,7 @@ test('角色缺失按只读处理（信息未就绪不得呈现可写）', () =>
 })
 
 test('视图消费单源：isReadOnlyProp 不再自行拼装 reason 集合', () => {
-  const page = source('src/views/settings/ClusterSettings.vue')
+  const page = code('src/views/settings/ClusterSettings.vue')
   const block = section(page, 'const isReadOnlyProp = computed', 'const clusterModeChanging')
   assert.match(block, /clusterWriteBlocked\(/)
   assert.match(block, /role: authStore\.user\?\.role/, '角色必须独立参与判定')

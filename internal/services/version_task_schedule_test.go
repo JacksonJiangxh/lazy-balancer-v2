@@ -145,6 +145,14 @@ func TestVersionTasks_slaveRoleSuppressesTick(t *testing.T) {
 			if after := versionTableNextUpdate(table); after != before {
 				t.Fatalf("从节点不得推进排程槽: before=%q after=%q", before, after)
 			}
+			// 正向控制：同一 tick 循环在主角态必须真的调用 fetch（否则上面的
+			// 负断言可能只是循环根本没跑）。DB 与引擎角色同时翻转，避免 60s
+			// 角色对账把引擎翻回从角色。
+			if _, err := db.DB.Exec(`UPDATE global_config SET is_master=1 WHERE id=1`); err != nil {
+				t.Fatal(err)
+			}
+			te.SetRole(true)
+			waitForCond(t, 5*time.Second, func() bool { return calls.Load() > 0 })
 		})
 	}
 }
@@ -223,7 +231,10 @@ func TestVersionTasks_firstSlotUsesConfiguredSchedule(t *testing.T) {
 	if _, err := db.DB.Exec(`UPDATE security_crs_version SET next_update='' WHERE id=1`); err != nil {
 		t.Fatal(err)
 	}
-	want := versionTableNextSlot("security_crs_version", time.Now().UTC())
+	// 期望值由独立测试过的排程原语（NextScheduledSlot 的日历/时区矩阵）直接
+	// 计算：调用生产 versionTableNextSlot 作期望是自证（排程读取/格式化错位时
+	// 两侧同错仍绿）。
+	want := NextScheduledSlot(time.Now().UTC(), []int{2}, "04:30", CurrentLocation()).UTC().Format(crsTimeLayout)
 	armSecurityLibraryFirstSlots()
 	if got := versionTableNextUpdate("security_crs_version"); got != want {
 		t.Fatalf("首槽=%q, want 配置化排程槽 %q", got, want)

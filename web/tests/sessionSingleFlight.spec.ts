@@ -7,6 +7,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { createSessionSingleFlight } from '../src/utils/sessionSingleFlight.ts'
+import { waitForMicrotasks } from './_helpers.ts'
 
 test('CRS 新对话框会话不会被旧单飞请求饿死', async () => {
   // 场景：会话 1 的请求在途 → 会话 2 打开（旧请求失效）→ 旧请求后到。
@@ -71,23 +72,28 @@ test('失败不闩死：同会话再次 ensure 重试', async () => {
 })
 
 test('旧会话失败不消耗新会话的加载态', async () => {
+  const loads: number[] = []
   const first = Promise.withResolvers<string>()
   const second = Promise.withResolvers<string>()
   const loadingStates: boolean[] = []
   const applied: string[] = []
   const loader = createSessionSingleFlight<string>({
-    load: (session) => (session === 1 ? first.promise : second.promise),
+    load: (session) => { loads.push(session); return session === 1 ? first.promise : second.promise },
     apply: (value) => { applied.push(value) },
     onLoadingChange: (value) => { loadingStates.push(value) },
   })
   const p1 = loader.ensure(1)
   const p2 = loader.ensure(2)
   first.reject(new Error('stale failure'))
-  await Promise.resolve()
+  // 旧会话失败后必须链式补取新会话：等「第二次 load 已发起」这个可观测状态，
+  // 而不是猜一次 await 够不够（猜少了 second.resolve 会先于链式 start 生效，
+  // 断言在未收敛时通过）。
+  await waitForMicrotasks(() => loads.length === 2, '旧会话失败后必须链式补取新会话')
   second.resolve('fresh')
   await Promise.all([p1, p2])
   assert.deepEqual(applied, ['fresh'])
   assert.equal(loadingStates.at(-1), false, '最终必须收尾为未加载态')
+  assert.equal(loader.loadedSession(), 2)
 })
 
 

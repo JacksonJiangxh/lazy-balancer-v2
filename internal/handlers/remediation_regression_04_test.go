@@ -36,7 +36,7 @@ func TestOIDCJWKSProbe(t *testing.T) {
 		_, _ = w.Write([]byte(`{"keys":[{"kty":"RSA"}]}`))
 	}))
 	defer ok.Close()
-	if err := probeOIDCJWKS(ok.URL); err != nil {
+	if err := probeOIDCJWKS(ok.URL, ok.URL); err != nil {
 		t.Fatalf("合法 JWKS 应通过: %v", err)
 	}
 
@@ -44,7 +44,7 @@ func TestOIDCJWKSProbe(t *testing.T) {
 		_, _ = w.Write([]byte(`{"keys":[]}`))
 	}))
 	defer empty.Close()
-	if err := probeOIDCJWKS(empty.URL); err == nil {
+	if err := probeOIDCJWKS(empty.URL, empty.URL); err == nil {
 		t.Fatalf("空密钥集必须失败")
 	}
 
@@ -52,10 +52,10 @@ func TestOIDCJWKSProbe(t *testing.T) {
 		http.Error(w, "nope", http.StatusNotFound)
 	}))
 	defer broken.Close()
-	if err := probeOIDCJWKS(broken.URL); err == nil {
+	if err := probeOIDCJWKS(broken.URL, broken.URL); err == nil {
 		t.Fatalf("非 200 必须失败")
 	}
-	if err := probeOIDCJWKS(""); err == nil {
+	if err := probeOIDCJWKS("", ""); err == nil {
 		t.Fatalf("缺失 jwks_uri 必须失败")
 	}
 }
@@ -434,6 +434,7 @@ func TestReconcileThreatFiles(t *testing.T) {
 	write("threat-ustc.iplist.fast")
 	write("threat-stray.iplist")
 	write("threat-kept.iplist")
+	write("threat-kept.iplist.fast")
 
 	tables := map[string][]map[string]any{
 		"security_threat_sources": {
@@ -446,11 +447,20 @@ func TestReconcileThreatFiles(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(wafDir, "threat-ustc.iplist")); !os.IsNotExist(err) {
 		t.Fatalf("空源 ustc 的旧文件必须删除")
 	}
+	// .iplist 与 .fast 是成对文件（removePair 双删）：只断言文本删除时，
+	// 二进制残留会让从节点 .fast 回退继续用已删除源的前缀集（删不掉=源表
+	// 收敛假成功）。
+	if _, err := os.Stat(filepath.Join(wafDir, "threat-ustc.iplist.fast")); !os.IsNotExist(err) {
+		t.Fatalf("空源 ustc 的 .fast 副本必须一并删除（否则从节点回退读到幽灵前缀集）")
+	}
 	if _, err := os.Stat(filepath.Join(wafDir, "threat-stray.iplist")); !os.IsNotExist(err) {
 		t.Fatalf("源表已不存在的 stray 文件必须删除")
 	}
 	if _, err := os.Stat(filepath.Join(wafDir, "threat-kept.iplist")); err != nil {
 		t.Fatalf("保留源文件被误删: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(wafDir, "threat-kept.iplist.fast")); err != nil {
+		t.Fatalf("保留源的 .fast 被误删: %v", err)
 	}
 	if len(warnings) == 0 {
 		t.Fatalf("删除动作必须产出可见警告")

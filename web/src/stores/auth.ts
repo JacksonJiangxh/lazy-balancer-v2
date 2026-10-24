@@ -77,6 +77,41 @@ export const useAuthStore = defineStore('auth', () => {
   // 复写 `nodeMode==='slave'`/`readOnlyReason==='slave'` 派生，收敛到本 getter。
   const isSlaveNode = computed(() => nodeMode.value === 'slave')
 
+  // ── 跨标签页会话同步 ──
+  // 令牌是 localStorage 与内存 ref 的双源：同标签页登出只清本页两份，其余
+  // 标签页的 store 仍握着旧 JWT（界面继续渲染主界面），而请求层只读
+  // localStorage（已无令牌）→ 后续每次操作静默 401：既不弹错误也不弹重登，
+  // 用户只能手动刷新。storage 事件由**其它**标签页写 localStorage 时触发，
+  // 正是补上这一跳的时机（本标签页自己的写入不会触发本事件）。
+  const onStorageChange = (event: StorageEvent): void => {
+    // key === null = 另一标签页执行了 localStorage.clear()（会话同样失效）
+    if (event.key !== null && event.key !== 'token') return
+    const stored = localStorage.getItem('token')
+    if (stored === token.value) return
+    clearUserRetryTimer()
+    clearConfigRetryTimer()
+    if (!stored) {
+      // 另一标签页已登出（或会话失效清理）：本页同步退出，App.vue 的登录页
+      // 判据（!authStore.token）立即生效。intentionalLogout 抑制在途请求的
+      // 「会话失效」弹窗——这是主动同步，不是会话异常。
+      intentionalLogout.value = true
+      user.value = null
+      token.value = null
+      nodeMode.value = null
+      return
+    }
+    // 另一标签页建立了新会话（登录 / 切换账号 / MFA step-up 刷新令牌）：跟随
+    // 令牌并重拉用户与节点模式——沿用本页旧 user 会把上一账号的权限继续渲染。
+    intentionalLogout.value = false
+    user.value = null
+    nodeMode.value = null
+    token.value = stored
+    void init()
+  }
+
+  // 仅浏览器环境绑定（node 单测/SSR 无 window）。
+  if (typeof window !== 'undefined') window.addEventListener('storage', onStorageChange)
+
   let userRetryTimer: number | null = null
   // 隐藏页停表留下的待补查标记：定时器在后台到期时只记标记、不排下一轮，
   // 由 visibilitychange 补查消费（与 /config 的「hidden 停表 + visible 补查」

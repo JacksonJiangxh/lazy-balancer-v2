@@ -242,3 +242,37 @@ func headerValuesContain(values []string, want string) bool {
 	}
 	return false
 }
+
+// Accept-Encoding 的 q 值语义（RFC 9110 §12.5.3）：q=0 表示「不可接受」。
+// 只做子串包含会把 gzip 回给明确声明不要 gzip 的客户端，非浏览器客户端
+// （脚本/老 SDK）解不开 body。
+func TestGzipMiddleware_acceptEncodingQValues(t *testing.T) {
+	router := newGzipCorsRouter()
+	cases := []struct {
+		name           string
+		acceptEncoding string
+		wantGzip       bool
+	}{
+		{name: "显式 q=0 拒绝", acceptEncoding: "gzip;q=0", wantGzip: false},
+		{name: "通配 q=0 且未列 gzip", acceptEncoding: "*;q=0", wantGzip: false},
+		{name: "低权重仍接受", acceptEncoding: "gzip;q=0.5", wantGzip: true},
+		{name: "通配允许", acceptEncoding: "*", wantGzip: true},
+		{name: "显式 gzip q=0 优先于通配", acceptEncoding: "gzip;q=0, *;q=1", wantGzip: false},
+		{name: "x-gzip 别名", acceptEncoding: "x-gzip", wantGzip: true},
+		{name: "列表中的 gzip 可接受", acceptEncoding: "br, gzip;q=0.8", wantGzip: true},
+		{name: "仅 identity", acceptEncoding: "identity", wantGzip: false},
+		{name: "未声明", acceptEncoding: "", wantGzip: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			response := performGzipRequest(router, http.MethodGet, "/ok", tc.acceptEncoding)
+			if response.Code != http.StatusOK {
+				t.Fatalf("status=%d, want 200", response.Code)
+			}
+			compressed := response.Header().Get("Content-Encoding") == "gzip"
+			if compressed != tc.wantGzip {
+				t.Fatalf("Accept-Encoding=%q: compressed=%t, want %t", tc.acceptEncoding, compressed, tc.wantGzip)
+			}
+		})
+	}
+}

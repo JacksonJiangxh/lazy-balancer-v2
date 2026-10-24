@@ -1,94 +1,59 @@
 package dnsproviders
 
 import (
-	"context"
-	"errors"
 	"strings"
 	"testing"
-
-	"lazy-balancer-v2/internal/dnsprovider"
 )
 
-func TestDNSPodCredentials(t *testing.T) {
-	p, ok := Get("dnspod")
-	if !ok {
-		t.Fatal("dnspod not registered")
-	}
-	_, err := p.BuildCredentialsJSON(map[string]string{})
-	if err == nil {
-		t.Fatal("expected error for empty credentials")
-	}
-	creds, err := p.BuildCredentialsJSON(map[string]string{"auth_mode": "dnspod", "app_id": "123", "app_token": "abc"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if creds["api_token"] != "123,abc" {
-		t.Fatalf("expected api_token 123,abc, got %v", creds["api_token"])
-	}
-	tencent, err := p.BuildCredentialsJSON(map[string]string{"auth_mode": "tencent_cloud", "secret_id": "sid", "secret_key": "skey"})
-	if err != nil {
-		t.Fatalf("unexpected error for tencent cloud: %v", err)
-	}
-	// tencent canonical 不再携带死字段 api_token(消费端只读
-	// secret_id/secret_key)。
-	if _, exists := tencent["api_token"]; exists {
-		t.Fatalf("tencent canonical must not carry dead api_token, got %v", tencent)
-	}
+// fakeProvider 只实现注册期需要的 Code/Name/ModuleName；其余能力本用例不触达。
+type fakeProvider struct {
+	BaseProvider
+	code string
 }
 
-type cleanupFailingProvider struct{}
-
-func (cleanupFailingProvider) Present(context.Context, string, string, string, int) error { return nil }
-func (cleanupFailingProvider) CleanUp(context.Context, string, string) error {
-	return errors.New("cleanup failed")
+func (p *fakeProvider) Code() string                        { return p.code }
+func (p *fakeProvider) Name() string                        { return p.code }
+func (p *fakeProvider) ModuleName() string                  { return "module." + p.code }
+func (p *fakeProvider) CredentialFields() []CredentialField { return nil }
+func (p *fakeProvider) BuildCredentialsJSON(map[string]string) (map[string]interface{}, error) {
+	return nil, nil
 }
 
-func TestDNSPod_Validate_returns_cleanup_error(t *testing.T) {
-	// Given
-	originalFactory := newDNSProviderFromCredentials
-	newDNSProviderFromCredentials = func(string) (dnsprovider.Provider, error) {
-		return cleanupFailingProvider{}, nil
-	}
-	t.Cleanup(func() { newDNSProviderFromCredentials = originalFactory })
-	provider := &DNSPod{}
+var _ Provider = (*fakeProvider)(nil)
 
-	// When
-	err := provider.Validate(context.Background(), map[string]string{"auth_mode": "dnspod", "app_id": "123", "app_token": "abc"}, "example.com")
-
-	// Then
-	if err == nil || !strings.Contains(err.Error(), "cleanup failed") {
-		t.Fatalf("cleanup error=%v, want cleanup failure", err)
+// 重复 Code 是 init 期复制粘贴漏改的典型形态：此前静默覆盖（List 少一项、
+// 字段表与 Validate 来自不同实现）。注册期必须 panic 快速失败。
+func TestRegister_duplicateCodePanics(t *testing.T) {
+	const code = "test-dup-provider-97"
+	Register(&fakeProvider{code: code})
+	got, ok := Get(code)
+	if !ok || got.Code() != code {
+		t.Fatalf("首次注册未生效: %v %v", got, ok)
 	}
+
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			t.Fatal("重复 Code 注册必须 panic（启动期快速失败）")
+		}
+		if message, _ := recovered.(string); !strings.Contains(message, "duplicate provider code") || !strings.Contains(message, code) {
+			t.Fatalf("panic 文案=%v，必须点名 duplicate provider code 与冲突 Code", recovered)
+		}
+	}()
+	Register(&fakeProvider{code: code})
 }
 
-// 原断言 len(List())==1 既是脆性计数（新增任何 DNS
-// 提供商即失败），又不验证注册表语义。改为钉「Get 命中 + List 含 dnspod + List
-// 非空 + 按 Code 升序」。
-func TestListProviders(t *testing.T) {
-	provider, ok := Get("dnspod")
-	if !ok || provider == nil {
-		t.Fatal("dnspod must be registered")
-	}
-	if provider.Code() != "dnspod" {
-		t.Fatalf("Get(dnspod).Code()=%q, want dnspod", provider.Code())
-	}
-	if _, ok := Get("no-such-provider"); ok {
-		t.Fatal("unknown provider code must not resolve")
-	}
+// 注册成功且 List 按 Code 排序（map 遍历序不稳定会让响应顺序随进程漂移）。
+func TestList_sortedByCode(t *testing.T) {
 	list := List()
-	if len(list) == 0 {
-		t.Fatal("List() must not be empty")
+	if len(list) < 2 {
+		t.Fatalf("注册表过小（%d）——扫描面失效", len(list))
 	}
-	found := false
-	for i, item := range list {
-		if item.Code() == "dnspod" {
-			found = true
+	last := ""
+	for _, p := range list {
+		if p.Code() <= last {
+			t.Fatalf("List 未按 Code 严格递增排序: %q 之后是 %q", last, p.Code())
 		}
-		if i > 0 && list[i-1].Code() > item.Code() {
-			t.Fatalf("List() codes=%v, want 按 Code 升序", []string{list[i-1].Code(), item.Code()})
-		}
-	}
-	if !found {
-		t.Fatalf("List() must include dnspod, got %d providers", len(list))
+		last = p.Code()
 	}
 }

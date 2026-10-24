@@ -23,10 +23,18 @@ export const formatDateParts = (d: Date, formatter: Intl.DateTimeFormat, withTim
 
 // DB 墙钟串（"YYYY-MM-DD HH:mm:ss"，UTC 存储）→ epoch ms。
 // 空格分隔格式在 Safari 裸 new Date 返回 NaN——统一替换为显式 UTC ISO 再解析；
-// 解析失败返回 null，调用方自行兜底。date.ts 的 parseDateValue 同此规范化（本模块
-// 零依赖，供无法加载 auth store 链的模块/测试共用）。
+// 解析失败返回 null，调用方自行兜底。
+//
+// 本模块是「DB 墙钟 → epoch」的**唯一内核**：utils/date.ts 的 parseDbTimeMs
+// 在它之上叠 ISO 白名单（区分「DB 墙钟串」与「人读文本」），threatFlowRules 的
+// flowTimestamp 把 null 映射为 NaN。三者接受集合的差异只有白名单这一层，规范化
+// 与解析不得各写一份（历史上三份实现已漂移）。
+
+/** DB 墙钟串 → 显式 UTC 的 ISO 串（其余形态原样返回）。 */
+export const normalizeDbWallClock = (value: string): string =>
+  /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?$/.test(value) ? `${value.replace(' ', 'T')}Z` : value
+
 export const parseDbDateMs = (value: string): number | null => {
-  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2})?$/.test(value) ? value.replace(' ', 'T') + 'Z' : value
-  const ms = new Date(normalized).getTime()
+  const ms = new Date(normalizeDbWallClock(value)).getTime()
   return Number.isNaN(ms) ? null : ms
 }
