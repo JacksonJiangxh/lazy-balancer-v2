@@ -1,7 +1,7 @@
 # 编译阶段固定在构建机架构执行（--platform=$BUILDPLATFORM）：buildx 多架构构建
 # 不会为目标架构起 QEMU 跑 Go 工具链（跨架构编译慢数倍）。产物架构由下方
 # GOOS/GOARCH 显式指定；CGO_ENABLED=0 使交叉编译无需目标架构的 C 工具链。
-FROM --platform=$BUILDPLATFORM golang:1.26.9-alpine@sha256:3082400e369fa24d5fc60bca20edab3f6d604e0c5a690ec66b295eff4dd87ade AS xcaddy-builder
+FROM --platform=$BUILDPLATFORM golang:1.26.10-alpine@sha256:27f2d3b83cfc5803c8078f8e730af0f7c431bf067afaec8f60a36fb763187cba AS xcaddy-builder
 RUN apk add --no-cache git
 # GOPROXY 逗号多级回退：阿里云 404/410 时依次回落 goproxy.cn、直连；
 # 校验不符类瞬态错误由下方 xcaddy build 的重试循环兜底
@@ -50,6 +50,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       --with github.com/mholt/caddy-l4@v0.1.2 \
       --with github.com/caddyserver/transform-encoder@ba4124974830222da7f12a091cf11ddf4d49363f \
       --with github.com/mholt/caddy-ratelimit@v0.1.0 \
+      --replace github.com/go-chi/chi/v5=github.com/go-chi/chi/v5@v5.4.0 \
       --with github.com/corazawaf/coraza-caddy/v2@v2.6.2 \
       --with lazy-balancer-v2/caddygeoip=./caddygeoip \
       --with lazy-balancer-v2/caddydeps=./caddydeps \
@@ -64,7 +65,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
   [ -f /app/caddy ] || { echo ">>> 构建成功但 /app/caddy 未生成" >&2; exit 1; }
 # 构建期断言：镜像扫描要求的最低依赖版本未被 MVS 抬升到位则直接失败
 # （版本下限：grpc>=v1.83.2、otel>=v1.45、x/net>=v0.58、x/crypto>=v0.56、
-#  cel.dev/cel-go>=v0.32.0——Caddy v2.11.7 上游同值，caddydeps 钉同版防传递
+#  cel.dev/cel-go>=v0.32.0、go-chi/chi/v5>=v5.4.0——Caddy v2.11.7 上游同值，caddydeps 钉同版防传递
 #  抬偏；注意模块路径是 cel.dev/cel-go，github.com/google/cel-go 是另一个
 #  模块路径，钉旧路径不参与 MVS）；go version -m 各列以 TAB 分隔，用 awk 的 ge()
 #  做逐段数值化语义比较，不设上限，依赖升到大版本也不会误报。
@@ -75,11 +76,12 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 #  [v3.8.1, v3.9) 区间断言（ge(v,"v3.8.1") && !ge(v,"v3.9.0")）——此处刻意设
 #  上限，升级需同步复核 blocked_counter.go 的 len(ID)==16 判定与本断言。
 RUN go version -m /app/caddy | tee /tmp/caddy-mods.txt && \
-    awk -F'\t' 'function ge(v, f,  a, b, av, bv, i) { split(substr(v, 2), a, "."); split(substr(f, 2), b, "."); for (i = 1; i <= 3; i++) { av = a[i] + 0; bv = b[i] + 0; if (av > bv) return 1; if (av < bv) return 0 } return 1 } { for (i = 1; i < NF; i++) { if ($i == "google.golang.org/grpc") ok1 = ge($(i+1), "v1.83.2"); else if ($i == "go.opentelemetry.io/otel") ok2 = ge($(i+1), "v1.45.0"); else if ($i == "golang.org/x/net") ok3 = ge($(i+1), "v0.58.0"); else if ($i == "golang.org/x/crypto") ok4 = ge($(i+1), "v0.56.0"); else if ($i == "cel.dev/cel-go") ok5 = ge($(i+1), "v0.32.0"); else if ($i == "github.com/corazawaf/coraza/v3") ok6 = (ge($(i+1), "v3.8.1") && !ge($(i+1), "v3.9.0")) } } END { exit (ok1 && ok2 && ok3 && ok4 && ok5 && ok6) ? 0 : 1 }' /tmp/caddy-mods.txt
+    grep -q 'go1.26.10' /tmp/caddy-mods.txt || { echo ">>> Caddy 未使用 go1.26.10 构建" >&2; exit 1; }; \
+    awk -F'\t' 'function ge(v, f,  a, b, av, bv, i) { split(substr(v, 2), a, "."); split(substr(f, 2), b, "."); for (i = 1; i <= 3; i++) { av = a[i] + 0; bv = b[i] + 0; if (av > bv) return 1; if (av < bv) return 0 } return 1 } { for (i = 1; i < NF; i++) { if ($i == "google.golang.org/grpc") ok1 = ge($(i+1), "v1.83.2"); else if ($i == "go.opentelemetry.io/otel") ok2 = ge($(i+1), "v1.45.0"); else if ($i == "golang.org/x/net") ok3 = ge($(i+1), "v0.58.0"); else if ($i == "golang.org/x/crypto") ok4 = ge($(i+1), "v0.56.0"); else if ($i == "cel.dev/cel-go") ok5 = ge($(i+1), "v0.32.0"); else if ($i == "github.com/corazawaf/coraza/v3") ok6 = (ge($(i+1), "v3.8.1") && !ge($(i+1), "v3.9.0")); else if ($i == "github.com/go-chi/chi/v5") ok7 = ge($(i+1), "v5.4.0") } } END { exit (ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7) ? 0 : 1 }' /tmp/caddy-mods.txt
 
 # Build Go backend
 # 与 xcaddy-builder 阶段同理：编译在构建机架构执行，产物平台由 GOOS/GOARCH 指定。
-FROM --platform=$BUILDPLATFORM golang:1.26.9-alpine@sha256:3082400e369fa24d5fc60bca20edab3f6d604e0c5a690ec66b295eff4dd87ade AS backend
+FROM --platform=$BUILDPLATFORM golang:1.26.10-alpine@sha256:27f2d3b83cfc5803c8078f8e730af0f7c431bf067afaec8f60a36fb763187cba AS backend
 WORKDIR /app
 # 交叉编译目标（buildx 预定义参数；无 buildx 时 TARGETARCH 为空则回落构建机架构）
 ARG TARGETOS=linux
@@ -137,10 +139,11 @@ WORKDIR /app/cmd/server
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH:-$(go env GOARCH)}" \
-    go build -trimpath -ldflags="-s -w" -o lazy-balancer
+    go build -trimpath -ldflags="-s -w" -o lazy-balancer && \
+    go version -m lazy-balancer | grep -q 'go1.26.10' || { echo ">>> 后端二进制未使用 go1.26.10 构建" >&2; exit 1; }
 
 # Final image
-FROM alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+FROM alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
 # 版本号注入（ARG VERSION + ENV APP_VERSION）刻意放在下方 CRS/xdb 下载层之后
 # ——见该层前的层序说明。此处不得放 ENV：版本号每次发版必变，提前注入会让
 # 之后所有外网下载层缓存失效。
@@ -154,7 +157,15 @@ FROM alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4c
 # useradd/usermod/groupadd 等调用，镜像内无消费方。
 # zlib 钉版 1.3.2-r1：alpine 3.24.2 基础镜像快照携带 r0，r1 为上游安全修复——
 # 沿 openssl 钉版先例显式升级（sqlite 依赖隐式装入 zlib）。
-RUN apk add --no-cache ca-certificates sqlite tzdata openssl=3.5.9-r0 zlib=1.3.2-r1
+# 安全修复（CVE 扫描）：musl 1.2.6-r6 目前只存在于 alpine edge 仓库——3.24
+# 分支最新仍为 r3。这里只对 musl/musl-utils 两个包指定 edge 仓库并精确钉版，
+# 基础系统（busybox/apk/openssl/zlib）仍来自 3.24.3；实测仅这两个包升级，
+# apk 正常运行。edge 若移除 r6，构建在此显性失败（不会静默用回 r3）。
+RUN apk add --no-cache ca-certificates sqlite tzdata openssl=3.5.9-r0 zlib=1.3.2-r1 && \
+    apk add --no-cache --repository https://dl-cdn.alpinelinux.org/alpine/edge/main \
+      musl=1.2.6-r6 musl-utils=1.2.6-r6 && \
+    apk list -I | grep -Eq '^musl-1\.2\.6-r6 ' && \
+    apk list -I | grep -Eq '^musl-utils-1\.2\.6-r6 '
 WORKDIR /app
 
 # —— 层序：慢变 + 外网层前移 ——
