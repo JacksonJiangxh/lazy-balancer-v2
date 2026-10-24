@@ -4,7 +4,7 @@
 //   ③ 省板包含：10 国省级 bbox ⊆ 国家 bbox ±18°（数据级，含中国高精度省界）
 //   ④ 下钻口径：统一倍率常量 / 主环取景中心 / 南界钳制（已退役的按国自适应
 //      fitDrillZoom 不再有生产消费方——v2.3.8 用户裁定统一倍率）
-//   ④b 反日界线 unwrap：俄罗斯主环 bbox 不跨全宽
+//   ④b/⑤ 反日界线：俄罗斯主环 bbox 不跨全宽（数据已包裹）；合成环驱动 unwrap 分支见 ⑤b
 //   ⑥ 地球球面逆投影往返：sphereSurfacePoint(正投影 NDC) 还原经纬度（含西半球
 //      wrap、高纬极区与背向射线 null）
 //
@@ -423,12 +423,28 @@ test('③省板包含：10 国省级 bbox ⊆ 国家 bbox ±18°（拦截生成/
   }
 })
 
-test('⑤反日界线 unwrap：俄罗斯主环 bbox 不再跨全宽', () => {
+test('⑤反日界线：数据本身已包裹——俄罗斯主环 span<180 与 unwrap 分支无关', () => {
   const c = WORLD_COUNTRIES.find((x) => x.name === '俄罗斯')
   assert.ok(c)
   const b = principalBounds(c.polys)
   const span = b.maxLon - b.minLon
-  assert.ok(span < 180, `俄罗斯主环 bbox span ${span.toFixed(1)}° 仍≈全宽（unwrap 失效）`)
+  assert.ok(span < 180, `俄罗斯主环 bbox span ${span.toFixed(1)}° 仍≈全宽`)
+})
+
+test('⑤b 合成跨日界线环：principalBounds 的 ±180 unwrap 分支真正生效', () => {
+  // 生产数据里没有任何业务国家的主环跨 ±180（唯一跨界的南极洲已剔出
+  // THREAT_COUNTRIES），所以 ⑤ 的 span<180 是数据已包裹的结果，不能当作
+  // 「unwrap 已验证」的证据。这里用合成环驱动该分支：未经 unwrap 的 bbox 是
+  // -170..170（span 340），unwrap 后应是 170..190（span 20）。
+  const ring = [170, 60, -170, 60, -170, 65, 170, 65]
+  const b = principalBounds([[ring]])
+  assert.equal(b.minLon, 170, '负经度 +360 平移后西界应为 170')
+  assert.equal(b.maxLon, 190, '东界应为 190（=-170+360）')
+  assert.equal(b.maxLon - b.minLon, 20, 'span 必须收敛到真实宽度（未 unwrap 时为 340）')
+  assert.equal(b.minLat, 60)
+  assert.equal(b.maxLat, 65)
+  // 取景中心落在 unwrap 窗内（180±10），不得被甩到 0 附近的对侧
+  assert.equal((b.minLon + b.maxLon) / 2, 180)
 })
 test('2D 光流池满时拒绝新弧线，不淘汰已开始动画', () => {
   const src = source('src/utils/threatScene.ts')

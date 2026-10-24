@@ -5,8 +5,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1347,14 +1349,17 @@ func TestListSecurityEvents_errorShapeUnified(t *testing.T) {
 // 列表 16KB 裁剪与采集 64KB 裁剪的丢弃计数键分离：采集计数键原样保留，
 // 列表裁剪计入独立键（前端按来源分文案——并入同一键会把 16KB 列表裁剪
 // 误标为「超出 64KB 采集上限」）。
-func TestTruncateEventListHeaders_listDropsUseSeparateKey(t *testing.T) {
+//
+// 入参来自 SQL 侧 cap+1 字节前缀（超限行的列值必然被切断）：前缀内的完整
+// 成员原样保留，被切断的尾部键数=总键数−已解出键数。
+func TestTruncateEventListHeaders_prefixKeepsCompleteMembersAndCountsDropped(t *testing.T) {
 	headers := map[string][]string{
 		securityEventDroppedHeadersKey: {"2"}, // 采集侧已丢弃 2 条
 		"Host":                         {"a.example.com"},
 	}
-	// 大量长键名短值头：键名开销本身超 16KB（值裁剪救不回），强制走丢条目路径。
-	for i := range 2000 {
-		headers["X-Trace-Header-"+strings.Repeat("k", 40)+"-"+time.Duration(i).String()] = []string{"v"}
+	// 大量长键名短值头：序列化后远超 16KB（超限行只会取回前缀）。
+	for i := range time.Duration(2000) {
+		headers["x-trace-header-"+strings.Repeat("k", 40)+"-"+i.String()] = []string{"v"}
 	}
 	raw, err := json.Marshal(headers)
 	if err != nil {
@@ -1363,26 +1368,77 @@ func TestTruncateEventListHeaders_listDropsUseSeparateKey(t *testing.T) {
 	if len(raw) <= securityEventListFieldCap {
 		t.Fatalf("夹具必须超过列表上限: %d", len(raw))
 	}
-	got := truncateEventListHeaders(string(raw))
+	prefix := string(raw[:securityEventListFieldCap+1])
+
+	got := truncateEventListHeaders(prefix, len(headers))
 	if len(got) > securityEventListFieldCap {
 		t.Fatalf("截断后 len=%d 超过列表上限 %d", len(got), securityEventListFieldCap)
 	}
 	var roundTrip map[string][]string
 	if err := json.Unmarshal([]byte(got), &roundTrip); err != nil {
-		t.Fatalf("列表截断必须保持合法 JSON: %v", err)
+		t.Fatalf("前缀裁剪必须保持合法 JSON: %v", err)
 	}
 	if values := roundTrip[securityEventDroppedHeadersKey]; len(values) != 1 || values[0] != "2" {
 		t.Fatalf("采集 64KB 计数键必须原样保留（不并入）: %v", roundTrip)
 	}
-	if values := roundTrip[securityEventListDroppedHeadersKey]; len(values) != 1 || values[0] == "" || values[0] == "0" {
+	kept := len(roundTrip)
+	if _, present := roundTrip[securityEventListDroppedHeadersKey]; present {
+		kept--
+	}
+	if values := roundTrip[securityEventListDroppedHeadersKey]; len(values) != 1 {
 		t.Fatalf("列表 16KB 裁剪必须计入独立键: %v", roundTrip)
+	} else if dropped, err := strconv.Atoi(values[0]); err != nil || dropped != len(headers)-kept {
+		t.Fatalf("丢失计数=%q, want 总键数(%d)−保留键数(%d)", values[0], len(headers), kept)
+	}
+	// 完整成员的值不得被改写（只丢尾部键）
+	for key, values := range roundTrip {
+		if key == securityEventListDroppedHeadersKey {
+			continue
+		}
+		if len(values) != len(headers[key]) {
+			t.Fatalf("头 %s 值条目数变化: %d → %d", key, len(headers[key]), len(values))
+		}
+		for i, value := range values {
+			if value != headers[key][i] {
+				t.Fatalf("头 %s 的值被改写: %q → %q", key, headers[key][i], value)
+			}
+		}
 	}
 }
 
-// 结构化头截断的按条目预算分支：单个头值超限但键名开销可容纳时，必须裁剪
-// 值（rune 边界 + 省略号）并保持 JSON 可解析——直接字节截断会产出半截 JSON，
-// 前端解析失败后整块退化为原文，头表/多值/敏感掩码全部失效。
-func TestTruncateEventListHeaders_structuredValueTrimKeepsJSON(t *testing.T) {
+// 前缀内解不出任何完整成员（首个值就超限/非 JSON 脏行）时退回字节截断+
+// 标记：此时保留半截 JSON 只会让前端解析失败，不如显式展示截断原文（前端
+// 亮截断横幅）。
+func TestTruncateEventListHeaders_unescapablePrefixFallsBackToByteTruncation(t *testing.T) {
+	// 单个超长值：前缀只落在该值内部，解不出任何完整成员。
+	headers := map[string][]string{"X-Long": {strings.Repeat("v", 20*1024)}}
+	raw, err := json.Marshal(headers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) <= securityEventListFieldCap {
+		t.Fatalf("夹具必须超过列表上限: %d", len(raw))
+	}
+	for _, prefix := range []string{
+		string(raw[:securityEventListFieldCap+1]),        // 超长单值前缀
+		strings.Repeat("a", securityEventListFieldCap+1), // 非 JSON 脏行
+	} {
+		got := truncateEventListHeaders(prefix, len(headers))
+		if len(got) > securityEventListFieldCap+len("\n...[TRUNCATED]") {
+			t.Fatalf("字节截断结果 len=%d 超出上限+标记", len(got))
+		}
+		if !strings.HasSuffix(got, "\n...[TRUNCATED]") {
+			t.Fatalf("无法保结构时必须追加截断标记: %q", got[len(got)-40:])
+		}
+		if strings.Contains(got, "_lb_list_dropped_headers") {
+			t.Fatalf("字节截断形态不得伪造丢弃计数键: %q", got)
+		}
+	}
+}
+
+// 前缀内存在完整成员时保留结构（即使首个超长键被切断）：不因单值超限就
+// 丢弃整块头表，仍返回合法 JSON + 丢弃计数。
+func TestTruncateEventListHeaders_keepsCompleteMembersWhenValueTruncated(t *testing.T) {
 	headers := map[string][]string{
 		"Host":   {"a.example.com"},
 		"X-Long": {strings.Repeat("v", 20*1024)},
@@ -1391,78 +1447,20 @@ func TestTruncateEventListHeaders_structuredValueTrimKeepsJSON(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(raw) <= securityEventListFieldCap {
-		t.Fatalf("夹具必须超过列表上限: %d", len(raw))
-	}
-
-	got := truncateEventListHeaders(string(raw))
-
-	if len(got) > securityEventListFieldCap {
-		t.Fatalf("截断后 len=%d 超过列表上限 %d", len(got), securityEventListFieldCap)
-	}
+	prefix := string(raw[:securityEventListFieldCap+1])
+	got := truncateEventListHeaders(prefix, len(headers))
 	var roundTrip map[string][]string
 	if err := json.Unmarshal([]byte(got), &roundTrip); err != nil {
-		t.Fatalf("按条目裁剪必须保持合法 JSON: %v", err)
+		t.Fatalf("有完整成员时必须保持合法 JSON: %v（body=%q）", err, got)
 	}
 	if values := roundTrip["Host"]; len(values) != 1 || values[0] != "a.example.com" {
-		t.Fatalf("短头必须原样保留: %v", roundTrip["Host"])
+		t.Fatalf("完整成员必须原样保留: %v", roundTrip["Host"])
 	}
-	longValues := roundTrip["X-Long"]
-	if len(longValues) != 1 {
-		t.Fatalf("超限头必须保留值条目: %v", longValues)
+	if _, present := roundTrip["X-Long"]; present {
+		t.Fatalf("被切断的成员不得以半截值出现: %v", roundTrip["X-Long"])
 	}
-	if len(longValues[0]) >= 20*1024 || !strings.HasSuffix(longValues[0], "…") {
-		t.Fatalf("超限头值必须裁剪并追加省略号（len=%d）", len(longValues[0]))
-	}
-	if _, dropped := roundTrip[securityEventListDroppedHeadersKey]; dropped {
-		t.Fatalf("值裁剪不应丢弃条目（不应出现列表丢弃计数键）: %v", roundTrip)
-	}
-}
-
-// 结构化头截断的总量分支：多条目（含单键多值形态）合计超限时，逐条目等额
-// 预算裁剪后仍必须保持全键集与合法 JSON，且不得字节截断为非 JSON 原文。
-func TestTruncateEventListHeaders_structuredTotalOverCapKeepsAllKeys(t *testing.T) {
-	headers := map[string][]string{
-		"X-Multi": make([]string, 0, 100),
-	}
-	for range 100 {
-		headers["X-Multi"] = append(headers["X-Multi"], strings.Repeat("m", 500))
-	}
-	for i := range 30 {
-		headers["X-Entry-"+time.Duration(i).String()] = []string{strings.Repeat("e", 800)}
-	}
-	raw, err := json.Marshal(headers)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(raw) <= securityEventListFieldCap {
-		t.Fatalf("夹具必须超过列表上限: %d", len(raw))
-	}
-
-	got := truncateEventListHeaders(string(raw))
-
-	if len(got) > securityEventListFieldCap {
-		t.Fatalf("截断后 len=%d 超过列表上限 %d", len(got), securityEventListFieldCap)
-	}
-	var roundTrip map[string][]string
-	if err := json.Unmarshal([]byte(got), &roundTrip); err != nil {
-		t.Fatalf("总量裁剪必须保持合法 JSON: %v", err)
-	}
-	if len(roundTrip) != len(headers) {
-		t.Fatalf("键集必须全部保留（got %d, want %d）", len(roundTrip), len(headers))
-	}
-	for key, values := range roundTrip {
-		if len(values) != len(headers[key]) {
-			t.Fatalf("头 %s 值条目数变化: %d → %d", key, len(headers[key]), len(values))
-		}
-		for _, value := range values {
-			if len(value) > len(headers[key][0]) {
-				t.Fatalf("头 %s 的值被放大: %d 字节", key, len(value))
-			}
-		}
-	}
-	if got := roundTrip["X-Multi"]; len(got) == 0 || !strings.HasSuffix(got[0], "…") {
-		t.Fatalf("多值头必须逐值裁剪并追加省略号: len=%d", len(got))
+	if values := roundTrip[securityEventListDroppedHeadersKey]; len(values) != 1 || values[0] != "1" {
+		t.Fatalf("被切断的键必须计入丢弃计数: %v", roundTrip)
 	}
 }
 
@@ -1510,5 +1508,100 @@ func TestListSecurityEvents_disclosesIncludesReserved(t *testing.T) {
 	}
 	if payload.Data.IncludesReserved == nil || !*payload.Data.IncludesReserved {
 		t.Fatalf("includes_reserved=%v, want true（口径披露与安全总览同键）", payload.Data.IncludesReserved)
+	}
+}
+
+// 超限请求头按「SQL 前缀 + 前缀内完整成员重序列化」处理：
+// 单行头不再整列（≤64KB/行）取回，响应仍是合法 JSON 头表（前缀内的完整头
+// 逐字保留），被切断的键数计入 _lb_list_dropped_headers，前端据此展示
+// 「已隐藏 N 个头」。
+func TestListSecurityEvents_oversizedHeadersKeepJSONAndDiscloseDropped(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	gin.SetMode(gin.TestMode)
+	h := &Handlers{}
+	router := gin.New()
+	// 管理视角：服务端脱敏对 admin 不触发（否则敏感头值被掩码，无法断言逐字保留）。
+	router.GET("/security/events", func(c *gin.Context) { c.Set("role", "admin") }, h.ListSecurityEvents)
+
+	const bulk = 80
+	headers := make(map[string][]string, bulk+1)
+	for i := range bulk {
+		headers[fmt.Sprintf("X-Bulk-%03d", i)] = []string{strings.Repeat("v", 1024)}
+	}
+	headers["Host"] = []string{"a.example.com"}
+	raw, err := json.Marshal(headers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) <= securityEventListFieldCap {
+		t.Fatalf("夹具必须超过列表上限: %d", len(raw))
+	}
+	if _, err := db.MetricsDB.Exec(`INSERT INTO security_events (event_time, client_ip, action, request_headers)
+		VALUES ('2026-10-19 10:00:00','185.199.108.9','blocked',?)`, string(raw)); err != nil {
+		t.Fatalf("seed event: %v", err)
+	}
+
+	recorder := getRequest(t, router, "/security/events")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", recorder.Code, recorder.Body.String())
+	}
+	var payload struct {
+		Data struct {
+			Events []models.SecurityEvent `json:"events"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode events: %v", err)
+	}
+	if len(payload.Data.Events) != 1 {
+		t.Fatalf("events=%d, want 1", len(payload.Data.Events))
+	}
+	got := payload.Data.Events[0].RequestHeaders
+	if len(got) > securityEventListFieldCap {
+		t.Fatalf("request_headers len=%d > 列表上限 %d", len(got), securityEventListFieldCap)
+	}
+	if strings.HasSuffix(got, "\n...[TRUNCATED]") {
+		t.Fatalf("合法 JSON 头必须保留结构（不得退化为字节截断）: %s", got[:80])
+	}
+	var parsed map[string][]string
+	if err := json.Unmarshal([]byte(got), &parsed); err != nil {
+		t.Fatalf("响应头必须是合法 JSON: %v", err)
+	}
+	if values := parsed["Host"]; len(values) != 1 || values[0] != "a.example.com" {
+		t.Fatalf("前缀内的完整头必须逐字保留: %v", parsed["Host"])
+	}
+	kept := 0
+	for key, values := range parsed {
+		if key == securityEventListDroppedHeadersKey {
+			continue
+		}
+		kept++
+		wantValue := strings.Repeat("v", 1024)
+		if key == "Host" {
+			wantValue = "a.example.com"
+		}
+		if len(values) != 1 || values[0] != wantValue {
+			t.Fatalf("头 %s 的值被裁剪（应只丢弃尾部键，不改写保留值）: %v", key, values)
+		}
+	}
+	dropValues := parsed[securityEventListDroppedHeadersKey]
+	if len(dropValues) != 1 {
+		t.Fatalf("必须披露被切断的键数: %+v", parsed)
+	}
+	dropped, err := strconv.Atoi(dropValues[0])
+	if err != nil {
+		t.Fatalf("丢弃计数非数字: %q", dropValues[0])
+	}
+	if dropped != len(headers)-kept || dropped <= 0 {
+		t.Fatalf("dropped=%d, want 总键数(%d) - 保留键数(%d)", dropped, len(headers), kept)
+	}
+
+	// 传输侧口径：SQL 投影只取 cap+1 字节（不再整列取回 64KB 级头）。
+	var projected string
+	if err := db.MetricsDB.QueryRow("SELECT " + securityEventListFieldSQL("request_headers") + " FROM security_events LIMIT 1").Scan(&projected); err != nil {
+		t.Fatalf("SQL 投影: %v", err)
+	}
+	if len(projected) > securityEventListFieldCap+1 {
+		t.Fatalf("SQL 投影取回 %d 字节 > cap+1", len(projected))
 	}
 }

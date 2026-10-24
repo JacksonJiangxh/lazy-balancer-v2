@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"lazy-balancer-v2/internal/models"
 	"lazy-balancer-v2/internal/taskengine"
 )
 
@@ -104,10 +105,18 @@ func TestRescanRequeuesDeploymentLifecycleWithoutMaterial(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read job id: %v", err)
 	}
-	// 队列管理器就绪（生产由 InitCAQueueManager 注入）。
+	// 队列管理器就绪（生产由 InitCAQueueManager 注入）。预置队列但**不启动
+	// loop**：本用例断言的是补扫的同步部分（行转 queued + 日志 + 审计）；若
+	// 由 loop 异步派发，真实签发执行会在断言前改写状态（creating_account/
+	// failed），断言退化为 goroutine 调度竞态（全量运行偶发 "want queued"）。
 	oldManager := caQueueManager
-	caQueueManager = &CAQueueManager{queues: make(map[int]*caQueue), active: true, blockedRules: map[string]map[RuleBlockToken]struct{}{}}
-	t.Cleanup(func() { caQueueManager = oldManager })
+	qm := &CAQueueManager{queues: make(map[int]*caQueue), active: true, blockedRules: map[string]map[RuleBlockToken]struct{}{}}
+	qm.queues[7] = newCAQueue(models.CAProvider{ID: 7, Name: "lost CA", Provider: "letsencrypt"}, func() error { return nil }, t.TempDir())
+	caQueueManager = qm
+	t.Cleanup(func() {
+		caQueueManager = oldManager
+		qm.queues[7].stop()
+	})
 
 	service := NewCertificateService()
 	resetCertificateServiceForTest(t)

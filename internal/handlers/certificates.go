@@ -119,6 +119,17 @@ func mergeMaskedDNSCredentials(submitted, stored map[string]string, preserveUnsu
 	return merged, nil
 }
 
+// respondStoredDNSCredentialsCorrupted 处理「库内 dns_credentials 不是合法
+// JSON」的存储损坏形态（带外改库/旧版本遗留；导入通道已校验 JSON 对象，正常
+// 写入不会产生）：与保存前测试端点（TestCertificateConfig）的
+// storage_corrupted 口径同源——500 + 固定中文文案，解析错误只进运行日志。
+// 不得折成 400（「Invalid stored DNS credentials」/「凭证字段不能为掩码占位符」
+// 等请求类文案），否则运维会把存储损坏误判成自己的表单填写问题并反复重填。
+func respondStoredDNSCredentialsCorrupted(c *gin.Context, configID int, cause error) {
+	recordAudit(c, "更新失败", "DNS配置", services.FormatAuditDetail(fmt.Sprintf("配置 %d", configID), services.AuditResultPart("storage_corrupted")))
+	writeInternalError(c, http.StatusInternalServerError, "存储的 DNS 凭证已损坏，请重新保存配置", cause)
+}
+
 func (h *Handlers) ListCertificateConfigs(c *gin.Context) {
 	rows, err := db.DB.Query("SELECT id, name, dns_provider, COALESCE(dns_credentials,''), COALESCE(enabled,1), created_at, updated_at FROM certificate_configs ORDER BY id")
 	if err != nil {
@@ -140,7 +151,7 @@ func (h *Handlers) ListCertificateConfigs(c *gin.Context) {
 	for rows.Next() {
 		var cfg models.CertificateConfig
 		if err := rows.Scan(&cfg.ID, &cfg.Name, &cfg.DNSProvider, &cfg.DNSCredentials, &cfg.Enabled, &cfg.CreatedAt, &cfg.UpdatedAt); err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取证书配置失败: " + err.Error()})
+			writeInternalError(c, http.StatusInternalServerError, "读取证书配置失败", err)
 			return
 		}
 		if maskCredentials {
@@ -149,7 +160,7 @@ func (h *Handlers) ListCertificateConfigs(c *gin.Context) {
 		configs = append(configs, cfg)
 	}
 	if err := rows.Err(); err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取证书配置失败: " + err.Error()})
+		writeInternalError(c, http.StatusInternalServerError, "读取证书配置失败", err)
 		return
 	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: configs})
@@ -307,7 +318,7 @@ func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 		effectiveCredentials = map[string]string{}
 		if oldCredentials != "" {
 			if err := json.Unmarshal([]byte(oldCredentials), &effectiveCredentials); err != nil {
-				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Invalid stored DNS credentials"})
+				respondStoredDNSCredentialsCorrupted(c, id, err)
 				return
 			}
 		}
@@ -319,7 +330,7 @@ func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 		effectiveCredentials = map[string]string{}
 		if oldCredentials != "" {
 			if err := json.Unmarshal([]byte(oldCredentials), &effectiveCredentials); err != nil {
-				c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Invalid stored DNS credentials"})
+				respondStoredDNSCredentialsCorrupted(c, id, err)
 				return
 			}
 		}
@@ -328,7 +339,12 @@ func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 		// 合并结果为准(掩码字段取库值),掩码串不得进入校验/落库。
 		stored := map[string]string{}
 		if oldCredentials != "" {
-			_ = json.Unmarshal([]byte(oldCredentials), &stored)
+			if uerr := json.Unmarshal([]byte(oldCredentials), &stored); uerr != nil {
+				// 库值不是合法 JSON 是存储损坏（与上方两个分支同口径），不得
+				// 吞掉解析错误让合并失败被报成「凭证字段不能为掩码占位符」。
+				respondStoredDNSCredentialsCorrupted(c, id, uerr)
+				return
+			}
 		}
 		merged, merr := mergeMaskedDNSCredentials(effectiveCredentials, stored, effectiveProvider == oldProvider)
 		if merr != nil {
@@ -478,6 +494,11 @@ func (h *Handlers) UpdateCertificateConfig(c *gin.Context) {
 // DELETE 执行前运行——用于断言「查询→DELETE」窗口仍持有 caddyOpMu，且并发
 // UpdateRule 无法在该窗口提交绑定。生产恒 nil。
 var deleteCertificateConfigPreDeleteHook func()
+
+// createOrRequeueCertJob 是 IssueCertificate 的入队接缝（测试注入队列族错误，
+// 与 issueCertificateBatchSnapshotHook 同型）。生产实现直连服务层，签发端点
+// 不得另写一套入队语义。
+var createOrRequeueCertJob = services.CreateOrRequeueCertJobWithChange
 
 // issueCertificateBatchSnapshotHook 是测试钩子：批量签发目标快照完成、取
 // caddyOpMu 之前运行（生产恒 nil）。测试用它确定性地模拟「快照已取、规则在
@@ -799,29 +820,31 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 	if req.CaddyID == "" && req.All {
 		rows, err := db.DB.Query("SELECT caddy_id, COALESCE(domain,'') FROM lb_rules WHERE enabled=1 AND enable_tls=1 AND tls_source='acme_dns' AND protocol='http' AND COALESCE(domain,'') != ''")
 		if err != nil {
-			auditFailure("failed", "查询 ACME 规则失败: "+err.Error())
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "查询 ACME 规则失败"})
+			// 审计详情/响应体都只放固定归因，底层驱动文本只进运行日志
+			// （writeInternalError 记录 cause）——business 组任意登录用户可读。
+			auditFailure("failed", "查询 ACME 规则失败")
+			writeInternalError(c, http.StatusInternalServerError, "查询 ACME 规则失败", err)
 			return
 		}
 		for rows.Next() {
 			var ruleID, domain string
 			if err := rows.Scan(&ruleID, &domain); err != nil {
 				err = errors.Join(err, rows.Close())
-				auditFailure("failed", "读取 ACME 规则失败: "+err.Error())
-				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取 ACME 规则失败: " + err.Error()})
+				auditFailure("failed", "读取 ACME 规则失败")
+				writeInternalError(c, http.StatusInternalServerError, "读取 ACME 规则失败", err)
 				return
 			}
 			batchTargets = append(batchTargets, certTarget{ruleID: ruleID, domain: domain})
 		}
 		if err := rows.Err(); err != nil {
 			err = errors.Join(err, rows.Close())
-			auditFailure("failed", "遍历 ACME 规则失败: "+err.Error())
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "遍历 ACME 规则失败: " + err.Error()})
+			auditFailure("failed", "遍历 ACME 规则失败")
+			writeInternalError(c, http.StatusInternalServerError, "遍历 ACME 规则失败", err)
 			return
 		}
 		if err := rows.Close(); err != nil {
-			auditFailure("failed", "关闭 ACME 规则结果失败: "+err.Error())
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "关闭 ACME 规则结果失败: " + err.Error()})
+			auditFailure("failed", "关闭 ACME 规则结果失败")
+			writeInternalError(c, http.StatusInternalServerError, "关闭 ACME 规则结果失败", err)
 			return
 		}
 		if issueCertificateBatchSnapshotHook != nil {
@@ -961,11 +984,11 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 				// rescheduled=false：规则/材料在窗口内刚变化，回落整轮重签。
 			}
 		} else if !errors.Is(err, sql.ErrNoRows) {
-			auditFailure("failed", "读取证书任务失败: "+err.Error())
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取证书任务失败"})
+			auditFailure("failed", "读取证书任务失败")
+			writeInternalError(c, http.StatusInternalServerError, "读取证书任务失败", err)
 			return
 		}
-		jobID, changed, err := services.CreateOrRequeueCertJobWithChange(req.CaddyID, canonicalRuleDomain, 0, qm)
+		jobID, changed, err := createOrRequeueCertJob(req.CaddyID, canonicalRuleDomain, 0, qm)
 		if err != nil {
 			if errors.Is(err, services.ErrCertRuleStateConflict) {
 				// upsert 落库闸的规则当前态复核拒绝（防御纵深——
@@ -974,8 +997,16 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 				c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "规则状态已变更（规则已删除、禁用或域名已修改），请刷新后重试"})
 				return
 			}
-			auditFailure("failed", "创建签发任务失败: "+err.Error())
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "创建签发任务失败: " + err.Error()})
+			// 入队族错误（队列暂停/规则屏障）是可行动 409，与规则写/任务重试
+			// 共用 certEnqueueErrorResponse 单源映射；其余才是 500，且响应只回
+			// 固定前缀（底层错误只进运行日志）。
+			statusCode, message := certEnqueueErrorResponse("创建签发任务失败", err)
+			if statusCode == http.StatusConflict {
+				auditFailure("skipped", message)
+			} else {
+				auditFailure("failed", message)
+			}
+			c.JSON(statusCode, models.APIResponse{Code: statusCode, Message: message})
 			return
 		}
 		if !changed {
@@ -1009,6 +1040,12 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 		// 规则当前态冲突（ErrCertRuleStateConflict）单列：全部失败且均为冲突时
 		// 与定向签发同口径 409（可行动：刷新后重试），不折成 500 服务器故障。
 		conflictFailed := 0
+		// 入队族冲突（队列暂停/规则屏障，certEnqueueErrorResponse 判 409）的
+		// 目标数与首条归因文案：这批目标没有创建任务但不是服务端故障，全部失败
+		// 时必须与定向签发同口径 409，不得折成 500 让调用方按「稍后自动重试」
+		// 以外的语义处理。
+		enqueueConflict := 0
+		enqueueConflictMessage := ""
 		// 只重排部署（材料在库、未重新签发）的目标数——与 queued（新建签发任务）
 		// 分列，响应文案不得把「重新部署」谎报为「已创建签发任务」。
 		redeployed := 0
@@ -1091,10 +1128,20 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 				failed = append(failed, fmt.Sprintf("%s(%v)", target.domain, jobErr))
 				continue
 			}
-			jobID, changed, err := services.CreateOrRequeueCertJobWithChange(target.ruleID, canonicalDomain, 0, qm)
+			jobID, changed, err := createOrRequeueCertJob(target.ruleID, canonicalDomain, 0, qm)
 			if err != nil {
 				if errors.Is(err, services.ErrCertRuleStateConflict) {
 					conflictFailed++
+				}
+				// 入队族 409（规则状态冲突/队列暂停/规则屏障）单列计数：全部目标
+				// 都是这类可行动冲突时统一按 409 回报（见下方「全部目标未入队」
+				// 分支）；仍保留在 failed 清单里，部分成功出口的「N 个失败」
+				// 计数与既有契约不变。err 原文只进运行日志（5xx 出口已脱敏）。
+				if statusCode, message := certEnqueueErrorResponse("创建签发任务失败", err); statusCode == http.StatusConflict {
+					enqueueConflict++
+					if enqueueConflictMessage == "" {
+						enqueueConflictMessage = message
+					}
 				}
 				failed = append(failed, fmt.Sprintf("%s(%v)", target.domain, err))
 				continue
@@ -1183,11 +1230,18 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 			return
 		}
 		if queued == 0 && len(failed) > 0 && redeployed == 0 {
-			// 全部失败且均为规则当前态冲突：与定向签发同口径 409——批量快照
-			// 取于锁外，期间规则被删除/禁用/改域属可行动冲突，不是服务端故障。
-			if conflictFailed == len(failed) {
-				auditFailure("conflict", "规则状态已变更（规则已删除、禁用或域名已修改）")
-				c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "规则状态已变更（规则已删除、禁用或域名已修改），请刷新后重试"})
+			// 全部失败且都是可行动冲突（规则状态已变更/队列暂停/规则屏障）：
+			// 与定向签发同口径 409——批量快照取于锁外，期间规则被删除/禁用/
+			// 改域或队列被并发暂停都不是服务端故障，刷新/恢复后重试即可。
+			// 入队族判定与定向签发共用 certEnqueueErrorResponse 单源。
+			if enqueueConflict == len(failed) {
+				if conflictFailed == enqueueConflict {
+					auditFailure("conflict", "规则状态已变更（规则已删除、禁用或域名已修改）")
+					c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "规则状态已变更（规则已删除、禁用或域名已修改），请刷新后重试"})
+					return
+				}
+				auditFailure("skipped", enqueueConflictMessage)
+				c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: enqueueConflictMessage})
 				return
 			}
 			skipNote := formulaSkippedNote(skippedCooldown+skippedWaitingCA, skippedInFlight, skippedBlocked, skippedUnsupported, skippedRetired)
@@ -1202,7 +1256,10 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 				detail += skipNote
 			}
 			auditFailure("failed", detail)
-			message := "全部签发任务创建失败: " + strings.Join(failed, "; ")
+			// 响应体只回固定文案：failed 明细含 SQL 片段/队列内部态，只进运行
+			// 日志（business 组任意登录用户可读，5xx 不得直出底层错误）。
+			services.Logf("error", "IssueCertificate batch: 全部签发任务创建失败: %s", strings.Join(failed, "; "))
+			message := "全部签发任务创建失败"
 			if skipNote != "" {
 				// 混合形态（部分目标失败 + 部分目标被冷却/退役跳过）必须同时
 				// 交代跳过归因，否则用户会把「冷却/退役跳过」误判为系统故障。
@@ -1218,6 +1275,7 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 				"skipped_blocked":    skippedBlocked,
 				"skipped_other":      skippedUnsupported,
 				"skipped_retired":    skippedRetired,
+				"enqueue_conflict":   enqueueConflict,
 			}})
 			return
 		}
@@ -1308,15 +1366,11 @@ func (h *Handlers) IssueCertificate(c *gin.Context) {
 		}
 
 	}
-	cooldownNote := ""
-	if skippedCooldown+skippedWaitingCA > 0 {
-		cooldownNote = fmt.Sprintf("，%d 个任务处于冷却期已跳过", skippedCooldown+skippedWaitingCA)
-	}
 	forceNote := ""
 	if forceCAOverride {
 		forceNote = "，手动越过 CA 冷却"
 	}
-	recordAudit(c, "触发签发", "证书", services.FormatAuditDetail(scope, fmt.Sprintf("入队 %d 个任务%s%s", queued, cooldownNote, forceNote), services.AuditResultPart("requested")))
+	recordAudit(c, "触发签发", "证书", services.FormatAuditDetail(scope, fmt.Sprintf("入队 %d 个任务%s", queued, forceNote), services.AuditResultPart("requested")))
 	// 入队后渲染输入零变化——签发完成由 worker 链路自行应用，去掉强制重载
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: fmt.Sprintf("已创建 %d 个签发任务", queued), Data: gin.H{"queued": queued, "skipped_cooldown": skippedCooldown}})
 }
@@ -1343,7 +1397,10 @@ func (h *Handlers) ParseCertificate(c *gin.Context) {
 
 	info, err := parseTLSCertificate(req.CertPEM, req.KeyPEM)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
+		// 解析错误含 tls/x509 英文内部文本（仅只读白名单端点也须固定中文文案）：
+		// 细节只进运行日志，响应固定为可行动的用户语义。
+		services.Logf("warn", "ParseCertificate: 证书解析失败: %v", err)
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "证书或私钥格式无效，或二者不匹配"})
 		return
 	}
 

@@ -11,6 +11,12 @@ test('not_after 优先于 expires_at（expires_at=null 仍可显示有效期/重
   assert.equal(certJobRenewalAt(job, 30), '2026-12-01T00:00:00.000Z')
 })
 
+test('not_after 与 expires_at 并存且不同时取 not_after（库列不得覆盖派生值）', () => {
+  const job = { not_after: '2026-12-31T00:00:00Z', expires_at: '2027-06-30T00:00:00Z' }
+  assert.equal(certJobEffectiveNotAfter(job), '2026-12-31T00:00:00Z')
+  assert.equal(certJobRenewalAt(job, 30), '2026-12-01T00:00:00.000Z')
+})
+
 test('旧版响应缺 not_after 时回退 expires_at', () => {
   const job = { expires_at: '2026-11-20T12:00:00Z' }
   assert.equal(certJobEffectiveNotAfter(job), '2026-11-20T12:00:00Z')

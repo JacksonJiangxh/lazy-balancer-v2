@@ -150,6 +150,11 @@ func (s *SyncService) Report(ctx context.Context) error {
 		return errors.New(message)
 	}
 	if resp.StatusCode >= http.StatusBadRequest {
+		// 任何 ≥400 一律按「本轮上报失败」返回错误，**不**按状态码分支终止：
+		// 终止上报循环的单点是下一轮 Pull 的 errSyncTokenRevoked（401），
+		// 只在此处再加一个终止源会让两处终止判据打架（例如未来 Pull 允许 401
+		// 重试时，这里的 404 终止就会变成静默失效）。主节点的 404 只提供
+		// 「节点身份不存在」的诊断语义，不承担「从端停手」的职责。
 		// 与传输失败相同的审计节流：主节点持续拒绝上报时同一错误只记录
 		// 一次；错误内容变化或上报恢复后再次失败时重记。
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 200))

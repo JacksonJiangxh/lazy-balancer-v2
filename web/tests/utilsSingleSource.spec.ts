@@ -10,7 +10,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { registerModuleHooks, repoSource, section, source } from './_helpers.ts'
+import { code, registerModuleHooks, repoSource, section, source } from './_helpers.ts'
 import { STUB_API } from './_stubs.ts'
 import { DEFAULT_ACCESS_LOG_FORMAT } from '../src/utils/caddyDefaults.ts'
 import { escapeHtml } from '../src/utils/escape.ts'
@@ -50,6 +50,44 @@ test('highlight 的 Prism 异常兜底必须转义（注入面不得回退原文
   const highlight = source('src/utils/highlight.ts')
   const catchBlock = section(highlight, '} catch {', '\n  }\n}')
   assert.match(catchBlock, /return escapeHtml\(content\)/, '兜底必须走共享 escapeHtml，不得返回原文')
+})
+
+test('branding 预取失败：静默回落默认页脚与默认标题，不抛给调用方', async (t) => {
+  // /branding 是装饰性预取：失败时页脚/标题保持默认（不得弹全局错误 toast）。
+  // 本用例先于成功路径执行，模块仍是初始状态（默认文案 + footerUsesDefault=true）。
+  const branding = await import('../src/utils/branding.ts')
+  const host = globalThis as { document?: unknown }
+  const previousDocument = host.document
+  const documentStub = { title: '' }
+  host.document = documentStub
+  t.after(() => {
+    if (previousDocument === undefined) Reflect.deleteProperty(host, 'document')
+    else host.document = previousDocument
+  })
+  let seenConfig: unknown
+  g.__get = async (_url: string, config?: unknown) => {
+    seenConfig = config
+    throw new Error('network down')
+  }
+  await branding.loadBranding()
+  assert.deepEqual(seenConfig, { silent: true }, '装饰性预取必须 silent——失败不得弹全局错误提示')
+  assert.match(branding.footerHtml.value, /class="footer-link"/, '失败后仍是默认页脚（带仓库链接）')
+  assert.match(branding.footerHtml.value, /Copyright © 2026 XiaoBao/)
+  assert.equal(branding.appName.value, 'Lazy Balancer', '失败后产品名保持默认')
+  assert.equal(documentStub.title, 'Lazy Balancer V2', '失败后标题仍写默认产品名')
+})
+
+test('displayThreatScreenMode：仅 globe 保留，其余（含缺失/未知库值）归一为地图', async () => {
+  const { displayThreatScreenMode } = await import('../src/utils/configValues.ts')
+  assert.equal(displayThreatScreenMode('globe'), 'globe')
+  assert.equal(displayThreatScreenMode('map'), 'map')
+  for (const value of ['3d', '', 'GLOBE', ' globe', null, undefined]) {
+    assert.equal(displayThreatScreenMode(value), 'map', `${String(value)} 必须展示为地图`)
+  }
+  // 库值非法不得把大屏留在空态/抛错：三处生产消费同走单源
+  for (const path of ['src/views/Settings.vue', 'src/views/settings/BasicSettings.vue', 'src/views/security/ThreatScreen.vue']) {
+    assert.match(code(path), /displayThreatScreenMode\(/, `${path} 必须走展示口径单源`)
+  }
 })
 
 test('branding.footerHtml：默认加 GitHub 链接、自定义仅转义文本', async (t) => {

@@ -47,9 +47,9 @@ type Config struct {
 	BackupDir string `json:"backup_dir"`
 }
 
-// configWarnf 是启动期告警出口：Load 直接打 stderr；LoadCollectWarnings 把
-// 告警收集给调用方，在运行日志装配完成后统一重放（否则配置误配信号只存在于
-// 容器 stdout，只采集日志文件的部署完全看不到）。
+// configWarnf 是启动期告警出口：LoadCollectWarnings 把告警收集给调用方，在
+// 运行日志装配完成后统一重放（否则配置误配信号只存在于容器 stdout，只采集
+// 日志文件的部署完全看不到）。
 type configWarnf func(format string, args ...any)
 
 // configValueKind 是配置文件键在 JSON 中的期望类型。
@@ -178,16 +178,15 @@ func jwtSecretWeakness(secret string) string {
 // 本判定——文件通道会生成随机密钥。
 func jwtSecretStrongEnough(secret string) bool { return jwtSecretWeakness(secret) == "" }
 
-// Load 加载运行配置：默认值 → 配置文件（仅 configFileKeys 支持的键）→ 环境变量。
-// 配置文件中的未知键逐条 log 告警后忽略；读取/解析失败同样可见（回退默认值）。
-func Load(path string) *Config {
-	return load(path, func(format string, args ...any) { log.Printf(format, args...) })
-}
-
-// LoadCollectWarnings 与 Load 语义相同，但启动期告警不直接打印，而是随返回值
-// 交给调用方在运行日志装配完成后统一重放（经统一日志级别门）。配置告警发生在
-// 日志装配之前——只在 stdout 可见，只采集日志文件的部署看不到未知键、类型
+// LoadCollectWarnings 加载运行配置并收集启动期告警：默认值 → 配置文件（仅
+// configFileKeys 支持的键）→ 环境变量。配置文件中的未知键/类型错误逐条收集
+// 后忽略；读取/解析失败同样可见（回退默认值）。告警不直接打印，而是随返回值
+// 交给调用方在运行日志装配完成后统一重放（经统一日志级别门）——配置告警发生
+// 在日志装配之前，只在 stdout 可见，只采集日志文件的部署看不到未知键、类型
 // 错误、弱 JWT 密钥、APP_VERSION 未注入等误配信号。
+// 本函数是生产唯一加载入口（测试侧的单返回值包装见 config_test.go 的
+// loadForTest）：产品文件不承载 test-only 入口，双入口会让「测试覆盖的路径 ≠
+// 生产路径」的分叉无从发现。
 func LoadCollectWarnings(path string) (*Config, []string) {
 	var warnings []string
 	cfg := load(path, func(format string, args ...any) {
@@ -373,13 +372,9 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
-// loadOrCreateJWTSecret 是测试直调入口：告警直接打印。
-func loadOrCreateJWTSecret(dataDir string) string {
-	return loadOrCreateJWTSecretWith(dataDir, func(format string, args ...any) { log.Printf(format, args...) })
-}
-
-// loadOrCreateJWTSecretWith 的告警统一走调用方给的出口（Load 打印、
-// LoadCollectWarnings 收集后重放）。
+// loadOrCreateJWTSecretWith 的告警统一走调用方给的出口（LoadCollectWarnings
+// 收集后重放；测试直调入口在同包 config_test.go 的
+// loadOrCreateJWTSecretForTest）。
 func loadOrCreateJWTSecretWith(dataDir string, warnf configWarnf) string {
 	secretPath := filepath.Join(dataDir, "jwt_secret")
 	if data, err := os.ReadFile(secretPath); err == nil {

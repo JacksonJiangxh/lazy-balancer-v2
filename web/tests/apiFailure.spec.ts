@@ -105,6 +105,19 @@ test('用户取消返回 null，且不影响下一轮弹窗', async () => {
   assert.equal(opens, 2)
 })
 
+test('弹窗实现抛错时复位在途标记：下一次 428 仍会重新弹窗', async () => {
+  const first = deferred<string | null>()
+  let opens = 0
+  const stepUp = createMfaStepUp(() => { opens++; return opens === 1 ? first.promise : Promise.resolve('222222') })
+  const failed = stepUp.prompt()
+  assert.equal(stepUp.isPromptPending(), true)
+  first.reject(new Error('dialog crashed'))
+  await assert.rejects(failed, /dialog crashed/)
+  assert.equal(stepUp.isPromptPending(), false, '失败必须复位（否则后续 428 永远共享已 rejection 的 Promise）')
+  assert.equal(await stepUp.prompt(), '222222')
+  assert.equal(opens, 2)
+})
+
 test('同码重放防护：并发等待者共享同一次 verify-step 刷新', async () => {
   const refresh = deferred<void>()
   let refreshes = 0

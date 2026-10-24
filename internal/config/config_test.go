@@ -10,6 +10,25 @@ import (
 	"testing"
 )
 
+// loadForTest 是测试侧的单返回值加载包装：生产唯一入口是
+// LoadCollectWarnings（告警延迟重放交给运行日志装配后的级别门）。测试仍按旧
+// 口径把告警直接打到 log，供用例捕获校验文案——产品文件不得再提供无告警出口
+// 的并行实现（双入口会让「测试覆盖的路径 ≠ 生产路径」无从发现；守卫见
+// testonly_symbols_test.go）。
+func loadForTest(path string) *Config {
+	cfg, warnings := LoadCollectWarnings(path)
+	for _, warning := range warnings {
+		log.Printf("%s", warning)
+	}
+	return cfg
+}
+
+// loadOrCreateJWTSecretForTest 是 loadOrCreateJWTSecretWith 的测试直调入口：
+// 告警直接打印（用例捕获输出校验文案）。
+func loadOrCreateJWTSecretForTest(dataDir string) string {
+	return loadOrCreateJWTSecretWith(dataDir, func(format string, args ...any) { log.Printf(format, args...) })
+}
+
 // APP_VERSION 未注入时版本兜底为 "unknown"（fail-visible）——不得静默显示
 // 一个并非当前构建的版本号；发版链（Dockerfile ARG VERSION/buildx
 // --build-arg）显式传参，不受兜底值影响。
@@ -17,7 +36,7 @@ func TestLoad_versionFallsBackToUnknownWhenAppVersionUnset(t *testing.T) {
 	t.Setenv("JWT_SECRET", "test-secret")
 	t.Setenv("APP_VERSION", "") // getEnv 视空值为未注入
 
-	loaded := Load("")
+	loaded := loadForTest("")
 
 	if loaded.Version != "unknown" {
 		t.Fatalf("version=%q, want unknown（APP_VERSION 未注入兜底）", loaded.Version)
@@ -28,7 +47,7 @@ func TestLoad_versionUsesAppVersionEnv(t *testing.T) {
 	t.Setenv("JWT_SECRET", "test-secret")
 	t.Setenv("APP_VERSION", "v9.9.9-test")
 
-	loaded := Load("")
+	loaded := loadForTest("")
 
 	if loaded.Version != "v9.9.9-test" {
 		t.Fatalf("version=%q, want v9.9.9-test", loaded.Version)
@@ -57,7 +76,7 @@ func TestLoad_parses_metrics_interval_with_safe_minimum(t *testing.T) {
 			}
 
 			// When
-			loaded := Load(configPath)
+			loaded := loadForTest(configPath)
 
 			// Then
 			if loaded.MetricsInterval != test.want {
@@ -83,7 +102,7 @@ func TestLoad_resolves_log_file_with_default(t *testing.T) {
 			t.Setenv("LOG_FILE", test.envValue)
 
 			// When
-			loaded := Load("")
+			loaded := loadForTest("")
 
 			// Then
 			if loaded.LogFile != test.wantPath {
@@ -110,7 +129,7 @@ func TestLoad_warnsOnUnsupportedConfigFileKeys(t *testing.T) {
 	t.Cleanup(func() { log.SetOutput(origOut) })
 
 	// When
-	loaded := Load(configPath)
+	loaded := loadForTest(configPath)
 
 	// Then：支持键生效
 	if loaded.Port != 8081 || loaded.DataDir != "/tmp/config-test-data" || loaded.MetricsInterval != 10 {
@@ -153,7 +172,7 @@ func TestLoad_warnsOnMismatchedCaddyAdminURL(t *testing.T) {
 	loadAndLog := func(t *testing.T, path string) string {
 		t.Helper()
 		logBuf.Reset()
-		Load(path)
+		loadForTest(path)
 		return logBuf.String()
 	}
 
@@ -193,7 +212,7 @@ func TestLoad_warnsOnSupportedConfigFileKeyTypeMismatch(t *testing.T) {
 	t.Cleanup(func() { log.SetOutput(origOut) })
 
 	// When
-	loaded := Load(configPath)
+	loaded := loadForTest(configPath)
 
 	// Then：沿用默认值但每个误配键都必须有类型告警，不再静默。
 	if loaded.Port != 8000 || loaded.DataDir != "/app/data" || loaded.StaticDir != "/app/ui" || loaded.CaddyAdminURL != "http://localhost:2019" || loaded.CaddyMetricsURL != "http://localhost:2019/metrics" || loaded.MetricsInterval != 30 {
@@ -211,7 +230,7 @@ func TestLoad_warnsOnSupportedConfigFileKeyTypeMismatch(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte(`{"data_dir":"/tmp/config-type-data","static_dir":"/tmp/config-type-ui","port":8081,"caddy_admin_url":"http://127.0.0.1:2019","caddy_metrics_url":"http://127.0.0.1:2019/metrics","metrics_interval":10}`), 0600); err != nil {
 		t.Fatal(err)
 	}
-	loaded = Load(configPath)
+	loaded = loadForTest(configPath)
 	if loaded.Port != 8081 || loaded.DataDir != "/tmp/config-type-data" || loaded.StaticDir != "/tmp/config-type-ui" || loaded.MetricsInterval != 10 {
 		t.Fatalf("valid config not applied: %+v", loaded)
 	}
@@ -237,7 +256,7 @@ func TestLoadOrCreateJWTSecret_readErrorWarnsBeforeRegenerate(t *testing.T) {
 	t.Cleanup(func() { log.SetOutput(origOut) })
 
 	// When
-	secret := loadOrCreateJWTSecret(dir)
+	secret := loadOrCreateJWTSecretForTest(dir)
 
 	// Then：照常产出 64 字符 hex（可用性不变），但读取失败必须 warn 可见
 	if len(secret) != 64 {
@@ -264,7 +283,7 @@ func TestLoadOrCreateJWTSecret_shortSecretWarnsAndRegenerates(t *testing.T) {
 	t.Cleanup(func() { log.SetOutput(origOut) })
 
 	// When
-	secret := loadOrCreateJWTSecret(dir)
+	secret := loadOrCreateJWTSecretForTest(dir)
 
 	// Then：重生成 64 字符 hex 并覆写持久化
 	if secret == "too-short" || len(secret) != 64 {
@@ -299,7 +318,7 @@ func TestLoadOrCreateJWTSecret_validReusedAndEmptyQuiet(t *testing.T) {
 		t.Cleanup(func() { log.SetOutput(origOut) })
 
 		// When
-		secret := loadOrCreateJWTSecret(dir)
+		secret := loadOrCreateJWTSecretForTest(dir)
 
 		// Then
 		if secret != want {
@@ -321,7 +340,7 @@ func TestLoadOrCreateJWTSecret_validReusedAndEmptyQuiet(t *testing.T) {
 		t.Cleanup(func() { log.SetOutput(origOut) })
 
 		// When
-		secret := loadOrCreateJWTSecret(dir)
+		secret := loadOrCreateJWTSecretForTest(dir)
 
 		// Then
 		if len(secret) != 64 {
@@ -342,7 +361,7 @@ func TestLoad_warnsOnShortEnvJWTSecret(t *testing.T) {
 	log.SetOutput(&logBuf)
 	t.Cleanup(func() { log.SetOutput(origOut) })
 
-	loaded := Load("")
+	loaded := loadForTest("")
 
 	if loaded.JWTSecret != "abc" {
 		t.Fatalf("env secret=%q; want operator-provided value preserved", loaded.JWTSecret)
@@ -355,7 +374,7 @@ func TestLoad_warnsOnShortEnvJWTSecret(t *testing.T) {
 	strong := "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a3928"
 	t.Setenv("JWT_SECRET", strong)
 	logBuf.Reset()
-	if loaded := Load(""); loaded.JWTSecret != strong {
+	if loaded := loadForTest(""); loaded.JWTSecret != strong {
 		t.Fatalf("valid env secret=%q", loaded.JWTSecret)
 	}
 	if strings.Contains(logBuf.String(), "强度不足") || strings.Contains(logBuf.String(), "过短") {
@@ -390,7 +409,7 @@ func TestLoad_metricsIntervalBoundsWarn(t *testing.T) {
 			if err := os.WriteFile(configPath, []byte(`{"metrics_interval":`+tc.raw+`}`), 0600); err != nil {
 				t.Fatal(err)
 			}
-			loaded := Load(configPath)
+			loaded := loadForTest(configPath)
 			if loaded.MetricsInterval != tc.want {
 				t.Fatalf("metrics interval=%d, want %d", loaded.MetricsInterval, tc.want)
 			}
@@ -411,7 +430,7 @@ func TestLoad_normalizesRelativeDataDir(t *testing.T) {
 	if err := os.WriteFile("config.json", []byte(`{"data_dir":"./data"}`), 0600); err != nil {
 		t.Fatal(err)
 	}
-	cfg := Load("config.json")
+	cfg := loadForTest("config.json")
 	wantData := filepath.Join(dir, "data")
 	if cfg.DataDir != wantData {
 		t.Fatalf("DataDir=%q, want absolute %q", cfg.DataDir, wantData)
@@ -439,7 +458,7 @@ func TestLoad_normalizesRelativeStaticDirAndWarnsWhenMissing(t *testing.T) {
 	if err := os.WriteFile("config.json", []byte(`{"static_dir":"./ui/"}`), 0600); err != nil {
 		t.Fatal(err)
 	}
-	cfg := Load("config.json")
+	cfg := loadForTest("config.json")
 	if want := filepath.Join(dir, "ui"); cfg.StaticDir != want {
 		t.Fatalf("StaticDir=%q, want absolute %q（去尾随斜杠）", cfg.StaticDir, want)
 	}
@@ -451,7 +470,7 @@ func TestLoad_normalizesRelativeStaticDirAndWarnsWhenMissing(t *testing.T) {
 	if err := os.WriteFile("config.json", []byte(`{"static_dir":"missing-ui"}`), 0600); err != nil {
 		t.Fatal(err)
 	}
-	cfg = Load("config.json")
+	cfg = loadForTest("config.json")
 	if want := filepath.Join(dir, "missing-ui"); cfg.StaticDir != want {
 		t.Fatalf("StaticDir=%q, want absolute %q", cfg.StaticDir, want)
 	}
@@ -480,7 +499,7 @@ func TestLoad_warnsOnLowEntropyEnvJWTSecret(t *testing.T) {
 			log.SetOutput(&logBuf)
 			t.Cleanup(func() { log.SetOutput(origOut) })
 
-			loaded := Load("")
+			loaded := loadForTest("")
 
 			if loaded.JWTSecret != tc.secret {
 				t.Fatalf("env secret=%q; want operator-provided value preserved", loaded.JWTSecret)
@@ -519,7 +538,7 @@ func TestLoad_portBoundsBeforeConversion(t *testing.T) {
 			if err := os.WriteFile(configPath, []byte(`{"port":`+tc.raw+`}`), 0600); err != nil {
 				t.Fatal(err)
 			}
-			loaded := Load(configPath)
+			loaded := loadForTest(configPath)
 
 			if loaded.Port != tc.want {
 				t.Fatalf("port=%d, want %d (raw %s)", loaded.Port, tc.want, tc.raw)
@@ -569,11 +588,12 @@ func TestLoadCollectWarnings_defersWarningsToCaller(t *testing.T) {
 		}
 	}
 
-	// 对照：Load 仍直接打印（既有调用面/测试捕获口径不变）。
+	// 对照：测试侧包装 loadForTest 把同一批告警直接打到 log（既有用例的捕获
+	// 口径）。生产不再有无告警出口的并行实现——唯一入口是本函数。
 	logBuf.Reset()
-	Load("")
+	loadForTest("")
 	if !strings.Contains(logBuf.String(), "APP_VERSION 未注入") {
-		t.Fatalf("Load 必须保持直接打印告警，got %q", logBuf.String())
+		t.Fatalf("loadForTest 必须转发告警到 log，got %q", logBuf.String())
 	}
 }
 

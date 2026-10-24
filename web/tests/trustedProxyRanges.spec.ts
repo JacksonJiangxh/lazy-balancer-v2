@@ -21,6 +21,7 @@ import {
   trustedProxyRangeError,
   trustedProxyRangesError,
   trustedProxyTotalError,
+  trustedProxyTotalWarning,
 } from '../src/utils/trustedProxyRanges.ts'
 import { repoSource, section, source } from './_helpers.ts'
 
@@ -152,11 +153,42 @@ test('同一前缀的不同书写形态合并计一次（裸 IP、IPv6 大小写
   )
 })
 
-test('引用条目未加载时按 entry_count 估算（只拦已知超限，不误拒）', () => {
+test('硬门只拦可证超限：未加载条目按条数估算，估算越限降级为提示', () => {
   assert.equal(trustedProxyTotalError(['203.0.113.0/24'], [{ values: null, entryCount: 0 }]), '')
-  assert.match(trustedProxyTotalError(['203.0.113.0/24'], [{ values: null, entryCount: 2000 }]), /按条数估算/)
+  // 内联 1 + 估算 2000：只是可能超限，不得硬拦（多份未加载名单会重复计数）
+  assert.equal(
+    trustedProxyTotalError(['203.0.113.0/24'], [{ values: null, entryCount: 2000 }]),
+    '',
+    '估算值不得触发硬门——前端以估算否掉配置会挡住后端会接受的合法载荷',
+  )
+  assert.ok(trustedProxyTotalWarning(['203.0.113.0/24'], [{ values: null, entryCount: 2000 }]).length > 0, '估算越限必须给出提示')
+  // 单份名单自身超过上限：任何并集都至少包含它 → 可证超限
+  assert.match(trustedProxyTotalError(['203.0.113.0/24'], [{ values: null, entryCount: 2100 }]), /按条数估算/)
+  assert.equal(trustedProxyTotalWarning([], [{ values: null, entryCount: 2100 }]), '', '可证超限由硬门报错，不重复提示')
   assert.equal(trustedProxyTotalError([], [{ values: null, entryCount: 2000 }]), '', '恰好 2000 应放行')
   assert.equal(trustedProxyTotalError([], [{ values: null, entryCount: 0 }]), '', '未引用名单时不设额外总量门')
+})
+
+test('多份未加载引用互相重叠：不得按条数累加硬拦（后端会接受的配置）', () => {
+  // 两份各 1500 条、真实并集远低于上限；条目接口在途/失败时前端无法去重。
+  const refs = [
+    { values: null, entryCount: 1500 },
+    { values: null, entryCount: 1500 },
+  ]
+  assert.equal(trustedProxyTotalError([], refs), '', '估算合计 3000 只是上界，不得拦保存')
+  const warning = trustedProxyTotalWarning([], refs)
+  assert.match(warning, /可能超过 2000 上限/)
+  assert.match(warning, /3000/)
+  assert.match(warning, /按条数估算/)
+  assert.match(warning, /最终以服务端/, '提示必须声明判定权在服务端')
+
+  // 一份已加载（并集可证）叠加一份未加载：已解析并集超限仍硬拦
+  const resolvedOver = Array.from({ length: 2001 }, (_, i) => `198.${Math.floor(i / 256)}.${i % 256}.0/24`)
+  assert.match(
+    trustedProxyTotalError([], [{ values: resolvedOver, entryCount: 2001 }, { values: null, entryCount: 10 }]),
+    /超过 2000 上限/,
+    '已解析并集超限是可证事实，必须硬拦',
+  )
 })
 
 test('非法/空条目不计入并集（由网段判据逐条点名）', () => {
@@ -179,11 +211,15 @@ test('组件接线：请求头与总量行内提示 + 保存门', () => {
   const card = source('src/views/settings/CaddyGlobalSettings.vue')
   assert.match(card, /const trustedHeadersError = computed\(\(\) => trustedProxyHeadersError\(trustedHeaders\.value\)\)/)
   assert.match(card, /const trustedTotalError = computed\(\(\) => trustedProxyTotalError\(trustedRanges\.value, /)
+  assert.match(card, /const trustedTotalWarning = computed\(\(\) => trustedProxyTotalWarning\(trustedRanges\.value, /, '估算越限提示须就地呈现')
   assert.match(card, /const trustedExpansion = computed\(\(\) => trustedProxyExpansion\(trustedRanges\.value, /)
   assert.match(card, /request\.get<APIResponse<TrustedIpListDetail>>\(`\/security\/ip-lists\/\$\{id\}`, \{ silent: true \}\)/, '总量门须拉取引用名单条目以去重')
   assert.match(card, /interface TrustedIpListDetail \{ id: number; entries\?: \{ value: string \}\[\] \}/, '详情载荷形状须与 GET /security/ip-lists/:id 对齐')
   assert.match(card, /v-if="trustedHeadersError"/, '非法请求头必须就地呈现')
   assert.match(card, /v-if="trustedTotalError"/, '合计超限必须就地呈现')
+  assert.match(card, /v-else-if="trustedTotalWarning"/, '估算越限必须就地呈现且与硬错误互斥')
+  assert.match(card, /v-if="refListEntriesRetryIds\.length"/, '条目加载失败须可见')
+  assert.match(card, /重新加载名单条目/, '条目加载失败必须给出一键重试入口（不得只让用户刷新整页）')
   assert.match(card, /上限 \{\{ TRUSTED_PROXY_MAX_TOTAL_ENTRIES \}\}/, '展示上限与判据常量同源')
   const save = section(card, 'const handleSave = async', 'const preview = await request.post')
   assert.ok(save.indexOf('trustedHeadersError.value') > 0, '保存门必须拦非法请求头')
@@ -192,4 +228,9 @@ test('组件接线：请求头与总量行内提示 + 保存门', () => {
     save.indexOf('trustedTotalError.value') < save.indexOf('buildCaddyConfigPayload'),
     '校验必须早于载荷组装与任何写请求',
   )
+  // 估算越限只提示不 return：硬门之后紧跟 saving 置位，两者之间不能再有 return
+  const warnIdx = save.indexOf('trustedTotalWarning.value')
+  assert.ok(warnIdx > save.indexOf('trustedTotalError.value'), '提示在硬门之后')
+  const between = save.slice(warnIdx, save.indexOf('saving.value = true'))
+  assert.doesNotMatch(between, /\breturn\b/, '估算越限不得拦保存（判定权在后端）')
 })

@@ -25,6 +25,16 @@ import (
 
 func seedWafBundleSources(t *testing.T) {
 	t.Helper()
+	// 全局包/响应体缓存必须与夹具同生命周期：合并窗口内的复用判定不比较
+	// key，残留条目会让后续用例读到上一夹具的引用与序列化体（-shuffle 或
+	// 重排时「引用变化必须重建」失效、复用断言语义错位）。种子即清空，
+	// 用例结束后恢复调用前状态。
+	oldCache := wafFileBundleCache
+	wafFileBundleCache.key = ""
+	wafFileBundleCache.bundle = nil
+	wafFileBundleCache.response = nil
+	wafFileBundleCache.responseValidatedAt = time.Time{}
+	t.Cleanup(func() { wafFileBundleCache = oldCache })
 	src := t.TempDir()
 	rules := filepath.Join(src, "crs", "rules")
 	if err := os.MkdirAll(rules, 0o755); err != nil {
@@ -97,6 +107,14 @@ func TestBuildWafFileBundleResponse_reusesSerializedBody(t *testing.T) {
 	}
 	if response.Code != 0 || response.Data == nil {
 		t.Fatalf("response envelope=%+v", response)
+	}
+	// 复用必须是「同一引用」的复用：合并窗口内的判定不比较 key，若全局缓存
+	// 未随夹具隔离，上一用例留下的引用（v9.9.9）会让本条以陈旧体积/切片恒绿。
+	if strings.Contains(string(first), "v9.9.9") {
+		t.Fatalf("serialized body carries another fixture's reference（全局缓存未隔离）")
+	}
+	if !strings.Contains(string(first), "v4.14.0") {
+		t.Fatalf("serialized body missing current fixture CRS version: %s", string(first))
 	}
 }
 

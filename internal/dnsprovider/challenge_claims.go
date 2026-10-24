@@ -1,9 +1,10 @@
 package dnsprovider
 
 import (
-	"strings"
 	"sync"
 	"time"
+
+	"lazy-balancer-v2/internal/dnsname"
 )
 
 // 同域名并发签发的互斥：RFC 8555 允许 CA 复用同账号同标识的 pending 授权，
@@ -47,11 +48,10 @@ var challengeClaims = struct {
 
 // challengeClaimKeyOf 归一 zone/challenge 名（DNS 名大小写不敏感、尾点可省略），
 // 让预清理与 deferred 清理即使传入不同书写形态也命中同一条登记。
+// 归一实现与清理账本共用 dnsprovider.NormalizeName（见其注释：两份实现分叉会
+// 让登记键与账本键不一致）。
 func challengeClaimKeyOf(zone, tokenFQDN, value string) challengeClaimKey {
-	normalize := func(s string) string {
-		return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(s), "."))
-	}
-	return challengeClaimKey{zone: normalize(zone), fqdn: normalize(tokenFQDN), value: value}
+	return challengeClaimKey{zone: dnsname.NormalizeName(zone), fqdn: dnsname.NormalizeName(tokenFQDN), value: value}
 }
 
 // ClaimChallengeValue 登记一次在途 DNS-01 挑战值（Present 之前调用）。返回的

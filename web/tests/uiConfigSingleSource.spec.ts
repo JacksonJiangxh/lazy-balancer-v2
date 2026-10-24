@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { member, section, source } from './_helpers.ts'
+import { code, member, section, source } from './_helpers.ts'
 
 // 设置/仪表盘配置面的「呈现与真实消费者一致」守卫：
 // - 全局 DNS 提供商是无消费者的死配置（签发链按证书配置行读 provider），
@@ -10,7 +10,8 @@ import { member, section, source } from './_helpers.ts'
 // - OIDC 配置读取的回填必须只接受最新一轮请求（迟到的旧响应不得回滚表单）。
 
 test('全局 DNS 提供商：表单入口与过度承诺文案已移除，键仍按库值回传', () => {
-  const page = source('src/views/settings/FreeCertificates.vue')
+  // 「不得回流」断言走剥注释视图：注释里写一句历史说明不得把用例改红。
+  const page = code('src/views/settings/FreeCertificates.vue')
   assert.doesNotMatch(page, /v-model="global\.dns_provider"/, '死配置不得继续呈现为可改')
   assert.doesNotMatch(page, /创建规则时默认使用/, '文案不得承诺不存在的全局默认机制')
   const save = member(page, 'const handleSave = async')

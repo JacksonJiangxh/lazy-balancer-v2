@@ -124,7 +124,7 @@ func TestDecideMFAStepUp_shortCircuits(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			c := stepUpContext(t, tc.method, tc.path, tc.sets)
-			decision, err := DecideMFAStepUp(c, tc.covered, services.MFAUserEnabled)
+			decision, err := DecideMFAStepUp(c, tc.covered, db.DB, services.MFAUserEnabled)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -148,7 +148,7 @@ func TestDecideMFAStepUp_guardDisabled(t *testing.T) {
 		"user_id":   float64(1),
 		"mfa_ts":    float64(time.Now().Add(-10 * time.Minute).Unix()),
 	})
-	decision, err := DecideMFAStepUp(c, true, services.MFAUserEnabled)
+	decision, err := DecideMFAStepUp(c, true, db.DB, services.MFAUserEnabled)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -167,7 +167,7 @@ func TestDecideMFAStepUp_distinguishesReadFailures(t *testing.T) {
 		"user_id":   float64(1),
 		"mfa_ts":    float64(time.Now().Add(-10 * time.Minute).Unix()),
 	})
-	if _, err := DecideMFAStepUp(c, true, func(int) (bool, error) { return false, errors.New("simulated state read failure") }); err == nil ||
+	if _, err := DecideMFAStepUp(c, true, db.DB, func(int) (bool, error) { return false, errors.New("simulated state read failure") }); err == nil ||
 		!strings.Contains(err.Error(), ErrMFAStepUpStateUnreadable.Error()) {
 		t.Fatalf("MFA 状态读取失败必须可识别（守卫 500/fail-closed）: %v", err)
 	}

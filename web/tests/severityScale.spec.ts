@@ -5,10 +5,13 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { section, source, stripComments } from './_helpers.ts'
+import { repoSource, section, source, stripComments } from './_helpers.ts'
 import {
   ANOMALY_SCORE_HIGH,
   ANOMALY_SCORE_MID,
+  GEOIP_CRAWLER_EXEMPT_BASE,
+  GEOIP_CRAWLER_SPOOF_BASE,
+  GEOIP_PRECHECK_LIMIT,
   anomalySeverity,
   overlayDetectionGrade,
   zeroScoreSeverity,
@@ -45,14 +48,26 @@ test('检测模式降级梯：拦截事件保持原档，未拦截整体降一�
   assert.equal(overlayDetectionGrade(anomalySeverity(ANOMALY_SCORE_MID), 'detected'), 'low')
 })
 
-test('0 分行回退族：2/3/12/14 高危、（8/8xxxxx）中危、其余按动作分中低', () => {
+test('0 分行回退族：2/3/12/14 高危，GeoIP 三族按段界分档，其余按动作分中低', () => {
   for (const ruleTriggered of ['2', '3', '12', '14']) {
     assert.equal(zeroScoreSeverity(ruleTriggered, 'blocked'), 'high', `${ruleTriggered} 拦截应为高危`)
     assert.equal(zeroScoreSeverity(ruleTriggered, 'detected'), 'mid', `${ruleTriggered} 检测模式降为中危`)
   }
-  for (const ruleTriggered of ['8', '800001', '899999']) {
+  // 普通 GeoIP `[800000,810000)`：后端补分 6（中危），检测模式不再二次下调
+  for (const ruleTriggered of ['8', '800001', '809999']) {
     assert.equal(zeroScoreSeverity(ruleTriggered, 'blocked'), 'mid', `${ruleTriggered} 为普通 GeoIP 中危`)
     assert.equal(zeroScoreSeverity(ruleTriggered, 'detected'), 'mid', '存量行检测模式不再二次下调')
+  }
+  // 爬虫伪装 `[850000,900000)`：后端补分 12（高危），与 12 分族同档
+  for (const ruleTriggered of ['850001', '899999']) {
+    assert.equal(zeroScoreSeverity(ruleTriggered, 'blocked'), 'high', `${ruleTriggered} 爬虫伪装应为高危`)
+    assert.equal(zeroScoreSeverity(ruleTriggered, 'detected'), 'mid', '检测模式高→中')
+  }
+  // 爬虫豁免 `[810000,850000)`：后端补分 0（已验证爬虫放行=审计轨迹），
+  // 不得被抬成中危；检测/拦截两种动作都不抬档
+  for (const ruleTriggered of ['810000', '810001', '849999']) {
+    assert.equal(zeroScoreSeverity(ruleTriggered, 'blocked'), 'low', `${ruleTriggered} 爬虫豁免应为低危`)
+    assert.equal(zeroScoreSeverity(ruleTriggered, 'detected'), 'low')
   }
   // 8 族边界：必须恰好 8 后跟 5 位（8xxxxx），5 位/7 位落入兜底
   assert.equal(zeroScoreSeverity('80000', 'blocked'), 'mid', '非 8 族兜底=拦截中危')
@@ -64,6 +79,25 @@ test('0 分行回退族：2/3/12/14 高危、（8/8xxxxx）中危、其余按动
   // 481-484 是 HTTP 阻断状态码而非 rule_triggered 值：不得被当作高危族
   assert.equal(zeroScoreSeverity('481', 'blocked'), 'mid')
   assert.equal(zeroScoreSeverity('483', 'detected'), 'low')
+})
+
+// 段界是跨栈契约：前端按段界分族，后端按同一编码发射 id。任一侧单改一侧
+// 会让大屏颜色与事件列表评分打架（899999 曾被当成普通 GeoIP 中危）。
+test('8xxxxx 三族段界与后端 encode/decode 及入库补分同源（跨栈钉）', () => {
+  const go = repoSource('internal/services/security.go')
+  assert.match(go, /geoipPrecheckRuleBase\s*=\s*800000/, '普通 GeoIP 段基址漂移')
+  assert.match(go, /geoipCrawlerRuleBase\s*=\s*810000/, '爬虫豁免段基址漂移')
+  assert.match(go, /geoipCrawlerSpoofRuleBase\s*=\s*850000/, '爬虫伪装段基址漂移')
+  assert.match(go, /geoipPrecheckRuleLimit\s*=\s*900000/, '预检段右开界漂移')
+  assert.equal(GEOIP_CRAWLER_EXEMPT_BASE, 810000)
+  assert.equal(GEOIP_CRAWLER_SPOOF_BASE, 850000)
+  assert.equal(GEOIP_PRECHECK_LIMIT, 900000)
+
+  // 入库补分：豁免=0（不计威胁）、伪装=12、普通 GeoIP=6
+  const events = repoSource('internal/services/securityevents.go')
+  assert.match(events, /case securityEventsIsCrawlerExemptRule\(rec\.RuleTriggered\):\s*rec\.AnomalyScore = 0/)
+  assert.match(events, /case securityEventsIsCrawlerSpoofRule\(rec\.RuleTriggered\):\s*rec\.AnomalyScore = 12/)
+  assert.match(events, /case securityEventsIsGeoIPScoringRule\(rec\.RuleTriggered\):\s*rec\.AnomalyScore = 6/)
 })
 
 test('大屏定级只做取值：视图不重写分档/降级语义', () => {

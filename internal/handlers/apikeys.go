@@ -31,7 +31,7 @@ import (
 // 语义豁免等条件只有一份，不再各自漂移；本层仅保留「特权授予」覆盖面语义
 // 与 fail-closed 口径（守卫按裁定 fail-open）。
 func requireAPIKeyStepUp(c *gin.Context) bool {
-	decision, derr := DecideMFAStepUp(c, true, services.MFAUserEnabled)
+	decision, derr := DecideMFAStepUp(c, true, db.DB, services.MFAUserEnabled)
 	if derr != nil {
 		if errors.Is(derr, ErrMFAStepUpGuardUnreadable) {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "MFA 写操作验证开关读取失败"})
@@ -337,7 +337,7 @@ func createAPIKeyForUser(c *gin.Context, userID int) {
 		fmt.Sprintf("过期：%s", expiry),
 		"权限："+map[bool]string{true: "只读", false: "可写"}[req.ReadOnly],
 		"MCP："+boolOnOff(req.MCPEnabled),
-		fmt.Sprintf("MCP 白名单：%d 条", len(whitelist)),
+		fmt.Sprintf("IP 白名单（约束全部 REST 与 MCP）：%d 条", len(whitelist)),
 	))
 	c.JSON(http.StatusCreated, models.APIResponse{Code: 0, Data: gin.H{
 		"id":      id,
@@ -441,9 +441,10 @@ func updateAPIKeyStatus(c *gin.Context, currentUserOnly bool) {
 	}
 	// 特权变更（收回只读/开启 MCP/放宽已启用 MCP 的白名单）与创建侧同构
 	// 走 requireAPIKeyStepUp（判定/响应单源）。
-	// 白名单变更仅在更新后该 Key 仍启用 MCP 时算特权变更（禁用态的遗留在册
-	// 白名单不产生可达面）；路由级守卫在开启时本已覆盖该请求，此集合是
-	// 「守卫开关读失败」场景下的纵深防御口径。
+	// 白名单变更在更新后该 Key 仍启用 MCP 时算特权变更（与路由级守卫开启时的
+	// 覆盖面对齐；此集合是「守卫开关读失败」场景下的纵深防御口径）。白名单
+	// 实际约束该 Key 的全部 REST 与 MCP 调用（middleware 不看 mcp_enabled），
+	// 字段名 mcp_ip_whitelist 为历史遗留。
 	afterMCPEnabled := beforeMCPEnabled == 1
 	if req.MCPEnabled != nil {
 		afterMCPEnabled = *req.MCPEnabled
@@ -518,7 +519,7 @@ func updateAPIKeyStatus(c *gin.Context, currentUserOnly bool) {
 	if req.MCPIPWhitelist != nil && whitelistJSON != nil {
 		beforeCount := apiKeyWhitelistCount(beforeWhitelist)
 		if beforeCount != whitelistCount || *whitelistJSON != beforeWhitelist {
-			changes = append(changes, fmt.Sprintf("MCP 白名单：%d 条→%d 条", beforeCount, whitelistCount))
+			changes = append(changes, fmt.Sprintf("IP 白名单（约束全部 REST 与 MCP）：%d 条→%d 条", beforeCount, whitelistCount))
 		}
 	}
 	if len(changes) > 0 {
@@ -534,8 +535,9 @@ func updateAPIKeyStatus(c *gin.Context, currentUserOnly bool) {
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "API 密钥已更新"})
 }
 
-// apiKeyWhitelistCount 统计库内 MCP 白名单条目数（审计 delta 用；
-// 损坏/空值按 0 计——只影响审计文案，不参与鉴权判定）。
+// apiKeyWhitelistCount 统计库内 IP 白名单条目数（审计 delta 用；字段名
+// mcp_ip_whitelist 为历史遗留，作用域是全部 REST 与 MCP 调用——注释与
+// 审计文案必须同口径。损坏/空值按 0 计——只影响审计文案，不参与鉴权判定）。
 func apiKeyWhitelistCount(raw string) int {
 	if raw == "" {
 		return 0

@@ -13,7 +13,7 @@ test('当前密码错误在页面本地 toast，拦截器复用精确分类', ()
 })
 
 test('只有已启用信任命中才抑制新增信任', () => {
-  const text = source('src/views/security/IPLocationAction.vue')
+  const text = code('src/views/security/IPLocationAction.vue')
   const hit = text.indexOf('if (!mergedTrustEntries(policy).some')
   const enabled = text.indexOf('if (!policy.ip_whitelist_enabled) continue', hit)
   const trusted = text.indexOf('trusted = true', hit)
@@ -93,10 +93,10 @@ test('混合策略只读视图复用独立黑名单生效谓词', () => {
 })
 
 test('只读态隐藏迁移入口并保留函数级守卫', () => {
-  const text = source('src/views/security/SecurityPolicies.vue')
+  const text = code('src/views/security/SecurityPolicies.vue')
   assert.match(text, /<el-button v-if="!isReadOnly" type="warning" @click="openMigrateFromView">/)
   assert.match(section(text, 'const openMigrateDialog', 'const submitMigrate'), /if \(isReadOnly\.value\) return/)
-  assert.match(section(text, 'const submitMigrate', '// ── 混合策略只读查看'), /if \(isReadOnly\.value \|\| migrateSaving\.value\) return/)
+  assert.match(section(text, 'const submitMigrate', 'const viewPolicyVisible'), /if \(isReadOnly\.value \|\| migrateSaving\.value\) return/)
 })
 
 test('关联规则与预览步骤同样补齐引用名单条目', () => {
@@ -249,7 +249,7 @@ test('拦截页删除重入守卫（确认前占位、finally 释放）', () => 
 })
 
 test('阶段页覆盖写入按 skipped 归集后再回写（不谎报已覆盖）', () => {
-  const text = source('src/views/security/SecurityPolicies.vue')
+  const text = code('src/views/security/SecurityPolicies.vue')
   const skippedSet = text.indexOf('const skippedIds = new Set(skippedItems.map((item) => item.rule_id))')
   const apply = text.indexOf('applyStageOverrideSuccess(caddyId, edit)', skippedSet)
   assert.ok(skippedSet > 0 && apply > skippedSet, '必须先归集 skipped 再回写成功态')
@@ -279,9 +279,13 @@ test('库状态未知时自动更新开关显示「—」而非默认开', () =>
 // ---- 前端展示/契约批次：单源化与首轮误标 ----
 test('分页器形态收敛 main.css，四个视图不得再本地重定义', () => {
   const main = source('src/styles/main.css')
-  assert.match(main, /\.rules-pagination \{ display: flex; justify-content: flex-end; margin-top: 16px; \}/)
+  // 选择器块内逐条匹配（不依赖单行排版：引入格式化工具不应批量假红）
+  const rule = section(main, '.rules-pagination {', '}')
+  assert.match(rule, /display:\s*flex/)
+  assert.match(rule, /justify-content:\s*flex-end/)
+  assert.match(rule, /margin-top:\s*16px/)
   for (const file of ['src/views/Rules.vue', 'src/views/security/SecurityRules.vue', 'src/views/security/SecurityPolicies.vue', 'src/views/security/SecurityBlockPages.vue']) {
-    assert.doesNotMatch(source(file), /^\.rules-pagination \{/m, `${file} 仍保留本地 .rules-pagination 定义`)
+    assert.doesNotMatch(code(file), /\.rules-pagination\s*\{/, `${file} 仍保留本地 .rules-pagination 定义`)
   }
 })
 
@@ -379,9 +383,10 @@ test('阶段页覆盖写前重读库值（未编辑阶段取最新，不旧快�
   assert.match(block, /avoid|避免覆盖他人修改|无法读取最新规则/)
 })
 
-test('阶段 0 预览信任名单恒启用（与保存侧 trustAlwaysEnabled 同口径）', () => {
+test('阶段 0 预览信任名单恒启用（与保存侧 trustEnabledForPolicyType 同口径）', () => {
   const text = source('src/views/security/SecurityPolicies.vue')
-  assert.match(text, /ip_whitelist_enabled: editorPolicyType\.value === 'stage0' \|\| ipWhitelistEnabled\.value/)
+  assert.match(text, /const trustEnabledInEditor = computed\(\(\) => trustEnabledForPolicyType\(editorPolicyType\.value, ipWhitelistEnabled\.value\)\)/)
+  assert.match(text, /ip_whitelist_enabled: trustEnabledInEditor\.value/)
 })
 
 test('改回原值后「待重试」标记消失', () => {

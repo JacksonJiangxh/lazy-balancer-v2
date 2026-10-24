@@ -1,8 +1,8 @@
 package handlers
 
-// （users 空表拒绝）、（预览单侧缺失
-// 建模）、（CRS 日志时序）、（未登记威胁条目告警）、
-// lbbak 导入/导出的文件相位与 WAF/Caddy 锁序（生产链用例）。
+// 覆盖：lbbak 导入/导出的文件相位与 WAF/Caddy 锁序（生产链用例），旁路契约
+// 包括 users 空表拒绝、预览单侧 WAF 文件缺失建模、CRS 日志时序、manifest
+// 未登记威胁条目告警。
 
 import (
 	"archive/tar"
@@ -98,7 +98,7 @@ func decodeValidateResponse(t *testing.T, rec *httptest.ResponseRecorder) import
 // 另定义了一个测试专属包装（自行加锁后调 InLock 变体）来「证明」阻塞，只能
 // 证明测试包装加了锁，属自证，已删除。
 
-// ──：lbbak 导出侧 BuildWafFileBundle 读相位必须受 wafFileMu 互斥 ──
+// lbbak 导出侧 BuildWafFileBundle 读相位必须受 wafFileMu 互斥
 
 // Given wafFileMu 被预持（模拟并发的三库更新器/lbbak 导入文件写相位）。
 // When buildLbbakExport 勾选「安全防护」分类（触发 BuildWafFileBundle 读 CRS
@@ -307,7 +307,7 @@ func TestLbbakImport_pausesSchedulingBeforeWafLock(t *testing.T) {
 	}
 }
 
-// ──：CRS 分阶段流水「reloading/success」必须落在 commit 成功之后 ──
+// CRS 分阶段流水「reloading/success」必须落在 commit 成功之后
 
 // Given lbbak 备份（含 CRS 文件）导入，Caddy stub 拒绝一切请求使 session.commit
 // 失败（POST /load 被拒→Caddy 拒绝→400 回滚）。
@@ -415,7 +415,7 @@ func TestLbbakImport_commit_success_uses_audit_not_crs_task_log(t *testing.T) {
 	}
 }
 
-// ──：manifest 未登记的 threat/*.iplist 条目必须告警（不拒绝） ──
+// manifest 未登记的 threat/*.iplist 条目必须告警（不拒绝）
 
 // Given lbbak 包内含 manifest 未登记的 threat/ustc.iplist 条目。
 // When 导入执行。
@@ -469,6 +469,8 @@ func TestLbbakImport_unregisteredThreatSkippedBySectionsWarnsNotImported(t *test
 		t.Fatalf("skipped threat file exists or stat failed unexpectedly: %v", err)
 	}
 }
+
+// 预览端点对未登记威胁条目给出同一告警（预览/导入口径一致）。
 
 // Given 同形态 lbbak 包投递预览端点。
 // When 预览执行。

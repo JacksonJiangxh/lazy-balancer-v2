@@ -1698,19 +1698,27 @@ func TestJSONStringEscapedLen_matchesEncodingJSON(t *testing.T) {
 }
 
 // 快照 headers 有界口径（与 part C/E 同 64KiB 上限）：伪造的客户端丢弃计数
-// 键在首个受信触点剥离；超限按序列化体积降序丢条目并以合成键记数。
+// 键在首个受信触点剥离；超限按序列化体积降序丢条目并以合成键记数。返回的
+// 精确字节数必须与实际序列化体积一致（差 ≤1 字节的上界），入队预算据此执法。
 func TestSnapshotAuditHeaders_boundedWithMarker(t *testing.T) {
 	t.Run("上限内深拷贝且剥离伪造标记", func(t *testing.T) {
 		src := map[string][]string{
 			"Host":                {"a.example.com"},
 			"_lb_dropped_headers": {"999"},
 		}
-		got := snapshotAuditHeaders(src)
+		got, exact := snapshotAuditHeaders(src)
 		if _, ok := got[auditSnapshotDroppedHeadersKey]; ok {
 			t.Fatalf("客户端伪造的丢弃计数键必须剥离: %v", got)
 		}
 		if len(got) != 1 || got["Host"][0] != "a.example.com" {
 			t.Fatalf("真实头必须保留: %v", got)
+		}
+		raw, err := json.Marshal(got)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if exact < int64(len(raw)) || exact > int64(len(raw))+1 {
+			t.Fatalf("精确字节=%d, want %d..%d（须与序列化体积一致）", exact, len(raw), len(raw)+1)
 		}
 		src["Host"][0] = "mutated"
 		if got["Host"][0] != "a.example.com" {
@@ -1724,13 +1732,16 @@ func TestSnapshotAuditHeaders_boundedWithMarker(t *testing.T) {
 			"User-Agent": {"probe"},
 			"X-Big":      {strings.Repeat("B", auditHeadersMaxBytes)},
 		}
-		got := snapshotAuditHeaders(src)
+		got, exact := snapshotAuditHeaders(src)
 		raw, err := json.Marshal(got)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if len(raw) > auditHeadersMaxBytes {
 			t.Fatalf("快照 headers 序列化 %d 字节，超过 %d 上限", len(raw), auditHeadersMaxBytes)
+		}
+		if exact < int64(len(raw)) || exact > int64(len(raw))+1 {
+			t.Fatalf("截断后精确字节=%d, want %d..%d（上界不得超过 1 字节）", exact, len(raw), len(raw)+1)
 		}
 		if _, ok := got["X-Big"]; ok {
 			t.Fatal("最大条目必须首先丢弃")
@@ -1742,6 +1753,181 @@ func TestSnapshotAuditHeaders_boundedWithMarker(t *testing.T) {
 			t.Fatalf("丢弃计数键=%v, want [\"1\"]", got[auditSnapshotDroppedHeadersKey])
 		}
 	})
+}
+
+// 头部密集形态的字节估算必须用快照侧已算出的精确序列化字节：5000 条三字符
+// header（请求+响应各一份）实际序列化 ~131KiB，旧实现按每条 (键 48 + 值 16)
+// 固定开销重估成 ~700KiB（5.7×），越过 auditItemMaxBytes 单条上限→整行被
+// 丢弃（丢的恰是头部密集的高价值行）。钉两点：估算不低于实际、不超限丢行。
+func TestEstimateAuditSnapshotBytes_headerDenseExactBytesUnderItemCap(t *testing.T) {
+	// 5000 个互不相同的三字符键（aaa..，26 进制）。
+	headers := make(map[string][]string, 5000)
+	for i := range 5000 {
+		n := i
+		key := []byte{'a', 'a', 'a'}
+		for pos := 2; pos >= 0; pos-- {
+			key[pos] = byte('a' + n%26)
+			n /= 26
+		}
+		headers[string(key)] = []string{string(key)}
+	}
+	reqHeaders, reqExact := snapshotAuditHeaders(headers)
+	respHeaders, respExact := snapshotAuditHeaders(headers)
+	if reqExact <= 0 || respExact <= 0 {
+		t.Fatalf("精确字节缺失: req=%d resp=%d", reqExact, respExact)
+	}
+	// 5000 条 14 字节条目 = 70KB > 64KiB 上限 → 两侧各被裁剪到上限内。
+	if reqExact > auditHeadersMaxBytes || respExact > auditHeadersMaxBytes {
+		t.Fatalf("快照 header 字节 req=%d resp=%d 超过 %d 上限", reqExact, respExact, auditHeadersMaxBytes)
+	}
+	snap := &auditSnapshot{}
+	snap.Transaction_.Request_ = &auditSnapshotRequest{Headers_: reqHeaders, HeadersBytes_: reqExact}
+	snap.Transaction_.Response_ = &auditSnapshotResponse{Headers_: respHeaders, HeadersBytes_: respExact}
+
+	serialized, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := estimateAuditSnapshotBytes(snap)
+	if got < int64(len(serialized)) {
+		t.Fatalf("估算 %d < 序列化 %d：低估会让实际驻留突破字节预算", got, len(serialized))
+	}
+	// 旧口径（36/48/16 固定开销）对照：同一快照会被估成 ~5.7×，必须越过单条上限。
+	var legacy int64 = auditSnapshotFixedBytes
+	for _, hs := range []map[string][]string{reqHeaders, respHeaders} {
+		for k, vs := range hs {
+			legacy += int64(len(k)) + 48
+			for _, v := range vs {
+				legacy += int64(len(v)) + 16
+			}
+		}
+	}
+	if legacy <= auditItemMaxBytes {
+		t.Fatalf("夹具无效：旧固定开销口径估算 %d 本应越过单条上限 %d", legacy, auditItemMaxBytes)
+	}
+	if got > auditItemMaxBytes {
+		t.Fatalf("精确估算 %d > 单条上限 %d（整行仍会被丢弃）", got, auditItemMaxBytes)
+	}
+
+	// 入队路径：不因估算失真丢弃该行。
+	p := &auditPipeline{
+		target: filepath.Join(t.TempDir(), "audit.log"),
+		queue:  make(chan lbAuditItem, 2),
+		done:   make(chan struct{}),
+	}
+	if err := p.openFile(0o644); err != nil {
+		t.Fatal(err)
+	}
+	p.enqueue(lbAuditItem{snap: snap, formatter: cannedFormatter{body: []byte(`{"row":"header-dense"}`)}})
+	if dropped := p.dropped.Load(); dropped != 0 {
+		t.Fatalf("dropped=%d, want 0（头部密集行不得因估算失真被整行丢弃）", dropped)
+	}
+	if length := len(p.queue); length != 1 {
+		t.Fatalf("queue length=%d, want 1", length)
+	}
+}
+
+// headerProbe* 是只携带 headers 的最小 AuditLog 实现（快照精确字节接线单测）：
+// 嵌入 nil 接口补足不可命名的 Args() 等方法，覆盖快照实际读取的方法。
+type headerProbeAuditLog struct{ tx headerProbeTx }
+
+func (l headerProbeAuditLog) Parts() types.AuditLogParts { return nil }
+func (l headerProbeAuditLog) Transaction() plugintypes.AuditLogTransaction {
+	return l.tx
+}
+func (l headerProbeAuditLog) Messages() []plugintypes.AuditLogMessage { return nil }
+
+type headerProbeTx struct {
+	plugintypes.AuditLogTransaction
+	req  headerProbeReq
+	resp headerProbeResp
+}
+
+func (t headerProbeTx) Timestamp() string       { return "" }
+func (t headerProbeTx) UnixTimestamp() int64    { return 0 }
+func (t headerProbeTx) ID() string              { return "tx-header-probe" }
+func (t headerProbeTx) ClientIP() string        { return "" }
+func (t headerProbeTx) ClientPort() int         { return 0 }
+func (t headerProbeTx) HostIP() string          { return "" }
+func (t headerProbeTx) HostPort() int           { return 0 }
+func (t headerProbeTx) ServerID() string        { return "" }
+func (t headerProbeTx) HighestSeverity() string { return "" }
+func (t headerProbeTx) IsInterrupted() bool     { return false }
+func (t headerProbeTx) Request() plugintypes.AuditLogTransactionRequest {
+	return t.req
+}
+func (t headerProbeTx) Response() plugintypes.AuditLogTransactionResponse {
+	return t.resp
+}
+func (t headerProbeTx) Producer() plugintypes.AuditLogTransactionProducer { return nil }
+
+type headerProbeReq struct {
+	plugintypes.AuditLogTransactionRequest
+	headers map[string][]string
+}
+
+func (r headerProbeReq) Method() string               { return "GET" }
+func (r headerProbeReq) Protocol() string             { return "HTTP/1.1" }
+func (r headerProbeReq) URI() string                  { return "/probe" }
+func (r headerProbeReq) HTTPVersion() string          { return "HTTP/1.1" }
+func (r headerProbeReq) Headers() map[string][]string { return r.headers }
+func (r headerProbeReq) Body() string                 { return "" }
+func (r headerProbeReq) Files() []plugintypes.AuditLogTransactionRequestFiles {
+	return nil
+}
+func (r headerProbeReq) Length() int32 { return 0 }
+
+type headerProbeResp struct {
+	plugintypes.AuditLogTransactionResponse
+	headers map[string][]string
+}
+
+func (r headerProbeResp) Protocol() string             { return "HTTP/1.1" }
+func (r headerProbeResp) Status() int                  { return 200 }
+func (r headerProbeResp) Headers() map[string][]string { return r.headers }
+func (r headerProbeResp) Body() string                 { return "" }
+
+// 快照构建必须把精确 header 字节写入 HeadersBytes_（入队估算的唯一来源）：
+// 请求/响应两侧都要。
+func TestSnapshotTransaction_recordsExactHeaderBytes(t *testing.T) {
+	reqHeaders := map[string][]string{"Host": {"a.example.com"}, "X-Probe": {"1"}}
+	respHeaders := map[string][]string{"Content-Type": {"text/html"}}
+	al := headerProbeAuditLog{tx: headerProbeTx{
+		req:  headerProbeReq{headers: reqHeaders},
+		resp: headerProbeResp{headers: respHeaders},
+	}}
+	snap := snapshotAuditLog(al)
+	check := func(name string, hs map[string][]string, exact int64) {
+		t.Helper()
+		if exact == 0 {
+			t.Fatalf("%s HeadersBytes_ 未写入", name)
+		}
+		raw, err := json.Marshal(hs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if exact < int64(len(raw)) || exact > int64(len(raw))+1 {
+			t.Fatalf("%s 精确字节=%d, want %d..%d", name, exact, len(raw), len(raw)+1)
+		}
+	}
+	if req := snap.Transaction_.Request_; req == nil {
+		t.Fatal("请求快照缺失")
+	} else {
+		check("请求侧", req.Headers_, req.HeadersBytes_)
+		// 字节记账字段不得进入 JSON（json:"-"，审计行信封零变化）。
+		full, err := json.Marshal(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(full), "HeadersBytes") {
+			t.Fatalf("HeadersBytes_ 不得进入 JSON: %s", full)
+		}
+	}
+	if resp := snap.Transaction_.Response_; resp == nil {
+		t.Fatal("响应快照缺失")
+	} else {
+		check("响应侧", resp.Headers_, resp.HeadersBytes_)
+	}
 }
 
 // 队列字节预算：条数上限不界字节——大快照洪峰下按字节收敛驻留。
@@ -2247,5 +2433,64 @@ func TestSnapshotAuditLog_truncatesMessagesUnderItemCap(t *testing.T) {
 	}
 	if !strings.Contains(string(serialized), `"messages_dropped":`) {
 		t.Fatalf("截断标记缺失: %s", serialized[:min(len(serialized), 200)])
+	}
+}
+
+// messages 截断方向必须是「掐中间、保两头」：CRS 的 949xxx/959xxx 评估汇总
+// 消息位于消息序列末尾，异常分只从它的 msg 文本读 "Total Score"——只保开头
+// 会把命中规则多的请求的分数截成 0（而这类请求恰是审计价值最高的）。
+func TestSnapshotAuditLog_keepsThreatEvaluationMessagesWhenTruncated(t *testing.T) {
+	mk := func(id int, msg string) plugintypes.AuditLogMessage {
+		return estimateTestMessage{Message_: msg, Data_: &estimateTestMessageData{ID_: id, Msg_: msg}}
+	}
+	raw := make([]plugintypes.AuditLogMessage, 0, 200)
+	for i := 0; i < 196; i++ {
+		raw = append(raw, mk(942000+i, "attack "+strings.Repeat("m", 100)))
+	}
+	raw = append(raw,
+		mk(949110, "Inbound Anomaly Score Exceeded (Total Score: 42)"),
+		mk(959100, "Outbound Anomaly Score Exceeded (Total Score: 3)"),
+	)
+	snap := snapshotAuditLog(messageOnlyAuditLog{msgs: raw})
+	if snap.MessagesDropped_ != len(raw)-len(snap.Messages_) || snap.MessagesDropped_ == 0 {
+		t.Fatalf("messages_dropped=%d, want %d（中间段丢弃条数须显性披露）",
+			snap.MessagesDropped_, len(raw)-len(snap.Messages_))
+	}
+	if got := len(snap.Messages_); got > auditMessagesMaxEntries {
+		t.Fatalf("messages 保留 %d 条 > 上限 %d", got, auditMessagesMaxEntries)
+	}
+	var used int64
+	for _, m := range snap.Messages_ {
+		used += estimateAuditMessageBytes(m)
+	}
+	if used > auditMessagesMaxBytes {
+		t.Fatalf("messages 估算 %d 字节 > 上限 %d", used, auditMessagesMaxBytes)
+	}
+	// 头段保留首条（攻击特征命中的起点），尾段保留评估汇总。
+	if first := snap.Messages_[0]; first.(estimateTestMessage).Data_.ID_ != 942000 {
+		t.Fatalf("头部首条被丢弃：id=%d（截断退化成尾部截断）",
+			first.(estimateTestMessage).Data_.ID_)
+	}
+	kept := make(map[int]bool, len(snap.Messages_))
+	for _, m := range snap.Messages_ {
+		kept[m.Data().ID()] = true
+	}
+	for _, id := range []int{949110, 959100} {
+		if !kept[id] {
+			t.Fatalf("截断丢弃了评估汇总消息 %d：异常分归零/低估且无分数可解释", id)
+		}
+	}
+	if last := snap.Messages_[len(snap.Messages_)-1]; last.Data().ID() != 959100 {
+		t.Fatalf("尾段顺序被破坏：末条 id=%d, want 959100", last.Data().ID())
+	}
+	// 未触发上限的形态必须原序原样保留（不因截断逻辑重排）。
+	small := snapshotAuditLog(messageOnlyAuditLog{msgs: raw[:3]})
+	if small.MessagesDropped_ != 0 || len(small.Messages_) != 3 {
+		t.Fatalf("未超限形态被截断：dropped=%d kept=%d", small.MessagesDropped_, len(small.Messages_))
+	}
+	for i, m := range small.Messages_ {
+		if m.Data().ID() != raw[i].Data().ID() {
+			t.Fatalf("未超限形态顺序改变：第 %d 条 id=%d", i, m.Data().ID())
+		}
 	}
 }

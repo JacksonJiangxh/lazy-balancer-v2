@@ -16,6 +16,17 @@ import {
 } from '../src/utils/certQueue.ts'
 import { credentialFieldVisible, credentialOptionLabel, defaultCredentialsFor } from '../src/utils/dnsProviderFields.ts'
 
+// 「占位先于确认」判据：先证占位赋值存在，再证顺序。
+// 只比 indexOf 大小会空转——左操作数缺失时 -1 < 正值 恒真，恰恰放过「双击叠出
+// 两个确认框」这条要防的回归；占位变量改名后旧 token 也会静默失效。
+const assertPlaceholderBeforeConfirm = (block: string, placeholder: string, where: string): void => {
+  const placeholderAt = block.indexOf(placeholder)
+  assert.ok(placeholderAt >= 0, `${where}：确认前占位「${placeholder}」不存在（缺失时顺序断言会假绿）`)
+  const confirmAt = block.indexOf('confirmAction(')
+  assert.ok(confirmAt >= 0, `${where}：本段未调用 confirmAction`)
+  assert.ok(placeholderAt < confirmAt, `${where}：占位必须先于 confirmAction`)
+}
+
 test('自定义规则编辑深拷贝条件行（取消/保存失败不得污染列表行）', () => {
   const body = section(code('src/views/security/SecurityRules.vue'), 'const openRuleDialog', 'const saveCustomRule')
   assert.match(body, /row\.conditions\.map\(\(c\) => \(\{ \.\.\.c \}\)\)/)
@@ -360,15 +371,30 @@ test('节点审批/拒绝/删除在确认弹框之前取得占位', () => {
 test('服务控制/同步/同步设置/清钉同样在确认前占位', () => {
   const page = code('src/views/settings/ClusterSettings.vue')
   const service = section(page, 'const executeServiceControl = async', 'const forgetNodePin = async')
-  assert.ok(service.indexOf('serviceControlLoading.value = true') < service.indexOf('confirmAction('), '服务控制占位须先于确认')
+  assertPlaceholderBeforeConfirm(service, 'serviceControlLoading.value = true', '服务控制')
   const forgetPin = section(page, 'const forgetNodePin = async', 'const registerToken = ref')
-  assert.ok(forgetPin.indexOf('nodePinForgetting.value = true') < forgetPin.indexOf('confirmAction('))
+  assertPlaceholderBeforeConfirm(forgetPin, 'nodePinForgetting.value = true', '忘记节点 PIN')
   const sync = section(page, 'const syncNow = async', 'const forgetPins = async')
-  assert.ok(sync.indexOf('syncing.value = true') < sync.indexOf('confirmAction('))
+  assertPlaceholderBeforeConfirm(sync, 'syncing.value = true', '立即同步')
+  // 占位变量名为 clusterSettingsSaving：此前这里钉的是已不存在的
+  // settingsLoading，indexOf 恒 -1 使「同步设置」这一格从未真正被守住。
   const syncField = section(page, 'const updateSyncField = async', 'const updateSyncInterval = async')
-  assert.ok(syncField.indexOf('settingsLoading.value = true') < syncField.indexOf('confirmAction('))
+  assertPlaceholderBeforeConfirm(syncField, 'clusterSettingsSaving.value = true', '同步设置')
   const pins = section(page, 'const forgetPins = async', 'const generateRegisterToken = async')
-  assert.ok(pins.indexOf('forgettingPins.value = true') < pins.indexOf('confirmAction('))
+  assertPlaceholderBeforeConfirm(pins, 'forgettingPins.value = true', '清钉')
+})
+
+test('占位顺序判据自身不空转（元测试）', () => {
+  const ok = 'const f = async () => {\n  syncing.value = true\n  const ok = await confirmAction()\n}'
+  assertPlaceholderBeforeConfirm(ok, 'syncing.value = true', '样本')
+  // 占位被删 → 旧写法（-1 < 正值）仍通过，新判据必须变红
+  const missing = 'const f = async () => {\n  const ok = await confirmAction()\n}'
+  assert.throws(() => assertPlaceholderBeforeConfirm(missing, 'syncing.value = true', '样本'), /不存在/)
+  // 占位挪到确认之后（双击叠加确认框）必须变红
+  const reversed = 'const f = async () => {\n  const ok = await confirmAction()\n  syncing.value = true\n}'
+  assert.throws(() => assertPlaceholderBeforeConfirm(reversed, 'syncing.value = true', '样本'), /必须先于/)
+  // 段内根本没有确认框（section 切错段）必须变红，而不是静默通过
+  assert.throws(() => assertPlaceholderBeforeConfirm('syncing.value = true', 'syncing.value = true', '样本'), /未调用/)
 })
 
 test('TLS 文件选择器读完即复位（同路径重选可再次触发 change）', () => {

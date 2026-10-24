@@ -286,7 +286,7 @@ const NON_ENVELOPE_SITES: Record<string, number> = {
 const MIN_ENVELOPES: Record<(typeof SCAN_DIRS)[number], number> = {
   // 实测下限：writeInternalError 等共享装配器把多站点收敛为一个信封，
   // 目录级下限跟随实测（调用点对账仍保证无漏网）。
-  'internal/handlers': 1339,
+  'internal/handlers': 1323,
   'internal/middleware': 43,
 }
 

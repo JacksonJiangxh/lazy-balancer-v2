@@ -11,7 +11,10 @@ import (
 // 从节点侧防御——主节点（或被扩散的快照）可能携带 ≥2 个
 // is_default=1 的拦截页，applySecurityBlockPages 必须在写入后降级多余默认页，
 // 仅保留 MIN(id)，避免死行在从节点扩散。
-func TestApplySnapshot_demotesExtraDefaultBlockPages(t *testing.T) {
+// 口径：本用例只经 replaceSnapshotTx（不发角色复核/Caddy 重载/提交后副作用），
+// 因此命名对齐事务层——默认页降级是 applySecurityBlockPages 的写入门语义，
+// 不是端到端 applySnapshot 行为。
+func TestReplaceSnapshotTx_demotesExtraDefaultBlockPages(t *testing.T) {
 	// Given
 	_, database := newClusterTestService(t)
 	snapshot := models.ClusterSnapshot{
@@ -30,7 +33,7 @@ func TestApplySnapshot_demotesExtraDefaultBlockPages(t *testing.T) {
 
 	// When
 	if err := replaceSnapshotDB(context.Background(), database, snapshot); err != nil {
-		t.Fatalf("apply snapshot: %v", err)
+		t.Fatalf("replaceSnapshotTx: %v", err)
 	}
 
 	// Then

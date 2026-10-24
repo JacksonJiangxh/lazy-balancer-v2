@@ -46,11 +46,20 @@ func TestVerifySnapshotConsistency_allows_zero_upstream_rule_with_warning(t *tes
 	}
 
 	// When
+	buf := captureLogf(t)
 	err := verifySnapshotConsistency(snapshot)
 
-	// Then：不再拒绝快照，生成端会跳过该规则并告警
+	// Then：不再拒绝快照，但仍必须留下可定位告警（用例名承诺的 warning）；
+	// 只断言 err==nil 时告警被删也全绿。
 	if err != nil {
 		t.Fatalf("zero-upstream snapshot rejected: %v", err)
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "没有上游") || !strings.Contains(logged, "lb_drift") {
+		t.Fatalf("logs=%q, want 零上游规则 lb_drift 的告警", logged)
+	}
+	if strings.Contains(logged, "lb_healthy") || strings.Contains(logged, "lb_disabled") {
+		t.Fatalf("logs=%q, want 仅告警启用且零上游的规则", logged)
 	}
 }
 
@@ -229,7 +238,10 @@ func TestSyncService_do_rejectsCertificateFingerprintMismatchBeforeSendingToken(
 	}
 }
 
-func TestSyncService_do_doesNotFollowHTTPRedirectOrForwardCredentials(t *testing.T) {
+// 只覆盖「降级到 http 的 301 不跟随」形态（本用例的 Location 目标是
+// httptest 明文服务，与请求主机同名）。窄口径重定向的升级重放与跨主机拒绝
+// 由 DoWithSameHostTLSUpgradeRedirect 的专项用例覆盖。
+func TestSyncService_do_doesNotFollowDowngradeRedirectOrForwardCredentials(t *testing.T) {
 	received := make(chan http.Header, 1)
 	plaintext := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		received <- request.Header.Clone()

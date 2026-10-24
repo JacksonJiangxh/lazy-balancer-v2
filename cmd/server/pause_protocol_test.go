@@ -213,3 +213,45 @@ func TestDrainCaddy_postsStop(t *testing.T) {
 		t.Fatalf("排水前必须写 pause 标记: %v", err)
 	}
 }
+
+// 标记路径被同名目录占据时 Stat 同样成功：必须留痕（否则 supervisor 按崩溃
+// 重拉而 app 侧零线索），且不得尝试覆盖。
+func TestWriteDrainPauseFile_warnsWhenPathIsDirectory(t *testing.T) {
+	var logs bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	path := withTempPausePath(t)
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	writeDrainPauseFile()
+
+	if !strings.Contains(logs.String(), "同名目录") {
+		t.Fatalf("目录占据标记路径必须留痕，got %q", logs.String())
+	}
+	if info, err := os.Stat(path); err != nil || !info.IsDir() {
+		t.Fatalf("标记路径必须是原目录（不得被覆盖）: info=%v err=%v", info, err)
+	}
+}
+
+// admin 返回非 2xx（半死形态）必须留痕并带状态码：此前零日志让排障无法判断
+// Caddy 是否真的收到了 /stop。
+func TestDrainCaddy_logsRejectedStop(t *testing.T) {
+	withTempPausePath(t)
+	var logs bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(server.Close)
+
+	drainCaddy(server.URL, time.Second)
+
+	if !strings.Contains(logs.String(), "排水请求被拒") || !strings.Contains(logs.String(), "500") {
+		t.Fatalf("非 2xx 排水响应必须留痕并带状态码，got %q", logs.String())
+	}
+}

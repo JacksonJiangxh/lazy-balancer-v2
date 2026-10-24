@@ -83,11 +83,16 @@ func TestGetCaddyConfig_oversizeBodyReportedAsLimitNotParseFailure(t *testing.T)
 		w.WriteHeader(http.StatusOK)
 		// 32MB+1 探测：写出超过上限的字节流（重复空白即可，无需合法 JSON——
 		// 超限判定先于解析）。
-		chunk := []byte("                                                                ")
+		chunk := []byte(strings.Repeat(" ", 4096))
 		var written int64
 		for written < 33<<20 {
-			n, _ := w.Write(chunk)
+			n, err := w.Write(chunk)
 			written += int64(n)
+			// 客户端提前断开/写失败时 Write 返回 (0, err)——没有退出条件会让
+			// handler 永不返回，httptest 的 Close 随之阻塞（CI 偶发挂死）。
+			if err != nil || n == 0 {
+				break
+			}
 		}
 	}))
 	t.Cleanup(fake.Close)

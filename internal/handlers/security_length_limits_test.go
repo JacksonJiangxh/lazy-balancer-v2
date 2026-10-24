@@ -4,8 +4,12 @@ package handlers
 // 自定义规则名 ≤100 rune、自定义规则描述 ≤500 rune、
 // 拦截页名 ≤100 rune、拦截页描述 ≤500 rune、
 // 拦截页 content ≤64KB;DB 列无长度约束,超长串随审计详情/列表响应/发射文本放大。
+// 另：策略内联 IP 名单条数 ≤ipListMaxEntries（与 IP 名单条目同阈值）、
+// 自定义规则条件数/pattern 长度与 custom_rules 引用数在 services 侧单源封顶。
 
 import (
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -137,4 +141,87 @@ func TestSecurityInputs_lengthLimits(t *testing.T) {
 			t.Fatalf("500-rune block page description must pass, got %d %s", rec.Code, rec.Body.String())
 		}
 	})
+}
+
+// 策略内联 IP 名单条数封顶（与 IP 名单条目上限同阈值 2000）：内联名单原样
+// 随策略列表/详情回传并在每次渲染时逐条展开，全局请求体上限拦不住十万级
+// 条目；创建与更新两侧同门，边界值 N 放行 / N+1 拒绝。
+func TestSecurityPolicy_inlineIPListCountLimit(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newSecurityLengthRouter(t)
+
+	entries := make([]string, ipListMaxEntries)
+	for i := range entries {
+		entries[i] = fmt.Sprintf("10.0.%d.%d", i/256, i%256)
+	}
+	atLimit, err := json.Marshal(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := postJSON(t, router, "/security/policies", map[string]any{
+		"name": "ip-limit-at", "mode": "off", "ip_whitelist": string(atLimit),
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("条目数=上限(%d)必须放行, got %d %s", ipListMaxEntries, rec.Code, rec.Body.String())
+	}
+
+	overLimit, err := json.Marshal(append(entries, "10.9.9.9"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	limitText := fmt.Sprintf("%d", ipListMaxEntries)
+	rec = postJSON(t, router, "/security/policies", map[string]any{
+		"name": "ip-limit-over", "mode": "off", "ip_whitelist": string(overLimit),
+	})
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "不能超过") || !strings.Contains(rec.Body.String(), limitText) {
+		t.Fatalf("创建条目数=上限+1 必须 400 并给出数值, got %d %s", rec.Code, rec.Body.String())
+	}
+	// 更新侧同门。
+	rec = putJSON(t, router, "/security/policies/1", map[string]any{"ip_whitelist": string(overLimit)})
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "不能超过") {
+		t.Fatalf("更新条目数=上限+1 必须 400, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// 自定义规则的条件数与 pattern 长度超限经 API 返回 400（阈值单源在
+// services：customRuleMaxConditions/customRuleMaxPatternBytes——本用例只钉
+// 「写端点确实拒绝并给出可读文案」，具体阈值由 services 侧边界测试钉住）。
+func TestSecurityCustomRule_fieldLevelLimits(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newSecurityLengthRouter(t)
+
+	conditions := make([]map[string]any, 65)
+	for i := range conditions {
+		conditions[i] = map[string]any{"target": "uri", "operator": "contains", "pattern": "/x"}
+	}
+	rec := postJSON(t, router, "/security/custom-rules", map[string]any{
+		"name": "cond-limit", "action": "block", "score": 5, "conditions": conditions,
+	})
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "最多支持") {
+		t.Fatalf("条件数超限必须 400, got %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = postJSON(t, router, "/security/custom-rules", map[string]any{
+		"name": "pattern-limit", "action": "block", "score": 5,
+		"conditions": []map[string]any{{"target": "uri", "operator": "contains", "pattern": strings.Repeat("a", 4*1024+1)}},
+	})
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "不能超过") {
+		t.Fatalf("pattern 超限必须 400, got %d %s", rec.Code, rec.Body.String())
+	}
+
+	// 边界回归：上限内（64 条件 / 4KB pattern）放行。
+	conditions = conditions[:64]
+	rec = postJSON(t, router, "/security/custom-rules", map[string]any{
+		"name": "cond-limit-ok", "action": "block", "score": 5, "conditions": conditions,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("条件数=上限必须放行, got %d %s", rec.Code, rec.Body.String())
+	}
+	rec = postJSON(t, router, "/security/custom-rules", map[string]any{
+		"name": "pattern-limit-ok", "action": "block", "score": 5,
+		"conditions": []map[string]any{{"target": "uri", "operator": "contains", "pattern": strings.Repeat("a", 4*1024)}},
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("pattern=上限必须放行, got %d %s", rec.Code, rec.Body.String())
+	}
 }

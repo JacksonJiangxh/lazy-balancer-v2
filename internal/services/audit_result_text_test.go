@@ -150,19 +150,101 @@ func TestAuditResultText_ticketFailureCodes(t *testing.T) {
 
 // handlers/certificates.go 的 auditFailure 是局部闭包，结果码
 // 以动态实参进入 AuditResultPart——字面量扫描钉测（literalArgsCovered）天然
-// 覆盖不到，"blocked" 由此长期缺映射（审计详情渲染英文码）。本用例钉住该
-// 动态入口的取值集在映射内。
+// 覆盖不到，"blocked" 与 "conflict" 由此两次缺映射（审计详情渲染英文码）。
+// 取值域的唯一事实源是 services.auditDynamicResultCodes：本用例直接遍历该
+// 常量集（不再在测试里手写清单——手写清单曾与映射表同步漂移漏掉 conflict），
+// 要求每一项都有中文映射。
 func TestAuditResultText_dynamicClosureCodes(t *testing.T) {
-	// 动态传入 AuditResultPart 的结果码集合（证书 blocked 路径 + CA 测试 +
-	// 用户状态 + 登录票据 reason 的取值域）。
-	for _, code := range []string{"blocked", "provider_error", "not_found", "missing_acme_email", "invalid_config", "register_failed", "enabled", "disabled"} {
-		if got := AuditResultText(code); got == code {
+	if len(auditDynamicResultCodes) == 0 {
+		t.Fatal("动态结果码常量集为空——守护失效")
+	}
+	for _, code := range auditDynamicResultCodes {
+		if got := AuditResultText(code); got == code || got == "" {
 			t.Fatalf("动态结果码 %q 缺中文映射（渲染会落英文）", code)
 		}
 	}
 	if got := AuditResultText("blocked"); got != "重试被阻止" {
 		t.Fatalf("blocked 渲染=%q，want 重试被阻止", got)
 	}
+	if got := AuditResultText("conflict"); got != "状态冲突" {
+		t.Fatalf("conflict 渲染=%q，want 状态冲突", got)
+	}
+}
+
+// TestAuditResultText_auditFailureLiteralsRegistered 用 AST 扫出所有
+// auditFailure(...) 的**字面量**首参（证书签发路径的闭包以动态实参进入
+// AuditResultPart，字面量扫描覆盖不到），要求每个结果码既在
+// auditResultTextMap 有中文映射、也在 auditDynamicResultCodes 登记——新增
+// 结果码漏登记/漏映射即红。同名 helper 在 cluster_service.go 首参是节点编号
+// （整数），非字符串字面量，天然不在扫描面。
+func TestAuditResultText_auditFailureLiteralsRegistered(t *testing.T) {
+	root, err := filepath.Abs(filepath.Join("..", "..", "internal"))
+	if err != nil {
+		t.Fatalf("resolve internal dir: %v", err)
+	}
+	registered := make(map[string]struct{}, len(auditDynamicResultCodes))
+	for _, code := range auditDynamicResultCodes {
+		registered[code] = struct{}{}
+	}
+	missing := map[string]string{} // 结果码 → 首处证据位置
+	err = filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil || info.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		fset := token.NewFileSet()
+		f, perr := parser.ParseFile(fset, path, nil, 0)
+		if perr != nil {
+			t.Errorf("parse %s: %v", path, perr)
+			return nil
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok || len(call.Args) == 0 {
+				return true
+			}
+			ident, ok := call.Fun.(*ast.Ident)
+			if !ok || ident.Name != "auditFailure" {
+				return true
+			}
+			lit, ok := call.Args[0].(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				return true
+			}
+			value, uerr := strconv.Unquote(lit.Value)
+			if uerr != nil {
+				return true
+			}
+			_, inMap := auditResultTextMap[value]
+			_, inSet := registered[value]
+			if !inMap || !inSet {
+				if _, seen := missing[value]; !seen {
+					missing[value] = fset.Position(call.Pos()).String()
+				}
+			}
+			return true
+		})
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk internal: %v", err)
+	}
+	if len(missing) == 0 {
+		return
+	}
+	codes := make([]string, 0, len(missing))
+	for code := range missing {
+		codes = append(codes, code)
+	}
+	sort.Strings(codes)
+	var b strings.Builder
+	for _, code := range codes {
+		b.WriteString("  ")
+		b.WriteString(strconv.Quote(code))
+		b.WriteString(" @ ")
+		b.WriteString(missing[code])
+		b.WriteString("\n")
+	}
+	t.Fatalf("auditFailure 字面量结果码未登记/未映射（请在 auditDynamicResultCodes 登记并补 auditResultTextMap）:\n%s", b.String())
 }
 
 // 审计来源码渲染——

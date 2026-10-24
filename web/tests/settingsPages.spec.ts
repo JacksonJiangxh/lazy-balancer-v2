@@ -15,7 +15,7 @@ import {
   settingsTabConsumesConfig,
   settingsTabOfPage,
 } from '../src/utils/settingsPages.ts'
-import { source } from './_helpers.ts'
+import { code, source } from './_helpers.ts'
 
 test('分页清单：页键 ↔ 页头标题/描述一一对应（可见文案即契约）', () => {
   assert.deepEqual([...SETTINGS_TAB_IDS], ['basic', 'cluster', 'certificates', 'apikeys', 'tasks'])
@@ -47,14 +47,14 @@ test('分页清单：settings-<tab> 页键可逆映射，非设置页与未知�
 })
 
 test('分页清单：两处消费方共用单源，不再自带第二份映射', () => {
-  const settings = source('src/views/Settings.vue')
+  const settings = code('src/views/Settings.vue')
   assert.match(settings, /from '@\/utils\/settingsPages'/)
   assert.match(settings, /SETTINGS_TAB_TITLES\[activeTab\.value\]/)
   assert.match(settings, /settingsTabOfPage\(authStore\.currentPage\) \?\? 'basic'/)
   assert.doesNotMatch(settings, /const titles: Record<string, string>/)
   assert.doesNotMatch(settings, /const descs: Record<string, string>/)
 
-  const layout = source('src/components/layout/AppLayout.vue')
+  const layout = code('src/components/layout/AppLayout.vue')
   assert.match(layout, /from '@\/utils\/settingsPages'/)
   assert.match(layout, /SETTINGS_TAB_IDS\.map\(\(tab\) => \[`settings-\$\{tab\}`, `\$\{SETTINGS_BREADCRUMB_PARENT\} \/ \$\{SETTINGS_TAB_TITLES\[tab\]\}`\]\)/)
   assert.doesNotMatch(layout, /'settings-basic': '系统设置 \/ 基础设置'/)

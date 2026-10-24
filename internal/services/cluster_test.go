@@ -66,6 +66,11 @@ func newClusterTestService(t *testing.T) (*ClusterService, *sql.DB) {
 	return service, database
 }
 
+// replaceSnapshotDB 是 replaceSnapshotTx 的裸事务包装：只覆盖三节写入与
+// 归一列，不含角色复核、Caddy 重载、提交后副作用（日志清理/爬虫快照/重载
+// 判定）。用例用它时命名必须体现「事务层/往返」口径（TestReplaceSnapshotTx_*
+// 或 TestClusterSnapshot_*RoundTrip），不得取名 TestApplySnapshot_* 冒充
+// 端到端 apply 行为——后者只由 SyncService.applySnapshot 覆盖。
 func replaceSnapshotDB(ctx context.Context, database *sql.DB, snapshot models.ClusterSnapshot) error {
 	tx, err := database.BeginTx(ctx, nil)
 	if err != nil {

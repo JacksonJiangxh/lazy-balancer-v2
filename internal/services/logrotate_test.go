@@ -183,7 +183,12 @@ func TestRuntimeLogCleanupOnce_wafAuditFallbackWhenIngestionStopped(t *testing.T
 	})
 
 	// daemon 停机形态：audit.log 超阈（2KB > 1KB 阈值）且无人轮转。
-	if err := os.WriteFile(logPath, bytes.Repeat([]byte("x"), 2048), 0644); err != nil {
+	// 内容必须是可解析的审计文档：复制前闸门要求尾部可追平（畸形尾不轮转）。
+	stream := securityEventsFixtureClean + "\n" + securityEventsFixtureBlocked + "\n"
+	if len(stream) <= 1024 {
+		t.Fatalf("夹具长度 %d，须超过 1KB 轮转阈值", len(stream))
+	}
+	if err := os.WriteFile(logPath, []byte(stream), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	res := RuntimeLogCleanupOnce(filepath.Join(dir, "app.log"))
@@ -486,8 +491,14 @@ func TestLogCleanupRound_wafFallbackRotationFailureIsReported(t *testing.T) {
 		auditLogPath, securityEventsOffsetPath, auditLogSizeBytes, auditLogCopyFile = oldLogPath, oldOffsetPath, oldSizeBytes, oldCopy
 	})
 	resetSecurityEventsPollState(t)
-	// daemon 停机形态：超阈且无人轮转；兜底轮转自身失败（复制失败）
-	if err := os.WriteFile(logPath, bytes.Repeat([]byte("x"), 2048), 0o644); err != nil {
+	// daemon 停机形态：超阈且无人轮转；兜底轮转自身失败（复制失败）。
+	// 内容为可解析审计文档（复制前闸门要求尾部可追平，畸形尾会在闸门处推迟，
+	// 根本走不到复制失败分支）。
+	stream := securityEventsFixtureClean + "\n" + securityEventsFixtureBlocked + "\n"
+	if len(stream) <= 1024 {
+		t.Fatalf("夹具长度 %d，须超过 1KB 轮转阈值", len(stream))
+	}
+	if err := os.WriteFile(logPath, []byte(stream), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	auditLogCopyFile = func(string, string) error { return errors.New("injected copy failure") }
@@ -708,7 +719,12 @@ func TestLogCleanupRound_emptyLogFileStillRunsWafFallback(t *testing.T) {
 	t.Cleanup(func() {
 		auditLogPath, securityEventsOffsetPath, auditLogSizeBytes = oldLogPath, oldOffsetPath, oldSizeBytes
 	})
-	if err := os.WriteFile(logPath, bytes.Repeat([]byte("x"), 2048), 0o644); err != nil {
+	// 可解析审计文档（复制前闸门要求尾部可追平；畸形尾会在闸门处推迟）。
+	stream := securityEventsFixtureClean + "\n" + securityEventsFixtureBlocked + "\n"
+	if len(stream) <= 1024 {
+		t.Fatalf("夹具长度 %d，须超过 1KB 轮转阈值", len(stream))
+	}
+	if err := os.WriteFile(logPath, []byte(stream), 0o644); err != nil {
 		t.Fatal(err)
 	}
 

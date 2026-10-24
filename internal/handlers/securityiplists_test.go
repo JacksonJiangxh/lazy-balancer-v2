@@ -226,6 +226,51 @@ func TestCreateIPList_globalCountLimit(t *testing.T) {
 	}
 }
 
+// 名单额度只计用户创建的名单（与备份导入 validateBackupIPListQuota 同口径）：
+// 系统内置名单由 SeedSystemIPLists 自动补齐、不占用户额度——此前新建门按
+// 全表行数计，系统名单会挤掉用户可建空间（导入 197 条用户名单后新建被误挡）。
+func TestCreateIPList_quotaCountsUserListsOnly(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newIPListRouter(t)
+	tx, err := db.DB.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4; i++ {
+		if _, err := tx.Exec(`INSERT INTO security_ip_lists (name, entries, system) VALUES (?, '[]', 1)`, fmt.Sprintf("系统名单-%d", i)); err != nil {
+			_ = tx.Rollback()
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < ipListMaxGlobalCount-1; i++ {
+		if _, err := tx.Exec(`INSERT INTO security_ip_lists (name, entries) VALUES (?, '[]')`, fmt.Sprintf("用户名单-%d", i)); err != nil {
+			_ = tx.Rollback()
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	var totalRows int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM security_ip_lists`).Scan(&totalRows); err != nil {
+		t.Fatal(err)
+	}
+	if totalRows <= ipListMaxGlobalCount {
+		t.Fatalf("夹具必须让全表行数超过额度（total=%d），否则旧口径不会误挡", totalRows)
+	}
+
+	// 第 200 个用户名单：放行（系统名单不占额度）。
+	rec := postJSON(t, router, "/security/ip-lists", map[string]any{"name": "额度边界-200", "entries": "[]"})
+	if rec.Code != http.StatusOK && rec.Code != http.StatusCreated {
+		t.Fatalf("status=%d body=%s, want 200（系统名单不占用户额度）", rec.Code, rec.Body.String())
+	}
+	// 第 201 个用户名单：拒绝。
+	rec = postJSON(t, router, "/security/ip-lists", map[string]any{"name": "额度边界-201", "entries": "[]"})
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "上限") {
+		t.Fatalf("status=%d body=%s, want 400 上限", rec.Code, rec.Body.String())
+	}
+}
+
 func TestRemoveIPFromList_rejectsNonCanonicalIDs(t *testing.T) {
 	for _, id := range []string{"5.0", "%205", "abc", "0", "-1"} {
 		t.Run(id, func(t *testing.T) {
@@ -975,5 +1020,168 @@ func TestIPListEntriesChanged_semanticComparison(t *testing.T) {
 				t.Fatalf("changed=%v, want %v", got, tc.changed)
 			}
 		})
+	}
+}
+
+// buildIPListEntries 造 n 条合法条目（可选到期时间），供上限/剔除用例复用。
+func buildIPListEntries(t *testing.T, n int, expiresAt string) []models.IPListEntry {
+	t.Helper()
+	entries := make([]models.IPListEntry, 0, n)
+	for i := range n {
+		entries = append(entries, models.IPListEntry{
+			Value:     fmt.Sprintf("10.%d.%d.1", i/256, i%256),
+			ExpiresAt: expiresAt,
+		})
+	}
+	return entries
+}
+
+func marshalIPListEntries(t *testing.T, entries []models.IPListEntry) string {
+	t.Helper()
+	raw, err := json.Marshal(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
+}
+
+// 条目上限按**生效**条目计：自动封禁关闭后到期条目不再被任务
+// 清理，按原始长度计上限会让「生效 2000 + 到期残留」的整表保存被 400 挡下，
+// 用户只能逐行删除到期行。保存时到期条目被剔除（到期即解封），原始条数与
+// 生效条数不再有两个口径。
+func TestIPListSave_capCountsActiveEntriesAndPrunesExpired(t *testing.T) {
+	const expiredAt = "2000-01-01 00:00:00"
+	t.Run("生效 2000 + 到期残留 5 → 放行且剔除到期条目", func(t *testing.T) {
+		setupSecurityPolicyTestDB(t)
+		router := newIPListRouter(t)
+		listID := seedIPListRow(t, "active-cap-ok", `[]`)
+		payload := append(buildIPListEntries(t, ipListMaxEntries, ""), buildIPListEntries(t, 5, expiredAt)...)
+		rec := putJSON(t, router, fmt.Sprintf("/security/ip-lists/%d", listID), map[string]any{
+			"entries": marshalIPListEntries(t, payload),
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s（生效条目未超上限，到期残留不得挡下保存）", rec.Code, rec.Body.String())
+		}
+		var payloadResp struct {
+			Data struct {
+				EntryCount    int `json:"entry_count"`
+				PrunedExpired int `json:"pruned_expired"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &payloadResp); err != nil {
+			t.Fatalf("decode: %v body=%s", err, rec.Body.String())
+		}
+		if payloadResp.Data.EntryCount != ipListMaxEntries || payloadResp.Data.PrunedExpired != 5 {
+			t.Fatalf("响应披露=(entry_count=%d, pruned_expired=%d), want (%d, 5)",
+				payloadResp.Data.EntryCount, payloadResp.Data.PrunedExpired, ipListMaxEntries)
+		}
+		var stored string
+		if err := db.DB.QueryRow(`SELECT entries FROM security_ip_lists WHERE id=?`, listID).Scan(&stored); err != nil {
+			t.Fatal(err)
+		}
+		var parsed []models.IPListEntry
+		if err := json.Unmarshal([]byte(stored), &parsed); err != nil {
+			t.Fatalf("stored entries: %v", err)
+		}
+		if len(parsed) != ipListMaxEntries {
+			t.Fatalf("落库条目=%d, want %d（到期条目必须剔除）", len(parsed), ipListMaxEntries)
+		}
+		for _, entry := range parsed {
+			if entry.ExpiresAt != "" {
+				t.Fatalf("到期条目未被剔除: %+v", entry)
+			}
+		}
+	})
+
+	t.Run("生效 2001 → 400 且文案点明生效口径", func(t *testing.T) {
+		setupSecurityPolicyTestDB(t)
+		router := newIPListRouter(t)
+		listID := seedIPListRow(t, "active-cap-over", `[]`)
+		payload := append(buildIPListEntries(t, ipListMaxEntries+1, ""), buildIPListEntries(t, 5, expiredAt)...)
+		rec := putJSON(t, router, fmt.Sprintf("/security/ip-lists/%d", listID), map[string]any{
+			"entries": marshalIPListEntries(t, payload),
+		})
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status=%d body=%s, want 400", rec.Code, rec.Body.String())
+		}
+		if body := rec.Body.String(); !strings.Contains(body, "生效条目数量不能超过") {
+			t.Fatalf("错误文案未点明生效口径: %s", body)
+		}
+	})
+
+	t.Run("仅剩到期条目的保存仍走 allow 空集门", func(t *testing.T) {
+		setupSecurityPolicyTestDB(t)
+		router := newIPListRouter(t)
+		listID := seedIPListRow(t, "all-expired", `[]`)
+		// 引用该名单的 allow 策略：清空（到期剔除后为空集）必须 409。
+		if _, err := db.DB.Exec(`INSERT INTO security_policies (name, mode, enabled, ip_acl_enabled, ip_acl_mode, ip_acl_list_refs) VALUES ('all-expired-policy','off',1,1,'allow',?)`, fmt.Sprintf("[%d]", listID)); err != nil {
+			t.Fatal(err)
+		}
+		rec := putJSON(t, router, fmt.Sprintf("/security/ip-lists/%d", listID), map[string]any{
+			"entries": marshalIPListEntries(t, buildIPListEntries(t, 3, expiredAt)),
+		})
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("status=%d body=%s, want 409（生效集变空必须拦截）", rec.Code, rec.Body.String())
+		}
+	})
+}
+
+// 名单「引用」展示含禁用策略（展示面全量），删除门只计启用——引用项必须
+// 携带启用态，并单独给出阻止删除的引用数：否则页面出现
+// 「显示有引用却可删除」，删除后禁用策略留下悬空引用（重启用时才 400）。
+func TestIPListRefs_exposeEnabledStateAndBlockingCount(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	router := newIPListRouter(t)
+	listID := seedIPListRow(t, "refs-enabled", `[{"value":"203.0.113.1"}]`)
+	if _, err := db.DB.Exec(`INSERT INTO security_policies (name, mode, enabled, ip_acl_enabled, ip_acl_mode, ip_acl_list_refs) VALUES ('refs-enabled-on','off',1,1,'deny',?)`, fmt.Sprintf("[%d]", listID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO security_policies (name, mode, enabled, ip_acl_enabled, ip_acl_mode, ip_acl_list_refs) VALUES ('refs-enabled-off','off',0,1,'deny',?)`, fmt.Sprintf("[%d]", listID)); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := getRequest(t, router, "/security/ip-lists")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Data []struct {
+			ID              int               `json:"id"`
+			RefCount        int               `json:"ref_count"`
+			RefCountEnabled int               `json:"ref_count_enabled"`
+			RefPolicies     []ipListRefPolicy `json:"ref_policies"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode: %v body=%s", err, rec.Body.String())
+	}
+	rowIdx := -1
+	for i := range payload.Data {
+		if payload.Data[i].ID == int(listID) {
+			rowIdx = i
+		}
+	}
+	if rowIdx < 0 {
+		t.Fatalf("名单 #%d 不在列表响应中: %s", listID, rec.Body.String())
+	}
+	row := payload.Data[rowIdx]
+	if row.RefCount != 2 || row.RefCountEnabled != 1 {
+		t.Fatalf("ref_count=%d ref_count_enabled=%d, want 2/1", row.RefCount, row.RefCountEnabled)
+	}
+	states := map[string]bool{}
+	for _, ref := range row.RefPolicies {
+		states[ref.Name] = ref.Enabled
+	}
+	if !states["refs-enabled-on"] || states["refs-enabled-off"] {
+		t.Fatalf("引用启用态错配: %+v", row.RefPolicies)
+	}
+	// 删除门只计启用——禁用引用的存在不阻止删除（既有裁定，展示口径不得改变门）。
+	if _, err := db.DB.Exec(`UPDATE security_policies SET enabled=0 WHERE name='refs-enabled-on'`); err != nil {
+		t.Fatal(err)
+	}
+	delRec := httptest.NewRecorder()
+	router.ServeHTTP(delRec, httptest.NewRequest(http.MethodDelete, fmt.Sprintf("/security/ip-lists/%d", listID), nil))
+	if delRec.Code != http.StatusOK {
+		t.Fatalf("delete status=%d body=%s, want 200（禁用引用不阻止删除）", delRec.Code, delRec.Body.String())
 	}
 }

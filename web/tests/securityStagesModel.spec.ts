@@ -27,7 +27,9 @@ import {
   trustHitMode,
   type SecurityStageBinding,
   type SecurityStageBlockPage,
+  type SecurityStageIPList,
   type SecurityStagePolicy,
+  type StageDetailSources,
 } from '../src/utils/securityStages.ts'
 
 const policyOf = (overrides: Partial<SecurityStagePolicy> = {}): SecurityStagePolicy => ({
@@ -508,3 +510,202 @@ test('多策略绑定链：同阶段两条策略出两组且按绑定顺序编�
   assert.equal(model.stages[0].enabled, false)
 })
 
+
+// ── 信任降级 / 信任生效 / 列表默认 tab 的补充验收 ──
+import { hasTrustDetectionBinding, pickDefaultPolicyTab } from '../src/utils/securityStages.ts'
+import { trustEnabledForPolicyType } from '../src/utils/policyPayload.ts'
+
+test('fs96-01 阶段 1 脚注降级判定：混合策略存量信任同样降级，不得按 policy_type 等值漏判', () => {
+  const bound = new Set([1])
+  const mixed = policyOf({
+    id: 1,
+    policy_type: 'mixed',
+    ip_whitelist_enabled: true,
+    ip_whitelist: '["203.0.113.7"]',
+    trust_detection: false,
+  })
+  // 引擎口径：mixed 存量信任进 id:3 并集（DetectionOnly），与 trust_detection 无关
+  assert.equal(hasTrustDetectionBinding(bound, [mixed]), true)
+  // 阶段 0 仍按 trust_detection
+  assert.equal(hasTrustDetectionBinding(bound, [policyOf({
+    id: 1, policy_type: 'stage0', ip_whitelist_enabled: true, ip_whitelist: '["1.1.1.1"]', trust_detection: true,
+  })]), true)
+  assert.equal(hasTrustDetectionBinding(bound, [policyOf({
+    id: 1, policy_type: 'stage0', ip_whitelist_enabled: true, ip_whitelist: '["1.1.1.1"]', trust_detection: false,
+  })]), false)
+  // 回归形状：未绑定 / 禁用 / 信任关闭 / 空名单 → 不得声称存在降级路径
+  assert.equal(hasTrustDetectionBinding(new Set([9]), [mixed]), false)
+  assert.equal(hasTrustDetectionBinding(bound, [{ ...mixed, enabled: false }]), false)
+  assert.equal(hasTrustDetectionBinding(bound, [{ ...mixed, ip_whitelist_enabled: false }]), false)
+  assert.equal(hasTrustDetectionBinding(bound, [{ ...mixed, ip_whitelist: '[]', ip_whitelist_refs: '[]' }]), false)
+})
+
+test('fs96-02 信任生效谓词：阶段 0 恒启用（新建态 ipWhitelistEnabled=false 也不得判零生效）', () => {
+  assert.equal(trustEnabledForPolicyType('stage0', false), true)
+  assert.equal(trustEnabledForPolicyType('stage0', true), true)
+  // 其余类型按三态开关
+  assert.equal(trustEnabledForPolicyType('stage1', true), true)
+  assert.equal(trustEnabledForPolicyType('stage1', false), false)
+  assert.equal(trustEnabledForPolicyType('mixed', false), false)
+})
+
+test('fs96-05 策略列表默认 tab 选择：第一个非空类型，全空回落阶段 1', () => {
+  const counts = (overrides: Partial<Record<'stage0' | 'stage1' | 'stage2' | 'stage3' | 'mixed', number>> = {}) => ({
+    stage0: 0, stage1: 0, stage2: 0, stage3: 0, mixed: 0, ...overrides,
+  })
+  // 只部署阶段 3：不得停在阶段 1 空表
+  assert.equal(pickDefaultPolicyTab(counts({ stage3: 2 })), 'stage3')
+  // 阶段顺序优先（阶段 0 有条目即优先于阶段 3）
+  assert.equal(pickDefaultPolicyTab(counts({ stage0: 1, stage3: 2 })), 'stage0')
+  assert.equal(pickDefaultPolicyTab(counts({ stage1: 1, stage2: 3 })), 'stage1')
+  // 混合兼容组按阶段顺序排最后
+  assert.equal(pickDefaultPolicyTab(counts({ mixed: 4 })), 'mixed')
+  // 全空回落到阶段 1（列表初始态）
+  assert.equal(pickDefaultPolicyTab(counts()), 'stage1')
+})
+
+// ── 阶段抽屉的明细面 ──
+// 此前覆盖只到「出组/不出的结构」，用户实际读到的
+// 明细行（地域措辞、限流口径、自定义规则 join、CRS 组标签、引用名单名/计数、
+// 条目合并去重）与阶段 2/3 的 buildGroupDetails 整块零执行。
+
+const detailsAt = (stageIndex: 0 | 1 | 2 | 3, policy: SecurityStagePolicy, ipLists: SecurityStageIPList[] = [], sources?: StageDetailSources) => {
+  const binding = bindingOf({ policy_id: policy.id, mode: policy.mode })
+  const model = buildStageModel([binding], [policy], ipLists, [])
+  return attachStageDetails(model, { policies: [policy], ipLists, sources }).stages[stageIndex].groups[0]?.details
+}
+
+test('明细 · 阶段 1 地域行：启用按模式措辞，关闭但保留区域显性披露', () => {
+  const deny = policyOf({ id: 21, has_geoip: true, geoip_mode: 'deny', geoip_countries: '["US","CN"]' })
+  assert.deepEqual(
+    stageRows(bindingOf({ policy_id: 21 }), deny, [], 1).find((row) => row.label === '地域拦截'),
+    { label: '地域拦截', detail: '拦截所选区域 · 2 区域' },
+  )
+  const allow = policyOf({ id: 21, has_geoip: true, geoip_mode: 'allow', geoip_countries: '["US"]' })
+  assert.equal(
+    stageRows(bindingOf({ policy_id: 21 }), allow, [], 1).find((row) => row.label === '地域拦截')?.detail,
+    '仅允许所选区域 · 1 区域',
+  )
+  // 关闭但保留区域：不得显示成「0 区域」或干脆不出行（用户看不出保留了什么）
+  const retained = policyOf({ id: 21, has_geoip: false, geoip_countries: '["US","JP","KR"]' })
+  assert.equal(
+    stageRows(bindingOf({ policy_id: 21 }), retained, [], 1).find((row) => row.label === '地域拦截')?.detail,
+    '已关闭（保留 3 区域）',
+  )
+  // 无地域能力且无保留区域 → 阶段 1 不出组
+  const none = policyOf({ id: 21, has_geoip: false, geoip_countries: '[]' })
+  assert.equal(buildStageModel([bindingOf({ policy_id: 21 })], [none], [], []).stages[1].groups[0], undefined)
+})
+
+test('明细 · 阶段 2 限流口径：限流双 zone 口径随 burst 切换', () => {
+  const burst = policyOf({ id: 31, has_rate_limit: true, rate_limit_rps: 10, rate_limit_burst: 20 })
+  assert.deepEqual(detailsAt(2, burst)?.rateLimit, {
+    rps: 10,
+    burst: 20,
+    caption: '1s 窗口上限 30 次（含突发）· 60s 窗口上限 600 次（持续 10 次/秒）',
+  })
+  // burst=0：后端只发射单 1s 窗口，文案不得再承诺 60s 窗口
+  const noBurst = policyOf({ id: 31, has_rate_limit: true, rate_limit_rps: 10, rate_limit_burst: 0 })
+  assert.deepEqual(detailsAt(2, noBurst)?.rateLimit, { rps: 10, burst: 0, caption: '1s 窗口上限 10 次' })
+})
+
+test('明细 · 阶段 3 自定义规则与 CRS 组：自定义规则按 id join 规则库、CRS 组标签可回退裸码', () => {
+  const policy = policyOf({ id: 41, mode: 'blocking', has_custom_rules: true, custom_rules_count: 3 })
+  const sources: StageDetailSources = {
+    fullPolicies: new Map([[41, { id: 41, custom_rules: [7, 8, 999], crs_rule_groups: ['42', '55', '99'] }]]),
+    customRules: [
+      { id: 7, name: 'SQL 注入', action: 'block', conditions: [{ target: 'ARGS' }, { target: 'BODY' }] },
+      { id: 8, name: 'XSS', action: 'log', score: 5, enabled: false },
+    ],
+    crsFiles: [
+      { filename: 'REQUEST-942-APPLICATION-ATTACK-SQLI.conf', category: 'SQL 注入' },
+      { filename: 'RESPONSE-955-WEB-SHELLS.conf', category: 'Web Shells' },
+    ],
+  }
+  const details = detailsAt(3, policy, [], sources)
+  // 命中库的行带名称/动作/目标串/启用态；已删除的行（999）显性标注「规则 #id」
+  assert.deepEqual(details?.customRules, [
+    { id: 7, name: 'SQL 注入', action: 'block', targets: 'ARGS / BODY', score: 0, enabled: true },
+    { id: 8, name: 'XSS', action: 'log', targets: '', score: 5, enabled: false },
+    { id: 999, name: '规则 #999', action: '-', targets: '', score: 0, enabled: true },
+  ])
+  assert.deepEqual(details?.crsGroups, ['请求 · 942 · SQL 注入', '响应 · 955 · Web Shells', '99'])
+  // 规则文件列表未加载 / 组已消失 → 回退裸组码，不阻断明细区
+  const bare = detailsAt(3, policy, [], { fullPolicies: sources.fullPolicies })
+  assert.deepEqual(bare?.crsGroups, ['42', '55', '99'])
+  // 绑定详情未拉取（无 fullPolicies）→ 明细对象为空，不虚增 customRules/crsGroups 键
+  assert.deepEqual(detailsAt(3, policy), {})
+})
+
+test('明细 · 阶段 3 模式行：检测 / 仅自定义措辞与 CRS 行裁剪', () => {
+  const detection = policyOf({ id: 51, mode: 'detection', crs_rule_groups: '["42","55"]' })
+  const detectionRows = stageRows(bindingOf({ policy_id: 51, mode: 'detection' }), detection, [], 3)
+  assert.deepEqual(detectionRows[0], { label: 'WAF（检测）', detail: '仅记录不阻断' })
+  assert.deepEqual(detectionRows.find((row) => row.label === 'CRS 规则组'), { label: 'CRS 规则组', detail: '2 组' })
+
+  const customOnly = policyOf({ id: 51, mode: 'custom_only', has_custom_rules: true, custom_rules_count: 4, crs_rule_groups: '["42"]' })
+  const customRows = stageRows(bindingOf({ policy_id: 51, mode: 'custom_only' }), customOnly, [], 3)
+  assert.deepEqual(customRows[0], { label: 'WAF（仅自定义）', detail: '自定义规则按动作执行' })
+  assert.equal(customRows.some((row) => row.label === 'CRS 规则组'), false, '仅自定义模式 CRS 不参与评估，不得出 CRS 行')
+  assert.deepEqual(customRows.find((row) => row.label === '自定义规则'), { label: '自定义规则', detail: '4 条' })
+})
+
+test('明细 · 条目合并与 ACL 名单计数：内联优先去重、引用条目带来源/备注、缺失名单跳过；ACL 名单名与计数', () => {
+  const ipLists: SecurityStageIPList[] = [
+    {
+      id: 10,
+      name: '名单甲',
+      entry_count: 2,
+      entries: [
+        { value: '2.2.2.2', remark: '重复项，不得覆盖内联' },
+        { value: '3.3.3.3', remark: '备注' },
+        { value: '   ' },
+      ],
+    },
+    { id: 11, entries: [{ value: '4.4.4.4' }] },
+  ]
+  const trust = policyOf({
+    id: 61,
+    policy_type: 'stage0',
+    ip_whitelist: '["1.1.1.1"," 2.2.2.2 ","1.1.1.1",""]',
+    ip_whitelist_refs: '[10,11,12]',
+  })
+  assert.deepEqual(detailsAt(0, trust, ipLists)?.trustEntries, [
+    { value: '1.1.1.1', source: '内联' },
+    { value: '2.2.2.2', source: '内联' },
+    { value: '3.3.3.3', remark: '备注', source: '列表：名单甲' },
+    // 引用条目无备注时键存在但为 undefined（消费方按 ?? 展示，不得改写为默认文案）
+    { value: '4.4.4.4', remark: undefined, source: '列表：#11' },
+  ])
+
+  const acl = policyOf({
+    id: 62,
+    policy_type: 'stage1',
+    has_ip_control: true,
+    ip_acl_enabled: true,
+    ip_acl_list: '["9.9.9.9","9.9.9.9","8.8.8.8"]',
+    ip_acl_list_refs: '[10,13]',
+  })
+  const aclDetails = detailsAt(1, acl, ipLists)
+  assert.equal(aclDetails?.aclInlineCount, 2, '内联按去重值计数')
+  assert.deepEqual(aclDetails?.aclLists, [
+    { name: '名单甲', count: 2 },
+    { name: '列表 #13', count: 0 },
+  ], '未加载的引用名单显性显示为「列表 #id」，不得静默丢弃')
+
+  // ACL 关闭但保留名单：明细与摘要同门——不出 aclLists/aclInlineCount，
+  // 遗留独立黑名单仍照常列出（它不受 ACL 开关门控）。
+  const closed = policyOf({
+    id: 63,
+    policy_type: 'stage1',
+    has_ip_control: true,
+    ip_acl_enabled: false,
+    ip_acl_list: '["9.9.9.9"]',
+    ip_acl_list_refs: '[10]',
+    ip_blacklist: '["7.7.7.7","7.7.7.7"]',
+  })
+  const closedDetails = detailsAt(1, closed, ipLists)
+  assert.equal(closedDetails?.aclLists, undefined)
+  assert.equal(closedDetails?.aclInlineCount, undefined)
+  assert.deepEqual(closedDetails?.blacklistEntries, ['7.7.7.7'])
+})

@@ -183,12 +183,6 @@ func threatRollupBackfillPending(database *sql.DB) (bool, error) {
 // 批间让出写锁的等待同时检查 ctx——Stop（cancel 后等待 worker 退出）
 // 得以在大批量首遍（如数据恢复后的百万行）中及时中止，不再被拖到 docker
 // SIGKILL 跳过 db.Close。
-// SecurityEventsRetentionCleanupCtxErr 单轮清理入口（导出面唯一形态）：任务体
-// 传 rc.Ctx（批间 ctx.Done() 分支才在生产可达，停机时百万行清理可及时中止，
-// 不拖过宽限期被 SIGKILL 跳过 db.Close/WAL 落盘），并返回本轮首个清理错误，
-// 供任务引擎把失败写进 task_runs。
-// Once（无 ctx 包装）与 Ctx（吞错误的 int 包装）全仓
-// 零调用，已删除——注释曾称「保留给测试/兼容调用」与事实不符。
 // SecurityEventsRetentionResult 单轮保留清理的各表删除量。任务日志必须按
 // 构成披露：聚合/高水位删除不计入事件数时，停摆后首次清理在事件表无过期行
 // 的形态会显示「删除 0 条」，运维据此误判保留策略未生效。
@@ -208,15 +202,11 @@ func (r SecurityEventsRetentionResult) Aggregates() int {
 	return r.Rollup + r.TargetRollup + r.Highwater
 }
 
-// SecurityEventsRetentionCleanupCtxErr 单轮清理入口（兼容形态）：只返回
-// security_events 删除数。任务日志用 Detail 形态披露全部构成。
-func SecurityEventsRetentionCleanupCtxErr(ctx context.Context) (int, error) {
-	res, err := securityEventsRetentionCleanup(ctx)
-	return res.Events, err
-}
-
-// SecurityEventsRetentionCleanupDetail 单轮清理入口（详细形态）：返回事件/
-// 聚合/高水位各表删除量，供任务日志按构成披露。
+// SecurityEventsRetentionCleanupDetail 是单轮清理的唯一入口（任务体传
+// rc.Ctx：批间 ctx.Done() 分支才在生产可达，停机时百万行清理可及时中止，
+// 不拖过宽限期被 SIGKILL 跳过 db.Close/WAL 落盘），返回事件/聚合/高水位
+// 各表删除量与首个清理错误（供任务引擎把失败写进 task_runs）。
+// 只返回事件数的兼容包装已删除——生产任务体只用本函数，其余形态没有调用方。
 func SecurityEventsRetentionCleanupDetail(ctx context.Context) (SecurityEventsRetentionResult, error) {
 	return securityEventsRetentionCleanup(ctx)
 }

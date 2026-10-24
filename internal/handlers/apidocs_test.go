@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"gopkg.in/yaml.v3"
@@ -877,6 +878,46 @@ func TestAPIDocs_threatScreenExampleKeysMatchImplementation(t *testing.T) {
 		t.Fatal("apiDocRoutes missing GET /security/overview/threat-screen entry")
 	}
 
+	for key := range impl.Data {
+		if _, ok := docExample[key]; !ok {
+			t.Errorf("实现响应键 %q 未在文档示例中", key)
+		}
+	}
+	for key := range docExample {
+		if _, ok := impl.Data[key]; !ok {
+			t.Errorf("文档示例键 %q 实现未返回", key)
+		}
+	}
+}
+
+// 攻击光流与正常光流的空洞披露必须同形（gap/gap_skipped）：文档示例缺这两个
+// 字段时，自建大屏/告警脚本无从区分「攻击减少」与「环形缓冲溢出丢样」。
+func TestAPIDocs_attackFlowExampleKeysMatchImplementation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/security/overview/threat-screen/attack-flow", (&Handlers{}).GetThreatScreenAttackFlow)
+	recorder := getRequest(t, router, "/security/overview/threat-screen/attack-flow")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var impl struct {
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &impl); err != nil {
+		t.Fatalf("parse implementation response: %v", err)
+	}
+
+	var docExample map[string]any
+	for _, route := range apiDocRoutes {
+		if route.Method == http.MethodGet && route.Path == "/security/overview/threat-screen/attack-flow" {
+			if err := json.Unmarshal([]byte(route.Response), &docExample); err != nil {
+				t.Fatalf("parse doc example: %v", err)
+			}
+		}
+	}
+	if docExample == nil {
+		t.Fatal("apiDocRoutes missing GET /security/overview/threat-screen/attack-flow entry")
+	}
 	for key := range impl.Data {
 		if _, ok := docExample[key]; !ok {
 			t.Errorf("实现响应键 %q 未在文档示例中", key)
@@ -1818,5 +1859,100 @@ func TestAPIDocRoutes_degradedSemanticsDocumented(t *testing.T) {
 	backup := routesEntry(t, "GET /settings/auto-backup").Description
 	if !strings.Contains(backup, "next_run_at") || !strings.Contains(backup, "null") {
 		t.Errorf("GET /settings/auto-backup description 未说明 next_run_at 可能为 null: %q", backup)
+	}
+}
+
+// 自动备份时间字段：文档示例为 UTC 墙钟串（2006-01-02 15:04:05）——实现必须
+// 同形（显式格式化，不依赖驱动把 DATETIME 隐式转 RFC3339）。按示例写解析器的
+// 脚本才能一次解析成功，也不会把 UTC 当本地时间再转一次。
+func TestAPIDocs_autoBackupTimeFieldsMatchDocumentedFormat(t *testing.T) {
+	layout := "2006-01-02 15:04:05"
+	const want = "2026-09-20 03:00:00"
+	h := newAutoBackupTestHandlers(t)
+	if _, err := db.DB.Exec(`INSERT INTO auto_backups (filename, created_at, status, size_bytes, sections, trigger_type, message, app_version)
+		VALUES ('lbbak-auto-20260920-030000.lbbak','` + want + `','success',1024,'["users"]','schedule','','v2.3.8-beta')`); err != nil {
+		t.Fatalf("seed auto_backups row: %v", err)
+	}
+	response := serveAutoBackupJSON(t, h, http.MethodGet, "/settings/auto-backup", "/settings/auto-backup", "", h.AutoBackupSettings)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var impl struct {
+		Data struct {
+			LastSuccessAt string `json:"last_success_at"`
+			Backups       []struct {
+				CreatedAt string `json:"created_at"`
+			} `json:"backups"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &impl); err != nil {
+		t.Fatalf("parse implementation response: %v", err)
+	}
+	if impl.Data.LastSuccessAt != want {
+		t.Errorf("last_success_at=%q, want %q（UTC 墙钟串）", impl.Data.LastSuccessAt, want)
+	}
+	if len(impl.Data.Backups) != 1 || impl.Data.Backups[0].CreatedAt != want {
+		t.Errorf("backups[0].created_at=%v, want %q（UTC 墙钟串）", impl.Data.Backups, want)
+	}
+
+	example := docResponseExample(t, "GET /settings/auto-backup")
+	docBackups, ok := example["backups"].([]any)
+	if !ok || len(docBackups) == 0 {
+		t.Fatalf("GET /settings/auto-backup 示例缺 backups 数组元素")
+	}
+	docRow, ok := docBackups[0].(map[string]any)
+	if !ok {
+		t.Fatalf("GET /settings/auto-backup 示例 backups[0] 不是对象")
+	}
+	docCreated, _ := docRow["created_at"].(string)
+	docLastSuccess, _ := example["last_success_at"].(string)
+	for _, sample := range []string{docCreated, docLastSuccess} {
+		if _, err := time.Parse(layout, sample); err != nil {
+			t.Errorf("文档示例时间 %q 不能按实现格式 %q 解析: %v", sample, layout, err)
+		}
+	}
+}
+
+// 自动备份族与 admin 配置族的 500 登记门：实现与既有钉测都证明这些端点会
+// 返回 500（DB 故障/节点角色查询失败），错误表缺 500 会让按规格生成的客户端
+// 把可诊断故障当未知错误处理。
+func TestAPIDocRoutes_autoBackupDocumentsReachable500(t *testing.T) {
+	for _, key := range []string{
+		"GET /settings/auto-backup",
+		"PUT /settings/auto-backup",
+		"POST /auto-backup/run",
+		"DELETE /auto-backup/:id",
+		"GET /auto-backup/:id/download",
+		"PUT /admin-tls",
+	} {
+		if route := routesEntry(t, key); !containsRouteError(route.Errors, "500") {
+			t.Errorf("%s errors=%v, want 500（DB/节点角色查询失败可达）", key, route.Errors)
+		}
+	}
+}
+
+// admin-tls 解析响应的决策键必须全部出现在文档示例：expired 是服务端现成的
+// 过期判定，示例缺键会让按示例建模的消费方只能用 days_left<0 反推（与向零
+// 截断语义耦合）。
+func TestAPIDocs_adminTLSCertInfoExampleMatchesImplementation(t *testing.T) {
+	assertStructKeysDocumented(t, "POST /admin-tls/inspect", mapKeysOf(docResponseExample(t, "POST /admin-tls/inspect")), adminTLSCertInfo{})
+}
+
+// day 字段契约：实现要求恒必填（daily 也校验 1-28），文档必须显式说明——
+// 否则脚本客户端按「daily 不需要 day」省略会被 400「缺少必填字段」拒绝。
+func TestAPIDocs_autoBackupDayFieldContractDocumented(t *testing.T) {
+	description := routesEntry(t, "PUT /settings/auto-backup").Description
+	for _, want := range []string{"day 恒必填", "daily 忽略取值"} {
+		if !strings.Contains(description, want) {
+			t.Errorf("PUT /settings/auto-backup description 缺 %q: %q", want, description)
+		}
+	}
+}
+
+// MFA 登录验码的并发形态：同一挑战已有一笔请求在验码时返回 409（不是重放
+// 信号，对方失败会归还挑战），文档必须登记，避免客户端把它当致命错误丢弃。
+func TestAPIDocs_mfaVerifyDocumentsConcurrent409(t *testing.T) {
+	if !containsRouteError(routesEntry(t, "POST /auth/mfa/verify").Errors, "409") {
+		t.Fatal("POST /auth/mfa/verify 未登记 409（并发验码形态）")
 	}
 }

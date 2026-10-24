@@ -217,7 +217,7 @@ func TestSetClusterMode_rejectsCredentialedMasterURLWithoutAuditingCredentials(t
 }
 
 func TestUpdateClusterSettings_sync_interval_range_validation(t *testing.T) {
-	// 发现1：handler 必须把 ErrInvalidSyncInterval 映射为 400（原实现统一 403），
+	// handler 必须把 ErrInvalidSyncInterval 映射为 400（原实现统一 403），
 	// 合法区间仍返回 200。
 	h := newBackupTestHandlers(t)
 	router := gin.New()

@@ -241,3 +241,88 @@ func TestSetThreatSystemListsForTest_isolatesAndRestores(t *testing.T) {
 		t.Fatalf("restore failed: %+v", got)
 	}
 }
+
+// 占名僵持态（规范名被另一 system=1 行占用）按设计「双方保留 + 人工归并」，
+// 每次重启重写一条相同审计会让操作日志噪声随重启线性增长：同一冲突只留痕
+// 一次，指纹变化（人工归并后新冲突）自动重报；冲突解除时清除 marker。
+func TestThreatSystemListRename_takeoverSkipAuditConvergesAcrossRestarts(t *testing.T) {
+	openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	// 生产启动序：ensureNewColumns 补全局标记列（fresh DDL 不携带 global_config 标记列）。
+	if err := ensureNewColumns(newColumnsRegistry, nil); err != nil {
+		t.Fatalf("add new columns: %v", err)
+	}
+	// 生产启动序：global_config 单行由 Initialize 在迁移前建好（标记列写点在此行）。
+	if _, err := DB.Exec(`INSERT INTO global_config (id, caddy_config) VALUES (1,'{}')`); err != nil {
+		t.Fatalf("seed global config: %v", err)
+	}
+	if _, err := DB.Exec("CREATE UNIQUE INDEX IF NOT EXISTS u_security_ip_lists_system_name ON security_ip_lists(name) WHERE system=1"); err != nil {
+		t.Fatalf("create unique index: %v", err)
+	}
+	newName := ThreatListNameBySource("ustc")
+	const legacyName = "威胁情报库-中科大黑 IP"
+	seedConflict := func() {
+		t.Helper()
+		if _, err := DB.Exec(`INSERT INTO security_ip_lists (name, description, category, entries, system, created_at, updated_at) VALUES
+			(?, '旧', '恶意 IP', '[]', 1, datetime('now'), datetime('now')),
+			(?, '另一 system 行', '恶意 IP', '[]', 1, datetime('now'), datetime('now'))`, legacyName, newName); err != nil {
+			t.Fatalf("seed conflict fixture: %v", err)
+		}
+	}
+	readMarker := func() string {
+		t.Helper()
+		var marker string
+		if err := DB.QueryRow(`SELECT COALESCE(` + threatListTakeoverSkipMarkerColumn + `,'') FROM global_config WHERE id=1`).Scan(&marker); err != nil {
+			t.Fatalf("read marker: %v", err)
+		}
+		return marker
+	}
+	seedConflict()
+	drainSystemAuditBuffer()
+
+	// 首轮：一条跳过接管审计 + marker 置位（指纹集合非空）。
+	if err := migrateThreatSystemListNames(); err != nil {
+		t.Fatalf("first migrate: %v", err)
+	}
+	entries := drainSystemAuditBuffer()
+	if len(entries) != 1 || entries[0].resource != "IP 名单" || !strings.Contains(entries[0].detail, "跳过接管") {
+		t.Fatalf("首轮审计=%+v, want 恰一条跳过接管留痕", entries)
+	}
+	if marker := readMarker(); marker == "" {
+		t.Fatal("首轮后 marker 必须置位（僵持态已告警）")
+	}
+
+	// 二次启动（同一僵持态）：零新审计，状态不变。
+	if err := migrateThreatSystemListNames(); err != nil {
+		t.Fatalf("second migrate: %v", err)
+	}
+	if entries := drainSystemAuditBuffer(); len(entries) != 0 {
+		t.Fatalf("二次启动审计=%+v, want 空（同一僵持态不重复留痕）", entries)
+	}
+
+	// 人工归并（删除旧名行）：marker 清除，行为回正常。
+	if _, err := DB.Exec(`DELETE FROM security_ip_lists WHERE system=1 AND name=?`, legacyName); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateThreatSystemListNames(); err != nil {
+		t.Fatalf("migrate after manual merge: %v", err)
+	}
+	if marker := readMarker(); marker != "" {
+		t.Fatalf("冲突解除后 marker=%q, want 空", marker)
+	}
+
+	// 回归形状：新冲突（同规范名、旧名新行）重新上报。
+	if _, err := DB.Exec(`INSERT INTO security_ip_lists (name, description, category, entries, system, created_at, updated_at)
+		VALUES (?, '旧', '恶意 IP', '[]', 1, datetime('now'), datetime('now'))`, legacyName); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateThreatSystemListNames(); err != nil {
+		t.Fatalf("migrate after recurrence: %v", err)
+	}
+	entries = drainSystemAuditBuffer()
+	if len(entries) != 1 || !strings.Contains(entries[0].detail, "跳过接管") {
+		t.Fatalf("复发审计=%+v, want 恰一条", entries)
+	}
+}

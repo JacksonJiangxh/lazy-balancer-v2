@@ -126,7 +126,7 @@ func TestAutoBackupDueSlot_monthly(t *testing.T) {
 }
 
 func TestAutoBackupDueSlot_monthlyBeforeSlotFallsToPrevMonth(t *testing.T) {
-	// Given: 9 月 1 日 01:00,monthly day=1 03:00(本月未到)
+	// Given: 9 月 1 日 01:00,monthly day=15 03:00(本月 15 日未到)
 	loc := time.UTC
 	now := time.Date(2026, 9, 1, 1, 0, 0, 0, loc)
 
@@ -248,12 +248,14 @@ func setupAutoBackupTestDB(t *testing.T) {
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
 	})
-	// 固定调度时区为 UTC,隔离 CurrentLocation 的全局态
+	// 固定调度时区为 UTC,隔离 CurrentLocation 的全局态；cleanup 必须恢复
+	// 调用前时区（CurrentLocation 是包级全局态，-shuffle 下写死不恢复会串味）。
+	previousLocation := CurrentLocation().String()
 	if _, err := ConfigureLocation("UTC"); err != nil {
 		t.Fatalf("configure UTC location: %v", err)
 	}
 	t.Cleanup(func() {
-		_, _ = ConfigureLocation("UTC")
+		_, _ = ConfigureLocation(previousLocation)
 	})
 }
 
@@ -448,8 +450,13 @@ func TestAutoBackupNextSlot_outOfRangeWeeklyDayStillSchedules(t *testing.T) {
 	if !ok {
 		t.Fatal("weekly day 越界不得让调度面零槽（任务静默停摆）")
 	}
+	// 未跑过 → 返回最近过去槽：weekly day=0 归一为周一，now=2026-02-28（周六）
+	// ⇒ 2026-02-23 03:00 UTC。钉具体时刻而非仅「≤now」——零值/任意过去时刻
+	// 同样满足形态断言，矩阵这一格会失去区分力（调度器会每分钟都到点）。
+	if want := time.Date(2026, 2, 23, 3, 0, 0, 0, time.UTC); !slot.Equal(want) {
+		t.Fatalf("slot=%v, want %v（weekly day 越界回退周一 03:00）", slot, want)
+	}
 	if slot.After(now) {
-		// 未跑过 → 返回最近过去槽（≤now，跨停机补跑）；形态断言即可。
 		t.Fatalf("slot=%v 应 ≤now（未执行过时返回最近槽）", slot)
 	}
 }

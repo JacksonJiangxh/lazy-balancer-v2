@@ -103,17 +103,19 @@ func TestAutoBackupSettings_lastSuccessAtSeparatedFromWatermark(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	// 口径：取最近 success 行的 created_at（库内形态随驱动归一，断言等值而非字面）
-	var successCreated string
+	// 口径：取最近 success 行的 created_at，响应形态为 UTC 墙钟串
+	//（与 /audit-logs、/certificates 同族），库内存储形态由驱动归一。
+	var successCreated time.Time
 	if err := db.DB.QueryRow(`SELECT created_at FROM auto_backups WHERE filename='lbbak-auto-ok.lbbak'`).Scan(&successCreated); err != nil {
 		t.Fatalf("read success created_at: %v", err)
 	}
-	if payload.Data.LastSuccessAt == nil || *payload.Data.LastSuccessAt != successCreated {
+	wantCreated := successCreated.UTC().Format("2006-01-02 15:04:05")
+	if payload.Data.LastSuccessAt == nil || *payload.Data.LastSuccessAt != wantCreated {
 		got := "<nil>"
 		if payload.Data.LastSuccessAt != nil {
 			got = *payload.Data.LastSuccessAt
 		}
-		t.Fatalf("last_success_at=%s, want 最近 success 行 %q（失败行不得入选）", got, successCreated)
+		t.Fatalf("last_success_at=%s, want 最近 success 行 %q（失败行不得入选）", got, wantCreated)
 	}
 }
 

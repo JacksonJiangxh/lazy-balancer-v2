@@ -177,3 +177,73 @@ func TestGetSecurityEventToastSummary_rebasesCursorWhenSinceExceedsMax(t *testin
 		t.Fatalf("next_id=%d, want MAX(id)=%d（重新基线到库尾，不得复位为 0）", payload.Data.NextID, maxID)
 	}
 }
+
+// 聚合上界=本次读到的 MAX(id)：在「读 MAX(id)」与「聚合扫描」之间落库的
+// 并发事件不得计入本批。否则 next_id 仍推进到旧 maxID，下一轮从 maxID 重扫，
+// 同一事件会被弹框两次（洪峰下每轮重复 1~10 条）。
+func TestGetSecurityEventToastSummary_excludesEventsArrivingAfterMaxRead(t *testing.T) {
+	setupSecurityPolicyTestDB(t)
+	now := time.Now().UTC().Truncate(time.Second).Format("2006-01-02 15:04:05")
+	insert := func(ip, uri string) int64 {
+		res, err := db.MetricsDB.Exec(`INSERT INTO security_events
+			(event_time, client_ip, method, uri, event_type, rule_triggered, rule_msg, action)
+			VALUES (?, ?, 'GET', ?, 'crs', '942100', 'SQL Injection', 'blocked')`, now, ip, uri)
+		if err != nil {
+			t.Fatalf("seed %s: %v", uri, err)
+		}
+		id, _ := res.LastInsertId()
+		return id
+	}
+	sinceID := insert("93.184.216.7", "/baseline")
+	maxID := insert("93.184.216.7", "/in-batch")
+
+	// 在 MAX(id) 读取与聚合之间插入一行，模拟并发落库（只触发一次）。
+	var lateID int64
+	toastSummaryBetweenMaxAndAggregateForTest = func() {
+		toastSummaryBetweenMaxAndAggregateForTest = nil
+		lateID = insert("185.199.108.9", "/late")
+	}
+	t.Cleanup(func() { toastSummaryBetweenMaxAndAggregateForTest = nil })
+
+	gin.SetMode(gin.TestMode)
+	h := &Handlers{cfg: &config.Config{}}
+	router := gin.New()
+	router.GET("/security/events/toast-summary", h.GetSecurityEventToastSummary)
+	call := func(since int64) (counts []int64, next int64) {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet,
+			"/security/events/toast-summary?since_id="+strconv.FormatInt(since, 10), nil))
+		var payload struct {
+			Data struct {
+				Groups []struct {
+					Count int64 `json:"count"`
+				} `json:"groups"`
+				NextID int64 `json:"next_id"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("decode: %v body=%s", err, rec.Body.String())
+		}
+		for _, group := range payload.Data.Groups {
+			counts = append(counts, group.Count)
+		}
+		return counts, payload.Data.NextID
+	}
+
+	// 第一轮：读取到的 MAX(id)=maxID，晚到事件不属于本批。
+	counts, next := call(sinceID)
+	if len(counts) != 1 || counts[0] != 1 {
+		t.Fatalf("第一轮 groups=%v, want [1]（maxID 之后落库的事件不得计入本批）", counts)
+	}
+	if next != maxID {
+		t.Fatalf("第一轮 next_id=%d, want %d（上界=读取到的 MAX(id)）", next, maxID)
+	}
+	// 第二轮：晚到事件必须恰好被投递一次（不重不漏）。
+	counts, next = call(next)
+	if len(counts) != 1 || counts[0] != 1 {
+		t.Fatalf("第二轮 groups=%v, want [1]（晚到事件应在本轮交付且只交付一次）", counts)
+	}
+	if next != lateID {
+		t.Fatalf("第二轮 next_id=%d, want %d", next, lateID)
+	}
+}

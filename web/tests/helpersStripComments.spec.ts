@@ -35,6 +35,59 @@ test('member：单表达式箭头体不得顺延到下一个成员（越界切�
   assert.doesNotMatch(k, /const h/, '切片不得回吞前一个成员')
 })
 
+// 多行返回类型：`): {\n … } => {` 里首个 `{\n` 是类型注解。若把它当函数体，切片在
+// 类型块收尾处结束，函数体整段不进切片——后续所有 doesNotMatch 恒真。
+test('member：多行返回类型不得被当函数体（切片必须进入真实块体）', () => {
+  const src = [
+    'const f = (',
+    '  x: number,',
+    '): {',
+    '  a: number',
+    '} => {',
+    '  return x',
+    '}',
+    'const g = () => {',
+    '  return 2',
+    '}',
+    '',
+  ].join('\n')
+  const slice = member(src, 'const f = ')
+  assert.match(slice, /return x/, '切片必须进入真实函数体')
+  assert.doesNotMatch(slice, /return 2/, '切片不得吞下下一个成员')
+  assert.doesNotMatch(slice, /const g/, '切片不得越界到下一个成员')
+})
+
+test('member：参数表内多行对象类型与函数声明返回类型同样跳过', () => {
+  const paramType = 'function f(opts: {\n  a: number\n}): string {\n  return String(opts.a)\n}\n'
+  assert.match(member(paramType, 'function f('), /return String/)
+  const returnType = 'function g(): {\n  a: number\n} {\n  return 1\n}\nfunction h() {\n  return 2\n}\n'
+  const slice = member(returnType, 'function g(')
+  assert.match(slice, /return 1/)
+  assert.doesNotMatch(slice, /function h/, '返回类型块后的函数体才算收尾')
+})
+
+test('section/member：注释里的同名 marker 不得命中（切片落进注释=假绿）', () => {
+  const src = [
+    'const k = 1',
+    '// 说明：const k2 与 const k9 的旧形态如下，return 语义无关',
+    'const k2 = (): string => {',
+    "  return 'k'",
+    '}',
+    '',
+  ].join('\n')
+  // 注释里出现 marker：跳过注释，切到真实声明
+  const seg = section(src, 'const k2', 'return')
+  assert.doesNotMatch(seg, /说明/, 'section 起点不得落在注释中段')
+  assert.match(seg, /const k2 = /)
+  const slice = member(src, 'const k2')
+  assert.match(slice, /return 'k'/)
+  assert.doesNotMatch(slice, /说明/)
+  // 只存在于注释里的 marker：代码里没有 → 硬失败（不得切到注释中段）
+  assert.throws(() => section(src, 'const k9', 'x'), /missing start marker/)
+  // 文档钉（断言对象本就是注释）仍按字面命中
+  assert.match(section(src, '// 说明：', 'const k2'), /return 语义无关/)
+})
+
 test('member：模板量 ${} 内嵌对象既不提前收尾也不越界', () => {
   const src = 'const f = () => {\n  const s = `a${ { b: 1 } }c`\n  return s\n}\nconst g = () => {\n  return 2\n}\n'
   const slice = member(src, 'const f = ')
@@ -90,6 +143,13 @@ test('脚本存在性断言文件禁止裸 source()/repoSource() 回流', () => 
     'securityBulk.spec.ts',
     'securityPoliciesWiring.spec.ts',
     'authRole.spec.ts',
+    // 断言对象全是脚本/Go 实现（无模板文案钉），已全量改走 code()/repoCode()。
+    'ingestionHealth.spec.ts',
+    'autobanStatus.spec.ts',
+    'certJobStatus.spec.ts',
+    'countUpTween.spec.ts',
+    'importFailure.spec.ts',
+    'importPreview.spec.ts',
   ]
   for (const name of locked) {
     const text = readFileSync(new URL(`./${name}`, import.meta.url), 'utf8')

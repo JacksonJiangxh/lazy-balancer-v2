@@ -14,6 +14,17 @@ cd "$(dirname "$0")/.."
 ./scripts/check-bulk-edit-safety.sh
 ./scripts/tests/guard-selftest.sh
 ./scripts/tests/bulk-edit-safety-selftest.sh
+# 修复声称反向核对（R-4b）：台账 -> 代码/测试事实。自检常开；带台账时
+# （FIX_LEDGER=<file> [FIX_COMMIT=<rev>] ./scripts/test-all.sh）逐条验证
+# code:path:line:token 与 test:Name 仍存在，并核对提交 message 的 Fixes: 声明。
+./scripts/check-fix-claims.sh --self-test
+if [ -n "${FIX_LEDGER:-}" ]; then
+  if [ -n "${FIX_COMMIT:-}" ]; then
+    ./scripts/check-fix-claims.sh --ledger "$FIX_LEDGER" --commit "$FIX_COMMIT"
+  else
+    ./scripts/check-fix-claims.sh --ledger "$FIX_LEDGER"
+  fi
+fi
 
 # 启动链工件语法：docker-entrypoint.sh 是每次部署的唯一入口（语法错误 = 面板
 # 不可用，且只在容器启动时暴露，此前无任何门禁触碰它）；scripts/ 全部按 bash
@@ -163,9 +174,10 @@ done
 # 这组构建参数下代码可编译——平台/cgo 相关代码路径不进本地测试面，四个嵌套
 # 模块由 xcaddy 在镜像内以同一组参数编译插件，其 linux-only 编译错误（构建
 # 标签/syscall/cgo 分支）此前只在发版构建暴露。
-# 注意工具链版本面未被本门覆盖：镜像基础阶段是 golang:1.26.9-alpine +
-# GOTOOLCHAIN=local，本门用宿主 go（可能更新）。误用新版 stdlib API 只会在
-# 发版构建暴露——发版前置步骤须以镜像工具链跑一次 go build（见发布流程）。
+# 注意工具链版本面未被本门覆盖：镜像两个阶段都是 golang:1.26.10-alpine +
+# GOTOOLCHAIN=local（Dockerfile 带 go1.26.10 构建期断言），本门用宿主 go（可能
+# 更新）。误用新版 stdlib API 只会在发版构建暴露——发版前置步骤须以镜像工具链
+# 跑一次 go build（见发布流程）。
 # 根模块是 main 包，产物丢 /dev/null；嵌套模块用 go install 配临时 GOBIN，
 # 不落仓库（库模块本不产二进制，未来出现 main 包也不会污染工作树）。
 echo "== cross-build equivalence (GOOS=linux CGO_ENABLED=0 go build) =="

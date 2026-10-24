@@ -101,6 +101,8 @@ docs/audit/
 **/*_round[0-9]*_test.go
 **/*audit[0-9]*
 **/*round[0-9]*
+**/*audit[_-][0-9]*
+**/*round[_-][0-9]*
 **/*audit[0-9]*/
 **/*round[0-9]*/
 # <<< audit-artifact patterns

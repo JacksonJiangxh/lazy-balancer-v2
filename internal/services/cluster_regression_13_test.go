@@ -103,7 +103,9 @@ func TestNotifyMasterDetach_followsSameHostTLSUpgradeRedirect(t *testing.T) {
 	}
 }
 
-// TestSyncService_do_doesNotFollowHTTPRedirectOrForwardCredentials 同契约）。
+// TestSyncService_do_doesNotFollowDowngradeRedirectOrForwardCredentials 同契约；
+// 跨主机升级重定向由 TestDoWithSameHostTLSUpgradeRedirect_doesNotFollowCrossHostHTTPSRedirect
+// 直接钉 helper）。
 func TestNotifyMasterDetach_doesNotFollowCrossHostRedirect(t *testing.T) {
 	// Given a redirect to the same listener but under a different hostname
 	received := make(chan struct{}, 1)

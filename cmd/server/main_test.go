@@ -97,8 +97,44 @@ func TestMain_exitsNonZero_whenHTTPListenFails(t *testing.T) {
 	if !errors.As(err, &exitError) || exitError.ExitCode() == 0 {
 		t.Fatalf("process error=%v output=%q, want non-zero exit", err, output)
 	}
-	if !strings.Contains(string(output), "HTTP server stopped unexpectedly") {
-		t.Fatalf("output=%q, want startup failure log", output)
+	// 绑定失败时服务从未开始监听 → 启动失败文案，不得记成运行期崩溃。
+	if !strings.Contains(string(output), "startup failed") || !strings.Contains(string(output), "监听失败") {
+		t.Fatalf("output=%q, want startup failed + 监听失败", output)
+	}
+	if strings.Contains(string(output), "HTTP server stopped unexpectedly") {
+		t.Fatalf("output=%q, 启动期监听失败被记成运行期崩溃", output)
+	}
+}
+
+// 库初始化失败（data_dir 指向普通文件）同样必须按启动失败上报：
+// 「stopped unexpectedly」会把运维引向 OOM/崩溃排查，而真实原因是挂载/权限。
+func TestMain_exitsNonZero_whenDatabaseInitFails(t *testing.T) {
+	tempDir := t.TempDir()
+	blocker := filepath.Join(tempDir, "data-is-a-file")
+	if err := os.WriteFile(blocker, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+	configPath := filepath.Join(tempDir, "config.json")
+	configJSON := fmt.Sprintf(`{"port":18081,"data_dir":%q,"static_dir":%q,"metrics_interval":5,"caddy_admin_url":"http://127.0.0.1:1"}`, blocker, tempDir)
+	if err := os.WriteFile(configPath, []byte(configJSON), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, os.Args[0], "-test.run=TestMainHelperProcess")
+	command.Env = append(os.Environ(), "LAZY_BALANCER_MAIN_HELPER=1", "LAZY_BALANCER_TEST_CONFIG="+configPath)
+
+	output, err := command.CombinedOutput()
+
+	var exitError *exec.ExitError
+	if !errors.As(err, &exitError) || exitError.ExitCode() == 0 {
+		t.Fatalf("process error=%v output=%q, want non-zero exit", err, output)
+	}
+	if !strings.Contains(string(output), "startup failed") || !strings.Contains(string(output), "initialize database") {
+		t.Fatalf("output=%q, want startup failed + initialize database", output)
+	}
+	if strings.Contains(string(output), "HTTP server stopped unexpectedly") {
+		t.Fatalf("output=%q, 启动期库初始化失败被记成运行期崩溃", output)
 	}
 }
 

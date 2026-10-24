@@ -38,6 +38,16 @@ func TestNormalizeClusterNodeName(t *testing.T) {
 		{name: "ZWJ with spaces becomes empty", in: "  \u200d \u200d  ", want: ""},
 		{name: "trailing ZWJ after visible char kept", in: "节点\u200d", want: "节点\u200d"},
 		{name: "only whitespace becomes empty", in: " \t\n\x00 ", want: ""},
+		// 视觉空白填充字形（非 Cf、非 unicode.IsSpace）：整名只由它们组成时
+		// 在列表/审计里是一行空白，必须归一到空；混在可见名里则直接剥离。
+		{name: "braille blank becomes empty", in: "\u2800", want: ""},
+		{name: "hangul filler becomes empty", in: "\u3164", want: ""},
+		{name: "braille blank with spaces becomes empty", in: "  \u2800  ", want: ""},
+		{name: "halfwidth hangul filler becomes empty", in: "\uffa0\uffa0", want: ""},
+		{name: "blank glyphs stripped from visible name", in: "\u2800nodes\u3164", want: "nodes"},
+		{name: "blank glyphs before visible char keep the char", in: strings.Repeat("\u2800", ClusterNodeNameMaxLen) + "a", want: "a"},
+		// 顺序缺口：截断可能把可见字符裁掉、只剩隐形字符（判据必须在截断后）。
+		{name: "truncation leaving only ZWJ becomes empty", in: strings.Repeat("\u200d", ClusterNodeNameMaxLen) + "a", want: ""},
 		{name: "exact limit kept", in: strings.Repeat("a", ClusterNodeNameMaxLen), want: strings.Repeat("a", ClusterNodeNameMaxLen)},
 		{name: "over limit truncated by rune", in: long, want: strings.Repeat("名", ClusterNodeNameMaxLen)},
 		{name: "unicode kept", in: "节点-东京-01", want: "节点-东京-01"},

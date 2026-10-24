@@ -1043,8 +1043,17 @@ func TestRotateAuditLog_retriesPendingDeltaBeforeShifting(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// When：指标库故障导致轮转后补采失败 → pending 标记落盘
-	_ = db.MetricsDB.Close()
+	// When：copy 完成后指标库故障导致轮转后补采失败 → pending 标记落盘。
+	// 复制前闸门会先补采活文件尾部，库在其后依然可用才对；故障注入点因此放在
+	// copy 钩子里（等价于 copy 完成、truncate 前的库故障）。
+	oldCopy := auditLogCopyFile
+	auditLogCopyFile = func(src, dst string) error {
+		if err := copyAuditLogTo(src, dst); err != nil {
+			return err
+		}
+		return db.MetricsDB.Close()
+	}
+	t.Cleanup(func() { auditLogCopyFile = oldCopy })
 	rotateAuditLogIfNeeded()
 	marker := securityEventsPendingDeltaPath()
 	if _, err := os.Stat(marker); err != nil {
@@ -1327,7 +1336,10 @@ func TestRotateAuditLog_recoversCrossBoundaryTransaction(t *testing.T) {
 		t.Fatalf("fixture split point not found")
 	}
 	prefix, suffix := fixtureT[:split], fixtureT[split:]
-	if err := os.WriteFile(logPath, []byte(securityEventsFixtureBlocked+"\n"+prefix), 0o644); err != nil {
+	// 活文件初始只有完整事务 A（复制前闸门要求尾部可追平）；跨界事务 T 由 copy
+	// 钩子模拟并发写入：闸门判过之后写者写入 T 的前半 → copy 只读到前半（归档
+	// 里 T 不完整）→ 写者补完后半（后缀只在活文件）。
+	if err := os.WriteFile(logPath, []byte(securityEventsFixtureBlocked+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	tailer := securityEventsNewTailer(logPath, offsetPath)
@@ -1342,18 +1354,25 @@ func TestRotateAuditLog_recoversCrossBoundaryTransaction(t *testing.T) {
 		t.Fatalf("rows after tick=%d, want 1 (incomplete prefix not ingested)", count)
 	}
 
-	// When：copy 完成后 Coraza 补写完 T 的后半（后缀只在活文件，.1 中 T 仍不完整）
+	// When：copy 末次读截断在 T 中部（归档只有前缀），Coraza 在 copy 后补写完 T
+	// 的后半（后缀只在活文件，.1 中 T 仍不完整）
 	auditLogCopyFile = func(src, dst string) error {
+		appendTo := func(s string) error {
+			f, err := os.OpenFile(src, os.O_APPEND|os.O_WRONLY, 0o644)
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+			_, err = f.WriteString(s)
+			return err
+		}
+		if err := appendTo(prefix); err != nil {
+			return err
+		}
 		if err := copyAuditLogTo(src, dst); err != nil {
 			return err
 		}
-		f, err := os.OpenFile(src, os.O_APPEND|os.O_WRONLY, 0o644)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-		_, err = f.WriteString(suffix)
-		return err
+		return appendTo(suffix)
 	}
 	rotateAuditLogIfNeeded()
 
@@ -1681,12 +1700,15 @@ func TestRotateAuditLog_backscanFindsStraddleDocStartBeyond8MB(t *testing.T) {
 }`
 	split := 9 << 20 // 截断点深入 uri 字符串内部
 	prefix, suffix := fixtureT[:split], fixtureT[split:]
-	if err := os.WriteFile(logPath, []byte(securityEventsFixtureBlocked+"\n"+prefix), 0o644); err != nil {
+	// 活文件初始只有完整事务 A（复制前闸门要求尾部可追平）；巨型跨界事务 T 由
+	// copy 钩子模拟并发写入：闸门判过后写者写入 T 的前 9MB → copy 只读到前缀
+	// （归档无 T 文档头）→ 写者补完后缀（后缀只在活文件）。
+	if err := os.WriteFile(logPath, []byte(securityEventsFixtureBlocked+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	tailer := securityEventsNewTailer(logPath, offsetPath)
-	if err := tailer.securityEventsTick(); err == nil || !strings.Contains(err.Error(), "scan window") {
-		t.Fatalf("tick err=%v, want beyond-scan-window error (incomplete straddle prefix)", err)
+	if err := tailer.securityEventsTick(); err != nil {
+		t.Fatalf("tick: %v", err)
 	}
 	var count int
 	if err := db.MetricsDB.QueryRow(`SELECT COUNT(*) FROM security_events`).Scan(&count); err != nil {
@@ -1696,18 +1718,25 @@ func TestRotateAuditLog_backscanFindsStraddleDocStartBeyond8MB(t *testing.T) {
 		t.Fatalf("rows after tick=%d, want 1 (A only)", count)
 	}
 
-	// When：copy 完成后 Coraza 补写完 T 的后缀（后缀只在活文件，.1 中 T 仍不完整）
+	// When：copy 末次读截断在 T 的 uri 中部（归档含 9MB 前缀、无文档头），
+	// Coraza 在 copy 后补写完 T 的后缀（后缀只在活文件）
 	auditLogCopyFile = func(src, dst string) error {
+		appendTo := func(s string) error {
+			f, err := os.OpenFile(src, os.O_APPEND|os.O_WRONLY, 0o644)
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+			_, err = f.WriteString(s)
+			return err
+		}
+		if err := appendTo(prefix); err != nil {
+			return err
+		}
 		if err := copyAuditLogTo(src, dst); err != nil {
 			return err
 		}
-		f, err := os.OpenFile(src, os.O_APPEND|os.O_WRONLY, 0o644)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-		_, err = f.WriteString(suffix)
-		return err
+		return appendTo(suffix)
 	}
 	rotateAuditLogIfNeeded()
 

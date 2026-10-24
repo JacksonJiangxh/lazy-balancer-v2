@@ -12,7 +12,7 @@ import assert from 'node:assert/strict'
 
 import { resetSettingsDraft, useSettingsDraft } from '../src/composables/useSettingsDraft.ts'
 import { securityEventsWritePayload } from '../src/utils/configValues.ts'
-import { section, source } from './_helpers.ts'
+import { code, section, source } from './_helpers.ts'
 
 const certInfo = { domain: 'example.com', issuer: 'fixture', not_after: '2027-01-01', days_left: 365 }
 
@@ -87,7 +87,8 @@ test('安全事件编辑：编辑值写回共享模型，dirty 跨挂载保留�
 })
 
 test('BasicSettings 接线：暂存态取草稿单例，可落父级模型的字段写回 settings', () => {
-  const page = source('src/views/settings/BasicSettings.vue')
+  // 「不得在组件内重建暂存」是死代码断言，走剥注释视图（注释提及不算消费）。
+  const page = code('src/views/settings/BasicSettings.vue')
   const draft = source('src/composables/useSettingsDraft.ts')
   assert.match(draft, /const githubTokenInput = ref\(''\)/, '令牌输入必须由草稿持有')
   assert.match(draft, /const adminTlsCertError = ref\(''\)/, '证书损坏原因必须由草稿持有')
@@ -116,7 +117,7 @@ test('BasicSettings 接线：暂存态取草稿单例，可落父级模型的字
 })
 
 test('Settings.vue 仅在离开设置页时复位草稿', () => {
-  const page = source('src/views/Settings.vue')
+  const page = code('src/views/Settings.vue')
   assert.match(page, /import \{ resetSettingsDraft \} from '@\/composables\/useSettingsDraft'/)
   const unmounted = section(page, 'onUnmounted(', '</script>')
   assert.match(unmounted, /resetSettingsDraft\(\)/)

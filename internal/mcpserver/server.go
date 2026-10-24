@@ -465,7 +465,10 @@ func forward(ctx context.Context, client *http.Client, baseURL, internalAuthSecr
 	path := spec.path
 	for _, name := range spec.pathArgs {
 		value, ok := arguments[name]
-		if !ok {
+		// 显式 JSON null 等价于未提供：客户端（尤其 LLM/Agent）常用 null 表示
+		// 「可选字段不填」，若照 scalarString 拼进路径会得到 /rules/%3Cnil%3E
+		// → REST 404，错误信息反而不指向真正的缺少参数。
+		if !ok || value == nil {
 			return toolCallError("缺少参数 %s", name)
 		}
 		path = strings.ReplaceAll(path, "{"+name+"}", url.PathEscape(scalarString(value)))
@@ -476,9 +479,14 @@ func forward(ctx context.Context, client *http.Client, baseURL, internalAuthSecr
 	}
 	query := endpoint.Query()
 	for _, name := range spec.queryArgs {
-		if value, ok := arguments[name]; ok && fmt.Sprint(value) != "" {
-			query.Set(name, scalarString(value))
+		value, ok := arguments[name]
+		// 显式 null 视为「未提供」：否则 scalarString(nil) 得到 "<nil>" 被当成
+		// 真实过滤值转发（分页参数 → 400；ip/client_ip → 按字面过滤后静默
+		// 空结果，比 400 更危险）。空字符串同样丢弃（REST 侧按缺省处理）。
+		if !ok || value == nil || scalarString(value) == "" {
+			continue
 		}
+		query.Set(name, scalarString(value))
 	}
 	endpoint.RawQuery = query.Encode()
 

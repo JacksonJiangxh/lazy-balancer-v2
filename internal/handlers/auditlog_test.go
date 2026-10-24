@@ -522,3 +522,26 @@ func TestGetAuditLogs_degradedResponseStillRejectsDeepPage(t *testing.T) {
 		}
 	}
 }
+
+// 行为钉：审计库存在不可解析的 created_at（带外改库/旧版本遗留）时，500 只回
+// 固定文案——此前两个明细分支把驱动原文（表列名 + "sql: Scan error"）拼进
+// 响应，而该端点在 business 组，任意登录用户可见。
+func TestGetAuditLogs_500BodyHidesDriverDetails(t *testing.T) {
+	router := newAuditLogTestRouter(t, `INSERT INTO audit_log (username, action, resource, detail, ip_address, created_at) VALUES ('admin','登录成功','用户认证','','127.0.0.1','not-a-time')`)
+
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/audit-logs", nil))
+
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s, want 500", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	for _, leak := range []string{"created_at", "sql:", "Scan error", "audit_log"} {
+		if strings.Contains(body, leak) {
+			t.Fatalf("500 body 泄露内部细节 %q: %s", leak, body)
+		}
+	}
+	if !strings.Contains(body, "读取操作日志失败") {
+		t.Fatalf("500 body 缺少固定文案: %s", body)
+	}
+}

@@ -7,7 +7,7 @@ import {
   importConfirmMessage,
   normalizeBackupSectionKeys,
 } from '../src/utils/backupSections.ts'
-import { repoSource, section, source } from './_helpers.ts'
+import { code, repoCode, section, source } from './_helpers.ts'
 
 // 设置页备份面回归守卫：导入入口/超大文件拒绝、lbbak Blob 直传、还原文案按分类、
 // 下次备份调度口径、立即备份的卸载收尾，以及备份四分类前后端单源一致性。
@@ -16,7 +16,7 @@ const page = source('src/views/settings/BasicSettings.vue')
 test('新文件入口先清旧内容，超大拒绝不可回用旧备份', () => {
   // 终点用「下一个函数声明」而非注释文本——注释终点可能落在本函数内部，
   // 切片会延伸到后续函数（该区间出现 48MB 字样即假红）。
-  const body = section(page, 'const handleImportFile', 'const postImportValidation')
+  const body = section(code('src/views/settings/BasicSettings.vue'), 'const handleImportFile', 'const postImportValidation')
   const oversized = body.indexOf('if (file.size > IMPORT_MAX_BYTES)')
   assert.ok(oversized > 0)
   const beforeReject = body.slice(0, oversized)
@@ -33,7 +33,7 @@ test('新文件入口先清旧内容，超大拒绝不可回用旧备份', () =>
 })
 
 test('导入大小上限与后端 maxConfigImportBytes 同源', () => {
-  const go = repoSource('internal/handlers/config_import_v1.go')
+  const go = repoCode('internal/handlers/config_import_v1.go')
   const declared = /var maxConfigImportBytes int64 = (\d+) << (\d+)/.exec(go)
   assert.ok(declared, '后端导入上限常量未解析')
   const goBytes = Number(declared[1]) * 2 ** Number(declared[2])
@@ -110,7 +110,7 @@ test('备份分类恰好四键且标签与后端口径一致', () => {
     [['users', '系统数据'], ['rules', '负载规则'], ['security', '安全防护'], ['cluster', '节点拓扑']],
   )
   // 跨栈一致性：后端 configBackupSections 单源派生键/标签必须同集同序
-  const go = repoSource('internal/handlers/config_backup.go')
+  const go = repoCode('internal/handlers/config_backup.go')
   const goBlock = section(go, 'var configBackupSections = []struct', '\n}\n')
   const goPairs = [...goBlock.matchAll(/\{Key: "(\w+)", Label: "([^"]+)"/g)].map((m) => [m[1], m[2]])
   assert.deepEqual(BACKUP_SECTIONS.map((s) => [s.key, s.label]), goPairs, '前后端分类键/标签漂移会静默改变导出/还原覆盖面')
@@ -200,4 +200,16 @@ test('应用运行日志失败显性化：错误提示 + 空态文案切换 + �
   assert.match(closed, /appLogError\.value = false/, '关闭弹框复位')
   const opened = section(page, 'const openAppLogDialog', 'const onAppLogOpened')
   assert.match(opened, /appLogError\.value = false/, '重开弹框复位')
+})
+
+// 自动备份列表：行内 sections 列损坏（带外改库/旧版本遗留）时后端给
+// sections_error。此前前端既未声明该字段也不渲染，损坏行显示「-」——被读成
+// 「不含任何分类的备份」而放弃一次内容完整的还原（还原按包内 sections 走）。
+test('自动备份范围损坏显性化：sections_error 非空时不得显示为空范围', () => {
+  const page = code('src/views/settings/BasicSettings.vue')
+  assert.match(page, /sections_error\?: string/, 'AutoBackupRow 必须声明后端字段')
+  const scope = section(page, 'const autoBackupScopeText', 'const autoBackupDetailTip')
+  assert.match(scope, /row\.sections_error/, '范围渲染必须消费 sections_error')
+  assert.match(scope, /范围损坏/, '损坏必须显式提示，不得渲染成空范围')
+  assert.match(page, /is-warning/, '损坏态必须按 warning 着色')
 })

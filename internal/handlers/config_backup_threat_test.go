@@ -107,10 +107,9 @@ func TestConfigBackup_threatSourcesRejectsForgedSource(t *testing.T) {
 	}
 }
 
-// ──：威胁文件收敛文案必须区分两种「备份未携带源
-// 文件」成因——上次下载成功但名单为空 vs 导出节点从未成功下载（后者在
-// update_enabled=0 时不会自动重取，需要可执行提示）。删除行为的
-// 「记录与执行面恒一致」不变量保持不变。 ──
+// 威胁文件收敛文案必须区分两种「备份未携带源文件」成因——上次下载成功但
+// 名单为空 vs 导出节点从未成功下载（后者在 update_enabled=0 时不会自动重取，
+// 需要可执行提示）。删除行为的「记录与执行面恒一致」不变量保持不变。
 
 func TestThreatReconcileDistinguishesAbsenceReasons(t *testing.T) {
 	wafDir := t.TempDir()

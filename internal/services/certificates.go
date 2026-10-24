@@ -973,7 +973,7 @@ func (s *CertificateService) rescanDroppedDeploymentRetries() (rescheduled int, 
 		   -- 一律跳过，没有任何周期通道回收——规则在重启前整条不发布（TLS 渲染
 		   -- 不命中材料即跳过规则，避免同端口明文降级）。
 		   OR (j.status IN (`+deploymentLifecycleJobStatusSQL+`)
-		       AND NOT (`+CertJobMaterialPredicateSQL("j")+`)
+		       AND `+CertJobMissingMaterialPredicateSQL("j")+`
 		       AND datetime(COALESCE(j.updated_at,j.created_at)) <= datetime('now', '-' || ? || ' minutes'))
 	`, settleMinutes, settleMinutes)
 	if err != nil {

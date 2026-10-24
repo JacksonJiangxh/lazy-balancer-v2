@@ -175,6 +175,9 @@ func newBackupTestHandlers(t *testing.T) *Handlers {
 		t.Fatalf("initialize test database: %v", err)
 	}
 	t.Cleanup(func() {
+		// 提交后产物清理异步执行：先等在途清理结束，避免其访问已关闭的测试库
+		// 或把审计写进下一个用例的库。
+		waitImportCleanup()
 		_ = db.Close()
 		db.DB, db.MetricsDB, db.AuditDB = oldDB, oldMetricsDB, oldAuditDB
 		// 直换包级句柄必须同步复位 currentDB（SetDB
@@ -307,7 +310,8 @@ func TestImportConfigBackup_normalizes_null_boolean_rows(t *testing.T) {
 // v2 备份导入通道对三张安全表的可空列零归一——带校验和的备份
 // 携带 content/action/score/description/custom_rules 等 NULL 时，restoreTable 原样
 // 落库（下游 raw 消费方：caddy.go 拦截页 content 扫描、自定义规则生成扫描），而
-// 集群快照 dump 侧（cluster_snapshot.go:420/428/449）已全量 COALESCE 硬化——两条
+// 集群快照 dump 侧（snapshotSecurityPolicies/snapshotSecurityCustomRules/
+// snapshotSecurityBlockPages）已全量 COALESCE 硬化——两条
 // 「全量替换」通道容忍度背离。导入必须成功（无 400/500），且落库值为 dump 侧对齐
 // 默认值而非 NULL；NULL 布尔列（enabled/is_default）落 schema/dump 默认而非布尔强转。
 // 自此 content NULL/空行被 skipEmptyBlockPages 软跳过（不再落库），
@@ -859,7 +863,8 @@ func TestImportConfigBackup_ignoresDeadMetricsRetentionDaysKey(t *testing.T) {
 				completeTables[table] = []map[string]any{}
 			}
 			completeTables["users"] = []map[string]any{{"id": 1, "username": "admin", "password_hash": "hash", "role": "admin", "is_enabled": 1}}
-			importCfg := map[string]any{"metrics_retention_days": item.value}
+			// 死键旁带一个真实键：导入被死键卡住时该键不会落库，断言才有判别力。
+			importCfg := map[string]any{"metrics_retention_days": item.value, "log_level": "warn"}
 			backupPayload := configBackup{
 				Meta:   configBackupMeta{App: "lazy-balancer-v2", Version: 2, ExportedAt: "2026-08-19T00:00:00Z"},
 				Config: importCfg,
@@ -883,13 +888,14 @@ func TestImportConfigBackup_ignoresDeadMetricsRetentionDaysKey(t *testing.T) {
 			if response.Code != http.StatusOK {
 				t.Fatalf("import status=%d body=%s", response.Code, response.Body.String())
 			}
-			// 死键未落库（列不存在）
-			var retentionColumn int
-			if err := db.DB.QueryRow("SELECT COUNT(*) FROM pragma_table_info('global_config') WHERE name='metrics_retention_days'").Scan(&retentionColumn); err != nil {
-				t.Fatalf("inspect global_config schema: %v", err)
+			// 死键被静默跳过，同包的正常键照常落库（表的列集合是 schema 事实，
+			// 查 PRAGMA 恒真、无法发现导入路径回归）。
+			var logLevel string
+			if err := db.DB.QueryRow("SELECT COALESCE(log_level,'') FROM global_config WHERE id=1").Scan(&logLevel); err != nil {
+				t.Fatalf("read imported log_level: %v", err)
 			}
-			if retentionColumn != 0 {
-				t.Fatalf("metrics_retention_days column count=%d, want 0（死键不得落库）", retentionColumn)
+			if logLevel != "warn" {
+				t.Fatalf("log_level=%q, want warn（死键不得阻断同包正常配置）", logLevel)
 			}
 		})
 	}
@@ -1052,6 +1058,30 @@ func TestImportConfigBackup_accepts_historical_v1_core_tables(t *testing.T) {
 	if rules != 0 || keys != 0 {
 		t.Fatalf("v1 空表导入不得产生规则/密钥行: rules=%d keys=%d", rules, keys)
 	}
+	// 完整性披露：完全不含校验和的 v1 备份比「仅数据表校验和」的旧格式更弱，
+	// 导入必须留审计警告（此前只有后者有披露）。
+	var integrityWarnings int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='导入警告' AND resource='配置备份' AND detail LIKE '%不含完整性校验和%'`).Scan(&integrityWarnings); err != nil {
+		t.Fatalf("read integrity audit: %v", err)
+	}
+	if integrityWarnings != 1 {
+		t.Fatalf("无校验和 v1 备份的完整性警告=%d, want 1（导入须披露内容未经摘要校验）", integrityWarnings)
+	}
+	// 预览同一事实必须可见（只读路径不落审计，改由 warnings 披露）。
+	preview := postValidateBytes(t, h, []byte(string(body)))
+	if !preview.Valid {
+		t.Fatalf("preview valid=false err=%s", preview.Error)
+	}
+	found := false
+	for _, warning := range preview.Warnings {
+		if strings.Contains(warning, "不含完整性校验和") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("preview warnings=%v, want 含「不含完整性校验和」披露", preview.Warnings)
+	}
 }
 
 func TestImportConfigBackup_requeues_imported_non_terminal_certificate_jobs(t *testing.T) {
@@ -1067,7 +1097,7 @@ func TestImportConfigBackup_requeues_imported_non_terminal_certificate_jobs(t *t
 		INSERT INTO cert_jobs (rule_id,domain,status,ca_provider_id) VALUES ('lb_requeue_v2','requeue.example.test','creating_order',999999)`); err != nil {
 		t.Fatalf("seed non-terminal job: %v", err)
 	}
-	// 发现2/自此启用 acme_dns 规则须引用有效证书配置（备份内可解析），
+	// 自此启用 acme_dns 规则须引用有效证书配置（备份内可解析），
 	// 夹具补种子行并绑定，保持本用例的 requeue 语义不变。
 	dnsResult, err := db.DB.Exec(`INSERT INTO certificate_configs (name,dns_provider,dns_credentials,enabled) VALUES ('requeue-dns','dnspod','{"token":"x"}',1)`)
 	if err != nil {
@@ -1147,6 +1177,97 @@ func TestImportConfigBackup_reports_partial_failure_when_certificate_job_recover
 	// ——前端按「已回滚」处理且不刷新会诱发重复导入）。
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "证书任务恢复失败") || !strings.Contains(response.Body.String(), "requeue failed") || !strings.Contains(response.Body.String(), `"partial":true`) {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+// 部分成功响应里阶段描述只出现一次：协调器 Error() 自带
+// 「导入部分失败（数据库已提交，证书任务恢复失败）：」前缀，直接拼 Error() 会让
+// message 出现两遍同一句、warnings 再重复一遍——读者会当成两起失败。
+func TestImportConfigBackup_partialFailureDescribesPhaseOnce(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	services.ResetCAQueueManagerForTest()
+	services.InitCAQueueManager(func() error { return nil }, t.TempDir())
+	services.GetCAQueueManager().Start()
+	t.Cleanup(services.ResetCAQueueManagerForTest)
+	oldRequeue := requeueNonTerminalCertJobs
+	requeueNonTerminalCertJobs = func() error { return errors.New("requeue failed") }
+	t.Cleanup(func() { requeueNonTerminalCertJobs = oldRequeue })
+	if _, err := db.DB.Exec("INSERT INTO users (username,password_hash,role,is_enabled) VALUES ('admin','hash','admin',1)"); err != nil {
+		t.Fatalf("seed admin: %v", err)
+	}
+	router := gin.New()
+	router.GET("/config/export", h.ExportConfigBackup)
+	router.POST("/config/import", h.ImportConfigBackup)
+	exportResponse := httptest.NewRecorder()
+	router.ServeHTTP(exportResponse, httptest.NewRequest(http.MethodGet, "/config/export", nil))
+	request := httptest.NewRequest(http.MethodPost, "/config/import", strings.NewReader(exportResponse.Body.String()))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("import status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Message string `json:"message"`
+		Data    struct {
+			Warnings []string `json:"warnings"`
+			Partial  bool     `json:"partial"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode partial response: %v", err)
+	}
+	if !payload.Data.Partial {
+		t.Fatal("队列恢复失败必须标记 partial=true")
+	}
+	if got := strings.Count(payload.Message, "证书任务恢复失败"); got != 1 {
+		t.Fatalf("message 阶段描述出现 %d 次, want 1: %s", got, payload.Message)
+	}
+	if strings.Contains(payload.Message, "导入部分失败") {
+		t.Fatalf("message 残留协调器动作前缀（双前缀）: %s", payload.Message)
+	}
+	phaseWarnings := 0
+	for _, warning := range payload.Data.Warnings {
+		if !strings.Contains(warning, "证书任务恢复失败") {
+			continue
+		}
+		phaseWarnings++
+		if got := strings.Count(warning, "证书任务恢复失败"); got != 1 {
+			t.Fatalf("warning 阶段描述出现 %d 次, want 1: %s", got, warning)
+		}
+		if strings.Contains(warning, "导入部分失败") {
+			t.Fatalf("warning 残留协调器动作前缀（双前缀）: %s", warning)
+		}
+	}
+	if phaseWarnings != 1 {
+		t.Fatalf("携带阶段描述的 warning 条数=%d, want 1（不得重复说明同一失败面）", phaseWarnings)
+	}
+}
+
+// 导入提交失败=结果不可判定：必须 500 + 「提交结果不确定」口径（不得宣称
+// 已回滚），且操作审计留痕。提交入口经 commitTx 缝注入后该分支才可钉。
+func TestImportConfigBackup_commitFailureReportsIndeterminate(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	forceCommitFailure(t)
+	rec := importBackupShared(h, t, buildBackup(t, backupFixtureOptions{FillAll: true, Tables: nil, Config: nil, Sections: nil, EmptyConfigIfNil: true}))
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s, want 500", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "提交结果不确定") {
+		t.Fatalf("响应未表述提交结果不确定: %s", body)
+	}
+	if strings.Contains(body, "已回滚") {
+		t.Fatalf("提交结果不可判定时不得宣称已回滚: %s", body)
+	}
+	var rows int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='导入失败' AND resource='配置备份' AND detail LIKE '%提交结果不确定%'`).Scan(&rows); err != nil {
+		t.Fatalf("统计导入失败审计: %v", err)
+	}
+	if rows == 0 {
+		t.Fatal("提交不确定性必须落操作审计（否则用户只能看到一次失败响应）")
 	}
 }
 
@@ -1734,7 +1855,10 @@ func TestValidateBackupRuleReferences_rejects_bad_origin_domain_and_health_check
 		{name: "空回源域名放行", rule: rule(nil), upstreamAny: map[string]any{"rule_id": "lb_origchk"}},
 		{name: "回源域名端口越界被拒", rule: rule(nil), upstreamAny: map[string]any{"rule_id": "lb_origchk", "origin_domain": "origin.example.com:99999"}, wantErr: "回源域名"},
 		{name: "回源域名 CRLF 被拒", rule: rule(nil), upstreamAny: map[string]any{"rule_id": "lb_origchk", "origin_domain": "evil.com\r\nX-Evil: 1"}, wantErr: "回源域名"},
-		{name: "TCP 规则回源域名被拒", rule: rule(map[string]any{"protocol": "tcp"}), upstreamAny: map[string]any{"rule_id": "lb_origchk", "origin_domain": "origin.example.com"}, wantErr: "仅 HTTP"},
+		// TCP 规则的回源域名是死值：导入按「归一」处理（校验侧按清零后形态
+		// 评估、写侧 normalizeRuleRowsForTransport 清零），而非整包拒收——
+		// 否则带外残留会让实例自己导出的备份无法再次导入（备份自毒）。
+		{name: "TCP 规则回源域名归一放行", rule: rule(map[string]any{"protocol": "tcp"}), upstreamAny: map[string]any{"rule_id": "lb_origchk", "origin_domain": "origin.example.com"}},
 		{name: "动态上游规则回源域名被拒", rule: rule(map[string]any{"dynamic_dns": true}), upstreamAny: map[string]any{"rule_id": "lb_origchk", "origin_domain": "origin.example.com"}, wantErr: "动态上游"},
 		{name: "合法健康检查域名放行", rule: rule(map[string]any{"health_check_host": "probe.example.com"})},
 		{name: "健康检查域名带端口被拒", rule: rule(map[string]any{"health_check_host": "probe.example.com:8443"}), wantErr: "健康检查域名"},

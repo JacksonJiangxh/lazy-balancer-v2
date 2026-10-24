@@ -445,7 +445,7 @@
           <el-table-column label="内容" width="230" class-name="auto-backup-scope-cell">
             <template #default="{ row }">
               <el-tooltip :content="autoBackupDetailTip(row)" placement="top" :show-after="150">
-                <span class="auto-backup-scope-text">{{ autoBackupScopeText(row) }}</span>
+                <span class="auto-backup-scope-text" :class="{ 'is-warning': row.sections_error }">{{ autoBackupScopeText(row) }}</span>
               </el-tooltip>
             </template>
           </el-table-column>
@@ -511,7 +511,7 @@ import { shouldToastQuietPollError } from '@/utils/pollErrorToast'
 import { displaySecurityEventsRetentionDays, displaySecurityEventsRowCap, displayThreatScreenMode, securityEventsWritePayload } from '@/utils/configValues'
 import { CHINA_SITE_CHOICES, COUNTRY_SITE_CHOICES, coordsForSiteLocation, nearestSiteLocation } from '@/utils/siteLocation'
 import { BACKUP_SECTIONS, importConfirmMessage, normalizeBackupSectionKeys } from '@/utils/backupSections'
-import { createImportPreviewSession, importPreviewFingerprint, type ImportPreviewSession } from '@/utils/importPreview'
+import { createImportPreviewSession, importPreviewFingerprint, invalidateImportPreviews, type ImportPreviewSession } from '@/utils/importPreview'
 import { importFailureLines, importFailureReport } from '@/utils/importFailure'
 import { MFA_SCOPE_GROUPS } from '@/utils/mfaScopeGroups'
 import { Setting, InfoFilled, Check, View, Upload, Download, Timer, Lock, Document } from '@element-plus/icons-vue'
@@ -651,6 +651,9 @@ interface AutoBackupRow {
   status: string
   size_bytes: number
   sections: string[]
+  /** 行内 sections 列损坏（带外改写/旧版本遗留）时的说明：非空表示「范围未知」
+   *  而不是「范围为空」——后端只在解析失败时给值，还原仍按包内 sections 走。 */
+  sections_error?: string
   trigger_type: string
   message: string
   app_version: string
@@ -836,6 +839,9 @@ const formatBackupSize = (bytes: number): string => (!bytes || bytes <= 0 ? '-' 
 
 // 内容列只显备份范围；hover 明细=各表行数摘要+触发方式（2026-09-21 用户裁定）
 const autoBackupScopeText = (row: AutoBackupRow): string => {
+  // 范围损坏 ≠ 范围为空：行内 sections 列解析失败时显示「-」会被读成「不含任何
+  // 分类的备份」而放弃一次内容完整的还原（还原按包内 sections 走，不读该列）。
+  if (row.sections_error) return '范围损坏（见日志）'
   const labels = normalizeBackupSectionKeys(row.sections || []).map((k) => BACKUP_SECTIONS.find((s) => s.key === k)?.label || k)
   return labels.length > 0 ? labels.join('、') : '-'
 }
@@ -1032,6 +1038,9 @@ const triggerImport = (): void => {
   importValidating.value = false
   importPreviewSession?.dispose()
   importPreviewSession = null
+  // 预览结果依赖打开弹框时的库状态（冲突/悬挂告警/策略引用都会随配置变化），
+  // 故每次打开都清空跨会话缓存——否则同一份备份在配置改变后仍返回旧预览。
+  invalidateImportPreviews()
   importFileName.value = ''
   importFileContent.value = ''
   importFileIsLbbak.value = false
@@ -1858,6 +1867,7 @@ const handleSave = async () => {
 .auto-backup-scope-hint { margin-left: 0; }
 /* 内容列只显范围标签，单行不换行（明细在 hover tooltip，2026-09-21 用户裁定） */
 .auto-backup-scope-text { white-space: nowrap; }
+.auto-backup-scope-text.is-warning { color: var(--el-color-warning); }
 .auto-backup-list { border-top: 1px solid var(--el-border-color-lighter); padding-top: 10px; }
 
 /* 自管标签行族已退役（2026-10-11 用户裁定：对齐统一走原生 el-form-item，

@@ -252,10 +252,13 @@ const (
 	metricsFailureStorePerRule = "store-per-rule"
 )
 
-// geoipPassSeriesMarker geoip 透传路由（buildGeoipPassRoute）的 Prometheus
-// 序列片段——该路由无 reverse_proxy，其序列不含任何上游语义。单趟聚合在
-// 行分派前跳过命中该片段的整行（全局族与规则族同时生效）。
-const geoipPassSeriesMarker = `handler="http.handlers.geoip2region"`
+// GeoIPPassSeriesMarker geoip 透传路由（buildGeoipPassRoute）的 Prometheus
+// 序列片段——该路由无 reverse_proxy，其序列不含任何上游语义。任何消费
+// /metrics 正文的解析器都必须在行分派前跳过命中该片段的整行，否则同一请求
+// 会被透传路由与主/路径路由各记一次（请求数/字节量/状态码分布翻倍）。
+// 本包采集链与 handlers 的实时指标解析共用此常量（单一事实源，避免第二份
+// 字面量漂移）。
+const GeoIPPassSeriesMarker = `handler="http.handlers.geoip2region"`
 
 func (m *MetricsService) collect() {
 	// 三项 DB 派生指标先于 /metrics 采集刷新——Caddy 未就绪或
@@ -312,7 +315,7 @@ func (m *MetricsService) collect() {
 	// text，此前两次 string(body) 最坏双拷贝 32MB（16MB body ×2）。
 	text := string(body)
 	// geoip 透传序列在单趟聚合内逐行剔除（aggregatePrometheusText 的行分派
-	// 前跳过 geoipPassSeriesMarker）——不再先重组一份过滤全文（16MB 上限下
+	// 前跳过 GeoIPPassSeriesMarker）——不再先重组一份过滤全文（16MB 上限下
 	// 省去每周期一次全量副本）。
 	// 单趟聚合：全局样本与规则级样本共用一次全文遍历（旧实现全局 6 趟 +
 	// 规则 4 趟全文正则，且同一 text 喂两条解析链）。两族错误语义独立——规则级
@@ -532,7 +535,7 @@ func aggregatePrometheusText(text string, mode prometheusScanMode) prometheusSca
 		// 请求的请求数/状态码/字节量在全局与 per-host 全部翻倍。透传路由无
 		// reverse_proxy，其序列不含任何上游语义，整行跳过即恢复真实计数；
 		// 全局族与规则族在同一分派前生效（单趟、零额外副本）。
-		if strings.Contains(line, geoipPassSeriesMarker) {
+		if strings.Contains(line, GeoIPPassSeriesMarker) {
 			continue
 		}
 		switch {
@@ -723,15 +726,6 @@ func parsePrometheusBucketSample(line string, byLE map[float64]int64) error {
 	return nil
 }
 
-// parsePrometheusMetrics 全局样本解析入口（测试/独立调用）：单趟扫描。
-func (m *MetricsService) parsePrometheusMetrics(text string) (parsedMetrics, error) {
-	res := aggregatePrometheusText(text, prometheusScanGlobal)
-	if res.globalErr != nil {
-		return parsedMetrics{}, res.globalErr
-	}
-	return res.global, nil
-}
-
 func parsePrometheusInteger(raw string) (int64, error) {
 	value, err := strconv.ParseFloat(raw, 64)
 	if err != nil {
@@ -741,24 +735,6 @@ func parsePrometheusInteger(raw string) (int64, error) {
 		return 0, fmt.Errorf("value is not a finite int64")
 	}
 	return int64(value), nil
-}
-
-// estimateLatencyPercentiles computes p50/p95/p99 in milliseconds from the
-// cumulative caddy_http_request_duration_seconds_bucket histogram.
-// 单族入口（测试/独立调用）：单趟读取 bucket 行后交给
-// latencyPercentilesFromBuckets；采集主路径在同一趟聚合里复用后者。
-func estimateLatencyPercentiles(text string) (int, int, int, error) {
-	byLE := map[float64]int64{}
-	for line := range strings.SplitSeq(text, "\n") {
-		if !strings.HasPrefix(line, "caddy_http_request_duration_seconds_bucket{") {
-			continue
-		}
-		if err := parsePrometheusBucketSample(line, byLE); err != nil {
-			return 0, 0, 0, err
-		}
-	}
-	p50, p95, p99 := latencyPercentilesFromBuckets(byLE)
-	return p50, p95, p99, nil
 }
 
 // latencyPercentilesFromBuckets 从按 le 聚合的累计直方图估算 p50/p95/p99

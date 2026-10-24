@@ -107,4 +107,18 @@ func TestCertJobProviderDanglingCounts_shapesAndRuleSource(t *testing.T) {
 	if disabled != 0 || missing != 0 {
 		t.Fatalf("carried disabled rules disabled/missing=%d/%d, want 0/0", disabled, missing)
 	}
+
+	// 空表随包（lb_rules 键存在但为空数组）：导入后无规则 → 零计数。判据必须
+	// 是「键存在」而非「行数 > 0」，否则会回退去读 live 规则——live 行在导入
+	// 全量替换后会被删除，告警与实际结果相反。
+	if _, err := database.Exec(`UPDATE lb_rules SET enabled=1`); err != nil {
+		t.Fatalf("re-enable live rules: %v", err)
+	}
+	disabled, missing, err = certJobProviderDanglingCounts(ctx, database, map[string][]map[string]any{"lb_rules": {}}, sectionTables)
+	if err != nil {
+		t.Fatalf("empty carried rules: %v", err)
+	}
+	if disabled != 0 || missing != 0 {
+		t.Fatalf("empty carried rules disabled/missing=%d/%d, want 0/0（空表随包不得回退读 live）", disabled, missing)
+	}
 }

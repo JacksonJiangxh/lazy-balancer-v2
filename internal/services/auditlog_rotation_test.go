@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"lazy-balancer-v2/internal/db"
 )
@@ -94,14 +96,17 @@ func TestRotateAuditLog_corruptPendingMarkerDefersRotation(t *testing.T) {
 // 只读挂载/IO 错误）不得改变归档代际。旧序先 .4→.5 … .1→.2 再复制，每 2s
 // tick 蚕食一代——.1..5 全存在时约 4 个 tick 即丢掉 4 代审计证据。
 func TestRotateAuditLog_copyFailureKeepsArchiveGenerations(t *testing.T) {
-	// Given：活文件超阈 + 5 代归档全部存在
+	// Given：活文件超阈 + 5 代归档全部存在（真实库使复制前闸门可追平尾部）
+	initServicesDB(t)
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "audit.log")
-	oldLogPath, oldSizeBytes, oldCopy := auditLogPath, auditLogSizeBytes, auditLogCopyFile
-	auditLogPath = logPath
+	oldLogPath, oldOffsetPath, oldSizeBytes, oldCopy := auditLogPath, securityEventsOffsetPath, auditLogSizeBytes, auditLogCopyFile
+	auditLogPath, securityEventsOffsetPath = logPath, filepath.Join(dir, "security_events.offset")
 	auditLogSizeBytes = func() int64 { return 1 }
-	t.Cleanup(func() { auditLogPath, auditLogSizeBytes, auditLogCopyFile = oldLogPath, oldSizeBytes, oldCopy })
-	if err := os.WriteFile(logPath, []byte("live-content"), 0o644); err != nil {
+	t.Cleanup(func() {
+		auditLogPath, securityEventsOffsetPath, auditLogSizeBytes, auditLogCopyFile = oldLogPath, oldOffsetPath, oldSizeBytes, oldCopy
+	})
+	if err := os.WriteFile(logPath, []byte(securityEventsFixtureBlocked+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	for i := 1; i <= 5; i++ {
@@ -134,7 +139,7 @@ func TestRotateAuditLog_copyFailureKeepsArchiveGenerations(t *testing.T) {
 	if _, err := os.Stat(logPath + ".1.new"); !os.IsNotExist(err) {
 		t.Fatalf("暂存文件必须清理, stat err=%v", err)
 	}
-	if got, err := os.ReadFile(logPath); err != nil || string(got) != "live-content" {
+	if got, err := os.ReadFile(logPath); err != nil || string(got) != securityEventsFixtureBlocked+"\n" {
 		t.Fatalf("活文件被改动: %q err=%v", got, err)
 	}
 }
@@ -153,7 +158,7 @@ func TestRotateAuditLog_promotesStagedArchiveAfterShift(t *testing.T) {
 	t.Cleanup(func() {
 		auditLogPath, securityEventsOffsetPath, auditLogSizeBytes, auditLogCopyFile = oldLogPath, oldOffsetPath, oldSizeBytes, oldCopy
 	})
-	if err := os.WriteFile(logPath, []byte("new-archive-content"), 0o644); err != nil {
+	if err := os.WriteFile(logPath, []byte(securityEventsFixtureBlocked+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(logPath+".1", []byte("gen-1"), 0o644); err != nil {
@@ -166,7 +171,7 @@ func TestRotateAuditLog_promotesStagedArchiveAfterShift(t *testing.T) {
 	}
 
 	// Then
-	if got, err := os.ReadFile(logPath + ".1"); err != nil || string(got) != "new-archive-content" {
+	if got, err := os.ReadFile(logPath + ".1"); err != nil || string(got) != securityEventsFixtureBlocked+"\n" {
 		t.Fatalf(".1 必须是本轮新归档: %q err=%v", got, err)
 	}
 	if got, err := os.ReadFile(logPath + ".2"); err != nil || string(got) != "gen-1" {
@@ -184,14 +189,17 @@ func TestRotateAuditLog_promotesStagedArchiveAfterShift(t *testing.T) {
 // 归档可能仍存在，继续 shift/promote 会覆盖仍有效的 .1（丢一代审计证据）。
 // 用自指符号链接注入 ELOOP（stat 失败但不是缺失）。
 func TestRotateAuditLog_statErrorAbortsBeforeOverwritingArchives(t *testing.T) {
+	initServicesDB(t)
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "audit.log")
-	oldLogPath, oldSizeBytes := auditLogPath, auditLogSizeBytes
-	auditLogPath = logPath
+	oldLogPath, oldOffsetPath, oldSizeBytes := auditLogPath, securityEventsOffsetPath, auditLogSizeBytes
+	auditLogPath, securityEventsOffsetPath = logPath, filepath.Join(dir, "security_events.offset")
 	auditLogSizeBytes = func() int64 { return 1 }
-	t.Cleanup(func() { auditLogPath, auditLogSizeBytes = oldLogPath, oldSizeBytes })
+	t.Cleanup(func() {
+		auditLogPath, securityEventsOffsetPath, auditLogSizeBytes = oldLogPath, oldOffsetPath, oldSizeBytes
+	})
 	resetPendingDeltaCorruptStreakForTest()
-	if err := os.WriteFile(logPath, []byte("live-content"), 0o644); err != nil {
+	if err := os.WriteFile(logPath, []byte(securityEventsFixtureBlocked+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(logPath+".1", []byte("archive-one"), 0o644); err != nil {
@@ -218,14 +226,17 @@ func TestRotateAuditLog_statErrorAbortsBeforeOverwritingArchives(t *testing.T) {
 // .1 未能让位时中止：.2 为非空目录使 .1→.2 的 rename 失败（上级链 .2/.3/.4/.5
 // 同样被占住，逐级 shift 全部失败），本轮必须中止且保留 .1 与 .2 现场。
 func TestRotateAuditLog_shiftFailureForFirstGenerationAbortsAndKeepsArchives(t *testing.T) {
+	initServicesDB(t)
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "audit.log")
-	oldLogPath, oldSizeBytes := auditLogPath, auditLogSizeBytes
-	auditLogPath = logPath
+	oldLogPath, oldOffsetPath, oldSizeBytes := auditLogPath, securityEventsOffsetPath, auditLogSizeBytes
+	auditLogPath, securityEventsOffsetPath = logPath, filepath.Join(dir, "security_events.offset")
 	auditLogSizeBytes = func() int64 { return 1 }
-	t.Cleanup(func() { auditLogPath, auditLogSizeBytes = oldLogPath, oldSizeBytes })
+	t.Cleanup(func() {
+		auditLogPath, securityEventsOffsetPath, auditLogSizeBytes = oldLogPath, oldOffsetPath, oldSizeBytes
+	})
 	resetPendingDeltaCorruptStreakForTest()
-	if err := os.WriteFile(logPath, []byte("live-content"), 0o644); err != nil {
+	if err := os.WriteFile(logPath, []byte(securityEventsFixtureBlocked+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(logPath+".1", []byte("archive-one"), 0o644); err != nil {
@@ -260,16 +271,19 @@ func TestRotateAuditLog_shiftFailureForFirstGenerationAbortsAndKeepsArchives(t *
 // 损坏的待补采标记在连续 N 轮不可解析后隔离为 .corrupt-<ts> 并继续轮转——
 // 单轮仍 fail-closed 保留现场，否则 audit.log 永久不轮转（无界增长）。
 func TestRotateAuditLog_corruptPendingMarkerQuarantinedAfterThreshold(t *testing.T) {
+	initServicesDB(t)
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "audit.log")
-	oldLogPath, oldSizeBytes := auditLogPath, auditLogSizeBytes
-	auditLogPath = logPath
+	oldLogPath, oldOffsetPath, oldSizeBytes := auditLogPath, securityEventsOffsetPath, auditLogSizeBytes
+	auditLogPath, securityEventsOffsetPath = logPath, filepath.Join(dir, "security_events.offset")
 	auditLogSizeBytes = func() int64 { return 1 }
-	t.Cleanup(func() { auditLogPath, auditLogSizeBytes = oldLogPath, oldSizeBytes })
+	t.Cleanup(func() {
+		auditLogPath, securityEventsOffsetPath, auditLogSizeBytes = oldLogPath, oldOffsetPath, oldSizeBytes
+	})
 	resetPendingDeltaCorruptStreakForTest()
 	t.Cleanup(resetPendingDeltaCorruptStreakForTest)
 
-	if err := os.WriteFile(logPath, []byte("live-content"), 0o644); err != nil {
+	if err := os.WriteFile(logPath, []byte(securityEventsFixtureBlocked+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	marker := securityEventsPendingDeltaPath()
@@ -538,5 +552,159 @@ func TestRotateAuditLog_truncateDeferredReturnsSentinel(t *testing.T) {
 	}
 	if _, aerr := os.Stat(logPath + ".1"); aerr != nil {
 		t.Fatalf("归档应已就位（副本语义未变）: %v", aerr)
+	}
+}
+
+// 持续写入下的推迟路径不得复制：复制前闸门不通过时每 tick 只做增量摄取，
+// 不复制、不移位、不改归档代际，告警同消息 60s 内只放行一条——旧实现每 2s
+// 全量复制 + 移位归档却永不 truncate（磁盘放大 ~6×、活文件无界增长）。流量
+// 停歇（尾部写完后）同一轮转必须一次成功：归档=轮转前全部字节、活文件截断、
+// 两笔事务均入库（零丢失）。
+func TestRotateAuditLog_deferredDoesNotCopyOrShift(t *testing.T) {
+	initServicesDB(t)
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	offsetPath := filepath.Join(dir, "security_events.offset")
+	oldLogPath, oldOffsetPath, oldSizeBytes, oldCopy := auditLogPath, securityEventsOffsetPath, auditLogSizeBytes, auditLogCopyFile
+	auditLogPath, securityEventsOffsetPath = logPath, offsetPath
+	auditLogSizeBytes = func() int64 { return 1 }
+	// 告警限流按固定时钟计数：20 轮推迟只允许一条 warn。
+	oldClock := auditFailureLogClock
+	auditFailureLogClock = func() time.Time { return time.Unix(1790000000, 0) }
+	auditFailureLogMu.Lock()
+	oldTimes := auditFailureLogTimes
+	auditFailureLogTimes = map[string]time.Time{}
+	auditFailureLogMu.Unlock()
+	var buf syncBuffer
+	oldWriter := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() {
+		log.SetOutput(oldWriter)
+		auditFailureLogClock = oldClock
+		auditFailureLogMu.Lock()
+		auditFailureLogTimes = oldTimes
+		auditFailureLogMu.Unlock()
+		auditLogPath, securityEventsOffsetPath, auditLogSizeBytes, auditLogCopyFile = oldLogPath, oldOffsetPath, oldSizeBytes, oldCopy
+	})
+
+	// 活文件：完整事务 A（tick 已摄取）+ 写者正在分多次 write 落盘的事务（截断点
+	// 深入 uri 字符串内部，尾部永远差最后一段）——持续写入下截断判据不成立的
+	// 确定性形态。
+	fixtureT := securityEventsFixtureClean
+	split := strings.Index(fixtureT, `"uri": "/upload`)
+	if split <= 0 {
+		t.Fatalf("fixture split point not found")
+	}
+	split += len(`"uri": "/upload`)
+	head, tail := fixtureT[:split], fixtureT[split:]
+	chunk := strings.Repeat("a", 64<<10)
+	if err := os.WriteFile(logPath, []byte(securityEventsFixtureBlocked+"\n"+head), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tailer := securityEventsNewTailer(logPath, offsetPath)
+	if err := tailer.securityEventsTick(); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	copies := 0
+	auditLogCopyFile = func(src, dst string) error {
+		copies++
+		if err := copyAuditLogTo(src, dst); err != nil {
+			return err
+		}
+		// copy 之后写者继续写下一段：尾部保持不可摄取（旧实现因此每 tick 全量
+		// 复制却永不 truncate）。
+		f, err := os.OpenFile(src, os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = f.WriteString(chunk)
+		return err
+	}
+	before, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// When：20 个 tick 尾部都追不平
+	const ticks = 20
+	for range ticks {
+		if _, rerr := rotateAuditLogIfNeeded(); !errors.Is(rerr, errAuditRotationDeferred) {
+			t.Fatalf("尾部未追平必须返回 deferred 哨兵, err=%v", rerr)
+		}
+	}
+
+	// Then：零复制、归档代际不动、活文件原样；告警一条；已摄取事件不丢。
+	if copies != 0 {
+		t.Fatalf("推迟路径不得复制（磁盘放大）: copies=%d over %d ticks", copies, ticks)
+	}
+	after, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("推迟路径不得改动活文件（零丢失前提）")
+	}
+	if _, serr := os.Stat(logPath + ".1.new"); !os.IsNotExist(serr) {
+		t.Fatalf("推迟路径不得留暂存归档, stat err=%v", serr)
+	}
+	if _, serr := os.Stat(logPath + ".1"); !os.IsNotExist(serr) {
+		t.Fatalf("推迟路径不得生成/移位归档, stat err=%v", serr)
+	}
+	if got := strings.Count(buf.String(), "live tail not fully ingested before copy"); got != 1 {
+		t.Fatalf("推迟告警条数=%d, want 1（同消息 60s 窗口内不得每 tick 刷一条）", got)
+	}
+	var rows int
+	if err := db.MetricsDB.QueryRow(`SELECT COUNT(*) FROM security_events WHERE transaction_id='tx-blocked-1'`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 {
+		t.Fatalf("rows=%d, want 1（推迟期间已摄取事件不得丢失）", rows)
+	}
+
+	// When：流量停歇（尾部补完）后同一轮转
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(tail + "\n"); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// 写者收尾：后续不再追写（复制钩子恢复真实行为，不再制造 churn）。
+	auditLogCopyFile = func(src, dst string) error {
+		copies++
+		return copyAuditLogTo(src, dst)
+	}
+	if _, rerr := rotateAuditLogIfNeeded(); rerr != nil {
+		t.Fatalf("尾部补完后轮转必须成功: %v", rerr)
+	}
+
+	// Then：一次复制、活文件截断、归档=轮转前全部内容、两事务均入库。
+	if copies != 1 {
+		t.Fatalf("完整轮转只允许一次复制, copies=%d", copies)
+	}
+	live, err := os.Stat(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if live.Size() != 0 {
+		t.Fatalf("live size=%d, want 0（轮转成功必须截断）", live.Size())
+	}
+	archive, err := os.ReadFile(logPath + ".1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := string(before) + tail + "\n"; string(archive) != want {
+		t.Fatalf("归档内容长度=%d, want %d（轮转前全部字节必须入档，零丢失）", len(archive), len(want))
+	}
+	if err := db.MetricsDB.QueryRow(`SELECT COUNT(*) FROM security_events WHERE transaction_id IN ('tx-blocked-1','tx-clean-1')`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 2 {
+		t.Fatalf("rows=%d, want 2（A + 补完的事务）", rows)
 	}
 }

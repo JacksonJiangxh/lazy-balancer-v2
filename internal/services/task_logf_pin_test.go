@@ -296,8 +296,13 @@ func TestTaskLogf_LogCleanupFailureFailsTaskAndLogsIncomplete(t *testing.T) {
 		auditLogPath, securityEventsOffsetPath, auditLogSizeBytes, auditLogCopyFile = oldLogPath, oldOffsetPath, oldSizeBytes, oldCopy
 	})
 	resetSecurityEventsPollState(t)
-	// daemon 停机形态：超阈活文件 + 兜底轮转失败（复制失败）
-	if err := os.WriteFile(auditLogPath, []byte(strings.Repeat("x", 2048)), 0o644); err != nil {
+	// daemon 停机形态：超阈活文件 + 兜底轮转失败（复制失败）。
+	// 内容为可解析审计文档——畸形尾会在复制前闸门处推迟，走不到复制失败分支。
+	stream := securityEventsFixtureClean + "\n" + securityEventsFixtureBlocked + "\n"
+	if len(stream) <= 1024 {
+		t.Fatalf("夹具长度 %d，须超过 1KB 轮转阈值", len(stream))
+	}
+	if err := os.WriteFile(auditLogPath, []byte(stream), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	auditLogCopyFile = func(string, string) error { return errors.New("injected copy failure") }

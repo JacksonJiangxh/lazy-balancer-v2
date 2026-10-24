@@ -53,9 +53,22 @@ func ValidateClusterAccessURL(value string) error {
 	return nil
 }
 
+// clusterNodeNameBlankGlyphs 是「视觉空白」字形集：渲染为空但既非 Cf 也非
+// unicode.IsSpace（U+2800 盲文空白属 So、U+3164/U+115F/U+1160/U+FFA0 属韩文
+// 填充字符）。整名只由它们组成时，集群列列表/切换节点选择器/审计详情的节点列
+// 都显示为空白，管理员无法辨认是哪台机器、也对不上审计——与 Cf 同处置直接
+// 剥离，而不是只做空白态判定。
+var clusterNodeNameBlankGlyphs = map[rune]struct{}{
+	'\u115f': {}, // HANGUL CHOSEONG FILLER
+	'\u1160': {}, // HANGUL JUNGSEONG FILLER
+	'\u2800': {}, // BRAILLE PATTERN BLANK
+	'\u3164': {}, // HANGUL FILLER
+	'\uffa0': {}, // HALFWIDTH HANGUL FILLER
+}
+
 // NormalizeClusterNodeName 节点名落库侧单源归一：去首尾空白、
-// 剥离控制字符与 Unicode 格式字符（Cf，保留 ZWJ）、按 schema VARCHAR(100)
-// 上限截断到合法 UTF-8 边界。HTTP 入口
+// 剥离控制字符、Unicode 格式字符（Cf，保留 ZWJ）与视觉空白填充字形、
+// 按 schema VARCHAR(100) 上限截断到合法 UTF-8 边界。HTTP 入口
 // 由 binding max=100 拦截；服务层直调与旧客户端仍需同一兜底（SQLite 不强制
 // VARCHAR 长度），否则 16KB 注册体可把超长/带换行的名字写进 nodes 并回显。
 func NormalizeClusterNodeName(name string) string {
@@ -73,17 +86,24 @@ func NormalizeClusterNodeName(name string) string {
 		if r != '\u200d' && unicode.Is(unicode.Cf, r) {
 			return -1
 		}
+		// 视觉空白填充字形：非 Cf、非空白，但渲染上是空的（见上表）。
+		if _, blank := clusterNodeNameBlankGlyphs[r]; blank {
+			return -1
+		}
 		return r
 	}, name)
 	name = strings.TrimSpace(name)
+	// 截断在前、空白态判定在后：截断可能把「可见字符位于上限之后」的名字
+	// 裁成纯隐形字符（100 个 ZWJ + 可见字符 → 100 个 ZWJ），判据若在截断
+	// 之前运行就已错过，落库值仍是视觉空名。
+	if utf8.RuneCountInString(name) > ClusterNodeNameMaxLen {
+		name = string([]rune(name)[:ClusterNodeNameMaxLen])
+	}
 	// ZWJ 例外只服务 emoji 组合：整名仅由 ZWJ 与空白构成时它不携带任何可见
 	// 字符，归一到空（由调用方按 ErrInvalidClusterNodeName 拒绝），否则会落成
 	// 视觉空名（集群列表/审计详情的节点列显示空白）。
 	if name != "" && strings.TrimFunc(name, func(r rune) bool { return r == '\u200d' || unicode.IsSpace(r) }) == "" {
 		return ""
-	}
-	if utf8.RuneCountInString(name) > ClusterNodeNameMaxLen {
-		name = string([]rune(name)[:ClusterNodeNameMaxLen])
 	}
 	return name
 }

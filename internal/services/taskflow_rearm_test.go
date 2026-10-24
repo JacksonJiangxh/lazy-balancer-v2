@@ -38,8 +38,15 @@ func TestRearmScheduleSlotsAfterTimezoneChange(t *testing.T) {
 	if _, err := db.DB.Exec(`INSERT OR REPLACE INTO security_ip2region_version (id, version, auto_update, next_update) VALUES (1,'u',1,?)`, pastSlot); err != nil {
 		t.Fatal(err)
 	}
-	// 威胁源表：启用+未来槽（应重排）与停用+未来槽（不动）。
-	if _, err := db.DB.Exec(`INSERT INTO security_threat_sources (name, update_enabled, next_update) VALUES ('src-on',1,?),('src-off',0,?)`, futureSh, futureSh); err != nil {
+	// 威胁源表：注册表源启用+未来槽（应重排）、注册表源停用+未来槽（不动）、
+	// 注册表外启用行+未来槽（槽域=运行域，不重排——其槽由启动期清理收敛）。
+	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_enabled=1, next_update=? WHERE name='ustc'`, futureSh); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET update_enabled=0, next_update=? WHERE name='firehol_l1'`, futureSh); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO security_threat_sources (name, update_enabled, next_update) VALUES ('src-legacy',1,?)`, futureSh); err != nil {
 		t.Fatal(err)
 	}
 
@@ -71,8 +78,9 @@ func TestRearmScheduleSlotsAfterTimezoneChange(t *testing.T) {
 	}
 	assertSlot("security_crs_version", "id=?", 1, true, futureSh)
 	assertSlot("security_ip2region_version", "id=?", 1, false, pastSlot) // 过期槽保留补跑
-	assertSlot("security_threat_sources", "name=?", "src-on", true, futureSh)
-	assertSlot("security_threat_sources", "name=?", "src-off", false, futureSh)
+	assertSlot("security_threat_sources", "name=?", "ustc", true, futureSh)
+	assertSlot("security_threat_sources", "name=?", "firehol_l1", false, futureSh)
+	assertSlot("security_threat_sources", "name=?", "src-legacy", false, futureSh) // 槽域=运行域
 }
 
 // Given 常驻任务运行中但 task_runs boot 行缺失（插入失败仅 WARN 的残留形态）。

@@ -152,6 +152,7 @@ func TestExportImportConfigBackup_syncUsersProtected(t *testing.T) {
 	}
 	router := gin.New()
 	router.POST("/config/import", h.ImportConfigBackup)
+	router.GET("/config/export", h.ExportConfigBackup)
 	importRec := httptest.NewRecorder()
 	importReq := httptest.NewRequest(http.MethodPost, "/config/import", strings.NewReader(string(body)))
 	importReq.Header.Set("Content-Type", "application/json")
@@ -165,5 +166,23 @@ func TestExportImportConfigBackup_syncUsersProtected(t *testing.T) {
 	}
 	if v != 1 {
 		t.Fatalf("sync_users=%d after import carrying 0, want 1 (protected key)", v)
+	}
+	// 导出半边：保护键只在导出侧剔除时才是恒同步不变量，「导入不落库」单独
+	// 无法阻止旧值/异常行被下一次导出外带。同包正常键必须仍在，证明 Config 区
+	// 确实被导出（否则「不含 sync_users」恒真）。
+	exportRec := httptest.NewRecorder()
+	router.ServeHTTP(exportRec, httptest.NewRequest(http.MethodGet, "/config/export", nil))
+	if exportRec.Code != http.StatusOK {
+		t.Fatalf("export status=%d body=%s", exportRec.Code, exportRec.Body.String())
+	}
+	var exported configBackup
+	if err := json.Unmarshal(unpackExportBody(t, exportRec.Body.Bytes()), &exported); err != nil {
+		t.Fatalf("parse export: %v", err)
+	}
+	if _, exists := exported.Config["sync_users"]; exists {
+		t.Fatal("export carries sync_users（保护键必须从导出剔除）")
+	}
+	if got, exists := exported.Config["timezone"]; !exists || got != "Asia/Shanghai" {
+		t.Fatalf("exported timezone=%v exists=%v, want Asia/Shanghai（导出须携带正常配置键）", got, exists)
 	}
 }

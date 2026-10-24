@@ -95,7 +95,8 @@ test('求值不修改入参', () => {
 test('组件接线：select 变更按字段求值，无 auth_mode 字面量重置', () => {
   const page = source('src/views/settings/FreeCertificates.vue')
   assert.match(page, /@change="onCredentialFieldChange"/)
-  assert.match(page, /applyCredentialFieldChange\(\n?\s*selectedProvider\.value\?\.credential_fields \?\? \[\],\n?\s*form\.value\.dns_credentials,/)
+  // 参数顺序与同一调用：允许任意换行/缩进，只钉两个实参按序出现在同一次调用里
+  assert.match(page, /applyCredentialFieldChange\([\s\S]{0,240}?selectedProvider\.value\?\.credential_fields \?\? \[\],[\s\S]{0,120}?form\.value\.dns_credentials,/)
   assert.doesNotMatch(page, /onAuthModeChange/)
   assert.doesNotMatch(page, /dns_credentials = \{ auth_mode: authMode\.value \}/)
   assert.doesNotMatch(page, /const authMode = computed\(/)

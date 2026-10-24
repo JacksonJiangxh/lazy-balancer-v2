@@ -102,3 +102,52 @@ func TestNormalizeUnregisteredThreatSourceSlots(t *testing.T) {
 		t.Fatalf("第二轮后注册表源槽=%q，want 保留", registrySlot)
 	}
 }
+
+// 槽域=运行域在**写侧**同样成立：注册表外启用行的槽被清空后，同一次装配的
+// 首槽武装与时区重排都不得把槽写回（两者此前无名字过滤，清理刚清空又被
+// 武装补回=伪收敛，只剩每次启动重复的误导性告警）。
+func TestUnregisteredThreatSlotNotRewrittenByArmOrTimezoneRearm(t *testing.T) {
+	_, database := newClusterTestService(t)
+	if _, err := database.Exec(`UPDATE global_config SET threat_auto_update=1 WHERE id=1`); err != nil {
+		t.Fatalf("enable threat auto update: %v", err)
+	}
+	// Given 注册表源空槽（应被武装）+ 注册表外启用行带过期槽（应被清空）。
+	if _, err := database.Exec(`UPDATE security_threat_sources SET update_enabled=1, next_update=NULL`); err != nil {
+		t.Fatalf("clear registry slots: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO security_threat_sources (name, url, update_enabled, next_update)
+		VALUES ('legacy-z','https://legacy.example/z.txt',1,'2020-01-01 00:00:00')`); err != nil {
+		t.Fatalf("seed unregistered source: %v", err)
+	}
+	readSlot := func(name string) string {
+		t.Helper()
+		var slot string
+		if err := database.QueryRow(`SELECT COALESCE(next_update,'') FROM security_threat_sources WHERE name=?`, name).Scan(&slot); err != nil {
+			t.Fatalf("read %s slot: %v", name, err)
+		}
+		return slot
+	}
+
+	// When 清理 + 首槽武装（同一次装配的两步）
+	normalizeUnregisteredThreatSourceSlots()
+	ArmThreatFirstSlots()
+
+	// Then 注册表源被武装，注册表外行保持空槽（不得被无过滤武装补回）。
+	if readSlot("ustc") == "" {
+		t.Fatal("注册表源空槽未被首槽武装")
+	}
+	if slot := readSlot("legacy-z"); slot != "" {
+		t.Fatalf("注册表外行槽被重新武装为 %q（清理被反向抵消）", slot)
+	}
+
+	// When 注册表外行带未来槽后再做时区重排
+	if _, err := database.Exec(`UPDATE security_threat_sources SET next_update='2999-05-06 07:08:09' WHERE name='legacy-z'`); err != nil {
+		t.Fatalf("seed future unregistered slot: %v", err)
+	}
+	RearmScheduleSlotsAfterTimezoneChange()
+
+	// Then 注册表外行的槽不被重排路径改写（槽域外行不参与重排）。
+	if slot := readSlot("legacy-z"); slot != "2999-05-06 07:08:09" {
+		t.Fatalf("注册表外行槽被时区重排改写为 %q（槽域=运行域被破坏）", slot)
+	}
+}

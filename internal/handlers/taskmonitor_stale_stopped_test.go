@@ -71,4 +71,12 @@ func TestSchedulingWriteEndpoints_rejectStoppedEngine(t *testing.T) {
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("已停引擎 control status=%d body=%s, want 503", rec.Code, rec.Body.String())
 	}
+
+	// Cancel 与 toggle/control 同口径：已停引擎上 te.Cancel 恒 false，409「任务
+	// 未在运行」会把「引擎已停止」误报成任务状态问题。
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/system/tasks/crs/cancel", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("已停引擎 cancel status=%d body=%s, want 503", rec.Code, rec.Body.String())
+	}
 }

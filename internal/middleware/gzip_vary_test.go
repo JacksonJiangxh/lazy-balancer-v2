@@ -5,6 +5,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -79,6 +82,29 @@ func TestGzipMiddleware_emptyBodyKeepsVaryOrigin(t *testing.T) {
 	}
 }
 
+// TestGzipMiddleware_panicStillRenders500 钉住 panic 恢复链路：defer 不得在
+// panic 在途时无条件 WriteHeaderNow——先落默认 200 会让 gin.Recovery 的 500
+// 无法生效，客户端拿到「200 + 空体」。
+func TestGzipMiddleware_panicStillRenders500(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	// 与生产链同序：Recovery 在外、压缩在内（SetupRouter 的 Use 顺序）。
+	router.Use(gin.Recovery())
+	router.Use(gzipMiddleware())
+	router.GET("/panic", func(c *gin.Context) {
+		panic("boom")
+	})
+
+	response := performGzipRequest(router, http.MethodGet, "/panic", "gzip")
+
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d, want 500——panic 必须由 gin.Recovery 写成 500", response.Code)
+	}
+	if encoding := response.Header().Get("Content-Encoding"); encoding != "" {
+		t.Errorf("500 响应不应压缩，Content-Encoding=%q", encoding)
+	}
+}
+
 // TestGzipMiddleware_successCompressesAndKeepsBothVary 钉住正常压缩路径：
 // 压缩生效、体可解压、Vary 同时含 Origin 与 Accept-Encoding。
 func TestGzipMiddleware_successCompressesAndKeepsBothVary(t *testing.T) {
@@ -123,6 +149,86 @@ func TestGzipMiddleware_clientWithoutGzipPassesThrough(t *testing.T) {
 	}
 	if !strings.Contains(response.Body.String(), `"code":0`) {
 		t.Errorf("响应体应为明文 JSON：%q", response.Body.String())
+	}
+}
+
+// TestGzipMiddleware_partialContentNotCompressed 钉住「206 不压缩」的守卫：
+// 206 一旦被 gzip 包住，Content-Range 声明的字节区间与「整包 gzip」语义冲突
+// （压缩分支还会删除 Content-Length），按分片拼接的客户端得到不可解内容。
+//
+// 形态说明：静态资产走 http.ServeContent，它在写体前已落头（gin 的
+// written=true），prepare 会在状态门之前提前返回——因此真实静态路径本来就不
+// 压缩（下方 staticFile 用例钉住该回归）。本用例用一个「先设头+状态、后写体」
+// 的 206 handler 覆盖状态门本身：这是守卫真正生效的形态，删除
+// StatusPartialContent 排除即复现压缩。
+func TestGzipMiddleware_partialContentNotCompressed(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(gzipMiddleware())
+	router.GET("/ranged", func(c *gin.Context) {
+		body := []byte("0123456789")
+		c.Header("Content-Type", "text/plain")
+		c.Header("Content-Range", "bytes 0-9/1024")
+		c.Header("Content-Length", strconv.Itoa(len(body)))
+		c.Status(http.StatusPartialContent)
+		_, _ = c.Writer.Write(body)
+	})
+
+	request := httptest.NewRequest(http.MethodGet, "/ranged", nil)
+	request.Header.Set("Accept-Encoding", "gzip")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusPartialContent {
+		t.Fatalf("status=%d, want 206", response.Code)
+	}
+	if encoding := response.Header().Get("Content-Encoding"); encoding != "" {
+		t.Fatalf("206 响应被压缩：Content-Encoding=%q（与 Content-Range 语义冲突）", encoding)
+	}
+	if got := response.Header().Get("Content-Length"); got != "10" {
+		t.Fatalf("Content-Length=%q, want 10（压缩会删除该头）", got)
+	}
+	if got := response.Header().Get("Content-Range"); got != "bytes 0-9/1024" {
+		t.Fatalf("Content-Range=%q", got)
+	}
+	if body := response.Body.String(); body != "0123456789" {
+		t.Fatalf("分片体被改写：%q", body)
+	}
+}
+
+// 真实静态资产路径的 206（http.ServeContent + Range）不得压缩：头在写体前已
+// 落盘，prepare 提前返回；若将来中间件改成先落头再判定，本用例会变红。
+func TestGzipMiddleware_staticFilePartialContentNotCompressed(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	assetPath := filepath.Join(t.TempDir(), "app.js")
+	content := strings.Repeat("console.log('partial');\n", 32)
+	if err := os.WriteFile(assetPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write asset: %v", err)
+	}
+	router := gin.New()
+	router.Use(gzipMiddleware())
+	router.StaticFile("/assets/app.js", assetPath)
+
+	request := httptest.NewRequest(http.MethodGet, "/assets/app.js", nil)
+	request.Header.Set("Accept-Encoding", "gzip")
+	request.Header.Set("Range", "bytes=0-9")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusPartialContent {
+		t.Fatalf("status=%d, want 206", response.Code)
+	}
+	if encoding := response.Header().Get("Content-Encoding"); encoding != "" {
+		t.Fatalf("206 静态分片被压缩：Content-Encoding=%q", encoding)
+	}
+	if got := response.Header().Get("Content-Length"); got != "10" {
+		t.Fatalf("Content-Length=%q, want 10", got)
+	}
+	if got, want := response.Header().Get("Content-Range"), "bytes 0-9/"+strconv.Itoa(len(content)); got != want {
+		t.Fatalf("Content-Range=%q, want %q", got, want)
+	}
+	if response.Body.Len() != 10 {
+		t.Fatalf("分片体长度=%d, want 10", response.Body.Len())
 	}
 }
 

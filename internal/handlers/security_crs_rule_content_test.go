@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -9,6 +10,8 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+
+	"lazy-balancer-v2/internal/services"
 )
 
 // 穿越门与尺寸门的回归钉：../ 与 / 形态的 filename 必须 400（此前只有
@@ -74,5 +77,86 @@ func TestGetCRSRuleContent_resolvesViaCRSRulesDirSeam(t *testing.T) {
 	}
 	if !strings.Contains(recorder.Body.String(), "@rx /w8-seam") {
 		t.Fatalf("body 不含注入目录中的规则内容: %s", recorder.Body.String())
+	}
+}
+
+// CRS 配置查看端点的三态（200/404/413）此前无端点级测试，crsSetupConf 测试缝
+// 也从未被注入：尺寸上限必须显式 413 而非静默截断。
+func TestSecurityCRSSetupConfig_endpointBoundaries(t *testing.T) {
+	const route = "/security/crs/setup"
+	h := newBackupTestHandlers(t)
+	confPath := filepath.Join(t.TempDir(), "crs-setup.conf")
+	oldConf := crsSetupConf
+	crsSetupConf = confPath
+	t.Cleanup(func() { crsSetupConf = oldConf })
+	call := func() *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodGet, route, nil)
+		h.GetCRSSetupConfig(ctx)
+		return recorder
+	}
+
+	// 文件不存在 → 404（不得 500，也不得返回空内容 200）
+	if rec := call(); rec.Code != http.StatusNotFound {
+		t.Fatalf("missing config status=%d body=%s, want 404", rec.Code, rec.Body.String())
+	}
+
+	// 正常读取 → 200 且逐字回传
+	const content = "SecAction \"id:900000,phase:1,pass\"\n"
+	if err := os.WriteFile(confPath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rec := call()
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "id:900000") {
+		t.Fatalf("status=%d body=%s, want 200 含配置内容", rec.Code, rec.Body.String())
+	}
+
+	// 超 1MB → 413（LimitReader 1MB+1 探针，显式拒绝而非静默截断）
+	if err := os.WriteFile(confPath, []byte(strings.Repeat("#", 1<<20+8)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if rec := call(); rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversize status=%d body=%s, want 413", rec.Code, rec.Body.String())
+	}
+}
+
+// CRS 更新状态端点：manager 未装配时显式 500（不得空对象 200），装配后
+// 按 StatusSnapshot 的六字段投影。
+func TestSecurityCRSUpdateStatus_projectsSnapshotAndReportsUninitialized(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	services.ResetCRSUpdateManagerForTest()
+	t.Cleanup(services.ResetCRSUpdateManagerForTest)
+	call := func() *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodGet, "/security/crs/update/status", nil)
+		h.GetCRSUpdateStatus(ctx)
+		return recorder
+	}
+
+	rec := call()
+	if rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), "更新服务未初始化") {
+		t.Fatalf("status=%d body=%s, want 500 更新服务未初始化", rec.Code, rec.Body.String())
+	}
+
+	services.InitCRSUpdateManager(func() error { return nil })
+	rec = call()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode: %v body=%s", err, rec.Body.String())
+	}
+	for _, key := range []string{"status", "trigger", "started_at", "finished_at", "message", "version"} {
+		if _, ok := payload.Data[key]; !ok {
+			t.Fatalf("缺少投影字段 %q: %+v", key, payload.Data)
+		}
+	}
+	if got := payload.Data["status"]; got != string(services.CRSStatusIdle) {
+		t.Fatalf("status=%v, want %q（新建 manager 的初始态）", got, services.CRSStatusIdle)
 	}
 }

@@ -25,19 +25,37 @@ export const overlayDetectionGrade = (base: AnomalySeverity, action: string): An
 /**
  * 0 分行（存量行）回退：现代引擎一律带评分，只有历史行落在这里。定性口径与
  * 后端入库补分（services/securityevents.go）一致——IP 名单/信任/威胁情报/
- * 爬虫伪装/预检=12（高），普通 GeoIP（rule_triggered 为 8 或 8xxxxx）=6（中），
+ * 爬虫伪装/预检=12（高），普通 GeoIP=6（中），爬虫豁免=0（低/审计轨迹），
  * 其余按动作给中/低。
+ *
+ * `^8\d{5}$` 一族不能一刀切：三族全部落在该模式内，必须按段界区分
+ * （段界与 internal/services/security.go 的 encode/decode 同值——Go 侧是
+ * 单一事实源，改动需同步）：
+ * - 普通 GeoIP `[800000,810000)`（+policyID）=6 → 中危；
+ * - 爬虫豁免 `[810000,850000)`（+policyID*16+引擎序号）=0 → 低危（放行轨迹）；
+ * - 爬虫伪装 `[850000,900000)`（+policyID）=12 → 与 12 分族同档。
  *
  * 检测模式只把高危族降为中危（存量行是粗粒度定性，不做中→低的二次下调，
  * 与评分分支的整档下移不同）。限流 429 不产生安全事件行（caddy-ratelimit 直接
  * 返回、无审计行），故不参与本回退。481-484 是渲染器发射的 HTTP 阻断状态码，
  * 不是 rule_triggered 值，落入兜底分支。
  */
+export const GEOIP_CRAWLER_EXEMPT_BASE = 810000
+export const GEOIP_CRAWLER_SPOOF_BASE = 850000
+/** 预检段右开界（CRS 保留段起点）。 */
+export const GEOIP_PRECHECK_LIMIT = 900000
+
 export const zeroScoreSeverity = (ruleTriggered: string, action: string): AnomalySeverity => {
   const blocked = action === 'blocked'
   if (ruleTriggered === '2' || ruleTriggered === '3' || ruleTriggered === '12' || ruleTriggered === '14') {
     return blocked ? 'high' : 'mid'
   }
-  if (ruleTriggered === '8' || /^8\d{5}$/.test(ruleTriggered)) return 'mid'
+  if (/^8\d{5}$/.test(ruleTriggered)) {
+    const n = Number(ruleTriggered)
+    if (n >= GEOIP_CRAWLER_SPOOF_BASE && n < GEOIP_PRECHECK_LIMIT) return blocked ? 'high' : 'mid'
+    if (n >= GEOIP_CRAWLER_EXEMPT_BASE) return 'low'
+    return 'mid'
+  }
+  if (ruleTriggered === '8') return 'mid'
   return blocked ? 'mid' : 'low'
 }

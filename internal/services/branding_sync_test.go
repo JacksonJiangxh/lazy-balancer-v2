@@ -246,7 +246,9 @@ func TestApplySnapshotBranding_emptyContentResetsToDefaultTemplate(t *testing.T)
 	}
 	injectLandingFromBranding(custom) // 模拟此前同步已注入的自定义 landing
 
-	applySnapshotBranding(dataDir, "")
+	if _, err := applySnapshotBranding(dataDir, ""); err != nil {
+		t.Fatalf("reset branding: %v", err)
+	}
 
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -274,7 +276,9 @@ func TestApplySnapshotBranding_emptyContentResetsToDefaultTemplate(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	applySnapshotBranding(dataDir, "")
+	if _, err := applySnapshotBranding(dataDir, ""); err != nil {
+		t.Fatalf("idempotent reset branding: %v", err)
+	}
 	st2, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
@@ -284,7 +288,9 @@ func TestApplySnapshotBranding_emptyContentResetsToDefaultTemplate(t *testing.T)
 	}
 
 	// dataDir 守卫保留:空目录不动作不 panic
-	applySnapshotBranding("", "")
+	if written, err := applySnapshotBranding("", ""); err != nil || written {
+		t.Fatalf("empty dataDir must be a no-op, written=%v err=%v", written, err)
+	}
 }
 
 // 三分类合并勘误(2026-09-19 生产实证):users 节哈希并入 basic_settings
@@ -405,7 +411,7 @@ func TestApplySnapshotBrandingChecked_throttlesRepeatedFailureAudit(t *testing.T
 	// 不含临时文件随机名——节流键=动作+类别+错误内容）。
 	cfg := &config.Config{DataDir: t.TempDir()}
 	for range 2 {
-		if err := sync.applySnapshotBrandingChecked(cfg, `[1,2]`); err == nil {
+		if _, err := sync.applySnapshotBrandingChecked(cfg, `[1,2]`); err == nil {
 			t.Fatal("non-object branding JSON must be rejected")
 		}
 	}
@@ -556,13 +562,13 @@ func TestApplySnapshotBranding_auditsOnlyWhenContentChanges(t *testing.T) {
 		}
 		return n
 	}
-	if err := applySnapshotBranding(dir, content); err != nil {
+	if _, err := applySnapshotBranding(dir, content); err != nil {
 		t.Fatalf("apply content: %v", err)
 	}
 	if got := countAudits(); got != 1 {
 		t.Fatalf("首次同步审计条数=%d, want 1", got)
 	}
-	if err := applySnapshotBranding(dir, content); err != nil {
+	if _, err := applySnapshotBranding(dir, content); err != nil {
 		t.Fatalf("re-apply unchanged content: %v", err)
 	}
 	if got := countAudits(); got != 1 {

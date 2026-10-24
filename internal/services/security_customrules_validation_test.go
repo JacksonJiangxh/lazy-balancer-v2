@@ -290,3 +290,78 @@ func TestEscapeCorazaPattern_stripsControlCharsAndPreservesLiteralBackslashN(t *
 		t.Fatalf("literal two-char \\n sequence must be preserved, got %q", got)
 	}
 }
+
+// 安全域字段级上限（与全局请求体上限分离）：custom_rules 引用数、单规则条件数、
+// pattern 字节数都在写侧 fail-closed 封顶——此前唯一约束是全局请求体上限
+// （默认 128MB），单条策略即可把列表/详情响应与每次渲染解析放大到不可用。
+// 覆盖目标（N 放行 / N+1 拒绝）、去重口径与三种载荷形状（引用数组/内嵌/
+// 旧版单条件）。
+func TestValidateCustomRules_fieldLevelLimits(t *testing.T) {
+	refs := make([]int, customRuleMaxRefs)
+	for i := range refs {
+		refs[i] = i + 1
+	}
+	payload, err := json.Marshal(refs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateCustomRulesJSON(string(payload)); err != nil {
+		t.Fatalf("引用数=上限(%d)必须放行: %v", customRuleMaxRefs, err)
+	}
+
+	// 去重后计数：重复 ID 不放大引用集合。
+	duplicated := make([]int, customRuleMaxRefs*2)
+	for i := range duplicated {
+		duplicated[i] = i%customRuleMaxRefs + 1
+	}
+	payload, err = json.Marshal(duplicated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateCustomRulesJSON(string(payload)); err != nil {
+		t.Fatalf("重复引用去重后仍在上限内必须放行: %v", err)
+	}
+
+	over := make([]int, customRuleMaxRefs+1)
+	for i := range over {
+		over[i] = i + 1
+	}
+	payload, err = json.Marshal(over)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateCustomRulesJSON(string(payload)); err == nil || !strings.Contains(err.Error(), "不能超过") {
+		t.Fatalf("引用数=上限+1(%d)必须拒绝, got %v", customRuleMaxRefs+1, err)
+	}
+
+	// 条件数边界：N 放行 / N+1 拒绝。
+	conditions := make([]models.CustomRuleCondition, customRuleMaxConditions)
+	for i := range conditions {
+		conditions[i] = models.CustomRuleCondition{Target: "uri", Operator: "contains", Pattern: "/x"}
+	}
+	if err := ValidateCustomRuleConditions(conditions); err != nil {
+		t.Fatalf("条件数=上限(%d)必须放行: %v", customRuleMaxConditions, err)
+	}
+	conditions = append(conditions, models.CustomRuleCondition{Target: "uri", Operator: "contains", Pattern: "/y"})
+	if err := ValidateCustomRuleConditions(conditions); err == nil || !strings.Contains(err.Error(), "64") {
+		t.Fatalf("条件数=上限+1 必须拒绝并给出数值, got %v", err)
+	}
+
+	// pattern 字节边界：N 放行 / N+1 拒绝（内嵌与旧版单条件形状同门）。
+	atLimit := strings.Repeat("a", customRuleMaxPatternBytes)
+	if err := ValidateCustomRuleConditions([]models.CustomRuleCondition{{Target: "uri", Operator: "contains", Pattern: atLimit}}); err != nil {
+		t.Fatalf("pattern=%d 字节必须放行: %v", customRuleMaxPatternBytes, err)
+	}
+	tooLong := strings.Repeat("a", customRuleMaxPatternBytes+1)
+	if err := ValidateCustomRuleConditions([]models.CustomRuleCondition{{Target: "uri", Operator: "contains", Pattern: tooLong}}); err == nil || !strings.Contains(err.Error(), "不能超过") {
+		t.Fatalf("pattern=上限+1 必须拒绝, got %v", err)
+	}
+	embedded := `[{"id":1,"name":"内嵌","enabled":true,"conditions":[{"target":"uri","operator":"contains","pattern":"` + tooLong + `"}]}]`
+	if err := ValidateCustomRulesJSON(embedded); err == nil || !strings.Contains(err.Error(), "不能超过") {
+		t.Fatalf("内嵌形状超长 pattern 必须拒绝, got %v", err)
+	}
+	legacy := `[{"id":1,"name":"旧版","enabled":true,"target":"uri","operator":"contains","pattern":"` + tooLong + `"}]`
+	if err := ValidateCustomRulesJSON(legacy); err == nil || !strings.Contains(err.Error(), "不能超过") {
+		t.Fatalf("旧版单条件形状超长 pattern 必须拒绝, got %v", err)
+	}
+}

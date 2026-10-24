@@ -424,8 +424,8 @@ func TestValidateBuiltinThreatListRefs_chunksLargeReferenceSets(t *testing.T) {
 	}
 }
 
-// ──：system=1 名单名称白名单（威胁/爬虫/自动封禁
-// 种子集合）——任意伪造内置名入库后管理员无法编辑/删除，UI 却宣称任务维护。 ──
+// system=1 名单名称白名单（威胁/爬虫/自动封禁种子集合）——任意伪造内置名
+// 入库后管理员无法编辑/删除，UI 却宣称任务维护。
 
 func TestRejectsForgedSystemIPListNames(t *testing.T) {
 	threatName := db.ThreatSystemLists()[0].Name

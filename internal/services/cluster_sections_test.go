@@ -377,7 +377,9 @@ func TestRecordAppliedSectionHashes_persistsAndUpdates(t *testing.T) {
 		t.Fatalf("record applied section hashes: %v", err)
 	}
 	var count int
-	database.QueryRow("SELECT COUNT(*) FROM cluster_applied_sections WHERE section='users'").Scan(&count)
+	if err := database.QueryRow("SELECT COUNT(*) FROM cluster_applied_sections WHERE section='users'").Scan(&count); err != nil {
+		t.Fatalf("count applied users section: %v", err)
+	}
 	if count != 0 {
 		t.Fatal("disabled section must not persist applied hash")
 	}
@@ -656,7 +658,9 @@ func TestUpdateSettings_rejectsDisablingSyncUsers(t *testing.T) {
 		t.Errorf("rejection should explain 系统数据恒同步, got: %v", err)
 	}
 	var v int
-	database.QueryRow(`SELECT COALESCE(sync_users,1) FROM global_config WHERE id=1`).Scan(&v)
+	if err := database.QueryRow(`SELECT COALESCE(sync_users,1) FROM global_config WHERE id=1`).Scan(&v); err != nil {
+		t.Fatalf("read sync_users: %v", err)
+	}
 	if v != 1 {
 		t.Errorf("sync_users=%d, must stay 1", v)
 	}
@@ -711,7 +715,9 @@ func TestApplySnapshot_versionRowsDiffGating(t *testing.T) {
 		t.Fatalf("apply: %v", err)
 	}
 	var v string
-	database.QueryRow(`SELECT COALESCE(version,'') FROM security_crs_version WHERE id=1`).Scan(&v)
+	if err := database.QueryRow(`SELECT COALESCE(version,'') FROM security_crs_version WHERE id=1`).Scan(&v); err != nil {
+		t.Fatalf("read crs version: %v", err)
+	}
 	if v != "9.9.9" {
 		t.Errorf("CRS version=%q, want 9.9.9 (diff must apply)", v)
 	}
@@ -722,7 +728,9 @@ func TestApplySnapshot_versionRowsDiffGating(t *testing.T) {
 	if err := syncService.applySnapshot(context.Background(), snapshot2); err != nil {
 		t.Fatalf("second apply: %v", err)
 	}
-	database.QueryRow(`SELECT COALESCE(version,'') FROM security_crs_version WHERE id=1`).Scan(&v)
+	if err := database.QueryRow(`SELECT COALESCE(version,'') FROM security_crs_version WHERE id=1`).Scan(&v); err != nil {
+		t.Fatalf("read crs version after idempotent apply: %v", err)
+	}
 	if v != "9.9.9" {
 		t.Errorf("CRS version=%q after idempotent apply, want stable 9.9.9", v)
 	}
@@ -737,6 +745,14 @@ func TestApplySnapshot_securitySwitchOffSkipsCRSVersionRows(t *testing.T) {
 	}))
 	defer caddyServer.Close()
 	syncService := NewSyncService(database, &config.Config{CaddyAdminURL: caddyServer.URL}, NewCaddyService(caddyServer.URL))
+	// 本地先落哨兵版本行：从库没有任何版本行时，「未被 9.9.9 覆盖」的断言
+	// 在 Scan 失败（零值）下也会通过——哨兵让「保留本地」成为可区分事实。
+	if _, err := database.Exec(`INSERT INTO security_crs_version (id, version) VALUES (1,'local-keep') ON CONFLICT(id) DO UPDATE SET version=excluded.version`); err != nil {
+		t.Fatalf("seed local crs row: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO security_ip2region_version (id, version) VALUES (1,'local-xdb') ON CONFLICT(id) DO UPDATE SET version=excluded.version`); err != nil {
+		t.Fatalf("seed local ip2region row: %v", err)
+	}
 	snapshot := models.ClusterSnapshot{
 		Version: 3,
 		MasterSyncSwitches: &models.ClusterSyncSwitchesPayload{
@@ -750,14 +766,18 @@ func TestApplySnapshot_securitySwitchOffSkipsCRSVersionRows(t *testing.T) {
 		t.Fatalf("apply: %v", err)
 	}
 	var v string
-	database.QueryRow(`SELECT COALESCE(version,'') FROM security_crs_version WHERE id=1`).Scan(&v)
-	if v == "9.9.9" {
-		t.Error("CRS version row must NOT apply when security switch off")
+	if err := database.QueryRow(`SELECT COALESCE(version,'') FROM security_crs_version WHERE id=1`).Scan(&v); err != nil {
+		t.Fatalf("read crs version: %v", err)
+	}
+	if v != "local-keep" {
+		t.Errorf("CRS version=%q, want local-keep（security 开关关闭时快照版本行不得覆盖本地）", v)
 	}
 	var x string
-	database.QueryRow(`SELECT COALESCE(version,'') FROM security_ip2region_version WHERE id=1`).Scan(&x)
-	if x == "999909" {
-		t.Error("IP2Region version row must NOT apply when security switch off")
+	if err := database.QueryRow(`SELECT COALESCE(version,'') FROM security_ip2region_version WHERE id=1`).Scan(&x); err != nil {
+		t.Fatalf("read ip2region version: %v", err)
+	}
+	if x != "local-xdb" {
+		t.Errorf("IP2Region version=%q, want local-xdb（security 开关关闭时快照版本行不得覆盖本地）", x)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"lazy-balancer-v2/internal/db"
+	"lazy-balancer-v2/internal/services"
 
 	"github.com/gin-gonic/gin"
 )
@@ -28,6 +29,10 @@ import (
 // setup 成功路径原子重置失败计数）。
 func seedMfaSetupUser(t *testing.T) {
 	t.Helper()
+	// 登录后验码/pending 验码限流为进程内内存态——同 user id（均 id=1）的跨
+	// 用例残留会让后序用例误中 429，播种即清并在用例结束时再清。
+	services.MFAResetVerifyAttemptsForTest()
+	t.Cleanup(services.MFAResetVerifyAttemptsForTest)
 	if _, err := db.DB.Exec("INSERT INTO users (id,username,password_hash,role,is_enabled,mfa_pending_fails) VALUES (1,'operator','seed-hash','admin',1,3)"); err != nil {
 		t.Fatalf("seed setup user: %v", err)
 	}

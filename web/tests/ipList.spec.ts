@@ -19,7 +19,7 @@ import {
   parseIPList,
   sharedEntriesCache,
 } from '../src/utils/securityStages.ts'
-import { member, repoSource, source } from './_helpers.ts'
+import { code, member, repoCode, source } from './_helpers.ts'
 
 test('IP 快捷处置：信任命中只全扫一次，GeoIP 区域只解析一次', () => {
   const src = source('src/views/security/IPLocationAction.vue')
@@ -142,8 +142,8 @@ test('C7 备注超过 100 字拒绝导入（带行号报错，不静默截断）
   // 101 个 code point：拒绝而非截断（旧实现静默截尾，用户无感知）
   assert.deepEqual(parseIpListEntryLine(`10.0.0.1,${'😀'.repeat(100)}尾`, isValidCidr), { error: 'remark_too_long' })
   assert.deepEqual(parseIpListEntryLine(`10.0.0.1,${'a'.repeat(101)}`, isValidCidr), { error: 'remark_too_long' })
-  // 导入流必须带文件行号点名拒绝（源码钉）
-  const src = source('src/views/security/SecurityRules.vue')
+  // 导入流必须带文件行号点名拒绝（脚本存在性：注释里的旧实现不得满足）
+  const src = code('src/views/security/SecurityRules.vue')
   const importFlow = member(src, 'const importEntriesFromText')
   assert.match(importFlow, /remarkTooLongLines\.push\(line\.no\)/, '导入流必须按文件行号记录备注超长拒绝')
   assert.match(importFlow, /第 \$\{[^}]+\} 行/, '拒绝信息必须携带文件行号')
@@ -151,7 +151,7 @@ test('C7 备注超过 100 字拒绝导入（带行号报错，不静默截断）
 
 test('C8 JSON 字符串数组统一 trim 并丢弃空项', () => {
   assert.deepEqual(parseIPList('[" 1.1.1.1 ","","  ",2,"10.0.0.0/8"]'), ['1.1.1.1', '10.0.0.0/8'])
-  const crsSource = source('src/composables/useCrsRuleIndex.ts')
+  const crsSource = code('src/composables/useCrsRuleIndex.ts')
   assert.match(crsSource, /normalizeStringEntries\(rec\.ips\)/, 'CRS 排除规则数组必须复用同一 trim 归一')
 })
 
@@ -248,7 +248,7 @@ test('D2 代际守卫：失效前发起的在途 loader 落地不得回填缓存
 test('名单条目上限/备注长度与后端 securityiplists.go 同源（跨栈钉）', () => {
   // 上限此前在 SFC 硬编码两处（校验 + 文案），后端单一常量 ipListMaxEntries；
   // 备注长度后端按 rune 计（len([]rune(...)) > 100），前端按 code point 计。
-  const go = repoSource('internal/handlers/securityiplists.go')
+  const go = repoCode('internal/handlers/securityiplists.go')
   // gofmt 对齐重排会让固定空格数假红——用 \s* 匹配
   assert.match(go, /\bipListMaxEntries\s*=\s*2000\b/, '后端条目上限常量漂移')
   assert.ok(go.includes('len([]rune('), '备注长度后端必须按 rune 计数（与前端 code point 一致）')
@@ -259,7 +259,14 @@ test('名单条目上限/备注长度与后端 securityiplists.go 同源（跨�
   // 分页示例会假红）。
   const rules = source('src/views/security/SecurityRules.vue')
   assert.match(rules, /IP_LIST_MAX_ENTRIES/, 'SecurityRules 必须引用单源常量')
-  assert.match(rules, /entries\.length > IP_LIST_MAX_ENTRIES/, '条目数校验必须引用单源常量')
+  // 上限按生效条目计（与后端 validateIPListShape / AutobanActiveEntries 同口径）：
+  // 已到期条目保存时被剔除、不占名额，原始条数比较会把到期残留顶到上限。
+  assert.match(rules, /activeEntryCount > IP_LIST_MAX_ENTRIES/, '条目数校验必须引用单源常量（生效条目口径）')
+  assert.match(
+    rules,
+    /entries\.filter\(\(e\) => !!e\.expires_at && autobanEntryExpired\(e\.expires_at\)\)/,
+    '生效条目数必须剔除已到期条目（与后端剔除口同源）',
+  )
   assert.doesNotMatch(rules, /length\s*>\s*2000\b/, '条目数比较不得写死 2000')
   assert.doesNotMatch(rules, /:max="\s*2000\s*"/, '控件上限不得写死 2000')
 })

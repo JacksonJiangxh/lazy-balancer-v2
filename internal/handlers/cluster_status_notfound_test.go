@@ -9,9 +9,11 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// 节点已被主节点删除后，从端重试上报/脱离通知必须得到「身份不存在」语义：
-// 非 detached 上报 404（停止重试），detached 更通知按幂等成功 200；
-// 此前统一 500 会让从端按「服务端故障」持续重试并写入 last_sync_error。
+// 节点已被主节点删除后，从端重试上报/脱离通知必须得到语义正确的应答：
+// 非 detached 上报 404（身份不存在；上报循环的终止由下一轮 Pull 的 401 令牌
+// 撤销承担，本端点不承担「停手」职责），detached 更通知按幂等成功 200；
+// 此前统一 500 会让从端把「节点已删」误报为「服务端故障」并持续写入
+// last_sync_error。
 func TestReportClusterNode_nodeNotFoundMapping(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	gin.SetMode(gin.TestMode)

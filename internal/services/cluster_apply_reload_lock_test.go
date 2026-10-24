@@ -18,11 +18,11 @@ import (
 	"lazy-balancer-v2/internal/models"
 )
 
-// Given CaddyOpLock 被预持（模拟并发的重启 watcher/规则写临界区），从端
-// SyncService 指向就绪的 Caddy stub。
+// Given 从端 SyncService 指向就绪的 Caddy stub；临界区入口观察点在重载段。
 // When applySnapshot 执行到末段「渲染+ApplyConfigForce 强制重载」。
-// Then 重载必须阻塞至 CaddyOpLock 释放（持锁期间不得完成），释放后照常完成。
-func TestSyncService_applySnapshot_reload_blocks_while_caddy_op_lock_held(t *testing.T) {
+// Then 进入临界区时 CaddyOpLock 必须已被持有（TryLock 失败），完成后 /load
+// 恰一次；锁序护栏不再依赖固定时间窗。
+func TestSyncService_applySnapshot_reload_holds_caddy_op_lock(t *testing.T) {
 	_, database := newClusterTestService(t)
 	if _, err := database.Exec("UPDATE global_config SET is_master=0 WHERE id=1"); err != nil {
 		t.Fatalf("set slave mode: %v", err)
@@ -47,25 +47,45 @@ func TestSyncService_applySnapshot_reload_blocks_while_caddy_op_lock_held(t *tes
 		BasicSettings: models.ClusterBasicSettings{LogLevel: new("info"), Timezone: new("Asia/Shanghai")},
 	})
 
-	CaddyOpLock.Lock()
+	// 临界区入口观察点：钩子在 applySnapshot 已持 CaddyOpLock 后被调用。
+	// 用例在此停住钩子，用 TryLock 直接断言「锁被持有时才进入重载段」——
+	// 不再用固定时间窗猜测进度（机器慢/前置阶段变慢时负向断言假绿）。
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseHook := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseHook)
+	syncReloadLockHook = func() {
+		close(entered)
+		<-release
+	}
+	t.Cleanup(func() { syncReloadLockHook = nil })
+
 	done := make(chan error, 1)
 	go func() {
 		done <- syncService.applySnapshot(context.Background(), snapshot)
 	}()
 	select {
+	case <-entered:
 	case err := <-done:
-		CaddyOpLock.Unlock()
-		t.Fatalf("applySnapshot 重载段在 CaddyOpLock 被预持期间完成（从端重载未入锁）, err=%v", err)
-	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("applySnapshot 未进入重载临界区即完成, err=%v", err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("applySnapshot 30s 内未进入重载临界区（前置阶段挂起）")
 	}
-	CaddyOpLock.Unlock()
+	// 钩子运行中=临界区内：锁必须不可再获取。
+	if CaddyOpLock.TryLock() {
+		CaddyOpLock.Unlock()
+		releaseHook()
+		t.Fatal("重载段未持 CaddyOpLock（临界区外执行渲染+/load，可被并发渲染覆盖）")
+	}
+	releaseHook()
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("锁释放后 applySnapshot 失败: %v", err)
+			t.Fatalf("applySnapshot 失败: %v", err)
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("锁释放后 applySnapshot 10s 内未完成")
+		t.Fatal("applySnapshot 10s 内未完成")
 	}
 	// 真实 POST /load 必须发生且恰一次：锁内路径退化为空操作时本条变红。
 	loadMu.Lock()

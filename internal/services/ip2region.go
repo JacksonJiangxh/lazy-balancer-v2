@@ -899,6 +899,15 @@ func writeRegionTreeCache(tree *IP2RegionRegionTree) {
 // RebuildRegionTreeCacheForSync 供集群同步/lbbak 导入路径在 xdb 变更后调用
 // ——与更新器 SetIP2RegionVersion 同款后置:树缓存重建+留痕(2026-09-18
 // 用户裁定:同步只是换源,更新流程照走)。
+// 写入门与启动路径同口径（ip2RegionStartupRepairWritesAllowed）：「文件/版本行/
+// 派生缓存一律不落盘」是本节点只读不变量的显式契约，同步/导入在从节点同样会
+// 执行，此前无条件落盘使该契约在这条路径上出现例外。跳过落盘不影响可用性：
+// 读侧（GetIP2RegionRegionTree / GetIP2RegionProvinces）缺缓存时按 xdb 在内存
+// 重建并记忆化。
 func RebuildRegionTreeCacheForSync() {
+	if !ip2RegionStartupRepairWritesAllowed() {
+		Logf("info", "ip2region: 非主节点（或角色不可证实），跳过地域树派生缓存落盘（读侧按 xdb 内存重建）")
+		return
+	}
 	writeRegionTreeCache(regionTreeFromXDB(ip2regionLivePath))
 }

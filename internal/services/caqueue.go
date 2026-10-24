@@ -530,8 +530,12 @@ func BeginConfigImportHold() {
 	configImportHold.Unlock()
 }
 
-// EndConfigImportHold 退出导入屏障；最后一层退出时兑现被延迟的启动意图，
-// 并补启动被导入窗口延迟的证书生命周期（cert-issuance daemon 启动）。
+// EndConfigImportHold 退出导入屏障；最后一层退出时兑现被延迟的启动意图
+// （CA 队列 + 证书生命周期）。读取意图与取走意图必须在同一次临界区内完成：
+// 登记侧（startUnlessConfigImportHold / startCertIssuanceLifecycle）在判定
+// 屏障活跃之后才登记，若本函数先解锁再消费，迟到的登记会落在「屏障已退出」
+// 之后而永不被任何组件兑现（CA 队列保持 inactive、签发 worker 不启动，且
+// 角色一致时不会重启 loop，本代进程内没有第二条恢复通道）。
 func EndConfigImportHold() {
 	configImportHold.Lock()
 	if configImportHold.depth > 0 {
@@ -539,6 +543,7 @@ func EndConfigImportHold() {
 	}
 	release := configImportHold.depth == 0
 	pending := release && configImportHold.pendingStart
+	certPending := release && certIssuanceStartDeferred.CompareAndSwap(true, false)
 	if release {
 		configImportHold.pendingStart = false
 	}
@@ -551,7 +556,9 @@ func EndConfigImportHold() {
 			manager.startIgnoringHold()
 		}
 	}
-	resumeDeferredCertIssuanceLifecycle()
+	if certPending {
+		startCertIssuanceLifecycleIgnoringHold()
+	}
 }
 
 // configImportHoldActive 当前是否处于导入屏障窗口。
@@ -559,6 +566,53 @@ func configImportHoldActive() bool {
 	configImportHold.Lock()
 	defer configImportHold.Unlock()
 	return configImportHold.depth > 0
+}
+
+// configImportHoldDeferHook 仅测试注入（生产恒 nil）：在「判定屏障活跃」与
+// 「登记延迟启动意图」之间执行，让用例把屏障退出精准插进这个窗口。窗口内的
+// 退出正是旧实现丢意图的形态（两次独立加锁：End 可在中间读完意图并退出）。
+var configImportHoldDeferHook func()
+
+// startUnlessConfigImportHold 按导入屏障语义决定本次启动能否立即执行：
+// true=屏障不在场（调用方直接启动），false=已登记延迟意图（由
+// EndConfigImportHold 兑现）。登记后立即在屏障锁内复核一次——屏障若在判定与
+// 登记之间退出（EndConfigImportHold 已读完意图），本代自行取走意图并返回
+// true。这条自愈路径是「意图永不丢」的保证，不得删。
+func startUnlessConfigImportHold() bool {
+	if !configImportHoldActive() {
+		return true
+	}
+	if configImportHoldDeferHook != nil {
+		configImportHoldDeferHook()
+	}
+	deferCAQueueStartLocked()
+	// 复核（屏障锁内）：屏障若已在判定与登记之间退出，本代自行取走意图。
+	return takeDeferredCAQueueStartIfReleased()
+}
+
+// takeDeferredCAQueueStartIfReleased 在屏障锁内复核并取走延迟的队列启动意图：
+// 屏障仍活跃则留给 EndConfigImportHold（返回 false），已退出则取走并返回 true。
+func takeDeferredCAQueueStartIfReleased() bool {
+	configImportHold.Lock()
+	defer configImportHold.Unlock()
+	if configImportHold.depth > 0 {
+		return false
+	}
+	taken := configImportHold.pendingStart
+	configImportHold.pendingStart = false
+	return taken
+}
+
+// takeDeferredCertIssuanceStartIfReleased 与队列版同语义：屏障已退出则取走
+// 证书生命周期的延迟启动意图（调用方自行启动），否则留给
+// EndConfigImportHold 兑现。
+func takeDeferredCertIssuanceStartIfReleased() bool {
+	configImportHold.Lock()
+	defer configImportHold.Unlock()
+	if configImportHold.depth > 0 {
+		return false
+	}
+	return certIssuanceStartDeferred.CompareAndSwap(true, false)
 }
 
 // deferCAQueueStartLocked 记录被屏障延迟的启动意图（调用方不持 hold 锁）。
@@ -569,8 +623,7 @@ func deferCAQueueStartLocked() {
 }
 
 func (m *CAQueueManager) Resume() {
-	if configImportHoldActive() {
-		deferCAQueueStartLocked()
+	if !startUnlessConfigImportHold() {
 		return
 	}
 	m.resumeIgnoringHold()
@@ -1054,10 +1107,10 @@ func (m *CAQueueManager) enqueueCompensation(providerID int, jobID int, ruleID, 
 }
 
 func (m *CAQueueManager) Start() {
-	if configImportHoldActive() {
-		// 导入窗口：只登记意图，不得打开队列（否则 StartACME 的部署重试
-		// 恢复会与导入事务并发写证书/库）。EndConfigImportHold 兑现。
-		deferCAQueueStartLocked()
+	// 导入窗口：只登记意图，不得打开队列（否则 StartACME 的部署重试恢复会与
+	// 导入事务并发写证书/库）。EndConfigImportHold 兑现，窗口内退出的交错由
+	// startUnlessConfigImportHold 的自愈复核兜底。
+	if !startUnlessConfigImportHold() {
 		return
 	}
 	m.startIgnoringHold()
@@ -1143,10 +1196,21 @@ type queueExecution struct {
 	cancel   context.CancelFunc
 }
 
+// normalizeCAProviderSnapshot 是队列 provider 快照的归一唯一出口。闸门直接用
+// 缓存快照判定（q.running >= q.provider.MaxConcurrent / lastOrder + MinInterval），
+// 未归一的 0 值会让该 CA 的派发闸门永久关闭（running=0 >= 0 恒真），而
+// enqueueLocked 复用队列时会同步 providerVersion——版本一致使 tick/refresh 的
+// 重载分支也不再纠偏（95 轮只在 tick/refresh 补归一，漏了这条入口）。
+// 归一对落库/审计比对（NormalizeCAProvider*）与队列快照共用同一对函数，
+// 队列侧不得另写钳制。
+func normalizeCAProviderSnapshot(provider models.CAProvider) models.CAProvider {
+	provider.MaxConcurrent = NormalizeCAProviderMaxConcurrent(provider.MaxConcurrent)
+	provider.MinIntervalMS = NormalizeCAProviderMinIntervalMS(provider.MinIntervalMS)
+	return provider
+}
+
 func newCAQueue(provider models.CAProvider, reloader func() error, dataDir ...string) *caQueue {
-	if provider.MaxConcurrent <= 0 {
-		provider.MaxConcurrent = 1
-	}
+	provider = normalizeCAProviderSnapshot(provider)
 	ctx, cancel := context.WithCancel(context.Background())
 	q := &caQueue{
 		provider:        provider,
@@ -1248,9 +1312,8 @@ func (q *caQueue) tick() {
 		q.failPendingProviderUnavailable(pending, message)
 		return
 	}
-	if provider.MaxConcurrent <= 0 {
-		provider.MaxConcurrent = 1
-	}
+	// loadCAProvider 已在唯一出口归一 max_concurrent/min_interval_ms，此处不再
+	// 重复钳制（重复钳制会让「归一」出现第二份实现而漂移）。
 	q.provider = provider
 	q.providerVersion = caProviderConfigVersion.Load()
 	// 加载到的新配置可能收紧，按新值复核（纯内存比较）：派发决策始终按最新
@@ -1292,9 +1355,7 @@ func (q *caQueue) refreshProviderLocked() bool {
 		q.failPendingProviderUnavailable(pending, message)
 		return false
 	}
-	if provider.MaxConcurrent <= 0 {
-		provider.MaxConcurrent = 1
-	}
+	// 归一已在 loadCAProvider 唯一出口完成（见 normalizeCAProviderSnapshot）。
 	q.provider = provider
 	q.providerVersion = caProviderConfigVersion.Load()
 	return true
@@ -1536,7 +1597,9 @@ func loadCAProvider(id int) (models.CAProvider, error) {
 		return p, fmt.Errorf("load CA provider %d: %w", id, err)
 	}
 	if err == nil {
-		return p, nil
+		// 归一必须在唯一加载出口完成：所有缓存快照写入点（newCAQueue /
+		// enqueueLocked / tick / refreshProviderLocked）都从这里取 provider。
+		return normalizeCAProviderSnapshot(p), nil
 	}
 	// 显式选择的提供商「存在但已禁用」时不得静默改派——回退会
 	// 把任务签到另一 CA（消耗其配额）并持久化改写 cert_jobs.ca_provider_id，
@@ -1578,7 +1641,7 @@ func loadCAProvider(id int) (models.CAProvider, error) {
 	if err != nil {
 		return p, fmt.Errorf("load CA provider %d: %w", id, err)
 	}
-	return p, nil
+	return normalizeCAProviderSnapshot(p), nil
 }
 
 // ResolveCAProviderID resolves provider zero using the same default selection as queue admission.

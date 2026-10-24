@@ -6,8 +6,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { isAutobanIneffective } from '../src/utils/autobanStatus.ts'
-import { source } from './_helpers.ts'
+import { isAutobanIneffective, suggestionBand } from '../src/utils/autobanStatus.ts'
+import { code, section } from './_helpers.ts'
 
 test('启用且 ban_effective === false 时展示黄条', () => {
   assert.equal(isAutobanIneffective({ enabled: true, ban_effective: false }), true)
@@ -22,6 +22,33 @@ test('list_referenced 形态不再驱动黄条（判据只看 ban_effective）',
   assert.equal(isAutobanIneffective(referencedButNotEffective), true)
 })
 
+// 建议行色深与进度条配色的同一判据：≥4× 阈值 high、≥2× mid、其余 low。
+test('建议档位边界：4×/2× 为闭区间，阈值缺省按 1', () => {
+  assert.equal(suggestionBand(1, 1), 'low', '不足 2× 为低档')
+  assert.equal(suggestionBand(2, 1), 'mid', '恰好 2× 属中档')
+  assert.equal(suggestionBand(4, 1), 'high', '4 次即高亮（>= 而非 >）')
+  assert.equal(suggestionBand(8, 2), 'high')
+  assert.equal(suggestionBand(3, 2), 'low')
+  assert.equal(suggestionBand(4, 2), 'mid')
+  assert.equal(suggestionBand(7, 2), 'mid')
+  assert.equal(suggestionBand(8, 2), 'high', '恰好 4× 阈值属高档')
+  // 阈值 0 按 1 兜底（后端可能下发 0 表示未配置）
+  assert.equal(suggestionBand(4, 0), 'high')
+  assert.equal(suggestionBand(1, 0), 'low')
+  // 负数只有 `threshold || 1` 的口径：0/NaN 才落缺省，负数按字面量比较（恒高档）。
+  // 后端校验阈值 ≥1，负数只可能来自带外数据——此处把现状钉住而非当 bug 修。
+  assert.equal(suggestionBand(1, -1), 'high')
+})
+
+// 消费侧接线：档位单源被两个呈现点共同消费（色深 / 进度条），不得各自判阈值。
+test('事件页两处建议样式都从档位单源派生', () => {
+  const page = code('src/views/security/SecurityEvents.vue')
+  const style = section(page, 'const suggestionCountStyle', 'const suggestionProgressColor')
+  assert.match(style, /suggestionBand\(/, '命中次数色深必须来自档位单源')
+  const progress = section(page, 'const suggestionProgressColor', '\n')
+  assert.match(progress, /suggestionBand\(/, '进度条配色必须来自同一档位单源')
+})
+
 test('未启用时不提示（黄条仅针对已启用但未生效）', () => {
   assert.equal(isAutobanIneffective({ enabled: false, ban_effective: false }), false)
   assert.equal(isAutobanIneffective({ enabled: false, ban_effective: true }), false)
@@ -33,7 +60,7 @@ test('fail-closed 默认：成功响应前 ban_effective 缺省不弹黄条', ()
 
 // 消费侧接线：纯函数用例拦不住「黄条绑定被删」——告警静默消失，用户以为封禁在生效。
 test('事件页黄条由该判据派生（绑定与计算属性都在）', () => {
-  const page = source('src/views/security/SecurityEvents.vue')
+  const page = code('src/views/security/SecurityEvents.vue')
   assert.match(
     page,
     /const autobanIneffective = computed\(\(\) => isAutobanIneffective\(autobanStatus\.value\)\)/,

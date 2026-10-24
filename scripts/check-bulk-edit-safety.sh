@@ -3,9 +3,10 @@
 #
 # 两道检查：
 #   A. 脚本静态面：scripts/ 下同时具备「遍历源码」与「写盘替换」的脚本必须支持
-#      只读模式（--dry-run / DRY_RUN），否则拒绝。写盘特征覆盖非紧邻 -i 的
-#      常见形态（sed -E -i / sed -e … -i / perl -pi -e / python -c）——只认
-#      「sed -i 紧邻」等于对最常见的批量改写作业形态失效。
+#      只读模式（--dry-run / DRY_RUN），否则拒绝。枚举面=已跟踪+未跟踪脚本
+#      （作业序是「写脚本→跑门禁→提交」，只扫已跟踪会在关键窗口假绿）。
+#      写盘特征覆盖非紧邻 -i 的常见形态（sed -E -i / sed -e … -i / perl -pi -e /
+#      python -c）——只认「sed -i 紧邻」等于对最常见的批量改写作业形态失效。
 #   B. 变更形态面：对当前变更集（staged 与 worktree 各查一段，两者皆空时查
 #      HEAD^..HEAD）统计空括号
 #      `()` / `（）` 的删除量；一次删除 ≥100 且新增不足其 1/5，判为「批量删括号」
@@ -43,7 +44,11 @@ scan_scripts() {
       echo "ERROR: 批量改写脚本缺少 --dry-run 只读模式：$f" >&2
       bad=1
     fi
-  done < <(git ls-files 'scripts/*.sh' 'scripts/*.py' | grep -v 'check-bulk-edit-safety.sh' | grep -v '^scripts/tests/' || true)
+  # 枚举面必须含未跟踪脚本：事故作业序是「写批量脚本 → 跑门禁 → 提交」，
+  # 只扫已跟踪文件使通道 A 在最需要它的时间窗（脚本刚写好、尚未 git add）
+  # 完全失效——同仓 test-all.sh（bash -n）与 check-no-audit-artifacts.sh
+  # （未跟踪文件入面）都取「受控 + 未跟踪」并集，三处口径必须一致。
+  done < <(git ls-files --cached --others --exclude-standard 'scripts/*.sh' 'scripts/*.py' | grep -v 'check-bulk-edit-safety.sh' | grep -v '^scripts/tests/' || true)
   return "$bad"
 }
 

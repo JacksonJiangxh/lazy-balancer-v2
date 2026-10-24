@@ -33,7 +33,11 @@ func (h *Handlers) GetRulesCertInfo(c *gin.Context) {
 		return
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "Invalid request: " + err.Error()})
+		// gin 校验器文本含 Go 结构体名/字段名（CertInfoBatchRequest.CaddyIDs）
+		// 与英文 tag：本端点在只读白名单（任何只读凭据可触发），响应固定中文
+		// 文案，细节只进运行日志。
+		services.Logf("warn", "GetRulesCertInfo: 请求体校验失败: %v", err)
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求参数无效"})
 		return
 	}
 

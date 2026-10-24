@@ -93,20 +93,27 @@ func TestOIDCSettingsTest_usesNormalizedIssuerCacheKey(t *testing.T) {
 
 // Entra 补 /v2.0 特例的命中面：浏览器地址栏/IdP 门户复制来的 issuer 常带
 // :443，且主权云主机与全球主机并列——按主机名（去端口）判定，否则 v1 端点
-// 无发现文档 → 恒登录失败且被归一为「服务不可达」。
+// 无发现文档 → 恒登录失败且被归一为「服务不可达」。主机形态同时归一到小写 +
+// 去协议默认端口：go-oidc 要求与发现文档 issuer 逐字节相等，IdP 宣告值恒为
+// 小写无默认端口，只查表不归一会出现「保存能过、登录恒 mismatch」。
 func TestNormalizeOIDCIssuer_matchesHostByHostname(t *testing.T) {
 	cases := []struct {
 		raw  string
 		want string
 	}{
 		{"https://login.microsoftonline.com/tenant", "https://login.microsoftonline.com/tenant/v2.0"},
-		{"https://login.microsoftonline.com:443/tenant", "https://login.microsoftonline.com:443/tenant/v2.0"},
-		{"https://Login.MicrosoftOnline.US/tenant/", "https://Login.MicrosoftOnline.US/tenant/v2.0"},
+		{"https://login.microsoftonline.com:443/tenant", "https://login.microsoftonline.com/tenant/v2.0"},
+		{"https://Login.MicrosoftOnline.US/tenant/", "https://login.microsoftonline.us/tenant/v2.0"},
+		{"https://LOGIN.MICROSOFTONLINE.COM:443/tenant/v2.0", "https://login.microsoftonline.com/tenant/v2.0"},
 		{"https://login.partner.microsoftonline.cn/tenant", "https://login.partner.microsoftonline.cn/tenant/v2.0"},
 		{"https://login.chinacloudapi.cn/tenant", "https://login.chinacloudapi.cn/tenant/v2.0"},
 		{"https://login.microsoftonline.com/tenant/v2.0", "https://login.microsoftonline.com/tenant/v2.0"},
-		// 非 Entra 主机逐字保留（只去尾斜杠/空白，不猜路径）。
+		// 非默认端口保留（只有协议默认端口可省略）。
+		{"https://login.microsoftonline.com:8443/tenant", "https://login.microsoftonline.com:8443/tenant/v2.0"},
+		// 非 Entra 主机逐字保留路径（只归一小写/默认端口，不猜路径）。
 		{"https://idp.example.com/tenant/", "https://idp.example.com/tenant"},
+		{"https://IDP.Example.COM:443/tenant/", "https://idp.example.com/tenant"},
+		{"https://idp.example.com:8443/tenant/", "https://idp.example.com:8443/tenant"},
 		{"https://idp.example.com/v2.0", "https://idp.example.com/v2.0"},
 		// 子域名不命中（避免把任意外观相似的域当 Entra）。
 		{"https://evil.login.microsoftonline.com/tenant", "https://evil.login.microsoftonline.com/tenant"},
@@ -117,5 +124,122 @@ func TestNormalizeOIDCIssuer_matchesHostByHostname(t *testing.T) {
 				t.Fatalf("normalizeOIDCIssuer(%q)=%q, want %q", tc.raw, got, tc.want)
 			}
 		})
+	}
+}
+
+// Given 库中 issuer 是未归一形态、users 表有按该原值建键的历史 OIDC 身份行
+// （v2.3.8 之前的旧库/带外改库形态）。
+// When 管理员保存任意 OIDC 设置（issuer 未随载荷，展示名变更）。
+// Then 保存把归一值写回库的同时迁移身份行——该 subject 再次登录命中同一行
+// （角色/禁用状态不被旁路），审计含「服务地址归一」delta。
+func TestOIDCSettingsUpdate_migratesLegacyIdentityRowsOnIssuerNormalization(t *testing.T) {
+	idp := newMockIdP(t)
+	router, _ := setupOIDCTest(t, idp)
+	legacyIssuer := idp.issuer + "/"
+	normalized := strings.TrimSuffix(legacyIssuer, "/")
+	if _, err := db.DB.Exec(`UPDATE global_config SET oidc_config=? WHERE id=1`,
+		`{"enabled":true,"issuer":"`+legacyIssuer+`","client_id":"test-client","client_secret":"s"}`); err != nil {
+		t.Fatalf("raw write oidc config: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT INTO users (username, password_hash, role, is_enabled, auth_provider, oidc_subject, oidc_issuer)
+		VALUES ('legacy-admin', '', 'admin', 0, 'oidc', 'user-sub-1', ?)`, legacyIssuer); err != nil {
+		t.Fatalf("seed legacy identity row: %v", err)
+	}
+
+	putOIDCConfig(t, router, `{"display_name":"新展示名"}`)
+
+	var issuer, role string
+	var enabled int
+	if err := db.DB.QueryRow(`SELECT oidc_issuer, role, COALESCE(is_enabled,1) FROM users WHERE auth_provider='oidc' AND oidc_subject='user-sub-1'`).
+		Scan(&issuer, &role, &enabled); err != nil {
+		t.Fatalf("read identity row: %v", err)
+	}
+	if issuer != normalized {
+		t.Fatalf("oidc_issuer=%q, want 归一值 %q（保存写回库后原值兼容通道失效，必须同批迁移）", issuer, normalized)
+	}
+	if role != "admin" || enabled != 0 {
+		t.Fatalf("迁移后身份行 role=%q enabled=%d, want admin/0（不得新建一行旁路禁用状态）", role, enabled)
+	}
+	var stored string
+	if err := db.DB.QueryRow(`SELECT COALESCE(oidc_config,'') FROM global_config WHERE id=1`).Scan(&stored); err != nil {
+		t.Fatalf("read stored oidc config: %v", err)
+	}
+	if strings.Contains(stored, legacyIssuer) {
+		t.Fatalf("库中仍保存未归一 issuer：%s", stored)
+	}
+
+	// 再登录命中同一行（已禁用 → 拒登，不得新建启用账号）。
+	front := runOIDCLoginFlow(t, router)
+	if strings.Contains(front, "#/oidc/callback?token=") {
+		t.Fatalf("已禁用的历史身份行必须继续生效（命中同一行），got redirect: %s", front)
+	}
+	var rows int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM users WHERE auth_provider='oidc'`).Scan(&rows); err != nil {
+		t.Fatalf("count oidc users: %v", err)
+	}
+	if rows != 1 {
+		t.Fatalf("OIDC 身份行数=%d, want 1（重复开户=封禁/角色旁路）", rows)
+	}
+
+	var detail string
+	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='更新' AND resource='OIDC 配置' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
+		t.Fatalf("read audit detail: %v", err)
+	}
+	if !strings.Contains(detail, "服务地址归一") || !strings.Contains(detail, "迁移历史身份行 1 条") {
+		t.Fatalf("审计未留痕身份键归一：%q", detail)
+	}
+}
+
+// Given 同一 subject 同时存在原值与归一值两行身份（旧版本遗留+重建）。
+// When 管理员保存 OIDC 设置。
+// Then 409 拒绝且不落任何改写（配置与身份行都保持原样）——同一自然人两行
+// 身份（角色/禁用分叉）必须人工合并，系统不得静默二选一。
+func TestOIDCSettingsUpdate_rejectsIdentityIssuerMigrationConflict(t *testing.T) {
+	idp := newMockIdP(t)
+	router, _ := setupOIDCTest(t, idp)
+	legacyIssuer := idp.issuer + "/"
+	normalized := strings.TrimSuffix(legacyIssuer, "/")
+	if _, err := db.DB.Exec(`UPDATE global_config SET oidc_config=? WHERE id=1`,
+		`{"enabled":true,"issuer":"`+legacyIssuer+`","client_id":"test-client","client_secret":"s"}`); err != nil {
+		t.Fatalf("raw write oidc config: %v", err)
+	}
+	for _, row := range []struct {
+		username string
+		role     string
+		enabled  int
+		issuer   string
+	}{
+		{"legacy-admin", "admin", 0, legacyIssuer},
+		{"dup-user", "user", 1, normalized},
+	} {
+		if _, err := db.DB.Exec(`INSERT INTO users (username, password_hash, role, is_enabled, auth_provider, oidc_subject, oidc_issuer)
+			VALUES (?, '', ?, ?, 'oidc', 'user-sub-1', ?)`, row.username, row.role, row.enabled, row.issuer); err != nil {
+			t.Fatalf("seed identity row %s: %v", row.username, err)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/settings/oidc", strings.NewReader(`{"display_name":"新展示名"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d body=%s, want 409（身份键迁移冲突必须 fail-visible）", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "user-sub-1") {
+		t.Fatalf("冲突响应缺少 subject 清单：%s", rec.Body.String())
+	}
+	var rows int
+	if err := db.DB.QueryRow(`SELECT COUNT(*) FROM users WHERE auth_provider='oidc' AND oidc_issuer IN (?, ?)`, legacyIssuer, normalized).Scan(&rows); err != nil {
+		t.Fatalf("count identity rows: %v", err)
+	}
+	if rows != 2 {
+		t.Fatalf("冲突后身份行数=%d, want 2（不得部分改写）", rows)
+	}
+	var stored string
+	if err := db.DB.QueryRow(`SELECT COALESCE(oidc_config,'') FROM global_config WHERE id=1`).Scan(&stored); err != nil {
+		t.Fatalf("read stored oidc config: %v", err)
+	}
+	if !strings.Contains(stored, legacyIssuer) {
+		t.Fatalf("冲突拒绝时不得写回配置（仍应保留原值）：%s", stored)
 	}
 }

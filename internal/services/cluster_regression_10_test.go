@@ -205,12 +205,20 @@ func TestValidateSnapshotACMEState_toleratesUnsetOrDanglingConfigWithWarning(t *
 	missing.Rules = []models.LbRule{{CaddyID: "lb_missing", EnableTLS: true, TLSSource: "acme_dns", ACMEConfigID: 42}}
 
 	// When
+	buf := captureLogf(t)
 	unsetErr := validateSnapshotACMEState(unset)
 	missingErr := validateSnapshotACMEState(missing)
 
 	// Then
 	if unsetErr != nil || missingErr != nil {
 		t.Fatalf("bad-rule snapshots must not be rejected wholesale: unset error=%v missing error=%v", unsetErr, missingErr)
+	}
+	// 用例名承诺 warning：fail-open 的代价是必须留痕，告警被删时本用例必须红。
+	logged := buf.String()
+	for _, want := range []string{"未设置证书配置", "lb_unset", "引用了不存在的证书配置", "lb_missing"} {
+		if !strings.Contains(logged, want) {
+			t.Fatalf("logs=%q, want contain %q（fail-open 必须逐条告警）", logged, want)
+		}
 	}
 }
 
@@ -229,11 +237,19 @@ func TestValidateSnapshotACMEState_toleratesDanglingCAProviderWithWarning(t *tes
 	snapshot.Certs = []models.ClusterCertificate{{RuleID: "lb_dangling_ca", CAProviderID: 98}}
 
 	// When
+	buf := captureLogf(t)
 	err := validateSnapshotACMEState(snapshot)
 
 	// Then
 	if err != nil {
 		t.Fatalf("dangling ca_provider_id must not reject the whole snapshot: %v", err)
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "引用了不存在的 CA 提供商 99") || !strings.Contains(logged, "lb_dangling_ca") {
+		t.Fatalf("logs=%q, want 规则行悬挂 CA 提供商告警", logged)
+	}
+	if !strings.Contains(logged, "引用了不存在的 CA 提供商 98") {
+		t.Fatalf("logs=%q, want 证书行悬挂 CA 提供商告警", logged)
 	}
 }
 
@@ -249,11 +265,19 @@ func TestValidateSnapshotACMEState_toleratesBrokenProviderAndConfigRowsWithWarni
 	}}
 
 	// When
+	buf := captureLogf(t)
 	err := validateSnapshotACMEState(snapshot)
 
 	// Then
 	if err != nil {
 		t.Fatalf("broken provider/config rows must not reject the whole snapshot: %v", err)
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "快照 CA 提供商 7 字段不完整") {
+		t.Fatalf("logs=%q, want provider 行损坏告警", logged)
+	}
+	if !strings.Contains(logged, "快照证书配置 8 字段不完整") {
+		t.Fatalf("logs=%q, want config 行损坏告警", logged)
 	}
 }
 

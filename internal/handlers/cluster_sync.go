@@ -138,7 +138,7 @@ func (h *Handlers) ForgetClusterPins(c *gin.Context) {
 	}
 	{
 		// 门控 ——查询失败按主节点语义拒绝
-		// (与 PullClusterSnapshot 的发现2 口径一致),防瞬时 DB 读错绕过
+		// (与 PullClusterSnapshot 的降级口径一致),防瞬时 DB 读错绕过
 		// 守卫误清从节点钉扎。
 		isMaster, err := h.clusterService.IsMaster(c.Request.Context())
 		if err != nil {

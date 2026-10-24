@@ -313,16 +313,19 @@ func RemoveRuleLogFiles(ruleID string) error {
 }
 
 // timberjackRotationReasons 会写进轮转副本名 reason 段的上游取值（timberjack
-// v1.4.8）：rotate("size")（按 roll_size_mb）与 rotate("time")
-// （RotationInterval/RotateAtMinutes/RotateAt 触发）；openNew("initial") 只新建
-// 文件、不改名，不产生副本。渲染侧当前只发射 roll_size_mb，故 time 家族暂不可
-// 达，但白名单按上游家族完整覆盖——新增 roll_interval/roll_minutes/roll_at
-// 时必须已在此登记，否则副本永久残留而清理报成功。键集↔家族的双向门禁在
-// rulelog_rotation_naming_test.go（TestTimberjackRotationReasonFamily_…）。
-var timberjackRotationReasons = []string{"size", "time"}
+// v1.4.8）：rotate("size")（按 roll_size_mb）、rotate("time")
+// （RotationInterval/RotateAtMinutes/RotateAt 触发）与 openNew("initial")
+// ——后者只在「现存文件存在但不可追加打开」的回退路径上触发（属主/权限不匹配、
+// 只读挂载、被替换为目录等），此时 openNew 会先把现存文件改名为
+// `<stem>-<ts>-initial.log[.gz]` 再新建，故该 reason 确实会落进副本名。
+// 渲染侧当前只发射 roll_size_mb，time/initial 家族正常路径不可达，但白名单按
+// 上游家族完整覆盖——新增轮转触发键时必须在此登记，否则副本永久残留而清理
+// 报成功。键集↔家族的双向门禁在 rulelog_rotation_naming_test.go
+// （TestTimberjackRotationReasonFamily_…）。
+var timberjackRotationReasons = []string{"size", "time", "initial"}
 
 // CaddyLogRotationReasonPattern 导出 timberjack 副本 reason 段的正则 alternation
-// （"size|time"）。删除侧白名单（本文件）与 handlers 的日志统计分类器共用同一
+// （"size|time|initial"）。删除侧白名单（本文件）与 handlers 的日志统计分类器共用同一
 // 上游知识源——两侧各写一份是命名家族漂移的种子（`-size` 与会话碰撞后缀 `_N`
 // 的分歧即由此产生）。
 func CaddyLogRotationReasonPattern() string {

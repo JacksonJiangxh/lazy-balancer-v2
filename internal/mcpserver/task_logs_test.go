@@ -25,7 +25,7 @@ func TestGetSystemTaskLogs_certJobReadsRealLogThroughMCP(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		_ = db.Close()
-		restoreMCPDatabaseHandles(oldDB, oldMetricsDB, oldAuditDB)
+		mcpserver.RestoreDBForTest(oldDB, oldMetricsDB, oldAuditDB)
 	})
 	oldLogDir := taskengine.LogDir()
 	taskengine.SetLogDir(t.TempDir())
@@ -71,7 +71,7 @@ func TestGetSystemTaskLogs_certJobMissingReturnsEmpty(t *testing.T) {
 	}
 	t.Cleanup(func() {
 		_ = db.Close()
-		restoreMCPDatabaseHandles(oldDB, oldMetricsDB, oldAuditDB)
+		mcpserver.RestoreDBForTest(oldDB, oldMetricsDB, oldAuditDB)
 	})
 	gin.SetMode(gin.TestMode)
 	router := gin.New()

@@ -145,9 +145,10 @@ func MaterializeBranding(dataDir, content string) (changed bool, err error) {
 // 恒同步+schema v3 强制,旧语义「开关关闭/旧主节点」消失）:重置为
 // 全空模板收敛默认品牌——不直接删除,loadBrandingConfig 对缺失文件保内存
 // 上一份旧值(2026-09-11 半截写窗口裁定),删除会让从端 /branding 长期陈旧。
-func applySnapshotBranding(dataDir, content string) error {
+// 返回值 changed=本轮是否实际写入文件（内容一致时为 false）。
+func applySnapshotBranding(dataDir, content string) (bool, error) {
 	if dataDir == "" {
-		return nil
+		return false, nil
 	}
 	reset := content == ""
 	changed, err := MaterializeBranding(dataDir, content)
@@ -156,20 +157,20 @@ func applySnapshotBranding(dataDir, content string) error {
 		// 失败审计由调用方（applySnapshotBrandingChecked）经 SyncService 的
 		// 失败节流写入：品牌落盘失败会在 304 补偿重拉/标记重试
 		// 下每轮重达此处，未节流的操作审计会按退避轮次洪泛。
-		return err
+		return false, err
 	}
 	if !changed {
 		// 内容一致（branding_json 未变）：控制面未发生品牌变更，不得写
 		// 「已同步生效/已重置为默认」审计——否则 users/basic_settings 节任意
 		// 变更都会在从端产生误导性品牌审计。
-		return nil
+		return false, nil
 	}
 	if reset {
 		RecordAuditLog("system", "同步", "集群同步", "品牌配置已重置为默认（主节点无品牌文件）", "")
 	} else {
 		RecordAuditLog("system", "同步", "集群同步", "品牌配置已同步生效", "")
 	}
-	return nil
+	return true, nil
 }
 
 // ReconcileBrandingFile 核对本地 branding.json 与 global_config.branding_json

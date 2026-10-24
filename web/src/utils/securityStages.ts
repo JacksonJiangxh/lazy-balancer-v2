@@ -447,6 +447,25 @@ export const trustHitMode = (policyType: string | undefined, trustDetection: boo
   return trustDetection === true ? 'detection' : 'passthrough'
 }
 
+/**
+ * 阶段 1 脚注的「信任命中降级为检测」判定（绑定链口径）。
+ * 命中条件 = 该策略被本规则绑定 ∧ 策略启用 ∧ 信任名单启用且条目非空（否则
+ * 引擎不发射信任规则）∧ trustHitMode 为检测（阶段 0 看 trust_detection；mixed
+ * 存量信任恒 DetectionOnly，见 security.go 的 id:3 并集）。判定必须与阶段 0
+ * 模式行同源，不得退回 policy_type === 'stage0' 等值判断——mixed 策略的信任
+ * 同样降级但不满足该等值。
+ */
+export const hasTrustDetectionBinding = (
+  boundIds: ReadonlySet<number>,
+  policies: readonly Pick<SecurityStagePolicy, 'id' | 'enabled' | 'ip_whitelist_enabled' | 'ip_whitelist' | 'ip_whitelist_refs' | 'policy_type' | 'trust_detection'>[],
+): boolean =>
+  policies.some((p) =>
+    boundIds.has(p.id)
+    && p.enabled
+    && p.ip_whitelist_enabled === true
+    && hasTrustEntries(p)
+    && trustHitMode(p.policy_type, p.trust_detection) === 'detection')
+
 // 阶段 0 · 信任名单行：条目数（空=未配置，任务 G 口径）+ 直通/保留检测模式
 const buildStage0Rows = (policy: SecurityStagePolicy | undefined, ipLists: readonly SecurityStageIPList[]): StageRow[] => {
   const rows: StageRow[] = []
@@ -891,6 +910,17 @@ export const POLICY_TYPE_SHORT_LABELS: Record<SecurityPolicyType, string> = {
   stage2: '阶段 2',
   stage3: '阶段 3',
   mixed: '混合',
+}
+
+// 策略列表默认 tab：按阶段顺序取第一个有条目的类型（阶段 0 → 1 → 2 → 3 → 混合），
+// 全空回落阶段 1（列表初始态）。首屏/保存后/迁移后共用本谓词——硬编码阶段 1 会让
+// 只部署其他类型策略的站点看到空表 +「暂无安全策略」，把「策略存在」误读为「保存失败」。
+export const pickDefaultPolicyTab = (counts: Readonly<Partial<Record<SecurityPolicyType, number>>>): SecurityPolicyType => {
+  const order: readonly SecurityPolicyType[] = ['stage0', 'stage1', 'stage2', 'stage3', 'mixed']
+  for (const type of order) {
+    if ((counts[type] ?? 0) > 0) return type
+  }
+  return 'stage1'
 }
 
 // 推断输入形状（策略类型组件/列表/抽屉共用；SecurityStagePolicy 与策略页 PolicySummary 均结构满足）

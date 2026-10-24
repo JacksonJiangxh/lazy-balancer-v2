@@ -5,6 +5,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"lazy-balancer-v2/internal/db"
 )
 
 // 任务日志统一滚动：所有写入都在追加前按真实文件大小判断。
@@ -24,7 +26,9 @@ func taskLogSizeBytes() int64 {
 	if fn != nil {
 		return fn()
 	}
-	return 10 * 1024 * 1024
+	// 未注入时的回退与治理默认值同源（services 读库侧同样引用
+	// db.DefaultTaskLogSizeMB）：默认值只有一处定义，禁止在本包写第二份字面量。
+	return int64(db.DefaultTaskLogSizeMB) * 1024 * 1024
 }
 
 // 按路径粒度的写入锁：stat→rotate→append 必须整体互斥——两个写入

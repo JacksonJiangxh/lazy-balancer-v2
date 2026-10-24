@@ -925,8 +925,10 @@ func TestValidateConfig_restoreFailurePersistsApplyBanner(t *testing.T) {
 	if err := db.DB.QueryRow(`SELECT COALESCE(caddy_apply_error,'') FROM global_config WHERE id=1`).Scan(&banner); err != nil {
 		t.Fatalf("read banner: %v", err)
 	}
-	if !strings.Contains(banner, "恢复运行配置失败") && !strings.Contains(banner, "配置") {
-		t.Fatalf("横幅未持久化恢复失败事实: %q", banner)
+	// 断言两态标签的具体取值：横幅模板恒含「配置」，用 Contains("配置")
+	// 兜底等于恒真（标签写错也不会红）。
+	if !strings.Contains(banner, "Caddy 配置应用失败") || !strings.Contains(banner, caddyApplyRestoreFailedLabel) {
+		t.Fatalf("横幅未持久化恢复失败事实（want %q）: %q", caddyApplyRestoreFailedLabel, banner)
 	}
 }
 

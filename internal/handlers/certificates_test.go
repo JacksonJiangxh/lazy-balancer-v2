@@ -132,11 +132,13 @@ func TestUpdateCertificateConfig_legacyEmptyCredentialsAllowNonCredentialUpdates
 		}
 	})
 
-	t.Run("malformed stored JSON remains rejected", func(t *testing.T) {
+	t.Run("malformed stored JSON is storage corruption", func(t *testing.T) {
 		h, id := seed(t, "not-json", 1)
 		response := put(h, id, `{"name":"renamed"}`)
-		if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), "Invalid stored DNS credentials") {
-			t.Fatalf("status=%d body=%s, want malformed stored JSON 400", response.Code, response.Body.String())
+		// 库内凭证非 JSON 是存储损坏（带外改库/旧版本遗留），与保存前测试端点
+		// 的 storage_corrupted 同口径 500——不得报 400 让运维反复重填。
+		if response.Code != http.StatusInternalServerError || !strings.Contains(response.Body.String(), "存储的 DNS 凭证已损坏") {
+			t.Fatalf("status=%d body=%s, want storage corruption 500", response.Code, response.Body.String())
 		}
 	})
 }

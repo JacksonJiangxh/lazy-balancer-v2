@@ -14,9 +14,13 @@ export interface IngestionHealth {
   task_running?: boolean
   writer_dropped?: number
   writer_io_errors?: number
+  // 写侧 formatter 契约失败（代码/缺陷方向，与磁盘故障分开披露）。
+  writer_format_errors?: number
   writer_degraded?: boolean
   writer_last_failure_at?: string
   writer_stats_unavailable?: boolean
+  // 写侧单行上限截断掉的规则命中条数：事件在库，命中明细永久缺失。
+  messages_dropped?: number
   // 摄取侧「畸形区跳过」：跳过即该段审计数据对应事件永久丢失，窗口内发生
   // 跳过时后端置 healthy=false（与写侧失败同一位）。
   skipped_bytes?: number
@@ -33,11 +37,13 @@ function humanBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`
 }
 
-/** 丢失量归因分项（写侧丢弃/写盘错误/畸形区跳过各自有则列出）。 */
+/** 丢失量归因分项（写侧丢弃/写盘错误/格式化失败/命中明细截断/畸形区跳过各自有则列出）。 */
 function lostParts(status: IngestionHealth): string[] {
   const parts: string[] = []
   if ((status.writer_dropped ?? 0) > 0) parts.push(`丢弃 ${status.writer_dropped} 条`)
   if ((status.writer_io_errors ?? 0) > 0) parts.push(`写盘错误 ${status.writer_io_errors} 次`)
+  if ((status.writer_format_errors ?? 0) > 0) parts.push(`格式化失败 ${status.writer_format_errors} 次`)
+  if ((status.messages_dropped ?? 0) > 0) parts.push(`命中明细截断 ${status.messages_dropped} 条`)
   if ((status.skipped_regions ?? 0) > 0) parts.push(`跳过畸形区 ${status.skipped_regions} 处（${humanBytes(status.skipped_bytes ?? 0)}）`)
   return parts
 }
@@ -58,7 +64,12 @@ export function ingestionWarningMessage(status?: IngestionHealth | null): string
     return '审计写侧计数不可用（计数侧车连续读取失败）：写侧丢弃/写盘错误计数显示 0 不代表无丢弃；请检查审计日志目录的磁盘空间与写权限。'
   }
   if (status.writer_degraded === true) {
-    return `审计日志写侧失败：累计丢弃 ${status.writer_dropped ?? 0} 条、写盘错误 ${status.writer_io_errors ?? 0} 次，安全事件可能缺失；请检查审计日志目录的磁盘空间与写权限。`
+    const format = status.writer_format_errors ?? 0
+    const formatPart = format > 0 ? `、格式化失败 ${format} 次` : ''
+    const hint = format > 0
+      ? '格式化失败属 formatter 契约/代码缺陷，请同时检查审计格式化实现与镜像版本'
+      : '请检查审计日志目录的磁盘空间与写权限'
+    return `审计日志写侧失败：累计丢弃 ${status.writer_dropped ?? 0} 条、写盘错误 ${status.writer_io_errors ?? 0} 次${formatPart}，安全事件可能缺失；${hint}。`
   }
   if (status.observed === true && status.healthy === false) {
     const failures = status.consecutive_failures ?? 0

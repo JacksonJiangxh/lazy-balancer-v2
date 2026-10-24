@@ -48,14 +48,131 @@ export const code = (relative: string): string => stripComments(source(relative)
 /** 同 code，但读取相对仓库根的路径（跨栈 Go 源码存在性断言用）。 */
 export const repoCode = (relative: string): string => stripComments(repoSource(relative))
 
+/** 注释内出现代码形态仍算「源码里存在」——切片误命中注释会让断言空转。 */
+const REGEX_PRECEDING_KEYWORDS: Record<string, true> = {
+  return: true, typeof: true, case: true, in: true, of: true, new: true,
+  delete: true, void: true, instanceof: true, yield: true, await: true, else: true, do: true,
+}
+
+/**
+ * 注释区间（`//`、`/* *\/`、Vue 模板 `<!-- -->`）。
+ *
+ * 词法判定与 stripComments 同源：跳过字符串与正则字面量，避免把 `'http://…'`
+ * 或 `/\/\//` 里的注释记号当真注释。区间用于「只在代码里找 marker」。
+ */
+const commentSpans = (text: string): Array<readonly [number, number]> => {
+  const spans: Array<readonly [number, number]> = []
+  let prevSignificant = ''
+  let prevWord = ''
+  const regexAllowedAfter = (): boolean => {
+    if (prevSignificant === '') return true
+    if (/[\w]/.test(prevSignificant)) return REGEX_PRECEDING_KEYWORDS[prevWord] === true
+    return !/[)\]]/.test(prevSignificant)
+  }
+  let i = 0
+  while (i < text.length) {
+    const ch = text[i]
+    const next = text[i + 1]
+    if (ch === '/' && next === '/') {
+      const start = i
+      while (i < text.length && text[i] !== '\n') i++
+      spans.push([start, i])
+      continue
+    }
+    if (ch === '/' && next === '*') {
+      const start = i
+      i += 2
+      while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++
+      i = Math.min(text.length, i + 2)
+      spans.push([start, i])
+      continue
+    }
+    if (ch === '<' && text.startsWith('<!--', i)) {
+      const start = i
+      const end = text.indexOf('-->', i + 4)
+      i = end < 0 ? text.length : end + 3
+      spans.push([start, i])
+      continue
+    }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      const quote = ch
+      i++
+      while (i < text.length) {
+        const c = text[i]
+        if (c === '\\' && i + 1 < text.length) {
+          i += 2
+          continue
+        }
+        i++
+        if (c === quote) break
+      }
+      prevSignificant = quote
+      prevWord = ''
+      continue
+    }
+    if (ch === '/' && regexAllowedAfter()) {
+      i++
+      let inClass = false
+      while (i < text.length) {
+        const c = text[i]
+        i++
+        if (c === '\\' && i < text.length) {
+          i++
+          continue
+        }
+        if (c === '[') inClass = true
+        else if (c === ']') inClass = false
+        else if (c === '/' && !inClass) break
+        else if (c === '\n') break
+      }
+      prevSignificant = '/'
+      prevWord = ''
+      continue
+    }
+    if (/\s/.test(ch)) {
+      // 空白不改词/字符状态
+    } else if (/[\w]/.test(ch)) {
+      prevWord = /[\w]/.test(prevSignificant) ? prevWord + ch : ch
+      prevSignificant = ch
+    } else {
+      prevSignificant = ch
+      prevWord = ''
+    }
+    i++
+  }
+  return spans
+}
+
+/**
+ * marker 首个**不在注释内**的命中位置（-1 = 代码里没有）。
+ *
+ * 以注释文字为断言对象的「文档钉」标记本身是注释（`//`/`/*`/`<!--`）——此时按
+ * 字面命中处理，否则文档钉永远找不到起点。
+ */
+const indexOfOutsideComments = (text: string, marker: string, from = 0): number => {
+  if (/^\s*(?:\/\/|\/\*|<!--)/.test(marker)) return text.indexOf(marker, from)
+  const spans = commentSpans(text)
+  let at = from
+  for (;;) {
+    const hit = text.indexOf(marker, at)
+    if (hit < 0) return -1
+    const span = spans.find(([start, end]) => hit >= start && hit < end)
+    if (!span) return hit
+    at = span[1]
+  }
+}
+
 /**
  * 从 startMarker 切到其后的 endMarker（endMarker 必须在 startMarker 之后）。
  * 缺任一 marker 或顺序倒置 → 抛错（而非返回空/倒置切片）；这是「限段钉」的统一边界。
+ *
+ * 两端都只在注释外匹配：注释里复述的代码形态（本仓注释密度高）会让切片落进
+ * 注释中段——`match` 被注释满足（假绿）、`doesNotMatch` 恒真。
  */
 export const section = (text: string, startMarker: string, endMarker: string): string => {
-  const start = text.indexOf(startMarker)
+  const start = indexOfOutsideComments(text, startMarker)
   if (start < 0) throw new Error(`missing start marker: ${startMarker}`)
-  const end = text.indexOf(endMarker, start + startMarker.length)
+  const end = indexOfOutsideComments(text, endMarker, start + startMarker.length)
   if (end <= start) throw new Error(`missing end marker: ${endMarker} after ${startMarker}`)
   return text.slice(start, end)
 }
@@ -71,108 +188,89 @@ export const section = (text: string, startMarker: string, endMarker: string): s
  * 正则态内遇未转义 `/` 或换行退出（字符类 `[...]` 内的 `/` 不退出）。
  */
 export const stripComments = (text: string): string => {
+  const spans = commentSpans(text)
+  if (spans.length === 0) return text
   let out = ''
-  let i = 0
-  // 前一输出字符（跳过空白）+ 当前累积的标识符词——正则/除法歧义判定用：
-  // `/` 前是标识符/数字/`)`/`]` 通常按除法，但标识符为关键字
-  //（return/typeof/case 等不能作操作数）时仍按正则。
-  let prevSignificant = ''
-  let prevWord = ''
-  const REGEX_PRECEDING_KEYWORDS: Record<string, true> = {
-    return: true, typeof: true, case: true, in: true, of: true, new: true,
-    delete: true, void: true, instanceof: true, yield: true, await: true, else: true, do: true,
+  let at = 0
+  for (const [start, end] of spans) {
+    out += text.slice(at, start)
+    at = end
   }
-  const regexAllowedAfter = (): boolean => {
-    if (prevSignificant === '') return true
-    if (/[\w]/.test(prevSignificant)) return REGEX_PRECEDING_KEYWORDS[prevWord] === true
-    return !/[)\]]/.test(prevSignificant)
-  }
+  return out + text.slice(at)
+}
+
+/** 续行运算符：命中则说明上一行的 `)`/`}` 只是表达式内部收尾，声明还没结束。 */
+const CONTINUATION_CHAR = /^[.?,:=&|{[(+)+\-*/]$/
+
+/**
+ * 声明头在行尾之后是否仍延续：`computed<…>(() =>\n  …\n    .filter(…)\n
+ *    .map((p) => {` 这类链式表达式，行尾 `)` 只是内层调用收尾。
+ *
+ * 判据 = 下一个**代码**字符（跳过空白与注释）是续行运算符。注释里的续行不算
+ * ——`const h = () => ({ a: 1 })\n// 说明\nconst k = …` 仍须硬失败，否则切片
+ * 会顺延到下一个成员（doesNotMatch 恒真空转）。
+ */
+const nextCodeChar = (text: string, from: number): string => {
+  const spans = commentSpans(text)
+  let i = from
   while (i < text.length) {
-    const ch = text[i]
-    const next = text[i + 1]
-    if (ch === '/' && next === '/') {
-      while (i < text.length && text[i] !== '\n') i++
-      continue
-    }
-    if (ch === '/' && next === '*') {
-      i += 2
-      while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++
-      i += 2
-      continue
-    }
-    if (ch === '<' && text.startsWith('<!--', i)) {
-      const end = text.indexOf('-->', i + 4)
-      i = end < 0 ? text.length : end + 3
-      continue
-    }
-    if (ch === '"' || ch === "'" || ch === '`') {
-      const quote = ch
-      out += ch
-      i++
-      while (i < text.length) {
-        const c = text[i]
-        out += c
-        if (c === '\\' && i + 1 < text.length) {
-          out += text[i + 1]
-          i += 2
-          continue
-        }
-        i++
-        if (c === quote) break
-      }
-      prevSignificant = quote
-      prevWord = ''
-      continue
-    }
-    if (ch === '/' && regexAllowedAfter()) {
-      // 正则字面量：原样保留到未转义的结束 `/`（字符类内的 / 不算结束）
-      out += ch
-      i++
-      let inClass = false
-      while (i < text.length) {
-        const c = text[i]
-        out += c
-        i++
-        if (c === '\\' && i < text.length) {
-          out += text[i]
-          i++
-          continue
-        }
-        if (c === '[') inClass = true
-        else if (c === ']') inClass = false
-        else if (c === '/' && !inClass) break
-        else if (c === '\n') break
-      }
-      prevSignificant = '/'
-      prevWord = ''
-      continue
-    }
-    out += ch
-    if (/\s/.test(ch)) {
-      // 空白不改词/字符状态
-    } else if (/[\w]/.test(ch)) {
-      prevWord = /[\w]/.test(prevSignificant) ? prevWord + ch : ch
-      prevSignificant = ch
-    } else {
-      prevSignificant = ch
-      prevWord = ''
-    }
-    i++
+    if (/\s/.test(text[i])) { i++; continue }
+    const span = spans.find(([start, end]) => i >= start && i < end)
+    if (span) { i = span[1]; continue }
+    return text[i]
   }
-  return out
+  return ''
 }
 
 /**
- * 成员体起点：marker 之后首个 `{` + 换行。
+ * 候选块是类型注解而非函数体：
+ *   - 收尾后声明头仍通向 `=>` 或函数体 `{`（多行返回类型）；
+ *   - 候选 `{` 前的最后一个代码字符是 `:`（`opts: {\n … }` 参数/属性类型）。
+ *
+ * 后者比「候选落在括号组内」精确：箭头回调体本身也在 `computed(… )`/`watch(… )`
+ * 的括号里（链式 `.map((p) => {`），按 paren>0 判定会把真实函数体全部误杀。
+ */
+const isTypeAnnotationBlock = (text: string, open: number, close: number): boolean => {
+  if (close >= 0 && headerContinuesAfterBlock(text, close)) return true
+  let i = open - 1
+  while (i >= 0 && /\s/.test(text[i])) i--
+  return i >= 0 && text[i] === ':'
+}
+
+/**
+ * 候选块收尾后声明头是否仍未结束：多行返回类型（`): {\n … } => {` /
+ * `): {\n … } {`）——是则该块是类型注解，不是函数体。
+ *
+ * 只认「收尾后经 `)`/`:`/`|`/`&`/空白可达 `=>` 或 `{`」：对象字面量成员的尾部
+ * `,`（合法的下一属性分隔）不在此列，避免把真函数体误判成类型块。
+ */
+const headerContinuesAfterBlock = (text: string, close: number): boolean => {
+  let i = close + 1
+  while (i < text.length) {
+    const ch = text[i]
+    if (/\s/.test(ch)) { i++; continue }
+    if (ch === ')' || ch === ':' || ch === '|' || ch === '&') { i++; continue }
+    if (ch === '=' && text[i + 1] === '>') return true
+    return ch === '{'
+  }
+  return false
+}
+
+/**
+ * 扫过 start→open 的声明头，返回**候选 `{` 处的括号深度**；声明在候选之前已
+ * 结束则硬失败。
  *
  * 单表达式成员（`const h = () => ({ a: 1 })`）没有块体，`{\n` 会顺延到**下一个
  * 成员**的块体，切片因此越界（match 可被邻接代码满足=假绿，doesNotMatch 假红）。
  * 声明在候选 `{` 之前已结束——顶层 `;`，或行尾（顶层）`)`/`}`——一律硬失败：
  * 说明该 marker 指向的不是块体成员，唯一正确的修法是换一个可切片的成员。
  */
-const memberBlockOpen = (text: string, start: number, marker: string): number => {
-  const open = text.indexOf('{\n', start)
-  if (open < 0) throw new Error(`member has no body: ${marker}`)
+const scanDeclarationHeader = (
+  text: string,
+  start: number,
+  open: number,
+  marker: string,
+): { paren: number; bracket: number } => {
   type Mode = 'code' | 'line' | 'block' | 'single' | 'double' | 'template'
   let mode: Mode = 'code'
   let paren = 0
@@ -180,6 +278,7 @@ const memberBlockOpen = (text: string, start: number, marker: string): number =>
   // 声明头里的顶层 `{...}` 只可能是类型/对象字面量（真正的函数体从 `{\n` 起算，
   // 不在扫描范围内）——其内的 `;`（返回类型对象的属性分隔）不构成声明结束。
   let typeBraces = 0
+  let closedTypeBrace = false
   let lastSignificant = ''
   for (let i = start; i < open; i++) {
     const ch = text[i]
@@ -218,14 +317,29 @@ const memberBlockOpen = (text: string, start: number, marker: string): number =>
       continue
     }
     if (ch === '}') {
-      if (paren <= 0 && bracket <= 0 && typeBraces > 0) typeBraces--
+      if (paren <= 0 && bracket <= 0 && typeBraces > 0) {
+        typeBraces--
+        // 刚收尾一个类型块：紧随其后的行尾可能是「返回类型块 + 下一行函数体」
+        // 形态（`}\n{`），不构成「声明已结束」。
+        closedTypeBrace = typeBraces === 0
+      }
       lastSignificant = ch
       continue
     }
     if (ch === '\n') {
+      if (closedTypeBrace) {
+        closedTypeBrace = false
+        lastSignificant = '\n'
+        continue
+      }
       // 顶层行尾落在 `)`/`}` = 声明已结束（单表达式箭头体 / 对象字面量成员）；
-      // 缩进内的续行（参数表/类型注解）不在此列。
-      if (paren <= 0 && bracket <= 0 && typeBraces === 0 && (lastSignificant === ')' || lastSignificant === '}')) {
+      // 缩进内的续行（参数表/类型注解/链式调用）不在此列——下一代码字符是
+      // 续行运算符时只是内层表达式收尾。
+      if (
+        paren <= 0 && bracket <= 0 && typeBraces === 0
+        && (lastSignificant === ')' || lastSignificant === '}')
+        && !CONTINUATION_CHAR.test(nextCodeChar(text, i + 1))
+      ) {
         throw new Error(`member has no block body: ${marker}`)
       }
       continue
@@ -235,26 +349,35 @@ const memberBlockOpen = (text: string, start: number, marker: string): number =>
     }
     if (!/\s/.test(ch)) lastSignificant = ch
   }
-  return open
+  return { paren, bracket }
 }
 
 /**
- * 截取成员体：从 marker 处的函数/方法声明花括号配对到收尾。
+ * 成员体起点：marker 之后首个 `{` + 换行的候选块，跳过类型注解候选。
  *
- * 必须按花括号配对——固定缩进启发式（找第一个 `\n    }`）会在函数内第一个内层
- * 块收尾处截断，块内文本的 doesNotMatch 断言因此空转（假绿）。
+ * 多行返回类型（`): {\n … } => {`）与参数对象类型（`opts: {\n … }`）都是「类型
+ * 注解」，判据见 isTypeAnnotationBlock。排除后从该块收尾继续找下一个候选。
+ */
+const memberBlockOpen = (text: string, start: number, marker: string): number => {
+  let searchFrom = start
+  for (;;) {
+    const open = indexOfOutsideComments(text, '{\n', searchFrom)
+    if (open < 0) throw new Error(`member has no body: ${marker}`)
+    scanDeclarationHeader(text, start, open, marker)
+    const close = matchBrace(text, open)
+    if (close < 0 || !isTypeAnnotationBlock(text, open, close)) return open
+    searchFrom = close + 1
+  }
+}
+
+/**
+ * 花括号配对（open 指向 `{`）：返回匹配的 `}` 下标，未闭合返回 -1。
  *
- * 配对必须跳过字符串/模板量/注释里的括号：`const s = '}'` 或注释里的孤立 `}`
+ * 必须跳过字符串/模板量/注释里的括号：`const s = '}'` 或注释里的孤立 `}`
  * 会让切片提前收尾（后续 doesNotMatch 假绿）；孤立 `{` 则越界吞下相邻函数
  * （match 假绿）。模板量里的 `${...}` 是表达式，其内部括号按代码计。
- *
- * 函数体起点取 marker 之后首个 `{\n`：参数表里的对象类型字面量
- * （`opts?: { a: 1 }`）后面不跟换行，不会被误认。
  */
-export const member = (text: string, marker: string): string => {
-  const start = text.indexOf(marker)
-  if (start < 0) throw new Error(`missing member: ${marker}`)
-  const open = memberBlockOpen(text, start, marker)
+const matchBrace = (text: string, open: number): number => {
   type Mode = 'code' | 'line' | 'block' | 'single' | 'double' | 'template'
   let mode: Mode = 'code'
   let depth = 0
@@ -296,10 +419,25 @@ export const member = (text: string, marker: string): string => {
         continue
       }
       depth--
-      if (depth === 0) return text.slice(start, i + 1)
+      if (depth === 0) return i
     }
   }
-  throw new Error(`unbalanced braces in member: ${marker}`)
+  return -1
+}
+
+/**
+ * 截取成员体：从 marker 处的函数/方法声明花括号配对到收尾。
+ *
+ * 起点只在注释外命中：注释里复述的成员形态（本仓注释密度高）会切到错误位置，
+ * 后续 `doesNotMatch` 恒真。收尾按花括号配对（见 matchBrace）。
+ */
+export const member = (text: string, marker: string): string => {
+  const start = indexOfOutsideComments(text, marker)
+  if (start < 0) throw new Error(`missing member: ${marker}`)
+  const open = memberBlockOpen(text, start, marker)
+  const close = matchBrace(text, open)
+  if (close < 0) throw new Error(`unbalanced braces in member: ${marker}`)
+  return text.slice(start, close + 1)
 }
 
 /** 最小 document 宿主：只提供 hidden + visibilitychange 监听（composable 消费面）。 */

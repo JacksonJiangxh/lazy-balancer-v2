@@ -232,3 +232,48 @@ func TestImportConfigBackup_normalizes_new_notnull_column_nulls(t *testing.T) {
 			healthCheckHost, originDomain, responseMode, responseStatus, responseBody, responseContentType, redirectTo, loginFailedAttempts, authProvider)
 	}
 }
+
+// TCP 上游的 origin_domain 是死值（保存族自该字段引入起即拒绝、TCP 渲染零
+// 消费）：带外残留一旦进库，实例自己导出的备份会在导入校验阶段被
+// 「回源域名仅 HTTP 规则支持」整包 400——备份自毒。导入面必须按与启动迁移/
+// 快照导出同一口径归一（而非拒收），HTTP 规则的上游回源域名原样保留。
+func TestImportConfigBackup_normalizesTCPUpstreamOriginDomain(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	backup := completeBackupJSON(t, map[string][]map[string]any{
+		"lb_rules": {
+			{"caddy_id": "lb_org_tcp", "name": "org-tcp", "protocol": "tcp", "listen_port": 19443, "enabled": 1},
+			{"caddy_id": "lb_org_http", "name": "org-http", "protocol": "http", "domain": "org.example.test",
+				"listen_port": 18080, "enabled": 1},
+		},
+		"upstreams": {
+			{"rule_id": "lb_org_tcp", "host": "127.0.0.1", "port": 9001, "weight": 1, "enabled": 1,
+				"protocol": "tcp", "origin_domain": "stale.example.test"},
+			{"rule_id": "lb_org_http", "host": "127.0.0.1", "port": 9002, "weight": 1, "enabled": 1,
+				"protocol": "http", "origin_domain": "origin.example.test"},
+		},
+	})
+	router := gin.New()
+	router.POST("/config/import", h.ImportConfigBackup)
+	request := httptest.NewRequest(http.MethodPost, "/config/import", strings.NewReader(backup))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("import status=%d body=%s, want 200（TCP 上游回源域名残留应被归一而非整包拒收）", response.Code, response.Body.String())
+	}
+	var tcpOrigin, httpOrigin string
+	if err := db.DB.QueryRow(`SELECT COALESCE(origin_domain,'') FROM upstreams WHERE rule_id='lb_org_tcp'`).Scan(&tcpOrigin); err != nil {
+		t.Fatalf("read tcp upstream: %v", err)
+	}
+	if err := db.DB.QueryRow(`SELECT COALESCE(origin_domain,'') FROM upstreams WHERE rule_id='lb_org_http'`).Scan(&httpOrigin); err != nil {
+		t.Fatalf("read http upstream: %v", err)
+	}
+	if tcpOrigin != "" {
+		t.Fatalf("TCP 上游 origin_domain=%q, want cleared（与启动迁移/快照导出口径一致）", tcpOrigin)
+	}
+	if httpOrigin != "origin.example.test" {
+		t.Fatalf("HTTP 上游 origin_domain=%q, want preserved", httpOrigin)
+	}
+}

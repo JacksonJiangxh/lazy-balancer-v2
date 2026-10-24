@@ -43,7 +43,12 @@ test('「重新加载」串接名单重取：loadPolicies 在策略就位后 awa
 
 test('失败态有横幅与重试入口，处置动作在失败态禁用', () => {
   assert.match(page, /<div v-if="listsError" class="info-note-bar">/)
-  assert.match(page, /@click="retryLists">重新加载<\/el-button>/)
+  // 属性与文案分开断言：内联排版/换行变化不构成契约变化
+  assert.match(page, /@click="retryLists"/)
+  assert.ok(
+    (page.match(/重新加载/g) ?? []).length > 0,
+    '失败横幅必须提供「重新加载」入口',
+  )
   assert.match(page, /const retryLists = \(\): void => \{ void loadPolicies\(\) \}/)
   assert.match(page, /:disabled="act\.disabled"/, '动作按钮绑定禁用态')
   assert.match(page, /return listsError\.value \? acts\.map\(\(act\) => \(\{ \.\.\.act, disabled: true \}\)\) : acts/,

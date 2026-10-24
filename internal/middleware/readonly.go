@@ -83,15 +83,23 @@ func isReadOnlyGuardWhitelisted(path string) bool {
 // isSelfServicePath 是主节点上非管理员用户可自助维护资源的路径
 // isSelfServiceUserWrite 报告当前写请求是否为「用户管理页本人行」操作：
 // PUT /api/v1/users/<自己的 id> 或 POST /api/v1/users/<自己的 id>/reset-password。
+// 方法必须显式限定——不能只依赖「当前没有 POST/DELETE /api/v1/users/<id> 路由」
+// 这条隐式前提（新增自助/管理路由时会把别的语义误判成自助写）。
 // 只接受数字 id，不接受 :id 模板——工具可见性枚举（按路由模板）不会因此把
 // update_user 暴露给非管理员。
 func isSelfServiceUserWrite(c *gin.Context) bool {
 	path := strings.TrimPrefix(c.Request.URL.Path, "/api/v1/users/")
+	if path == c.Request.URL.Path {
+		// 前缀不匹配（TrimPrefix 原样返回）：不是用户资源路径。
+		return false
+	}
 	if i := strings.IndexByte(path, '/'); i >= 0 {
-		if path[i:] != "/reset-password" {
+		if path[i:] != "/reset-password" || c.Request.Method != http.MethodPost {
 			return false
 		}
 		path = path[:i]
+	} else if c.Request.Method != http.MethodPut {
+		return false
 	}
 	target, err := strconv.Atoi(path)
 	if err != nil || target <= 0 {

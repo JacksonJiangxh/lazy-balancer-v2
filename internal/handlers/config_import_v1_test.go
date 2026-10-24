@@ -227,6 +227,8 @@ func TestImportV1Config_cleansDisappearedRuleMetricsAndLogs(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/config/import/v1", strings.NewReader(backup))
 	request.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(response, request)
+	// 提交后产物清理已异步执行（响应不等清理）：等它结束再断言产物与调用集。
+	waitImportCleanup()
 
 	// Then only the disappeared rule's artifacts are removed.
 	if response.Code != http.StatusOK {
@@ -611,9 +613,9 @@ func stringMustMarshal(t *testing.T, value string) string {
 	return string(data)
 }
 
-// ──：预览 has_waf_files 必须纳入威胁库名单条目
-// ——RDB 文件化后存在「仅威胁 .iplist、无 CRS/xdb」的合法 lbbak，此前预览提示
-// 「不含规则库文件」而实际会落盘名单文件（文案与真实能力不符）。 ──
+// 预览 has_waf_files 必须纳入威胁库名单条目——RDB 文件化后存在「仅威胁
+// .iplist、无 CRS/xdb」的合法 lbbak，此前预览提示「不含规则库文件」而实际会
+// 落盘名单文件（文案与真实能力不符）。
 
 func a3CanonicalThreatURL(t *testing.T, source string) string {
 	t.Helper()

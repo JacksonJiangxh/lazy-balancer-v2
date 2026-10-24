@@ -393,7 +393,10 @@ func TestClusterSnapshot_securityAuxTablesRoundTrip(t *testing.T) {
 	}
 }
 
-func TestApplySnapshot_emptySecurityPayloadDeletesRows(t *testing.T) {
+// 口径：只经 replaceSnapshotTx（不含角色复核/Caddy 重载/提交后副作用）。
+// 这是「显式空载荷清空全部安全表」的唯一归属用例（六表联合清点）——单表的
+// 重复清点已并入此处，新增表只需在本矩阵加一项。
+func TestReplaceSnapshotTx_emptySecurityPayloadDeletesRows(t *testing.T) {
 	// Given
 	_, database := newClusterTestService(t)
 	if _, err := database.Exec(`INSERT INTO security_policies (id,name,mode) VALUES (5,'doomed','blocking');

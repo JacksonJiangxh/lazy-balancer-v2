@@ -205,13 +205,16 @@ func TestMFAStepUpGuard_roleReadsInjectedHandle(t *testing.T) {
 		t.Fatalf("enable mfa write guard: %v", err)
 	}
 
-	// 独立从节点库：守卫只从中读 global_config.is_master。
+	// 独立从节点库：守卫的三处读取（开关/用户 MFA 状态/节点角色）全走它。
 	slaveDB, err := sql.Open("sqlite", t.TempDir()+"/injected-slave.db")
 	if err != nil {
 		t.Fatalf("open injected db: %v", err)
 	}
 	t.Cleanup(func() { _ = slaveDB.Close() })
-	if _, err := slaveDB.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, is_master INTEGER); INSERT INTO global_config (id,is_master) VALUES (1,0)`); err != nil {
+	if _, err := slaveDB.Exec(`CREATE TABLE global_config (id INTEGER PRIMARY KEY, is_master INTEGER, mfa_write_guard INTEGER);
+		INSERT INTO global_config (id,is_master,mfa_write_guard) VALUES (1,0,1);
+		CREATE TABLE users (id INTEGER PRIMARY KEY, mfa_enabled INTEGER);
+		INSERT INTO users (id,mfa_enabled) VALUES (91,1)`); err != nil {
 		t.Fatalf("seed injected slave db: %v", err)
 	}
 
@@ -235,5 +238,76 @@ func TestMFAStepUpGuard_roleReadsInjectedHandle(t *testing.T) {
 	}
 	if !strings.Contains(response.Body.String(), "从节点只读") {
 		t.Fatalf("body=%s, want 含「从节点只读」", response.Body.String())
+	}
+}
+
+// 守卫链上的 MFA 读取（全局开关 + 用户启用态）必须与角色读取共用装配期注入
+// 的句柄：任一读取回落到进程库，嵌入/测试形态下就会拼出「按 A 库判从节点
+// 403、按 B 库判已启用 428」这类自相矛盾判定，且测试绿掩盖生产形状分叉。
+func TestMFAStepUpGuard_stateReadsInjectedHandle(t *testing.T) {
+	oldDB, oldMetricsDB, oldAuditDB := db.DB, db.MetricsDB, db.AuditDB
+	if err := db.Initialize(t.TempDir()); err != nil {
+		t.Fatalf("initialize database: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+		restoreTestDBHandles(oldDB, oldMetricsDB, oldAuditDB)
+	})
+	// 进程库：守卫开启 + 用户 92 已启用 MFA——任何回落到 db.DB 的读取都会 428。
+	if _, err := db.DB.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled,mfa_enabled) VALUES (92,'injected-state','x','admin',1,1)`); err != nil {
+		t.Fatalf("seed mfa user: %v", err)
+	}
+	if _, err := db.DB.Exec(`UPDATE global_config SET mfa_write_guard=1 WHERE id=1`); err != nil {
+		t.Fatalf("enable mfa write guard: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		seed string
+	}{
+		{
+			name: "写守卫开关按注入句柄关闭",
+			seed: `CREATE TABLE global_config (id INTEGER PRIMARY KEY, is_master INTEGER, mfa_write_guard INTEGER);
+				INSERT INTO global_config (id,is_master,mfa_write_guard) VALUES (1,1,0)`,
+		},
+		{
+			name: "MFA 启用态按注入句柄为未启用",
+			seed: `CREATE TABLE global_config (id INTEGER PRIMARY KEY, is_master INTEGER, mfa_write_guard INTEGER);
+				INSERT INTO global_config (id,is_master,mfa_write_guard) VALUES (1,1,1);
+				CREATE TABLE users (id INTEGER PRIMARY KEY, mfa_enabled INTEGER);
+				INSERT INTO users (id,mfa_enabled) VALUES (92,0)`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			injected, err := sql.Open("sqlite", t.TempDir()+"/injected-mfa-state.db")
+			if err != nil {
+				t.Fatalf("open injected db: %v", err)
+			}
+			t.Cleanup(func() { _ = injected.Close() })
+			if _, err := injected.Exec(tc.seed); err != nil {
+				t.Fatalf("seed injected db: %v", err)
+			}
+
+			gin.SetMode(gin.TestMode)
+			router := gin.New()
+			router.Use(func(c *gin.Context) {
+				c.Set("auth_type", "jwt")
+				c.Set("auth_method", "password")
+				c.Set("user_id", 92)
+				c.Set("role", "admin")
+				c.Next()
+			})
+			router.Use(mfaStepUpGuard(injected))
+			router.POST("/api/v1/rules", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/rules", nil))
+
+			if response.Code != http.StatusNoContent {
+				t.Fatalf("status=%d body=%s, want 204（状态读取必须用注入句柄；回落到进程库会 428）",
+					response.Code, response.Body.String())
+			}
+		})
 	}
 }

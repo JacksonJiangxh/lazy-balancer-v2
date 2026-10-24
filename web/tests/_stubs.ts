@@ -23,14 +23,25 @@ export const resetCalls = (): void => {
 /** data: 模块源码包装（node 直接求值，不落盘）。 */
 export const dataModule = (code: string): string => `data:text/javascript,${encodeURIComponent(code)}`
 
+/** 真实调用面用到的方法集合（两处替身共用；新增方法只改这里）。 */
+export const EL_MESSAGE_METHODS = ['info', 'error', 'success'] as const
+
+const elMessageMethodsSource = (): string =>
+  EL_MESSAGE_METHODS.map((method) => `    ${method}: (arg) => globalThis.__calls?.push({ fn: 'ElMessage.${method}', arg }),`).join('\n')
+
 /**
  * saveResult 的两个依赖替身（element-plus 的 ElMessage + api 的 mfaAwareSuccess）。
- * 必须与真实调用面同形：ElMessage 是「可调用对象」，记录入参与 STUB_ELEMENT 一致
- * （宿主 `globalThis.__calls` 指向 calls 数组）。
+ * 必须与真实调用面同形：ElMessage 是「可调用对象」，方法集由 EL_MESSAGE_METHODS
+ * 单源生成（与 STUB_ELEMENT 逐字同源，改一处不会分叉）。
  */
 export const STUB_SAVE_RESULT_DEPS = dataModule(`
-export const ElMessage = (arg) => globalThis.__calls.push({ fn: 'ElMessage', arg })
-export const mfaAwareSuccess = (message) => globalThis.__calls.push({ fn: 'mfaAwareSuccess', arg: message })
+export const ElMessage = Object.assign(
+  (arg) => globalThis.__calls?.push({ fn: 'ElMessage', arg }),
+  {
+${elMessageMethodsSource()}
+  },
+)
+export const mfaAwareSuccess = (message) => globalThis.__calls?.push({ fn: 'mfaAwareSuccess', arg: message })
 `)
 
 /** element-plus 替身：ElMessage 的 info/error/success 与 MessageBox.confirm 均记录调用。 */
@@ -38,9 +49,7 @@ export const STUB_ELEMENT = dataModule(`
 export const ElMessage = Object.assign(
   (arg) => globalThis.__calls?.push({ fn: 'ElMessage', arg }),
   {
-    info: (arg) => globalThis.__calls?.push({ fn: 'ElMessage.info', arg }),
-    error: (arg) => globalThis.__calls?.push({ fn: 'ElMessage.error', arg }),
-    success: (arg) => globalThis.__calls?.push({ fn: 'ElMessage.success', arg }),
+${elMessageMethodsSource()}
   },
 )
 export const ElMessageBox = { confirm: (...args) => globalThis.__confirm(...args) }

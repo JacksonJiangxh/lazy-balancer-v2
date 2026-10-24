@@ -963,12 +963,12 @@ import type { CrsExcludedRow, CrsRuleOptionView } from '@/composables/useCrsRule
 import type { APIResponse, UserListItem } from '@/types'
 import SecurityBindingEditor from '@/components/SecurityBindingEditor.vue'
 import DialogHeader from '@/components/DialogHeader.vue'
-import { POLICY_TYPE_LABELS, POLICY_TYPE_SHORT_LABELS, STAGE_BLOCK_STATUS_OPTIONS, blockPageMissing, blockPageStageCanIntercept, buildStageModel, chunkForBulk, entriesIntersect, ensureSharedEntries, formatAclModeDetail, hasGeoIPControl, hasIPACLControl, hasStage3Features, hasTrustEntries, inferPolicyType, mergeIpEntryCount, mergeIpEntryValues, parseCrsFilename, parseIPList, parseRefIds, parseUnknownIds, parseUnknownStrings, sharedEntriesCache, subscribeSharedEntriesCache, trustHitMode, IP_LIST_CATEGORIES, MAX_POLICIES_PER_RULE, SECURITY_BULK_LIMITS, resolveBlockPageAttribution, type BlockPageAttribution, type BlockPageStage } from '@/utils/securityStages'
+import { POLICY_TYPE_LABELS, POLICY_TYPE_SHORT_LABELS, STAGE_BLOCK_STATUS_OPTIONS, blockPageMissing, blockPageStageCanIntercept, buildStageModel, chunkForBulk, entriesIntersect, ensureSharedEntries, formatAclModeDetail, hasGeoIPControl, hasIPACLControl, hasStage3Features, hasTrustEntries, inferPolicyType, mergeIpEntryCount, mergeIpEntryValues, parseCrsFilename, parseIPList, parseRefIds, parseUnknownIds, parseUnknownStrings, pickDefaultPolicyTab, sharedEntriesCache, subscribeSharedEntriesCache, trustHitMode, IP_LIST_CATEGORIES, MAX_POLICIES_PER_RULE, SECURITY_BULK_LIMITS, resolveBlockPageAttribution, type BlockPageAttribution, type BlockPageStage } from '@/utils/securityStages'
 import type { RuleStageModel, SecurityPolicyType, SecurityStagePolicy, CrsRuleFileOption } from '@/utils/securityStages'
 import { fetchAllCrsRuleFiles } from '@/utils/crsRuleFiles'
 import { updaterName } from '@/utils/updaterName'
 import { DEEP_LINK_PARAMS, pageUrl } from '@/utils/deepLink'
-import { buildPolicyPayload, crawlerExemptionNeedsEngines } from '@/utils/policyPayload'
+import { buildPolicyPayload, crawlerExemptionNeedsEngines, trustEnabledForPolicyType } from '@/utils/policyPayload'
 
 interface PolicyDetail { id: number; name: string; description: string; mode: string; anomaly_threshold: number; ip_acl_mode: string; ip_acl_list: string; ip_acl_enabled: boolean; ip_whitelist: string; ip_whitelist_enabled?: boolean; ip_blacklist?: string; ip_acl_list_refs?: string; ip_whitelist_refs?: string; rate_limit_enabled: boolean; rate_limit_rps: number; rate_limit_burst: number; crs_rule_groups: string; crs_excluded_rules: string; custom_rules: string; block_page_id: number; block_status_code: number; enabled: boolean; updated_at: string; geoip_mode?: string; geoip_countries?: string; geoip_crawler_exempt?: boolean; geoip_crawler_engines?: string; waf_check_response?: boolean; log_request_body?: boolean; trust_detection?: boolean }
 // 规则行携带阶段拦截页覆盖 4 字段（关联规则行内编辑与生效投影同源）
@@ -1075,11 +1075,16 @@ const policySearch = ref('')
 // 与后端兜底同形状） ──
 const activeTypeTab = ref<SecurityPolicyType>('stage1')
 const policyTypeOf = (row: PolicySummary): SecurityPolicyType => inferPolicyType(row)
-// 「混合策略（兼容旧版）」tab 条件可见：仅当存在 mixed 策略（导入或存量）时显示；
-// 混合组清空（如更新迁移完成）后当前 tab 自动切回阶段 1
-const policyTypeTabs = computed(() => {
+// 各类型条数（tab 标签 + 默认/回落 tab 选择共用一个计数源）
+const policyTypeCounts = computed<Record<SecurityPolicyType, number>>(() => {
   const counts: Record<SecurityPolicyType, number> = { stage0: 0, stage1: 0, stage2: 0, stage3: 0, mixed: 0 }
   for (const p of policies.value) counts[policyTypeOf(p)]++
+  return counts
+})
+// 「混合策略（兼容旧版）」tab 条件可见：仅当存在 mixed 策略（导入或存量）时显示；
+// 混合组清空（如更新迁移完成）后当前 tab 回落到第一个非空类型
+const policyTypeTabs = computed(() => {
+  const counts = policyTypeCounts.value
   // 阶段编号体系：阶段 0 · 信任名单 → 阶段 1 → 阶段 2 → 阶段 3（混合兼容组条件可见）
   const tabs = (['stage0', 'stage1', 'stage2', 'stage3'] as const).map((type) => ({
     type: type as SecurityPolicyType,
@@ -1090,16 +1095,20 @@ const policyTypeTabs = computed(() => {
   return tabs
 })
 
+// tab 消失（混合组迁移/删除清空）时回落到第一个非空类型——硬编码阶段 1 会让
+// 「子策略都在别的 tab」的站点停在空表。
+watch(policyTypeTabs, (tabs) => {
+  if (!tabs.some((tab) => tab.type === activeTypeTab.value)) {
+    activeTypeTab.value = pickDefaultPolicyTab(policyTypeCounts.value)
+  }
+})
+
 // 行内阶段页编辑收敛到当前策略类型对应阶段（任务 D）：stage1→阶段 1、stage3→阶段 3；
 // stage2 无覆盖页编辑；mixed 走只读查看弹框不进编辑器（恒空兜底）
 const editableOverrideStages = computed<readonly (1 | 3)[]>(() => {
   if (editorPolicyType.value === 'stage1') return [1]
   if (editorPolicyType.value === 'stage3') return [3]
   return []
-})
-
-watch(policyTypeTabs, (tabs) => {
-  if (!tabs.some((tab) => tab.type === activeTypeTab.value)) activeTypeTab.value = 'stage1'
 })
 
 const filteredPolicies = computed(() => {
@@ -1324,6 +1333,10 @@ const submitMigrate = async (): Promise<void> => {
     }
     migrateVisible.value = false
     await fetchData()
+    // 迁移后切到第一个子策略的类型 tab：混合组消失后回落谓词会选「第一个非空」，
+    // 但子策略类型顺序与创建结果一致，直接跟随可避免落到不相关的非空 tab。
+    const createdType = data?.created.find((c) => c.policy_type === 'stage0' || c.policy_type === 'stage1' || c.policy_type === 'stage2' || c.policy_type === 'stage3')?.policy_type
+    if (createdType) activeTypeTab.value = createdType as SecurityPolicyType
   } catch (error: unknown) {
     // 错误提示已由全局拦截器展示
     console.error('migrate policy failed', error)
@@ -1647,6 +1660,11 @@ const createPolicyType = ref<'stage0' | 'stage1' | 'stage2' | 'stage3'>('stage0'
 const editingPolicyType = ref<SecurityPolicyType | null>(null)
 const editorPolicyType = computed<SecurityPolicyType>(() =>
   editingId.value === null ? createPolicyType.value : (editingPolicyType.value ?? 'mixed'))
+
+// 信任名单在编辑器内的生效口径（与保存载荷 trustEnabledForPolicyType 同源）：
+// 阶段 0 恒启用——新建阶段 0 时 ipWhitelistEnabled 初值 false 且向导没有开关控件，
+// 告警/预览若各自读开关会把恒启用的信任条目判成零生效（跨策略冲突静默）。
+const trustEnabledInEditor = computed(() => trustEnabledForPolicyType(editorPolicyType.value, ipWhitelistEnabled.value))
 
 // 弹框副标题按策略类型描述；mixed/缺省保持兼容组总述文案
 const EDITOR_SUBTITLES: Record<SecurityPolicyType, string> = {
@@ -2360,7 +2378,7 @@ const ipAclSideEntries = (mode: string, aclEnabled: boolean, aclList: string[], 
 }
 
 // 本策略（表单实时值）的允许/拒绝两侧名单——引用列表条目并入内联后参与比较
-const selfIpAclSides = computed(() => ipAclSideEntries(form.value.ip_acl_mode, form.value.ip_acl_enabled, mergeIpEntries(ipACLList.value, ipACLListRefs.value), mergeIpEntries(ipWhitelist.value, ipWhitelistRefs.value), ipBlacklistSelf.value, ipWhitelistEnabled.value))
+const selfIpAclSides = computed(() => ipAclSideEntries(form.value.ip_acl_mode, form.value.ip_acl_enabled, mergeIpEntries(ipACLList.value, ipACLListRefs.value), mergeIpEntries(ipWhitelist.value, ipWhitelistRefs.value), ipBlacklistSelf.value, trustEnabledInEditor.value))
 
 const customRuleActionOf = (id: number): string => allCustomRules.value.find((r) => r.id === id)?.action ?? ''
 
@@ -2672,8 +2690,10 @@ const wafStepCrsAlert = computed<string>(() => {
 // - whitelistSectionAlert（信任名单区）：ip_whitelist（允许侧）。
 // 名单生效口径与保存语义对齐：ip_whitelist 随保存下发且受 ip_whitelist_enabled
 // 三态门应用——**门控在 computed 内**（信任关闭 = 条目零生效，与引擎发射门 /
-// ipAclSideEntries 同源），不参与跨策略冲突比较；模板只渲染结果，不做二次判断。
-// 若把门挪到显示层，关闭态会误报「本策略信任 X 却在被拦截」的伪冲突。
+// ipAclSideEntries 同源），不参与跨策略冲突比较；阶段 0 恒启用（与保存载荷
+// trustEnabledForPolicyType 同源——新建阶段 0 时 ipWhitelistEnabled 初值 false
+// 且无开关控件，按开关判断会漏掉恒启用信任条目的跨策略冲突）；模板只渲染结果，
+// 不做二次判断。若把门挪到显示层，关闭态会误报「本策略信任 X 却在被拦截」的伪冲突。
 // ip_acl_list 仅 ip_acl_enabled 时生效（同 ipAclSideEntries）；ip_blacklist 非空
 // 即生效（无开关，但其警告随访问控制区显示，显示门控 form.ip_acl_enabled）。
 // v1 仅精确字符串匹配，不展开 CIDR 包含。
@@ -2720,8 +2740,9 @@ const aclSectionAlert = computed<string>(() => {
 const whitelistSectionAlert = computed<string>(() => {
   const { peers, coBound } = comparisonContext.value
   // 信任名单同样合并引用列表条目后与对端比较
-  // 三态：信任关闭零生效（与后端发射门同口径），不参与跨策略冲突比较
-  const trust = ipWhitelistEnabled.value ? mergeIpEntries(ipWhitelist.value, ipWhitelistRefs.value) : []
+  // 三态：信任关闭零生效（与后端发射门同口径），不参与跨策略冲突比较；
+  // 阶段 0 恒启用（与保存载荷 trustEnabledForPolicyType 同源）
+  const trust = trustEnabledInEditor.value ? mergeIpEntries(ipWhitelist.value, ipWhitelistRefs.value) : []
   if (trust.length === 0) return ''
   const suffix = coBound ? '' : '（若两策略绑定同一规则）'
   const items: string[] = []
@@ -2764,6 +2785,11 @@ const inactiveReason = (a: BlockPageAttribution): string => {
   return '绑定链无其他有效拦截页，拦截回落 Caddy 默认响应'
 }
 const blockPageNotes = (caddyId: string, chain: ChainEntry[]): BlockPageNote[] => {
+  // 类型门先行：阶段 0 策略没有拦截页概念（向导无该步骤、后端归一
+  // block_page_id=0）——不得为其渲染「未选择自定义页面」等任何页面提示。
+  // 旧顺序先判 block_page_id<=0，stage0 永远命中该分支，类型门不可达。
+  const stages = editorBlockPageStages()
+  if (stages.length === 0) return []
   if (!form.value.enabled) return [{ kind: 'disabled', text: '策略禁用中，拦截页面不生效' }]
   const type = editorPolicyType.value
   if (form.value.block_page_id <= 0) {
@@ -2771,8 +2797,6 @@ const blockPageNotes = (caddyId: string, chain: ChainEntry[]): BlockPageNote[] =
       ? '未选择自定义页面：限流拦截返回空响应体 429'
       : '未选择自定义页面：拦截返回 Caddy 默认 403（规则级阶段 1/3 覆盖除外）' }]
   }
-  const stages = editorBlockPageStages()
-  if (stages.length === 0) return []
   // 页面列表未落地：不做任何生效判定（不得假设页面存在或已删除）
   if (!blockPagesLoaded.value) {
     return [{ kind: 'info', text: '拦截页列表未加载成功，无法判定本策略页面是否实际生效' }]
@@ -2883,9 +2907,9 @@ const previewModel = computed<RuleStageModel>(() => {
     // 走「ACL 启用 ∧ 内联∪引用非空」定义判定，缺 ip_acl_enabled 会把引用了名单的
     // 策略误判为未启用（预览阶段 1 恒灰）。
     ip_acl_enabled: typeAllowsStage(1) && form.value.ip_acl_enabled,
-    // 阶段 0 信任名单恒启用（与保存侧 buildPolicyPayload 的 trustAlwaysEnabled
-    // 同口径）；其余类型按开关三态。原投影让 stage0 预览显示「（未启用）」。
-    ip_whitelist_enabled: editorPolicyType.value === 'stage0' || ipWhitelistEnabled.value,
+    // 阶段 0 信任名单恒启用（与保存侧 buildPolicyPayload 的
+    // trustEnabledForPolicyType 同口径）；其余类型按开关三态
+    ip_whitelist_enabled: trustEnabledInEditor.value,
     block_page_id: typeAllowsStage(1) ? form.value.block_page_id : 0,
     block_status_code: form.value.block_status_code,
     has_ip_control: typeAllowsStage(1) && ((form.value.ip_acl_enabled && aclMergedCount.value > 0) || ipBlacklistSelf.value.length > 0),
@@ -3401,7 +3425,13 @@ const handleSave = async () => {
     // 无后缀不重复 toast）；汇总全部分片而非末片。
     const mergedBind = mergeBulkResults(bindResponses)
     if (mergedBind?.message?.includes(CADDY_APPLY_FAILED_MARKER)) showSaveResult(mergedBind, '')
-    dialogVisible.value = false; fetchData()
+    // 保存后停在本次保存的类型 tab——否则新建非阶段 1 策略后列表仍停在
+    // 阶段 1 空表，用户误读为「保存未生效」。类型须在关闭前取：关闭触发的
+    // resetWizard 会清空 editingId/editingPolicyType。
+    const savedType = editorPolicyType.value
+    dialogVisible.value = false
+    activeTypeTab.value = savedType
+    fetchData()
     // 本地契约 throw(如「响应缺少 id」)不经 axios 拦截器,
     // 空 catch 会静默吞掉——点保存无反应且已落库可致重试重复创建;按错误
     // 来源分流:ApiRequestError=HTTP 层(拦截器已 toast,不二次弹),其余
@@ -3464,6 +3494,9 @@ onMounted(async () => {
   const focusId = Number(query.get(DEEP_LINK_PARAMS.policyId) || 0)
   if (search || query.has(DEEP_LINK_PARAMS.policyId)) window.history.replaceState(null, '', window.location.pathname)
   const loaded = await fetchData()
+  // 首屏默认落在第一个非空类型（全空回落阶段 1）——硬编码阶段 1 会让只部署
+  // 阶段 0/2/3 策略的站点首屏看到空表 +「暂无安全策略」。
+  if (loaded) activeTypeTab.value = pickDefaultPolicyTab(policyTypeCounts.value)
   if (search && loaded) {
     const query = search.trim().toLowerCase()
     const matched = policies.value.find((p) => (p.name || '').toLowerCase() === query)

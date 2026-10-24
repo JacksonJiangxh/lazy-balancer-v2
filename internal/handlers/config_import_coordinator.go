@@ -402,13 +402,42 @@ func (session *configImportSession) close() {
 	}
 	// 提交后产物清理放在最后：此时 caddyOpMu 与导入会话锁都已释放，删证书
 	// 文件/日志/指标不再阻塞配置写与重载窗口（锁内只做了判定集收集与
-	// cert_jobs 的必要删除，见 collectPostCommitCleanup）。提交已落地，清理
-	// 失败只留痕不否决导入。
+	// cert_jobs 的必要删除，见 collectPostCommitCleanup）。清理移出请求
+	// goroutine 异步执行：close() 是 handler 的 defer，同步跑会让小响应体
+	// （无警告时仅数百字节）在 bufio 刷出前等清理完成，客户端表现为「导入卡住」。
+	// 提交已落地，清理失败只留痕不否决导入。
 	if plan := session.pendingCleanup; plan != nil {
 		session.pendingCleanup = nil
-		session.runPostCommitCleanup(plan)
+		if plan.empty() && importPostCommitCleanupHook == nil {
+			// 无产物可删：不启后台 goroutine（避免空跑的调度与测试收尾耦合）。
+			return
+		}
+		session.dispatchPostCommitCleanup(plan)
 	}
 }
+
+// importCleanupWG 跟踪在途的提交后清理（测试收尾等待，生产零消费）。
+var importCleanupWG sync.WaitGroup
+
+// dispatchPostCommitCleanup 异步执行提交后产物清理。清理已用
+// context.WithoutCancel + 自带预算与请求生命周期解耦，异步不改变其语义；
+// panic 兜底留痕，避免拖垮进程。runPostCommitCleanup 内部对「判定集→删除」
+// 窗口按已提交视图复核，与下一次导入重叠执行是设计内形态。
+func (session *configImportSession) dispatchPostCommitCleanup(plan *importArtifactCleanupPlan) {
+	importCleanupWG.Add(1)
+	go func() {
+		defer importCleanupWG.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				services.Logf("error", "导入清理：提交后产物清理 panic: %v", r)
+			}
+		}()
+		session.runPostCommitCleanup(plan)
+	}()
+}
+
+// waitImportCleanup 等待全部在途提交后清理结束（测试收尾单源；生产零调用）。
+func waitImportCleanup() { importCleanupWG.Wait() }
 
 func (session *configImportSession) abort(importErr error) error {
 	if session.finished {
@@ -491,9 +520,10 @@ func (session *configImportSession) abort(importErr error) error {
 		// 库视图（零 /load）。钉回失败不代表运行配置恢复失败，故独立留痕而
 		// 不并入 importErr（避免横幅被误标成「运行配置状态未知」）。
 		if pinErr := session.h.pinLastGoodAfterCompensation(); pinErr != nil {
-			detail := "导入未生效回弹后把 last-known-good 钉回已提交视图失败（LKG 可能仍为请求前运行配置）: " + pinErr.Error()
-			services.Logf("warn", "%s", detail)
-			services.RecordAuditLog("system", session.actionLabel()+"警告", "配置备份", detail, "")
+			// 附带失败独立留痕（不与「运行配置是否恢复」混为一谈）：导入会话不携带
+			// 用户身份，统一写点以系统身份落审计；不再由本处自造第二份文案，
+			// 否则同一次失败会出现两行（helper 时代）或零审计（只 warn）。
+			session.h.recordCompensationSideEffects(session.actionLabel()+"未生效回弹", pinErr)
 		}
 	}
 	session.finished = true
@@ -539,9 +569,11 @@ func (session *configImportSession) commit(affectedRuleIDs []string, certificate
 	if cleanupErr != nil {
 		return &importCoordinatorError{err: session.abort(cleanupErr), action: session.action}
 	}
-	if err := session.tx.Commit(); err != nil {
+	if err := commitTx(session.tx); err != nil {
 		// Commit 报错=结果不可判定（可能已落地但确认丢失）：先标记再 abort，
-		// 文件面据此跳过回退（回退只在确定回滚时执行）。
+		// 文件面据此跳过回退（回退只在确定回滚时执行）。提交入口统一走
+		// commitTx（测试缝单源）——导入的「不确定态」语义（WAF 文件不回退 +
+		// 人工核对指引）只有可注入才可能钉测。
 		session.commitIndeterminate = true
 		return &importCoordinatorError{phase: importPhaseCommit, err: session.abort(err), action: session.action}
 	}

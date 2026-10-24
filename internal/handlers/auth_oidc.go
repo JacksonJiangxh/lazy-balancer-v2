@@ -190,6 +190,110 @@ func saveOIDCConfig(cfg OIDCConfig) error {
 	return nil
 }
 
+// oidcIssuerMigration 描述一次「归一值写回库」对历史身份行的迁移结果：
+// moved=实际改写的行数，conflicts=迁移后会出现同 (issuer,subject) 双行的
+// subject 集合（此时整体回滚，由管理员人工合并）。
+type oidcIssuerMigration struct {
+	from      string
+	to        string
+	moved     int
+	conflicts []string
+}
+
+// auditText 返回审计 delta 片段（无迁移返回空串）：写回归一值本身无字段差异
+// （before/after 都是归一值），不显式留痕会显示「无字段变化」而身份键已被
+// 改写——长期取证面必须可解释。
+func (m oidcIssuerMigration) auditText() string {
+	if m.from == "" || m.from == m.to {
+		return ""
+	}
+	return fmt.Sprintf("服务地址归一：%s→%s（迁移历史身份行 %d 条）", m.from, m.to, m.moved)
+}
+
+// migrateOIDCIdentityIssuer 把按原值建键的历史身份行迁到归一值（同一事务内，
+// 与配置写回同生共死）。读取阶段先查冲突：同 subject 已存在归一值行时迁移会
+// 触发 (oidc_issuer,oidc_subject) 唯一索引，且意味着同一自然人有两行身份
+// （角色/禁用状态分叉）——必须拒绝并列出 subject 交人工合并，绝不静默二选一。
+func migrateOIDCIdentityIssuer(tx *sql.Tx, from, to string) (oidcIssuerMigration, error) {
+	mig := oidcIssuerMigration{from: from, to: to}
+	if from == "" || to == "" || from == to {
+		return mig, nil
+	}
+	rows, err := tx.Query(`SELECT oidc_subject FROM users
+		WHERE auth_provider='oidc' AND oidc_subject<>'' AND oidc_issuer=?
+		  AND oidc_subject IN (SELECT oidc_subject FROM users WHERE auth_provider='oidc' AND oidc_subject<>'' AND oidc_issuer=?)
+		ORDER BY oidc_subject`, from, to)
+	if err != nil {
+		return mig, err
+	}
+	for rows.Next() {
+		var subject string
+		if scanErr := rows.Scan(&subject); scanErr != nil {
+			rows.Close()
+			return mig, scanErr
+		}
+		mig.conflicts = append(mig.conflicts, subject)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return mig, err
+	}
+	rows.Close()
+	if len(mig.conflicts) > 0 {
+		return mig, nil
+	}
+	res, err := tx.Exec(`UPDATE users SET oidc_issuer=? WHERE auth_provider='oidc' AND oidc_subject<>'' AND oidc_issuer=?`, to, from)
+	if err != nil {
+		return mig, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return mig, err
+	}
+	mig.moved = int(affected)
+	return mig, nil
+}
+
+// saveOIDCConfigWithIssuerMigration 在同一事务内写配置并迁移历史身份行。
+// 读侧归一保留 rawIssuer 只是为了「库中还存着原值」时能回退查询；配置一旦
+// 写回库，原值即消失、兼容通道失效——若不同步迁移身份行，该自然人再登录会
+// 被当成首次登录并新建启用账号（封禁/角色旁路）。conflicts 非空时函数不提交，
+// 由调用方回 409。
+func saveOIDCConfigWithIssuerMigration(cfg OIDCConfig, migrateFrom string) (oidcIssuerMigration, error) {
+	mig := oidcIssuerMigration{from: migrateFrom, to: cfg.Issuer}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		return mig, err
+	}
+	tx, err := db.DB.Begin()
+	if err != nil {
+		return mig, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.Exec("UPDATE global_config SET oidc_config=? WHERE id=1", string(raw))
+	if err != nil {
+		return mig, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return mig, err
+	}
+	if affected != 1 {
+		return mig, fmt.Errorf("保存 OIDC 配置失败：影响行数 %d（global_config 行缺失）", affected)
+	}
+	mig, err = migrateOIDCIdentityIssuer(tx, migrateFrom, cfg.Issuer)
+	if err != nil {
+		return mig, err
+	}
+	if len(mig.conflicts) > 0 {
+		return mig, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return mig, err
+	}
+	return mig, nil
+}
+
 // oidcAccessClaims 是访问白名单判定的输入（claims 解析后单源传递）。
 type oidcAccessClaims struct {
 	Email string
@@ -378,15 +482,43 @@ func normalizeOIDCAllowedGroups(raw []string) []string {
 	return out
 }
 
-// normalizeOIDCIssuer 通用规范化：去首尾空白与尾斜杠；按主机名（去端口）匹配
-// Entra 家族登录主机，缺 /v2.0 时自动补——Entra 的 v1 端点无 OIDC 发现文档，
-// 漏写 /v2.0 是最高频配置错误。这是针对 Entra 的兼容特例，不属于标准 OIDC
-// 语义；其余提供商逐字保留（不猜路径）。主机名判定使浏览器地址栏复制来的
-// `:443` 形态同样命中。
+// normalizeOIDCIssuer 通用规范化：去首尾空白与尾斜杠；主机按 RFC 3986 归一到
+// 小写并去掉协议默认端口（https:443 / http:80）；随后按主机名匹配 Entra 家族
+// 登录主机，缺 /v2.0 时自动补——Entra 的 v1 端点无 OIDC 发现文档，漏写 /v2.0
+// 是最高频配置错误。
+//
+// 主机归一后 :443 与大写主机形态才真正可用：go-oidc 要求配置的 issuer 与发现
+// 文档宣告的 issuer **逐字节相等**（Issuers must match exactly），而 IdP 宣告值
+// 恒为小写、不带默认端口。旧实现只按 Hostname 查表、原样保留 :443 与大小写，
+// 这类地址保存能过、测试端点报英文 mismatch、登录恒失败——注释曾声称「同样
+// 命中」，与实际能力不符。路径/查询保持原样（只有主机不区分大小写）。
 func normalizeOIDCIssuer(raw string) string {
 	issuer := strings.TrimRight(strings.TrimSpace(raw), "/")
 	u, err := url.Parse(issuer)
-	if err != nil || !entraIssuerHosts[strings.ToLower(u.Hostname())] {
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return issuer
+	}
+	hostName := u.Hostname()
+	if hostName != "" {
+		port := u.Port()
+		if (strings.EqualFold(u.Scheme, "https") && port == "443") || (strings.EqualFold(u.Scheme, "http") && port == "80") {
+			port = ""
+		}
+		normalizedHost := strings.ToLower(hostName)
+		if port != "" {
+			normalizedHost = net.JoinHostPort(normalizedHost, port)
+		} else if strings.Contains(normalizedHost, ":") && !strings.HasPrefix(normalizedHost, "[") {
+			// IPv6 字面量在 URL 中必须带方括号。
+			normalizedHost = "[" + normalizedHost + "]"
+		}
+		if normalizedHost != u.Host {
+			u.Host = normalizedHost
+			issuer = u.String()
+		}
+		if !entraIssuerHosts[strings.ToLower(hostName)] {
+			return issuer
+		}
+	} else if !entraIssuerHosts[strings.ToLower(u.Hostname())] {
 		return issuer
 	}
 	if !strings.HasSuffix(issuer, "/v2.0") {
@@ -831,7 +963,8 @@ func lookupOIDCIdentity(issuer, subject string) (oidcIdentity, error) {
 // lookupOIDCIdentityCompat 读侧归一后的身份查询：库中原值可能与归一值不同
 // （带外写入的 Entra issuer 缺 /v2.0、带尾斜杠的 issuer），历史 JIT 行按原值
 // 建键——只查归一值会 miss 并重复开户。归一值未命中且原值不同时回退原值查询。
-// 命中后不再改写该行（身份键保持为开户时的事实，避免两行竞争）。
+// 命中后不在读路径改写该行（避免两行竞争）；改写由保存路径的
+// saveOIDCConfigWithIssuerMigration 在写回归一值时同批完成。
 func lookupOIDCIdentityCompat(cfg OIDCConfig, subject string) (oidcIdentity, error) {
 	ident, err := lookupOIDCIdentity(cfg.Issuer, subject)
 	if err == nil || !errors.Is(err, sql.ErrNoRows) || cfg.rawIssuer == "" || cfg.rawIssuer == cfg.Issuer {
@@ -1332,11 +1465,32 @@ func (h *Handlers) OIDCSettingsUpdate(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "启用前需完整配置服务地址、Client ID 与 Client Secret"})
 		return
 	}
-	if err := saveOIDCConfig(cfg); err != nil {
+	// 本次保存会把归一值写回库（原值消失）：若库中原值正是新 issuer 归一前的
+	// 形态，历史身份行必须同批迁移——否则兼容查询失效，同一 subject 再登录被
+	// 当成首登新建一行（封禁/角色旁路），且这次改写不留任何审计 delta。
+	migrateFrom := ""
+	if before.rawIssuer != "" && before.rawIssuer != cfg.Issuer && normalizeOIDCIssuer(before.rawIssuer) == cfg.Issuer {
+		migrateFrom = before.rawIssuer
+	}
+	migration, err := saveOIDCConfigWithIssuerMigration(cfg, migrateFrom)
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "保存 OIDC 配置失败"})
 		return
 	}
-	recordAudit(c, "更新", "OIDC 配置", services.FormatAuditDetail(oidcConfigUpdateAuditDetail(before, cfg), services.AuditResultPart("success")))
+	if len(migration.conflicts) > 0 {
+		services.Logf("warn", "OIDC 设置保存被拒绝：服务地址归一后与既有身份行冲突（%d 个 subject）", len(migration.conflicts))
+		c.JSON(http.StatusConflict, models.APIResponse{
+			Code:    409,
+			Message: fmt.Sprintf("服务地址归一后与既有身份记录冲突（%d 个 subject 已存在归一值身份行），请先人工合并重复账号再保存", len(migration.conflicts)),
+			Data:    gin.H{"conflicts": migration.conflicts},
+		})
+		return
+	}
+	detail := oidcConfigUpdateAuditDetail(before, cfg)
+	if text := migration.auditText(); text != "" {
+		detail = services.FormatAuditDetail(detail, text)
+	}
+	recordAudit(c, "更新", "OIDC 配置", services.FormatAuditDetail(detail, services.AuditResultPart("success")))
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Message: "OIDC 配置已保存"})
 }
 
@@ -1447,7 +1601,7 @@ func (h *Handlers) OIDCSettingsTest(c *gin.Context) {
 	p, err := oidcProvider(issuer)
 	if err != nil {
 		recordAudit(c, "测试失败", "OIDC 配置", services.FormatAuditDetail(issuer, services.AuditResultPart("failure")))
-		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"ok": false, "error": err.Error()}})
+		c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: gin.H{"ok": false, "error": oidcTestFailureText(err)}})
 		return
 	}
 	// JWKS 可达性——此前注释声称「一次签验失败即证可达性」，实际
@@ -1511,6 +1665,17 @@ func (h *Handlers) OIDCSettingsTest(c *gin.Context) {
 		"credentials_checked":    credentialsChecked,
 		"jwks_checked":           true,
 	}})
+}
+
+// oidcTestFailureText 把发现阶段错误翻译为可操作提示（仅「测试连接」端点；
+// 未认证登录页保持固定短句，不泄露配置细节）。issuer 与发现文档逐字节不等
+// 是最高频配置错误，go-oidc 原文为英文且不提端口/大小写，管理员会误查网络。
+func oidcTestFailureText(err error) string {
+	var mismatch *oidc.IssuerMismatchError
+	if errors.As(err, &mismatch) {
+		return fmt.Sprintf("服务地址与认证服务宣告的 issuer 不一致：配置 %s，宣告 %s（常见原因：多了 :443 等默认端口、主机大小写不同或尾斜杠差异——请按宣告值填写）", mismatch.Provided, mismatch.Discovered)
+	}
+	return err.Error()
 }
 
 // oidcProbeClient 凭证探测专用客户端:出站请求必须有界(挂起的 token 端点

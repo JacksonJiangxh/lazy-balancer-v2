@@ -28,8 +28,8 @@ curl -s http://localhost:8000/api/v1/mcp \
 | Key 类型 | 可用工具 |
 |---|---|
 | 管理员 Key（读写） | 全部工具（以 `tools/list` 为准） |
-| 只读 Key（read_only） | GET 查询工具（export_config 与 get_caddy_config 除外——前者导出含用户/密钥哈希、后者原始 Caddy 配置可能含内联私钥，二者对只读 Key 一律 403，列表亦不展示）+ 3 个读探测 POST 工具（parse_certificate / validate_import / preview_config；证书配置测试含真实 DNS 写入、CA 提供商测试在 ZeroSSL 缺 EAB 时会写入 CA 凭据，均已移出只读豁免） |
-| 非管理员用户 Key | 仅查询类工具与上述读探测 POST；负载规则/证书配置/证书签发/集群与系统管理等写工具对该 Key 一律 403，`tools/list` 不会列出这些工具 |
+| 只读 Key（read_only） | GET 查询工具（export_config 与 get_caddy_config 除外——前者导出含用户/密钥哈希、后者原始 Caddy 配置可能含内联私钥，二者对只读 Key 一律 403，列表亦不展示）+ 3 个读探测 POST 工具（parse_certificate / validate_import / preview_config；后两者另要求 Key 属主为管理员，见下行；证书配置测试含真实 DNS 写入、CA 提供商测试在 ZeroSSL 缺 EAB 时会写入 CA 凭据，均已移出只读豁免） |
+| 非管理员用户 Key | 仅查询类工具 + `parse_certificate`；`preview_config`/`validate_import` 需管理员属主 Key（非管理员调用恒 403，且不在 `tools/list` 中展示）；负载规则/证书配置/证书签发/集群与系统管理等写工具对该 Key 一律 403，`tools/list` 不会列出这些工具 |
 | IP 白名单 Key | 请求来源 IP 必须命中白名单（MCP 内部转发不受影响） |
 
 请求体必须是**单条 JSON-RPC 对象**：服务器不接受 JSON-RPC 批处理数组（返回 HTTP 400 + `PARSE_ERROR`）。客户端请逐条发送请求；`tools/list` 的按 Key 过滤也按单条请求生效。
@@ -96,8 +96,8 @@ lazy-balancer://docs/ops-playbook
 | 域 | 仅 REST 的端点示例 | 说明 |
 |---|---|---|
 | 监控指标 | `GET /caddy/metrics`、`GET /caddy/host-metrics`、`GET /logs/stats` | Caddy 进程级/按域名聚合指标与日志保留统计 |
-| 规则查询 | `POST /rules/cert-info` | 按域名批量查询规则关联证书信息 |
-| 证书队列 | `POST /certificates/jobs/current` | 查询当前进行中的证书签发任务 |
+| 规则查询 | `POST /rules/cert-info` | 按 `caddy_ids`（规则 ID 列表，最多 200 条）批量查询规则证书信息；空数组返回空 map |
+| 证书队列 | `POST /certificates/jobs/current` | 按 `rule_ids` 批量取每条规则最新一条非 disabled 证书签发任务（轮询不受分页漂移影响） |
 | 审计 | `GET /audit-logs/options` | 审计日志筛选下拉选项 |
 | WAF 规则库 | `GET /security/crs/setup` | CRS 全局配置（crs-setup 摘要） |
 | 自动封禁 | `GET /security/autoban`、`PUT /security/autoban` | 自动封禁阈值/窗口/时长/作用域/演练模式配置 |

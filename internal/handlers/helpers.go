@@ -271,8 +271,16 @@ func tlsWildcardMatch(pattern, domain string) bool {
 // dialOutboundIP 探测本机出口 IP（UDP dial 不写包，仅借路由决策读本地地址）。
 // 探测失败或地址类型意外（原 unchecked type assertion）
 // 回退 127.0.0.1 并返回 ok=false——单源实现，cluster_mode.go（需 ok 位做
-// 审计点名）与本函数（系统信息展示）共用。
-func dialOutboundIP() (string, bool) {
+// 审计点名）与系统信息展示共用。
+//
+// dialOutboundIPFn 是可注入的探测缝：被保护的失败分支（无默认路由的容器里
+// ip_address 置空而非回显 127.0.0.1）只在该环境发生，而开发机/CI 恒有默认
+// 路由——不注入就永不被自动化覆盖。生产恒为 netDialOutboundIP。
+var dialOutboundIPFn = netDialOutboundIP
+
+func dialOutboundIP() (string, bool) { return dialOutboundIPFn() }
+
+func netDialOutboundIP() (string, bool) {
 	conn, err := net.Dial("udp", "8.8.8.8:80")
 	if err != nil {
 		return "127.0.0.1", false
@@ -1328,6 +1336,14 @@ func parsePrometheusSamples(body string) ([]prometheusSample, error) {
 	for lineNumber, line := range strings.Split(body, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// geoip 透传路由无 reverse_proxy：同一请求先过它、再过主/路径路由，
+		// 两条路由各自注入指标。本仓库的采集链按
+		// services.GeoIPPassSeriesMarker 整行剔除，实时指标解析必须同口径
+		// （共用同一常量），否则首页「总请求数/流量」在启用 GeoIP 的规则上
+		// 恰好是真实值的两倍，且与同页采集链来源的速率卡互相矛盾。
+		if strings.Contains(line, services.GeoIPPassSeriesMarker) {
 			continue
 		}
 		fields := strings.Fields(line)

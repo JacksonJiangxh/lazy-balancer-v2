@@ -130,7 +130,8 @@ func classifyRotationCopyName(name string) rotationCopyName {
 
 // timberjackRotationReasonSuffix 匹配 timberjack 副本的 reason 尾部：
 // -size.log / -size_1.log（同毫秒碰撞计数写在 reason 段内）/ -time.log /
-// -time_2.log。reason 家族取自 services.CaddyLogRotationReasonPattern——与删除
+// -time_2.log / -initial.log（现存文件不可追加打开时的回退改名）。
+// reason 家族取自 services.CaddyLogRotationReasonPattern——与删除
 // 侧白名单同源，避免两侧各写一份上游命名知识后漂移。
 var timberjackRotationReasonSuffix = regexp.MustCompile(
 	`-(?:` + services.CaddyLogRotationReasonPattern() + `)(?:_\d+)?\.log$`)

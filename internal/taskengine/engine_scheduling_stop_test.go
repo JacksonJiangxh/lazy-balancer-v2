@@ -56,6 +56,9 @@ func TestEngine_PeriodicNonPositiveIntervalStopsWithFailedRun(t *testing.T) {
 	if got := runs.Load(); got != 0 {
 		t.Fatalf("非正周期不得执行 Run, got %d 次", got)
 	}
+	// 停调标记先于运行行落库（LoopEnabled 置 false 与 finishRun 写行是两步），
+	// 只等停调会读到「行尚未写入」的瞬时态。
+	waitForEngine(t, "停调运行行落库", 2*time.Second, func() bool { return countRuns(t, id) >= 1 })
 	var status, message string
 	if err := db.DB.QueryRow(`SELECT status, COALESCE(message,'') FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1`, id).
 		Scan(&status, &message); err != nil {
@@ -214,5 +217,169 @@ func TestEngine_RegisterRejectedAfterStop(t *testing.T) {
 		Run: func(RunContext) error { return nil }})
 	if !errors.Is(err, ErrEngineStopped) {
 		t.Fatalf("已停引擎注册 err=%v, want ErrEngineStopped", err)
+	}
+}
+
+// Given Scheduled 任务的自动轮已连续失败（槽未推进），管理员又手动重试也失败。
+// When 手动失败次数达到自动停调预算的轮数，随后继续自动轮失败。
+// Then 手动轮不消耗自动停调预算：手动失败只保留退避节流，streak 不增、调度
+// 不停；自动轮从零累计到预算终点才停调。
+func TestEngine_ScheduledManualFailuresDoNotConsumeStopBudget(t *testing.T) {
+	e := newTestEngineWithOptions(t, Options{TickInterval: time.Hour})
+	pastSlot := time.Now().Add(-time.Minute)
+	const id = "t-manual-no-budget"
+	if err := e.Register(Descriptor{
+		ID: id, Family: "t", Name: "手动轮不耗预算", Kind: KindScheduled, RunsOn: RoleAny,
+		NextSlotFn: func() time.Time { return pastSlot },
+		Run:        func(RunContext) error { return os.ErrDeadlineExceeded },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	e.SetRole(true)
+	e.StartLoop(id)
+	// 与 tick 同口径预置槽缓存：退避分支只覆盖「槽已到期且未推进」形态。
+	e.mu.RLock()
+	r := e.regs[id]
+	e.mu.RUnlock()
+	r.mu.Lock()
+	r.nextScheduledTime = pastSlot
+	r.mu.Unlock()
+
+	for i := 0; i < scheduledFailStreakStopLimit; i++ {
+		if _, err := e.RunSync(id, "manual", "tester"); err == nil {
+			t.Fatal("注入失败的手动轮应返回错误")
+		}
+	}
+	if !loopEnabledOf(t, e, id) {
+		t.Fatal("手动轮失败不得停止自动调度（次数天然有界）")
+	}
+	if _, _, retry, streak := scheduleStateOf(t, e, id); streak != 0 || retry.IsZero() {
+		t.Fatalf("手动轮不得消耗自动停调预算: streak=%d retry=%v（退避节流须保留）", streak, retry)
+	}
+
+	// 自动轮从零开始累计：前 limit-1 轮不停调，第 limit 轮停调。
+	for i := 1; i < scheduledFailStreakStopLimit; i++ {
+		if _, err := e.RunSync(id, "auto", ""); err == nil {
+			t.Fatal("注入失败的自动轮应返回错误")
+		}
+		if !loopEnabledOf(t, e, id) {
+			t.Fatalf("自动轮第 %d 轮未到停调终点，不得提前停调", i)
+		}
+		if _, _, _, streak := scheduleStateOf(t, e, id); streak != i {
+			t.Fatalf("自动轮 streak=%d, want %d", streak, i)
+		}
+	}
+	if _, err := e.RunSync(id, "auto", ""); err == nil {
+		t.Fatal("注入失败的自动轮应返回错误")
+	}
+	if loopEnabledOf(t, e, id) {
+		t.Fatalf("自动轮累计到 %d 轮仍应停调", scheduledFailStreakStopLimit)
+	}
+}
+
+// Given Scheduled 任务已开启且当前槽已被成功消费（水位=槽值）。
+// When 业务唤醒经 RearmLoop(hasWork=true) 到达（任务本来就在调度中）。
+// Then 槽水位与退避不被复位——已开启任务的普通唤醒不得把已消费的过期槽重新
+// 投递（复位只属于「已停止→恢复」过渡）。
+func TestEngine_RearmLoopHasWorkKeepsConsumedSlotWhenAlreadyOn(t *testing.T) {
+	e := newTestEngine(t)
+	pastSlot := time.Now().Add(-time.Minute)
+	var runs atomic.Int32
+	const id = "t-rearm-on"
+	if err := e.Register(Descriptor{
+		ID: id, Family: "t", Name: "已开启唤醒", Kind: KindScheduled, RunsOn: RoleAny,
+		NextSlotFn: func() time.Time { return pastSlot },
+		Run:        func(RunContext) error { runs.Add(1); return nil },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	e.SetRole(true)
+	e.StartLoop(id)
+	waitForEngine(t, "首轮消费本槽", 2*time.Second, func() bool {
+		_, done, _, _ := scheduleStateOf(t, e, id)
+		return runs.Load() == 1 && !done.IsZero()
+	})
+
+	e.RearmLoop(id, true)
+
+	if _, done, _, _ := scheduleStateOf(t, e, id); done.IsZero() {
+		t.Fatal("已开启任务的唤醒不得复位槽消费水位（会把过期槽重新投递）")
+	}
+	time.Sleep(200 * time.Millisecond) // ≈20 个 tick
+	if got := runs.Load(); got != 1 {
+		t.Fatalf("已开启任务被唤醒后重复投递: runs=%d, want 1", got)
+	}
+}
+
+// Given 引擎因「槽连续未推进」自行停调。
+// When 读取任务元数据；随后用户重新开启调度，再主动停止。
+// Then 停调来源机器可读（schedule_stopped_reason=fail-streak），重新开启即清空；
+// 用户主动停止不留来源标记——两者可区分。
+func TestEngine_ScheduleStopReasonIsMachineReadable(t *testing.T) {
+	e := newTestEngineWithOptions(t, Options{TickInterval: time.Hour})
+	pastSlot := time.Now().Add(-time.Minute)
+	const id = "t-stop-reason"
+	if err := e.Register(Descriptor{
+		ID: id, Family: "t", Name: "停调来源", Kind: KindScheduled, RunsOn: RoleAny,
+		NextSlotFn: func() time.Time { return pastSlot },
+		Run:        func(RunContext) error { return os.ErrDeadlineExceeded },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	e.SetRole(true)
+	e.StartLoop(id)
+	e.mu.RLock()
+	r := e.regs[id]
+	e.mu.RUnlock()
+	r.mu.Lock()
+	r.nextScheduledTime = pastSlot
+	r.schedFailStreak = scheduledFailStreakStopLimit - 1
+	r.mu.Unlock()
+
+	if _, err := e.RunSync(id, "auto", ""); err == nil {
+		t.Fatal("注入失败的任务应记录失败")
+	}
+	m, ok := e.Lookup(id)
+	if !ok {
+		t.Fatal("任务未注册")
+	}
+	if m.LoopOn {
+		t.Fatal("停调后 LoopOn 应为 false")
+	}
+	if m.ScheduleStoppedReason != ScheduleStopReasonFailStreak {
+		t.Fatalf("停调来源=%q, want %q（视图据此区分引擎停调与用户停止）", m.ScheduleStoppedReason, ScheduleStopReasonFailStreak)
+	}
+
+	e.StartLoop(id)
+	if m, _ := e.Lookup(id); m.ScheduleStoppedReason != "" {
+		t.Fatalf("重新开启调度后停调来源应清空, got %q", m.ScheduleStoppedReason)
+	}
+	e.StopLoop(id)
+	if m, _ := e.Lookup(id); m.ScheduleStoppedReason != "" {
+		t.Fatalf("用户主动停止不得留下引擎停调来源, got %q", m.ScheduleStoppedReason)
+	}
+}
+
+// Given 引擎已停止且传入非法描述符。
+// When 注册。
+// Then 先报字段错误（排障指向真正缺失的字段）；合法描述符仍被 ErrEngineStopped
+// 拒绝——停调门的语义不变。
+func TestEngine_RegisterAfterStopReportsFieldErrorFirst(t *testing.T) {
+	e := NewEngine(Options{TickInterval: time.Hour})
+	e.Stop()
+
+	err := e.Register(Descriptor{Family: "t", Name: "缺 ID", Kind: KindOneshot,
+		Run: func(RunContext) error { return nil }})
+	if errors.Is(err, ErrEngineStopped) {
+		t.Fatal("非法描述符应先报字段错误，而不是「引擎已停止」（排障指向错误）")
+	}
+	if err == nil || !strings.Contains(err.Error(), "ID/Family 必填") {
+		t.Fatalf("非法描述符 err=%v, want 字段错误", err)
+	}
+
+	err = e.Register(Descriptor{ID: "t-after-stop-field", Family: "t", Name: "合法描述符", Kind: KindOneshot,
+		Run: func(RunContext) error { return nil }})
+	if !errors.Is(err, ErrEngineStopped) {
+		t.Fatalf("合法描述符在已停引擎注册 err=%v, want ErrEngineStopped", err)
 	}
 }

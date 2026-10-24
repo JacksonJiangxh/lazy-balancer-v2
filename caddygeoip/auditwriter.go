@@ -530,6 +530,7 @@ type auditSnapshot struct {
 	Messages_    []plugintypes.AuditLogMessage `json:"messages,omitempty"`
 	// MessagesDropped_ 是写侧 messages 上限截断时丢弃的条数（0 不发射）：
 	// 整行不再因命中规则过多被 auditItemMaxBytes 丢弃，丢失量显性可见。
+	// 丢弃只发生在中间段——头部与尾部（CRS 评估汇总）都保留。
 	MessagesDropped_ int `json:"messages_dropped,omitempty"`
 }
 
@@ -668,16 +669,19 @@ func (t *auditSnapshotTransaction) IsInterrupted() bool {
 // drain 侧格式化恒晚于 tx.Close）。
 type auditSnapshotRequest struct {
 	plugintypes.AuditLogTransactionRequest `json:"-"`
-	Method_                                string                                        `json:"method"`
-	Protocol_                              string                                        `json:"protocol"`
-	URI_                                   string                                        `json:"uri"`
-	HTTPVersion_                           string                                        `json:"http_version"`
-	Headers_                               map[string][]string                           `json:"headers"`
-	Body_                                  string                                        `json:"body"`
-	BodyTruncated_                         bool                                          `json:"body_truncated,omitempty"`
-	Files_                                 []plugintypes.AuditLogTransactionRequestFiles `json:"files"`
-	ArgsStub                               struct{}                                      `json:"args"`
-	Length_                                int32                                         `json:"length"`
+	Method_                                string              `json:"method"`
+	Protocol_                              string              `json:"protocol"`
+	URI_                                   string              `json:"uri"`
+	HTTPVersion_                           string              `json:"http_version"`
+	Headers_                               map[string][]string `json:"headers"`
+	// HeadersBytes_ 是 Headers_ 的精确序列化字节数（snapshotAuditHeaders 已算出，
+	// 不入 JSON）：入队字节估算直接引用，避免按条固定开销重估失真。
+	HeadersBytes_  int64                                         `json:"-"`
+	Body_          string                                        `json:"body"`
+	BodyTruncated_ bool                                          `json:"body_truncated,omitempty"`
+	Files_         []plugintypes.AuditLogTransactionRequestFiles `json:"files"`
+	ArgsStub       struct{}                                      `json:"args"`
+	Length_        int32                                         `json:"length"`
 }
 
 func (r *auditSnapshotRequest) Method() string {
@@ -753,11 +757,13 @@ func (f auditSnapshotFile) Mime() string { return f.Mime_ }
 // auditSnapshotResponse 实现 plugintypes.AuditLogTransactionResponse。
 // BodyTruncated_ 与请求侧同标记位（JSON 契约对称 omitempty）。
 type auditSnapshotResponse struct {
-	Protocol_      string              `json:"protocol"`
-	Status_        int                 `json:"status"`
-	Headers_       map[string][]string `json:"headers"`
-	Body_          string              `json:"body"`
-	BodyTruncated_ bool                `json:"body_truncated,omitempty"`
+	Protocol_ string              `json:"protocol"`
+	Status_   int                 `json:"status"`
+	Headers_  map[string][]string `json:"headers"`
+	// HeadersBytes_ 同请求侧（精确序列化字节，不入 JSON）。
+	HeadersBytes_  int64  `json:"-"`
+	Body_          string `json:"body"`
+	BodyTruncated_ bool   `json:"body_truncated,omitempty"`
 }
 
 func (r *auditSnapshotResponse) Protocol() string {
@@ -882,49 +888,60 @@ const auditHeadersMaxBytes = 64 * 1024
 // 同名客户端头在此一律剥离，此后管线内出现的该键均为写侧真实丢弃计数。
 const auditSnapshotDroppedHeadersKey = "_lb_dropped_headers"
 
+// auditHeaderEntrySerializedBytes 返回单条 header 条目 `"k":["v1","v2"],` 的
+// 精确序列化字节数（含 JSON 语法与条目间逗号）：键/值走
+// jsonStringEscapedLen 逐字节对齐 json.Marshal，零分配。
+func auditHeaderEntrySerializedBytes(k string, vs []string) int64 {
+	size := int64(jsonStringEscapedLen(k)) + 3 // "k":
+	if len(vs) == 0 {
+		size += 2 // []
+	} else {
+		size += 2 // 两侧 []
+		for _, s := range vs {
+			size += int64(jsonStringEscapedLen(s)) + 2 // "v"
+		}
+		size += int64(len(vs) - 1) // 值间逗号
+	}
+	return size + 1 // 条目间逗号
+}
+
 // snapshotAuditHeaders 深拷贝请求/响应头并施加 64KiB 序列化上限（有界口径与
 // part C/E 一致）：先剥离客户端伪造的丢弃计数键，再按序列化体积降序丢条目
 // 直至落入上限，丢弃数写入合成键（摄取落库侧会把该计数并入自身裁剪计数）。
 // 尺寸估算用 jsonStringEscapedLen 精确计数（与 json.Marshal 逐字节一致，
 // 零分配字节扫描）——请求路径不再为每个 header key/value 付出一次
 // json.Marshal 的编码与分配。
-func snapshotAuditHeaders(hs map[string][]string) map[string][]string {
+//
+// 第二个返回值是该 map 的精确序列化字节数（含外层 `{}` 与条目逗号，恒为实际
+// 值的上界至多 1 字节）：入队字节预算直接引用它，不再按每条 header 的固定
+// 开销重估——固定开销在头部密集（几千条短 header）时会把约 70KiB 估成
+// ~350KiB，请求/响应两侧叠加即越过 auditItemMaxBytes 把整行丢弃。
+func snapshotAuditHeaders(hs map[string][]string) (map[string][]string, int64) {
 	if hs == nil {
-		return nil
+		return nil, 0
 	}
 	out := make(map[string][]string, len(hs))
 	type keySize struct {
 		key  string
-		size int
+		size int64
 	}
 	keys := make([]keySize, 0, len(hs))
-	total := 2 // 外层 {}
+	total := int64(2) // 外层 {}
 	for k, v := range hs {
 		if strings.EqualFold(k, auditSnapshotDroppedHeadersKey) {
 			continue // 客户端伪造的丢弃计数键一律剥离（写侧保留键）
 		}
 		vv := append([]string(nil), v...)
 		out[k] = vv
-		// "key":["v1","v2"] 的精确序列化字节数 + 冒号/逗号分隔。
-		size := jsonStringEscapedLen(k) + 3 // "key":
-		if len(vv) == 0 {
-			size += 2 // []
-		} else {
-			size += 2 // 两侧 []
-			for _, s := range vv {
-				size += jsonStringEscapedLen(s) + 2 // "v"
-			}
-			size += len(vv) - 1 // 值间逗号
-		}
-		size++ // 条目间逗号
+		size := auditHeaderEntrySerializedBytes(k, vv)
 		keys = append(keys, keySize{key: k, size: size})
 		total += size
 	}
 	if len(out) == 0 {
-		return nil
+		return nil, 0
 	}
 	if total <= auditHeadersMaxBytes {
-		return out
+		return out, total
 	}
 	sort.Slice(keys, func(i, j int) bool {
 		if keys[i].size != keys[j].size {
@@ -933,7 +950,7 @@ func snapshotAuditHeaders(hs map[string][]string) map[string][]string {
 		return keys[i].key < keys[j].key
 	})
 	// 丢弃标记键的精确形态开销（dropped 位数按 6 位上限预留）。
-	markerOverhead := len(`"_lb_dropped_headers":["000000"]`) + 1
+	markerOverhead := int64(len(`"_lb_dropped_headers":["000000"]`) + 1)
 	dropped := 0
 	for _, ks := range keys {
 		if total+markerOverhead <= auditHeadersMaxBytes {
@@ -943,8 +960,9 @@ func snapshotAuditHeaders(hs map[string][]string) map[string][]string {
 		total -= ks.size
 		dropped++
 	}
-	out[auditSnapshotDroppedHeadersKey] = []string{strconv.Itoa(dropped)}
-	return out
+	marker := strconv.Itoa(dropped)
+	out[auditSnapshotDroppedHeadersKey] = []string{marker}
+	return out, total + int64(len(`"_lb_dropped_headers":[""]`)+len(marker)+1)
 }
 
 // jsonStringEscapedLen 返回 s 经 encoding/json 字符串编码后的精确字节数
@@ -993,19 +1011,74 @@ func snapshotAuditLog(al plugintypes.AuditLog) *auditSnapshot {
 	// messages 写侧上限：条数 + 估算字节双门（与快照估算同口径）。超限不再
 	// 让整行撞 auditItemMaxBytes 被丢弃——保留高价值事务信息并把丢弃条数
 	// 显性记入 messages_dropped。
-	msgs := al.Messages()
-	s.Messages_ = make([]plugintypes.AuditLogMessage, 0, len(msgs))
-	var used int64
-	for _, m := range msgs {
-		size := estimateAuditMessageBytes(m)
-		if size > 0 && (len(s.Messages_) >= auditMessagesMaxEntries || used+size > auditMessagesMaxBytes) {
-			s.MessagesDropped_ = len(msgs) - len(s.Messages_)
+	s.Messages_, s.MessagesDropped_ = snapshotAuditMessages(al.Messages())
+	return s
+}
+
+// snapshotAuditMessages 按「掐中间、保两头」截断 messages：丢弃只发生在中间
+// 段，头部（攻击特征命中序列的前若干条）与尾部（CRS 评估汇总）都保留。
+//
+// 尾部固定保留不是可选优化：CRS 的 949xxx/959xxx 评估规则在 phase 4/5 运行，
+// 其 msg 携带事务累计总分（"Total Score: N"），异常分只从那里读；只保开头
+// 会把汇总消息丢掉，使命中规则多的请求分数归零（与 severityScale 分档冲突），
+// 且这类请求恰是审计价值最高的。尾部估算字节独立预算，评估消息（数十字节）
+// 不会挤压头部条目。
+func snapshotAuditMessages(msgs []plugintypes.AuditLogMessage) ([]plugintypes.AuditLogMessage, int) {
+	if len(msgs) == 0 {
+		return nil, 0
+	}
+	// 尾段：从末尾向前保留至多 auditMessagesTailEntries 条 / auditMessagesTailBytes
+	// 估算；评估汇总消息超出条数上限也继续收集（有上限，防单行串成条）。
+	tailStart := len(msgs)
+	var tailBytes int64
+	tailEntries := 0
+	for tailStart > 0 && tailEntries < auditMessagesTailEntries*2 {
+		m := msgs[tailStart-1]
+		eval := auditMessageIsEvaluation(m)
+		if !eval && tailEntries >= auditMessagesTailEntries {
 			break
 		}
-		s.Messages_ = append(s.Messages_, m)
-		used += size
+		size := estimateAuditMessageBytes(m)
+		if !eval && tailEntries > 0 && tailBytes+size > auditMessagesTailBytes {
+			break
+		}
+		tailBytes += size
+		tailEntries++
+		tailStart--
 	}
-	return s
+	// 头段：填满剩余条目/字节预算（总字节 = 头 + 尾 ≤ auditMessagesMaxBytes）。
+	headEntries := 0
+	var headBytes int64
+	headLimit := auditMessagesMaxEntries - tailEntries
+	if headLimit < 0 {
+		headLimit = 0
+	}
+	for headEntries < tailStart && headEntries < headLimit {
+		size := estimateAuditMessageBytes(msgs[headEntries])
+		if headBytes+size > auditMessagesMaxBytes-tailBytes {
+			break
+		}
+		headBytes += size
+		headEntries++
+	}
+	out := make([]plugintypes.AuditLogMessage, 0, headEntries+(len(msgs)-tailStart))
+	out = append(out, msgs[:headEntries]...)
+	out = append(out, msgs[tailStart:]...)
+	return out, tailStart - headEntries
+}
+
+// auditMessageIsEvaluation 判定 CRS 评估汇总消息（949xxx 入站/959xxx 出站）：
+// 异常分只从这类消息的 msg 文本里读，截断必须优先收纳在尾段。
+func auditMessageIsEvaluation(m plugintypes.AuditLogMessage) bool {
+	if isNilInterface(m) {
+		return false
+	}
+	data := m.Data()
+	if isNilInterface(data) {
+		return false
+	}
+	id := data.ID()
+	return (id >= 949000 && id <= 949999) || (id >= 959000 && id <= 959999)
 }
 
 func snapshotTransaction(tx plugintypes.AuditLogTransaction) *auditSnapshotTransaction {
@@ -1034,7 +1107,7 @@ func snapshotTransaction(tx plugintypes.AuditLogTransaction) *auditSnapshotTrans
 			ArgsStub:       struct{}{},
 		}
 		if hs := req.Headers(); hs != nil {
-			r.Headers_ = snapshotAuditHeaders(hs)
+			r.Headers_, r.HeadersBytes_ = snapshotAuditHeaders(hs)
 		}
 		for _, f := range req.Files() {
 			r.Files_ = append(r.Files_, auditSnapshotFile{Name_: f.Name(), Size_: f.Size(), Mime_: f.Mime()})
@@ -1053,7 +1126,7 @@ func snapshotTransaction(tx plugintypes.AuditLogTransaction) *auditSnapshotTrans
 			BodyTruncated_: respTruncated,
 		}
 		if hs := resp.Headers(); hs != nil {
-			q.Headers_ = snapshotAuditHeaders(hs)
+			q.Headers_, q.HeadersBytes_ = snapshotAuditHeaders(hs)
 		}
 		t.Response_ = q
 	}
@@ -1182,29 +1255,20 @@ type auditPipeline struct {
 	// formatErrors 是 formatter.Format 失败累计计数（独立侧车字段
 	// format_errors）：排障路径与 io_errors 完全不同（先查代码而非磁盘）。
 	formatErrors atomic.Uint64
-	// dropLogMu 保护丢弃告警节流状态（请求路径并发入队可见）。
-	dropLogMu    sync.Mutex
-	lastDropLog  time.Time
-	dropLogCount int
-	// ioErrMu 保护 IO 错误节流状态（drain 与其关闭路径并发可见）。
-	ioErrMu      sync.Mutex
-	lastIOErrLog time.Time
-	ioErrCount   int
-	// formatErrMu 保护格式化失败节流状态（与 IO 错误同族节流：首次立即记录，
-	// 其后每分钟至多一条，携带被抑制计数）。formatter 契约破裂会逐行失败，
-	// 不节流即刷屏。
-	formatErrMu      sync.Mutex
-	lastFormatErrLog time.Time
-	formatErrCount   int
+	// dropLog/ioErrLog/formatErrLog 是三类写侧失败告警的节流状态（单源
+	// auditLogThrottle：首次立即记录，其后每分钟至多一条并携带被抑制数）。
+	// 计数目标/日志缝/文案各不相同，但窗口与首报规则必须一致。
+	dropLog      auditLogThrottle
+	ioErrLog     auditLogThrottle
+	formatErrLog auditLogThrottle
 	// statsDirty 标记累计计数自上次写盘后是否变化；statsMu 保护写盘节流
 	// 状态（仅 drain goroutine 触碰，无需与请求路径互斥——计数是原子读）。
 	statsDirty     atomic.Bool
 	statsMu        sync.Mutex
 	lastStatsWrite time.Time
-	// lastStatsFailLog 是侧车写盘失败的节流留痕时间（statsMu 保护）：
-	// 磁盘满/目录只读时侧车双向失效（写不进也读不到），不留痕则写侧
-	// 丢弃/IO 计数对外恒 0、健康位假绿。
-	lastStatsFailLog time.Time
+	// statsFailLog 是侧车写盘失败的告警节流状态（磁盘满/目录只读时侧车双向
+	// 失效：写不进也读不到；不留痕则写侧丢弃/IO 计数对外恒 0、健康位假绿）。
+	statsFailLog auditLogThrottle
 }
 
 // auditWriterStatsSuffix 是写侧失败计数侧车文件名后缀（紧跟审计日志目标路径）。
@@ -1259,6 +1323,30 @@ var auditDropLogf = func(format string, args ...any) {
 	caddy.Log().Named("auditwriter").Sugar().Warnf(format, args...)
 }
 
+// auditLogThrottle 是写侧失败告警的单源节流状态：首次立即记录，其后每个
+// 窗口（minute）至多一条，并携带窗口内被抑制的次数。三个调用点（行丢弃/
+// 落盘 IO 错误/formatter 契约失败）的计数目标、日志缝与文案各不相同，
+// 但首报与节流规则必须一致——各写一份会让窗口/首报语义逐处漂移。
+type auditLogThrottle struct {
+	mu    sync.Mutex
+	last  time.Time
+	since int
+}
+
+// report 登记一次事件，返回本次被抑制数与是否应输出告警。首个事件恒记录。
+func (t *auditLogThrottle) report(now time.Time) (suppressed int, logNow bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.since++
+	suppressed = t.since - 1
+	logNow = t.last.IsZero() || now.Sub(t.last) >= time.Minute
+	if logNow {
+		t.last = now
+		t.since = 0
+	}
+	return suppressed, logNow
+}
+
 // reportIOError 记录落盘 IO 错误：首次立即记录，其后每分钟至多
 // 一条（携带被抑制计数），保证「静默丢行」不可能。错误不再只是被丢弃的
 // error 返回值——drain 侧旧实现 `_, _ = p.bw.Write(...)` 完全不可观测。
@@ -1269,17 +1357,7 @@ func (p *auditPipeline) reportIOError(op string, err error) {
 	// 累计计数（面板健康位消费）先于节流告警：告警被抑制也绝不丢计数。
 	p.ioErrors.Add(1)
 	p.statsDirty.Store(true)
-	p.ioErrMu.Lock()
-	now := time.Now()
-	p.ioErrCount++
-	suppressed := p.ioErrCount - 1
-	logNow := p.lastIOErrLog.IsZero() || now.Sub(p.lastIOErrLog) >= time.Minute
-	if logNow {
-		p.lastIOErrLog = now
-		p.ioErrCount = 0
-	}
-	p.ioErrMu.Unlock()
-	if logNow {
+	if suppressed, logNow := p.ioErrLog.report(time.Now()); logNow {
 		auditIOLogf("audit writer: %s failed for %s (suppressed %d since last report): %v", op, p.target, suppressed, err)
 	}
 }
@@ -1293,17 +1371,7 @@ func (p *auditPipeline) reportFormatError(err error) {
 	}
 	p.formatErrors.Add(1)
 	p.statsDirty.Store(true)
-	p.formatErrMu.Lock()
-	now := time.Now()
-	p.formatErrCount++
-	suppressed := p.formatErrCount - 1
-	logNow := p.lastFormatErrLog.IsZero() || now.Sub(p.lastFormatErrLog) >= time.Minute
-	if logNow {
-		p.lastFormatErrLog = now
-		p.formatErrCount = 0
-	}
-	p.formatErrMu.Unlock()
-	if logNow {
+	if suppressed, logNow := p.formatErrLog.report(time.Now()); logNow {
 		auditDropLogf("audit writer: format failed for %s (suppressed %d since last report): %v", p.target, suppressed, err)
 	}
 }
@@ -1394,6 +1462,11 @@ func acquireAuditPipeline(target string, mode os.FileMode) (*auditPipeline, erro
 	if err := p.openFile(mode); err != nil {
 		return nil, err
 	}
+	// 新进程的计数从 0 起：盘上残留的失败标记描述的是上一代进程的故障，对本代
+	// 无效（读侧另有按标记内时间做的代际判定）。不清除会让「上次故障 + 本代
+	// 计数无变化」的部署永久显示写侧不可用——侧车只在计数变化时写盘，本代无
+	// 失败即无写盘，标记永远不会被成功路径删除。
+	p.clearWriterStatsFailure()
 	auditPipelines[target] = p
 	go p.drain()
 	return p, nil
@@ -1413,15 +1486,16 @@ func (p *auditPipeline) openFile(mode os.FileMode) error {
 }
 
 // 快照字节估算的固定开销项：估算 = 内容字节（len 求和，常数级、零分配）
-// + JSON 语法与容器驻留开销。各项按上界取整（map/slice 桶头 + 引号/冒号/
-// 括号/逗号），使 header 密集、多文件、多 messages 形态的估算不低于实际
-// 序列化字节——enqueue 按估算执法字节预算，低估即意味着实际驻留可突破
-// auditQueueByteBudget 数倍（旧实现只累加 len()）。
+// + JSON 语法与容器驻留开销。各项按上界取整（slice 桶头 + 引号/冒号/括号/
+// 逗号），使多文件、多 messages 形态的估算不低于实际序列化字节——enqueue 按
+// 估算执法字节预算，低估即意味着实际驻留可突破 auditQueueByteBudget 数倍
+// （旧实现只累加 len()）。header 段不走固定开销：快照侧已算出精确序列化字节
+// （HeadersBytes_），只在手工构造的快照上按同一 jsonStringEscapedLen 口径现算。
 const (
-	// 每个 header 键：map 桶驻留头（≈40B）+ `"k":[` 与条目逗号。
-	auditHeaderKeyOverhead = 48
-	// 每个 header 值：slice 元素头 + `"v",`。
-	auditHeaderValueOverhead = 16
+	// 每个 message tag：slice 元素头 + `"tag",`。header 不再按条固定开销
+	// 估算——快照侧已算出精确序列化字节（HeadersBytes_），按 48/16 逐条累加
+	// 在头部密集形态下会把 70KiB 的 header 表估成 ~350KiB。
+	auditTagEntryOverhead = 16
 	// 每个上传文件条目：`{"name":"…","size":N,"mime":"…"},` + 结构体驻留。
 	auditFileEntryOverhead = 96
 	// 每条 message：键名/数字字段/tags 语法 + slice 元素与 RuleMatch 驻留；
@@ -1431,9 +1505,17 @@ const (
 	// 四段（请求/响应体与头，各 64KiB）+ 固定开销后仅剩 ~65KiB 余量，约 70-80
 	// 条规则命中即触发 auditItemMaxBytes 整行丢弃——丢的恰是「命中规则多」的
 	// 高价值行。写侧先截断 messages 并标记 messages_dropped，保留整行；
-	// auditItemMaxBytes 仍是兜底（真超限才丢行）。
+	// auditItemMaxBytes 仍是兜底（真超限才丢行）。截断方向是「掐中间、保两头」
+	// （见 snapshotAuditMessages）：尾部承载 CRS 评估汇总（949xxx/959xxx，异常
+	// 分的唯一来源），只保开头会让高分请求的分数归零。
 	auditMessagesMaxEntries = 64
 	auditMessagesMaxBytes   = 32 * 1024
+	// auditMessagesTailEntries / auditMessagesTailBytes 是尾段保留预算：
+	// 评估汇总消息位于消息序列末尾，条数按「4 条评估 × 相位数 + 余量」取 8，
+	// 字节预算独立（评估消息仅数十字节），避免尾段挤压头部攻击特征条目。
+	// 评估族消息超出条数上限仍继续收纳，硬上限为条数的 2 倍。
+	auditMessagesTailEntries = 8
+	auditMessagesTailBytes   = 8 * 1024
 	// 快照骨架：transaction/request/response/producer 的固定键名与 envelope。
 	auditSnapshotFixedBytes = 512
 )
@@ -1457,26 +1539,33 @@ func estimateAuditMessageBytes(m plugintypes.AuditLogMessage) int64 {
 		n += int64(len(d.File()) + len(d.Rev()) + len(d.Msg()) + len(d.Data()) +
 			len(d.Ver()) + len(d.Raw()))
 		for _, tag := range d.Tags() {
-			n += int64(len(tag)) + auditHeaderValueOverhead
+			n += int64(len(tag)) + auditTagEntryOverhead
 		}
 	}
 	return n
 }
 
 // estimateAuditSnapshotBytes 估算快照驻留字节（请求路径可付：只做 len 求和
-// 与固定开销累加，无分配、无序列化）。口径见上方常量：内容 + 语法/容器
-// 固定开销，对 header/文件/messages 条目数是保守上界。
+// 与固定开销累加，零分配）。口径见上方常量：内容 + 语法/容器固定开销，对
+// 文件/messages 条目数是保守上界；header 段直接用快照侧已算出的精确序列化
+// 字节（HeadersBytes_），不再按条固定开销重估——后者在头部密集时高估数倍，
+// 会把实际 ~131KiB 的双向 header 表估成 ~700KiB 并越过单条上限整行丢弃。
 func estimateAuditSnapshotBytes(s *auditSnapshot) int64 {
 	if s == nil {
 		return 0
 	}
-	headerBytes := func(hs map[string][]string) int64 {
-		var n int64
+	// 兜底形态（快照未携带精确字节：仅手工构造/测试）按同一 jsonStringEscapedLen
+	// 口径现算，仍为零分配扫描且不低于实际序列化体积。
+	headerBytes := func(hs map[string][]string, exact int64) int64 {
+		if exact > 0 {
+			return exact
+		}
+		if hs == nil {
+			return 0
+		}
+		n := int64(2) // 外层 {}
 		for k, vs := range hs {
-			n += int64(len(k)) + auditHeaderKeyOverhead
-			for _, v := range vs {
-				n += int64(len(v)) + auditHeaderValueOverhead
-			}
+			n += auditHeaderEntrySerializedBytes(k, vs)
 		}
 		return n
 	}
@@ -1486,7 +1575,7 @@ func estimateAuditSnapshotBytes(s *auditSnapshot) int64 {
 		len(t.ServerID_) + len(t.HighestSeverity_))
 	if r := t.Request_; r != nil {
 		n += int64(len(r.Method_) + len(r.Protocol_) + len(r.URI_) + len(r.HTTPVersion_) + len(r.Body_))
-		n += headerBytes(r.Headers_)
+		n += headerBytes(r.Headers_, r.HeadersBytes_)
 		for _, f := range r.Files_ {
 			n += auditFileEntryOverhead
 			if isNilInterface(f) {
@@ -1497,7 +1586,7 @@ func estimateAuditSnapshotBytes(s *auditSnapshot) int64 {
 	}
 	if q := t.Response_; q != nil {
 		n += int64(len(q.Protocol_) + len(q.Body_))
-		n += headerBytes(q.Headers_)
+		n += headerBytes(q.Headers_, q.HeadersBytes_)
 	}
 	if pr := t.Producer_; pr != nil {
 		n += int64(len(pr.Connector_) + len(pr.Version_) + len(pr.Server_) + len(pr.RuleEngine_) + len(pr.Stopwatch_))
@@ -1558,16 +1647,7 @@ func (p *auditPipeline) enqueue(item lbAuditItem) {
 func (p *auditPipeline) reportDropped(reason string) {
 	total := p.dropped.Add(1)
 	p.statsDirty.Store(true)
-	p.dropLogMu.Lock()
-	now := time.Now()
-	p.dropLogCount++
-	suppressed := p.dropLogCount - 1
-	logNow := p.lastDropLog.IsZero() || now.Sub(p.lastDropLog) >= time.Minute
-	if logNow {
-		p.lastDropLog = now
-		p.dropLogCount = 0
-	}
-	p.dropLogMu.Unlock()
+	suppressed, logNow := p.dropLog.report(time.Now())
 	if logNow {
 		auditDropLogf("audit writer: %s for %s, dropped audit line (total dropped %d, suppressed %d since last report)", reason, p.target, total, suppressed)
 	}
@@ -1651,12 +1731,11 @@ func (p *auditPipeline) writeWriterStatsIfDue(now time.Time) {
 }
 
 // logStatsWriteFailureLocked 侧车写盘失败节流留痕（调用方已持 statsMu，
-// 每分钟至多一条；与 reportIOError 的节流口径同族）。
+// 每分钟至多一条；与其余写侧失败告警共用 auditLogThrottle 的窗口语义）。
 func (p *auditPipeline) logStatsWriteFailureLocked(now time.Time, err error) {
-	if !p.lastStatsFailLog.IsZero() && now.Sub(p.lastStatsFailLog) < time.Minute {
+	if _, logNow := p.statsFailLog.report(now); !logNow {
 		return
 	}
-	p.lastStatsFailLog = now
 	auditIOLogf("audit writer: writer-stats sidecar write failed for %s (writer counters unavailable to panel until retry succeeds): %v", p.target, err)
 }
 

@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { buildCaddyConfigPayload } from '../src/utils/caddyConfigPayload.ts'
-import { section, source } from './_helpers.ts'
+import { code, section, source, repoCode } from './_helpers.ts'
 
 // 关闭「自定义 JSON」时后端的跨字段门（internal/handlers/caddy.go
 // resolveAccessLogFormatGate）：json=false 且请求显式携带非空格式 → 400；
@@ -57,10 +57,27 @@ test('白名单外的键不会泄露进载荷（兄弟卡片未保存编辑不�
 
 test('视图消费单源：载荷经统一组装，清空语义进确认框且与开关提示同口径', () => {
   const card = source('src/views/settings/CaddyGlobalSettings.vue')
-  const save = section(card, 'const handleSave = async', 'const handleReloadCaddy')
+  const save = section(code('src/views/settings/CaddyGlobalSettings.vue'), 'const handleSave = async', 'const handleReloadCaddy')
   assert.match(save, /buildCaddyConfigPayload\(settings\.value, CADDY_CONFIG_KEYS\)/)
   assert.doesNotMatch(save, /Object\.fromEntries\(CADDY_CONFIG_KEYS/, '不得保留第二处白名单展开')
   assert.match(save, /accessLogFormatCleared/, '确认框必须消费清空标记')
   assert.match(save, /库中自定义字段映射将被清空/)
   assert.match(card, /关闭后保存会清空已配置的自定义字段映射/, '开关提示与确认框同口径')
+})
+
+// 跨栈对表：前端载荷语义（剔除格式键 / 保留空串 / 开启时原样）预测的是后端
+// resolveAccessLogFormatGate 的判定顺序。此前该契约只写在注释里——后端改判定
+// 顺序时前端 6 条用例全绿，用户却会在保存时收到 400。
+test('跨栈对表：后端 access_log 跨字段门仍与前端载荷语义一致', () => {
+  const go = repoCode('internal/handlers/caddy.go')
+  const gate = section(go, 'func resolveAccessLogFormatGate(', 'func (h *Handlers) PreviewConfigUpdate(')
+  assert.match(gate, /effectiveAccessLogJSON := old\.AccessLogJSON/, '未显式携带时按存量生效值判定')
+  assert.match(gate, /if effectiveAccessLogJSON \{/, 'json=true 无门')
+  assert.match(gate, /strings\.TrimSpace\(\*req\.AccessLogFormat\) != ""/, '显式非空格式必须报错（前端因此剔除键）')
+  assert.match(gate, /storedFormat := old\.AccessLogFormat/)
+  assert.match(gate, /req\.AccessLogFormat = &emptyFormat/, 'json=false 且有存量/显式格式时净空')
+  assert.match(gate, /return true, nil/)
+  // 保存与预览共用同一门：只在一侧归一会让预览对「保存必 400」的载荷放行。
+  const calls = go.match(/resolveAccessLogFormatGate\(&req, old\)/g) ?? []
+  assert.equal(calls.length, 2, '保存与预览都必须经同一跨字段门')
 })

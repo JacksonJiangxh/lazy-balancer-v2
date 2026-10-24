@@ -47,12 +47,16 @@ type TaskInfo struct {
 	// RoleApplicable 本节点角色是否允许该任务运行（服务端派生，不暴露原始
 	// 角色值）。从节点上 master-only 族的 LoopOn/NextRunAt 仍是主节点语义的
 	// 值——视图据此标注「仅主节点运行」并解释调度开关不可用。
-	RoleApplicable bool         `json:"role_applicable"`
-	LastRun        *TaskRunInfo `json:"last_run,omitempty"`
-	NextRunAt      string       `json:"next_run_at,omitempty"`
-	Runs24h        int          `json:"runs_24h"`
-	Success24h     int          `json:"success_24h"`
-	Fail24h        int          `json:"fail_24h"`
+	RoleApplicable bool `json:"role_applicable"`
+	// ScheduleStoppedReason 引擎自行停止调度的来源标记（taskengine.
+	// ScheduleStopReason*），空=非引擎停调。业务驱动任务的调度开关在本页只读，
+	// 视图据此把「引擎停调」与「用户关闭业务开关」分开呈现并指向业务页恢复入口。
+	ScheduleStoppedReason string       `json:"schedule_stopped_reason,omitempty"`
+	LastRun               *TaskRunInfo `json:"last_run,omitempty"`
+	NextRunAt             string       `json:"next_run_at,omitempty"`
+	Runs24h               int          `json:"runs_24h"`
+	Success24h            int          `json:"success_24h"`
+	Fail24h               int          `json:"fail_24h"`
 }
 
 // TaskRunInfo 最近一次运行。
@@ -235,7 +239,8 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 			Category: m.Category, Kind: m.Kind,
 			Controllable: m.Controllable, Cancellable: m.Cancelable, Triggerable: m.CanTrigger,
 			LoopOn: m.LoopOn, BusinessDriven: IsBusinessDrivenTask(m.ID),
-			RoleApplicable: m.RoleApplicable,
+			RoleApplicable:        m.RoleApplicable,
+			ScheduleStoppedReason: m.ScheduleStoppedReason,
 		}
 		// 节奏：循环=间隔，定时=排程槽，常驻=自管理，触发=手动
 		switch m.Kind {
@@ -312,7 +317,7 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 					// 年龄门只覆盖「刚写入」的行，终态写失败的行一定会变老。
 					if m.Running {
 						ti.Status = TaskStatusRunning
-					} else if !staleRunningResidual(latestRun.StartedAt) {
+					} else if !taskengine.StaleRunningResidual(latestRun.StartedAt) {
 						ti.Status = TaskStatusRunning
 					} else {
 						ti.Status = TaskStatusFailed
@@ -321,9 +326,15 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 				}
 			}
 		}
-		// 下一槽：定时=NextSlotFn（声明式）；循环=last+interval 兜底
-		ti.NextRunAt = m.NextSlot
-		if m.ID == "cert-waiting-ca" && db.DB != nil {
+		// 下一槽：定时=NextSlotFn（声明式）；循环=last+interval 兜底。
+		// 角色门覆盖**全部**来源（不只下方周期族的兜底推算）：NextSlotFn 纯读
+		// 本地库，从节点的槽值来自主端快照，不门控就恒有值——同一响应里
+		// role_applicable=false 与具体执行时刻并存，直接消费 /system/tasks 的
+		// 脚本会据此排程而实际永不投递。UI 另行遮蔽不构成 API 契约。
+		if m.RoleApplicable {
+			ti.NextRunAt = m.NextSlot
+		}
+		if m.ID == "cert-waiting-ca" && m.RoleApplicable && db.DB != nil {
 			// 仅展示「下次 CA 可用时间」，不参与 Periodic 调度；Descriptor 不再携带
 			// Scheduled 专用 NextSlotFn。
 			var at string
@@ -381,21 +392,12 @@ func collectEngineFamilies(te *taskengine.Engine) []TaskInfo {
 	return out
 }
 
-// staleRunningGrace / staleRunInterruptedMessage / staleRunningResidual 全部委托
-// 引擎单源（taskengine.StaleRunningGrace / StaleRunInterruptedMessage /
-// StaleRunningResidual）：历史与最近运行（Engine.History/LatestRun）已内置同一
-// 归一，列表侧（RunOverview 批量行 + DescribeAll 内存快照）在此用同一判定呈现
-// 失败/已中断——同一 run 不得在两个端点给出相反结论。
-const (
-	staleRunningGrace          = taskengine.StaleRunningGrace
-	staleRunInterruptedMessage = taskengine.StaleRunInterruptedMessage
-)
-
-// staleRunningResidual 判定「库行 running」是否为残留（本进程已无在途执行且行
-// 年龄超过瞬态宽限）。调用方先自行确认本进程无在途执行。
-func staleRunningResidual(startedAt string) bool {
-	return taskengine.StaleRunningResidual(startedAt)
-}
+// staleRunInterruptedMessage 委托引擎单源（taskengine.StaleRunInterruptedMessage）：
+// 历史与最近运行（Engine.History/LatestRun）已内置同一归一，列表侧（RunOverview
+// 批量行 + DescribeAll 内存快照）用同一文案呈现失败/已中断——同一 run 不得在两个
+// 端点给出相反结论。残留判定与年龄门直接调用 taskengine.StaleRunningResidual
+// （无可本地状态），不在本包保留第二套常量/包装。
+const staleRunInterruptedMessage = taskengine.StaleRunInterruptedMessage
 
 func humanInterval(sec int) string {
 	switch {

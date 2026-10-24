@@ -226,6 +226,12 @@ func (h *Handlers) CancelSystemTask(c *gin.Context) {
 	}
 	// 取消与 Trigger/Toggle/Control 共用集群写门；引擎 RunsOn 另管执行角色。
 	if te := services.TaskEngine(); te != nil {
+		// 已停止引擎：Cancel 恒 false，409「任务未在运行」会把「引擎已停止」
+		// 误报成任务状态问题——与 toggle/control 同口径统一 503。
+		if te.IsStopped() {
+			respondTaskEngineStopped(c)
+			return
+		}
 		if _, ok := te.Lookup(id); !ok {
 			c.JSON(http.StatusNotFound, models.APIResponse{Code: 404, Message: "任务不存在"})
 			return

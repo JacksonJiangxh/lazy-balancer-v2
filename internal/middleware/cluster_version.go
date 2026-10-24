@@ -307,6 +307,24 @@ var clusterVersionRuntimeColumns = map[string]map[string]bool{
 	),
 }
 
+// updateOfColumns 返回 UPDATE 触发器的 OF 列（快照列逐一过滤掉
+// clusterVersionRuntimeColumns 登记的运行态/簿记列）。逐列集合判定而非
+// 位置敏感的子串裁剪：旧实现 strings.Replace(",last_checked","",1) 在列排到
+// 清单首位时静默失效（子串不存在），OF 列表会重新包含运行态列。
+func updateOfColumns(table clusterSyncedTable) []string {
+	runtimeCols := clusterVersionRuntimeColumns[table.name]
+	columns := strings.Split(table.snapshotColumns, ",")
+	kept := make([]string, 0, len(columns))
+	for _, column := range columns {
+		column = strings.TrimSpace(column)
+		if column == "" || runtimeCols[column] {
+			continue
+		}
+		kept = append(kept, column)
+	}
+	return kept
+}
+
 // InstallClusterVersionTriggers 安装/替换全部集群版本触发器（幂等 DDL：
 // DROP IF EXISTS + CREATE IF NOT EXISTS）。
 //
@@ -353,21 +371,12 @@ func InstallClusterVersionTriggers(database *sql.DB) error {
 			// 历史库 NULL 行两层判定不再分裂（写闸放行写、触发器却不 bump 版本）。
 			whenClause := "(SELECT COALESCE(is_master,1) FROM global_config WHERE id=1)=1"
 			if operation == "UPDATE" {
-				// CL-新1:last_checked 是读路径指标(页面浏览即写),
-				// 入 OF 列表会使 CRS/IP2Region 页面浏览触发集群级全量重放+
-				// 各从节点强制 Caddy 重载,从触发列排除。
-				// threat 源的 consecutive_failures 同法排除
-				// ——纯运行态失败计数(failSourceRow 每次失败独立 UPDATE +1),
-				// 入列会使源持续不可达期间每轮失败写都 bump 版本引发全集群快照
-				// 重放;失败路径的状态列(update_status/message/finished_at)仍在
-				// OF 内,真实状态变更照常传播,快照 dump 亦恒携带最新计数值。
-				ofColumns := table.snapshotColumns
-				if table.name == "security_crs_version" || table.name == "security_ip2region_version" || table.name == "security_threat_sources" || table.name == "security_crawler_sources" {
-					ofColumns = strings.Replace(ofColumns, ",last_checked", "", 1)
-				}
-				if table.name == "security_threat_sources" || table.name == "security_crawler_sources" {
-					ofColumns = strings.Replace(ofColumns, ",consecutive_failures", "", 1)
-				}
+				// 运行态/簿记列一律排除在 OF 之外（单源：clusterVersionRuntimeColumns）。
+				// SQLite 的 UPDATE OF 只要列出现在 SET 即触发（与值是否变化无关），
+				// 这些列每轮例行检查都写，入 OF 会让 304 门失效、从节点反复拉取
+				// 整包快照并重写表。同时下方值变化守卫也排除同一集合，两处
+				// 不再各写一份（旧实现用位置敏感的子串裁剪，列排到首位即静默失效）。
+				ofColumns := strings.Join(updateOfColumns(table), ",")
 				operationClause += " OF " + ofColumns
 			}
 			// users 表值变化守卫——登录热路径同值写
@@ -396,13 +405,10 @@ func InstallClusterVersionTriggers(database *sql.DB) error {
 			// format/开关等影响从端行为与数据的列变化照常 bump；纯运行态/展示态
 			// 列变化不 bump（从端展示陈旧至下次语义变化，快照 dump 恒携带最新值）。
 			if runtimeCols := clusterVersionRuntimeColumns[table.name]; runtimeCols != nil && operation == "UPDATE" {
-				cols := strings.Split(table.snapshotColumns, ",")
+				// 与 OF 排除集合共用 updateOfColumns 的过滤结果（单一来源）。
+				cols := updateOfColumns(table)
 				valueChange := make([]string, 0, len(cols))
 				for _, col := range cols {
-					col = strings.TrimSpace(col)
-					if runtimeCols[col] {
-						continue
-					}
 					valueChange = append(valueChange, fmt.Sprintf("OLD.%s IS NOT NEW.%s", col, col))
 				}
 				whenClause += " AND (" + strings.Join(valueChange, " OR ") + ")"

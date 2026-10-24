@@ -59,7 +59,7 @@ func TestRuntimeLifecycle_ShutdownGatesLaterStarts(t *testing.T) {
 	lifecycle.StartSync()
 	lifecycle.StartSync() // 重复启动由 worker 自身幂等，此处只断言生命周期门
 
-	lifecycle.Shutdown()
+	shutdownForTest(lifecycle)
 	if got := worker.stops.Load(); got != 1 {
 		t.Fatalf("StopSync invocations=%d, want 1", got)
 	}
@@ -68,7 +68,7 @@ func TestRuntimeLifecycle_ShutdownGatesLaterStarts(t *testing.T) {
 	if got := worker.starts.Load(); got != 2 {
 		t.Fatalf("StartSync after Shutdown must be a no-op: starts=%d (before shutdown=2)", got)
 	}
-	lifecycle.Shutdown() // 幂等
+	shutdownForTest(lifecycle) // 幂等
 	if got := worker.stops.Load(); got != 1 {
 		t.Fatalf("second Shutdown must not stop again: stops=%d", got)
 	}
@@ -285,4 +285,94 @@ func TestRuntimeLifecycle_ShutdownSyncStopIsSingleFlight(t *testing.T) {
 	}
 	worker.releaseNow() // 放行后弃留的 daemon 收尾才会返回
 	<-daemonDone
+}
+
+// shutdownForTest 是固定预算的关停辅助（同包测试可访问未导出符号）：产品
+// 文件只保留 ShutdownWithTimeout 的预算派生入口——固定预算调用若进产品符号
+// 表，会被误当生产入口而绕过 shutdown.segment() 的预算切分。
+func shutdownForTest(l *runtimeLifecycle) { l.ShutdownWithTimeout(acmeStopSegmentMax) }
+
+// 关停预算的「段内锁等待」必须同样有界：并发停止长期持有证书启停互斥时，
+// ShutdownWithTimeout 不得无界阻塞在锁上——否则最坏关停墙钟 =
+// 25s + 一个停止预算，正好等于 compose stop_grace_period，设计余量归零。
+func TestShutdownWithTimeout_lockWaitCountsAgainstBudget(t *testing.T) {
+	lifecycle := newRuntimeLifecycle(idleSyncWorker{}, func() lifecycleWorker {
+		return &blockingCertificateWorker{stop: make(chan struct{}), exited: make(chan struct{})}
+	})
+	// 模拟并发 StopACME 长期持有证书启停互斥。
+	if !lifecycle.acquireACMEOps(time.Second) {
+		t.Fatal("测试用启停互斥获取失败")
+	}
+	t.Cleanup(lifecycle.releaseACMEOps)
+
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		lifecycle.ShutdownWithTimeout(50 * time.Millisecond)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ShutdownWithTimeout 在证书启停锁上无界等待（段内锁等待未计入关停预算）")
+	}
+}
+
+// 在途停止句柄不得被后续停止覆写：第二个停止若用自己的 finished 覆盖
+// acmeStopDone，其快速完成会让 StartACME 误判前一个停止（仍在 PauseAndDrain
+// 旧队列）也已收尾而拉起新一代。
+func TestStopACME_keepsInFlightStopHandle(t *testing.T) {
+	second := newStubLifecycleWorker()
+	lifecycle := newRuntimeLifecycle(idleSyncWorker{}, func() lifecycleWorker { return second })
+
+	inFlight := make(chan struct{})
+	lifecycle.mu.Lock()
+	lifecycle.acmeStopDone = inFlight
+	lifecycle.mu.Unlock()
+	var releaseOnce sync.Once
+	releaseInFlight := func() {
+		releaseOnce.Do(func() {
+			lifecycle.mu.Lock()
+			if lifecycle.acmeStopDone == inFlight {
+				lifecycle.acmeStopDone = nil
+			}
+			lifecycle.mu.Unlock()
+			close(inFlight)
+		})
+	}
+	t.Cleanup(releaseInFlight)
+
+	// 第二次停止：本代无 worker，但有一个已完成的 done 句柄——旧实现会为它
+	// 登记新一代 finished 并在快速完成后清空跟踪字段。
+	settled := make(chan struct{})
+	close(settled)
+	lifecycle.mu.Lock()
+	lifecycle.certDone = settled
+	lifecycle.mu.Unlock()
+	lifecycle.stopACMEWithin(20 * time.Millisecond)
+
+	lifecycle.mu.Lock()
+	tracked := lifecycle.acmeStopDone
+	lifecycle.mu.Unlock()
+	if tracked != inFlight {
+		t.Fatal("后续停止覆写了在途停止句柄——StartACME 会观测到错误的收尾信号")
+	}
+
+	// And 在途停止收尾前 StartACME 必须等待（不得立即装配新一代）。
+	startReturned := make(chan struct{})
+	go func() {
+		defer close(startReturned)
+		lifecycle.StartACME()
+	}()
+	select {
+	case <-second.started:
+		t.Fatal("在途停止未收尾时启动了新一代——在途 Stop 会关闭新队列")
+	case <-time.After(150 * time.Millisecond):
+	}
+	releaseInFlight()
+	select {
+	case <-second.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("在途停止收尾后新一代仍未启动")
+	}
+	<-startReturned
 }

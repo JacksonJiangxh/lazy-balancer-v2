@@ -229,11 +229,20 @@ func TestPreferredInterfaceIP_prefersIPv4ThenGlobalIPv6(t *testing.T) {
 }
 
 // 出口 IP 探测失败时 system info 不得把回环地址当机器地址展示。
+// 用注入缝构造失败形态：无默认路由的容器才会自然发生，开发机/CI 恒有默认
+// 路由——不注入则该保护分支零自动化覆盖（旧用例在有路由的机器上直接 Skip）。
 func TestGetOutboundIP_emptyWhenProbeFails(t *testing.T) {
-	if ip, ok := dialOutboundIP(); ok {
-		t.Skipf("本机有默认路由（%s），无法构造探测失败形态", ip)
-	}
+	old := dialOutboundIPFn
+	t.Cleanup(func() { dialOutboundIPFn = old })
+
+	dialOutboundIPFn = func() (string, bool) { return "127.0.0.1", false }
 	if ip := getOutboundIP(); ip != "" {
 		t.Fatalf("ip=%q, want 空串（探测失败不得回显 127.0.0.1）", ip)
+	}
+
+	// 回归形状：探测成功时原样返回探测值。
+	dialOutboundIPFn = func() (string, bool) { return "192.0.2.10", true }
+	if ip := getOutboundIP(); ip != "192.0.2.10" {
+		t.Fatalf("ip=%q, want 192.0.2.10（成功路径不得被缝改变）", ip)
 	}
 }

@@ -81,7 +81,11 @@ export const useLogStorageStats = (options: {
     ([nextTarget]) => {
       if (nextTarget !== lastTargetKey) {
         lastTargetKey = nextTarget
+        // 换行 = 上一条日志的一切展示状态都过期：值与错误位一起清空。
+        // 只清值会让新行取数期间顶着上一行的「统计暂不可用」提示
+        // （失败位原本只在成功/失败回包时改写）。
         info.value = null
+        error.value = null
       }
       void loadStats()
     },

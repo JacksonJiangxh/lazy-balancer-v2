@@ -9,7 +9,7 @@ import assert from 'node:assert/strict'
 import { readdirSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
-import { calls, resetCalls, STUB_ELEMENT, STUB_SAVE_RESULT_DEPS, type StubCall } from './_stubs.ts'
+import { calls, resetCalls, EL_MESSAGE_METHODS, STUB_ELEMENT, STUB_SAVE_RESULT_DEPS, type StubCall } from './_stubs.ts'
 import { source } from './_helpers.ts'
 
 const webRoot = new URL('../', import.meta.url)
@@ -26,18 +26,29 @@ test('index.html 保留挂载点、入口脚本与首帧标题（否则运行期
   assert.match(branding, /document\.title = `\$\{appName\.value\} V2`/, '运行期标题必须同形')
 })
 
-test('每个 spec 都含 test( 与 assert（防空用例文件混入）', () => {
+test('每个 spec 都含 test( 与 assert（防空用例文件混入，递归扫描子目录）', () => {
   const specDir = fileURLToPath(new URL('./', import.meta.url))
+  // runner 的 glob 是 `tests/**/*.spec.ts`：单层 readdirSync 会让子目录里的新
+  // spec 绕过本守卫（被 runner 执行但从未被检查）。
+  const files = (readdirSync(specDir, { recursive: true }) as string[])
+    .filter((name) => name.endsWith('.spec.ts'))
+    .sort()
+  assert.ok(files.length > 50, `递归扫描必须看到全部 spec（实际 ${files.length} 个）`)
   const offenders: string[] = []
-  for (const name of readdirSync(specDir)) {
-    if (!name.endsWith('.spec.ts')) continue
+  for (const name of files) {
     const text = readFileSync(`${specDir}${name}`, 'utf8')
-    if (!/\btest\(/.test(text) || !/\bassert[.(]/.test(text)) offenders.push(name)
+    // 可量化口径：顶层用例数与断言数。注释里的 `test(` 不在行首、注释里的
+    // `assert.` 仍会被计入（偏宽松）；断言数少于用例数则必然存在无用例。
+    const testCount = (text.match(/^test\(/gm) ?? []).length
+    const assertCount = (text.match(/\bassert\./g) ?? []).length
+    if (testCount === 0 || assertCount < testCount) {
+      offenders.push(`${name}（test=${testCount}，assert=${assertCount}）`)
+    }
   }
-  assert.deepEqual(offenders, [], '空 spec（无 test/assert）不得入库')
+  assert.deepEqual(offenders, [], '空 spec / 断言少于用例数的文件不得入库')
 })
 
-test('_stubs 两处 ElMessage 替身共用同一契约（可调用 + 同名记录）', async () => {
+test('_stubs 两处 ElMessage 替身共用同一契约（可调用 + 方法集同源）', async () => {
   const g = globalThis as unknown as { __calls?: StubCall[] }
   const previous = g.__calls
   g.__calls = calls
@@ -45,20 +56,36 @@ test('_stubs 两处 ElMessage 替身共用同一契约（可调用 + 同名记�
   try {
     // 测试本身即在验证「data: 模块替身」的加载边界（静态 import 无法加载
     // 运行时拼接的 data: URL），故此处必须用动态 import。
-    const saveDeps = (await import(STUB_SAVE_RESULT_DEPS)) as { ElMessage: (arg: string) => void }
+    const saveDeps = (await import(STUB_SAVE_RESULT_DEPS)) as {
+      ElMessage: ((arg: string) => void) & Record<string, unknown>
+    }
     const element = (await import(STUB_ELEMENT)) as {
-      ElMessage: ((arg: string) => void) & { info: (arg: string) => void; error: (arg: string) => void; success: (arg: string) => void }
+      ElMessage: ((arg: string) => void) & Record<string, unknown>
     }
     assert.equal(typeof saveDeps.ElMessage, 'function', 'saveResult 替身的 ElMessage 必须可调用（真实 API 同形）')
     assert.equal(typeof element.ElMessage, 'function', 'element 替身的 ElMessage 必须可调用')
+    // 方法集必须逐项相同：两份替身各自漂移时（如只给一份加 warning）此前全绿。
+    assert.deepEqual(
+      Object.keys(saveDeps.ElMessage).sort(),
+      Object.keys(element.ElMessage).sort(),
+      '两处替身的 ElMessage 方法集必须一致',
+    )
+    assert.deepEqual(
+      Object.keys(element.ElMessage).sort(),
+      [...EL_MESSAGE_METHODS].sort(),
+      '替身方法集必须来自单源清单（新增调用面只改 EL_MESSAGE_METHODS）',
+    )
     saveDeps.ElMessage('a')
     element.ElMessage('b')
-    element.ElMessage.info('c')
-    assert.deepEqual(
-      calls.map((call) => call.fn),
-      ['ElMessage', 'ElMessage', 'ElMessage.info'],
-      '两处替身记录的函数名必须一致（新增 ElMessage.warning 等调用时各自漂移即红）',
-    )
+    for (const method of EL_MESSAGE_METHODS) {
+      (element.ElMessage[method] as (arg: string) => void)('x')
+      ;(saveDeps.ElMessage[method] as (arg: string) => void)('x')
+    }
+    const recorded = calls.map((call) => call.fn)
+    for (const method of EL_MESSAGE_METHODS) {
+      assert.ok(recorded.includes(`ElMessage.${method}`), `两处替身都必须记录 ElMessage.${method}`)
+    }
+    assert.equal(recorded.filter((fn) => fn === 'ElMessage').length, 2, '可调用形态各一次')
   } finally {
     g.__calls = previous
   }

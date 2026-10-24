@@ -184,4 +184,26 @@ if ! grep -q 'BULK_EDIT_RANGE 显式范围' /tmp/bulk-range-out.out; then
   echo "SELFTEST FAIL: 显式范围命中原因未标注范围来源"; cat /tmp/bulk-range-out.out; exit 1
 fi
 
+# 10) 未跟踪的无 dry-run 批量脚本必须拦下：事故作业序是「写脚本 → 跑门禁 →
+#     提交」，通道 A 用 git ls-files（仅受控文件）枚举时，脚本尚未 git add
+#     的窗口里守卫假绿——恰是最需要它的时间窗。
+mk_repo "$work/untracked"
+printf 'base\n' > .gitkeep
+git add -A && git commit -qm base
+cat > scripts/rewrite.py <<'PY'
+import os, re
+for dp, _, fs in os.walk('.'):
+    for f in fs:
+        if f.endswith('.go'):
+            p=os.path.join(dp,f)
+            open(p,'w').write(re.sub(r'\\s+$','',open(p).read()))
+PY
+# 刻意不 git add：脚本处于未跟踪状态
+if bash scripts/check-bulk-edit-safety.sh >/tmp/bulk-untracked.out 2>&1; then
+  echo "SELFTEST FAIL: 未跟踪的无 dry-run 脚本未拦截"; cat /tmp/bulk-untracked.out; exit 1
+fi
+if ! grep -q '缺少 --dry-run' /tmp/bulk-untracked.out; then
+  echo "SELFTEST FAIL: 未跟踪脚本命中原因错误（应为缺 dry-run）"; cat /tmp/bulk-untracked.out; exit 1
+fi
+
 echo "bulk-edit safety selftest: PASS"

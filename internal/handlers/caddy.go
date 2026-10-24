@@ -680,7 +680,7 @@ func (h *Handlers) PreviewConfigUpdate(c *gin.Context) {
 		return
 	}
 	if err := validateUpdateConfigRequest(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
+		writeUpdateConfigValidationFailure(c, err)
 		return
 	}
 	old, err := loadConfigSnapshot()
@@ -745,6 +745,19 @@ func writeConfigValidationFailure(c *gin.Context, err error) {
 	c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 }
 
+// writeUpdateConfigValidationFailure 映射 UpdateConfig/PreviewConfigUpdate 的
+// 入参校验错误：受信代理校验内含 DB 读取（读存量网段/引用展开），其失败是
+// 服务端故障——必须 500 + 固定文案并留痕，不得回 400 让管理员误判载荷非法，
+// 也不得把 SQL/驱动文本透给客户端。其余纯载荷错误保持 400 全部展示。
+func writeUpdateConfigValidationFailure(c *gin.Context, err error) {
+	var readErr *trustedProxyReadError
+	if errors.As(err, &readErr) {
+		writeInternalError(c, http.StatusInternalServerError, errTrustedProxyRead.Error(), readErr.Unwrap())
+		return
+	}
+	c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
+}
+
 func (h *Handlers) UpdateConfig(c *gin.Context) {
 	// global_config 全量替换的写者：导入窗口内提交会被导入静默覆盖，事务开启
 	// 后则排队至导入结束（客户端早已超时但请求仍在导入后落库）——与同族
@@ -765,7 +778,7 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 	h.caddyOpMu.Lock()
 	defer h.caddyOpMu.Unlock()
 	if err := validateUpdateConfigRequest(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
+		writeUpdateConfigValidationFailure(c, err)
 		return
 	}
 
@@ -936,8 +949,11 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
 			applyErr = errors.Join(applyErr, rbErr)
 		}
-		if pinErr := h.caddyService.PersistCommittedViewAsLastGoodInLock(); pinErr != nil {
-			services.Logf("warn", "配置应用失败后把 last-known-good 钉回已提交视图失败（LKG 可能仍为请求前运行配置）: %v", pinErr)
+		if pinErr := h.pinLastGoodAfterCompensation(); pinErr != nil {
+			// 附带失败走统一留痕（`recordCaddyApplyFailure` 的两态标签只由
+			// 运行配置恢复决定，LKG 未钉回不改变该事实，但重启兜底可能回放
+			// 漂移形态，必须留下审计而不只是可能被过滤的 warn 日志）。
+			h.recordCompensationSideEffects("Caddy 配置应用失败", pinErr)
 		}
 		// 回弹也可能失败（Caddy 不可达/超时）——运行
 		// 配置可能停留候选态而 DB 已回滚，仅响应+审计会在重启后消失。
@@ -961,7 +977,7 @@ func (h *Handlers) UpdateConfig(c *gin.Context) {
 		reloadNote.auditReload()
 		// 横幅两态：恢复失败=「运行配置状态未知」，恢复成功=「旧配置已保留」。
 		// 提交失败不是配置应用失败（apply 已发生）——失败对象用提交口径。
-		h.recordPostCommitRestoreFailure(postCommitSaveFailedBanner, err, recovery.runtime, recovery.db)
+		h.recordPostCommitRestoreFailure(commitSaveFailedSubject, err, recovery.runtime, recovery.db)
 		err = errors.Join(err, recovery.err())
 		recordAudit(c, "更新失败", "全局配置", services.FormatAuditDetail(commitUncertainLabel+"："+err.Error(), services.AuditResultPart("failure")))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + "：" + err.Error()})
@@ -1407,8 +1423,8 @@ func (h *Handlers) PutCaddyConfig(c *gin.Context) {
 		// 回弹目标是请求前运行配置（可能已漂移）——事务已显式回滚，把 LKG
 		// 钉回已提交库视图，维持「LKG=已提交库视图」的全族不变量（逃生口的
 		// 成功路径仍是例外：LKG=用户原始载荷）。
-		if pinErr := h.caddyService.PersistCommittedViewAsLastGoodInLock(); pinErr != nil {
-			services.Logf("warn", "原始配置应用失败后把 last-known-good 钉回已提交视图失败（LKG 可能仍为请求前运行配置）: %v", pinErr)
+		if pinErr := h.pinLastGoodAfterCompensation(); pinErr != nil {
+			h.recordCompensationSideEffects("Caddy 配置应用失败", pinErr)
 		}
 		// 回弹失败持久化横幅（事务已显式回滚）。
 		h.recordCaddyApplyFailure(err, restoreErr)
@@ -1432,7 +1448,7 @@ func (h *Handlers) PutCaddyConfig(c *gin.Context) {
 		}
 		// 横幅两态（恢复成功=旧配置已保留 / 失败=运行配置状态未知），失败对象
 		// 为提交而非配置应用。
-		h.recordPostCommitRestoreFailure(postCommitSaveFailedBanner, err, recovery.runtime, recovery.db)
+		h.recordPostCommitRestoreFailure(commitSaveFailedSubject, err, recovery.runtime, recovery.db)
 		err = errors.Join(err, recovery.err())
 		recordAudit(c, "更新失败", "Caddy配置", services.FormatAuditDetail(commitUncertainLabel, err.Error(), services.AuditResultPart("failure")))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + ": " + err.Error()})

@@ -192,6 +192,37 @@ test('取数失败：置 error 且保留上一次统计（不得整条消失）'
   assert.equal(error.value, null)
 })
 
+test('换行同时清空错误位：新行取数期间不得继承上一行的失败提示', async () => {
+  const target = ref({ logKey: 'audit' })
+  const pending = deferred()
+  g.__gets = []
+  let call = 0
+  g.__get = async () => {
+    call += 1
+    if (call === 1) throw new Error('network down')
+    return pending.promise
+  }
+  const { info, error } = useLogStorageStats({ target: () => target.value })
+  await flush()
+  const noStatsYet: unknown = info.value
+  assert.equal(noStatsYet, null)
+  assert.equal(error.value, 'network down', '上一行取数失败须显式暴露')
+
+  target.value = { logKey: 'runtime' }
+  await nextTick()
+  // 值已清空但新行请求仍在途：此时若错误位残留，LogStorageBar 会显示
+  // 「日志统计暂不可用」并把这条提示错记到新行头上。
+  const clearedOnTargetChange: unknown = info.value
+  assert.equal(clearedOnTargetChange, null)
+  assert.equal(error.value, null, '换行后旧行错误位必须立即清空')
+  assert.equal(g.__gets.length, 2, '换行仍须重新取数')
+
+  pending.resolve(statsOf('runtime', '运行日志'))
+  await flush()
+  assert.equal(error.value, null)
+  assert.equal(info.value?.name, '运行日志')
+})
+
 test('组合子不导出取数函数（loadStats 无外部消费）', () => {
   const src = source('src/composables/useLogStorageStats.ts')
   assert.match(src, /return \{ info, error \}/, '返回值只含消费面（info/error）')

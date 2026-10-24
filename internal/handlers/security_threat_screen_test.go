@@ -2454,3 +2454,77 @@ func TestThreatRollup_rewindDropsMinuteHighwaterForInPlaceUpgrade(t *testing.T) 
 		t.Fatalf("迟到基线未在重固事务内消费（残留 %d 行 → 下一次回退会重复合并迟到行）", baselineRows)
 	}
 }
+
+// 攻击光流端点的边界：保留地址兜底过滤仍推进 next_seq、环溢出
+// 空洞当轮披露 gap/gap_skipped、采样租约驱动 enabled/sample_n。
+func TestThreatScreenAttackFlow_filtersReservedAndDisclosesGap(t *testing.T) {
+	services.ResetThreatScreenAttackFlowForTest()
+	t.Cleanup(services.ResetThreatScreenAttackFlowForTest)
+	if err := services.AcquireThreatScreenAttackFlowLease("flow-handler-test", time.Minute, 1); err != nil {
+		t.Fatalf("lease: %v", err)
+	}
+	// 第一条为保留地址（必须被过滤），第二条为公网地址。
+	services.ThreatScreenAttackFlowAppendForTest("10.0.0.5", "blocked", "942100")
+	publicSeq := services.ThreatScreenAttackFlowAppendForTest("185.199.108.9", "blocked", "942100")
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/security/overview/threat-screen/attack-flow", (&Handlers{}).GetThreatScreenAttackFlow)
+	type flowEvent struct {
+		Seq     uint64 `json:"seq"`
+		Country string `json:"country"`
+	}
+	type flowPayload struct {
+		Enabled    bool        `json:"enabled"`
+		SampleN    int         `json:"sample_n"`
+		NextSeq    uint64      `json:"next_seq"`
+		Gap        bool        `json:"gap"`
+		GapSkipped uint64      `json:"gap_skipped"`
+		Events     []flowEvent `json:"events"`
+	}
+	read := func(query string) flowPayload {
+		rec := getRequest(t, router, "/security/overview/threat-screen/attack-flow"+query)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
+		}
+		var payload struct {
+			Data flowPayload `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("decode: %v body=%s", err, rec.Body.String())
+		}
+		return payload.Data
+	}
+
+	// 首屏：保留地址事件被过滤，但游标仍推进到本批最大序号。
+	first := read("")
+	if len(first.Events) != 1 || first.Events[0].Seq != publicSeq {
+		t.Fatalf("events=%+v, want 仅公网事件 seq=%d（保留地址过滤后游标不得回退）", first.Events, publicSeq)
+	}
+	if first.Events[0].Country == "" {
+		t.Fatalf("country 不得为空（未命中归属地时回退「未知」）")
+	}
+	if !first.Enabled || first.SampleN != 1 || first.NextSeq != publicSeq || first.Gap {
+		t.Fatalf("首屏 enabled=%v sample_n=%d next=%d gap=%v, want true/1/%d/false",
+			first.Enabled, first.SampleN, first.NextSeq, first.Gap, publicSeq)
+	}
+
+	// 环溢出：追加大批事件把最老保留序号推高，since=1 因此出现永久空洞。
+	for range 5000 {
+		services.ThreatScreenAttackFlowAppendForTest("185.199.108.10", "blocked", "942100")
+	}
+	oldest, _, _ := services.ThreatScreenAttackFlowSnapshot(1, 1)
+	if len(oldest) != 1 {
+		t.Fatalf("环内应有可读事件: %+v", oldest)
+	}
+	oldestSeq := oldest[0].Seq
+	gapped := read("?since=1&limit=5")
+	if !gapped.Gap || gapped.GapSkipped != oldestSeq-2 {
+		t.Fatalf("gap=%v gap_skipped=%d, want true/%d（since=1 到最老保留序号 %d 之间的永久空洞）",
+			gapped.Gap, gapped.GapSkipped, oldestSeq-2, oldestSeq)
+	}
+	if len(gapped.Events) != 5 || gapped.NextSeq != oldestSeq+4 {
+		t.Fatalf("events=%d next=%d, want 5/%d（limit 生效且游标推进到本批末尾）",
+			len(gapped.Events), gapped.NextSeq, oldestSeq+4)
+	}
+}

@@ -7,8 +7,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { createImportPreviewSession, importPreviewFingerprint } from '../src/utils/importPreview.ts'
-import { section, source } from './_helpers.ts'
+import { createImportPreviewSession, importPreviewFingerprint, invalidateImportPreviews } from '../src/utils/importPreview.ts'
+import type * as ImportPreviewModule from '../src/utils/importPreview.ts'
+import { code, section } from './_helpers.ts'
 
 const deferred = <T>() => Promise.withResolvers<T>()
 
@@ -126,8 +127,27 @@ test('非安全上下文（无 crypto.subtle）同样可得指纹：HTTP 访问�
   }
 })
 
+test('缓存超过上限后淘汰最旧键，最新结果仍命中（长会话不无界增长）', async () => {
+  // 缓存是模块级状态：查询串加载独立实例，避免受本文件其它用例已写入的键影响。
+  const fresh = (await import(`../src/utils/importPreview.ts?evict=${Date.now()}`)) as typeof ImportPreviewModule
+  let sends = 0
+  const session = fresh.createImportPreviewSession<string>({
+    fingerprint: 'fp-evict',
+    send: async (sections) => { sends++; return sections.join(',') },
+  })
+  // 33 个不同分类组合 > 上限 32：最早的 k0 被淘汰
+  for (let i = 0; i < 33; i++) {
+    assert.equal((await session.validate([`k${i}`])).cached, false)
+  }
+  assert.equal((await session.validate(['k0'])).cached, false, '最旧键必须已淘汰（否则会话无界增长）')
+  assert.equal((await session.validate(['k32'])).cached, true, '最新键必须仍在缓存（不得删最新）')
+  // 重新插入的 k0 排到最新，淘汰顺延到 k1
+  assert.equal((await session.validate(['k1'])).cached, false)
+  assert.equal(sends, 35)
+})
+
 test('组件接线：预览经会话复用，请求带 abort signal，关闭/换文件即取消', () => {
-  const page = source('src/views/settings/BasicSettings.vue')
+  const page = code('src/views/settings/BasicSettings.vue')
   const preview = section(page, 'const postImportValidation', 'const revalidateImport')
   assert.match(preview, /signal/, '预览请求必须可被取消')
   assert.match(preview, /\?sections=/, '预览必须携带 sections query')
@@ -145,4 +165,44 @@ test('组件接线：预览经会话复用，请求带 abort signal，关闭/换
   const closed = section(page, 'const onImportDialogClosed', 'const chooseImportFile')
   assert.match(closed, /importPreviewSession\?\.dispose\(\)/, '关闭弹框必须取消在途上传')
   assert.match(closed, /importPreviewSession = null/)
+})
+
+// 缓存时效：预览事实依赖服务端「当时」的库状态，跨会话常驻会让同一份备份在
+// 配置改变后仍返回旧预览（例如刚删掉一个 CA 提供商，预览却说无悬挂告警）。
+test('缓存有 TTL：超过有效期必须重新校验', async () => {
+  const realNow = Date.now
+  let now = 1_000_000
+  Date.now = () => now
+  try {
+    const sent: string[] = []
+    const session = createImportPreviewSession<string>({
+      fingerprint: 'fp-ttl',
+      send: async () => { sent.push('x'); return 'v' },
+    })
+    assert.equal((await session.validate(['users'])).cached, false)
+    now += 4 * 60 * 1000
+    assert.equal((await session.validate(['users'])).cached, true, '有效期内仍可复用')
+    now += 2 * 60 * 1000
+    assert.equal((await session.validate(['users'])).cached, false, '过期条目必须重新校验')
+    assert.equal(sent.length, 2)
+  } finally {
+    Date.now = realNow
+  }
+})
+
+test('invalidateImportPreviews 清空跨会话缓存，且弹框打开时调用它', async () => {
+  const sent: string[] = []
+  const session = createImportPreviewSession<string>({
+    fingerprint: 'fp-invalidate',
+    send: async () => { sent.push('x'); return 'v' },
+  })
+  await session.validate(['users'])
+  assert.equal((await session.validate(['users'])).cached, true)
+  invalidateImportPreviews()
+  assert.equal((await session.validate(['users'])).cached, false)
+  assert.equal(sent.length, 2)
+
+  const page = code('src/views/settings/BasicSettings.vue')
+  const trigger = section(page, 'const triggerImport = (): void =>', 'const onImportDialogClosed')
+  assert.match(trigger, /invalidateImportPreviews\(\)/, '打开导入弹框必须清空预览缓存')
 })

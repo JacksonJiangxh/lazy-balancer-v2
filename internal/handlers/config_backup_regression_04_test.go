@@ -150,7 +150,7 @@ func TestImportConfigBackup_sectionsSelectedUsersResolvesAgainstBackupRows(t *te
 }
 
 // 形状⑤:规则库单独备份(从未携带 cert 表)+选 rules 未选 users——
-// 对称),导入成功且警告进响应。
+// 预览/导入对称，导入成功且警告进响应。
 func TestImportConfigBackup_rulesOnlyBackupLiveDanglingACMEWarns(t *testing.T) {
 	// Given:live 有本地管理员(rules 分类不触碰 users),无 certificate_configs id 7
 	h := newBackupTestHandlers(t)

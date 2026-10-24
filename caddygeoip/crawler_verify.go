@@ -64,9 +64,10 @@ const (
 	crawlerDNSQueryTimeout  = 500 * time.Millisecond
 	// crawlerVerifySlots 在途 DNS 并发上限（非阻塞获取：满员 fail-closed）
 	crawlerVerifySlots = 32
-	// crawlerCachePruneProbeLimit 限制单次新键插入时的过期回收工作量，
-	// 避免满员后对 200k map 做全表扫描。map 遍历顺序不作保证；未探到的
-	// 过期条目由后续插入继续回收，满员时维持既有的「不缓存新键」降级。
+	// crawlerCachePruneProbeLimit 限制单次新键插入时的回收工作量，避免满员后
+	// 对 200k map 做全表扫描。map 遍历顺序不作保证；探针内先回收过期条目，
+	// 并至多记住一个**活跃负结论**作为候选（插入前淘汰）——正结论绝不淘汰。
+	// 探针未找到可回收条目时新结论不缓存（留痕）。
 	crawlerCachePruneProbeLimit = 64
 )
 
@@ -78,8 +79,10 @@ var (
 	crawlerCachePruneVisitsForTest int
 	// crawlerVerifySem 非阻塞信号量（cap 32；关账本式释放）
 	crawlerVerifySem = make(chan struct{}, crawlerVerifySlots)
-	// crawlerCacheMax 容量护栏：到上限按固定探针数回收过期条目；仍满员则跳过新键缓存，
-	// 保留未过期的正/负结论（已存在键可原位更新，不增加条目数）。
+	// crawlerCacheMax 容量护栏：到上限时在固定探针内回收过期条目，并至多淘汰
+	// 一个**活跃负结论**以接纳新结论（负结论丢弃后 10min 可重验，正结论绝不
+	// 淘汰）。探针内无可回收条目时（正结论占满）新结论不缓存并留痕；
+	// 已存在键原位更新，不增加条目数。
 	crawlerCacheMax = 200_000
 )
 

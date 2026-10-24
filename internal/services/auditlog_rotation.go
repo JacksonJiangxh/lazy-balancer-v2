@@ -247,6 +247,46 @@ func rotateAuditLogIfNeeded() (total int, rotErr error) {
 	if offErr != nil {
 		throttledAuditFailureLogf("audit log rotation: 读取摄取偏移失败，补采起点退化为 0: %v", offErr)
 	}
+	// —— 复制前闸门：只在「本轮能追平活文件尾部」时才付全量复制/移位成本 ——
+	// 持续写入（或补采持续失败）下截断判据可能连续多轮不成立；旧序每 2s 先把
+	// 整文件复制到 .1.new 并移位归档，再在截断判据处推迟——推迟期间每 tick 仍付
+	// O(文件大小) 复制、归档代际被反复移位覆盖，磁盘放大 ~6×、活文件无界增长。
+	// 现在把尾部摄取前置为闸门：
+	//   · 可追平（摄取到达 stat 边界，或剩余仅空白）→ 继续复制/移位/截断；
+	//   · 追不平（仍有未摄取字节 / 补采依赖不可用 / 积压超过闸门上限）→ 本轮
+	//     只做增量摄取，不复制、不移位、不改归档代际，下轮续试。
+	// 已落盘事件零丢失：未截断则字节原样留在活文件；已摄取部分由
+	// transaction_id 唯一索引 + 请求级去重表幂等吸收，重复补采不产生重复行。
+	// 取舍：补采不可用期间不再「先复制再截断+留 pending 标记」——那条路径靠
+	// 复制覆盖窗口，代价正是本项要消除的每 tick 全量复制；改为保持活文件完整、
+	// 推迟轮转（磁盘增长换零丢失，健康位经 errAuditRotationDeferred 如实披露）。
+	// 告警统一走 throttledAuditFailureLogf（同消息 60s 窗口），持续推迟不会每
+	// tick 刷一条。
+	precopySize := info.Size()
+	if precopySize > persistedOffset {
+		if !securityEventsIngestDepsReady() {
+			throttledAuditFailureLogf("audit log rotation: pre-copy live tail ingest deferred (security events database unavailable, no copy performed)")
+			return total, fmt.Errorf("%w: 补采依赖不可用，本轮不复制（活文件保持完整，下轮续试）", errAuditRotationDeferred)
+		}
+		if backlog := precopySize - persistedOffset; backlog > auditLogRotationPreflightTailLimit {
+			throttledAuditFailureLogf("audit log rotation: pre-copy live tail backlog %d bytes exceeds %d, rotation deferred (no copy performed)", backlog, auditLogRotationPreflightTailLimit)
+			return total, fmt.Errorf("%w: 活文件待摄取 %d 字节超过复制前闸门 %d（本轮只摄取不复制，下轮续试）",
+				errAuditRotationDeferred, backlog, auditLogRotationPreflightTailLimit)
+		}
+		// 归档语义（区间有界、畸形区 scan-to-EOF）与 copy 后的尾部补采同口径；
+		// 去重表与 live tailer 共享（同一 poll goroutine，见 ingestDeltaFrom）。
+		n, reached, ierr := securityEventsIngestDeltaFrom(auditLogPath, persistedOffset, true)
+		if ierr != nil {
+			throttledAuditFailureLogf("audit log rotation: pre-copy live tail ingest failed, rotation deferred (no copy performed): %v", ierr)
+			return total, fmt.Errorf("%w: 轮转前补采活文件尾部失败: %w", errAuditRotationDeferred, ierr)
+		}
+		total += n
+		if reached < precopySize && !auditLogTailOnlyWhitespace(auditLogPath, reached, precopySize) {
+			throttledAuditFailureLogf("audit log rotation: live tail not fully ingested before copy (reached %d of %d bytes), rotation deferred (no copy performed)", reached, precopySize)
+			return total, fmt.Errorf("%w: 活文件尾部尚未摄取（reached %d of %d bytes，本轮不复制，下轮续试）",
+				errAuditRotationDeferred, reached, precopySize)
+		}
+	}
 	dir := filepath.Dir(auditLogPath)
 	base := auditLogBaseName()
 	current := filepath.Join(dir, base+".1")
@@ -367,8 +407,10 @@ func rotateAuditLogIfNeeded() (total int, rotErr error) {
 	// 的仅是文档间空白分隔）才截断；否则保留本轮现场、下周期先经正常路径摄取
 	// 尾部再轮转——半条在途事务被截断抹除后，后续归档 pass 同样静默跳过，事件
 	// 永久丢失。放宽截断必须留痕：该分支此前完全静默（rotErr 保持 nil、健康位
-	// 正常、任务日志零痕迹），持续高流量下退化为「每 2s 全量复制并移位归档但
-	// 永不 truncate」，活文件无界增长且磁盘放大 ~6×。
+	// 正常、任务日志零痕迹）。复制前闸门已把「追不平尾部」的常态挡在复制之前
+	// （见上），这里的残余窗口只剩 copy→最后一次补采之间新写入的字节：本轮推迟
+	// 时归档已就位但活文件未截断，下轮闸门重判、仍可能在复制后推迟——告警经
+	// 60s 限流，磁盘放大被限制为「闸门通过后的偶发单次复制」。
 	finalInfo, ferr := os.Stat(auditLogPath)
 	if ferr != nil {
 		throttledAuditFailureLogf("audit log rotation: stat live log before truncate failed (not truncating): %v", ferr)
@@ -426,6 +468,12 @@ func rotateAuditLogIfNeeded() (total int, rotErr error) {
 	}
 	return total, rotErr
 }
+
+// auditLogRotationPreflightTailLimit 是复制前闸门允许本轮补采的活文件尾部上限：
+// 超过该值说明存在大量积压（停摆恢复/长时间停更），本轮只摄取不复制——把
+// 剩余积压交给 2s 节拍的限量 live pass 分摊，避免一个无界归档 pass 把轮转
+// 拖过停机宽限（live pass 受事件数/字节数上限与 ctx 取消约束，归档 pass 不受）。
+const auditLogRotationPreflightTailLimit = 8 << 20
 
 // auditLogWhitespaceTailLimit 是「尾部剩余字节」按空白处理的判定上限：
 // 摄取到达偏移与当前文件大小之间的差值超过该值只可能来自补采 pass 结束后的
@@ -645,29 +693,30 @@ const auditLogSizeCacheTTL = 60 * time.Second
 var auditLogSizeValueCache = dbValueCache{ttl: auditLogSizeCacheTTL}
 
 func getAuditLogSizeBytes() int64 {
-	// 未初始化库回退默认 10MB，不得 nil deref（当前
-	// 不可达；与同包多数配置读取 helper 的 db.DB==nil 守卫口径一致）。
+	defaultBytes := int64(db.DefaultAuditLogSizeMB) * 1024 * 1024
+	// 未初始化库回退治理默认值（db.DefaultAuditLogSizeMB），不得 nil deref
+	// （当前不可达；与同包多数配置读取 helper 的 db.DB==nil 守卫口径一致）。
 	if db.DB == nil {
-		return 10 * 1024 * 1024
+		return defaultBytes
 	}
 	return auditLogSizeValueCache.get(func() (int64, error) {
 		var sizeMB int
-		if err := db.DB.QueryRow("SELECT COALESCE(audit_log_size_mb, 10) FROM global_config WHERE id = 1").Scan(&sizeMB); err != nil {
-			// 读失败回退 10MB 当轮生效，且必须留痕：此前静默回退让「轮转阈值
+		if err := db.DB.QueryRow("SELECT COALESCE(audit_log_size_mb, ?) FROM global_config WHERE id = 1", db.DefaultAuditLogSizeMB).Scan(&sizeMB); err != nil {
+			// 读失败回退默认值当轮生效，且必须留痕：此前静默回退让「轮转阈值
 			// 长期按兜底值滚动而面板配置形同虚设」零信号。状态转换口径（首报
 			// warn + 恢复 info）与同族配置读取（运行日志尺寸/时区刷新）同源，
 			// 缓存未命中才走到这里，稳态不刷屏。
 			if lvl := logStateTransition("audit-log-size-refresh", true); lvl != "" {
-				Logf(lvl, "读取审计日志轮转阈值失败，回退默认 10MB（本轮生效，下一轮重试）: %v", err)
+				Logf(lvl, "读取审计日志轮转阈值失败，回退默认 %dMB（本轮生效，下一轮重试）: %v", db.DefaultAuditLogSizeMB, err)
 			}
-			return 0, err // 失败不缓存：回退 10MB 当轮生效，下一 tick 重试
+			return 0, err // 失败不缓存：回退默认值当轮生效，下一 tick 重试
 		}
 		if lvl := logStateTransition("audit-log-size-refresh", false); lvl != "" {
 			Logf(lvl, "读取审计日志轮转阈值已恢复")
 		}
 		if sizeMB <= 0 {
-			sizeMB = 10
+			sizeMB = db.DefaultAuditLogSizeMB
 		}
 		return int64(sizeMB) * 1024 * 1024, nil
-	}, 10*1024*1024)
+	}, defaultBytes)
 }

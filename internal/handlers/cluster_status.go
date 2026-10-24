@@ -84,8 +84,11 @@ func (h *Handlers) ReportClusterNode(c *gin.Context) {
 			return
 		}
 		if errors.Is(err, services.ErrNodeNotFound) {
-			// 节点已被主节点删除：身份不存在的 404 语义（同族端点一致），
-			// 从端据此停止上报而不是反复重试。
+			// 节点已被主节点删除：身份不存在的 404 语义（同族端点一致）。
+			// 注意：404 本身不终止从端上报循环——从端上报客户端对任何 ≥400
+			// 都只当作一次可重试失败（cluster_report.go），真正让循环停下的是
+			// 下一轮 Pull 的 401（令牌已撤销）。404 的收益是排障语义准确
+			// （「身份不存在」而非「服务端故障」），不是停止重试。
 			clusterError(c, http.StatusNotFound, "节点状态上报失败：节点已不在集群", err)
 			return
 		}

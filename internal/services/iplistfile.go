@@ -147,6 +147,42 @@ type ipListProjectionMemoEntry struct {
 	size      int64
 }
 
+// ipListProjectionPass 记录「本轮渲染新建」的投影文件（写前不存在），是回滚
+// 删除的唯一判据。不能用「目录里有、快照里没有」判定：快照阶段的瞬时读失败/
+// 目录列举失败会让在役投影缺项，按缺失判据回滚即把它当作渲染新增删除——运行
+// 中 Caddy 的 @ipListFast 会读到文件不存在，allow/deny 名单同时失效。
+// 生命周期：SnapshotIPListProjections 开启一轮，RestoreIPListProjections 或
+// EndIPListProjectionPass 收尾（成功路径不删除任何文件，只释放清单）。
+// 并发前提与 ipListRenderRefs 同款：渲染串行。
+var ipListProjectionPass = struct {
+	mu      sync.Mutex
+	created map[string]struct{}
+}{}
+
+func beginIPListProjectionPass() map[string]struct{} {
+	created := make(map[string]struct{})
+	ipListProjectionPass.mu.Lock()
+	ipListProjectionPass.created = created
+	ipListProjectionPass.mu.Unlock()
+	return created
+}
+
+func noteIPListProjectionCreated(path string) {
+	ipListProjectionPass.mu.Lock()
+	if ipListProjectionPass.created != nil {
+		ipListProjectionPass.created[path] = struct{}{}
+	}
+	ipListProjectionPass.mu.Unlock()
+}
+
+// EndIPListProjectionPass 结束本轮渲染的新建清单跟踪（渲染成功后调用：新建的
+// 投影已随配置提交，不得再被后续回滚删除）。
+func EndIPListProjectionPass() {
+	ipListProjectionPass.mu.Lock()
+	ipListProjectionPass.created = nil
+	ipListProjectionPass.mu.Unlock()
+}
+
 func ipListInputHash(entries []string) uint64 {
 	h := fnv.New64a()
 	for _, entry := range entries {
@@ -202,7 +238,8 @@ func writeIPListFile(scope string, merged []string) (string, error) {
 			ipListProjectionMemoMu.Unlock()
 		}
 	}
-	if existing, err := os.ReadFile(path); err == nil && string(existing) == content {
+	existing, readErr := os.ReadFile(path)
+	if readErr == nil && string(existing) == content {
 		// 同字节跳写仍须归一权限：存量投影由 os.CreateTemp 生成（恒 0600），
 		// 内容不再变化的名单永远走不到重写路径，Caddy 换 uid 部署时读不到。
 		// chmod 幂等且不改 mtime（内容未变，wafiplist 不重建）。
@@ -252,6 +289,11 @@ func writeIPListFile(scope string, merged []string) (string, error) {
 		_ = os.Remove(tmpName)
 		return "", fmt.Errorf("原子替换 IP 名单文件失败 %s: %w", name, err)
 	}
+	// 写前不存在（读回仅报 ErrNotExist）＝本轮渲染新建：登记进回滚清单。
+	// 权限/列举类错误不登记（无法判定文件是否本就有），回滚宁可少删。
+	if readErr != nil && errors.Is(readErr, os.ErrNotExist) {
+		noteIPListProjectionCreated(path)
+	}
 	if err := syncParentDir(path); err != nil {
 		return "", fmt.Errorf("同步 IP 名单目录失败 %s: %w", name, err)
 	}
@@ -259,35 +301,53 @@ func writeIPListFile(scope string, merged []string) (string, error) {
 	return path, nil
 }
 
-// IPListProjectionSnapshot 是渲染前投影目录的字节快照（仅 .txt 投影文件）。
-type IPListProjectionSnapshot map[string][]byte
+// IPListProjectionSnapshot 是渲染前投影目录的字节快照（仅 .txt 投影文件）与
+// 「本轮渲染新建」清单。files 用于回写旧内容；created 是回滚删除的唯一判据。
+type IPListProjectionSnapshot struct {
+	files   map[string][]byte
+	created map[string]struct{}
+}
 
-// SnapshotIPListProjections 供 CLI 预检失败时自回滚。
-func SnapshotIPListProjections() IPListProjectionSnapshot {
-	snapshot := IPListProjectionSnapshot{}
+// SnapshotIPListProjections 开启一轮渲染并快照投影目录，供 CLI 预检失败时
+// 自回滚。读目录或读任一投影失败即返回错误（不返回不完整快照）：调用方不得
+// 在快照不完整的前提下渲染——回写缺项会让未提交内容留在投影目录，而旧口径
+// 下缺失项还会被当作渲染新增删除，直接删掉在役名单。
+func SnapshotIPListProjections() (IPListProjectionSnapshot, error) {
+	created := beginIPListProjectionPass()
+	snapshot := IPListProjectionSnapshot{files: map[string][]byte{}, created: created}
 	entries, err := os.ReadDir(IPListDataDir)
 	if err != nil {
-		return snapshot
+		if errors.Is(err, os.ErrNotExist) {
+			// 首次保存：目录尚未创建＝没有任何在役投影可回滚。
+			return snapshot, nil
+		}
+		EndIPListProjectionPass()
+		return IPListProjectionSnapshot{}, fmt.Errorf("读取 IP 名单投影目录 %s: %w", IPListDataDir, err)
 	}
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".txt") {
 			continue
 		}
 		path := filepath.Join(IPListDataDir, entry.Name())
-		if data, err := os.ReadFile(path); err == nil {
-			snapshot[path] = data
+		data, rerr := os.ReadFile(path)
+		if rerr != nil {
+			EndIPListProjectionPass()
+			return IPListProjectionSnapshot{}, fmt.Errorf("读取 IP 名单投影 %s: %w", path, rerr)
 		}
+		snapshot.files[path] = data
 	}
-	return snapshot
+	return snapshot, nil
 }
 
-// RestoreIPListProjections 删除渲染新增的 .txt 并回写快照内容，返回回滚失败
-// 明细（nil=完整回滚）。
+// RestoreIPListProjections 删除本轮渲染新建的投影、回写快照内容，返回回滚
+// 失败明细（nil=完整回滚）。
 //
-// 回滚失败不得静默：预检失败后投影目录若停留在「新内容」状态，稳定命名 +
-// 热路径设计会让运行中的 Caddy 在 ≤1s 内感知到未提交的名单内容；同时被删
-// 文件的 wafiplist 运行期缓存必须与 GC 路径同口径淘汰（fail-stale 下继续
-// 用已删集合判定）。调用方据此留痕（caddy CLI 预检回滚路径写 error 日志）。
+// 删除只认渲染清单（snapshot.created），不遍历目录做差集：快照缺项不代表
+// 渲染新增，按差集删除会在快照读失败时删掉在役投影。回滚失败不得静默：预检
+// 失败后投影目录若停留在「新内容」状态，稳定命名 + 热路径设计会让运行中的
+// Caddy 在 ≤1s 内感知到未提交的名单内容；同时被删文件的 wafiplist 运行期
+// 缓存必须与 GC 路径同口径淘汰（fail-stale 下继续用已删集合判定）。调用方
+// 据此留痕（caddy CLI 预检回滚路径写 error 日志）。
 func RestoreIPListProjections(snapshot IPListProjectionSnapshot) error {
 	// 回滚直接重写/删除投影文件——备忘的落盘态记录随之失效，清空防陈旧
 	// 命中跳过必要重写。
@@ -296,25 +356,17 @@ func RestoreIPListProjections(snapshot IPListProjectionSnapshot) error {
 	ipListProjectionMemoMu.Unlock()
 	var errs []error
 	var deleted []string
-	entries, err := os.ReadDir(IPListDataDir)
-	if err != nil {
-		errs = append(errs, fmt.Errorf("读取投影目录 %s: %w", IPListDataDir, err))
-	} else {
-		for _, entry := range entries {
-			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".txt") {
+	for path := range snapshot.created {
+		if rerr := os.Remove(path); rerr != nil {
+			if errors.Is(rerr, os.ErrNotExist) {
 				continue
 			}
-			path := filepath.Join(IPListDataDir, entry.Name())
-			if _, keep := snapshot[path]; !keep {
-				if rerr := os.Remove(path); rerr != nil {
-					errs = append(errs, fmt.Errorf("删除投影 %s: %w", path, rerr))
-				} else {
-					deleted = append(deleted, path)
-				}
-			}
+			errs = append(errs, fmt.Errorf("删除投影 %s: %w", path, rerr))
+		} else {
+			deleted = append(deleted, path)
 		}
 	}
-	for path, data := range snapshot {
+	for path, data := range snapshot.files {
 		// 内容相同的文件不重写：回滚会改写全部投影 inode/mtime，运行中 Caddy 的
 		// @ipListFast stat 缓存在 ≤1s 内对所有名单重建（读盘放大 + 统计形态全变）。
 		if current, rerr := os.ReadFile(path); rerr == nil && bytes.Equal(current, data) {
@@ -327,6 +379,7 @@ func RestoreIPListProjections(snapshot IPListProjectionSnapshot) error {
 	if len(deleted) > 0 {
 		wafiplist.EvictIPListCache(deleted...)
 	}
+	EndIPListProjectionPass()
 	return errors.Join(errs...)
 }
 

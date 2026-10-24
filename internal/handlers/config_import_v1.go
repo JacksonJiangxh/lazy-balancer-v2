@@ -656,6 +656,13 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 			ValidateRuleListenPort: h.validateRuleListenPortForSave,
 		}, &backup, importValidationOptions{LbbakPayload: lbbakPayloadFromCtx(c), RequestedSections: c.Query("sections")})
 		if chainErr != nil {
+			// 受信代理校验内含 DB 读取：服务端故障不回「备份校验失败」（会把
+			// 「硬盘 I/O 错误」说成备份内容问题，并透出 SQL 文本）。
+			var readErr *trustedProxyReadError
+			if errors.As(chainErr, &readErr) {
+				writeInternalError(c, http.StatusInternalServerError, errTrustedProxyRead.Error(), readErr.Unwrap())
+				return
+			}
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v2", Error: chainErr.Error()}})
 			return
 		}
@@ -673,6 +680,11 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 		validateWarnings = append(validateWarnings, skipWarnings...)
 		if warning := backupProductVersionWarning(backup.Meta, h.cfg.Version); warning != "" {
 			validateWarnings = append(validateWarnings, warning)
+		}
+		// 完全不含校验和的史前 v1 备份：导入照常（结构门全执行），预览必须
+		// 明确告知内容未经摘要校验——与导入侧审计警告同文案。
+		if chain.NoIntegrityChecksum {
+			validateWarnings = append(validateWarnings, warningNoIntegrityChecksum)
 		}
 		if crsTreeReplaced {
 			validateWarnings = append(validateWarnings, warningCRSTreeReplaced)
@@ -750,6 +762,10 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 		validRules, validationSkips, normalizations := validateConvertedV1Rules(rules, h.validateRuleListenPortForSave)
 		allWarnings := append(conversionWarnings, validationSkips...)
 		allWarnings = append(allWarnings, normalizations...)
+		// 证书质量警告与导入路径同源（预览阶段无 caddy_id，前缀只带规则名）。
+		for _, r := range validRules {
+			allWarnings = append(allWarnings, v1CertificateWarnings(r, "")...)
+		}
 		if len(validRules) == 0 {
 			c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: importValidateResponse{Valid: false, Type: "v1", Error: "所有规则均校验失败", Warnings: allWarnings}})
 			return
@@ -764,7 +780,7 @@ func (h *Handlers) ValidateConfigImport(c *gin.Context) {
 			upstreamCount += len(r.Upstreams)
 		}
 		warnings := []string{
-			"仅导入负载规则（用户、全局配置不导入，证书任务保持不变）",
+			"仅导入负载规则（用户、全局配置不导入；旧规则的证书任务、证书材料与日志将随规则替换一并清理）",
 			"v1 不支持 ACME，HTTPS 规则的证书与私钥将以手动方式随规则导入",
 			"nginx 特有配置（custom_config、日志路径等）已忽略",
 		}
@@ -849,28 +865,36 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 	restoreImportNodeRole, err := suppressImportClusterVersionBumps(ctx, tx)
 	if err != nil {
 		err = session.abort(err)
+		recordAudit(c, "导入失败", "配置备份", services.FormatAuditDetail("准备导入事务", err.Error()))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "准备导入事务失败，已回滚: " + importFailureAuditDetail(err)})
 		return
 	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM path_rules"); err != nil {
 		err = session.abort(err)
+		recordAudit(c, "导入失败", "配置备份", services.FormatAuditDetail("清理旧路径规则", err.Error()))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "清理旧路径规则失败，已回滚: " + importFailureAuditDetail(err)})
 		return
 	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM upstreams"); err != nil {
 		err = session.abort(err)
+		recordAudit(c, "导入失败", "配置备份", services.FormatAuditDetail("清理旧上游", err.Error()))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "清理旧上游失败，已回滚: " + importFailureAuditDetail(err)})
 		return
 	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM lb_rules"); err != nil {
 		err = session.abort(err)
+		recordAudit(c, "导入失败", "配置备份", services.FormatAuditDetail("清理旧规则", err.Error()))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "清理旧规则失败，已回滚: " + importFailureAuditDetail(err)})
 		return
 	}
 	// v1 导入覆盖 lb_rules 后须同步清空 security_policy_bindings——
 	// 绑定表对 rule_caddy_id 无外键级联，残留行会指向已删除规则成为悬挂绑定。
+	// v1 无策略概念：此处清空全表且不回写、不告警——normalizeRuleRowsForTransport
+	// 的 droppedTCPBindings 在 v1 恒为 0（表已空），因此 v1 路径不复用 v2 的
+	// 「已解除 N 条 TCP 绑定」文案。
 	if _, err := tx.ExecContext(ctx, "DELETE FROM security_policy_bindings"); err != nil {
 		err = session.abort(err)
+		recordAudit(c, "导入失败", "配置备份", services.FormatAuditDetail("清理旧策略绑定", err.Error()))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "清理旧策略绑定失败，已回滚: " + importFailureAuditDetail(err)})
 		return
 	}
@@ -884,6 +908,7 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 		caddyID, err := services.GenerateCaddyID()
 		if err != nil {
 			err = session.abort(err)
+			recordAudit(c, "导入失败", "配置备份", services.FormatAuditDetail("生成规则编号", err.Error()))
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "生成规则编号失败: " + importFailureAuditDetail(err)})
 			return
 		}
@@ -919,6 +944,8 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 		if r.EnableTLS && r.TLSCert != "" && r.TLSKey != "" {
 			pendingCerts = append(pendingCerts, importCertificate{ruleID: caddyID, certPEM: r.TLSCert, keyPEM: r.TLSKey})
 		}
+		// 证书质量警告与规则保存/v2 导入同源（导入响应与「导入」审计都带出）。
+		allWarnings = append(allWarnings, v1CertificateWarnings(r, caddyID)...)
 		if r.EnableTLS {
 			tlsCount++
 		}
@@ -928,16 +955,13 @@ func (h *Handlers) ImportV1Config(c *gin.Context) {
 	// 导入/此处）中唯一事务内零归一的写路径——转换器对 BackendDomain/Gzip 无
 	// 协议门，TCP 行可携带 host_header/enable_compress/compress_types 死值落库。
 	// INSERT 后统一调与 v2 备份导入共享的 normalizeRuleRowsForTransport（单一
-	// 事实源）。
-	droppedTCPBindings, err := normalizeRuleRowsForTransport(ctx, tx)
-	if err != nil {
+	// 事实源）。其 droppedTCPBindings 在 v1 恒为 0（绑定表已在上方清空），
+	// 故 v1 不消费返回值、也不复用 v2 的告警文案。
+	if _, err := normalizeRuleRowsForTransport(ctx, tx); err != nil {
 		err = session.abort(err)
 		recordAudit(c, "导入失败", "配置备份", importFailureAuditDetail(err))
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "导入规则归一失败，已回滚: " + importFailureAuditDetail(err)})
 		return
-	}
-	if droppedTCPBindings > 0 {
-		allWarnings = append(allWarnings, fmt.Sprintf("已解除 %d 条 TCP 规则的安全策略绑定（TCP 不参与策略渲染）", droppedTCPBindings))
 	}
 	if err := restoreImportNodeRole(); err != nil {
 		err = session.abort(err)
@@ -1011,4 +1035,23 @@ func tlsSource(r convertedRule) string {
 		return "manual"
 	}
 	return ""
+}
+
+// v1CertificateWarnings 返回一条 v1 转化规则的手动证书质量警告（前缀与 v2
+// 备份导入同源）：规则保存与 v2 导入都会对手动证书做「域名不匹配/过期/未生效/
+// 链不完整」提示，v1 导入此前零判定——错域名或过期证书静默导入，上线后只在
+// 浏览器层面暴露。caddyID 为空（预览阶段尚未生成编号）时前缀只带规则名。
+func v1CertificateWarnings(r convertedRule, caddyID string) []string {
+	if !r.EnableTLS || r.TLSCert == "" || r.TLSKey == "" {
+		return nil
+	}
+	prefix := "规则 " + r.Name
+	if caddyID != "" {
+		prefix += "（" + caddyID + "）"
+	}
+	var out []string
+	for _, warning := range tlsCertificateWarnings(r.TLSCert, r.TLSKey, r.Domain) {
+		out = append(out, prefix+"："+warning)
+	}
+	return out
 }

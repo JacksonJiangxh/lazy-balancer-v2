@@ -22,6 +22,12 @@ func TestServicePackageHasNoProductionTestOnlyEntryPoints(t *testing.T) {
 		"parseRuleLabelMetrics": true,
 		"storeRuleMetricsText":  true,
 		"updateOverview":        true,
+		// 已迁到 *_test.go 的入口登记为绊线：搬回产品文件（含方法形态，
+		// FuncDecl 同时覆盖 Recv!=nil）即报错。
+		"parsePrometheusMetrics":     true,
+		"estimateLatencyPercentiles": true,
+		"upsertCrawlerIPList":        true,
+		"upsertCrawlerIPListChanged": true,
 	}
 	entries, err := os.ReadDir(".")
 	if err != nil {

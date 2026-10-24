@@ -462,7 +462,9 @@ func (h *Handlers) GetAuditLogs(c *gin.Context) {
 		var e AuditLogEntry
 		var createdAt time.Time
 		if err := rows.Scan(&e.ID, &e.Username, &e.Action, &e.Resource, &e.Detail, &e.IPAddress, &createdAt); err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取操作日志失败: " + err.Error()})
+			// 与计数分支同口径：本端点在 business 组，任意登录用户可读，响应
+			// 只回固定文案，扫描失败的表/列名与驱动错误只进运行日志。
+			writeInternalError(c, http.StatusInternalServerError, "读取操作日志失败", fmt.Errorf("扫描操作日志行: %w", err))
 			return
 		}
 		e.CreatedAt = createdAt.UTC().Format("2006-01-02 15:04:05")
@@ -473,7 +475,7 @@ func (h *Handlers) GetAuditLogs(c *gin.Context) {
 		logs = append(logs, e)
 	}
 	if err := rows.Err(); err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "遍历操作日志失败: " + err.Error()})
+		writeInternalError(c, http.StatusInternalServerError, "遍历操作日志失败", fmt.Errorf("遍历操作日志行: %w", err))
 		return
 	}
 	if logs == nil {

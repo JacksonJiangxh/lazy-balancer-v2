@@ -172,11 +172,15 @@
             <el-tooltip v-if="row.role_applicable === false" content="仅主节点生效：从节点不调度此任务，调度开关仅在主节点可用" placement="top" :offset="8" :show-after="150" :show-arrow="false">
               <el-tag size="small" type="info" effect="plain">仅主节点</el-tag>
             </el-tooltip>
-            <el-tooltip v-else-if="row.id === 'cert-waiting-ca'" content="有证书任务入队时自动唤醒" placement="top" :offset="8" :show-after="150" :show-arrow="false">
+            <el-tooltip v-else-if="row.id === 'cert-waiting-ca'" :content="scheduleStoppedTip(row) || '有证书任务入队时自动唤醒'" placement="top" :offset="8" :show-after="150" :show-arrow="false">
               <el-switch :model-value="!!row.loop_on" :disabled="!canOperate" @change="(v: string | number | boolean) => onToggle(row, !!v)" />
             </el-tooltip>
-            <el-tooltip v-else-if="row.kind !== 'oneshot'" :content="isBusinessDrivenTask(row) ? '由对应业务页自动更新控制' : '停止/恢复调度'" placement="top" :offset="8" :show-after="150" :show-arrow="false">
-              <el-switch :model-value="!!row.loop_on" :disabled="!canOperate || isBusinessDrivenTask(row)" @change="(v: string | number | boolean) => onToggle(row, !!v)" />
+            <el-tooltip v-else-if="row.kind !== 'oneshot'" :content="scheduleStoppedTip(row) || (isBusinessDrivenTask(row) ? '由对应业务页自动更新控制' : '停止/恢复调度')" placement="top" :offset="8" :show-after="150" :show-arrow="false">
+              <!-- 引擎自行停调（连续失败未推进排程槽）：业务驱动任务的开关在本页
+                   只读，恢复入口在业务页——用警示标签替代不可用开关，避免「关着的
+                   开关」被读成用户主动停止；非业务驱动任务保留开关（打开即恢复）。 -->
+              <el-tag v-if="row.schedule_stopped_reason && isBusinessDrivenTask(row)" size="small" type="danger" effect="plain">已停调</el-tag>
+              <el-switch v-else :model-value="!!row.loop_on" :disabled="!canOperate || isBusinessDrivenTask(row)" @change="(v: string | number | boolean) => onToggle(row, !!v)" />
             </el-tooltip>
             <!-- 触发类（含 cert-job 动态行）：统一显示禁用开关保持页面一致性——
                  仅手动/代码触发执行（2026-10-01 用户裁定；cert-job 特例已消除） -->
@@ -279,6 +283,9 @@
               <el-tag v-else size="small" type="info" effect="plain">不可调度</el-tag>
             </el-tooltip>
           </el-descriptions-item>
+          <el-descriptions-item v-if="detailTask.schedule_stopped_reason" label="停调原因">
+            <span class="tm-bad">{{ scheduleStoppedTip(detailTask) }}</span>
+          </el-descriptions-item>
           <!-- 与列表「下次执行」列同门（loop_on 且非常驻且角色适用）——停用
                任务的排程槽是陈旧预约值，详情无条件显示会与列表「—」口径分叉 -->
           <el-descriptions-item label="下次执行">{{ (detailTask.next_run_at && detailTask.loop_on && detailTask.kind !== 'daemon' && detailTask.role_applicable !== false) ? detailTask.next_run_at : '—' }}</el-descriptions-item>
@@ -375,6 +382,7 @@ interface TaskInfo {
   status: string; cancellable: boolean; controllable?: boolean; triggerable?: boolean
   last_run?: TaskRunInfo; next_run_at?: string; runs_24h: number; success_24h: number; fail_24h: number
   loop_on?: boolean; started_at?: string; business_driven?: boolean // 常驻族：循环启停态/引擎启动时刻
+  schedule_stopped_reason?: string // 引擎自行停调来源（fail-streak=自动轮连续失败未推进排程槽）
   role_applicable?: boolean // 本节点角色是否允许该任务运行（false=仅主节点，从节点视图标注）
 }
 interface RunRecord {
@@ -793,6 +801,19 @@ const kindTag = (k: string): 'primary' | 'success' | 'info' | 'warning' =>
   k === 'scheduled' ? 'primary' : k === 'daemon' ? 'success' : k === 'periodic' ? 'info' : 'warning'
 const kindTagClass = (k: string) => (k === 'periodic' ? 'tm-tag-periodic' : '')
 const isBusinessDrivenTask = (row: TaskInfo) => !!row.business_driven
+// 引擎自行停调的恢复入口与用户主动停止不同：业务驱动任务的调度开关在本页
+// 只读（后端 400），须到业务页重新保存「自动更新」（setter 会重新对齐调度），
+// 或重启进程；其余任务直接打开本页开关即恢复。空串=非引擎停调。
+const scheduleStoppedTip = (row: TaskInfo) => {
+  if (!row.schedule_stopped_reason) return ''
+  if (row.schedule_stopped_reason !== 'fail-streak') {
+    return '引擎已停止该任务自动调度：请先修复失败原因，再重新开启调度，或重启进程恢复'
+  }
+  const head = '引擎已停止自动调度（自动轮连续失败且排程槽未推进）'
+  return isBusinessDrivenTask(row)
+    ? `${head}：请先修复失败原因，再到对应业务页重新保存「自动更新」开关，或重启进程恢复`
+    : `${head}：请先修复失败原因，再打开本页调度开关恢复，或重启进程恢复`
+}
 const categoryOrder: Record<string, number> = { '安全防护': 0, '证书': 1, '备份': 2, '集群': 3, '系统': 4 }
 const categoryTagType = (c: string): 'primary' | 'success' | 'warning' | 'info' =>
   c === '安全防护' ? 'primary' : c === '证书' ? 'success' : c === '备份' ? 'warning' : 'info'

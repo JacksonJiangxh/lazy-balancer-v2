@@ -3,6 +3,7 @@ package services
 import (
 	"bytes"
 	"log"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -146,13 +147,16 @@ func TestScheduleReaders_logReadFailure(t *testing.T) {
 		t.Fatalf("logs=%q, want 含「读取任务排程失败」", logs.String())
 	}
 
-	// 畸形形状：nil 库守卫——不得 panic，返回默认排程。
-	db.DB = nil
-	if days, hhmm := globalTaskSchedule("threat"); len(days) == 0 || hhmm == "" {
+	// 畸形形状：nil 库守卫——读侧走原子句柄 db.GetDB()，必须摘除原子句柄才
+	// 能覆盖 nil 分支。只清 db.DB 时读侧仍持有旧句柄，用例只会证明「查询报错
+	// →回落」，将来删掉 nil 守卫仍会绿（鉴别力缺失）。不得 panic，返回默认排程。
+	db.SetDB(nil)
+	wantDays := ParseScheduleDays(db.DefaultScheduleDays)
+	if days, hhmm := globalTaskSchedule("threat"); !reflect.DeepEqual(days, wantDays) || hhmm != db.DefaultScheduleTime {
 		t.Fatalf("nil 库应返回默认排程, got %v %q", days, hhmm)
 	}
-	if _, hhmm := versionTableSchedule("security_crs_version"); hhmm == "" {
-		t.Fatalf("nil 库版本表排程应回落默认, got %q", hhmm)
+	if days, hhmm := versionTableSchedule("security_crs_version"); !reflect.DeepEqual(days, wantDays) || hhmm != db.DefaultScheduleTime {
+		t.Fatalf("nil 库版本表排程应回落默认, got %v %q", days, hhmm)
 	}
 }
 

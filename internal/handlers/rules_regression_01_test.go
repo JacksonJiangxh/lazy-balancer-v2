@@ -184,7 +184,7 @@ func TestDisableRule_certJobPredicateKeepsFailed(t *testing.T) {
 	}
 }
 
-// ──：weight<1 保存侧响亮拒绝 ───────────────────────────────────────────
+// weight<1 保存侧响亮拒绝
 
 func postCreateRule(t *testing.T, handler *Handlers, body map[string]any) *httptest.ResponseRecorder {
 	t.Helper()

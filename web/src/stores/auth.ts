@@ -78,8 +78,13 @@ export const useAuthStore = defineStore('auth', () => {
   const isSlaveNode = computed(() => nodeMode.value === 'slave')
 
   let userRetryTimer: number | null = null
+  // 隐藏页停表留下的待补查标记：定时器在后台到期时只记标记、不排下一轮，
+  // 由 visibilitychange 补查消费（与 /config 的「hidden 停表 + visible 补查」
+  // 同范式，避免后台标签页每 15s 唤醒一次）。
+  let userRetryDeferred = false
 
   const clearUserRetryTimer = (): void => {
+    userRetryDeferred = false
     if (userRetryTimer !== null) {
       window.clearTimeout(userRetryTimer)
       userRetryTimer = null
@@ -88,8 +93,15 @@ export const useAuthStore = defineStore('auth', () => {
 
   const scheduleUserRetry = (): void => {
     if (userRetryTimer !== null || !token.value) return
+    bindVisibilityRefresh()
     userRetryTimer = window.setTimeout(() => {
       userRetryTimer = null
+      // 后台标签页不发请求，也不顺延定时器；改记待补查标记，恢复可见时
+      // 由 visibilitychange 立即补拉，回来时不必再等一个周期。
+      if (typeof document !== 'undefined' && document.hidden) {
+        userRetryDeferred = true
+        return
+      }
       void fetchUser()
     }, 15_000)
   }
@@ -141,13 +153,20 @@ export const useAuthStore = defineStore('auth', () => {
   // 恢复可见立即补查（与 usePollingTask/useLogTailPolling 的
   // 「hidden 暂停 + visible 立即补拉」同范式）——15s 轮询在隐藏页被顺延，
   // 回来时不必再等一个周期。单次绑定（store 生命周期内常驻；token 已清时空转）。
-  const bindConfigVisibilityRefresh = (): void => {
+  // /config 与 /users/me 两条重试链共用此监听，停表后都必须有人补查。
+  const bindVisibilityRefresh = (): void => {
     if (configVisibilityBound || typeof document === 'undefined') return
     configVisibilityBound = true
     document.addEventListener('visibilitychange', () => {
       if (document.hidden || !token.value) return
       clearConfigRetryTimer()
       void fetchConfig(true)
+      // 用户信息只在「隐藏期间有待补查」时补拉：已成功拉取且无待重试时，
+      // 每次回前台都打一发 /users/me 属无谓出站。
+      if (userRetryDeferred) {
+        userRetryDeferred = false
+        void fetchUser()
+      }
     })
   }
 
@@ -155,7 +174,7 @@ export const useAuthStore = defineStore('auth', () => {
   // 单定时器防重让登录、设置保存与后台刷新可以共用此入口而不叠加轮询。
   const scheduleConfigRetry = (): void => {
     if (configRetryTimer !== null || !token.value) return
-    bindConfigVisibilityRefresh()
+    bindVisibilityRefresh()
     configRetryTimer = window.setTimeout(() => {
       configRetryTimer = null
       // 后台标签页不发请求，也不顺延定时器：隐藏页每 15s 唤醒一次等于永久

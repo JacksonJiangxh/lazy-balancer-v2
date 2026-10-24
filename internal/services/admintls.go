@@ -63,28 +63,17 @@ func RuntimeAdminTLSChanged(cfg AdminTLSConfig) bool {
 	return *v != fingerprintAdminTLS(cfg)
 }
 
-// LoadAdminTLSConfig 是只读消费面的降级变体：查询失败 warn 后按 selfsigned
-// 默认形态返回（Get/启动/集群比较对可用性敏感，一次读失败不中断）。写路径
-// 与备份合并路径必须使用 LoadAdminTLSConfigE——降级默认值不可作为读-改-写
-// 基线。
-func LoadAdminTLSConfig() AdminTLSConfig {
-	if db.DB == nil {
-		return AdminTLSConfig{Mode: "selfsigned"}
-	}
-	cfg, err := LoadAdminTLSConfigE()
-	if err != nil {
-		// 查询失败不得无声吞掉——warn 留痕后按默认形态返回（API
-		// 形态不变；db nil 分支属启动窗口正常路径不告警）。
-		Logf("warn", "LoadAdminTLSConfig: query failed, falling back to selfsigned default: %v", err)
-		return AdminTLSConfig{Mode: "selfsigned"}
-	}
-	return cfg
-}
-
-// LoadAdminTLSConfigE 是写/合并路径的严格变体：读取失败（db 未
-// 初始化、查询错误、行缺失）返回 error。调用方必须中止写操作——把降级默认
-// 值当现有配置合并，会在「本次 SELECT 失败 + 随后 UPDATE 成功」的时序里把已
-// 上传证书/私钥改写为空，且接口仍可能返回成功。
+// LoadAdminTLSConfigE 是唯一读入口：读取失败（db 未初始化、查询错误、行缺失）
+// 一律返回 error，由调用方按场景处置。
+//   - 写/合并路径必须中止：把降级默认值当现有配置合并，会在「本次 SELECT
+//     失败、随后 UPDATE 成功」的时序里把已上传证书/私钥改写为空，且接口仍可能
+//     返回成功；
+//   - 启动监听必须拒绝启动：降级默认值 Enabled=false 会让进程以明文 HTTP 提供
+//     管理面（安全属性静默丢失，而不是「HTTPS 关闭」）；
+//   - 展示与重启判定必须显式披露/跳过：不得把降级值当真值比对（假「需重启」）。
+//
+// 不再提供「读失败回退 selfsigned/未启用」的宽容变体——它的三类消费方都会
+// 把「读不到」误解成一条真实配置。
 func LoadAdminTLSConfigE() (AdminTLSConfig, error) {
 	cfg := AdminTLSConfig{Mode: "selfsigned"}
 	if db.DB == nil {

@@ -82,9 +82,17 @@ export interface PolicyPayload {
   policy_type?: string
 }
 
+/**
+ * 信任名单生效判定（编辑器口径单源）：阶段 0 恒启用（名单非空即生效），其余类型
+ * 按三态开关。保存载荷、向导冲突告警与阶段预览必须共用本谓词——告警/预览各自
+ * 读取开关会在「新建阶段 0」时把恒启用的信任条目判成零生效（ipWhitelistEnabled
+ * 初值 false 且向导内无开关控件）。
+ */
+export const trustEnabledForPolicyType = (policyType: string, ipWhitelistEnabled: boolean): boolean =>
+  policyType === 'stage0' || ipWhitelistEnabled
+
 export const buildPolicyPayload = (input: PolicyPayloadInput): PolicyPayload => {
-  const trustAlwaysEnabled = input.policyType === 'stage0'
-  const trustEnabled = trustAlwaysEnabled || input.ipWhitelistEnabled
+  const trustEnabled = trustEnabledForPolicyType(input.policyType, input.ipWhitelistEnabled)
   return {
     name: input.name,
     description: input.description,

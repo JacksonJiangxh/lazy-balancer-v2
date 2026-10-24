@@ -38,10 +38,11 @@ var internalMCPAuthSecret = rand.Text()
 // 测试可覆盖它以模拟瞬时 DB 失败。
 var jwtAuthenticationQuery func(database *sql.DB, query string, args ...any) *sql.Row
 
-// mfaUserEnabledCheck：MFA 启用态查询的测试注入点（与 jwtAuthenticationQuery 同模式）——
-// fail-closed 回归测试需要模拟「瞬时 DB 失败」，真实关闭 DB 会
+// mfaUserEnabledCheckWith：MFA 启用态查询的测试注入点（与 jwtAuthenticationQuery
+// 同模式）——fail-closed 回归测试需要模拟「瞬时 DB 失败」，真实关闭 DB 会
 // 连带让 jwtAuth 的会话校验先失败（401），无法单独触发守卫分支。
-var mfaUserEnabledCheck = services.MFAUserEnabled
+// 句柄首参：守卫链上必须读装配期注入的库（与角色读取同源），不得回落到包级 db.DB。
+var mfaUserEnabledCheckWith = services.MFAUserEnabledWith
 
 var recordAuthenticationSecurityAudit = services.RecordAuditLog
 var authenticationSecurityAuditNow = time.Now
@@ -92,12 +93,23 @@ type authenticationAuditLimiter struct {
 // enqueueLocked 把键登记到回收队列尾部（调用方须持有 mu）。入队时间不小于
 // 队列内已有条目时队列保持升序；非单调的 now（时钟回拨）只会让回收延后，
 // 不改变语义（回收到期判定仍按表内时间戳）。
+//
+// 环满时覆盖队头，被覆盖条目的「回收点」随之消失：若它恰是表内该键仅存的
+// 登记（时间戳一致），该键从此进不了回收视野——表会撑到硬上限并永久丢弃新
+// 审计（只有重启才恢复）。故覆盖时同步删除这样的键（「覆盖即淘汰」），把
+// 丢掉的回收点补回来：被淘汰的是队内最久未命中的键，其代价仅是去重窗提前
+// 结束（洪水量级下的最佳努力留痕优先于「每条只记一次」）。
 func (limiter *authenticationAuditLimiter) enqueueLocked(key string, at time.Time) {
 	if len(limiter.reclaim) == 0 {
 		limiter.reclaim = make([]authenticationAuditEvent, authenticationAuditQueueCapacity)
 	}
 	if limiter.reclaimCount == len(limiter.reclaim) {
 		// 环满：覆盖队头（最旧条目退化为可丢弃），队列长度恒有界。
+		if overwritten := limiter.reclaim[limiter.reclaimHead]; overwritten.key != key {
+			if last, live := limiter.events[overwritten.key]; live && last.Equal(overwritten.at) {
+				delete(limiter.events, overwritten.key)
+			}
+		}
 		limiter.reclaim[limiter.reclaimHead] = authenticationAuditEvent{key: key, at: at}
 		limiter.reclaimHead = (limiter.reclaimHead + 1) % len(limiter.reclaim)
 		return
@@ -1057,6 +1069,9 @@ func SetupRouter(h *handlers.Handlers, cfg *config.Config) *gin.Engine {
 				}
 				nonAdminForbidden[route] = struct{}{}
 			}
+			// mcpserver 的可见性名单是进程级全局（最后一次 SetupRouter 覆写）：
+			// 生产单例无碍；测试/嵌入同时装配两个 router 时后者生效。名单内容
+			// 只取决于路由注册记录，单例部署下不存在跨实例污染。
 			mcpserver.SetNonAdminForbiddenRoutes(nonAdminForbidden)
 		}
 	}
@@ -1471,7 +1486,9 @@ func mfaStepUpGuard(database *sql.DB) gin.HandlerFunc {
 		// 判定单源（handlers.DecideMFAStepUp）：覆盖面、机器身份、机制本体/
 		// 只读语义写路由豁免、OIDC 会话短路、开关与 MFA 状态读取、宽限窗全部
 		// 只有一份——handler 内联副本（特权 API Key 创建）共用同一实现。
-		decision, decisionErr := handlers.DecideMFAStepUp(c, covered, mfaUserEnabledCheck)
+		decision, decisionErr := handlers.DecideMFAStepUp(c, covered, database, func(userID int) (bool, error) {
+			return mfaUserEnabledCheckWith(database, userID)
+		})
 		if decisionErr != nil {
 			if errors.Is(decisionErr, handlers.ErrMFAStepUpGuardUnreadable) {
 				// 2026-09-08 裁定维持：DB 读失败时守卫关闭是

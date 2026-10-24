@@ -268,3 +268,25 @@ func ResetThreatScreenAttackFlowForTest() {
 	threatScreenAttackFlowAttempt.Store(0)
 	threatScreenAttackFlowSampleN.Store(0)
 }
+
+// ThreatScreenAttackFlowAppendForTest 测试缝：直接向环形缓冲追加一条光流
+// 事件并返回分配到的序号（过滤/空洞判定的跨包用例需要可控的入环序列；
+// 生产路径经 threatScreenAttackFlowRecordBatch 在 security_events 事务提交后
+// 写入）。绕过采样与租约——采样状态由租约函数独立布置。
+func ThreatScreenAttackFlowAppendForTest(clientIP, action, ruleTriggered string) uint64 {
+	threatScreenAttackFlowMu.Lock()
+	defer threatScreenAttackFlowMu.Unlock()
+	seq := threatScreenAttackFlowSeq.Add(1)
+	threatScreenAttackFlowEvents = append(threatScreenAttackFlowEvents, ThreatScreenAttackFlowEvent{
+		Seq:           seq,
+		At:            time.Now().UnixMilli(),
+		ClientIP:      clientIP,
+		Action:        action,
+		RuleTriggered: ruleTriggered,
+		Weight:        1,
+	})
+	if over := len(threatScreenAttackFlowEvents) - threatScreenAttackFlowRingMax; over > 0 {
+		threatScreenAttackFlowEvents = threatScreenAttackFlowEvents[over:]
+	}
+	return seq
+}

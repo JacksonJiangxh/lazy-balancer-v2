@@ -8,6 +8,7 @@ package middleware
 
 import (
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -64,5 +65,31 @@ func TestClusterVersionTrigger_bumpsForRetentionAndSampleColumns(t *testing.T) {
 				t.Fatalf("cluster_version=%d after updating %s, want 101 (column missing from OF list)", got, column)
 			}
 		})
+	}
+}
+
+// TestGlobalConfigSyncedColumns_existInSchema 是单向护栏的补面：清单里的每一列
+// 都必须真实存在于 global_config。反向漏检时，列改名/删除而清单未同步会让
+// CREATE TRIGGER ... OF <不存在列> 整语句失败——InstallClusterVersionTriggers
+// 返回错误，启动门拒绝启动，装配期则让全部分类写 500（且错误文案指向触发器
+// 不可用而非缺列）。对照 cluster_synced_columns_test.go 的同款 stale 分支。
+func TestGlobalConfigSyncedColumns_existInSchema(t *testing.T) {
+	cleanup := syncedSchemaTestDB(t)
+	defer cleanup()
+
+	known := map[string]bool{}
+	for _, column := range pragmaTableColumns(t, "global_config") {
+		known[column] = true
+	}
+	var stale []string
+	for _, column := range globalConfigSyncedColumns {
+		if !known[column] {
+			stale = append(stale, column)
+		}
+	}
+	sort.Strings(stale)
+	if len(stale) > 0 {
+		t.Fatalf("清单列在 global_config 中不存在：%s（陈旧列会让触发器 CREATE 失败→全部分类写 500）",
+			strings.Join(stale, ","))
 	}
 }

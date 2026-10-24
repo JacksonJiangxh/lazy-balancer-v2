@@ -258,6 +258,7 @@ func TestUpdateAutoBackupSettings_validationMatrix(t *testing.T) {
 		{name: "unknown frequency", body: `{"enabled":true,"frequency":"hourly","time":"02:30","day":3,"keep":5,"sections":["users","rules"]}`},
 		{name: "empty frequency", body: `{"enabled":true,"frequency":"","time":"02:30","day":3,"keep":5,"sections":["users","rules"]}`},
 		{name: "missing frequency", body: `{"enabled":true,"time":"02:30","day":3,"keep":5,"sections":["users","rules"]}`},
+		{name: "daily missing day", body: `{"enabled":true,"frequency":"daily","time":"03:00","keep":5,"sections":["users","rules"]}`},
 		{name: "time missing leading zero", body: `{"enabled":true,"frequency":"daily","time":"2:30","day":1,"keep":5,"sections":["users","rules"]}`},
 		{name: "time hour overflow", body: `{"enabled":true,"frequency":"daily","time":"24:00","day":1,"keep":5,"sections":["users","rules"]}`},
 		{name: "time minute overflow", body: `{"enabled":true,"frequency":"daily","time":"03:60","day":1,"keep":5,"sections":["users","rules"]}`},

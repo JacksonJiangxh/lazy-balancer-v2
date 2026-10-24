@@ -55,14 +55,19 @@ func TestLbbakImport_commitFailureRestoresWafFilesToPreImportBytes(t *testing.T)
 		t.Fatal(err)
 	}
 
-	// 导入前现场：CRS 内容不同且多一个只属于本地的文件；xdb 不存在；
-	// 威胁名单文本与编译产物都与备份不同。
+	// 导入前现场：CRS 内容与 VERSION 都不同且多一个只属于本地的文件；xdb
+	// 不存在；威胁名单文本与编译产物都与备份不同。VERSION 必须与包内字节不同，
+	// 否则「回滚」与「导入已生效」在字节上不可区分。
+	preImportVERSION := []byte("v0.9.9-preimport\n")
 	preImportCRS := []byte("# pre-import-crs\n")
 	preImportThreat := []byte("198.51.100.250/32\n")
 	preImportFast := []byte("PRE-IMPORT-FAST\n")
 	localOnlyContent := []byte("keep-me\n")
 	localOnlyPath := filepath.Join(crsDir, "rules", "local-only.conf")
 	if err := os.WriteFile(filepath.Join(crsDir, "rules", "crs-setup.conf"), preImportCRS, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(crsDir, "VERSION"), preImportVERSION, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(localOnlyPath, localOnlyContent, 0o644); err != nil {
@@ -80,12 +85,26 @@ func TestLbbakImport_commitFailureRestoresWafFilesToPreImportBytes(t *testing.T)
 	// Caddy 预检拒绝：WAF 文件已落盘、事务尚未提交。
 	h.caddyService.SetCLIValidatorForTest(func([]byte) error { return errors.New("cli: reject import") })
 	versionRowCountsBefore := map[string]int{}
-	for _, table := range []string{"security_crs_version", "security_ip2region_version"} {
+	versionValuesBefore := map[string]string{}
+	readVersionRow := func(table string) (int, string) {
+		t.Helper()
 		var count int
 		if err := db.DB.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&count); err != nil {
 			t.Fatal(err)
 		}
-		versionRowCountsBefore[table] = count
+		var value string
+		if err := db.DB.QueryRow("SELECT COALESCE((SELECT version FROM " + table + " ORDER BY id LIMIT 1),'')").Scan(&value); err != nil {
+			t.Fatal(err)
+		}
+		return count, value
+	}
+	for _, table := range []string{"security_crs_version", "security_ip2region_version"} {
+		versionRowCountsBefore[table], versionValuesBefore[table] = readVersionRow(table)
+	}
+	// 夹具自检：两份版本表的导入前值与包内值必须可区分，行数 1→1 形态下
+	// 只有值级断言能发现「导入已提交而文件已回退」的分裂。
+	if versionValuesBefore["security_crs_version"] == "v4.29.0" || versionValuesBefore["security_ip2region_version"] == "xdb-backup" {
+		t.Fatalf("pre-import version values=%v 与包内值相同，断言不可判别", versionValuesBefore)
 	}
 
 	// When
@@ -104,7 +123,7 @@ func TestLbbakImport_commitFailureRestoresWafFilesToPreImportBytes(t *testing.T)
 	// CRS 整树逐字节回到导入前（含仅存在于导入前的本地文件与不同内容）。
 	assertFileBytes(t, filepath.Join(crsDir, "rules", "crs-setup.conf"), preImportCRS)
 	assertFileBytes(t, localOnlyPath, localOnlyContent)
-	assertFileBytes(t, filepath.Join(crsDir, "VERSION"), backupVERSION)
+	assertFileBytes(t, filepath.Join(crsDir, "VERSION"), preImportVERSION)
 	// 导入前不存在的 xdb 与其版本标记必须被删除回「不存在」。
 	if _, err := os.Stat(xdbPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("xdb must be absent again after rollback, err=%v", err)
@@ -115,14 +134,15 @@ func TestLbbakImport_commitFailureRestoresWafFilesToPreImportBytes(t *testing.T)
 	// 威胁名单文本与编译产物逐字节回到导入前。
 	assertFileBytes(t, filepath.Join(wafDir, "threat-ustc.iplist"), preImportThreat)
 	assertFileBytes(t, filepath.Join(wafDir, "threat-ustc.iplist.fast"), preImportFast)
-	// 数据库同样已回滚：版本表行数与导入前一致（不残留导入行，也不丢本地行）。
+	// 数据库同样已回滚：版本表行数与**值**都与导入前一致（不残留导入行，也不
+	// 丢本地行）。行数可能是 1→1 的恒等形态，必须比对值。
 	for _, table := range []string{"security_crs_version", "security_ip2region_version"} {
-		var count int
-		if err := db.DB.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&count); err != nil {
-			t.Fatal(err)
-		}
+		count, value := readVersionRow(table)
 		if count != versionRowCountsBefore[table] {
 			t.Fatalf("%s rows=%d after rollback, want pre-import %d", table, count, versionRowCountsBefore[table])
+		}
+		if value != versionValuesBefore[table] {
+			t.Fatalf("%s version=%q after rollback, want pre-import %q", table, value, versionValuesBefore[table])
 		}
 	}
 }

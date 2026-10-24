@@ -34,7 +34,10 @@ type importValidationOptions struct {
 // 被校验的备份上）。链本身不产生审计副作用——审计动作由调用方按这些事实决定
 // （预览只读不落审计，因此不可放进链内）。
 type importValidationResult struct {
-	UsedLegacyChecksum      bool
+	UsedLegacyChecksum bool
+	// NoIntegrityChecksum v1 史前备份完全不含完整性校验和（比旧格式校验和
+	// 更弱）——导入照常但必须披露；预览侧转为 warning。
+	NoIntegrityChecksum     bool
 	SectionTables           map[string]bool
 	IncludeGlobal           bool
 	SkipWarnings            []string
@@ -143,11 +146,12 @@ func (ch *importValidationChain) snapshotExportedTables() error {
 }
 
 func (ch *importValidationChain) verifyIntegrity() error {
-	usedLegacy, err := verifyBackupIntegrity(*ch.backup)
+	integrity, err := verifyBackupIntegrity(*ch.backup)
 	if err != nil {
 		return err
 	}
-	ch.result.UsedLegacyChecksum = usedLegacy
+	ch.result.UsedLegacyChecksum = integrity.LegacyChecksum
+	ch.result.NoIntegrityChecksum = integrity.NoChecksum
 	return nil
 }
 

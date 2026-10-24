@@ -28,7 +28,7 @@
         </el-form-item>
         <el-form-item label="自动续签时间">
           <el-input-number v-model="global.cert_renewal_days" :min="1" :max="CERT_RENEWAL_DAYS_MAX" />
-          <span class="form-tip-inline">证书到期前多少天自动尝试重签；建议不超过 60，上限 {{ CERT_RENEWAL_DAYS_MAX }} 天——窗口接近证书寿命（90 天）时，刚签发的证书仍落在窗口内，会反复重签并被 CA 限流。0 = 默认 30 天（仅 API 直写/备份导入可达，本控件下限为 1）</span>
+          <span class="form-tip-inline">证书到期前多少天自动尝试重签；建议不超过 60，上限 {{ CERT_RENEWAL_DAYS_MAX }} 天。选到 84–88 天（超过证书寿命 − 7 天）时，系统按证书实际寿命把窗口收敛为到期前 7 天再续签，并对该规则每小时留一条告警（库值保持原样）；到期前 7 天是续签保护区，任何配置都不会更晚。0 = 默认 30 天（仅 API 直写/备份导入可达，本控件下限为 1）</span>
         </el-form-item>
         <el-form-item label="续签重试次数">
           <el-input-number v-model="global.cert_renewal_attempts" :min="1" :max="10" />
@@ -583,17 +583,23 @@ const openConfigDialog = (config?: CertConfig) => {
     const providerFields = providers.value.find((p) => p.code === config.dns_provider)?.credential_fields ?? []
     const selects = providerFields.filter((f) => f.type === 'select' && (f.options?.length ?? 0) > 0)
     const canPruneHidden = selects.length > 0 && selects.every((f) => (parsedCreds[f.name] ?? '') !== '')
+    // 表单初值与挑战基线必须同源：基线用未裁剪的库值、表单用裁剪后的凭证时，
+    // 只要库里存在被当前元数据判为隐藏的键（导入/带外写/旧版本遗留，或后端
+    // 未来调整 visible_when），键集必然不同 → 仅改名/仅停用也被判「凭证变更」
+    // 而强制真实 DNS 挑战。
+    const initialCredentials = canPruneHidden ? applyCredentialFieldChange(providerFields, parsedCreds) : { ...parsedCreds }
     form.value = {
       name: config.name,
       dns_provider: config.dns_provider,
-      dns_credentials: canPruneHidden ? applyCredentialFieldChange(providerFields, parsedCreds) : parsedCreds,
+      dns_credentials: initialCredentials,
       enabled: config.enabled,
     }
-    // 挑战判定基线＝打开弹框时的库值（凭证快照按原样，未填过即 null）——
-    // 与保存时的表单自比会恒等，改名/禁用就再也判不出「无需验证」。
+    // 挑战判定基线＝打开弹框时的库值（凭证快照按与表单同一份归一结果取拷贝，
+    // 未填过即 null）——与保存时的表单自比会恒等，改名/禁用就再也判不出
+    // 「无需验证」；直接快照原样库值则会把不可见的隐藏键算进差异。
     configBaseline.value = {
       dnsProvider: config.dns_provider,
-      dnsCredentials: legacyEmptyCredentials.value ? null : { ...parsedCreds },
+      dnsCredentials: legacyEmptyCredentials.value ? null : { ...initialCredentials },
       enabled: config.enabled,
     }
   } else {

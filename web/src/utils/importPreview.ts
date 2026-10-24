@@ -8,12 +8,36 @@
  *
  * 缓存只影响预览文案：确认导入时后端对同一份字节重跑完整校验（校验和 + 行级
  * 门），冲突/警告以那次真实结果为准，陈旧预览不会让问题备份被静默写入。
+ *
+ * 预览事实依赖服务端当时的库状态，故缓存有两条时效边界：条目 TTL 5 分钟，且
+ * 导入/还原弹框每次打开时由调用方 invalidateImportPreviews() 清空。
  */
 
 /** 单个会话的校验结果缓存上限（一份备份通常只会被勾选几次；防止长会话无界增长）。 */
 const MAX_CACHED_PREVIEWS = 32
 
-const previewCache = new Map<string, unknown>()
+/** 缓存有效期。预览事实（冲突、悬挂告警、策略引用）依赖服务端「当时」的库
+ *  状态，而键只有内容指纹 + 分类集合——不加时效就可能在配置改变后仍返回旧
+ *  预览（管理员刚删掉一个 CA 提供商，预览却仍显示无悬挂告警）。 */
+const PREVIEW_CACHE_TTL_MS = 5 * 60 * 1000
+
+interface PreviewCacheEntry {
+  readonly value: unknown
+  readonly at: number
+}
+
+const previewCache = new Map<string, PreviewCacheEntry>()
+
+/**
+ * 清空跨会话预览缓存。
+ *
+ * 导入/还原弹框每次打开时调用：用户可能在两次预览之间改了配置（删 CA 提供商、
+ * 改规则），旧结果已不代表当前库状态。TTL 只是第二道保险，打开弹框即清空才能
+ * 保证「同一份备份的第二次预览 = 当前库状态」。
+ */
+export const invalidateImportPreviews = (): void => {
+  previewCache.clear()
+}
 
 export interface ImportPreviewResult<T> {
   readonly value: T
@@ -41,13 +65,17 @@ export const createImportPreviewSession = <T>(options: ImportPreviewSessionOptio
     async validate(sections) {
       // 分类集合与顺序无关（后端按集合过滤），去重排序后才是一个稳定的键
       const key = `${options.fingerprint}\u0000${[...new Set(sections)].sort().join(',')}`
-      if (previewCache.has(key)) return { value: previewCache.get(key) as T, cached: true }
+      const cached = previewCache.get(key)
+      if (cached && Date.now() - cached.at < PREVIEW_CACHE_TTL_MS) {
+        return { value: cached.value as T, cached: true }
+      }
+      if (cached) previewCache.delete(key)
       controller?.abort()
       const current = new AbortController()
       controller = current
       try {
         const value = await options.send(sections, current.signal)
-        previewCache.set(key, value)
+        previewCache.set(key, { value, at: Date.now() })
         if (previewCache.size > MAX_CACHED_PREVIEWS) {
           const oldest = previewCache.keys().next()
           if (!oldest.done) previewCache.delete(oldest.value)

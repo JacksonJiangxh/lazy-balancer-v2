@@ -205,7 +205,7 @@ func (h *Handlers) ListCertJobs(c *gin.Context) {
 
 	rows, err := db.DB.Query(query, args...)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "Failed to query cert jobs"})
+		writeInternalError(c, http.StatusInternalServerError, "查询证书任务失败", err)
 		return
 	}
 	defer rows.Close()
@@ -215,13 +215,13 @@ func (h *Handlers) ListCertJobs(c *gin.Context) {
 	for rows.Next() {
 		var j certJobListItem
 		if err := j.scanFrom(rows, now, expiryDays); err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取证书任务失败: " + err.Error()})
+			writeInternalError(c, http.StatusInternalServerError, "读取证书任务失败", err)
 			return
 		}
 		jobs = append(jobs, j)
 	}
 	if err := rows.Err(); err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取证书任务失败: " + err.Error()})
+		writeInternalError(c, http.StatusInternalServerError, "读取证书任务失败", err)
 		return
 	}
 	c.Header("X-Page", strconv.FormatInt(page, 10))
@@ -240,7 +240,10 @@ func (h *Handlers) GetCurrentCertJobs(c *gin.Context) {
 		return
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求格式错误: " + err.Error()})
+		// gin 解析文本含 Go 字段名/英文（只读白名单端点，任意只读凭据可触发）：
+		// 响应固定中文文案，细节只进运行日志。
+		services.Logf("warn", "GetCurrentCertJobs: 请求体校验失败: %v", err)
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求格式错误"})
 		return
 	}
 	if len(req.RuleIDs) > 200 {
@@ -272,7 +275,7 @@ func (h *Handlers) GetCurrentCertJobs(c *gin.Context) {
 	for rows.Next() {
 		var job models.CertJob
 		if err := rows.Scan(&job.ID, &job.RuleID, &job.Domain, &job.CAProviderID, &job.CAProviderName, &job.Status, &job.Message, &job.RenewalAttempts, &job.CAAvailableAfter, &job.LastErrorCode, &job.ExpiresAt, &job.CreatedAt, &job.UpdatedAt); err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取证书任务失败: " + err.Error()})
+			writeInternalError(c, http.StatusInternalServerError, "读取证书任务失败", err)
 			return
 		}
 		if result[job.RuleID] == nil {
@@ -280,7 +283,7 @@ func (h *Handlers) GetCurrentCertJobs(c *gin.Context) {
 		}
 	}
 	if err := rows.Err(); err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取证书任务失败: " + err.Error()})
+		writeInternalError(c, http.StatusInternalServerError, "读取证书任务失败", err)
 		return
 	}
 	c.JSON(http.StatusOK, models.APIResponse{Code: 0, Data: result})

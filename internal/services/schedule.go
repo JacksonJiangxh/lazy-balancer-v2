@@ -214,15 +214,20 @@ func RearmScheduleSlotsAfterTimezoneChange() {
 		}
 	}
 	// 威胁/爬虫源表：逐启用行重排（行键不同——威胁按 id、爬虫按 name）。
+	// 威胁族带注册表名过滤（与读侧寻槽、首槽武装同源）：注册表外启用行的槽
+	// 不属于运行域，重排只会把被清理的惰性槽又写回去。
 	for _, st := range []struct {
 		table  string
 		keyCol string
 		slotFn func(time.Time) string
+		names  []string
 	}{
-		{"security_threat_sources", "id", threatNextSlot},
-		{"security_crawler_sources", "name", crawlerNextSlot},
+		{"security_threat_sources", "id", threatNextSlot, threatSourceRegistryNames()},
+		{"security_crawler_sources", "name", crawlerNextSlot, nil},
 	} {
-		rows, err := database.Query(`SELECT ` + st.keyCol + `, COALESCE(next_update,'') FROM ` + st.table + ` WHERE update_enabled=1 AND COALESCE(next_update,'')<>''`)
+		nameClause, nameArgs := sourceNameSetClause("name", st.names, false)
+		rows, err := database.Query(`SELECT `+st.keyCol+`, COALESCE(next_update,'') FROM `+st.table+`
+			WHERE update_enabled=1 AND COALESCE(next_update,'')<>''`+nameClause, nameArgs...)
 		if err != nil {
 			Logf("warn", "时区变更重排：读取 %s 排程失败: %v", st.table, err)
 			continue
@@ -535,16 +540,9 @@ func earliestEnabledSourceUpdate(sourceTable string, names []string) string {
 	if database == nil {
 		return ""
 	}
-	// 名过滤与威胁族运行域同源（db.ThreatSystemLists 的 Source 集合）。
-	// 空名单不拼子句（此时保持「全部启用行」——与爬虫族运行域一致）。
-	nameClause, args := "", make([]any, 0, len(names))
-	if len(names) > 0 {
-		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(names)), ",")
-		nameClause = " AND name IN (" + placeholders + ")"
-		for _, name := range names {
-			args = append(args, name)
-		}
-	}
+	// 名过滤与威胁族运行域同源（threatSourceRegistryNames）。空名单不拼子句
+	//（此时保持「全部启用行」——与爬虫族运行域一致）。
+	nameClause, args := sourceNameSetClause("name", names, false)
 	var next string
 	if err := database.QueryRow(`SELECT datetime(next_update) FROM `+sourceTable+`
 		WHERE update_enabled=1
@@ -565,10 +563,11 @@ func earliestEnabledSourceUpdate(sourceTable string, names []string) string {
 	return next
 }
 
-// earliestThreatNextUpdate 威胁族槽域 = 运行域（注册表源名集合）：
-// 运行体 threatDueSources 只处理注册表列出的源，槽域必须同步收窄，
-// 见 earliestEnabledSourceUpdate 的停滞机理说明。
-func earliestThreatNextUpdate() string {
+// threatSourceRegistryNames 威胁族运行域（内置注册表源名集合）单源：读侧最早
+// 槽、首槽武装、时区重排与启动期注册表外槽清理必须共用同一集合——任一路径
+// 漏过滤都会让「槽域=运行域」在数据面失效（清理刚清空的槽会被同一次装配的
+// 无过滤武装反向补回）。
+func threatSourceRegistryNames() []string {
 	registry := db.ThreatSystemLists()
 	names := make([]string, 0, len(registry))
 	for _, source := range registry {
@@ -576,7 +575,34 @@ func earliestThreatNextUpdate() string {
 			names = append(names, source.Source)
 		}
 	}
-	return earliestEnabledSourceUpdate("security_threat_sources", names)
+	return names
+}
+
+// sourceNameSetClause 把源名集合编译为含前导 " AND " 的 `column IN (...)` /
+// `column NOT IN (...)` 谓词。集合为空返回空串与 nil：空集合加 IN 会命中零行、
+// 加 NOT IN 会命中全部行，都不等价于「不过滤」，调用方必须按空名单显式决定
+// 语义（威胁族注册表为空时不做过滤，与运行体不筛源的形态一致）。
+func sourceNameSetClause(column string, names []string, negate bool) (string, []any) {
+	if len(names) == 0 {
+		return "", nil
+	}
+	op := " IN ("
+	if negate {
+		op = " NOT IN ("
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(names)), ",")
+	args := make([]any, 0, len(names))
+	for _, name := range names {
+		args = append(args, name)
+	}
+	return " AND " + column + op + placeholders + ")", args
+}
+
+// earliestThreatNextUpdate 威胁族槽域 = 运行域（注册表源名集合）：
+// 运行体 threatDueSources 只处理注册表列出的源，槽域必须同步收窄，
+// 见 earliestEnabledSourceUpdate 的停滞机理说明。
+func earliestThreatNextUpdate() string {
+	return earliestEnabledSourceUpdate("security_threat_sources", threatSourceRegistryNames())
 }
 
 // earliestCrawlerNextUpdate 爬虫族运行域=全部启用行（crawlerDueSources 不按
@@ -627,8 +653,10 @@ func SetIP2RegionSchedule(days []int, hhmm string) error {
 }
 
 // setGlobalTaskSchedule 保存任务级排程并事务化重排启用源 next_update。
-// 配置列前缀与源表由内部调用方固定传入，不接受外部输入。
-func setGlobalTaskSchedule(prefix, sourceTable string, days []int, hhmm string) error {
+// 配置列前缀与源表由内部调用方固定传入，不接受外部输入。names 是该族的运行域
+// 源名集合（威胁族传注册表源名，爬虫族传 nil=全部启用行）：槽域必须等于
+// 运行域，否则保存排程会把注册表外的惰性槽一并写回（与启动期清理互相抵消）。
+func setGlobalTaskSchedule(prefix, sourceTable string, names []string, days []int, hhmm string) error {
 	norm, err := validateScheduleInput(days, hhmm)
 	if err != nil {
 		return err
@@ -651,7 +679,8 @@ func setGlobalTaskSchedule(prefix, sourceTable string, days []int, hhmm string) 
 	} else if affected != 1 {
 		return fmt.Errorf("保存定时更新设置失败: global_config 配置行缺失（命中 %d 行）", affected)
 	}
-	if _, err := tx.Exec(`UPDATE `+sourceTable+` SET next_update=? WHERE update_enabled=1`, next); err != nil {
+	nameClause, nameArgs := sourceNameSetClause("name", names, false)
+	if _, err := tx.Exec(`UPDATE `+sourceTable+` SET next_update=? WHERE update_enabled=1`+nameClause, append([]any{next}, nameArgs...)...); err != nil {
 		return fmt.Errorf("重排规则库源更新计划: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -660,22 +689,24 @@ func setGlobalTaskSchedule(prefix, sourceTable string, days []int, hhmm string) 
 	return nil
 }
 
-// SetThreatSchedule 保存威胁库任务级排程（global_config）并重排全部启用源的
+// SetThreatSchedule 保存威胁库任务级排程（global_config）并重排注册表源的
 // next_update（2026-09-25 用户裁定：失败源不再保留退避，一律重排到新槽）。
 // 两步写事务化——跨表双写曾各自独立提交，第二步失败
 // 留「排程已改、槽位照旧」中间态；现失败整体回滚报错。
 func SetThreatSchedule(days []int, hhmm string) error {
-	return setGlobalTaskSchedule("threat", "security_threat_sources", days, hhmm)
+	return setGlobalTaskSchedule("threat", "security_threat_sources", threatSourceRegistryNames(), days, hhmm)
 }
 
 // SetCrawlerSchedule 保存爬虫地址库独立排程并重排全部启用爬虫源。
 func SetCrawlerSchedule(days []int, hhmm string) error {
-	return setGlobalTaskSchedule("crawler", "security_crawler_sources", days, hhmm)
+	return setGlobalTaskSchedule("crawler", "security_crawler_sources", nil, days, hhmm)
 }
 
 // versionUpdateStatuses 是版本表/更新源表 update_status 列的合法词表
 // （CRS/IP2Region 版本表与威胁/爬虫源表共用；与各族状态常量同值）。这些列
 // 属于运行态簿记词表，前端状态徽标与轮询判定直读、渲染层零兜底。
+// sourceUpdateStatusRunning 必须在词表内：源表族写侧只写该活动词，漏掉会把
+// 合法的「更新中」行误判为词表外值（导入 warning 失实、归一丢真实状态）。
 var versionUpdateStatuses = map[string]struct{}{
 	string(CRSStatusIdle):        {},
 	string(CRSStatusChecking):    {},
@@ -686,6 +717,16 @@ var versionUpdateStatuses = map[string]struct{}{
 	string(CRSStatusFailed):      {},
 	string(CRSStatusSkipped):     {},
 	string(CRSStatusCancelled):   {},
+	sourceUpdateStatusRunning:    {},
+}
+
+// IsActiveUpdateStatus 判定 update_status 是否属于「更新中」活动态（类判据）：
+// 版本表四活动词（CRS/IP2Region）+ 源表族唯一活动词 running。活动态只属于
+// 执行该任务的进程——跨进程序列化通道（配置导入、集群快照、读侧角色投影）
+// 一律按本判据收敛，不得按表维护逐词白名单：白名单必然滞后于写侧新增活动词，
+// running 就曾被漏在版本表词表之外。
+func IsActiveUpdateStatus(status string) bool {
+	return IsActiveCRSStatus(status) || IsActiveIP2RegionStatus(status) || status == sourceUpdateStatusRunning
 }
 
 // NormalizeVersionUpdateStatus 归一 update_status：词表外值（含空串/未知）

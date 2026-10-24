@@ -23,7 +23,7 @@ func TestPostCommitFailureBanner_commitObjectWording(t *testing.T) {
 	initializeRuleFeatureTestDB(t)
 	handler := &Handlers{}
 
-	handler.recordPostCommitRestoreFailure(postCommitSaveFailedBanner, errors.New("disk I/O error"), errors.New("恢复 /load 失败"), nil)
+	handler.recordPostCommitRestoreFailure(commitSaveFailedSubject, errors.New("disk I/O error"), errors.New("恢复 /load 失败"), nil)
 	got := bannerText(t)
 	if !strings.Contains(got, "配置保存失败") || !strings.Contains(got, "数据库提交结果不确定") {
 		t.Fatalf("横幅=%q, want 失败对象为提交（配置保存失败 + 提交结果不确定）", got)
@@ -41,7 +41,7 @@ func TestPostCommitFailureBanner_sideEffectDoesNotFlipLabel(t *testing.T) {
 	handler := &Handlers{}
 
 	// 运行配置已恢复（runtimeErr=nil），只有附带失败：不得写失败横幅。
-	handler.recordPostCommitRestoreFailure(postCommitSaveFailedBanner, errors.New("disk I/O error"), nil, errors.New("last-known-good 钉回失败"))
+	handler.recordPostCommitRestoreFailure(commitSaveFailedSubject, errors.New("disk I/O error"), nil, errors.New("last-known-good 钉回失败"))
 	if got := bannerText(t); got != "" {
 		t.Fatalf("运行配置已恢复时不应写横幅: %q", got)
 	}
@@ -131,5 +131,89 @@ func assertReloadAuditPresent(t *testing.T) {
 	}
 	if rows == 0 {
 		t.Fatal("真实 /load 已发生，提交失败分支不得吞掉「重载」审计")
+	}
+}
+
+// 更新/删除/启用/禁用四个端点的「提交失败」双通道行为钉测——此前测试缝
+// （commitTx）只接在创建与配置端点上，这四个端点的横幅/附带失败语义只有
+// 源码结构门（审计存在性）覆盖，写反了仍然全绿。
+// 两种形态逐端点各一例：
+//   - 提交失败 + 恢复成功 = 库态/运行态一致 → 不写横幅，但「重载」审计在册；
+//   - 提交失败 + 恢复失败 = 分叉 → 提交口径横幅 + 「运行配置状态未知」标签。
+func TestRuleEndpoints_commitFailureDoubleChannels(t *testing.T) {
+	type endpointCase struct {
+		name       string
+		caddyID    string
+		suffix     string
+		method     string
+		body       string
+		seedEnable bool
+		failAction string
+	}
+	cases := []endpointCase{
+		{"update", "lb_cf_upd", "", http.MethodPut, `{"name":"cf-upd-renamed"}`, true, "更新失败"},
+		{"delete", "lb_cf_del", "", http.MethodDelete, "", true, "删除失败"},
+		{"enable", "lb_cf_ena", "/enable", http.MethodPost, "", false, "启用失败"},
+		{"disable", "lb_cf_dis", "/disable", http.MethodPost, "", true, "禁用失败"},
+	}
+	for _, tc := range cases {
+		for _, restoreSucceeds := range []bool{true, false} {
+			name := tc.name + "/restore-fail"
+			if restoreSucceeds {
+				name = tc.name + "/restore-ok"
+			}
+			t.Run(name, func(t *testing.T) {
+				handler, _ := newCompensationLoadHandlers(t, restoreSucceeds)
+				seedAuditRule(t, tc.caddyID, tc.caddyID, strings.ReplaceAll(tc.caddyID, "_", "-")+".example.test", 18101, tc.seedEnable, "manual", false)
+				seedAuditUpstream(t, tc.caddyID)
+				forceCommitFailure(t)
+
+				gin.SetMode(gin.TestMode)
+				router := gin.New()
+				switch tc.method {
+				case http.MethodDelete:
+					router.DELETE("/rules/:caddy_id", handler.DeleteRule)
+				case http.MethodPut:
+					router.PUT("/rules/:caddy_id", handler.UpdateRule)
+				default:
+					router.POST("/rules/:caddy_id/enable", handler.EnableRule)
+					router.POST("/rules/:caddy_id/disable", handler.DisableRule)
+				}
+
+				request := httptest.NewRequest(tc.method, "/rules/"+tc.caddyID+tc.suffix, strings.NewReader(tc.body))
+				request.Header.Set("Content-Type", "application/json")
+				response := httptest.NewRecorder()
+				router.ServeHTTP(response, request)
+
+				if response.Code != http.StatusInternalServerError {
+					t.Fatalf("status=%d body=%s, want 500", response.Code, response.Body.String())
+				}
+				if !strings.Contains(response.Body.String(), commitUncertainLabel) {
+					t.Fatalf("body=%s, want 含提交不确定文案", response.Body.String())
+				}
+				got := bannerText(t)
+				if restoreSucceeds {
+					if got != "" {
+						t.Fatalf("恢复成功不应写失败横幅: %q", got)
+					}
+				} else {
+					if !strings.Contains(got, "配置保存失败") || !strings.Contains(got, caddyApplyRestoreFailedLabel) {
+						t.Fatalf("横幅=%q, want 提交口径 + 运行配置状态未知", got)
+					}
+					if strings.Contains(got, "Caddy 配置应用失败") {
+						t.Fatalf("横幅=%q, want 不得归因为配置应用失败", got)
+					}
+				}
+				assertReloadAuditPresent(t)
+				var failureRows int
+				if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action=? AND resource='负载规则' AND detail LIKE ?`,
+					tc.failAction, "%"+tc.caddyID+"%").Scan(&failureRows); err != nil {
+					t.Fatalf("read failure audit: %v", err)
+				}
+				if failureRows != 1 {
+					t.Fatalf("%s 审计条数=%d, want 1（提交失败必须留痕）", tc.failAction, failureRows)
+				}
+			})
+		}
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -246,6 +247,31 @@ func TestPrimeCrawlerIPLists_writesSnapshotOnce(t *testing.T) {
 		if len(snapshot[src.Name]) == 0 {
 			t.Errorf("快照缺少引擎 %s", src.Name)
 		}
+	}
+}
+
+// TestPrimeCrawlerIPLists_migratesOnce 启动预载只跑一次名单名迁移：迁移必须
+// 在读库之前完成（读库以名单名为键，旧键未迁移会让逐引擎写入落到另一行），
+// 且不得在逐引擎循环前重复调用（每引擎一次迁移 = N 条幂等 UPDATE）。
+func TestPrimeCrawlerIPLists_migratesOnce(t *testing.T) {
+	_, _ = newClusterTestService(t)
+	oldFile := crawlerIPListFile
+	crawlerIPListFile = filepath.Join(t.TempDir(), "crawler-ip-lists.json")
+	t.Cleanup(func() { crawlerIPListFile = oldFile })
+
+	var migrates atomic.Int64
+	oldMigrate := crawlerIPListMigrate
+	crawlerIPListMigrate = func() error {
+		migrates.Add(1)
+		return oldMigrate()
+	}
+	t.Cleanup(func() { crawlerIPListMigrate = oldMigrate })
+
+	if err := GetCrawlerUpdateManager().Prime(); err != nil {
+		t.Fatalf("prime: %v", err)
+	}
+	if got := migrates.Load(); got != 1 {
+		t.Fatalf("Prime 名单名迁移 %d 次, want 1（重复迁移=每引擎 N 条幂等 UPDATE）", got)
 	}
 }
 

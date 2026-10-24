@@ -384,7 +384,7 @@ func (h *Handlers) RunAutoBackupOnce(ctx context.Context, trigger, operator stri
 	}
 	// 入口 fail-fast：BackupDir 为空或相对路径时，后续任何文件操作都会落在
 	// 进程 CWD（failed 行裁剪按 DB 行文件名 + dir 相对解析执行 os.Remove）。
-	// 生产配置由 config.Load 保证绝对路径，此处防配置缺失/测试构造形态。
+	// 生产配置由 config 载入（LoadCollectWarnings）保证绝对路径，此处防配置缺失/测试构造形态。
 	if strings.TrimSpace(dir) == "" || !filepath.IsAbs(dir) {
 		reason := fmt.Errorf("备份目录未配置或不是绝对路径: %q", dir)
 		services.Logf("warn", "%s失败：%v", action, reason)
@@ -533,12 +533,46 @@ type sqlRowScanner interface {
 	Scan(dest ...any) error
 }
 
+// autoBackupTimeLayout 是备份时间字段的对外形态：UTC 墙钟串，与 /audit-logs、
+// /certificates 同族（前端 parseDateValue 两种形态都接受）。
+const autoBackupTimeLayout = "2006-01-02 15:04:05"
+
+// formatAutoBackupTimestamp 把驱动返回值归一到对外形态：驱动可能把 DATETIME
+// 列解析成 time.Time，也可能因列元数据缺失或存量值非常规而返回原始文本。
+// 可解析值统一转 UTC 墙钟串——此前直接把驱动值扫进 string，实际形态随驱动
+// 变成 RFC3339，与文档示例及同族端点不一致，按示例解析的脚本会失败或把 UTC
+// 当本地时间再转一次。不可解析的存量值原样返回：历史脏值只影响该行展示，
+// 不得让整个备份列表 500。
+func formatAutoBackupTimestamp(raw any) string {
+	switch v := raw.(type) {
+	case nil:
+		return ""
+	case time.Time:
+		return v.UTC().Format(autoBackupTimeLayout)
+	case []byte:
+		return formatAutoBackupTimestamp(string(v))
+	case string:
+		if parsed, err := time.ParseInLocation(autoBackupTimeLayout, v, time.UTC); err == nil {
+			return parsed.UTC().Format(autoBackupTimeLayout)
+		}
+		if parsed, err := time.Parse(time.RFC3339Nano, v); err == nil {
+			return parsed.UTC().Format(autoBackupTimeLayout)
+		}
+		return v
+	default:
+		return fmt.Sprint(v)
+	}
+}
+
 func scanAutoBackupRowView(rows sqlRowScanner) (autoBackupRowView, error) {
 	var view autoBackupRowView
+	var createdAtRaw any
 	var sectionsRaw string
-	if err := rows.Scan(&view.ID, &view.Filename, &view.CreatedAt, &view.Status, &view.SizeBytes, &sectionsRaw, &view.TriggerType, &view.Message, &view.AppVersion); err != nil {
+	if err := rows.Scan(&view.ID, &view.Filename, &createdAtRaw, &view.Status, &view.SizeBytes, &sectionsRaw, &view.TriggerType, &view.Message, &view.AppVersion); err != nil {
 		return view, err
 	}
+	// 格式化单源在此：last_success_at 复用本字段。
+	view.CreatedAt = formatAutoBackupTimestamp(createdAtRaw)
 	view.Sections = []string{}
 	if err := json.Unmarshal([]byte(sectionsRaw), &view.Sections); err != nil {
 		// 与设置读侧同一列同一口径（decodeAutoBackupSectionsRaw 损坏即报错），

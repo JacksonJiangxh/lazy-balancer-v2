@@ -727,8 +727,9 @@ const aclRefsAllSystem = (p: PolicyRow): boolean => {
   if (!refs.every((id) => Boolean(ipLists.value.find((l) => l.id === id)?.system))) return false
   // 本 IP 在该策略信任侧（内联 ∪ 引用）仍有命中时不得隐藏：隐藏卡的
   // 「取消信任」入口随之消失，而 ipTrustedAnywhere 又抑制其他卡的信任动作——
-  // 该 IP 的豁免将只能去策略页处理（混合策略还是只读面）。
-  if (!p.ip_whitelist_enabled) return true
+  // 该 IP 的豁免将只能去策略页处理（混合策略还是只读面）。信任名单关闭时同样
+  // 不得整卡隐藏（隐藏条件=信任侧无命中，与启用态无关）：该形态正是「条目存在
+  // 但未生效」提示与「清除条目」动作的唯一入口。
   return !mergedTrustEntries(p).some((e) => entryMatchesIp(e, trimmedIp.value))
 }
 // 筛选下拉选项池（实测裁定③①）：仅「有 IP 管控面」（stage0/stage1/

@@ -95,7 +95,7 @@ func TestImportConfigBackup_users_key_absent_still_imports(t *testing.T) {
 	}
 }
 
-// ──：预览镜像导入侧单侧 WAF 文件缺失建模 ──
+// 预览镜像导入侧单侧 WAF 文件缺失建模
 
 // Given lbbak 备份只携带 xdb（无 CRS 文件），config.json 含两个版本表。
 // When 预览。

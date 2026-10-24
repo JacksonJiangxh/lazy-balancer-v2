@@ -226,8 +226,8 @@ func TestImportConfigBackup_trustedProxyTextColumnsGate(t *testing.T) {
 		for i := range 2000 {
 			entries = append(entries, fmt.Sprintf(`{"value":"198.51.%d.%d"}`, i/254, i%254+1))
 		}
-		// 替换），refs 存在性仅按备份行解析——被引用的 2000 条名单须随备份行
-		// 到场（自洽备份），总量门判定面=备份行展开。
+		// 名单表随备份全量替换，refs 存在性仅按备份行解析——被引用的 2000 条
+		// 名单须随备份行到场（自洽备份），总量门判定面=备份行展开。
 		backup := configBackupJSON(t, map[string][]map[string]any{
 			"security_ip_lists": {{"id": 5, "name": "huge-list", "entries": "[" + strings.Join(entries, ",") + "]"}},
 		}, map[string]any{

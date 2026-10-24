@@ -42,7 +42,7 @@ const (
 // CaddyAdminListenAddr 是渲染产物中 Caddy admin 的监听地址（单源常量）。
 // 首次成功 /load 后 Caddy admin 即迁到本地址——cfg.CaddyAdminURL 仅是
 // 「首次 /load 之前」的引导端点，稳态必须指向同一地址，否则面板配置的
-// 端点在首次 /load 后失联（启动期一致性 WARN 见 config.Load）。
+// 端点在首次 /load 后失联（启动期一致性 WARN 见 config.LoadCollectWarnings）。
 const CaddyAdminListenAddr = "127.0.0.1:2019"
 
 // CaddyAdminListenPort 是 CaddyAdminListenAddr 的端口部分（规则端口冲突门
@@ -714,15 +714,24 @@ func (s *CaddyService) ValidateTxRenderViaCLI(tx *sql.Tx, rulesWrittenInTx bool)
 	}
 	// 渲染会写 IP 名单投影；CLI 拒绝时必须自回滚，不能依赖每个调用方
 	//成功路径保留新投影供随后的 ApplyConfigFromTx 使用。
-	projectionSnapshot := SnapshotIPListProjections()
+	// 快照失败（目录/投影瞬时读失败）必须显式失败：以不完整快照渲染后，
+	// 拒绝路径既无法回写缺项内容，也不能用「目录里有、快照里没有」判定新增
+	// ——那会把在役投影当渲染产物删掉。
+	projectionSnapshot, snapshotErr := SnapshotIPListProjections()
+	if snapshotErr != nil {
+		return fmt.Errorf("IP 名单投影快照失败，拒绝在不可回滚的前提下渲染: %w", snapshotErr)
+	}
 	applied := false
 	defer func() {
-		if !applied {
-			if rerr := RestoreIPListProjections(projectionSnapshot); rerr != nil {
-				// 回滚不完整=投影目录可能残留未提交的名单内容（稳定命名热路径
-				// ≤1s 会被在役配置感知），必须留痕供排障。
-				Logf("error", "caddy CLI 预检失败后的 IP 名单投影回滚不完整: %v", rerr)
-			}
+		if applied {
+			// 渲染成功＝新建投影随配置提交，清单只释放不删除。
+			EndIPListProjectionPass()
+			return
+		}
+		if rerr := RestoreIPListProjections(projectionSnapshot); rerr != nil {
+			// 回滚不完整=投影目录可能残留未提交的名单内容（稳定命名热路径
+			// ≤1s 会被在役配置感知），必须留痕供排障。
+			Logf("error", "caddy CLI 预检失败后的 IP 名单投影回滚不完整: %v", rerr)
 		}
 	}()
 	config := generateCaddyConfigWithCertSource(tx, db.DB, rulesWrittenInTx)
@@ -3002,7 +3011,7 @@ func generateCaddyConfigWithCertSource(store, certSource caddyConfigStore, rules
 	// Caddy）——首次成功 /load 后 admin 监听即被本渲染产物迁到 127.0.0.1:2019，
 	// 此后一切 admin 请求（含 cfg.CaddyAdminURL 指向的客户端）必须打同一地址。
 	// caddy_admin_url 配成其他地址的部署会在首次 /load 后失联，启动期
-	// config.Load 对此发 WARN（fail-visible）。
+	// config.LoadCollectWarnings 对此发 WARN（fail-visible）。
 
 	conf := map[string]interface{}{
 		"admin": map[string]interface{}{

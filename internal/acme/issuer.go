@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"lazy-balancer-v2/internal/dnsname"
 	"lazy-balancer-v2/internal/dnsprovider"
 
 	"github.com/miekg/dns"
@@ -1204,9 +1205,11 @@ func discoverAuthoritativeNS(ctx context.Context, fqdn, bootstrap string) ([]str
 }
 
 // normalizeDNSName 统一 FQDN 形态（去空白、小写、补末尾点）：DNS 名字大小写
-// 不敏感，而应答里的 owner 大小写不可控，比较前必须归一。
+// 不敏感，而应答里的 owner 大小写不可控，比较前必须归一。基础归一与挑战登记/
+// 清理账本共用 dnsname.NormalizeName，本侧只额外补 FQDN 末尾点（权威应答
+// 比较需要规范形态）。
 func normalizeDNSName(name string) string {
-	return strings.ToLower(dns.Fqdn(strings.TrimSpace(name)))
+	return dns.Fqdn(dnsname.NormalizeName(name))
 }
 
 // sameDNSName 归一后比较两个 DNS 名字。

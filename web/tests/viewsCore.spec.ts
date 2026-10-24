@@ -339,16 +339,41 @@ test('只读 Key 工具清单与后端只读探测集一致', () => {
   assert.doesNotMatch(keys, /5 个读探测 POST 工具/)
 })
 
-// 本套件的前提守卫：node --test 没有 .vue 装载器，spec 一律不得静态 import
-// SFC（引入 loader 时本用例转红，提醒同步更正各 spec 的「文本钉」前提注释）。
-test('spec 不得静态 import .vue（SFC 无 node 装载器）', () => {
+// 本套件的前提守卫：node --test 没有 .vue 装载器，spec 一律不得 import SFC
+// （引入 loader 时本用例转红，提醒同步更正各 spec 的「文本钉」前提注释）。
+// 三种形态都要拦：单行静态 import、跨行静态 import、动态 import()。
+const VUE_STATIC_IMPORT = /(?:^|\n)\s*(?:import|export)\b[\s\S]*?from\s+['"][^'"]+\.vue['"]/
+const VUE_SIDE_EFFECT_IMPORT = /(?:^|\n)\s*import\s+['"][^'"]+\.vue['"]/
+const VUE_DYNAMIC_IMPORT = /\bimport\s*\(\s*['"][^'"]+\.vue['"]\s*\)/
+const vueImportOffender = (text: string): boolean => {
+  const body = stripComments(text)
+  return VUE_STATIC_IMPORT.test(body) || VUE_SIDE_EFFECT_IMPORT.test(body) || VUE_DYNAMIC_IMPORT.test(body)
+}
+
+test('spec 不得 import .vue（SFC 无 node 装载器）', () => {
   const offenders: string[] = []
   const specDir = new URL('./', import.meta.url)
   for (const name of readdirSync(specDir)) {
-    const text = readFileSync(new URL(name, specDir), 'utf8')
-    // 剥注释后扫描静态 import/export-from 语句
-    if (/^\s*(?:import|export)\b[^\n]*from\s+['"][^'"]+\.vue['"]/m.test(stripComments(text))) offenders.push(name)
-    if (/^\s*import\s+['"][^'"]+\.vue['"]/m.test(stripComments(text))) offenders.push(name)
+    if (vueImportOffender(readFileSync(new URL(name, specDir), 'utf8'))) offenders.push(name)
   }
-  assert.deepEqual(offenders, [], 'spec 出现 .vue 静态导入——node 无法装载，需改为 utils 行为求值或文本钉')
+  assert.deepEqual(offenders, [], 'spec 出现 .vue 导入——node 无法装载，需改为 utils 行为求值或文本钉')
+})
+
+test('.vue 导入守卫覆盖单行/跨行/副作用/动态四形态（元测试）', () => {
+  // 样本文本用 <vue> 占位再替换：否则本文件自己含被禁字面量，会被上方守卫判红。
+  const sample = (text: string): string => text.split('<vue>').join('.vue')
+  assert.equal(vueImportOffender(sample("import Rules from '../src/views/Rules<vue>'")), true)
+  assert.equal(
+    vueImportOffender(sample("import {\n  Rules,\n} from '../src/views/Rules<vue>'")),
+    true,
+    '跨行静态 import 曾被放过（原正则要求整句同行）',
+  )
+  assert.equal(vueImportOffender(sample("import '../src/views/Rules<vue>'")), true)
+  assert.equal(vueImportOffender(sample("const mod = await import('../src/views/Rules<vue>')")), true)
+  // 注释里的写法不得误伤（剥注释后不应命中）
+  assert.equal(vueImportOffender(sample("// import Rules from '../src/views/Rules<vue>'\nconst a = 1")), false)
+  // 非 .vue 的导入照常放行
+  assert.equal(vueImportOffender("import { ref } from 'vue'"), false)
+  assert.equal(vueImportOffender("import { section } from './_helpers.ts'"), false)
+  assert.equal(vueImportOffender(sample("const doc = 'src/views/Rules<vue>'")), false)
 })

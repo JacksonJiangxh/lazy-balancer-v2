@@ -466,27 +466,43 @@ func (s *CertIssuer) Issue(ctx context.Context, jobID int, ruleID, domains strin
 	var ruleEnabled bool
 	var ruleProviderID int
 	var jobDomain, ruleDomain string
-	// 使用 QueryRowContext 以响应 worker 取消信号。
-	if err := db.DB.QueryRowContext(ctx, `SELECT j.status, COALESCE(j.ca_provider_id,0), COALESCE(j.deployment_attempts,0), COALESCE(r.enabled,0), COALESCE(r.ca_provider_id,0), COALESCE(j.domain,''), COALESCE(r.domain,'')
-		FROM cert_jobs j LEFT JOIN lb_rules r ON r.caddy_id = j.rule_id WHERE j.id = ?`, jobID).
-		Scan(&jobStatus, &jobProviderID, &deploymentAttempt, &ruleEnabled, &ruleProviderID, &jobDomain, &ruleDomain); err == nil &&
+	// 使用 QueryRowContext 以响应 worker 取消信号。首查故障必须与「行不存在」
+	// 区分（见下）：瞬时 DB 故障静默回落完整签发会白烧 CA 订单/DNS 写入。
+	jobStateErr := issueJobStateQuery(ctx, jobID, &jobStatus, &jobProviderID, &deploymentAttempt, &ruleEnabled, &ruleProviderID, &jobDomain, &ruleDomain)
+	if jobStateErr != nil && !errors.Is(jobStateErr, sql.ErrNoRows) {
+		// 与下方材料读失败分支同口径：保持现态、不重签，由 30s 补扫 /
+		// 6h 对账重读接管（返回部署类错误——handleQueueExecutionError 不改写状态）。
+		Logf("error", "证书任务 %d：读取任务状态失败，保持现态不重签（由补扫/对账接管）: %v", jobID, jobStateErr)
+		WriteCertJobLog(jobID, "WARN", "job_state_read_failed", "读取证书任务状态失败（保持现态，不重新签发）: "+jobStateErr.Error())
+		return &certificateDeploymentError{err: fmt.Errorf("read certificate job state: %w", jobStateErr)}
+	}
+	if jobStateErr == nil &&
 		(jobStatus == "issued" || jobStatus == "downloaded") && ruleEnabled {
 		// 域名适用性：规则改域后旧行的 domain 是当时集合的快照。这类「不适用
 		// 却带材料」的行若继续走快速路径，confirmCertificateDeployment 会以
 		// 「域名不再匹配」失败 → failJob 对 downloaded+材料保留部署态 → 30s
 		// 补扫再调度，形成最长约 6h 的无效部署重试，并占住规则的新签发（补建
-		// 要求无任何非 disabled 行）。此处显式退役旧行并立即补建：恢复路径从
-		// 「等对账」缩短为「一次执行内完成」。
+		// 要求无任何非 disabled 行）。
+		// 这是**并发兜底**：主改域路径由 UpdateRule 先退役旧域任务
+		// （retireCertJobsForDomain），残留形态再由 6h 对账 sweepOrphanedCertJobs
+		// 收口；本分支只处理「任务入队后被并发推进到 issued/downloaded」的
+		// 窗口内形态——不得据此认为改域自愈已在此收口。
 		if !certJobRuleApplicable(true, ruleDomain, jobDomain) {
 			Logf("warn", "证书任务 %d：任务域名 %q 与规则 %s 当前域名 %q 不匹配，退役旧任务并补建新任务", jobID, jobDomain, ruleID, ruleDomain)
 			// 走 approved 状态写入口（CAS from=issued/downloaded）；并发流转
 			// （如 worker 已推进）不阻断补建尝试。
-			if err := transitionJob(db.DB, jobID, []string{"issued", "downloaded"}, "disabled", map[string]any{"message": "规则域名已变更，旧任务不再适用"}); err != nil {
-				if !errors.Is(err, ErrJobTransitionConflict) {
-					Logf("error", "证书任务 %d：退役域名不匹配的旧任务失败: %v", jobID, err)
-					return fmt.Errorf("disable stale certificate job: %w", err)
-				}
-				Logf("warn", "证书任务 %d：退役时状态已被并发流转（%v），按现状继续补建", jobID, err)
+			retireErr := transitionJob(db.DB, jobID, []string{"issued", "downloaded"}, "disabled", map[string]any{"message": "规则域名已变更，旧任务不再适用"})
+			if retireErr != nil && !errors.Is(retireErr, ErrJobTransitionConflict) {
+				Logf("error", "证书任务 %d：退役域名不匹配的旧任务失败: %v", jobID, retireErr)
+				return fmt.Errorf("disable stale certificate job: %w", retireErr)
+			}
+			if retireErr != nil {
+				Logf("warn", "证书任务 %d：退役时状态已被并发流转（%v），按现状继续补建", jobID, retireErr)
+			} else {
+				// 用户可见状态变化（issued/downloaded→disabled）必须进操作审计：
+				// sweep 与材料丢失重排同族都有审计行，本分支此前只有 warn 日志。
+				// 并发流转（CAS 落败）未由本执行改态，不记审计。
+				RecordAuditLog("system", "禁用", "证书任务", FormatAuditDetail(AuditJobPart(jobID), AuditRulePart(ruleID), AuditSourcePart("domain_mismatch")), "")
 			}
 			if _, backfillErr := BackfillMissingACMECertJobs(ctx, GetCAQueueManager()); backfillErr != nil {
 				Logf("warn", "证书任务 %d：域名不匹配旧任务退役后补建失败（对账/重启接管）: %v", jobID, backfillErr)
@@ -644,6 +660,16 @@ func (s *CertIssuer) Issue(ctx context.Context, jobID int, ruleID, domains strin
 
 	RecordAuditLog("system", "签发成功", "证书任务", fmt.Sprintf("规则 %s 证书签发成功，过期时间 %s", ruleID, notAfter.Format("2006-01-02")), "")
 	return nil
+}
+
+// issueJobStateQuery 是 Issue 首查（任务状态 + 规则适用性快照）的测试缝：
+// 注入瞬时读故障，钉住「首查失败不得静默回落完整签发」的分流（与
+// readFastPathIssuedMaterial 同型）。行不存在返回 sql.ErrNoRows，调用方回落
+// 既有的完整签发语义。
+var issueJobStateQuery = func(ctx context.Context, jobID int, dest ...any) error {
+	return db.DB.QueryRowContext(ctx, `SELECT j.status, COALESCE(j.ca_provider_id,0), COALESCE(j.deployment_attempts,0), COALESCE(r.enabled,0), COALESCE(r.ca_provider_id,0), COALESCE(j.domain,''), COALESCE(r.domain,'')
+		FROM cert_jobs j LEFT JOIN lb_rules r ON r.caddy_id = j.rule_id WHERE j.id = ?`, jobID).
+		Scan(dest...)
 }
 
 // readFastPathIssuedMaterial 读取快速路径复用的已签发材料（测试缝：var 而非
@@ -1076,6 +1102,28 @@ func extractRetryAfterFromError(errText string) time.Duration {
 func ValidateACMEDomains(domains string) error {
 	if normalizeAndValidateDomains(domains) == nil {
 		return fmt.Errorf("ACME证书仅支持单域名或根域+www二级域名: %s", domains)
+	}
+	return nil
+}
+
+// ValidateACMEDomainsForIssuance 是保存/启用/导入侧的签发域名校验：结构校验
+// 之上叠加公共 CA 的字符集要求（RFC 1035 LDH、≥2 标签）。缺这道门时
+// `foo_bar.example.com`、`localhost`、非 ASCII 域能保存、能启用、能入队，
+// 直到签发执行期（Issue 的纵深门）才失败，并消耗 5 次自动重试才停。
+//
+// 与 ValidateACMEDomains 的分工：结构层继续服务任务/规则域比较
+// （CanonicalACMEDomains / certJobRuleApplicable）——历史行可能含下划线，
+// 比较层拒绝会让这些行被误判「规则不适用」而遭退役/断链。本函数只用于
+// 写入口，不参与比较。
+func ValidateACMEDomainsForIssuance(domains string) error {
+	list := normalizeAndValidateDomains(domains)
+	if list == nil {
+		return fmt.Errorf("ACME证书仅支持单域名或根域+www二级域名: %s", domains)
+	}
+	for _, domain := range list {
+		if !isValidACMEIssuanceDomain(domain) {
+			return fmt.Errorf("ACME证书域名不符合公共 CA 签发要求（仅小写字母/数字/连字符标签，且至少两级）: %s", domain)
+		}
 	}
 	return nil
 }

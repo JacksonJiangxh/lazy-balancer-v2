@@ -379,7 +379,7 @@ import type { APIResponse } from '@/types'
 import type { RuleFlowPathRule } from '@/types/rules'
 import { hostPortKey } from '@/utils/upstreamKeys'
 import { weightPercent } from '@/utils/upstreamWeights'
-import { STAGE_TITLES, attachStageDetails, formatDurationUs, inferPolicyType, mergeIpEntries, parseIPList, parseRefIds, stage1FootnoteText, stageSubLabel, trustHitMode } from '@/utils/securityStages'
+import { STAGE_TITLES, attachStageDetails, formatDurationUs, hasTrustDetectionBinding, inferPolicyType, mergeIpEntries, parseIPList, parseRefIds, stage1FootnoteText, stageSubLabel, trustHitMode } from '@/utils/securityStages'
 import { fetchAllCrsRuleFiles } from '@/utils/crsRuleFiles'
 import { useCountryNamesCn, countryLabel } from '@/composables/useCountryNamesCn'
 import type {
@@ -735,10 +735,11 @@ const flowNodes = computed<FlowNode[]>(() => {
 const stage1Footnote = computed(() => {
   // 按本规则实际绑定链判定（model.stages[0] 的 group 键 = 绑定策略 id）：
   // 按全部策略判定会在「本规则未绑 stage0、但别处存在保留检测策略」时误称
-  // 本规则存在检测降级路径。
+  // 本规则存在检测降级路径。降级判定与阶段 0 模式行同源
+  // （hasTrustDetectionBinding → trustHitMode）：mixed 存量信任在引擎侧同样
+  // 恒 DetectionOnly，不能退回 policy_type === 'stage0' 等值判断。
   const boundIds = new Set(props.model?.stages.find((stage) => stage.stage === 0)?.groups.map((group) => group.key) ?? [])
-  return stage1FootnoteText(props.policies.some((p) =>
-    boundIds.has(p.id) && p.policy_type === 'stage0' && p.enabled && p.ip_whitelist_enabled && p.trust_detection === true))
+  return stage1FootnoteText(hasTrustDetectionBinding(boundIds, props.policies))
 })
 
 const stageSub = (stage: 1 | 2 | 3): string => stageSubLabel(stage)

@@ -687,6 +687,15 @@ func TestIssueCertificate_batchAllConflictReturns409(t *testing.T) {
 	if !strings.Contains(response.Body.String(), "规则状态已变更") || !strings.Contains(response.Body.String(), "刷新后重试") {
 		t.Fatalf("body=%s, want 可行动冲突文案", response.Body.String())
 	}
+	// 审计详情必须渲染中文结果码：conflict 曾因 auditResultTextMap 与动态
+	// 结果码清单双缺而落英文内部标识（界面显示「结果：conflict」）。
+	var detail string
+	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='触发签发' AND resource='证书' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
+		t.Fatalf("read issue audit detail: %v", err)
+	}
+	if !strings.Contains(detail, "结果：状态冲突") || strings.Contains(detail, "conflict") {
+		t.Fatalf("审计详情=%q, want 结果：状态冲突 且不含英文码 conflict", detail)
+	}
 }
 
 // seedDownloadedJobWithMaterial 播种部署生命周期 + 材料在库的任务行

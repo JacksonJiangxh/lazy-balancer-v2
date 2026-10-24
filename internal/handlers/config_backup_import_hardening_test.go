@@ -305,11 +305,12 @@ func TestValidateConvertedV1Rules_saveSideValueDomain(t *testing.T) {
 		}
 	}
 	tests := []struct {
-		name   string
-		mutate func(*convertedRule)
+		name     string
+		mutate   func(*convertedRule)
+		wantSkip string
 	}{
-		{name: "host header CRLF", mutate: func(r *convertedRule) { r.HostHeader = "backend.example\r\nX-Injected: true" }},
-		{name: "duplicate upstream", mutate: func(r *convertedRule) { r.Upstreams = append(r.Upstreams, r.Upstreams[0]) }},
+		{name: "host header CRLF", mutate: func(r *convertedRule) { r.HostHeader = "backend.example\r\nX-Injected: true" }, wantSkip: "后端域名含非法字符"},
+		{name: "duplicate upstream", mutate: func(r *convertedRule) { r.Upstreams = append(r.Upstreams, r.Upstreams[0]) }, wantSkip: "重复"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -317,10 +318,15 @@ func TestValidateConvertedV1Rules_saveSideValueDomain(t *testing.T) {
 			rule := base()
 			tt.mutate(&rule)
 
-			// When / Then the v1 soft-skip gate rejects it before insertion.
-			valid, _, _ := validateConvertedV1Rules([]convertedRule{rule})
+			// When / Then the v1 soft-skip gate rejects it before insertion，且
+			// 跳过原因是本条违例（丢弃原因被合并/换序时断言仍必须失败——只查
+			// 「没进 valid」无法区分「被别的原因丢弃」）。
+			valid, skips, _ := validateConvertedV1Rules([]convertedRule{rule})
 			if len(valid) != 0 {
 				t.Fatalf("invalid v1 rule passed validation: %+v", valid[0])
+			}
+			if len(skips) != 1 || !strings.Contains(skips[0], tt.wantSkip) {
+				t.Fatalf("skips=%v, want 1 条含 %q 的跳过原因", skips, tt.wantSkip)
 			}
 		})
 	}
@@ -684,9 +690,9 @@ func TestValidateCredentialsJSONObject_rejectsNull(t *testing.T) {
 	}
 }
 
-// ──：仅导入「安全防护」分类时，备份携带的
-// security_policy_bindings 指向 live TCP 规则——TCP 渲染链不消费策略，绑定为
-// 死绑定，必须在插入后清理（策略页不得宣称生效而运行态零防护）。 ──
+// 仅导入「安全防护」分类时，备份携带的 security_policy_bindings 可能指向 live
+// TCP 规则——TCP 渲染链不消费策略，绑定为死绑定，必须在插入后清理（策略页
+// 不得宣称生效而运行态零防护）。
 
 func TestSecurityOnlyImportDropsTCPRuleBindings(t *testing.T) {
 	h := newBackupTestHandlers(t)

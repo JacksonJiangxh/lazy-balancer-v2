@@ -887,6 +887,36 @@ func geoipLocOperator(countries []string, allowMode bool, exactSet map[string]bo
 	return op
 }
 
+// 自定义规则与策略引用的字段级上限（与全局请求体上限分离）
+// 安全域各写端点的唯一体积门此前是全局 request_body_max_size_mb（默认
+// 128MB）——单条策略可提交十万级内联名单/引用 ID 或超长 pattern，随后被策略
+// 列表/详情原样回传、并在每次 Caddy 渲染时解析，把响应与解析成本放大到
+// 不可用。以下阈值与本域既有同族封顶口径一致（名单条目 2000、自定义规则
+// 全局 200），在写侧 fail-closed（400 并给出数值），导入/集群快照等带外
+// 形状仍由发射侧兜底。
+const (
+	// customRuleMaxRefs：策略 custom_rules 引用的规则 ID 去重后上限
+	// （与 securityCustomRuleMaxGlobalCount 同值：引用的上限不应超过可存
+	// 在的规则总数）。
+	customRuleMaxRefs = 200
+	// customRuleMaxConditions：单条自定义规则的匹配条件数上限。
+	customRuleMaxConditions = 64
+	// customRuleMaxPatternBytes：单条条件 pattern 的字节上限。
+	customRuleMaxPatternBytes = 4 << 10
+)
+
+// validateCustomRulePatternLength 是写侧 pattern 字节上限，刻意与发射侧的
+// 结构校验 validateCustomRulePattern 分离：后者被 conditionsEmissionIssue
+// 共用（集群 apply / 带外旧库的兜底门），在那里拒绝超长 pattern 会把
+// 「50KB 规则渲染出超 48KiB 单行 → assertDirectiveLines 护栏报错」降级为
+// 「静默跳过该规则」，反而弱化渲染护栏；写侧封顶即可阻断新载荷的放大通道。
+func validateCustomRulePatternLength(pattern string) error {
+	if len(pattern) > customRuleMaxPatternBytes {
+		return fmt.Errorf("匹配内容不能超过 %d 字节", customRuleMaxPatternBytes)
+	}
+	return nil
+}
+
 // customRuleTargets / customRuleOperators 是自定义规则条件允许的目标与运算符
 // 映射；emitCustomRules 与校验函数共用同一份，避免两处硬编码漂移。
 // equals → @streq：@pm 是短语匹配（大小写不敏感+空格分词），
@@ -2895,6 +2925,11 @@ func ValidateCustomRuleConditions(conditions []models.CustomRuleCondition) error
 	if len(conditions) == 0 {
 		return fmt.Errorf("自定义规则至少需要一个匹配条件")
 	}
+	// 条件数封顶：每条条件都会发射成一条链式 SecRule 片段，条件数无上限时
+	// 单条规则即可把配置体积与编译成本线性放大（全局 128MB 体上限拦不住）。
+	if len(conditions) > customRuleMaxConditions {
+		return fmt.Errorf("自定义规则最多支持 %d 个匹配条件", customRuleMaxConditions)
+	}
 	for i, cond := range conditions {
 		if _, ok := customRuleTargets[cond.Target]; !ok {
 			return fmt.Errorf("自定义规则条件 %d 的 target 无效：%q（可选：uri、args、body、headers、user_agent）", i+1, cond.Target)
@@ -2903,6 +2938,9 @@ func ValidateCustomRuleConditions(conditions []models.CustomRuleCondition) error
 			return fmt.Errorf("自定义规则条件 %d 的 operator 无效：%q（可选：contains、regex、equals、starts_with）", i+1, cond.Operator)
 		}
 		if err := validateCustomRulePattern(cond.Operator, cond.Pattern); err != nil {
+			return fmt.Errorf("自定义规则条件 %d：%w", i+1, err)
+		}
+		if err := validateCustomRulePatternLength(cond.Pattern); err != nil {
 			return fmt.Errorf("自定义规则条件 %d：%w", i+1, err)
 		}
 	}
@@ -2917,6 +2955,21 @@ func ValidateCustomRulesJSON(customRulesJSON string) error {
 	}
 	var ids []int
 	if err := json.Unmarshal([]byte(customRulesJSON), &ids); err == nil {
+		// 引用数封顶（去重后计数）：策略列表每次请求都会解析该数组并构建 ID
+		// 集合、渲染端逐条解析引用规则——十万级 ID 数组会让列表页解析成本
+		// 达到秒级；重复 ID 不放大集合，按去重后口径判定。
+		seen := make(map[int]struct{}, len(ids))
+		unique := 0
+		for _, id := range ids {
+			if _, dup := seen[id]; dup {
+				continue
+			}
+			seen[id] = struct{}{}
+			unique++
+		}
+		if unique > customRuleMaxRefs {
+			return fmt.Errorf("custom_rules 引用的自定义规则数量不能超过 %d 条", customRuleMaxRefs)
+		}
 		return nil
 	}
 	var rules []models.CustomRule
@@ -2952,16 +3005,23 @@ func ValidateCustomRulesJSON(customRulesJSON string) error {
 		if err := validateCustomRulePattern(r.Operator, r.Pattern); err != nil {
 			return fmt.Errorf("自定义规则 #%d：%w", i+1, err)
 		}
+		if err := validateCustomRulePatternLength(r.Pattern); err != nil {
+			return fmt.Errorf("自定义规则 #%d：%w", i+1, err)
+		}
 	}
 	return nil
 }
 
-// validateCustomRulePattern 拒绝三类会破坏 SecRule 行的模式：
+// validateCustomRulePattern 拒绝四类会破坏 SecRule 行的模式：
 //  1. 空/纯空白模式——@contains "" 之类对空模式的匹配等于匹配一切请求，全员命中；
 //  2. 真实控制字符（含换行/回车/NUL/制表符等）会截断 SecRule 行；
 //  3. 以反斜杠结尾的模式——coraza 的 UnescapeQuotedString 仅反转义 \"，其余
 //     反斜杠序列原样保留，末尾的反斜杠会与结尾引号组合成转义引号，使 SecRule
-//     行畸形并被 coraza 拒绝，进而导致之后所有配置重生成失败。
+//     行畸形并被 coraza 拒绝，进而导致之后所有配置重生成失败；
+//  4. 含「反斜杠+双引号」序列（`\"`）的模式——发射侧只转义双引号、其余反斜杠
+//     逐字透传（见 escapeCorazaPattern），该序列渲染成 `\\"`：coraza 先把 `\\`
+//     反转义为一个反斜杠，随后的引号提前闭合算子串，整行动作解析失败（保存被
+//     Caddy 校验拒绝，提示指向引擎内部而非内容写法）。
 func validateCustomRulePattern(operator, pattern string) error {
 	if strings.TrimSpace(pattern) == "" {
 		return fmt.Errorf("匹配内容不能为空")
@@ -2970,6 +3030,14 @@ func validateCustomRulePattern(operator, pattern string) error {
 		if r < 0x20 || r == 0x7f {
 			return fmt.Errorf("匹配内容不能包含控制字符（含制表符）")
 		}
+	}
+	if strings.Contains(pattern, `\"`) {
+		// 合法写法：只写引号本身（发射时自动转义）；regex 需匹配「反斜杠+引号」
+		// 两个字符时用 \x5c\x22（十六进制转义不受发射期引号转义影响）。
+		if operator == "regex" {
+			return fmt.Errorf(`匹配内容不能包含「反斜杠+双引号」序列：发射时双引号会被转义，前导反斜杠会让引号提前闭合。匹配双引号请直接写「"」；匹配字面反斜杠用「\\」；需匹配反斜杠+引号两个字符时请用「\x5c\x22」`)
+		}
+		return fmt.Errorf(`匹配内容不能包含「反斜杠+双引号」序列：发射时双引号会被转义，前导反斜杠会让引号提前闭合。匹配双引号请直接写「"」；匹配字面反斜杠请用「\\」`)
 	}
 	// coraza 的 @contains/@streq/@beginsWith 会把参数包成 Macro 并做
 	// %{VAR} 宏展开；@rx 不展开。非 regex 运算符里的宏会让规则语义静默

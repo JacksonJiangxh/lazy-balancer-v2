@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"net/http"
@@ -135,9 +136,9 @@ func TestMFAStepUpGuard_failClosedOnDBError(t *testing.T) {
 	}
 
 	// 模拟瞬时 DB 失败（仅 MFA 启用态查询报错，认证链其余查询正常）
-	oldCheck := mfaUserEnabledCheck
-	mfaUserEnabledCheck = func(int) (bool, error) { return false, errors.New("simulated transient db failure") }
-	t.Cleanup(func() { mfaUserEnabledCheck = oldCheck })
+	oldCheck := mfaUserEnabledCheckWith
+	mfaUserEnabledCheckWith = func(*sql.DB, int) (bool, error) { return false, errors.New("simulated transient db failure") }
+	t.Cleanup(func() { mfaUserEnabledCheckWith = oldCheck })
 
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/config", nil)
 	req.Header.Set("Authorization", "Bearer "+token)

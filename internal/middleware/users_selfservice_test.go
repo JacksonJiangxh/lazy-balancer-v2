@@ -173,3 +173,35 @@ func TestDatabaseHandleParityAfterFixtureRestore(t *testing.T) {
 		t.Fatal("复位后 db.GetDB() 必须与被还原的包级句柄同源")
 	}
 }
+
+// 自助写的方法约束必须显式：PUT /users/<own> 与
+// POST /users/<own>/reset-password 之外的方法一律不算自助——不再依赖「当前
+// 没有对应路由」的隐式前提（新增路由即把别的语义误判成自助写）。
+func TestIsSelfServiceUserWrite_methodConstrained(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, tc := range []struct {
+		method string
+		path   string
+		want   bool
+	}{
+		{http.MethodPut, "/api/v1/users/7", true},
+		{http.MethodPost, "/api/v1/users/7/reset-password", true},
+		{http.MethodPost, "/api/v1/users/7", false},
+		{http.MethodDelete, "/api/v1/users/7", false},
+		{http.MethodPatch, "/api/v1/users/7", false},
+		{http.MethodPost, "/api/v1/users/7/other", false},
+		{http.MethodGet, "/api/v1/users/7/reset-password", false},
+		{http.MethodPut, "/api/v1/users/8", false},
+		{http.MethodPut, "/api/v1/users/me", false},
+	} {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			context, _ := gin.CreateTestContext(recorder)
+			context.Request = httptest.NewRequest(tc.method, tc.path, nil)
+			context.Set("user_id", 7)
+			if got := isSelfServiceUserWrite(context); got != tc.want {
+				t.Fatalf("isSelfServiceUserWrite(%s %s)=%v, want %v", tc.method, tc.path, got, tc.want)
+			}
+		})
+	}
+}

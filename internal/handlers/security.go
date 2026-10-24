@@ -433,6 +433,11 @@ func (h *Handlers) DeleteSecurityCustomRule(c *gin.Context) {
 }
 
 func (h *Handlers) ListSecurityBlockPages(c *gin.Context) {
+	// 列表载荷含全量 content（单页 ≤64KiB，页面总数 ≤200，最坏约 12.8MiB）：
+	// content 同时是编辑器的唯一数据源（无详情端点，PUT 为全量覆盖），
+	// 截断会让「查看→保存」把页面内容写掉，因此不做逐行裁剪；上限由
+	// securityBlockPageMaxGlobalCount（200）与 validateBlockPagePayload 的
+	// 64KiB 共同界定，响应经 HTTP gzip 压缩传输。
 	// 引用计数与 DeleteSecurityBlockPage 门同口径（有意设计，两种口径的
 	// 取舍已裁定保留）：策略侧仅计启用（禁用策略的配页是休眠配置，删除后
 	// 运行期 JOIN 容忍悬挂）；规则侧阶段页引用全量计（禁用规则重新启用即
@@ -4113,14 +4118,16 @@ func (h *Handlers) ListSecurityEvents(c *gin.Context) {
 	// 事件表这些列 schema 可空（仅 DEFAULT、无 NOT NULL），
 	// 带外/异常写入显式 NULL 会让整页 500——列表投影统一 COALESCE，与策略/拦截页/
 	// 自定义规则的 NULL 容忍口径一致（security_null_coalesce_test.go）。
-	// request_body 在 SQL 侧只取截断上限（+1 探针）——
+	// request_body / request_headers 在 SQL 侧只取截断上限（+1 探针）——
 	// 此前整列（上行落库上限 64KB/字段）取回再在 Go 侧截到 16KB，
 	// 100 行 × 2 字段最多传输 ~12.8MB 只为返回 ≤1.6MB；列表弹框只消费截断内容。
-	// request_headers 例外取完整列——它是 map[string][]string 的 JSON
-	// 文本，SQL 侧按字符硬切会产出半截 JSON（前端解析失败、整块退化为原文）；
-	// Go 侧按条目裁剪后重序列化（见 truncateEventListHeaders）。
+	// request_headers 是 map[string][]string 的 JSON 文本，超限行的前缀必然
+	// 是半截 JSON：Go 侧只重序列化前缀中**完整**的成员（见
+	// truncateEventListHeaders），被切断的键数由 securityEventListHeadersTotalSQL
+	// 在 SQL 侧数出总键数后相减得出——前端仍按 _lb_list_dropped_headers 展示
+	// 「已隐藏 N 个头」。
 	rows, err := db.MetricsDB.Query(`SELECT e.id, e.event_time, COALESCE(e.rule_caddy_id,''), COALESCE(e.policy_id,0), COALESCE(e.client_ip,''), COALESCE(e.method,''), COALESCE(e.uri,''), COALESCE(e.event_type,''), COALESCE(e.rule_triggered,''), COALESCE(e.rule_msg,''), COALESCE(e.action,''), COALESCE(e.anomaly_score, 0),
-		COALESCE(e.rule_name,''), COALESCE(e.policy_name,''), COALESCE(e.duration_us,0), COALESCE(e.precheck_us,0), COALESCE(e.request_headers,''), `+securityEventListFieldSQL("e.request_body")+`
+		COALESCE(e.rule_name,''), COALESCE(e.policy_name,''), COALESCE(e.duration_us,0), COALESCE(e.precheck_us,0), `+securityEventListFieldSQL("e.request_headers")+`, `+securityEventListHeadersTotalSQL("e.request_headers")+`, `+securityEventListFieldSQL("e.request_body")+`
 		FROM security_events e`+where+" ORDER BY e.event_time DESC, e.id DESC LIMIT ? OFFSET ?", queryArgs...)
 	if err != nil {
 		// 与计数/扫描分支同口径：泛化文案 + 服务端留痕（不向登录用户泄露
@@ -4134,8 +4141,11 @@ func (h *Handlers) ListSecurityEvents(c *gin.Context) {
 	var events []models.SecurityEvent
 	for rows.Next() {
 		var e models.SecurityEvent
+		// headersTotalKeys 是该行 request_headers 的全部键数（SQL 侧数出）；
+		// 前缀被切断时用它减去已解码键数得到被隐藏的键数。
+		var headersTotalKeys int
 		// Scan 失败必须中止：否则部分零值的事件行会被当作真实事件返回
-		if err := rows.Scan(&e.ID, &e.EventTime, &e.RuleCaddyID, &e.PolicyID, &e.ClientIP, &e.Method, &e.URI, &e.EventType, &e.RuleTriggered, &e.RuleMsg, &e.Action, &e.AnomalyScore, &e.RuleName, &e.PolicyName, &e.DurationUs, &e.PrecheckUs, &e.RequestHeaders, &e.RequestBody); err != nil {
+		if err := rows.Scan(&e.ID, &e.EventTime, &e.RuleCaddyID, &e.PolicyID, &e.ClientIP, &e.Method, &e.URI, &e.EventType, &e.RuleTriggered, &e.RuleMsg, &e.Action, &e.AnomalyScore, &e.RuleName, &e.PolicyName, &e.DurationUs, &e.PrecheckUs, &e.RequestHeaders, &headersTotalKeys, &e.RequestBody); err != nil {
 			services.Logf("error", "security events: scan failed: %v", err)
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "安全事件查询失败"})
 			return
@@ -4146,8 +4156,8 @@ func (h *Handlers) ListSecurityEvents(c *gin.Context) {
 		e.TriggerType = triggerTypeForRule(e.RuleTriggered)
 		// 列表响应字节上限：100 行 × 64KB 头/体可 >15MB。
 		// 列表侧二次截断到 16KB/字段（详情弹框仍可看到截断标记）。
-		// 头按条目裁剪后重序列化（保持 JSON 结构）；体按 base64 4 对齐。
-		e.RequestHeaders = truncateEventListHeaders(e.RequestHeaders)
+		// 头只重序列化前缀中完整的成员（被切断的键计入隐藏数）；体按 base64 4 对齐。
+		e.RequestHeaders = truncateEventListHeaders(e.RequestHeaders, headersTotalKeys)
 		e.RequestBody = truncateEventListBody(e.RequestBody)
 		// 请求头/体含凭证明文（Cookie/Authorization/请求体），
 		// 此前对任意登录用户/只读 Key 原样返回，掩码仅在前端——服务端脱敏。
@@ -4191,66 +4201,110 @@ func truncateEventListField(value string) string {
 	return value[:cut] + "\n...[TRUNCATED]"
 }
 
+// securityEventListHeadersTotalSQL 与 securityEventListFieldSQL 配套：只在
+// 该列超限且为合法 JSON 时数出全部键数（否则 0）。被切断的键数 = 总键数 −
+// Go 侧从前缀解出的键数——SQL 侧不传输键内容，只回一个整数。
+func securityEventListHeadersTotalSQL(column string) string {
+	capText := strconv.Itoa(securityEventListFieldCap)
+	return "CASE WHEN length(COALESCE(" + column + ",'')) > " + capText +
+		" AND json_valid(" + column + ") THEN (SELECT COUNT(*) FROM json_each(" + column + ")) ELSE 0 END"
+}
+
 // truncateEventListHeaders 请求头列表侧截断：request_headers 是
-// map[string][]string 的 JSON 文本，字节硬切会产出半截 JSON——前端解析失败后
-// 整块退化为 pre 原文，头表/多值/敏感掩码全部失效。这里解析后按条目裁剪
-// （每条目等额预算，值超预算时按 rune 边界裁剪并追加省略号），再重新序列化；
-// 极端多数短头导致序列化仍超限时，按体积降序丢条目并把丢弃数记入
-// securityEventListDroppedHeadersKey（列表 16KB 裁剪计数）——与采集 64KB
-// 裁剪的 securityEventDroppedHeadersKey 分离，前端按来源展示不同文案
-// （此前并入同一键，16KB 列表裁剪被误标为「超出 64KB 采集上限」）。
-// 非 JSON 形态（带外写入/历史脏行）退回原字节截断。
-func truncateEventListHeaders(value string) string {
+// map[string][]string 的 JSON 文本。SQL 侧只取 securityEventListFieldCap+1 字节
+// ——超限行的入参必然是被切断的前缀。这里把前缀中**完整**的成员逐个解出后
+// 重新序列化（前端仍拿到合法 JSON 头表），被切断的键数按
+// totalKeys − 已解出键数记入 securityEventListDroppedHeadersKey（列表 16KB
+// 裁剪计数）——与采集 64KB 裁剪的 securityEventDroppedHeadersKey 分离，前端
+// 按来源展示不同文案。
+// 前缀本身解不出任何完整成员（首个值就超限）或非 JSON 形态（带外写入/历史
+// 脏行）时退回字节截断 + 截断标记——前端降级为原文展示并亮截断横幅。
+func truncateEventListHeaders(value string, totalKeys int) string {
 	if len(value) <= securityEventListFieldCap {
 		return value
 	}
-	var headers map[string][]string
-	if err := json.Unmarshal([]byte(value), &headers); err != nil || len(headers) == 0 {
+	headers, ok := decodeCompleteHeaderMembers(value)
+	if !ok {
 		return truncateEventListField(value)
 	}
-	if raw, ok := fitHeadersWithinListCap(headers); ok {
+	// 前缀本身已用满 cap，追加丢弃计数会溢出——按体积降序丢条目直到放得下
+	// （保留最多信息量；通常只需丢 1 个）。丢不下的键数并入丢弃计数。
+	marshalWithinCap := func(headers map[string][]string) (string, bool) {
+		payload := make(map[string][]string, len(headers)+1)
+		for key, values := range headers {
+			payload[key] = values
+		}
+		if dropped := totalKeys - len(headers); dropped > 0 {
+			payload[securityEventListDroppedHeadersKey] = []string{strconv.Itoa(dropped)}
+		}
+		raw, err := json.Marshal(payload)
+		if err != nil || len(raw) > securityEventListFieldCap {
+			return "", false
+		}
+		return string(raw), true
+	}
+	if raw, ok := marshalWithinCap(headers); ok {
 		return raw
 	}
-	// 键名开销本身超过上限：按序列化体积降序丢条目（保留最多信息量）。
-	type headerEntry struct {
+	type sizedKey struct {
 		key  string
 		size int
 	}
-	entries := make([]headerEntry, 0, len(headers))
+	// 采集/列表侧计数键不参与丢弃（它们是写侧保留键，丢了对前端毫无信息量）。
+	order := make([]sizedKey, 0, len(headers))
 	for key, values := range headers {
-		keyJSON, _ := json.Marshal(key)
-		valueJSON, _ := json.Marshal(values)
-		entries = append(entries, headerEntry{key: key, size: len(keyJSON) + len(valueJSON) + 2})
-	}
-	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].size != entries[j].size {
-			return entries[i].size > entries[j].size
-		}
-		return entries[i].key < entries[j].key
-	})
-	dropped := 0
-	if existing, ok := headers[securityEventListDroppedHeadersKey]; ok && len(existing) > 0 {
-		if parsed, err := strconv.Atoi(existing[0]); err == nil && parsed > 0 {
-			dropped = parsed
-		}
-	}
-	for _, entry := range entries {
-		// 采集侧 64KB 裁剪计数键原样保留（不并入、不删除）——两个来源的
-		// 丢弃各自计数，前端分文案展示。
-		if entry.key == securityEventDroppedHeadersKey || entry.key == securityEventListDroppedHeadersKey {
+		if key == securityEventDroppedHeadersKey || key == securityEventListDroppedHeadersKey {
 			continue
 		}
-		delete(headers, entry.key)
-		dropped++
-		if dropped > 0 {
-			headers[securityEventListDroppedHeadersKey] = []string{strconv.Itoa(dropped)}
+		keyJSON, _ := json.Marshal(key)
+		valueJSON, _ := json.Marshal(values)
+		order = append(order, sizedKey{key: key, size: len(keyJSON) + len(valueJSON) + 2})
+	}
+	sort.Slice(order, func(i, j int) bool {
+		if order[i].size != order[j].size {
+			return order[i].size > order[j].size
 		}
-		if raw, err := json.Marshal(headers); err == nil && len(raw) <= securityEventListFieldCap {
-			return string(raw)
+		return order[i].key < order[j].key
+	})
+	for _, entry := range order {
+		delete(headers, entry.key)
+		if raw, ok := marshalWithinCap(headers); ok {
+			return raw
 		}
 	}
-	// 连只剩丢弃标记都超限（病态形态）：退回字节截断，至少不返回半截结构以外的空串。
+	// 连只剩计数键都超限（病态形态）：退回字节截断。
 	return truncateEventListField(value)
+}
+
+// decodeCompleteHeaderMembers 流式解出 JSON 对象前缀中完整的 key→[]string
+// 成员：截断点落在成员中间时，json.Decoder 在该成员处报错，此前的完整成员
+// 保留。ok=false 表示未解出任何成员（含非对象/脏行），调用方退回字节截断。
+func decodeCompleteHeaderMembers(prefix string) (map[string][]string, bool) {
+	dec := json.NewDecoder(strings.NewReader(prefix))
+	tok, err := dec.Token()
+	if err != nil || tok != json.Delim('{') {
+		return nil, false
+	}
+	headers := make(map[string][]string)
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			break
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			break
+		}
+		var values []string
+		if err := dec.Decode(&values); err != nil {
+			break
+		}
+		headers[key] = values
+	}
+	if len(headers) == 0 {
+		return nil, false
+	}
+	return headers, true
 }
 
 // securityEventDroppedHeadersKey 与摄取侧写侧的丢弃计数合成键同源（采集
@@ -4264,53 +4318,6 @@ const securityEventDroppedHeadersKey = services.SecurityEventsDroppedHeadersKey
 // 的事件在列表弹框同样会被裁剪，并入同一键会让前端把 16KB 列表裁剪误标为
 // 「超出 64KB 采集上限」。
 const securityEventListDroppedHeadersKey = "_lb_list_dropped_headers"
-
-// fitHeadersWithinListCap 逐条目裁剪直到序列化结果落入列表上限：每条目预算
-// 从 cap/条目数 起步，仍超限则预算减半重试（键名/引号开销也占预算）。
-func fitHeadersWithinListCap(headers map[string][]string) (string, bool) {
-	budget := securityEventListFieldCap / len(headers)
-	if budget < 1 {
-		budget = 1
-	}
-	for ; budget >= 1; budget /= 2 {
-		trimmed := make(map[string][]string, len(headers))
-		for key, values := range headers {
-			parts := make([]string, len(values))
-			for i, value := range values {
-				parts[i] = truncateRunesToBudget(value, budget)
-			}
-			trimmed[key] = parts
-		}
-		raw, err := json.Marshal(trimmed)
-		if err != nil {
-			return "", false
-		}
-		if len(raw) <= securityEventListFieldCap {
-			return string(raw), true
-		}
-		if budget == 1 {
-			return "", false
-		}
-	}
-	return "", false
-}
-
-// truncateRunesToBudget 按 rune 边界把字符串裁到 ≤budget 字节并在裁剪时追加省略号。
-func truncateRunesToBudget(value string, budget int) string {
-	if len(value) <= budget {
-		return value
-	}
-	const ellipsis = "…"
-	limit := budget - len(ellipsis)
-	if limit <= 0 {
-		return ""
-	}
-	cut := limit
-	for cut > 0 && !utf8.RuneStart(value[cut]) {
-		cut--
-	}
-	return value[:cut] + ellipsis
-}
 
 // truncateEventListBody 请求体列表侧截断：base64/base64-truncated
 // 载荷必须按 4 字符对齐切分（否则前端 atob 抛错、正文整块退化为原文），
@@ -4646,7 +4653,11 @@ func overlayCRSOverviewUpdateStatus(stored string, snapshot *services.CRSUpdateS
 	if snapshot != nil && services.IsActiveCRSStatus(snapshot.Status) {
 		return snapshot.Status
 	}
-	return stored
+	// 库值直读面与 status 快照面同口径：活动态只属执行进程，从节点上的
+	// 残留活动态按角色投影为 failed（单源 services.ProjectActiveUpdateStatusForLocalRole，
+	// 不写库）。不投影时总览徽标与「更新」弹框对同一行给出相反结论。
+	projected, _ := services.ProjectActiveUpdateStatusForLocalRole(stored, "")
+	return projected
 }
 
 // securityOverviewSevenDayStartUTC 返回近 7 天窗口起点（UTC 规范串）：
@@ -4826,8 +4837,10 @@ func (h *Handlers) GetCRSInfo(c *gin.Context) {
 			info.Version = stored.version
 		}
 		info.UpdatedAt = stored.updatedAt
-		info.UpdateStatus = stored.updateStatus
-		info.Message = stored.message
+		// 库值按角色投影（与 crsstatus 读侧快照单源同函数）：从节点上的
+		// 活动态残留不改写库，只在本端点呈现 failed + 归属文案，避免规则库
+		// 卡片显示「更新中」而「立即更新」弹框显示「本节点不执行该任务」。
+		info.UpdateStatus, info.Message = services.ProjectActiveUpdateStatusForLocalRole(stored.updateStatus, stored.message)
 		info.LastChecked = stored.lastChecked
 		info.Trigger = stored.trigger
 		info.AutoUpdate = stored.autoUpdate
@@ -5099,6 +5112,9 @@ func (h *Handlers) GetIP2RegionInfo(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取 IP2Region 版本信息失败"})
 		return
 	}
+	// 同 GetCRSInfo：库值活动态按角色投影（读侧单源、不写库）——从节点的
+	// 残留活动态不得让 IP 库卡片显示「更新中」。
+	info.UpdateStatus, info.Message = services.ProjectActiveUpdateStatusForLocalRole(info.UpdateStatus, info.Message)
 	if err == nil && info.Version == "" {
 		info.Version = "unknown"
 	}
@@ -5721,6 +5737,13 @@ func validateIPCIDRList(field, raw string) error {
 	var entries []string
 	if err := json.Unmarshal([]byte(raw), &entries); err != nil {
 		return fmt.Errorf("%s 必须是 JSON 数组", field)
+	}
+	// 条数封顶：内联名单原样随策略列表/详情回传，并在每次渲染时逐条展开
+	// （全局请求体上限默认 128MB，拦不住十万级条目的写入）。阈值与 IP 名单
+	// 条目上限（ipListMaxEntries）同源——同一份 IP 集合不应因写入口不同而
+	// 出现两种上限。
+	if len(entries) > ipListMaxEntries {
+		return fmt.Errorf("%s 条目数量不能超过 %d 条", field, ipListMaxEntries)
 	}
 	for _, entry := range entries {
 		if !validIPOrCIDR(entry) {

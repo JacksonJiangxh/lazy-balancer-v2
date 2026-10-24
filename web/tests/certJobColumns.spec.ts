@@ -10,7 +10,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { member, section, source } from './_helpers.ts'
+import { code, member, section, source } from './_helpers.ts'
 import {
   CERT_JOB_COLUMNS,
   CERT_JOB_COLUMNS_MIN_WIDTH,
@@ -100,7 +100,8 @@ test('容器 overflow 裁断，杜绝卡片/页面级横向滚动', () => {
 })
 
 test('冷却提示文案形态：waiting_ca 且带冷却时间时返回「冷却：…」', () => {
-  const wrap = member(page, 'const coolingHint')
+  const wrap = member(code('src/views/settings/CertJobs.vue'), 'const coolingHint')
   assert.match(wrap, /冷却：/, '冷却提示并入重试 tooltip 的文案形态')
   assert.match(wrap, /row\.status !== 'waiting_ca'/, '非 waiting_ca 不得显示冷却提示')
+  assert.match(wrap, /!row\.ca_available_after/, '冷却时间缺失必须先返回（否则显示「冷却：」空值）')
 })

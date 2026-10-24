@@ -80,8 +80,8 @@ func TestRuleEndpoint5xxBodiesHideInternalErrors(t *testing.T) {
 }
 
 // 扫描器自检：识别能力本身必须被钉住——若匹配逻辑退化为恒空，上面的门禁
-// 就成了假绿。合成三类泄漏形态（c.JSON 5xx / fail 5xx / failEnable 文案）
-// 必须全部被捕获。
+// 就成了假绿。合成五类泄漏形态（c.JSON 5xx / fail 5xx / failEnable 文案 /
+// 裸 err 的 Sprintf %v 与 Errorf %s）必须全部被捕获。
 func TestRuleEndpoint5xxLeakScannerDetectsLeaks(t *testing.T) {
 	const source = `package p
 
@@ -92,6 +92,9 @@ func f(c *gin.Context, err error) {
 	failEnable("z: "+err.Error(), err)
 	failUpdateWithStatus("w: "+err.Error(), http.StatusInternalServerError, err)
 	failCertEnqueue("v: "+err.Error(), err)
+	// 不经 .Error() 字面串的形态同样会泄露内部文本（SQL/路径/admin 地址）。
+	c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: fmt.Sprintf("x: %v", err)})
+	fail(http.StatusBadGateway, fmt.Errorf("y: %s", err))
 	// 4xx 配置拒绝类保留细节，不算泄漏。
 	c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 }`
@@ -100,8 +103,8 @@ func f(c *gin.Context, err error) {
 	if err != nil {
 		t.Fatalf("parse synthetic source: %v", err)
 	}
-	if leaks := collect5xxErrorTextLeaks(fset, parsed); len(leaks) != 6 {
-		t.Fatalf("扫描器应捕获 6 处 5xx 泄漏，实际 %d: %v", len(leaks), leaks)
+	if leaks := collect5xxErrorTextLeaks(fset, parsed); len(leaks) != 8 {
+		t.Fatalf("扫描器应捕获 8 处 5xx 泄漏，实际 %d: %v", len(leaks), leaks)
 	}
 }
 
@@ -166,7 +169,52 @@ func isInternalStatusExpr(expr ast.Expr) bool {
 
 func mentionsErrorText(fset *token.FileSet, node ast.Node) bool {
 	source := printNode(fset, node)
-	return strings.Contains(source, ".Error()")
+	if strings.Contains(source, ".Error()") {
+		return true
+	}
+	return formatsRawErrorValue(node)
+}
+
+// formatsRawErrorValue 报告节点是否用 %v/%s/%w 直接格式化裸 err 标识符
+// （fmt.Sprintf / fmt.Errorf 形态）——这类写法不产生 ".Error()" 字面串，
+// 却同样把底层错误（SQL 文本/表列名、文件路径、admin 地址）拼进响应体。
+func formatsRawErrorValue(node ast.Node) bool {
+	found := false
+	ast.Inspect(node, func(n ast.Node) bool {
+		if found {
+			return false
+		}
+		call, ok := n.(*ast.CallExpr)
+		if !ok || len(call.Args) < 2 {
+			return true
+		}
+		selector, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || (selector.Sel.Name != "Sprintf" && selector.Sel.Name != "Errorf") {
+			return true
+		}
+		formatLiteral, ok := call.Args[0].(*ast.BasicLit)
+		if !ok || formatLiteral.Kind != token.STRING || !containsErrorVerb(formatLiteral.Value) {
+			return true
+		}
+		for _, arg := range call.Args[1:] {
+			if ident, ok := arg.(*ast.Ident); ok && ident.Name == "err" {
+				found = true
+				return false
+			}
+		}
+		return true
+	})
+	return found
+}
+
+// containsErrorVerb 报告格式串字面量是否含会打印错误文本的动词。
+func containsErrorVerb(quotedFormat string) bool {
+	for _, verb := range []string{"%v", "%s", "%w"} {
+		if strings.Contains(quotedFormat, verb) {
+			return true
+		}
+	}
+	return false
 }
 
 func printNode(fset *token.FileSet, node ast.Node) string {
@@ -258,6 +306,7 @@ func TestCaddyAdmin5xxDetailPolicyIsExplicit(t *testing.T) {
 		t.Fatalf("parse caddy.go: %v", err)
 	}
 	seen := map[string]bool{}
+	matched := 0
 	for _, decl := range file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
 		if !ok {
@@ -270,7 +319,14 @@ func TestCaddyAdmin5xxDetailPolicyIsExplicit(t *testing.T) {
 		}
 		if _, allowed := caddyAdmin5xxDetailFunctions[fn.Name.Name]; !allowed {
 			t.Errorf("caddy.go:%s 的 5xx 响应拼接了内部错误文本，且不在 admin 细节清单内（business 组必须固定文案；新增 admin 端点须登记理由）: %v", fn.Name.Name, leaks)
+		} else {
+			matched++
 		}
+	}
+	// 扫描器自检：清单门必须真实命中至少一个函数——命中数为 0 说明识别逻辑
+	// 退化（例如只认 .Error() 后写点全部改成别形态），门禁变成假绿。
+	if matched == 0 {
+		t.Fatal("admin 细节清单门未命中任何函数——5xx 泄漏扫描器可能已退化")
 	}
 	for name, reason := range caddyAdmin5xxDetailFunctions {
 		if !seen[name] {
@@ -278,6 +334,99 @@ func TestCaddyAdmin5xxDetailPolicyIsExplicit(t *testing.T) {
 		}
 		if strings.TrimSpace(reason) == "" {
 			t.Errorf("政策清单条目 %q 缺少理由", name)
+		}
+	}
+}
+
+// 审计列表（business 组，任意登录用户可读）：5xx 只回固定文案——扫描/遍历
+// 失败的表列名与驱动错误只进运行日志。此前同一函数的计数分支已固定文案、
+// 明细两个分支却直接拼 err.Error()，口径分裂且暴露对象是全体登录用户。
+func TestAuditLogEndpoint5xxBodiesHideInternalErrors(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "auditlog.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse auditlog.go: %v", err)
+	}
+	found := map[string]bool{"GetAuditLogs": false, "GetAuditLogOptions": false}
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		if _, want := found[fn.Name.Name]; !want {
+			continue
+		}
+		found[fn.Name.Name] = true
+		for _, leak := range collect5xxErrorTextLeaks(fset, fn) {
+			t.Errorf("auditlog.go:%s 的 5xx 响应拼接了内部错误文本: %s", fn.Name.Name, leak)
+		}
+	}
+	for name, ok := range found {
+		if !ok {
+			t.Errorf("auditlog.go 未找到 %s（扫描面漂移会让门禁假绿）", name)
+		}
+	}
+}
+
+// adminBusiness5xxDetailFunctions 是 caddy.go 之外 admin 组端点的 5xx「保留
+// 底层细节」政策登记（键=文件名:函数名，值=理由）。admin 端点是排障接口：
+// 自动备份需区分 DB 锁与备份目录 errno，管理面板 HTTPS 需点名哪一步材料
+// 读失败。未登记即按 business 组口径（固定文案）——不存在「既不登记也不扫描」
+// 的真空区。
+var adminBusiness5xxDetailFunctions = map[string]string{
+	"autobackup.go:AutoBackupSettings":       "设置/备份列表读取失败需管理员看到 errno",
+	"autobackup.go:UpdateAutoBackupSettings": "设置事务写失败需点名（DB 锁/只读库）",
+	"autobackup.go:RunAutoBackupNow":         "引擎触发失败需点名（admission/执行错误）",
+	"autobackup.go:DeleteAutoBackup":         "删除备份行失败需点名（DB 故障）",
+	"autobackup.go:RestoreAutoBackup":        "备份文件读取失败需点名（权限/errno）",
+	"autobackup.go:DownloadAutoBackup":       "备份文件读取失败需点名（权限/errno）",
+	"admintls.go:UpdateAdminTLS":             "当前 HTTPS 配置读校验失败需点名，避免半套材料落库",
+}
+
+// 政策可判性门禁（admin 业务族）：登记文件里每个 5xx 拼接内部错误文本的函数
+// 都必须在清单内，且清单条目必须仍存在并仍在拼接细节（过期白名单会掩盖新
+// 端点的政策缺口）。4xx 配置拒绝类不受约束。
+func TestAdminBusiness5xxDetailPolicyIsExplicit(t *testing.T) {
+	registered := map[string]map[string]string{}
+	for key, reason := range adminBusiness5xxDetailFunctions {
+		file, fn, ok := strings.Cut(key, ":")
+		if !ok || file == "" || fn == "" || strings.TrimSpace(reason) == "" {
+			t.Fatalf("政策登记条目 %q 形态非法（want 文件:函数 + 非空理由）", key)
+		}
+		if registered[file] == nil {
+			registered[file] = map[string]string{}
+		}
+		registered[file][fn] = reason
+	}
+	fset := token.NewFileSet()
+	for file, allowed := range registered {
+		node, err := parser.ParseFile(fset, file, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", file, err)
+		}
+		seen := map[string]bool{}
+		leaking := map[string]bool{}
+		for _, decl := range node.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok {
+				continue
+			}
+			seen[fn.Name.Name] = true
+			leaks := collect5xxErrorTextLeaks(fset, fn)
+			if len(leaks) == 0 {
+				continue
+			}
+			leaking[fn.Name.Name] = true
+			if _, ok := allowed[fn.Name.Name]; !ok {
+				t.Errorf("%s:%s 的 5xx 响应拼接了内部错误文本，且未登记 admin 细节清单（business 组必须固定文案；新增 admin 端点须登记理由）: %v", file, fn.Name.Name, leaks)
+			}
+		}
+		for name := range allowed {
+			if !seen[name] {
+				t.Errorf("%s 政策条目 %q 已不存在（过期条目掩盖新端点的政策缺口）", file, name)
+			} else if !leaking[name] {
+				t.Errorf("%s:%s 已不再拼接内部错误文本，请删除过期政策条目", file, name)
+			}
 		}
 	}
 }

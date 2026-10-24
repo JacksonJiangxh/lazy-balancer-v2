@@ -100,8 +100,13 @@ export const trustedProxyHeadersError = (values: readonly string[]): string => {
  * 后端按「规范化前缀集合大小」判定——同一网段既内联又出现在引用名单时只计
  * 一次；按条目数累加会把实际展开集合远小于上限的合法载荷拒掉。引用面的条目
  * 原文来自 `GET /security/ip-lists/:id`（`values`）；尚未拉取或拉取失败时
- * （`null`）退回 `entryCount`（列表接口缓存的条数）估算——只在「已知合计已
- * 超限」时拦截，不确定形态交给后端兜底，避免误拒合法配置。
+ * （`null`）只能按 `entryCount` 估算，且**无法参与去重**——多份互相重叠的
+ * 名单会被逐份累加，估算值可能远大于真实并集。
+ *
+ * 因此硬门只拦「可证超限」两种形态：①已解析并集已超上限；②某份未加载名单
+ * 自身条数已超上限（任何并集都至少包含它）。其余含估算项的形态一律降级为
+ * 非阻断提示（`trustedProxyTotalWarning`），由后端去重判定兜底——前端不得以
+ * 估算数字否掉后端会接受的配置。
  */
 export interface TrustedProxyReferencedEntries {
   /** 名单条目原文；null = 尚未拉取或拉取失败（按 entryCount 计入且无法去重）。 */
@@ -112,11 +117,16 @@ export interface TrustedProxyReferencedEntries {
 
 /** 展开规模（并集口径）。referenced 含与内联重叠的键，与后端错误文案同构。 */
 export interface TrustedProxyExpansion {
+  /** 已解析网段的并集大小（可证事实；硬门只用这个与单份上限判定）。 */
+  readonly resolvedUnion: number
+  /** 估算合计 = resolvedUnion + unresolved（含无法去重的按条数累加项，仅供提示）。 */
   readonly union: number
   readonly inline: number
   readonly referenced: number
   /** 未能去重、按 entryCount 计入的条数（>0 时文案须声明为估算）。 */
   readonly unresolved: number
+  /** 未加载引用中单份最大 entryCount（单份自身超上限即可证整体超限）。 */
+  readonly maxUnresolvedEntryCount: number
 }
 
 const ipv4Octets = (address: string): readonly number[] | null => {
@@ -197,9 +207,12 @@ export const trustedProxyExpansion = (
   const inline = union.size
   let referencedKeys = 0
   let unresolved = 0
+  let maxUnresolvedEntryCount = 0
   for (const ref of referenced) {
     if (ref.values === null) {
-      unresolved += Math.max(0, ref.entryCount)
+      const count = Math.max(0, ref.entryCount)
+      unresolved += count
+      if (count > maxUnresolvedEntryCount) maxUnresolvedEntryCount = count
       continue
     }
     const keys = new Set<string>()
@@ -210,7 +223,23 @@ export const trustedProxyExpansion = (
     referencedKeys += keys.size
     for (const key of keys) union.add(key)
   }
-  return { union: union.size + unresolved, inline, referenced: referencedKeys + unresolved, unresolved }
+  const resolvedUnion = union.size
+  return {
+    resolvedUnion,
+    union: resolvedUnion + unresolved,
+    inline,
+    referenced: referencedKeys + unresolved,
+    unresolved,
+    maxUnresolvedEntryCount,
+  }
+}
+
+/** 硬门文案（可证超限形态共用）：与后端错误文案同结构。 */
+const totalExceededMessage = (union: number, inline: number, referencedCount: number, unresolved: number): string => {
+  const estimate = unresolved > 0
+    ? `；其中 ${unresolved} 条按条数估算（引用名单条目未加载，重叠网段未参与去重）`
+    : ''
+  return `受信网段总数超过 ${TRUSTED_PROXY_MAX_TOTAL_ENTRIES} 上限（去重后合计 ${union}：内联 ${inline} + 引用展开 ${referencedCount}；重叠网段只计一次${estimate}），请收窄内联网段或减少引用列表`
 }
 
 /** 总量门：返回空串=通过，否则为可直接展示的汇总文案（与后端文案同结构）。 */
@@ -218,10 +247,28 @@ export const trustedProxyTotalError = (
   inlineValues: readonly string[],
   referenced: readonly TrustedProxyReferencedEntries[],
 ): string => {
-  const { union, inline, referenced: referencedCount, unresolved } = trustedProxyExpansion(inlineValues, referenced)
-  if (union <= TRUSTED_PROXY_MAX_TOTAL_ENTRIES) return ''
-  const estimate = unresolved > 0
-    ? `；其中 ${unresolved} 条按条数估算（引用名单条目未加载，重叠网段未参与去重）`
-    : ''
-  return `受信网段总数超过 ${TRUSTED_PROXY_MAX_TOTAL_ENTRIES} 上限（去重后合计 ${union}：内联 ${inline} + 引用展开 ${referencedCount}；重叠网段只计一次${estimate}），请收窄内联网段或减少引用列表`
+  const { resolvedUnion, union, inline, referenced: referencedCount, unresolved, maxUnresolvedEntryCount } =
+    trustedProxyExpansion(inlineValues, referenced)
+  // 只拦可证超限：已解析并集超限，或某份未加载名单自身已超上限。多份未加载
+  // 名单互相重叠时按条数累加的值只是上界估计，不能据此否掉合法配置。
+  if (resolvedUnion <= TRUSTED_PROXY_MAX_TOTAL_ENTRIES && maxUnresolvedEntryCount <= TRUSTED_PROXY_MAX_TOTAL_ENTRIES) {
+    return ''
+  }
+  return totalExceededMessage(union, inline, referencedCount, unresolved)
+}
+
+/**
+ * 总量提示（非阻断）：估算合计越过上限、但无法证明真实并集超限时返回文案，
+ * 否则空串。消费方据此提示后**继续保存**，最终以后端去重判定为准。
+ */
+export const trustedProxyTotalWarning = (
+  inlineValues: readonly string[],
+  referenced: readonly TrustedProxyReferencedEntries[],
+): string => {
+  const { resolvedUnion, union, inline, referenced: referencedCount, unresolved, maxUnresolvedEntryCount } =
+    trustedProxyExpansion(inlineValues, referenced)
+  if (unresolved === 0 || union <= TRUSTED_PROXY_MAX_TOTAL_ENTRIES) return ''
+  // 可证超限由硬门报错，不重复提示
+  if (resolvedUnion > TRUSTED_PROXY_MAX_TOTAL_ENTRIES || maxUnresolvedEntryCount > TRUSTED_PROXY_MAX_TOTAL_ENTRIES) return ''
+  return `受信网段合计约 ${union} 条，可能超过 ${TRUSTED_PROXY_MAX_TOTAL_ENTRIES} 上限（内联 ${inline} + 引用展开 ${referencedCount}；其中 ${unresolved} 条来自条目未加载的引用列表，按条数估算且未参与去重）。仍可保存，最终以服务端按去重后的网段集合判定为准`
 }

@@ -44,8 +44,12 @@ func TestReplaceSnapshotTx_SkippedSectionsAreNotCleared(t *testing.T) {
 	}
 
 	var userCount, ruleCount int
-	tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM users").Scan(&userCount)
-	tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM lb_rules").Scan(&ruleCount)
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM users").Scan(&userCount); err != nil {
+		t.Fatalf("count users: %v", err)
+	}
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM lb_rules").Scan(&ruleCount); err != nil {
+		t.Fatalf("count rules: %v", err)
+	}
 	if userCount != 1 {
 		t.Fatalf("skipped users section must keep local rows, got %d", userCount)
 	}

@@ -542,7 +542,7 @@ func TestCreateAPIKey_auditDetailRecordsPrivilegeFields(t *testing.T) {
 	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='创建' AND resource='API密钥' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
 		t.Fatalf("read audit detail: %v", err)
 	}
-	for _, want := range []string{"权限：可写", "MCP：开", "MCP 白名单：2 条"} {
+	for _, want := range []string{"权限：可写", "MCP：开", "IP 白名单（约束全部 REST 与 MCP）：2 条"} {
 		if !strings.Contains(detail, want) {
 			t.Fatalf("audit detail=%q, want 含 %q", detail, want)
 		}
@@ -575,7 +575,7 @@ func TestUpdateAPIKey_auditDetailRecordsSecurityDelta(t *testing.T) {
 	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='更新' AND resource='API密钥' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
 		t.Fatalf("read audit detail: %v", err)
 	}
-	for _, want := range []string{"启用状态：开→关", "MCP：关→开", "只读：关→开", "MCP 白名单：0 条→1 条"} {
+	for _, want := range []string{"启用状态：开→关", "MCP：关→开", "只读：关→开", "IP 白名单（约束全部 REST 与 MCP）：0 条→1 条"} {
 		if !strings.Contains(detail, want) {
 			t.Fatalf("audit detail=%q, want 含 %q", detail, want)
 		}
@@ -665,7 +665,7 @@ func TestUpdateAPIKeyStatus_auditUsesNormalizedWhitelistCount(t *testing.T) {
 	if err := db.AuditDB.QueryRow(`SELECT detail FROM audit_log WHERE action='更新' AND resource='API密钥' ORDER BY id DESC LIMIT 1`).Scan(&detail); err != nil {
 		t.Fatalf("read audit detail: %v", err)
 	}
-	if !strings.Contains(detail, "MCP 白名单：0 条→1 条") {
+	if !strings.Contains(detail, "IP 白名单（约束全部 REST 与 MCP）：0 条→1 条") {
 		t.Fatalf("audit detail=%q, want 归一化后的「0 条→1 条」", detail)
 	}
 	if strings.Contains(detail, "→2 条") {

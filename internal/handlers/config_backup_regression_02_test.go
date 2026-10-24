@@ -13,7 +13,7 @@ package handlers
 //   运行期设置门（timezone/坐标/枚举/超时/default_ca）
 //   导入 off→on 水位线
 //   sections 并集 == configBackupTables
-//   cert_renewal_days 导入下界 1
+//   cert_renewal_days 导入保留 0（0=默认 30，不再钳到 1）
 
 import (
 	"context"
@@ -59,7 +59,7 @@ func legacyBackupJSON(t *testing.T, tables map[string][]map[string]any, cfg map[
 	return string(data)
 }
 
-// ──：布尔列枚举补项 + PRAGMA/语义列对照 ──
+// 布尔列枚举补项 + PRAGMA/语义列对照
 
 // 语义 0/1 列（PRAGMA 声明为 INTEGER，无法按 BOOLEAN 类型识别）——新增列须
 // 同步本清单与 backupBooleanTableColumns（本测试即两处漂移的机械拦截点）。
@@ -189,7 +189,7 @@ func TestValidateV2Backup_newlyEnumeratedBooleanColumnsRejectStrings(t *testing.
 	})
 }
 
-// ──：导出包体携带 sections；还原按包体过滤 ──
+// 导出包体携带 sections；还原按包体过滤
 
 func TestBuildLbbakExport_writesSectionsAndScopedRestore(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -242,7 +242,7 @@ func TestBuildLbbakExport_writesSectionsAndScopedRestore(t *testing.T) {
 	}
 }
 
-// ──：auto backup 设置组导入门 ──
+// auto backup 设置组导入门
 
 func TestImportAutoBackupSettings_gatePreviewAndImport(t *testing.T) {
 	type tc struct {
@@ -293,7 +293,7 @@ func TestImportAutoBackupSettings_gatePreviewAndImport(t *testing.T) {
 	}
 }
 
-// ──：完整性 → sections 过滤 → 行级门 ──
+// 完整性 → sections 过滤 → 行级门
 
 func TestBackupValidationOrder_sectionsBeforeRowGates(t *testing.T) {
 	badSecurity := map[string][]map[string]any{
@@ -347,7 +347,7 @@ func TestBackupValidationOrder_sectionsBeforeRowGates(t *testing.T) {
 	})
 }
 
-// ──：冲突矩阵分桶预计算等价性 ──
+// 冲突矩阵分桶预计算等价性
 
 func TestValidateRuleConflictMatrix_bucketedEquivalence(t *testing.T) {
 	candidates := []ruleConflictCandidate{
@@ -406,7 +406,7 @@ func BenchmarkValidateRuleConflictMatrix_500UniqueDomains(b *testing.B) {
 	}
 }
 
-// ──：legacy 仅 tables 校验和路径继续执行后置门 ──
+// legacy 仅 tables 校验和路径继续执行后置门
 
 func legacyBackupShared(t *testing.T, mutate func(tables map[string][]map[string]any)) string {
 	t.Helper()
@@ -687,7 +687,7 @@ func TestLbbakImport_threatSourceFailureWarnsAndKeepsLocal(t *testing.T) {
 	}
 }
 
-// ──：commit 后应用日志级别 + admin TLS 重启提示 ──
+// commit 后应用日志级别 + admin TLS 重启提示
 
 func TestImportConfigBackup_appliesLogLevelAndAdminTLSTip(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -707,7 +707,7 @@ func TestImportConfigBackup_appliesLogLevelAndAdminTLSTip(t *testing.T) {
 	}
 }
 
-// ──：运行期设置门 ──
+// 运行期设置门
 
 func TestImportRuntimeSettings_gate(t *testing.T) {
 	cases := []struct {
@@ -760,7 +760,7 @@ func TestImportRuntimeSettings_gate(t *testing.T) {
 	}
 }
 
-// ──：导入 off→on 水位线 ──
+// 导入 off→on 水位线
 
 func TestImportConfigBackup_autobackupWatermarkOnEnable(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -789,7 +789,7 @@ func TestImportConfigBackup_autobackupWatermarkOnEnable(t *testing.T) {
 	}
 }
 
-// ──：sections 并集 == configBackupTables 且无重复 ──
+// sections 并集 == configBackupTables 且无重复
 
 func TestConfigBackupSections_unionMatchesTables(t *testing.T) {
 	seen := map[string]string{}
@@ -811,9 +811,10 @@ func TestConfigBackupSections_unionMatchesTables(t *testing.T) {
 	}
 }
 
-// ──：cert_renewal_days 导入下界 1 ──
+// cert_renewal_days 导入保留 0（0=默认 30；钳到 1 是保存侧下界，不适用于导入
+// ——导入是存量行还原，钳制会静默改变用户配置）。
 
-func TestImportConfigBackup_clampsZeroCertRenewalDays(t *testing.T) {
+func TestImportConfigBackup_keepsZeroCertRenewalDays(t *testing.T) {
 	h := newBackupTestHandlers(t)
 	body := legacyBackupJSON(t, nil, map[string]any{"cert_renewal_days": 0}, nil)
 	rec := importBackupShared(h, t, body)
@@ -829,7 +830,7 @@ func TestImportConfigBackup_clampsZeroCertRenewalDays(t *testing.T) {
 	}
 }
 
-// ──：导入后四族规则库首槽武装（DescribeAll NextSlot 非空的行为侧） ──
+// 导入后四族规则库首槽武装（DescribeAll NextSlot 非空的行为侧）
 
 func TestImportConfigBackup_rearmsSecurityLibrarySlots(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -887,7 +888,7 @@ func TestImportConfigBackup_rearmsSecurityLibrarySlots(t *testing.T) {
 	}
 }
 
-// ──：证书队列未排空 → 导入 409 ──
+// 证书队列未排空 → 导入 409
 
 func TestImportConfigBackup_rejectsWhenCertDrainIncomplete(t *testing.T) {
 	h := newBackupTestHandlers(t)

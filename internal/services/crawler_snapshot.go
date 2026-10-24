@@ -106,7 +106,10 @@ func (m *CrawlerUpdateManager) Prime() error {
 	if err := ensureCrawlerSources(); err != nil {
 		return err
 	}
-	if err := migrateCrawlerIPListNames(); err != nil {
+	// 名单名迁移单轮一次，且必须在读库之前：loadCrawlerIPListsFromDB 以名单名
+	// 为键，旧键（crawlerbot:<engine>）若未先迁移，后续逐引擎 upsert 会写到
+	// 另一行上。走测试缝以便钉住「单轮只迁移一次」。
+	if err := crawlerIPListMigrate(); err != nil {
 		return err
 	}
 	// 启动期把内置源的 canonical url/format 刷新到存量行（用户开关/
@@ -127,11 +130,8 @@ func (m *CrawlerUpdateManager) Prime() error {
 			all[src.Name] = append([]string(nil), seed...)
 		}
 	}
-	// 名单名迁移单轮一次（与 RunUpdate 同原则）：逐引擎 upsert 各自重跑
-	// 迁移等于每引擎 N 条 UPDATE。
-	if err := crawlerIPListMigrate(); err != nil {
-		return err
-	}
+	// 名单名迁移已在上方读库前完成一次（逐引擎 upsert 不再各自重跑：那等于
+	// 每引擎 N 条 UPDATE，且迁移晚于读库会让旧键行被重复写入）。
 	for engineID, entries := range all {
 		// 逐引擎只落 DB：带快照形态会在 DB 尚未补种完的中间态各写一次全量
 		// 快照（插件可能读到只含部分引擎的合法 JSON）。全量快照在循环末尾
@@ -155,30 +155,9 @@ func RebuildCrawlerIPListSnapshot() error {
 	return writeCrawlerIPListSnapshotAll(all)
 }
 
-// upsertCrawlerIPList 名单行原子快照（内容变化才更新）；失败/空集不写（保留
-// 上次快照）。changed 语义见 upsertCrawlerIPListChanged。
-func upsertCrawlerIPList(engineID string, entries []string) error {
-	_, err := upsertCrawlerIPListChanged(engineID, entries)
-	return err
-}
-
-// upsertCrawlerIPListChanged 名单行原子快照：内容变化才更新（entries JSON、
-// updated_at、entry_count）；失败/空集不写（保留上次快照）。
-// 返回 changed=DB/快照内容真实变化（调用方据此决定投影收敛）。
-// 同步推送插件内存态（模块边界友好：caddygeoip 独立模块不能 import 根 DB）。
-func upsertCrawlerIPListChanged(engineID string, entries []string) (bool, error) {
-	if len(entries) == 0 {
-		return false, errors.New("空 IP 段列表（解析无产出）")
-	}
-	if err := crawlerIPListMigrate(); err != nil {
-		return false, err
-	}
-	return upsertCrawlerIPListChangedInner(engineID, entries)
-}
-
 // upsertCrawlerIPListChangedInner upsert 主体（名单名迁移已由调用方完成——
-// RunUpdate 单轮提升一次；独立调用方走 upsertCrawlerIPListChanged 带迁移形态）。
-// DB 行落定后才写运行快照（快照写失败须让调用方判失败）。
+// RunUpdate/Prime 单轮提升一次）。DB 行落定后才写运行快照（快照写失败须让
+// 调用方判失败）。
 func upsertCrawlerIPListChangedInner(engineID string, entries []string) (bool, error) {
 	changed, snapshotNeeded, err := upsertCrawlerIPListChangedInnerNoSnapshot(engineID, entries)
 	if err != nil {

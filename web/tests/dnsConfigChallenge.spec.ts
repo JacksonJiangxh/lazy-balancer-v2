@@ -65,6 +65,33 @@ test('遗留空凭证：未填凭证时改名/禁用不挑战，填入凭证才�
   assert.equal(dnsConfigNeedsChallenge(empty, draft({ dnsCredentials: { auth_mode: 'dnspod', app_id: '1', app_key: '' } })), true)
 })
 
+// 库值含「当前元数据判为隐藏」的键（导入备份/带外写库/旧版本遗留，或后端未来
+// 调整 visible_when 后的全部存量）时，表单按隐藏规则裁剪、基线若快照原样库值，
+// 键集差异会让「仅改名/仅停用」重新被判为凭证变更而强制真实 DNS 挑战。
+test('基线与表单同源裁剪：隐藏键不得进入基线键集', () => {
+  // 修复后形态：基线与表单来自同一次归一（同键集），仅改名不挑战
+  const pruned = { auth_mode: 'dnspod', app_id: '1', app_key: 'k' }
+  assert.equal(dnsConfigNeedsChallenge(baseline({ dnsCredentials: pruned }), draft({ dnsCredentials: { ...pruned } })), false)
+  // 修复前形态（基线含隐藏键、表单不含）：键集不同 → 判定为变更，正是误判来源
+  const unstripped = baseline({ dnsCredentials: { ...pruned, stale_token: 'x' } })
+  assert.equal(dnsConfigNeedsChallenge(unstripped, draft()), true, '键集差异按变更处理（该形态不得出现在组件基线里）')
+
+  const page = source('src/views/settings/FreeCertificates.vue')
+  const open = section(page, 'const openConfigDialog = (config?: CertConfig) => {', '\nconst ')
+  assert.match(
+    open,
+    /const initialCredentials = canPruneHidden \? applyCredentialFieldChange\(providerFields, parsedCreds\) : \{ \.\.\.parsedCreds \}/,
+    '表单初值与基线必须来自同一次归一',
+  )
+  assert.match(open, /dns_credentials: initialCredentials,/, '表单使用归一后的凭证')
+  assert.match(open, /dnsCredentials: legacyEmptyCredentials\.value \? null : \{ \.\.\.initialCredentials \}/, '基线取同一份归一结果的拷贝')
+  assert.doesNotMatch(
+    open,
+    /dnsCredentials: legacyEmptyCredentials\.value \? null : \{ \.\.parsedCreds \}/,
+    '禁止基线直传未裁剪库值（隐藏键会造成键集差异 → 改名/停用被强制挑战）',
+  )
+})
+
 test('组件接线：挑战门由快照判定，弹框只在需要时出现', () => {
   const page = source('src/views/settings/FreeCertificates.vue')
   assert.match(page, /const configBaseline = ref<DnsConfigBaseline \| null>\(null\)/)

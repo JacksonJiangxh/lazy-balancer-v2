@@ -371,6 +371,14 @@ func (h *Handlers) MFAActivate(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "请求格式错误"})
 		return
 	}
+	// 先过内存滑动窗限流（与登录后验码同一 per-user 实现）：pending 校验的
+	// 收敛此前完全依赖 DB 失败计数硬闸，DB 写不可用（只读挂载/磁盘满/
+	// WAL 长占）时计数落不了库，5 次作废不生效，窗口内可对 10^6 码空间
+	// 持续枚举。内存层不依赖 DB，故障期仍生效；DB 硬闸保留为跨进程/重启的
+	// 二次防线（作废 pending 本身）。
+	if mfaVerifyRateLimitedRejection(c, userID) {
+		return
+	}
 	if ok, verr := services.MFAVerifyPending(userID, req.Code, time.Now()); !ok {
 		if errors.Is(verr, services.ErrMFANoPendingSecret) {
 			// 业务态哨兵（未 setup/pending 被并发覆盖）→ 400 业务文案，
@@ -382,14 +390,13 @@ func (h *Handlers) MFAActivate(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "MFA 验证服务暂时不可用，请稍后重试"})
 			return
 		}
-		// pending 码失败计数——VerifyPending 无锁定无限流（loginRateLimit
-		// 只挂公开路由），持会话者可对 10^6 码空间暴力；5 次失败作废 pending（重新
-		// setup 才能再试），与挑战级计数同为与全局开关无关的硬闸。
+		// 真验证码错误：先在内存窗口记一次（不依赖 DB，故障期即是唯一硬闸），
+		// 再落 DB 计数硬闸（达 5 次作废 pending，跨进程/重启有效）。
+		services.MFARecordVerifyAttemptFailure(userID, time.Now())
 		invalidated, ferr := services.MFARecordPendingFailure(userID)
 		if ferr != nil {
-			// 失败计数未落库 = 5 次硬闸失效（activate 无登录限流）；fail-closed 500，
-			// 不得以「验证码错误」回应让爆破继续。pending secret 与计数保持原状，
-			// 用户重试即可。
+			// 失败计数未落库 = DB 硬闸失效；fail-closed 500，不得以「验证码错误」
+			// 回应让爆破继续。内存窗口（上方记账）仍限制尝试速率。
 			mfaInternalFailure(c, "记录 MFA 绑定失败次数", ferr)
 			return
 		}
@@ -400,6 +407,7 @@ func (h *Handlers) MFAActivate(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: "验证码错误，请确认 Authenticator 时间同步后重试"})
 		return
 	}
+	services.MFAClearVerifyAttempts(userID)
 	services.MFAClearPendingFailures(userID)
 	codes, err := services.MFAActivate(userID)
 	if err != nil {
@@ -573,8 +581,10 @@ type MFAStepUpDecision struct {
 // 调用方按自身路由语义给出 covered（守卫：写方法/敏感导出 GET；特权 API Key
 // 创建：固定 true），其余短路条件必须单源——任一侧漏掉 OIDC 会话短路或只读
 // 语义写路由豁免，就是 428 误弹码/二因子旁路。
+// database 是开关读取的库句柄：守卫链上「同请求同源」——角色读取（调用方）、
+// 开关读取（本函数）与 MFA 状态读取（mfaEnabledCheck）不得分叉到不同库。
 // mfaEnabledCheck 由调用方注入（守卫保留测试注入点）。
-func DecideMFAStepUp(c *gin.Context, covered bool, mfaEnabledCheck func(int) (bool, error)) (MFAStepUpDecision, error) {
+func DecideMFAStepUp(c *gin.Context, covered bool, database *sql.DB, mfaEnabledCheck func(int) (bool, error)) (MFAStepUpDecision, error) {
 	// 非写操作/非敏感 GET，或机器身份（API Key/MCP）——无 MFA 概念。
 	if !covered || c.GetString("auth_type") != "jwt" {
 		return MFAStepUpDecision{}, nil
@@ -595,7 +605,7 @@ func DecideMFAStepUp(c *gin.Context, covered bool, mfaEnabledCheck func(int) (bo
 	if c.GetString("auth_method") == "oidc" {
 		return MFAStepUpDecision{}, nil
 	}
-	guardEnabled, err := services.MFAWriteGuardEnabled()
+	guardEnabled, err := services.MFAWriteGuardEnabledWith(database)
 	if err != nil {
 		return MFAStepUpDecision{}, fmt.Errorf("%w: %v", ErrMFAStepUpGuardUnreadable, err)
 	}

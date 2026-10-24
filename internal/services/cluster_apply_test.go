@@ -667,6 +667,15 @@ func TestSyncService_applySnapshot_preservesOIDCIdentityAndConfig(t *testing.T) 
 	if snapshot.BasicSettings.OIDCConfig == nil || !strings.Contains(*snapshot.BasicSettings.OIDCConfig, "idp.example.com") {
 		t.Fatalf("snapshot global oidc_config lost: %v", snapshot.BasicSettings.OIDCConfig)
 	}
+	// 同库快照的 sections 哈希与本地一致会整节跳过——先把本地 oidc_config
+	// 与用户 OIDC 身份改成漂移值，使 users 节必然重放，落库断言才有区分力
+	// （否则「从库保留」与「根本没写」不可区分）。
+	if _, err := database.Exec(`UPDATE global_config SET oidc_config='{"enabled":false}' WHERE id=1`); err != nil {
+		t.Fatalf("drift local oidc_config: %v", err)
+	}
+	if _, err := database.Exec(`UPDATE users SET auth_provider='local', oidc_subject='', oidc_issuer='' WHERE username='sso-user'`); err != nil {
+		t.Fatalf("drift local oidc identity: %v", err)
+	}
 	// When: 应用到干净从库
 	err = syncService.applySnapshot(context.Background(), snapshot)
 	if err != nil {

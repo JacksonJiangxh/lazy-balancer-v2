@@ -2662,4 +2662,13 @@ func TestUpdateRule_disableWithRunningJobReturnsConflict(t *testing.T) {
 	if enabled != 1 || jobStatus != "issued" {
 		t.Fatalf("enabled=%d job_status=%q, want 1/issued（409 分支零写入）", enabled, jobStatus)
 	}
+	// 被在途签发挡住的禁用尝试必须留痕（与 /disable、DELETE 同口径）：
+	// 后续追查「谁在何时尝试禁用、被什么挡住」时编辑入口不得缺席。
+	var auditRows int
+	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action='更新失败' AND resource='负载规则' AND detail LIKE '%lb_a87_running%'`).Scan(&auditRows); err != nil {
+		t.Fatalf("read audit: %v", err)
+	}
+	if auditRows != 1 {
+		t.Fatalf("PUT enabled=false 被 409 拦住时必须留 1 条失败审计, got %d", auditRows)
+	}
 }

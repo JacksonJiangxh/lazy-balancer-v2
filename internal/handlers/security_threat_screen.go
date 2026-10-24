@@ -100,6 +100,11 @@ func describeThreatRuleNameWithNames(key string, customNames map[int]string) str
 		return "爬虫伪装拦截（#" + key + "）"
 	}
 	switch {
+	case n >= services.SyntheticCustomRuleIDBase:
+		// 无 id 的内嵌自定义规则（v2.1.0 前遗留）按合成 emit id 发射：
+		// security_custom_rules 无对应行可查，但语义仍属自定义规则族——
+		// 直接回裸数字会与事件列表 trigger_type 的「WAF·自定义」分叉。
+		return "自定义规则（#" + key + "）"
 	case n >= services.GeoIPPrecheckSegmentLimit && n < services.SyntheticCustomRuleIDBase:
 		if idx := services.GetCRSRuleIndex(); idx != nil {
 			if entry := idx.Find(key); entry != nil && strings.TrimSpace(entry.Msg) != "" {
@@ -1580,12 +1585,9 @@ func fetchThreatTrafficSnapshot(adminURL string) (gin.H, bool) {
 		if country == "" || country == "Reserved" || country == "0" {
 			continue
 		}
-		name := geoipnames.CountryChinese(country)
-		if name == country && country != "中国" {
-			// 未收录英文名原样保留（前端质心表 miss 走兜底位）
-			name = country
-		}
-		out[name] = entry
+		// 未收录的英文名由 CountryChinese 原样返回，无需再回退赋值
+		// （前端质心表 miss 时按兜底位展示）。
+		out[geoipnames.CountryChinese(country)] = entry
 	}
 	return gin.H{
 		"countries": out,
@@ -1983,6 +1985,11 @@ func (h *Handlers) GetThreatScreenAttackFlow(c *gin.Context) {
 	}})
 }
 
+// toastSummaryBetweenMaxAndAggregateForTest 仅测试注入的并发窗口钩子：在
+// 「读 MAX(id)」与「聚合扫描」之间执行，用于钉住聚合上界（maxID 之后新落库
+// 的事件不得计入本批）。生产恒为 nil（零成本）。
+var toastSummaryBetweenMaxAndAggregateForTest func()
+
 // GetSecurityEventToastSummary GET /security/events/toast-summary?since_id=N
 // 弹框专用精确聚合：按游标扫描全部新安全事件，按「IP + 攻击类型 + 动作」
 // 计数后返回摘要。事件列表仍走最新 N 条快照；本端点不受列表窗口截断影响。
@@ -2037,20 +2044,26 @@ func (h *Handlers) GetSecurityEventToastSummary(c *gin.Context) {
 	// 1200 条并推进到 maxID（跳过更老的弹框展示，安全日志仍完整）。这样
 	// 2000/s 洪峰下 SQL 扫描与临时分组有硬上限，不会随积压无限增长。
 	const toastSummaryMaxEvents = 400 * 3
+	// 聚合上界必须固定为本次读到的 maxID：否则「读 MAX(id) 之后、聚合执行
+	// 之前」新落库的事件会被计入本批，而 next_id 仍推进到 maxID——下一轮
+	// 从 maxID 起重扫，同一事件被弹框两次（洪峰下每轮重复 1~10 条）。
+	if hook := toastSummaryBetweenMaxAndAggregateForTest; hook != nil {
+		hook()
+	}
 	rows, err := db.MetricsDB.Query(`
 		SELECT client_ip, action, COALESCE(rule_triggered,''), COALESCE(rule_msg,''),
 		       COUNT(*), MAX(id), AVG(COALESCE(duration_us,0))
 		FROM (
 			SELECT client_ip, action, rule_triggered, rule_msg, duration_us, id
 			FROM security_events
-			WHERE id > ? AND event_time >= datetime('now','-5 minutes')
+			WHERE id > ? AND id <= ? AND event_time >= datetime('now','-5 minutes')
 			  AND `+services.AttackEventSQLPredicate("rule_triggered", "action")+`
 			ORDER BY id DESC
 			LIMIT ?
 		)
 		GROUP BY client_ip, action, rule_triggered, rule_msg
 		ORDER BY COUNT(*) DESC, MAX(id) DESC
-		LIMIT 200`, sinceID, toastSummaryMaxEvents)
+		LIMIT 200`, sinceID, maxID, toastSummaryMaxEvents)
 	if err != nil {
 		services.Logf("error", "security event toast summary: query failed: %v", err)
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "安全事件查询失败"})

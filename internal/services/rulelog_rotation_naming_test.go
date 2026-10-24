@@ -35,6 +35,11 @@ func TestRemoveRuleLogFiles_deletesRealTimberjackRotationCopies(t *testing.T) {
 		// 接入即永久残留。
 		"lb_live-2026-10-23T18-38-57.122-time.log.gz",
 		"lb_live-2026-10-23T18-38-57.122-time_2.log",
+		// 「现存文件不可追加打开」回退 reason：timberjack 的 openNew("initial")
+		// 会 rename 现存文件并保留该 reason 段（`-initial`），与 size/time
+		// 同属上游命名家族。
+		"lb_live-2026-10-23T18-38-57.122-initial.log.gz",
+		"lb_live-2026-10-23T18-38-57.122-initial.log",
 	}
 	// 兄弟规则副本（caddy_id 以本规则 id 为前缀）：一个都不能动。
 	brotherCopies := []string{
@@ -42,6 +47,7 @@ func TestRemoveRuleLogFiles_deletesRealTimberjackRotationCopies(t *testing.T) {
 		"lb_live-1-2026-10-23T18-38-57.122-size.log.gz",
 		"lb_live-extra-2026-10-23T18-38-57.122-size_1.log.gz",
 		"lb_live-1-2026-10-23T18-38-57.122-time.log.gz",
+		"lb_live-extra-2026-10-23T18-38-57.122-initial.log.gz",
 	}
 	for _, name := range append(append([]string{}, ownCopies...), brotherCopies...) {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {

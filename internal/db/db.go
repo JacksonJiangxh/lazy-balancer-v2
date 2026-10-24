@@ -1080,7 +1080,13 @@ var newColumnsRegistry = map[string]string{
 	// 该迁移的判据在 JSON 内容里，无法用索引探测，只能整表读+解析——marker
 	// 置位后启动零读零写。
 	"global_config.legacy_custom_rule_sanitize_fp": "TEXT NOT NULL DEFAULT ''",
-	"security_ip_lists.system":                     "INTEGER NOT NULL DEFAULT 0",
+	// 启动期「已知僵持态」的收敛指纹（''=未告警或冲突已解除）：内置威胁名单
+	// 规范名被另一 system=1 行占用、users 存在重复 OIDC 身份——两者都需人工
+	// 处置、无法自动收敛，缺指纹则每重启重写一条一模一样的审计（噪声随重启
+	// 线性增长）。指纹变化（人工归并/新冲突）即自动重报。
+	"global_config.threat_list_takeover_skip_fp": "TEXT NOT NULL DEFAULT ''",
+	"global_config.oidc_dup_identity_fp":         "TEXT NOT NULL DEFAULT ''",
+	"security_ip_lists.system":                   "INTEGER NOT NULL DEFAULT 0",
 	// MFA 登录挑战绑定签发时密码版本。
 	"mfa_challenges.password_version":      "INTEGER NOT NULL DEFAULT 0",
 	"path_rules.upstream_path":             "TEXT NOT NULL DEFAULT ''",
@@ -3532,6 +3538,12 @@ func migrateCrawlerSourcesOutOfThreat() error {
 	}); err != nil {
 		return err
 	}
+	// 两表都是用户可见表（威胁情报库 / 爬虫地址库）且在集群同步清单内：
+	// 源行「从威胁库消失、在爬虫库出现」必须可追溯，否则管理员无法区分
+	// 「按设计归位」与「配置被吞」。与同族结构搬迁迁移同口径，事务提交后留痕。
+	detail := fmt.Sprintf("启动迁移：早期合并形态的爬虫源 %d 条已迁入爬虫地址库并从威胁情报库移除（googlebot/gptbot/bingbot/so360spider，原开关/版本/状态保留）", pending)
+	log.Print(detail)
+	recordSystemAudit("启动迁移", "威胁源", detail)
 	return nil
 }
 
@@ -3792,16 +3804,33 @@ const nodesDedupeSQL = `DELETE FROM nodes WHERE id NOT IN (
 	) WHERE rn = 1
 )`
 
-// dedupeNodesTx 在 nodes 重建事务内执行去重并留痕删除条数。
-func dedupeNodesTx(tx *sql.Tx) error {
+// dedupeNodesTx 在 nodes 重建事务内执行去重并返回删除条数（去重语句单源）。
+// 留痕归调用方在事务提交成功后统一执行（recordNodesDedupeAudit）——回滚的
+// 迁移不得留下「已删行」记录。
+func dedupeNodesTx(tx *sql.Tx) (int64, error) {
 	result, err := tx.Exec(nodesDedupeSQL)
 	if err != nil {
-		return fmt.Errorf("dedupe nodes: %w", err)
+		return 0, fmt.Errorf("dedupe nodes: %w", err)
 	}
-	if removed, rowsErr := result.RowsAffected(); rowsErr == nil && removed > 0 {
-		log.Printf("WARN: nodes 迁移去重删除 %d 条重复 (ip_address, port) 行（保留已批准/持令牌/最近上报者）", removed)
+	removed, rowsErr := result.RowsAffected()
+	if rowsErr != nil {
+		return 0, nil
 	}
-	return nil
+	return removed, nil
+}
+
+// recordNodesDedupeAudit 在 nodes 重建提交后为去重删行留痕：被删行可能连同
+// cluster_token_hash/registration_secret 一起消失（认证侧按 nodes.id 取注册
+// 密钥，行没了即认证失败），只写进程 stdout 会让「节点为何从注册表消失、
+// 为何需重新注册」在操作日志里不可追溯。与 cert_jobs/IP 名单去重、孤儿
+// path_rules/upstream 清理同口径落「全操作审计」。
+func recordNodesDedupeAudit(removed int64) {
+	if removed <= 0 {
+		return
+	}
+	detail := fmt.Sprintf("启动迁移：nodes 去重删除 %d 条重复 (ip_address, port) 行（保留已批准/持令牌/最近上报者）", removed)
+	log.Print("WARN: " + detail)
+	recordSystemAudit("启动迁移", "集群节点", detail)
 }
 
 func migrateNodesDeadColumns() error {
@@ -3812,7 +3841,8 @@ func migrateNodesDeadColumns() error {
 	if legacyColumns == 0 {
 		return nil
 	}
-	return withTableRebuild(context.Background(), "nodes", func(tx *sql.Tx) error {
+	var removed int64
+	err := withTableRebuild(context.Background(), "nodes", func(tx *sql.Tx) error {
 		// 重建目标对齐新 schema(无 master_id/自引用 FK,idx_nodes_master；
 		// 补 UNIQUE(ip,port))——master_id 死列经本路径与 migrateNodesDropMasterID
 		// 双路径收敛为同一形态。
@@ -3823,9 +3853,11 @@ func migrateNodesDeadColumns() error {
 		// nodesRebuildCopySQL 单源——本路径与 migrateNodesDropMasterID 曾各自
 		// 手写一份并已文本分叉（cluster_token_delivered DEFAULT 0/FALSE），
 		// 未来给 nodes 加列只需改单源。
-		if err := dedupeNodesTx(tx); err != nil {
-			return err
+		deduped, dedupeErr := dedupeNodesTx(tx)
+		if dedupeErr != nil {
+			return dedupeErr
 		}
+		removed = deduped
 		if _, err := tx.Exec(nodesRebuildDDL("nodes_without_legacy_sync") + nodesRebuildCopySQL("nodes_without_legacy_sync") + `
 		DROP TABLE nodes;
 		ALTER TABLE nodes_without_legacy_sync RENAME TO nodes;
@@ -3834,6 +3866,11 @@ func migrateNodesDeadColumns() error {
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	recordNodesDedupeAudit(removed)
+	return nil
 }
 
 // nodesRebuildDDL 与 nodesRebuildCopySQL 是 nodes 整表重建的唯一 DDL 单源
@@ -3892,6 +3929,27 @@ var (
 	oidcIdentityIndexSkips atomic.Int64
 )
 
+// oidcDupIdentityMarkerColumn 是「已告警的重复 OIDC 身份集合」指纹列
+// （global_config，newColumns 登记）。空串=未告警或冲突已解除。
+const oidcDupIdentityMarkerColumn = "oidc_dup_identity_fp"
+
+// readOIDCDupIdentityMarker 读已告警指纹：列/行缺失或读失败一律返回空串
+// （按「未告警」处理——最多多留一条审计，不影响正确性）。
+func readOIDCDupIdentityMarker() string {
+	var stored string
+	if err := DB.QueryRow(`SELECT COALESCE(` + oidcDupIdentityMarkerColumn + `,'') FROM global_config WHERE id=1`).Scan(&stored); err != nil {
+		return ""
+	}
+	return stored
+}
+
+// writeOIDCDupIdentityMarker 写指纹；失败只告警不阻断启动（下次启动重报）。
+func writeOIDCDupIdentityMarker(fingerprint string) {
+	if _, err := DB.Exec(`UPDATE global_config SET `+oidcDupIdentityMarkerColumn+`=? WHERE id=1`, fingerprint); err != nil {
+		log.Printf("启动迁移：OIDC 重复身份告警指纹写入失败（下次启动将重报）: %v", err)
+	}
+}
+
 // migrateOidcIdentityUniqueIndex：OIDC 身份三元组唯一
 // 索引——JIT 开户在并发回调窗口（双请求同走 no-rows 分支）下可产生重复
 // (oidc_issuer, oidc_subject) 行，命中 SELECT 无 ORDER BY 时取行不确定，会话
@@ -3935,8 +3993,22 @@ func migrateOidcIdentityUniqueIndex() error {
 		return fmt.Errorf("iterate duplicate oidc identities: %w", err)
 	}
 	if len(duplicates) > 0 {
-		log.Printf("WARN: users 表存在重复 OIDC 身份(%s)，跳过 u_oidc_identity 唯一索引创建——请人工合并/清理重复行后重启", strings.Join(duplicates, ", "))
+		fingerprint := strings.Join(duplicates, ", ")
+		log.Printf("WARN: users 表存在重复 OIDC 身份(%s)，跳过 u_oidc_identity 唯一索引创建——请人工合并/清理重复行后重启", fingerprint)
+		// 该僵持态只能人工处置（合并/删除重复行后重启），每次重启都重写一条
+		// 一模一样的审计会冲淡真实信号——指纹命中只留 WARN，指纹变化（新增
+		// 重复或人工部分合并后残留）才重报。账号面板据此可见「为何登录身份
+		// 可能落到不同行」。
+		if readOIDCDupIdentityMarker() != fingerprint {
+			detail := fmt.Sprintf("启动迁移：users 存在重复 OIDC 身份(%s)，已跳过 u_oidc_identity 唯一索引（同一身份登录可能随机落到重复行之一）；请人工合并重复行后重启", fingerprint)
+			recordSystemAudit("启动迁移", "用户", detail)
+			writeOIDCDupIdentityMarker(fingerprint)
+		}
 		return nil
+	}
+	// 冲突已解除（人工合并后重启）：清除指纹，未来复发可重新上报。
+	if readOIDCDupIdentityMarker() != "" {
+		writeOIDCDupIdentityMarker("")
 	}
 	if _, err := DB.Exec("CREATE UNIQUE INDEX IF NOT EXISTS u_oidc_identity ON users(oidc_issuer, oidc_subject) WHERE auth_provider='oidc' AND oidc_subject<>''"); err != nil {
 		return fmt.Errorf("create u_oidc_identity index: %w", err)
@@ -4525,15 +4597,18 @@ func migrateNodesDropMasterID() error {
 	// 启动死循环;DROP 与 RENAME 之间崩溃→nodes 表丢失→下次启动静默重建
 	// 空表,节点注册表全量丢失。事务化后失败整体回滚、重跑幂等（骨架
 	// 已收敛到 withTableRebuild）。
-	return withTableRebuild(context.Background(), "nodes master_id", func(tx *sql.Tx) error {
+	var removed int64
+	err := withTableRebuild(context.Background(), "nodes master_id", func(tx *sql.Tx) error {
 		// DDL/拷贝 SELECT 与 migrateNodesDeadColumns
 		// 共用 nodesRebuildDDL/nodesRebuildCopySQL 单源。
 		if _, err := tx.Exec(`DROP INDEX IF EXISTS idx_nodes_master;`); err != nil {
 			return fmt.Errorf("drop legacy nodes index: %w", err)
 		}
-		if err := dedupeNodesTx(tx); err != nil {
-			return err
+		deduped, dedupeErr := dedupeNodesTx(tx)
+		if dedupeErr != nil {
+			return dedupeErr
 		}
+		removed = deduped
 		if _, err := tx.Exec(nodesRebuildDDL("nodes_new") + nodesRebuildCopySQL("nodes_new") + `
 	DROP TABLE nodes;
 	ALTER TABLE nodes_new RENAME TO nodes;`); err != nil {
@@ -4541,6 +4616,11 @@ func migrateNodesDropMasterID() error {
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	recordNodesDedupeAudit(removed)
+	return nil
 }
 
 func ensureClusterAppliedSections() error {

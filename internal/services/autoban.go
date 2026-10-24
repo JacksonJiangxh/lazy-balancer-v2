@@ -31,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -62,6 +63,12 @@ const (
 	// AutobanAuditAction 封禁审计动作名（merge 写点与 AutobanBannedToday
 	// 计数共用单源——两处字面量漂移会让今日封禁恒 0）。
 	AutobanAuditAction = "自动封禁"
+	// autobanAuditSummaryPrefix 是单轮汇总行 detail 的机器可读前缀：前缀后紧跟
+	// 被省略的逐条记录数（形如「汇总：其余 300 个 IP 省略逐条记录（本轮共 800 个
+	// IP，逐条上限 500；…）」）。AutobanBannedToday 按「逐 IP 行各 1 + 汇总行
+	// 省略数」相加补齐单轮逐条上限丢掉的部分——汇总文案可改说明段，但不得改变
+	// 「前缀 + 省略数」这个开头。
+	autobanAuditSummaryPrefix = "汇总：其余 "
 
 	// autobanReloadThrottle 重载节流窗口：全量重载回退路径至少间隔 60s 才真实
 	// 重载，窗口内的回退请求暂存合并到下一轮（投影热路径免节流——节流对象恒为
@@ -87,9 +94,10 @@ var AutobanListEntryCap = 2000
 // autobanAuditPerRoundCap 单轮逐 IP「自动封禁」审计行上限。逐 IP 留痕是
 // 可追溯性裁定（2026-09-14/15 审计可见性强化链）的默认形态，正常规模不
 // 触发；（首次启用/容量刚释放时）单轮 2000 个 IP 同时达标会一次写 2000 行
-// 审计——审计库按 3 个月保留且 AutobanBannedToday 依赖 audit_log(action)
-// 索引，洪峰下写放大与体积不可控。超限时保留前 N 条逐 IP 行并补一条汇总行
-// （点名总数与省略数）；完整名单始终以预置 IP 列表为准。
+// 审计——审计库按 3 个月保留，洪峰下写放大与体积不可控。超限时保留前 N 条
+// 逐 IP 行并补一条汇总行（点名总数与省略数）；完整名单始终以预置 IP 列表
+// 为准。今日封禁计数不依赖逐 IP 行数：汇总行携带本轮总数，AutobanBannedToday
+// 按「逐 IP 行 + 汇总总数」相加，省略部分不会从统计里消失。
 var autobanAuditPerRoundCap = 500
 
 // AutobanDuration/Clock/Scope：配置枚举与时长换算。
@@ -1309,7 +1317,8 @@ func autobanAuditBanned(cfg AutobanConfig, banned []string) {
 	}
 	if omitted > 0 {
 		RecordAuditLog("system", AutobanAuditAction, "IP 地址列表",
-			fmt.Sprintf("本轮自动封禁共 %d 个 IP，逐 IP 审计超过单轮上限 %d，其余 %d 个省略逐条记录（完整名单见预置 IP 列表）", len(banned)+omitted, autobanAuditPerRoundCap, omitted), "")
+			fmt.Sprintf("%s%d 个 IP 省略逐条记录（本轮共 %d 个 IP，逐条上限 %d；完整名单见预置 IP 列表）",
+				autobanAuditSummaryPrefix, omitted, len(banned)+omitted, autobanAuditPerRoundCap), "")
 	}
 }
 
@@ -1474,6 +1483,10 @@ func AutobanActiveEntries(entries []models.IPListEntry) []models.IPListEntry {
 // 到期解封不回退今日计数，同 IP 重新封禁累计次数。数据源=audit_log
 // （created_at UTC 墙钟串，action/created_at 双索引；默认保留 3 个月，
 // 覆盖当日）；审计库未初始化/查询失败按 0（状态卡统计位容错）。
+// 单轮逐 IP 行有上限（autobanAuditPerRoundCap）时，超出部分只存在于汇总行，
+// 故计数按「逐 IP 行各 1 + 汇总行携带的省略数」相加——行数上限不会让洪峰
+// 轮次的封禁数被截断或重复计（旧实现直接 COUNT(*)：800 个 IP 的一轮以
+// 501 条审计行计成 501；只加汇总总数则会把已逐条记录的 500 个再计一遍）。
 func AutobanBannedToday() int {
 	if db.AuditDB == nil {
 		return 0
@@ -1481,9 +1494,39 @@ func AutobanBannedToday() int {
 	loc := CurrentLocation()
 	now := autobanNow().In(loc)
 	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc).UTC().Format(autobanTimeLayout)
-	var n int
-	if err := db.AuditDB.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE action=? AND created_at >= ?`, AutobanAuditAction, dayStart).Scan(&n); err != nil {
+	rows, err := db.AuditDB.Query(`SELECT COALESCE(detail,'') FROM audit_log WHERE action=? AND created_at >= ?`, AutobanAuditAction, dayStart)
+	if err != nil {
+		return 0
+	}
+	defer rows.Close()
+	n := 0
+	for rows.Next() {
+		var detail string
+		if err := rows.Scan(&detail); err != nil {
+			return 0
+		}
+		n += autobanAuditEventCount(detail)
+	}
+	if err := rows.Err(); err != nil {
 		return 0
 	}
 	return n
+}
+
+// autobanAuditEventCount 把一条「自动封禁」审计行折算成封禁事件数：汇总行
+// 携带被省略的逐条记录数（前缀后的整数），逐 IP 行与历史文案各计 1——
+// 无法识别的形态按 1 计是保守方向（不会凭空放大统计）。
+func autobanAuditEventCount(detail string) int {
+	if rest, ok := strings.CutPrefix(detail, autobanAuditSummaryPrefix); ok {
+		end := 0
+		for end < len(rest) && rest[end] >= '0' && rest[end] <= '9' {
+			end++
+		}
+		if end > 0 {
+			if n, err := strconv.Atoi(rest[:end]); err == nil && n > 0 {
+				return n
+			}
+		}
+	}
+	return 1
 }

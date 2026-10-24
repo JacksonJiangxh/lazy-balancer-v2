@@ -486,49 +486,65 @@ func ipListEntriesChanged(oldJSON, newJSON string) bool {
 	return false
 }
 
-// validateIPListShape 校验列表载荷并返回解析后的条目：名称非空 ≤50、描述 ≤200、
-// 分类 ≤32、条目数 ≤2000（修正：2026-10-14 用户裁定上限已 500→2000）、
+// validateIPListShape 校验列表载荷并返回**生效**条目：名称非空 ≤50、描述 ≤200、
+// 分类 ≤32、生效条目数 ≤2000（修正：2026-10-14 用户裁定上限已 500→2000）、
 // value 过 validIPOrCIDR、remark ≤100。
-func validateIPListShape(name, description, category, entriesJSON string) ([]models.IPListEntry, error) {
+//
+// 到期条目在保存时剔除（到期即解封，与渲染生效集/追加上限同判据
+// services.AutobanActiveEntries）：自动封禁关闭后到期条目不再被任务清理，
+// 旧实现按原始长度计上限，让「生效 2000 + 到期残留 N」的整表保存被 400 挡下
+// ——用户只能逐行删除到期行才能保存。剔除后返回的条目即落库形态，原始条数
+// 与生效条数不再有两个口径；被剔除的条数由 prunedExpired 返回供响应披露。
+func validateIPListShape(name, description, category, entriesJSON string) ([]models.IPListEntry, int, error) {
 	if err := validateIPListMetadataShape(name, description, category); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	var entries []models.IPListEntry
-	if err := json.Unmarshal([]byte(entriesJSON), &entries); err != nil {
-		return nil, fmt.Errorf("entries 必须是 {value, remark} 对象的 JSON 数组")
+	var raw []models.IPListEntry
+	if err := json.Unmarshal([]byte(entriesJSON), &raw); err != nil {
+		return nil, 0, fmt.Errorf("entries 必须是 {value, remark} 对象的 JSON 数组")
 	}
+	entries := services.AutobanActiveEntries(raw)
+	prunedExpired := len(raw) - len(entries)
 	if len(entries) > ipListMaxEntries {
-		return nil, fmt.Errorf("条目数量不能超过 %d 条", ipListMaxEntries)
+		return nil, 0, fmt.Errorf("生效条目数量不能超过 %d 条（已到期条目不计入）", ipListMaxEntries)
 	}
 	for i, entry := range entries {
 		if !validIPOrCIDR(entry.Value) {
-			return nil, fmt.Errorf("条目 %d 包含无效的 IP/CIDR：%s", i+1, entry.Value)
+			return nil, 0, fmt.Errorf("条目 %d 包含无效的 IP/CIDR：%s", i+1, entry.Value)
 		}
 		if len([]rune(entry.Remark)) > ipListMaxRemarkLength {
-			return nil, fmt.Errorf("条目 %d 的备注长度不能超过 %d 个字符", i+1, ipListMaxRemarkLength)
+			return nil, 0, fmt.Errorf("条目 %d 的备注长度不能超过 %d 个字符", i+1, ipListMaxRemarkLength)
 		}
 	}
-	return entries, nil
+	return entries, prunedExpired, nil
 }
 
 type ipListRefPolicy struct {
 	ID   int    `json:"id"`
 	Name string `json:"name"`
+	// Enabled 引用策略的启用态：引用计数同时覆盖禁用策略（展示面），
+	// 但只有启用的引用会阻止删除（DeleteIPList 409 门只计 enabled=1）——
+	// 前端据此给禁用引用加「已禁用」标注，消除「显示有引用却能删」的落差。
+	Enabled bool `json:"enabled"`
 }
 
 type ipListRow struct {
-	ID          int               `json:"id"`
-	Name        string            `json:"name"`
-	Description string            `json:"description"`
-	Category    string            `json:"category"`
-	Entries     json.RawMessage   `json:"entries,omitempty"`
-	EntryCount  int               `json:"entry_count"`
-	RefCount    int               `json:"ref_count"`
-	RefPolicies []ipListRefPolicy `json:"ref_policies"`
-	CreatedBy   int               `json:"created_by"`
-	CreatedAt   string            `json:"created_at"`
-	UpdatedBy   int               `json:"updated_by"`
-	UpdatedAt   string            `json:"updated_at"`
+	ID          int             `json:"id"`
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Category    string          `json:"category"`
+	Entries     json.RawMessage `json:"entries,omitempty"`
+	EntryCount  int             `json:"entry_count"`
+	RefCount    int             `json:"ref_count"`
+	// RefCountEnabled 启用策略引用数（与 DeleteIPList 的 409 门同口径，
+	// 含受信代理引用）——ref_count 含禁用策略的展示面引用，页面对
+	// 「显示有引用但能删」的解释由本字段与 ref_policies[].enabled 承担。
+	RefCountEnabled int               `json:"ref_count_enabled"`
+	RefPolicies     []ipListRefPolicy `json:"ref_policies"`
+	CreatedBy       int               `json:"created_by"`
+	CreatedAt       string            `json:"created_at"`
+	UpdatedBy       int               `json:"updated_by"`
+	UpdatedAt       string            `json:"updated_at"`
 	// System=内置只读名单（威胁情报库三源，v2.3.2 名单化）——前端据此只读化。
 	System bool `json:"system"`
 	// PresetAutoban=预置「自动封禁名单」：system=1 但条目可改/禁删
@@ -545,16 +561,16 @@ type ipListRow struct {
 // 刻意不用 SQL LIKE（"5" 会命中 "[15]"、"[51]"——15 误报对 5 的假阳性），
 // JSON 解析是唯一精确口径。
 func loadIPListRefPolicies() (map[int64][]ipListRefPolicy, error) {
-	rows, err := db.DB.Query("SELECT id, COALESCE(name,''), COALESCE(ip_acl_list_refs,'[]'), COALESCE(ip_whitelist_refs,'[]'), COALESCE(crs_excluded_rules,'[]') FROM security_policies")
+	rows, err := db.DB.Query("SELECT id, COALESCE(name,''), COALESCE(enabled,0), COALESCE(ip_acl_list_refs,'[]'), COALESCE(ip_whitelist_refs,'[]'), COALESCE(crs_excluded_rules,'[]') FROM security_policies")
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	refs := make(map[int64][]ipListRefPolicy)
 	for rows.Next() {
-		var policyID int
+		var policyID, enabled int
 		var policyName, aclRefs, wlRefs, crsExcluded string
-		if err := rows.Scan(&policyID, &policyName, &aclRefs, &wlRefs, &crsExcluded); err != nil {
+		if err := rows.Scan(&policyID, &policyName, &enabled, &aclRefs, &wlRefs, &crsExcluded); err != nil {
 			return nil, err
 		}
 		seenList := make(map[int64]struct{})
@@ -566,7 +582,7 @@ func loadIPListRefPolicies() (map[int64][]ipListRefPolicy, error) {
 					continue
 				}
 				seenList[listID] = struct{}{}
-				refs[listID] = append(refs[listID], ipListRefPolicy{ID: policyID, Name: policyName})
+				refs[listID] = append(refs[listID], ipListRefPolicy{ID: policyID, Name: policyName, Enabled: enabled != 0})
 			}
 		}
 		// 补排除条目 listRefs 面（409 守卫已覆盖，仅补展示口径）。
@@ -575,7 +591,7 @@ func loadIPListRefPolicies() (map[int64][]ipListRefPolicy, error) {
 				continue
 			}
 			seenList[listID] = struct{}{}
-			refs[listID] = append(refs[listID], ipListRefPolicy{ID: policyID, Name: policyName})
+			refs[listID] = append(refs[listID], ipListRefPolicy{ID: policyID, Name: policyName, Enabled: enabled != 0})
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -671,10 +687,17 @@ func (h *Handlers) ListIPLists(c *gin.Context) {
 			row.RefPolicies = []ipListRefPolicy{}
 		}
 		row.RefCount = len(row.RefPolicies)
+		for _, ref := range row.RefPolicies {
+			if ref.Enabled {
+				row.RefCountEnabled++
+			}
+		}
 		if trustedProxyRefs[int64(row.ID)] {
 			row.TrustedProxyReferenced = true
 			row.TrustedProxyScope = "受信代理网段"
 			row.RefCount++ // 展示计数合并（ref_policies 不伪造策略项）
+			// 受信代理引用同属删除门（409），计入阻止删除的引用数。
+			row.RefCountEnabled++
 		}
 		lists = append(lists, row)
 	}
@@ -757,9 +780,15 @@ func (h *Handlers) CreateIPList(c *gin.Context) {
 	if strings.TrimSpace(req.Entries) == "" {
 		req.Entries = "[]"
 	}
-	entries, err := validateIPListShape(req.Name, req.Description, req.Category, req.Entries)
+	entries, prunedExpired, err := validateIPListShape(req.Name, req.Description, req.Category, req.Entries)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
+		return
+	}
+	// 落库形态=校验返回的生效条目（到期条目已剔除，见 validateIPListShape）。
+	entriesJSON, err := json.Marshal(entries)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: serverErrMsg("服务器内部错误", err)})
 		return
 	}
 	tx, err := db.DB.BeginTx(c.Request.Context(), nil)
@@ -785,27 +814,35 @@ func (h *Handlers) CreateIPList(c *gin.Context) {
 		c.JSON(http.StatusConflict, models.APIResponse{Code: 409, Message: "IP 列表名称已存在"})
 		return
 	}
+	// 额度只计**用户创建**的名单：系统内置名单（威胁情报库/爬虫地址库/自动
+	// 封禁预置）在提交后由 SeedSystemIPLists 自动补齐，不应占用用户额度。
+	// 与备份导入的 validateBackupIPListQuota 同口径（userCount ≤ 200），
+	// 否则系统名单行会挤掉用户可建空间（导入 197 条用户名单后新建被误挡）。
 	var total int
-	if err := tx.QueryRowContext(c.Request.Context(), "SELECT COUNT(*) FROM security_ip_lists").Scan(&total); err != nil {
+	if err := tx.QueryRowContext(c.Request.Context(), "SELECT COUNT(*) FROM security_ip_lists WHERE COALESCE(system,0)=0").Scan(&total); err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: serverErrMsg("服务器内部错误", err)})
 		return
 	}
 	if total >= ipListMaxGlobalCount {
-		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("IP 地址列表数量已达上限（%d 个）", ipListMaxGlobalCount)})
+		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("IP 地址列表（用户创建）数量已达上限（%d 个）", ipListMaxGlobalCount)})
 		return
 	}
 	result, err := tx.ExecContext(c.Request.Context(), `INSERT INTO security_ip_lists (name, description, category, entries, created_by, created_at, updated_by, updated_at) VALUES (?,?,?,?,?,datetime('now'),?,datetime('now'))`,
-		req.Name, req.Description, req.Category, req.Entries, int(contextUserID(c)), int(contextUserID(c)))
+		req.Name, req.Description, req.Category, string(entriesJSON), int(contextUserID(c)), int(contextUserID(c)))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: serverErrMsg("服务器内部错误", err)})
 		return
 	}
 	id, _ := result.LastInsertId()
+	createData := gin.H{"id": id, "entry_count": len(entries)}
+	if prunedExpired > 0 {
+		createData["pruned_expired"] = prunedExpired
+	}
 	h.finishTxApply(c, tx, txApplyFinish{
 		Resource: "IP 地址列表", AuditAction: "创建",
 		AuditDetail: fmt.Sprintf("名称：%s（#%d，%d 条）", req.Name, id, len(entries)),
 		SuccessMsg:  "IP 地址列表创建成功",
-		Data:        gin.H{"id": id},
+		Data:        createData,
 	})
 }
 
@@ -883,10 +920,20 @@ func (h *Handlers) UpdateIPList(c *gin.Context) {
 		entriesJSON = *req.Entries
 	}
 	entriesJSON = normalizeIPListEntriesJSON(entriesJSON)
-	entries, err := validateIPListShape(name, description, category, entriesJSON)
+	entries, prunedExpired, err := validateIPListShape(name, description, category, entriesJSON)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: err.Error()})
 		return
+	}
+	if req.Entries != nil {
+		// 落库形态=生效条目（到期条目已剔除）：原始条数与生效条数不再有两个
+		// 口径，后续保存不会再被到期残留顶到上限。
+		marshaled, merr := json.Marshal(entries)
+		if merr != nil {
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: serverErrMsg("服务器内部错误", merr)})
+			return
+		}
+		entriesJSON = string(marshaled)
 	}
 	// 条目清空 + 本列表被 allow 模式策略引用 → 该策略
 	// 生效名单变空 → 发射端 fail-open(「其余一律拒绝」实际全放行)且 UI
@@ -894,30 +941,21 @@ func (h *Handlers) UpdateIPList(c *gin.Context) {
 	// 走 allowEmptyingBlockedByPolicies 的「并集是否为空」语义（策略内联或
 	// 其他引用名单仍有条目时清空本列表不会放行全部请求），此前按「是否被
 	// 引用」一律 409 的偏严口径给出的文案在并集非空时是假的。
-	// 判据用**过滤到期后**的有效集合——与 remove-ip
-	// 路径同源。导入/带外名单可含 expires_at，保存一组仅已到期
-	// 条目时原始 len>0 会绕过本门，而渲染侧（AutobanActiveEntries）生效集
-	// 为空 = allow 策略放行全部。
-	if req.Entries != nil {
-		activeValues := make([]string, 0, len(entries))
-		for _, entry := range services.AutobanActiveEntries(entries) {
-			if entry.Value != "" {
-				activeValues = append(activeValues, entry.Value)
-			}
+	// entries 已是生效集合（到期条目在 validateIPListShape 剔除），因此
+	// 「仅剩已到期条目」的保存同样走本门——否则渲染侧
+	// （AutobanActiveEntries）生效集为空 = allow 策略放行全部。
+	if req.Entries != nil && len(entries) == 0 {
+		blocked, berr := allowEmptyingBlockedByPolicies(tx, listID, nil)
+		if berr != nil {
+			// 守卫查询失败 fail-closed——静默放行
+			// 「清空被 allow 引用的列表」正是要防的发射端 fail-open 形态。
+			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: serverErrMsg("校验 IP 列表引用失败", berr)})
+			return
 		}
-		if len(activeValues) == 0 {
-			blocked, berr := allowEmptyingBlockedByPolicies(tx, listID, activeValues)
-			if berr != nil {
-				// 守卫查询失败 fail-closed——静默放行
-				// 「清空被 allow 引用的列表」正是要防的发射端 fail-open 形态。
-				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: serverErrMsg("校验 IP 列表引用失败", berr)})
-				return
-			}
-			if blocked {
-				c.JSON(http.StatusConflict, models.APIResponse{Code: 409,
-					Message: "清空后会使引用它的白名单策略生效集合为空（空名单会拒绝所有请求）；请先为相关策略补充内联条目或其他引用名单，或解除引用"})
-				return
-			}
+		if blocked {
+			c.JSON(http.StatusConflict, models.APIResponse{Code: 409,
+				Message: "清空后会使引用它的白名单策略生效集合为空（空名单会拒绝所有请求）；请先为相关策略补充内联条目或其他引用名单，或解除引用"})
+			return
 		}
 	}
 	var dup int
@@ -967,10 +1005,18 @@ func (h *Handlers) UpdateIPList(c *gin.Context) {
 			services.AutobanForgetIPs(removed)
 		}
 	}
+	applyData := gin.H(nil)
+	if req.Entries != nil {
+		applyData = gin.H{"entry_count": len(entries)}
+		if prunedExpired > 0 {
+			applyData["pruned_expired"] = prunedExpired
+		}
+	}
 	if h.tryIPListHotPathApply(c, tx, listID, ipListEntriesChanged(oldEntriesJSON, entriesJSON), txApplyFinish{
 		Resource: "IP 地址列表", AuditAction: "更新",
 		AuditDetail: fmt.Sprintf("名称：%s（#%s，%d 条）", name, id, len(entries)),
 		SuccessMsg:  "IP 地址列表已更新",
+		Data:        applyData,
 	}) {
 		return
 	}
@@ -978,6 +1024,7 @@ func (h *Handlers) UpdateIPList(c *gin.Context) {
 		Resource: "IP 地址列表", AuditAction: "更新",
 		AuditDetail: fmt.Sprintf("名称：%s（#%s，%d 条）", name, id, len(entries)),
 		SuccessMsg:  "IP 地址列表已更新",
+		Data:        applyData,
 	})
 }
 
@@ -1210,7 +1257,7 @@ func (h *Handlers) AddIPToList(c *gin.Context) {
 		// 自动封禁关闭期间滞留的已到期条目不占名额（清理只在启用收尾/任务
 		// merge 时发生，按原始长度计会把生效远未达上限的手动封禁 400 挡下）。
 		if len(services.AutobanActiveEntries(entries)) >= ipListMaxEntries {
-			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("条目数量不能超过 %d 条", ipListMaxEntries)})
+			c.JSON(http.StatusBadRequest, models.APIResponse{Code: 400, Message: fmt.Sprintf("生效条目数量不能超过 %d 条", ipListMaxEntries)})
 			return
 		}
 		entries = append(entries, models.IPListEntry{Value: req.Value, Remark: newEntryRemark})
@@ -1225,10 +1272,12 @@ func (h *Handlers) AddIPToList(c *gin.Context) {
 		return
 	}
 
-	// 覆盖已到期条目的动作在审计/提示中显式区分（不是「新增」）。
+	// 覆盖已到期条目的动作在审计中显式区分（不是「新增」）——响应仍为
+	// added:true（该 IP 已进入生效集），审计标签与之一致地表述为「新增
+	// （覆盖已到期条目）」：同一动作不再出现「新增」与「覆盖」两种口径。
 	actionLabel := "新增"
 	if !added {
-		actionLabel = "覆盖已到期条目"
+		actionLabel = "新增（覆盖已到期条目）"
 	}
 	if h.tryIPListHotPathApply(c, tx, listID, true, txApplyFinish{
 		Resource: "IP 地址列表", AuditAction: "写入",
@@ -1456,7 +1505,7 @@ func (h *Handlers) tryIPListHotPathApply(c *gin.Context, tx *sql.Tx, listID int6
 				// 恢复失败=运行配置可能停留候选且 DB 已回滚——横幅必须落盘
 				// （看门狗只比对路由 @id，名单/证书变化不触发漂移->分叉不可见）。
 				// 本条 apply 已失败，不得补「重载」审计。
-				h.recordPostCommitRestoreFailure(postCommitSaveFailedBanner, err, recovery.runtime, recovery.db)
+				h.recordPostCommitRestoreFailure(commitSaveFailedSubject, err, recovery.runtime, recovery.db)
 				joined := errors.Join(err, recovery.err())
 				recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail(commitUncertainLabel, joined.Error(), services.AuditResultPart("failure")))
 				c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + "：" + joined.Error()})
@@ -1480,7 +1529,7 @@ func (h *Handlers) tryIPListHotPathApply(c *gin.Context, tx *sql.Tx, listID int6
 			recovery := h.recoverCommittedViewAfterCommitFailure(tx)
 			// 强制 /load 已真实成功——「触发重载必须留痕」不因 commit 失败豁免。
 			recordAudit(c, "重载", "Caddy服务", services.FormatAuditDetail("IP 名单热路径证书物化，强制重载收敛", services.AuditResultPart("success")))
-			h.recordPostCommitRestoreFailure(postCommitSaveFailedBanner, err, recovery.runtime, recovery.db)
+			h.recordPostCommitRestoreFailure(commitSaveFailedSubject, err, recovery.runtime, recovery.db)
 			joined := errors.Join(err, recovery.err())
 			recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail(commitUncertainLabel, joined.Error(), services.AuditResultPart("failure")))
 			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: commitUncertainLabel + "：" + joined.Error()})

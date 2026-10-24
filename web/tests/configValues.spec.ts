@@ -9,7 +9,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { DEFAULT_CERT_RENEWAL_DAYS, displaySecurityEventsRetentionDays, displaySecurityEventsRowCap, securityEventsWritePayload } from '../src/utils/configValues.ts'
-import { section, source, repoSource } from './_helpers.ts'
+import { code, section, repoCode } from './_helpers.ts'
 
 test('行数上限：1..999 等合法小值原样展示，不被夹到 1000/1,000,000', () => {
   for (const value of [1, 2, 500, 999, 1000, 5000, 100000000]) {
@@ -59,7 +59,7 @@ test('编辑态 0 原样携带（不夹紧）——写侧拒绝由后端负责�
     securityEventsWritePayload({ retentionDays: 90, retentionDirty: false, rowCap: 0, rowCapDirty: true }),
     { security_events_row_cap: 0 },
   )
-  const vue = source('src/views/settings/BasicSettings.vue')
+  const vue = code('src/views/settings/BasicSettings.vue')
   assert.match(vue, /v-model="seRetentionDays"[^>]*:min="1"/, '保留天数控件下限必须为 1（否则编辑态 0 会 400）')
   assert.match(vue, /v-model="seRowCap"[^>]*:min="1"/, '行数上限控件下限必须为 1')
 })
@@ -67,10 +67,10 @@ test('编辑态 0 原样携带（不夹紧）——写侧拒绝由后端负责�
 // Caddy 全局配置保存键集与后端审计归因映射必须同集——两侧此前仅靠人工
 // 核对（22 键），漂移会静默改变保存载荷覆盖面/审计归因段落。
 test('CADDY_CONFIG_KEYS ⇄ ConfigFieldSections「Caddy配置」键集一致', () => {
-  const vue = source('src/views/settings/CaddyGlobalSettings.vue')
+  const vue = code('src/views/settings/CaddyGlobalSettings.vue')
   const keysBlock = section(vue, 'const CADDY_CONFIG_KEYS = [', '] as const')
   const frontend = [...keysBlock.matchAll(/'([a-z0-9_]+)'/g)].map((m) => m[1])
-  const go = repoSource('internal/services/auditlog.go')
+  const go = repoCode('internal/services/auditlog.go')
   const mapBlock = section(go, 'var ConfigFieldSections = map[string]string{', '\n}\n')
   const backend = [...mapBlock.matchAll(/"([a-z0-9_]+)":\s*"Caddy配置"/g)].map((m) => m[1])
   assert.ok(frontend.length > 0 && backend.length > 0)
@@ -80,7 +80,7 @@ test('CADDY_CONFIG_KEYS ⇄ ConfigFieldSections「Caddy配置」键集一致', (
 test('展示默认值与后端 db.go 常量同源（跨栈钉）', () => {
   // 前端展示归一的 90 天 / 1,000,000 行必须等于后端内置默认——任一侧调整
   // 另一侧不同步时，UI 会把「自动」显示成错误默认值并被用户当真。
-  const go = repoSource('internal/db/db.go')
+  const go = repoCode('internal/db/db.go')
   assert.match(go, /\bDefaultSecurityEventsRetentionDays\s*=\s*90\b/, '保留天数默认漂移')
   // 常量块内新增更长标识符会触发 gofmt 对齐重排——固定空格数属脆性断言
   assert.match(go, /\bDefaultSecurityEventsRowCap\s*=\s*1000000\b/, '行数上限默认漂移')
@@ -92,10 +92,10 @@ test('展示默认值与后端 db.go 常量同源（跨栈钉）', () => {
 test('证书自动重签天数默认值与后端 db.go 同源（跨栈钉）', () => {
   // 前端兜底曾两处硬编码 30：后端默认调整后 CertJobs「自动重签时间」整列偏移，
   // 且无测试拦截。默认值单源在 configValues，auth store 只引用。
-  const go = repoSource('internal/db/db.go')
+  const go = repoCode('internal/db/db.go')
   assert.match(go, /\bDefaultCertRenewalDays\s*=\s*30\b/, '后端证书重签天数默认值漂移')
   assert.equal(DEFAULT_CERT_RENEWAL_DAYS, 30, '前端默认值必须等于默认常量')
-  const auth = source('src/stores/auth.ts')
+  const auth = code('src/stores/auth.ts')
   assert.match(auth, /certRenewalDays = ref\(DEFAULT_CERT_RENEWAL_DAYS\)/, 'store 初值必须取单源常量')
   assert.match(auth, /cert_renewal_days \?\? DEFAULT_CERT_RENEWAL_DAYS/, '/config 缺省必须取单源常量')
   assert.match(auth, /renewalDays > 0 \? renewalDays : DEFAULT_CERT_RENEWAL_DAYS/, '≤0 兜底必须取单源常量')
@@ -111,7 +111,7 @@ test('保留天数展示：0/缺省落 90，正值原样（不再 SFC 内联第�
   assert.equal(displaySecurityEventsRetentionDays(-1), 90)
   assert.equal(displaySecurityEventsRetentionDays(null), 90)
   assert.equal(displaySecurityEventsRetentionDays(undefined), 90)
-  const vue = source('src/views/settings/BasicSettings.vue')
+  const vue = code('src/views/settings/BasicSettings.vue')
   assert.match(
     vue,
     /get: \(\) => displaySecurityEventsRetentionDays\(settings\.value\.security_events_retention_days\)/,

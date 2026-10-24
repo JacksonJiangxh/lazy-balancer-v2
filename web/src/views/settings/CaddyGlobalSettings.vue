@@ -108,6 +108,11 @@
             <el-option v-for="l in customIpLists" :key="l.id" :label="`${l.name}（${l.entry_count} 条）`" :value="l.id" />
           </el-select>
           <div v-if="trustedTotalError" class="form-tip-line trusted-ranges-error">{{ trustedTotalError }}</div>
+          <div v-else-if="trustedTotalWarning" class="form-tip-line">{{ trustedTotalWarning }}</div>
+          <div v-if="refListEntriesRetryIds.length" class="info-note-bar">
+            <span class="info-note-desc">{{ refListEntriesRetryIds.length }} 个引用列表的条目未加载成功，「合计」条数按名单记录数估算（重叠网段未去重）；不影响保存，服务端以去重后结果为准</span>
+            <el-button size="small" type="primary" plain @click="retryRefListEntries">重新加载名单条目</el-button>
+          </div>
           <div class="form-tip-line">引用「规则集 → IP 地址列表」中的可复用列表，条目与上方内联网段合并生效（合计 {{ trustedRangesTotalCount }} 条，上限 {{ TRUSTED_PROXY_MAX_TOTAL_ENTRIES }}）</div>
         </el-form-item>
         <el-form-item label="请求头">
@@ -249,7 +254,7 @@ import { ansiToHtml } from '@/utils/ansi'
 import { request, mfaAwareSuccess } from '@/utils/api'
 import { CDN_PRESETS, DEFAULT_ACCESS_LOG_FORMAT } from '@/utils/caddyDefaults'
 import { buildCaddyConfigPayload } from '@/utils/caddyConfigPayload'
-import { TRUSTED_PROXY_MAX_TOTAL_ENTRIES, trustedProxyExpansion, trustedProxyHeadersError, trustedProxyRangesError, trustedProxyTotalError } from '@/utils/trustedProxyRanges'
+import { TRUSTED_PROXY_MAX_TOTAL_ENTRIES, trustedProxyExpansion, trustedProxyHeadersError, trustedProxyRangesError, trustedProxyTotalError, trustedProxyTotalWarning } from '@/utils/trustedProxyRanges'
 import type { TrustedProxyReferencedEntries } from '@/utils/trustedProxyRanges'
 import { IP_LIST_CATEGORIES, parseIPList, parseRefIds } from '@/utils/securityStages'
 import type { APIResponse, ProxyTimeoutConfig } from '@/types'
@@ -382,6 +387,10 @@ onMounted(() => { void fetchIpLists() })
 // 合法配置。条目按 id 惰性拉取一次（null=拉取失败/未返回，总量门退回条数估算）。
 interface TrustedIpListDetail { id: number; entries?: { value: string }[] }
 const refListEntries = ref<Record<number, string[] | null>>({})
+// 拉取失败的引用 id：失败不写缓存键（下次 watch 触发可重试），但必须让用户
+// 看到「合计 N 条」里有哪几个列表是按条数估算的，并提供一键重试——否则某份
+// 名单条目接口瞬时失败后，本页再无重拉入口，只能改选引用或刷新整页。
+const refListEntriesFailed = ref<Record<number, boolean>>({})
 // 拉取在途集合（占位 null 之外的独立标记：失败后可随下次选择重试）
 const refListEntriesLoading = new Set<number>()
 const fetchRefListEntries = async (id: number): Promise<void> => {
@@ -393,8 +402,14 @@ const fetchRefListEntries = async (id: number): Promise<void> => {
       ...refListEntries.value,
       [id]: (res.data?.entries ?? []).map((entry) => String(entry.value ?? '')).filter((value) => value.trim() !== ''),
     }
+    if (refListEntriesFailed.value[id]) {
+      const next = { ...refListEntriesFailed.value }
+      delete next[id]
+      refListEntriesFailed.value = next
+    }
   } catch {
-    // 失败保持未知：总量门按 entry_count 估算（与旧口径一致，不误拒确定未超限的配置）
+    // 失败保持未知：总量门降级为提示且不硬拦（估算无法去重），保存由后端兜底
+    refListEntriesFailed.value = { ...refListEntriesFailed.value, [id]: true }
   } finally {
     refListEntriesLoading.delete(id)
   }
@@ -402,6 +417,18 @@ const fetchRefListEntries = async (id: number): Promise<void> => {
 watch(trustedRangeRefs, (ids) => {
   for (const id of ids) void fetchRefListEntries(id)
 }, { immediate: true })
+
+/** 条目未加载成功的引用 id（用于提示与重试入口）。 */
+const refListEntriesRetryIds = computed(() => trustedRangeRefs.value.filter((id) => refListEntriesFailed.value[id]))
+const retryRefListEntries = async (): Promise<void> => {
+  const ids = refListEntriesRetryIds.value
+  for (const id of ids) {
+    const next = { ...refListEntriesFailed.value }
+    delete next[id]
+    refListEntriesFailed.value = next
+  }
+  await Promise.all(ids.map((id) => fetchRefListEntries(id)))
+}
 
 const referencedLists = computed<TrustedProxyReferencedEntries[]>(() => trustedRangeRefs.value.map((id) => ({
   values: refListEntries.value[id] ?? null,
@@ -418,6 +445,9 @@ const trustedRangesError = computed(() => trustedProxyRangesError(trustedRanges.
 // ≤2000（后端去重前缀并集口径）——未知条目按条数估算，只在已知超限时拦。
 const trustedHeadersError = computed(() => trustedProxyHeadersError(trustedHeaders.value))
 const trustedTotalError = computed(() => trustedProxyTotalError(trustedRanges.value, referencedLists.value))
+// 非阻断提示：估算合计越限但无法证明真实并集超限（含未加载条目时重叠无法去重）
+// ——不拦保存，由后端按去重后的网段集合兜底判定。
+const trustedTotalWarning = computed(() => trustedProxyTotalWarning(trustedRanges.value, referencedLists.value))
 
 // —— 存为列表：内联网段一键建名单并转为引用（镜像策略侧「提取为列表」） ——
 const saveListDialogVisible = ref(false)
@@ -519,6 +549,9 @@ const handleSave = async (): Promise<void> => {
     ElMessage.warning(trustedTotalError.value)
     return
   }
+  // 估算合计越限但无法证明真实并集超限（引用条目未加载，重叠未去重）：
+  // 提示后继续保存，判定以后端去重后的集合为准——前端不得以估算否掉合法配置。
+  if (trustedTotalWarning.value) ElMessage.warning(trustedTotalWarning.value)
   saving.value = true
   try {
     // 显式白名单：settings 是与 BasicSettings 共享的同一对象，全量展开会把

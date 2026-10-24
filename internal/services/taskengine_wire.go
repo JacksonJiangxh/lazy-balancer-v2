@@ -12,7 +12,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -56,30 +55,40 @@ func SetCertIssuanceLifecycleHooks(start, stop func()) {
 var certIssuanceStartDeferred atomic.Bool
 
 // startCertIssuanceLifecycle 证书签发常驻 Run 的生命周期启动（导入屏障门）。
+// 屏障活跃时只登记意图（导入结束由 EndConfigImportHold 兑现）；「判定活跃 →
+// 登记意图」之间的屏障退出由 takeDeferredCertIssuanceStartIfReleased 兜底：
+// 若 EndConfigImportHold 已在这两步之间读完意图并退出，本代立即取走意图自行
+// 启动——否则意图永不兑现，CA 队列/部署重试/签发 worker 整代不启动。
 func startCertIssuanceLifecycle() {
-	if configImportHoldActive() {
-		certIssuanceStartDeferred.Store(true)
+	if !configImportHoldActive() {
+		startCertIssuanceLifecycleIgnoringHold()
 		return
 	}
+	if configImportHoldDeferHook != nil {
+		configImportHoldDeferHook()
+	}
+	certIssuanceStartDeferred.Store(true)
+	// 屏障可能在本次判定与登记之间退出（EndConfigImportHold 已读完意图并
+	// 退出）：取走意图并自启动，否则该意图永无人兑现。
+	if takeDeferredCertIssuanceStartIfReleased() {
+		startCertIssuanceLifecycleIgnoringHold()
+	}
+}
+
+// startCertIssuanceLifecycleIgnoringHold 直接启动（跳过屏障判定）：屏障不在场
+// 的正常路径与 EndConfigImportHold 兑现延迟意图共用。
+func startCertIssuanceLifecycleIgnoringHold() {
 	if certIssuanceLifecycleStart != nil {
 		certIssuanceLifecycleStart()
 	}
 }
 
 // stopCertIssuanceLifecycle 生命周期停止：同时作废延迟启动意图（该代 Run
-// 已退出）。
+// 已退出，兑现一个已无主的启动会让 ACME 队列留在无人停止的运行态）。
 func stopCertIssuanceLifecycle() {
 	certIssuanceStartDeferred.Store(false)
 	if certIssuanceLifecycleStop != nil {
 		certIssuanceLifecycleStop()
-	}
-}
-
-// resumeDeferredCertIssuanceLifecycle 导入屏障解除后补启动被延迟的证书生命
-// 周期（仅当延迟意图仍有效——Run 已退出时 stop 已清位）。
-func resumeDeferredCertIssuanceLifecycle() {
-	if certIssuanceStartDeferred.CompareAndSwap(true, false) && certIssuanceLifecycleStart != nil {
-		certIssuanceLifecycleStart()
 	}
 }
 
@@ -193,10 +202,12 @@ func mustRegisterTask(te *taskengine.Engine, d taskengine.Descriptor) {
 // （coveredSlotStepPast/slotCoveredByRun/crsNextSlotAware/ip2regionNextSlotAware 已退役——
 // 排程槽生命周期 2026-10-11：失败落定落库推进，NextSlotFn 纯读库。）
 
-// interruptedUpdateStatusFamilies 持久化「更新中」活动态的四族（活动词表
-// 判定复用状态镜像同一 helper）。表名只接受包内常量。
-//   - 版本表族（id=1 单行）：活动态词表由族给出；
-//   - 源表族（多行，状态列逐行）perSourceRow=true：活动态恒为 running。
+// interruptedUpdateStatusFamilies 持久化「更新中」活动态的四族。表名只接受
+// 包内常量；taskID 必须是**注册任务 ID**（告警经 TaskLogfWarn 写入该任务的
+// 任务日志，未注册 ID 会产生无人查看的游离日志文件）。
+//   - 版本表族（id=1 单行）：活动态词表由 active 给出；
+//   - 源表族（多行，状态列逐行）perSourceRow=true：活动态恒为包级常量
+//     sourceUpdateStatusRunning（谓词单源，族表不另发词表，active 留 nil）。
 //
 // 源表此前完全无启动归一：主节点靠「槽未推进→首个 tick 重跑覆盖」自愈，但
 // 同一残留落到从节点时该任务不运行（RunsOn=RoleMasterOnly），行会永久滞留
@@ -204,6 +215,7 @@ func mustRegisterTask(te *taskengine.Engine, d taskengine.Descriptor) {
 var interruptedUpdateStatusFamilies = []struct {
 	table  string
 	taskID string
+	// active 版本表族的活动态词表；perSourceRow=true 时忽略（见上）。
 	active func(string) bool
 	// perSourceRow=true 表示状态列分散在多行源表（无 id=1 单行约定），
 	// 归一按行集执行；否则按版本表单行 id=1 归一。
@@ -211,16 +223,13 @@ var interruptedUpdateStatusFamilies = []struct {
 }{
 	{table: "security_crs_version", taskID: "crs", active: IsActiveCRSStatus},
 	{table: "security_ip2region_version", taskID: "ip2region", active: IsActiveIP2RegionStatus},
-	{table: "security_threat_sources", taskID: "threat-update", active: isSourceUpdateStatusRunning, perSourceRow: true},
-	{table: "security_crawler_sources", taskID: "crawlerbot-update", active: isSourceUpdateStatusRunning, perSourceRow: true},
+	{table: "security_threat_sources", taskID: "threat", perSourceRow: true},
+	{table: "security_crawler_sources", taskID: "crawlerbot-update", perSourceRow: true},
 }
 
 // sourceUpdateStatusRunning 源表族唯一活动态（v2.3.x 写侧只写 running）：
 // 状态词表与归一的 WHERE 谓词共用，禁止两处各写字面量。
 const sourceUpdateStatusRunning = "running"
-
-// isSourceUpdateStatusRunning 源表族活动态判定（族表的 active 字段）。
-func isSourceUpdateStatusRunning(status string) bool { return status == sourceUpdateStatusRunning }
 
 // normalizeInterruptedUpdateStatuses 把上次进程退出时残留的活动态归一为
 // failed：活动态只在本进程更新运行期间成立，进程重建后它既无真实执行也无
@@ -276,27 +285,17 @@ func normalizeInterruptedSourceStatusRows(table, taskID string) {
 // 排程槽（幂等、最小破坏：只清 next_update，不改 update_enabled/url/内容）。
 // 注册表外的行不会被 threatDueSources 处理，其槽没有任何推进写点；一旦过期，
 // 「启用源最早槽」就恒钉在该值上，威胁库自动更新静默停摆（槽域 ⊋ 运行域）。
-// 读侧已按注册表收窄（earliestThreatNextUpdate），本函数让数据面同步收敛；
-// 未来若该名重新进入注册表，行以「空槽=到期」语义自然恢复运行。
+// 读侧与写侧（首槽武装、时区重排）都已按注册表名收窄，本函数让数据面同步
+// 收敛且不再被同一次装配的武装反向补回；未来若该名重新进入注册表，行以
+// 「空槽=到期」语义自然恢复运行。
 func normalizeUnregisteredThreatSourceSlots() {
-	registry := db.ThreatSystemLists()
-	names := make([]string, 0, len(registry))
-	for _, source := range registry {
-		if source.Source != "" {
-			names = append(names, source.Source)
-		}
-	}
+	names := threatSourceRegistryNames()
 	if len(names) == 0 {
 		return
 	}
-	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(names)), ",")
-	args := make([]any, 0, len(names))
-	for _, name := range names {
-		args = append(args, name)
-	}
+	clause, args := sourceNameSetClause("name", names, true)
 	res, err := db.DB.Exec(`UPDATE security_threat_sources SET next_update=NULL
-		WHERE update_enabled=1 AND NULLIF(next_update,'') IS NOT NULL
-		  AND COALESCE(name,'') NOT IN (`+placeholders+`)`, args...)
+		WHERE update_enabled=1 AND NULLIF(next_update,'') IS NOT NULL`+clause, args...)
 	if err != nil {
 		Logf("warn", "威胁源表注册表外启用行槽清理失败（不影响调度读侧收窄）: %v", err)
 		return
@@ -904,14 +903,18 @@ func InitTaskEngine(watchdogAdminURL, runtimeLogFile string) *taskengine.Engine 
 	// StartLoop 副作用（启动记录/首轮执行）之前跳过；否则先启动再 StopLoop
 	// 会留下假启动记录并可能实际跑一轮。
 	taskLoopPrefs := loadTaskLoopPrefs()
-	// 装配期服务屏障：常驻族的 Run 体起步即真实接管服务（cert-issuance →
-	// StartACME → CA 队列/证书部署重试 → Caddy /load），而本循环先于
-	// startup:config-load（规则库载入 → 证书物化 → Caddy 渲染/应用）执行。
-	// schedPaused 只覆盖 tick 与执行登记（启动执行面唯一豁免是 BootSync），
-	// 常驻族启停由 loopEnabled 与角色门管理，故须单独用同一道配置屏障
-	// （configImportHoldActive 单源门）挡住部署面：屏障期内只登记启动意图，
-	// BootSync 完成后 EndConfigImportHold 兑现。不扩大 schedPaused 作用域
+	// 装配期服务屏障：部署面常驻任务（cert-issuance）的 Run 体起步即真实接管
+	// 服务（cert-issuance → StartACME → CA 队列/证书部署重试 → Caddy /load），
+	// 而本循环先于 startup:config-load（规则库载入 → 证书物化 → Caddy
+	// 渲染/应用）执行。schedPaused 只覆盖 tick 与执行登记（启动执行面唯一豁免
+	// 是 BootSync），常驻族启停由 loopEnabled 与角色门管理，故须单独用同一道
+	// 配置屏障（configImportHoldActive 单源门）挡住部署面：屏障期内只登记启动
+	// 意图，BootSync 完成后 EndConfigImportHold 兑现。不扩大 schedPaused 作用域
 	// ——混入装配暂停会让两种语义纠缠并影响 pendingRestart 通道。
+	// 屏障实际只拦部署面（startCertIssuanceLifecycle 与 caqueue 的
+	// configImportHoldActive 门）：security-events-ingestion（只读尾读）与
+	// cluster-sync 照常先启动（行为与引入屏障前一致；从节点快照应用由快照
+	// 应用自身收敛），不得据此宣称「全部常驻族被挡在配置载入之后」。
 	BeginConfigImportHold()
 	for _, id := range []string{
 		"config-watchdog", "log-cleanup", "audit-retention", "security-events-retention",
@@ -1185,6 +1188,9 @@ func armSecurityLibraryFirstSlots() {
 
 // ArmThreatFirstSlots 威胁源首槽武装：开启业务或逐源启用时，空 next_update
 // 的启用源写入威胁排程槽，避免 NextSlotFn 永不到期。
+// 只武装注册表内的源（与读侧槽域同源）：注册表外启用行的槽没有任何推进
+// 写点，武装它会让读侧「最早槽」被排除后仍留下无意义的惰性槽，并与启动期
+// 清理互相抵消（清空→武装补回→下次启动再清空）。
 func ArmThreatFirstSlots() {
 	if db.DB == nil {
 		// 同族 DB 入口的 nil 守卫：装配缺失时静默返回（无调度可武装），
@@ -1194,7 +1200,9 @@ func ArmThreatFirstSlots() {
 	if !ThreatAutoUpdateEnabled() {
 		return
 	}
-	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET next_update=? WHERE update_enabled=1 AND COALESCE(next_update,'')=''`, threatNextSlot(time.Now().UTC())); err != nil {
+	nameClause, args := sourceNameSetClause("name", threatSourceRegistryNames(), false)
+	args = append([]any{threatNextSlot(time.Now().UTC())}, args...)
+	if _, err := db.DB.Exec(`UPDATE security_threat_sources SET next_update=? WHERE update_enabled=1 AND COALESCE(next_update,'')=''`+nameClause, args...); err != nil {
 		Logf("warn", "首槽武装：security_threat_sources 写入 next_update 失败: %v", err)
 	}
 }

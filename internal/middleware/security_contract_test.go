@@ -363,6 +363,41 @@ func TestAuthenticationAuditLimiter_reclaimQueueStaysBounded(t *testing.T) {
 	}
 }
 
+// 环被冲刷后陈旧键必须仍可回收：环满覆盖队头时，若被覆盖条目是表内该键
+// 仅存的登记，该键从此进不了回收视野——表撑到硬上限后新审计永久丢弃（只有
+// 重启恢复）。覆盖即淘汰把这条丢失的回收点补回来。
+func TestAuthenticationAuditLimiter_overwrittenEntryKeepsKeyReclaimable(t *testing.T) {
+	limiter := &authenticationAuditLimiter{events: make(map[string]time.Time)}
+	now := time.Now()
+	// 一个键的唯一条目位于环头——后续登记全部来自另一个热键。
+	if !limiter.allow("victim", now) {
+		t.Fatal("victim 必须入表")
+	}
+	// 越过 1min 去重窗反复登记热键，把环填满并开始覆盖队头（表内键数恒 <2，
+	// 不触发阈值回收，覆盖是本用例唯一的淘汰路径）。
+	for i := range authenticationAuditQueueCapacity {
+		now = now.Add(61 * time.Second)
+		if !limiter.allow("hot", now) {
+			t.Fatalf("hot 第 %d 次刷新必须放行", i)
+		}
+	}
+
+	// Then 唯一登记被覆盖的键必须已被淘汰（否则它永不回收）。
+	limiter.mu.Lock()
+	_, live := limiter.events["victim"]
+	size := len(limiter.events)
+	limiter.mu.Unlock()
+	if live {
+		t.Fatalf("victim 的唯一条目被环覆盖后仍留在表内（size=%d）——该键从此不可回收", size)
+	}
+	if size > 2 {
+		t.Fatalf("环覆盖期间表内键数=%d，want ≤2（覆盖即淘汰）", size)
+	}
+	if !limiter.allow("fresh", now) {
+		t.Fatal("环覆盖后新键必须仍可入表")
+	}
+}
+
 // 认证态每请求回读 DB——禁用立即 401、角色取自 DB 而非
 // token claim（旧令牌提升权限必须失效）。
 func TestJWTAuth_disabledUserRejectedImmediately(t *testing.T) {

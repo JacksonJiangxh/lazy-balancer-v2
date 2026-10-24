@@ -6,7 +6,8 @@
 #     Dockerfile/docker-entrypoint.sh/.dockerignore/Caddyfile、JSON/HTML/conf 的
 #     字符串与文本节点）、扩展名大小写、
 #     含 NUL 字节的文本文件（报错而非整文件跳过）、下划线/小写/
-#     连写形态、审计产物文件名、.gitignore 双向校验（含重复模式行）、轮次引用的
+#     连写形态、审计产物文件名（含 audit_96/audit-round-96/round-96 等分隔符
+#     型轮次命名）、.gitignore 双向校验（含重复模式行）、轮次引用的
 #     各书写形态（裸轮次＋审计动作、斜杠并列、中文数字归属、注释头截断残骸、
 #     跨行拆字含续行注释前缀）；
 #   • 误报面：npm 生成物（package-lock.json 内容面豁免）、百分位、版本串、
@@ -159,6 +160,23 @@ mkdir -p "$tmp_root/reports/audit85"
 echo "x" >"$tmp_root/reports/audit85/notes.md"
 git -C "$tmp_root" add -f reports/audit85/notes.md
 assert_bad "auditNN directory" "reports/audit85/notes.md"
+
+# 5b) 分隔符型轮次命名（audit_96 / audit-round-96 / round-96）——路径规则必须
+#     是「分隔符可选」而非「紧跟数字」：只认紧邻形态时这类目录/文件名能正常
+#     git add 入库，而守卫仍宣告通过（审计产物逃逸公网仓）。
+for round_dir in audit_96 audit-round-96 round-96; do
+  reset_fixture
+  mkdir -p "$tmp_root/reports/$round_dir"
+  echo "x" >"$tmp_root/reports/$round_dir/notes.md"
+  git -C "$tmp_root" add -f "reports/$round_dir/notes.md"
+  assert_bad "separator round dir ($round_dir)" "reports/$round_dir/notes.md"
+done
+
+reset_fixture
+mkdir_in docs/round-96-notes.md
+echo "x" >"$tmp_root/docs/round-96-notes.md"
+git -C "$tmp_root" add -f docs/round-96-notes.md
+assert_bad "separator round filename" "docs/round-96-notes.md"
 
 # 6) 连写形态（无短横线）
 reset_fixture

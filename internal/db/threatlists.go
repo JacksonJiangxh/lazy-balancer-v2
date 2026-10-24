@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"log"
 	"slices"
+	"sort"
+	"strings"
 )
 
 // ThreatSourceSeed 是内置威胁源下载端的唯一事实源；数据库种子、备份导入
@@ -74,6 +76,50 @@ var threatSystemListLegacyNames = map[string]string{
 	"Emerging Threats 失陷主机名单": "威胁情报库-ET Compromised",
 }
 
+// threatListTakeoverSkipMarkerColumn 是「已告警的规范名占用冲突」指纹列
+// （global_config，newColumns 登记）。值为「;」分隔的冲突指纹集合，
+// 空串=无冲突或冲突已解除。
+const threatListTakeoverSkipMarkerColumn = "threat_list_takeover_skip_fp"
+
+// readThreatListTakeoverSkipMarker 读已告警指纹集合：列/行缺失或读失败一律
+// 返回空集（按「未告警」处理——最多多留一条审计，不影响正确性）。
+func readThreatListTakeoverSkipMarker() map[string]struct{} {
+	stored := ""
+	if err := DB.QueryRow(`SELECT COALESCE(` + threatListTakeoverSkipMarkerColumn + `,'') FROM global_config WHERE id=1`).Scan(&stored); err != nil {
+		return map[string]struct{}{}
+	}
+	seen := make(map[string]struct{})
+	for _, fingerprint := range strings.Split(stored, ";") {
+		if fingerprint != "" {
+			seen[fingerprint] = struct{}{}
+		}
+	}
+	return seen
+}
+
+// writeThreatListTakeoverSkipMarker 覆盖写指纹集合（空集写空串即清除）；
+// 失败只告警不阻断启动（下次启动重报）。
+func writeThreatListTakeoverSkipMarker(fingerprints map[string]struct{}) {
+	sorted := make([]string, 0, len(fingerprints))
+	for fingerprint := range fingerprints {
+		sorted = append(sorted, fingerprint)
+	}
+	sort.Strings(sorted)
+	if _, err := DB.Exec(`UPDATE global_config SET `+threatListTakeoverSkipMarkerColumn+`=? WHERE id=1`, strings.Join(sorted, ";")); err != nil {
+		log.Printf("启动迁移：威胁名单占名冲突告警指纹写入失败（下次启动将重报）: %v", err)
+	}
+}
+
+// threatListTakeoverSkipFingerprint 标识一处「规范名被另一 system=1 行占用」
+// 僵持态：规范名 + 旧名 + 双方行 id。任何一方变化（人工归并后新建冲突）都
+// 视为新冲突并重报。
+func threatListTakeoverSkipFingerprint(canonical, legacy string) string {
+	var canonicalID, legacyID int64
+	_ = DB.QueryRow(`SELECT id FROM security_ip_lists WHERE name=? AND system=1 ORDER BY id LIMIT 1`, canonical).Scan(&canonicalID)
+	_ = DB.QueryRow(`SELECT id FROM security_ip_lists WHERE name=? AND system=1 ORDER BY id LIMIT 1`, legacy).Scan(&legacyID)
+	return fmt.Sprintf("%s|%s|%d|%d", canonical, legacy, canonicalID, legacyID)
+}
+
 // migrateThreatSystemListNames 存量 system=1 内置名单按旧名改名为新名（保 id——
 // 策略 refs 按 id 引用）。幂等；种子 INSERT 按新名查重，旧名行不改名会双重存在。
 // 识别同名冲突；历史起新名被占用（如用户手工建的
@@ -82,6 +128,10 @@ var threatSystemListLegacyNames = map[string]string{
 // 名单不会因跳过改名而永久失更。
 func migrateThreatSystemListNames() error {
 	renamedUserLists := 0
+	// 已知僵持态集合（本次启动观察到的）与已告警集合（上次落库的）：
+	// 集合相等即不再写审计，只在变化时留痕并覆盖 marker。
+	reportedSkips := readThreatListTakeoverSkipMarker()
+	observedSkips := make(map[string]struct{})
 	for _, sl := range ThreatSystemLists() {
 		legacy, ok := threatSystemListLegacyNames[sl.Name]
 		if !ok {
@@ -110,7 +160,14 @@ func migrateThreatSystemListNames() error {
 			}
 			if systemHeld > 0 {
 				log.Printf("WARN: 内置威胁名单规范名 %q 已被另一 system=1 行占用，旧名 %q 行跳过接管（双方保留，请人工归并）", sl.Name, legacy)
-				recordSystemAudit("启动迁移", "IP 名单", fmt.Sprintf("启动迁移：内置威胁名单规范名 %q 已被另一 system=1 行占用，旧名 %q 行跳过接管（双方保留，名单可能失更，请人工归并）", sl.Name, legacy))
+				// 同一僵持态只留一条审计：该状态按设计「双方保留 + 人工归并」，
+				// 每重启重放会让审计噪声随重启次数线性增长；指纹变化（人工归并
+				// 后出现新冲突）自动重报。
+				fingerprint := threatListTakeoverSkipFingerprint(sl.Name, legacy)
+				observedSkips[fingerprint] = struct{}{}
+				if _, alreadyReported := reportedSkips[fingerprint]; !alreadyReported {
+					recordSystemAudit("启动迁移", "IP 名单", fmt.Sprintf("启动迁移：内置威胁名单规范名 %q 已被另一 system=1 行占用，旧名 %q 行跳过接管（双方保留，名单可能失更，请人工归并）", sl.Name, legacy))
+				}
 				continue
 			}
 			// 新名被用户名单占用时不能跳过：旧 system 名单会永久失更。
@@ -156,7 +213,24 @@ func migrateThreatSystemListNames() error {
 	if renamedUserLists > 0 {
 		log.Printf("启动迁移：威胁名单规范化共改名用户名单 %d 条", renamedUserLists)
 	}
+	if !sameThreatListTakeoverFingerprints(reportedSkips, observedSkips) {
+		writeThreatListTakeoverSkipMarker(observedSkips)
+	}
 	return nil
+}
+
+// sameThreatListTakeoverFingerprints 比较两次观察到的僵持态集合（长度为 0 的
+// 空集相等——收敛库与「冲突已解除」都不触发 marker 写）。
+func sameThreatListTakeoverFingerprints(a, b map[string]struct{}) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for fingerprint := range a {
+		if _, ok := b[fingerprint]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // ThreatListNameBySource 源名 → 名单名（未登记返回空串）。

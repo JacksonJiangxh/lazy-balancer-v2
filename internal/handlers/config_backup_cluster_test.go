@@ -176,8 +176,8 @@ func TestImportNodes_usesBackupTokenForNewIdentity(t *testing.T) {
 	}
 }
 
-// ──：nodes 导入行级门的
-// access_url / name+ip_address 形态，以及「存活身份键与落库 port 默认同源」。 ──
+// nodes 导入行级门：access_url / name+ip_address 形态，以及「存活身份键与
+// 落库 port 默认同源」。
 
 func a3SeedLiveAdmin(t *testing.T) {
 	t.Helper()
@@ -315,11 +315,13 @@ func TestNodeSurvivingIdentitiesUseStoreDefaultPort(t *testing.T) {
 		{"name": "缺 port", "ip_address": "10.0.0.2"},
 		{"name": "port null", "ip_address": "10.0.0.3", "port": nil},
 		{"name": "port 8000", "ip_address": "10.0.0.4", "port": 8000},
-		{"name": "port 字符串", "ip_address": "10.0.0.5", "port": "8000"},
+		{"name": "port 字符串", "ip_address": "10.0.0.5", "port": "9000"},
 		{"name": "port 非默认", "ip_address": "10.0.0.6", "port": 9000},
 	}
 	surviving := nodeSurvivingIdentities(rows)
-	for _, want := range []string{"10.0.0.2:8000", "10.0.0.3:8000", "10.0.0.4:8000", "10.0.0.5:8000", "10.0.0.6:9000"} {
+	// 字符串端口必须是**非默认**值："8000" 与「缺 port 回落 8000」产出同一
+	// 身份键，删掉字符串解析也照样通过。
+	for _, want := range []string{"10.0.0.2:8000", "10.0.0.3:8000", "10.0.0.4:8000", "10.0.0.5:9000", "10.0.0.6:9000"} {
 		if !surviving[want] {
 			t.Fatalf("surviving 缺 %s（身份键须与 restoreTable 的 port 默认 8000 同源）: %v", want, surviving)
 		}

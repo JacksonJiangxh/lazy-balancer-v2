@@ -277,3 +277,126 @@ func TestStoredOutOfRangeTryWindowRejectedOnEnableAndAggregate(t *testing.T) {
 		}
 	})
 }
+
+// http 侧下界自愈：直改 DB / 旧版本残留的 tcp_try_duration < -1 或
+// tcp_try_interval < 0 同样会让任意无关编辑命中值域门 400 死端（界面无该
+// 字段可自救）。自愈只对存量生效——显式提交的越界值仍交值域门；-1 是 NTLM
+// 接管态合法哨兵，不得归零；interval 非法时 duration 不残留正值
+// （td>0+ti=0 是渲染必填门的自相矛盾形态）。
+func TestUpdateRule_httpEditHealsBelowMinTryWindowResidue(t *testing.T) {
+	cases := []struct {
+		name     string
+		caddyID  string
+		port     int
+		duration int
+		interval int
+		wantDur  int
+		wantInt  int
+	}{
+		{"duration below sentinel", "lb_httptrylow_dur", 18615, -2, 250, 0, 250},
+		{"negative interval with positive window", "lb_httptrylow_int", 18616, 1000, -5, 0, 0},
+		{"ntlm sentinel preserved", "lb_httptrylow_keep", 18617, -1, 250, -1, 250},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := newRuleFeatureTestHandlers(t)
+			gin.SetMode(gin.TestMode)
+			router := gin.New()
+			router.PUT("/rules/:caddy_id", handler.UpdateRule)
+			if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,description,protocol,domain,listen_port,strategy,enabled,tcp_try_duration,tcp_try_interval)
+				VALUES (?,?,'','http',?,?,'weighted_round_robin',1,?,?)`,
+				tc.caddyID, tc.caddyID, strings.ReplaceAll(tc.caddyID, "_", "-")+".test", tc.port, tc.duration, tc.interval); err != nil {
+				t.Fatalf("seed rule: %v", err)
+			}
+			if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES (?,'up.test',80,1,1,'http')`, tc.caddyID); err != nil {
+				t.Fatalf("seed upstream: %v", err)
+			}
+
+			request := httptest.NewRequest(http.MethodPut, "/rules/"+tc.caddyID, strings.NewReader(`{"name":"`+tc.caddyID+`-renamed"}`))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+
+			if response.Code != http.StatusOK {
+				t.Fatalf("http edit: status=%d body=%s（存量下界越界必须自愈而非 400 死端）", response.Code, response.Body.String())
+			}
+			var duration, interval int
+			if err := db.DB.QueryRow(`SELECT COALESCE(tcp_try_duration,0), COALESCE(tcp_try_interval,0) FROM lb_rules WHERE caddy_id=?`, tc.caddyID).
+				Scan(&duration, &interval); err != nil {
+				t.Fatal(err)
+			}
+			if duration != tc.wantDur || interval != tc.wantInt {
+				t.Fatalf("td/ti=%d/%d, want %d/%d", duration, interval, tc.wantDur, tc.wantInt)
+			}
+		})
+	}
+
+	// 显式提交的越界值不得被自愈吞掉——仍是值域门 400（不改请求契约）。
+	t.Run("explicit out-of-range still rejected", func(t *testing.T) {
+		handler := newRuleFeatureTestHandlers(t)
+		gin.SetMode(gin.TestMode)
+		router := gin.New()
+		router.PUT("/rules/:caddy_id", handler.UpdateRule)
+		if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,description,protocol,domain,listen_port,strategy,enabled)
+			VALUES ('lb_httptrylow_explicit','explicit','','http','explicit.test',18618,'weighted_round_robin',1)`); err != nil {
+			t.Fatalf("seed rule: %v", err)
+		}
+		if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES ('lb_httptrylow_explicit','up.test',80,1,1,'http')`); err != nil {
+			t.Fatalf("seed upstream: %v", err)
+		}
+		request := httptest.NewRequest(http.MethodPut, "/rules/lb_httptrylow_explicit", strings.NewReader(`{"tcp_try_duration":-2}`))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("status=%d body=%s, want 400（显式越界值必须拒绝）", response.Code, response.Body.String())
+		}
+	})
+}
+
+// DuplicateRule 的 http 源行同样不得把下界越界窗口放大到副本（同族自愈）。
+func TestDuplicateRule_healsBelowMinTryWindowResidue(t *testing.T) {
+	cases := []struct {
+		name     string
+		caddyID  string
+		port     int
+		duration int
+		interval int
+		wantDur  int
+		wantInt  int
+	}{
+		{"duration below sentinel", "lb_httpduplow_dur", 18619, -2, 250, 0, 250},
+		{"negative interval with positive window", "lb_httpduplow_int", 18620, 1000, -5, 0, 0},
+		{"ntlm sentinel preserved", "lb_httpduplow_keep", 18621, -1, 250, -1, 250},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := newRuleFeatureTestHandlers(t)
+			gin.SetMode(gin.TestMode)
+			router := gin.New()
+			router.POST("/rules/:caddy_id/duplicate", handler.DuplicateRule)
+			if _, err := db.DB.Exec(`INSERT INTO lb_rules (caddy_id,name,description,protocol,domain,listen_port,strategy,enabled,tcp_try_duration,tcp_try_interval)
+				VALUES (?,?,'','http',?,?,'weighted_round_robin',1,?,?)`,
+				tc.caddyID, tc.caddyID, strings.ReplaceAll(tc.caddyID, "_", "-")+".test", tc.port, tc.duration, tc.interval); err != nil {
+				t.Fatalf("seed rule: %v", err)
+			}
+			if _, err := db.DB.Exec(`INSERT INTO upstreams (rule_id,host,port,weight,enabled,protocol) VALUES (?,'up.test',80,1,1,'http')`, tc.caddyID); err != nil {
+				t.Fatalf("seed upstream: %v", err)
+			}
+
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/rules/"+tc.caddyID+"/duplicate", nil))
+			if response.Code != http.StatusCreated {
+				t.Fatalf("status=%d body=%s, want 201（源行下界越界不得让复制 400 死端）", response.Code, response.Body.String())
+			}
+			var duration, interval int
+			if err := db.DB.QueryRow(`SELECT tcp_try_duration, tcp_try_interval FROM lb_rules WHERE name=?`, tc.caddyID+"（副本）").
+				Scan(&duration, &interval); err != nil {
+				t.Fatalf("read copy: %v", err)
+			}
+			if duration != tc.wantDur || interval != tc.wantInt {
+				t.Fatalf("副本 td/ti=%d/%d, want %d/%d", duration, interval, tc.wantDur, tc.wantInt)
+			}
+		})
+	}
+}

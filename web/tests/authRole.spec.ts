@@ -48,6 +48,23 @@ test('隐藏页不得自续 /config 重试定时器（恢复可见由 visibility
   assert.match(authSrc, /visibilitychange'[\s\S]*?clearConfigRetryTimer\(\)[\s\S]*?fetchConfig\(true\)/, '恢复可见必须立即补查')
 })
 
+test('隐藏页不得自续 /users/me 重试定时器（与 /config 同范式：停表 + 恢复可见补查）', () => {
+  const body = member(authSrc, 'const scheduleUserRetry = ')
+  const hiddenIdx = body.indexOf('document.hidden')
+  assert.ok(hiddenIdx > 0, '必须显式判定隐藏态')
+  const hiddenBranch = body.slice(hiddenIdx)
+  // 隐藏分支只记待补查标记后结束本轮：顺延（再次 scheduleUserRetry）等于
+  // 后台标签页每 15s 唤醒一次。
+  assert.match(hiddenBranch, /document\.hidden\)\s*\{\s*userRetryDeferred = true\s+return/, '隐藏态必须停表并记待补查标记')
+  const afterReturn = hiddenBranch.slice(hiddenBranch.indexOf('return'))
+  assert.doesNotMatch(afterReturn, /scheduleUserRetry\(\)/, '隐藏态之后不得再自排一轮')
+  assert.match(body, /bindVisibilityRefresh\(\)/, '排表时须确保可见性监听已绑定（config 从未排过表时也能补查）')
+  // 补查路径必须真的调用 fetchUser，否则停表等于永久停摆。
+  assert.match(authSrc, /visibilitychange'[\s\S]*?if \(userRetryDeferred\)\s*\{\s*userRetryDeferred = false\s+void fetchUser\(\)/, '恢复可见必须补拉用户信息')
+  // 登出/会话失效清表时同时复位标记，避免旧标记在下一个会话抢跑。
+  assert.match(authSrc, /const clearUserRetryTimer = \(\): void => \{\s*userRetryDeferred = false/, '清表须复位待补查标记')
+})
+
 test('mfa_write_guard 随 /config 投影单源：Users 页不再单独整取 GET /config', () => {
   // 结构边界：花括号配对取函数体（不再用远处的 interface 声明作终点——那样
   // fetchConfig 之后新增的函数会落进切片，让断言被相邻函数满足）。

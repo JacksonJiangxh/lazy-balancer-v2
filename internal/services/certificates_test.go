@@ -416,10 +416,12 @@ func TestRequeueNonTerminalCertJobs_schedules_downloaded_deployment(t *testing.T
 	service.pauseDeploymentRetries()
 }
 
-func TestRequeueNonTerminalCertJobs_skips_downloaded_job_missing_cert_material_when_paused(t *testing.T) {
-	// 自此恢复排队走 EnqueueIfActive：暂停的队列管理器在 transition 之前
-	// 即拒绝（与 PauseAndDrain 门控同语义），任务保持原状态等待下次恢复，
-	// 不写库、不入队、不报错。
+func TestRequeueNonTerminalCertJobs_pausedQueueLeavesDownloadedJobUntouched(t *testing.T) {
+	// 恢复排队走 EnqueueIfActive：暂停的队列管理器在 transition 之前即拒绝
+	//（与 PauseAndDrain 门控同语义），任务保持原状态等待下次恢复——不写库、
+	// 不入队、不报错。本用例断言的是**暂停门**（材料分支在暂停期同样不执行，
+	// 二者在此形态下不可区分）；材料缺失行的回收通道见
+	// TestRescanDroppedDeploymentRetries_requeuesLostMaterialJob。
 	// Given
 	jobID, _ := seedCertificateJob(t, "cleanup_dns")
 	ResetCAQueueManagerForTest()

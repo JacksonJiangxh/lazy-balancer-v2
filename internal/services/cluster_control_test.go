@@ -241,6 +241,61 @@ func TestDoWithSameHostTLSUpgradeRedirect_hostnameComparisonIgnoresCase(t *testi
 	}
 }
 
+// 跨主机的 https 升级重定向一律不跟随：请求携带 X-Cluster-Token / 票据，
+// Location 指向别的主机名时重放等于把凭据交给第三方。主机名比较被放宽成
+// 恒真（或误删）即失守，因此这里直接钉 helper 本身（notifyMasterDetach 只是
+// 间接调用方）。含「原主机名为前缀的伪造域名」形态，防后缀/前缀比较。
+func TestDoWithSameHostTLSUpgradeRedirect_doesNotFollowCrossHostHTTPSRedirect(t *testing.T) {
+	for _, location := range []string{
+		"https://evil.example/ticket",
+		"https://master.example.evil.example/ticket",
+	} {
+		t.Run(location, func(t *testing.T) {
+			var hits atomic.Int32
+			client := &http.Client{
+				CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+				Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					hits.Add(1)
+					if hits.Load() > 1 {
+						return &http.Response{
+							StatusCode: http.StatusOK,
+							Status:     "200 OK",
+							Header:     http.Header{},
+							Body:       http.NoBody,
+							Request:    req,
+						}, nil
+					}
+					return &http.Response{
+						StatusCode: http.StatusMovedPermanently,
+						Status:     "301 Moved Permanently",
+						Header:     http.Header{"Location": []string{location}},
+						Body:       http.NoBody,
+						Request:    req,
+					}, nil
+				}),
+			}
+			req, err := http.NewRequest(http.MethodPost, "http://master.example:8080/ticket", strings.NewReader("payload"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("X-Cluster-Token", "cluster-secret")
+
+			resp, err := DoWithSameHostTLSUpgradeRedirect(client, req)
+			if err != nil {
+				t.Fatalf("cross-host redirect returned error: %v", err)
+			}
+			defer resp.Body.Close()
+			// Then 原 301 原样返回（调用方据此走「重定向指引」），且没有第二次请求。
+			if resp.StatusCode != http.StatusMovedPermanently {
+				t.Fatalf("status=%d, want original 301（不得跟随跨主机重定向）", resp.StatusCode)
+			}
+			if got := hits.Load(); got != 1 {
+				t.Fatalf("transport saw %d requests, want 1（凭据不得离开原主机）", got)
+			}
+		})
+	}
+}
+
 // 无 GetBody 的带体请求在同主机 https 升级重定向下返回合成 301
 // 空体，且目标端不再收到请求。
 func TestDoWithSameHostTLSUpgradeRedirect_unreplayableBodySynthetic301(t *testing.T) {

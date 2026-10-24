@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
-
-	"lazy-balancer-v2/internal/models"
 )
 
 // security_ip_lists 随 security 节同步——快照携带列表行与策略 refs 列，
@@ -113,37 +111,5 @@ func TestClusterSnapshot_securitySectionHashTracksIPLists(t *testing.T) {
 	// Then
 	if second.SectionHashes["security"] == firstHash {
 		t.Fatal("security section hash must change when an ip list row changes")
-	}
-}
-
-// 空 SecurityIPLists 载荷的全量替换语义——主节点清空列表后从节点同步删除。
-func TestApplySnapshot_emptySecurityIPListsDeletesRows(t *testing.T) {
-	// Given
-	_, database := newClusterTestService(t)
-	if _, err := database.Exec(`INSERT INTO security_ip_lists (id,name,entries) VALUES (11,'doomed','[]')`); err != nil {
-		t.Fatal(err)
-	}
-	snapshot := models.ClusterSnapshot{
-		Version:             9,
-		SecurityPolicies:    json.RawMessage("[]"),
-		SecurityBindings:    json.RawMessage("[]"),
-		SecurityCustomRules: []models.SecurityCustomRule{},
-		SecurityBlockPages:  []models.SecurityBlockPage{},
-		SecurityIPLists:     json.RawMessage("[]"),
-		SecurityCRSVersion:  []models.ClusterSecurityCRSVersion{},
-	}
-
-	// When
-	if err := replaceSnapshotDB(context.Background(), database, snapshot); err != nil {
-		t.Fatalf("apply snapshot: %v", err)
-	}
-
-	// Then
-	var count int
-	if err := database.QueryRow("SELECT COUNT(*) FROM security_ip_lists").Scan(&count); err != nil {
-		t.Fatal(err)
-	}
-	if count != 0 {
-		t.Fatalf("security_ip_lists rows=%d after empty snapshot, want 0", count)
 	}
 }

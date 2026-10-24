@@ -350,13 +350,13 @@ func readAdminTLSFiles(c *gin.Context) (string, string, error) {
 }
 
 func (h *Handlers) GetAdminTLS(c *gin.Context) {
-	// 读失败必须显式披露：降级 loader 返回 selfsigned/未启用形态，静默展示会
-	// 让运维在 DB 故障/迁移窗口看到与真实启用态相反的视图（写路径用严格
-	// loader，不会回写降级值，故无二次破坏）。内部可用性敏感调用方
-	// （启动/集群比较）继续用降级 loader。
+	// 读失败必须显式披露：此时返回的 enabled/mode 只是占位形态，静默展示会让
+	// 运维在 DB 故障/迁移窗口看到与真实启用态相反的视图，故以
+	// config_unavailable=true 单独标注（写路径读失败会中止，不会回写占位值，
+	// 无二次破坏）。
 	cfg, cfgErr := services.LoadAdminTLSConfigE()
 	if cfgErr != nil {
-		services.Logf("warn", "管理面板 HTTPS 配置读取失败，按未启用/自签名降级展示: %v", cfgErr)
+		services.Logf("warn", "管理面板 HTTPS 配置读取失败，按未启用/自签名占位展示（config_unavailable=true）: %v", cfgErr)
 	}
 	resp := gin.H{
 		"enabled":            cfg.Enabled,

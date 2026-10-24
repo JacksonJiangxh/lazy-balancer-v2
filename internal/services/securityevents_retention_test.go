@@ -207,7 +207,8 @@ func TestSecurityEventsRetentionCleanup_stopsPromptlyWhenContextCanceled(t *test
 	deleted := -1
 	go func() {
 		defer close(done)
-		deleted, _ = SecurityEventsRetentionCleanupCtxErr(ctx)
+		res, _ := SecurityEventsRetentionCleanupDetail(ctx)
+		deleted = res.Events
 	}()
 
 	// Then: 清理迅速返回且仅完成一个批次（未删净），证明中途被取消而非跑完
@@ -254,7 +255,8 @@ func TestSecurityEventsRetentionCleanup_batchesAgeDelete(t *testing.T) {
 	}
 
 	// When
-	deleted, _ := SecurityEventsRetentionCleanupCtxErr(context.Background())
+	res, _ := SecurityEventsRetentionCleanupDetail(context.Background())
+	deleted := res.Events
 
 	// Then：全部过期事件被分批删除，近期事件保留
 	if got := countSecurityEventsByType(t, "expired"); got != 0 {
@@ -353,7 +355,8 @@ func TestSecurityEventsRetentionCleanup_trimsOldestWhenRowCapExceeded(t *testing
 	}
 
 	// When
-	deleted, _ := SecurityEventsRetentionCleanupCtxErr(context.Background())
+	res, _ := SecurityEventsRetentionCleanupDetail(context.Background())
+	deleted := res.Events
 
 	// Then 行数收敛到 cap，且删的是最旧两行（不是随机/最新）
 	var count int
@@ -454,11 +457,6 @@ func TestSecurityEventsRetentionCleanupDetail_reportsAggregateDeletions(t *testi
 	}
 	if res.Aggregates() != res.Rollup+res.TargetRollup+res.Highwater {
 		t.Fatalf("Aggregates()=%d, want sum of the three buckets", res.Aggregates())
-	}
-	// 兼容入口仍按事件数返回
-	events, err := SecurityEventsRetentionCleanupCtxErr(context.Background())
-	if err != nil || events != 0 {
-		t.Fatalf("compat wrapper events=%d err=%v, want 0/nil", events, err)
 	}
 }
 

@@ -65,3 +65,37 @@ func TestCollectEngineFamilies_masterOnlyNextRunAtGatedByRole(t *testing.T) {
 		t.Fatalf("角色不适用任务不得推算下次执行（实际永不投递）, got %q", slave.NextRunAt)
 	}
 }
+
+// Given 从节点 + 已武装的定时族（Scheduled）槽。定时族的「下次执行」来自
+// NextSlotFn 纯读本地库（从节点的槽值由主端快照带入），与本机角色无关。
+// When 聚合任务视图。
+// Then 定时族同样受角色门约束——不得对永不投递的任务给出具体时刻（API 直读
+// 消费者会据此排程；UI 的另行遮蔽不构成契约）；主节点同形态照常给出。
+func TestCollectEngineFamilies_scheduledNextRunAtGatedByRole(t *testing.T) {
+	te := newWireTestEngine(t)
+	const id = "threat"
+	if _, err := db.DB.Exec(`UPDATE global_config SET threat_auto_update=1 WHERE id=1`); err != nil {
+		t.Fatalf("enable threat auto update: %v", err)
+	}
+	res, err := db.DB.Exec(`UPDATE security_threat_sources SET update_enabled=1, next_update='2999-01-02 00:00:00' WHERE name='ustc'`)
+	if err != nil {
+		t.Fatalf("seed threat slot: %v", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		t.Fatalf("威胁源注册行未命中（affected=%d），夹具失效", n)
+	}
+
+	te.SetRole(true)
+	master := findTaskInfo(t, collectEngineFamilies(te), id)
+	if !master.RoleApplicable || master.NextRunAt == "" {
+		t.Fatalf("主节点上定时任务应给出下次执行, RoleApplicable=%v NextRunAt=%q", master.RoleApplicable, master.NextRunAt)
+	}
+	te.SetRole(false)
+	slave := findTaskInfo(t, collectEngineFamilies(te), id)
+	if slave.RoleApplicable {
+		t.Fatal("前置条件：从节点上 master-only 定时任务应不适用")
+	}
+	if slave.NextRunAt != "" {
+		t.Fatalf("角色不适用定时任务不得给出下次执行（实际永不投递）, got %q", slave.NextRunAt)
+	}
+}

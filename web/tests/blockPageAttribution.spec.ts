@@ -13,7 +13,7 @@ import {
   resolveBlockPageAttribution,
   type BlockPageChainPolicy,
 } from '../src/utils/securityStages.ts'
-import { source } from './_helpers.ts'
+import { source, repoCode, section } from './_helpers.ts'
 
 const peer = (over: Partial<BlockPageChainPolicy> = {}): BlockPageChainPolicy => ({
   policyId: 1,
@@ -133,6 +133,35 @@ test('拦截页列表未落地时不得判定缺失（不出假警告）', () =>
   assert.equal(blockPageMissing(8, [{ id: 8, content: '' }], true), true)
   // 未配置自定义页（id<=0）不是缺失
   assert.equal(blockPageMissing(0, pages, true), false)
+})
+
+// 跨栈对表：上面十几条行为用例预测的是「后端会渲染哪个页」——后端改阶段码或
+// 归因分支时，纯函数用例不会红。此处钉住后端函数/常量/分支仍在，Go 侧改动即红
+// 并强制人工复核前端预测。
+test('跨栈对表：后端阶段码与归因分支仍与前端预测同口径', () => {
+  const go = repoCode('internal/services/caddy.go')
+  // 合成码域：阶段 1=481、阶段 3=482、逐策略 483+
+  assert.match(go, /blockPageStage1Code\s*=\s*481/)
+  assert.match(go, /blockPageStage3Code\s*=\s*482/)
+  assert.match(go, /blockPageSyntheticBase\s*=\s*483/)
+  // 阶段 1：仅规则级覆盖页内容非空时抬 481
+  const stage1 = section(go, 'func stage1BlockStatus(', '\nfunc ')
+  assert.match(stage1, /rule\.BlockPageStage1ID > 0/)
+  assert.match(stage1, /securityCtx\.blockPageByID\[rule\.BlockPageStage1ID\]/)
+  assert.match(stage1, /return blockPageStage1Code/)
+  // 阶段 3：规则级覆盖压过逐策略合成码（前端「覆盖 > self」的前提）
+  const stage3 = section(go, 'func blockStatusForPolicy(', '\nfunc ')
+  assert.match(stage3, /rule\.BlockPageStage3ID > 0/)
+  assert.match(stage3, /return blockPageStage3Code/)
+  assert.match(stage3, /return securityCtx\.policySynthetic\[policy\.ID\]/)
+  // 兜底路由：取首个「内容非空」页（空内容页不得遮蔽后续），状态码 0 归一 403
+  const fallback = section(go, 'func buildBlockPageErrorRoute(', '\nfunc ')
+  assert.match(fallback, /if c := securityCtx\.blockPageByID\[policy\.BlockPageID\]; c != "" \{/)
+  assert.match(fallback, /statusCode = 403/)
+  // 阶段 2：至少一条启用策略开启限流才产生该路由；页取首个有页策略
+  const rate = section(go, 'func buildRateLimitErrorRoute(', '\nfunc ')
+  assert.match(rate, /if policy\.RateLimitEnabled \{/)
+  assert.match(rate, /if !rateLimited \|\| pagePolicy == nil \{/)
 })
 
 // ---- 接线钉：视图是否真的消费上面的单源实现（纯函数测试全绿但视图回退不会红）----

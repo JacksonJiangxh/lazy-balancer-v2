@@ -61,9 +61,12 @@ func (w *gzipResponseWriter) prepare() {
 	}
 	// 错误与无体响应不压缩：既不发 Content-Encoding，也不动 Vary/ETag
 	// （上游实现在这两类分支里删整个 Vary，正是本实现要消除的回归）。
+	// 206 Partial Content 同列：压缩分支会删除 Content-Length，而 Content-Range
+	// 仍声明「整包的第 N–M 字节」——响应同时声称「这是分片」与「整包是 gzip」，
+	// 按 Range 拼接分片的客户端会得到不可解内容。
 	if status := w.ResponseWriter.Status(); status >= http.StatusBadRequest ||
 		status == http.StatusNoContent || status == http.StatusNotModified ||
-		status < http.StatusOK {
+		status == http.StatusPartialContent || status < http.StatusOK {
 		return
 	}
 	if w.Header().Get("Content-Encoding") != "" {
@@ -111,14 +114,21 @@ func gzipMiddleware() gin.HandlerFunc {
 		}
 		writer := &gzipResponseWriter{ResponseWriter: c.Writer}
 		c.Writer = writer
+		panicking := true
 		defer func() {
 			// 无体的成功响应（204/304 或不写体的 handler）也要把头落盘，
 			// 与 gin 默认行为一致；此时未设 Content-Encoding，Vary 不受影响。
 			if writer.compressor != nil {
 				_ = writer.compressor.Close()
 			}
-			c.Writer.WriteHeaderNow()
+			// panic 在途时不得 WriteHeaderNow：此刻尚未写头，先落盘等于把
+			// 默认 200 提交给客户端，上层 gin.Recovery 的 500 再也写不进去
+			// （只能得到「200 + 空体」）。恢复成功后由 Recovery 写 500。
+			if !panicking {
+				c.Writer.WriteHeaderNow()
+			}
 		}()
 		c.Next()
+		panicking = false
 	}
 }

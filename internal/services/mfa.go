@@ -503,14 +503,26 @@ func MFAResetForUser(userID int) error {
 	return err
 }
 
-// MFAUserEnabled 读用户 MFA 启用态（guard 每请求一次，代价可忽略）。
-func MFAUserEnabled(userID int) (bool, error) {
+// MFAUserEnabledWith 读用户 MFA 启用态（带库句柄版本，与 RoleOf 同族）：
+// 守卫链上的读取必须与同请求的其他读取同源——生产两处句柄同一指针，但
+// 嵌入/测试装配注入独立句柄时，读包级 db.DB 会让「角色按 A 库、MFA 按 B 库」
+// 拼出自相矛盾的判定。
+func MFAUserEnabledWith(database *sql.DB, userID int) (bool, error) {
+	if database == nil {
+		return false, errors.New("读取 MFA 启用态: 数据库未初始化")
+	}
 	var v int
-	err := db.DB.QueryRow("SELECT COALESCE(mfa_enabled,0) FROM users WHERE id=?", userID).Scan(&v)
+	err := database.QueryRow("SELECT COALESCE(mfa_enabled,0) FROM users WHERE id=?", userID).Scan(&v)
 	if err != nil {
 		return false, err
 	}
 	return v == 1, nil
+}
+
+// MFAUserEnabled 读用户 MFA 启用态（guard 每请求一次，代价可忽略）。
+// 进程库句柄的便捷包装；仅供 handler 直调，守卫链必须用 With 变体。
+func MFAUserEnabled(userID int) (bool, error) {
+	return MFAUserEnabledWith(db.DB, userID)
 }
 
 // MFAStatus 用户 MFA 状态摘要。
@@ -536,17 +548,26 @@ func MFAGetStatus(userID int) (MFAStatus, error) {
 	return MFAStatus{Enabled: enabled, RecoveryCodesRemaining: len(hashes)}, nil
 }
 
+// MFAWriteGuardEnabledWith 读全局写操作验证开关（带库句柄版本，与
+// MFAUserEnabledWith 同族——守卫链上两处读取必须与角色读取同源）。
+func MFAWriteGuardEnabledWith(database *sql.DB) (bool, error) {
+	if database == nil {
+		return false, errors.New("读取 MFA 写操作验证开关: 数据库未初始化")
+	}
+	var v int
+	if err := database.QueryRow("SELECT COALESCE(mfa_write_guard,0) FROM global_config WHERE id=1").Scan(&v); err != nil {
+		return false, err
+	}
+	return v == 1, nil
+}
+
 // MFAWriteGuardEnabled 读全局写操作验证开关。
 // 读取失败必须显式报错——旧实现返回 false 把「读不到」
 // 降级为「开关关闭」且无任何留痕，与 MFALockoutEnabled 的裁定（读失败
 // 显式报错、调用方决定口径）分裂。调用方各自决定 /路由级
 // step-up 守卫按裁定维持 fail-open（第二因子便利层，jwtAuth 已在前序
 // fail-closed 把关）但必须留痕；API Key 创建路径与相邻的 MFA 状态读取同口径
-// fail-closed。
+// fail-closed。进程库句柄的便捷包装；守卫链必须用 With 变体。
 func MFAWriteGuardEnabled() (bool, error) {
-	var v int
-	if err := db.DB.QueryRow("SELECT COALESCE(mfa_write_guard,0) FROM global_config WHERE id=1").Scan(&v); err != nil {
-		return false, err
-	}
-	return v == 1, nil
+	return MFAWriteGuardEnabledWith(db.DB)
 }

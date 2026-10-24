@@ -92,20 +92,25 @@ var snapshotBrandingDegradeWarned atomic.Bool
 // （dataDir/branding.json）。cfg 缺失或 dataDir 未配置=显式降级：留痕一次并跳过。
 // 失败操作审计经 SyncService 的失败节流写入（同一错误内容不按
 // 重试轮重复）——本 path 在标记驱动重试下会每轮重达，未节流即审计洪泛。
-func (s *SyncService) applySnapshotBrandingChecked(cfg *config.Config, content string) error {
+// written 报告本轮是否实际写出文件：品牌文件不在节哈希口径内（branding.json
+// 是派生文件，payload 里的 branding_json 属 users 节），304 补偿重拉轮三节
+// 哈希可能全一致，调用方必须用该标志把「文件收敛」并入 Caddy 重载判据——
+// 否则默认站点内嵌的落地文案滞留旧值直到下一次真实节变更。
+func (s *SyncService) applySnapshotBrandingChecked(cfg *config.Config, content string) (written bool, err error) {
 	if cfg == nil || cfg.DataDir == "" {
 		if snapshotBrandingDegradeWarned.CompareAndSwap(false, true) {
 			Logf("warn", "集群品牌配置同步已降级：数据目录未配置，branding.json 不落盘（下次重启请检查品牌配置）")
 			RecordAuditLog("system", "警告", "集群同步", "品牌配置同步跳过：数据目录未配置", "")
 		}
-		return nil
+		return false, nil
 	}
-	if err := applySnapshotBranding(cfg.DataDir, content); err != nil {
+	changed, err := applySnapshotBranding(cfg.DataDir, content)
+	if err != nil {
 		detail := fmt.Sprintf("品牌配置落盘失败: %v", err)
 		if s.syncFailureAuditDue("同步失败", "集群同步", detail) {
 			RecordAuditLog("system", "同步失败", "集群同步", detail, "")
 		}
-		return err
+		return false, err
 	}
 	expected := content
 	if expected == "" {
@@ -113,17 +118,28 @@ func (s *SyncService) applySnapshotBrandingChecked(cfg *config.Config, content s
 	}
 	actual, err := os.ReadFile(filepath.Join(cfg.DataDir, "branding.json"))
 	if err != nil {
-		return fmt.Errorf("回读品牌配置: %w", err)
+		return false, fmt.Errorf("回读品牌配置: %w", err)
 	}
 	if string(actual) != expected {
-		return errors.New("品牌配置文件内容与快照不一致")
+		return false, errors.New("品牌配置文件内容与快照不一致")
 	}
-	return nil
+	return changed, nil
 }
 
 // rebuildCrawlerSnapshotForSync 集群 apply / 升主后的爬虫运行快照重建缝
 // （测试可注入计数；生产=CrawlerUpdateManager 同一 DB→文件单源实现）。
 var rebuildCrawlerSnapshotForSync = RebuildCrawlerIPListSnapshot
+
+// syncWafFileLockHook / syncReloadLockHook 是 applySnapshot 对应临界区入口的
+// 测试观察点（生产恒 nil，调用点已持锁）。锁序护栏用例在钩子内停住，用
+// TryLock 断言「锁确实被持有时才进入临界区」，取代按固定时间窗猜测进度——
+// 预持锁 + 时间窗的旧形态既可能在申请锁之前超时（假绿），也可能因前置阶段
+// 同样争用该锁（wafFilesDrifted→BuildWafFileRef）而在错误位置阻塞，把「被
+// 阻塞」误判为「已入临界区」。
+var (
+	syncWafFileLockHook func()
+	syncReloadLockHook  func()
+)
 
 func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.ClusterSnapshot) error {
 	// 与 s.caddy == nil 同型的 fail-visible 守卫：NewSyncService 恒注入
@@ -300,8 +316,15 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	// 落盘失败不得只审计——写 apply_ok_branding_failed 标记
 	// （apply_ok_reload_failed 同族），304 分支据此全量重拉并在下一轮强制
 	// 重试；users 节被哈希跳过时标记同样强制重试。
+	// written 是本轮文件真实收敛的信号：品牌文件内容不在节哈希口径内，
+	// 补偿重拉轮三节哈希可能全一致，漏并入重载判据会让默认站点落地文案
+	// 滞留旧值（标记已被事务清空，无后续自愈）。
+	brandingWritten := false
 	if snapshot.BasicSettings.BrandingJSON != nil && (!skip.skip("users") || brandingRetry || reloadCompensation) {
-		if brandingErr := s.applySnapshotBrandingChecked(s.cfg, *snapshot.BasicSettings.BrandingJSON); brandingErr != nil {
+		var brandingErr error
+		brandingWritten, brandingErr = s.applySnapshotBrandingChecked(s.cfg, *snapshot.BasicSettings.BrandingJSON)
+		if brandingErr != nil {
+			brandingWritten = false
 			Logf("error", "同步品牌配置未落盘（数据库已应用，文件未收敛，下轮重试）: %v", brandingErr)
 			s.persistSyncError(ctx, syncBrandingFailureMarkerPrefix+": 品牌配置落盘失败（数据库已应用，文件未收敛，下轮同步重试）", models.SyncErrorCodeApplyFailed)
 		}
@@ -346,6 +369,9 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 		var aerr error
 		if ferr == nil {
 			WafFileLock().Lock()
+			if syncWafFileLockHook != nil {
+				syncWafFileLockHook()
+			}
 			crsChanged, xdbChanged, threatChanged, aerr = ApplyWafFileBundle(bundle)
 			if aerr == nil {
 				// 收口（SecurityEngine 域移交）：主端删除威胁源后，从端
@@ -411,7 +437,9 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	// 锁内仅 ApplyConfigForce 的 s.mu（叶操作），Pull 路径锁不反向嵌套。
 	// 渲染数据未变跳过 /load——判定口径=节级信号
 	// 三节（users/rules/security，渲染的全部 DB 输入）哈希跳过 + WAF 数据文件
-	// 无变化 + 证书轴无变化（证书内容变化 JSON 字节不变，必须强制）+ 无重载
+	// 无变化 + 证书轴无变化（证书内容变化 JSON 字节不变，必须强制）+ 品牌文件
+	// 本轮实际写出（派生文件不在节哈希口径内；补偿重拉轮三节全跳过时文件已
+	// 收敛，默认站点落地文案必须随重载生效）+ 无重载
 	// 失败补偿标记（标记在=上轮重载失败，本轮是 304 补偿重拉的语义终点，必须
 	// 强制；标记由事务内「记录同步状态」清空，故在事务前捕获）。版本行
 	// next_update/update_status 族、登录锁等纯簿记列不在节 payload 内，不触发；
@@ -420,10 +448,13 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 	// last_good 兼容：渲染未变则既有 last_good 仍是当前运行配置的准确
 	// 快照，无需重写。
 	renderInputsChanged := !(skip.skip("users") && skip.skip("rules") && skip.skip("security"))
-	mustReload := renderInputsChanged || crsChanged || xdbChanged || threatChanged || certsChanged || reloadCompensation
+	mustReload := renderInputsChanged || crsChanged || xdbChanged || threatChanged || certsChanged || brandingWritten || reloadCompensation
 	var reloadErr error
 	if mustReload {
 		CaddyOpLock.Lock()
+		if syncReloadLockHook != nil {
+			syncReloadLockHook()
+		}
 		if s.caddy == nil {
 			// nil CaddyService 是合法构造（测试/独立运维路径）。
 			// 按「不可判定」走既有重载失败标记语义（marker→304 补偿重拉），
@@ -474,10 +505,10 @@ func (s *SyncService) applySnapshot(ctx context.Context, snapshot models.Cluster
 		Logf("info", "集群同步：渲染输入无变化，跳过 Caddy 重载")
 	}
 	clusterSnapshotCaches.Delete(s.db)
-	// 重启判定必须用严格读取变体——宽容版
-	// LoadAdminTLSConfig 读失败回退 {selfsigned, disabled}，运行态为 upload 证书
-	// 时一次瞬时读失败会被误判「配置变化」触发进程重启（重启抖动），反向则可能
-	// 漏判真实变化。读失败仅 warn 并跳过本轮判定：不重启、不改状态。
+	// 重启判定遇读失败只跳过：把降级默认值 {selfsigned, disabled} 当真值比对，
+	// 运行态为 upload 证书时一次瞬时读失败会被误判「配置变化」触发进程重启
+	// （重启抖动），反向则可能漏判真实变化。读失败仅 warn 并跳过本轮判定：
+	// 不重启、不改状态。
 	if adminTLS, tlsErr := LoadAdminTLSConfigE(); tlsErr != nil {
 		Logf("warn", "集群同步后读取 Admin TLS 配置失败，跳过重启判定（不触发重启）: %v", tlsErr)
 	} else if RuntimeAdminTLSChanged(adminTLS) {
@@ -1382,12 +1413,12 @@ const clusterRuleLibVersionInsertSQL = `INSERT INTO %s (id,version,updated_at,au
 const snapshotActiveUpdateStatusMessage = "来自主节点快照的进行中状态，本节点不执行该任务"
 
 // snapshotActiveUpdateStatus 判定快照载荷里的状态是否属于「进行中」活动态。
-// 覆盖三族词表：CRS/IP2Region（checking/downloading/installing/reloading）
-// 与威胁源/爬虫源（running）。活动态只属于执行该任务的进程；从节点收到
-// 后若不归一，主端以「已是最新/失败」收尾时只写运行态列、不 bump 版本，
-// 从端行会长期滞留活动态且无任何收敛通道。
+// 判据单源 IsActiveUpdateStatus（覆盖 CRS/IP2Region 四活动词与源表 running），
+// 快照通道与配置导入通道必须共用同一类判据。活动态只属于执行该任务的进程；
+// 从节点收到后若不归一，主端以「已是最新/失败」收尾时只写运行态列、不 bump
+// 版本，从端行会长期滞留活动态且无任何收敛通道。
 func snapshotActiveUpdateStatus(status string) bool {
-	return IsActiveCRSStatus(status) || IsActiveIP2RegionStatus(status) || status == "running"
+	return IsActiveUpdateStatus(status)
 }
 
 // normalizeSnapshotTaskState 归一从主端快照搬运的活动态任务行：

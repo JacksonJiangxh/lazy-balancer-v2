@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/netip"
 	"regexp"
@@ -25,6 +26,22 @@ import (
 //   - headers：条数 ≤8；字符集 ^[A-Za-z0-9-]{1,64}$；去重保序；
 //     空数组 = 仅 X-Forwarded-For（渲染层省略 client_ip_headers）。
 var trustedProxyHeaderPattern = regexp.MustCompile(`^[A-Za-z0-9-]{1,64}$`)
+
+// errTrustedProxyRead 标记受信代理校验中的数据库读取失败：这不是载荷问题，
+// 调用方必须映射为 500 + 固定文案并留痕——回 400 会让管理员误以为网段填错而
+// 反复修改，且把 SQL/驱动错误文本透给客户端。格式/宽度/存在性校验仍走 400。
+var errTrustedProxyRead = errors.New("读取受信代理配置失败")
+
+// trustedProxyReadError 携带底层原因供日志使用；Error() 只返回固定文案，
+// 避免经 400/响应体把底层错误文本外泄。
+type trustedProxyReadError struct {
+	cause error
+}
+
+func (e *trustedProxyReadError) Error() string { return errTrustedProxyRead.Error() }
+func (e *trustedProxyReadError) Unwrap() error { return e.cause }
+
+func trustedProxyReadFailure(cause error) error { return &trustedProxyReadError{cause: cause} }
 
 // trustedProxyMaxTotalCIDRs 受信网段总量上限（内联 ∪ 引用展开，去重前
 // 按条目计）：Caddy static ranges 是逐条装载的集合，无聚合链路——上限
@@ -156,7 +173,7 @@ func trustedProxyInlinePrefixes(req *models.UpdateConfigRequest) (map[string]str
 	}
 	var raw string
 	if err := db.DB.QueryRow(`SELECT COALESCE(trusted_proxy_ranges,'[]') FROM global_config WHERE id=1`).Scan(&raw); err != nil {
-		return nil, fmt.Errorf("读取当前受信代理网段失败: %v", err)
+		return nil, trustedProxyReadFailure(fmt.Errorf("读取当前受信代理网段失败: %w", err))
 	}
 	var entries []string
 	if err := json.Unmarshal([]byte(raw), &entries); err != nil {
@@ -167,8 +184,9 @@ func trustedProxyInlinePrefixes(req *models.UpdateConfigRequest) (map[string]str
 	return trustedProxyPrefixKeys(entries), nil
 }
 
-// idChunk 是一个 id 分片及其预构造的 IN 子句占位符与参数（受信代理两处 500
-// 分片样板单源——仅共享分片构造，不合并查询/校验语义）。
+// idChunk 是一个 id 分片及其预构造的 IN 子句占位符与参数。chunkIDs 是全部
+// 500 分片样板的单源（受信代理校验、备份导入、IP 名单、威胁筛查四处消费），
+// 仅共享分片构造，不合并各处的查询/校验语义。
 type idChunk struct {
 	placeholders string
 	args         []any
@@ -217,7 +235,7 @@ func resolveTrustedProxyRefLists(ids []int64, source trustedProxyBackupSource) (
 	for _, ch := range chunkIDs(missing, 500) {
 		rows, err := db.DB.Query(`SELECT id, COALESCE(entries,'[]'), COALESCE(name,''), COALESCE(system,0) FROM security_ip_lists WHERE id IN (`+ch.placeholders+`)`, ch.args...)
 		if err != nil {
-			return nil, fmt.Errorf("校验受信代理引用列表失败: %v", err)
+			return nil, trustedProxyReadFailure(fmt.Errorf("校验受信代理引用列表失败: %w", err))
 		}
 		for rows.Next() {
 			var id int64
@@ -225,13 +243,13 @@ func resolveTrustedProxyRefLists(ids []int64, source trustedProxyBackupSource) (
 			var system int
 			if err := rows.Scan(&id, &entriesJSON, &name, &system); err != nil {
 				rows.Close()
-				return nil, fmt.Errorf("校验受信代理引用列表失败: %v", err)
+				return nil, trustedProxyReadFailure(fmt.Errorf("校验受信代理引用列表失败: %w", err))
 			}
 			resolved[id] = trustedProxyListSource{name: name, entries: entriesJSON, builtin: system == 1}
 		}
 		if err := rows.Err(); err != nil {
 			rows.Close()
-			return nil, fmt.Errorf("校验受信代理引用列表失败: %v", err)
+			return nil, trustedProxyReadFailure(fmt.Errorf("校验受信代理引用列表失败: %w", err))
 		}
 		rows.Close()
 	}
@@ -251,7 +269,7 @@ func resolveTrustedProxyRefLists(ids []int64, source trustedProxyBackupSource) (
 func trustedProxyStoredRefPrefixesWithSource(source trustedProxyBackupSource) (map[string]struct{}, error) {
 	var raw string
 	if err := db.DB.QueryRow(`SELECT COALESCE(trusted_proxy_range_refs,'[]') FROM global_config WHERE id=1`).Scan(&raw); err != nil {
-		return nil, fmt.Errorf("读取当前受信代理引用列表失败: %v", err)
+		return nil, trustedProxyReadFailure(fmt.Errorf("读取当前受信代理引用列表失败: %w", err))
 	}
 	var ids []int64
 	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &ids); err != nil || len(ids) == 0 {

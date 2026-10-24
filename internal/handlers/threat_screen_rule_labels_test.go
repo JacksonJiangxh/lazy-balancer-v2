@@ -103,3 +103,24 @@ func TestLabeledThreatRuleCounts_prefetchesCustomNames(t *testing.T) {
 		t.Fatalf("批量标签解析发起点查 %d 次, want 0", got)
 	}
 }
+
+// 合成自定义规则 id（1000000+，v2.1.0 前无 id 内嵌规则）没有 DB 行可查，
+// 但语义仍属自定义规则族——大屏「命中规则」榜必须给出可读类别标签，且与
+// 事件列表 trigger_type 的「WAF·自定义」同族，不得回退成裸数字。
+func TestDescribeThreatRuleName_syntheticCustomRuleIsLabeled(t *testing.T) {
+	if got := describeThreatRuleNameWithNames("1000001", nil); got != "自定义规则（#1000001）" {
+		t.Fatalf("合成自定义 id 标签=%q, want 自定义规则（#1000001）", got)
+	}
+	// 与事件列表分类同族（避免榜面与列表口径分叉）
+	if got := triggerTypeForRule("1000001"); got != "WAF·自定义" {
+		t.Fatalf("trigger_type=%q, want WAF·自定义", got)
+	}
+	// 批量预取路径同样覆盖合成段（customNames 非 nil 时不点查主库）
+	labeled := labeledThreatRuleCounts(map[string]int{"1000002": 2})
+	if labeled["自定义规则（#1000002）"] != 2 {
+		t.Fatalf("合成 id 未进入可读标签维度: %+v", labeled)
+	}
+	if got := threatRuleNamePointQueriesForTest.Load(); got != 0 {
+		t.Fatalf("合成段解析发起点查 %d 次, want 0", got)
+	}
+}

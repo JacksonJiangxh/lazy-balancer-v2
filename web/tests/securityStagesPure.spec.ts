@@ -13,7 +13,9 @@ import assert from 'node:assert/strict'
 import {
   attachStageDetails,
   compareVersion,
+  createIpMatcher,
   ensureSharedEntries,
+  entryMatchesIp,
   formatDurationUs,
   hasGeoIPControl,
   hasTrustEntries,
@@ -245,4 +247,43 @@ test('阶段标题/策略类型标签/名单类别：文案与键集即契约', 
 
   // 名单类别是写入值（落库 category）与筛选口径：值与顺序都钉住。
   assert.deepEqual([...IP_LIST_CATEGORIES], ['搜索引擎爬虫', 'CDN 节点', '云服务商', '办公网络', '数据中心', '可信地址', '恶意 IP', '其他'])
+})
+
+// 事件详情弹框的多结论扫描走 createIpMatcher（IP 只解析一次），逐条路径走
+// entryMatchesIp。两者语义必须等价——否则弹框的命中结论与名单判定表分叉，
+// 而排障场景下用户只看到结论面。差分用例：同一 (ip, entries) 集合逐个比对，
+// 并附命中/未命中样本，防止「两边同时恒 false」的伪等价。
+test('createIpMatcher 与 entryMatchesIp 差分等价（v4/v6、CIDR 边界、族隔离、非法条目）', () => {
+  const cases: Array<{ ip: string; entries: readonly string[] }> = [
+    {
+      ip: '10.0.0.5',
+      entries: ['10.0.0.5', '10.0.0.6', '10.0.0.0/24', '10.0.1.0/24', '0.0.0.0/0', '10.0.0.5/32',
+        '10.0.0.6/32', '::/0', '::1', 'banana', '10.0.0.0/33', '10.0.0.0/-1', ''],
+    },
+    {
+      ip: '2001:db8::1',
+      entries: ['2001:db8::1', '2001:db8::2', '2001:db8::/32', '2001:db9::/32', '::/0', '::1/128',
+        '2001:db8::1/128', '0.0.0.0/0', '10.0.0.5', '::/129', 'zz::1/64'],
+    },
+    { ip: '255.255.255.255', entries: ['255.255.255.0/24', '0.0.0.0/1', '128.0.0.0/1'] },
+    { ip: 'not-an-ip', entries: ['not-an-ip', 'not-an-ip/8', '10.0.0.0/8'] },
+  ]
+  for (const { ip, entries } of cases) {
+    const matcher = createIpMatcher(ip)
+    for (const entry of entries) {
+      assert.equal(matcher(entry), entryMatchesIp(entry, ip), `差分不一致：ip=${ip} entry=${entry}`)
+    }
+  }
+  // 真命中样本（差分两侧同变时靠这组守）
+  const v4 = createIpMatcher('10.0.0.5')
+  assert.equal(v4('10.0.0.0/24'), true)
+  assert.equal(v4('10.0.1.0/24'), false)
+  assert.equal(v4('10.0.0.5'), true)
+  const v6 = createIpMatcher('2001:db8::1')
+  assert.equal(v6('2001:db8::/32'), true)
+  assert.equal(v6('2001:db9::/32'), false)
+  // /0 只在本族生效：IPv6 /0 不得命中 IPv4 地址，反之亦然
+  assert.equal(v6('::/0'), true)
+  assert.equal(v6('0.0.0.0/0'), false)
+  assert.equal(v4('::/0'), false)
 })

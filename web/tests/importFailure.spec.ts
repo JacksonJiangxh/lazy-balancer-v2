@@ -9,7 +9,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { importFailureLines, importFailureReport } from '../src/utils/importFailure.ts'
-import { code, section, source } from './_helpers.ts'
+import { code, section } from './_helpers.ts'
 
 // 后端失败响应体（models.APIResponse）：真实形态由 config_backup.go 的
 // respondAfterWafFailure 产出，挂在 ApiRequestError.data 上。
@@ -38,7 +38,10 @@ test('失败响应的 warnings 全部进入展示行（两种文件面判决形�
   assert.equal(lines[0], report.message)
   assert.ok(lines.includes(indeterminate), '提交不确定的人工核对指引不得被丢弃')
   assert.ok(lines.includes(rollbackFailed), '文件面分裂结论不得被丢弃')
-  assert.ok(lines.includes('冲突置为禁用：1 条'))
+  const conflictLine = lines.find((line) => line.includes('冲突规则'))
+  assert.ok(conflictLine, '冲突条数必须出现（但只能是预告口径）')
+  assert.match(conflictLine, /若导入成功将禁用/, '失败分支的冲突条数是预演清单，不得写成既成事实')
+  assert.doesNotMatch(conflictLine, /^冲突置为禁用/, '不得沿用成功路径的既成事实句')
 })
 
 test('无响应体（网络失败/旧形态错误）回退兜底文案且不造警告行', () => {
@@ -57,7 +60,7 @@ test('接线：拦截器透传响应体，导入/还原失败路径复用同一�
   assert.match(api, /constructor\(message: string, readonly status\?: number, readonly data\?: unknown\)/, 'ApiRequestError 必须携带响应体')
   assert.match(api, /new ApiRequestError\(message, status, error\.response\?\.data\)/, '错误分支必须透传 error.response.data')
 
-  const page = source('src/views/settings/BasicSettings.vue')
+  const page = code('src/views/settings/BasicSettings.vue')
   const helper = section(page, 'const showImportFailure', 'const triggerImport')
   assert.match(helper, /importFailureReport\(error, fallbackMessage\)/)
   assert.match(helper, /importFailureLines\(report\)/)
@@ -67,6 +70,6 @@ test('接线：拦截器透传响应体，导入/还原失败路径复用同一�
   assert.match(restore, /showImportFailure\(error, '配置还原失败', '还原失败'\)/, '还原失败必须展示 warnings')
   assert.doesNotMatch(restore, /配置未受影响/, '不得把「配置未受影响」当成确定事实（文件面可能已分裂）')
 
-  const importFn = section(page, 'const confirmImport', '// 本卡读写的配置键')
+  const importFn = section(page, 'const confirmImport', 'interface BasicSettingsConfig')
   assert.match(importFn, /showImportFailure\(error, '配置导入失败', '导入失败'\)/, '导入失败必须展示 warnings')
 })

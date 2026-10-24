@@ -158,3 +158,28 @@ func TestDeleteSecurityBlockPage_rejectsBuiltinPage(t *testing.T) {
 		t.Fatalf("内置页被删除: rows=%d err=%v", pages, err)
 	}
 }
+
+// 内置页双表一致性：blockPageSpecs（渲染规格）与 builtinBlockPageIdentities
+// （播种身份）必须双向对齐——只加 spec 不加 identity 会静默不播种，identity
+// 指向不存在的 variant 会渲染空串写入内容库存页。两者均无编译期约束，由本
+// 用例做机器门禁。
+func TestBuiltinBlockPageSpecsAndIdentitiesStayInSync(t *testing.T) {
+	variants := make(map[string]bool, len(builtinBlockPageIdentities))
+	for _, bp := range builtinBlockPageIdentities {
+		if _, ok := blockPageSpecs[bp.variant]; !ok {
+			t.Errorf("内置页 %d（%s）的 variant %q 不在 blockPageSpecs 中（会渲染空内容）", bp.id, bp.name, bp.variant)
+		}
+		if variants[bp.variant] {
+			t.Errorf("内置页 variant %q 重复登记（播种 id 冲突/重复行）", bp.variant)
+		}
+		variants[bp.variant] = true
+	}
+	for variant := range blockPageSpecs {
+		if variant == "default" {
+			continue // 默认 403 页由 is_default=1 行承载，不是内置备选页
+		}
+		if !variants[variant] {
+			t.Errorf("blockPageSpecs 的 variant %q 没有对应的内置页身份（永不播种）", variant)
+		}
+	}
+}

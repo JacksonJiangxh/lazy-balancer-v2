@@ -3688,27 +3688,9 @@ func TestInitialize_backfillsCertExpiryDays(t *testing.T) {
 func TestMigrateCrawlerSourcesID_rebuildsLegacyAndPreservesRows(t *testing.T) {
 	// Given 存量库：旧形 security_crawler_sources（无 id），一行自定义开关状态
 	database := openMigrationTestDB(t)
-	if _, err := database.Exec(`CREATE TABLE security_crawler_sources (
-		name TEXT NOT NULL UNIQUE,
-		display_name TEXT NOT NULL DEFAULT '',
-		url TEXT NOT NULL DEFAULT '',
-		format TEXT NOT NULL DEFAULT 'plain',
-		update_enabled INTEGER NOT NULL DEFAULT 1,
-		entry_count INTEGER NOT NULL DEFAULT 0,
-		version TEXT NOT NULL DEFAULT '',
-		update_status TEXT NOT NULL DEFAULT 'idle',
-		message TEXT NOT NULL DEFAULT '',
-		last_checked DATETIME,
-		next_update DATETIME,
-		trigger TEXT NOT NULL DEFAULT '',
-		started_at DATETIME,
-		finished_at DATETIME,
-		consecutive_failures INTEGER NOT NULL DEFAULT 0,
-		created_at DATETIME DEFAULT (datetime('now')),
-		updated_at DATETIME DEFAULT (datetime('now'))
-	);
-	INSERT INTO security_crawler_sources (name,display_name,url,format,update_enabled,entry_count,version)
-	VALUES ('googlebot','爬虫机器人 Google','https://example.com/ips.json','json',0,170,'2026.10.16');`); err != nil {
+	createLegacyCrawlerSourcesTable(t, database)
+	if _, err := database.Exec(`INSERT INTO security_crawler_sources (name,display_name,url,format,update_enabled,entry_count,version)
+		VALUES ('googlebot','爬虫机器人 Google','https://example.com/ips.json','json',0,170,'2026.10.16')`); err != nil {
 		t.Fatalf("seed legacy crawler sources: %v", err)
 	}
 
@@ -3754,6 +3736,7 @@ func TestMigrateCrawlerSourcesOutOfThreat_preservesStateAndRemovesLegacyRows(t *
 	}
 
 	// When
+	drainSystemAuditBuffer()
 	if err := migrateCrawlerSourcesOutOfThreat(); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -3778,6 +3761,18 @@ func TestMigrateCrawlerSourcesOutOfThreat_preservesStateAndRemovesLegacyRows(t *
 	}
 	if crawlerRows != 1 || legacyRows != 0 {
 		t.Errorf("迁移行数错误: crawler=%d legacy=%d", crawlerRows, legacyRows)
+	}
+	// And：跨表搬迁留痕一行（威胁库少了哪些源必须可追溯）。
+	entries := drainSystemAuditBuffer()
+	if len(entries) != 1 || entries[0].resource != "威胁源" || !strings.Contains(entries[0].detail, "已迁入爬虫地址库") || !strings.Contains(entries[0].detail, "1 条") {
+		t.Fatalf("搬迁审计=%+v, want 恰一条含条数的威胁源留痕", entries)
+	}
+	// 回归形状：收敛库（威胁表无爬虫行）重跑零审计。
+	if err := migrateCrawlerSourcesOutOfThreat(); err != nil {
+		t.Fatalf("re-run migrate: %v", err)
+	}
+	if entries := drainSystemAuditBuffer(); len(entries) != 0 {
+		t.Fatalf("收敛库重跑审计=%+v, want 空", entries)
 	}
 }
 
@@ -3920,5 +3915,86 @@ func TestInitialize_oidcIdentityIndexProbeSkipsRescan(t *testing.T) {
 	}
 	if indexCount != 1 {
 		t.Fatalf("索引被删后必须重建，实际 count=%d", indexCount)
+	}
+}
+
+// OIDC 重复身份安全阀的事实必须进「操作日志」（账号面板唯一可见通道），
+// 且同一重复集合只留痕一次：该僵持态只能人工合并后重启，每次重启都重写
+// 相同审计会让噪声随重启线性增长；指纹变化/冲突解除后自动重报。
+func TestMigrateOidcIdentityUniqueIndex_auditConvergesAndNamesDuplicates(t *testing.T) {
+	openMigrationTestDB(t)
+	if err := createTables(); err != nil {
+		t.Fatalf("create tables: %v", err)
+	}
+	// 生产启动序：标记列由 ensureNewColumns 补（fresh DDL 不携带 global_config 标记列）。
+	if err := ensureNewColumns(newColumnsRegistry, nil); err != nil {
+		t.Fatalf("add new columns: %v", err)
+	}
+	// 生产启动序：global_config 单行由 Initialize 在迁移前建好（标记列写点在此行）。
+	if _, err := DB.Exec(`INSERT INTO global_config (id, caddy_config) VALUES (1,'{}')`); err != nil {
+		t.Fatalf("seed global config: %v", err)
+	}
+	seedDuplicate := func(username string) {
+		t.Helper()
+		if _, err := DB.Exec(`INSERT INTO users (username, password_hash, role, is_enabled, auth_provider, oidc_subject, oidc_issuer)
+			VALUES (?, 'x', 'user', 1, 'oidc', 'sub-dup', 'https://idp.example.com')`, username); err != nil {
+			t.Fatalf("seed duplicate %s: %v", username, err)
+		}
+	}
+	readMarker := func() string {
+		t.Helper()
+		var marker string
+		if err := DB.QueryRow(`SELECT COALESCE(` + oidcDupIdentityMarkerColumn + `,'') FROM global_config WHERE id=1`).Scan(&marker); err != nil {
+			t.Fatalf("read marker: %v", err)
+		}
+		return marker
+	}
+	readIndexCount := func() int {
+		t.Helper()
+		var count int
+		if err := DB.QueryRow(`SELECT COUNT(*) FROM pragma_index_list('users') WHERE name='u_oidc_identity'`).Scan(&count); err != nil {
+			t.Fatalf("inspect users indexes: %v", err)
+		}
+		return count
+	}
+	seedDuplicate("dup-a")
+	seedDuplicate("dup-b")
+	drainSystemAuditBuffer()
+
+	// 首轮：一条点名 issuer/subject×N 的审计 + marker 置位，索引仍跳过。
+	if err := migrateOidcIdentityUniqueIndex(); err != nil {
+		t.Fatalf("first migrate: %v", err)
+	}
+	entries := drainSystemAuditBuffer()
+	if len(entries) != 1 || entries[0].resource != "用户" || !strings.Contains(entries[0].detail, "https://idp.example.com/sub-dup×2") {
+		t.Fatalf("首轮审计=%+v, want 恰一条点名重复身份的留痕", entries)
+	}
+	if marker := readMarker(); marker == "" {
+		t.Fatal("首轮后 marker 必须置位（同一重复集合已告警）")
+	}
+	if got := readIndexCount(); got != 0 {
+		t.Fatalf("重复身份在场时索引数=%d, want 0（安全阀不得建索引）", got)
+	}
+
+	// 二次启动（同一重复集合）：零新审计（marker 命中），状态不变。
+	if err := migrateOidcIdentityUniqueIndex(); err != nil {
+		t.Fatalf("second migrate: %v", err)
+	}
+	if entries := drainSystemAuditBuffer(); len(entries) != 0 {
+		t.Fatalf("二次启动审计=%+v, want 空（同一集合不重复留痕）", entries)
+	}
+
+	// 人工合并（删除一行）后重启：索引建立、marker 清除。
+	if _, err := DB.Exec(`DELETE FROM users WHERE username='dup-b'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateOidcIdentityUniqueIndex(); err != nil {
+		t.Fatalf("migrate after manual merge: %v", err)
+	}
+	if got := readIndexCount(); got != 1 {
+		t.Fatalf("合并后索引数=%d, want 1（自动建唯一索引）", got)
+	}
+	if marker := readMarker(); marker != "" {
+		t.Fatalf("冲突解除后 marker=%q, want 空", marker)
 	}
 }

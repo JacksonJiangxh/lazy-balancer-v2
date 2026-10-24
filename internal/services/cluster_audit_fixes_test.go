@@ -105,9 +105,24 @@ func TestSyncService_applySnapshot_preservesLocalLoginLockoutState(t *testing.T)
 	defer caddyServer.Close()
 	syncService := NewSyncService(database, &config.Config{CaddyAdminURL: caddyServer.URL}, NewCaddyService(caddyServer.URL))
 
+	// 同库快照的 users 节哈希与本地一致会被整节跳过（断言随之空转）：先让
+	// 本地用户内容漂移（密码哈希不同），逼出真实重放再验证记账保留语义。
+	if _, err := database.Exec(`UPDATE users SET password_hash='drifted-hash' WHERE username='root'`); err != nil {
+		t.Fatalf("drift local user: %v", err)
+	}
+
 	// When：应用含 users 节的快照（全量重放）
 	if err := syncService.applySnapshot(context.Background(), incoming); err != nil {
 		t.Fatal(err)
+	}
+
+	// 重放确实发生（漂移值被快照值覆盖），下方记账断言才有意义。
+	var replayedHash string
+	if err := database.QueryRow("SELECT COALESCE(password_hash,'') FROM users WHERE username='root'").Scan(&replayedHash); err != nil {
+		t.Fatalf("read replayed password hash: %v", err)
+	}
+	if replayedHash != "hash" {
+		t.Fatalf("password_hash=%q, want snapshot value（users 节未重放，记账断言无区分力）", replayedHash)
 	}
 
 	// Then：本地登录失败计数与锁定时间保留（不被重放重置）
@@ -434,7 +449,9 @@ func TestSyncService_applySnapshot_preservesLocalTOTPTimestep(t *testing.T) {
 	syncService := NewSyncService(database, &config.Config{CaddyAdminURL: caddyServer.URL}, NewCaddyService(caddyServer.URL))
 
 	// 本地 timestep 900(从节点已消费码)
-	database.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled,mfa_last_timestep) VALUES (1,'u','h','admin',1,900)`)
+	if _, err := database.Exec(`INSERT INTO users (id,username,password_hash,role,is_enabled,mfa_last_timestep) VALUES (1,'u','h','admin',1,900)`); err != nil {
+		t.Fatalf("seed mfa timestep: %v", err)
+	}
 	snapshot := models.ClusterSnapshot{
 		Version: 2,
 		Users:   []models.ClusterUser{{ID: 1, Username: "u", PasswordHash: "h", Role: "admin", IsEnabled: true, MFALastTimestep: 500}},
@@ -444,7 +461,9 @@ func TestSyncService_applySnapshot_preservesLocalTOTPTimestep(t *testing.T) {
 		t.Fatal(err)
 	}
 	var got int64
-	database.QueryRow(`SELECT COALESCE(mfa_last_timestep,0) FROM users WHERE id=1`).Scan(&got)
+	if err := database.QueryRow(`SELECT COALESCE(mfa_last_timestep,0) FROM users WHERE id=1`).Scan(&got); err != nil {
+		t.Fatalf("read local timestep: %v", err)
+	}
 	if got != 900 {
 		t.Fatalf("local timestep=%d after replay, want 900 preserved (replay window must not reopen)", got)
 	}
@@ -460,7 +479,9 @@ func TestSyncService_applySnapshot_preservesLocalTOTPTimestep(t *testing.T) {
 	if err := syncService.applySnapshot(context.Background(), snapshot2); err != nil {
 		t.Fatal(err)
 	}
-	database.QueryRow(`SELECT COALESCE(mfa_last_timestep,0) FROM users WHERE id=1`).Scan(&got)
+	if err := database.QueryRow(`SELECT COALESCE(mfa_last_timestep,0) FROM users WHERE id=1`).Scan(&got); err != nil {
+		t.Fatalf("read timestep after master update: %v", err)
+	}
 	if got != 1200 {
 		t.Fatalf("timestep=%d after master update, want 1200", got)
 	}
@@ -496,8 +517,12 @@ func TestSyncService_applySnapshot_preservesLocalLastLoginAndAPIKeyLastUsed(t *t
 		t.Fatal(err)
 	}
 	var gotLogin, gotKeyUsed sql.NullString
-	database.QueryRow(`SELECT last_login FROM users WHERE id=1`).Scan(&gotLogin)
-	database.QueryRow(`SELECT last_used FROM api_keys WHERE id=1`).Scan(&gotKeyUsed)
+	if err := database.QueryRow(`SELECT last_login FROM users WHERE id=1`).Scan(&gotLogin); err != nil {
+		t.Fatalf("read last_login: %v", err)
+	}
+	if err := database.QueryRow(`SELECT last_used FROM api_keys WHERE id=1`).Scan(&gotKeyUsed); err != nil {
+		t.Fatalf("read last_used: %v", err)
+	}
 	if !gotLogin.Valid || gotLogin.String != localLogin {
 		t.Fatalf("last_login=%v after replay, want %q preserved", gotLogin, localLogin)
 	}

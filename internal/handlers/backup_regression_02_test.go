@@ -1,7 +1,9 @@
 package handlers
 
-//         cluster_sync.go/cluster_status.go 节点写端点）
-//         cluster_status.go 加导出薄包装 ClearNodeSectionReports）
+// 覆盖：
+//   节点拓扑：nodes 行级门（access_url / ip_address / port）、缺席保留本地
+//   集群节点写端点在导入窗 409（门在 cluster_sync.go / cluster_status.go；
+//     节点分区缓存清理直接调用 services.ClearNodeSectionReports）
 //   无令牌哈希节点恢复成 pending（不保留 approved 死行）
 //   导入侧 upstream weight<1 响亮拒绝（不静默归一）
 
@@ -129,7 +131,7 @@ func TestNodesImportRowGate_absentNodesKeepsLocal(t *testing.T) {
 	}
 }
 
-// ──：无哈希节点恢复成 pending ──
+// 无哈希节点恢复成 pending
 
 func TestNodeWithoutTokenHashRestoredAsPending(t *testing.T) {
 	h := newBackupTestHandlers(t)
@@ -324,7 +326,7 @@ func TestImportAccessLogFormatGate(t *testing.T) {
 	})
 }
 
-// ──：导入侧 weight<1 拒绝 ──
+// 导入侧 weight<1 拒绝
 
 func TestImportRejectsUpstreamWeightBelowOne(t *testing.T) {
 	rule := map[string]any{"caddy_id": "lb_w", "name": "w", "protocol": "http", "domain": "w.example.test", "listen_port": 18080, "enabled": 1}

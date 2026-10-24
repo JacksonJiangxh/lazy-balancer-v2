@@ -10,9 +10,10 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
+
+	"lazy-balancer-v2/internal/dnsname"
 )
 
 // logf 是包级日志接缝（镜像 services/certjoblog.go certJobLogWarnf
@@ -180,13 +181,13 @@ func Replace(dataDir string, data []byte) error {
 }
 
 // normalizeRecordName 归一 DNS 名（大小写不敏感、尾点可省略），与挑战登记
-// （challenge_claims 的 challengeClaimKeyOf）同口径。账本比较若不归一，同一
-// 挑战以两种书写形态分别 Present/CleanUp（例如新的调用方或手工验证路径）时
-// 命中失败——该 TXT 既不按 ID 删除也不会被 MatchingValue 选中，只能等
-// StaleOwnershipAge 兜底，条目本身还要留到 OwnershipRetention。
-// 存量条目在比较侧同样归一，旧文件无需迁移。
+// 共用 dnsname.NormalizeName 单源实现。账本比较若不归一，同一挑战以两种
+// 书写形态分别 Present/CleanUp（例如新的调用方或手工验证路径）时命中失败——
+// 该 TXT 既不按 ID 删除也不会被 MatchingValue 选中，只能等 StaleOwnershipAge
+// 兜底，条目本身还要留到 OwnershipRetention。存量条目在比较侧同样归一，旧文件
+// 无需迁移。
 func normalizeRecordName(name string) string {
-	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(name), "."))
+	return dnsname.NormalizeName(name)
 }
 
 func (s *Store) Add(record Record) error {

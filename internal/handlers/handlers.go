@@ -173,6 +173,31 @@ func (h *Handlers) recordCaddyApplyResult(err error) {
 	h.recordCaddyApplyFailure(err, nil)
 }
 
+// applyFailureSubject 把横幅正文的失败对象短语、操作日志动作与事件对象绑成一个
+// 值——三者是同一事实的三面，必须同时给出。动作列恒为「应用失败」会让提交失败
+// （数据库）与证书文件清理失败（文件系统）在审计页被读成「Caddy 拒绝了配置」，
+// 按动作过滤/检索的人因此走向错误的排障方向。
+type applyFailureSubject struct {
+	action   string // 操作日志「动作」列
+	resource string // 操作日志「事件对象」列
+	object   string // 横幅正文的失败对象短语
+}
+
+// caddyApplyFailureSubject 是 apply 面的默认主体（Caddy 拒绝/传输/渲染失败）。
+func caddyApplyFailureSubject(object string) applyFailureSubject {
+	return applyFailureSubject{action: "应用失败", resource: "Caddy配置", object: object}
+}
+
+var (
+	// commitSaveFailedSubject 提交失败：Commit 报错无法区分「未提交」与「已提交
+	// 但确认丢失」（见 commitUncertainLabel），退出路径在数据库而不在配置内容。
+	commitSaveFailedSubject = applyFailureSubject{action: "保存失败", resource: "Caddy配置", object: postCommitSaveFailedBanner}
+	// certJobEnqueueFailedSubject 提交后证书任务入队失败：处置对象是任务队列。
+	certJobEnqueueFailedSubject = applyFailureSubject{action: "创建失败", resource: "证书任务", object: "证书任务入队失败"}
+	// certFileCleanupFailedSubject 提交后证书文件清理失败：处置对象是文件系统。
+	certFileCleanupFailedSubject = applyFailureSubject{action: "清理失败", resource: "证书文件", object: "证书文件清理失败"}
+)
+
 // recordCaddyApplyFailure 是「配置应用失败」横幅/系统审计的写点。restoreErr
 // 非空（恢复运行配置失败）时横幅改走「状态未知」文案——apply 错误本身可能来自
 // /load 传输失败（请求超时/响应丢失发生在 Caddy 已 provision 之后），此时
@@ -182,16 +207,17 @@ func (h *Handlers) recordCaddyApplyResult(err error) {
 // 驱动）。附带失败（LKG 钉回、证书文件清理、未提交事务回滚、DB 快照回退）
 // 不影响该事实，走 recordCompensationSideEffects 独立留痕，禁止并进本参数。
 func (h *Handlers) recordCaddyApplyFailure(err, restoreErr error) {
-	h.writeApplyFailureBanner("Caddy 配置应用失败", err, restoreErr)
+	h.writeApplyFailureBanner(caddyApplyFailureSubject("Caddy 配置应用失败"), err, restoreErr)
 }
 
-// writeApplyFailureBanner 是横幅/系统审计的唯一落盘点。failureObject 是失败
-// 对象短语：提交失败、证书清理失败不得沿用「Caddy 配置应用失败」模板（错称
-// 会让运维按配置内容排障，而处置对象是数据库/文件系统）。
-func (h *Handlers) writeApplyFailureBanner(failureObject string, err, restoreErr error) {
-	wrapped := fmt.Sprintf("%s（%s）：%v", failureObject, caddyApplyFailureLabel(restoreErr), err)
+// writeApplyFailureBanner 是横幅/系统审计的唯一落盘点。subject 决定横幅正文
+// 对象与审计的动作/事件对象——提交失败、证书清理失败、任务入队失败不得沿用
+// 「Caddy 配置应用失败」模板（错称会让运维按配置内容排障，而处置对象是数据库/
+// 文件系统/任务队列）。
+func (h *Handlers) writeApplyFailureBanner(subject applyFailureSubject, err, restoreErr error) {
+	wrapped := fmt.Sprintf("%s（%s）：%v", subject.object, caddyApplyFailureLabel(restoreErr), err)
 	services.Logf("error", "%s", wrapped)
-	services.RecordAuditLog("system", "应用失败", "Caddy配置", wrapped, "")
+	services.RecordAuditLog("system", subject.action, subject.resource, wrapped, "")
 	if db.DB != nil {
 		if _, derr := db.DB.Exec(`UPDATE global_config SET caddy_apply_error=? WHERE id=1`, wrapped); derr != nil {
 			services.Logf("warn", "caddy_apply_error_persist_failed: 持久化 caddy_apply_error 失败(重启后真实失败不可见): %v", derr)
@@ -211,14 +237,13 @@ const postCommitSaveFailedBanner = "配置保存失败（数据库提交结果�
 //   - sideErr：附带失败（LKG 钉回 / 证书文件清理 / 未提交事务回滚 / DB 快照
 //     回退），与「运行配置是否已恢复」无关，独立留痕。
 //
-// failureObject 见 writeApplyFailureBanner；提交失败请用
-// postCommitSaveFailedBanner。
-func (h *Handlers) recordPostCommitRestoreFailure(failureObject string, opErr, runtimeErr, sideErr error) {
-	h.recordCompensationSideEffects(failureObject, sideErr)
+// subject 见 writeApplyFailureBanner；提交失败请用 commitSaveFailedSubject。
+func (h *Handlers) recordPostCommitRestoreFailure(subject applyFailureSubject, opErr, runtimeErr, sideErr error) {
+	h.recordCompensationSideEffects(subject.object, sideErr)
 	if runtimeErr == nil {
 		return
 	}
-	h.writeApplyFailureBanner(failureObject, errors.Join(opErr, runtimeErr), runtimeErr)
+	h.writeApplyFailureBanner(subject, errors.Join(opErr, runtimeErr), runtimeErr)
 }
 
 // recordCompensationSideEffects 提交后补偿的附带失败留痕。LKG 钉回失败意味着
@@ -405,6 +430,20 @@ func commitTx(tx *sql.Tx) error {
 	return tx.Commit()
 }
 
+// txRollbackForTest 仅测试注入回滚失败（nil = 生产直通）。同 txCommitForTest：
+// 测试实现必须先把事务真正回滚再返回错误（否则恢复路径读已提交视图会撞在
+// 泄漏的写锁上）。提交失败恢复的两条通道（库态 / 运行配置）只有可注入才可能
+// 钉住「未提交事务回滚失败不得被写成运行配置恢复失败」。
+var txRollbackForTest func(*sql.Tx) error
+
+// rollbackTx 是提交失败恢复路径的事务回滚唯一入口（测试缝收口）。
+func rollbackTx(tx *sql.Tx) error {
+	if txRollbackForTest != nil {
+		return txRollbackForTest(tx)
+	}
+	return tx.Rollback()
+}
+
 // txApplyFinish 是 finishTxApply 的收尾选项。Resource/AuditAction/AuditDetail/
 // SuccessMsg 必填；SuccessStatus 默认 200；ReloadDetail 默认「配置变更后自动重载」。
 // RulesWrittenInTx：事务是否写过 lb_rules（ACME 谓词 miss 补查门控，默认 false
@@ -449,7 +488,7 @@ func (h *Handlers) finishTxApply(c *gin.Context, tx *sql.Tx, f txApplyFinish) {
 			joined := errors.Join(err, recovery.err())
 			// 真实 /load 已发生（重载审计）+ 恢复失败时的分叉横幅。
 			reloadNote.auditReload()
-			h.recordPostCommitRestoreFailure(postCommitSaveFailedBanner, err, recovery.runtime, recovery.db)
+			h.recordPostCommitRestoreFailure(commitSaveFailedSubject, err, recovery.runtime, recovery.db)
 			recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail(commitUncertainLabel, joined.Error(), services.AuditResultPart("failure")))
 			writeInternalError(c, http.StatusInternalServerError, commitUncertainLabel, joined)
 			return
@@ -481,9 +520,15 @@ func (h *Handlers) finishTxApply(c *gin.Context, tx *sql.Tx, f txApplyFinish) {
 		// id（纯策略/限流变化不触发漂移横幅）。复用提交失败的统一恢复：
 		// 回滚事务 + 以已提交视图重渲染 /load + 回退 LKG/投影/证书副作用。
 		recovery := h.recoverCommittedViewAfterCommitFailure(tx)
+		// 两通道分开陈述：库态（未提交事务回滚失败）与运行配置恢复是两件事，
+		// 把前者包成「回滚到已提交运行配置失败」会让同一次响应的正文
+		// （下方 restoreNote 只看 runtime）与审计/日志给出相反结论。
 		joined := applyErr
-		if err := recovery.err(); err != nil {
-			joined = errors.Join(applyErr, fmt.Errorf("回滚到已提交运行配置失败: %w", err))
+		if recovery.db != nil {
+			joined = errors.Join(joined, recovery.db)
+		}
+		if recovery.runtime != nil {
+			joined = errors.Join(joined, fmt.Errorf("回滚到已提交运行配置失败: %w", recovery.runtime))
 		}
 		h.recordCompensationSideEffects("Caddy 应用失败且 CLI 校验不可用", recovery.db)
 		h.recordCaddyApplyFailure(joined, recovery.runtime)
@@ -505,7 +550,7 @@ func (h *Handlers) finishTxApply(c *gin.Context, tx *sql.Tx, f txApplyFinish) {
 		// apply 失败（applyErr != nil）时 reloadNote 为 nil——auditReload 安全
 		// 跳过；恢复失败仍须落横幅（提交结果不确定 + 运行态可能滞留候选）。
 		reloadNote.auditReload()
-		h.recordPostCommitRestoreFailure(postCommitSaveFailedBanner, err, recovery.runtime, recovery.db)
+		h.recordPostCommitRestoreFailure(commitSaveFailedSubject, err, recovery.runtime, recovery.db)
 		recordAudit(c, f.AuditAction+"失败", f.Resource, services.FormatAuditDetail(commitUncertainLabel, joined.Error(), services.AuditResultPart("failure")))
 		writeInternalError(c, http.StatusInternalServerError, commitUncertainLabel, joined)
 		return
@@ -540,7 +585,7 @@ func (r postCommitRecovery) err() error {
 // 调用契约：调用方处于写路径临界区（已持 caddyOpMu），且此后不得再使用 tx。
 func (h *Handlers) recoverCommittedViewAfterCommitFailure(tx *sql.Tx) postCommitRecovery {
 	var out postCommitRecovery
-	if err := tx.Rollback(); err != nil {
+	if err := rollbackTx(tx); err != nil {
 		if errors.Is(err, sql.ErrTxDone) {
 			// database/sql 在 Commit 失败后把 Tx 标记为 done 且
 			// 不会调用 driver.Rollback（releaseConn 直接归还连接）。SQLite 的
@@ -968,7 +1013,7 @@ func (h *Handlers) validateRulePayloadBeforeSave(req interface{}) error {
 		if data.Domain == "" {
 			return fmt.Errorf("ACME DNS 证书需要填写域名")
 		}
-		if err := services.ValidateACMEDomains(data.Domain); err != nil {
+		if err := services.ValidateACMEDomainsForIssuance(data.Domain); err != nil {
 			return err
 		}
 	}
@@ -1080,7 +1125,11 @@ var caddyRestartBackoff struct {
 	triggerMod    time.Time // 退避状态对应的触发文件 mtime
 	appliedMod    time.Time // 已成功应用且等待删除的触发文件 mtime
 	removalWarned time.Time // 删除失败已留痕的触发文件 mtime（同一触发只报一次）
+	statWarned    bool      // 触发文件探测失败已留痕（恢复后补 info 并清零）
 }
+
+// caddyRestartStat 是触发文件探测入口（测试缝：注入 stat 失败形态）。
+var caddyRestartStat = os.Stat
 
 // resetCaddyRestartBackoffForTest 测试缝：复位退避状态（生产不调用）。
 func resetCaddyRestartBackoffForTest() {
@@ -1091,6 +1140,7 @@ func resetCaddyRestartBackoffForTest() {
 	caddyRestartBackoff.triggerMod = time.Time{}
 	caddyRestartBackoff.appliedMod = time.Time{}
 	caddyRestartBackoff.removalWarned = time.Time{}
+	caddyRestartBackoff.statWarned = false
 	caddyRestartBackoff.mu.Unlock()
 }
 
@@ -1127,6 +1177,24 @@ func caddyRestartNoteRemovalFailure(mod time.Time, err error) {
 	caddyRestartBackoff.mu.Unlock()
 	if !alreadyWarned {
 		services.Logf("warn", "Caddy 重启触发文件删除失败（已应用的配置不会重复执行，请检查目录权限/挂载）: %v", err)
+	}
+}
+
+// caddyRestartNoteStatFailure 区分触发文件探测的错误类别：文件不存在与成功
+// 同属常态（无待处理事件），任何其它错误（权限收紧、异常只读挂载）都会让
+// 崩溃自愈链永久静默停摆——按状态只留一条 warn，恢复探测后补一条 info。
+// 此前该分支裸 return，四类留痕面（运行日志/任务日志/审计/横幅）全无信号。
+func caddyRestartNoteStatFailure(err error) {
+	unexpected := err != nil && !errors.Is(err, os.ErrNotExist)
+	caddyRestartBackoff.mu.Lock()
+	alreadyWarned := caddyRestartBackoff.statWarned
+	caddyRestartBackoff.statWarned = unexpected
+	caddyRestartBackoff.mu.Unlock()
+	switch {
+	case unexpected && !alreadyWarned:
+		services.Logf("warn", "Caddy 重启触发文件探测失败（崩溃自愈链停摆，请检查 /tmp 触发文件所在目录的权限/挂载）: %v", err)
+	case !unexpected && alreadyWarned:
+		services.Logf("info", "Caddy 重启触发文件探测恢复")
 	}
 }
 
@@ -1194,10 +1262,14 @@ func caddyRestartEndAttempt(ok bool) {
 //   - 失败按指数退避（2s→30s），且仅在首次/状态变化/每 10 轮落 task_runs 行
 //     （其余轮 RunSyncQuiet 执行同体不落行）——持续失败行数有界。
 func (h *Handlers) caddyRestartWatcherOnce(triggerFile string, processStart time.Time) {
-	st, err := os.Stat(triggerFile)
+	st, err := caddyRestartStat(triggerFile)
 	if err != nil {
+		// 文件不存在是常态（无待处理事件）；其余错误会让 watcher 永久静默
+		// 跳过，必须留痕，否则崩溃自愈链停摆只能靠翻库/猜。
+		caddyRestartNoteStatFailure(err)
 		return
 	}
+	caddyRestartNoteStatFailure(nil)
 	if st.ModTime().Before(processStart) {
 		if err := os.Remove(triggerFile); err != nil {
 			// 存量文件删不掉（只读目录/异常挂载）时每个 tick 都会重进本分支：

@@ -111,6 +111,25 @@ test('formatter 缓存：同 时区×形态 只构造一次（轮询高频调用
   assert.equal(g.__formatCalls, before + 2, 'date-only 形态后续命中缓存')
 })
 
+test('非法配置时区 + 图表轴：首个调用即回退 DEFAULT_TZ 并缓存回退实例', async () => {
+  g.__tz = 'Mars/Olympus'
+  const warnings: string[] = []
+  const originalWarn = console.warn
+  console.warn = (message?: unknown) => { warnings.push(String(message)) }
+  try {
+    const fresh = await import(`../src/utils/date.ts?invalid-tz-chart=${Date.now()}`)
+    assert.equal(fresh.formatChartTimeInConfigTz(Date.UTC(2026, 0, 1, 16, 5, 9)), '00:05:09')
+    const afterFirst = g.__formatCalls
+    assert.equal(fresh.formatChartTimeInConfigTz(Date.UTC(2026, 0, 1, 15, 59, 59)), '23:59:59')
+    assert.equal(g.__formatCalls, afterFirst, '回退实例同样进入缓存（后续调用不再构造 Intl）')
+    assert.equal(warnings.length, 1, '图表轴与文本格式化共用同一 warn 去重位')
+    assert.match(warnings[0], /Mars\/Olympus/)
+  } finally {
+    console.warn = originalWarn
+    g.__tz = 'Asia/Shanghai'
+  }
+})
+
 test('非法配置时区：回退 DEFAULT_TZ 且只 warn 一次（不刷屏、不抛）', async () => {
   g.__tz = 'Mars/Olympus'
   const warnings: string[] = []

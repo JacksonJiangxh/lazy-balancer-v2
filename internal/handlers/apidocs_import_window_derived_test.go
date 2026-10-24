@@ -20,7 +20,12 @@ import (
 
 func derivedImportWindowGatedRoutes(t *testing.T) map[string]string {
 	t.Helper()
-	gated := map[string]bool{}
+	// 门调用可能在 helper 里（clusterNodeAction / libAutoUpdate / updateLibSchedule
+	// 等）：只扫「handler 函数体直接含门调用」会漏掉这些端点，于是文档永远缺
+	// 409。两层派生：①直接含门调用的函数集合；②再沿一层调用边（h.X / X）扩张，
+	// 得到「经 helper 间接受门」的 handler。
+	directGated := map[string]bool{}
+	callees := map[string]map[string]bool{}
 	fset := token.NewFileSet()
 	entries, err := os.ReadDir(".")
 	if err != nil {
@@ -40,21 +45,47 @@ func derivedImportWindowGatedRoutes(t *testing.T) map[string]string {
 			if !ok || fn.Body == nil {
 				continue
 			}
+			name := fn.Name.Name
+			out := callees[name]
+			if out == nil {
+				out = map[string]bool{}
+				callees[name] = out
+			}
 			hit := false
 			ast.Inspect(fn.Body, func(n ast.Node) bool {
 				call, ok := n.(*ast.CallExpr)
 				if !ok {
 					return true
 				}
-				if id, ok := call.Fun.(*ast.Ident); ok &&
-					(id.Name == "rejectWriteDuringImport" || id.Name == "rejectNodeWriteDuringImport") {
-					hit = true
-					return false
+				switch callee := call.Fun.(type) {
+				case *ast.Ident:
+					if callee.Name == "rejectWriteDuringImport" || callee.Name == "rejectNodeWriteDuringImport" {
+						hit = true
+						return false
+					}
+					out[callee.Name] = true
+				case *ast.SelectorExpr:
+					out[callee.Sel.Name] = true
 				}
 				return true
 			})
 			if hit {
-				gated[fn.Name.Name] = true
+				directGated[name] = true
+			}
+		}
+	}
+	gated := map[string]bool{}
+	for name := range directGated {
+		gated[name] = true
+	}
+	for name, calls := range callees {
+		if gated[name] {
+			continue
+		}
+		for callee := range calls {
+			if directGated[callee] {
+				gated[name] = true
+				break
 			}
 		}
 	}
@@ -63,12 +94,20 @@ func derivedImportWindowGatedRoutes(t *testing.T) map[string]string {
 		t.Fatalf("read middleware.go: %v", err)
 	}
 	// 两个登记组（adminGroup/business）都是 v1.Group("")，故注册路径即
-	// apiDocRoutes 的相对路径。
-	routePattern := regexp.MustCompile(`(?m)^\s*\w+\.(GET|POST|PUT|PATCH|DELETE)\("([^"]+)",\s*h\.(\w+)\)`)
+	// apiDocRoutes 的相对路径。注册形态有两种：`("path", h.X)` 与
+	// `("path", someMiddleware(), h.X)`（内联中间件，如限流/认证）——handler
+	// 恒为最后一个参数，取实参区里最后一个 `h.<Name>`。
+	routePattern := regexp.MustCompile(`(?m)^\s*\w+\.(GET|POST|PUT|PATCH|DELETE)\("([^"]+)",(.*)\)`)
+	handlerPattern := regexp.MustCompile(`h\.(\w+)`)
 	derived := map[string]string{}
 	for _, match := range routePattern.FindAllStringSubmatch(string(middleware), -1) {
-		if gated[match[3]] {
-			derived[match[1]+" "+match[2]] = match[3]
+		handlers := handlerPattern.FindAllStringSubmatch(match[3], -1)
+		if len(handlers) == 0 {
+			continue
+		}
+		handler := handlers[len(handlers)-1][1]
+		if gated[handler] {
+			derived[match[1]+" "+match[2]] = handler
 		}
 	}
 	return derived
@@ -152,5 +191,41 @@ func TestAPIDocRoutes_restoreDocumentsPartialAndBodyLimit(t *testing.T) {
 	}
 	if !strings.Contains(route.Description, "partial") {
 		t.Errorf("restore 描述未说明 200+partial 形态: %q", route.Description)
+	}
+}
+
+// 此前派生扫描器的两个盲区（内联中间件注册、门在 helper 里）让 8 类会返回 409
+// 的端点文档缺码：集群机器接口（注册/确认/快照/规则库包/上报）与节点审批写、
+// 成员写、API Key 自助写。逐端点断言 OpenAPI 输出里这些路径段含该码——只断言
+// 「整份 YAML 某处出现 import_in_progress」会被别的族掩盖。
+func TestOpenAPIYAML_gatedRouteFamiliesDocument409(t *testing.T) {
+	yaml := buildOpenAPIYAML()
+	paths := []string{
+		"/cluster/register:",
+		"/cluster/registration/confirm:",
+		"/cluster/sync/snapshot:",
+		"/cluster/sync/waf-files:",
+		"/cluster/nodes/report:",
+		"/cluster/nodes/{id}/approve:",
+		"/cluster/nodes/{id}/reject:",
+		"/cluster/nodes/{id}:",
+		"/users/{id}:",
+		"/users/{id}/reset-password:",
+		"/api-keys:",
+		"/security/crs/schedule:",
+	}
+	for _, path := range paths {
+		start := strings.Index(yaml, "  "+path)
+		if start < 0 {
+			t.Errorf("OpenAPI YAML 缺路径 %s", path)
+			continue
+		}
+		block := yaml[start+len(path):]
+		if end := strings.Index(block, "\n  /"); end >= 0 {
+			block = block[:end]
+		}
+		if !strings.Contains(block, "import_in_progress") {
+			t.Errorf("路径 %s 的文档缺 409 import_in_progress（该端点实际受导入窗口写门约束）", path)
+		}
 	}
 }

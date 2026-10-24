@@ -17,7 +17,7 @@ export interface ImportFailureReport {
   readonly message: string
   /** 后端 data.warnings，按原顺序（已滤掉空串/非字符串）。 */
   readonly warnings: readonly string[]
-  /** 后端 data.disabled_conflicts 条数（失败分支通常为 0，但回滚明细可能携带）。 */
+  /** 后端 data.disabled_conflicts 条数（失败响应携带的是「导入成功会禁用哪些」预演清单）。 */
   readonly conflictCount: number
 }
 
@@ -44,9 +44,17 @@ export const importFailureReport = (error: unknown, fallbackMessage: string): Im
   }
 }
 
-/** 展示行：主文案 + 冲突计数 + 后端 warnings（逐条独立成行）。 */
+/** 展示行：主文案 + 冲突预演 + 后端 warnings（逐条独立成行）。
+ *
+ * 冲突行必须写成「预演」：失败响应里的 disabled_conflicts 是链内算出的
+ * 「若导入成功会禁用哪些规则」，此时事务已回滚、一条规则都没被禁用（提交结果
+ * 不确定时则以实际库态为准）。用成功路径的既成事实句会让管理员以为规则已被
+ * 禁用而去核对，或反过来不再检查冲突。
+ */
 export const importFailureLines = (report: ImportFailureReport): string[] => [
   report.message,
-  ...(report.conflictCount > 0 ? [`冲突置为禁用：${report.conflictCount} 条`] : []),
+  ...(report.conflictCount > 0
+    ? [`若导入成功将禁用冲突规则：${report.conflictCount} 条（本次失败，实际状态以规则页为准）`]
+    : []),
   ...report.warnings,
 ]

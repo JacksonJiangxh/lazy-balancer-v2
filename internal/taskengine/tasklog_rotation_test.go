@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"lazy-balancer-v2/internal/db"
 )
 
 func TestAppendTaskLogLine_rotatesBeforeWriteAtConfiguredThreshold(t *testing.T) {
@@ -42,5 +44,16 @@ func TestAppendTaskLogLine_rotatesBeforeWriteAtConfiguredThreshold(t *testing.T)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "b.log.1")); !os.IsNotExist(err) {
 		t.Errorf("B 不应滚动: err=%v", err)
+	}
+}
+
+// 未注入尺寸函数（引擎早于 services 装配 / 纯 taskengine 测试）时的回退值必须
+// 与治理默认值同源（db.DefaultTaskLogSizeMB），不得写第二份字面量。
+func TestTaskLogSizeFallbackUsesDBDefault(t *testing.T) {
+	SetTaskLogSizeBytesFn(nil)
+	t.Cleanup(func() { SetTaskLogSizeBytesFn(nil) })
+	want := int64(db.DefaultTaskLogSizeMB) * 1024 * 1024
+	if got := taskLogSizeBytes(); got != want {
+		t.Fatalf("任务日志尺寸回退=%d, want %d（须引用 db.DefaultTaskLogSizeMB）", got, want)
 	}
 }

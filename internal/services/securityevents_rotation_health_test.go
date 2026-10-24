@@ -7,6 +7,7 @@ package services
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -68,5 +69,49 @@ func TestSecurityEventsPollOnce_rotationFailureEntersHealthSnapshot(t *testing.T
 	}
 	if info, err := os.Stat(logPath); err != nil || info.Size() != 0 {
 		t.Fatalf("恢复后活文件未截断: size=%v err=%v", info, err)
+	}
+}
+
+// 轮转顺延（活文件尾部尚未摄取）不得计入采集失败：持续写入期每轮都会返回
+// 该哨兵，按失败记账会让三面健康位在数轮内误报「采集异常」，真实失败反而被
+// 容量噪音掩盖。顺延轮次按成功 tick 记账，另以 RotationDeferred 单列披露。
+func TestSecurityEventsRecordPollResult_rotationDeferredStaysHealthy(t *testing.T) {
+	SecurityEventsSetIngestionHealthForTest(SecurityEventsIngestionStatus{})
+	t.Cleanup(func() { SecurityEventsSetIngestionHealthForTest(SecurityEventsIngestionStatus{}) })
+	raw := func() SecurityEventsIngestionStatus {
+		securityEventsIngestionHealth.Lock()
+		defer securityEventsIngestionHealth.Unlock()
+		return securityEventsIngestionHealth.status
+	}
+
+	// When：连续多轮（> 失败阈值）都只是轮转顺延。
+	for range securityEventsIngestionFailureThreshold + 2 {
+		securityEventsRecordPollResult(fmt.Errorf("%w: 活文件尾部尚未摄取", errAuditRotationDeferred))
+	}
+
+	// Then：健康位保持健康、连续失败为 0、延迟状态单列。
+	status := raw()
+	if !status.Observed || !status.Healthy || status.ConsecutiveFailures != 0 {
+		t.Fatalf("顺延轮次健康快照=%+v, want observed+healthy+0 failures", status)
+	}
+	if !status.RotationDeferred || status.RotationLastDeferredAt == "" {
+		t.Fatalf("延迟状态未记录: %+v", status)
+	}
+	if status.LastError != "" || status.LastErrorAt != "" {
+		t.Fatalf("顺延不得写成 last_error: %q/%q", status.LastError, status.LastErrorAt)
+	}
+
+	// 真失败仍必须降级——延迟记账不得掩盖采集异常。
+	for range securityEventsIngestionFailureThreshold {
+		securityEventsRecordPollResult(errors.New("injected tick failure"))
+	}
+	if status = raw(); status.Healthy || status.ConsecutiveFailures != securityEventsIngestionFailureThreshold {
+		t.Fatalf("真实失败未降级: %+v", status)
+	}
+
+	// 恢复后的成功 tick 复位延迟标记。
+	securityEventsRecordPollResult(nil)
+	if status = raw(); !status.Healthy || status.RotationDeferred || status.RotationLastDeferredAt == "" {
+		t.Fatalf("成功 tick 未复位延迟标记: %+v", status)
 	}
 }

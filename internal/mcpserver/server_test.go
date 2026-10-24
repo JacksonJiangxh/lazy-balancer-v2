@@ -745,6 +745,59 @@ func TestGetRuleMetricsHistoryForwardsRangeQuery(t *testing.T) {
 	}
 }
 
+func TestForwardQueryNullTreatedAsOmitted(t *testing.T) {
+	// Given：显式 JSON null 是 Agent 表达「可选筛选不填」的常见形态——若按
+	// fmt.Sprint 串化会变成 "<nil>" 被当真实过滤值转发（分页 400 / 按字面
+	// 过滤后静默空结果）。
+	var forwardedQueries []string
+	rest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwardedQueries = append(forwardedQueries, r.URL.RawQuery)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{}}`))
+	}))
+	defer rest.Close()
+	handler := NewForTest(rest.URL+"/api/v1", rest.Client())
+
+	// When：可选 query 参数显式传 null（range 与分页/过滤参数同属可选面）
+	callTool(t, handler, "get_rule_metrics_history", `{"caddy_id":"lb_metrics","range":null}`)
+	callTool(t, handler, "list_security_events", `{"page":null,"ip":null,"start_time":null}`)
+
+	// Then：null 等同未提供，转发 URL 不带该参数
+	if len(forwardedQueries) != 2 {
+		t.Fatalf("forwarded requests=%d, want 2", len(forwardedQueries))
+	}
+	if forwardedQueries[0] != "" {
+		t.Fatalf("forwarded query=%q, want empty (null range treated as omitted)", forwardedQueries[0])
+	}
+	if forwardedQueries[1] != "" {
+		t.Fatalf("forwarded query=%q, want empty (null page/ip/start_time treated as omitted)", forwardedQueries[1])
+	}
+}
+
+func TestForwardPathArgNullReturnsMissingParam(t *testing.T) {
+	// Given：路径参数显式 null 时不得拼出 /rules/%3Cnil%3E（REST 侧 404，
+	// 错误指向不存在的规则而非缺少参数）。
+	restCalls := 0
+	rest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		restCalls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{}}`))
+	}))
+	defer rest.Close()
+	handler := NewForTest(rest.URL+"/api/v1", rest.Client())
+
+	// When
+	result := callTool(t, handler, "get_rule", `{"caddy_id":null}`)
+
+	// Then：按「缺少参数」返回工具错误，且不发出请求
+	if !strings.Contains(result, `"isError":true`) || !strings.Contains(result, "缺少参数 caddy_id") {
+		t.Fatalf("result=%q, want isError + 缺少参数 caddy_id", result)
+	}
+	if restCalls != 0 {
+		t.Fatalf("upstream calls=%d, want 0 (null path arg must not be forwarded)", restCalls)
+	}
+}
+
 func TestOversizedResponseMessageDistinguishesExportConfig(t *testing.T) {
 	// Given：内部 API 返回超过 4 MiB——export_config 无分页参数也无专用导出
 	// 工具，通用文案「改用分页或专用导出工具」对它是死路指引，须给专用文案。
@@ -1345,6 +1398,6 @@ func withIsolatedMCPDatabase(t *testing.T) {
 		if err := db.Close(); err != nil {
 			t.Errorf("close database: %v", err)
 		}
-		restoreMCPDatabaseHandles(oldDB, oldMetricsDB, oldAuditDB)
+		RestoreDBForTest(oldDB, oldMetricsDB, oldAuditDB)
 	})
 }

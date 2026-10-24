@@ -36,6 +36,15 @@ func CertJobMaterialPredicateSQL(alias string) string {
 	return nonBlank("cert_pem") + " AND " + nonBlank("key_pem") + " AND COALESCE(" + prefix + "status,'') <> 'disabled'"
 }
 
+// CertJobMissingMaterialPredicateSQL 是 CertJobMaterialPredicateSQL 的逻辑取反。
+// 取反必须经 COALESCE 归一到布尔：SQL 三值逻辑下 NOT(NULL) 仍是 NULL，材料列
+// 为 NULL（任务行创建时的默认形态——签发中断从未写入，正是「材料丢失」最常见
+// 的形态）会被 `NOT (predicate)` 静默排除，而不是被当作「无材料」回收。
+// 正向与取反共用同一表达式，不得另写条件组合。
+func CertJobMissingMaterialPredicateSQL(alias string) string {
+	return "NOT COALESCE(" + CertJobMaterialPredicateSQL(alias) + ", 0)"
+}
+
 // CertJobMaterialUsable 是 CertJobMaterialPredicateSQL 的 Go 侧等价判定，供
 // 内存中的行（已是查询结果）复用同一语义（含 trim 口径，见上）。
 func CertJobMaterialUsable(status, certPEM, keyPEM string) bool {

@@ -19,7 +19,11 @@ import (
 	"lazy-balancer-v2/internal/services"
 )
 
-var caddyMetricsHTTPClient = &http.Client{Timeout: 10 * time.Second}
+// caddyMetricsHTTPClient 不设 Client.Timeout：抓取截止时间只由
+// caddyMetricsFetchTimeout 施加的 request context 表达（单一截止时间）。
+// 曾同时存在 10s 客户端超时与 15s 自身上限，客户端恒先触发，使「自身超时/
+// 取消不写负缓存」的分支在真实 HTTP 路径永不可达，且 15s 调大调小都无效果。
+var caddyMetricsHTTPClient = &http.Client{}
 
 func fetchCaddyMetrics(ctx context.Context, url string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -47,8 +51,11 @@ func fetchCaddyMetrics(ctx context.Context, url string) ([]byte, error) {
 	return body, nil
 }
 
+// caddyMetricsError 是采集类失败（指标源不可达/正文不可解析）的唯一写点：
+// 6 个消费端点都在任意登录身份可读的组里，响应只回固定文案——底层错误
+// （指标源 URL 与内网 IP:端口、Prometheus 正文片段与行号）只进运行日志。
 func caddyMetricsError(c *gin.Context, err error) {
-	c.JSON(http.StatusBadGateway, models.APIResponse{Code: http.StatusBadGateway, Message: "采集 Caddy 指标失败: " + err.Error()})
+	writeInternalError(c, http.StatusBadGateway, "采集 Caddy 指标失败", err)
 }
 
 func (h *Handlers) GetMetricsOverview(c *gin.Context) {
@@ -182,6 +189,8 @@ func loadCaddyMetricsSnapshot(ctx context.Context, url string, cacheFailure bool
 		switch {
 		case err == nil:
 			storeCaddyMetricsSnapshot(url, body, nil, time.Now())
+		// fetchCtx 是抓取唯一的截止时间来源（HTTP 客户端不设 Client.Timeout），
+		// 因此「自身超时/取消」在此处真实可达：到期即不写负缓存。
 		case cacheFailure && fetchCtx.Err() == nil:
 			storeCaddyMetricsSnapshot(url, nil, err, time.Now())
 		}
@@ -267,11 +276,13 @@ func storeMetricsDashboardOutcome(url string, outcome metricsDashboardOutcome, n
 func (h *Handlers) buildMetricsDashboard(ctx context.Context) metricsDashboardOutcome {
 	body, err := loadCaddyMetricsSnapshot(ctx, h.cfg.CaddyMetricsURL, false)
 	if err != nil {
-		return metricsDashboardOutcome{status: http.StatusBadGateway, message: "采集 Caddy 指标失败: " + err.Error()}
+		services.Logf("warn", "采集 Caddy 指标失败: %v", err)
+		return metricsDashboardOutcome{status: http.StatusBadGateway, message: "采集 Caddy 指标失败"}
 	}
 	samples, err := parsePrometheusSamples(string(body))
 	if err != nil {
-		return metricsDashboardOutcome{status: http.StatusBadGateway, message: "采集 Caddy 指标失败: " + err.Error()}
+		services.Logf("warn", "解析 Caddy 指标失败: %v", err)
+		return metricsDashboardOutcome{status: http.StatusBadGateway, message: "采集 Caddy 指标失败"}
 	}
 	metricsIndex := buildPrometheusMetricsIndex(samples)
 
@@ -380,7 +391,7 @@ func (h *Handlers) GetRuleMetrics(c *gin.Context) {
 	if rule.Protocol == "tcp" {
 		upstreams, err := loadRuleUpstreams(ruleID)
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "读取规则上游失败: " + err.Error()})
+			writeInternalError(c, http.StatusInternalServerError, "读取规则上游失败", err)
 			return
 		}
 		metrics, parseErr = parseTCPRuleMetricsFromPrometheus(string(body), upstreams)
@@ -625,7 +636,9 @@ func (h *Handlers) GetMetricsHistory(c *gin.Context) {
 	}
 
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.APIResponse{Code: 500, Message: "数据库错误"})
+		// 查询失败是本端点最频繁的读库故障路径，必须与同端点其余三个失败
+		// 分支（Scan/时间解析/rows.Err）共用固定文案 + 日志留痕。
+		writeInternalError(c, http.StatusInternalServerError, "读取指标历史失败", err)
 		return
 	}
 	defer rows.Close()

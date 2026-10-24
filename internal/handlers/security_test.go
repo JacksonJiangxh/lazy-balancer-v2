@@ -141,3 +141,85 @@ func TestReadUpdateLogWithRotation_cappedAt128KB(t *testing.T) {
 		t.Fatal("拼接结果未裁剪：旧代头部仍在")
 	}
 }
+
+// 从节点上三个直读 SQL 的规则库读面（/security/crs、/security/ip2region、
+// /security/overview）必须与 status 快照面同结论：残留活动态（进程崩溃/降级
+// 前本机残留/旧备份）按角色投影为 failed，不得让卡片显示「更新中」而同一个
+// 库值在更新弹框里显示「本节点不执行该任务」。主节点同形态原样呈现，且投影
+// 只影响展示——库值不得被改写。
+func TestSecurityLibraryReadFacesProjectActiveStatusByRole(t *testing.T) {
+	h := newBackupTestHandlers(t)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/security/crs", h.GetCRSInfo)
+	router.GET("/security/ip2region", h.GetIP2RegionInfo)
+	router.GET("/security/overview", h.GetSecurityOverview)
+
+	// Given 两族版本行的库值都是活动态。
+	if _, err := db.DB.Exec(`INSERT OR REPLACE INTO security_crs_version (id, version, update_status, message)
+		VALUES (1, 'v-test', 'downloading', '正在下载')`); err != nil {
+		t.Fatalf("seed crs version: %v", err)
+	}
+	if _, err := db.DB.Exec(`INSERT OR REPLACE INTO security_ip2region_version (id, version, update_status, message)
+		VALUES (1, 'v-test', 'installing', '正在安装')`); err != nil {
+		t.Fatalf("seed ip2region version: %v", err)
+	}
+	readData := func(path string) map[string]any {
+		t.Helper()
+		recorder := getRequest(t, router, path)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("%s status=%d body=%s, want 200", path, recorder.Code, recorder.Body.String())
+		}
+		var resp struct {
+			Data map[string]any `json:"data"`
+		}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("%s parse response: %v", path, err)
+		}
+		return resp.Data
+	}
+
+	// When 从节点读取三个面
+	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=0 WHERE id=1`); err != nil {
+		t.Fatalf("demote node: %v", err)
+	}
+	crsSlave := readData("/security/crs")
+	ipSlave := readData("/security/ip2region")
+	overviewSlave := readData("/security/overview")
+
+	// Then 活动态一律投影为 failed（且携带归属文案，不再是「正在下载」）。
+	if got := crsSlave["update_status"]; got != "failed" {
+		t.Fatalf("从节点 /security/crs update_status=%v, want failed（活动态只属执行进程）", got)
+	}
+	if msg, _ := crsSlave["message"].(string); msg == "" || msg == "正在下载" {
+		t.Fatalf("从节点 /security/crs message=%q, want 归属说明", msg)
+	}
+	if got := ipSlave["update_status"]; got != "failed" {
+		t.Fatalf("从节点 /security/ip2region update_status=%v, want failed", got)
+	}
+	if got := overviewSlave["update_status"]; got != "failed" {
+		t.Fatalf("从节点 /security/overview update_status=%v, want failed", got)
+	}
+	// 投影只影响展示：库值仍是活动态（写库会在从端伪造终态）。
+	var storedStatus string
+	if err := db.DB.QueryRow(`SELECT update_status FROM security_crs_version WHERE id=1`).Scan(&storedStatus); err != nil {
+		t.Fatalf("read stored status: %v", err)
+	}
+	if storedStatus != "downloading" {
+		t.Fatalf("库值被改写为 %q（读侧投影不得写库）", storedStatus)
+	}
+
+	// Then 主节点原样呈现（活动态属于本节点执行进程）。
+	if _, err := db.DB.Exec(`UPDATE global_config SET is_master=1 WHERE id=1`); err != nil {
+		t.Fatalf("promote node: %v", err)
+	}
+	if got := readData("/security/crs")["update_status"]; got != "downloading" {
+		t.Fatalf("主节点 /security/crs update_status=%v, want downloading（原值）", got)
+	}
+	if got := readData("/security/ip2region")["update_status"]; got != "installing" {
+		t.Fatalf("主节点 /security/ip2region update_status=%v, want installing（原值）", got)
+	}
+	if got := readData("/security/overview")["update_status"]; got != "downloading" {
+		t.Fatalf("主节点 /security/overview update_status=%v, want downloading（原值）", got)
+	}
+}

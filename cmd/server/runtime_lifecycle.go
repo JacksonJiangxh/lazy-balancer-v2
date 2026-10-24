@@ -22,13 +22,17 @@ type runtimeLifecycle struct {
 	certFactory func() lifecycleWorker
 	certService lifecycleWorker
 	certDone    chan struct{}
-	// acmeOpsMu 串行化证书侧启停（StartACME vs stopACMEWithin）：停止在途时
+	// acmeOps 串行化证书侧启停（StartACME vs stopACMEWithin）：停止在途时
 	// 不得拉起新一代，否则在途的 queue.Stop() 会关掉新一代队列。互斥**覆盖**
 	// 等待——有界等待就在临界区内执行，因此启动最多被推迟一个停止预算。
 	// 超时后等待被放弃但互斥即释放：残留在途的停止仍可能落在新一代队列上，
 	// 故 acmeStopDone 记录「停止仍在途」，由 StartACME 在拉起新一代前等待它
 	// 收尾（有界，超时则拒绝启动并 error，见 StartACME）。
-	acmeOpsMu sync.Mutex
+	// 容量 1 的通道而非 sync.Mutex：互斥获取本身必须能按关停预算有界——
+	// Mutex.Lock 没有 deadline，并发的证书 daemon 停止（同样持锁、最长一个
+	// 停止预算）会把证书段从 timeout 拖成 2×timeout，正好吃掉 compose grace
+	// 的余量，使「最坏 25s」的断言在极端形态下失真。
+	acmeOps chan struct{}
 	// acmeStopDone 是在途 ACME 停止的完成信号（l.mu 保护）：停止启动时登记，
 	// 真正收尾（queue.Stop/worker.Stop/<-done 全部返回）后清空并 close。
 	// 关停超时只放弃「等待」，不谎称停止已完成——残留停止仍会 PauseAndDrain
@@ -51,18 +55,46 @@ type runtimeLifecycle struct {
 const syncStopSegmentMax = 3 * time.Second
 
 func newRuntimeLifecycle(syncService lifecycleWorker, certFactory func() lifecycleWorker) *runtimeLifecycle {
-	return &runtimeLifecycle{syncService: syncService, certFactory: certFactory}
+	return &runtimeLifecycle{syncService: syncService, certFactory: certFactory, acmeOps: make(chan struct{}, 1)}
 }
 
+// acquireACMEOps 在 budget 内获取证书启停互斥；budget<=0 表示只做非阻塞尝试
+// （与同层 awaitChannelWithin/runWithin 的「0=放弃」口径一致）。
+func (l *runtimeLifecycle) acquireACMEOps(budget time.Duration) bool {
+	if budget <= 0 {
+		select {
+		case l.acmeOps <- struct{}{}:
+			return true
+		default:
+			return false
+		}
+	}
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+	select {
+	case l.acmeOps <- struct{}{}:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+// releaseACMEOps 释放证书启停互斥。
+func (l *runtimeLifecycle) releaseACMEOps() { <-l.acmeOps }
+
 func (l *runtimeLifecycle) StartACME() {
-	// 与在途停止串行化（见 acmeOpsMu）。互斥只保证「同一时刻一个启停动作」，
+	// 与在途停止串行化（见 acmeOps）。互斥只保证「同一时刻一个启停动作」，
 	// 不保证上一代停止已经收尾——关停超时后互斥已释放而停止 goroutine 还在跑。
 	// 拉起新一代前必须等它收尾：在途 queue.Stop() 会 PauseAndDrain 新一代队列
-	// 并清空规则屏障租约（证书签发/部署静默停摆）。等待有界（一个停止预算），
-	// 超时则拒绝启动并 error——降级为「无证书 worker 但可诊断」，好过静默启动
-	// 一个立刻被上一代停止杀掉的队列。
-	l.acmeOpsMu.Lock()
-	defer l.acmeOpsMu.Unlock()
+	// 并清空规则屏障租约（证书签发/部署静默停摆）。等待有界（一个停止预算，
+	// 互斥获取与在途停止等待共用该预算），超时则拒绝启动并 error——降级为
+	// 「无证书 worker 但可诊断」，好过静默启动一个立刻被上一代停止杀掉的队列。
+	started := time.Now()
+	if !l.acquireACMEOps(acmeStopSegmentMax) {
+		services.Logf("error", "证书服务启停竞态：%s 内未取得启停锁（并发停止在途），本次启动放弃（下次换代重试）", acmeStopSegmentMax)
+		return
+	}
+	defer l.releaseACMEOps()
 	l.mu.Lock()
 	if l.stopped || l.certService != nil {
 		l.mu.Unlock()
@@ -71,9 +103,14 @@ func (l *runtimeLifecycle) StartACME() {
 	pendingStop := l.acmeStopDone
 	l.mu.Unlock()
 	if pendingStop != nil {
+		remaining := acmeStopSegmentMax - time.Since(started)
+		if remaining <= 0 {
+			services.Logf("error", "证书服务启停竞态：上一代停止仍在途（启停锁等待已耗尽 %s 预算），本次启动放弃以免在途 Stop 关闭新队列（下次换代重试）", acmeStopSegmentMax)
+			return
+		}
 		select {
 		case <-pendingStop:
-		case <-time.After(acmeStopSegmentMax):
+		case <-time.After(remaining):
 			services.Logf("error", "证书服务启停竞态：上一代停止仍在途（超过 %s），本次启动放弃以免在途 Stop 关闭新队列（下次换代重试）", acmeStopSegmentMax)
 			return
 		}
@@ -113,10 +150,38 @@ func (l *runtimeLifecycle) StopACME() { l.stopACMEWithin(acmeStopSegmentMax) }
 // 后放弃等待（进程继续退出）。放弃等待**不等于**停止已完成：finished 通道
 // 登记为 l.acmeStopDone，StartACME 在拉起新一代前会等它收尾（见该函数）。
 func (l *runtimeLifecycle) stopACMEWithin(timeout time.Duration) {
-	l.acmeOpsMu.Lock()
-	defer l.acmeOpsMu.Unlock()
+	started := time.Now()
+	// 互斥获取本身也计入同一个关停预算：并发停止各持一个停止预算，无界等锁
+	// 会把证书段从 timeout 拖成 2×timeout，正好吃掉 compose grace 的余量。
+	if !l.acquireACMEOps(timeout) {
+		// 互斥被在途启停动作持有：若那是另一个停止，等它的完成信号（同一个
+		// 预算），让本次调用仍具备「停止已收尾」语义；没有任何在途停止句柄
+		// 可等（对端是启动动作）才只能跳过本段。
+		l.mu.Lock()
+		pendingStop := l.acmeStopDone
+		l.mu.Unlock()
+		if pendingStop != nil {
+			l.awaitACMEStop(pendingStop, timeout-time.Since(started))
+			return
+		}
+		if timeout <= 0 {
+			services.Logf("error", "证书服务停止等待超时（关停预算已耗尽），放弃等待继续退出")
+		} else {
+			services.Logf("error", "证书服务停止等待超时（%s）：未能在预算内取得启停锁（并发启停动作在途），跳过本段继续退出", timeout)
+		}
+		return
+	}
+	defer l.releaseACMEOps()
 
 	l.mu.Lock()
+	// 已有停止在途：单飞复用它的完成信号，不登记新一代句柄。若用本次的
+	// finished 覆写 acmeStopDone，后一个停止快速完成会让 StartACME 误判
+	// 前一个（仍在 PauseAndDrain 旧队列）也已收尾而放行新一代。
+	if pendingStop := l.acmeStopDone; pendingStop != nil {
+		l.mu.Unlock()
+		l.awaitACMEStop(pendingStop, timeout-time.Since(started))
+		return
+	}
 	queue := services.GetCAQueueManager()
 	worker := l.certService
 	done := l.certDone
@@ -156,7 +221,13 @@ func (l *runtimeLifecycle) stopACMEWithin(timeout time.Duration) {
 			<-done
 		}
 	}()
-	if timeout <= 0 {
+	l.awaitACMEStop(finished, timeout-time.Since(started))
+}
+
+// awaitACMEStop 按剩余预算等待一次证书停止收尾；remaining<=0 表示预算已耗尽
+// （只做非阻塞检查，进程必须按时退出）。
+func (l *runtimeLifecycle) awaitACMEStop(finished <-chan struct{}, remaining time.Duration) {
+	if remaining <= 0 {
 		// 预算耗尽：不再等待，但如实报告未收尾（非阻塞检查，进程必须按时退出）。
 		select {
 		case <-finished:
@@ -167,8 +238,8 @@ func (l *runtimeLifecycle) stopACMEWithin(timeout time.Duration) {
 	}
 	select {
 	case <-finished:
-	case <-time.After(timeout):
-		services.Logf("error", "证书服务停止等待超时（%s），放弃等待继续退出（worker goroutine 随进程回收）", timeout)
+	case <-time.After(remaining):
+		services.Logf("error", "证书服务停止等待超时（%s），放弃等待继续退出（worker goroutine 随进程回收）", remaining)
 	}
 }
 
@@ -250,13 +321,10 @@ func (l *runtimeLifecycle) stopSyncWithin(d time.Duration) {
 	}
 }
 
-// Shutdown 是测试缝：用固定预算（acmeStopSegmentMax）调用 ShutdownWithTimeout，
-// 让测试不必自行构造关停预算。生产退出路径（main.go 的关停链）一律走
-// ShutdownWithTimeout(剩余预算)，本方法在生产代码中无调用点。
-func (l *runtimeLifecycle) Shutdown() { l.ShutdownWithTimeout(acmeStopSegmentMax) }
-
-// ShutdownWithTimeout 与 Shutdown 同语义，同步段与 ACME 收尾段的等待都由
+// ShutdownWithTimeout 关停证书/同步两域：同步段与 ACME 收尾段的等待都由
 // 调用方给的关停预算派生（进程退出路径传剩余预算）。stopped 门与幂等语义不变。
+// 生产退出路径一律传预算调用本方法；固定预算的测试辅助在
+// runtime_lifecycle_test.go（shutdownForTest），产品文件不承载 test-only 入口。
 func (l *runtimeLifecycle) ShutdownWithTimeout(timeout time.Duration) {
 	l.mu.Lock()
 	if l.stopped {

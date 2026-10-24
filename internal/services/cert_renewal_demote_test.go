@@ -65,6 +65,10 @@ func TestCertRenewalScan_demoteMidLoopLandsSkipped(t *testing.T) {
 	t.Cleanup(func() { certRenewalRoleRecheckHook = oldHook })
 
 	resetCertificateServiceForTest(t)
+	// 单例隔离：InitCAQueueManager 由 sync.Once 守卫，缺 Reset 时本用例注入的
+	// no-op reloader 会泄漏到后续用例（后续 Init(真实 reloader) 静默变 no-op）。
+	ResetCAQueueManagerForTest()
+	t.Cleanup(ResetCAQueueManagerForTest)
 	InitCAQueueManager(func() error { return nil })
 	err := NewCertificateService().renewExpiringCertificates()
 

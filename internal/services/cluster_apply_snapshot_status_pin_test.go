@@ -8,7 +8,11 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+
+	"lazy-balancer-v2/internal/config"
 )
 
 func TestClusterApply_normalizesSnapshotActiveUpdateStatus(t *testing.T) {
@@ -60,9 +64,26 @@ func TestClusterApply_normalizesSnapshotActiveUpdateStatus(t *testing.T) {
 	if err := database.QueryRow(`SELECT COALESCE(cluster_version,0) FROM global_config WHERE id=1`).Scan(&versionBefore); err != nil {
 		t.Fatalf("read cluster_version: %v", err)
 	}
+	// 断言要有区分力：仅比较「apply 前后」在版本记账恒写 snapshot.Version 时
+	// 是恒等式（snapshot.Version 就是本地读出的值）。先把本地版本推到哨兵值
+	// （快照版本之后），apply 必须把它拉回 snapshot.Version——归一若额外推进
+	// 版本、或版本记账被移除/后移，这里必然不等。
+	sentinelVersion := versionBefore + 100
+	if _, err := database.Exec(`UPDATE global_config SET cluster_version=? WHERE id=1`, sentinelVersion); err != nil {
+		t.Fatalf("seed sentinel cluster_version: %v", err)
+	}
+	if snapshot.Version == sentinelVersion {
+		t.Fatalf("夹具前提不成立：快照版本与哨兵值相同（%d）", sentinelVersion)
+	}
 
-	// When
-	if err := replaceSnapshotDB(context.Background(), database, snapshot); err != nil {
+	// When：走生产入口 applySnapshot（版本记账与归一在同一事务内；
+	// 只调 replaceSnapshotTx 不会覆盖 cluster_version，断言会失去区分力）。
+	caddyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer caddyServer.Close()
+	syncService := NewSyncService(database, &config.Config{DataDir: t.TempDir(), CaddyAdminURL: caddyServer.URL}, NewCaddyService(caddyServer.URL))
+	if err := syncService.applySnapshot(context.Background(), snapshot); err != nil {
 		t.Fatalf("apply snapshot: %v", err)
 	}
 
@@ -82,13 +103,14 @@ func TestClusterApply_normalizesSnapshotActiveUpdateStatus(t *testing.T) {
 	assertNormalized(`SELECT update_status, message FROM security_crs_version WHERE id=1`)
 	assertNormalized(`SELECT update_status, message FROM security_ip2region_version WHERE id=1`)
 
-	// 归一属于「展示态修正」而非语义变更：不得 bump 集群版本。
+	// 归一属于「展示态修正」而非语义变更：版本只按快照版本记账一次，
+	// 不得被归一路径额外推进。
 	var versionAfter int
 	if err := database.QueryRow(`SELECT COALESCE(cluster_version,0) FROM global_config WHERE id=1`).Scan(&versionAfter); err != nil {
 		t.Fatalf("read cluster_version: %v", err)
 	}
-	if versionAfter != versionBefore {
-		t.Fatalf("cluster_version=%d，want %d（活动态归一不得 bump 版本）", versionAfter, versionBefore)
+	if versionAfter != snapshot.Version {
+		t.Fatalf("cluster_version=%d，want %d（活动态归一不得额外 bump 版本）", versionAfter, snapshot.Version)
 	}
 }
 
@@ -115,8 +137,14 @@ func TestClusterApply_preservesSnapshotTerminalUpdateStatus(t *testing.T) {
 		t.Fatalf("diverge local crs row: %v", err)
 	}
 
-	// When
-	if err := replaceSnapshotDB(context.Background(), database, snapshot); err != nil {
+	// When：走生产入口 applySnapshot（版本记账与归一在同一事务内；
+	// 只调 replaceSnapshotTx 不会覆盖 cluster_version，断言会失去区分力）。
+	caddyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer caddyServer.Close()
+	syncService := NewSyncService(database, &config.Config{DataDir: t.TempDir(), CaddyAdminURL: caddyServer.URL}, NewCaddyService(caddyServer.URL))
+	if err := syncService.applySnapshot(context.Background(), snapshot); err != nil {
 		t.Fatalf("apply snapshot: %v", err)
 	}
 

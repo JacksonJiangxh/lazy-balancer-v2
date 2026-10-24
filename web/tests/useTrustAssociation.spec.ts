@@ -522,3 +522,117 @@ test('复用路径：确认后目标已被并发关联——不重复写 refs，
   assert.deepEqual(posts, [{ url: '/security/ip-lists/77/ips', body: { value: '203.0.113.9' } }])
   assert.deepEqual(puts, [], '最新 refs 已含目标列表时不得再写（无变化写会覆盖并发状态）')
 })
+
+// —— added 反馈口径（与 useIpListAdd 同源）——
+// 后端对「条目已存在且生效中」返回 added=false 且全程无写入
+// （securityiplists.go 该分支 rollback 后直接返回）。此时若照旧提示
+// 「已加入列表」，用户会以为刚完成一次拦截/放行处置。
+
+test('复用路径：IP 已在列表中（added=false）且已关联——如实提示存在，不报成功', async () => {
+  const { posts, puts } = reset()
+  g.__get = async () => ({ data: { policy: { ip_acl_list_refs: '[]', ip_whitelist_refs: '[77]' } } })
+  g.__post = async (url: string, body?: unknown) => {
+    posts.push({ url, body })
+    return { data: { added: false } }
+  }
+  const existing = [...lists, { id: 77, name: '策略 A-信任', ref_policies: [] }]
+  let changed = 0
+  const { ensureListAndJoin } = useTrustAssociation({
+    getList: () => existing,
+    onChanged: () => {
+      changed += 1
+    },
+  })
+  await ensureListAndJoin({ id: 5, name: '策略 A', ip_whitelist_refs: '' }, '203.0.113.9', 'trust')
+
+  assert.deepEqual(posts, [{ url: '/security/ip-lists/77/ips', body: { value: '203.0.113.9' } }])
+  assert.deepEqual(puts, [], '已关联时不得再写 refs')
+  assert.equal(callsOf('mfaAwareSuccess').length, 0, '零写入不得报成功')
+  assert.equal(callsOf('showSaveResult').length, 0)
+  const infos = callsOf('ElMessage.info')
+  assert.equal(infos.length, 1, '必须给出「已存在」的事实说明')
+  assert.match(String(infos[0].arg), /该 IP 已在列表「策略 A-信任」中/)
+  assert.equal(changed, 1, '列表可见状态仍须刷新（entry_count 可能已过期）')
+})
+
+test('复用路径：IP 已在列表中但本次补了关联——按关联口径反馈，不声称加入了条目', async () => {
+  const { posts, puts } = reset()
+  g.__post = async (url: string, body?: unknown) => {
+    posts.push({ url, body })
+    return { data: { added: false } }
+  }
+  const existing = [...lists, { id: 77, name: '策略 A-信任', ref_policies: [] }]
+  const { ensureListAndJoin } = useTrustAssociation({ getList: () => existing })
+  await ensureListAndJoin({ id: 5, name: '策略 A', ip_whitelist_refs: '' }, '203.0.113.9', 'trust')
+
+  assert.deepEqual(posts, [{ url: '/security/ip-lists/77/ips', body: { value: '203.0.113.9' } }])
+  assert.deepEqual(puts, [{ url: '/security/policies/5', body: { ip_whitelist_refs: '[77]' } }], '关联确为一次写入')
+  assert.equal(callsOf('ElMessage.info').length, 0, '本次确有写入，不能只报「已存在」')
+  const saves = callsOf('mfaAwareSuccess')
+  assert.equal(saves.length, 1)
+  assert.match(String(saves[0].arg), /已关联既有「策略 A-信任」/)
+  assert.match(String(saves[0].arg), /未重复添加/, '须说明条目未重复写入')
+})
+
+// ── 三条边界路径（此前零覆盖）──
+// 名单名尝试次数耗尽、创建响应缺 id、移除动作取消。前两条是用户可见的错误
+// 提示分支，第三条是占位释放与「取消无副作用」的契约。
+
+test('自动名 20 次尝试全被占用：回退策略限定名，不无限递增也不抛错', async () => {
+  const { posts, puts } = reset()
+  // 自动名「策略 A-信任」与全部 20 个限定名都被占用（用户自建同名名单的极少数情形）
+  const taken = ['策略 A-信任']
+  for (let attempt = 1; attempt <= 20; attempt++) {
+    taken.push(attempt === 1 ? '策略 A-信任#5' : `策略 A-信任#5-${attempt}`)
+  }
+  const existing = taken.map((name, index) => ({ id: 100 + index, name }))
+  const { ensureListAndJoin } = useTrustAssociation({ getList: () => existing })
+  await ensureListAndJoin({ id: 5, name: '策略 A', ip_whitelist_refs: '' }, '203.0.113.9', 'trust')
+
+  assert.equal(posts.length, 1, '必须发起一次创建')
+  assert.equal(puts.length, 1, '创建成功后必须补一次关联')
+  assert.equal(
+    assertCreatedListName(posts[0]),
+    '策略 A-信任#5',
+    '尝试耗尽后回退首个限定名（不再递增，交由后端 409 显性失败）',
+  )
+  assert.equal(callsOf('ElMessage.error').length, 0, '回退不是异常，不得附带错误提示')
+})
+
+test('创建响应缺 id：报「创建响应异常」且不再发关联请求', async () => {
+  const { posts, puts } = reset()
+  g.__post = async (url: string, body?: unknown) => {
+    posts.push({ url, body })
+    if (url === '/security/ip-lists') return { data: {} }
+    throw new Error(`unexpected POST ${url}`)
+  }
+  const { creating, ensureListAndJoin } = useTrustAssociation({ getList: () => lists })
+  await ensureListAndJoin({ id: 5, name: '策略 A', ip_whitelist_refs: '' }, '203.0.113.9', 'trust')
+
+  assert.deepEqual(puts, [], '没有名单 id 时不得写入 refs（会往引用里塞 undefined）')
+  const errors = callsOf('ElMessage.error')
+  assert.equal(errors.length, 1, '必须显性报错，不能静默中断')
+  assert.match(String(errors[0].arg), /创建响应异常/)
+  assert.equal(callsOf('mfaAwareSuccess').length, 0, '失败不得声称成功')
+  assert.equal(creating.value, false, '占位必须释放')
+})
+
+test('移除动作取消：不发请求、不刷新、释放占位（取消无副作用）', async () => {
+  const { posts } = reset()
+  g.__confirm = async () => {
+    throw new Error('cancel')
+  }
+  let changed = 0
+  const { creating, removeFromSideRef } = useTrustAssociation({
+    getList: () => lists,
+    onChanged: () => {
+      changed += 1
+    },
+  })
+  await removeFromSideRef({ id: 3, name: '办公网段' }, '203.0.113.9')
+
+  assert.deepEqual(posts, [], '取消不得调用 remove-ip')
+  assert.equal(callsOf('ElMessage.success').length, 0)
+  assert.equal(changed, 0, '取消不触发列表刷新')
+  assert.equal(creating.value, false, '占位必须在取消路径释放（否则按钮永久灰死）')
+})

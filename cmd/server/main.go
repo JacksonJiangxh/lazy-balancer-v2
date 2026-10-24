@@ -34,9 +34,27 @@ import (
 // 版本经 config(APP_VERSION env / Dockerfile ARG 兜底)进入 cfg.Version——
 // 启动日志与 branding API 同源(此前独立 ldflags 变量无注入链,恒 "dev")。
 
+// startupError 标记「服务尚未开始监听」的启动期失败（库初始化、集群触发器
+// 就绪门、管理 TLS 证书解析与监听绑定）。main 据此与运行期崩溃（serve 中途
+// 中止）分判文案——把启动失败记成「HTTP server stopped unexpectedly」会让
+// 运维去查 OOM/崩溃，而真实原因通常是挂载权限、库损坏或证书口令错。
+type startupError struct{ err error }
+
+func (e *startupError) Error() string { return e.err.Error() }
+
+func (e *startupError) Unwrap() error { return e.err }
+
+// startupFailed 包装启动期失败（仅用于「尚未开始监听」的返回点）。
+func startupFailed(err error) error { return &startupError{err: err} }
+
 func main() {
 	if err := run(); err != nil {
-		services.Logf("error", "HTTP server stopped unexpectedly: %v", err)
+		var startupFailure *startupError
+		if errors.As(err, &startupFailure) {
+			services.Logf("error", "startup failed: %v", startupFailure.err)
+		} else {
+			services.Logf("error", "HTTP server stopped unexpectedly: %v", err)
+		}
 		os.Exit(1)
 	}
 }
@@ -83,7 +101,7 @@ func run() error {
 
 	// Initialize database（前置设施——非任务，不入 task_runs）
 	if err := db.Initialize(cfg.DataDir); err != nil {
-		return fmt.Errorf("initialize database: %w", err)
+		return startupFailed(fmt.Errorf("initialize database: %w", err))
 	}
 	defer func() {
 		if err := db.Close(); err != nil {
@@ -129,7 +147,7 @@ func run() error {
 	// 永不传播，任务日志全绿。触发器是同步正确性的结构性前提，安装失败即拒绝
 	// 启动（容器重启策略接管），不得带病运行。
 	if err := middleware.InstallClusterVersionTriggers(db.GetDB()); err != nil {
-		return fmt.Errorf("install cluster version triggers before task engine start: %w", err)
+		return startupFailed(fmt.Errorf("install cluster version triggers before task engine start: %w", err))
 	}
 
 	var tz string
@@ -380,7 +398,14 @@ func run() error {
 	log.Printf("Starting lazy-balancer-v2 %s on %s", cfg.Version, addr)
 	server := newAdminHTTPServer(addr, router)
 
-	tlsCfg := services.LoadAdminTLSConfig()
+	// 监听协议必须走严格读取变体：宽容版在库读取失败时回退 Enabled=false，
+	// 本进程会以明文 HTTP 在同一端口提供登录与 API（无跳转、无拒绝），把
+	// 「配置读不到」静默变成「未启用 HTTPS」的安全属性丢失。读失败即拒绝
+	// 启动（与 ResolveCertificate 失败同口径），由编排层重试；不得降级监听。
+	tlsCfg, tlsErr := startupAdminTLSConfig()
+	if tlsErr != nil {
+		return startupFailed(tlsErr)
+	}
 	services.RecordRuntimeAdminTLS(tlsCfg)
 	serverErrors := make(chan error, 1)
 	// 启动窗口内已收到退出信号——不再开监听，直接走正常关停收尾
@@ -398,7 +423,7 @@ func run() error {
 	if tlsCfg.Enabled {
 		cert, err := tlsCfg.ResolveCertificate(cfg.DataDir)
 		if err != nil {
-			return fmt.Errorf("管理面板 HTTPS 启用失败: %w", err)
+			return startupFailed(fmt.Errorf("管理面板 HTTPS 启用失败: %w", err))
 		}
 		log.Printf("管理面板 HTTPS 监听 %s（证书来源：%s，HTTP 明文请求 302 跳转）", addr, tlsCfg.Mode)
 		server.TLSConfig = &tls.Config{
@@ -407,11 +432,17 @@ func run() error {
 		}
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
-			return fmt.Errorf("HTTPS 监听失败: %w", err)
+			return startupFailed(fmt.Errorf("HTTPS 监听失败: %w", err))
 		}
 		go func() { serverErrors <- server.ServeTLS(newHTTPRedirectMux(ln), "", "") }()
 	} else {
-		go func() { serverErrors <- server.ListenAndServe() }()
+		// 显式 Listen 再 Serve（等价 ListenAndServe）：绑定失败属启动期失败
+		// （服务从未开始监听），必须能与运行期 serve 中止分判。
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			return startupFailed(fmt.Errorf("HTTP 监听失败: %w", err))
+		}
+		go func() { serverErrors <- server.Serve(ln) }()
 	}
 
 	serverErr := waitForServerStop(server, serverStopSignals{quit: quit, restart: restart, serverErrors: serverErrors, caddyAdminURL: cfg.CaddyAdminURL, budget: shutdown})
@@ -419,6 +450,18 @@ func run() error {
 		return fmt.Errorf("serve HTTP: %w", serverErr)
 	}
 	return nil
+}
+
+// startupAdminTLSConfig 读取管理面板 HTTPS 配置用于启动监听。读失败必须
+// 返回 error（run 据此拒绝启动）：宽容 loader 的回退值 Enabled=false 会让本
+// 进程以明文 HTTP 提供管理面，而从外部看只是「HTTPS 关闭」，不构成可接受的
+// 降级。独立成函数以便钉住该判定。
+func startupAdminTLSConfig() (services.AdminTLSConfig, error) {
+	cfg, err := services.LoadAdminTLSConfigE()
+	if err != nil {
+		return services.AdminTLSConfig{}, fmt.Errorf("读取管理面板 HTTPS 配置失败，拒绝以明文方式监听管理端口（请检查数据库可用性后重启）: %w", err)
+	}
+	return cfg, nil
 }
 
 // startupTimezone 读取启动期进程时区（global_config.id=1）。
@@ -757,7 +800,13 @@ var caddyPauseFilePath = caddyPauseFileDefaultPath
 // 清残兜底（docker-entrypoint.sh）；非容器部署下次 startCaddy
 // 亦会删标记。此处粘滞因此安全。
 func writeDrainPauseFile() {
-	if _, err := os.Stat(caddyPauseFilePath); err == nil {
+	if info, err := os.Stat(caddyPauseFilePath); err == nil {
+		// 同名目录占据标记路径时 Stat 也成功——静默当作「已存在」会让
+		// supervisor 按崩溃重拉（伪 CRASHES）且 app 侧零线索。留痕后照常返回
+		// （写入必然失败，且这不是本函数能自愈的带外状态）。
+		if info.IsDir() {
+			services.Logf("warn", "Caddy pause 标记路径 %s 被同名目录占据（监督器将按崩溃重拉，需人工清理）", caddyPauseFilePath)
+		}
 		return
 	}
 	// 写失败必须可见：pause 语义失效时监督器按崩溃重拉（排水窗口内抢绑
@@ -790,6 +839,11 @@ func drainCaddy(adminURL string, timeout time.Duration) {
 		services.Logf("info", "Caddy 排水请求未达（可能已停止）: %v", err)
 		return
 	}
+	// 非 2xx 必须留痕：admin 半死（返回 500）时此前零日志，pause 标记又照留，
+	// 排障时无法从 app 侧判断 Caddy 是否真的收到 /stop。仍按 best-effort 返回。
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		services.Logf("info", "Caddy 排水请求被拒（status=%d），Caddy 可能未执行优雅关停", resp.StatusCode)
+	}
 	_ = resp.Body.Close()
 }
 
@@ -805,6 +859,11 @@ type tzLogWriter struct {
 // 前缀与正文分两次写时，跨阈值的那一行会被拆进两个文件（旧文件尾部只剩裸
 // 时间戳、新文件首行没有时间戳）——按行首解析的日志采集与取证因此错位。
 // 拼接缓冲取自 sync.Pool，避免每行新分配（日志密集时每秒数百行）。
+//
+// 短写（底层 n<len(line) 且 err==nil）不重试、不留痕：当前唯一下游
+// RotatingFileWriter 直写 *os.File，短写不出现；未来接入缓冲/io.Copy 形态时
+// 必须先在此显式处理短写（否则整行被静默截断，且本函数按契约返回 len(p)
+// 会让上游以为写成功）。
 func (t *tzLogWriter) Write(p []byte) (int, error) {
 	prefix := time.Now().In(services.CurrentLocation()).Format("2006/01/02 15:04:05 ")
 	buffer := logLineBufferPool.Get().(*[]byte)

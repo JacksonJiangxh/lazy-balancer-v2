@@ -212,7 +212,7 @@
               <template #default="{ row }">
                 <el-tooltip v-if="row.ref_policies.length > 0 || row.trusted_proxy_referenced" placement="top" popper-class="ip-list-refs-popper" :popper-options="popperViewportSafe">
                   <template #content>
-                    <div v-for="p in row.ref_policies" :key="p.id">{{ p.name }}</div>
+                    <div v-for="p in row.ref_policies" :key="p.id">{{ p.name }}<template v-if="!p.enabled">（已禁用，不阻止删除）</template></div>
                     <div v-if="row.trusted_proxy_referenced">{{ row.trusted_proxy_scope || '受信代理网段' }}</div>
                   </template>
                   <span>{{ row.ref_count }}</span>
@@ -425,7 +425,7 @@
               </div>
             </div>
             <input ref="importEntriesInput" type="file" accept=".txt,.csv" class="entries-import-input" @change="onImportEntriesFileChange" />
-            <div class="form-tip-line">每条支持单 IP 或 CIDR（如 10.0.0.1、2001:db8::/32）；每个列表最多 {{ IP_LIST_MAX_ENTRIES }} 条，全站列表总数上限 200 个，格式错误的行以红色标出；导入支持 .txt/.csv（每行一条：IP/CIDR + 可选备注，逗号或空白分隔）</div>
+            <div class="form-tip-line">每条支持单 IP 或 CIDR（如 10.0.0.1、2001:db8::/32）；每个列表最多 {{ IP_LIST_MAX_ENTRIES }} 条（已到期条目不计入），用户创建的名单最多 200 个（内置名单不占额度），格式错误的行以红色标出；导入支持 .txt/.csv（每行一条：IP/CIDR + 可选备注，逗号或空白分隔）</div>
           </div>
         </el-form-item>
       </el-form>
@@ -941,8 +941,9 @@ interface CustomRuleCondition { target: string; operator: string; pattern: strin
 interface CustomRule { id: number; name: string; description: string; conditions: CustomRuleCondition[]; action: string; score: number; enabled: boolean; updated_at: string; updated_by: number }
 // 自动封禁名单条目携带加入时间/到期时间（UTC 墙钟串，formatDate 消费）
 interface IPListEntry { value: string; remark: string; created_at?: string; expires_at?: string }
-interface IPListRefPolicy { id: number; name: string }
-interface IPListRow { id: number; name: string; description: string; category: string; entries: IPListEntry[]; entry_count: number; ref_count: number; ref_policies: IPListRefPolicy[]; trusted_proxy_referenced?: boolean; trusted_proxy_scope?: string; created_by: number; created_at: string; updated_by: number; updated_at: string; system: boolean; preset_autoban?: boolean }
+// enabled=引用策略的启用态：禁用策略的引用只作展示（不阻止删除，409 门只计启用）
+interface IPListRefPolicy { id: number; name: string; enabled: boolean }
+interface IPListRow { id: number; name: string; description: string; category: string; entries: IPListEntry[]; entry_count: number; ref_count: number; ref_count_enabled?: number; ref_policies: IPListRefPolicy[]; trusted_proxy_referenced?: boolean; trusted_proxy_scope?: string; created_by: number; created_at: string; updated_by: number; updated_at: string; system: boolean; preset_autoban?: boolean }
 interface CRSUpdateInfo { readonly status: string; readonly trigger: string; readonly started_at: string; readonly finished_at: string; readonly message: string; readonly version: string }
 interface IP2RegionUpdateInfo { readonly status: string; readonly trigger: string; readonly started_at: string; readonly finished_at: string; readonly message: string; readonly version: string }
 interface ThreatUpdateInfo { running: boolean; trigger: string; started_at: string; finished_at: string; outcome: string }
@@ -1190,7 +1191,12 @@ const saveIpList = async () => {
   }
   // 允许空列表保存（用户裁定）：后端 validateIPListShape 不要求非空；
   // allow 模式策略引用的清空由后端守卫 409 拦截（fail-open 防护）
-  if (entries.length > IP_LIST_MAX_ENTRIES) { ElMessage.warning(`每个列表最多 ${IP_LIST_MAX_ENTRIES} 条条目`); return }
+  // 上限按**生效**条目计（与后端 validateIPListShape 及手动追加上限同口径）：
+  // 已到期条目不渲染、保存时由后端剔除，若按原始条数计，自动封禁关闭后滞留
+  // 的到期条目会把整表保存顶到上限（用户只能逐行删除）。
+  const expiredEntryCount = entries.filter((e) => !!e.expires_at && autobanEntryExpired(e.expires_at)).length
+  const activeEntryCount = entries.length - expiredEntryCount
+  if (activeEntryCount > IP_LIST_MAX_ENTRIES) { ElMessage.warning(`每个列表最多 ${IP_LIST_MAX_ENTRIES} 条生效条目（已到期条目不计入，当前 ${activeEntryCount} 条）`); return }
   // 已有名单 + 0 条：全量 PUT 会清空——必须二次确认且文案明示
   if (needsEmptyListConfirm(editingIpListId.value, entries.length)) {
     try {
@@ -1198,8 +1204,9 @@ const saveIpList = async () => {
     } catch { return }
   }
   const action = editingIpListId.value ? '保存' : '创建'
+  const expiredNote = expiredEntryCount > 0 ? `，其中 ${expiredEntryCount} 条已到期（保存后自动移除）` : ''
   try {
-    await ElMessageBox.confirm(`确定${action} IP 地址列表「${name}」（${entries.length} 条条目）？`, '确认', { type: 'warning' })
+    await ElMessageBox.confirm(`确定${action} IP 地址列表「${name}」（${entries.length} 条条目${expiredNote}）？`, '确认', { type: 'warning' })
   } catch { return }
   savingIpList.value = true
   try {

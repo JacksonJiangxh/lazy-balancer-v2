@@ -186,6 +186,11 @@ type registration struct {
 	schedFailStreak        int
 	schedRetryAfter        time.Time
 	schedBackoffLastWarnAt time.Time
+	// schedStopReason 引擎自行停调的来源标记（ScheduleStopReason*）：
+	// 停调时 loopEnabled=false，与用户主动停止同形——监控视图据此把「引擎
+	// 停调」与「用户停止」分开呈现，并指向可执行的恢复入口。恢复调度
+	// （resetScheduleProgressLocked）即清空。
+	schedStopReason string
 	// schedDoneSlot 已消费的排程槽：同一槽值只执行一次（success 落定后
 	// 业务未把槽推进到未来，或用户在任务监控显式取消**自动轮**的**已到期**
 	// 槽——取消=显式放弃本槽）。tick 与 admission 的到期判定要求
@@ -246,9 +251,14 @@ type Options struct {
 	// 作用域边界（有意设计）：暂停只覆盖 tick 投递与 Trigger/RunSync/runNow
 	// 登记，**不覆盖常驻族**——Daemon 的 StartLoop→tryStartDaemon 照常拉起
 	// （常驻 Run 体起步即真实接管服务，如 cert-issuance→StartACME→部署重试）。
-	// 因此「装配期不跑业务」对常驻族由装配方的配置屏障承担
+	// 因此「装配期不写部署面」由装配方的配置屏障承担
 	// （services.InitTaskEngine 在默认启动前 BeginConfigImportHold，BootSync
-	// 完成后 EndConfigImportHold）；不得把常驻启停并入 schedPaused。
+	// 完成后 EndConfigImportHold）。屏障的**实际覆盖范围只有部署面**（证书
+	// 签发 lifecycle / CA 队列 / 证书部署重试，见 services.startCertIssuance
+	// Lifecycle 与 caqueue 的 configImportHoldActive 门）：security-events-
+	// ingestion（只读尾读）与 cluster-sync 仍在 BootSync 前启动，行为与引入
+	// 屏障前一致，其终态由各自快照应用/巡检收敛。不得把常驻启停并入
+	// schedPaused。
 	StartPaused bool
 }
 
@@ -568,12 +578,6 @@ func (e *Engine) tryStartDaemon(r *registration, restartIntent bool) {
 }
 
 func (e *Engine) Register(d Descriptor) error {
-	// 已停止的引擎不会再有调度 goroutine 判活：注册成功只会得到「已注册但
-	// 永不被调度」的静默形态（StartLoop 对 stopped 恒 no-op）。响亮拒绝，
-	// 装配方须显式新建引擎。
-	if e.stopped.Load() {
-		return ErrEngineStopped
-	}
 	if d.ID == "" || d.Family == "" {
 		return errors.New("taskengine: ID/Family 必填")
 	}
@@ -650,6 +654,13 @@ func (e *Engine) Register(d Descriptor) error {
 	// 未置 Cancelable 的 CancelHook 永不触达，注册期响亮拒绝。
 	if d.CancelHook != nil && !d.Cancelable {
 		return fmt.Errorf("taskengine: %s 声明 CancelHook 但未置 Cancelable（CancelHook 永不可达，静默忽略）", d.ID)
+	}
+	// 已停止的引擎不会再有调度 goroutine 判活：注册成功只会得到「已注册但
+	// 永不被调度」的静默形态（StartLoop 对 stopped 恒 no-op）。响亮拒绝，
+	// 装配方须显式新建引擎。门排在描述符校验之后：停止态下传入非法描述符时
+	// 先报真正缺失的字段（排障指向正确），合法描述符仍被 ErrEngineStopped 拒绝。
+	if e.stopped.Load() {
+		return ErrEngineStopped
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -992,6 +1003,7 @@ func (e *Engine) RearmLoop(id string, hasWork ...bool) {
 		return
 	}
 	r.mu.Lock()
+	wasOn := r.loopEnabled
 	if bypassStop {
 		r.loopEnabled = true
 		// 新工作唤醒=显式恢复调度：仅在自愈已用尽时重置预算（普通唤醒
@@ -1000,13 +1012,20 @@ func (e *Engine) RearmLoop(id string, hasWork ...bool) {
 			r.abnormalRestarts = 0
 			r.restartExhausted = false
 		}
-		// 越过「已停止」=重新接受本任务的预约：与 StartLoop 的关→开过渡
-		// 同口径清空 Scheduled 槽消费水位/失败退避/求值节拍。缺这一步时，
-		// 停止前 schedDoneSlot 已等于当前 due 槽（成功落定未推进槽/用户取消
-		// 已到期槽）的任务重开后 tick 的到期判定恒拒绝同一槽——loop_on=true
-		// 却零投递、零 task_runs 行（静默停摆，只能靠重启恢复）。非 Scheduled
-		// 由 resetScheduleProgressLocked 内建 guard 零动作。
-		resetScheduleProgressLocked(r)
+		if !wasOn {
+			// 越过「已停止」=重新接受本任务的预约：与 StartLoop 的关→开
+			// 过渡同口径清空 Scheduled 槽消费水位/失败退避/求值节拍。缺这一步
+			// 时，停止前 schedDoneSlot 已等于当前 due 槽（成功落定未推进槽/
+			// 用户取消已到期槽）的任务重开后 tick 的到期判定恒拒绝同一槽——
+			// loop_on=true 却零投递、零 task_runs 行（静默停摆，只能靠重启
+			// 恢复）。非 Scheduled 由 resetScheduleProgressLocked 内建 guard
+			// 零动作。
+			//
+			// 只在「已停止→开启」过渡复位：已开启任务的普通唤醒（hasWork）
+			// 不得清空已消费水位——否则同一过期槽被重新视为到期，整轮业务
+			// 重复执行（全量下载/整包备份）。
+			resetScheduleProgressLocked(r)
+		}
 	} else if !r.loopEnabled {
 		r.mu.Unlock()
 		return
@@ -1044,7 +1063,8 @@ func (e *Engine) ResetScheduleProgress(id string) {
 }
 
 // resetScheduleProgressLocked 清空 Scheduled 槽缓存/消费水位/退避与求值节拍
-// （调用方持 r.mu）：下一次 tick 重新求值槽，业务预约成为唯一事实。
+// （调用方持 r.mu）：下一次 tick 重新求值槽，业务预约成为唯一事实。引擎停调
+// 来源标记随复位清空——调度重新开启/重排槽即不再有「停调」可言。
 func resetScheduleProgressLocked(r *registration) {
 	if r.desc.Kind != KindScheduled {
 		return
@@ -1054,6 +1074,7 @@ func resetScheduleProgressLocked(r *registration) {
 	r.schedSlotEvalAt = time.Time{}
 	r.schedFailStreak = 0
 	r.schedRetryAfter = time.Time{}
+	r.schedStopReason = ""
 }
 
 func (e *Engine) StopLoop(id string) {
@@ -1683,8 +1704,17 @@ func (e *Engine) executeRun(res *runReservation, id, trigger, operator string) (
 			// 到期前失败）不在退避范围——未来槽本来就不会被 tick 重投，
 			// 写「退避后重投」告警是失实信号，且会无谓消耗 streak/5 分钟
 			// 告警地板。判据与成功消费分支同口径（槽已到期）。
-			r.schedFailStreak++
-			delay := scheduledFailBackoff(r.schedFailStreak)
+			//
+			// 只有自动轮消耗停调预算（streak）：手动触发轮由用户显式发起、
+			// 次数天然有界，不得因几次手动失败让自动排程提前停摆。手动失败
+			// 仍沿用当前档位的退避节流（防手动连点把 tick 打进重投风暴），
+			// 但不推进 streak、不触发停调。
+			auto := trigger == "auto"
+			if auto {
+				r.schedFailStreak++
+			}
+			streak := r.schedFailStreak
+			delay := scheduledFailBackoff(streak)
 			r.schedRetryAfter = time.Now().Add(delay)
 			outcome := map[bool]string{true: "失败", false: "跳过"}[status == "failed"]
 			// 连续失败/跳过留 WARN 行（节流：非首轮至多每分钟一条——兜底
@@ -1694,25 +1724,30 @@ func (e *Engine) executeRun(res *runReservation, id, trigger, operator string) (
 			// 「成功(新槽)/失败」形态每轮都是 streak==1，无地板可 1 条/s；
 			// 长静默后的首次失败距上次 WARN 远超地板，可见性不变。
 			warnDue := time.Since(r.schedBackoffLastWarnAt) >= time.Minute
-			if r.schedFailStreak == 1 {
+			if streak == 1 {
 				warnDue = time.Since(r.schedBackoffLastWarnAt) >= scheduledBackoffFirstWarnFloor
 			}
 			if warnDue {
 				r.schedBackoffLastWarnAt = time.Now()
-				taskLogAppend(id, fmt.Sprintf("[warn] 排程槽未推进且本轮%s，退避 %s 后重投（连续 %d 轮；业务 Run 早退须推进槽，见任务引擎标准）", outcome, delay, r.schedFailStreak))
+				if auto {
+					taskLogAppend(id, fmt.Sprintf("[warn] 排程槽未推进且本轮%s，退避 %s 后重投（连续 %d 轮；业务 Run 早退须推进槽，见任务引擎标准）", outcome, delay, streak))
+				} else {
+					taskLogAppend(id, fmt.Sprintf("[warn] 排程槽未推进且本轮手动%s，退避 %s 后重投（手动轮不计入自动停调预算）", outcome, delay))
+				}
 			}
-			if trigger == "auto" && r.schedFailStreak >= scheduledFailStreakStopLimit {
+			if auto && streak >= scheduledFailStreakStopLimit {
 				// 与常驻族「重拉预算用尽即停调」对称的终点：退避只节流不定界，
 				// 业务永不推进槽的缺陷形态下 task_runs 会以 30s 节拍无限增长
 				// （≈2880 行/日，保留期内单任务数十万行）并把 24h 失败计数放大
 				// 到失真。连续 N 轮（含首轮）仍未推进槽=调度侧已无可为，停调
 				// 并留痕；StartLoop 关→开（或业务推进槽后重开）即恢复。
-				// 只对自动轮生效：手动触发轮由用户显式发起、次数天然有界，
-				// 不得因几次手动失败让自动排程静默停摆。
+				// 停调来源机器可读（schedStopReason）：与用户主动停止同形
+				// （loopEnabled=false），视图据此区分来源并指向恢复入口。
 				r.loopEnabled = false
 				r.schedFailStreak = 0
 				r.schedRetryAfter = time.Time{}
-				taskLogAppend(id, fmt.Sprintf("[error] 排程槽连续 %d 轮未推进且本轮%s，已停止该任务调度（需业务推进槽或重开调度）", scheduledFailStreakStopLimit, outcome))
+				r.schedStopReason = ScheduleStopReasonFailStreak
+				taskLogAppend(id, fmt.Sprintf("[error] 排程槽连续 %d 轮未推进且本轮%s，已停止该任务调度（修复失败原因后重新开启调度：任务页调度开关或对应业务页「自动更新」保存一次；重启进程同样恢复）", scheduledFailStreakStopLimit, outcome))
 			}
 		default:
 			r.schedFailStreak = 0
@@ -1793,6 +1828,10 @@ func slotDueForBackoff(nextSlot, prevSlot time.Time, now time.Time) bool {
 // 无限增长并失真 24h 统计。停调可被 StartLoop 关→开显式恢复
 // （resetScheduleProgressLocked 清 streak），不构成不可恢复状态。
 const scheduledFailStreakStopLimit = 4
+
+// ScheduleStopReasonFailStreak 是 Scheduled 引擎停调的来源标记值（任务视图
+// schedule_stopped_reason 字段）：连续 N 轮自动轮未推进槽且失败/跳过。
+const ScheduleStopReasonFailStreak = "fail-streak"
 
 // scheduledFailBackoff Scheduled「槽未推进+失败」退避表（与常驻重拉
 // defaultDaemonRestartDelays 同形 1s/5s/30s，第 3 次起封顶 30s）——节流
@@ -2473,7 +2512,11 @@ type TaskMeta struct {
 	// RestartExhausted：Daemon 自愈预算用尽且已停止调度（此时 LoopOn=false，
 	// 与用户主动停止同形——监控据此把永久停摆呈现为 failed）。
 	RestartExhausted bool `json:"restart_exhausted,omitempty"`
-	CanTrigger       bool `json:"can_trigger"`
+	// ScheduleStoppedReason 引擎自行停止调度（Scheduled）的来源标记，空=非
+	// 引擎停调（用户在调度开关显式停止，或调度仍在开启）。与用户停止同形时
+	// 视图据此区分停摆来源并给出恢复入口。
+	ScheduleStoppedReason string `json:"schedule_stopped_reason,omitempty"`
+	CanTrigger            bool   `json:"can_trigger"`
 	// RoleApplicable 本节点角色是否允许该任务运行（RunsOn 派生的只读结论）。
 	// 从节点上 master-only 族的 LoopOn/NextSlot 仍是主节点语义的值，视图
 	// 据此标注「仅主节点运行」并解释调度开关不可用——不暴露原始角色取值。
@@ -2490,9 +2533,9 @@ func (e *Engine) Lookup(id string) (TaskMeta, bool) {
 		return TaskMeta{}, false
 	}
 	r.mu.Lock()
-	loopOn, running, exhausted := r.loopEnabled, r.running, r.restartExhausted
+	loopOn, running, exhausted, stopReason := r.loopEnabled, r.running, r.restartExhausted, r.schedStopReason
 	r.mu.Unlock()
-	return buildTaskMeta(id, r.desc, loopOn, running, exhausted, e.roleAllows(r.desc.RunsOn)), true
+	return buildTaskMeta(id, r.desc, loopOn, running, exhausted, stopReason, e.roleAllows(r.desc.RunsOn)), true
 }
 
 // buildTaskMeta 元数据构建单源（Lookup 与 DescribeAll 共用）：调用方只负责
@@ -2501,19 +2544,20 @@ func (e *Engine) Lookup(id string) (TaskMeta, bool) {
 // 装配闭包单任务缺陷不得让 GET /system/tasks / toggle / detail 整页 500。
 // 求值面按 Kind 收窄：IntervalFn 仅 Periodic、NextSlotFn 仅 Scheduled 产出
 // 对应字段（错配声明即使绕过注册校验也不产出假 interval_sec/next_slot）。
-func buildTaskMeta(id string, d Descriptor, loopOn, running, exhausted, roleAllows bool) TaskMeta {
+func buildTaskMeta(id string, d Descriptor, loopOn, running, exhausted bool, stopReason string, roleAllows bool) TaskMeta {
 	m := TaskMeta{
 		ID: id, Family: d.Family, Name: d.Name,
 		Description: d.Description, Category: d.Category, Kind: d.Kind,
 		// 类型派生：定时/循环/触发均可手动调度；常驻族恒不可（启停语义，
 		// 调度开关+重启承担）。
-		CanTrigger:       d.Kind != KindDaemon,
-		Cancelable:       d.Cancelable,
-		LoopOn:           loopOn,
-		Running:          running,
-		Controllable:     d.Kind == KindDaemon, // 常驻族可启停（真实生命周期挂钩）
-		RestartExhausted: exhausted,
-		RoleApplicable:   roleAllows,
+		CanTrigger:            d.Kind != KindDaemon,
+		Cancelable:            d.Cancelable,
+		LoopOn:                loopOn,
+		Running:               running,
+		Controllable:          d.Kind == KindDaemon, // 常驻族可启停（真实生命周期挂钩）
+		RestartExhausted:      exhausted,
+		ScheduleStoppedReason: stopReason,
+		RoleApplicable:        roleAllows,
 	}
 	if d.Kind == KindPeriodic && d.IntervalFn != nil {
 		m.IntervalSec = int(safeInterval(id+".IntervalFn", d.IntervalFn).Seconds())
@@ -2537,25 +2581,26 @@ func buildTaskMeta(id string, d Descriptor, loopOn, running, exhausted, roleAllo
 
 func (e *Engine) DescribeAll() []TaskMeta {
 	type snap struct {
-		id        string
-		desc      Descriptor
-		loopOn    bool
-		running   bool
-		exhausted bool
+		id         string
+		desc       Descriptor
+		loopOn     bool
+		running    bool
+		exhausted  bool
+		stopReason string
 	}
 	e.mu.RLock()
 	snaps := make([]snap, 0, len(e.regs))
 	for id, r := range e.regs {
 		r.mu.Lock()
-		loopOn, running, exhausted := r.loopEnabled, r.running, r.restartExhausted
+		loopOn, running, exhausted, stopReason := r.loopEnabled, r.running, r.restartExhausted, r.schedStopReason
 		r.mu.Unlock()
-		snaps = append(snaps, snap{id: id, desc: r.desc, loopOn: loopOn, running: running, exhausted: exhausted})
+		snaps = append(snaps, snap{id: id, desc: r.desc, loopOn: loopOn, running: running, exhausted: exhausted, stopReason: stopReason})
 	}
 	e.mu.RUnlock()
 
 	out := make([]TaskMeta, 0, len(snaps))
 	for _, s := range snaps {
-		out = append(out, buildTaskMeta(s.id, s.desc, s.loopOn, s.running, s.exhausted, e.roleAllows(s.desc.RunsOn)))
+		out = append(out, buildTaskMeta(s.id, s.desc, s.loopOn, s.running, s.exhausted, s.stopReason, e.roleAllows(s.desc.RunsOn)))
 	}
 	// 按「分类固定序 + 类内 ID 字典序」稳定排序——曾直接 range map
 	// 输出，连续请求行序随机（前端只做分类排序，类内仍抖动）。

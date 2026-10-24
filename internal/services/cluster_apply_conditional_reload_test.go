@@ -14,10 +14,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -335,5 +337,144 @@ func TestSyncService_applySnapshot_reloadsOnCertAxisChanges(t *testing.T) {
 	})
 	if got := fixture.loadCount(); got != 3 {
 		t.Fatalf("证书内容变更后 /load=%d, want 3（内容轮换必须强制重载）", got)
+	}
+}
+
+// 品牌文件是派生状态（branding.json 不是节哈希的输入，只有镜像列
+// branding_json 属 users 节）：304 补偿重拉轮三节哈希可能全一致，若「本轮
+// 实际写出品牌文件」不并入重载判据，默认站点内嵌的落地文案会滞留旧值——
+// 快照事务已清空 last_sync_error，品牌节又不在漂移口径内，没有第二次自愈。
+// 本用例钉住补偿轮写出即重载且 /load 载荷携带新落地文案；文件已一致时
+// 仍按「渲染输入无变化」跳过重载（反向回归）。
+func TestSyncService_applySnapshot_reloadsWhenBrandingFileRewrittenInCompensationRound(t *testing.T) {
+	service, database := newClusterTestService(t)
+	if _, err := database.Exec("UPDATE global_config SET is_master=0 WHERE id=1"); err != nil {
+		t.Fatalf("set slave mode: %v", err)
+	}
+	defer SetDefaultLandingBody(DefaultLandingText)
+	const landing = "补偿轮新落地文案"
+	branding := `{"app_name":"gw","landing_text":"` + landing + `"}`
+	if _, err := database.Exec("UPDATE global_config SET branding_json=? WHERE id=1", branding); err != nil {
+		t.Fatalf("seed branding mirror: %v", err)
+	}
+	// 种子与前一条用例同口径：users/rules 经显式列回放往返哈希稳定，
+	// security 表行缺失会走漂移重放（干扰「无变化」形态）。
+	for _, stmt := range []string{
+		`INSERT INTO lb_rules (caddy_id,name,protocol,domain,listen_port,enabled) VALUES ('lb_dg','dg','http','dg.example',80,1)`,
+		`INSERT INTO upstreams (rule_id,host,port,weight,enabled) VALUES ('lb_dg','127.0.0.1',8080,1,1)`,
+		`INSERT INTO path_rules (rule_id,sort_order,match_type,path) VALUES ('lb_dg',0,'prefix','/api')`,
+		`INSERT INTO users (id,username,password_hash,role,is_enabled,last_login) VALUES (1,'admin','h','admin',1,datetime('now'))`,
+		`INSERT INTO api_keys (name,key_hash,key_prefix,created_by,is_enabled,last_used) VALUES ('k','kh','kp',1,1,datetime('now'))`,
+		`INSERT INTO security_crs_version (id,version) VALUES (1,'v4.0.0') ON CONFLICT(id) DO UPDATE SET version=excluded.version`,
+		`INSERT INTO security_ip2region_version (id,version) VALUES (1,'v3.17.0') ON CONFLICT(id) DO UPDATE SET version=excluded.version`,
+	} {
+		if _, err := database.Exec(stmt); err != nil {
+			t.Fatalf("seed %q: %v", stmt, err)
+		}
+	}
+	dataDir := t.TempDir()
+	var mu sync.Mutex
+	loads := 0
+	var lastBody string
+	caddyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/load" {
+			raw, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			loads++
+			lastBody = string(raw)
+			mu.Unlock()
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer caddyServer.Close()
+	syncService := NewSyncService(database, &config.Config{DataDir: dataDir, CaddyAdminURL: caddyServer.URL}, NewCaddyService(caddyServer.URL))
+	loadCount := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return loads
+	}
+	loadPayload := func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		return lastBody
+	}
+	base, err := service.clusterSnapshotBypassingCache(context.Background())
+	if err != nil {
+		t.Fatalf("build canonical snapshot: %v", err)
+	}
+	if base.BasicSettings.BrandingJSON == nil || *base.BasicSettings.BrandingJSON != branding {
+		t.Fatalf("canonical snapshot branding=%v, want mirror value", base.BasicSettings.BrandingJSON)
+	}
+	withVersion := func(v int) models.ClusterSnapshot {
+		snap := base
+		snap.Version = v
+		return snap
+	}
+	brandingPath := filepath.Join(dataDir, "branding.json")
+	assertBrandingFile := func() {
+		t.Helper()
+		raw, readErr := os.ReadFile(brandingPath)
+		if readErr != nil {
+			t.Fatalf("read branding file: %v", readErr)
+		}
+		if string(raw) != branding {
+			t.Fatalf("branding file=%q, want mirror content %q", raw, branding)
+		}
+	}
+	seedBrandingFailureMarker := func() {
+		t.Helper()
+		if _, execErr := database.Exec("UPDATE global_config SET last_sync_error=? WHERE id=1",
+			encodeSyncError(syncBrandingFailureMarkerPrefix+": 品牌配置落盘失败（数据库已应用，文件未收敛，下轮同步重试）", models.SyncErrorCodeApplyFailed)); execErr != nil {
+			t.Fatalf("seed branding failure marker: %v", execErr)
+		}
+	}
+
+	// Given 首轮应用：全节首次应用 → 品牌文件落盘 + /load（基准）。
+	if err := syncService.applySnapshot(context.Background(), withVersion(7)); err != nil {
+		t.Fatalf("apply v7: %v", err)
+	}
+	if got := loadCount(); got != 1 {
+		t.Fatalf("首轮应用后 /load=%d, want 1", got)
+	}
+	assertBrandingFile()
+	if payload := loadPayload(); !strings.Contains(payload, landing) {
+		t.Fatalf("/load 载荷未携带新落地文案")
+	}
+
+	// When 模拟上轮品牌落盘失败：文件停在旧内容，标记留在 last_sync_error，
+	// 本轮 304 补偿重拉（版本推进但三节载荷逐字节相同）。
+	if err := os.WriteFile(brandingPath, []byte(`{"app_name":"old","landing_text":"旧文案"}`), 0o644); err != nil {
+		t.Fatalf("simulate stale branding file: %v", err)
+	}
+	seedBrandingFailureMarker()
+	if err := syncService.applySnapshot(context.Background(), withVersion(8)); err != nil {
+		t.Fatalf("apply v8 (compensation): %v", err)
+	}
+	// Then 品牌文件收敛且必须重载——默认站点落地文案随之更新。
+	assertBrandingFile()
+	if got := loadCount(); got != 2 {
+		t.Fatalf("补偿轮 /load=%d, want 2（本轮写出品牌文件必须重载）", got)
+	}
+	if payload := loadPayload(); !strings.Contains(payload, landing) {
+		t.Fatalf("补偿轮 /load 载荷未携带新落地文案")
+	}
+	var stored string
+	if err := database.QueryRow("SELECT COALESCE(last_sync_error,'') FROM global_config WHERE id=1").Scan(&stored); err != nil {
+		t.Fatalf("read last_sync_error: %v", err)
+	}
+	if stored != "" {
+		t.Fatalf("last_sync_error=%q, want cleared after branding write succeeded", stored)
+	}
+
+	// When 下一轮三节仍全跳过、品牌文件已一致（无需写出）。
+	seedBrandingFailureMarker()
+	if err := syncService.applySnapshot(context.Background(), withVersion(9)); err != nil {
+		t.Fatalf("apply v9: %v", err)
+	}
+	// Then 反向回归：只读一致文件不算渲染输入变化，仍跳过重载
+	// （重试标记本身不属于「文件已变」，补偿轮的唯一语义是重试落盘）。
+	assertBrandingFile()
+	if got := loadCount(); got != 2 {
+		t.Fatalf("品牌文件已一致时 /load=%d, want 2（不得为无变化重试重载）", got)
 	}
 }

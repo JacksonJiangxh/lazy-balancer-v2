@@ -15,8 +15,11 @@ func TestFormatDriftBanner_excludesDetectTime(t *testing.T) {
 	// When
 	banner := formatDriftBanner([]string{"测试规则（lb_a）"}, []string{"幽灵（lb_b）"})
 
-	// Then 正文不含检测时间（拆到 config_drift_since），内容两段保留
-	if strings.Contains(banner, "检测于") || strings.Contains(banner, "23:19:04") {
+	// Then 正文不含检测时间（拆到 config_drift_since），内容两段保留。
+	// 时间字面量的归属由下方 TestDriftBannerAndSinceFields_splitCleanly 用
+	// driftSinceText(drift) == since 钉住；此处输入本身不含时间，若再断言
+	// 「正文不含某个时间字面量」只是恒真噪声。
+	if strings.Contains(banner, "检测于") {
 		t.Fatalf("banner=%q, want 不含检测时间", banner)
 	}
 	if !strings.Contains(banner, "缺失规则路由: 测试规则（lb_a）") || !strings.Contains(banner, "多余规则路由: 幽灵（lb_b）") {

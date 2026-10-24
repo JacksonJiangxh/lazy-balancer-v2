@@ -102,8 +102,9 @@ func TestDNSPod_Validate_cleanupUsesIndependentBudget(t *testing.T) {
 	if fake.cleanupCtxErr != nil {
 		t.Fatalf("cleanup ctx err=%v, want 独立预算下 ctx 未过期", fake.cleanupCtxErr)
 	}
-	if fake.cleanupBudget <= 0 || fake.cleanupBudget > dnsProviderValidateTimeout {
-		t.Fatalf("cleanup budget=%v, want (0, %v]", fake.cleanupBudget, dnsProviderValidateTimeout)
+	if fake.cleanupBudget <= dnsProviderValidateTimeout || fake.cleanupBudget > dnsProviderValidateTimeout*retryEnvelopeFactor {
+		t.Fatalf("cleanup budget=%v, want (%v, %v]（清理预算必须覆盖重试包络，与写入侧同倍数）",
+			fake.cleanupBudget, dnsProviderValidateTimeout, dnsProviderValidateTimeout*retryEnvelopeFactor)
 	}
 }
 

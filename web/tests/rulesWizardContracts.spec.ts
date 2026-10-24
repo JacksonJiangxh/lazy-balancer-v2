@@ -58,7 +58,10 @@ test('C 三个辅助端点失败有错误态 + 横幅重试（不再仅 console�
   assert.match(page, /const auxDataLoadFailed = computed\(/, '失败合入单条横幅')
   const alert = section(page, 'v-if="auxDataLoadFailed"', '</el-alert>')
   assert.match(alert, /retryAuxData/, '横幅必须带重试')
-  // 字段级：ACME 步骤的 DNS 配置下拉失败与「未配置」区分
+  // 字段级：ACME 步骤的 DNS 配置下拉失败与「未配置」区分。
+  // ⚠ 与「提示条样式统一（info-note-bar）」联动：本行钉的是当前 form-tip-line
+  // 形态；若该提示迁到 info-note-bar，须在同一提交里同步改这条断言（文案保留），
+  // 否则纯样式改动会被误判成回归。
   assert.match(
     page,
     /v-if="certConfigsLoadError" class="form-tip-line port-warning">DNS 提供商配置加载失败/,

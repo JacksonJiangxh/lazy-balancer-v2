@@ -216,10 +216,21 @@ export const useTrustAssociation = (options: {
             return
           }
         }
-        showSaveResult(
-          added as unknown as { message?: string },
-          alreadyLinked ? `已${cfg.verb}——已加入列表「${reuseTarget.name}」` : `已关联既有「${reuseTarget.name}」并加入 ${ip}`,
-        )
+        // 后端幂等：IP 已存在且生效中时返回 added=false 且不做任何写入
+        // （securityiplists.go 该分支 rollback 后直接返回）。提示必须与事实一致——
+        // 把「已存在」说成「已加入」会让用户以为刚完成一次处置。
+        if (added.data?.added === true) {
+          showSaveResult(
+            added as unknown as { message?: string },
+            alreadyLinked ? `已${cfg.verb}——已加入列表「${reuseTarget.name}」` : `已关联既有「${reuseTarget.name}」并加入 ${ip}`,
+          )
+        } else if (alreadyLinked) {
+          // 条目与关联都已存在：本次零写入，只陈述事实（与 useIpListAdd 同文案）。
+          ElMessage.info(`该 IP 已在列表「${reuseTarget.name}」中`)
+        } else {
+          // 条目已在、本次只补了关联：按关联口径反馈，不再声称加入了条目。
+          mfaAwareSuccess(`已关联既有「${reuseTarget.name}」——该 IP 已在列表中，未重复添加`)
+        }
         await options.onChanged?.()
         return
       }

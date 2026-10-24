@@ -43,6 +43,11 @@ test('表单上限与后端写侧门对齐（证书重签天数 / HTTP 超时）
   assert.doesNotMatch(cert, /cert_renewal_days[^>]*:max="60"/, '60 只是建议值，不得作为硬上限（会把 API/导入写入的 61-88 静默夹回）')
   const configValues = source('src/utils/configValues.ts')
   assert.match(configValues, /export const CERT_RENEWAL_DAYS_MAX = 88/, '上限常量必须是写侧门同值')
+  // 提示文案必须写清 84–88 天的真实后果：控制面已把上限提到写侧门，而扫描侧
+  // 对「窗口 > 寿命 − 7 天」的配置会收敛为到期前 7 天并限频告警（旧文案描述的
+  // 「反复重签」来自已删除的迟滞实现，会让用户以为窗口越大会越早开始续签）。
+  assert.match(cert, /到期前 7 天/, '提示必须写明 84–88 天被收敛为到期前 7 天')
+  assert.doesNotMatch(cert, /反复重签/, '不得再用已删除的旧实现形态描述收敛行为')
   // 跨栈钉：后端上界 = 规划寿命 90 − 2
   const certinfo = repoSource('internal/services/certinfo.go')
   assert.match(certinfo, /const CertRenewalLifetimeDays = 90/)
@@ -88,14 +93,17 @@ test('信任侧冲突警告的门控位置与注释一致（computed 内）', ()
   assert.doesNotMatch(doc, /仅模板\s*$/m, '注释不得声称门控只在模板层')
   assert.match(doc, /门控在 computed 内/)
   const alert = section(page, 'const whitelistSectionAlert = computed<string>(', '  if (trust.length === 0)')
-  assert.match(alert, /ipWhitelistEnabled\.value \? mergeIpEntries/, '实现口径：信任关闭时条目零生效')
+  assert.match(alert, /trustEnabledInEditor\.value \? mergeIpEntries/, '实现口径：信任关闭时条目零生效，阶段 0 恒启用')
+  assert.match(page, /const trustEnabledInEditor = computed\(\(\) => trustEnabledForPolicyType\(editorPolicyType\.value, ipWhitelistEnabled\.value\)\)/, '告警/预览必须复用保存载荷同一谓词')
+  assert.match(page, /ipBlacklistSelf\.value, trustEnabledInEditor\.value\)\)/, 'Step 4 冲突检测的本策略允许侧同样走单源门')
 })
 
 test('IP 快捷弹框的隐藏谓词必须看信任侧命中', () => {
   const page = source('src/views/security/IPLocationAction.vue')
   const predicate = member(page, 'const aclRefsAllSystem = ')
   assert.match(predicate, /mergedTrustEntries\(p\)/, '被隐藏卡的信任侧命中会让「取消信任」无入口')
-  assert.match(predicate, /ip_whitelist_enabled/, '信任关闭时条目零生效，不构成保留理由')
+  assert.doesNotMatch(predicate, /if \(!p\.ip_whitelist_enabled\) return true/, '信任关闭时整卡隐藏会让「未生效」提示与清除入口不可达')
+  assert.match(predicate, /return !mergedTrustEntries\(p\)\.some/, '隐藏条件=信任侧无命中（与启用态无关）')
 })
 
 test('威胁大屏：攻击弹框层级高于错误条堆叠，且错误条默认点击穿透', () => {
@@ -112,5 +120,34 @@ test('规则流程弹框会话打开即作废在途证书响应', () => {
   const dialog = source('src/components/RuleFlowDialog.vue')
   const open = member(dialog, 'const onDialogOpen = ')
   assert.match(open, /detailsSeq\+\+[\s\S]*?certSeq\+\+/, '打开时必须无条件自增证书序号（非 TLS 规则也要作废上一会话）')
-  assert.match(open, /certSeq\+\+\s*\n\s*detailLoading\.value = false/, '自增必须与其它会话状态重置同处')
+  // 不钉换行/缩进形状：只要求两件事都在同一成员体内（各自独立断言）
+  assert.match(open, /certSeq\+\+/, '自增证书序号必须存在')
+  assert.match(open, /detailLoading\.value = false/, '自增必须与其它会话状态重置同处')
+})
+
+// ── 安全策略侧补充验收（脚注降级口径 / 拦截页注记类型门 / 列表默认 tab） ──
+test('fs96-01 流程弹框阶段 1 脚注降级判定与阶段 0 模式行同源（混合策略不得漏判）', () => {
+  const dialog = code('src/components/RuleFlowDialog.vue')
+  const footnote = section(dialog, 'const stage1Footnote = ', '\nconst stageSub = (')
+  assert.match(footnote, /hasTrustDetectionBinding\(boundIds, props\.policies\)/, '必须复用 trustHitMode 系谓词')
+  assert.doesNotMatch(footnote, /policy_type === 'stage0'/, 'mixed 存量信任同样恒 DetectionOnly，等值判断会漏报降级路径')
+})
+
+test('fs96-03 拦截页注记类型门先于 block_page_id 判定（阶段 0 无页面概念）', () => {
+  const page = source('src/views/security/SecurityPolicies.vue')
+  const notes = section(page, 'const blockPageNotes = ', '\n// Step 4 已关联规则的逐条视图')
+  const typeGate = notes.indexOf('if (stages.length === 0) return []')
+  const unsetGate = notes.indexOf('form.value.block_page_id <= 0')
+  assert.ok(typeGate > 0 && unsetGate > 0, '两处门都必须存在')
+  assert.ok(typeGate < unsetGate, '阶段 0（stages 为空）必须先返回，否则永远命中「未选择自定义页面」')
+  assert.match(notes, /限流拦截返回空响应体 429/, '阶段 2 专属文案不得丢')
+})
+
+test('fs96-05 策略列表默认/保存/迁移后 tab 跟随实际类型', () => {
+  const page = source('src/views/security/SecurityPolicies.vue')
+  const defaults = page.match(/activeTypeTab\.value = pickDefaultPolicyTab\(policyTypeCounts\.value\)/g) ?? []
+  assert.equal(defaults.length, 2, '首屏与 tab 消失回落必须共用 pickDefaultPolicyTab')
+  assert.match(page, /const savedType = editorPolicyType\.value[\s\S]*?activeTypeTab\.value = savedType/, '保存成功后切到本次保存类型')
+  assert.match(page, /activeTypeTab\.value = createdType as SecurityPolicyType/, '迁移成功后切到第一个子策略类型')
+  assert.doesNotMatch(page, /if \(!tabs\.some\(\(tab\) => tab\.type === activeTypeTab\.value\)\) activeTypeTab\.value = 'stage1'/, '硬编码回落阶段 1 必须删除')
 })

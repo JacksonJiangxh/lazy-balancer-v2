@@ -2,7 +2,9 @@ package taskengine
 
 // Scheduled 失败退避兜底钉测：Run 早退不推进槽（失败且槽仍是过期旧值）时，
 // tick 不得按秒级节拍无限重投（1 行/tick ≈ 8.6 万行/天）。退避 1s→5s→30s
-// 封顶，槽推进/成功即清零。
+// 封顶，槽推进/成功即清零；连续到 scheduledFailStreakStopLimit（4）轮自动轮
+// 仍未推进则停调（终点形状见 engine_scheduling_stop_test.go，本文件只覆盖
+// 前两轮的节流——用例在 runs>=2 即断言，不会走到停调终点）。
 
 import (
 	"errors"
@@ -14,7 +16,8 @@ import (
 // Given Scheduled 任务的 Run 恒失败且不推进槽（NextSlotFn 恒返回过期旧槽）。
 // When tick 循环运转。
 // Then 退避兜底生效：350ms 窗口（≈35 ticks）内至多 2 次执行（无退避时
-// 每 tick 重投 ≈30+ 次）；退避衰减（1s）后恢复重投——不永久停摆。
+// 每 tick 重投 ≈30+ 次）；退避衰减（1s）后照常重投（终点是「连续 4 轮自动轮
+// 未推进即停调」，本用例在首次 1s 退避后的第二轮结束，不触达终点）。
 func TestEngine_ScheduledStaleSlotFailureBackoff(t *testing.T) {
 	e := newTestEngine(t)
 	pastSlot := time.Now().Add(-time.Minute)

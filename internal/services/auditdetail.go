@@ -53,8 +53,31 @@ var auditResultTextMap = map[string]string{
 	// 证书任务「重试被阻止」终态（certificates.go 经局部
 	// auditFailure 闭包以动态实参传入，字面量扫描钉测覆盖不到——本码曾因此
 	// 渲染成英文 blocked）。
-	"blocked":            "重试被阻止",
+	"blocked": "重试被阻止",
+	// 证书签发命中「规则当前态已变更」冲突（同一 auditFailure 闭包动态实参，
+	// 曾因映射表与钉测清单双缺而渲染成英文 conflict）。
+	"conflict":           "状态冲突",
 	"deleted_unverified": "已删除（结果未确认）",
+}
+
+// auditDynamicResultCodes 是「动态实参」进入 AuditResultPart 的结果码取值域
+// （字面量扫描钉测 audit_result_text_test.go 的 literalArgsCovered 天然覆盖
+// 不到变量/闭包/函数返回值实参）。本清单是这些码的唯一事实源：
+//   - 新增动态结果码必须在此登记，并在 auditResultTextMap 补中文映射，
+//     否则审计详情渲染成英文内部标识（blocked、conflict 两次前车之鉴）；
+//   - handlers 侧 auditFailure 闭包的字面量实参另由 AST 扫描兜底
+//     （TestAuditResultText_auditFailureLiteralsRegistered），新增码未登记即红；
+//   - 守护测试直接遍历本清单，不再在测试里手写第二份清单（手写清单曾漏
+//     conflict，映射表与测试同步漂移）。
+var auditDynamicResultCodes = []string{
+	// handlers/certificates.go IssueCertificate 的 auditFailure 闭包
+	"blocked", "conflict", "failed", "invalid_request", "skipped",
+	// handlers/caproviders.go 测试 CA 提供商的结果码
+	"provider_error", "not_found", "missing_acme_email", "invalid_config", "register_failed",
+	// handlers/users.go 修改用户状态
+	"enabled", "disabled",
+	// handlers/cluster_ticket.go 登录票据失败归因
+	"database_error", "invalid_ticket", "invalid_signature", "expired", "replay", "user_unavailable",
 }
 
 func AuditResultText(result string) string {
@@ -139,6 +162,8 @@ var auditSourceTextMap = map[string]string{
 	"first_issuance_retry": "来源：首次签发重试",
 	// 部署生命周期行缺证书材料（ACME 下载完成后进程退出）：补扫重新排队签发。
 	"deployment_material_lost": "来源：证书材料丢失",
+	// 签发执行期发现任务域名与规则当前域名不匹配（并发兜底）：退役旧任务。
+	"domain_mismatch": "来源：规则域名变更",
 }
 
 func AuditSourcePart(source string) string {

@@ -221,7 +221,9 @@ crs/ip2region 状态镜像仅在对应 manager 本进程在途时采纳——持
 - 调度列：非触发类=开关（绑定 loop_on）；触发类=禁用开关（一致性）；cert-job 动态行=「—」；
   `role_applicable=false`（从节点上的 master-only 族，服务端按 `RunsOn` 派生）的行改显
   「仅主节点」标签并解释从节点不调度，对应「下次执行」列显示「—」——避免把主节点语义的
-  预约时刻误读为即将运行；详情弹框同步展示「角色适用性」
+  预约时刻误读为即将运行；`/system/tasks` 的 `next_run_at` 同口径置空（门覆盖全部来源：
+  定时族 `NextSlotFn`、周期族「最近运行 + 间隔」兜底与 cert 等待时刻），直接消费该字段的
+  脚本不得对角色不适用任务排程；详情弹框同步展示「角色适用性」
 - 常驻族停止需确认弹框；操作列常驻族有「重启」
 
 ### 4.1 逐任务启停持久化（2026-10-18 用户裁定）
@@ -282,9 +284,9 @@ task_runs 保留 90 天（audit-retention 每日清理）。`Engine.Stop` 先取
 
 **配置导入暂停/排空**：`PauseScheduling` 与 `ResumeScheduling` 成对使用，均在 `e.mu` 内提交暂停状态，与 `runNow` 的 `inFlight` 登记严格定序。暂停后 tick 不再派发，`Trigger`、`RunSync` 及已越过入口检查的迟到 `runNow` 均返回 `ErrSchedulingPaused`；仅装配期 BootSync（`trigger=startup`）豁免。因此除该启动路径外，暂停返回后 `inFlight` 只减不增，导入可安全排空在途执行；恢复同样在 `e.mu` 内提交，暂停/恢复边界不留下登记窗口。
 
-**装配期启动屏障**：`Options.StartPaused` 只覆盖 tick 投递与 `Trigger`/`RunSync`/`runNow` 登记，**不覆盖常驻族启停**——默认清单里 `security-events-ingestion`/`cert-issuance`/`cluster-sync` 先于 `startup:config-load` 被 `StartLoop` 拉起，其 Run 体起步即真实接管服务（证书签发 → `StartACME` → CA 队列 / 证书部署重试 → Caddy `/load`）。因此装配方在启动默认清单**之前**进入配置屏障（`BeginConfigImportHold`），BootSync（规则库载入 → 证书物化 → Caddy 渲染/应用）完成后 `EndConfigImportHold` 兑现被延迟的队列与生命周期启动：配置载入前面板不得已有证书部署写入运行配置。不得把常驻启停并入 `schedPaused`（会与 `loopEnabled`/`pendingRestart` 语义纠缠）。
+**装配期启动屏障**：`Options.StartPaused` 只覆盖 tick 投递与 `Trigger`/`RunSync`/`runNow` 登记，**不覆盖常驻族启停**——默认清单里 `security-events-ingestion`/`cert-issuance`/`cluster-sync` 先于 `startup:config-load` 被 `StartLoop` 拉起，其 Run 体起步即真实接管服务（证书签发 → `StartACME` → CA 队列 / 证书部署重试 → Caddy `/load`）。其中只有 `cert-issuance` 写部署面。因此装配方在启动默认清单**之前**进入配置屏障（`BeginConfigImportHold`），BootSync（规则库载入 → 证书物化 → Caddy 渲染/应用）完成后 `EndConfigImportHold` 兑现被延迟的队列与生命周期启动：配置载入前面板不得已有证书部署写入运行配置。**屏障的实际覆盖范围只有部署面**（`startCertIssuanceLifecycle` 与 `caqueue` 的 `configImportHoldActive` 门）：`security-events-ingestion`（只读尾读）与 `cluster-sync` 照常先启动，行为与引入屏障前一致（从节点快照应用由快照应用自身收敛），不得据此宣称「全部常驻族被挡在配置载入之后」。不得把常驻启停并入 `schedPaused`（会与 `loopEnabled`/`pendingRestart` 语义纠缠）。
 
-**调度自动停摆的留痕口径**：两类「引擎自行停止调度」都必须与用户主动停止可区分——① `IntervalFn` 返回非正周期：立即停调并落一条 `failed` 运行行（状态列呈现 failed，含原因）+ `[error]` 日志；② 定时槽连续 `scheduledFailStreakStopLimit`（4）轮未推进且本轮失败/跳过：停调 + `[error]` 日志（失败轮本身已有 failed 行）。两者均可由 `StartLoop` 关→开恢复（清空退避/槽水位）。
+**调度自动停摆的留痕口径**：两类「引擎自行停止调度」都必须与用户主动停止可区分——① `IntervalFn` 返回非正周期：立即停调并落一条 `failed` 运行行（状态列呈现 failed，含原因）+ `[error]` 日志；② 定时槽连续 `scheduledFailStreakStopLimit`（4）轮**自动轮**未推进且本轮失败/跳过：停调 + `[error]` 日志（失败轮本身已有 failed 行），并在任务元数据透出 `schedule_stopped_reason=fail-streak`（视图据此把「引擎停调」与「用户停止」分开呈现，业务驱动任务提示到业务页重新保存自动更新）。手动轮失败只走退避节流，不消耗停调预算。恢复入口：`StartLoop` 关→开（业务驱动任务=对应业务页重新保存开关）、`ResetScheduleProgress` 或重启进程，均清空停调来源与退避/槽水位。
 
 ## 6. 业务侧 helper
 
@@ -329,6 +331,8 @@ task_runs 保留 90 天（audit-retention 每日清理）。`Engine.Stop` 先取
 
 ## 7. 修订记录
 
+- v2.0.9（2026-10-24）：联动契约收敛——① 「活动态只属执行进程」补上导入通道：配置导入把四表 `update_status` 的活动态（版本表四活动词 + 源表 `running`）按类判据 `services.IsActiveUpdateStatus` 归一为 failed + 归属文案，`running` 补入共享词表（不再被误判为词表外值归 idle）；② 「槽域=运行域」落到写侧：威胁族首槽武装、时区重排与排程保存统一按注册表源名过滤，注册表外启用行的槽不再被清理后的武装反向补回；③ 角色不适用任务的 `next_run_at` 全部来源置空（定时族 `NextSlotFn`/cert 等待时刻同门），与 `role_applicable=false` 不再自相矛盾；④ 规则库读面（`/security/crs`、`/security/ip2region`、`/security/overview`）接入角色投影，从节点残留活动态与状态端点同结论。
+- v2.0.8（2026-10-24）：停调语义与恢复入口口径收敛——① 只有自动轮消耗停调预算：手动轮失败/跳过只走退避节流、不推进 `schedFailStreak`（不再让几次手动重试提前用尽自动停调预算）；② 引擎停调来源机器可读（`schedule_stopped_reason=fail-streak`），任务视图把「引擎停调」与「用户停止」分开呈现，业务驱动任务给出「到业务页重新保存自动更新 / 重启进程」的可执行恢复入口；`[error]` 日志文案同步改为可执行指引；③ `RearmLoop(hasWork=true)` 只在「已停止→开启」过渡复位 Scheduled 槽水位/退避（已开启任务的普通唤醒不再把已消费的过期槽重新投递，与 `StartLoop` 同口径）；④ 源表族启动归一的告警写入注册任务 ID `threat`（此前写入不存在的 `threat-update`，产生游离日志文件且任务日志弹框不可见）；⑤ 任务/审计日志尺寸的兜底值单源 `db.DefaultTaskLogSizeMB`/`db.DefaultAuditLogSizeMB`（删除各自字面量）；⑥ 已停引擎的 `Cancel` 与 toggle/control 同口径回 503，`Register` 的停止门移到描述符校验之后（先报真正缺失的字段）；⑦ §5 装配期屏障口径收窄为「只覆盖部署面」。
 - v2.0.7（2026-10-24）：调度自动停摆与观测口径收敛——① Periodic 的 `IntervalFn`
   返回非正周期时停调并落 failed 运行行 + `[error]` 日志（此前只有日志行，与用户
   主动停止同形；失败行让状态列与「近 24 小时」失败计数可见）；② 定时槽连续

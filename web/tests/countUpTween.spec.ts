@@ -9,7 +9,7 @@ import assert from 'node:assert/strict'
 import { nextTick, ref } from 'vue'
 
 import { useCountUp } from '../src/composables/useCountUp.ts'
-import { FakeDocument, mountForLifecycle, source } from './_helpers.ts'
+import { FakeDocument, code, mountForLifecycle } from './_helpers.ts'
 
 class FakeFrames {
   private nextId = 1
@@ -32,12 +32,15 @@ class FakeFrames {
 interface Harness {
   doc: FakeDocument
   frames: FakeFrames
+  /** 固定时钟：补间起点取 performance.now()，实钟会让中间值断言随进程停顿抖动。 */
+  clock: { now: number }
   dispose: () => void
 }
 
 const makeHarness = (): Harness => {
   const doc = new FakeDocument()
   const frames = new FakeFrames()
+  const clock = { now: 0 }
   const g = globalThis as unknown as {
     document?: unknown
     requestAnimationFrame?: unknown
@@ -48,21 +51,25 @@ const makeHarness = (): Harness => {
     document: g.document,
     raf: g.requestAnimationFrame,
     caf: g.cancelAnimationFrame,
+    performance: Object.getOwnPropertyDescriptor(globalThis, 'performance'),
   }
   g.document = doc
   g.requestAnimationFrame = frames.request
   g.cancelAnimationFrame = frames.cancel
+  Object.defineProperty(globalThis, 'performance', { value: { now: () => clock.now }, configurable: true, writable: true })
   // onUnmounted 无组件实例会打印 Vue 警告——本文件只验证可见性行为，静音
   const warn = console.warn
   console.warn = () => {}
   return {
     doc,
     frames,
+    clock,
     dispose: () => {
       console.warn = warn
       g.document = previous.document
       g.requestAnimationFrame = previous.raf
       g.cancelAnimationFrame = previous.caf
+      if (previous.performance) Object.defineProperty(globalThis, 'performance', previous.performance)
     },
   }
 }
@@ -78,7 +85,7 @@ test('可见时按帧补间到源值', async () => {
     await nextTick()
     assert.equal(h.frames.size, 1, '源值变化排一帧')
 
-    h.frames.step(performance.now() + 400)
+    h.frames.step(h.clock.now + 400)
     assert.equal(display.value, 100, '补间终点=源值')
     assert.equal(h.frames.size, 0, '到达后不再排帧')
   } finally {
@@ -91,7 +98,8 @@ test('页签隐藏即停帧，隐藏期源值直接落值，恢复可见落到�
   try {
     const source = ref(0)
     const display = useCountUp(source, 1000)
-    const startAt = performance.now()
+    // 起点由固定时钟给出（0），中间值断言不依赖真实进程时间
+    const startAt = h.clock.now
 
     source.value = 1000
     await nextTick()
@@ -157,11 +165,16 @@ test('卸载时摘除可见性监听并取消在途补间帧', async () => {
   }
 })
 
-// 消费侧接线钉：大屏四个 KPI 必须经 useCountUp 滚动（绕过时表现为数字不再
-// 补间，纯函数用例不会红）。
-test('ThreatScreen 接线：四个 KPI 均经 useCountUp', () => {
-  const screen = source('src/views/security/ThreatScreen.vue')
-  const calls = screen.match(/useCountUp\(/g) ?? []
-  assert.equal(calls.length, 4, `ThreatScreen 的 useCountUp 调用点应为 4 处，实际 ${calls.length}`)
+// 消费侧接线钉：大屏 KPI 必须经 useCountUp 滚动（绕过时表现为数字不再补间，
+// 纯函数用例不会红）。用名册式逐项断言——新增合法 KPI 不应因「恰好 4 处」假红。
+test('ThreatScreen 接线：每个 KPI 均经 useCountUp', () => {
+  const screen = code('src/views/security/ThreatScreen.vue')
   assert.match(screen, /import \{ useCountUp \} from '@\/composables\/useCountUp'/)
+  const lines = screen.split('\n').filter((line) => line.includes('useCountUp('))
+  for (const field of ['total_events', 'ratelimit_blocks', 'active_sources', 'recent_rate']) {
+    assert.ok(
+      lines.some((line) => line.includes(field)),
+      `KPI ${field} 必须经 useCountUp 滚动（当前调用行：${lines.length}）`,
+    )
+  }
 })
