@@ -25,10 +25,14 @@
         </el-form-item>
         <el-form-item label="过期提醒天数">
           <el-input-number v-model="global.cert_expiry_days" :min="1" :max="365" />
+          <span class="form-tip-inline">证书剩余天数少于该值时标记为「即将过期」，并在证书列表与告警中提醒。</span>
         </el-form-item>
         <el-form-item label="自动续签时间">
           <el-input-number v-model="global.cert_renewal_days" :min="1" :max="CERT_RENEWAL_DAYS_MAX" />
-          <span class="form-tip-inline">证书到期前多少天自动尝试重签；建议不超过 60，上限 {{ CERT_RENEWAL_DAYS_MAX }} 天。选到 84–88 天（超过证书寿命 − 7 天）时，系统按证书实际寿命把窗口收敛为到期前 7 天再续签，并对该规则每小时留一条告警（库值保持原样）；到期前 7 天是续签保护区，任何配置都不会更晚。0 = 默认 30 天（仅 API 直写/备份导入可达，本控件下限为 1）</span>
+          <span
+            class="form-tip-inline"
+            title="选择 84–88 天（超过证书寿命 − 7 天）时，系统按证书实际寿命把窗口收敛为到期前 7 天再续签，并对该规则每小时留一条告警（库值保持原样）。0 = 默认 30 天，仅 API 直写/备份导入可达，本控件下限为 1。"
+          >到期前多少天开始自动续签，建议不超过 60 天（上限 {{ CERT_RENEWAL_DAYS_MAX }} 天）；到期前 7 天内必定续签。</span>
         </el-form-item>
         <el-form-item label="续签重试次数">
           <el-input-number v-model="global.cert_renewal_attempts" :min="1" :max="10" />
